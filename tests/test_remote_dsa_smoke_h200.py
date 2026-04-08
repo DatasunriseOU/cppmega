@@ -5,10 +5,9 @@ def test_remote_dsa_smoke_enables_native_megatron_dsa_flags():
     script = (Path(__file__).resolve().parents[1] / "scripts" / "remote_smoke_h200_dsa.sh").read_text()
     assert "pretrain_gpt.py" in script
     assert "--no-gradient-accumulation-fusion \\" in script
-    assert "--multi-latent-attention \\" in script
-    assert "--experimental-attention-variant dsa \\" in script
-    assert "--dsa-indexer-topk 16 \\" in script
-    assert "--dsa-indexer-loss-coeff 0.0 \\" in script
+    assert "from cppmega.recipes.nam56r_launch import build_nam56r_megatron_native_args" in script
+    assert "from cppmega.recipes.nam56r_megatron import build_nam56r_feature_plan" in script
+    assert "${NATIVE_ARGS} \\" in script
 
 
 def test_remote_dsa_smoke_keeps_cp_at_one():

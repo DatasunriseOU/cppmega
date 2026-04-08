@@ -15,7 +15,7 @@ trap 'rm -f "${LOCAL_TMP_SCRIPT}"' EXIT
 cat > "${LOCAL_TMP_SCRIPT}" <<'EOF'
 set -euo pipefail
 source "${REMOTE_VENV}/bin/activate"
-export PYTHONPATH="${REMOTE_ROOT}/megatron-lm:${PYTHONPATH:-}"
+export PYTHONPATH="${REMOTE_ROOT}/cppmega:${REMOTE_ROOT}/megatron-lm:${PYTHONPATH:-}"
 mkdir -p "${REMOTE_ROOT}/cppmega" "${REMOTE_ROOT}/.triton-cache"
 REMOTE_CKPT_DIR="${REMOTE_ROOT}/cppmega/${CPPMEGA_RUN_ID}_ckpt"
 
@@ -27,6 +27,15 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_IB_SL=1
 export TRITON_CACHE_DIR="${REMOTE_ROOT}/.triton-cache"
 export CPPMEGA_DSA_DISABLE_ROPE_FUSION=1
+NATIVE_ARGS="$(${REMOTE_VENV}/bin/python - <<'PY'
+from cppmega.recipes.nam56r_launch import build_nam56r_megatron_native_args
+from cppmega.recipes.nam56r_megatron import build_nam56r_feature_plan
+
+plan = build_nam56r_feature_plan(pattern='AEMEAEMEAEMR', depth=52)
+bundle = build_nam56r_megatron_native_args(plan=plan, enable_mla=True, enable_dsa=True)
+print(bundle.to_shell_fragment())
+PY
+)"
 
 python - <<'PY'
 from pathlib import Path
@@ -108,17 +117,7 @@ python -m torch.distributed.run --nproc_per_node=8 pretrain_gpt.py \
   --bf16 \
   --use-mcore-models \
   --transformer-impl transformer_engine \
-  --multi-latent-attention \
-  --q-lora-rank 64 \
-  --kv-lora-rank 64 \
-  --qk-head-dim 64 \
-  --qk-pos-emb-head-dim 32 \
-  --v-head-dim 64 \
-  --experimental-attention-variant dsa \
-  --dsa-indexer-n-heads 8 \
-  --dsa-indexer-head-dim 64 \
-  --dsa-indexer-topk 16 \
-  --dsa-indexer-loss-coeff 0.0 \
+  ${NATIVE_ARGS} \
   --save "${REMOTE_CKPT_DIR}" \
   --load "${REMOTE_CKPT_DIR}" \
   --save-interval 1 \
