@@ -10,6 +10,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from cppmega.features.engram import EngramConfig, NgramHashConfig
+from cppmega.features.mhc.config import MHCConfig
+from cppmega.features.mod.config import MoDConfig, MoDAConfig
+from cppmega.features.structure.config import StructureConfig
 
 
 _SUPPORTED_NEMOTRON_SYMBOLS = frozenset({"A", "M", "D", "E", "G", "R", "|"})
@@ -37,6 +40,10 @@ class MegatronHybridPlan:
     issues: tuple[TranslationIssue, ...]
     engram: EngramConfig | None = None
     ngram_hash: NgramHashConfig | None = None
+    mhc: MHCConfig | None = None
+    mod: MoDConfig | None = None
+    moda: MoDAConfig | None = None
+    structure: StructureConfig | None = None
 
     @property
     def is_fully_native(self) -> bool:
@@ -86,6 +93,10 @@ def translate_nanochat_pattern_to_megatron(
     force_author_mamba3: bool = True,
     engram: EngramConfig | None = None,
     ngram_hash: NgramHashConfig | None = None,
+    mhc: MHCConfig | None = None,
+    mod: MoDConfig | None = None,
+    moda: MoDAConfig | None = None,
+    structure: StructureConfig | None = None,
 ) -> MegatronHybridPlan:
     """Translate a nanochat Nemotron pattern into Megatron hybrid syntax.
 
@@ -147,6 +158,10 @@ def translate_nanochat_pattern_to_megatron(
         issues=tuple(issues),
         engram=engram,
         ngram_hash=ngram_hash,
+        mhc=mhc,
+        mod=mod,
+        moda=moda,
+        structure=structure,
     )
 
 
@@ -186,6 +201,42 @@ def build_nam56r_feature_plan(
     ngram_hash_table_size: int = 500_000,
     ngram_hash_embed_dim: int = 16,
     ngram_hash_offload: bool = False,
+    mhc_enabled: bool = False,
+    mhc_layers: str = "",
+    mhc_n_streams: int = 4,
+    mhc_sinkhorn_iters: int = 5,
+    mhc_temperature: float = 1.0,
+    mhc_epsilon: float = 1e-6,
+    mhc_blend_alpha: float = 1.0,
+    mhc_dynamic: bool = False,
+    mhc_dynamic_mode: str = "maxtext",
+    mhc_fused_ops: bool = False,
+    mhc_recompute_group_size: int = 0,
+    mod_enabled: bool = False,
+    mod_layers: str = "",
+    mod_capacity: float = 0.5,
+    mod_aux_loss_weight: float = 0.01,
+    mod_routing: str = "topk",
+    mod_target: str = "",
+    mod_scorer: str = "",
+    mod_selector: str = "",
+    mod_schedule: str = "",
+    mod_executor: str = "auto",
+    mod_ffn_only: bool = False,
+    mod_skip_first_n: int = 4,
+    mod_skip_mamba: bool = True,
+    moda_enabled: bool = False,
+    structure_enabled: bool = False,
+    structure_components: str = "core",
+    max_ast_depth: int = 20,
+    max_sibling_index: int = 10,
+    num_node_types: int = 64,
+    structure_bottleneck_dim: int = 64,
+    relation_bias_enabled: bool = False,
+    tree_ffn_enabled: bool = False,
+    tree_ffn_steps: int = 3,
+    tree_ffn_dropout: float = 0.0,
+    platform_embed_enabled: bool = False,
 ) -> MegatronHybridPlan:
     engram = EngramConfig.from_nanochat_args(
         enabled=engram_enabled,
@@ -206,10 +257,60 @@ def build_nam56r_feature_plan(
         embed_dim=ngram_hash_embed_dim,
         offload=ngram_hash_offload,
     )
+    mhc = MHCConfig.from_nanochat_args(
+        enabled=mhc_enabled,
+        layers=mhc_layers,
+        n_streams=mhc_n_streams,
+        sinkhorn_iters=mhc_sinkhorn_iters,
+        temperature=mhc_temperature,
+        epsilon=mhc_epsilon,
+        blend_alpha=mhc_blend_alpha,
+        dynamic=mhc_dynamic,
+        dynamic_mode=mhc_dynamic_mode,
+        fused_ops=mhc_fused_ops,
+        recompute_group_size=mhc_recompute_group_size,
+    )
+    mod = MoDConfig.from_nanochat_args(
+        enabled=mod_enabled,
+        layers=mod_layers,
+        capacity=mod_capacity,
+        aux_loss_weight=mod_aux_loss_weight,
+        routing=mod_routing,
+        target=mod_target,
+        scorer=mod_scorer,
+        selector=mod_selector,
+        schedule=mod_schedule,
+        executor=mod_executor,
+        ffn_only=mod_ffn_only,
+        skip_first_n=mod_skip_first_n,
+        skip_mamba=mod_skip_mamba,
+    )
+    moda = MoDAConfig.from_nanochat_args(enabled=moda_enabled)
+    structure = StructureConfig.from_nanochat_args(
+        enabled=structure_enabled,
+        components=structure_components,
+        max_ast_depth=max_ast_depth,
+        max_sibling_index=max_sibling_index,
+        num_node_types=num_node_types,
+        bottleneck_dim=structure_bottleneck_dim,
+        relation_bias_enabled=relation_bias_enabled,
+        tree_ffn_enabled=tree_ffn_enabled,
+        tree_ffn_steps=tree_ffn_steps,
+        tree_ffn_dropout=tree_ffn_dropout,
+        platform_embed_enabled=platform_embed_enabled,
+    )
     if engram is not None:
         invalid = [index for index in engram.layer_indices if index >= depth]
         if invalid:
             raise ValueError(f"Engram layer indices {invalid} exceed depth={depth}")
+    if mhc is not None:
+        invalid = [index for index in mhc.layer_indices if index >= depth]
+        if invalid:
+            raise ValueError(f"mHC layer indices {invalid} exceed depth={depth}")
+    if mod is not None:
+        invalid = [index for index in mod.layer_indices if index >= depth]
+        if invalid:
+            raise ValueError(f"MoD layer indices {invalid} exceed depth={depth}")
     return translate_nanochat_pattern_to_megatron(
         pattern=pattern,
         depth=depth,
@@ -217,4 +318,8 @@ def build_nam56r_feature_plan(
         force_author_mamba3=force_author_mamba3,
         engram=engram,
         ngram_hash=ngram_hash,
+        mhc=mhc,
+        mod=mod,
+        moda=moda,
+        structure=structure,
     )

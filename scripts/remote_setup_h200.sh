@@ -11,6 +11,9 @@ REMOTE_TMP_SCRIPT="${REMOTE_TMP_SCRIPT:-/tmp/cppmega-remote-setup.sh}"
 MEGATRON_COMMIT="${MEGATRON_COMMIT:-fd762549816ea21cc8c00db602a66c01717e2794}"
 MAMBA_COMMIT="${MAMBA_COMMIT:-31f3d7baba69d0ccad1635ace1e477367899e408}"
 INSTALL_AUTHOR_MAMBA3="${INSTALL_AUTHOR_MAMBA3:-0}"
+INSTALL_TE_PYTORCH="${INSTALL_TE_PYTORCH:-0}"
+TE_VERSION="${TE_VERSION:-2.13.0}"
+GCS_ARTIFACT_PREFIX="${GCS_ARTIFACT_PREFIX:-}"
 LOCAL_TMP_SCRIPT="$(mktemp -t cppmega-remote-setup.XXXXXX.sh)"
 
 trap 'rm -f "${LOCAL_TMP_SCRIPT}"' EXIT
@@ -20,54 +23,74 @@ set -euo pipefail
 mkdir -p "${REMOTE_ROOT}"
 cd "${REMOTE_ROOT}"
 
-if [ ! -d "${REMOTE_BASE_VENV}" ]; then
-  echo "missing base nanochat venv at ${REMOTE_BASE_VENV}" >&2
+if [ ! -x "${REMOTE_BASE_VENV}/bin/python" ]; then
+  echo "missing base python at ${REMOTE_BASE_VENV}/bin/python" >&2
   exit 1
 fi
 
-BASE_TORCH_VERSION="$("${REMOTE_BASE_VENV}/bin/python" -c 'import torch; print(torch.__version__)')"
+BASE_TORCH_VERSION="$(${REMOTE_BASE_VENV}/bin/python -c 'import torch; print(torch.__version__)')"
 
 rm -rf "${REMOTE_VENV}"
-mkdir -p "${REMOTE_VENV}"
-cp -a "${REMOTE_BASE_VENV}/." "${REMOTE_VENV}/"
-find "${REMOTE_VENV}" -path '*/site-packages/~vidia*' -prune -exec rm -rf {} + || true
-
-OLD_VENV="${REMOTE_BASE_VENV}" NEW_VENV="${REMOTE_VENV}" "${REMOTE_BASE_VENV}/bin/python" - <<'PY'
-from pathlib import Path
-import os
-
-old = os.environ["OLD_VENV"]
-new = os.environ["NEW_VENV"]
-
-targets = [Path(new) / "pyvenv.cfg", *(Path(new) / "bin").iterdir()]
-for path in targets:
-    if not path.is_file():
-        continue
-    try:
-        text = path.read_text()
-    except UnicodeDecodeError:
-        continue
-    if old in text:
-        path.write_text(text.replace(old, new))
-PY
-
-CLONED_PREFIX="$("${REMOTE_VENV}/bin/python" -c 'import sys; print(sys.prefix)')"
-if [ "${CLONED_PREFIX}" != "${REMOTE_VENV}" ]; then
-  echo "cloned venv prefix mismatch: ${CLONED_PREFIX} != ${REMOTE_VENV}" >&2
-  exit 1
-fi
+"${REMOTE_BASE_VENV}/bin/python" -m venv --system-site-packages "${REMOTE_VENV}"
 
 source "${REMOTE_VENV}/bin/activate"
-
+python -m ensurepip --upgrade
+python -m pip install --upgrade pip wheel packaging setuptools
 python -m pip install --no-deps pybind11
 
-if ! command -v python3-config >/dev/null 2>&1; then
-  cat > "${REMOTE_VENV}/bin/python3-config" <<'PYCFG'
+BASE_SITE_PACKAGES="$(${REMOTE_BASE_VENV}/bin/python - <<'PY'
+import site
+paths = site.getsitepackages()
+print("\n".join(paths))
+PY
+)"
+BASE_PY_SITE="$(${REMOTE_BASE_VENV}/bin/python - <<'PY'
+import site
+for path in site.getsitepackages():
+    if 'site-packages' in path:
+        print(path)
+        break
+PY
+)"
+REMOTE_SITE_PACKAGES="$(python - <<'PY'
+import site
+for path in site.getsitepackages():
+    if 'site-packages' in path:
+        print(path)
+        break
+PY
+)"
+PTH_FILE="${REMOTE_SITE_PACKAGES}/cppmega-base-venv.pth"
+printf '%s\n' "${BASE_SITE_PACKAGES}" > "${PTH_FILE}"
+"${REMOTE_BASE_VENV}/bin/python" - "${PTH_FILE}" <<'PY'
+import site
+import sys
+
+base_paths = set(site.getsitepackages())
+target = sys.argv[1]
+with open(target, "a", encoding="utf-8") as handle:
+    for path in sys.path:
+        if path and path.startswith("/mnt/data/venv/") and path not in base_paths:
+            handle.write(path + "\n")
+PY
+
+if [ -d "${BASE_PY_SITE}/nvidia" ]; then
+  mkdir -p "${REMOTE_SITE_PACKAGES}/nvidia"
+  for entry in "${BASE_PY_SITE}/nvidia"/*; do
+    [ -e "${entry}" ] || continue
+    name="$(basename "${entry}")"
+    if [ ! -e "${REMOTE_SITE_PACKAGES}/nvidia/${name}" ]; then
+      ln -s "${entry}" "${REMOTE_SITE_PACKAGES}/nvidia/${name}"
+    fi
+  done
+fi
+
+cat > "${REMOTE_VENV}/bin/python3-config" <<'PYCFG'
 #!/usr/bin/env bash
 set -euo pipefail
 
 if [ "${1:-}" = "--extension-suffix" ]; then
-  python3 - <<'PY'
+  python - <<'PY'
 import sysconfig
 print(sysconfig.get_config_var("EXT_SUFFIX") or "")
 PY
@@ -77,8 +100,7 @@ fi
 echo "unsupported python3-config invocation: $*" >&2
 exit 1
 PYCFG
-  chmod +x "${REMOTE_VENV}/bin/python3-config"
-fi
+chmod +x "${REMOTE_VENV}/bin/python3-config"
 
 if [ ! -d megatron-lm ]; then
   git clone https://github.com/NVIDIA/Megatron-LM.git megatron-lm
@@ -86,8 +108,32 @@ fi
 cd megatron-lm
 git fetch --all --tags
 git checkout "${MEGATRON_COMMIT}"
-python -m pip install --upgrade pip wheel packaging
 python -m pip install --no-deps -e .
+
+if [ "${INSTALL_TE_PYTORCH}" = "1" ]; then
+  CUDNN_ROOT="${BASE_PY_SITE}/nvidia/cudnn"
+  NCCL_ROOT="${BASE_PY_SITE}/nvidia/nccl"
+  export CUDNN_PATH="${CUDNN_ROOT}"
+  export NCCL_ROOT_DIR="${NCCL_ROOT}"
+  export CPATH="${CUDNN_ROOT}/include:${NCCL_ROOT}/include:${CPATH:-}"
+  export CPLUS_INCLUDE_PATH="${CUDNN_ROOT}/include:${NCCL_ROOT}/include:${CPLUS_INCLUDE_PATH:-}"
+  export LIBRARY_PATH="${CUDNN_ROOT}/lib:${NCCL_ROOT}/lib:${LIBRARY_PATH:-}"
+  export LD_LIBRARY_PATH="${CUDNN_ROOT}/lib:${NCCL_ROOT}/lib:${LD_LIBRARY_PATH:-}"
+  python -m pip install --no-deps --force-reinstall "transformer_engine_cu13==${TE_VERSION}" "transformer_engine_torch==${TE_VERSION}"
+  python -m pip install --no-deps "transformer-engine==${TE_VERSION}" onnx onnxscript onnx_ir nvdlfw-inspect ml_dtypes
+  python - <<'PY'
+import torch
+import transformer_engine
+import transformer_engine.pytorch
+print('transformer_engine ready', torch.__version__, transformer_engine.__file__)
+PY
+  if [ -n "${GCS_ARTIFACT_PREFIX}" ]; then
+    ART_DIR="${REMOTE_ROOT}/cppmega/te-artifacts"
+    mkdir -p "${ART_DIR}"
+    python -m pip wheel --no-deps --wheel-dir "${ART_DIR}" "transformer_engine_cu13==${TE_VERSION}" "transformer_engine_torch==${TE_VERSION}" "transformer-engine==${TE_VERSION}" onnx onnxscript onnx_ir nvdlfw-inspect ml_dtypes
+    gcloud storage cp "${ART_DIR}"/* "${GCS_ARTIFACT_PREFIX}/"
+  fi
+fi
 
 if [ "${INSTALL_AUTHOR_MAMBA3}" = "1" ]; then
   cd "${REMOTE_ROOT}"
@@ -123,7 +169,7 @@ gcloud compute scp \
 
 gcloud compute ssh "${REMOTE_HOST}" \
   --zone "${REMOTE_ZONE}" \
-  --command "REMOTE_ROOT='${REMOTE_ROOT}' REMOTE_CPPMEGA_DIR='${REMOTE_CPPMEGA_DIR}' REMOTE_BASE_VENV='${REMOTE_BASE_VENV}' REMOTE_VENV='${REMOTE_VENV}' MEGATRON_COMMIT='${MEGATRON_COMMIT}' MAMBA_COMMIT='${MAMBA_COMMIT}' INSTALL_AUTHOR_MAMBA3='${INSTALL_AUTHOR_MAMBA3}' bash '${REMOTE_TMP_SCRIPT}'"
+  --command "REMOTE_ROOT='${REMOTE_ROOT}' REMOTE_CPPMEGA_DIR='${REMOTE_CPPMEGA_DIR}' REMOTE_BASE_VENV='${REMOTE_BASE_VENV}' REMOTE_VENV='${REMOTE_VENV}' MEGATRON_COMMIT='${MEGATRON_COMMIT}' MAMBA_COMMIT='${MAMBA_COMMIT}' INSTALL_AUTHOR_MAMBA3='${INSTALL_AUTHOR_MAMBA3}' INSTALL_TE_PYTORCH='${INSTALL_TE_PYTORCH}' TE_VERSION='${TE_VERSION}' GCS_ARTIFACT_PREFIX='${GCS_ARTIFACT_PREFIX}' bash '${REMOTE_TMP_SCRIPT}'"
 
 gcloud compute ssh "${REMOTE_HOST}" \
   --zone "${REMOTE_ZONE}" \
