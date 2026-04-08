@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+cppmega/__init__.py
+cppmega.egg-info/PKG-INFO
+cppmega.egg-info/SOURCES.txt
+cppmega.egg-info/dependency_links.txt
+cppmega.egg-info/top_level.txt
+cppmega/features/__init__.py
+cppmega/features/mamba3/__init__.py
+cppmega/recipes/__init__.py
+cppmega/recipes/nam56r_megatron.py
+cppmega/remote/__init__.py
+tests/test_nam56r_megatron.py

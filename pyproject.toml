@@ -1,0 +1,21 @@
+[project]
+name = "cppmega"
+version = "0.1.0"
+description = "Megatron-first CUDA-only rebuild of nanochat feature contracts"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+include = ["cppmega*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

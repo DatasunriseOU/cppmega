@@ -1,0 +1,6 @@
+tests/__pycache__/*
+cppmega/features/m2rnn/__pycache__/*
+cppmega/features/mamba3/__pycache__/*
+*/__pycache__/*
+cppmega/megatron/__pycache__/*
+*.pyc
