@@ -75,3 +75,64 @@ def test_feature_plan_rejects_engram_layers_outside_depth():
         assert "exceed depth=4" in str(exc)
     else:
         raise AssertionError("expected ValueError for out-of-range Engram layer")
+
+
+def test_feature_plan_captures_mhc_mod_moda_and_structure_surfaces():
+    plan = build_nam56r_feature_plan(
+        pattern="AEMEAEMEAEMR",
+        depth=52,
+        mhc_enabled=True,
+        mhc_layers="1,5,9",
+        mhc_n_streams=4,
+        mod_enabled=True,
+        mod_layers="10,11",
+        mod_capacity=0.25,
+        mod_routing="topk",
+        moda_enabled=True,
+        structure_enabled=True,
+        structure_components="core,ast",
+        max_ast_depth=32,
+        structure_bottleneck_dim=128,
+        relation_bias_enabled=True,
+    )
+    assert plan.mhc is not None
+    assert plan.mhc.layer_indices == (1, 5, 9)
+    assert plan.mhc.n_streams == 4
+    assert plan.mod is not None
+    assert plan.mod.layer_indices == (10, 11)
+    assert plan.mod.capacity == 0.25
+    assert plan.moda is not None
+    assert plan.moda.enabled is True
+    assert plan.structure is not None
+    assert plan.structure.components == "core,ast"
+    assert plan.structure.max_ast_depth == 32
+    assert plan.structure.bottleneck_dim == 128
+    assert plan.structure.relation_bias_enabled is True
+
+
+def test_feature_plan_rejects_mhc_layers_outside_depth():
+    try:
+        build_nam56r_feature_plan(
+            pattern="AE",
+            depth=4,
+            mhc_enabled=True,
+            mhc_layers="0,4",
+        )
+    except ValueError as exc:
+        assert "mHC layer indices" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for out-of-range mHC layer")
+
+
+def test_feature_plan_rejects_mod_layers_outside_depth():
+    try:
+        build_nam56r_feature_plan(
+            pattern="AE",
+            depth=4,
+            mod_enabled=True,
+            mod_layers="1,4",
+        )
+    except ValueError as exc:
+        assert "MoD layer indices" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for out-of-range MoD layer")

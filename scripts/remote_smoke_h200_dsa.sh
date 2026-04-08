@@ -42,6 +42,38 @@ if replacement not in text:
     if needle not in text:
         raise SystemExit('failed to find Megatron config insertion point for DSA rope fusion override')
     p.write_text(text.replace(needle, replacement, 1))
+
+spec_path = Path('/mnt/data/megatron-lm/megatron/core/models/gpt/experimental_attention_variant_module_specs.py')
+spec_text = spec_path.read_text()
+spec_old = (
+    '    if config.experimental_attention_variant == "gated_delta_net":\n'
+    '        return get_gated_delta_net_module_spec(config=config, backend=backend)\n'
+    '    else:\n'
+    '        raise ValueError(\n'
+    '            f"Invalid experimental attention variant: {config.experimental_attention_variant}"\n'
+    '        )\n'
+)
+spec_new = (
+    '    if config.experimental_attention_variant == "gated_delta_net":\n'
+    '        return get_gated_delta_net_module_spec(config=config, backend=backend)\n'
+    '    if config.experimental_attention_variant == "dsa":\n'
+    '        return get_dsa_module_spec_for_backend(config=config, backend=backend)\n'
+    '    raise ValueError(\n'
+    '        f"Invalid experimental attention variant: {config.experimental_attention_variant}"\n'
+    '    )\n'
+)
+if spec_new not in spec_text:
+    if spec_old not in spec_text:
+        raise SystemExit('failed to find Megatron experimental attention variant routing block for DSA patch')
+    spec_path.write_text(spec_text.replace(spec_old, spec_new, 1))
+
+layernorm_old = '            if attention.metainfo["fuse_input_layernorm"]\n'
+layernorm_new = '            if attention.metainfo.get("fuse_input_layernorm", False)\n'
+spec_text = spec_path.read_text()
+if layernorm_new not in spec_text:
+    if layernorm_old not in spec_text:
+        raise SystemExit('failed to find Megatron DSA input-layernorm metainfo access for smoke patch')
+    spec_path.write_text(spec_text.replace(layernorm_old, layernorm_new, 1))
 PY
 
 python -m torch.distributed.run --nproc_per_node=8 pretrain_gpt.py \
@@ -54,6 +86,7 @@ python -m torch.distributed.run --nproc_per_node=8 pretrain_gpt.py \
   --context-parallel-size 1 \
   --sequence-parallel \
   --use-distributed-optimizer \
+  --no-gradient-accumulation-fusion \
   --num-layers 4 \
   --hidden-size 256 \
   --ffn-hidden-size 1024 \
@@ -76,9 +109,14 @@ python -m torch.distributed.run --nproc_per_node=8 pretrain_gpt.py \
   --use-mcore-models \
   --transformer-impl transformer_engine \
   --multi-latent-attention \
+  --q-lora-rank 64 \
+  --kv-lora-rank 64 \
+  --qk-head-dim 64 \
+  --qk-pos-emb-head-dim 32 \
+  --v-head-dim 64 \
   --experimental-attention-variant dsa \
-  --dsa-indexer-n-heads 2 \
-  --dsa-indexer-head-dim 16 \
+  --dsa-indexer-n-heads 8 \
+  --dsa-indexer-head-dim 64 \
   --dsa-indexer-topk 16 \
   --dsa-indexer-loss-coeff 0.0 \
   --save "${REMOTE_CKPT_DIR}" \
