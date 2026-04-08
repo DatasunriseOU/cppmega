@@ -56,9 +56,9 @@ The first custom seams that remain plausible after grounding are:
 - author `Mamba3` wrapped into a Megatron-style hybrid stack; `cppmega.megatron.author_mamba3_spec` is the new narrow TP1/CP1, training-only seam
 - `M2RNN` / `R` block support, because `nanochat` uses it in `AEMEAEMEAEMR` and Megatron has no direct equivalent; the first local seam now exists as `cppmega.megatron.m2rnn_spec` and has passed the same 2-iteration 8xH200 smoke lane
 - DSA sparse attention, but only after exhausting the new official Megatron DSA/experimental-attention surface first
-- Engram
+- Engram; first fail-closed config/recipe port surface now exists in `cppmega.features.engram` and `cppmega.recipes.nam56r_megatron`
 - mHC
-- ngram hash enrichment
+- ngram hash enrichment; first fail-closed config/recipe port surface now exists in `cppmega.features.engram` and `cppmega.recipes.nam56r_megatron`
 - MoD / Gamma-MoD / MoDA family
 - enriched structure/data glue that is not already represented by Megatron datasets/configs
 

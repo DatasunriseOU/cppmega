@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from cppmega.features.engram import EngramConfig, NgramHashConfig
+
 
 _SUPPORTED_NEMOTRON_SYMBOLS = frozenset({"A", "M", "D", "E", "G", "R", "|"})
 _NEMOTRON_TO_MEGATRON = {
@@ -33,6 +35,8 @@ class MegatronHybridPlan:
     requires_custom_m2rnn: bool
     requires_mtp_suffix: bool
     issues: tuple[TranslationIssue, ...]
+    engram: EngramConfig | None = None
+    ngram_hash: NgramHashConfig | None = None
 
     @property
     def is_fully_native(self) -> bool:
@@ -80,6 +84,8 @@ def translate_nanochat_pattern_to_megatron(
     depth: int,
     mtp_depths: int = 0,
     force_author_mamba3: bool = True,
+    engram: EngramConfig | None = None,
+    ngram_hash: NgramHashConfig | None = None,
 ) -> MegatronHybridPlan:
     """Translate a nanochat Nemotron pattern into Megatron hybrid syntax.
 
@@ -139,6 +145,8 @@ def translate_nanochat_pattern_to_megatron(
         requires_custom_m2rnn=requires_custom_m2rnn,
         requires_mtp_suffix=requires_mtp_suffix,
         issues=tuple(issues),
+        engram=engram,
+        ngram_hash=ngram_hash,
     )
 
 
@@ -154,4 +162,59 @@ def build_nam56r_reference_plan() -> MegatronHybridPlan:
         depth=52,
         mtp_depths=1,
         force_author_mamba3=True,
+    )
+
+
+def build_nam56r_feature_plan(
+    *,
+    pattern: str,
+    depth: int,
+    mtp_depths: int = 0,
+    force_author_mamba3: bool = True,
+    engram_enabled: bool = False,
+    engram_layers: str = "",
+    engram_ngram_orders: str = "2,3,4",
+    engram_bottleneck_dim: int = 0,
+    engram_dropout: float = 0.0,
+    engram_gated: bool = False,
+    engram_gate_sqrt_compress: bool = False,
+    engram_conv_kernel: int = 0,
+    engram_conv_impl: str = "xla_safe",
+    ngram_hash_enabled: bool = False,
+    ngram_hash_orders: str = "2,3",
+    ngram_hash_heads: int = 8,
+    ngram_hash_table_size: int = 500_000,
+    ngram_hash_embed_dim: int = 16,
+    ngram_hash_offload: bool = False,
+) -> MegatronHybridPlan:
+    engram = EngramConfig.from_nanochat_args(
+        enabled=engram_enabled,
+        layers=engram_layers,
+        ngram_orders=engram_ngram_orders,
+        bottleneck_dim=engram_bottleneck_dim,
+        dropout=engram_dropout,
+        gated=engram_gated,
+        gate_sqrt_compress=engram_gate_sqrt_compress,
+        conv_kernel=engram_conv_kernel,
+        conv_impl=engram_conv_impl,
+    )
+    ngram_hash = NgramHashConfig.from_nanochat_args(
+        enabled=ngram_hash_enabled,
+        orders=ngram_hash_orders,
+        heads=ngram_hash_heads,
+        table_size=ngram_hash_table_size,
+        embed_dim=ngram_hash_embed_dim,
+        offload=ngram_hash_offload,
+    )
+    if engram is not None:
+        invalid = [index for index in engram.layer_indices if index >= depth]
+        if invalid:
+            raise ValueError(f"Engram layer indices {invalid} exceed depth={depth}")
+    return translate_nanochat_pattern_to_megatron(
+        pattern=pattern,
+        depth=depth,
+        mtp_depths=mtp_depths,
+        force_author_mamba3=force_author_mamba3,
+        engram=engram,
+        ngram_hash=ngram_hash,
     )
