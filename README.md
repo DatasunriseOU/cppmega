@@ -25,6 +25,8 @@ The project goal is narrow:
 - `scripts/remote_setup_h200.sh` clones the nanochat H200 venv into a dedicated `cppmega` env, installs Megatron there, and can optionally build author `mamba-ssm`
 - `scripts/remote_smoke_h200.sh` runs the first `pretrain_mamba.py --mock-data` smoke on H200 and can switch specs via `CPPMEGA_SPEC_MODULE` / `CPPMEGA_SPEC_NAME`
 - `scripts/remote_smoke_h200_dsa.sh` is the native-first H200 smoke for official Megatron DSA (`pretrain_gpt.py` + MLA + `--experimental-attention-variant dsa`)
+- `scripts/remote_smoke_h200_ngram_hash_poly.sh` is the canonical H200 smoke for ngram-hash enrichment through the `CppMegaGPTModel` / `CppMegaLanguageModelEmbedding` builder path
+- `scripts/remote_smoke_h200_structure_poly.sh` is the canonical H200 smoke for structure enrichment through the same Megatron-style polymorphic builder path
 
 ## Verified bring-up status
 
@@ -33,6 +35,8 @@ The project goal is narrow:
 - the current smoke uses `cppmega.megatron.mamba_local_spec.cppmega_mamba_stack_spec` instead of Megatron's default TE-bound `mamba_stack_spec`
 - the smoke launcher now isolates checkpoints/logs per spec via `CPPMEGA_RUN_ID`, so alternate smoke specs do not try to load incompatible state
 - `cppmega.megatron.author_mamba3_spec.cppmega_author_mamba3_stack_spec` now also completes the same 8-GPU H200 smoke with 2 training iterations and checkpoint saves on `h200_legacy`
+- `scripts/remote_smoke_h200_ngram_hash_poly.sh` completes a real 8-GPU H200 smoke with 2 training iterations and checkpoint saves through the `cppmega.megatron.gpt_builder.cppmega_gpt_builder` route
+- `scripts/remote_smoke_h200_structure_poly.sh` completes the same 8-GPU H200 smoke with 2 training iterations and checkpoint saves through the same builder route
 - the launcher also applies the minimal no-extension flags required by the verified H200 environment:
   - `--no-gradient-accumulation-fusion`
   - `--no-persist-layer-norm`
@@ -40,6 +44,13 @@ The project goal is narrow:
   - `--eval-interval 50000000 --eval-iters 0`
 
 These are smoke-lane compatibility settings for the current no-TE / no-Apex H200 environment. They are not a license to fork Megatron behavior in the actual ported training stack.
+
+## Canonical custom-feature route
+
+- custom feature enrichment now enters Megatron through `cppmega.megatron.gpt_builder.cppmega_gpt_builder`
+- the builder owns `CppMegaGPTModel`, which swaps only the embedding surface to `CppMegaLanguageModelEmbedding`
+- `CppMegaLanguageModelEmbedding.forward()` preserves upstream Megatron shape/scatter behavior and adds enrichment only in the local embedding layout before the upstream transpose path
+- old remote file-rewrite patch helpers are legacy-only and are no longer the primary launch or test contract
 
 ## Grounded upstream baseline
 
