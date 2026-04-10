@@ -57,6 +57,91 @@ def find_parquet_shards(input_dir: str, split: str) -> list[str]:
         raise ValueError(f"unknown split: {split}")
 
 
+def _convert_parquet_to_numpy(
+    input_dir: str,
+    output_prefix: str,
+    split: str,
+    token_column: str,
+    dtype_str: str,
+) -> None:
+    """Fallback: write Megatron-compatible .bin + .idx using raw numpy.
+
+    Format:
+    - .bin: contiguous flat array of all token IDs
+    - .idx: magic(9), version(1), dtype_code(1), num_sequences(8), num_documents(8),
+            then sizes[num_docs] as int32, then pointers[num_docs] as int64
+    """
+    import pyarrow.parquet as pq
+    import struct
+
+    dtype_map = {"uint16": np.uint16, "uint32": np.uint32, "int32": np.int32}
+    dtype_code_map = {np.uint16: 1, np.uint32: 4, np.int32: 5}  # Megatron codes
+    dtype = dtype_map[dtype_str]
+
+    shards = find_parquet_shards(input_dir, split)
+    print(f"found {len(shards)} {split} shards")
+
+    output_dir = os.path.dirname(output_prefix)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    # Collect all documents
+    all_docs: list[np.ndarray] = []
+    t0 = time.time()
+
+    for shard_idx, shard_path in enumerate(shards):
+        pf = pq.ParquetFile(shard_path)
+        for rg_idx in range(pf.metadata.num_row_groups):
+            table = pf.read_row_group(rg_idx, columns=[token_column])
+            column = table.column(token_column)
+            for row_idx in range(len(column)):
+                token_ids = column[row_idx].as_py()
+                if token_ids:
+                    all_docs.append(np.array(token_ids, dtype=dtype))
+        if (shard_idx + 1) % 10 == 0:
+            print(f"  read {shard_idx + 1}/{len(shards)} shards, {len(all_docs)} docs")
+
+    print(f"total: {len(all_docs)} documents")
+
+    # Write .bin
+    bin_path = output_prefix + ".bin"
+    total_tokens = sum(len(d) for d in all_docs)
+    flat = np.empty(total_tokens, dtype=dtype)
+    offset = 0
+    sizes = np.empty(len(all_docs), dtype=np.int32)
+    pointers = np.empty(len(all_docs), dtype=np.int64)
+
+    for i, doc in enumerate(all_docs):
+        n = len(doc)
+        flat[offset:offset + n] = doc
+        sizes[i] = n
+        pointers[i] = offset * dtype().itemsize
+        offset += n
+
+    flat.tofile(bin_path)
+
+    # Write .idx (Megatron MMapIndexedDataset format)
+    idx_path = output_prefix + ".idx"
+    MAGIC = b"MMIDIDX\x00\x00"  # 9 bytes
+    VERSION = 1
+    with open(idx_path, "wb") as f:
+        f.write(MAGIC)
+        f.write(struct.pack("<Q", VERSION))
+        f.write(struct.pack("<B", dtype_code_map.get(dtype, 1)))
+        f.write(struct.pack("<Q", len(all_docs)))  # num sequences
+        f.write(struct.pack("<Q", len(all_docs) + 1))  # num documents (includes sentinel)
+        sizes.tofile(f)
+        pointers.tofile(f)
+        # Document indices (each doc is one sequence)
+        doc_idx = np.arange(len(all_docs) + 1, dtype=np.int64)
+        doc_idx.tofile(f)
+
+    elapsed = time.time() - t0
+    bin_size = os.path.getsize(bin_path) / (1024**3)
+    print(f"\n{split}: {len(all_docs)} docs, {total_tokens:,} tokens, {bin_size:.2f} GiB in {elapsed:.1f}s")
+    print(f"output: {bin_path} + {idx_path}")
+
+
 def convert_parquet_to_megatron(
     input_dir: str,
     output_prefix: str,
@@ -69,10 +154,15 @@ def convert_parquet_to_megatron(
 
     # Import Megatron's dataset builder
     try:
-        from megatron.core.datasets.indexed_dataset import MMapIndexedDatasetBuilder
-    except ImportError:
-        print("ERROR: megatron.core not found. Run this on the H200 machine.", file=sys.stderr)
-        sys.exit(1)
+        from megatron.core.datasets.indexed_dataset import IndexedDatasetBuilder as MMapIndexedDatasetBuilder
+    except (ImportError, Exception) as e:
+        print(f"WARNING: megatron import failed ({e}), using fallback writer", file=sys.stderr)
+        MMapIndexedDatasetBuilder = None
+
+    if MMapIndexedDatasetBuilder is None:
+        # Fallback: write raw numpy binary + simple index
+        _convert_parquet_to_numpy(input_dir, output_prefix, split, token_column, dtype_str)
+        return
 
     shards = find_parquet_shards(input_dir, split)
     print(f"found {len(shards)} {split} shards in {input_dir}")
