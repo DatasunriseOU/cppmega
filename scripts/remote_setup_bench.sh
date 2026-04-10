@@ -140,6 +140,21 @@ fi
 # ---- Install flash-attn ----
 python -m pip install flash-attn --no-build-isolation 2>/dev/null || echo "WARN: flash-attn install failed"
 
+# ---- Install TileLang for Mamba3 MIMO kernels (requires apache-tvm-ffi<0.1.10) ----
+# tvm-ffi 0.1.10 introduced __slots__=() enforcement via _ObjectSlotsMeta that breaks
+# TileLang's TVMDerivedObject. TileLang's vendored TVM fork doesn't have the
+# apache/tvm PR #18938 fix. Pin tvm-ffi<0.1.10 (what tilelang main branch does).
+python -m pip install --no-deps "apache-tvm-ffi<0.1.10" 2>/dev/null || \
+  echo "WARN: apache-tvm-ffi pin failed"
+python -m pip install --no-deps tilelang 2>/dev/null || \
+  echo "WARN: tilelang install failed"
+python -c "
+import tilelang, importlib.metadata
+tvm_ffi_ver = importlib.metadata.version('apache-tvm-ffi')
+assert tvm_ffi_ver < '0.1.10', f'tvm-ffi must be <0.1.10, got {tvm_ffi_ver}'
+print(f'TileLang {tilelang.__version__} + tvm-ffi {tvm_ffi_ver} ready')
+" || echo "WARN: tilelang verification failed"
+
 # ---- Install cppmega ----
 cd "${REMOTE_ROOT}"
 mkdir -p "${REMOTE_CPPMEGA_DIR}"

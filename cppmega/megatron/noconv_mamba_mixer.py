@@ -802,3 +802,139 @@ class Mamba3NoConvMixer(Mamba3ScanMixin, NoConvMambaMixer):
             y = self.norm(y, z)
 
         return y
+
+
+class NoConvMamba3BCMixer(NoConvMambaMixer):
+    """NoConvMambaMixer with only QK-Norm + learnable B/C bias on the SSM inputs.
+
+    This is the minimal Branch-B port of the mamba3_te feature surface
+    ("QK-Norm on B/C, learnable B/C bias") onto the vanilla Mamba-2 SSD kernel
+    (``mamba_chunk_scan_combined``) with conv1d removed.  It intentionally
+    excludes trapezoidal discretisation, data-dependent A, and RoPE because
+    those either have subtle correctness issues in ``Mamba3NoConvMixer`` (see
+    docs/changelog.md) or require compensating ``x`` / ``D`` handling that
+    should land behind a dedicated kernel.
+
+    The in_proj layout is unchanged from ``NoConvMambaMixer``
+    (``[z, x, B, C, dt]``) so partition sizes match MambaMixer exactly.  This
+    allows loading checkpoints saved with vanilla Mamba-2 SSD and vice versa
+    as long as the norm/bias parameters are zero/one-initialised.
+
+    Parameters added on top of the base class:
+      - ``B_norm_weight`` ``(ngroups_local, d_state)`` -- initialised to ones
+      - ``C_norm_weight`` ``(ngroups_local, d_state)`` -- initialised to ones
+      - ``B_bias``        ``(ngroups_local, d_state)`` -- initialised to zeros
+      - ``C_bias``        ``(ngroups_local, d_state)`` -- initialised to zeros
+
+    The bias tensors initialise to **zero** (identity shift) so an untuned
+    model starts behaviourally identical to the vanilla SSD path.  The
+    norm_weight tensors initialise to **one** so ``rms_norm`` produces the
+    same scale as the input at step zero.  ``Mamba3NoConvMixer`` initialises
+    the bias to ones, which is a bug for fresh training runs (shifts every
+    B/C value at init); this class uses the correct zero init.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        with get_cuda_rng_tracker().fork():
+            self.B_norm_weight = nn.Parameter(
+                torch.ones(
+                    self.ngroups_local, self.d_state,
+                    device=torch.cuda.current_device(),
+                )
+            )
+            self.C_norm_weight = nn.Parameter(
+                torch.ones(
+                    self.ngroups_local, self.d_state,
+                    device=torch.cuda.current_device(),
+                )
+            )
+            self.B_bias = nn.Parameter(
+                torch.zeros(
+                    self.ngroups_local, self.d_state,
+                    device=torch.cuda.current_device(),
+                )
+            )
+            self.C_bias = nn.Parameter(
+                torch.zeros(
+                    self.ngroups_local, self.d_state,
+                    device=torch.cuda.current_device(),
+                )
+            )
+        for p in (
+            self.B_norm_weight, self.C_norm_weight, self.B_bias, self.C_bias,
+        ):
+            setattr(p, "tensor_model_parallel", True)
+            setattr(p, "partition_dim", 0)
+
+    def _ssm_noconv(self, zxBCdt: torch.Tensor) -> torch.Tensor:
+        """Same as base class but applies QK-Norm + B/C bias after reshape.
+
+        The hot path is:
+            split -> SiLU(x) -> reshape -> rms_norm(B,C) + bias -> scan.
+        All preprocessing is small per-layer overhead vs the scan kernel; no
+        extra kernel launches for bias add (fused with norm's output).
+        """
+        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
+
+        A = -torch.exp(self.A_log.float())
+
+        z, x, B, C, dt = torch.split(
+            zxBCdt,
+            [
+                self.d_inner_local,
+                self.d_inner_local,
+                self.ngroups_local * self.d_state,
+                self.ngroups_local * self.d_state,
+                self.nheads_local,
+            ],
+            dim=-1,
+        )
+
+        x = self.act(x)
+
+        x = rearrange(x, "b l (h p) -> b l h p", p=self.headdim).contiguous()
+        dt = dt.contiguous()
+        B = rearrange(B, "b l (g n) -> b l g n", n=self.d_state).contiguous()
+        C = rearrange(C, "b l (g n) -> b l g n", n=self.d_state).contiguous()
+        z = rearrange(z, "b l (h p) -> b l h p", p=self.headdim).contiguous()
+
+        # === Mamba-3 features: QK-Norm + learnable B/C bias ===
+        # Cast the normed-and-biased B/C back to the input dtype: the
+        # ``mamba_chunk_scan_combined`` backward kernel saves C for backward
+        # and expects it in the same dtype as x / dout (bf16 in training),
+        # otherwise the bwd Triton kernel hits ``tl.dot`` dtype mismatches.
+        # The fp32 norm_weight / fp32 bias upcast the ops to fp32 via
+        # PyTorch's type-promotion rules; we downcast explicitly here.
+        bc_dtype = B.dtype
+        B = (F.rms_norm(B, (self.d_state,)) * self.B_norm_weight + self.B_bias).to(bc_dtype)
+        C = (F.rms_norm(C, (self.d_state,)) * self.C_norm_weight + self.C_bias).to(bc_dtype)
+
+        D = (
+            rearrange(self.D.float(), "(h p) -> h p", p=self.headdim)
+            if self.D_has_hdim
+            else self.D
+        )
+
+        y = mamba_chunk_scan_combined(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            self.chunk_size,
+            D=D,
+            z=z if not self.rmsnorm else None,
+            dt_bias=self.dt_bias.float(),
+            dt_softplus=True,
+            return_final_states=False,
+        )
+
+        y = rearrange(y, "b l h p -> l b (h p)").contiguous()
+
+        if self.rmsnorm:
+            z = rearrange(z, "b l h p -> l b (h p)").contiguous()
+            y = self.norm(y, z)
+
+        return y

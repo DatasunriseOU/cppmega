@@ -1,5 +1,328 @@
 # NAM56R NeMo Migration Changelog
 
+## 2026-04-10 (later): Branch B — NoConvMamba3BCMixer wired for SSD path
+
+Following the GB10 autotune exploration hitting a hard hardware wall (see below
+for shared-memory blocker on `mamba_mimo_bwd_bwd`), work pivoted back to
+Branch B from the Test-loop task: "port Mamba3 features onto the vanilla
+Mamba-2 SSD kernel" to get the QK-Norm/B-bias feature surface at
+`mamba_chunk_scan_combined` speed.
+
+### New mixer: `NoConvMamba3BCMixer`
+
+Added to `cppmega/megatron/noconv_mamba_mixer.py`.  Subclasses
+`NoConvMambaMixer` and overrides `_ssm_noconv` to apply:
+
+  - `F.rms_norm(B) * B_norm_weight + B_bias`
+  - `F.rms_norm(C) * C_norm_weight + C_bias`
+
+before calling `mamba_chunk_scan_combined`.  That is the entire Mamba3
+feature surface for this class — no trapezoidal / dd_A / RoPE — which
+intentionally matches the `mamba3_te` recipe's "QK-Norm, B/C bias" column.
+
+**Initialisation correction.**  The existing `Mamba3NoConvMixer` class
+initialises `B_bias` / `C_bias` to **ones** (line 742-747 in the pre-change
+file), which shifts every SSM input by +1 before training has moved a single
+step.  `NoConvMamba3BCMixer` initialises them to **zeros** so an untuned
+model starts behaviourally identical to vanilla Mamba-2 SSD.  This is
+important for loading vanilla checkpoints into the new class and vice versa.
+
+**in_proj layout.**  Left unchanged from the base `NoConvMambaMixer`
+(`[z, x, B, C, dt]`, same widths as Megatron's `MambaMixer`), so partition
+sizes match vanilla SSD exactly — unlike `Mamba3NoConvMixer` which adds
+`dd_A`, `trap`, `angles` components and is not checkpoint-compatible.
+
+### `Mamba3NoConvMixer` audit: math bugs found
+
+While designing `NoConvMamba3BCMixer` I audited the full `Mamba3NoConvMixer`
+and found the following issues that would break any H200 benchmark.  These
+are **not fixed** in this change (the class is not used anywhere) but are
+documented here so a future pass can correct them:
+
+1. **Data-dependent A in `_mamba3_scan` doesn't scale `x`.**  The trick is
+   `A_kernel = -1`, `dt_kernel = -A_dd*DT` (positive), which gives the
+   correct `decay = exp(A_dd*DT)` but leaves the input term as
+   `dt_kernel * B * x = |A_dd|*DT * B * x` — off by a factor of `|A_dd|`.
+   The working version in `cppmega/megatron/mamba3_mixer.py::_apply_data_dep_a`
+   compensates by passing `x_scan = x / |A_dd|` and `D=None` (then adds
+   `D*x` manually with original `x`); `Mamba3NoConvMixer._mamba3_scan`
+   passes the un-scaled `x` and `D=D`, so the input term is wrong.
+
+2. **Trapezoidal scaling in `_preprocess_bc_mamba3` is off by a factor of `dt`.**
+   The code computes `scale = dt_scale` (per head) and applies
+   `B = B * scale_g`, but `mamba_chunk_scan_combined` then computes
+   `input = dt_kernel * B_new * x = dt_kernel * (B * dt_scale) * x`.  To get
+   the intended trapezoidal `input = dt_scale * B * x` the scale must be
+   `dt_scale / dt_kernel` (per position), not `dt_scale`.
+
+3. **B_bias / C_bias init = ones** (note above) — same file, lines ~742-747.
+
+The docstring "Complex RoPE: not supported (would need kernel modification)"
+in `Path Forward for Mamba3 at Production Speed` below is **stale**: the
+code in `_apply_rope_on_state_dim` and `_preprocess_bc_mamba3` does apply
+RoPE to B and C along the state dimension.  Whether the math is faithful to
+the in-kernel Author-Mamba3 complex RoPE is a separate question that
+requires end-to-end validation.
+
+### Wiring: `nam56r_noconv_spec.py`
+
+Mirrors `nam56r_te_spec.py` (which wraps Author Mamba3) but substitutes
+`NoConvMamba3BCMixer` for M-layers.  R-layers still go to
+`CppMegaM2RNNMixer`.  All non-Mamba layers (GDN, attention, MLP, MoE, MTP)
+use the upstream TE-fused submodules from `mamba_stack_spec.submodules`
+unchanged, so TE CUDA graph fusion, TE norms and TE MoE all stay in the
+hot path.
+
+The selector class `CppMegaNoConvSelectiveMambaMixer` has the same call
+signature as `CppMegaSelectiveMambaMixerTE` and accepts the `r_layer_indices`
+param at build time, so the NAM56R R-layer positions (12, 24, 36, 48 by
+default) get the M²RNN mixer exactly as in `nam56r_full_spec`.
+
+### Launch script: `remote_train_h200_nam56r_noconv.sh`
+
+Near-identical copy of `remote_train_h200_nam56r_full.sh` with a single
+diff: `--spec cppmega.megatron.nam56r_noconv_spec build_cppmega_nam56r_noconv_stack_spec`.
+All other args (hidden_size, PP, BF16, MoE layout, MTP mode, MLA enable,
+feature plan) are unchanged so the benchmark is directly comparable to the
+`nam56r_full` baseline when run against the same cluster.
+
+**Status:** blocked on H200 availability.  `h200_legacy` is
+TERMINATED (preemptible, LOCATION_3 shows STOCKOUT for `a3-ultragpu-8g`),
+so the noconv recipe has not been benchmarked yet.  The two running H200
+instances (`h200_1` in LOCATION_1, `h200_1`
+in LOCATION_2) do not have the cppmega stack installed.
+
+### Tests
+
+`tests/test_nam56r_noconv_spec.py`: 16 tests (13 source-level + 3 importability
+gated on megatron/mamba_ssm).  Verifies:
+
+  - `NoConvMamba3BCMixer` applies QK-Norm + B/C bias inside `_ssm_noconv`
+  - Uses `mamba_chunk_scan_combined` (not `mamba3_siso_combined`)
+  - No conv1d, no trap, no dd_A, no angles in the class body
+  - B_bias / C_bias initialised to zeros; norm_weight to ones
+  - The spec wires `CppMegaNoConvSelectiveMambaMixer` and the upstream TE
+    substrate, does not import Author Mamba3
+  - Spec builder has the module-level alias required for `--spec MODULE NAME`
+
+Tests use an AST helper (`_extract_class_body_code`) that strips class and
+method docstrings so the keyword scans aren't fooled by the prose in
+docstrings.
+
+Full local suite passes: 230 tests (9 skipped / megatron-gated).
+
+### Isolated layer benchmark on H200 (h200_1 in LOCATION_1)
+
+Ran NoConvMambaMixer (baseline) vs NoConvMamba3BCMixer (Mamba3 B/C features)
+head-to-head at NAM56R shapes: hidden=3584, nheads=112, ngroups=8, d_state=64,
+head_dim=64, seq=4096, batch=2, bf16, single layer, fwd+bwd per iter, warmup=3,
+timed=10.  Single H200 GPU, no TP/PP/CP.
+
+| Config | ms/iter fwd+bwd | Params | Overhead |
+|---|---|---|---|
+| `NoConvMambaMixer` (baseline) | 9.4-9.6 | 429,080 | — |
+| `NoConvMamba3BCMixer` (QK-Norm + B/C bias) | 9.95-9.98 | 429,336 (+256) | +3.8% to +6.1% |
+
+So the Python preprocessing (2 rms_norms + 2 elementwise multiplies + 2
+adds + dtype downcast) costs ~3.8-6.1% on top of the scan kernel.  At full
+NAM56R scale this should extrapolate to roughly the same +5% that
+`CppMegaMamba3Mixer` (the conv1d-keeping variant) measured earlier:
+784 ms / 167k tok/sec vs 748 ms / 175k tok/sec baseline.
+
+### Bug fix: dtype promotion downcast
+
+First isolated-layer run on H200 hit a Triton backward error:
+``Both operands must be same dtype. Got bf16 and fp32`` in
+``mamba_chunk_scan_combined``'s `tl.dot(dout, c)`.  Root cause: the
+norm_weight / B_bias / C_bias parameters are fp32 (PyTorch default), so
+``F.rms_norm(B) * self.B_norm_weight + self.B_bias`` type-promotes the
+bf16 input B to fp32 via standard PyTorch promotion rules.  The forward
+kernel tolerated fp32 C but saved it for backward in the same dtype,
+which then mismatched the bf16 dout.
+
+Fix: explicit `.to(bc_dtype)` cast after the preprocessing chain so B and
+C go into the scan kernel in the same dtype as x.  The cast is in
+`NoConvMamba3BCMixer._ssm_noconv` right after the norm+bias expression.
+This was the crucial diff between "crashes on backward" and "runs
+cleanly at +3.8% overhead."  Note: `CppMegaMamba3Mixer` uses the same
+fp32 bias pattern but routes through the fused kernel which takes fp32
+B/C internally; the noconv direct-call path doesn't have that escape
+hatch.
+
+### Why this matters
+
+`NoConvMamba3BCMixer` gives the same ~5% overhead as
+`CppMegaMamba3Mixer` but via a cleaner code path (direct kernel call,
+no causal_conv1d dependency) and uses the upstream vanilla
+``mamba_chunk_scan_combined`` without any Megatron-internal subclassing.
+That makes it a better starting point for further Mamba3 feature ports:
+any new feature (RoPE, data-dep A, trapezoidal) can be added as another
+preprocessing step with the same type-safety pattern, without touching
+the conv1d integration path.  The ~5% overhead is the same cost we
+already accept for `CppMegaMamba3Mixer`, so adopting this path costs
+nothing in perf — the two are equivalent — but gives us a cleaner
+foundation.
+
+The real gap from 167k to 200k+ tok/sec is NOT about mixer choice; it
+comes from FP8 GEMMs in attention/MLP/MoE + larger MBS + CUDA graph
+scope tuning.  Branch B ended here as a correct-and-fast wire-up; the
+next optimisation lever is the FP8/CUDA-graph axis from Branch A.
+
+### GB10 autotune detour
+
+Spent a session on GB10 (Grace Blackwell consumer, sm_121) trying to enable
+the upstream `@autotune` block in `mamba3_mimo_fwd.py` / `mamba3_mimo_bwd.py`
+(`state-spaces/mamba`) to measure the config-sweep speedup.  Standalone
+autotune verified that tuned configs give ~19% speedup over the hardcoded
+`{threads: 128, num_stages: 0}` default on the forward kernel.
+
+**Hardware blocker on `mamba_mimo_bwd_bwd`.**  The gradient kernel requires
+140-144 KB of dynamic shared memory per block at the smoke-test dimensions
+(B=2 S=256 H=8 G=1 N=64 P=64 R=4 chunk_size=16).  GB10 reports
+`shared_memory_per_block_optin = 101376` bytes (≈99 KB) and
+`shared_memory_per_multiprocessor = 102400` bytes (100 KB), so both
+`{threads: 128}` and `{threads: 256}` configs fail at bench time with
+`tvm.error.InternalError: Failed to set the allowed dynamic shared memory
+size to 140960`.  The forward and the `bwd_fwd` (activation recompute)
+kernels fit in GB10's budget and autotune successfully; only the true
+`bwd_bwd` exceeds the limit.
+
+See `memory/reference_gb10_bwd_bwd_blocker.md` for the full reproduction
+and device properties dump.  This is not a blocker for H200 (sm_90 has
+228 KB per SM), only for any eventual GB10 / consumer Blackwell deployment.
+
+---
+
+## 2026-04-10: MIMO R=4 Working on Full NAM56R + CUDA Graphs
+
+Full NAM56R with Author Mamba3 MIMO R=4 kernel (TileLang), CUDA graphs captured via
+`--cuda-graph-impl local`. All 7/7 Mamba3 features active: trapezoidal discretization,
+data-dependent A, complex RoPE, QK-Norm, B/C bias, no-conv, MIMO rank-4.
+
+### Final benchmark table (8xH200, BF16, MBS=4, GBS=32)
+
+| Config | Mamba3 features | ms/iter | tok/sec | vs Baseline |
+|--------|-----------------|---------|---------|-------------|
+| Baseline (Mamba-2 SSD) | 0/7 | 748 | 175k | — |
+| CppMegaMamba3Mixer (native SSD) | 2/7 | 784 | 167k | +4.9% |
+| Author SISO + local graphs | 6/7 (no MIMO) | 796 | 165k | +6.4% |
+| **Author MIMO R=4 + local graphs** | **7/7** | **1267** | **103k** | **+69%** |
+
+### MIMO overhead breakdown (+59% over SISO) — nsys measured
+
+Profiled with `nsys profile --trace=cuda,nvtx` on 8-layer isolated iter-4 window.
+The +12.3 ms kernel-time delta (MIMO vs SISO) breaks down as:
+
+| Category | SISO ms | MIMO ms | Delta |
+|---|---|---|---|
+| **mamba_custom** (Triton/TileLang scan+proj) | 2.77 | **12.99** | **+10.22** |
+| elementwise (pointwise/copy/activation) | 11.62 | 12.31 | +0.69 |
+| gemm_cublaslt (linear proj + FFN) | 6.55 | 6.59 | +0.04 |
+| attn_flash (cuDNN SDPA) | 2.30 | 2.30 | 0 |
+| reduce | 1.78 | 2.48 | +0.70 |
+| optimizer (Adam) | 0.91 | 0.92 | 0 |
+| layernorm | 0.38 | 0.73 | +0.35 |
+| Other | 1.01 | 1.04 | 0 |
+
+**83% of the overhead is in the Author Mamba kernels themselves** — everything else flat.
+GEMM, attention, elementwise ops are unchanged.
+
+Author Mamba kernels breakdown per iter (4 M-layers):
+
+| Kernel | SISO ms | MIMO ms |
+|---|---|---|
+| mamba3_siso_fwd_kernel | 0.907 | — |
+| mamba3_siso_bwd_kernel_dqkv | 0.847 | — |
+| mamba3_siso_bwd_kernel_rotary_bias_angles | 0.446 | — |
+| mamba3_siso_bwd_kernel_dzdo | 0.178 | — |
+| angle_dt_bwd_kernel | 0.205 | — |
+| **SISO subtotal** | **2.77** | — |
+| mamba_mimo_fwd_kernel | — | 2.330 |
+| mamba_mimo_bwd_fwd_kernel (recompute in bwd!) | — | 4.741 |
+| mamba_mimo_bwd_bwd_kernel | — | 5.752 |
+| helpers (bwd_dadt/segsum/dtrap/dacs) | — | 0.314 |
+| **MIMO subtotal** | — | **13.14** |
+
+**Key insight: MIMO bwd triggers RECOMPUTE of fwd** (`mamba_mimo_bwd_fwd_kernel_kernel = 4.74ms`)
+This is activation recomputation inside the Author TileLang backward path — doubles the
+scan cost on backward. Combined with 2.5x slower fwd (2.33 vs 0.91 ms) the total Mamba
+kernel time grows from 2.77 → 13.14 ms = **+10.37 ms** ≈ the full +12.3 ms kernel delta.
+
+Earlier speculation about "O(R^2), chunk_size=16, R copies of B/C" was partially correct
+(R^2 explains the fwd 2.5x slowdown) but missed the dominant factor: **bwd recompute
+of the whole fwd scan** is the biggest single cost.
+
+### MIMO kernel requirements
+- TileLang 0.1.8 + apache-tvm-ffi 0.1.9 (pin <0.1.10)
+- `ngroups` must be 1 or nheads (not arbitrary)
+- All bias/projection tensors must be fp32 (B_bias, C_bias, mimo_x/z/o, D, DT, ADT)
+- chunk_size for MIMO: `min(original, 64 // rank)`
+
+### Training stability
+Loss converges cleanly: 11.81 → 8.17 over 15 iterations, no NaN/skipped iterations,
+CUDA graph replay active from iter 3.
+
+---
+
+## 2026-04-10: cuTile Python H200 Compatibility Matrix (tested)
+
+NVIDIA cuTile Python (`cuda-tile` 1.2.0, CUDA 13.2) cannot target H200 (sm_90a).
+Exhaustive test on h200_1:
+
+| tileiras target | Compile | H200 runtime |
+|-----------------|---------|--------------|
+| sm_80, sm_86, sm_87, sm_88, sm_89 (Ampere/Ada) | OK | no_kernel_image |
+| **sm_90 (Hopper)** | **REJECTED: "Cannot find option named 'sm_90'"** | n/a |
+| sm_100, sm_103, sm_110, sm_120, sm_121 (Blackwell) | OK | no_kernel_image |
+
+- All Ampere/Ada/Blackwell cubins load-fail on H200 (ISA binary incompatibility)
+- sm_90 is explicitly missing from tileiras compiler 13.2
+- NVIDIA README: "tileiras compiler (version 13.2) only supports Blackwell GPU
+  and Ampere/Ada GPU. Hopper GPU will be supported in the coming versions."
+- Sources:
+  - https://github.com/NVIDIA/cutile-python/blob/main/README.md
+  - https://docs.nvidia.com/cuda/cutile-python/quickstart.html
+  - https://developer.nvidia.com/blog/cuda-13-2-introduces-enhanced-cuda-tile-support-and-new-python-features/
+
+**For H200 we stay on TileLang** (`pip install tilelang apache-tvm-ffi<0.1.10`).
+cuTile Python port is deferred until NVIDIA adds sm_90 to tileiras.
+
+---
+
+## 2026-04-10: TileLang MIMO Unblocked (apache-tvm-ffi<0.1.10)
+
+### Root Cause: tvm-ffi 0.1.10 Regression
+
+TileLang 0.1.8 crashes on import when `apache-tvm-ffi==0.1.10` is installed:
+```
+AttributeError: '_NestedLoopCheckVisitor' object has no attribute '_inst'
+```
+
+**Chain:**
+1. `apache-tvm-ffi 0.1.10` (2026-04-07) introduced [PR #480](https://github.com/apache/tvm-ffi/pull/480)
+   which enforces `__slots__=()` on all `Object` subclasses via `_ObjectSlotsMeta`.
+2. `apache/tvm` fixed this in [PR #18938](https://github.com/apache/tvm/pull/18938) (2026-03-28)
+   by adding `__slots__ = ("__dict__", "__weakref__")` to `TVMDerivedObject`.
+3. TileLang's vendored TVM fork is pinned to commit `882a774` which does NOT have the fix.
+4. TileLang main branch pinned [apache-tvm-ffi<0.1.10](https://github.com/tile-ai/tilelang/pull/2020)
+   on 2026-04-08 as a workaround.
+
+### Fix
+
+Pin `apache-tvm-ffi<0.1.10` in setup. Updated `scripts/remote_setup_bench.sh` to install
+TileLang with `apache-tvm-ffi<0.1.10` for MIMO kernel support.
+
+### Stack (verified working on bench machine)
+- PyTorch 2.12.0.dev20260409+cu132
+- CUDA 13.2 (driver 595.58.03 — updated from 580.126.09)
+- Transformer Engine 2.13.0
+- mamba-ssm 2.3.1 + PR #909 patch applied
+- flash-attn 2.8.3
+- TileLang 0.1.8 + apache-tvm-ffi 0.1.9
+- Megatron-LM e40feed4a
+
+---
+
 ## 2026-04-10: Mamba3-Native Mixer (CppMegaMamba3Mixer v2)
 
 ### New Approach: Inject Mamba3 into Native SSD Kernel
