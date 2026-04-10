@@ -390,10 +390,10 @@ class CppMegaMamba3TE(MegatronModule):
         )
         trap = rearrange(trap, "b l h -> b h l")
 
-        # --- Data-dependent A and dt ---
+        # --- Data-dependent A and dt (fp32 for Author kernel contract) ---
         _A = -F.softplus(dd_A.to(torch.float32))
         _A = torch.clamp(_A, max=-self.A_floor)
-        DT = F.softplus(dd_dt + self.dt_bias)
+        DT = F.softplus((dd_dt + self.dt_bias).to(torch.float32))
         ADT = _A * DT
         DT = rearrange(DT, "b l n -> b n l")
         ADT = rearrange(ADT, "b l n -> b n l")
@@ -415,6 +415,11 @@ class CppMegaMamba3TE(MegatronModule):
         # --- SSM scan ---
         if self.is_mimo:
             angles = angle_dt(angles, DT.transpose(-1, -2))
+            # MIMO kernel: chunk_size*R must be <= 64 for shared memory.
+            # B_bias/C_bias must be fp32 per kernel dtype contract.
+            mimo_chunk = min(self.chunk_size, max(1, 64 // self.mimo_rank))
+            # Author mamba3_mimo_combined kernel requires fp32 for all
+            # learnable bias/projection tensors (D, B_bias, C_bias, mimo_*)
             y = mamba3_mimo_combined(
                 Q=C,
                 K=B,
@@ -422,15 +427,15 @@ class CppMegaMamba3TE(MegatronModule):
                 ADT=ADT,
                 DT=DT,
                 Trap=trap,
-                Q_bias=self.C_bias,
-                K_bias=self.B_bias,
-                MIMO_V=self.mimo_x,
-                MIMO_Z=self.mimo_z,
-                MIMO_Out=self.mimo_o if not self.is_outproj_norm else None,
+                Q_bias=self.C_bias.float(),
+                K_bias=self.B_bias.float(),
+                MIMO_V=self.mimo_x.float(),
+                MIMO_Z=self.mimo_z.float(),
+                MIMO_Out=self.mimo_o.float() if not self.is_outproj_norm else None,
                 Angles=angles,
-                D=self.D,
+                D=self.D.float(),
                 Z=z if not self.is_outproj_norm else None,
-                chunk_size=self.chunk_size,
+                chunk_size=mimo_chunk,
                 rotary_dim_divisor=self.rotary_dim_divisor,
                 dtype=x.dtype,
                 return_state=False,
