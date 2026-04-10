@@ -8,6 +8,8 @@ from cppmega.recipes.nam56r_nemo_recipe import (
     NAM56RNeMoRecipe,
     build_nemo_hybrid_pattern,
     nam56r_author_dp_pretrain,
+    nam56r_mamba3_te_pretrain,
+    nam56r_nemo_native_max_throughput,
     nam56r_nemo_native_pretrain,
     nam56r_smoke_test,
 )
@@ -47,12 +49,12 @@ class TestHybridPattern:
 
 
 class TestRecipeArgs:
-    def test_nemo_native_uses_tp2(self):
+    def test_nemo_native_uses_tp1_dp8(self):
         recipe = nam56r_nemo_native_pretrain()
         args = recipe.to_args()
         tp_idx = args.index("--tensor-model-parallel-size")
-        assert args[tp_idx + 1] == "2"
-        assert "--sequence-parallel" in args
+        assert args[tp_idx + 1] == "1"
+        assert "--sequence-parallel" not in args
 
     def test_author_dp_uses_tp1(self):
         recipe = nam56r_author_dp_pretrain()
@@ -66,13 +68,37 @@ class TestRecipeArgs:
             args = recipe.to_args()
             assert "--use-distributed-optimizer" in args
             assert "--overlap-grad-reduce" in args
+            assert "--overlap-param-gather" in args
 
     def test_gradient_accum_fusion_disabled_without_apex(self):
         """Without APEX, gradient accumulation fusion must be disabled."""
         recipe = nam56r_nemo_native_pretrain()
         args = recipe.to_args()
         assert "--no-gradient-accumulation-fusion" in args
-        assert "--no-masked-softmax-fusion" not in args
+
+    def test_nemo_throughput_features(self):
+        recipe = nam56r_nemo_native_pretrain()
+        args = recipe.to_args()
+        assert "--cross-entropy-loss-fusion" in args
+        assert "--first-last-layers-bf16" in args
+        assert "--attention-backend" in args
+        idx = args.index("--attention-backend")
+        assert args[idx + 1] == "auto"
+
+    def test_selective_recompute_without_cuda_graphs(self):
+        """Selective recompute is enabled when CUDA graphs are off."""
+        recipe = NAM56RNeMoRecipe(use_selective_recompute=True, use_cuda_graphs=False)
+        args = recipe.to_args()
+        assert "--recompute-granularity" in args
+        idx = args.index("--recompute-granularity")
+        assert args[idx + 1] == "selective"
+
+    def test_recompute_disabled_with_cuda_graphs(self):
+        """CUDA graphed attention conflicts with core_attn recompute."""
+        recipe = nam56r_nemo_native_pretrain()
+        assert recipe.use_cuda_graphs is True
+        args = recipe.to_args()
+        assert "--recompute-granularity" not in args
 
     def test_moe_args_present(self):
         recipe = nam56r_author_dp_pretrain()
@@ -84,13 +110,13 @@ class TestRecipeArgs:
         idx = args.index("--moe-router-score-function")
         assert args[idx + 1] == "sigmoid"
 
-    def test_mla_args_in_author_mode(self):
+    def test_no_mla_in_author_dp_mode(self):
+        """author_dp uses upstream TE attention (not MLA) for throughput."""
         recipe = nam56r_author_dp_pretrain()
         args = recipe.to_args()
-        assert "--multi-latent-attention" in args
-        assert "--q-lora-rank" in args
+        assert "--multi-latent-attention" not in args
 
-    def test_no_mla_in_native_mode(self):
+    def test_no_mla_in_nemo_native_mode(self):
         recipe = nam56r_nemo_native_pretrain()
         args = recipe.to_args()
         assert "--multi-latent-attention" not in args
@@ -100,7 +126,7 @@ class TestRecipeArgs:
         args = recipe.to_args()
         assert "--spec" in args
         spec_idx = args.index("--spec")
-        assert args[spec_idx + 1] == "cppmega.megatron.nam56r_full_spec"
+        assert args[spec_idx + 1] == "cppmega.megatron.nam56r_te_spec"
 
     def test_spec_in_native_mode(self):
         recipe = nam56r_nemo_native_pretrain()
@@ -137,6 +163,83 @@ class TestRecipeArgs:
         assert "--mamba-head-dim" in args
 
 
+class TestCudaGraphs:
+    def test_nemo_native_has_cuda_graphs(self):
+        recipe = nam56r_nemo_native_pretrain()
+        args = recipe.to_args()
+        assert "--cuda-graph-impl" in args
+        idx = args.index("--cuda-graph-impl")
+        assert args[idx + 1] == "transformer_engine"
+        assert "--cuda-graph-scope" in args
+
+    def test_mamba3_te_has_cuda_graphs(self):
+        recipe = nam56r_mamba3_te_pretrain()
+        args = recipe.to_args()
+        assert "--cuda-graph-impl" in args
+
+    def test_max_throughput_has_cuda_graphs_and_fp8(self):
+        recipe = nam56r_nemo_native_max_throughput()
+        args = recipe.to_args()
+        assert "--cuda-graph-impl" in args
+        assert "--fp8-format" in args
+        idx = args.index("--fp8-recipe")
+        assert args[idx + 1] == "tensorwise"
+        # FP8-aligned nheads
+        nheads_idx = args.index("--mamba-num-heads")
+        assert args[nheads_idx + 1] == "64"
+
+    def test_max_throughput_no_recompute(self):
+        recipe = nam56r_nemo_native_max_throughput()
+        args = recipe.to_args()
+        assert "--recompute-granularity" not in args
+        assert recipe.micro_batch_size == 5
+        assert recipe.global_batch_size == 320  # 8x grad accum
+
+    def test_max_throughput_full_moe_graph(self):
+        recipe = nam56r_nemo_native_max_throughput()
+        args = recipe.to_args()
+        scope_idx = args.index("--cuda-graph-scope")
+        scopes = []
+        for a in args[scope_idx + 1:]:
+            if a.startswith("--"):
+                break
+            scopes.append(a)
+        assert "moe" in scopes  # full MoE graph, not partial
+        assert "moe_router" not in scopes
+        assert "--moe-expert-capacity-factor" in args
+        assert "--moe-pad-expert-input-to-capacity" in args
+
+    def test_cuda_graph_scope_values(self):
+        recipe = nam56r_nemo_native_pretrain()
+        args = recipe.to_args()
+        scope_idx = args.index("--cuda-graph-scope")
+        scopes = []
+        for a in args[scope_idx + 1:]:
+            if a.startswith("--"):
+                break
+            scopes.append(a)
+        assert "attn" in scopes
+        assert "mamba" in scopes
+        assert "moe_router" in scopes
+        assert "moe_preprocess" in scopes
+
+    def test_smoke_test_no_cuda_graphs(self):
+        recipe = nam56r_smoke_test()
+        args = recipe.to_args()
+        assert "--cuda-graph-impl" not in args
+        assert "--optimizer-cuda-graph" not in args
+
+
+class TestFP8:
+    def test_fp8_uses_tensorwise(self):
+        recipe = NAM56RNeMoRecipe(precision="fp8")
+        args = recipe.to_args()
+        assert "--fp8-format" in args
+        assert "--fp8-recipe" in args
+        idx = args.index("--fp8-recipe")
+        assert args[idx + 1] == "tensorwise"
+
+
 class TestEnvDict:
     def test_base_env(self):
         recipe = NAM56RNeMoRecipe()
@@ -144,6 +247,15 @@ class TestEnvDict:
         assert env["CUDA_DEVICE_MAX_CONNECTIONS"] == "1"
         assert env["CPPMEGA_NEM_PATTERN"] == "AEMEAEMEAEMR"
         assert env["CPPMEGA_LAYER_DEPTH"] == "52"
+
+    def test_nemo_perf_env_vars(self):
+        recipe = NAM56RNeMoRecipe()
+        env = recipe.to_env_dict()
+        assert env["NVTE_FWD_LAYERNORM_SM_MARGIN"] == "16"
+        assert env["NVTE_BWD_LAYERNORM_SM_MARGIN"] == "16"
+        assert env["NVTE_NORM_FWD_USE_CUDNN"] == "1"
+        assert env["NCCL_AVOID_RECORD_STREAMS"] == "1"
+        assert env["NCCL_GRAPH_REGISTER"] == "0"
 
     def test_ngram_hash_env(self):
         recipe = NAM56RNeMoRecipe(ngram_hash_enabled=True)

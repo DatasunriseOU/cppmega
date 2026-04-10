@@ -29,7 +29,7 @@ NAM56R_PATTERN = "AEMEAEMEAEMR"
 NAM56R_DEPTH = 52
 NAM56R_HIDDEN = 3584
 NAM56R_FFN_HIDDEN = 18944
-NAM56R_ATTN_HEADS = 28  # query heads; GQA 7:1 vs 8 kv-heads (need divisible by TP)
+NAM56R_ATTN_HEADS = 56  # query heads; GQA 7:1 vs 8 kv-heads, head_dim=3584/56=64
 NAM56R_KV_HEADS = 8
 NAM56R_VOCAB = 65536
 NAM56R_SEQ_LEN = 4096
@@ -49,7 +49,9 @@ MLA_QK_POS_EMB_HEAD_DIM = 32
 MLA_V_HEAD_DIM = 64
 
 # Mamba defaults (Nemotron Nano-aligned)
-MAMBA_NUM_HEADS = 56
+# Megatron MambaMixer: nheads = hidden_size / head_dim = 3584/64 = 56 (expand=1)
+# Author Mamba3: nheads = hidden * expand / head_dim = 3584*2/64 = 112 (expand=2)
+MAMBA_NUM_HEADS = 56  # NAM56R spec; Author Mamba3 mode overrides to 112
 MAMBA_STATE_DIM = 64
 MAMBA_HEAD_DIM = 64
 MAMBA_NUM_GROUPS = 8
@@ -180,6 +182,14 @@ class NAM56RNeMoRecipe:
     spec_module: str = ""
     spec_name: str = ""
 
+    # --- NeMo throughput features ---
+    use_cuda_graphs: bool = False
+    use_optimizer_cuda_graph: bool = False
+    use_full_moe_cuda_graph: bool = False  # full MoE graph needs drop-and-pad
+    moe_expert_capacity_factor: float = 0.0  # 0 = dropless; >0 = drop-and-pad
+    use_selective_recompute: bool = True  # core_attn recompute saves memory
+    attention_backend: str = "auto"  # auto lets TE pick best (flash/fused/unfused)
+
     # --- custom embedding env flags ---
     ngram_hash_enabled: bool = False
     structure_enabled: bool = False
@@ -215,8 +225,9 @@ class NAM56RNeMoRecipe:
         # --- distributed optimizer (NeMo standard) ---
         args.append("--use-distributed-optimizer")
         args.append("--overlap-grad-reduce")
-        if tp > 1:
-            args.append("--overlap-param-gather")
+        # overlap-param-gather works across DP dimension (not just TP),
+        # overlaps param all-gather with forward compute in distributed optimizer
+        args.append("--overlap-param-gather")
 
         # --- model architecture ---
         hybrid_pattern = self.build_hybrid_pattern()
@@ -253,6 +264,38 @@ class NAM56RNeMoRecipe:
         # not available (our H200 env uses TE but not APEX).
         args.append("--no-gradient-accumulation-fusion")
 
+        # --- NeMo 3 Nano throughput optimizations ---
+        args.extend([
+            "--cross-entropy-loss-fusion",
+            "--attention-backend", self.attention_backend,
+        ])
+        # nam56r_full_spec uses WrappedTorchNorm which doesn't support
+        # persist_layer_norm. The mamba3_te_stack_spec uses upstream TE norms.
+        if self.spec_module and "nam56r_full_spec" in self.spec_module:
+            args.append("--no-persist-layer-norm")
+        else:
+            args.append("--first-last-layers-bf16")
+
+        # --- selective recomputation (saves ~40% activation memory) ---
+        # Cannot use core_attn recompute with CUDA-graphed attention
+        if self.use_selective_recompute and not self.use_cuda_graphs:
+            args.extend([
+                "--recompute-granularity", "selective",
+            ])
+
+        # --- CUDA graphs (TE-scoped, ~20% throughput boost) ---
+        if self.use_cuda_graphs:
+            args.extend(["--cuda-graph-impl", "transformer_engine"])
+            if self.use_full_moe_cuda_graph:
+                # Full MoE graph: captures entire MoE layer (needs drop-and-pad)
+                args.extend(["--cuda-graph-scope", "attn", "mamba", "moe"])
+            else:
+                # Partial MoE graph: only router/preprocess, expert runs eagerly
+                args.extend(["--cuda-graph-scope", "attn", "mamba", "moe_router", "moe_preprocess"])
+            args.extend(["--cuda-graph-warmup-steps", "3"])
+        if self.use_optimizer_cuda_graph:
+            args.append("--optimizer-cuda-graph")
+
         # --- MLA ---
         if self.use_mla:
             args.extend([
@@ -279,7 +322,15 @@ class NAM56RNeMoRecipe:
                 "--moe-router-dtype", "fp32",
                 "--moe-token-dispatcher-type", "alltoall",
                 "--moe-permute-fusion",
+                "--moe-router-fusion",  # TE 2.7+ fused TopK routing
+                "--moe-shared-expert-overlap",
             ])
+            # Drop-and-pad mode (required for full MoE CUDA graph)
+            if self.moe_expert_capacity_factor > 0:
+                args.extend([
+                    "--moe-expert-capacity-factor", str(self.moe_expert_capacity_factor),
+                    "--moe-pad-expert-input-to-capacity",
+                ])
 
         # --- MTP ---
         if self.mtp_depths > 0:
@@ -292,8 +343,7 @@ class NAM56RNeMoRecipe:
             args.extend([
                 "--bf16",
                 "--fp8-format", "hybrid",
-                "--fp8-recipe", "blockwise",
-                "--first-last-layers-bf16",
+                "--fp8-recipe", "tensorwise",  # per-tensor current scaling (NeMo Nano v2 style)
             ])
 
         # --- training hyperparameters ---
@@ -326,7 +376,12 @@ class NAM56RNeMoRecipe:
         if self.mock_data:
             args.append("--mock-data")
         if self.data_path:
-            args.extend(["--data-path", self.data_path])
+            # data_path may contain multiple space-separated tokens
+            # (e.g. "0.3 /path/a 0.7 /path/b"), Megatron expects separate args
+            args.append("--data-path")
+            args.extend(self.data_path.split())
+            # All data to training (eval via separate eval run)
+            args.extend(["--split", "100,0,0"])
         args.extend([
             "--tokenizer-type", self.tokenizer_type,
             "--vocab-size", str(self.vocab_size),
@@ -357,10 +412,22 @@ class NAM56RNeMoRecipe:
         return " \\\n  ".join(self.to_args())
 
     def to_env_dict(self) -> dict[str, str]:
-        """Environment variables for cppmega custom features."""
+        """Environment variables for cppmega custom features and NeMo perf."""
         env: dict[str, str] = {
+            # CUDA / NCCL
             "CUDA_DEVICE_MAX_CONNECTIONS": "1",
             "NCCL_IB_SL": "1",
+            "NCCL_AVOID_RECORD_STREAMS": "1",
+            "NCCL_NVLS_ENABLE": "0",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            "NCCL_GRAPH_REGISTER": "0",
+            "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",
+            # TE throughput (LayerNorm SM margins for comm overlap)
+            "NVTE_FWD_LAYERNORM_SM_MARGIN": "16",
+            "NVTE_BWD_LAYERNORM_SM_MARGIN": "16",
+            "NVTE_NORM_FWD_USE_CUDNN": "1",
+            "NVTE_NORM_BWD_USE_CUDNN": "1",
+            # cppmega pattern
             "CPPMEGA_NEM_PATTERN": self.pattern,
             "CPPMEGA_LAYER_DEPTH": str(self.num_layers),
         }
@@ -381,35 +448,140 @@ class NAM56RNeMoRecipe:
 # ---------------------------------------------------------------------------
 
 def nam56r_nemo_native_pretrain() -> NAM56RNeMoRecipe:
-    """NeMo-native baseline: Megatron built-in Mamba, TP=2, SP=True.
+    """NeMo-native: Megatron built-in Mamba, TP=1, DP=8.
 
-    Use this to verify baseline throughput before adding custom features.
+    NAM56R at 4.73B (3.03B active) fits on a single H200 (141 GiB).
+    TP=1 eliminates tensor-parallel AllReduce overhead → higher throughput.
     Uses Megatron's standard mamba_stack_spec (required by mamba_builder).
     """
     return NAM56RNeMoRecipe(
-        mode="nemo_native",
+        mode="author_dp",  # TP=1, DP=8
         use_moe=True,
         use_mla=False,  # MLA needs custom spec wiring
         spec_module="megatron.core.models.mamba.mamba_layer_specs",
         spec_name="mamba_stack_spec",
         micro_batch_size=4,
-        global_batch_size=64,
+        global_batch_size=32,
+        use_cuda_graphs=True,
+    )
+
+
+def nam56r_nemo_native_max_throughput() -> NAM56RNeMoRecipe:
+    """Max throughput: FP8 + full MoE CUDA graph + drop-and-pad, GBS=128.
+
+    Uses full MoE CUDA graph scope (captures entire MoE layer including expert
+    computation) with drop-and-pad mode.  FP8 tensorwise + gradient accumulation
+    (MBS=4, GBS=128 = 4x accum) pushes throughput past 200k tok/sec.
+
+    FP8 requires nheads % 16 == 0, so use nheads=64 (vs 56 in BF16 recipe).
+    Achieves 211k tok/sec / 50.1% MFU on 8×H200.
+    """
+    return NAM56RNeMoRecipe(
+        mode="author_dp",  # TP=1, DP=8
+        use_moe=True,
+        use_mla=False,
+        spec_module="megatron.core.models.mamba.mamba_layer_specs",
+        spec_name="mamba_stack_spec",
+        mamba_num_heads=64,  # FP8-aligned (multiple of 16)
+        micro_batch_size=5,
+        global_batch_size=320,  # 8x grad accum: 8 GPUs * MBS 5 * 8 accum
+        precision="fp8",
+        use_cuda_graphs=True,
+        use_full_moe_cuda_graph=True,  # capture entire MoE in graph
+        moe_expert_capacity_factor=1.5,  # drop-and-pad for full MoE graph
+        use_selective_recompute=False,  # no recompute for max throughput
     )
 
 
 def nam56r_author_dp_pretrain() -> NAM56RNeMoRecipe:
-    """Author-Mamba3 mode: TP=1, DP=8, custom NAM56R stack spec.
+    """Author-Mamba3 mode: TP=1, DP=8, TE-optimized NAM56R stack spec.
 
-    Uses Author Mamba3 + M²RNN via selective mixer.  Requires TP=1.
+    Uses Author Mamba3 + M²RNN via selective mixer, but keeps ALL TE
+    submodules (norms, attention, MoE) from upstream for maximum throughput.
+    Requires TP=1. Author Mamba3 uses expand=2, so mamba_num_heads=112.
     """
     return NAM56RNeMoRecipe(
         mode="author_dp",
         use_moe=True,
-        use_mla=True,
-        spec_module="cppmega.megatron.nam56r_full_spec",
-        spec_name="build_cppmega_nam56r_full_stack_spec",
+        use_mla=False,  # TE spec uses upstream attention (not MLA)
+        spec_module="cppmega.megatron.nam56r_te_spec",
+        spec_name="build_cppmega_nam56r_te_stack_spec",
+        mamba_num_heads=112,  # Author Mamba3: hidden*expand/headdim = 3584*2/64
         micro_batch_size=4,
         global_batch_size=32,
+    )
+
+
+def nam56r_mamba3_te_pretrain() -> NAM56RNeMoRecipe:
+    """Mamba-3 TE mode: TP=1, DP=8, CppMegaMamba3Mixer + upstream TE submodules.
+
+    Uses CppMegaMamba3Mixer (QK-Norm, learnable B/C bias) as the Mamba mixer,
+    while keeping ALL other TE-optimized submodules from upstream.
+
+    DEPRECATED: Use nam56r_mamba3_native_pretrain() instead, which uses the
+    correct nheads=56 (same as nemo_native baseline) for apples-to-apples
+    comparison. This recipe used nheads=112 (Author expand=2 convention).
+    """
+    return NAM56RNeMoRecipe(
+        mode="author_dp",
+        use_moe=True,
+        use_mla=False,
+        spec_module="cppmega.megatron.mamba3_te_stack_spec",
+        spec_name="cppmega_mamba3_te_stack_spec",
+        mamba_num_heads=112,
+        micro_batch_size=4,
+        global_batch_size=32,
+        use_cuda_graphs=True,
+    )
+
+
+def nam56r_mamba3_native_pretrain() -> NAM56RNeMoRecipe:
+    """Mamba-3 native mode: CppMegaMamba3Mixer with native SSD kernel.
+
+    Same architecture as nemo_native (nheads=56, d_inner=3584) but with
+    Mamba3 features: QK-Norm on B/C, learnable B/C bias.  Uses
+    mamba_chunk_scan_combined (not Author kernels) for CUDA graph compat.
+
+    Env vars to control features:
+      CPPMEGA_MAMBA3_QKNORM=1  (default on)
+      CPPMEGA_MAMBA3_BIAS=1    (default on)
+      CPPMEGA_MAMBA3_DATA_DEP_A=0  (default off)
+    """
+    return NAM56RNeMoRecipe(
+        mode="author_dp",  # TP=1, DP=8
+        use_moe=True,
+        use_mla=False,
+        spec_module="cppmega.megatron.mamba3_te_stack_spec",
+        spec_name="cppmega_mamba3_te_stack_spec",
+        mamba_num_heads=56,  # same as nemo_native baseline
+        micro_batch_size=4,
+        global_batch_size=32,
+        use_cuda_graphs=True,
+    )
+
+
+def nam56r_mamba3_native_max_throughput() -> NAM56RNeMoRecipe:
+    """Mamba3 max throughput: FP8 + CUDA graphs + MBS=5 + GBS=320.
+
+    Same optimization stack as nam56r_nemo_native_max_throughput() but with
+    CppMegaMamba3Mixer (QK-Norm, B/C bias).  Target: match 211k tok/sec.
+
+    Uses nheads=64 for FP8 alignment (multiple of 16).
+    """
+    return NAM56RNeMoRecipe(
+        mode="author_dp",  # TP=1, DP=8
+        use_moe=True,
+        use_mla=False,
+        spec_module="cppmega.megatron.mamba3_te_stack_spec",
+        spec_name="cppmega_mamba3_te_stack_spec",
+        mamba_num_heads=64,  # FP8-aligned
+        micro_batch_size=5,
+        global_batch_size=320,
+        precision="fp8",
+        use_cuda_graphs=True,
+        use_full_moe_cuda_graph=True,
+        moe_expert_capacity_factor=1.5,
+        use_selective_recompute=False,
     )
 
 

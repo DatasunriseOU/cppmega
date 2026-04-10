@@ -76,16 +76,25 @@ else
   cp "${REMOTE_ROOT}/megatron-lm/model_provider.py" "${REMOTE_WORKDIR}/model_provider.py"
 fi
 
-# ---- Environment variables (NeMo-style) ----
+# ---- Environment variables (NeMo 3 Nano performance settings) ----
+# CUDA / NCCL
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_IB_SL=1
-export TRITON_CACHE_DIR="${REMOTE_ROOT}/.triton-cache"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-
-# NeMo kernel optimizations
+export NCCL_AVOID_RECORD_STREAMS=1
+export NCCL_NVLS_ENABLE=0
+export NCCL_GRAPH_REGISTER=0
+export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# System now has CUDA 13.2 + cuDNN 9.20 + cuBLAS 13.3. No LD_LIBRARY_PATH needed.
+# TE throughput (LayerNorm SM margins for comm overlap, cuDNN norms)
+export NVTE_FWD_LAYERNORM_SM_MARGIN=16
+export NVTE_BWD_LAYERNORM_SM_MARGIN=16
+export NVTE_NORM_FWD_USE_CUDNN=1
+export NVTE_NORM_BWD_USE_CUDNN=1
+
+# System
+export TRITON_CACHE_DIR="${REMOTE_ROOT}/.triton-cache"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
 # cppmega pattern config
 export CPPMEGA_NEM_PATTERN="${CPPMEGA_NEM_PATTERN:-AEMEAEMEAEMR}"
@@ -96,6 +105,7 @@ export CPPMEGA_R_LAYER_INDICES="${CPPMEGA_R_LAYER_INDICES:-12,24,36,48}"
 RECIPE_ARGS="$(python - <<PYEOF
 from cppmega.recipes.nam56r_nemo_recipe import (
     nam56r_nemo_native_pretrain,
+    nam56r_nemo_native_max_throughput,
     nam56r_author_dp_pretrain,
 )
 import os
@@ -103,6 +113,11 @@ import os
 mode = os.environ.get("CPPMEGA_MODE", "nemo_native")
 if mode == "nemo_native":
     recipe = nam56r_nemo_native_pretrain()
+elif mode == "max_throughput":
+    recipe = nam56r_nemo_native_max_throughput()
+elif mode == "mamba3_te":
+    from cppmega.recipes.nam56r_nemo_recipe import nam56r_mamba3_te_pretrain
+    recipe = nam56r_mamba3_te_pretrain()
 elif mode == "author_dp":
     recipe = nam56r_author_dp_pretrain()
 else:
@@ -140,6 +155,9 @@ if save_dir:
 transformer_impl = os.environ.get("CPPMEGA_TRANSFORMER_IMPL")
 if transformer_impl:
     overrides["transformer_impl"] = transformer_impl
+precision = os.environ.get("CPPMEGA_PRECISION")
+if precision:
+    overrides["precision"] = precision
 
 if overrides:
     recipe = dataclasses.replace(recipe, **overrides)
@@ -176,5 +194,5 @@ INNER
 gcloud compute scp --zone "${REMOTE_ZONE}" "${LOCAL_TMP_SCRIPT}" "${REMOTE_HOST}:${REMOTE_TMP_SCRIPT}"
 gcloud compute ssh "${REMOTE_HOST}" \
   --zone "${REMOTE_ZONE}" \
-  --command "REMOTE_ROOT='${REMOTE_ROOT}' REMOTE_VENV='${REMOTE_VENV}' REMOTE_LOG='${REMOTE_LOG}' CPPMEGA_RUN_ID='${CPPMEGA_RUN_ID}' CPPMEGA_MODE='${CPPMEGA_MODE}' CPPMEGA_TRAIN_ITERS='${CPPMEGA_TRAIN_ITERS:-100}' CPPMEGA_MICRO_BATCH_SIZE='${CPPMEGA_MICRO_BATCH_SIZE:-}' CPPMEGA_GLOBAL_BATCH_SIZE='${CPPMEGA_GLOBAL_BATCH_SIZE:-}' CPPMEGA_SEQ_LENGTH='${CPPMEGA_SEQ_LENGTH:-}' CPPMEGA_LR='${CPPMEGA_LR:-}' CPPMEGA_DATA_PATH='${CPPMEGA_DATA_PATH:-}' CPPMEGA_TOKENIZER_TYPE='${CPPMEGA_TOKENIZER_TYPE:-}' CPPMEGA_TOKENIZER_MODEL='${CPPMEGA_TOKENIZER_MODEL:-}' CPPMEGA_SAVE_DIR='${CPPMEGA_SAVE_DIR:-}' CPPMEGA_TRANSFORMER_IMPL='${CPPMEGA_TRANSFORMER_IMPL:-}' bash '${REMOTE_TMP_SCRIPT}' || (status=\$?; echo 'training failed; tail follows:'; tail -n 200 '${REMOTE_LOG}' 2>/dev/null || true; exit \$status)"
+  --command "REMOTE_ROOT='${REMOTE_ROOT}' REMOTE_VENV='${REMOTE_VENV}' REMOTE_LOG='${REMOTE_LOG}' CPPMEGA_RUN_ID='${CPPMEGA_RUN_ID}' CPPMEGA_MODE='${CPPMEGA_MODE}' CPPMEGA_TRAIN_ITERS='${CPPMEGA_TRAIN_ITERS:-100}' CPPMEGA_MICRO_BATCH_SIZE='${CPPMEGA_MICRO_BATCH_SIZE:-}' CPPMEGA_GLOBAL_BATCH_SIZE='${CPPMEGA_GLOBAL_BATCH_SIZE:-}' CPPMEGA_SEQ_LENGTH='${CPPMEGA_SEQ_LENGTH:-}' CPPMEGA_LR='${CPPMEGA_LR:-}' CPPMEGA_DATA_PATH='${CPPMEGA_DATA_PATH:-}' CPPMEGA_TOKENIZER_TYPE='${CPPMEGA_TOKENIZER_TYPE:-}' CPPMEGA_TOKENIZER_MODEL='${CPPMEGA_TOKENIZER_MODEL:-}' CPPMEGA_SAVE_DIR='${CPPMEGA_SAVE_DIR:-}' CPPMEGA_TRANSFORMER_IMPL='${CPPMEGA_TRANSFORMER_IMPL:-}' CPPMEGA_PRECISION='${CPPMEGA_PRECISION:-}' bash '${REMOTE_TMP_SCRIPT}' || (status=\$?; echo 'training failed; tail follows:'; tail -n 200 '${REMOTE_LOG}' 2>/dev/null || true; exit \$status)"
 gcloud compute ssh "${REMOTE_HOST}" --zone "${REMOTE_ZONE}" --command "rm -f '${REMOTE_TMP_SCRIPT}'"
