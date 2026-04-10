@@ -56,7 +56,39 @@ class CppMegaLanguageModelEmbedding(LanguageModelEmbedding):
                 bottleneck_dim=int(os.environ.get("CPPMEGA_STRUCTURE_BOTTLENECK_DIM", "64")),
             )
 
-    def forward(self, input_ids: Tensor, position_ids: Tensor, tokentype_ids: int = None) -> Tensor:
+    @staticmethod
+    def _normalize_structure_inputs(
+        input_ids: Tensor,
+        structure_inputs: dict[str, Tensor] | None,
+    ) -> dict[str, Tensor | None]:
+        names = (
+            "structure_ids",
+            "dep_levels",
+            "ast_depth_ids",
+            "sibling_index_ids",
+            "node_type_ids",
+        )
+        normalized: dict[str, Tensor | None] = {name: None for name in names}
+        if structure_inputs is None:
+            return normalized
+        for name in names:
+            tensor = structure_inputs.get(name)
+            if tensor is None:
+                continue
+            if tensor.shape != input_ids.shape:
+                raise ValueError(
+                    f"structure input {name} shape {tuple(tensor.shape)} does not match input_ids {tuple(input_ids.shape)}"
+                )
+            normalized[name] = tensor.to(device=input_ids.device, dtype=torch.long)
+        return normalized
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        tokentype_ids: int = None,
+        structure_inputs: dict[str, Tensor] | None = None,
+    ) -> Tensor:
         word_embeddings = self.word_embeddings(input_ids)
         if self.add_position_embedding:
             position_embeddings = self.position_embeddings(position_ids)
@@ -69,13 +101,17 @@ class CppMegaLanguageModelEmbedding(LanguageModelEmbedding):
             embeddings = embeddings + ngram_embeddings
 
         if self.cppmega_structure is not None:
-            zeros = torch.zeros_like(input_ids, dtype=torch.long)
+            normalized_structure = self._normalize_structure_inputs(input_ids, structure_inputs)
             structure_embeddings = self.cppmega_structure(
-                structure_ids=zeros,
-                dep_levels=zeros,
+                structure_ids=normalized_structure["structure_ids"],
+                dep_levels=normalized_structure["dep_levels"],
+                ast_depth_ids=normalized_structure["ast_depth_ids"],
+                sibling_index_ids=normalized_structure["sibling_index_ids"],
+                node_type_ids=normalized_structure["node_type_ids"],
                 target_dtype=embeddings.dtype,
             )
-            embeddings = embeddings + structure_embeddings
+            if isinstance(structure_embeddings, torch.Tensor) and structure_embeddings.ndim == embeddings.ndim:
+                embeddings = embeddings + structure_embeddings
 
         if not self.reduce_scatter_embeddings:
             embeddings = embeddings.transpose(0, 1).contiguous()

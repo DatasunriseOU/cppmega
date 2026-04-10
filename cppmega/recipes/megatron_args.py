@@ -41,6 +41,7 @@ def build_megatron_args_bundle(
     qk_pos_emb_head_dim: int = 32,
     v_head_dim: int = 64,
     use_mtp: bool = False,
+    mtp_mode: str = "gpt",
     mtp_num_predictors: int = 1,
     use_fim: bool = False,
     use_moe: bool = False,
@@ -76,7 +77,14 @@ def build_megatron_args_bundle(
         )
 
     if use_mtp:
-        args.extend(["--multi-token-prediction", "--mtp-num-layers", str(mtp_num_predictors)])
+        if mtp_mode == "gpt":
+            args.extend(["--multi-token-prediction", "--mtp-num-layers", str(mtp_num_predictors)])
+        elif mtp_mode == "hybrid":
+            # Hybrid Mamba lanes express MTP structure in --hybrid-layer-pattern and
+            # only require the predictor depth count on current Megatron.
+            args.extend(["--mtp-num-layers", str(mtp_num_predictors)])
+        else:
+            raise ValueError(f"unsupported mtp_mode: {mtp_mode!r}")
 
     args.extend(_bool_flag(use_fim, "--fim-rate"))
     if use_fim:

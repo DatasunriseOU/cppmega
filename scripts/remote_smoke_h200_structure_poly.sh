@@ -12,22 +12,19 @@ LOCAL_TMP_SCRIPT="$(mktemp -t cppmega-remote-structure-poly.XXXXXX.sh)"
 
 trap 'rm -f "${LOCAL_TMP_SCRIPT}"' EXIT
 
-cat > "${LOCAL_TMP_SCRIPT}" <<'EOF'
+cat > "${LOCAL_TMP_SCRIPT}" <<'INNER'
 set -euo pipefail
 source "${REMOTE_VENV}/bin/activate"
 export PYTHONPATH="${REMOTE_ROOT}/cppmega:${REMOTE_ROOT}/megatron-lm:${PYTHONPATH:-}"
 mkdir -p "${REMOTE_ROOT}/cppmega" "${REMOTE_ROOT}/.triton-cache"
 REMOTE_CKPT_DIR="${REMOTE_ROOT}/cppmega/${CPPMEGA_RUN_ID}_ckpt"
+REMOTE_WORKDIR="$(mktemp -d /tmp/cppmega-structure-poly.XXXXXX)"
+export REMOTE_WORKDIR
+trap 'rm -rf "${REMOTE_WORKDIR}"' EXIT
 
 python -c "import cppmega, megatron; print('import smoke ok', cppmega.__version__)"
 
-cd "${REMOTE_ROOT}/megatron-lm"
-
-export CUDA_DEVICE_MAX_CONNECTIONS=1
-export NCCL_IB_SL=1
-export TRITON_CACHE_DIR="${REMOTE_ROOT}/.triton-cache"
-export CPPMEGA_STRUCTURE_ENABLED=1
-export CPPMEGA_STRUCTURE_COMPONENTS="core"
+cp "${REMOTE_ROOT}/megatron-lm/pretrain_gpt.py" "${REMOTE_WORKDIR}/pretrain_gpt.py"
 
 python - <<'PY'
 from pathlib import Path
@@ -49,7 +46,40 @@ if 'return cppmega_gpt_builder(args, pre_process, post_process, vp_stage, config
     p.write_text(p.read_text().replace(needle, replacement, 1))
 PY
 
-python -m torch.distributed.run --nproc_per_node=8 pretrain_gpt.py \
+python - <<'PY'
+from pathlib import Path
+
+path = Path(__import__('os').environ['REMOTE_WORKDIR']) / 'pretrain_gpt.py'
+text = path.read_text()
+if 'from cppmega.megatron.structure_batch import maybe_set_structure_inputs' not in text:
+    text = text.replace(
+        'from model_provider import model_provider\n',
+        'from model_provider import model_provider\nfrom cppmega.megatron.structure_batch import maybe_set_structure_inputs\n',
+        1,
+    )
+needle = '        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator, vp_stage)\n'
+replacement = (
+    '        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator, vp_stage)\n'
+    '        structure_batch = {\n'
+    '            "structure_ids": (tokens % 7).to(dtype=tokens.dtype),\n'
+    '            "dep_levels": (position_ids % 5).to(dtype=position_ids.dtype),\n'
+    '        }\n'
+    '        maybe_set_structure_inputs(model, structure_batch)\n'
+)
+if 'maybe_set_structure_inputs(model, structure_batch)' not in text:
+    text = text.replace(needle, replacement, 1)
+path.write_text(text)
+PY
+
+cd "${REMOTE_ROOT}/megatron-lm"
+
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export NCCL_IB_SL=1
+export TRITON_CACHE_DIR="${REMOTE_ROOT}/.triton-cache"
+export CPPMEGA_STRUCTURE_ENABLED=1
+export CPPMEGA_STRUCTURE_COMPONENTS="core"
+
+python -m torch.distributed.run --nproc_per_node=8 "${REMOTE_WORKDIR}/pretrain_gpt.py" \
   --mock-data \
   --tokenizer-type NullTokenizer \
   --vocab-size 65536 \
@@ -88,7 +118,7 @@ python -m torch.distributed.run --nproc_per_node=8 pretrain_gpt.py \
   > "${REMOTE_LOG}" 2>&1
 
 tail -n 60 "${REMOTE_LOG}"
-EOF
+INNER
 
 gcloud compute scp --zone "${REMOTE_ZONE}" "${LOCAL_TMP_SCRIPT}" "${REMOTE_HOST}:${REMOTE_TMP_SCRIPT}"
 gcloud compute ssh "${REMOTE_HOST}" --zone "${REMOTE_ZONE}" --command "REMOTE_ROOT='${REMOTE_ROOT}' REMOTE_VENV='${REMOTE_VENV}' REMOTE_LOG='${REMOTE_LOG}' CPPMEGA_RUN_ID='${CPPMEGA_RUN_ID}' bash '${REMOTE_TMP_SCRIPT}' || (status=\$?; echo 'remote structure poly smoke failed; tail follows:'; tail -n 120 '${REMOTE_LOG}' || true; exit \$status)"

@@ -44,6 +44,23 @@ def test_nam56r_launch_helper_emits_native_fragment_only_for_builtins():
     assert any("mHC remains custom" in note for note in bundle.custom_notes)
 
 
+def test_nam56r_launch_helper_uses_hybrid_mtp_fragment_for_mamba_lane():
+    plan = build_nam56r_feature_plan(
+        pattern="AEMEAEMEAEMR",
+        depth=52,
+        mtp_depths=1,
+    )
+    bundle = build_nam56r_megatron_native_args(
+        plan=plan,
+        enable_mtp=True,
+        mtp_mode="hybrid",
+    )
+
+    fragment = bundle.to_shell_fragment()
+    assert "--mtp-num-layers 1" in fragment
+    assert "--multi-token-prediction" not in fragment
+
+
 def test_nam56r_launch_cli_emits_native_fragment(capsys, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["nam56r_launch", "--enable-mla", "--enable-dsa"])
     exit_code = nam56r_launch.main()

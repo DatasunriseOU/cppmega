@@ -5,7 +5,11 @@ from __future__ import annotations
 import argparse
 
 from cppmega.recipes.megatron_args import MegatronArgsBundle, build_megatron_args_bundle
-from cppmega.recipes.nam56r_megatron import MegatronHybridPlan, build_nam56r_feature_plan
+from cppmega.recipes.nam56r_megatron import (
+    MegatronHybridPlan,
+    build_nam56r_feature_plan,
+    parse_nem_pattern,
+)
 
 
 def build_nam56r_megatron_native_args(
@@ -13,6 +17,7 @@ def build_nam56r_megatron_native_args(
     plan: MegatronHybridPlan,
     enable_mla: bool = True,
     enable_mtp: bool = False,
+    mtp_mode: str = "gpt",
     enable_fim: bool = False,
     enable_moe: bool = False,
     enable_dsa: bool = False,
@@ -28,9 +33,49 @@ def build_nam56r_megatron_native_args(
         plan=plan,
         use_mla=enable_mla,
         use_mtp=enable_mtp,
+        mtp_mode=mtp_mode,
         use_fim=enable_fim,
         use_moe=enable_moe,
         use_dsa=enable_dsa,
+    )
+
+
+def build_nam56r_lite_main_pattern(
+    *,
+    pattern: str,
+    depth: int,
+    mtp_depths: int = 0,
+) -> str:
+    mapped: list[str] = []
+    for symbol in parse_nem_pattern(pattern, depth):
+        if symbol == "A":
+            mapped.append("*")
+        elif symbol == "E":
+            mapped.append("E")
+        elif symbol in {"M", "R"}:
+            mapped.append("M")
+        elif symbol in {"D", "G"}:
+            mapped.append("G")
+        else:
+            raise ValueError(f"unsupported symbol for NAM56R-lite pattern: {symbol!r}")
+
+    result = "".join(mapped)
+    if mtp_depths > 0:
+        result = result + "/" + "/".join("*-" for _ in range(mtp_depths))
+    return result
+
+
+def get_custom_layer_indices(
+    *,
+    pattern: str,
+    depth: int,
+    custom_symbols: tuple[str, ...] = ("R",),
+) -> tuple[int, ...]:
+    symbols = frozenset(custom_symbols)
+    return tuple(
+        index + 1
+        for index, symbol in enumerate(parse_nem_pattern(pattern, depth))
+        if symbol in symbols
     )
 
 
@@ -41,6 +86,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mtp-depths", type=int, default=0)
     parser.add_argument("--enable-mla", action="store_true")
     parser.add_argument("--enable-mtp", action="store_true")
+    parser.add_argument("--mtp-mode", choices=("gpt", "hybrid"), default="gpt")
     parser.add_argument("--enable-fim", action="store_true")
     parser.add_argument("--enable-moe", action="store_true")
     parser.add_argument("--enable-dsa", action="store_true")
@@ -58,6 +104,7 @@ def main() -> int:
         plan=plan,
         enable_mla=args.enable_mla,
         enable_mtp=args.enable_mtp,
+        mtp_mode=args.mtp_mode,
         enable_fim=args.enable_fim,
         enable_moe=args.enable_moe,
         enable_dsa=args.enable_dsa,
