@@ -143,7 +143,14 @@ if [ "${INSTALL_AUTHOR_MAMBA3}" = "1" ]; then
   cd state-spaces-mamba
   git fetch --all --tags
   git checkout "${MAMBA_COMMIT}"
-  MAMBA_FORCE_BUILD=TRUE python -m pip install --no-deps --no-build-isolation .
+  MAMBA_FORCE_BUILD=TRUE python -m pip install --no-deps --no-build-isolation --force-reinstall --ignore-installed .
+  python - <<'PY'
+import importlib.util
+
+assert importlib.util.find_spec("mamba_ssm.modules.mamba3") is not None, (
+    "author Mamba3 install did not expose mamba_ssm.modules.mamba3"
+)
+PY
 fi
 
 mkdir -p "${REMOTE_CPPMEGA_DIR}"

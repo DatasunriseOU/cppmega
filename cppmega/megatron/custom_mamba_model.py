@@ -1,14 +1,16 @@
-"""Cppmega-owned GPT model wrapper using derived embedding modules."""
+"""Cppmega-owned Mamba model wrapper using derived embedding modules."""
 
 from __future__ import annotations
 
-from megatron.core import tensor_parallel
-from megatron.core.models.gpt.gpt_model import GPTModel
+try:
+    from megatron.core.models.mamba.mamba_model import MambaModel
+except ModuleNotFoundError:  # local macOS/dev environments without Megatron checkout
+    MambaModel = object  # type: ignore[assignment]
 
 from cppmega.megatron.custom_embedding import CppMegaLanguageModelEmbedding
 
 
-class CppMegaGPTModel(GPTModel):
+class CppMegaMambaModel(MambaModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._cppmega_structure_inputs = None
@@ -30,41 +32,39 @@ class CppMegaGPTModel(GPTModel):
         self._cppmega_structure_inputs = None
         return structure_inputs
 
-    def _preprocess(
+    def forward(
         self,
         input_ids,
         position_ids,
+        attention_mask,
         decoder_input=None,
+        labels=None,
         inference_context=None,
+        runtime_gather_output=None,
+        *,
+        inference_params=None,
+        loss_mask=None,
         packed_seq_params=None,
         padding_mask=None,
+        is_spec_decode=None,
     ):
-        in_inference_mode = inference_context is not None and not self.training
-
         if decoder_input is None and self.pre_process:
-            if padding_mask is not None:
-                assert padding_mask.shape == input_ids.shape, (
-                    f"padding_mask shape {padding_mask.shape} does not match "
-                    f"input_ids shape {input_ids.shape}"
-                )
             decoder_input = self.embedding(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 structure_inputs=self._cppmega_take_structure_inputs(),
             )
-            if padding_mask is not None and self.config.sequence_parallel:
-                padding_mask = (
-                    tensor_parallel.scatter_to_sequence_parallel_region(
-                        padding_mask.transpose(0, 1).contiguous()
-                    )
-                    .transpose(0, 1)
-                    .contiguous()
-                )
-        return super()._preprocess(
+        return super().forward(
             input_ids=input_ids,
             position_ids=position_ids,
+            attention_mask=attention_mask,
             decoder_input=decoder_input,
+            labels=labels,
             inference_context=inference_context,
+            runtime_gather_output=runtime_gather_output,
+            inference_params=inference_params,
+            loss_mask=loss_mask,
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
+            is_spec_decode=is_spec_decode,
         )

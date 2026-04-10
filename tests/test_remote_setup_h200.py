@@ -24,3 +24,9 @@ def test_remote_setup_uses_base_env_as_runtime_source_of_truth():
     assert 'CLONED_TORCH_VERSION="$(python -c ' in script
     assert 'mkdir -p "${REMOTE_SITE_PACKAGES}/nvidia"' in script
     assert 'ln -s "${entry}" "${REMOTE_SITE_PACKAGES}/nvidia/${name}"' in script
+
+
+def test_remote_setup_force_reinstalls_author_mamba3_over_base_env_shadow():
+    script = (Path(__file__).resolve().parents[1] / "scripts" / "remote_setup_h200.sh").read_text()
+    assert 'MAMBA_FORCE_BUILD=TRUE python -m pip install --no-deps --no-build-isolation --force-reinstall --ignore-installed .' in script
+    assert 'find_spec("mamba_ssm.modules.mamba3") is not None' in script

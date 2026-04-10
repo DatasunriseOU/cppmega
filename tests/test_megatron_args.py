@@ -22,6 +22,19 @@ def test_megatron_args_bundle_emits_native_mla_mtp_fim_moe_dsa_flags():
     assert bundle.args[bundle.args.index("--experimental-attention-variant") + 1] == "dsa"
 
 
+def test_megatron_args_bundle_uses_hybrid_mtp_contract_without_gpt_toggle():
+    plan = build_nam56r_feature_plan(pattern="AEMEAEMEAEMR", depth=52, mtp_depths=1)
+    bundle = build_megatron_args_bundle(
+        plan=plan,
+        use_mtp=True,
+        mtp_mode="hybrid",
+        mtp_num_predictors=1,
+    )
+
+    assert "--mtp-num-layers" in bundle.args
+    assert "--multi-token-prediction" not in bundle.args
+
+
 def test_megatron_args_bundle_marks_custom_features_as_notes_only():
     plan = build_nam56r_feature_plan(
         pattern="AEMEAEMEAEMR",
