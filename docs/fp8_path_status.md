@@ -27,7 +27,7 @@ fp32 bias/parameter tensors inside `Mamba3` / `M2RNN` cleanly.
 |---|---|---|---|---|---|
 | A  | `cppmega.megatron.mamba3_te_stack_spec` (`CppMegaMamba3Mixer`, 2/7 Mamba3: QK-Norm + B/C bias via native SSD kernel) | n/a (no guard) | **PASS** | 1116 / 1082 / 1064 | No FP8 blocker; grad norms converge (128 to 101), loss trajectory 22.8 -> 18.6 |
 | B  | `cppmega.megatron.mamba3_author_spec` (Author SISO 6/7) | `author_mamba3_spec.py:51-52` removed | **PASS** | 1416 / 1082 / 1047 | Author `mamba3_siso_combined` Triton kernel works under `--fp8-format hybrid`; fp32 bias/D/dt tensors stay fp32 as expected |
-| C  | `cppmega.megatron.mamba3_author_spec` + MIMO (`cppmega_mamba3_is_mimo=True`, `mimo_rank=4`, `chunk_size=16`) | same (removed) | **FAIL** | - | Forward OK; backward hits **TileLang MIMO kernel limitation**: `mamba_mimo_bwd_combined` raises `ValueError: G value of 8 is not currently supported!` in `mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py:1314`. **Not an FP8 issue** — same failure would occur in BF16 with ngroups=8 (cppmega config fixes `ngroups=8` for 8-way TP). Fix lives in the TileLang MIMO backward kernel (ngroups support), not in the guard. |
+| C  | `cppmega.megatron.mamba3_author_spec` + MIMO (`cppmega_mamba3_is_mimo=True`, `mimo_rank=4`, `chunk_size=16`) | same (removed) | **was FAIL → NOW PASS as of 2026-04-11** | - | Forward OK; backward previously hit **TileLang MIMO kernel limitation**: `mamba_mimo_bwd_combined` raised `ValueError: G value of 8 is not currently supported!` in `mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py:1314`. **FIXED** by patching the post-kernel reduction case for `1 < G < H` (added `elif G < H: dq = dq_tilelang.view(B, S, R, G, H//G, N).sum(dim=4)` and same for dk). This unblocks MIMO R=4 ngroups=8 backward on H200. Full NAM56R MIMO 7/7 run completed 2026-04-11 at **56,280 tok/sec baseline** — see `docs/nam56r_mimo7_baseline_2026_04_11.md`. |
 | D  | `cppmega.megatron.nam56r_noconv_spec` (`NoConvMamba3BCMixer` on M-layers + `CppMegaM2RNNMixer` on R-layers 12/24/36/48) | `m2rnn_spec.py:85-86` removed (sibling guard on M2RNN mixer) | **PASS** | 38279 / 37625 / 37909 | Slower because this spec uses `CppMegaMambaModel` (full pipeline: cppmega embedding + MTP + per-layer M2RNN build). FP8 converges cleanly; grad norms 234 -> 55 |
 
 ## FP8 + CUDA graphs axis
@@ -49,13 +49,17 @@ for Paths A, B, D is a trivial next step — just re-invoke the
   at the correctness level. Performance still bounded by the Author
   scan kernels not participating in TE CUDA graph fusion (same caveat
   as the BF16 mamba3_te number, 127k tok/sec).
-- **Path C (Author MIMO R=4)** — blocked by the TileLang MIMO **backward**
-  kernel (`mamba_mimo_bwd_combined` doesn't support `G=8`). The FP8
-  guard was never the real blocker; the kernel limitation is. Either
-  reduce `ngroups` to a supported value (2 or 4) or extend the TileLang
-  kernel. This matches the existing `reference_gb10_bwd_bwd_blocker`
-  note about MIMO bwd weaknesses, now extended to cover a G-axis
-  constraint on H200 as well as the GB10 shared-memory one.
+- **Path C (Author MIMO R=4)** — **UNBLOCKED as of 2026-04-11**. The
+  TileLang MIMO backward kernel `mamba_mimo_bwd_combined` was patched
+  to handle the `1 < G < H` case (was raising `ValueError: G value of 8
+  is not currently supported!` at line 1314 of
+  `mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py`). The fix adds a
+  post-kernel reduction for partial-group contraction:
+  `dq = dq_tilelang.view(B, S, R, G, H//G, N).sum(dim=4)` (and same
+  for dk). First successful NAM56R MIMO 7/7 full-stack training run
+  landed 2026-04-11 at **56,280 tok/sec** baseline on 8x H200; see
+  `docs/nam56r_mimo7_baseline_2026_04_11.md`. FP8 was NOT enabled in
+  that run — re-testing Path C under FP8 is a pending follow-up.
 - **Path D (`nam56r_noconv_spec`)** — production-ready for FP8 training
   once the m2rnn sibling guard removal is accepted. Steady-state ms/iter
   at 37-38s reflects the heavyweight cppmega pipeline wiring and is

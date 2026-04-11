@@ -222,6 +222,27 @@ case "${CPPMEGA_CUDA_GRAPH}" in
     ;;
 esac
 
+# FP8 support.
+#   CPPMEGA_FP8=1     → FP8 hybrid format (per-tensor current scaling, TE 2.13+)
+#   CPPMEGA_FP8=0     → BF16 (default)
+# FP8 requires nheads % 16 == 0 (use CPPMEGA_MAMBA_NUM_HEADS=64 for FP8 mode).
+FP8_ARGS=()
+if [ "${CPPMEGA_FP8:-0}" = "1" ]; then
+  FP8_ARGS+=(
+    --fp8-format hybrid
+    --fp8-amax-history-len 16
+    --fp8-amax-compute-algo max
+  )
+fi
+
+# Precision: FP8 mode overrides --bf16 with FP8 args; otherwise BF16.
+PRECISION_ARGS=()
+if [ "${CPPMEGA_FP8:-0}" = "1" ]; then
+  PRECISION_ARGS+=(--bf16)  # base precision for non-FP8 ops
+else
+  PRECISION_ARGS+=(--bf16)
+fi
+
 python -m torch.distributed.run --nproc_per_node=8 "${REMOTE_WORKDIR}/pretrain_mamba.py" \
   "${DATA_ARGS[@]}" \
   --tensor-model-parallel-size 1 \
@@ -235,7 +256,7 @@ python -m torch.distributed.run --nproc_per_node=8 "${REMOTE_WORKDIR}/pretrain_m
   --hybrid-layer-pattern "${HYBRID_LAYER_PATTERN}" \
   --hidden-size 3584 \
   --ffn-hidden-size 18944 \
-  --num-attention-heads 28 \
+  --num-attention-heads "${CPPMEGA_NUM_ATTN_HEADS:-28}" \
   --seq-length "${CPPMEGA_SEQ_LENGTH:-4096}" \
   --max-position-embeddings "${CPPMEGA_MAX_POSITION_EMBEDDINGS:-4096}" \
   --micro-batch-size "${CPPMEGA_MICRO_BATCH_SIZE:-1}" \
@@ -250,12 +271,13 @@ python -m torch.distributed.run --nproc_per_node=8 "${REMOTE_WORKDIR}/pretrain_m
   --normalization RMSNorm \
   --disable-bias-linear \
   --untie-embeddings-and-output-weights \
-  --bf16 \
+  "${PRECISION_ARGS[@]}" \
   --use-mcore-models \
   --transformer-impl transformer_engine \
   --attention-backend "${CPPMEGA_ATTN_BACKEND:-auto}" \
   --spec cppmega.megatron.nam56r_noconv_spec build_cppmega_nam56r_noconv_stack_spec \
   "${CUDA_GRAPH_ARGS[@]}" \
+  "${FP8_ARGS[@]}" \
   ${NATIVE_ARGS} \
   --save "${REMOTE_CKPT_DIR}" \
   --load "${REMOTE_CKPT_DIR}" \

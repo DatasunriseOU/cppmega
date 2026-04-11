@@ -279,3 +279,61 @@ class TestBwdParity:
         assert rel(v1.grad, v2.grad) < 1e-4
         assert rel(W1.grad, W2.grad) < 1e-4
         assert rel(xf1.grad, xf2.grad) < 1e-4
+
+
+# ---------------------------------------------------------------------------
+# Recompute vs save parity
+# ---------------------------------------------------------------------------
+
+
+class TestRecomputeVsSaveParity:
+    """Verify that SAVE_HNEW=0 (recompute) and SAVE_HNEW=1 (save) produce
+    identical fwd outputs and bwd gradients within bf16 tolerance.
+
+    The test monkey-patches ``cppmega.megatron.m2rnn_triton._SAVE_HNEW`` to
+    run both paths in the same process, then compares all outputs and grads.
+    """
+
+    def test_recompute_vs_save_parity(self):
+        try:
+            import triton  # noqa: F401
+        except ImportError:
+            pytest.skip("triton not available")
+        import cppmega.megatron.m2rnn_triton as _mod
+
+        B, S, H, K, V = 2, 128, 4, 32, 16
+        q0, k0, v0, W0, xf0 = _make_inputs(B, S, H, K, V, dtype=torch.float32)
+
+        def run_with_save_hnew(flag):
+            """Run fwd+bwd with _SAVE_HNEW = flag."""
+            orig = _mod._SAVE_HNEW
+            _mod._SAVE_HNEW = flag
+            try:
+                q = q0.detach().clone().requires_grad_(True)
+                k = k0.detach().clone().requires_grad_(True)
+                v = v0.detach().clone().requires_grad_(True)
+                W = W0.detach().clone().requires_grad_(True)
+                xf = xf0.detach().clone().requires_grad_(True)
+                out, h_final = _mod.m2rnn_scan_triton(q, k, v, W, xf)
+                # Use a fixed grad_output seeded from q0's shape.
+                g = torch.randn(out.shape, device=out.device, dtype=out.dtype,
+                                generator=torch.Generator(device=out.device).manual_seed(99))
+                (out * g).sum().backward()
+                return out, h_final, q.grad, k.grad, v.grad, W.grad, xf.grad
+            finally:
+                _mod._SAVE_HNEW = orig
+
+        # Run both paths.
+        save_results = run_with_save_hnew(True)
+        recompute_results = run_with_save_hnew(False)
+
+        names = ["out", "h_final", "dq", "dk", "dv", "dW", "dxf"]
+        for name, save_t, recomp_t in zip(names, save_results, recompute_results):
+            assert save_t.shape == recomp_t.shape, f"{name}: shape mismatch"
+            diff = (save_t - recomp_t).abs().max().item()
+            mag = save_t.abs().max().item() + 1e-12
+            rel = diff / mag
+            assert rel < 1e-4, (
+                f"{name}: save vs recompute relative error {rel:.4e} "
+                f"(abs={diff:.4e}, mag={mag:.4e})"
+            )

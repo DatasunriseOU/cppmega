@@ -30,28 +30,19 @@ from einops import rearrange
 
 from megatron.core.ssm.mamba_mixer import MambaMixer
 
-try:
-    from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
-except ImportError:
-    mamba_chunk_scan_combined = None
+# NO FALLBACKS: these are required runtime dependencies.
+# If mamba_ssm is not installed, crash immediately — don't silently degrade.
+from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
 
 try:
     from mamba_ssm.ops.triton.causal_conv1d import causal_conv1d_fn
 except ImportError:
-    try:
-        from causal_conv1d import causal_conv1d_fn
-    except ImportError:
-        causal_conv1d_fn = None
+    from causal_conv1d import causal_conv1d_fn  # alternate package name, NOT a fallback
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
     return os.environ.get(name, "1" if default else "0") == "1"
-
-
-try:
-    from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
-except ImportError:
-    mamba_split_conv1d_scan_combined = None
 
 
 class CppMegaMamba3Mixer(MambaMixer):

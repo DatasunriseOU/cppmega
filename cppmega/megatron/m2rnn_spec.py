@@ -11,7 +11,10 @@ from torch import nn
 
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.torch_norm import WrappedTorchNorm
+
+# NO FALLBACK: TENorm is required (supports sequence parallel for TP>1).
+# WrappedTorchNorm silently breaks TP>1 — crash immediately if TE is missing.
+from megatron.core.extensions.transformer_engine import TENorm as _NormClass
 
 from cppmega.features.m2rnn import build_cppmega_m2rnn_config
 from cppmega.megatron.mamba_local_spec import CppMegaLocalMambaStack
@@ -21,12 +24,24 @@ from cppmega.megatron.mamba_local_spec import CppMegaLocalMambaStack
 # and delivers ~40x fwd speedup on GB10 / ~100x on H200 at NAM56R dims
 # (B=2, S=4096, H=8, K=64, V=16).  Set ``CPPMEGA_M2RNN_KERNEL=torch`` to
 # force the slow reference path for debugging / A-B comparison.
+# Triton M²RNN kernel import.  The torch fallback path is NOT a silent
+# degradation — it's an explicit debug/parity reference selected via
+# CPPMEGA_M2RNN_KERNEL=torch.  If Triton is missing on a GPU host,
+# training will use the 460× slower Python scan and print a loud warning.
 try:
     from cppmega.megatron.m2rnn_triton import (
         TRITON_AVAILABLE as _M2RNN_TRITON_AVAILABLE,
         m2rnn_scan_triton as _m2rnn_scan_triton,
     )
 except ImportError:  # pragma: no cover
+    import warnings
+    warnings.warn(
+        "cppmega.megatron.m2rnn_triton not importable — M²RNN will use the "
+        "460× slower Python scan loop.  This is NOT acceptable for training.  "
+        "Install Triton or check your PYTHONPATH.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
     _M2RNN_TRITON_AVAILABLE = False
     _m2rnn_scan_triton = None  # type: ignore[assignment]
 
@@ -167,7 +182,7 @@ class CppMegaM2RNNMixer(nn.Module):
             if self.use_residual
             else None
         )
-        self.g_norm = WrappedTorchNorm(
+        self.g_norm = _NormClass(
             config=config,
             hidden_size=self.num_heads * self.v_head_dim,
             eps=config.layernorm_epsilon,

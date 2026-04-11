@@ -585,6 +585,55 @@ def nam56r_mamba3_native_max_throughput() -> NAM56RNeMoRecipe:
     )
 
 
+def nam56r_noconv_max_throughput() -> NAM56RNeMoRecipe:
+    """Branch B max throughput: NoConvMamba3BCMixer + fused Triton M²RNN + FP8.
+
+    Uses vanilla ``mamba_chunk_scan_combined`` with QK-Norm + B/C bias
+    preprocessing (NoConvMamba3BCMixer) on M-layers plus the fused Triton
+    M²RNN kernel on R-layer positions.  This is the full NAM56R architecture
+    with all architectural features enabled at production speed.
+
+    Same optimization stack as ``nam56r_nemo_native_max_throughput()`` (FP8,
+    full MoE CUDA graph, drop-and-pad, GBS=320, MBS=5) but with Mamba3
+    features + M²RNN.  Target: 250k tok/sec on 8×H200 (>211k baseline).
+    """
+    return NAM56RNeMoRecipe(
+        mode="author_dp",  # TP=1, PP=1, DP=8
+        use_moe=True,
+        use_mla=True,  # MLA with cuDNN 9.20 fused attention
+        spec_module="cppmega.megatron.nam56r_noconv_spec",
+        spec_name="build_cppmega_nam56r_noconv_stack_spec",
+        mamba_num_heads=64,  # FP8-aligned (multiple of 16)
+        micro_batch_size=5,
+        global_batch_size=320,  # 8x grad accum: 8 GPUs × MBS 5 × 8 accum
+        precision="fp8",
+        use_cuda_graphs=True,
+        use_full_moe_cuda_graph=True,  # capture entire MoE in graph
+        moe_expert_capacity_factor=1.5,  # drop-and-pad for full MoE graph
+        use_selective_recompute=False,  # no recompute for max throughput
+    )
+
+
+def nam56r_noconv_pretrain() -> NAM56RNeMoRecipe:
+    """Branch B BF16 pretrain: NoConvMamba3BCMixer + fused Triton M²RNN.
+
+    Conservative config for convergence testing with real data before
+    enabling FP8.  MBS=4 GBS=32, BF16, te_attn CUDA graphs.
+    """
+    return NAM56RNeMoRecipe(
+        mode="author_dp",  # TP=1, PP=1, DP=8
+        use_moe=True,
+        use_mla=True,
+        spec_module="cppmega.megatron.nam56r_noconv_spec",
+        spec_name="build_cppmega_nam56r_noconv_stack_spec",
+        mamba_num_heads=56,  # BF16 — nheads=56 matches baseline
+        micro_batch_size=4,
+        global_batch_size=32,
+        precision="bf16",
+        use_cuda_graphs=True,
+    )
+
+
 def nam56r_smoke_test() -> NAM56RNeMoRecipe:
     """Minimal smoke test: small model, 2 iterations."""
     return NAM56RNeMoRecipe(
