@@ -17,6 +17,11 @@ try:
 except ModuleNotFoundError:
     tensor_parallel = None  # type: ignore[assignment]
 
+try:
+    from megatron.core import parallel_state as _mcore_parallel_state
+except ModuleNotFoundError:  # local macOS/dev environments without Megatron checkout
+    _mcore_parallel_state = None  # type: ignore[assignment]
+
 from cppmega.features.engram.ngram_hash import CppMegaNgramHashEmbedding
 from cppmega.features.structure.embedding import CppMegaStructureEmbedding
 
@@ -24,6 +29,17 @@ try:
     from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 except ModuleNotFoundError:  # local macOS/dev environments without Megatron checkout
     LanguageModelEmbedding = object  # type: ignore[assignment]
+
+# Prefixes (relative to the CppMegaLanguageModelEmbedding module) of submodules
+# whose ShardedTensor replica_id must be rewritten to reflect the current
+# pipeline stage. The default Megatron walker stamps replica_id=(0, tp, dp) on
+# every rank, which produces a duplicate "main replica" when MTP replicates the
+# embedding on a non-first PP stage. See
+# :meth:`CppMegaLanguageModelEmbedding.sharded_state_dict`.
+_CPPMEGA_CUSTOM_PREFIXES: tuple[str, ...] = (
+    "cppmega_ngram_hash.",
+    "cppmega_structure.",
+)
 
 
 class CppMegaLanguageModelEmbedding(LanguageModelEmbedding):
@@ -144,3 +160,86 @@ class CppMegaLanguageModelEmbedding(LanguageModelEmbedding):
             embeddings = self.embedding_dropout(embeddings)
 
         return embeddings
+
+    def sharded_state_dict(
+        self,
+        prefix: str = "",
+        sharded_offsets: tuple = (),
+        metadata: dict | None = None,
+    ):
+        """Sharded state dict with pipeline-stage-aware replica ids for cppmega submodules.
+
+        Upstream ``LanguageModelEmbedding`` inherits the default
+        ``MegatronModule.sharded_state_dict`` walker. For any custom submodule
+        (``cppmega_ngram_hash`` / ``cppmega_structure``) that walker produces
+        ShardedTensors with ``replica_id=(0, tp_rank, dp_rank)`` on every PP
+        stage where the embedding exists. When Multi-Token Prediction (MTP) is
+        enabled, ``CppMegaMambaModel`` / ``CppMegaGPTModel`` build the
+        embedding on *both* the first PP stage (``pre_process``) **and** the
+        MTP stage (``mtp_process``), so Megatron's
+        ``validate_sharding_integrity`` sees two "main replicas"
+        (``shard_access_cnt=2``) for the same key and aborts the checkpoint
+        save with ``Invalid access pattern for ShardedTensor(...)``.
+
+        For every cppmega-owned submodule under ``self``, rewrite the replica
+        id to match the upstream convention used for the tied word embedding
+        (see ``tie_word_embeddings_state_dict`` in
+        ``megatron.core.transformer.multi_token_prediction``):
+
+        * PP-first / ``pre_process`` stage: ``(0, tp_rank, dp_rank)`` (main)
+        * MTP copy (any later PP stage that still holds the embedding):
+          ``(1, tp_rank, dp_rank)`` (secondary copy)
+
+        On PP stages that do not hold the embedding, the parent
+        ``CppMegaMambaModel.__init__`` simply does not instantiate the
+        embedding, so this method is never reached.
+        """
+
+        sharded_state_dict = super().sharded_state_dict(
+            prefix=prefix, sharded_offsets=sharded_offsets, metadata=metadata
+        )
+
+        if _mcore_parallel_state is None:
+            # Local dev environment without Megatron; nothing to rewrite.
+            return sharded_state_dict
+
+        # Determine whether this embedding lives on the pipeline-first stage.
+        # If Megatron's parallel state is not initialized (unit-test mode),
+        # treat the module as pipeline-first so the rewrite is a no-op.
+        try:
+            is_first_pipeline_stage = _mcore_parallel_state.is_pipeline_first_stage(
+                ignore_virtual=True
+            )
+        except (AssertionError, RuntimeError, AttributeError):
+            is_first_pipeline_stage = True
+
+        leading_replica_axis = 0 if is_first_pipeline_stage else 1
+
+        custom_key_prefixes = tuple(
+            f"{prefix}{suffix}" for suffix in _CPPMEGA_CUSTOM_PREFIXES
+        )
+        if not custom_key_prefixes:
+            return sharded_state_dict
+
+        for key, value in sharded_state_dict.items():
+            if not key.startswith(custom_key_prefixes):
+                continue
+            existing = getattr(value, "replica_id", None)
+            if existing is None:
+                continue
+            if isinstance(existing, int):
+                # Should not happen for tensor shardings created by the default
+                # walker, but handle it conservatively: a scalar replica id is
+                # already "main" (0) or "copy" (non-zero). Preserve copy-ness.
+                new_replica = leading_replica_axis if existing == 0 else existing
+            else:
+                tail = tuple(existing[1:]) if len(existing) >= 1 else ()
+                new_replica = (leading_replica_axis,) + tail
+            try:
+                value.replica_id = new_replica
+            except AttributeError:
+                # ShardedObject / ShardedTensor dataclasses are frozen in some
+                # Megatron versions; fall back to object.__setattr__.
+                object.__setattr__(value, "replica_id", new_replica)
+
+        return sharded_state_dict

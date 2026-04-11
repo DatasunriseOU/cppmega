@@ -1,5 +1,112 @@
 # NAM56R NeMo Migration Changelog
 
+## 2026-04-11: M²RNN Triton kernel libdevice.tanh + smoke14
+
+Replaced the manual stable-tanh in the fused Triton M²RNN kernel
+(`cppmega/megatron/m2rnn_triton.py`) with the hardware `tanh.approx.f32`
+PTX instruction via `tl.inline_asm_elementwise`, and eliminated the
+per-step `h_new` recompute in the backward kernel by saving the
+pre-gate `h_new` candidate from the forward pass.
+
+**Why inline PTX and not `libdevice.tanh`:** Triton ships
+`triton.language.extra.libdevice.tanh` which was expected to lower to
+the SFU `tanh.approx.f32` op. On bench3 H200 with Triton 3.7.0 it maps
+instead to `__nv_tanh` from the cuda libdevice bitcode (a software
+polynomial), measured ~22% *slower* than the prior manual stable-tanh
+formula.  Switching to `tl.inline_asm_elementwise` with the raw
+`tanh.approx.f32 $0, $1;` instruction gives a true 1-SFU-op tanh.
+
+**H200 microbench at NAM56R dims (B=2 S=4096 H=8 K=64 V=16, bf16):**
+
+| kernel variant               | fwd (ms) | fwd+bwd (ms) |
+|------------------------------|---------:|-------------:|
+| manual stable-tanh (smoke13) |    4.82  |       16.18  |
+| `libdevice.tanh` (polynomial)|    5.88  |       19.64  |
+| inline PTX `tanh.approx.f32` |    3.97  |       15.08  |
+| + bwd loads saved `h_new`    |    3.92  |       12.95  |
+| num_warps=2 (rejected)       |    6.76  |       17.44  |
+| num_warps=8 (rejected)       |    3.95  |       16.07  |
+| input_precision=tf32 (rejected — breaks fp32 parity test) | 3.74 | 11.58 |
+
+Final kernel (inline PTX tanh + saved h_new + num_warps=4): fwd=3.92 ms,
+fwd+bwd=12.95 ms. fwd −18.7%, fwd+bwd −20.0% vs the manual stable-tanh
+baseline.  All 9 tests in `tests/test_m2rnn_triton.py` pass on both
+bench3 H200 and GB10 (sm_121).
+
+**End-to-end smoke14 on bench3 H200×8 (15 iter, PP=4 MBS=2 GBS=16
+seq=4096 BF16 te_attn graphs, identical config to smoke13):**
+
+| run     | iter 5-15 mean (ms) | first loss | last loss | NaN |
+|---------|--------------------:|-----------:|----------:|:---:|
+| smoke13 (manual stable)  | 1396.98 | 12.499 | 7.753 | no |
+| smoke14 (inline PTX + h_new save) | 1365.15 | 12.499 | 7.822 | no |
+
+Training-time delta: −31.8 ms/iter (−2.28%). Modest gain vs the
+microbench's 3.2 ms kernel-level win per call because the 4 R-layers
+are distributed across PP=4 stages, where each stage is still bound
+by its M-layer cost (Mamba-2 SSD + MLA). Remaining gap to the Path A
+`mamba3_te` target (~1080 ms/iter) is ~285 ms, well beyond the
+maximum ~64 ms the M²RNN kernel can contribute across all 4 R-layers
+at the new speed.
+
+**Other optimizations tried and rejected:**
+
+- `input_precision="tf32"` on all three `tl.dot` calls: measured fwd=3.74
+  fwd+bwd=11.58 ms (−28% vs inline-PTX tanh alone) BUT broke
+  `test_fp32_smoke` with `out max_abs` exceeding the 1e-2 bound on the
+  fp32-input path. TF32's 10-bit mantissa accumulates >1e-2 drift over
+  the 128-step scan. Not "by a hair" — reverted per parity rule.
+- `num_warps=2`: −occupancy, +latency. fwd 3.97 → 6.76, fwd+bwd
+  12.95 → 17.44. Reverted.
+- `num_warps=8`: bwd register pressure blows up; fwd unchanged, fwd+bwd
+  12.95 → 16.07. Reverted.
+- `libdevice.fast_tanhf`: present on the python-level libdevice wrapper
+  but the cuda backend libdevice module does not surface it, compile
+  error at `ast_to_ttir`. Used raw `inline_asm_elementwise` instead.
+
+**What's left on the table to close the ~285 ms gap to Path A:**
+
+- The M²RNN backward still does 2 dots per step (`dh_from_mm` and
+  `dW += h_prev.T @ d_pre`). Both are (16,16)×(16,16) tiny dots that
+  likely saturate the tensor-core launch overhead, not the math — a
+  chunked version processing N>1 time steps at once could amortize
+  that.  Would need a rewrite.
+- Residual 12.95 ms fwd+bwd × 4 R-layers ≈ 52 ms total M²RNN cost is
+  already small enough that the remaining ~285 ms must be outside the
+  R-layer — likely Mamba-2 SSD, MLA, or MoE on the non-R stages, or
+  pipeline bubbles. Profiling with nsys on a PP=4 run should be the
+  next step.
+
+## 2026-04-10 (latest): FP8 validated on Mamba3 paths (guards were never tested)
+
+Removed two precautionary `NotImplementedError` guards that were both
+added without any empirical FP8 test:
+
+  - `cppmega/megatron/author_mamba3_spec.py` (AuthorMamba3Mixer, 2 lines)
+  - `cppmega/megatron/m2rnn_spec.py`         (CppMegaM2RNNMixer, 2 lines)
+
+The previous internal framing ("blocked on upstream MoE grouped GEMM
+FP8 bug") was inaccurate — the real blockers were our own untested
+guards, not any upstream bug. Smoke-tested on 8× H200
+(`h200_1`) with `--fp8-format hybrid --fp8-amax-history-len 16
+--fp8-amax-compute-algo max --cuda-graph-impl none`, 5 iters, PP=4,
+MBS=2, GBS=16, NAM56R feature plan with MLA+MTP+MoE:
+
+| Path | Spec                                   | FP8 result | iter 3-5 ms |
+|------|----------------------------------------|-----------|-------------|
+| A    | `mamba3_te_stack_spec`                 | PASS      | 1116/1082/1064 |
+| B    | `mamba3_author_spec` (SISO)            | PASS      | 1416/1082/1047 |
+| C    | `mamba3_author_spec` + MIMO rank=4     | FAIL      | backward hits TileLang kernel ngroups=8 limit, NOT an FP8 issue |
+| D    | `nam56r_noconv_spec` (NoConvBC + M2RNN)| PASS      | 38279/37625/37909 |
+
+Path C's failure is in `mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py:1314`:
+`ValueError: G value of 8 is not currently supported!`. The forward
+pass succeeded under FP8; only the backward kernel has the ngroups
+constraint. Path C needs either a reduction in `ngroups` or an
+extension of the TileLang MIMO backward to cover G=8.
+
+See `docs/fp8_path_status.md` for the full table.
+
 ## 2026-04-10 (later): Branch B — NoConvMamba3BCMixer wired for SSD path
 
 Following the GB10 autotune exploration hitting a hard hardware wall (see below

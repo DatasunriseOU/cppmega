@@ -48,9 +48,6 @@ class AuthorMamba3Mixer(nn.Module):
             raise NotImplementedError(
                 "AuthorMamba3Mixer currently supports context-parallel-size=1 only"
             )
-        if getattr(config, "fp8", False) or getattr(config, "fp4", False):
-            raise NotImplementedError("AuthorMamba3Mixer currently supports non-fp8, non-fp4 runs only")
-
         try:
             from mamba_ssm.modules.mamba3 import Mamba3
         except ImportError as exc:
