@@ -48,17 +48,11 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import build_module
 
-try:
-    from einops import rearrange
-except ImportError:
-    rearrange = None
-
-try:
-    from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
-    from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
-except ImportError:
-    mamba_chunk_scan_combined = None
-    RMSNormGated = None
+# NO FALLBACKS: these are required runtime dependencies.
+# If they're missing, crash immediately — don't silently degrade.
+from einops import rearrange
+from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
+from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
 
 # ---------------------------------------------------------------------------

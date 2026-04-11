@@ -34,15 +34,13 @@ from cppmega.megatron.mla_shared import (
 )
 from cppmega.recipes.nam56r_launch import build_nam56r_lite_main_pattern
 
-try:
-    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-except ImportError:  # pragma: no cover - remote-only dependency
-    TESpecProvider = None  # type: ignore[assignment]
+# NO FALLBACKS: TE spec provider is required for NAM56R full spec.
+from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 
 try:
     from megatron.core.extensions.kitchen import KitchenSpecProvider
-except ImportError:  # pragma: no cover - remote-only dependency
-    KitchenSpecProvider = None  # type: ignore[assignment]
+except ImportError:
+    KitchenSpecProvider = None  # Kitchen is optional (experimental Megatron extension)
 
 
 

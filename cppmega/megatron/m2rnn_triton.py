@@ -37,10 +37,14 @@ Where ``h_prev`` is the state *before* this step's update and
 in ``y[s]`` during the forward pass).
 
 Backward checkpoint strategy:
-    We save the full y history (shape (B, S, H, K, V)) from the forward
-    so the backward does not need to recompute intermediate tanh values.
-    At NAM56R production dims (B=2, S=4096, H=8, K=64, V=16) that's
-    2*4096*8*64*16*2 = 64 MB per R-layer in bf16 — totally fine.
+    We always save the full y history (shape (B, S, H, K, V)) from the
+    forward.  The h_new candidate tensor (same shape) is OPTIONAL:
+    - CPPMEGA_M2RNN_SAVE_HNEW=0 (default): bwd recomputes h_new from
+      h_prev + k + v + W (one tl.dot + tanh per step, ~2 ms/layer extra).
+      Saves (B*S*H*K*V*2) bytes per R-layer.  At NAM56R full dims
+      (B=4, S=4096, H=44, K=64, V=16) that's ~1.4 GB/layer, ~5.6 GB total.
+    - CPPMEGA_M2RNN_SAVE_HNEW=1: bwd loads h_new from saved tensor (faster
+      bwd, but uses more memory).  Useful for debugging parity.
 
 Usage:
     from cppmega.megatron.m2rnn_triton import m2rnn_scan_triton
@@ -49,9 +53,18 @@ Usage:
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
+
+# When True, the fwd kernel saves h_new (the pre-gate tanh candidate) to global
+# memory so the backward can load it directly.  When False (the default), the
+# backward RECOMPUTES h_new from h_prev + k + v + W, saving
+# (B * S * H * K * V * 2) bytes per R-layer call.  At NAM56R production dims
+# (B=4, S=4096, H=44, K=64, V=16) that is ~1.4 GB/layer, ~5.6 GB across 4
+# R-layers — the difference between OOM and fitting at MBS=5.
+_SAVE_HNEW: bool = os.environ.get("CPPMEGA_M2RNN_SAVE_HNEW", "0") == "1"
 
 
 # Lazy import of triton so importing this module on a CPU-only host still
@@ -89,7 +102,12 @@ if TRITON_AVAILABLE:
         for nw in [1, 2, 4, 8, 16]
         for ns in [1, 2, 3, 4]
     ]
-    _M2RNN_AUTOTUNE_KEY = ["BATCH", "SEQ", "NHEADS", "K_DIM", "V_DIM"]
+    # BATCH is deliberately excluded from the autotune key — it only
+    # affects the grid (program_id(0)), not the kernel body.  Including
+    # it forces a full autotune sweep + Triton JIT recompilation for
+    # each new batch size, which OOMs at MBS≥3 because the JIT compiler
+    # needs ~10-20 GB GPU workspace while the model already fills 100+ GB.
+    _M2RNN_AUTOTUNE_KEY = ["SEQ", "NHEADS", "K_DIM", "V_DIM"]
 
     @triton.autotune(configs=_M2RNN_AUTOTUNE_CONFIGS, key=_M2RNN_AUTOTUNE_KEY)
     @triton.jit
@@ -105,7 +123,7 @@ if TRITON_AVAILABLE:
         out_ptr,
         hfinal_ptr,
         HAS_H0: tl.constexpr,
-        BATCH: tl.constexpr,
+        SAVE_HNEW: tl.constexpr,
         SEQ: tl.constexpr,
         NHEADS: tl.constexpr,
         K_DIM: tl.constexpr,
@@ -193,17 +211,19 @@ if TRITON_AVAILABLE:
                 pack=1,
             )
 
-            # Store h_new (pre-gate candidate) — consumed in bwd to avoid
-            # recomputing ``tanh(hW + x)`` in the backward sweep.
-            tl.store(
-                hnew_ptr
-                + b * hn_sb
-                + s * hn_ss
-                + h_idx * hn_sh
-                + offs_k[:, None] * hn_sk
-                + offs_v[None, :] * hn_sv,
-                h_new,
-            )
+            # Optionally store h_new (pre-gate candidate) for the bwd kernel.
+            # When SAVE_HNEW=False, the bwd kernel recomputes h_new from
+            # h_prev + k + v + W, saving (B*S*H*K*V*2) bytes of global memory.
+            if SAVE_HNEW:
+                tl.store(
+                    hnew_ptr
+                    + b * hn_sb
+                    + s * hn_ss
+                    + h_idx * hn_sh
+                    + offs_k[:, None] * hn_sk
+                    + offs_v[None, :] * hn_sv,
+                    h_new,
+                )
 
             h = xf_s * h + (1.0 - xf_s) * h_new
 
@@ -261,7 +281,7 @@ if TRITON_AVAILABLE:
         dxf_ptr,
         dh0_ptr,
         HAS_H0: tl.constexpr,
-        BATCH: tl.constexpr,
+        SAVE_HNEW: tl.constexpr,
         SEQ: tl.constexpr,
         NHEADS: tl.constexpr,
         K_DIM: tl.constexpr,
@@ -289,15 +309,12 @@ if TRITON_AVAILABLE:
 
         Reads y[s] (the gated state *after* step s).  Also needs
         h_prev (the state *before* step s) for dW; we get it from y[s-1]
-        (or h0 if s == 0).  The candidate h_new[s] is reconstructed from
-        the gate equation: h[s] = xf * h_prev + (1 - xf) * h_new  =>
-        h_new = (h[s] - xf * h_prev) / (1 - xf).
+        (or h0 if s == 0).
 
-        That division-by-(1-xf) could blow up when xf ≈ 1.  In practice
-        the softplus-decay gate is bounded in (0, 1), but to stay numerically
-        safe we instead recompute h_new from k/v/W inline: it's one extra
-        tl.dot per step but avoids the instability.  Kernel is already bound
-        by memory loads of the bf16 y slabs, so an extra dot is cheap.
+        When SAVE_HNEW=True, loads h_new directly from the saved tensor.
+        When SAVE_HNEW=False, recomputes h_new = tanh(h_prev @ W + k⊗v)
+        per step (one extra tl.dot + tanh) to avoid storing the full
+        (B, S, H, K, V) tensor in global memory.
         """
         b = tl.program_id(0)
         h_idx = tl.program_id(1)
@@ -390,19 +407,31 @@ if TRITON_AVAILABLE:
                 dout_ptr + b * dout_sb + s * dout_ss + h_idx * dout_sh + offs_v * dout_sv,
             ).to(tl.float32)
 
-            # Load h_new candidate saved by fwd.  This replaces the previous
-            # hot-path that recomputed ``tanh(h_prev @ W + k⊗v)`` on every
-            # bwd step (one tl.dot + one tanh per step).  Memory cost: one
-            # extra (B, S, H, K, V) tensor per R-layer, matching the y
-            # save size.
-            h_new = tl.load(
-                hnew_ptr
-                + b * hn_sb
-                + s * hn_ss
-                + h_idx * hn_sh
-                + offs_k[:, None] * hn_sk
-                + offs_v[None, :] * hn_sv,
-            ).to(tl.float32)
+            # Obtain h_new (pre-gate tanh candidate).
+            if SAVE_HNEW:
+                # Load from saved fwd tensor (fast, but costs memory).
+                h_new = tl.load(
+                    hnew_ptr
+                    + b * hn_sb
+                    + s * hn_ss
+                    + h_idx * hn_sh
+                    + offs_k[:, None] * hn_sk
+                    + offs_v[None, :] * hn_sv,
+                ).to(tl.float32)
+            else:
+                # Recompute h_new from h_prev + inputs (same math as fwd).
+                # k_s and v_s are already loaded above.
+                x = k_s[:, None] * v_s[None, :]
+                hW = tl.dot(h_prev, W, out_dtype=tl.float32, input_precision="ieee")
+                pre = hW + x
+                h_new = tl.inline_asm_elementwise(
+                    asm="tanh.approx.f32 $0, $1;",
+                    constraints="=f,f",
+                    args=[pre],
+                    dtype=tl.float32,
+                    is_pure=True,
+                    pack=1,
+                )
 
             # dq_s = dy_s @ h_curr.T  (reduce over v)
             dq_s = tl.sum(dy_s[None, :] * h_curr, axis=1)
@@ -540,7 +569,12 @@ class _M2RNNFn(torch.autograd.Function):
             has_h0 = True
 
         y = torch.empty(B, S, H, K_DIM, V_DIM, device=q.device, dtype=q.dtype)
-        h_new_save = torch.empty(B, S, H, K_DIM, V_DIM, device=q.device, dtype=q.dtype)
+        if _SAVE_HNEW:
+            h_new_save = torch.empty(B, S, H, K_DIM, V_DIM, device=q.device, dtype=q.dtype)
+        else:
+            # Dummy 1-element tensor: Triton needs a valid pointer but won't
+            # read/write it when SAVE_HNEW=False.
+            h_new_save = torch.empty(1, device=q.device, dtype=q.dtype)
         out = torch.empty(B, S, H, V_DIM, device=q.device, dtype=q.dtype)
         h_final = torch.empty(B, H, K_DIM, V_DIM, device=q.device, dtype=q.dtype)
 
@@ -558,7 +592,7 @@ class _M2RNNFn(torch.autograd.Function):
             out,
             h_final,
             HAS_H0=has_h0,
-            BATCH=B,
+            SAVE_HNEW=_SAVE_HNEW,
             SEQ=S,
             NHEADS=H,
             K_DIM=K_DIM,
@@ -570,13 +604,18 @@ class _M2RNNFn(torch.autograd.Function):
             xf_sb=xf_c.stride(0), xf_ss=xf_c.stride(1), xf_sh=xf_c.stride(2),
             h0_sb=h0_c.stride(0), h0_sh=h0_c.stride(1), h0_sk=h0_c.stride(2), h0_sv=h0_c.stride(3),
             y_sb=y.stride(0), y_ss=y.stride(1), y_sh=y.stride(2), y_sk=y.stride(3), y_sv=y.stride(4),
-            hn_sb=h_new_save.stride(0), hn_ss=h_new_save.stride(1), hn_sh=h_new_save.stride(2), hn_sk=h_new_save.stride(3), hn_sv=h_new_save.stride(4),
+            hn_sb=h_new_save.stride(0) if _SAVE_HNEW else 0,
+            hn_ss=h_new_save.stride(1) if _SAVE_HNEW else 0,
+            hn_sh=h_new_save.stride(2) if _SAVE_HNEW else 0,
+            hn_sk=h_new_save.stride(3) if _SAVE_HNEW else 0,
+            hn_sv=h_new_save.stride(4) if _SAVE_HNEW else 0,
             out_sb=out.stride(0), out_ss=out.stride(1), out_sh=out.stride(2), out_sv=out.stride(3),
             hf_sb=h_final.stride(0), hf_sh=h_final.stride(1), hf_sk=h_final.stride(2), hf_sv=h_final.stride(3),
         )
 
         ctx.save_for_backward(q_c, k_c, v_c, W_c, xf_c, h0_c, y, h_new_save)
         ctx.has_h0 = has_h0
+        ctx.save_hnew = _SAVE_HNEW
         ctx.orig_shapes = (q.shape, k.shape, v.shape, W.shape, xf.shape)
         return out, h_final
 
@@ -584,6 +623,7 @@ class _M2RNNFn(torch.autograd.Function):
     def backward(ctx, dout, dh_final):
         q_c, k_c, v_c, W_c, xf_c, h0_c, y, h_new_save = ctx.saved_tensors
         has_h0 = ctx.has_h0
+        save_hnew = ctx.save_hnew
         orig_q_shape, orig_k_shape, orig_v_shape, orig_W_shape, orig_xf_shape = ctx.orig_shapes
 
         B, S, H, K_DIM = q_c.shape
@@ -607,7 +647,7 @@ class _M2RNNFn(torch.autograd.Function):
             dout_c, dhf_c,
             dq, dk, dv, dW_slabs, dxf, dh0,
             HAS_H0=has_h0,
-            BATCH=B,
+            SAVE_HNEW=save_hnew,
             SEQ=S,
             NHEADS=H,
             K_DIM=K_DIM,
@@ -619,7 +659,11 @@ class _M2RNNFn(torch.autograd.Function):
             xf_sb=xf_c.stride(0), xf_ss=xf_c.stride(1), xf_sh=xf_c.stride(2),
             h0_sb=h0_c.stride(0), h0_sh=h0_c.stride(1), h0_sk=h0_c.stride(2), h0_sv=h0_c.stride(3),
             y_sb=y.stride(0), y_ss=y.stride(1), y_sh=y.stride(2), y_sk=y.stride(3), y_sv=y.stride(4),
-            hn_sb=h_new_save.stride(0), hn_ss=h_new_save.stride(1), hn_sh=h_new_save.stride(2), hn_sk=h_new_save.stride(3), hn_sv=h_new_save.stride(4),
+            hn_sb=h_new_save.stride(0) if save_hnew else 0,
+            hn_ss=h_new_save.stride(1) if save_hnew else 0,
+            hn_sh=h_new_save.stride(2) if save_hnew else 0,
+            hn_sk=h_new_save.stride(3) if save_hnew else 0,
+            hn_sv=h_new_save.stride(4) if save_hnew else 0,
             dout_sb=dout_c.stride(0), dout_ss=dout_c.stride(1), dout_sh=dout_c.stride(2), dout_sv=dout_c.stride(3),
             dhf_sb=dhf_c.stride(0), dhf_sh=dhf_c.stride(1), dhf_sk=dhf_c.stride(2), dhf_sv=dhf_c.stride(3),
             dq_sb=dq.stride(0), dq_ss=dq.stride(1), dq_sh=dq.stride(2), dq_sk=dq.stride(3),

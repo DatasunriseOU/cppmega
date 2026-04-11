@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# DSA smoke test on 8xH200.
+#
+# This is a MINIMAL importability and patching smoke test -- it uses a toy
+# GPT model (hidden=256, 4 layers) to verify that the DSA Megatron patches
+# apply correctly and the experimental_attention_variant=dsa path loads.
+# It does NOT exercise the full NAM56R architecture.
+#
+# For full NAM56R + DSA benchmarking, use:
+#   scripts/remote_smoke_h200_dsa_full_nam56r.sh
 set -euo pipefail
 
 REMOTE_HOST="${REMOTE_HOST:-h200_legacy}"
@@ -40,7 +49,7 @@ PY
 python - <<'PY'
 from pathlib import Path
 
-p = Path('/mnt/data/megatron-lm/megatron/training/arguments.py')
+p = Path('${REMOTE_ROOT}/megatron-lm/megatron/training/arguments.py')
 text = p.read_text()
 needle = "    kw_args['persist_layer_norm'] = not args.no_persist_layer_norm\n"
 replacement = needle + (
@@ -52,7 +61,7 @@ if replacement not in text:
         raise SystemExit('failed to find Megatron config insertion point for DSA rope fusion override')
     p.write_text(text.replace(needle, replacement, 1))
 
-spec_path = Path('/mnt/data/megatron-lm/megatron/core/models/gpt/experimental_attention_variant_module_specs.py')
+spec_path = Path('${REMOTE_ROOT}/megatron-lm/megatron/core/models/gpt/experimental_attention_variant_module_specs.py')
 spec_text = spec_path.read_text()
 spec_old = (
     '    if config.experimental_attention_variant == "gated_delta_net":\n'
@@ -85,6 +94,8 @@ if layernorm_new not in spec_text:
     spec_path.write_text(spec_text.replace(layernorm_old, layernorm_new, 1))
 PY
 
+# NOTE: This is a toy model (hidden=256). For full NAM56R + DSA throughput,
+# use scripts/remote_smoke_h200_dsa_full_nam56r.sh instead.
 python -m torch.distributed.run --nproc_per_node=8 pretrain_gpt.py \
   --mock-data \
   --tokenizer-type NullTokenizer \

@@ -77,95 +77,20 @@ trap 'rm -rf "${REMOTE_WORKDIR}"' EXIT
 
 # --- Monkey patch / MIMO shim -------------------------------------------------
 #
-# Paths B and C import cppmega.megatron.mamba3_te_mixer which does:
-#   from megatron.core.inference.contexts.static_context import deprecate_inference_params
-# but in the installed megatron-core 0.18rc0 that function lives in
-# megatron.core.utils.  Inject a compatibility alias before pretrain_mamba runs.
-#
-# Path C additionally needs TransformerConfig.cppmega_mamba3_is_mimo=True set at
-# __init__ time via a __post_init__ hook.
+# Use the canonical shim module at scripts/cppmega_fp8_shim.py.  It installs:
+#   (1) megatron.core.inference.contexts.static_context.deprecate_inference_params
+#       compatibility alias (needed by mamba3_te_mixer on megatron-core 0.18rc0)
+#   (2) MIMO config patch driven by CPPMEGA_MAMBA3_MIMO / CPPMEGA_MAMBA_NUM_GROUPS
+#       (enables is_mimo=True, rank=4, chunk=16 on TransformerConfig __post_init__)
+#   (3) TransformerConfig.__getattr__ AttributeError fallback for cppmega_mamba3_*
+#       (so getattr(..., default) works for optional attributes)
+#   (4) Float16Module.__init__ ONE-SHOT patch that restores Mamba3 fp32 params
+#       (dt_bias, D, B_bias, C_bias, mimo_x_bias, mimo_z_bias, mimo_o_bias) after
+#       Megatron's blanket bf16 cast, so the TileLang mamba_mimo_fwd_kernel dtype
+#       contract is preserved.  Replaces the previous per-forward pre-hook which
+#       nsys showed was the #1 iter-time bottleneck (305 ms/iter elementwise).
 
-cat > "${REMOTE_WORKDIR}/cppmega_fp8_shim.py" <<'PY'
-"""Shim: install deprecate_inference_params alias and optional MIMO patch."""
-from __future__ import annotations
-
-import os
-
-# (1) deprecate_inference_params compatibility shim.
-try:
-    from megatron.core.inference.contexts import static_context as _sc
-    if not hasattr(_sc, "deprecate_inference_params"):
-        try:
-            from megatron.core.utils import deprecate_inference_params as _dip
-        except ImportError:
-            def _dip(inference_context, inference_params):
-                if inference_context is None and inference_params is not None:
-                    return inference_params
-                return inference_context
-        _sc.deprecate_inference_params = _dip
-except Exception as _exc:  # pragma: no cover
-    import sys
-    print(f"[cppmega_fp8_shim] static_context alias skipped: {_exc}", file=sys.stderr)
-
-# (2) Optional MIMO patch for Path C: add default fields to TransformerConfig
-# so the author Mamba3 mixer picks up is_mimo=True / rank=4 / chunk=16.
-# Also optional mamba_num_groups override via CPPMEGA_MAMBA_NUM_GROUPS.
-_mimo_on = os.environ.get("CPPMEGA_MAMBA3_MIMO", "0") == "1"
-_num_groups_override = os.environ.get("CPPMEGA_MAMBA_NUM_GROUPS", "")
-if _mimo_on or _num_groups_override:
-    try:
-        from megatron.core.transformer.transformer_config import TransformerConfig
-        _orig_post_init = TransformerConfig.__post_init__
-
-        def _cppmega_mimo_post_init(self):
-            if _num_groups_override:
-                try:
-                    _ng = int(_num_groups_override)
-                    object.__setattr__(self, "mamba_num_groups", _ng)
-                    print(f"[cppmega_fp8_shim] mamba_num_groups override -> {_ng}")
-                except Exception as _e:
-                    import sys
-                    print(f"[cppmega_fp8_shim] mamba_num_groups override failed: {_e}", file=sys.stderr)
-            _orig_post_init(self)
-            if _mimo_on:
-                if not getattr(self, "cppmega_mamba3_is_mimo", False):
-                    object.__setattr__(self, "cppmega_mamba3_is_mimo", True)
-                if not getattr(self, "cppmega_mamba3_mimo_rank", None):
-                    object.__setattr__(self, "cppmega_mamba3_mimo_rank", 4)
-                if not getattr(self, "cppmega_mamba3_chunk_size", None):
-                    object.__setattr__(self, "cppmega_mamba3_chunk_size", 16)
-
-        TransformerConfig.__post_init__ = _cppmega_mimo_post_init
-        if _mimo_on:
-            print("[cppmega_fp8_shim] MIMO patch installed (rank=4, chunk=16)")
-        if _num_groups_override:
-            print(f"[cppmega_fp8_shim] mamba_num_groups override arm set -> {_num_groups_override}")
-    except Exception as _exc:  # pragma: no cover
-        import sys
-        print(f"[cppmega_fp8_shim] MIMO patch failed: {_exc}", file=sys.stderr)
-
-# (3) Always allow dynamic mamba3 attr lookups on the dataclass.
-# IMPORTANT: we must RAISE AttributeError for unset cppmega_mamba3_* attrs so
-# that ``getattr(config, "cppmega_mamba3_rope_fraction", 0.5)`` falls back to
-# the supplied default 0.5 (returning None would propagate through and trip
-# asserts like ``rope_fraction in (0.5, 1.0)`` inside CppMegaMamba3TE).
-try:
-    from megatron.core.transformer.transformer_config import TransformerConfig
-    _TC_BASE_GETATTR = getattr(TransformerConfig, "__getattr__", None)
-
-    def _cppmega_getattr(self, name):
-        if name.startswith("cppmega_mamba3_"):
-            raise AttributeError(name)
-        if _TC_BASE_GETATTR is not None:
-            return _TC_BASE_GETATTR(self, name)
-        raise AttributeError(name)
-
-    if not hasattr(TransformerConfig, "_cppmega_mamba3_attr_patched"):
-        TransformerConfig.__getattr__ = _cppmega_getattr
-        TransformerConfig._cppmega_mamba3_attr_patched = True
-except Exception:
-    pass
-PY
+cp "${REMOTE_CPPMEGA_ROOT}/scripts/cppmega_fp8_shim.py" "${REMOTE_WORKDIR}/cppmega_fp8_shim.py"
 
 # --- Quick import smoke -------------------------------------------------------
 PYTHONPATH="${REMOTE_WORKDIR}:${PYTHONPATH:-}" python - <<PY

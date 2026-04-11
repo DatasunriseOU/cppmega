@@ -1,4 +1,15 @@
-"""Author-pure Mamba3 seam wrapped in Megatron-local Mamba builders."""
+"""Author-pure Mamba3 seam wrapped in Megatron-local Mamba builders.
+
+When used inside ``nam56r_te_spec`` the upstream ``MambaLayer.norm`` is
+``IdentityOp`` (a no-op) because the standard Megatron mixer fuses
+LayerNorm into ``TELayerNormColumnParallelLinear``.  Since the Author
+``Mamba3`` module uses a plain ``nn.Linear`` for its ``in_proj`` (no
+fused norm), we must apply RMSNorm explicitly in this mixer so the
+residual stream is normalised before projection.
+
+Without this norm the residual magnitudes grow unbounded through 52
+layers, producing NaN grad_norm from iteration 1.
+"""
 
 from __future__ import annotations
 
@@ -21,7 +32,12 @@ def _group_world_size(group) -> int:
 
 
 class AuthorMamba3Mixer(nn.Module):
-    """Training-only Megatron mixer shim around the upstream author Mamba3."""
+    """Training-only Megatron mixer shim around the upstream author Mamba3.
+
+    Includes an explicit RMSNorm before ``Mamba3.in_proj`` to compensate
+    for the missing fused norm when used with ``IdentityOp`` as the
+    ``MambaLayer`` norm (standard in ``mamba_stack_spec``).
+    """
 
     def __init__(
         self,
@@ -61,6 +77,16 @@ class AuthorMamba3Mixer(nn.Module):
         if torch.cuda.is_available() and not getattr(config, "use_cpu_initialization", False):
             device = torch.cuda.current_device()
 
+        # RMSNorm applied before in_proj to compensate for IdentityOp norm
+        # in MambaLayer.  Matches the behaviour of TELayerNormColumnParallelLinear
+        # which fuses LayerNorm + Linear in the standard MambaMixer path.
+        self.pre_norm = nn.RMSNorm(
+            d_model,
+            eps=getattr(config, "layernorm_epsilon", 1e-5),
+            device=device,
+            dtype=config.params_dtype,
+        )
+
         self.mixer = Mamba3(
             d_model=author_config.d_model,
             d_state=author_config.d_state,
@@ -96,6 +122,10 @@ class AuthorMamba3Mixer(nn.Module):
             raise NotImplementedError("AuthorMamba3Mixer does not support packed sequences yet")
         if hidden_states.ndim != 3:
             raise ValueError("AuthorMamba3Mixer expects hidden_states shaped [seq, batch, hidden]")
+
+        # Apply RMSNorm before projection (compensates for IdentityOp norm
+        # in upstream MambaLayer).
+        hidden_states = self.pre_norm(hidden_states)
 
         batch_first = hidden_states.transpose(0, 1).contiguous()
         out = self.mixer(batch_first)

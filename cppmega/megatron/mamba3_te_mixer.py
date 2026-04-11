@@ -37,33 +37,15 @@ from megatron.core.inference.contexts.static_context import deprecate_inference_
 
 from cppmega.features.mamba3 import build_author_mamba3_config
 
-# Author Mamba3 kernel imports (available on GPU nodes with mamba_ssm installed)
-try:
-    from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
-except ImportError:
-    RMSNormGated = None
-
-try:
-    from mamba_ssm.ops.triton.mamba3.mamba3_siso_combined import mamba3_siso_combined
-except ImportError:
-    mamba3_siso_combined = None
-
-try:
-    from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo as mamba3_mimo_combined
-except ImportError:
-    mamba3_mimo_combined = None
-
-try:
-    from mamba_ssm.ops.triton.angle_cumsum import angle_dt
-except ImportError:
-    angle_dt = None
-
-try:
-    from mamba_ssm.ops.triton.mamba3.mamba3_mimo_rotary_step import (
-        apply_rotary_qk_inference_fwd,
-    )
-except ImportError:
-    apply_rotary_qk_inference_fwd = None
+# NO FALLBACKS: Author Mamba3 kernels are REQUIRED.
+# If mamba_ssm is not installed or kernels are missing, crash immediately.
+from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
+from mamba_ssm.ops.triton.mamba3.mamba3_siso_combined import mamba3_siso_combined
+from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo as mamba3_mimo_combined
+from mamba_ssm.ops.triton.angle_cumsum import angle_dt
+from mamba_ssm.ops.triton.mamba3.mamba3_mimo_rotary_step import (
+    apply_rotary_qk_inference_fwd,
+)
 
 try:
     from mamba_ssm.ops.cute.mamba3.mamba3_step_fn import mamba3_step_fn
