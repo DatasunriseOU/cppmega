@@ -103,6 +103,11 @@ def build_megatron_args_bundle(
                 str(moe_ffn_hidden_size),
                 "--moe-shared-expert-intermediate-size",
                 str(moe_shared_expert_intermediate_size),
+                # AllToAll dispatcher required for CUDA graph compatibility.
+                # AllGather (default) has .item() D2H sync that breaks graph capture.
+                "--moe-token-dispatcher-type",
+                "alltoall",
+                "--moe-permute-fusion",
             ]
         )
         args.extend(_bool_flag(moe_grouped_gemm, "--moe-grouped-gemm"))
