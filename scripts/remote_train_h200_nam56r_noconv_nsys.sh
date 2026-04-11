@@ -1,30 +1,53 @@
 #!/usr/bin/env bash
-# Launch NAM56R training on H200 using the vanilla Mamba-2 SSD kernel path
-# with Mamba3 B/C features (QK-Norm + learnable bias) injected as Python
-# preprocessing.  This is Branch B from the Test-loop task -- an alternative
-# to the mamba3_te recipe (Author kernels, 127k tok/sec) that reuses the
-# proven-fast mamba_chunk_scan_combined kernel.
+# Nsys-profiled variant of remote_train_h200_nam56r_noconv.sh.
 #
-# Usage (same contract as remote_train_h200_nam56r_full.sh):
+# This is a COPY of the existing noconv launch script with the sole addition
+# of nsys profiling on LOCAL_RANK=0 only. All other arguments (model config,
+# CUDA graph mode, env vars, etc.) are identical. Do NOT edit the original
+# script -- this file exists for profiling runs only.
 #
-#     REMOTE_HOST=h200_legacy \
-#     REMOTE_ZONE=LOCATION_3 \
-#     CPPMEGA_TRAIN_ITERS=10 \
-#     bash scripts/remote_train_h200_nam56r_noconv.sh
+# Profiling strategy:
+# * Only rank 0 is traced. With 8 GPUs on a single node and the standard
+#   data-parallel / pipeline-parallel setup, rank 0's timeline is
+#   representative of the critical path.
+# * Delayed-start capture: --delay=NNN --duration=MMM lets nsys skip the
+#   import/bootstrap/compile/CUDA-graph-capture warmup (iters 1-4 cost ~100s
+#   of wall time on this config) and land directly in steady state.
+# * The steady-state iter time on smoke14 is ~1365 ms, so 20 s of capture
+#   covers ~14 iterations -- more than enough for a per-kernel breakdown.
 #
-# The script is intentionally a near-copy of remote_train_h200_nam56r_full.sh
-# so differences are visible in diff view: the ONLY change is the ``--spec``
-# argument to point at the noconv stack builder.
+# Usage (defaults target smoke14 config):
+#
+#     REMOTE_HOST=h200_1 \
+#     REMOTE_ZONE=LOCATION_1 \
+#     CPPMEGA_TRAIN_ITERS=15 \
+#     CPPMEGA_MICRO_BATCH_SIZE=2 \
+#     CPPMEGA_GLOBAL_BATCH_SIZE=16 \
+#     CPPMEGA_PP_SIZE=4 \
+#     CPPMEGA_SEQ_LENGTH=4096 \
+#     CPPMEGA_RUN_ID=cppmega_nam56r_noconv_smoke15_nsys \
+#     CPPMEGA_NSYS_DELAY=150 \
+#     CPPMEGA_NSYS_DURATION=25 \
+#     bash scripts/remote_train_h200_nam56r_noconv_nsys.sh
+#
+# Environment knobs added on top of the base script:
+#   CPPMEGA_NSYS_DELAY       (default 150)    seconds before capture starts
+#   CPPMEGA_NSYS_DURATION    (default 25)     seconds of capture
+#   CPPMEGA_NSYS_OUTPUT      (default /mnt/data/cppmega-root/cppmega/nsys_smoke15_full.nsys-rep)
+#   CPPMEGA_NSYS_SPEC        (default cppmega.megatron.nam56r_noconv_spec build_cppmega_nam56r_noconv_stack_spec)
+#                            override to e.g.
+#                              "cppmega.megatron.mamba3_te_stack_spec cppmega_mamba3_te_stack_spec"
+#                            for a Path A comparison profile.
 set -euo pipefail
 
-REMOTE_HOST="${REMOTE_HOST:-h200_legacy}"
-REMOTE_ZONE="${REMOTE_ZONE:-LOCATION_3}"
-REMOTE_ROOT="${REMOTE_ROOT:-/mnt/data}"
-CPPMEGA_RUN_ID="${CPPMEGA_RUN_ID:-cppmega_nam56r_noconv_train}"
-REMOTE_VENV="${REMOTE_VENV:-${REMOTE_ROOT}/cppmega-venv}"
+REMOTE_HOST="${REMOTE_HOST:-h200_1}"
+REMOTE_ZONE="${REMOTE_ZONE:-LOCATION_1}"
+REMOTE_ROOT="${REMOTE_ROOT:-/mnt/data/cppmega-root}"
+CPPMEGA_RUN_ID="${CPPMEGA_RUN_ID:-cppmega_nam56r_noconv_smoke15_nsys}"
+REMOTE_VENV="${REMOTE_VENV:-/mnt/data/venv}"
 REMOTE_LOG="${REMOTE_LOG:-${REMOTE_ROOT}/cppmega/${CPPMEGA_RUN_ID}.log}"
-REMOTE_TMP_SCRIPT="${REMOTE_TMP_SCRIPT:-/tmp/cppmega-remote-nam56r-noconv-train.sh}"
-LOCAL_TMP_SCRIPT="$(mktemp -t cppmega-remote-nam56r-noconv.XXXXXX.sh)"
+REMOTE_TMP_SCRIPT="${REMOTE_TMP_SCRIPT:-/tmp/cppmega-remote-nam56r-noconv-nsys.sh}"
+LOCAL_TMP_SCRIPT="$(mktemp -t cppmega-remote-nam56r-noconv-nsys.XXXXXX.sh)"
 
 trap 'rm -f "${LOCAL_TMP_SCRIPT}"' EXIT
 
@@ -32,33 +55,19 @@ cat > "${LOCAL_TMP_SCRIPT}" <<'INNER'
 set -euo pipefail
 source "${REMOTE_VENV}/bin/activate"
 export PYTHONPATH="${REMOTE_ROOT}/cppmega:${REMOTE_ROOT}/megatron-lm:${PYTHONPATH:-}"
-# Force TransformerEngine to load the venv's cuDNN 9.20 (which has MLA engine configs
-# for sm_90 at head_dim_qk=96/head_dim_v=64), NOT the system cuDNN 9.10.2 that ldconfig
-# resolves by default. Without this, the unversioned ctypes.CDLL("libcudnn.so") in TE's
-# _load_cuda_library falls through to /lib/x86_64-linux-gnu which has the older version
-# that lacks MLA configs and crashes with "No valid engine configs" on the NAM56R attn
-# layer. A sibling fix creates the venv's libcudnn.so -> libcudnn.so.9 symlink.
 _VENV_CUDNN_LIB="${REMOTE_VENV}/lib/python3.13/site-packages/nvidia/cudnn/lib"
 if [ -d "${_VENV_CUDNN_LIB}" ]; then
   export LD_LIBRARY_PATH="${_VENV_CUDNN_LIB}:${LD_LIBRARY_PATH:-}"
 fi
-# Reduce PyTorch CUDA memory fragmentation. CUDA graph capture pre-allocates
-# large static workspaces; without expandable_segments the allocator fragments
-# badly on MBS=4 + MTP + MoE16-top4 + grouped GEMM and OOMs even though the
-# 141 GiB H200 has plenty of raw capacity. Observed on smoke6/7 where
-# GPU used=72.7 GiB, fragmented reserved=1.5 GiB, failed to alloc 516 MiB.
-# expandable_segments lets the allocator remap/coalesce free chunks so CUDA
-# graph workspace + per-step buffers can share the same heap.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-# expandable_segments:True + CUDA graph capture requires NCCL_GRAPH_REGISTER=0
-# to avoid illegal memory access when NCCL tries to register graph-captured
-# buffers that get remapped by the expandable allocator. Megatron asserts this
-# combination at arguments.py:1573-1576.
 export NCCL_GRAPH_REGISTER="${NCCL_GRAPH_REGISTER:-0}"
 mkdir -p "${REMOTE_ROOT}/cppmega" "${REMOTE_ROOT}/.triton-cache"
 REMOTE_CKPT_DIR="${REMOTE_ROOT}/cppmega/${CPPMEGA_RUN_ID}_ckpt"
-REMOTE_WORKDIR="$(mktemp -d /tmp/cppmega-nam56r-noconv.XXXXXX)"
+REMOTE_WORKDIR="$(mktemp -d /tmp/cppmega-nam56r-noconv-nsys.XXXXXX)"
 trap 'rm -rf "${REMOTE_WORKDIR}"' EXIT
+
+which nsys
+nsys --version
 
 python -c "import cppmega, megatron, transformer_engine; print('import smoke ok', cppmega.__version__)"
 python -c "from cppmega.megatron.nam56r_noconv_spec import build_cppmega_nam56r_noconv_stack_spec; print('noconv spec importable')"
@@ -95,11 +104,6 @@ PY
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_IB_SL=1
 export TRITON_CACHE_DIR="${REMOTE_ROOT}/.triton-cache"
-# CUDA graph capture with TE requires NCCL_GRAPH_REGISTER=0 to avoid illegal
-# memory access when PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is also
-# active (which Megatron sets by default). Without this, training crashes at
-# startup with "AssertionError: Setting NCCL_GRAPH_REGISTER=0 to avoid illegal
-# memory access when using CUDA Graph".
 export NCCL_GRAPH_REGISTER="${NCCL_GRAPH_REGISTER:-0}"
 export CPPMEGA_NEM_PATTERN="AEMEAEMEAEMR"
 export CPPMEGA_LAYER_DEPTH=52
@@ -159,40 +163,10 @@ else
   )
 fi
 
-# CUDA graph capture wiring.
-#
-# NAM56R uses dropless MoE (no moe-expert-capacity-factor and no
-# moe-pad-expert-input-to-capacity) so the MoE layer has dynamic shapes and
-# cannot be captured in a CUDA graph -- attempting to do so hits
-# "RuntimeError: Cannot copy between CPU and CUDA tensors during CUDA graph
-# capture unless the CPU tensor is pinned" inside MoEAlltoAll dispatcher's
-# tokens_per_expert = self.local_map.sum(dim=0).long().cpu() on line 295.
-#
-# Per megatron-core/transformer/moe/README.md, the correct config for dropless
-# MoE with CUDA graphs is:
-#   --cuda-graph-impl=transformer_engine --cuda-graph-scope=attn
-# which captures only TransformerLayer._forward_attention() and leaves the MoE
-# _forward_mlp() untouched. Also required: --te-rng-tracker.
-#
-# The --cuda-graph-scope=attn scope is NOT supported by --cuda-graph-impl=local
-# (local only supports full_iteration / full_iteration_inference scopes).
-#
-# Avoid --moe-shared-expert-overlap (incompatible with graphs).
-#
-# Env vars:
-#   CPPMEGA_CUDA_GRAPH       = te_attn (default) | te_full | local_full | none
-#     te_attn   -> TE impl, attn-only scope  (works with dropless MoE)
-#     te_full   -> TE impl, full scope       (likely hits MoE shared expert assert)
-#     local_full-> local impl, full_iteration scope (local+dropless MoE fails)
-#     none      -> CUDA graphs disabled
-#   CPPMEGA_CUDA_GRAPH_WARMUP_STEPS = integer warmup steps before capture
 CPPMEGA_CUDA_GRAPH="${CPPMEGA_CUDA_GRAPH:-te_attn}"
 CUDA_GRAPH_ARGS=()
 case "${CPPMEGA_CUDA_GRAPH}" in
   te_attn)
-    # te_rng_tracker is auto-enabled by Megatron when cuda_graph_impl includes
-    # transformer_engine (arguments.py:1568-1571), no need to pass it as CLI flag
-    # (there is no --te-rng-tracker argparse declaration anyway).
     CUDA_GRAPH_ARGS+=(
       --cuda-graph-impl transformer_engine
       --cuda-graph-scope attn
@@ -222,10 +196,43 @@ case "${CPPMEGA_CUDA_GRAPH}" in
     ;;
 esac
 
-python -m torch.distributed.run --nproc_per_node=8 "${REMOTE_WORKDIR}/pretrain_mamba.py" \
+CPPMEGA_NSYS_OUTPUT="${CPPMEGA_NSYS_OUTPUT:-${REMOTE_ROOT}/cppmega/nsys_smoke15_full.nsys-rep}"
+CPPMEGA_NSYS_DELAY="${CPPMEGA_NSYS_DELAY:-150}"
+CPPMEGA_NSYS_DURATION="${CPPMEGA_NSYS_DURATION:-25}"
+CPPMEGA_NSYS_SPEC="${CPPMEGA_NSYS_SPEC:-cppmega.megatron.nam56r_noconv_spec build_cppmega_nam56r_noconv_stack_spec}"
+
+# Write a per-rank wrapper script: only rank 0 is traced by nsys. Other ranks
+# exec the Python target directly. This keeps the nsys report small (~1-2 GB)
+# and avoids multi-process nsys contention.
+cat > "${REMOTE_WORKDIR}/nsys_rank0_wrapper.sh" <<WRAPPER
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "\${LOCAL_RANK:-0}" = "0" ]; then
+  exec nsys profile \\
+    --trace=cuda,nvtx,osrt \\
+    --sample=none \\
+    --cpuctxsw=none \\
+    --gpu-metrics-device=none \\
+    --delay=${CPPMEGA_NSYS_DELAY} \\
+    --duration=${CPPMEGA_NSYS_DURATION} \\
+    --output=${CPPMEGA_NSYS_OUTPUT} \\
+    --force-overwrite=true \\
+    --export=none \\
+    python "\$@"
+else
+  exec python "\$@"
+fi
+WRAPPER
+chmod +x "${REMOTE_WORKDIR}/nsys_rank0_wrapper.sh"
+
+rm -f "${CPPMEGA_NSYS_OUTPUT}" || true
+
+python -m torch.distributed.run --nproc_per_node=8 --no-python \
+  "${REMOTE_WORKDIR}/nsys_rank0_wrapper.sh" \
+  "${REMOTE_WORKDIR}/pretrain_mamba.py" \
   "${DATA_ARGS[@]}" \
   --tensor-model-parallel-size 1 \
-  --pipeline-model-parallel-size "${CPPMEGA_PP_SIZE:-1}" \
+  --pipeline-model-parallel-size "${CPPMEGA_PP_SIZE:-4}" \
   --context-parallel-size 1 \
   --sequence-parallel \
   --use-distributed-optimizer \
@@ -254,7 +261,7 @@ python -m torch.distributed.run --nproc_per_node=8 "${REMOTE_WORKDIR}/pretrain_m
   --use-mcore-models \
   --transformer-impl transformer_engine \
   --attention-backend "${CPPMEGA_ATTN_BACKEND:-auto}" \
-  --spec cppmega.megatron.nam56r_noconv_spec build_cppmega_nam56r_noconv_stack_spec \
+  --spec ${CPPMEGA_NSYS_SPEC} \
   "${CUDA_GRAPH_ARGS[@]}" \
   ${NATIVE_ARGS} \
   --save "${REMOTE_CKPT_DIR}" \
@@ -263,9 +270,12 @@ python -m torch.distributed.run --nproc_per_node=8 "${REMOTE_WORKDIR}/pretrain_m
   --log-interval 1 \
   > "${REMOTE_LOG}" 2>&1
 
-tail -n 120 "${REMOTE_LOG}"
+echo "--- training log tail ---"
+tail -n 60 "${REMOTE_LOG}"
+echo "--- nsys artefact ---"
+ls -la "${CPPMEGA_NSYS_OUTPUT}" || echo "nsys output MISSING"
 INNER
 
 gcloud compute scp --zone "${REMOTE_ZONE}" "${LOCAL_TMP_SCRIPT}" "${REMOTE_HOST}:${REMOTE_TMP_SCRIPT}"
-gcloud compute ssh "${REMOTE_HOST}" --zone "${REMOTE_ZONE}" --command "REMOTE_ROOT='${REMOTE_ROOT}' REMOTE_VENV='${REMOTE_VENV}' REMOTE_LOG='${REMOTE_LOG}' CPPMEGA_RUN_ID='${CPPMEGA_RUN_ID}' CPPMEGA_TRAIN_ITERS='${CPPMEGA_TRAIN_ITERS:-2}' CPPMEGA_PP_SIZE='${CPPMEGA_PP_SIZE:-4}' CPPMEGA_SEQ_LENGTH='${CPPMEGA_SEQ_LENGTH:-4096}' CPPMEGA_MAX_POSITION_EMBEDDINGS='${CPPMEGA_MAX_POSITION_EMBEDDINGS:-4096}' CPPMEGA_MICRO_BATCH_SIZE='${CPPMEGA_MICRO_BATCH_SIZE:-1}' CPPMEGA_GLOBAL_BATCH_SIZE='${CPPMEGA_GLOBAL_BATCH_SIZE:-8}' CPPMEGA_LR='${CPPMEGA_LR:-1e-4}' CPPMEGA_MIN_LR='${CPPMEGA_MIN_LR:-1e-5}' CPPMEGA_DATA_PATH='${CPPMEGA_DATA_PATH:-}' CPPMEGA_DATA_SPLIT='${CPPMEGA_DATA_SPLIT:-98,1,1}' CPPMEGA_TOKENIZER_TYPE='${CPPMEGA_TOKENIZER_TYPE:-HuggingFaceTokenizer}' CPPMEGA_TOKENIZER_MODEL='${CPPMEGA_TOKENIZER_MODEL:-}' CPPMEGA_VOCAB_SIZE='${CPPMEGA_VOCAB_SIZE:-131072}' CPPMEGA_EVAL_ITERS='${CPPMEGA_EVAL_ITERS:-1}' CPPMEGA_SAVE_INTERVAL='${CPPMEGA_SAVE_INTERVAL:-1}' CPPMEGA_ATTN_BACKEND='${CPPMEGA_ATTN_BACKEND:-auto}' CPPMEGA_CUDA_GRAPH='${CPPMEGA_CUDA_GRAPH:-te_attn}' CPPMEGA_CUDA_GRAPH_WARMUP_STEPS='${CPPMEGA_CUDA_GRAPH_WARMUP_STEPS:-3}' bash '${REMOTE_TMP_SCRIPT}' || (status=\$?; echo 'remote nam56r-noconv train failed; tail follows:'; tail -n 200 '${REMOTE_LOG}' || true; exit \$status)"
+gcloud compute ssh "${REMOTE_HOST}" --zone "${REMOTE_ZONE}" --command "REMOTE_ROOT='${REMOTE_ROOT}' REMOTE_VENV='${REMOTE_VENV}' REMOTE_LOG='${REMOTE_LOG}' CPPMEGA_RUN_ID='${CPPMEGA_RUN_ID}' CPPMEGA_TRAIN_ITERS='${CPPMEGA_TRAIN_ITERS:-15}' CPPMEGA_PP_SIZE='${CPPMEGA_PP_SIZE:-4}' CPPMEGA_SEQ_LENGTH='${CPPMEGA_SEQ_LENGTH:-4096}' CPPMEGA_MAX_POSITION_EMBEDDINGS='${CPPMEGA_MAX_POSITION_EMBEDDINGS:-4096}' CPPMEGA_MICRO_BATCH_SIZE='${CPPMEGA_MICRO_BATCH_SIZE:-2}' CPPMEGA_GLOBAL_BATCH_SIZE='${CPPMEGA_GLOBAL_BATCH_SIZE:-16}' CPPMEGA_LR='${CPPMEGA_LR:-1e-4}' CPPMEGA_MIN_LR='${CPPMEGA_MIN_LR:-1e-5}' CPPMEGA_DATA_PATH='${CPPMEGA_DATA_PATH:-}' CPPMEGA_DATA_SPLIT='${CPPMEGA_DATA_SPLIT:-98,1,1}' CPPMEGA_TOKENIZER_TYPE='${CPPMEGA_TOKENIZER_TYPE:-HuggingFaceTokenizer}' CPPMEGA_TOKENIZER_MODEL='${CPPMEGA_TOKENIZER_MODEL:-}' CPPMEGA_VOCAB_SIZE='${CPPMEGA_VOCAB_SIZE:-131072}' CPPMEGA_EVAL_ITERS='${CPPMEGA_EVAL_ITERS:-1}' CPPMEGA_SAVE_INTERVAL='${CPPMEGA_SAVE_INTERVAL:-1000}' CPPMEGA_ATTN_BACKEND='${CPPMEGA_ATTN_BACKEND:-auto}' CPPMEGA_CUDA_GRAPH='${CPPMEGA_CUDA_GRAPH:-te_attn}' CPPMEGA_CUDA_GRAPH_WARMUP_STEPS='${CPPMEGA_CUDA_GRAPH_WARMUP_STEPS:-3}' CPPMEGA_NSYS_DELAY='${CPPMEGA_NSYS_DELAY:-150}' CPPMEGA_NSYS_DURATION='${CPPMEGA_NSYS_DURATION:-25}' CPPMEGA_NSYS_OUTPUT='${CPPMEGA_NSYS_OUTPUT:-/mnt/data/cppmega-root/cppmega/nsys_smoke15_full.nsys-rep}' CPPMEGA_NSYS_SPEC='${CPPMEGA_NSYS_SPEC:-cppmega.megatron.nam56r_noconv_spec build_cppmega_nam56r_noconv_stack_spec}' bash '${REMOTE_TMP_SCRIPT}' || (status=\$?; echo 'remote nam56r-noconv nsys run failed; tail follows:'; tail -n 200 '${REMOTE_LOG}' || true; exit \$status)"
 gcloud compute ssh "${REMOTE_HOST}" --zone "${REMOTE_ZONE}" --command "rm -f '${REMOTE_TMP_SCRIPT}'"

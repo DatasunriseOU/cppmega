@@ -105,6 +105,12 @@ def build_cppmega_nam56r_noconv_stack_spec(config):
     Same TE-fused submodules as ``build_cppmega_nam56r_te_stack_spec`` (norm,
     attention, MLP, MoE, MTP all upstream-TE).  Only the Mamba mixer changes
     to route through the vanilla SSD scan kernel with Mamba3 B/C preprocessing.
+
+    R-layer positions (12/24/36/48 in the 52-layer NAM56R layout) are always
+    routed through ``CppMegaM2RNNMixer``, which dispatches to the fused Triton
+    ``m2rnn_scan_triton`` kernel (see ``cppmega/megatron/m2rnn_triton.py``).
+    The learned M2RNN state transition is part of the NAM56R architecture and
+    cannot be silently disabled.
     """
     r_layer_indices = load_r_layer_indices()
     upstream = mamba_stack_spec.submodules
