@@ -112,7 +112,8 @@ class FusedBwdBwdP4:
         sSts  = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
         sLKQ  = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
         sDKI  = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
-        sK_T  = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
+        sK_T0  = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
+        sK_T1  = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
         sDKI_T = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
         # sK dies after GEMM2. Reuse it as the output staging scratch instead of
         # keeping a separate resident sOut tile for the four per-chunk outputs
@@ -130,8 +131,14 @@ class FusedBwdBwdP4:
         )
         acc_dstates.fill(0.0)
 
+        if nchunks > 0:
+            first_chunk_idx = nchunks - 1
+            cute.copy(copy_g2s, thr_g2s.partition_S(gKT_all[first_chunk_idx, None, None]), thr_g2s.partition_D(sK_T0))
+        arch.sync_threads()
+
         for chunk_rev in cutlass.range(nchunks, unroll=1):
             chunk_idx = nchunks - 1 - chunk_rev
+            next_chunk_idx = chunk_idx - 1
 
             gK_c = gK_all[chunk_idx, None, None]
             gKT_c = gKT_all[chunk_idx, None, None]
@@ -246,13 +253,24 @@ class FusedBwdBwdP4:
             arch.fence_view_async_shared()
             arch.sync_threads()
 
-            # Load K^T only when its live range actually begins: just before GEMM9.
-            cute.copy(copy_g2s, thr_g2s.partition_S(gKT_c), thr_g2s.partition_D(sK_T))
-            arch.sync_threads()
+            # K^T uses its own tiny double-buffer. Prefetch the next chunk's K^T while
+            # the current chunk continues on the already-materialized bank.
+            if (chunk_rev & 1) == 0:
+                if next_chunk_idx >= 0:
+                    cute.copy(copy_g2s, thr_g2s.partition_S(gKT_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sK_T1))
+                arch.sync_threads()
 
-            # === GEMM9: dq += dki^T @ K (via pre-transposed K_T and computed dki_T) ===
-            _, tA9, tB9 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDKI_T, sK_T)
-            sm90_utils.gemm(tiled_mma, acc_dq, tA9, tB9, zero_init=False, wg_wait=0)
+                # === GEMM9: dq += dki^T @ K (via pre-transposed K_T and computed dki_T) ===
+                _, tA9, tB9 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDKI_T, sK_T0)
+                sm90_utils.gemm(tiled_mma, acc_dq, tA9, tB9, zero_init=False, wg_wait=0)
+            else:
+                if next_chunk_idx >= 0:
+                    cute.copy(copy_g2s, thr_g2s.partition_S(gKT_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sK_T0))
+                arch.sync_threads()
+
+                # === GEMM9: dq += dki^T @ K (via pre-transposed K_T and computed dki_T) ===
+                _, tA9, tB9 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDKI_T, sK_T1)
+                sm90_utils.gemm(tiled_mma, acc_dq, tA9, tB9, zero_init=False, wg_wait=0)
 
             # === Store per-chunk outputs ===
             gDPs_c = gDPs_all[chunk_idx, None, None]
