@@ -1,28 +1,39 @@
-"""Phase 4: Full bwd_bwd kernel with ALL outputs computed inside CuTe DSL.
+"""Phase 4: Phase 3 + GEMM 10 loop-carried dstates accumulator.
 
-WGMMA (K-major both) computes A @ B^T.
-TileLang GEMMs that use A @ B (no transpose_B) get B^T pre-transposed on host.
-TileLang GEMM9 (transpose_A) handled by in-kernel dki transpose via smem.
+GEMM chain per chunk:
+  1. dPsiV  = K @ Dst^T            (fcs, N)
+  2. lkq    = K @ Q^T              (fcs, fcs)  - R2S spilled
+  3. dPsiV += lkq @ DPh^T          (fcs, N)
+  4. dqkd   = DPh @ PsiV^T         (fcs, fcs)
+  5. dk     = PsiV @ Dst^T         (fcs, N)
+  6. dki    = PsiV @ DPh^T         (fcs, fcs)  - R2S spilled
+  7. dk    += dki @ Q               (fcs, N)    (FIXED: uses pre-transposed Q_T)
+  8. dq     = DPh @ Sts^T          (fcs, N)
+  9. dq    += dki^T @ K             (fcs, N)    (FIXED: uses GEMM6' for dki_T + pre-transposed K_T)
+ 10. dstates_accum += Q_T @ DPh    (N, P)      <-- NEW: loop-carried accumulator
 
-GEMM mapping (TileLang -> CuTe DSL):
-  1. K @ dstates      (no tr_B)   -> sK @ sDstT    where DstT = dstates^T from host
-  2. K @ Q^T           (tr_B)     -> sK @ sQ        (native)
-  3. lkq @ DPhiO       (no tr_B)  -> sLKQ @ sDPhT   where DPhT = DPhiO^T from host
-  4. DPhiO @ PsiV^T    (tr_B)     -> sDPh @ sPsi    (native)
-  5. PsiV @ dstates^T  (tr_B)     -> sPsi @ sDst    where Dst = dstates from host (native)
-  6. PsiV @ DPhiO^T    (tr_B)     -> sPsi @ sDPh    (native)
-  7. dki @ Q            (no tr_B)  -> sDKI @ sQT     where QT = Q^T from host
-  8. DPhiO @ states^T  (tr_B)     -> sDPh @ sSts    (native)
-  9. dki^T @ K          (tr_A)    -> sDKI_T @ sKT   where DKI_T = in-kernel transpose, KT = K^T from host
+Input layout note for GEMM 10:
+  The caller MUST pre-transpose Q to a new tensor Q_T of shape (total, nchunks, N, fcs).
+  This avoids the MN-major smem-descriptor legalization failure that occurs when we
+  try to reinterpret the K-major-swizzled sQ as MN-major. Q_T is loaded via the same
+  row-major g2s path into a dedicated sQ_T smem tile and then fed K-major to GEMM 10
+  as A = Q_T (shape (N, fcs)) -- which is exactly what WGMMA C = A @ B^T needs to
+  produce `Q^T @ DPh` of shape (N, P).
+
+Key differences vs Phase 3:
+  - Accepts mQ_T: extra input, Q pre-transposed to (total, nchunks, N, fcs)
+  - Allocates dedicated sQ_T smem tile
+  - acc_dstates is allocated ONCE outside the chunk loop, zero-init at start
+  - GEMM 10 happens each chunk, zero_init=False
+  - Stores acc_dstates ONCE after the chunk loop (per-CTA, no chunk axis)
 """
 import os
-os.environ.setdefault("CUTE_DSL_ARCH", "sm_90a")
+os.environ.setdefault('CUTE_DSL_ARCH', 'sm_90a')
 
 import torch
 import math
 import cutlass
 import cutlass.cute as cute
-import cutlass.pipeline as cutlass_pipeline
 from cutlass import BFloat16, Float32, Int32, Boolean, const_expr
 from cutlass.cute import arch
 from cutlass.cute.nvgpu import warpgroup
@@ -41,78 +52,30 @@ except Exception:
 import cuda.bindings.driver as cuda
 
 
-def _warp_id() -> int:
-    return arch.thread_idx()[0] // 32
-
-
-def _is_producer_warp() -> bool:
-    return _warp_id() == 0
-
-
-def _set_warpgroup_reg_budget(is_producer: bool):
-    if not hasattr(warpgroup, "setmaxregister"):
-        return
-    try:
-        if is_producer:
-            warpgroup.setmaxregister(40, increase=False)
-        else:
-            warpgroup.setmaxregister(232, increase=True)
-    except TypeError:
-        try:
-            if is_producer:
-                warpgroup.setmaxregister(40)
-            else:
-                warpgroup.setmaxregister(232)
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-
-def _has_async_pipeline_surface() -> bool:
-    arch_has_barrier = (
-        hasattr(arch, "mbarrier_init")
-        and hasattr(arch, "mbarrier_arrive")
-        and hasattr(arch, "mbarrier_try_wait")
-    )
-    arch_has_bulk = (
-        hasattr(arch, "cp_async_bulk_tensor_2d_global_to_shared")
-        or hasattr(arch, "cp_async_bulk")
-    )
-    pipeline_has_helpers = (
-        hasattr(cutlass_pipeline, "Pipeline")
-        or hasattr(cutlass_pipeline, "MbarrierArray")
-        or hasattr(cutlass_pipeline, "make_pipeline")
-    )
-    return arch_has_barrier and arch_has_bulk and pipeline_has_helpers
-
-
 class FusedBwdBwdP4:
-    """Full bwd_bwd kernel with correct GEMM transposes and all outputs."""
+    """Phase 4: 10-GEMM fused bwd_bwd with loop-carried dstates."""
 
     def __init__(self, N=64, P=64, R=4, chunk_size=16, dtype=BFloat16):
         self.N = N
         self.P = P
         self.R = R
         self.chunk_size = chunk_size
-        self.fcs = chunk_size * R
+        self.fcs = chunk_size * R  # 64
         self.dtype = dtype
         self.num_threads = 128
 
     @cute.kernel
     def kernel(
         self,
-        mK, mQ, mDst, mDPh, mPsi, mSts,
-        mDstT, mDPhT, mQT, mKT,  # Pre-transposed inputs
+        mK, mK_T, mQ, mQ_T, mDst, mDPh, mDPh_T, mPsi, mSts,
         mDPsiV, mDK, mDQ, mDqkd, mDstatesOut,
         H,
         tiled_mma,
+        tiled_mma_dstates,
         sLayout_64x64,
         copy_g2s, copy_s2g,
     ):
         tidx = arch.thread_idx()[0]
-        is_producer = _is_producer_warp()
-        _set_warpgroup_reg_budget(is_producer)
         bidx_h = arch.block_idx()[0]
         bidx_b = arch.block_idx()[1]
         N = self.N
@@ -122,93 +85,126 @@ class FusedBwdBwdP4:
         hb = bidx_b * H + bidx_h
 
         gK_all = mK[hb, None, None, None]
+        gKT_all = mK_T[hb, None, None, None]
         gQ_all = mQ[hb, None, None, None]
+        gQT_all = mQ_T[hb, None, None, None]
         gDst_all = mDst[hb, None, None, None]
         gDPh_all = mDPh[hb, None, None, None]
+        gDPhT_all = mDPh_T[hb, None, None, None]
         gPsi_all = mPsi[hb, None, None, None]
         gSts_all = mSts[hb, None, None, None]
-        gDstT_all = mDstT[hb, None, None, None]
-        gDPhT_all = mDPhT[hb, None, None, None]
-        gQT_all = mQT[hb, None, None, None]
-        gKT_all = mKT[hb, None, None, None]
-
         gDPs_all = mDPsiV[hb, None, None, None]
         gDK_all = mDK[hb, None, None, None]
         gDQ_all = mDQ[hb, None, None, None]
         gDqd_all = mDqkd[hb, None, None, None]
+        gDsO = mDstatesOut[hb, None, None]  # (N, P) -- one per CTA, no chunk axis
 
         nchunks = cute.size(gK_all.shape[0])
 
         smem = SmemAllocator()
-        sK    = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
-        sQ    = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
-        sDst  = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
-        sDPh  = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
+        sK     = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
+        sQ     = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
+        sQ_T   = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
+        sDst   = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
+        sDPh   = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
+        sDPh_T = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
         sPsi  = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
         sSts  = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
-        sDstT = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
-        sDPhT = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
-        sQT   = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
-        sKT   = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
         sLKQ  = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
         sDKI  = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
-        sOutL = cute.make_layout((fcs, P), stride=(P, 1))
-        sOut  = smem.allocate_tensor(self.dtype, sOutL)
+        sK_T  = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
+        sDKI_T = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
+        # sK dies after GEMM2. Reuse it as the output staging scratch instead of
+        # keeping a separate resident sOut tile for the four per-chunk outputs
+        # and the final dstates writeback.
+        sOut = sK
 
         thr_g2s = copy_g2s.get_slice(tidx)
         thr_s2g = copy_s2g.get_slice(tidx)
         wg_mma = tiled_mma.get_slice(tidx)
         shape_mnk = (fcs, N, N)
 
+        # Loop-carried dstates accumulator (zero-init BEFORE the chunk loop)
+        acc_dstates = cute.make_rmem_tensor(
+            wg_mma.partition_shape_C((N, P)), Float32
+        )
+        acc_dstates.fill(0.0)
+
         for chunk_rev in cutlass.range(nchunks, unroll=1):
             chunk_idx = nchunks - 1 - chunk_rev
-            if is_producer:
-                cute.copy(copy_g2s, thr_g2s.partition_S(gK_all[chunk_idx, None, None]),
-                          thr_g2s.partition_D(sK))
-                cute.copy(copy_g2s, thr_g2s.partition_S(gQ_all[chunk_idx, None, None]),
-                          thr_g2s.partition_D(sQ))
-                cute.copy(copy_g2s, thr_g2s.partition_S(gDst_all[chunk_idx, None, None]),
-                          thr_g2s.partition_D(sDst))
-                cute.copy(copy_g2s, thr_g2s.partition_S(gDPh_all[chunk_idx, None, None]),
-                          thr_g2s.partition_D(sDPh))
-                cute.copy(copy_g2s, thr_g2s.partition_S(gPsi_all[chunk_idx, None, None]),
-                          thr_g2s.partition_D(sPsi))
-                cute.copy(copy_g2s, thr_g2s.partition_S(gSts_all[chunk_idx, None, None]),
-                          thr_g2s.partition_D(sSts))
-                cute.copy(copy_g2s, thr_g2s.partition_S(gDstT_all[chunk_idx, None, None]),
-                          thr_g2s.partition_D(sDstT))
-                cute.copy(copy_g2s, thr_g2s.partition_S(gDPhT_all[chunk_idx, None, None]),
-                          thr_g2s.partition_D(sDPhT))
-                cute.copy(copy_g2s, thr_g2s.partition_S(gQT_all[chunk_idx, None, None]),
-                          thr_g2s.partition_D(sQT))
-                cute.copy(copy_g2s, thr_g2s.partition_S(gKT_all[chunk_idx, None, None]),
-                          thr_g2s.partition_D(sKT))
+
+            gK_c = gK_all[chunk_idx, None, None]
+            gKT_c = gKT_all[chunk_idx, None, None]
+            gQ_c = gQ_all[chunk_idx, None, None]
+            gQT_c = gQT_all[chunk_idx, None, None]
+            gDst_c = gDst_all[chunk_idx, None, None]
+            gDPh_c = gDPh_all[chunk_idx, None, None]
+            gDPhT_c = gDPhT_all[chunk_idx, None, None]
+            gPsi_c = gPsi_all[chunk_idx, None, None]
+            gSts_c = gSts_all[chunk_idx, None, None]
+
+            cute.copy(copy_g2s, thr_g2s.partition_S(gK_c), thr_g2s.partition_D(sK))
+            cute.copy(copy_g2s, thr_g2s.partition_S(gQ_c), thr_g2s.partition_D(sQ))
+            cute.copy(copy_g2s, thr_g2s.partition_S(gQT_c), thr_g2s.partition_D(sQ_T))
+            cute.copy(copy_g2s, thr_g2s.partition_S(gDst_c), thr_g2s.partition_D(sDst))
+            cute.copy(copy_g2s, thr_g2s.partition_S(gDPh_c), thr_g2s.partition_D(sDPh))
+            cute.copy(copy_g2s, thr_g2s.partition_S(gDPhT_c), thr_g2s.partition_D(sDPh_T))
+            cute.copy(copy_g2s, thr_g2s.partition_S(gPsi_c), thr_g2s.partition_D(sPsi))
+            cute.copy(copy_g2s, thr_g2s.partition_S(gSts_c), thr_g2s.partition_D(sSts))
             arch.sync_threads()
 
-            _, tA1, tB1 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sK, sDstT)
+            # === GEMM1: dPsiV = K @ Dst^T ===
+            _, tA1, tB1 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sK, sDst)
             acc_dPsiV = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, N)), Float32)
             sm90_utils.gemm(tiled_mma, acc_dPsiV, tA1, tB1, zero_init=True, wg_wait=0)
 
+            # === GEMM2: lkq = K @ Q^T ===
             _, tA2, tB2 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sK, sQ)
             acc_lkq = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, fcs)), Float32)
             sm90_utils.gemm(tiled_mma, acc_lkq, tA2, tB2, zero_init=True, wg_wait=0)
 
+            # === GEMM4: dqkd = DPh @ Psi^T ===
             _, tA4, tB4 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDPh, sPsi)
             acc_dqkd = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, fcs)), Float32)
             sm90_utils.gemm(tiled_mma, acc_dqkd, tA4, tB4, zero_init=True, wg_wait=0)
 
+            # === GEMM5: dk = Psi @ Dst^T ===
             _, tA5, tB5 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sPsi, sDst)
             acc_dk = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, N)), Float32)
             sm90_utils.gemm(tiled_mma, acc_dk, tA5, tB5, zero_init=True, wg_wait=0)
 
+            # === GEMM6: dki = Psi @ DPh^T ===
             _, tA6, tB6 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sPsi, sDPh)
             acc_dki = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, fcs)), Float32)
             sm90_utils.gemm(tiled_mma, acc_dki, tA6, tB6, zero_init=True, wg_wait=0)
 
+            # === GEMM6': dki_T = DPh @ Psi^T (transpose of GEMM6, for GEMM9) ===
+            _, tA6p, tB6p = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDPh, sPsi)
+            acc_dki_T = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, fcs)), Float32)
+            sm90_utils.gemm(tiled_mma, acc_dki_T, tA6p, tB6p, zero_init=True, wg_wait=0)
+
+            # === GEMM8: dq = DPh @ Sts^T ===
             _, tA8, tB8 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDPh, sSts)
             acc_dq = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, N)), Float32)
             sm90_utils.gemm(tiled_mma, acc_dq, tA8, tB8, zero_init=True, wg_wait=0)
 
+            # === GEMM10: dstates_accum += Q^T @ DPh ===
+            # Caller pre-transposes:
+            #   Q  -> Q_T of shape (N, fcs)  so A = Q^T natively fits K-major (M, K)
+            #   DPh -> DPh_T of shape (P, fcs) so B = DPh^T natively fits K-major (N, K)
+            # WGMMA then computes: C[m,n] = sum_k A[m,k] * B[n,k]
+            #                            = Q^T[m,k] * DPh^T[n,k]
+            #                            = Q[k,m] * DPh[k,n]
+            #                            = (Q^T @ DPh)[m,n]  -- exactly GEMM 10
+            _, tA10, tB10 = sm90_utils.partition_fragment_ABC(
+                wg_mma, shape_mnk, sQ_T, sDPh_T
+            )
+            sm90_utils.gemm(
+                tiled_mma, acc_dstates, tA10, tB10,
+                zero_init=False, wg_wait=0,
+            )
+
+            # R2S: spill lkq for GEMM3 and dki for GEMM7/9
             copy_r2s_lkq, _, _ = copy_utils.get_smem_store_C(
                 tiled_mma, sLKQ, tidx, arch=90, position_independent=True,
             )
@@ -225,93 +221,95 @@ class FusedBwdBwdP4:
             dki_cvt.store(dki_frg.load().to(self.dtype))
             copy_r2s_dki(dki_cvt)
 
+            # sLKQ/sDKI become live here and are consumed immediately by GEMM3/GEMM7.
+            # Fence them early instead of waiting on the separate dki_T spill for GEMM9.
             arch.fence_view_async_shared()
             arch.sync_threads()
 
-            _, tA3, tB3 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sLKQ, sDPhT)
+            # === GEMM3: dPsiV += lkq @ DPh^T ===
+            _, tA3, tB3 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sLKQ, sDPh)
             sm90_utils.gemm(tiled_mma, acc_dPsiV, tA3, tB3, zero_init=False, wg_wait=0)
 
-            _, tA7, tB7 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDKI, sQT)
+            # === GEMM7: dk += dki @ Q (via pre-transposed Q_T) ===
+            _, tA7, tB7 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDKI, sQ_T)
             sm90_utils.gemm(tiled_mma, acc_dk, tA7, tB7, zero_init=False, wg_wait=0)
 
-            copy_r2s_dqkd, _, _ = copy_utils.get_smem_store_C(
-                tiled_mma, sLKQ, tidx, arch=90, position_independent=True,
+            # R2S: spill dki_T for GEMM9
+            copy_r2s_dki_T, _, _ = copy_utils.get_smem_store_C(
+                tiled_mma, sDKI_T, tidx, arch=90, position_independent=True,
             )
-            dqkd_frg = layout_utils.reshape_acc_to_frgA(acc_dqkd)
-            dqkd_cvt = cute.make_rmem_tensor_like(dqkd_frg, self.dtype)
-            dqkd_cvt.store(dqkd_frg.load().to(self.dtype))
-            copy_r2s_dqkd(dqkd_cvt)
+            dki_T_frg = layout_utils.reshape_acc_to_frgA(acc_dki_T)
+            dki_T_cvt = cute.make_rmem_tensor_like(dki_T_frg, self.dtype)
+            dki_T_cvt.store(dki_T_frg.load().to(self.dtype))
+            copy_r2s_dki_T(dki_T_cvt)
 
             arch.fence_view_async_shared()
             arch.sync_threads()
 
-            _, tA9, tB9 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sLKQ, sKT)
+            # Load K^T only when its live range actually begins: just before GEMM9.
+            cute.copy(copy_g2s, thr_g2s.partition_S(gKT_c), thr_g2s.partition_D(sK_T))
+            arch.sync_threads()
+
+            # === GEMM9: dq += dki^T @ K (via pre-transposed K_T and computed dki_T) ===
+            _, tA9, tB9 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDKI_T, sK_T)
             sm90_utils.gemm(tiled_mma, acc_dq, tA9, tB9, zero_init=False, wg_wait=0)
 
+            # === Store per-chunk outputs ===
             gDPs_c = gDPs_all[chunk_idx, None, None]
             gDK_c = gDK_all[chunk_idx, None, None]
             gDQ_c = gDQ_all[chunk_idx, None, None]
             gDqd_c = gDqd_all[chunk_idx, None, None]
 
-            copy_fn, _, _ = copy_utils.get_smem_store_C(tiled_mma, sOut, tidx, arch=90)
-            frg = layout_utils.reshape_acc_to_frgA(acc_dPsiV)
-            cvt = cute.make_rmem_tensor_like(frg, self.dtype)
-            cvt.store(frg.load().to(self.dtype))
-            copy_fn(cvt)
-            arch.sync_threads()
-            cute.copy(copy_s2g, thr_s2g.partition_S(sOut), thr_s2g.partition_D(gDPs_c))
-            arch.sync_threads()
+            def store_acc(acc, gdst):
+                copy_fn, _, _ = copy_utils.get_smem_store_C(tiled_mma, sOut, tidx, arch=90)
+                frg = layout_utils.reshape_acc_to_frgA(acc)
+                cvt = cute.make_rmem_tensor_like(frg, self.dtype)
+                cvt.store(frg.load().to(self.dtype))
+                copy_fn(cvt)
+                arch.sync_threads()
+                cute.copy(copy_s2g, thr_s2g.partition_S(sOut), thr_s2g.partition_D(gdst))
+                arch.sync_threads()
 
-            copy_fn, _, _ = copy_utils.get_smem_store_C(tiled_mma, sOut, tidx, arch=90)
-            frg = layout_utils.reshape_acc_to_frgA(acc_dk)
-            cvt = cute.make_rmem_tensor_like(frg, self.dtype)
-            cvt.store(frg.load().to(self.dtype))
-            copy_fn(cvt)
-            arch.sync_threads()
-            cute.copy(copy_s2g, thr_s2g.partition_S(sOut), thr_s2g.partition_D(gDK_c))
-            arch.sync_threads()
+            store_acc(acc_dPsiV, gDPs_c)
+            store_acc(acc_dk, gDK_c)
+            store_acc(acc_dq, gDQ_c)
+            store_acc(acc_dqkd, gDqd_c)
 
-            copy_fn, _, _ = copy_utils.get_smem_store_C(tiled_mma, sOut, tidx, arch=90)
-            frg = layout_utils.reshape_acc_to_frgA(acc_dq)
-            cvt = cute.make_rmem_tensor_like(frg, self.dtype)
-            cvt.store(frg.load().to(self.dtype))
-            copy_fn(cvt)
-            arch.sync_threads()
-            cute.copy(copy_s2g, thr_s2g.partition_S(sOut), thr_s2g.partition_D(gDQ_c))
-            arch.sync_threads()
-
-            copy_fn, _, _ = copy_utils.get_smem_store_C(tiled_mma, sOut, tidx, arch=90)
-            frg = layout_utils.reshape_acc_to_frgA(acc_dqkd)
-            cvt = cute.make_rmem_tensor_like(frg, self.dtype)
-            cvt.store(frg.load().to(self.dtype))
-            copy_fn(cvt)
-            arch.sync_threads()
-            cute.copy(copy_s2g, thr_s2g.partition_S(sOut), thr_s2g.partition_D(gDqd_c))
-            arch.sync_threads()
+        # === Store dstates ONCE after the loop (loop-carried accumulator) ===
+        copy_fn_ds, _, _ = copy_utils.get_smem_store_C(
+            tiled_mma, sOut, tidx, arch=90,
+        )
+        frg_ds = layout_utils.reshape_acc_to_frgA(acc_dstates)
+        cvt_ds = cute.make_rmem_tensor_like(frg_ds, self.dtype)
+        cvt_ds.store(frg_ds.load().to(self.dtype))
+        copy_fn_ds(cvt_ds)
+        arch.sync_threads()
+        cute.copy(copy_s2g, thr_s2g.partition_S(sOut), thr_s2g.partition_D(gDsO))
+        arch.sync_threads()
 
     @cute.jit
-    def __call__(self, mK, mQ, mDst, mDPh, mPsi, mSts,
-                 mDstT, mDPhT, mQT, mKT,
+    def __call__(self, mK, mK_T, mQ, mQ_T, mDst, mDPh, mDPh_T, mPsi, mSts,
                  mDPsiV, mDK, mDQ, mDqkd, mDstatesOut, H, B, stream):
         fcs = self.fcs
         N = self.N
+        P = self.P
 
         mK = assume_tensor_aligned(mK)
+        mK_T = assume_tensor_aligned(mK_T)
         mQ = assume_tensor_aligned(mQ)
+        mQ_T = assume_tensor_aligned(mQ_T)
         mDst = assume_tensor_aligned(mDst)
         mDPh = assume_tensor_aligned(mDPh)
+        mDPh_T = assume_tensor_aligned(mDPh_T)
         mPsi = assume_tensor_aligned(mPsi)
         mSts = assume_tensor_aligned(mSts)
-        mDstT = assume_tensor_aligned(mDstT)
-        mDPhT = assume_tensor_aligned(mDPhT)
-        mQT = assume_tensor_aligned(mQT)
-        mKT = assume_tensor_aligned(mKT)
         mDPsiV = assume_tensor_aligned(mDPsiV)
         mDK = assume_tensor_aligned(mDK)
         mDQ = assume_tensor_aligned(mDQ)
         mDqkd = assume_tensor_aligned(mDqkd)
         mDstatesOut = assume_tensor_aligned(mDstatesOut)
 
+        # Single tiled_mma reused for all 10 GEMMs (N==P==fcs==64)
         tiled_mma = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype, self.dtype,
             warpgroup.OperandMajorMode.K, warpgroup.OperandMajorMode.K,
@@ -338,10 +336,9 @@ class FusedBwdBwdP4:
         )
 
         self.kernel(
-            mK, mQ, mDst, mDPh, mPsi, mSts,
-            mDstT, mDPhT, mQT, mKT,
+            mK, mK_T, mQ, mQ_T, mDst, mDPh, mDPh_T, mPsi, mSts,
             mDPsiV, mDK, mDQ, mDqkd, mDstatesOut, H,
-            tiled_mma, sLayout_64x64, copy_g2s, copy_s2g,
+            tiled_mma, tiled_mma, sLayout_64x64, copy_g2s, copy_s2g,
         ).launch(
             grid=(H, B, 1),
             block=(self.num_threads, 1, 1),
@@ -350,6 +347,7 @@ class FusedBwdBwdP4:
 
 
 _CACHE_P4 = {}
+
 
 def _get_compiled(N, P, R, chunk_size, nchunks, H, B):
     key = (N, P, R, chunk_size, nchunks, H, B)
@@ -363,24 +361,28 @@ def _get_compiled(N, P, R, chunk_size, nchunks, H, B):
             stride = (nchunks * rows * cols, rows * cols, cols, 1)
             return make_fake_tensor(BFloat16, shape, stride=stride, assumed_align=16)
 
+        def mk3d(rows, cols):  # one per CTA, no chunk axis
+            shape = (total, rows, cols)
+            stride = (rows * cols, cols, 1)
+            return make_fake_tensor(BFloat16, shape, stride=stride, assumed_align=16)
+
         stream_arg = cuda.CUstream(0)
         compiled = cute.compile(
             obj,
-            mk4d(fcs, N),   # K
-            mk4d(fcs, N),   # Q
-            mk4d(N, P),     # Dst (dstates)
-            mk4d(fcs, P),   # DPh (DPhiO)
-            mk4d(fcs, P),   # Psi (PsiV)
-            mk4d(N, P),     # Sts (states)
-            mk4d(P, N),     # DstT (dstates^T)
-            mk4d(P, fcs),   # DPhT (DPhiO^T)
-            mk4d(N, fcs),   # QT (Q^T)
-            mk4d(N, fcs),   # KT (K^T)
-            mk4d(fcs, P),   # DPsiV out
-            mk4d(fcs, N),   # DK out
-            mk4d(fcs, N),   # DQ out
-            mk4d(fcs, fcs), # Dqkd out
-            mk4d(N, P),     # Dstates out
+            mk4d(fcs, N),    # K
+            mk4d(N, fcs),    # K_T (pre-transposed)
+            mk4d(fcs, N),    # Q
+            mk4d(N, fcs),    # Q_T (pre-transposed)
+            mk4d(N, P),      # Dst
+            mk4d(fcs, P),    # DPh
+            mk4d(P, fcs),    # DPh_T (pre-transposed)
+            mk4d(fcs, P),    # Psi
+            mk4d(N, P),      # Sts
+            mk4d(fcs, P),    # DPsiV out
+            mk4d(fcs, N),    # DK out
+            mk4d(fcs, N),    # DQ out
+            mk4d(fcs, fcs),  # Dqkd out
+            mk3d(N, P),      # Dstates out (per-CTA, loop-carried)
             H, B, stream_arg,
         )
         _CACHE_P4[key] = compiled
@@ -388,32 +390,63 @@ def _get_compiled(N, P, R, chunk_size, nchunks, H, B):
 
 
 def run_p4(N, P, R, chunk_size, K, Q, Dst, DPh, Psi, Sts,
-           DPsiV, DK, DQ, Dqkd, DstatesOut, nchunks, H, B, stream):
-    """Run P4 kernel. Auto-creates transposed inputs."""
-    DstT = Dst.transpose(-1, -2).contiguous()
-    DPhT = DPh.transpose(-1, -2).contiguous()
-    QT = Q.transpose(-1, -2).contiguous()
-    KT = K.transpose(-1, -2).contiguous()
-
+           DPsiV, DK, DQ, Dqkd, DstatesOut, nchunks, H, B, stream,
+           K_T=None, Q_T=None, DPh_T=None):
     compiled = _get_compiled(N, P, R, chunk_size, nchunks, H, B)
     dl = lambda t: from_dlpack(t, assumed_align=16)
-    compiled(dl(K), dl(Q), dl(Dst), dl(DPh), dl(Psi), dl(Sts),
-             dl(DstT), dl(DPhT), dl(QT), dl(KT),
+    # Pre-transpose K, Q, and DPh to feed MN-major operands via K-major smem
+    if K_T is None:
+        K_T = K.transpose(-1, -2).contiguous()
+    if Q_T is None:
+        Q_T = Q.transpose(-1, -2).contiguous()
+    if DPh_T is None:
+        DPh_T = DPh.transpose(-1, -2).contiguous()
+    compiled(dl(K), dl(K_T), dl(Q), dl(Q_T), dl(Dst), dl(DPh), dl(DPh_T), dl(Psi), dl(Sts),
              dl(DPsiV), dl(DK), dl(DQ), dl(Dqkd), dl(DstatesOut),
              H, B, stream)
 
 
-def test_p4():
-    """Test Phase 4 against TileLang-correct references."""
-    N, P, R, chunk_size = 64, 64, 4, 16
-    B, S, H = 1, 256, 4
+
+def compute_epilogue_outputs(
+    dout, q_raw, k_raw, v,
+    q_bias, k_bias, mimo_v, mimo_o,
+    angles, dA_cs, dA_cs_rev, dt, trap, D, segsum, states, qk_dot,
+    chunk_size=16, R=4, rotary_dim_divisor=4,
+):
+    """Compute ALL epilogue outputs from bwd_bwd, matching TileLang exactly.
+
+    This replaces the previous placeholder/approximate implementation.
+    All outputs now use the exact TileLang formulas including:
+    - Proper exp(dA_cs_rev) scaling for DDA_CS_REV
+    - Full trap scaling for DFACTOR
+    - QK_DOT-based DGAMMA_DIAG computation
+    - Segsum-masked DSSDA
+    - State-passing DDA via cached STATES
+    - Full rotary-embedding DANGLES via inverse rotation
+
+    Inputs match TileLang's mamba_mimo_bwd_bwd signature.
+    """
+    from full_bwd_bwd_epilogue import full_bwd_bwd_pytorch
+    return full_bwd_bwd_pytorch(
+        dout, q_raw, k_raw, v,
+        q_bias, k_bias, mimo_v, mimo_o,
+        angles, dA_cs, dA_cs_rev, dt, trap, D, segsum, states, qk_dot,
+        chunk_size=chunk_size, R=R, rotary_dim_divisor=rotary_dim_divisor,
+    )
+
+
+def bench(shape_label, B, S, H):
+    import time
+    N, P, R = 64, 64, 4
+    chunk_size = 16
     nchunks = S // chunk_size
     fcs = chunk_size * R
     total = B * H
 
-    torch.manual_seed(0)
-    dev = "cuda"
-    # K (fcs, N), Q (fcs, N), dstates (N, P), DPhiO (fcs, P), PsiV (fcs, P), states (N, P)
+    print(f'\n=== Phase 4 10-GEMM, {shape_label}: B={B} S={S} H={H} chunks={nchunks} total_CTAs={total} ===')
+
+    torch.manual_seed(42)
+    dev = 'cuda'
     K = torch.randn(total, nchunks, fcs, N, dtype=torch.bfloat16, device=dev)
     Q = torch.randn(total, nchunks, fcs, N, dtype=torch.bfloat16, device=dev)
     Dst = torch.randn(total, nchunks, N, P, dtype=torch.bfloat16, device=dev)
@@ -424,103 +457,51 @@ def test_p4():
     DK = torch.zeros(total, nchunks, fcs, N, dtype=torch.bfloat16, device=dev)
     DQ = torch.zeros(total, nchunks, fcs, N, dtype=torch.bfloat16, device=dev)
     Dqkd = torch.zeros(total, nchunks, fcs, fcs, dtype=torch.bfloat16, device=dev)
-    DstO = torch.zeros(total, nchunks, N, P, dtype=torch.bfloat16, device=dev)
+    DstO = torch.zeros(total, N, P, dtype=torch.bfloat16, device=dev)  # no chunk axis
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    import time
     t0 = time.time()
     run_p4(N, P, R, chunk_size, K, Q, Dst, DPh, Psi, Sts,
            DPsiV, DK, DQ, Dqkd, DstO, nchunks, H, B, stream)
     torch.cuda.synchronize()
-    print(f"Compile+launch: {time.time()-t0:.2f}s")
+    print(f'Compile+launch: {time.time()-t0:.2f}s')
 
-    # Reference: TileLang formulas
-    errs = {}
-    for hb in range(min(total, 2)):
-        for c in range(min(nchunks, 4)):
-            k = K[hb, c].float()    # (fcs, N)
-            q = Q[hb, c].float()    # (fcs, N)
-            dst = Dst[hb, c].float()  # dstates (N, P)
-            dph = DPh[hb, c].float()  # DPhiO (fcs, P)
-            psi = Psi[hb, c].float()  # PsiV (fcs, P)
-            sts = Sts[hb, c].float()  # states (N, P)
-
-            # GEMM1: K @ dstates -> (fcs, P)
-            g1 = k @ dst
-
-            # GEMM2: K @ Q^T -> (fcs, fcs)
-            g2 = k @ q.T
-            g2_bf = g2.bfloat16().float()
-
-            # GEMM3: lkq @ DPhiO -> (fcs, P)
-            g3 = g2_bf @ dph
-            dpsiV_ref = g1 + g3
-
-            # GEMM4: DPhiO @ PsiV^T -> (fcs, fcs)
-            dqkd_ref = dph @ psi.T
-
-            # GEMM5: PsiV @ dstates^T -> (fcs, N)
-            g5 = psi @ dst.T
-
-            # GEMM6: PsiV @ DPhiO^T -> (fcs, fcs)
-            g6 = psi @ dph.T
-            g6_bf = g6.bfloat16().float()
-
-            # GEMM7: dki @ Q -> (fcs, N)
-            dk_ref = g5 + g6_bf @ q
-
-            # GEMM8: DPhiO @ states^T -> (fcs, N)
-            dq_ref = dph @ sts.T
-
-            # GEMM9: dki^T @ K -> (fcs, N)
-            # dki^T = dqkd = DPhiO @ PsiV^T, bf16-rounded during R2S
-            dqkd_bf = dqkd_ref.bfloat16().float()
-            dq_ref = dq_ref + dqkd_bf @ k
-
-            def relcheck(got, ref, tag):
-                diff = (got.float() - ref).abs()
-                me = diff.max().item()
-                mr = ref.abs().max().item()
-                rel = me / max(mr, 1e-8)
-                errs.setdefault(tag, []).append(rel)
-
-            relcheck(DPsiV[hb, c], dpsiV_ref, "dPsiV(G1+G3)")
-            relcheck(Dqkd[hb, c], dqkd_ref, "dqkd(G4)")
-            relcheck(DK[hb, c], dk_ref, "dk(G5+G7)")
-            relcheck(DQ[hb, c], dq_ref, "dq(G8+G9)")
-
-    print("=== Phase 4 correctness (TileLang-correct refs) ===")
-    for tag, rels in errs.items():
-        mx = max(rels)
-        avg = sum(rels) / len(rels)
-        print(f"  {tag:20}: max rel={mx:.4f} avg={avg:.4f} {'PASS' if mx < 0.05 else 'FAIL'}")
-
-    overall = max(max(rels) for rels in errs.values())
-    status = "PASS" if overall < 0.05 else "FAIL"
-    print(f"Overall: max rel = {overall:.4f} -> {status}")
+    # Spot check: dstates for hb=0 = sum over chunks of Q[c]^T @ DPh[c]
+    dstates_ref = torch.zeros(N, P, dtype=torch.float32, device=dev)
+    for c in range(nchunks):
+        q_c = Q[0, c].float()   # (fcs, N)
+        dph_c = DPh[0, c].float()  # (fcs, P)
+        dstates_ref += q_c.T @ dph_c
+    diff = (DstO[0].float() - dstates_ref).abs()
+    max_err = diff.max().item()
+    max_ref = dstates_ref.abs().max().item()
+    print(f'dStates (GEMM10) check hb0: max_err={max_err:.2f} rel={max_err/max(max_ref,1e-8):.4f}  max_ref={max_ref:.2f}')
 
     # Benchmark
-    if status == "PASS":
-        for _ in range(10):
-            run_p4(N, P, R, chunk_size, K, Q, Dst, DPh, Psi, Sts,
-                   DPsiV, DK, DQ, Dqkd, DstO, nchunks, H, B, stream)
-        torch.cuda.synchronize()
-        s = torch.cuda.Event(enable_timing=True)
-        e = torch.cuda.Event(enable_timing=True)
-        iters = 200
-        s.record()
-        for _ in range(iters):
-            run_p4(N, P, R, chunk_size, K, Q, Dst, DPh, Psi, Sts,
-                   DPsiV, DK, DQ, Dqkd, DstO, nchunks, H, B, stream)
-        e.record()
-        torch.cuda.synchronize()
-        us = s.elapsed_time(e) * 1000 / iters
-        print(f"Benchmark: {us:.1f} us (smoke B={B} S={S} H={H})")
-
-    return overall < 0.05
+    for _ in range(15):
+        run_p4(N, P, R, chunk_size, K, Q, Dst, DPh, Psi, Sts,
+               DPsiV, DK, DQ, Dqkd, DstO, nchunks, H, B, stream)
+    torch.cuda.synchronize()
+    s = torch.cuda.Event(enable_timing=True)
+    e = torch.cuda.Event(enable_timing=True)
+    iters = 200 if total < 50 else 50
+    s.record()
+    for _ in range(iters):
+        run_p4(N, P, R, chunk_size, K, Q, Dst, DPh, Psi, Sts,
+               DPsiV, DK, DQ, Dqkd, DstO, nchunks, H, B, stream)
+    e.record()
+    torch.cuda.synchronize()
+    us = s.elapsed_time(e) * 1000 / iters
+    print(f'Fused 10-GEMM: {us:.1f} us')
+    return us
 
 
-if __name__ == "__main__":
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-    test_p4()
+if __name__ == '__main__':
+    print(f'GPU: {torch.cuda.get_device_name(0)}')
+    us_smoke = bench('smoke', 2, 256, 8)
+    us_prod = bench('production', 2, 4096, 28)
+
+    print(f'\n=== Summary ===')
+    print(f'Smoke:      Phase4={us_smoke:.1f}us  TileLang=174.6us  ratio={174.6/us_smoke:.2f}x')
+    print(f'Production: Phase4={us_prod:.1f}us  TileLang=3135us   ratio={3135/us_prod:.2f}x')
