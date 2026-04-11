@@ -13,7 +13,7 @@ import cutlass.cute as cute
 from cutlass import BFloat16
 
 from cppmega.megatron.cute_dsl_mimo.single_gemm_test import run_single_gemm
-from cppmega.megatron.cute_dsl_mimo.bwd_bwd_wgmma import run_fused
+from cppmega.megatron.cute_dsl_mimo.fa4_bwd_adapter import run_fa4_fused as run_fused
 
 
 def bench(label, fn, n_iter=1000):

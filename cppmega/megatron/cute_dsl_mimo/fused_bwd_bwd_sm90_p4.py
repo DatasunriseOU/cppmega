@@ -32,7 +32,11 @@ from cutlass.utils import LayoutEnum, SmemAllocator
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 
 from quack import sm90_utils, copy_utils, layout_utils
-from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+try:
+    from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+except Exception:
+    def assume_tensor_aligned(x):
+        return x
 
 import cuda.bindings.driver as cuda
 
@@ -169,190 +173,264 @@ class FusedBwdBwdP4:
         wg_mma = tiled_mma.get_slice(tidx)
         shape_mnk = (fcs, N, N)
 
-        def _load_chunk_to_bank(chunk_idx, sK_bank, sQ_bank, sDst_bank, sDPh_bank, sPsi_bank, sSts_bank, sDstT_bank, sDPhT_bank, sQT_bank, sKT_bank):
-            if is_producer:
-                cute.copy(copy_g2s, thr_g2s.partition_S(gK_all[chunk_idx, None, None]),
-                          thr_g2s.partition_D(sK_bank))
-                cute.copy(copy_g2s, thr_g2s.partition_S(gQ_all[chunk_idx, None, None]),
-                          thr_g2s.partition_D(sQ_bank))
-                cute.copy(copy_g2s, thr_g2s.partition_S(gDst_all[chunk_idx, None, None]),
-                          thr_g2s.partition_D(sDst_bank))
-                cute.copy(copy_g2s, thr_g2s.partition_S(gDPh_all[chunk_idx, None, None]),
-                          thr_g2s.partition_D(sDPh_bank))
-                cute.copy(copy_g2s, thr_g2s.partition_S(gPsi_all[chunk_idx, None, None]),
-                          thr_g2s.partition_D(sPsi_bank))
-                cute.copy(copy_g2s, thr_g2s.partition_S(gSts_all[chunk_idx, None, None]),
-                          thr_g2s.partition_D(sSts_bank))
-                cute.copy(copy_g2s, thr_g2s.partition_S(gDstT_all[chunk_idx, None, None]),
-                          thr_g2s.partition_D(sDstT_bank))
-                cute.copy(copy_g2s, thr_g2s.partition_S(gDPhT_all[chunk_idx, None, None]),
-                          thr_g2s.partition_D(sDPhT_bank))
-                cute.copy(copy_g2s, thr_g2s.partition_S(gQT_all[chunk_idx, None, None]),
-                          thr_g2s.partition_D(sQT_bank))
-                cute.copy(copy_g2s, thr_g2s.partition_S(gKT_all[chunk_idx, None, None]),
-                          thr_g2s.partition_D(sKT_bank))
-
         if nchunks > 0:
             first_chunk_idx = nchunks - 1
-            _load_chunk_to_bank(first_chunk_idx, sK0, sQ0, sDst0, sDPh0, sPsi0, sSts0, sDstT0, sDPhT0, sQT0, sKT0)
+            if is_producer:
+                cute.copy(copy_g2s, thr_g2s.partition_S(gK_all[first_chunk_idx, None, None]),
+                          thr_g2s.partition_D(sK0))
+                cute.copy(copy_g2s, thr_g2s.partition_S(gQ_all[first_chunk_idx, None, None]),
+                          thr_g2s.partition_D(sQ0))
+                cute.copy(copy_g2s, thr_g2s.partition_S(gDst_all[first_chunk_idx, None, None]),
+                          thr_g2s.partition_D(sDst0))
+                cute.copy(copy_g2s, thr_g2s.partition_S(gDPh_all[first_chunk_idx, None, None]),
+                          thr_g2s.partition_D(sDPh0))
+                cute.copy(copy_g2s, thr_g2s.partition_S(gPsi_all[first_chunk_idx, None, None]),
+                          thr_g2s.partition_D(sPsi0))
+                cute.copy(copy_g2s, thr_g2s.partition_S(gSts_all[first_chunk_idx, None, None]),
+                          thr_g2s.partition_D(sSts0))
+                cute.copy(copy_g2s, thr_g2s.partition_S(gDstT_all[first_chunk_idx, None, None]),
+                          thr_g2s.partition_D(sDstT0))
+                cute.copy(copy_g2s, thr_g2s.partition_S(gDPhT_all[first_chunk_idx, None, None]),
+                          thr_g2s.partition_D(sDPhT0))
+                cute.copy(copy_g2s, thr_g2s.partition_S(gQT_all[first_chunk_idx, None, None]),
+                          thr_g2s.partition_D(sQT0))
+                cute.copy(copy_g2s, thr_g2s.partition_S(gKT_all[first_chunk_idx, None, None]),
+                          thr_g2s.partition_D(sKT0))
         arch.sync_threads()
 
         for chunk_rev in cutlass.range(nchunks, unroll=1):
             chunk_idx = nchunks - 1 - chunk_rev
-            use_bank1 = (chunk_rev & 1) != 0
-            if use_bank1:
-                sK_cur, sQ_cur, sDst_cur = sK1, sQ1, sDst1
-                sDPh_cur, sPsi_cur, sSts_cur = sDPh1, sPsi1, sSts1
-                sDstT_cur, sDPhT_cur, sQT_cur, sKT_cur = sDstT1, sDPhT1, sQT1, sKT1
-                sLKQ_cur, sDKI_cur, sOut_cur = sLKQ1, sDKI1, sOut1
-                sK_next, sQ_next, sDst_next = sK0, sQ0, sDst0
-                sDPh_next, sPsi_next, sSts_next = sDPh0, sPsi0, sSts0
-                sDstT_next, sDPhT_next, sQT_next, sKT_next = sDstT0, sDPhT0, sQT0, sKT0
-            else:
-                sK_cur, sQ_cur, sDst_cur = sK0, sQ0, sDst0
-                sDPh_cur, sPsi_cur, sSts_cur = sDPh0, sPsi0, sSts0
-                sDstT_cur, sDPhT_cur, sQT_cur, sKT_cur = sDstT0, sDPhT0, sQT0, sKT0
-                sLKQ_cur, sDKI_cur, sOut_cur = sLKQ0, sDKI0, sOut0
-                sK_next, sQ_next, sDst_next = sK1, sQ1, sDst1
-                sDPh_next, sPsi_next, sSts_next = sDPh1, sPsi1, sSts1
-                sDstT_next, sDPhT_next, sQT_next, sKT_next = sDstT1, sDPhT1, sQT1, sKT1
-
             next_chunk_idx = chunk_idx - 1
 
-            # GEMM1: K @ dstates (no tr_B) -> use sDstT (dstates^T)
-            # WGMMA: K(fcs,N) @ sDstT(P,N)^T = K @ dstates
-            _, tA1, tB1 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sK_cur, sDstT_cur)
-            acc_dPsiV = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, N)), Float32)
-            sm90_utils.gemm(tiled_mma, acc_dPsiV, tA1, tB1, zero_init=True, wg_wait=0)
+            if (chunk_rev & 1) == 0:
+                # GEMM1: K @ dstates (no tr_B) -> use sDstT (dstates^T)
+                # WGMMA: K(fcs,N) @ sDstT(P,N)^T = K @ dstates
+                _, tA1, tB1 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sK0, sDstT0)
+                acc_dPsiV = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, N)), Float32)
+                sm90_utils.gemm(tiled_mma, acc_dPsiV, tA1, tB1, zero_init=True, wg_wait=0)
 
-            # GEMM2: K @ Q^T (tr_B) -> native
-            _, tA2, tB2 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sK_cur, sQ_cur)
-            acc_lkq = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, fcs)), Float32)
-            sm90_utils.gemm(tiled_mma, acc_lkq, tA2, tB2, zero_init=True, wg_wait=0)
+                # GEMM2: K @ Q^T (tr_B) -> native
+                _, tA2, tB2 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sK0, sQ0)
+                acc_lkq = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, fcs)), Float32)
+                sm90_utils.gemm(tiled_mma, acc_lkq, tA2, tB2, zero_init=True, wg_wait=0)
 
-            # GEMM4: DPhiO @ PsiV^T (tr_B) -> native
-            _, tA4, tB4 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDPh_cur, sPsi_cur)
-            acc_dqkd = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, fcs)), Float32)
-            sm90_utils.gemm(tiled_mma, acc_dqkd, tA4, tB4, zero_init=True, wg_wait=0)
+                # GEMM4: DPhiO @ PsiV^T (tr_B) -> native
+                _, tA4, tB4 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDPh0, sPsi0)
+                acc_dqkd = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, fcs)), Float32)
+                sm90_utils.gemm(tiled_mma, acc_dqkd, tA4, tB4, zero_init=True, wg_wait=0)
 
-            # GEMM5: PsiV @ dstates^T (tr_B) -> native, use sDst
-            _, tA5, tB5 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sPsi_cur, sDst_cur)
-            acc_dk = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, N)), Float32)
-            sm90_utils.gemm(tiled_mma, acc_dk, tA5, tB5, zero_init=True, wg_wait=0)
+                # GEMM5: PsiV @ dstates^T (tr_B) -> native, use sDst
+                _, tA5, tB5 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sPsi0, sDst0)
+                acc_dk = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, N)), Float32)
+                sm90_utils.gemm(tiled_mma, acc_dk, tA5, tB5, zero_init=True, wg_wait=0)
 
-            # GEMM6: PsiV @ DPhiO^T (tr_B) -> native
-            _, tA6, tB6 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sPsi_cur, sDPh_cur)
-            acc_dki = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, fcs)), Float32)
-            sm90_utils.gemm(tiled_mma, acc_dki, tA6, tB6, zero_init=True, wg_wait=0)
+                # GEMM6: PsiV @ DPhiO^T (tr_B) -> native
+                _, tA6, tB6 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sPsi0, sDPh0)
+                acc_dki = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, fcs)), Float32)
+                sm90_utils.gemm(tiled_mma, acc_dki, tA6, tB6, zero_init=True, wg_wait=0)
 
-            # GEMM8: DPhiO @ states^T (tr_B) -> native
-            _, tA8, tB8 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDPh_cur, sSts_cur)
-            acc_dq = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, N)), Float32)
-            sm90_utils.gemm(tiled_mma, acc_dq, tA8, tB8, zero_init=True, wg_wait=0)
+                # GEMM8: DPhiO @ states^T (tr_B) -> native
+                _, tA8, tB8 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDPh0, sSts0)
+                acc_dq = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, N)), Float32)
+                sm90_utils.gemm(tiled_mma, acc_dq, tA8, tB8, zero_init=True, wg_wait=0)
 
-            if next_chunk_idx >= 0:
-                _load_chunk_to_bank(
-                    next_chunk_idx,
-                    sK_next,
-                    sQ_next,
-                    sDst_next,
-                    sDPh_next,
-                    sPsi_next,
-                    sSts_next,
-                    sDstT_next,
-                    sDPhT_next,
-                    sQT_next,
-                    sKT_next,
-                )
+                if next_chunk_idx >= 0:
+                    if is_producer:
+                        cute.copy(copy_g2s, thr_g2s.partition_S(gK_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sK1))
+                        cute.copy(copy_g2s, thr_g2s.partition_S(gQ_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sQ1))
+                        cute.copy(copy_g2s, thr_g2s.partition_S(gDst_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sDst1))
+                        cute.copy(copy_g2s, thr_g2s.partition_S(gDPh_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sDPh1))
+                        cute.copy(copy_g2s, thr_g2s.partition_S(gPsi_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sPsi1))
+                        cute.copy(copy_g2s, thr_g2s.partition_S(gSts_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sSts1))
+                        cute.copy(copy_g2s, thr_g2s.partition_S(gDstT_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sDstT1))
+                        cute.copy(copy_g2s, thr_g2s.partition_S(gDPhT_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sDPhT1))
+                        cute.copy(copy_g2s, thr_g2s.partition_S(gQT_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sQT1))
+                        cute.copy(copy_g2s, thr_g2s.partition_S(gKT_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sKT1))
 
-            # R2S: spill lkq for GEMM3
-            copy_r2s_lkq, _, _ = copy_utils.get_smem_store_C(
-                tiled_mma, sLKQ_cur, tidx, arch=90, position_independent=True,
-            )
-            lkq_frg = layout_utils.reshape_acc_to_frgA(acc_lkq)
-            lkq_cvt = cute.make_rmem_tensor_like(lkq_frg, self.dtype)
-            lkq_cvt.store(lkq_frg.load().to(self.dtype))
-            copy_r2s_lkq(lkq_cvt)
+                copy_r2s_lkq, _, _ = copy_utils.get_smem_store_C(tiled_mma, sLKQ0, tidx, arch=90, position_independent=True)
+                lkq_frg = layout_utils.reshape_acc_to_frgA(acc_lkq)
+                lkq_cvt = cute.make_rmem_tensor_like(lkq_frg, self.dtype)
+                lkq_cvt.store(lkq_frg.load().to(self.dtype))
+                copy_r2s_lkq(lkq_cvt)
 
-            # R2S: spill dki for GEMM7
-            copy_r2s_dki, _, _ = copy_utils.get_smem_store_C(
-                tiled_mma, sDKI_cur, tidx, arch=90, position_independent=True,
-            )
-            dki_frg = layout_utils.reshape_acc_to_frgA(acc_dki)
-            dki_cvt = cute.make_rmem_tensor_like(dki_frg, self.dtype)
-            dki_cvt.store(dki_frg.load().to(self.dtype))
-            copy_r2s_dki(dki_cvt)
+                copy_r2s_dki, _, _ = copy_utils.get_smem_store_C(tiled_mma, sDKI0, tidx, arch=90, position_independent=True)
+                dki_frg = layout_utils.reshape_acc_to_frgA(acc_dki)
+                dki_cvt = cute.make_rmem_tensor_like(dki_frg, self.dtype)
+                dki_cvt.store(dki_frg.load().to(self.dtype))
+                copy_r2s_dki(dki_cvt)
 
-            arch.fence_view_async_shared()
-            arch.sync_threads()
+                arch.fence_view_async_shared()
+                arch.sync_threads()
 
-            # GEMM3: lkq @ DPhiO (no tr_B) -> use sDPhT (DPhiO^T)
-            _, tA3, tB3 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sLKQ_cur, sDPhT_cur)
-            sm90_utils.gemm(tiled_mma, acc_dPsiV, tA3, tB3, zero_init=False, wg_wait=0)
+                _, tA3, tB3 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sLKQ0, sDPhT0)
+                sm90_utils.gemm(tiled_mma, acc_dPsiV, tA3, tB3, zero_init=False, wg_wait=0)
 
-            # GEMM7: dki @ Q (no tr_B) -> use sQT (Q^T)
-            _, tA7, tB7 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDKI_cur, sQT_cur)
-            sm90_utils.gemm(tiled_mma, acc_dk, tA7, tB7, zero_init=False, wg_wait=0)
+                _, tA7, tB7 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDKI0, sQT0)
+                sm90_utils.gemm(tiled_mma, acc_dk, tA7, tB7, zero_init=False, wg_wait=0)
 
-            # GEMM9: dki^T @ K (tr_A)
-            # Key insight: dki^T = (PsiV @ DPhiO^T)^T = DPhiO @ PsiV^T = dqkd (GEMM4 result!)
-            # So we R2S dqkd to sLKQ (now free after GEMM3) and use it for GEMM9.
-            # WGMMA: sLKQ(dki^T=dqkd) @ sKT(K^T)^T = dki^T @ K = (fcs, N)
-            copy_r2s_dqkd, _, _ = copy_utils.get_smem_store_C(
-                tiled_mma, sLKQ_cur, tidx, arch=90, position_independent=True,
-            )
-            dqkd_frg = layout_utils.reshape_acc_to_frgA(acc_dqkd)
-            dqkd_cvt = cute.make_rmem_tensor_like(dqkd_frg, self.dtype)
-            dqkd_cvt.store(dqkd_frg.load().to(self.dtype))
-            copy_r2s_dqkd(dqkd_cvt)
+                copy_r2s_dqkd, _, _ = copy_utils.get_smem_store_C(tiled_mma, sLKQ0, tidx, arch=90, position_independent=True)
+                dqkd_frg = layout_utils.reshape_acc_to_frgA(acc_dqkd)
+                dqkd_cvt = cute.make_rmem_tensor_like(dqkd_frg, self.dtype)
+                dqkd_cvt.store(dqkd_frg.load().to(self.dtype))
+                copy_r2s_dqkd(dqkd_cvt)
 
-            arch.fence_view_async_shared()
-            arch.sync_threads()
+                arch.fence_view_async_shared()
+                arch.sync_threads()
 
-            _, tA9, tB9 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sLKQ_cur, sKT_cur)
-            sm90_utils.gemm(tiled_mma, acc_dq, tA9, tB9, zero_init=False, wg_wait=0)
+                _, tA9, tB9 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sLKQ0, sKT0)
+                sm90_utils.gemm(tiled_mma, acc_dq, tA9, tB9, zero_init=False, wg_wait=0)
 
-            # Store outputs
-            gDPs_c = gDPs_all[chunk_idx, None, None]
-            gDK_c = gDK_all[chunk_idx, None, None]
-            gDQ_c = gDQ_all[chunk_idx, None, None]
-            gDqd_c = gDqd_all[chunk_idx, None, None]
+                gDPs_c = gDPs_all[chunk_idx, None, None]
+                gDK_c = gDK_all[chunk_idx, None, None]
+                gDQ_c = gDQ_all[chunk_idx, None, None]
+                gDqd_c = gDqd_all[chunk_idx, None, None]
 
-            copy_fn, _, _ = copy_utils.get_smem_store_C(tiled_mma, sOut_cur, tidx, arch=90)
-            frg = layout_utils.reshape_acc_to_frgA(acc_dPsiV)
-            cvt = cute.make_rmem_tensor_like(frg, self.dtype)
-            cvt.store(frg.load().to(self.dtype))
-            copy_fn(cvt)
-            arch.sync_threads()
-            cute.copy(copy_s2g, thr_s2g.partition_S(sOut_cur), thr_s2g.partition_D(gDPs_c))
-            arch.sync_threads()
+                copy_fn, _, _ = copy_utils.get_smem_store_C(tiled_mma, sOut0, tidx, arch=90)
+                frg = layout_utils.reshape_acc_to_frgA(acc_dPsiV)
+                cvt = cute.make_rmem_tensor_like(frg, self.dtype)
+                cvt.store(frg.load().to(self.dtype))
+                copy_fn(cvt)
+                arch.sync_threads()
+                cute.copy(copy_s2g, thr_s2g.partition_S(sOut0), thr_s2g.partition_D(gDPs_c))
+                arch.sync_threads()
 
-            copy_fn, _, _ = copy_utils.get_smem_store_C(tiled_mma, sOut_cur, tidx, arch=90)
-            frg = layout_utils.reshape_acc_to_frgA(acc_dk)
-            cvt = cute.make_rmem_tensor_like(frg, self.dtype)
-            cvt.store(frg.load().to(self.dtype))
-            copy_fn(cvt)
-            arch.sync_threads()
-            cute.copy(copy_s2g, thr_s2g.partition_S(sOut_cur), thr_s2g.partition_D(gDK_c))
-            arch.sync_threads()
+                copy_fn, _, _ = copy_utils.get_smem_store_C(tiled_mma, sOut0, tidx, arch=90)
+                frg = layout_utils.reshape_acc_to_frgA(acc_dk)
+                cvt = cute.make_rmem_tensor_like(frg, self.dtype)
+                cvt.store(frg.load().to(self.dtype))
+                copy_fn(cvt)
+                arch.sync_threads()
+                cute.copy(copy_s2g, thr_s2g.partition_S(sOut0), thr_s2g.partition_D(gDK_c))
+                arch.sync_threads()
 
-            copy_fn, _, _ = copy_utils.get_smem_store_C(tiled_mma, sOut_cur, tidx, arch=90)
-            frg = layout_utils.reshape_acc_to_frgA(acc_dq)
-            cvt = cute.make_rmem_tensor_like(frg, self.dtype)
-            cvt.store(frg.load().to(self.dtype))
-            copy_fn(cvt)
-            arch.sync_threads()
-            cute.copy(copy_s2g, thr_s2g.partition_S(sOut_cur), thr_s2g.partition_D(gDQ_c))
-            arch.sync_threads()
+                copy_fn, _, _ = copy_utils.get_smem_store_C(tiled_mma, sOut0, tidx, arch=90)
+                frg = layout_utils.reshape_acc_to_frgA(acc_dq)
+                cvt = cute.make_rmem_tensor_like(frg, self.dtype)
+                cvt.store(frg.load().to(self.dtype))
+                copy_fn(cvt)
+                arch.sync_threads()
+                cute.copy(copy_s2g, thr_s2g.partition_S(sOut0), thr_s2g.partition_D(gDQ_c))
+                arch.sync_threads()
 
-            copy_fn, _, _ = copy_utils.get_smem_store_C(tiled_mma, sOut_cur, tidx, arch=90)
-            frg = layout_utils.reshape_acc_to_frgA(acc_dqkd)
-            cvt = cute.make_rmem_tensor_like(frg, self.dtype)
-            cvt.store(frg.load().to(self.dtype))
-            copy_fn(cvt)
-            arch.sync_threads()
-            cute.copy(copy_s2g, thr_s2g.partition_S(sOut_cur), thr_s2g.partition_D(gDqd_c))
-            arch.sync_threads()
+                copy_fn, _, _ = copy_utils.get_smem_store_C(tiled_mma, sOut0, tidx, arch=90)
+                frg = layout_utils.reshape_acc_to_frgA(acc_dqkd)
+                cvt = cute.make_rmem_tensor_like(frg, self.dtype)
+                cvt.store(frg.load().to(self.dtype))
+                copy_fn(cvt)
+                arch.sync_threads()
+                cute.copy(copy_s2g, thr_s2g.partition_S(sOut0), thr_s2g.partition_D(gDqd_c))
+                arch.sync_threads()
+            else:
+                _, tA1, tB1 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sK1, sDstT1)
+                acc_dPsiV = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, N)), Float32)
+                sm90_utils.gemm(tiled_mma, acc_dPsiV, tA1, tB1, zero_init=True, wg_wait=0)
+
+                _, tA2, tB2 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sK1, sQ1)
+                acc_lkq = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, fcs)), Float32)
+                sm90_utils.gemm(tiled_mma, acc_lkq, tA2, tB2, zero_init=True, wg_wait=0)
+
+                _, tA4, tB4 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDPh1, sPsi1)
+                acc_dqkd = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, fcs)), Float32)
+                sm90_utils.gemm(tiled_mma, acc_dqkd, tA4, tB4, zero_init=True, wg_wait=0)
+
+                _, tA5, tB5 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sPsi1, sDst1)
+                acc_dk = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, N)), Float32)
+                sm90_utils.gemm(tiled_mma, acc_dk, tA5, tB5, zero_init=True, wg_wait=0)
+
+                _, tA6, tB6 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sPsi1, sDPh1)
+                acc_dki = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, fcs)), Float32)
+                sm90_utils.gemm(tiled_mma, acc_dki, tA6, tB6, zero_init=True, wg_wait=0)
+
+                _, tA8, tB8 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDPh1, sSts1)
+                acc_dq = cute.make_rmem_tensor(wg_mma.partition_shape_C((fcs, N)), Float32)
+                sm90_utils.gemm(tiled_mma, acc_dq, tA8, tB8, zero_init=True, wg_wait=0)
+
+                if next_chunk_idx >= 0:
+                    if is_producer:
+                        cute.copy(copy_g2s, thr_g2s.partition_S(gK_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sK0))
+                        cute.copy(copy_g2s, thr_g2s.partition_S(gQ_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sQ0))
+                        cute.copy(copy_g2s, thr_g2s.partition_S(gDst_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sDst0))
+                        cute.copy(copy_g2s, thr_g2s.partition_S(gDPh_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sDPh0))
+                        cute.copy(copy_g2s, thr_g2s.partition_S(gPsi_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sPsi0))
+                        cute.copy(copy_g2s, thr_g2s.partition_S(gSts_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sSts0))
+                        cute.copy(copy_g2s, thr_g2s.partition_S(gDstT_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sDstT0))
+                        cute.copy(copy_g2s, thr_g2s.partition_S(gDPhT_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sDPhT0))
+                        cute.copy(copy_g2s, thr_g2s.partition_S(gQT_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sQT0))
+                        cute.copy(copy_g2s, thr_g2s.partition_S(gKT_all[next_chunk_idx, None, None]), thr_g2s.partition_D(sKT0))
+
+                copy_r2s_lkq, _, _ = copy_utils.get_smem_store_C(tiled_mma, sLKQ1, tidx, arch=90, position_independent=True)
+                lkq_frg = layout_utils.reshape_acc_to_frgA(acc_lkq)
+                lkq_cvt = cute.make_rmem_tensor_like(lkq_frg, self.dtype)
+                lkq_cvt.store(lkq_frg.load().to(self.dtype))
+                copy_r2s_lkq(lkq_cvt)
+
+                copy_r2s_dki, _, _ = copy_utils.get_smem_store_C(tiled_mma, sDKI1, tidx, arch=90, position_independent=True)
+                dki_frg = layout_utils.reshape_acc_to_frgA(acc_dki)
+                dki_cvt = cute.make_rmem_tensor_like(dki_frg, self.dtype)
+                dki_cvt.store(dki_frg.load().to(self.dtype))
+                copy_r2s_dki(dki_cvt)
+
+                arch.fence_view_async_shared()
+                arch.sync_threads()
+
+                _, tA3, tB3 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sLKQ1, sDPhT1)
+                sm90_utils.gemm(tiled_mma, acc_dPsiV, tA3, tB3, zero_init=False, wg_wait=0)
+
+                _, tA7, tB7 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDKI1, sQT1)
+                sm90_utils.gemm(tiled_mma, acc_dk, tA7, tB7, zero_init=False, wg_wait=0)
+
+                copy_r2s_dqkd, _, _ = copy_utils.get_smem_store_C(tiled_mma, sLKQ1, tidx, arch=90, position_independent=True)
+                dqkd_frg = layout_utils.reshape_acc_to_frgA(acc_dqkd)
+                dqkd_cvt = cute.make_rmem_tensor_like(dqkd_frg, self.dtype)
+                dqkd_cvt.store(dqkd_frg.load().to(self.dtype))
+                copy_r2s_dqkd(dqkd_cvt)
+
+                arch.fence_view_async_shared()
+                arch.sync_threads()
+
+                _, tA9, tB9 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sLKQ1, sKT1)
+                sm90_utils.gemm(tiled_mma, acc_dq, tA9, tB9, zero_init=False, wg_wait=0)
+
+                gDPs_c = gDPs_all[chunk_idx, None, None]
+                gDK_c = gDK_all[chunk_idx, None, None]
+                gDQ_c = gDQ_all[chunk_idx, None, None]
+                gDqd_c = gDqd_all[chunk_idx, None, None]
+
+                copy_fn, _, _ = copy_utils.get_smem_store_C(tiled_mma, sOut1, tidx, arch=90)
+                frg = layout_utils.reshape_acc_to_frgA(acc_dPsiV)
+                cvt = cute.make_rmem_tensor_like(frg, self.dtype)
+                cvt.store(frg.load().to(self.dtype))
+                copy_fn(cvt)
+                arch.sync_threads()
+                cute.copy(copy_s2g, thr_s2g.partition_S(sOut1), thr_s2g.partition_D(gDPs_c))
+                arch.sync_threads()
+
+                copy_fn, _, _ = copy_utils.get_smem_store_C(tiled_mma, sOut1, tidx, arch=90)
+                frg = layout_utils.reshape_acc_to_frgA(acc_dk)
+                cvt = cute.make_rmem_tensor_like(frg, self.dtype)
+                cvt.store(frg.load().to(self.dtype))
+                copy_fn(cvt)
+                arch.sync_threads()
+                cute.copy(copy_s2g, thr_s2g.partition_S(sOut1), thr_s2g.partition_D(gDK_c))
+                arch.sync_threads()
+
+                copy_fn, _, _ = copy_utils.get_smem_store_C(tiled_mma, sOut1, tidx, arch=90)
+                frg = layout_utils.reshape_acc_to_frgA(acc_dq)
+                cvt = cute.make_rmem_tensor_like(frg, self.dtype)
+                cvt.store(frg.load().to(self.dtype))
+                copy_fn(cvt)
+                arch.sync_threads()
+                cute.copy(copy_s2g, thr_s2g.partition_S(sOut1), thr_s2g.partition_D(gDQ_c))
+                arch.sync_threads()
+
+                copy_fn, _, _ = copy_utils.get_smem_store_C(tiled_mma, sOut1, tidx, arch=90)
+                frg = layout_utils.reshape_acc_to_frgA(acc_dqkd)
+                cvt = cute.make_rmem_tensor_like(frg, self.dtype)
+                cvt.store(frg.load().to(self.dtype))
+                copy_fn(cvt)
+                arch.sync_threads()
+                cute.copy(copy_s2g, thr_s2g.partition_S(sOut1), thr_s2g.partition_D(gDqd_c))
+                arch.sync_threads()
 
     @cute.jit
     def __call__(self, mK, mQ, mDst, mDPh, mPsi, mSts,

@@ -145,15 +145,15 @@ if [ -n "${CPPMEGA_DATA_PATH:-}" ]; then
     )
   else
     DATA_ARGS+=(
-      --tokenizer-type NullTokenizer
+      --tokenizer-type HuggingFaceTokenizer
       --vocab-size "${CPPMEGA_VOCAB_SIZE:-131072}"
       --make-vocab-size-divisible-by 128
     )
   fi
 else
   DATA_ARGS=(
-    --mock-data
-    --tokenizer-type NullTokenizer
+    --data-path "1.0 ${REMOTE_ROOT:-/mnt/data}/data/megatron/clang_semantic_4k_v10_train"
+    --tokenizer-type HuggingFaceTokenizer
     --vocab-size 131072
     --make-vocab-size-divisible-by 128
   )

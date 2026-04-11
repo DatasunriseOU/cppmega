@@ -21,6 +21,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 
 from cppmega.features.mamba3 import build_author_mamba3_config
 from cppmega.megatron.mamba_local_spec import build_cppmega_local_stack_spec
+from cppmega.megatron.tilelang_mimo_autograd import cppmega_tilelang_mimo_combined
 
 
 def _group_world_size(group) -> int:
@@ -107,6 +108,12 @@ class AuthorMamba3Mixer(nn.Module):
             device=device,
             dtype=config.params_dtype,
         )
+
+        # Monkeypatch: route MIMO through cppmega's custom autograd.Function
+        # instead of upstream _Mamba3Function.  Same TileLang kernels, but
+        # controlled saved-tensor lifecycle and fp32 param enforcement.
+        import mamba_ssm.modules.mamba3 as _m3_mod
+        _m3_mod.mamba3_mimo_combined = cppmega_tilelang_mimo_combined
 
     def forward(
         self,

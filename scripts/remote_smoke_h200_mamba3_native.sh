@@ -23,7 +23,8 @@ COMMON_ARGS=(
     --kv-channels 64
     --seq-length 4096
     --max-position-embeddings 4096
-    --tokenizer-type NullTokenizer
+    --tokenizer-type HuggingFaceTokenizer
+    --tokenizer-model "${REMOTE_ROOT:-/mnt/data}/tokenizer"
     --vocab-size 65536
     --micro-batch-size 4
     --global-batch-size 32
@@ -52,7 +53,7 @@ COMMON_ARGS=(
     --cross-entropy-loss-fusion
     --first-last-layers-bf16
     --attention-backend auto
-    --mock-data
+    --data-path "1.0 ${REMOTE_ROOT:-/mnt/data}/data/megatron/clang_semantic_4k_v10_train"
     --eval-iters 0
     --cuda-graph-impl transformer_engine
     --cuda-graph-scope attn mamba moe_router moe_preprocess

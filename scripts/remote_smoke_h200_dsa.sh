@@ -97,8 +97,9 @@ PY
 # NOTE: This is a toy model (hidden=256). For full NAM56R + DSA throughput,
 # use scripts/remote_smoke_h200_dsa_full_nam56r.sh instead.
 python -m torch.distributed.run --nproc_per_node=8 pretrain_gpt.py \
-  --mock-data \
-  --tokenizer-type NullTokenizer \
+  --data-path "1.0 ${REMOTE_ROOT:-/mnt/data}/data/megatron/clang_semantic_4k_v10_train" \
+  --tokenizer-type HuggingFaceTokenizer \
+  --tokenizer-model "${REMOTE_ROOT:-/mnt/data}/tokenizer" \
   --vocab-size 65536 \
   --make-vocab-size-divisible-by 128 \
   --tensor-model-parallel-size 1 \

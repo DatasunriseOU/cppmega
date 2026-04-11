@@ -164,9 +164,11 @@ class NAM56RNeMoRecipe:
     precision: Literal["bf16", "fp8"] = "bf16"
 
     # --- data ---
-    mock_data: bool = True
+    # NEVER use mock_data=True or NullTokenizer for benchmarks — produces
+    # fake throughput numbers that don't match real training.
+    mock_data: bool = False
     data_path: str = ""
-    tokenizer_type: str = "NullTokenizer"
+    tokenizer_type: str = "HuggingFaceTokenizer"
     tokenizer_model: str = ""
 
     # --- checkpoint ---
@@ -374,7 +376,10 @@ class NAM56RNeMoRecipe:
 
         # --- data ---
         if self.mock_data:
-            args.append("--mock-data")
+            raise ValueError(
+                "mock_data=True is FORBIDDEN. Use real data with "
+                "HuggingFaceTokenizer. Set data_path and tokenizer_model."
+            )
         if self.data_path:
             # data_path may contain multiple space-separated tokens
             # (e.g. "0.3 /path/a 0.7 /path/b"), Megatron expects separate args
