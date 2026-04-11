@@ -90,8 +90,9 @@ PY
 )"
 
 python -m torch.distributed.run --nproc_per_node=8 "${REMOTE_WORKDIR}/pretrain_mamba.py" \
-  --mock-data \
-  --tokenizer-type NullTokenizer \
+  --data-path "1.0 ${REMOTE_ROOT:-/mnt/data}/data/megatron/clang_semantic_4k_v10_train" \
+  --tokenizer-type HuggingFaceTokenizer \
+  --tokenizer-model "${REMOTE_ROOT:-/mnt/data}/tokenizer" \
   --vocab-size 131072 \
   --make-vocab-size-divisible-by 128 \
   --tensor-model-parallel-size 1 \

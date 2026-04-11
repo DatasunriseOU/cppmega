@@ -186,7 +186,7 @@ def run_phase1():
         print(f'C_ref[0,:4]: {C_ref[0,:4]}')
         
         passed = max_err < 1.0
-        print(f'{PASS if passed else FAIL}: Correctness')
+        print(f'{"PASS" if passed else "FAIL"}: Correctness')
         
         if not passed:
             return False, None

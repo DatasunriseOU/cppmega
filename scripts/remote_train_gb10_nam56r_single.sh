@@ -180,8 +180,9 @@ PY
 )"
 
 DATA_ARGS=(
-  --mock-data
-  --tokenizer-type NullTokenizer
+  --data-path "1.0 /home/dave/cppmega-root/data/megatron/clang_semantic_4k_v10_train"
+  --tokenizer-type HuggingFaceTokenizer
+  --tokenizer-model /home/dave/cppmega-root/data/tokenizer
   --vocab-size 65536
   --make-vocab-size-divisible-by 128
 )

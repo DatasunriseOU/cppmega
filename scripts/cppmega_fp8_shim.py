@@ -218,3 +218,19 @@ try:
 except Exception as _exc:  # pragma: no cover
     import sys
     print(f"[cppmega_fp8_shim] _broadcast_cu_seqlens patch failed: {_exc}", file=sys.stderr)
+
+
+# -----------------------------------------------------------------------------
+# (6) MTP Liger fused linear cross-entropy (env-driven: CPPMEGA_MTP_LIGER_CE=1)
+# -----------------------------------------------------------------------------
+# Replaces the per-depth output_layer(hidden) + CE pair in process_mtp_loss
+# with Liger-Kernel's fused_linear_cross_entropy Triton kernel.  Eliminates
+# the [B*S, V] logits materialization (~4.3 GB at B=4,S=4096,V=65536), saving
+# ~82% activation memory per MTP depth.  Only active when TP=1.
+
+try:
+    from cppmega.megatron.mtp_liger_ce import patch_mtp_loss_with_liger
+    patch_mtp_loss_with_liger()
+except Exception as _exc:  # pragma: no cover
+    import sys
+    print(f"[cppmega_fp8_shim] MTP Liger CE patch failed: {_exc}", file=sys.stderr)
