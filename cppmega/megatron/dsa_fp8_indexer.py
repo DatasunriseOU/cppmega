@@ -302,9 +302,22 @@ def _attention_target_fp32(
         torch.full((sq, sk), float("-inf"), dtype=torch.float32, device=device),
         diagonal=1,
     )
+    # Validate topk_indices are in range [0, sk) before scatter.
+    import sys as _sys
+    _topk_max = topk_indices.max().item()
+    _topk_min = topk_indices.min().item()
+    if _topk_max >= sk or _topk_min < 0:
+        print(
+            f"[head_stream_debug] ERROR: topk_indices out of range! "
+            f"min={_topk_min} max={_topk_max} sk={sk} "
+            f"topk_indices.shape={tuple(topk_indices.shape)} "
+            f"query.shape={tuple(query.shape)} key.shape={tuple(key.shape)} "
+            f"topk_indices.dtype={topk_indices.dtype}",
+            file=_sys.stderr, flush=True,
+        )
     index_mask = torch.full(
         (b, sq, sk), float("-inf"), dtype=torch.float32, device=device
-    ).scatter_(-1, topk_indices, 0)
+    ).scatter_(-1, topk_indices.clamp(0, sk - 1), 0)
 
     # Accumulator for sum-over-heads of post-softmax distributions.
     acc = torch.zeros(b, sq, sk, dtype=torch.float32, device=device)
