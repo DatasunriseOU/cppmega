@@ -53,7 +53,7 @@ def build_megatron_args_bundle(
     use_dsa: bool = False,
     dsa_indexer_n_heads: int = 8,
     dsa_indexer_head_dim: int = 64,
-    dsa_indexer_topk: int = 256,
+    dsa_indexer_topk: int = 16,
     dsa_indexer_loss_coeff: float = 0.0,
     dsa_indexer_dtype: str = "bf16",
 ) -> MegatronArgsBundle:
@@ -104,10 +104,13 @@ def build_megatron_args_bundle(
                 str(moe_ffn_hidden_size),
                 "--moe-shared-expert-intermediate-size",
                 str(moe_shared_expert_intermediate_size),
-                # AllToAll dispatcher required for CUDA graph compatibility.
-                # AllGather (default) has .item() D2H sync that breaks graph capture.
+                # DeepEP flex dispatcher: pre-allocated fixed buffers instead
+                # of Megatron's alltoall which creates 84-224 GiB gradient
+                # tensors at EP>2. DeepEP uses NVLink for intranode, NVSHMEM
+                # IBGDA for internode. Falls back to alltoall if deep_ep not
+                # installed. See https://github.com/deepseek-ai/DeepEP
                 "--moe-token-dispatcher-type",
-                "alltoall",
+                "flex",
                 "--moe-permute-fusion",
             ]
         )
