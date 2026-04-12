@@ -751,3 +751,31 @@ New modules: `cppmega_mamba3_tp_mixer.py`, `dsa_fp8_indexer.py`, `dsa_fp8_patch.
 New tests: `test_cppmega_mamba3_tp_mixer.py` (13 tests), `test_dsa_fp8_indexer.py` (11),
 `test_dsa_splitk_indexer_loss.py` (6), `test_dsa_tilelang_fused_kl.py` (17).
 New scripts: `modal_dsa_indexer_bench.py` (804 LOC), multiple launcher scripts.
+
+## Stream M/L EP sweep with loss_coeff==0 gate (2026-04-12, europe)
+
+**Machine:** h200_1 (LOCATION_2), H200x8, driver 595.58.03, cuDNN 9.2.0, TE 2.13, torch 2.12+cu132.
+**Code:** commit 5830c18 (includes loss_coeff==0 gate, head-streaming, split-K indexer).
+**Script:** `scripts/remote_smoke_h200_dsa_9_4_m.sh` (created this session).
+
+### Results
+
+| Run | EP | DP | MBS | GBS | Recompute | Attn Backend | Result |
+|-----|----|----|-----|-----|-----------|--------------|--------|
+| v6  | 4  | 1  | 1   | 16  | selective moe_act | fused (cuDNN) | **1 iter OK** then OOM iter 2. peak=131.4 GiB. iter_ms=98527. TFLOP/s=2.1. loss=11.73. |
+| v8  | 4  | 1  | 4   | 64  | selective moe_act | fused (cuDNN) | OOM in backward: 224 GiB alloc attempt (DSA unfused_dsa_fn gradient). peak=105.8 GiB stage 1. |
+| v1-v5 | 4 | 1 | 4 | 64 | various | various | All OOM (cuDNN crash or DSA bmm OOM). |
+
+### Blockers found
+
+1. **cuDNN SUBLIBRARY_LOADING_FAILED** (transient): cuDNN 9.2.0 fused attention crashes after repeated CUDA OOM crashes on europe. Fixed by instance reboot. Not a persistent bug -- driver state corruption from OOM.
+
+2. **DSA `unfused_dsa_fn` forward OOM** (`dsa.py:936`): `torch.bmm(query.float(), key.float())` allocates `[b*np, sq, sk]` = 7.0 GiB per DSA layer (float32). With 5 DSA layers per PP stage, peak forward activation = ~35 GiB for DSA alone.
+
+3. **DSA backward 224 GiB OOM**: Autograd backward of `unfused_dsa_fn` tries to allocate 224 GiB gradient tensor. Root cause: PyTorch backward materializes full attention score gradient across all DSA layers simultaneously.
+
+4. **loss_coeff==0 gate works** -- saves ~63 GiB (verified: no OOM at dsa.py:202). Head-streaming (commit 563fcb0) further reduces indexer target from 7.5 to 0.8 GiB/layer. But main DSA attention path (`unfused_dsa_fn`) is unchanged.
+
+### Conclusion
+
+DSA 9+4 at MBS=4/GBS=64 does not fit on H200 140 GiB regardless of EP value. The `unfused_dsa_fn` materializes O(b*np*sq*sk) attention scores per DSA layer. **Integrating `sparse_dsa_fn` (gather-scatter, 28.7 MB vs 7 GiB) is required before any EP sweep can succeed.**
