@@ -53,8 +53,8 @@ def build_megatron_args_bundle(
     use_dsa: bool = False,
     dsa_indexer_n_heads: int = 8,
     dsa_indexer_head_dim: int = 64,
-    dsa_indexer_topk: int = 16,
-    dsa_indexer_loss_coeff: float = 0.0,
+    dsa_indexer_topk: int = 256,
+    dsa_indexer_loss_coeff: float = 0.001,
     dsa_indexer_dtype: str = "bf16",
 ) -> MegatronArgsBundle:
     args: list[str] = []
