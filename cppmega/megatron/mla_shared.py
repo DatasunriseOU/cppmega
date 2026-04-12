@@ -11,6 +11,19 @@ from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttenti
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
+# AbsorbedMLA from Megatron dev (PR #3193, merged Feb 2026).
+# Absorbs K up-projection into Q, keeps KV compressed → MQA-style attention.
+# Saves ~2-3 GiB per DSA layer by avoiding full K/V decompression.
+try:
+    from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+        AbsorbedMLASelfAttention,
+        AbsorbedMLASelfAttentionSubmodules,
+    )
+
+    _HAS_ABSORBED_MLA = True
+except ImportError:
+    _HAS_ABSORBED_MLA = False
+
 
 class CppMegaMLASelfAttentionAdapter(MLASelfAttention):
     def __init__(self, *args, pp_layer_offset=None, **kwargs):
@@ -32,6 +45,18 @@ class CppMegaFusedMLASelfAttentionAdapter(FusedMLASelfAttention):
         return super().forward(*args, rotary_pos_emb=None, **kwargs)
 
 
+if _HAS_ABSORBED_MLA:
+
+    class CppMegaAbsorbedMLASelfAttentionAdapter(AbsorbedMLASelfAttention):
+        def __init__(self, *args, pp_layer_offset=None, **kwargs):
+            del pp_layer_offset
+            super().__init__(*args, **kwargs)
+
+        def forward(self, *args, rotary_pos_emb=None, **kwargs):
+            del rotary_pos_emb
+            return super().forward(*args, rotary_pos_emb=None, **kwargs)
+
+
 def adapt_mla_self_attention_spec(self_attention_spec):
     if isinstance(self_attention_spec, ModuleSpec):
         if self_attention_spec.module is MLASelfAttention:
@@ -43,6 +68,12 @@ def adapt_mla_self_attention_spec(self_attention_spec):
         if self_attention_spec.module is FusedMLASelfAttention:
             return ModuleSpec(
                 module=CppMegaFusedMLASelfAttentionAdapter,
+                params=self_attention_spec.params,
+                submodules=self_attention_spec.submodules,
+            )
+        if _HAS_ABSORBED_MLA and self_attention_spec.module is AbsorbedMLASelfAttention:
+            return ModuleSpec(
+                module=CppMegaAbsorbedMLASelfAttentionAdapter,
                 params=self_attention_spec.params,
                 submodules=self_attention_spec.submodules,
             )
