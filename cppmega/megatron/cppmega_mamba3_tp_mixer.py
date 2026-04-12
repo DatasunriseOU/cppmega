@@ -440,7 +440,7 @@ class CppmegaMamba3TPMixer(MegatronModule):
                 gather_from_sequence_parallel_region,
             )
             angles_raw = gather_from_sequence_parallel_region(
-                angles_raw, tensor_parallel_output_grad=False, group=self.tp_group,
+                angles_raw, group=self.tp_group,
             )
 
         # ------------------------------------------------------------------
