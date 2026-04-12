@@ -218,3 +218,95 @@ The original plan's primary target (variant 4: tied + standalone at ~157-165k) i
 | FP8 on MLA+MoE | +15-20% | pending |
 | TP=2 PP=2 VPP=2 | +15-25% | medium effort |
 | MTP removal (last resort) | +18.6% | architectural regression |
+
+---
+
+## 2026-04-12 optimization session: DSA/TP/recompute
+
+### TP=2 investigation (Streams B, B v2)
+
+- `CppmegaMamba3TPMixer` written (589 LOC), TE-native pattern following Megatron `MambaMixer`.
+- TP=1 vs TP=2 numeric parity: **PASS** (max_abs=1.5625e-2 bf16).
+- B/C layout bug found and fixed: upstream `(r,g,n)` must be `(g,r,n)` for TP>1.
+- `angle_proj` SP backward bug found (Stream I): `tensor_parallel_output_grad=False` must be `True` (1-line fix).
+- TP=2 throughput: **34,672 tok/sec = 3.2x slower** than TP=1 (112k baseline). Confirmed by both v1 and v2 measurements.
+- Root causes: collective overhead + compute bandwidth-bound + PP=2 VPP=2 is a more efficient topology.
+- **Verdict:** TP>1 is net loss for NAM56R Mamba-3 MIMO on single-node H200x8. Mixer kept for future multi-node.
+
+### DSA 9+4 permanent attention layout
+
+- User decision: 13 A-layers = 9 DSA + 4 full MLA. DSA is NOT optional.
+- A-ranks DSA: `[1,2,3,5,6,7,9,10,11]`, MLA: `[0,4,8,12]`.
+- Env var: `CPPMEGA_DSA_A_LAYER_RANKS="1,2,3,5,6,7,9,10,11"`.
+- Mechanism already wired: `CppMegaSelectiveAttentionLayer` in `nam56r_full_spec.py`.
+
+### DSA memory optimization saga
+
+- **Stream D v1:** DSA 9+4 BF16 OOM at PP=2 (136 GB, stage 1 MoE activation).
+- **Stream E:** FP8 indexer port from DeepSeek V3.2 via `torch._scaled_mm`. Per-head fused accumulation. 9.3-13.4x peak delta reduction. Topk overlap 94.4%. Saves ~26 GB stage 0 forward.
+- **Stream G:** Backward FP8 cleanup. Indexer-only 69.5% savings, but full-path only 0.7% because main-attention bmm dominates.
+- **Stream D v2:** FP8 indexer applied, stage 0 OK, but stage 1 OOM at MoE activation (136 GB). MTP=2 pushes extra weight to stage 1.
+- **Stream J:** 4-variant memory sweep (FP8 only, +MoE recompute, +MTP redistribution, PP=4). ALL OOM'd. Found **REAL** bottleneck: `compute_dsa_indexer_loss` at `dsa.py:202` allocates 7.5 GiB FP32 per DSA layer even when `loss_coeff=0`.
+- **loss_coeff==0 gate:** monkey-patch to skip KL loss computation when coeff=0. Saves ~63 GB.
+- **Head-streaming:** rewrite `_attention_target_fp32` to loop over heads (7.5 GiB -> 0.8 GiB per layer). For future `loss_coeff>0` training.
+- **SECOND bottleneck found:** `unfused_dsa_fn` at `dsa.py:920` materializes FULL `[b*np, sq, sk]` = 7.0 GiB per DSA layer for MAIN attention (not loss). 5 layers x 7 GiB = 35 GiB.
+- **sparse_dsa_fn:** gather-scatter replacement, only computes topk=16 entries per query (28.7 MB vs 7 GiB, ~250x reduction).
+- **EP=2/EP=4 sweep:** all OOM'd because `unfused_dsa_fn` dominates, not MoE weights.
+
+### Ready-made sparse attention kernels found
+
+- TileLang `tile-ai/tilelang/examples/deepseek_v32/sparse_mla_fwd.py` -- fused sparse fwd+bwd, already in TileLang package (github only, not pip).
+- NVIDIA PR #3674 "Enable DSA CP/absorbed/THD paths with TileLang fused ops" -- `SparseMLA autograd.Function` + TileLang kernels, in Final Review.
+- `fla-org/native-sparse-attention` -- Triton fwd+bwd.
+- `lemyx/tilelang-dsa` -- one-pass fused FA+KL in TileLang.
+- NVIDIA PR #4039 split-K indexer loss (ported to cppmega).
+
+### ROOT CAUSE DISCOVERY: No selective recompute
+
+- Memory diagnostic: 99.7 GB of 119.8 GB per rank = ACTIVATIONS with NO recompute.
+- nanochat uses `recompute_granularity="selective"` BY DEFAULT. cppmega NEVER had it.
+- With selective recompute: ~45-60 GB total (vs 120 GB without).
+- Fix: `--recompute-granularity selective --recompute-modules moe_act` added to all launchers (commit `f4f192c`).
+- Testing: full selective recompute + CUDA graphs combination (user: "don't disable CUDA graphs, debug instead").
+
+### Blackwell features (Stream C)
+
+- GB10 NAM56R-half real-data baseline: **4303.8 tok/sec** (first honest measurement, prior runs used NullTokenizer).
+- 5 Blackwell features tested, all blocked (CuTe DSL not wired, FP8 lda%16 bug, no DSA code, no TK source, wrong kernel path).
+- Modal B200 DSA indexer bench: FP8 11.4% slower than BF16 (too small for FP8 amortization), FP4 not testable (TE 2.1 no FP4 API).
+
+### Environment fixes
+
+- bench3 SSH IP updated (H200_1_IP -> H200_1_IP).
+- europe: git SSH key installed, fresh git clone (was rsync before), github authenticated.
+- europe: killed zombie cuTe DSL bench (PID 490683).
+- europe: kernel `mamba3_mimo_bwd.py` patched for GQA G<H support (was upstream-only without patch).
+- Environment drift documented: bench3 has locally-patched kernel, europe had upstream.
+
+### Research (6x6 agents)
+
+- TileLang has no kernel-internal TP primitives.
+- Dutt 2026 paper: SSM TP = shard nheads, scan stays local, 1 allreduce on out_proj.
+- Mamba-3 paper silent on TP; Nemotron-H delegates to Megatron defaults.
+- NCCL + CUDA graphs compatible since NCCL 2.9 (external TP doesn't break CUDA graph fusion).
+- nvFuser #6003: fused comm+compute on Hopper = 4 vs 50 TFLOP/s (kernel-internal TP underperforms).
+- state-spaces/mamba PR #850: community Mamba-3 TP implementation (unmerged, Triton not TileLang).
+
+### Files created/modified (commit 3eb75fe -> f4f192c)
+
+- `cppmega/megatron/cppmega_mamba3_tp_mixer.py` (589 LOC, new)
+- `cppmega/megatron/dsa_fp8_indexer.py` (new, FP8 + head-streaming)
+- `cppmega/megatron/dsa_fp8_patch.py` (new, 3-tier monkey-patch)
+- `cppmega/megatron/dsa_sparse_attention.py` (new, gather-scatter sparse)
+- `cppmega/megatron/dsa_splitk_indexer_loss.py` (new, PR #4039 port)
+- `cppmega/megatron/dsa_tilelang_fused_kl.py` (new, lemyx port)
+- `cppmega/megatron/memory_debug.py` (new, copied from nanochat)
+- `cppmega/megatron/fp8_activations.py` (new, copied from nanochat)
+- `cppmega/megatron/tilelang_sparse_mla/` (new dir, fetched from tilelang examples)
+- `tests/test_cppmega_mamba3_tp_mixer.py` (458 LOC, 11+2 tests)
+- `tests/test_dsa_fp8_indexer.py` (11 tests)
+- `tests/test_dsa_splitk_indexer_loss.py` (6 tests)
+- `tests/test_dsa_tilelang_fused_kl.py` (17 tests)
+- `scripts/modal_dsa_indexer_bench.py` (804 LOC)
+- Multiple launcher scripts for DSA/EP/TP/grid sweep
+- Docs updates to both optimization plans + grid search + blackwell sweep

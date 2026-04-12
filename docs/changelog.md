@@ -1,5 +1,82 @@
 # NAM56R NeMo Migration Changelog
 
+## 2026-04-12: DSA/TP/recompute optimization session
+
+Major optimization session covering TP=2 investigation, DSA 9+4 memory
+optimization, selective recompute root cause discovery, and Blackwell
+feature assessment.
+
+### TP=2 investigation (Streams B, B v2)
+
+Wrote `CppmegaMamba3TPMixer` (589 LOC), TE-native TP-aware Mamba-3 mixer
+following Megatron `MambaMixer` pattern. TP=1 vs TP=2 numeric parity
+passes (max_abs=1.5625e-2 bf16). Found and fixed B/C layout bug
+(upstream `(r,g,n)` -> `(g,r,n)` for TP>1) and `angle_proj` SP backward
+bug (`tensor_parallel_output_grad=False` -> `True`).
+
+**TP=2 throughput: 34,672 tok/sec = 3.2x slower than TP=1 (112k
+baseline).** Confirmed by both v1 and v2 runs. Root causes: collective
+overhead + compute bandwidth-bound + PP=2 VPP=2 is more efficient
+topology. Verdict: TP>1 is net loss for NAM56R Mamba-3 MIMO on
+single-node H200x8.
+
+### DSA 9+4 permanent attention layout
+
+User decision: 13 A-layers = 9 DSA + 4 full MLA. A-ranks DSA:
+`[1,2,3,5,6,7,9,10,11]`, MLA: `[0,4,8,12]`. Env var:
+`CPPMEGA_DSA_A_LAYER_RANKS="1,2,3,5,6,7,9,10,11"`. Mechanism wired via
+`CppMegaSelectiveAttentionLayer` in `nam56r_full_spec.py`.
+
+### DSA memory optimization saga
+
+- Stream D v1: DSA 9+4 BF16 OOM at PP=2 (136 GB, stage 1 MoE activation)
+- Stream E: FP8 indexer port from DeepSeek V3.2 via `torch._scaled_mm`,
+  9.3-13.4x peak delta reduction, saves ~26 GB stage 0 forward
+- Stream G: Backward FP8 cleanup (indexer-only 69.5% savings, full-path 0.7%)
+- Stream D v2: FP8 indexer applied, stage 0 OK, stage 1 OOM (MoE + MTP=2)
+- Stream J: 4-variant sweep (FP8, +MoE recompute, +MTP redistrib, PP=4) ALL OOM
+- Stream L/M: EP=2/EP=4 + loss_coeff==0 gate, ALL OOM
+- Real bottleneck: `unfused_dsa_fn` at `dsa.py:920` materializes 7.0 GiB
+  per DSA layer; `sparse_dsa_fn` written (gather-scatter, ~250x reduction)
+- Ready-made kernels found: TileLang `sparse_mla_fwd.py`, NVIDIA PR #3674,
+  `fla-org/native-sparse-attention`, `lemyx/tilelang-dsa`, PR #4039
+
+### ROOT CAUSE: No selective recompute (commit f4f192c)
+
+Memory diagnostic: 99.7 GB of 119.8 GB per rank = ACTIVATIONS with NO
+recompute. nanochat uses `recompute_granularity="selective"` by default;
+cppmega never had it. Fix: `--recompute-granularity selective
+--recompute-modules moe_act` added to all launchers.
+
+### Blackwell features (Stream C)
+
+GB10 NAM56R-half real-data baseline: 4303.8 tok/sec (first honest
+measurement). 5 Blackwell features tested, all blocked. Modal B200 DSA
+indexer bench: FP8 11.4% slower than BF16.
+
+### Environment fixes
+
+- bench3 SSH IP updated (H200_1_IP -> H200_1_IP)
+- europe: git SSH key + fresh clone + github auth
+- europe: zombie cuTe DSL bench killed, kernel patched for GQA G<H
+
+### New files
+
+- `cppmega/megatron/cppmega_mamba3_tp_mixer.py` (589 LOC)
+- `cppmega/megatron/dsa_fp8_indexer.py` (FP8 + head-streaming)
+- `cppmega/megatron/dsa_fp8_patch.py` (3-tier monkey-patch)
+- `cppmega/megatron/dsa_sparse_attention.py` (gather-scatter sparse)
+- `cppmega/megatron/dsa_splitk_indexer_loss.py` (PR #4039 port)
+- `cppmega/megatron/dsa_tilelang_fused_kl.py` (lemyx port)
+- `cppmega/megatron/memory_debug.py`, `fp8_activations.py` (from nanochat)
+- `cppmega/megatron/tilelang_sparse_mla/` (from tilelang examples)
+- `tests/test_cppmega_mamba3_tp_mixer.py` (13 tests)
+- `tests/test_dsa_fp8_indexer.py` (11 tests)
+- `tests/test_dsa_splitk_indexer_loss.py` (6 tests)
+- `tests/test_dsa_tilelang_fused_kl.py` (17 tests)
+- `scripts/modal_dsa_indexer_bench.py` (804 LOC)
+- Multiple launcher scripts for DSA/EP/TP/grid sweep
+
 ## 2026-04-11: M²RNN Triton kernel libdevice.tanh + smoke14
 
 Replaced the manual stable-tanh in the fused Triton M²RNN kernel

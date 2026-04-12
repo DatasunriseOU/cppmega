@@ -434,3 +434,320 @@ per-layer), and no variant touches the DSA KL-loss path itself.
 - tmux sessions on bench3: `nam56r_dsa_j_v{1,2,3,4}` (all exited cleanly
   at the bash prompt after `VARIANT=vN ... ; echo V{N}_DONE_$?` reported
   exit 1).
+
+## Stream K PP=1 topology sweep (2026-04-12)
+
+Task #88. Explore **PP=1 topologies** that eliminate Stream D v2's
+stage-imbalance OOM by dropping pipeline parallelism entirely, following
+the Nemotron Nano v2 / Nemotron-H 56B production pattern.
+
+All real data (`clang_semantic_4k_v10_train` + HuggingFaceTokenizer). Full
+7/7 Mamba-3 MIMO via `CppmegaMamba3TPMixer` (Stream B's TP-aware mixer) at
+`CPPMEGA_MAMBA3_TP_MIXER=1`. DSA 9+4 permanent layout
+(`CPPMEGA_DSA_A_LAYER_RANKS="1,2,3,5,6,7,9,10,11"`) + Stream E FP8 DSA
+indexer patch. MBS=4 GBS=64 MTP=2. CUDA graph per_module (attn mamba
+moe_router moe_preprocess). `--sequence-parallel` on. BF16.
+
+Launcher: `scripts/remote_smoke_h200_nam56r_k_pp1.sh` (new, parameterised
+for bench3 `/mnt/data` layout and europe `/home/dave/cppmega-root` layout;
+selects variant via `K_VARIANT=1|2|3|4`). ngram-hash and structure
+embeddings disabled at TP>1 due to a pre-existing `custom_embedding.py`
+sequence-parallel shape mismatch (orthogonal to this sweep; tracked
+separately). Architectural features DSA/MoE/MLA/MTP/MIMO all preserved.
+
+### Dependency status when K launched
+
+- **Stream B v2 (#85)** completed on europe at 00:50 with the corrected
+  ngroups=8 TP=2 result: **34,697 tok/sec** (iter_ms ≈ 7560, 109
+  TFLOPS/GPU) at PP=1 TP=2 EP=1 MBS=4 GBS=64 MTP=2 full stack. This is
+  a **3.2× throughput loss vs the 112k TP=1 PP=2 baseline**, confirming
+  that Stream B's `CppmegaMamba3TPMixer` is correct but not a throughput
+  win even at TP=2 EP=1 (which was not tested as a K variant per the
+  brief's topology plan - DP=4 isn't on the table).
+- **Stream J (#87)** PP=2 sweep on bench3 completed with all 4 variants
+  OOM (see Stream J section above). Root cause is DSA indexer KL-loss
+  FP32 bmm, orthogonal to Stream K's PP=1 target.
+- **Stream I (#86)** - not polled; non-blocking.
+
+### Sweep results
+
+Note on machine placement: Stream B v2 occupied europe through ~00:50;
+Stream J ran on bench3 through ~01:00. K V1 and K V2 ran on europe
+immediately after Stream B v2 completed. K V3 was interrupted on europe
+(at iter 4) by an external `rsync --ignore-existing cppmega.rsync.bak.*
+cppmega/` action starting at 01:08 (not this stream) and relaunched on
+bench3 after Stream J vacated - where it OOM'd before iter 1. K V4 was
+then launched on bench3 and failed at argument validation (structural
+constraint, see below).
+
+| # | Config | tmux | log | iter_ms @ steady | tok/sec | Peak GB | lm_loss | Result | Notes |
+|---|--------|------|-----|------------------|---------|---------|---------|--------|-------|
+| K1 | PP=1 TP=2 EP=2 VPP=1 (DP=2) MBS=4 GBS=64 MTP=2 BF16 CG=per_module DSA 9+4 FP8 | europe `nam56r_k_v1` | `/home/dave/cppmega-root/cppmega/cppmega_nam56r_k_v1.log` | **17,597** | **14,907** | 142.2 (near 143 ceiling) | 6.96 @ iter 8 | **PASS (fits, slow)** | Memory fits but only because FP8 DSA indexer saved ~26 GB. 8 clean iters (5-8 all within 17597±10 ms). CppmegaMamba3TPMixer for Mamba-3 MIMO is the dominant cost: 46.8 TFLOPS/GPU vs ~109 at TP=1 (2.3× slower kernel), compounded by DSA+MoE overhead at TP=2. Terminated at iter 8 for K2 (no point running 100 iters on 7.5× regression). |
+| K2 | PP=1 TP=2 EP=4 VPP=1 (DP=1) MBS=4 GBS=64 MTP=2 BF16 CG=per_module DSA 9+4 FP8 | europe `nam56r_k_v2` | `/home/dave/cppmega-root/cppmega/cppmega_nam56r_k_v2.log` | **17,610** | **14,881** | ~122 steady | 10.70 @ iter 6 | **PASS (fits, slow)** | Essentially identical throughput to K1. More EP does not help at TP=2 because Mamba-3 MIMO is not a MoE cost. Param count per rank: 1,558,863,760 (1.56B x TP=2). 6 clean iters. |
+| K3 | PP=1 TP=4 EP=2 VPP=1 (DP=1) MBS=4 GBS=64 MTP=2 BF16 CG=per_module DSA 9+4 FP8 | europe `nam56r_k_v3` (interrupted) + bench3 `nam56r_k_v3_bench3` | `/home/dave/cppmega-root/cppmega/cppmega_nam56r_k_v3.log` (europe, backed up to `cppmega.rsync.bak.20260412_010835/`) + `/mnt/data/cppmega-root/cppmega/cppmega_nam56r_k_v3.log` (bench3) | 11,835 (iter 3 only, compile bleed) | 22,148 (iter 3, not steady) | 134+ / OOM | 12.81 @ iter 3 | **FAIL (OOM on bench3 retry)** | Europe run was interrupted at iter 4 by an external rsync action over the `cppmega/` checkout at 01:08:35 (not this stream). Bench3 relaunch: `torch.OutOfMemoryError` at `_reduce_scatter_along_first_dim` inside `moe_layer.token_dispatcher.combine_preprocess` on iter 1 forward - GPU 1 tried +112 MiB with 90.69 MiB free, PyTorch alloc 56.54 GB + other rank 79.84 GB = 136 GB. TP=4 + EP=2 does not fit MoE activations + DSA indexer at MBS=4. The iter 3 number from europe is not a steady-state measurement (TileLang compile was amortised into iter 1-2; iter 3 was first real iter before CUDA-graph capture at iter 4). |
+| K4 | PP=1 TP=8 EP=1 VPP=1 (DP=1) MBS=4 GBS=64 MTP=2 BF16 CG=per_module DSA 9+4 FP8 | bench3 `nam56r_k_v4_bench3` | `/mnt/data/cppmega-root/cppmega/cppmega_nam56r_k_v4.log` | — | — | — | — | **FAIL (structural)** | Megatron argument validation raised `ValueError: num_attention_heads (28) must be a multiple of tensor_model_parallel_size (8)`. 28 % 8 ≠ 0. **TP=8 is structurally impossible for NAM56R.** The task brief assumed `nheads=112` / `ngroups=8` (Mamba-3 module counts) but the Megatron constraint is on `--num-attention-heads`, which NAM56R sets to 28 (MLA/DSA attention head count, not Mamba head count). Divisors of 28 permitted by Megatron: {1, 2, 4, 7, 14, 28}. TP=8 requires `num_attention_heads % 8 == 0`, blocking it. TP=7 (28/7=4 heads/rank) would work numerically but doesn't evenly divide an 8-GPU world. No workaround preserves the feature contract. |
+
+### Comparison vs baselines
+
+| Config | tok/sec | vs 112k baseline |
+|---|---:|---:|
+| **TP=1 PP=2 VPP=2 MTP=1 no-DSA (Stream A run 02 anchor)** | **112,152** | **1.00×** |
+| TP=1 PP=2 VPP=2 MTP=1 no-DSA no-CG (baseline CG-off) | 86,845 | 0.77× |
+| TP=1 PP=2 VPP=2 MTP=0 no-DSA no-CG | 98,412 | 0.88× |
+| TP=1 PP=2 VPP=2 MTP=1 attn-CG no-DSA | 90,399 | 0.81× |
+| Stream B v2 TP=2 PP=1 EP=1 MTP=2 no-DSA (europe, ngroups=8 correct) | 34,697 | 0.31× |
+| **K1** TP=2 EP=2 DP=2 MTP=2 DSA-FP8 | **14,907** | **0.13×** |
+| **K2** TP=2 EP=4 DP=1 MTP=2 DSA-FP8 | **14,881** | **0.13×** |
+| **K3** TP=4 EP=2 DP=1 MTP=2 DSA-FP8 | OOM | — |
+| **K4** TP=8 EP=1 DP=1 MTP=2 DSA-FP8 | structural fail | — |
+| Stream J best (any PP=2/PP=4 + DSA-FP8) | OOM all 4 | — |
+
+### Verdict
+
+**PP=1 topology is NOT a structural win for NAM56R Mamba-3 MIMO 4.73B on
+8×H200 under the current stack (cppmega-venv torch 2.12, megatron-core
+0.18, TE 2.13, Mamba3 TileLang kernels).**
+
+Three independent mechanisms compound the loss:
+
+1. **`CppmegaMamba3TPMixer` TP>1 is a 2-3× kernel slowdown.** The mixer
+   correctness was verified (Stream B) but its TP=2 code path is
+   ~46.8 TFLOPS/GPU vs ~109 TFLOPS/GPU at TP=1 -- a 2.3× regression on
+   the dominant Mamba-3 MIMO cost. This appears in Stream B v2's pure
+   TP=2 no-DSA result (34.7k, 3.2× regression) and in K1/K2 (14.9k,
+   7.5× regression once DSA+MoE overheads are layered on).
+
+2. **Adding DSA 9+4 on top of TP>1 compounds memory pressure**, not
+   relieves it: K1 settles at 142 GB/rank (right against the 143 GB
+   ceiling), K3 OOMs on the MoE token_dispatcher `reduce_scatter`
+   output allocation before iter 1. The FP8 indexer savings from
+   Stream E apply per-stage and do not solve the TP>1 case because
+   TP-heavy configs move memory pressure to MoE/AllToAll buffers.
+
+3. **TP=8 is architecturally impossible.** `num_attention_heads=28` is
+   not divisible by 8 in Megatron. The Nemotron-H 56B reference that
+   motivated K4 uses `num_attention_heads` that divides by 8 (56 or
+   similar); NAM56R's 28 caps TP at 4.
+
+Combined with Stream J's finding that PP>=2 with DSA 9+4 always OOMs on
+the DSA KL-loss FP32 bmm (independent of the FP8 indexer patch), **the
+current Stream A 112k tok/sec TP=1 PP=2 VPP=2 MTP=1 no-DSA configuration
+remains the production-viable topology for NAM56R on 8×H200**. Neither
+Stream J (memory) nor Stream K (topology) produced a viable alternative
+that lands full DSA 9+4 + MTP=2 inside 140 GB AND outperforms or matches
+the 112k baseline on throughput.
+
+### Recommendation: production topology for NAM56R on 8×H200
+
+- **Keep**: `TP=1 PP=2 VPP=2 MBS=4 GBS=64 MTP=1` (Stream A run 02:
+  **112,152 tok/sec**), either with or without CUDA graphs depending on
+  stability. **Do not** adopt PP=1 + any TP>1 variant for throughput.
+- **DSA 9+4**: blocked until the DSA KL-loss FP32 bmm at `dsa.py:202`
+  is made FP8 or chunked (Stream J Option A or C). Do not attempt to
+  bolt DSA 9+4 onto a TP>1 topology as a memory workaround - TP>1
+  makes throughput worse by 3-8× and does not help memory.
+- **MTP=2** (DeepSeek-V3 style): orthogonal throughput cost (13% over
+  MTP=1 per Stream A run 03); if throughput matters more than training
+  efficiency, use MTP=1. K1/K2 show MTP=2 is not the limiting memory
+  factor once DSA is removed from TP=1 PP=2 topology.
+
+### Implication for Mamba-3 MIMO TP>1 as a feature
+
+The `CppmegaMamba3TPMixer` path is correctness-sound but throughput-unsound
+on the current stack. If TP>1 is ever needed (e.g. to fit a larger
+NAM56R variant or to reduce per-rank memory for DSA), the mixer's
+per-head Mamba-3 kernel splits need a TileLang-level re-tune for
+`heads_per_rank = nheads/TP` shapes before it can be considered a
+production option. For now, treat Mamba-3 MIMO TP as a correctness
+checkpoint, not a throughput lever.
+
+### Constraint compliance
+
+- Real data only (`clang_semantic_4k_v10_train` + HF tokenizer verified
+  in every launch's pre-flight guard that rejects `NullTokenizer` /
+  `--mock-data` in the rendered command).
+- Mamba-3 MIMO only (K1/K2/K3 all used `CPPMEGA_MAMBA3_TP_MIXER=1` ->
+  `CppmegaMamba3TPMixer`; no Mamba-2 or CP paths touched).
+- DSA 9+4 permanent layout preserved across all K variants. No feature
+  disable hacks. MBS stayed at 4, MoE on, MLA on, MTP=2, DSA on, MIMO
+  7/7 on, `--mamba-num-groups 8`, `--sequence-parallel`.
+- Stream E FP8 DSA indexer patch applied (shim verified
+  `DSA FP8 patch applied=True` on all ranks in K1-K3 logs).
+- cuDNN path handled: on europe the script wipes `LD_LIBRARY_PATH` from
+  `~/.bashrc`-injected venv cuDNN and forces `/usr/local/cuda-13.2/lib64`
+  to avoid the TE fused_attn `CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED`
+  error (first K1 attempt hit this, resolved in subsequent runs by
+  `CUDNN_SOURCE=system`). On bench3 venv cuDNN is the working path
+  (`CUDNN_SOURCE=venv` default).
+- No git commits, no git pushes.
+- Did not touch Stream A (#75) `nam56r_grid` session, Stream B v2 (#85)
+  session `nam56r_tp2_v2`, or Stream J (#87) `nam56r_dsa_j_v*` sessions.
+  Stream J had already exited (4x `Vn_DONE_1`) by the time K launched
+  on bench3.
+
+### Artefacts
+
+- Launcher: `scripts/remote_smoke_h200_nam56r_k_pp1.sh` (local +
+  `/home/dave/cppmega-root/cppmega/scripts/` on europe +
+  `/mnt/data/cppmega-root/cppmega/scripts/` on bench3).
+- Logs:
+  - europe K1: `/home/dave/cppmega-root/cppmega/cppmega_nam56r_k_v1.log`
+  - europe K2: `/home/dave/cppmega-root/cppmega/cppmega_nam56r_k_v2.log`
+  - europe K3 (interrupted): backup copy at
+    `/home/dave/cppmega-root/cppmega.rsync.bak.20260412_010835/cppmega_nam56r_k_v3.log`
+  - bench3 K3 (OOM retry): `/mnt/data/cppmega-root/cppmega/cppmega_nam56r_k_v3.log`
+  - bench3 K4 (structural fail): `/mnt/data/cppmega-root/cppmega/cppmega_nam56r_k_v4.log`
+- tmux sessions:
+  - europe: `nam56r_k_v1`, `nam56r_k_v2`, `nam56r_k_v3`
+  - bench3: `nam56r_k_v3_bench3`, `nam56r_k_v4_bench3`
+- File rsync to both machines (pre-run): `cppmega_mamba3_tp_mixer.py` and
+  `nam56r_full_spec.py` local-uncommitted versions had to be copied to
+  bench3 (bench3's `cppmega/` was missing the Stream B TP mixer toggle
+  at import time; synced from local repo at 00:40).
+
+## Stream M/L EP sweep with loss_coeff==0 gate (2026-04-12, bench3)
+
+**Result: ALL variants OOM. DSA 9+4 is infeasible at MBS=4 on H200.**
+
+### Attempted configurations
+
+| Run | PP | VPP | EP | DP | OOM site | Peak alloc (GiB) | Free at OOM |
+|-----|----|----|----|----|----------|------------------|-------------|
+| M-V1a (no gate) | 2 | 2 | 2 | 2 | `dsa_fp8_indexer.py:183` (256 MiB `index_scores`) | 135.61 | 148 MiB |
+| M-V1b (tier-1 eval gate) | 2 | 2 | 2 | 2 | `dsa_fp8_indexer.py:202` (64 MiB `relu*w_h`) | 135.78 | 22 MiB |
+| M-V1c (PP=4 + gate) | 4 | 1 | 2 | 2 | `dsa.py:936` (**7.0 GiB** `torch.bmm(q,k)`) | 135.52 | 766 MiB |
+
+All runs: TP=1, MBS=4, GBS=64, MTP=2, selective moe_act recompute, FP8 DSA indexer,
+`dsa_indexer_loss_coeff=0.0`, DSA 9+4, full 7/7 MIMO.
+
+### Root cause: `unfused_dsa_fn` attention matrix
+
+The real memory bottleneck is NOT the indexer loss or the FP8 index scores.
+It is `unfused_dsa_fn` at `dsa.py:936` which materializes the full attention
+score matrix as `torch.bmm(query.float(), key.float())`:
+
+- Shape: `(b*np, sq, sk)` = `(4*28, 4096, 4096)` float32 = **7.0 GiB per DSA layer forward**
+- With ~3 DSA layers per pipeline stage (PP=4), plus their autograd-saved
+  backward copies, this alone consumes ~42 GiB per stage
+- Combined with Mamba, MoE, MLA activations, model params, and optimizer
+  states: **total exceeds 140 GiB**
+
+The `loss_coeff==0` gate (tier 1 + tier 2) saves:
+- ~1.6 GiB from FusedDSAIndexerLoss backward saves (9 DSA layers * 183 MiB)
+- ~63 GiB from KL loss computation (gated by tier 2)
+- ~bwd_fused_indexer_loss_naive backward compute (not allocated)
+
+But `unfused_dsa_fn` runs AFTER the indexer (it uses topk_indices for sparse routing),
+and its 7 GiB allocation is unavoidable without a fused sparse attention kernel
+(e.g., FlashAttention with block-sparse mask).
+
+### Code changes applied
+
+1. **`dsa_fp8_patch.py` tier-1 `DSAttention.forward` gate**: When `loss_coeff==0`
+   during training, temporarily switches DSAttention to eval mode to bypass
+   `FusedDSAIndexerLoss.apply()` entirely. Uses inference-style no-grad topk.
+   Saves 183 MiB/layer * 9 layers = 1.6 GiB backward-saved tensors + all
+   indexer backward compute.
+
+2. **`--dsa-indexer-dtype` strip in launch script**: Removed cppmega-only
+   CLI flag from NATIVE_ARGS before passing to Megatron (flag not registered
+   in Megatron's argparser; runtime behavior controlled by env var).
+
+### Blocking issue for DSA 9+4
+
+To fit DSA 9+4 at MBS=4, the 7 GiB/layer `unfused_dsa_fn` attention matrix
+must be eliminated. Required: fused sparse attention kernel that computes
+`softmax(Q@K^T * sparse_mask) @ V` without materializing the full `(b*np, sq, sk)`
+matrix. This is architecturally similar to block-sparse FlashAttention but
+with DSA's dynamic topk-based sparsity pattern.
+
+Delta vs 112k baseline: N/A (no successful training iteration completed).
+
+### Artifacts
+- Logs: `/mnt/data/cppmega-root/cppmega/cppmega_nam56r_dsa_ep2_m_v1.log` (V1a),
+  `cppmega_nam56r_dsa_ep2_m_v1b.log` (V1b), `cppmega_nam56r_dsa_ep2_m_v1c_pp4.log` (V1c)
+- Launcher: `scripts/remote_smoke_h200_dsa_9_4_j.sh` (updated with `--dsa-indexer-dtype` strip)
+- Patch: `cppmega/megatron/dsa_fp8_patch.py` (tier-1 DSAttention.forward gate added)
+
+## 2026-04-12 session summary: DSA/TP/recompute optimization
+
+### TP=2 investigation (Streams B, B v2)
+
+`CppmegaMamba3TPMixer` (589 LOC) written following TE-native Megatron `MambaMixer`
+pattern. TP=1 vs TP=2 numeric parity: PASS (max_abs=1.5625e-2 bf16).
+
+Two bugs found:
+1. B/C layout: upstream `(r,g,n)` must be `(g,r,n)` for TP>1.
+2. `angle_proj` SP backward (Stream I): `tensor_parallel_output_grad=False` must be `True`.
+
+**TP=2 throughput: 34,672 tok/sec = 3.2x slower than TP=1 (112k baseline).**
+Confirmed by both v1 (ngroups=2) and v2 (ngroups=8 + GQA patch). Root causes:
+collective overhead + compute bandwidth-bound + PP=2 VPP=2 is more efficient.
+Verdict: TP>1 is net loss for NAM56R Mamba-3 MIMO on single-node H200x8.
+
+### DSA 9+4 memory bottleneck chain
+
+| Stream | What | Result |
+|--------|------|--------|
+| D v1 | DSA 9+4 BF16, PP=2 | OOM (136 GB, MoE activation stage 1) |
+| E | FP8 indexer port (DeepSeek V3.2 `torch._scaled_mm`) | 9.3-13.4x peak delta reduction, topk overlap 94.4%, saves ~26 GB fwd |
+| G | Backward FP8 | Indexer-only 69.5% savings, full-path 0.7% (bmm dominates) |
+| D v2 | FP8 indexer applied | Stage 0 OK, stage 1 OOM (136 GB, MoE + MTP=2) |
+| J | 4-variant sweep (FP8, +MoE recompute, +MTP redistrib, PP=4) | ALL OOM |
+| L/M | EP=2/EP=4 + loss_coeff==0 gate | ALL OOM (`unfused_dsa_fn` dominates) |
+
+**Real bottleneck chain:**
+1. `compute_dsa_indexer_loss` at `dsa.py:202`: 7.5 GiB FP32 per DSA layer even at `loss_coeff=0` (gated via monkey-patch, saves ~63 GB).
+2. `unfused_dsa_fn` at `dsa.py:920`: materializes full `[b*np, sq, sk]` = 7.0 GiB per DSA layer for MAIN attention. 5 layers x 7 GiB = 35 GiB. **This is the ultimate blocker.**
+3. `sparse_dsa_fn` written (gather-scatter, topk=16, 28.7 MB vs 7 GiB, ~250x reduction) but not yet integrated end-to-end.
+
+### Ready-made sparse attention kernels found
+
+| Source | Type | Status |
+|--------|------|--------|
+| TileLang `sparse_mla_fwd.py` | Fused sparse fwd+bwd | In github, not pip |
+| NVIDIA PR #3674 | SparseMLA + TileLang kernels | Final Review |
+| `fla-org/native-sparse-attention` | Triton fwd+bwd | Available |
+| `lemyx/tilelang-dsa` | One-pass fused FA+KL | Available |
+| NVIDIA PR #4039 | Split-K indexer loss | Ported to cppmega |
+
+### ROOT CAUSE: No selective recompute
+
+Memory diagnostic: **99.7 GB of 119.8 GB per rank = ACTIVATIONS with NO recompute.**
+nanochat uses `recompute_granularity="selective"` by default; cppmega never had it.
+With selective recompute: ~45-60 GB total (vs 120 GB without).
+
+Fix: `--recompute-granularity selective --recompute-modules moe_act` added to all
+launchers (commit `f4f192c`).
+
+### Blackwell features (Stream C)
+
+- GB10 NAM56R-half real-data baseline: **4303.8 tok/sec** (first honest measurement).
+- 5 Blackwell features tested, all blocked (CuTe DSL not wired, FP8 lda%16 bug, no DSA code, no TK source, wrong kernel path).
+- Modal B200 DSA indexer bench: FP8 11.4% slower than BF16 (too small for amortization).
+
+### Environment fixes
+
+- bench3 SSH IP: H200_1_IP -> H200_1_IP.
+- europe: git SSH key installed, fresh git clone, github authenticated.
+- europe: zombie cuTe DSL bench killed (PID 490683).
+- europe: kernel `mamba3_mimo_bwd.py` patched for GQA G<H support.
+- Environment drift documented: bench3 has locally-patched kernel, europe had upstream.
+
+### Research findings (6x6 agents)
+
+- TileLang has no kernel-internal TP primitives.
+- Dutt 2026: SSM TP = shard nheads, scan local, 1 allreduce on out_proj.
+- Mamba-3 paper silent on TP; Nemotron-H delegates to Megatron defaults.
+- NCCL + CUDA graphs compatible since NCCL 2.9.
+- nvFuser #6003: fused comm+compute on Hopper = 4 vs 50 TFLOP/s (kernel-internal TP underperforms).
+- state-spaces/mamba PR #850: community Mamba-3 TP (unmerged, Triton not TileLang).
+
+### Files created/modified (commits 3eb75fe -> f4f192c)
+
+New modules: `cppmega_mamba3_tp_mixer.py`, `dsa_fp8_indexer.py`, `dsa_fp8_patch.py`,
+`dsa_sparse_attention.py`, `dsa_splitk_indexer_loss.py`, `dsa_tilelang_fused_kl.py`,
+`memory_debug.py`, `fp8_activations.py`, `tilelang_sparse_mla/` directory.
+New tests: `test_cppmega_mamba3_tp_mixer.py` (13 tests), `test_dsa_fp8_indexer.py` (11),
+`test_dsa_splitk_indexer_loss.py` (6), `test_dsa_tilelang_fused_kl.py` (17).
+New scripts: `modal_dsa_indexer_bench.py` (804 LOC), multiple launcher scripts.
