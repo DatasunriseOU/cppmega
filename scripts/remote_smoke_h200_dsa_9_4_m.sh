@@ -62,6 +62,10 @@ export CPPMEGA_STRUCTURE_COMPONENTS="${CPPMEGA_STRUCTURE_COMPONENTS:-core}"
 export CPPMEGA_DSA_A_LAYER_RANKS="${CPPMEGA_DSA_A_LAYER_RANKS:-1,2,3,5,6,7,9,10,11}"
 # Stream E+G FP8 DSA indexer (fwd + bwd patched)
 export CPPMEGA_DSA_INDEXER_DTYPE="${CPPMEGA_DSA_INDEXER_DTYPE:-fp8}"
+# Use gather_scatter for DSA sparse attention: the TileLang sparse_mla_ops
+# kernel expects MLA compressed KV format (d_v=96), but our DSA pipeline
+# passes decompressed Q/K/V (d_v=512). gather_scatter handles arbitrary dims.
+export CPPMEGA_DSA_SPARSE_MODE="${CPPMEGA_DSA_SPARSE_MODE:-gather_scatter}"
 
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export NCCL_GRAPH_REGISTER=0
