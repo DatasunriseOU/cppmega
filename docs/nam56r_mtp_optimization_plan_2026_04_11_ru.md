@@ -955,3 +955,50 @@ Stream B v2 production run ограничен одним параметром (`
 - `scripts/modal_dsa_indexer_bench.py` (804 LOC)
 - Множество launcher-скриптов для DSA/EP/TP/grid sweep
 - Обновления документации в обоих планах оптимизации + grid search + blackwell sweep
+
+### Production DSA конфигурация NAM56R (2026-04-12)
+
+**topk=256** (6.25% density при seq=4096). Каждый query token attend'ит к 256 из 4096 предыдущих позиций.
+
+Предыдущий default topk=16 (0.4% density) был placeholder — слишком агрессивный sparse, модель теряла контекст. DeepSeek V3.2 production использует 3-12% density range.
+
+| topk | Density | Совместимость TileLang | Статус |
+|---:|---:|---|---|
+| 16 | 0.4% | ❌ (16 % 64 ≠ 0) | Placeholder, убран |
+| 64 | 1.6% | ✅ | Минимальный |
+| 128 | 3.1% | ✅ | Нижняя граница DeepSeek range |
+| **256** | **6.25%** | **✅** | **Production default** |
+| 512 | 12.5% | ✅ | Верхняя граница DeepSeek range |
+
+**Sparse attention kernel**: TileLang fused SparseMLA (default, `CPPMEGA_DSA_SPARSE_MODE=tilelang`).
+- Источник: `tile-ai/tilelang/examples/deepseek_v32/sparse_mla_fwd.py` + NVIDIA Megatron-LM PR #3674
+- Принцип: gather только topk K/V entries в shared memory → fused Q@K^T + online softmax + S@V
+- Память: near-zero extra (vs unfused_dsa_fn 7 GiB per layer)
+- Требование: topk % 64 == 0 (256 % 64 = 4 blocks ✓)
+- Fallback: `CPPMEGA_DSA_SPARSE_MODE=gather_scatter` (PyTorch, без TileLang JIT)
+
+**DSA KL loss target**: 3 режима через `CPPMEGA_DSA_KL_MODE`:
+- `head_streaming` (default): Python loop over heads, 0.8 GiB/call (vs 7.5 GiB naive)
+- `splitk`: NVIDIA PR #4039 Triton split-K kernels, 60% memory save
+- `tilelang_fused`: lemyx/tilelang-dsa one-pass fused FA+KL, near-zero extra memory
+
+**FP8 indexer**: `CPPMEGA_DSA_INDEXER_DTYPE=fp8` через `apply_dsa_fp8_patch()`. Port из DeepSeek V3.2 `fp8_index` TileLang kernel → `torch._scaled_mm` (WGMMA на H200). Per-head fused accumulation, never materializes [sq,h,sk]. Topk overlap BF16 vs FP8: 94.4%.
+
+**Selective recompute**: `--recompute-granularity selective --recompute-modules moe_act`. Совместимо с per-module CUDA graphs. Saves ~26 GB activation memory (99.7 GB → ~74 GB). Root cause всех DSA OOM'ов — отсутствие этого флага.
+
+**Полная production конфигурация DSA 9+4**:
+```bash
+export CPPMEGA_DSA_A_LAYER_RANKS="1,2,3,5,6,7,9,10,11"
+export CPPMEGA_DSA_INDEXER_DTYPE=fp8
+export CPPMEGA_DSA_SPARSE_MODE=tilelang   # fused TileLang sparse attention
+export CPPMEGA_DSA_KL_MODE=head_streaming  # or splitk / tilelang_fused
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+--enable-dsa \
+--dsa-indexer-topk 256 \
+--dsa-indexer-n-heads 8 \
+--dsa-indexer-head-dim 64 \
+--dsa-indexer-loss-coeff 0.001 \
+--recompute-granularity selective \
+--recompute-modules moe_act
+```

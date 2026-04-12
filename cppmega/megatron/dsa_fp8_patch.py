@@ -114,19 +114,20 @@ def resolve_sparse_mode() -> str:
     """Return the desired DSA sparse attention mode.
 
     Values:
-    * ``"gather_scatter"`` (default) — existing PyTorch gather-scatter
-      implementation in ``dsa_sparse_attention.py``. No TileLang JIT
-      dependency. Works on any GPU.
-    * ``"tilelang"`` — fused TileLang sparse MLA kernel ported from
-      Megatron-LM PR #3674. Requires TileLang JIT. Uses online softmax
-      in shared memory, avoids full attention score materialisation.
-      Numerically close but not bit-identical to ``gather_scatter``.
+    * ``"tilelang"`` (default) — fused TileLang sparse MLA kernel ported
+      from Megatron-LM PR #3674. Requires TileLang JIT (already installed
+      via mamba_ssm). Uses online softmax in shared memory, avoids full
+      attention score materialisation. Near-zero extra memory. Requires
+      topk % 64 == 0 (production default topk=256 satisfies this).
+    * ``"gather_scatter"`` — PyTorch gather-scatter fallback in
+      ``dsa_sparse_attention.py``. No TileLang JIT dependency. Works on
+      any GPU. Used automatically if TileLang import fails.
     """
     val = os.environ.get(DSA_SPARSE_MODE_ENV, "").strip().lower()
-    if val in ("tilelang", "tilelang_mla", "tilelang-mla"):
-        return "tilelang"
-    # default
-    return "gather_scatter"
+    if val in ("gather_scatter", "gather-scatter", "pytorch"):
+        return "gather_scatter"
+    # default: tilelang (falls back to gather_scatter on import error)
+    return "tilelang"
 
 
 # Sentinel for the tilelang_fused KL mode monkey-patch.

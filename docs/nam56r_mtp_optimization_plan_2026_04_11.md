@@ -310,3 +310,41 @@ The original plan's primary target (variant 4: tied + standalone at ~157-165k) i
 - `scripts/modal_dsa_indexer_bench.py` (804 LOC)
 - Multiple launcher scripts for DSA/EP/TP/grid sweep
 - Docs updates to both optimization plans + grid search + blackwell sweep
+
+### Production DSA Configuration for NAM56R (2026-04-12)
+
+**topk=256** (6.25% density at seq=4096). Each query token attends to 256 of 4096 previous positions.
+
+Previous default topk=16 (0.4% density) was a placeholder — too aggressive sparse, model lost context. DeepSeek V3.2 production uses 3-12% density range.
+
+| topk | Density | TileLang Compatible | Status |
+|---:|---:|---|---|
+| 16 | 0.4% | No (16 % 64 != 0) | Placeholder, removed |
+| 64 | 1.6% | Yes | Minimum viable |
+| 128 | 3.1% | Yes | Low end of DeepSeek range |
+| **256** | **6.25%** | **Yes** | **Production default** |
+| 512 | 12.5% | Yes | High end of DeepSeek range |
+
+**Sparse attention kernel**: TileLang fused SparseMLA (default, `CPPMEGA_DSA_SPARSE_MODE=tilelang`).
+- Source: `tile-ai/tilelang/examples/deepseek_v32/sparse_mla_fwd.py` + NVIDIA Megatron-LM PR #3674
+- Approach: gather only topk K/V entries into shared memory, fused Q@K^T + online softmax + S@V
+- Memory: near-zero extra (vs unfused_dsa_fn 7 GiB per layer)
+- Constraint: topk % 64 == 0 (256 % 64 = 4 blocks)
+- Fallback: `CPPMEGA_DSA_SPARSE_MODE=gather_scatter` (PyTorch, no TileLang JIT needed)
+
+**Full production DSA 9+4 configuration**:
+```bash
+export CPPMEGA_DSA_A_LAYER_RANKS="1,2,3,5,6,7,9,10,11"
+export CPPMEGA_DSA_INDEXER_DTYPE=fp8
+export CPPMEGA_DSA_SPARSE_MODE=tilelang
+export CPPMEGA_DSA_KL_MODE=head_streaming
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+--enable-dsa \
+--dsa-indexer-topk 256 \
+--dsa-indexer-n-heads 8 \
+--dsa-indexer-head-dim 64 \
+--dsa-indexer-loss-coeff 0.001 \
+--recompute-granularity selective \
+--recompute-modules moe_act
+```
