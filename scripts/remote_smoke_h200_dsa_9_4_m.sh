@@ -317,7 +317,9 @@ echo "NATIVE_ARGS (post-sed): ${NATIVE_ARGS}"
 
 # Per-module CUDA graph scope (matches 112k baseline).
 CG_FLAGS="--cuda-graph-impl transformer_engine --cuda-graph-scope attn mamba moe_router moe_preprocess --cuda-graph-warmup-steps 3"
-MOE_EXTRA_FLAGS="--moe-pad-expert-input-to-capacity --moe-expert-capacity-factor 1.0"
+# NOTE: --moe-pad-expert-input-to-capacity is INCOMPATIBLE with flex dispatcher
+# (raises ValueError). Omit when using DeepEP flex.
+MOE_EXTRA_FLAGS=""
 
 # Stream M: selective MoE activation recompute.
 # head-streaming in dsa_fp8_indexer.py (commit 563fcb0) reduces DSA target from

@@ -22,6 +22,8 @@ def build_nam56r_megatron_native_args(
     enable_moe: bool = False,
     enable_dsa: bool = False,
     dsa_indexer_dtype: str = "bf16",
+    dsa_indexer_topk: int = 256,
+    dsa_indexer_loss_coeff: float = 0.001,
 ) -> MegatronArgsBundle:
     """Return the current native Megatron feature fragment for NAM-style lanes.
 
@@ -39,6 +41,8 @@ def build_nam56r_megatron_native_args(
         use_moe=enable_moe,
         use_dsa=enable_dsa,
         dsa_indexer_dtype=dsa_indexer_dtype,
+        dsa_indexer_topk=dsa_indexer_topk,
+        dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
     )
 
 
