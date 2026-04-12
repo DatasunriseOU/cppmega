@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}System - nanochat{% endblock %}
+{% block content %}
+<h1 style="font-size: 24px; margin-bottom: 20px;">System</h1>
+
+<!-- CPU / RAM -->
+<div class="card">
+  <div class="card-title" style="margin-bottom: 12px;">Host</div>
+  <div class="grid grid-3">
+    {% if info.cpu_percent is not none %}
+    <div class="metric">
+      <div class="metric-value" style="font-size: 22px;">{{ info.cpu_percent }}%</div>
+      <div class="metric-label">CPU</div>
+    </div>
+    <div class="metric">
+      <div class="metric-value" style="font-size: 22px;">{{ info.ram_used_gb }} / {{ info.ram_total_gb }} GB</div>
+      <div class="metric-label">RAM ({{ info.ram_percent }}%)</div>
+    </div>
+    {% else %}
+    <div class="metric">
+      <div class="metric-value" style="font-size: 16px; color: var(--fg2);">psutil not installed</div>
+      <div class="metric-label">pip install psutil</div>
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+<!-- GPUs -->
+{% if info.gpus %}
+<div class="card">
+  <div class="card-title" style="margin-bottom: 12px;">GPUs</div>
+  <table>
+    <thead>
+      <tr><th>GPU</th><th>Name</th><th>Memory</th><th>Utilization</th><th>Temp</th></tr>
+    </thead>
+    <tbody>
+      {% for gpu in info.gpus %}
+      <tr>
+        <td>{{ gpu.index }}</td>
+        <td>{{ gpu.name }}</td>
+        <td>
+          {{ gpu.mem_used }} / {{ gpu.mem_total }} MiB
+          {% set pct = (gpu.mem_used | float / gpu.mem_total | float * 100) if gpu.mem_total | float > 0 else 0 %}
+          <span style="color: {% if pct > 90 %}var(--red){% elif pct > 70 %}var(--orange){% else %}var(--green){% endif %};">
+            ({{ '{:.0f}'.format(pct) }}%)
+          </span>
+        </td>
+        <td>{{ gpu.util }}%</td>
+        <td>{{ gpu.temp }}&deg;C</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="card">
+  <p style="color: var(--fg2);">No GPUs detected (nvidia-smi not available)</p>
+</div>
+{% endif %}
+
+<script>setTimeout(() => location.reload(), 10000);</script>
+{% endblock %}

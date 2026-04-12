@@ -105,14 +105,18 @@ class SparseMLA(torch.autograd.Function):
 
 
 class SparseMLA_FP8(torch.autograd.Function):
-    """Autograd wrapper: FP8 forward + BF16 backward for sparse-MLA.
+    """Autograd wrapper: FP8 forward + FP8 backward for sparse-MLA.
 
-    The FP8 TileLang kernel handles forward only (Q@K in float8_e4m3fn with
-    per-token scaling, S@V in BF16 after dequant). Backward reuses the
-    standard BF16 TileLang backward kernel — this means we save the BF16
-    copies of q/kv for backward even though forward ran in FP8. The memory
-    cost is identical to the BF16 path but forward FLOPS benefit from FP8
-    tensor-core throughput (2x on H100/H200).
+    Both forward and backward use FP8 TileLang kernels. Q and KV are
+    quantized to float8_e4m3fn with per-token scale factors. The FP8
+    tensors and scales are saved for backward, so memory footprint is
+    ~half compared to saving BF16 copies (FP8 = 1 byte vs BF16 = 2 bytes
+    per element, plus small FP32 scale vectors).
+
+    Forward: Q@K in FP8 with per-token dequant, S@V in BF16 after dequant.
+    Backward: Q@K^T in FP8 with dequant, dO@V^T in BF16 (V dequantized),
+              dQ and dKV accumulations use pre-scaled dS to handle FP8 K/Q.
+    Output dQ, dKV are BF16 for optimizer stability.
     """
 
     @staticmethod
@@ -130,6 +134,7 @@ class SparseMLA_FP8(torch.autograd.Function):
             (out, lse) where out: [batch, seq, heads, dim], lse: [batch, seq, heads]
         """
         from cppmega.megatron.sparse_mla_ops.tilelang_sparse_mla_fwd_fp8 import (
+            per_token_cast_to_fp8,
             sparse_mla_fwd_fp8_interface,
         )
 
@@ -140,29 +145,60 @@ class SparseMLA_FP8(torch.autograd.Function):
         if d_v is None:
             d_v = q.shape[-1]
 
+        # Quantize Q and KV to FP8 before forward so we can save the FP8
+        # copies (not BF16) for backward — halves activation memory.
+        batch = q.shape[0] if q.ndim == 4 else 1
+        seq_len = q.shape[-3] if q.ndim == 4 else q.shape[0]
+        heads = q.shape[-2]
+        dim_total = q.shape[-1]
+        seq_kv = kv.shape[-3] if kv.ndim == 4 else kv.shape[0]
+        kv_group = kv.shape[-2]
+
+        if q.dtype != torch.float8_e4m3fn:
+            q_flat = q.reshape(-1, heads * dim_total)
+            q_fp8_flat, q_scale_flat = per_token_cast_to_fp8(q_flat)
+            q_fp8 = q_fp8_flat.reshape(q.shape)
+            q_scale = q_scale_flat.reshape(q.shape[:-2])
+        else:
+            raise ValueError("SparseMLA_FP8.forward expects BF16 input q, not pre-quantized FP8")
+
+        if kv.dtype != torch.float8_e4m3fn:
+            kv_flat = kv.reshape(-1, kv_group * dim_total)
+            kv_fp8_flat, kv_scale_flat = per_token_cast_to_fp8(kv_flat)
+            kv_fp8 = kv_fp8_flat.reshape(kv.shape)
+            kv_scale = kv_scale_flat.reshape(kv.shape[:-2])
+        else:
+            raise ValueError("SparseMLA_FP8.forward expects BF16 input kv, not pre-quantized FP8")
+
         tl_out, tl_lse = sparse_mla_fwd_fp8_interface(
-            q, kv, indices, sm_scale=scaling, d_v=d_v,
+            q_fp8, kv_fp8, indices,
+            q_scale=q_scale, kv_scale=kv_scale,
+            sm_scale=scaling, d_v=d_v,
         )
 
         ctx.d_v = d_v
-        # Save BF16 tensors for backward (BF16 backward kernel needs them).
-        ctx.save_for_backward(q, kv, indices, tl_out, tl_lse)
+        # Save FP8 tensors + scales for backward (not BF16 — saves memory).
+        ctx.save_for_backward(q_fp8, kv_fp8, q_scale, kv_scale, indices, tl_out, tl_lse)
         return tl_out, tl_lse
 
     @staticmethod
     def backward(ctx, grad_output, grad_lse):
-        """Backward pass using BF16 sparse MLA kernel.
+        """Backward pass using FP8 sparse MLA kernel.
 
         Returns:
             Gradients for (q, kv, indices=None, scaling=None, d_v=None).
         """
-        from cppmega.megatron.sparse_mla_ops.tilelang_sparse_mla_bwd import sparse_mla_bwd
+        from cppmega.megatron.sparse_mla_ops.tilelang_sparse_mla_bwd_fp8 import (
+            sparse_mla_bwd_fp8,
+        )
 
-        q, kv, indices, tl_out, tl_lse = ctx.saved_tensors
+        q_fp8, kv_fp8, q_scale, kv_scale, indices, tl_out, tl_lse = ctx.saved_tensors
         scaling = ctx.scaling
 
-        tl_dq, tl_dkv = sparse_mla_bwd(
-            q, kv, tl_out, grad_output.contiguous(), indices, tl_lse, sm_scale=scaling
+        tl_dq, tl_dkv = sparse_mla_bwd_fp8(
+            q_fp8, kv_fp8, q_scale, kv_scale,
+            tl_out, grad_output.contiguous(),
+            indices, tl_lse, sm_scale=scaling,
         )
 
         return tl_dq, tl_dkv, None, None, None

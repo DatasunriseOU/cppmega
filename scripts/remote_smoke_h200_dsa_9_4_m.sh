@@ -72,6 +72,8 @@ export CPPMEGA_DSA_SPARSE_MODE="${CPPMEGA_DSA_SPARSE_MODE:-gather_scatter}"
 export CPPMEGA_MAMBA_RECOMPUTE="${CPPMEGA_MAMBA_RECOMPUTE:-1}"
 # Skip indexer loss (7 GiB torch.bmm) until head-streaming loss is implemented.
 export CPPMEGA_DSA_SKIP_INDEXER_LOSS="${CPPMEGA_DSA_SKIP_INDEXER_LOSS:-1}"
+export CPPMEGA_SELECTIVE_FP8_MOE="${CPPMEGA_SELECTIVE_FP8_MOE:-0}"
+export CPPMEGA_MTP_LIGER_CE="${CPPMEGA_MTP_LIGER_CE:-0}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export NCCL_GRAPH_REGISTER=0
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -172,19 +174,35 @@ try:
     from mamba_ssm.modules.mamba3 import Mamba3 as _Mamba3
     import torch as _torch
     _FP32_NAMES = ("B_bias", "C_bias", "D", "dt_bias", "mimo_x", "mimo_z", "mimo_o")
-    def _restore_bias_fp32(module, _inputs):
-        for _name in _FP32_NAMES:
-            _p = getattr(module, _name, None)
-            if _p is not None and _p.dtype != _torch.float32:
-                _p.data = _p.data.float()
+    # CG-safe: cast fp32 params ONCE in __init__ post-hook, not per-forward.
+    # Pre-forward hooks break CUDA graph capture.
     if not getattr(_Mamba3, "_cppmega_fp32_bias_hook", False):
         _Mamba3._cppmega_fp32_bias_hook = True
         _orig_init = _Mamba3.__init__
         def _patched_init(self, *args, **kwargs):
             _orig_init(self, *args, **kwargs)
-            self.register_forward_pre_hook(_restore_bias_fp32)
+            # Ensure fp32 params stay fp32 even after Float16Module._apply
+            for _name in _FP32_NAMES:
+                _p = getattr(self, _name, None)
+                if _p is not None and _p.dtype != _torch.float32:
+                    self.__dict__[_name] = _p.data.float()
         _Mamba3.__init__ = _patched_init
-        print("[cppmega_mimo_shim] Mamba3 fp32-bias forward pre-hook installed")
+        # Also patch _apply to protect fp32 params from bf16 cast
+        _orig_apply = _Mamba3._apply
+        def _cg_safe_apply(self, fn, *a, **kw):
+            _saved = {}
+            for _name in _FP32_NAMES:
+                _p = getattr(self, _name, None)
+                if _p is not None:
+                    _saved[_name] = _p.data.clone()
+            result = _orig_apply(self, fn, *a, **kw)
+            for _name, _data in _saved.items():
+                _p = getattr(self, _name, None)
+                if _p is not None:
+                    _p.data = _data
+            return result
+        _Mamba3._apply = _cg_safe_apply
+        print("[cppmega_mimo_shim] Mamba3 fp32-bias CG-safe init patch installed (no pre-hook)")
 except Exception as _exc:
     print(f"[cppmega_mimo_shim] Mamba3 fp32-bias hook failed: {_exc}", file=sys.stderr)
 
@@ -226,6 +244,23 @@ if _mamba_recompute:
     except Exception as _exc:
         print(f"[cppmega_mimo_shim] Mamba recompute patch failed: {_exc}", file=sys.stderr)
         raise
+
+# (8) Selective FP8 for MoE only (CPPMEGA_SELECTIVE_FP8_MOE=1)
+if os.environ.get("CPPMEGA_SELECTIVE_FP8_MOE", "0") == "1":
+    try:
+        from cppmega.megatron.selective_fp8_moe_patch import apply_selective_fp8_moe_patch
+        apply_selective_fp8_moe_patch()
+    except Exception as _exc:
+        print(f"[cppmega_mimo_shim] Selective FP8 MoE patch failed: {_exc}", file=sys.stderr)
+        raise
+
+# (9) MTP Liger fused CE (CPPMEGA_MTP_LIGER_CE=1)
+if os.environ.get("CPPMEGA_MTP_LIGER_CE", "0") == "1":
+    try:
+        from cppmega.megatron.mtp_liger_ce import patch_mtp_loss_with_liger
+        patch_mtp_loss_with_liger()
+    except Exception as _exc:
+        print(f"[cppmega_mimo_shim] MTP Liger CE patch failed: {_exc}", file=sys.stderr)
 
 # (7) Stream M: per-rank peak-memory reporter (atexit hook)
 def _cppmega_peak_mem_report():
@@ -349,19 +384,31 @@ if [[ "${CPPMEGA_DISPATCHER_OVERRIDE:-}" == alltoall* ]]; then
 fi
 echo "NATIVE_ARGS (post-sed): ${NATIVE_ARGS}"
 
-# CUDA graphs — disabled until first iteration completes successfully.
-CG_FLAGS=""
-echo "[stream_m] CUDA graphs DISABLED (bringup)"
+# CUDA graphs — full scope verified stable with lr warmup.
+CG_FLAGS="${CG_FLAGS:---cuda-graph-impl local --cuda-graph-scope attn mamba moe_router moe_preprocess}"
+echo "[stream_m] CUDA graphs: ${CG_FLAGS}"
 # NOTE: --moe-pad-expert-input-to-capacity is INCOMPATIBLE with flex dispatcher
 # (raises ValueError). Omit when using DeepEP flex.
 # Only reset MOE_EXTRA_FLAGS if not already set by alltoall override above.
 MOE_EXTRA_FLAGS="${MOE_EXTRA_FLAGS:-}"
 
-# Stream M: selective MoE activation recompute.
+# FP8 GEMM flags: enables FP8 for ALL TE linear layers (MLP, MoE experts,
+# attention projections, embeddings). --bf16 remains the base precision;
+# FP8 applies inside TE's Linear forward via delayed scaling.
+FP8_FLAGS="${FP8_FLAGS:---fp8-format hybrid --fp8-amax-history-len 1024 --fp8-amax-compute-algo max}"
+
+# Stream M: selective activation recompute.
 # head-streaming in dsa_fp8_indexer.py (commit 563fcb0) reduces DSA target from
 # 7.5 GiB to 0.8 GiB per layer, so selective moe_act recompute is sufficient.
 # --mla-down-proj-fusion: fuses MLA down-projection GEMMs (PR #3039, free perf).
-EXTRA_FLAGS="--recompute-granularity selective --recompute-modules moe_act mlp mla_up_proj --mla-down-proj-fusion --clip-grad 1.0"
+# NOTE: moe_act recompute is INCOMPATIBLE with FP8 delayed scaling (Megatron
+# raises ValueError). When FP8 GEMMs are enabled, drop moe_act from recompute.
+if [ -n "${FP8_FLAGS}" ]; then
+  RECOMPUTE_MODULES="mlp mla_up_proj"
+else
+  RECOMPUTE_MODULES="moe_act mlp mla_up_proj"
+fi
+EXTRA_FLAGS="${EXTRA_FLAGS:---recompute-granularity selective --recompute-modules ${RECOMPUTE_MODULES} --mla-down-proj-fusion --clip-grad 1.0}"
 
 ROPE_FLAG=""
 if [ "${NO_ROPE_FUSION}" = "1" ]; then
@@ -407,7 +454,21 @@ echo "LOG=${LOG}"
 nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
 echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-<unset>}"
 
-python -m torch.distributed.run --nproc_per_node=8 "${WORKDIR}/pretrain_mamba.py" \
+# nsys profiling wrapper
+NSYS_CMD=""
+if [ "${NSYS_PROFILE:-0}" = "1" ]; then
+  NSYS_OUT="${NSYS_OUT:-/home/dave/cppmega-root/cppmega/nsys_${RUN_ID}}"
+  NSYS_CMD="nsys profile --trace=cuda,nvtx,osrt --cuda-memory-usage=true -o ${NSYS_OUT} -f true --stats=true --duration=120"
+  echo "[nsys] profiling 120s → ${NSYS_OUT}.nsys-rep"
+fi
+
+# Memory debug: dumps detailed CUDA allocation info after step 0
+if [ "${CPPMEGA_MEMORY_DEBUG:-0}" = "1" ]; then
+  export NANOCHAT_MEMORY_DEBUG=1
+  echo "[mem_debug] CUDA memory snapshot enabled (step 0)"
+fi
+
+${NSYS_CMD} python -m torch.distributed.run --nproc_per_node=8 "${WORKDIR}/pretrain_mamba.py" \
   --data-path 1.0 "${REMOTE_ROOT}/data/megatron/clang_semantic_4k_v10_train" \
   --tokenizer-type HuggingFaceTokenizer \
   --tokenizer-model "${REMOTE_ROOT}/data/tokenizer" \
@@ -416,7 +477,7 @@ python -m torch.distributed.run --nproc_per_node=8 "${WORKDIR}/pretrain_mamba.py
   --pipeline-model-parallel-size ${PP_SIZE} \
   --context-parallel-size 1 \
   --sequence-parallel \
-  --use-distributed-optimizer \
+  ${OPTIMIZER_FLAGS:---use-distributed-optimizer} \
   --no-gradient-accumulation-fusion \
   --no-persist-layer-norm \
   --no-masked-softmax-fusion \
@@ -440,6 +501,7 @@ python -m torch.distributed.run --nproc_per_node=8 "${WORKDIR}/pretrain_mamba.py
   --disable-bias-linear \
   --untie-embeddings-and-output-weights \
   --bf16 \
+  ${FP8_FLAGS} \
   --use-mcore-models \
   --transformer-impl transformer_engine \
   --attention-backend auto \

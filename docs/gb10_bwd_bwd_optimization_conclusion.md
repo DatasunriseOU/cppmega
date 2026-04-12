@@ -6,11 +6,11 @@ After exhaustive attempts across three paths, **TileLang 167 µs is the ceiling 
 
 **Key new data point:** the same 5 cuTile variants that regressed on GB10 were re-tested on **Modal B200:2 (sm_100a datacenter Blackwell, TMEM present, 228 KiB smem)**. Two of them **flipped from losers to winners**:
 
-| Variant | B200 µs (−% vs baseline) | GB10 µs (−% vs baseline) |
-|---|---|---|
-| Baseline 2-kernel A/B | 687.6 (1.00×) | 624 (1.00×) |
-| **V3 3-kernel split** | **460.5 (−33%) WINS** | 678 (+9% regressed) |
-| V4 hoisted invariants | 622.3 (−10%) wins | 742 (+19% regressed) |
+| Variant               | B200 µs (−% vs baseline) | GB10 µs (−% vs baseline) |
+| --------------------- | ------------------------ | ------------------------ |
+| Baseline 2-kernel A/B | 687.6 (1.00×)            | 624 (1.00×)              |
+| **V3 3-kernel split** | **460.5 (−33%) WINS**    | 678 (+9% regressed)      |
+| V4 hoisted invariants | 622.3 (−10%) wins        | 742 (+19% regressed)     |
 
 **Same algorithmic variant, opposite outcome on two Blackwell chips.** Reason: the launch-overhead vs live-set-savings trade-off depends on the smem budget per kernel. B200's 228 KiB rewards splitting into 3 kernels; GB10's 99 KiB dynamic budget punishes the extra launch overhead with no compensating register relief.
 
@@ -34,14 +34,14 @@ After exhaustive attempts across three paths, **TileLang 167 µs is the ceiling 
 
 Five variants tried (see `.tmp/cutile_bwd_bwd_rewrite/RESULTS.md`). **All regressed** vs the 2-kernel baseline (624 µs).
 
-| Variant | µs | vs baseline |
-|---|---|---|
-| **Baseline 2-kernel A/B split** | **624** (optimal) | 1.00× |
-| Nested `@ct.function` per phase | 1498 | 2.40× slower |
-| Fused monolithic | 1405 | 2.26× slower |
-| 3-kernel split | 678 | 1.09× slower |
-| Hoisted loop invariants | 742 | 1.19× slower |
-| `ct.static_iter` unroll | 3236 | 5.20× slower |
+| Variant                         | µs                | vs baseline  |
+| ------------------------------- | ----------------- | ------------ |
+| **Baseline 2-kernel A/B split** | **624** (optimal) | 1.00×        |
+| Nested `@ct.function` per phase | 1498              | 2.40× slower |
+| Fused monolithic                | 1405              | 2.26× slower |
+| 3-kernel split                  | 678               | 1.09× slower |
+| Hoisted loop invariants         | 742               | 1.19× slower |
+| `ct.static_iter` unroll         | 3236              | 5.20× slower |
 
 **Verdict:** The existing 2-kernel split is pareto-optimal. Kernel fission via gmem temps is the only reliable live-range cut in cuTile Python — fusing regresses, nested helpers regress, hoisting regresses, full unroll catastrophically regresses. See `memory/reference_cutile_compiler_behavior.md` for the full list of compiler behavior findings.
 

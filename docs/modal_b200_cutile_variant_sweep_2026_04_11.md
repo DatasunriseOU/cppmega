@@ -33,14 +33,14 @@ Almost identical to GB10's 624 µs bwd_bwd baseline. **B200's hardware advantage
 
 Tested 6 variants, 20 iter × 5 warmup per variant, `torch.cuda.Event` timing:
 
-| Variant | B200 bwd_bwd µs | vs baseline | vs TileLang | Correct | GB10 ratio | Reversal? |
-|---|---:|---:|---:|:---:|---:|---|
-| baseline 2-kernel A/B | 687.6 | 1.00× | 3.84× | PASS | 3.73× | — |
-| V2 fused monolithic | 729.4 | 1.06× slower | 4.07× | PASS | 8.42× | gap compressed, still slower |
-| **V3 3-kernel split** | **460.5** | **0.67× (−33%)** | **2.57×** | PASS | 4.06× (slower on GB10!) | **WINS on B200, LOSES on GB10** |
-| V4 hoisted invariants | 622.3 | 0.90× (−10%) | 3.47× | PASS | 4.45× | flipped to win on B200 |
-| V7 `@ct.kernel(occupancy=1)` | 689.2 | 1.00× (noise) | 3.85× | PASS | — | **no-op** |
-| V8 V4+occ=1 | 622.8 | 0.91× | 3.48× | PASS | — | identical to V4 |
+| Variant                      | B200 bwd_bwd µs |      vs baseline | vs TileLang | Correct |              GB10 ratio | Reversal?                       |
+| ---------------------------- | --------------: | ---------------: | ----------: | :-----: | ----------------------: | ------------------------------- |
+| baseline 2-kernel A/B        |           687.6 |            1.00× |       3.84× |  PASS   |                   3.73× | —                               |
+| V2 fused monolithic          |           729.4 |     1.06× slower |       4.07× |  PASS   |                   8.42× | gap compressed, still slower    |
+| **V3 3-kernel split**        |       **460.5** | **0.67× (−33%)** |   **2.57×** |  PASS   | 4.06× (slower on GB10!) | **WINS on B200, LOSES on GB10** |
+| V4 hoisted invariants        |           622.3 |     0.90× (−10%) |       3.47× |  PASS   |                   4.45× | flipped to win on B200          |
+| V7 `@ct.kernel(occupancy=1)` |           689.2 |    1.00× (noise) |       3.85× |  PASS   |                       — | **no-op**                       |
+| V8 V4+occ=1                  |           622.8 |            0.91× |       3.48× |  PASS   |                       — | identical to V4                 |
 
 bwd_fwd kernel was not modified — stable at ~166-167 µs across all variants. All correctness checks pass rtol=1e-2 atol=1e-2 (worst residual: `DFACTOR` 4.3e-3 vs TileLang max abs 5.9e-3).
 
@@ -57,9 +57,9 @@ Measured on B200:
 
 V3 3-kernel split and V4 hoisted invariants **both regressed on GB10** but **both won on B200**:
 
-| Variant | B200 | GB10 |
-|---|---|---|
-| V3 3-kernel split | **−33%** (wins) | +9% (regresses) |
+| Variant               | B200            | GB10             |
+| --------------------- | --------------- | ---------------- |
+| V3 3-kernel split     | **−33%** (wins) | +9% (regresses)  |
 | V4 hoisted invariants | **−10%** (wins) | +19% (regresses) |
 
 **Why:** the launch-overhead vs live-set-savings trade-off depends on per-kernel smem budget and register pressure. On B200's 228 KiB smem, splitting into 3 kernels gives each one enough headroom; on GB10's 99 KiB dynamic budget the extra launch overhead (~30 µs) isn't amortized by the register relief.
