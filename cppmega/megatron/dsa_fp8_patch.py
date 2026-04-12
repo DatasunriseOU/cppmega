@@ -192,6 +192,39 @@ def apply_dsa_fp8_patch(*, force: bool = False) -> bool:
     # staticmethod body does a plain ``bwd_fused_indexer_loss_naive(...)``
     # lookup, not a captured reference.
     log.info("cppmega DSA FP8 backward patch applied (dtype=fp8)")
+
+    # ------------------------------------------------------------------
+    # Stream M: gate compute_dsa_indexer_loss on loss_coeff == 0.0
+    #
+    # compute_dsa_indexer_loss at dsa.py:202 allocates a 7.5 GiB FP32
+    # tensor [b*np, sq, sk] = [112, 4096, 4096] per DSA layer forward,
+    # even when loss_coeff=0 (the scalar result is multiplied by 0 anyway).
+    # At 9 DSA layers this wastes ~63 GB total. Gating on loss_coeff == 0
+    # short-circuits to return zeros — backward autograd then receives
+    # zero grad_loss and produces zero gradients automatically.
+    # ------------------------------------------------------------------
+    import torch
+
+    _LOSS_GATE_MARKER = "__cppmega_dsa_loss_gate_patched__"
+    existing_loss = getattr(dsa_mod, "compute_dsa_indexer_loss", None)
+    if existing_loss is not None and not getattr(existing_loss, _LOSS_GATE_MARKER, False):
+        _orig_loss = existing_loss
+
+        def _gated_compute_dsa_indexer_loss(
+            index_scores, topk_indices, query, key,
+            softmax_scale, loss_coeff, sparse_loss, pg_collection,
+        ):
+            if loss_coeff == 0.0:
+                return torch.zeros((), device=query.device, dtype=torch.float32)
+            return _orig_loss(
+                index_scores, topk_indices, query, key,
+                softmax_scale, loss_coeff, sparse_loss, pg_collection,
+            )
+
+        setattr(_gated_compute_dsa_indexer_loss, _LOSS_GATE_MARKER, True)
+        dsa_mod.compute_dsa_indexer_loss = _gated_compute_dsa_indexer_loss
+        log.info("cppmega DSA loss_coeff==0 gate applied (saves ~7.5 GiB per DSA layer forward)")
+
     return True
 
 
