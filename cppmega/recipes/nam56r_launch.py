@@ -21,6 +21,7 @@ def build_nam56r_megatron_native_args(
     enable_fim: bool = False,
     enable_moe: bool = False,
     enable_dsa: bool = False,
+    dsa_indexer_dtype: str = "bf16",
 ) -> MegatronArgsBundle:
     """Return the current native Megatron feature fragment for NAM-style lanes.
 
@@ -37,6 +38,7 @@ def build_nam56r_megatron_native_args(
         use_fim=enable_fim,
         use_moe=enable_moe,
         use_dsa=enable_dsa,
+        dsa_indexer_dtype=dsa_indexer_dtype,
     )
 
 
@@ -90,6 +92,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-fim", action="store_true")
     parser.add_argument("--enable-moe", action="store_true")
     parser.add_argument("--enable-dsa", action="store_true")
+    parser.add_argument(
+        "--dsa-indexer-dtype",
+        choices=("bf16", "fp8"),
+        default="bf16",
+        help="DSA indexer q@k^T compute dtype (requires cppmega dsa_fp8_patch for 'fp8')",
+    )
     return parser
 
 
@@ -108,6 +116,7 @@ def main() -> int:
         enable_fim=args.enable_fim,
         enable_moe=args.enable_moe,
         enable_dsa=args.enable_dsa,
+        dsa_indexer_dtype=args.dsa_indexer_dtype,
     )
     print(bundle.to_shell_fragment())
     return 0

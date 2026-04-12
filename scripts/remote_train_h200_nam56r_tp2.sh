@@ -1,108 +1,103 @@
 #!/usr/bin/env bash
-# Full NAM56R 4.73B + DSA permanent 9+4 attention layout on bench3 H200x8.
+# NAM56R full 7/7 MIMO training on LOCATION_2 H200x8 with TP=2.
 #
-# Stream D (v2) for task #79, 2026-04-12. Supersedes the old PP=1 noconv
-# smoke variant of this script.
+# Mirrors scripts/remote_train_h200_nam56r_grid.sh but flips the parallelism
+# to TP=2 PP=1 and toggles CPPMEGA_MAMBA3_TP_MIXER=1 so the
+# CppMegaSelectiveMambaMixer wraps CppmegaMamba3TPMixer (TP-aware Mamba3)
+# instead of AuthorMamba3Mixer (TP=1 only).
 #
-# Permanent production attention layout (2026-04-12 decision):
-#   * AEMEAEMEAEMR pattern @ depth 52 -> 13 A-layers at
-#     layer_numbers [1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49].
-#   * A-ranks 0..12; MLA at ranks [0, 4, 8, 12]; DSA at ranks
-#     [1, 2, 3, 5, 6, 7, 9, 10, 11]. MLA layer_numbers: [1, 17, 33, 49].
-#     DSA layer_numbers: [5, 9, 13, 21, 25, 29, 37, 41, 45].
-#   * Routing lives in cppmega.megatron.nam56r_full_spec.CppMegaSelectiveAttentionLayer
-#     via CPPMEGA_DSA_A_LAYER_RANKS env var (see nam56r_layout.load_dsa_a_layer_ranks).
-#
-# Config matches the 112k tok/sec baseline + DSA:
-#   PP=2, VPP=2, TP=1, MBS=4, GBS=64, MTP=2 (hybrid /-separator), BF16,
-#   full 7/7 Mamba3 MIMO, MoE AllToAll + permute-fusion + grouped GEMM,
-#   per-module CUDA graphs (attn mamba moe_router moe_preprocess),
-#   --no-rope-fusion (required for PP>1), DSA indexer defaults
-#   (n_heads=8, head_dim=64, topk=16, loss_coeff=0.0).
+# Baseline for comparison: TP=1 PP=2 VPP=2 MBS=4 GBS=64 MTP=2 = 112k tok/sec
+# (see docs/nam56r_grid_search_2026_04_12.md, "112k tok/sec baseline" row).
 #
 # Hard constraints:
-#   * Real data only (clang_semantic_4k_v10_train + HF tokenizer).
-#   * No feature disable hacks.
-#   * cuDNN LD_LIBRARY_PATH must be set via ~/.bashrc (check before launching).
-#
-# Designed to run directly on bench3 inside a tmux session launched with
-# `bash -l`. No gcloud/scp wrapping here - this script IS the remote body.
+#   * Real data only (clang_semantic_4k_v10_train) -- never NullTokenizer
+#   * Full 7/7 Mamba3 MIMO features (nam56r_full_spec)
+#   * tensor_model_parallel_size=2
+#   * cuDNN path fixed via ~/.bashrc on europe; we re-export here as a safety net
 set -euo pipefail
 
-REMOTE_ROOT="${REMOTE_ROOT:-/mnt/data}"
-REMOTE_VENV="${REMOTE_VENV:-${REMOTE_ROOT}/venv}"
-RUN_ID="${RUN_ID:-cppmega_nam56r_dsa_9_4_run1}"
-LOG="${LOG:-${REMOTE_ROOT}/cppmega-root/cppmega/${RUN_ID}.log}"
-CKPT_DIR="${CKPT_DIR:-${REMOTE_ROOT}/cppmega-root/cppmega/nam56r_grid/${RUN_ID}_ckpt}"
+REMOTE_HOST="${REMOTE_HOST:-h200_1}"
+REMOTE_ZONE="${REMOTE_ZONE:-LOCATION_2}"
+REMOTE_ROOT="${REMOTE_ROOT:-/home/dave/cppmega-root}"
+RUN_ID="${RUN_ID:-nam56r_tp2_run}"
+REMOTE_VENV="${REMOTE_VENV:-${REMOTE_ROOT}/cppmega-venv}"
+REMOTE_LOG="${REMOTE_LOG:-${REMOTE_ROOT}/cppmega/${RUN_ID}.log}"
+REMOTE_TMP_SCRIPT="${REMOTE_TMP_SCRIPT:-/tmp/cppmega-nam56r-tp2.sh}"
+LOCAL_TMP_SCRIPT="$(mktemp -t cppmega-nam56r-tp2.XXXXXX.sh)"
 
-mkdir -p "$(dirname "${LOG}")" "${CKPT_DIR}"
-rm -rf "${CKPT_DIR}"/* || true  # fresh init each run (safe - these are throwaway DSA benchmarks)
+trap 'rm -f "${LOCAL_TMP_SCRIPT}"' EXIT
 
-# Activate venv
+cat > "${LOCAL_TMP_SCRIPT}" <<'INNER'
+set -euo pipefail
+# Pull the cuDNN/NCCL/cuBLAS LD_LIBRARY_PATH lines out of ~/.bashrc directly.
+# Sourcing ~/.bashrc would not work because bash's non-interactive guard
+# (`case $- in *i*) ;; *) return;; esac`) returns immediately.
+: "${LD_LIBRARY_PATH:=}"
+# Use the system CUDA 13.2 libraries (cuDNN, NCCL, cuBLAS).  The venv-bundled
+# cuDNN under nvidia/cudnn/lib hits CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED
+# inside TE fused_attn for MLA on this image; the system cuDNN 9.20 in
+# /usr/local/cuda-13.2/lib64 is the working configuration.
+export LD_LIBRARY_PATH="/usr/local/cuda-13.2/lib64:${LD_LIBRARY_PATH}"
 source "${REMOTE_VENV}/bin/activate"
-export PYTHONPATH="${REMOTE_ROOT}/cppmega-root/cppmega:${REMOTE_ROOT}/cppmega-root/megatron-lm:${PYTHONPATH:-}"
+export PYTHONPATH="${REMOTE_ROOT}/cppmega:${REMOTE_ROOT}/megatron-lm:${PYTHONPATH:-}"
+mkdir -p "${REMOTE_ROOT}/cppmega" "${REMOTE_ROOT}/.triton-cache"
 
-# venv cuDNN must come first (bash -l + ~/.bashrc gives us LD_LIBRARY_PATH already,
-# but keep the explicit guard so this script is self-contained when someone sources
-# it without -l). The ~/.bashrc entry is:
-#   export LD_LIBRARY_PATH=/mnt/data/venv/lib/python3.13/site-packages/nvidia/cudnn/lib:...
-_CL="${REMOTE_VENV}/lib/python3.13/site-packages/nvidia/cudnn/lib"
-[ -d "${_CL}" ] && export LD_LIBRARY_PATH="${_CL}:${LD_LIBRARY_PATH:-}"
+CKPT_DIR="${REMOTE_ROOT}/cppmega/${RUN_ID}_ckpt"
+WORKDIR="$(mktemp -d /tmp/cppmega-nam56r-tp2.XXXXXX)"
+trap 'rm -rf "${WORKDIR}"' EXIT
 
-# NAM56R env defaults
+mkdir -p "$(dirname "${REMOTE_LOG}")" "${CKPT_DIR}"
+rm -rf "${CKPT_DIR}"/* || true
+
+echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-<empty>}" >&2
+
+# ---- NAM56R env defaults (mirror grid script) ----
 export TILELANG_EXECUTION_BACKEND="${TILELANG_EXECUTION_BACKEND:-cython}"
 export CPPMEGA_MAMBA3_MIMO="${CPPMEGA_MAMBA3_MIMO:-1}"
 export CPPMEGA_MAMBA_NUM_GROUPS="${CPPMEGA_MAMBA_NUM_GROUPS:-8}"
 export CPPMEGA_NEM_PATTERN="${CPPMEGA_NEM_PATTERN:-AEMEAEMEAEMR}"
 export CPPMEGA_LAYER_DEPTH="${CPPMEGA_LAYER_DEPTH:-52}"
 export CPPMEGA_R_LAYER_INDICES="${CPPMEGA_R_LAYER_INDICES:-12,24,36,48}"
-export CPPMEGA_NGRAM_HASH_ENABLED="${CPPMEGA_NGRAM_HASH_ENABLED:-1}"
-export CPPMEGA_NGRAM_HASH_ORDERS="${CPPMEGA_NGRAM_HASH_ORDERS:-2,3}"
-export CPPMEGA_NGRAM_HASH_HEADS="${CPPMEGA_NGRAM_HASH_HEADS:-8}"
-export CPPMEGA_NGRAM_HASH_TABLE_SIZE="${CPPMEGA_NGRAM_HASH_TABLE_SIZE:-500000}"
-export CPPMEGA_NGRAM_HASH_EMBED_DIM="${CPPMEGA_NGRAM_HASH_EMBED_DIM:-16}"
-export CPPMEGA_STRUCTURE_ENABLED="${CPPMEGA_STRUCTURE_ENABLED:-1}"
-export CPPMEGA_STRUCTURE_COMPONENTS="${CPPMEGA_STRUCTURE_COMPONENTS:-core}"
-
-# PERMANENT DSA 9+4 attention layout -- A-ranks (0-indexed) that get DSA.
-# MLA covers the remaining A-ranks [0, 4, 8, 12].
-export CPPMEGA_DSA_A_LAYER_RANKS="${CPPMEGA_DSA_A_LAYER_RANKS:-1,2,3,5,6,7,9,10,11}"
-
+# NOTE: ngram-hash + structure custom embeddings are temporarily disabled at
+# TP=2 because cppmega/megatron/custom_embedding.py does not handle
+# sequence-parallel sharding (the ngram embeddings come out at full L while
+# the parallel embedding is sliced to L/tp -- shape mismatch in the add).
+# This is a pre-existing bug in custom_embedding.py orthogonal to the
+# CppmegaMamba3TPMixer task; tracked separately.
+export CPPMEGA_NGRAM_HASH_ENABLED="${CPPMEGA_NGRAM_HASH_ENABLED:-0}"
+export CPPMEGA_STRUCTURE_ENABLED="${CPPMEGA_STRUCTURE_ENABLED:-0}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export NCCL_GRAPH_REGISTER=0
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_IB_SL=1
-# bench3 has a broken NCCL NET plugin; force NCCL to fall back to the built-in
-# transports. Same fix used by the nam56r grid driver.
-unset NCCL_NET NCCL_NET_PLUGIN 2>/dev/null || true
-export NCCL_NET_PLUGIN=none
 export TRITON_CACHE_DIR="${REMOTE_ROOT}/.triton-cache"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 mkdir -p "${TRITON_CACHE_DIR}"
 
-# Parallelism / batch knobs -- match 112k baseline exactly.
-TP_SIZE="${TP_SIZE:-1}"             # MUST stay 1 - Mamba3 has no TP
-PP_SIZE="${PP_SIZE:-2}"
-VPP_SIZE="${VPP_SIZE:-2}"
+# *** TP-aware Mamba3 mixer toggle ***
+export CPPMEGA_MAMBA3_TP_MIXER=1
+
+# ---- Parallelism knobs (TP=2 default; everything else mirrors baseline) ----
+TP_SIZE="${TP_SIZE:-2}"
+PP_SIZE="${PP_SIZE:-1}"
+VPP_SIZE="${VPP_SIZE:-1}"
 EP_SIZE="${EP_SIZE:-1}"
 MBS="${MBS:-4}"
 GBS="${GBS:-64}"
 SEQ_LEN="${SEQ_LEN:-4096}"
-TRAIN_ITERS="${TRAIN_ITERS:-120}"   # >=100 iters so iters 50-100 give a clean throughput window
-MTP_DEPTHS="${MTP_DEPTHS:-2}"       # DeepSeek-V3-style MTP depth, / separator applied below
-NO_ROPE_FUSION="${NO_ROPE_FUSION:-1}"
+TRAIN_ITERS="${TRAIN_ITERS:-100}"
+MTP_DEPTHS="${MTP_DEPTHS:-2}"
+CUDA_GRAPH_MODE="${CUDA_GRAPH_MODE:-per_module}"
+FP8_MODE="${FP8_MODE:-off}"
+NO_ROPE_FUSION="${NO_ROPE_FUSION:-0}"  # only needed when PP>1
 
-# Build workdir with pretrain_mamba shim (MIMO __post_init__ + fp32-bias hook).
-WORKDIR=$(mktemp -d /tmp/cppmega-nam56r-dsa-9-4.XXXXXX)
-trap "rm -rf ${WORKDIR}" EXIT
-
+# ---- Build the same shim as the grid launcher ----
 cat > "${WORKDIR}/cppmega_mimo_shim.py" <<'PY'
 """Shim: install MIMO __post_init__ hook + Mamba3 fp32-bias forward pre-hook."""
 from __future__ import annotations
 import os
 import sys
 
-# (1) deprecate_inference_params compatibility shim
 try:
     from megatron.core.inference.contexts import static_context as _sc
     if not hasattr(_sc, "deprecate_inference_params"):
@@ -117,7 +112,6 @@ try:
 except Exception as _exc:
     print(f"[cppmega_mimo_shim] static_context alias skipped: {_exc}", file=sys.stderr)
 
-# (2) MIMO __post_init__
 _mimo_on = os.environ.get("CPPMEGA_MAMBA3_MIMO", "0") == "1"
 if _mimo_on:
     try:
@@ -136,7 +130,6 @@ if _mimo_on:
     except Exception as _exc:
         print(f"[cppmega_mimo_shim] MIMO patch failed: {_exc}", file=sys.stderr)
 
-# (3) Mamba3 fp32-bias forward pre-hook
 try:
     from mamba_ssm.modules.mamba3 import Mamba3 as _Mamba3
     import torch as _torch
@@ -157,7 +150,28 @@ try:
 except Exception as _exc:
     print(f"[cppmega_mimo_shim] Mamba3 fp32-bias hook failed: {_exc}", file=sys.stderr)
 
-# (4) cppmega_mamba3_* __getattr__ fallback
+# Also install the same fp32 forward pre-hook on CppmegaMamba3TPMixer so its
+# per-head Mamba3 params stay fp32 even when wrapped in Float16Module.
+try:
+    from cppmega.megatron.cppmega_mamba3_tp_mixer import CppmegaMamba3TPMixer as _TP
+    import torch as _torch
+    _TP_FP32_NAMES = ("B_bias", "C_bias", "D", "dt_bias", "mimo_x", "mimo_z", "mimo_o")
+    def _restore_tp_bias_fp32(module, _inputs):
+        for _name in _TP_FP32_NAMES:
+            _p = getattr(module, _name, None)
+            if _p is not None and _p.dtype != _torch.float32:
+                _p.data = _p.data.float()
+    if not getattr(_TP, "_cppmega_fp32_bias_hook", False):
+        _TP._cppmega_fp32_bias_hook = True
+        _orig_tp_init = _TP.__init__
+        def _patched_tp_init(self, *args, **kwargs):
+            _orig_tp_init(self, *args, **kwargs)
+            self.register_forward_pre_hook(_restore_tp_bias_fp32)
+        _TP.__init__ = _patched_tp_init
+        print("[cppmega_mimo_shim] CppmegaMamba3TPMixer fp32-bias hook installed")
+except Exception as _exc:
+    print(f"[cppmega_mimo_shim] TP mixer fp32-bias hook failed: {_exc}", file=sys.stderr)
+
 try:
     from megatron.core.transformer.transformer_config import TransformerConfig
     _TC_BASE_GETATTR = getattr(TransformerConfig, "__getattr__", None)
@@ -174,7 +188,7 @@ except Exception:
     pass
 PY
 
-cp "${REMOTE_ROOT}/cppmega-root/megatron-lm/pretrain_mamba.py" "${WORKDIR}/pretrain_mamba_original.py"
+cp "${REMOTE_ROOT}/megatron-lm/pretrain_mamba.py" "${WORKDIR}/pretrain_mamba_original.py"
 cat > "${WORKDIR}/pretrain_mamba.py" <<'PY'
 import os, sys, runpy
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -198,12 +212,9 @@ def model_provider(model_builder, pre_process=True, post_process=True, vp_stage=
     return model_builder(args, pre_process, post_process, vp_stage, config=config, pg_collection=pg_collection)
 PY
 
-# Build hybrid layer pattern.
-#  - MTP_DEPTHS >=1 -> suffix "/*-" per predictor depth.
-#  - VPP>1 -> split main into PP*VPP equal chunks separated by "|".
+# ---- Build hybrid layer pattern (no PP/VPP splitting since PP=1, VPP=1) ----
 HYBRID_PATTERN=$(python - <<PY
 from cppmega.megatron.nam56r_lite_spec import build_default_hybrid_layer_pattern
-
 mtp_depths = ${MTP_DEPTHS}
 pp = ${PP_SIZE}
 vpp = ${VPP_SIZE}
@@ -218,7 +229,7 @@ n_chunks = pp * max(vpp, 1)
 if n_chunks > 1:
     total = len(main)
     per = total // n_chunks
-    assert total % n_chunks == 0, f"cannot split {total}-layer main into {n_chunks} equal chunks"
+    assert total % n_chunks == 0
     chunks = [main[i*per:(i+1)*per] for i in range(n_chunks)]
     main = "|".join(chunks)
 print(main + (("/" + mtp_part) if mtp_part else ""))
@@ -226,93 +237,77 @@ PY
 )
 echo "HYBRID_PATTERN: ${HYBRID_PATTERN}"
 
-# Native args (MLA + MoE + MTP + DSA). DSA default is True after the local
-# nam56r_launch.py edit, but we pass enable_dsa=True explicitly for clarity.
+# ---- Native arg fragment (MLA + MoE + MTP) ----
 NATIVE_ARGS=$(python - <<PY
 from cppmega.recipes.nam56r_launch import build_nam56r_megatron_native_args
 from cppmega.recipes.nam56r_megatron import build_nam56r_feature_plan
-
 mtp_depths = ${MTP_DEPTHS}
 enable_mtp = mtp_depths > 0
 plan = build_nam56r_feature_plan(pattern="AEMEAEMEAEMR", depth=52, mtp_depths=max(mtp_depths, 1))
 bundle = build_nam56r_megatron_native_args(
-    plan=plan,
-    enable_mla=True,
-    enable_mtp=enable_mtp,
-    mtp_mode="hybrid",
-    enable_moe=True,
-    enable_dsa=True,
+    plan=plan, enable_mla=True, enable_mtp=enable_mtp,
+    mtp_mode="hybrid", enable_moe=True,
 )
 print(bundle.to_shell_fragment())
 PY
 )
 echo "NATIVE_ARGS: ${NATIVE_ARGS}"
 
-# Override --mtp-num-layers to match MTP_DEPTHS if >1 (the helper always emits 1).
+if [ "${EP_SIZE}" != "1" ]; then
+  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--expert-model-parallel-size 1/--expert-model-parallel-size ${EP_SIZE}/")
+fi
 if [ "${MTP_DEPTHS}" -gt 1 ]; then
   NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--mtp-num-layers 1/--mtp-num-layers ${MTP_DEPTHS}/")
 fi
 
-# Override expert-model-parallel-size if EP_SIZE != 1.
-if [ "${EP_SIZE}" != "1" ]; then
-  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--expert-model-parallel-size 1/--expert-model-parallel-size ${EP_SIZE}/")
+# CUDA graph flags
+CG_FLAGS=""
+case "${CUDA_GRAPH_MODE}" in
+  off)
+    CG_FLAGS="--cuda-graph-impl none"
+    ;;
+  per_module)
+    CG_FLAGS="--cuda-graph-impl transformer_engine --cuda-graph-scope attn mamba moe --cuda-graph-warmup-steps 3"
+    ;;
+  full_iteration)
+    CG_FLAGS="--cuda-graph-impl local --cuda-graph-scope full_iteration --cuda-graph-warmup-steps 3"
+    ;;
+  *)
+    echo "ERROR: unknown CUDA_GRAPH_MODE=${CUDA_GRAPH_MODE}"; exit 2;;
+esac
+
+FP8_FLAGS=""
+if [ "${FP8_MODE}" = "hybrid_mla_moe" ]; then
+  FP8_FLAGS="--fp8-format hybrid --fp8-recipe delayed --fp8-amax-history-len 1024 --fp8-amax-compute-algo max"
 fi
-
-# Per-module CUDA graph scope (attn mamba moe_router moe_preprocess).
-CG_FLAGS="--cuda-graph-impl transformer_engine --cuda-graph-scope attn mamba moe_router moe_preprocess --cuda-graph-warmup-steps 3"
-
-# MoE dispatcher + capacity args. --moe-token-dispatcher-type alltoall and
-# --moe-permute-fusion are already emitted by build_megatron_args_bundle, so we
-# only append the CUDA-graph specific extras here.
-MOE_EXTRA_FLAGS="--moe-pad-expert-input-to-capacity --moe-expert-capacity-factor 1.0"
 
 ROPE_FLAG=""
 if [ "${NO_ROPE_FUSION}" = "1" ]; then
   ROPE_FLAG="--no-rope-fusion"
 fi
 
-# Pre-flight import check.
+MOE_EXTRA_FLAGS="--moe-token-dispatcher-type alltoall"
+if [ "${CUDA_GRAPH_MODE}" != "off" ]; then
+  MOE_EXTRA_FLAGS="${MOE_EXTRA_FLAGS} --moe-pad-expert-input-to-capacity --moe-expert-capacity-factor 1.0 --moe-permute-fusion"
+fi
+
 python -c 'import cppmega, megatron; print("cppmega", cppmega.__version__)'
 
-# Validate DSA A-layer rank parsing and emit the derived layer-number map so
-# the launch log records the exact 9+4 attention layout for this run.
-python - <<PY
-import os
-os.environ.setdefault("CPPMEGA_DSA_A_LAYER_RANKS", "${CPPMEGA_DSA_A_LAYER_RANKS}")
-from cppmega.megatron.nam56r_layout import load_attention_layer_numbers, load_dsa_a_layer_ranks
-attn_nums = load_attention_layer_numbers()
-dsa_ranks = load_dsa_a_layer_ranks()
-mla_ranks = [r for r in range(len(attn_nums)) if r not in dsa_ranks]
-print(f"[DSA-9-4] A-layer layer_numbers (1-indexed): {list(attn_nums)}")
-print(f"[DSA-9-4] DSA A-ranks: {list(dsa_ranks)}")
-print(f"[DSA-9-4] DSA layer_numbers: {[attn_nums[r] for r in dsa_ranks]}")
-print(f"[DSA-9-4] MLA A-ranks: {mla_ranks}")
-print(f"[DSA-9-4] MLA layer_numbers: {[attn_nums[r] for r in mla_ranks]}")
-assert len(dsa_ranks) == 9 and len(mla_ranks) == 4, (
-    f"expected 9 DSA + 4 MLA, got {len(dsa_ranks)} + {len(mla_ranks)}"
-)
-PY
-
-# Guard: refuse to launch if forbidden tokenizer/mock-data flags are present
-# in the rendered command fragments (not in the launcher source itself, which
-# trivially mentions these strings inside this guard).
-_FORBID1="Null""Tokenizer"
-_FORBID2="--mock""-data"
-if echo "${NATIVE_ARGS} ${CG_FLAGS} ${MOE_EXTRA_FLAGS} ${ROPE_FLAG}" | grep -E "(${_FORBID1}|${_FORBID2})" > /dev/null; then
-  echo "ERROR: rendered command contains ${_FORBID1} or ${_FORBID2}"
+if grep -E "^\s*--(tokenizer-type NullTokenizer|mock-data)\b" "$0" > /dev/null 2>&1; then
+  echo "ERROR: forbidden NullTokenizer/mock-data tokens detected"
   exit 9
 fi
 
-echo "=== NAM56R full 7/7 MIMO + DSA 9+4 permanent layout ==="
-echo "RUN_ID=${RUN_ID} TP=${TP_SIZE} PP=${PP_SIZE} VPP=${VPP_SIZE} EP=${EP_SIZE} MBS=${MBS} GBS=${GBS} MTP=${MTP_DEPTHS}"
-echo "DSA_A_LAYER_RANKS=${CPPMEGA_DSA_A_LAYER_RANKS}"
-echo "LOG=${LOG}"
-nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
+echo "=== NAM56R full 7/7 MIMO TP=${TP_SIZE} run ==="
+echo "RUN_ID=${RUN_ID} TP=${TP_SIZE} PP=${PP_SIZE} VPP=${VPP_SIZE} EP=${EP_SIZE} MBS=${MBS} GBS=${GBS} MTP=${MTP_DEPTHS} CG=${CUDA_GRAPH_MODE} FP8=${FP8_MODE}"
+echo "CPPMEGA_MAMBA3_TP_MIXER=${CPPMEGA_MAMBA3_TP_MIXER}"
+echo "LOG=${REMOTE_LOG}"
+nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader || true
 
 python -m torch.distributed.run --nproc_per_node=8 "${WORKDIR}/pretrain_mamba.py" \
   --data-path 1.0 "${REMOTE_ROOT}/data/megatron/clang_semantic_4k_v10_train" \
   --tokenizer-type HuggingFaceTokenizer \
-  --tokenizer-model "${REMOTE_ROOT}/tokenizer" \
+  --tokenizer-model "${REMOTE_ROOT}/data/tokenizer" \
   --split 98,1,1 \
   --tensor-model-parallel-size ${TP_SIZE} \
   --pipeline-model-parallel-size ${PP_SIZE} \
@@ -346,7 +341,9 @@ python -m torch.distributed.run --nproc_per_node=8 "${WORKDIR}/pretrain_mamba.py
   --transformer-impl transformer_engine \
   --attention-backend auto \
   --spec cppmega.megatron.nam56r_full_spec build_cppmega_nam56r_full_stack_spec \
+  --log-throughput \
   ${CG_FLAGS} \
+  ${FP8_FLAGS} \
   ${MOE_EXTRA_FLAGS} \
   --no-check-for-nan-in-loss-and-grad \
   ${NATIVE_ARGS} \
@@ -354,10 +351,19 @@ python -m torch.distributed.run --nproc_per_node=8 "${WORKDIR}/pretrain_mamba.py
   --load "${CKPT_DIR}" \
   --save-interval 1000000 \
   --log-interval 1 \
-  > "${LOG}" 2>&1
+  > "${REMOTE_LOG}" 2>&1
 
 EXIT_CODE=$?
 echo "=== Exit code: ${EXIT_CODE} ==="
-echo "=== Last 60 lines of ${LOG} ==="
-tail -60 "${LOG}"
+echo "=== Throughput summary ==="
+grep -E "(throughput|tokens/sec|TFLOP|TFLOPS|elapsed time per iteration)" "${REMOTE_LOG}" | tail -40 || true
+echo "=== Last 60 lines of ${REMOTE_LOG} ==="
+tail -60 "${REMOTE_LOG}"
 exit ${EXIT_CODE}
+INNER
+
+gcloud compute scp --zone "${REMOTE_ZONE}" "${LOCAL_TMP_SCRIPT}" "${REMOTE_HOST}:${REMOTE_TMP_SCRIPT}"
+gcloud compute ssh "${REMOTE_HOST}" \
+  --zone "${REMOTE_ZONE}" \
+  --command "REMOTE_ROOT='${REMOTE_ROOT}' REMOTE_VENV='${REMOTE_VENV}' REMOTE_LOG='${REMOTE_LOG}' RUN_ID='${RUN_ID}' TP_SIZE='${TP_SIZE:-2}' PP_SIZE='${PP_SIZE:-1}' VPP_SIZE='${VPP_SIZE:-1}' EP_SIZE='${EP_SIZE:-1}' MBS='${MBS:-4}' GBS='${GBS:-64}' SEQ_LEN='${SEQ_LEN:-4096}' TRAIN_ITERS='${TRAIN_ITERS:-100}' MTP_DEPTHS='${MTP_DEPTHS:-2}' CUDA_GRAPH_MODE='${CUDA_GRAPH_MODE:-per_module}' FP8_MODE='${FP8_MODE:-off}' NO_ROPE_FUSION='${NO_ROPE_FUSION:-0}' bash '${REMOTE_TMP_SCRIPT}' || (status=\$?; echo 'training failed; tail follows:'; tail -n 200 '${REMOTE_LOG}' 2>/dev/null || true; exit \$status)"
+gcloud compute ssh "${REMOTE_HOST}" --zone "${REMOTE_ZONE}" --command "rm -f '${REMOTE_TMP_SCRIPT}'"

@@ -246,3 +246,105 @@ DeepNormRMS, certain attention bias paths). Both require an upstream Megatron PR
 Without this workaround the MIMO path errors out on first forward with NaN grad
 norms from iteration 1.
 
+---
+
+## TransformerEngine 2.13 cuBLASLt FP8 `lda % 16` assertion on GB10 sm_121a
+
+- **File**: `transformer_engine/common/gemm/cublaslt_gemm.cu:157`
+  (`CanonicalizeGemmInput`)
+- **TE version**: 2.13.0 (both GB10 and bench3 H200)
+- **Status**: Hard crash on GB10 sm_121a; same stack **PASSES on H200** per
+  `docs/fp8_path_status.md` (all 4 Mamba3 paths).
+- **First observed**: 2026-04-11 during task #77 Stream C Blackwell feature
+  sweep on NAM56R-half.
+- **Severity**: Blocks FP8 hybrid training of NAM56R-half on GB10.
+
+### Symptom
+
+Running NAM56R-half (hidden=1792, ffn=9472, heads=14, noconv spec) with
+`--fp8-format hybrid --fp8-amax-history-len 16 --fp8-amax-compute-algo max`
+via `scripts/remote_train_gb10_nam56r_single.sh` (CUDA graphs off):
+
+```
+File ".../transformer_engine/pytorch/module/layernorm_linear.py", line 733, in backward
+  gemm_out, *_, reduce_scatter_out = general_gemm(weight, ...)
+File ".../transformer_engine/pytorch/cpp_extensions/gemm.py", line 197, in general_gemm
+  out, bias_grad, gelu_input, extra_output = tex.generic_gemm(*args, **kwargs)
+RuntimeError: /TransformerEngine/transformer_engine/common/gemm/cublaslt_gemm.cu:157
+  in function CanonicalizeGemmInput:
+  Assertion failed: ret.lda % 16 == 0.
+  Leading dimension requirement on A for FP8 GEMM. Caller must pad.
+```
+
+Happens in the **backward pass** of a `TELayerNormColumnParallelLinear`. The
+stack does not identify which layer instance; the error fires on the first
+backward of iter 1.
+
+### Why it's not a cppmega model-config issue
+
+All NAM56R-half dims are 16-aligned:
+
+| param | value | % 16 |
+|---|---|---|
+| hidden_size | 1792 | 0 |
+| ffn_hidden_size | 9472 | 0 |
+| num_attention_heads | 14 | — |
+| q_lora_rank | 64 | 0 |
+| kv_lora_rank | 64 | 0 |
+| qk_head_dim | 64 | 0 |
+| qk_pos_emb_head_dim | 32 | 0 |
+| v_head_dim | 64 | 0 |
+| moe_ffn_hidden_size | 896 | 0 |
+| moe_shared_expert_intermediate | 1024 | 0 |
+| num_experts | 16 | 0 |
+| mamba_num_groups | 8 | — |
+| mamba_state_dim | 128 | 0 |
+| mamba_head_dim | 64 | 0 |
+| padded_vocab_size | 65664 | 0 |
+
+Reproduced with `mbs=2 gbs=2` AND `mbs=4 gbs=4` so not a token-count lda.
+
+### Why it's GB10-specific
+
+The identical `(spec, dims, TE 2.13.0, mamba_ssm 2.3.1, torch 2.12+cu132)`
+stack runs **FP8 hybrid PASS** on bench3 H200 for all 4 Mamba3 paths (A, B,
+C, D) per `docs/fp8_path_status.md`. Only the target device differs.
+
+The crashing leading dimension comes from a weight slice that TE materializes
+inside `CanonicalizeGemmInput` before the cublasLt call; cublasLt's FP8 kernel
+on sm_90/cc 10.3 (Hopper/H200) accepts lda values that sm_121a's kernel
+rejects. NVIDIA's cuBLAS 13.2 release notes explicitly call out MXFP8 and
+NVFP4 tuning for DGX Spark (GB10), but **not** E4M3 hybrid — consistent with
+the hybrid path being the rough one.
+
+Adjacent evidence from `docs/gb10_software_stack.md`:
+> FP8 cuDNN attention — Not optimized on cc 12.1 (cuDNN FP8 paths target cc
+> 10.3 only)
+
+### Workarounds considered (and rejected)
+
+1. Change `mbs`/`gbs` — doesn't help, lda is weight-space not batch-space.
+2. Switch `--fp8-format` to pure `e4m3` — same cublasLt path, same assertion.
+3. Disable CUDA graphs — already off in the failing run (`--cuda-graph-impl
+   none`).
+4. Patch `cppmega_fp8_shim.py` — shim fixes Mamba3 fp32 bias/D casts, not TE
+   internal lda alignment. Tested in the H200 fp8 matrix; doesn't help here.
+5. Pad one of the hidden dims to a 32× multiple — would change model arch
+   and violates the "no feature disable hacks" rule; also unclear *which*
+   dim since all are already 16-aligned.
+
+### Upstream next step
+
+Open a Transformer Engine issue with a minimal repro: NAM56R-half dims +
+`--fp8-format hybrid` on sm_121a. The assertion message "Caller must pad"
+suggests the fix is in the CanonicalizeGemmInput path itself — TE should pad
+internally when targeting sm_12x.
+
+### Impact on cppmega
+
+**Blocks FP8 training on GB10** for NAM56R-half (and by extension full
+NAM56R). Does NOT block H200 or B200 — those are the production targets per
+`docs/gb10_software_stack.md` ("Training on GB10 — only for smoke tests.
+Production goes to H200 / B200"). Recommend: use GB10 for BF16 smoke only,
+run FP8 on bench3 H200 per the existing FP8 path matrix.
+
