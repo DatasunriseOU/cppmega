@@ -399,6 +399,30 @@ def apply_dsa_fp8_patch(*, force: bool = False) -> bool:
                 "(loss_coeff==0: skip; loss_coeff>0: 0.8 GiB instead of 7.5 GiB per DSA layer)"
             )
 
+    # ------------------------------------------------------------------
+    # Tier 4: Sparse gather-scatter DSA attention
+    #
+    # unfused_dsa_fn (dsa.py:920) materializes FULL [b*np, sq, sk] FP32
+    # attention scores = 7.0 GiB per DSA layer at production shape, then
+    # masks non-topk to -inf before softmax.  This is the REAL memory
+    # bottleneck for DSA 9+4 on H200 (5 layers × 7 GiB = 35 GiB extra).
+    #
+    # sparse_dsa_fn gathers only topk K/V entries per query, computing
+    # [b, np, sq, topk=16] scores = 28.7 MB instead of 7 GiB.
+    # ~250× reduction in attention scores tensor.
+    # ------------------------------------------------------------------
+    _SPARSE_DSA_MARKER = "__cppmega_sparse_dsa_patched__"
+    existing_unfused = getattr(dsa_mod, "unfused_dsa_fn", None)
+    if existing_unfused is not None and not getattr(existing_unfused, _SPARSE_DSA_MARKER, False):
+        from cppmega.megatron.dsa_sparse_attention import sparse_dsa_fn
+
+        setattr(sparse_dsa_fn, _SPARSE_DSA_MARKER, True)
+        dsa_mod.unfused_dsa_fn = sparse_dsa_fn
+        log.info(
+            "cppmega sparse_dsa_fn applied (replaces unfused_dsa_fn: "
+            "7.0 GiB → 28.7 MB attention scores per DSA layer, ~250× reduction)"
+        )
+
     # -- KL mode patch: tilelang_fused online-softmax --
     # When CPPMEGA_DSA_KL_MODE=tilelang_fused, replace _attention_target_fp32
     # in the dsa_fp8_indexer module with the one-pass online-softmax variant
