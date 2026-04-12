@@ -1,3 +1,5 @@
+import pytest
+
 from cppmega.recipes.megatron_args import build_megatron_args_bundle
 from cppmega.recipes.nam56r_megatron import build_nam56r_feature_plan
 
@@ -20,6 +22,24 @@ def test_megatron_args_bundle_emits_native_mla_mtp_fim_moe_dsa_flags():
     assert "--num-experts" in bundle.args
     assert "--experimental-attention-variant" in bundle.args
     assert bundle.args[bundle.args.index("--experimental-attention-variant") + 1] == "dsa"
+    # Default indexer dtype is bf16 and the flag is always emitted under --use-dsa.
+    assert "--dsa-indexer-dtype" in bundle.args
+    assert bundle.args[bundle.args.index("--dsa-indexer-dtype") + 1] == "bf16"
+
+
+def test_megatron_args_bundle_emits_dsa_fp8_indexer_dtype_flag_with_note():
+    plan = build_nam56r_feature_plan(pattern="AEMEAEMEAEMR", depth=52, mtp_depths=1)
+    bundle = build_megatron_args_bundle(plan=plan, use_dsa=True, dsa_indexer_dtype="fp8")
+
+    assert "--dsa-indexer-dtype" in bundle.args
+    assert bundle.args[bundle.args.index("--dsa-indexer-dtype") + 1] == "fp8"
+    assert any("dsa_fp8_patch" in note for note in bundle.custom_notes)
+
+
+def test_megatron_args_bundle_rejects_unknown_dsa_indexer_dtype():
+    plan = build_nam56r_feature_plan(pattern="AEMEAEMEAEMR", depth=52, mtp_depths=1)
+    with pytest.raises(ValueError, match="unsupported dsa_indexer_dtype"):
+        build_megatron_args_bundle(plan=plan, use_dsa=True, dsa_indexer_dtype="int4")
 
 
 def test_megatron_args_bundle_uses_hybrid_mtp_contract_without_gpt_toggle():

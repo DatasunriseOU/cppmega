@@ -96,14 +96,15 @@ MBS=2, GBS=16, NAM56R feature plan with MLA+MTP+MoE:
 |------|----------------------------------------|-----------|-------------|
 | A    | `mamba3_te_stack_spec`                 | PASS      | 1116/1082/1064 |
 | B    | `mamba3_author_spec` (SISO)            | PASS      | 1416/1082/1047 |
-| C    | `mamba3_author_spec` + MIMO rank=4     | FAIL      | backward hits TileLang kernel ngroups=8 limit, NOT an FP8 issue |
+| C    | `mamba3_author_spec` + MIMO rank=4     | FAIL (historical on one env) | backward originally failed in one local `mamba3_mimo_bwd.py` install; this was later fixed and is not the current TP bottleneck |
 | D    | `nam56r_noconv_spec` (NoConvBC + M2RNN)| PASS      | 38279/37625/37909 |
 
-Path C's failure is in `mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py:1314`:
-`ValueError: G value of 8 is not currently supported!`. The forward
-pass succeeded under FP8; only the backward kernel has the ngroups
-constraint. Path C needs either a reduction in `ngroups` or an
-extension of the TileLang MIMO backward to cover G=8.
+Path C's failure above was a historical local-environment issue in one
+installed `mamba3_mimo_bwd.py` wrapper, not the durable explanation for
+the current NAM56R TP result. The later single-node H200 TP=2 verdict is
+still "net loss", but because of collective overhead plus a compute
+profile that does not shrink enough under TP, not because of an
+inherent `ngroups` kernel constraint.
 
 See `docs/fp8_path_status.md` for the full table.
 

@@ -19,6 +19,7 @@ from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
 from cppmega.megatron.author_mamba3_spec import AuthorMamba3Mixer
+from cppmega.megatron.cppmega_mamba3_tp_mixer import CppmegaMamba3TPMixer
 from cppmega.megatron.dsa_local_spec import get_cppmega_dsa_layer_spec
 from cppmega.megatron.m2rnn_spec import CppMegaM2RNNMixer
 from cppmega.megatron.nam56r_layout import (
@@ -72,6 +73,18 @@ def _clone_attention_variant_config(config, *, experimental_attention_variant):
     return cloned
 
 
+def _select_mamba3_mixer_cls():
+    """Pick the Mamba3 mixer implementation based on env-var toggle.
+
+    ``CPPMEGA_MAMBA3_TP_MIXER=1`` swaps the TP=1-only ``AuthorMamba3Mixer``
+    for ``CppmegaMamba3TPMixer`` which supports tensor-model-parallel-size>1
+    while preserving the full 7/7 Mamba3 MIMO feature surface.
+    """
+    if os.environ.get("CPPMEGA_MAMBA3_TP_MIXER", "0") == "1":
+        return CppmegaMamba3TPMixer
+    return AuthorMamba3Mixer
+
+
 class CppMegaSelectiveMambaMixer(nn.Module):
     """Select Author Mamba3 or M2RNN per global Mamba-like layer position."""
 
@@ -88,7 +101,26 @@ class CppMegaSelectiveMambaMixer(nn.Module):
         super().__init__()
         indices = frozenset(int(index) for index in r_layer_indices)
         layer_idx = 1 if layer_number is None else layer_number
-        mixer_cls = CppMegaM2RNNMixer if layer_idx in indices else AuthorMamba3Mixer
+        mamba3_cls = _select_mamba3_mixer_cls()
+        mixer_cls = CppMegaM2RNNMixer if layer_idx in indices else mamba3_cls
+        # CppmegaMamba3TPMixer requires concrete in_proj/out_proj submodule
+        # classes (TELayerNormColumnParallelLinear / TERowParallelLinear).
+        # Inject them lazily when the TP mixer is selected and the upstream
+        # spec did not supply them.
+        if mixer_cls is CppmegaMamba3TPMixer and (
+            submodules is None
+            or getattr(submodules, "in_proj", None) is None
+            or getattr(submodules, "out_proj", None) is None
+        ):
+            from megatron.core.extensions.transformer_engine import (
+                TELayerNormColumnParallelLinear,
+                TERowParallelLinear,
+            )
+            from megatron.core.ssm.mamba_mixer import MambaMixerSubmodules
+            submodules = MambaMixerSubmodules(
+                in_proj=TELayerNormColumnParallelLinear,
+                out_proj=TERowParallelLinear,
+            )
         self.impl = mixer_cls(
             config=config,
             d_model=d_model,
@@ -168,13 +200,23 @@ def build_cppmega_nam56r_full_stack_spec(config):
             "attention_layer_numbers": attention_layer_numbers,
         },
     )
+
+    # WrappedTorchNorm does not support sequence-parallel; switch to TENorm
+    # whenever we run with TP>1 (which requires SP for MoE) so the spec
+    # works at TP=2 with the new CppmegaMamba3TPMixer.
+    tp_size = getattr(config, "tensor_model_parallel_size", 1)
+    if tp_size > 1:
+        from megatron.core.extensions.transformer_engine import TENorm as _MixerNorm
+    else:
+        _MixerNorm = WrappedTorchNorm
+
     return ModuleSpec(
         module=MambaStack,
         submodules=MambaStackSubmodules(
             mamba_layer=ModuleSpec(
                 module=MambaLayer,
                 submodules=MambaLayerSubmodules(
-                    norm=WrappedTorchNorm,
+                    norm=_MixerNorm,
                     mixer=ModuleSpec(
                         module=CppMegaSelectiveMambaMixer,
                         params={"r_layer_indices": r_layer_indices},

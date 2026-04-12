@@ -196,6 +196,12 @@ class NAM56RNeMoRecipe:
     ngram_hash_enabled: bool = False
     structure_enabled: bool = False
 
+    # --- TP-aware Mamba3 mixer toggle ---
+    # When True, swap AuthorMamba3Mixer for CppmegaMamba3TPMixer in
+    # nam56r_full_spec via the CPPMEGA_MAMBA3_TP_MIXER=1 env var.  Required
+    # for tensor-model-parallel-size > 1.
+    use_tp_mamba3_mixer: bool = False
+
     def _tp(self) -> int:
         return 2 if self.mode == "nemo_native" else 1
 
@@ -445,6 +451,8 @@ class NAM56RNeMoRecipe:
         if self.structure_enabled:
             env["CPPMEGA_STRUCTURE_ENABLED"] = "1"
             env["CPPMEGA_STRUCTURE_COMPONENTS"] = "core"
+        if self.use_tp_mamba3_mixer:
+            env["CPPMEGA_MAMBA3_TP_MIXER"] = "1"
         return env
 
 

@@ -55,6 +55,7 @@ def build_megatron_args_bundle(
     dsa_indexer_head_dim: int = 64,
     dsa_indexer_topk: int = 16,
     dsa_indexer_loss_coeff: float = 0.0,
+    dsa_indexer_dtype: str = "bf16",
 ) -> MegatronArgsBundle:
     args: list[str] = []
     notes: list[str] = []
@@ -113,6 +114,10 @@ def build_megatron_args_bundle(
         args.extend(_bool_flag(moe_grouped_gemm, "--moe-grouped-gemm"))
 
     if use_dsa:
+        if dsa_indexer_dtype not in ("bf16", "fp8"):
+            raise ValueError(
+                f"unsupported dsa_indexer_dtype: {dsa_indexer_dtype!r} (expected 'bf16' or 'fp8')"
+            )
         args.extend(
             [
                 "--experimental-attention-variant",
@@ -125,8 +130,16 @@ def build_megatron_args_bundle(
                 str(dsa_indexer_topk),
                 "--dsa-indexer-loss-coeff",
                 str(dsa_indexer_loss_coeff),
+                "--dsa-indexer-dtype",
+                dsa_indexer_dtype,
             ]
         )
+        if dsa_indexer_dtype == "fp8":
+            notes.append(
+                "DSA indexer FP8 path requires "
+                "cppmega.megatron.dsa_fp8_patch.apply_dsa_fp8_patch() "
+                "at launch time and CPPMEGA_DSA_INDEXER_DTYPE=fp8 env var"
+            )
 
     if plan.engram is not None:
         notes.append("Engram remains custom; no Megatron-native emitter yet")
