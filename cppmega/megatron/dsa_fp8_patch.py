@@ -279,14 +279,6 @@ def apply_dsa_fp8_patch(*, force: bool = False) -> bool:
             grad_loss = rest_kwargs.get("grad_loss", None)
             pg_collection = rest_kwargs.get("pg_collection", None)
 
-        # If indexer loss was skipped in forward, return zero gradients
-        if os.environ.get("CPPMEGA_DSA_SKIP_INDEXER_LOSS", "0") == "1":
-            return (
-                torch.zeros_like(q),
-                torch.zeros_like(weights),
-                torch.zeros_like(k),
-            )
-
         return bwd_fused_indexer_loss_fp8(
             q, weights, k, query, key, topk_indices,
             softmax_scale, loss_coeff, sparse_loss,
@@ -383,13 +375,70 @@ def apply_dsa_fp8_patch(*, force: bool = False) -> bool:
     _LOSS_GATE_MARKER = "__cppmega_dsa_loss_gate_patched__"
     existing_loss = getattr(dsa_mod, "compute_dsa_indexer_loss", None)
     if existing_loss is not None and not getattr(existing_loss, _LOSS_GATE_MARKER, False):
-        _orig_loss = existing_loss
         _kl_mode = resolve_kl_mode()
 
         if _kl_mode == "splitk":
             from cppmega.megatron.dsa_splitk_indexer_loss import (
                 compute_dsa_indexer_loss_splitk,
             )
+
+        from cppmega.megatron.dsa_fp8_indexer import _attention_target_fp32
+
+        def _compute_dsa_indexer_loss_head_streaming(
+            index_scores, topk_indices, query, key,
+            softmax_scale, loss_coeff, sparse_loss, pg_collection,
+        ):
+            """Head-streaming KL loss: loops over heads instead of full bmm.
+
+            Replaces upstream ``compute_dsa_indexer_loss`` which materializes
+            ``[b*np, sq, sk]`` FP32 = 7 GiB at production shape
+            (b=4, np=28, sq=sk=4096).
+
+            This implementation reuses ``_attention_target_fp32`` from
+            ``dsa_fp8_indexer.py`` which loops per-head, keeping peak live
+            memory at ~0.8 GiB (3 x [b, sq, sk] FP32 buffers).
+
+            Shapes:
+                index_scores: [b, sq, sk]  (float32)
+                topk_indices: [b, sq, topk] (int64)
+                query:        [sq, b, np, hn] (bf16)
+                key:          [sk, b, np, hn] (bf16)
+            """
+            sq, b, np_, hn = query.shape
+            sk = key.shape[0]
+
+            # (A) Head-streaming attention target: loops over np heads,
+            # accumulates [b, sq, sk] softmax sum, then L1-normalizes.
+            # Peak: ~0.8 GiB instead of 7 GiB.
+            attention_target, index_mask = _attention_target_fp32(
+                query, key, softmax_scale, topk_indices, sparse_loss, pg_collection
+            )
+
+            # (B) Index scores softmax (same masks as attention target).
+            causal_mask = torch.triu(
+                torch.full((sq, sk), float("-inf"),
+                           dtype=torch.float32, device=query.device),
+                diagonal=1,
+            )
+            idx_input = index_scores + causal_mask.unsqueeze(0)
+            del causal_mask
+            if sparse_loss:
+                idx_input = idx_input + index_mask
+            del index_mask
+            index_probs = torch.nn.functional.softmax(
+                idx_input, dim=-1, dtype=torch.float32
+            )
+            del idx_input
+
+            # (C) KL divergence: sum_k p * (log p - log q)
+            eps = 1e-10
+            kl = attention_target * (
+                torch.log(attention_target + eps) - torch.log(index_probs + eps)
+            )
+            del attention_target, index_probs
+            per_position_loss = kl.sum(dim=-1)  # [b, sq]
+            del kl
+            return per_position_loss.mean() * loss_coeff
 
         def _gated_compute_dsa_indexer_loss(
             index_scores, topk_indices, query, key,
@@ -412,13 +461,10 @@ def apply_dsa_fp8_patch(*, force: bool = False) -> bool:
                         softmax_scale, loss_coeff, sparse_loss, pg_collection,
                     )
                 # TP > 1: fall through to head_streaming
-            # loss_coeff > 0: upstream compute_dsa_indexer_loss does a full
-            # torch.bmm(query.float(), key.float()) = 7 GiB at sq=sk=4096.
-            # Force loss_coeff=0 gate when CPPMEGA_DSA_SKIP_INDEXER_LOSS=1
-            # (temporary memory workaround — disables indexer loss training).
-            if os.environ.get("CPPMEGA_DSA_SKIP_INDEXER_LOSS", "0") == "1":
-                return torch.zeros((), device=query.device, dtype=torch.float32)
-            return _orig_loss(
+            # Head-streaming: loop over np heads, compute per-head [b, sq, sk]
+            # attention scores + softmax, accumulate. Peak memory ~0.8 GiB
+            # instead of 7 GiB for the full [b*np, sq, sk] bmm.
+            return _compute_dsa_indexer_loss_head_streaming(
                 index_scores, topk_indices, query, key,
                 softmax_scale, loss_coeff, sparse_loss, pg_collection,
             )
