@@ -96,6 +96,8 @@ case "${VARIANT}" in
   v0)
     echo "[stream_m] V0 = EP=1 DP=4 PP=2 VPP=2 (all 16 experts/rank, 4x DP, no DeepEP)"
     EP_SIZE=1
+    # flex dispatcher requires TP*EP > 1; override to alltoall for EP=1
+    CPPMEGA_DISPATCHER_OVERRIDE=alltoall
     ;;
   v1)
     echo "[stream_m] V1 = EP=4 DP=1 PP=2 VPP=2 (4 experts/rank, grad-accum GBS)"
@@ -320,6 +322,13 @@ fi
 if ! echo "${NATIVE_ARGS}" | grep -q -- "--expert-model-parallel-size ${EP_SIZE}"; then
   echo "ERROR: failed to set --expert-model-parallel-size ${EP_SIZE}; NATIVE_ARGS=${NATIVE_ARGS}" >&2
   exit 3
+fi
+# EP=1 override: flex dispatcher requires TP*EP > 1, fall back to alltoall
+if [ "${CPPMEGA_DISPATCHER_OVERRIDE:-}" = "alltoall" ]; then
+  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--moe-token-dispatcher-type flex/--moe-token-dispatcher-type alltoall/")
+  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/ --moe-router-dtype fp32//")
+  MOE_EXTRA_FLAGS="--moe-pad-expert-input-to-capacity --moe-expert-capacity-factor 1.0"
+  echo "NATIVE_ARGS (alltoall override for EP=1): dispatcher=alltoall"
 fi
 echo "NATIVE_ARGS (post-sed): ${NATIVE_ARGS}"
 
