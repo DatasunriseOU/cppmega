@@ -166,6 +166,19 @@ def apply_all():
         ),
     ], "tilelang_sparse_mla_bwd.py D hardcode")
 
+    # === Patch 7: tilelang_sparse_mla_bwd.py — FP32 P/dP for dKV precision ===
+    print("Patch 7: tilelang_sparse_mla_bwd.py FP32 P/dP precision fix")
+    _patch_file(bwd_file, [
+        (
+            "P_shared_cast = T.alloc_shared([block_H, BS], dtype)",
+            "P_shared_cast = T.alloc_shared([block_H, BS], accum_dtype)  # fp32 for dKV precision",
+        ),
+        (
+            "dP_shared_cast = T.alloc_shared([block_H, BS], dtype)",
+            "dP_shared_cast = T.alloc_shared([block_H, BS], accum_dtype)  # fp32 for dKV precision",
+        ),
+    ], "tilelang_sparse_mla_bwd.py P/dP fp32")
+
     print()
     print("All patches applied. Restart training to pick up changes.")
 
