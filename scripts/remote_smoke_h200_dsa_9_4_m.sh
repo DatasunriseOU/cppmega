@@ -349,15 +349,9 @@ if [[ "${CPPMEGA_DISPATCHER_OVERRIDE:-}" == alltoall* ]]; then
 fi
 echo "NATIVE_ARGS (post-sed): ${NATIVE_ARGS}"
 
-# CUDA graphs — full scope verified stable with TileLang + lr=1e-5.
-# Disable only for pure alltoall EP>1 (NCCL collective in CG capture).
-# EP=1 alltoall_keep_cg is CG-safe (local routing only).
-if [ "${CPPMEGA_DISPATCHER_OVERRIDE:-}" = "alltoall" ]; then
-  CG_FLAGS=""
-  echo "[stream_m] CUDA graphs DISABLED (alltoall EP>1 dispatcher)"
-else
-  CG_FLAGS="--cuda-graph-impl transformer_engine --cuda-graph-scope attn mamba moe_router moe_preprocess --cuda-graph-warmup-steps 3"
-fi
+# CUDA graphs — disabled until first iteration completes successfully.
+CG_FLAGS=""
+echo "[stream_m] CUDA graphs DISABLED (bringup)"
 # NOTE: --moe-pad-expert-input-to-capacity is INCOMPATIBLE with flex dispatcher
 # (raises ValueError). Omit when using DeepEP flex.
 # Only reset MOE_EXTRA_FLAGS if not already set by alltoall override above.
