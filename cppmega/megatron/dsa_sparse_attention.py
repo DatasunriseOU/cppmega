@@ -63,50 +63,46 @@ def sparse_dsa_fn(
     v = value.permute(1, 2, 0, 3).contiguous()
 
     # ===================================================================
-    # 2) Gather topk K entries per query position
-    #    topk_indices: [b, sq, topk] — same indices for all heads (GQA)
-    #    Expand to [b, np, sq, topk] then gather from k along sk dim
+    # 2-6) Head-chunked sparse attention to avoid O(b*np*sq*topk*hn) peak
+    #
+    # With topk=256, the naive gather k_sparse[b,np,sq,topk,hn] is 42 GiB.
+    # We chunk over heads to keep peak at O(b*chunk*sq*topk*hn).
     # ===================================================================
-    # [b, sq, topk] → [b, 1, sq, topk, 1] → [b, np, sq, topk, hn]
-    idx_k = topk_indices.unsqueeze(1).unsqueeze(-1).expand(b, np_, sq, topk, hn)
-    # k_expanded: [b, np, sk, hn] → [b, np, 1, sk, hn] (broadcast sq dim)
-    # Gather along dim=3 (sk): [b, np, sq, topk, hn]
-    k_sparse = k.unsqueeze(2).expand(-1, -1, sq, -1, -1).gather(3, idx_k)
+    # Precompute causal mask: topk_indices[b, sq, topk] > position → future
+    sq_positions = torch.arange(sq, device=q.device, dtype=topk_indices.dtype)
+    future_mask = topk_indices > sq_positions.view(1, -1, 1)  # [b, sq, topk]
 
-    # ===================================================================
-    # 3) Compute sparse attention scores: Q @ K_sparse^T
-    #    q: [b, np, sq, hn], k_sparse: [b, np, sq, topk, hn]
-    #    → scores: [b, np, sq, topk] = 28.7 MB (not 7 GiB!)
-    # ===================================================================
-    scores = torch.einsum("bnqd,bnqkd->bnqk", q.float(), k_sparse.float()) * softmax_scale
-    del k_sparse
+    # Per-head index templates (same for all heads — GQA shared indices)
+    # [b, sq, topk, 1]
+    idx_k_base = topk_indices.unsqueeze(-1)
+    idx_v_base = topk_indices.unsqueeze(-1)
 
-    # ===================================================================
-    # 4) Causal mask: set future positions to -inf
-    #    topk_indices[b, sq, topk] > sq_position → future → mask
-    # ===================================================================
-    sq_positions = torch.arange(sq, device=scores.device, dtype=topk_indices.dtype)
-    # [b, sq, topk]: True where topk_index is in the future
-    future_mask = topk_indices > sq_positions.view(1, -1, 1)
-    # Expand to [b, np, sq, topk]
-    scores.masked_fill_(future_mask.unsqueeze(1), float("-inf"))
+    head_chunk = min(np_, max(1, 140 * 1024**3 // (b * sq * topk * hn * 2 * 4)))  # fit ~4 tensors in 140G
+    output = torch.zeros(b, np_, sq, hnv, device=q.device, dtype=q.dtype)
+
+    for h0 in range(0, np_, head_chunk):
+        h1 = min(h0 + head_chunk, np_)
+        nc = h1 - h0
+
+        # Gather K for this head chunk: [b, nc, sq, topk, hn]
+        idx_k = idx_k_base.unsqueeze(1).expand(b, nc, sq, topk, hn)
+        k_chunk = k[:, h0:h1].unsqueeze(2).expand(-1, -1, sq, -1, -1).gather(3, idx_k)
+
+        # Scores in bf16 then upcast only for softmax
+        scores = torch.einsum("bnqd,bnqkd->bnqk", q[:, h0:h1], k_chunk) * softmax_scale
+        del k_chunk
+        scores.masked_fill_(future_mask.unsqueeze(1), float("-inf"))
+        attn_w = F.softmax(scores.float(), dim=-1, dtype=torch.float32)
+        del scores
+
+        # Gather V for this head chunk: [b, nc, sq, topk, hnv]
+        idx_v = idx_v_base.unsqueeze(1).expand(b, nc, sq, topk, hnv)
+        v_chunk = v[:, h0:h1].unsqueeze(2).expand(-1, -1, sq, -1, -1).gather(3, idx_v)
+
+        output[:, h0:h1] = torch.einsum("bnqk,bnqkd->bnqd", attn_w.to(v_chunk.dtype), v_chunk)
+        del attn_w, v_chunk
+
     del future_mask
-
-    # ===================================================================
-    # 5) Softmax over topk dimension (not full sk!)
-    # ===================================================================
-    attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32)
-    del scores
-
-    # ===================================================================
-    # 6) Gather topk V entries and weighted sum
-    # ===================================================================
-    idx_v = topk_indices.unsqueeze(1).unsqueeze(-1).expand(b, np_, sq, topk, hnv)
-    v_sparse = v.unsqueeze(2).expand(-1, -1, sq, -1, -1).gather(3, idx_v)
-
-    # [b, np, sq, topk] @ [b, np, sq, topk, hnv] → [b, np, sq, hnv]
-    output = torch.einsum("bnqk,bnqkd->bnqd", attn_weights.to(v_sparse.dtype), v_sparse)
-    del attn_weights, v_sparse
 
     # ===================================================================
     # 7) Reshape back to Megatron expected format: [sq, b, np * hnv]
