@@ -38,7 +38,7 @@ def build_megatron_args_bundle(
     q_lora_rank: int = 64,
     kv_lora_rank: int = 64,
     qk_head_dim: int = 64,
-    qk_pos_emb_head_dim: int = 32,
+    qk_pos_emb_head_dim: int = 64,  # was 32; 64 → tail_dim=128 (power-of-2 for TileLang)
     v_head_dim: int = 64,
     use_mtp: bool = False,
     mtp_mode: str = "gpt",
