@@ -863,3 +863,95 @@ Stream B v2 production run ограничен одним параметром (`
 3. После PASS: re-run task #85 production TP=2 run на europe, получить
    новый валидационный loss, сравнить с TP=1 baseline уже с правильной
    математикой.
+
+---
+
+## Сессия 2026-04-12: DSA/TP/recompute оптимизация
+
+### Исследование TP=2 (Streams B, B v2)
+
+- Написан `CppmegaMamba3TPMixer` (589 LOC), TE-нативный паттерн по образцу Megatron `MambaMixer`.
+- Числовая совместимость TP=1 vs TP=2: **PASS** (max_abs=1.5625e-2 bf16).
+- Найден и исправлен баг B/C layout: upstream `(r,g,n)` -> должно быть `(g,r,n)` при TP>1.
+- Найден баг backward `angle_proj` в SP-режиме (Stream I): `tensor_parallel_output_grad=False` -> должно быть `True` (1-строчный фикс).
+- Throughput TP=2: **34,672 tok/sec = 3.2x медленнее** чем TP=1 (112k baseline). Подтверждено обеими версиями v1 и v2.
+- Корневые причины: overhead коллективов + compute bandwidth-bound + PP=2 VPP=2 эффективнее как топология.
+- **Вердикт:** TP>1 — чистый проигрыш для NAM56R Mamba-3 MIMO на single-node H200x8. Mixer сохранён для будущего multi-node.
+
+### Постоянная DSA 9+4 конфигурация attention
+
+- Решение пользователя: 13 A-слоёв = 9 DSA + 4 полных MLA. DSA НЕ опционален.
+- A-ранги DSA: `[1,2,3,5,6,7,9,10,11]`, MLA: `[0,4,8,12]`.
+- Env var: `CPPMEGA_DSA_A_LAYER_RANKS="1,2,3,5,6,7,9,10,11"`.
+- Механизм уже подключён: `CppMegaSelectiveAttentionLayer` в `nam56r_full_spec.py`.
+
+### Сага оптимизации памяти DSA
+
+- **Stream D v1:** DSA 9+4 BF16 OOM при PP=2 (136 GB, активации MoE stage 1).
+- **Stream E:** Порт FP8 indexer из DeepSeek V3.2 через `torch._scaled_mm`. Per-head fused аккумуляция. 9.3-13.4x снижение пиковой дельты. Topk overlap 94.4%. Экономия ~26 GB stage 0 forward.
+- **Stream G:** Очистка backward FP8. Indexer-only 69.5% экономии, но full-path только 0.7% потому что основной attention bmm доминирует.
+- **Stream D v2:** FP8 indexer применён, stage 0 OK, но stage 1 OOM на активации MoE (136 GB). MTP=2 кладёт лишние веса на stage 1.
+- **Stream J:** 4-вариантный sweep памяти (FP8 only, +MoE recompute, +MTP redistribution, PP=4). ВСЕ OOM. Найден **НАСТОЯЩИЙ** bottleneck: `compute_dsa_indexer_loss` в `dsa.py:202` аллоцирует 7.5 GiB FP32 на каждый DSA-слой даже когда `loss_coeff=0`.
+- **Гейт loss_coeff==0:** monkey-patch для пропуска KL loss computation при coeff=0. Экономия ~63 GB.
+- **Head-streaming:** переписка `_attention_target_fp32` с циклом по головам (7.5 GiB -> 0.8 GiB на слой). Для будущего тренинга с `loss_coeff>0`.
+- **ВТОРОЙ bottleneck найден:** `unfused_dsa_fn` в `dsa.py:920` материализует ПОЛНУЮ матрицу `[b*np, sq, sk]` = 7.0 GiB на DSA-слой для ОСНОВНОГО attention (не loss). 5 слоёв x 7 GiB = 35 GiB.
+- **sparse_dsa_fn:** gather-scatter замена, вычисляет только topk=16 entries на query (28.7 MB vs 7 GiB, ~250x сокращение).
+- **EP=2/EP=4 sweep:** все OOM потому что `unfused_dsa_fn` доминирует, а не MoE веса.
+
+### Найденные готовые sparse attention kernels
+
+- TileLang `tile-ai/tilelang/examples/deepseek_v32/sparse_mla_fwd.py` — fused sparse fwd+bwd, уже в TileLang пакете (но не в pip install, только github).
+- NVIDIA PR #3674 "Enable DSA CP/absorbed/THD paths with TileLang fused ops" — `SparseMLA autograd.Function` + TileLang kernels, в Final Review.
+- `fla-org/native-sparse-attention` — Triton fwd+bwd.
+- `lemyx/tilelang-dsa` — one-pass fused FA+KL в TileLang.
+- NVIDIA PR #4039 split-K indexer loss (портирован в cppmega).
+
+### КОРЕННАЯ ПРИЧИНА: отсутствие selective recompute
+
+- Диагностика памяти: 99.7 GB из 119.8 GB на rank = АКТИВАЦИИ без recompute.
+- nanochat использует `recompute_granularity="selective"` ПО УМОЛЧАНИЮ. cppmega НИКОГДА этого не имел.
+- С selective recompute: ~45-60 GB total (vs 120 GB без).
+- Фикс: `--recompute-granularity selective --recompute-modules moe_act` добавлен во все launcher-ы (commit `f4f192c`).
+- Тестирование: комбинация full selective recompute + CUDA graphs (пользователь: "не отключайте CUDA graphs, дебажьте").
+
+### Blackwell функции (Stream C)
+
+- GB10 NAM56R-half baseline на реальных данных: **4303.8 tok/sec** (первое честное измерение, предыдущие запуски использовали NullTokenizer).
+- 5 Blackwell-функций протестированы, все заблокированы (CuTe DSL не подключён, FP8 lda%16 баг, нет DSA кода, нет TK source, неправильный kernel path).
+- Modal B200 DSA indexer bench: FP8 на 11.4% медленнее чем BF16 (слишком мал для амортизации FP8), FP4 не тестируем (TE 2.1 нет FP4 API).
+
+### Исправления окружения
+
+- bench3 SSH IP обновлён (H200_1_IP -> H200_1_IP).
+- europe: установлен git SSH-ключ, свежий git clone (раньше был rsync), github аутентифицирован.
+- europe: убит зомби-процесс cuTe DSL bench (PID 490683).
+- europe: kernel `mamba3_mimo_bwd.py` пропатчен для GQA G<H поддержки (upstream без патча).
+- Документирован drift окружений: bench3 имеет locally-patched kernel, europe имел upstream.
+
+### Исследования (6x6 агентов)
+
+- TileLang не имеет kernel-internal TP примитивов.
+- Статья Dutt 2026: SSM TP = шардинг nheads, scan остаётся локальным, 1 allreduce на out_proj.
+- Статья Mamba-3 молчит о TP; Nemotron-H делегирует Megatron defaults.
+- NCCL + CUDA graphs совместимы с NCCL 2.9 (external TP не ломает CUDA graph fusion).
+- nvFuser #6003: fused comm+compute на Hopper = 4 vs 50 TFLOP/s (kernel-internal TP проигрывает).
+- state-spaces/mamba PR #850: community Mamba-3 TP реализация (не вмерджена, Triton не TileLang).
+
+### Созданные/изменённые файлы (commit 3eb75fe -> f4f192c)
+
+- `cppmega/megatron/cppmega_mamba3_tp_mixer.py` (589 LOC, новый)
+- `cppmega/megatron/dsa_fp8_indexer.py` (новый, FP8 + head-streaming)
+- `cppmega/megatron/dsa_fp8_patch.py` (новый, 3-tier monkey-patch)
+- `cppmega/megatron/dsa_sparse_attention.py` (новый, gather-scatter sparse)
+- `cppmega/megatron/dsa_splitk_indexer_loss.py` (новый, порт PR #4039)
+- `cppmega/megatron/dsa_tilelang_fused_kl.py` (новый, порт lemyx)
+- `cppmega/megatron/memory_debug.py` (новый, скопирован из nanochat)
+- `cppmega/megatron/fp8_activations.py` (новый, скопирован из nanochat)
+- `cppmega/megatron/tilelang_sparse_mla/` (новый каталог, fetched из tilelang examples)
+- `tests/test_cppmega_mamba3_tp_mixer.py` (458 LOC, 11+2 теста)
+- `tests/test_dsa_fp8_indexer.py` (11 тестов)
+- `tests/test_dsa_splitk_indexer_loss.py` (6 тестов)
+- `tests/test_dsa_tilelang_fused_kl.py` (17 тестов)
+- `scripts/modal_dsa_indexer_bench.py` (804 LOC)
+- Множество launcher-скриптов для DSA/EP/TP/grid sweep
+- Обновления документации в обоих планах оптимизации + grid search + blackwell sweep
