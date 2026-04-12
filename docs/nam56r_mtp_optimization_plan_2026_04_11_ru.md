@@ -1124,3 +1124,25 @@ lr=1e-4 diverges с TileLang (grad_norm=inf at iter 4), lr=1e-5 стабильн
 | 6 | PP=2 VPP=1 EP=2 DP=2 | europe | ~55k (VPP=1 worse) |
 
 Цель: найти конфигурацию с максимальным throughput × scalability.
+
+### Результаты sweep (2026-04-12)
+
+#### LR Sweep (PP=1, full CG, TileLang fused)
+
+| lr | Iter 4 grad_norm | Iter 10 grad_norm | Iter 20 | Статус |
+|----|-----------------|-------------------|---------|--------|
+| 1e-5 | 95.5 | 9.7 | 16.5 | ✅ 20/20 stable |
+| 3e-5 | 60.8 | 122.2 | 7.7M → NaN | ❌ diverges iter 15 |
+| 1e-4 | 3.9T → inf | nan | nan | ❌ diverges iter 4 |
+
+Оптимальный lr: **1e-5..2e-5**. Нужно проверить 2e-5.
+lr=1e-4 требует warmup (1e-6 → 1e-4 за 100+ steps).
+
+#### Topology Sweep (lr=1e-5, full CG, TileLang fused)
+
+| Config | Machine | TFLOP/s | tok/sec | Статус |
+|--------|---------|---------|---------|--------|
+| PP=1 EP=1 DP=8 | europe | 237 | 75k | ✅ 20/20 |
+| PP=2 VPP=2 EP=2 DP=2 | europe | 185 | 59k | ✅ 20/20 |
+| PP=2 VPP=2 EP=1 DP=4 | bench3 | TBD | TBD | 🔄 running |
+| PP=1 VPP=1 EP=2 DP=4 | europe | TBD | TBD | 🔄 running |
