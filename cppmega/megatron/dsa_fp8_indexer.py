@@ -314,6 +314,17 @@ def _attention_target_fp32(
         q_h = query[:, :, h, :].float().permute(1, 0, 2).contiguous()   # -> [b, sq, hn]
         k_h = key[:, :, h, :].float().permute(1, 2, 0).contiguous()     # -> [b, hn, sk]
 
+        if h == 0:
+            import sys
+            _alloc = torch.cuda.memory_allocated(device) / (1024**3)
+            _res = torch.cuda.memory_reserved(device) / (1024**3)
+            print(
+                f"[head_stream_debug] h=0 q_h={tuple(q_h.shape)} k_h={tuple(k_h.shape)} "
+                f"q_h.is_contiguous={q_h.is_contiguous()} k_h.is_contiguous={k_h.is_contiguous()} "
+                f"alloc={_alloc:.2f}GiB reserved={_res:.2f}GiB",
+                file=sys.stderr, flush=True,
+            )
+
         # Per-head scores: [b, sq, sk] = 268 MB at production shape.
         scores_h = torch.bmm(q_h, k_h) * softmax_scale
         del q_h, k_h
