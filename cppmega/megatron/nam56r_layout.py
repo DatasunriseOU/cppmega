@@ -11,6 +11,30 @@ FULL_NAM56R_PATTERN = "AEMEAEMEAEMR"
 FULL_NAM56R_DEPTH = 52
 
 
+def has_megatron_dsa_symbol() -> bool:
+    """Return True if Megatron supports PR #3553 'D' (DS_ATTENTION) symbol.
+
+    Probes ``megatron.core.ssm.mamba_hybrid_layer_allocation.Symbols`` for
+    the ``DS_ATTENTION`` attribute and ``MambaStackSubmodules`` for the
+    ``dsa_layer`` field.  Both must be present for the full PR #3553 codepath.
+    """
+    try:
+        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+
+        if not hasattr(Symbols, "DS_ATTENTION"):
+            return False
+    except ImportError:
+        return False
+    try:
+        from megatron.core.ssm.mamba_block import MambaStackSubmodules
+
+        if not hasattr(MambaStackSubmodules, "dsa_layer"):
+            return False
+    except ImportError:
+        return False
+    return True
+
+
 def parse_indices(raw: str) -> tuple[int, ...]:
     values: list[int] = []
     for item in raw.split(","):

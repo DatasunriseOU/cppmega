@@ -51,11 +51,24 @@ def build_nam56r_lite_main_pattern(
     pattern: str,
     depth: int,
     mtp_depths: int = 0,
+    use_dsa_symbol: bool = False,
 ) -> str:
+    """Build Megatron hybrid_layer_pattern from NAM56R symbols.
+
+    When *use_dsa_symbol* is True (Megatron has PR #3553), ALL attention
+    layers (``A`` in the nanochat pattern) emit ``D`` instead of ``*``.
+    PR #3553 blocks mixing ``*`` and ``D`` in the same pattern, so we must
+    use one symbol for all attention layers.  The cppmega
+    ``CppMegaSelectiveAttentionLayer`` routes DSA vs MLA internally based on
+    ``CPPMEGA_DSA_A_LAYER_RANKS``, so both DSA and MLA layers can share the
+    same Megatron symbol.
+    """
+    attn_symbol = "D" if use_dsa_symbol else "*"
+
     mapped: list[str] = []
     for symbol in parse_nem_pattern(pattern, depth):
         if symbol == "A":
-            mapped.append("*")
+            mapped.append(attn_symbol)
         elif symbol == "E":
             mapped.append("E")
         elif symbol in {"M", "R"}:
@@ -67,7 +80,7 @@ def build_nam56r_lite_main_pattern(
 
     result = "".join(mapped)
     if mtp_depths > 0:
-        result = result + "/" + "/".join("*-" for _ in range(mtp_depths))
+        result = result + "/" + "/".join(f"{attn_symbol}-" for _ in range(mtp_depths))
     return result
 
 

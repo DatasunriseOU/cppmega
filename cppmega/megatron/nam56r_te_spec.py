@@ -22,6 +22,7 @@ from cppmega.megatron.m2rnn_spec import CppMegaM2RNNMixer
 from cppmega.megatron.nam56r_layout import (
     FULL_NAM56R_DEPTH,
     FULL_NAM56R_PATTERN,
+    has_megatron_dsa_symbol,
     load_r_layer_indices,
 )
 
@@ -83,28 +84,38 @@ def build_cppmega_nam56r_te_stack_spec(config):
     # Get the upstream Mamba layer submodules (TE norms, TE projections)
     upstream_mamba_sub = upstream.mamba_layer.submodules
 
+    submodules_kwargs = dict(
+        mamba_layer=ModuleSpec(
+            module=MambaLayer,
+            submodules=MambaLayerSubmodules(
+                # Keep upstream TE norm (IdentityOp - norm fused into in_proj)
+                norm=upstream_mamba_sub.norm,
+                # Replace ONLY the mixer with our selective mixer
+                mixer=ModuleSpec(
+                    module=CppMegaSelectiveMambaMixerTE,
+                    params={"r_layer_indices": r_layer_indices},
+                ),
+                # Keep upstream bias-dropout-add
+                mamba_bda=upstream_mamba_sub.mamba_bda,
+            ),
+        ),
+        # Keep ALL upstream layers unchanged (TE-optimized)
+        gdn_layer=upstream.gdn_layer,
+        attention_layer=upstream.attention_layer,
+        mlp_layer=upstream.mlp_layer,
+        moe_layer=upstream.moe_layer,
+        mtp_block_spec=upstream.mtp_block_spec,
+    )
+
+    # PR #3553 adds 'dsa_layer' field to MambaStackSubmodules.
+    # Provide the upstream DSA layer spec (or attention_layer as fallback)
+    # when available, so 'D' layers are correctly routed.
+    if has_megatron_dsa_symbol():
+        submodules_kwargs["dsa_layer"] = getattr(
+            upstream, "dsa_layer", upstream.attention_layer
+        )
+
     return ModuleSpec(
         module=MambaStack,
-        submodules=MambaStackSubmodules(
-            mamba_layer=ModuleSpec(
-                module=MambaLayer,
-                submodules=MambaLayerSubmodules(
-                    # Keep upstream TE norm (IdentityOp - norm fused into in_proj)
-                    norm=upstream_mamba_sub.norm,
-                    # Replace ONLY the mixer with our selective mixer
-                    mixer=ModuleSpec(
-                        module=CppMegaSelectiveMambaMixerTE,
-                        params={"r_layer_indices": r_layer_indices},
-                    ),
-                    # Keep upstream bias-dropout-add
-                    mamba_bda=upstream_mamba_sub.mamba_bda,
-                ),
-            ),
-            # Keep ALL upstream layers unchanged (TE-optimized)
-            gdn_layer=upstream.gdn_layer,
-            attention_layer=upstream.attention_layer,
-            mlp_layer=upstream.mlp_layer,
-            moe_layer=upstream.moe_layer,
-            mtp_block_spec=upstream.mtp_block_spec,
-        ),
+        submodules=MambaStackSubmodules(**submodules_kwargs),
     )
