@@ -1002,3 +1002,48 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 --recompute-granularity selective \
 --recompute-modules moe_act
 ```
+
+## AbsorbedMLA + Fused Sparse DSA (2026-04-12)
+
+### Проблема: decompress path не масштабируется при topk=256
+
+Стандартный Megatron MLA: decompress KV → gather topk K/V → einsum.
+При topk=256 gather `[b, np, sq, topk, hn]` = **14 GiB per DSA layer** (28 heads × 4096 × 256 × 96 × bf16).
+9 DSA слоёв × 14 GiB = **126 GiB** только на sparse gather — не влезает ни при каком EP/PP.
+
+### Решение: absorption trick (как у DeepSeek V3)
+
+DeepSeek **никогда** не decompressit K/V для sparse attention:
+
+```
+Стандартный путь (OOM при topk=256):
+  compressed_kv [b, s, 1, 96] → W_k_up → K [b, s, 28, 96]  ← decompress 28 heads
+  sparse_gather(K, topk=256) → [b, 28, s, 256, 96] = 14 GiB  ← OOM
+
+Absorbed путь (DeepSeek, PR #3674):
+  Q_absorbed = Q @ W_k_up^T                    ← один einsum
+  sparse_gather(compressed_kv, topk=256) → [b, 256, 1, 96] = 49 KB  ← крошечный!
+  scores = Q_absorbed @ kv_gathered^T           ← 28 heads × 256 topk
+  output = attn_out @ W_v_up                    ← V up-proj ПОСЛЕ attention
+```
+
+Разница: gather на **1 head × compressed** vs **28 heads × decompressed** = **28× меньше памяти**.
+
+### Upstream PRs применённые к нашему Megatron `dev`
+
+| PR | Что даёт | Статус |
+|----|----------|--------|
+| **#3193** AbsorbedMLASelfAttention | Absorption trick для MLA, MQA-style attention | MERGED в dev |
+| **#3674** DSA bridge + TileLang ядра | `get_absorb_query_key_value_tensors()`, fused sparse MLA fwd+bwd | OPEN, applied вручную |
+| **#3039** MLA down-proj fusion | Fuses MLA down-projection GEMMs: `--mla-down-proj-fusion` | MERGED в dev |
+| **#3649** Zero-copy checkpoint | Снижает peak memory при recompute backward | MERGED в dev |
+| **#3401** MoE+MTP hang fix | Deadlock fix при MoE aux loss + MTP | MERGED в dev |
+| **#3399** Uneven PP fix | Fix Mamba при неравном PP split (раньше молча терял слои!) | MERGED в dev |
+| **#4173** Mamba offloading | Fine-grained activation offloading для hybrid Mamba+MoE | MERGED в dev |
+
+### DeepEP flex dispatcher (EP>1)
+
+- **Библиотека**: deepseek-ai/DeepEP v1.2.1, собран с NVSHMEM на bench3
+- **Флаг**: `--moe-token-dispatcher-type flex --moe-router-dtype fp32`
+- **Требование**: `TP × EP > 1` (при EP=1 fallback на alltoall через `VARIANT=v0`)
+- **DeepEP .so**: собран на bench3, скопирован на europe через scp
