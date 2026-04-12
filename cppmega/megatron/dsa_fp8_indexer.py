@@ -302,22 +302,24 @@ def _attention_target_fp32(
         torch.full((sq, sk), float("-inf"), dtype=torch.float32, device=device),
         diagonal=1,
     )
-    # Validate topk_indices are in range [0, sk) before scatter.
-    import sys as _sys
-    _topk_max = topk_indices.max().item()
-    _topk_min = topk_indices.min().item()
-    if _topk_max >= sk or _topk_min < 0:
-        print(
-            f"[head_stream_debug] ERROR: topk_indices out of range! "
-            f"min={_topk_min} max={_topk_max} sk={sk} "
-            f"topk_indices.shape={tuple(topk_indices.shape)} "
-            f"query.shape={tuple(query.shape)} key.shape={tuple(key.shape)} "
-            f"topk_indices.dtype={topk_indices.dtype}",
-            file=_sys.stderr, flush=True,
-        )
+    # topk_indices may contain -1 sentinel values for positions where
+    # fewer than topk valid keys exist (e.g., due to causal masking at
+    # early sequence positions). The upstream _scatter_topk_into_index_mask
+    # handles this by only scattering indices >= 0. We replicate the same
+    # logic: clamp -1 -> 0 for scatter, then re-mask those positions to
+    # -inf so the sentinel doesn't accidentally unmask key position 0.
     index_mask = torch.full(
         (b, sq, sk), float("-inf"), dtype=torch.float32, device=device
-    ).scatter_(-1, topk_indices.clamp(0, sk - 1), 0)
+    )
+    _has_neg = (topk_indices < 0).any()
+    if _has_neg:
+        valid = topk_indices >= 0
+        if valid.any():
+            bi, qi, ti = torch.where(valid)
+            ki = topk_indices[bi, qi, ti]
+            index_mask[bi, qi, ki] = 0.0
+    else:
+        index_mask.scatter_(-1, topk_indices, 0.0)
 
     # Accumulator for sum-over-heads of post-softmax distributions.
     acc = torch.zeros(b, sq, sk, dtype=torch.float32, device=device)
@@ -326,17 +328,6 @@ def _attention_target_fp32(
         # Per-head Q and K slices: [sq, b, hn] and [sk, b, hn].
         q_h = query[:, :, h, :].float().permute(1, 0, 2).contiguous()   # -> [b, sq, hn]
         k_h = key[:, :, h, :].float().permute(1, 2, 0).contiguous()     # -> [b, hn, sk]
-
-        if h == 0:
-            import sys
-            _alloc = torch.cuda.memory_allocated(device) / (1024**3)
-            _res = torch.cuda.memory_reserved(device) / (1024**3)
-            print(
-                f"[head_stream_debug] h=0 q_h={tuple(q_h.shape)} k_h={tuple(k_h.shape)} "
-                f"q_h.is_contiguous={q_h.is_contiguous()} k_h.is_contiguous={k_h.is_contiguous()} "
-                f"alloc={_alloc:.2f}GiB reserved={_res:.2f}GiB",
-                file=sys.stderr, flush=True,
-            )
 
         # Per-head scores: [b, sq, sk] = 268 MB at production shape.
         scores_h = torch.bmm(q_h, k_h) * softmax_scale
