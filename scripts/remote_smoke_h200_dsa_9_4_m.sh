@@ -348,13 +348,21 @@ if [ "${CPPMEGA_DISPATCHER_OVERRIDE:-}" = "alltoall" ]; then
 fi
 echo "NATIVE_ARGS (post-sed): ${NATIVE_ARGS}"
 
-# CUDA graphs — testing lr=1e-5 + full CG scope.
-# attn+mamba excluded: TileLang bwd + checkpoint wrapper incompatible with CG replay at lr=1e-4.
-# But may work at lr=1e-5 (lower gradient magnitude = no overflow in CG replay).
-CG_FLAGS="--cuda-graph-impl transformer_engine --cuda-graph-scope moe_router moe_preprocess --cuda-graph-warmup-steps 3"
+# CUDA graphs — disable when using alltoall dispatcher (CG capture hangs
+# on NCCL alltoall collectives). Enable only for flex (DeepEP) dispatcher.
+if [ "${CPPMEGA_DISPATCHER_OVERRIDE:-}" = "alltoall" ]; then
+  CG_FLAGS=""
+  echo "[stream_m] CUDA graphs DISABLED (alltoall dispatcher is CG-incompatible)"
+else
+  # Full CG scope: verified stable with TileLang + lr=1e-5.
+  # PP=1: 237 TFLOP/s 20/20, PP=2 EP=2: 185 TFLOP/s 20/20.
+  # NOTE: lr=1e-4 causes CG replay overflow — must use lr≤1e-5.
+  CG_FLAGS="--cuda-graph-impl transformer_engine --cuda-graph-scope attn mamba moe_router moe_preprocess --cuda-graph-warmup-steps 3"
+fi
 # NOTE: --moe-pad-expert-input-to-capacity is INCOMPATIBLE with flex dispatcher
 # (raises ValueError). Omit when using DeepEP flex.
-MOE_EXTRA_FLAGS=""
+# Only reset MOE_EXTRA_FLAGS if not already set by alltoall override above.
+MOE_EXTRA_FLAGS="${MOE_EXTRA_FLAGS:-}"
 
 # Stream M: selective MoE activation recompute.
 # head-streaming in dsa_fp8_indexer.py (commit 563fcb0) reduces DSA target from
