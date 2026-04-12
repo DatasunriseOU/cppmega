@@ -4,3 +4,6 @@ cppmega/features/mamba3/__pycache__/*
 */__pycache__/*
 cppmega/megatron/__pycache__/*
 *.pyc
+.omx/*
+.tmp/*
+cppmega_nam56r_tp2_v2.log

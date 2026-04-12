@@ -418,7 +418,7 @@ def sparse_mla_bwd(
     _, S_kv, kv_group, _ = kv.shape
     assert kv.shape[-1] == dim_plus_tail_dim
     assert kv.shape[0] == B
-    D = 512
+    D = o.shape[-1]  # value head dimension (d_v) — inferred from output tensor
     assert (
         dim_plus_tail_dim >= D
     ), f"Invalid dimensions: dim_plus_tail_dim={dim_plus_tail_dim} is smaller than base D={D}"

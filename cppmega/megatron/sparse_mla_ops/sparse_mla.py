@@ -53,7 +53,7 @@ class SparseMLA(torch.autograd.Function):
     """Autograd wrapper around TileLang sparse-MLA forward/backward kernels."""
 
     @staticmethod
-    def forward(ctx, q, kv, indices, scaling):
+    def forward(ctx, q, kv, indices, scaling, d_v=None):
         """Forward pass.
 
         Args:
@@ -62,6 +62,7 @@ class SparseMLA(torch.autograd.Function):
             indices: Sparse indices [batch, seq, kv_group, topk] or [seq, kv_group, topk]
                      int32, -1 = invalid/masked
             scaling: float softmax scale
+            d_v: int, value head dimension. If None, inferred from q's last dim.
 
         Returns:
             (out, lse) where out: [batch, seq, heads, dim], lse: [batch, seq, heads]
@@ -74,8 +75,13 @@ class SparseMLA(torch.autograd.Function):
         q, kv = q.contiguous(), kv.contiguous()
         ctx.scaling = scaling
 
-        tl_out, tl_lse = sparse_mla_fwd_interface(q, kv, indices, sm_scale=scaling)
+        # Infer d_v from tensor shape if not provided.
+        if d_v is None:
+            d_v = q.shape[-1]
 
+        tl_out, tl_lse = sparse_mla_fwd_interface(q, kv, indices, sm_scale=scaling, d_v=d_v)
+
+        ctx.d_v = d_v
         ctx.save_for_backward(q, kv, indices, tl_out, tl_lse)
         return tl_out, tl_lse
 
@@ -95,7 +101,7 @@ class SparseMLA(torch.autograd.Function):
             q, kv, tl_out, grad_output.contiguous(), indices, tl_lse, sm_scale=scaling
         )
 
-        return tl_dq, tl_dkv, None, None
+        return tl_dq, tl_dkv, None, None, None
 
 
 def sparse_mla_as_unfused_dsa(
@@ -153,8 +159,8 @@ def sparse_mla_as_unfused_dsa(
     indices_i32 = indices_i32.contiguous()
 
     # ---- Forward ----
-    out, _lse = SparseMLA.apply(q, kv, indices_i32, softmax_scale)
-    # out: [b, sq, np, hnv] (dim = hnv = 512)
+    out, _lse = SparseMLA.apply(q, kv, indices_i32, softmax_scale, hnv)
+    # out: [b, sq, np, hnv] (dim = hnv = v_head_dim)
 
     # ---- Output: [b, sq, np, hnv] -> [sq, b, np * hnv] ----
     output = out.permute(1, 0, 2, 3).contiguous().reshape(sq, b, np_ * hnv)
