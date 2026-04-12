@@ -311,8 +311,8 @@ def _attention_target_fp32(
 
     for h in range(np_):
         # Per-head Q and K slices: [sq, b, hn] and [sk, b, hn].
-        q_h = query[:, :, h, :].float().permute(1, 0, 2)   # -> [b, sq, hn]
-        k_h = key[:, :, h, :].float().permute(1, 2, 0)     # -> [b, hn, sk]
+        q_h = query[:, :, h, :].float().permute(1, 0, 2).contiguous()   # -> [b, sq, hn]
+        k_h = key[:, :, h, :].float().permute(1, 2, 0).contiguous()     # -> [b, hn, sk]
 
         # Per-head scores: [b, sq, sk] = 268 MB at production shape.
         scores_h = torch.bmm(q_h, k_h) * softmax_scale
