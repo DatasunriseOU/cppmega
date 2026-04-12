@@ -220,7 +220,7 @@ def apply_dsa_fp8_patch(*, force: bool = False) -> bool:
     if fwd_already and not force:
         log.info("cppmega DSA FP8 forward patch already applied")
     else:
-        def _compute_index_scores_fp8(q, weights, k):
+        def _compute_index_scores_fp8(q, weights, k, **kwargs):
             """FP8 replacement for Megatron dsa._compute_index_scores."""
             return compute_index_scores_fp8(q, weights, k)
 
