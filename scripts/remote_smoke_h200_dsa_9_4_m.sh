@@ -93,6 +93,10 @@ NO_ROPE_FUSION="${NO_ROPE_FUSION:-1}"
 # Variant overrides (v1 = EP=4 DP=1, v2 = EP=2 DP=2)
 # ---------------------------------------------------------------------------
 case "${VARIANT}" in
+  v0)
+    echo "[stream_m] V0 = EP=1 DP=4 PP=2 VPP=2 (all 16 experts/rank, 4x DP, no DeepEP)"
+    EP_SIZE=1
+    ;;
   v1)
     echo "[stream_m] V1 = EP=4 DP=1 PP=2 VPP=2 (4 experts/rank, grad-accum GBS)"
     EP_SIZE=4
@@ -102,7 +106,7 @@ case "${VARIANT}" in
     EP_SIZE=2
     ;;
   *)
-    echo "ERROR: unknown VARIANT=${VARIANT} (expected v1|v2)" >&2
+    echo "ERROR: unknown VARIANT=${VARIANT} (expected v0|v1|v2)" >&2
     exit 2
     ;;
 esac
