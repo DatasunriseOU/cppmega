@@ -25,6 +25,7 @@ from cppmega.megatron.m2rnn_spec import CppMegaM2RNNMixer
 from cppmega.megatron.nam56r_layout import (
     FULL_NAM56R_DEPTH,
     FULL_NAM56R_PATTERN,
+    has_megatron_dsa_symbol,
     load_attention_layer_numbers,
     load_dsa_a_layer_ranks,
     load_r_layer_indices,
@@ -138,7 +139,12 @@ class CppMegaSelectiveMambaMixer(nn.Module):
 
 
 class CppMegaSelectiveAttentionLayer(TransformerLayer):
-    """Select MLA or upstream DSA on A-layers by A-layer rank."""
+    """Select MLA or upstream DSA on A-layers by A-layer rank.
+
+    When PR #3553 is active, this class is used for BOTH ``*`` (attention)
+    and ``D`` (dsa) layer types.  MTP layers always get MLA (dense
+    attention) regardless of DSA rank configuration.
+    """
 
     def __init__(
         self,
@@ -156,11 +162,22 @@ class CppMegaSelectiveAttentionLayer(TransformerLayer):
         dsa_a_layer_ranks = frozenset(int(x) for x in dsa_a_layer_ranks)
         attention_layer_numbers = tuple(int(x) for x in attention_layer_numbers)
         layer_idx = 1 if layer_number is None else int(layer_number)
-        try:
-            a_rank = attention_layer_numbers.index(layer_idx)
-        except ValueError as exc:
-            raise ValueError(f"layer_number={layer_idx} is not an A-layer in the NAM56R pattern") from exc
-        if a_rank in dsa_a_layer_ranks:
+
+        # MTP layers always use MLA (dense attention), never DSA.
+        # Also fall back to MLA if layer_number is not found in the NAM56R
+        # attention layout (can happen with MTP's internal layer numbering
+        # when using PR #3553 'D' symbol).
+        use_dsa = False
+        if not is_mtp_layer:
+            try:
+                a_rank = attention_layer_numbers.index(layer_idx)
+            except ValueError as exc:
+                raise ValueError(
+                    f"layer_number={layer_idx} is not an A-layer in the NAM56R pattern"
+                ) from exc
+            use_dsa = a_rank in dsa_a_layer_ranks
+
+        if use_dsa:
             branch_config = _clone_attention_variant_config(
                 config, experimental_attention_variant="dsa"
             )
@@ -193,7 +210,7 @@ def build_cppmega_nam56r_full_stack_spec(config):
         if config.transformer_impl == "inference_optimized"
         else mamba_stack_spec.submodules
     )
-    attention_layer = ModuleSpec(
+    selective_attention_spec = ModuleSpec(
         module=CppMegaSelectiveAttentionLayer,
         params={
             "dsa_a_layer_ranks": load_dsa_a_layer_ranks(),
@@ -210,26 +227,35 @@ def build_cppmega_nam56r_full_stack_spec(config):
     else:
         _MixerNorm = WrappedTorchNorm
 
+    submodules_kwargs = dict(
+        mamba_layer=ModuleSpec(
+            module=MambaLayer,
+            submodules=MambaLayerSubmodules(
+                norm=_MixerNorm,
+                mixer=ModuleSpec(
+                    module=CppMegaSelectiveMambaMixer,
+                    params={"r_layer_indices": r_layer_indices},
+                ),
+                mamba_bda=get_bias_dropout_add,
+            ),
+        ),
+        gdn_layer=upstream.gdn_layer,
+        attention_layer=selective_attention_spec,
+        mlp_layer=upstream.mlp_layer,
+        moe_layer=upstream.moe_layer,
+        mtp_block_spec=upstream.mtp_block_spec,
+    )
+
+    # PR #3553 adds 'dsa_layer' to MambaStackSubmodules for routing 'D'
+    # layers.  When available, we provide the same selective attention spec
+    # so 'D' layers go through CppMegaSelectiveAttentionLayer (which
+    # internally routes DSA vs MLA based on CPPMEGA_DSA_A_LAYER_RANKS).
+    if has_megatron_dsa_symbol():
+        submodules_kwargs["dsa_layer"] = selective_attention_spec
+
     return ModuleSpec(
         module=MambaStack,
-        submodules=MambaStackSubmodules(
-            mamba_layer=ModuleSpec(
-                module=MambaLayer,
-                submodules=MambaLayerSubmodules(
-                    norm=_MixerNorm,
-                    mixer=ModuleSpec(
-                        module=CppMegaSelectiveMambaMixer,
-                        params={"r_layer_indices": r_layer_indices},
-                    ),
-                    mamba_bda=get_bias_dropout_add,
-                ),
-            ),
-            gdn_layer=upstream.gdn_layer,
-            attention_layer=attention_layer,
-            mlp_layer=upstream.mlp_layer,
-            moe_layer=upstream.moe_layer,
-            mtp_block_spec=upstream.mtp_block_spec,
-        ),
+        submodules=MambaStackSubmodules(**submodules_kwargs),
     )
 
 
@@ -237,4 +263,10 @@ def build_cppmega_nam56r_full_stack_spec(config):
 def build_default_hybrid_layer_pattern(*, mtp_depths: int = 1) -> str:
     pattern = os.environ.get("CPPMEGA_NEM_PATTERN", FULL_NAM56R_PATTERN)
     depth = int(os.environ.get("CPPMEGA_LAYER_DEPTH", str(FULL_NAM56R_DEPTH)))
-    return build_nam56r_lite_main_pattern(pattern=pattern, depth=depth, mtp_depths=mtp_depths)
+    use_dsa_symbol = has_megatron_dsa_symbol() and bool(load_dsa_a_layer_ranks())
+    return build_nam56r_lite_main_pattern(
+        pattern=pattern,
+        depth=depth,
+        mtp_depths=mtp_depths,
+        use_dsa_symbol=use_dsa_symbol,
+    )

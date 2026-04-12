@@ -41,7 +41,7 @@ from megatron.core.ssm.mamba_mixer import MambaMixerSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 
 from cppmega.megatron.m2rnn_spec import CppMegaM2RNNMixer
-from cppmega.megatron.nam56r_layout import load_r_layer_indices
+from cppmega.megatron.nam56r_layout import has_megatron_dsa_symbol, load_r_layer_indices
 from cppmega.megatron.noconv_mamba_mixer import (
     NoConvMamba3BCMixer,
     NoConvMambaMixerSubmodules,
@@ -116,34 +116,42 @@ def build_cppmega_nam56r_noconv_stack_spec(config):
     upstream = mamba_stack_spec.submodules
     upstream_mamba_sub = upstream.mamba_layer.submodules
 
+    submodules_kwargs = dict(
+        mamba_layer=ModuleSpec(
+            module=MambaLayer,
+            submodules=MambaLayerSubmodules(
+                # Keep the upstream Mamba-layer norm (TE fused into in_proj)
+                norm=upstream_mamba_sub.norm,
+                # Replace ONLY the mixer with the noconv selector
+                mixer=ModuleSpec(
+                    module=CppMegaNoConvSelectiveMambaMixer,
+                    # ``NoConvMamba3BCMixer`` reads ``submodules.in_proj`` /
+                    # ``submodules.out_proj`` -- identical field names to
+                    # Megatron's ``MambaMixerSubmodules``, so we reuse the
+                    # upstream TE-fused linear specs.
+                    submodules=upstream_mamba_sub.mixer.submodules,
+                    params={"r_layer_indices": r_layer_indices},
+                ),
+                mamba_bda=upstream_mamba_sub.mamba_bda,
+            ),
+        ),
+        # All other layers unchanged from upstream (TE-fused)
+        gdn_layer=upstream.gdn_layer,
+        attention_layer=upstream.attention_layer,
+        mlp_layer=upstream.mlp_layer,
+        moe_layer=upstream.moe_layer,
+        mtp_block_spec=upstream.mtp_block_spec,
+    )
+
+    # PR #3553: provide dsa_layer when available.
+    if has_megatron_dsa_symbol():
+        submodules_kwargs["dsa_layer"] = getattr(
+            upstream, "dsa_layer", upstream.attention_layer
+        )
+
     return ModuleSpec(
         module=MambaStack,
-        submodules=MambaStackSubmodules(
-            mamba_layer=ModuleSpec(
-                module=MambaLayer,
-                submodules=MambaLayerSubmodules(
-                    # Keep the upstream Mamba-layer norm (TE fused into in_proj)
-                    norm=upstream_mamba_sub.norm,
-                    # Replace ONLY the mixer with the noconv selector
-                    mixer=ModuleSpec(
-                        module=CppMegaNoConvSelectiveMambaMixer,
-                        # ``NoConvMamba3BCMixer`` reads ``submodules.in_proj`` /
-                        # ``submodules.out_proj`` -- identical field names to
-                        # Megatron's ``MambaMixerSubmodules``, so we reuse the
-                        # upstream TE-fused linear specs.
-                        submodules=upstream_mamba_sub.mixer.submodules,
-                        params={"r_layer_indices": r_layer_indices},
-                    ),
-                    mamba_bda=upstream_mamba_sub.mamba_bda,
-                ),
-            ),
-            # All other layers unchanged from upstream (TE-fused)
-            gdn_layer=upstream.gdn_layer,
-            attention_layer=upstream.attention_layer,
-            mlp_layer=upstream.mlp_layer,
-            moe_layer=upstream.moe_layer,
-            mtp_block_spec=upstream.mtp_block_spec,
-        ),
+        submodules=MambaStackSubmodules(**submodules_kwargs),
     )
 
 

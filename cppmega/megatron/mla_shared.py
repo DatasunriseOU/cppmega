@@ -25,10 +25,23 @@ except ImportError:
     _HAS_ABSORBED_MLA = False
 
 
+def _supports_pp_layer_offset(cls) -> bool:
+    """Check if the upstream MLA class accepts pp_layer_offset in __init__."""
+    import inspect
+
+    try:
+        sig = inspect.signature(cls.__init__)
+        return "pp_layer_offset" in sig.parameters
+    except (ValueError, TypeError):
+        return False
+
+
 class CppMegaMLASelfAttentionAdapter(MLASelfAttention):
     def __init__(self, *args, pp_layer_offset=None, **kwargs):
-        del pp_layer_offset
-        super().__init__(*args, **kwargs)
+        if pp_layer_offset is not None and _supports_pp_layer_offset(MLASelfAttention):
+            super().__init__(*args, pp_layer_offset=pp_layer_offset, **kwargs)
+        else:
+            super().__init__(*args, **kwargs)
 
     def forward(self, *args, rotary_pos_emb=None, **kwargs):
         del rotary_pos_emb
@@ -37,8 +50,10 @@ class CppMegaMLASelfAttentionAdapter(MLASelfAttention):
 
 class CppMegaFusedMLASelfAttentionAdapter(FusedMLASelfAttention):
     def __init__(self, *args, pp_layer_offset=None, **kwargs):
-        del pp_layer_offset
-        super().__init__(*args, **kwargs)
+        if pp_layer_offset is not None and _supports_pp_layer_offset(FusedMLASelfAttention):
+            super().__init__(*args, pp_layer_offset=pp_layer_offset, **kwargs)
+        else:
+            super().__init__(*args, **kwargs)
 
     def forward(self, *args, rotary_pos_emb=None, **kwargs):
         del rotary_pos_emb
@@ -49,8 +64,10 @@ if _HAS_ABSORBED_MLA:
 
     class CppMegaAbsorbedMLASelfAttentionAdapter(AbsorbedMLASelfAttention):
         def __init__(self, *args, pp_layer_offset=None, **kwargs):
-            del pp_layer_offset
-            super().__init__(*args, **kwargs)
+            if pp_layer_offset is not None and _supports_pp_layer_offset(AbsorbedMLASelfAttention):
+                super().__init__(*args, pp_layer_offset=pp_layer_offset, **kwargs)
+            else:
+                super().__init__(*args, **kwargs)
 
         def forward(self, *args, rotary_pos_emb=None, **kwargs):
             del rotary_pos_emb
