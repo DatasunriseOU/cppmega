@@ -46,16 +46,19 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "DSA_FP8_ATTENTION_ENV",
     "DSA_INDEXER_DTYPE_ENV",
     "DSA_KL_MODE_ENV",
     "DSA_SPARSE_MODE_ENV",
     "apply_dsa_fp8_patch",
     "apply_dsa_kl_mode_patch",
+    "resolve_fp8_attention",
     "resolve_indexer_dtype",
     "resolve_kl_mode",
     "resolve_sparse_mode",
 ]
 
+DSA_FP8_ATTENTION_ENV = "CPPMEGA_DSA_FP8_ATTENTION"
 DSA_INDEXER_DTYPE_ENV = "CPPMEGA_DSA_INDEXER_DTYPE"
 DSA_KL_MODE_ENV = "CPPMEGA_DSA_KL_MODE"
 DSA_SPARSE_MODE_ENV = "CPPMEGA_DSA_SPARSE_MODE"
@@ -108,6 +111,17 @@ def resolve_kl_mode() -> str:
         return "tilelang_fused"
     # default
     return "head_streaming"
+
+
+def resolve_fp8_attention() -> bool:
+    """Return whether FP8 sparse attention forward is enabled.
+
+    Controlled by ``CPPMEGA_DSA_FP8_ATTENTION`` environment variable.
+    Set to ``1`` to enable FP8 forward pass for absorbed sparse MLA
+    attention (backward stays BF16).
+    """
+    val = os.environ.get(DSA_FP8_ATTENTION_ENV, "0").strip()
+    return val == "1"
 
 
 def resolve_sparse_mode() -> str:
@@ -553,6 +567,66 @@ def apply_dsa_fp8_patch(*, force: bool = False) -> bool:
             "cppmega sparse_absorbed_dsa_fn applied (replaces _unfused_absorbed_dsa_fn: "
             "7.0 GiB → 0.44 GiB attention scores per absorbed DSA layer, ~16× reduction)"
         )
+
+    # ------------------------------------------------------------------
+    # Tier 6: FP8 sparse attention forward
+    #
+    # When CPPMEGA_DSA_FP8_ATTENTION=1, replace _fused_sparse_mla_absorbed
+    # with an FP8 variant that uses SparseMLA_FP8 (FP8 forward, BF16
+    # backward). The FP8 forward uses float8_e4m3fn for Q@K GEMMs with
+    # per-token scaling, giving ~2x tensor-core throughput on H100/H200.
+    #
+    # Also patches unfused_dsa_fn to use FP8 for the non-absorbed path.
+    # ------------------------------------------------------------------
+    _FP8_ATTN_MARKER = "__cppmega_fp8_attention_patched__"
+    if resolve_fp8_attention():
+        _fused_absorbed = getattr(dsa_mod, "_fused_sparse_mla_absorbed", None)
+        if _fused_absorbed is not None and not getattr(
+            _fused_absorbed, _FP8_ATTN_MARKER, False
+        ):
+            try:
+                from cppmega.megatron.sparse_mla_ops.sparse_mla import (
+                    fused_sparse_mla_absorbed_fp8,
+                )
+
+                setattr(fused_sparse_mla_absorbed_fp8, _FP8_ATTN_MARKER, True)
+                dsa_mod._fused_sparse_mla_absorbed = fused_sparse_mla_absorbed_fp8
+                log.info(
+                    "cppmega FP8 sparse attention applied "
+                    "(replaces _fused_sparse_mla_absorbed: FP8 fwd + BF16 bwd)"
+                )
+            except Exception as exc:
+                log.warning(
+                    "cppmega FP8 sparse attention import failed (%s), "
+                    "keeping BF16 _fused_sparse_mla_absorbed",
+                    exc,
+                )
+
+        # Also patch unfused_dsa_fn for non-absorbed path
+        existing_unfused_fn = getattr(dsa_mod, "unfused_dsa_fn", None)
+        if existing_unfused_fn is not None and not getattr(
+            existing_unfused_fn, _FP8_ATTN_MARKER, False
+        ):
+            try:
+                from cppmega.megatron.sparse_mla_ops.sparse_mla import (
+                    sparse_mla_fp8_as_unfused_dsa,
+                )
+
+                setattr(sparse_mla_fp8_as_unfused_dsa, _FP8_ATTN_MARKER, True)
+                # Preserve the sparse DSA marker so we don't re-patch in Tier 4
+                if hasattr(existing_unfused_fn, _SPARSE_DSA_MARKER):
+                    setattr(sparse_mla_fp8_as_unfused_dsa, _SPARSE_DSA_MARKER, True)
+                dsa_mod.unfused_dsa_fn = sparse_mla_fp8_as_unfused_dsa
+                log.info(
+                    "cppmega FP8 sparse attention applied "
+                    "(replaces unfused_dsa_fn: FP8 fwd + BF16 bwd)"
+                )
+            except Exception as exc:
+                log.warning(
+                    "cppmega FP8 sparse attention (unfused_dsa_fn) import failed (%s), "
+                    "keeping existing unfused_dsa_fn",
+                    exc,
+                )
 
     # -- KL mode patch: tilelang_fused online-softmax --
     # When CPPMEGA_DSA_KL_MODE=tilelang_fused, replace _attention_target_fp32

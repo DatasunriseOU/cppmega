@@ -104,12 +104,125 @@ class SparseMLA(torch.autograd.Function):
         return tl_dq, tl_dkv, None, None, None
 
 
+class SparseMLA_FP8(torch.autograd.Function):
+    """Autograd wrapper: FP8 forward + BF16 backward for sparse-MLA.
+
+    The FP8 TileLang kernel handles forward only (Q@K in float8_e4m3fn with
+    per-token scaling, S@V in BF16 after dequant). Backward reuses the
+    standard BF16 TileLang backward kernel — this means we save the BF16
+    copies of q/kv for backward even though forward ran in FP8. The memory
+    cost is identical to the BF16 path but forward FLOPS benefit from FP8
+    tensor-core throughput (2x on H100/H200).
+    """
+
+    @staticmethod
+    def forward(ctx, q, kv, indices, scaling, d_v=None):
+        """Forward pass using FP8 sparse MLA kernel.
+
+        Args:
+            q: Query tensor [batch, seq, heads, dim+tail_dim] BF16
+            kv: KV tensor [batch, seq_kv, kv_group, dim+tail_dim] BF16
+            indices: Sparse indices [batch, seq, kv_group, topk] int32
+            scaling: float softmax scale
+            d_v: int, value head dimension
+
+        Returns:
+            (out, lse) where out: [batch, seq, heads, dim], lse: [batch, seq, heads]
+        """
+        from cppmega.megatron.sparse_mla_ops.tilelang_sparse_mla_fwd_fp8 import (
+            sparse_mla_fwd_fp8_interface,
+        )
+
+        indices = indices.contiguous()
+        q, kv = q.contiguous(), kv.contiguous()
+        ctx.scaling = scaling
+
+        if d_v is None:
+            d_v = q.shape[-1]
+
+        tl_out, tl_lse = sparse_mla_fwd_fp8_interface(
+            q, kv, indices, sm_scale=scaling, d_v=d_v,
+        )
+
+        ctx.d_v = d_v
+        # Save BF16 tensors for backward (BF16 backward kernel needs them).
+        ctx.save_for_backward(q, kv, indices, tl_out, tl_lse)
+        return tl_out, tl_lse
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_lse):
+        """Backward pass using BF16 sparse MLA kernel.
+
+        Returns:
+            Gradients for (q, kv, indices=None, scaling=None, d_v=None).
+        """
+        from cppmega.megatron.sparse_mla_ops.tilelang_sparse_mla_bwd import sparse_mla_bwd
+
+        q, kv, indices, tl_out, tl_lse = ctx.saved_tensors
+        scaling = ctx.scaling
+
+        tl_dq, tl_dkv = sparse_mla_bwd(
+            q, kv, tl_out, grad_output.contiguous(), indices, tl_lse, sm_scale=scaling
+        )
+
+        return tl_dq, tl_dkv, None, None, None
+
+
+def sparse_mla_fp8_as_unfused_dsa(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+    **kwargs,
+) -> torch.Tensor:
+    """Drop-in replacement for Megatron ``unfused_dsa_fn`` using FP8 SparseMLA.
+
+    Same interface as ``sparse_mla_as_unfused_dsa`` but routes forward through
+    the FP8 TileLang kernel for ~2x tensor-core throughput on H100/H200.
+
+    Args:
+        query: [sq, b, np, hn] — where hn = dim + tail_dim (576 for DeepSeek MLA)
+        key:   [sk, b, np, hn] — full KV latent (576 channels)
+        value: [sk, b, np, hnv] — value prefix (512 channels, subset of key)
+        topk_indices: [b, sq, topk] int64 — KV positions to attend to
+        softmax_scale: float
+        **kwargs: mask, varlen_starts, varlen_ends, key_positions (ignored by
+            TileLang kernel; causal masking is built into the kernel via the
+            -1 sentinel convention on indices).
+
+    Returns:
+        output: [sq, b, np * hnv] — same shape as unfused_dsa_fn output
+    """
+    sq, b, np_, hn = query.shape
+    sk = key.shape[0]
+    hnv = value.shape[3]
+
+    q = query.permute(1, 0, 2, 3).contiguous()
+    kv = key.permute(1, 0, 2, 3)[:, :, 0:1, :].contiguous()
+
+    indices_i32 = topk_indices.to(torch.int32)
+    indices_i32 = indices_i32.unsqueeze(2)
+    indices_i32 = torch.where(
+        (indices_i32 >= 0) & (indices_i32 < sk),
+        indices_i32,
+        torch.tensor(-1, dtype=torch.int32, device=indices_i32.device),
+    )
+    indices_i32 = indices_i32.contiguous()
+
+    out, _lse = SparseMLA_FP8.apply(q, kv, indices_i32, softmax_scale, hnv)
+
+    output = out.permute(1, 0, 2, 3).contiguous().reshape(sq, b, np_ * hnv)
+    return output
+
+
 def sparse_mla_as_unfused_dsa(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     topk_indices: torch.Tensor,
     softmax_scale: float,
+    **kwargs,
 ) -> torch.Tensor:
     """Drop-in replacement for Megatron ``unfused_dsa_fn`` using TileLang SparseMLA.
 
@@ -122,6 +235,9 @@ def sparse_mla_as_unfused_dsa(
         value: [sk, b, np, hnv] — value prefix (512 channels, subset of key)
         topk_indices: [b, sq, topk] int64 — KV positions to attend to
         softmax_scale: float
+        **kwargs: mask, varlen_starts, varlen_ends, key_positions (ignored by
+            TileLang kernel; causal masking is built into the kernel via the
+            -1 sentinel convention on indices).
 
     Returns:
         output: [sq, b, np * hnv] — same shape as unfused_dsa_fn output
@@ -165,3 +281,51 @@ def sparse_mla_as_unfused_dsa(
     # ---- Output: [b, sq, np, hnv] -> [sq, b, np * hnv] ----
     output = out.permute(1, 0, 2, 3).contiguous().reshape(sq, b, np_ * hnv)
     return output
+
+
+def fused_sparse_mla_absorbed_fp8(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+    v_channels: int,
+) -> Optional[torch.Tensor]:
+    """Run fused SparseMLA FP8 kernel for absorbed-MLA path.
+
+    Same interface as ``_fused_sparse_mla_absorbed`` in dsa.py but routes
+    the forward pass through the FP8 TileLang kernel. Backward uses BF16.
+
+    Inputs are expected in SBHD with MQA key heads (kv_group=1):
+      query: [sq, b, np, d_total]
+      key:   [skv, b, 1, d_total]
+      topk:  [b, sq, topk]
+
+    Returns:
+      output: [sq, b, np, v_channels], or None if unsupported / unavailable.
+    """
+    if query.ndim != 4 or key.ndim != 4 or topk_indices.ndim != 3:
+        return None
+    if key.size(2) != 1:
+        return None
+    if query.size(1) != key.size(1) or topk_indices.size(0) != query.size(1):
+        return None
+    if topk_indices.size(1) != query.size(0):
+        return None
+    if query.size(-1) != key.size(-1):
+        return None
+    if topk_indices.size(-1) % 64 != 0:
+        return None
+
+    batch_output_list = []
+    for bi in range(query.size(1)):
+        q_t = query[:, bi].contiguous()
+        kv_t = key[:, bi].contiguous()
+        idx_t = topk_indices[bi].unsqueeze(1).to(torch.int32).contiguous()
+        out, _ = SparseMLA_FP8.apply(q_t, kv_t, idx_t, softmax_scale, v_channels)
+        if out.ndim != 3 or out.size(-1) != v_channels:
+            return None
+        batch_output_list.append(out)
+
+    if not batch_output_list:
+        return None
+    return torch.stack(batch_output_list, dim=1).contiguous()
