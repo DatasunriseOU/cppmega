@@ -111,6 +111,9 @@ def build_megatron_args_bundle(
                 # installed. See https://github.com/deepseek-ai/DeepEP
                 "--moe-token-dispatcher-type",
                 "flex",
+                # DeepEP requires fp32 router probabilities (only supports float32).
+                "--moe-router-dtype",
+                "fp32",
                 "--moe-permute-fusion",
             ]
         )
