@@ -348,9 +348,9 @@ if [ "${CPPMEGA_DISPATCHER_OVERRIDE:-}" = "alltoall" ]; then
 fi
 echo "NATIVE_ARGS (post-sed): ${NATIVE_ARGS}"
 
-# Per-module CUDA graph scope (full scope restored).
-# torch.equal in dsa.py:645 patched to torch.all on both machines.
-# mamba recompute uses is_graph_capturing() guard — skips checkpoint during CG.
+# Per-module CUDA graph scope (full).
+# All torch.equal/item() in DSA patched via upstream_patches/apply_dsa_cg_patches.py.
+# Mamba recompute wrapper uses is_graph_capturing() guard (CG-aware).
 CG_FLAGS="--cuda-graph-impl transformer_engine --cuda-graph-scope attn mamba moe_router moe_preprocess --cuda-graph-warmup-steps 3"
 # NOTE: --moe-pad-expert-input-to-capacity is INCOMPATIBLE with flex dispatcher
 # (raises ValueError). Omit when using DeepEP flex.
@@ -360,7 +360,7 @@ MOE_EXTRA_FLAGS=""
 # head-streaming in dsa_fp8_indexer.py (commit 563fcb0) reduces DSA target from
 # 7.5 GiB to 0.8 GiB per layer, so selective moe_act recompute is sufficient.
 # --mla-down-proj-fusion: fuses MLA down-projection GEMMs (PR #3039, free perf).
-EXTRA_FLAGS="--recompute-granularity selective --recompute-modules moe_act mlp mla_up_proj --mla-down-proj-fusion"
+EXTRA_FLAGS="--recompute-granularity selective --recompute-modules moe_act mlp mla_up_proj --mla-down-proj-fusion --clip-grad 1.0"
 
 ROPE_FLAG=""
 if [ "${NO_ROPE_FUSION}" = "1" ]; then
@@ -431,8 +431,8 @@ python -m torch.distributed.run --nproc_per_node=8 "${WORKDIR}/pretrain_mamba.py
   --train-iters ${TRAIN_ITERS} \
   --eval-interval 50000000 \
   --eval-iters 1 \
-  --lr 1e-4 \
-  --min-lr 1e-5 \
+  --lr 1e-5 \
+  --min-lr 1e-6 \
   --lr-decay-style constant \
   --position-embedding-type rope \
   --normalization RMSNorm \

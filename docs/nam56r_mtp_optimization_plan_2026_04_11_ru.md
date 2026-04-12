@@ -1047,3 +1047,51 @@ Absorbed путь (DeepSeek, PR #3674):
 - **Флаг**: `--moe-token-dispatcher-type flex --moe-router-dtype fp32`
 - **Требование**: `TP × EP > 1` (при EP=1 fallback на alltoall через `VARIANT=v0`)
 - **DeepEP .so**: собран на bench3, скопирован на europe через scp
+
+---
+
+## DSA EP=2 Absorbed MLA + TileLang Sparse Attention (2026-04-12)
+
+### Изменение архитектуры: qk_pos_emb_head_dim 32 → 64
+
+**Причина:** TileLang sparse MLA ядро требует `tail_dim = d_total - d_v` быть степенью двойки.
+Старое значение `tail_dim = 96` (не степень двойки) ломало padding в TileLang kernel.
+Новое: `qk_pos_emb_head_dim = 64` → `d_total = 64+64+64 = 192`, `tail_dim = 192-64 = 128` ✓
+
+**Файлы:**
+- `cppmega/recipes/megatron_args.py`: `qk_pos_emb_head_dim: int = 64`
+- `cppmega/recipes/nam56r_nemo_recipe.py`: `MLA_QK_POS_EMB_HEAD_DIM = 64`
+
+**Влияние:** +3% параметров в attention слоях (13 слоёв из 52), незначительное влияние на общий размер модели.
+
+### Upstream Megatron патчи
+
+Все патчи в `cppmega/megatron/upstream_patches/`:
+- `apply_dsa_cg_patches.py` — скрипт применения (идемпотентный)
+- `README.md` — документация
+
+**Целевая версия:** Megatron-LM `dev` branch (commit `7960a311f`) + PR #3674 merged.
+
+**Патчи:**
+1. `torch.equal()` → `if False:` (CG-unsafe CPU sync ops в dsa.py)
+2. Убраны хардкоды 576/512 (DeepSeek V3.2 dims)
+3. `d_v` parameter propagation через SparseMLA.apply → fwd → bwd
+4. Ослаблены power-of-2 assertions в tilelang fwd (dim%16 достаточно)
+5. `D=512` → `d_v` в tilelang bwd
+
+### Новые cppmega файлы
+
+| Файл | Назначение |
+|------|-----------|
+| `mamba_recompute_patch.py` | Activation checkpointing для Mamba/M2RNN (CG-aware) |
+| `dsa_sparse_absorbed.py` | Sparse gather-scatter для absorbed MLA DSA |
+| `upstream_patches/` | Все патчи к upstream Megatron + README |
+
+### Результаты
+
+| Конфигурация | Скорость | Память | Статус |
+|-------------|----------|--------|--------|
+| Baseline (topk=256) | OOM | 135.75 GiB | ❌ |
+| PyTorch sparse + full CG | 5.8s / 141 TFLOP/s | 103 GiB | ✅ 20/20 stable |
+| TileLang fused fwd+bwd | 4.2s / 194 TFLOP/s | 55 GiB | ⚠️ bwd NaN (tail_dim=96) |
+| TileLang + qk_pos=64 | TBD (tail_dim=128) | TBD | 🔄 testing |

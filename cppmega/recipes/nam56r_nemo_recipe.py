@@ -45,7 +45,7 @@ MOE_SHARED_EXPERT_SIZE = 1024
 MLA_Q_LORA_RANK = 64
 MLA_KV_LORA_RANK = 64
 MLA_QK_HEAD_DIM = 64
-MLA_QK_POS_EMB_HEAD_DIM = 32
+MLA_QK_POS_EMB_HEAD_DIM = 64  # was 32; 64 → tail_dim=128 (power-of-2 for TileLang)
 MLA_V_HEAD_DIM = 64
 
 # Mamba defaults (Nemotron Nano-aligned)
