@@ -1,51 +1,56 @@
 #!/usr/bin/env bash
-# Stream M: NAM56R DSA 9+4 + FP8 indexer + loss_coeff==0 gate + EP sweep
-#           + selective MoE recompute.
+# NAM56R DSA 9+4 production parameter sweep (2026-04-12)
 #
-# Inherits Stream L topology (TP=1 PP=2 VPP=2 MBS=4 GBS=64 MTP=2) but adds:
-#   1. loss_coeff==0 gate in dsa_fp8_patch.py (commit 26ff3ca) saves ~63 GB
-#   2. --recompute-granularity selective --recompute-modules moe_act
+# Sequential sweep of 8 configs on bench3 (h200_1), 50 iters each.
+# Measures tok/sec at iter 30-50 steady state.
 #
-# VARIANT=v1 -> EP=4 DP=1 (4 experts/rank, gradient accumulation handles GBS)
-# VARIANT=v2 -> EP=2 DP=2 (8 experts/rank, 2x data-parallel)
+# All configs share:
+#   TP=1, DSA 9+4 (CPPMEGA_DSA_A_LAYER_RANKS="1,2,3,5,6,7,9,10,11"),
+#   FP8 indexer (CPPMEGA_DSA_INDEXER_DTYPE=fp8),
+#   sparse attention (CPPMEGA_DSA_SPARSE_MODE=tilelang, fallback gather_scatter),
+#   real HF tokenizer + clang_semantic data, --enable-dsa,
+#   --dsa-indexer-topk 256, --dsa-indexer-loss-coeff 0.001
 #
-# NO feature disable hacks. NO MBS drop. NO DSA off. NO MTP off. NO MoE off.
-# NO CppmegaMamba3TPMixer. Real data only. Mamba-3 MIMO 7/7 preserved.
+# Usage (on bench3):
+#   CONFIG=B1 bash scripts/remote_sweep_h200_dsa_production.sh
+#   CONFIG=B2 bash scripts/remote_sweep_h200_dsa_production.sh
+#   ...
 #
-# Designed to run directly on LOCATION_2 (h200_1)
-# inside a tmux session launched with `bash -l`. No gcloud/scp wrapping here
-# -- this script IS the remote body.
+# Or run the driver script to run all 8 sequentially:
+#   bash scripts/drive_sweep_dsa_production.sh
 set -euo pipefail
 
-# Source .bashrc for cuDNN/NCCL/cublas LD_LIBRARY_PATH -- bash -l in tmux
-# does NOT source .bashrc on this machine.
+# Source .bashrc for cuDNN/NCCL paths
 [ -f "${HOME}/.bashrc" ] && source "${HOME}/.bashrc"
 
-REMOTE_ROOT="${REMOTE_ROOT:-/home/dave/cppmega-root}"
-REMOTE_VENV="${REMOTE_VENV:-${REMOTE_ROOT}/cppmega-venv}"
-VARIANT="${VARIANT:-v1}"
-RUN_ID="${RUN_ID:-cppmega_nam56r_dsa_9_4_fp8_m_${VARIANT}}"
-LOG="${LOG:-${REMOTE_ROOT}/cppmega/${RUN_ID}.log}"
-CKPT_DIR="${CKPT_DIR:-${REMOTE_ROOT}/cppmega/nam56r_grid/${RUN_ID}_ckpt}"
+CONFIG="${CONFIG:-B1}"
+REMOTE_ROOT="${REMOTE_ROOT:-/mnt/data}"
+REMOTE_VENV="${REMOTE_VENV:-${REMOTE_ROOT}/venv}"
+RUN_ID="${RUN_ID:-nam56r_dsa_sweep_${CONFIG}}"
+LOG_DIR="${REMOTE_ROOT}/cppmega-root/cppmega/nam56r_dsa_sweep"
+LOG="${LOG:-${LOG_DIR}/${RUN_ID}.log}"
+CKPT_DIR="${CKPT_DIR:-${LOG_DIR}/${RUN_ID}_ckpt}"
+RESULTS_FILE="${LOG_DIR}/sweep_results.jsonl"
 
-mkdir -p "$(dirname "${LOG}")" "${CKPT_DIR}"
-rm -rf "${CKPT_DIR}"/* || true  # fresh init each run
+mkdir -p "${LOG_DIR}" "${CKPT_DIR}"
+rm -rf "${CKPT_DIR}"/* || true
 
 # Activate venv
 source "${REMOTE_VENV}/bin/activate"
-export PYTHONPATH="${REMOTE_ROOT}/cppmega:${REMOTE_ROOT}/megatron-lm:${PYTHONPATH:-}"
+export PYTHONPATH="${REMOTE_ROOT}/cppmega-root/cppmega:${REMOTE_ROOT}/cppmega-root/megatron-lm:${PYTHONPATH:-}"
 
-# venv NVIDIA libs must come first (cuDNN for MLA, NCCL for comms, cublas for MoE).
-# bash -l on europe does NOT source .bashrc, so we must set this explicitly.
+# venv cuDNN must come first
 _NV="${REMOTE_VENV}/lib/python3.13/site-packages/nvidia"
 _LD_PREFIX=""
 for _pkg in cudnn nccl cublas; do
   _d="${_NV}/${_pkg}/lib"
   [ -d "${_d}" ] && _LD_PREFIX="${_d}:${_LD_PREFIX}"
 done
-export LD_LIBRARY_PATH="${_LD_PREFIX}/usr/local/cuda-13.2/lib64:${LD_LIBRARY_PATH:-}"
+if [ -n "${_LD_PREFIX}" ]; then
+  export LD_LIBRARY_PATH="${_LD_PREFIX}${LD_LIBRARY_PATH:-}"
+fi
 
-# NAM56R env defaults (same as Stream D v2 / Stream J / Stream L)
+# NAM56R env defaults
 export TILELANG_EXECUTION_BACKEND="${TILELANG_EXECUTION_BACKEND:-cython}"
 export CPPMEGA_MAMBA3_MIMO="${CPPMEGA_MAMBA3_MIMO:-1}"
 export CPPMEGA_MAMBA_NUM_GROUPS="${CPPMEGA_MAMBA_NUM_GROUPS:-8}"
@@ -59,74 +64,93 @@ export CPPMEGA_NGRAM_HASH_TABLE_SIZE="${CPPMEGA_NGRAM_HASH_TABLE_SIZE:-500000}"
 export CPPMEGA_NGRAM_HASH_EMBED_DIM="${CPPMEGA_NGRAM_HASH_EMBED_DIM:-16}"
 export CPPMEGA_STRUCTURE_ENABLED="${CPPMEGA_STRUCTURE_ENABLED:-1}"
 export CPPMEGA_STRUCTURE_COMPONENTS="${CPPMEGA_STRUCTURE_COMPONENTS:-core}"
+
+# DSA 9+4 permanent layout
 export CPPMEGA_DSA_A_LAYER_RANKS="${CPPMEGA_DSA_A_LAYER_RANKS:-1,2,3,5,6,7,9,10,11}"
 # Stream E+G FP8 DSA indexer (fwd + bwd patched)
 export CPPMEGA_DSA_INDEXER_DTYPE="${CPPMEGA_DSA_INDEXER_DTYPE:-fp8}"
-# Use gather_scatter for DSA sparse attention: the TileLang sparse_mla_ops
-# kernel expects MLA compressed KV format (d_v=96), but our DSA pipeline
-# passes decompressed Q/K/V (d_v=512). gather_scatter handles arbitrary dims.
-export CPPMEGA_DSA_SPARSE_MODE="${CPPMEGA_DSA_SPARSE_MODE:-gather_scatter}"
+# Sparse attention mode (tilelang fused kernel, fallback to gather_scatter)
+export CPPMEGA_DSA_SPARSE_MODE="${CPPMEGA_DSA_SPARSE_MODE:-tilelang}"
 
-# Mamba/M2RNN activation checkpointing — saves ~28+ GiB per microbatch
-# by recomputing SSM forward during backward instead of saving intermediates.
-export CPPMEGA_MAMBA_RECOMPUTE="${CPPMEGA_MAMBA_RECOMPUTE:-1}"
-# Skip indexer loss (7 GiB torch.bmm) until head-streaming loss is implemented.
-export CPPMEGA_DSA_SKIP_INDEXER_LOSS="${CPPMEGA_DSA_SKIP_INDEXER_LOSS:-1}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export NCCL_GRAPH_REGISTER=0
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_IB_SL=1
-unset NCCL_NET NCCL_NET_PLUGIN 2>/dev/null || true
-export NCCL_NET_PLUGIN=none
 export TRITON_CACHE_DIR="${REMOTE_ROOT}/.triton-cache"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 mkdir -p "${TRITON_CACHE_DIR}"
 
-# Parallelism defaults: 112k baseline topology (PP=2 VPP=2 MBS=4 GBS=64 MTP=2).
-TP_SIZE="${TP_SIZE:-1}"
-PP_SIZE="${PP_SIZE:-2}"
-VPP_SIZE="${VPP_SIZE:-2}"
-EP_SIZE="${EP_SIZE:-1}"   # overridden per variant below
-MBS="${MBS:-4}"
-GBS="${GBS:-64}"
-SEQ_LEN="${SEQ_LEN:-4096}"
-TRAIN_ITERS="${TRAIN_ITERS:-120}"
-MTP_DEPTHS="${MTP_DEPTHS:-2}"
-NO_ROPE_FUSION="${NO_ROPE_FUSION:-1}"
+# =====================================================================
+# Config definitions: PP VPP MBS GBS MTP_DEPTHS RECOMPUTE CG EP
+# =====================================================================
+TP_SIZE=1
+SEQ_LEN=4096
+TRAIN_ITERS=50
+NO_ROPE_FUSION=1
+DSA_TOPK=256
+DSA_LOSS_COEFF=0.001
 
-# ---------------------------------------------------------------------------
-# Variant overrides (v1 = EP=4 DP=1, v2 = EP=2 DP=2)
-# ---------------------------------------------------------------------------
-case "${VARIANT}" in
-  v0)
-    echo "[stream_m] V0 = EP=1 DP=4 PP=2 VPP=2 (all 16 experts/rank, 4x DP, no DeepEP)"
+case "${CONFIG}" in
+  B1)
+    PP_SIZE=2; VPP_SIZE=2; MBS=4; GBS=64; MTP_DEPTHS=2
+    RECOMPUTE_MODE="moe_act"
+    CUDA_GRAPH_MODE="per_module"
     EP_SIZE=1
-    # flex dispatcher requires TP*EP > 1; override to alltoall for EP=1
-    CPPMEGA_DISPATCHER_OVERRIDE=alltoall
     ;;
-  v1)
-    echo "[stream_m] V1 = EP=4 DP=1 PP=2 VPP=2 (4 experts/rank, grad-accum GBS)"
-    EP_SIZE=4
+  B2)
+    PP_SIZE=2; VPP_SIZE=2; MBS=4; GBS=64; MTP_DEPTHS=2
+    RECOMPUTE_MODE="moe_act"
+    CUDA_GRAPH_MODE="off"
+    EP_SIZE=1
     ;;
-  v2)
-    echo "[stream_m] V2 = EP=2 DP=2 PP=2 VPP=2 (8 experts/rank, 2x DP)"
-    EP_SIZE=2
+  B3)
+    PP_SIZE=2; VPP_SIZE=2; MBS=8; GBS=64; MTP_DEPTHS=2
+    RECOMPUTE_MODE="moe_act"
+    CUDA_GRAPH_MODE="per_module"
+    EP_SIZE=1
+    ;;
+  B4)
+    PP_SIZE=2; VPP_SIZE=2; MBS=2; GBS=64; MTP_DEPTHS=2
+    RECOMPUTE_MODE="moe_act"
+    CUDA_GRAPH_MODE="per_module"
+    EP_SIZE=1
+    ;;
+  B5)
+    PP_SIZE=2; VPP_SIZE=2; MBS=4; GBS=128; MTP_DEPTHS=2
+    RECOMPUTE_MODE="moe_act"
+    CUDA_GRAPH_MODE="per_module"
+    EP_SIZE=1
+    ;;
+  B6)
+    PP_SIZE=2; VPP_SIZE=2; MBS=4; GBS=64; MTP_DEPTHS=1
+    RECOMPUTE_MODE="moe_act"
+    CUDA_GRAPH_MODE="per_module"
+    EP_SIZE=1
+    ;;
+  B7)
+    PP_SIZE=2; VPP_SIZE=2; MBS=4; GBS=64; MTP_DEPTHS=2
+    RECOMPUTE_MODE="full_selective"
+    CUDA_GRAPH_MODE="per_module"
+    EP_SIZE=1
+    ;;
+  B8)
+    PP_SIZE=2; VPP_SIZE=1; MBS=4; GBS=64; MTP_DEPTHS=2
+    RECOMPUTE_MODE="moe_act"
+    CUDA_GRAPH_MODE="per_module"
+    EP_SIZE=1
     ;;
   *)
-    echo "ERROR: unknown VARIANT=${VARIANT} (expected v0|v1|v2)" >&2
+    echo "ERROR: unknown CONFIG=${CONFIG} (expected B1..B8)" >&2
     exit 2
     ;;
 esac
 
-# Build workdir with pretrain_mamba shim (MIMO __post_init__ + fp32-bias hook
-# + DSA FP8 patch + loss_coeff==0 gate + peak-memory reporter).
-WORKDIR=$(mktemp -d /tmp/cppmega-nam56r-dsa-9-4-m.XXXXXX)
+# Build workdir with pretrain_mamba shim
+WORKDIR=$(mktemp -d /tmp/cppmega-nam56r-dsa-sweep.XXXXXX)
 trap "rm -rf ${WORKDIR}" EXIT
 
 cat > "${WORKDIR}/cppmega_mimo_shim.py" <<'PY'
-"""Shim: install MIMO __post_init__ hook + Mamba3 fp32-bias forward pre-hook
-+ Stream E/G DSA FP8 fwd+bwd patch + loss_coeff==0 gate + per-rank
-peak-memory reporter + cuDNN fused-attn workaround for europe."""
+"""Shim: MIMO + fp32-bias + DSA FP8 + sparse attention + peak-memory reporter."""
 from __future__ import annotations
 import os
 import sys
@@ -203,7 +227,7 @@ try:
 except Exception:
     pass
 
-# (5) Stream E+G: DSA FP8 fwd+bwd indexer patch + loss_coeff==0 gate
+# (5) DSA FP8 fwd+bwd indexer patch + sparse attention + KL mode
 _dsa_dtype = os.environ.get("CPPMEGA_DSA_INDEXER_DTYPE", "bf16").lower()
 print(f"[cppmega_mimo_shim] CPPMEGA_DSA_INDEXER_DTYPE resolves to '{_dsa_dtype}'")
 if _dsa_dtype == "fp8":
@@ -215,18 +239,10 @@ if _dsa_dtype == "fp8":
         print(f"[cppmega_mimo_shim] DSA FP8 patch failed: {_exc}", file=sys.stderr)
         raise
 
-# (6) Mamba/M2RNN activation checkpointing (CPPMEGA_MAMBA_RECOMPUTE=1)
-_mamba_recompute = os.environ.get("CPPMEGA_MAMBA_RECOMPUTE", "0") == "1"
-if _mamba_recompute:
-    try:
-        from cppmega.megatron.mamba_recompute_patch import apply_mamba_recompute_patch
-        _applied = apply_mamba_recompute_patch()
-        print(f"[cppmega_mimo_shim] Mamba recompute patch applied={_applied}")
-    except Exception as _exc:
-        print(f"[cppmega_mimo_shim] Mamba recompute patch failed: {_exc}", file=sys.stderr)
-        raise
+_sparse_mode = os.environ.get("CPPMEGA_DSA_SPARSE_MODE", "tilelang").lower()
+print(f"[cppmega_mimo_shim] CPPMEGA_DSA_SPARSE_MODE resolves to '{_sparse_mode}'")
 
-# (7) Stream M: per-rank peak-memory reporter (atexit hook)
+# (6) Per-rank peak-memory reporter (atexit hook)
 def _cppmega_peak_mem_report():
     try:
         import torch
@@ -237,17 +253,17 @@ def _cppmega_peak_mem_report():
         peak_reserved = torch.cuda.max_memory_reserved(dev) / (1024 ** 3)
         rank = int(os.environ.get("RANK", "0"))
         print(
-            f"[stream_m_peak_mem] rank={rank} device={dev} "
+            f"[sweep_peak_mem] rank={rank} device={dev} "
             f"peak_alloc_gib={peak_alloc:.3f} peak_reserved_gib={peak_reserved:.3f}",
             flush=True,
         )
     except Exception as _exc:
-        print(f"[stream_m_peak_mem] report failed: {_exc}", file=sys.stderr)
+        print(f"[sweep_peak_mem] report failed: {_exc}", file=sys.stderr)
 
 atexit.register(_cppmega_peak_mem_report)
 PY
 
-cp "${REMOTE_ROOT}/megatron-lm/pretrain_mamba.py" "${WORKDIR}/pretrain_mamba_original.py"
+cp "${REMOTE_ROOT}/cppmega-root/megatron-lm/pretrain_mamba.py" "${WORKDIR}/pretrain_mamba_original.py"
 cat > "${WORKDIR}/pretrain_mamba.py" <<'PY'
 import os, sys, runpy
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -271,7 +287,7 @@ def model_provider(model_builder, pre_process=True, post_process=True, vp_stage=
     return model_builder(args, pre_process, post_process, vp_stage, config=config, pg_collection=pg_collection)
 PY
 
-# Build hybrid layer pattern -- PP*VPP equal chunks separated by "|".
+# Build hybrid layer pattern
 HYBRID_PATTERN=$(python - <<PY
 from cppmega.megatron.nam56r_lite_spec import build_default_hybrid_layer_pattern
 
@@ -297,7 +313,7 @@ PY
 )
 echo "HYBRID_PATTERN: ${HYBRID_PATTERN}"
 
-# Native args (MLA + MoE + MTP + DSA).
+# Native args (MLA + MoE + MTP + DSA) with custom topk and loss_coeff
 NATIVE_ARGS=$(python - <<PY
 from cppmega.recipes.nam56r_launch import build_nam56r_megatron_native_args
 from cppmega.recipes.nam56r_megatron import build_nam56r_feature_plan
@@ -312,66 +328,72 @@ bundle = build_nam56r_megatron_native_args(
     mtp_mode="hybrid",
     enable_moe=True,
     enable_dsa=True,
+    dsa_indexer_dtype="fp8",
+    dsa_indexer_topk=${DSA_TOPK},
+    dsa_indexer_loss_coeff=${DSA_LOSS_COEFF},
 )
 print(bundle.to_shell_fragment())
 PY
 )
 echo "NATIVE_ARGS (pre-sed): ${NATIVE_ARGS}"
 
-# Override --mtp-num-layers to match MTP_DEPTHS if >1.
+# Fix MTP depths if >1
 if [ "${MTP_DEPTHS}" -gt 1 ]; then
   NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--mtp-num-layers 1/--mtp-num-layers ${MTP_DEPTHS}/")
 fi
 
-# Strip --dsa-indexer-dtype from NATIVE_ARGS: it is a cppmega recipe arg, not
-# a Megatron CLI arg. The FP8 indexer behavior is controlled entirely by the
-# CPPMEGA_DSA_INDEXER_DTYPE env var and the shim's apply_dsa_fp8_patch().
+# Strip --dsa-indexer-dtype (env var controls, not CLI)
 NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed 's/ *--dsa-indexer-dtype [a-z0-9]*//')
 
-# Override --expert-model-parallel-size to EP_SIZE (always runs for Stream M:
-# both variants set EP_SIZE >=2).
+# EP override
 if [ "${EP_SIZE}" != "1" ]; then
   NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--expert-model-parallel-size 1/--expert-model-parallel-size ${EP_SIZE}/")
 fi
-
-# Confirm the substitution actually happened.
-if ! echo "${NATIVE_ARGS}" | grep -q -- "--expert-model-parallel-size ${EP_SIZE}"; then
-  echo "ERROR: failed to set --expert-model-parallel-size ${EP_SIZE}; NATIVE_ARGS=${NATIVE_ARGS}" >&2
-  exit 3
-fi
-# EP=1 override: flex dispatcher requires TP*EP > 1, fall back to alltoall
-if [ "${CPPMEGA_DISPATCHER_OVERRIDE:-}" = "alltoall" ]; then
-  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--moe-token-dispatcher-type flex/--moe-token-dispatcher-type alltoall/")
-  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/ --moe-router-dtype fp32//")
-  MOE_EXTRA_FLAGS="--moe-pad-expert-input-to-capacity --moe-expert-capacity-factor 1.0"
-  echo "NATIVE_ARGS (alltoall override for EP=1): dispatcher=alltoall"
-fi
 echo "NATIVE_ARGS (post-sed): ${NATIVE_ARGS}"
 
-# Per-module CUDA graph scope (full scope restored).
-# torch.equal in dsa.py:645 patched to torch.all on both machines.
-# mamba recompute uses is_graph_capturing() guard — skips checkpoint during CG.
-CG_FLAGS="--cuda-graph-impl transformer_engine --cuda-graph-scope attn mamba moe_router moe_preprocess --cuda-graph-warmup-steps 3"
-# NOTE: --moe-pad-expert-input-to-capacity is INCOMPATIBLE with flex dispatcher
-# (raises ValueError). Omit when using DeepEP flex.
-MOE_EXTRA_FLAGS=""
+# CUDA graph flags
+CG_FLAGS=""
+case "${CUDA_GRAPH_MODE}" in
+  off)
+    CG_FLAGS="--cuda-graph-impl none"
+    ;;
+  per_module)
+    CG_FLAGS="--cuda-graph-impl transformer_engine --cuda-graph-scope attn mamba moe_router moe_preprocess --cuda-graph-warmup-steps 3"
+    ;;
+  *)
+    echo "ERROR: unknown CUDA_GRAPH_MODE=${CUDA_GRAPH_MODE}"; exit 2;;
+esac
 
-# Stream M: selective MoE activation recompute.
-# head-streaming in dsa_fp8_indexer.py (commit 563fcb0) reduces DSA target from
-# 7.5 GiB to 0.8 GiB per layer, so selective moe_act recompute is sufficient.
-# --mla-down-proj-fusion: fuses MLA down-projection GEMMs (PR #3039, free perf).
-EXTRA_FLAGS="--recompute-granularity selective --recompute-modules moe_act mlp mla_up_proj --mla-down-proj-fusion"
+# MoE flags (required for CUDA graph compat)
+MOE_EXTRA_FLAGS="--moe-token-dispatcher-type alltoall"
+if [ "${CUDA_GRAPH_MODE}" != "off" ]; then
+  MOE_EXTRA_FLAGS="${MOE_EXTRA_FLAGS} --moe-pad-expert-input-to-capacity --moe-expert-capacity-factor 1.0 --moe-permute-fusion"
+fi
 
+# Recompute flags
+RECOMPUTE_FLAGS=""
+case "${RECOMPUTE_MODE}" in
+  moe_act)
+    RECOMPUTE_FLAGS="--recompute-granularity selective --recompute-modules moe_act"
+    ;;
+  full_selective)
+    RECOMPUTE_FLAGS="--recompute-granularity selective"
+    ;;
+  *)
+    echo "ERROR: unknown RECOMPUTE_MODE=${RECOMPUTE_MODE}"; exit 2;;
+esac
+
+# RoPE fusion flag
 ROPE_FLAG=""
 if [ "${NO_ROPE_FUSION}" = "1" ]; then
   ROPE_FLAG="--no-rope-fusion"
 fi
 
+# Pre-flight checks
 python -c 'import cppmega, megatron; print("cppmega", cppmega.__version__)'
 python -c "from cppmega.megatron.dsa_fp8_patch import apply_dsa_fp8_patch; print('dsa_fp8_patch importable')"
-python -c "from cppmega.megatron.dsa_fp8_indexer import bwd_fused_indexer_loss_fp8, compute_index_scores_fp8; print('dsa_fp8_indexer fwd+bwd importable')"
 
-# Validate DSA A-layer rank parsing.
+# Validate DSA A-layer rank parsing
 python - <<PY
 import os
 os.environ.setdefault("CPPMEGA_DSA_A_LAYER_RANKS", "${CPPMEGA_DSA_A_LAYER_RANKS}")
@@ -389,19 +411,21 @@ assert len(dsa_ranks) == 9 and len(mla_ranks) == 4, (
 )
 PY
 
-# Guard: refuse to launch if forbidden tokenizer/mock-data flags are present.
+# Guard: refuse NullTokenizer or mock-data
 _FORBID1="Null""Tokenizer"
 _FORBID2="--mock""-data"
-if echo "${NATIVE_ARGS} ${CG_FLAGS} ${MOE_EXTRA_FLAGS} ${ROPE_FLAG} ${EXTRA_FLAGS}" | grep -E "(${_FORBID1}|${_FORBID2})" > /dev/null; then
+if echo "${NATIVE_ARGS} ${CG_FLAGS} ${MOE_EXTRA_FLAGS} ${ROPE_FLAG} ${RECOMPUTE_FLAGS}" | grep -E "(${_FORBID1}|${_FORBID2})" > /dev/null; then
   echo "ERROR: rendered command contains ${_FORBID1} or ${_FORBID2}"
   exit 9
 fi
 
-echo "=== Stream M NAM56R 7/7 MIMO + DSA 9+4 + FP8 indexer + loss gate + selective recompute (${VARIANT}) ==="
-echo "RUN_ID=${RUN_ID} VARIANT=${VARIANT} TP=${TP_SIZE} PP=${PP_SIZE} VPP=${VPP_SIZE} EP=${EP_SIZE} MBS=${MBS} GBS=${GBS} MTP=${MTP_DEPTHS}"
+echo "=== NAM56R DSA 9+4 production sweep: ${CONFIG} ==="
+echo "RUN_ID=${RUN_ID} CONFIG=${CONFIG}"
+echo "TP=${TP_SIZE} PP=${PP_SIZE} VPP=${VPP_SIZE} EP=${EP_SIZE} MBS=${MBS} GBS=${GBS} MTP=${MTP_DEPTHS}"
+echo "RECOMPUTE=${RECOMPUTE_MODE} CG=${CUDA_GRAPH_MODE}"
+echo "DSA_TOPK=${DSA_TOPK} DSA_LOSS_COEFF=${DSA_LOSS_COEFF}"
+echo "DSA_SPARSE_MODE=${CPPMEGA_DSA_SPARSE_MODE}"
 echo "DSA_A_LAYER_RANKS=${CPPMEGA_DSA_A_LAYER_RANKS}"
-echo "CPPMEGA_DSA_INDEXER_DTYPE=${CPPMEGA_DSA_INDEXER_DTYPE}"
-echo "EXTRA_FLAGS=${EXTRA_FLAGS}"
 echo "LOG=${LOG}"
 nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
 echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-<unset>}"
@@ -409,7 +433,7 @@ echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-<unset>}"
 python -m torch.distributed.run --nproc_per_node=8 "${WORKDIR}/pretrain_mamba.py" \
   --data-path 1.0 "${REMOTE_ROOT}/data/megatron/clang_semantic_4k_v10_train" \
   --tokenizer-type HuggingFaceTokenizer \
-  --tokenizer-model "${REMOTE_ROOT}/data/tokenizer" \
+  --tokenizer-model "${REMOTE_ROOT}/tokenizer" \
   --split 98,1,1 \
   --tensor-model-parallel-size ${TP_SIZE} \
   --pipeline-model-parallel-size ${PP_SIZE} \
@@ -447,7 +471,7 @@ python -m torch.distributed.run --nproc_per_node=8 "${WORKDIR}/pretrain_mamba.py
   ${MOE_EXTRA_FLAGS} \
   --no-check-for-nan-in-loss-and-grad \
   ${NATIVE_ARGS} \
-  ${EXTRA_FLAGS} \
+  ${RECOMPUTE_FLAGS} \
   --save "${CKPT_DIR}" \
   --load "${CKPT_DIR}" \
   --save-interval 1000000 \

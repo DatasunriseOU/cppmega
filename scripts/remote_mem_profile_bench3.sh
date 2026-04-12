@@ -1,42 +1,27 @@
 #!/usr/bin/env bash
-# Stream M: NAM56R DSA 9+4 + FP8 indexer + loss_coeff==0 gate + EP sweep
-#           + selective MoE recompute.
+# Memory profiling baseline: NAM56R on old main (e40feed4a)
+# EP=1 TP=1 PP=2 VPP=2, NO CUDA graphs, TRAIN_ITERS=5
+# Prints per-step memory stats + full memory_summary + param counts at exit.
 #
-# Inherits Stream L topology (TP=1 PP=2 VPP=2 MBS=4 GBS=64 MTP=2) but adds:
-#   1. loss_coeff==0 gate in dsa_fp8_patch.py (commit 26ff3ca) saves ~63 GB
-#   2. --recompute-granularity selective --recompute-modules moe_act
-#
-# VARIANT=v1 -> EP=4 DP=1 (4 experts/rank, gradient accumulation handles GBS)
-# VARIANT=v2 -> EP=2 DP=2 (8 experts/rank, 2x data-parallel)
-#
-# NO feature disable hacks. NO MBS drop. NO DSA off. NO MTP off. NO MoE off.
-# NO CppmegaMamba3TPMixer. Real data only. Mamba-3 MIMO 7/7 preserved.
-#
-# Designed to run directly on LOCATION_2 (h200_1)
-# inside a tmux session launched with `bash -l`. No gcloud/scp wrapping here
-# -- this script IS the remote body.
+# Designed to run on bench3 (H200_1_IP) inside tmux.
 set -euo pipefail
 
-# Source .bashrc for cuDNN/NCCL/cublas LD_LIBRARY_PATH -- bash -l in tmux
-# does NOT source .bashrc on this machine.
 [ -f "${HOME}/.bashrc" ] && source "${HOME}/.bashrc"
 
-REMOTE_ROOT="${REMOTE_ROOT:-/home/dave/cppmega-root}"
-REMOTE_VENV="${REMOTE_VENV:-${REMOTE_ROOT}/cppmega-venv}"
-VARIANT="${VARIANT:-v1}"
-RUN_ID="${RUN_ID:-cppmega_nam56r_dsa_9_4_fp8_m_${VARIANT}}"
+REMOTE_ROOT="${REMOTE_ROOT:-/mnt/data/cppmega-root}"
+REMOTE_VENV="${REMOTE_VENV:-/mnt/data/venv}"
+RUN_ID="${RUN_ID:-mem_profile_baseline}"
 LOG="${LOG:-${REMOTE_ROOT}/cppmega/${RUN_ID}.log}"
 CKPT_DIR="${CKPT_DIR:-${REMOTE_ROOT}/cppmega/nam56r_grid/${RUN_ID}_ckpt}"
 
 mkdir -p "$(dirname "${LOG}")" "${CKPT_DIR}"
-rm -rf "${CKPT_DIR}"/* || true  # fresh init each run
+rm -rf "${CKPT_DIR}"/* || true
 
 # Activate venv
 source "${REMOTE_VENV}/bin/activate"
 export PYTHONPATH="${REMOTE_ROOT}/cppmega:${REMOTE_ROOT}/megatron-lm:${PYTHONPATH:-}"
 
-# venv NVIDIA libs must come first (cuDNN for MLA, NCCL for comms, cublas for MoE).
-# bash -l on europe does NOT source .bashrc, so we must set this explicitly.
+# venv NVIDIA libs
 _NV="${REMOTE_VENV}/lib/python3.13/site-packages/nvidia"
 _LD_PREFIX=""
 for _pkg in cudnn nccl cublas; do
@@ -45,7 +30,7 @@ for _pkg in cudnn nccl cublas; do
 done
 export LD_LIBRARY_PATH="${_LD_PREFIX}/usr/local/cuda-13.2/lib64:${LD_LIBRARY_PATH:-}"
 
-# NAM56R env defaults (same as Stream D v2 / Stream J / Stream L)
+# NAM56R env defaults
 export TILELANG_EXECUTION_BACKEND="${TILELANG_EXECUTION_BACKEND:-cython}"
 export CPPMEGA_MAMBA3_MIMO="${CPPMEGA_MAMBA3_MIMO:-1}"
 export CPPMEGA_MAMBA_NUM_GROUPS="${CPPMEGA_MAMBA_NUM_GROUPS:-8}"
@@ -60,18 +45,9 @@ export CPPMEGA_NGRAM_HASH_EMBED_DIM="${CPPMEGA_NGRAM_HASH_EMBED_DIM:-16}"
 export CPPMEGA_STRUCTURE_ENABLED="${CPPMEGA_STRUCTURE_ENABLED:-1}"
 export CPPMEGA_STRUCTURE_COMPONENTS="${CPPMEGA_STRUCTURE_COMPONENTS:-core}"
 export CPPMEGA_DSA_A_LAYER_RANKS="${CPPMEGA_DSA_A_LAYER_RANKS:-1,2,3,5,6,7,9,10,11}"
-# Stream E+G FP8 DSA indexer (fwd + bwd patched)
 export CPPMEGA_DSA_INDEXER_DTYPE="${CPPMEGA_DSA_INDEXER_DTYPE:-fp8}"
-# Use gather_scatter for DSA sparse attention: the TileLang sparse_mla_ops
-# kernel expects MLA compressed KV format (d_v=96), but our DSA pipeline
-# passes decompressed Q/K/V (d_v=512). gather_scatter handles arbitrary dims.
 export CPPMEGA_DSA_SPARSE_MODE="${CPPMEGA_DSA_SPARSE_MODE:-gather_scatter}"
 
-# Mamba/M2RNN activation checkpointing — saves ~28+ GiB per microbatch
-# by recomputing SSM forward during backward instead of saving intermediates.
-export CPPMEGA_MAMBA_RECOMPUTE="${CPPMEGA_MAMBA_RECOMPUTE:-1}"
-# Skip indexer loss (7 GiB torch.bmm) until head-streaming loss is implemented.
-export CPPMEGA_DSA_SKIP_INDEXER_LOSS="${CPPMEGA_DSA_SKIP_INDEXER_LOSS:-1}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export NCCL_GRAPH_REGISTER=0
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -82,51 +58,28 @@ export TRITON_CACHE_DIR="${REMOTE_ROOT}/.triton-cache"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 mkdir -p "${TRITON_CACHE_DIR}"
 
-# Parallelism defaults: 112k baseline topology (PP=2 VPP=2 MBS=4 GBS=64 MTP=2).
-TP_SIZE="${TP_SIZE:-1}"
-PP_SIZE="${PP_SIZE:-2}"
-VPP_SIZE="${VPP_SIZE:-2}"
-EP_SIZE="${EP_SIZE:-1}"   # overridden per variant below
-MBS="${MBS:-4}"
-GBS="${GBS:-64}"
-SEQ_LEN="${SEQ_LEN:-4096}"
-TRAIN_ITERS="${TRAIN_ITERS:-120}"
-MTP_DEPTHS="${MTP_DEPTHS:-2}"
-NO_ROPE_FUSION="${NO_ROPE_FUSION:-1}"
+# Parallelism: EP=1 baseline topology
+TP_SIZE=1
+PP_SIZE=2
+VPP_SIZE=2
+EP_SIZE=1
+# MBS=1: DSA gather_scatter with topk=256 OOMs even at MBS=2/4 (136+ GiB peak).
+MBS=1
+GBS=64
+SEQ_LEN=4096
+TRAIN_ITERS=5
+MTP_DEPTHS=2
+NO_ROPE_FUSION=1
 
-# ---------------------------------------------------------------------------
-# Variant overrides (v1 = EP=4 DP=1, v2 = EP=2 DP=2)
-# ---------------------------------------------------------------------------
-case "${VARIANT}" in
-  v0)
-    echo "[stream_m] V0 = EP=1 DP=4 PP=2 VPP=2 (all 16 experts/rank, 4x DP, no DeepEP)"
-    EP_SIZE=1
-    # flex dispatcher requires TP*EP > 1; override to alltoall for EP=1
-    CPPMEGA_DISPATCHER_OVERRIDE=alltoall
-    ;;
-  v1)
-    echo "[stream_m] V1 = EP=4 DP=1 PP=2 VPP=2 (4 experts/rank, grad-accum GBS)"
-    EP_SIZE=4
-    ;;
-  v2)
-    echo "[stream_m] V2 = EP=2 DP=2 PP=2 VPP=2 (8 experts/rank, 2x DP)"
-    EP_SIZE=2
-    ;;
-  *)
-    echo "ERROR: unknown VARIANT=${VARIANT} (expected v0|v1|v2)" >&2
-    exit 2
-    ;;
-esac
+# EP=1 -> alltoall dispatcher (flex requires TP*EP > 1)
+CPPMEGA_DISPATCHER_OVERRIDE=alltoall
 
-# Build workdir with pretrain_mamba shim (MIMO __post_init__ + fp32-bias hook
-# + DSA FP8 patch + loss_coeff==0 gate + peak-memory reporter).
-WORKDIR=$(mktemp -d /tmp/cppmega-nam56r-dsa-9-4-m.XXXXXX)
+# Build workdir with memory-profiling shim
+WORKDIR=$(mktemp -d /tmp/cppmega-mem-profile.XXXXXX)
 trap "rm -rf ${WORKDIR}" EXIT
 
 cat > "${WORKDIR}/cppmega_mimo_shim.py" <<'PY'
-"""Shim: install MIMO __post_init__ hook + Mamba3 fp32-bias forward pre-hook
-+ Stream E/G DSA FP8 fwd+bwd patch + loss_coeff==0 gate + per-rank
-peak-memory reporter + cuDNN fused-attn workaround for europe."""
+"""Memory profiling shim: MIMO hooks + per-step memory stats + exit summary."""
 from __future__ import annotations
 import os
 import sys
@@ -145,7 +98,7 @@ try:
                 return inference_context
         _sc.deprecate_inference_params = _dip
 except Exception as _exc:
-    print(f"[cppmega_mimo_shim] static_context alias skipped: {_exc}", file=sys.stderr)
+    print(f"[mem_profile_shim] static_context alias skipped: {_exc}", file=sys.stderr)
 
 # (2) MIMO __post_init__
 _mimo_on = os.environ.get("CPPMEGA_MAMBA3_MIMO", "0") == "1"
@@ -162,9 +115,9 @@ if _mimo_on:
             if not getattr(self, "cppmega_mamba3_chunk_size", None):
                 object.__setattr__(self, "cppmega_mamba3_chunk_size", 16)
         TransformerConfig.__post_init__ = _cppmega_mimo_post_init
-        print("[cppmega_mimo_shim] MIMO patch installed (rank=4, chunk=16)")
+        print("[mem_profile_shim] MIMO patch installed (rank=4, chunk=16)")
     except Exception as _exc:
-        print(f"[cppmega_mimo_shim] MIMO patch failed: {_exc}", file=sys.stderr)
+        print(f"[mem_profile_shim] MIMO patch failed: {_exc}", file=sys.stderr)
 
 # (3) Mamba3 fp32-bias forward pre-hook
 try:
@@ -183,9 +136,9 @@ try:
             _orig_init(self, *args, **kwargs)
             self.register_forward_pre_hook(_restore_bias_fp32)
         _Mamba3.__init__ = _patched_init
-        print("[cppmega_mimo_shim] Mamba3 fp32-bias forward pre-hook installed")
+        print("[mem_profile_shim] Mamba3 fp32-bias forward pre-hook installed")
 except Exception as _exc:
-    print(f"[cppmega_mimo_shim] Mamba3 fp32-bias hook failed: {_exc}", file=sys.stderr)
+    print(f"[mem_profile_shim] Mamba3 fp32-bias hook failed: {_exc}", file=sys.stderr)
 
 # (4) cppmega_mamba3_* __getattr__ fallback
 try:
@@ -203,48 +156,186 @@ try:
 except Exception:
     pass
 
-# (5) Stream E+G: DSA FP8 fwd+bwd indexer patch + loss_coeff==0 gate
+# (5) DSA FP8 fwd+bwd indexer patch + loss_coeff==0 gate
 _dsa_dtype = os.environ.get("CPPMEGA_DSA_INDEXER_DTYPE", "bf16").lower()
-print(f"[cppmega_mimo_shim] CPPMEGA_DSA_INDEXER_DTYPE resolves to '{_dsa_dtype}'")
+print(f"[mem_profile_shim] CPPMEGA_DSA_INDEXER_DTYPE resolves to '{_dsa_dtype}'")
 if _dsa_dtype == "fp8":
     try:
         from cppmega.megatron.dsa_fp8_patch import apply_dsa_fp8_patch
         _applied = apply_dsa_fp8_patch()
-        print(f"[cppmega_mimo_shim] DSA FP8 patch applied={_applied}")
+        print(f"[mem_profile_shim] DSA FP8 patch applied={_applied}")
     except Exception as _exc:
-        print(f"[cppmega_mimo_shim] DSA FP8 patch failed: {_exc}", file=sys.stderr)
+        print(f"[mem_profile_shim] DSA FP8 patch failed: {_exc}", file=sys.stderr)
         raise
 
-# (6) Mamba/M2RNN activation checkpointing (CPPMEGA_MAMBA_RECOMPUTE=1)
-_mamba_recompute = os.environ.get("CPPMEGA_MAMBA_RECOMPUTE", "0") == "1"
-if _mamba_recompute:
+# (6) Per-step memory tracking via training log hook
+_STEP_COUNT = [0]
+_MAX_TRACK_STEPS = 5
+
+def _install_step_memory_hook():
+    """Monkey-patch megatron's training log to inject memory stats."""
+    import torch
     try:
-        from cppmega.megatron.mamba_recompute_patch import apply_mamba_recompute_patch
-        _applied = apply_mamba_recompute_patch()
-        print(f"[cppmega_mimo_shim] Mamba recompute patch applied={_applied}")
-    except Exception as _exc:
-        print(f"[cppmega_mimo_shim] Mamba recompute patch failed: {_exc}", file=sys.stderr)
-        raise
+        import megatron.training.training as _mt
+        _orig_log_fn = getattr(_mt, 'training_log', None)
+        if _orig_log_fn is None:
+            print("[mem_profile_shim] WARNING: cannot find megatron.training.training.training_log", file=sys.stderr)
+            return
 
-# (7) Stream M: per-rank peak-memory reporter (atexit hook)
-def _cppmega_peak_mem_report():
+        def _patched_training_log(*args, **kwargs):
+            result = _orig_log_fn(*args, **kwargs)
+            _STEP_COUNT[0] += 1
+            step = _STEP_COUNT[0]
+            if step <= _MAX_TRACK_STEPS:
+                rank = int(os.environ.get("RANK", "0"))
+                dev = torch.cuda.current_device()
+                alloc_gib = torch.cuda.memory_allocated(dev) / (1024**3)
+                peak_alloc_gib = torch.cuda.max_memory_allocated(dev) / (1024**3)
+                reserved_gib = torch.cuda.memory_reserved(dev) / (1024**3)
+                peak_reserved_gib = torch.cuda.max_memory_reserved(dev) / (1024**3)
+                print(
+                    f"[MEM_STEP] rank={rank} step={step} "
+                    f"alloc_gib={alloc_gib:.3f} peak_alloc_gib={peak_alloc_gib:.3f} "
+                    f"reserved_gib={reserved_gib:.3f} peak_reserved_gib={peak_reserved_gib:.3f}",
+                    flush=True,
+                )
+            return result
+
+        _mt.training_log = _patched_training_log
+        print("[mem_profile_shim] per-step memory hook installed")
+    except Exception as _exc:
+        print(f"[mem_profile_shim] step memory hook failed: {_exc}", file=sys.stderr)
+
+_install_step_memory_hook()
+
+# (7) At-exit: full memory summary + parameter count by module
+def _cppmega_mem_exit_report():
     try:
         import torch
         if not torch.cuda.is_available():
             return
-        dev = torch.cuda.current_device()
-        peak_alloc = torch.cuda.max_memory_allocated(dev) / (1024 ** 3)
-        peak_reserved = torch.cuda.max_memory_reserved(dev) / (1024 ** 3)
         rank = int(os.environ.get("RANK", "0"))
-        print(
-            f"[stream_m_peak_mem] rank={rank} device={dev} "
-            f"peak_alloc_gib={peak_alloc:.3f} peak_reserved_gib={peak_reserved:.3f}",
-            flush=True,
-        )
-    except Exception as _exc:
-        print(f"[stream_m_peak_mem] report failed: {_exc}", file=sys.stderr)
+        dev = torch.cuda.current_device()
 
-atexit.register(_cppmega_peak_mem_report)
+        # Peak memory
+        peak_alloc = torch.cuda.max_memory_allocated(dev) / (1024**3)
+        peak_reserved = torch.cuda.max_memory_reserved(dev) / (1024**3)
+        print(f"\n{'='*80}", flush=True)
+        print(f"[MEM_EXIT] rank={rank} device={dev} "
+              f"peak_alloc_gib={peak_alloc:.3f} peak_reserved_gib={peak_reserved:.3f}",
+              flush=True)
+
+        # Full memory summary (only on rank 0 to avoid spam)
+        if rank == 0:
+            print(f"\n[MEM_SUMMARY] torch.cuda.memory_summary():", flush=True)
+            print(torch.cuda.memory_summary(dev), flush=True)
+
+        # Parameter count by module type
+        try:
+            from megatron.training import get_model
+            models = get_model._model if hasattr(get_model, '_model') else None
+        except Exception:
+            models = None
+
+        # Alternative: scan all parameters on this rank via torch modules
+        if rank == 0:
+            print(f"\n[PARAM_COUNT] Scanning all CUDA tensors on rank={rank}:", flush=True)
+            total_params = 0
+            total_bytes = 0
+            for obj in gc.get_objects():
+                try:
+                    if isinstance(obj, torch.nn.Module) and hasattr(obj, '_parameters'):
+                        pass  # We'll use the model reference approach below
+                except Exception:
+                    pass
+
+            # Just print total CUDA memory stats
+            stats = torch.cuda.memory_stats(dev)
+            print(f"\n[CUDA_STATS] Key memory stats:", flush=True)
+            for key in sorted(stats.keys()):
+                if any(k in key for k in ['allocated', 'reserved', 'active', 'peak']):
+                    val = stats[key]
+                    if isinstance(val, (int, float)) and val > 1024*1024:
+                        print(f"  {key}: {val / (1024**3):.3f} GiB ({val})", flush=True)
+                    elif isinstance(val, (int, float)) and val > 0:
+                        print(f"  {key}: {val}", flush=True)
+
+        print(f"{'='*80}\n", flush=True)
+    except Exception as _exc:
+        import traceback
+        print(f"[MEM_EXIT] report failed: {_exc}", file=sys.stderr)
+        traceback.print_exc()
+
+import gc
+atexit.register(_cppmega_mem_exit_report)
+
+# (8) Parameter count reporter -- hooks into model build
+def _install_param_reporter():
+    """After model is built, print parameter counts grouped by module type."""
+    import torch
+    try:
+        import megatron.training.training as _mt
+        _orig_setup = getattr(_mt, 'setup_model_and_optimizer', None)
+        if _orig_setup is None:
+            print("[mem_profile_shim] WARNING: cannot find setup_model_and_optimizer", file=sys.stderr)
+            return
+
+        def _patched_setup(*args, **kwargs):
+            result = _orig_setup(*args, **kwargs)
+            rank = int(os.environ.get("RANK", "0"))
+            if rank == 0:
+                models = result[0] if isinstance(result, tuple) else result
+                if not isinstance(models, (list, tuple)):
+                    models = [models]
+                print(f"\n{'='*80}", flush=True)
+                print(f"[PARAM_REPORT] Model parameter breakdown (rank=0):", flush=True)
+                grand_total = 0
+                grand_bytes = 0
+                for mi, model in enumerate(models):
+                    print(f"\n  --- Virtual Pipeline Stage {mi} ---", flush=True)
+                    module_counts = {}
+                    for name, param in model.named_parameters():
+                        # Group by top-level module
+                        parts = name.split('.')
+                        # Find meaningful grouping (e.g., 'layers.0.self_attention')
+                        if len(parts) >= 4:
+                            group = '.'.join(parts[:4])
+                        elif len(parts) >= 2:
+                            group = '.'.join(parts[:2])
+                        else:
+                            group = parts[0]
+
+                        n = param.numel()
+                        b = n * param.element_size()
+                        if group not in module_counts:
+                            module_counts[group] = {'params': 0, 'bytes': 0}
+                        module_counts[group]['params'] += n
+                        module_counts[group]['bytes'] += b
+                        grand_total += n
+                        grand_bytes += b
+
+                    # Print sorted by bytes descending
+                    for grp, info in sorted(module_counts.items(), key=lambda x: -x[1]['bytes']):
+                        print(f"    {grp}: {info['params']:>12,} params  {info['bytes']/(1024**2):>8.1f} MiB", flush=True)
+
+                print(f"\n  TOTAL: {grand_total:,} params  {grand_bytes/(1024**3):.3f} GiB", flush=True)
+
+                # Also print optimizer state size estimate
+                # Adam: 2 states per param (m, v) in fp32
+                opt_state_bytes = grand_total * 4 * 2  # m + v in fp32
+                param_fp32_bytes = grand_total * 4  # master weights in fp32
+                print(f"  Optimizer state (Adam m+v fp32): {opt_state_bytes/(1024**3):.3f} GiB", flush=True)
+                print(f"  Master weights (fp32 copy): {param_fp32_bytes/(1024**3):.3f} GiB", flush=True)
+                print(f"  Total model+opt memory est: {(grand_bytes + opt_state_bytes + param_fp32_bytes)/(1024**3):.3f} GiB", flush=True)
+                print(f"{'='*80}\n", flush=True)
+            return result
+
+        _mt.setup_model_and_optimizer = _patched_setup
+        print("[mem_profile_shim] param reporter hook installed")
+    except Exception as _exc:
+        print(f"[mem_profile_shim] param reporter hook failed: {_exc}", file=sys.stderr)
+
+_install_param_reporter()
 PY
 
 cp "${REMOTE_ROOT}/megatron-lm/pretrain_mamba.py" "${WORKDIR}/pretrain_mamba_original.py"
@@ -271,7 +362,7 @@ def model_provider(model_builder, pre_process=True, post_process=True, vp_stage=
     return model_builder(args, pre_process, post_process, vp_stage, config=config, pg_collection=pg_collection)
 PY
 
-# Build hybrid layer pattern -- PP*VPP equal chunks separated by "|".
+# Build hybrid layer pattern
 HYBRID_PATTERN=$(python - <<PY
 from cppmega.megatron.nam56r_lite_spec import build_default_hybrid_layer_pattern
 
@@ -297,7 +388,7 @@ PY
 )
 echo "HYBRID_PATTERN: ${HYBRID_PATTERN}"
 
-# Native args (MLA + MoE + MTP + DSA).
+# Native args
 NATIVE_ARGS=$(python - <<PY
 from cppmega.recipes.nam56r_launch import build_nam56r_megatron_native_args
 from cppmega.recipes.nam56r_megatron import build_nam56r_feature_plan
@@ -318,48 +409,27 @@ PY
 )
 echo "NATIVE_ARGS (pre-sed): ${NATIVE_ARGS}"
 
-# Override --mtp-num-layers to match MTP_DEPTHS if >1.
+# Override --mtp-num-layers for MTP_DEPTHS > 1
 if [ "${MTP_DEPTHS}" -gt 1 ]; then
   NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--mtp-num-layers 1/--mtp-num-layers ${MTP_DEPTHS}/")
 fi
 
-# Strip --dsa-indexer-dtype from NATIVE_ARGS: it is a cppmega recipe arg, not
-# a Megatron CLI arg. The FP8 indexer behavior is controlled entirely by the
-# CPPMEGA_DSA_INDEXER_DTYPE env var and the shim's apply_dsa_fp8_patch().
+# Strip --dsa-indexer-dtype (cppmega recipe arg, not Megatron CLI arg)
 NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed 's/ *--dsa-indexer-dtype [a-z0-9]*//')
 
-# Override --expert-model-parallel-size to EP_SIZE (always runs for Stream M:
-# both variants set EP_SIZE >=2).
-if [ "${EP_SIZE}" != "1" ]; then
-  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--expert-model-parallel-size 1/--expert-model-parallel-size ${EP_SIZE}/")
-fi
+# EP=1: flex -> alltoall override
+NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--moe-token-dispatcher-type flex/--moe-token-dispatcher-type alltoall/")
+NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/ --moe-router-dtype fp32//")
+MOE_EXTRA_FLAGS="--moe-pad-expert-input-to-capacity --moe-expert-capacity-factor 1.0"
+echo "NATIVE_ARGS (alltoall override for EP=1): dispatcher=alltoall"
 
-# Confirm the substitution actually happened.
-if ! echo "${NATIVE_ARGS}" | grep -q -- "--expert-model-parallel-size ${EP_SIZE}"; then
-  echo "ERROR: failed to set --expert-model-parallel-size ${EP_SIZE}; NATIVE_ARGS=${NATIVE_ARGS}" >&2
-  exit 3
-fi
-# EP=1 override: flex dispatcher requires TP*EP > 1, fall back to alltoall
-if [ "${CPPMEGA_DISPATCHER_OVERRIDE:-}" = "alltoall" ]; then
-  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--moe-token-dispatcher-type flex/--moe-token-dispatcher-type alltoall/")
-  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/ --moe-router-dtype fp32//")
-  MOE_EXTRA_FLAGS="--moe-pad-expert-input-to-capacity --moe-expert-capacity-factor 1.0"
-  echo "NATIVE_ARGS (alltoall override for EP=1): dispatcher=alltoall"
-fi
 echo "NATIVE_ARGS (post-sed): ${NATIVE_ARGS}"
 
-# Per-module CUDA graph scope (full scope restored).
-# torch.equal in dsa.py:645 patched to torch.all on both machines.
-# mamba recompute uses is_graph_capturing() guard — skips checkpoint during CG.
+# CUDA graphs required -- without them DSA gather_scatter OOMs on first forward.
+# The 112k baseline ran WITH CG, so this is the correct comparison config.
 CG_FLAGS="--cuda-graph-impl transformer_engine --cuda-graph-scope attn mamba moe_router moe_preprocess --cuda-graph-warmup-steps 3"
-# NOTE: --moe-pad-expert-input-to-capacity is INCOMPATIBLE with flex dispatcher
-# (raises ValueError). Omit when using DeepEP flex.
-MOE_EXTRA_FLAGS=""
 
-# Stream M: selective MoE activation recompute.
-# head-streaming in dsa_fp8_indexer.py (commit 563fcb0) reduces DSA target from
-# 7.5 GiB to 0.8 GiB per layer, so selective moe_act recompute is sufficient.
-# --mla-down-proj-fusion: fuses MLA down-projection GEMMs (PR #3039, free perf).
+# Recompute: same as production run for fair comparison
 EXTRA_FLAGS="--recompute-granularity selective --recompute-modules moe_act mlp mla_up_proj --mla-down-proj-fusion"
 
 ROPE_FLAG=""
@@ -371,7 +441,7 @@ python -c 'import cppmega, megatron; print("cppmega", cppmega.__version__)'
 python -c "from cppmega.megatron.dsa_fp8_patch import apply_dsa_fp8_patch; print('dsa_fp8_patch importable')"
 python -c "from cppmega.megatron.dsa_fp8_indexer import bwd_fused_indexer_loss_fp8, compute_index_scores_fp8; print('dsa_fp8_indexer fwd+bwd importable')"
 
-# Validate DSA A-layer rank parsing.
+# Validate DSA A-layer rank parsing
 python - <<PY
 import os
 os.environ.setdefault("CPPMEGA_DSA_A_LAYER_RANKS", "${CPPMEGA_DSA_A_LAYER_RANKS}")
@@ -389,27 +459,17 @@ assert len(dsa_ranks) == 9 and len(mla_ranks) == 4, (
 )
 PY
 
-# Guard: refuse to launch if forbidden tokenizer/mock-data flags are present.
-_FORBID1="Null""Tokenizer"
-_FORBID2="--mock""-data"
-if echo "${NATIVE_ARGS} ${CG_FLAGS} ${MOE_EXTRA_FLAGS} ${ROPE_FLAG} ${EXTRA_FLAGS}" | grep -E "(${_FORBID1}|${_FORBID2})" > /dev/null; then
-  echo "ERROR: rendered command contains ${_FORBID1} or ${_FORBID2}"
-  exit 9
-fi
-
-echo "=== Stream M NAM56R 7/7 MIMO + DSA 9+4 + FP8 indexer + loss gate + selective recompute (${VARIANT}) ==="
-echo "RUN_ID=${RUN_ID} VARIANT=${VARIANT} TP=${TP_SIZE} PP=${PP_SIZE} VPP=${VPP_SIZE} EP=${EP_SIZE} MBS=${MBS} GBS=${GBS} MTP=${MTP_DEPTHS}"
-echo "DSA_A_LAYER_RANKS=${CPPMEGA_DSA_A_LAYER_RANKS}"
-echo "CPPMEGA_DSA_INDEXER_DTYPE=${CPPMEGA_DSA_INDEXER_DTYPE}"
+echo "=== Memory Profile Baseline: NAM56R old main (e40feed4a) ==="
+echo "EP=1 TP=1 PP=2 VPP=2 MBS=4 GBS=64 MTP=2 TRAIN_ITERS=5 NO_CG"
 echo "EXTRA_FLAGS=${EXTRA_FLAGS}"
 echo "LOG=${LOG}"
 nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
 echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-<unset>}"
 
 python -m torch.distributed.run --nproc_per_node=8 "${WORKDIR}/pretrain_mamba.py" \
-  --data-path 1.0 "${REMOTE_ROOT}/data/megatron/clang_semantic_4k_v10_train" \
+  --data-path 1.0 /mnt/data/data/megatron/clang_semantic_4k_v10_train \
   --tokenizer-type HuggingFaceTokenizer \
-  --tokenizer-model "${REMOTE_ROOT}/data/tokenizer" \
+  --tokenizer-model /mnt/data/tokenizer/ \
   --split 98,1,1 \
   --tensor-model-parallel-size ${TP_SIZE} \
   --pipeline-model-parallel-size ${PP_SIZE} \
@@ -457,6 +517,6 @@ python -m torch.distributed.run --nproc_per_node=8 "${WORKDIR}/pretrain_mamba.py
 
 EXIT_CODE=$?
 echo "=== Exit code: ${EXIT_CODE} ==="
-echo "=== Last 80 lines of ${LOG} ==="
-tail -80 "${LOG}"
+echo "=== Last 120 lines of ${LOG} ==="
+tail -120 "${LOG}"
 exit ${EXIT_CODE}

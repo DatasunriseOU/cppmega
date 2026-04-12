@@ -255,31 +255,42 @@ def apply_dsa_fp8_patch(*, force: bool = False) -> bool:
         return True
 
     def _bwd_fused_indexer_loss_fp8(
-        q,
-        weights,
-        k,
-        query,
-        key,
-        topk_indices,
-        softmax_scale,
-        loss_coeff,
-        sparse_loss,
-        grad_loss,
-        pg_collection,
+        q, weights, k, query, key, topk_indices, softmax_scale,
+        loss_coeff, sparse_loss, *rest_args, **rest_kwargs,
     ):
-        """FP8 replacement for Megatron dsa.bwd_fused_indexer_loss_naive."""
+        """FP8 replacement for Megatron dsa.bwd_fused_indexer_loss_naive.
+
+        PR #3674 added ``mask`` as a new positional arg before ``grad_loss``.
+        We accept *rest_args to handle both old (grad_loss, pg_collection)
+        and new (mask, grad_loss, pg_collection, ...) signatures.
+        """
+        # Extract grad_loss and pg_collection from the tail args.
+        # Old: rest_args = (grad_loss, pg_collection)
+        # New: rest_args = (mask, grad_loss, pg_collection, ...)
+        if len(rest_args) >= 3:
+            # New signature: mask, grad_loss, pg_collection, ...
+            grad_loss = rest_args[1]
+            pg_collection = rest_args[2]
+        elif len(rest_args) == 2:
+            # Old signature: grad_loss, pg_collection
+            grad_loss = rest_args[0]
+            pg_collection = rest_args[1]
+        else:
+            grad_loss = rest_kwargs.get("grad_loss", None)
+            pg_collection = rest_kwargs.get("pg_collection", None)
+
+        # If indexer loss was skipped in forward, return zero gradients
+        if os.environ.get("CPPMEGA_DSA_SKIP_INDEXER_LOSS", "0") == "1":
+            return (
+                torch.zeros_like(q),
+                torch.zeros_like(weights),
+                torch.zeros_like(k),
+            )
+
         return bwd_fused_indexer_loss_fp8(
-            q,
-            weights,
-            k,
-            query,
-            key,
-            topk_indices,
-            softmax_scale,
-            loss_coeff,
-            sparse_loss,
-            grad_loss,
-            pg_collection,
+            q, weights, k, query, key, topk_indices,
+            softmax_scale, loss_coeff, sparse_loss,
+            grad_loss, pg_collection,
         )
 
     setattr(_bwd_fused_indexer_loss_fp8, _BWD_PATCH_MARKER, True)
@@ -401,9 +412,12 @@ def apply_dsa_fp8_patch(*, force: bool = False) -> bool:
                         softmax_scale, loss_coeff, sparse_loss, pg_collection,
                     )
                 # TP > 1: fall through to head_streaming
-            # loss_coeff > 0: upstream compute_dsa_indexer_loss internally
-            # calls _attention_target_fp32 which is now head-streaming
-            # (commit 26ff3ca+). Memory: 0.8 GiB instead of 7.5 GiB.
+            # loss_coeff > 0: upstream compute_dsa_indexer_loss does a full
+            # torch.bmm(query.float(), key.float()) = 7 GiB at sq=sk=4096.
+            # Force loss_coeff=0 gate when CPPMEGA_DSA_SKIP_INDEXER_LOSS=1
+            # (temporary memory workaround — disables indexer loss training).
+            if os.environ.get("CPPMEGA_DSA_SKIP_INDEXER_LOSS", "0") == "1":
+                return torch.zeros((), device=query.device, dtype=torch.float32)
             return _orig_loss(
                 index_scores, topk_indices, query, key,
                 softmax_scale, loss_coeff, sparse_loss, pg_collection,
@@ -476,6 +490,23 @@ def apply_dsa_fp8_patch(*, force: bool = False) -> bool:
                 "cppmega sparse_dsa_fn applied (replaces unfused_dsa_fn: "
                 "7.0 GiB → 28.7 MB attention scores per DSA layer, ~250× reduction)"
             )
+
+    # ------------------------------------------------------------------
+    # Tier 5: Sparse absorbed-MLA DSA attention
+    #
+    # PR #3674 adds _unfused_absorbed_dsa_fn which does full dense matmul
+    # torch.matmul(q.float(), k.float()) = 7 GiB at [b, np, sq, sk].
+    # Replace with sparse gather-scatter that only computes topk entries.
+    # ------------------------------------------------------------------
+    _unfused_absorbed = getattr(dsa_mod, "_unfused_absorbed_dsa_fn", None)
+    if _unfused_absorbed is not None:
+        from cppmega.megatron.dsa_sparse_absorbed import sparse_absorbed_dsa_fn
+
+        dsa_mod._unfused_absorbed_dsa_fn = sparse_absorbed_dsa_fn
+        log.info(
+            "cppmega sparse_absorbed_dsa_fn applied (replaces _unfused_absorbed_dsa_fn: "
+            "7.0 GiB → 0.44 GiB attention scores per absorbed DSA layer, ~16× reduction)"
+        )
 
     # -- KL mode patch: tilelang_fused online-softmax --
     # When CPPMEGA_DSA_KL_MODE=tilelang_fused, replace _attention_target_fp32

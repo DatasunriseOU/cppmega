@@ -6,15 +6,10 @@ inside MambaBlock.forward() are NEVER checkpointed, meaning their full
 intermediate activations (in_proj output, SSM states, M2RNN scan tensors)
 are held in memory for backward.
 
-For NAM56R with 27 Mamba layers + 4 M2RNN layers, this consumes ~28+ GiB
-per microbatch of uncheckpointed activations. With the interleaved 1F1B
-pipeline schedule (PP=2 VPP=2), multiple microbatches' activations are
-live simultaneously, pushing total activation memory above 120 GiB.
-
 This monkey-patch wraps each non-TransformerLayer in MambaBlock.layers
-with a thin wrapper that forwards to ``torch.utils.checkpoint.checkpoint()``,
-so the existing MambaBlock.forward() loop calls them as normal but gets
-automatic activation checkpointing.
+with a thin wrapper that uses ``torch.utils.checkpoint.checkpoint()``
+when NOT inside CUDA graph capture, and runs directly when capturing
+(matching Megatron's ``CheckpointWithoutOutput`` / PR #3919 pattern).
 
 Usage: set ``CPPMEGA_MAMBA_RECOMPUTE=1`` and call ``apply_mamba_recompute_patch()``
 from the training shim (before training loop starts).
@@ -29,17 +24,40 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 logger = logging.getLogger(__name__)
 
+# Import Megatron's CUDA graph state checkers (PR #3919 pattern).
+# These are module-level booleans toggled by CudaGraphManager.
+try:
+    from megatron.core.transformer.cuda_graphs import (
+        is_graph_capturing,
+        is_graph_warmup,
+    )
+except ImportError:
+    def is_graph_capturing():
+        return False
+
+    def is_graph_warmup():
+        return False
+
 
 class _CheckpointedMambaLayerWrapper(torch.nn.Module):
-    """Wraps a Mamba/M2RNN layer to use activation checkpointing."""
+    """Wraps a Mamba/M2RNN layer to use activation checkpointing.
+
+    During CUDA graph capture/warmup, runs the layer directly (no checkpoint)
+    so the ops are recorded into the graph. During normal forward, uses
+    torch.utils.checkpoint to discard activations and recompute in backward.
+    """
 
     def __init__(self, layer: torch.nn.Module):
         super().__init__()
         self.layer = layer
-        # Proxy layer_number for MambaBlock's inner_quant_context
         self.layer_number = getattr(layer, "layer_number", 0)
 
     def forward(self, hidden_states, **kwargs):
+        # During CUDA graph capture/warmup: run directly (PR #3919 pattern)
+        if is_graph_capturing() or is_graph_warmup():
+            return self.layer(hidden_states=hidden_states, **kwargs)
+
+        # Normal forward: use activation checkpoint
         def _run(hs):
             return self.layer(hidden_states=hs, **kwargs)
 
@@ -52,25 +70,25 @@ class _CheckpointedMambaLayerWrapper(torch.nn.Module):
 
 
 def apply_mamba_recompute_patch() -> bool:
-    """Wrap Mamba/M2RNN layers in all MambaBlock instances with checkpoint.
-
-    This is called AFTER model construction but BEFORE training starts.
-    It iterates over all MambaBlock.layers and wraps non-TransformerLayer
-    entries with _CheckpointedMambaLayerWrapper.
-
-    Returns True if any layers were wrapped.
-    """
+    """Wrap Mamba/M2RNN layers in all MambaBlock instances with checkpoint."""
     try:
-        from megatron.core.ssm.mamba_block import MambaBlock
         from megatron.core.transformer.transformer_layer import TransformerLayer
     except ImportError as e:
-        logger.warning("mamba_recompute_patch: cannot import: %s", e)
+        logger.warning("mamba_recompute_patch: cannot import TransformerLayer: %s", e)
         return False
+
+    try:
+        from megatron.core.ssm.mamba_block import MambaBlock
+    except ImportError:
+        try:
+            from megatron.core.ssm.mamba_block import MambaStack as MambaBlock
+        except ImportError as e:
+            logger.warning("mamba_recompute_patch: cannot import MambaBlock/MambaStack: %s", e)
+            return False
 
     if getattr(MambaBlock, "_cppmega_mamba_recompute_patched", False):
         return True
 
-    # Patch the __init__ to auto-wrap layers after construction
     _orig_init = MambaBlock.__init__
 
     def _patched_init(self, *args, **kwargs):
@@ -91,10 +109,10 @@ def apply_mamba_recompute_patch() -> bool:
         if wrapped > 0:
             print(
                 f"[mamba_recompute_patch] Wrapped {wrapped} Mamba/M2RNN layers "
-                f"with activation checkpointing"
+                f"with activation checkpointing (CG-aware)"
             )
 
     MambaBlock.__init__ = _patched_init
     MambaBlock._cppmega_mamba_recompute_patched = True
-    print("[mamba_recompute_patch] Patch installed (will wrap layers on construction)")
+    print("[mamba_recompute_patch] Patch installed (CG-aware: skips checkpoint during graph capture)")
     return True

@@ -315,6 +315,10 @@ if [ "${EP_SIZE}" != "1" ]; then
   NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--expert-model-parallel-size 1/--expert-model-parallel-size ${EP_SIZE}/")
 fi
 
+# Strip --dsa-indexer-dtype (cppmega-only flag not registered in Megatron's
+# argparser; actual FP8 behavior is controlled by CPPMEGA_DSA_INDEXER_DTYPE env).
+NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed 's/--dsa-indexer-dtype [a-z0-9]*//')
+
 # Per-module CUDA graph scope.
 CG_FLAGS="--cuda-graph-impl transformer_engine --cuda-graph-scope attn mamba moe_router moe_preprocess --cuda-graph-warmup-steps 3"
 MOE_EXTRA_FLAGS="--moe-pad-expert-input-to-capacity --moe-expert-capacity-factor 1.0"

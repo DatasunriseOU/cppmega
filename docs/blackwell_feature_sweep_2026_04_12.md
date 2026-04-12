@@ -16,9 +16,9 @@ Status semantics:
 
 ## Model config for every row
 
-| target | layers | hidden | ffn | heads | seq | mbs | gbs | MLA | MTP | MoE |
-|---|---|---|---|---|---|---|---|---|---|---|
-| GB10 single | 26 | 1792 | 9472 | 14 | 2048 | 2 | 2 | yes | hybrid (d=1) | yes (dropless topk=4, 16 experts) |
+| target      | layers | hidden | ffn  | heads | seq  | mbs | gbs | MLA | MTP          | MoE                               |
+| ----------- | ------ | ------ | ---- | ----- | ---- | --- | --- | --- | ------------ | --------------------------------- |
+| GB10 single | 26     | 1792   | 9472 | 14    | 2048 | 2   | 2   | yes | hybrid (d=1) | yes (dropless topk=4, 16 experts) |
 
 Spec: `cppmega.megatron.nam56r_noconv_spec.build_cppmega_nam56r_noconv_stack_spec`
 NEM pattern: `AEMEAEMEAEMR` (depth=26 for half)
@@ -28,12 +28,12 @@ CUDA graph: `transformer_engine` impl, `attn` scope (dropless-MoE compatible)
 
 ## Stack versions
 
-| | GB10 | bench3 H200 (ref) |
-|---|---|---|
-| torch  | 2.12 cu132 (nightly) | same |
-| TE     | 2.13.0 | 2.13.0 |
-| mamba_ssm | 2.3.1 | 2.3.1 |
-| CUTLASS Python DSL | 4.4.2 | n/a |
+|                    | GB10                 | bench3 H200 (ref) |
+| ------------------ | -------------------- | ----------------- |
+| torch              | 2.12 cu132 (nightly) | same              |
+| TE                 | 2.13.0               | 2.13.0            |
+| mamba_ssm          | 2.3.1                | 2.3.1             |
+| CUTLASS Python DSL | 4.4.2                | n/a               |
 
 ## Baseline verification
 
@@ -54,16 +54,16 @@ Baseline log: `gb10:/home/dave/cppmega/cppmega_sweep77_half_baseline_10.log`
 
 ## Results
 
-| target | feature | baseline_tok/s | with_feature_tok/s | delta_% | status | notes |
-|---|---|---|---|---|---|---|
-| GB10 | (0) real data + real HF tokenizer (vs mock) | N/A | 4303.8 | N/A | fixed-input-bug | Prior runs in `cppmega_nam56r_gb10_half_*.log` used NullTokenizer+MockGPTDataset. Wrong tokenizer path in launcher. Fixed in this task. All rows below are real-data numbers. |
-| GB10 | (1) CuTe DSL BF16 warp MMA + TMA wired into Mamba3 fwd | 4303.8 | — | — | BLOCKED (not-wired) | `cppmega/megatron/cute_dsl_mimo/*.py` exist as ISOLATED kernel tests/benchmarks only; nothing imports them from `nam56r_noconv_spec.py` or the mamba builder. End-to-end plumbing is a multi-hour wiring task beyond this sweep. Kernel-level proof still collected (see row 5). |
-| GB10 | (2) FP8 hybrid (`--fp8-format hybrid`) | 4303.8 | 0 (crash) | -100% | BLOCKED (TE assertion) | Crashes in backward at `transformer_engine/common/gemm/cublaslt_gemm.cu:157: CanonicalizeGemmInput: Assertion failed: ret.lda % 16 == 0. Leading dimension requirement on A for FP8 GEMM. Caller must pad.` Reproduced with mbs=2/gbs=2 AND mbs=4/gbs=4 so not a batch-dim issue. NAM56R-half dims are all %16-aligned (hidden 1792, ffn 9472, MLA q_lora/kv_lora 64, qk_head 64, v_head 64, pe 32, moe_ffn 896, num_experts 16) so the offending lda is coming from a weight slice TE materializes internally in the backward — same code path PASSES on bench3 H200 (TE 2.13, cuBLAS 13.2) per `docs/fp8_path_status.md` so it is **GB10 sm_121a + cuBLASLt FP8 specific**. Logged in `docs/upstream_bugs.md`. |
-| GB10 | (3) FP4 DSA (DeepSeek Sparse Attention) indexer | 4303.8 | — | — | BLOCKED (no code) | No DSA indexer is implemented in `cppmega.megatron` at all. `grep -r dsa_indexer cppmega/` returns nothing. `scripts/remote_smoke_h200_dsa*.sh` exists but wires H200 DSA training at the Megatron arg level only — no FP4 indexer module. Feature is plan-only. |
-| GB10 | (4) ThunderKittens FA4-style fused mamba3 kernel | 4303.8 | — | — | BLOCKED (no code) | No ThunderKittens source in `cppmega/` (only doc references in `docs/nam56r_mtp_optimization_plan_*.md`). ThunderKittens requires tcgen05 on Blackwell which GB10 lacks per `reference_sm121_gb10_hw_caps`. The fused-mamba3 adapter in `cppmega/megatron/cute_dsl_mimo/fa4_bwd_adapter*.py` is a CuTe DSL file that uses FA4 patterns but is not wired into training. |
-| GB10 | (5) CuTe DSL kernel-level smoke (health check for feature (1)) | N/A (µs) | 38.46 µs/iter | — | PASS (kernel only) | Ran `/home/dave/PyTorch_cuda_13_1_main_4fd1b9b7/third_party/cutlass/examples/python/CuTeDSL/blackwell_geforce/dense_gemm.py --mnkl 1024,1024,1024,1 --a_dtype BFloat16 --b_dtype BFloat16 --c_dtype BFloat16 --iterations 5 --warmup_iterations 2` on GB10: `PASS` + `Execution time: 38.464 µs/iter`. Matches `docs/gb10_software_stack.md` empirical claim exactly. Confirms CuTe DSL BF16 warp MMA + TMA + persistent scheduler WORK on sm_121a without any compat shim. Only the wiring-to-NAM56R step remains (row 1). |
-| GB10 | (6) TMA single-CTA in mamba3 kernels | 4303.8 | — | — | BLOCKED (wrong kernel path) | `cppmega/megatron/noconv_mamba_mixer.py` uses `mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined` (Triton SSD, not the TileLang mamba3 MIMO kernels). All 4 `mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_{fwd,bwd,fwd_varlen,bwd_varlen}.py` files set `TL_DISABLE_TMA_LOWER: True` but they are not on the NAM56R-half training hot path at all. Flipping the TMA flag is therefore a no-op for this spec. Triton's lowering handles TMA at its own level; Triton MoE/MXFP4 has gaps on sm_121 per `docs/gb10_software_stack.md` but BF16/FP16 works fine. Bottom line: TMA is not a throughput knob on the noconv path. |
-| Modal B200:2 | all features (1-5) | — | — | — | BLOCKED (no training infra) | cppmega has **no** Modal B200 NAM56R training script. Only `scripts/modal_cutile_b200.py`, `scripts/modal_cutile_b200_variant_sweep.py`, and `scripts/modal_cutile_mamba_mimo.py` exist — all three run isolated kernel-level cuTile/TileLang benchmarks on B200, not Megatron training. Writing a Modal B200 Megatron NAM56R launcher (image build + megatron clone + TE source-build + data mount + tokenizer mount + pretrain_mamba wrapper) would take several hours and multiple Modal billable runs, which exceeds this sweep task's budget. Deferring to a dedicated task. The existing `docs/modal_b200_cutile_variant_sweep_2026_04_11.md` already covers the kernel-level B200 results. |
+| target       | feature                                                        | baseline_tok/s | with_feature_tok/s | delta_% | status                      | notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ------------ | -------------------------------------------------------------- | -------------- | ------------------ | ------- | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GB10         | (0) real data + real HF tokenizer (vs mock)                    | N/A            | 4303.8             | N/A     | fixed-input-bug             | Prior runs in `cppmega_nam56r_gb10_half_*.log` used NullTokenizer+MockGPTDataset. Wrong tokenizer path in launcher. Fixed in this task. All rows below are real-data numbers.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| GB10         | (1) CuTe DSL BF16 warp MMA + TMA wired into Mamba3 fwd         | 4303.8         | —                  | —       | BLOCKED (not-wired)         | `cppmega/megatron/cute_dsl_mimo/*.py` exist as ISOLATED kernel tests/benchmarks only; nothing imports them from `nam56r_noconv_spec.py` or the mamba builder. End-to-end plumbing is a multi-hour wiring task beyond this sweep. Kernel-level proof still collected (see row 5).                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| GB10         | (2) FP8 hybrid (`--fp8-format hybrid`)                         | 4303.8         | 0 (crash)          | -100%   | BLOCKED (TE assertion)      | Crashes in backward at `transformer_engine/common/gemm/cublaslt_gemm.cu:157: CanonicalizeGemmInput: Assertion failed: ret.lda % 16 == 0. Leading dimension requirement on A for FP8 GEMM. Caller must pad.` Reproduced with mbs=2/gbs=2 AND mbs=4/gbs=4 so not a batch-dim issue. NAM56R-half dims are all %16-aligned (hidden 1792, ffn 9472, MLA q_lora/kv_lora 64, qk_head 64, v_head 64, pe 32, moe_ffn 896, num_experts 16) so the offending lda is coming from a weight slice TE materializes internally in the backward — same code path PASSES on bench3 H200 (TE 2.13, cuBLAS 13.2) per `docs/fp8_path_status.md` so it is **GB10 sm_121a + cuBLASLt FP8 specific**. Logged in `docs/upstream_bugs.md`. |
+| GB10         | (3) FP4 DSA (DeepSeek Sparse Attention) indexer                | 4303.8         | —                  | —       | BLOCKED (no code)           | No DSA indexer is implemented in `cppmega.megatron` at all. `grep -r dsa_indexer cppmega/` returns nothing. `scripts/remote_smoke_h200_dsa*.sh` exists but wires H200 DSA training at the Megatron arg level only — no FP4 indexer module. Feature is plan-only.                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| GB10         | (4) ThunderKittens FA4-style fused mamba3 kernel               | 4303.8         | —                  | —       | BLOCKED (no code)           | No ThunderKittens source in `cppmega/` (only doc references in `docs/nam56r_mtp_optimization_plan_*.md`). ThunderKittens requires tcgen05 on Blackwell which GB10 lacks per `reference_sm121_gb10_hw_caps`. The fused-mamba3 adapter in `cppmega/megatron/cute_dsl_mimo/fa4_bwd_adapter*.py` is a CuTe DSL file that uses FA4 patterns but is not wired into training.                                                                                                                                                                                                                                                                                                                                           |
+| GB10         | (5) CuTe DSL kernel-level smoke (health check for feature (1)) | N/A (µs)       | 38.46 µs/iter      | —       | PASS (kernel only)          | Ran `/home/dave/PyTorch_cuda_13_1_main_4fd1b9b7/third_party/cutlass/examples/python/CuTeDSL/blackwell_geforce/dense_gemm.py --mnkl 1024,1024,1024,1 --a_dtype BFloat16 --b_dtype BFloat16 --c_dtype BFloat16 --iterations 5 --warmup_iterations 2` on GB10: `PASS` + `Execution time: 38.464 µs/iter`. Matches `docs/gb10_software_stack.md` empirical claim exactly. Confirms CuTe DSL BF16 warp MMA + TMA + persistent scheduler WORK on sm_121a without any compat shim. Only the wiring-to-NAM56R step remains (row 1).                                                                                                                                                                                      |
+| GB10         | (6) TMA single-CTA in mamba3 kernels                           | 4303.8         | —                  | —       | BLOCKED (wrong kernel path) | `cppmega/megatron/noconv_mamba_mixer.py` uses `mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined` (Triton SSD, not the TileLang mamba3 MIMO kernels). All 4 `mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_{fwd,bwd,fwd_varlen,bwd_varlen}.py` files set `TL_DISABLE_TMA_LOWER: True` but they are not on the NAM56R-half training hot path at all. Flipping the TMA flag is therefore a no-op for this spec. Triton's lowering handles TMA at its own level; Triton MoE/MXFP4 has gaps on sm_121 per `docs/gb10_software_stack.md` but BF16/FP16 works fine. Bottom line: TMA is not a throughput knob on the noconv path.                                                                                |
+| Modal B200:2 | all features (1-5)                                             | —              | —                  | —       | BLOCKED (no training infra) | cppmega has **no** Modal B200 NAM56R training script. Only `scripts/modal_cutile_b200.py`, `scripts/modal_cutile_b200_variant_sweep.py`, and `scripts/modal_cutile_mamba_mimo.py` exist — all three run isolated kernel-level cuTile/TileLang benchmarks on B200, not Megatron training. Writing a Modal B200 Megatron NAM56R launcher (image build + megatron clone + TE source-build + data mount + tokenizer mount + pretrain_mamba wrapper) would take several hours and multiple Modal billable runs, which exceeds this sweep task's budget. Deferring to a dedicated task. The existing `docs/modal_b200_cutile_variant_sweep_2026_04_11.md` already covers the kernel-level B200 results.                |
 
 ## Upstream bug log
 
@@ -96,23 +96,23 @@ Modal run: https://modal.com/apps/jewelmusic/main/ap-FnXZ31G6Q0D6nIqJglAtdU
 **Production shape (NAM56R, verified against `cppmega/recipes/megatron_args.py`
 lines 38/54-57):**
 
-| param | value |
-|---|---|
-| hidden_size | 3584 |
-| q_lora_rank | 64 |
-| index_n_heads | 8 |
-| index_head_dim | 64 |
-| index_topk | 16 |
-| batch | 4 |
-| seqlen | 4096 |
+| param          | value |
+| -------------- | ----- |
+| hidden_size    | 3584  |
+| q_lora_rank    | 64    |
+| index_n_heads  | 8     |
+| index_head_dim | 64    |
+| index_topk     | 16    |
+| batch          | 4     |
+| seqlen         | 4096  |
 
 ### Latency table (mean µs, lower is better)
 
-| dtype | linear_fwd_µs | linear_bwd_µs | index_compute_fwd_µs | index_compute_bwd_µs | fused_qk_topk_µs | peak_memory_MB | topk_overlap_vs_bf16% |
-|---|---|---|---|---|---|---|---|
-| BF16 | 5462.3 | 13482.1 | 3011.7 | 8191.5 | 4163.0 | 6726.6 | 100.0 |
-| FP8  | 6082.4 (+11.4%) | 14081.7 (+4.4%) | 3028.0 (+0.5%) | 8269.0 (+0.9%) | 4181.6 (+0.4%) | 6875.1 (+2.2%) | 0.41 |
-| FP4  | SKIPPED — TE 2.1.0 has no FP4 recipe | — | — | — | — | — | — |
+| dtype | linear_fwd_µs                        | linear_bwd_µs   | index_compute_fwd_µs | index_compute_bwd_µs | fused_qk_topk_µs | peak_memory_MB | topk_overlap_vs_bf16% |
+| ----- | ------------------------------------ | --------------- | -------------------- | -------------------- | ---------------- | -------------- | --------------------- |
+| BF16  | 5462.3                               | 13482.1         | 3011.7               | 8191.5               | 4163.0           | 6726.6         | 100.0                 |
+| FP8   | 6082.4 (+11.4%)                      | 14081.7 (+4.4%) | 3028.0 (+0.5%)       | 8269.0 (+0.9%)       | 4181.6 (+0.4%)   | 6875.1 (+2.2%) | 0.41                  |
+| FP4   | SKIPPED — TE 2.1.0 has no FP4 recipe | —               | —                    | —                    | —                | —              | —                     |
 
 (p50/p99 tracked but omitted for compactness; always within ±5% of mean.)
 

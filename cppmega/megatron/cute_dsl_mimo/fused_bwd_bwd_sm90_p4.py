@@ -52,6 +52,24 @@ except Exception:
 import cuda.bindings.driver as cuda
 
 
+def _pick_bench_device():
+    """Prefer an actually-available CUDA device on busy multi-GPU hosts."""
+    if not torch.cuda.is_available():
+        return 'cuda'
+
+    best_idx = 0
+    best_free = -1
+    for idx in range(torch.cuda.device_count()):
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(idx)
+        except Exception:
+            continue
+        if free_bytes > best_free:
+            best_free = free_bytes
+            best_idx = idx
+    return f'cuda:{best_idx}'
+
+
 class FusedBwdBwdP4:
     """Phase 4: 10-GEMM fused bwd_bwd with loop-carried dstates."""
 
@@ -110,11 +128,17 @@ class FusedBwdBwdP4:
         sDPh_T = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
         sPsi  = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
         sSts  = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
-        sLKQ  = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
-        sDKI  = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
+        # Keep lkq/dki scratch isolated from the output-staging alias. This makes
+        # the next narrow banking/prefetch layer local to GEMM3/GEMM7 without
+        # perturbing the current sOut = sK locality.
+        sLKQ0 = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
+        sLKQ1 = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
+        sDKI0 = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
+        sDKI1 = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
         sK_T0  = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
         sK_T1  = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
-        sDKI_T = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
+        sDKI_T0 = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
+        sDKI_T1 = smem.allocate_tensor(self.dtype, sLayout_64x64.outer, swizzle=sLayout_64x64.inner)
         # sK dies after GEMM2. Reuse it as the output staging scratch instead of
         # keeping a separate resident sOut tile for the four per-chunk outputs
         # and the final dstates writeback.
@@ -124,7 +148,6 @@ class FusedBwdBwdP4:
         thr_s2g = copy_s2g.get_slice(tidx)
         wg_mma = tiled_mma.get_slice(tidx)
         shape_mnk = (fcs, N, N)
-
         # Loop-carried dstates accumulator (zero-init BEFORE the chunk loop)
         acc_dstates = cute.make_rmem_tensor(
             wg_mma.partition_shape_C((N, P)), Float32
@@ -135,6 +158,13 @@ class FusedBwdBwdP4:
             first_chunk_idx = nchunks - 1
             cute.copy(copy_g2s, thr_g2s.partition_S(gKT_all[first_chunk_idx, None, None]), thr_g2s.partition_D(sK_T0))
         arch.sync_threads()
+
+        sLKQ_cur = sLKQ0
+        sDKI_cur = sDKI0
+        sLKQ_next = sLKQ1
+        sDKI_next = sDKI1
+        sDKI_T_cur = sDKI_T0
+        sDKI_T_next = sDKI_T1
 
         for chunk_rev in cutlass.range(nchunks, unroll=1):
             chunk_idx = nchunks - 1 - chunk_rev
@@ -212,8 +242,23 @@ class FusedBwdBwdP4:
             )
 
             # R2S: spill lkq for GEMM3 and dki for GEMM7/9
+            if (chunk_rev & 1) == 0:
+                sLKQ_cur = sLKQ0
+                sDKI_cur = sDKI0
+                sLKQ_next = sLKQ1
+                sDKI_next = sDKI1
+                sDKI_T_cur = sDKI_T0
+                sDKI_T_next = sDKI_T1
+            else:
+                sLKQ_cur = sLKQ1
+                sDKI_cur = sDKI1
+                sLKQ_next = sLKQ0
+                sDKI_next = sDKI0
+                sDKI_T_cur = sDKI_T1
+                sDKI_T_next = sDKI_T0
+
             copy_r2s_lkq, _, _ = copy_utils.get_smem_store_C(
-                tiled_mma, sLKQ, tidx, arch=90, position_independent=True,
+                tiled_mma, sLKQ_cur, tidx, arch=90, position_independent=True,
             )
             lkq_frg = layout_utils.reshape_acc_to_frgA(acc_lkq)
             lkq_cvt = cute.make_rmem_tensor_like(lkq_frg, self.dtype)
@@ -221,7 +266,7 @@ class FusedBwdBwdP4:
             copy_r2s_lkq(lkq_cvt)
 
             copy_r2s_dki, _, _ = copy_utils.get_smem_store_C(
-                tiled_mma, sDKI, tidx, arch=90, position_independent=True,
+                tiled_mma, sDKI_cur, tidx, arch=90, position_independent=True,
             )
             dki_frg = layout_utils.reshape_acc_to_frgA(acc_dki)
             dki_cvt = cute.make_rmem_tensor_like(dki_frg, self.dtype)
@@ -229,26 +274,42 @@ class FusedBwdBwdP4:
             copy_r2s_dki(dki_cvt)
 
             # sLKQ/sDKI become live here and are consumed immediately by GEMM3/GEMM7.
-            # Fence them early instead of waiting on the separate dki_T spill for GEMM9.
+            # Keep a neighboring bank selected now so the next chunk can take it
+            # without perturbing the current sOut path.
             arch.fence_view_async_shared()
             arch.sync_threads()
 
             # === GEMM3: dPsiV += lkq @ DPh^T ===
-            _, tA3, tB3 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sLKQ, sDPh)
+            _, tA3, tB3 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sLKQ_cur, sDPh)
             sm90_utils.gemm(tiled_mma, acc_dPsiV, tA3, tB3, zero_init=False, wg_wait=0)
 
             # === GEMM7: dk += dki @ Q (via pre-transposed Q_T) ===
-            _, tA7, tB7 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDKI, sQ_T)
+            _, tA7, tB7 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDKI_cur, sQ_T)
             sm90_utils.gemm(tiled_mma, acc_dk, tA7, tB7, zero_init=False, wg_wait=0)
+
+            # Touch the next-bank descriptors before leaving the scratch window so
+            # adjacent chunk handoff stays local to lkq/dki banking only.
+            if next_chunk_idx >= 0:
+                copy_utils.get_smem_store_C(
+                    tiled_mma, sLKQ_next, tidx, arch=90, position_independent=True,
+                )
+                copy_utils.get_smem_store_C(
+                    tiled_mma, sDKI_next, tidx, arch=90, position_independent=True,
+                )
 
             # R2S: spill dki_T for GEMM9
             copy_r2s_dki_T, _, _ = copy_utils.get_smem_store_C(
-                tiled_mma, sDKI_T, tidx, arch=90, position_independent=True,
+                tiled_mma, sDKI_T_cur, tidx, arch=90, position_independent=True,
             )
             dki_T_frg = layout_utils.reshape_acc_to_frgA(acc_dki_T)
             dki_T_cvt = cute.make_rmem_tensor_like(dki_T_frg, self.dtype)
             dki_T_cvt.store(dki_T_frg.load().to(self.dtype))
             copy_r2s_dki_T(dki_T_cvt)
+
+            if next_chunk_idx >= 0:
+                copy_utils.get_smem_store_C(
+                    tiled_mma, sDKI_T_next, tidx, arch=90, position_independent=True,
+                )
 
             arch.fence_view_async_shared()
             arch.sync_threads()
@@ -261,7 +322,7 @@ class FusedBwdBwdP4:
                 arch.sync_threads()
 
                 # === GEMM9: dq += dki^T @ K (via pre-transposed K_T and computed dki_T) ===
-                _, tA9, tB9 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDKI_T, sK_T0)
+                _, tA9, tB9 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDKI_T_cur, sK_T0)
                 sm90_utils.gemm(tiled_mma, acc_dq, tA9, tB9, zero_init=False, wg_wait=0)
             else:
                 if next_chunk_idx >= 0:
@@ -269,7 +330,7 @@ class FusedBwdBwdP4:
                 arch.sync_threads()
 
                 # === GEMM9: dq += dki^T @ K (via pre-transposed K_T and computed dki_T) ===
-                _, tA9, tB9 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDKI_T, sK_T1)
+                _, tA9, tB9 = sm90_utils.partition_fragment_ABC(wg_mma, shape_mnk, sDKI_T_cur, sK_T1)
                 sm90_utils.gemm(tiled_mma, acc_dq, tA9, tB9, zero_init=False, wg_wait=0)
 
             # === Store per-chunk outputs ===
@@ -460,59 +521,61 @@ def bench(shape_label, B, S, H):
     nchunks = S // chunk_size
     fcs = chunk_size * R
     total = B * H
+    dev = _pick_bench_device()
 
-    print(f'\n=== Phase 4 10-GEMM, {shape_label}: B={B} S={S} H={H} chunks={nchunks} total_CTAs={total} ===')
+    print(f'\n=== Phase 4 10-GEMM, {shape_label}: B={B} S={S} H={H} chunks={nchunks} total_CTAs={total} dev={dev} ===')
 
-    torch.manual_seed(42)
-    dev = 'cuda'
-    K = torch.randn(total, nchunks, fcs, N, dtype=torch.bfloat16, device=dev)
-    Q = torch.randn(total, nchunks, fcs, N, dtype=torch.bfloat16, device=dev)
-    Dst = torch.randn(total, nchunks, N, P, dtype=torch.bfloat16, device=dev)
-    DPh = torch.randn(total, nchunks, fcs, P, dtype=torch.bfloat16, device=dev)
-    Psi = torch.randn(total, nchunks, fcs, P, dtype=torch.bfloat16, device=dev)
-    Sts = torch.randn(total, nchunks, N, P, dtype=torch.bfloat16, device=dev)
-    DPsiV = torch.zeros(total, nchunks, fcs, P, dtype=torch.bfloat16, device=dev)
-    DK = torch.zeros(total, nchunks, fcs, N, dtype=torch.bfloat16, device=dev)
-    DQ = torch.zeros(total, nchunks, fcs, N, dtype=torch.bfloat16, device=dev)
-    Dqkd = torch.zeros(total, nchunks, fcs, fcs, dtype=torch.bfloat16, device=dev)
-    DstO = torch.zeros(total, N, P, dtype=torch.bfloat16, device=dev)  # no chunk axis
+    dev_index = torch.device(dev).index or 0
+    with torch.cuda.device(dev_index):
+        torch.manual_seed(42)
+        K = torch.randn(total, nchunks, fcs, N, dtype=torch.bfloat16, device=dev)
+        Q = torch.randn(total, nchunks, fcs, N, dtype=torch.bfloat16, device=dev)
+        Dst = torch.randn(total, nchunks, N, P, dtype=torch.bfloat16, device=dev)
+        DPh = torch.randn(total, nchunks, fcs, P, dtype=torch.bfloat16, device=dev)
+        Psi = torch.randn(total, nchunks, fcs, P, dtype=torch.bfloat16, device=dev)
+        Sts = torch.randn(total, nchunks, N, P, dtype=torch.bfloat16, device=dev)
+        DPsiV = torch.zeros(total, nchunks, fcs, P, dtype=torch.bfloat16, device=dev)
+        DK = torch.zeros(total, nchunks, fcs, N, dtype=torch.bfloat16, device=dev)
+        DQ = torch.zeros(total, nchunks, fcs, N, dtype=torch.bfloat16, device=dev)
+        Dqkd = torch.zeros(total, nchunks, fcs, fcs, dtype=torch.bfloat16, device=dev)
+        DstO = torch.zeros(total, N, P, dtype=torch.bfloat16, device=dev)  # no chunk axis
 
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        stream = cuda.CUstream(torch.cuda.current_stream(device=dev).cuda_stream)
 
-    t0 = time.time()
-    run_p4(N, P, R, chunk_size, K, Q, Dst, DPh, Psi, Sts,
-           DPsiV, DK, DQ, Dqkd, DstO, nchunks, H, B, stream)
-    torch.cuda.synchronize()
-    print(f'Compile+launch: {time.time()-t0:.2f}s')
+        t0 = time.time()
+        run_p4(N, P, R, chunk_size, K, Q, Dst, DPh, Psi, Sts,
+               DPsiV, DK, DQ, Dqkd, DstO, nchunks, H, B, stream)
+        torch.cuda.synchronize(device=dev_index)
+        print(f'Compile+launch: {time.time()-t0:.2f}s')
 
     # Spot check: dstates for hb=0 = sum over chunks of Q[c]^T @ DPh[c]
-    dstates_ref = torch.zeros(N, P, dtype=torch.float32, device=dev)
-    for c in range(nchunks):
-        q_c = Q[0, c].float()   # (fcs, N)
-        dph_c = DPh[0, c].float()  # (fcs, P)
-        dstates_ref += q_c.T @ dph_c
-    diff = (DstO[0].float() - dstates_ref).abs()
-    max_err = diff.max().item()
-    max_ref = dstates_ref.abs().max().item()
-    print(f'dStates (GEMM10) check hb0: max_err={max_err:.2f} rel={max_err/max(max_ref,1e-8):.4f}  max_ref={max_ref:.2f}')
+        dstates_ref = torch.zeros(N, P, dtype=torch.float32, device=dev)
+        for c in range(nchunks):
+            q_c = Q[0, c].float()   # (fcs, N)
+            dph_c = DPh[0, c].float()  # (fcs, P)
+            dstates_ref += q_c.T @ dph_c
+        diff = (DstO[0].float() - dstates_ref).abs()
+        max_err = diff.max().item()
+        max_ref = dstates_ref.abs().max().item()
+        print(f'dStates (GEMM10) check hb0: max_err={max_err:.2f} rel={max_err/max(max_ref,1e-8):.4f}  max_ref={max_ref:.2f}')
 
     # Benchmark
-    for _ in range(15):
-        run_p4(N, P, R, chunk_size, K, Q, Dst, DPh, Psi, Sts,
-               DPsiV, DK, DQ, Dqkd, DstO, nchunks, H, B, stream)
-    torch.cuda.synchronize()
-    s = torch.cuda.Event(enable_timing=True)
-    e = torch.cuda.Event(enable_timing=True)
-    iters = 200 if total < 50 else 50
-    s.record()
-    for _ in range(iters):
-        run_p4(N, P, R, chunk_size, K, Q, Dst, DPh, Psi, Sts,
-               DPsiV, DK, DQ, Dqkd, DstO, nchunks, H, B, stream)
-    e.record()
-    torch.cuda.synchronize()
-    us = s.elapsed_time(e) * 1000 / iters
-    print(f'Fused 10-GEMM: {us:.1f} us')
-    return us
+        for _ in range(15):
+            run_p4(N, P, R, chunk_size, K, Q, Dst, DPh, Psi, Sts,
+                   DPsiV, DK, DQ, Dqkd, DstO, nchunks, H, B, stream)
+        torch.cuda.synchronize(device=dev_index)
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        iters = 200 if total < 50 else 50
+        s.record()
+        for _ in range(iters):
+            run_p4(N, P, R, chunk_size, K, Q, Dst, DPh, Psi, Sts,
+                   DPsiV, DK, DQ, Dqkd, DstO, nchunks, H, B, stream)
+        e.record()
+        torch.cuda.synchronize(device=dev_index)
+        us = s.elapsed_time(e) * 1000 / iters
+        print(f'Fused 10-GEMM: {us:.1f} us')
+        return us
 
 
 if __name__ == '__main__':

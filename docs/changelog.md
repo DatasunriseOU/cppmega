@@ -95,15 +95,15 @@ formula.  Switching to `tl.inline_asm_elementwise` with the raw
 
 **H200 microbench at NAM56R dims (B=2 S=4096 H=8 K=64 V=16, bf16):**
 
-| kernel variant               | fwd (ms) | fwd+bwd (ms) |
-|------------------------------|---------:|-------------:|
-| manual stable-tanh (smoke13) |    4.82  |       16.18  |
-| `libdevice.tanh` (polynomial)|    5.88  |       19.64  |
-| inline PTX `tanh.approx.f32` |    3.97  |       15.08  |
-| + bwd loads saved `h_new`    |    3.92  |       12.95  |
-| num_warps=2 (rejected)       |    6.76  |       17.44  |
-| num_warps=8 (rejected)       |    3.95  |       16.07  |
-| input_precision=tf32 (rejected — breaks fp32 parity test) | 3.74 | 11.58 |
+| kernel variant                                            | fwd (ms) | fwd+bwd (ms) |
+| --------------------------------------------------------- | -------: | -----------: |
+| manual stable-tanh (smoke13)                              |     4.82 |        16.18 |
+| `libdevice.tanh` (polynomial)                             |     5.88 |        19.64 |
+| inline PTX `tanh.approx.f32`                              |     3.97 |        15.08 |
+| + bwd loads saved `h_new`                                 |     3.92 |        12.95 |
+| num_warps=2 (rejected)                                    |     6.76 |        17.44 |
+| num_warps=8 (rejected)                                    |     3.95 |        16.07 |
+| input_precision=tf32 (rejected — breaks fp32 parity test) |     3.74 |        11.58 |
 
 Final kernel (inline PTX tanh + saved h_new + num_warps=4): fwd=3.92 ms,
 fwd+bwd=12.95 ms. fwd −18.7%, fwd+bwd −20.0% vs the manual stable-tanh
@@ -113,10 +113,10 @@ bench3 H200 and GB10 (sm_121).
 **End-to-end smoke14 on bench3 H200×8 (15 iter, PP=4 MBS=2 GBS=16
 seq=4096 BF16 te_attn graphs, identical config to smoke13):**
 
-| run     | iter 5-15 mean (ms) | first loss | last loss | NaN |
-|---------|--------------------:|-----------:|----------:|:---:|
-| smoke13 (manual stable)  | 1396.98 | 12.499 | 7.753 | no |
-| smoke14 (inline PTX + h_new save) | 1365.15 | 12.499 | 7.822 | no |
+| run                               | iter 5-15 mean (ms) | first loss | last loss |  NaN  |
+| --------------------------------- | ------------------: | ---------: | --------: | :---: |
+| smoke13 (manual stable)           |             1396.98 |     12.499 |     7.753 |  no   |
+| smoke14 (inline PTX + h_new save) |             1365.15 |     12.499 |     7.822 |  no   |
 
 Training-time delta: −31.8 ms/iter (−2.28%). Modest gain vs the
 microbench's 3.2 ms kernel-level win per call because the 4 R-layers
@@ -169,12 +169,12 @@ guards, not any upstream bug. Smoke-tested on 8× H200
 --fp8-amax-compute-algo max --cuda-graph-impl none`, 5 iters, PP=4,
 MBS=2, GBS=16, NAM56R feature plan with MLA+MTP+MoE:
 
-| Path | Spec                                   | FP8 result | iter 3-5 ms |
-|------|----------------------------------------|-----------|-------------|
-| A    | `mamba3_te_stack_spec`                 | PASS      | 1116/1082/1064 |
-| B    | `mamba3_author_spec` (SISO)            | PASS      | 1416/1082/1047 |
-| C    | `mamba3_author_spec` + MIMO rank=4     | FAIL (historical on one env) | backward originally failed in one local `mamba3_mimo_bwd.py` install; this was later fixed and is not the current TP bottleneck |
-| D    | `nam56r_noconv_spec` (NoConvBC + M2RNN)| PASS      | 38279/37625/37909 |
+| Path | Spec                                    | FP8 result                   | iter 3-5 ms                                                                                                                     |
+| ---- | --------------------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| A    | `mamba3_te_stack_spec`                  | PASS                         | 1116/1082/1064                                                                                                                  |
+| B    | `mamba3_author_spec` (SISO)             | PASS                         | 1416/1082/1047                                                                                                                  |
+| C    | `mamba3_author_spec` + MIMO rank=4      | FAIL (historical on one env) | backward originally failed in one local `mamba3_mimo_bwd.py` install; this was later fixed and is not the current TP bottleneck |
+| D    | `nam56r_noconv_spec` (NoConvBC + M2RNN) | PASS                         | 38279/37625/37909                                                                                                               |
 
 Path C's failure above was a historical local-environment issue in one
 installed `mamba3_mimo_bwd.py` wrapper, not the durable explanation for
@@ -303,10 +303,10 @@ head-to-head at NAM56R shapes: hidden=3584, nheads=112, ngroups=8, d_state=64,
 head_dim=64, seq=4096, batch=2, bf16, single layer, fwd+bwd per iter, warmup=3,
 timed=10.  Single H200 GPU, no TP/PP/CP.
 
-| Config | ms/iter fwd+bwd | Params | Overhead |
-|---|---|---|---|
-| `NoConvMambaMixer` (baseline) | 9.4-9.6 | 429,080 | — |
-| `NoConvMamba3BCMixer` (QK-Norm + B/C bias) | 9.95-9.98 | 429,336 (+256) | +3.8% to +6.1% |
+| Config                                     | ms/iter fwd+bwd | Params         | Overhead       |
+| ------------------------------------------ | --------------- | -------------- | -------------- |
+| `NoConvMambaMixer` (baseline)              | 9.4-9.6         | 429,080        | —              |
+| `NoConvMamba3BCMixer` (QK-Norm + B/C bias) | 9.95-9.98       | 429,336 (+256) | +3.8% to +6.1% |
 
 So the Python preprocessing (2 rms_norms + 2 elementwise multiplies + 2
 adds + dtype downcast) costs ~3.8-6.1% on top of the scan kernel.  At full
@@ -386,47 +386,47 @@ data-dependent A, complex RoPE, QK-Norm, B/C bias, no-conv, MIMO rank-4.
 
 ### Final benchmark table (8xH200, BF16, MBS=4, GBS=32)
 
-| Config | Mamba3 features | ms/iter | tok/sec | vs Baseline |
-|--------|-----------------|---------|---------|-------------|
-| Baseline (Mamba-2 SSD) | 0/7 | 748 | 175k | — |
-| CppMegaMamba3Mixer (native SSD) | 2/7 | 784 | 167k | +4.9% |
-| Author SISO + local graphs | 6/7 (no MIMO) | 796 | 165k | +6.4% |
-| **Author MIMO R=4 + local graphs** | **7/7** | **1267** | **103k** | **+69%** |
+| Config                             | Mamba3 features | ms/iter  | tok/sec  | vs Baseline |
+| ---------------------------------- | --------------- | -------- | -------- | ----------- |
+| Baseline (Mamba-2 SSD)             | 0/7             | 748      | 175k     | —           |
+| CppMegaMamba3Mixer (native SSD)    | 2/7             | 784      | 167k     | +4.9%       |
+| Author SISO + local graphs         | 6/7 (no MIMO)   | 796      | 165k     | +6.4%       |
+| **Author MIMO R=4 + local graphs** | **7/7**         | **1267** | **103k** | **+69%**    |
 
 ### MIMO overhead breakdown (+59% over SISO) — nsys measured
 
 Profiled with `nsys profile --trace=cuda,nvtx` on 8-layer isolated iter-4 window.
 The +12.3 ms kernel-time delta (MIMO vs SISO) breaks down as:
 
-| Category | SISO ms | MIMO ms | Delta |
-|---|---|---|---|
-| **mamba_custom** (Triton/TileLang scan+proj) | 2.77 | **12.99** | **+10.22** |
-| elementwise (pointwise/copy/activation) | 11.62 | 12.31 | +0.69 |
-| gemm_cublaslt (linear proj + FFN) | 6.55 | 6.59 | +0.04 |
-| attn_flash (cuDNN SDPA) | 2.30 | 2.30 | 0 |
-| reduce | 1.78 | 2.48 | +0.70 |
-| optimizer (Adam) | 0.91 | 0.92 | 0 |
-| layernorm | 0.38 | 0.73 | +0.35 |
-| Other | 1.01 | 1.04 | 0 |
+| Category                                     | SISO ms | MIMO ms   | Delta      |
+| -------------------------------------------- | ------- | --------- | ---------- |
+| **mamba_custom** (Triton/TileLang scan+proj) | 2.77    | **12.99** | **+10.22** |
+| elementwise (pointwise/copy/activation)      | 11.62   | 12.31     | +0.69      |
+| gemm_cublaslt (linear proj + FFN)            | 6.55    | 6.59      | +0.04      |
+| attn_flash (cuDNN SDPA)                      | 2.30    | 2.30      | 0          |
+| reduce                                       | 1.78    | 2.48      | +0.70      |
+| optimizer (Adam)                             | 0.91    | 0.92      | 0          |
+| layernorm                                    | 0.38    | 0.73      | +0.35      |
+| Other                                        | 1.01    | 1.04      | 0          |
 
 **83% of the overhead is in the Author Mamba kernels themselves** — everything else flat.
 GEMM, attention, elementwise ops are unchanged.
 
 Author Mamba kernels breakdown per iter (4 M-layers):
 
-| Kernel | SISO ms | MIMO ms |
-|---|---|---|
-| mamba3_siso_fwd_kernel | 0.907 | — |
-| mamba3_siso_bwd_kernel_dqkv | 0.847 | — |
-| mamba3_siso_bwd_kernel_rotary_bias_angles | 0.446 | — |
-| mamba3_siso_bwd_kernel_dzdo | 0.178 | — |
-| angle_dt_bwd_kernel | 0.205 | — |
-| **SISO subtotal** | **2.77** | — |
-| mamba_mimo_fwd_kernel | — | 2.330 |
-| mamba_mimo_bwd_fwd_kernel (recompute in bwd!) | — | 4.741 |
-| mamba_mimo_bwd_bwd_kernel | — | 5.752 |
-| helpers (bwd_dadt/segsum/dtrap/dacs) | — | 0.314 |
-| **MIMO subtotal** | — | **13.14** |
+| Kernel                                        | SISO ms  | MIMO ms   |
+| --------------------------------------------- | -------- | --------- |
+| mamba3_siso_fwd_kernel                        | 0.907    | —         |
+| mamba3_siso_bwd_kernel_dqkv                   | 0.847    | —         |
+| mamba3_siso_bwd_kernel_rotary_bias_angles     | 0.446    | —         |
+| mamba3_siso_bwd_kernel_dzdo                   | 0.178    | —         |
+| angle_dt_bwd_kernel                           | 0.205    | —         |
+| **SISO subtotal**                             | **2.77** | —         |
+| mamba_mimo_fwd_kernel                         | —        | 2.330     |
+| mamba_mimo_bwd_fwd_kernel (recompute in bwd!) | —        | 4.741     |
+| mamba_mimo_bwd_bwd_kernel                     | —        | 5.752     |
+| helpers (bwd_dadt/segsum/dtrap/dacs)          | —        | 0.314     |
+| **MIMO subtotal**                             | —        | **13.14** |
 
 **Key insight: MIMO bwd triggers RECOMPUTE of fwd** (`mamba_mimo_bwd_fwd_kernel_kernel = 4.74ms`)
 This is activation recomputation inside the Author TileLang backward path — doubles the
@@ -454,11 +454,11 @@ CUDA graph replay active from iter 3.
 NVIDIA cuTile Python (`cuda-tile` 1.2.0, CUDA 13.2) cannot target H200 (sm_90a).
 Exhaustive test on h200_1:
 
-| tileiras target | Compile | H200 runtime |
-|-----------------|---------|--------------|
-| sm_80, sm_86, sm_87, sm_88, sm_89 (Ampere/Ada) | OK | no_kernel_image |
-| **sm_90 (Hopper)** | **REJECTED: "Cannot find option named 'sm_90'"** | n/a |
-| sm_100, sm_103, sm_110, sm_120, sm_121 (Blackwell) | OK | no_kernel_image |
+| tileiras target                                    | Compile                                          | H200 runtime    |
+| -------------------------------------------------- | ------------------------------------------------ | --------------- |
+| sm_80, sm_86, sm_87, sm_88, sm_89 (Ampere/Ada)     | OK                                               | no_kernel_image |
+| **sm_90 (Hopper)**                                 | **REJECTED: "Cannot find option named 'sm_90'"** | n/a             |
+| sm_100, sm_103, sm_110, sm_120, sm_121 (Blackwell) | OK                                               | no_kernel_image |
 
 - All Ampere/Ada/Blackwell cubins load-fail on H200 (ISA binary incompatibility)
 - sm_90 is explicitly missing from tileiras compiler 13.2
@@ -548,22 +548,22 @@ Works correctly because `rmsnorm=True` mode does z-gating externally.
 
 ### Expected Performance
 
-| Config | Kernel | Expected tok/sec | Notes |
-|--------|--------|-----------------|-------|
-| nemo_native (baseline) | fused split+scan | 165k | vanilla Mamba-2 |
-| **mamba3_native QK-Norm+bias** | split conv + scan | ~155-165k | +2 RMSNorm + bias adds |
-| mamba3_native + data-dep A | split conv + scan | ~145-160k | +softplus + norm + div |
-| mamba3_te (old, Author kernels) | mamba3_siso_combined | 127k | CUDA graph breakage |
+| Config                          | Kernel               | Expected tok/sec | Notes                  |
+| ------------------------------- | -------------------- | ---------------- | ---------------------- |
+| nemo_native (baseline)          | fused split+scan     | 165k             | vanilla Mamba-2        |
+| **mamba3_native QK-Norm+bias**  | split conv + scan    | ~155-165k        | +2 RMSNorm + bias adds |
+| mamba3_native + data-dep A      | split conv + scan    | ~145-160k        | +softplus + norm + div |
+| mamba3_te (old, Author kernels) | mamba3_siso_combined | 127k             | CUDA graph breakage    |
 
 Key: if mamba3_native matches ~165k, then FP8 + CUDA graphs should reach 200k+ with Mamba3.
 
 ### Benchmark Results (8×H200, BF16 + CUDA graphs, MBS=4, GBS=32)
 
-| Config | Steady-state (ms) | tok/sec | vs Baseline |
-|--------|-------------------|---------|-------------|
-| **Baseline** (Mamba-2 SSD, fused kernel) | **743** | **176k** | — |
-| **Mamba3 native** (QK-Norm + B/C bias) | **788** | **166k** | **+6.1%** |
-| mamba3_te (Author kernels, old) | 1,035 | 127k | +39% |
+| Config                                   | Steady-state (ms) | tok/sec  | vs Baseline |
+| ---------------------------------------- | ----------------- | -------- | ----------- |
+| **Baseline** (Mamba-2 SSD, fused kernel) | **743**           | **176k** | —           |
+| **Mamba3 native** (QK-Norm + B/C bias)   | **788**           | **166k** | **+6.1%**   |
+| mamba3_te (Author kernels, old)          | 1,035             | 127k     | +39%        |
 
 The 6.1% overhead comes from replacing `mamba_split_conv1d_scan_combined` (fused conv+scan)
 with separate `causal_conv1d_fn` + `mamba_chunk_scan_combined` + 2×RMSNorm + bias.
@@ -572,11 +572,11 @@ With FP8 + MoE CUDA graph + MBS=5 + GBS=320, extrapolated: ~198k tok/sec (vs 211
 
 ### Optimization: Fused vs Split (benchmarked on R595/CUDA 13.2)
 
-| Config | Avg 5-15 (ms) | tok/sec | Overhead |
-|--------|---------------|---------|----------|
-| Baseline (Mamba-2 SSD) | 748 | 175k | — |
-| Mamba3 Fused (pre-conv QK-Norm) | 784 | 167k | +4.9% |
-| Mamba3 Split (post-conv QK-Norm) | 784 | 167k | +4.9% |
+| Config                           | Avg 5-15 (ms) | tok/sec | Overhead |
+| -------------------------------- | ------------- | ------- | -------- |
+| Baseline (Mamba-2 SSD)           | 748           | 175k    | —        |
+| Mamba3 Fused (pre-conv QK-Norm)  | 784           | 167k    | +4.9%    |
+| Mamba3 Split (post-conv QK-Norm) | 784           | 167k    | +4.9%    |
 
 Fused and split give identical overhead — the 4.9% is from QK-Norm + bias ops
 themselves, not from kernel split vs fused.
@@ -589,15 +589,15 @@ themselves, not from kernel split vs fused.
 
 The "Mamba3 native" mixer is NOT Mamba3. It's Mamba-2 SSD with QK-Norm and B/C bias:
 
-| Mamba-3 Feature | Status | Why Missing |
-|-----------------|--------|-------------|
-| QK-Norm on B/C | **DONE** | RMSNorm before/after conv1d |
-| Learnable B/C bias | **DONE** | Element-wise addition |
-| Trapezoidal discretization | **NOT DONE** | Requires modified scan: h_t = α*h_{t-1} + β*v_{t-1} + γ*v_t |
-| Data-dependent A | **CODE EXISTS, OFF** | A=-1/dt trick ready, not benchmarked |
-| Complex RoPE on B/C | **NOT DONE** | Pre-scan rotation, implementable in PyTorch |
-| No conv1d | **NOT DONE** | We keep conv1d for kernel compatibility |
-| MIMO | **NOT DONE** | Shared state, native SSD can't express directly |
+| Mamba-3 Feature            | Status               | Why Missing                                                 |
+| -------------------------- | -------------------- | ----------------------------------------------------------- |
+| QK-Norm on B/C             | **DONE**             | RMSNorm before/after conv1d                                 |
+| Learnable B/C bias         | **DONE**             | Element-wise addition                                       |
+| Trapezoidal discretization | **NOT DONE**         | Requires modified scan: h_t = α*h_{t-1} + β*v_{t-1} + γ*v_t |
+| Data-dependent A           | **CODE EXISTS, OFF** | A=-1/dt trick ready, not benchmarked                        |
+| Complex RoPE on B/C        | **NOT DONE**         | Pre-scan rotation, implementable in PyTorch                 |
+| No conv1d                  | **NOT DONE**         | We keep conv1d for kernel compatibility                     |
+| MIMO                       | **NOT DONE**         | Shared state, native SSD can't express directly             |
 
 ### Core Mamba-3 Innovations Missing
 
@@ -611,11 +611,11 @@ Without these, our mixer is essentially Mamba-2 + normalization tricks.
 
 ### Author Kernels: Fast Compute, Broken Integration
 
-| Kernel | Compute Speed | CUDA Graph? | Why |
-|--------|--------------|-------------|-----|
-| `mamba_chunk_scan_combined` (Mamba-2) | baseline | **YES** | Clean Triton |
-| `mamba3_siso_combined` (SISO) | ~same | **NO** | 27 saved tensors, non-tensor autograd inputs |
-| `mamba3_mimo_combined` (MIMO) | ~same | **NO** | All SISO issues + TileLang JIT + TVM PackedFunc |
+| Kernel                                | Compute Speed | CUDA Graph? | Why                                             |
+| ------------------------------------- | ------------- | ----------- | ----------------------------------------------- |
+| `mamba_chunk_scan_combined` (Mamba-2) | baseline      | **YES**     | Clean Triton                                    |
+| `mamba3_siso_combined` (SISO)         | ~same         | **NO**      | 27 saved tensors, non-tensor autograd inputs    |
+| `mamba3_mimo_combined` (MIMO)         | ~same         | **NO**      | All SISO issues + TileLang JIT + TVM PackedFunc |
 
 The 30% throughput gap (1035ms vs 793ms) is NOT from kernel compute —
 it's from loss of CUDA graph capture. Without graphs, every iteration
@@ -626,12 +626,12 @@ pays full kernel launch overhead for 17 Mamba layers × 5 bwd kernels.
 `/Users/dave/sources/nanochat/nanochat/mamba2.py` implements ALL Mamba3
 features in pure PyTorch using a chunked SSD reference scan:
 
-| Feature | Implementation | Lines | CUDA Graph OK? |
-|---------|---------------|-------|----------------|
-| Trapezoidal | B pre-scaling + diagonal correction | 2079-2189 | YES |
-| MIMO | Shared-state einsum scan | 3252-3451 | YES |
-| Data-dependent A | (B,T,H) shaped A in chunked scan | 1960-1971 | YES |
-| Complex RoPE | cos/sin rotation on B/C pairs | 919-1168 | YES |
+| Feature          | Implementation                      | Lines     | CUDA Graph OK? |
+| ---------------- | ----------------------------------- | --------- | -------------- |
+| Trapezoidal      | B pre-scaling + diagonal correction | 2079-2189 | YES            |
+| MIMO             | Shared-state einsum scan            | 3252-3451 | YES            |
+| Data-dependent A | (B,T,H) shaped A in chunked scan    | 1960-1971 | YES            |
+| Complex RoPE     | cos/sin rotation on B/C pairs       | 919-1168  | YES            |
 
 **Key insight:** nanochat's trapezoidal works by pre-scaling B:
 ```
@@ -674,12 +674,12 @@ Tested on H200x8 with `--cuda-graph-impl local`:
 - Small model (4 layers): 8 graphs created in 0.29s, EXIT 0
 - Full NAM56R (52 layers, 8×H200): **796 ms/iter = 165k tok/sec**
 
-| Config | ms/iter | tok/sec | Mamba3 features | Overhead |
-|--------|---------|---------|-----------------|----------|
-| Baseline (Mamba-2 SSD + TE graphs) | 748 | 175k | 0/7 | — |
-| CppMegaMamba3Mixer (native SSD) | 784 | 167k | 2/7 | +4.9% |
-| **Author SISO + local graphs** | **796** | **165k** | **6/7** | **+6.4%** |
-| Author SISO no graphs (old) | 1,035 | 127k | 6/7 | +38% |
+| Config                             | ms/iter | tok/sec  | Mamba3 features | Overhead  |
+| ---------------------------------- | ------- | -------- | --------------- | --------- |
+| Baseline (Mamba-2 SSD + TE graphs) | 748     | 175k     | 0/7             | —         |
+| CppMegaMamba3Mixer (native SSD)    | 784     | 167k     | 2/7             | +4.9%     |
+| **Author SISO + local graphs**     | **796** | **165k** | **6/7**         | **+6.4%** |
+| Author SISO no graphs (old)        | 1,035   | 127k     | 6/7             | +38%      |
 
 The 6.4% overhead is from actual kernel compute (QK-Norm, RoPE, trapezoidal,
 data-dependent A), NOT from CUDA graph loss. CUDA graphs via `--cuda-graph-impl local`
@@ -699,12 +699,12 @@ TileLang has `execution_backend="nvrtc"` which bypasses TVM runtime entirely:
 
 ### DSL Landscape (Mamba3 uses 3 DSLs)
 
-| Component | DSL | CUDA Graph? |
-|-----------|-----|-------------|
-| SISO prefill | Triton | YES (confirmed on H200) |
-| MIMO prefill | TileLang | YES (via nvrtc backend) |
-| Decode | CuTe DSL | YES (CUTLASS 4.3.4 fixed refcnt bug) |
-| FA4 | CuTe DSL | YES |
+| Component    | DSL      | CUDA Graph?                          |
+| ------------ | -------- | ------------------------------------ |
+| SISO prefill | Triton   | YES (confirmed on H200)              |
+| MIMO prefill | TileLang | YES (via nvrtc backend)              |
+| Decode       | CuTe DSL | YES (CUTLASS 4.3.4 fixed refcnt bug) |
+| FA4          | CuTe DSL | YES                                  |
 
 ### Driver Update
 
@@ -742,34 +742,34 @@ NeMo 3 Nano optimizations (FP8 tensorwise, TE CUDA graphs, MoE drop-and-pad, gra
 
 Six Mamba3 features were ported into TE-compatible modules:
 
-| Feature | Module | Status | Impact on Speed |
-|---------|--------|--------|-----------------|
-| QK-Norm on B/C | `mamba3_te_mixer.py` | Tests pass | -23% throughput |
-| Learnable B/C bias | `mamba3_te_mixer.py` | Tests pass | -23% throughput |
-| Trapezoidal discretization | `mamba3_te_mixer.py` | Tests pass | -23% throughput |
-| Complex RoPE on SSM | `mamba3_te_mixer.py` | Tests pass | -23% throughput |
-| Data-dependent A | `mamba3_te_mixer.py` | Tests pass | -23% throughput |
-| No-conv (conv1d removed) | `noconv_mamba_mixer.py` | Tests pass | Not benchmarked |
+| Feature                    | Module                  | Status     | Impact on Speed |
+| -------------------------- | ----------------------- | ---------- | --------------- |
+| QK-Norm on B/C             | `mamba3_te_mixer.py`    | Tests pass | -23% throughput |
+| Learnable B/C bias         | `mamba3_te_mixer.py`    | Tests pass | -23% throughput |
+| Trapezoidal discretization | `mamba3_te_mixer.py`    | Tests pass | -23% throughput |
+| Complex RoPE on SSM        | `mamba3_te_mixer.py`    | Tests pass | -23% throughput |
+| Data-dependent A           | `mamba3_te_mixer.py`    | Tests pass | -23% throughput |
+| No-conv (conv1d removed)   | `noconv_mamba_mixer.py` | Tests pass | Not benchmarked |
 
 The -23% comes from using Author Mamba3 scan kernels (`mamba3_siso_combined`) which
 cannot participate in TE CUDA graph capture, breaking the fusion pipeline.
 
 ### Mamba3 vs Mamba2 Throughput Comparison
 
-| Mode | Scan Kernel | Iter (ms) | tok/sec | MFU | CUDA Graphs |
-|------|-------------|-----------|---------|-----|-------------|
-| **nemo_native** (production) | `mamba_chunk_scan_combined` | 810 | 165k | 37.2% | yes |
-| **nemo_native + FP8 + MoE graph** | `mamba_chunk_scan_combined` | 6,207 (GBS=320) | **211k** | **50.1%** | yes |
-| mamba3_te | `mamba3_siso_combined` | 1,035 | 127k | ~29% | partial |
-| author_dp (legacy wrap) | Author Mamba3 native | 39,800 | 3.3k | <1% | no |
+| Mode                              | Scan Kernel                 | Iter (ms)       | tok/sec  | MFU       | CUDA Graphs |
+| --------------------------------- | --------------------------- | --------------- | -------- | --------- | ----------- |
+| **nemo_native** (production)      | `mamba_chunk_scan_combined` | 810             | 165k     | 37.2%     | yes         |
+| **nemo_native + FP8 + MoE graph** | `mamba_chunk_scan_combined` | 6,207 (GBS=320) | **211k** | **50.1%** | yes         |
+| mamba3_te                         | `mamba3_siso_combined`      | 1,035           | 127k     | ~29%      | partial     |
+| author_dp (legacy wrap)           | Author Mamba3 native        | 39,800          | 3.3k     | <1%       | no          |
 
 ### Features NOT Implemented
 
-| Feature | Source | Status |
-|---------|--------|--------|
-| **M²RNN** (Mamba3 R-layers) | Author Mamba3 / accelerated-model-architectures | **Not implemented** |
-| **MIMO** (multi-input multi-output SSM) | `mamba3_mimo_combined` kernel | Kernel reference only, not wired |
-| **Output projection norm** (RMSNormGated before out_proj) | `mamba3_te_out_proj.py` | Built, not benchmarked |
+| Feature                                                   | Source                                          | Status                           |
+| --------------------------------------------------------- | ----------------------------------------------- | -------------------------------- |
+| **M²RNN** (Mamba3 R-layers)                               | Author Mamba3 / accelerated-model-architectures | **Not implemented**              |
+| **MIMO** (multi-input multi-output SSM)                   | `mamba3_mimo_combined` kernel                   | Kernel reference only, not wired |
+| **Output projection norm** (RMSNormGated before out_proj) | `mamba3_te_out_proj.py`                         | Built, not benchmarked           |
 
 ### Path Forward for Mamba3 at Production Speed
 

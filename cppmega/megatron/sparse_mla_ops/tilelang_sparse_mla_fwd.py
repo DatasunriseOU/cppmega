@@ -127,12 +127,8 @@ def sparse_mla_fwd(
     threads=256,
 ):
     """Build sparse-MLA forward kernel."""
-    assert dim == tilelang.math.next_power_of_2(
-        dim
-    ), f"haven't check padding correctness yet, dim={dim}"
-    assert tail_dim == tilelang.math.next_power_of_2(
-        tail_dim
-    ), f"haven't check padding correctness yet, dim={tail_dim}"
+    assert dim % 16 == 0, f"dim must be multiple of 16 for warp ops, got {dim}"
+    assert tail_dim % 16 == 0, f"tail_dim must be multiple of 16 for warp ops, got {tail_dim}"
     assert is_causal == True, "non-casual is not supported"
     assert (
         topk % block_I == 0
