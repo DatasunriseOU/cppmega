@@ -342,7 +342,7 @@ MOE_EXTRA_FLAGS=""
 # head-streaming in dsa_fp8_indexer.py (commit 563fcb0) reduces DSA target from
 # 7.5 GiB to 0.8 GiB per layer, so selective moe_act recompute is sufficient.
 # --mla-down-proj-fusion: fuses MLA down-projection GEMMs (PR #3039, free perf).
-EXTRA_FLAGS="--recompute-granularity selective --recompute-modules moe core_attn mlp mla_up_proj --mla-down-proj-fusion"
+EXTRA_FLAGS="--recompute-granularity selective --recompute-modules moe_act core_attn mlp mla_up_proj --mla-down-proj-fusion"
 
 ROPE_FLAG=""
 if [ "${NO_ROPE_FUSION}" = "1" ]; then
