@@ -47,11 +47,15 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "DSA_INDEXER_DTYPE_ENV",
+    "DSA_KL_MODE_ENV",
     "apply_dsa_fp8_patch",
+    "apply_dsa_kl_mode_patch",
     "resolve_indexer_dtype",
+    "resolve_kl_mode",
 ]
 
 DSA_INDEXER_DTYPE_ENV = "CPPMEGA_DSA_INDEXER_DTYPE"
+DSA_KL_MODE_ENV = "CPPMEGA_DSA_KL_MODE"
 
 # Sentinel stored on the patched function so repeated calls are no-ops.
 _PATCH_MARKER = "__cppmega_dsa_fp8_patched__"
@@ -77,6 +81,80 @@ def resolve_indexer_dtype(config: Optional[object] = None) -> str:
     if env_val:
         return env_val
     return "bf16"
+
+
+def resolve_kl_mode() -> str:
+    """Return the desired DSA KL-loss computation mode.
+
+    Values:
+    * ``"head_streaming"`` (default) — existing head-streaming path from
+      Stream M tier 3 (commit 563fcb0).
+    * ``"splitk"`` — Triton split-K recomputation ported from upstream
+      PR #4039. Saves ~60% peak memory by avoiding the full
+      ``[b*np, sq, sk]`` attention_scores materialisation.
+    * ``"tilelang_fused"`` — one-pass online-softmax port of the
+      lemyx/tilelang-dsa forward KL kernel. Uses tiled streaming along
+      sk with running (max, sum_exp) accumulators. Pure PyTorch, no
+      TileLang JIT dependency. Numerically close but not bit-identical
+      to ``head_streaming`` due to reordered FP arithmetic.
+    """
+    val = os.environ.get(DSA_KL_MODE_ENV, "").strip().lower()
+    if val in ("splitk", "split_k", "split-k"):
+        return "splitk"
+    if val in ("tilelang_fused", "tilelang-fused", "tilelang"):
+        return "tilelang_fused"
+    # default
+    return "head_streaming"
+
+
+# Sentinel for the tilelang_fused KL mode monkey-patch.
+_KL_FUSED_PATCH_MARKER = "__cppmega_dsa_kl_tilelang_fused_patched__"
+
+
+def apply_dsa_kl_mode_patch(*, force: bool = False) -> bool:
+    """Monkey-patch ``_attention_target_fp32`` based on ``CPPMEGA_DSA_KL_MODE``.
+
+    When ``resolve_kl_mode()`` returns ``"tilelang_fused"``, replaces
+    :func:`cppmega.megatron.dsa_fp8_indexer._attention_target_fp32` with the
+    one-pass online-softmax variant from
+    :func:`cppmega.megatron.dsa_tilelang_fused_kl.attention_target_fused_kl`.
+
+    Idempotent unless ``force`` is True. Returns True if the patch was
+    applied (or already present), False if the mode is not tilelang_fused.
+    """
+
+    kl_mode = resolve_kl_mode()
+    if kl_mode != "tilelang_fused":
+        log.info("cppmega DSA KL mode patch skipped (mode=%s)", kl_mode)
+        return False
+
+    import cppmega.megatron.dsa_fp8_indexer as indexer_mod
+    from cppmega.megatron.dsa_tilelang_fused_kl import attention_target_fused_kl
+
+    existing = getattr(indexer_mod, "_attention_target_fp32", None)
+    if existing is None:
+        raise RuntimeError(
+            "cppmega.megatron.dsa_fp8_indexer._attention_target_fp32 not found"
+        )
+    already = getattr(existing, _KL_FUSED_PATCH_MARKER, False)
+    if already and not force:
+        log.info("cppmega DSA KL tilelang_fused patch already applied")
+        return True
+
+    def _attention_target_tilelang_fused(
+        query, key, softmax_scale, topk_indices, sparse_loss, pg_collection
+    ):
+        return attention_target_fused_kl(
+            query, key, softmax_scale, topk_indices, sparse_loss, pg_collection
+        )
+
+    setattr(_attention_target_tilelang_fused, _KL_FUSED_PATCH_MARKER, True)
+    indexer_mod._attention_target_fp32 = _attention_target_tilelang_fused
+    log.info(
+        "cppmega DSA KL tilelang_fused patch applied "
+        "(online-softmax one-pass, ported from lemyx/tilelang-dsa)"
+    )
+    return True
 
 
 def apply_dsa_fp8_patch(*, force: bool = False) -> bool:
@@ -194,25 +272,90 @@ def apply_dsa_fp8_patch(*, force: bool = False) -> bool:
     log.info("cppmega DSA FP8 backward patch applied (dtype=fp8)")
 
     # ------------------------------------------------------------------
-    # Stream M: two-tier memory optimization for compute_dsa_indexer_loss
+    # Stream M: three-tier memory optimization for DSA indexer forward
     #
-    # Tier 1 (loss_coeff==0 gate): skip entire KL loss when coeff=0.
-    # Tier 2 (head-streaming): when coeff>0, _attention_target_fp32 now
-    # loops over heads instead of materializing [b*np, sq, sk]. Saves
-    # 7.5 GiB → 0.8 GiB per DSA layer forward at production shape.
+    # Tier 1 (DSAttention.forward gate): when loss_coeff==0 during
+    #   training, temporarily switch DSAttention to eval mode so the
+    #   base forward takes the inference indexer path (no-grad topk
+    #   only). Bypasses FusedDSAIndexerLoss.apply() entirely, saving
+    #   183 MiB/layer of backward-saved tensors * 9 DSA layers = 1.6 GiB,
+    #   plus the 63 GiB of KL loss computation, plus the backward
+    #   recompute overhead. Critical for fitting DSA 9+4 in 140 GiB.
     #
-    # The head-streaming is built into _attention_target_fp32 in
-    # dsa_fp8_indexer.py — no additional monkey-patch needed for tier 2
-    # because the function is called from both fwd and bwd paths already
-    # patched above. Tier 1 gate is still useful as a fast-path for
-    # benchmarking with untrained indexer.
+    # Tier 2 (compute_dsa_indexer_loss gate): when loss_coeff==0, return
+    #   torch.zeros(()) immediately. Redundant with tier 1 but kept as
+    #   safety net in case tier 1 is ever bypassed.
+    #
+    # Tier 3 (head-streaming): when loss_coeff>0, _attention_target_fp32
+    #   now loops over heads instead of materializing [b*np, sq, sk].
+    #   Saves 7.5 GiB -> 0.8 GiB per DSA layer forward at production
+    #   shape. Built into dsa_fp8_indexer.py; no additional monkey-patch
+    #   needed.
     # ------------------------------------------------------------------
     import torch
 
+    # -- Tier 1: DSAttention.forward gate --
+    # When loss_coeff==0 during training, bypass FusedDSAIndexerLoss.apply()
+    # entirely and use a no-grad topk-only path. This eliminates:
+    # - FusedDSAIndexerLoss ctx.save_for_backward (183 MiB per DSA layer)
+    # - compute_dsa_indexer_loss (7.5 GiB per DSA layer)
+    # - bwd_fused_indexer_loss_naive backward computation + allocations
+    # - DSAIndexerLossAutoScaler overhead
+    # The index_scores tensor is freed immediately after topk selection.
+    # Total saving with 9 DSA layers: ~1.6 GiB saved-tensors + 63 GiB loss.
+    _DSA_FWD_GATE_MARKER = "__cppmega_dsattn_fwd_gate_patched__"
+    _DSAttention = getattr(dsa_mod, "DSAttention", None)
+    _unfused_dsa_fn = getattr(dsa_mod, "unfused_dsa_fn", None)
+    if (
+        _DSAttention is not None
+        and _unfused_dsa_fn is not None
+        and not getattr(_DSAttention, _DSA_FWD_GATE_MARKER, False)
+    ):
+        _orig_dsattn_forward = _DSAttention.forward
+
+        def _gated_dsattn_forward(self, *args, **kwargs):
+            # Peek at loss_coeff: if 0 during training, use inference-style
+            # indexer path to avoid all indexer-loss autograd overhead.
+            loss_coeff = getattr(self.config, "dsa_indexer_loss_coeff", 0.0)
+            if not (self.training and torch.is_grad_enabled() and loss_coeff == 0.0):
+                # Non-zero loss_coeff or not training: use original path.
+                return _orig_dsattn_forward(self, *args, **kwargs)
+
+            # -- loss_coeff==0 fast path --
+            # Temporarily switch to eval mode so the base forward takes the
+            # inference branch (no-grad topk + no FusedDSAIndexerLoss +
+            # no DSAIndexerLossAutoScaler). Gradients still flow through
+            # unfused_dsa_fn because torch.is_grad_enabled() is True; only
+            # the indexer-loss autograd machinery is bypassed.
+            # DSAttention.forward has no dropout/batchnorm, so eval mode
+            # is safe here.
+            self.eval()
+            try:
+                output = _orig_dsattn_forward(self, *args, **kwargs)
+            finally:
+                self.train()
+            return output
+
+        _DSAttention.forward = _gated_dsattn_forward
+        setattr(_DSAttention, _DSA_FWD_GATE_MARKER, True)
+        log.info(
+            "cppmega DSAttention.forward gate applied "
+            "(loss_coeff==0: eval indexer path, skips "
+            "FusedDSAIndexerLoss + DSAIndexerLossAutoScaler entirely)"
+        )
+
+    # -- Tier 2: compute_dsa_indexer_loss gate (safety net) --
+    # Also routes to split-K Triton kernel when CPPMEGA_DSA_KL_MODE=splitk.
     _LOSS_GATE_MARKER = "__cppmega_dsa_loss_gate_patched__"
     existing_loss = getattr(dsa_mod, "compute_dsa_indexer_loss", None)
     if existing_loss is not None and not getattr(existing_loss, _LOSS_GATE_MARKER, False):
         _orig_loss = existing_loss
+        _kl_mode = resolve_kl_mode()
+
+        if _kl_mode == "splitk":
+            from cppmega.megatron.dsa_splitk_indexer_loss import (
+                compute_dsa_indexer_loss_splitk,
+            )
 
         def _gated_compute_dsa_indexer_loss(
             index_scores, topk_indices, query, key,
@@ -220,6 +363,20 @@ def apply_dsa_fp8_patch(*, force: bool = False) -> bool:
         ):
             if loss_coeff == 0.0:
                 return torch.zeros((), device=query.device, dtype=torch.float32)
+            # Split-K mode: use Triton recomputation kernel (saves ~60%
+            # peak memory by avoiding full [b*np, sq, sk] materialisation).
+            # Falls back to head_streaming when TP > 1 because the Triton
+            # kernel does not fuse the TP all-reduce.
+            if _kl_mode == "splitk":
+                tp_size = getattr(
+                    getattr(pg_collection, "tp", None), "size", lambda: 1
+                )()
+                if tp_size <= 1:
+                    return compute_dsa_indexer_loss_splitk(
+                        index_scores, topk_indices, query, key,
+                        softmax_scale, loss_coeff, sparse_loss, pg_collection,
+                    )
+                # TP > 1: fall through to head_streaming
             # loss_coeff > 0: upstream compute_dsa_indexer_loss internally
             # calls _attention_target_fp32 which is now head-streaming
             # (commit 26ff3ca+). Memory: 0.8 GiB instead of 7.5 GiB.
@@ -230,10 +387,24 @@ def apply_dsa_fp8_patch(*, force: bool = False) -> bool:
 
         setattr(_gated_compute_dsa_indexer_loss, _LOSS_GATE_MARKER, True)
         dsa_mod.compute_dsa_indexer_loss = _gated_compute_dsa_indexer_loss
-        log.info(
-            "cppmega DSA loss gate + head-streaming applied "
-            "(loss_coeff==0: skip; loss_coeff>0: 0.8 GiB instead of 7.5 GiB per DSA layer)"
-        )
+        if _kl_mode == "splitk":
+            log.info(
+                "cppmega DSA loss gate + split-K Triton applied "
+                "(loss_coeff==0: skip; loss_coeff>0: split-K recompute, "
+                "~60%% memory saving vs full materialisation)"
+            )
+        else:
+            log.info(
+                "cppmega DSA loss gate + head-streaming applied "
+                "(loss_coeff==0: skip; loss_coeff>0: 0.8 GiB instead of 7.5 GiB per DSA layer)"
+            )
+
+    # -- KL mode patch: tilelang_fused online-softmax --
+    # When CPPMEGA_DSA_KL_MODE=tilelang_fused, replace _attention_target_fp32
+    # in the dsa_fp8_indexer module with the one-pass online-softmax variant
+    # ported from lemyx/tilelang-dsa. This is independent of the FP8 forward/
+    # backward patches above and applies to the KL target computation only.
+    apply_dsa_kl_mode_patch(force=force)
 
     return True
 
