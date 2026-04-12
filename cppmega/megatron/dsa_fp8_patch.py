@@ -382,7 +382,8 @@ def apply_dsa_fp8_patch(*, force: bool = False) -> bool:
 
         def _gated_compute_dsa_indexer_loss(
             index_scores, topk_indices, query, key,
-            softmax_scale, loss_coeff, sparse_loss, pg_collection,
+            softmax_scale, loss_coeff, sparse_loss=False, pg_collection=None,
+            **kwargs,
         ):
             if loss_coeff == 0.0:
                 return torch.zeros((), device=query.device, dtype=torch.float32)
