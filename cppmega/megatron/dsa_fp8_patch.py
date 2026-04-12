@@ -194,14 +194,18 @@ def apply_dsa_fp8_patch(*, force: bool = False) -> bool:
     log.info("cppmega DSA FP8 backward patch applied (dtype=fp8)")
 
     # ------------------------------------------------------------------
-    # Stream M: gate compute_dsa_indexer_loss on loss_coeff == 0.0
+    # Stream M: two-tier memory optimization for compute_dsa_indexer_loss
     #
-    # compute_dsa_indexer_loss at dsa.py:202 allocates a 7.5 GiB FP32
-    # tensor [b*np, sq, sk] = [112, 4096, 4096] per DSA layer forward,
-    # even when loss_coeff=0 (the scalar result is multiplied by 0 anyway).
-    # At 9 DSA layers this wastes ~63 GB total. Gating on loss_coeff == 0
-    # short-circuits to return zeros — backward autograd then receives
-    # zero grad_loss and produces zero gradients automatically.
+    # Tier 1 (loss_coeff==0 gate): skip entire KL loss when coeff=0.
+    # Tier 2 (head-streaming): when coeff>0, _attention_target_fp32 now
+    # loops over heads instead of materializing [b*np, sq, sk]. Saves
+    # 7.5 GiB → 0.8 GiB per DSA layer forward at production shape.
+    #
+    # The head-streaming is built into _attention_target_fp32 in
+    # dsa_fp8_indexer.py — no additional monkey-patch needed for tier 2
+    # because the function is called from both fwd and bwd paths already
+    # patched above. Tier 1 gate is still useful as a fast-path for
+    # benchmarking with untrained indexer.
     # ------------------------------------------------------------------
     import torch
 
@@ -216,6 +220,9 @@ def apply_dsa_fp8_patch(*, force: bool = False) -> bool:
         ):
             if loss_coeff == 0.0:
                 return torch.zeros((), device=query.device, dtype=torch.float32)
+            # loss_coeff > 0: upstream compute_dsa_indexer_loss internally
+            # calls _attention_target_fp32 which is now head-streaming
+            # (commit 26ff3ca+). Memory: 0.8 GiB instead of 7.5 GiB.
             return _orig_loss(
                 index_scores, topk_indices, query, key,
                 softmax_scale, loss_coeff, sparse_loss, pg_collection,
@@ -223,7 +230,10 @@ def apply_dsa_fp8_patch(*, force: bool = False) -> bool:
 
         setattr(_gated_compute_dsa_indexer_loss, _LOSS_GATE_MARKER, True)
         dsa_mod.compute_dsa_indexer_loss = _gated_compute_dsa_indexer_loss
-        log.info("cppmega DSA loss_coeff==0 gate applied (saves ~7.5 GiB per DSA layer forward)")
+        log.info(
+            "cppmega DSA loss gate + head-streaming applied "
+            "(loss_coeff==0: skip; loss_coeff>0: 0.8 GiB instead of 7.5 GiB per DSA layer)"
+        )
 
     return True
 

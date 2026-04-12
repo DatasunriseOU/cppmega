@@ -269,65 +269,77 @@ def _attention_target_fp32(
     sparse_loss: bool,
     pg_collection,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute the KL target ``attention_scores_normalized`` and retain
-    ``index_mask`` needed for gradient masking.
+    """Compute the KL target ``attention_scores_normalized`` via head-streaming.
 
-    Mirrors the upstream bwd flow for the main-attention side. The main
-    attention bmm is intentionally left in BF16/FP32 because its output is
-    structurally required across ``np`` before softmax + reduction (see
-    design note above).
+    Original Megatron code materializes ``[b*np, sq, sk]`` in FP32 = 7.5 GiB
+    at production shape (b=4, np=28, sq=sk=4096). This head-streaming variant
+    loops over ``np`` heads, computing per-head softmax and accumulating into
+    a ``[b, sq, sk]`` FP32 buffer. Peak live: ~0.8 GiB (3 × ``[b, sq, sk]``),
+    a **~89% reduction**.
+
+    Mathematically identical: softmax is per-head per-row (does not depend on
+    other heads), and sum-over-heads is linear post-softmax. The only
+    reduction across heads is the final sum which commutes with per-head
+    softmax. L1 normalization happens AFTER summing — same in both variants.
+
+    Pattern source: FlashAttention-2/3/4 online softmax (Milakov &
+    Gimelshein 2018, arxiv 1805.02867) applied to the head axis instead of
+    the KV-tile axis. DeepSeek V3.2 inference ``fp8_index_kernel`` uses the
+    same principle: ``T.reduce_sum(logits, logits_sum, dim=1)`` sums over
+    heads inside the kernel, never materializing ``[b, h, sq, sk]``.
 
     Returns:
         ``(attention_scores_normalized [b, sq, sk] fp32, index_mask [b, sq, sk] fp32)``
-        where ``index_mask`` is 0 at the topk positions and -inf elsewhere.
     """
 
     sq, b, np_, hn = query.size()
     sk = key.size(0)
 
-    # [sq, b, np, hn] -> [b*np, sq, hn]
-    query_reshaped = query.permute(1, 2, 0, 3).reshape(b * np_, sq, hn)
-    # [sk, b, np, hn] -> [b*np, hn, sk]
-    key_reshaped = key.permute(1, 2, 3, 0).reshape(b * np_, hn, sk)
-    attention_scores = torch.bmm(query_reshaped.float(), key_reshaped.float()) * softmax_scale
-    del query_reshaped, key_reshaped
+    device = query.device
 
-    attention_scores = attention_scores.reshape(b, np_, sq, sk)
-
+    # Masks: computed once, reused across all heads.
     causal_mask = torch.triu(
-        torch.full((sq, sk), float("-inf"), dtype=torch.float32, device=attention_scores.device),
+        torch.full((sq, sk), float("-inf"), dtype=torch.float32, device=device),
         diagonal=1,
     )
     index_mask = torch.full(
-        (b, sq, sk), float("-inf"), dtype=torch.float32, device=causal_mask.device
+        (b, sq, sk), float("-inf"), dtype=torch.float32, device=device
     ).scatter_(-1, topk_indices, 0)
 
-    # In-place mask additions. Upstream does these out-of-place which
-    # briefly doubles the ``[b, np, sq, sk]`` footprint --- that is the
-    # actual bwd peak at production shape. Keeping it in-place here does
-    # NOT change the autograd surface (``attention_scores`` has no
-    # gradient: query/key were saved via ``ctx.save_for_backward`` in the
-    # autograd.Function wrapper so ``.float()`` above already detaches).
-    attention_scores.add_(causal_mask.view(1, 1, sq, sk))
-    if sparse_loss:
-        attention_scores.add_(index_mask.view(b, 1, sq, sk))
+    # Accumulator for sum-over-heads of post-softmax distributions.
+    acc = torch.zeros(b, sq, sk, dtype=torch.float32, device=device)
+
+    for h in range(np_):
+        # Per-head Q and K slices: [sq, b, hn] and [sk, b, hn].
+        q_h = query[:, :, h, :].float().permute(1, 0, 2)   # -> [b, sq, hn]
+        k_h = key[:, :, h, :].float().permute(1, 2, 0)     # -> [b, hn, sk]
+
+        # Per-head scores: [b, sq, sk] = 268 MB at production shape.
+        scores_h = torch.bmm(q_h, k_h) * softmax_scale
+        del q_h, k_h
+
+        # Apply masks in-place (no gradient through detached query/key).
+        scores_h.add_(causal_mask)
+        if sparse_loss:
+            scores_h.add_(index_mask)
+
+        # Per-head, per-row softmax — independent of other heads.
+        softmax_h = torch.nn.functional.softmax(scores_h, dim=-1, dtype=torch.float32)
+        del scores_h
+
+        # Accumulate into head-sum buffer.
+        acc.add_(softmax_h)
+        del softmax_h
+
     del causal_mask
 
-    attention_scores_softmax = torch.nn.functional.softmax(
-        attention_scores, dim=-1, dtype=torch.float32
-    )
-    del attention_scores
-
-    attention_scores_sum = attention_scores_softmax.sum(dim=1)
-    del attention_scores_softmax
-
+    # Optional TP all-reduce (sum local-TP heads across ranks).
     if pg_collection is not None and pg_collection.tp.size() > 1:
-        torch.distributed.all_reduce(attention_scores_sum.contiguous(), group=pg_collection.tp)
+        torch.distributed.all_reduce(acc.contiguous(), group=pg_collection.tp)
 
-    attention_scores_normalized = attention_scores_sum / attention_scores_sum.sum(
-        dim=-1, keepdim=True
-    )
-    del attention_scores_sum
+    # L1 normalize after summing (same math as original).
+    attention_scores_normalized = acc / acc.sum(dim=-1, keepdim=True)
+    del acc
     return attention_scores_normalized, index_mask
 
 
