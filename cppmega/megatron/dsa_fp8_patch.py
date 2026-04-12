@@ -48,14 +48,17 @@ log = logging.getLogger(__name__)
 __all__ = [
     "DSA_INDEXER_DTYPE_ENV",
     "DSA_KL_MODE_ENV",
+    "DSA_SPARSE_MODE_ENV",
     "apply_dsa_fp8_patch",
     "apply_dsa_kl_mode_patch",
     "resolve_indexer_dtype",
     "resolve_kl_mode",
+    "resolve_sparse_mode",
 ]
 
 DSA_INDEXER_DTYPE_ENV = "CPPMEGA_DSA_INDEXER_DTYPE"
 DSA_KL_MODE_ENV = "CPPMEGA_DSA_KL_MODE"
+DSA_SPARSE_MODE_ENV = "CPPMEGA_DSA_SPARSE_MODE"
 
 # Sentinel stored on the patched function so repeated calls are no-ops.
 _PATCH_MARKER = "__cppmega_dsa_fp8_patched__"
@@ -105,6 +108,25 @@ def resolve_kl_mode() -> str:
         return "tilelang_fused"
     # default
     return "head_streaming"
+
+
+def resolve_sparse_mode() -> str:
+    """Return the desired DSA sparse attention mode.
+
+    Values:
+    * ``"gather_scatter"`` (default) — existing PyTorch gather-scatter
+      implementation in ``dsa_sparse_attention.py``. No TileLang JIT
+      dependency. Works on any GPU.
+    * ``"tilelang"`` — fused TileLang sparse MLA kernel ported from
+      Megatron-LM PR #3674. Requires TileLang JIT. Uses online softmax
+      in shared memory, avoids full attention score materialisation.
+      Numerically close but not bit-identical to ``gather_scatter``.
+    """
+    val = os.environ.get(DSA_SPARSE_MODE_ENV, "").strip().lower()
+    if val in ("tilelang", "tilelang_mla", "tilelang-mla"):
+        return "tilelang"
+    # default
+    return "gather_scatter"
 
 
 # Sentinel for the tilelang_fused KL mode monkey-patch.
@@ -400,28 +422,58 @@ def apply_dsa_fp8_patch(*, force: bool = False) -> bool:
             )
 
     # ------------------------------------------------------------------
-    # Tier 4: Sparse gather-scatter DSA attention
+    # Tier 4: Sparse DSA attention
     #
     # unfused_dsa_fn (dsa.py:920) materializes FULL [b*np, sq, sk] FP32
     # attention scores = 7.0 GiB per DSA layer at production shape, then
     # masks non-topk to -inf before softmax.  This is the REAL memory
     # bottleneck for DSA 9+4 on H200 (5 layers × 7 GiB = 35 GiB extra).
     #
-    # sparse_dsa_fn gathers only topk K/V entries per query, computing
-    # [b, np, sq, topk=16] scores = 28.7 MB instead of 7 GiB.
-    # ~250× reduction in attention scores tensor.
+    # Two modes (controlled by CPPMEGA_DSA_SPARSE_MODE env var):
+    #
+    # "gather_scatter" (default): PyTorch gather-scatter implementation.
+    #   sparse_dsa_fn gathers only topk K/V entries per query, computing
+    #   [b, np, sq, topk=16] scores = 28.7 MB instead of 7 GiB.
+    #   ~250× reduction in attention scores tensor.
+    #
+    # "tilelang": TileLang fused sparse MLA from Megatron-LM PR #3674.
+    #   Uses online softmax in shared memory with LRU kernel caching.
+    #   Requires TileLang JIT. Falls back to gather_scatter on import error.
     # ------------------------------------------------------------------
     _SPARSE_DSA_MARKER = "__cppmega_sparse_dsa_patched__"
     existing_unfused = getattr(dsa_mod, "unfused_dsa_fn", None)
     if existing_unfused is not None and not getattr(existing_unfused, _SPARSE_DSA_MARKER, False):
-        from cppmega.megatron.dsa_sparse_attention import sparse_dsa_fn
+        sparse_mode = resolve_sparse_mode()
 
-        setattr(sparse_dsa_fn, _SPARSE_DSA_MARKER, True)
-        dsa_mod.unfused_dsa_fn = sparse_dsa_fn
-        log.info(
-            "cppmega sparse_dsa_fn applied (replaces unfused_dsa_fn: "
-            "7.0 GiB → 28.7 MB attention scores per DSA layer, ~250× reduction)"
-        )
+        if sparse_mode == "tilelang":
+            try:
+                from cppmega.megatron.sparse_mla_ops.sparse_mla import (
+                    sparse_mla_as_unfused_dsa,
+                )
+
+                setattr(sparse_mla_as_unfused_dsa, _SPARSE_DSA_MARKER, True)
+                dsa_mod.unfused_dsa_fn = sparse_mla_as_unfused_dsa
+                log.info(
+                    "cppmega TileLang SparseMLA applied (replaces unfused_dsa_fn: "
+                    "fused online-softmax sparse attention from Megatron-LM PR #3674)"
+                )
+            except Exception as exc:
+                log.warning(
+                    "cppmega TileLang SparseMLA import failed (%s), "
+                    "falling back to PyTorch gather-scatter sparse_dsa_fn",
+                    exc,
+                )
+                sparse_mode = "gather_scatter"
+
+        if sparse_mode == "gather_scatter":
+            from cppmega.megatron.dsa_sparse_attention import sparse_dsa_fn
+
+            setattr(sparse_dsa_fn, _SPARSE_DSA_MARKER, True)
+            dsa_mod.unfused_dsa_fn = sparse_dsa_fn
+            log.info(
+                "cppmega sparse_dsa_fn applied (replaces unfused_dsa_fn: "
+                "7.0 GiB → 28.7 MB attention scores per DSA layer, ~250× reduction)"
+            )
 
     # -- KL mode patch: tilelang_fused online-softmax --
     # When CPPMEGA_DSA_KL_MODE=tilelang_fused, replace _attention_target_fp32
