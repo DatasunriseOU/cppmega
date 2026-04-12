@@ -101,8 +101,9 @@ case "${VARIANT}" in
   v0)
     echo "[stream_m] V0 = EP=1 DP=4 PP=2 VPP=2 (all 16 experts/rank, 4x DP, no DeepEP)"
     EP_SIZE=1
-    # flex dispatcher requires TP*EP > 1; override to alltoall for EP=1
-    CPPMEGA_DISPATCHER_OVERRIDE=alltoall
+    # EP=1: flex dispatcher requires TP*EP > 1, so use alltoall for routing.
+    # But do NOT disable CG — alltoall at EP=1 is just local routing, CG-safe.
+    CPPMEGA_DISPATCHER_OVERRIDE=alltoall_keep_cg
     ;;
   v1)
     echo "[stream_m] V1 = EP=4 DP=1 PP=2 VPP=2 (4 experts/rank, grad-accum GBS)"
@@ -340,7 +341,7 @@ if ! echo "${NATIVE_ARGS}" | grep -q -- "--expert-model-parallel-size ${EP_SIZE}
   exit 3
 fi
 # EP=1 override: flex dispatcher requires TP*EP > 1, fall back to alltoall
-if [ "${CPPMEGA_DISPATCHER_OVERRIDE:-}" = "alltoall" ]; then
+if [[ "${CPPMEGA_DISPATCHER_OVERRIDE:-}" == alltoall* ]]; then
   NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--moe-token-dispatcher-type flex/--moe-token-dispatcher-type alltoall/")
   NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/ --moe-router-dtype fp32//")
   MOE_EXTRA_FLAGS="--moe-pad-expert-input-to-capacity --moe-expert-capacity-factor 1.0"
@@ -348,15 +349,13 @@ if [ "${CPPMEGA_DISPATCHER_OVERRIDE:-}" = "alltoall" ]; then
 fi
 echo "NATIVE_ARGS (post-sed): ${NATIVE_ARGS}"
 
-# CUDA graphs — disable when using alltoall dispatcher (CG capture hangs
-# on NCCL alltoall collectives). Enable only for flex (DeepEP) dispatcher.
+# CUDA graphs — full scope verified stable with TileLang + lr=1e-5.
+# Disable only for pure alltoall EP>1 (NCCL collective in CG capture).
+# EP=1 alltoall_keep_cg is CG-safe (local routing only).
 if [ "${CPPMEGA_DISPATCHER_OVERRIDE:-}" = "alltoall" ]; then
   CG_FLAGS=""
-  echo "[stream_m] CUDA graphs DISABLED (alltoall dispatcher is CG-incompatible)"
+  echo "[stream_m] CUDA graphs DISABLED (alltoall EP>1 dispatcher)"
 else
-  # Full CG scope: verified stable with TileLang + lr=1e-5.
-  # PP=1: 237 TFLOP/s 20/20, PP=2 EP=2: 185 TFLOP/s 20/20.
-  # NOTE: lr=1e-4 causes CG replay overflow — must use lr≤1e-5.
   CG_FLAGS="--cuda-graph-impl transformer_engine --cuda-graph-scope attn mamba moe_router moe_preprocess --cuda-graph-warmup-steps 3"
 fi
 # NOTE: --moe-pad-expert-input-to-capacity is INCOMPATIBLE with flex dispatcher
