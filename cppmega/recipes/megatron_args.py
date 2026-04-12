@@ -53,7 +53,7 @@ def build_megatron_args_bundle(
     use_dsa: bool = False,
     dsa_indexer_n_heads: int = 8,
     dsa_indexer_head_dim: int = 64,
-    dsa_indexer_topk: int = 16,
+    dsa_indexer_topk: int = 128,
     dsa_indexer_loss_coeff: float = 0.0,
     dsa_indexer_dtype: str = "bf16",
 ) -> MegatronArgsBundle:
@@ -130,8 +130,10 @@ def build_megatron_args_bundle(
                 str(dsa_indexer_topk),
                 "--dsa-indexer-loss-coeff",
                 str(dsa_indexer_loss_coeff),
-                "--dsa-indexer-dtype",
-                dsa_indexer_dtype,
+                # NOTE: --dsa-indexer-dtype is NOT emitted here because
+                # Megatron's argparser does not register it.  The actual
+                # FP8 path is activated via CPPMEGA_DSA_INDEXER_DTYPE env
+                # var, read by cppmega_mimo_shim at startup.
             ]
         )
         if dsa_indexer_dtype == "fp8":
