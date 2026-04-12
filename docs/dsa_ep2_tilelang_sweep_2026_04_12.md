@@ -179,3 +179,79 @@ Europe has driver 595.58.03 (fixed). Driver upgrade to 595 installed, reboot pen
 | Upstream PRs | 0 | **16 applied (10 clean + 6 partial)** |
 | PR #3553 | Incompatible | **Auto-detect adapter written** |
 | Bench3 DeepEP | Broken | **Root cause found, driver upgraded** |
+
+## FP8 GEMMs (TE) Evaluation — 2026-04-12 Evening
+
+### Config: PP=1 EP=1 DP=8, MBS=4, --fp8-format hybrid --fp8-amax-history-len 1024
+
+| Metric | BF16 (MBS=6) | FP8 (MBS=4 GBS=64) | FP8 (MBS=4 GBS=32) |
+|--------|-------------|---------------------|---------------------|
+| TFLOP/s | 249 | 156 (2 grad_accum) | **154** |
+| ms/iter | ~3300 | 5260 | **2679** |
+| tok/sec | ~59k | ~49k | **~49k** |
+| Memory | 104 GiB | 89 GiB | ~85 GiB |
+| CG | off | off | off |
+
+### Extended FP8 vs BF16 Sweep (all PP=1 EP=1 DP=8, CG=off)
+
+| Config | TFLOP/s | ms/iter | GBS | Peak GiB | Notes |
+|--------|---------|---------|-----|----------|-------|
+| BF16 MBS=6 GBS=48 | **249** | ~3300 | 48 | 104 | **BEST** |
+| BF16 MBS=8 GBS=64 | 145 | 5674 | 64 | **136** | Mem pressure |
+| FP8 MBS=4 GBS=32 | 154 | 2679 | 32 | 85 | |
+| FP8 MBS=4 GBS=64 | 156 | 5260 | 64 | 89 | 2 grad_accum |
+| FP8 MBS=6 GBS=48 | 158 | 3911 | 48 | 112 | |
+
+**Analysis**: FP8 TE GEMMs add ~8 GiB memory (amax history, FP8 weight copies, scale tensors)
+and are consistently ~37% slower at same MBS. BF16 master weights are NOT eliminated —
+TE keeps both BF16 and FP8 copies. DeepSeek V3 also keeps BF16 master weights for optimizer
+(confirmed by agent research). No production approach eliminates the BF16 copy.
+
+MBS=8 BF16 fits (136 GiB) but is slower due to memory pressure.
+MBS=6 BF16 remains the sweet spot for H200 143 GiB.
+
+**Verdict: TE FP8 GEMMs = NET LOSS for hybrid Mamba model.**
+- GEMMs = only 23.5% of compute (SSM = 27.5%, PP bubble = 24.3%)
+- FP8 amax overhead (quantize/dequantize + history tracking) applied to ALL GEMMs
+- Only MoE expert FFN + attention projections benefit; Mamba stays BF16
+- FP8 adds ~8 GiB memory for amax history + scaling tensors
+- Per-microbatch time: ~2630ms (FP8) vs ~3300ms (BF16) → FP8 23% faster per-microbatch
+  BUT MBS=4 instead of MBS=6 → worse throughput overall
+
+### FlashAdamW (PR #4229)
+- NOT compatible with `--use-distributed-optimizer` (which we use)
+- Would trade DP-sharded 4 GiB optimizer for per-rank 16.6 GiB → NET LOSS
+- Not recommended
+
+### Mamba SSM Kernel Analysis (nsys)
+
+| Kernel | Time | Regs | Smem | Occupancy | Issue |
+|--------|------|------|------|-----------|-------|
+| mamba_mimo_fwd | 1192ms | 239 | 196KB | 6.2% | TMA off |
+| mamba_mimo_bwd_fwd | 1034ms | 255 | 196KB | 6.2% | TMA off |
+| mamba_mimo_bwd_bwd | 2110ms | 255 | 228KB | 12.5% | Recompute tax |
+| _m2rnn_fwd | 405ms | 64 | 100KB | 12.5% | Sequential |
+| _m2rnn_bwd | 623ms | 255 | 32KB | 12.5% | Sequential |
+| **Total SSM** | **5364ms** | | | | |
+
+**Optimizations (prioritized):**
+1. P1: Enable TMA + warp specialization → ~1500-2000ms savings
+2. P2: State checkpointing (eliminate bwd_bwd recompute) → ~1000ms
+3. P3: Reduce register pressure 255→128 → ~500-800ms  
+4. **Projected**: 5364→2064ms = **2.6× SSM speedup**
+
+### Strategy: Path to 50% MFU
+
+Instead of FP8 GEMMs, focus on:
+1. **Mamba TMA + warp spec** (P1): -1500ms → 24→28% MFU
+2. **State checkpoint** (P2): -1000ms → 28→32% MFU  
+3. **MBS=8 via Liger CE** (`CPPMEGA_MTP_LIGER_CE=1`, -21 GiB): +5% → 34% MFU
+4. **CUDA Graphs** (full scope): -20% overhead → 34→40% MFU
+5. **Fuse 89 elementwise kernels** (torch.compile): -14.7% → 40→45% MFU
+6. **Register pressure P3 + M2RNN chunk**: -1300ms → 45→50% MFU
+
+### Nanochat Techniques (Applicable)
+1. `FP8ActivationPacker` — FP8 activation checkpointing, ~2× mem save on activations
+2. `fused_linear_cross_entropy_chunked` — chunked logits, same as our Liger CE
+3. `CPUOffloadCheckpoint` — async D2H for attention activations
+4. `FP8AdamWWrapper` (COAT) — FP8 optimizer states (but conflicts with dist-opt)

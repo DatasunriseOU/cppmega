@@ -22,26 +22,26 @@ Reference for what NVIDIA Blackwell **consumer** silicon (sm_120a RTX 5090 and s
 
 ## Capability matrix
 
-| Feature | sm_100a (B200) | sm_121a (GB10) | sm_120a (RTX 5090) | sm_90a (H100) |
-|---|---|---|---|---|
-| `tcgen05.mma` | ✅ | ❌ | ❌ | ❌ |
-| `tcgen05.ld / .st / .alloc / .cp` | ✅ | ❌ | ❌ | ❌ |
-| TMEM (Tensor Memory, 256 KiB/SM) | ✅ | ❌ silicon absent | ❌ silicon absent | ❌ |
-| `wgmma.mma_async` | ❌ deprecated | ❌ | ❌ | ✅ |
-| `cp.async.bulk.tensor` (TMA, single-CTA) | ✅ | ✅ | ✅ | ✅ |
-| TMA multicast (cluster > 1) | ✅ | ⚠️ (1) | ⚠️ (1) | ✅ |
-| DSMEM (distributed shared memory) | ✅ | ✅ | ✅ | ✅ |
-| Extended `mma.sync kind::f8f6f4` | ✅ | ✅ | ✅ | — |
-| Extended `mma.sync kind::mxf8f6f4.block_scale` | ✅ | ✅ (**`a` suffix required**) | ✅ (**`a` suffix required**) | — |
-| Extended `mma.sync kind::mxf4nvf4.block_scale` | ✅ | ✅ (`a` suffix required) | ✅ (`a` suffix required) | — |
-| `ldmatrix` / `stmatrix` swizzled smem | ✅ | ✅ | ✅ | ✅ |
-| `setmaxnreg.inc/.dec` warp specialization | ✅ | ✅ | ✅ | ✅ |
-| Cluster launch control | ✅ | ✅ | ✅ | ✅ |
-| Shared memory per SM (physical) | 228 KiB | **~128 KiB** | 128 KiB | 228 KiB |
-| Shared memory per SM (CUTLASS dynamic budget) | 232 KiB | **99 KiB** (`sm120_smem_capacity_bytes = 101376`) | 99 KiB | 228 KiB |
-| Max resident warps / SM | 64 | **48** | 48 | 64 |
-| 32-bit registers / SM | 64 K | 64 K | 64 K | 64 K |
-| Max registers / thread | 255 | 255 | 255 | 255 |
+| Feature                                        | sm_100a (B200) | sm_121a (GB10)                                    | sm_120a (RTX 5090)          | sm_90a (H100) |
+| ---------------------------------------------- | -------------- | ------------------------------------------------- | --------------------------- | ------------- |
+| `tcgen05.mma`                                  | ✅              | ❌                                                 | ❌                           | ❌             |
+| `tcgen05.ld / .st / .alloc / .cp`              | ✅              | ❌                                                 | ❌                           | ❌             |
+| TMEM (Tensor Memory, 256 KiB/SM)               | ✅              | ❌ silicon absent                                  | ❌ silicon absent            | ❌             |
+| `wgmma.mma_async`                              | ❌ deprecated   | ❌                                                 | ❌                           | ✅             |
+| `cp.async.bulk.tensor` (TMA, single-CTA)       | ✅              | ✅                                                 | ✅                           | ✅             |
+| TMA multicast (cluster > 1)                    | ✅              | ⚠️ (1)                                             | ⚠️ (1)                       | ✅             |
+| DSMEM (distributed shared memory)              | ✅              | ✅                                                 | ✅                           | ✅             |
+| Extended `mma.sync kind::f8f6f4`               | ✅              | ✅                                                 | ✅                           | —             |
+| Extended `mma.sync kind::mxf8f6f4.block_scale` | ✅              | ✅ (**`a` suffix required**)                       | ✅ (**`a` suffix required**) | —             |
+| Extended `mma.sync kind::mxf4nvf4.block_scale` | ✅              | ✅ (`a` suffix required)                           | ✅ (`a` suffix required)     | —             |
+| `ldmatrix` / `stmatrix` swizzled smem          | ✅              | ✅                                                 | ✅                           | ✅             |
+| `setmaxnreg.inc/.dec` warp specialization      | ✅              | ✅                                                 | ✅                           | ✅             |
+| Cluster launch control                         | ✅              | ✅                                                 | ✅                           | ✅             |
+| Shared memory per SM (physical)                | 228 KiB        | **~128 KiB**                                      | 128 KiB                     | 228 KiB       |
+| Shared memory per SM (CUTLASS dynamic budget)  | 232 KiB        | **99 KiB** (`sm120_smem_capacity_bytes = 101376`) | 99 KiB                      | 228 KiB       |
+| Max resident warps / SM                        | 64             | **48**                                            | 48                          | 64            |
+| 32-bit registers / SM                          | 64 K           | 64 K                                              | 64 K                        | 64 K          |
+| Max registers / thread                         | 255            | 255                                               | 255                         | 255           |
 
 (1) @margaretz-nv (NVIDIA) says DSMEM + TMA multicast available on Spark; CUTLASS example 79 forces `cluster_shape=1×1×1` with comment "GeForce does not support multicast feature of TMA load". Probable reconciliation: multicast instruction exists but cluster-size limit makes it a no-op. **Do not rely on multicast speedup on sm_120/121.**
 
@@ -81,20 +81,20 @@ Total **~160 atom specializations** across two files covering dense + sparse:
 
 **`include/cute/arch/mma_sm120.hpp` (dense, 80 atoms, 3278 lines):**
 
-| PTX `.kind::` modifier | Shape | Dtype inventory |
-|---|---|---|
-| `f8f6f4` | m16n8k32 | 25 pairs of {e5m2, e4m3, e3m2, e2m3, e2m1} × {f16, f32} accum = 50 |
-| `mxf8f6f4.block_scale.scale_vec::1X` | m16n8k32 | Same 25 dtype pairs + `ue8m0` scale = 25 |
-| `mxf4nvf4.block_scale.scale_vec::2X` | m16n8k64 | e2m1 × e2m1 + `ue8m0` scale |
-| `mxf4nvf4.block_scale.scale_vec::4X` | m16n8k64 | e2m1 × e2m1 + `ue8m0` or `ue4m3` scale |
+| PTX `.kind::` modifier               | Shape    | Dtype inventory                                                    |
+| ------------------------------------ | -------- | ------------------------------------------------------------------ |
+| `f8f6f4`                             | m16n8k32 | 25 pairs of {e5m2, e4m3, e3m2, e2m3, e2m1} × {f16, f32} accum = 50 |
+| `mxf8f6f4.block_scale.scale_vec::1X` | m16n8k32 | Same 25 dtype pairs + `ue8m0` scale = 25                           |
+| `mxf4nvf4.block_scale.scale_vec::2X` | m16n8k64 | e2m1 × e2m1 + `ue8m0` scale                                        |
+| `mxf4nvf4.block_scale.scale_vec::4X` | m16n8k64 | e2m1 × e2m1 + `ue8m0` or `ue4m3` scale                             |
 
 **`include/cute/arch/mma_sm120_sparse.hpp` (2:4 sparse, 80 atoms, 3467 lines):**
 
-| PTX `.kind::` modifier | Shape | Notes |
-|---|---|---|
-| `f8f6f4.sp::ordered_metadata` | m16n8k64 | 25 dtype pairs × {f16, f32} accum |
-| `mxf8f6f4.sp::ordered_metadata.block_scale.scale_vec::1X` | m16n8k64 | `ue8m0` |
-| `mxf4nvf4.sp::ordered_metadata.block_scale.scale_vec::{2X,4X}` | m16n8k128 | `ue8m0` or `ue4m3` |
+| PTX `.kind::` modifier                                         | Shape     | Notes                             |
+| -------------------------------------------------------------- | --------- | --------------------------------- |
+| `f8f6f4.sp::ordered_metadata`                                  | m16n8k64  | 25 dtype pairs × {f16, f32} accum |
+| `mxf8f6f4.sp::ordered_metadata.block_scale.scale_vec::1X`      | m16n8k64  | `ue8m0`                           |
+| `mxf4nvf4.sp::ordered_metadata.block_scale.scale_vec::{2X,4X}` | m16n8k128 | `ue8m0` or `ue4m3`                |
 
 **Config guards:** `CUTE_ARCH_F8F6F4_MMA_ENABLED`, `CUTE_ARCH_MXF8F6F4_MMA_ENABLED`, `CUTE_ARCH_MXF4NVF4_{2X,4X}_{UE8M0,UE4M3}_MMA_ENABLED`. All active when `CUTLASS_ARCH_MMA_SM120A_ENABLED || SM121A_ENABLED`.
 
@@ -104,13 +104,13 @@ Total **~160 atom specializations** across two files covering dense + sparse:
 
 ## SASS opcodes emitted on sm_120/sm_121
 
-| PTX instruction | SASS opcode | Notes |
-|---|---|---|
-| `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32` | `HMMA.16816.F32.BF16` | **Same as sm_90 non-WGMMA** — Ampere-era HMMA family |
-| `mma.sync.aligned.m16n8k16.row.col.f16.f16.f16` | `HMMA.16816.F16.F16` | f16 accumulator — 2× throughput of f32 accum |
-| `mma.sync.aligned.m16n8k32.kind::f8f6f4` | `QMMA.*` / `HMMA.MXF*` | Blackwell-specific extended |
-| `mma.sync.aligned.m16n8k32.kind::mxf8f6f4.block_scale` | `QMMA.MXF*` with scale fetch | |
-| `mma.sync.aligned.m16n8k64.kind::mxf4nvf4.block_scale` | `QMMA.MXF4.*` | |
+| PTX instruction                                        | SASS opcode                  | Notes                                                |
+| ------------------------------------------------------ | ---------------------------- | ---------------------------------------------------- |
+| `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`  | `HMMA.16816.F32.BF16`        | **Same as sm_90 non-WGMMA** — Ampere-era HMMA family |
+| `mma.sync.aligned.m16n8k16.row.col.f16.f16.f16`        | `HMMA.16816.F16.F16`         | f16 accumulator — 2× throughput of f32 accum         |
+| `mma.sync.aligned.m16n8k32.kind::f8f6f4`               | `QMMA.*` / `HMMA.MXF*`       | Blackwell-specific extended                          |
+| `mma.sync.aligned.m16n8k32.kind::mxf8f6f4.block_scale` | `QMMA.MXF*` with scale fetch |                                                      |
+| `mma.sync.aligned.m16n8k64.kind::mxf4nvf4.block_scale` | `QMMA.MXF4.*`                |                                                      |
 
 **No `BlackwellMMA` / `UMMA` SASS family on sm_120/sm_121.** UMMA is reserved for sm_100a where TMEM exists.
 
@@ -126,12 +126,12 @@ Total **~160 atom specializations** across two files covering dense + sparse:
 
 From NVIDIA RTX Blackwell whitepaper + dev forum confirmations (Crovella) + TRT-LLM #11368 + NVIDIA forums "SM121 CUTLASS Kernel Optimization Results":
 
-| Chip | BF16 (f32 acc) | FP16 (f16 acc) | FP8 | FP4 | SMEM | Memory BW |
-|---|---|---|---|---|---|---|
-| GB10 DGX Spark (sm_121a) | ~100 TFLOPS | ~200 TFLOPS | ~200 TFLOPS | ~400 TFLOPS (1 PFLOP sparse spec) | ~128 KB | **273 GB/s** LPDDR5X |
-| RTX 5090 (sm_120a GB202, 170 SM) | 209 TFLOPS | **419 TFLOPS** | 838 TFLOPS | 1676 TFLOPS | 128 KB | 1792 GB/s GDDR7 |
-| B200 (sm_100a) | 2250 TFLOPS | — | 4500 TFLOPS | 9000 TFLOPS | 228 KB | 8000 GB/s HBM3e |
-| H100 (sm_90a) | 989 TFLOPS | — | 1979 TFLOPS | — (no FP4) | 228 KB | 3350 GB/s HBM3 |
+| Chip                             | BF16 (f32 acc) | FP16 (f16 acc) | FP8         | FP4                               | SMEM    | Memory BW            |
+| -------------------------------- | -------------- | -------------- | ----------- | --------------------------------- | ------- | -------------------- |
+| GB10 DGX Spark (sm_121a)         | ~100 TFLOPS    | ~200 TFLOPS    | ~200 TFLOPS | ~400 TFLOPS (1 PFLOP sparse spec) | ~128 KB | **273 GB/s** LPDDR5X |
+| RTX 5090 (sm_120a GB202, 170 SM) | 209 TFLOPS     | **419 TFLOPS** | 838 TFLOPS  | 1676 TFLOPS                       | 128 KB  | 1792 GB/s GDDR7      |
+| B200 (sm_100a)                   | 2250 TFLOPS    | —              | 4500 TFLOPS | 9000 TFLOPS                       | 228 KB  | 8000 GB/s HBM3e      |
+| H100 (sm_90a)                    | 989 TFLOPS     | —              | 1979 TFLOPS | — (no FP4)                        | 228 KB  | 3350 GB/s HBM3       |
 
 **FP16 with f16 accumulator is 2× faster than BF16 with f32 accumulator on sm_120a** (419 vs 209 TFLOPS). If numerical tolerance permits, this gives free 2× speedup for GEMM-heavy kernels.
 

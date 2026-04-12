@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - nanochat{% endblock %}
+{% block content %}
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+  <h1 style="font-size: 24px;">Training Runs</h1>
+  <span style="color: var(--fg2); font-size: 13px;">{{ now.strftime('%Y-%m-%d %H:%M:%S UTC') }} | auto-refresh 30s</span>
+</div>
+
+{% if not runs %}
+<div class="empty-state">
+  <h2>No training runs detected</h2>
+  <p>Start a training run with <code>python -m scripts.base_train</code> and it will appear here.</p>
+</div>
+{% else %}
+
+<!-- Summary metrics -->
+<div class="grid grid-4" style="margin-bottom: 20px;">
+  <div class="card metric">
+    <div class="metric-value">{{ runs | selectattr('reachable') | list | length }}</div>
+    <div class="metric-label">Active Runs</div>
+  </div>
+  <div class="card metric">
+    {% set total_tok = runs | selectattr('reachable') | map(attribute='status') | map(attribute='tok_per_sec', default=0) | select('number') | list | sum %}
+    <div class="metric-value">{{ '{:,.0f}'.format(total_tok) }}</div>
+    <div class="metric-label">Total tok/sec</div>
+  </div>
+  <div class="card metric">
+    {% set losses = runs | selectattr('reachable') | map(attribute='status') | map(attribute='loss') | select('number') | list %}
+    <div class="metric-value">{{ '{:.4f}'.format(losses | min) if losses else '-' }}</div>
+    <div class="metric-label">Best Loss</div>
+  </div>
+  <div class="card metric">
+    {% set mfus = runs | selectattr('reachable') | map(attribute='status') | map(attribute='mfu') | select('number') | list %}
+    <div class="metric-value">{{ '{:.1f}%'.format(mfus | max * 100) if mfus else '-' }}</div>
+    <div class="metric-label">Peak MFU</div>
+  </div>
+</div>
+
+<!-- Run cards -->
+{% for run in runs %}
+<div class="card">
+  <div class="card-header">
+    <div>
+      <span class="card-title">
+        {% if run.reachable %}
+          <a href="{{ url_for('run_detail', port=run.port) }}">
+            {{ run.status.get('run_name', 'run@' ~ run.port) }}
+          </a>
+        {% else %}
+          run@{{ run.port }}
+        {% endif %}
+      </span>
+      {% if run.reachable %}
+        <span class="badge badge-green">RUNNING</span>
+      {% else %}
+        <span class="badge badge-red">UNREACHABLE</span>
+      {% endif %}
+      <span style="color: var(--fg3); font-size: 13px; margin-left: 8px;">port {{ run.port }}</span>
+      {% if run.get('process', {}).get('pid') %}
+        <span style="color: var(--fg3); font-size: 13px;">| PID {{ run.process.pid }}</span>
+      {% endif %}
+    </div>
+    {% if run.reachable %}
+    <a href="{{ url_for('run_detail', port=run.port) }}" class="btn btn-sm btn-primary">Details</a>
+    {% endif %}
+  </div>
+
+  {% if run.reachable %}
+  {% set s = run.status %}
+  <div class="grid grid-4">
+    <div class="metric">
+      <div class="metric-value" style="font-size: 20px;">{{ s.get('step', '?') }}</div>
+      <div class="metric-label">Step{% if s.get('num_iterations') %} / {{ s.num_iterations }}{% endif %}</div>
+    </div>
+    <div class="metric">
+      <div class="metric-value" style="font-size: 20px;">{{ '{:.4f}'.format(s.loss) if s.get('loss') is not none else '-' }}</div>
+      <div class="metric-label">Loss</div>
+    </div>
+    <div class="metric">
+      <div class="metric-value" style="font-size: 20px;">{{ '{:,.0f}'.format(s.tok_per_sec) if s.get('tok_per_sec') else '-' }}</div>
+      <div class="metric-label">tok/sec</div>
+    </div>
+    <div class="metric">
+      <div class="metric-value" style="font-size: 20px;">{{ '{:.1f}%'.format(s.mfu * 100) if s.get('mfu') else '-' }}</div>
+      <div class="metric-label">MFU</div>
+    </div>
+  </div>
+  {% endif %}
+
+  {% if run.get('process', {}).get('cmdline') %}
+  <div class="cmdline">{{ run.process.cmdline }}</div>
+  {% endif %}
+</div>
+{% endfor %}
+{% endif %}
+
+<script>
+// Auto-refresh every 30 seconds
+setTimeout(() => location.reload(), 30000);
+</script>
+{% endblock %}

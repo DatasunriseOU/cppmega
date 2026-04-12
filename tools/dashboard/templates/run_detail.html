@@ -1,0 +1,339 @@
+{% extends "base.html" %}
+{% block title %}{{ run.get('status', {}).get('run_name', 'Run') }} - nanochat{% endblock %}
+{% block content %}
+<div style="display: flex; align-items: center; gap: 16px; margin-bottom: 20px;">
+  <a href="{{ url_for('index') }}" style="color: var(--fg2);">&larr; Back</a>
+  <h1 style="font-size: 24px;">{{ run.get('status', {}).get('run_name', 'Run @ port ' ~ port) }}</h1>
+  {% if run.reachable %}
+    <span class="badge badge-green">RUNNING</span>
+  {% else %}
+    <span class="badge badge-red">UNREACHABLE</span>
+  {% endif %}
+</div>
+
+{% if not run.reachable %}
+<div class="card"><p style="color: var(--fg2);">Training API on port {{ port }} is not responding.</p></div>
+{% else %}
+{% set s = run.status %}
+{% set c = run.config %}
+{% set m = run.memory %}
+
+<!-- Live metrics -->
+<div class="grid grid-4" style="margin-bottom: 16px;">
+  <div class="card metric">
+    <div class="metric-value">{{ s.get('step', '?') }}</div>
+    <div class="metric-label">Step{% if s.get('num_iterations') %} / {{ s.num_iterations }}{% endif %}</div>
+  </div>
+  <div class="card metric">
+    <div class="metric-value">{{ '{:.4f}'.format(s.loss) if s.get('loss') is not none else '-' }}</div>
+    <div class="metric-label">Loss</div>
+  </div>
+  <div class="card metric">
+    <div class="metric-value">{{ '{:,.0f}'.format(s.tok_per_sec) if s.get('tok_per_sec') else '-' }}</div>
+    <div class="metric-label">tok/sec</div>
+  </div>
+  <div class="card metric">
+    <div class="metric-value">{{ '{:.1f}%'.format(s.mfu * 100) if s.get('mfu') else '-' }}</div>
+    <div class="metric-label">MFU</div>
+  </div>
+</div>
+
+<!-- Analytics summary -->
+{% if analytics %}
+<div class="card" style="margin-bottom: 16px;">
+  <div class="card-header">
+    <span class="card-title">Analytics</span>
+    <span style="color: var(--fg2); font-size: 12px;">Based on {{ analytics.get('total_points', 0) }} data points, window={{ analytics.get('window_size', 0) }}</span>
+  </div>
+  <div class="grid grid-4">
+    <div class="metric">
+      <div class="metric-value" style="font-size: 18px; color: {% if analytics.get('loss_per_1k_steps', 0) < 0 %}var(--green){% else %}var(--red){% endif %};">
+        {{ '{:+.4f}'.format(analytics.loss_per_1k_steps) if analytics.get('loss_per_1k_steps') is not none else '-' }}
+      </div>
+      <div class="metric-label">Loss / 1K steps</div>
+    </div>
+    <div class="metric">
+      <div class="metric-value" style="font-size: 18px;">{{ '{:.4f}'.format(analytics.smoothed_loss_latest) if analytics.get('smoothed_loss_latest') is not none else '-' }}</div>
+      <div class="metric-label">Smoothed Loss (EMA)</div>
+    </div>
+    {% if analytics.get('predictions') %}
+    {% for key, val in analytics.predictions.items() %}
+    <div class="metric">
+      <div class="metric-value" style="font-size: 18px;">{{ '{:.4f}'.format(val) }}</div>
+      <div class="metric-label">Predicted @ {{ key.replace('step_', 'step ') }}</div>
+    </div>
+    {% endfor %}
+    {% endif %}
+  </div>
+  {% if analytics.get('convergence') %}
+  <div style="margin-top: 8px; font-size: 13px; color: var(--fg2);">
+    Convergence estimates:
+    {% for key, steps in analytics.convergence.items() %}
+      {{ key.replace('loss_', 'loss=') }}: ~{{ '{:,.0f}'.format(steps) }} steps
+    {% endfor %}
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+
+<!-- Charts -->
+<div class="grid grid-2" style="margin-bottom: 16px;">
+  <div class="card">
+    <div class="card-title" style="margin-bottom: 8px;">Loss</div>
+    <canvas id="lossChart" height="200"></canvas>
+  </div>
+  <div class="card">
+    <div class="card-title" style="margin-bottom: 8px;">Throughput & MFU</div>
+    <canvas id="throughputChart" height="200"></canvas>
+  </div>
+</div>
+<div class="grid grid-2" style="margin-bottom: 16px;">
+  <div class="card">
+    <div class="card-title" style="margin-bottom: 8px;">Learning Rate</div>
+    <canvas id="lrChart" height="160"></canvas>
+  </div>
+  <div class="card">
+    <div class="card-title" style="margin-bottom: 8px;">Validation BPB</div>
+    <canvas id="bpbChart" height="160"></canvas>
+  </div>
+</div>
+
+<!-- Status + Memory -->
+<div class="grid grid-2">
+  <div class="card">
+    <div class="card-title" style="margin-bottom: 12px;">Status</div>
+    <table>
+      {% for key in ['lr', 'val_bpb', 'eta_seconds', 'global_step', 'stage_step', 'stage_start_step', 'stage_end_step', 'grad_norm'] %}
+        {% if s.get(key) is not none %}
+        <tr>
+          <td style="color: var(--fg2); width: 180px;">{{ key }}</td>
+          <td>{% if key == 'eta_seconds' %}{{ '{:.0f}'.format(s[key] / 3600) }}h {{ '{:.0f}'.format((s[key] % 3600) / 60) }}m{% elif key == 'lr' %}{{ '{:.2e}'.format(s[key]) }}{% else %}{{ s[key] }}{% endif %}</td>
+        </tr>
+        {% endif %}
+      {% endfor %}
+    </table>
+  </div>
+  <div class="card">
+    <div class="card-title" style="margin-bottom: 12px;">Memory</div>
+    {% if m %}
+    <table>
+      {% for key, val in m.items() %}
+      <tr><td style="color: var(--fg2); width: 180px;">{{ key }}</td><td>{{ val }}</td></tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <p style="color: var(--fg2);">No memory info available</p>
+    {% endif %}
+  </div>
+</div>
+
+<!-- Runtime Config (editable) -->
+<div class="card" style="margin-top: 16px;">
+  <div class="card-header">
+    <div class="card-title">Runtime Config</div>
+    <span style="color: var(--fg2); font-size: 12px;">Edit values and click Update</span>
+  </div>
+  <form method="post" action="{{ url_for('update_config', port=port) }}">
+    {% set readonly = c.get('_readonly', {}) %}
+    {% if readonly %}
+    <div class="section-title">Model (read-only)</div>
+    <div class="config-form" style="margin-bottom: 16px;">
+      {% for key, val in readonly.items() %}
+      <label>{{ key }}</label>
+      <input type="text" value="{{ val }}" disabled style="opacity: 0.5;">
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    {% set categories = {
+      'Training Schedule': ['save_every', 'eval_every', 'sample_every', 'core_metric_every', 'num_iterations'],
+      'Gradient & Optimizer': ['max_grad_norm', 'lr', 'final_lr_frac', 'adamw_weight_decay'],
+      'Loss Weights': ['mtp_lambda', 'mtp_start_step', 'mtp_warmup_steps', 'mtp_cadence', 'mtp_ntp_weight', 'ncp_concept_loss_weight', 'top_lambda', 'stp_lambda', 'gateskip_lambda', 'temporal_aux_lambda', 'temporal_latent_lambda', 'dsa_distillation_weight', 'moe_aux_loss_weight', 'moe_router_z_loss_weight', 'mod_aux_loss_weight'],
+      'MoE / MoD Dynamic': ['moe_capacity_factor', 'moe_routed_scaling_factor', 'mod_capacity'],
+      'FIM Rates': ['fim_rate', 'function_fim_rate', 'include_fim_rate', 'ast_fim_rate', 'ifim_rate'],
+      'DSA Tuning': ['dsa_top_k_ratio', 'dsa_local_window'],
+      'Batch & Profiling': ['device_batch_size', 'total_batch_size', 'profile_steps'],
+    } %}
+
+    {% for cat_name, keys in categories.items() %}
+      {% set ns = namespace(has_any=false) %}
+      {% for key in keys %}{% if c.get(key) is not none %}{% set ns.has_any = true %}{% endif %}{% endfor %}
+      {% if ns.has_any %}
+      <div class="section-title">{{ cat_name }}</div>
+      <div class="config-form">
+        {% for key in keys %}
+          {% if c.get(key) is not none %}
+          <label>{{ key }}</label>
+          <input type="number" name="{{ key }}" value="{{ c[key] }}" step="any">
+          {% endif %}
+        {% endfor %}
+      </div>
+      {% endif %}
+    {% endfor %}
+
+    <div style="margin-top: 16px; display: flex; gap: 8px;">
+      <button type="submit" class="btn btn-primary">Update Config</button>
+    </div>
+  </form>
+</div>
+
+<!-- Actions -->
+<div class="card" style="margin-top: 16px;">
+  <div class="card-title" style="margin-bottom: 12px;">Actions</div>
+  <div style="display: flex; gap: 8px;">
+    <form method="post" action="{{ url_for('trigger_checkpoint', port=port) }}" style="display: inline;">
+      <button type="submit" class="btn">Save Checkpoint</button>
+    </form>
+    <form method="post" action="{{ url_for('trigger_shutdown', port=port) }}" style="display: inline;"
+          onsubmit="return confirm('Shut down this training run? A checkpoint will be saved first.')">
+      <button type="submit" class="btn btn-danger">Shutdown</button>
+    </form>
+  </div>
+</div>
+
+{% if run.get('process', {}).get('cmdline') %}
+<div class="card" style="margin-top: 16px;">
+  <div class="card-title" style="margin-bottom: 8px;">Command Line</div>
+  <pre style="font-size: 12px; color: var(--fg2); white-space: pre-wrap; word-break: break-all;">{{ run.process.cmdline }}</pre>
+</div>
+{% endif %}
+
+{% endif %}
+
+<!-- Chart.js from CDN -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script>
+const PORT = {{ port }};
+const CHART_COLORS = {
+  loss: '#f85149',
+  smoothed: '#58a6ff',
+  trendline: '#d29922',
+  tokSec: '#3fb950',
+  mfu: '#bc8cff',
+  lr: '#58a6ff',
+  bpb: '#f0883e',
+  valLoss: '#d29922',
+};
+
+const chartDefaults = {
+  responsive: true,
+  animation: false,
+  plugins: { legend: { labels: { color: '#8b949e', font: { size: 11 } } } },
+  scales: {
+    x: { ticks: { color: '#484f58', font: { size: 10 } }, grid: { color: '#21262d' } },
+    y: { ticks: { color: '#484f58', font: { size: 10 } }, grid: { color: '#21262d' } },
+  },
+};
+
+let lossChart, throughputChart, lrChart, bpbChart;
+
+function createCharts() {
+  lossChart = new Chart(document.getElementById('lossChart'), {
+    type: 'line',
+    data: { labels: [], datasets: [] },
+    options: { ...chartDefaults, plugins: { ...chartDefaults.plugins, title: { display: false } },
+      scales: { ...chartDefaults.scales, y: { ...chartDefaults.scales.y, title: { display: true, text: 'Loss', color: '#8b949e' } } } },
+  });
+  throughputChart = new Chart(document.getElementById('throughputChart'), {
+    type: 'line',
+    data: { labels: [], datasets: [] },
+    options: { ...chartDefaults,
+      scales: {
+        x: chartDefaults.scales.x,
+        y: { ...chartDefaults.scales.y, position: 'left', title: { display: true, text: 'tok/sec', color: '#8b949e' } },
+        y1: { ...chartDefaults.scales.y, position: 'right', title: { display: true, text: 'MFU %', color: '#8b949e' }, grid: { drawOnChartArea: false } },
+      },
+    },
+  });
+  lrChart = new Chart(document.getElementById('lrChart'), {
+    type: 'line',
+    data: { labels: [], datasets: [] },
+    options: { ...chartDefaults, scales: { ...chartDefaults.scales, y: { ...chartDefaults.scales.y, type: 'logarithmic' } } },
+  });
+  bpbChart = new Chart(document.getElementById('bpbChart'), {
+    type: 'line',
+    data: { labels: [], datasets: [] },
+    options: chartDefaults,
+  });
+}
+
+function updateCharts(data) {
+  const steps = data.steps;
+  const m = data.metrics;
+
+  // Loss chart: raw + smoothed + trendline
+  lossChart.data.labels = steps;
+  lossChart.data.datasets = [
+    { label: 'Loss', data: m.loss, borderColor: CHART_COLORS.loss, borderWidth: 1, pointRadius: 0, tension: 0.1 },
+    { label: 'Smoothed (EMA)', data: data.smoothed_loss, borderColor: CHART_COLORS.smoothed, borderWidth: 2, pointRadius: 0, tension: 0.3 },
+  ];
+  if (m.loss_val && m.loss_val.some(v => v !== null)) {
+    lossChart.data.datasets.push({ label: 'Val Loss', data: m.loss_val, borderColor: CHART_COLORS.valLoss, borderWidth: 1.5, pointRadius: 2, tension: 0.1 });
+  }
+  if (data.trendline.steps.length > 0) {
+    // Map trendline to chart labels (sparse dataset)
+    lossChart.data.datasets.push({
+      label: 'Trend', data: data.trendline.steps.map((s, i) => ({ x: s, y: data.trendline.values[i] })),
+      borderColor: CHART_COLORS.trendline, borderWidth: 2, borderDash: [6, 4], pointRadius: 0, tension: 0,
+      parsing: { xAxisKey: 'x', yAxisKey: 'y' },
+    });
+  }
+  lossChart.update();
+
+  // Throughput chart: tok/sec (left axis) + MFU (right axis)
+  throughputChart.data.labels = steps;
+  throughputChart.data.datasets = [
+    { label: 'tok/sec', data: m.tok_per_sec, borderColor: CHART_COLORS.tokSec, borderWidth: 1.5, pointRadius: 0, yAxisID: 'y' },
+    { label: 'MFU %', data: (m.mfu || []).map(v => v !== null ? (v * 100).toFixed(1) : null), borderColor: CHART_COLORS.mfu, borderWidth: 1.5, pointRadius: 0, yAxisID: 'y1' },
+  ];
+  throughputChart.update();
+
+  // LR chart
+  lrChart.data.labels = steps;
+  lrChart.data.datasets = [
+    { label: 'Learning Rate', data: m.lr, borderColor: CHART_COLORS.lr, borderWidth: 1.5, pointRadius: 0 },
+  ];
+  lrChart.update();
+
+  // BPB chart
+  const hasBpb = m.val_bpb && m.val_bpb.some(v => v !== null);
+  bpbChart.data.labels = steps;
+  bpbChart.data.datasets = [];
+  if (hasBpb) {
+    bpbChart.data.datasets.push({ label: 'Val BPB', data: m.val_bpb, borderColor: CHART_COLORS.bpb, borderWidth: 1.5, pointRadius: 2, spanGaps: true });
+  }
+  if (m.grad_norm && m.grad_norm.some(v => v !== null)) {
+    bpbChart.data.datasets.push({ label: 'Grad Norm', data: m.grad_norm, borderColor: '#8b949e', borderWidth: 1, pointRadius: 0 });
+  }
+  if (!hasBpb && (!m.grad_norm || !m.grad_norm.some(v => v !== null))) {
+    bpbChart.data.datasets.push({ label: 'No data yet', data: [], borderColor: '#484f58' });
+  }
+  bpbChart.update();
+}
+
+async function fetchAndUpdate() {
+  try {
+    const resp = await fetch('/api/chart/' + PORT);
+    const data = await resp.json();
+    updateCharts(data);
+    // Update analytics display
+    if (data.analytics && data.analytics.loss_per_1k_steps !== undefined) {
+      const el = document.getElementById('live-loss-per-1k');
+      if (el) el.textContent = (data.analytics.loss_per_1k_steps >= 0 ? '+' : '') + data.analytics.loss_per_1k_steps.toFixed(4);
+    }
+  } catch (e) {
+    console.error('Chart update failed:', e);
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  createCharts();
+  fetchAndUpdate();
+  // Auto-refresh charts every 15s (much faster than page reload)
+  setInterval(fetchAndUpdate, 15000);
+});
+
+// Page still auto-refreshes for metrics cards every 60s
+setTimeout(() => location.reload(), 60000);
+</script>
+{% endblock %}

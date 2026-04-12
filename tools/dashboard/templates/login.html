@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Login - nanochat{% endblock %}
+{% block content %}
+<div style="max-width: 360px; margin: 80px auto;">
+  <div class="card">
+    <h2 style="text-align: center; margin-bottom: 20px;">nanochat Dashboard</h2>
+    <form method="post">
+      <div style="margin-bottom: 12px;">
+        <label style="font-size: 13px; color: var(--fg2);">Username</label>
+        <input type="text" name="username" autofocus required>
+      </div>
+      <div style="margin-bottom: 16px;">
+        <label style="font-size: 13px; color: var(--fg2);">Password</label>
+        <input type="password" name="password" required>
+      </div>
+      <button type="submit" class="btn btn-primary" style="width: 100%; padding: 10px;">Login</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

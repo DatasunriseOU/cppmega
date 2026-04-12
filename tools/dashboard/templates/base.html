@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}nanochat{% endblock %}</title>
+<style>
+:root {
+  --bg: #0d1117; --bg2: #161b22; --bg3: #21262d;
+  --fg: #c9d1d9; --fg2: #8b949e; --fg3: #484f58;
+  --accent: #58a6ff; --green: #3fb950; --red: #f85149;
+  --orange: #d29922; --purple: #bc8cff;
+  --border: #30363d; --radius: 8px;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, 'Segoe UI', Roboto, monospace; background: var(--bg); color: var(--fg); line-height: 1.5; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.nav { background: var(--bg2); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; align-items: center; gap: 24px; }
+.nav-brand { font-size: 18px; font-weight: 700; color: var(--fg); }
+.nav-links { display: flex; gap: 16px; }
+.nav-right { margin-left: auto; color: var(--fg2); font-size: 13px; }
+
+.container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+
+.card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; margin-bottom: 16px; }
+.card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.card-title { font-size: 16px; font-weight: 600; }
+
+.grid { display: grid; gap: 16px; }
+.grid-2 { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+.grid-3 { grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }
+.grid-4 { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+
+.metric { text-align: center; padding: 12px; }
+.metric-value { font-size: 28px; font-weight: 700; color: var(--accent); }
+.metric-label { font-size: 12px; color: var(--fg2); text-transform: uppercase; letter-spacing: 1px; }
+
+.badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+.badge-green { background: rgba(63,185,80,0.15); color: var(--green); }
+.badge-red { background: rgba(248,81,73,0.15); color: var(--red); }
+.badge-orange { background: rgba(210,153,34,0.15); color: var(--orange); }
+
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th { text-align: left; padding: 8px 12px; color: var(--fg2); font-weight: 600; border-bottom: 1px solid var(--border); font-size: 12px; text-transform: uppercase; }
+td { padding: 8px 12px; border-bottom: 1px solid var(--border); }
+tr:hover { background: var(--bg3); }
+
+.btn { display: inline-block; padding: 6px 16px; border-radius: 6px; font-size: 14px; font-weight: 500; border: 1px solid var(--border); cursor: pointer; background: var(--bg3); color: var(--fg); }
+.btn:hover { background: var(--border); text-decoration: none; }
+.btn-primary { background: rgba(88,166,255,0.15); border-color: var(--accent); color: var(--accent); }
+.btn-danger { background: rgba(248,81,73,0.1); border-color: var(--red); color: var(--red); }
+.btn-sm { padding: 3px 10px; font-size: 12px; }
+
+input[type=text], input[type=password], input[type=number] {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 10px; color: var(--fg); font-size: 14px; width: 100%;
+}
+input:focus { outline: none; border-color: var(--accent); }
+
+.flash { padding: 10px 16px; border-radius: 6px; margin-bottom: 16px; font-size: 14px; }
+.flash-success { background: rgba(63,185,80,0.1); border: 1px solid var(--green); color: var(--green); }
+.flash-error { background: rgba(248,81,73,0.1); border: 1px solid var(--red); color: var(--red); }
+
+.cmdline { font-family: 'Fira Code', 'Cascadia Code', monospace; font-size: 12px; color: var(--fg2); word-break: break-all; max-height: 60px; overflow: hidden; }
+.cmdline:hover { max-height: none; }
+
+.empty-state { text-align: center; padding: 60px 20px; color: var(--fg2); }
+.empty-state h2 { margin-bottom: 8px; color: var(--fg); }
+
+.config-form { display: grid; grid-template-columns: 200px 1fr; gap: 8px; align-items: center; }
+.config-form label { font-size: 13px; color: var(--fg2); }
+.config-form input { max-width: 200px; }
+
+.section-title { font-size: 14px; font-weight: 600; color: var(--fg2); text-transform: uppercase; letter-spacing: 1px; margin: 16px 0 8px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
+
+footer { text-align: center; padding: 20px; color: var(--fg3); font-size: 12px; }
+</style>
+</head>
+<body>
+<nav class="nav">
+  <span class="nav-brand">nanochat</span>
+  <div class="nav-links">
+    <a href="{{ url_for('index') }}">Dashboard</a>
+    <a href="{{ url_for('history') }}">History</a>
+    <a href="{{ url_for('system') }}">System</a>
+  </div>
+  <div class="nav-right">
+    {% if session.get('logged_in') %}
+      {{ session.username }} | <a href="{{ url_for('logout') }}">Logout</a>
+    {% endif %}
+  </div>
+</nav>
+
+<div class="container">
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, msg in messages %}
+      <div class="flash flash-{{ category }}">{{ msg }}</div>
+    {% endfor %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</div>
+
+<footer>nanochat training dashboard</footer>
+</body>
+</html>

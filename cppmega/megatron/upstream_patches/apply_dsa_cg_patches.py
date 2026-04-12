@@ -179,6 +179,34 @@ def apply_all():
         ),
     ], "tilelang_sparse_mla_bwd.py P/dP fp32")
 
+    # === Patch 8: dsa.py — _scatter_topk_into_index_mask CG-unsafe .any() ===
+    print("Patch 8: dsa.py _scatter_topk_into_index_mask CG safety")
+    # The upstream implementation uses ``if torch.any(idx_chunk < 0):`` and
+    # ``if valid_topk.any():`` which trigger implicit .item() CPU syncs,
+    # breaking CUDA graph capture.  Replace with branchless clamp+scatter+fixup.
+    _patch_file(dsa_file, [
+        (
+            """        if torch.any(idx_chunk < 0):
+            valid_topk = idx_chunk >= 0
+            if valid_topk.any():
+                b_idx, q_rel_idx, t_idx = torch.where(valid_topk)
+                q_idx = q_rel_idx + s0
+                k_idx = idx_chunk[b_idx, q_rel_idx, t_idx]
+                index_mask[b_idx, q_idx, k_idx] = 0.0
+        else:
+            index_mask[:, s0:s1].scatter_(-1, idx_chunk, 0.0)""",
+            """        # cppmega: branchless scatter (CG-safe, no .any()/.item() CPU sync)
+        sentinel = idx_chunk < 0
+        safe_chunk = idx_chunk.clamp(min=0)
+        index_mask[:, s0:s1].scatter_(-1, safe_chunk, 0.0)
+        # Undo position-0 unmasking from clamped sentinels
+        has_sent = sentinel.any(dim=-1)          # [b, chunk_len]
+        has_real0 = ((idx_chunk == 0) & ~sentinel).any(dim=-1)
+        fixup = has_sent & ~has_real0            # [b, chunk_len]
+        index_mask[:, s0:s1, 0].masked_fill_(fixup, float("-inf"))""",
+        ),
+    ], "dsa.py _scatter_topk_into_index_mask CG safety")
+
     print()
     print("All patches applied. Restart training to pick up changes.")
 

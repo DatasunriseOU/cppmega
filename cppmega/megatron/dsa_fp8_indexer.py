@@ -308,18 +308,25 @@ def _attention_target_fp32(
     # handles this by only scattering indices >= 0. We replicate the same
     # logic: clamp -1 -> 0 for scatter, then re-mask those positions to
     # -inf so the sentinel doesn't accidentally unmask key position 0.
+    #
+    # NOTE: We use a branchless approach (clamp + scatter + fixup) instead
+    # of ``if (topk_indices < 0).any():`` because ``.any()`` triggers an
+    # implicit ``.item()`` CPU sync which is banned during CUDA graph
+    # capture (cudaErrorStreamCaptureUnsupported).
     index_mask = torch.full(
         (b, sq, sk), float("-inf"), dtype=torch.float32, device=device
     )
-    _has_neg = (topk_indices < 0).any()
-    if _has_neg:
-        valid = topk_indices >= 0
-        if valid.any():
-            bi, qi, ti = torch.where(valid)
-            ki = topk_indices[bi, qi, ti]
-            index_mask[bi, qi, ki] = 0.0
-    else:
-        index_mask.scatter_(-1, topk_indices, 0.0)
+    # Clamp sentinels to 0 so scatter_ doesn't OOB, then scatter 0.0.
+    sentinel_mask = topk_indices < 0  # [b, sq, topk] bool
+    safe_indices = topk_indices.clamp(min=0)
+    index_mask.scatter_(-1, safe_indices, 0.0)
+    # Undo any position-0 unmasking caused by clamped sentinels:
+    # for rows that had a sentinel mapped to k=0, re-mask k=0 to -inf
+    # UNLESS a real (non-sentinel) index also pointed to k=0.
+    has_sentinel = sentinel_mask.any(dim=-1)        # [b, sq]
+    has_real_zero = ((topk_indices == 0) & ~sentinel_mask).any(dim=-1)  # [b, sq]
+    fixup = has_sentinel & ~has_real_zero            # [b, sq]
+    index_mask[:, :, 0].masked_fill_(fixup, float("-inf"))
 
     # Accumulator for sum-over-heads of post-softmax distributions.
     acc = torch.zeros(b, sq, sk, dtype=torch.float32, device=device)

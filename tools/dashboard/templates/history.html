@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}History - nanochat{% endblock %}
+{% block content %}
+<h1 style="font-size: 24px; margin-bottom: 20px;">Run History</h1>
+
+{% if not by_run %}
+<div class="empty-state">
+  <h2>No history yet</h2>
+  <p>History is recorded each time you visit the dashboard while training runs are active.</p>
+</div>
+{% else %}
+
+{% for run_name, entries in by_run.items() | sort %}
+<div class="card">
+  <div class="card-header">
+    <span class="card-title">{{ run_name }}</span>
+    <span style="color: var(--fg2); font-size: 13px;">{{ entries | length }} snapshots | port {{ entries[-1].port }}</span>
+  </div>
+
+  {% if entries %}
+  {% set first = entries[0] %}
+  {% set last = entries[-1] %}
+  <div class="grid grid-4">
+    <div class="metric">
+      <div class="metric-value" style="font-size: 18px;">{{ first.step }} &rarr; {{ last.step }}</div>
+      <div class="metric-label">Step Range</div>
+    </div>
+    <div class="metric">
+      <div class="metric-value" style="font-size: 18px;">{{ '{:.4f}'.format(last.loss) if last.loss else '-' }}</div>
+      <div class="metric-label">Latest Loss</div>
+    </div>
+    <div class="metric">
+      <div class="metric-value" style="font-size: 18px;">{{ '{:,.0f}'.format(last.tok_per_sec) if last.tok_per_sec else '-' }}</div>
+      <div class="metric-label">Latest tok/sec</div>
+    </div>
+    <div class="metric">
+      <div class="metric-value" style="font-size: 18px;">{{ first.timestamp[:10] }}</div>
+      <div class="metric-label">First Seen</div>
+    </div>
+  </div>
+  {% endif %}
+</div>
+{% endfor %}
+
+{% endif %}
+{% endblock %}
