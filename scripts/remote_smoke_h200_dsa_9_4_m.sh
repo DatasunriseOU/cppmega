@@ -348,10 +348,10 @@ if [ "${CPPMEGA_DISPATCHER_OVERRIDE:-}" = "alltoall" ]; then
 fi
 echo "NATIVE_ARGS (post-sed): ${NATIVE_ARGS}"
 
-# Per-module CUDA graph scope (full).
-# All torch.equal/item() in DSA patched via upstream_patches/apply_dsa_cg_patches.py.
-# Mamba recompute wrapper uses is_graph_capturing() guard (CG-aware).
-CG_FLAGS="--cuda-graph-impl transformer_engine --cuda-graph-scope attn mamba moe_router moe_preprocess --cuda-graph-warmup-steps 3"
+# CUDA graphs — testing lr=1e-5 + full CG scope.
+# attn+mamba excluded: TileLang bwd + checkpoint wrapper incompatible with CG replay at lr=1e-4.
+# But may work at lr=1e-5 (lower gradient magnitude = no overflow in CG replay).
+CG_FLAGS="--cuda-graph-impl transformer_engine --cuda-graph-scope moe_router moe_preprocess --cuda-graph-warmup-steps 3"
 # NOTE: --moe-pad-expert-input-to-capacity is INCOMPATIBLE with flex dispatcher
 # (raises ValueError). Omit when using DeepEP flex.
 MOE_EXTRA_FLAGS=""
