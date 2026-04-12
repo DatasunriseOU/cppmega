@@ -297,6 +297,10 @@ if [ "${EP_SIZE}" != "1" ]; then
   NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--expert-model-parallel-size 1/--expert-model-parallel-size ${EP_SIZE}/")
 fi
 
+# Strip --dsa-indexer-dtype (cppmega-only flag not registered in Megatron's
+# argparser; actual FP8 behavior is controlled by CPPMEGA_DSA_INDEXER_DTYPE env).
+NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed 's/--dsa-indexer-dtype [a-z0-9]*//')
+
 # Confirm the substitution actually happened.
 if ! echo "${NATIVE_ARGS}" | grep -q -- "--expert-model-parallel-size ${EP_SIZE}"; then
   echo "ERROR: failed to set --expert-model-parallel-size ${EP_SIZE}; NATIVE_ARGS=${NATIVE_ARGS}" >&2
