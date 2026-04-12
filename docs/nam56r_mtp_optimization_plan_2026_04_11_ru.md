@@ -1095,3 +1095,32 @@ Absorbed путь (DeepSeek, PR #3674):
 | PyTorch sparse + full CG | 5.8s / 141 TFLOP/s | 103 GiB | ✅ 20/20 stable |
 | TileLang fused fwd+bwd | 4.2s / 194 TFLOP/s | 55 GiB | ⚠️ bwd NaN (tail_dim=96) |
 | TileLang + qk_pos=64 | TBD (tail_dim=128) | TBD | 🔄 testing |
+
+### LR Sweep Plan (TileLang absorbed MLA)
+
+lr=1e-4 diverges с TileLang (grad_norm=inf at iter 4), lr=1e-5 стабильно (20/20).
+Оптимальный lr между ними. План sweep:
+
+| lr | Ожидание | Машина | Итерации |
+|----|----------|--------|----------|
+| 1e-5 | ✅ verified stable | europe v28 | 20/20 OK |
+| 2e-5 | likely stable | bench3 | 50 iters |
+| 3e-5 | likely stable | europe | 50 iters |
+| 5e-5 | borderline | bench3 | 50 iters |
+| 7e-5 | borderline | europe | 50 iters |
+| 1e-4 | ❌ known unstable | — | skip |
+
+Также проверить: lr warmup (1e-6 → 1e-4 за 100 steps) может стабилизировать 1e-4.
+
+### Topology Sweep Plan (обе машины параллельно)
+
+| # | Config | Машина | Ожидание |
+|---|--------|--------|----------|
+| 1 | PP=1 EP=1 DP=8 | bench3 | Baseline 75k tok/sec (v28 verified) |
+| 2 | PP=2 VPP=2 EP=2 DP=2 | europe | ~60k (PP overhead) |
+| 3 | PP=2 VPP=2 EP=4 DP=1 | europe | ~55k (more EP overhead) |
+| 4 | PP=1 EP=2 DP=4 | bench3 | ~70k (no PP overhead) |
+| 5 | PP=1 EP=4 DP=2 | bench3 | ~65k |
+| 6 | PP=2 VPP=1 EP=2 DP=2 | europe | ~55k (VPP=1 worse) |
+
+Цель: найти конфигурацию с максимальным throughput × scalability.
