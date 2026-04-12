@@ -77,7 +77,11 @@ def sparse_dsa_fn(
     idx_k_base = topk_indices.unsqueeze(-1)
     idx_v_base = topk_indices.unsqueeze(-1)
 
-    head_chunk = min(np_, max(1, 140 * 1024**3 // (b * sq * topk * hn * 2 * 4)))  # fit ~4 tensors in 140G
+    # Budget: K_gather(bf16) + V_gather(bf16) + scores(fp32) + attn_w(fp32) per chunk
+    bytes_per_head = b * sq * topk * (hn * 2 + hnv * 2 + 4 + 4)
+    free_bytes = torch.cuda.mem_get_info(q.device)[0]
+    # Use at most 80% of free memory for the chunk to leave room for autograd
+    head_chunk = min(np_, max(1, int(free_bytes * 0.8) // bytes_per_head))
     output = torch.zeros(b, np_, sq, hnv, device=q.device, dtype=q.dtype)
 
     for h0 in range(0, np_, head_chunk):
