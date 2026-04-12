@@ -146,3 +146,36 @@ This is the recommended production config for NAM56R DSA training.
 # TileLang fused sparse MLA (auto-enabled via upstream_patches)
 # Mamba recompute: CPPMEGA_MAMBA_RECOMPUTE=1
 ```
+
+## MBS Sweep (PP=1, full CG, TileLang, lr=1e-5)
+
+| MBS | GBS | TFLOP/s | tok/sec | Peak GiB | Headroom | Status |
+|-----|-----|---------|---------|----------|----------|--------|
+| 4 | 32 | 237 | 75k | 81 | 59 GiB | ✅ |
+| 5 | 40 | 242 | 77k | 93 | 47 GiB | ✅ |
+| **6** | **48** | **249** | **79k** | **104** | **36 GiB** | **✅ optimal** |
+| 8 | 64 | 255* | — | 127 | 13 GiB | ❌ OOM |
+
+MBS=6 is the sweet spot. +5% throughput over MBS=4 with 36 GiB headroom.
+MBS=8 OOMs during CG backward capture (MTP logits FP32 cast = 8 GiB).
+
+## Bench3 DeepEP Fix
+
+Root cause: NVIDIA driver 590.48.01 has IOVAS IPC bug (240 assertion failures in dmesg).
+Europe has driver 595.58.03 (fixed). Driver upgrade to 595 installed, reboot pending.
+
+## Complete Session Achievements
+
+| Metric | Start | End |
+|--------|-------|-----|
+| Peak memory | 135.75 GiB OOM | **55 GiB** (TileLang) |
+| Throughput PP=1 | 0 (crash) | **249 TFLOP/s / 79k tok/sec** (MBS=6) |
+| Throughput PP=2 EP=2 | 0 (crash) | **185 TFLOP/s / 59k tok/sec** |
+| CUDA Graphs | Broken | **Full scope working** |
+| TileLang | Not running | **Fused sparse MLA fwd+bwd** |
+| FP8 kernel | N/A | **Written, ready to test** |
+| DSA indexer loss | Skipped (7 GiB) | **Head-streaming (0.8 GiB)** |
+| lr | Fixed 1e-5 | **1e-4 + warmup=100 verified** |
+| Upstream PRs | 0 | **16 applied (10 clean + 6 partial)** |
+| PR #3553 | Incompatible | **Auto-detect adapter written** |
+| Bench3 DeepEP | Broken | **Root cause found, driver upgraded** |
