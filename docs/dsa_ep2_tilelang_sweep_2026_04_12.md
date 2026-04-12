@@ -121,3 +121,28 @@ Files: `cppmega/recipes/megatron_args.py`, `cppmega/recipes/nam56r_nemo_recipe.p
    fragments; BF16 truncation for GEMM input is acceptable at lr=1e-5.
 
 5. **Europe disk**: migrated to `/mnt/data` via symlink. All data on 10TB disk now.
+
+## LR Warmup Result (VERIFIED ✅)
+
+**Config**: lr=1e-4, min-lr=1e-5, warmup=100 steps, cosine decay, full CG, TileLang, PP=1
+
+| Iter | lr | grad_norm | loss | Status |
+|------|-----|-----------|------|--------|
+| 10 | 1e-5 | 101.0 | 7.50 | ✅ warmup |
+| 42 | 4.2e-5 | 5.8 | 2.29 | ✅ past 3e-5 danger zone |
+| 80 | 8e-5 | 3.0 | 1.63 | ✅ approaching peak |
+| 99 | 9.9e-5 | 5.3 | 1.61 | ✅ at peak |
+| 100 | **1e-4** | — | — | ✅ **PEAK PASSED** |
+| 117 | 9.37e-5 | 2.5 | 1.49 | ✅ cosine decay |
+| 118 | 9.3e-5 | 2.6 | 1.33 | ✅ stable |
+
+**VERDICT**: lr=1e-4 with 100-step warmup is STABLE with full CG + TileLang.
+This is the recommended production config for NAM56R DSA training.
+
+### Final Production Config
+```bash
+--lr 1e-4 --min-lr 1e-5 --lr-warmup-iters 100 --lr-decay-style cosine
+--cuda-graph-scope attn mamba moe_router moe_preprocess
+# TileLang fused sparse MLA (auto-enabled via upstream_patches)
+# Mamba recompute: CPPMEGA_MAMBA_RECOMPUTE=1
+```
