@@ -105,13 +105,15 @@ class CppMegaTileLangMIMOFunction(Function):
         D = _contiguous_or_none(D)
         Z = _contiguous_or_none(Z)
 
-        # -- fp32 enforcement on weight/bias params --
+        # -- fp32 enforcement on weight/bias params + DT/ADT --
         Q_bias = _ensure_fp32(Q_bias)
         K_bias = _ensure_fp32(K_bias)
         MIMO_V = _ensure_fp32(MIMO_V)
         MIMO_Z = _ensure_fp32(MIMO_Z)
         MIMO_Out = _ensure_fp32(MIMO_Out)
         D = _ensure_fp32(D)
+        DT = _ensure_fp32(DT)
+        ADT = _ensure_fp32(ADT)
 
         # -- dA prefix-sums (Triton kernel, no varlen for now) --
         if cu_seqlens is not None:
