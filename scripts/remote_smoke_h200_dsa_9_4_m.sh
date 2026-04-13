@@ -77,6 +77,12 @@ export CPPMEGA_SELECTIVE_FP8_MOE="${CPPMEGA_SELECTIVE_FP8_MOE:-0}"
 export CPPMEGA_MTP_LIGER_CE="${CPPMEGA_MTP_LIGER_CE:-0}"
 # CPPMEGA_MAMBA3_COMPILE removed — regional compile is now always-on
 export CPPMEGA_LEMYX_DSA="${CPPMEGA_LEMYX_DSA:-0}"
+# FP8 sparse attention: when 1, unfused_dsa_fn dispatches to SparseMLA_FP8
+# which does per-token quantize bf16->fp8 then runs the FP8 TileLang kernel.
+# Also overrides dsa.SparseMLA so _fused_sparse_mla_absorbed uses FP8.
+export CPPMEGA_DSA_FP8_ATTENTION="${CPPMEGA_DSA_FP8_ATTENTION:-0}"
+# IndexCache: cross-layer index reuse for DSA (skip indexer on 6/9 layers)
+export CPPMEGA_INDEX_CACHE="${CPPMEGA_INDEX_CACHE:-0}"
 # Always on — prevents fragmentation OOM on large models
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export NCCL_GRAPH_REGISTER=0
@@ -272,6 +278,7 @@ if os.environ.get("CPPMEGA_HYBRID_SCHEDULE_PLAN", "0") == "1":
 
 # (15) TileLang SparseMLA monkey-patch for DSA sparse attention
 _sparse_mode = os.environ.get("CPPMEGA_DSA_SPARSE_MODE", "tilelang").strip().lower()
+_fp8_attn = os.environ.get("CPPMEGA_DSA_FP8_ATTENTION", "0") == "1"
 if _sparse_mode not in ("gather_scatter", "gather-scatter", "pytorch"):
     try:
         from megatron.core.transformer.experimental_attention_variant import dsa as _dsa_mod
@@ -279,13 +286,26 @@ if _sparse_mode not in ("gather_scatter", "gather-scatter", "pytorch"):
         if _existing_unfused is not None and not getattr(
             _existing_unfused, "__cppmega_sparse_dsa_patched__", False
         ):
-            from cppmega.megatron.sparse_mla_ops.sparse_mla import (
-                sparse_mla_as_unfused_dsa as _sparse_mla_fn,
-            )
+            if _fp8_attn:
+                from cppmega.megatron.sparse_mla_ops.sparse_mla import (
+                    sparse_mla_fp8_as_unfused_dsa as _sparse_mla_fn,
+                )
+                _label = "FP8"
+            else:
+                from cppmega.megatron.sparse_mla_ops.sparse_mla import (
+                    sparse_mla_as_unfused_dsa as _sparse_mla_fn,
+                )
+                _label = "BF16"
             setattr(_sparse_mla_fn, "__cppmega_sparse_dsa_patched__", True)
             _dsa_mod.unfused_dsa_fn = _sparse_mla_fn
+            # If FP8 attention, also override SparseMLA in dsa module namespace
+            # so _fused_sparse_mla_absorbed always uses FP8 (even for BF16 inputs).
+            if _fp8_attn:
+                from cppmega.megatron.sparse_mla_ops.sparse_mla import SparseMLA_FP8 as _FP8Cls
+                _dsa_mod.SparseMLA = _FP8Cls
+                print("[cppmega_mimo_shim] dsa.SparseMLA overridden with SparseMLA_FP8 (always-on FP8)")
             print(
-                "[cppmega_mimo_shim] TileLang SparseMLA applied "
+                f"[cppmega_mimo_shim] TileLang SparseMLA {_label} applied "
                 "(replaces unfused_dsa_fn: fused online-softmax sparse attention)"
             )
     except Exception as _exc:
@@ -540,6 +560,9 @@ echo "=== Stream M NAM56R 7/7 MIMO + DSA 9+4 + FP8 indexer + loss gate + selecti
 echo "RUN_ID=${RUN_ID} VARIANT=${VARIANT} TP=${TP_SIZE} PP=${PP_SIZE} VPP=${VPP_SIZE} EP=${EP_SIZE} MBS=${MBS} GBS=${GBS} MTP=${MTP_DEPTHS}"
 echo "DSA_A_LAYER_RANKS=${CPPMEGA_DSA_A_LAYER_RANKS}"
 echo "DSA path: lemyx + IndexCache"
+echo "CPPMEGA_DSA_FP8_ATTENTION=${CPPMEGA_DSA_FP8_ATTENTION}"
+echo "CPPMEGA_INDEX_CACHE=${CPPMEGA_INDEX_CACHE}"
+echo "CPPMEGA_MTP_LIGER_CE=${CPPMEGA_MTP_LIGER_CE}"
 echo "EXTRA_FLAGS=${EXTRA_FLAGS}"
 echo "LOG=${LOG}"
 nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
