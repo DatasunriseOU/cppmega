@@ -442,11 +442,15 @@ def apply_hybrid_schedule_plan_patch():
     """Monkey-patch MambaModel + combined_1f1b to enable EP A2A overlap.
 
     1. Bypasses MTP num_layers assertion in TransformerConfig.__post_init__
-       without modifying mtp_num_layers (avoids triggering GPTModel init
-       side-effects from downstream code that checks mtp_num_layers==None).
+       by temporarily setting mtp_num_layers=1 (NOT None -- using None
+       breaks validate_layer_layout and can trigger GPTModel instantiation
+       with incompatible __init__ signature).
     2. Adds build_schedule_plan() to MambaModel.
     3. Wraps combined_forward_backward_step to:
-       a) Accept MambaModel (not just GPTModel) for the isinstance check.
+       a) Accept MambaModel (not just GPTModel) for the isinstance check,
+          by temporarily making GPTModel resolve to LanguageModule (the
+          common base class).  Cannot use __bases__ patching because
+          GPTModel and MambaModel share LanguageModule, causing MRO conflict.
        b) Wrap forward_step_func to support return_schedule_plan=True.
     """
     # (0) Bypass MTP num_layers restriction with EP overlap.
