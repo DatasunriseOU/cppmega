@@ -68,6 +68,42 @@ def _unwrap_quantized(t: torch.Tensor) -> torch.Tensor:
     return t
 
 
+def _extract_fp8_data(t: torch.Tensor):
+    """Extract raw FP8 data + scale from TE Float8Tensor (zero-copy).
+
+    Returns (fp8_data, scale) if the tensor is a Float8Tensor with extractable
+    FP8 data, otherwise returns (None, None).
+
+    TE Float8Tensor stores:
+      - _data: plain torch.Tensor with dtype=float8_e4m3fn, valid data_ptr()
+      - _scale_inv: float32 scalar, dequant factor (real = fp8 * _scale_inv)
+
+    _scale_inv uses the same convention as our per_token_cast_to_fp8 scale
+    (both represent: real_value = fp8_value * scale_factor, where
+    scale_factor = amax / 448.0).
+
+    Note: TE uses per-TENSOR scale (one scalar for all tokens). Our TileLang
+    FP8 kernel expects per-TOKEN scales [batch, seq]. The caller must broadcast
+    the scalar to the required shape.
+    """
+    try:
+        from transformer_engine.pytorch.tensor import QuantizedTensor
+    except ImportError:
+        return None, None
+    if not isinstance(t, QuantizedTensor):
+        return None, None
+    # Check that this is a Float8Tensor with accessible _data
+    data = getattr(t, '_data', None)
+    scale_inv = getattr(t, '_scale_inv', None)
+    if data is None or scale_inv is None:
+        return None, None
+    if data.dtype != torch.float8_e4m3fn:
+        return None, None
+    if data.data_ptr() == 0:
+        return None, None
+    return data, scale_inv
+
+
 class SparseMLA(torch.autograd.Function):
     """Autograd wrapper around TileLang sparse-MLA forward/backward kernels."""
 
@@ -146,8 +182,8 @@ class SparseMLA_FP8(torch.autograd.Function):
         """Forward pass using FP8 sparse MLA kernel.
 
         Args:
-            q: Query tensor [batch, seq, heads, dim+tail_dim] BF16
-            kv: KV tensor [batch, seq_kv, kv_group, dim+tail_dim] BF16
+            q: Query tensor [batch, seq, heads, dim+tail_dim] BF16 or TE Float8Tensor
+            kv: KV tensor [batch, seq_kv, kv_group, dim+tail_dim] BF16 or TE Float8Tensor
             indices: Sparse indices [batch, seq, kv_group, topk] int32
             scaling: float softmax scale
             d_v: int, value head dimension
@@ -160,40 +196,81 @@ class SparseMLA_FP8(torch.autograd.Function):
             sparse_mla_fwd_fp8_interface,
         )
 
-        # Unwrap TE Float8Tensor before FP8 quantization path.
-        q = _unwrap_quantized(q)
-        kv = _unwrap_quantized(kv)
+        # Zero-copy path: extract raw FP8 data + scale from TE Float8Tensor
+        # directly, avoiding the dequantize(fp8->bf16) + re-quantize(bf16->fp8)
+        # round-trip. TE uses per-tensor scale; we broadcast to per-token.
+        q_fp8_data, q_te_scale = _extract_fp8_data(q)
+        kv_fp8_data, kv_te_scale = _extract_fp8_data(kv)
+
+        q_fp8 = None
+        q_scale = None
+        kv_fp8 = None
+        kv_scale = None
+
+        if q_fp8_data is not None:
+            q_fp8 = q_fp8_data.contiguous()
+            # Broadcast per-tensor scale to per-token [batch, seq] or [seq]
+            if q_fp8.ndim == 4:
+                q_scale = q_te_scale.expand(q_fp8.shape[0], q_fp8.shape[1]).contiguous()
+            else:
+                q_scale = q_te_scale.expand(q_fp8.shape[0]).contiguous()
+        else:
+            q = _unwrap_quantized(q)
+            q = q.contiguous()
+
+        if kv_fp8_data is not None:
+            kv_fp8 = kv_fp8_data.contiguous()
+            # Broadcast per-tensor scale to per-token [batch, seq_kv] or [seq_kv]
+            if kv_fp8.ndim == 4:
+                kv_scale = kv_te_scale.expand(kv_fp8.shape[0], kv_fp8.shape[1]).contiguous()
+            else:
+                kv_scale = kv_te_scale.expand(kv_fp8.shape[0]).contiguous()
+        else:
+            kv = _unwrap_quantized(kv)
+            kv = kv.contiguous()
+
         indices = indices.contiguous()
-        q, kv = q.contiguous(), kv.contiguous()
         ctx.scaling = scaling
 
-        if d_v is None:
-            d_v = q.shape[-1]
-
-        # Quantize Q and KV to FP8 before forward so we can save the FP8
-        # copies (not BF16) for backward — halves activation memory.
-        batch = q.shape[0] if q.ndim == 4 else 1
-        seq_len = q.shape[-3] if q.ndim == 4 else q.shape[0]
-        heads = q.shape[-2]
-        dim_total = q.shape[-1]
-        seq_kv = kv.shape[-3] if kv.ndim == 4 else kv.shape[0]
-        kv_group = kv.shape[-2]
-
-        if q.dtype != torch.float8_e4m3fn:
-            q_flat = q.reshape(-1, heads * dim_total)
-            q_fp8_flat, q_scale_flat = per_token_cast_to_fp8(q_flat)
-            q_fp8 = q_fp8_flat.reshape(q.shape)
-            q_scale = q_scale_flat.reshape(q.shape[:-2])
+        if q_fp8 is not None:
+            if d_v is None:
+                d_v = q_fp8.shape[-1]
         else:
-            raise ValueError("SparseMLA_FP8.forward expects BF16 input q, not pre-quantized FP8")
+            if d_v is None:
+                d_v = q.shape[-1]
 
-        if kv.dtype != torch.float8_e4m3fn:
-            kv_flat = kv.reshape(-1, kv_group * dim_total)
-            kv_fp8_flat, kv_scale_flat = per_token_cast_to_fp8(kv_flat)
-            kv_fp8 = kv_fp8_flat.reshape(kv.shape)
-            kv_scale = kv_scale_flat.reshape(kv.shape[:-2])
-        else:
-            raise ValueError("SparseMLA_FP8.forward expects BF16 input kv, not pre-quantized FP8")
+        # Quantize Q and KV to FP8 if not already extracted from Float8Tensor.
+        if q_fp8 is None:
+            batch = q.shape[0] if q.ndim == 4 else 1
+            seq_len = q.shape[-3] if q.ndim == 4 else q.shape[0]
+            heads = q.shape[-2]
+            dim_total = q.shape[-1]
+
+            if q.dtype != torch.float8_e4m3fn:
+                q_flat = q.reshape(-1, heads * dim_total)
+                q_fp8_flat, q_scale_flat = per_token_cast_to_fp8(q_flat)
+                q_fp8 = q_fp8_flat.reshape(q.shape)
+                q_scale = q_scale_flat.reshape(q.shape[:-2])
+            else:
+                raise ValueError(
+                    "SparseMLA_FP8.forward: q is raw float8_e4m3fn without scale. "
+                    "Pass BF16 or TE Float8Tensor."
+                )
+
+        if kv_fp8 is None:
+            kv_group = kv.shape[-2]
+            dim_total = kv.shape[-1]
+
+            if kv.dtype != torch.float8_e4m3fn:
+                kv_flat = kv.reshape(-1, kv_group * dim_total)
+                kv_fp8_flat, kv_scale_flat = per_token_cast_to_fp8(kv_flat)
+                kv_fp8 = kv_fp8_flat.reshape(kv.shape)
+                kv_scale = kv_scale_flat.reshape(kv.shape[:-2])
+            else:
+                raise ValueError(
+                    "SparseMLA_FP8.forward: kv is raw float8_e4m3fn without scale. "
+                    "Pass BF16 or TE Float8Tensor."
+                )
 
         tl_out, tl_lse = sparse_mla_fwd_fp8_interface(
             q_fp8, kv_fp8, indices,
