@@ -17,6 +17,25 @@ import tilelang
 import torch
 from tilelang import language as T
 
+
+def _unwrap_quantized(t: torch.Tensor) -> torch.Tensor:
+    """Unwrap TE Float8Tensor (or any QuantizedTensor) to a plain torch.Tensor.
+
+    Transformer Engine's Float8Tensor subclass stores data in FP8 internally but
+    reports .dtype as the logical dtype (e.g. bfloat16).  It survives .contiguous(),
+    .to(dtype), .reshape(), and slicing --- so it can silently reach TileLang kernel
+    launchers which call .data_ptr() and get NULL (Float8Tensor.data_ptr() == 0).
+
+    Calling .dequantize() converts back to a plain tensor with valid data_ptr.
+    """
+    try:
+        from transformer_engine.pytorch.tensor import QuantizedTensor
+    except ImportError:
+        return t
+    if isinstance(t, QuantizedTensor):
+        return t.dequantize()
+    return t
+
 _tilelang_sparse_mla_fwd_kernel_cache = OrderedDict()
 _tilelang_sparse_mla_fwd_cache_lock = threading.Lock()
 
@@ -288,6 +307,12 @@ def sparse_mla_fwd_interface(
     """
     seq_bucket = _env_int("MCORE_DSA_TILELANG_SEQ_BUCKET", 256)
     topk_bucket = _env_int("MCORE_DSA_TILELANG_TOPK_BUCKET", block_I)
+
+    # Unwrap TE Float8Tensor/QuantizedTensor before any TileLang operations.
+    # Float8Tensor.data_ptr() returns 0 (NULL) and survives .contiguous()/.to()
+    # so it must be dequantized explicitly before reaching the kernel launcher.
+    q = _unwrap_quantized(q)
+    kv = _unwrap_quantized(kv)
 
     squeeze_batch = q.ndim == 3
     if squeeze_batch:
