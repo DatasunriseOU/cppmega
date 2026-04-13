@@ -1,76 +1,182 @@
 # cppmega
 
-`cppmega` is a CUDA-only, Megatron-first rebuild of the `nanochat` training surface.
+Megatron-first training framework for **NAM56R** — a 4.73B hybrid Mamba3 + MLA + DSA + MoE model.
 
-The project goal is narrow:
+## Production Configuration
 
-- reuse native NVIDIA Megatron Core and Megatron-LM training/runtime features wherever they already exist
-- reuse NeMo/Nemotron guidance where it matches Megatron-native behavior
-- port only the `nanochat` blocks and glue that do not have a real upstream equivalent
-- keep `Mamba3` sourced from the upstream author implementation, not from `nanochat`
+**265 TFLOP/s** on 8xH200 (verified 2026-04-13).
 
-## Constraints
+| Parameter | Value |
+|-----------|-------|
+| Model | NAM56R 4.73B (52 layers, hybrid `*EME*EME*EMM*`) |
+| Architecture | heads=32, hidden=4096, headdim=128, d_state=128 |
+| Mamba | Mamba-3 MIMO rank=4, chunk=16, SISO+MIMO TileLang kernels |
+| Attention | 4 MLA layers (q_lora=64, kv_lora=64, qk_pos=64) |
+| DSA | 9 DSA layers (sparse attention, indexer topk=256) |
+| MoE | 16 experts, topk=4, shared expert, grouped GEMM |
+| MTP | 2 prediction layers |
+| Precision | FP8 tensorwise (TE hybrid format) |
+| Parallelism | PP=1, TP=1, EP=4, DP=2 |
+| Micro-batch | MBS=4, GBS=64, seq_len=4096 |
+| Hardware | 8x NVIDIA H200 141GB (NVLink) |
 
-- local macOS is not a Megatron runtime target
-- local `.venv` is the shared [`../nanochat/.venv`](/Volumes/external/sources/nanochat/.venv) for helper code only
-- real Megatron and CUDA validation happens on the GCP H200 node `h200_legacy`
-- `cppmega` should not install itself into the `nanochat` repo or reuse its worktree
-- remote CUDA work must not mutate the shared `/mnt/data/venv`; `cppmega` uses a cloned remote env with the same starting package set
+## Quick Start
 
-## Current shape
+### Prerequisites
 
-- `docs/migration_matrix.md` records what is reused from Megatron vs what remains a custom port candidate
-- `docs/porting_policy.md` defines the fail-closed porting rules
-- `cppmega/recipes/nam56r_megatron.py` contains the first translation/helper layer for `nanochat` NAM-style patterns into Megatron hybrid patterns
-- `scripts/remote_setup_h200.sh` clones the nanochat H200 venv into a dedicated `cppmega` env, installs Megatron there, and can optionally build author `mamba-ssm`
-- `scripts/remote_smoke_h200.sh` runs the first `pretrain_mamba.py --mock-data` smoke on H200 and can switch specs via `CPPMEGA_SPEC_MODULE` / `CPPMEGA_SPEC_NAME`
-- `scripts/remote_smoke_h200_dsa.sh` is the native-first H200 smoke for official Megatron DSA (`pretrain_gpt.py` + MLA + `--experimental-attention-variant dsa`)
-- `scripts/remote_smoke_h200_ngram_hash_poly.sh` is the canonical H200 smoke for ngram-hash enrichment through the `CppMegaGPTModel` / `CppMegaLanguageModelEmbedding` builder path
-- `scripts/remote_smoke_h200_structure_poly.sh` is the canonical H200 smoke for structure enrichment through the same Megatron-style polymorphic builder path
+```bash
+# Megatron-LM (our dev_latest branch with PR #3674 + PR #4268)
+cd /mnt/data/cppmega-root/megatron-lm
 
-## Verified bring-up status
+# After any Megatron update, MUST apply patches:
+cd /mnt/data/cppmega-root/cppmega
+python -m cppmega.megatron.upstream_patches.apply_dsa_cg_patches
 
-- local macOS remains helper-only; Megatron runtime validation is still H200-only
-- `scripts/remote_smoke_h200.sh` now completes a real 8-GPU H200 smoke with 2 training iterations and checkpoint saves on `h200_legacy`
-- the current smoke uses `cppmega.megatron.mamba_local_spec.cppmega_mamba_stack_spec` instead of Megatron's default TE-bound `mamba_stack_spec`
-- the smoke launcher now isolates checkpoints/logs per spec via `CPPMEGA_RUN_ID`, so alternate smoke specs do not try to load incompatible state
-- `cppmega.megatron.author_mamba3_spec.cppmega_author_mamba3_stack_spec` now also completes the same 8-GPU H200 smoke with 2 training iterations and checkpoint saves on `h200_legacy`
-- `scripts/remote_smoke_h200_ngram_hash_poly.sh` completes a real 8-GPU H200 smoke with 2 training iterations and checkpoint saves through the `cppmega.megatron.gpt_builder.cppmega_gpt_builder` route
-- `scripts/remote_smoke_h200_structure_poly.sh` completes the same 8-GPU H200 smoke with 2 training iterations and checkpoint saves through the same builder route
-- the launcher also applies the minimal no-extension flags required by the verified H200 environment:
-  - `--no-gradient-accumulation-fusion`
-  - `--no-persist-layer-norm`
-  - `--no-masked-softmax-fusion`
-  - `--eval-interval 50000000 --eval-iters 0`
+# Required packages
+pip install dualpipe  # from github: pip install git+https://github.com/deepseek-ai/DualPipe.git
+pip install liger-kernel
+pip install apex  # NVIDIA apex from source with --cpp_ext --cuda_ext
+```
 
-These are smoke-lane compatibility settings for the current no-TE / no-Apex H200 environment. They are not a license to fork Megatron behavior in the actual ported training stack.
+### Training
 
-## Canonical custom-feature route
+```bash
+cd /mnt/data/cppmega-root/cppmega
 
-- custom feature enrichment now enters Megatron through `cppmega.megatron.gpt_builder.cppmega_gpt_builder`
-- the builder owns `CppMegaGPTModel`, which swaps only the embedding surface to `CppMegaLanguageModelEmbedding`
-- `CppMegaLanguageModelEmbedding.forward()` preserves upstream Megatron shape/scatter behavior and adds enrichment only in the local embedding layout before the upstream transpose path
-- old remote file-rewrite patch helpers are legacy-only and are no longer the primary launch or test contract
+# Production run: PP=1 EP=4 h32 + all optimizations
+CPPMEGA_INDEX_CACHE=1 \
+CPPMEGA_LEMYX_DSA=1 \
+CPPMEGA_LIGER_CE=1 \
+bash scripts/remote_smoke_h200_dsa_9_4_m.sh
+```
 
-## Grounded upstream baseline
+The script auto-applies:
+- Regional torch.compile (4 Mamba3 elementwise regions)
+- IndexCache (67% DSA indexer savings)
+- lemyx fused FA+KL kernel (DSA warmup)
+- Liger chunked cross-entropy (MTP memory savings)
+- FP8 tensorwise recipe
+- expandable_segments (mandatory)
 
-- Megatron Core already covers the main training substrate: TP, PP, CP, EP, sequence parallel, FSDP, distributed optimizer, MLA, MTP, and FIM
-- Megatron-LM already has hybrid Mamba models, `pretrain_mamba.py`, `MambaModel`, `--hybrid-layer-pattern`, and mock-data support
-- Megatron main still targets Megatron's Mamba stack, not author-pure `Mamba3`
-- upstream `state-spaces/mamba` is the authority for `Mamba3`
-- grounding tools in this workspace: `exa`, `tavily`, and `perplexity` are available; `brave` is not wired here yet
+### Architecture Override (h32)
 
-## First custom seams
+The default script uses heads=28 hidden=3584. For production h32:
 
-The first custom seams that remain plausible after grounding are:
+```bash
+sed -i 's/--num-attention-heads 28/--num-attention-heads 32/' /tmp/run.sh
+sed -i 's/--hidden-size 3584/--hidden-size 4096/' /tmp/run.sh
+# Also override dsa-indexer-n-heads to 32 in NATIVE_ARGS
+```
 
-- author `Mamba3` wrapped into a Megatron-style hybrid stack; `cppmega.megatron.author_mamba3_spec` is the new narrow TP1/CP1, training-only seam
-- `M2RNN` / `R` block support, because `nanochat` uses it in `AEMEAEMEAEMR` and Megatron has no direct equivalent; the first local seam now exists as `cppmega.megatron.m2rnn_spec` and has passed the same 2-iteration 8xH200 smoke lane
-- DSA sparse attention, but only after exhausting the new official Megatron DSA/experimental-attention surface first
-- Engram; first fail-closed config/recipe port surface now exists in `cppmega.features.engram` and `cppmega.recipes.nam56r_megatron`
-- mHC
-- ngram hash enrichment; first fail-closed config/recipe port surface now exists in `cppmega.features.engram` and `cppmega.recipes.nam56r_megatron`
-- MoD / Gamma-MoD / MoDA family
-- enriched structure/data glue that is not already represented by Megatron datasets/configs
+## Optimization Stack
 
-Everything else should default to Megatron-native implementation unless proven missing.
+### Always On (no env gates)
+
+| Component | File | Effect |
+|-----------|------|--------|
+| Regional torch.compile | `mamba3_compile_patch.py` | Fuses Mamba3 elementwise ops (5.93x data-dep-A) |
+| expandable_segments | script env var | Prevents CUDA allocator fragmentation OOM |
+| Unfused DSA banned | `apply_dsa_cg_patches.py` | Crash if fused SparseMLA unavailable |
+
+### Env-Gated
+
+| Component | Gate | File | Effect |
+|-----------|------|------|--------|
+| IndexCache | `CPPMEGA_INDEX_CACHE=1` | `index_cache_patch.py` | 3 Full + 6 Shared DSA layers = 67% indexer savings |
+| lemyx DSA | `CPPMEGA_LEMYX_DSA=1` | `lemyx_dsa_warmup.py` | Fused FA+KL TileLang kernel for indexer warmup |
+| Liger CE | `CPPMEGA_LIGER_CE=1` | `mtp_liger_ce.py` | Chunked fused cross-entropy, saves 21 GiB MTP logits |
+| Selective FP8 MoE | `CPPMEGA_SELECTIVE_FP8_MOE=1` | `selective_fp8_moe_patch.py` | FP8 only on MoE expert GEMMs |
+| Mamba recompute | `CPPMEGA_MAMBA_RECOMPUTE=1` | `mamba_recompute_patch.py` | Activation checkpointing for Mamba layers |
+
+### Pipeline Schedules
+
+| Schedule | File | When to use |
+|----------|------|-------------|
+| Standard 1F1B | Megatron built-in | PP=2 VPP=2 (194 TFLOP/s) |
+| DualPipeV | `dualpipev_schedule.py` | PP=2 near-zero bubble (205 TFLOP/s, MBS=2) |
+| combined_1f1b | `hybrid_schedule_plan.py` | PP=1 EP A2A overlap (hides MoE all-to-all) |
+
+### Upstream Patches (apply_dsa_cg_patches.py)
+
+**MUST run after every Megatron update.** 9 patches:
+
+1. CUDA graph safety (ban torch.equal/.any CPU syncs)
+2. Remove 576/512 dim hardcodes (our dims: 128/64)
+3. SparseMLA d_v propagation
+4. sparse_mla.py d_v parameter
+5. tilelang_sparse_mla_fwd.py dim assertions relaxed
+6. tilelang_sparse_mla_bwd.py D=512 hardcode removed
+7. tilelang_sparse_mla_bwd.py FP32 P/dP precision
+8. CG-safe _scatter_topk_into_index_mask (branchless)
+9. FP8 SparseMLA dispatch (QuantizedTensor → SparseMLA_FP8)
+
+## Throughput Results
+
+| Config | TFLOP/s | tok/sec/GPU | Notes |
+|--------|---------|-------------|-------|
+| **PP=1 EP=4 MBS=4 + compile** | **265** | ~8,500 | Production config |
+| PP=2 VPP=2 EP=4 MBS=4 | 194 | ~6,200 | Save verified |
+| DualPipeV PP=2 MBS=2 | 205 | ~6,600 | No DSA/FP8 yet |
+| Selective FP8 MoE (no DSA) | 205 | ~6,600 | MoE-only FP8 |
+| PP=1 EP=1 MBS=10 (h=3584) | 272 | ~8,700 | Previous golden |
+
+## Machines
+
+| Machine | Zone | IP | Path | GPU |
+|---------|------|----|------|-----|
+| europe | LOCATION_2 | H200_2_IP | `/mnt/data/cppmega-root` | 8x H200 |
+| bench3 | LOCATION_1 | H200_1_IP | `/mnt/data/cppmega-root` | 8x H200 |
+| GB10 | local network | gb10 | `/home/dave` | 1x GB10 (sm_121) |
+
+### Megatron Version
+
+Branch `dev_latest` on top of NVIDIA/Megatron-LM `dev`:
+- `core_v0.15.0rc7` + PR #3674 (DSA absorbed MLA) + PR #4268 (delayed wgrad overlap)
+
+### Software Stack
+
+- PyTorch 2.12 nightly + cu132
+- Transformer Engine 2.13
+- TileLang 0.1.8
+- mamba-ssm 2.3.1
+- Megatron Core 0.18
+- NVIDIA Apex (from source)
+- dualpipe 1.0.0+030ce43 (from github)
+- liger-kernel
+
+## Key Design Decisions
+
+- **heads=32, hidden=4096**: FP8 compatible (32%8=0), WGMMA tiling, lemyx (heads==index_heads)
+- **52 layers** (NAM56R_DEPTH): divides by 4 (VPP=4) and 2 (VPP=2)
+- **Single DSA path**: lemyx + IndexCache only, no fallbacks, crash on failure
+- **No _apply guard**: D/dt_bias stay bf16 after Float16Module, use .float() in forward
+- **No silent fallbacks**: critical patches crash on failure, never try/except + continue
+- **expandable_segments mandatory**: hardcoded, not overridable
+- **Unfused DSA banned forever**: if fused kernel unavailable, crash immediately
+
+## Project Structure
+
+```
+cppmega/
+  megatron/
+    index_cache_patch.py       # DSA index reuse (3 Full + 6 Shared)
+    lemyx_dsa_warmup.py        # Fused FA+KL TileLang kernel
+    mamba3_compile_patch.py    # Regional torch.compile (4 regions)
+    dualpipev_schedule.py      # DualPipeV pipeline schedule (167 LOC)
+    hybrid_schedule_plan.py    # build_schedule_plan for MambaModel
+    mtp_liger_ce.py            # Liger fused cross-entropy for MTP
+    selective_fp8_moe_patch.py # FP8 only for MoE experts
+    mamba_recompute_patch.py   # Mamba activation checkpointing
+    noconv_mamba_mixer.py      # Mamba3 mixer (no conv1d)
+    custom_mamba_model.py      # CppMegaMambaModel wrapper
+    sparse_mla_ops/            # TileLang SparseMLA fwd/bwd + FP8
+    upstream_patches/
+      apply_dsa_cg_patches.py  # 9 patches for DSA + CG + FP8 + dims
+  recipes/
+    nam56r_nemo_recipe.py      # NAM56R configuration
+scripts/
+  remote_smoke_h200_dsa_9_4_m.sh  # Production training script
+docs/
+  optimization_session_2026_04_13.md     # Session notes (English)
+  optimization_session_2026_04_13_ru.md  # Session notes (Russian)
+```
