@@ -51,7 +51,7 @@ def build_megatron_args_bundle(
     moe_shared_expert_intermediate_size: int = 1024,
     moe_grouped_gemm: bool = True,
     use_dsa: bool = False,
-    dsa_indexer_n_heads: int = 8,
+    dsa_indexer_n_heads: int = 32,
     dsa_indexer_head_dim: int = 64,
     dsa_indexer_topk: int = 256,
     dsa_indexer_loss_coeff: float = 0.001,

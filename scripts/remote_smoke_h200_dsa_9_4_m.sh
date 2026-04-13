@@ -527,9 +527,9 @@ ${NSYS_CMD} python -m torch.distributed.run --nproc_per_node=8 "${WORKDIR}/pretr
   --no-masked-softmax-fusion \
   ${ROPE_FLAG} \
   --hybrid-layer-pattern "${HYBRID_PATTERN}" \
-  --hidden-size 3584 \
-  --ffn-hidden-size 18944 \
-  --num-attention-heads 28 \
+  --hidden-size 4096 \
+  --ffn-hidden-size 21504 \
+  --num-attention-heads 32 \
   --seq-length ${SEQ_LEN} \
   --max-position-embeddings ${SEQ_LEN} \
   --micro-batch-size ${MBS} \

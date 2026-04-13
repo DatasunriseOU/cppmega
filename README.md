@@ -6,19 +6,19 @@ Megatron-first training framework for **NAM56R** — a 4.73B hybrid Mamba3 + MLA
 
 **265 TFLOP/s** on 8xH200 (verified 2026-04-13).
 
-| Parameter | Value |
-|-----------|-------|
-| Model | NAM56R 4.73B (52 layers, hybrid `*EME*EME*EMM*`) |
-| Architecture | heads=32, hidden=4096, headdim=128, d_state=128 |
-| Mamba | Mamba-3 MIMO rank=4, chunk=16, SISO+MIMO TileLang kernels |
-| Attention | 4 MLA layers (q_lora=64, kv_lora=64, qk_pos=64) |
-| DSA | 9 DSA layers (sparse attention, indexer topk=256) |
-| MoE | 16 experts, topk=4, shared expert, grouped GEMM |
-| MTP | 2 prediction layers |
-| Precision | FP8 tensorwise (TE hybrid format) |
-| Parallelism | PP=1, TP=1, EP=4, DP=2 |
-| Micro-batch | MBS=4, GBS=64, seq_len=4096 |
-| Hardware | 8x NVIDIA H200 141GB (NVLink) |
+| Parameter    | Value                                                     |
+| ------------ | --------------------------------------------------------- |
+| Model        | NAM56R 4.73B (52 layers, hybrid `*EME*EME*EMM*`)          |
+| Architecture | heads=32, hidden=4096, headdim=128, d_state=128           |
+| Mamba        | Mamba-3 MIMO rank=4, chunk=16, SISO+MIMO TileLang kernels |
+| Attention    | 4 MLA layers (q_lora=64, kv_lora=64, qk_pos=64)           |
+| DSA          | 9 DSA layers (sparse attention, indexer topk=256)         |
+| MoE          | 16 experts, topk=4, shared expert, grouped GEMM           |
+| MTP          | 2 prediction layers                                       |
+| Precision    | FP8 tensorwise (TE hybrid format)                         |
+| Parallelism  | PP=1, TP=1, EP=4, DP=2                                    |
+| Micro-batch  | MBS=4, GBS=64, seq_len=4096                               |
+| Hardware     | 8x NVIDIA H200 141GB (NVLink)                             |
 
 ## Quick Start
 
@@ -58,42 +58,32 @@ The script auto-applies:
 - FP8 tensorwise recipe
 - expandable_segments (mandatory)
 
-### Architecture Override (h32)
-
-The default script uses heads=28 hidden=3584. For production h32:
-
-```bash
-sed -i 's/--num-attention-heads 28/--num-attention-heads 32/' /tmp/run.sh
-sed -i 's/--hidden-size 3584/--hidden-size 4096/' /tmp/run.sh
-# Also override dsa-indexer-n-heads to 32 in NATIVE_ARGS
-```
-
 ## Optimization Stack
 
 ### Always On (no env gates)
 
-| Component | File | Effect |
-|-----------|------|--------|
+| Component              | File                      | Effect                                          |
+| ---------------------- | ------------------------- | ----------------------------------------------- |
 | Regional torch.compile | `mamba3_compile_patch.py` | Fuses Mamba3 elementwise ops (5.93x data-dep-A) |
-| expandable_segments | script env var | Prevents CUDA allocator fragmentation OOM |
-| Unfused DSA banned | `apply_dsa_cg_patches.py` | Crash if fused SparseMLA unavailable |
+| expandable_segments    | script env var            | Prevents CUDA allocator fragmentation OOM       |
+| Unfused DSA banned     | `apply_dsa_cg_patches.py` | Crash if fused SparseMLA unavailable            |
 
 ### Env-Gated
 
-| Component | Gate | File | Effect |
-|-----------|------|------|--------|
-| IndexCache | `CPPMEGA_INDEX_CACHE=1` | `index_cache_patch.py` | 3 Full + 6 Shared DSA layers = 67% indexer savings |
-| lemyx DSA | `CPPMEGA_LEMYX_DSA=1` | `lemyx_dsa_warmup.py` | Fused FA+KL TileLang kernel for indexer warmup |
-| Liger CE | `CPPMEGA_LIGER_CE=1` | `mtp_liger_ce.py` | Chunked fused cross-entropy, saves 21 GiB MTP logits |
-| Selective FP8 MoE | `CPPMEGA_SELECTIVE_FP8_MOE=1` | `selective_fp8_moe_patch.py` | FP8 only on MoE expert GEMMs |
-| Mamba recompute | `CPPMEGA_MAMBA_RECOMPUTE=1` | `mamba_recompute_patch.py` | Activation checkpointing for Mamba layers |
+| Component         | Gate                          | File                         | Effect                                               |
+| ----------------- | ----------------------------- | ---------------------------- | ---------------------------------------------------- |
+| IndexCache        | `CPPMEGA_INDEX_CACHE=1`       | `index_cache_patch.py`       | 3 Full + 6 Shared DSA layers = 67% indexer savings   |
+| lemyx DSA         | `CPPMEGA_LEMYX_DSA=1`         | `lemyx_dsa_warmup.py`        | Fused FA+KL TileLang kernel for indexer warmup       |
+| Liger CE          | `CPPMEGA_LIGER_CE=1`          | `mtp_liger_ce.py`            | Chunked fused cross-entropy, saves 21 GiB MTP logits |
+| Selective FP8 MoE | `CPPMEGA_SELECTIVE_FP8_MOE=1` | `selective_fp8_moe_patch.py` | FP8 only on MoE expert GEMMs                         |
+| Mamba recompute   | `CPPMEGA_MAMBA_RECOMPUTE=1`   | `mamba_recompute_patch.py`   | Activation checkpointing for Mamba layers            |
 
 ### Pipeline Schedules
 
-| Schedule | File | When to use |
-|----------|------|-------------|
-| Standard 1F1B | Megatron built-in | PP=2 VPP=2 (194 TFLOP/s) |
-| DualPipeV | `dualpipev_schedule.py` | PP=2 near-zero bubble (205 TFLOP/s, MBS=2) |
+| Schedule      | File                      | When to use                                |
+| ------------- | ------------------------- | ------------------------------------------ |
+| Standard 1F1B | Megatron built-in         | PP=2 VPP=2 (194 TFLOP/s)                   |
+| DualPipeV     | `dualpipev_schedule.py`   | PP=2 near-zero bubble (205 TFLOP/s, MBS=2) |
 | combined_1f1b | `hybrid_schedule_plan.py` | PP=1 EP A2A overlap (hides MoE all-to-all) |
 
 ### Upstream Patches (apply_dsa_cg_patches.py)
@@ -112,21 +102,21 @@ sed -i 's/--hidden-size 3584/--hidden-size 4096/' /tmp/run.sh
 
 ## Throughput Results
 
-| Config | TFLOP/s | tok/sec/GPU | Notes |
-|--------|---------|-------------|-------|
-| **PP=1 EP=4 MBS=4 + compile** | **265** | ~8,500 | Production config |
-| PP=2 VPP=2 EP=4 MBS=4 | 194 | ~6,200 | Save verified |
-| DualPipeV PP=2 MBS=2 | 205 | ~6,600 | No DSA/FP8 yet |
-| Selective FP8 MoE (no DSA) | 205 | ~6,600 | MoE-only FP8 |
-| PP=1 EP=1 MBS=10 (h=3584) | 272 | ~8,700 | Previous golden |
+| Config                        | TFLOP/s | tok/sec/GPU | Notes             |
+| ----------------------------- | ------- | ----------- | ----------------- |
+| **PP=1 EP=4 MBS=4 + compile** | **265** | ~8,500      | Production config |
+| PP=2 VPP=2 EP=4 MBS=4         | 194     | ~6,200      | Save verified     |
+| DualPipeV PP=2 MBS=2          | 205     | ~6,600      | No DSA/FP8 yet    |
+| Selective FP8 MoE (no DSA)    | 205     | ~6,600      | MoE-only FP8      |
+| PP=1 EP=1 MBS=10 (h=3584)     | 272     | ~8,700      | Previous golden   |
 
 ## Machines
 
-| Machine | Zone | IP | Path | GPU |
-|---------|------|----|------|-----|
-| europe | LOCATION_2 | H200_2_IP | `/mnt/data/cppmega-root` | 8x H200 |
-| bench3 | LOCATION_1 | H200_1_IP | `/mnt/data/cppmega-root` | 8x H200 |
-| GB10 | local network | gb10 | `/home/dave` | 1x GB10 (sm_121) |
+| Machine | Zone           | IP            | Path                     | GPU              |
+| ------- | -------------- | ------------- | ------------------------ | ---------------- |
+| europe  | LOCATION_2 | H200_2_IP  | `/mnt/data/cppmega-root` | 8x H200          |
+| bench3  | LOCATION_1  | H200_1_IP | `/mnt/data/cppmega-root` | 8x H200          |
+| GB10    | local network  | gb10          | `/home/dave`             | 1x GB10 (sm_121) |
 
 ### Megatron Version
 
