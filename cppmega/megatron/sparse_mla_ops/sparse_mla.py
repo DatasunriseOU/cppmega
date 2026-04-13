@@ -354,6 +354,9 @@ def sparse_mla_fp8_as_unfused_dsa(
     return output
 
 
+_sparse_mla_unfused_diag_logged = False
+
+
 def sparse_mla_as_unfused_dsa(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -380,6 +383,18 @@ def sparse_mla_as_unfused_dsa(
     Returns:
         output: [sq, b, np * hnv] — same shape as unfused_dsa_fn output
     """
+    global _sparse_mla_unfused_diag_logged
+    if not _sparse_mla_unfused_diag_logged:
+        _sparse_mla_unfused_diag_logged = True
+        _q_type = type(query).__name__
+        _k_type = type(key).__name__
+        print(
+            f"[sparse_mla] ACTIVE: query type={_q_type} dtype={query.dtype} "
+            f"shape={tuple(query.shape)}, key type={_k_type} dtype={key.dtype} "
+            f"shape={tuple(key.shape)}",
+            flush=True,
+        )
+
     sq, b, np_, hn = query.shape
     sk = key.shape[0]
     hnv = value.shape[3]

@@ -441,47 +441,80 @@ def _get_mamba_forward_inputs(data_iterator, model, vp_stage, forward_step_func=
 def apply_hybrid_schedule_plan_patch():
     """Monkey-patch MambaModel + combined_1f1b to enable EP A2A overlap.
 
-    1. Bypasses MTP num_layers assertion in TransformerConfig.__post_init__.
+    1. Bypasses MTP num_layers assertion in TransformerConfig.__post_init__
+       without modifying mtp_num_layers (avoids triggering GPTModel init
+       side-effects from downstream code that checks mtp_num_layers==None).
     2. Adds build_schedule_plan() to MambaModel.
-    3. Makes MambaModel a subclass of GPTModel (via __bases__ patching) so
-       isinstance(mamba_instance, GPTModel) returns True.
-    4. Wraps combined_forward_backward_step to add return_schedule_plan
-       support for pretrain_mamba.py's forward_step.
+    3. Wraps combined_forward_backward_step to:
+       a) Accept MambaModel (not just GPTModel) for the isinstance check.
+       b) Wrap forward_step_func to support return_schedule_plan=True.
     """
     # (0) Bypass MTP num_layers restriction with EP overlap.
     #     Upstream only tested MTP=1 with EP overlap, but our hybrid model
     #     handles MTP in the post-process node, so MTP>1 is safe.
+    #
+    #     Strategy: temporarily set mtp_num_layers to 1 (NOT None) during
+    #     __post_init__.  Using 1 (instead of None) is critical because:
+    #       - None changes behavior in validate_layer_layout (pipeline
+    #         layout asserts mtp layer count == mtp_num_layers)
+    #       - None changes behavior in MTP model construction code paths
+    #         that use ``mtp_num_layers is not None`` to decide whether
+    #         to build MTP blocks
+    #       - 1 passes the ``mtp_num_layers is None or mtp_num_layers == 1``
+    #         assertion cleanly
+    #       - 1 preserves ``mtp_num_layers is not None`` semantics for all
+    #         other code paths in __post_init__
+    #
+    #     The ``if mtp_num_layers == 1`` sub-block also asserts
+    #     ``pipeline_model_parallel_size > 1``, which is separately valid
+    #     for our config (PP>=2).  We keep the real PP value so that
+    #     assertion runs against the actual config.
     from megatron.core.transformer.transformer_config import TransformerConfig
 
     _orig_post_init = TransformerConfig.__post_init__
 
     def _relaxed_post_init(self):
-        # Temporarily hide mtp_num_layers from the EP overlap assertion.
-        # Setting to None skips the entire MTP+EP check block (lines 2400-2407),
-        # which is safe because our HybridModelChunkSchedulePlan handles MTP
-        # in the post-process node regardless of mtp_num_layers count.
         _saved_mtp = getattr(self, "mtp_num_layers", None)
         _saved_overlap = getattr(self, "overlap_moe_expert_parallel_comm", False)
-        if _saved_overlap and _saved_mtp is not None and _saved_mtp > 1:
-            object.__setattr__(self, "mtp_num_layers", None)
-        _orig_post_init(self)
-        # Restore the real value
-        if _saved_overlap and _saved_mtp is not None and _saved_mtp > 1:
-            object.__setattr__(self, "mtp_num_layers", _saved_mtp)
+        _needs_bypass = _saved_overlap and _saved_mtp is not None and _saved_mtp > 1
+        if _needs_bypass:
+            # Set to 1 (NOT None) so the overlap+MTP assertion passes.
+            # Using 1 instead of None is critical: other __post_init__ code
+            # checks ``mtp_num_layers is not None`` for layout validation
+            # and MTP block construction.  Setting to None changes those
+            # code paths and can trigger GPTModel instantiation with the
+            # wrong __init__ signature.
+            #
+            # The ``if mtp_num_layers == 1`` sub-block also asserts
+            # ``pipeline_model_parallel_size > 1`` which is satisfied by
+            # our production config (PP>=2).
+            self.mtp_num_layers = 1
+        try:
+            _orig_post_init(self)
+        finally:
+            if _needs_bypass:
+                self.mtp_num_layers = _saved_mtp
 
     TransformerConfig.__post_init__ = _relaxed_post_init
     print("[hybrid_schedule_plan] MTP num_layers assertion bypassed", file=sys.stderr)
 
-    from megatron.core.models.gpt.gpt_model import GPTModel
     from megatron.core.models.mamba.mamba_model import MambaModel
 
     # (1) Patch build_schedule_plan onto MambaModel
     MambaModel.build_schedule_plan = _mamba_build_schedule_plan
     print("[hybrid_schedule_plan] MambaModel.build_schedule_plan patched", file=sys.stderr)
 
-    # (2) Replace combined_forward_backward_step with a version that:
-    #     a) Removes the isinstance(GPTModel) assert
-    #     b) Wraps forward_step_func to handle return_schedule_plan=True
+    # (2) Patch combined_forward_backward_step to:
+    #     a) Remove the isinstance(GPTModel) assert (MambaModel is not a
+    #        GPTModel subclass and cannot be made one -- MRO conflict)
+    #     b) Wrap forward_step_func to handle return_schedule_plan=True
+    #
+    #     We replace the function with a version that delegates to the
+    #     original but with the isinstance check removed.  We do this by
+    #     patching the function's globals so the ``GPTModel`` name imported
+    #     inside the function resolves to LanguageModule (the common base
+    #     of both GPTModel and MambaModel), making isinstance() pass for
+    #     both model types without touching __bases__.
     import megatron.core.pipeline_parallel.combined_1f1b as c1f1b
 
     _orig_cfbs = c1f1b.combined_forward_backward_step
@@ -491,22 +524,14 @@ def apply_hybrid_schedule_plan_patch():
         input_tensor, forward_data_store, b_model, b_input_tensor,
         b_output_tensor, b_output_tensor_grad, config, **kwargs,
     ):
-        import contextlib
         import inspect
-        from contextlib import nullcontext
         from functools import partial
 
-        from megatron.core.enums import Fp8Recipe
-        from megatron.core.fp8_utils import get_fp8_context
-        from megatron.core.pipeline_parallel.utils import (
-            AbstractSchedulePlan,
-            ScheduleNode,
-            get_comp_stream,
-            set_streams,
-        )
         from megatron.core.utils import get_attr_wrapped_model
 
-        # Wrap forward_step_func if it doesn't support return_schedule_plan
+        # (a) Wrap forward_step_func if it doesn't support return_schedule_plan.
+        #     This teaches pretrain_mamba.py's forward_step to produce a
+        #     schedule plan when asked.
         sig = inspect.signature(forward_step_func)
         if "return_schedule_plan" not in sig.parameters:
             _orig_fwd = forward_step_func
@@ -525,128 +550,29 @@ def apply_hybrid_schedule_plan_patch():
 
             forward_step_func = _wrapped_fwd
 
-        # --- Inline the original combined_forward_backward_step logic ---
-        # WITHOUT the isinstance(GPTModel) assert.
-        assert kwargs.get("checkpoint_activations_microbatch") is None or \
-            "checkpoint_activations_microbatch" not in kwargs, \
-            "checkpoint_activations_microbatch not supported for EP overlap"
+        # (b) Temporarily make the isinstance(GPTModel) check in the original
+        #     function accept MambaModel by patching the module-level import.
+        #     The original function does:
+        #       from megatron.core.models.gpt.gpt_model import GPTModel
+        #       assert isinstance(unwrapped_model, GPTModel)
+        #     We temporarily inject a fake GPTModel into sys.modules' cache so
+        #     the ``from ... import GPTModel`` inside the function resolves to
+        #     LanguageModule (common base of both GPTModel and MambaModel).
+        #     This is safe because the function only uses GPTModel for the
+        #     isinstance check, never for construction.
+        import megatron.core.models.gpt.gpt_model as _gpt_mod
+        from megatron.core.models.common.language_module.language_module import LanguageModule
 
-        from megatron.core.pipeline_parallel.schedules import set_current_microbatch
-
-        f_model_chunk_id = kwargs.get("f_model_chunk_id")
-        pre_forward = kwargs.get("pre_forward")
-        pre_backward = kwargs.get("pre_backward")
-        post_forward = kwargs.get("post_forward")
-        post_backward = kwargs.get("post_backward")
-        collect_non_loss_data = kwargs.get("collect_non_loss_data", False)
-        is_first_microbatch = kwargs.get("is_first_microbatch", False)
-        current_microbatch = kwargs.get("current_microbatch")
-
-        if f_model is not None and config.timers is not None:
-            config.timers('forward-compute', log_level=2).start()
-
-        if config.enable_autocast:
-            context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
-        else:
-            context_manager = contextlib.nullcontext()
-
-        unwrap_output_tensor = False
-        f_schedule_plan = None
-        if f_model is not None:
-            if is_first_microbatch and hasattr(f_model, 'set_is_first_microbatch'):
-                f_model.set_is_first_microbatch()
-            if current_microbatch is not None:
-                set_current_microbatch(f_model, current_microbatch)
-            if not isinstance(input_tensor, list):
-                input_tensor = [input_tensor]
-                unwrap_output_tensor = True
-
-            set_input_tensor = get_attr_wrapped_model(f_model, "set_input_tensor")
-            set_input_tensor(input_tensor)
-
-        if f_model is not None:
-            with context_manager:
-                unwrapped_model = get_attr_wrapped_model(
-                    f_model, "build_schedule_plan", return_model_obj=True
-                )
-                # NO isinstance(GPTModel) assert -- we accept any model with
-                # build_schedule_plan (including MambaModel).
-                f_schedule_plan, loss_func = forward_step_func(
-                    data_iterator, unwrapped_model, return_schedule_plan=True
-                )
-                assert isinstance(f_schedule_plan, AbstractSchedulePlan), (
-                    "first output of forward_step_func must be AbstractSchedulePlan"
-                )
-
-        unwrap_input_tensor_grad = False
-        b_schedule_plan = None
-        if b_model is not None:
-            if not isinstance(b_input_tensor, list):
-                b_input_tensor = [b_input_tensor]
-                unwrap_input_tensor_grad = True
-            for x in b_input_tensor:
-                if x is not None:
-                    x.retain_grad()
-            if not isinstance(b_output_tensor, list):
-                b_output_tensor = [b_output_tensor]
-            if not isinstance(b_output_tensor_grad, list):
-                b_output_tensor_grad = [b_output_tensor_grad]
-
-            b_schedule_plan = b_output_tensor[0].schedule_plan
-            b_output_tensor[0].schedule_plan = None
-            loss_node = b_output_tensor[0].loss_func
-            b_output_tensor[0].loss_func = None
-
-            if b_output_tensor_grad[0] is None:
-                if config.grad_scale_func is not None:
-                    b_output_tensor[0] = config.grad_scale_func(b_output_tensor[0])
-                torch.autograd.backward(
-                    b_output_tensor[0], grad_tensors=b_output_tensor_grad[0]
-                )
-                b_output_tensor_grad[0] = loss_node.get_grad()
-
-        use_outer_fp8_context = config.fp8 and config.fp8_recipe == Fp8Recipe.delayed
-        outer_fp8_context = (
-            get_fp8_context(config) if use_outer_fp8_context else nullcontext()
-        )
-
-        b_grad = b_output_tensor_grad[0] if b_model else None
-        with context_manager and outer_fp8_context:
-            output_tensor = type(f_schedule_plan or b_schedule_plan).run(
-                f_schedule_plan, b_schedule_plan, b_grad=b_grad,
-                pre_forward=pre_forward, pre_backward=pre_backward,
-                post_forward=post_forward, post_backward=post_backward,
+        _real_gpt = _gpt_mod.GPTModel
+        _gpt_mod.GPTModel = LanguageModule
+        try:
+            return _orig_cfbs(
+                forward_step_func, data_iterator, f_model, num_microbatches,
+                input_tensor, forward_data_store, b_model, b_input_tensor,
+                b_output_tensor, b_output_tensor_grad, config, **kwargs,
             )
-
-        num_tokens = None
-        if f_model is not None:
-            from megatron.core.pipeline_parallel.schedules import forward_step_calc_loss
-
-            loss_node = ScheduleNode(
-                loss_func, get_comp_stream, f_schedule_plan.event, name="loss_func"
-            )
-            loss_func = loss_node.forward
-            output_tensor, num_tokens = forward_step_calc_loss(
-                f_model, output_tensor, loss_func, config, f_model_chunk_id,
-                collect_non_loss_data, num_microbatches, forward_data_store,
-            )
-            output_tensor.schedule_plan = f_schedule_plan
-            output_tensor.loss_func = loss_node
-
-            if not unwrap_output_tensor:
-                output_tensor, num_tokens = [output_tensor], num_tokens
-
-        input_tensor_grad = None
-        if b_model is not None:
-            input_tensor_grad = [None]
-            if b_input_tensor is not None:
-                input_tensor_grad = []
-                for x in b_input_tensor:
-                    input_tensor_grad.append(x.grad if x is not None else None)
-            if unwrap_input_tensor_grad:
-                input_tensor_grad = input_tensor_grad[0]
-
-        return output_tensor, num_tokens, input_tensor_grad
+        finally:
+            _gpt_mod.GPTModel = _real_gpt
 
     c1f1b.combined_forward_backward_step = _patched_cfbs
 
