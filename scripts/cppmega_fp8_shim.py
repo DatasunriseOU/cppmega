@@ -234,3 +234,72 @@ try:
 except Exception as _exc:  # pragma: no cover
     import sys
     print(f"[cppmega_fp8_shim] MTP Liger CE patch failed: {_exc}", file=sys.stderr)
+
+
+# -----------------------------------------------------------------------------
+# (7) TileLang SparseMLA monkey-patch for DSA sparse attention (env-driven)
+# -----------------------------------------------------------------------------
+# Replaces Megatron's ``unfused_dsa_fn`` (which materializes the FULL
+# [b*np, sq, sk] FP32 attention scores = 7 GiB at production shape) with
+# TileLang's fused online-softmax sparse MLA kernel from Megatron-LM PR #3674.
+#
+# Controlled by CPPMEGA_DSA_SPARSE_MODE env var:
+#   "tilelang" (default) — fused TileLang kernel, ~40% throughput improvement
+#   "gather_scatter"     — PyTorch gather-scatter fallback (no TileLang dep)
+#
+# The TileLang kernel is parameterized for arbitrary d_v (works with d_v=512,
+# d_v=96, etc.) despite earlier comments claiming d_v=96 only.
+
+_sparse_mode = os.environ.get("CPPMEGA_DSA_SPARSE_MODE", "tilelang").strip().lower()
+if _sparse_mode not in ("gather_scatter", "gather-scatter", "pytorch"):
+    try:
+        from megatron.core.transformer.experimental_attention_variant import dsa as _dsa_mod
+
+        _existing_unfused = getattr(_dsa_mod, "unfused_dsa_fn", None)
+        if _existing_unfused is not None and not getattr(
+            _existing_unfused, "__cppmega_sparse_dsa_patched__", False
+        ):
+            from cppmega.megatron.sparse_mla_ops.sparse_mla import (
+                sparse_mla_as_unfused_dsa as _sparse_mla_fn,
+            )
+
+            setattr(_sparse_mla_fn, "__cppmega_sparse_dsa_patched__", True)
+            _dsa_mod.unfused_dsa_fn = _sparse_mla_fn
+            print(
+                "[cppmega_fp8_shim] TileLang SparseMLA applied "
+                "(replaces unfused_dsa_fn: fused online-softmax sparse attention)"
+            )
+        else:
+            print("[cppmega_fp8_shim] TileLang SparseMLA: already patched or unfused_dsa_fn not found")
+    except Exception as _exc:
+        import sys
+        print(f"[cppmega_fp8_shim] TileLang SparseMLA patch failed: {_exc}", file=sys.stderr)
+        # Fall back to gather_scatter
+        try:
+            from megatron.core.transformer.experimental_attention_variant import dsa as _dsa_mod
+            from cppmega.megatron.dsa_sparse_attention import sparse_dsa_fn as _sparse_dsa_fn
+
+            setattr(_sparse_dsa_fn, "__cppmega_sparse_dsa_patched__", True)
+            _dsa_mod.unfused_dsa_fn = _sparse_dsa_fn
+            print("[cppmega_fp8_shim] Fallback: gather_scatter sparse_dsa_fn applied")
+        except Exception as _exc2:
+            print(f"[cppmega_fp8_shim] gather_scatter fallback also failed: {_exc2}", file=sys.stderr)
+else:
+    # Explicit gather_scatter mode
+    try:
+        from megatron.core.transformer.experimental_attention_variant import dsa as _dsa_mod
+        from cppmega.megatron.dsa_sparse_attention import sparse_dsa_fn as _sparse_dsa_fn
+
+        _existing_unfused = getattr(_dsa_mod, "unfused_dsa_fn", None)
+        if _existing_unfused is not None and not getattr(
+            _existing_unfused, "__cppmega_sparse_dsa_patched__", False
+        ):
+            setattr(_sparse_dsa_fn, "__cppmega_sparse_dsa_patched__", True)
+            _dsa_mod.unfused_dsa_fn = _sparse_dsa_fn
+            print(
+                "[cppmega_fp8_shim] gather_scatter sparse_dsa_fn applied "
+                "(CPPMEGA_DSA_SPARSE_MODE=gather_scatter)"
+            )
+    except Exception as _exc:
+        import sys
+        print(f"[cppmega_fp8_shim] gather_scatter patch failed: {_exc}", file=sys.stderr)
