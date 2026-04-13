@@ -406,7 +406,7 @@ def bwd(
 
 
 def sparse_mla_bwd(
-    q, kv, o, do, indices, lse, sm_scale=None, is_casual=True, return_kernel=False, delta=None
+    q, kv, o, do, indices, lse, sm_scale=None, d_v=None, is_casual=True, return_kernel=False, delta=None
 ):
     """Run sparse-MLA backward kernels and return (dq, dkv).
 
