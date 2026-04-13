@@ -157,8 +157,8 @@ def apply_all():
     bwd_file = ops_dir / "tilelang_sparse_mla_bwd.py"
     _patch_file(bwd_file, [
         (
-            "q, kv, o, do, indices, lse, sm_scale=None,",
-            "q, kv, o, do, indices, lse, sm_scale=None, d_v=None,",
+            "q, kv, o, do, indices, lse, sm_scale=None, is_casual",
+            "q, kv, o, do, indices, lse, sm_scale=None, d_v=None, is_casual",
         ),
         (
             "D = 512",
@@ -178,6 +178,51 @@ def apply_all():
             "dP_shared_cast = T.alloc_shared([block_H, BS], accum_dtype)  # fp32 for dKV precision",
         ),
     ], "tilelang_sparse_mla_bwd.py P/dP fp32")
+
+    # === Patch 9: dsa.py — FP8 SparseMLA dispatch in _fused_sparse_mla_absorbed ===
+    print("Patch 9: dsa.py FP8 SparseMLA dispatch")
+    _patch_file(dsa_file, [
+        # Replace the batch loop in _fused_sparse_mla_absorbed to detect FP8
+        # inputs and dispatch to SparseMLA_FP8 instead of dequantizing to bf16.
+        (
+            """\
+    batch_outputs = None
+    for bi in range(query.size(1)):
+        q_t = query[:, bi].contiguous()  # [sq, np, d_total]
+        kv_t = key[:, bi].contiguous()  # [skv, 1, d_total]
+        idx_t = topk_indices[bi].unsqueeze(1).to(torch.int32).contiguous()  # [sq, 1, topk]
+        out, _ = SparseMLA.apply(q_t, kv_t, idx_t, softmax_scale, v_channels)""",
+            """\
+    # cppmega: detect FP8 inputs and dispatch to SparseMLA_FP8 for 2x throughput
+    _use_fp8_mla = False
+    try:
+        from transformer_engine.pytorch.tensor import QuantizedTensor
+        if isinstance(query, QuantizedTensor) or isinstance(key, QuantizedTensor):
+            _use_fp8_mla = True
+            query = query.dequantize() if isinstance(query, QuantizedTensor) else query
+            key = key.dequantize() if isinstance(key, QuantizedTensor) else key
+    except ImportError:
+        pass
+    if _use_fp8_mla:
+        try:
+            from cppmega.megatron.sparse_mla_ops.sparse_mla import SparseMLA_FP8 as _SparseMLA_FP8
+        except ImportError:
+            raise RuntimeError(
+                "FP8 inputs detected but cppmega SparseMLA_FP8 not importable. "
+                "Install cppmega or disable FP8."
+            )
+        _mla_fn = _SparseMLA_FP8
+    else:
+        _mla_fn = SparseMLA
+
+    batch_outputs = None
+    for bi in range(query.size(1)):
+        q_t = query[:, bi].contiguous()  # [sq, np, d_total]
+        kv_t = key[:, bi].contiguous()  # [skv, 1, d_total]
+        idx_t = topk_indices[bi].unsqueeze(1).to(torch.int32).contiguous()  # [sq, 1, topk]
+        out, _ = _mla_fn.apply(q_t, kv_t, idx_t, softmax_scale, v_channels)""",
+        ),
+    ], "dsa.py FP8 SparseMLA dispatch")
 
     # === Patch 8: dsa.py — _scatter_topk_into_index_mask CG-unsafe .any() ===
     print("Patch 8: dsa.py _scatter_topk_into_index_mask CG safety")
