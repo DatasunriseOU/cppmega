@@ -94,39 +94,46 @@ def apply_all():
     # === Patch 4: sparse_mla.py — Accept d_v in forward/backward ===
     print("Patch 4: sparse_mla.py d_v parameter")
     sma_file = ops_dir / "sparse_mla.py"
-    _patch_file(sma_file, [
-        (
-            "def forward(ctx, q, kv, indices, scaling):",
-            "def forward(ctx, q, kv, indices, scaling, d_v=512):",
-        ),
-        (
-            "ctx.scaling = scaling",
-            "ctx.scaling = scaling\n        ctx.d_v = d_v",
-        ),
-        (
-            "tl_out, tl_lse = sparse_mla_fwd_interface(q, kv, indices, sm_scale=scaling)",
-            "tl_out, tl_lse = sparse_mla_fwd_interface(q, kv, indices, sm_scale=scaling, d_v=d_v)",
-        ),
-        (
-            "return tl_dq, tl_dkv, None, None",
-            "return tl_dq, tl_dkv, None, None, None  # last None for d_v grad",
-        ),
-    ], "sparse_mla.py d_v")
-
-    # Also patch backward to pass d_v
     if sma_file.exists():
         text = sma_file.read_text()
+        original = text
+        # Forward: add d_v param
+        text = text.replace(
+            "def forward(ctx, q, kv, indices, scaling):",
+            "def forward(ctx, q, kv, indices, scaling, d_v=512):",
+        )
+        # Forward: save d_v (only if not already present)
+        if "ctx.d_v = d_v" not in text:
+            text = text.replace(
+                "ctx.scaling = scaling",
+                "ctx.scaling = scaling\n        ctx.d_v = d_v",
+            )
+        # Forward: pass d_v to kernel
+        text = text.replace(
+            "sparse_mla_fwd_interface(q, kv, indices, sm_scale=scaling)",
+            "sparse_mla_fwd_interface(q, kv, indices, sm_scale=scaling, d_v=d_v)",
+        )
+        # Forward: return 5 grads (add None for d_v)
+        text = text.replace(
+            "return tl_dq, tl_dkv, None, None\n",
+            "return tl_dq, tl_dkv, None, None, None  # last None for d_v grad\n",
+        )
+        # Backward: retrieve d_v (only if not already present)
         if "d_v = ctx.d_v" not in text:
             text = text.replace(
                 "scaling = ctx.scaling",
                 "scaling = ctx.scaling\n        d_v = ctx.d_v",
             )
-            text = text.replace(
-                "q, kv, tl_out, grad_output.contiguous(), indices, tl_lse, sm_scale=scaling",
-                "q, kv, tl_out, grad_output.contiguous(), indices, tl_lse, sm_scale=scaling, d_v=d_v",
-            )
+        # Backward: pass d_v to bwd kernel
+        text = text.replace(
+            "q, kv, tl_out, grad_output.contiguous(), indices, tl_lse, sm_scale=scaling)",
+            "q, kv, tl_out, grad_output.contiguous(), indices, tl_lse, sm_scale=scaling, d_v=d_v)",
+        )
+        if text != original:
             sma_file.write_text(text)
-            print("  DONE sparse_mla.py bwd d_v propagation")
+            print("  DONE sparse_mla.py d_v patched")
+        else:
+            print("  OK   sparse_mla.py d_v: already patched")
 
     # === Patch 5: tilelang_sparse_mla_fwd.py — Relax power-of-2 assertions ===
     print("Patch 5: tilelang_sparse_mla_fwd.py dimension assertions")
