@@ -4,7 +4,7 @@ Megatron-first training framework for **NAM56R** — a 4.73B hybrid Mamba3 + MLA
 
 ## Production Configuration
 
-**265 TFLOP/s** on 8xH200 (verified 2026-04-13).
+**289 TFLOP/s** on 8xH200 (verified 2026-04-14). BF16 outperforms FP8 tensorwise by 3.5%.
 
 | Parameter    | Value                                                     |
 | ------------ | --------------------------------------------------------- |
@@ -15,7 +15,7 @@ Megatron-first training framework for **NAM56R** — a 4.73B hybrid Mamba3 + MLA
 | DSA          | 9 DSA layers (sparse attention, indexer topk=256)         |
 | MoE          | 16 experts, topk=4, shared expert, grouped GEMM           |
 | MTP          | 2 prediction layers                                       |
-| Precision    | FP8 tensorwise (TE hybrid format)                         |
+| Precision    | BF16 (FP8 tensorwise available but -3.5% slower)          |
 | Parallelism  | PP=1, TP=1, EP=4, DP=2                                    |
 | Micro-batch  | MBS=4, GBS=64, seq_len=4096                               |
 | Hardware     | 8x NVIDIA H200 141GB (NVLink)                             |
@@ -104,7 +104,9 @@ The script auto-applies:
 
 | Config                        | TFLOP/s | tok/sec/GPU | Notes             |
 | ----------------------------- | ------- | ----------- | ----------------- |
-| **PP=1 EP=4 MBS=4 + compile** | **265** | ~8,500      | Production config |
+| **PP=1 MBS=8 BF16 no-CG + compile** | **289** | ~9,250 | Production config |
+| PP=1 MBS=8 FP8 no-CG + compile | 279 | ~8,950 | FP8 overhead > gain |
+| PP=1 EP=4 MBS=4 + compile | 265 | ~8,500 | With CUDA graphs |
 | PP=2 VPP=2 EP=4 MBS=4         | 194     | ~6,200      | Save verified     |
 | DualPipeV PP=2 MBS=2          | 205     | ~6,600      | No DSA/FP8 yet    |
 | Selective FP8 MoE (no DSA)    | 205     | ~6,600      | MoE-only FP8      |
