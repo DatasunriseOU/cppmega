@@ -422,7 +422,9 @@ def apply_mamba3_compile_patch() -> None:
     """
     import torch
 
-    _patch_cppmega_mamba3_te()
+    # CppMegaMamba3TE: compile is now INLINE (import _compiled_data_dep_A
+    # directly in mamba3_te_mixer.py). No monkey-patch needed.
+    # _patch_cppmega_mamba3_te()  # REMOVED — inline in mamba3_te_mixer.py
     _patch_noconv_mamba3()
 
     print(
