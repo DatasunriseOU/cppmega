@@ -72,8 +72,10 @@ export CPPMEGA_DSA_SPARSE_MODE="${CPPMEGA_DSA_SPARSE_MODE:-gather_scatter}"
 export CPPMEGA_MAMBA_RECOMPUTE="${CPPMEGA_MAMBA_RECOMPUTE:-1}"
 # Skip indexer loss (7 GiB torch.bmm) until head-streaming loss is implemented.
 export CPPMEGA_DSA_SKIP_INDEXER_LOSS="${CPPMEGA_DSA_SKIP_INDEXER_LOSS:-1}"
+export CPPMEGA_DSA_INDEXER_LOSS_COEFF="${CPPMEGA_DSA_INDEXER_LOSS_COEFF:-0}"
 export CPPMEGA_SELECTIVE_FP8_MOE="${CPPMEGA_SELECTIVE_FP8_MOE:-0}"
 export CPPMEGA_MTP_LIGER_CE="${CPPMEGA_MTP_LIGER_CE:-0}"
+export CPPMEGA_MAMBA3_COMPILE="${CPPMEGA_MAMBA3_COMPILE:-0}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export NCCL_GRAPH_REGISTER=0
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -173,36 +175,39 @@ if _mimo_on:
 try:
     from mamba_ssm.modules.mamba3 import Mamba3 as _Mamba3
     import torch as _torch
-    _FP32_NAMES = ("B_bias", "C_bias", "D", "dt_bias", "mimo_x", "mimo_z", "mimo_o")
-    # CG-safe: cast fp32 params ONCE in __init__ post-hook, not per-forward.
-    # Pre-forward hooks break CUDA graph capture.
-    if not getattr(_Mamba3, "_cppmega_fp32_bias_hook", False):
-        _Mamba3._cppmega_fp32_bias_hook = True
-        _orig_init = _Mamba3.__init__
-        def _patched_init(self, *args, **kwargs):
-            _orig_init(self, *args, **kwargs)
-            # Ensure fp32 params stay fp32 even after Float16Module._apply
-            for _name in _FP32_NAMES:
-                _p = getattr(self, _name, None)
-                if _p is not None and _p.dtype != _torch.float32:
-                    self.__dict__[_name] = _p.data.float()
-        _Mamba3.__init__ = _patched_init
-        # Also patch _apply to protect fp32 params from bf16 cast
-        _orig_apply = _Mamba3._apply
-        def _cg_safe_apply(self, fn, *a, **kw):
+    # Mamba3 fp32 bias: Float16Module casts D/dt_bias/B_bias/C_bias to bf16,
+    # but TileLang MIMO kernel expects DT (from dt_bias) as float32.
+    # The upstream forward computes DT = F.softplus(dd_dt + self.dt_bias) which
+    # returns fp32 only if dt_bias is fp32. We must restore fp32 on params.
+    # CG-safe: use is_graph_capturing() guard to skip during graph capture.
+    # Mamba3 fp32 fix: TileLang MIMO kernel expects DT, ADT, D, biases as fp32.
+    # Float16Module._apply casts ALL params to bf16 AFTER __init__.
+    # Fix: override Float16Module._apply to skip Mamba3 fp32 params.
+    # This is a ONE-TIME fix at model construction, not per-forward.
+    # Guard Mamba3._apply to preserve fp32 params when Float16Module casts to bf16.
+    # ONLY dt_bias and D need fp32 — they feed TileLang fp32 params DT/D.
+    # B_bias/C_bias are ADDED to bf16 Q/K tensors → must stay bf16.
+    # mimo_x/z/o are used in .float() einsum → auto-promoted, no issue.
+    _FP32_PARAM_NAMES = {"D", "dt_bias"}
+    if not getattr(_Mamba3, "_cppmega_apply_guard", False):
+        _Mamba3._cppmega_apply_guard = True
+        _orig_m3_apply = _Mamba3._apply
+        def _m3_guarded_apply(self, fn, *a, **kw):
+            # Save fp32 param data
             _saved = {}
-            for _name in _FP32_NAMES:
-                _p = getattr(self, _name, None)
+            for _pn in _FP32_PARAM_NAMES:
+                _p = getattr(self, _pn, None)
+                if _p is not None and isinstance(_p, _torch.nn.Parameter):
+                    _saved[_pn] = _p.data.clone()
+            result = _orig_m3_apply(self, fn, *a, **kw)
+            # Restore fp32 (fn may have cast to bf16)
+            for _pn, _data in _saved.items():
+                _p = getattr(self, _pn, None)
                 if _p is not None:
-                    _saved[_name] = _p.data.clone()
-            result = _orig_apply(self, fn, *a, **kw)
-            for _name, _data in _saved.items():
-                _p = getattr(self, _name, None)
-                if _p is not None:
-                    _p.data = _data
+                    _p.data = _data.to(device=_p.device)
             return result
-        _Mamba3._apply = _cg_safe_apply
-        print("[cppmega_mimo_shim] Mamba3 fp32-bias CG-safe init patch installed (no pre-hook)")
+        _Mamba3._apply = _m3_guarded_apply
+        print("[cppmega_mimo_shim] Mamba3._apply guarded: fp32 params preserved through bf16 cast")
 except Exception as _exc:
     print(f"[cppmega_mimo_shim] Mamba3 fp32-bias hook failed: {_exc}", file=sys.stderr)
 
@@ -253,6 +258,42 @@ if os.environ.get("CPPMEGA_SELECTIVE_FP8_MOE", "0") == "1":
     except Exception as _exc:
         print(f"[cppmega_mimo_shim] Selective FP8 MoE patch failed: {_exc}", file=sys.stderr)
         raise
+
+# (11) Override dsa_indexer_loss_coeff via env var
+_ilc = os.environ.get("CPPMEGA_DSA_INDEXER_LOSS_COEFF")
+if _ilc is not None:
+    try:
+        from megatron.core.transformer.transformer_config import TransformerConfig
+        _old_post = TransformerConfig.__post_init__
+        _ilc_val = float(_ilc)
+        def _ilc_post_init(self):
+            _old_post(self)
+            if hasattr(self, "dsa_indexer_loss_coeff"):
+                object.__setattr__(self, "dsa_indexer_loss_coeff", _ilc_val)
+            # Also enable sparse loss (top-k KL only) for faster indexer training
+            if hasattr(self, "dsa_indexer_use_sparse_loss"):
+                _sparse = os.environ.get("CPPMEGA_DSA_SPARSE_LOSS", "1") == "1"
+                object.__setattr__(self, "dsa_indexer_use_sparse_loss", _sparse)
+        TransformerConfig.__post_init__ = _ilc_post_init
+        print(f"[cppmega_mimo_shim] dsa_indexer_loss_coeff overridden to {_ilc_val}")
+    except Exception as _e:
+        print(f"[cppmega_mimo_shim] indexer_loss_coeff override failed: {_e}")
+
+# (12) IndexCache: cross-layer index reuse (CPPMEGA_INDEX_CACHE=1)
+if os.environ.get("CPPMEGA_INDEX_CACHE", "0") == "1":
+    try:
+        from cppmega.megatron.index_cache_patch import apply_index_cache_patch
+        apply_index_cache_patch()
+    except Exception as _exc:
+        print(f"[cppmega_mimo_shim] IndexCache patch failed: {_exc}", file=sys.stderr)
+
+# (10) Mamba3 regional torch.compile (CPPMEGA_MAMBA3_COMPILE=1)
+if os.environ.get("CPPMEGA_MAMBA3_COMPILE", "0") == "1":
+    try:
+        from cppmega.megatron.mamba3_compile_patch import apply_mamba3_compile_patch
+        apply_mamba3_compile_patch()
+    except Exception as _exc:
+        print(f"[cppmega_mimo_shim] Mamba3 compile patch failed: {_exc}", file=sys.stderr)
 
 # (9) MTP Liger fused CE (CPPMEGA_MTP_LIGER_CE=1)
 if os.environ.get("CPPMEGA_MTP_LIGER_CE", "0") == "1":
@@ -382,10 +423,19 @@ if [[ "${CPPMEGA_DISPATCHER_OVERRIDE:-}" == alltoall* ]]; then
   MOE_EXTRA_FLAGS="--moe-pad-expert-input-to-capacity --moe-expert-capacity-factor 1.0"
   echo "NATIVE_ARGS (alltoall override for EP=1): dispatcher=alltoall"
 fi
+# Override dsa-indexer-loss-coeff in native args if env var set
+if [ "${CPPMEGA_DSA_INDEXER_LOSS_COEFF}" != "" ] && [ "${CPPMEGA_DSA_INDEXER_LOSS_COEFF}" != "0.001" ]; then
+  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--dsa-indexer-loss-coeff [0-9.e-]*/--dsa-indexer-loss-coeff ${CPPMEGA_DSA_INDEXER_LOSS_COEFF}/")
+  echo "NATIVE_ARGS: dsa-indexer-loss-coeff overridden to ${CPPMEGA_DSA_INDEXER_LOSS_COEFF}"
+fi
 echo "NATIVE_ARGS (post-sed): ${NATIVE_ARGS}"
 
 # CUDA graphs — full scope verified stable with lr warmup.
-CG_FLAGS="${CG_FLAGS:---cuda-graph-impl local --cuda-graph-scope attn mamba moe_router moe_preprocess}"
+if [ -z "${CG_FLAGS+x}" ]; then
+  CG_FLAGS="--cuda-graph-impl transformer_engine --cuda-graph-scope attn mamba moe_router moe_preprocess"
+elif [ "${CG_FLAGS}" = "NONE" ]; then
+  CG_FLAGS=""
+fi
 echo "[stream_m] CUDA graphs: ${CG_FLAGS}"
 # NOTE: --moe-pad-expert-input-to-capacity is INCOMPATIBLE with flex dispatcher
 # (raises ValueError). Omit when using DeepEP flex.
@@ -395,18 +445,27 @@ MOE_EXTRA_FLAGS="${MOE_EXTRA_FLAGS:-}"
 # FP8 GEMM flags: enables FP8 for ALL TE linear layers (MLP, MoE experts,
 # attention projections, embeddings). --bf16 remains the base precision;
 # FP8 applies inside TE's Linear forward via delayed scaling.
-FP8_FLAGS="${FP8_FLAGS:---fp8-format hybrid --fp8-amax-history-len 1024 --fp8-amax-compute-algo max}"
+if [ -z "${FP8_FLAGS+x}" ]; then
+  # FP8_FLAGS not set at all → use default FP8 with tensorwise recipe
+  FP8_FLAGS="--fp8-format hybrid --fp8-recipe tensorwise --fp8-amax-history-len 1024 --fp8-amax-compute-algo max"
+elif [ "${FP8_FLAGS}" = "NONE" ]; then
+  FP8_FLAGS=""
+fi
+# If FP8_FLAGS="" (explicitly empty) → no FP8 (BF16 only)
 
 # Stream M: selective activation recompute.
 # head-streaming in dsa_fp8_indexer.py (commit 563fcb0) reduces DSA target from
 # 7.5 GiB to 0.8 GiB per layer, so selective moe_act recompute is sufficient.
 # --mla-down-proj-fusion: fuses MLA down-projection GEMMs (PR #3039, free perf).
-# NOTE: moe_act recompute is INCOMPATIBLE with FP8 delayed scaling (Megatron
-# raises ValueError). When FP8 GEMMs are enabled, drop moe_act from recompute.
-if [ -n "${FP8_FLAGS}" ]; then
+# NOTE: moe_act recompute is INCOMPATIBLE with FP8 *delayed* scaling only.
+# FP8 tensorwise (current scaling) IS compatible with moe_act recompute.
+# Only drop moe_act if FP8 + delayed recipe.
+if echo "${FP8_FLAGS}" | grep -q "fp8" && ! echo "${FP8_FLAGS}" | grep -q "tensorwise"; then
   RECOMPUTE_MODULES="mlp mla_up_proj"
+  echo "[stream_m] FP8 delayed → dropping moe_act from recompute"
 else
   RECOMPUTE_MODULES="moe_act mlp mla_up_proj"
+  echo "[stream_m] moe_act recompute enabled (BF16 or FP8 tensorwise)"
 fi
 EXTRA_FLAGS="${EXTRA_FLAGS:---recompute-granularity selective --recompute-modules ${RECOMPUTE_MODULES} --mla-down-proj-fusion --clip-grad 1.0}"
 
@@ -458,7 +517,7 @@ echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-<unset>}"
 NSYS_CMD=""
 if [ "${NSYS_PROFILE:-0}" = "1" ]; then
   NSYS_OUT="${NSYS_OUT:-/home/dave/cppmega-root/cppmega/nsys_${RUN_ID}}"
-  NSYS_CMD="nsys profile --trace=cuda,nvtx,osrt --cuda-memory-usage=true -o ${NSYS_OUT} -f true --stats=true --duration=120"
+  NSYS_CMD="nsys profile --trace=cuda,nvtx,osrt --cuda-memory-usage=true -o ${NSYS_OUT} -f true --stats=true --duration=${NSYS_DURATION:-300}"
   echo "[nsys] profiling 120s → ${NSYS_OUT}.nsys-rep"
 fi
 
