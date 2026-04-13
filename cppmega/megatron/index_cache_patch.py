@@ -41,18 +41,10 @@ def apply_index_cache_patch(force: bool = False) -> bool:
     Shared layers: skip indexer entirely, reuse cached topk_indices from
                    nearest preceding Full layer, skip indexer loss.
     """
-    if os.environ.get("CPPMEGA_INDEX_CACHE", "0") != "1":
-        return False
-
-    try:
-        from megatron.core.transformer.experimental_attention_variant import dsa as dsa_mod
-    except ImportError:
-        log.warning("index_cache_patch: cannot import DSA module")
-        return False
+    from megatron.core.transformer.experimental_attention_variant import dsa as dsa_mod
 
     _DSAttention = getattr(dsa_mod, "DSAttention", None)
-    if _DSAttention is None:
-        return False
+    assert _DSAttention is not None, "DSAttention not found in dsa module"
 
     _MARKER = "__cppmega_index_cache_v3__"
     if getattr(_DSAttention, _MARKER, False) and not force:
@@ -174,13 +166,15 @@ def apply_index_cache_patch(force: bool = False) -> bool:
                 break
 
         if cached_indices is None:
-            # Safety fallback: no preceding Full layer ran (shouldn't happen
-            # with FSSFSSFSSS pattern). Run original forward.
-            log.warning(
-                "IndexCache: DSA rank %d has no cached indices, falling back",
-                dsa_rank,
+            # No preceding Full layer on this PP stage — promote to Full.
+            # This happens when PP>1 splits DSA layers across stages.
+            self._ic_is_full = True
+            log.info(
+                "IndexCache: DSA rank %d auto-promoted to FULL "
+                "(no preceding Full on this PP stage)", dsa_rank,
             )
-            return _orig_forward(
+            # Re-enter as Full layer (runs orig forward + caches indices)
+            return _ic_forward(
                 self, query, key, value, attention_mask, x, qr,
                 position_ids=position_ids,
                 attn_mask_type=attn_mask_type,

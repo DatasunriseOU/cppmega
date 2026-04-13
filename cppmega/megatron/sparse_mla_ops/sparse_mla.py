@@ -49,6 +49,25 @@ import torch
 log = logging.getLogger(__name__)
 
 
+def _unwrap_quantized(t: torch.Tensor) -> torch.Tensor:
+    """Unwrap TE Float8Tensor (or any QuantizedTensor) to a plain torch.Tensor.
+
+    Transformer Engine's Float8Tensor stores data in FP8 internally but reports
+    .dtype as the logical dtype (e.g. bfloat16).  It survives .contiguous(),
+    .to(dtype), .reshape(), and slicing, so it can silently reach TileLang
+    kernel launchers which call .data_ptr() and get NULL.
+
+    Calling .dequantize() converts back to a plain tensor with valid data_ptr.
+    """
+    try:
+        from transformer_engine.pytorch.tensor import QuantizedTensor
+    except ImportError:
+        return t
+    if isinstance(t, QuantizedTensor):
+        return t.dequantize()
+    return t
+
+
 class SparseMLA(torch.autograd.Function):
     """Autograd wrapper around TileLang sparse-MLA forward/backward kernels."""
 
@@ -71,6 +90,9 @@ class SparseMLA(torch.autograd.Function):
             sparse_mla_fwd_interface,
         )
 
+        # Unwrap TE Float8Tensor before passing to TileLang.
+        q = _unwrap_quantized(q)
+        kv = _unwrap_quantized(kv)
         indices = indices.contiguous()
         q, kv = q.contiguous(), kv.contiguous()
         ctx.scaling = scaling
@@ -138,6 +160,9 @@ class SparseMLA_FP8(torch.autograd.Function):
             sparse_mla_fwd_fp8_interface,
         )
 
+        # Unwrap TE Float8Tensor before FP8 quantization path.
+        q = _unwrap_quantized(q)
+        kv = _unwrap_quantized(kv)
         indices = indices.contiguous()
         q, kv = q.contiguous(), kv.contiguous()
         ctx.scaling = scaling

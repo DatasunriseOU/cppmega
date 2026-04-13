@@ -60,8 +60,7 @@ export CPPMEGA_NGRAM_HASH_EMBED_DIM="${CPPMEGA_NGRAM_HASH_EMBED_DIM:-16}"
 export CPPMEGA_STRUCTURE_ENABLED="${CPPMEGA_STRUCTURE_ENABLED:-1}"
 export CPPMEGA_STRUCTURE_COMPONENTS="${CPPMEGA_STRUCTURE_COMPONENTS:-core}"
 export CPPMEGA_DSA_A_LAYER_RANKS="${CPPMEGA_DSA_A_LAYER_RANKS:-1,2,3,5,6,7,9,10,11}"
-# Stream E+G FP8 DSA indexer (fwd + bwd patched)
-export CPPMEGA_DSA_INDEXER_DTYPE="${CPPMEGA_DSA_INDEXER_DTYPE:-fp8}"
+# DSA indexer dtype: lemyx handles this, no separate FP8 patch needed
 # Use gather_scatter for DSA sparse attention: the TileLang sparse_mla_ops
 # kernel expects MLA compressed KV format (d_v=96), but our DSA pipeline
 # passes decompressed Q/K/V (d_v=512). gather_scatter handles arbitrary dims.
@@ -75,8 +74,10 @@ export CPPMEGA_DSA_SKIP_INDEXER_LOSS="${CPPMEGA_DSA_SKIP_INDEXER_LOSS:-1}"
 export CPPMEGA_DSA_INDEXER_LOSS_COEFF="${CPPMEGA_DSA_INDEXER_LOSS_COEFF:-0}"
 export CPPMEGA_SELECTIVE_FP8_MOE="${CPPMEGA_SELECTIVE_FP8_MOE:-0}"
 export CPPMEGA_MTP_LIGER_CE="${CPPMEGA_MTP_LIGER_CE:-0}"
-export CPPMEGA_MAMBA3_COMPILE="${CPPMEGA_MAMBA3_COMPILE:-0}"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# CPPMEGA_MAMBA3_COMPILE removed — regional compile is now always-on
+export CPPMEGA_LEMYX_DSA="${CPPMEGA_LEMYX_DSA:-0}"
+# Always on — prevents fragmentation OOM on large models
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export NCCL_GRAPH_REGISTER=0
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_IB_SL=1
@@ -155,21 +156,18 @@ except Exception as _exc:
 # (2) MIMO __post_init__
 _mimo_on = os.environ.get("CPPMEGA_MAMBA3_MIMO", "0") == "1"
 if _mimo_on:
-    try:
-        from megatron.core.transformer.transformer_config import TransformerConfig
-        _orig_post_init = TransformerConfig.__post_init__
-        def _cppmega_mimo_post_init(self):
-            _orig_post_init(self)
-            if not getattr(self, "cppmega_mamba3_is_mimo", False):
-                object.__setattr__(self, "cppmega_mamba3_is_mimo", True)
-            if not getattr(self, "cppmega_mamba3_mimo_rank", None):
-                object.__setattr__(self, "cppmega_mamba3_mimo_rank", 4)
-            if not getattr(self, "cppmega_mamba3_chunk_size", None):
-                object.__setattr__(self, "cppmega_mamba3_chunk_size", 16)
-        TransformerConfig.__post_init__ = _cppmega_mimo_post_init
-        print("[cppmega_mimo_shim] MIMO patch installed (rank=4, chunk=16)")
-    except Exception as _exc:
-        print(f"[cppmega_mimo_shim] MIMO patch failed: {_exc}", file=sys.stderr)
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    _orig_post_init = TransformerConfig.__post_init__
+    def _cppmega_mimo_post_init(self):
+        _orig_post_init(self)
+        if not getattr(self, "cppmega_mamba3_is_mimo", False):
+            object.__setattr__(self, "cppmega_mamba3_is_mimo", True)
+        if not getattr(self, "cppmega_mamba3_mimo_rank", None):
+            object.__setattr__(self, "cppmega_mamba3_mimo_rank", 4)
+        if not getattr(self, "cppmega_mamba3_chunk_size", None):
+            object.__setattr__(self, "cppmega_mamba3_chunk_size", 16)
+    TransformerConfig.__post_init__ = _cppmega_mimo_post_init
+    print("[cppmega_mimo_shim] MIMO patch installed (rank=4, chunk=16)")
 
 # (3) Mamba3 fp32-bias forward pre-hook
 try:
@@ -188,26 +186,12 @@ try:
     # ONLY dt_bias and D need fp32 — they feed TileLang fp32 params DT/D.
     # B_bias/C_bias are ADDED to bf16 Q/K tensors → must stay bf16.
     # mimo_x/z/o are used in .float() einsum → auto-promoted, no issue.
-    _FP32_PARAM_NAMES = {"D", "dt_bias"}
-    if not getattr(_Mamba3, "_cppmega_apply_guard", False):
-        _Mamba3._cppmega_apply_guard = True
-        _orig_m3_apply = _Mamba3._apply
-        def _m3_guarded_apply(self, fn, *a, **kw):
-            # Save fp32 param data
-            _saved = {}
-            for _pn in _FP32_PARAM_NAMES:
-                _p = getattr(self, _pn, None)
-                if _p is not None and isinstance(_p, _torch.nn.Parameter):
-                    _saved[_pn] = _p.data.clone()
-            result = _orig_m3_apply(self, fn, *a, **kw)
-            # Restore fp32 (fn may have cast to bf16)
-            for _pn, _data in _saved.items():
-                _p = getattr(self, _pn, None)
-                if _p is not None:
-                    _p.data = _data.to(device=_p.device)
-            return result
-        _Mamba3._apply = _m3_guarded_apply
-        print("[cppmega_mimo_shim] Mamba3._apply guarded: fp32 params preserved through bf16 cast")
+    # _apply guard REMOVED: keeping D/dt_bias as fp32 while rest is bf16 causes
+    # distributed optimizer save crash — optimizer state tensors get cross-mapped
+    # between the bf16 and fp32 gradient buffers (model_param_group_index_map
+    # ordering mismatch). Instead, let Float16Module cast D/dt_bias to bf16 normally
+    # and use .float() in forward (already done in mamba_ssm Mamba3 + noconv_mamba_mixer).
+    print("[cppmega_mimo_shim] Mamba3._apply guard DISABLED (bf16 D/dt_bias + .float() in fwd)")
 except Exception as _exc:
     print(f"[cppmega_mimo_shim] Mamba3 fp32-bias hook failed: {_exc}", file=sys.stderr)
 
@@ -228,16 +212,7 @@ except Exception:
     pass
 
 # (5) Stream E+G: DSA FP8 fwd+bwd indexer patch + loss_coeff==0 gate
-_dsa_dtype = os.environ.get("CPPMEGA_DSA_INDEXER_DTYPE", "bf16").lower()
-print(f"[cppmega_mimo_shim] CPPMEGA_DSA_INDEXER_DTYPE resolves to '{_dsa_dtype}'")
-if _dsa_dtype == "fp8":
-    try:
-        from cppmega.megatron.dsa_fp8_patch import apply_dsa_fp8_patch
-        _applied = apply_dsa_fp8_patch()
-        print(f"[cppmega_mimo_shim] DSA FP8 patch applied={_applied}")
-    except Exception as _exc:
-        print(f"[cppmega_mimo_shim] DSA FP8 patch failed: {_exc}", file=sys.stderr)
-        raise
+# DSA FP8 patch removed — lemyx + IndexCache is the only path
 
 # (6) Mamba/M2RNN activation checkpointing (CPPMEGA_MAMBA_RECOMPUTE=1)
 _mamba_recompute = os.environ.get("CPPMEGA_MAMBA_RECOMPUTE", "0") == "1"
@@ -262,46 +237,46 @@ if os.environ.get("CPPMEGA_SELECTIVE_FP8_MOE", "0") == "1":
 # (11) Override dsa_indexer_loss_coeff via env var
 _ilc = os.environ.get("CPPMEGA_DSA_INDEXER_LOSS_COEFF")
 if _ilc is not None:
-    try:
-        from megatron.core.transformer.transformer_config import TransformerConfig
-        _old_post = TransformerConfig.__post_init__
-        _ilc_val = float(_ilc)
-        def _ilc_post_init(self):
-            _old_post(self)
-            if hasattr(self, "dsa_indexer_loss_coeff"):
-                object.__setattr__(self, "dsa_indexer_loss_coeff", _ilc_val)
-            # Also enable sparse loss (top-k KL only) for faster indexer training
-            if hasattr(self, "dsa_indexer_use_sparse_loss"):
-                _sparse = os.environ.get("CPPMEGA_DSA_SPARSE_LOSS", "1") == "1"
-                object.__setattr__(self, "dsa_indexer_use_sparse_loss", _sparse)
-        TransformerConfig.__post_init__ = _ilc_post_init
-        print(f"[cppmega_mimo_shim] dsa_indexer_loss_coeff overridden to {_ilc_val}")
-    except Exception as _e:
-        print(f"[cppmega_mimo_shim] indexer_loss_coeff override failed: {_e}")
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    _old_post = TransformerConfig.__post_init__
+    _ilc_val = float(_ilc)
+    def _ilc_post_init(self):
+        _old_post(self)
+        if hasattr(self, "dsa_indexer_loss_coeff"):
+            object.__setattr__(self, "dsa_indexer_loss_coeff", _ilc_val)
+        if hasattr(self, "dsa_indexer_use_sparse_loss"):
+            _sparse = os.environ.get("CPPMEGA_DSA_SPARSE_LOSS", "1") == "1"
+            object.__setattr__(self, "dsa_indexer_use_sparse_loss", _sparse)
+    TransformerConfig.__post_init__ = _ilc_post_init
+    print(f"[cppmega_mimo_shim] dsa_indexer_loss_coeff overridden to {_ilc_val}")
+
+# (13) lemyx fused DSA warmup kernel (CPPMEGA_LEMYX_DSA=1)
+if os.environ.get("CPPMEGA_LEMYX_DSA", "0") == "1":
+    from cppmega.megatron.lemyx_dsa_warmup import apply_lemyx_dsa_patch
+    apply_lemyx_dsa_patch()
 
 # (12) IndexCache: cross-layer index reuse (CPPMEGA_INDEX_CACHE=1)
 if os.environ.get("CPPMEGA_INDEX_CACHE", "0") == "1":
-    try:
-        from cppmega.megatron.index_cache_patch import apply_index_cache_patch
-        apply_index_cache_patch()
-    except Exception as _exc:
-        print(f"[cppmega_mimo_shim] IndexCache patch failed: {_exc}", file=sys.stderr)
+    from cppmega.megatron.index_cache_patch import apply_index_cache_patch
+    apply_index_cache_patch()
 
-# (10) Mamba3 regional torch.compile (CPPMEGA_MAMBA3_COMPILE=1)
-if os.environ.get("CPPMEGA_MAMBA3_COMPILE", "0") == "1":
+# (14) Hybrid schedule plan for combined_1f1b EP A2A overlap
+if os.environ.get("CPPMEGA_HYBRID_SCHEDULE_PLAN", "0") == "1":
     try:
-        from cppmega.megatron.mamba3_compile_patch import apply_mamba3_compile_patch
-        apply_mamba3_compile_patch()
+        from cppmega.megatron.hybrid_schedule_plan import apply_hybrid_schedule_plan_patch
+        apply_hybrid_schedule_plan_patch()
     except Exception as _exc:
-        print(f"[cppmega_mimo_shim] Mamba3 compile patch failed: {_exc}", file=sys.stderr)
+        print(f"[cppmega_mimo_shim] Hybrid schedule plan patch failed: {_exc}", file=sys.stderr)
+        raise
+
+# (10) Mamba3 regional torch.compile — always on, no env gate
+from cppmega.megatron.mamba3_compile_patch import apply_mamba3_compile_patch
+apply_mamba3_compile_patch()
 
 # (9) MTP Liger fused CE (CPPMEGA_MTP_LIGER_CE=1)
 if os.environ.get("CPPMEGA_MTP_LIGER_CE", "0") == "1":
-    try:
-        from cppmega.megatron.mtp_liger_ce import patch_mtp_loss_with_liger
-        patch_mtp_loss_with_liger()
-    except Exception as _exc:
-        print(f"[cppmega_mimo_shim] MTP Liger CE patch failed: {_exc}", file=sys.stderr)
+    from cppmega.megatron.mtp_liger_ce import patch_mtp_loss_with_liger
+    patch_mtp_loss_with_liger()
 
 # (7) Stream M: per-rank peak-memory reporter (atexit hook)
 def _cppmega_peak_mem_report():
@@ -467,7 +442,18 @@ else
   RECOMPUTE_MODULES="moe_act mlp mla_up_proj"
   echo "[stream_m] moe_act recompute enabled (BF16 or FP8 tensorwise)"
 fi
-EXTRA_FLAGS="${EXTRA_FLAGS:---recompute-granularity selective --recompute-modules ${RECOMPUTE_MODULES} --mla-down-proj-fusion --clip-grad 1.0}"
+# EP A2A overlap: --overlap-moe-expert-parallel-comm + --delay-wgrad-compute
+# Requires CPPMEGA_HYBRID_SCHEDULE_PLAN=1 (set automatically when enabled).
+# CUDA_DEVICE_MAX_CONNECTIONS must be >1 for multi-stream overlap.
+EP_OVERLAP_FLAGS=""
+if [ "${CPPMEGA_EP_OVERLAP:-0}" = "1" ]; then
+  EP_OVERLAP_FLAGS="--overlap-moe-expert-parallel-comm --delay-wgrad-compute"
+  export CPPMEGA_HYBRID_SCHEDULE_PLAN=1
+  export CUDA_DEVICE_MAX_CONNECTIONS=32
+  echo "[stream_m] EP A2A overlap enabled (CUDA_DEVICE_MAX_CONNECTIONS=32)"
+fi
+
+EXTRA_FLAGS="${EXTRA_FLAGS:---recompute-granularity selective --recompute-modules ${RECOMPUTE_MODULES} --mla-down-proj-fusion --clip-grad 1.0 ${EP_OVERLAP_FLAGS}}"
 
 ROPE_FLAG=""
 if [ "${NO_ROPE_FUSION}" = "1" ]; then
@@ -475,8 +461,7 @@ if [ "${NO_ROPE_FUSION}" = "1" ]; then
 fi
 
 python -c 'import cppmega, megatron; print("cppmega", cppmega.__version__)'
-python -c "from cppmega.megatron.dsa_fp8_patch import apply_dsa_fp8_patch; print('dsa_fp8_patch importable')"
-python -c "from cppmega.megatron.dsa_fp8_indexer import bwd_fused_indexer_loss_fp8, compute_index_scores_fp8; print('dsa_fp8_indexer fwd+bwd importable')"
+# dsa_fp8_patch/indexer removed — lemyx + IndexCache is the only path
 
 # Validate DSA A-layer rank parsing.
 python - <<PY
@@ -507,7 +492,7 @@ fi
 echo "=== Stream M NAM56R 7/7 MIMO + DSA 9+4 + FP8 indexer + loss gate + selective recompute (${VARIANT}) ==="
 echo "RUN_ID=${RUN_ID} VARIANT=${VARIANT} TP=${TP_SIZE} PP=${PP_SIZE} VPP=${VPP_SIZE} EP=${EP_SIZE} MBS=${MBS} GBS=${GBS} MTP=${MTP_DEPTHS}"
 echo "DSA_A_LAYER_RANKS=${CPPMEGA_DSA_A_LAYER_RANKS}"
-echo "CPPMEGA_DSA_INDEXER_DTYPE=${CPPMEGA_DSA_INDEXER_DTYPE}"
+echo "DSA path: lemyx + IndexCache"
 echo "EXTRA_FLAGS=${EXTRA_FLAGS}"
 echo "LOG=${LOG}"
 nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader

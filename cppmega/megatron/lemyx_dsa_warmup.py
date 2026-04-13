@@ -1,21 +1,12 @@
 """Megatron integration for lemyx/tilelang-dsa fused FA+KL warmup kernel.
 
-The lemyx kernel (``kernel_bf16_training_dsa_warmup_lightning_indexer.py``)
-fuses FlashAttention + lightning-indexer score computation + KL divergence
-into a single TileLang pass.  During DSA warmup only the indexer parameters
-receive gradients, so this is a drop-in for the ``FusedDSAIndexerLoss``
-autograd path in Megatron's DSA layer.
+The lemyx kernel fuses FlashAttention + lightning-indexer score computation
++ KL divergence into a single TileLang pass. Used for DSA indexer warmup
+(first ~1000 steps). After warmup, IndexCache skips indexer on Shared layers
+and Full layers use the standard indexer path.
 
-Performance (verified shapes: heads=28, dim=192, index_heads=28,
-index_dim=64, batch=4, seqlen=4096):
-    FWD 5.26 ms, BWD 19.8 ms -- correctness PASSED for FA, KL, gradients.
-
-REQUIREMENT: The lemyx kernel requires ``heads == index_heads``.
-Our production DSA uses ``num_attention_heads=28, dsa_indexer_n_heads=8``.
-For warmup training, set ``dsa_indexer_n_heads=28`` to match.  The patch
-will refuse to activate if heads != index_heads and log an error.
-
-Gate: ``CPPMEGA_LEMYX_DSA=1`` environment variable.
+REQUIREMENT: heads == index_heads (set --dsa-indexer-n-heads == --num-attention-heads).
+With heads=32 hidden=4096 this is satisfied and FP8-compatible (32 % 8 == 0).
 
 Usage::
 
@@ -25,47 +16,39 @@ Usage::
 
 from __future__ import annotations
 
-import logging
 import os
 import sys
 
 import torch
 
-log = logging.getLogger(__name__)
-
-LEMYX_DSA_ENV = "CPPMEGA_LEMYX_DSA"
-_LEMYX_REPO_PATH = "/home/dave/cppmega-root/tilelang-dsa"
 _PATCH_MARKER = "__cppmega_lemyx_dsa_patched__"
-
-# ---------------------------------------------------------------------------
-# Lazy-loaded lemyx kernel singleton
-# ---------------------------------------------------------------------------
 _DsaWarmupFunc = None
 
 
+def _get_lemyx_repo():
+    """Resolve tilelang-dsa repo path: sibling of cppmega-root."""
+    # Same REMOTE_ROOT used everywhere: /mnt/data/cppmega-root
+    root = os.environ.get("REMOTE_ROOT", "/mnt/data/cppmega-root")
+    return os.path.join(root, "tilelang-dsa")
+
+
 def _ensure_lemyx_imported():
-    """Import ``_DsaWarmupFunc`` from the lemyx repo (adds to sys.path)."""
     global _DsaWarmupFunc
     if _DsaWarmupFunc is not None:
         return
 
-    repo = os.environ.get("CPPMEGA_LEMYX_DSA_PATH", _LEMYX_REPO_PATH)
+    repo = _get_lemyx_repo()
+    assert os.path.isdir(repo), f"tilelang-dsa repo not found at {repo}"
+
     if repo not in sys.path:
         sys.path.insert(0, repo)
 
-    try:
-        from kernel_bf16_training_dsa_warmup_lightning_indexer import (
-            _DsaWarmupFunc as _Func,
-        )
-    except ImportError as e:
-        raise ImportError(
-            f"Cannot import lemyx _DsaWarmupFunc from {repo}. "
-            f"Ensure the tilelang-dsa repo is at {repo} or set "
-            f"CPPMEGA_LEMYX_DSA_PATH. Original error: {e}"
-        ) from e
+    from kernel_bf16_training_dsa_warmup_lightning_indexer import (
+        _DsaWarmupFunc as _Func,
+    )
 
     _DsaWarmupFunc = _Func
-    log.info("lemyx _DsaWarmupFunc imported from %s", repo)
+    print(f"[cppmega] lemyx _DsaWarmupFunc imported from {repo}")
 
 
 # ---------------------------------------------------------------------------
@@ -124,49 +107,32 @@ class _LemyxFusedDSAIndexerLoss:
         sk = key.shape[0]
         index_heads = q.shape[2]
 
-        if np_ != index_heads:
-            raise ValueError(
-                f"lemyx fused kernel requires heads == index_heads, "
-                f"got {np_} != {index_heads}. Set dsa_indexer_n_heads={np_} "
-                f"for warmup training."
-            )
-
-        if loss_coeff == 0.0:
-            # Fast path: no loss needed, just compute topk.
-            from megatron.core.transformer.experimental_attention_variant.dsa import (
-                fused_qk_topk_naive,
-            )
-            _, topk_indices = fused_qk_topk_naive(
-                q, k, weights, topk,
-                mask=mask,
-                varlen_starts=varlen_starts,
-                varlen_ends=varlen_ends,
-                key_positions=key_positions,
-                use_relu=use_relu,
-            )
-            return topk_indices, torch.zeros(
-                (), device=query.device, dtype=torch.float32
-            )
+        assert np_ == index_heads, (
+            f"lemyx fused kernel requires heads == index_heads, "
+            f"got {np_} != {index_heads}. Set --dsa-indexer-n-heads {np_}"
+        )
 
         # -- Layout conversion (all ops are differentiable) --
+        # All outputs must be contiguous: TileLang static-shape kernels
+        # check strides and reject non-C-contiguous tensors.
 
         # Attention Q: [sq, b, np, hn] -> [b*sq, np, hn]
-        q_unpad = _to_varlen_unpad(query, b, sq)
+        q_unpad = _to_varlen_unpad(query, b, sq).contiguous()
 
         # Attention K: [sk, b, np, hn] -> MQA squeeze head 0 -> [b*sk, hn]
         # Lemyx kernel uses MQA-style K: [total_kv, dim].  In DSA warmup
         # all heads share the same K (nkv=1), so taking head 0 is correct.
-        k_unpad = _to_varlen_unpad(key[:, :, 0:1, :], b, sk).squeeze(1)
+        k_unpad = _to_varlen_unpad(key[:, :, 0:1, :], b, sk).squeeze(1).contiguous()
 
         # Indexer Q: [sq, b, index_heads, index_dim] -> [b*sq, index_heads, index_dim]
-        idx_q_unpad = _to_varlen_unpad(q, b, sq)
+        idx_q_unpad = _to_varlen_unpad(q, b, sq).contiguous()
 
         # Indexer K: [sk, b, index_dim] -> [b*sk, index_dim]
-        idx_k_unpad = _to_varlen_unpad(k, b, sk)
+        idx_k_unpad = _to_varlen_unpad(k, b, sk).contiguous()
 
         # Indexer weights: [sq, b, index_heads] -> [b*sq, index_heads]
         # Lemyx kernel expects float32 weights; Megatron passes bf16.
-        idx_w_unpad = _to_varlen_unpad(weights, b, sq).float()
+        idx_w_unpad = _to_varlen_unpad(weights, b, sq).float().contiguous()
 
         # V is needed by the fused kernel but we discard attention output.
         v_unpad = torch.zeros_like(k_unpad)
@@ -219,52 +185,27 @@ setattr(_LemyxFusedDSAIndexerLoss, _PATCH_MARKER, True)
 # Public API
 # ---------------------------------------------------------------------------
 
-def apply_lemyx_dsa_patch() -> bool:
+def apply_lemyx_dsa_patch():
     """Monkey-patch Megatron DSA to use the lemyx fused FA+KL kernel.
 
     Replaces ``FusedDSAIndexerLoss`` in the DSA module so that the fused
     TileLang kernel handles the combined attention + KL divergence
     computation in a single pass.
 
-    Gate: only activates when ``CPPMEGA_LEMYX_DSA=1``.
-
-    Returns:
-        True if the patch was applied, False if skipped.
+    Crashes on failure — no fallback.
     """
-    enabled = os.environ.get(LEMYX_DSA_ENV, "0")
-    if enabled not in ("1", "true", "yes"):
-        log.debug(
-            "lemyx DSA patch skipped (set %s=1 to enable)", LEMYX_DSA_ENV
-        )
-        return False
-
-    try:
-        import megatron.core.transformer.experimental_attention_variant.dsa as dsa_mod
-    except ImportError:
-        log.warning(
-            "Cannot import megatron DSA module; lemyx patch not applied."
-        )
-        return False
+    import megatron.core.transformer.experimental_attention_variant.dsa as dsa_mod
 
     existing = getattr(dsa_mod, "FusedDSAIndexerLoss", None)
-    if existing is None:
-        log.warning(
-            "megatron dsa.FusedDSAIndexerLoss not found; "
-            "lemyx patch not applied."
-        )
-        return False
+    assert existing is not None, "megatron dsa.FusedDSAIndexerLoss not found"
 
     if getattr(existing, _PATCH_MARKER, False):
-        log.info("lemyx DSA patch already applied; skipping.")
-        return True
+        return  # already applied
 
-    # Pre-validate import (fail fast, not at first forward pass).
     _ensure_lemyx_imported()
 
     dsa_mod.FusedDSAIndexerLoss = _LemyxFusedDSAIndexerLoss
-    log.info(
-        "cppmega lemyx DSA fused FA+KL patch applied. "
-        "FusedDSAIndexerLoss now uses TileLang fused kernel "
-        "(FWD ~5ms, BWD ~20ms at b=4 sq=4096 heads=28)."
+    print(
+        f"[cppmega] lemyx DSA fused FA+KL patch applied. "
+        f"FusedDSAIndexerLoss -> TileLang fused kernel."
     )
-    return True

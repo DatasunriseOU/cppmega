@@ -17,6 +17,20 @@ import tilelang
 import torch
 from tilelang import language as T
 
+
+def _unwrap_quantized(t: torch.Tensor) -> torch.Tensor:
+    """Unwrap TE Float8Tensor/QuantizedTensor to a plain torch.Tensor.
+
+    See tilelang_sparse_mla_fwd.py for full rationale.
+    """
+    try:
+        from transformer_engine.pytorch.tensor import QuantizedTensor
+    except ImportError:
+        return t
+    if isinstance(t, QuantizedTensor):
+        return t.dequantize()
+    return t
+
 _SPARSE_MLA_BWD_BLOCK_SIZE = 32
 _tilelang_sparse_mla_preprocess_kernel_cache = OrderedDict()
 _tilelang_sparse_mla_bwd_kernel_cache = OrderedDict()
@@ -398,6 +412,12 @@ def sparse_mla_bwd(
 
     Accepts 3D tensors [seq, heads, dim] or 4D [batch, seq, heads, dim].
     """
+    # Unwrap TE Float8Tensor before TileLang operations.
+    q = _unwrap_quantized(q)
+    kv = _unwrap_quantized(kv)
+    o = _unwrap_quantized(o)
+    do = _unwrap_quantized(do)
+
     seq_bucket = _env_int("MCORE_DSA_TILELANG_SEQ_BUCKET", 256)
     topk_bucket = _env_int("MCORE_DSA_TILELANG_TOPK_BUCKET", _SPARSE_MLA_BWD_BLOCK_SIZE)
 
