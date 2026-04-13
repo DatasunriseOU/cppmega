@@ -1,0 +1,78 @@
+diff --git a/mamba_ssm/modules/mamba3.py b/mamba_ssm/modules/mamba3.py
+index 5b47866..349f2cf 100644
+--- a/mamba_ssm/modules/mamba3.py
++++ b/mamba_ssm/modules/mamba3.py
+@@ -169,7 +169,7 @@ class Mamba3(nn.Module):
+         # Compute ADT, DT
+         _A = -F.softplus(dd_A.to(torch.float32)) # (B, L, N)
+         _A = torch.clamp(_A, max=-self.A_floor)            
+-        DT = F.softplus(dd_dt + self.dt_bias) # (B, L, N)
++        DT = F.softplus((dd_dt + self.dt_bias).to(torch.float32)) # (B, L, N) -- fp32 for TileLang kernel
+         ADT = _A * DT
+         DT = rearrange(DT, "b l n -> b n l")
+         ADT = rearrange(ADT, "b l n -> b n l")
+@@ -255,7 +255,7 @@ class Mamba3(nn.Module):
+     def _preprocess(self, A_proj, dd_dt, B, C, x, z, trap_proj, angle_proj):
+         _A = -F.softplus(A_proj.to(torch.float32))
+         _A = torch.clamp(_A, max=-self.A_floor)
+-        DT = F.softplus(dd_dt + self.dt_bias)
++        DT = F.softplus((dd_dt + self.dt_bias).to(torch.float32))  # fp32 for TileLang kernel
+         trap = torch.sigmoid(trap_proj)
+ 
+         rank = self.mimo_rank if self.is_mimo else 1
+diff --git a/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py b/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
+index 44402a7..513564e 100755
+--- a/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
++++ b/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
+@@ -1310,8 +1310,22 @@ def mamba_mimo_bwd_combined(
+         dmimo_v = dmimo_v.sum(dim=0)
+         dmimo_z = dmimo_z.sum(dim=0) if dmimo_z is not None else None
+         dD = dD.sum(dim=0) if dD is not None else None
++    elif H % G == 0:
++        # GQA-style: 1 < G < H, H divisible by G.  Sum over heads_per_group.
++        hpg = H // G
++        # bias grads: [B, S, R, H, N] -> sum(batch, seq) -> [R, H, N] -> permute -> [H, R, N]
++        # Must compute BEFORE reducing dq/dk, since Q_bias has shape [H, R, N]
++        dq_bias_tilelang = dq_tilelang.sum(dim=(0, 1)).permute((1, 0, 2))
++        dk_bias_tilelang = dk_tilelang.sum(dim=(0, 1)).permute((1, 0, 2))
++        # dq/dk: [B, S, R, H, N] -> [B, S, R, G, hpg, N] -> sum(dim=4) -> [B, S, R, G, N]
++        dq_tilelang = dq_tilelang.view(B, S, R, G, hpg, N).sum(dim=4)
++        dk_tilelang = dk_tilelang.view(B, S, R, G, hpg, N).sum(dim=4)
++        # mimo_v, mimo_z, D: sum over batch, already (B, H, R, P) or (B, H)
++        dmimo_v = dmimo_v.sum(dim=0)
++        dmimo_z = dmimo_z.sum(dim=0) if dmimo_z is not None else None
++        dD = dD.sum(dim=0) if dD is not None else None
+     else:
+-        raise ValueError(f"G value of {G} is not currently supported!")
++        raise ValueError(f"G value of {G} is not currently supported (H={H}, G must divide H)!")
+ 
+     ddt, dtrap = bwd_dtrap_ddt_triton(
+         trap, dt, dfactor, dgamma_diag, chunk_size
+diff --git a/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd_varlen.py b/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd_varlen.py
+index 8254481..bf3d6af 100644
+--- a/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd_varlen.py
++++ b/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd_varlen.py
+@@ -1374,8 +1374,22 @@ def mamba_mimo_bwd_combined_varlen(
+         dmimo_v = dmimo_v.sum(dim=(0, 2))
+         dmimo_z = dmimo_z.sum(dim=(0, 2)) if dmimo_z is not None else None
+         dD = dD.sum(dim=(0, 2)) if dD is not None else None
++    elif H % G == 0:
++        # GQA-style: 1 < G < H, H divisible by G.  Sum over heads_per_group.
++        hpg = H // G
++        # bias grads: [B, S, R, H, N] -> sum(batch, seq) -> [R, H, N] -> permute -> [H, R, N]
++        # Must compute BEFORE reducing dq/dk, since Q_bias has shape [H, R, N]
++        dq_bias_tilelang = dq_tilelang.sum(dim=(0, 1)).permute((1, 0, 2))
++        dk_bias_tilelang = dk_tilelang.sum(dim=(0, 1)).permute((1, 0, 2))
++        # dq/dk: [B, S, R, H, N] -> [B, S, R, G, hpg, N] -> sum(dim=4) -> [B, S, R, G, N]
++        dq_tilelang = dq_tilelang.view(B, S, R, G, hpg, N).sum(dim=4)
++        dk_tilelang = dk_tilelang.view(B, S, R, G, hpg, N).sum(dim=4)
++        # mimo_v, mimo_z, D: sum over batch+varlen dims
++        dmimo_v = dmimo_v.sum(dim=(0, 2))
++        dmimo_z = dmimo_z.sum(dim=(0, 2)) if dmimo_z is not None else None
++        dD = dD.sum(dim=(0, 2)) if dD is not None else None
+     else:
+-        raise ValueError(f"G value of {G} is not currently supported!")
++        raise ValueError(f"G value of {G} is not currently supported (H={H}, G must divide H)!")
+ 
+     ddt, dtrap = bwd_dtrap_ddt_triton_varlen(trap, dt, dfactor, dgamma_diag, chunk_size, cu_seqlens)
+ 
