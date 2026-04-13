@@ -173,18 +173,23 @@ def apply_all():
         ),
     ], "tilelang_sparse_mla_bwd.py D hardcode")
 
-    # === Patch 7: tilelang_sparse_mla_bwd.py — FP32 P/dP for dKV precision ===
-    print("Patch 7: tilelang_sparse_mla_bwd.py FP32 P/dP precision fix")
+    # === Patch 7: tilelang_sparse_mla_bwd.py — P/dP dtype check ===
+    # NOTE: P_shared_cast and dP_shared_cast MUST stay in `dtype` (BF16), not
+    # accum_dtype (FP32), because TileLang T.gemm requires both operands to have
+    # the same dtype. The GEMM accumulator is already FP32 via accum_dtype.
+    # The softmax precision is maintained via acc_p/acc_dp fragments (FP32).
+    # If a previous run of this patch changed them to accum_dtype, revert.
+    print("Patch 7: tilelang_sparse_mla_bwd.py P/dP dtype (revert fp32 if needed)")
     _patch_file(bwd_file, [
         (
-            "P_shared_cast = T.alloc_shared([block_H, BS], dtype)",
             "P_shared_cast = T.alloc_shared([block_H, BS], accum_dtype)  # fp32 for dKV precision",
+            "P_shared_cast = T.alloc_shared([block_H, BS], dtype)  # must match GEMM operand dtype",
         ),
         (
-            "dP_shared_cast = T.alloc_shared([block_H, BS], dtype)",
             "dP_shared_cast = T.alloc_shared([block_H, BS], accum_dtype)  # fp32 for dKV precision",
+            "dP_shared_cast = T.alloc_shared([block_H, BS], dtype)  # must match GEMM operand dtype",
         ),
-    ], "tilelang_sparse_mla_bwd.py P/dP fp32")
+    ], "tilelang_sparse_mla_bwd.py P/dP dtype revert")
 
     # === Patch 9: dsa.py — FP8 SparseMLA dispatch in _fused_sparse_mla_absorbed ===
     # Zero-copy FP8: pass TE Float8Tensor directly to SparseMLA_FP8 which
