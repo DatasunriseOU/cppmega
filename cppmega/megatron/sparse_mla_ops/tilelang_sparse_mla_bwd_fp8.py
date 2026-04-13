@@ -265,10 +265,14 @@ def bwd_fp8(
             dO_shared = T.alloc_shared([block_H, D], out_dtype)
             mask = T.alloc_fragment([BS], "bool")
 
-            # Dequantized KV tile (BF16) for dP = dO @ V^T GEMM.
+            # Dequantized KV tile (BF16) for dP = dO @ V^T GEMM and dQ += dS @ K.
             # V is the first D channels of KV. Per-token kv_scale varies
-            # across BS, so we dequantize to BF16 for this GEMM.
+            # across BS, so we dequantize to BF16 for these GEMMs.
             KV_deq_shared = T.alloc_shared([BS, D], out_dtype)
+            KV_tail_deq_shared = T.alloc_shared([BS, D_tail], out_dtype)
+            # Dequantized Q tiles (BF16) for dKV += Q^T @ dS GEMMs.
+            Q_deq_shared = T.alloc_shared([block_H, D], out_dtype)
+            Q_tail_deq_shared = T.alloc_shared([block_H, D_tail], out_dtype)
 
             P_shared_cast = T.alloc_shared([block_H, BS], out_dtype)
             dP_shared_cast = T.alloc_shared([block_H, BS], out_dtype)
@@ -284,10 +288,6 @@ def bwd_fp8(
             acc_dkv_shared = T.alloc_shared([BS // split_store, D], accum_dtype)
             acc_dkv_tail_shared = T.alloc_shared([BS // split_store, D_tail], accum_dtype)
 
-            # Scaled dP tiles for FP8 dequant in dQ/dKV GEMMs
-            dP_kv_scaled_shared = T.alloc_shared([block_H, BS], out_dtype)
-            dP_q_scaled_shared = T.alloc_shared([block_H, BS], out_dtype)
-
             # Scale fragments
             kv_scale_frag = T.alloc_fragment([BS], accum_dtype)
             q_scale_val = T.alloc_fragment([1], accum_dtype)
@@ -300,6 +300,16 @@ def bwd_fp8(
 
             # Load q_scale for this token (scalar, broadcast to all heads)
             q_scale_val[0] = QScale[by, s_i]
+
+            # Dequantize Q from FP8 to BF16 for dKV += Q^T @ dS GEMMs
+            for h_i, d_i in T.Parallel(block_H, D):
+                Q_deq_shared[h_i, d_i] = T.cast(
+                    T.cast(Q_shared[h_i, d_i], accum_dtype) * q_scale_val[0], out_dtype
+                )
+            for h_i, d_i in T.Parallel(block_H, D_tail):
+                Q_tail_deq_shared[h_i, d_i] = T.cast(
+                    T.cast(Q_tail_shared[h_i, d_i], accum_dtype) * q_scale_val[0], out_dtype
+                )
 
             T.clear(acc_dq)
             T.clear(acc_dq_tail)
@@ -356,11 +366,17 @@ def bwd_fp8(
 
                 T.copy(acc_p, P_shared_cast)
 
-                # Dequantize V from FP8 to BF16 for dP = dO @ V^T GEMM.
+                # Dequantize KV from FP8 to BF16 for dP = dO @ V^T and dQ += dS @ K GEMMs.
                 # V shares the first D channels of KV.
                 for bi_i, d_i in T.Parallel(BS, D):
                     KV_deq_shared[bi_i, d_i] = T.cast(
                         T.cast(KV_shared[bi_i, d_i], accum_dtype) * kv_scale_frag[bi_i],
+                        out_dtype,
+                    )
+                # Dequantize KV tail from FP8 to BF16 for dQ_tail += dS @ K_tail GEMM.
+                for bi_i, d_i in T.Parallel(BS, D_tail):
+                    KV_tail_deq_shared[bi_i, d_i] = T.cast(
+                        T.cast(KV_tail_shared[bi_i, d_i], accum_dtype) * kv_scale_frag[bi_i],
                         out_dtype,
                     )
 
@@ -384,60 +400,25 @@ def bwd_fp8(
 
                 T.copy(acc_dp, dP_shared_cast)
 
-                # dQ += dS @ K — K is FP8, dS is BF16.
-                # The GEMM produces dS @ K_fp8 in FP32. We need to
-                # dequantize by kv_scale per K-token. However kv_scale
-                # varies per BS row and the GEMM contracts over BS, so we
-                # cannot simply post-multiply. Instead we pre-scale dP
-                # rows by kv_scale before the GEMM, keeping dQ accumulation
-                # exact. We already have dP_shared_cast in BF16 — build a
-                # scaled copy for the K GEMMs.
-                #
-                # Actually, for dQ += dS @ K the contraction is over the
-                # BS dimension (topk). Each element dS[h, bi] is multiplied
-                # by K[bi, d]. The dequantized K[bi, d] = K_fp8[bi, d] * kv_scale[bi].
-                # So dQ[h, d] = sum_bi { dS[h, bi] * K_fp8[bi, d] * kv_scale[bi] }
-                #             = sum_bi { (dS[h, bi] * kv_scale[bi]) * K_fp8[bi, d] }
-                # We can pre-scale dS by kv_scale, then do dS_scaled @ K_fp8.
-                #
-                # Similarly for dKV += Q^T @ dS:
-                # dKV[bi, d] = sum_h { Q_fp8[h, d] * dS[h, bi] * q_scale }
-                #            = sum_h { (dS[h, bi] * q_scale) * Q_fp8[h, d] }
-                #            = q_scale * sum_h { dS[h, bi] * Q_fp8[h, d] }
-                # Since q_scale is a scalar for this token, we can post-multiply.
-
-                # Build dP_kv_scaled: dS[h, bi] * kv_scale[bi] for dQ GEMMs
-                # We re-use dP_shared_cast for the dKV path (unscaled dS).
-                # For dQ path, create scaled version in-place in a separate shared buf.
-                # Actually we need both unscaled (for dKV) and kv-scaled (for dQ).
-                # We'll use acc_dp (still in FP32) to build the scaled version.
-
-                # dQ += (dS * kv_scale) @ K_fp8  [FP8 GEMM for K part]
-                # Build scaled dP in shared memory
-                for h_i, bi_i in T.Parallel(block_H, BS):
-                    dP_kv_scaled_shared[h_i, bi_i] = T.cast(
-                        acc_dp[h_i, bi_i] * kv_scale_frag[bi_i], out_dtype
-                    )
-
-                T.gemm(dP_kv_scaled_shared, KV_shared, acc_dq, policy=T.GemmWarpPolicy.FullCol)
+                # dQ += dS @ K_dequant — all BF16 GEMMs.
+                # KV_deq_shared and KV_tail_deq_shared already contain
+                # K_fp8 * kv_scale (per-token dequantized), so
+                # dQ[h,d] = sum_bi { dS[h,bi] * K_deq[bi,d] }
+                #         = sum_bi { dS[h,bi] * K_fp8[bi,d] * kv_scale[bi] }
+                T.gemm(dP_shared_cast, KV_deq_shared, acc_dq, policy=T.GemmWarpPolicy.FullCol)
                 T.gemm(
-                    dP_kv_scaled_shared, KV_tail_shared, acc_dq_tail,
+                    dP_shared_cast, KV_tail_deq_shared, acc_dq_tail,
                     policy=T.GemmWarpPolicy.FullCol,
                 )
 
-                # dKV += Q^T @ dS — Q is FP8.
-                # dKV[bi, d] = q_scale * sum_h { dS[h, bi] * Q_fp8[h, d] }
-                # We do the GEMM with FP8 Q and BF16 dS, then post-multiply
-                # by q_scale. But mixed dtype GEMM (FP8 x BF16) is not
-                # supported. Instead pre-scale dS by q_scale (scalar).
-                for h_i, bi_i in T.Parallel(block_H, BS):
-                    dP_q_scaled_shared[h_i, bi_i] = T.cast(
-                        acc_dp[h_i, bi_i] * q_scale_val[0], out_dtype
-                    )
-
+                # dKV += Q_dequant^T @ dS — all BF16 GEMMs.
+                # Q_deq_shared contains Q_fp8 * q_scale (dequantized once
+                # before the loop), so
+                # dKV[bi,d] = sum_h { dS[h,bi] * Q_deq[h,d] }
+                #           = sum_h { dS[h,bi] * Q_fp8[h,d] * q_scale }
                 T.gemm(
-                    dP_q_scaled_shared,
-                    Q_shared,
+                    dP_shared_cast,
+                    Q_deq_shared,
                     acc_dkv,
                     transpose_A=True,
                     policy=T.GemmWarpPolicy.FullCol,
@@ -454,8 +435,8 @@ def bwd_fp8(
 
                 T.clear(acc_dkv_tail)
                 T.gemm(
-                    dP_q_scaled_shared,
-                    Q_tail_shared,
+                    dP_shared_cast,
+                    Q_tail_deq_shared,
                     acc_dkv_tail,
                     transpose_A=True,
                     policy=T.GemmWarpPolicy.FullCol,
