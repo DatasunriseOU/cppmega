@@ -1,5 +1,32 @@
 # NAM56R optimization plan — next 10 hours
 
+## Pivot 2026-04-14: DualPipeV is phantom, combined_1f1b is canon
+
+Exa deep research (agent ad869db932d3e8d66) confirmed:
+
+- **NVIDIA Megatron-LM gave up on DualPipeV** (issue #1524 closed by
+  @Victarry): *"DualPipe requires decomposition of xgrad and wgrad. But
+  mcore prefers TE which makes it hard to decompose backprop."*
+- **NVIDIA NeMo-Bridge DeepSeek-V3 recipe** (the authoritative DS-V3
+  reproduction): TP=2 PP=16 EP=64, uses **VPP + 1F1B-A2A-overlap =
+  our `combined_1f1b`**, NOT DualPipeV.
+- DeepSeek's own DualPipe repo has ZERO EP/MoE examples — toy MLPs only.
+- DeepSeek's training launcher was never open-sourced.
+
+**Direction change**:
+1. STOP DualPipeV integration work. It's a phantom — our earlier
+   `apply_dualpipev_patch.py` + `dualpipev_schedule.py` stay as
+   scaffolding, env gate default OFF. Do not pursue.
+2. FIX `combined_1f1b` memory instead. Our OOM-at-every-MBS finding
+   needs re-investigation: activation recompute granularity, memory
+   accounting, small-PP feasibility. DeepEP (via Megatron flex) is the
+   same as DeepSeek-V3 production stack.
+3. Update `reference_combined_1f1b_dead_for_nam56r.md` memory from
+   "dead" to "needs-memory-fix" after `combined_1f1b` debug.
+
+See `reference_dualpipev_phantom_combined1f1b_canon.md` memory for
+full evidence.
+
 ## Hard rules for this cycle (enforced)
 
 - **NEVER open PRs / issues / comments in external projects (state-spaces,
