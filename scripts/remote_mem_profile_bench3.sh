@@ -156,17 +156,14 @@ try:
 except Exception:
     pass
 
-# (5) DSA FP8 fwd+bwd indexer patch + loss_coeff==0 gate
+# (5) DSA indexer path (bf16-only after FP8 indexer removal) + loss_coeff==0 gate
 _dsa_dtype = os.environ.get("CPPMEGA_DSA_INDEXER_DTYPE", "bf16").lower()
 print(f"[mem_profile_shim] CPPMEGA_DSA_INDEXER_DTYPE resolves to '{_dsa_dtype}'")
 if _dsa_dtype == "fp8":
-    try:
-        from cppmega.megatron.dsa_fp8_patch import apply_dsa_fp8_patch
-        _applied = apply_dsa_fp8_patch()
-        print(f"[mem_profile_shim] DSA FP8 patch applied={_applied}")
-    except Exception as _exc:
-        print(f"[mem_profile_shim] DSA FP8 patch failed: {_exc}", file=sys.stderr)
-        raise
+    raise RuntimeError(
+        "CPPMEGA_DSA_INDEXER_DTYPE=fp8 is no longer supported: dsa_fp8_patch.py "
+        "and dsa_fp8_indexer.py were deleted on 2026-04-13. Use bf16."
+    )
 
 # (6) Per-step memory tracking via training log hook
 _STEP_COUNT = [0]
@@ -438,8 +435,12 @@ if [ "${NO_ROPE_FUSION}" = "1" ]; then
 fi
 
 python -c 'import cppmega, megatron; print("cppmega", cppmega.__version__)'
-python -c "from cppmega.megatron.dsa_fp8_patch import apply_dsa_fp8_patch; print('dsa_fp8_patch importable')"
-python -c "from cppmega.megatron.dsa_fp8_indexer import bwd_fused_indexer_loss_fp8, compute_index_scores_fp8; print('dsa_fp8_indexer fwd+bwd importable')"
+python - <<PY
+import os
+dtype = os.environ.get("CPPMEGA_DSA_INDEXER_DTYPE", "bf16").lower()
+assert dtype == "bf16", f"expected bf16 live DSA indexer path, got {dtype!r}"
+print("live DSA indexer path validated: bf16 only")
+PY
 
 # Validate DSA A-layer rank parsing
 python - <<PY

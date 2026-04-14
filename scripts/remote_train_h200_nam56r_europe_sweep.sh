@@ -4,7 +4,7 @@
 # 8 sequential configs (E1-E8), 50 iterations each, measure tok/sec at
 # iter 30-50. Stop early on OOM, move to next config.
 #
-# All configs: TP=1, DSA 9+4 (env vars), FP8 indexer, sparse attention
+# All configs: TP=1, DSA 9+4 (env vars), bf16 indexer, sparse attention
 # (tilelang→gather_scatter fallback), real data, --enable-dsa,
 # --dsa-indexer-topk 256, --dsa-indexer-loss-coeff 0.001.
 #
@@ -158,17 +158,14 @@ try:
 except Exception:
     pass
 
-# (5) DSA FP8 indexer + sparse attention patches
+# (5) DSA indexer path (bf16-only after FP8 indexer removal)
 _dsa_dtype = os.environ.get("CPPMEGA_DSA_INDEXER_DTYPE", "bf16")
 print(f"[cppmega_mimo_shim] CPPMEGA_DSA_INDEXER_DTYPE resolves to '{_dsa_dtype}'")
 if _dsa_dtype == "fp8":
-    try:
-        from cppmega.megatron.dsa_fp8_patch import apply_dsa_fp8_patch
-        _applied = apply_dsa_fp8_patch(force=True)
-        print(f"[cppmega_mimo_shim] DSA FP8 patch applied={_applied}")
-    except Exception as _exc:
-        print(f"[cppmega_mimo_shim] DSA FP8 patch FAILED: {_exc}", file=sys.stderr)
-        raise
+    raise RuntimeError(
+        "CPPMEGA_DSA_INDEXER_DTYPE=fp8 is no longer supported: dsa_fp8_patch.py "
+        "and dsa_fp8_indexer.py were deleted on 2026-04-13. Use bf16."
+    )
 PY
 
 cp "${REMOTE_ROOT}/megatron-lm/pretrain_mamba.py" "${WORKDIR}/pretrain_mamba_original.py"
@@ -266,7 +263,7 @@ bundle = build_megatron_args_bundle(
     use_dsa=True,
     dsa_indexer_topk=256,
     dsa_indexer_loss_coeff=0.001,
-    dsa_indexer_dtype="fp8",
+    dsa_indexer_dtype="bf16",
 )
 print(bundle.to_shell_fragment())
 PYEOF
