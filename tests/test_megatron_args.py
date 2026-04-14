@@ -28,14 +28,10 @@ def test_megatron_args_bundle_emits_native_mla_mtp_fim_moe_dsa_flags():
     assert "--dsa-indexer-dtype" not in bundle.args
 
 
-def test_megatron_args_bundle_emits_dsa_fp8_indexer_note():
+def test_megatron_args_bundle_rejects_removed_dsa_fp8_indexer_path():
     plan = build_nam56r_feature_plan(pattern="AEMEAEMEAEMR", depth=52, mtp_depths=1)
-    bundle = build_megatron_args_bundle(plan=plan, use_dsa=True, dsa_indexer_dtype="fp8")
-
-    # FP8 path is env-var gated, not flag-gated — see comment above.
-    assert "--dsa-indexer-dtype" not in bundle.args
-    assert any("dsa_indexer_fused_patch" in note for note in bundle.custom_notes)
-    assert any("CPPMEGA_DSA_INDEXER_DTYPE=fp8" in note for note in bundle.custom_notes)
+    with pytest.raises(ValueError, match="only 'bf16' is supported"):
+        build_megatron_args_bundle(plan=plan, use_dsa=True, dsa_indexer_dtype="fp8")
 
 
 def test_megatron_args_bundle_rejects_unknown_dsa_indexer_dtype():

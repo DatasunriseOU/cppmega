@@ -1,6 +1,6 @@
 """Replace Megatron MTP's output_layer + CE with Liger fused_linear_cross_entropy.
 
-Env: CPPMEGA_MTP_LIGER_CE=1 enables this optimization.
+Always-on patch: installs unconditionally when imported.
 
 When enabled, monkey-patches ``process_mtp_loss`` so that each MTP depth
 replaces the two-step:
