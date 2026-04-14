@@ -157,6 +157,12 @@ class HybridModelChunkSchedulePlan(AbstractSchedulePlan):
         s.context = None
         s.context_mask = None
         s.attention_bias = None
+        # Upstream GPT TransformerLayerSchedulePlan reads these off the state
+        # for MoE-only layers.  NAM56R MoE layers have IdentityOp attention so
+        # none of these are consumed, but attribute access still happens.
+        s.rotary_pos_cos = None
+        s.rotary_pos_sin = None
+        s.sequence_len_offset = None
 
         self.pre_process = _HybridPreProcessNode(model, s, self._event, get_comp_stream)
         self._build_layer_schedule_plans(model.decoder, get_comp_stream, get_comm_stream)
@@ -480,19 +486,23 @@ def apply_hybrid_schedule_plan_patch():
     def _relaxed_post_init(self):
         _saved_mtp = getattr(self, "mtp_num_layers", None)
         _saved_overlap = getattr(self, "overlap_moe_expert_parallel_comm", False)
-        _needs_bypass = _saved_overlap and _saved_mtp is not None and _saved_mtp > 1
+        _saved_pp = getattr(self, "pipeline_model_parallel_size", 1)
+        # Need bypass when MTP>1 (upstream assert limits MTP==1 with overlap)
+        # OR when PP==1 with MTP==1 (upstream hard-asserts PP>1).  For PP==1
+        # path we temporarily flip MTP to None so the MTP sub-block is
+        # skipped entirely; this is safe because our hybrid post-process
+        # node handles MTP outside the upstream schedule.
+        _needs_bypass = _saved_overlap and _saved_mtp is not None and _saved_mtp >= 1
+        _use_none = _saved_overlap and _saved_pp == 1 and _saved_mtp is not None and _saved_mtp >= 1
         if _needs_bypass:
-            # Set to 1 (NOT None) so the overlap+MTP assertion passes.
-            # Using 1 instead of None is critical: other __post_init__ code
-            # checks ``mtp_num_layers is not None`` for layout validation
-            # and MTP block construction.  Setting to None changes those
-            # code paths and can trigger GPTModel instantiation with the
-            # wrong __init__ signature.
-            #
-            # The ``if mtp_num_layers == 1`` sub-block also asserts
-            # ``pipeline_model_parallel_size > 1`` which is satisfied by
-            # our production config (PP>=2).
-            self.mtp_num_layers = 1
+            if _use_none:
+                # PP==1: set to None to bypass the PP>1 assertion entirely.
+                # Our _HybridPostProcessNode still runs MTP via process_mtp_loss
+                # independent of this config field.
+                self.mtp_num_layers = None
+            else:
+                # PP>1: set to 1 so the overlap+MTP assertion passes.
+                self.mtp_num_layers = 1
         try:
             _orig_post_init(self)
         finally:
@@ -501,6 +511,32 @@ def apply_hybrid_schedule_plan_patch():
 
     TransformerConfig.__post_init__ = _relaxed_post_init
     print("[hybrid_schedule_plan] MTP num_layers assertion bypassed", file=sys.stderr)
+
+    # (0b) Patch IdentityOp with no-op backward_dw so MoE-only layers (where
+    #      self_attention = IdentityOp) work with TransformerLayerSchedulePlan.
+    #      In NAM56R, E-pattern layers are pure MoE with no attention module;
+    #      upstream _BackwardDWWrapper unconditionally reads
+    #      layer.self_attention.backward_dw.
+    from megatron.core.transformer.identity_op import IdentityOp
+
+    if not hasattr(IdentityOp, "backward_dw"):
+        def _identity_backward_dw(self):
+            pass
+        IdentityOp.backward_dw = _identity_backward_dw
+        print("[hybrid_schedule_plan] IdentityOp.backward_dw no-op added", file=sys.stderr)
+
+    # (0c) Stub MambaStack.final_layernorm to return None so upstream
+    #      submodule_combine_forward skips the final norm (the
+    #      ``if final_layernorm and node.is_last_layer`` guard becomes False).
+    #      Our _HybridPostProcessNode applies final_norm explicitly after the
+    #      decoder, so skipping it inside combine avoids double application.
+    from megatron.core.ssm.mamba_block import MambaStack
+
+    if not isinstance(getattr(MambaStack, "final_layernorm", None), property):
+        def _mamba_final_layernorm(self):
+            return None
+        MambaStack.final_layernorm = property(_mamba_final_layernorm)
+        print("[hybrid_schedule_plan] MambaStack.final_layernorm -> None stub added", file=sys.stderr)
 
     from megatron.core.models.mamba.mamba_model import MambaModel
 
