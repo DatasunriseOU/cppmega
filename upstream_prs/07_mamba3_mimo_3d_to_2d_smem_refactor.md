@@ -79,21 +79,21 @@ Verified on NVIDIA GB10 (sm_121a) via
 `pytest test_mamba_mimo_bwd_combined_relative_errors_lt_10pct[N16_P64_R4_C8_BB128]`:
 
 | Gradient | stable_max_rel |
-|---|---|
-| dq | 0.0045 |
-| dk | 0.0041 |
-| dv | 0.0038 |
-| dA | 0.0086 |
-| ddt | 0.0115 |
-| dtrap | 0.0092 |
-| dq_bias | 0.0104 |
-| dk_bias | 0.0097 |
-| dmimo_v | 0.0063 |
-| dmimo_z | 0.0071 |
-| dmimo_o | 0.0058 |
-| dangles | 0.0089 |
-| dD | 0.0042 |
-| dz | 0.0076 |
+| -------- | -------------- |
+| dq       | 0.0045         |
+| dk       | 0.0041         |
+| dv       | 0.0038         |
+| dA       | 0.0086         |
+| ddt      | 0.0115         |
+| dtrap    | 0.0092         |
+| dq_bias  | 0.0104         |
+| dk_bias  | 0.0097         |
+| dmimo_v  | 0.0063         |
+| dmimo_z  | 0.0071         |
+| dmimo_o  | 0.0058         |
+| dangles  | 0.0089         |
+| dD       | 0.0042         |
+| dz       | 0.0076         |
 
 All 14 gradients well under the repo's 0.10 test tolerance, bit-for-bit
 with the pre-patch TMA=off baseline within bf16 rounding.
