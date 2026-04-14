@@ -120,9 +120,9 @@ def build_megatron_args_bundle(
         args.extend(_bool_flag(moe_grouped_gemm, "--moe-grouped-gemm"))
 
     if use_dsa:
-        if dsa_indexer_dtype not in ("bf16", "fp8"):
+        if dsa_indexer_dtype != "bf16":
             raise ValueError(
-                f"unsupported dsa_indexer_dtype: {dsa_indexer_dtype!r} (expected 'bf16' or 'fp8')"
+                f"unsupported dsa_indexer_dtype: {dsa_indexer_dtype!r} (only 'bf16' is supported; FP8 indexer path was removed)"
             )
         args.extend(
             [
@@ -136,18 +136,11 @@ def build_megatron_args_bundle(
                 str(dsa_indexer_topk),
                 "--dsa-indexer-loss-coeff",
                 str(dsa_indexer_loss_coeff),
-                # NOTE: --dsa-indexer-dtype is NOT emitted here because
-                # Megatron's argparser does not register it.  The actual
-                # FP8 path is activated via CPPMEGA_DSA_INDEXER_DTYPE env
-                # var, read by cppmega_mimo_shim at startup.
+                # NOTE: --dsa-indexer-dtype is not emitted here because
+                # Megatron's argparser does not register it and the only
+                # supported live path is the bf16 DSA indexer.
             ]
         )
-        if dsa_indexer_dtype == "fp8":
-            notes.append(
-                "DSA indexer FP8 path requires "
-                "cppmega.megatron.dsa_indexer_fused_patch.apply_dsa_indexer_fused_patch() "
-                "at launch time and CPPMEGA_DSA_INDEXER_DTYPE=fp8 env var"
-            )
 
     if plan.engram is not None:
         notes.append("Engram remains custom; no Megatron-native emitter yet")

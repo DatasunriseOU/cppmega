@@ -24,8 +24,8 @@ Multi-agent investigation triggered by user pushback on prior claims. Launched 1
 **Worst case**: if `grad_output[0] == 0` (e.g., first token is `ignore_index`), ALL gradients become zero (issue #968 reproducer).
 
 **Implications for our prior measurements**:
-- `cppmega/megatron/mtp_liger_ce.py:169` calls Liger with `reduction="none"` for MTP loss. Gradients hitting `_MTPLossAutoScaler.apply(...)` may be per-token or scalar depending on autoscaler semantics — likely per-token → silent corruption.
-- All bench3 baselines using `CPPMEGA_MTP_LIGER_CE=1` (including 268 / 269.4 TFLOP/s records) had **MTP gradients silently corrupted**. Loss converged but training was effectively running with wrong MTP signal.
+- Historical `cppmega/megatron/mtp_liger_ce.py` called Liger with `reduction="none"` for MTP loss. That path was silently corrupt until the local workaround was changed to `reduction="mean"` + broadcast.
+- Any earlier bench3 baselines collected before that workaround landed need to be treated as tainted on the MTP gradient path. Current canonical bench3 record is the post-workaround `268 TFLOP/s` lane, and old `269.4` wording should stay superseded.
 - `nanochat/kernels.py:458-520` (`fused_linear_cross_entropy_liger`) has the same pattern — should be flagged.
 
 **Status of upstream fixes** (independently verified by grounding agents):

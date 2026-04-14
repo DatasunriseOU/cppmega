@@ -111,9 +111,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-dsa", action="store_true")
     parser.add_argument(
         "--dsa-indexer-dtype",
-        choices=("bf16", "fp8"),
+        choices=("bf16",),
         default="bf16",
-        help="DSA indexer q@k^T compute dtype (requires cppmega dsa_fp8_patch for 'fp8')",
+        help="DSA indexer q@k^T compute dtype (bf16 only; FP8 indexer path was removed)",
     )
     return parser
 

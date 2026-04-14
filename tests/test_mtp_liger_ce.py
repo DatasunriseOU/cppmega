@@ -1,18 +1,16 @@
 """Tests for cppmega.megatron.mtp_liger_ce — Liger fused linear cross-entropy for MTP.
 
 These tests verify:
-  1. The patch installs and replaces process_mtp_loss correctly (structure
-     only — no gradient checking in this section).
-  2. The structural env-gate on ``CPPMEGA_MTP_LIGER_CE``.
-  3. **Liger reduction='none' backward is CORRUPT** — the exact bug that
-     ``cppmega.megatron.apply_linear_ce_patch._install_liger_compute``
-     works around by calling Liger with ``reduction='mean'`` and broadcasting
-     the scalar to ``[b, s]``.  This is a regression guard: if a future
-     Liger release fixes the FLCE bwd (upstream issue #968 / draft PR #1126),
-     the ``test_liger_reduction_none_backward_is_corrupt`` assertion flips
-     and we can delete the workaround.
-  4. The workaround pattern (``reduction='mean'`` + broadcast) produces
-     gradients matching the reference eager implementation.
+  1. The patch entrypoint imports cleanly and is callable.
+  2. **Liger reduction='none' backward is CORRUPT** — the exact bug that
+      ``cppmega.megatron.apply_linear_ce_patch._install_liger_compute``
+      works around by calling Liger with ``reduction='mean'`` and broadcasting
+      the scalar to ``[b, s]``.  This is a regression guard: if a future
+      Liger release fixes the FLCE bwd (upstream issue #968 / draft PR #1126),
+      the ``test_liger_reduction_none_backward_is_corrupt`` assertion flips
+      and we can delete the workaround.
+  3. The workaround pattern (``reduction='mean'`` + broadcast) produces
+      gradients matching the reference eager implementation.
 
 Run (CPU-only, no GPU required for import/structure tests):
     pytest tests/test_mtp_liger_ce.py -v
@@ -71,20 +69,6 @@ class TestMTPLigerCEStructure:
     def test_import(self):
         from cppmega.megatron.mtp_liger_ce import patch_mtp_loss_with_liger
         assert callable(patch_mtp_loss_with_liger)
-
-    def test_noop_without_env(self):
-        """patch_mtp_loss_with_liger is a no-op when env var is absent."""
-        os.environ.pop("CPPMEGA_MTP_LIGER_CE", None)
-        from cppmega.megatron.mtp_liger_ce import patch_mtp_loss_with_liger
-        # Should return without error
-        patch_mtp_loss_with_liger()
-
-    def test_env_gate(self, monkeypatch):
-        """Only patches when CPPMEGA_MTP_LIGER_CE=1."""
-        monkeypatch.setenv("CPPMEGA_MTP_LIGER_CE", "0")
-        from cppmega.megatron.mtp_liger_ce import patch_mtp_loss_with_liger
-        patch_mtp_loss_with_liger()  # should be no-op
-
 
 @pytest.mark.skipif(
     not _LIGER_IMPORTS,

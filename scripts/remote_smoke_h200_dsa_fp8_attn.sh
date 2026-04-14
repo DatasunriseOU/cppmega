@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# FP8 sparse attention test: NAM56R DSA 9+4 with FP8 forward kernel.
+# FP8 sparse attention test: NAM56R DSA 9+4 with FP8 attention on top of the surviving bf16 indexer path.
 #
 # Tests the FP8 TileLang sparse MLA forward kernel integration:
 #   - CPPMEGA_DSA_FP8_ATTENTION=1 enables FP8 forward + BF16 backward
@@ -53,8 +53,8 @@ export CPPMEGA_NGRAM_HASH_EMBED_DIM="${CPPMEGA_NGRAM_HASH_EMBED_DIM:-16}"
 export CPPMEGA_STRUCTURE_ENABLED="${CPPMEGA_STRUCTURE_ENABLED:-1}"
 export CPPMEGA_STRUCTURE_COMPONENTS="${CPPMEGA_STRUCTURE_COMPONENTS:-core}"
 export CPPMEGA_DSA_A_LAYER_RANKS="${CPPMEGA_DSA_A_LAYER_RANKS:-1,2,3,5,6,7,9,10,11}"
-# Stream E+G FP8 DSA indexer (fwd + bwd patched)
-export CPPMEGA_DSA_INDEXER_DTYPE="${CPPMEGA_DSA_INDEXER_DTYPE:-fp8}"
+# Live DSA indexer path is bf16-only; FP8 indexer path was removed 2026-04-13.
+export CPPMEGA_DSA_INDEXER_DTYPE="${CPPMEGA_DSA_INDEXER_DTYPE:-bf16}"
 # Use gather_scatter for DSA sparse attention baseline
 export CPPMEGA_DSA_SPARSE_MODE="${CPPMEGA_DSA_SPARSE_MODE:-gather_scatter}"
 
@@ -182,19 +182,16 @@ try:
 except Exception:
     pass
 
-# (5) Stream E+G: DSA FP8 fwd+bwd indexer patch + loss_coeff==0 gate + FP8 attention
+# (5) DSA indexer path (bf16-only after FP8 indexer removal) + loss_coeff==0 gate + FP8 attention
 _dsa_dtype = os.environ.get("CPPMEGA_DSA_INDEXER_DTYPE", "bf16").lower()
 _fp8_attn = os.environ.get("CPPMEGA_DSA_FP8_ATTENTION", "0")
 print(f"[cppmega_mimo_shim] CPPMEGA_DSA_INDEXER_DTYPE={_dsa_dtype}")
 print(f"[cppmega_mimo_shim] CPPMEGA_DSA_FP8_ATTENTION={_fp8_attn}")
 if _dsa_dtype == "fp8":
-    try:
-        from cppmega.megatron.dsa_fp8_patch import apply_dsa_fp8_patch
-        _applied = apply_dsa_fp8_patch()
-        print(f"[cppmega_mimo_shim] DSA FP8 patch applied={_applied}")
-    except Exception as _exc:
-        print(f"[cppmega_mimo_shim] DSA FP8 patch failed: {_exc}", file=sys.stderr)
-        raise
+    raise RuntimeError(
+        "CPPMEGA_DSA_INDEXER_DTYPE=fp8 is no longer supported: dsa_fp8_patch.py "
+        "and dsa_fp8_indexer.py were deleted on 2026-04-13. Use bf16."
+    )
 
 # (6) Mamba/M2RNN activation checkpointing
 _mamba_recompute = os.environ.get("CPPMEGA_MAMBA_RECOMPUTE", "0") == "1"
@@ -320,7 +317,13 @@ if [ "${NO_ROPE_FUSION}" = "1" ]; then
 fi
 
 python -c 'import cppmega, megatron; print("cppmega", cppmega.__version__)'
-python -c "from cppmega.megatron.dsa_fp8_patch import apply_dsa_fp8_patch, resolve_fp8_attention; print('dsa_fp8_patch importable, fp8_attn=', resolve_fp8_attention())"
+python - <<PY
+import os
+dtype = os.environ.get("CPPMEGA_DSA_INDEXER_DTYPE", "bf16").lower()
+assert dtype == "bf16", f"expected bf16 live DSA indexer path, got {dtype!r}"
+print("live DSA indexer path validated: bf16 only")
+print(f"fp8 attention env={os.environ.get('CPPMEGA_DSA_FP8_ATTENTION', '0')}")
+PY
 python -c "from cppmega.megatron.sparse_mla_ops.sparse_mla import SparseMLA_FP8, fused_sparse_mla_absorbed_fp8; print('SparseMLA_FP8 importable')"
 
 echo "=== FP8 Attention Test: ${VARIANT} ==="

@@ -1,6 +1,6 @@
 """Swap MambaModel.output_layer to LinearCrossEntropyModule to fuse GEMM + CE.
 
-Env gate: ``CPPMEGA_MAIN_HEAD_LINEAR_CE=1``
+Always-on patch: installs unconditionally when imported.
 
 Upstream Megatron GPT model uses ``LinearCrossEntropyModule`` (subclass of
 ``ColumnParallelLinear``) which — when ``config.cross_entropy_loss_fusion=True``
@@ -543,4 +543,3 @@ def patch_mamba_output_layer_with_linear_ce() -> None:
         )
 
     MambaModel.__init__ = _patched_init
-
