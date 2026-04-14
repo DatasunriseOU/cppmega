@@ -54,14 +54,14 @@ $ python reproducer.py
 
 ## Upstream state (verified 2026-04-14)
 
-| PR     | Status     | What it does                                                    |
-|--------|------------|-----------------------------------------------------------------|
-| #3345  | **Open**   | Adds Hopper (`cc[0] == 9`) entry point + CuTe-DSL WGMMA kernels |
-| #2206  | Merged     | Initial Blackwell (`cc[0] == 10`) implementation                |
-| #3226  | Open       | DSAttention + CP/THD + TileLang fused (unrelated but nearby)    |
-| #3207  | Merged     | Restores output_layer when linear CE fusion is disabled         |
-| #3674  | Merged     | Reapplies MTP for hybrid models                                 |
-| #3919  | Open       | Skip recompute during CUDA graph warmup/capture                 |
+| PR   | Status   | What it does                                                    |
+| ---- | -------- | --------------------------------------------------------------- |
+| 3345 | **Open** | Adds Hopper (`cc[0] == 9`) entry point + CuTe-DSL WGMMA kernels |
+| 2206 | Merged   | Initial Blackwell (`cc[0] == 10`) implementation                |
+| 3226 | Open     | DSAttention + CP/THD + TileLang fused (unrelated but nearby)    |
+| 3207 | Merged   | Restores output_layer when linear CE fusion is disabled         |
+| 3674 | Merged   | Reapplies MTP for hybrid models                                 |
+| 3919 | Open     | Skip recompute during CUDA graph warmup/capture                 |
 
 PR #3345 (`feat/hopper-kernels` by `JungHoyoun`, base: `dev`, 9 files, mergeable=true) adds:
 
@@ -99,13 +99,13 @@ Local validation: cherry-picked into our `dev`-pinned tree, NAM56R (Mamba3 + DSA
 
 ## Which of our local patches are still needed vs landed upstream?
 
-| Local patch                                               | Status                                                      |
-|-----------------------------------------------------------|-------------------------------------------------------------|
-| `apply_linear_ce_patch.py` (Liger/CCE reroute on cc!=10)  | **Still needed** until #3345 lands + is released in 0.17    |
-| `apply_linear_ce_patch.py` (CCE probe on GB10 cc=12)      | **Still needed** — #3345 only adds cc=9, not cc=12          |
-| `MambaModel.output_layer` → `LinearCrossEntropyModule`    | **Still needed** — upstream Mamba model uses plain CPL      |
-| PR #3207 (restore output_layer when fusion disabled)      | Landed (0.16) — can drop from our rebase checklist          |
-| PR #3674 (MTP hybrid reapply)                             | Landed (0.16) — can drop                                    |
+| Local patch                                              | Status                                                   |
+| -------------------------------------------------------- | -------------------------------------------------------- |
+| `apply_linear_ce_patch.py` (Liger/CCE reroute on cc!=10) | **Still needed** until #3345 lands + is released in 0.17 |
+| `apply_linear_ce_patch.py` (CCE probe on GB10 cc=12)     | **Still needed** — #3345 only adds cc=9, not cc=12       |
+| `MambaModel.output_layer` → `LinearCrossEntropyModule`   | **Still needed** — upstream Mamba model uses plain CPL   |
+| PR #3207 (restore output_layer when fusion disabled)     | Landed (0.16) — can drop from our rebase checklist       |
+| PR #3674 (MTP hybrid reapply)                            | Landed (0.16) — can drop                                 |
 
 ## Proposed fix (two-tier)
 

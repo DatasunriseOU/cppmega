@@ -76,12 +76,12 @@ Shape mirrors one NAM56R microbatch: `B=2 S=512 H=1024 V=32000` bf16, ~10% of
 tokens set to `ignore_index`. Compares three paths against eager
 `F.linear + F.cross_entropy`:
 
-| path | expected | observed (liger-kernel 0.7.0 on H200 sm_90a, bench3) |
-|---|---|---|
-| `reduction="mean"` | `max\|Δ\| < 5e-3` (bf16 noise) | **OK** (`4.8e-7 / 3.8e-6`) |
-| `reduction="none"` + `.sum().backward()` | match `reduction="sum"` ref | **OK** (`4.9e-4 / 2.0e-3`) — *coincidental*: grad_output=[1,1,…] |
-| `reduction="none"` + `(loss*mask).sum()` | match masked eager ref | **FAIL** (`4.7e-2 / 2.5e-1`) — the real bug |
-| workaround: `reduction="mean"` × `n_valid` | match `reduction="sum"` ref | **OK** (`4.9e-4 / 3.9e-3`) |
+| path                                       | expected                       | observed (liger-kernel 0.7.0 on H200 sm_90a, bench3)             |
+| ------------------------------------------ | ------------------------------ | ---------------------------------------------------------------- |
+| `reduction="mean"`                         | `max\|Δ\| < 5e-3` (bf16 noise) | **OK** (`4.8e-7 / 3.8e-6`)                                       |
+| `reduction="none"` + `.sum().backward()`   | match `reduction="sum"` ref    | **OK** (`4.9e-4 / 2.0e-3`) — *coincidental*: grad_output=[1,1,…] |
+| `reduction="none"` + `(loss*mask).sum()`   | match masked eager ref         | **FAIL** (`4.7e-2 / 2.5e-1`) — the real bug                      |
+| workaround: `reduction="mean"` × `n_valid` | match `reduction="sum"` ref    | **OK** (`4.9e-4 / 3.9e-3`)                                       |
 
 Run:
 ```bash
