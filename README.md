@@ -126,31 +126,31 @@ The script auto-applies (regardless of topology):
 
 ## Optimization Stack
 
-### Always On (no env gates)
+### Always On (no env gates) — patches install unconditionally; raise on failure
 
-| Component              | File                      | Effect                                          |
-| ---------------------- | ------------------------- | ----------------------------------------------- |
-| Regional torch.compile | `mamba3_compile_patch.py` | Fuses Mamba3 elementwise ops (5.93x data-dep-A) |
-| expandable_segments    | script env var            | Prevents CUDA allocator fragmentation OOM       |
-| Unfused DSA banned     | `apply_dsa_cg_patches.py` | Crash if fused SparseMLA unavailable            |
+| Component              | File                                | Effect                                                                 |
+| ---------------------- | ----------------------------------- | ---------------------------------------------------------------------- |
+| Regional torch.compile | `mamba3_compile_patch.py`           | Fuses Mamba3 elementwise ops (5.93x data-dep-A)                        |
+| expandable_segments    | script env var                      | Prevents CUDA allocator fragmentation OOM                              |
+| Unfused DSA banned     | `apply_dsa_cg_patches.py`           | Crash if fused SparseMLA unavailable                                   |
+| Mamba LinearCE swap    | `apply_linear_ce_patch.py`          | MambaModel.output_layer → LinearCrossEntropyModule (PR #3226→#3207 fix)|
+| MTP Liger CE           | `mtp_liger_ce.py`                   | Chunked fused CE, saves 21 GiB MTP logits, reduction="mean" + broadcast |
+| DSA indexer fused      | `dsa_indexer_fused_patch.py`        | Per-head bmm, saves ~40 GiB at MBS=10 NAM56R                           |
 
-### Env-Gated
+### Env-Gated (selectors + opt-in features)
 
 | Component         | Gate                          | File                         | Effect                                               |
 | ----------------- | ----------------------------- | ---------------------------- | ---------------------------------------------------- |
 | IndexCache        | `CPPMEGA_INDEX_CACHE=1`       | `index_cache_patch.py`       | 3 Full + 6 Shared DSA layers = 67% indexer savings   |
 | lemyx DSA         | `CPPMEGA_LEMYX_DSA=1`         | `lemyx_dsa_warmup.py`        | Fused FA+KL TileLang kernel for indexer warmup       |
-| Liger CE          | `CPPMEGA_LIGER_CE=1`          | `mtp_liger_ce.py`            | Chunked fused cross-entropy, saves 21 GiB MTP logits |
+| Linear CE kernel  | `CPPMEGA_LINEAR_CE_KERNEL=auto\|liger\|cce` | `apply_linear_ce_patch.py` | Selector for non-Blackwell fallback kernel; default `auto` |
 | Selective FP8 MoE | `CPPMEGA_SELECTIVE_FP8_MOE=1` | `selective_fp8_moe_patch.py` | FP8 only on MoE expert GEMMs                         |
 | Mamba recompute   | `CPPMEGA_MAMBA_RECOMPUTE=1`   | `mamba_recompute_patch.py`   | Activation checkpointing for Mamba layers            |
 | FP8 param-gather  | `CPPMEGA_FP8_PARAM_GATHER=1`  | Megatron `--fp8-param-gather`| -5 GiB (FP8 all-gather bucket, master stays FP32)    |
-| DualPipeV         | `CPPMEGA_DUALPIPEV=1`         | `apply_dualpipev_patch.py`   | V-shape PP; forces Megatron PP=1, carves own 2-rank group (experimental) |
+| DualPipeV         | `CPPMEGA_DUALPIPEV=1`         | `apply_dualpipev_patch.py`   | V-shape PP; forces Megatron PP=1 (experimental)      |
+| MTP native Hopper | `CPPMEGA_MTP_NATIVE_HOPPER_CE=1` | `mtp_native_hopper_ce.py` | **DO NOT ENABLE** — produces grad_norm=NaN, Suspects #1+#2 refuted, #3-5 pending |
 | Mamba3 MIMO P1    | `CPPMEGA_MAMBA3_P1=1`         | `apply_mamba3_mimo_p1_patches.py` | TMA + warp-spec on Mamba3 MIMO fwd only (bwd blocked by TileLang TMA layout bug) |
-| Main-head linear CE | `CPPMEGA_MAIN_HEAD_LINEAR_CE=1` | `apply_linear_ce_patch.py` | MambaModel.output_layer class-swap → `LinearCrossEntropyModule` (fixes upstream Megatron regression from PR #3207) |
-| Linear CE kernel  | `CPPMEGA_LINEAR_CE_KERNEL=auto\|liger\|cce` | `apply_linear_ce_patch.py` | Selects fallback kernel for non-Blackwell. Liger uses reduction="mean" broadcast workaround (sidesteps Liger #968 silent corruption) |
-| Prefer native Hopper | `CPPMEGA_PREFER_NATIVE_HOPPER_CE=1` | `apply_linear_ce_patch.py` | When the open Megatron PR #3345 is locally cherry-picked, skip Liger/CCE reroute and use the native Hopper CuTe DSL kernel directly |
-| MTP native Hopper | `CPPMEGA_MTP_NATIVE_HOPPER_CE=1` | `mtp_native_hopper_ce.py` | Route MTP depths through `LinearCrossEntropyModule`. **Infrastructure committed, default OFF. Activating produces grad_norm=NaN (Suspect #1 transpose round-trip refuted empirically, Suspect #2 CG collective pending). Do NOT enable until NaN root-caused.** |
-| DSA indexer fused | `CPPMEGA_DSA_INDEXER_FUSED=1`  | `dsa_indexer_fused_patch.py` | Per-head bmm accumulation → eliminates `[sq,b,h,sk]` fp32 intermediate (16 GiB → 268 MiB at prod shape) |
+| Prefer native Hopper | `CPPMEGA_PREFER_NATIVE_HOPPER_CE=1` | `apply_linear_ce_patch.py` | When local Megatron PR #3345 is cherry-picked, skip Liger/CCE reroute and use native Hopper CuTe DSL kernel |
 
 ### Pipeline Schedules
 
