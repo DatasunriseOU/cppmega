@@ -1,4 +1,19 @@
 #!/usr/bin/env bash
+# ============================================================================
+# LEGACY / DEPRECATED (2026-04-14)
+# ----------------------------------------------------------------------------
+# Targets the original bring-up host `h200_legacy` (LOCATION_3).
+# Current active H200 anchors (2026-04) are bench3 (LOCATION_1) and europe
+# (LOCATION_2). Override REMOTE_HOST / REMOTE_ZONE / REMOTE_ROOT explicitly
+# to target them, or prefer the in-place tmux "remote body" scripts such as
+# scripts/remote_smoke_h200_dsa_9_4_m.sh for current production + smoke work.
+# The LOCATION_3 defaults below are preserved only for backward compatibility
+# with any caller that still exports them explicitly.
+#
+# GB10 note: `ssh gb10` may fail with hostname resolution (e.g.
+# `ssh dave@gx10-9cd4: hostname resolution`). GB10 requires local-network
+# access or a direct IP; it is not always reachable from cloud hosts.
+# ============================================================================
 # DSA smoke test on 8xH200.
 #
 # This is a MINIMAL importability and patching smoke test -- it uses a toy
@@ -10,6 +25,7 @@
 #   scripts/remote_smoke_h200_dsa_full_nam56r.sh
 set -euo pipefail
 
+# LEGACY default (LOCATION_3); override REMOTE_HOST/REMOTE_ZONE for bench3 or europe.
 REMOTE_HOST="${REMOTE_HOST:-h200_legacy}"
 REMOTE_ZONE="${REMOTE_ZONE:-LOCATION_3}"
 REMOTE_ROOT="${REMOTE_ROOT:-/mnt/data}"

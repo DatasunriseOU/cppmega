@@ -2,6 +2,15 @@
 
 Multi-agent investigation triggered by user pushback on prior claims. Launched 13+ parallel agents (research, grounding verification, empirical test) over MCP web search (perplexity deep research, exa, brave, tavily) + bench3/europe/GB10 hardware.
 
+> **Canonical production numbers**: see
+> [`docs/production_status.md`](production_status.md). Any throughput numbers
+> mentioned below are historical/empirical context; the single source of
+> truth for "what we ship today" is `production_status.md`. In particular,
+> bench3's canonical record is **268 TFLOP/s** with Liger
+> `reduction="mean"` broadcast — the "269.4 with reduction=none" path
+> documented in section 1 below is **superseded** because it silently
+> corrupts gradients (Liger #968).
+
 ---
 
 ## 1. Liger FLCE backward bug — `reduction="none"` produces silently corrupt gradients

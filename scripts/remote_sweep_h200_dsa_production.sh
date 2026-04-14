@@ -1,12 +1,36 @@
 #!/usr/bin/env bash
-# NAM56R DSA 9+4 production parameter sweep (2026-04-12)
+# ============================================================================
+# DEPRECATED / HISTORICAL (2026-04-14)
+# ----------------------------------------------------------------------------
+# Original purpose (2026-04-12): sequential sweep of 8 PP=2 configs on bench3
+# to find the best DSA 9+4 topology. That exploration has CONCLUDED:
+# PP=1 EP=8 MBS=10 FP8 tensorwise (v3) is the bench3 production config at
+# 268 TFLOP/s, and PP=1 EP=4 MBS=8 BF16 is europe at 289 TFLOP/s. See
+# `docs/production_status.md` for the canonical table.
 #
-# Sequential sweep of 8 configs on bench3 (h200_1), 50 iters each.
-# Measures tok/sec at iter 30-50 steady state.
+# ALL B1-B8 configs below use PP=2 VPP=2 MBS=4/8 EP=1 — this is the old
+# "Stream L" topology which measures ~193 TFLOP/s on europe (12-month-old
+# baseline). They do NOT reproduce the current 268/289 production records.
+#
+# Additionally, the FP8 indexer path this script originally invoked
+# (`cppmega.megatron.dsa_fp8_patch`) has been REMOVED upstream. The shim
+# below has been rewritten to use `dsa_indexer_fused_patch` (the current
+# BF16 per-head fused accumulator — memory-equivalent, no FP8 amax cost,
+# production-ready). The CPPMEGA_DSA_INDEXER_DTYPE=fp8 env var is now a
+# no-op for this script.
+#
+# Use this script ONLY for historical PP=2 config comparisons. For current
+# production runs use `scripts/remote_smoke_h200_dsa_9_4_m.sh` with
+# VARIANT=v3 (bench3) or VARIANT=v1 (europe). See `docs/production_status.md`.
+# ============================================================================
+# NAM56R DSA 9+4 PP=2 sweep (2026-04-12, historical)
+#
+# Sequential sweep of 8 PP=2 configs on bench3 (h200_1),
+# 50 iters each. Measures tok/sec at iter 30-50 steady state.
 #
 # All configs share:
 #   TP=1, DSA 9+4 (CPPMEGA_DSA_A_LAYER_RANKS="1,2,3,5,6,7,9,10,11"),
-#   FP8 indexer (CPPMEGA_DSA_INDEXER_DTYPE=fp8),
+#   BF16 fused indexer (via dsa_indexer_fused_patch; FP8 path deleted),
 #   sparse attention (CPPMEGA_DSA_SPARSE_MODE=tilelang, fallback gather_scatter),
 #   real HF tokenizer + clang_semantic data, --enable-dsa,
 #   --dsa-indexer-topk 256, --dsa-indexer-loss-coeff 0.001
@@ -67,8 +91,9 @@ export CPPMEGA_STRUCTURE_COMPONENTS="${CPPMEGA_STRUCTURE_COMPONENTS:-core}"
 
 # DSA 9+4 permanent layout
 export CPPMEGA_DSA_A_LAYER_RANKS="${CPPMEGA_DSA_A_LAYER_RANKS:-1,2,3,5,6,7,9,10,11}"
-# Stream E+G FP8 DSA indexer (fwd + bwd patched)
-export CPPMEGA_DSA_INDEXER_DTYPE="${CPPMEGA_DSA_INDEXER_DTYPE:-fp8}"
+# DSA indexer dtype env var (legacy, no-op after dsa_fp8_patch removal;
+# fused BF16 per-head accumulator is now the only path).
+export CPPMEGA_DSA_INDEXER_DTYPE="${CPPMEGA_DSA_INDEXER_DTYPE:-bf16}"
 # Sparse attention mode (tilelang fused kernel, fallback to gather_scatter)
 export CPPMEGA_DSA_SPARSE_MODE="${CPPMEGA_DSA_SPARSE_MODE:-tilelang}"
 
@@ -150,7 +175,7 @@ WORKDIR=$(mktemp -d /tmp/cppmega-nam56r-dsa-sweep.XXXXXX)
 trap "rm -rf ${WORKDIR}" EXIT
 
 cat > "${WORKDIR}/cppmega_mimo_shim.py" <<'PY'
-"""Shim: MIMO + fp32-bias + DSA FP8 + sparse attention + peak-memory reporter."""
+"""Shim: MIMO + fp32-bias + DSA fused indexer + sparse attention + peak-memory reporter."""
 from __future__ import annotations
 import os
 import sys
@@ -227,17 +252,24 @@ try:
 except Exception:
     pass
 
-# (5) DSA FP8 fwd+bwd indexer patch + sparse attention + KL mode
+# (5) DSA indexer fused patch (BF16 per-head bmm, current path)
+# Historical note: CPPMEGA_DSA_INDEXER_DTYPE=fp8 used to invoke
+# cppmega.megatron.dsa_fp8_patch.apply_dsa_fp8_patch — that module has
+# been removed. The fused BF16 indexer is memory-equivalent and the
+# only supported path. The env var is preserved here only to keep
+# legacy invocation surface compatible; any value other than "bf16"
+# is ignored (with a warning).
 _dsa_dtype = os.environ.get("CPPMEGA_DSA_INDEXER_DTYPE", "bf16").lower()
-print(f"[cppmega_mimo_shim] CPPMEGA_DSA_INDEXER_DTYPE resolves to '{_dsa_dtype}'")
-if _dsa_dtype == "fp8":
-    try:
-        from cppmega.megatron.dsa_fp8_patch import apply_dsa_fp8_patch
-        _applied = apply_dsa_fp8_patch()
-        print(f"[cppmega_mimo_shim] DSA FP8 patch applied={_applied}")
-    except Exception as _exc:
-        print(f"[cppmega_mimo_shim] DSA FP8 patch failed: {_exc}", file=sys.stderr)
-        raise
+print(f"[cppmega_mimo_shim] CPPMEGA_DSA_INDEXER_DTYPE='{_dsa_dtype}' (fused BF16 path is the only supported path)")
+if _dsa_dtype != "bf16":
+    print(f"[cppmega_mimo_shim] WARNING: CPPMEGA_DSA_INDEXER_DTYPE='{_dsa_dtype}' is legacy; FP8 patch removed, using fused BF16", file=sys.stderr)
+try:
+    from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_patch
+    _applied = apply_dsa_indexer_fused_patch()
+    print(f"[cppmega_mimo_shim] DSA indexer fused patch applied={_applied}")
+except Exception as _exc:
+    print(f"[cppmega_mimo_shim] DSA indexer fused patch failed: {_exc}", file=sys.stderr)
+    raise
 
 _sparse_mode = os.environ.get("CPPMEGA_DSA_SPARSE_MODE", "tilelang").lower()
 print(f"[cppmega_mimo_shim] CPPMEGA_DSA_SPARSE_MODE resolves to '{_sparse_mode}'")
@@ -328,7 +360,7 @@ bundle = build_nam56r_megatron_native_args(
     mtp_mode="hybrid",
     enable_moe=True,
     enable_dsa=True,
-    dsa_indexer_dtype="fp8",
+    dsa_indexer_dtype="bf16",
     dsa_indexer_topk=${DSA_TOPK},
     dsa_indexer_loss_coeff=${DSA_LOSS_COEFF},
 )
@@ -391,7 +423,7 @@ fi
 
 # Pre-flight checks
 python -c 'import cppmega, megatron; print("cppmega", cppmega.__version__)'
-python -c "from cppmega.megatron.dsa_fp8_patch import apply_dsa_fp8_patch; print('dsa_fp8_patch importable')"
+python -c "from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_patch; print('dsa_indexer_fused_patch importable')"
 
 # Validate DSA A-layer rank parsing
 python - <<PY
