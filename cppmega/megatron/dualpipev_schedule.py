@@ -338,11 +338,16 @@ def dualpipev_forward_backward(state: DualPipeVState, **kw) -> List[dict]:
                 return_outputs=False,
             )
         if state.groups.pipe_rank == 0:
-            tot = loss_t.sum()
+            # loss_t is a list of per-chunk CE values, each already divided by
+            # num_chunks in DualPipeVLossFn.  Summing recovers the per-token
+            # average CE across all chunks.  Megatron's reducer expects
+            # [sum_of_losses_over_tokens, num_tokens] so it divides again -- we
+            # must multiply avg_ce by num_tokens to satisfy that contract.
+            avg_ce = loss_t.sum()
+            num_tokens_val = mbs * seq_len * num_chunks
+            tot = avg_ce * num_tokens_val  # un-average for Megatron's reducer
             num_tokens = torch.tensor(
-                [mbs * seq_len * num_chunks],
-                dtype=torch.int,
-                device=tot.device,
+                [num_tokens_val], dtype=torch.int, device=tot.device,
             )
             results.append(
                 {
