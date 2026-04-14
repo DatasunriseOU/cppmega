@@ -137,6 +137,31 @@ production (we need EP=4 for memory/expert distribution).
   - Baseline vs P1+TMA smoke (MBS=8, 25 iters, PP=1 EP=4 no-CG)
   - Target: ≥3% TFLOP/s gain → ship to main; <3% → keep infra + hold
 
+### Merge conflict note for tma-layout-fix-3d-to-2d
+
+`git merge-tree main origin/tma-layout-fix-3d-to-2d` reports 1 conflict:
+
+- `docs/mamba3_mimo_p1_notes.md` — both branches appended addendums.
+  Trivial to resolve (keep both addendums in order).
+
+Resolution plan (execute only if europe full P1+TMA measurement gives
+a ship-worthy win):
+
+```bash
+git checkout tma-layout-fix-3d-to-2d
+git pull origin tma-layout-fix-3d-to-2d
+git merge origin/main   # or rebase; resolve the doc conflict
+git push origin tma-layout-fix-3d-to-2d
+git checkout main
+git merge --ff-only tma-layout-fix-3d-to-2d  # or open PR via gh
+git push origin main
+```
+
+Files unique to the branch (additions, no conflict):
+- `cppmega/megatron/upstream_patches/apply_mamba3_mimo_tma_layout_fix.py`
+- `cppmega/megatron/upstream_patches/mamba3_mimo_bwd_tma_layout_fix.patch`
+- `scripts/exploration/tma_layout_repro.py` (+ related bench files on branch)
+
 ### Action items (still active)
   - Apply: `apply_mamba3_mimo_p1_patches` + `apply_mamba3_mimo_tma_layout_fix`
   - Config: PP=1 EP=4 MBS=8 no-CG FP8 tensorwise, 25 iters
