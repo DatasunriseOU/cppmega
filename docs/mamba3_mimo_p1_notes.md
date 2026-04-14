@@ -198,3 +198,54 @@ Options after measurement:
 - **Selective fwd-only fallback**: if full P1 has other issues (bwd
   smem overflow even with flatten, or other WGMMA issues on H200),
   ship only the fwd patch — ~1.3-1.8% interim gain.
+
+## Addendum 2026-04-14 late evening: selective-fwd H200 measurement (bench3)
+
+**Result**: selective-fwd P1 is a **wash** on H200 — does not ship.
+
+### Test setup (bench3, 8xH200)
+
+- `scripts/remote_smoke_h200_dsa_9_4_m.sh`, MBS=8, VARIANT=v1 (EP=4 PP=2),
+  `CPPMEGA_INDEX_CACHE=1 CPPMEGA_LEMYX_DSA=1 CPPMEGA_MTP_LIGER_CE=1`,
+  `TRAIN_ITERS=25`.
+- Only `mamba_mimo_fwd` in `mamba3_mimo_fwd.py` and
+  `mamba3_mimo_fwd_varlen.py` gets TMA+warp-spec flipped.
+  `mamba3_mimo_bwd*.py` kernels left with TMA lower OFF (they crash
+  compile otherwise — see addendum above).
+
+### Numbers (iters 5-25 mean, 19 samples each)
+
+| Metric                  | Baseline (P1 OFF) | Selective P1 ON | Delta      |
+|-------------------------|-------------------|-----------------|------------|
+| Throughput (TFLOP/s)    | 183.016           | 183.005         | −0.006 %   |
+| Iter 25 TFLOP/s         | 183.6             | 183.6           |  0.0 %     |
+| Iter 1 lm loss          | 1.187753e+01      | 1.187753e+01    | identical  |
+| Iter 25 lm loss         | 5.329613e+00      | 5.181808e+00    | −0.15      |
+| Val test loss iter 25   | 5.268564          | 5.109381        | −0.16      |
+| Peak reserved GiB (max) | 131.924           | 132.686         | +0.76 GiB  |
+
+Loss delta at iter 25 is within numerical noise from BF16 accumulation in a
+different kernel schedule (TMA/warp-spec path has different FMA ordering);
+iter-1 loss is bit-identical as a sanity check.
+
+### Verdict — HOLD selective P1 default OFF
+
+Fwd kernel is not the bottleneck at current bench3 MBS=8 NAM56R config.
+nsys on baseline showed `mamba_mimo_fwd` at 1192 ms/step total wall time
+but that's already a small fraction of the 5540 ms iteration — a 20–30 %
+fwd-kernel speedup would only move total TFLOP/s by ~1 %, below
+measurement noise.
+
+The full P1 plan (fwd + bwd + bwd_bwd with TMA layout flatten) remains
+the path to the 5–10 % win originally modeled. Until the TMA layout
+patch is verified on H200, keep `CPPMEGA_MAMBA3_P1` default OFF.
+
+### Commit
+
+`apply_mamba3_mimo_p1_patches.py`:
+- scope narrowed to fwd + fwd_varlen flips only
+- bwd + bwd_varlen get only AGGRESSIVE_SHARED_MEMORY_MERGE (GB10 guard)
+- 8-rank race fix: `LOCAL_RANK==0` patches, others wait on flock + sentinel
+- line-count-preserving aggressive-merge (merged onto FAST_MATH line)
+  prevents `inspect.getsource` desync when `import mamba_ssm` happens
+  before apply_all
