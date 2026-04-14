@@ -387,6 +387,14 @@ if os.environ.get("CPPMEGA_MTP_LIGER_CE", "0") == "1":
     from cppmega.megatron.mtp_liger_ce import patch_mtp_loss_with_liger
     patch_mtp_loss_with_liger()
 
+# (9b) Main-head linear CE fusion (CPPMEGA_MAIN_HEAD_LINEAR_CE=1)
+# Swaps MambaModel.output_layer from ColumnParallelLinear to LinearCrossEntropyModule,
+# which fuses GEMM + cross-entropy (no logits materialization, saves ~12 GiB at MBS=12).
+# Requires --cross-entropy-loss-fusion --cross-entropy-fusion-impl linear in EXTRA_FLAGS.
+if os.environ.get("CPPMEGA_MAIN_HEAD_LINEAR_CE", "0") == "1":
+    from cppmega.megatron.apply_linear_ce_patch import patch_mamba_output_layer_with_linear_ce
+    patch_mamba_output_layer_with_linear_ce()
+
 # (7) Stream M: per-rank peak-memory reporter (atexit hook)
 def _cppmega_peak_mem_report():
     try:
