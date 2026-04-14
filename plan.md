@@ -14,7 +14,7 @@
 #### Code shipped:
 1. ✅ **`cppmega/megatron/apply_linear_ce_patch.py`** — main-head LinearCrossEntropyModule swap + Liger reduction=mean fix (workaround Liger #968 silent grad corruption). Probe-based dispatcher works for cc=9 (Hopper native PR #3345 if cherry-picked), cc=10 (Blackwell native), cc=12 (GB10 Liger fallback)
 2. ✅ **`cppmega/megatron/dsa_indexer_fused_patch.py`** — module-level monkey-patch of `_compute_index_scores` → per-head fused BF16 accumulation. Saves ~16 GiB at MBS=8 (4.11 → 0.24 GiB per call, 17× reduction). GB10 verified rel_err 1.9e-7 at NAM56R prod shape.
-3. ✅ **`cppmega/megatron/mtp_native_hopper_ce.py`** — extends PR #3345 cherry-pick to MTP head (in progress per agent a4666f85)
+3. ⚠️ **`cppmega/megatron/mtp_native_hopper_ce.py`** — infrastructure committed (class-swap + monkey-patch wiring), env gate `CPPMEGA_MTP_NATIVE_HOPPER_CE=0` default OFF. Activating produces `grad_norm=NaN` (Suspect #1 transpose round-trip refuted empirically, Suspect #2 CG collective pending). **Do NOT enable until NaN root-caused.**
 4. ✅ **`scripts/remote_smoke_h200_dsa_9_4_m.sh`** — env var hooks for all new patches, default ON for `CPPMEGA_DSA_INDEXER_FUSED=1`
 5. ✅ **`tests/test_dsa_indexer_fused_patch.py`** — parity tests vs upstream einsum
 
