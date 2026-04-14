@@ -124,3 +124,113 @@ Better than P3 for total throughput (deferred further):
 - Implementation: not started.
 - Branch: would be `p3-bwd-bwd-register-split` once we have P1 full result to decide
   whether to pursue.
+
+## Implementation blockers (2026-04-14, Phase-3 agent audit)
+
+An attempt to start P3 uncovered three stop-the-work issues. The original design is
+still **on paper only**; do not follow it as-is.
+
+### Blocker 1 — split point is not clean (design assumption false)
+
+The original design proposed splitting into Pass-1 (state-reverse) + Pass-2 (chunk-local).
+Reading `mamba3_mimo_bwd.py::mamba_mimo_bwd_bwd_kernel` (lines 543-1170) line-by-line:
+
+- Loop-carried state `dstates_frag` is **updated at the END of each reverse chunk** via
+  `T.gemm(q_shared, dPhiO_scaled_frag, dstates_frag, clear_accum=False)` (line ~1151),
+  then copied to `dstates_shared` for the **next** reverse iteration.
+- This means Pass-1 (state-reverse path) must still hold `q_shared`, `dPhiO_shared`,
+  and `dstates_frag` live — the exact fragments the design claimed could be dropped.
+- The 10-fragment live-set attributed to "state-reverse" is actually shared between
+  passes. Separating them would require (a) saving `dPhiO_shared` per-chunk to gmem
+  (an extra `[B, H, nchunks, chunk_size·R, P]` buffer = 3×bigger than dstates buffer,
+  ~200 MiB/sample), (b) re-deriving rotated-and-trap-scaled Q/K inside Pass-1 from
+  scratch.
+
+**Consequence**: the forecast "Pass-1 live-set ~140-150 regs" is too optimistic.
+Realistic estimate after split is **~200-220 regs** — still over the 256 ceiling that
+causes spilling, just slightly better. Occupancy bump is marginal.
+
+This matches the prior research agent (Agent 6) verdict: **PARTIALLY VALID**,
+**realistic gain 1.3-2.1% total TFLOP/s**, not 30-50% per-kernel as doc claims.
+
+### Blocker 2 — GB10 is not a viable correctness platform for this kernel
+
+Empirical test 2026-04-14: `mamba3_mimo` forward kernel fails to compile on GB10
+(sm_121a, 99 KiB smem) at **every tested shape**, including tiny shapes:
+
+```
+B=1, S=128, H=4, G=1, N=32, P=32, R=2  →  TMA desc init error 716 (InternalError)
+B=1, S=64,  H=16, G=1, N=64, P=64, R=4 →  autotune RuntimeError (0 configs compiled)
+```
+
+So even the single-kernel baseline does not run on GB10 at any shape we can reach.
+Correctness validation for a P3 split — which would need **baseline vs split** output
+comparison — is **not possible on GB10** without first fixing the baseline kernel's
+GB10 compile path (separate unrelated work).
+
+### Blocker 3 — bench3 SSH key is broken (as of 2026-04-14)
+
+`ssh h200_1` returns `Permission denied (publickey)` for the
+`google_compute_engine` identity. Until that is restored we have no H200 to
+measure P3 perf on. Europe H200 is also gated (separate lane).
+
+### Recommended path forward (deprecates the split-kernel plan)
+
+1. **Skip the full split** — ROI is 1-2% at ≥1 week of kernel work plus a 540 MiB
+   gmem buffer (`dstates_per_chunk`), not the 30-50% the doc sold.
+
+2. **Try the Hoist-PsiV alternative (line 119 of this doc) first**: cache post-rotary
+   Q/K + PsiV from `bwd_fwd` into gmem, consume them in `bwd_bwd`. This removes ~3 frag
+   tiles from bwd_bwd's inner live-set without touching the reverse-scan. Cost is
+   adding two gmem outputs to `bwd_fwd`; bwd_fwd already has 196 KiB smem + 255 regs so
+   this also risks pushing it over, needs an actual test.
+   - 2-3 days implementation vs 8-12 days for the full split.
+   - Same expected ~1-2% total TFLOP/s gain, same risk profile.
+
+3. **Preferred actual next step**: the cheaper unrealized wins on the plan list beat
+   P3 comfortably:
+   - MBS=12 with reduction-mean bugfix + Liger main-head (blocked on backward-NaN per
+     `reference_main_head_liger_ce_gap.md`)
+   - `--fp8-param-gather` for custom modules (+1-2% if MBS headroom opens, per
+     `reference_fp8_param_gather_net_neutral.md`)
+   - P1 full once TileLang ≥ **TMA lower with InputDim>2** supports bwd kernels
+
+4. **If P3 is pursued anyway** (by a future agent with restored bench3 access):
+   start with Pass-2 only (consume a **separately-produced** `dstates_per_chunk` from a
+   modified `bwd_fwd`, not a new Pass-1 kernel). This avoids the loop-carried-state
+   duplication issue in Blocker 1 entirely. Pass-2 alone at NAM56R shape also stays
+   inside 228 KiB smem. The perf win will be smaller (~0.5-1%) but the code change is
+   tractable.
+
+### Files inspected
+
+- `/home/dave/cppmega-venv/lib/python*/site-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py`
+  (1365 lines; bwd_bwd_kernel lines 543-1170)
+- `/Volumes/external/sources/cppmega/cppmega/megatron/upstream_patches/apply_mamba3_mimo_p1_patches.py`
+  (patch infra referenced for future env-gated P3 patch)
+
+### Empirical GB10 baseline compile failure
+
+```
+File ".../mamba3_mimo_fwd.py", line 462, in mamba_mimo_forward
+  kernel( q, k, v, ...)
+File ".../tilelang/jit/adapter/tvm_ffi.py", line 244, in func
+  executable(*tensor_list)
+tvm.error.InternalError: Failed to initialize the TMA descriptor 716
+  TMA Desc Addr:   0xffffe26eb138
+  format         7
+  dim            3
+  gmem_address   0x32ee1ea00
+  globalDim      [128, 4, 1]
+  globalStrides  [4, 512, 2048]
+  boxDim         [16, 1, 1]
+```
+
+Same kernel at NAM56R small (B=1, S=64, H=16, N=64, P=64, R=4):
+`RuntimeError: Auto-tuning failed: No configuration successfully compiled`.
+
+### Decision
+
+**Do not ship P3.** Pursue Hoist-PsiV + cheaper known wins. Close this design doc
+as "superseded, not implemented". Keep the document as a historical record of why
+the naive split was rejected.

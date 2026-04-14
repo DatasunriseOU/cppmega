@@ -1,0 +1,20 @@
+# Reproducer for upstream_prs/05_mamba3_dt_fp32_gqa_bwd
+#
+# Exact versions used to validate the reproducer on GB10 (sm_121a) and
+# H200 (sm_90a). mamba-ssm must be the Dao AI Lab / Goombalab fork with
+# the TileLang MIMO kernels — the PyPI release (2.3.1) does NOT include
+# mamba_ssm.ops.tilelang or mamba_ssm.modules.mamba3 and will silently
+# fail to import for this reproducer.
+#
+# Install the fork editable:
+#     git clone https://github.com/state-spaces/mamba
+#     cd mamba
+#     MAMBA_FORCE_BUILD=TRUE pip install -e .
+torch>=2.6
+einops
+# TileLang is required for the MIMO fwd/bwd kernels we exercise.
+tilelang
+triton
+# mamba-ssm fork with TileLang Mamba3 MIMO kernels. Do NOT substitute the
+# PyPI 2.3.1 wheel — it does not have the affected code paths.
+# mamba-ssm @ git+https://github.com/state-spaces/mamba

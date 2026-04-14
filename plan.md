@@ -1,4 +1,96 @@
-# NAM56R optimization plan — next 10 hours
+# NAM56R optimization plan
+
+## Current state (2026-04-14 morning session 2 — multi-agent investigation)
+
+### Production configs
+
+| Machine | Config | TFLOP/s | MFU | Status |
+|---|---|---|---|---|
+| **bench3** H200×8 | PP=1 EP=8 MBS=10 FP8 tensorwise + Liger main-head + IndexCache + lemyx | **~268-269** | ~27% | Production (with caveat: re-baselining post-fixes pending) |
+| **europe** H200×8 | PP=1 EP=4 MBS=8 BF16 + IndexCache + lemyx | **289** | 29.2% | Production (gold record, fabric-bound) |
+
+### What's DONE (this session)
+
+#### Code shipped:
+1. ✅ **`cppmega/megatron/apply_linear_ce_patch.py`** — main-head LinearCrossEntropyModule swap + Liger reduction=mean fix (workaround Liger #968 silent grad corruption). Probe-based dispatcher works for cc=9 (Hopper native PR #3345 if cherry-picked), cc=10 (Blackwell native), cc=12 (GB10 Liger fallback)
+2. ✅ **`cppmega/megatron/dsa_indexer_fused_patch.py`** — module-level monkey-patch of `_compute_index_scores` → per-head fused BF16 accumulation. Saves ~16 GiB at MBS=8 (4.11 → 0.24 GiB per call, 17× reduction). GB10 verified rel_err 1.9e-7 at NAM56R prod shape.
+3. ✅ **`cppmega/megatron/mtp_native_hopper_ce.py`** — extends PR #3345 cherry-pick to MTP head (in progress per agent a4666f85)
+4. ✅ **`scripts/remote_smoke_h200_dsa_9_4_m.sh`** — env var hooks for all new patches, default ON for `CPPMEGA_DSA_INDEXER_FUSED=1`
+5. ✅ **`tests/test_dsa_indexer_fused_patch.py`** — parity tests vs upstream einsum
+
+#### Stack upgrades:
+- ✅ **TileLang main built + distributed** to bench3 + europe + GB10 + local Mac (commit `f309d814`, 2026-04-14)
+  - PR #746 follow-ups: 3D smem `LowerBulkCopy` falls back gracefully вместо ICHECK
+  - PR #2002: pipeline planning before layout inference
+  - PR #1909: ProducerConsumerWarpSpecialized + `T.tma_copy()` API
+  - PR #2024 + #2037
+- ✅ **Apple CCE 25.1.1 → 25.9.3** upgraded on bench3 + europe (но empirically не помогает в нашем shape — delta ±200 MiB)
+- ✅ **Megatron PR #3345** cherry-picked на bench3 (Hopper native fused linear CE). Standalone smoke validates compilation + correctness. Integration via class-swap works.
+- ✅ **SSH keys fixed** — direct `dave@<ip>` works on bench3 + europe (was Permission denied earlier)
+- ✅ **Bwd files state**: P1 patches re-applied (`TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE=True` for bwd_bwd compile)
+
+### What's IN PROGRESS
+
+| Agent | Task | ETA |
+|---|---|---|
+| ac244d76 | Verify CG_FLAGS=NONE actually propagates + identify 63.5 GiB pool source | running |
+| a4666f85 | Extend PR #3345 cherry-pick to MTP head | running |
+| af7f16fa | (duplicate) In-place dsa.py edit — will be canceled, ac2fa14c monkey-patch path chosen | running |
+| current | bench3 MBS=10 + all fixes (CG=NONE + Liger=mean + indexer fused) | iter ~1 (just launched pid 2223812) |
+
+### What's PROD-READY
+
+1. **Liger main-head reduction=mean** (Path A, Liger #968 workaround) — math exact, gradient correct
+2. **DSA indexer fused** (per-head accumulation) — saves 3.87 GiB/call, 17× reduction
+3. **TileLang main** — unblocks ALL bwd kernels (3D smem fallback works)
+4. **SSH key infrastructure** — direct dave@ access on both H200 machines
+
+### What's IN PLAN (week+ effort, kernel-level)
+
+1. **Mamba3 P2 PsiV cache** (5 days, +1.5-2.3% = 274-277 TFLOP/s on bench3)
+   - Cache `Q_rot + K_rot` in bwd_fwd, drop PsiV recompute
+   - Memory: 5.6 GiB/rank for cache (9 layers × 0.62 GiB)
+   - GB10-testable
+
+2. **Mamba3 P3 register split** (HALT — better path = warp-spec)
+   - Path 0 (warp-spec annotations): 2-3 weeks, gated on TMA layout fix on H200
+   - Path 1 (PsiV hoist): 2 days, GB10-testable, attacks root cause (17 → 13 frags)
+   - Path 2 (full kernel split): 8-12 days, last resort (no atomics needed)
+
+3. **PR #3345 native Hopper CE** (cherry-picked, MTP extension in progress)
+   - Eliminates Liger entirely on cc=9
+   - No silent gradient corruption (per-token bwd works correctly)
+   - Estimated +1-3% if MTP coverage completes
+
+4. **TileLang upstream PRs file** (require user approval per `feedback_pr_approval.md`):
+   - Mamba LinearCrossEntropyModule regression (Megatron PR #3226 → #3207 clobber)
+   - TileLang TMA 3D smem documentation/support request
+   - TileLang FloorMod const-fold in T.Parallel
+
+### Stretch goal (250k tok/sec / 50% MFU)
+
+- Current ~289 TFLOP/s = 29.2% MFU
+- 50% MFU = 495 TFLOP/s = **1.7× gap**
+- Realistic stack of P2 + indexer fused + PR #3345 = +5-10% → 305-318 TFLOP/s = 31-32% MFU
+- **Gap remains** — requires CUTLASS WGMMA custom kernels (months) или новое hardware (B200+)
+
+### Critical session findings (verified by 6 grounding agents)
+
+- **Liger #968 silent grad corruption REAL** — `reduction="none"` backward reads `grad_output[0]` as scalar regardless of shape. Worst case: `grad_output[0]=0` → all gradients = 0. Multiple PRs (#1126 = assertion only, #680 = different module). No real per-token bwd fix exists in any fork.
+- **Apple CCE doesn't help on our V=65k shape** — 28GB→1GB paper number was vs dense fp32 CE at V=256K, not vs Liger. Practical delta ±200 MiB in our regime.
+- **63.5 GiB "CUDA Graphs private pool"** label is from PyTorch OOM message, illustrative not exclusive. Source = TE FP8 `make_graphed_callables` or Megatron `--cuda-graph-impl=transformer_engine`. CG_FLAGS=NONE properly empties — verified.
+- **TileLang TMA bug REAL on v0.1.8**, but **main HEAD has graceful fallback** for 3D smem
+- **Mamba3 P3 register split path partially valid** but warp-spec annotations approach (Path 0) is NOT drop-in (kernel needs explicit WS split first — 2-3 weeks rewrite)
+
+### Action items for next session
+
+1. **Re-baseline production** with all fixes shipped (current bench3 test, pid 2223812 running)
+2. **Commit + push to repo** (in progress)
+3. **Update install/setup docs** with new env vars, TileLang main build instructions, mamba_ssm patch reapplication
+4. **MTP extension** (PR #3345 path) — when a4666f85 returns
+5. **Mamba3 P2 PsiV cache** — implement after current fixes validated
+
+---
 
 ## EMPIRICAL CONFIG EXPLORATION COMPLETE (2026-04-14 deep night)
 
