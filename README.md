@@ -4,7 +4,7 @@ Megatron-first training framework for **NAM56R** — a 4.73B hybrid Mamba3 + MLA
 
 ## Production Configuration
 
-**289 TFLOP/s** on 8xH200 (verified 2026-04-14). BF16 outperforms FP8 tensorwise by 3.5%.
+**289 TFLOP/s** on 8xH200 europe (verified 2026-04-14, PP=1 EP=4 MBS=8 BF16 no-CG). BF16 outperforms FP8 tensorwise by 3.5%. bench3 at the same topology = **253 TFLOP/s** (different HW, ~13% gap is NVLink/NUMA/thermal variance).
 
 | Parameter    | Value                                                     |
 | ------------ | --------------------------------------------------------- |
@@ -16,8 +16,8 @@ Megatron-first training framework for **NAM56R** — a 4.73B hybrid Mamba3 + MLA
 | MoE          | 16 experts, topk=4, shared expert, grouped GEMM           |
 | MTP          | 2 prediction layers                                       |
 | Precision    | BF16 (FP8 tensorwise available but -3.5% slower)          |
-| Parallelism  | PP=1, TP=1, EP=4, DP=2                                    |
-| Micro-batch  | MBS=4, GBS=64, seq_len=4096                               |
+| Parallelism  | PP=1, TP=1, EP=4, DP=2  (CG must be OFF at PP=1)          |
+| Micro-batch  | MBS=8, GBS=64, seq_len=4096                               |
 | Hardware     | 8x NVIDIA H200 141GB (NVLink)                             |
 
 ## Quick Start
@@ -79,18 +79,19 @@ The script auto-applies:
 | Mamba recompute   | `CPPMEGA_MAMBA_RECOMPUTE=1`   | `mamba_recompute_patch.py`   | Activation checkpointing for Mamba layers            |
 | FP8 param-gather  | `CPPMEGA_FP8_PARAM_GATHER=1`  | Megatron `--fp8-param-gather`| -5 GiB (FP8 all-gather bucket, master stays FP32)    |
 | DualPipeV         | `CPPMEGA_DUALPIPEV=1`         | `apply_dualpipev_patch.py`   | V-shape PP; forces Megatron PP=1, carves own 2-rank group (experimental) |
+| Mamba3 MIMO P1    | `CPPMEGA_MAMBA3_P1=1`         | `apply_mamba3_mimo_p1_patches.py` | TMA + warp-spec on Mamba3 MIMO fwd only (bwd blocked by TileLang TMA layout bug) |
 
 ### Pipeline Schedules
 
-| Schedule      | File                      | When to use                                |
+| Schedule      | File                      | Status / When to use                       |
 | ------------- | ------------------------- | ------------------------------------------ |
-| Standard 1F1B | Megatron built-in         | PP=2 VPP=2 (194 TFLOP/s)                   |
-| DualPipeV     | `dualpipev_schedule.py`   | PP=2 near-zero bubble (205 TFLOP/s, MBS=2) |
-| combined_1f1b | `hybrid_schedule_plan.py` | PP=1 EP A2A overlap (hides MoE all-to-all) |
+| Standard 1F1B | Megatron built-in         | PP=2 VPP=2 = 193 TFLOP/s europe (verified 2026-04-14) |
+| DualPipeV     | `dualpipev_schedule.py`   | Experimental; infrastructure written but incompatible with EP>1 (DeepEP A2A cross-rank desync). `CPPMEGA_DUALPIPEV=1`, default off |
+| combined_1f1b | `hybrid_schedule_plan.py` | Closed: OOM at every PP=2 MBS, PP=4 impossible (52 layers). Infrastructure kept; `CPPMEGA_EP_OVERLAP=1`, default off |
 
 ### Upstream Patches (apply_dsa_cg_patches.py)
 
-**MUST run after every Megatron update.** 9 patches:
+**MUST run after every Megatron update.** 10 patches (1-9 + 9b):
 
 1. CUDA graph safety (ban torch.equal/.any CPU syncs)
 2. Remove 576/512 dim hardcodes (our dims: 128/64)
@@ -98,21 +99,26 @@ The script auto-applies:
 4. sparse_mla.py d_v parameter
 5. tilelang_sparse_mla_fwd.py dim assertions relaxed
 6. tilelang_sparse_mla_bwd.py D=512 hardcode removed
-7. tilelang_sparse_mla_bwd.py FP32 P/dP precision
+7. tilelang_sparse_mla_bwd.py P/dP dtype (revert fp32 — broke TileLang GEMM dtype constraint)
 8. CG-safe _scatter_topk_into_index_mask (branchless)
-9. FP8 SparseMLA dispatch (QuantizedTensor → SparseMLA_FP8)
+9. FP8 SparseMLA dispatch (QuantizedTensor → SparseMLA_FP8, zero-copy via `_data`)
+9b. Remove stray `query.dequantize()` + `key.dequantize()` that had drifted into installed dsa.py (was killing zero-copy FP8 by re-quantizing BF16 tensors per-token)
 
 ## Throughput Results
 
-| Config                        | TFLOP/s | tok/sec/GPU | Notes             |
-| ----------------------------- | ------- | ----------- | ----------------- |
-| **PP=1 MBS=8 BF16 no-CG + compile** | **289** | ~9,250 | Production config |
-| PP=1 MBS=8 FP8 no-CG + compile | 279 | ~8,950 | FP8 overhead > gain |
-| PP=1 EP=4 MBS=4 + compile | 265 | ~8,500 | With CUDA graphs |
-| PP=2 VPP=2 EP=4 MBS=4         | 194     | ~6,200      | Save verified     |
-| DualPipeV PP=2 MBS=2          | 205     | ~6,600      | No DSA/FP8 yet    |
-| Selective FP8 MoE (no DSA)    | 205     | ~6,600      | MoE-only FP8      |
-| PP=1 EP=1 MBS=10 (h=3584)     | 272     | ~8,700      | Previous golden   |
+Measurements on 8×H200 (LOCATION_2 unless noted). 25-iter median,
+iters 3-25. CG must be OFF at PP=1 (TE CG private pool = 39.5 GiB).
+
+| Config                                  | TFLOP/s | tok/sec/GPU | Notes             |
+| --------------------------------------- | ------- | ----------- | ----------------- |
+| **PP=1 EP=4 MBS=8 BF16 no-CG** europe   | **289** | ~9,250      | Production config |
+| PP=1 EP=4 MBS=8 FP8 no-CG europe        | 279     | ~8,950      | FP8 overhead > gain |
+| PP=1 EP=4 MBS=8 FP8 no-CG **bench3**    | 253     | ~8,100      | Same topology, 13% machine delta |
+| PP=1 EP=4 MBS=8 FP8 +param-gather bench3 | 252    | ~8,080      | -2.6 GiB mem, neutral throughput |
+| PP=2 VPP=2 EP=4 MBS=4 MTP=2 europe      | 193     | ~6,200      | Vanilla PP=2 baseline |
+| PP=2 VPP=2 EP=2 DP=2 MBS=4 europe       | 193     | ~6,200      | Alternate EP split |
+| combined_1f1b overlap any PP=2 config   | OOM     | —           | ~40 GiB pipe buffers + 95 GiB baseline > 141 GiB |
+| combined_1f1b PP=1 MBS=4 no-MTP         | 182     | ~5,900      | -12.5% + OOM@iter 8 |
 
 ## Machines
 
@@ -156,7 +162,7 @@ cppmega/
     index_cache_patch.py       # DSA index reuse (3 Full + 6 Shared)
     lemyx_dsa_warmup.py        # Fused FA+KL TileLang kernel
     mamba3_compile_patch.py    # Regional torch.compile (4 regions)
-    dualpipev_schedule.py      # DualPipeV pipeline schedule (167 LOC)
+    dualpipev_schedule.py      # DualPipeV pipeline schedule (~470 LOC, experimental)
     hybrid_schedule_plan.py    # build_schedule_plan for MambaModel
     mtp_liger_ce.py            # Liger fused cross-entropy for MTP
     selective_fp8_moe_patch.py # FP8 only for MoE experts
@@ -165,7 +171,10 @@ cppmega/
     custom_mamba_model.py      # CppMegaMambaModel wrapper
     sparse_mla_ops/            # TileLang SparseMLA fwd/bwd + FP8
     upstream_patches/
-      apply_dsa_cg_patches.py  # 9 patches for DSA + CG + FP8 + dims
+      apply_dsa_cg_patches.py             # 10 patches for DSA + CG + FP8 + dims (1-9 + 9b)
+      apply_mamba3_mimo_p1_patches.py     # Mamba3 TMA+warpspec (fwd only, bwd blocked upstream)
+      apply_mamba3_mimo_tma_layout_fix.py # 3D→2D smem flatten, unblocks full P1 (branch: tma-layout-fix-3d-to-2d)
+      apply_dualpipev_patch.py            # DualPipeV Megatron hook (experimental)
   recipes/
     nam56r_nemo_recipe.py      # NAM56R configuration
 scripts/
