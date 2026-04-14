@@ -16,14 +16,14 @@ All of these trigger `.item()` under the hood, which synchronizes the CUDA strea
 
 ### Validation checks (torch.equal)
 
-Replace `torch.equal()` validation checks with `if False:` guards. These checks verify invariants that hold by construction during training — the values are deterministic outputs of the indexer. In debug mode, users can re-enable them.
-
-A better approach would be to move these checks into a `torch.compiler.is_compiling()` or `torch.cuda.is_current_stream_capturing()` guard:
+Gate `torch.equal()` validation checks on `torch.cuda.is_current_stream_capturing()` so they continue to run in eager / non-capturing mode but are bypassed under CUDA graph capture:
 
 ```python
 if not torch.cuda.is_current_stream_capturing():
     assert torch.equal(finite, expected), "..."
 ```
+
+This preserves the invariant checks (deterministic outputs of the indexer) outside capture while avoiding the CPU sync that breaks graph capture.
 
 ### Scatter with sentinels (_scatter_topk_into_index_mask)
 
