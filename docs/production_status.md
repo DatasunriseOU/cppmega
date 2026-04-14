@@ -31,11 +31,11 @@ silent gradient corruption).
   moe_router moe_preprocess`, which holds a 63.5 GiB CUDA Graph private pool.
   At MBS=10 this pushes peak past 140 GiB and OOMs at iter 1. Always pass
   `CG_FLAGS=NONE` explicitly in env. Verified on bench3 2026-04-14.
-- **WARNING — `CPPMEGA_DSA_INDEXER_FUSED` default flipped to OFF**: the
-  per-head streamed indexer creates a 640 MiB fp32 buffer per DSA layer and
-  9 DSA layers × 640 MiB = ~5.7 GiB resident across forward (autograd holds
-  for backward). Adds memory pressure on top of the CG private pool. To
-  enable explicitly set `CPPMEGA_DSA_INDEXER_FUSED=1` (production override).
+- **`CPPMEGA_DSA_INDEXER_FUSED=1` (default ON, keep it)**: per-head streamed
+  indexer saves ~40 GiB vs upstream einsum at MBS=10 NAM56R (upstream
+  materialises `[sq, b, h, sk]` = ~5 GiB/layer × 9 layers = 45 GiB resident;
+  fused `[b, sq, sk]` = 640 MiB/layer × 9 = 5.7 GiB). Without this gate,
+  MBS=10 is impossible regardless of CG_FLAGS.
 - **Do NOT enable**: `CPPMEGA_MTP_NATIVE_HOPPER_CE=1` — produces
   `grad_norm=NaN`, Suspects #1+#2 both empirically refuted on bench3
   (2026-04-14). Suspects #3-5 (shared-weight dual-bwd, mask handling,
