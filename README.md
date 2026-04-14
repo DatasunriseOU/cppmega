@@ -153,8 +153,18 @@ iters 3-25. CG must be OFF at PP=1 (TE CG private pool = 39.5 GiB).
 
 ### Megatron Version
 
-Branch `dev_latest` on top of NVIDIA/Megatron-LM `dev`:
-- `core_v0.15.0rc7` + PR #3674 (DSA absorbed MLA) + PR #4268 (delayed wgrad overlap)
+Branch `dev_latest` on top of NVIDIA/Megatron-LM `dev`, with per-machine divergence:
+
+| Machine | Version | Base | Our patches | Notes |
+|---|---|---|---|---|
+| bench3  | `megatron-core 0.16.0rc0` | tarball snapshot (no `.git`) | PR #3345 cherry-pick + DSA integration | 2026-04-14 backup: `sftp://BUCKET_ARTIFACTS/backups/backup_bench3_2026_04_14/megatron_lm_tree.tar.gz`. Upstream commit unverified — see `docs/megatron_restoration_recipe.md` |
+| europe  | `megatron-core 0.16.0rc0` | NVIDIA/Megatron-LM `origin/dev` | 2 commits ahead on `dev_latest` branch | HEAD = `ec6a9e900` (cherry-pick of PR #4268 on top of `2eeabc668` which merges PR #3674 — DSA absorbed MLA + TileLang fused sparse ops) |
+| GB10    | n/a     | n/a  | n/a       | GB10 is bwd_bwd/kernel dev only, no megatron install |
+
+Both H200 hosts are on `0.16.0rc0` (verified from `megatron/core/package_info.py`).
+The earlier README claim of `0.18` was wrong. See
+`docs/megatron_restoration_recipe.md` for full base-commit recovery + patch
+listing.
 
 ### Software Stack
 
@@ -162,7 +172,7 @@ Branch `dev_latest` on top of NVIDIA/Megatron-LM `dev`:
 - Transformer Engine 2.13
 - TileLang 0.1.8+cuda.gitf309d814 (main-branch build; install via `scripts/install_tilelang_wheel.sh` or source)
 - mamba-ssm 2.3.1
-- Megatron Core 0.18
+- Megatron Core 0.16.0rc0 (both bench3 and europe; see Megatron Version above)
 - NVIDIA Apex (from source)
 - dualpipe 1.0.0+030ce43 (from github)
 - liger-kernel
