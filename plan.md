@@ -43,6 +43,21 @@ Archived baseline: `/mnt/data/cppmega-root/cppmega/c1f1b_baseline_v3.log`
 **Do not ship the v3 + overlap combo** until fix. v3 baseline
 (no overlap) is already validated at 257 TFLOP/s.
 
+### Option (b) fix LANDED (2026-04-14 late — commit 239b4c9)
+
+`_HybridPostProcessNode._do_forward` now guards `process_mtp_loss` with
+`_has_mtp_blocks` check — inspects `model.mtp.layers` / `.mtp_modules`
+list. If MTP module wasn't constructed (e.g., because `_relaxed_post_init`
+flipped `mtp_num_layers=None` during init), the loss call is skipped.
+Normal MTP path (mtp constructed) unchanged.
+
+**Test plan** (next session):
+1. bench3: re-run `CPPMEGA_EP_OVERLAP=1` with VARIANT=v3 to verify
+   overlap no longer crashes at iter 0.
+2. If clean: measure overlap TFLOP/s vs 257 baseline. Expected +3-5%
+   from A2A hide (if we're not already compute-bound).
+3. If regression: confirm "overlap not useful single-node" and drop.
+
 ## Test iter 14 finding (2026-04-14 late evening)
 
 **bench3 PP=1 EP=8 (VARIANT=v3) baseline stable at 257 TFLOP/s** (iters
