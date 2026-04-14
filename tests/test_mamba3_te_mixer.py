@@ -5,11 +5,18 @@ Tests that require the ``megatron`` package are skipped when it is not installed
 (the module only runs on the remote H200 bench).
 """
 
-import importlib
-
 import pytest
 
-_has_megatron = importlib.util.find_spec("megatron") is not None
+# ``find_spec("megatron")`` alone is unsafe here: an earlier test may have
+# installed a ``MagicMock`` stub (possibly with or without a real
+# ``ModuleSpec``).  Use the shared helper which (a) treats a stub as
+# "not installed" and (b) ensures future ``find_spec`` calls don't raise
+# ``ValueError: megatron.__spec__ is not set`` on Python 3.12+.
+from tests._megatron_stub import install_megatron_stub, is_real_megatron_available
+
+_has_megatron = is_real_megatron_available()
+if not _has_megatron:
+    install_megatron_stub()
 
 
 # ---------------------------------------------------------------------------

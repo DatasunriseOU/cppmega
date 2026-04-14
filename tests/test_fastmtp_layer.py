@@ -3,35 +3,15 @@
 from __future__ import annotations
 
 import sys
-from unittest.mock import MagicMock
 
 import pytest
 import torch
 
-# Stub out megatron imports for local testing
-if "megatron" not in sys.modules:
-    from importlib.machinery import ModuleSpec
+# Stub out megatron imports for local testing.  Uses the shared helper so
+# the ``__spec__`` handling stays consistent across the test suite.
+from tests._megatron_stub import install_megatron_stub
 
-    _megatron = MagicMock()
-    # A real ``ModuleSpec`` is required so that downstream tests that call
-    # ``importlib.util.find_spec("megatron")`` during their collection phase
-    # (Python 3.12+ enforces ``module.__spec__`` be a valid ModuleSpec) do
-    # not raise ``ValueError: megatron.__spec__ is not set``.
-    for _name in (
-        "megatron",
-        "megatron.core",
-        "megatron.core.tensor_parallel",
-        "megatron.core.transformer",
-        "megatron.core.transformer.module",
-        "megatron.core.transformer.transformer_config",
-    ):
-        _mod = _megatron
-        for _part in _name.split(".")[1:]:
-            _mod = getattr(_mod, _part)
-        _mod.__spec__ = ModuleSpec(_name, loader=None)
-        sys.modules[_name] = _mod
-    # Provide a base class for MegatronModule
-    _megatron.core.transformer.module.MegatronModule = torch.nn.Module
+install_megatron_stub()
 
 from cppmega.megatron.fastmtp_layer import (
     _compute_step_weights,

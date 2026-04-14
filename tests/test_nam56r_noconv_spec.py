@@ -18,11 +18,25 @@ builder doesn't raise at import and the resulting spec has the expected shape.
 import ast
 import importlib
 import pathlib
+import sys
 
 import pytest
 
-_has_megatron = importlib.util.find_spec("megatron") is not None
-_has_mamba_ssm = importlib.util.find_spec("mamba_ssm") is not None
+# See tests/_megatron_stub.py: an earlier test may have installed a MagicMock
+# stub for megatron, which breaks both ``find_spec`` (on Python 3.12+) and
+# naive ``is not None`` checks.  Use the shared helper to get a correct
+# "real install?" answer and to ensure ``find_spec`` never raises.
+from tests._megatron_stub import install_megatron_stub, is_real_megatron_available
+
+_has_megatron = is_real_megatron_available()
+if not _has_megatron:
+    install_megatron_stub()
+
+try:
+    _has_mamba_ssm = importlib.util.find_spec("mamba_ssm") is not None
+except ValueError:
+    sys.modules.pop("mamba_ssm", None)
+    _has_mamba_ssm = False
 
 _repo_root = pathlib.Path(__file__).parent.parent
 _spec_path = _repo_root / "cppmega" / "megatron" / "nam56r_noconv_spec.py"
