@@ -18,6 +18,32 @@ in; see `docs/fp8_research_session_2026_04_14.md` for session context.
 Expected max gain from this 10-hour block: **+5-8% TFLOP/s** if P1 full
 lands. Target: bench3 ~270 / europe ~310 = ~31% MFU.
 
+## Stretch target reality check (test-loop steering)
+
+User's test-loop directive: **250k tok/sec** and **MFU > 50%** on 8×H200.
+
+| metric | baseline | this-block ceiling | stretch target | feasibility |
+|---|---|---|---|---|
+| TFLOP/s | 289 | ~347 (35%) | 495 (50%) / 982 (99%) | 50% = months of research; 99% = impossible |
+| tok/sec | 74,000 | ~89,000 | 125,000 (50% MFU) / **250,000 (99% MFU)** | 250k = at HW peak |
+| Gap vs 250k | 3.4× | 2.8× | — | — |
+
+**Honest conclusion**: 250k tok/sec and 50% MFU are **aspirational
+long-term goals**, not achievable in 10 hours. Realistic ceiling with
+current Mamba3+MLA+DSA+MoE architecture and TileLang 0.1.8 kernels is
+~35-37% MFU (~105-110k tok/sec). Beyond that requires:
+
+- CUTLASS-level persistent kernel rewrites (FA-4 pattern, months)
+- Custom PTX for Mamba scan (weeks, uncertain perf)
+- Architecture surgery (remove MLA for DSA-only, replace Mamba3 with
+  Mamba-2 SSD — quality regression)
+- Multi-node scale-out (beats 8-GPU efficiency for large-seq workloads)
+
+This 10-hour block pursues the **achievable part** (~+7% via P1 full)
+and the **groundwork** for future research (upstream PRs, P2 correct
+impl, P3 design). We DO NOT claim to hit 50% MFU; we honestly target
+31-35% and document the ceiling.
+
 ---
 
 ## Hour 0-2 — Wait + apply TMA fix on first free H200
@@ -135,16 +161,14 @@ After DualPipeV decision, if time remains:
 
 Once P1 is landed + P2 is sketched, outward contributions:
 
-- [ ] **TileLang upstream issue**: file a repro for the `LowerBulkCopy`
-  3D-smem bug. Use `scripts/exploration/tma_layout_repro.py` + detailed
-  diagnosis from GB10 agent. Link to our `apply_mamba3_mimo_tma_layout_fix.py`
-  as workaround. Title: *"LowerBulkCopy requires 2D smem layout for TMA
-  — Mamba3 bwd kernels need 3D→2D refactor as workaround"*.
-- [ ] **state-spaces/mamba PR (draft)**: 3D→2D refactor is a clean
-  correctness improvement independent of TMA (flattens QK_DOT and Q/K
-  shared-memory layouts, reduces one rank on multiple tensors). Draft
-  the PR body in `upstream_prs/07_mamba3_mimo_3d_to_2d_smem_refactor.md`
-  — do NOT post until user approval per memory `feedback_pr_approval.md`.
+- [x] **TileLang upstream issue draft**: written to
+  `upstream_prs/08_tilelang_tma_bulk_copy_3d_smem_issue.md` (pulled
+  forward during test-loop iteration since GB10 was busy with TMA fix
+  only).  Ready to post pending user approval.
+- [x] **state-spaces/mamba PR draft**: written to
+  `upstream_prs/07_mamba3_mimo_3d_to_2d_smem_refactor.md` (same test
+  iteration). Contains full correctness table (14 gradients), site list,
+  rationale. Ready to open PR after H200 perf numbers confirm the win.
 - [ ] **README refresh**:
   - Update throughput results table with post-P1 measurements
   - Remove the mythical DualPipeV 205 TFLOP/s row (or mark experimental)
