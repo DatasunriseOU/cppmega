@@ -1,5 +1,22 @@
 # NAM56R optimization plan — next 10 hours
 
+## Hard rules for this cycle (enforced)
+
+- **NEVER open PRs / issues / comments in external projects (state-spaces,
+  tile-ai, NVIDIA, Dao-AILab, etc.) without explicit user request AND
+  explicit approval of the exact text.** Drafting into `upstream_prs/*.md`
+  is fine; running `gh` write commands against third-party repos is not.
+  Reinforced 2026-04-14.  See memory `feedback_pr_approval.md`.
+- No silent fallbacks. Crash loudly on failure, no try/except that hides
+  errors. See `feedback_no_silent_fallbacks.md`.
+- Apply `apply_dsa_cg_patches.py` after any Megatron-side state change.
+- PP=1 on H200 requires CG disabled (TE CG pool eats 39.5 GiB).
+- TP>1 for Mamba3 MIMO is a net loss on single-node H200 (3.2× slower);
+  do not propose it. See `project_mamba3_tp_is_net_loss.md`.
+- CP direction closed (architectural trade-off, not bug). See
+  `reference_cp_blocked_by_custom_mixers.md`.
+
+
 Written 2026-04-14 after TMA layout fix validated on GB10 (branch
 `tma-layout-fix-3d-to-2d` @ `31dc695`). Plan is revised as results come
 in; see `docs/fp8_research_session_2026_04_14.md` for session context.
@@ -50,14 +67,61 @@ impl, P3 design). We DO NOT claim to hit 50% MFU; we honestly target
 
 **Blocker**: both H200 currently busy. Work runs opportunistically.
 
-- [ ] When bench3 selective-P1 agent returns: review result
-  - If +1% neutral: the selective fwd-only patch lands, but TMA fix will
-    make it obsolete in hour 2
-  - If OOM/crash: debug the race-condition fix
-- [ ] When europe DualPipeV smoke returns: review result
-  - If works: good, reserve europe for full P1 measurement later
-  - If blocks: document blocker, close DualPipeV direction OR schedule
-    deeper debug in hour 6-8 block
+### Live findings from running agents (test-iter 2)
+
+Observed via partial output sampling (not committed-SHA-yet):
+
+**bench3 selective P1 agent (a417bac3f9cee042b)** — found a subtle
+patch bug:
+- `mamba_ssm/__init__.py` auto-imports `Mamba3` which transitively
+  imports `mamba3_mimo_forward` BEFORE `apply_all()` runs in our shim.
+- `co_firstlineno` of `mamba_mimo_fwd_kernel` is cached at import time.
+- Our patch inserts a new `TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE`
+  line, shifting subsequent lines down by 1.
+- `inspect.getsource(func)` via `linecache` reads the new file at the
+  OLD line number → grabs partial function → `IndentationError`.
+
+**Root-cause fix options** (agent is picking one):
+1. Make patch preserve line count (replace an existing whitespace line
+   instead of inserting a new one).
+2. Invalidate `linecache.clearcache()` after patching.
+3. Run `apply_all()` before `import mamba_ssm` — requires earlier hook
+   point in shim (before `mamba_ssm`'s own `__init__.py` pulls Mamba3).
+
+Likely ship option 1 (minimal invasive); maybe also clear linecache
+for belt-and-suspenders.
+
+**europe DualPipeV agent (a23dd1434fcf36945)** — found an architectural
+incompatibility with MoE expert-parallelism:
+- DualPipeV V-shape puts different pipe_ranks on different layers at
+  the same time (rank 0 in stage 0 layer 12; rank 1 in stage 1 layer
+  18 simultaneously).
+- EP=4 spans the full world (ranks 0-3 in one EP group, 4-7 in
+  another). DeepEP's `fused_dispatch` A2A requires ALL EP peers to hit
+  the SAME MoE layer's A2A call at the same time.
+- With DualPipeV: rank 0 (pipe_rank 0) at MoE in layer 12, rank 1
+  (pipe_rank 1) at MoE in layer 18 (or wherever stage 1 is). They
+  never synchronize on the same collective → deadlock inside
+  `deep_ep/buffer.py:97 all_gather_object`.
+
+**Current attempt**: agent is retrying with `VARIANT=v0` (EP=1, no
+expert parallelism) to at least verify DualPipeV works on dense
+layers. If that works, we know the DualPipeV mechanics are correct —
+the limitation is EP is incompatible with DualPipeV V-shape.
+
+**Implication**: if DualPipeV is to ever ship for NAM56R with MoE, we'd
+need **EP scoped within pipe_rank** (e.g., EP=2 across ranks at same
+pipe_rank), or EP disabled entirely. This is significantly narrower
+than the initial hope and likely makes DualPipeV unviable for
+production (we need EP=4 for memory/expert distribution).
+
+### Action items when agents return
+
+- [ ] When bench3 selective-P1 agent returns: review IndentationError
+  fix. If clean + TFLOP/s measured: land as interim win (~1.3-1.8%).
+- [ ] When europe DualPipeV EP=1 retry returns: if works, document
+  "DualPipeV works on dense but fundamentally incompatible with EP";
+  close direction and stop spending cycles on it.
 - [ ] Immediately when a H200 frees: **launch full P1 + TMA fix smoke**:
   - Apply: `apply_mamba3_mimo_p1_patches` + `apply_mamba3_mimo_tma_layout_fix`
   - Config: PP=1 EP=4 MBS=8 no-CG FP8 tensorwise, 25 iters
