@@ -41,52 +41,31 @@ Usage::
     from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_patch
     apply_dsa_indexer_fused_patch()  # call after Megatron imports, before training
 
-Gate: ``CPPMEGA_DSA_INDEXER_FUSED=0`` disables (default is ON).
-
-Applied idempotently. No backward changes — upstream ``_compute_index_scores``
-is not autograd-aware (called under ``torch.no_grad()`` in the fwd path and
+Applied unconditionally. This patch is mandatory for production at
+MBS=10 NAM56R — upstream ``_compute_index_scores`` materialises
+``[sq, b, h, sk]`` fp32 = ~5 GiB/layer held by autograd for backward;
+9 DSA layers => ~45 GiB resident.  Fused per-head ``[b, sq, sk]`` =
+640 MiB/layer => ~5.7 GiB resident.  Net save ~40 GiB; without the fused
+path MBS=10 is impossible, period.  No env gate — install or raise.
+No backward changes — upstream ``_compute_index_scores`` is not
+autograd-aware (called under ``torch.no_grad()`` in the fwd path and
 inside a custom-autograd recompute in the bwd).
 """
 
 from __future__ import annotations
 
 import logging
-import os
 
 import torch
 
 log = logging.getLogger(__name__)
 
 __all__ = [
-    "DSA_INDEXER_FUSED_ENV",
     "apply_dsa_indexer_fused_patch",
     "compute_index_scores_fused_bf16",
 ]
 
-DSA_INDEXER_FUSED_ENV = "CPPMEGA_DSA_INDEXER_FUSED"
-
 _PATCH_MARKER = "__cppmega_dsa_indexer_fused_patched__"
-
-
-def _fused_enabled() -> bool:
-    """Return True when the fused per-head patch should be installed.
-
-    Default: ON.  Set ``CPPMEGA_DSA_INDEXER_FUSED=0`` to fall back to the
-    upstream allocation-heavy einsum path (debug only).
-
-    Memory accounting (NAM56R MBS=10, b=10, sq=sk=4096, h=8, fp32):
-      * Upstream einsum ``[sq, b, h, sk]``: ~5 GiB *per DSA layer call*,
-        held by autograd for backward.  9 DSA layers => ~45 GiB resident.
-      * Our per-head streamed ``[b, sq, sk]``: ~640 MiB per layer call.
-        9 layers => ~5.7 GiB resident.
-      * Net save vs upstream: ~40 GiB at MBS=10.
-
-    Verified GB10 rel_err 1.6e-7 on production NAM56R shapes (PR 12
-    reproducer at upstream_prs/examples/12_dsa_indexer_memory/).
-    """
-
-    val = os.environ.get(DSA_INDEXER_FUSED_ENV, "1").strip()
-    return val != "0"
 
 
 def compute_index_scores_fused_bf16(
@@ -157,18 +136,10 @@ def compute_index_scores_fused_bf16(
 def apply_dsa_indexer_fused_patch(*, force: bool = False) -> bool:
     """Monkey-patch ``dsa._compute_index_scores`` with the fused variant.
 
-    Idempotent.  Returns ``True`` if the patch was applied (or already
-    present), ``False`` if the env var disabled it.
-
-    No-op when ``CPPMEGA_DSA_INDEXER_FUSED=0``.
+    Idempotent.  Always installs — no env gate.  Raises on any failure;
+    production MBS=10 is impossible without this patch (see module
+    docstring for the ~40 GiB memory accounting).
     """
-
-    if not _fused_enabled():
-        log.info(
-            "cppmega DSA indexer fused patch skipped "
-            "(CPPMEGA_DSA_INDEXER_FUSED=0)"
-        )
-        return False
 
     from megatron.core.transformer.experimental_attention_variant import dsa as dsa_mod
 

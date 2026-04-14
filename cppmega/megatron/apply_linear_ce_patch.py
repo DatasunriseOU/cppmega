@@ -483,67 +483,64 @@ def _install_liger_compute(
 def patch_mamba_output_layer_with_linear_ce() -> None:
     """Monkey-patch MambaModel.__init__ to swap output_layer class.
 
-    Safe to call unconditionally — does nothing unless
-    ``CPPMEGA_MAIN_HEAD_LINEAR_CE=1`` is set.
+    Always installs — no env gate.  Upstream Megatron ``MambaModel`` uses
+    plain ``ColumnParallelLinear`` for output_layer while ``GPTModel`` uses
+    ``LinearCrossEntropyModule`` (PR #3226 wired both, PR #3207 silently
+    reverted Mamba — see upstream_prs/11_megatron_mamba_linear_ce_module.md).
+    Without this class swap the fused linear CE path raises TypeError on
+    ``output_cross_entropy_loss`` / ``labels`` kwargs, forcing the vanilla
+    CE path which materialises ~12 GiB FP32 logits — MBS=10 OOM.
+
+    Raises on any import/install failure — config is invalid, don't
+    silently degrade.
     """
-    if os.environ.get("CPPMEGA_MAIN_HEAD_LINEAR_CE", "0") != "1":
-        return
 
-    try:
-        from megatron.core import tensor_parallel
-        from megatron.core.models.mamba.mamba_model import MambaModel
-        from megatron.core.transformer.linear_cross_entropy import (
-            LinearCrossEntropyModule,
+    from megatron.core import tensor_parallel
+    from megatron.core.models.mamba.mamba_model import MambaModel
+    from megatron.core.transformer.linear_cross_entropy import (
+        LinearCrossEntropyModule,
+    )
+
+    # Re-route fused kernel to CCE (preferred) or Liger (fallback) on
+    # Hopper so the native path doesn't hit
+    # ``ValueError: Unsupported architecture: 9``.
+    _patch_linear_ce_route_to_liger()
+
+    _orig_init = MambaModel.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        _orig_init(self, *args, **kwargs)
+
+        # Only swap on post_process rank where output_layer exists.
+        if not hasattr(self, "output_layer"):
+            return
+        if not isinstance(self.output_layer, tensor_parallel.ColumnParallelLinear):
+            return
+        if isinstance(self.output_layer, LinearCrossEntropyModule):
+            return  # already correct
+
+        cfg = self.config
+        want_fusion = (
+            getattr(cfg, "cross_entropy_loss_fusion", False)
+            and getattr(cfg, "cross_entropy_fusion_impl", None) == "linear"
         )
+        if not want_fusion:
+            return
 
-        # Re-route fused kernel to CCE (preferred) or Liger (fallback) on
-        # Hopper so the native path doesn't hit
-        # ``ValueError: Unsupported architecture: 9``.
-        _patch_linear_ce_route_to_liger()
+        # LinearCrossEntropyModule is a pure subclass of ColumnParallelLinear
+        # that adds an `output_cross_entropy_loss` kwarg to forward(). All
+        # attributes (weight, bias, config, tp_group, etc.) are compatible,
+        # so __class__ reassignment is safe.
+        self.output_layer.__class__ = LinearCrossEntropyModule
 
-        _orig_init = MambaModel.__init__
+        # Ensure fuse_linear_cross_entropy flag reflects the swap so the
+        # mamba_model.forward() branch at line 482-486 uses the fused path.
+        self.fuse_linear_cross_entropy = True
 
-        def _patched_init(self, *args, **kwargs):
-            _orig_init(self, *args, **kwargs)
-
-            # Only swap on post_process rank where output_layer exists.
-            if not hasattr(self, "output_layer"):
-                return
-            if not isinstance(self.output_layer, tensor_parallel.ColumnParallelLinear):
-                return
-            if isinstance(self.output_layer, LinearCrossEntropyModule):
-                return  # already correct
-
-            cfg = self.config
-            want_fusion = (
-                getattr(cfg, "cross_entropy_loss_fusion", False)
-                and getattr(cfg, "cross_entropy_fusion_impl", None) == "linear"
-            )
-            if not want_fusion:
-                return
-
-            # LinearCrossEntropyModule is a pure subclass of ColumnParallelLinear
-            # that adds an `output_cross_entropy_loss` kwarg to forward(). All
-            # attributes (weight, bias, config, tp_group, etc.) are compatible,
-            # so __class__ reassignment is safe.
-            self.output_layer.__class__ = LinearCrossEntropyModule
-
-            # Ensure fuse_linear_cross_entropy flag reflects the swap so the
-            # mamba_model.forward() branch at line 482-486 uses the fused path.
-            self.fuse_linear_cross_entropy = True
-
-            print(
-                "[cppmega] main-head linear_cross_entropy fusion enabled "
-                "(MambaModel.output_layer -> LinearCrossEntropyModule)"
-            )
-
-        MambaModel.__init__ = _patched_init
-
-    except Exception as exc:  # pragma: no cover
         print(
-            f"[cppmega] main-head linear_cross_entropy patch FAILED: {exc}",
-            file=sys.stderr,
+            "[cppmega] main-head linear_cross_entropy fusion enabled "
+            "(MambaModel.output_layer -> LinearCrossEntropyModule)"
         )
-        import traceback
 
-        traceback.print_exc(file=sys.stderr)
+    MambaModel.__init__ = _patched_init
+
