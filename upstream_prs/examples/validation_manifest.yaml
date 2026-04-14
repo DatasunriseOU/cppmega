@@ -38,7 +38,7 @@ prs:
       repo: "NVIDIA/Megatron-LM"
       issue_or_pr: null
       state: "new_report"
-      verified_via: "gh api"
+      verified_via: "gh api 2026-04-14"
 
   "02_sparse_mla_dimensions":
     local_path: "upstream_prs/examples/02_sparse_mla_dimensions/reproducer.py"
@@ -53,7 +53,7 @@ prs:
       repo: "NVIDIA/Megatron-LM"
       issue_or_pr: null
       state: "new_report"
-      verified_via: "gh api"
+      verified_via: "gh api 2026-04-14"
 
   "03_sparse_mla_fp8_dispatch":
     local_path: "upstream_prs/examples/03_sparse_mla_fp8_dispatch/reproducer.py"
@@ -72,7 +72,7 @@ prs:
       repo: "NVIDIA/TransformerEngine"
       issue_or_pr: null
       state: "new_report"
-      verified_via: "gh api"
+      verified_via: "gh api 2026-04-14"
 
   "04_mamba3_siso_bwd_vdot":
     local_path: "upstream_prs/examples/04_mamba3_siso_bwd_vdot/reproducer.py"
@@ -87,7 +87,12 @@ prs:
       repo: "state-spaces/mamba"
       issue_or_pr: null
       state: "new_report"
-      verified_via: "gh api"
+      verified_via: "gh api 2026-04-14"
+      related_prs:
+        - number: 868
+          state: "closed"
+          title: "mamba3_siso_bwd_kernel_dqkv fails with bf16 inputs due to dtype mismatch in tl.dot"
+          note: "Adjacent siso bwd kernel issue; already closed, informational."
 
   "05_mamba3_dt_fp32_gqa_bwd":
     local_path: "upstream_prs/examples/05_mamba3_dt_fp32_gqa_bwd/reproducer.py"
@@ -105,7 +110,12 @@ prs:
       repo: "state-spaces/mamba"
       issue_or_pr: null
       state: "new_report"
-      verified_via: "gh api"
+      verified_via: "gh api 2026-04-14"
+      related_prs:
+        - number: 886
+          state: "open"
+          title: "Mamba3 backward pass crashes with misaligned address when nheads % 4 != 0 and seqlen % 4 != 0"
+          note: "Open mamba3 bwd correctness issue; our GQA fix touches adjacent code."
 
   "07_mamba3_mimo_3d_to_2d_smem":
     local_path: "upstream_prs/examples/07_mamba3_mimo_3d_to_2d_smem/reproducer.py"
@@ -115,12 +125,20 @@ prs:
       exit_code: 0
       output_tags: ["LEGALITY_PROVED"]
       log_location: null
-      notes: "Legality proof for 3D->2D smem descriptor rewrite; verified on GB10 (sm_121a)."
+      notes: >-
+        Legality proof for 3D->2D smem descriptor rewrite in
+        mamba3_mimo_bwd.py; verified on GB10 (sm_121a). The refactor
+        unblocks TileLang TMA lowering for bwd_fwd/bwd_bwd.
     upstream_status:
-      repo: "tile-ai/tilelang"
+      repo: "state-spaces/mamba"
       issue_or_pr: null
       state: "new_report"
-      verified_via: "gh api"
+      verified_via: "gh api 2026-04-14"
+      notes: >-
+        CORRECTION: manifest previously said tile-ai/tilelang. Template
+        explicitly targets state-spaces/mamba (mamba3_mimo_bwd.py lives
+        there). The TileLang-side blocker for bwd_bwd lowering is pack 13,
+        not pack 07.
 
   "08_tilelang_tma_bulk_copy_3d_smem":
     local_path: "upstream_prs/examples/08_tilelang_tma_bulk_copy_3d_smem/reproducer.py"
@@ -132,13 +150,15 @@ prs:
       log_location: null
       notes: >-
         Regression test for TileLang LowerBulkCopy 3D smem path.
-        Upstream PR #746 already merged the fix; this pack is a regression
-        test to keep it from breaking again.
+        Upstream PR #746 already merged the fix (confirmed closed+merged via
+        gh api 2026-04-14). Follow-ups #761 (1D TMA support, closed+merged
+        2025-08-28) and #2005 (1D TMA regression test for #1842, closed+merged
+        2026-04-14) also landed. Pack 08 is an internal regression test only.
     upstream_status:
       repo: "tile-ai/tilelang"
       issue_or_pr: 746
       state: "merged"
-      verified_via: "gh api"
+      verified_via: "gh api 2026-04-14"
 
   "09_liger_flce_reduction_none":
     local_path: "upstream_prs/examples/09_liger_flce_reduction_none/reproducer.py"
@@ -157,8 +177,17 @@ prs:
     upstream_status:
       repo: "linkedin/Liger-Kernel"
       issue_or_pr: 968
-      state: "open"
-      verified_via: "gh api"
+      state: "closed"
+      verified_via: "gh api 2026-04-14"
+      related_prs:
+        - number: 1126
+          state: "open"
+          draft: true
+          title: "Prevent FLCE backward when reduction=\"none\""
+          note: >-
+            Upstream draft PR #1126 only PREVENTS reduction='none' backward
+            (raises/errors); it does not fix the corruption. Our pack 09
+            fix provides the working mean-broadcast path.
 
   "10_megatron_flce_hopper":
     local_path: "upstream_prs/examples/10_megatron_flce_hopper/reproducer.py"
@@ -177,7 +206,12 @@ prs:
       repo: "NVIDIA/Megatron-LM"
       issue_or_pr: 3345
       state: "open"
-      verified_via: "gh api"
+      verified_via: "gh api 2026-04-14"
+      notes: >-
+        PR #3345 "Feature: Add Hopper kernels for fused linear cross entropy"
+        is open (not draft, updated 2026-03-23). Our pack 10 is a
+        complementary reproducer + regression note; file as issue commenting
+        on #3345, not as a competing PR.
 
   "11_mamba_linear_ce":
     local_path: "upstream_prs/examples/11_mamba_linear_ce/reproducer.py"
@@ -192,7 +226,15 @@ prs:
       repo: "NVIDIA/Megatron-LM"
       issue_or_pr: null
       state: "new_report"
-      verified_via: "gh api"
+      verified_via: "gh api 2026-04-14"
+      related_prs:
+        - number: 3226
+          state: "closed_merged"
+          title: "[DEV] Reapply fix Linear CE Fusion"
+        - number: 3207
+          state: "closed_merged"
+          title: "Reapply \"Add MTP support for hybrid models (#2363)\""
+          note: "Context for the MambaModel + MTP interaction in our pack."
 
   "12_dsa_indexer_memory":
     local_path: "upstream_prs/examples/12_dsa_indexer_memory/reproducer.py"
@@ -207,7 +249,26 @@ prs:
       repo: "NVIDIA/Megatron-LM"
       issue_or_pr: null
       state: "new_report"
-      verified_via: "gh api"
+      verified_via: "gh api 2026-04-14"
+      related_prs:
+        - number: 4039
+          state: "open"
+          draft: false
+          title: "[Kernel] Fused Indexer Loss Kernel"
+          author: "laixinn"
+          updated_at: "2026-03-27"
+          note: >-
+            OVERLAP: PR #4039 solves the same problem (avoid materializing
+            [seqlen_q, seqlen_k] tensor in DSA indexer) via split-K Triton
+            kernel (60% mem save, 32% perf hit; TP support deferred). Our
+            pack 12 uses per-head bf16 streaming accumulation (89% mem save,
+            no perf hit, no TP deferral). File as a COMPLEMENTARY approach
+            / comment on #4039 referencing this alternative, not as a
+            competing PR. See feedback_check_megatron_prs.md.
+        - number: 3674
+          state: "open"
+          title: "Enable DSA CP/absorbed/THD paths with TileLang fused ops"
+          note: "Our previously-applied patch (in-house), currently open upstream."
 
   "13_tilelang_floormod_dbz":
     local_path: "upstream_prs/examples/13_tilelang_floormod_dbz/reproducer.py"
@@ -225,4 +286,9 @@ prs:
       repo: "tile-ai/tilelang"
       issue_or_pr: null
       state: "new_report"
-      verified_via: "gh api"
+      verified_via: "gh api 2026-04-14"
+      related_prs:
+        - number: 904
+          state: "open"
+          title: "Mamba3 backward pass (mamba3_siso_bwd_kernel_dqkv) 38.7x slower on GB200 (SM100) due to ptxas C7907 eliminating autotuner configs"
+          note: "Our own already-filed GB200 perf issue in TileLang; same repo, adjacent code path."
