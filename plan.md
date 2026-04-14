@@ -1,5 +1,48 @@
 # NAM56R optimization plan — next 10 hours
 
+## combined_1f1b overlap PP=1 EP=8: BLOCKED by pre-existing MTP bug (2026-04-14)
+
+Parallel agent (me) ran the overlap test (`CPPMEGA_EP_OVERLAP=1`) with
+VARIANT=v3 (PP=1 EP=8) on bench3. **Both MTP_DEPTHS=2 and MTP_DEPTHS=1
+crash at iteration 0** with:
+
+```
+RuntimeError: The size of tensor a (4096) must match the size of tensor b (2048/1366)
+  at non-singleton dimension 1
+  cppmega/cppmega/megatron/mtp_liger_ce.py:178
+  mtp_loss = loss_mask * mtp_loss
+```
+
+**Root cause**: `cppmega/megatron/hybrid_schedule_plan.py`
+`_relaxed_post_init` flips `mtp_num_layers = None` when
+`overlap_moe_expert_parallel_comm=True AND PP==1` to bypass upstream
+`PP>1` assertion. But flipping to None during `__post_init__` causes
+the model to **skip MTP block construction entirely** — decoder emits
+`[s, b, h]` not `[(1+D)*s, b, h]`. Post-process node still calls
+`process_mtp_loss` which chunks by `1+config.mtp_num_layers=2 or 3`,
+yielding `[s/2, b, h]` or `[s/3, b, h]`. Then `loss_mask*mtp_loss`
+dies on the shape mismatch (`loss_mask` stays `[b, s]`).
+
+Baseline (same config WITHOUT `CPPMEGA_EP_OVERLAP`) is fine: 257
+TFLOP/s steady for iters 3-30, loss converges 11.95 → 4.96. Matches
+the 253 TFLOP/s EP=4 record with +1.6% win (already documented).
+Archived baseline: `/mnt/data/cppmega-root/cppmega/c1f1b_baseline_v3.log`
+(30 iters complete, max_alloc 111 GB/rank). Overlap failure logs:
+`c1f1b_overlap_mtp{1,2}_FAIL.log`.
+
+**Next steps to unblock overlap**:
+1. Fix `_relaxed_post_init` PP=1 path: either (a) keep
+   `mtp_num_layers` intact and find a different bypass for the PP>1
+   assert, or (b) skip `process_mtp_loss` in `_HybridPostProcessNode`
+   when mtp_num_layers was flipped.
+2. Or: make MTP block construction NOT depend on
+   `mtp_num_layers is None` gate (build MTP blocks based on a separate
+   flag that we preserve).
+3. Test overlap again after fix. Target: ≥260 TFLOP/s (EP A2A overlap).
+
+**Do not ship the v3 + overlap combo** until fix. v3 baseline
+(no overlap) is already validated at 257 TFLOP/s.
+
 ## Test iter 14 finding (2026-04-14 late evening)
 
 **bench3 PP=1 EP=8 (VARIANT=v3) baseline stable at 257 TFLOP/s** (iters
