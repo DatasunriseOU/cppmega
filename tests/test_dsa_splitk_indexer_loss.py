@@ -255,19 +255,7 @@ def test_splitk_larger_seq():
     )
 
 
-@_REQUIRES_CUDA
-def test_patch_routing_splitk(monkeypatch):
-    """Verify that CPPMEGA_DSA_KL_MODE=splitk is resolved correctly."""
-    from cppmega.megatron.dsa_fp8_patch import resolve_kl_mode
-
-    monkeypatch.setenv("CPPMEGA_DSA_KL_MODE", "splitk")
-    assert resolve_kl_mode() == "splitk"
-
-    monkeypatch.setenv("CPPMEGA_DSA_KL_MODE", "split-k")
-    assert resolve_kl_mode() == "splitk"
-
-    monkeypatch.setenv("CPPMEGA_DSA_KL_MODE", "")
-    assert resolve_kl_mode() == "head_streaming"
-
-    monkeypatch.delenv("CPPMEGA_DSA_KL_MODE", raising=False)
-    assert resolve_kl_mode() == "head_streaming"
+# NOTE: the ``resolve_kl_mode`` test was removed along with the
+# ``dsa_fp8_patch`` module on 2026-04-13. Routing now lives in
+# ``dsa_indexer_fused_patch`` and is exercised by
+# ``tests/test_dsa_indexer_fused_patch.py``.
