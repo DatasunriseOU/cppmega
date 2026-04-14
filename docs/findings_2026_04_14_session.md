@@ -376,3 +376,78 @@ Direct SSH `dave@H200_1_IP` возвращал Permission denied. Fix: pipe pubk
 3. **Validate Liger fix A** на чистом bench3 → измерить TFLOP/s
 4. **Re-test CCE 25.9.3** — реально OOM или TMA bug confound?
 5. **Implement P2 PsiV hoist** (5 дней, GB10-testable, +5-7 TFLOP/s)
+
+---
+
+## Session 3 afternoon — backup + PR filing prep
+
+### EN
+
+**Scope**: no new training runs; focus on capturing state + preparing upstream contributions.
+
+**Shipped**:
+
+1. **13 PR templates drafted** (C1…C13) covering: Liger FLCE `reduction="none"` bug, Megatron PR #3345 MTP extension, DSA indexer fused memory patch, TileLang TMA 3D→2D smem fallback, Apple CCE 25.9.3, `apply_linear_ce_patch.py` main-head swap, Mamba3 P1 patches, `mtp_native_hopper_ce.py`, mamba_ssm fork drift, bench3-specific `mamba3_mimo_bwd.py`, FP8 sparse MLA europe-only files, DualPipeV cleanup, combined_1f1b documentation. All local drafts — **nothing filed upstream** per `feedback_pr_approval.md`.
+2. **Reproducers** for each PR — smallest possible numeric-parity / regression reproduction.
+3. **`explanation_ru.md`** — RU-language narrative for each claim so user can review without English translation.
+4. **Backups → GS**:
+   - `sftp://BUCKET_ARTIFACTS/backups/backup_bench3_2026_04_14/` (17 MiB, 23 objects)
+   - `sftp://BUCKET_ARTIFACTS/backups/backup_europe_2026_04_14/` (full state + `.git` HEAD for each repo + format-patch of unpushed commits)
+5. **`docs/megatron_restoration_recipe.md`** — recovery procedure for bench3 megatron (no `.git` in tarball; best-effort upstream commit hypothesis `2eeabc668` pending diff confirmation).
+
+**MCP grounding results** (`.tmp/mcp_grounding_pr_claims.md`):
+
+- **Perplexity hallucination exposed**: Perplexity confidently attributed the Liger FLCE `reduction="none"` fix to **PR #680**. Grounding via exa + direct GitHub inspection shows #680 fixes non-fused `LigerCrossEntropy`, not `LigerFusedLinearCrossEntropy`. FLCE bug is unfixed. **Do not cite #680 in any upstream filing as a FLCE fix.**
+- PRs #968, #1126 are plausible but no MCP engine could independently confirm them. Verify on GitHub before quoting.
+
+**Diagnostic updates on MBS=12 backward NaN**:
+- Suspect #1 (`apply_linear_ce_patch.py` Liger routing): **refuted** — broadcast math is exact; NaN is not caused by this.
+- Suspect #2 (`CUDA_GRAPH_FLAGS=NONE` not propagating through TE `make_graphed_callables`): **pending** — test deferred to next session.
+
+**Drift discoveries (new this afternoon)**:
+- **Megatron version**: both bench3 and europe are on `0.16.0rc0`, NOT `0.18` as previously documented in README. Verified from `megatron/core/package_info.py`. README + memory notes updated.
+- **Bench3 megatron has NO `.git`**: flat tree only. Restoration recipe relies on `sftp://…/megatron_lm_tree.tar.gz` as authoritative.
+- **Europe 2 commits ahead of `origin/dev`**: `ec6a9e900` (PR #4268 cherry-pick) on top of `2eeabc668` (PR #3674 merge). Bench3 likely at `2eeabc668` only (PR #4268 path never exercised on bench3 which runs PP=1).
+- **mamba_ssm fork drift**: bench3 at `31f3d7b` + 4 modified files; europe at `31f3d7b` + 3 modified files + stock `.orig` copy. Previously assumed identical — they are not.
+- **FP8 sparse_mla files**: `tilelang_sparse_mla_{fwd,bwd}_fp8.py` + `__init__.py` exist ONLY on europe. Captured in `europe_megatron_modified.tar.gz`. Port to bench3 if FP8 sparse MLA ever targeted there.
+
+**Files created / modified this afternoon**:
+- NEW: `docs/megatron_restoration_recipe.md`
+- MODIFIED: `README.md` (Megatron Version section rewrite, Software Stack row)
+- MODIFIED: `plan.md` (afternoon session block)
+- MODIFIED: `docs/findings_2026_04_14_session.md` (this section)
+- NEW: 13 local PR-template drafts + reproducers + `explanation_ru.md` files (not yet committed — user approval gate)
+
+### RU
+
+**Scope**: никаких новых training runs; фокус на захвате state + подготовке upstream contributions.
+
+**Сделано**:
+
+1. **13 PR templates** (C1…C13): Liger FLCE bug, Megatron PR #3345 MTP extension, DSA indexer fused, TileLang TMA 3D→2D, Apple CCE 25.9.3, `apply_linear_ce_patch.py`, Mamba3 P1 patches, `mtp_native_hopper_ce.py`, mamba_ssm fork drift, bench3-specific `mamba3_mimo_bwd.py`, FP8 sparse MLA европейские файлы, DualPipeV cleanup, combined_1f1b docs. Все drafts local — **ничего не запушено** per `feedback_pr_approval.md`.
+2. **Reproducers** для каждого PR.
+3. **`explanation_ru.md`** для каждого PR — RU-narrative.
+4. **Backups → GS**:
+   - `sftp://BUCKET_ARTIFACTS/backups/backup_bench3_2026_04_14/`
+   - `sftp://BUCKET_ARTIFACTS/backups/backup_europe_2026_04_14/`
+5. **`docs/megatron_restoration_recipe.md`** — процедура восстановления bench3 megatron (нет `.git` в tarball'е).
+
+**MCP grounding results**:
+- **Perplexity hallucination**: PR #680 приписан фиксу FLCE — неправда. Реальный #680 фиксит non-fused `LigerCrossEntropy`. **Не цитировать #680 как FLCE fix в upstream filings.**
+- PRs #968, #1126 — plausible но не подтверждены независимо. Проверить на GitHub перед цитированием.
+
+**Диагностика MBS=12 backward NaN**:
+- Suspect #1 (`apply_linear_ce_patch.py`): **отвергнут** — математика broadcast корректна.
+- Suspect #2 (`CG_FLAGS=NONE` не propagates через TE): **pending** — отложено на следующую сессию.
+
+**Drift discoveries (новое за эту сессию)**:
+- **Megatron**: обе машины на `0.16.0rc0`, НЕ `0.18` как утверждал README. Проверено по `package_info.py`. README поправлен.
+- **Bench3 без `.git`**: flat tree. Recipe опирается на GS tarball.
+- **Europe 2 коммита впереди `origin/dev`**: `ec6a9e900` поверх `2eeabc668`. Bench3 вероятно только `2eeabc668`.
+- **mamba_ssm drift**: bench3 31f3d7b + 4 файла, europe 31f3d7b + 3 файла + `.orig` копия.
+- **FP8 sparse_mla файлы**: только на europe.
+
+**Файлы, созданные/изменённые сегодня днем**:
+- NEW: `docs/megatron_restoration_recipe.md`
+- MODIFIED: `README.md`, `plan.md`, `docs/findings_2026_04_14_session.md`
+- NEW: 13 local PR-template drafts (не закоммичены — approval gate)
