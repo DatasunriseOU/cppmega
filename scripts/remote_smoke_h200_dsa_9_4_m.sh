@@ -21,8 +21,26 @@ set -euo pipefail
 # does NOT source .bashrc on this machine.
 [ -f "${HOME}/.bashrc" ] && source "${HOME}/.bashrc"
 
-REMOTE_ROOT="${REMOTE_ROOT:-/home/dave/cppmega-root}"
-REMOTE_VENV="${REMOTE_VENV:-${REMOTE_ROOT}/cppmega-venv}"
+# Per-machine path autodetect. Bench3 lives on /mnt/data/, Europe on
+# /home/dave/. User can still override via REMOTE_ROOT / REMOTE_VENV env.
+if [ -z "${REMOTE_ROOT:-}" ]; then
+  if [ -d /mnt/data/cppmega-root ]; then
+    REMOTE_ROOT=/mnt/data/cppmega-root
+  elif [ -d /home/dave/cppmega-root ]; then
+    REMOTE_ROOT=/home/dave/cppmega-root
+  else
+    echo "[remote_smoke] FATAL: cannot autodetect REMOTE_ROOT (neither /mnt/data/cppmega-root nor /home/dave/cppmega-root exists). Set REMOTE_ROOT explicitly." >&2
+    exit 1
+  fi
+fi
+if [ -z "${REMOTE_VENV:-}" ]; then
+  # Bench3 venv is /mnt/data/venv; Europe venv is ${REMOTE_ROOT}/cppmega-venv.
+  if [ -d /mnt/data/venv ] && [ "${REMOTE_ROOT}" = "/mnt/data/cppmega-root" ]; then
+    REMOTE_VENV=/mnt/data/venv
+  else
+    REMOTE_VENV="${REMOTE_ROOT}/cppmega-venv"
+  fi
+fi
 VARIANT="${VARIANT:-v1}"
 RUN_ID="${RUN_ID:-cppmega_nam56r_dsa_9_4_fp8_m_${VARIANT}}"
 LOG="${LOG:-${REMOTE_ROOT}/cppmega/${RUN_ID}.log}"
@@ -74,16 +92,13 @@ export CPPMEGA_MAMBA_RECOMPUTE="${CPPMEGA_MAMBA_RECOMPUTE:-1}"
 export CPPMEGA_DSA_SKIP_INDEXER_LOSS="${CPPMEGA_DSA_SKIP_INDEXER_LOSS:-1}"
 export CPPMEGA_DSA_INDEXER_LOSS_COEFF="${CPPMEGA_DSA_INDEXER_LOSS_COEFF:-0}"
 export CPPMEGA_SELECTIVE_FP8_MOE="${CPPMEGA_SELECTIVE_FP8_MOE:-0}"
-export CPPMEGA_MTP_LIGER_CE="${CPPMEGA_MTP_LIGER_CE:-0}"
-# Native MTP linear CE (PR #3345 Hopper kernel) — requires
-# CPPMEGA_MAIN_HEAD_LINEAR_CE=1 and --cross-entropy-loss-fusion
-# --cross-entropy-fusion-impl linear in EXTRA_FLAGS. Mutually exclusive with
-# CPPMEGA_MTP_LIGER_CE=1.
+# CPPMEGA_MTP_LIGER_CE removed — MTP Liger CE is unconditional since dd4da34.
+# Patch installs at module load (cppmega/megatron/mtp_liger_ce.py).
+# Native MTP linear CE (PR #3345 Hopper kernel) — DO NOT enable: produces
+# grad_norm=NaN. Suspects #1+#2 empirically refuted on bench3, #3-5 pending.
 export CPPMEGA_MTP_NATIVE_HOPPER_CE="${CPPMEGA_MTP_NATIVE_HOPPER_CE:-0}"
-# These must be exported for subprocess (torch.distributed.run -> python)
-# to see them. Without explicit export, `env KEY=VAL bash` propagation
-# through the launcher has been observed to drop them on some shells.
-export CPPMEGA_MAIN_HEAD_LINEAR_CE="${CPPMEGA_MAIN_HEAD_LINEAR_CE:-0}"
+# CPPMEGA_MAIN_HEAD_LINEAR_CE removed — Mamba LinearCE class-swap is
+# unconditional since dd4da34 (cppmega/megatron/apply_linear_ce_patch.py).
 export CPPMEGA_PREFER_NATIVE_HOPPER_CE="${CPPMEGA_PREFER_NATIVE_HOPPER_CE:-0}"
 export CPPMEGA_LINEAR_CE_KERNEL="${CPPMEGA_LINEAR_CE_KERNEL:-auto}"
 export CPPMEGA_MAIN_HEAD_LIGER_NONFUSED="${CPPMEGA_MAIN_HEAD_LIGER_NONFUSED:-0}"
@@ -95,9 +110,8 @@ export CPPMEGA_LEMYX_DSA="${CPPMEGA_LEMYX_DSA:-0}"
 export CPPMEGA_DSA_FP8_ATTENTION="${CPPMEGA_DSA_FP8_ATTENTION:-0}"
 # IndexCache: cross-layer index reuse for DSA (skip indexer on 6/9 layers)
 export CPPMEGA_INDEX_CACHE="${CPPMEGA_INDEX_CACHE:-0}"
-# DSA indexer fused per-head accumulation: eliminates [sq,b,h,sk] FP32 intermediate
-# inside _compute_index_scores. Default ON (set to 0 only for debugging parity).
-export CPPMEGA_DSA_INDEXER_FUSED="${CPPMEGA_DSA_INDEXER_FUSED:-1}"
+# CPPMEGA_DSA_INDEXER_FUSED removed — fused per-head accumulation patch is
+# unconditional since dd4da34 (saves ~40 GiB at MBS=10 NAM56R).
 # Mamba3 MIMO P1: enable TMA + warp specialization in upstream TileLang kernels.
 # Opt-in until H200 perf is confirmed. See docs/mamba3_mimo_p1_notes.md.
 export CPPMEGA_MAMBA3_P1="${CPPMEGA_MAMBA3_P1:-0}"
@@ -302,13 +316,13 @@ if _ilc is not None:
     TransformerConfig.__post_init__ = _ilc_post_init
     print(f"[cppmega_mimo_shim] dsa_indexer_loss_coeff overridden to {_ilc_val}")
 
-# (12.5) DSA indexer fused per-head accumulation patch (CPPMEGA_DSA_INDEXER_FUSED=1,
-# default ON). Eliminates the [sq, b, h, sk] FP32 intermediate inside
-# _compute_index_scores. Must run BEFORE lemyx/IndexCache so those patches
-# see the fused implementation when they call fused_qk_topk_naive.
-if os.environ.get("CPPMEGA_DSA_INDEXER_FUSED", "1") != "0":
-    from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_patch
-    apply_dsa_indexer_fused_patch()
+# (12.5) DSA indexer fused per-head accumulation patch — UNCONDITIONAL since
+# dd4da34. Eliminates the [sq, b, h, sk] FP32 intermediate inside
+# _compute_index_scores (saves ~40 GiB at MBS=10 NAM56R). Must run BEFORE
+# lemyx/IndexCache so those patches see the fused implementation when they
+# call fused_qk_topk_naive. No env gate; raises on install failure.
+from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_patch
+apply_dsa_indexer_fused_patch()
 
 # (13) lemyx fused DSA warmup kernel (CPPMEGA_LEMYX_DSA=1)
 if os.environ.get("CPPMEGA_LEMYX_DSA", "0") == "1":
@@ -405,18 +419,20 @@ if os.environ.get("CPPMEGA_DUALPIPEV", "0") == "1":
     from cppmega.megatron.upstream_patches.apply_dualpipev_patch import apply as _apply_dualpipev
     _apply_dualpipev()
 
-# (9) MTP Liger fused CE (CPPMEGA_MTP_LIGER_CE=1)
-if os.environ.get("CPPMEGA_MTP_LIGER_CE", "0") == "1":
-    from cppmega.megatron.mtp_liger_ce import patch_mtp_loss_with_liger
-    patch_mtp_loss_with_liger()
+# (9) MTP Liger fused CE — UNCONDITIONAL since dd4da34. Saves 21 GiB MTP
+# logits materialization. Uses reduction="mean" + broadcast to sidestep
+# Liger FLCE #968 silent grad corruption. No env gate; raises on failure.
+from cppmega.megatron.mtp_liger_ce import patch_mtp_loss_with_liger
+patch_mtp_loss_with_liger()
 
-# (9b) Main-head linear CE fusion (CPPMEGA_MAIN_HEAD_LINEAR_CE=1)
-# Swaps MambaModel.output_layer from ColumnParallelLinear to LinearCrossEntropyModule,
-# which fuses GEMM + cross-entropy (no logits materialization, saves ~12 GiB at MBS=12).
-# Requires --cross-entropy-loss-fusion --cross-entropy-fusion-impl linear in EXTRA_FLAGS.
-if os.environ.get("CPPMEGA_MAIN_HEAD_LINEAR_CE", "0") == "1":
-    from cppmega.megatron.apply_linear_ce_patch import patch_mamba_output_layer_with_linear_ce
-    patch_mamba_output_layer_with_linear_ce()
+# (9b) Main-head linear CE fusion — UNCONDITIONAL since dd4da34. Swaps
+# MambaModel.output_layer from ColumnParallelLinear to LinearCrossEntropyModule
+# (fixes upstream Megatron PR #3226→#3207 regression). Fused GEMM+CE saves
+# ~12 GiB FP32 logits at MBS=12. Requires --cross-entropy-loss-fusion
+# --cross-entropy-fusion-impl linear in EXTRA_FLAGS to actually use the
+# fused path. No env gate; raises on failure.
+from cppmega.megatron.apply_linear_ce_patch import patch_mamba_output_layer_with_linear_ce
+patch_mamba_output_layer_with_linear_ce()
 
 # (9c) MTP native Hopper CE (CPPMEGA_MTP_NATIVE_HOPPER_CE=1)
 # Wires MTP head through the same LinearCrossEntropyModule class swap used by
@@ -664,10 +680,8 @@ echo "DSA_A_LAYER_RANKS=${CPPMEGA_DSA_A_LAYER_RANKS}"
 echo "DSA path: lemyx + IndexCache"
 echo "CPPMEGA_DSA_FP8_ATTENTION=${CPPMEGA_DSA_FP8_ATTENTION}"
 echo "CPPMEGA_INDEX_CACHE=${CPPMEGA_INDEX_CACHE}"
-echo "CPPMEGA_DSA_INDEXER_FUSED=${CPPMEGA_DSA_INDEXER_FUSED}"
-echo "CPPMEGA_MTP_LIGER_CE=${CPPMEGA_MTP_LIGER_CE}"
-echo "CPPMEGA_MTP_NATIVE_HOPPER_CE=${CPPMEGA_MTP_NATIVE_HOPPER_CE}"
-echo "CPPMEGA_MAIN_HEAD_LINEAR_CE=${CPPMEGA_MAIN_HEAD_LINEAR_CE:-0}"
+echo "Always-on (no env): DSA indexer fused, Mamba LinearCE swap, MTP Liger CE"
+echo "CPPMEGA_MTP_NATIVE_HOPPER_CE=${CPPMEGA_MTP_NATIVE_HOPPER_CE} (DO NOT enable until NaN root-caused)"
 echo "CPPMEGA_PREFER_NATIVE_HOPPER_CE=${CPPMEGA_PREFER_NATIVE_HOPPER_CE:-0}"
 echo "EXTRA_FLAGS=${EXTRA_FLAGS}"
 echo "LOG=${LOG}"
