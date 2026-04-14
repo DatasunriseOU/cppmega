@@ -194,6 +194,12 @@ def apply_all():
     # === Patch 9: dsa.py — FP8 SparseMLA dispatch in _fused_sparse_mla_absorbed ===
     # Zero-copy FP8: pass TE Float8Tensor directly to SparseMLA_FP8 which
     # extracts _data + _scale_inv internally, avoiding dequantize+requantize.
+    #
+    # Compatibility note for CPPMEGA_SELECTIVE_FP8_MOE=1:
+    #   The selective-FP8-MoE patch wraps attention forwards in nullcontext, so
+    #   query/key arrive as BF16 (not QuantizedTensor). The isinstance check
+    #   below evaluates False, _use_fp8_mla stays False, and regular SparseMLA
+    #   (BF16) runs. This is what keeps Selective FP8 MoE and DSA compatible.
     print("Patch 9: dsa.py FP8 SparseMLA dispatch (zero-copy)")
     _patch_file(dsa_file, [
         (
@@ -208,6 +214,8 @@ def apply_all():
     # cppmega: detect FP8 inputs and dispatch to SparseMLA_FP8 for 2x throughput.
     # Float8Tensors are passed through directly — SparseMLA_FP8 extracts raw
     # FP8 data + scale zero-copy, avoiding dequantize+requantize round-trip.
+    # Selective FP8 MoE: when that patch is active, attention runs in
+    # nullcontext so query/key are BF16 and this branch is skipped.
     _use_fp8_mla = False
     try:
         from transformer_engine.pytorch.tensor import QuantizedTensor
@@ -235,6 +243,26 @@ def apply_all():
         out, _ = _mla_fn.apply(q_t, kv_t, idx_t, softmax_scale, v_channels)""",
         ),
     ], "dsa.py FP8 SparseMLA dispatch (zero-copy)")
+
+    # === Patch 9b: dsa.py — Fix inconsistent dequantize+FP8 dispatch ===
+    # If a previous drift introduced `query.dequantize()` inside the
+    # _use_fp8_mla=True branch, it destroys the zero-copy advantage AND
+    # corrupts the FP8 path (SparseMLA_FP8 sees BF16 tensors and has to
+    # per-token re-quantize). Fix: remove dequantize calls so zero-copy
+    # works. The subsequent `if _use_fp8_mla:` branch routes correctly.
+    print("Patch 9b: dsa.py remove stray dequantize in FP8 branch")
+    _patch_file(dsa_file, [
+        (
+            """\
+        if isinstance(query, QuantizedTensor) or isinstance(key, QuantizedTensor):
+            _use_fp8_mla = True
+            query = query.dequantize() if isinstance(query, QuantizedTensor) else query
+            key = key.dequantize() if isinstance(key, QuantizedTensor) else key""",
+            """\
+        if isinstance(query, QuantizedTensor) or isinstance(key, QuantizedTensor):
+            _use_fp8_mla = True""",
+        ),
+    ], "dsa.py remove stray dequantize in FP8 branch")
 
     # === Patch 8: dsa.py — _scatter_topk_into_index_mask CG-unsafe .any() ===
     print("Patch 8: dsa.py _scatter_topk_into_index_mask CG safety")

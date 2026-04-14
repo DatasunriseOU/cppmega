@@ -108,12 +108,34 @@ def apply_selective_fp8_moe_patch(*, force: bool = False) -> bool:
         else:
             bf16_layers.append(tag)
 
-    log.info(
-        "cppmega selective FP8 MoE: %d/%d layers in FP8, %d in BF16",
-        len(fp8_layers), len(symbols), len(bf16_layers),
+    # Use print so the summary is visible regardless of logging level.
+    # NAM56R operators run with WARNING-level root loggers, which would
+    # swallow these INFO lines otherwise.
+    print(
+        f"[cppmega] Selective FP8 MoE: {len(fp8_layers)}/{len(symbols)} layers "
+        f"in FP8, {len(bf16_layers)} in BF16 (incl. DSA attention)",
+        flush=True,
     )
     log.info("  FP8  layers: %s", ", ".join(fp8_layers))
     log.info("  BF16 layers: %s", ", ".join(bf16_layers))
+
+    # Compatibility check: the DSA Patch 9 dispatch keys off isinstance(query,
+    # QuantizedTensor). With selective FP8 MoE, attention layers run in
+    # nullcontext so inputs are BF16 and the FP8 branch stays inactive. If a
+    # future edit removes that isinstance guard, warn loudly.
+    try:
+        from megatron.core.transformer.experimental_attention_variant import dsa as _dsa_mod  # noqa
+        _dsa_src = open(_dsa_mod.__file__, "r", encoding="utf-8").read()
+        if "_use_fp8_mla" not in _dsa_src:
+            print(
+                "[cppmega] WARNING: DSA Patch 9 (_use_fp8_mla dispatch) not "
+                "detected in installed dsa.py. Selective FP8 MoE may still "
+                "work but run apply_dsa_cg_patches to get the FP8 zero-copy "
+                "path for full-FP8 configurations.",
+                flush=True,
+            )
+    except Exception:
+        pass
 
     def _selective_get_fp8_context(config, layer_no=-1, is_init=False):
         """Per-layer FP8 gate: FP8 for MoE, nullcontext for everything else."""
