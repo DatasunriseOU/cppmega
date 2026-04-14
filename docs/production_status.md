@@ -23,9 +23,23 @@ silent gradient corruption).
 - **lemyx fused DSA**: `CPPMEGA_LEMYX_DSA=1`
 - **DSA indexer fused**: `CPPMEGA_DSA_INDEXER_FUSED=1` (per-head bmm)
 - **CUDA graphs**: OFF (`CG_FLAGS=NONE`; required at PP=1)
-- **Peak memory**: ~115 GiB / 141 GiB per rank
+- **Peak memory**: ~115 GiB / 141 GiB per rank (was measured at session 3
+  golden snapshot; subsequent re-verify on 2026-04-14 evening showed
+  130.5 GiB without `CG_FLAGS=NONE` — see warning below)
+- **WARNING — `CG_FLAGS=NONE` is mandatory for MBS=10**: the script default
+  is `--cuda-graph-impl transformer_engine --cuda-graph-scope attn mamba
+  moe_router moe_preprocess`, which holds a 63.5 GiB CUDA Graph private pool.
+  At MBS=10 this pushes peak past 140 GiB and OOMs at iter 1. Always pass
+  `CG_FLAGS=NONE` explicitly in env. Verified on bench3 2026-04-14.
+- **WARNING — `CPPMEGA_DSA_INDEXER_FUSED` default flipped to OFF**: the
+  per-head streamed indexer creates a 640 MiB fp32 buffer per DSA layer and
+  9 DSA layers × 640 MiB = ~5.7 GiB resident across forward (autograd holds
+  for backward). Adds memory pressure on top of the CG private pool. To
+  enable explicitly set `CPPMEGA_DSA_INDEXER_FUSED=1` (production override).
 - **Do NOT enable**: `CPPMEGA_MTP_NATIVE_HOPPER_CE=1` — produces
-  `grad_norm=NaN` pending Suspect #2 CG collective test
+  `grad_norm=NaN`, Suspects #1+#2 both empirically refuted on bench3
+  (2026-04-14). Suspects #3-5 (shared-weight dual-bwd, mask handling,
+  dtype) under investigation
 
 ## Europe (LOCATION_2) — BF16
 

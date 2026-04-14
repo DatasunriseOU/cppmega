@@ -71,11 +71,21 @@ _PATCH_MARKER = "__cppmega_dsa_indexer_fused_patched__"
 def _fused_enabled() -> bool:
     """Return True when the fused per-head patch should be installed.
 
-    Default: ON.  Set ``CPPMEGA_DSA_INDEXER_FUSED=0`` to fall back to the
-    upstream allocation-heavy path (debug only).
+    Default: OFF.  Set ``CPPMEGA_DSA_INDEXER_FUSED=1`` to enable the per-head
+    streamed accumulation path.
+
+    Why default OFF (changed 2026-04-14): the per-head buffer is a fresh
+    ``[b, sq, sk]`` fp32 tensor at every DSA layer (640 MiB at MBS=10 NAM56R).
+    9 DSA layers * 640 MiB = ~5.7 GiB of resident activations across the
+    forward pass — autograd holds these for backward.  At MBS=10 EP=8 v3 the
+    bench3 budget is already at ~130 GiB pre-fused-indexer; another 5-6 GiB
+    pushes the run into iter-1 OOM (192 GiB peak with 63 GiB CG private pool).
+    Production MBS=10 stays on the upstream einsum path until we either
+    (a) drop MBS to 8, or (b) chunk the indexer fp32 buffer so it doesn't
+    persist across all 9 layers.
     """
 
-    val = os.environ.get(DSA_INDEXER_FUSED_ENV, "1").strip()
+    val = os.environ.get(DSA_INDEXER_FUSED_ENV, "0").strip()
     return val != "0"
 
 
