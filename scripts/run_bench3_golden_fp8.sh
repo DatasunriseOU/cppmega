@@ -46,7 +46,7 @@ exec env \
   CPPMEGA_INDEX_CACHE=1 \
   CPPMEGA_LEMYX_DSA=1 \
   CPPMEGA_LINEAR_CE_KERNEL=liger \
-  CPPMEGA_DSA_SKIP_INDEXER_LOSS=0 \
-  CPPMEGA_DSA_INDEXER_LOSS_COEFF=0.001 \
+  CPPMEGA_DSA_SKIP_INDEXER_LOSS=1 \
+  CPPMEGA_DSA_INDEXER_LOSS_COEFF=0 \
   EXTRA_FLAGS="--cross-entropy-loss-fusion --cross-entropy-fusion-impl linear --recompute-granularity selective --recompute-modules moe_act mlp mla_up_proj m2rnn --mla-down-proj-fusion --clip-grad 1.0" \
   bash "$(dirname "$0")/remote_smoke_h200_dsa_9_4_m.sh"
