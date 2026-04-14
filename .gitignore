@@ -6,4 +6,13 @@ cppmega/megatron/__pycache__/*
 *.pyc
 .omx/*
 .tmp/*
-cppmega_nam56r_tp2_v2.log
+
+# Training artefacts (large; created on bench3 / europe). DO NOT stash —
+# git stash --include-untracked would attempt to pickle 76+ GiB of
+# checkpoint shards and hang for 7+ min per call.
+nam56r_grid/
+*.log
+*_console.log
+ckpt/
+checkpoints/
+
