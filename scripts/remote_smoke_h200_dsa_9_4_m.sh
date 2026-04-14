@@ -86,6 +86,12 @@ export CPPMEGA_INDEX_CACHE="${CPPMEGA_INDEX_CACHE:-0}"
 # Mamba3 MIMO P1: enable TMA + warp specialization in upstream TileLang kernels.
 # Opt-in until H200 perf is confirmed. See docs/mamba3_mimo_p1_notes.md.
 export CPPMEGA_MAMBA3_P1="${CPPMEGA_MAMBA3_P1:-0}"
+# DualPipeV V-shape pipeline schedule (DeepSeek DualPipe). Requires PP=1
+# (the Megatron PP; DualPipeV carves its own 2-rank process group out of
+# the world).  World size must be multiple of 2.  See
+# cppmega/megatron/dualpipev_schedule.py + apply_dualpipev_patch.py.
+export CPPMEGA_DUALPIPEV="${CPPMEGA_DUALPIPEV:-0}"
+export CPPMEGA_DUALPIPEV_CHUNKS="${CPPMEGA_DUALPIPEV_CHUNKS:-4}"
 # Always on — prevents fragmentation OOM on large models
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export NCCL_GRAPH_REGISTER=0
@@ -101,6 +107,13 @@ mkdir -p "${TRITON_CACHE_DIR}"
 TP_SIZE="${TP_SIZE:-1}"
 PP_SIZE="${PP_SIZE:-2}"
 VPP_SIZE="${VPP_SIZE:-2}"
+# DualPipeV requires Megatron PP=1 (full model per rank); it manages its
+# own 2-rank pipeline via a carved-out process group.  Override PP/VPP.
+if [ "${CPPMEGA_DUALPIPEV}" = "1" ]; then
+  PP_SIZE=1
+  VPP_SIZE=1
+  echo "[stream_m] CPPMEGA_DUALPIPEV=1 -> forcing PP_SIZE=1 VPP_SIZE=1"
+fi
 EP_SIZE="${EP_SIZE:-1}"   # overridden per variant below
 MBS="${MBS:-4}"
 GBS="${GBS:-64}"
@@ -348,6 +361,12 @@ apply_mamba3_compile_patch()
 if os.environ.get("CPPMEGA_MAMBA3_P1", "0") == "1":
     from cppmega.megatron.upstream_patches.apply_mamba3_mimo_p1_patches import apply_all as _apply_mamba3_p1
     _apply_mamba3_p1()
+
+# (10c) DualPipeV V-shape pipeline schedule (CPPMEGA_DUALPIPEV=1)
+# Hooks into setup_model_and_optimizer; requires Megatron PP=1.
+if os.environ.get("CPPMEGA_DUALPIPEV", "0") == "1":
+    from cppmega.megatron.upstream_patches.apply_dualpipev_patch import apply as _apply_dualpipev
+    _apply_dualpipev()
 
 # (9) MTP Liger fused CE (CPPMEGA_MTP_LIGER_CE=1)
 if os.environ.get("CPPMEGA_MTP_LIGER_CE", "0") == "1":
