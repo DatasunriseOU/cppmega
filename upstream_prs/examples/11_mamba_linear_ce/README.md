@@ -32,7 +32,23 @@ python reproducer.py
 The reproducer initialises a 1-proc torch.distributed group
 (`gloo` on CPU, `nccl` if CUDA is present), builds a minimal
 `GPTModel` and `MambaModel`, inspects `type(output_layer)`, then
-applies the proposed fix as a monkey-patch and re-verifies.
+applies the proposed fix as a monkey-patch and re-verifies
+(class-swap validated).
+
+## Not validated (explicit limitations)
+
+This reproducer validates ONLY:
+- `output_layer.__class__` is `ColumnParallelLinear` in upstream
+- `output_layer.__class__` becomes `LinearCrossEntropyModule` after monkey-patch
+
+This reproducer does NOT validate:
+- Forward-loss parity between vanilla and fused linear-CE paths
+- Gradient parity
+- Training stability over multiple iters
+- Throughput impact (should be neutral to slightly positive)
+
+For production evidence of the fix working end-to-end, see
+`docs/production_status.md` bench3 / europe training runs.
 
 ## Actual run (2026-04-14, bench3 H200, megatron-lm @ `/mnt/data/cppmega-root/megatron-lm`, commit state mirrors `dev` HEAD)
 
@@ -59,7 +75,7 @@ Applying proposed fix (class-swap, equivalent to restoring PR #3226)
   assert isinstance(mamba, LinearCrossEntropyModule)  -> True
 
 ========================================================================
-VERDICT: regression CONFIRMED and fix VALIDATED.
+VERDICT: regression CONFIRMED and class-swap VALIDATED.
   - GPTModel.output_layer is LinearCrossEntropyModule (PR #3226)
   - MambaModel.output_layer is plain ColumnParallelLinear (PR #3207 regression)
   - Class-swap (or restoring PR #3226's mamba_model.py diff) fixes it.

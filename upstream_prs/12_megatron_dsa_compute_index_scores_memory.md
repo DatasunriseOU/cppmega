@@ -85,12 +85,13 @@ fused einsum.
 | Upstream einsum       | ~16.0 GiB        |
 | Per-head accumulation | **~268 MiB**     |
 
-→ 60x reduction in the indexer working set. In our training runs this
-alone unblocks `--micro-batch-size 10` on H200, which is worth approximately
-+5% end-to-end throughput.
+→ 60x reduction in the indexer working set. Reduces the ~40 GiB DSA
+indexer memory footprint (verified on GB10 at production shape,
+`rel_err 1.6e-7`). Required to fit NAM56R MBS=10 on H200 alongside
+other memory consumers, but not sole enabler.
 
-**Throughput**: No measurable change on H200 — the per-head GEMMs stay
-cuBLAS-bound at the same arithmetic intensity as the single einsum.
+**Throughput**: Throughput impact: neutral to slightly positive on GB10
+(not measured on H200). Primary deliverable is the memory savings.
 
 **Correctness**: `rel_err = 1.9e-7` at production shape (verified GB10,
 see `upstream_prs/examples/12_dsa_indexer_memory/reproducer.py`). Gradient
@@ -135,4 +136,18 @@ No open PR touches `_compute_index_scores` itself (searched 2026-04-14).
   - Memory delta reported from `torch.cuda.max_memory_allocated`
   - Gradient parity via `torch.autograd.gradcheck` at small shape
 - Real workload: NAM56R DSA 9+4 training, 8xH200, MBS=10 confirmed
-  unblocked (previously OOM at `einsum` call).
+  unblocked (previously OOM at `einsum` call). No H200 log retained
+  for this pack — only GB10 `run_gb10.log` is receipted.
+
+## Prior art / coordination
+
+**Existing upstream work**: Megatron-LM PR #4039 (`[Kernel] Fused
+Indexer Loss Kernel`, laixinn, open, updated 2026-03-27) addresses the
+same indexer memory problem via a split-K Triton kernel (60% memory
+save, 32% perf hit, TP support deferred).
+
+**Recommended action**: File this patch as a **comment on PR #4039**
+offering the per-head bf16 streaming accumulation as a complementary
+approach (89% memory save, no perf hit, no TP deferral) rather than
+opening a competing PR. See `upstream_prs/SUBMISSION_CHECKLIST.md:40`.
+
