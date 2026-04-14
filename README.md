@@ -2,13 +2,189 @@
 
 Megatron-first training framework for **NAM56R** — a 4.73B hybrid Mamba3 + MLA + DSA + MoE model.
 
-## Production Configuration
+---
+
+## 1. Model: NAM56R — what we train
+
+NAM56R is a **4.73B parameter hybrid Mamba3 + MLA + DSA + MoE** language model
+designed for code and semantic understanding. It originated as a research fork
+of Mamba3 crossed with DeepSeek-V3.2's sparse attention components, and has
+since been extended with MTP heads, an ngram-hash embedding, and structure-aware
+code signals. The training stack here is Megatron-first — no NeMo runtime, no
+Lightning — but it consumes a NeMo-style recipe file for configuration.
+
+### Architecture overview
+
+- **52 layers** in a `*EME*EME*EMM*` repeating pattern:
+  - `E` = Expert MoE layer
+  - `M` = Mamba3 SSM layer
+  - `A` = full attention (MLA) layer — 4 of these, anchoring long-range dependencies
+  - `R` = ngram-hash embedding head (at the model entrance)
+  - The 9 DSA layers (sparse attention with top-k selection) are interleaved
+    with the MoE/Mamba blocks
+- **Hidden dim 4096, 32 heads, head_dim 128, d_state 128, vocab 131072**
+- **Sequence length 4096**, BF16 or FP8 tensorwise compute (per machine)
+
+The 13 attention layers split as **9 DSA + 4 full MLA** — DSA is *not* optional,
+it is the production configuration. The other 39 layers are Mamba3 SSM / MoE
+(1 Mamba + 1 MoE alternation within each `*EME*` group, with occasional
+`*EMM*` groups for a second Mamba hop).
+
+### Why hybrid
+
+- **Mamba3 SSM** gives O(N) sequence cost with constant state — the backbone
+  of cheap long-context training.
+- **Full attention (MLA)** layers anchor long-range token-to-token dependencies
+  where SSM state compression is lossy.
+- **DSA (DeepSeek Sparse Attention)** gives selective top-k attention — dense
+  attention's expressive power on the tokens that matter, at a fraction of
+  the compute.
+- **MoE** (16 experts, top-k=4, +1 shared) scales parameters sub-linearly in
+  compute: we get a 4.73B-param model for roughly the active-param cost of a
+  much smaller dense one.
+
+### Components
+
+| Component | Detail |
+|---|---|
+| **Mamba3 MIMO** | rank=4, chunk=16, ngroups=8. TileLang fused fwd/bwd kernels |
+| **MLA** (Multi-head Latent Attention) | 4 layers, q_lora=64, kv_lora=64, qk_pos=64. TileLang SparseMLA + FP8 dispatch via `sparse_mla_ops/` |
+| **DSA** (DeepSeek Sparse Attention) | 9 layers, indexer top-k=256, lemyx fused FA+KL warmup kernel, IndexCache cross-layer reuse (3 Full + 6 Shared) |
+| **MoE** | 16 experts top-k=4 + 1 shared expert, EP=4 or EP=8 distribution (per machine), grouped GEMM |
+| **MTP** | 2 multi-token-prediction depths, via Liger fused linear CE |
+| **ngram-hash embedding** | 2-gram and 3-gram hash bucketing; heads=8, table=500k, embed_dim=16 |
+| **Structure-aware components** | code AST-derived signals feeding the embedding / mixer |
+| **Float16Module wrapper** | with selective fp32 — `D` and `dt_bias` are kept as fp32 tensors inside the SSM for numerical stability (but parameter storage is bf16; `.float()` happens in the forward). See "No _apply guard" below. |
+
+---
+
+## 2. Features included — always-on divergence from upstream
+
+Every item below is a patch we apply on top of Megatron-LM / Liger / mamba_ssm
+*unconditionally*. There are no silent fallbacks: if any patch fails to apply,
+training crashes. The list is short on purpose; opt-in flags live in the
+"Env-Gated" section further down.
+
+### Mamba LinearCE class-swap — `apply_linear_ce_patch.py`
+- **What**: replaces `MambaModel.output_layer` with `LinearCrossEntropyModule`
+  so the main LM head goes through fused linear-CE instead of materializing
+  the `[s*b, V=131072]` fp32 logits tensor.
+- **Bug fixed**: upstream Megatron PR #3226 was silently reverted by PR #3207,
+  re-breaking the fused path for MambaModel. Without this patch, MBS=12 runs
+  OOM on ~12 GiB of fp32 logits.
+- **Why ship**: unconditional memory win, zero throughput cost. Always on.
+
+### MTP Liger fused CE — `mtp_liger_ce.py`
+- **What**: replaces the vanilla MTP prediction head's `[s*b, V]` logits
+  materialization with Liger fused linear CE, using `reduction="mean"` plus
+  a broadcast trick to reconstruct per-token loss.
+- **Bug fixed**: Liger issue #968 — FLCE `reduction="none"` silently corrupts
+  the backward gradient. The `reduction="mean"` workaround yields correct
+  gradients.
+- **Why ship**: saves ~21 GiB of MTP-head activations at MBS=10 NAM56R.
+  Always on.
+
+### DSA indexer fused — `dsa_indexer_fused_patch.py`
+- **What**: per-head `bmm` accumulation inside `_compute_index_scores`,
+  eliminating the `[sq, b, h, sk]` fp32 intermediate tensor.
+- **Bug fixed**: stock Megatron einsum materializes the full 4D scores tensor
+  for every DSA layer; across 9 DSA layers that is ~45 GiB resident at MBS=10.
+- **Why ship**: saves ~40 GiB at MBS=10. Verified correctness on GB10 to
+  `rel_err = 1.6e-7`. Always on.
+
+### DSA CG-safety patches — `apply_dsa_cg_patches.py`
+- **What**: 10 patches (1-9 + 9b) enabling CUDA Graph capture in the DSA path.
+  Replaces CPU-sync `torch.equal` / `torch.any` validation with branchless
+  variants; relaxes hard-coded 576/512 dimension asserts to our 128/64;
+  routes FP8 quantized tensors to `SparseMLA_FP8` zero-copy via `_data`;
+  removes a stray `query.dequantize()` / `key.dequantize()` that had drifted
+  into the installed `dsa.py`.
+- **Why ship**: mandatory after every Megatron rebase. Without these the
+  training either crashes or silently falls off the CUDA-graph path.
+
+### Regional torch.compile — `mamba3_compile_patch.py`
+- **What**: compiles 4 Mamba3 elementwise regions (the data-dependent A
+  computation and neighbours).
+- **Why ship**: 5.93× speedup on the data-dep-A region, ~6% end-to-end
+  throughput. Always on.
+
+### GB10 smem preflight — `preflight_smem_check.py`
+- **What**: on `sm_121` machines (GB10), refuses to launch training unless
+  *every* TileLang kernel in the import set was built with
+  `TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE=True` (keeping dynamic smem under
+  the 99 KiB GB10 cap).
+- **Why ship**: without this, kernels silently compile but fail at first
+  launch with a shared-memory-too-large error. Hard-fail is better than
+  guessing which kernel blew the limit.
+
+### Index cache + lemyx DSA — opt-in
+
+Not always-on, but worth listing here because they are the canonical DSA
+training acceleration path:
+
+- `CPPMEGA_INDEX_CACHE=1` — reuses indexer top-k across DSA-Shared layers
+  (3 Full + 6 Shared pattern), 67% indexer compute savings.
+- `CPPMEGA_LEMYX_DSA=1` — loads the lemyx/tilelang-dsa fused FA +
+  lightning-indexer + KL kernel for the indexer warmup phase (~first 1000
+  steps).
+
+---
+
+## 3. What was removed and why
+
+The history is also the truth. These are paths we tried, measured, and
+deleted — or kept in tree but gated off pending further work. Be honest about
+each one.
+
+### Deleted
+
+- **`dsa_fp8_indexer.py`** *(deleted 2026-04-13)* — FP8 quantization for DSA
+  indexer scores. Empirically **-0.91× on GB10**, **~1.07× projected on
+  H200** — net regression. The expected memory savings did not materialize
+  because the indexer is not memory-bound; compute quant overhead dominated.
+
+- **`dsa_fp8_patch.py`** *(deleted 2026-04-13)* — umbrella FP8 dispatcher
+  for the DSA path. Superseded by `apply_dsa_cg_patches.py` Patch 9
+  (quantized tensor zero-copy into SparseMLA_FP8) + `dsa_indexer_fused_patch.py`
+  (BF16 fused accumulation). No single FP8 file owns the DSA path anymore.
+
+- **`dsa_tilelang_fused_kl.py`** *(deleted)* — standalone fused FA+KL
+  TileLang kernel. Replaced by `lemyx_dsa_warmup.py`, which loads the same
+  kernel via the upstream lemyx library's interface rather than a local copy.
+
+### Kept but gated OFF by default
+
+- **`mtp_native_hopper_ce.py`** — a native Hopper CuTe-DSL linear-CE kernel
+  for the MTP heads. Infrastructure is committed; activation
+  (`CPPMEGA_MTP_NATIVE_HOPPER_CE=1`) produces `grad_norm=NaN`. Suspects #1
+  (transpose round-trip) and #2 (CG collective corruption) were empirically
+  refuted. Suspects #3 (shared-weight dual-bwd), #4 (mask handling), and
+  #5 (dtype mismatch) are under investigation. Will ship once root-caused.
+
+- **DualPipeV V-shape pipeline** (`dualpipev_schedule.py`) — experimental
+  pipeline schedule that carves 2 PP ranks inside a PP=1 Megatron config.
+  **Incompatible with EP>1**: the DeepEP all-to-all desyncs across the
+  V-shape rank groups. Gate `CPPMEGA_DUALPIPEV=1`, default off. Upstream
+  NVIDIA PR #1524 (DualPipeV integration into Megatron) has been abandoned.
+
+- **combined_1f1b overlap** (`hybrid_schedule_plan.py`) — closed as a
+  production path: OOM at every PP=2 MBS we tried; PP=4 impossible with
+  52 layers (pipeline bubble too deep). Code kept for reference, gate
+  `CPPMEGA_EP_OVERLAP=1`, default off. EP within a PP stage on NVLink
+  does not need compute/comm overlap; the NVIDIA ModelZoo DS-V3 recipe
+  confirms this (Qwen3-30B-A3B uses PP=1 EP=8 with no overlap).
+
+---
+
+## 4. Production configurations + how to launch
 
 Canonical production numbers and launch commands live in
-**[docs/production_status.md](docs/production_status.md)** (single source of
-truth — see that file for canonical config details, launch commands, and
-per-machine peak memory). Summary (2026-04-14 session 3, post Liger
-grad-corruption audit):
+**[docs/production_status.md](docs/production_status.md)** — single source of
+truth for per-machine env vars, launch commands, and peak memory. The table
+and examples below are a quick summary; any conflict with `production_status.md`
+is a bug in this README.
+
+Session 3 summary (2026-04-14, post Liger grad-corruption audit):
 
 | Machine | Precision     | Topology             | Throughput       |
 | ------- | ------------- | -------------------- | ---------------- |
@@ -42,9 +218,7 @@ bench3 or europe — there is no gcloud/scp wrapper in it.
 | Micro-batch  | MBS=8/10 per machine, seq_len=4096                        |
 | Hardware     | 8x NVIDIA H200 141GB (NVLink)                             |
 
-## Quick Start
-
-### Prerequisites
+### Quick Start — prerequisites
 
 ```bash
 # Megatron-LM: our local `dev_latest` branch on europe (based on 0.16.0rc0),
@@ -65,7 +239,7 @@ pip install liger-kernel
 pip install apex  # NVIDIA apex from source with --cpp_ext --cuda_ext
 ```
 
-### Training
+### Quick Start — training
 
 Paths below assume **bench3** (`/mnt/data/cppmega-root`). On **europe** the
 root is `/home/dave/cppmega-root`; on either machine, run from inside the
@@ -124,7 +298,13 @@ The script auto-applies (regardless of topology):
 - FP8 tensorwise recipe — when `FP8_FLAGS=...` is set (BF16 wins on europe)
 - expandable_segments (mandatory, hard-coded)
 
-## Optimization Stack
+## 5. Data preparation
+
+See **[docs/data_preparation.md](docs/data_preparation.md)** for tokenizer
+choice, corpus layout, ngram-hash bucket construction, and the Megatron
+indexed-dataset build steps. (Stub; parallel agent is authoring this doc.)
+
+## 6. Optimization stack — full patch reference
 
 ### Always On (no env gates) — patches install unconditionally; raise on failure
 
@@ -193,7 +373,7 @@ Notes:
 - GB10 (aarch64, sm_121) must build from source — no aarch64 wheel yet.
 - Build recipe: `cd tilelang-build && pip wheel . --no-build-isolation --wheel-dir /tmp/tilelang-wheel/`.
 
-## Throughput Results
+## 7. Throughput results — measured
 
 Measurements on 8×H200 (LOCATION_2 unless noted). 25-iter median,
 iters 3-25. CG must be OFF at PP=1 (TE CG private pool = 39.5 GiB).
@@ -209,7 +389,9 @@ iters 3-25. CG must be OFF at PP=1 (TE CG private pool = 39.5 GiB).
 | combined_1f1b overlap any PP=2 config   | OOM     | —           | ~40 GiB pipe buffers + 95 GiB baseline > 141 GiB |
 | combined_1f1b PP=1 MBS=4 no-MTP         | 182     | ~5,900      | -12.5% + OOM@iter 8 |
 
-## Machines
+## 8. Hardware + software stack
+
+### Machines
 
 | Machine | Zone           | IP            | Path                     | GPU              |
 | ------- | -------------- | ------------- | ------------------------ | ---------------- |
@@ -239,8 +421,9 @@ recovery + patch listing.
 
 ### Upstream status (verified 2026-04-14)
 
-None of the behaviour-critical fixes that cppmega relies on are merged in
-their upstream repositories. Anything referenced below lives only on our
+Some related upstream changes are merged, but the cppmega-critical
+Megatron/FLCE/Hopper pieces we still depend on are not fully upstream or not
+available in a released form. Anything referenced below lives only on our
 local `dev_latest` branch until noted otherwise.
 
 | Ref | Upstream status | What we do locally |
@@ -265,7 +448,7 @@ local `dev_latest` branch until noted otherwise.
 - dualpipe 1.0.0+030ce43 (from github)
 - liger-kernel
 
-## Key Design Decisions
+## 9. Key design decisions
 
 - **heads=32, hidden=4096**: FP8 compatible (32%8=0), WGMMA tiling, lemyx (heads==index_heads)
 - **52 layers** (NAM56R_DEPTH): divides by 4 (VPP=4) and 2 (VPP=2)
@@ -282,7 +465,7 @@ local `dev_latest` branch until noted otherwise.
 - **expandable_segments mandatory**: hardcoded, not overridable
 - **Unfused DSA banned forever**: if fused kernel unavailable, crash immediately
 
-## Project Structure
+## 10. Project structure
 
 ```
 cppmega/
