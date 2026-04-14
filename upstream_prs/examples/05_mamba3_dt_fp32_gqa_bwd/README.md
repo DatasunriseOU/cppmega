@@ -130,18 +130,19 @@ Python subprocess per stage via `MAMBA3_REPRO_STAGE=<name>`.
 
 GB10 currently cannot run this reproducer because of an unrelated
 TileLang `LayoutInference` FloorMod constant-folding crash when the
-`mamba_mimo_bwd_bwd` kernel is compiled (tracked separately in
-`reference_p1_blocked_tilelang_tma_layout.md`). Problem 1 (bf16 DT,
-`STAGE_RESULT=bf16_refused`) *does* reproduce on GB10 since it fails
-inside the forward kernel and never reaches bwd compile.
+`mamba_mimo_bwd_bwd` kernel is compiled (see pack 13 for the minimal
+repro; see `docs/mamba3_mimo_p1_notes.md` for the broader P1 blocker
+writeup). Problem 1 (bf16 DT, `STAGE_RESULT=bf16_refused`) *does*
+reproduce on GB10 since it fails inside the forward kernel and never
+reaches bwd compile.
 
 ## Related, but NOT the same bug
 
-- `reference_mamba3_bc_layout_bug.md` — B/C layout `(r,g,n)` vs
-  `(g,r,n)` latent bug, only triggered at TP>1 with `ngroups>1`. This
-  reproducer is about `dt` dtype and the `dq`/`dk` *reduction* shape
-  in the backward — different tensors, different code path, different
-  fix.
+- Mamba3 B/C layout `(r,g,n)` vs `(g,r,n)` latent bug, only triggered
+  at TP>1 with `ngroups>1`. This reproducer is about `dt` dtype and
+  the `dq`/`dk` *reduction* shape in the backward — different tensors,
+  different code path, different fix. See `upstream_prs/05_mamba3_dt_fp32_gqa_bwd.md`
+  § "Not in scope" for the layout-bug discussion.
 
 ## Files
 
