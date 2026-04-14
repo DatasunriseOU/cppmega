@@ -18,10 +18,13 @@ silent gradient corruption).
 - **Throughput**: **268 TFLOP/s ± 0.5** (27.1% MFU), steady-state iters 3-15
 - **Liger main-head path**: `reduction="mean"` broadcast (correct gradients,
   Liger #968 workaround via `cppmega/megatron/apply_linear_ce_patch.py`)
-- **MTP**: Liger chunked CE (`CPPMEGA_LIGER_CE=1`, known correct)
+- **MTP**: Liger chunked CE (always installed via `cppmega/megatron/mtp_liger_ce.py`,
+  no env gate since dd4da34; uses `reduction="mean"` + broadcast to sidestep
+  FLCE #968 silent grad corruption)
 - **Index cache**: `CPPMEGA_INDEX_CACHE=1` (67% DSA indexer savings)
 - **lemyx fused DSA**: `CPPMEGA_LEMYX_DSA=1`
-- **DSA indexer fused**: `CPPMEGA_DSA_INDEXER_FUSED=1` (per-head bmm)
+- **DSA indexer fused**: always installed (per-head bmm, no env gate since
+  dd4da34 — see `feedback_no_fallback_gates.md`)
 - **CUDA graphs**: OFF (`CG_FLAGS=NONE`; required at PP=1)
 - **Peak memory**: ~115 GiB / 141 GiB per rank (was measured at session 3
   golden snapshot; subsequent re-verify on 2026-04-14 evening showed
@@ -31,11 +34,11 @@ silent gradient corruption).
   moe_router moe_preprocess`, which holds a 63.5 GiB CUDA Graph private pool.
   At MBS=10 this pushes peak past 140 GiB and OOMs at iter 1. Always pass
   `CG_FLAGS=NONE` explicitly in env. Verified on bench3 2026-04-14.
-- **`CPPMEGA_DSA_INDEXER_FUSED=1` (default ON, keep it)**: per-head streamed
-  indexer saves ~40 GiB vs upstream einsum at MBS=10 NAM56R (upstream
-  materialises `[sq, b, h, sk]` = ~5 GiB/layer × 9 layers = 45 GiB resident;
-  fused `[b, sq, sk]` = 640 MiB/layer × 9 = 5.7 GiB). Without this gate,
-  MBS=10 is impossible regardless of CG_FLAGS.
+- **DSA indexer fused memory accounting**: per-head streamed indexer saves
+  ~40 GiB vs upstream einsum at MBS=10 NAM56R (upstream materialises
+  `[sq, b, h, sk]` = ~5 GiB/layer × 9 layers = 45 GiB resident; fused
+  `[b, sq, sk]` = 640 MiB/layer × 9 = 5.7 GiB). Unconditional since dd4da34
+  — MBS=10 impossible without it regardless of CG_FLAGS.
 - **Do NOT enable**: `CPPMEGA_MTP_NATIVE_HOPPER_CE=1` — produces
   `grad_norm=NaN`, Suspects #1+#2 both empirically refuted on bench3
   (2026-04-14). Suspects #3-5 (shared-weight dual-bwd, mask handling,
@@ -48,8 +51,9 @@ silent gradient corruption).
 - **Variant**: `VARIANT=v1` in `scripts/remote_smoke_h200_dsa_9_4_m.sh`
 - **Throughput**: **289 TFLOP/s** (29.2% MFU), gold record
 - **Liger main-head path**: same as bench3 — `reduction="mean"` broadcast
-- **MTP**: Liger chunked CE (same as bench3)
-- **Index cache / lemyx / fused indexer**: same env gates as bench3
+- **MTP**: Liger chunked CE (same as bench3, unconditional since dd4da34)
+- **Index cache / lemyx**: same opt-in env gates as bench3
+- **DSA indexer fused**: same unconditional install as bench3
 - **CUDA graphs**: OFF (`CG_FLAGS=NONE`; required at PP=1)
 - **Peak memory**: ~127 GiB / 141 GiB per rank (MBS=10 OOMs)
 - **FP8 on europe**: every FP8 variant regresses on this fabric — keep BF16
@@ -60,26 +64,25 @@ silent gradient corruption).
 
 ```bash
 # europe (289 TFLOP/s, BF16, MBS=8 EP=4)
+# NOTE: DSA-indexer-fused + Mamba LinearCE class-swap + MTP Liger CE patches
+# now install unconditionally (commit dd4da34, see feedback_no_fallback_gates).
+# Only selector / opt-in env vars remain.
 PP_SIZE=1 VPP_SIZE=1 MBS=8 EP_SIZE_OVERRIDE=4 \
 CG_FLAGS=NONE \
 CPPMEGA_INDEX_CACHE=1 \
 CPPMEGA_LEMYX_DSA=1 \
-CPPMEGA_LIGER_CE=1 \
-CPPMEGA_MAIN_HEAD_LINEAR_CE=1 \
 CPPMEGA_LINEAR_CE_KERNEL=liger \
-CPPMEGA_DSA_INDEXER_FUSED=1 \
+EXTRA_FLAGS="--cross-entropy-loss-fusion --cross-entropy-fusion-impl linear" \
 bash scripts/remote_smoke_h200_dsa_9_4_m.sh
 
 # bench3 (268 TFLOP/s, FP8 tensorwise, MBS=10 EP=8)
 VARIANT=v3 PP_SIZE=1 VPP_SIZE=1 MBS=10 EP_SIZE_OVERRIDE=8 \
 CG_FLAGS=NONE \
-CPPMEGA_FP8=1 \
+FP8_FLAGS="--fp8-format hybrid --fp8-recipe tensorwise --fp8-amax-history-len 1024 --fp8-amax-compute-algo max" \
 CPPMEGA_INDEX_CACHE=1 \
 CPPMEGA_LEMYX_DSA=1 \
-CPPMEGA_LIGER_CE=1 \
-CPPMEGA_MAIN_HEAD_LINEAR_CE=1 \
 CPPMEGA_LINEAR_CE_KERNEL=liger \
-CPPMEGA_DSA_INDEXER_FUSED=1 \
+EXTRA_FLAGS="--cross-entropy-loss-fusion --cross-entropy-fusion-impl linear" \
 bash scripts/remote_smoke_h200_dsa_9_4_m.sh
 ```
 

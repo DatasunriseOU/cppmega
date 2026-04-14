@@ -6,22 +6,27 @@ Megatron-first training framework for **NAM56R** — a 4.73B hybrid Mamba3 + MLA
 
 Canonical production numbers and launch commands live in
 **[docs/production_status.md](docs/production_status.md)** (single source of
-truth). Summary (2026-04-14 session 3, post Liger grad-corruption audit):
+truth — see that file for canonical config details, launch commands, and
+per-machine peak memory). Summary (2026-04-14 session 3, post Liger
+grad-corruption audit):
 
-- **europe**: 289 TFLOP/s (BF16, PP=1 EP=4 MBS=8, no-CG) — gold record
-- **bench3**: 268 TFLOP/s (FP8 tensorwise, PP=1 EP=8 MBS=10 v3, no-CG)
+| Machine | Precision     | Topology             | Throughput       |
+| ------- | ------------- | -------------------- | ---------------- |
+| europe  | BF16          | PP=1 EP=4 MBS=8, CG off | **289 TFLOP/s** (gold record) |
+| bench3  | FP8 tensorwise | PP=1 EP=8 MBS=10 v3, CG off | **268 TFLOP/s** (MTP Liger CE) |
 
 Both machines use Liger `reduction="mean"` broadcast workaround for correct
 gradients (Liger #968). The earlier "269.4 TFLOP/s bench3" measurement with
 `reduction="none"` is **superseded** — it was silently corrupted.
 
-Note: the PP=1 EP=4 MBS=8 BF16 numbers above are the *measured best* topology.
-The default launcher `scripts/remote_smoke_h200_dsa_9_4_m.sh` ships with the
-older "Stream L" defaults (PP=2 VPP=2 MBS=4 GBS=64, VARIANT=v1 → EP=4); the
-PP=1 EP=4 MBS=8 production topology is reached via env-var overrides — see
-Quick Start below. The script is designed to run as the remote body inside a
-tmux session on either bench3 or europe — there is no gcloud/scp wrapper in
-it.
+Note: the topologies above are the *measured best* per machine — they differ
+(europe=BF16 EP=4 MBS=8, bench3=FP8 EP=8 MBS=10). The default launcher
+`scripts/remote_smoke_h200_dsa_9_4_m.sh` ships with the older "Stream L"
+defaults (PP=2 VPP=2 MBS=4 GBS=64, VARIANT=v1 → EP=4); production topologies
+are reached via env-var overrides — see Quick Start below and
+`docs/production_status.md` for the exact launch command per machine. The
+script is designed to run as the remote body inside a tmux session on either
+bench3 or europe — there is no gcloud/scp wrapper in it.
 
 | Parameter    | Value                                                     |
 | ------------ | --------------------------------------------------------- |
@@ -32,9 +37,9 @@ it.
 | DSA          | 9 DSA layers (sparse attention, indexer topk=256)         |
 | MoE          | 16 experts, topk=4, shared expert, grouped GEMM           |
 | MTP          | 2 prediction layers                                       |
-| Precision    | BF16 (FP8 tensorwise available but -3.5% slower)          |
-| Parallelism  | PP=1, TP=1, EP=4, DP=2  (CG must be OFF at PP=1)          |
-| Micro-batch  | MBS=8, GBS=64, seq_len=4096                               |
+| Precision    | BF16 (europe) / FP8 tensorwise (bench3) — see production_status.md |
+| Parallelism  | PP=1, TP=1, EP=4/8 per machine (CG must be OFF at PP=1)   |
+| Micro-batch  | MBS=8/10 per machine, seq_len=4096                        |
 | Hardware     | 8x NVIDIA H200 141GB (NVLink)                             |
 
 ## Quick Start
@@ -80,21 +85,28 @@ written for.
 
 ```bash
 # Script default (PP=2 VPP=2 MBS=4 EP=4) — Stream L topology, ~193 TFLOP/s europe
+# NOTE: MTP Liger CE + Mamba LinearCE class-swap + DSA indexer fused are now
+# unconditional (commit dd4da34) — no env gate needed for those.
 CPPMEGA_INDEX_CACHE=1 \
 CPPMEGA_LEMYX_DSA=1 \
-CPPMEGA_LIGER_CE=1 \
 bash scripts/remote_smoke_h200_dsa_9_4_m.sh
 ```
 
-**Production topology** (PP=1 EP=4 MBS=8 BF16, the 289 TFLOP/s europe /
-253 TFLOP/s bench3 configuration) — the script honours these overrides:
+**Production topology** — production configs differ per machine; see
+`docs/production_status.md` for the canonical launch commands. Summary:
+europe = BF16 PP=1 EP=4 MBS=8 (289 TFLOP/s); bench3 = FP8 tensorwise PP=1
+EP=8 MBS=10 v3 (268 TFLOP/s). The launcher script honours env-var overrides:
 
 ```bash
+# europe (289 TFLOP/s, BF16, PP=1 EP=4 MBS=8)
+# NOTE: MTP Liger CE, Mamba LinearCE class-swap and DSA indexer fused are
+# unconditional since dd4da34 — no env gate needed.
 PP_SIZE=1 VPP_SIZE=1 MBS=8 EP_SIZE_OVERRIDE=4 \
 CG_FLAGS=NONE \
 CPPMEGA_INDEX_CACHE=1 \
 CPPMEGA_LEMYX_DSA=1 \
-CPPMEGA_LIGER_CE=1 \
+CPPMEGA_LINEAR_CE_KERNEL=liger \
+EXTRA_FLAGS="--cross-entropy-loss-fusion --cross-entropy-fusion-impl linear" \
 bash scripts/remote_smoke_h200_dsa_9_4_m.sh
 ```
 
@@ -104,10 +116,12 @@ you must pass `CG_FLAGS=NONE` explicitly as shown above.
 
 The script auto-applies (regardless of topology):
 - Regional torch.compile (4 Mamba3 elementwise regions)
+- MTP Liger chunked CE (always on, no gate; saves 21 GiB MTP logits)
+- Mamba LinearCE class-swap (always on, fixes upstream PR #3226→#3207 regression)
+- DSA indexer fused per-head bmm (always on, saves ~40 GiB at MBS=10 NAM56R)
 - IndexCache (67% DSA indexer savings) — when `CPPMEGA_INDEX_CACHE=1`
 - lemyx fused FA+KL kernel (DSA warmup) — when `CPPMEGA_LEMYX_DSA=1`
-- Liger chunked cross-entropy (MTP memory savings) — when `CPPMEGA_LIGER_CE=1`
-- FP8 tensorwise recipe (opt-in via env, off by default — BF16 wins on europe)
+- FP8 tensorwise recipe — when `FP8_FLAGS=...` is set (BF16 wins on europe)
 - expandable_segments (mandatory, hard-coded)
 
 ## Optimization Stack
