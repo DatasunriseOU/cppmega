@@ -1,5 +1,79 @@
 # NAM56R NeMo Migration Changelog
 
+## 2026-04-14: FP8 paths exploration + Mamba3 MIMO P1 + pipeline topology closures
+
+Multi-stream session across europe H200, bench3 H200, and GB10 sm_121.
+Established production config 289 TFLOP/s on europe (PP=1 EP=4 MBS=8 BF16
+no-CG) and 253 TFLOP/s on bench3 (same topology), closed multiple
+exploration directions, shipped infrastructure for future work.
+
+### Production records (new)
+
+- **europe PP=1 EP=4 MBS=8 BF16 no-CG** = **289 TFLOP/s / ~9,250 tok/sec/GPU** — production gold
+- **bench3 PP=1 EP=4 MBS=8 FP8 tensorwise** = **253 TFLOP/s / ~8,100 tok/sec/GPU** — new bench3 record, refutes earlier "bench3 100 TFLOP/s slower" claim (real delta = 13%, HW variance)
+- europe PP=2 VPP=2 EP=4 MBS=4 MTP=2 = 193 TFLOP/s — standard PP=2 baseline (confirms)
+
+### FP8 direction audit
+
+**Dead paths (empirically refuted)**:
+- FP8 Mamba SSM MIMO: full 478-LOC port gives **0.73-0.91× on GB10 sm_121** and **0.45-0.51× on H200 sm_90** (2× slower!). Kernel is NOT GEMM-bound — rotary/trap-scaling/SEGSUM/state-update dominate. Cast-before-GEMM overhead > modest FP8 GEMM speedup. Branch `fp8-mamba-ssm-exploration` @ c0c6bd1 kept as reference port (numerically correct). Memory: `reference_fp8_mamba_ssm_dead_path.md`.
+- `--fp8-param-gather`: net-neutral (-0.5% noise). Saves only 2.6 GiB (not 5 as hypothesized) because custom BF16 modules (TileLang SparseMLA, Mamba3) sit outside `fp8_model_init` context. Env gate kept as safe option, default OFF. Memory: `reference_fp8_param_gather_net_neutral.md`.
+- FSDP2 FP8 params (PR #2245): not our path (we use Megatron dist-opt), dismissed.
+
+**Live paths**:
+- FP8 MoE grouped-GEMM: `CPPMEGA_SELECTIVE_FP8_MOE=1` coexists with DSA (both stay on when set, verified by GB10 agent). Commit `f208e15` adds Patch 9b that removes a stray `query.dequantize()` pair that had drifted into installed dsa.py (killing zero-copy FP8 by re-quantizing BF16 per-token).
+- FP8 attention **backward R&D** on branch `fp8-bwd-piggyback-exploration` @ 4d79332: working E5M2 dO path via TE `Float8Quantizer`, rel_err dq=1.56e-02 / dkv=1.40e-02 on GB10, 5-iter smoke stable. Env-gated `CPPMEGA_SPARSEMLA_FP8_BWD=1`, default OFF. Convergence validation on H200 pending.
+
+### Mamba3 MIMO P1 — TMA + warp specialization
+
+- `apply_mamba3_mimo_p1_patches.py` commits `4f115ea` → `d80bf9c`: flip `TL_DISABLE_TMA_LOWER/WARP_SPECIALIZED` in upstream mamba_ssm kernels + propagate `TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True`.
+- **Discovered bug**: inserting lines into patched file breaks `inspect.getsource` via `co_firstlineno` desync when `import mamba_ssm` auto-imports Mamba3 BEFORE `apply_all()` runs. Fixed with line-count-preserving merge onto FAST_MATH line. Memory: `reference_py_patch_line_shift_bug.md`.
+- **Race fix**: 8-rank concurrent writes caused `IndentationError` from torn reads. Added `LOCAL_RANK=0 + fcntl.LOCK_EX + sentinel + atomic writes` pattern. Non-rank-0 ranks `LOCK_SH + poll` (120 s deadline).
+- **bench3 selective-fwd P1 result**: **wash** (183.016 → 183.005 TFLOP/s, -0.006%). Fwd kernel not the bottleneck at MBS=8; 20-30% fwd speedup ≈ +1% total, below measurement noise. Env gate kept default OFF.
+- **Full P1 (fwd + bwd + bwd_bwd)** blocked by TileLang TMA layout bug: bwd kernels use rank-3 smem descriptors, `LowerBulkCopy` asserts `InputDim == 2`. Memory: `reference_p1_blocked_tilelang_tma_layout.md`.
+- **TMA layout fix** on branch `tma-layout-fix-3d-to-2d` @ `31dc695`: flattens `qk_dot_shared [chunk, R, R] → [chunk, R*R]` and `Q/K [B, S, R, G, N] → [B, S*R, G, N]`. Correctness verified GB10: 14 gradient tensors rel_err 0.0038-0.0116. H200 perf measurement in progress.
+
+### Pipeline topology closures
+
+- **DualPipeV integration**: commit `06269f0` adds Megatron PP=1 + carved 2-rank DualPipe group via `dist.new_group`, `apply_dualpipev_patch.py` hooks `setup_model_and_optimizer`. Env-gated `CPPMEGA_DUALPIPEV=1`. Experimental — **not measurable with EP>1** because V-shape puts ranks at different layers simultaneously while DeepEP A2A requires synchronized EP peers (deadlock at `deep_ep/buffer.py:97`).
+- **combined_1f1b closed** (`reference_combined_1f1b_dead_for_nam56r.md`): OOM at every PP=2 MBS down to MBS=1 GBS=32 (overlap holds ~40 GiB extra pipe buffers + 95 GiB baseline > 141 GiB). PP=4 impossible (52 layers don't divide PP*VPP for VPP>1). Infrastructure kept (commit `13e2d7d` fixes MTP bypass + IdentityOp.backward_dw + MambaStack.final_layernorm). Env gate `CPPMEGA_EP_OVERLAP=1`, default OFF.
+- **CP (Context Parallel) closed** (`reference_cp_blocked_by_custom_mixers.md`): all three custom mixers (CppMegaMamba3TE, dsa_sparse_*, mla_shared) lack `cp_group` plumbing. Multi-week port AND would be net-negative because Mamba CP = head-parallel = TP-equivalent (3.2× Mamba slowdown per TP=2 memory). Only reopens at 128k extension phase.
+
+### Integration quality improvements
+
+- **libnvrtc RTLD_GLOBAL workaround** (`39cb474`): force-load libnvrtc.so.13 at cppmega sparse_mla_ops import to prevent TileLang from aborting with "libnvrtc symbols not found globally" when compiling a second kernel variant in the same process. Candidate for upstream TileLang issue.
+- `docs/long_context_roadmap.md`: documents 4k → 16k → 128k thresholds. SWA switch at seq > 16k. MLA `window_size` plumbing is a ~5 LOC add-on when needed (not preempted).
+- `plan.md`: 10-hour optimization block with hard rules (no external PRs without explicit user approval, no silent fallbacks, CG must be OFF at PP=1).
+- `upstream_prs/07_mamba3_mimo_3d_to_2d_smem_refactor.md` + `08_tilelang_tma_bulk_copy_3d_smem_issue.md` — drafted locally, **not posted** (hard rule: external PRs require explicit user approval).
+
+### Hard-won knowledge (memory entries added)
+
+- `reference_py_patch_line_shift_bug.md` — inserting lines breaks inspect.getsource
+- `reference_mamba_ssm_reinstall.md` — `MAMBA_FORCE_BUILD=TRUE pip install ... .` (not raw `--force-reinstall`)
+- `reference_gb10_bwd_bwd_blocker.md` — FIXED via `TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE`
+- `project_bench3_vs_europe_delta.md` — gap was PP topology, not hardware; real = 13%
+- `project_dualpipev_unwired.md` → integrated but EP-incompatible
+- `reference_fp8_param_gather_net_neutral.md`
+- `reference_fp8_mamba_ssm_dead_path.md`
+- `reference_combined_1f1b_dead_for_nam56r.md`
+- `reference_p1_blocked_tilelang_tma_layout.md`
+- `reference_cp_blocked_by_custom_mixers.md`
+
+### Honest reality check on stretch targets
+
+User set aspirational "250k tok/sec + MFU > 50%" goal via test-loop:
+- 250k tok/sec on 8×H200 = ~982 TFLOP/s = **99% MFU** = essentially at hardware peak; not achievable on current architecture in 10 hours or realistically months without CUTLASS-level kernel rewrites
+- Realistic ceiling this session: **31-35% MFU** (~105-110k tok/sec) if P1 full lands
+- Documented honestly in `plan.md`
+
+### Open (at session end)
+
+- Europe full P1 + TMA fix measurement (agent `ab0cdd07a098d108a`) — if wins ≥3%, merge `tma-layout-fix-3d-to-2d` and ship. Cross-machine validation on bench3 after.
+- P2 post-rotary Q/K + PsiV cache — design ready, ~10-15% bwd_bwd saving, ~1% total. Deferred pending P1 result.
+- P3 register split 255→130 — design ready (`docs/mamba3_mimo_p3_register_split_design.md`), ~1% total, week+ work. Deferred.
+
+---
+
 ## 2026-04-12: DSA/TP/recompute optimization session
 
 Major optimization session covering TP=2 investigation, DSA 9+4 memory
