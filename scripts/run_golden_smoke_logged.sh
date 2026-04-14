@@ -56,7 +56,10 @@ log "TRAIN_LOG=$TRAIN_LOG"
 # (commit 93217b0 forensics) was caused by my run_bench3_golden_fp8.sh
 # wrapper dropping --recompute-granularity selective from EXTRA_FLAGS;
 # fixed in commit 36584ad. Reverting to MBS=10 to match golden 268.
-step launch bash scripts/run_bench3_golden_fp8.sh
+# Start with MBS=8 (safer, gives ~10 GiB margin) since we're now also
+# enabling DSA indexer KL loss (coeff=0.001) via lemyx tilelang fused FA+KL
+# kernel. Once MBS=8 + indexer loss verified, can escalate to MBS=10.
+step launch bash scripts/run_bench3_mbs8_fp8.sh
 
 # On failure, show last 30 lines of the training log to make diagnosis
 # possible from STEPLOG alone (no need to ssh in and grep).
