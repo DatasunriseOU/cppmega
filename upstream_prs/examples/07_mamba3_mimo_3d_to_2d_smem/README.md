@@ -33,14 +33,19 @@ It then verifies:
 
 ## Run
 
-CUDA hardware required. Expected stack (see
-`reference_gb10_working_stack_2026_04.md` /
-`reference_stack_bench.md`):
+CUDA hardware required. The reproducer is self-contained — it embeds the
+indexing pattern directly and only depends on `torch` + `tilelang` (pins
+listed in `requirements.txt`). No `mamba_ssm` checkout is needed.
 
 ```bash
 pip install -r requirements.txt
 python reproducer.py
 ```
+
+Verified environments (2026-04-14 session):
+
+- GB10 (sm_121a): `TILELANG_VERSION=0.1.8+cuda` via Modal image.
+- H200 (sm_90):   `TILELANG_VERSION=0.1.8+cuda`, `torch 2.12 nightly +cu132`.
 
 ### Expected output
 

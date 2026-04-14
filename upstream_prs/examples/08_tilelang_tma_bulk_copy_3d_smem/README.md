@@ -105,6 +105,8 @@ TileLang. This is tracked as a separate feature request in
 Practical impact on NAM56R: Mamba3 MIMO backward `qk_dot_shared`
 (`[chunk_size, R, R]`) and Q/K smem views (`[chunk_size, R, N]`)
 currently compile but do not get the TMA+warp-spec throughput win
-(~20–30% reported by NVIDIA on similar kernels). See
-`reference/reference_p1_blocked_tilelang_tma_layout.md` in project
-memory for the workaround status.
+(~20–30% reported by NVIDIA on similar kernels). The active workaround
+lives in the kernel source itself (`mamba3_mimo_bwd.py` emits 2D smem
+descriptors with manual index math); see pack 07 (`07_mamba3_mimo_3d_to_2d_smem`)
+for the legality proof and `docs/mamba3_mimo_p1_notes.md` for the
+broader P1 blocker discussion.

@@ -157,8 +157,10 @@ before `LayoutInference` runs. The options that do work are:
 - `upstream_prs/08_tilelang_tma_bulk_copy_3d_smem_issue.md` — sibling
   issue covering the `LowerBulkCopy InputDim==2` assert (separate bug,
   addressed upstream by PR #746 warn+fallback).
-- `reference_tma_layout_fix_broken_h200.md` (cppmega memory note) —
-  internal authoritative description of what the bug is.
+- `docs/findings_2026_04_14_session.md` — session writeup covering why
+  the `tma-layout-fix-3d-to-2d` branch must not be merged on H200
+  (csr % R inside T.Parallel trips LayoutInference FloorMod DBZ); this
+  pack is the minimal repro of that blocker.
 - TileLang PR [#1458](https://github.com/tile-ai/tilelang/pull/1458) —
   fixed a different FloorMod bug in the Z3 prover; does **not** address
   the const-fold DBZ path reproduced here.

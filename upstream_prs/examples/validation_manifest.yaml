@@ -12,7 +12,16 @@
 #                      (e.g. BUG_REPRODUCED, FIX_VALIDATED, LEGALITY_PROVED,
 #                      BITWISE_IDENTICAL, REGRESSION_TEST_PASSED,
 #                      BLOCKED, SKIPPED)
-#         log_location: optional sftp://... or local path; null if not captured
+#         log_location: repo-relative path to the captured run log, or null
+#                       if no log was retained
+#         log_sha256: sha256 of the captured log file, or null if not captured
+#         verification_source: receipted_log | reported_by_agent | pending
+#             * receipted_log         — log exists on disk at log_location
+#             * reported_by_agent     — pack was verified inside an agent
+#                                       session transcript but no log was
+#                                       retained; text-only claim
+#             * pending               — reproducer exists but has not been
+#                                       run on listed host this session
 #         notes: optional free-form caveats
 #       upstream_status:
 #         repo: github owner/name
@@ -20,9 +29,14 @@
 #         state: new_report | open | draft | merged | closed | not_filed
 #         verified_via: how upstream state was checked (e.g. "gh api", null)
 #
-# Source of truth for this first population: agent session reports
-# 2026-04-14. Any field marked "pending" means the reproducer exists but
-# has not yet been run on the listed host this session.
+# Receipt honesty policy (2026-04-14 audit):
+# Only pack 12 has a retained log file (run_gb10.log, sha256 recorded below).
+# All other packs were verified inside agent session reports without
+# saving stdout/stderr, so their last_verified.verification_source is
+# "reported_by_agent" and their log_location is null. Treat these as
+# claimed-but-unreceipted until a receipted log is captured.
+#
+# Pack 10 stays "pending" on mac-local (no CUDA cc=9 locally).
 
 prs:
   "01_dsa_cuda_graph_safety":
@@ -33,7 +47,13 @@ prs:
       exit_code: 0
       output_tags: ["BUG_REPRODUCED", "FIX_VALIDATED"]
       log_location: null
-      notes: "DSA CUDA graph capture safety: unsafe path shows stale pointer; fused-patch path clean."
+      log_sha256: null
+      verification_source: "reported_by_agent"
+      notes: >-
+        DSA CUDA graph capture safety: unsafe path shows stale pointer;
+        fused-patch path clean.
+        RECEIPT: none retained on disk; verified inside session transcript
+        only. Needs receipted rerun to promote to receipted_log.
     upstream_status:
       repo: "NVIDIA/Megatron-LM"
       issue_or_pr: null
@@ -48,7 +68,13 @@ prs:
       exit_code: 0
       output_tags: ["BUG_REPRODUCED", "FIX_VALIDATED"]
       log_location: null
-      notes: "SparseMLA dimension/layout mismatch reproduced on native mixer; cppmega fix path validates."
+      log_sha256: null
+      verification_source: "reported_by_agent"
+      notes: >-
+        SparseMLA dimension/layout mismatch reproduced on native mixer;
+        cppmega fix path validates.
+        RECEIPT: none retained on disk; verified inside session transcript
+        only. Needs receipted rerun to promote to receipted_log.
     upstream_status:
       repo: "NVIDIA/Megatron-LM"
       issue_or_pr: null
@@ -63,11 +89,15 @@ prs:
       exit_code: 0
       output_tags: ["HAZARDS_SHOWN"]
       log_location: null
+      log_sha256: null
+      verification_source: "reported_by_agent"
       notes: >-
         FP8 dispatch hazards demonstrated.
         HEDGE: TE 2.13 silently auto-dequantizes some FP8 tensors, which can
         mask the bug in certain stacks; reproducer documents this caveat.
         Bug is real for user-observed-semantics purposes.
+        RECEIPT: none retained on disk; verified inside session transcript
+        only. Needs receipted rerun to promote to receipted_log.
     upstream_status:
       repo: "NVIDIA/TransformerEngine"
       issue_or_pr: null
@@ -82,7 +112,13 @@ prs:
       exit_code: 0
       output_tags: ["BITWISE_IDENTICAL"]
       log_location: null
-      notes: "Code-clarity refactor (v_dot in siso bwd); bitwise-identical vs baseline. Not a perf PR."
+      log_sha256: null
+      verification_source: "reported_by_agent"
+      notes: >-
+        Code-clarity refactor (v_dot in siso bwd); bitwise-identical vs
+        baseline. Not a perf PR.
+        RECEIPT: none retained on disk; verified inside session transcript
+        only. Needs receipted rerun to promote to receipted_log.
     upstream_status:
       repo: "state-spaces/mamba"
       issue_or_pr: null
@@ -102,10 +138,14 @@ prs:
       exit_code: 0
       output_tags: ["BUG_REPRODUCED", "FIX_VALIDATED", "GB10_BLOCKED"]
       log_location: null
+      log_sha256: null
+      verification_source: "reported_by_agent"
       notes: >-
         Two bugs (dt fp32 cast, GQA B/C layout) + two fixes validated on bench3.
         GB10 run blocked by TileLang LayoutInference FloorMod divide-by-zero
         (see pack 13); fix correctness verified on H200 only.
+        RECEIPT: none retained on disk; verified inside session transcript
+        only. Needs receipted rerun to promote to receipted_log.
     upstream_status:
       repo: "state-spaces/mamba"
       issue_or_pr: null
@@ -125,10 +165,14 @@ prs:
       exit_code: 0
       output_tags: ["LEGALITY_PROVED"]
       log_location: null
+      log_sha256: null
+      verification_source: "reported_by_agent"
       notes: >-
         Legality proof for 3D->2D smem descriptor rewrite in
         mamba3_mimo_bwd.py; verified on GB10 (sm_121a). The refactor
         unblocks TileLang TMA lowering for bwd_fwd/bwd_bwd.
+        RECEIPT: none retained on disk; verified inside session transcript
+        only. Needs receipted rerun to promote to receipted_log.
     upstream_status:
       repo: "state-spaces/mamba"
       issue_or_pr: null
@@ -148,12 +192,16 @@ prs:
       exit_code: 0
       output_tags: ["REGRESSION_TEST_PASSED"]
       log_location: null
+      log_sha256: null
+      verification_source: "reported_by_agent"
       notes: >-
         Regression test for TileLang LowerBulkCopy 3D smem path.
         Upstream PR #746 already merged the fix (confirmed closed+merged via
         gh api 2026-04-14). Follow-ups #761 (1D TMA support, closed+merged
         2025-08-28) and #2005 (1D TMA regression test for #1842, closed+merged
         2026-04-14) also landed. Pack 08 is an internal regression test only.
+        RECEIPT: none retained on disk; verified inside session transcript
+        only. Needs receipted rerun to promote to receipted_log.
     upstream_status:
       repo: "tile-ai/tilelang"
       issue_or_pr: 746
@@ -168,12 +216,16 @@ prs:
       exit_code: 0
       output_tags: ["BUG_REPRODUCED", "FIX_VALIDATED"]
       log_location: null
+      log_sha256: null
+      verification_source: "reported_by_agent"
       notes: >-
         Silent gradient corruption in LigerFusedLinearCrossEntropyFunction
         reduction='none' backward reproduced; mean-broadcast workaround
         (path #3 in apply_linear_ce_patch.py) validated.
         Liger PR #680 does NOT fix this (it fixed plain CE only, and in
         fact removed reduction='none' from FLCE).
+        RECEIPT: none retained on disk; verified inside session transcript
+        only. Needs receipted rerun to promote to receipted_log.
     upstream_status:
       repo: "linkedin/Liger-Kernel"
       issue_or_pr: 968
@@ -197,11 +249,15 @@ prs:
       exit_code: null
       output_tags: ["SKIPPED"]
       log_location: null
+      log_sha256: null
+      verification_source: "pending"
       notes: >-
         SKIPPED on local Mac (no CUDA cc=9 available).
         Needs H200 validation rerun before filing upstream. Companion file
         mtp_nan_reproducer.py captures the main+MTP NaN symptom that
         gates CPPMEGA_MTP_NATIVE_HOPPER_CE=1.
+        RECEIPT: pack is pending — has not been executed on a capable host
+        this session.
     upstream_status:
       repo: "NVIDIA/Megatron-LM"
       issue_or_pr: 3345
@@ -221,7 +277,13 @@ prs:
       exit_code: 0
       output_tags: ["FIX_VALIDATED"]
       log_location: null
-      notes: "MambaModel.output_layer class-swap to LinearCrossEntropyModule; fix validated end-to-end."
+      log_sha256: null
+      verification_source: "reported_by_agent"
+      notes: >-
+        MambaModel.output_layer class-swap to LinearCrossEntropyModule;
+        fix validated end-to-end.
+        RECEIPT: none retained on disk; verified inside session transcript
+        only. Needs receipted rerun to promote to receipted_log.
     upstream_status:
       repo: "NVIDIA/Megatron-LM"
       issue_or_pr: null
@@ -243,8 +305,13 @@ prs:
       date: "2026-04-14"
       exit_code: 0
       output_tags: ["MEMORY_SAVE_VERIFIED"]
-      log_location: null
-      notes: "5.2x memory save verified on GB10 via per-head fused bf16 accumulation replacement for _compute_index_scores."
+      log_location: "upstream_prs/examples/12_dsa_indexer_memory/run_gb10.log"
+      log_sha256: "b122aa20e1adaa31a61da002f8202892f1acc012f12c1d0be206ad15a78a4149"
+      verification_source: "receipted_log"
+      notes: >-
+        5.2x memory save verified on GB10 via per-head fused bf16 accumulation
+        replacement for _compute_index_scores. RECEIPT: run_gb10.log retained
+        alongside reproducer.py (sha256 above).
     upstream_status:
       repo: "NVIDIA/Megatron-LM"
       issue_or_pr: null
@@ -278,10 +345,14 @@ prs:
       exit_code: 0
       output_tags: ["BUG_REPRODUCED"]
       log_location: null
+      log_sha256: null
+      verification_source: "reported_by_agent"
       notes: >-
         LayoutInference divide-by-zero on FloorMod(csr, R) inside T.Parallel
         in bwd_bwd kernel; reproduces the blocker that also prevents pack 05
         fix from being validated on GB10.
+        RECEIPT: none retained on disk; verified inside session transcript
+        only. Needs receipted rerun to promote to receipted_log.
     upstream_status:
       repo: "tile-ai/tilelang"
       issue_or_pr: null
