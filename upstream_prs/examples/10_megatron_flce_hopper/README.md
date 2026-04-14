@@ -69,6 +69,8 @@ Exit code: **0**.
 
 Exit code: **0**.
 
+Important: on our current bench3 tree this outcome only validates that the Hopper path is already patched in. It does **not** by itself prove a fresh reproduction of the original unsupported-arch bug, because the current tree is no longer unfixed.
+
 ### On macOS / CPU-only
 
 ```
@@ -79,7 +81,7 @@ Exit code: **77**.
 
 ## What the fix enables
 
-Once #3345 merges (or we patch in Tier-B soft fallback), Megatron-LM users on H100/H200 can opt into the single-kernel fused LM-head path and avoid materializing the `[seq·batch, vocab]` logits tensor. On NAM56R (MBS=10, bf16, V≈150k) this saves ~6 GiB of activation memory per rank and sustains **269.4 TFLOP/s** on 8×H200 (bench3 record) vs our prior materialized-logits workaround.
+Once #3345 merges (or we patch in Tier-B soft fallback), Megatron-LM users on H100/H200 can opt into the single-kernel fused LM-head path and avoid materializing the `[seq·batch, vocab]` logits tensor. In our tree this is still expected to save roughly ~6 GiB of activation memory per rank versus the materialized-logits fallback, but pack 10 should not cite `269.4 TFLOP/s` as current proof: repo source-of-truth now treats that bench3 number as superseded, and this pack still needs a retained H200 receipt before it is filing-ready.
 
 ## Local validation path (without ssh access)
 
@@ -88,4 +90,4 @@ If you only have a macOS / CPU machine, run the reproducer locally — it exits 
 1. Scp the file onto bench3 (`/mnt/data/cppmega-root/cppmega/upstream_prs/examples/10_megatron_flce_hopper/`) and run there, or
 2. Use any NVIDIA Megatron CI container (`nvcr.io/nvidia/pytorch:24.xx-py3`) with an H200 available, after `pip install -e git+https://github.com/NVIDIA/Megatron-LM.git@dev`.
 
-The captured output from bench3 (2026-04-14) is included inline in `../../10_megatron_fused_linear_ce_hopper_support.md` § Testing.
+The current bench3/europe situation should be read carefully: a patched tree can validate Hopper-path loading, but filing readiness still requires a retained H200 receipt that clearly distinguishes pre-fix reproduction from post-fix validation.
