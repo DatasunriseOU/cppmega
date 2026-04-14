@@ -8,6 +8,8 @@ In the SparseMLA backward TileLang kernel (`tilelang_sparse_mla_bwd.py`), the sh
 
 Allocate `P_shared_cast` and `dP_shared_cast` with `accum_dtype` (fp32) so the dKV GEMM reads fp32 P/dP instead of bf16-rounded values.
 
+This pack is currently a local patch note, not a fully receipted upstream-ready bundle: there is no checked-in example directory or `validation_manifest.yaml` entry yet, so the wording below is intentionally limited to the code-level change and the expected validation target.
+
 ```python
 # Before:
 P_shared_cast = T.alloc_shared([...], dtype)
@@ -24,5 +26,5 @@ dP_shared_cast = T.alloc_shared([...], accum_dtype)
 
 ## Testing
 
-- dKV gradient matches `torch.autograd.gradcheck` at fp64 reference within tightened tolerance (bf16 P/dP buffers exceed tolerance; fp32 buffers pass).
-- No measurable throughput change on 8×H200 (shared-memory budget still fits within the 99 KiB Hopper cap for the kernel tile).
+- Validation receipt is still missing in this tree: no example bundle or manifest entry currently demonstrates fresh gradcheck or H200 throughput evidence for this change.
+- Intended validation target: show improved dKV accuracy against an fp32/fp64 reference and confirm no material Hopper regression once a reproducible example bundle is added.

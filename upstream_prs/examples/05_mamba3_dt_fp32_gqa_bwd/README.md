@@ -1,6 +1,26 @@
 # Reproducer: Mamba3 DT fp32 cast + MIMO GQA backward branch
 
-Validates both fixes from `upstream_prs/05_mamba3_dt_fp32_gqa_bwd.patch`:
+> **Scope note.** This reproducer exercises **two distinct upstream bugs**
+> that co-trigger in the same Megatron + Mamba3 training config, so it is
+> kept as one pack for convenience. The bugs target **different
+> repositories** and are filed as two separate PRs:
+>
+> - **PR 05** (`state-spaces/mamba`) — the Mamba3-side MIMO GQA backward
+>   branch (`G value of 2 not supported`). The `gqa_unpatched` /
+>   `gqa_patched` stages below exercise this.
+> - **PR 16** (`NVIDIA/Megatron-LM`) — the `Float16Module` silent cast of
+>   Mamba3's fp32-contract parameters (DT/D/bias). The `bf16` / `fp32`
+>   stages below exercise this. See `docs/upstream_bugs.md:187` for the
+>   Megatron-side writeup.
+>
+> When filing upstream, split the evidence by stage: bf16/fp32 → PR 16,
+> gqa_unpatched/gqa_patched → PR 05.
+
+The local convenience patch `upstream_prs/05_mamba3_dt_fp32_gqa_bwd.patch`
+currently bundles both fixes because they co-trigger in the same training
+lane, but upstream filing should split them by repository as noted above.
+
+The shared reproducer validates both bug/fix pairs:
 
 1. **Problem 1 (DT dtype)** — `mamba_ssm/modules/mamba3.py` calls
    `F.softplus(dd_dt + self.dt_bias)`. When Megatron's `Float16Module`

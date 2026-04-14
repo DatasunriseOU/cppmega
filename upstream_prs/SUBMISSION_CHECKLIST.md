@@ -10,6 +10,9 @@ Legend:
   state understood, reproducer has been exercised on a listed host.
 - `ready = N` — a blocker exists (reproducer not validated on a CC=9 host,
   upstream duplicate, etc.).
+- `ready` is a filing-prep flag only; it does **not** mean a retained on-disk
+  receipt exists. Check `upstream_prs/examples/validation_manifest.yaml`
+  before describing any pack as receipted or fully validated.
 
 ---
 
@@ -122,8 +125,11 @@ Legend:
   CC=9). Needs H200 rerun before filing.
 - **Explanation (RU):** `upstream_prs/examples/10_megatron_flce_hopper/explanation_ru.md`
 - **Ready:** **N** — blocked on H200 reproducer run. Do a bench3/europe
-  run first, capture log, flip `exit_code` from null to 0.
+  run first, capture retained log, and flip `exit_code` from null to 0.
 - **File as:** COMMENT on PR #3345 with H200-validated reproducer.
+- **Receipt gate:** pack 10 still lacks a retained H200 filing receipt; do
+  not describe it as receipted, H200-validated, or ready-to-file until that
+  rerun artifact exists on disk.
 - **Command (after H200 rerun):**
   ```
   gh pr comment 3345 --repo NVIDIA/Megatron-LM \
@@ -196,8 +202,25 @@ is low — bundle them to avoid three separate notifications.
 - **Template:** `upstream_prs/05_mamba3_dt_fp32_gqa_bwd.md` (+ `.patch`)
 - **Reproducer:** `upstream_prs/examples/05_mamba3_dt_fp32_gqa_bwd/reproducer.py`
   (bench3, exit 0, BUG_REPRODUCED + FIX_VALIDATED + GB10_BLOCKED).
+- **Shared-evidence note:** the same reproducer also covers PR 16's
+  Megatron-side Float16Module cast bug. For filing, split by stage:
+  `bf16/fp32` -> PR 16, `gqa_unpatched/gqa_patched` -> PR 05.
 - **Ready:** Y (H200-only validation; GB10 blocked by pack 13).
-- **File as:** PR with `.patch` attached, cross-reference #886 as related.
+- **File as:** PR with the Mamba-side GQA diff only; do not present the
+  bundled local convenience patch as if every hunk belongs in
+  `state-spaces/mamba`. Cross-reference #886 as related.
+
+### PR 16 — Megatron Float16Module silently casts Mamba3 fp32-contract params
+- **Target repo:** NVIDIA/Megatron-LM
+- **Upstream state:** `new_report`.
+- **Template:** `upstream_prs/16_megatron_float16module_mamba3_cast.md`
+- **Reproducer:** shared with PR 05 at
+  `upstream_prs/examples/05_mamba3_dt_fp32_gqa_bwd/reproducer.py`
+  (bench3, exit 0; `bf16` reproduces the cast symptom, `fp32` validates the
+  fp32-contract path).
+- **Ready:** Y (shared H200 transcript-backed evidence only; no retained log yet).
+- **File as:** ISSUE first against Megatron-LM. Frame it as a generic
+  Float16Module contract bug, not as a Mamba-only local workaround request.
 
 ### PR 07 — Mamba3 MIMO 3D→2D smem refactor
 - **Upstream state:** `new_report`. **Target resolved:**
