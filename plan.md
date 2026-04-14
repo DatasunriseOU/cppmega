@@ -1,5 +1,108 @@
 # NAM56R optimization plan — next 10 hours
 
+## EMPIRICAL CONFIG EXPLORATION COMPLETE (2026-04-14 deep night)
+
+**Stop running config sweeps.** 20 empirical tests across every dimension
+(precision, MBS, GBS, EP, DP, recompute modules, CE fusion paths, Liger
+variants) have mapped the full space. Production ceilings locked.
+
+Next productive work is kernel-level (week+ effort):
+1. **MBS=12 backward nan debug** (my `apply_linear_ce_patch.py` Liger routing
+   has correct forward at MBS=12, fits 130 GiB, but backward grad_norm=nan)
+2. Mamba3 P2 PsiV cache (design deferred)
+3. Mamba3 P3 register split (design ready, week+ effort)
+4. cuTile bwd_bwd refactor per TileGym patterns
+
+## Session conclusion (2026-04-14 deep night — 17 empirical tests + new patch)
+
+Config-space fully mapped on 8×H200. Production ceilings:
+- **europe = 289 TFLOP/s (29.2% MFU)** — BF16 MBS=8 EP=4, fabric-bound
+- **bench3 = 269.4 TFLOP/s (27.2% MFU)** — FP8 MBS=10 EP=8 + Liger main-head CE
+  (NEW RECORD via `cppmega/megatron/apply_linear_ce_patch.py` written this session)
+- Prior bench3 baseline was 268 (MTP-Liger + vanilla main head). Swapping to
+  main-head Liger adds +0.5% (268.0 → 269.4, σ<0.15)
+
+**Gap to user's 250k tok/sec / 50% MFU stretch target**: 1.7× throughput.
+Empirical evidence shows **this gap cannot be closed by config/topology tuning**
+on this architecture + hardware (every knob tried regresses or doesn't fit).
+Realistic near-term improvements: +5-10% via Mamba3 P2/P3 kernels (weeks of
+work). Reaching 50% MFU requires either (a) CUTLASS WGMMA kernel rewrites
+(months), (b) architecture change (not our call), or (c) newer hardware (B200+).
+
+Document honestly: 289/268 TFLOP/s are production numbers we can ship today.
+
+## Production baselines (2026-04-14 night — definitive)
+
+| Machine    | Config                                                        | TFLOP/s   | MFU       | Status                                                                           |
+| ---------- | ------------------------------------------------------------- | --------- | --------- | -------------------------------------------------------------------------------- |
+| europe     | PP=1 EP=4 MBS=8 BF16 no-CG                                    | **289**   | 29.2%     | **gold record, ship**                                                            |
+| **bench3** | **PP=1 EP=8 MBS=10 FP8 tensorwise (v3)**                      | **268**   | **27.1%** | **new bench3 record, ship**                                                      |
+| bench3     | PP=1 EP=8 MBS=10 FP8 + CPPMEGA_SELECTIVE_FP8_MOE=1            | 268       | 27.1%     | **net-neutral gate (redundant when global FP8)**                                 |
+| bench3     | PP=1 EP=8 MBS=8 BF16 no-CG (v3)                               | 257       | 26.0%     | superseded                                                                       |
+| europe     | PP=1 EP=8 MBS=8 BF16 no-CG (v3)                               | 262       | 26.5%     | -9.3%, DO NOT SHIP on europe                                                     |
+| europe     | PP=1 EP=4 MBS=10 FP8 tensorwise                               | 190       | 19.2%     | -34%, DO NOT SHIP FP8 on europe                                                  |
+| europe     | PP=1 EP=4 MBS=8 BF16 + CPPMEGA_SELECTIVE_FP8_MOE=1            | 247       | 25.0%     | -14%, DO NOT SHIP FP8 MoE on europe                                              |
+| europe     | PP=1 EP=4 MBS=9 BF16                                          | 228       | 23.1%     | -21%, odd MBS breaks FP16 GEMM tile alignment                                    |
+| europe     | PP=1 EP=4 MBS=8 GBS=128 BF16                                  | 252       | 25.5%     | -12%, doubled grad-accum = more recompute passes                                 |
+| europe     | PP=1 EP=4 MBS=8 BF16 + Liger main-head CE                     | 250       | 25.3%     | -13%, same pattern — Liger slowdown outweighs memory savings europe doesn't need |
+| europe     | PP=1 EP=4 MBS=10 BF16                                         | OOM       | —         | NCCL crash at peak 127.7 GiB — MBS=8 is europe memory ceiling                    |
+| bench3     | PP=1 EP=8 MBS=11 FP8 tensorwise (v3)                          | 264       | 26.7%     | -1.5%, odd MBS marginal regress — MBS=10 optimal                                 |
+| bench3     | PP=1 EP=8 MBS=10 FP8 + Liger main-head CE (MTP vanilla)       | **269.4** | **27.2%** | **+0.5% vs 268 baseline, NEW RECORD**. σ<0.15 rock-solid                         |
+| bench3     | PP=1 EP=8 MBS=10 FP8 + Liger MTP + Liger main-head (stacked)  | 269.2     | 27.2%     | stacking no additive gain vs main-only                                           |
+| bench3     | PP=1 EP=8 MBS=10 FP8 + Liger stacked + drop moe_act recompute | 165-178   | 17-18%    | **catastrophic** -34%; moe_act recompute is critical, not optional               |
+| bench3     | PP=1 EP=8 MBS=12 FP8 tensorwise (v3)                          | OOM       | —         | CUDA illegal address / NCCL crash — MBS=10 is bench3 ceiling                     |
+| bench3     | PP=1 EP=8 MBS=12 FP8 + full recompute                         | OOM       | —         | OOM at vocab_parallel_cross_entropy (12 GiB logits), CE head-bound not Mamba     |
+| bench3     | PP=1 EP=8 MBS=10 BF16 (v3)                                    | **118**   | 11.9%     | **-56%, thrashes — FP8 is MEMORY enabler (peak 128 GiB vs 115 GiB FP8)**         |
+
+**Definitive conclusion — per-machine production configs locked in**:
+- **bench3** ships `VARIANT=v3 MBS=10 FP8 tensorwise` → 268 TFLOP/s (σ<0.5, rock steady).
+- **europe** ships `VARIANT=v1 MBS=8 BF16` → 289 TFLOP/s. FP8 tensorwise
+  REGRESSES on europe (190 TFLOP/s, -34%) — amax overhead exceeds GEMM
+  speedup on europe's fabric.
+- FP8 tensorwise is machine-specific: wins on bench3 (+4.3% vs BF16 v3),
+  loses on europe. Memory: `reference_fp8_mbs10_bench3_wins.md`,
+  `reference_fp8_mbs10_europe_regression.md`.
+
+**Gap to stretch goal**: europe 289 TFLOP/s = 29.2% MFU vs 50% target = **1.7× to go**.
+EP + FP8 + MBS + GBS topology tuning **all exhausted** (15 empirical tests this session).
+
+**Potential main-head Liger CE lever (2026-04-14 night, HONEST assessment)**:
+MBS=12 bench3 OOMs at `vocab_parallel_cross_entropy` (12 GiB logits on LM head).
+Current `CPPMEGA_MTP_LIGER_CE=1` applies Liger fused linear CE to MTP only.
+Per `cppmega/megatron/mtp_liger_ce.py` docstring: **Liger CE is 2.7× SLOWER than
+vanilla on H200** (memory enabler, not speedup). So adding it to main head:
+- ✓ Unlocks MBS=12 on bench3 (currently OOM) — empirically needed
+- ✗ Slows main-head CE by ~75 ms per iter (+1-2% per-iter time)
+- ≈ Net throughput: likely **flat to +5%** (bench3 MBS=11 was -1.5% vs MBS=10,
+  so MBS=12 gain is uncertain)
+- Europe unlikely to benefit (MBS=9/10 BF16 both regress due to fabric/odd batch)
+
+Worth trying on bench3 after implementation. Memory: `reference_main_head_liger_ce_gap.md`.
+Implementation: hook `compute_language_model_loss` in `megatron/core/models/common/language_module/language_module.py:168` to route through `LigerFusedLinearCrossEntropyFunction` when env gate enabled. Mirror `cppmega/megatron/mtp_liger_ce.py` pattern.
+
+Next levers require kernel-level implementation:
+
+1. **Mamba3 P2 post-rotary Q/K + PsiV cache**: potential +1-3% via bwd saving,
+   but MORE IMPORTANT — could save 10-20 GiB per rank, which per session insight
+   `reference_fp8_is_memory_win_not_compute.md` directly unlocks BF16 MBS=10 on
+   bench3 (currently thrashes at 128 GiB, FP8 saves 13 GiB to reach 115 GiB).
+   **Design doc missing** — write before implementation.
+2. **Mamba3 P3 register split 255→130**: +1% total, week+ effort. Design in
+   `docs/mamba3_mimo_p3_register_split_design.md`.
+3. **FP8 attention backward** (R&D branch `fp8-bwd-piggyback-exploration` @
+   4d79332): GB10 5-iter smoke stable, needs H200 convergence validation before
+   stacking with production config.
+4. **cuTile Python bwd_bwd refactor** (TileGym patterns per
+   `reference_tilegym_cutile_patterns.md`): multi-week rewrite, unknown gain.
+
+**FP8 MoE gate** (`CPPMEGA_SELECTIVE_FP8_MOE=1`) CLOSED this session:
+- Bench3 with global FP8: **no-op** (267.7 vs 268 baseline, redundant)
+- Europe BF16 + MoE FP8: **-14%** regression (247 vs 289 baseline)
+
+Stacked realistic best case: ~5-10% over 289 → 303-318 TFLOP/s = 30-32% MFU.
+Still far from 50% without CUTLASS WGMMA custom or CuTe DSL Hopper stack
+rewrites. Document honestly.
+
 ## combined_1f1b overlap PP=1 EP=8: BLOCKED by pre-existing MTP bug (2026-04-14)
 
 Parallel agent (me) ran the overlap test (`CPPMEGA_EP_OVERLAP=1`) with
@@ -191,11 +294,11 @@ lands. Target: bench3 ~270 / europe ~310 = ~31% MFU.
 
 User's test-loop directive: **250k tok/sec** and **MFU > 50%** on 8×H200.
 
-| metric | baseline | this-block ceiling | stretch target | feasibility |
-|---|---|---|---|---|
-| TFLOP/s | 289 | ~347 (35%) | 495 (50%) / 982 (99%) | 50% = months of research; 99% = impossible |
-| tok/sec | 74,000 | ~89,000 | 125,000 (50% MFU) / **250,000 (99% MFU)** | 250k = at HW peak |
-| Gap vs 250k | 3.4× | 2.8× | — | — |
+| metric      | baseline | this-block ceiling | stretch target                            | feasibility                                |
+| ----------- | -------- | ------------------ | ----------------------------------------- | ------------------------------------------ |
+| TFLOP/s     | 289      | ~347 (35%)         | 495 (50%) / 982 (99%)                     | 50% = months of research; 99% = impossible |
+| tok/sec     | 74,000   | ~89,000            | 125,000 (50% MFU) / **250,000 (99% MFU)** | 250k = at HW peak                          |
+| Gap vs 250k | 3.4×     | 2.8×               | —                                         | —                                          |
 
 **Honest conclusion**: 250k tok/sec and 50% MFU are **aspirational
 long-term goals**, not achievable in 10 hours. Realistic ceiling with

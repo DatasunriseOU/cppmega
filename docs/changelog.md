@@ -66,11 +66,68 @@ User set aspirational "250k tok/sec + MFU > 50%" goal via test-loop:
 - Realistic ceiling this session: **31-35% MFU** (~105-110k tok/sec) if P1 full lands
 - Documented honestly in `plan.md`
 
+### Europe FP8 sweep — all paths regress (2026-04-14 night)
+
+Tested 3 FP8-related configs on europe vs BF16 MBS=8 baseline 289 TFLOP/s:
+
+| Config | TFLOP/s | Δ |
+|---|---|---|
+| BF16 MBS=8 EP=4 baseline | 289 | — |
+| EP=8 v3 (take-3) | 262 | -9.3% |
+| FP8 tensorwise MBS=10 | 190 | -34% |
+| BF16 + CPPMEGA_SELECTIVE_FP8_MOE=1 | 247 | -14% |
+
+**Pattern**: every non-baseline config on europe regresses. Europe's
+NVLink/NVSwitch fabric baseline is already fast enough that the amax
+recalibration cost + EP=8 fanout overhead exceed any FP8 GEMM speedup.
+
+**Decision**: europe ships pure BF16 MBS=8 EP=4 (no FP8, no EP=8).
+Memory: `reference_europe_fp8_all_paths_regress.md`.
+
+### Bench3 FP8 + CPPMEGA_SELECTIVE_FP8_MOE=1 (2026-04-14 night)
+
+Tested gate additive to FP8 tensorwise baseline: **267.7 TFLOP/s =
+identical to 268.0 baseline** (σ<0.5 within noise). Gate is a no-op
+when global FP8 tensorwise is active (MoE GEMMs already FP8 via TE).
+Memory: `reference_fp8_moe_gate_net_neutral.md`.
+
+### FP8 tensorwise MBS=10 cross-machine (late night — 2026-04-14)
+
+Ran FP8 tensorwise MBS=10 GBS=80 tests on both machines simultaneously to
+resolve the 2026-04-13 golden config 273 TFLOP/s claim:
+
+| Machine | Config | Iters | TFLOP/s | Peak alloc | Val PPL |
+|---|---|---|---|---|---|
+| **bench3** | v3 EP=8 MBS=10 FP8 | 30/30 | **268.0** (σ<0.5) | 115.3 GiB | 207 |
+| europe | v1 EP=4 DP=2 MBS=10 FP8 | 30/30 | 190.5 (σ=13) | — | — |
+
+**Bench3 new record = 268 TFLOP/s** (+4.3% vs BF16 EP=8 v3 baseline of 257).
+Ship as bench3 production config. Matches 2026-04-13 "golden config" claim
+exactly — turns out that claim was specifically for bench3, not europe.
+
+**Europe FP8 = REGRESSION (-34% vs BF16 MBS=8 = 289)**. High per-iter
+variance (170-213 TFLOP/s range, σ=13) suggests amax recalibration churn
+overhead exceeds FP8 GEMM speedup on europe's fabric. Keep europe on BF16.
+
+Memory entries: `reference_fp8_mbs10_bench3_wins.md`,
+`reference_fp8_mbs10_europe_regression.md`.
+
+### Europe EP=8 v3 take-3 (late evening confirmation)
+
+Third europe attempt with GQA patch restored + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`:
+
+- **25/25 iters clean**, steady state **262.0 TFLOP/s** (σ ≈ 0.1), val PPL 16.7
+- Peak alloc **108.5 GiB** / reserved 117 GiB per rank (well within 140 GiB budget)
+- **-9.3% regression vs europe PP=1 EP=4 baseline (289 TFLOP/s)**
+
+**Verdict**: EP=8 v3 is machine-specific. Ship on bench3 (+1.6% win), keep EP=4 on europe. Prior OOM on take-2 was env drift (GQA patch missing), not a memory pressure issue. With patch restored, memory is healthy but throughput regresses — A2A cost scales badly with EP=8 on europe's NVLink fabric, and grouped-GEMM per-rank tile count drops from 4 local experts to 2. Memory updated in `reference_ep8_v3_machine_specific.md`.
+
 ### Open (at session end)
 
 - Europe full P1 + TMA fix measurement (agent `ab0cdd07a098d108a`) — if wins ≥3%, merge `tma-layout-fix-3d-to-2d` and ship. Cross-machine validation on bench3 after.
 - P2 post-rotary Q/K + PsiV cache — design ready, ~10-15% bwd_bwd saving, ~1% total. Deferred pending P1 result.
 - P3 register split 255→130 — design ready (`docs/mamba3_mimo_p3_register_split_design.md`), ~1% total, week+ work. Deferred.
+- FP8 attention backward on H200 — branch `fp8-bwd-piggyback-exploration` @ 4d79332 pending convergence validation after GB10 5-iter smoke stable.
 
 ---
 
