@@ -16,7 +16,15 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-_has_megatron = importlib.util.find_spec("megatron") is not None
+# See tests/_megatron_stub.py: a prior test (e.g. test_fastmtp_layer.py) may
+# have installed a MagicMock stub for megatron.  Use the shared helper to
+# detect a real install vs stub and to keep ``find_spec`` from raising on
+# Python 3.12+.
+from tests._megatron_stub import install_megatron_stub, is_real_megatron_available
+
+_has_megatron = is_real_megatron_available()
+if not _has_megatron:
+    install_megatron_stub()
 _module_path = pathlib.Path(__file__).parent.parent / "cppmega" / "megatron" / "noconv_mamba_mixer.py"
 
 
