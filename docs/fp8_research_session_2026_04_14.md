@@ -9,7 +9,7 @@ Comprehensive parallel research into FP8 paths across NAM56R for Mamba3 SSM, MLA
 | FP8 MoE Linear GEMMs | ✅ live | Works; selective_fp8_moe + DSA coexist (verified GB10) |
 | FP8 MLA/DSA forward (zero-copy) | ✅ live | SparseMLA_FP8 via Float8Tensor._data, 0% net on our compute mix |
 | FP8 MLA/DSA backward (E5M2 dO) | 🧪 R&D | TileLang patch feasible (~110 LOC, not 30 as earlier estimated), gain ~0.7%, risk grad_norm 100× |
-| FP8 SSM scan | 🚀 **NEW** — empirically feasible | GB10 demo: 1.66× 2-GEMM scan-loop. Potential +17% throughput, 35% MFU ceiling |
+| FP8 SSM scan | ❌ **dead path** (post-full-port) | Full MIMO port: 0.73-0.91× GB10, ~1.07× H200 projection. Kernel latency-bound, not GEMM-bound |
 | FP8 param-gather | 🧪 testing | -5 GiB memory (enables MBS=10+); throughput neutral per prior docs |
 | FP8 model replica (TE fp8_model_init) | ❌ not taken | PR #2245 is FSDP2-specific, we use Megatron dist-opt |
 
@@ -77,7 +77,21 @@ Per-token scaled single GEMM rel err: 3.6%.
 
 **H200 implications**: Same source path lowers to WGMMA FP8 on sm_90 — higher ceiling without code change.
 
-**Potential win for NAM56R**: SSM = 34.5% GPU time. At 1.5× speedup on 34.5% compute → +17% total → **339 TFLOP/s = 34% MFU** from current 289.
+**Initial hypothesis**: SSM = 34.5% GPU time. At 1.5× speedup on 34.5% compute → +17% total → **339 TFLOP/s = 34% MFU** from current 289.
+
+### FP8 Mamba SSM full port — hypothesis REFUTED (commit c0c6bd1 on branch)
+
+Full `mamba3_mimo_fwd.py` ported to FP8 (478 LOC, 5 GEMMs, all operands e4m3fn, accumulator fp32):
+- GB10 sm_121: **0.73-0.91×** vs BF16 — **net slowdown 10-27%**
+- H200 WGMMA projection: **~1.07×** — marginal
+- Numerics OK (rel_err 3-10%, stable on amp 0.5-2.0)
+- Cross-compiles sm_90a, emits `tl::wgmma_ss<Float8_e4m3, Float8_e4m3, Float32, 64, 64, 32>`
+
+**Root cause**: MIMO kernel is NOT GEMM-bound. Rotary / trap-scaling / SEGSUM mask / state-update / diagonal-reduction / Z gate / D term overhead dominate the kernel time. FP8 cast-before-GEMM overhead exceeds the modest GEMM speedup. Consistent with `reference_mamba_ssm_optimization_plan.md` (255 regs, 6.25% occupancy → register/latency-bound).
+
+**Lesson**: single-GEMM microbenchmark (1.66×) did NOT predict full-kernel performance. Always measure on full kernel before projecting gains.
+
+**Decision**: FP8 Mamba SSM = dead path for NAM56R production. Branch kept as R&D artifact. Full numerical tables in `docs/fp8_mamba_ssm_exploration_notes.md` on branch `fp8-mamba-ssm-exploration`.
 
 ### GB10: FP8 attn bwd piggyback exploration
 Branch: `fp8-bwd-piggyback-exploration` @ d91f5a9 (GB10 local, not pushed).
