@@ -141,11 +141,25 @@ case "${VARIANT}" in
     echo "[stream_m] V2 = EP=2 DP=2 PP=2 VPP=2 (8 experts/rank, 2x DP)"
     EP_SIZE=2
     ;;
+  v3)
+    # v3 = PP=1 EP=8 DP=1 TP=1 (full EP across 8 ranks, no pipelining).
+    # Routes to combined_1f1b_schedule_for_no_pipelining with --overlap-moe-expert-parallel-comm.
+    # Caller must set PP_SIZE=1 VPP_SIZE=1 (script trusts env here).
+    echo "[stream_m] V3 = EP=8 DP=1 PP=1 VPP=1 (full EP, no pipelining, combined_1f1b path)"
+    EP_SIZE=8
+    CPPMEGA_DISPATCHER_OVERRIDE=alltoall_keep_cg
+    ;;
   *)
-    echo "ERROR: unknown VARIANT=${VARIANT} (expected v0|v1|v2)" >&2
+    echo "ERROR: unknown VARIANT=${VARIANT} (expected v0|v1|v2|v3)" >&2
     exit 2
     ;;
 esac
+
+# EP_SIZE_OVERRIDE: allow explicit EP override regardless of variant (e.g. smoke tests).
+if [ -n "${EP_SIZE_OVERRIDE:-}" ]; then
+  echo "[stream_m] EP_SIZE_OVERRIDE=${EP_SIZE_OVERRIDE} (was ${EP_SIZE})"
+  EP_SIZE="${EP_SIZE_OVERRIDE}"
+fi
 
 # Build workdir with pretrain_mamba shim (MIMO __post_init__ + fp32-bias hook
 # + DSA FP8 patch + loss_coeff==0 gate + peak-memory reporter).
