@@ -304,7 +304,23 @@ class _HybridPostProcessNode(ScheduleNode):
         if model.share_embeddings_and_output_weights:
             output_weight = model.shared_embedding_or_output_weight()
 
-        if model.mtp_process:
+        # Guard against the `_relaxed_post_init` PP=1 overlap workaround:
+        # that path flips `config.mtp_num_layers` to None during __post_init__
+        # to bypass an upstream `PP>1` assert, then restores it.  The flip
+        # makes Megatron skip actual MTP block construction (`model.mtp` is
+        # None / empty) while `mtp_process` and `config.mtp_num_layers`
+        # eventually get restored to truthy values.  If we then call
+        # `process_mtp_loss`, it chunks hidden_states by (1 + mtp_num_layers)
+        # but the decoder output only has a single [s, b, h] slice --> shape
+        # mismatch when multiplying by `loss_mask[b, s]` in mtp_liger_ce.py.
+        # Skip the loss call when there are no actual MTP blocks to back it.
+        _mtp_module = getattr(model, "mtp", None)
+        _has_mtp_blocks = _mtp_module is not None and (
+            len(getattr(_mtp_module, "layers", []) or [])
+            + len(getattr(_mtp_module, "mtp_modules", []) or [])
+            > 0
+        )
+        if model.mtp_process and _has_mtp_blocks:
             hidden_states = process_mtp_loss(
                 hidden_states=hidden_states,
                 labels=s.labels,
