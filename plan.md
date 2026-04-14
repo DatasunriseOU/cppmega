@@ -130,10 +130,16 @@ superseded (silent grad corruption).
    provides diff procedure to confirm against upstream when network available.
 
 5. **README Megatron Version corrections** (`README.md` section around line
-   154): the previous claim of "megatron-core 0.18" was wrong. Verified from
-   `megatron/core/package_info.py` in **both** bench3 tarball and europe git
-   working tree: version is `0.16.0rc0` on both machines. Per-machine
-   divergence recorded (base commit, patches, notes).
+   154): per-machine divergence recorded (base commit, patches, notes).
+   Authoritative per `docs/megatron_restoration_recipe.md` and
+   `docs/session_3_gap_audit.md`:
+   - **bench3**: `megatron-core 0.18.0rc0` (installed via `pip install
+     git+NVIDIA/Megatron-LM@980211ae`; has PR #3345 cherry-pick). Note the
+     bench3 tarball's `package_info.py` reports `0.16.0rc0` but the actual
+     installed site-packages is `0.18.0rc0` — this is what caused the
+     earlier "both machines at 0.16" confusion.
+   - **europe**: `megatron-core 0.16.0rc0` (`dev_latest` branch, 2 commits
+     ahead of `origin/dev`; has PR #3674 + PR #4268 cherry-picks).
 
 ### Diagnostic findings (no new code)
 
@@ -147,12 +153,17 @@ superseded (silent grad corruption).
 
 ### Drift discoveries (previously unknown)
 
-- **bench3 vs europe megatron divergence**: earlier memory note claimed bench3
-  "megatron-core 0.18" — false. Both are 0.16.0rc0. Install paths differ
-  (bench3 = flat tarball, europe = live git on `dev_latest` 2 commits ahead
-  of `origin/dev`). Bench3's upstream base commit is unverified (no `.git`);
-  likely `2eeabc668` (PR #3674 only) because bench3 never exercised PR #4268's
-  PP>1 wgrad overlap path.
+- **bench3 vs europe megatron divergence**: the two H200 hosts are on
+  **different** megatron-core versions (see
+  `docs/megatron_restoration_recipe.md` + `docs/session_3_gap_audit.md` for
+  authoritative source):
+  - bench3 = `megatron-core 0.18.0rc0` (flat tarball install via
+    `pip install git+NVIDIA/Megatron-LM@980211ae`; has PR #3345
+    cherry-pick). The bench3 tarball's `package_info.py` reports
+    `0.16.0rc0`, but the *actually-installed* site-packages is
+    `0.18.0rc0` — this caused the earlier "both at 0.16" misread.
+  - europe = `megatron-core 0.16.0rc0` (live git on `dev_latest` 2
+    commits ahead of `origin/dev`; has PR #3674 + PR #4268 cherry-picks).
 - **mamba_ssm fork drift `31f3d7b` vs `4f4857f`**: bench3 at `31f3d7b`
   detached + 4 modified files; europe at `31f3d7b` detached + 3 modified
   files + `mamba3_siso_bwd.py.orig` stock copy. Previously assumed both
