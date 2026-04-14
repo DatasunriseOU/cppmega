@@ -5,7 +5,13 @@ import torch
 from utils import assert_tensors_similar
 
 
-@tilelang.jit(out_idx=[-1])
+@tilelang.jit(
+    out_idx=[-1],
+    # GB10 sm_121 99 KiB smem cap — see reference_gb10_bwd_bwd_blocker.md.
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
+    },
+)
 def preprocess(
     B,
     S,
@@ -43,7 +49,13 @@ def preprocess(
     return preprocess_kernel
 
 
-@tilelang.jit(out_idx=[-1])
+@tilelang.jit(
+    out_idx=[-1],
+    # GB10 sm_121 99 KiB smem cap — see reference_gb10_bwd_bwd_blocker.md.
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
+    },
+)
 def postprocess(
     B,
     S_kv,

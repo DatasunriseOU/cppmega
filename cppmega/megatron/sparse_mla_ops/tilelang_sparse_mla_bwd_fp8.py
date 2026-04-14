@@ -99,7 +99,13 @@ def _get_postprocess_fp8_kernel(D: int, D_tail: int, kv_group: int):
         return kernel
 
 
-@tilelang.jit(out_idx=[-1])
+@tilelang.jit(
+    out_idx=[-1],
+    # GB10 sm_121 99 KiB smem cap — see reference_gb10_bwd_bwd_blocker.md.
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
+    },
+)
 def preprocess(H, D, block_ND=32, num_stages=5, dtype=T.bfloat16, accum_dtype=T.float32):
     """Build preprocessing kernel that computes Delta = sum(O * dO) per row/head.
 
@@ -149,7 +155,13 @@ def preprocess(H, D, block_ND=32, num_stages=5, dtype=T.bfloat16, accum_dtype=T.
     return preprocess_kernel
 
 
-@tilelang.jit(out_idx=[-1])
+@tilelang.jit(
+    out_idx=[-1],
+    # GB10 sm_121 99 KiB smem cap — see reference_gb10_bwd_bwd_blocker.md.
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
+    },
+)
 def postprocess(
     D, D_tail, kv_group=1, block_N=64, threads=128, dtype=T.bfloat16, accum_dtype=T.float32
 ):

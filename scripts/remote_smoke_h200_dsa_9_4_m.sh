@@ -622,6 +622,14 @@ if [ "${NO_ROPE_FUSION}" = "1" ]; then
 fi
 
 python -c 'import cppmega, megatron; print("cppmega", cppmega.__version__)'
+
+# GB10 sm_121 smem-cap preflight: static-audit every TileLang kernel we ship
+# and confirm TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE is set.  Hard-fails
+# before training starts rather than mid-iter.  Safe on H200 (warn only
+# unless CPPMEGA_SMEM_CHECK_STRICT=1).  See
+# cppmega/megatron/preflight_smem_check.py and reference_gb10_bwd_bwd_blocker.md.
+python -m cppmega.megatron.preflight_smem_check
+
 # dsa_fp8_patch/indexer removed — lemyx + IndexCache is the only path
 
 # Validate DSA A-layer rank parsing.
