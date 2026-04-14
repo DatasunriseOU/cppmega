@@ -27,6 +27,39 @@ Exa deep research (agent ad869db932d3e8d66) confirmed:
 See `reference_dualpipev_phantom_combined1f1b_canon.md` memory for
 full evidence.
 
+### combined_1f1b concrete solvable path (research found)
+
+Exa+Context7 agent (a28511a315f73a9b5) dug into Megatron internals and
+found: **PP=2 is architecturally worst-case** (+1 microbatch penalty +
+`--recompute-granularity full` incompatible via hard assertion in
+`combined_1f1b.py:303-305`). The combined_1f1b scheduler is designed
+for **PP=1** (no-pipelining variant, no penalty) or **PP≥4+VPP≥2**
+(VPP amortization).
+
+**Test path for NAM56R**:
+```
+--pipeline-model-parallel-size 1
+--expert-model-parallel-size 8                # 2 experts/rank at 16 total experts
+--tensor-model-parallel-size 1
+--overlap-moe-expert-parallel-comm
+--moe-token-dispatcher-type alltoall          # NOT flex; combined_1f1b uses
+                                              # Megatron's reference A2A not DeepEP
+--recompute-granularity selective
+--delay-wgrad-compute
+```
+
+At PP=1, `schedules.py:648` routes to `combined_1f1b_schedule_for_no_pipelining`
+— just one extra output tensor, no pipeline-buffer penalty. NAM56R 4.73B
+PP=1 MBS=8 fits at ~118 GiB; overlap adds ~2-5 GiB. Should fit in
+141 GiB.
+
+**Blocker to check**: Issue #1862 (closed 2025-10-16) — combined_1f1b
+crashed with `TP=1` giving "Input A does not hold any data!". Workaround
+was TP≥2 which we can't afford (Mamba3 TP=2 is 3.2× slower). Need to
+verify the fix is present in our `core_v0.15.0rc7 + PR #3674` Megatron.
+
+Full details: `reference_combined_1f1b_solvable_path.md` memory.
+
 ## Hard rules for this cycle (enforced)
 
 - **NEVER open PRs / issues / comments in external projects (state-spaces,
