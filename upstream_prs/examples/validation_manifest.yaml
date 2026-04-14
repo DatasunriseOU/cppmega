@@ -191,7 +191,11 @@ prs:
       log_sha256: null
       verification_source: "reported_by_agent"
       notes: >-
-        Two bugs (dt fp32 cast, GQA B/C layout) + two fixes validated on bench3.
+        Shared reproducer covers two separate upstream bugs that co-trigger
+        in the same lane. For PR 05, only the GQA-backward stages are in
+        scope: `gqa_unpatched` reproduces the missing intermediate-GQA branch
+        and `gqa_patched` validates the Mamba-side fix. The `bf16/fp32`
+        stages are PR 16 evidence, not Mamba-side filing evidence.
         Reproducer convention (reproducer.py:558): returns 0 iff
         (bug1 AND fix1 AND bug2 AND fix2); returns 1 otherwise.
         GB10 run blocked by TileLang LayoutInference FloorMod divide-by-zero
@@ -327,7 +331,9 @@ prs:
         mtp_nan_reproducer.py captures the main+MTP NaN symptom that
         gates CPPMEGA_MTP_NATIVE_HOPPER_CE=1.
         RECEIPT: pack is pending — has not been executed on a capable host
-        this session.
+        this session. No retained H200 filing receipt exists yet, so this
+        pack must not be presented as receipted, H200-validated, or
+        ready-to-file.
     upstream_status:
       repo: "NVIDIA/Megatron-LM"
       issue_or_pr: 3345
@@ -338,6 +344,33 @@ prs:
         is open (not draft, updated 2026-03-23). Our pack 10 is a
         complementary reproducer + regression note; file as issue commenting
         on #3345, not as a competing PR.
+
+  "16_megatron_float16module_mamba3_cast":
+    local_path: "upstream_prs/examples/05_mamba3_dt_fp32_gqa_bwd/reproducer.py"
+    last_verified:
+      host: "h200_1"
+      date: "2026-04-14"
+      process_exit_code: 0
+      semantic_verdict: "bug_reproduced_and_fix_validated"
+      output_tags: ["BUG_REPRODUCED", "FIX_VALIDATED", "GB10_BLOCKED"]
+      log_location: null
+      log_sha256: null
+      verification_source: "reported_by_agent"
+      notes: >-
+        Shared with pack 05. For PR 16, only the `bf16` and `fp32` stages
+        are in scope: `bf16` reproduces the Float16Module-induced fp32->bf16
+        contract break on Mamba3 DT/D/bias parameters, and `fp32` validates
+        the fp32-contract path. Current cppmega workaround is the one-shot
+        Float16Module.__init__ restore in scripts/cppmega_fp8_shim.py,
+        not the older per-forward pre-hook. GB10 only reproduces the forward
+        symptom; backward there is blocked by pack 13.
+        RECEIPT: none retained on disk; verified inside session transcript
+        only. Needs receipted rerun to promote to receipted_log.
+    upstream_status:
+      repo: "NVIDIA/Megatron-LM"
+      issue_or_pr: null
+      state: "new_report"
+      verified_via: "gh api 2026-04-14"
 
   "11_mamba_linear_ce":
     local_path: "upstream_prs/examples/11_mamba_linear_ce/reproducer.py"

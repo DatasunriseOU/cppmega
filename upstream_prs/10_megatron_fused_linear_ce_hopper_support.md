@@ -94,7 +94,9 @@ Key dispatcher diff (`megatron/core/fusions/fused_linear_cross_entropy.py`):
          self._initialized = True
 ```
 
-Local validation: cherry-picked into our `dev`-pinned tree, NAM56R (Mamba3 + DSA + MoE) 8×H200 @ MBS=10 FP8 tensorwise, main-head fused linear CE active end-to-end, **269.4 TFLOP/s** sustained (matches our Liger fallback throughput, removes ~6 GiB of logits materialization vs the non-fused fallback). No regression vs Blackwell path.
+Current local status: PR #3345 has been cherry-picked into our `dev`-pinned tree, so our current H200 environment validates the **patched Hopper path**, not the original pre-fix crash. That is still useful as post-fix coverage, but it is **not** a fresh retained reproducer of `ValueError: Unsupported architecture: 9` on an unfixed tree. Also, our older `269.4 TFLOP/s` bench3 note is no longer the canonical throughput reference: repo source-of-truth now treats it as superseded, with `268 TFLOP/s` on the mean-broadcast workaround as the current honest production number. Pack 10 therefore remains **not ready to file** until we attach a retained H200 receipt for this specific reproducer/validation lane.
+
+Current local status: PR #3345 has been cherry-picked into our `dev`-pinned tree, so our current H200 environment validates the **patched Hopper path**, not the original pre-fix crash. That is still useful as post-fix coverage, but it is **not** a fresh retained reproducer of `ValueError: Unsupported architecture: 9` on an unfixed tree. Also, our older `269.4 TFLOP/s` bench3 note is no longer the canonical throughput reference: repo source-of-truth now treats it as superseded, with `268 TFLOP/s` on the mean-broadcast workaround as the current honest production number. Pack 10 therefore remains **not ready to file** until we attach a retained H200 receipt for this specific reproducer/validation lane.
 
 ## Which of our local patches are still needed vs landed upstream?
 
@@ -112,7 +114,7 @@ Local validation: cherry-picked into our `dev`-pinned tree, NAM56R (Mamba3 + DSA
 
 **Tier B — add a soft fallback for every other cc.** Instead of crashing, the dispatcher should fall back to a correct but unaccelerated path (plain `F.cross_entropy` on materialized logits, or the `fused_vocab_parallel_cross_entropy` path that already exists at `megatron/core/fusions/fused_cross_entropy.py`). The fusion flag then degrades gracefully rather than being a silent landmine.
 
-Minimal Tier-B patch (`megatron/core/fusions/fused_linear_cross_entropy.py`):
+Dispatcher sketch for Tier B (`megatron/core/fusions/fused_linear_cross_entropy.py`):
 
 ```python
 def __init__(self) -> None:
@@ -155,11 +157,11 @@ Tier B requires wrapping `fused_cross_entropy.fused_vocab_parallel_cross_entropy
 
 1. `examples/10_megatron_flce_hopper/reproducer.py` on H200 before the fix → `ValueError: Unsupported architecture: 9`.
 2. Same reproducer after #3345 merged → forward + backward succeed, grads bit-match `F.cross_entropy` reference within `atol=1e-3 rtol=1e-3` (bf16).
-3. NAM56R 8×H200 PP=1 EP=8 MBS=10 FP8 tensorwise, main-head `LinearCrossEntropyModule`: sustained 269.4 TFLOP/s with fused Hopper path vs 267 TFLOP/s with Liger fallback — identical loss curve across 200 steps.
+3. Current H200 post-fix validation in our tree should be described narrowly: the Hopper native path loads and runs after the #3345-style dispatcher change, but this is **patched-tree validation**, not a fresh repro of the original unsupported-arch failure.
 4. Tier-B fallback test: set `CUDA_VISIBLE_DEVICES` to a cc=8.x device (A100) and confirm warning + correctness against eager reference.
 
 ## References
 
 - Our reroute / workaround: `cppmega/megatron/apply_linear_ce_patch.py` (auto-probes `_get_platform()`; installs Apple CCE or Liger fused CE when native raises).
-- Local confirmation of PR #3345: see memory note `reference_main_head_liger_ce_gap.md` — bench3 MBS=10 + Liger main-head = 269.4 TFLOP/s, new record.
-- Our per-machine FP8 configs: `reference_golden_config_2026_04_13.md`, `reference_fp8_mbs10_bench3_wins.md`.
+- Current production/source-of-truth status: `docs/production_status.md` marks bench3 `269.4 TFLOP/s` as **SUPERSEDED** and keeps `268 TFLOP/s` with the mean-broadcast workaround as the canonical number.
+- Validation/readiness source: `upstream_prs/SUBMISSION_CHECKLIST.md` keeps PR 10 at **Ready: N** pending an H200 rerun with captured log.

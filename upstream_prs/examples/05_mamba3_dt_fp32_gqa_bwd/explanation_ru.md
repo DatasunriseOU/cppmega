@@ -116,7 +116,16 @@ elif H % G == 0:
 - **Файл 1:** `mamba_ssm/modules/mamba3.py`, строки 169 и 255.
 - **Файл 2:** `mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py`, около строки 1310 (функция `mamba_mimo_bwd_combined`).
 - **Файл 3:** `mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd_varlen.py`, около строки 1374 (функция `mamba_mimo_bwd_combined_varlen`).
-- **Полный патч:** `upstream_prs/05_mamba3_dt_fp32_gqa_bwd.patch`.
+- **Локальный convenience patch:** `upstream_prs/05_mamba3_dt_fp32_gqa_bwd.patch`.
+
+Важно: этот `.patch` сейчас объединяет **два разных upstream-fix'а**,
+потому что они ко-триггерятся в одном Megatron + Mamba3 training lane.
+Для upstream filing их надо разделять:
+
+- `bf16` / `fp32` стадии reproducer'а — это **PR 16** против `NVIDIA/Megatron-LM`
+  (Float16Module silently casts Mamba3 fp32-contract params).
+- `gqa_unpatched` / `gqa_patched` стадии — это **PR 05** против
+  `state-spaces/mamba` (missing intermediate GQA branch in MIMO backward).
 
 Чтобы посмотреть на bench3:
 
