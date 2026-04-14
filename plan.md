@@ -117,12 +117,27 @@ production (we need EP=4 for memory/expert distribution).
 
 ### Action items when agents return
 
-- [ ] When bench3 selective-P1 agent returns: review IndentationError
-  fix. If clean + TFLOP/s measured: land as interim win (~1.3-1.8%).
-- [ ] When europe DualPipeV EP=1 retry returns: if works, document
-  "DualPipeV works on dense but fundamentally incompatible with EP";
-  close direction and stop spending cycles on it.
-- [ ] Immediately when a H200 frees: **launch full P1 + TMA fix smoke**:
+- [x] **bench3 selective-P1 agent returned** (commit `d80bf9c`):
+  - Infrastructure shipped: rank-0-only + flock race fix, atomic writes,
+    line-count-preserving patch (merge onto FAST_MATH line — fixes the
+    IndentationError from `co_firstlineno` desync).
+  - Scope narrowed to fwd + fwd_varlen only.
+  - Measurement: **wash** (183.016 → 183.005 TFLOP/s, -0.006% noise).
+    Fwd not the bottleneck at MBS=8. Memory +0.76 GiB.
+  - Verdict: HOLD selective-fwd P1 default OFF. Ship infra.
+  - New memory: `reference_py_patch_line_shift_bug.md`,
+    `reference_mamba_ssm_reinstall.md`.
+- [x] **DualPipeV EP=1 agent STOPPED** at test-iter 3: europe was
+  verified idle, agent was stuck in SSH loop. Killed it to free
+  europe for the higher-ROI full P1 + TMA fix measurement.
+- [~] **europe full P1 + TMA fix agent LAUNCHED** (a21a3192d964308bb):
+  - Checks out `tma-layout-fix-3d-to-2d` branch
+  - Applies P1 + TMA layout fix patches
+  - Compile probe at NAM56R shape on H200 sm_90
+  - Baseline vs P1+TMA smoke (MBS=8, 25 iters, PP=1 EP=4 no-CG)
+  - Target: ≥3% TFLOP/s gain → ship to main; <3% → keep infra + hold
+
+### Action items (still active)
   - Apply: `apply_mamba3_mimo_p1_patches` + `apply_mamba3_mimo_tma_layout_fix`
   - Config: PP=1 EP=4 MBS=8 no-CG FP8 tensorwise, 25 iters
   - Compare TFLOP/s + peak memory + loss vs 253/289 baseline
