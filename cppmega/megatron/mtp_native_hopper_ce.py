@@ -1,6 +1,6 @@
 """Route MTP head cross-entropy to native Megatron LinearCrossEntropyModule.
 
-Env gate: ``CPPMEGA_MTP_NATIVE_HOPPER_CE=1``
+Gate: ``CPPMEGA_MTP_NATIVE_HOPPER_CE=1``
 
 Post-PR #3345 the upstream ``process_mtp_loss`` in
 ``megatron/core/transformer/multi_token_prediction.py`` **already has** a
@@ -16,10 +16,10 @@ the main head. That branch activates when both of these are set on the
 Both are flipped by ``--cross-entropy-loss-fusion --cross-entropy-fusion-impl
 linear`` on the Megatron CLI.
 
-The ``output_layer.__class__`` swap is performed by
-``cppmega.megatron.apply_linear_ce_patch`` on :class:`MambaModel` when
-``CPPMEGA_MAIN_HEAD_LINEAR_CE=1``. ``process_mtp_loss`` sees the same
-``self.output_layer`` reference so the class swap propagates transparently.
+The ``output_layer.__class__`` swap is performed unconditionally by
+``cppmega.megatron.apply_linear_ce_patch`` on :class:`MambaModel`.
+``process_mtp_loss`` sees the same ``self.output_layer`` reference so the
+class swap propagates transparently.
 
 HOWEVER: the upstream fuse_linear_cross_entropy branch in
 ``process_mtp_loss`` calls ``output_layer(..., reduction="none")`` (the
@@ -40,9 +40,7 @@ returns a scalar and never reshapes.
 
 So this module is BOTH a verification shim AND a monkey-patch:
 
-  * Preflight: refuse to install if ``CPPMEGA_MTP_LIGER_CE=1`` (Liger
-    replacement would override ``process_mtp_loss`` and undo our patch).
-  * Preflight: refuse to install if ``CPPMEGA_MAIN_HEAD_LINEAR_CE=0``
+  * Preflight: assert the always-on main-head class swap is present
     (no class swap → ColumnParallelLinear raises on kwargs).
   * Preflight: assert ``--cross-entropy-loss-fusion --cross-entropy-fusion-
     impl linear`` on the CLI via a post-init hook on :class:`MambaModel`.
@@ -74,29 +72,10 @@ def patch_mtp_native_hopper_ce() -> None:
     if os.environ.get("CPPMEGA_MTP_NATIVE_HOPPER_CE", "0") != "1":
         return
 
-    # Hard error if user tries to stack with MTP Liger: the Liger patch
-    # replaces process_mtp_loss entirely, which would bypass the native
-    # fusion and reintroduce the bwd bug we're trying to avoid.
-    if os.environ.get("CPPMEGA_MTP_LIGER_CE", "0") == "1":
-        raise RuntimeError(
-            "[cppmega] CPPMEGA_MTP_NATIVE_HOPPER_CE=1 is mutually exclusive "
-            "with CPPMEGA_MTP_LIGER_CE=1. The Liger MTP patch monkey-patches "
-            "process_mtp_loss and would defeat the native fusion. Set "
-            "CPPMEGA_MTP_LIGER_CE=0 to use the native path."
-        )
-
     # Class swap on output_layer is what makes the native fusion branch in
     # process_mtp_loss work. Without it, output_layer is plain
     # ColumnParallelLinear which raises TypeError on
     # output_cross_entropy_loss=True / labels= kwargs.
-    if os.environ.get("CPPMEGA_MAIN_HEAD_LINEAR_CE", "0") != "1":
-        raise RuntimeError(
-            "[cppmega] CPPMEGA_MTP_NATIVE_HOPPER_CE=1 requires "
-            "CPPMEGA_MAIN_HEAD_LINEAR_CE=1 (the class swap on "
-            "MambaModel.output_layer -> LinearCrossEntropyModule is shared "
-            "between main head and MTP head)."
-        )
-
     try:
         from megatron.core.models.mamba.mamba_model import MambaModel
         from megatron.core.transformer.linear_cross_entropy import (
@@ -138,7 +117,8 @@ def patch_mtp_native_hopper_ce() -> None:
         if not isinstance(self.output_layer, LinearCrossEntropyModule):
             raise RuntimeError(
                 "[cppmega] MTP native Hopper CE expected output_layer to be "
-                "LinearCrossEntropyModule (installed by apply_linear_ce_patch)"
+                "LinearCrossEntropyModule (installed unconditionally by "
+                "apply_linear_ce_patch)"
                 f" but found {type(self.output_layer).__name__}. This most "
                 "likely means apply_linear_ce_patch ran BEFORE MambaModel was "
                 "constructed — check shim ordering in pretrain_mamba.py."

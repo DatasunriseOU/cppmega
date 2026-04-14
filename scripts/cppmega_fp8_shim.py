@@ -221,7 +221,7 @@ except Exception as _exc:  # pragma: no cover
 
 
 # -----------------------------------------------------------------------------
-# (6) MTP Liger fused linear cross-entropy (env-driven: CPPMEGA_MTP_LIGER_CE=1)
+# (6) MTP Liger fused linear cross-entropy (always-on)
 # -----------------------------------------------------------------------------
 # Replaces the per-depth output_layer(hidden) + CE pair in process_mtp_loss
 # with Liger-Kernel's fused_linear_cross_entropy Triton kernel.  Eliminates

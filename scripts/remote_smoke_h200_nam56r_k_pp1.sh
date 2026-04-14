@@ -249,16 +249,14 @@ try:
 except Exception:
     pass
 
-# (6) DSA FP8 indexer monkey-patch (Stream D v2 / Stream E)
-try:
-    from cppmega.megatron.dsa_fp8_patch import apply_dsa_fp8_patch, resolve_indexer_dtype
-    _dtype = resolve_indexer_dtype(None)
-    print(f"[cppmega_mimo_shim] CPPMEGA_DSA_INDEXER_DTYPE resolves to {_dtype!r}")
-    _applied = apply_dsa_fp8_patch()
-    print(f"[cppmega_mimo_shim] DSA FP8 patch applied={_applied}")
-except Exception as _exc:
-    print(f"[cppmega_mimo_shim] DSA FP8 patch FAILED: {_exc}", file=sys.stderr)
-    raise
+# (6) DSA indexer path (bf16-only after FP8 indexer removal)
+_dtype = os.environ.get("CPPMEGA_DSA_INDEXER_DTYPE", "bf16").lower()
+print(f"[cppmega_mimo_shim] CPPMEGA_DSA_INDEXER_DTYPE resolves to {_dtype!r}")
+if _dtype == "fp8":
+    raise RuntimeError(
+        "CPPMEGA_DSA_INDEXER_DTYPE=fp8 is no longer supported: dsa_fp8_patch.py "
+        "and dsa_fp8_indexer.py were deleted on 2026-04-13. Use bf16."
+    )
 PY
 
 cp "${MEGATRON_DIR}/pretrain_mamba.py" "${WORKDIR}/pretrain_mamba_original.py"
@@ -386,7 +384,7 @@ if echo "${NATIVE_ARGS} ${CG_FLAGS} ${MOE_EXTRA_FLAGS} ${ROPE_FLAG}" | grep -E "
   exit 9
 fi
 
-echo "=== Stream K v${K_VARIANT} - NAM56R full 7/7 MIMO + DSA 9+4 + FP8 indexer + PP=1 topology ==="
+echo "=== Stream K v${K_VARIANT} - NAM56R full 7/7 MIMO + DSA 9+4 + bf16 indexer + PP=1 topology ==="
 echo "RUN_ID=${RUN_ID}"
 echo "TP=${TP_SIZE} PP=${PP_SIZE} VPP=${VPP_SIZE} EP=${EP_SIZE} MBS=${MBS} GBS=${GBS} MTP=${MTP_DEPTHS}"
 echo "DSA_A_LAYER_RANKS=${CPPMEGA_DSA_A_LAYER_RANKS}"

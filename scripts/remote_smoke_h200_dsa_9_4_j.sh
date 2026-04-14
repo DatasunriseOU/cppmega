@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Stream J (task #87): NAM56R DSA 9+4 + FP8 indexer memory-fit sweep.
+# Stream J (task #87): NAM56R DSA 9+4 memory-fit sweep on the surviving bf16 indexer path.
 #
 # Sequentially applies 4 memory-optimization variants on top of the
 # Stream D v2 configuration that OOM'd on stage 1 (PP=2 VPP=2 MBS=4 GBS=64
-# MTP=2 + DSA 9+4 + FP8 indexer fwd+bwd). Each variant is invoked by setting
+# MTP=2 + DSA 9+4 on the surviving bf16 indexer path). Each variant is invoked by setting
 # VARIANT=v{1..4} in the environment before running this script.
 #
 # V1: FP8 fwd + FP8 bwd (Stream G) only -- no other change.
@@ -197,17 +197,14 @@ try:
 except Exception:
     pass
 
-# (5) Stream E+G: DSA FP8 fwd+bwd indexer patch
+# (5) DSA indexer path (bf16-only after FP8 indexer removal)
 _dsa_dtype = os.environ.get("CPPMEGA_DSA_INDEXER_DTYPE", "bf16").lower()
 print(f"[cppmega_mimo_shim] CPPMEGA_DSA_INDEXER_DTYPE resolves to '{_dsa_dtype}'")
 if _dsa_dtype == "fp8":
-    try:
-        from cppmega.megatron.dsa_fp8_patch import apply_dsa_fp8_patch
-        _applied = apply_dsa_fp8_patch()
-        print(f"[cppmega_mimo_shim] DSA FP8 patch applied={_applied}")
-    except Exception as _exc:
-        print(f"[cppmega_mimo_shim] DSA FP8 patch failed: {_exc}", file=sys.stderr)
-        raise
+    raise RuntimeError(
+        "CPPMEGA_DSA_INDEXER_DTYPE=fp8 is no longer supported: dsa_fp8_patch.py "
+        "and dsa_fp8_indexer.py were deleted on 2026-04-13. Use bf16."
+    )
 
 # (6) Stream J: per-rank peak-memory reporter (atexit hook)
 def _cppmega_peak_mem_report():
@@ -329,8 +326,12 @@ if [ "${NO_ROPE_FUSION}" = "1" ]; then
 fi
 
 python -c 'import cppmega, megatron; print("cppmega", cppmega.__version__)'
-python -c "from cppmega.megatron.dsa_fp8_patch import apply_dsa_fp8_patch; print('dsa_fp8_patch importable')"
-python -c "from cppmega.megatron.dsa_fp8_indexer import bwd_fused_indexer_loss_fp8, compute_index_scores_fp8; print('dsa_fp8_indexer fwd+bwd importable')"
+python - <<PY
+import os
+dtype = os.environ.get("CPPMEGA_DSA_INDEXER_DTYPE", "bf16").lower()
+assert dtype == "bf16", f"expected bf16 live DSA indexer path, got {dtype!r}"
+print("live DSA indexer path validated: bf16 only")
+PY
 
 # Validate DSA A-layer rank parsing.
 python - <<PY
@@ -358,7 +359,7 @@ if echo "${NATIVE_ARGS} ${CG_FLAGS} ${MOE_EXTRA_FLAGS} ${ROPE_FLAG} ${EXTRA_FLAG
   exit 9
 fi
 
-echo "=== Stream J NAM56R 7/7 MIMO + DSA 9+4 + FP8 indexer (${VARIANT}) ==="
+echo "=== Stream J NAM56R 7/7 MIMO + DSA 9+4 + bf16 indexer (${VARIANT}) ==="
 echo "RUN_ID=${RUN_ID} VARIANT=${VARIANT} TP=${TP_SIZE} PP=${PP_SIZE} VPP=${VPP_SIZE} EP=${EP_SIZE} MBS=${MBS} GBS=${GBS} MTP=${MTP_DEPTHS}"
 echo "DSA_A_LAYER_RANKS=${CPPMEGA_DSA_A_LAYER_RANKS}"
 echo "CPPMEGA_DSA_INDEXER_DTYPE=${CPPMEGA_DSA_INDEXER_DTYPE}"
