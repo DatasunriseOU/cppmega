@@ -130,6 +130,8 @@ def _get_sparse_mla_fwd_kernel(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        # GB10 sm_121 99 KiB smem cap — see reference_gb10_bwd_bwd_blocker.md.
+        tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
     },
 )
 def sparse_mla_fwd(
