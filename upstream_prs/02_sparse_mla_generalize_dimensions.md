@@ -65,16 +65,16 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None, d_v=None, ...):
     D = d_v if d_v is not None else o.shape[-1]
 ```
 
-### 5. FP32 precision for P/dP in backward
-
-While generalizing, fix a precision issue: `P_shared_cast` and `dP_shared_cast` use `dtype` (bf16) but should use `accum_dtype` (fp32) for numerical stability in dKV gradient computation.
-
 ## Files Changed
 
 - `megatron/core/transformer/experimental_attention_variant/dsa.py`
 - `megatron/core/transformer/experimental_attention_variant/ops/sparse_mla.py`
 - `megatron/core/transformer/experimental_attention_variant/ops/tilelang_sparse_mla_fwd.py`
 - `megatron/core/transformer/experimental_attention_variant/ops/tilelang_sparse_mla_bwd.py`
+
+## Out of scope
+
+The `P_shared_cast` / `dP_shared_cast` fp32 precision fix in the backward kernel is tracked separately in `14_sparse_mla_precision.md` — it is independent of dimension generalization.
 
 ## Testing
 
