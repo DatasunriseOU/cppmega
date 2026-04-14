@@ -172,7 +172,7 @@ Reproducer (`reproducer.py` в этой же папке) — это **миним
    - Q/K тензоры формы `[B, S, R, G, N]`.
    - smem `[chunk_size, R, N]` для load и `[chunk_size, R, R]` для qk_dot.
    - Компилируется с `TL_DISABLE_TMA_LOWER=False`.
-   - Ожидаем `ASSERTION_HIT_AT_3D` (на старом TileLang) или `COMPILE_FALLBACK_AT_3D` (на TileLang ≥ #746).
+   - Ожидаем `ASSERTION_HIT_AT_3D` (на старом TileLang) или `COMPILE_FALLBACK_AT_3D` (на TileLang ≥ #746), но только если реальный assertion/warning действительно пойман. Если 3D-ветка просто компилируется и не печатает fallback evidence, reproducer оставляет статус `OK` и не лепит false-positive tag.
 
 2. **Variant B (2D, post-refactor):**
    - Q/K тензоры формы `[B, S*R, G, N]`.
@@ -201,7 +201,8 @@ SHAPES           : B=1 S=8 R=4 G=1 N=16 chunk=4
 PR 07 target     : state-spaces/mamba — mamba3_mimo_bwd.py
 
 [A] 3D smem variant ...
-    STATUS: COMPILE_FALLBACK_AT_3D       (post-PR-746 TileLang)
+    STATUS: COMPILE_FALLBACK_AT_3D       (post-PR-746 TileLang, warning пойман)
+    # либо STATUS: OK (compiled, но fallback warning не пойман)
 
 [B] 2D smem variant ...
     STATUS: CLEAN_COMPILE_AT_2D
@@ -209,7 +210,7 @@ PR 07 target     : state-spaces/mamba — mamba3_mimo_bwd.py
 [C] Correctness ...
     STATUS: CORRECTNESS_PASS
 
-TAGS: COMPILE_FALLBACK_AT_3D CLEAN_COMPILE_AT_2D CORRECTNESS_PASS
+TAGS: [опционально COMPILE_FALLBACK_AT_3D] CLEAN_COMPILE_AT_2D CORRECTNESS_PASS
 VERDICT: OK
 ```
 
