@@ -85,3 +85,22 @@ These issues should be reported upstream:
 - CUDA graph torch.equal: trivial fix, could PR
 - Dimension hardcodes: upstream only tested with DeepSeek V3.2
 - D=512 hardcode: same, upstream limitation
+
+---
+
+## Mamba3 MIMO P1 Patches (opt-in, separate script)
+
+`apply_mamba3_mimo_p1_patches.py` flips
+`TL_DISABLE_TMA_LOWER` / `TL_DISABLE_WARP_SPECIALIZED` from True to False on
+all 8 `@tilelang.jit` pass_configs in upstream
+`mamba_ssm.ops.tilelang.mamba3.*` (fwd, bwd, bwd_varlen, fwd_varlen). Also
+ensures `TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True` is present on every
+site so GB10 sm_121 keeps working on shapes that remain in-budget.
+
+Env-gated: `CPPMEGA_MAMBA3_P1=1` to opt in. Default OFF. See
+`docs/mamba3_mimo_p1_notes.md` for correctness tables and the H200 perf TODO.
+
+To apply manually:
+```bash
+python -m cppmega.megatron.upstream_patches.apply_mamba3_mimo_p1_patches
+```

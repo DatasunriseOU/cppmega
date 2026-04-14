@@ -83,6 +83,9 @@ export CPPMEGA_LEMYX_DSA="${CPPMEGA_LEMYX_DSA:-0}"
 export CPPMEGA_DSA_FP8_ATTENTION="${CPPMEGA_DSA_FP8_ATTENTION:-0}"
 # IndexCache: cross-layer index reuse for DSA (skip indexer on 6/9 layers)
 export CPPMEGA_INDEX_CACHE="${CPPMEGA_INDEX_CACHE:-0}"
+# Mamba3 MIMO P1: enable TMA + warp specialization in upstream TileLang kernels.
+# Opt-in until H200 perf is confirmed. See docs/mamba3_mimo_p1_notes.md.
+export CPPMEGA_MAMBA3_P1="${CPPMEGA_MAMBA3_P1:-0}"
 # Always on — prevents fragmentation OOM on large models
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export NCCL_GRAPH_REGISTER=0
@@ -339,6 +342,12 @@ else:
 # (10) Mamba3 regional torch.compile — always on, no env gate
 from cppmega.megatron.mamba3_compile_patch import apply_mamba3_compile_patch
 apply_mamba3_compile_patch()
+
+# (10b) Mamba3 MIMO P1: TMA + warp specialization (CPPMEGA_MAMBA3_P1=1)
+# Opt-in until H200 perf is confirmed. See docs/mamba3_mimo_p1_notes.md.
+if os.environ.get("CPPMEGA_MAMBA3_P1", "0") == "1":
+    from cppmega.megatron.upstream_patches.apply_mamba3_mimo_p1_patches import apply_all as _apply_mamba3_p1
+    _apply_mamba3_p1()
 
 # (9) MTP Liger fused CE (CPPMEGA_MTP_LIGER_CE=1)
 if os.environ.get("CPPMEGA_MTP_LIGER_CE", "0") == "1":
