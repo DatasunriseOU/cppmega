@@ -1,5 +1,33 @@
 # NAM56R optimization plan — next 10 hours
 
+## Test iter 14 finding (2026-04-14 late evening)
+
+**bench3 PP=1 EP=8 (VARIANT=v3) baseline stable at 257 TFLOP/s** (iters
+3-14 steady-state). Prior record was 253 TFLOP/s at PP=1 EP=4. This is
+a **+1.6% real gain** — marginal but reproducible. Loss converging
+(11.95 → 7.07), grad_norm reasonable. **Production candidate**: switch
+bench3 default from EP=4 to EP=8.
+
+**Europe P1+TMA test FAILED** — agent ab0cdd07a098d108a returned:
+- **TMA layout fix branch (`tma-layout-fix-3d-to-2d` @ `31dc695`) is
+  BROKEN on H200**: `csr % R` / `csr // R` modulo indexing in
+  `mamba_mimo_bwd_bwd_kernel` trips TileLang's LayoutInference
+  FloorMod const-fold with "Divide by zero".
+- **GB10 correctness test was a false positive**: GB10's 99 KiB smem
+  cap prevented bwd_bwd from running at NAM56R shape, so the buggy
+  path never exercised. **Lesson**: GB10 correctness ≠ H200 correctness.
+- **GQA patch tangled in same diff**: pristine mamba_ssm reinstall
+  loses our local `elif H % G == 0` branch → `G value of 8 not supported`
+  (matches `reference_env_drift_bench3_europe.md` memory).
+
+**Direction change**:
+1. **Do NOT merge tma-layout-fix-3d-to-2d to main**. P1 full is blocked.
+2. **Ship PP=1 EP=8 (v3) config** as new bench3 production candidate
+   pending overlap test completion + europe cross-validation.
+3. **TMA layout fix repair** deferred: needs `T.constexpr` hints or
+   modulo elimination in `qk_dot_shared` indexing. 1-2 days kernel
+   surgery. See `reference_tma_layout_fix_broken_h200.md`.
+
 ## Pivot 2026-04-14: DualPipeV is phantom, combined_1f1b is canon
 
 Exa deep research (agent ad869db932d3e8d66) confirmed:
