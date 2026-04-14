@@ -82,10 +82,13 @@ INNER_CMD=(env "${ENV_ASSIGNS[@]}" bash "${SCRIPT_AND_ARGS[@]}")
   echo "${CHILD_PID}" > "${PID_FILE}"
   disown "${CHILD_PID}" 2>/dev/null || true
 
-  # Watchdog: update status file when child exits.
+  # Watchdog: poll the child PID and update status file when it exits.
+  # `wait` can't be used because the watchdog runs in a sibling subshell
+  # where ${CHILD_PID} is not its own child, so `wait` returns immediately.
   (
-    wait "${CHILD_PID}" 2>/dev/null
-    echo "DONE $?" > "${STATUS_FILE}"
+    while kill -0 "${CHILD_PID}" 2>/dev/null; do sleep 5; done
+    # Can't read exit code cross-process; report as DONE unknown.
+    echo "DONE" > "${STATUS_FILE}"
   ) >/dev/null 2>&1 &
   disown $! 2>/dev/null || true
 ) </dev/null >/dev/null 2>&1
