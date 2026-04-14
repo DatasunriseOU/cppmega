@@ -13,5 +13,6 @@ exec env \
   FP8_FLAGS="--fp8-format hybrid --fp8-recipe tensorwise --fp8-amax-history-len 1024 --fp8-amax-compute-algo max" \
   CPPMEGA_INDEX_CACHE=1 CPPMEGA_LEMYX_DSA=1 \
   CPPMEGA_LINEAR_CE_KERNEL=liger \
-  EXTRA_FLAGS="--cross-entropy-loss-fusion --cross-entropy-fusion-impl linear" \
+  CPPMEGA_DSA_INDEXER_LOSS_COEFF=0 \
+  EXTRA_FLAGS="--cross-entropy-loss-fusion --cross-entropy-fusion-impl linear --recompute-granularity selective --recompute-modules moe_act mlp mla_up_proj --mla-down-proj-fusion --clip-grad 1.0" \
   bash "$(dirname "$0")/remote_smoke_h200_dsa_9_4_m.sh"
