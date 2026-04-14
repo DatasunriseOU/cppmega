@@ -414,7 +414,9 @@ Direct SSH `dave@H200_1_IP` возвращал Permission denied. Fix: pipe pubk
 - Suspect #2 (`CUDA_GRAPH_FLAGS=NONE` not propagating through TE `make_graphed_callables`): **pending** — test deferred to next session.
 
 **Drift discoveries (new this afternoon)**:
-- **Megatron version**: both bench3 and europe are on `0.16.0rc0`, NOT `0.18` as previously documented in README. Verified from `megatron/core/package_info.py`. README + memory notes updated.
+- **Megatron version**: per-machine divergence (see `docs/megatron_restoration_recipe.md` and `docs/session_3_gap_audit.md` for authoritative source):
+  - **bench3**: `megatron-core 0.18.0rc0` — installed via `pip install git+NVIDIA/Megatron-LM@980211ae`, with local PR #3345 cherry-pick. The bench3 tarball's `package_info.py` reports `0.16.0rc0` but the actually-installed site-packages is `0.18.0rc0` (this caused the earlier "both at 0.16" misread).
+  - **europe**: `megatron-core 0.16.0rc0` — `dev_latest` branch, 2 commits ahead of `origin/dev`, with PR #3674 + PR #4268 cherry-picks.
 - **Bench3 megatron has NO `.git`**: flat tree only. Restoration recipe relies on `sftp://…/megatron_lm_tree.tar.gz` as authoritative.
 - **Europe 2 commits ahead of `origin/dev`**: `ec6a9e900` (PR #4268 cherry-pick) on top of `2eeabc668` (PR #3674 merge). Bench3 likely at `2eeabc668` only (PR #4268 path never exercised on bench3 which runs PP=1).
 - **mamba_ssm fork drift**: bench3 at `31f3d7b` + 4 modified files; europe at `31f3d7b` + 3 modified files + stock `.orig` copy. Previously assumed identical — they are not.

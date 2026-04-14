@@ -7,7 +7,7 @@ Fixes in upstream dependencies that affect (or may affect) cppmega.
 ## state-spaces/mamba PR #909 -- Cache ctx.saved_tensors in Mamba3 backward (FSDP activation checkpointing)
 
 - **PR**: https://github.com/state-spaces/mamba/pull/909
-- **Status**: Open (as of 2026-04-10)
+- **Status**: Open (re-verified 2026-04-14 via `gh api` — `mergedAt=null`, `updatedAt=2026-04-09T16:50:01Z`)
 - **File modified**: `mamba_ssm/ops/triton/mamba3/mamba3_siso_combined.py`
 - **Severity**: Critical when using FSDP activation checkpointing with Mamba3 scan kernels
 
@@ -98,8 +98,10 @@ def backward(ctx, *grad_outputs):
 
 **Action items**:
 
-- When upgrading `mamba-ssm` pip dependency, ensure the installed version includes
-  this fix (PR #909 merged, or commit `809b31ec`+).
+- Track progress of open PR #909 upstream; when it merges, upgrade
+  `mamba-ssm` pip dependency to a version that includes the fix
+  (commit `809b31ec`+ once landed). As of 2026-04-14 PR #909 is still
+  **open** — if you need the fix today, apply it locally.
 - If CppMegaMamba3TE is ever re-enabled with FSDP activation checkpointing, this
   fix is mandatory.
 
