@@ -51,10 +51,12 @@ TRAIN_LOG="/home/dave/logs/golden_smoke_$(date +%Y%m%d_%H%M%S).log"
 echo "$TRAIN_LOG" > /tmp/golden_smoke_log_path
 log "TRAIN_LOG=$TRAIN_LOG"
 
-# Switched bench3-smoke (MBS=10) → bench3-mbs8 because golden MBS=10 OOMs
-# at 134.65 GiB / 139.80 GiB cap on bench3 (verified 2026-04-15). MBS=8
-# gives ~10 GiB margin. See scripts/run_bench3_mbs8_fp8.sh header.
-step launch bash scripts/run_bench3_mbs8_fp8.sh
+# Golden MBS=10 with selective recompute + MLA fusion + clip-grad + indexer
+# loss off (per reference_fp8_mbs10_bench3_wins.md). Earlier MBS=10 OOM
+# (commit 93217b0 forensics) was caused by my run_bench3_golden_fp8.sh
+# wrapper dropping --recompute-granularity selective from EXTRA_FLAGS;
+# fixed in commit 36584ad. Reverting to MBS=10 to match golden 268.
+step launch bash scripts/run_bench3_golden_fp8.sh
 
 # On failure, show last 30 lines of the training log to make diagnosis
 # possible from STEPLOG alone (no need to ssh in and grep).
