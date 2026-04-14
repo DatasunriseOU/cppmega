@@ -92,6 +92,82 @@
 
 ---
 
+## Afternoon session (2026-04-14) — PR filing prep + backup + drift discovery
+
+### Work shipped
+
+1. **13 PR templates + reproducers + explanation_ru.md drafted** covering Liger
+   FLCE bug (C1), Megatron PR #3345 MTP extension (C2), DSA indexer fused
+   memory patch (C3), TileLang TMA 3D→2D smem fallback (C4), Apple CCE 25.9.3
+   upgrade (C5), `apply_linear_ce_patch.py` main-head swap (C6), Mamba3 P1
+   patches (C7), `mtp_native_hopper_ce.py` (C8), mamba_ssm fork drift (C9),
+   bench3 specific `mamba3_mimo_bwd.py` patch (C10), FP8 sparse MLA europe-only
+   files (C11), DualPipeV abandoned path cleanup (C12), combined_1f1b
+   documentation (C13). All drafts local, **nothing filed upstream** pending
+   user explicit approval per `feedback_pr_approval.md`.
+
+2. **MCP grounding of PR claims** — `.tmp/mcp_grounding_pr_claims.md`. Key findings:
+   - Perplexity hallucinated **PR #680** as the Liger FLCE `reduction="none"`
+     fix; the real #680 is for non-fused LigerCrossEntropy (different module,
+     doesn't help FLCE path). **Do not cite #680 as a FLCE fix in any upstream
+     comment.**
+   - PRs #968 / #1126 plausible but could not be independently confirmed by
+     MCP engines — verify on GitHub directly before quoting in any filing.
+
+3. **Full backups captured + pushed to GS**:
+   - `sftp://BUCKET_ARTIFACTS/backups/backup_bench3_2026_04_14/` — 17 MiB, 23
+     objects. Incl. `megatron_lm_tree.tar.gz` (flat tree, **no `.git`** — this
+     motivated the restoration recipe below)
+   - `sftp://BUCKET_ARTIFACTS/backups/backup_europe_2026_04_14/` — full state
+     including `.git` HEAD hashes and format-patch files for unpushed commits
+
+4. **Megatron restoration recipe** — `docs/megatron_restoration_recipe.md`.
+   Discovered bench3 megatron tree has **no `.git` history**; recipe pins the
+   tarball in GS as authoritative source-of-truth, documents best-effort
+   upstream commit hypothesis (bench3 likely at `2eeabc668` — PR #3674 only),
+   provides diff procedure to confirm against upstream when network available.
+
+5. **README Megatron Version corrections** (`README.md` section around line
+   154): the previous claim of "megatron-core 0.18" was wrong. Verified from
+   `megatron/core/package_info.py` in **both** bench3 tarball and europe git
+   working tree: version is `0.16.0rc0` on both machines. Per-machine
+   divergence recorded (base commit, patches, notes).
+
+### Diagnostic findings (no new code)
+
+- **MTP NaN Suspect #1 REFUTED**: `apply_linear_ce_patch.py` Liger routing has
+  correct `expand(b,s).contiguous()` broadcast pattern — re-reviewed math,
+  matches what #968 workaround requires. NaN at MBS=12 backward is NOT caused
+  by this patch. Moved investigation to Suspect #2.
+- **MTP NaN Suspect #2 pending CG_FLAGS=NONE propagation**: Need to verify
+  whether `CUDA_GRAPH_FLAGS=NONE` env var actually threads through to the TE
+  `make_graphed_callables` path or gets silently ignored — next session.
+
+### Drift discoveries (previously unknown)
+
+- **bench3 vs europe megatron divergence**: earlier memory note claimed bench3
+  "megatron-core 0.18" — false. Both are 0.16.0rc0. Install paths differ
+  (bench3 = flat tarball, europe = live git on `dev_latest` 2 commits ahead
+  of `origin/dev`). Bench3's upstream base commit is unverified (no `.git`);
+  likely `2eeabc668` (PR #3674 only) because bench3 never exercised PR #4268's
+  PP>1 wgrad overlap path.
+- **mamba_ssm fork drift `31f3d7b` vs `4f4857f`**: bench3 at `31f3d7b`
+  detached + 4 modified files; europe at `31f3d7b` detached + 3 modified
+  files + `mamba3_siso_bwd.py.orig` stock copy. Previously assumed both
+  machines ran the same fork — they do not.
+- **Europe-only FP8 sparse_mla files**: `tilelang_sparse_mla_{fwd,bwd}_fp8.py`
+  and `__init__.py` in `experimental_attention_variant/ops/` exist only on
+  europe (not bench3). These are captured in `europe_megatron_modified.tar.gz`.
+  Port to bench3 if FP8 sparse MLA path ever becomes desired.
+
+### Status transitions this session
+
+- In production: bench3 FP8 MBS=10 EP=8 v3 = 268-269.4 TFLOP/s, europe BF16 MBS=8 EP=4 = 289 TFLOP/s (unchanged this session)
+- In test: all 13 PR templates (awaiting user approval gate before any filing)
+- Deferred: MBS=12 backward NaN debug (needs Suspect #2 CG flag propagation test), Mamba3 P2 PsiV cache (~5 days, not started), TileLang upstream issue/PRs (draft only)
+
+---
+
 ## EMPIRICAL CONFIG EXPLORATION COMPLETE (2026-04-14 deep night)
 
 **Stop running config sweeps.** 20 empirical tests across every dimension
