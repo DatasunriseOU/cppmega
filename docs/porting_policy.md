@@ -19,7 +19,11 @@
 - local NeMo AutoModel checkout: `/private/tmp/nemo_automodel`
 - local author Mamba checkout: `/private/tmp/state-spaces-mamba`
 - local `nanochat` checkout: `/Volumes/external/sources/nanochat`
-- remote CUDA target: `h200_legacy`
+- remote CUDA targets (current, 2026-04):
+  - **bench3** (LOCATION_1), hostname `h200_1`, root `/mnt/data/cppmega-root`, venv `/mnt/data/venv`
+  - **europe** (LOCATION_2), hostname `h200_1`, root `/home/dave/cppmega-root`, venv `/home/dave/cppmega-root/cppmega-venv`
+  - **GB10** (local network, hostname `gx10-9cd4`), root `/home/dave`, venv `/home/dave/cppmega-venv` — single-GPU sm_121 kernel-dev anchor, NOT a training target
+- remote CUDA target (**LEGACY / deprecated**, kept for historical scripts only): `h200_legacy` — bring-up machine from the 2026-01..02 era. Do not target for new work; many references to it in `scripts/remote_*` ship with `REMOTE_HOST="${REMOTE_HOST:-h200_legacy}"` defaults so that env-var overrides keep working, but in practice bench3 / europe are the current anchors.
 
 ## Tool reality in this environment
 
@@ -46,7 +50,12 @@ That means the dependable grounding path for this repo is:
 ## Current verified H200 smoke frontier
 
 The first remote Megatron smoke is now past bring-up and completes 2 training iterations on
-`h200_legacy` with checkpoint saves.
+`h200_legacy` with checkpoint saves. **(Historical note: the
+`h200_legacy` anchor below is LEGACY — that original bring-up
+machine has been superseded by bench3 and europe for all current production
+and smoke work. This section is preserved as the paper trail of the
+bring-up lane and is NOT the current frontier. See the "remote CUDA targets"
+list above for currently active machines.)**
 
 The smoke currently depends on four explicit launcher choices that were verified one blocker at a time
 against real H200 tracebacks:

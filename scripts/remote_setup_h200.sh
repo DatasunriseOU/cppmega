@@ -1,6 +1,25 @@
 #!/usr/bin/env bash
+# ============================================================================
+# LEGACY / DEPRECATED (2026-04-14)
+# ----------------------------------------------------------------------------
+# This script was written for the original bring-up host `h200_legacy`
+# (LOCATION_3) in early 2026 and targets `/mnt/data` on that machine.
+#
+# Current active H200 anchors (2026-04) are:
+#   bench3  — zone LOCATION_1, hostname h200_1,
+#             root /mnt/data/cppmega-root, venv /mnt/data/venv
+#   europe  — zone LOCATION_2, hostname h200_1,
+#             root /home/dave/cppmega-root, venv /home/dave/cppmega-root/cppmega-venv
+#
+# The LOCATION_3 defaults below are preserved for backward compatibility with
+# any caller still exporting them explicitly; new work should override
+# REMOTE_HOST / REMOTE_ZONE / REMOTE_ROOT to point at bench3 or europe, or
+# (for bench3/europe) use the in-place tmux "remote body" scripts such as
+# scripts/remote_smoke_h200_dsa_9_4_m.sh instead of this gcloud-wrapping setup.
+# ============================================================================
 set -euo pipefail
 
+# LEGACY default (LOCATION_3); override REMOTE_HOST/REMOTE_ZONE for bench3 or europe.
 REMOTE_HOST="${REMOTE_HOST:-h200_legacy}"
 REMOTE_ZONE="${REMOTE_ZONE:-LOCATION_3}"
 REMOTE_ROOT="${REMOTE_ROOT:-/mnt/data}"

@@ -224,21 +224,20 @@ try:
 except Exception:
     pass
 
-# (5) DSA FP8 fwd+bwd indexer patch + loss_coeff gate + sparse DSA + KL mode
+# (5) DSA loss_coeff gate + sparse DSA + KL mode
+# NOTE: FP8 indexer path removed 2026-04-13 — dsa_fp8_patch.py and
+# dsa_fp8_indexer.py were deleted. bf16 indexer is the only supported dtype.
 _dsa_dtype = os.environ.get("CPPMEGA_DSA_INDEXER_DTYPE", "bf16").lower()
-print(f"[cppmega_mimo_shim] CPPMEGA_DSA_INDEXER_DTYPE resolves to '{_dsa_dtype}'")
+print(f"[cppmega_mimo_shim] CPPMEGA_DSA_INDEXER_DTYPE resolves to '{_dsa_dtype}' (fp8 path removed)")
 _sparse_mode = os.environ.get("CPPMEGA_DSA_SPARSE_MODE", "tilelang").lower()
 print(f"[cppmega_mimo_shim] CPPMEGA_DSA_SPARSE_MODE resolves to '{_sparse_mode}'")
 _kl_mode = os.environ.get("CPPMEGA_DSA_KL_MODE", "head_streaming").lower()
 print(f"[cppmega_mimo_shim] CPPMEGA_DSA_KL_MODE resolves to '{_kl_mode}'")
 if _dsa_dtype == "fp8":
-    try:
-        from cppmega.megatron.dsa_fp8_patch import apply_dsa_fp8_patch
-        _applied = apply_dsa_fp8_patch()
-        print(f"[cppmega_mimo_shim] DSA FP8 patch applied={_applied}")
-    except Exception as _exc:
-        print(f"[cppmega_mimo_shim] DSA FP8 patch failed: {_exc}", file=sys.stderr)
-        raise
+    raise RuntimeError(
+        "CPPMEGA_DSA_INDEXER_DTYPE=fp8 is no longer supported: dsa_fp8_patch.py "
+        "and dsa_fp8_indexer.py were deleted on 2026-04-13. Use bf16."
+    )
 
 # (6) per-rank peak-memory reporter (atexit hook)
 def _cppmega_peak_mem_report():
@@ -359,8 +358,8 @@ fi
 
 # Pre-flight checks
 python -c 'import cppmega, megatron; print("cppmega", cppmega.__version__)'
-python -c "from cppmega.megatron.dsa_fp8_patch import apply_dsa_fp8_patch; print('dsa_fp8_patch importable')"
-python -c "from cppmega.megatron.dsa_fp8_indexer import bwd_fused_indexer_loss_fp8, compute_index_scores_fp8; print('dsa_fp8_indexer fwd+bwd importable')"
+# dsa_fp8_patch / dsa_fp8_indexer import-checks removed 2026-04-13 — those
+# modules were deleted; single DSA path is lemyx + IndexCache.
 python -c "import torch; print(f'cuDNN version: {torch.backends.cudnn.version()}')"
 
 # Validate DSA A-layer rank parsing.

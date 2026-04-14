@@ -285,15 +285,41 @@ def _install_liger_nonfused_compute(
 ) -> None:
     """Install non-fused Liger CE compute (workaround #2 for Liger fused bwd bug).
 
-    Uses :class:`liger_kernel.ops.cross_entropy.LigerCrossEntropyFunction`
-    whose ``reduction="none"`` backward was fixed by Liger PR #680 (Apr 2025):
-    ``elif grad_output.ndim > 0: _input = _input * grad_output.unsqueeze(dim=1)``.
+    ### Scope of Liger PR #680 — read carefully
 
-    Unlike the fused ``LigerFusedLinearCrossEntropyFunction`` (issue #968,
-    no fix), this path materialises the ``[s*b, V]`` logits tensor and then
-    runs only the CE kernel. Memory regression (~6 GiB at NAM56R MBS=10,
-    V≈150k, bf16) is the cost of correctness. Peak-alloc watch: MBS=12
-    adds ~1.2× and is expected to crash the 141 GiB budget.
+    Liger PR #680 (merged, Apr 2025) fixed ``reduction="none"`` backward for
+    ``LigerCrossEntropyLoss`` / ``LigerCrossEntropyFunction`` — the plain
+    CE-on-logits path. The fix hunk is::
+
+        elif grad_output.ndim > 0:
+            _input = _input * grad_output.unsqueeze(dim=1)
+
+    **PR #680 does NOT fix ``LigerFusedLinearCrossEntropyFunction`` (FLCE).**
+    In fact #680 contains a commit *"Remove reduction='none' from flce"* —
+    upstream explicitly acknowledged the FLCE backward was broken and
+    removed the option rather than fix it. Liger issue #968 tracks the
+    FLCE silent-corruption bug; draft PR #1126 only adds an assertion guard,
+    not a fix. FLCE ``reduction="none"`` backward remains broken upstream
+    as of 2026-04-14.
+
+    ### How the three workaround paths in this file map to #680
+
+    * **Path #2 (this function) — non-fused Liger.** Manually does the
+      ``hidden @ weight.T`` matmul, then calls ``LigerCrossEntropyFunction``
+      (the plain-CE path that #680 DID fix). ``reduction="none"`` backward
+      is correct here. Memory regression (~6 GiB at NAM56R MBS=10, V≈150k,
+      bf16) is the cost of materialising logits. Peak-alloc watch: MBS=12
+      adds ~1.2× and is expected to crash the 141 GiB budget.
+    * **Path #3 — fused Liger with reduction="mean" broadcast** (see
+      ``_install_liger_compute`` below). Uses ``LigerFusedLinearCrossEntropy
+      Function`` but only calls it with ``reduction="mean"`` because the
+      FLCE ``reduction="none"`` backward (the bug PR #680 did NOT fix)
+      still silently corrupts gradients. The mean-scalar is then broadcast
+      to ``[b, s]`` so Megatron's tensor-shaped loss contract holds, while
+      the kernel only ever executes the mean code path.
+
+    **Boundary:** #680 fixed plain CE (path #2). #680 did NOT fix FLCE
+    (path #3 exists precisely because FLCE backward is still broken).
 
     API:
         LigerCrossEntropyFunction.apply(
