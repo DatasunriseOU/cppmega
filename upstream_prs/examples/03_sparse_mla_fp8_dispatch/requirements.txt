@@ -1,0 +1,17 @@
+# Pinned deps used to validate the reproducer on h200_1
+# (/mnt/data/venv) on 2026-04-14 against NVIDIA H200 sm_90.
+#
+# These are the "works today" versions for the bench3 stack. See
+# MEMORY.md > reference_bench3_h200_stack.md for the full picture.
+torch==2.12.0.dev20260410+cu132
+transformer-engine==2.13.0
+# cppmega is the in-tree editable install:
+#   pip install -e /path/to/cppmega
+# It must be built against the same tilelang/tvm-ffi stack as the rest of
+# the bench3 environment; otherwise SparseMLA / SparseMLA_FP8 will fail to
+# import. See cppmega/README for build instructions.
+#
+# Also required at runtime (not pip-installable):
+#   - TileLang dev build: /mnt/data/tilelang-build/build
+#   - tvm-ffi < 0.1.10   (TileLang-compatible)
+#   - CUDA 13.2 driver stack

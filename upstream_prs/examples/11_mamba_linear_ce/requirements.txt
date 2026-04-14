@@ -1,0 +1,15 @@
+# Pinned versions for reproducing the MambaModel vs GPTModel output_layer
+# class-parity regression on NVIDIA/Megatron-LM@dev.
+#
+# The bug reproduces at exactly commit 9d71cb1cd2 (Megatron-LM@dev, 2026-02-04)
+# and forward — PR #3207 clobbered PR #3226's Mamba wiring there.
+#
+# Until PR #3226 re-syncs to main, `dev` is the only branch that has both
+# GPTModel using LinearCrossEntropyModule AND MambaModel using plain
+# ColumnParallelLinear. On `main` both use ColumnParallelLinear (no fusion
+# anywhere yet).
+torch>=2.12
+# megatron-core must be built from source at a commit that has both PR #3226
+# and PR #3207 landed, i.e. any commit on `dev` between 9d71cb1cd2 and HEAD.
+# The core_v0.15.0rc7-dev_latest tag used in our cppmega environment matches.
+megatron-core @ git+https://github.com/NVIDIA/Megatron-LM.git@dev

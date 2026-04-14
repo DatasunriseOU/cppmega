@@ -1,0 +1,13 @@
+# SparseMLA dimension generalization reproducer
+#
+# Expects a CUDA environment with the cppmega-stack TileLang build. On
+# bench3 / europe these come pre-installed in the venv — do NOT pip-install
+# torch or tilelang on top, as the CUDA 13.2 / torch-nightly pins are
+# fragile. Version ranges below are for documentation / dry-run only.
+#
+# Sanity pins from h200_1 (2026-04-14):
+#   torch    2.12.0.dev20260410+cu132
+#   tilelang 0.1.8+cuda.gitf309d814
+#
+torch>=2.7,<2.14
+tilelang>=0.1.6,<0.2
