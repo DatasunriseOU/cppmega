@@ -77,6 +77,7 @@ The script auto-applies:
 | Liger CE          | `CPPMEGA_LIGER_CE=1`          | `mtp_liger_ce.py`            | Chunked fused cross-entropy, saves 21 GiB MTP logits |
 | Selective FP8 MoE | `CPPMEGA_SELECTIVE_FP8_MOE=1` | `selective_fp8_moe_patch.py` | FP8 only on MoE expert GEMMs                         |
 | Mamba recompute   | `CPPMEGA_MAMBA_RECOMPUTE=1`   | `mamba_recompute_patch.py`   | Activation checkpointing for Mamba layers            |
+| FP8 param-gather  | `CPPMEGA_FP8_PARAM_GATHER=1`  | Megatron `--fp8-param-gather`| -5 GiB (FP8 all-gather bucket, master stays FP32)    |
 
 ### Pipeline Schedules
 

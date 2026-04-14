@@ -493,6 +493,18 @@ if [ -z "${FP8_FLAGS+x}" ]; then
 elif [ "${FP8_FLAGS}" = "NONE" ]; then
   FP8_FLAGS=""
 fi
+
+# CPPMEGA_FP8_PARAM_GATHER=1 adds --fp8-param-gather: stores param gather bucket
+# in FP8 storage (master weights stay FP32). Saves ~5 GiB on NAM56R-class models
+# (removes BF16 param-gather copy in dist-optimizer). Tensorwise + dist-opt
+# compatible; master stays FP32; custom bf16 modules (TileLang SparseMLA, Mamba3)
+# untouched since they are created outside fp8_model_init() context.
+# Requires --use-distributed-optimizer (already set below). INCOMPATIBLE with
+# --use-precision-aware-optimizer and --optimizer-cpu-offload.
+if [ "${CPPMEGA_FP8_PARAM_GATHER:-0}" = "1" ] && [ -n "${FP8_FLAGS}" ]; then
+  FP8_FLAGS="${FP8_FLAGS} --fp8-param-gather"
+  echo "[stream_m] FP8 param-gather enabled (-5 GiB all-gather buffer)"
+fi
 # If FP8_FLAGS="" (explicitly empty) → no FP8 (BF16 only)
 
 # Stream M: selective activation recompute.
