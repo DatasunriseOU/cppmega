@@ -20,7 +20,7 @@
 
 ### 1.2. Code Cleanup
 
-Removed fallback paths and obsolete files to enforce the single DSA path (lemyx + IndexCache):
+Removed try/except fallback paths inside the kept DSA modules and deleted the three FP8-indexer-specific files. The DSA stack is **not** a single module — lemyx warmup, per-head fused indexer, split-K indexer loss, sparse attention (standard + absorbed), and IndexCache all remain active and ship together. What was removed:
 
 | Action | File |
 |--------|------|
@@ -30,6 +30,8 @@ Removed fallback paths and obsolete files to enforce the single DSA path (lemyx 
 | Deleted | `dsa_fp8_indexer.py` |
 | Deleted | `dsa_tilelang_fused_kl.py` |
 | Removed env var gates | `CPPMEGA_INDEX_CACHE`, `CPPMEGA_LEMYX_DSA` -- now always-on |
+
+Still present and active (bf16 DSA path): `lemyx_dsa_warmup.py`, `dsa_indexer_fused_patch.py`, `dsa_splitk_indexer_loss.py`, `dsa_sparse_attention.py`, `dsa_sparse_absorbed.py`, `index_cache_patch.py`. FP8-indexer variants are removed; FP8 applies to GEMMs / MoE only, indexer stays bf16.
 
 ### 1.3. Architecture Change: heads=32, hidden=4096
 

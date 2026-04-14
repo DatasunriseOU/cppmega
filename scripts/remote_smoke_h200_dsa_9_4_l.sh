@@ -182,17 +182,16 @@ try:
 except Exception:
     pass
 
-# (5) Stream E+G: DSA FP8 fwd+bwd indexer patch
+# (5) Stream E+G: DSA FP8 fwd+bwd indexer patch — REMOVED 2026-04-13
+# dsa_fp8_patch.py / dsa_fp8_indexer.py were deleted. Single DSA path is
+# lemyx + IndexCache; FP8 indexer is no longer a supported variant.
 _dsa_dtype = os.environ.get("CPPMEGA_DSA_INDEXER_DTYPE", "bf16").lower()
-print(f"[cppmega_mimo_shim] CPPMEGA_DSA_INDEXER_DTYPE resolves to '{_dsa_dtype}'")
+print(f"[cppmega_mimo_shim] CPPMEGA_DSA_INDEXER_DTYPE resolves to '{_dsa_dtype}' (fp8 path removed)")
 if _dsa_dtype == "fp8":
-    try:
-        from cppmega.megatron.dsa_fp8_patch import apply_dsa_fp8_patch
-        _applied = apply_dsa_fp8_patch()
-        print(f"[cppmega_mimo_shim] DSA FP8 patch applied={_applied}")
-    except Exception as _exc:
-        print(f"[cppmega_mimo_shim] DSA FP8 patch failed: {_exc}", file=sys.stderr)
-        raise
+    raise RuntimeError(
+        "CPPMEGA_DSA_INDEXER_DTYPE=fp8 is no longer supported: dsa_fp8_patch.py "
+        "and dsa_fp8_indexer.py were deleted on 2026-04-13. Use bf16."
+    )
 
 # (6) Stream L: per-rank peak-memory reporter (atexit hook)
 def _cppmega_peak_mem_report():
@@ -318,8 +317,8 @@ if [ "${NO_ROPE_FUSION}" = "1" ]; then
 fi
 
 python -c 'import cppmega, megatron; print("cppmega", cppmega.__version__)'
-python -c "from cppmega.megatron.dsa_fp8_patch import apply_dsa_fp8_patch; print('dsa_fp8_patch importable')"
-python -c "from cppmega.megatron.dsa_fp8_indexer import bwd_fused_indexer_loss_fp8, compute_index_scores_fp8; print('dsa_fp8_indexer fwd+bwd importable')"
+# dsa_fp8_patch / dsa_fp8_indexer import-checks removed 2026-04-13 — those
+# modules were deleted; single DSA path is lemyx + IndexCache.
 
 # Validate DSA A-layer rank parsing.
 python - <<PY

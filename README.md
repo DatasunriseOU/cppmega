@@ -6,6 +6,14 @@ Megatron-first training framework for **NAM56R** — a 4.73B hybrid Mamba3 + MLA
 
 **289 TFLOP/s** on 8xH200 europe (verified 2026-04-14, PP=1 EP=4 MBS=8 BF16 no-CG). BF16 outperforms FP8 tensorwise by 3.5%. bench3 at the same topology = **253 TFLOP/s** (different HW, ~13% gap is NVLink/NUMA/thermal variance).
 
+Note: the PP=1 EP=4 MBS=8 BF16 numbers above are the *measured best* topology.
+The default launcher `scripts/remote_smoke_h200_dsa_9_4_m.sh` ships with the
+older "Stream L" defaults (PP=2 VPP=2 MBS=4 GBS=64, VARIANT=v1 → EP=4); the
+PP=1 EP=4 MBS=8 production topology is reached via env-var overrides — see
+Quick Start below. The script is designed to run as the remote body inside a
+tmux session on either bench3 or europe — there is no gcloud/scp wrapper in
+it.
+
 | Parameter    | Value                                                     |
 | ------------ | --------------------------------------------------------- |
 | Model        | NAM56R 4.73B (52 layers, hybrid `*EME*EME*EMM*`)          |
@@ -25,8 +33,11 @@ Megatron-first training framework for **NAM56R** — a 4.73B hybrid Mamba3 + MLA
 ### Prerequisites
 
 ```bash
-# Megatron-LM (our dev_latest branch with PR #3674 + PR #4268)
-cd /mnt/data/cppmega-root/megatron-lm
+# Megatron-LM: our local `dev_latest` branch, which cherry-picks the
+# currently-open upstream PRs #3674 and #4268 on top of 0.16.0rc0.
+# Neither PR is merged upstream yet — this branch is our local state.
+cd /mnt/data/cppmega-root/megatron-lm   # bench3 path
+# cd /home/dave/cppmega-root/megatron-lm  # europe path
 
 # After any Megatron update, MUST apply patches:
 cd /mnt/data/cppmega-root/cppmega
@@ -40,23 +51,53 @@ pip install apex  # NVIDIA apex from source with --cpp_ext --cuda_ext
 
 ### Training
 
-```bash
-cd /mnt/data/cppmega-root/cppmega
+Paths below assume **bench3** (`/mnt/data/cppmega-root`). On **europe** the
+root is `/home/dave/cppmega-root`; on either machine, run from inside the
+appropriate tmux session (`bash -l`).
 
-# Production run: PP=1 EP=4 h32 + all optimizations
+```bash
+# bench3
+cd /mnt/data/cppmega-root/cppmega
+# europe
+cd /home/dave/cppmega-root/cppmega
+```
+
+**Script default topology** (what you get with no overrides):
+`TP=1 PP=2 VPP=2 MBS=4 GBS=64 MTP=2`, `VARIANT=v1 → EP=4`. Measured ~193
+TFLOP/s on europe. This is the Stream L baseline the script was originally
+written for.
+
+```bash
+# Script default (PP=2 VPP=2 MBS=4 EP=4) — Stream L topology, ~193 TFLOP/s europe
 CPPMEGA_INDEX_CACHE=1 \
 CPPMEGA_LEMYX_DSA=1 \
 CPPMEGA_LIGER_CE=1 \
 bash scripts/remote_smoke_h200_dsa_9_4_m.sh
 ```
 
-The script auto-applies:
+**Production topology** (PP=1 EP=4 MBS=8 BF16, the 289 TFLOP/s europe /
+253 TFLOP/s bench3 configuration) — the script honours these overrides:
+
+```bash
+PP_SIZE=1 VPP_SIZE=1 MBS=8 EP_SIZE_OVERRIDE=4 \
+CG_FLAGS=NONE \
+CPPMEGA_INDEX_CACHE=1 \
+CPPMEGA_LEMYX_DSA=1 \
+CPPMEGA_LIGER_CE=1 \
+bash scripts/remote_smoke_h200_dsa_9_4_m.sh
+```
+
+CG must be off at PP=1 (TE CG private pool = 39.5 GiB, which OOMs the
+production topology). The script does *not* auto-disable CG when PP_SIZE=1;
+you must pass `CG_FLAGS=NONE` explicitly as shown above.
+
+The script auto-applies (regardless of topology):
 - Regional torch.compile (4 Mamba3 elementwise regions)
-- IndexCache (67% DSA indexer savings)
-- lemyx fused FA+KL kernel (DSA warmup)
-- Liger chunked cross-entropy (MTP memory savings)
-- FP8 tensorwise recipe
-- expandable_segments (mandatory)
+- IndexCache (67% DSA indexer savings) — when `CPPMEGA_INDEX_CACHE=1`
+- lemyx fused FA+KL kernel (DSA warmup) — when `CPPMEGA_LEMYX_DSA=1`
+- Liger chunked cross-entropy (MTP memory savings) — when `CPPMEGA_LIGER_CE=1`
+- FP8 tensorwise recipe (opt-in via env, off by default — BF16 wins on europe)
+- expandable_segments (mandatory, hard-coded)
 
 ## Optimization Stack
 
@@ -82,8 +123,8 @@ The script auto-applies:
 | Mamba3 MIMO P1    | `CPPMEGA_MAMBA3_P1=1`         | `apply_mamba3_mimo_p1_patches.py` | TMA + warp-spec on Mamba3 MIMO fwd only (bwd blocked by TileLang TMA layout bug) |
 | Main-head linear CE | `CPPMEGA_MAIN_HEAD_LINEAR_CE=1` | `apply_linear_ce_patch.py` | MambaModel.output_layer class-swap → `LinearCrossEntropyModule` (fixes upstream Megatron regression from PR #3207) |
 | Linear CE kernel  | `CPPMEGA_LINEAR_CE_KERNEL=auto\|liger\|cce` | `apply_linear_ce_patch.py` | Selects fallback kernel for non-Blackwell. Liger uses reduction="mean" broadcast workaround (sidesteps Liger #968 silent corruption) |
-| Prefer native Hopper | `CPPMEGA_PREFER_NATIVE_HOPPER_CE=1` | `apply_linear_ce_patch.py` | When PR #3345 cherry-picked, skip Liger/CCE reroute and use native Hopper CuTe DSL kernel directly |
-| MTP native Hopper | `CPPMEGA_MTP_NATIVE_HOPPER_CE=1` | `mtp_native_hopper_ce.py` | Route MTP depths through `LinearCrossEntropyModule` (**experimental — gated OFF by default, grad_norm=NaN bug pending fix**) |
+| Prefer native Hopper | `CPPMEGA_PREFER_NATIVE_HOPPER_CE=1` | `apply_linear_ce_patch.py` | When the open Megatron PR #3345 is locally cherry-picked, skip Liger/CCE reroute and use the native Hopper CuTe DSL kernel directly |
+| MTP native Hopper | `CPPMEGA_MTP_NATIVE_HOPPER_CE=1` | `mtp_native_hopper_ce.py` | Route MTP depths through `LinearCrossEntropyModule`. **Infrastructure committed, default OFF. Activating produces grad_norm=NaN (Suspect #1 transpose round-trip refuted empirically, Suspect #2 CG collective pending). Do NOT enable until NaN root-caused.** |
 | DSA indexer fused | `CPPMEGA_DSA_INDEXER_FUSED=1`  | `dsa_indexer_fused_patch.py` | Per-head bmm accumulation → eliminates `[sq,b,h,sk]` fp32 intermediate (16 GiB → 268 MiB at prod shape) |
 
 ### Pipeline Schedules
@@ -157,14 +198,31 @@ Branch `dev_latest` on top of NVIDIA/Megatron-LM `dev`, with per-machine diverge
 
 | Machine | Version | Base | Our patches | Notes |
 |---|---|---|---|---|
-| bench3  | `megatron-core 0.16.0rc0` | tarball snapshot (no `.git`) | PR #3345 cherry-pick + DSA integration | 2026-04-14 backup: `sftp://BUCKET_ARTIFACTS/backups/backup_bench3_2026_04_14/megatron_lm_tree.tar.gz`. Upstream commit unverified — see `docs/megatron_restoration_recipe.md` |
-| europe  | `megatron-core 0.16.0rc0` | NVIDIA/Megatron-LM `origin/dev` | 2 commits ahead on `dev_latest` branch | HEAD = `ec6a9e900` (cherry-pick of PR #4268 on top of `2eeabc668` which merges PR #3674 — DSA absorbed MLA + TileLang fused sparse ops) |
-| GB10    | n/a     | n/a  | n/a       | GB10 is bwd_bwd/kernel dev only, no megatron install |
+| bench3  | `megatron-core 0.16.0rc0` | tarball snapshot (no `.git`) | local cherry-pick of open PR #3345 + DSA integration | 2026-04-14 backup: `sftp://BUCKET_ARTIFACTS/backups/backup_bench3_2026_04_14/megatron_lm_tree.tar.gz`. Upstream commit unverified — see `docs/megatron_restoration_recipe.md` |
+| europe  | `megatron-core 0.16.0rc0` | NVIDIA/Megatron-LM `origin/dev` | 2 commits ahead on local `dev_latest` branch | HEAD = `ec6a9e900`: local cherry-pick of open PR #4268 on top of local commit `2eeabc668`, which is our local merge of open PR #3674 (DSA absorbed MLA + TileLang fused sparse ops). Neither PR is merged upstream as of 2026-04-14 — see "Upstream status" below. |
+| GB10    | n/a     | n/a  | local clone present (`/home/dave/megatron-lm`) + `cppmega-venv` under `/home/dave/cppmega-venv` | Primary role is bwd_bwd / TileLang / CuTe-DSL single-GPU kernel dev; full NAM56R training is not validated here (sm_121 HW caps block tcgen05/FP4/WGMMA paths) |
 
 Both H200 hosts are on `0.16.0rc0` (verified from `megatron/core/package_info.py`).
 The earlier README claim of `0.18` was wrong. See
 `docs/megatron_restoration_recipe.md` for full base-commit recovery + patch
 listing.
+
+### Upstream status (verified 2026-04-14)
+
+None of the behaviour-critical fixes that cppmega relies on are merged in
+their upstream repositories. Anything referenced below lives only on our
+local `dev_latest` branch until noted otherwise.
+
+| Ref | Upstream status | What we do locally |
+|---|---|---|
+| Megatron-LM PR #3345 (Hopper fused linear CE) | OPEN (not merged) | Local cherry-pick on bench3 + `apply_linear_ce_patch.py` gates `CPPMEGA_PREFER_NATIVE_HOPPER_CE` on top of it |
+| Megatron-LM PR #3674 (DSA absorbed + TileLang fused sparse) | OPEN (not merged) | Local merge on europe at commit `2eeabc668`; `apply_dsa_cg_patches.py` carries the additional fixes on top |
+| Megatron-LM PR #4268 (delayed wgrad / P2P bwd overlap) | OPEN, **DRAFT** | Local cherry-pick on europe at commit `ec6a9e900` |
+| TileLang PR #746 (bulk-copy / layout inference) | MERGED ✓ | Picked up via the pinned TileLang build `f309d814` |
+| Liger-Kernel issue #968 (FLCE reduction="none" wrong grad) | CLOSED, **no functional fix shipped** | We sidestep via `reduction="mean"` broadcast workaround in `apply_linear_ce_patch.py` |
+| Liger-Kernel PR #1126 (FLCE reduction="none" guard) | OPEN, **DRAFT** — assertion only, not a real fix | Not applied; we do not rely on it |
+| Liger-Kernel PR #680 (LigerCrossEntropy reduction="none") | MERGED ✓, **but scope is scalar CE only** — the same commit explicitly *removes* `reduction="none"` from FLCE | Useful for scalar CE only; does not fix the FLCE path that our MTP heads hit |
+| state-spaces/mamba issue #886 (Mamba3 bwd misalignment when `nheads%4 != 0` and `seqlen%4 != 0`) | OPEN (not fixed) | We keep `nheads=32` / `seqlen=4096` so the corrupt path is never taken |
 
 ### Software Stack
 
@@ -181,7 +239,14 @@ listing.
 
 - **heads=32, hidden=4096**: FP8 compatible (32%8=0), WGMMA tiling, lemyx (heads==index_heads)
 - **52 layers** (NAM56R_DEPTH): divides by 4 (VPP=4) and 2 (VPP=2)
-- **Single DSA path**: lemyx + IndexCache only, no fallbacks, crash on failure
+- **DSA stack** (bf16 only; FP8 indexer variants deleted 2026-04-13):
+  - `lemyx_dsa_warmup.py` — lemyx/tilelang-dsa fused FA + lightning-indexer + KL kernel, used for indexer warmup (~first 1000 steps)
+  - `dsa_indexer_fused_patch.py` — per-head fused accumulation replacement for Megatron's `_compute_index_scores` (bf16)
+  - `dsa_splitk_indexer_loss.py` — split-K Triton fused indexer KL loss (port of NVIDIA Megatron-LM PR #4039); ~60% memory save
+  - `dsa_sparse_attention.py` — sparse gather/scatter replacement for Megatron's `unfused_dsa_fn`; avoids the 7 GiB full `[b*np, sq, sk]` FP32 scores tensor
+  - `dsa_sparse_absorbed.py` — same sparse-gather replacement for the absorbed-MLA DSA path (`_unfused_absorbed_dsa_fn`, PR #3674)
+  - `index_cache_patch.py` — reuses indexer top-k across DSA-Shared layers (3 Full + 6 Shared pattern)
+  - No try/except fallbacks in any of the above — fused kernel unavailable = crash
 - **No _apply guard**: D/dt_bias stay bf16 after Float16Module, use .float() in forward
 - **No silent fallbacks**: critical patches crash on failure, never try/except + continue
 - **expandable_segments mandatory**: hardcoded, not overridable
