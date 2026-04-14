@@ -4,7 +4,16 @@ Megatron-first training framework for **NAM56R** — a 4.73B hybrid Mamba3 + MLA
 
 ## Production Configuration
 
-**289 TFLOP/s** on 8xH200 europe (verified 2026-04-14, PP=1 EP=4 MBS=8 BF16 no-CG). BF16 outperforms FP8 tensorwise by 3.5%. bench3 at the same topology = **253 TFLOP/s** (different HW, ~13% gap is NVLink/NUMA/thermal variance).
+Canonical production numbers and launch commands live in
+**[docs/production_status.md](docs/production_status.md)** (single source of
+truth). Summary (2026-04-14 session 3, post Liger grad-corruption audit):
+
+- **europe**: 289 TFLOP/s (BF16, PP=1 EP=4 MBS=8, no-CG) — gold record
+- **bench3**: 268 TFLOP/s (FP8 tensorwise, PP=1 EP=8 MBS=10 v3, no-CG)
+
+Both machines use Liger `reduction="mean"` broadcast workaround for correct
+gradients (Liger #968). The earlier "269.4 TFLOP/s bench3" measurement with
+`reduction="none"` is **superseded** — it was silently corrupted.
 
 Note: the PP=1 EP=4 MBS=8 BF16 numbers above are the *measured best* topology.
 The default launcher `scripts/remote_smoke_h200_dsa_9_4_m.sh` ships with the

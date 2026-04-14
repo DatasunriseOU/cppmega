@@ -4,10 +4,12 @@
 
 ### Production configs
 
-| Machine | Config | TFLOP/s | MFU | Status |
-|---|---|---|---|---|
-| **bench3** H200×8 | PP=1 EP=8 MBS=10 FP8 tensorwise + Liger main-head + IndexCache + lemyx | **~268-269** | ~27% | Production (with caveat: re-baselining post-fixes pending) |
-| **europe** H200×8 | PP=1 EP=4 MBS=8 BF16 + IndexCache + lemyx | **289** | 29.2% | Production (gold record, fabric-bound) |
+Canonical throughput + config table lives in
+**[`docs/production_status.md`](docs/production_status.md)** (single source
+of truth). Summary: bench3 = 268 TFLOP/s (FP8, PP=1 EP=8 MBS=10 v3), europe
+= 289 TFLOP/s (BF16, PP=1 EP=4 MBS=8). Both use Liger `reduction="mean"`
+broadcast workaround — the earlier "269.4 with reduction=none" is
+superseded (silent grad corruption).
 
 ### What's DONE (this session)
 
@@ -162,7 +164,7 @@
 
 ### Status transitions this session
 
-- In production: bench3 FP8 MBS=10 EP=8 v3 = 268-269.4 TFLOP/s, europe BF16 MBS=8 EP=4 = 289 TFLOP/s (unchanged this session)
+- In production: bench3 FP8 MBS=10 EP=8 v3 = 268 TFLOP/s (canonical, Liger reduction=mean), europe BF16 MBS=8 EP=4 = 289 TFLOP/s. See `docs/production_status.md` for single source of truth. Prior "269.4" was Liger reduction=none, superseded (silent grad corruption)
 - In test: all 13 PR templates (awaiting user approval gate before any filing)
 - Deferred: MBS=12 backward NaN debug (needs Suspect #2 CG flag propagation test), Mamba3 P2 PsiV cache (~5 days, not started), TileLang upstream issue/PRs (draft only)
 
@@ -183,12 +185,15 @@ Next productive work is kernel-level (week+ effort):
 
 ## Session conclusion (2026-04-14 deep night — 17 empirical tests + new patch)
 
-Config-space fully mapped on 8×H200. Production ceilings:
+Config-space fully mapped on 8×H200. Production ceilings (canonical in
+`docs/production_status.md`):
 - **europe = 289 TFLOP/s (29.2% MFU)** — BF16 MBS=8 EP=4, fabric-bound
-- **bench3 = 269.4 TFLOP/s (27.2% MFU)** — FP8 MBS=10 EP=8 + Liger main-head CE
-  (NEW RECORD via `cppmega/megatron/apply_linear_ce_patch.py` written this session)
-- Prior bench3 baseline was 268 (MTP-Liger + vanilla main head). Swapping to
-  main-head Liger adds +0.5% (268.0 → 269.4, σ<0.15)
+- **bench3 = 268 TFLOP/s (27.1% MFU)** — FP8 MBS=10 EP=8 + Liger main-head CE
+  with `reduction="mean"` broadcast (Liger #968 workaround via
+  `cppmega/megatron/apply_linear_ce_patch.py`)
+- The earlier "269.4 with Liger reduction=none" measurement is SUPERSEDED —
+  that path silently corrupts gradients via Liger #968. Canonical bench3
+  record is 268 with the mean-broadcast workaround.
 
 **Gap to user's 250k tok/sec / 50% MFU stretch target**: 1.7× throughput.
 Empirical evidence shows **this gap cannot be closed by config/topology tuning**
@@ -198,8 +203,16 @@ work). Reaching 50% MFU requires either (a) CUTLASS WGMMA kernel rewrites
 (months), (b) architecture change (not our call), or (c) newer hardware (B200+).
 
 Document honestly: 289/268 TFLOP/s are production numbers we can ship today.
+Single source of truth: `docs/production_status.md`.
 
-## Production baselines (2026-04-14 night — definitive)
+## Production baselines (2026-04-14 night — historical empirical sweep)
+
+NOTE: the canonical production configs live in `docs/production_status.md`.
+The table below preserves the full empirical sweep from 2026-04-14 night
+for reference. Any standalone number you find here MUST be cross-checked
+against `docs/production_status.md` before citation. In particular, the
+"269.4" bench3 row used Liger reduction=none which is now known to silently
+corrupt gradients (Liger #968) — do NOT treat that row as shippable.
 
 | Machine    | Config                                                        | TFLOP/s   | MFU       | Status                                                                           |
 | ---------- | ------------------------------------------------------------- | --------- | --------- | -------------------------------------------------------------------------------- |
