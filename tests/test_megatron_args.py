@@ -22,18 +22,20 @@ def test_megatron_args_bundle_emits_native_mla_mtp_fim_moe_dsa_flags():
     assert "--num-experts" in bundle.args
     assert "--experimental-attention-variant" in bundle.args
     assert bundle.args[bundle.args.index("--experimental-attention-variant") + 1] == "dsa"
-    # Default indexer dtype is bf16 and the flag is always emitted under --use-dsa.
-    assert "--dsa-indexer-dtype" in bundle.args
-    assert bundle.args[bundle.args.index("--dsa-indexer-dtype") + 1] == "bf16"
+    # NOTE: ``--dsa-indexer-dtype`` is intentionally NOT emitted as a CLI flag;
+    # Megatron's argparser does not register it. The dtype selection happens
+    # via the ``CPPMEGA_DSA_INDEXER_DTYPE`` env var read by ``cppmega_mimo_shim``.
+    assert "--dsa-indexer-dtype" not in bundle.args
 
 
-def test_megatron_args_bundle_emits_dsa_fp8_indexer_dtype_flag_with_note():
+def test_megatron_args_bundle_emits_dsa_fp8_indexer_note():
     plan = build_nam56r_feature_plan(pattern="AEMEAEMEAEMR", depth=52, mtp_depths=1)
     bundle = build_megatron_args_bundle(plan=plan, use_dsa=True, dsa_indexer_dtype="fp8")
 
-    assert "--dsa-indexer-dtype" in bundle.args
-    assert bundle.args[bundle.args.index("--dsa-indexer-dtype") + 1] == "fp8"
-    assert any("dsa_fp8_patch" in note for note in bundle.custom_notes)
+    # FP8 path is env-var gated, not flag-gated — see comment above.
+    assert "--dsa-indexer-dtype" not in bundle.args
+    assert any("dsa_indexer_fused_patch" in note for note in bundle.custom_notes)
+    assert any("CPPMEGA_DSA_INDEXER_DTYPE=fp8" in note for note in bundle.custom_notes)
 
 
 def test_megatron_args_bundle_rejects_unknown_dsa_indexer_dtype():

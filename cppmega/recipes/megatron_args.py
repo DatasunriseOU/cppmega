@@ -145,7 +145,7 @@ def build_megatron_args_bundle(
         if dsa_indexer_dtype == "fp8":
             notes.append(
                 "DSA indexer FP8 path requires "
-                "cppmega.megatron.dsa_fp8_patch.apply_dsa_fp8_patch() "
+                "cppmega.megatron.dsa_indexer_fused_patch.apply_dsa_indexer_fused_patch() "
                 "at launch time and CPPMEGA_DSA_INDEXER_DTYPE=fp8 env var"
             )
 

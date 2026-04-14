@@ -223,26 +223,7 @@ class TestSparseMLA:
         assert q.grad.shape == q.shape, f"Q grad shape mismatch: {q.grad.shape} vs {q.shape}"
         assert kv.grad.shape == kv.shape, f"KV grad shape mismatch: {kv.grad.shape} vs {kv.shape}"
 
-    def test_monkey_patch_resolve(self):
-        """Test that resolve_sparse_mode returns correct values."""
-        import os
-        from cppmega.megatron.dsa_fp8_patch import resolve_sparse_mode, DSA_SPARSE_MODE_ENV
-
-        # Default should be gather_scatter
-        old = os.environ.pop(DSA_SPARSE_MODE_ENV, None)
-        try:
-            assert resolve_sparse_mode() == "gather_scatter"
-
-            os.environ[DSA_SPARSE_MODE_ENV] = "tilelang"
-            assert resolve_sparse_mode() == "tilelang"
-
-            os.environ[DSA_SPARSE_MODE_ENV] = "tilelang_mla"
-            assert resolve_sparse_mode() == "tilelang"
-
-            os.environ[DSA_SPARSE_MODE_ENV] = ""
-            assert resolve_sparse_mode() == "gather_scatter"
-        finally:
-            if old is not None:
-                os.environ[DSA_SPARSE_MODE_ENV] = old
-            else:
-                os.environ.pop(DSA_SPARSE_MODE_ENV, None)
+    # NOTE: the ``test_monkey_patch_resolve`` test was removed along with the
+    # ``dsa_fp8_patch`` module on 2026-04-13. The equivalent routing now lives
+    # in ``dsa_indexer_fused_patch`` and is exercised by
+    # ``tests/test_dsa_indexer_fused_patch.py``.

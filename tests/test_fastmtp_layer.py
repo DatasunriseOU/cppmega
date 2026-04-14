@@ -10,15 +10,26 @@ import torch
 
 # Stub out megatron imports for local testing
 if "megatron" not in sys.modules:
+    from importlib.machinery import ModuleSpec
+
     _megatron = MagicMock()
-    sys.modules["megatron"] = _megatron
-    sys.modules["megatron.core"] = _megatron.core
-    sys.modules["megatron.core.tensor_parallel"] = _megatron.core.tensor_parallel
-    sys.modules["megatron.core.transformer"] = _megatron.core.transformer
-    sys.modules["megatron.core.transformer.module"] = _megatron.core.transformer.module
-    sys.modules["megatron.core.transformer.transformer_config"] = (
-        _megatron.core.transformer.transformer_config
-    )
+    # A real ``ModuleSpec`` is required so that downstream tests that call
+    # ``importlib.util.find_spec("megatron")`` during their collection phase
+    # (Python 3.12+ enforces ``module.__spec__`` be a valid ModuleSpec) do
+    # not raise ``ValueError: megatron.__spec__ is not set``.
+    for _name in (
+        "megatron",
+        "megatron.core",
+        "megatron.core.tensor_parallel",
+        "megatron.core.transformer",
+        "megatron.core.transformer.module",
+        "megatron.core.transformer.transformer_config",
+    ):
+        _mod = _megatron
+        for _part in _name.split(".")[1:]:
+            _mod = getattr(_mod, _part)
+        _mod.__spec__ = ModuleSpec(_name, loader=None)
+        sys.modules[_name] = _mod
     # Provide a base class for MegatronModule
     _megatron.core.transformer.module.MegatronModule = torch.nn.Module
 
