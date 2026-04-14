@@ -43,20 +43,26 @@ Archived baseline: `/mnt/data/cppmega-root/cppmega/c1f1b_baseline_v3.log`
 **Do not ship the v3 + overlap combo** until fix. v3 baseline
 (no overlap) is already validated at 257 TFLOP/s.
 
-### Option (b) fix LANDED (2026-04-14 late — commit 239b4c9)
+### Option (b) fix LANDED + TESTED (2026-04-14 late — commit 253f740)
 
 `_HybridPostProcessNode._do_forward` now guards `process_mtp_loss` with
-`_has_mtp_blocks` check — inspects `model.mtp.layers` / `.mtp_modules`
-list. If MTP module wasn't constructed (e.g., because `_relaxed_post_init`
-flipped `mtp_num_layers=None` during init), the loss call is skipped.
-Normal MTP path (mtp constructed) unchanged.
+a SHAPE check: `hidden_states.shape[0] == (1 + mtp_num_layers) * loss_mask.shape[-1]`.
+If decoder didn't emit MTP-expanded output, skip the loss call.
 
-**Test plan** (next session):
-1. bench3: re-run `CPPMEGA_EP_OVERLAP=1` with VARIANT=v3 to verify
-   overlap no longer crashes at iter 0.
-2. If clean: measure overlap TFLOP/s vs 257 baseline. Expected +3-5%
-   from A2A hide (if we're not already compute-bound).
-3. If regression: confirm "overlap not useful single-node" and drop.
+**Test result** (bench3 VARIANT=v3 + CPPMEGA_EP_OVERLAP=1):
+- **MTP bypass fixed** — training past iter 0, no more shape mismatch crash
+- **New failure**: OOM at iter 2, peak 131 GiB/rank vs 115 GiB baseline
+- **+16 GiB memory overhead** for combined_1f1b scheduling + DeepEP A2A
+  buffers, overflowing bench3's 140 GiB budget during Mamba3 bwd temps
+- Exact error site: `dq_bias_tilelang = dq_tilelang.sum(dim=(0,1)).permute(...)`
+  needed +512 MiB transient that didn't fit
+
+**Final conclusion: combined_1f1b single-node 8×H200 is not viable**.
+Research predicted no benefit, empirical confirms. Ship:
+- PP=1 EP=8 WITHOUT overlap = bench3 production candidate (257 TFLOP/s)
+- `CPPMEGA_EP_OVERLAP=1` env gate stays default OFF
+- MTP shape guard (253f740) = infrastructure safety net for future
+  overlap explorations (e.g., at deeper PP or smaller models)
 
 ## Test iter 14 finding (2026-04-14 late evening)
 
