@@ -4,6 +4,8 @@ import tilelang.language as T
 
 pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
+    # GB10 sm_121 99 KiB smem cap — see reference_gb10_bwd_bwd_blocker.md.
+    tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
 }
 
 
