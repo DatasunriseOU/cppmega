@@ -7,8 +7,8 @@
 Flattens three rank-3 shared-memory descriptors in `mamba3_mimo_bwd.py`
 to rank-2, which (a) is a clean correctness-neutral refactor and (b)
 unblocks TileLang's TMA bulk-copy lowering for `bwd_fwd` + `bwd_bwd`.
-With TMA enabled, H200 Mamba3 MIMO backward is expected **~20-30%
-faster** per NVIDIA's profiling data.
+The retained validation here is a legality/correctness proof for the
+refactor; H200 performance measurement is still pending.
 
 ## Problem
 
@@ -120,12 +120,18 @@ Independent benefits:
   ~5 consumer-site rewrites per kernel, plus signature and caller
   updates in `mamba_mimo_bwd_combined`.
 
-## Testing
+## Testing / validation scope
 
 - GB10 (sm_121a): compile OK with `TL_DISABLE_TMA_LOWER=False`,
-  correctness PASS (table above).
+  correctness PASS (table above). This is the retained proof that the
+  3D -> 2D rewrite is legality/correctness-preserving.
+- The tiny self-contained reproducer only tags
+  `COMPILE_FALLBACK_AT_3D` when an actual assertion/warning/fallback signal is
+  captured from the 3D compile path; it no longer synthesizes that tag in the
+  best-effort `STATUS: OK` branch.
 - H200 perf measurement pending (requires our internal H200 node; will
-  post numbers in follow-up comment when available).
+  post numbers in follow-up comment when available). Do not read this
+  pack as H200 performance-validated until that receipt is attached.
 
 ## Related
 
