@@ -71,21 +71,21 @@ _PATCH_MARKER = "__cppmega_dsa_indexer_fused_patched__"
 def _fused_enabled() -> bool:
     """Return True when the fused per-head patch should be installed.
 
-    Default: OFF.  Set ``CPPMEGA_DSA_INDEXER_FUSED=1`` to enable the per-head
-    streamed accumulation path.
+    Default: ON.  Set ``CPPMEGA_DSA_INDEXER_FUSED=0`` to fall back to the
+    upstream allocation-heavy einsum path (debug only).
 
-    Why default OFF (changed 2026-04-14): the per-head buffer is a fresh
-    ``[b, sq, sk]`` fp32 tensor at every DSA layer (640 MiB at MBS=10 NAM56R).
-    9 DSA layers * 640 MiB = ~5.7 GiB of resident activations across the
-    forward pass — autograd holds these for backward.  At MBS=10 EP=8 v3 the
-    bench3 budget is already at ~130 GiB pre-fused-indexer; another 5-6 GiB
-    pushes the run into iter-1 OOM (192 GiB peak with 63 GiB CG private pool).
-    Production MBS=10 stays on the upstream einsum path until we either
-    (a) drop MBS to 8, or (b) chunk the indexer fp32 buffer so it doesn't
-    persist across all 9 layers.
+    Memory accounting (NAM56R MBS=10, b=10, sq=sk=4096, h=8, fp32):
+      * Upstream einsum ``[sq, b, h, sk]``: ~5 GiB *per DSA layer call*,
+        held by autograd for backward.  9 DSA layers => ~45 GiB resident.
+      * Our per-head streamed ``[b, sq, sk]``: ~640 MiB per layer call.
+        9 layers => ~5.7 GiB resident.
+      * Net save vs upstream: ~40 GiB at MBS=10.
+
+    Verified GB10 rel_err 1.6e-7 on production NAM56R shapes (PR 12
+    reproducer at upstream_prs/examples/12_dsa_indexer_memory/).
     """
 
-    val = os.environ.get(DSA_INDEXER_FUSED_ENV, "0").strip()
+    val = os.environ.get(DSA_INDEXER_FUSED_ENV, "1").strip()
     return val != "0"
 
 
