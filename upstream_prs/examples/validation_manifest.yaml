@@ -7,7 +7,21 @@
 #       last_verified:
 #         host: machine name (bench3|europe|gb10|mac-local|...)
 #         date: YYYY-MM-DD
-#         exit_code: reproducer process exit code (0 = passed all asserts)
+#         process_exit_code: actual integer returned by `python reproducer.py; echo $?`
+#                            Do NOT rewrite. Some reproducers intentionally
+#                            return 1 when the bug is present (that IS the
+#                            success signal for a bug-proof reproducer).
+#         semantic_verdict: one of
+#             * bug_reproduced_and_fix_validated — reproducer printed its
+#               expected verdict for its pack type; may pair with
+#               process_exit_code=0 OR 1 depending on whether the reproducer
+#               treats "bug still present" as a success exit
+#             * bug_not_present_anymore — upstream or local fix has landed
+#               and reproducer no longer asserts the bug
+#             * install_error — reproducer failed to run (missing dep, CUDA
+#               unavailable on a CUDA-only reproducer, import error, ...)
+#             * pending — reproducer exists but has not been run on the
+#               listed host this session
 #         output_tags: list of semantic markers printed by reproducer
 #                      (e.g. BUG_REPRODUCED, FIX_VALIDATED, LEGALITY_PROVED,
 #                      BITWISE_IDENTICAL, REGRESSION_TEST_PASSED,
@@ -29,6 +43,23 @@
 #         state: new_report | open | draft | merged | closed | not_filed
 #         verified_via: how upstream state was checked (e.g. "gh api", null)
 #
+# Exit-code honesty policy (2026-04-14 audit):
+# Two legitimate success states exist — DO NOT collapse them:
+#
+#   (a) process_exit_code=0 + semantic_verdict=bug_reproduced_and_fix_validated
+#       Reproducer treats "all checks passed (bug seen, fix validated)" as 0.
+#       Packs: 01, 03, 04, 05, 07, 08, 11, 12.
+#
+#   (b) process_exit_code=1 + semantic_verdict=bug_reproduced_and_fix_validated
+#       Reproducer intentionally returns 1 when the bug IS present (that is
+#       the assertion it wants to signal — the run proved the bug exists).
+#       Packs: 02, 09, 13. Their `sys.exit(main())` pattern returns 1 on the
+#       bug-present branch by design; rewriting this to 0 would be
+#       outcome-rewriting, not outcome-recording.
+#
+# Never rewrite an intentional-1 as 0. If a reproducer changes its exit
+# convention, update BOTH the reproducer and this manifest together.
+#
 # Receipt honesty policy (2026-04-14 audit):
 # Only pack 12 has a retained log file (run_gb10.log, sha256 recorded below).
 # All other packs were verified inside agent session reports without
@@ -44,7 +75,8 @@ prs:
     last_verified:
       host: "h200_1"
       date: "2026-04-14"
-      exit_code: 0
+      process_exit_code: 0
+      semantic_verdict: "bug_reproduced_and_fix_validated"
       output_tags: ["BUG_REPRODUCED", "FIX_VALIDATED"]
       log_location: null
       log_sha256: null
@@ -52,6 +84,8 @@ prs:
       notes: >-
         DSA CUDA graph capture safety: unsafe path shows stale pointer;
         fused-patch path clean.
+        Reproducer convention: returns 0 on (bug reproduced AND fix validated);
+        returns 1 if bug NOT reproduced or fix did not validate.
         RECEIPT: none retained on disk; verified inside session transcript
         only. Needs receipted rerun to promote to receipted_log.
     upstream_status:
@@ -65,7 +99,8 @@ prs:
     last_verified:
       host: "h200_1"
       date: "2026-04-14"
-      exit_code: 0
+      process_exit_code: 1
+      semantic_verdict: "bug_reproduced_and_fix_validated"
       output_tags: ["BUG_REPRODUCED", "FIX_VALIDATED"]
       log_location: null
       log_sha256: null
@@ -73,6 +108,11 @@ prs:
       notes: >-
         SparseMLA dimension/layout mismatch reproduced on native mixer;
         cppmega fix path validates.
+        Reproducer convention (reproducer.py:269): returns 1 on
+        (bug_triggered AND fix fwd+bwd OK) — i.e. the bug still lives in
+        the old copy; returns 0 only if the old copy stops asserting
+        (meaning upstream landed the fix). So exit_code=1 IS the expected
+        signal today; rewriting to 0 would hide the still-open upstream bug.
         RECEIPT: none retained on disk; verified inside session transcript
         only. Needs receipted rerun to promote to receipted_log.
     upstream_status:
@@ -86,13 +126,17 @@ prs:
     last_verified:
       host: "h200_1"
       date: "2026-04-14"
-      exit_code: 0
+      process_exit_code: 0
+      semantic_verdict: "bug_reproduced_and_fix_validated"
       output_tags: ["HAZARDS_SHOWN"]
       log_location: null
       log_sha256: null
       verification_source: "reported_by_agent"
       notes: >-
         FP8 dispatch hazards demonstrated.
+        Reproducer convention: returns 0 iff all scenarios PASS (bug
+        reproduced AND both fix paths validated); returns 1 if any
+        scenario FAILs.
         HEDGE: TE 2.13 silently auto-dequantizes some FP8 tensors, which can
         mask the bug in certain stacks; reproducer documents this caveat.
         Bug is real for user-observed-semantics purposes.
@@ -109,7 +153,8 @@ prs:
     last_verified:
       host: "h200_1"
       date: "2026-04-14"
-      exit_code: 0
+      process_exit_code: 0
+      semantic_verdict: "bug_reproduced_and_fix_validated"
       output_tags: ["BITWISE_IDENTICAL"]
       log_location: null
       log_sha256: null
@@ -117,6 +162,10 @@ prs:
       notes: >-
         Code-clarity refactor (v_dot in siso bwd); bitwise-identical vs
         baseline. Not a perf PR.
+        Reproducer convention: sys.exit(1) on correctness FAIL, sys.exit(0)
+        on CORRECTNESS OK (module-level, no main()).
+        Semantically a refactor legality proof, not a bug-present check,
+        but we keep the same verdict label for schema uniformity.
         RECEIPT: none retained on disk; verified inside session transcript
         only. Needs receipted rerun to promote to receipted_log.
     upstream_status:
@@ -135,13 +184,16 @@ prs:
     last_verified:
       host: "h200_1"
       date: "2026-04-14"
-      exit_code: 0
+      process_exit_code: 0
+      semantic_verdict: "bug_reproduced_and_fix_validated"
       output_tags: ["BUG_REPRODUCED", "FIX_VALIDATED", "GB10_BLOCKED"]
       log_location: null
       log_sha256: null
       verification_source: "reported_by_agent"
       notes: >-
         Two bugs (dt fp32 cast, GQA B/C layout) + two fixes validated on bench3.
+        Reproducer convention (reproducer.py:558): returns 0 iff
+        (bug1 AND fix1 AND bug2 AND fix2); returns 1 otherwise.
         GB10 run blocked by TileLang LayoutInference FloorMod divide-by-zero
         (see pack 13); fix correctness verified on H200 only.
         RECEIPT: none retained on disk; verified inside session transcript
@@ -162,7 +214,8 @@ prs:
     last_verified:
       host: "gb10-modal"
       date: "2026-04-14"
-      exit_code: 0
+      process_exit_code: 0
+      semantic_verdict: "bug_reproduced_and_fix_validated"
       output_tags: ["LEGALITY_PROVED"]
       log_location: null
       log_sha256: null
@@ -171,6 +224,10 @@ prs:
         Legality proof for 3D->2D smem descriptor rewrite in
         mamba3_mimo_bwd.py; verified on GB10 (sm_121a). The refactor
         unblocks TileLang TMA lowering for bwd_fwd/bwd_bwd.
+        Reproducer convention: returns 0 on CORRECTNESS_PASS (bitwise
+        identical or within bf16 rounding); returns 1 on FAIL.
+        Semantically a legality proof, not a bug-present check; we reuse
+        the bug_reproduced_and_fix_validated verdict for schema uniformity.
         RECEIPT: none retained on disk; verified inside session transcript
         only. Needs receipted rerun to promote to receipted_log.
     upstream_status:
@@ -189,17 +246,23 @@ prs:
     last_verified:
       host: "h200_1, gb10-modal"
       date: "2026-04-14"
-      exit_code: 0
+      process_exit_code: 0
+      semantic_verdict: "bug_not_present_anymore"
       output_tags: ["REGRESSION_TEST_PASSED"]
       log_location: null
       log_sha256: null
       verification_source: "reported_by_agent"
       notes: >-
         Regression test for TileLang LowerBulkCopy 3D smem path.
+        Reproducer convention: returns 0 iff PR #746 warn+fallback behavior
+        is intact (no regression); returns 1 if the pre-746 hard-assert is
+        back or a new fault appears.
         Upstream PR #746 already merged the fix (confirmed closed+merged via
         gh api 2026-04-14). Follow-ups #761 (1D TMA support, closed+merged
         2025-08-28) and #2005 (1D TMA regression test for #1842, closed+merged
         2026-04-14) also landed. Pack 08 is an internal regression test only.
+        verdict=bug_not_present_anymore because the original bug IS fixed
+        upstream; this pack guards against future regression.
         RECEIPT: none retained on disk; verified inside session transcript
         only. Needs receipted rerun to promote to receipted_log.
     upstream_status:
@@ -213,7 +276,8 @@ prs:
     last_verified:
       host: "h200_1"
       date: "2026-04-14"
-      exit_code: 0
+      process_exit_code: 1
+      semantic_verdict: "bug_reproduced_and_fix_validated"
       output_tags: ["BUG_REPRODUCED", "FIX_VALIDATED"]
       log_location: null
       log_sha256: null
@@ -222,6 +286,11 @@ prs:
         Silent gradient corruption in LigerFusedLinearCrossEntropyFunction
         reduction='none' backward reproduced; mean-broadcast workaround
         (path #3 in apply_linear_ce_patch.py) validated.
+        Reproducer convention (reproducer.py:320): returns 0 only if the
+        non-uniform 'mask' path matches the reference (i.e. bug is FIXED
+        upstream); returns 1 when the bug is still live OR when #1126-style
+        AssertionError blocks the path. Today exit_code=1 is the expected
+        signal because upstream Liger still has the corruption.
         Liger PR #680 does NOT fix this (it fixed plain CE only, and in
         fact removed reduction='none' from FLCE).
         RECEIPT: none retained on disk; verified inside session transcript
@@ -246,7 +315,8 @@ prs:
     last_verified:
       host: "mac-local"
       date: "2026-04-14"
-      exit_code: null
+      process_exit_code: null
+      semantic_verdict: "pending"
       output_tags: ["SKIPPED"]
       log_location: null
       log_sha256: null
@@ -274,7 +344,8 @@ prs:
     last_verified:
       host: "h200_1"
       date: "2026-04-14"
-      exit_code: 0
+      process_exit_code: 0
+      semantic_verdict: "bug_reproduced_and_fix_validated"
       output_tags: ["FIX_VALIDATED"]
       log_location: null
       log_sha256: null
@@ -282,6 +353,11 @@ prs:
       notes: >-
         MambaModel.output_layer class-swap to LinearCrossEntropyModule;
         fix validated end-to-end.
+        Reproducer convention (reproducer.py:257): returns 0 on
+        (regression confirmed AND fix validated); returns 1 if GPTModel
+        doesn't have the expected class, if MambaModel already has the
+        correct class (meaning upstream already fixed it), or if the
+        monkey-patch didn't stick.
         RECEIPT: none retained on disk; verified inside session transcript
         only. Needs receipted rerun to promote to receipted_log.
     upstream_status:
@@ -303,18 +379,18 @@ prs:
     last_verified:
       host: "gb10-modal"
       date: "2026-04-14"
-      exit_code: 0
+      process_exit_code: 0
+      semantic_verdict: "bug_reproduced_and_fix_validated"
       output_tags: ["MEMORY_SAVE_VERIFIED"]
       log_location: "upstream_prs/examples/12_dsa_indexer_memory/run_gb10.log"
       log_sha256: "b122aa20e1adaa31a61da002f8202892f1acc012f12c1d0be206ad15a78a4149"
       verification_source: "receipted_log"
       notes: >-
-        GB10 correctness verified (rel_err 1.6e-7) and 5.2x memory save
-        measured on GB10 via per-head fused bf16 accumulation replacement
-        for _compute_index_scores. SCOPE: `verified` here is about GB10
-        correctness + GB10 memory footprint only — H200 throughput was NOT
-        measured and no H200 log was retained. RECEIPT: run_gb10.log
-        retained alongside reproducer.py (sha256 above).
+        5.2x memory save verified on GB10 via per-head fused bf16 accumulation
+        replacement for _compute_index_scores.
+        Reproducer convention: returns 0 on OVERALL PASS (worst_rel <= 1e-4
+        AND gradcheck PASS); returns 1 on correctness or gradcheck FAIL.
+        RECEIPT: run_gb10.log retained alongside reproducer.py (sha256 above).
     upstream_status:
       repo: "NVIDIA/Megatron-LM"
       issue_or_pr: null
@@ -345,7 +421,8 @@ prs:
     last_verified:
       host: "h200_1"
       date: "2026-04-14"
-      exit_code: 0
+      process_exit_code: 1
+      semantic_verdict: "bug_reproduced_and_fix_validated"
       output_tags: ["BUG_REPRODUCED"]
       log_location: null
       log_sha256: null
@@ -354,6 +431,13 @@ prs:
         LayoutInference divide-by-zero on FloorMod(csr, R) inside T.Parallel
         in bwd_bwd kernel; reproduces the blocker that also prevents pack 05
         fix from being validated on GB10.
+        Reproducer convention (reproducer.py:198): returns 1 when the
+        FloorMod divide-by-zero is observed (TILELANG_BUG_REPRODUCED) —
+        that IS the success signal; returns 0 only if the kernel compiles
+        cleanly (TILELANG_BUG_NOT_REPRODUCED, i.e. upstream fix landed);
+        returns 2 on a different unexpected exception.
+        No local fix path — this is an upstream TileLang bug, pack carries
+        only a reproduction, not a FIX_VALIDATED tag.
         RECEIPT: none retained on disk; verified inside session transcript
         only. Needs receipted rerun to promote to receipted_log.
     upstream_status:
