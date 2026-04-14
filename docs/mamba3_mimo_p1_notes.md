@@ -157,3 +157,44 @@ until H200 perf confirms speedup.
 - No silent fallback: `apply_all()` raises `RuntimeError` if the upstream
   decorator block can't be located.
 - Idempotent: safe to re-run after a `pip install` refreshes the files.
+
+## Addendum 2026-04-14 evening: H200 bwd compile failure + fix
+
+When the P1 patch (TMA+warp-spec ON) is applied on H200, `mamba_mimo_fwd`
+compiles fine but `mamba_mimo_bwd_fwd` and `mamba_mimo_bwd_bwd` fail with:
+
+```
+tvm.error.InternalError: Check failed: (shared_layout->InputDim() == 2)
+is false: Cannot detect TMA layout.
+```
+
+Origin: `tvm::tl::CopyNode::LowerBulkCopy` in `LowerTileOpPass`. The bwd
+kernel uses three rank-3 shared-memory descriptors that TileLang's TMA
+lowering can't handle (requires 2D).
+
+### Resolution: branch `tma-layout-fix-3d-to-2d` @ `31dc695`
+
+Flattens the 3D smem to 2D via `qk_dot_shared[c, r1, r2] →
+[c, r1 * R + r2]` + `Q[B, S, R, G, N] → [B, S*R, G, N]` (zero-copy view).
+Correctness verified on GB10: 14 gradient tensors rel_err 0.0038-0.0116
+(target <0.02, bit-for-bit with TMA=off baseline within bf16 rounding).
+
+Two follow-on files on the branch:
+- `apply_mamba3_mimo_tma_layout_fix.py` — idempotent applier
+- `mamba3_mimo_bwd_tma_layout_fix.patch` — unified diff
+
+Env gate: `CPPMEGA_MAMBA3_BWD_TMA_LAYOUT_FIX=1`.
+
+### Status
+
+**H200 perf measurement still pending**. When a H200 frees, apply both
+patches (`P1` + `TMA layout fix`) and measure.
+
+Options after measurement:
+- **P1 full wins ≥3%**: merge TMA layout fix into main + flip P1 default
+  ON. Propose to state-spaces/mamba as upstream PR (draft ready at
+  `upstream_prs/07_mamba3_mimo_3d_to_2d_smem_refactor.md`). **Do NOT
+  post upstream without explicit user approval.**
+- **Selective fwd-only fallback**: if full P1 has other issues (bwd
+  smem overflow even with flatten, or other WGMMA issues on H200),
+  ship only the fwd patch — ~1.3-1.8% interim gain.
