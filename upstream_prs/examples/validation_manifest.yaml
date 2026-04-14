@@ -309,9 +309,12 @@ prs:
       log_sha256: "b122aa20e1adaa31a61da002f8202892f1acc012f12c1d0be206ad15a78a4149"
       verification_source: "receipted_log"
       notes: >-
-        5.2x memory save verified on GB10 via per-head fused bf16 accumulation
-        replacement for _compute_index_scores. RECEIPT: run_gb10.log retained
-        alongside reproducer.py (sha256 above).
+        GB10 correctness verified (rel_err 1.6e-7) and 5.2x memory save
+        measured on GB10 via per-head fused bf16 accumulation replacement
+        for _compute_index_scores. SCOPE: `verified` here is about GB10
+        correctness + GB10 memory footprint only — H200 throughput was NOT
+        measured and no H200 log was retained. RECEIPT: run_gb10.log
+        retained alongside reproducer.py (sha256 above).
     upstream_status:
       repo: "NVIDIA/Megatron-LM"
       issue_or_pr: null
