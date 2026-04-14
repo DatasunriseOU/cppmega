@@ -318,7 +318,6 @@ def main() -> int:
             print("    STATUS: OK (compiled — no TMA fallback warning captured)")
             print("            (TileLang may have inferred a 2D layout internally.")
             print("             PR 07 refactor is still valuable as explicit semantics.)")
-            tags.append("COMPILE_FALLBACK_AT_3D")  # best-effort tag
     print()
 
     # --- 2D variant (post-refactor pattern), TMA enabled. ---
