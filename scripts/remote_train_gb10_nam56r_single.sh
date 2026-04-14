@@ -62,6 +62,11 @@ trap 'rm -rf "${REMOTE_WORKDIR}"' EXIT
 python -c "import cppmega, megatron, transformer_engine; print('import smoke ok', cppmega.__version__)"
 python -c "from cppmega.megatron.nam56r_noconv_spec import build_cppmega_nam56r_noconv_stack_spec; print('noconv spec importable')"
 
+# GB10 sm_121 smem-cap preflight: every in-tree TileLang kernel must declare
+# TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE.  On sm_121 this is a HARD fail.
+# See cppmega/megatron/preflight_smem_check.py and reference_gb10_bwd_bwd_blocker.md.
+python -m cppmega.megatron.preflight_smem_check
+
 cp "${REMOTE_ROOT}/megatron-lm/pretrain_mamba.py" "${REMOTE_WORKDIR}/pretrain_mamba_inner.py"
 
 # Wrapper that applies a small pre-flight patch for the GB10 single-GPU CUDA

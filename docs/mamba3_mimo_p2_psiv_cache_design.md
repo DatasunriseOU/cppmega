@@ -257,7 +257,7 @@ Before investing kernel-work time, confirm these **are not** blockers:
 ## 13. Next session TODO
 
 1. **Phase A Python prototype** (1 day): materialise `psi_v = v * psi` in the Python wrapper before calling the kernel, feed as V. Measure nsys delta. Gate the whole P2 pursuit on this result: if no measurable perf change, abandon.
-2. **If Phase A wins**: start Phase B (fwd kernel PsiV output). On bench3 H200 (not GB10 — GB10 smem cap blocks `bwd_bwd` at NAM56R shape per P1 notes). ~2 days.
+2. **If Phase A wins**: start Phase B (fwd kernel PsiV output). GB10 sm_121 was blocked at NAM56R `bwd_bwd` in earlier P1 notes; as of 2026-04-14 this is resolved by `TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True` in every TileLang `pass_configs` (enforced by `cppmega/megatron/preflight_smem_check.py`). GB10 is still NOT a throughput target (48 SMs vs 132; use for correctness/smoke only). Bench on H200. ~2 days.
 3. **Phase C** (bwd kernel PsiV input): most of the real work, ~2 days.
 4. **Perf + correctness validation**: nsys before/after, rel_err check on all 14 grads, compare iter-25 loss to baseline (should be BF16-noise-identical).
 5. **Doc + commit flip**: env-gate default OFF → ON only after H200 perf confirms ≥1.5%.
