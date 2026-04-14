@@ -43,7 +43,11 @@ REPO="${REPO:-/mnt/data/cppmega-root/cppmega}"
 step cd cd "$REPO"
 
 step git_status git status --short
-step git_stash git stash push -m "auto-$(date +%s)" --include-untracked
+# Do NOT --include-untracked: dataset cache + checkpoints (~76+ GiB total)
+# are untracked on bench3 and would hang git stash for 7+ min per call
+# (bench3 incident 2026-04-15). Tracked-only stash is enough — we only
+# need to clear modifications to tracked files before pull.
+step git_stash git stash push -m "auto-$(date +%s)"
 step git_pull git pull origin main
 step git_log git log -1 --oneline
 
