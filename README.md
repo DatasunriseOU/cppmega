@@ -33,9 +33,11 @@ it.
 ### Prerequisites
 
 ```bash
-# Megatron-LM: our local `dev_latest` branch, which cherry-picks the
-# currently-open upstream PRs #3674 and #4268 on top of 0.16.0rc0.
+# Megatron-LM: our local `dev_latest` branch on europe (based on 0.16.0rc0),
+# which cherry-picks the currently-open upstream PRs #3674 and #4268.
 # Neither PR is merged upstream yet — this branch is our local state.
+# bench3 instead runs 0.18.0rc0 installed via pip-git @ 980211ae (upstream dev
+# HEAD 2026-04-09). See Megatron Version section below for details.
 cd /mnt/data/cppmega-root/megatron-lm   # bench3 path
 # cd /home/dave/cppmega-root/megatron-lm  # europe path
 
@@ -198,14 +200,19 @@ Branch `dev_latest` on top of NVIDIA/Megatron-LM `dev`, with per-machine diverge
 
 | Machine | Version | Base | Our patches | Notes |
 |---|---|---|---|---|
-| bench3  | `megatron-core 0.16.0rc0` | tarball snapshot (no `.git`) | local cherry-pick of open PR #3345 + DSA integration | 2026-04-14 backup: `sftp://BUCKET_ARTIFACTS/backups/backup_bench3_2026_04_14/megatron_lm_tree.tar.gz`. Upstream commit unverified — see `docs/megatron_restoration_recipe.md` |
+| bench3  | `megatron-core 0.18.0rc0` (installed via `pip install git+NVIDIA/Megatron-LM@980211ae`) | upstream `dev` at commit `980211ae`, 2026-04-09 | local cherry-pick of open PR #3345 + DSA integration (overlaid on tarball at `/mnt/data/cppmega-root/megatron-lm/`) | 2026-04-14 backup: `sftp://BUCKET_ARTIFACTS/backups/backup_bench3_2026_04_14/megatron_lm_tree.tar.gz`. **Note**: the tarball's `package_info.py` reports `0.16.0rc0` but the actually-installed site-packages is `0.18.0rc0` — see `docs/session_3_gap_audit.md` |
 | europe  | `megatron-core 0.16.0rc0` | NVIDIA/Megatron-LM `origin/dev` | 2 commits ahead on local `dev_latest` branch | HEAD = `ec6a9e900`: local cherry-pick of open PR #4268 on top of local commit `2eeabc668`, which is our local merge of open PR #3674 (DSA absorbed MLA + TileLang fused sparse ops). Neither PR is merged upstream as of 2026-04-14 — see "Upstream status" below. |
 | GB10    | n/a     | n/a  | local clone present (`/home/dave/megatron-lm`) + `cppmega-venv` under `/home/dave/cppmega-venv` | Primary role is bwd_bwd / TileLang / CuTe-DSL single-GPU kernel dev; full NAM56R training is not validated here (sm_121 HW caps block tcgen05/FP4/WGMMA paths) |
 
-Both H200 hosts are on `0.16.0rc0` (verified from `megatron/core/package_info.py`).
-The earlier README claim of `0.18` was wrong. See
-`docs/megatron_restoration_recipe.md` for full base-commit recovery + patch
-listing.
+The two H200 hosts are on **different** megatron-core versions:
+- bench3: `0.18.0rc0` (installed via `pip install git+...@980211ae`)
+- europe: `0.16.0rc0` (editable install from `/home/dave/cppmega-root/megatron-lm/`, local `dev_latest` branch 2 ahead of `origin/dev`)
+
+The previous README claim that "both are 0.16.0rc0" was wrong — it was based on
+the `package_info.py` inside the bench3 tarball snapshot, but the *installed*
+site-packages version is 0.18.0rc0. See `docs/session_3_gap_audit.md` for the
+correction and `docs/megatron_restoration_recipe.md` for full base-commit
+recovery + patch listing.
 
 ### Upstream status (verified 2026-04-14)
 
@@ -230,7 +237,7 @@ local `dev_latest` branch until noted otherwise.
 - Transformer Engine 2.13
 - TileLang 0.1.8+cuda.gitf309d814 (main-branch build; install via `scripts/install_tilelang_wheel.sh` or source)
 - mamba-ssm 2.3.1
-- Megatron Core 0.16.0rc0 (both bench3 and europe; see Megatron Version above)
+- Megatron Core: bench3 `0.18.0rc0` (pip-git@980211ae), europe `0.16.0rc0` (editable `dev_latest`). See Megatron Version above.
 - NVIDIA Apex (from source)
 - dualpipe 1.0.0+030ce43 (from github)
 - liger-kernel
