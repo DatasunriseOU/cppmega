@@ -2,13 +2,39 @@
 
 **Target repo:** state-spaces/mamba
 **File:** `mamba_ssm/ops/triton/mamba3/mamba3_siso_bwd.py`
-**Type:** Performance optimization / code cleanup
+**Type:** Code clarity / CSE regression robustness (NOT a perf PR)
 
 ## Summary
 
 The `mamba3_siso_bwd_kernel_dqkv` kernel computes `tl.dot(v_block, tl.trans(do_block))` (a CHUNK_SIZE x CHUNK_SIZE GEMM) **three separate times** in the inner chunk loop, followed by the same causal decay mask application each time. All three produce identical results before diverging into their respective consumers (dADT, dK, dQ gradients).
 
 This PR computes the dot product and mask once, then reuses the result.
+
+**The motivation is code clarity and CSE regression robustness, NOT
+throughput.** On Triton 3.7 + H200 the compiler already CSEs the three
+redundant `tl.dot`s automatically; measured speedup is within timing noise
+(see *Measured impact* below). The value is:
+
+1. Making the CSE explicit in source so the correctness of the fusion
+   is a property of the code we wrote, not a property of whichever
+   Triton version happens to be installed.
+2. Guarding against future Triton / MLIR pass ordering changes that
+   weaken CSE (has happened before in Triton 2.x → 3.x transitions).
+3. Removing 25 lines of duplicated mask+dot code that made the
+   `RECOMPUTE_MASK` path harder to audit.
+
+## Measured impact
+
+Bench3 (NVIDIA H200 SXM, torch 2.12+cu132, Triton nightly 2026-04):
+
+| Config          | Baseline       | Patched        | Delta       |
+| --------------- | -------------- | -------------- | ----------- |
+| Smoke test      | —              | —              | **+2.33%**  |
+| NAM56R full run | —              | —              | **-0.85%**  |
+
+Both values are within step-to-step timing noise (σ ≈ ±2%) and are
+consistent with "no measurable perf change". The compiler has already
+fused the three dot products; this PR just writes them fused in source.
 
 ## Changes
 

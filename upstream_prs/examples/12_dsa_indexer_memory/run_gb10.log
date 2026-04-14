@@ -1,0 +1,32 @@
+Run on GB10 (NVIDIA GB10, 121.6 GiB unified memory) 2026-04-14
+torch: 2.12.0.dev20260407+cu132
+
+=== shape=small  b=2 sq=256 sk=256 h=4 d=32  dtype=torch.bfloat16  device=cuda ===
+  expected upstream [sq,b,h,sk] fp32 intermediate: 2.0 MiB
+  expected output   [b,sq,sk]   fp32:              0.5 MiB
+  upstream         peak_alloc=     36.2 MiB (delta vs inputs +36.0 MiB)
+  fused            peak_alloc=     34.3 MiB (delta vs inputs +1.6 MiB)
+  correctness: max rel_err = 0.000e+00
+  memory:      upstream 36.0 MiB -> fused 1.6 MiB   (saved 34.4 MiB, 22.1x)
+  PASS: correctness within 1e-4
+
+=== shape=prod  b=4 sq=4096 sk=4096 h=8 d=128  dtype=torch.bfloat16  device=cuda ===
+  expected upstream [sq,b,h,sk] fp32 intermediate: 2048.0 MiB
+  expected output   [b,sq,sk]   fp32:              256.0 MiB
+  upstream         peak_alloc=   4164.2 MiB (delta vs inputs +4096.0 MiB)
+  fused            peak_alloc=   1108.3 MiB (delta vs inputs +784.1 MiB)
+  correctness: max rel_err = 1.640e-07
+  memory:      upstream 4096.0 MiB -> fused 784.1 MiB   (saved 3311.9 MiB, 5.2x)
+  PASS: correctness within 1e-4
+
+=== gradcheck (small shape, float64) ===
+  upstream gradcheck: PASS
+  fused    gradcheck: PASS
+  fwd parity (double): rel_err = 0.000e+00
+  bwd parity: dq rel_err=0.000e+00  dw rel_err=0.000e+00  dk rel_err=2.706e-16
+  gradcheck overall: PASS
+
+=== summary ===
+  worst rel_err across shapes: 1.640e-07
+  gradcheck: PASS
+OVERALL: PASS

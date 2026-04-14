@@ -11,6 +11,15 @@ When FP8 training is enabled (`--fp8-format hybrid --fp8-recipe tensorwise`), Tr
 
 When `_fused_sparse_mla_absorbed()` passes these Float8Tensors to the TileLang SparseMLA kernel, the kernel gets NULL data pointers and crashes.
 
+**TE version caveat**: With Transformer Engine ≥ 2.13, the `__torch_dispatch__`
+hook silently auto-dequantizes `Float8Tensor` when passed to a raw CUDA
+kernel. So the headline `RuntimeError: data pointer expected non-NULL`
+does NOT fire on current stacks — instead users pay silent 2× memory
+bandwidth (asked for FP8, got BF16 on an auto-dequantized tensor). The
+underlying hazards (NULL `data_ptr()`, lying `.dtype=bf16`, `.contiguous()`
+does not unwrap) are still present; only `.dequantize()` unwraps. The
+dispatch fix is therefore about correctness of intent, not crash prevention.
+
 ## Solution
 
 Detect `QuantizedTensor` inputs in `_fused_sparse_mla_absorbed()` and dispatch to an FP8-aware SparseMLA variant:

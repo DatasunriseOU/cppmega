@@ -1,0 +1,4 @@
+# CUDA graph capture + torch.cuda.graph context manager.
+# Any torch with CUDAGraph support (>=1.10) works in principle, but the
+# dsa.py upstream baseline targets torch 2.12 nightly (cu13.2).
+torch>=2.12

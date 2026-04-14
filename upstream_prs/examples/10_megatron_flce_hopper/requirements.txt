@@ -1,0 +1,18 @@
+# Reproducer needs:
+#   * torch with CUDA (on a Hopper/Blackwell/Ada host) to actually trigger
+#     the dispatcher. CPU-only torch will SKIP (exit 77).
+#   * megatron-core from the `dev` branch (or any release that ships
+#     `megatron/core/fusions/fused_linear_cross_entropy.py` — at the time
+#     of writing, core_v0.16.x releases do NOT yet contain this file;
+#     only `dev` does. Expected to ship in core_v0.17.x.).
+#
+# Pin here matches what we run on bench3 (LOCATION_1) and LOCATION_2
+# H200 machines — see reference_bench3_h200_stack.md.
+
+torch>=2.12,<2.13
+# megatron-core `dev` isn't on PyPI; install directly from git:
+#   pip install "git+https://github.com/NVIDIA/Megatron-LM.git@dev#egg=megatron-core"
+# The PyPI `megatron-core` wheel (>=0.15,<0.17) does NOT ship the
+# `fused_linear_cross_entropy.py` file and thus cannot reproduce the bug —
+# the script will SKIP (exit 77).
+megatron-core @ git+https://github.com/NVIDIA/Megatron-LM.git@dev

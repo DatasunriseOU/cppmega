@@ -1,0 +1,6 @@
+# Minimum stack required to reproduce PR #04 (mamba3 SISO bwd vdot cleanup).
+# Versions below match the H200 bench environment where this was validated
+# (h200_1, 2026-04-14).
+torch>=2.7
+triton>=3.4
+mamba-ssm==2.3.1

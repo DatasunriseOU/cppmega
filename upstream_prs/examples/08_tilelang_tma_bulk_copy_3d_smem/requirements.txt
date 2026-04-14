@@ -1,0 +1,20 @@
+# Reproduces TileLang LowerBulkCopy behavior on rank-3 shared-memory descriptors.
+#
+# Version matrix (summary; full history in README):
+#   tilelang <= 0.1.7   (pre-PR #746, merged 2025-08-22)
+#       → hard ICHECK "Cannot detect TMA layout" on rank-3 smem + T.copy.
+#   tilelang  >= 0.1.8  (post-PR #746)
+#       → LOG(WARNING) + graceful fallback to LowerNormalCopy (cp.async).
+#
+# tvm-ffi < 0.1.10 is a hard requirement of the TileLang bench stack
+# (reference_stack_bench.md in MEMORY.md).
+#
+# Torch nightly with cu132 is what the bench fleet uses; any torch >= 2.6 with
+# CUDA should work for the reproducer, but to match the observed env keep 2.12.
+#
+# NOTE: TileLang is distributed as a source checkout on the bench machines
+# (TL_TEMPLATE_PATH→/mnt/data/tilelang-build). pip install works for cold repro
+# on clean boxes.
+torch>=2.6
+tilelang>=0.1.8
+tvm-ffi<0.1.10

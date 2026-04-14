@@ -75,6 +75,18 @@ export CPPMEGA_DSA_SKIP_INDEXER_LOSS="${CPPMEGA_DSA_SKIP_INDEXER_LOSS:-1}"
 export CPPMEGA_DSA_INDEXER_LOSS_COEFF="${CPPMEGA_DSA_INDEXER_LOSS_COEFF:-0}"
 export CPPMEGA_SELECTIVE_FP8_MOE="${CPPMEGA_SELECTIVE_FP8_MOE:-0}"
 export CPPMEGA_MTP_LIGER_CE="${CPPMEGA_MTP_LIGER_CE:-0}"
+# Native MTP linear CE (PR #3345 Hopper kernel) — requires
+# CPPMEGA_MAIN_HEAD_LINEAR_CE=1 and --cross-entropy-loss-fusion
+# --cross-entropy-fusion-impl linear in EXTRA_FLAGS. Mutually exclusive with
+# CPPMEGA_MTP_LIGER_CE=1.
+export CPPMEGA_MTP_NATIVE_HOPPER_CE="${CPPMEGA_MTP_NATIVE_HOPPER_CE:-0}"
+# These must be exported for subprocess (torch.distributed.run -> python)
+# to see them. Without explicit export, `env KEY=VAL bash` propagation
+# through the launcher has been observed to drop them on some shells.
+export CPPMEGA_MAIN_HEAD_LINEAR_CE="${CPPMEGA_MAIN_HEAD_LINEAR_CE:-0}"
+export CPPMEGA_PREFER_NATIVE_HOPPER_CE="${CPPMEGA_PREFER_NATIVE_HOPPER_CE:-0}"
+export CPPMEGA_LINEAR_CE_KERNEL="${CPPMEGA_LINEAR_CE_KERNEL:-auto}"
+export CPPMEGA_MAIN_HEAD_LIGER_NONFUSED="${CPPMEGA_MAIN_HEAD_LIGER_NONFUSED:-0}"
 # CPPMEGA_MAMBA3_COMPILE removed — regional compile is now always-on
 export CPPMEGA_LEMYX_DSA="${CPPMEGA_LEMYX_DSA:-0}"
 # FP8 sparse attention: when 1, unfused_dsa_fn dispatches to SparseMLA_FP8
@@ -83,6 +95,9 @@ export CPPMEGA_LEMYX_DSA="${CPPMEGA_LEMYX_DSA:-0}"
 export CPPMEGA_DSA_FP8_ATTENTION="${CPPMEGA_DSA_FP8_ATTENTION:-0}"
 # IndexCache: cross-layer index reuse for DSA (skip indexer on 6/9 layers)
 export CPPMEGA_INDEX_CACHE="${CPPMEGA_INDEX_CACHE:-0}"
+# DSA indexer fused per-head accumulation: eliminates [sq,b,h,sk] FP32 intermediate
+# inside _compute_index_scores. Default ON (set to 0 only for debugging parity).
+export CPPMEGA_DSA_INDEXER_FUSED="${CPPMEGA_DSA_INDEXER_FUSED:-1}"
 # Mamba3 MIMO P1: enable TMA + warp specialization in upstream TileLang kernels.
 # Opt-in until H200 perf is confirmed. See docs/mamba3_mimo_p1_notes.md.
 export CPPMEGA_MAMBA3_P1="${CPPMEGA_MAMBA3_P1:-0}"
@@ -287,6 +302,14 @@ if _ilc is not None:
     TransformerConfig.__post_init__ = _ilc_post_init
     print(f"[cppmega_mimo_shim] dsa_indexer_loss_coeff overridden to {_ilc_val}")
 
+# (12.5) DSA indexer fused per-head accumulation patch (CPPMEGA_DSA_INDEXER_FUSED=1,
+# default ON). Eliminates the [sq, b, h, sk] FP32 intermediate inside
+# _compute_index_scores. Must run BEFORE lemyx/IndexCache so those patches
+# see the fused implementation when they call fused_qk_topk_naive.
+if os.environ.get("CPPMEGA_DSA_INDEXER_FUSED", "1") != "0":
+    from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_patch
+    apply_dsa_indexer_fused_patch()
+
 # (13) lemyx fused DSA warmup kernel (CPPMEGA_LEMYX_DSA=1)
 if os.environ.get("CPPMEGA_LEMYX_DSA", "0") == "1":
     from cppmega.megatron.lemyx_dsa_warmup import apply_lemyx_dsa_patch
@@ -394,6 +417,15 @@ if os.environ.get("CPPMEGA_MTP_LIGER_CE", "0") == "1":
 if os.environ.get("CPPMEGA_MAIN_HEAD_LINEAR_CE", "0") == "1":
     from cppmega.megatron.apply_linear_ce_patch import patch_mamba_output_layer_with_linear_ce
     patch_mamba_output_layer_with_linear_ce()
+
+# (9c) MTP native Hopper CE (CPPMEGA_MTP_NATIVE_HOPPER_CE=1)
+# Wires MTP head through the same LinearCrossEntropyModule class swap used by
+# (9b) -- native process_mtp_loss has a fuse_linear_cross_entropy branch that
+# calls output_layer(..., output_cross_entropy_loss=True, labels=...) which
+# lowers to PR #3345 Hopper kernel on cc[0]==9.
+if os.environ.get("CPPMEGA_MTP_NATIVE_HOPPER_CE", "0") == "1":
+    from cppmega.megatron.mtp_native_hopper_ce import patch_mtp_native_hopper_ce
+    patch_mtp_native_hopper_ce()
 
 # (7) Stream M: per-rank peak-memory reporter (atexit hook)
 def _cppmega_peak_mem_report():
@@ -624,7 +656,11 @@ echo "DSA_A_LAYER_RANKS=${CPPMEGA_DSA_A_LAYER_RANKS}"
 echo "DSA path: lemyx + IndexCache"
 echo "CPPMEGA_DSA_FP8_ATTENTION=${CPPMEGA_DSA_FP8_ATTENTION}"
 echo "CPPMEGA_INDEX_CACHE=${CPPMEGA_INDEX_CACHE}"
+echo "CPPMEGA_DSA_INDEXER_FUSED=${CPPMEGA_DSA_INDEXER_FUSED}"
 echo "CPPMEGA_MTP_LIGER_CE=${CPPMEGA_MTP_LIGER_CE}"
+echo "CPPMEGA_MTP_NATIVE_HOPPER_CE=${CPPMEGA_MTP_NATIVE_HOPPER_CE}"
+echo "CPPMEGA_MAIN_HEAD_LINEAR_CE=${CPPMEGA_MAIN_HEAD_LINEAR_CE:-0}"
+echo "CPPMEGA_PREFER_NATIVE_HOPPER_CE=${CPPMEGA_PREFER_NATIVE_HOPPER_CE:-0}"
 echo "EXTRA_FLAGS=${EXTRA_FLAGS}"
 echo "LOG=${LOG}"
 nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader

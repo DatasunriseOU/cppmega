@@ -1,0 +1,6 @@
+# Pinned versions for reproducing Liger-Kernel FLCE reduction="none" bwd bug.
+# Latest PyPI release (0.7.0, Apr 2026) still exhibits the bug — issue #968
+# was CLOSED WITHOUT FIX, PR #1126 (assertion only) is OPEN draft as of run.
+torch>=2.12
+triton>=3.2
+liger-kernel==0.7.0

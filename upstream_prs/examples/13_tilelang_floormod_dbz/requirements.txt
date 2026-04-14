@@ -1,0 +1,16 @@
+# Pinned versions for reproducing the TileLang LayoutInference FloorMod
+# divide-by-zero bug. Verified 2026-04-14 on bench3 H200 (sm_90a) against
+# tilelang 0.1.8 built at upstream commit f309d814 (main HEAD at time of
+# filing).
+#
+# TileLang: install from source at commit f309d814 or later (PyPI 0.1.8 is
+# the same snapshot). Bug is present on current main.
+tilelang>=0.1.8
+# tvm-ffi must remain <0.1.10 (TileLang runtime constraint — see cppmega
+# reference_stack_bench.md).
+tvm-ffi<0.1.10
+# state-spaces/mamba provides the bwd_bwd kernel the reproducer exercises.
+# Any 2026-04-ish snapshot works (upstream master around that date).
+mamba-ssm
+# Torch is transitively required by mamba_ssm import; any recent version OK.
+torch>=2.5

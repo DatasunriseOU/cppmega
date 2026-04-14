@@ -80,6 +80,11 @@ The script auto-applies:
 | FP8 param-gather  | `CPPMEGA_FP8_PARAM_GATHER=1`  | Megatron `--fp8-param-gather`| -5 GiB (FP8 all-gather bucket, master stays FP32)    |
 | DualPipeV         | `CPPMEGA_DUALPIPEV=1`         | `apply_dualpipev_patch.py`   | V-shape PP; forces Megatron PP=1, carves own 2-rank group (experimental) |
 | Mamba3 MIMO P1    | `CPPMEGA_MAMBA3_P1=1`         | `apply_mamba3_mimo_p1_patches.py` | TMA + warp-spec on Mamba3 MIMO fwd only (bwd blocked by TileLang TMA layout bug) |
+| Main-head linear CE | `CPPMEGA_MAIN_HEAD_LINEAR_CE=1` | `apply_linear_ce_patch.py` | MambaModel.output_layer class-swap → `LinearCrossEntropyModule` (fixes upstream Megatron regression from PR #3207) |
+| Linear CE kernel  | `CPPMEGA_LINEAR_CE_KERNEL=auto\|liger\|cce` | `apply_linear_ce_patch.py` | Selects fallback kernel for non-Blackwell. Liger uses reduction="mean" broadcast workaround (sidesteps Liger #968 silent corruption) |
+| Prefer native Hopper | `CPPMEGA_PREFER_NATIVE_HOPPER_CE=1` | `apply_linear_ce_patch.py` | When PR #3345 cherry-picked, skip Liger/CCE reroute and use native Hopper CuTe DSL kernel directly |
+| MTP native Hopper | `CPPMEGA_MTP_NATIVE_HOPPER_CE=1` | `mtp_native_hopper_ce.py` | Route MTP depths through `LinearCrossEntropyModule` (**experimental — gated OFF by default, grad_norm=NaN bug pending fix**) |
+| DSA indexer fused | `CPPMEGA_DSA_INDEXER_FUSED=1`  | `dsa_indexer_fused_patch.py` | Per-head bmm accumulation → eliminates `[sq,b,h,sk]` fp32 intermediate (16 GiB → 268 MiB at prod shape) |
 
 ### Pipeline Schedules
 
@@ -103,6 +108,24 @@ The script auto-applies:
 8. CG-safe _scatter_topk_into_index_mask (branchless)
 9. FP8 SparseMLA dispatch (QuantizedTensor → SparseMLA_FP8, zero-copy via `_data`)
 9b. Remove stray `query.dequantize()` + `key.dequantize()` that had drifted into installed dsa.py (was killing zero-copy FP8 by re-quantizing BF16 tensors per-token)
+
+### TileLang wheel
+
+Prebuilt x86_64 wheel (cp38 stable ABI) for H200 machines lives in Google Storage:
+
+```
+sftp://BUCKET_ARTIFACTS/tilelang/tilelang-0.1.8+cuda.gitf309d814-cp38-abi3-linux_x86_64.whl
+```
+
+Install with `scripts/install_tilelang_wheel.sh` — it activates the target venv,
+pulls the wheel from GS, and verifies the import. If the GS fetch fails (auth,
+no network), the script falls back to cloning `tile-ai/tilelang` and building
+from commit `f309d814` via `pip install -e . --no-build-isolation`.
+
+Notes:
+- Wheel works on bench3 and europe (both x86_64 H200).
+- GB10 (aarch64, sm_121) must build from source — no aarch64 wheel yet.
+- Build recipe: `cd tilelang-build && pip wheel . --no-build-isolation --wheel-dir /tmp/tilelang-wheel/`.
 
 ## Throughput Results
 
@@ -137,7 +160,7 @@ Branch `dev_latest` on top of NVIDIA/Megatron-LM `dev`:
 
 - PyTorch 2.12 nightly + cu132
 - Transformer Engine 2.13
-- TileLang 0.1.8
+- TileLang 0.1.8+cuda.gitf309d814 (main-branch build; install via `scripts/install_tilelang_wheel.sh` or source)
 - mamba-ssm 2.3.1
 - Megatron Core 0.18
 - NVIDIA Apex (from source)

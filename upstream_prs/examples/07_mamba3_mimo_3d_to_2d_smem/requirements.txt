@@ -1,0 +1,13 @@
+# Tested on GB10 (sm_121a) and H200 (sm_90a), cu13.2 nightly stack.
+# See reference_stack_bench.md / reference_gb10_working_stack_2026_04.md.
+#
+# torch 2.12 nightly + cu132 is the bench3/europe/gb10 canonical stack.
+torch>=2.12.0.dev0
+# TileLang 0.1.8 is the version where this refactor was validated (GB10
+# sm_121a, H200 sm_90a). 0.1.9+ adds PR #746 (graceful warn+fallback on
+# rank-3 smem) but the 07 refactor remains the right call because even
+# with the fallback the 3D site does not get TMA+warp-spec.
+tilelang>=0.1.8,<=0.1.9
+# tvm-ffi pinned per reference_stack_bench.md: TileLang < 0.1.10 needs
+# tvm-ffi < 0.1.10 to avoid ABI drift.
+tvm-ffi<0.1.10
