@@ -78,6 +78,14 @@ fi
 step copy_launcher cp "$LAUNCHER_SRC" "$BISECT_ROOT/scripts/remote_smoke_h200_dsa_9_4_m.sh"
 chmod +x "$BISECT_ROOT/scripts/remote_smoke_h200_dsa_9_4_m.sh"
 
+# Older commits may lack modules the main launcher invokes (e.g.
+# cppmega.megatron.preflight_smem_check was added after 0038ad4). Make those
+# invocations best-effort — we want to exercise the training iters, not the
+# new preflights. This ONLY patches the worktree copy; main tree is untouched.
+step soften_preflight sed -i \
+  -e 's|^python -m cppmega\.megatron\.preflight_smem_check$|python -m cppmega.megatron.preflight_smem_check \|\| echo "[bisect] preflight_smem_check missing — skipped"|' \
+  "$BISECT_ROOT/scripts/remote_smoke_h200_dsa_9_4_m.sh"
+
 # ---------------------------------------------------------------------------
 # 3) Rebuild editable install pointing at BISECT_ROOT, then clear pycache.
 #    --force-reinstall makes sure the .pth and egg-info rewrite the worktree
