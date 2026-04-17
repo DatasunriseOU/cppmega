@@ -67,16 +67,16 @@ Our sister project `nanochat` (`/Volumes/external/sources/nanochat/`) implements
 
 **Baseline to beat: 112,152 tok/sec (VPP PP=2 VPP=2 MTP ON, current config)**
 
-| # | Config | Untied→Tied | MTP standalone | MBS | MTP | Extra | Expected tok/sec |
-|---|---|:-:|:-:|:-:|:-:|---|---|
-| 1 | Current baseline (control) | untied | no | 4 | on | — | **112,152 (verify)** |
-| 2 | Tied embeddings only | **tied** | no | 4 | on | — | ~125-135k |
-| 3 | Standalone VPP only | untied | **yes** | 4 | on | — | ~140-155k |
-| 4 | **Tied + standalone** | **tied** | **yes** | 4 | on | — | **~157-165k (primary target)** |
-| 5 | Full fixes + MBS=5 | tied | yes | 5 | on | — | ~170-185k |
-| 6 | Full fixes + MBS=6 | tied | yes | 6 | on | — | ~180-200k (if mem fits) |
-| 7 | Full fixes + PP=4 VPP=2 | tied | yes | 4 | on | PP=4 | test bubble shift |
-| 8 | NoMTP control (architectural regression) | tied | — | 4 | **off** | — | ~133k (sanity check) |
+| #   | Config                                   | Untied→Tied | MTP standalone |  MBS  |   MTP   | Extra | Expected tok/sec               |
+| --- | ---------------------------------------- | :---------: | :------------: | :---: | :-----: | ----- | ------------------------------ |
+| 1   | Current baseline (control)               |   untied    |       no       |   4   |   on    | —     | **112,152 (verify)**           |
+| 2   | Tied embeddings only                     |  **tied**   |       no       |   4   |   on    | —     | ~125-135k                      |
+| 3   | Standalone VPP only                      |   untied    |    **yes**     |   4   |   on    | —     | ~140-155k                      |
+| 4   | **Tied + standalone**                    |  **tied**   |    **yes**     |   4   |   on    | —     | **~157-165k (primary target)** |
+| 5   | Full fixes + MBS=5                       |    tied     |      yes       |   5   |   on    | —     | ~170-185k                      |
+| 6   | Full fixes + MBS=6                       |    tied     |      yes       |   6   |   on    | —     | ~180-200k (if mem fits)        |
+| 7   | Full fixes + PP=4 VPP=2                  |    tied     |      yes       |   4   |   on    | PP=4  | test bubble shift              |
+| 8   | NoMTP control (architectural regression) |    tied     |       —        |   4   | **off** | —     | ~133k (sanity check)           |
 
 **Expected winner:** variant 5 or 6 (~170-200k). At 200k we're **1.25× from the 250k target** which remaining levers can close (CUDA graphs after Megatron bug fixes, TP=2).
 
@@ -133,34 +133,34 @@ Parallel execution across machines. Each variant = 30-iter training run (~5-10 m
 
 ### MTP Super flags experiment (europe, 3 variants)
 
-| Variant | Config | Iter ms | Tok/sec | LM loss@30 | MTP loss@30 |
-|---|---|---|---|---|---|
-| V1 baseline | untied, MTP on | 2348.5 | 111,621 | 2.70 | 2.66 |
-| V2 `mtp_use_repeated_layer=True` depth=1 | Super flags | 2355.8 | 111,275 | 2.81 | 2.54 |
-| V3 `mtp_use_repeated_layer=True` depth=2 | Super flags | 2688.9 | 97,530 | 2.75 | 2.66/2.49 |
+| Variant                                  | Config         | Iter ms | Tok/sec | LM loss@30 | MTP loss@30 |
+| ---------------------------------------- | -------------- | ------- | ------- | ---------- | ----------- |
+| V1 baseline                              | untied, MTP on | 2348.5  | 111,621 | 2.70       | 2.66        |
+| V2 `mtp_use_repeated_layer=True` depth=1 | Super flags    | 2355.8  | 111,275 | 2.81       | 2.54        |
+| V3 `mtp_use_repeated_layer=True` depth=2 | Super flags    | 2688.9  | 97,530  | 2.75       | 2.66/2.49   |
 
 **Conclusion:** `mtp_use_repeated_layer=True` works for Mamba hybrid but gives 0% speedup at depth=1 (no-op when only 1 layer). At depth=2, -12.6% (expected -- shared weights save params not FLOPs). MTP overhead is forward+backward FLOPs, not param count.
 
 ### Tied embeddings experiment (europe)
 
-| Config | Iter ms | Tok/sec | Delta |
-|---|---|---|---|
-| Untied (baseline) | 2348.5 | 111,621 | 0% |
-| Tied | 2349.4 | 111,623 | -0.04% |
+| Config            | Iter ms | Tok/sec | Delta  |
+| ----------------- | ------- | ------- | ------ |
+| Untied (baseline) | 2348.5  | 111,621 | 0%     |
+| Tied              | 2349.4  | 111,623 | -0.04% |
 
 **Conclusion:** 0% effect on PP=2 hybrid. Megatron can't fuse embedding/output head across PP ranks.
 
 ### 8-variant MTP sweep results (europe + bench3)
 
-| # | Name | Iter ms | Tok/sec | Status |
-|---|---|---|---|---|
-| 1 | Control untied | 2348.5 | 111,666 | baseline |
-| 2 | Tied only | 2349.4 | 111,623 | 0% gain |
-| 3 | Standalone VPP | -- | -- | BLOCKED (Megatron hybrid) |
-| 4 | Tied + standalone | -- | -- | BLOCKED |
-| 5 | Tied MBS=5 | -- | -- | OOM (~142/140 GB) |
-| 7 | PP=4 VPP=1 | 3258.3 | 80,490 | -28% regression |
-| 8 | NoMTP control | 1981.2 | 132,438 | +18.6% (confirms 133k) |
+| #   | Name              | Iter ms | Tok/sec | Status                    |
+| --- | ----------------- | ------- | ------- | ------------------------- |
+| 1   | Control untied    | 2348.5  | 111,666 | baseline                  |
+| 2   | Tied only         | 2349.4  | 111,623 | 0% gain                   |
+| 3   | Standalone VPP    | --      | --      | BLOCKED (Megatron hybrid) |
+| 4   | Tied + standalone | --      | --      | BLOCKED                   |
+| 5   | Tied MBS=5        | --      | --      | OOM (~142/140 GB)         |
+| 7   | PP=4 VPP=1        | 3258.3  | 80,490  | -28% regression           |
+| 8   | NoMTP control     | 1981.2  | 132,438 | +18.6% (confirms 133k)    |
 
 **Key findings from sweep:**
 - Standalone VPP (variants 3, 4) BLOCKED: Megatron hybrid (`mamba_model.py:195-199`) explicitly does not support standalone MTP placement. PR #3377 confirms.
@@ -171,21 +171,21 @@ Parallel execution across machines. Each variant = 30-iter training run (~5-10 m
 
 ### Liger fused CE for MTP (bench3)
 
-| Metric | Standard CE | Liger fused | Delta |
-|---|---|---|---|
-| MTP time (4 depths fwd+bwd) | 178.8 ms | 483.2 ms | 2.7x SLOWER |
-| Peak memory | 27.36 GB | 5.49 GB | -82% |
+| Metric                      | Standard CE | Liger fused | Delta       |
+| --------------------------- | ----------- | ----------- | ----------- |
+| MTP time (4 depths fwd+bwd) | 178.8 ms    | 483.2 ms    | 2.7x SLOWER |
+| Peak memory                 | 27.36 GB    | 5.49 GB     | -82%        |
 
 **Conclusion:** Liger saves 82% memory but 2.7x slower on H200 (poor tensor core utilization on chunked small-M GEMMs). DO NOT enable on H200. Valuable for memory-constrained hardware only.
 
 ### CUDA graphs experiments (bench3)
 
-| Scope | Status | Tok/sec | Delta |
-|---|---|---|---|
-| Baseline (no graphs) | -- | 68,844 | -- |
-| `--cuda-graph-scope attn` | PASS | 69,822 | +1.4% |
-| `--cuda-graph-scope full_iteration` | FAIL | -- | MoE `.item()` blocker |
-| `transformer_engine` | FAIL | -- | Same MoE blocker |
+| Scope                               | Status | Tok/sec | Delta                 |
+| ----------------------------------- | ------ | ------- | --------------------- |
+| Baseline (no graphs)                | --     | 68,844  | --                    |
+| `--cuda-graph-scope attn`           | PASS   | 69,822  | +1.4%                 |
+| `--cuda-graph-scope full_iteration` | FAIL   | --      | MoE `.item()` blocker |
+| `transformer_engine`                | FAIL   | --      | Same MoE blocker      |
 
 **Key discovery:** cppmega already has working per-module CUDA graph scope: `--cuda-graph-scope attn mamba moe_router moe_preprocess` (in `nam56r_nemo_recipe.py:287-296`). Full MoE graph needs `--moe-pad-expert-input-to-capacity`. **211k tok/sec production recipe used this exact config.**
 
@@ -211,13 +211,13 @@ Root cause of ALL bench3 training failures in late session: system cuDNN 9.10.2 
 
 The original plan's primary target (variant 4: tied + standalone at ~157-165k) is **blocked** by Megatron's lack of standalone MTP support for hybrid models. Remaining viable levers:
 
-| Lever | Expected effect | Status |
-|---|---|---|
-| Per-module CUDA graphs (existing recipe) | Already in 211k config | needs cuDNN fix applied |
-| `--moe-pad-expert-input-to-capacity` | Enables full MoE CUDA graph | untested with fix |
-| FP8 on MLA+MoE | +15-20% | pending |
-| TP=2 PP=2 VPP=2 | +15-25% | medium effort |
-| MTP removal (last resort) | +18.6% | architectural regression |
+| Lever                                    | Expected effect             | Status                   |
+| ---------------------------------------- | --------------------------- | ------------------------ |
+| Per-module CUDA graphs (existing recipe) | Already in 211k config      | needs cuDNN fix applied  |
+| `--moe-pad-expert-input-to-capacity`     | Enables full MoE CUDA graph | untested with fix        |
+| FP8 on MLA+MoE                           | +15-20%                     | pending                  |
+| TP=2 PP=2 VPP=2                          | +15-25%                     | medium effort            |
+| MTP removal (last resort)                | +18.6%                      | architectural regression |
 
 ---
 
@@ -277,7 +277,7 @@ The original plan's primary target (variant 4: tied + standalone at ~157-165k) i
 
 ### Environment fixes
 
-- bench3 SSH IP updated (H200_1_IP -> H200_1_IP).
+- bench3 SSH IP updated (h200_1).
 - europe: git SSH key installed, fresh git clone (was rsync before), github authenticated.
 - europe: killed zombie cuTe DSL bench (PID 490683).
 - europe: kernel `mamba3_mimo_bwd.py` patched for GQA G<H support (was upstream-only without patch).
@@ -317,13 +317,13 @@ The original plan's primary target (variant 4: tied + standalone at ~157-165k) i
 
 Previous default topk=16 (0.4% density) was a placeholder — too aggressive sparse, model lost context. DeepSeek V3.2 production uses 3-12% density range.
 
-| topk | Density | TileLang Compatible | Status |
-|---:|---:|---|---|
-| 16 | 0.4% | No (16 % 64 != 0) | Placeholder, removed |
-| 64 | 1.6% | Yes | Minimum viable |
-| 128 | 3.1% | Yes | Low end of DeepSeek range |
-| **256** | **6.25%** | **Yes** | **Production default** |
-| 512 | 12.5% | Yes | High end of DeepSeek range |
+|    topk |   Density | TileLang Compatible | Status                     |
+| ------: | --------: | ------------------- | -------------------------- |
+|      16 |      0.4% | No (16 % 64 != 0)   | Placeholder, removed       |
+|      64 |      1.6% | Yes                 | Minimum viable             |
+|     128 |      3.1% | Yes                 | Low end of DeepSeek range  |
+| **256** | **6.25%** | **Yes**             | **Production default**     |
+|     512 |     12.5% | Yes                 | High end of DeepSeek range |
 
 **Sparse attention kernel**: TileLang fused SparseMLA (default, `CPPMEGA_DSA_SPARSE_MODE=tilelang`).
 - Source: `tile-ai/tilelang/examples/deepseek_v32/sparse_mla_fwd.py` + NVIDIA Megatron-LM PR #3674

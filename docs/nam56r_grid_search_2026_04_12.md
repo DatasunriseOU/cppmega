@@ -37,15 +37,15 @@ Push NAM56R full-stack training throughput from 112k tok/sec baseline toward
 
 ## Results table
 
-| # | Config | iter_ms | tok/sec | lm_loss@end | Notes |
-|---|---|---|---|---|---|
-| 01 | PP=2 VPP=2 MBS=4 GBS=64 MTP=1 CG=per_module(attn mamba moe) BF16 | CRASH | — | — | SIGSEGV at CUDAGraph replay iter 2; per-module scope + MoE unstable on this stack |
-| 02 | PP=2 VPP=2 MBS=4 GBS=64 MTP=1 CG=off BF16 (bench3 baseline anchor) | 3018.5 | **86,845** | 5.51 | 30 iters OK, loss 11.9→5.5; CUDA graphs disabled to anchor a stable reference |
-| 03 | PP=2 VPP=2 MBS=4 GBS=64 MTP=0 CG=off (NoMTP control) | 2663.7 | **98,412** | 5.18 | +13.3% over baseline; matches prior 18% MTP-cost measurement |
-| 04 | PP=2 VPP=2 MBS=4 GBS=64 MTP=1 CG=attn_only | 2899.9 | **90,399** | 5.17 | +4.1% over baseline; attn-only graph captures without MoE crash |
-| 05 | PP=2 VPP=2 MBS=4 GBS=64 MTP=1 CG=per_module(attn mamba moe_router moe_preprocess) | CRASH | — | — | SIGABRT device-side assert (CUDACachingAllocator::insert_events) during graph capture |
-| 06 | PP=1 VPP=1 MBS=2 GBS=32 MTP=1 CG=off (DP=8) | 1523.1 | **86,054** | 5.20 | PP=1 DP=8 has same tok/sec as PP=2 — pipeline gives no speedup on bench3 without CUDA graphs |
-| 07 | PP=1 VPP=1 MBS=4 GBS=64 MTP=1 CG=off | OOM | — | — | Cross-entropy 4GB logits OOM on rank 0 — DP=8 full-layer setup too tight |
+| #   | Config                                                                            | iter_ms | tok/sec    | lm_loss@end | Notes                                                                                        |
+| --- | --------------------------------------------------------------------------------- | ------- | ---------- | ----------- | -------------------------------------------------------------------------------------------- |
+| 01  | PP=2 VPP=2 MBS=4 GBS=64 MTP=1 CG=per_module(attn mamba moe) BF16                  | CRASH   | —          | —           | SIGSEGV at CUDAGraph replay iter 2; per-module scope + MoE unstable on this stack            |
+| 02  | PP=2 VPP=2 MBS=4 GBS=64 MTP=1 CG=off BF16 (bench3 baseline anchor)                | 3018.5  | **86,845** | 5.51        | 30 iters OK, loss 11.9→5.5; CUDA graphs disabled to anchor a stable reference                |
+| 03  | PP=2 VPP=2 MBS=4 GBS=64 MTP=0 CG=off (NoMTP control)                              | 2663.7  | **98,412** | 5.18        | +13.3% over baseline; matches prior 18% MTP-cost measurement                                 |
+| 04  | PP=2 VPP=2 MBS=4 GBS=64 MTP=1 CG=attn_only                                        | 2899.9  | **90,399** | 5.17        | +4.1% over baseline; attn-only graph captures without MoE crash                              |
+| 05  | PP=2 VPP=2 MBS=4 GBS=64 MTP=1 CG=per_module(attn mamba moe_router moe_preprocess) | CRASH   | —          | —           | SIGABRT device-side assert (CUDACachingAllocator::insert_events) during graph capture        |
+| 06  | PP=1 VPP=1 MBS=2 GBS=32 MTP=1 CG=off (DP=8)                                       | 1523.1  | **86,054** | 5.20        | PP=1 DP=8 has same tok/sec as PP=2 — pipeline gives no speedup on bench3 without CUDA graphs |
+| 07  | PP=1 VPP=1 MBS=4 GBS=64 MTP=1 CG=off                                              | OOM     | —          | —           | Cross-entropy 4GB logits OOM on rank 0 — DP=8 full-layer setup too tight                     |
 
 ## DSA 9+4 permanent layout (2026-04-12, Stream D)
 
@@ -62,10 +62,10 @@ the Megatron-LM default (n_heads=8, head_dim=64, topk=16, loss_coeff=0.0).
 Launch script: `scripts/remote_smoke_h200_dsa_full_nam56r.sh` (rewritten from
 the old PP=1 noconv smoke to match the 112k baseline plumbing + DSA).
 
-| # | Config | iter_ms | tok/sec | lm_loss | Notes |
-|---|---|---|---|---|---|
-| D1 | PP=2 VPP=2 MBS=**4** GBS=64 MTP=2 CG=per_module(attn mamba moe_router moe_preprocess) BF16 + DSA 9+4 | **OOM** | — | — | Crash in first forward: `torch.OutOfMemoryError` inside `dsa.fwd_fused_indexer_loss_naive → _compute_index_scores → torch.relu(index_scores)` (dsa.py:281). Rank 2 GPU had only 1.16 GB free, tried to allocate 2.00 GB. 58.81 GB active in process at failure time. |
-| D2 | PP=2 VPP=2 MBS=**2** GBS=64 MTP=2 CG=per_module BF16 + DSA 9+4 | **OOM** | — | — | Crash during backward of iter 1: rank 0-3 (PP stage 0) each allocate 134.65 GB PyTorch + ~3.6 GB non-PyTorch, then `Variable._execution_engine.run_backward` tries +3.50 GB and fails (138.31 GB in use on a 139.80 GB H200). DSA indexer activation retention pushes stage 0 past the H200 ceiling even at MBS=2. |
+| #   | Config                                                                                               | iter_ms | tok/sec | lm_loss | Notes                                                                                                                                                                                                                                                                                                              |
+| --- | ---------------------------------------------------------------------------------------------------- | ------- | ------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| D1  | PP=2 VPP=2 MBS=**4** GBS=64 MTP=2 CG=per_module(attn mamba moe_router moe_preprocess) BF16 + DSA 9+4 | **OOM** | —       | —       | Crash in first forward: `torch.OutOfMemoryError` inside `dsa.fwd_fused_indexer_loss_naive → _compute_index_scores → torch.relu(index_scores)` (dsa.py:281). Rank 2 GPU had only 1.16 GB free, tried to allocate 2.00 GB. 58.81 GB active in process at failure time.                                               |
+| D2  | PP=2 VPP=2 MBS=**2** GBS=64 MTP=2 CG=per_module BF16 + DSA 9+4                                       | **OOM** | —       | —       | Crash during backward of iter 1: rank 0-3 (PP stage 0) each allocate 134.65 GB PyTorch + ~3.6 GB non-PyTorch, then `Variable._execution_engine.run_backward` tries +3.50 GB and fails (138.31 GB in use on a 139.80 GB H200). DSA indexer activation retention pushes stage 0 past the H200 ceiling even at MBS=2. |
 
 ### Reproducibility artifacts
 - Launch script: `scripts/remote_smoke_h200_dsa_full_nam56r.sh`
@@ -127,11 +127,11 @@ sq=sk=4096 production shape.
 **Memory reduction (fused per-head accumulation, bench3 H200 sm_90a,
 `torch._scaled_mm` rowwise fp8_e4m3fn):**
 
-| Shape (sq=sk, b, h, d) | BF16 peak_delta | FP8 peak_delta | Reduction |
-|---|---:|---:|---:|
-| 4096, 2, 8, 64 | 3254.8 MB | **340.6 MB** | **9.6x less** |
-| 4096, 4, 8, 64 | 6442.5 MB | **479.8 MB** | **13.4x less** |
-| 4096, 2, 8, 128 | 3221.2 MB | **345.3 MB** | **9.3x less** |
+| Shape (sq=sk, b, h, d) | BF16 peak_delta | FP8 peak_delta |      Reduction |
+| ---------------------- | --------------: | -------------: | -------------: |
+| 4096, 2, 8, 64         |       3254.8 MB |   **340.6 MB** |  **9.6x less** |
+| 4096, 4, 8, 64         |       6442.5 MB |   **479.8 MB** | **13.4x less** |
+| 4096, 2, 8, 128        |       3221.2 MB |   **345.3 MB** |  **9.3x less** |
 
 **Impact on Stream D OOM at DSA 9+4 layout:** the BF16 path materialised
 `index_scores [sq, b, h, sk] fp32` live through `sum(dim=2)` and the fp32
@@ -190,11 +190,11 @@ marker set.
 
 ### Result
 
-| # | Config | iter_ms | tok/sec | lm_loss | Notes |
-|---|---|---|---|---|---|
-| D v1 (context) | PP=2 VPP=2 MBS=4 GBS=64 MTP=2 BF16 DSA 9+4 | OOM | - | - | Stage 0 OOM in `dsa._compute_index_scores → relu` on iter 1 forward. 134-135 GB PyTorch on stage 0 before tip-over. |
-| D v1 retry (context) | same as above + MBS=2 | OOM | - | - | Stage 0 OOM in backward, 138.31/139.80 GB. |
-| **D v2** | PP=2 VPP=2 MBS=4 GBS=64 MTP=2 BF16 DSA 9+4 + **FP8 indexer** | **OOM** | - | - | **Stage 1** OOM in `moe_layer.routed_experts_compute → bias_act_func → activation_func` on iter 1 forward. Ranks 0,1,2,3 each at 136.27 GB allocated / 139.80 GB total, 91-113 MB free. FP8 indexer patch applied successfully on all 8 ranks per shim logs - the failure is NOT in DSA. |
+| #                    | Config                                                       | iter_ms | tok/sec | lm_loss | Notes                                                                                                                                                                                                                                                                                    |
+| -------------------- | ------------------------------------------------------------ | ------- | ------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D v1 (context)       | PP=2 VPP=2 MBS=4 GBS=64 MTP=2 BF16 DSA 9+4                   | OOM     | -       | -       | Stage 0 OOM in `dsa._compute_index_scores → relu` on iter 1 forward. 134-135 GB PyTorch on stage 0 before tip-over.                                                                                                                                                                      |
+| D v1 retry (context) | same as above + MBS=2                                        | OOM     | -       | -       | Stage 0 OOM in backward, 138.31/139.80 GB.                                                                                                                                                                                                                                               |
+| **D v2**             | PP=2 VPP=2 MBS=4 GBS=64 MTP=2 BF16 DSA 9+4 + **FP8 indexer** | **OOM** | -       | -       | **Stage 1** OOM in `moe_layer.routed_experts_compute → bias_act_func → activation_func` on iter 1 forward. Ranks 0,1,2,3 each at 136.27 GB allocated / 139.80 GB total, 91-113 MB free. FP8 indexer patch applied successfully on all 8 ranks per shim logs - the failure is NOT in DSA. |
 
 ### Per-stage parameter load
 
@@ -346,12 +346,12 @@ FP8 patch was verified present on bench3 before launch (module marker
 
 ### Sweep results
 
-| Variant | Config delta | tmux session | Log file | Result | Stage-0 peak GB | Stage-1 peak GB | Failure site |
-|---------|---|---|---|---|---|---|---|
-| J-V1 | FP8 fwd+bwd (Stream G) only | `nam56r_dsa_j_v1` | `cppmega_nam56r_dsa_9_4_fp8_j_v1.log` | **OOM** | 136.27 (crash) | 55.6 | `moe_layer.routed_experts_compute → bias_act_func → activation_func` at `experts.py:321`. Tried +112 MiB, 91 MiB free. Same crash location as Stream D v2 on ranks 0-3. Stream G backward FP8 patch applied successfully but the OOM happens in **forward**, so bwd savings never materialise. |
-| J-V2 | V1 + `--recompute-granularity selective --recompute-modules moe_act` | `nam56r_dsa_j_v2` | `cppmega_nam56r_dsa_9_4_fp8_j_v2.log` | **OOM** | 109.28 (crash, new site) | 49.5 (stable) | `compute_dsa_indexer_loss → torch.bmm(query.float(), key.float()) * softmax_scale` at `dsa.py:202`. Tried +7.00 GiB FP32 `[b*np, sq, sk] = [112, 4096, 4096]` tensor for KL-divergence loss, 6.86 GiB free. moe_act recompute fixed the MoE bias_act OOM (peak alloc dropped 136→109 GB) but the DSA KL-loss FP32 bmm became the new bottleneck. This matches Stream E's original blocker note that the KL-loss bmm stays FP32 and is NOT covered by the FP8 indexer patch. |
-| J-V3 | V2 + `--decoder-first-pipeline-num-layers 29 --decoder-last-pipeline-num-layers 23` (VPP=1, flat hybrid pattern) | `nam56r_dsa_j_v3` | `cppmega_nam56r_dsa_9_4_fp8_j_v3.log` | **OOM** | 131.30 (crash, worse) | ~23 | Same `dsa.py:202` bmm as V2. Stage 0 moved to 29 base layers; this **increased** the number of DSA layers on stage 0 from 5 (D v2 split) to 6, raising the per-stage activation baseline. Uneven PP split pushed in the wrong direction. (First attempt also hit a Megatron assertion: `--hybrid-layer-pattern` with `\|` separators cannot coexist with `--decoder-first/last-pipeline-num-layers`; launcher was patched to emit a flat pattern for V3/V4 falling back to VPP=1.) |
-| J-V4 | PP=4 VPP=1 (4 stages × 13 base layers, MBS=4 GBS=64 MTP=2) | `nam56r_dsa_j_v4` | `cppmega_nam56r_dsa_9_4_fp8_j_v4.log` | **OOM** | 135.85 (crash) | ~97 (stage 1), ~16 (stage 2), ~19 (stage 3) | Same `dsa.py:202` bmm. Per-stage weight+optimizer memory halved vs PP=2 but the 1F1B pipeline buffer now holds 4 in-flight micro-batches of forward activations (vs 2 at PP=2), which cancels the weight saving and then some. Each stage still has 2-3 DSA layers, and the first call to the FP32 bmm with only 392 MiB free overflows the same way. V4 as defined (PP=4 VPP=2) is not achievable because 52 % 8 ≠ 0; switched to PP=4 VPP=1, still fails. Note: the task spec's V4=PP=4 VPP=2 assumes 52 layers split into 8 equal chunks, which Megatron's hybrid pattern parser rejects. |
+| Variant | Config delta                                                                                                     | tmux session      | Log file                              | Result  | Stage-0 peak GB          | Stage-1 peak GB                             | Failure site                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ------- | ---------------------------------------------------------------------------------------------------------------- | ----------------- | ------------------------------------- | ------- | ------------------------ | ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| J-V1    | FP8 fwd+bwd (Stream G) only                                                                                      | `nam56r_dsa_j_v1` | `cppmega_nam56r_dsa_9_4_fp8_j_v1.log` | **OOM** | 136.27 (crash)           | 55.6                                        | `moe_layer.routed_experts_compute → bias_act_func → activation_func` at `experts.py:321`. Tried +112 MiB, 91 MiB free. Same crash location as Stream D v2 on ranks 0-3. Stream G backward FP8 patch applied successfully but the OOM happens in **forward**, so bwd savings never materialise.                                                                                                                                                                                                                                                                                               |
+| J-V2    | V1 + `--recompute-granularity selective --recompute-modules moe_act`                                             | `nam56r_dsa_j_v2` | `cppmega_nam56r_dsa_9_4_fp8_j_v2.log` | **OOM** | 109.28 (crash, new site) | 49.5 (stable)                               | `compute_dsa_indexer_loss → torch.bmm(query.float(), key.float()) * softmax_scale` at `dsa.py:202`. Tried +7.00 GiB FP32 `[b*np, sq, sk] = [112, 4096, 4096]` tensor for KL-divergence loss, 6.86 GiB free. moe_act recompute fixed the MoE bias_act OOM (peak alloc dropped 136→109 GB) but the DSA KL-loss FP32 bmm became the new bottleneck. This matches Stream E's original blocker note that the KL-loss bmm stays FP32 and is NOT covered by the FP8 indexer patch.                                                                                                                  |
+| J-V3    | V2 + `--decoder-first-pipeline-num-layers 29 --decoder-last-pipeline-num-layers 23` (VPP=1, flat hybrid pattern) | `nam56r_dsa_j_v3` | `cppmega_nam56r_dsa_9_4_fp8_j_v3.log` | **OOM** | 131.30 (crash, worse)    | ~23                                         | Same `dsa.py:202` bmm as V2. Stage 0 moved to 29 base layers; this **increased** the number of DSA layers on stage 0 from 5 (D v2 split) to 6, raising the per-stage activation baseline. Uneven PP split pushed in the wrong direction. (First attempt also hit a Megatron assertion: `--hybrid-layer-pattern` with `\|` separators cannot coexist with `--decoder-first/last-pipeline-num-layers`; launcher was patched to emit a flat pattern for V3/V4 falling back to VPP=1.)                                                                                                           |
+| J-V4    | PP=4 VPP=1 (4 stages × 13 base layers, MBS=4 GBS=64 MTP=2)                                                       | `nam56r_dsa_j_v4` | `cppmega_nam56r_dsa_9_4_fp8_j_v4.log` | **OOM** | 135.85 (crash)           | ~97 (stage 1), ~16 (stage 2), ~19 (stage 3) | Same `dsa.py:202` bmm. Per-stage weight+optimizer memory halved vs PP=2 but the 1F1B pipeline buffer now holds 4 in-flight micro-batches of forward activations (vs 2 at PP=2), which cancels the weight saving and then some. Each stage still has 2-3 DSA layers, and the first call to the FP32 bmm with only 392 MiB free overflows the same way. V4 as defined (PP=4 VPP=2) is not achievable because 52 % 8 ≠ 0; switched to PP=4 VPP=1, still fails. Note: the task spec's V4=PP=4 VPP=2 assumes 52 layers split into 8 equal chunks, which Megatron's hybrid pattern parser rejects. |
 
 ### Root cause (all 4 variants)
 
@@ -480,27 +480,27 @@ bench3 after Stream J vacated - where it OOM'd before iter 1. K V4 was
 then launched on bench3 and failed at argument validation (structural
 constraint, see below).
 
-| # | Config | tmux | log | iter_ms @ steady | tok/sec | Peak GB | lm_loss | Result | Notes |
-|---|--------|------|-----|------------------|---------|---------|---------|--------|-------|
-| K1 | PP=1 TP=2 EP=2 VPP=1 (DP=2) MBS=4 GBS=64 MTP=2 BF16 CG=per_module DSA 9+4 FP8 | europe `nam56r_k_v1` | `/home/dave/cppmega-root/cppmega/cppmega_nam56r_k_v1.log` | **17,597** | **14,907** | 142.2 (near 143 ceiling) | 6.96 @ iter 8 | **PASS (fits, slow)** | Memory fits but only because FP8 DSA indexer saved ~26 GB. 8 clean iters (5-8 all within 17597±10 ms). CppmegaMamba3TPMixer for Mamba-3 MIMO is the dominant cost: 46.8 TFLOPS/GPU vs ~109 at TP=1 (2.3× slower kernel), compounded by DSA+MoE overhead at TP=2. Terminated at iter 8 for K2 (no point running 100 iters on 7.5× regression). |
-| K2 | PP=1 TP=2 EP=4 VPP=1 (DP=1) MBS=4 GBS=64 MTP=2 BF16 CG=per_module DSA 9+4 FP8 | europe `nam56r_k_v2` | `/home/dave/cppmega-root/cppmega/cppmega_nam56r_k_v2.log` | **17,610** | **14,881** | ~122 steady | 10.70 @ iter 6 | **PASS (fits, slow)** | Essentially identical throughput to K1. More EP does not help at TP=2 because Mamba-3 MIMO is not a MoE cost. Param count per rank: 1,558,863,760 (1.56B x TP=2). 6 clean iters. |
-| K3 | PP=1 TP=4 EP=2 VPP=1 (DP=1) MBS=4 GBS=64 MTP=2 BF16 CG=per_module DSA 9+4 FP8 | europe `nam56r_k_v3` (interrupted) + bench3 `nam56r_k_v3_bench3` | `/home/dave/cppmega-root/cppmega/cppmega_nam56r_k_v3.log` (europe, backed up to `cppmega.rsync.bak.20260412_010835/`) + `/mnt/data/cppmega-root/cppmega/cppmega_nam56r_k_v3.log` (bench3) | 11,835 (iter 3 only, compile bleed) | 22,148 (iter 3, not steady) | 134+ / OOM | 12.81 @ iter 3 | **FAIL (OOM on bench3 retry)** | Europe run was interrupted at iter 4 by an external rsync action over the `cppmega/` checkout at 01:08:35 (not this stream). Bench3 relaunch: `torch.OutOfMemoryError` at `_reduce_scatter_along_first_dim` inside `moe_layer.token_dispatcher.combine_preprocess` on iter 1 forward - GPU 1 tried +112 MiB with 90.69 MiB free, PyTorch alloc 56.54 GB + other rank 79.84 GB = 136 GB. TP=4 + EP=2 does not fit MoE activations + DSA indexer at MBS=4. The iter 3 number from europe is not a steady-state measurement (TileLang compile was amortised into iter 1-2; iter 3 was first real iter before CUDA-graph capture at iter 4). |
-| K4 | PP=1 TP=8 EP=1 VPP=1 (DP=1) MBS=4 GBS=64 MTP=2 BF16 CG=per_module DSA 9+4 FP8 | bench3 `nam56r_k_v4_bench3` | `/mnt/data/cppmega-root/cppmega/cppmega_nam56r_k_v4.log` | — | — | — | — | **FAIL (structural)** | Megatron argument validation raised `ValueError: num_attention_heads (28) must be a multiple of tensor_model_parallel_size (8)`. 28 % 8 ≠ 0. **TP=8 is structurally impossible for NAM56R.** The task brief assumed `nheads=112` / `ngroups=8` (Mamba-3 module counts) but the Megatron constraint is on `--num-attention-heads`, which NAM56R sets to 28 (MLA/DSA attention head count, not Mamba head count). Divisors of 28 permitted by Megatron: {1, 2, 4, 7, 14, 28}. TP=8 requires `num_attention_heads % 8 == 0`, blocking it. TP=7 (28/7=4 heads/rank) would work numerically but doesn't evenly divide an 8-GPU world. No workaround preserves the feature contract. |
+| #   | Config                                                                        | tmux                                                             | log                                                                                                                                                                                       | iter_ms @ steady                    | tok/sec                     | Peak GB                  | lm_loss        | Result                         | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| --- | ----------------------------------------------------------------------------- | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------- | --------------------------- | ------------------------ | -------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| K1  | PP=1 TP=2 EP=2 VPP=1 (DP=2) MBS=4 GBS=64 MTP=2 BF16 CG=per_module DSA 9+4 FP8 | europe `nam56r_k_v1`                                             | `/home/dave/cppmega-root/cppmega/cppmega_nam56r_k_v1.log`                                                                                                                                 | **17,597**                          | **14,907**                  | 142.2 (near 143 ceiling) | 6.96 @ iter 8  | **PASS (fits, slow)**          | Memory fits but only because FP8 DSA indexer saved ~26 GB. 8 clean iters (5-8 all within 17597±10 ms). CppmegaMamba3TPMixer for Mamba-3 MIMO is the dominant cost: 46.8 TFLOPS/GPU vs ~109 at TP=1 (2.3× slower kernel), compounded by DSA+MoE overhead at TP=2. Terminated at iter 8 for K2 (no point running 100 iters on 7.5× regression).                                                                                                                                                                                                                                                                                                                                  |
+| K2  | PP=1 TP=2 EP=4 VPP=1 (DP=1) MBS=4 GBS=64 MTP=2 BF16 CG=per_module DSA 9+4 FP8 | europe `nam56r_k_v2`                                             | `/home/dave/cppmega-root/cppmega/cppmega_nam56r_k_v2.log`                                                                                                                                 | **17,610**                          | **14,881**                  | ~122 steady              | 10.70 @ iter 6 | **PASS (fits, slow)**          | Essentially identical throughput to K1. More EP does not help at TP=2 because Mamba-3 MIMO is not a MoE cost. Param count per rank: 1,558,863,760 (1.56B x TP=2). 6 clean iters.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| K3  | PP=1 TP=4 EP=2 VPP=1 (DP=1) MBS=4 GBS=64 MTP=2 BF16 CG=per_module DSA 9+4 FP8 | europe `nam56r_k_v3` (interrupted) + bench3 `nam56r_k_v3_bench3` | `/home/dave/cppmega-root/cppmega/cppmega_nam56r_k_v3.log` (europe, backed up to `cppmega.rsync.bak.20260412_010835/`) + `/mnt/data/cppmega-root/cppmega/cppmega_nam56r_k_v3.log` (bench3) | 11,835 (iter 3 only, compile bleed) | 22,148 (iter 3, not steady) | 134+ / OOM               | 12.81 @ iter 3 | **FAIL (OOM on bench3 retry)** | Europe run was interrupted at iter 4 by an external rsync action over the `cppmega/` checkout at 01:08:35 (not this stream). Bench3 relaunch: `torch.OutOfMemoryError` at `_reduce_scatter_along_first_dim` inside `moe_layer.token_dispatcher.combine_preprocess` on iter 1 forward - GPU 1 tried +112 MiB with 90.69 MiB free, PyTorch alloc 56.54 GB + other rank 79.84 GB = 136 GB. TP=4 + EP=2 does not fit MoE activations + DSA indexer at MBS=4. The iter 3 number from europe is not a steady-state measurement (TileLang compile was amortised into iter 1-2; iter 3 was first real iter before CUDA-graph capture at iter 4).                                       |
+| K4  | PP=1 TP=8 EP=1 VPP=1 (DP=1) MBS=4 GBS=64 MTP=2 BF16 CG=per_module DSA 9+4 FP8 | bench3 `nam56r_k_v4_bench3`                                      | `/mnt/data/cppmega-root/cppmega/cppmega_nam56r_k_v4.log`                                                                                                                                  | —                                   | —                           | —                        | —              | **FAIL (structural)**          | Megatron argument validation raised `ValueError: num_attention_heads (28) must be a multiple of tensor_model_parallel_size (8)`. 28 % 8 ≠ 0. **TP=8 is structurally impossible for NAM56R.** The task brief assumed `nheads=112` / `ngroups=8` (Mamba-3 module counts) but the Megatron constraint is on `--num-attention-heads`, which NAM56R sets to 28 (MLA/DSA attention head count, not Mamba head count). Divisors of 28 permitted by Megatron: {1, 2, 4, 7, 14, 28}. TP=8 requires `num_attention_heads % 8 == 0`, blocking it. TP=7 (28/7=4 heads/rank) would work numerically but doesn't evenly divide an 8-GPU world. No workaround preserves the feature contract. |
 
 ### Comparison vs baselines
 
-| Config | tok/sec | vs 112k baseline |
-|---|---:|---:|
-| **TP=1 PP=2 VPP=2 MTP=1 no-DSA (Stream A run 02 anchor)** | **112,152** | **1.00×** |
-| TP=1 PP=2 VPP=2 MTP=1 no-DSA no-CG (baseline CG-off) | 86,845 | 0.77× |
-| TP=1 PP=2 VPP=2 MTP=0 no-DSA no-CG | 98,412 | 0.88× |
-| TP=1 PP=2 VPP=2 MTP=1 attn-CG no-DSA | 90,399 | 0.81× |
-| Stream B v2 TP=2 PP=1 EP=1 MTP=2 no-DSA (europe, ngroups=8 correct) | 34,697 | 0.31× |
-| **K1** TP=2 EP=2 DP=2 MTP=2 DSA-FP8 | **14,907** | **0.13×** |
-| **K2** TP=2 EP=4 DP=1 MTP=2 DSA-FP8 | **14,881** | **0.13×** |
-| **K3** TP=4 EP=2 DP=1 MTP=2 DSA-FP8 | OOM | — |
-| **K4** TP=8 EP=1 DP=1 MTP=2 DSA-FP8 | structural fail | — |
-| Stream J best (any PP=2/PP=4 + DSA-FP8) | OOM all 4 | — |
+| Config                                                              |         tok/sec | vs 112k baseline |
+| ------------------------------------------------------------------- | --------------: | ---------------: |
+| **TP=1 PP=2 VPP=2 MTP=1 no-DSA (Stream A run 02 anchor)**           |     **112,152** |        **1.00×** |
+| TP=1 PP=2 VPP=2 MTP=1 no-DSA no-CG (baseline CG-off)                |          86,845 |            0.77× |
+| TP=1 PP=2 VPP=2 MTP=0 no-DSA no-CG                                  |          98,412 |            0.88× |
+| TP=1 PP=2 VPP=2 MTP=1 attn-CG no-DSA                                |          90,399 |            0.81× |
+| Stream B v2 TP=2 PP=1 EP=1 MTP=2 no-DSA (europe, ngroups=8 correct) |          34,697 |            0.31× |
+| **K1** TP=2 EP=2 DP=2 MTP=2 DSA-FP8                                 |      **14,907** |        **0.13×** |
+| **K2** TP=2 EP=4 DP=1 MTP=2 DSA-FP8                                 |      **14,881** |        **0.13×** |
+| **K3** TP=4 EP=2 DP=1 MTP=2 DSA-FP8                                 |             OOM |                — |
+| **K4** TP=8 EP=1 DP=1 MTP=2 DSA-FP8                                 | structural fail |                — |
+| Stream J best (any PP=2/PP=4 + DSA-FP8)                             |       OOM all 4 |                — |
 
 ### Verdict
 
@@ -611,11 +611,11 @@ checkpoint, not a throughput lever.
 
 ### Attempted configurations
 
-| Run | PP | VPP | EP | DP | OOM site | Peak alloc (GiB) | Free at OOM |
-|-----|----|----|----|----|----------|------------------|-------------|
-| M-V1a (no gate) | 2 | 2 | 2 | 2 | `dsa_fp8_indexer.py:183` (256 MiB `index_scores`) | 135.61 | 148 MiB |
-| M-V1b (tier-1 eval gate) | 2 | 2 | 2 | 2 | `dsa_fp8_indexer.py:202` (64 MiB `relu*w_h`) | 135.78 | 22 MiB |
-| M-V1c (PP=4 + gate) | 4 | 1 | 2 | 2 | `dsa.py:936` (**7.0 GiB** `torch.bmm(q,k)`) | 135.52 | 766 MiB |
+| Run                      | PP  | VPP | EP  | DP  | OOM site                                          | Peak alloc (GiB) | Free at OOM |
+| ------------------------ | --- | --- | --- | --- | ------------------------------------------------- | ---------------- | ----------- |
+| M-V1a (no gate)          | 2   | 2   | 2   | 2   | `dsa_fp8_indexer.py:183` (256 MiB `index_scores`) | 135.61           | 148 MiB     |
+| M-V1b (tier-1 eval gate) | 2   | 2   | 2   | 2   | `dsa_fp8_indexer.py:202` (64 MiB `relu*w_h`)      | 135.78           | 22 MiB      |
+| M-V1c (PP=4 + gate)      | 4   | 1   | 2   | 2   | `dsa.py:936` (**7.0 GiB** `torch.bmm(q,k)`)       | 135.52           | 766 MiB     |
 
 All runs: TP=1, MBS=4, GBS=64, MTP=2, selective moe_act recompute, FP8 DSA indexer,
 `dsa_indexer_loss_coeff=0.0`, DSA 9+4, full 7/7 MIMO.
@@ -687,14 +687,14 @@ Verdict: TP>1 is net loss for NAM56R Mamba-3 MIMO on single-node H200x8.
 
 ### DSA 9+4 memory bottleneck chain
 
-| Stream | What | Result |
-|--------|------|--------|
-| D v1 | DSA 9+4 BF16, PP=2 | OOM (136 GB, MoE activation stage 1) |
-| E | FP8 indexer port (DeepSeek V3.2 `torch._scaled_mm`) | 9.3-13.4x peak delta reduction, topk overlap 94.4%, saves ~26 GB fwd |
-| G | Backward FP8 | Indexer-only 69.5% savings, full-path 0.7% (bmm dominates) |
-| D v2 | FP8 indexer applied | Stage 0 OK, stage 1 OOM (136 GB, MoE + MTP=2) |
-| J | 4-variant sweep (FP8, +MoE recompute, +MTP redistrib, PP=4) | ALL OOM |
-| L/M | EP=2/EP=4 + loss_coeff==0 gate | ALL OOM (`unfused_dsa_fn` dominates) |
+| Stream | What                                                        | Result                                                               |
+| ------ | ----------------------------------------------------------- | -------------------------------------------------------------------- |
+| D v1   | DSA 9+4 BF16, PP=2                                          | OOM (136 GB, MoE activation stage 1)                                 |
+| E      | FP8 indexer port (DeepSeek V3.2 `torch._scaled_mm`)         | 9.3-13.4x peak delta reduction, topk overlap 94.4%, saves ~26 GB fwd |
+| G      | Backward FP8                                                | Indexer-only 69.5% savings, full-path 0.7% (bmm dominates)           |
+| D v2   | FP8 indexer applied                                         | Stage 0 OK, stage 1 OOM (136 GB, MoE + MTP=2)                        |
+| J      | 4-variant sweep (FP8, +MoE recompute, +MTP redistrib, PP=4) | ALL OOM                                                              |
+| L/M    | EP=2/EP=4 + loss_coeff==0 gate                              | ALL OOM (`unfused_dsa_fn` dominates)                                 |
 
 **Real bottleneck chain:**
 1. `compute_dsa_indexer_loss` at `dsa.py:202`: 7.5 GiB FP32 per DSA layer even at `loss_coeff=0` (gated via monkey-patch, saves ~63 GB).
@@ -703,13 +703,13 @@ Verdict: TP>1 is net loss for NAM56R Mamba-3 MIMO on single-node H200x8.
 
 ### Ready-made sparse attention kernels found
 
-| Source | Type | Status |
-|--------|------|--------|
-| TileLang `sparse_mla_fwd.py` | Fused sparse fwd+bwd | In github, not pip |
-| NVIDIA PR #3674 | SparseMLA + TileLang kernels | Final Review |
-| `fla-org/native-sparse-attention` | Triton fwd+bwd | Available |
-| `lemyx/tilelang-dsa` | One-pass fused FA+KL | Available |
-| NVIDIA PR #4039 | Split-K indexer loss | Ported to cppmega |
+| Source                            | Type                         | Status             |
+| --------------------------------- | ---------------------------- | ------------------ |
+| TileLang `sparse_mla_fwd.py`      | Fused sparse fwd+bwd         | In github, not pip |
+| NVIDIA PR #3674                   | SparseMLA + TileLang kernels | Final Review       |
+| `fla-org/native-sparse-attention` | Triton fwd+bwd               | Available          |
+| `lemyx/tilelang-dsa`              | One-pass fused FA+KL         | Available          |
+| NVIDIA PR #4039                   | Split-K indexer loss         | Ported to cppmega  |
 
 ### ROOT CAUSE: No selective recompute
 
@@ -728,7 +728,7 @@ launchers (commit `f4f192c`).
 
 ### Environment fixes
 
-- bench3 SSH IP: H200_1_IP -> H200_1_IP.
+- bench3 SSH IP: h200_1.
 - europe: git SSH key installed, fresh git clone, github authenticated.
 - europe: zombie cuTe DSL bench killed (PID 490683).
 - europe: kernel `mamba3_mimo_bwd.py` patched for GQA G<H support.
@@ -760,11 +760,11 @@ New scripts: `modal_dsa_indexer_bench.py` (804 LOC), multiple launcher scripts.
 
 ### Results
 
-| Run | EP | DP | MBS | GBS | Recompute | Attn Backend | Result |
-|-----|----|----|-----|-----|-----------|--------------|--------|
-| v6  | 4  | 1  | 1   | 16  | selective moe_act | fused (cuDNN) | **1 iter OK** then OOM iter 2. peak=131.4 GiB. iter_ms=98527. TFLOP/s=2.1. loss=11.73. |
-| v8  | 4  | 1  | 4   | 64  | selective moe_act | fused (cuDNN) | OOM in backward: 224 GiB alloc attempt (DSA unfused_dsa_fn gradient). peak=105.8 GiB stage 1. |
-| v1-v5 | 4 | 1 | 4 | 64 | various | various | All OOM (cuDNN crash or DSA bmm OOM). |
+| Run   | EP  | DP  | MBS | GBS | Recompute         | Attn Backend  | Result                                                                                        |
+| ----- | --- | --- | --- | --- | ----------------- | ------------- | --------------------------------------------------------------------------------------------- |
+| v6    | 4   | 1   | 1   | 16  | selective moe_act | fused (cuDNN) | **1 iter OK** then OOM iter 2. peak=131.4 GiB. iter_ms=98527. TFLOP/s=2.1. loss=11.73.        |
+| v8    | 4   | 1   | 4   | 64  | selective moe_act | fused (cuDNN) | OOM in backward: 224 GiB alloc attempt (DSA unfused_dsa_fn gradient). peak=105.8 GiB stage 1. |
+| v1-v5 | 4   | 1   | 4   | 64  | various           | various       | All OOM (cuDNN crash or DSA bmm OOM).                                                         |
 
 ### Blockers found
 
