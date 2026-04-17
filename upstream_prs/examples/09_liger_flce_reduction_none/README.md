@@ -25,7 +25,7 @@ python reproducer.py
 
 Requires a CUDA device (the Liger Triton kernels are CUDA-only).
 
-## Expected output — bug present (current state, liger-kernel 0.7.0, verified on H200 bench3 2026-04-14)
+## Expected output — current live bug path (liger-kernel 0.7.0, verified on H200 bench3 2026-04-14)
 
 ```
 Liger kernel results:
@@ -48,7 +48,11 @@ to read correctly as `1.0`. Any non-uniform `grad_output` (the Megatron
 loss-mask pattern, document-boundary masking, per-token loss weighting, etc.)
 silently reads only `grad_output[0]` and mis-scales every other row.
 
-## Expected output — PR #1126 merged (assertion guard only)
+This is the current observed behavior. The important live failure is the
+masked / non-uniform backward corruption path, and the documented
+workaround is `reduction="mean"` times `n_valid`.
+
+## Alternate output — if PR #1126-style assertion guard lands
 
 ```
   [ASSERT] reduction='none' raised AssertionError: ...
@@ -58,6 +62,10 @@ VERDICT: reduction='none' blocked by AssertionError (PR #1126-style guard).
 ```
 
 Exit code: **1**.
+
+This assertion branch is not today's live behavior on the validated
+bench3 run above. It is only the expected behavior if the upstream guard
+lands before a real functional fix.
 
 ## Expected output — functional fix merged
 

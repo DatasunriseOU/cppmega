@@ -4,13 +4,16 @@
 
 Multi-stream session across europe H200, bench3 H200, and GB10 sm_121.
 Established production config 289 TFLOP/s on europe (PP=1 EP=4 MBS=8 BF16
-no-CG) and 253 TFLOP/s on bench3 (same topology), closed multiple
-exploration directions, shipped infrastructure for future work.
+no-CG) and an earlier 253 TFLOP/s bench3 waypoint on the old PP=1 EP=4 MBS=8
+FP8 topology, closed multiple exploration directions, shipped infrastructure
+for future work. Canonical current production numbers live in
+`docs/production_status.md`; bench3's active production record is 268 TFLOP/s
+on PP=1 EP=8 MBS=10 v3 with the Liger `reduction="mean"` broadcast workaround.
 
-### Production records (new)
+### Production records at the time (historical; see `docs/production_status.md` for current canon)
 
 - **europe PP=1 EP=4 MBS=8 BF16 no-CG** = **289 TFLOP/s / ~9,250 tok/sec/GPU** — production gold
-- **bench3 PP=1 EP=4 MBS=8 FP8 tensorwise** = **253 TFLOP/s / ~8,100 tok/sec/GPU** — new bench3 record, refutes earlier "bench3 100 TFLOP/s slower" claim (real delta = 13%, HW variance)
+- **bench3 PP=1 EP=4 MBS=8 FP8 tensorwise** = **253 TFLOP/s / ~8,100 tok/sec/GPU** — historical pre-v3 bench3 waypoint; superseded by the current 268 TFLOP/s EP=8 MBS=10 v3 production config in `docs/production_status.md`
 - europe PP=2 VPP=2 EP=4 MBS=4 MTP=2 = 193 TFLOP/s — standard PP=2 baseline (confirms)
 
 ### FP8 direction audit
