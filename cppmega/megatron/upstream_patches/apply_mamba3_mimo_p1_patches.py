@@ -287,6 +287,20 @@ def _do_patch() -> None:
 def apply_all() -> None:
     """Apply P1 patches to the live mamba_ssm installation.
 
+    DISABLED 2026-04-15: this script mutates installed site-packages mamba_ssm
+    `.py` files in place, which is non-reversible (env=0 doesn't undo file
+    rewrites; only `pip install --force-reinstall` from the fork restores).
+    On bench3 + GB10 we found the persistent mutation produces grad_norm=NaN
+    in backward (TileLang TMA layout broken on H200/sm_121, see memory
+    `reference_tma_layout_fix_broken_h200.md`).
+
+    To run anyway (NOT for production), set both env vars:
+      CPPMEGA_MAMBA3_P1=1
+      MAMBA3_P1_ALLOW_FILE_MUTATION=1
+
+    Loud refusal otherwise. After running, mamba_ssm site-packages are
+    PERSISTENTLY MUTATED and you must reinstall to restore.
+
     8-rank race fix:
       1. If torch.distributed is initialized: rank 0 writes, others wait on
          dist.barrier().
