@@ -1,16 +1,23 @@
-"""Patch causal-conv1d / mamba-ssm setup.py in-place for sm_100-only builds.
+"""Patch causal-conv1d / mamba-ssm setup.py in-place for selected-arch builds.
 
 Copied into the Modal image at /tmp/patch_setup.py and invoked during the
-mamba-ssm image layer build. See scripts/modal_cutile_b200.py::_image_with_mamba.
+mamba-ssm image layer build. See scripts/modal_cutile_b200.py and
+scripts/modal_cppmega_base.py.
 
 Rationale: both packages hardcode a full `cc_flag` list covering compute_75
 through compute_121 in their setup.py. On Modal's builder that translates to
 40+ min of compile time PLUS Modal's container log rate limit killing the
-build because ptxas emits ~10k info lines per kernel. We only need sm_100
-(B200) so we strip everything else and also drop `--ptxas-options=-v`.
+build because ptxas emits ~10k info lines per kernel. We keep only the
+arch(es) we need.
+
+Select which archs to keep via the `MODAL_KEEP_ARCHS` env var (comma-
+separated list of compute-capability digits, e.g. "90" for H100, "100" for
+B200, "90,100" for both). Default: "100" (B200) for backwards-compat with
+the original B200 sweep scripts.
 """
 from __future__ import annotations
 
+import os
 import sys
 
 
@@ -22,6 +29,7 @@ def _indent_of(line: str) -> int:
 
 
 def patch(path: str) -> None:
+    keep = [a.strip() for a in os.environ.get("MODAL_KEEP_ARCHS", "100").split(",") if a.strip()]
     with open(path, encoding="utf-8") as f:
         text = f.read()
 
@@ -36,11 +44,13 @@ def patch(path: str) -> None:
         if "cc_flag.append(\"-gencode\")" in ln and i + 1 < len(lines):
             nxt = lines[i + 1]
             if "arch=compute_" in nxt:
-                if "arch=compute_100" in nxt:
+                if any(f"arch=compute_{a}," in nxt for a in keep):
                     out.append(ln)
                     out.append(nxt)
-                    kept_archs.append("100")
-                # else: drop both lines (skip the non-sm_100 arch pair)
+                    for a in keep:
+                        if f"arch=compute_{a}," in nxt:
+                            kept_archs.append(a)
+                # else: drop both lines (skip the non-selected arch pair)
                 i += 2
                 continue
         # Drop --ptxas-options=-v so the build doesn't spam the log.

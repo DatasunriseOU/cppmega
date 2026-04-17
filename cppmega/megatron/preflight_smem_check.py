@@ -305,26 +305,26 @@ def check(
     for p in _TRACKED_KERNEL_FILES:
         sites.extend(_scan_file(p))
 
-    if not sites:
-        # No kernel files found — package layout changed.  Don't pretend
-        # everything is fine; loudly notify.
-        msg = (
-            "[preflight_smem_check] No TileLang kernel files found on disk; "
-            "the tracked-files list in preflight_smem_check.py is stale. "
-            "Update _TRACKED_KERNEL_FILES."
-        )
-        if raise_on_error:
-            raise SmemPreflightError(msg)
-        print(msg, file=sys.stderr)
-        return sites
-
-    bad = [s for s in sites if not s.has_flag]
-
     if cc is None:
         cc = _detect_cc()
     cap_kib = _kib_cap_for(cc) if cc is not None else DEFAULT_SMEM_CAP_KIB
 
     hard_fail = strict or (cc in _HARD_FAIL_CAPS)
+
+    if not sites:
+        # Package layout drift should not block non-GB10 hosts from reaching the
+        # real runtime frontier. Keep this as a hard fail only on strict/GB10.
+        msg = (
+            "[preflight_smem_check] No TileLang kernel files found on disk; "
+            "the tracked-files list in preflight_smem_check.py is stale. "
+            "Update _TRACKED_KERNEL_FILES."
+        )
+        if hard_fail and raise_on_error:
+            raise SmemPreflightError(msg)
+        print("WARNING: " + msg, file=sys.stderr)
+        return sites
+
+    bad = [s for s in sites if not s.has_flag]
 
     if bad:
         detail = _format_sites(bad)
