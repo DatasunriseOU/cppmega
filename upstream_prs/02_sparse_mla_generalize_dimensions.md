@@ -79,6 +79,5 @@ The `P_shared_cast` / `dP_shared_cast` fp32 precision fix in the backward kernel
 ## Testing
 
 - Verified with d_total=128, v_channels=64 (kv_lora_rank=64, qk_pos_emb_head_dim=64) on 8xH200
-- Fused SparseMLA kernel compiles and runs correctly for non-576/512 dimensions
-- Loss convergence matches unfused baseline (before this PR, unfused was the only path for non-DeepSeek dims)
-- Backward gradients match torch.autograd.gradcheck at float64
+- Fused SparseMLA kernel compiles and launches for non-576/512 dimensions, proving the hardcoded dimension assumptions were removed from the fused path.
+- The scoped reproducer validates dimension plumbing only; it does not yet prove end-to-end convergence parity or fp64 gradcheck correctness for the generalized kernel.
