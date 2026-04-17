@@ -30,13 +30,13 @@ Multi-agent investigation triggered by user pushback on prior claims. Launched 1
 
 **Status of upstream fixes** (independently verified by grounding agents):
 
-| PR | What it does | Fixes our bug? |
-|---|---|---|
-| #1126 (DRAFT) | Adds `assert grad_output.ndim == 0` — fail-fast | ❌ assertion only |
-| #496 (merged 2024-12) | Added forward "none" support, backward broken | ❌ origin of bug |
-| #1182 (OPEN) | Routes kwarg through `loss_utils.py` | ❌ kernel untouched |
-| #680 (merged 2025-04) | Fixed reduction="none" for non-fused `LigerCrossEntropy` | ❌ different module |
-| OFSkean fork | `has_post_kernel_scaling` for weighted tokens | ❌ forward-only, backward identical |
+| PR                    | What it does                                             | Fixes our bug?                     |
+| --------------------- | -------------------------------------------------------- | ---------------------------------- |
+| #1126 (DRAFT)         | Adds `assert grad_output.ndim == 0` — fail-fast          | ❌ assertion only                   |
+| #496 (merged 2024-12) | Added forward "none" support, backward broken            | ❌ origin of bug                    |
+| #1182 (OPEN)          | Routes kwarg through `loss_utils.py`                     | ❌ kernel untouched                 |
+| #680 (merged 2025-04) | Fixed reduction="none" for non-fused `LigerCrossEntropy` | ❌ different module                 |
+| OFSkean fork          | `has_post_kernel_scaling` for weighted tokens            | ❌ forward-only, backward identical |
 
 **Author's own statement** (Nick Knight, NVIDIA, in #968):
 > "adding this functionality would preclude the current chunkwise (pre)computation of grad_weight and grad_bias in the forward pass"
@@ -242,7 +242,7 @@ Per implementation+verification agent (a3a6117b87cd1a33d) and grounding (a14bc6d
 **3 blockers found**:
 1. **Split point not clean** — `dstates_frag` is loop-carried in reverse-scan. Pass-1 needs `dPhiO_shared` (which design said only Pass-2 needs). Realistic regs after split: 200-220, NOT 140 (matches Agent 6).
 2. **GB10 cannot validate** — `mamba_mimo_fwd` fails to compile at every shape. `TMA desc init error 716` (dim=3 descriptor) — same TileLang TMA family. Auto-tuning fails. No baseline available.
-3. **Bench3 SSH was broken initially** — `dave@H200_1_IP` direct returned `Permission denied (publickey)`. Now FIXED via gcloud + key install.
+3. **Bench3 SSH was broken initially** — `dave@h200_1` direct returned `Permission denied (publickey)`. Now FIXED via gcloud + key install.
 
 **Atomics NOT required** (refuted prior claim) — DQ/DK writes go to disjoint per-chunk slices via plain `T.copy`. Source audit: `mamba3_mimo_bwd.py:1090,1131`. Between-chunks split safe with staging buffer.
 
@@ -287,12 +287,12 @@ Per design agent (a6887247c17870849):
 - `PsiV` = V * MIMO_V
 
 **Cost at NAM56R MBS=10** (per Mamba3 layer):
-| Tensor | Shape | bf16 GiB |
-|---|---|---|
-| Q_rot | [B,S,R,G,N] = 10·4096·4·8·128 | 0.31 |
-| K_rot | [B,S,R,G,N] | 0.31 |
-| **PsiV** | [B,S,R,H,P] = 10·4096·4·32·128 | **1.25** |
-| **per-layer total** | | **1.87** |
+| Tensor              | Shape                          | bf16 GiB |
+| ------------------- | ------------------------------ | -------- |
+| Q_rot               | [B,S,R,G,N] = 10·4096·4·8·128  | 0.31     |
+| K_rot               | [B,S,R,G,N]                    | 0.31     |
+| **PsiV**            | [B,S,R,H,P] = 10·4096·4·32·128 | **1.25** |
+| **per-layer total** |                                | **1.87** |
 
 × 9 Mamba3 layers/rank = **16.8 GiB/rank** if cache all → overshoots ~2 GiB budget by 8×.
 
@@ -326,7 +326,7 @@ Per design agent (a6887247c17870849):
 
 ### EN
 
-Direct SSH `dave@H200_1_IP` was returning `Permission denied (publickey)` because `~/.ssh/google_compute_engine.pub` was not in `dave`'s `authorized_keys`. `gcloud compute ssh` worked because IAP authenticates as `google_test_datasunrise_ou_io` (the GCE-managed user), not `dave`.
+Direct SSH `dave@h200_1 was returning `Permission denied (publickey)` because `~/.ssh/google_compute_engine.pub` was not in `dave`'s `authorized_keys`. `gcloud compute ssh` worked because IAP authenticates as `google_test_datasunrise_ou_io` (the GCE-managed user), not `dave`.
 
 **Fix applied**: piped local pubkey through `gcloud compute ssh ... --command='sudo tee -a /home/dave/.ssh/authorized_keys'` for both bench3 (LOCATION_1) and europe (LOCATION_2) machines.
 
@@ -334,7 +334,7 @@ Both `dave@<ip>` direct SSH now works. Use direct SSH for `pip install` (avoids 
 
 ### RU
 
-Direct SSH `dave@H200_1_IP` возвращал Permission denied. Fix: pipe pubkey через `gcloud compute ssh ... sudo tee -a /home/dave/.ssh/authorized_keys` для обеих машин. Сейчас работает.
+Direct SSH `dave@h200_1` возвращал Permission denied. Fix: pipe pubkey через `gcloud compute ssh ... sudo tee -a /home/dave/.ssh/authorized_keys` для обеих машин. Сейчас работает.
 
 ---
 
@@ -342,29 +342,29 @@ Direct SSH `dave@H200_1_IP` возвращал Permission denied. Fix: pipe pubk
 
 ### EN
 
-| Item | Status | Note |
-|---|---|---|
-| europe production: BF16 MBS=8 EP=4 = 289 TFLOP/s | ✅ stands | unaffected by Liger bug (no MTP Liger active by default? — verify) |
-| bench3 production: FP8 MBS=10 EP=8 + Liger CE = 269.4 TFLOP/s | ⚠️ **suspect** | MTP Liger reduction="none" path → silent grad corruption. Number is throughput of training-with-broken-gradients. Re-baseline needed. |
-| Bench3 mamba3 backward | ❌ **broken today** | TileLang TMA bug from P1 patch persistence |
-| Liger reduction=mean fix path A | ✅ patch ready | empirical validation blocked by TMA bug |
-| CCE 25.9.3 upgrade | ✅ installed | retest in flight |
-| Megatron PR #3345 cherry-pick | 🔄 testing | combo with class-swap |
-| Mamba3 P2 PsiV cache | 📐 design ready | 5 days effort |
-| Mamba3 P3 register split | ❌ HALT | use Path 1 (PsiV hoist) instead |
+| Item                                                          | Status             | Note                                                                                                                                  |
+| ------------------------------------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| europe production: BF16 MBS=8 EP=4 = 289 TFLOP/s              | ✅ stands           | unaffected by Liger bug (no MTP Liger active by default? — verify)                                                                    |
+| bench3 production: FP8 MBS=10 EP=8 + Liger CE = 269.4 TFLOP/s | ⚠️ **suspect**      | MTP Liger reduction="none" path → silent grad corruption. Number is throughput of training-with-broken-gradients. Re-baseline needed. |
+| Bench3 mamba3 backward                                        | ❌ **broken today** | TileLang TMA bug from P1 patch persistence                                                                                            |
+| Liger reduction=mean fix path A                               | ✅ patch ready      | empirical validation blocked by TMA bug                                                                                               |
+| CCE 25.9.3 upgrade                                            | ✅ installed        | retest in flight                                                                                                                      |
+| Megatron PR #3345 cherry-pick                                 | 🔄 testing          | combo with class-swap                                                                                                                 |
+| Mamba3 P2 PsiV cache                                          | 📐 design ready     | 5 days effort                                                                                                                         |
+| Mamba3 P3 register split                                      | ❌ HALT             | use Path 1 (PsiV hoist) instead                                                                                                       |
 
 ### RU
 
-| Item | Status | Note |
-|---|---|---|
-| europe BF16 MBS=8 EP=4 = 289 | ✅ stands | не затронут Liger багом (если MTP Liger не дефолтен) |
-| bench3 FP8 MBS=10 EP=8 + Liger = 269.4 | ⚠️ **подозрителен** | MTP Liger reduction="none" → silent corruption. Throughput training-с-сломанными-gradients. Re-baseline нужен. |
-| Bench3 mamba3 backward | ❌ **сломано сегодня** | TileLang TMA bug от P1 patch persistence |
-| Liger reduction=mean fix A | ✅ patch ready | validation blocked by TMA |
-| CCE 25.9.3 upgrade | ✅ installed | retest идет |
-| Megatron PR #3345 | 🔄 testing | combo с class-swap |
-| Mamba3 P2 PsiV cache | 📐 design ready | 5 дней |
-| Mamba3 P3 register split | ❌ HALT | use Path 1 (PsiV hoist) |
+| Item                                   | Status                | Note                                                                                                           |
+| -------------------------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------- |
+| europe BF16 MBS=8 EP=4 = 289           | ✅ stands              | не затронут Liger багом (если MTP Liger не дефолтен)                                                           |
+| bench3 FP8 MBS=10 EP=8 + Liger = 269.4 | ⚠️ **подозрителен**    | MTP Liger reduction="none" → silent corruption. Throughput training-с-сломанными-gradients. Re-baseline нужен. |
+| Bench3 mamba3 backward                 | ❌ **сломано сегодня** | TileLang TMA bug от P1 patch persistence                                                                       |
+| Liger reduction=mean fix A             | ✅ patch ready         | validation blocked by TMA                                                                                      |
+| CCE 25.9.3 upgrade                     | ✅ installed           | retest идет                                                                                                    |
+| Megatron PR #3345                      | 🔄 testing             | combo с class-swap                                                                                             |
+| Mamba3 P2 PsiV cache                   | 📐 design ready        | 5 дней                                                                                                         |
+| Mamba3 P3 register split               | ❌ HALT                | use Path 1 (PsiV hoist)                                                                                        |
 
 ---
 
