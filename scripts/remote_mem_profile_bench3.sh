@@ -3,7 +3,7 @@
 # EP=1 TP=1 PP=2 VPP=2, NO CUDA graphs, TRAIN_ITERS=5
 # Prints per-step memory stats + full memory_summary + param counts at exit.
 #
-# Designed to run on bench3 (H200_1_IP) inside tmux.
+# Designed to run on bench3 (h200_1) inside tmux.
 set -euo pipefail
 
 [ -f "${HOME}/.bashrc" ] && source "${HOME}/.bashrc"

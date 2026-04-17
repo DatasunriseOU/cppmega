@@ -73,12 +73,12 @@ User set aspirational "250k tok/sec + MFU > 50%" goal via test-loop:
 
 Tested 3 FP8-related configs on europe vs BF16 MBS=8 baseline 289 TFLOP/s:
 
-| Config | TFLOP/s | Δ |
-|---|---|---|
-| BF16 MBS=8 EP=4 baseline | 289 | — |
-| EP=8 v3 (take-3) | 262 | -9.3% |
-| FP8 tensorwise MBS=10 | 190 | -34% |
-| BF16 + CPPMEGA_SELECTIVE_FP8_MOE=1 | 247 | -14% |
+| Config                             | TFLOP/s | Δ     |
+| ---------------------------------- | ------- | ----- |
+| BF16 MBS=8 EP=4 baseline           | 289     | —     |
+| EP=8 v3 (take-3)                   | 262     | -9.3% |
+| FP8 tensorwise MBS=10              | 190     | -34%  |
+| BF16 + CPPMEGA_SELECTIVE_FP8_MOE=1 | 247     | -14%  |
 
 **Pattern**: every non-baseline config on europe regresses. Europe's
 NVLink/NVSwitch fabric baseline is already fast enough that the amax
@@ -99,10 +99,10 @@ Memory: `reference_fp8_moe_gate_net_neutral.md`.
 Ran FP8 tensorwise MBS=10 GBS=80 tests on both machines simultaneously to
 resolve the 2026-04-13 golden config 273 TFLOP/s claim:
 
-| Machine | Config | Iters | TFLOP/s | Peak alloc | Val PPL |
-|---|---|---|---|---|---|
-| **bench3** | v3 EP=8 MBS=10 FP8 | 30/30 | **268.0** (σ<0.5) | 115.3 GiB | 207 |
-| europe | v1 EP=4 DP=2 MBS=10 FP8 | 30/30 | 190.5 (σ=13) | — | — |
+| Machine    | Config                  | Iters | TFLOP/s           | Peak alloc | Val PPL |
+| ---------- | ----------------------- | ----- | ----------------- | ---------- | ------- |
+| **bench3** | v3 EP=8 MBS=10 FP8      | 30/30 | **268.0** (σ<0.5) | 115.3 GiB  | 207     |
+| europe     | v1 EP=4 DP=2 MBS=10 FP8 | 30/30 | 190.5 (σ=13)      | —          | —       |
 
 **Bench3 new record = 268 TFLOP/s** (+4.3% vs BF16 EP=8 v3 baseline of 257).
 Ship as bench3 production config. Matches 2026-04-13 "golden config" claim
@@ -190,7 +190,7 @@ indexer bench: FP8 11.4% slower than BF16.
 
 ### Environment fixes
 
-- bench3 SSH IP updated (H200_1_IP -> H200_1_IP)
+- bench3 SSH IP updated 
 - europe: git SSH key + fresh clone + github auth
 - europe: zombie cuTe DSL bench killed, kernel patched for GQA G<H
 
