@@ -179,10 +179,10 @@ Guard активен ТОЛЬКО при `cuda_graph_impl == "transformer_engine
 
 **`--cuda-graph-impl` варианты**: `megatron/core/transformer/cuda_graphs.py`
 
-| impl | Механизм | Recompute | Memory |
-|------|----------|-----------|--------|
-| `local` | `make_graphed_callables` — весь forward как 1 граф | ❌ crash | +62 GiB private pools |
-| `transformer_engine` | TE `CudaGraphManager` — per-layer capture | ✅ CG-aware | Минимальный overhead |
+| impl                 | Механизм                                           | Recompute  | Memory                |
+| -------------------- | -------------------------------------------------- | ---------- | --------------------- |
+| `local`              | `make_graphed_callables` — весь forward как 1 граф | ❌ crash    | +62 GiB private pools |
+| `transformer_engine` | TE `CudaGraphManager` — per-layer capture          | ✅ CG-aware | Минимальный overhead  |
 
 **Вывод**: единственная рабочая комбинация = `--fp8-format hybrid` + `--cuda-graph-impl transformer_engine` + `--recompute-modules`.
 
@@ -231,12 +231,12 @@ def _restore_bias_fp32(module, _inputs):
 
 ### FP8+CG Throughput Sweep (europe, PP=1 EP=1)
 
-| Config | TFLOP/s | ms/iter | Memory | CG |
-|--------|---------|---------|--------|-----|
-| BF16 MBS=6 no CG | 158 | 3900 | 112 GiB | ❌ |
-| BF16 MBS=4 no CG | 154 | 2679 | 81 GiB | ❌ |
-| FP8 MBS=4 no CG | 154 | 2679 | 85 GiB | ❌ |
-| FP8 MBS=4 + CG(TE) | 155.5 | 2649 | 89 GiB | ✅ |
+| Config                         | TFLOP/s     | ms/iter       | Memory      | CG    |
+| ------------------------------ | ----------- | ------------- | ----------- | ----- |
+| BF16 MBS=6 no CG               | 158         | 3900          | 112 GiB     | ❌     |
+| BF16 MBS=4 no CG               | 154         | 2679          | 81 GiB      | ❌     |
+| FP8 MBS=4 no CG                | 154         | 2679          | 85 GiB      | ❌     |
+| FP8 MBS=4 + CG(TE)             | 155.5       | 2649          | 89 GiB      | ✅     |
 | **FP8 MBS=6 + CG(TE) + idx=0** | **258→218** | **2396→2840** | **106 GiB** | **✅** |
 
 **KEY FINDING**: iter 3 = 258 TFLOP/s (pre-CG-bwd), iters 5+ = 218 (post-CG-bwd).
@@ -248,13 +248,13 @@ Fixed via `CPPMEGA_DSA_INDEXER_LOSS_COEFF=0` env override.
 
 ## DEFINITIVE COMPARISON (all PP=1 EP=1 DP=8 MBS=6 GBS=48, no indexer)
 
-| Config | TFLOP/s | ms/iter | tok/sec | Why |
-|--------|---------|---------|---------|-----|
-| **BF16 + moe_act recomp** | **254** | **2429** | **81k** | **BEST** |
-| FP8 + CG(TE) iter3 | 258 | 2396 | 82k | pre-CG-bwd |
-| FP8 + CG(TE) steady | 218 | 2840 | 69k | CG bwd overhead |
-| FP8 no-CG | 218 | 2840 | 69k | no moe_act recomp |
-| FP8 + moe_act | CRASH | — | — | Megatron assertion |
+| Config                    | TFLOP/s | ms/iter  | tok/sec | Why                |
+| ------------------------- | ------- | -------- | ------- | ------------------ |
+| **BF16 + moe_act recomp** | **254** | **2429** | **81k** | **BEST**           |
+| FP8 + CG(TE) iter3        | 258     | 2396     | 82k     | pre-CG-bwd         |
+| FP8 + CG(TE) steady       | 218     | 2840     | 69k     | CG bwd overhead    |
+| FP8 no-CG                 | 218     | 2840     | 69k     | no moe_act recomp  |
+| FP8 + moe_act             | CRASH   | —        | —       | Megatron assertion |
 
 ## NEW BEST CONFIG: BF16 MBS=8 + Liger CE + moe_act recompute + no indexer
 
@@ -270,11 +270,11 @@ Liger CE saves 21 GiB MTP logits → MBS=8 fits in 110 GiB (vs 136 GiB without L
 
 ### MBS Sweep (BF16 + Liger CE + moe_act recompute + no indexer, PP=1 EP=1)
 
-| MBS | GBS | TFLOP/s | ms/iter | tok/sec | Memory | Headroom |
-|-----|-----|---------|---------|---------|--------|----------|
-| 6 | 48 | 254 | 2429 | 81k | ~85 GiB | 58 GiB |
+| MBS   | GBS    | TFLOP/s | ms/iter  | tok/sec | Memory      | Headroom   |
+| ----- | ------ | ------- | -------- | ------- | ----------- | ---------- |
+| 6     | 48     | 254     | 2429     | 81k     | ~85 GiB     | 58 GiB     |
 | **8** | **64** | **265** | **3111** | **84k** | **110 GiB** | **33 GiB** |
-| 10 | 80 | 268 | 3850 | 85k | 128 GiB | 15 GiB |
+| 10    | 80     | 268     | 3850     | 85k     | 128 GiB     | 15 GiB     |
 
 **Recommended: MBS=8** (best throughput-to-headroom ratio).
 
@@ -302,10 +302,10 @@ FP8_FLAGS="--fp8-format hybrid --fp8-recipe tensorwise --fp8-amax-history-len 10
 # + all other golden flags (moe_act recompute, Liger CE, indexer=0)
 ```
 
-| Config | TFLOP/s | Memory | vs BF16 |
-|--------|---------|--------|---------|
-| BF16 MBS=8 Liger | 265 | 110 GiB | baseline |
-| FP8 tensorwise MBS=8 Liger | 269 | 104 GiB | +1.5% speed, -6 GiB mem |
+| Config                          | TFLOP/s | Memory      | vs BF16                        |
+| ------------------------------- | ------- | ----------- | ------------------------------ |
+| BF16 MBS=8 Liger                | 265     | 110 GiB     | baseline                       |
+| FP8 tensorwise MBS=8 Liger      | 269     | 104 GiB     | +1.5% speed, -6 GiB mem        |
 | **FP8 tensorwise MBS=10 Liger** | **273** | **119 GiB** | **+3% speed, 24 GiB headroom** |
 
 **CEILING (no indexer): 273 TFLOP/s / 87k tok/sec (FP8 tensorwise MBS=10)**
@@ -327,12 +327,12 @@ EXTRA_FLAGS="--recompute-granularity selective --recompute-modules moe_act mlp m
 
 ### Production Config (with indexer training)
 
-| Indexer mode | TFLOP/s | tok/sec | Overhead | Bottleneck |
-|-------------|---------|---------|----------|------------|
-| **off** (ceiling) | **273** | **87k** | 0% | — |
-| head-streaming + sparse KL | **214** | **69k** | 28% | Q@K per-head loop in `_attention_target_fp32` |
-| head-streaming + dense KL | 212 | 69k | 28% | Same Q@K bottleneck |
-| split-K Triton | 187 | 61k | 46% | Different code path, slower |
+| Indexer mode               | TFLOP/s | tok/sec | Overhead | Bottleneck                                    |
+| -------------------------- | ------- | ------- | -------- | --------------------------------------------- |
+| **off** (ceiling)          | **273** | **87k** | 0%       | —                                             |
+| head-streaming + sparse KL | **214** | **69k** | 28%      | Q@K per-head loop in `_attention_target_fp32` |
+| head-streaming + dense KL  | 212     | 69k     | 28%      | Same Q@K bottleneck                           |
+| split-K Triton             | 187     | 61k     | 46%      | Different code path, slower                   |
 
 **Key insight**: sparse KL doesn't help (214 vs 212) because bottleneck is Q@K attention target matmul, NOT the KL computation itself.
 
@@ -426,8 +426,8 @@ _compiled_forward = torch.compile(
 ## 8. Infrastructure / Инфраструктура
 
 ### Static IPs (assigned this session)
-- **bench3**: `H200_1_IP` (LOCATION_1) — static ✅
-- **europe**: `H200_2_IP` (LOCATION_2) — static ✅
+- **bench3**: `h200_1` (LOCATION_1) — static ✅
+- **europe**: `h200_2` (LOCATION_2) — static ✅
 
 ### Patches applied on both hosts
 - FlashAdamW PR #4229
@@ -476,15 +476,15 @@ _compiled_forward = torch.compile(
 
 ### nsys Profile Breakdown (golden config, 262 TFLOP/s steady state)
 
-| Category | % GPU | Improvement Path |
-|----------|-------|-----------------|
-| **Mamba/SSM** | **34.5%** | Smem reduction (228→48KB), state checkpointing, register pressure |
-| **GEMMs (cuBLAS)** | 29.9% | Already WGMMA-optimized. FP8 didn't help. |
-| **Elementwise** | 10.7% | 1.3M launches. torch.compile failed (Triton tuple). Need manual fusion |
-| **DSA Indexer** | 4.2% | Still runs fwd for routing. Head-streaming or disable entirely |
-| **NCCL** | 4.7% | AllReduce. Normal for DP=8 |
-| **Permute** | 4.5% | MoE dispatch. DeepEP flex for EP≥2 |
-| **Other** | 11.5% | LayerNorm, cat, reduction, Triton, sort |
+| Category           | % GPU     | Improvement Path                                                       |
+| ------------------ | --------- | ---------------------------------------------------------------------- |
+| **Mamba/SSM**      | **34.5%** | Smem reduction (228→48KB), state checkpointing, register pressure      |
+| **GEMMs (cuBLAS)** | 29.9%     | Already WGMMA-optimized. FP8 didn't help.                              |
+| **Elementwise**    | 10.7%     | 1.3M launches. torch.compile failed (Triton tuple). Need manual fusion |
+| **DSA Indexer**    | 4.2%      | Still runs fwd for routing. Head-streaming or disable entirely         |
+| **NCCL**           | 4.7%      | AllReduce. Normal for DP=8                                             |
+| **Permute**        | 4.5%      | MoE dispatch. DeepEP flex for EP≥2                                     |
+| **Other**          | 11.5%     | LayerNorm, cat, reduction, Triton, sort                                |
 
 **Top 5 kernel targets:**
 1. `_m2rnn_bwd_kernel` — 11.2% (33ms) → chunked parallel scan, state cache
@@ -505,22 +505,22 @@ _compiled_forward = torch.compile(
 
 ## Session Timeline (Test loop 37 iterations)
 
-| Iter | TFLOP/s | Config | Finding |
-|------|---------|--------|---------|
-| 1-4 | CRASH | FP8+CG(TE) | 9 CG bugs found + fixed |
-| 5-7 | CRASH | FP8+CG dtype | Float16Module._apply → Mamba3._apply guard |
-| 8-9 | 155.5 | FP8+CG MBS=4 | First CG run (1% boost — CG barely helps) |
-| 10 | 258→218 | FP8+CG MBS=6 | CG backward capture = -15% |
-| 11-12 | 218 | FP8 no-CG | Same as FP8+CG → FP8 overhead = net zero |
-| 13 | — | — | **ROOT CAUSE: indexer loss = 37% overhead** |
-| 14-15 | 258→218 | FP8 no-idx | FP8 still 14% slower (no moe_act recompute) |
-| 16 | 254 | BF16 no-idx | **BF16 + moe_act = best BF16 config** |
-| 17 | CRASH | FP8+moe_act | `ValueError: delayed scaling incompatible` |
-| 18-19 | **265** | **BF16 MBS=8 Liger** | **GOLDEN CONFIG FOUND** |
-| 20 | 268 | BF16 MBS=10 | Tight memory (128 GiB) |
-| 21-24 | CRASH | torch.compile | InductorError on Triton tuples |
-| 25-30 | 262-265 | nsys profile | SSM=34.5%, GEMMs=29.9%, Elem=10.7% |
-| 31-37 | — | bench3 JIT | bench3 TileLang 10× slower than europe |
+| Iter  | TFLOP/s | Config               | Finding                                     |
+| ----- | ------- | -------------------- | ------------------------------------------- |
+| 1-4   | CRASH   | FP8+CG(TE)           | 9 CG bugs found + fixed                     |
+| 5-7   | CRASH   | FP8+CG dtype         | Float16Module._apply → Mamba3._apply guard  |
+| 8-9   | 155.5   | FP8+CG MBS=4         | First CG run (1% boost — CG barely helps)   |
+| 10    | 258→218 | FP8+CG MBS=6         | CG backward capture = -15%                  |
+| 11-12 | 218     | FP8 no-CG            | Same as FP8+CG → FP8 overhead = net zero    |
+| 13    | —       | —                    | **ROOT CAUSE: indexer loss = 37% overhead** |
+| 14-15 | 258→218 | FP8 no-idx           | FP8 still 14% slower (no moe_act recompute) |
+| 16    | 254     | BF16 no-idx          | **BF16 + moe_act = best BF16 config**       |
+| 17    | CRASH   | FP8+moe_act          | `ValueError: delayed scaling incompatible`  |
+| 18-19 | **265** | **BF16 MBS=8 Liger** | **GOLDEN CONFIG FOUND**                     |
+| 20    | 268     | BF16 MBS=10          | Tight memory (128 GiB)                      |
+| 21-24 | CRASH   | torch.compile        | InductorError on Triton tuples              |
+| 25-30 | 262-265 | nsys profile         | SSM=34.5%, GEMMs=29.9%, Elem=10.7%          |
+| 31-37 | —       | bench3 JIT           | bench3 TileLang 10× slower than europe      |
 
 ## Bench3 Issue
 bench3 TileLang JIT compile is 10× slower than europe (same TileLang 0.1.8).
