@@ -922,7 +922,7 @@ Stream B v2 production run ограничен одним параметром (`
 
 ### Исправления окружения
 
-- bench3 SSH IP обновлён (H200_1_IP -> H200_1_IP).
+- bench3 SSH IP обновлён (h200_1).
 - europe: установлен git SSH-ключ, свежий git clone (раньше был rsync), github аутентифицирован.
 - europe: убит зомби-процесс cuTe DSL bench (PID 490683).
 - europe: kernel `mamba3_mimo_bwd.py` пропатчен для GQA G<H поддержки (upstream без патча).
@@ -1081,47 +1081,47 @@ Absorbed путь (DeepSeek, PR #3674):
 
 ### Новые cppmega файлы
 
-| Файл | Назначение |
-|------|-----------|
+| Файл                       | Назначение                                          |
+| -------------------------- | --------------------------------------------------- |
 | `mamba_recompute_patch.py` | Activation checkpointing для Mamba/M2RNN (CG-aware) |
-| `dsa_sparse_absorbed.py` | Sparse gather-scatter для absorbed MLA DSA |
-| `upstream_patches/` | Все патчи к upstream Megatron + README |
+| `dsa_sparse_absorbed.py`   | Sparse gather-scatter для absorbed MLA DSA          |
+| `upstream_patches/`        | Все патчи к upstream Megatron + README              |
 
 ### Результаты
 
-| Конфигурация | Скорость | Память | Статус |
-|-------------|----------|--------|--------|
-| Baseline (topk=256) | OOM | 135.75 GiB | ❌ |
-| PyTorch sparse + full CG | 5.8s / 141 TFLOP/s | 103 GiB | ✅ 20/20 stable |
-| TileLang fused fwd+bwd | 4.2s / 194 TFLOP/s | 55 GiB | ⚠️ bwd NaN (tail_dim=96) |
-| TileLang + qk_pos=64 | TBD (tail_dim=128) | TBD | 🔄 testing |
+| Конфигурация             | Скорость           | Память     | Статус                  |
+| ------------------------ | ------------------ | ---------- | ----------------------- |
+| Baseline (topk=256)      | OOM                | 135.75 GiB | ❌                       |
+| PyTorch sparse + full CG | 5.8s / 141 TFLOP/s | 103 GiB    | ✅ 20/20 stable          |
+| TileLang fused fwd+bwd   | 4.2s / 194 TFLOP/s | 55 GiB     | ⚠️ bwd NaN (tail_dim=96) |
+| TileLang + qk_pos=64     | TBD (tail_dim=128) | TBD        | 🔄 testing               |
 
 ### LR Sweep Plan (TileLang absorbed MLA)
 
 lr=1e-4 diverges с TileLang (grad_norm=inf at iter 4), lr=1e-5 стабильно (20/20).
 Оптимальный lr между ними. План sweep:
 
-| lr | Ожидание | Машина | Итерации |
-|----|----------|--------|----------|
+| lr   | Ожидание          | Машина     | Итерации |
+| ---- | ----------------- | ---------- | -------- |
 | 1e-5 | ✅ verified stable | europe v28 | 20/20 OK |
-| 2e-5 | likely stable | bench3 | 50 iters |
-| 3e-5 | likely stable | europe | 50 iters |
-| 5e-5 | borderline | bench3 | 50 iters |
-| 7e-5 | borderline | europe | 50 iters |
-| 1e-4 | ❌ known unstable | — | skip |
+| 2e-5 | likely stable     | bench3     | 50 iters |
+| 3e-5 | likely stable     | europe     | 50 iters |
+| 5e-5 | borderline        | bench3     | 50 iters |
+| 7e-5 | borderline        | europe     | 50 iters |
+| 1e-4 | ❌ known unstable  | —          | skip     |
 
 Также проверить: lr warmup (1e-6 → 1e-4 за 100 steps) может стабилизировать 1e-4.
 
 ### Topology Sweep Plan (обе машины параллельно)
 
-| # | Config | Машина | Ожидание |
-|---|--------|--------|----------|
-| 1 | PP=1 EP=1 DP=8 | bench3 | Baseline 75k tok/sec (v28 verified) |
-| 2 | PP=2 VPP=2 EP=2 DP=2 | europe | ~60k (PP overhead) |
-| 3 | PP=2 VPP=2 EP=4 DP=1 | europe | ~55k (more EP overhead) |
-| 4 | PP=1 EP=2 DP=4 | bench3 | ~70k (no PP overhead) |
-| 5 | PP=1 EP=4 DP=2 | bench3 | ~65k |
-| 6 | PP=2 VPP=1 EP=2 DP=2 | europe | ~55k (VPP=1 worse) |
+| #   | Config               | Машина | Ожидание                            |
+| --- | -------------------- | ------ | ----------------------------------- |
+| 1   | PP=1 EP=1 DP=8       | bench3 | Baseline 75k tok/sec (v28 verified) |
+| 2   | PP=2 VPP=2 EP=2 DP=2 | europe | ~60k (PP overhead)                  |
+| 3   | PP=2 VPP=2 EP=4 DP=1 | europe | ~55k (more EP overhead)             |
+| 4   | PP=1 EP=2 DP=4       | bench3 | ~70k (no PP overhead)               |
+| 5   | PP=1 EP=4 DP=2       | bench3 | ~65k                                |
+| 6   | PP=2 VPP=1 EP=2 DP=2 | europe | ~55k (VPP=1 worse)                  |
 
 Цель: найти конфигурацию с максимальным throughput × scalability.
 
@@ -1129,20 +1129,20 @@ lr=1e-4 diverges с TileLang (grad_norm=inf at iter 4), lr=1e-5 стабильн
 
 #### LR Sweep (PP=1, full CG, TileLang fused)
 
-| lr | Iter 4 grad_norm | Iter 10 grad_norm | Iter 20 | Статус |
-|----|-----------------|-------------------|---------|--------|
-| 1e-5 | 95.5 | 9.7 | 16.5 | ✅ 20/20 stable |
-| 3e-5 | 60.8 | 122.2 | 7.7M → NaN | ❌ diverges iter 15 |
-| 1e-4 | 3.9T → inf | nan | nan | ❌ diverges iter 4 |
+| lr   | Iter 4 grad_norm | Iter 10 grad_norm | Iter 20    | Статус             |
+| ---- | ---------------- | ----------------- | ---------- | ------------------ |
+| 1e-5 | 95.5             | 9.7               | 16.5       | ✅ 20/20 stable     |
+| 3e-5 | 60.8             | 122.2             | 7.7M → NaN | ❌ diverges iter 15 |
+| 1e-4 | 3.9T → inf       | nan               | nan        | ❌ diverges iter 4  |
 
 Оптимальный lr: **1e-5..2e-5**. Нужно проверить 2e-5.
 lr=1e-4 требует warmup (1e-6 → 1e-4 за 100+ steps).
 
 #### Topology Sweep (lr=1e-5, full CG, TileLang fused)
 
-| Config | Machine | TFLOP/s | tok/sec | Статус |
-|--------|---------|---------|---------|--------|
-| PP=1 EP=1 DP=8 | europe | 237 | 75k | ✅ 20/20 |
-| PP=2 VPP=2 EP=2 DP=2 | europe | 185 | 59k | ✅ 20/20 |
-| PP=2 VPP=2 EP=1 DP=4 | bench3 | TBD | TBD | 🔄 running |
-| PP=1 VPP=1 EP=2 DP=4 | europe | TBD | TBD | 🔄 running |
+| Config               | Machine | TFLOP/s | tok/sec | Статус    |
+| -------------------- | ------- | ------- | ------- | --------- |
+| PP=1 EP=1 DP=8       | europe  | 237     | 75k     | ✅ 20/20   |
+| PP=2 VPP=2 EP=2 DP=2 | europe  | 185     | 59k     | ✅ 20/20   |
+| PP=2 VPP=2 EP=1 DP=4 | bench3  | TBD     | TBD     | 🔄 running |
+| PP=1 VPP=1 EP=2 DP=4 | europe  | TBD     | TBD     | 🔄 running |
