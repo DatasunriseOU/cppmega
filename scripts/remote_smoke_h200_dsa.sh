@@ -145,6 +145,7 @@ python -m torch.distributed.run --nproc_per_node=8 pretrain_gpt.py \
   --bf16 \
   --use-mcore-models \
   --transformer-impl transformer_engine \
+  --use-flash-attn \
   ${NATIVE_ARGS} \
   --save "${REMOTE_CKPT_DIR}" \
   --load "${REMOTE_CKPT_DIR}" \

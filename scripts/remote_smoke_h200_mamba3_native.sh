@@ -52,7 +52,7 @@ COMMON_ARGS=(
     --no-gradient-accumulation-fusion
     --cross-entropy-loss-fusion
     --first-last-layers-bf16
-    --attention-backend auto
+    --attention-backend flash
     --data-path "1.0 ${REMOTE_ROOT:-/mnt/data}/data/megatron/clang_semantic_4k_v10_train"
     --eval-iters 0
     --cuda-graph-impl transformer_engine

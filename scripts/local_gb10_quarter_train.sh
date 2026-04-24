@@ -246,21 +246,70 @@ if os.environ.get("CPPMEGA_MEM_PROFILE", "0") == "1":
                 flush=True,
             )
 
+        dtype_bytes = {"fp32": 4, "fp16": 2, "bf16": 2, "fp8": 1}
         model_bf16 = total_bytes
         grad_fp32 = total_numel * 4
         main_param_fp32 = total_numel * 4
         adam_m_fp32 = total_numel * 4
         adam_v_fp32 = total_numel * 4
         static_est = model_bf16 + grad_fp32 + main_param_fp32 + adam_m_fp32 + adam_v_fp32
-        print("[mem_profile] static_training_state_estimate:", flush=True)
+        print("[mem_profile] fp32_adam_reference_estimate:", flush=True)
         print(f"[mem_profile]   model_params_actual  {_gib(model_bf16):8.3f} GiB", flush=True)
         print(f"[mem_profile]   grad_buffer_fp32     {_gib(grad_fp32):8.3f} GiB", flush=True)
         print(f"[mem_profile]   main_params_fp32     {_gib(main_param_fp32):8.3f} GiB", flush=True)
         print(f"[mem_profile]   adam_exp_avg_fp32   {_gib(adam_m_fp32):8.3f} GiB", flush=True)
         print(f"[mem_profile]   adam_exp_sq_fp32    {_gib(adam_v_fp32):8.3f} GiB", flush=True)
-        print(f"[mem_profile]   static_total_est    {_gib(static_est):8.3f} GiB", flush=True)
+        print(f"[mem_profile]   reference_total     {_gib(static_est):8.3f} GiB", flush=True)
 
-        dtype_bytes = {"fp32": 4, "fp16": 2, "bf16": 2, "fp8": 1}
+        if os.environ.get("CPPMEGA_OPTIMIZER", "") == "muon":
+            fallback_numel = 0
+            muon_numel = 0
+            for model in models:
+                for _name, param in model.named_parameters():
+                    is_fallback = (
+                        getattr(param, "is_embedding_or_output_parameter", False)
+                        or getattr(param, "is_emerging_optimizer_fallback_parameter", False)
+                        or len(param.shape) != 2
+                    )
+                    if is_fallback:
+                        fallback_numel += int(param.numel())
+                    else:
+                        muon_numel += int(param.numel())
+
+            grad_b = 2 if os.environ.get("CPPMEGA_GRAD_REDUCE_IN_BF16", "0") == "1" else 4
+            muon_state_b = (
+                2
+                if os.environ.get("CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER", "0") == "1"
+                else 4
+            )
+            fallback_no_master = (
+                os.environ.get("CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER", "0")
+                == "1"
+            )
+            scalar_opt = os.environ.get("CPPMEGA_MUON_SCALAR_OPTIMIZER", "adam")
+            fallback_state_count = 1 if scalar_opt == "lion" else 2
+            fallback_state_b = 2 if fallback_no_master else 4
+            master_b = 0 if fallback_no_master else 4
+            configured_est = (
+                model_bf16
+                + total_numel * grad_b
+                + fallback_numel * master_b
+                + muon_numel * muon_state_b
+                + fallback_numel * fallback_state_count * fallback_state_b
+            )
+            print("[mem_profile] configured_muon_state_estimate:", flush=True)
+            print(
+                f"[mem_profile]   muon_params={muon_numel:,} fallback_params={fallback_numel:,}",
+                flush=True,
+            )
+            print(
+                f"[mem_profile]   grad={grad_b}B muon_momentum={muon_state_b}B "
+                f"fallback_state={fallback_state_count}x{fallback_state_b}B "
+                f"fallback_master={master_b}B",
+                flush=True,
+            )
+            print(f"[mem_profile]   configured_total {_gib(configured_est):8.3f} GiB", flush=True)
+
         if os.environ.get("CPPMEGA_USE_PRECISION_AWARE_OPTIMIZER", "0") == "1":
             main_grads_b = dtype_bytes[os.environ.get("CPPMEGA_MAIN_GRADS_DTYPE", "fp32")]
             main_params_b = dtype_bytes[os.environ.get("CPPMEGA_MAIN_PARAMS_DTYPE", "fp32")]
@@ -451,7 +500,8 @@ python -m torch.distributed.run --nproc_per_node=1 "${WORKDIR}/pretrain_mamba.py
   --fp8-amax-compute-algo max \
   --use-mcore-models \
   --transformer-impl transformer_engine \
-  --attention-backend unfused \
+  --use-flash-attn \
+  --attention-backend flash \
   --spec cppmega.megatron.nam56r_noconv_spec build_cppmega_nam56r_noconv_stack_spec \
   --cross-entropy-loss-fusion \
   --cross-entropy-fusion-impl linear \

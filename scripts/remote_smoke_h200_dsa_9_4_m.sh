@@ -738,7 +738,8 @@ ${NSYS_CMD} python -m torch.distributed.run --nproc_per_node=8 "${WORKDIR}/pretr
   ${FP8_FLAGS} \
   --use-mcore-models \
   --transformer-impl transformer_engine \
-  --attention-backend auto \
+  --use-flash-attn \
+  --attention-backend flash \
   --spec cppmega.megatron.nam56r_full_spec build_cppmega_nam56r_full_stack_spec \
   ${CG_FLAGS} \
   ${MOE_EXTRA_FLAGS} \
