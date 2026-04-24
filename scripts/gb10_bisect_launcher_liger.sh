@@ -122,7 +122,7 @@ python -m torch.distributed.run --nproc_per_node=1 "${REMOTE_WORKDIR}/pretrain_m
   --disable-bias-linear --untie-embeddings-and-output-weights \
   --bf16 --fp8-format hybrid --fp8-recipe tensorwise \
   --fp8-amax-history-len 1024 --fp8-amax-compute-algo max \
-  --use-mcore-models --transformer-impl transformer_engine --attention-backend unfused \
+  --use-mcore-models --transformer-impl transformer_engine --use-flash-attn --attention-backend flash \
   --spec cppmega.megatron.nam56r_noconv_spec build_cppmega_nam56r_noconv_stack_spec \
   --cross-entropy-loss-fusion --cross-entropy-fusion-impl linear \
   ${NATIVE_ARGS} --moe-token-dispatcher-type alltoall \

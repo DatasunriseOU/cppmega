@@ -46,7 +46,7 @@ trap 'rm -f "${LOCAL_TMP_SCRIPT}"' EXIT
 : "${CPPMEGA_MICRO_BATCH_SIZE:=2}"
 : "${CPPMEGA_GLOBAL_BATCH_SIZE:=16}"
 : "${CPPMEGA_SAVE_INTERVAL:=100}"
-: "${CPPMEGA_ATTN_BACKEND:=auto}"
+: "${CPPMEGA_ATTN_BACKEND:=flash}"
 : "${CPPMEGA_CUDA_GRAPH:=none}"
 : "${CPPMEGA_FP8:=0}"
 : "${CPPMEGA_MAMBA3_MIMO:=0}"
@@ -322,6 +322,7 @@ python -m torch.distributed.run --nproc_per_node=8 "${REMOTE_WORKDIR}/pretrain_m
   --bf16 \
   --use-mcore-models \
   --transformer-impl transformer_engine \
+  --use-flash-attn \
   --attention-backend "${CPPMEGA_ATTN_BACKEND}" \
   --spec "${CPPMEGA_SPEC_MODULE}" "${CPPMEGA_SPEC_NAME}" \
   "${CUDA_GRAPH_ARGS[@]}" \
