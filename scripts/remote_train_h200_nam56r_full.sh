@@ -124,6 +124,7 @@ python -m torch.distributed.run --nproc_per_node=8 "${REMOTE_WORKDIR}/pretrain_m
   --bf16 \
   --use-mcore-models \
   --transformer-impl transformer_engine \
+  --use-flash-attn \
   --spec cppmega.megatron.nam56r_full_spec build_cppmega_nam56r_full_stack_spec \
   ${NATIVE_ARGS} \
   --save "${REMOTE_CKPT_DIR}" \

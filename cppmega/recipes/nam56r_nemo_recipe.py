@@ -190,7 +190,7 @@ class NAM56RNeMoRecipe:
     use_full_moe_cuda_graph: bool = False  # full MoE graph needs drop-and-pad
     moe_expert_capacity_factor: float = 0.0  # 0 = dropless; >0 = drop-and-pad
     use_selective_recompute: bool = True  # core_attn recompute saves memory
-    attention_backend: str = "auto"  # auto lets TE pick best (flash/fused/unfused)
+    attention_backend: str = "flash"  # force FlashAttention when available
 
     # --- custom embedding env flags ---
     ngram_hash_enabled: bool = False

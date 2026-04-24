@@ -341,6 +341,7 @@ fi
   --bf16 \
   --use-mcore-models \
   --transformer-impl transformer_engine \
+  --use-flash-attn \
   --attention-backend flash \
   --spec cppmega.megatron.nam56r_noconv_spec build_cppmega_nam56r_noconv_stack_spec \
   ${NATIVE_ARGS} \

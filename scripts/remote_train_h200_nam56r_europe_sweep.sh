@@ -362,7 +362,8 @@ PYEOF
         --bf16 \
         --use-mcore-models \
         --transformer-impl transformer_engine \
-        --attention-backend auto \
+        --use-flash-attn \
+        --attention-backend flash \
         --spec cppmega.megatron.nam56r_full_spec build_cppmega_nam56r_full_stack_spec \
         ${CG_FLAGS} \
         ${RECOMPUTE_FLAGS} \
