@@ -62,6 +62,8 @@ class CppMegaStructureEmbedding(nn.Module):
         num_active = len(self.active_component_names)
         self.stacked_emb = nn.Embedding(total_vocab, bottleneck_dim)
         self.up_proj = nn.Linear(bottleneck_dim, hidden_size, bias=False)
+        self.stacked_emb.weight.is_embedding_or_output_parameter = True
+        self.up_proj.weight.is_embedding_or_output_parameter = True
         self.component_scales = nn.Parameter(torch.full((num_active,), 1.0 / max(num_active, 1)))
         nn.init.zeros_(self.stacked_emb.weight)
         nn.init.zeros_(self.up_proj.weight)
