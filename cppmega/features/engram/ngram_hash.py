@@ -86,6 +86,7 @@ class CppMegaNgramHashEmbedding(nn.Module):
         self.register_buffer("table_offsets", torch.tensor(offsets, dtype=torch.long))
         self.register_buffer("table_sizes_t", torch.tensor(self.table_sizes, dtype=torch.long))
         self.unified_table = nn.Embedding(total_entries, embed_dim)
+        self.unified_table.weight.is_embedding_or_output_parameter = True
 
         max_order = max(self.orders)
         self.max_order = max_order
@@ -109,6 +110,7 @@ class CppMegaNgramHashEmbedding(nn.Module):
         self.register_buffer("order_mask", order_mask)
 
         self.out_proj = nn.Linear(self.num_tables * embed_dim, hidden_size, bias=False)
+        self.out_proj.weight.is_embedding_or_output_parameter = True
         torch.nn.init.zeros_(self.out_proj.weight)
         self.dropout = nn.Dropout(dropout)
 
