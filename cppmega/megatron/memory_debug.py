@@ -100,12 +100,62 @@ def _print_snapshot_top_allocations(top_n: int = 20) -> None:
                 print(f"    {f.get('filename', '?')}:{f.get('line', '?')} in {f.get('name', '?')}")
 
 
+def _call_or_value(value):
+    return value() if callable(value) else value
+
+
+def _storage_nbytes(tensor: torch.Tensor, seen_storages: set[int] | None = None) -> int:
+    if seen_storages is not None:
+        try:
+            storage = tensor.untyped_storage()
+            ptr = storage.data_ptr()
+            if ptr in seen_storages:
+                return 0
+            seen_storages.add(ptr)
+            return int(storage.nbytes())
+        except Exception:
+            pass
+    return int(tensor.numel() * tensor.element_size())
+
+
+def _object_nbytes(obj, seen_storages: set[int] | None = None) -> int:
+    if obj is None:
+        return 0
+    if torch.is_tensor(obj):
+        return _storage_nbytes(obj, seen_storages)
+
+    # Megatron DDP exposes ParamAndGradBuffer objects through model.buffers.
+    # Count their real tensor storage, not the integer metadata fields.
+    total = 0
+    for attr in ("param_data", "grad_data", "shared_buffer"):
+        if hasattr(obj, attr):
+            total += _object_nbytes(getattr(obj, attr), seen_storages)
+    if total:
+        return total
+
+    numel = getattr(obj, "numel", None)
+    element_size = getattr(obj, "element_size", None)
+    if numel is not None and element_size is not None:
+        try:
+            return int(_call_or_value(numel) * _call_or_value(element_size))
+        except Exception:
+            return 0
+    return 0
+
+
 def _print_param_memory(model: torch.nn.Module) -> None:
     """Print memory consumed by model parameters, gradients, and buffers."""
-    param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
-    grad_bytes = sum(p.grad.numel() * p.grad.element_size()
+    param_bytes = sum(_object_nbytes(p) for p in model.parameters())
+    grad_bytes = sum(_object_nbytes(p.grad)
                      for p in model.parameters() if p.grad is not None)
-    buf_bytes = sum(b.numel() * b.element_size() for b in model.buffers())
+    buffers_attr = getattr(model, "buffers", None)
+    if callable(buffers_attr):
+        buffers_iter = buffers_attr()
+    elif buffers_attr is not None:
+        buffers_iter = buffers_attr
+    else:
+        buffers_iter = ()
+    buf_bytes = sum(_object_nbytes(b, set()) for b in buffers_iter)
     total = param_bytes + grad_bytes + buf_bytes
     residual = torch.cuda.memory_allocated() - total
 
@@ -134,8 +184,16 @@ def dump_memory_after_first_step(model: torch.nn.Module, step: int) -> None:
         print("  NANOCHAT_MEMORY_DEBUG: Post-step-0 memory inspection")
         print("=" * 60)
         _print_memory_stats()
-        _print_param_memory(model)
-        _print_snapshot_top_allocations(top_n=20)
+        try:
+            _print_param_memory(model)
+        except Exception as e:
+            print(f"  [memory_debug] Model memory section failed: {e}")
+            traceback.print_exc()
+        try:
+            _print_snapshot_top_allocations(top_n=20)
+        except Exception as e:
+            print(f"  [memory_debug] Snapshot section failed: {e}")
+            traceback.print_exc()
         print("\n" + "=" * 60)
         print("  End memory inspection")
         print("=" * 60 + "\n")
