@@ -97,7 +97,7 @@ Then invoke the allocator with `utils.get_smem_capacity_in_bytes("sm_120")` (har
 | cuDNN | `cudnnGraphNotSupportedError` on NVFP4 mm_fp4 for SM120; BF16 paths work; SDPA via efficient-attention backend is fast | 9.13 / 9.17 tested — no GB10-specific kernels |
 | Triton | `TRITON_PTXAS_PATH` fix; PR #9755 reverted the broken PR #9734. MoE/MXFP4 have gaps | Stable for BF16/FP16/FP32 |
 | FlashInfer | FA2 prefill/decode/MLA all work; multiple PRs in flight for CuTe DSL / fmha_v2 / XQA backends | PR #2598, #3016, #2689 in review |
-| Transformer Engine | No sm_121 PRs found; no documented sm_121-specific path | Unknown |
+| Transformer Engine | No sm_121 PRs found; no documented sm_121-specific path. Works as of 2.14.0 on GB10 via generic sm_120 kernels. **Operational gotcha:** `transformer_engine_torch` ships as sdist-only and is always compiled against the torch currently in the venv — every torch-nightly bump risks an ABI break (`undefined symbol` at import). Recipe: `docs/transformer_engine_abi_rebuild.md` | Unknown |
 | FlashAttention-2 / FA3 | Source-build workarounds documented (patched setup.py, CUTLASS 4.3+, flash_api.cpp arch check). Perf ≈ SDPA on GB10 | Community wheels exist |
 | FlashAttention-4 | **Unrunnable** on GB10 — requires tcgen05/TMEM | Don't try |
 
