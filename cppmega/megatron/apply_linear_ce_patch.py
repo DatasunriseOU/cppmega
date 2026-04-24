@@ -506,6 +506,9 @@ def patch_mamba_output_layer_with_linear_ce() -> None:
     # ``ValueError: Unsupported architecture: 9``.
     _patch_linear_ce_route_to_liger()
 
+    if getattr(MambaModel, "_cppmega_linear_ce_patched", False):
+        return
+
     _orig_init = MambaModel.__init__
 
     def _patched_init(self, *args, **kwargs):
@@ -543,3 +546,4 @@ def patch_mamba_output_layer_with_linear_ce() -> None:
         )
 
     MambaModel.__init__ = _patched_init
+    MambaModel._cppmega_linear_ce_patched = True
