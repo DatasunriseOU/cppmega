@@ -50,7 +50,14 @@ def _print_frames(frames: list[dict], max_frames: int = 5) -> None:
     skip_parts = (
         "memory_snapshot.cpp",
         "RegisterCUDA_",
+        "RegisterCompositeExplicitAutograd_",
+        "RegisterCompositeImplicitAutograd_",
         "RegisterBackendSelect.cpp",
+        "VariableType_",
+        "python_torch_functions_",
+        "python_variable_methods.cpp",
+        "python_function.cpp",
+        "LinearAlgebra.cpp",
         "torch/nn/modules/module.py",
         "torch/_dynamo",
         "torch/_inductor",
@@ -177,7 +184,7 @@ def _print_history_peak(snapshot, top_n: int = 12) -> None:
                 f"size={_fmt_bytes(int(event.get('size', 0) or 0))} "
                 f"action={event.get('action')}"
             )
-            _print_frames(event.get("frames", []), max_frames=4)
+            _print_frames(event.get("frames", []), max_frames=8)
 
 
 def _call_or_value(value):

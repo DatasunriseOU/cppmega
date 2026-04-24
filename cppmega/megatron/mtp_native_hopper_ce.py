@@ -77,6 +77,7 @@ def patch_mtp_native_hopper_ce() -> None:
     # ColumnParallelLinear which raises TypeError on
     # output_cross_entropy_loss=True / labels= kwargs.
     try:
+        from megatron.core import tensor_parallel
         from megatron.core.models.mamba.mamba_model import MambaModel
         from megatron.core.transformer.linear_cross_entropy import (
             LinearCrossEntropyModule,
@@ -115,13 +116,17 @@ def patch_mtp_native_hopper_ce() -> None:
             )
 
         if not isinstance(self.output_layer, LinearCrossEntropyModule):
-            raise RuntimeError(
-                "[cppmega] MTP native Hopper CE expected output_layer to be "
-                "LinearCrossEntropyModule (installed unconditionally by "
-                "apply_linear_ce_patch)"
-                f" but found {type(self.output_layer).__name__}. This most "
-                "likely means apply_linear_ce_patch ran BEFORE MambaModel was "
-                "constructed — check shim ordering in pretrain_mamba.py."
+            if not isinstance(self.output_layer, tensor_parallel.ColumnParallelLinear):
+                raise RuntimeError(
+                    "[cppmega] MTP native Hopper CE expected output_layer to be "
+                    "ColumnParallelLinear-compatible but found "
+                    f"{type(self.output_layer).__name__}."
+                )
+            self.output_layer.__class__ = LinearCrossEntropyModule
+            self.fuse_linear_cross_entropy = True
+            print(
+                "[cppmega] MTP native CE applied MambaModel.output_layer -> "
+                "LinearCrossEntropyModule class swap"
             )
 
         mtp_layers = getattr(cfg, "mtp_num_layers", None)

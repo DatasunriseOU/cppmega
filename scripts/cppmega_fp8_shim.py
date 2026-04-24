@@ -221,19 +221,29 @@ except Exception as _exc:  # pragma: no cover
 
 
 # -----------------------------------------------------------------------------
-# (6) MTP Liger fused linear cross-entropy (always-on)
+# (6) MTP fused linear cross-entropy route
 # -----------------------------------------------------------------------------
-# Replaces the per-depth output_layer(hidden) + CE pair in process_mtp_loss
-# with Liger-Kernel's fused_linear_cross_entropy Triton kernel.  Eliminates
-# the [B*S, V] logits materialization (~4.3 GB at B=4,S=4096,V=65536), saving
-# ~82% activation memory per MTP depth.  Only active when TP=1.
+# Default to Megatron's LinearCrossEntropyModule route.  On GB10 this is routed
+# to Apple CCE by cppmega.megatron.apply_linear_ce_patch; on supported Hopper /
+# Blackwell stacks it can use the native Megatron backend.  Liger remains
+# available as an explicit opt-in for A/B via CPPMEGA_MTP_CE_KERNEL=liger.
 
 try:
-    from cppmega.megatron.mtp_liger_ce import patch_mtp_loss_with_liger
-    patch_mtp_loss_with_liger()
+    _mtp_ce_kernel = os.environ.get("CPPMEGA_MTP_CE_KERNEL", "native").lower()
+    if _mtp_ce_kernel in ("native", "linear", "output_layer", "cce", "auto"):
+        os.environ.setdefault("CPPMEGA_MTP_NATIVE_HOPPER_CE", "1")
+        from cppmega.megatron.mtp_native_hopper_ce import patch_mtp_native_hopper_ce
+        patch_mtp_native_hopper_ce()
+    elif _mtp_ce_kernel == "liger":
+        from cppmega.megatron.mtp_liger_ce import patch_mtp_loss_with_liger
+        patch_mtp_loss_with_liger()
+    elif _mtp_ce_kernel in ("0", "none", "off", "false"):
+        print("[cppmega_fp8_shim] MTP CE patch disabled by CPPMEGA_MTP_CE_KERNEL")
+    else:
+        raise ValueError(f"unsupported CPPMEGA_MTP_CE_KERNEL={_mtp_ce_kernel!r}")
 except Exception as _exc:  # pragma: no cover
     import sys
-    print(f"[cppmega_fp8_shim] MTP Liger CE patch failed: {_exc}", file=sys.stderr)
+    print(f"[cppmega_fp8_shim] MTP CE patch failed: {_exc}", file=sys.stderr)
 
 
 # -----------------------------------------------------------------------------
