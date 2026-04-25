@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+CPPMEGA_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${CPPMEGA_SCRIPT_DIR}/lib/deprecated_guard.sh"
+cppmega_deprecated_script_guard "$(basename "$0")" \
+  "current bench3/europe in-place smoke scripts"
+
 REMOTE_HOST="${REMOTE_HOST:-h200_legacy}"
 REMOTE_ZONE="${REMOTE_ZONE:-LOCATION_3}"
 REMOTE_ROOT="${REMOTE_ROOT:-/mnt/data}"

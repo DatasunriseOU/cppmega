@@ -1,0 +1,29 @@
+configs:
+  mamba_mxfp8_eval_bf16:
+    transformer_engine_config_type: "TEQuantizationParams"
+    training_recipe:
+      fp8_quantization_recipe: "mxfp8"
+      fp8_format: "hybrid"
+    evaluation_recipe: {}
+
+matchers:
+  noconv_mamba_impl_in_proj_mxfp8:
+    config: "mamba_mxfp8_eval_bf16"
+    type: "glob"
+    pattern: "*mixer.impl.in_proj"
+    enabled: true
+  noconv_mamba_impl_out_proj_mxfp8:
+    config: "mamba_mxfp8_eval_bf16"
+    type: "glob"
+    pattern: "*mixer.impl.out_proj"
+    enabled: true
+  direct_mamba_in_proj_mxfp8:
+    config: "mamba_mxfp8_eval_bf16"
+    type: "glob"
+    pattern: "*mixer.in_proj"
+    enabled: true
+  direct_mamba_out_proj_mxfp8:
+    config: "mamba_mxfp8_eval_bf16"
+    type: "glob"
+    pattern: "*mixer.out_proj"
+    enabled: true

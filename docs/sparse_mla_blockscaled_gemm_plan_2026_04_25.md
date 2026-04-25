@@ -70,6 +70,14 @@ TE MXFP8 tensors already carry rowwise/columnwise data and scale buffers in the
 layout expected by TE/cuBLAS GEMM. That makes TE the lowest-risk way to get
 block-scaled GEMM without inventing a second scale layout.
 
+Dense TE block-scaled status is tracked separately in
+`docs/gb10_dense_mxfp8_status_2026_04_25.md`. Important caveat: selected
+prequantized forward `general_gemm` calls are fast on GB10, but whole-model
+TE `--fp8-recipe mxfp8` training is not currently a drop-in replacement on
+this stack. After bypassing TE's sm_12.x recipe guard and padding the
+NAM56R no-conv Mamba packed in-projection to a multiple of 32, backward still
+fails in TE Linear dgrad with cuBLASLt `CUBLAS_STATUS_NOT_SUPPORTED`.
+
 ### Torch `_scaled_mm`
 
 Torch nightly exposes `_scaled_mm` and `_scaled_mm_v2`. This is useful as a

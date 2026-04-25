@@ -37,6 +37,17 @@ export CPPMEGA_DSA_SKIP_INDEXER_LOSS="${CPPMEGA_DSA_SKIP_INDEXER_LOSS:-1}"
 export CPPMEGA_SEQ_LENGTH="${CPPMEGA_SEQ_LENGTH:-4096}"
 export CPPMEGA_MAX_POSITION_EMBEDDINGS="${CPPMEGA_MAX_POSITION_EMBEDDINGS:-4096}"
 export CPPMEGA_FP8_RECIPE="${CPPMEGA_FP8_RECIPE:-tensorwise}"
+if [[ "${CPPMEGA_FP8_RECIPE}" == "mxfp8" || -n "${CPPMEGA_TE_PRECISION_CONFIG_FILE:-}" ]]; then
+  export CPPMEGA_ALLOW_TE_MXFP8_SM12="${CPPMEGA_ALLOW_TE_MXFP8_SM12:-1}"
+  export CPPMEGA_PAD_MAMBA_IN_PROJ_FOR_MXFP8="${CPPMEGA_PAD_MAMBA_IN_PROJ_FOR_MXFP8:-1}"
+  export CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER="${CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER:-1}"
+  export CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK="${CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK:-0}"
+  export CPPMEGA_TE_MXFP8_DGRAD_BF16="${CPPMEGA_TE_MXFP8_DGRAD_BF16:-0}"
+  export CPPMEGA_TE_MXFP8_WGRAD_BF16="${CPPMEGA_TE_MXFP8_WGRAD_BF16:-0}"
+  export NVTE_BACKWARD_OVERRIDE="${NVTE_BACKWARD_OVERRIDE:-none}"
+fi
+export CPPMEGA_SPEC_MODULE="${CPPMEGA_SPEC_MODULE:-cppmega.megatron.nam56r_noconv_spec}"
+export CPPMEGA_SPEC_FUNCTION="${CPPMEGA_SPEC_FUNCTION:-build_cppmega_nam56r_noconv_stack_spec}"
 export CPPMEGA_SPARSE_MLA_FP8_QUANT="te_tensorwise"
 export CPPMEGA_OPTIMIZER="muon"
 export CPPMEGA_MUON_MOMENTUM="${CPPMEGA_MUON_MOMENTUM:-0.95}"
@@ -514,6 +525,9 @@ echo "[local-quarter] data=${CPPMEGA_DATA_PATH}"
 echo "[local-quarter] depth=${CPPMEGA_LAYER_DEPTH} hidden=${CPPMEGA_HIDDEN_SIZE:-3584} ffn=${CPPMEGA_FFN_HIDDEN_SIZE:-18944} heads=${CPPMEGA_NUM_ATTN_HEADS:-28}"
 echo "[local-quarter] torch_extensions=${TORCH_EXTENSIONS_DIR}"
 echo "[local-quarter] fp8_recipe=${CPPMEGA_FP8_RECIPE}"
+echo "[local-quarter] spec=${CPPMEGA_SPEC_MODULE} ${CPPMEGA_SPEC_FUNCTION}"
+echo "[local-quarter] te_precision_config=${CPPMEGA_TE_PRECISION_CONFIG_FILE:-}"
+echo "[local-quarter] mxfp8_bwd_tn_adapter=${CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER:-0} bf16_fallback=${CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK:-0} nvte_backward_override=${NVTE_BACKWARD_OVERRIDE:-}"
 echo "[local-quarter] sparse_mla_fp8_quant=${CPPMEGA_SPARSE_MLA_FP8_QUANT}"
 echo "[local-quarter] optimizer=${CPPMEGA_OPTIMIZER} muon_scalar=${CPPMEGA_MUON_SCALAR_OPTIMIZER}"
 echo "[local-quarter] no_master_emerging=${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER} no_master_fallback=${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER} grad_reduce_bf16=${CPPMEGA_GRAD_REDUCE_IN_BF16}"
@@ -566,6 +580,10 @@ if [[ "${CPPMEGA_USE_PRECISION_AWARE_OPTIMIZER}" == "1" ]]; then
 fi
 if [[ "${CPPMEGA_LOCAL_DDP_DISABLE_CONTIGUOUS_GRAD_BUFFER}" == "1" ]]; then
   OPTIMIZER_ARGS+=(--local-ddp-disable-contiguous-grad-buffer)
+fi
+TE_PRECISION_ARGS=()
+if [[ -n "${CPPMEGA_TE_PRECISION_CONFIG_FILE:-}" ]]; then
+  TE_PRECISION_ARGS+=(--te-precision-config-file "${CPPMEGA_TE_PRECISION_CONFIG_FILE}")
 fi
 
 LAUNCH_PREFIX=()
@@ -622,7 +640,8 @@ fi
   --transformer-impl transformer_engine \
   --use-flash-attn \
   --attention-backend flash \
-  --spec cppmega.megatron.nam56r_noconv_spec build_cppmega_nam56r_noconv_stack_spec \
+  "${TE_PRECISION_ARGS[@]}" \
+  --spec "${CPPMEGA_SPEC_MODULE}" "${CPPMEGA_SPEC_FUNCTION}" \
   --cross-entropy-loss-fusion \
   --cross-entropy-fusion-impl linear \
   --recompute-granularity selective \

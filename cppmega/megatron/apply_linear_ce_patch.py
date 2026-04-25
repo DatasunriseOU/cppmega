@@ -44,6 +44,8 @@ from __future__ import annotations
 import os
 import sys
 
+from cppmega.megatron.deprecated_paths import require_deprecated_ack
+
 
 # ---------------------------------------------------------------------------
 # Optional kernel imports — order matters: CCE preferred, Liger fallback.
@@ -128,10 +130,11 @@ def _patch_linear_ce_route_to_liger() -> None:
 
     # Legacy env override: skip everything and trust native.
     if os.environ.get("CPPMEGA_PREFER_NATIVE_HOPPER_CE", "0") == "1":
-        print(
-            "[cppmega] CPPMEGA_PREFER_NATIVE_HOPPER_CE=1 — skipping Liger/CCE "
-            "reroute, deferring to native Megatron dispatcher (PR #3345 hopper "
-            "entry on sm_90, native blackwell on sm_100)"
+        require_deprecated_ack(
+            feature="CPPMEGA_PREFER_NATIVE_HOPPER_CE=1",
+            ack_env="CPPMEGA_I_UNDERSTAND_PREFER_NATIVE_HOPPER_CE_IS_DEPRECATED",
+            replacement="CPPMEGA_LINEAR_CE_KERNEL=auto",
+            reason="It bypasses the probe-based CCE/native LinearCE route.",
         )
         return
 
@@ -166,6 +169,15 @@ def _patch_linear_ce_route_to_liger() -> None:
     # Correctness: exact per-token grad. Cost: [s*b, V] logits materialized
     # (~6 GiB at MBS=10 NAM56R). See reference_main_head_liger_ce_gap.md.
     if os.environ.get("CPPMEGA_MAIN_HEAD_LIGER_NONFUSED", "0") == "1":
+        require_deprecated_ack(
+            feature="CPPMEGA_MAIN_HEAD_LIGER_NONFUSED=1",
+            ack_env=(
+                "CPPMEGA_I_UNDERSTAND_MAIN_HEAD_LIGER_NONFUSED_"
+                "IS_DEPRECATED_AND_MATERIALIZES_LOGITS"
+            ),
+            replacement="CPPMEGA_LINEAR_CE_KERNEL=auto or cce",
+            reason="It materializes full logits and is only a diagnostic bridge.",
+        )
         try:
             from liger_kernel.ops.cross_entropy import (
                 LigerCrossEntropyFunction as _LigerCrossEntropyFunction,

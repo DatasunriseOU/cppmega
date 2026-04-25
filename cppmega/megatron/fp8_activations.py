@@ -10,8 +10,8 @@ Two modes:
 2. **COAT** (optional): NVlabs COAT library (ICLR 2025) for mixed-granularity
    quantization + FP8 optimizer states. Requires `pip install fp8-coat`.
 
-Pack/unpack falls back to the older Triton/PyTorch path if TE is unavailable or
-CPPMEGA_FP8_ACTIVATION_BACKEND=legacy is set.
+Pack/unpack uses Transformer Engine by default. The older Triton/PyTorch path
+is fail-closed and requires an explicit deprecated-path acknowledgement.
 
 Usage:
     from nanochat.fp8_activations import enable_fp8_activation_checkpointing
@@ -38,6 +38,8 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, TypeAlias, cast
 
 import torch
+
+from cppmega.megatron.deprecated_paths import require_deprecated_ack
 
 logger = logging.getLogger(__name__)
 
@@ -541,16 +543,39 @@ def is_coat_available() -> bool:
 # FP8 activation checkpoint hooks
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _allow_legacy_activation_backend(feature: str, reason: str) -> None:
+    require_deprecated_ack(
+        feature=feature,
+        ack_env=(
+            "CPPMEGA_I_UNDERSTAND_FP8_ACTIVATION_LEGACY_BACKEND_"
+            "IS_DEPRECATED_AND_SYNCY"
+        ),
+        replacement="CPPMEGA_FP8_ACTIVATION_BACKEND=te",
+        reason=reason,
+    )
+
+
 def _use_te_packer() -> bool:
     """Return True if Transformer Engine should pack saved activations."""
     backend = os.environ.get("CPPMEGA_FP8_ACTIVATION_BACKEND", "te").lower()
     if backend in {"legacy", "triton", "torch"}:
+        _allow_legacy_activation_backend(
+            f"CPPMEGA_FP8_ACTIVATION_BACKEND={backend}",
+            "The legacy activation packer can synchronize the CUDA stream and "
+            "does not use TE Float8Tensor quantize/dequantize.",
+        )
         return False
     if backend not in {"te", "transformer_engine", "auto"}:
         logger.warning(
             "Unknown CPPMEGA_FP8_ACTIVATION_BACKEND=%s; using Transformer Engine if available.",
             backend,
         )
+    if not _TE_AVAILABLE and torch.cuda.is_available():
+        _allow_legacy_activation_backend(
+            "FP8 activation checkpointing without Transformer Engine",
+            "Silent fallback would route to the old Triton/PyTorch packer.",
+        )
+        return False
     return _TE_AVAILABLE and torch.cuda.is_available()
 
 
@@ -580,8 +605,8 @@ class FP8ActivationPacker:
 
     The default CUDA backend uses Transformer Engine current-scaling quantize
     and dequantize, avoiding the host-side scale readback in the legacy path.
-    Set CPPMEGA_FP8_ACTIVATION_BACKEND=legacy to use the older Triton/PyTorch
-    implementation.
+    The older Triton/PyTorch implementation is deprecated and requires an
+    explicit ``CPPMEGA_I_UNDERSTAND_*`` acknowledgement.
     """
 
     @staticmethod
