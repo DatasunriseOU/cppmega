@@ -36,15 +36,15 @@ export CPPMEGA_DSA_SKIP_INDEXER_LOSS="${CPPMEGA_DSA_SKIP_INDEXER_LOSS:-1}"
 export CPPMEGA_SEQ_LENGTH="${CPPMEGA_SEQ_LENGTH:-4096}"
 export CPPMEGA_MAX_POSITION_EMBEDDINGS="${CPPMEGA_MAX_POSITION_EMBEDDINGS:-4096}"
 export CPPMEGA_FP8_RECIPE="${CPPMEGA_FP8_RECIPE:-tensorwise}"
-export CPPMEGA_OPTIMIZER="${CPPMEGA_OPTIMIZER:-adam}"
+export CPPMEGA_OPTIMIZER="muon"
 export CPPMEGA_MUON_MOMENTUM="${CPPMEGA_MUON_MOMENTUM:-0.95}"
 export CPPMEGA_MUON_SCALE_MODE="${CPPMEGA_MUON_SCALE_MODE:-spectral}"
 export CPPMEGA_MUON_NUM_NS_STEPS="${CPPMEGA_MUON_NUM_NS_STEPS:-5}"
 export CPPMEGA_MUON_TP_MODE="${CPPMEGA_MUON_TP_MODE:-blockwise}"
-export CPPMEGA_MUON_SCALAR_OPTIMIZER="${CPPMEGA_MUON_SCALAR_OPTIMIZER:-adam}"
-export CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER="${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER:-0}"
-export CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER="${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER:-0}"
-export CPPMEGA_GRAD_REDUCE_IN_BF16="${CPPMEGA_GRAD_REDUCE_IN_BF16:-0}"
+export CPPMEGA_MUON_SCALAR_OPTIMIZER="adam8bit"
+export CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER=1
+export CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER=1
+export CPPMEGA_GRAD_REDUCE_IN_BF16=1
 export CPPMEGA_USE_DISTRIBUTED_OPTIMIZER="${CPPMEGA_USE_DISTRIBUTED_OPTIMIZER:-0}"
 export CPPMEGA_USE_PRECISION_AWARE_OPTIMIZER="${CPPMEGA_USE_PRECISION_AWARE_OPTIMIZER:-0}"
 export CPPMEGA_MAIN_GRADS_DTYPE="${CPPMEGA_MAIN_GRADS_DTYPE:-fp32}"
@@ -287,8 +287,8 @@ if os.environ.get("CPPMEGA_MEM_PROFILE", "0") == "1":
                 == "1"
             )
             scalar_opt = os.environ.get("CPPMEGA_MUON_SCALAR_OPTIMIZER", "adam")
-            fallback_state_count = 1 if scalar_opt == "lion" else 2
-            fallback_state_b = 2 if fallback_no_master else 4
+            fallback_state_count = 1 if scalar_opt in ("lion", "lion8bit") else 2
+            fallback_state_b = 1 if scalar_opt.endswith("8bit") else (2 if fallback_no_master else 4)
             master_b = 0 if fallback_no_master else 4
             configured_est = (
                 model_bf16
