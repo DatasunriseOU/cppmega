@@ -55,6 +55,11 @@ _TE_TENSORWISE_SPARSE_MLA_ALIASES = {
     "te_tensorwise",
     "tensorwise",
 }
+_BLOCKSCALED_QK_ENV = "CPPMEGA_SPARSE_MLA_BLOCKSCALED_QK"
+
+
+def _env_enabled(name: str) -> bool:
+    return os.getenv(name, "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _sparse_mla_fp8_quant_backend() -> str:
@@ -72,6 +77,45 @@ def _sparse_mla_fp8_quant_backend() -> str:
 def _use_te_sparse_mla_fp8_zero_copy() -> bool:
     _sparse_mla_fp8_quant_backend()
     return True
+
+
+def sparse_mla_blockscaled_qk_scores(
+    q_data: torch.Tensor,
+    kv_data: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    quant_format: str,
+    block_i: int = 64,
+    threads: int = 256,
+) -> torch.Tensor:
+    """Experimental SparseMLA block-scaled QK scores.
+
+    This helper is intentionally not part of the default SparseMLA FP8 runtime.
+    It is gated by ``CPPMEGA_SPARSE_MLA_BLOCKSCALED_QK=1`` and returns only
+    raw sparse QK scores, so the production TE tensorwise softmax/PV path is
+    unchanged.
+    """
+    if not _env_enabled(_BLOCKSCALED_QK_ENV):
+        raise RuntimeError(
+            f"experimental SparseMLA block-scaled QK requires {_BLOCKSCALED_QK_ENV}=1"
+        )
+
+    from cppmega.megatron.sparse_mla_ops.tilelang_sparse_mla_blockscaled_qk import (
+        sparse_mla_blockscaled_qk_scores as _blockscaled_qk_scores,
+    )
+
+    return _blockscaled_qk_scores(
+        q_data,
+        kv_data,
+        q_scale,
+        kv_scale,
+        indices,
+        quant_format=quant_format,
+        block_i=block_i,
+        threads=threads,
+    )
 
 
 def _unwrap_quantized(t: torch.Tensor) -> torch.Tensor:

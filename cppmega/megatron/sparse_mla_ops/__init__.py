@@ -39,6 +39,9 @@ _preload_nvrtc_global()
 del _preload_nvrtc_global
 del ctypes, os, sys
 
-from cppmega.megatron.sparse_mla_ops.sparse_mla import SparseMLA  # noqa: E402
+from cppmega.megatron.sparse_mla_ops.sparse_mla import (  # noqa: E402
+    SparseMLA,
+    sparse_mla_blockscaled_qk_scores,
+)
 
-__all__ = ["SparseMLA"]
+__all__ = ["SparseMLA", "sparse_mla_blockscaled_qk_scores"]
