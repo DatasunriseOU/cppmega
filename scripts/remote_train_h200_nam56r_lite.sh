@@ -13,6 +13,11 @@
 # ============================================================================
 set -euo pipefail
 
+CPPMEGA_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${CPPMEGA_SCRIPT_DIR}/lib/deprecated_guard.sh"
+cppmega_deprecated_script_guard "$(basename "$0")" \
+  "scripts/remote_smoke_h200_dsa_9_4_m.sh or scripts/remote_smoke_h200_nam56r_k_pp1.sh"
+
 # LEGACY default (LOCATION_3); override REMOTE_HOST/REMOTE_ZONE for bench3 or europe.
 REMOTE_HOST="${REMOTE_HOST:-h200_legacy}"
 REMOTE_ZONE="${REMOTE_ZONE:-LOCATION_3}"
