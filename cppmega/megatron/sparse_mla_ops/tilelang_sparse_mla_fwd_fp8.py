@@ -19,6 +19,7 @@ from tilelang import language as T
 
 _tilelang_sparse_mla_fwd_fp8_kernel_cache = OrderedDict()
 _tilelang_sparse_mla_fwd_fp8_cache_lock = threading.Lock()
+_TE_FP8_QUANTIZER_CACHE = {}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -30,6 +31,62 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
     return parsed if parsed > 0 else default
+
+
+def _fp8_quant_backend() -> str:
+    return os.getenv("CPPMEGA_SPARSE_MLA_FP8_QUANT", "local_per_token").strip().lower()
+
+
+def _te_fp8_dtype():
+    import transformer_engine  # noqa: F401
+    import transformer_engine_torch as tex
+
+    return tex.DType.kFloat8E4M3
+
+
+def _te_quantizer_for(device: torch.device):
+    import transformer_engine  # noqa: F401
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor import Float8CurrentScalingQuantizer
+
+    if device.type != "cuda":
+        raise RuntimeError("TE SparseMLA FP8 quantization requires CUDA tensors")
+    index = torch.cuda.current_device() if device.index is None else device.index
+    key = (index, int(tex.DType.kFloat8E4M3))
+    quantizer = _TE_FP8_QUANTIZER_CACHE.get(key)
+    if quantizer is None:
+        quantizer = Float8CurrentScalingQuantizer(
+            tex.DType.kFloat8E4M3,
+            device=torch.device("cuda", index),
+            rowwise=True,
+            columnwise=False,
+        )
+        _TE_FP8_QUANTIZER_CACHE[key] = quantizer
+    return quantizer
+
+
+def _te_tensorwise_cast_to_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cast with TE current scaling and broadcast its tensor scale per row.
+
+    This intentionally preserves the TileLang kernel interface, not the old
+    per-row quantization granularity.  It is an aggressive A/B mode controlled
+    by CPPMEGA_SPARSE_MLA_FP8_QUANT=te_tensorwise.
+    """
+    import transformer_engine  # noqa: F401
+    import transformer_engine_torch as tex
+
+    packed = tex.quantize(x.contiguous(), _te_quantizer_for(x.device))
+    data = getattr(packed, "_data", None)
+    scale = getattr(packed, "_scale_inv", None)
+    if data is None or scale is None:
+        raise RuntimeError("TE Float8Tensor did not expose _data/_scale_inv")
+    if data.dtype == torch.float8_e4m3fn:
+        fp8_data = data
+    elif data.dtype == torch.uint8 and getattr(getattr(packed, "_fp8_dtype", None), "name", None) == "kFloat8E4M3":
+        fp8_data = data.view(torch.float8_e4m3fn)
+    else:
+        raise RuntimeError(f"unsupported TE FP8 storage dtype: {data.dtype}")
+    return fp8_data, scale.expand(x.shape[:-1]).contiguous()
 
 
 _TILELANG_KERNEL_CACHE_MAX = _env_int("MCORE_DSA_TILELANG_KERNEL_CACHE_MAX", 512)
@@ -337,6 +394,15 @@ def per_token_cast_to_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         (x_fp8, scales) where x_fp8 is float8_e4m3fn and scales is float32
         with shape [...] (last dim removed).
     """
+    backend = _fp8_quant_backend()
+    if backend in {"te", "te_current", "te_tensorwise", "tensorwise"}:
+        return _te_tensorwise_cast_to_fp8(x)
+    if backend not in {"local", "local_per_token", "per_token", "rowwise"}:
+        raise ValueError(
+            "CPPMEGA_SPARSE_MLA_FP8_QUANT must be one of "
+            "local_per_token, te_tensorwise"
+        )
+
     # Compute per-token absmax over the last dimension
     x_float = x.float()
     amax = x_float.abs().amax(dim=-1, keepdim=True).clamp(min=1e-4)
