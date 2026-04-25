@@ -176,14 +176,18 @@ jobs:
       - name: Install build deps
         run: pip install ninja packaging pybind11 cmake numpy einops
 
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ matrix.repo }}
-          ref: ${{ matrix.ref }}
-          submodules: ${{ matrix.submodules }}
-          path: src
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Clone source (any ref — branch / tag / SHA)
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          rm -rf src
+          git clone https://github.com/${{ matrix.repo }}.git src
+          cd src
+          git checkout ${{ matrix.ref }}
+          if [[ "${{ matrix.submodules }}" == "true" ]]; then
+            git submodule update --init --recursive --depth 1
+          fi
+          git log -1 --format='Source HEAD: %h %s'
 
       - name: Apply patch
         if: matrix.patch
