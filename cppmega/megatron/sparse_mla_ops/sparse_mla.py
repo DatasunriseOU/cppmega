@@ -42,11 +42,25 @@ Key interface translation:
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 import torch
 
 log = logging.getLogger(__name__)
+
+
+def _sparse_mla_fp8_quant_backend() -> str:
+    return os.getenv("CPPMEGA_SPARSE_MLA_FP8_QUANT", "local_per_token").strip().lower()
+
+
+def _use_te_sparse_mla_fp8_zero_copy() -> bool:
+    return _sparse_mla_fp8_quant_backend() in {
+        "te",
+        "te_current",
+        "te_tensorwise",
+        "tensorwise",
+    }
 
 
 def _unwrap_quantized(t: torch.Tensor) -> torch.Tensor:
@@ -75,7 +89,7 @@ def _extract_fp8_data(t: torch.Tensor):
     FP8 data, otherwise returns (None, None).
 
     TE Float8Tensor stores:
-      - _data: plain torch.Tensor with dtype=float8_e4m3fn, valid data_ptr()
+      - _data: plain torch.Tensor with raw FP8 bytes, valid data_ptr()
       - _scale_inv: float32 scalar, dequant factor (real = fp8 * _scale_inv)
 
     _scale_inv uses the same convention as our per_token_cast_to_fp8 scale
@@ -97,11 +111,20 @@ def _extract_fp8_data(t: torch.Tensor):
     scale_inv = getattr(t, '_scale_inv', None)
     if data is None or scale_inv is None:
         return None, None
-    if data.dtype != torch.float8_e4m3fn:
+    if data.dtype == torch.float8_e4m3fn:
+        fp8_data = data
+    elif (
+        data.dtype == torch.uint8
+        and getattr(getattr(t, "_fp8_dtype", None), "name", None) == "kFloat8E4M3"
+    ):
+        # TE 2.14 exposes raw Float8Tensor storage as uint8.  TileLang needs a
+        # torch FP8 dtype tensor, but the byte layout is already e4m3.
+        fp8_data = data.view(torch.float8_e4m3fn)
+    else:
         return None, None
     if data.data_ptr() == 0:
         return None, None
-    return data, scale_inv
+    return fp8_data, scale_inv
 
 
 class SparseMLA(torch.autograd.Function):
@@ -196,11 +219,16 @@ class SparseMLA_FP8(torch.autograd.Function):
             sparse_mla_fwd_fp8_interface,
         )
 
-        # Zero-copy path: extract raw FP8 data + scale from TE Float8Tensor
-        # directly, avoiding the dequantize(fp8->bf16) + re-quantize(bf16->fp8)
-        # round-trip. TE uses per-tensor scale; we broadcast to per-token.
-        q_fp8_data, q_te_scale = _extract_fp8_data(q)
-        kv_fp8_data, kv_te_scale = _extract_fp8_data(kv)
+        # Aggressive mode: extract raw FP8 data + scale from TE Float8Tensor
+        # directly, avoiding dequantize(fp8->bf16) + per-row re-quantize.
+        # TE current/tensorwise scaling changes the old per-token scale
+        # contract, so keep it behind CPPMEGA_SPARSE_MLA_FP8_QUANT.
+        if _use_te_sparse_mla_fp8_zero_copy():
+            q_fp8_data, q_te_scale = _extract_fp8_data(q)
+            kv_fp8_data, kv_te_scale = _extract_fp8_data(kv)
+        else:
+            q_fp8_data = q_te_scale = None
+            kv_fp8_data = kv_te_scale = None
 
         q_fp8 = None
         q_scale = None
