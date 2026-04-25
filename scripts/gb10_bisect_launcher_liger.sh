@@ -41,6 +41,8 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export TRITON_CACHE_DIR=/home/dave/.triton-cache
 export CPPMEGA_OPTIMIZER=muon
 export CPPMEGA_MUON_SCALAR_OPTIMIZER=adam8bit
+export CPPMEGA_MUON_QUANTIZED_MOMENTUM=1
+export CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE=int8
 export CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER=1
 export CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER=1
 export CPPMEGA_GRAD_REDUCE_IN_BF16=1
@@ -126,6 +128,7 @@ python -m torch.distributed.run --nproc_per_node=1 "${REMOTE_WORKDIR}/pretrain_m
   --optimizer "${CPPMEGA_OPTIMIZER}" \
   --muon-momentum 0.95 --muon-scale-mode spectral --muon-num-ns-steps 5 \
   --muon-tp-mode blockwise --muon-scalar-optimizer "${CPPMEGA_MUON_SCALAR_OPTIMIZER}" \
+  --muon-quantized-momentum --muon-quantized-momentum-dtype "${CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE}" \
   --use-bf16-no-master-emerging-optimizer \
   --use-bf16-no-master-emerging-fallback-optimizer --grad-reduce-in-bf16 \
   --position-embedding-type rope --normalization RMSNorm \
