@@ -90,13 +90,13 @@ bash scripts/remote_smoke_h200_dsa_9_4_m.sh
 
 ## Deprecated measurements (do not cite)
 
-| Measurement | Status | Reason |
-|---|---|---|
+| Measurement                                   | Status         | Reason                                                                                                |
+| --------------------------------------------- | -------------- | ----------------------------------------------------------------------------------------------------- |
 | bench3 269.4 TFLOP/s (Liger reduction="none") | **SUPERSEDED** | Silent gradient corruption via Liger #968; 268 with `reduction="mean"` broadcast is the new canonical |
-| bench3 253 TFLOP/s (PP=1 EP=4 MBS=8 FP8) | superseded | Topology replaced by EP=8 MBS=10 (v3) |
-| europe 193 TFLOP/s (PP=2 VPP=2 MBS=4) | superseded | Stream L topology, kept as default in launcher only for backward compat |
-| "205 TFLOP/s DualPipeV baseline" | never real | See `project_dualpipev_unwired.md` |
-| bench3 "100 TFLOP/s gap vs europe" | refuted | Was PP=2 bubble artifact; correct gap is 13% HW variance |
+| bench3 253 TFLOP/s (PP=1 EP=4 MBS=8 FP8)      | superseded     | Topology replaced by EP=8 MBS=10 (v3)                                                                 |
+| europe 193 TFLOP/s (PP=2 VPP=2 MBS=4)         | superseded     | Stream L topology, kept as default in launcher only for backward compat                               |
+| "205 TFLOP/s DualPipeV baseline"              | never real     | See `project_dualpipev_unwired.md`                                                                    |
+| bench3 "100 TFLOP/s gap vs europe"            | refuted        | Was PP=2 bubble artifact; correct gap is 13% HW variance                                              |
 
 ---
 
