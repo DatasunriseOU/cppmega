@@ -35,20 +35,20 @@ Action: none (gap is intentional, documented here).
 
 Audited all three patch files in `cppmega/megatron/upstream_patches/` + the top-level `apply_linear_ce_patch.py` against existing PR templates 01-13.
 
-| Patch file | Covered by PR template(s)? | Status |
-|---|---|---|
-| `apply_dsa_cg_patches.py` patches 1-9 + 9b | PR 01 (CG safety), PR 02 (dims), PR 03 (FP8 dispatch) | COVERED |
-| `apply_linear_ce_patch.py` | PR 09 (Liger FLCE bug), PR 10 (Megatron Hopper CE), PR 11 (Mamba LinearCE class-swap) | COVERED |
-| `apply_mamba3_mimo_p1_patches.py` | **NOT YET PR'd** — TMA + warpspec enable on Mamba3 MIMO fwd | **GAP** |
-| `apply_dualpipev_patch.py` | N/A — DualPipeV is experimental, EP>1 incompatible, phantom per memory | NOT A BUG FIX — skip |
-| `dsa_indexer_fused_patch.py` | PR 12 (DSA indexer memory) | COVERED |
-| `index_cache_patch.py` | Not a bug fix — cppmega-specific layer pattern (3 Full + 6 Shared), not upstreamable | INTERNAL |
-| `lemyx_dsa_warmup.py` | External dependency wrapping (lemyx/tilelang-dsa) | INTERNAL |
-| `mamba_recompute_patch.py` | Not a bug fix — opt-in activation checkpointing | INTERNAL |
-| `mamba3_compile_patch.py` | Not a bug fix — torch.compile regional wrapping | INTERNAL |
-| `mtp_liger_ce.py` | Subsumed by PR 09 / 11 logic | COVERED |
-| `mtp_native_hopper_ce.py` | Status: infrastructure only, grad_norm=NaN — NOT ready to upstream | BLOCKED |
-| `selective_fp8_moe_patch.py` | FP8 MoE gate — internal config, no upstream target | INTERNAL |
+| Patch file                                 | Covered by PR template(s)?                                                            | Status               |
+| ------------------------------------------ | ------------------------------------------------------------------------------------- | -------------------- |
+| `apply_dsa_cg_patches.py` patches 1-9 + 9b | PR 01 (CG safety), PR 02 (dims), PR 03 (FP8 dispatch)                                 | COVERED              |
+| `apply_linear_ce_patch.py`                 | PR 09 (Liger FLCE bug), PR 10 (Megatron Hopper CE), PR 11 (Mamba LinearCE class-swap) | COVERED              |
+| `apply_mamba3_mimo_p1_patches.py`          | **NOT YET PR'd** — TMA + warpspec enable on Mamba3 MIMO fwd                           | **GAP**              |
+| `apply_dualpipev_patch.py`                 | N/A — DualPipeV is experimental, EP>1 incompatible, phantom per memory                | NOT A BUG FIX — skip |
+| `dsa_indexer_fused_patch.py`               | PR 12 (DSA indexer memory)                                                            | COVERED              |
+| `index_cache_patch.py`                     | Not a bug fix — cppmega-specific layer pattern (3 Full + 6 Shared), not upstreamable  | INTERNAL             |
+| `lemyx_dsa_warmup.py`                      | External dependency wrapping (lemyx/tilelang-dsa)                                     | INTERNAL             |
+| `mamba_recompute_patch.py`                 | Not a bug fix — opt-in activation checkpointing                                       | INTERNAL             |
+| `mamba3_compile_patch.py`                  | Not a bug fix — torch.compile regional wrapping                                       | INTERNAL             |
+| `mtp_liger_ce.py`                          | Subsumed by PR 09 / 11 logic                                                          | COVERED              |
+| `mtp_native_hopper_ce.py`                  | Status: infrastructure only, grad_norm=NaN — NOT ready to upstream                    | BLOCKED              |
+| `selective_fp8_moe_patch.py`               | FP8 MoE gate — internal config, no upstream target                                    | INTERNAL             |
 
 ### Gap — Candidate PR 14: Mamba3 MIMO P1 (TMA + warpspec enable on fwd kernels)
 
@@ -179,11 +179,11 @@ README Quick Start is **~90% correct**. A fresh user would succeed if they're al
 
 ## Files modified in this audit
 
-| File | Change |
-|---|---|
-| `README.md` | 4 edits — megatron-core bench3/europe version, Quick Start comment, Megatron Version table row, Software Stack row |
-| `.tmp/backup_bench3_2026_04_14/MANIFEST.md` | 3 edits — active-libs-row, CRITICAL UNIQUE ARTIFACTS section 1, RESTORABILITY step 3 |
-| `docs/session_3_gap_audit.md` | NEW (this file) |
+| File                                        | Change                                                                                                             |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `README.md`                                 | 4 edits — megatron-core bench3/europe version, Quick Start comment, Megatron Version table row, Software Stack row |
+| `.tmp/backup_bench3_2026_04_14/MANIFEST.md` | 3 edits — active-libs-row, CRITICAL UNIQUE ARTIFACTS section 1, RESTORABILITY step 3                               |
+| `docs/session_3_gap_audit.md`               | NEW (this file)                                                                                                    |
 
 ## Items flagged for session 4 (not fixed this audit)
 

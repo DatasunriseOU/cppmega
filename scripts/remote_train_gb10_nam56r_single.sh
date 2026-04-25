@@ -151,6 +151,8 @@ export CPPMEGA_STRUCTURE_ENABLED="${CPPMEGA_STRUCTURE_ENABLED:-0}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export CPPMEGA_OPTIMIZER="muon"
 export CPPMEGA_MUON_SCALAR_OPTIMIZER="adam8bit"
+export CPPMEGA_MUON_QUANTIZED_MOMENTUM="${CPPMEGA_MUON_QUANTIZED_MOMENTUM:-1}"
+export CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE="${CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE:-int8}"
 export CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER=1
 export CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER=1
 export CPPMEGA_GRAD_REDUCE_IN_BF16=1
@@ -218,6 +220,12 @@ OPTIMIZER_ARGS=(
   --use-bf16-no-master-emerging-fallback-optimizer
   --grad-reduce-in-bf16
 )
+if [ "${CPPMEGA_MUON_QUANTIZED_MOMENTUM}" = "1" ]; then
+  OPTIMIZER_ARGS+=(
+    --muon-quantized-momentum
+    --muon-quantized-momentum-dtype "${CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE}"
+  )
+fi
 
 # CUDA graph capture.  NAM56R uses DROPLESS MoE (no capacity factor, no
 # pad-expert-input-to-capacity) so the MoE layer has dynamic shapes and

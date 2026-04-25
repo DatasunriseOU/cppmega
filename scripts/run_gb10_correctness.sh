@@ -52,7 +52,7 @@ exec env \
   MTP_DEPTHS=0 \
   CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
   CG_FLAGS=NONE \
-  OPTIMIZER_FLAGS="--optimizer muon --muon-momentum 0.95 --muon-scale-mode spectral --muon-num-ns-steps 5 --muon-tp-mode blockwise --muon-scalar-optimizer adam8bit --use-bf16-no-master-emerging-optimizer --use-bf16-no-master-emerging-fallback-optimizer --grad-reduce-in-bf16" \
+	  OPTIMIZER_FLAGS="--optimizer muon --muon-momentum 0.95 --muon-scale-mode spectral --muon-num-ns-steps 5 --muon-tp-mode blockwise --muon-scalar-optimizer adam8bit --muon-quantized-momentum --muon-quantized-momentum-dtype int8 --use-bf16-no-master-emerging-optimizer --use-bf16-no-master-emerging-fallback-optimizer --grad-reduce-in-bf16" \
   CPPMEGA_SMEM_CHECK="${CPPMEGA_SMEM_CHECK:-1}" \
   CPPMEGA_INDEX_CACHE=0 \
   CPPMEGA_LEMYX_DSA=0 \
