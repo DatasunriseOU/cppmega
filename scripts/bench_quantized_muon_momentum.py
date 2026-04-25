@@ -14,9 +14,12 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from cppmega.megatron.quantized_muon_momentum import (  # noqa: E402
     TRITON_AVAILABLE,
+    QuantizedMuonNormSegment,
+    build_quantized_muon_norm_plan,
     dequantize_momentum,
     empty_quantized_momentum_like,
     quantize_momentum_,
+    quantized_muon_momentum_update_multi_and_normalize_groups_,
     quantized_muon_momentum_update_multi_and_normalize_,
     quantized_muon_momentum_update_multi_,
     quantized_muon_momentum_update_,
@@ -118,6 +121,84 @@ def _run_one(
     )
 
 
+def _run_qkv_grouped(
+    *,
+    rows: int,
+    cols: int,
+    storage_dtype: torch.dtype,
+    beta: float,
+    warmup: int,
+    iters: int,
+) -> None:
+    if rows % 4 != 0:
+        raise SystemExit("--qkv-grouped requires --rows divisible by 4 for split=(2,1,1)")
+    if cols % 256 != 0:
+        raise SystemExit("--qkv-grouped requires --cols divisible by 256 for block-aligned slices")
+
+    device = "cuda"
+    qkv_split = (2, 1, 1)
+    rows_per_group = sum(qkv_split)
+    num_query_groups = rows // rows_per_group
+    shape = (rows, cols)
+    gen = torch.Generator(device=device).manual_seed(20260425)
+    old_m = 0.2 * torch.randn(shape, device=device, dtype=torch.bfloat16, generator=gen)
+    grad_src = 0.2 * torch.randn(shape, device=device, dtype=torch.bfloat16, generator=gen)
+
+    segments = []
+    for query_group in range(num_query_groups):
+        cursor = query_group * rows_per_group
+        for group_id, split_rows in enumerate(qkv_split):
+            segments.append(
+                QuantizedMuonNormSegment(
+                    tensor_index=0,
+                    start=cursor * cols,
+                    length=split_rows * cols,
+                    group_id=group_id,
+                )
+            )
+            cursor += split_rows
+
+    state_fused = empty_quantized_momentum_like(old_m, storage_dtype=storage_dtype)
+    state_base = empty_quantized_momentum_like(old_m, storage_dtype=storage_dtype)
+    quantize_momentum_(state_fused, old_m)
+    quantize_momentum_(state_base, old_m)
+    norm_plan = build_quantized_muon_norm_plan([state_fused], segments, num_groups=3)
+    grad_fused = grad_src.clone()
+    grad_base = grad_src.clone()
+
+    def _fused_grouped():
+        grad_fused.copy_(grad_src)
+        quantized_muon_momentum_update_multi_and_normalize_groups_(
+            [state_fused],
+            [grad_fused],
+            norm_plan,
+            beta=beta,
+            return_inv_norms=False,
+        )
+
+    def _update_then_torch_qkv_norm():
+        grad_base.copy_(grad_src)
+        quantized_muon_momentum_update_multi_([state_base], [grad_base], beta=beta)
+        qkv = grad_base.view(num_query_groups, rows_per_group, cols)
+        for part in (qkv[:, 0:2, :], qkv[:, 2:3, :], qkv[:, 3:4, :]):
+            inv_norm = part.float().square().sum().clamp_min(1e-14).rsqrt()
+            part.mul_(inv_norm)
+
+    fused_ms = _time_cuda(_fused_grouped, warmup=warmup, iters=iters)
+    torch_ms = _time_cuda(_update_then_torch_qkv_norm, warmup=warmup, iters=iters)
+    print(
+        f"qkv_grouped storage={storage_dtype} shape={shape} "
+        f"numel={old_m.numel():,} segments={len(segments):,} "
+        f"blocks={norm_plan.block_group_ids.numel():,}"
+    )
+    print(
+        "  perf: "
+        f"fused_group_update_norm={fused_ms:.4f} ms "
+        f"update_plus_torch_qkv_norm={torch_ms:.4f} ms "
+        f"ratio={fused_ms / torch_ms:.2f}x"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", type=int, default=4096)
@@ -131,6 +212,11 @@ def main() -> None:
         default="both",
         help="Quantized momentum storage dtype to test.",
     )
+    parser.add_argument(
+        "--qkv-grouped",
+        action="store_true",
+        help="Benchmark grouped Q/K/V sumsq+scale path instead of the base paths.",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -142,13 +228,23 @@ def main() -> None:
     shape = (args.rows, args.cols)
     storage_dtypes = [torch.int8, torch.uint8] if args.storage == "both" else [getattr(torch, args.storage)]
     for storage_dtype in storage_dtypes:
-        _run_one(
-            shape=shape,
-            storage_dtype=storage_dtype,
-            beta=args.beta,
-            warmup=args.warmup,
-            iters=args.iters,
-        )
+        if args.qkv_grouped:
+            _run_qkv_grouped(
+                rows=args.rows,
+                cols=args.cols,
+                storage_dtype=storage_dtype,
+                beta=args.beta,
+                warmup=args.warmup,
+                iters=args.iters,
+            )
+        else:
+            _run_one(
+                shape=shape,
+                storage_dtype=storage_dtype,
+                beta=args.beta,
+                warmup=args.warmup,
+                iters=args.iters,
+            )
 
 
 if __name__ == "__main__":
