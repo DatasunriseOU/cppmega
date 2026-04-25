@@ -10,20 +10,38 @@ real `clang_semantic_4k_v10_train` data.
 | `CPPMEGA_SPARSE_MLA_FP8_QUANT=local_per_token` |       4371.8 ms | 3747.7 |          7.336141 | 5.958006 |  6.006602 | 25,696 MB |
 | `CPPMEGA_SPARSE_MLA_FP8_QUANT=te_tensorwise`   |       4413.8 ms | 3712.0 |          7.383913 | 5.918729 |  5.907243 | 25,696 MB |
 
-The 5-step loss A/B does not show a correctness red flag for the aggressive
-TE tensorwise path, but it also does not improve steady-state throughput on
-GB10. The gain is expected to show only if it removes materialization in a
-hot DSA path that is otherwise quantizing BF16 activations again.
+The 5-step A/B alone was too noisy: it showed a ~1% apparent slowdown for
+`te_tensorwise`, but focused profiling showed that was not coming from
+SparseMLA.
+
+Focused `SparseMLA_FP8.forward`, `seq=4096`, `heads=28`, `topk=64`, 8 calls:
+
+| SparseMLA FP8 quant path | CUDA total | Main kernel | Peak alloc |
+| --- | ---: | ---: | ---: |
+| `local_per_token` | 92.0 ms | 15.9 ms | 1008 MB |
+| `te_tensorwise` | 13.4 ms | 13.4 ms | 422 MB |
+
+End-to-end torch profiler on quarter train step 3:
+
+| SparseMLA FP8 quant path | Step wall time | Self CUDA total |
+| --- | ---: | ---: |
+| `local_per_token` | 6745.5 ms | 4.417 s |
+| `te_tensorwise` | 6721.8 ms | 4.386 s |
+
+The old local path spent most of its SparseMLA forward time in
+`abs/amax/div/copy_` and allocated much larger temporaries. The runtime is now
+hard-wired to TE current/tensorwise scaling.
 
 ## Current Code Contract
 
-- Default remains `local_per_token`: BF16/TE input is converted to plain tensor
-  and quantized rowwise for the TileLang SparseMLA FP8 kernel.
-- Aggressive path is explicit:
-  `CPPMEGA_SPARSE_MLA_FP8_QUANT=te_tensorwise`.
-- In aggressive mode, TE `Float8Tensor` input is used zero-copy by viewing TE
-  2.14 `_data` uint8 storage as `torch.float8_e4m3fn` and broadcasting the
-  TE tensor scale to the TileLang kernel's existing scale shape.
+- SparseMLA FP8 always uses TE current/tensorwise scaling.
+- TE `Float8Tensor` input is used zero-copy by viewing TE 2.14 `_data` uint8
+  storage as `torch.float8_e4m3fn` and broadcasting the TE tensor scale to the
+  TileLang kernel's existing scale shape.
+- `CPPMEGA_SPARSE_MLA_FP8_QUANT` is no longer a choice. Only TE aliases
+  (`te`, `te_current`, `te_tensorwise`, `tensorwise`) are accepted for old
+  launch compatibility; `local_per_token`, `per_token`, and `rowwise` fail
+  fast.
 
 ## Runtime Options Checked
 
@@ -75,9 +93,10 @@ hatch if TE cannot fuse the exact operation:
 
 1. Use TE MXFP8/NVFP4 tensor + `general_gemm/generic_gemm` first for dense
    MLP/MoE/projection paths where GEMM boundaries already exist.
-2. Keep SparseMLA on the current TileLang FP8 kernel for now, with the explicit
-   `te_tensorwise` A/B flag. Do not rewrite SparseMLA around block-scaled GEMM
-   until we decide how to represent scale blocks inside sparse/topk attention.
+2. Keep SparseMLA on the current TileLang FP8 kernel for now, hard-wired to TE
+   tensorwise/current scaling. Do not rewrite SparseMLA around block-scaled
+   GEMM until we decide how to represent scale blocks inside sparse/topk
+   attention.
 3. If SparseMLA needs true block-scaled fusion, use CuTe DSL directly, not
    RightNow-Tile. The fused target is:
    - quantize/load Q/K/V in MXFP8 or NVFP4 block layout,
