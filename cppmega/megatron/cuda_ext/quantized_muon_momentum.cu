@@ -208,11 +208,11 @@ void validate_tensor_lists(
 
 template <typename GradT, typename QT, bool UnsignedStorage>
 void launch_update(
-    const at::Tensor& d_q_ptrs,
-    const at::Tensor& d_absmax_ptrs,
-    const at::Tensor& d_grad_ptrs,
-    const at::Tensor& d_n_elements,
-    const at::Tensor& d_block_offsets,
+    const int64_t* d_q_ptrs,
+    const int64_t* d_absmax_ptrs,
+    const int64_t* d_grad_ptrs,
+    const int64_t* d_n_elements,
+    const int64_t* d_block_offsets,
     const at::Tensor& sumsq_out,
     int num_tensors,
     int64_t total_blocks,
@@ -220,11 +220,11 @@ void launch_update(
     cudaStream_t stream) {
   qmuon_update_multi_kernel<GradT, QT, UnsignedStorage>
       <<<static_cast<unsigned int>(total_blocks), kThreads, 0, stream>>>(
-          reinterpret_cast<const uintptr_t*>(d_q_ptrs.data_ptr<int64_t>()),
-          reinterpret_cast<const uintptr_t*>(d_absmax_ptrs.data_ptr<int64_t>()),
-          reinterpret_cast<const uintptr_t*>(d_grad_ptrs.data_ptr<int64_t>()),
-          d_n_elements.data_ptr<int64_t>(),
-          d_block_offsets.data_ptr<int64_t>(),
+          reinterpret_cast<const uintptr_t*>(d_q_ptrs),
+          reinterpret_cast<const uintptr_t*>(d_absmax_ptrs),
+          reinterpret_cast<const uintptr_t*>(d_grad_ptrs),
+          d_n_elements,
+          d_block_offsets,
           sumsq_out.defined() ? sumsq_out.data_ptr<float>() : nullptr,
           num_tensors,
           beta);
@@ -246,32 +246,33 @@ at::Tensor qmuon_update_multi_impl_(
   const auto device = q_tensors[0].device();
   const int num_tensors = static_cast<int>(q_tensors.size());
 
-  std::vector<int64_t> h_q_ptrs(num_tensors);
-  std::vector<int64_t> h_absmax_ptrs(num_tensors);
-  std::vector<int64_t> h_grad_ptrs(num_tensors);
-  std::vector<int64_t> h_n_elements(num_tensors);
-  std::vector<int64_t> h_block_offsets(num_tensors + 1, 0);
+  const int64_t q_ptrs_offset = 0;
+  const int64_t absmax_ptrs_offset = q_ptrs_offset + num_tensors;
+  const int64_t grad_ptrs_offset = absmax_ptrs_offset + num_tensors;
+  const int64_t n_elements_offset = grad_ptrs_offset + num_tensors;
+  const int64_t block_offsets_offset = n_elements_offset + num_tensors;
+  const int64_t metadata_size = block_offsets_offset + num_tensors + 1;
+  std::vector<int64_t> h_metadata(metadata_size, 0);
 
   for (int i = 0; i < num_tensors; ++i) {
-    h_q_ptrs[i] = reinterpret_cast<int64_t>(q_tensors[i].data_ptr());
-    h_absmax_ptrs[i] = reinterpret_cast<int64_t>(absmax_tensors[i].data_ptr<float>());
-    h_grad_ptrs[i] = reinterpret_cast<int64_t>(grad_tensors[i].data_ptr());
-    h_n_elements[i] = q_tensors[i].numel();
-    h_block_offsets[i + 1] = h_block_offsets[i] + div_up(h_n_elements[i], kBlockSize);
+    h_metadata[q_ptrs_offset + i] = reinterpret_cast<int64_t>(q_tensors[i].data_ptr());
+    h_metadata[absmax_ptrs_offset + i] =
+        reinterpret_cast<int64_t>(absmax_tensors[i].data_ptr<float>());
+    h_metadata[grad_ptrs_offset + i] = reinterpret_cast<int64_t>(grad_tensors[i].data_ptr());
+    h_metadata[n_elements_offset + i] = q_tensors[i].numel();
+    h_metadata[block_offsets_offset + i + 1] =
+        h_metadata[block_offsets_offset + i] +
+        div_up(h_metadata[n_elements_offset + i], kBlockSize);
   }
 
-  const int64_t total_blocks = h_block_offsets.back();
+  const int64_t total_blocks = h_metadata[metadata_size - 1];
   if (total_blocks == 0) {
     return at::empty({0}, at::TensorOptions().device(device).dtype(at::kFloat));
   }
 
   const auto long_opts = at::TensorOptions().device(device).dtype(at::kLong);
   const auto float_opts = at::TensorOptions().device(device).dtype(at::kFloat);
-  at::Tensor d_q_ptrs = at::empty({num_tensors}, long_opts);
-  at::Tensor d_absmax_ptrs = at::empty({num_tensors}, long_opts);
-  at::Tensor d_grad_ptrs = at::empty({num_tensors}, long_opts);
-  at::Tensor d_n_elements = at::empty({num_tensors}, long_opts);
-  at::Tensor d_block_offsets = at::empty({num_tensors + 1}, long_opts);
+  at::Tensor d_metadata = at::empty({metadata_size}, long_opts);
   at::Tensor sumsq_out;
   if (return_sumsq) {
     sumsq_out = at::empty({total_blocks}, float_opts);
@@ -279,35 +280,17 @@ at::Tensor qmuon_update_multi_impl_(
 
   auto stream = at::cuda::getCurrentCUDAStream(device.index()).stream();
   C10_CUDA_CHECK(cudaMemcpyAsync(
-      d_q_ptrs.data_ptr<int64_t>(),
-      h_q_ptrs.data(),
-      sizeof(int64_t) * h_q_ptrs.size(),
+      d_metadata.data_ptr<int64_t>(),
+      h_metadata.data(),
+      sizeof(int64_t) * h_metadata.size(),
       cudaMemcpyHostToDevice,
       stream));
-  C10_CUDA_CHECK(cudaMemcpyAsync(
-      d_absmax_ptrs.data_ptr<int64_t>(),
-      h_absmax_ptrs.data(),
-      sizeof(int64_t) * h_absmax_ptrs.size(),
-      cudaMemcpyHostToDevice,
-      stream));
-  C10_CUDA_CHECK(cudaMemcpyAsync(
-      d_grad_ptrs.data_ptr<int64_t>(),
-      h_grad_ptrs.data(),
-      sizeof(int64_t) * h_grad_ptrs.size(),
-      cudaMemcpyHostToDevice,
-      stream));
-  C10_CUDA_CHECK(cudaMemcpyAsync(
-      d_n_elements.data_ptr<int64_t>(),
-      h_n_elements.data(),
-      sizeof(int64_t) * h_n_elements.size(),
-      cudaMemcpyHostToDevice,
-      stream));
-  C10_CUDA_CHECK(cudaMemcpyAsync(
-      d_block_offsets.data_ptr<int64_t>(),
-      h_block_offsets.data(),
-      sizeof(int64_t) * h_block_offsets.size(),
-      cudaMemcpyHostToDevice,
-      stream));
+  const int64_t* d_metadata_ptr = d_metadata.data_ptr<int64_t>();
+  const int64_t* d_q_ptrs = d_metadata_ptr + q_ptrs_offset;
+  const int64_t* d_absmax_ptrs = d_metadata_ptr + absmax_ptrs_offset;
+  const int64_t* d_grad_ptrs = d_metadata_ptr + grad_ptrs_offset;
+  const int64_t* d_n_elements = d_metadata_ptr + n_elements_offset;
+  const int64_t* d_block_offsets = d_metadata_ptr + block_offsets_offset;
 
   const float beta_f = static_cast<float>(beta);
   const auto grad_dtype = grad_tensors[0].scalar_type();
