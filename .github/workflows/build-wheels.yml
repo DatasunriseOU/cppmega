@@ -1,0 +1,237 @@
+name: build-wheels
+
+# Build all custom CUDA wheels (TE 2.16.0.dev0, flash-attn, mamba_ssm,
+# causal_conv1d, fast_hadamard, tilelang, qoptim_cuda) on free ubuntu-latest
+# x86_64 runners (50000 free min/month).
+#
+# Each matrix entry caches its own ~/.ccache between runs, keyed on source
+# git commit. Wheels are uploaded as a single GH Release `wheels-${{ inputs.tag }}`.
+#
+# Trigger manually after bumping STACK.lock; or on push to STACK.lock /
+# upstream_prs/*.patch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag suffix (default: short SHA of triggering commit)"
+        required: false
+        type: string
+  push:
+    paths:
+      - STACK.lock
+      - upstream_prs/*.patch
+      - .github/workflows/build-wheels.yml
+
+permissions:
+  contents: write   # needed to create the Release that holds the wheel assets
+
+env:
+  CUDA_VERSION: "13.2.1"
+  PYTHON_VERSION: "3.13"
+  TORCH_VERSION: "2.13.*"
+  TORCH_INDEX: "https://download.pytorch.org/whl/nightly/cu132"
+  TORCH_CUDA_ARCH_LIST: "9.0;10.0;12.1"
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.t.outputs.tag }}
+    steps:
+      - id: t
+        run: |
+          if [[ -n "${{ inputs.tag }}" ]]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$(echo ${{ github.sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 350     # 6h hard limit; flash_attn at MAX_JOBS=1 ~= 4h
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: transformer_engine
+            repo: jewelmusicee/TransformerEngine
+            ref: cppmega-mxfp8-transpose-emit
+            submodules: "true"
+            extra_env: "NVTE_FRAMEWORK=pytorch"
+          - name: flash_attn
+            repo: Dao-AILab/flash-attention
+            ref: v2.8.3
+            submodules: "false"
+            patch: upstream_prs/flash_attn_setup_sm120f.patch
+            extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
+          - name: mamba_ssm
+            repo: state-spaces/mamba
+            ref: 31f3d7b
+            submodules: "false"
+            extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
+          - name: causal_conv1d
+            repo: Dao-AILab/causal-conv1d
+            ref: v1.6.1
+            submodules: "false"
+            extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
+          - name: fast_hadamard_transform
+            repo: Dao-AILab/fast-hadamard-transform
+            ref: main
+            submodules: "false"
+            extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
+          - name: tilelang
+            repo: tile-ai/tilelang
+            ref: f309d814
+            submodules: "true"
+            extra_env: ""
+          - name: qoptim_cuda
+            repo: NVlabs/COAT
+            ref: main
+            submodules: "false"
+            subdir: coat/optimizer/kernels
+            extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
+
+    steps:
+      - name: Checkout cppmega (for patches)
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        # Reclaims ~30 GB by removing Android SDK / dotnet / Haskell / etc.
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Resolve source SHA
+        id: src
+        run: |
+          SHA=$(git ls-remote https://github.com/${{ matrix.repo }}.git ${{ matrix.ref }} | awk '{print $1}' | head -1)
+          if [ -z "$SHA" ]; then SHA="${{ matrix.ref }}"; fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Resolved ${{ matrix.repo }}@${{ matrix.ref }} → $SHA"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install gcc-15
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y gcc-15 g++-15 ccache ninja-build
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-15 90
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-15 90
+          gcc --version
+
+      - name: Install CUDA ${{ env.CUDA_VERSION }}
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          linux-local-args: '["--toolkit"]'
+          method: network
+          sub-packages: '["nvcc","cudart","cudart-dev","cudnn","cublas","cublas-dev","cufft","cufft-dev","curand","curand-dev","cusolver","cusolver-dev","cusparse","cusparse-dev","nvrtc","nvrtc-dev","nvtx"]'
+
+      - name: Configure nvcc → gcc-15
+        run: |
+          echo "NVCC_PREPEND_FLAGS=--compiler-bindir=/usr/bin/g++-15 --allow-unsupported-compiler" >> "$GITHUB_ENV"
+          echo "CUDACXX=ccache nvcc" >> "$GITHUB_ENV"
+          echo "CC=ccache gcc-15" >> "$GITHUB_ENV"
+          echo "CXX=ccache g++-15" >> "$GITHUB_ENV"
+          echo "TORCH_CUDA_ARCH_LIST=${{ env.TORCH_CUDA_ARCH_LIST }}" >> "$GITHUB_ENV"
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ matrix.name }}-${{ steps.src.outputs.sha }}-cuda${{ env.CUDA_VERSION }}-torch${{ env.TORCH_VERSION }}
+          restore-keys: |
+            ccache-${{ matrix.name }}-
+
+      - name: Configure ccache
+        run: |
+          ccache -M 5G
+          ccache -o compiler_check=content
+          ccache -z
+
+      - name: Install torch ${{ env.TORCH_VERSION }}
+        run: |
+          pip install --upgrade pip setuptools wheel
+          pip install --pre --extra-index-url ${{ env.TORCH_INDEX }} "torch==${{ env.TORCH_VERSION }}"
+          python -c "import torch; print(torch.__version__, torch.version.cuda)"
+
+      - name: Install build deps
+        run: pip install ninja packaging pybind11 cmake numpy einops
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo }}
+          ref: ${{ matrix.ref }}
+          submodules: ${{ matrix.submodules }}
+          path: src
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Apply patch
+        if: matrix.patch
+        run: |
+          cd src
+          git apply --verbose "$GITHUB_WORKSPACE/${{ matrix.patch }}"
+
+      - name: Build wheel
+        run: |
+          set -euo pipefail
+          BUILD_DIR="src${{ matrix.subdir && format('/{0}', matrix.subdir) || '' }}"
+          mkdir -p wheels
+          cd "$BUILD_DIR"
+          env ${{ matrix.extra_env }} \
+            pip wheel . --no-build-isolation --no-deps -w "$GITHUB_WORKSPACE/wheels" -v
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
+
+      - name: List wheels
+        run: ls -lh wheels/
+
+      - name: Upload wheels artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.name }}
+          path: wheels/*.whl
+          retention-days: 7
+
+  release:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: wheels
+
+      - name: List collected wheels
+        run: ls -lh wheels/
+
+      - name: Create / update Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="wheels-${{ needs.resolve.outputs.tag }}"
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" \
+              --title "cppmega wheels ${{ needs.resolve.outputs.tag }}" \
+              --notes "Auto-built by build-wheels.yml from commit ${{ github.sha }}." \
+              --prerelease
+          gh release upload "$TAG" wheels/*.whl --clobber
