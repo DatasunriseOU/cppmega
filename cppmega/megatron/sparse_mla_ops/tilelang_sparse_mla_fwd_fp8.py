@@ -20,6 +20,12 @@ from tilelang import language as T
 _tilelang_sparse_mla_fwd_fp8_kernel_cache = OrderedDict()
 _tilelang_sparse_mla_fwd_fp8_cache_lock = threading.Lock()
 _TE_FP8_QUANTIZER_CACHE = {}
+_TE_TENSORWISE_SPARSE_MLA_ALIASES = {
+    "te",
+    "te_current",
+    "te_tensorwise",
+    "tensorwise",
+}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -33,8 +39,15 @@ def _env_int(name: str, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
-def _fp8_quant_backend() -> str:
-    return os.getenv("CPPMEGA_SPARSE_MLA_FP8_QUANT", "local_per_token").strip().lower()
+def _enforce_te_tensorwise_quant_backend() -> None:
+    backend = os.getenv("CPPMEGA_SPARSE_MLA_FP8_QUANT", "te_tensorwise").strip().lower()
+    if backend not in _TE_TENSORWISE_SPARSE_MLA_ALIASES:
+        raise RuntimeError(
+            "CPPMEGA_SPARSE_MLA_FP8_QUANT no longer supports "
+            f"{backend!r}. SparseMLA FP8 is hard-wired to TE current/tensorwise "
+            "scaling because profiling showed the local per-token requant path "
+            "is slower and allocates much more temporary memory."
+        )
 
 
 def _te_fp8_dtype():
@@ -69,8 +82,7 @@ def _te_tensorwise_cast_to_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     """Cast with TE current scaling and broadcast its tensor scale per row.
 
     This intentionally preserves the TileLang kernel interface, not the old
-    per-row quantization granularity.  It is an aggressive A/B mode controlled
-    by CPPMEGA_SPARSE_MLA_FP8_QUANT=te_tensorwise.
+    per-row quantization granularity.
     """
     import transformer_engine  # noqa: F401
     import transformer_engine_torch as tex
@@ -382,34 +394,22 @@ def sparse_mla_fwd_fp8(
 
 
 def per_token_cast_to_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Cast a tensor to FP8 with per-token (per-row) scaling.
+    """Cast a tensor to FP8 using TE current/tensorwise scaling.
 
-    Matches the scaling convention from tile-ai/tilelang utils.py:
-    scale = absmax / 448.0, then x_fp8 = x / scale.
+    Historical name kept for SparseMLA call sites.  The old local per-token
+    requant path is intentionally removed: targeted profiling showed it spent
+    most of its time in abs/amax/div/copy kernels and allocated much larger
+    temporary buffers than TE current scaling.
 
     Args:
-        x: Input tensor [..., D]. Scaling is over the last dimension.
+        x: Input tensor [..., D].
 
     Returns:
-        (x_fp8, scales) where x_fp8 is float8_e4m3fn and scales is float32
-        with shape [...] (last dim removed).
+        (x_fp8, scales) where x_fp8 is float8_e4m3fn and the TE tensorwise
+        scale is broadcast to shape [...] for the existing TileLang kernel ABI.
     """
-    backend = _fp8_quant_backend()
-    if backend in {"te", "te_current", "te_tensorwise", "tensorwise"}:
-        return _te_tensorwise_cast_to_fp8(x)
-    if backend not in {"local", "local_per_token", "per_token", "rowwise"}:
-        raise ValueError(
-            "CPPMEGA_SPARSE_MLA_FP8_QUANT must be one of "
-            "local_per_token, te_tensorwise"
-        )
-
-    # Compute per-token absmax over the last dimension
-    x_float = x.float()
-    amax = x_float.abs().amax(dim=-1, keepdim=True).clamp(min=1e-4)
-    # Scale factor: maps max value to 448 (FP8 e4m3 max)
-    scale = amax / 448.0
-    x_scaled = (x_float / scale).to(torch.float8_e4m3fn)
-    return x_scaled, scale.squeeze(-1)
+    _enforce_te_tensorwise_quant_backend()
+    return _te_tensorwise_cast_to_fp8(x)
 
 
 def sparse_mla_fwd_fp8_interface(

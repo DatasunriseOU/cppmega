@@ -49,18 +49,29 @@ import torch
 
 log = logging.getLogger(__name__)
 
+_TE_TENSORWISE_SPARSE_MLA_ALIASES = {
+    "te",
+    "te_current",
+    "te_tensorwise",
+    "tensorwise",
+}
+
 
 def _sparse_mla_fp8_quant_backend() -> str:
-    return os.getenv("CPPMEGA_SPARSE_MLA_FP8_QUANT", "local_per_token").strip().lower()
+    backend = os.getenv("CPPMEGA_SPARSE_MLA_FP8_QUANT", "te_tensorwise").strip().lower()
+    if backend in _TE_TENSORWISE_SPARSE_MLA_ALIASES:
+        return "te_tensorwise"
+    raise RuntimeError(
+        "CPPMEGA_SPARSE_MLA_FP8_QUANT no longer supports "
+        f"{backend!r}. SparseMLA FP8 is hard-wired to TE current/tensorwise "
+        "scaling because profiling showed the local per-token requant path is "
+        "slower and allocates much more temporary memory."
+    )
 
 
 def _use_te_sparse_mla_fp8_zero_copy() -> bool:
-    return _sparse_mla_fp8_quant_backend() in {
-        "te",
-        "te_current",
-        "te_tensorwise",
-        "tensorwise",
-    }
+    _sparse_mla_fp8_quant_backend()
+    return True
 
 
 def _unwrap_quantized(t: torch.Tensor) -> torch.Tensor:
@@ -219,16 +230,12 @@ class SparseMLA_FP8(torch.autograd.Function):
             sparse_mla_fwd_fp8_interface,
         )
 
-        # Aggressive mode: extract raw FP8 data + scale from TE Float8Tensor
-        # directly, avoiding dequantize(fp8->bf16) + per-row re-quantize.
-        # TE current/tensorwise scaling changes the old per-token scale
-        # contract, so keep it behind CPPMEGA_SPARSE_MLA_FP8_QUANT.
-        if _use_te_sparse_mla_fp8_zero_copy():
-            q_fp8_data, q_te_scale = _extract_fp8_data(q)
-            kv_fp8_data, kv_te_scale = _extract_fp8_data(kv)
-        else:
-            q_fp8_data = q_te_scale = None
-            kv_fp8_data = kv_te_scale = None
+        # Always take the TE current/tensorwise path.  The old local per-token
+        # requant path materialized large BF16/FP32 temporaries and was slower
+        # in both targeted SparseMLA profiling and end-to-end step profiling.
+        _use_te_sparse_mla_fp8_zero_copy()
+        q_fp8_data, q_te_scale = _extract_fp8_data(q)
+        kv_fp8_data, kv_te_scale = _extract_fp8_data(kv)
 
         q_fp8 = None
         q_scale = None
