@@ -44,8 +44,128 @@ class QuantizedMuonMomentum:
         return self.data.dtype == torch.uint8
 
 
+@dataclass(frozen=True)
+class QuantizedMuonNormSegment:
+    """A flattened tensor segment that contributes to one normalization group.
+
+    `group_id` is the logical normalization group. For fused QKV tensors, use
+    the same `group_id` for every repeated Q, K, or V segment across query
+    groups, so the norm is accumulated per slice type rather than over the
+    whole fused QKV tensor.
+    """
+
+    tensor_index: int
+    start: int
+    length: int
+    group_id: int
+
+
+@dataclass(frozen=True)
+class QuantizedMuonNormPlan:
+    """Reusable block-to-normalization-group metadata.
+
+    `block_group_ids` has one int64 entry per quantization block across the
+    multi-tensor update list. Reusing this plan avoids rebuilding QKV/shard
+    metadata every optimizer step.
+    """
+
+    block_group_ids: torch.Tensor
+    num_groups: int
+
+
 def _num_blocks(n_elements: int, block_size: int = BLOCK_SIZE) -> int:
     return (n_elements + block_size - 1) // block_size
+
+
+def build_quantized_muon_norm_plan(
+    states: Sequence[QuantizedMuonMomentum],
+    segments: Sequence[QuantizedMuonNormSegment],
+    *,
+    num_groups: int | None = None,
+    require_full_coverage: bool = True,
+) -> QuantizedMuonNormPlan:
+    """Build reusable grouped-normalization metadata for the CUDA extension.
+
+    The plan is intentionally block-based: each 256-value quantization block
+    maps to exactly one normalization group. That makes the fused update kernel
+    cheap: after computing a block-local sumsq it performs one atomic add to the
+    appropriate group. Segment boundaries therefore must align with quantization
+    block boundaries, except for a segment ending at the tensor's final partial
+    block.
+
+    For tensor-parallel sharding, build the same logical group order on every
+    rank and pass `tp_group` to
+    `quantized_muon_momentum_update_multi_and_normalize_groups_`; local shard
+    sums are all-reduced before scaling.
+    """
+
+    if not states:
+        raise ValueError("states must not be empty")
+    if not segments:
+        raise ValueError("segments must not be empty")
+    device = states[0].data.device
+    if any(state.data.device != device for state in states):
+        raise ValueError("all states must be on the same device")
+    if any(state.block_size != BLOCK_SIZE for state in states):
+        raise ValueError(f"only block_size={BLOCK_SIZE} is implemented")
+
+    inferred_groups = max(segment.group_id for segment in segments) + 1
+    if num_groups is None:
+        num_groups = inferred_groups
+    if num_groups <= 0:
+        raise ValueError(f"num_groups must be positive, got {num_groups}")
+    if inferred_groups > num_groups:
+        raise ValueError(f"segments refer to group {inferred_groups - 1}, num_groups={num_groups}")
+
+    block_offsets: list[int] = [0]
+    for state in states:
+        block_offsets.append(block_offsets[-1] + _num_blocks(state.data.numel(), state.block_size))
+
+    block_group_ids = [-1] * block_offsets[-1]
+    for segment in segments:
+        if segment.tensor_index < 0 or segment.tensor_index >= len(states):
+            raise ValueError(f"invalid tensor_index {segment.tensor_index}")
+        if segment.group_id < 0 or segment.group_id >= num_groups:
+            raise ValueError(f"invalid group_id {segment.group_id}")
+        if segment.start < 0 or segment.length <= 0:
+            raise ValueError(f"invalid segment start/length: {segment}")
+
+        n = states[segment.tensor_index].data.numel()
+        end = segment.start + segment.length
+        if end > n:
+            raise ValueError(f"segment exceeds tensor {segment.tensor_index} numel={n}: {segment}")
+        if segment.start % BLOCK_SIZE != 0:
+            raise ValueError(f"segment start must align to block size {BLOCK_SIZE}: {segment}")
+        if end % BLOCK_SIZE != 0 and end != n:
+            raise ValueError(
+                f"segment end must align to block size {BLOCK_SIZE} or tensor end: {segment}"
+            )
+
+        first_block = segment.start // BLOCK_SIZE
+        last_block = _num_blocks(end, BLOCK_SIZE)
+        global_first = block_offsets[segment.tensor_index] + first_block
+        global_last = block_offsets[segment.tensor_index] + last_block
+        for block_idx in range(global_first, global_last):
+            previous = block_group_ids[block_idx]
+            if previous != -1 and previous != segment.group_id:
+                raise ValueError(
+                    f"overlapping normalization segments for global block {block_idx}: "
+                    f"{previous} vs {segment.group_id}"
+                )
+            block_group_ids[block_idx] = segment.group_id
+
+    if require_full_coverage:
+        try:
+            missing = block_group_ids.index(-1)
+        except ValueError:
+            missing = -1
+        if missing >= 0:
+            raise ValueError(f"normalization segments do not cover global block {missing}")
+
+    return QuantizedMuonNormPlan(
+        block_group_ids=torch.tensor(block_group_ids, device=device, dtype=torch.long),
+        num_groups=num_groups,
+    )
 
 
 def empty_quantized_momentum_like(
@@ -245,6 +365,167 @@ def quantized_muon_momentum_update_multi_with_sumsq_(
     return torch.cat([grad.float().square().reshape(-1).sum().reshape(1) for grad in grads])
 
 
+def quantized_muon_momentum_update_multi_with_group_sumsq_(
+    states: Sequence[QuantizedMuonMomentum],
+    grads: Sequence[torch.Tensor],
+    norm_plan: QuantizedMuonNormPlan,
+    *,
+    beta: float,
+) -> torch.Tensor:
+    """Update quantized momentum and return sumsq per normalization group.
+
+    This is the QKV/sharded variant of
+    `quantized_muon_momentum_update_multi_with_sumsq_`. Each 256-value
+    quantization block contributes to one logical norm group, so fused QKV can
+    accumulate Q, K, and V norms independently while still updating the
+    quantized momentum in one pass.
+    """
+
+    _validate_multi_update(states, grads, beta)
+    _validate_norm_plan(states, norm_plan)
+
+    unsigned = states[0].unsigned
+    grad_dtype = grads[0].dtype
+    if _can_use_cuda_ext(states, grads):
+        ext = _load_cuda_ext()
+        return ext.update_multi_with_group_sumsq_(
+            [state.data for state in states],
+            [state.absmax for state in states],
+            list(grads),
+            norm_plan.block_group_ids,
+            int(norm_plan.num_groups),
+            float(beta),
+            bool(unsigned),
+        )
+
+    quantized_muon_momentum_update_multi_(states, grads, beta=beta)
+    flat_group_ids = norm_plan.block_group_ids.cpu().tolist()
+    sums = torch.zeros((norm_plan.num_groups,), device=grads[0].device, dtype=torch.float32)
+    block_cursor = 0
+    for grad in grads:
+        flat = grad.float().reshape(-1)
+        for start in range(0, flat.numel(), BLOCK_SIZE):
+            group_id = flat_group_ids[block_cursor]
+            if group_id >= 0:
+                sums[group_id] += flat[start : start + BLOCK_SIZE].square().sum()
+            block_cursor += 1
+    return sums
+
+
+def quantized_muon_momentum_scale_multi_by_group_(
+    grads: Sequence[torch.Tensor],
+    norm_plan: QuantizedMuonNormPlan,
+    inv_norms: torch.Tensor,
+) -> Sequence[torch.Tensor]:
+    """Scale grad tensors in place by per-block group inverse norm."""
+
+    if not grads:
+        return grads
+    _validate_norm_plan_for_grads(grads, norm_plan)
+    if inv_norms.shape != (norm_plan.num_groups,):
+        raise ValueError(
+            f"inv_norms must have shape ({norm_plan.num_groups},), got {tuple(inv_norms.shape)}"
+        )
+    if inv_norms.device != grads[0].device:
+        raise ValueError("inv_norms must be on grad device")
+    if inv_norms.dtype != torch.float32:
+        raise ValueError(f"inv_norms must be float32, got {inv_norms.dtype}")
+    if not inv_norms.is_contiguous():
+        inv_norms = inv_norms.contiguous()
+
+    if _CUDA_EXT_ERROR is None and all(grad.is_cuda for grad in grads):
+        ext = _load_cuda_ext()
+        ext.scale_multi_by_group_(list(grads), norm_plan.block_group_ids, inv_norms)
+        return grads
+
+    flat_group_ids = norm_plan.block_group_ids.cpu().tolist()
+    block_cursor = 0
+    for grad in grads:
+        flat = grad.reshape(-1)
+        for start in range(0, flat.numel(), BLOCK_SIZE):
+            group_id = flat_group_ids[block_cursor]
+            if group_id >= 0:
+                flat[start : start + BLOCK_SIZE].mul_(inv_norms[group_id].to(grad.dtype))
+            block_cursor += 1
+    return grads
+
+
+def quantized_muon_momentum_scale_multi_by_group_from_sumsq_(
+    grads: Sequence[torch.Tensor],
+    norm_plan: QuantizedMuonNormPlan,
+    group_sumsq: torch.Tensor,
+    *,
+    eps: float = 1e-7,
+) -> Sequence[torch.Tensor]:
+    """Scale grad tensors in place by `rsqrt(max(group_sumsq, eps**2))`."""
+
+    if not grads:
+        return grads
+    _validate_norm_plan_for_grads(grads, norm_plan)
+    if group_sumsq.shape != (norm_plan.num_groups,):
+        raise ValueError(
+            f"group_sumsq must have shape ({norm_plan.num_groups},), got {tuple(group_sumsq.shape)}"
+        )
+    if group_sumsq.device != grads[0].device:
+        raise ValueError("group_sumsq must be on grad device")
+    if group_sumsq.dtype != torch.float32:
+        raise ValueError(f"group_sumsq must be float32, got {group_sumsq.dtype}")
+    if eps <= 0.0:
+        raise ValueError(f"eps must be positive, got {eps}")
+    if not group_sumsq.is_contiguous():
+        group_sumsq = group_sumsq.contiguous()
+
+    if _CUDA_EXT_ERROR is None and all(grad.is_cuda for grad in grads):
+        ext = _load_cuda_ext()
+        ext.scale_multi_by_group_from_sumsq_(
+            list(grads),
+            norm_plan.block_group_ids,
+            group_sumsq,
+            float(eps),
+        )
+        return grads
+
+    inv_norms = group_sumsq.clamp_min(eps * eps).rsqrt()
+    return quantized_muon_momentum_scale_multi_by_group_(grads, norm_plan, inv_norms)
+
+
+def quantized_muon_momentum_update_multi_and_normalize_groups_(
+    states: Sequence[QuantizedMuonMomentum],
+    grads: Sequence[torch.Tensor],
+    norm_plan: QuantizedMuonNormPlan,
+    *,
+    beta: float,
+    eps: float = 1e-7,
+    tp_group: torch.distributed.ProcessGroup | None = None,
+    return_inv_norms: bool = True,
+) -> torch.Tensor:
+    """Update quantized momentum and normalize each group in place.
+
+    This is the production path for fused QKV and sharded Muon tensors:
+    local group sums are computed inside the momentum update kernel, optionally
+    all-reduced across tensor-parallel ranks, then a grouped scale kernel turns
+    the updated BF16 grads into Newton-Schulz input.
+    """
+
+    group_sumsq = quantized_muon_momentum_update_multi_with_group_sumsq_(
+        states,
+        grads,
+        norm_plan,
+        beta=beta,
+    )
+    if tp_group is not None:
+        torch.distributed.all_reduce(group_sumsq, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+    quantized_muon_momentum_scale_multi_by_group_from_sumsq_(
+        grads,
+        norm_plan,
+        group_sumsq,
+        eps=eps,
+    )
+    if return_inv_norms:
+        return group_sumsq.clamp_min(eps * eps).rsqrt()
+    return group_sumsq
+
+
 def quantized_muon_momentum_update_multi_and_normalize_(
     states: Sequence[QuantizedMuonMomentum],
     grads: Sequence[torch.Tensor],
@@ -321,6 +602,68 @@ def _validate_update_inputs(
             raise ValueError(f"scratch must be bfloat16, got {scratch.dtype}")
         if not scratch.is_contiguous():
             raise ValueError("scratch must be contiguous for the prototype Triton kernel")
+
+
+def _validate_multi_update(
+    states: Sequence[QuantizedMuonMomentum],
+    grads: Sequence[torch.Tensor],
+    beta: float,
+) -> None:
+    if len(states) != len(grads):
+        raise ValueError(f"states and grads length mismatch: {len(states)} != {len(grads)}")
+    if not states:
+        raise ValueError("states must not be empty")
+    if not 0.0 <= beta <= 1.0:
+        raise ValueError(f"beta must be in [0, 1], got {beta}")
+    for state, grad in zip(states, grads):
+        _validate_update_inputs(state, grad, beta, scratch=grad)
+
+    unsigned = states[0].unsigned
+    if any(state.unsigned != unsigned for state in states):
+        raise ValueError("all quantized momentum states in one multi update must share storage dtype")
+    grad_dtype = grads[0].dtype
+    if any(grad.dtype != grad_dtype for grad in grads):
+        raise ValueError("all grad tensors in one multi update must share dtype")
+
+
+def _validate_norm_plan(
+    states: Sequence[QuantizedMuonMomentum],
+    norm_plan: QuantizedMuonNormPlan,
+) -> None:
+    if norm_plan.num_groups <= 0:
+        raise ValueError(f"num_groups must be positive, got {norm_plan.num_groups}")
+    if norm_plan.block_group_ids.dtype != torch.long:
+        raise ValueError("norm_plan.block_group_ids must be int64")
+    if not norm_plan.block_group_ids.is_contiguous():
+        raise ValueError("norm_plan.block_group_ids must be contiguous")
+    if norm_plan.block_group_ids.device != states[0].data.device:
+        raise ValueError("norm_plan.block_group_ids must be on state device")
+    expected_blocks = sum(_num_blocks(state.data.numel(), state.block_size) for state in states)
+    if norm_plan.block_group_ids.shape != (expected_blocks,):
+        raise ValueError(
+            f"norm_plan.block_group_ids must have shape ({expected_blocks},), "
+            f"got {tuple(norm_plan.block_group_ids.shape)}"
+        )
+
+
+def _validate_norm_plan_for_grads(
+    grads: Sequence[torch.Tensor],
+    norm_plan: QuantizedMuonNormPlan,
+) -> None:
+    if norm_plan.num_groups <= 0:
+        raise ValueError(f"num_groups must be positive, got {norm_plan.num_groups}")
+    if norm_plan.block_group_ids.dtype != torch.long:
+        raise ValueError("norm_plan.block_group_ids must be int64")
+    if not norm_plan.block_group_ids.is_contiguous():
+        raise ValueError("norm_plan.block_group_ids must be contiguous")
+    if norm_plan.block_group_ids.device != grads[0].device:
+        raise ValueError("norm_plan.block_group_ids must be on grad device")
+    expected_blocks = sum(_num_blocks(grad.numel(), BLOCK_SIZE) for grad in grads)
+    if norm_plan.block_group_ids.shape != (expected_blocks,):
+        raise ValueError(
+            f"norm_plan.block_group_ids must have shape ({expected_blocks},), "
+            f"got {tuple(norm_plan.block_group_ids.shape)}"
+        )
 
 
 def _can_use_cuda_ext(
