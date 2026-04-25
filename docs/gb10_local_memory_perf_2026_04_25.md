@@ -16,6 +16,8 @@ bf16 no-master fallback, and quantized Muon momentum.
   - keeps FlashAttention pinned with `--use-flash-attn --attention-backend flash`;
   - makes scalar fallback selectable via `CPPMEGA_MUON_SCALAR_OPTIMIZER`;
   - passes `--muon-quantized-momentum-block-size`;
+  - hard-pins precision-aware storage, when enabled, to
+    `main_grads=bf16`, `main_params=fp16`, and `exp_avg/exp_avg_sq=fp8`;
   - defaults `CPPMEGA_LOCAL_DDP_DISABLE_CONTIGUOUS_GRAD_BUFFER=1`;
   - adds local PyTorch profiler hooks;
   - adds an embedded `nsys profile` launch option;
@@ -35,6 +37,12 @@ did not commit it as a bulk Megatron change.
   quantized Muon. QKV tensors get separate Q/K/V norm groups, ordinary 2D tensors
   get one group per tensor, and the lowmem Newton-Schulz path is told the input
   is already normalized so it does not repeat the Frobenius normalization.
+- `megatron/training/arguments.py` and
+  `megatron/core/optimizer/optimizer_config.py`: enforce the aggressive dtype
+  ladder. BF16 training no longer auto-enables FP32 grad accumulation/reduction,
+  `--accumulate-allreduce-grads-in-fp32` is rejected, precision-aware main grads
+  are BF16, precision-aware main params are FP16, and precision-aware Adam
+  moments are FP8.
 - `megatron/core/fusions/fused_bias_gelu.py`: adds
   `MEGATRON_BIAS_GELU_IMPL={compiled,eager,te}`. The GB10 launcher defaults to
   `te` to avoid the worse Inductor path.
