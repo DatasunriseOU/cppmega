@@ -40,6 +40,11 @@
 #                            for a Path A comparison profile.
 set -euo pipefail
 
+CPPMEGA_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${CPPMEGA_SCRIPT_DIR}/lib/deprecated_guard.sh"
+cppmega_deprecated_script_guard "$(basename "$0")" \
+  "scripts/remote_train_h200_nam56r_noconv_nsys.sh"
+
 REMOTE_HOST="${REMOTE_HOST:-h200_1}"
 REMOTE_ZONE="${REMOTE_ZONE:-LOCATION_1}"
 REMOTE_ROOT="${REMOTE_ROOT:-/mnt/data/cppmega-root}"

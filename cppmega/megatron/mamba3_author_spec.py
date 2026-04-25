@@ -26,6 +26,18 @@ from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixerSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 
+from cppmega.megatron.deprecated_paths import require_deprecated_ack
+
+require_deprecated_ack(
+    feature="cppmega.megatron.mamba3_author_spec",
+    ack_env="CPPMEGA_I_UNDERSTAND_MAMBA3_AUTHOR_SPEC_IS_DEPRECATED",
+    replacement=(
+        "cppmega.megatron.nam56r_noconv_spec "
+        "build_cppmega_nam56r_noconv_stack_spec"
+    ),
+    reason="Author scan kernels are no longer the default debug/training path.",
+)
+
 from cppmega.megatron.mamba3_te_mixer import CppMegaMamba3TE
 from cppmega.megatron.nam56r_layout import has_megatron_dsa_symbol
 

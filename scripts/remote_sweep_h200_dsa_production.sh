@@ -44,6 +44,11 @@
 #   bash scripts/drive_sweep_dsa_production.sh
 set -euo pipefail
 
+CPPMEGA_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${CPPMEGA_SCRIPT_DIR}/lib/deprecated_guard.sh"
+cppmega_deprecated_script_guard "$(basename "$0")" \
+  "scripts/remote_smoke_h200_dsa_9_4_m.sh with VARIANT=v3 or VARIANT=v1"
+
 # Source .bashrc for cuDNN/NCCL paths
 [ -f "${HOME}/.bashrc" ] && source "${HOME}/.bashrc"
 
