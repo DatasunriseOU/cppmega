@@ -45,8 +45,24 @@ def test_te_fp8_saved_tensors_hooks_backward(monkeypatch):
     assert torch.isfinite(x.grad).all()
 
 
-def test_legacy_fp8_activation_backend_still_available(monkeypatch):
+def test_legacy_fp8_activation_backend_fails_without_ack(monkeypatch):
     monkeypatch.setenv("CPPMEGA_FP8_ACTIVATION_BACKEND", "legacy")
+    monkeypatch.delenv(
+        "CPPMEGA_I_UNDERSTAND_FP8_ACTIVATION_LEGACY_BACKEND_IS_DEPRECATED_AND_SYNCY",
+        raising=False,
+    )
+    x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+
+    with pytest.raises(RuntimeError, match="FP8_ACTIVATION_LEGACY_BACKEND"):
+        fp8.FP8ActivationPacker.pack(x)
+
+
+def test_legacy_fp8_activation_backend_still_available_with_ack(monkeypatch):
+    monkeypatch.setenv("CPPMEGA_FP8_ACTIVATION_BACKEND", "legacy")
+    monkeypatch.setenv(
+        "CPPMEGA_I_UNDERSTAND_FP8_ACTIVATION_LEGACY_BACKEND_IS_DEPRECATED_AND_SYNCY",
+        "1",
+    )
     x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
 
     packed = fp8.FP8ActivationPacker.pack(x)
