@@ -956,3 +956,16 @@ kernel rework, not hours.
   first use TE 2.14 MXFP8/NVFP4 tensors + `generic_gemm` for dense GEMM
   paths; use CuTe DSL only as the custom fused SparseMLA escape hatch; do not
   use RightNow-Tile in the training hot path.
+- [x] TE/CUDA MXFP8 backward follow-up documented in
+  `docs/te_mxfp8_backward_gb10_plan_2026_04_25.md`: native no-transpose
+  `NN/NT` is the exact math but still has no GB10 cuBLASLt algorithm; Python
+  no-copy metadata tricks are wrong. A probe-only transposed-emission CUDA
+  extension emits the supported `TN` compact layout from BF16 source and
+  matches the copy adapter exactly while avoiding existing MXFP8 payload copies.
+- [x] Experimental fused MXFP8 SparseMLA forward landed behind
+  `CPPMEGA_SPARSE_MLA_BLOCKSCALED_FUSED=1`; it fuses blockscaled QK, online
+  softmax, and PV without full sparse-score or BF16 Q/K/V materialization.
+  Backward remains fail-closed: explicit BF16 reference requires
+  `CPPMEGA_SPARSE_MLA_BLOCKSCALED_BWD_REFERENCE_ACK=1`, and the unsafe
+  TileLang backward prototype is debug-only. Details are in
+  `docs/sparse_mla_blockscaled_fused_backend_2026_04_25.md`.
