@@ -27,15 +27,15 @@ for GB10).
 
 **Script**: `scripts/run_bench3_golden_fp8.sh`
 
-| Item | Value |
-|---|---|
-| Model | NAM56R (52 hybrid Mamba3-MIMO + 9 DSA + 4 full-attn, MoE 16 experts) |
-| Hardware | 8x H200 SXM, LOCATION_1 (`h200_1`) |
-| Precision | FP8 tensorwise (`--fp8-format hybrid`) |
-| Topology | TP=1 PP=1 EP=8 DP=1, MBS=10 GBS=80, seq=4096, MTP=2 |
-| Target throughput | **268 TFLOP/s ± 0.5** (27.1% MFU) |
-| Peak memory | ~115 GiB / 141 GiB per rank (`CG_FLAGS=NONE` mandatory) |
-| Iters | 15 (override via `TRAIN_ITERS`) |
+| Item              | Value                                                                |
+| ----------------- | -------------------------------------------------------------------- |
+| Model             | NAM56R (52 hybrid Mamba3-MIMO + 9 DSA + 4 full-attn, MoE 16 experts) |
+| Hardware          | 8x H200 SXM, LOCATION_1 (`h200_1`)                                   |
+| Precision         | FP8 tensorwise (`--fp8-format hybrid`)                               |
+| Topology          | TP=1 PP=1 EP=8 DP=1, MBS=10 GBS=80, seq=4096, MTP=2                  |
+| Target throughput | **268 TFLOP/s ± 0.5** (27.1% MFU)                                    |
+| Peak memory       | ~115 GiB / 141 GiB per rank (`CG_FLAGS=NONE` mandatory)              |
+| Iters             | 15 (override via `TRAIN_ITERS`)                                      |
 
 **Active patches** — see README.md "Always On" + "Env-Gated":
 - Always on: MTP Liger CE, Mamba LinearCE class-swap, DSA indexer fused per-head bmm, Mamba3 regional torch.compile
@@ -74,15 +74,15 @@ bash scripts/launch.sh bench3-fp8
 
 **Script**: `scripts/run_europe_baseline_bf16.sh`
 
-| Item | Value |
-|---|---|
-| Model | NAM56R (identical to bench3 variant) |
-| Hardware | 8x H200 SXM, LOCATION_2 (`h200_1`) |
-| Precision | BF16 (FP8 regresses -34% on this fabric) |
-| Topology | TP=1 PP=1 EP=4 DP=2, MBS=8 GBS=64, seq=4096, MTP=2 |
-| Target throughput | **289 TFLOP/s** (29.2% MFU) — europe gold record |
-| Peak memory | ~127 GiB / 141 GiB per rank (MBS=10 OOMs) |
-| Iters | 15 (override via `TRAIN_ITERS`) |
+| Item              | Value                                              |
+| ----------------- | -------------------------------------------------- |
+| Model             | NAM56R (identical to bench3 variant)               |
+| Hardware          | 8x H200 SXM, LOCATION_2 (`h200_1`)                 |
+| Precision         | BF16 (FP8 regresses -34% on this fabric)           |
+| Topology          | TP=1 PP=1 EP=4 DP=2, MBS=8 GBS=64, seq=4096, MTP=2 |
+| Target throughput | **289 TFLOP/s** (29.2% MFU) — europe gold record   |
+| Peak memory       | ~127 GiB / 141 GiB per rank (MBS=10 OOMs)          |
+| Iters             | 15 (override via `TRAIN_ITERS`)                    |
 
 **Active patches**: same unconditional set as bench3; same opt-in gates
 (IndexCache, lemyx, Liger main-head CE). No FP8 flags.
@@ -119,12 +119,12 @@ to a full training run. Identical config to `bench3-fp8` except
 `TRAIN_ITERS=7`, so it finishes in ~90 seconds including model load and
 TileLang JIT compile.
 
-| Item | Value |
-|---|---|
-| Hardware | same as `bench3-fp8` (8x H200, bench3) |
-| Iters | 7 |
-| Target | TFLOP/s converging to 260-268 by iter 4-7 |
-| Peak memory | ~115 GiB (same as golden) |
+| Item        | Value                                     |
+| ----------- | ----------------------------------------- |
+| Hardware    | same as `bench3-fp8` (8x H200, bench3)    |
+| Iters       | 7                                         |
+| Target      | TFLOP/s converging to 260-268 by iter 4-7 |
+| Peak memory | ~115 GiB (same as golden)                 |
 
 **Login + run**:
 ```bash
@@ -163,14 +163,14 @@ A correctness check, **not** a throughput run: verifies TileLang kernels
 compile under the sm_121 99 KiB smem cap (no tcgen05, no WGMMA, no TMEM)
 and produce finite grads end-to-end.
 
-| Item | Value |
-|---|---|
-| Model | NAM56R, EP=1 (no MoE routing; 1 expert/rank) |
-| Hardware | 1x NVIDIA GB10 (Grace+Blackwell, sm_121, 128 GB unified) |
+| Item      | Value                                                                                      |
+| --------- | ------------------------------------------------------------------------------------------ |
+| Model     | NAM56R, EP=1 (no MoE routing; 1 expert/rank)                                               |
+| Hardware  | 1x NVIDIA GB10 (Grace+Blackwell, sm_121, 128 GB unified)                                   |
 | Precision | BF16 (FP8 is a dead path on GB10 — 0.73-0.91x, see `reference_fp8_mamba_ssm_dead_path.md`) |
-| Topology | TP=1 PP=1 EP=1 DP=1, MBS=1 GBS=1, seq=2048, MTP=0 |
-| Target | all iters complete, `grad_norm` finite, preflight smem check passes |
-| Iters | 5 (override via `TRAIN_ITERS`) |
+| Topology  | TP=1 PP=1 EP=1 DP=1, MBS=1 GBS=1, seq=2048, MTP=0                                          |
+| Target    | all iters complete, `grad_norm` finite, preflight smem check passes                        |
+| Iters     | 5 (override via `TRAIN_ITERS`)                                                             |
 
 **Preflight smem check**: enable with `CPPMEGA_SMEM_CHECK=1` (default in
 the script). Promotes to hard fail with `CPPMEGA_SMEM_CHECK_STRICT=1`. See
