@@ -920,3 +920,25 @@ Every smoke test uses:
 Expected ceiling after this 10-hour block: **bench3 ~270, europe ~310,
 MFU ~31%**. Past that we're into P3/P4/P5 territory which is weeks of
 kernel rework, not hours.
+
+---
+
+## 2026-04-25 — SparseMLA FP8 and block-scaled GEMM direction
+
+- [x] Added explicit SparseMLA FP8 quantization backend switch:
+  `CPPMEGA_SPARSE_MLA_FP8_QUANT=local_per_token|te_tensorwise`.
+- [x] Kept `local_per_token` as default; `te_tensorwise` is now the
+  aggressive zero-copy TE `Float8Tensor` path.
+- [x] Ran local GB10 quarter-model A/B at `MBS=4`, 5 train steps:
+  - `local_per_token`: stable iter 3-5 = 4371.8 ms, 3747.7 tok/s,
+    step-5 train loss 7.336141, val/test 5.958006 / 6.006602.
+  - `te_tensorwise`: stable iter 3-5 = 4413.8 ms, 3712.0 tok/s,
+    step-5 train loss 7.383913, val/test 5.918729 / 5.907243.
+- [x] Installed/probed RightNow-Tile at `/tmp/RightNow-Tile`; it builds, but
+  it is a TypeScript CUDA-to-cuTile transpiler UI, not a runtime kernel source
+  for TE/cuBLAS block-scaled GEMM.
+- [x] Chosen direction documented in
+  `docs/sparse_mla_blockscaled_gemm_plan_2026_04_25.md`:
+  first use TE 2.14 MXFP8/NVFP4 tensors + `generic_gemm` for dense GEMM
+  paths; use CuTe DSL only as the custom fused SparseMLA escape hatch; do not
+  use RightNow-Tile in the training hot path.

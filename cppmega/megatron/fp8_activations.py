@@ -5,17 +5,13 @@ decompresses to bf16 during recompute. Saves ~2x activation memory with
 minimal quality impact.
 
 Two modes:
-1. **Native PyTorch** (default): Custom pack/unpack hooks for torch.utils.checkpoint.
-   Works on any SM90+ GPU, no extra dependencies.
+1. **Transformer Engine** (default when installed): TE current-scaling FP8
+   quantize/dequantize hooks for torch.utils.checkpoint.
 2. **COAT** (optional): NVlabs COAT library (ICLR 2025) for mixed-granularity
    quantization + FP8 optimizer states. Requires `pip install fp8-coat`.
 
-Pack/unpack use fused Triton kernels when available (CUDA + triton installed):
-- **Fused pack** (2 launches instead of 3+): _amax_kernel fuses abs()+amax()
-  into one reduction pass, _quantize_kernel fuses scale+clamp+cast into one pass.
-- **Fused unpack** (1 launch instead of 2): _fp8_unpack_kernel fuses
-  FP8-to-dtype cast + scale multiply into a single pass.
-Falls back to unfused PyTorch ops on non-CUDA devices or when triton is absent.
+Pack/unpack falls back to the older Triton/PyTorch path if TE is unavailable or
+CPPMEGA_FP8_ACTIVATION_BACKEND=legacy is set.
 
 Usage:
     from nanochat.fp8_activations import enable_fp8_activation_checkpointing
@@ -44,6 +40,17 @@ from typing import TYPE_CHECKING, Any, Callable, TypeAlias, cast
 import torch
 
 logger = logging.getLogger(__name__)
+
+try:
+    import transformer_engine  # noqa: F401
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor import Float8CurrentScalingQuantizer
+
+    _TE_AVAILABLE = True
+except ImportError:
+    tex = None  # type: ignore[assignment]
+    Float8CurrentScalingQuantizer = None  # type: ignore[assignment]
+    _TE_AVAILABLE = False
 
 # FP8 dtype for activations (e4m3 = 4 exponent, 3 mantissa, no NaN encoding)
 _FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
@@ -84,7 +91,7 @@ except ImportError:
 
 PackedActivation: TypeAlias = (
     torch.Tensor
-    | tuple[torch.Tensor, torch.Tensor, torch.dtype]
+    | tuple[Any, Any, torch.dtype]
     | int
     | None
 )
@@ -109,6 +116,26 @@ else:
 
 # FP8 e4m3fn max value, computed once at import time
 _FP8_MAX: float = torch.finfo(_FP8_DTYPE).max if _FP8_DTYPE is not None else 448.0
+_TE_PACK_SENTINEL = "te_fp8"
+_TE_QUANTIZER_CACHE: dict[tuple[int, int], Any] = {}
+
+
+def _torch_dtype_to_te(dtype: torch.dtype):
+    if tex is None:
+        raise RuntimeError("Transformer Engine is not available")
+    if dtype == torch.bfloat16:
+        return tex.DType.kBFloat16
+    if dtype == torch.float16:
+        return tex.DType.kFloat16
+    if dtype == torch.float32:
+        return tex.DType.kFloat32
+    raise TypeError(f"unsupported FP8 activation unpack dtype: {dtype}")
+
+
+def _te_fp8_dtype():
+    if tex is None:
+        raise RuntimeError("Transformer Engine is not available")
+    return tex.DType.kFloat8E4M3
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -468,6 +495,38 @@ def _unfused_fp8_unpack(fp8_tensor: torch.Tensor, scale: torch.Tensor, orig_dtyp
     return fp8_tensor.to(orig_dtype) * scale
 
 
+def _te_quantizer_for(device: torch.device):
+    if not _TE_AVAILABLE or tex is None or Float8CurrentScalingQuantizer is None:
+        raise RuntimeError("Transformer Engine FP8 quantizer is not available")
+    if device.type != "cuda":
+        raise RuntimeError("Transformer Engine FP8 activation pack requires CUDA tensors")
+    index = torch.cuda.current_device() if device.index is None else device.index
+    key = (index, int(_te_fp8_dtype()))
+    quantizer = _TE_QUANTIZER_CACHE.get(key)
+    if quantizer is None:
+        quantizer = Float8CurrentScalingQuantizer(
+            _te_fp8_dtype(),
+            device=torch.device("cuda", index),
+            rowwise=True,
+            columnwise=False,
+        )
+        _TE_QUANTIZER_CACHE[key] = quantizer
+    return quantizer
+
+
+def _te_fp8_pack(tensor: torch.Tensor, *, clamp: bool = False):
+    """Pack with Transformer Engine current-scaling FP8, without CPU sync."""
+    if clamp:
+        tensor = tensor.clamp(-_FP8_MAX, _FP8_MAX)
+    fp8_tensor = tex.quantize(tensor, _te_quantizer_for(tensor.device))  # type: ignore[union-attr]
+    return (_TE_PACK_SENTINEL, fp8_tensor, tensor.dtype)
+
+
+def _te_fp8_unpack(fp8_tensor: Any, orig_dtype: torch.dtype) -> torch.Tensor:
+    """Unpack a TE Float8Tensor to the original tensor dtype."""
+    return tex.dequantize(fp8_tensor, _torch_dtype_to_te(orig_dtype))  # type: ignore[union-attr]
+
+
 def is_fp8_activation_available() -> bool:
     """Check if FP8 activation compression is available."""
     return _FP8_AVAILABLE
@@ -479,11 +538,24 @@ def is_coat_available() -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Native PyTorch FP8 activation checkpoint hooks
+# FP8 activation checkpoint hooks
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _use_te_packer() -> bool:
+    """Return True if Transformer Engine should pack saved activations."""
+    backend = os.environ.get("CPPMEGA_FP8_ACTIVATION_BACKEND", "te").lower()
+    if backend in {"legacy", "triton", "torch"}:
+        return False
+    if backend not in {"te", "transformer_engine", "auto"}:
+        logger.warning(
+            "Unknown CPPMEGA_FP8_ACTIVATION_BACKEND=%s; using Transformer Engine if available.",
+            backend,
+        )
+    return _TE_AVAILABLE and torch.cuda.is_available()
+
+
 def _use_triton_fused() -> bool:
-    """Return True if fused Triton FP8 kernels should be used.
+    """Return True if legacy fused Triton FP8 kernels should be used.
 
     Can be disabled via NANOCHAT_FP8_NO_TRITON=1. Needed on torch 2.12
     nightly + triton 3.7 + sm90 where inductor async precompile of the
@@ -492,6 +564,8 @@ def _use_triton_fused() -> bool:
     then div().clamp().to(fp8)) gets fused by inductor transparently.
     """
     if os.environ.get("NANOCHAT_FP8_NO_TRITON", "0") == "1":
+        return False
+    if os.environ.get("CPPMEGA_FP8_NO_TRITON", "0") == "1":
         return False
     return _TRITON_AVAILABLE and torch.cuda.is_available()
 
@@ -504,11 +578,10 @@ class FP8ActivationPacker:
 
     Memory savings: ~2x on activation tensors (bf16=2B -> fp8=1B per element).
 
-    When Triton is available (CUDA), uses fused kernels that reduce
-    kernel launch overhead:
-    - pack: 2 launches instead of 3+ (fused amax reduction + fused quantize)
-    - unpack: 1 launch instead of 2 (fused cast + multiply)
-    Falls back to unfused PyTorch ops on non-CUDA devices.
+    The default CUDA backend uses Transformer Engine current-scaling quantize
+    and dequantize, avoiding the host-side scale readback in the legacy path.
+    Set CPPMEGA_FP8_ACTIVATION_BACKEND=legacy to use the older Triton/PyTorch
+    implementation.
     """
 
     @staticmethod
@@ -529,6 +602,8 @@ class FP8ActivationPacker:
         # assert_size_stride failures in torch.compile's backward graph.
         tensor = tensor.contiguous()
 
+        if _use_te_packer() and tensor.is_cuda:
+            return _te_fp8_pack(tensor)
         if _use_triton_fused() and tensor.is_cuda:
             return _triton_fp8_pack(tensor)
         return _unfused_fp8_pack(tensor)
@@ -539,6 +614,8 @@ class FP8ActivationPacker:
         if not isinstance(packed, tuple) or len(packed) != 3:
             return cast(torch.Tensor, packed)
         fp8_tensor, scale, orig_dtype = packed
+        if isinstance(fp8_tensor, str) and fp8_tensor == _TE_PACK_SENTINEL:
+            return _te_fp8_unpack(scale, orig_dtype)
         if fp8_tensor.numel() < _FP8_MIN_ELEMENTS:
             logger.debug(
                 "FP8 unpack: tensor with %d elements (< %d threshold) was quantized",
@@ -555,8 +632,8 @@ class ClampingFP8Packer:
 
     This replaces the old per-forward ``--fp8_activation_clamp`` path that added
     two extra ``.clamp()`` kernel launches per MLP layer on every forward pass.
-    By moving the clamp into the pack hook, it piggybacks on the quantisation
-    pass that already touches every element, eliminating per-forward overhead.
+    The default TE backend applies the clamp immediately before TE quantization;
+    the legacy Triton backend can still fold it into its quantization kernel.
 
     The clamp prevents a single outlier from inflating the per-tensor scale
     factor.  Without it, one large value can cause the scale to be very large,
@@ -576,6 +653,8 @@ class ClampingFP8Packer:
 
         tensor = tensor.contiguous()
 
+        if _use_te_packer() and tensor.is_cuda:
+            return _te_fp8_pack(tensor, clamp=True)
         if _use_triton_fused() and tensor.is_cuda:
             return _triton_fp8_pack(tensor, clamp=True)
         return _unfused_fp8_pack(tensor, clamp=True)
