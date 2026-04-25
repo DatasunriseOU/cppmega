@@ -15,6 +15,12 @@ Current checkpoint:
   pass.
 - GB10 launch scripts are pinned to Muon with no-master BF16 fallback and
   Adam8bit fallback for scalar/non-2D parameters.
+- Local Megatron `TensorParallelMuon` is patched to use quantized momentum
+  state instead of `state["momentum_buffer"].lerp_` when
+  `--muon-quantized-momentum` is set.
+- QKV split correctness is preserved by feeding the updated BF16 grad through
+  the existing per-slice `orthogonalize()` path. Fused sliced normalization is
+  still a follow-up.
 
 Verified:
 
@@ -28,41 +34,68 @@ Result:
 8 passed
 ```
 
+Local GB10 quarter smoke:
+
+```bash
+CPPMEGA_TRAIN_ITERS=1 CPPMEGA_MICRO_BATCH_SIZE=4 CPPMEGA_GLOBAL_BATCH_SIZE=4 \
+  scripts/local_gb10_quarter_train.sh
+```
+
+Result:
+
+```text
+lm loss 1.165463E+01, mtp_1 loss 1.164793E+01, grad norm ~76.95,
+skipped 0, nan 0, max allocated 27760.22 MB, max reserved 29524.00 MB
+```
+
+Nsight Systems microbench:
+
+```text
+/home/dave/logs/qmuon_microbench_nsys.nsys-rep
+qmuon_update_multi_kernel: 21 launches, 9.304 ms total
+```
+
+Torch profiler found and fixed wrapper overhead in the CUDA extension:
+
+```text
+before: 5 CUDA metadata allocations + 5 H2D copies per multi-update call
+after:  1 CUDA metadata allocation  + 1 H2D copy  per multi-update call
+trace:  /home/dave/logs/qmuon_torch_profiler_packed_meta
+```
+
 Next implementation target:
 
-1. Wire quantized momentum into Megatron Muon in
-   `/home/dave/megatron-lm/megatron/core/optimizer/emerging_optimizers.py`.
-2. Replace:
-
-   ```python
-   state["momentum_buffer"].lerp_(grad, 1 - group["momentum"])
-   ```
-
-   with quantized state plus:
+1. Make the local Megatron patch durable without swallowing unrelated dirty
+   Megatron worktree changes.
+2. Add checkpoint/state_dict handling for `quantized_momentum_buffer`.
+3. Replace remaining unfused normalization where safe:
+   - non-QKV tensors can use update plus fused sumsq/norm directly;
+   - fused QKV tensors need grouped/sliced sumsq so Q, K, and V norms remain
+     independent.
+4. Keep this invariant:
 
    ```python
    quantized_muon_momentum_update_multi_(q_states, grads, beta=group["momentum"])
    ```
 
-3. Do not allocate `state["momentum_buffer"]` in quantized mode.
-4. Reuse `p.grad` as the BF16 Newton-Schulz input after the update kernel.
-5. Preserve current QKV correctness:
-   - fused QKV parameters must still split Q/K/V before orthogonalization;
-   - Q, K, and V norms must be computed independently;
-   - do not normalize the whole fused QKV matrix as one tensor.
-6. Keep router scalar/bias/gating, RMSNorm, bias, embedding, output, and other
+5. Do not allocate `state["momentum_buffer"]` in quantized mode.
+6. Reuse `p.grad` as the BF16 Newton-Schulz input after the update kernel.
+7. Keep router scalar/bias/gating, RMSNorm, bias, embedding, output, and other
    non-2D fallback parameters on no-master BF16-state Adam8bit.
 
 Profiling sequence after short training works:
 
-1. Run 50-200 steps on real clang 4k data and compare loss, grad norm,
+1. Fix full-training profiling capture: wrapper-level `nsys` captured setup
+   and microbench kernels but not the optimizer worker reliably.
+2. Run 50-200 steps on real clang 4k data and compare loss, grad norm,
    skipped iterations, tokens/sec, CUDA max allocated/reserved.
-2. Run nsys and torch profiler on the optimizer step.
-3. Inspect Nsight Systems kernel timeline for update, normalization,
+3. Run nsys and torch profiler on the optimizer step.
+4. Inspect Nsight Systems kernel timeline for update, normalization,
    Newton-Schulz matmul/SYRK, and allocation spikes.
-4. Use Nsight Compute on the quantized momentum kernel for throughput,
-   occupancy, register pressure, and shared-memory reductions.
-5. Fuse in this order:
+5. Use Nsight Compute on the quantized momentum kernel after GB10 performance
+   counter access is enabled. Current `ncu` attempt fails with
+   `ERR_NVGPUCTRPERM`.
+6. Fuse in this order:
    - momentum update plus sumsq and in-place normalization;
    - QKV grouped/sliced sumsq in the same update pass;
    - transpose/normalization handling for tall matrices where it avoids copies;
