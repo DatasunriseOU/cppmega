@@ -69,10 +69,10 @@ Device: NVIDIA GB10, CUDA capability `(12, 1)`.
 
 ```text
 Triton separate scratch update:     0.4548 ms
-CUDA multi in-place update:         0.4626 ms
-CUDA update + fused sumsq + norm:   0.7704 ms
-CUDA update + torch norm/div:       0.8646 ms
-BF16 momentum.lerp_:                0.4266 ms
+CUDA multi in-place update:         0.4454 ms
+CUDA update + fused sumsq + norm:   0.7543 ms
+CUDA update + torch norm/div:       0.8477 ms
+BF16 momentum.lerp_:                0.4192 ms
 ```
 
 `65536 x 3584`, int8 state:
@@ -94,6 +94,41 @@ Interpretation:
 - The update-and-normalize path is already faster than update followed by
   ordinary torch norm/div because the sum-of-squares work is fused into the
   momentum update pass.
+
+Nsight Systems microbench capture:
+
+```text
+/home/dave/logs/qmuon_microbench_nsys.nsys-rep
+```
+
+Top relevant kernels for `4096 x 4096`, int8, 5 measured iterations:
+
+```text
+qmuon_update_multi_kernel:          21 launches, 9.304 ms total
+_quantized_muon_momentum_update:    13 launches, 5.769 ms total
+BF16 torch norm reduce:              7 launches, 1.089 ms total
+```
+
+The symbolized `qmuon_update_multi_kernel` is the CUDA multi-tensor in-place
+path. The remaining `_quantized_muon_momentum_update_kernel` launches are from
+the older single-tensor benchmark path, retained for parity comparison.
+
+PyTorch profiler found that the initial extension wrapper was allocating and
+copying five small metadata arrays on every multi-update call. That is now
+packed into one metadata tensor and one H2D copy:
+
+```text
+before: aten::empty 50 calls, HtoD memcpy 50 calls per 10 updates
+after:  aten::empty 10 calls, HtoD memcpy 10 calls per 10 updates
+```
+
+Post-patch profiler trace:
+
+```text
+/home/dave/logs/qmuon_torch_profiler_packed_meta
+qmuon_update_multi_kernel: 10 launches, 4.430 ms total, 443 us avg
+Memcpy HtoD metadata:      10 copies,   4.256 us total
+```
 
 ## Correctness Coverage
 
@@ -121,10 +156,17 @@ The tests cover:
 
 ## Known Limitations
 
-- This is not yet wired into Megatron `TensorParallelMuon.step`.
+- A local Megatron worktree integration exists in
+  `/home/dave/megatron-lm/megatron/core/optimizer/emerging_optimizers.py`.
+  It is intentionally not committed from this repository because the Megatron
+  worktree is a detached, heavily dirty checkout with many unrelated local
+  changes.
 - Current state_dict/checkpoint integration is not implemented.
-- QKV split normalization must be handled per Q/K/V slice, not over the fused
-  QKV tensor as a whole.
+- Current Megatron integration preserves QKV correctness by reusing the
+  existing `orthogonalize()` path after the quantized momentum update. That
+  means Q/K/V are still split and normalized independently. The fused
+  update-and-normalize helper is not used for QKV yet because it currently
+  computes one global norm over its tensor list.
 - Stochastic rounding is not implemented yet. The current kernel uses nearest
   rounding to keep parity debugging simple.
 - The CUDA kernel handles contiguous tensors only.
@@ -132,9 +174,9 @@ The tests cover:
   tensor list. Megatron QKV split integration must call it per slice or add a
   grouped/sliced normalization mode.
 
-## Next Integration Target
+## Local Megatron Integration
 
-Replace the current Megatron/Emerging path:
+The local Megatron patch replaces the current Emerging optimizer path:
 
 ```python
 state["momentum_buffer"].lerp_(grad, 1 - group["momentum"])
@@ -150,3 +192,28 @@ quantized_muon_momentum_update_multi_(q_states, grads, beta=group["momentum"])
 For the low-memory Newton-Schulz path, use the grad tensor itself as the BF16
 input. For QKV parameters, split Q/K/V first and normalize each slice
 independently before Newton-Schulz, matching current Muon behavior.
+
+Smoke result on the local GB10 quarter NAM56R launcher:
+
+```text
+CPPMEGA_TRAIN_ITERS=1 CPPMEGA_MICRO_BATCH_SIZE=4 CPPMEGA_GLOBAL_BATCH_SIZE=4 \
+  scripts/local_gb10_quarter_train.sh
+```
+
+Observed result:
+
+```text
+iteration:      1/1
+lm loss:        1.165463E+01
+mtp_1 loss:     1.164793E+01
+grad norm:      ~76.95
+skipped/nan:    0/0
+max allocated:  27760.22 MB
+max reserved:   29524.00 MB
+```
+
+Important profiling note: profiling the wrapper training script with `nsys`
+did not capture the optimizer worker reliably yet. The extension microbench
+does capture and symbolize the `qmuon_update_multi_kernel`; the full training
+profile still needs either direct `torchrun` profiling or an explicit
+Megatron/PyTorch profiler window around `optimizer.step()`.
