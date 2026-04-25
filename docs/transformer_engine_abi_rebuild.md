@@ -6,11 +6,11 @@ How to keep Transformer Engine working after a `torch` nightly upgrade. Applies 
 
 NVIDIA publishes three TE artifacts per release, but **only two of them are prebuilt wheels** — the third is deliberately ship-as-sdist because it links against libtorch:
 
-| package | artifact on PyPI | ABI-sensitive to torch? |
-|---|---|---|
-| `transformer_engine` | `py3-none-any` wheel | no (pure Python metapackage) |
-| `transformer_engine_cu13` | `manylinux_2_28_<arch>` wheel (~258 MB) | no (links only CUDA runtime / cuDNN) |
-| `transformer_engine_torch` | **sdist only** (`.tar.gz`, ~300 KB) | **yes** — C++ shim binding TE core to PyTorch C++ API |
+| package                    | artifact on PyPI                        | ABI-sensitive to torch?                               |
+| -------------------------- | --------------------------------------- | ----------------------------------------------------- |
+| `transformer_engine`       | `py3-none-any` wheel                    | no (pure Python metapackage)                          |
+| `transformer_engine_cu13`  | `manylinux_2_28_<arch>` wheel (~258 MB) | no (links only CUDA runtime / cuDNN)                  |
+| `transformer_engine_torch` | **sdist only** (`.tar.gz`, ~300 KB)     | **yes** — C++ shim binding TE core to PyTorch C++ API |
 
 `transformer_engine_torch` is therefore always built locally at install-time against whatever torch is currently installed. If you later upgrade torch and the C++ ABI of libtorch changes, the previously-compiled shim keeps referencing symbols that no longer exist → `ImportError: undefined symbol: ...`.
 
@@ -53,13 +53,13 @@ Pin the three versions identically — `transformer_engine_torch`'s `setup.py` c
 
 ### Why each flag is load-bearing
 
-| flag | what it does | what breaks without it |
-|---|---|---|
-| `NVTE_PYTORCH_FORCE_BUILD=TRUE` | Short-circuits `CachedWheelsCommand.run` in `setup.py` which otherwise tries to download a prebuilt wheel from `github.com/NVIDIA/TransformerEngine/releases/download/v<ver>/...` matching the exact `(cu_major, torch_version, cxx11abi, py_version)` tuple | Always a 404 for torch nightlies → wasted roundtrip, sometimes silent fallback to a version-mismatched wheel |
-| `--no-build-isolation` | Makes the build step use the venv's installed `torch`, `setuptools`, etc. | pip spins up an isolated build env, `pyproject.toml`'s `requires = ["torch>=2.1"]` pulls the **latest stable** torch from PyPI, the shim gets linked against *that* libtorch, and the resulting `.so` is still ABI-incompatible with the nightly in your venv — exact same symptom as before |
-| `--no-deps` | Don't touch `einops`, `onnx`, `pydantic`, `transformers`, etc. | pip resolver may downgrade/reinstall adjacent heavy ML deps |
-| `--no-cache-dir` | Force a fresh build, don't pull a wheel from `~/.cache/pip` that was built against a different torch | Silent "install" of a stale cached wheel, reproducing the ABI mismatch you just tried to fix |
-| `MAX_JOBS=16` | Parallelism for the C++ compile | Slow build (serial by default) |
+| flag                            | what it does                                                                                                                                                                                                                                                 | what breaks without it                                                                                                                                                                                                                                                                       |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `NVTE_PYTORCH_FORCE_BUILD=TRUE` | Short-circuits `CachedWheelsCommand.run` in `setup.py` which otherwise tries to download a prebuilt wheel from `github.com/NVIDIA/TransformerEngine/releases/download/v<ver>/...` matching the exact `(cu_major, torch_version, cxx11abi, py_version)` tuple | Always a 404 for torch nightlies → wasted roundtrip, sometimes silent fallback to a version-mismatched wheel                                                                                                                                                                                 |
+| `--no-build-isolation`          | Makes the build step use the venv's installed `torch`, `setuptools`, etc.                                                                                                                                                                                    | pip spins up an isolated build env, `pyproject.toml`'s `requires = ["torch>=2.1"]` pulls the **latest stable** torch from PyPI, the shim gets linked against *that* libtorch, and the resulting `.so` is still ABI-incompatible with the nightly in your venv — exact same symptom as before |
+| `--no-deps`                     | Don't touch `einops`, `onnx`, `pydantic`, `transformers`, etc.                                                                                                                                                                                               | pip resolver may downgrade/reinstall adjacent heavy ML deps                                                                                                                                                                                                                                  |
+| `--no-cache-dir`                | Force a fresh build, don't pull a wheel from `~/.cache/pip` that was built against a different torch                                                                                                                                                         | Silent "install" of a stale cached wheel, reproducing the ABI mismatch you just tried to fix                                                                                                                                                                                                 |
+| `MAX_JOBS=16`                   | Parallelism for the C++ compile                                                                                                                                                                                                                              | Slow build (serial by default)                                                                                                                                                                                                                                                               |
 
 ## Verification
 
@@ -94,16 +94,16 @@ nm -D --undefined-only "$SO" | grep TensorImpl || echo "clean"
 
 ## Stack baseline this was verified against
 
-| component | version | notes |
-|---|---|---|
-| Host | Ubuntu 24.04, aarch64 (GB10 DGX Spark) | driver 595.58.03 |
-| CUDA toolkit | 13.2.78 (`/usr/local/cuda` → `cuda-13.2`) | runtime CUDA 13.2 |
-| GPU | NVIDIA GB10 (sm_121a / Blackwell consumer) | see `docs/gb10_sm121_hardware.md` |
-| torch | 2.13.0.dev20260417+cu132 | nightly |
-| TransformerEngine | 2.14.0 (all three packages) | |
-| gcc / g++ | 15.2.0 | only matters for C++ shim build |
-| cmake / ninja | 4.3.1 / 1.13.0 | |
-| cuDNN | 9.20.0 (system `libcudnn9-dev-cuda-13` + `nvidia-cudnn` in venv) | |
+| component         | version                                                          | notes                             |
+| ----------------- | ---------------------------------------------------------------- | --------------------------------- |
+| Host              | Ubuntu 24.04, aarch64 (GB10 DGX Spark)                           | driver 595.58.03                  |
+| CUDA toolkit      | 13.2.78 (`/usr/local/cuda` → `cuda-13.2`)                        | runtime CUDA 13.2                 |
+| GPU               | NVIDIA GB10 (sm_121a / Blackwell consumer)                       | see `docs/gb10_sm121_hardware.md` |
+| torch             | 2.13.0.dev20260417+cu132                                         | nightly                           |
+| TransformerEngine | 2.14.0 (all three packages)                                      |                                   |
+| gcc / g++         | 15.2.0                                                           | only matters for C++ shim build   |
+| cmake / ninja     | 4.3.1 / 1.13.0                                                   |                                   |
+| cuDNN             | 9.20.0 (system `libcudnn9-dev-cuda-13` + `nvidia-cudnn` in venv) |                                   |
 
 The `transformer_engine_torch` shim is pure `.cpp` (no `.cu` — verified by `find csrc -name '*.cu'` on the sdist), so nvcc/GCC-version compatibility isn't on the hot path for *this* package. It is for `transformer_engine_cu13` if you ever need to rebuild *that* from source, but the prebuilt aarch64 wheel covers our case.
 

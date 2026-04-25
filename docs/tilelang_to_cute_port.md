@@ -8,10 +8,10 @@ The user requested a "1:1 port to NVIDIA cuTile Python (part of
 nvidia-cutlass-dsl / CUTLASS 4.x)". In reality there are **two
 separate** Python DSLs from NVIDIA and they are frequently conflated:
 
-| DSL                     | Package                     | Level    | Abstractions                                          |
-|-------------------------|-----------------------------|----------|-------------------------------------------------------|
-| **CuTe DSL**            | `nvidia-cutlass-dsl`        | low      | `cute.make_layout`, `SmemAllocator`, `cute.copy`, `TiledMma`, `TiledCopy`, explicit pipeline stages. Essentially CUTLASS 3.x in Python. |
-| **cuTile Python**       | `cuda-tile` (`cuda.tile`)   | high     | `ct.load`, `ct.store`, `ct.mma`, `ct.matmul`, `ct.full`, `ct.bid`, `ct.launch`. Built on Numba + Tile IR, announced at GTC 2025. |
+| DSL               | Package                   | Level | Abstractions                                                                                                                            |
+| ----------------- | ------------------------- | ----- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| **CuTe DSL**      | `nvidia-cutlass-dsl`      | low   | `cute.make_layout`, `SmemAllocator`, `cute.copy`, `TiledMma`, `TiledCopy`, explicit pipeline stages. Essentially CUTLASS 3.x in Python. |
+| **cuTile Python** | `cuda-tile` (`cuda.tile`) | high  | `ct.load`, `ct.store`, `ct.mma`, `ct.matmul`, `ct.full`, `ct.bid`, `ct.launch`. Built on Numba + Tile IR, announced at GTC 2025.        |
 
 cuTile is the *tile-based* model ("think in tiles, not threads"). It is
 **not** part of `nvidia-cutlass-dsl` — it lives in the `cuda.tile`
@@ -120,21 +120,21 @@ def matmul(A: torch.Tensor, B: torch.Tensor,
 
 ## Side-by-side primitive mapping
 
-| TileLang primitive                                 | cuTile Python equivalent                                           | Notes |
-|----------------------------------------------------|--------------------------------------------------------------------|-------|
-| `@tl.jit(out_idx=-1)`                              | `@ct.kernel` (+ plain Python host wrapper that allocates `C`)      | cuTile does not auto-allocate the output tensor; the caller does. |
-| `@T.prim_func` / `T.Tensor((M,K), dtype)`          | Plain kernel function; tensors are passed as `torch.Tensor` / CuPy | No explicit shape/dtype annotation on kernel params. |
-| `with T.Kernel(gx, gy, threads=128) as (bx, by)`   | `ct.bid(0)`, `ct.bid(1)` inside the kernel; `ct.launch(..., grid)` on the host | **`threads=128` has no counterpart.** cuTile hides per-thread scheduling entirely — the compiler picks the warp/CTA layout. |
-| `A_shared = T.alloc_shared((bM, bK), dtype)`       | *implicit* — created by `ct.load(A, index=..., shape=(tm, tk))`    | Shared memory is not a first-class user object. |
-| `B_shared = T.alloc_shared((bK, bN), dtype)`       | *implicit* — `ct.load(B, ...)`                                     | Same. |
-| `C_local = T.alloc_fragment((bM, bN), accum_dtype)`| `acc = ct.full((tm, tn), 0, dtype=ct.float32)`                     | Register-resident accumulator tile. |
-| `T.clear(C_local)`                                 | Fused into `ct.full((...), 0, ...)`                                | One call instead of two. |
-| `for k in T.Pipelined(n_k, num_stages=3):`         | `for k in range(num_k_tiles):`                                     | **No explicit `num_stages` knob.** cuTile picks the pipeline depth automatically. Compile-time loops can be annotated with `ct.static_iter` but that is an unrolling hint, not a pipeline hint. |
-| `T.copy(A[by*bM, k*bK], A_shared)`                 | `a_tile = ct.load(A, index=(by, k), shape=(tm, tk))`               | Index is in *tiles*, not elements. |
-| `T.copy(B[k*bK, bx*bN], B_shared)`                 | `b_tile = ct.load(B, index=(k, bx), shape=(tk, tn))`               | Same. |
-| `T.gemm(A_shared, B_shared, C_local)`              | `acc = ct.mma(a_tile, b_tile, acc)`                                | `ct.mma(x, y, acc)` is fused multiply-accumulate and returns the new accumulator value. `ct.matmul(x, y)` is the non-accumulating variant. |
-| `T.copy(C_local, C[by*bM, bx*bN])`                 | `ct.store(C, index=(by, bx), tile=acc.astype(ct.float16))`         | Need explicit dtype cast from fp32 accumulator. |
-| Grid arg `(T.ceildiv(N, bN), T.ceildiv(M, bM))`    | `grid = (ceil(N/bN), ceil(M/bM), 1)` passed to `ct.launch`         | `ct.launch(stream, grid, kernel, args)`. |
+| TileLang primitive                                  | cuTile Python equivalent                                                       | Notes                                                                                                                                                                                           |
+| --------------------------------------------------- | ------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `@tl.jit(out_idx=-1)`                               | `@ct.kernel` (+ plain Python host wrapper that allocates `C`)                  | cuTile does not auto-allocate the output tensor; the caller does.                                                                                                                               |
+| `@T.prim_func` / `T.Tensor((M,K), dtype)`           | Plain kernel function; tensors are passed as `torch.Tensor` / CuPy             | No explicit shape/dtype annotation on kernel params.                                                                                                                                            |
+| `with T.Kernel(gx, gy, threads=128) as (bx, by)`    | `ct.bid(0)`, `ct.bid(1)` inside the kernel; `ct.launch(..., grid)` on the host | **`threads=128` has no counterpart.** cuTile hides per-thread scheduling entirely — the compiler picks the warp/CTA layout.                                                                     |
+| `A_shared = T.alloc_shared((bM, bK), dtype)`        | *implicit* — created by `ct.load(A, index=..., shape=(tm, tk))`                | Shared memory is not a first-class user object.                                                                                                                                                 |
+| `B_shared = T.alloc_shared((bK, bN), dtype)`        | *implicit* — `ct.load(B, ...)`                                                 | Same.                                                                                                                                                                                           |
+| `C_local = T.alloc_fragment((bM, bN), accum_dtype)` | `acc = ct.full((tm, tn), 0, dtype=ct.float32)`                                 | Register-resident accumulator tile.                                                                                                                                                             |
+| `T.clear(C_local)`                                  | Fused into `ct.full((...), 0, ...)`                                            | One call instead of two.                                                                                                                                                                        |
+| `for k in T.Pipelined(n_k, num_stages=3):`          | `for k in range(num_k_tiles):`                                                 | **No explicit `num_stages` knob.** cuTile picks the pipeline depth automatically. Compile-time loops can be annotated with `ct.static_iter` but that is an unrolling hint, not a pipeline hint. |
+| `T.copy(A[by*bM, k*bK], A_shared)`                  | `a_tile = ct.load(A, index=(by, k), shape=(tm, tk))`                           | Index is in *tiles*, not elements.                                                                                                                                                              |
+| `T.copy(B[k*bK, bx*bN], B_shared)`                  | `b_tile = ct.load(B, index=(k, bx), shape=(tk, tn))`                           | Same.                                                                                                                                                                                           |
+| `T.gemm(A_shared, B_shared, C_local)`               | `acc = ct.mma(a_tile, b_tile, acc)`                                            | `ct.mma(x, y, acc)` is fused multiply-accumulate and returns the new accumulator value. `ct.matmul(x, y)` is the non-accumulating variant.                                                      |
+| `T.copy(C_local, C[by*bM, bx*bN])`                  | `ct.store(C, index=(by, bx), tile=acc.astype(ct.float16))`                     | Need explicit dtype cast from fp32 accumulator.                                                                                                                                                 |
+| Grid arg `(T.ceildiv(N, bN), T.ceildiv(M, bM))`     | `grid = (ceil(N/bN), ceil(M/bM), 1)` passed to `ct.launch`                     | `ct.launch(stream, grid, kernel, args)`.                                                                                                                                                        |
 
 ## Primitives with no direct cuTile equivalent
 
@@ -192,13 +192,13 @@ Calibrating against `cppmega/megatron/structure_batch.py` +
 MIMO analogue we already ship — sparse structure-aware embedding +
 reduction + scatter):
 
-| Component                              | TileLang LOC | cuTile LOC | Δ    |
-|----------------------------------------|--------------|------------|------|
-| GEMM body (1 op, the example above)    | 18           | 19         | +1   |
-| Fused QKV projection (3 outputs)       | ~45          | ~55        | +10  |
-| FlashAttention v2 fwd (softmax, masking, scaling, online-renorm) | ~180         | ~260       | +80  |
-| FlashAttention v2 bwd (dQ/dK/dV, recompute) | ~320   | ~480       | +160 |
-| Structure-aware attention (our MIMO case, with ngram-hash ingest + gather + masked softmax + scatter) | ~420 | ~600–650 | +180–230 |
+| Component                                                                                             | TileLang LOC | cuTile LOC | Δ        |
+| ----------------------------------------------------------------------------------------------------- | ------------ | ---------- | -------- |
+| GEMM body (1 op, the example above)                                                                   | 18           | 19         | +1       |
+| Fused QKV projection (3 outputs)                                                                      | ~45          | ~55        | +10      |
+| FlashAttention v2 fwd (softmax, masking, scaling, online-renorm)                                      | ~180         | ~260       | +80      |
+| FlashAttention v2 bwd (dQ/dK/dV, recompute)                                                           | ~320         | ~480       | +160     |
+| Structure-aware attention (our MIMO case, with ngram-hash ingest + gather + masked softmax + scatter) | ~420         | ~600–650   | +180–230 |
 
 **Why the blow-up on anything beyond a plain GEMM?**
 
@@ -246,12 +246,12 @@ For the MIMO kernels we actually run in this repo (NAM56R mixed-A
 attention, structure-aware embedding with scatter), based on the above
 losses I expect:
 
-| Workload                              | TileLang tok/s | cuTile projected | Δ    |
-|---------------------------------------|----------------|------------------|------|
-| Plain GEMM (reference)                | SOL            | SOL              | ~0%  |
-| Fused QKV                             | SOL            | SOL − 2%         | −2%  |
-| FlashAttention fwd (H200)             | SOL − 3%       | SOL − 8 to −12%  | −5 to −9% |
-| FlashAttention bwd (H200)             | SOL − 5%       | SOL − 12 to −18% | −7 to −13% |
+| Workload                              | TileLang tok/s        | cuTile projected         | Δ               |
+| ------------------------------------- | --------------------- | ------------------------ | --------------- |
+| Plain GEMM (reference)                | SOL                   | SOL                      | ~0%             |
+| Fused QKV                             | SOL                   | SOL − 2%                 | −2%             |
+| FlashAttention fwd (H200)             | SOL − 3%              | SOL − 8 to −12%          | −5 to −9%       |
+| FlashAttention bwd (H200)             | SOL − 5%              | SOL − 12 to −18%         | −7 to −13%      |
 | NAM56R structure attention (our MIMO) | 183k tok/s (measured) | 150–165k tok/s projected | **−10 to −18%** |
 
 The biggest risks are (a) the missing `num_stages` knob eating latency-
