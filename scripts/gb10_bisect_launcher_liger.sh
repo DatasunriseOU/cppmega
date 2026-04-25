@@ -39,6 +39,11 @@ export CPPMEGA_STRUCTURE_ENABLED=0
 export CUDA_VISIBLE_DEVICES=0
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export TRITON_CACHE_DIR=/home/dave/.triton-cache
+export CPPMEGA_OPTIMIZER=muon
+export CPPMEGA_MUON_SCALAR_OPTIMIZER=adam8bit
+export CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER=1
+export CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER=1
+export CPPMEGA_GRAD_REDUCE_IN_BF16=1
 mkdir -p "${TRITON_CACHE_DIR}" /home/dave/logs
 
 cd "${BISECT_ROOT}"
@@ -118,6 +123,11 @@ python -m torch.distributed.run --nproc_per_node=1 "${REMOTE_WORKDIR}/pretrain_m
   --micro-batch-size 8 --global-batch-size 8 --train-iters 5 \
   --eval-interval 50000000 --eval-iters 1 \
   --lr 1e-4 --min-lr 1e-5 --lr-decay-style constant \
+  --optimizer "${CPPMEGA_OPTIMIZER}" \
+  --muon-momentum 0.95 --muon-scale-mode spectral --muon-num-ns-steps 5 \
+  --muon-tp-mode blockwise --muon-scalar-optimizer "${CPPMEGA_MUON_SCALAR_OPTIMIZER}" \
+  --use-bf16-no-master-emerging-optimizer \
+  --use-bf16-no-master-emerging-fallback-optimizer --grad-reduce-in-bf16 \
   --position-embedding-type rope --normalization RMSNorm \
   --disable-bias-linear --untie-embeddings-and-output-weights \
   --bf16 --fp8-format hybrid --fp8-recipe tensorwise \
