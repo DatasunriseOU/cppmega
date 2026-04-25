@@ -25,7 +25,16 @@ def test_te_fp8_activation_roundtrip(monkeypatch):
     assert out.shape == x.shape
     assert out.is_contiguous()
     assert torch.isfinite(out).all()
-    torch.testing.assert_close(out, x, rtol=0.2, atol=0.08)
+
+    # Compare against a direct TE quantize/dequantize of the same input
+    # rather than against the original bf16 tensor. The previous bound
+    # (rtol=0.2, atol=0.08) measured FP8 quantization noise rather than
+    # the packer wrapper, and would have passed even if the packer
+    # silently routed through a different quantizer.
+    quantizer = fp8._te_quantizer_for(x.device)
+    te_packed = fp8.tex.quantize(x, quantizer)
+    te_ref = fp8.tex.dequantize(te_packed, fp8._torch_dtype_to_te(x.dtype))
+    torch.testing.assert_close(out, te_ref, rtol=0, atol=0)
 
 
 def test_te_fp8_saved_tensors_hooks_backward(monkeypatch):
