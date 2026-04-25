@@ -19,6 +19,7 @@ source "${VENV}/bin/activate"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/home/dave/.triton-cache}"
+export MEGATRON_BIAS_GELU_IMPL="${MEGATRON_BIAS_GELU_IMPL:-te}"
 mkdir -p "$(dirname "${LOG}")" "${TRITON_CACHE_DIR}"
 
 export CPPMEGA_NEM_PATTERN="${CPPMEGA_NEM_PATTERN:-AEMEAEMEAEMR}"
@@ -41,9 +42,10 @@ export CPPMEGA_MUON_MOMENTUM="${CPPMEGA_MUON_MOMENTUM:-0.95}"
 export CPPMEGA_MUON_SCALE_MODE="${CPPMEGA_MUON_SCALE_MODE:-spectral}"
 export CPPMEGA_MUON_NUM_NS_STEPS="${CPPMEGA_MUON_NUM_NS_STEPS:-5}"
 export CPPMEGA_MUON_TP_MODE="${CPPMEGA_MUON_TP_MODE:-blockwise}"
-export CPPMEGA_MUON_SCALAR_OPTIMIZER="adam8bit"
+export CPPMEGA_MUON_SCALAR_OPTIMIZER="${CPPMEGA_MUON_SCALAR_OPTIMIZER:-adam8bit}"
 export CPPMEGA_MUON_QUANTIZED_MOMENTUM="${CPPMEGA_MUON_QUANTIZED_MOMENTUM:-1}"
 export CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE="${CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE:-int8}"
+export CPPMEGA_MUON_QUANTIZED_MOMENTUM_BLOCK_SIZE="${CPPMEGA_MUON_QUANTIZED_MOMENTUM_BLOCK_SIZE:-256}"
 export CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER=1
 export CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER=1
 export CPPMEGA_GRAD_REDUCE_IN_BF16=1
@@ -53,7 +55,13 @@ export CPPMEGA_MAIN_GRADS_DTYPE="${CPPMEGA_MAIN_GRADS_DTYPE:-fp32}"
 export CPPMEGA_MAIN_PARAMS_DTYPE="${CPPMEGA_MAIN_PARAMS_DTYPE:-fp32}"
 export CPPMEGA_EXP_AVG_DTYPE="${CPPMEGA_EXP_AVG_DTYPE:-fp32}"
 export CPPMEGA_EXP_AVG_SQ_DTYPE="${CPPMEGA_EXP_AVG_SQ_DTYPE:-fp32}"
+export CPPMEGA_LOCAL_DDP_DISABLE_CONTIGUOUS_GRAD_BUFFER="${CPPMEGA_LOCAL_DDP_DISABLE_CONTIGUOUS_GRAD_BUFFER:-1}"
 export CPPMEGA_MEMORY_DEBUG="${CPPMEGA_MEMORY_DEBUG:-0}"
+export CPPMEGA_TORCH_PROFILE="${CPPMEGA_TORCH_PROFILE:-0}"
+export CPPMEGA_TORCH_PROFILE_STEPS="${CPPMEGA_TORCH_PROFILE_STEPS:-2}"
+export CPPMEGA_TORCH_PROFILE_DIR="${CPPMEGA_TORCH_PROFILE_DIR:-/home/dave/logs/${RUN_ID}_torch_profile}"
+export CPPMEGA_NSYS_PROFILE="${CPPMEGA_NSYS_PROFILE:-0}"
+export CPPMEGA_NSYS_OUTPUT="${CPPMEGA_NSYS_OUTPUT:-/home/dave/logs/${RUN_ID}_nsys}"
 if [[ "${CPPMEGA_MEMORY_DEBUG}" == "1" ]]; then
   export NANOCHAT_MEMORY_DEBUG="${NANOCHAT_MEMORY_DEBUG:-1}"
 fi
@@ -266,24 +274,41 @@ if os.environ.get("CPPMEGA_MEM_PROFILE", "0") == "1":
         if os.environ.get("CPPMEGA_OPTIMIZER", "") == "muon":
             fallback_numel = 0
             muon_numel = 0
+            muon_q_blocks = 0
+            q_block_size = int(os.environ.get("CPPMEGA_MUON_QUANTIZED_MOMENTUM_BLOCK_SIZE", "256"))
             for model in models:
                 for _name, param in model.named_parameters():
+                    numel = int(param.numel())
                     is_fallback = (
                         getattr(param, "is_embedding_or_output_parameter", False)
                         or getattr(param, "is_emerging_optimizer_fallback_parameter", False)
                         or len(param.shape) != 2
                     )
                     if is_fallback:
-                        fallback_numel += int(param.numel())
+                        fallback_numel += numel
                     else:
-                        muon_numel += int(param.numel())
+                        muon_numel += numel
+                        muon_q_blocks += (numel + q_block_size - 1) // q_block_size
 
             grad_b = 2 if os.environ.get("CPPMEGA_GRAD_REDUCE_IN_BF16", "0") == "1" else 4
-            muon_state_b = (
-                2
-                if os.environ.get("CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER", "0") == "1"
-                else 4
+            local_no_contig_grad = (
+                os.environ.get("CPPMEGA_LOCAL_DDP_DISABLE_CONTIGUOUS_GRAD_BUFFER", "0") == "1"
             )
+            qmuon_enabled = os.environ.get("CPPMEGA_MUON_QUANTIZED_MOMENTUM", "0") == "1"
+            if qmuon_enabled:
+                muon_state_bytes = muon_numel + muon_q_blocks * 4
+                muon_state_desc = (
+                    f"q8_data=1B + fp32_absmax/blk{q_block_size} "
+                    f"({_gib(muon_state_bytes):.3f} GiB)"
+                )
+            else:
+                muon_state_b = (
+                    2
+                    if os.environ.get("CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER", "0") == "1"
+                    else 4
+                )
+                muon_state_bytes = muon_numel * muon_state_b
+                muon_state_desc = f"{muon_state_b}B ({_gib(muon_state_bytes):.3f} GiB)"
             fallback_no_master = (
                 os.environ.get("CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER", "0")
                 == "1"
@@ -292,25 +317,35 @@ if os.environ.get("CPPMEGA_MEM_PROFILE", "0") == "1":
             fallback_state_count = 1 if scalar_opt in ("lion", "lion8bit") else 2
             fallback_state_b = 1 if scalar_opt.endswith("8bit") else (2 if fallback_no_master else 4)
             master_b = 0 if fallback_no_master else 4
-            configured_est = (
+            persistent_grad_bytes = 0 if local_no_contig_grad else total_numel * grad_b
+            live_grad_bytes = total_numel * grad_b
+            setup_floor_est = (
                 model_bf16
-                + total_numel * grad_b
+                + persistent_grad_bytes
                 + fallback_numel * master_b
-                + muon_numel * muon_state_b
+                + muon_state_bytes
                 + fallback_numel * fallback_state_count * fallback_state_b
             )
+            step_live_est = setup_floor_est + (live_grad_bytes if local_no_contig_grad else 0)
             print("[mem_profile] configured_muon_state_estimate:", flush=True)
             print(
                 f"[mem_profile]   muon_params={muon_numel:,} fallback_params={fallback_numel:,}",
                 flush=True,
             )
             print(
-                f"[mem_profile]   grad={grad_b}B muon_momentum={muon_state_b}B "
+                f"[mem_profile]   grad={grad_b}B "
+                f"{'param.grad transient' if local_no_contig_grad else 'persistent DDP buffer'} "
+                f"muon_momentum={muon_state_desc} "
                 f"fallback_state={fallback_state_count}x{fallback_state_b}B "
                 f"fallback_master={master_b}B",
                 flush=True,
             )
-            print(f"[mem_profile]   configured_total {_gib(configured_est):8.3f} GiB", flush=True)
+            print(f"[mem_profile]   setup_floor_total {_gib(setup_floor_est):8.3f} GiB", flush=True)
+            if local_no_contig_grad:
+                print(
+                    f"[mem_profile]   step_live_with_param_grads {_gib(step_live_est):8.3f} GiB",
+                    flush=True,
+                )
 
         if os.environ.get("CPPMEGA_USE_PRECISION_AWARE_OPTIMIZER", "0") == "1":
             main_grads_b = dtype_bytes[os.environ.get("CPPMEGA_MAIN_GRADS_DTYPE", "fp32")]
@@ -373,6 +408,57 @@ if os.environ.get("CPPMEGA_MEM_PROFILE", "0") == "1":
         print("[mem_profile] local memory profile hooks installed", flush=True)
     except Exception as exc:
         print(f"[mem_profile] hook install failed: {exc}", file=sys.stderr)
+
+if os.environ.get("CPPMEGA_TORCH_PROFILE", "0") == "1":
+    import torch
+
+    _TORCH_PROFILE_STEPS = int(os.environ.get("CPPMEGA_TORCH_PROFILE_STEPS", "2"))
+    _TORCH_PROFILE_DIR = os.environ.get("CPPMEGA_TORCH_PROFILE_DIR")
+    _TORCH_PROFILE_STEP = 0
+    os.makedirs(_TORCH_PROFILE_DIR, exist_ok=True)
+
+    try:
+        import megatron.training.training as _training_profile
+
+        _orig_profile_train_step = _training_profile.train_step
+
+        @functools.wraps(_orig_profile_train_step)
+        def _torch_profiled_train_step(*args, **kwargs):
+            global _TORCH_PROFILE_STEP
+            _TORCH_PROFILE_STEP += 1
+            if _TORCH_PROFILE_STEP > _TORCH_PROFILE_STEPS:
+                return _orig_profile_train_step(*args, **kwargs)
+
+            trace_path = os.path.join(
+                _TORCH_PROFILE_DIR, f"train_step_{_TORCH_PROFILE_STEP}.json"
+            )
+            table_path = os.path.join(
+                _TORCH_PROFILE_DIR, f"train_step_{_TORCH_PROFILE_STEP}_cuda_table.txt"
+            )
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=False,
+            ) as prof:
+                result = _orig_profile_train_step(*args, **kwargs)
+            prof.export_chrome_trace(trace_path)
+            with open(table_path, "w", encoding="utf-8") as f:
+                f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=80))
+            print(
+                f"[torch_profile] step={_TORCH_PROFILE_STEP} trace={trace_path} table={table_path}",
+                flush=True,
+            )
+            return result
+
+        _training_profile.train_step = _torch_profiled_train_step
+        print(
+            f"[torch_profile] hooks installed dir={_TORCH_PROFILE_DIR} "
+            f"steps={_TORCH_PROFILE_STEPS}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[torch_profile] hook install failed: {exc}", file=sys.stderr)
 PY
 
 sed -i '1i import cppmega_local_quarter_shim  # local GB10 quarter train patches' \
@@ -428,6 +514,9 @@ echo "[local-quarter] fp8_recipe=${CPPMEGA_FP8_RECIPE}"
 echo "[local-quarter] optimizer=${CPPMEGA_OPTIMIZER} muon_scalar=${CPPMEGA_MUON_SCALAR_OPTIMIZER}"
 echo "[local-quarter] no_master_emerging=${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER} no_master_fallback=${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER} grad_reduce_bf16=${CPPMEGA_GRAD_REDUCE_IN_BF16}"
 echo "[local-quarter] dist_optimizer=${CPPMEGA_USE_DISTRIBUTED_OPTIMIZER} precision_aware=${CPPMEGA_USE_PRECISION_AWARE_OPTIMIZER}"
+echo "[local-quarter] local_ddp_no_contig_grad_buffer=${CPPMEGA_LOCAL_DDP_DISABLE_CONTIGUOUS_GRAD_BUFFER}"
+echo "[local-quarter] torch_profile=${CPPMEGA_TORCH_PROFILE} profile_dir=${CPPMEGA_TORCH_PROFILE_DIR}"
+echo "[local-quarter] nsys_profile=${CPPMEGA_NSYS_PROFILE} nsys_output=${CPPMEGA_NSYS_OUTPUT}"
 
 # shellcheck disable=SC2206
 DATA_ARGS=(--data-path ${CPPMEGA_DATA_PATH})
@@ -445,6 +534,7 @@ case "${CPPMEGA_OPTIMIZER}" in
       OPTIMIZER_ARGS+=(
         --muon-quantized-momentum
         --muon-quantized-momentum-dtype "${CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE}"
+        --muon-quantized-momentum-block-size "${CPPMEGA_MUON_QUANTIZED_MOMENTUM_BLOCK_SIZE}"
       )
     fi
     ;;
@@ -470,8 +560,26 @@ if [[ "${CPPMEGA_USE_PRECISION_AWARE_OPTIMIZER}" == "1" ]]; then
     --exp-avg-sq-dtype "${CPPMEGA_EXP_AVG_SQ_DTYPE}"
   )
 fi
+if [[ "${CPPMEGA_LOCAL_DDP_DISABLE_CONTIGUOUS_GRAD_BUFFER}" == "1" ]]; then
+  OPTIMIZER_ARGS+=(--local-ddp-disable-contiguous-grad-buffer)
+fi
 
-python -m torch.distributed.run --nproc_per_node=1 "${WORKDIR}/pretrain_mamba.py" \
+LAUNCH_PREFIX=()
+if [[ "${CPPMEGA_NSYS_PROFILE}" == "1" ]]; then
+  LAUNCH_PREFIX=(
+    nsys profile
+    --trace=cuda,nvtx,osrt
+    --cuda-memory-usage=true
+    --sample=none
+    --cpuctxsw=none
+    --trace-fork-before-exec=true
+    --force-overwrite=true
+    --wait=all
+    -o "${CPPMEGA_NSYS_OUTPUT}"
+  )
+fi
+
+"${LAUNCH_PREFIX[@]}" python -m torch.distributed.run --nproc_per_node=1 "${WORKDIR}/pretrain_mamba.py" \
   "${DATA_ARGS[@]}" \
   --tokenizer-type HuggingFaceTokenizer \
   --tokenizer-model "${CPPMEGA_TOKENIZER_MODEL}" \

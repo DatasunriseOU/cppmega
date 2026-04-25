@@ -280,6 +280,56 @@ class TestBwdParity:
         assert rel(W1.grad, W2.grad) < 1e-4
         assert rel(xf1.grad, xf2.grad) < 1e-4
 
+    def test_bwd_fp32_with_h0_across_chunks(self, monkeypatch):
+        """Exercise checkpointed backward carry propagation into h0 grad."""
+        try:
+            import triton  # noqa: F401
+        except ImportError:
+            pytest.skip("triton not available")
+        import cppmega.megatron.m2rnn_triton as _mod
+
+        monkeypatch.setattr(_mod, "_BWD_CHUNK_SIZE", 8)
+
+        B, S, H, K, V = 1, 33, 2, 16, 16
+        q0, k0, v0, W0, xf0 = _make_inputs(B, S, H, K, V, dtype=torch.float32, seed=11)
+        g = torch.Generator(device="cuda").manual_seed(12)
+        h00 = torch.randn(B, H, K, V, device="cuda", dtype=torch.float32, generator=g)
+
+        def leaves(src):
+            return [x.detach().clone().requires_grad_(True) for x in src]
+
+        q1, k1, v1, W1, xf1, h01 = leaves([q0, k0, v0, W0, xf0, h00])
+        q2, k2, v2, W2, xf2, h02 = leaves([q0, k0, v0, W0, xf0, h00])
+
+        out_ref, h_ref = _torch_m2rnn_forward(q1, k1, v1, W1, xf1, h0=h01)
+        out_tri, h_tri = _mod.m2rnn_scan_triton(q2, k2, v2, W2, xf2, h0=h02)
+
+        g_out = torch.randn(
+            out_ref.shape,
+            device=out_ref.device,
+            dtype=out_ref.dtype,
+            generator=torch.Generator(device="cuda").manual_seed(13),
+        )
+        g_h = torch.randn(
+            h_ref.shape,
+            device=h_ref.device,
+            dtype=h_ref.dtype,
+            generator=torch.Generator(device="cuda").manual_seed(14),
+        )
+        ((out_ref * g_out).sum() + (h_ref * g_h).sum()).backward()
+        ((out_tri * g_out).sum() + (h_tri * g_h).sum()).backward()
+
+        def rel(a, b):
+            denom = a.abs().max().item() + 1e-12
+            return (a - b).abs().max().item() / denom
+
+        assert rel(q1.grad, q2.grad) < 1e-4
+        assert rel(k1.grad, k2.grad) < 1e-4
+        assert rel(v1.grad, v2.grad) < 1e-4
+        assert rel(W1.grad, W2.grad) < 1e-4
+        assert rel(xf1.grad, xf2.grad) < 1e-4
+        assert rel(h01.grad, h02.grad) < 1e-4
+
 
 # ---------------------------------------------------------------------------
 # Recompute vs save parity
@@ -337,3 +387,51 @@ class TestRecomputeVsSaveParity:
                 f"{name}: save vs recompute relative error {rel:.4e} "
                 f"(abs={diff:.4e}, mag={mag:.4e})"
             )
+
+
+# ---------------------------------------------------------------------------
+# Checkpointed backward memory mode
+# ---------------------------------------------------------------------------
+
+
+class TestCheckpointedBackwardMemory:
+    def test_default_forward_allocates_checkpoints_not_full_y(self, monkeypatch):
+        try:
+            import triton  # noqa: F401
+        except ImportError:
+            pytest.skip("triton not available")
+        import cppmega.megatron.m2rnn_triton as _mod
+
+        monkeypatch.setattr(_mod, "_SAVE_HNEW", False)
+        monkeypatch.setattr(_mod, "_BWD_CHUNK_SIZE", 8)
+
+        B, S, H, K, V = 1, 33, 2, 16, 16
+        q, k, v, W, xf = _make_inputs(B, S, H, K, V, dtype=torch.float32, seed=21)
+
+        allocations = []
+        orig_empty = torch.empty
+
+        def recording_empty(*args, **kwargs):
+            if args:
+                raw_shape = args[0] if len(args) == 1 and isinstance(args[0], (tuple, list, torch.Size)) else args
+            else:
+                raw_shape = kwargs.get("size", ())
+            try:
+                shape = tuple(int(x) for x in raw_shape)
+            except TypeError:
+                shape = None
+            allocations.append((shape, kwargs.get("dtype")))
+            return orig_empty(*args, **kwargs)
+
+        monkeypatch.setattr(torch, "empty", recording_empty)
+
+        out, h_final = _mod.m2rnn_scan_triton(q, k, v, W, xf)
+        torch.cuda.synchronize()
+
+        shapes = [shape for shape, _dtype in allocations]
+        full_y_shape = (B, S, H, K, V)
+        ckpt_shape = (B, (S + 7) // 8 + 1, H, K, V)
+        assert full_y_shape not in shapes
+        assert ckpt_shape in shapes
+        assert out.shape == (B, S, H, V)
+        assert h_final.shape == (B, H, K, V)

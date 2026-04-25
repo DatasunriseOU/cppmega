@@ -1,100 +1,110 @@
 # NAM56R optimization plan
 
-## Quantized Muon momentum plan (2026-04-25)
+## GB10 Muon memory/perf plan (2026-04-25)
 
 Detailed implementation note:
 [`docs/quantized_muon_momentum.md`](docs/quantized_muon_momentum.md).
 
-Current checkpoint:
+Current session note:
+[`docs/gb10_local_memory_perf_2026_04_25.md`](docs/gb10_local_memory_perf_2026_04_25.md).
 
-- Added a lazy-built CUDA extension for blockwise int8/uint8 Muon momentum.
-- Added Python wrappers, CUDA tests, and a benchmark script.
-- Added multi-tensor update that overwrites BF16 grads in place, so the grad
+Completed in this checkpoint:
+
+- Blockwise int8/uint8 Muon momentum extension exists and is covered by CUDA
+  tests.
+- Multi-tensor q8 momentum update overwrites BF16 grads in place, so the grad
   buffer becomes the Newton-Schulz input and no separate BF16 scratch is needed.
-- Added update plus sumsq collection for the first Newton-Schulz normalization
-  pass.
-- GB10 launch scripts are pinned to Muon with no-master BF16 fallback and
-  Adam8bit fallback for scalar/non-2D parameters.
-- Local Megatron `TensorParallelMuon` is patched to use quantized momentum
-  state instead of `state["momentum_buffer"].lerp_` when
-  `--muon-quantized-momentum` is set.
-- QKV split correctness is preserved by feeding the updated BF16 grad through
-  the existing per-slice `orthogonalize()` path. Wiring Megatron to skip its
-  internal duplicate normalization after the new fused grouped primitive is the
-  remaining integration step.
-- Added the fused grouped/sliced primitive needed to remove that follow-up:
-  `quantized_muon_momentum_update_multi_and_normalize_groups_` maps each
-  256-value quantization block to a logical norm group, so Q/K/V can be
-  normalized independently while the momentum update still runs as one
-  multi-tensor pass.
-- Sharding is part of the API: every rank builds local norm metadata with the
-  same logical group ids, local group sumsq values are all-reduced over
+- Grouped update+normalization is wired into local Megatron
+  `TensorParallelMuon`: QKV tensors use independent Q/K/V norm groups, ordinary
+  2D tensors use one group per tensor, and `_newton_schulz_lowmem` skips its
+  duplicate input normalization when the grouped primitive already normalized
+  the BF16 input.
+- Norm-plan metadata is cached on the optimizer instead of rebuilt every step.
+- Sharding remains part of the API: every rank builds local norm metadata with
+  the same logical group ids, local group sumsq values are all-reduced over
   `tp_group`, and the scale kernel uses the global group norms.
+- `cppmega/megatron/m2rnn_triton.py` no longer saves full
+  `y[B,S,H,K,V]`; backward recomputes chunks from sparse fp32 checkpoints.
+- Local GB10 launcher defaults to FlashAttention, TE bias+GELU, Muon no-master
+  BF16 fallback, quantized Muon momentum, Adam8bit scalar fallback, and
+  `--local-ddp-disable-contiguous-grad-buffer`.
+- Lion8bit scalar fallback is now an opt-in env override:
+  `CPPMEGA_MUON_SCALAR_OPTIMIZER=lion8bit`.
 
 Verified:
 
 ```bash
 PYTHONPATH=. /home/dave/cppmega-venv/bin/python -m pytest -q tests/test_quantized_muon_momentum.py
+PYTHONPATH=. /home/dave/cppmega-venv/bin/python -m pytest -q tests/test_m2rnn_triton.py
 ```
 
 Result:
 
 ```text
-8 passed
+quantized_muon_momentum: 11 passed
+m2rnn_triton:            12 passed
 ```
 
-Local GB10 quarter smoke:
+Local GB10 quarter MBS=4 smoke with no contiguous DDP grad buffer:
 
 ```bash
-CPPMEGA_TRAIN_ITERS=1 CPPMEGA_MICRO_BATCH_SIZE=4 CPPMEGA_GLOBAL_BATCH_SIZE=4 \
-  scripts/local_gb10_quarter_train.sh
+CPPMEGA_TRAIN_ITERS=1 \
+CPPMEGA_MICRO_BATCH_SIZE=4 \
+CPPMEGA_GLOBAL_BATCH_SIZE=4 \
+CPPMEGA_MEM_PROFILE=1 \
+CPPMEGA_MEM_PROFILE_STEPS=1 \
+scripts/local_gb10_quarter_train.sh
 ```
 
 Result:
 
 ```text
-lm loss 1.165463E+01, mtp_1 loss 1.164793E+01, grad norm ~76.95,
-skipped 0, nan 0, max allocated 27760.22 MB, max reserved 29524.00 MB
+after setup: alloc 3.422 GiB, reserved 4.199 GiB
+step 1 post: alloc 11.504 GiB, reserved 24.367 GiB, max_alloc 22.932 GiB
+lm loss 1.165463E+01, mtp_1 loss 1.164792E+01, grad norm 76.923,
+skipped 0, nan 0
 ```
 
-Nsight Systems microbench:
+Local GB10 quarter MBS=4 profile:
 
 ```text
-/home/dave/logs/qmuon_microbench_nsys.nsys-rep
-qmuon_update_multi_kernel: 21 launches, 9.304 ms total
+/home/dave/logs/gb10_quarter_mbs4_profile_20260425_110533.log
+/home/dave/logs/gb10_quarter_mbs4_profile_20260425_110533_torch_profile/train_step_2_cuda_table.txt
 ```
-
-Torch profiler found and fixed wrapper overhead in the CUDA extension:
 
 ```text
-before: 5 CUDA metadata allocations + 5 H2D copies per multi-update call
-after:  1 CUDA metadata allocation  + 1 H2D copy  per multi-update call
-trace:  /home/dave/logs/qmuon_torch_profiler_packed_meta
+after setup: alloc 3.422 GiB, reserved 4.199 GiB
+step 2 post: alloc 11.505 GiB, reserved 26.408 GiB, max_alloc 25.095 GiB
+step 2 losses: lm 1.097315E+01, mtp_1 1.137682E+01
+grad norm 113.327, skipped 0, nan 0
 ```
 
-Grouped QKV fused path:
+Delta vs earlier local baseline:
 
 ```text
-shape=(4096, 3584), split=(2,1,1), segments=3072, blocks=57344
-fused_group_update_norm       0.8950 ms
-update_plus_torch_qkv_norm    1.9239 ms
+setup allocation: 6.832 GiB -> 3.422 GiB
+step-2 max_alloc: 29.224 GiB -> 25.095 GiB
+step-2 reserved:  31.740 GiB -> 26.408 GiB
 ```
 
-Nsight Compute:
+Lion8bit scalar fallback A/B:
+[`docs/lion8bit_ab_2026_04_25.md`](docs/lion8bit_ab_2026_04_25.md).
+
+```text
+full AEMEAEMEAEMR, MBS=1, 2 iters:
+adam8bit step2 loss/grad/max_alloc: 11.21753 / 127.889 / 12.807 GiB
+lion8bit step2 loss/grad/max_alloc: 11.21530 / 128.080 / 12.460 GiB
+```
+
+Nsight/profiler state:
 
 ```text
 /home/dave/logs/qmuon_qkv_grouped_ncu.ncu-rep
-qmuon_update_multi_kernel:                 393.65 us avg, 80.69% occupancy
-qmuon_scale_multi_by_group_from_sumsq:     254.77 us avg, 91.97% occupancy
-```
-
-Nsight permission state:
-
-```text
+/home/dave/logs/gb10_quarter_mbs4_nsys_fork_20260425_111137_nsys.nsys-rep
 /etc/modprobe.d/nvidia-profiler-counters.conf installed
 update-initramfs -u -k all completed
-loaded driver still has RmProfilingAdminOnly=1 until reboot/module reload
-ncu report above was collected with sudo -E /usr/local/cuda/bin/ncu
+ncu reports were collected with sudo -E /usr/local/cuda/bin/ncu
+end-to-end nsys under torch.distributed.run is still partial; torch profiler is reliable
 ```
 
 Next implementation target:
@@ -102,40 +112,40 @@ Next implementation target:
 1. Make the local Megatron patch durable without swallowing unrelated dirty
    Megatron worktree changes.
 2. Add checkpoint/state_dict handling for `quantized_momentum_buffer`.
-3. Wire Megatron `TensorParallelMuon` to consume the new grouped primitive
-   without double-normalizing in `_newton_schulz_lowmem`:
-   - non-QKV tensors can use one group per tensor;
-   - fused QKV tensors use repeated Q/K/V segments with group ids 0/1/2;
-   - TP-sharded tensors pass `tp_group` so group sums are all-reduced before
-     scale.
-4. Keep this invariant:
+3. Continue fusing the Muon step around Newton-Schulz; grouped q8 update+norm is
+   wired, but `TensorParallelMuon.step` remains the top profiler entry.
+4. Inspect CCE backward and GEMM shapes from the torch trace.
+5. Improve MoE token movement/sort/permute; partial nsys reports still point at
+   `_permute_kernel` and `_sort_chunks_by_map_kernel`.
+6. Run a longer full-pattern Lion8bit A/B before switching the default.
+7. Keep this invariant:
 
    ```python
    quantized_muon_momentum_update_multi_(q_states, grads, beta=group["momentum"])
    ```
 
-5. Do not allocate `state["momentum_buffer"]` in quantized mode.
-6. Reuse `p.grad` as the BF16 Newton-Schulz input after the update kernel.
-7. Keep router scalar/bias/gating, RMSNorm, bias, embedding, output, and other
+8. Do not allocate `state["momentum_buffer"]` in quantized mode.
+9. Reuse `p.grad` as the BF16 Newton-Schulz input after the update kernel.
+10. Keep router scalar/bias/gating, RMSNorm, bias, embedding, output, and other
    non-2D fallback parameters on no-master BF16-state Adam8bit.
 
-Profiling sequence after short training works:
+Updated profiling/fusion sequence:
 
-1. Fix full-training profiling capture: wrapper-level `nsys` captured setup
-   and microbench kernels but not the optimizer worker reliably.
+1. Get a cleaner end-to-end nsys capture; the embedded `nsys` reports are
+   partial under `torch.distributed.run`, while torch profiler is currently
+   reliable.
 2. Run 50-200 steps on real clang 4k data and compare loss, grad norm,
    skipped iterations, tokens/sec, CUDA max allocated/reserved.
-3. Run nsys and torch profiler on the optimizer step.
-4. Inspect Nsight Systems kernel timeline for update, normalization,
-   Newton-Schulz matmul/SYRK, and allocation spikes.
-5. Use Nsight Compute on the quantized momentum kernel after GB10 performance
-   counter access is enabled. Current `ncu` attempt fails with
-   `ERR_NVGPUCTRPERM`.
-6. Fuse in this order:
-   - momentum update plus sumsq and in-place normalization;
-   - QKV grouped/sliced sumsq in the same update pass;
-   - transpose/normalization handling for tall matrices where it avoids copies;
-   - only then evaluate deeper Newton-Schulz GEMM/SYRK replacement.
+3. Profile optimizer, CCE backward, MoE token movement, and GEMM shapes from
+   the same run so we do not chase a microbench win that does not move
+   end-to-end throughput.
+4. Use `sudo -E /usr/local/cuda/bin/ncu` for focused kernel reports while the
+   loaded NVIDIA module still requires admin profiling counters.
+5. Fuse in this order:
+   - remove remaining Python/metadata overhead around q8 Muon plan dispatch;
+   - fuse deeper around Newton-Schulz input handling where it avoids copies;
+   - attack MoE sort/permute if nsys continues to show it as large;
+   - then evaluate CCE/GEMM-specific kernel work.
 
 ## Current state (2026-04-14 morning session 2 — multi-agent investigation)
 
