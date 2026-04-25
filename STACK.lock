@@ -1,0 +1,103 @@
+# cppmega stack pinning — single source of truth for CI image builds.
+# Bump a pin → CI rebuilds only the affected wheel(s) thanks to ccache + buildx cache.
+
+base:
+  cuda_image: nvidia/cuda:13.2.1-cudnn-devel-ubuntu24.04
+  python: "3.13"
+  gcc: "15"           # via ppa:ubuntu-toolchain-r/test; needs nvcc --allow-unsupported-compiler
+  torch: "2.13.*"
+  torch_index: https://download.pytorch.org/whl/nightly/cu132
+  torch_arch_list: "9.0;10.0;12.1"   # H100 / B200 / GB10
+
+# Wheels built in matrix on ubuntu-latest (x86_64), uploaded to GH Release as assets.
+wheels:
+  transformer_engine:
+    repo: jewelmusicee/TransformerEngine
+    ref: cppmega-mxfp8-transpose-emit
+    version: 2.16.0.dev0
+    build: |
+      NVTE_FRAMEWORK=pytorch \
+        pip wheel . --no-build-isolation -w /wheels
+    produces:
+      - transformer_engine_torch-*.whl
+      - transformer_engine_cu13-*.whl
+      - transformer_engine-*.whl
+
+  flash_attn:
+    repo: Dao-AILab/flash-attention
+    ref: v2.8.3
+    version: 2.8.3
+    patches:
+      - upstream_prs/flash_attn_setup_sm120f.patch
+    build: |
+      MAX_JOBS=1 NVCC_THREADS=2 \
+        pip wheel . --no-build-isolation -w /wheels
+    produces:
+      - flash_attn-*.whl
+
+  mamba_ssm:
+    repo: state-spaces/mamba
+    ref: 31f3d7b
+    version: 2.3.1
+    build: |
+      MAX_JOBS=1 NVCC_THREADS=2 \
+        pip wheel . --no-build-isolation -w /wheels
+    produces:
+      - mamba_ssm-*.whl
+
+  causal_conv1d:
+    repo: Dao-AILab/causal-conv1d
+    ref: v1.6.1
+    version: 1.6.1
+    build: |
+      MAX_JOBS=1 NVCC_THREADS=2 \
+        pip wheel . --no-build-isolation -w /wheels
+    produces:
+      - causal_conv1d-*.whl
+
+  fast_hadamard_transform:
+    repo: Dao-AILab/fast-hadamard-transform
+    ref: main
+    version: 1.1.0
+    build: |
+      MAX_JOBS=1 NVCC_THREADS=2 \
+        pip wheel . --no-build-isolation -w /wheels
+    produces:
+      - fast_hadamard_transform-*.whl
+
+  tilelang:
+    repo: tile-ai/tilelang
+    ref: f309d814
+    version: 0.1.8+cuda.gitf309d814
+    submodules: true
+    build: |
+      pip wheel . --no-build-isolation -w /wheels
+    produces:
+      - tilelang-*.whl
+
+  qoptim_cuda:
+    repo: NVlabs/COAT
+    ref: main
+    version: 0.0.0
+    subdir: coat/optimizer/kernels
+    build: |
+      MAX_JOBS=1 NVCC_THREADS=2 \
+        pip wheel . --no-build-isolation -w /wheels
+    produces:
+      - qoptim_cuda-*.whl
+
+# Repos cloned at runtime in the final image (not built as wheels).
+sources:
+  megatron_lm:
+    repo: jewelmusicee/Megatron-LM
+    ref: cppmega/bench3-fork
+    install_path: /opt/megatron-lm
+    install_mode: editable    # `pip install -e .`
+
+# Final runtime image
+image:
+  registry: ghcr.io/jewelmusicee/cppmega
+  buildcache_tag: buildcache
+  tags:
+    - "{{ git_sha }}"
+    - latest

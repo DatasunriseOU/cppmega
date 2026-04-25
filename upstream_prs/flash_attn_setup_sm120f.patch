@@ -1,0 +1,21 @@
+From: cppmega
+Subject: setup.py: emit sm_120f code for CUDA >= 12.9
+
+Upstream emits arch=compute_120,code=sm_120. CUDA 12.9+ ships PTX/SASS for
+sm_120f (Blackwell consumer) which is what GB10 / B40 / RTX5090 actually
+need. Keep the legacy sm_120 path for CUDA 12.8.
+
+--- a/setup.py
++++ b/setup.py
+@@ -188,7 +188,10 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
+             cc_flag.append("arch=compute_100,code=sm_100")
+         if bare_metal_version >= Version("12.8") and "120" in cuda_archs():
+             cc_flag.append("-gencode")
+-            cc_flag.append("arch=compute_120,code=sm_120")
++            if bare_metal_version >= Version("12.9"):
++                cc_flag.append("arch=compute_120f,code=sm_120")
++            else:
++                cc_flag.append("arch=compute_120,code=sm_120")
+
+     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
+     # torch._C._GLIBCXX_USE_CXX11_ABI
