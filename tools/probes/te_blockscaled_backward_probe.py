@@ -21,7 +21,7 @@ import json
 import os
 from pathlib import Path
 import time
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
@@ -51,13 +51,23 @@ def _max_abs(out: torch.Tensor, ref: torch.Tensor) -> float:
     return float((out.float() - ref.float()).abs().max().item())
 
 
-def _record_success(name: str, out: torch.Tensor, ref: torch.Tensor) -> dict[str, Any]:
+def _record_success(
+    name: str,
+    out: torch.Tensor,
+    ref: torch.Tensor,
+    *,
+    rel_l2_limit: float | None = None,
+) -> dict[str, Any]:
+    rel_l2 = _rel_l2(out, ref)
+    status = "pass"
+    if rel_l2_limit is not None and rel_l2 > rel_l2_limit:
+        status = "bad_math"
     return {
         "name": name,
-        "status": "pass",
+        "status": status,
         "shape": list(out.shape),
         "max_abs": _max_abs(out, ref),
-        "rel_l2": _rel_l2(out, ref),
+        "rel_l2": rel_l2,
     }
 
 
@@ -75,12 +85,13 @@ def _try_gemm(
     ref: torch.Tensor,
     gemm_fn: Any,
     *args: Any,
+    rel_l2_limit: float | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
     try:
         out, *_ = gemm_fn(*args, **kwargs)
         torch.cuda.synchronize()
-        return _record_success(name, out, ref)
+        return _record_success(name, out, ref, rel_l2_limit=rel_l2_limit)
     except Exception as exc:  # pragma: no cover - this is a probe
         try:
             torch.cuda.synchronize()
@@ -113,8 +124,22 @@ def _nvfp4_quantize(tensor: torch.Tensor, *, columnwise: bool, is_weight: bool) 
     return quantizer(tensor)
 
 
-def _mxfp8_columnwise_as_rowwise_transpose(tensor: Any) -> MXFP8Tensor:
-    """Build a rowwise MXFP8 tensor for ``tensor.T`` from columnwise payloads."""
+_RetargetMode = Literal["copy", "view", "reshape"]
+
+
+def _mxfp8_retarget_columnwise_as_rowwise_transpose(
+    tensor: Any,
+    *,
+    data_mode: _RetargetMode = "copy",
+    scale_mode: _RetargetMode = "copy",
+) -> MXFP8Tensor:
+    """Build a rowwise MXFP8 tensor for ``tensor.T`` from columnwise payloads.
+
+    ``copy`` is the accepted adapter path. ``view`` and ``reshape`` are no-copy
+    probes that keep the same storage and change only tensor metadata. TE's
+    current MXFP8 C++ converter ignores PyTorch strides, so these modes are
+    expected to demonstrate wrong math rather than provide a production path.
+    """
 
     if tensor._with_gemm_swizzled_scales:
         raise ValueError("MXFP8 transpose adapter requires compact, non-swizzled scales")
@@ -126,8 +151,19 @@ def _mxfp8_columnwise_as_rowwise_transpose(tensor: Any) -> MXFP8Tensor:
     if tensor._columnwise_scale_inv.dim() != 2:
         raise ValueError("MXFP8 transpose adapter requires 2D compact scales")
     data_2d = tensor._columnwise_data.reshape(-1, tensor._columnwise_data.shape[-1])
-    rowwise_data = data_2d.t().contiguous()
-    rowwise_scale_inv = tensor._columnwise_scale_inv.t().contiguous()
+    scale = tensor._columnwise_scale_inv
+
+    def _retarget_2d(source: torch.Tensor, mode: _RetargetMode) -> torch.Tensor:
+        if mode == "copy":
+            return source.t().contiguous()
+        if mode == "view":
+            return source.t()
+        if mode == "reshape":
+            return source.reshape(source.shape[1], source.shape[0])
+        raise ValueError(f"unsupported retarget mode: {mode}")
+
+    rowwise_data = _retarget_2d(data_2d, data_mode)
+    rowwise_scale_inv = _retarget_2d(scale, scale_mode)
     quantizer = MXFP8Quantizer(tensor._fp8_dtype, rowwise=True, columnwise=False)
     quantizer.internal = True
     quantizer.optimize_for_gemm = False
@@ -143,6 +179,77 @@ def _mxfp8_columnwise_as_rowwise_transpose(tensor: Any) -> MXFP8Tensor:
         requires_grad=False,
         with_gemm_swizzled_scales=False,
     )
+
+
+def _mxfp8_columnwise_as_rowwise_transpose(tensor: Any) -> MXFP8Tensor:
+    """Build a rowwise MXFP8 tensor for ``tensor.T`` from copied columnwise payloads."""
+
+    return _mxfp8_retarget_columnwise_as_rowwise_transpose(tensor)
+
+
+def _mxfp8_transpose_copy_bytes(tensor: Any) -> int:
+    if tensor._columnwise_data is None or tensor._columnwise_scale_inv is None:
+        return 0
+    return int(tensor._columnwise_data.numel() + tensor._columnwise_scale_inv.numel())
+
+
+def _append_mxfp8_nocopy_probe_results(
+    results: list[dict[str, Any]],
+    refs: dict[str, torch.Tensor],
+    xq: Any,
+    wq: Any,
+    dyq: Any,
+    *,
+    rel_l2_limit: float,
+) -> None:
+    """Exercise no-copy retargeting variants that should fail accuracy today."""
+
+    variants: tuple[tuple[str, _RetargetMode, _RetargetMode], ...] = (
+        ("copy_data_copy_scale", "copy", "copy"),
+        ("view_data_copy_scale", "view", "copy"),
+        ("copy_data_view_scale", "copy", "view"),
+        ("view_data_view_scale", "view", "view"),
+        ("reshape_data_reshape_scale", "reshape", "reshape"),
+    )
+    for variant_name, data_mode, scale_mode in variants:
+        weight_t = _mxfp8_retarget_columnwise_as_rowwise_transpose(
+            wq, data_mode=data_mode, scale_mode=scale_mode
+        )
+        results.append(
+            _try_gemm(
+                f"mxfp8_dgrad_adapter_TN_{variant_name}",
+                refs["dgrad"],
+                general_gemm,
+                weight_t,
+                dyq,
+                out_dtype=torch.bfloat16,
+                layout="TN",
+                grad=True,
+                use_split_accumulator=False,
+                rel_l2_limit=rel_l2_limit,
+            )
+        )
+
+        x_t = _mxfp8_retarget_columnwise_as_rowwise_transpose(
+            xq, data_mode=data_mode, scale_mode=scale_mode
+        )
+        dy_t = _mxfp8_retarget_columnwise_as_rowwise_transpose(
+            dyq, data_mode=data_mode, scale_mode=scale_mode
+        )
+        results.append(
+            _try_gemm(
+                f"mxfp8_wgrad_adapter_TN_{variant_name}",
+                refs["wgrad"],
+                general_gemm,
+                x_t,
+                dy_t,
+                out_dtype=torch.bfloat16,
+                layout="TN",
+                grad=True,
+                use_split_accumulator=False,
+                rel_l2_limit=rel_l2_limit,
+            )
+        )
 
 
 def _run(args: argparse.Namespace) -> dict[str, Any]:
@@ -173,6 +280,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         xq = _mxfp8_quantize(x, columnwise=True)
         wq = _mxfp8_quantize(weight, columnwise=True)
         dyq = _mxfp8_quantize(dy, columnwise=True)
+        mxfp8_copy_bytes = {
+            "dgrad_payload_and_scale_bytes": _mxfp8_transpose_copy_bytes(wq),
+            "wgrad_payload_and_scale_bytes": (
+                _mxfp8_transpose_copy_bytes(xq) + _mxfp8_transpose_copy_bytes(dyq)
+            ),
+        }
         results.append(
             _try_gemm(
                 "mxfp8_fprop_native_TN",
@@ -185,6 +298,16 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 use_split_accumulator=False,
             )
         )
+
+        if args.probe_nocopy:
+            _append_mxfp8_nocopy_probe_results(
+                results,
+                refs,
+                xq,
+                wq,
+                dyq,
+                rel_l2_limit=args.nocopy_rel_l2_limit,
+            )
         results.append(
             _try_gemm(
                 "mxfp8_dgrad_native_NN",
@@ -322,6 +445,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "use_shim": args.use_shim,
         "results": results,
     }
+    if args.format in ("mxfp8", "both"):
+        report["mxfp8_adapter_copy_bytes"] = mxfp8_copy_bytes
     if shim_module is not None and hasattr(shim_module, "cppmega_te_mxfp8_bwd_stats_snapshot"):
         report["shim_stats"] = shim_module.cppmega_te_mxfp8_bwd_stats_snapshot()
     return report
@@ -338,6 +463,20 @@ def main() -> None:
         "--use-shim",
         action="store_true",
         help="Load scripts/cppmega_fp8_shim.py and verify NN/NT calls are routed by the shim.",
+    )
+    parser.add_argument(
+        "--probe-nocopy",
+        action="store_true",
+        help=(
+            "Also run experimental no-copy MXFP8 transpose retargeting variants. "
+            "These are expected to report bad_math on current TE."
+        ),
+    )
+    parser.add_argument(
+        "--nocopy-rel-l2-limit",
+        type=float,
+        default=0.15,
+        help="Relative L2 threshold used to mark no-copy retargeting variants as bad_math.",
     )
     args = parser.parse_args()
 
