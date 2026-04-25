@@ -7,6 +7,11 @@ cppmega/megatron/__pycache__/*
 .omx/*
 .tmp/*
 
+# Editor / sed -i.bak / BSD sed -i '' artefacts
+*.sh-e
+*.bak
+*.orig
+
 # Training artefacts (large; created on bench3 / europe). DO NOT stash —
 # git stash --include-untracked would attempt to pickle 76+ GiB of
 # checkpoint shards and hang for 7+ min per call.
