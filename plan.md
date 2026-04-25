@@ -8,6 +8,12 @@ Detailed implementation note:
 Current session note:
 [`docs/gb10_local_memory_perf_2026_04_25.md`](docs/gb10_local_memory_perf_2026_04_25.md).
 
+Deprecated-path gates:
+[`docs/deprecated_path_gates_2026_04_25.md`](docs/deprecated_path_gates_2026_04_25.md).
+
+Dense MXFP8 status:
+[`docs/gb10_dense_mxfp8_status_2026_04_25.md`](docs/gb10_dense_mxfp8_status_2026_04_25.md).
+
 Completed in this checkpoint:
 
 - Blockwise int8/uint8 Muon momentum extension exists and is covered by CUDA

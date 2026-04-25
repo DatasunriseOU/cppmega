@@ -23,6 +23,7 @@ from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
 from cppmega.megatron.custom_gpt_model import CppMegaGPTModel
+from cppmega.megatron.deprecated_paths import require_deprecated_ack
 
 
 def cppmega_gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
@@ -33,6 +34,12 @@ def cppmega_gpt_builder(args, pre_process, post_process, vp_stage=None, config=N
         else:
             config = core_transformer_config_from_args(args)
     if args.use_legacy_models:
+        require_deprecated_ack(
+            feature="--use-legacy-models in cppmega GPT builder",
+            ack_env="CPPMEGA_I_UNDERSTAND_MEGATRON_LEGACY_GPT_MODEL_IS_DEPRECATED",
+            replacement="Megatron Core GPTModel via --use-mcore-models",
+            reason="The legacy Megatron model path bypasses cppmega/MCore feature hooks.",
+        )
         return megatron.legacy.model.GPTModel(
             config,
             num_tokentypes=0,

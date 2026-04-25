@@ -36,6 +36,7 @@ discretization, complex RoPE, and QK normalization.
 from __future__ import annotations
 
 import math
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -342,6 +343,18 @@ class NoConvMambaMixerSubmodules:
         self.out_proj = out_proj
 
 
+def _is_mxfp8_recipe(config: TransformerConfig) -> bool:
+    if os.environ.get("CPPMEGA_PAD_MAMBA_IN_PROJ_FOR_MXFP8", "0") == "1":
+        return True
+    return str(getattr(config, "fp8_recipe", "")).split(".")[-1] == "mxfp8"
+
+
+def _pad_local_dim_for_mxfp8(local_dim: int, config: TransformerConfig) -> int:
+    if not _is_mxfp8_recipe(config):
+        return 0
+    return (-int(local_dim)) % 32
+
+
 class NoConvMambaMixer(MegatronModule):
     """Megatron-native Mamba mixer without conv1d.
 
@@ -444,11 +457,29 @@ class NoConvMambaMixer(MegatronModule):
         assert not bias
         assert not self.norm_before_gate
 
+        in_proj_partition_sizes = [
+            self.d_inner_local,   # z
+            self.d_inner_local,   # x
+            self.ngroups_local * self.d_state,  # B
+            self.ngroups_local * self.d_state,  # C
+            self.nheads_local,    # dt
+        ]
+        self._in_proj_logical_dim_local = sum(in_proj_partition_sizes)
+        self._in_proj_mxfp8_pad_dim_local = _pad_local_dim_for_mxfp8(
+            self._in_proj_logical_dim_local, self.config
+        )
+        in_proj_output_size = (
+            self.d_inner * 2
+            + 2 * self.ngroups * self.d_state
+            + self.nheads
+            + self._in_proj_mxfp8_pad_dim_local * tp_size
+        )
+
         # -- in_proj: [z, x, B, C, dt] packed into one ColumnParallelLinear --
         self.in_proj = build_module(
             submodules.in_proj,
             self.d_model,
-            self.d_inner * 2 + 2 * self.ngroups * self.d_state + self.nheads,
+            in_proj_output_size,
             config=self.config,
             init_method=self.config.init_method,
             gather_output=False,
@@ -458,13 +489,11 @@ class NoConvMambaMixer(MegatronModule):
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
         )
-        in_proj_partition_sizes = [
-            self.d_inner_local,   # z
-            self.d_inner_local,   # x
-            self.ngroups_local * self.d_state,  # B
-            self.ngroups_local * self.d_state,  # C
-            self.nheads_local,    # dt
-        ]
+        if self._in_proj_mxfp8_pad_dim_local:
+            in_proj_partition_sizes = [
+                *in_proj_partition_sizes,
+                self._in_proj_mxfp8_pad_dim_local,
+            ]
         setattr(self.in_proj.weight, "partition_sizes", in_proj_partition_sizes)
 
         # -- NO conv1d -- this is the whole point.
@@ -577,6 +606,8 @@ class NoConvMambaMixer(MegatronModule):
           3. Call ``mamba_chunk_scan_combined`` with pre-split tensors.
         """
         # transpose: (seq, batch, proj) -> (batch, seq, proj)
+        if self._in_proj_mxfp8_pad_dim_local:
+            zxBCdt = zxBCdt[..., : self._in_proj_logical_dim_local]
         zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
 
         A = -torch.exp(self.A_log.float())
@@ -694,22 +725,6 @@ class Mamba3NoConvMixer(Mamba3ScanMixin, NoConvMambaMixer):
             pg_collection=pg_collection, pp_layer_offset=pp_layer_offset,
         )
 
-        # Override in_proj to include dd_A, trap, angles
-        new_out_dim = (
-            self.d_inner * 2
-            + 2 * self.ngroups * self.d_state
-            + 3 * self.nheads
-            + self._n_rope_angles
-        )
-
-        self.in_proj = build_module(
-            submodules.in_proj, self.d_model, new_out_dim,
-            config=self.config, init_method=self.config.init_method,
-            gather_output=False, bias=bias, skip_bias_add=False,
-            is_expert=False, tp_comm_buffer_name="fc1",
-            tp_group=self.pg_collection.tp,
-        )
-
         in_proj_partition_sizes = [
             self.d_inner_local,
             self.d_inner_local,
@@ -720,6 +735,32 @@ class Mamba3NoConvMixer(Mamba3ScanMixin, NoConvMambaMixer):
             self.nheads_local,
             self._n_rope_angles,
         ]
+        self._in_proj_logical_dim_local = sum(in_proj_partition_sizes)
+        self._in_proj_mxfp8_pad_dim_local = _pad_local_dim_for_mxfp8(
+            self._in_proj_logical_dim_local, self.config
+        )
+
+        # Override in_proj to include dd_A, trap, angles.
+        new_out_dim = (
+            self.d_inner * 2
+            + 2 * self.ngroups * self.d_state
+            + 3 * self.nheads
+            + self._n_rope_angles
+            + self._in_proj_mxfp8_pad_dim_local * self.pg_collection.tp.size()
+        )
+
+        self.in_proj = build_module(
+            submodules.in_proj, self.d_model, new_out_dim,
+            config=self.config, init_method=self.config.init_method,
+            gather_output=False, bias=bias, skip_bias_add=False,
+            is_expert=False, tp_comm_buffer_name="fc1",
+            tp_group=self.pg_collection.tp,
+        )
+        if self._in_proj_mxfp8_pad_dim_local:
+            in_proj_partition_sizes = [
+                *in_proj_partition_sizes,
+                self._in_proj_mxfp8_pad_dim_local,
+            ]
         setattr(self.in_proj.weight, "partition_sizes", in_proj_partition_sizes)
 
         # QK-norm and bias parameters
@@ -742,6 +783,8 @@ class Mamba3NoConvMixer(Mamba3ScanMixin, NoConvMambaMixer):
 
     def _ssm_noconv(self, zxBCdt: torch.Tensor) -> torch.Tensor:
         """SSM computation with full Mamba3 feature pre-processing."""
+        if self._in_proj_mxfp8_pad_dim_local:
+            zxBCdt = zxBCdt[..., : self._in_proj_logical_dim_local]
         zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
 
         z, x, B, C, dd_dt, dd_A, trap, angles = torch.split(
@@ -870,6 +913,8 @@ class NoConvMamba3BCMixer(NoConvMambaMixer):
         All preprocessing is small per-layer overhead vs the scan kernel; no
         extra kernel launches for bias add (fused with norm's output).
         """
+        if self._in_proj_mxfp8_pad_dim_local:
+            zxBCdt = zxBCdt[..., : self._in_proj_logical_dim_local]
         zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
 
         A = -torch.exp(self.A_log.float())
