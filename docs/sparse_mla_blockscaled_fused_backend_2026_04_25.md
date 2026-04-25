@@ -93,6 +93,30 @@ Not production-ready:
 - Gradients are returned with respect to the logical dequantized Q/KV tensors,
   not with respect to FP8 bytes or scale tensors.
 
+Additional 2026-04-25 unsafe-kernel check:
+
+```text
+CPPMEGA_SPARSE_MLA_BLOCKSCALED_FUSED=1
+CPPMEGA_SPARSE_MLA_BLOCKSCALED_TILELANG_BWD_UNSAFE=1
+MCORE_DSA_TILELANG_SEQ_BUCKET=1
+MCORE_DSA_TILELANG_TOPK_BUCKET=64
+```
+
+Direct small-shape calls still produced non-finite gradients even with no
+padding and with `invalid_fraction=0.0`:
+
+```text
+H=16: dq NaNs=640,  dkv NaNs=5504
+H=28: dq NaNs=896,  dkv NaNs=5504
+H=32: dq NaNs=1408, dkv NaNs=5504
+H=64: dq NaNs=2303, dkv NaNs=5504
+```
+
+Forward output and LSE were finite, and the preprocess kernel was finite in
+isolation. The remaining bug is inside the unsafe TileLang backward mainloop
+or block-scaled score recompute, not the public wrapper. Do not route training
+through this kernel until it has a finite-gradient parity test.
+
 ## Validation
 
 Syntax check:
@@ -116,8 +140,8 @@ python tools/probes/sparse_mla_blockscaled_fused_probe.py \
 Result:
 
 ```text
-runtime_fwd_ms=0.5460 ref_fwd_ms=0.5775
-runtime_bwd_reference_ms=1.0491 ref_bwd_ms=36.2454
+runtime_fwd_ms=0.5708 ref_fwd_ms=0.5652
+runtime_bwd_reference_ms=1.9864 ref_bwd_ms=34.2854
 fwd_max_abs=0.000244141
 lse_nat_max_abs=4.76837e-07
 dq_max_abs=0 dkv_max_abs=0
@@ -149,6 +173,26 @@ materialization runtime_forward_full_scores=False runtime_forward_full_bf16_qkv=
 
 The large relative forward errors in the probe are from near-zero reference
 elements; absolute error is the useful signal for these small random tensors.
+
+## Hugging Face Kernel Search
+
+No Hugging Face kernel found on 2026-04-25 is a drop-in replacement for this
+SparseMLA training backend:
+
+- `kernels-community/flash-mla` / DeepSeek FlashMLA is the closest forward
+  reference, but it is sparse MLA forward/decode-oriented, uses a different FP8
+  KV cache ABI, and does not provide MXFP8 block-scaled sparse training
+  backward.
+- FlashAttention-4/FlexAttention is useful as a backward and block-sparse
+  scheduling reference, but it is not token-topk SparseMLA and not this
+  `q_data/kv_data/q_scale/kv_scale` ABI.
+- `finegrained-fp8`, `fp8-fbgemm`, and DeepGEMM-style kernels are useful GEMM
+  references, not fused sparse online-softmax/PV backward replacements.
+- vLLM/FlashInfer MLA sparse paths are inference/decode paths, not training
+  backward.
+
+Conclusion: clone/probe FlashMLA and FA4/FlexAttention for ideas, but keep the
+cppmega ABI and implement the MXFP8 SparseMLA backward here.
 
 ## Sharding Implications
 

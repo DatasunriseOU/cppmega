@@ -109,22 +109,39 @@ This completed one real-data train iteration on GB10. Metrics:
   `general_gemm` probe: it is forward-only and would not preserve the existing
   backward/weight-gradient contract.
 
-## 100-Step Real-Data A/B
+## Current 100-Step Real-Data A/B
 
 Both runs used the local GB10 quarter NAM56R script on real clang parquet data:
 `CPPMEGA_TRAIN_ITERS=100`, `CPPMEGA_MICRO_BATCH_SIZE=4`,
-`CPPMEGA_GLOBAL_BATCH_SIZE=4`, no nsys/torch profiler.
+`CPPMEGA_GLOBAL_BATCH_SIZE=4`, no nsys/torch profiler, real
+`clang_semantic_4k_v10_train`, sequence length 4096, FlashAttention, q8 Muon
+momentum, no-master BF16 fallback, Adam8bit scalar fallback, and contiguous DDP
+grad buffer disabled.
+
+Current logs:
+
+```text
+/home/dave/logs/gb10_100_tensorwise_mbs4_20260425_2025.log
+/home/dave/logs/gb10_100_mamba_mxfp8_tn_mbs4_20260425_2034.log
+```
 
 | Run | Train lm loss @100 | Val lm loss @100 | Test lm loss @100 | Avg ms/iter, steps 10-100 | Peak max allocated |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| TE tensorwise default | 1.568469 | 1.820359 | 1.891402 | 4460.641 | 25697.59 MB |
-| Mamba in/out MXFP8, old BF16 backward bridge | 1.577934 | 1.835458 | 1.890061 | 4624.763 | 25735.36 MB |
-| Mamba in/out MXFP8, TN backward adapter | 1.566162 | 1.826358 | 1.902454 | 4501.460 | 25737.67 MB |
+| TE tensorwise default | 1.608007 | 1.840445 | 1.917589 | 4437.158 | 25703.02 MB |
+| Mamba in/out MXFP8, TN backward adapter | 1.609526 | 1.855715 | 1.927164 | 4515.766 | 25737.33 MB |
 
-This run is a baseline for the old bridge path, not the target MXFP8 training
-path. It proves the model can survive 100 real-data steps when Mamba forward
-uses MXFP8 and backward dequantizes unsupported dgrad/wgrad operands to BF16,
-but it is not a win: it is about 3.7% slower and uses the same memory.
+Throughput:
+
+```text
+tensorwise steps 10-100: 3692.5 tok/s
+MXFP8/TN steps 10-100:  3628.2 tok/s
+```
+
+The MXFP8/TN path is numerically viable for this short run but is not a speed
+or memory win yet: it is about 1.8% slower and uses the same memory. The covered
+Mamba projections use MXFP8 forward and TE block-scaled backward through the
+TN-adapter route; the rest of the model remains on the regular tensorwise/BF16
+training path.
 
 The TN-adapter run hit the intended acceptance target for covered Mamba
 projections:
@@ -151,10 +168,79 @@ otherwise any attempt to enable `CPPMEGA_TE_MXFP8_DGRAD_BF16`,
 `CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK=1`, or
 `NVTE_BACKWARD_OVERRIDE=dequantized/high_precision` raises before training.
 
-The old bridge run showed larger transient grad-norm spikes in earlier smoke
-logs. The 100-step TN-adapter run also saw spikes (`grad_norm=787.971` at step
-100), but finished with no skipped or NaN iterations. Longer runs still need
-loss/grad-norm monitoring before making this a default.
+Both accepted runs finished with zero skipped and zero NaN iterations. Both had
+occasional transient grad-norm spikes on real batches:
+
+```text
+tensorwise max grad norm: 28002.506
+MXFP8/TN max grad norm:  16424.762
+```
+
+The spikes did not coincide with loss NaNs or skipped iterations, but longer
+runs should keep loss/grad-norm monitoring enabled before changing defaults.
+
+## GB10/H100/B200 Support Boundary
+
+Official support summary from the 2026-04-25 research pass:
+
+- CUDA lists H100/H200/GH200 as SM90, B200/GB200 as SM100, B300/GB300 as
+  SM103, and GB10/DGX Spark as SM121.
+- H100 does not support MXFP8 or NVFP4 training. It supports ordinary FP8 and
+  Hopper FP8 block-scaling modes with FP32 scales.
+- TE documents MXFP8 and NVFP4 training support for Blackwell datacenter
+  targets SM100/SM103. NVFP4 inference is listed as SM100+.
+- CUDA 13.2 release notes mention improved DGX Spark/GB10 GEMM performance for
+  MXFP8 and NVFP4, so GB10 has partial support.
+- cuBLAS layout rules point to TN-only coverage for Ada, Hopper, and Blackwell
+  GeForce/CC12.x-style paths. That matches local behavior: native MXFP8 TN
+  works, while native MXFP8 NN dgrad and NT wgrad return
+  `CUBLAS_STATUS_NOT_SUPPORTED`.
+
+Local probe result:
+
+```text
+mxfp8_fprop_native_TN: pass
+mxfp8_dgrad_native_NN: CUBLAS_STATUS_NOT_SUPPORTED
+mxfp8_wgrad_native_NT: CUBLAS_STATUS_NOT_SUPPORTED
+mxfp8_dgrad_shim_NN_to_TN: pass
+mxfp8_wgrad_shim_NT_to_TN: pass
+bf16_fallback_dgrad=0
+bf16_fallback_wgrad=0
+```
+
+Interpretation: GB10 can do standard BF16/FP16 and some MXFP8/NVFP4 matmuls,
+but it does not expose the same full block-scaled GEMM layout surface as B200
+through the current TE 2.14 + CUDA 13.2 stack. Adding this to TE is plausible
+as a lower-level adapter or emitter, but simply removing the transpose and
+calling the existing native NN/NT TE path is not currently supported on this
+machine.
+
+## Torch Profiler
+
+Short profiler captures:
+
+```text
+/home/dave/logs/gb10_prof_tensorwise_mbs4_20260425_2044_torch_profile/
+/home/dave/logs/gb10_prof_mamba_mxfp8_tn_mbs4_20260425_2046_torch_profile/
+```
+
+Step-6 profile highlights:
+
+| Area | Tensorwise step 6 | MXFP8/TN step 6 | Comment |
+| --- | ---: | ---: | --- |
+| `TensorParallelMuon.step` CUDA total | 2.597 s | 2.627 s | still top bottleneck |
+| `Optimizer.step` self CUDA | 1.497 s | 1.465 s | q8 Muon path dominates |
+| `LinearCrossEntropyFunctionBackward` | 796 ms | 797 ms | CCE backward is next large item |
+| `aten::addmm` CUDA total | 1.749 s | 1.809 s | GEMM aggregate slightly worse in MXFP8/TN |
+| `aten::copy_` self CUDA | 149 ms | 207 ms | extra copies/contiguous activity in MXFP8/TN |
+| `aten::clone` CUDA total | 100 ms | 142 ms | MXFP8/TN adds clone/contiguous pressure |
+| `FlashAttnFuncBackward` | 100 ms | 102 ms | FlashAttention is active and stable |
+| `_moe_chunk_sort` | 42 ms | 42 ms | MoE token movement remains visible |
+| `qmuon_update_multi_kernel` | 41 ms | 40 ms | q8 momentum kernel itself is not the whole optimizer cost |
+
+Next profiler targets are still: fuse/reduce Python and launch overhead around
+Muon/Newton-Schulz, reduce CCE backward cost, remove remaining copy/clone paths
+around MXFP8/TN, and then revisit MoE token movement.
 
 ## Next Viable Paths
 

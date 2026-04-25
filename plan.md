@@ -14,6 +14,9 @@ Deprecated-path gates:
 Dense MXFP8 status:
 [`docs/gb10_dense_mxfp8_status_2026_04_25.md`](docs/gb10_dense_mxfp8_status_2026_04_25.md).
 
+SparseMLA block-scaled fused prototype:
+[`docs/sparse_mla_blockscaled_fused_backend_2026_04_25.md`](docs/sparse_mla_blockscaled_fused_backend_2026_04_25.md).
+
 Completed in this checkpoint:
 
 - Blockwise int8/uint8 Muon momentum extension exists and is covered by CUDA
@@ -39,6 +42,9 @@ Completed in this checkpoint:
   local Megatron patch also rejects FP32 BF16-gradient accumulation/reduction.
 - Lion8bit scalar fallback is now an opt-in env override:
   `CPPMEGA_MUON_SCALAR_OPTIMIZER=lion8bit`.
+- Old agent worktrees have been reviewed, useful commits merged into `main`,
+  and stale worktrees removed. Current `git worktree list` contains only the
+  main checkout.
 
 Verified:
 
@@ -95,6 +101,48 @@ setup allocation: 6.832 GiB -> 3.422 GiB
 step-2 max_alloc: 29.224 GiB -> 25.095 GiB
 step-2 reserved:  31.740 GiB -> 26.408 GiB
 ```
+
+Current 100-step real-data A/B on GB10, MBS=4, seq=4096, real clang 4k v10:
+
+```text
+tensorwise:
+  final train lm / val / test: 1.608007 / 1.840445 / 1.917589
+  avg steps 10-100: 4437.158 ms, 3692.5 tok/s
+  peak max_alloc: 25703.02 MB
+  skipped/nan: 0/0
+
+mamba MXFP8 TN adapter:
+  final train lm / val / test: 1.609526 / 1.855715 / 1.927164
+  avg steps 10-100: 4515.766 ms, 3628.2 tok/s
+  peak max_alloc: 25737.33 MB
+  TE backward stats: dgrad/wgrad TN adapter 600/600, BF16 fallback 0/0
+  skipped/nan: 0/0
+```
+
+Conclusion: MXFP8/TN is correct enough for this short smoke and has no BF16
+fallback, but is still about 1.8% slower and memory-equivalent on GB10.
+
+Current torch profiler captures:
+
+```text
+/home/dave/logs/gb10_prof_tensorwise_mbs4_20260425_2044_torch_profile/
+/home/dave/logs/gb10_prof_mamba_mxfp8_tn_mbs4_20260425_2046_torch_profile/
+```
+
+Step-6 profiler signal:
+
+```text
+TensorParallelMuon.step CUDA total: 2.597s tensorwise, 2.627s MXFP8/TN
+CCE backward:                     ~796ms both
+aten::addmm CUDA total:            1.749s tensorwise, 1.809s MXFP8/TN
+aten::copy_ self CUDA:             149ms tensorwise, 207ms MXFP8/TN
+aten::clone CUDA total:            100ms tensorwise, 142ms MXFP8/TN
+FlashAttn backward:                ~100ms both
+qmuon_update_multi_kernel:         ~40ms both
+```
+
+The next performance work should focus on the Muon/Newton-Schulz envelope and
+MXFP8/TN copy/clone pressure, not on the q8 momentum update kernel alone.
 
 Lion8bit scalar fallback A/B:
 [`docs/lion8bit_ab_2026_04_25.md`](docs/lion8bit_ab_2026_04_25.md).
