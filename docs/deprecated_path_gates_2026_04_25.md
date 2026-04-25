@@ -51,6 +51,35 @@ Currently gated:
 - `scripts/remote_smoke_h200_structure_ingress.sh`
 - `scripts/remote_smoke_h200_ngram_hash_poly.sh`
 
+## GB10 Accepted-Path Validation
+
+Use the focused probe before treating a GB10 Mamba-MXFP8 run as accepted:
+
+```bash
+python tools/probes/gb10_accepted_path_validation.py --require-mxfp8-probe
+```
+
+The probe verifies that these old paths fail without their explicit ACK env
+vars: the MXFP8 BF16 backward bridge, DSA `gather_scatter`, and the legacy FP8
+activation packer. It then runs the TE block-scaled backward probe through
+`scripts/cppmega_fp8_shim.py` and requires `mxfp8_tn_adapter_{dgrad,wgrad}>0`,
+`bf16_fallback_{dgrad,wgrad}=0`, no native passthrough, and empty
+`fallback_reasons`.
+
+After an optional one-step local run, pass the log back to the same probe:
+
+```bash
+CPPMEGA_FP8_RECIPE=mxfp8 CPPMEGA_TRAIN_ITERS=1 \
+  scripts/local_gb10_quarter_train.sh
+
+python tools/probes/gb10_accepted_path_validation.py \
+  --skip-mxfp8-probe \
+  --train-log /home/dave/logs/<run_id>.log
+```
+
+The log parser extracts `lm`/`mtp_1` losses and the TE backward counters, then
+applies the same zero-BF16-fallback assertions.
+
 ## Policy
 
 New compatibility bridges should use
