@@ -57,7 +57,7 @@ wheels:
 
   fast_hadamard_transform:
     repo: Dao-AILab/fast-hadamard-transform
-    ref: main
+    ref: master
     version: 1.1.0
     build: |
       MAX_JOBS=1 NVCC_THREADS=2 \
