@@ -41,7 +41,14 @@ del ctypes, os, sys
 
 from cppmega.megatron.sparse_mla_ops.sparse_mla import (  # noqa: E402
     SparseMLA,
+    sparse_mla_blockscaled_mxfp8_backward,
+    sparse_mla_blockscaled_mxfp8_forward,
     sparse_mla_blockscaled_qk_scores,
 )
 
-__all__ = ["SparseMLA", "sparse_mla_blockscaled_qk_scores"]
+__all__ = [
+    "SparseMLA",
+    "sparse_mla_blockscaled_mxfp8_backward",
+    "sparse_mla_blockscaled_mxfp8_forward",
+    "sparse_mla_blockscaled_qk_scores",
+]
