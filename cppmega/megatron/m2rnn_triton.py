@@ -37,14 +37,21 @@ Where ``h_prev`` is the state *before* this step's update and
 in ``y[s]`` during the forward pass).
 
 Backward checkpoint strategy:
-    We always save the full y history (shape (B, S, H, K, V)) from the
-    forward.  The h_new candidate tensor (same shape) is OPTIONAL:
+    Forward saves only sparse recurrent-state checkpoints every
+    CPPMEGA_M2RNN_BWD_CHUNK_SIZE tokens (default: 64), not the full
+    y history (B, S, H, K, V).  Backward walks chunks in reverse, recomputes
+    that chunk's y into a temporary buffer, runs the local backward sweep,
+    then reuses the temporary for the next chunk.  At NAM56R full dims
+    (B=4, S=4096, H=44, K=64, V=16), replacing full saved y with default
+    fp32 checkpoints cuts forward saved recurrent state from ~1.38 GiB to
+    ~44.7 MiB; backward holds checkpoints plus one fp32 64-token temporary,
+    for ~89.4 MiB of recurrent checkpoint/recompute state.
+
+    The h_new candidate tensor is still optional:
     - CPPMEGA_M2RNN_SAVE_HNEW=0 (default): bwd recomputes h_new from
-      h_prev + k + v + W (one tl.dot + tanh per step, ~2 ms/layer extra).
-      Saves (B*S*H*K*V*2) bytes per R-layer.  At NAM56R full dims
-      (B=4, S=4096, H=44, K=64, V=16) that's ~1.4 GB/layer, ~5.6 GB total.
-    - CPPMEGA_M2RNN_SAVE_HNEW=1: bwd loads h_new from saved tensor (faster
-      bwd, but uses more memory).  Useful for debugging parity.
+      h_prev + k + v + W.
+    - CPPMEGA_M2RNN_SAVE_HNEW=1: fwd saves full h_new for debugging/perf
+      parity, at the cost of another full (B, S, H, K, V) tensor.
 
 Usage:
     from cppmega.megatron.m2rnn_triton import m2rnn_scan_triton
@@ -60,11 +67,22 @@ import torch
 
 # When True, the fwd kernel saves h_new (the pre-gate tanh candidate) to global
 # memory so the backward can load it directly.  When False (the default), the
-# backward RECOMPUTES h_new from h_prev + k + v + W, saving
-# (B * S * H * K * V * 2) bytes per R-layer call.  At NAM56R production dims
-# (B=4, S=4096, H=44, K=64, V=16) that is ~1.4 GB/layer, ~5.6 GB across 4
-# R-layers — the difference between OOM and fitting at MBS=5.
+# backward recomputes h_new from h_prev + k + v + W.
 _SAVE_HNEW: bool = os.environ.get("CPPMEGA_M2RNN_SAVE_HNEW", "0") == "1"
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+# Backward chunk length for checkpointed recompute.  Larger chunks reduce
+# kernel-launch overhead but increase the reusable y_chunk temporary.  Default
+# 64 gives ~32x lower forward saved recurrent state than full y at S=4096,
+# and ~16x lower peak while backward's reusable y_chunk is live.
+_BWD_CHUNK_SIZE: int = _env_int("CPPMEGA_M2RNN_BWD_CHUNK_SIZE", 64)
 
 
 # Lazy import of triton so importing this module on a CPU-only host still
@@ -118,12 +136,13 @@ if TRITON_AVAILABLE:
         W_ptr,
         xf_ptr,
         h0_ptr,
-        y_ptr,
+        ckpt_ptr,
         hnew_ptr,
         out_ptr,
         hfinal_ptr,
         HAS_H0: tl.constexpr,
         SAVE_HNEW: tl.constexpr,
+        BWD_CHUNK_SIZE: tl.constexpr,
         SEQ: tl.constexpr,
         NHEADS: tl.constexpr,
         K_DIM: tl.constexpr,
@@ -135,7 +154,7 @@ if TRITON_AVAILABLE:
         W_sh, W_sr, W_sc,
         xf_sb, xf_ss, xf_sh,
         h0_sb, h0_sh, h0_sk, h0_sv,
-        y_sb, y_ss, y_sh, y_sk, y_sv,
+        ckpt_sb, ckpt_sc, ckpt_sh, ckpt_sk, ckpt_sv,
         hn_sb, hn_ss, hn_sh, hn_sk, hn_sv,
         out_sb, out_ss, out_sh, out_sv,
         hf_sb, hf_sh, hf_sk, hf_sv,
@@ -143,8 +162,9 @@ if TRITON_AVAILABLE:
         """One program per (batch, head) pair.
 
         Maintains ``h`` (K_DIM x V_DIM) in registers; loops over SEQ steps.
-        For each step writes ``y[b, s, h]`` (the new state, used as saved
-        tensor for bwd) and ``out[b, s, h]`` (q @ h).
+        Writes ``out[b, s, h]`` (q @ h) for every step, but only stores
+        recurrent-state checkpoints every BWD_CHUNK_SIZE positions for
+        backward recompute.
         """
         b = tl.program_id(0)
         h_idx = tl.program_id(1)
@@ -170,6 +190,18 @@ if TRITON_AVAILABLE:
             ).to(tl.float32)
         else:
             h = tl.zeros((K_DIM, V_DIM), dtype=tl.float32)
+
+        # Checkpoint 0 is the state before the first token.  Checkpoints are
+        # fp32 so chunk recompute restarts from the same precision carried by
+        # the forward kernel, without saving the full per-token state history.
+        tl.store(
+            ckpt_ptr
+            + b * ckpt_sb
+            + h_idx * ckpt_sh
+            + offs_k[:, None] * ckpt_sk
+            + offs_v[None, :] * ckpt_sv,
+            h,
+        )
 
         for s in range(SEQ):
             # Load q_s, k_s, v_s, xf_s for this (b, h_idx)
@@ -227,16 +259,19 @@ if TRITON_AVAILABLE:
 
             h = xf_s * h + (1.0 - xf_s) * h_new
 
-            # Store y[b, s, h] = h  (the *new* gated state)
-            tl.store(
-                y_ptr
-                + b * y_sb
-                + s * y_ss
-                + h_idx * y_sh
-                + offs_k[:, None] * y_sk
-                + offs_v[None, :] * y_sv,
-                h,
-            )
+            # Store sparse checkpoint after each backward chunk and at the
+            # final partial chunk.  ckpt index 0 is the initial state.
+            if ((s + 1) % BWD_CHUNK_SIZE == 0) or (s == SEQ - 1):
+                ckpt_idx = (s + 1 + BWD_CHUNK_SIZE - 1) // BWD_CHUNK_SIZE
+                tl.store(
+                    ckpt_ptr
+                    + b * ckpt_sb
+                    + ckpt_idx * ckpt_sc
+                    + h_idx * ckpt_sh
+                    + offs_k[:, None] * ckpt_sk
+                    + offs_v[None, :] * ckpt_sv,
+                    h,
+                )
 
             # out_s = q_s @ h  (reduce over k): (V_DIM,)
             out_s = tl.sum(q_s[:, None] * h, axis=0)
@@ -507,6 +542,286 @@ if TRITON_AVAILABLE:
                 dh,
             )
 
+    @triton.jit
+    def _m2rnn_recompute_chunk_kernel(
+        # inputs
+        k_ptr,
+        v_ptr,
+        W_ptr,
+        xf_ptr,
+        ckpt_ptr,
+        # output
+        ychunk_ptr,
+        # runtime chunk coordinates
+        start,
+        ckpt_idx,
+        # constexpr shape
+        CHUNK_LEN: tl.constexpr,
+        K_DIM: tl.constexpr,
+        V_DIM: tl.constexpr,
+        # strides
+        k_sb, k_ss, k_sh, k_sk,
+        v_sb, v_ss, v_sh, v_sv,
+        W_sh, W_sr, W_sc,
+        xf_sb, xf_ss, xf_sh,
+        ckpt_sb, ckpt_sc, ckpt_sh, ckpt_sk, ckpt_sv,
+        yc_sb, yc_ss, yc_sh, yc_sk, yc_sv,
+    ):
+        """Recompute one chunk of recurrent states from a saved checkpoint.
+
+        ``ychunk[:, 0]`` is the start state, and ``ychunk[:, r + 1]`` is the
+        state after local step r.  The tensor is fp32 and reused for each
+        backward chunk.
+        """
+        b = tl.program_id(0)
+        h_idx = tl.program_id(1)
+
+        offs_k = tl.arange(0, K_DIM)
+        offs_v = tl.arange(0, V_DIM)
+
+        W_row = tl.arange(0, V_DIM)
+        W_col = tl.arange(0, V_DIM)
+        W = tl.load(
+            W_ptr + h_idx * W_sh + W_row[:, None] * W_sr + W_col[None, :] * W_sc
+        ).to(tl.float32)
+
+        h = tl.load(
+            ckpt_ptr
+            + b * ckpt_sb
+            + ckpt_idx * ckpt_sc
+            + h_idx * ckpt_sh
+            + offs_k[:, None] * ckpt_sk
+            + offs_v[None, :] * ckpt_sv,
+        ).to(tl.float32)
+
+        tl.store(
+            ychunk_ptr
+            + b * yc_sb
+            + h_idx * yc_sh
+            + offs_k[:, None] * yc_sk
+            + offs_v[None, :] * yc_sv,
+            h,
+        )
+
+        for r in range(CHUNK_LEN):
+            s = start + r
+            k_s = tl.load(
+                k_ptr + b * k_sb + s * k_ss + h_idx * k_sh + offs_k * k_sk,
+            ).to(tl.float32)
+            v_s = tl.load(
+                v_ptr + b * v_sb + s * v_ss + h_idx * v_sh + offs_v * v_sv,
+            ).to(tl.float32)
+            xf_s = tl.load(
+                xf_ptr + b * xf_sb + s * xf_ss + h_idx * xf_sh,
+            ).to(tl.float32)
+
+            x = k_s[:, None] * v_s[None, :]
+            hW = tl.dot(h, W, out_dtype=tl.float32, input_precision="ieee")
+            pre = hW + x
+            h_new = tl.inline_asm_elementwise(
+                asm="tanh.approx.f32 $0, $1;",
+                constraints="=f,f",
+                args=[pre],
+                dtype=tl.float32,
+                is_pure=True,
+                pack=1,
+            )
+            h = xf_s * h + (1.0 - xf_s) * h_new
+
+            tl.store(
+                ychunk_ptr
+                + b * yc_sb
+                + (r + 1) * yc_ss
+                + h_idx * yc_sh
+                + offs_k[:, None] * yc_sk
+                + offs_v[None, :] * yc_sv,
+                h,
+            )
+
+    @triton.jit
+    def _m2rnn_bwd_chunk_kernel(
+        # inputs
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        W_ptr,
+        xf_ptr,
+        ychunk_ptr,    # fp32 states for this chunk, with local start at index 0
+        hnew_ptr,      # optional full saved h_new tensor
+        dout_ptr,
+        # in/out carry and accumulated W slabs
+        dh_carry_ptr,
+        dW_ptr,
+        # gradient outputs
+        dq_ptr,
+        dk_ptr,
+        dv_ptr,
+        dxf_ptr,
+        # runtime chunk coordinate
+        start,
+        SAVE_HNEW: tl.constexpr,
+        CHUNK_LEN: tl.constexpr,
+        NHEADS: tl.constexpr,
+        K_DIM: tl.constexpr,
+        V_DIM: tl.constexpr,
+        q_sb, q_ss, q_sh, q_sk,
+        k_sb, k_ss, k_sh, k_sk,
+        v_sb, v_ss, v_sh, v_sv,
+        W_sh, W_sr, W_sc,
+        xf_sb, xf_ss, xf_sh,
+        yc_sb, yc_ss, yc_sh, yc_sk, yc_sv,
+        hn_sb, hn_ss, hn_sh, hn_sk, hn_sv,
+        dout_sb, dout_ss, dout_sh, dout_sv,
+        dhc_sb, dhc_sh, dhc_sk, dhc_sv,
+        dW_sbh, dW_sr, dW_sc,
+        dq_sb, dq_ss, dq_sh, dq_sk,
+        dk_sb, dk_ss, dk_sh, dk_sk,
+        dv_sb, dv_ss, dv_sh, dv_sv,
+        dxf_sb, dxf_ss, dxf_sh,
+    ):
+        """Backward sweep for one recomputed chunk.
+
+        ``dh_carry`` enters as dL/dh at the chunk end and is overwritten with
+        dL/dh at the chunk start.  ``dW_ptr`` accumulates per-(batch, head)
+        slabs across sequential chunk launches.
+        """
+        b = tl.program_id(0)
+        h_idx = tl.program_id(1)
+
+        offs_k = tl.arange(0, K_DIM)
+        offs_v = tl.arange(0, V_DIM)
+
+        W_row = tl.arange(0, V_DIM)
+        W_col = tl.arange(0, V_DIM)
+        W = tl.load(
+            W_ptr + h_idx * W_sh + W_row[:, None] * W_sr + W_col[None, :] * W_sc
+        ).to(tl.float32)
+        Wt = tl.trans(W)
+
+        dh = tl.load(
+            dh_carry_ptr
+            + b * dhc_sb
+            + h_idx * dhc_sh
+            + offs_k[:, None] * dhc_sk
+            + offs_v[None, :] * dhc_sv,
+        ).to(tl.float32)
+
+        bh = b * NHEADS + h_idx
+        dW = tl.load(
+            dW_ptr
+            + bh * dW_sbh
+            + W_row[:, None] * dW_sr
+            + W_col[None, :] * dW_sc,
+        ).to(tl.float32)
+
+        for r_rev in range(CHUNK_LEN):
+            r = CHUNK_LEN - 1 - r_rev
+            s = start + r
+
+            h_prev = tl.load(
+                ychunk_ptr
+                + b * yc_sb
+                + r * yc_ss
+                + h_idx * yc_sh
+                + offs_k[:, None] * yc_sk
+                + offs_v[None, :] * yc_sv,
+            ).to(tl.float32)
+            h_curr = tl.load(
+                ychunk_ptr
+                + b * yc_sb
+                + (r + 1) * yc_ss
+                + h_idx * yc_sh
+                + offs_k[:, None] * yc_sk
+                + offs_v[None, :] * yc_sv,
+            ).to(tl.float32)
+
+            q_s = tl.load(
+                q_ptr + b * q_sb + s * q_ss + h_idx * q_sh + offs_k * q_sk,
+            ).to(tl.float32)
+            k_s = tl.load(
+                k_ptr + b * k_sb + s * k_ss + h_idx * k_sh + offs_k * k_sk,
+            ).to(tl.float32)
+            v_s = tl.load(
+                v_ptr + b * v_sb + s * v_ss + h_idx * v_sh + offs_v * v_sv,
+            ).to(tl.float32)
+            xf_s = tl.load(
+                xf_ptr + b * xf_sb + s * xf_ss + h_idx * xf_sh,
+            ).to(tl.float32)
+            dy_s = tl.load(
+                dout_ptr + b * dout_sb + s * dout_ss + h_idx * dout_sh + offs_v * dout_sv,
+            ).to(tl.float32)
+
+            if SAVE_HNEW:
+                h_new = tl.load(
+                    hnew_ptr
+                    + b * hn_sb
+                    + s * hn_ss
+                    + h_idx * hn_sh
+                    + offs_k[:, None] * hn_sk
+                    + offs_v[None, :] * hn_sv,
+                ).to(tl.float32)
+            else:
+                x = k_s[:, None] * v_s[None, :]
+                hW = tl.dot(h_prev, W, out_dtype=tl.float32, input_precision="ieee")
+                pre = hW + x
+                h_new = tl.inline_asm_elementwise(
+                    asm="tanh.approx.f32 $0, $1;",
+                    constraints="=f,f",
+                    args=[pre],
+                    dtype=tl.float32,
+                    is_pure=True,
+                    pack=1,
+                )
+
+            dq_s = tl.sum(dy_s[None, :] * h_curr, axis=1)
+
+            dh = dh + q_s[:, None] * dy_s[None, :]
+
+            df_s = tl.sum((h_prev - h_new) * dh)
+            dh_new = (1.0 - xf_s) * dh
+            d_pre = dh_new * (1.0 - h_new * h_new)
+
+            dh_from_mm = tl.dot(d_pre, Wt, out_dtype=tl.float32, input_precision="ieee")
+            dW += tl.dot(tl.trans(h_prev), d_pre, out_dtype=tl.float32, input_precision="ieee")
+
+            dk_s = tl.sum(d_pre * v_s[None, :], axis=1)
+            dv_s = tl.sum(d_pre * k_s[:, None], axis=0)
+
+            dh = xf_s * dh + dh_from_mm
+
+            tl.store(
+                dq_ptr + b * dq_sb + s * dq_ss + h_idx * dq_sh + offs_k * dq_sk,
+                dq_s,
+            )
+            tl.store(
+                dk_ptr + b * dk_sb + s * dk_ss + h_idx * dk_sh + offs_k * dk_sk,
+                dk_s,
+            )
+            tl.store(
+                dv_ptr + b * dv_sb + s * dv_ss + h_idx * dv_sh + offs_v * dv_sv,
+                dv_s,
+            )
+            tl.store(
+                dxf_ptr + b * dxf_sb + s * dxf_ss + h_idx * dxf_sh,
+                df_s,
+            )
+
+        tl.store(
+            dW_ptr
+            + bh * dW_sbh
+            + W_row[:, None] * dW_sr
+            + W_col[None, :] * dW_sc,
+            dW,
+        )
+        tl.store(
+            dh_carry_ptr
+            + b * dhc_sb
+            + h_idx * dhc_sh
+            + offs_k[:, None] * dhc_sk
+            + offs_v[None, :] * dhc_sv,
+            dh,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Python wrappers + autograd.Function
@@ -561,14 +876,21 @@ class _M2RNNFn(torch.autograd.Function):
         xf_c = xf_b.contiguous()
 
         if h0 is None:
-            h0_c = torch.zeros(B, H, K_DIM, V_DIM, device=q.device, dtype=q.dtype)
+            # Valid pointer for the Triton signature; not read when HAS_H0=False.
+            h0_c = torch.empty(1, device=q.device, dtype=q.dtype)
             has_h0 = False
+            h0_dtype = None
         else:
             assert h0.shape == (B, H, K_DIM, V_DIM)
             h0_c = h0.contiguous()
             has_h0 = True
+            h0_dtype = h0.dtype
 
-        y = torch.empty(B, S, H, K_DIM, V_DIM, device=q.device, dtype=q.dtype)
+        chunk_size = _BWD_CHUNK_SIZE
+        num_chunks = (S + chunk_size - 1) // chunk_size
+        checkpoints = torch.empty(
+            B, num_chunks + 1, H, K_DIM, V_DIM, device=q.device, dtype=torch.float32
+        )
         if _SAVE_HNEW:
             h_new_save = torch.empty(B, S, H, K_DIM, V_DIM, device=q.device, dtype=q.dtype)
         else:
@@ -587,12 +909,13 @@ class _M2RNNFn(torch.autograd.Function):
             W_c,
             xf_c,
             h0_c,
-            y,
+            checkpoints,
             h_new_save,
             out,
             h_final,
             HAS_H0=has_h0,
             SAVE_HNEW=_SAVE_HNEW,
+            BWD_CHUNK_SIZE=chunk_size,
             SEQ=S,
             NHEADS=H,
             K_DIM=K_DIM,
@@ -602,8 +925,13 @@ class _M2RNNFn(torch.autograd.Function):
             v_sb=v_c.stride(0), v_ss=v_c.stride(1), v_sh=v_c.stride(2), v_sv=v_c.stride(3),
             W_sh=W_c.stride(0), W_sr=W_c.stride(1), W_sc=W_c.stride(2),
             xf_sb=xf_c.stride(0), xf_ss=xf_c.stride(1), xf_sh=xf_c.stride(2),
-            h0_sb=h0_c.stride(0), h0_sh=h0_c.stride(1), h0_sk=h0_c.stride(2), h0_sv=h0_c.stride(3),
-            y_sb=y.stride(0), y_ss=y.stride(1), y_sh=y.stride(2), y_sk=y.stride(3), y_sv=y.stride(4),
+            h0_sb=h0_c.stride(0) if has_h0 else 0,
+            h0_sh=h0_c.stride(1) if has_h0 else 0,
+            h0_sk=h0_c.stride(2) if has_h0 else 0,
+            h0_sv=h0_c.stride(3) if has_h0 else 0,
+            ckpt_sb=checkpoints.stride(0), ckpt_sc=checkpoints.stride(1),
+            ckpt_sh=checkpoints.stride(2), ckpt_sk=checkpoints.stride(3),
+            ckpt_sv=checkpoints.stride(4),
             hn_sb=h_new_save.stride(0) if _SAVE_HNEW else 0,
             hn_ss=h_new_save.stride(1) if _SAVE_HNEW else 0,
             hn_sh=h_new_save.stride(2) if _SAVE_HNEW else 0,
@@ -613,69 +941,127 @@ class _M2RNNFn(torch.autograd.Function):
             hf_sb=h_final.stride(0), hf_sh=h_final.stride(1), hf_sk=h_final.stride(2), hf_sv=h_final.stride(3),
         )
 
-        ctx.save_for_backward(q_c, k_c, v_c, W_c, xf_c, h0_c, y, h_new_save)
+        ctx.save_for_backward(q_c, k_c, v_c, W_c, xf_c, h0_c, checkpoints, h_new_save)
         ctx.has_h0 = has_h0
+        ctx.h0_dtype = h0_dtype
         ctx.save_hnew = _SAVE_HNEW
+        ctx.bwd_chunk_size = chunk_size
+        ctx.num_chunks = num_chunks
         ctx.orig_shapes = (q.shape, k.shape, v.shape, W.shape, xf.shape)
         return out, h_final
 
     @staticmethod
     def backward(ctx, dout, dh_final):
-        q_c, k_c, v_c, W_c, xf_c, h0_c, y, h_new_save = ctx.saved_tensors
+        q_c, k_c, v_c, W_c, xf_c, _h0_c, checkpoints, h_new_save = ctx.saved_tensors
         has_h0 = ctx.has_h0
         save_hnew = ctx.save_hnew
+        chunk_size = ctx.bwd_chunk_size
+        num_chunks = ctx.num_chunks
         orig_q_shape, orig_k_shape, orig_v_shape, orig_W_shape, orig_xf_shape = ctx.orig_shapes
 
         B, S, H, K_DIM = q_c.shape
         V_DIM = v_c.size(-1)
 
-        dout_c = dout.contiguous()
-        dhf_c = dh_final.contiguous() if dh_final is not None else torch.zeros_like(h0_c)
+        if dout is None:
+            dout_c = torch.zeros(B, S, H, V_DIM, device=q_c.device, dtype=q_c.dtype)
+        else:
+            dout_c = dout.contiguous()
+
+        if dh_final is None:
+            dh_carry = torch.zeros(B, H, K_DIM, V_DIM, device=q_c.device, dtype=torch.float32)
+        else:
+            # The chunk kernels overwrite this tensor with the carry for the
+            # previous chunk, so never mutate autograd's incoming grad tensor.
+            dh_carry = dh_final.to(torch.float32).contiguous().clone()
 
         dq = torch.empty_like(q_c)
         dk = torch.empty_like(k_c)
         dv = torch.empty_like(v_c)
         dxf = torch.empty_like(xf_c)
-        # Per-(batch*head) dW slabs; reduced across batch on host.
-        dW_slabs = torch.empty(B * H, V_DIM, V_DIM, device=q_c.device, dtype=torch.float32)
-        dh0 = torch.empty_like(h0_c) if has_h0 else torch.empty(1, device=q_c.device, dtype=q_c.dtype)
+        # Per-(batch*head) dW slabs; chunk kernels accumulate into these and
+        # host-side reduction sums over batch.
+        dW_slabs = torch.zeros(B * H, V_DIM, V_DIM, device=q_c.device, dtype=torch.float32)
+        max_chunk_len = min(chunk_size, S)
+        y_chunk = torch.empty(
+            B, max_chunk_len + 1, H, K_DIM, V_DIM, device=q_c.device, dtype=torch.float32
+        )
 
         grid = (B, H)
 
-        _m2rnn_bwd_kernel[grid](
-            q_c, k_c, v_c, W_c, xf_c, h0_c, y, h_new_save,
-            dout_c, dhf_c,
-            dq, dk, dv, dW_slabs, dxf, dh0,
-            HAS_H0=has_h0,
-            SAVE_HNEW=save_hnew,
-            SEQ=S,
-            NHEADS=H,
-            K_DIM=K_DIM,
-            V_DIM=V_DIM,
-            q_sb=q_c.stride(0), q_ss=q_c.stride(1), q_sh=q_c.stride(2), q_sk=q_c.stride(3),
-            k_sb=k_c.stride(0), k_ss=k_c.stride(1), k_sh=k_c.stride(2), k_sk=k_c.stride(3),
-            v_sb=v_c.stride(0), v_ss=v_c.stride(1), v_sh=v_c.stride(2), v_sv=v_c.stride(3),
-            W_sh=W_c.stride(0), W_sr=W_c.stride(1), W_sc=W_c.stride(2),
-            xf_sb=xf_c.stride(0), xf_ss=xf_c.stride(1), xf_sh=xf_c.stride(2),
-            h0_sb=h0_c.stride(0), h0_sh=h0_c.stride(1), h0_sk=h0_c.stride(2), h0_sv=h0_c.stride(3),
-            y_sb=y.stride(0), y_ss=y.stride(1), y_sh=y.stride(2), y_sk=y.stride(3), y_sv=y.stride(4),
-            hn_sb=h_new_save.stride(0) if save_hnew else 0,
-            hn_ss=h_new_save.stride(1) if save_hnew else 0,
-            hn_sh=h_new_save.stride(2) if save_hnew else 0,
-            hn_sk=h_new_save.stride(3) if save_hnew else 0,
-            hn_sv=h_new_save.stride(4) if save_hnew else 0,
-            dout_sb=dout_c.stride(0), dout_ss=dout_c.stride(1), dout_sh=dout_c.stride(2), dout_sv=dout_c.stride(3),
-            dhf_sb=dhf_c.stride(0), dhf_sh=dhf_c.stride(1), dhf_sk=dhf_c.stride(2), dhf_sv=dhf_c.stride(3),
-            dq_sb=dq.stride(0), dq_ss=dq.stride(1), dq_sh=dq.stride(2), dq_sk=dq.stride(3),
-            dk_sb=dk.stride(0), dk_ss=dk.stride(1), dk_sh=dk.stride(2), dk_sk=dk.stride(3),
-            dv_sb=dv.stride(0), dv_ss=dv.stride(1), dv_sh=dv.stride(2), dv_sv=dv.stride(3),
-            dW_sbh=dW_slabs.stride(0), dW_sr=dW_slabs.stride(1), dW_sc=dW_slabs.stride(2),
-            dxf_sb=dxf.stride(0), dxf_ss=dxf.stride(1), dxf_sh=dxf.stride(2),
-            dh0_sb=dh0.stride(0) if has_h0 else 0,
-            dh0_sh=dh0.stride(1) if has_h0 else 0,
-            dh0_sk=dh0.stride(2) if has_h0 else 0,
-            dh0_sv=dh0.stride(3) if has_h0 else 0,
-        )
+        for chunk_idx in range(num_chunks - 1, -1, -1):
+            start = chunk_idx * chunk_size
+            chunk_len = min(chunk_size, S - start)
+
+            _m2rnn_recompute_chunk_kernel[grid](
+                k_c,
+                v_c,
+                W_c,
+                xf_c,
+                checkpoints,
+                y_chunk,
+                start,
+                chunk_idx,
+                CHUNK_LEN=chunk_len,
+                K_DIM=K_DIM,
+                V_DIM=V_DIM,
+                k_sb=k_c.stride(0), k_ss=k_c.stride(1), k_sh=k_c.stride(2), k_sk=k_c.stride(3),
+                v_sb=v_c.stride(0), v_ss=v_c.stride(1), v_sh=v_c.stride(2), v_sv=v_c.stride(3),
+                W_sh=W_c.stride(0), W_sr=W_c.stride(1), W_sc=W_c.stride(2),
+                xf_sb=xf_c.stride(0), xf_ss=xf_c.stride(1), xf_sh=xf_c.stride(2),
+                ckpt_sb=checkpoints.stride(0), ckpt_sc=checkpoints.stride(1),
+                ckpt_sh=checkpoints.stride(2), ckpt_sk=checkpoints.stride(3),
+                ckpt_sv=checkpoints.stride(4),
+                yc_sb=y_chunk.stride(0), yc_ss=y_chunk.stride(1),
+                yc_sh=y_chunk.stride(2), yc_sk=y_chunk.stride(3), yc_sv=y_chunk.stride(4),
+                num_warps=4,
+                num_stages=3,
+            )
+
+            _m2rnn_bwd_chunk_kernel[grid](
+                q_c,
+                k_c,
+                v_c,
+                W_c,
+                xf_c,
+                y_chunk,
+                h_new_save,
+                dout_c,
+                dh_carry,
+                dW_slabs,
+                dq,
+                dk,
+                dv,
+                dxf,
+                start,
+                SAVE_HNEW=save_hnew,
+                CHUNK_LEN=chunk_len,
+                NHEADS=H,
+                K_DIM=K_DIM,
+                V_DIM=V_DIM,
+                q_sb=q_c.stride(0), q_ss=q_c.stride(1), q_sh=q_c.stride(2), q_sk=q_c.stride(3),
+                k_sb=k_c.stride(0), k_ss=k_c.stride(1), k_sh=k_c.stride(2), k_sk=k_c.stride(3),
+                v_sb=v_c.stride(0), v_ss=v_c.stride(1), v_sh=v_c.stride(2), v_sv=v_c.stride(3),
+                W_sh=W_c.stride(0), W_sr=W_c.stride(1), W_sc=W_c.stride(2),
+                xf_sb=xf_c.stride(0), xf_ss=xf_c.stride(1), xf_sh=xf_c.stride(2),
+                yc_sb=y_chunk.stride(0), yc_ss=y_chunk.stride(1),
+                yc_sh=y_chunk.stride(2), yc_sk=y_chunk.stride(3), yc_sv=y_chunk.stride(4),
+                hn_sb=h_new_save.stride(0) if save_hnew else 0,
+                hn_ss=h_new_save.stride(1) if save_hnew else 0,
+                hn_sh=h_new_save.stride(2) if save_hnew else 0,
+                hn_sk=h_new_save.stride(3) if save_hnew else 0,
+                hn_sv=h_new_save.stride(4) if save_hnew else 0,
+                dout_sb=dout_c.stride(0), dout_ss=dout_c.stride(1),
+                dout_sh=dout_c.stride(2), dout_sv=dout_c.stride(3),
+                dhc_sb=dh_carry.stride(0), dhc_sh=dh_carry.stride(1),
+                dhc_sk=dh_carry.stride(2), dhc_sv=dh_carry.stride(3),
+                dW_sbh=dW_slabs.stride(0), dW_sr=dW_slabs.stride(1), dW_sc=dW_slabs.stride(2),
+                dq_sb=dq.stride(0), dq_ss=dq.stride(1), dq_sh=dq.stride(2), dq_sk=dq.stride(3),
+                dk_sb=dk.stride(0), dk_ss=dk.stride(1), dk_sh=dk.stride(2), dk_sk=dk.stride(3),
+                dv_sb=dv.stride(0), dv_ss=dv.stride(1), dv_sh=dv.stride(2), dv_sv=dv.stride(3),
+                dxf_sb=dxf.stride(0), dxf_ss=dxf.stride(1), dxf_sh=dxf.stride(2),
+                num_warps=4,
+                num_stages=3,
+            )
 
         # Reduce dW slabs: (B*H, V, V) -> (H, V, V) by summing over batch.
         dW = dW_slabs.view(B, H, V_DIM, V_DIM).sum(dim=0).to(W_c.dtype)
@@ -689,7 +1075,7 @@ class _M2RNNFn(torch.autograd.Function):
         dW_out = _unbroadcast_heads(dW, orig_W_shape[0], dim=0)
         dxf_out = _unbroadcast_heads(dxf, orig_xf_shape[-1], dim=-1)
 
-        dh0_out = dh0 if has_h0 else None
+        dh0_out = dh_carry.to(ctx.h0_dtype) if has_h0 else None
 
         return dq_out, dk_out, dv_out, dW_out, dxf_out, dh0_out
 
