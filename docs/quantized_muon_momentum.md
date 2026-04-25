@@ -34,6 +34,10 @@ The CUDA extension provides two production-shaped update paths:
 - `quantized_muon_momentum_update_multi_and_normalize_`: same update, plus
   sum-of-squares collection in the update kernel, followed by in-place
   Frobenius normalization for Newton-Schulz input.
+- `quantized_muon_momentum_update_multi_and_normalize_groups_`: grouped/sliced
+  variant for fused QKV and sharded tensors. It accumulates one sumsq per
+  logical norm group, optionally all-reduces those sums over a tensor-parallel
+  process group, then scales every block by its group norm.
 
 The important property is that the BF16 grad buffer is reused as the
 Newton-Schulz input. There is no separate persistent BF16 momentum tensor and
@@ -60,6 +64,37 @@ For each 256-element block:
 
 The CUDA kernel uses a bitsandbytes-style element layout: 64 threads per block,
 4 elements per thread, for 256 elements per quantization block.
+
+## Grouped QKV And Sharding
+
+Grouped normalization is driven by reusable metadata:
+
+- `QuantizedMuonNormSegment(tensor_index, start, length, group_id)`
+- `build_quantized_muon_norm_plan(states, segments, num_groups=...)`
+- `QuantizedMuonNormPlan.block_group_ids`: one int64 group id per 256-value
+  quantization block.
+
+For fused QKV, build repeated segments with shared logical group ids:
+
+- Q segments -> `group_id=0`
+- K segments -> `group_id=1`
+- V segments -> `group_id=2`
+
+This matches current Megatron Muon semantics: Q, K, and V are normalized
+independently, even when the storage tensor is fused/interleaved.
+
+Shard contract:
+
+- Momentum state is local to each shard: int8/uint8 data plus local absmax.
+- Norm groups are logical and must use the same `group_id` order on every TP
+  rank.
+- Each rank builds a local `QuantizedMuonNormPlan` for its shard.
+- `quantized_muon_momentum_update_multi_and_normalize_groups_(..., tp_group=...)`
+  computes local group sums in the update kernel, all-reduces the `num_groups`
+  FP32 sums across `tp_group`, then scales local grads by the global norm.
+- Segment boundaries must align to 256-value quantization block boundaries,
+  except a segment ending at the tensor's final partial block. This keeps the
+  update kernel one-pass and avoids per-element segment lookup.
 
 ## Current GB10 Measurements
 
@@ -129,6 +164,111 @@ Post-patch profiler trace:
 qmuon_update_multi_kernel: 10 launches, 4.430 ms total, 443 us avg
 Memcpy HtoD metadata:      10 copies,   4.256 us total
 ```
+
+Grouped QKV path, int8 state, synthetic interleaved QKV shape
+`(4096, 3584)`, split `(2, 1, 1)`, 3072 segments, 57344 quantization blocks:
+
+```text
+fused_group_update_norm:      0.8950 ms
+update_plus_torch_qkv_norm:   1.9239 ms
+ratio:                        0.47x
+```
+
+PyTorch profiler, 10 grouped updates on the same shape:
+
+```text
+qmuon_update_multi_kernel:                  3.888 ms total, 388.8 us avg
+qmuon_scale_multi_by_group_from_sumsq:      2.541 ms total, 254.1 us avg
+benchmark DtoD grad copy:                   2.425 ms total, not part of real optimizer step
+```
+
+Nsight Compute report:
+
+```text
+/home/dave/logs/qmuon_qkv_grouped_ncu.ncu-rep
+```
+
+Key `ncu --set basic` metrics:
+
+```text
+qmuon_update_multi_kernel:
+  duration avg:             393.65 us
+  achieved occupancy avg:    80.69%
+  registers/thread:          26
+  memory throughput:         32.69%
+
+qmuon_scale_multi_by_group_from_sumsq_kernel:
+  duration avg:             254.77 us
+  achieved occupancy avg:    91.97%
+  registers/thread:          16
+  memory throughput:         14.27%
+```
+
+`ncu` command used:
+
+```bash
+sudo -E /usr/local/cuda/bin/ncu \
+  --target-processes all \
+  --kernel-name-base demangled \
+  --kernel-name 'regex:.*qmuon_(update_multi|scale_multi_by_group_from_sumsq)_kernel.*' \
+  --launch-skip 0 \
+  --launch-count 4 \
+  --set basic \
+  --force-overwrite \
+  --export /home/dave/logs/qmuon_qkv_grouped_ncu \
+  /home/dave/cppmega-venv/bin/python \
+  scripts/bench_quantized_muon_momentum.py \
+  --qkv-grouped --rows 4096 --cols 3584 --warmup 1 --iters 2 --storage int8
+```
+
+## Nsight Counter Permissions
+
+Official NVIDIA references:
+
+- <https://developer.nvidia.com/ERR_NVGPUCTRPERM>
+- <https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html>
+
+Current loaded driver state before reboot:
+
+```text
+/proc/driver/nvidia/params: RmProfilingAdminOnly: 1
+```
+
+Persistent Linux config installed:
+
+```bash
+sudo install -m 0644 /dev/stdin /etc/modprobe.d/nvidia-profiler-counters.conf <<'EOF'
+# Allow non-root Nsight Compute/Nsight Systems/CUPTI access to NVIDIA GPU
+# performance counters. Required to avoid ERR_NVGPUCTRPERM when profiling
+# qmuon and other CUDA kernels as the normal development user.
+#
+# NVIDIA official guidance:
+# https://developer.nvidia.com/ERR_NVGPUCTRPERM
+options nvidia NVreg_RestrictProfilingToAdminUsers=0
+EOF
+
+sudo update-initramfs -u -k all
+```
+
+The config is present in the current initrd:
+
+```bash
+lsinitramfs /boot/initrd.img-$(uname -r) | grep nvidia-profiler-counters
+```
+
+A reboot or a safe NVIDIA module unload/reload is still required for
+`RmProfilingAdminOnly` to become `0` in the loaded driver.
+
+Immediate profiling path used for this session:
+
+```bash
+sudo setcap cap_sys_admin+ep \
+  /usr/local/cuda-13.2/nsight-compute-2026.1.1/target/linux-desktop-t210-a64/ncu
+```
+
+Setting `cap_sys_admin` only on `ncu` was not enough for this GB10 userspace
+path: `ncu` connected, but counter collection still failed. Running `ncu` with
+`sudo -E` worked and produced `/home/dave/logs/qmuon_qkv_grouped_ncu.ncu-rep`.
 
 ## Correctness Coverage
 

@@ -5,10 +5,14 @@ import torch
 
 from cppmega.megatron.quantized_muon_momentum import (
     TRITON_AVAILABLE,
+    QuantizedMuonNormSegment,
+    build_quantized_muon_norm_plan,
     dequantize_momentum,
     empty_quantized_momentum_like,
     quantize_momentum_,
+    quantized_muon_momentum_update_multi_and_normalize_groups_,
     quantized_muon_momentum_update_multi_and_normalize_,
+    quantized_muon_momentum_update_multi_with_group_sumsq_,
     quantized_muon_momentum_update_multi_with_sumsq_,
     quantized_muon_momentum_update_,
     quantized_muon_momentum_update_multi_,
@@ -154,3 +158,116 @@ def test_cuda_multi_update_and_normalize_reuses_grad_as_ns_input():
     torch.testing.assert_close(inv_norm, inv_norm_expected, rtol=2.0e-5, atol=1.0e-8)
     for grad, upd in zip(grads, updated):
         torch.testing.assert_close(grad, (upd * inv_norm_expected).to(torch.bfloat16), rtol=0.0, atol=2.0e-2)
+
+
+def test_grouped_update_and_normalize_matches_qkv_slice_norms():
+    device = "cuda"
+    beta = 0.95
+    gen = torch.Generator(device=device).manual_seed(112233)
+    num_query_groups = 3
+    qkv_split = (2, 1, 1)
+    rows_per_group = sum(qkv_split)
+    cols = 256
+    shape = (num_query_groups * rows_per_group, cols)
+    old_m = 0.2 * torch.randn(shape, device=device, dtype=torch.bfloat16, generator=gen)
+    grad = 0.2 * torch.randn(shape, device=device, dtype=torch.bfloat16, generator=gen)
+
+    state = empty_quantized_momentum_like(old_m)
+    quantize_momentum_(state, old_m)
+    old_dequant = dequantize_momentum(state)
+    updated = beta * old_dequant + (1.0 - beta) * grad.float()
+
+    segments = []
+    for query_group in range(num_query_groups):
+        base_row = query_group * rows_per_group
+        cursor = base_row
+        for group_id, split_rows in enumerate(qkv_split):
+            start = cursor * cols
+            length = split_rows * cols
+            segments.append(
+                QuantizedMuonNormSegment(
+                    tensor_index=0,
+                    start=start,
+                    length=length,
+                    group_id=group_id,
+                )
+            )
+            cursor += split_rows
+    norm_plan = build_quantized_muon_norm_plan([state], segments, num_groups=3)
+
+    q_expected = []
+    for group_id, split_rows in enumerate(qkv_split):
+        pieces = []
+        for query_group in range(num_query_groups):
+            base = query_group * rows_per_group
+            row_start = base + sum(qkv_split[:group_id])
+            pieces.append(updated[row_start : row_start + split_rows])
+        q_expected.append(torch.cat([piece.reshape(-1) for piece in pieces]))
+    sumsq_expected = torch.stack([piece.square().sum() for piece in q_expected])
+    inv_expected = sumsq_expected.clamp_min(1e-14).rsqrt()
+
+    inv_norms = quantized_muon_momentum_update_multi_and_normalize_groups_(
+        [state],
+        [grad],
+        norm_plan,
+        beta=beta,
+    )
+
+    torch.testing.assert_close(inv_norms, inv_expected, rtol=2.0e-5, atol=1.0e-8)
+    for group_id, split_rows in enumerate(qkv_split):
+        for query_group in range(num_query_groups):
+            base = query_group * rows_per_group
+            row_start = base + sum(qkv_split[:group_id])
+            expected = (updated[row_start : row_start + split_rows] * inv_expected[group_id]).to(
+                torch.bfloat16
+            )
+            torch.testing.assert_close(
+                grad[row_start : row_start + split_rows],
+                expected,
+                rtol=0.0,
+                atol=2.0e-2,
+            )
+
+
+def test_grouped_sumsq_can_accumulate_one_logical_group_across_shards():
+    device = "cuda"
+    beta = 0.95
+    gen = torch.Generator(device=device).manual_seed(445566)
+    old_ms = [
+        0.2 * torch.randn((2, 256), device=device, dtype=torch.bfloat16, generator=gen),
+        0.2 * torch.randn((3, 256), device=device, dtype=torch.bfloat16, generator=gen),
+    ]
+    grads = [0.2 * torch.randn_like(old_m, generator=gen) for old_m in old_ms]
+    states = [empty_quantized_momentum_like(old_m) for old_m in old_ms]
+    for state, old_m in zip(states, old_ms):
+        quantize_momentum_(state, old_m)
+
+    updated = [
+        beta * dequantize_momentum(state) + (1.0 - beta) * grad.float()
+        for state, grad in zip(states, grads)
+    ]
+    segments = [
+        QuantizedMuonNormSegment(0, 0, old_ms[0].numel(), 0),
+        QuantizedMuonNormSegment(1, 0, old_ms[1].numel(), 0),
+    ]
+    norm_plan = build_quantized_muon_norm_plan(states, segments, num_groups=1)
+
+    group_sumsq = quantized_muon_momentum_update_multi_with_group_sumsq_(
+        states,
+        grads,
+        norm_plan,
+        beta=beta,
+    )
+    expected = torch.cat([u.reshape(-1) for u in updated]).square().sum().reshape(1)
+    torch.testing.assert_close(group_sumsq, expected, rtol=2.0e-5, atol=1.0e-3)
+
+
+def test_norm_plan_rejects_mid_block_qkv_boundary():
+    device = "cuda"
+    state = empty_quantized_momentum_like(torch.empty((513,), device=device, dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="segment end must align"):
+        build_quantized_muon_norm_plan(
+            [state],
+            [QuantizedMuonNormSegment(tensor_index=0, start=0, length=257, group_id=0)],
+            num_groups=1,
+        )
