@@ -149,6 +149,11 @@ export CPPMEGA_R_LAYER_INDICES="${CPPMEGA_R_LAYER_INDICES:-12,24,36,48}"
 export CPPMEGA_NGRAM_HASH_ENABLED="${CPPMEGA_NGRAM_HASH_ENABLED:-0}"
 export CPPMEGA_STRUCTURE_ENABLED="${CPPMEGA_STRUCTURE_ENABLED:-0}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CPPMEGA_OPTIMIZER="muon"
+export CPPMEGA_MUON_SCALAR_OPTIMIZER="adam8bit"
+export CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER=1
+export CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER=1
+export CPPMEGA_GRAD_REDUCE_IN_BF16=1
 
 # Start nvidia-smi logger in background for peak-mem capture
 NVSMI_LOG="${REMOTE_LOG%.log}.nvsmi.log"
@@ -201,6 +206,18 @@ DIST_OPT_ARGS=()
 if [ "${CPPMEGA_GB10_USE_DIST_OPT:-0}" = "1" ]; then
   DIST_OPT_ARGS+=(--use-distributed-optimizer)
 fi
+
+OPTIMIZER_ARGS=(
+  --optimizer "${CPPMEGA_OPTIMIZER}"
+  --muon-momentum 0.95
+  --muon-scale-mode spectral
+  --muon-num-ns-steps 5
+  --muon-tp-mode blockwise
+  --muon-scalar-optimizer "${CPPMEGA_MUON_SCALAR_OPTIMIZER}"
+  --use-bf16-no-master-emerging-optimizer
+  --use-bf16-no-master-emerging-fallback-optimizer
+  --grad-reduce-in-bf16
+)
 
 # CUDA graph capture.  NAM56R uses DROPLESS MoE (no capacity factor, no
 # pad-expert-input-to-capacity) so the MoE layer has dynamic shapes and
@@ -317,6 +334,7 @@ fi
   "${CUDA_GRAPH_ARGS[@]}" \
   "${EXTRA_MOE_ARGS[@]}" \
   "${FP8_ARGS[@]}" \
+  "${OPTIMIZER_ARGS[@]}" \
   --no-gradient-accumulation-fusion \
   --no-persist-layer-norm \
   --no-masked-softmax-fusion \
