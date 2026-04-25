@@ -149,3 +149,13 @@ hatch if TE cannot fuse the exact operation:
    than replacing the production path immediately.  Full integration still
    needs online softmax/PV fusion, backward, and direct TE MXFP8/NVFP4 tensor
    extraction.
+
+## Fused Prototype Update
+
+`agent/sparse-mla-fused-backend` implements the next SparseMLA step for MXFP8:
+block-scaled QK, online softmax, and PV are fused in a TileLang forward kernel
+behind `CPPMEGA_SPARSE_MLA_BLOCKSCALED_FUSED=1`.  The default TE tensorwise
+SparseMLA path remains intact.  Backward has an explicit-ACK BF16 correctness
+reference and a disabled TileLang prototype; it is not production-ready.
+Details and sharding notes are in
+`docs/sparse_mla_blockscaled_fused_backend_2026_04_25.md`.

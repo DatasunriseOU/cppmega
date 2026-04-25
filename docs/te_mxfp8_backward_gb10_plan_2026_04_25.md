@@ -109,6 +109,210 @@ for the `m=64, n=96, k=128` probe shape. For projection-like
 }
 ```
 
+## TE/CUDA Transpose-Avoidance Follow-Up: 2026-04-25
+
+Follow-up worktree:
+`/home/dave/source/cppmega-te-cuda-mxfp8-nocopy-agent`
+
+This pass checked whether the GB10 MXFP8 backward path can avoid transposed
+emission by changing GEMM operand order, tile order, or a lower TE/CUDA
+descriptor without changing math. The short answer is no for TE 2.14's current
+pure MXFP8 compact tensor path.
+
+Relevant low-level findings:
+
+- The only exact no-transposed-emission backward math is TE's native layout:
+  dgrad `dy @ W` as `NN`, and wgrad `dy.T @ x` as `NT`. TE already reaches
+  those `NN`/`NT` cuBLASLt calls, and on GB10 they still fail with
+  `CUBLAS_STATUS_NOT_SUPPORTED`.
+- `NVTETensorFromMXFP8Tensor` in
+  `transformer_engine/pytorch/csrc/type_converters.cpp` passes MXFP8 data
+  pointers plus shapes into TE. PyTorch strides are not part of the current
+  `TensorWrapper` representation for the GEMM operand.
+- `CanonicalizeGemmInput` in
+  `transformer_engine/common/gemm/cublaslt_gemm.cu` selects MXFP8 rowwise
+  storage for transposed operands and columnwise storage for non-transposed
+  operands while preserving the requested GEMM transpose flags. It does not
+  expose a descriptor bit that means "treat compact columnwise storage for
+  `[M, K]` as compact rowwise storage for `[K, M]`".
+- The MXFP8 cast path writes rowwise and columnwise FP8 payload tensors in the
+  same logical row-major `[rows, cols]` element order; the difference is the
+  block-scale grouping. Compact columnwise scales are shaped like
+  `[rows / 32, cols]`. Rowwise scales for the logical transpose are shaped like
+  `[cols, rows / 32]`. A tile-order-only reinterpretation would attach the
+  wrong payload elements and/or wrong E8M0 scale groups to the GEMM operands.
+- TE's `convert_block_scaling_to_mxfp8_tensor` helper is useful for the older
+  FP8 block-scaling representation, where columnwise/GEMM-ready data has
+  different physical semantics. It is not a pure MXFP8 no-copy GEMM operand
+  path.
+
+That makes this a compact-layout semantic issue, not just a missing Python
+stride or cuBLASLt tile-order knob. Rewriting unsupported GB10 backward GEMMs
+to supported `TN` still needs logical transposed operand storage unless TE
+adds a new MXFP8 GEMM path that can consume the original compact layout with
+different scale-index semantics and prove equivalent math.
+
+The lower-copy prototype added here is therefore a transposed-emission probe,
+not a no-transpose descriptor tweak:
+
+- `tools/probes/te_mxfp8_transpose_emit_ext.py` builds a local runtime CUDA
+  extension. It does not mutate installed TransformerEngine.
+- `tools/probes/te_blockscaled_backward_probe.py --prototype-transpose-emit`
+  uses that extension to emit rowwise MXFP8 storage for `source.T` directly
+  from BF16 source values and TE's compact columnwise E8M0 scales.
+- This removes copying existing MXFP8 payload bytes from the backward adapter
+  path in the prototype. It still transposes compact scale bytes, and because
+  it is a standalone probe it reads BF16 source values instead of being fused
+  into TE's original quantize/cast emission point.
+
+Small GB10 check:
+
+```bash
+PYTHONPATH=/home/dave/source/cppmega-te-cuda-mxfp8-nocopy-agent:/home/dave/source/cppmega-te-cuda-mxfp8-nocopy-agent/scripts:$PYTHONPATH \
+CPPMEGA_ALLOW_TE_MXFP8_SM12=1 \
+CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER=1 \
+CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK=0 \
+CPPMEGA_TE_MXFP8_DGRAD_BF16=0 \
+CPPMEGA_TE_MXFP8_WGRAD_BF16=0 \
+NVTE_BACKWARD_OVERRIDE=none \
+python tools/probes/te_blockscaled_backward_probe.py \
+  --format mxfp8 --use-shim --probe-nocopy --prototype-transpose-emit \
+  --m 64 --n 96 --k 128
+```
+
+Result on NVIDIA GB10 sm_12.1:
+
+| Case | rel L2 vs BF16 | rel L2 vs copy adapter | Max abs vs copy adapter | Status |
+| --- | ---: | ---: | ---: | --- |
+| MXFP8 transpose-emit dgrad `TN` | 0.037086 | 0.0 | 0.0 | pass |
+| MXFP8 transpose-emit wgrad `TN` | 0.037205 | 0.0 | 0.0 | pass |
+| MXFP8 native dgrad `NN` | n/a | n/a | n/a | cuBLASLt no algorithm |
+| MXFP8 native wgrad `NT` | n/a | n/a | n/a | cuBLASLt no algorithm |
+
+Small-shape byte/timing accounting:
+
+```json
+{
+  "adapter_copy_bytes": {
+    "dgrad_payload_and_scale_bytes": 12800,
+    "wgrad_payload_and_scale_bytes": 15360
+  },
+  "prototype": {
+    "dgrad": {
+      "bf16_source_read_bytes": 24576,
+      "emitted_payload_bytes": 12288,
+      "scale_transpose_bytes": 512,
+      "existing_mxfp8_payload_copy_bytes": 0,
+      "copy_adapter_transpose_elapsed_ms": 0.023776,
+      "emit_elapsed_ms": 0.05264
+    },
+    "wgrad_x": {
+      "bf16_source_read_bytes": 16384,
+      "emitted_payload_bytes": 8192,
+      "scale_transpose_bytes": 512,
+      "existing_mxfp8_payload_copy_bytes": 0,
+      "copy_adapter_transpose_elapsed_ms": 0.051136,
+      "emit_elapsed_ms": 0.017312
+    },
+    "wgrad_dy": {
+      "bf16_source_read_bytes": 12288,
+      "emitted_payload_bytes": 6144,
+      "scale_transpose_bytes": 512,
+      "existing_mxfp8_payload_copy_bytes": 0,
+      "copy_adapter_transpose_elapsed_ms": 0.022752,
+      "emit_elapsed_ms": 0.01792
+    }
+  }
+}
+```
+
+Projection-like GB10 check:
+
+```bash
+PYTHONPATH=/home/dave/source/cppmega-te-cuda-mxfp8-nocopy-agent:/home/dave/source/cppmega-te-cuda-mxfp8-nocopy-agent/scripts:$PYTHONPATH \
+CPPMEGA_ALLOW_TE_MXFP8_SM12=1 \
+CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER=1 \
+CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK=0 \
+CPPMEGA_TE_MXFP8_DGRAD_BF16=0 \
+CPPMEGA_TE_MXFP8_WGRAD_BF16=0 \
+NVTE_BACKWARD_OVERRIDE=none \
+python tools/probes/te_blockscaled_backward_probe.py \
+  --format mxfp8 --use-shim --prototype-transpose-emit \
+  --m 256 --n 4096 --k 4096
+```
+
+Result on NVIDIA GB10 sm_12.1:
+
+| Case | rel L2 vs BF16 | rel L2 vs copy adapter | Max abs vs copy adapter | GEMM elapsed ms | Status |
+| --- | ---: | ---: | ---: | ---: | --- |
+| MXFP8 transpose-emit dgrad `TN` | 0.037767 | 0.0 | 0.0 | 0.184384 | pass |
+| MXFP8 transpose-emit wgrad `TN` | 0.037756 | 0.0 | 0.0 | 0.20784 | pass |
+| MXFP8 native dgrad `NN` | n/a | n/a | n/a | n/a | cuBLASLt no algorithm |
+| MXFP8 native wgrad `NT` | n/a | n/a | n/a | n/a | cuBLASLt no algorithm |
+
+Projection-like byte/timing accounting:
+
+```json
+{
+  "adapter_copy_bytes": {
+    "dgrad_payload_and_scale_bytes": 17301504,
+    "wgrad_payload_and_scale_bytes": 2162688
+  },
+  "prototype": {
+    "dgrad": {
+      "bf16_source_read_bytes": 33554432,
+      "emitted_payload_bytes": 16777216,
+      "scale_transpose_bytes": 524288,
+      "existing_mxfp8_payload_copy_bytes": 0,
+      "copy_adapter_transpose_elapsed_ms": 0.572992,
+      "emit_elapsed_ms": 0.291392
+    },
+    "wgrad_x": {
+      "bf16_source_read_bytes": 2097152,
+      "emitted_payload_bytes": 1048576,
+      "scale_transpose_bytes": 32768,
+      "existing_mxfp8_payload_copy_bytes": 0,
+      "copy_adapter_transpose_elapsed_ms": 0.064832,
+      "emit_elapsed_ms": 0.018784
+    },
+    "wgrad_dy": {
+      "bf16_source_read_bytes": 2097152,
+      "emitted_payload_bytes": 1048576,
+      "scale_transpose_bytes": 32768,
+      "existing_mxfp8_payload_copy_bytes": 0,
+      "copy_adapter_transpose_elapsed_ms": 0.196704,
+      "emit_elapsed_ms": 0.020992
+    }
+  }
+}
+```
+
+Shim stats remained fail-closed in both runs:
+
+```text
+mxfp8_tn_adapter_dgrad=1
+mxfp8_tn_adapter_wgrad=1
+bf16_fallback_dgrad=0
+bf16_fallback_wgrad=0
+native_passthrough_dgrad=0
+native_passthrough_wgrad=0
+fallback_reasons={}
+```
+
+This is not production-ready as written. It is a TE patch candidate: to become
+production-useful, TE's quantizer/cast path would need an option to emit and
+stash the backward `TN` rowwise-transposed compact MXFP8 operand at the time
+the high-precision source is already available. Running the standalone probe
+kernel in backward from BF16 source would only be valid for paths that still
+save that source and would trade the MXFP8 payload copy for a BF16 read plus
+requantization.
+
+Additional recipe/context checks did not reveal a higher-level workaround:
+local `../nanochat` and Megatron Core MXFP8 recipe plumbing select TE recipes
+and quantizer scope, but do not add an MXFP8 backward descriptor/stride path.
+No local Megatron Bridge checkout was present under `/home/dave` during this
+pass.
+
 ## Runtime Env Flags
 
 Preserved existing flags:
