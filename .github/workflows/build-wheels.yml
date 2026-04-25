@@ -78,7 +78,7 @@ jobs:
             extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
           - name: fast_hadamard_transform
             repo: Dao-AILab/fast-hadamard-transform
-            ref: main
+            ref: master
             submodules: "false"
             extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
           - name: tilelang
@@ -137,9 +137,10 @@ jobs:
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
-          # cuda-toolkit-13-2 pulls latest 13.2.x (13.2.1 by 2026-04). cudnn9-cuda-13 = cuDNN 9 for CUDA 13.
+          # cuda-toolkit-13-2 pulls latest 13.2.x (13.2.1 by 2026-04). cudnn9-cuda-13 = cuDNN 9.
+          # libnccl-dev/libnccl2 needed by TE (nccl.h #include in common/util/logging.h).
           sudo apt-get install -y --no-install-recommends \
-              cuda-toolkit-13-2 cudnn9-cuda-13
+              cuda-toolkit-13-2 cudnn9-cuda-13 libnccl-dev libnccl2
           echo "CUDA_HOME=/usr/local/cuda-13.2" >> "$GITHUB_ENV"
           echo "/usr/local/cuda-13.2/bin" >> "$GITHUB_PATH"
           /usr/local/cuda-13.2/bin/nvcc --version
@@ -182,7 +183,10 @@ jobs:
           python -c "import torch; print(torch.__version__, torch.version.cuda)"
 
       - name: Install build deps
-        run: pip install ninja packaging pybind11 cmake numpy einops
+        # scikit-build-core: PEP 517 backend used by tilelang/CMake-based wheels.
+        # setuptools-scm: many wheels resolve their version from git tags.
+        # numpy must be present for torch's tensor_numpy.cpp at build time.
+        run: pip install ninja packaging pybind11 cmake numpy einops scikit-build-core setuptools-scm
 
       - name: Clone source (any ref — branch / tag / SHA)
         run: |
