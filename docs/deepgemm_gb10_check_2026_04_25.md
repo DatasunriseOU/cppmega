@@ -22,6 +22,11 @@ RuntimeError: Assertion error (csrc/apis/layout.hpp:59): Unknown SF transformati
 That matches the source: DeepGEMM scale-factor layout conversion has SM90 and
 SM100 branches, but no SM12x branch.
 
+The local diagnostic probe is kept at `tools/deepgemm_probe.py`. It is
+non-invasive: it records Torch/CUDA/GPU state and scans DeepGEMM source trees
+for architecture-dispatch evidence without importing `deep_gemm` or launching
+GEMM kernels.
+
 ## Sources Checked
 
 - Upstream `deepseek-ai/DeepGEMM` at `891d57b4db1071624b5c8fa0d1e51cb317fa709f`
