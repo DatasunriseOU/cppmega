@@ -89,6 +89,8 @@ __global__ __launch_bounds__(kThreads, 4) void qmuon_update_multi_kernel(
     const int64_t* __restrict__ n_elements,
     const int64_t* __restrict__ block_offsets,
     float* __restrict__ sumsq_out,
+    const int64_t* __restrict__ block_group_ids,
+    float* __restrict__ group_sumsq_out,
     int num_tensors,
     float beta) {
   const int64_t global_block = static_cast<int64_t>(blockIdx.x);
@@ -160,6 +162,75 @@ __global__ __launch_bounds__(kThreads, 4) void qmuon_update_multi_kernel(
     if (sumsq_out != nullptr) {
       sumsq_out[global_block] = reduce_sum[0];
     }
+    if (group_sumsq_out != nullptr) {
+      const int64_t group_id = block_group_ids[global_block];
+      if (group_id >= 0) {
+        atomicAdd(group_sumsq_out + group_id, reduce_sum[0]);
+      }
+    }
+  }
+}
+
+template <typename GradT>
+__global__ __launch_bounds__(kThreads, 4) void qmuon_scale_multi_by_group_kernel(
+    const uintptr_t* __restrict__ grad_ptrs,
+    const int64_t* __restrict__ n_elements,
+    const int64_t* __restrict__ block_offsets,
+    const int64_t* __restrict__ block_group_ids,
+    const float* __restrict__ inv_norms,
+    int num_tensors) {
+  const int64_t global_block = static_cast<int64_t>(blockIdx.x);
+  const int tensor_idx = tensor_for_block(global_block, block_offsets, num_tensors);
+  const int64_t local_block = global_block - block_offsets[tensor_idx];
+  const int64_t group_id = block_group_ids[global_block];
+  if (group_id < 0) {
+    return;
+  }
+
+  const int tid = threadIdx.x;
+  const int64_t n = n_elements[tensor_idx];
+  GradT* grad = reinterpret_cast<GradT*>(grad_ptrs[tensor_idx]);
+  const float scale = inv_norms[group_id];
+
+#pragma unroll
+  for (int item = 0; item < kItemsPerThread; ++item) {
+    const int64_t element = local_block * kBlockSize + tid + item * kThreads;
+    if (element < n) {
+      const float value = load_value<GradT>(grad, element) * scale;
+      store_value<GradT>(grad, element, value);
+    }
+  }
+}
+
+template <typename GradT>
+__global__ __launch_bounds__(kThreads, 4) void qmuon_scale_multi_by_group_from_sumsq_kernel(
+    const uintptr_t* __restrict__ grad_ptrs,
+    const int64_t* __restrict__ n_elements,
+    const int64_t* __restrict__ block_offsets,
+    const int64_t* __restrict__ block_group_ids,
+    const float* __restrict__ group_sumsq,
+    float eps2,
+    int num_tensors) {
+  const int64_t global_block = static_cast<int64_t>(blockIdx.x);
+  const int tensor_idx = tensor_for_block(global_block, block_offsets, num_tensors);
+  const int64_t local_block = global_block - block_offsets[tensor_idx];
+  const int64_t group_id = block_group_ids[global_block];
+  if (group_id < 0) {
+    return;
+  }
+
+  const int tid = threadIdx.x;
+  const int64_t n = n_elements[tensor_idx];
+  GradT* grad = reinterpret_cast<GradT*>(grad_ptrs[tensor_idx]);
+  const float scale = rsqrtf(fmaxf(group_sumsq[group_id], eps2));
+
+#pragma unroll
+  for (int item = 0; item < kItemsPerThread; ++item) {
+    const int64_t element = local_block * kBlockSize + tid + item * kThreads;
+    if (element < n) {
+      const float value = load_value<GradT>(grad, element) * scale;
+      store_value<GradT>(grad, element, value);
+    }
   }
 }
 
@@ -214,6 +285,8 @@ void launch_update(
     const int64_t* d_n_elements,
     const int64_t* d_block_offsets,
     const at::Tensor& sumsq_out,
+    const at::Tensor& block_group_ids,
+    const at::Tensor& group_sumsq_out,
     int num_tensors,
     int64_t total_blocks,
     float beta,
@@ -226,8 +299,54 @@ void launch_update(
           d_n_elements,
           d_block_offsets,
           sumsq_out.defined() ? sumsq_out.data_ptr<float>() : nullptr,
+          block_group_ids.defined() ? block_group_ids.data_ptr<int64_t>() : nullptr,
+          group_sumsq_out.defined() ? group_sumsq_out.data_ptr<float>() : nullptr,
           num_tensors,
           beta);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename GradT>
+void launch_scale_by_group(
+    const int64_t* d_grad_ptrs,
+    const int64_t* d_n_elements,
+    const int64_t* d_block_offsets,
+    const at::Tensor& block_group_ids,
+    const at::Tensor& inv_norms,
+    int num_tensors,
+    int64_t total_blocks,
+    cudaStream_t stream) {
+  qmuon_scale_multi_by_group_kernel<GradT>
+      <<<static_cast<unsigned int>(total_blocks), kThreads, 0, stream>>>(
+          reinterpret_cast<const uintptr_t*>(d_grad_ptrs),
+          d_n_elements,
+          d_block_offsets,
+          block_group_ids.data_ptr<int64_t>(),
+          inv_norms.data_ptr<float>(),
+          num_tensors);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename GradT>
+void launch_scale_by_group_from_sumsq(
+    const int64_t* d_grad_ptrs,
+    const int64_t* d_n_elements,
+    const int64_t* d_block_offsets,
+    const at::Tensor& block_group_ids,
+    const at::Tensor& group_sumsq,
+    float eps,
+    int num_tensors,
+    int64_t total_blocks,
+    cudaStream_t stream) {
+  qmuon_scale_multi_by_group_from_sumsq_kernel<GradT>
+      <<<static_cast<unsigned int>(total_blocks), kThreads, 0, stream>>>(
+          reinterpret_cast<const uintptr_t*>(d_grad_ptrs),
+          d_n_elements,
+          d_block_offsets,
+          block_group_ids.data_ptr<int64_t>(),
+          group_sumsq.data_ptr<float>(),
+          eps * eps,
+          num_tensors);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -239,7 +358,9 @@ at::Tensor qmuon_update_multi_impl_(
     std::vector<at::Tensor> grad_tensors,
     double beta,
     bool unsigned_storage,
-    bool return_sumsq) {
+    bool return_sumsq,
+    const at::Tensor& block_group_ids = at::Tensor(),
+    int64_t num_groups = 0) {
   validate_tensor_lists(q_tensors, absmax_tensors, grad_tensors, beta, unsigned_storage);
 
   c10::cuda::CUDAGuard device_guard(q_tensors[0].device());
@@ -277,8 +398,27 @@ at::Tensor qmuon_update_multi_impl_(
   if (return_sumsq) {
     sumsq_out = at::empty({total_blocks}, float_opts);
   }
+  at::Tensor group_sumsq_out;
+  if (block_group_ids.defined()) {
+    TORCH_CHECK(num_groups > 0, "num_groups must be positive for grouped sumsq");
+    TORCH_CHECK(block_group_ids.is_cuda(), "block_group_ids must be CUDA");
+    TORCH_CHECK(block_group_ids.device() == device, "block_group_ids must be on the same device");
+    TORCH_CHECK(block_group_ids.scalar_type() == at::kLong, "block_group_ids must be int64");
+    TORCH_CHECK(block_group_ids.is_contiguous(), "block_group_ids must be contiguous");
+    TORCH_CHECK(
+        block_group_ids.numel() == total_blocks,
+        "block_group_ids has ",
+        block_group_ids.numel(),
+        " entries, expected ",
+        total_blocks);
+    group_sumsq_out = at::empty({num_groups}, float_opts);
+  }
 
   auto stream = at::cuda::getCurrentCUDAStream(device.index()).stream();
+  if (group_sumsq_out.defined()) {
+    C10_CUDA_CHECK(cudaMemsetAsync(
+        group_sumsq_out.data_ptr<float>(), 0, sizeof(float) * num_groups, stream));
+  }
   C10_CUDA_CHECK(cudaMemcpyAsync(
       d_metadata.data_ptr<int64_t>(),
       h_metadata.data(),
@@ -299,32 +439,32 @@ at::Tensor qmuon_update_multi_impl_(
     if (grad_dtype == at::kBFloat16) {
       launch_update<__nv_bfloat16, uint8_t, true>(
           d_q_ptrs, d_absmax_ptrs, d_grad_ptrs, d_n_elements, d_block_offsets,
-          sumsq_out, num_tensors, total_blocks, beta_f, stream);
+          sumsq_out, block_group_ids, group_sumsq_out, num_tensors, total_blocks, beta_f, stream);
     } else if (grad_dtype == at::kHalf) {
       launch_update<__half, uint8_t, true>(
           d_q_ptrs, d_absmax_ptrs, d_grad_ptrs, d_n_elements, d_block_offsets,
-          sumsq_out, num_tensors, total_blocks, beta_f, stream);
+          sumsq_out, block_group_ids, group_sumsq_out, num_tensors, total_blocks, beta_f, stream);
     } else {
       launch_update<float, uint8_t, true>(
           d_q_ptrs, d_absmax_ptrs, d_grad_ptrs, d_n_elements, d_block_offsets,
-          sumsq_out, num_tensors, total_blocks, beta_f, stream);
+          sumsq_out, block_group_ids, group_sumsq_out, num_tensors, total_blocks, beta_f, stream);
     }
   } else {
     if (grad_dtype == at::kBFloat16) {
       launch_update<__nv_bfloat16, int8_t, false>(
           d_q_ptrs, d_absmax_ptrs, d_grad_ptrs, d_n_elements, d_block_offsets,
-          sumsq_out, num_tensors, total_blocks, beta_f, stream);
+          sumsq_out, block_group_ids, group_sumsq_out, num_tensors, total_blocks, beta_f, stream);
     } else if (grad_dtype == at::kHalf) {
       launch_update<__half, int8_t, false>(
           d_q_ptrs, d_absmax_ptrs, d_grad_ptrs, d_n_elements, d_block_offsets,
-          sumsq_out, num_tensors, total_blocks, beta_f, stream);
+          sumsq_out, block_group_ids, group_sumsq_out, num_tensors, total_blocks, beta_f, stream);
     } else {
       launch_update<float, int8_t, false>(
           d_q_ptrs, d_absmax_ptrs, d_grad_ptrs, d_n_elements, d_block_offsets,
-          sumsq_out, num_tensors, total_blocks, beta_f, stream);
+          sumsq_out, block_group_ids, group_sumsq_out, num_tensors, total_blocks, beta_f, stream);
     }
   }
-  return sumsq_out;
+  return group_sumsq_out.defined() ? group_sumsq_out : sumsq_out;
 }
 
 void qmuon_update_multi_cuda_(
@@ -343,4 +483,192 @@ at::Tensor qmuon_update_multi_with_sumsq_cuda_(
     double beta,
     bool unsigned_storage) {
   return qmuon_update_multi_impl_(q_tensors, absmax_tensors, grad_tensors, beta, unsigned_storage, true);
+}
+
+at::Tensor qmuon_update_multi_with_group_sumsq_cuda_(
+    std::vector<at::Tensor> q_tensors,
+    std::vector<at::Tensor> absmax_tensors,
+    std::vector<at::Tensor> grad_tensors,
+    at::Tensor block_group_ids,
+    int64_t num_groups,
+    double beta,
+    bool unsigned_storage) {
+  return qmuon_update_multi_impl_(
+      q_tensors,
+      absmax_tensors,
+      grad_tensors,
+      beta,
+      unsigned_storage,
+      false,
+      block_group_ids,
+      num_groups);
+}
+
+void qmuon_scale_multi_by_group_cuda_(
+    std::vector<at::Tensor> grad_tensors,
+    at::Tensor block_group_ids,
+    at::Tensor inv_norms) {
+  TORCH_CHECK(!grad_tensors.empty(), "grad_tensors must not be empty");
+  TORCH_CHECK(block_group_ids.is_cuda(), "block_group_ids must be CUDA");
+  TORCH_CHECK(block_group_ids.scalar_type() == at::kLong, "block_group_ids must be int64");
+  TORCH_CHECK(block_group_ids.is_contiguous(), "block_group_ids must be contiguous");
+  TORCH_CHECK(inv_norms.is_cuda(), "inv_norms must be CUDA");
+  TORCH_CHECK(inv_norms.scalar_type() == at::kFloat, "inv_norms must be float32");
+  TORCH_CHECK(inv_norms.is_contiguous(), "inv_norms must be contiguous");
+
+  const auto device = grad_tensors[0].device();
+  const auto grad_dtype = grad_tensors[0].scalar_type();
+  TORCH_CHECK(
+      grad_dtype == at::kBFloat16 || grad_dtype == at::kHalf || grad_dtype == at::kFloat,
+      "grad tensors must be bf16, fp16, or fp32");
+  TORCH_CHECK(block_group_ids.device() == device, "block_group_ids must be on grad device");
+  TORCH_CHECK(inv_norms.device() == device, "inv_norms must be on grad device");
+
+  const int num_tensors = static_cast<int>(grad_tensors.size());
+  int64_t total_blocks = 0;
+  for (size_t i = 0; i < grad_tensors.size(); ++i) {
+    const auto& grad = grad_tensors[i];
+    TORCH_CHECK(grad.is_cuda(), "all grad tensors must be CUDA");
+    TORCH_CHECK(grad.device() == device, "all grad tensors must be on the same CUDA device");
+    TORCH_CHECK(grad.scalar_type() == grad_dtype, "all grad tensors must share one dtype");
+    TORCH_CHECK(grad.is_contiguous(), "all grad tensors must be contiguous");
+    total_blocks += div_up(grad.numel(), kBlockSize);
+  }
+  TORCH_CHECK(
+      block_group_ids.numel() == total_blocks,
+      "block_group_ids has ",
+      block_group_ids.numel(),
+      " entries, expected ",
+      total_blocks);
+  if (total_blocks == 0) {
+    return;
+  }
+
+  c10::cuda::CUDAGuard device_guard(device);
+  const int64_t grad_ptrs_offset = 0;
+  const int64_t n_elements_offset = grad_ptrs_offset + num_tensors;
+  const int64_t block_offsets_offset = n_elements_offset + num_tensors;
+  const int64_t metadata_size = block_offsets_offset + num_tensors + 1;
+  std::vector<int64_t> h_metadata(metadata_size, 0);
+  for (int i = 0; i < num_tensors; ++i) {
+    h_metadata[grad_ptrs_offset + i] = reinterpret_cast<int64_t>(grad_tensors[i].data_ptr());
+    h_metadata[n_elements_offset + i] = grad_tensors[i].numel();
+    h_metadata[block_offsets_offset + i + 1] =
+        h_metadata[block_offsets_offset + i] +
+        div_up(h_metadata[n_elements_offset + i], kBlockSize);
+  }
+
+  const auto long_opts = at::TensorOptions().device(device).dtype(at::kLong);
+  at::Tensor d_metadata = at::empty({metadata_size}, long_opts);
+  auto stream = at::cuda::getCurrentCUDAStream(device.index()).stream();
+  C10_CUDA_CHECK(cudaMemcpyAsync(
+      d_metadata.data_ptr<int64_t>(),
+      h_metadata.data(),
+      sizeof(int64_t) * h_metadata.size(),
+      cudaMemcpyHostToDevice,
+      stream));
+  const int64_t* d_metadata_ptr = d_metadata.data_ptr<int64_t>();
+  const int64_t* d_grad_ptrs = d_metadata_ptr + grad_ptrs_offset;
+  const int64_t* d_n_elements = d_metadata_ptr + n_elements_offset;
+  const int64_t* d_block_offsets = d_metadata_ptr + block_offsets_offset;
+
+  if (grad_dtype == at::kBFloat16) {
+    launch_scale_by_group<__nv_bfloat16>(
+        d_grad_ptrs, d_n_elements, d_block_offsets, block_group_ids, inv_norms,
+        num_tensors, total_blocks, stream);
+  } else if (grad_dtype == at::kHalf) {
+    launch_scale_by_group<__half>(
+        d_grad_ptrs, d_n_elements, d_block_offsets, block_group_ids, inv_norms,
+        num_tensors, total_blocks, stream);
+  } else {
+    launch_scale_by_group<float>(
+        d_grad_ptrs, d_n_elements, d_block_offsets, block_group_ids, inv_norms,
+        num_tensors, total_blocks, stream);
+  }
+}
+
+void qmuon_scale_multi_by_group_from_sumsq_cuda_(
+    std::vector<at::Tensor> grad_tensors,
+    at::Tensor block_group_ids,
+    at::Tensor group_sumsq,
+    double eps) {
+  TORCH_CHECK(!grad_tensors.empty(), "grad_tensors must not be empty");
+  TORCH_CHECK(block_group_ids.is_cuda(), "block_group_ids must be CUDA");
+  TORCH_CHECK(block_group_ids.scalar_type() == at::kLong, "block_group_ids must be int64");
+  TORCH_CHECK(block_group_ids.is_contiguous(), "block_group_ids must be contiguous");
+  TORCH_CHECK(group_sumsq.is_cuda(), "group_sumsq must be CUDA");
+  TORCH_CHECK(group_sumsq.scalar_type() == at::kFloat, "group_sumsq must be float32");
+  TORCH_CHECK(group_sumsq.is_contiguous(), "group_sumsq must be contiguous");
+  TORCH_CHECK(eps > 0.0, "eps must be positive, got ", eps);
+
+  const auto device = grad_tensors[0].device();
+  const auto grad_dtype = grad_tensors[0].scalar_type();
+  TORCH_CHECK(
+      grad_dtype == at::kBFloat16 || grad_dtype == at::kHalf || grad_dtype == at::kFloat,
+      "grad tensors must be bf16, fp16, or fp32");
+  TORCH_CHECK(block_group_ids.device() == device, "block_group_ids must be on grad device");
+  TORCH_CHECK(group_sumsq.device() == device, "group_sumsq must be on grad device");
+
+  const int num_tensors = static_cast<int>(grad_tensors.size());
+  int64_t total_blocks = 0;
+  for (size_t i = 0; i < grad_tensors.size(); ++i) {
+    const auto& grad = grad_tensors[i];
+    TORCH_CHECK(grad.is_cuda(), "all grad tensors must be CUDA");
+    TORCH_CHECK(grad.device() == device, "all grad tensors must be on the same CUDA device");
+    TORCH_CHECK(grad.scalar_type() == grad_dtype, "all grad tensors must share one dtype");
+    TORCH_CHECK(grad.is_contiguous(), "all grad tensors must be contiguous");
+    total_blocks += div_up(grad.numel(), kBlockSize);
+  }
+  TORCH_CHECK(
+      block_group_ids.numel() == total_blocks,
+      "block_group_ids has ",
+      block_group_ids.numel(),
+      " entries, expected ",
+      total_blocks);
+  if (total_blocks == 0) {
+    return;
+  }
+
+  c10::cuda::CUDAGuard device_guard(device);
+  const int64_t grad_ptrs_offset = 0;
+  const int64_t n_elements_offset = grad_ptrs_offset + num_tensors;
+  const int64_t block_offsets_offset = n_elements_offset + num_tensors;
+  const int64_t metadata_size = block_offsets_offset + num_tensors + 1;
+  std::vector<int64_t> h_metadata(metadata_size, 0);
+  for (int i = 0; i < num_tensors; ++i) {
+    h_metadata[grad_ptrs_offset + i] = reinterpret_cast<int64_t>(grad_tensors[i].data_ptr());
+    h_metadata[n_elements_offset + i] = grad_tensors[i].numel();
+    h_metadata[block_offsets_offset + i + 1] =
+        h_metadata[block_offsets_offset + i] +
+        div_up(h_metadata[n_elements_offset + i], kBlockSize);
+  }
+
+  const auto long_opts = at::TensorOptions().device(device).dtype(at::kLong);
+  at::Tensor d_metadata = at::empty({metadata_size}, long_opts);
+  auto stream = at::cuda::getCurrentCUDAStream(device.index()).stream();
+  C10_CUDA_CHECK(cudaMemcpyAsync(
+      d_metadata.data_ptr<int64_t>(),
+      h_metadata.data(),
+      sizeof(int64_t) * h_metadata.size(),
+      cudaMemcpyHostToDevice,
+      stream));
+  const int64_t* d_metadata_ptr = d_metadata.data_ptr<int64_t>();
+  const int64_t* d_grad_ptrs = d_metadata_ptr + grad_ptrs_offset;
+  const int64_t* d_n_elements = d_metadata_ptr + n_elements_offset;
+  const int64_t* d_block_offsets = d_metadata_ptr + block_offsets_offset;
+  const float eps_f = static_cast<float>(eps);
+
+  if (grad_dtype == at::kBFloat16) {
+    launch_scale_by_group_from_sumsq<__nv_bfloat16>(
+        d_grad_ptrs, d_n_elements, d_block_offsets, block_group_ids, group_sumsq,
+        eps_f, num_tensors, total_blocks, stream);
+  } else if (grad_dtype == at::kHalf) {
+    launch_scale_by_group_from_sumsq<__half>(
+        d_grad_ptrs, d_n_elements, d_block_offsets, block_group_ids, group_sumsq,
+        eps_f, num_tensors, total_blocks, stream);
+  } else {
+    launch_scale_by_group_from_sumsq<float>(
+        d_grad_ptrs, d_n_elements, d_block_offsets, block_group_ids, group_sumsq,
+        eps_f, num_tensors, total_blocks, stream);
+  }
 }

@@ -19,8 +19,17 @@ Current checkpoint:
   state instead of `state["momentum_buffer"].lerp_` when
   `--muon-quantized-momentum` is set.
 - QKV split correctness is preserved by feeding the updated BF16 grad through
-  the existing per-slice `orthogonalize()` path. Fused sliced normalization is
-  still a follow-up.
+  the existing per-slice `orthogonalize()` path. Wiring Megatron to skip its
+  internal duplicate normalization after the new fused grouped primitive is the
+  remaining integration step.
+- Added the fused grouped/sliced primitive needed to remove that follow-up:
+  `quantized_muon_momentum_update_multi_and_normalize_groups_` maps each
+  256-value quantization block to a logical norm group, so Q/K/V can be
+  normalized independently while the momentum update still runs as one
+  multi-tensor pass.
+- Sharding is part of the API: every rank builds local norm metadata with the
+  same logical group ids, local group sumsq values are all-reduced over
+  `tp_group`, and the scale kernel uses the global group norms.
 
 Verified:
 
@@ -63,15 +72,42 @@ after:  1 CUDA metadata allocation  + 1 H2D copy  per multi-update call
 trace:  /home/dave/logs/qmuon_torch_profiler_packed_meta
 ```
 
+Grouped QKV fused path:
+
+```text
+shape=(4096, 3584), split=(2,1,1), segments=3072, blocks=57344
+fused_group_update_norm       0.8950 ms
+update_plus_torch_qkv_norm    1.9239 ms
+```
+
+Nsight Compute:
+
+```text
+/home/dave/logs/qmuon_qkv_grouped_ncu.ncu-rep
+qmuon_update_multi_kernel:                 393.65 us avg, 80.69% occupancy
+qmuon_scale_multi_by_group_from_sumsq:     254.77 us avg, 91.97% occupancy
+```
+
+Nsight permission state:
+
+```text
+/etc/modprobe.d/nvidia-profiler-counters.conf installed
+update-initramfs -u -k all completed
+loaded driver still has RmProfilingAdminOnly=1 until reboot/module reload
+ncu report above was collected with sudo -E /usr/local/cuda/bin/ncu
+```
+
 Next implementation target:
 
 1. Make the local Megatron patch durable without swallowing unrelated dirty
    Megatron worktree changes.
 2. Add checkpoint/state_dict handling for `quantized_momentum_buffer`.
-3. Replace remaining unfused normalization where safe:
-   - non-QKV tensors can use update plus fused sumsq/norm directly;
-   - fused QKV tensors need grouped/sliced sumsq so Q, K, and V norms remain
-     independent.
+3. Wire Megatron `TensorParallelMuon` to consume the new grouped primitive
+   without double-normalizing in `_newton_schulz_lowmem`:
+   - non-QKV tensors can use one group per tensor;
+   - fused QKV tensors use repeated Q/K/V segments with group ids 0/1/2;
+   - TP-sharded tensors pass `tp_group` so group sums are all-reduced before
+     scale.
 4. Keep this invariant:
 
    ```python
