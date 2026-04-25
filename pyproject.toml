@@ -13,6 +13,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 include-package-data = false
 
+[tool.setuptools.package-data]
+cppmega = ["megatron/cuda_ext/*.cpp", "megatron/cuda_ext/*.cu"]
+
 [tool.setuptools.packages.find]
 include = ["cppmega*"]
 

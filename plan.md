@@ -1,5 +1,73 @@
 # NAM56R optimization plan
 
+## Quantized Muon momentum plan (2026-04-25)
+
+Detailed implementation note:
+[`docs/quantized_muon_momentum.md`](docs/quantized_muon_momentum.md).
+
+Current checkpoint:
+
+- Added a lazy-built CUDA extension for blockwise int8/uint8 Muon momentum.
+- Added Python wrappers, CUDA tests, and a benchmark script.
+- Added multi-tensor update that overwrites BF16 grads in place, so the grad
+  buffer becomes the Newton-Schulz input and no separate BF16 scratch is needed.
+- Added update plus sumsq collection for the first Newton-Schulz normalization
+  pass.
+- GB10 launch scripts are pinned to Muon with no-master BF16 fallback and
+  Adam8bit fallback for scalar/non-2D parameters.
+
+Verified:
+
+```bash
+PYTHONPATH=. /home/dave/cppmega-venv/bin/python -m pytest -q tests/test_quantized_muon_momentum.py
+```
+
+Result:
+
+```text
+8 passed
+```
+
+Next implementation target:
+
+1. Wire quantized momentum into Megatron Muon in
+   `/home/dave/megatron-lm/megatron/core/optimizer/emerging_optimizers.py`.
+2. Replace:
+
+   ```python
+   state["momentum_buffer"].lerp_(grad, 1 - group["momentum"])
+   ```
+
+   with quantized state plus:
+
+   ```python
+   quantized_muon_momentum_update_multi_(q_states, grads, beta=group["momentum"])
+   ```
+
+3. Do not allocate `state["momentum_buffer"]` in quantized mode.
+4. Reuse `p.grad` as the BF16 Newton-Schulz input after the update kernel.
+5. Preserve current QKV correctness:
+   - fused QKV parameters must still split Q/K/V before orthogonalization;
+   - Q, K, and V norms must be computed independently;
+   - do not normalize the whole fused QKV matrix as one tensor.
+6. Keep router scalar/bias/gating, RMSNorm, bias, embedding, output, and other
+   non-2D fallback parameters on no-master BF16-state Adam8bit.
+
+Profiling sequence after short training works:
+
+1. Run 50-200 steps on real clang 4k data and compare loss, grad norm,
+   skipped iterations, tokens/sec, CUDA max allocated/reserved.
+2. Run nsys and torch profiler on the optimizer step.
+3. Inspect Nsight Systems kernel timeline for update, normalization,
+   Newton-Schulz matmul/SYRK, and allocation spikes.
+4. Use Nsight Compute on the quantized momentum kernel for throughput,
+   occupancy, register pressure, and shared-memory reductions.
+5. Fuse in this order:
+   - momentum update plus sumsq and in-place normalization;
+   - QKV grouped/sliced sumsq in the same update pass;
+   - transpose/normalization handling for tall matrices where it avoids copies;
+   - only then evaluate deeper Newton-Schulz GEMM/SYRK replacement.
+
 ## Current state (2026-04-14 morning session 2 — multi-agent investigation)
 
 ### Production configs
