@@ -144,12 +144,20 @@ jobs:
           echo "/usr/local/cuda-13.2/bin" >> "$GITHUB_PATH"
           /usr/local/cuda-13.2/bin/nvcc --version
 
+      - name: Wire ccache as gcc/g++/nvcc via PATH
+        # CC="ccache gcc-15" breaks setuptools/ninja (it splits the value and
+        # treats "gcc-15" as a positional arg). Use PATH-based wrappers instead:
+        # /usr/lib/ccache/<tool> -> ccache; ccache then exec's the real binary.
+        run: |
+          sudo mkdir -p /usr/lib/ccache
+          for tool in cc gcc g++ c++ gcc-15 g++-15 nvcc; do
+            sudo ln -sf /usr/bin/ccache /usr/lib/ccache/$tool
+          done
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+
       - name: Configure nvcc → gcc-15
         run: |
           echo "NVCC_PREPEND_FLAGS=--compiler-bindir=/usr/bin/g++-15 --allow-unsupported-compiler" >> "$GITHUB_ENV"
-          echo "CUDACXX=ccache nvcc" >> "$GITHUB_ENV"
-          echo "CC=ccache gcc-15" >> "$GITHUB_ENV"
-          echo "CXX=ccache g++-15" >> "$GITHUB_ENV"
           echo "TORCH_CUDA_ARCH_LIST=${{ env.TORCH_CUDA_ARCH_LIST }}" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=/usr/local/cuda-13.2/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
