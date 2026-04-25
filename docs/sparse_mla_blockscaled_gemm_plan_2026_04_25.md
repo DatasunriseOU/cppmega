@@ -43,6 +43,25 @@ hard-wired to TE current/tensorwise scaling.
   launch compatibility; `local_per_token`, `per_token`, and `rowwise` fail
   fast.
 
+## 2026-04-25 QK Runtime Probe Update
+
+`agent/sparse-mla-blockscaled-runtime` adds a QK-only experimental runtime
+helper behind `CPPMEGA_SPARSE_MLA_BLOCKSCALED_QK=1`:
+
+- `cppmega.megatron.sparse_mla_ops.sparse_mla_blockscaled_qk_scores`
+- `cppmega/megatron/sparse_mla_ops/tilelang_sparse_mla_blockscaled_qk.py`
+- `tools/probes/sparse_mla_blockscaled_qk_probe.py`
+
+This is not wired into `SparseMLA_FP8.forward` by default.  It accepts
+pre-quantized MXFP8 or NVFP4 payloads plus per-block scales and returns raw
+SparseMLA QK logits.  The MXFP8 path runs FP8 GEMM per 32-wide K block and
+applies block scales inside the K-block loop, avoiding BF16 Q/K
+materialization.  The NVFP4 path is a correctness probe that scalar-decodes
+packed E2M1 values in TileLang; it is not a native NVFP4 tensor-core path.
+
+Validation and blockers are recorded in
+`docs/sparse_mla_blockscaled_qk_runtime_2026_04_25.md`.
+
 ## Runtime Options Checked
 
 ### RightNow-Tile
@@ -126,7 +145,7 @@ hatch if TE cannot fuse the exact operation:
    flow into GEMM without materialization.
 3. For MLP/MoE, prefer TE-native block-scaled linear first. This gets us real
    cuBLAS block-scaled GEMM quickly.
-4. For SparseMLA, only move to block/MX scales after a kernel design change:
-   current TileLang code assumes one scalar per query token and one scalar per
-   KV token. Block scales require summing per-K-block products, not just
-   multiplying the finished accumulator by one scalar.
+4. For SparseMLA, use the QK helper as the next kernel-design foothold rather
+   than replacing the production path immediately.  Full integration still
+   needs online softmax/PV fusion, backward, and direct TE MXFP8/NVFP4 tensor
+   extraction.
