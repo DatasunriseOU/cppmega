@@ -19,6 +19,7 @@ import argparse
 import importlib.util
 import json
 import os
+from functools import lru_cache
 from pathlib import Path
 import time
 from typing import Any, Literal
@@ -38,6 +39,17 @@ def _load_cppmega_fp8_shim() -> Any:
     spec = importlib.util.spec_from_file_location("cppmega_fp8_shim_probe", shim_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"could not load shim from {shim_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@lru_cache(maxsize=1)
+def _load_mxfp8_transpose_emit_ext() -> Any:
+    ext_path = Path(__file__).with_name("te_mxfp8_transpose_emit_ext.py")
+    spec = importlib.util.spec_from_file_location("te_mxfp8_transpose_emit_ext_probe", ext_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load transpose-emission extension from {ext_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -88,16 +100,41 @@ def _try_gemm(
     rel_l2_limit: float | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
+    row, _ = _try_gemm_capture(
+        name,
+        ref,
+        gemm_fn,
+        *args,
+        rel_l2_limit=rel_l2_limit,
+        **kwargs,
+    )
+    return row
+
+
+def _try_gemm_capture(
+    name: str,
+    ref: torch.Tensor,
+    gemm_fn: Any,
+    *args: Any,
+    rel_l2_limit: float | None = None,
+    **kwargs: Any,
+) -> tuple[dict[str, Any], torch.Tensor | None]:
     try:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
         out, *_ = gemm_fn(*args, **kwargs)
+        end.record()
         torch.cuda.synchronize()
-        return _record_success(name, out, ref, rel_l2_limit=rel_l2_limit)
+        row = _record_success(name, out, ref, rel_l2_limit=rel_l2_limit)
+        row["elapsed_ms"] = float(start.elapsed_time(end))
+        return row, out
     except Exception as exc:  # pragma: no cover - this is a probe
         try:
             torch.cuda.synchronize()
         except Exception:
             pass
-        return _record_failure(name, exc)
+        return _record_failure(name, exc), None
 
 
 def _mxfp8_quantize(tensor: torch.Tensor, *, columnwise: bool) -> Any:
@@ -187,10 +224,84 @@ def _mxfp8_columnwise_as_rowwise_transpose(tensor: Any) -> MXFP8Tensor:
     return _mxfp8_retarget_columnwise_as_rowwise_transpose(tensor)
 
 
+def _timed_mxfp8_columnwise_as_rowwise_transpose(tensor: Any) -> tuple[MXFP8Tensor, float]:
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    transposed = _mxfp8_columnwise_as_rowwise_transpose(tensor)
+    end.record()
+    torch.cuda.synchronize()
+    return transposed, float(start.elapsed_time(end))
+
+
+def _mxfp8_emit_rowwise_transpose_from_bf16(source: torch.Tensor, tensor: Any) -> MXFP8Tensor:
+    """Emit rowwise MXFP8 storage for ``source.T`` using TE columnwise scales."""
+
+    if tensor._with_gemm_swizzled_scales:
+        raise ValueError("MXFP8 transpose emission requires compact, non-swizzled scales")
+    if tensor._columnwise_scale_inv is None:
+        raise ValueError("MXFP8 tensor is missing compact columnwise scales")
+    if source.dim() != 2:
+        raise ValueError("MXFP8 transpose emission probe requires a 2D BF16 source")
+
+    ext = _load_mxfp8_transpose_emit_ext()
+    rowwise_data, rowwise_scale_inv = ext.emit_transpose_from_bf16(
+        source,
+        tensor._columnwise_scale_inv,
+    )
+    quantizer = MXFP8Quantizer(tensor._fp8_dtype, rowwise=True, columnwise=False)
+    quantizer.internal = True
+    quantizer.optimize_for_gemm = False
+    return MXFP8Tensor(
+        shape=rowwise_data.shape,
+        dtype=tensor._dtype,
+        fp8_dtype=tensor._fp8_dtype,
+        rowwise_data=rowwise_data,
+        rowwise_scale_inv=rowwise_scale_inv,
+        columnwise_data=None,
+        columnwise_scale_inv=None,
+        quantizer=quantizer,
+        requires_grad=False,
+        with_gemm_swizzled_scales=False,
+    )
+
+
+def _timed_mxfp8_emit_rowwise_transpose_from_bf16(
+    source: torch.Tensor,
+    tensor: Any,
+) -> tuple[MXFP8Tensor, float]:
+    _mxfp8_emit_rowwise_transpose_from_bf16(source, tensor)
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    emitted = _mxfp8_emit_rowwise_transpose_from_bf16(source, tensor)
+    end.record()
+    torch.cuda.synchronize()
+    return emitted, float(start.elapsed_time(end))
+
+
 def _mxfp8_transpose_copy_bytes(tensor: Any) -> int:
     if tensor._columnwise_data is None or tensor._columnwise_scale_inv is None:
         return 0
     return int(tensor._columnwise_data.numel() + tensor._columnwise_scale_inv.numel())
+
+
+def _mxfp8_transpose_emit_bytes(source: torch.Tensor, tensor: Any) -> dict[str, int]:
+    if tensor._columnwise_scale_inv is None:
+        return {
+            "bf16_source_read_bytes": int(source.numel() * source.element_size()),
+            "emitted_payload_bytes": int(source.numel()),
+            "scale_transpose_bytes": 0,
+            "existing_mxfp8_payload_copy_bytes": 0,
+        }
+    return {
+        "bf16_source_read_bytes": int(source.numel() * source.element_size()),
+        "emitted_payload_bytes": int(source.numel()),
+        "scale_transpose_bytes": int(tensor._columnwise_scale_inv.numel()),
+        "existing_mxfp8_payload_copy_bytes": 0,
+    }
 
 
 def _append_mxfp8_nocopy_probe_results(
@@ -252,6 +363,101 @@ def _append_mxfp8_nocopy_probe_results(
         )
 
 
+def _append_mxfp8_transpose_emit_probe_results(
+    results: list[dict[str, Any]],
+    refs: dict[str, torch.Tensor],
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    dy: torch.Tensor,
+    xq: Any,
+    wq: Any,
+    dyq: Any,
+) -> dict[str, Any]:
+    """Compare direct BF16->rowwise-transposed MXFP8 emission with copied TN adapter."""
+
+    emit_bytes = {
+        "dgrad": _mxfp8_transpose_emit_bytes(weight, wq),
+        "wgrad_x": _mxfp8_transpose_emit_bytes(x, xq),
+        "wgrad_dy": _mxfp8_transpose_emit_bytes(dy, dyq),
+    }
+
+    try:
+        weight_t_copy, copy_ms = _timed_mxfp8_columnwise_as_rowwise_transpose(wq)
+        emit_bytes["dgrad"]["copy_adapter_transpose_elapsed_ms"] = copy_ms
+        weight_t_emit, emit_ms = _timed_mxfp8_emit_rowwise_transpose_from_bf16(weight, wq)
+        emit_bytes["dgrad"]["emit_elapsed_ms"] = emit_ms
+        copy_row, copy_out = _try_gemm_capture(
+            "mxfp8_dgrad_adapter_TN_copy_for_emit_compare",
+            refs["dgrad"],
+            general_gemm,
+            weight_t_copy,
+            dyq,
+            out_dtype=torch.bfloat16,
+            layout="TN",
+            grad=True,
+            use_split_accumulator=False,
+        )
+        emit_row, emit_out = _try_gemm_capture(
+            "mxfp8_dgrad_transpose_emit_TN",
+            refs["dgrad"],
+            general_gemm,
+            weight_t_emit,
+            dyq,
+            out_dtype=torch.bfloat16,
+            layout="TN",
+            grad=True,
+            use_split_accumulator=False,
+        )
+        if copy_out is not None and emit_out is not None:
+            emit_row["max_abs_vs_copy_adapter"] = _max_abs(emit_out, copy_out)
+            emit_row["rel_l2_vs_copy_adapter"] = _rel_l2(emit_out, copy_out)
+        results.append(copy_row)
+        results.append(emit_row)
+    except Exception as exc:  # pragma: no cover - this is a probe
+        results.append(_record_failure("mxfp8_dgrad_transpose_emit_TN", exc))
+
+    try:
+        x_t_copy, x_copy_ms = _timed_mxfp8_columnwise_as_rowwise_transpose(xq)
+        dy_t_copy, dy_copy_ms = _timed_mxfp8_columnwise_as_rowwise_transpose(dyq)
+        emit_bytes["wgrad_x"]["copy_adapter_transpose_elapsed_ms"] = x_copy_ms
+        emit_bytes["wgrad_dy"]["copy_adapter_transpose_elapsed_ms"] = dy_copy_ms
+        x_t_emit, x_emit_ms = _timed_mxfp8_emit_rowwise_transpose_from_bf16(x, xq)
+        dy_t_emit, dy_emit_ms = _timed_mxfp8_emit_rowwise_transpose_from_bf16(dy, dyq)
+        emit_bytes["wgrad_x"]["emit_elapsed_ms"] = x_emit_ms
+        emit_bytes["wgrad_dy"]["emit_elapsed_ms"] = dy_emit_ms
+        copy_row, copy_out = _try_gemm_capture(
+            "mxfp8_wgrad_adapter_TN_copy_for_emit_compare",
+            refs["wgrad"],
+            general_gemm,
+            x_t_copy,
+            dy_t_copy,
+            out_dtype=torch.bfloat16,
+            layout="TN",
+            grad=True,
+            use_split_accumulator=False,
+        )
+        emit_row, emit_out = _try_gemm_capture(
+            "mxfp8_wgrad_transpose_emit_TN",
+            refs["wgrad"],
+            general_gemm,
+            x_t_emit,
+            dy_t_emit,
+            out_dtype=torch.bfloat16,
+            layout="TN",
+            grad=True,
+            use_split_accumulator=False,
+        )
+        if copy_out is not None and emit_out is not None:
+            emit_row["max_abs_vs_copy_adapter"] = _max_abs(emit_out, copy_out)
+            emit_row["rel_l2_vs_copy_adapter"] = _rel_l2(emit_out, copy_out)
+        results.append(copy_row)
+        results.append(emit_row)
+    except Exception as exc:  # pragma: no cover - this is a probe
+        results.append(_record_failure("mxfp8_wgrad_transpose_emit_TN", exc))
+
+    return emit_bytes
+
+
 def _run(args: argparse.Namespace) -> dict[str, Any]:
     shim_module = None
     wrapped_general_gemm = None
@@ -275,6 +481,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "wgrad": dy.t() @ x,
     }
     results: list[dict[str, Any]] = []
+    mxfp8_emit_bytes: dict[str, Any] | None = None
 
     if args.format in ("mxfp8", "both"):
         xq = _mxfp8_quantize(x, columnwise=True)
@@ -307,6 +514,17 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 wq,
                 dyq,
                 rel_l2_limit=args.nocopy_rel_l2_limit,
+            )
+        if args.prototype_transpose_emit:
+            mxfp8_emit_bytes = _append_mxfp8_transpose_emit_probe_results(
+                results,
+                refs,
+                x,
+                weight,
+                dy,
+                xq,
+                wq,
+                dyq,
             )
         results.append(
             _try_gemm(
@@ -447,6 +665,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     }
     if args.format in ("mxfp8", "both"):
         report["mxfp8_adapter_copy_bytes"] = mxfp8_copy_bytes
+    if mxfp8_emit_bytes is not None:
+        report["mxfp8_transpose_emit_prototype_bytes"] = mxfp8_emit_bytes
     if shim_module is not None and hasattr(shim_module, "cppmega_te_mxfp8_bwd_stats_snapshot"):
         report["shim_stats"] = shim_module.cppmega_te_mxfp8_bwd_stats_snapshot()
     return report
@@ -477,6 +697,15 @@ def main() -> None:
         type=float,
         default=0.15,
         help="Relative L2 threshold used to mark no-copy retargeting variants as bad_math.",
+    )
+    parser.add_argument(
+        "--prototype-transpose-emit",
+        action="store_true",
+        help=(
+            "Build a local CUDA extension that emits rowwise-transposed MXFP8 operands "
+            "directly from BF16 plus TE columnwise scales and compares against the "
+            "copy-based TN adapter. This is a probe, not a TE runtime patch."
+        ),
     )
     args = parser.parse_args()
 
