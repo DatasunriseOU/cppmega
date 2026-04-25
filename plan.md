@@ -28,6 +28,9 @@ Completed in this checkpoint:
 - Local GB10 launcher defaults to FlashAttention, TE bias+GELU, Muon no-master
   BF16 fallback, quantized Muon momentum, Adam8bit scalar fallback, and
   `--local-ddp-disable-contiguous-grad-buffer`.
+- Precision-aware storage, when explicitly enabled, is hard-pinned to the
+  aggressive ladder: main grads BF16, main params FP16, Adam moments FP8. The
+  local Megatron patch also rejects FP32 BF16-gradient accumulation/reduction.
 - Lion8bit scalar fallback is now an opt-in env override:
   `CPPMEGA_MUON_SCALAR_OPTIMIZER=lion8bit`.
 
