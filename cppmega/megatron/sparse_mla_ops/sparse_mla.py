@@ -56,6 +56,13 @@ _TE_TENSORWISE_SPARSE_MLA_ALIASES = {
     "tensorwise",
 }
 _BLOCKSCALED_QK_ENV = "CPPMEGA_SPARSE_MLA_BLOCKSCALED_QK"
+_BLOCKSCALED_FUSED_ENV = "CPPMEGA_SPARSE_MLA_BLOCKSCALED_FUSED"
+_BLOCKSCALED_BWD_REFERENCE_ACK_ENV = (
+    "CPPMEGA_SPARSE_MLA_BLOCKSCALED_BWD_REFERENCE_ACK"
+)
+_BLOCKSCALED_TILELANG_BWD_UNSAFE_ENV = (
+    "CPPMEGA_SPARSE_MLA_BLOCKSCALED_TILELANG_BWD_UNSAFE"
+)
 
 
 def _env_enabled(name: str) -> bool:
@@ -114,6 +121,123 @@ def sparse_mla_blockscaled_qk_scores(
         indices,
         quant_format=quant_format,
         block_i=block_i,
+        threads=threads,
+    )
+
+
+def sparse_mla_blockscaled_mxfp8_forward(
+    q_data: torch.Tensor,
+    kv_data: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    softmax_scale: Optional[float],
+    d_v: int,
+    block_i: int = 64,
+    num_stages: int = 2,
+    threads: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Experimental fused MXFP8 block-scaled SparseMLA forward.
+
+    This path is intentionally separate from ``SparseMLA_FP8`` and raises
+    unless ``CPPMEGA_SPARSE_MLA_BLOCKSCALED_FUSED=1`` is set. It consumes
+    pre-quantized MXFP8 payloads plus per-32-channel FP32 scales, runs
+    block-scaled QK + online softmax + PV, and returns ``(out, lse)``.
+    """
+    if not _env_enabled(_BLOCKSCALED_FUSED_ENV):
+        raise RuntimeError(
+            f"experimental fused block-scaled SparseMLA requires {_BLOCKSCALED_FUSED_ENV}=1"
+        )
+
+    from cppmega.megatron.sparse_mla_ops.tilelang_sparse_mla_blockscaled_fused import (
+        sparse_mla_blockscaled_mxfp8_fwd_interface,
+    )
+
+    return sparse_mla_blockscaled_mxfp8_fwd_interface(
+        q_data,
+        kv_data,
+        q_scale,
+        kv_scale,
+        indices,
+        sm_scale=softmax_scale,
+        d_v=d_v,
+        block_i=block_i,
+        num_stages=num_stages,
+        threads=threads,
+    )
+
+
+def sparse_mla_blockscaled_mxfp8_backward(
+    q_data: torch.Tensor,
+    kv_data: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
+    out: torch.Tensor,
+    grad_out: torch.Tensor,
+    indices: torch.Tensor,
+    lse: torch.Tensor,
+    *,
+    softmax_scale: Optional[float],
+    d_v: int,
+    block_size: int = 32,
+    num_stages: int = 0,
+    threads: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Experimental MXFP8 block-scaled SparseMLA backward prototype.
+
+    Returns BF16 gradients with respect to the logical dequantized Q and KV
+    tensors. It does not return gradients for FP8 bytes or scale tensors.
+    """
+    if not _env_enabled(_BLOCKSCALED_FUSED_ENV):
+        raise RuntimeError(
+            f"experimental fused block-scaled SparseMLA requires {_BLOCKSCALED_FUSED_ENV}=1"
+        )
+
+    if _env_enabled(_BLOCKSCALED_BWD_REFERENCE_ACK_ENV):
+        from cppmega.megatron.sparse_mla_ops.tilelang_sparse_mla_blockscaled_fused import (
+            sparse_mla_blockscaled_mxfp8_bwd_reference,
+        )
+
+        return sparse_mla_blockscaled_mxfp8_bwd_reference(
+            q_data,
+            kv_data,
+            q_scale,
+            kv_scale,
+            out,
+            grad_out,
+            indices,
+            lse,
+            sm_scale=softmax_scale,
+            d_v=d_v,
+        )
+
+    if not _env_enabled(_BLOCKSCALED_TILELANG_BWD_UNSAFE_ENV):
+        raise RuntimeError(
+            "experimental fused block-scaled SparseMLA TileLang backward is not "
+            "enabled because the current prototype has not passed finite-gradient "
+            "validation. For the explicit correctness prototype set "
+            f"{_BLOCKSCALED_BWD_REFERENCE_ACK_ENV}=1. For kernel debugging only set "
+            f"{_BLOCKSCALED_TILELANG_BWD_UNSAFE_ENV}=1."
+        )
+
+    from cppmega.megatron.sparse_mla_ops.tilelang_sparse_mla_blockscaled_fused import (
+        sparse_mla_blockscaled_mxfp8_bwd,
+    )
+
+    return sparse_mla_blockscaled_mxfp8_bwd(
+        q_data,
+        kv_data,
+        q_scale,
+        kv_scale,
+        out,
+        grad_out,
+        indices,
+        lse,
+        sm_scale=softmax_scale,
+        d_v=d_v,
+        block_size=block_size,
+        num_stages=num_stages,
         threads=threads,
     )
 

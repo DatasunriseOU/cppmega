@@ -140,3 +140,12 @@ SparseMLA block-scaled backend yet.
 5. The value path needs a producer/ABI decision.  QK block scales are per
    K-block, while `P @ V` either needs a compatible block-scaled V path or a
    deliberate BF16 V tile dequant strategy.
+
+## Fused Follow-Up
+
+`agent/sparse-mla-fused-backend` adds an experimental MXFP8 fused forward
+prototype that extends this QK helper into block-scaled QK + online softmax +
+PV without materializing full sparse scores.  Its backward remains an
+explicit-ACK BF16 correctness reference until the TileLang backward prototype
+passes finite-gradient validation.  See
+`docs/sparse_mla_blockscaled_fused_backend_2026_04_25.md`.
