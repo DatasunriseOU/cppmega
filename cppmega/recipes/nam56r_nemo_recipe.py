@@ -19,6 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+from cppmega.megatron.deprecated_paths import require_deprecated_ack
+
 from cppmega.recipes.nam56r_megatron import parse_nem_pattern
 
 # ---------------------------------------------------------------------------
@@ -535,6 +537,15 @@ def nam56r_mamba3_te_pretrain() -> NAM56RNeMoRecipe:
     correct nheads=56 (same as nemo_native baseline) for apples-to-apples
     comparison. This recipe used nheads=112 (Author expand=2 convention).
     """
+    require_deprecated_ack(
+        feature="nam56r_mamba3_te_pretrain()",
+        ack_env=(
+            "CPPMEGA_I_UNDERSTAND_NAM56R_MAMBA3_TE_PRETRAIN_"
+            "USES_DEPRECATED_NHEADS112"
+        ),
+        replacement="nam56r_mamba3_native_pretrain()",
+        reason="It uses the old nheads=112 Author convention.",
+    )
     return NAM56RNeMoRecipe(
         mode="author_dp",
         use_moe=True,
