@@ -186,7 +186,8 @@ jobs:
         # scikit-build-core: PEP 517 backend used by tilelang/CMake-based wheels.
         # setuptools-scm: many wheels resolve their version from git tags.
         # numpy must be present for torch's tensor_numpy.cpp at build time.
-        run: pip install ninja packaging pybind11 cmake numpy einops scikit-build-core setuptools-scm
+        # z3-solver: tilelang's CMake calls 'import z3' during configure (FindZ3.cmake).
+        run: pip install ninja packaging pybind11 cmake numpy einops scikit-build-core setuptools-scm "z3-solver>=4.13.0"
 
       - name: Clone source (any ref — branch / tag / SHA)
         run: |
