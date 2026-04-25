@@ -40,6 +40,75 @@ strides for this representation. Removing the copy needs a lower-level TE/CUDA
 patch that teaches the GEMM path about the opposite compact payload layout, not
 only a layout flag swap.
 
+## No-Copy Follow-Up: 2026-04-25
+
+Follow-up worktree:
+`/home/dave/source/cppmega-te-nocopy-agent`
+
+Local `/home/dave/TransformerEngine` was inspected before changing the probe.
+The relevant source points are:
+
+- `transformer_engine/pytorch/csrc/type_converters.cpp`
+  `NVTETensorFromMXFP8Tensor` passes MXFP8 PyTorch tensors into TE with
+  `data_ptr()` and shape only. PyTorch strides are not represented in the
+  `TensorWrapper`.
+- `transformer_engine/common/gemm/cublaslt_gemm.cu`
+  `CanonicalizeGemmInput` chooses MXFP8 rowwise storage for transposed operands
+  and columnwise storage for non-transposed operands, while preserving the
+  requested cuBLAS transpose flags. There is no Python-visible descriptor knob
+  for "consume this compact columnwise buffer as the logical rowwise storage of
+  the transposed operand".
+- `transformer_engine/pytorch/csrc/util.h` has a lower-level
+  `convert_block_scaling_to_mxfp8_tensor` helper that can reinterpret
+  block-scaled columnwise data as rowwise to avoid a transpose, but it is scoped
+  to FP8 block scaling conversion and is not exposed as a pure MXFP8 GEMM
+  operand path.
+
+`tools/probes/te_blockscaled_backward_probe.py` now has
+`--probe-nocopy`, which tests the current copied adapter against no-copy
+metadata variants:
+
+```bash
+PYTHONPATH=/worktree python tools/probes/te_blockscaled_backward_probe.py \
+  --format mxfp8 --probe-nocopy --m 64 --n 96 --k 128
+```
+
+Result on NVIDIA GB10, sm_12.1:
+
+| Variant | dgrad rel L2 | dgrad status | wgrad rel L2 | wgrad status |
+| --- | ---: | --- | ---: | --- |
+| copied payload + copied scale | 0.037086 | pass | 0.037205 | pass |
+| `.t()` view payload + copied scale | 1.448428 | bad_math | 1.517260 | bad_math |
+| copied payload + `.t()` view scale | 0.580868 | bad_math | 0.907368 | bad_math |
+| `.t()` view payload + `.t()` view scale | 1.337617 | bad_math | 1.161306 | bad_math |
+| reshape-only payload + reshape-only scale | 1.337617 | bad_math | 1.161306 | bad_math |
+
+This proves both compact MXFP8 payload bytes and compact E8M0 scale bytes need
+real reordered storage for TE 2.14's current Python/C++ GEMM path. A no-copy
+solution requires a TE/CUDA patch that carries an alternate MXFP8 operand
+descriptor into `CanonicalizeGemmInput`/`nvte_cublas_gemm_v2`, or a fused
+quantize/cast path that directly emits the rowwise-transposed backward
+operand storage.
+
+The probe also reports the current adapter copy volume:
+
+```json
+{
+  "dgrad_payload_and_scale_bytes": 12800,
+  "wgrad_payload_and_scale_bytes": 15360
+}
+```
+
+for the `m=64, n=96, k=128` probe shape. For projection-like
+`m=256, n=4096, k=4096`, the required shim probe reports:
+
+```json
+{
+  "dgrad_payload_and_scale_bytes": 17301504,
+  "wgrad_payload_and_scale_bytes": 2162688
+}
+```
+
 ## Runtime Env Flags
 
 Preserved existing flags:
