@@ -35,6 +35,7 @@ env:
 
 jobs:
   resolve:
+    if: github.repository == 'jewelmusicee/cppmega'
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.t.outputs.tag }}
@@ -48,6 +49,7 @@ jobs:
           fi
 
   build:
+    if: github.repository == 'jewelmusicee/cppmega'
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 350     # 6h hard limit; flash_attn at MAX_JOBS=1 ~= 4h
@@ -243,6 +245,7 @@ jobs:
           retention-days: 7
 
   release:
+    if: github.repository == 'jewelmusicee/cppmega'
     needs: [resolve, build]
     runs-on: ubuntu-latest
     steps:

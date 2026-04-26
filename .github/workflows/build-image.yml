@@ -1,7 +1,7 @@
 name: build-image
 
 # Assemble the cppmega runtime image from the prebuilt wheel release and push
-# to ghcr.io/datasunriseou/cppmega:<sha>. Buildx registry cache lives in the same
+# to ghcr.io/jewelmusicee/cppmega:<sha>. Buildx registry cache lives in the same
 # repo so re-runs after a fix start from the last good layer, never from scratch.
 
 on:
@@ -28,11 +28,13 @@ permissions:
   packages: write   # ghcr.io push
 
 env:
-  IMAGE: ghcr.io/datasunriseou/cppmega
+  IMAGE: ghcr.io/jewelmusicee/cppmega
 
 jobs:
   image:
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    if: |
+      github.repository == 'jewelmusicee/cppmega' &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
