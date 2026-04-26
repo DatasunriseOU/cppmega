@@ -288,7 +288,8 @@ class TestBwdParity:
             pytest.skip("triton not available")
         import cppmega.megatron.m2rnn_triton as _mod
 
-        monkeypatch.setattr(_mod, "_BWD_CHUNK_SIZE", 8)
+        monkeypatch.setenv("CPPMEGA_M2RNN_BWD_CHUNK_SIZE", "8")
+        _mod.reset_m2rnn_runtime_config_cache()
 
         B, S, H, K, V = 1, 33, 2, 16, 16
         q0, k0, v0, W0, xf0 = _make_inputs(B, S, H, K, V, dtype=torch.float32, seed=11)
@@ -340,11 +341,11 @@ class TestRecomputeVsSaveParity:
     """Verify that SAVE_HNEW=0 (recompute) and SAVE_HNEW=1 (save) produce
     identical fwd outputs and bwd gradients within bf16 tolerance.
 
-    The test monkey-patches ``cppmega.megatron.m2rnn_triton._SAVE_HNEW`` to
-    run both paths in the same process, then compares all outputs and grads.
+    The test changes ``CPPMEGA_M2RNN_SAVE_HNEW`` to run both paths in the
+    same process, then compares all outputs and grads.
     """
 
-    def test_recompute_vs_save_parity(self):
+    def test_recompute_vs_save_parity(self, monkeypatch):
         try:
             import triton  # noqa: F401
         except ImportError:
@@ -353,25 +354,22 @@ class TestRecomputeVsSaveParity:
 
         B, S, H, K, V = 2, 128, 4, 32, 16
         q0, k0, v0, W0, xf0 = _make_inputs(B, S, H, K, V, dtype=torch.float32)
+        _mod.reset_m2rnn_runtime_config_cache()
 
         def run_with_save_hnew(flag):
-            """Run fwd+bwd with _SAVE_HNEW = flag."""
-            orig = _mod._SAVE_HNEW
-            _mod._SAVE_HNEW = flag
-            try:
-                q = q0.detach().clone().requires_grad_(True)
-                k = k0.detach().clone().requires_grad_(True)
-                v = v0.detach().clone().requires_grad_(True)
-                W = W0.detach().clone().requires_grad_(True)
-                xf = xf0.detach().clone().requires_grad_(True)
-                out, h_final = _mod.m2rnn_scan_triton(q, k, v, W, xf)
-                # Use a fixed grad_output seeded from q0's shape.
-                g = torch.randn(out.shape, device=out.device, dtype=out.dtype,
-                                generator=torch.Generator(device=out.device).manual_seed(99))
-                (out * g).sum().backward()
-                return out, h_final, q.grad, k.grad, v.grad, W.grad, xf.grad
-            finally:
-                _mod._SAVE_HNEW = orig
+            """Run fwd+bwd with CPPMEGA_M2RNN_SAVE_HNEW = flag."""
+            monkeypatch.setenv("CPPMEGA_M2RNN_SAVE_HNEW", "1" if flag else "0")
+            q = q0.detach().clone().requires_grad_(True)
+            k = k0.detach().clone().requires_grad_(True)
+            v = v0.detach().clone().requires_grad_(True)
+            W = W0.detach().clone().requires_grad_(True)
+            xf = xf0.detach().clone().requires_grad_(True)
+            out, h_final = _mod.m2rnn_scan_triton(q, k, v, W, xf)
+            # Use a fixed grad_output seeded from q0's shape.
+            g = torch.randn(out.shape, device=out.device, dtype=out.dtype,
+                            generator=torch.Generator(device=out.device).manual_seed(99))
+            (out * g).sum().backward()
+            return out, h_final, q.grad, k.grad, v.grad, W.grad, xf.grad
 
         # Run both paths.
         save_results = run_with_save_hnew(True)
@@ -402,8 +400,9 @@ class TestCheckpointedBackwardMemory:
             pytest.skip("triton not available")
         import cppmega.megatron.m2rnn_triton as _mod
 
-        monkeypatch.setattr(_mod, "_SAVE_HNEW", False)
-        monkeypatch.setattr(_mod, "_BWD_CHUNK_SIZE", 8)
+        monkeypatch.setenv("CPPMEGA_M2RNN_SAVE_HNEW", "0")
+        monkeypatch.setenv("CPPMEGA_M2RNN_BWD_CHUNK_SIZE", "8")
+        _mod.reset_m2rnn_runtime_config_cache()
 
         B, S, H, K, V = 1, 33, 2, 16, 16
         q, k, v, W, xf = _make_inputs(B, S, H, K, V, dtype=torch.float32, seed=21)

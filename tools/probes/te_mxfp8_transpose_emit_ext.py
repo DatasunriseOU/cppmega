@@ -1,9 +1,9 @@
-"""Runtime CUDA extension for MXFP8 transposed-emission probes.
+"""MXFP8 transposed-emission helper for probes.
 
-This is intentionally a probe helper, not production code.  It does not patch
-TransformerEngine.  The kernel uses TE's already-computed compact columnwise
-E8M0 scales and emits the rowwise MXFP8 storage for the logical transpose
-directly from a BF16 source tensor.
+Patched TransformerEngine builds expose this as
+``transformer_engine_torch.mxfp8_scaling_transpose_cast``.  This module prefers
+that real TE op and keeps the inline runtime extension as a fallback for
+comparing older/unpatched wheels.
 """
 
 from __future__ import annotations
@@ -14,6 +14,9 @@ from typing import Any
 
 import torch
 from torch.utils.cpp_extension import load_inline
+
+
+_BACKEND_ENV = "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"
 
 
 _CPP_SOURCE = r"""
@@ -223,6 +226,33 @@ def emit_transpose_from_bf16(
         device=source.device,
         dtype=torch.uint8,
     )
+    backend = os.environ.get(_BACKEND_ENV, "auto").lower()
+    if backend not in {"auto", "te", "probe"}:
+        raise ValueError(f"{_BACKEND_ENV} must be one of auto, te, probe; got {backend!r}")
+    if backend in {"auto", "te"}:
+        try:
+            import transformer_engine.common as te_common
+
+            te_common.load_framework_extension("torch")
+            import transformer_engine_torch as tex
+        except ImportError:
+            tex = None
+        te_op = getattr(tex, "mxfp8_scaling_transpose_cast", None) if tex is not None else None
+        if te_op is not None:
+            te_op(
+                source,
+                columnwise_scale_inv,
+                rowwise_data,
+                rowwise_scale_inv,
+                rows,
+                cols,
+            )
+            return rowwise_data, rowwise_scale_inv
+        if backend == "te":
+            raise RuntimeError(
+                "patched TransformerEngine op mxfp8_scaling_transpose_cast is not available"
+            )
+
     load_extension().mxfp8_transpose_emit(
         source,
         columnwise_scale_inv,

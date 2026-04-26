@@ -16,15 +16,39 @@ small parsers for the probe output and one-step training logs.
 from __future__ import annotations
 
 import argparse
-import ast
 from dataclasses import asdict, dataclass
+import importlib.util
 import json
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 from typing import Any
+
+if __package__:
+    from .gb10_accepted_path_validation_helpers import (
+        ADAPTER_STAT_KEYS,
+        FALLBACK_STAT_KEYS,
+        SIDECAR_REGISTRY_ZERO_KEYS,
+        extract_first_json_object,
+        parse_training_log,
+        validate_probe_report,
+    )
+else:
+    _HELPER_PATH = Path(__file__).with_name("gb10_accepted_path_validation_helpers.py")
+    _HELPER_SPEC = importlib.util.spec_from_file_location(
+        "_gb10_accepted_path_validation_helpers", _HELPER_PATH
+    )
+    if _HELPER_SPEC is None or _HELPER_SPEC.loader is None:
+        raise ImportError(f"could not load helper module at {_HELPER_PATH}")
+    _helpers = importlib.util.module_from_spec(_HELPER_SPEC)
+    _HELPER_SPEC.loader.exec_module(_helpers)
+    ADAPTER_STAT_KEYS = _helpers.ADAPTER_STAT_KEYS
+    FALLBACK_STAT_KEYS = _helpers.FALLBACK_STAT_KEYS
+    SIDECAR_REGISTRY_ZERO_KEYS = _helpers.SIDECAR_REGISTRY_ZERO_KEYS
+    extract_first_json_object = _helpers.extract_first_json_object
+    parse_training_log = _helpers.parse_training_log
+    validate_probe_report = _helpers.validate_probe_report
 
 
 MXFP8_BF16_ACK = "CPPMEGA_I_UNDERSTAND_MXFP8_BF16_BACKWARD_BRIDGE_IS_DEPRECATED_AND_SLOW"
@@ -32,13 +56,6 @@ DSA_GATHER_ACK = "CPPMEGA_I_UNDERSTAND_DSA_GATHER_SCATTER_IS_DEPRECATED_AND_SLOW
 FP8_ACT_LEGACY_ACK = (
     "CPPMEGA_I_UNDERSTAND_FP8_ACTIVATION_LEGACY_BACKEND_IS_DEPRECATED_AND_SYNCY"
 )
-
-FALLBACK_STAT_KEYS = ("bf16_fallback_dgrad", "bf16_fallback_wgrad")
-ADAPTER_STAT_KEYS = ("mxfp8_tn_adapter_dgrad", "mxfp8_tn_adapter_wgrad")
-PASSTHROUGH_STAT_KEYS = ("native_passthrough_dgrad", "native_passthrough_wgrad")
-ALL_STAT_KEYS = ADAPTER_STAT_KEYS + FALLBACK_STAT_KEYS + PASSTHROUGH_STAT_KEYS
-
-NUMBER_RE = r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?"
 
 
 @dataclass
@@ -207,52 +224,6 @@ def _probe_prereqs_available(timeout_s: int) -> tuple[bool, str]:
     return True, "CUDA and Transformer Engine are available"
 
 
-def extract_first_json_object(text: str) -> dict[str, Any]:
-    decoder = json.JSONDecoder()
-    for idx, char in enumerate(text):
-        if char != "{":
-            continue
-        try:
-            obj, _ = decoder.raw_decode(text[idx:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict):
-            return obj
-    raise ValueError("no JSON object found in probe output")
-
-
-def validate_probe_report(report: dict[str, Any]) -> list[str]:
-    errors: list[str] = []
-    stats = report.get("shim_stats")
-    if not isinstance(stats, dict):
-        return ["probe report is missing shim_stats"]
-
-    for key in FALLBACK_STAT_KEYS:
-        if int(stats.get(key, -1)) != 0:
-            errors.append(f"{key}={stats.get(key)}; expected 0")
-    for key in ADAPTER_STAT_KEYS:
-        if int(stats.get(key, 0)) <= 0:
-            errors.append(f"{key}={stats.get(key)}; expected >0")
-    for key in PASSTHROUGH_STAT_KEYS:
-        if int(stats.get(key, -1)) != 0:
-            errors.append(f"{key}={stats.get(key)}; expected 0")
-    if stats.get("fallback_reasons", {}) not in ({}, None):
-        errors.append(f"fallback_reasons={stats.get('fallback_reasons')!r}; expected empty")
-
-    results = {
-        row.get("name"): row
-        for row in report.get("results", [])
-        if isinstance(row, dict) and isinstance(row.get("name"), str)
-    }
-    for name in ("mxfp8_dgrad_shim_NN_to_TN", "mxfp8_wgrad_shim_NT_to_TN"):
-        row = results.get(name)
-        if row is None:
-            errors.append(f"missing probe result {name}")
-        elif row.get("status") != "pass":
-            errors.append(f"{name} status={row.get('status')!r}; expected pass")
-    return errors
-
-
 def run_mxfp8_shim_probe(args: argparse.Namespace) -> CheckResult:
     if args.skip_mxfp8_probe:
         return CheckResult(
@@ -335,46 +306,6 @@ def run_mxfp8_shim_probe(args: argparse.Namespace) -> CheckResult:
     )
 
 
-def parse_training_log(text: str) -> dict[str, Any]:
-    losses: dict[str, list[float]] = {"lm": [], "mtp_1": []}
-    for key in list(losses):
-        for pattern in (
-            rf"\b{re.escape(key)}\s+loss\s*[:=]\s*({NUMBER_RE})",
-            rf"\bloss:\s*.*?\b{re.escape(key)}\s+({NUMBER_RE})",
-        ):
-            losses[key].extend(float(match) for match in re.findall(pattern, text))
-    losses = {key: values for key, values in losses.items() if values}
-
-    counters: dict[str, int] = {}
-    fallback_reasons: dict[str, Any] | None = None
-    marker = "TE block-scaled backward stats:"
-    for line in text.splitlines():
-        if marker not in line:
-            continue
-        payload = line.split(marker, 1)[1].strip()
-        try:
-            parsed = ast.literal_eval(payload)
-        except (SyntaxError, ValueError):
-            continue
-        if not isinstance(parsed, dict):
-            continue
-        for key in ALL_STAT_KEYS:
-            if key in parsed:
-                counters[key] = int(parsed[key])
-        reasons = parsed.get("fallback_reasons")
-        if isinstance(reasons, dict):
-            fallback_reasons = reasons
-
-    for key in ALL_STAT_KEYS:
-        matches = re.findall(rf"\b{re.escape(key)}\s*=\s*(\d+)\b", text)
-        if matches:
-            counters[key] = int(matches[-1])
-    if fallback_reasons is None and re.search(r"\bfallback_reasons\s*=\s*\{\s*\}", text):
-        fallback_reasons = {}
-
-    return {"losses": losses, "counters": counters, "fallback_reasons": fallback_reasons}
-
-
 def validate_training_log(path: Path) -> CheckResult:
     text = path.read_text(encoding="utf-8", errors="replace")
     parsed = parse_training_log(text)
@@ -391,6 +322,11 @@ def validate_training_log(path: Path) -> CheckResult:
         for key in ADAPTER_STAT_KEYS:
             if int(counters.get(key, 0)) <= 0:
                 errors.append(f"{key}={counters.get(key)}; expected >0")
+        for key in SIDECAR_REGISTRY_ZERO_KEYS:
+            if key not in counters:
+                errors.append(f"{key} missing; expected 0")
+            elif int(counters.get(key, -1)) != 0:
+                errors.append(f"{key}={counters.get(key)}; expected 0")
     reasons = parsed.get("fallback_reasons")
     if reasons not in ({}, None):
         errors.append(f"fallback_reasons={reasons!r}; expected empty")
