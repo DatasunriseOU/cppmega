@@ -661,6 +661,11 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "shape": {"m": args.m, "n": args.n, "k": args.k},
         "format": args.format,
         "use_shim": args.use_shim,
+        "transpose_emit_backend": os.environ.get(
+            "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND", "auto"
+        )
+        if args.prototype_transpose_emit
+        else None,
         "results": results,
     }
     if args.format in ("mxfp8", "both"):
@@ -702,12 +707,26 @@ def main() -> None:
         "--prototype-transpose-emit",
         action="store_true",
         help=(
-            "Build a local CUDA extension that emits rowwise-transposed MXFP8 operands "
-            "directly from BF16 plus TE columnwise scales and compares against the "
-            "copy-based TN adapter. This is a probe, not a TE runtime patch."
+            "Emit rowwise-transposed MXFP8 operands directly from BF16 plus TE "
+            "columnwise scales and compare against the copy-based TN adapter. "
+            "Uses a patched TE op when available, otherwise falls back to the "
+            "local probe extension."
+        ),
+    )
+    parser.add_argument(
+        "--require-te-transpose-emit",
+        action="store_true",
+        help=(
+            "Require transformer_engine_torch.mxfp8_scaling_transpose_cast for "
+            "--prototype-transpose-emit instead of falling back to the probe extension."
         ),
     )
     args = parser.parse_args()
+
+    if args.require_te_transpose_emit:
+        args.prototype_transpose_emit = True
+        os.environ["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] = "te"
+        os.environ["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT"] = "1"
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
