@@ -47,7 +47,8 @@ def smoke() -> dict:
     """Verify torch + TE + flash-attn + mamba_ssm + tilelang + qoptim_cuda
     all import cleanly and CUDA is visible."""
     import torch
-    import transformer_engine.pytorch as te
+    import transformer_engine
+    import transformer_engine.pytorch  # noqa: F401
     import flash_attn  # noqa: F401
     import mamba_ssm  # noqa: F401
     import causal_conv1d  # noqa: F401
@@ -58,7 +59,7 @@ def smoke() -> dict:
     return {
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
-        "te": te.__version__,
+        "te": transformer_engine.__version__,
         "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "image_ref": GHCR_REF,
     }
