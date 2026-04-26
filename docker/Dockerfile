@@ -7,8 +7,8 @@
 #
 # Layers are ordered cheapest → most-volatile so buildx registry cache reuses
 # everything below the changed wheel. Push/pull cache via:
-#   --cache-from=type=registry,ref=ghcr.io/jewelmusicee/cppmega:buildcache
-#   --cache-to=type=registry,ref=ghcr.io/jewelmusicee/cppmega:buildcache,mode=max
+#   --cache-from=type=registry,ref=ghcr.io/datasunriseou/cppmega:buildcache
+#   --cache-to=type=registry,ref=ghcr.io/datasunriseou/cppmega:buildcache,mode=max
 
 ARG CUDA_IMAGE=nvidia/cuda:13.2.1-cudnn-devel-ubuntu24.04
 FROM ${CUDA_IMAGE} AS runtime
