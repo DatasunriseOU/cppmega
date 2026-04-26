@@ -41,6 +41,7 @@ if [[ "${CPPMEGA_FP8_RECIPE}" == "mxfp8" || -n "${CPPMEGA_TE_PRECISION_CONFIG_FI
   export CPPMEGA_ALLOW_TE_MXFP8_SM12="${CPPMEGA_ALLOW_TE_MXFP8_SM12:-1}"
   export CPPMEGA_PAD_MAMBA_IN_PROJ_FOR_MXFP8="${CPPMEGA_PAD_MAMBA_IN_PROJ_FOR_MXFP8:-1}"
   export CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER="${CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER:-1}"
+  export CPPMEGA_TE_MXFP8_BWD_BACKEND="${CPPMEGA_TE_MXFP8_BWD_BACKEND:-cutlass_native}"
   export CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK="${CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK:-0}"
   export CPPMEGA_TE_MXFP8_DGRAD_BF16="${CPPMEGA_TE_MXFP8_DGRAD_BF16:-0}"
   export CPPMEGA_TE_MXFP8_WGRAD_BF16="${CPPMEGA_TE_MXFP8_WGRAD_BF16:-0}"
@@ -140,6 +141,7 @@ cat > "${WORKDIR}/cppmega_local_quarter_shim.py" <<'PY'
 from __future__ import annotations
 
 import collections
+import atexit
 import functools
 import os
 import sys
@@ -154,6 +156,17 @@ from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_pat
 apply_dsa_indexer_fused_patch()
 patch_mamba_output_layer_with_linear_ce()
 print("[local_quarter_shim] full GB10 training patches installed", file=sys.stderr)
+
+
+@atexit.register
+def _cppmega_destroy_torch_distributed() -> None:
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+    except Exception as exc:
+        print(f"[local_quarter_shim] destroy_process_group skipped: {exc}", file=sys.stderr)
 
 if os.environ.get("CPPMEGA_MEM_PROFILE", "0") == "1":
     import torch
@@ -527,7 +540,7 @@ echo "[local-quarter] torch_extensions=${TORCH_EXTENSIONS_DIR}"
 echo "[local-quarter] fp8_recipe=${CPPMEGA_FP8_RECIPE}"
 echo "[local-quarter] spec=${CPPMEGA_SPEC_MODULE} ${CPPMEGA_SPEC_FUNCTION}"
 echo "[local-quarter] te_precision_config=${CPPMEGA_TE_PRECISION_CONFIG_FILE:-}"
-echo "[local-quarter] mxfp8_bwd_tn_adapter=${CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER:-0} bf16_fallback=${CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK:-0} nvte_backward_override=${NVTE_BACKWARD_OVERRIDE:-}"
+echo "[local-quarter] mxfp8_bwd_tn_adapter=${CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER:-0} mxfp8_bwd_backend=${CPPMEGA_TE_MXFP8_BWD_BACKEND:-te_tn_adapter} bf16_fallback=${CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK:-0} nvte_backward_override=${NVTE_BACKWARD_OVERRIDE:-}"
 echo "[local-quarter] sparse_mla_fp8_quant=${CPPMEGA_SPARSE_MLA_FP8_QUANT}"
 echo "[local-quarter] optimizer=${CPPMEGA_OPTIMIZER} muon_scalar=${CPPMEGA_MUON_SCALAR_OPTIMIZER}"
 echo "[local-quarter] no_master_emerging=${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER} no_master_fallback=${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER} grad_reduce_bf16=${CPPMEGA_GRAD_REDUCE_IN_BF16}"

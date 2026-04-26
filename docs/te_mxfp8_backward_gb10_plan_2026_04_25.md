@@ -313,6 +313,103 @@ and quantizer scope, but do not add an MXFP8 backward descriptor/stride path.
 No local Megatron Bridge checkout was present under `/home/dave` during this
 pass.
 
+## Local TransformerEngine Patch Artifact: 2026-04-25
+
+Local source `/home/dave/TransformerEngine` is present and was patched
+directly. Baseline before edits was `v0.1-1538-geb8e792b`
+(`eb8e792b38228e3c221a2d6b69babe3a91acd1f4`). This is a local TE source
+patch, not an upstream patch file.
+
+Patched TE files:
+
+- `transformer_engine/common/include/transformer_engine/recipe.h`
+- `transformer_engine/common/recipe/mxfp8_scaling.cu`
+- `transformer_engine/pytorch/csrc/extensions.h`
+- `transformer_engine/pytorch/csrc/extensions/fp8_partial_cast.cpp`
+- `transformer_engine/pytorch/csrc/extensions/pybind.cpp`
+- `transformer_engine/pytorch/tensor/mxfp8_tensor.py`
+
+What is real now:
+
+- New C API:
+  `nvte_mxfp8_scaling_transpose_cast(input, scale_inv_colwise,
+  output_rowwise, output_rowwise_scale_inv, rows, cols, stream)`.
+- New CUDA path that reads high-precision source values and compact MXFP8
+  columnwise E8M0 scales, then emits rowwise MXFP8 payload plus transposed
+  compact rowwise scales for the logical transpose.
+- New PyTorch binding:
+  `transformer_engine_torch.mxfp8_scaling_transpose_cast`.
+- New Python helper:
+  `MXFP8Quantizer.quantize_rowwise_transpose(tensor, columnwise_scale_inv)`.
+
+Cppmega probe wrapper changes make `tools/probes/te_mxfp8_transpose_emit_ext.py`
+prefer the patched TE op when available and keep the runtime CUDA extension as
+the fallback. The backend is selected with
+`CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=auto|te|probe`, and
+`tools/probes/te_blockscaled_backward_probe.py --require-te-transpose-emit`
+sets `CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT=1` to require the patched TE
+binding and a sidecar instead of silently falling back.
+`tools/probes/te_mxfp8_transpose_emit_te_op_check.py` is a focused check that
+compares the patched TE op against the old runtime probe kernel byte-for-byte.
+
+Build checks completed in `/home/dave/TransformerEngine`:
+
+```bash
+ninja -C build/cmake transformer_engine
+PYTHONPATH=/home/dave/TransformerEngine \
+NVTE_FRAMEWORK=pytorch \
+NVTE_SKIP_SUBMODULE_CHECKS_DURING_BUILD=1 \
+MAX_JOBS=16 \
+python setup.py build_ext
+```
+
+The built extension exposes the new binding when loaded from:
+
+```text
+/home/dave/TransformerEngine/build/lib.linux-aarch64-cpython-313/transformer_engine/transformer_engine_torch.cpython-313-aarch64-linux-gnu.so
+```
+
+Direct byte-for-byte check against the old runtime probe kernel:
+
+```bash
+LD_PRELOAD=/usr/local/cuda-13.1/targets/sbsa-linux/lib/libnvrtc.so \
+LD_LIBRARY_PATH=/usr/local/cuda-13.1/targets/sbsa-linux/lib:/home/dave/cppmega-venv/lib/python3.13/site-packages/torch/lib:/home/dave/TransformerEngine/build/lib.linux-aarch64-cpython-313/transformer_engine:$LD_LIBRARY_PATH \
+PYTHONPATH=/home/dave/TransformerEngine/build/lib.linux-aarch64-cpython-313/transformer_engine:/home/dave/source/cppmega \
+python tools/probes/te_mxfp8_transpose_emit_te_op_check.py \
+  --te-common-lib /home/dave/TransformerEngine/build/lib.linux-aarch64-cpython-313/transformer_engine/libtransformer_engine.so \
+  --rows 64 --cols 128
+```
+
+Result:
+
+```text
+has_op=True
+payload_equal=True
+scale_equal=True
+max_payload_abs_byte_delta=0
+```
+
+The full cppmega backward probe can require the new op with:
+
+```bash
+CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=te \
+CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT=1 \
+python tools/probes/te_blockscaled_backward_probe.py \
+  --format mxfp8 --prototype-transpose-emit --require-te-transpose-emit \
+  --m 64 --n 96 --k 128
+```
+
+Remaining integration gap: the installed cppmega environment is using TE 2.14
+Python package APIs, while local `/home/dave/TransformerEngine` is a
+2.12-dev source tree. Loading the whole local TE Python package into the
+existing cppmega backward probe hits that API drift
+(`MXFP8TensorStorage._with_gemm_swizzled_scales`). Preloading only the rebuilt
+C++ extension into the installed 2.14 package also trips extension/package
+symbol drift. The new TE op itself is compiled and byte-equivalent to the
+prototype emitter, but end-to-end Linear backward integration still needs a
+single consistent patched TE install or a rebase of the patch onto the exact
+installed TE 2.14 source.
+
 ## Runtime Env Flags
 
 Preserved existing flags:
@@ -397,10 +494,14 @@ Tracked keys:
 - `fallback_reasons`
 
 With `CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK=0`, an unsupported adapter case
-is counted as `native_passthrough_*` and then handed to native TE, which fails
-loudly on current GB10 MXFP8 `NN`/`NT`. With fallback enabled, the same case is
-counted as `bf16_fallback_*`, logged with a reason, and then dequantized through
-the old bridge.
+is counted as `native_passthrough_*` and raises before native TE sees the
+unsupported GB10 MXFP8 `NN`/`NT` layout. Missing TE transpose sidecars are not
+unsupported by themselves: normal training uses the FP8 compact transpose
+adapter and counts `mxfp8_tn_adapter_missing_sidecar_copy`. Set
+`CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT=1` only for probes that must prove every
+MXFP8 operand came from TE transpose-emit. With BF16 fallback enabled,
+unsupported cases are counted as `bf16_fallback_*`, logged with a reason, and
+then dequantized through the old bridge.
 
 The old explicit BF16 bridge flags still work, but those calls are now counted
 with reason `legacy_bf16_override`.

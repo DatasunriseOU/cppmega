@@ -61,28 +61,80 @@ Usage:
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
-# When True, the fwd kernel saves h_new (the pre-gate tanh candidate) to global
-# memory so the backward can load it directly.  When False (the default), the
-# backward recomputes h_new from h_prev + k + v + W.
-_SAVE_HNEW: bool = os.environ.get("CPPMEGA_M2RNN_SAVE_HNEW", "0") == "1"
+_SAVE_HNEW_ENV = "CPPMEGA_M2RNN_SAVE_HNEW"
+_BWD_CHUNK_SIZE_ENV = "CPPMEGA_M2RNN_BWD_CHUNK_SIZE"
+_DEFAULT_SAVE_HNEW = False
+_DEFAULT_BWD_CHUNK_SIZE = 64
 
 
-def _env_int(name: str, default: int) -> int:
+@dataclass(frozen=True)
+class M2RNNRuntimeConfig:
+    """Runtime knobs captured once per forward call."""
+
+    # When True, the fwd kernel saves h_new (the pre-gate tanh candidate) to
+    # global memory so the backward can load it directly.  When False (the
+    # default), the backward recomputes h_new from h_prev + k + v + W.
+    save_hnew: bool = _DEFAULT_SAVE_HNEW
+    # Backward chunk length for checkpointed recompute.  Larger chunks reduce
+    # kernel-launch overhead but increase the reusable y_chunk temporary.
+    bwd_chunk_size: int = _DEFAULT_BWD_CHUNK_SIZE
+
+
+_M2RNN_RUNTIME_CONFIG_CACHE: (
+    tuple[tuple[str | None, str | None], M2RNNRuntimeConfig] | None
+) = None
+
+
+def _env_flag(raw: str | None, default: bool) -> bool:
+    if raw is None:
+        return default
+    return raw == "1"
+
+
+def _env_int(raw: str | None, default: int) -> int:
+    if raw is None:
+        return default
     try:
-        return max(1, int(os.environ.get(name, str(default))))
+        return max(1, int(raw))
     except ValueError:
         return default
 
 
-# Backward chunk length for checkpointed recompute.  Larger chunks reduce
-# kernel-launch overhead but increase the reusable y_chunk temporary.  Default
-# 64 gives ~32x lower forward saved recurrent state than full y at S=4096,
-# and ~16x lower peak while backward's reusable y_chunk is live.
-_BWD_CHUNK_SIZE: int = _env_int("CPPMEGA_M2RNN_BWD_CHUNK_SIZE", 64)
+def reset_m2rnn_runtime_config_cache() -> None:
+    """Clear the parsed env cache used by ``get_m2rnn_runtime_config``."""
+    global _M2RNN_RUNTIME_CONFIG_CACHE
+    _M2RNN_RUNTIME_CONFIG_CACHE = None
+
+
+def get_m2rnn_runtime_config() -> M2RNNRuntimeConfig:
+    """Read M²RNN runtime env vars and return the current parsed snapshot.
+
+    The cache key is the raw env strings, so env changes after module import
+    or between forward calls are honored without requiring a module reload.
+    ``reset_m2rnn_runtime_config_cache`` is available for tests and explicit
+    cache invalidation.
+    """
+    global _M2RNN_RUNTIME_CONFIG_CACHE
+
+    raw_env = (
+        os.environ.get(_SAVE_HNEW_ENV),
+        os.environ.get(_BWD_CHUNK_SIZE_ENV),
+    )
+    cached = _M2RNN_RUNTIME_CONFIG_CACHE
+    if cached is not None and cached[0] == raw_env:
+        return cached[1]
+
+    config = M2RNNRuntimeConfig(
+        save_hnew=_env_flag(raw_env[0], _DEFAULT_SAVE_HNEW),
+        bwd_chunk_size=_env_int(raw_env[1], _DEFAULT_BWD_CHUNK_SIZE),
+    )
+    _M2RNN_RUNTIME_CONFIG_CACHE = (raw_env, config)
+    return config
 
 
 # Lazy import of triton so importing this module on a CPU-only host still
@@ -886,12 +938,14 @@ class _M2RNNFn(torch.autograd.Function):
             has_h0 = True
             h0_dtype = h0.dtype
 
-        chunk_size = _BWD_CHUNK_SIZE
+        runtime_config = get_m2rnn_runtime_config()
+        save_hnew = runtime_config.save_hnew
+        chunk_size = runtime_config.bwd_chunk_size
         num_chunks = (S + chunk_size - 1) // chunk_size
         checkpoints = torch.empty(
             B, num_chunks + 1, H, K_DIM, V_DIM, device=q.device, dtype=torch.float32
         )
-        if _SAVE_HNEW:
+        if save_hnew:
             h_new_save = torch.empty(B, S, H, K_DIM, V_DIM, device=q.device, dtype=q.dtype)
         else:
             # Dummy 1-element tensor: Triton needs a valid pointer but won't
@@ -914,7 +968,7 @@ class _M2RNNFn(torch.autograd.Function):
             out,
             h_final,
             HAS_H0=has_h0,
-            SAVE_HNEW=_SAVE_HNEW,
+            SAVE_HNEW=save_hnew,
             BWD_CHUNK_SIZE=chunk_size,
             SEQ=S,
             NHEADS=H,
@@ -932,11 +986,11 @@ class _M2RNNFn(torch.autograd.Function):
             ckpt_sb=checkpoints.stride(0), ckpt_sc=checkpoints.stride(1),
             ckpt_sh=checkpoints.stride(2), ckpt_sk=checkpoints.stride(3),
             ckpt_sv=checkpoints.stride(4),
-            hn_sb=h_new_save.stride(0) if _SAVE_HNEW else 0,
-            hn_ss=h_new_save.stride(1) if _SAVE_HNEW else 0,
-            hn_sh=h_new_save.stride(2) if _SAVE_HNEW else 0,
-            hn_sk=h_new_save.stride(3) if _SAVE_HNEW else 0,
-            hn_sv=h_new_save.stride(4) if _SAVE_HNEW else 0,
+            hn_sb=h_new_save.stride(0) if save_hnew else 0,
+            hn_ss=h_new_save.stride(1) if save_hnew else 0,
+            hn_sh=h_new_save.stride(2) if save_hnew else 0,
+            hn_sk=h_new_save.stride(3) if save_hnew else 0,
+            hn_sv=h_new_save.stride(4) if save_hnew else 0,
             out_sb=out.stride(0), out_ss=out.stride(1), out_sh=out.stride(2), out_sv=out.stride(3),
             hf_sb=h_final.stride(0), hf_sh=h_final.stride(1), hf_sk=h_final.stride(2), hf_sv=h_final.stride(3),
         )
@@ -944,7 +998,7 @@ class _M2RNNFn(torch.autograd.Function):
         ctx.save_for_backward(q_c, k_c, v_c, W_c, xf_c, h0_c, checkpoints, h_new_save)
         ctx.has_h0 = has_h0
         ctx.h0_dtype = h0_dtype
-        ctx.save_hnew = _SAVE_HNEW
+        ctx.save_hnew = save_hnew
         ctx.bwd_chunk_size = chunk_size
         ctx.num_chunks = num_chunks
         ctx.orig_shapes = (q.shape, k.shape, v.shape, W.shape, xf.shape)
