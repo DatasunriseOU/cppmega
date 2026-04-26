@@ -1,0 +1,40 @@
+name: mirror-from-datasunriseou
+
+# Pull the latest main of DatasunriseOU/cppmega into jewelmusicee/cppmega.
+# Code stays canonical in DatasunriseOU; this repo is a build-target mirror
+# that owns the heavy CI (jewelmusicee Enterprise = 50000 free min/month).
+#
+# Runs only in jewelmusicee/cppmega. In the upstream DatasunriseOU repo this
+# workflow file is also present (single source of truth) but its job-level
+# `if:` short-circuits it to a no-op there.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"     # every 10 minutes
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    if: github.repository == 'jewelmusicee/cppmega'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync main from DatasunriseOU/cppmega
+        env:
+          MIRROR_PAT: ${{ secrets.MIRROR_PAT }}
+        run: |
+          set -euo pipefail
+          git config --global user.email "mirror-bot@jewelmusicee"
+          git config --global user.name "cppmega-mirror"
+          git clone --quiet --bare \
+            "https://x-access-token:${MIRROR_PAT}@github.com/DatasunriseOU/cppmega.git" upstream.git
+          cd upstream.git
+          # Push main only (don't mirror branches/tags that don't belong here).
+          git push --force \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/jewelmusicee/cppmega.git" \
+            +refs/heads/main:refs/heads/main
+          echo "Synced $(git rev-parse --short main) from DatasunriseOU."
