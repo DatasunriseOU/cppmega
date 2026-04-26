@@ -1,7 +1,7 @@
 name: build-image
 
 # Assemble the cppmega runtime image from the prebuilt wheel release and push
-# to ghcr.io/jewelmusicee/cppmega:<sha>. Buildx registry cache lives in the same
+# to ghcr.io/datasunriseou/cppmega:<sha>. Buildx registry cache lives in the same
 # repo so re-runs after a fix start from the last good layer, never from scratch.
 
 on:
@@ -28,7 +28,7 @@ permissions:
   packages: write   # ghcr.io push
 
 env:
-  IMAGE: ghcr.io/jewelmusicee/cppmega
+  IMAGE: ghcr.io/datasunriseou/cppmega
 
 jobs:
   image:
