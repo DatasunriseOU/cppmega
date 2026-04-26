@@ -26,6 +26,13 @@ on:
 permissions:
   contents: write   # needed to create the Release that holds the wheel assets
 
+concurrency:
+  # Cancel any in-flight build-wheels run when a new one is queued — two
+  # parallel matrix runs (7 jobs each) compete for the runner pool and
+  # GitHub starts SIGTERM-ing long-running jobs (flash_attn) at exit 143.
+  group: build-wheels-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CUDA_VERSION: "13.2.1"
   PYTHON_VERSION: "3.13"
