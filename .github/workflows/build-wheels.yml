@@ -144,6 +144,13 @@ jobs:
           echo "CUDA_HOME=/usr/local/cuda-13.2" >> "$GITHUB_ENV"
           echo "/usr/local/cuda-13.2/bin" >> "$GITHUB_PATH"
           /usr/local/cuda-13.2/bin/nvcc --version
+          # Stub libs for libcuda/libnvidia-ml — runners have no NVIDIA driver,
+          # so the real .so isn't present. CMake (CUDA::cuda_driver, CUDA::nvml)
+          # and link-time refs need symlinks from stubs/ into lib64/.
+          sudo ln -sf /usr/local/cuda-13.2/lib64/stubs/libcuda.so /usr/local/cuda-13.2/lib64/libcuda.so
+          sudo ln -sf /usr/local/cuda-13.2/lib64/stubs/libcuda.so /usr/local/cuda-13.2/lib64/libcuda.so.1
+          sudo ln -sf /usr/local/cuda-13.2/lib64/stubs/libnvidia-ml.so /usr/local/cuda-13.2/lib64/libnvidia-ml.so
+          sudo ln -sf /usr/local/cuda-13.2/lib64/stubs/libnvidia-ml.so /usr/local/cuda-13.2/lib64/libnvidia-ml.so.1
 
       - name: Wire ccache as gcc/g++/nvcc via PATH
         # CC="ccache gcc-15" breaks setuptools/ninja (it splits the value and
@@ -187,7 +194,8 @@ jobs:
         # setuptools-scm: many wheels resolve their version from git tags.
         # numpy must be present for torch's tensor_numpy.cpp at build time.
         # z3-solver: tilelang's CMake calls 'import z3' during configure (FindZ3.cmake).
-        run: pip install ninja packaging pybind11 cmake numpy einops scikit-build-core setuptools-scm "z3-solver>=4.13.0"
+        # cython: tilelang ships a .pyx module (jit/adapter/cython/cython_wrapper.pyx).
+        run: pip install ninja packaging pybind11 cmake numpy einops scikit-build-core setuptools-scm "z3-solver>=4.13.0" cython
 
       - name: Clone source (any ref — branch / tag / SHA)
         run: |
