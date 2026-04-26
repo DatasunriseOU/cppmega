@@ -27,6 +27,10 @@ permissions:
   contents: read
   packages: write   # ghcr.io push
 
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   IMAGE: ghcr.io/jewelmusicee/cppmega
 
