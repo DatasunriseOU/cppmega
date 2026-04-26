@@ -2,7 +2,7 @@
 instead of rebuilding the stack from declarative pip_install layers.
 
 Image is built by .github/workflows/build-image.yml and lives at
-ghcr.io/datasunriseou/cppmega:<sha>. To pull a private image, Modal needs a
+ghcr.io/jewelmusicee/cppmega:<sha>. To pull a private image, Modal needs a
 secret named `ghcr-pull` with REGISTRY_USERNAME and REGISTRY_PASSWORD
 (use a fine-grained PAT scoped to read:packages on the jewelmusicee org):
 
@@ -19,7 +19,7 @@ from typing import Any
 
 import modal
 
-GHCR_REPO = os.environ.get("GHCR_REPO", "ghcr.io/datasunriseou/cppmega")
+GHCR_REPO = os.environ.get("GHCR_REPO", "ghcr.io/jewelmusicee/cppmega")
 GHCR_TAG = os.environ.get("GHCR_TAG", "latest")
 GHCR_REF = f"{GHCR_REPO}:{GHCR_TAG}"
 

@@ -96,7 +96,7 @@ sources:
 
 # Final runtime image
 image:
-  registry: ghcr.io/datasunriseou/cppmega
+  registry: ghcr.io/jewelmusicee/cppmega
   buildcache_tag: buildcache
   tags:
     - "{{ git_sha }}"
