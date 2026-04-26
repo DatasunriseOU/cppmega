@@ -80,6 +80,12 @@ python tools/probes/gb10_accepted_path_validation.py \
 The log parser extracts `lm`/`mtp_1` losses and the TE backward counters, then
 applies the same zero-BF16-fallback assertions.
 
+Pytest coverage keeps the same boundary: parser and counter assertions import
+only `tools/probes/gb10_accepted_path_validation_helpers.py`, while the
+deprecated-path gate check runs the probe as a CLI smoke test with
+`--skip-mxfp8-probe`. Tests should not import the executable probe module to
+call subprocess orchestration internals directly.
+
 ## Policy
 
 New compatibility bridges should use

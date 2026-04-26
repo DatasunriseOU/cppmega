@@ -43,6 +43,8 @@ from __future__ import annotations
 
 import logging
 import os
+import warnings
+from importlib import metadata as importlib_metadata
 from typing import Optional
 
 import torch
@@ -63,6 +65,8 @@ _BLOCKSCALED_BWD_REFERENCE_ACK_ENV = (
 _BLOCKSCALED_TILELANG_BWD_UNSAFE_ENV = (
     "CPPMEGA_SPARSE_MLA_BLOCKSCALED_TILELANG_BWD_UNSAFE"
 )
+_TE_PRIVATE_ATTR_TESTED_VERSIONS = frozenset({"2.13.0", "2.14.0"})
+_te_private_attr_warning_emitted = False
 
 
 def _env_enabled(name: str) -> bool:
@@ -84,6 +88,48 @@ def _sparse_mla_fp8_quant_backend() -> str:
 def _use_te_sparse_mla_fp8_zero_copy() -> bool:
     _sparse_mla_fp8_quant_backend()
     return True
+
+
+def _installed_transformer_engine_version() -> str:
+    try:
+        import transformer_engine
+    except ImportError:
+        return "not-installed"
+
+    version = getattr(transformer_engine, "__version__", None)
+    if version:
+        return str(version)
+
+    try:
+        return importlib_metadata.version("transformer-engine")
+    except importlib_metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def _normalize_te_version(version: str) -> str:
+    return version.split("+", 1)[0]
+
+
+def _warn_once_if_untested_te_private_attrs() -> None:
+    global _te_private_attr_warning_emitted
+
+    version = _installed_transformer_engine_version()
+    if _normalize_te_version(version) in _TE_PRIVATE_ATTR_TESTED_VERSIONS:
+        return
+    if _te_private_attr_warning_emitted:
+        return
+
+    _te_private_attr_warning_emitted = True
+    tested = ", ".join(sorted(_TE_PRIVATE_ATTR_TESTED_VERSIONS))
+    warnings.warn(
+        "SparseMLA FP8 zero-copy is reading Transformer Engine Float8Tensor "
+        f"private attributes (_data/_scale_inv) on untested Transformer Engine "
+        f"version {version!r}; tested versions are: {tested}. If TE changes this "
+        "private layout, SparseMLA FP8 extraction may fail or produce invalid "
+        "payloads.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
 
 
 def sparse_mla_blockscaled_qk_scores(
@@ -286,6 +332,7 @@ def _extract_fp8_data(t: torch.Tensor):
     if not isinstance(t, QuantizedTensor):
         return None, None
     # Check that this is a Float8Tensor with accessible _data
+    _warn_once_if_untested_te_private_attrs()
     data = getattr(t, '_data', None)
     scale_inv = getattr(t, '_scale_inv', None)
     if data is None or scale_inv is None:
