@@ -44,7 +44,7 @@ ENV NVCC_PREPEND_FLAGS="--compiler-bindir=/usr/bin/g++-15 --allow-unsupported-co
 RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel
 
 ARG TORCH_INDEX=https://download.pytorch.org/whl/nightly/cu132
-RUN pip install --pre --extra-index-url ${TORCH_INDEX} \
+RUN python -m pip install --pre --extra-index-url ${TORCH_INDEX} \
         "torch==2.13.*" \
         numpy packaging ninja einops pybind11 pyyaml regex \
         sentencepiece tiktoken six scipy filelock typing-extensions \
@@ -57,17 +57,17 @@ RUN pip install --pre --extra-index-url ${TORCH_INDEX} \
 
 # --- prebuilt wheels (this layer changes whenever any wheel is rebuilt) -----
 COPY wheels/ /tmp/wheels/
-RUN pip install --no-deps /tmp/wheels/*.whl && rm -rf /tmp/wheels
+RUN python -m pip install --no-deps /tmp/wheels/*.whl && rm -rf /tmp/wheels
 
 # --- megatron-lm with cppmega patches (editable so runtime patches resolve) -
 ARG MEGATRON_REPO=https://github.com/jewelmusicee/Megatron-LM.git
 ARG MEGATRON_REF=cppmega/bench3-fork
 RUN git clone --depth=1 --branch ${MEGATRON_REF} ${MEGATRON_REPO} /opt/megatron-lm \
-    && cd /opt/megatron-lm && pip install -e . --no-build-isolation --no-deps
+    && cd /opt/megatron-lm && python -m pip install -e . --no-build-isolation --no-deps
 
 # --- cppmega itself (source of cppmega.megatron.* runtime patches) ----------
 COPY . /opt/cppmega
-RUN pip install -e /opt/cppmega --no-build-isolation --no-deps
+RUN python -m pip install -e /opt/cppmega --no-build-isolation --no-deps
 
 # --- runtime env (mirrors modal_cppmega_base.py) ----------------------------
 ENV CUDA_HOME=/usr/local/cuda \
