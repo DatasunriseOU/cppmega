@@ -78,8 +78,10 @@ ENV CUDA_HOME=/usr/local/cuda \
     PYTHONPATH=/opt/megatron-lm:/opt/cppmega
 
 # Smoke-import to fail fast on ABI mismatches at build time.
-RUN python -c "import torch; print('torch', torch.__version__); \
-import transformer_engine.pytorch as te; print('te', te.__version__); \
+RUN python -c "\
+import torch; print('torch', torch.__version__); \
+import transformer_engine; print('te', transformer_engine.__version__); \
+import transformer_engine.pytorch; \
 import flash_attn, mamba_ssm, causal_conv1d, fast_hadamard_transform, tilelang, qoptim_cuda; \
 print('OK')"
 
