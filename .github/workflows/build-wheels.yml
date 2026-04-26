@@ -59,7 +59,10 @@ jobs:
             repo: jewelmusicee/TransformerEngine
             ref: cppmega-mxfp8-transpose-emit
             submodules: "true"
-            extra_env: "NVTE_FRAMEWORK=pytorch"
+            # MAX_JOBS=1 NVCC_THREADS=2 — without these, ninja saturates the
+            # 4-core / 7 GB runner and the job gets cancelled at ~1h30m with
+            # nothing useful in the logs. TE has 100s of .cu files * 3 archs.
+            extra_env: "NVTE_FRAMEWORK=pytorch MAX_JOBS=1 NVCC_THREADS=2"
           - name: flash_attn
             repo: Dao-AILab/flash-attention
             ref: v2.8.3
