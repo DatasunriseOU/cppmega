@@ -19,25 +19,29 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
 
 # --- system tooling: gcc-15 + python 3.13 -----------------------------------
+# Skip the system python3-pip apt package — it installs pip without a RECORD
+# file, so 'pip install --upgrade pip' later fails with 'Cannot uninstall'.
+# Use ensurepip on python3.13 directly instead.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         software-properties-common ca-certificates gnupg curl wget \
     && add-apt-repository -y ppa:ubuntu-toolchain-r/test \
     && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt-get update && apt-get install -y --no-install-recommends \
         gcc-15 g++-15 \
-        python3.13 python3.13-dev python3.13-venv python3-pip \
+        python3.13 python3.13-dev python3.13-venv \
         git build-essential cmake ninja-build pkg-config libnuma-dev \
     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-15 90 \
     && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-15 90 \
     && update-alternatives --install /usr/bin/python python /usr/bin/python3.13 90 \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.13 90 \
+    && python3.13 -m ensurepip --upgrade \
     && rm -rf /var/lib/apt/lists/*
 
 # nvcc must be told to accept gcc-15 (CUDA 13.2 officially supports up to gcc-14).
 ENV NVCC_PREPEND_FLAGS="--compiler-bindir=/usr/bin/g++-15 --allow-unsupported-compiler"
 
 # --- python deps from PyPI (stable, slow-changing layer) --------------------
-RUN python -m pip install --upgrade pip setuptools wheel
+RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel
 
 ARG TORCH_INDEX=https://download.pytorch.org/whl/nightly/cu132
 RUN pip install --pre --extra-index-url ${TORCH_INDEX} \
