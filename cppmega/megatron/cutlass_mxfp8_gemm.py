@@ -29,6 +29,29 @@ def _as_uint8_contiguous(tensor: torch.Tensor) -> torch.Tensor:
     return tensor if tensor.is_contiguous() else tensor.contiguous()
 
 
+def _resolve_beta(beta: float | None, accumulate: bool) -> float:
+    """Validate ``beta`` against ``accumulate`` and return the value passed to C++.
+
+    The C++ side always uses ``beta`` as-passed (no longer re-gated against
+    ``accumulate`` there).  Rules:
+
+    - ``accumulate=True``:  default ``beta=1.0`` if ``None``; any explicit
+      finite value is accepted.
+    - ``accumulate=False``: ``beta`` must be ``None`` or ``0.0``.  A non-zero
+      ``beta`` would have been silently dropped previously; raise instead so
+      callers don't think it took effect.
+    """
+
+    if accumulate:
+        return 1.0 if beta is None else float(beta)
+    if beta is None or float(beta) == 0.0:
+        return 0.0
+    raise ValueError(
+        "beta is meaningful only when accumulate=True; "
+        f"got beta={beta!r} with accumulate=False"
+    )
+
+
 def _load_cuda_ext() -> Any:
     global _CUDA_EXT, _CUDA_EXT_ERROR
     if _CUDA_EXT is not None:
@@ -126,6 +149,8 @@ def tn_gemm(
         out_arg = out
         use_out = True
 
+    beta_f = _resolve_beta(beta, bool(accumulate))
+
     ext = _load_cuda_ext()
     return ext.tn_gemm_compact_scale(
         _as_uint8_contiguous(a_rowwise_data),
@@ -139,7 +164,7 @@ def tn_gemm(
         use_out,
         bool(accumulate),
         float(alpha),
-        float(1.0 if beta is None and accumulate else (0.0 if beta is None else beta)),
+        beta_f,
     )
 
 
@@ -183,6 +208,9 @@ def _tn_gemm_compact_direct(
             raise ValueError("out must be contiguous")
         out_arg = out
         use_out = True
+
+    beta_f = _resolve_beta(beta, bool(accumulate))
+
     ext = _load_cuda_ext()
     entrypoint = ext.tn_gemm_compact_direct_asym if asymmetric else ext.tn_gemm_compact_direct
     return entrypoint(
@@ -203,7 +231,7 @@ def _tn_gemm_compact_direct(
         use_out,
         bool(accumulate),
         float(alpha),
-        float(1.0 if beta is None and accumulate else (0.0 if beta is None else beta)),
+        beta_f,
     )
 
 
