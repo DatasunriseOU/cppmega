@@ -146,8 +146,9 @@ if os.environ.get("CPPMEGA_ALLOW_TE_MXFP8_SM12", "0") == "1":
 #   wgrad: general_gemm(x.T_mxfp8, dy.T_mxfp8, layout="TN")
 #
 # Backend selection:
-#   CPPMEGA_TE_MXFP8_BWD_BACKEND=te_tn_adapter      # default, TE TN GEMM
-#   CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native     # GB10 CUTLASS SM120/121
+#   CPPMEGA_TE_MXFP8_BWD_BACKEND=te_tn_adapter       # TE TN GEMM
+#   CPPMEGA_TE_MXFP8_BWD_BACKEND=flashinfer_cutlass  # TE payload + FlashInfer SM120
+#   CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native      # old direct compact loader
 #   CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND=compact     # direct compact-scale mainloop
 #   CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND=prepack     # old native-scale prepack A/B
 #
@@ -168,10 +169,11 @@ _te_mxfp8_bwd_tn_adapter = os.environ.get("CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER", "0"
 _te_mxfp8_bwd_backend = os.environ.get(
     "CPPMEGA_TE_MXFP8_BWD_BACKEND", "te_tn_adapter"
 ).lower()
-if _te_mxfp8_bwd_backend not in ("te_tn_adapter", "cutlass_native"):
+if _te_mxfp8_bwd_backend not in ("te_tn_adapter", "flashinfer_cutlass", "cutlass_native"):
     raise RuntimeError(
         "Unsupported CPPMEGA_TE_MXFP8_BWD_BACKEND="
-        f"{_te_mxfp8_bwd_backend!r}; expected te_tn_adapter or cutlass_native"
+        f"{_te_mxfp8_bwd_backend!r}; expected te_tn_adapter, flashinfer_cutlass, "
+        "or cutlass_native"
     )
 _te_mxfp8_transpose_emit_default = (
     "off" if _te_mxfp8_bwd_backend == "cutlass_native" else "auto"
@@ -283,6 +285,10 @@ if (
             "mxfp8_tn_sidecar_attr_attached_bytes": 0,
             "mxfp8_cutlass_native_dgrad": 0,
             "mxfp8_cutlass_native_wgrad": 0,
+            "mxfp8_flashinfer_fprop": 0,
+            "mxfp8_flashinfer_fprop_fallback": 0,
+            "mxfp8_flashinfer_dgrad": 0,
+            "mxfp8_flashinfer_wgrad": 0,
             "bf16_fallback_dgrad": 0,
             "bf16_fallback_wgrad": 0,
             "native_passthrough_dgrad": 0,
@@ -949,6 +955,7 @@ if (
             )
 
         _cppmega_cutlass_mxfp8_module = [None]
+        _cppmega_flashinfer_mxfp8_module = [None]
 
         def _cppmega_load_cutlass_mxfp8_module():
             if _cppmega_cutlass_mxfp8_module[0] is not None:
@@ -957,6 +964,14 @@ if (
 
             _cppmega_cutlass_mxfp8_module[0] = _cutlass_mxfp8_gemm
             return _cutlass_mxfp8_gemm
+
+        def _cppmega_load_flashinfer_mxfp8_module():
+            if _cppmega_flashinfer_mxfp8_module[0] is not None:
+                return _cppmega_flashinfer_mxfp8_module[0]
+            from cppmega.megatron import flashinfer_mxfp8_gemm as _flashinfer_mxfp8_gemm
+
+            _cppmega_flashinfer_mxfp8_module[0] = _flashinfer_mxfp8_gemm
+            return _flashinfer_mxfp8_gemm
 
         def _cppmega_mxfp8_rowwise_payload_and_scale(_x):
             _data = getattr(_x, "_rowwise_data", None)
@@ -1072,6 +1087,82 @@ if (
             # wgrad: dy.T[N, M] @ x[M, K].
             return True, _cppmega_cutlass_wgrad_nt_gemm(_args[0], _args[1], _kwargs)
 
+        def _cppmega_flashinfer_kwargs(_kwargs):
+            _flashinfer = _cppmega_load_flashinfer_mxfp8_module()
+            return _flashinfer.normalize_gemm_kwargs(
+                out_dtype=_kwargs.get("out_dtype", None),
+                out=_kwargs.get("out", None),
+                bias=_kwargs.get("bias", None),
+                gelu=bool(_kwargs.get("gelu", False)),
+                gelu_in=_kwargs.get("gelu_in", None),
+                quantization_params=_kwargs.get("quantization_params", None),
+                accumulate=bool(_kwargs.get("accumulate", False)),
+                alpha=float(_kwargs.get("alpha", 1.0)),
+                beta=_kwargs.get("beta", None),
+            )
+
+        def _cppmega_flashinfer_fprop_tn_gemm(_weight, _x, _kwargs):
+            _flashinfer = _cppmega_load_flashinfer_mxfp8_module()
+            _result = _flashinfer.fprop_tn_gemm(
+                _weight,
+                _x,
+                **_cppmega_flashinfer_kwargs(_kwargs),
+            )
+            return _result, None, None, None
+
+        def _cppmega_flashinfer_dgrad_nn_gemm(_weight, _dy, _kwargs):
+            _flashinfer = _cppmega_load_flashinfer_mxfp8_module()
+            _weight_t = _cppmega_mxfp8_colwise_as_rowwise_transpose(_weight)
+            _result = _flashinfer.dgrad_nn_gemm(
+                _weight_t,
+                _dy,
+                **_cppmega_flashinfer_kwargs(_kwargs),
+            )
+            return _result, None, None, None
+
+        def _cppmega_flashinfer_wgrad_nt_gemm(_x, _dy, _kwargs):
+            _flashinfer = _cppmega_load_flashinfer_mxfp8_module()
+            _x_t = _cppmega_mxfp8_colwise_as_rowwise_transpose(_x)
+            _dy_t = _cppmega_mxfp8_colwise_as_rowwise_transpose(_dy)
+            _result = _flashinfer.wgrad_nt_gemm(
+                _x_t,
+                _dy_t,
+                **_cppmega_flashinfer_kwargs(_kwargs),
+            )
+            return _result, None, None, None
+
+        def _cppmega_try_mxfp8_flashinfer_cutlass(_args, _kwargs):
+            _layout = _kwargs.get("layout")
+            if _layout not in ("NN", "NT"):
+                return False, f"unsupported_layout:{_layout}"
+            if len(_args) < 2:
+                return False, "missing_operands"
+            if _cppmega_has_comm_overlap(_kwargs):
+                return False, "comm_overlap_not_covered"
+            if not (
+                _cppmega_is_mxfp8_tensor(_args[0])
+                and _cppmega_is_mxfp8_tensor(_args[1])
+            ):
+                return False, "non_mxfp8_operands"
+
+            if _layout == "NN":
+                return True, _cppmega_flashinfer_dgrad_nn_gemm(_args[0], _args[1], _kwargs)
+            return True, _cppmega_flashinfer_wgrad_nt_gemm(_args[0], _args[1], _kwargs)
+
+        def _cppmega_try_mxfp8_flashinfer_fprop(_args, _kwargs):
+            if _kwargs.get("layout") != "TN" or _kwargs.get("grad", False):
+                return False, "not_plain_fprop_tn"
+            if len(_args) < 2:
+                return False, "missing_operands"
+            if _cppmega_has_comm_overlap(_kwargs):
+                return False, "comm_overlap_not_covered"
+            if not (
+                _cppmega_is_mxfp8_tensor(_args[0])
+                and _cppmega_is_mxfp8_tensor(_args[1])
+            ):
+                return False, "non_mxfp8_operands"
+            return True, _cppmega_flashinfer_fprop_tn_gemm(_args[0], _args[1], _kwargs)
+
         def _cppmega_try_mxfp8_tn_adapter(_orig_general_gemm, _args, _kwargs):
             _layout = _kwargs.get("layout")
             if not _te_mxfp8_bwd_tn_adapter:
@@ -1093,6 +1184,15 @@ if (
                         False,
                         f"cutlass_native_unavailable:{type(_cutlass_exc).__name__}: "
                         f"{_cutlass_exc}",
+                    )
+            if _te_mxfp8_bwd_backend == "flashinfer_cutlass":
+                try:
+                    return _cppmega_try_mxfp8_flashinfer_cutlass(_args, _kwargs)
+                except Exception as _flashinfer_exc:  # pragma: no cover
+                    return (
+                        False,
+                        f"flashinfer_cutlass_unavailable:{type(_flashinfer_exc).__name__}: "
+                        f"{_flashinfer_exc}",
                     )
 
             _new_args = list(_args)
@@ -1212,6 +1312,50 @@ if (
             @_functools.wraps(_orig_general_gemm)
             def _general_gemm(*_args, **_kwargs):
                 _layout = _kwargs.get("layout")
+                if (
+                    _te_mxfp8_bwd_tn_adapter
+                    and _te_mxfp8_bwd_backend == "flashinfer_cutlass"
+                    and len(_args) >= 2
+                    and not _kwargs.get("grad", False)
+                    and _layout == "TN"
+                    and _cppmega_is_mxfp8_tensor(_args[0])
+                    and _cppmega_is_mxfp8_tensor(_args[1])
+                ):
+                    try:
+                        _flashinfer_ok, _flashinfer_result = (
+                            _cppmega_try_mxfp8_flashinfer_fprop(_args, _kwargs)
+                        )
+                        if _flashinfer_ok:
+                            _cppmega_record_bwd_stat("mxfp8_flashinfer_fprop")
+                            if _te_mxfp8_bwd_debug:
+                                print(
+                                    "[cppmega_fp8_shim] MXFP8 fprop backend "
+                                    "flashinfer_cutlass layout=TN"
+                                )
+                            return _flashinfer_result
+                        _cppmega_record_bwd_stat(
+                            "mxfp8_flashinfer_fprop_fallback",
+                            str(_flashinfer_result),
+                        )
+                        if _te_mxfp8_bwd_debug:
+                            print(
+                                "[cppmega_fp8_shim] MXFP8 fprop FlashInfer "
+                                f"skip: {_flashinfer_result}"
+                            )
+                    except Exception as _flashinfer_fprop_exc:  # pragma: no cover
+                        _cppmega_record_bwd_stat(
+                            "mxfp8_flashinfer_fprop_fallback",
+                            f"{type(_flashinfer_fprop_exc).__name__}: "
+                            f"{_flashinfer_fprop_exc}",
+                        )
+                        if _te_mxfp8_bwd_debug:
+                            print(
+                                "[cppmega_fp8_shim] MXFP8 fprop FlashInfer "
+                                "fallback to TE generic_gemm: "
+                                f"{type(_flashinfer_fprop_exc).__name__}: "
+                                f"{_flashinfer_fprop_exc}"
+                            )
+
                 _is_target_bwd = (
                     len(_args) >= 2
                     and _kwargs.get("grad", False)
@@ -1237,6 +1381,8 @@ if (
                         if _adapted_ok:
                             if _te_mxfp8_bwd_backend == "cutlass_native":
                                 _cppmega_record_bwd_stat(f"mxfp8_cutlass_native_{_op_kind}")
+                            elif _te_mxfp8_bwd_backend == "flashinfer_cutlass":
+                                _cppmega_record_bwd_stat(f"mxfp8_flashinfer_{_op_kind}")
                             else:
                                 _cppmega_record_bwd_stat(f"mxfp8_tn_adapter_{_op_kind}")
                             if _te_mxfp8_bwd_debug:

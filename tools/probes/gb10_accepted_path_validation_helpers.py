@@ -16,6 +16,8 @@ from typing import Any
 FALLBACK_STAT_KEYS = ("bf16_fallback_dgrad", "bf16_fallback_wgrad")
 ADAPTER_STAT_KEYS = ("mxfp8_tn_adapter_dgrad", "mxfp8_tn_adapter_wgrad")
 CUTLASS_STAT_KEYS = ("mxfp8_cutlass_native_dgrad", "mxfp8_cutlass_native_wgrad")
+FLASHINFER_STAT_KEYS = ("mxfp8_flashinfer_dgrad", "mxfp8_flashinfer_wgrad")
+FLASHINFER_FPROP_STAT_KEYS = ("mxfp8_flashinfer_fprop",)
 PASSTHROUGH_STAT_KEYS = ("native_passthrough_dgrad", "native_passthrough_wgrad")
 MATERIALIZATION_STAT_KEYS = (
     "mxfp8_tn_adapter_te_emit",
@@ -44,6 +46,8 @@ SIDECAR_REGISTRY_STAT_KEYS = SIDECAR_LIVE_ZERO_KEYS + (
 ALL_STAT_KEYS = (
     ADAPTER_STAT_KEYS
     + CUTLASS_STAT_KEYS
+    + FLASHINFER_STAT_KEYS
+    + FLASHINFER_FPROP_STAT_KEYS
     + FALLBACK_STAT_KEYS
     + PASSTHROUGH_STAT_KEYS
     + MATERIALIZATION_STAT_KEYS
@@ -77,16 +81,21 @@ def validate_probe_report(report: dict[str, Any]) -> list[str]:
         if int(stats.get(key, -1)) != 0:
             errors.append(f"{key}={stats.get(key)}; expected 0")
     adapter_used = False
-    cutlass_used = False
+    direct_cutlass_used = False
+    flashinfer_used = False
     for adapter_key, cutlass_key in zip(ADAPTER_STAT_KEYS, CUTLASS_STAT_KEYS):
         adapter_count = int(stats.get(adapter_key, 0))
+        flashinfer_key = FLASHINFER_STAT_KEYS[ADAPTER_STAT_KEYS.index(adapter_key)]
         cutlass_count = int(stats.get(cutlass_key, 0))
+        flashinfer_count = int(stats.get(flashinfer_key, 0))
         adapter_used = adapter_used or adapter_count > 0
-        cutlass_used = cutlass_used or cutlass_count > 0
-        if adapter_count <= 0 and cutlass_count <= 0:
+        direct_cutlass_used = direct_cutlass_used or cutlass_count > 0
+        flashinfer_used = flashinfer_used or flashinfer_count > 0
+        if adapter_count <= 0 and cutlass_count <= 0 and flashinfer_count <= 0:
             errors.append(
                 f"{adapter_key}={stats.get(adapter_key)} and "
-                f"{cutlass_key}={stats.get(cutlass_key)}; expected one >0"
+                f"{cutlass_key}={stats.get(cutlass_key)} and "
+                f"{flashinfer_key}={stats.get(flashinfer_key)}; expected one >0"
             )
     for key in PASSTHROUGH_STAT_KEYS:
         if int(stats.get(key, -1)) != 0:
@@ -98,7 +107,7 @@ def validate_probe_report(report: dict[str, Any]) -> list[str]:
             errors.append(f"{key} missing; expected 0")
         elif int(stats.get(key, -1)) != 0:
             errors.append(f"{key}={stats.get(key)}; expected 0")
-    if cutlass_used and not adapter_used:
+    if direct_cutlass_used and not adapter_used and not flashinfer_used:
         for key in MATERIALIZATION_STAT_KEYS:
             if int(stats.get(key, 0)) != 0:
                 errors.append(f"{key}={stats.get(key)}; expected 0 for cutlass_native")
