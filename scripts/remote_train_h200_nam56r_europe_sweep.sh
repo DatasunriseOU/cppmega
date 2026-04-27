@@ -218,8 +218,8 @@ run_config() {
     echo "================================================================"
 
     # Build hybrid layer pattern
-    local HYBRID_PATTERN
-    HYBRID_PATTERN=$(python - <<PYEOF
+    local HYBRID_LAYER_PATTERN
+    HYBRID_LAYER_PATTERN=$(python - <<PYEOF
 from cppmega.megatron.nam56r_lite_spec import build_default_hybrid_layer_pattern
 
 mtp_depths = ${MTP}
@@ -242,7 +242,7 @@ if n_chunks > 1:
 print(main + (("/" + mtp_part) if mtp_part else ""))
 PYEOF
     )
-    echo "  HYBRID_PATTERN: ${HYBRID_PATTERN}"
+    echo "  HYBRID_LAYER_PATTERN: ${HYBRID_LAYER_PATTERN}"
 
     # Build native args (use build_megatron_args_bundle directly so we can
     # pass dsa_indexer_topk and dsa_indexer_loss_coeff)
@@ -333,7 +333,7 @@ PYEOF
         --no-persist-layer-norm \
         --no-masked-softmax-fusion \
         ${ROPE_FLAG} \
-        --hybrid-layer-pattern "${HYBRID_PATTERN}" \
+        --hybrid-layer-pattern "${HYBRID_LAYER_PATTERN}" \
         --hidden-size 3584 \
         --ffn-hidden-size 18944 \
         --num-attention-heads 28 \

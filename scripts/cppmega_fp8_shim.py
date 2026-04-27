@@ -56,6 +56,39 @@ deprecated; do not re-introduce it.
 from __future__ import annotations
 
 import os
+import warnings
+import weakref as _weakref
+
+_CPPMEGA_MXFP8_TN_SIDECAR_ATTR = "_cppmega_mxfp8_rowwise_transpose"
+_CPPMEGA_MXFP8_TN_SIDECAR_PERSISTENT_ATTR = (
+    "_cppmega_mxfp8_rowwise_transpose_persistent"
+)
+_CPPMEGA_MXFP8_TN_SIDECAR_REF_ATTRS = (
+    "_te_rowwise_transpose_for_backward",
+    "_te_rowwise_transpose_for_backward_unregister",
+    _CPPMEGA_MXFP8_TN_SIDECAR_ATTR,
+    "_cppmega_mxfp8_rowwise_transpose_unregister",
+    _CPPMEGA_MXFP8_TN_SIDECAR_PERSISTENT_ATTR,
+)
+
+
+def _cppmega_clear_mxfp8_sidecar_refs(_x) -> bool:
+    """Drop producer-side references to a consumed MXFP8 transpose sidecar."""
+
+    _cleared = False
+    for _attr in _CPPMEGA_MXFP8_TN_SIDECAR_REF_ATTRS:
+        if not hasattr(_x, _attr):
+            continue
+        try:
+            delattr(_x, _attr)
+        except Exception:
+            try:
+                setattr(_x, _attr, None)
+            except Exception:
+                continue
+        _cleared = True
+    return _cleared
+
 
 _raw_nvte_backward_override = os.environ.get("NVTE_BACKWARD_OVERRIDE", None)
 if _raw_nvte_backward_override in ("", "none", "None", "NONE"):
@@ -244,6 +277,10 @@ if (
             "mxfp8_tn_adapter_missing_sidecar_copy": 0,
             "mxfp8_tn_adapter_te_emit_failed": 0,
             "mxfp8_norm_quantize_sidecar_bridge": 0,
+            "mxfp8_tn_sidecar_attr_attached": 0,
+            "mxfp8_tn_sidecar_attr_cleared": 0,
+            "mxfp8_tn_sidecar_consumed": 0,
+            "mxfp8_tn_sidecar_attr_attached_bytes": 0,
             "mxfp8_cutlass_native_dgrad": 0,
             "mxfp8_cutlass_native_wgrad": 0,
             "bf16_fallback_dgrad": 0,
@@ -258,12 +295,26 @@ if (
             _snapshot["fallback_reasons"] = dict(_cppmega_te_bwd_stats["fallback_reasons"])
             try:
                 _registry = _cppmega_mxfp8_tn_sidecar_registry
+                _cppmega_cleanup_unconsumed_mxfp8_sidecars()
+                _cppmega_prune_dead_mxfp8_sidecar_registry()
                 _snapshot["mxfp8_tn_sidecar_registry_size"] = len(_registry)
                 _snapshot["mxfp8_tn_sidecar_registry_persistent"] = sum(
                     1 for _entry in _registry.values() if _entry[1]
                 )
                 _snapshot["mxfp8_tn_sidecar_registry_peak"] = (
                     _cppmega_mxfp8_tn_sidecar_registry_peak[0]
+                )
+                _snapshot["mxfp8_tn_sidecar_registry_current_bytes"] = (
+                    _cppmega_mxfp8_tn_sidecar_registry_bytes[0]
+                )
+                _snapshot["mxfp8_tn_sidecar_registry_peak_bytes"] = (
+                    _cppmega_mxfp8_tn_sidecar_registry_peak_bytes[0]
+                )
+                _snapshot["mxfp8_tn_sidecar_tracked_attr_current_bytes"] = (
+                    _cppmega_mxfp8_tn_sidecar_attr_bytes[0]
+                )
+                _snapshot["mxfp8_tn_sidecar_tracked_attr_peak_bytes"] = (
+                    _cppmega_mxfp8_tn_sidecar_attr_peak_bytes[0]
                 )
             except NameError:
                 pass
@@ -283,9 +334,9 @@ if (
         globals()["cppmega_te_mxfp8_bwd_stats_snapshot"] = _cppmega_te_bwd_stats_snapshot
         _atexit.register(_cppmega_print_bwd_stats)
 
-        _cppmega_mxfp8_tn_sidecar_attr = "_cppmega_mxfp8_rowwise_transpose"
+        _cppmega_mxfp8_tn_sidecar_attr = _CPPMEGA_MXFP8_TN_SIDECAR_ATTR
         _cppmega_mxfp8_tn_sidecar_persistent_attr = (
-            "_cppmega_mxfp8_rowwise_transpose_persistent"
+            _CPPMEGA_MXFP8_TN_SIDECAR_PERSISTENT_ATTR
         )
 
         def _cppmega_mark_recipe(_recipe_cls):
@@ -327,6 +378,10 @@ if (
         # and are removed on lookup in backward.
         _cppmega_mxfp8_tn_sidecar_registry_limit = 8192
         _cppmega_mxfp8_tn_sidecar_registry_peak = [0]
+        _cppmega_mxfp8_tn_sidecar_registry_bytes = [0]
+        _cppmega_mxfp8_tn_sidecar_registry_peak_bytes = [0]
+        _cppmega_mxfp8_tn_sidecar_attr_bytes = [0]
+        _cppmega_mxfp8_tn_sidecar_attr_peak_bytes = [0]
 
         def _cppmega_is_mxfp8_tensor(_x):
             return "MXFP8" in type(_x).__name__
@@ -390,36 +445,210 @@ if (
                 str(getattr(_x, "_fp8_dtype", None)),
             )
 
+        def _cppmega_tensor_storage_nbytes(_tensor, _seen):
+            if not isinstance(_tensor, _torch.Tensor):
+                return 0
+            try:
+                _storage = _tensor.untyped_storage()
+                _ptr = int(_storage.data_ptr())
+                if _ptr in _seen:
+                    return 0
+                _seen.add(_ptr)
+                return int(_storage.nbytes())
+            except Exception:
+                return int(_tensor.numel() * _tensor.element_size())
+
+        def _cppmega_mxfp8_sidecar_nbytes(_sidecar):
+            _seen = set()
+            _total = 0
+            for _attr in (
+                "_rowwise_data",
+                "_rowwise_scale_inv",
+                "_columnwise_data",
+                "_columnwise_scale_inv",
+            ):
+                _total += _cppmega_tensor_storage_nbytes(
+                    getattr(_sidecar, _attr, None), _seen
+                )
+            return _total
+
+        def _cppmega_pop_mxfp8_sidecar_registry_key(_key):
+            if _key is None:
+                return None
+            _entry = _cppmega_mxfp8_tn_sidecar_registry.pop(_key, None)
+            if _entry is not None:
+                _entry_bytes = int(_entry[2]) if len(_entry) > 2 else 0
+                _cppmega_mxfp8_tn_sidecar_registry_bytes[0] = max(
+                    0,
+                    _cppmega_mxfp8_tn_sidecar_registry_bytes[0] - _entry_bytes,
+                )
+            return _entry
+
+        def _cppmega_resolve_mxfp8_sidecar_registry_entry(_entry):
+            if _entry is None:
+                return None
+            _stored_sidecar = _entry[0]
+            if isinstance(_stored_sidecar, _weakref.ReferenceType):
+                _sidecar = _stored_sidecar()
+                if _sidecar is None:
+                    return None
+            else:
+                _sidecar = _stored_sidecar
+            return _sidecar, bool(_entry[1]), int(_entry[2]) if len(_entry) > 2 else 0
+
+        def _cppmega_resolve_mxfp8_sidecar_source(_entry):
+            if _entry is None or len(_entry) <= 3:
+                return None
+            _stored_source = _entry[3]
+            if _stored_source is None:
+                return None
+            if isinstance(_stored_source, _weakref.ReferenceType):
+                return _stored_source()
+            return _stored_source
+
+        def _cppmega_prune_dead_mxfp8_sidecar_registry():
+            for _key, _entry in list(_cppmega_mxfp8_tn_sidecar_registry.items()):
+                if (
+                    _cppmega_resolve_mxfp8_sidecar_registry_entry(_entry) is None
+                    or _cppmega_resolve_mxfp8_sidecar_source(_entry) is None
+                ):
+                    _cppmega_pop_mxfp8_sidecar_registry_key(_key)
+
+        def _cppmega_mxfp8_sidecar_weakref(_key, _sidecar):
+            def _finalize(_ref, *, _finalized_key=_key):
+                _entry = _cppmega_mxfp8_tn_sidecar_registry.get(_finalized_key)
+                if _entry is not None and _entry[0] is _ref:
+                    _cppmega_pop_mxfp8_sidecar_registry_key(_finalized_key)
+
+            try:
+                return _weakref.ref(_sidecar, _finalize)
+            except TypeError:
+                return _sidecar
+
+        def _cppmega_mxfp8_sidecar_source_weakref(_key, _source, _sidecar_bytes):
+            def _finalize(_ref, *, _finalized_key=_key, _bytes=_sidecar_bytes):
+                _entry = _cppmega_mxfp8_tn_sidecar_registry.get(_finalized_key)
+                if _entry is not None and len(_entry) > 3 and _entry[3] is _ref:
+                    _cppmega_pop_mxfp8_sidecar_registry_key(_finalized_key)
+                    _cppmega_mxfp8_tn_sidecar_attr_bytes[0] = max(
+                        0,
+                        _cppmega_mxfp8_tn_sidecar_attr_bytes[0] - _bytes,
+                    )
+
+            try:
+                return _weakref.ref(_source, _finalize)
+            except TypeError:
+                return None
+
+        def _cppmega_cleanup_unconsumed_mxfp8_sidecars():
+            for _key, _entry in list(_cppmega_mxfp8_tn_sidecar_registry.items()):
+                _source = _cppmega_resolve_mxfp8_sidecar_source(_entry)
+                if _source is not None:
+                    _cppmega_clear_mxfp8_sidecar_refs_tracked(_source)
+                _cppmega_pop_mxfp8_sidecar_registry_key(_key)
+
+        def _cppmega_set_mxfp8_sidecar_refs(_x, _sidecar, *, persistent=False):
+            # GEMM-ready transpose sidecars are a backward operand cache, not a
+            # second persistent weight cache.  Keeping them past the first
+            # consumer defeats the MXFP8 saved-activation memory goal.
+            persistent = False
+            _old_sidecar = getattr(_x, _cppmega_mxfp8_tn_sidecar_attr, None)
+            if _old_sidecar is None:
+                _old_sidecar = getattr(_x, "_te_rowwise_transpose_for_backward", None)
+            if _old_sidecar is not None and _old_sidecar is not _sidecar:
+                _cppmega_clear_mxfp8_sidecar_refs_tracked(_x, _old_sidecar)
+            _had_sidecar = _old_sidecar is _sidecar
+            setattr(_x, "_te_rowwise_transpose_for_backward", _sidecar)
+            setattr(
+                _x,
+                "_te_rowwise_transpose_for_backward_unregister",
+                _cppmega_unregister_mxfp8_sidecar,
+            )
+            setattr(_x, _cppmega_mxfp8_tn_sidecar_attr, _sidecar)
+            setattr(
+                _x,
+                "_cppmega_mxfp8_rowwise_transpose_unregister",
+                _cppmega_unregister_mxfp8_sidecar,
+            )
+            setattr(_x, _cppmega_mxfp8_tn_sidecar_persistent_attr, bool(persistent))
+            if not _had_sidecar:
+                _bytes = _cppmega_mxfp8_sidecar_nbytes(_sidecar)
+                _cppmega_record_bwd_stat("mxfp8_tn_sidecar_attr_attached")
+                _cppmega_te_bwd_stats["mxfp8_tn_sidecar_attr_attached_bytes"] += _bytes
+                _cppmega_mxfp8_tn_sidecar_attr_bytes[0] += _bytes
+                _cppmega_mxfp8_tn_sidecar_attr_peak_bytes[0] = max(
+                    _cppmega_mxfp8_tn_sidecar_attr_peak_bytes[0],
+                    _cppmega_mxfp8_tn_sidecar_attr_bytes[0],
+                )
+
+        def _cppmega_clear_mxfp8_sidecar_refs_tracked(_x, _sidecar=None):
+            if _sidecar is None:
+                _sidecar = getattr(_x, _cppmega_mxfp8_tn_sidecar_attr, None)
+                if _sidecar is None:
+                    _sidecar = getattr(_x, "_te_rowwise_transpose_for_backward", None)
+            _bytes = _cppmega_mxfp8_sidecar_nbytes(_sidecar)
+            if _cppmega_clear_mxfp8_sidecar_refs(_x):
+                _cppmega_record_bwd_stat("mxfp8_tn_sidecar_attr_cleared")
+                _cppmega_mxfp8_tn_sidecar_attr_bytes[0] = max(
+                    0,
+                    _cppmega_mxfp8_tn_sidecar_attr_bytes[0] - _bytes,
+                )
+                return True
+            return False
+
         def _cppmega_register_mxfp8_sidecar(_x, _sidecar, *, persistent=False):
+            persistent = False
             _key = _cppmega_mxfp8_sidecar_key(_x)
             if _key is None:
                 return
-            _cppmega_mxfp8_tn_sidecar_registry[_key] = (_sidecar, bool(persistent))
+            _old_entry = _cppmega_pop_mxfp8_sidecar_registry_key(_key)
+            _sidecar_bytes = _cppmega_mxfp8_sidecar_nbytes(_sidecar)
+            _cppmega_mxfp8_tn_sidecar_registry[_key] = (
+                _cppmega_mxfp8_sidecar_weakref(_key, _sidecar),
+                bool(persistent),
+                _sidecar_bytes,
+                _cppmega_mxfp8_sidecar_source_weakref(_key, _x, _sidecar_bytes),
+            )
+            if _old_entry is None:
+                _cppmega_mxfp8_tn_sidecar_registry_bytes[0] += _sidecar_bytes
+            else:
+                _cppmega_mxfp8_tn_sidecar_registry_bytes[0] += _sidecar_bytes
             _cppmega_mxfp8_tn_sidecar_registry_peak[0] = max(
                 _cppmega_mxfp8_tn_sidecar_registry_peak[0],
                 len(_cppmega_mxfp8_tn_sidecar_registry),
             )
+            _cppmega_mxfp8_tn_sidecar_registry_peak_bytes[0] = max(
+                _cppmega_mxfp8_tn_sidecar_registry_peak_bytes[0],
+                _cppmega_mxfp8_tn_sidecar_registry_bytes[0],
+            )
             while len(_cppmega_mxfp8_tn_sidecar_registry) > (
                 _cppmega_mxfp8_tn_sidecar_registry_limit
             ):
-                _cppmega_mxfp8_tn_sidecar_registry.pop(
-                    next(iter(_cppmega_mxfp8_tn_sidecar_registry))
+                _cppmega_pop_mxfp8_sidecar_registry_key(
+                    next(reversed(_cppmega_mxfp8_tn_sidecar_registry))
                 )
 
         def _cppmega_get_mxfp8_sidecar_entry(_x):
             _sidecar = getattr(_x, _cppmega_mxfp8_tn_sidecar_attr, None)
             _key = _cppmega_mxfp8_sidecar_key(_x)
             if _sidecar is not None:
-                _persistent = bool(
-                    getattr(_x, _cppmega_mxfp8_tn_sidecar_persistent_attr, False)
-                )
-                if _key is not None and not _persistent:
-                    _cppmega_mxfp8_tn_sidecar_registry.pop(_key, None)
+                _persistent = False
+                if _key is not None:
+                    _cppmega_pop_mxfp8_sidecar_registry_key(_key)
+                _cppmega_clear_mxfp8_sidecar_refs_tracked(_x, _sidecar)
+                _cppmega_record_bwd_stat("mxfp8_tn_sidecar_consumed")
                 return _sidecar, _persistent
             _entry = _cppmega_mxfp8_tn_sidecar_registry.get(_key)
-            if _entry is not None and not _entry[1]:
-                _cppmega_mxfp8_tn_sidecar_registry.pop(_key, None)
-            return _entry
+            if _entry is None:
+                return None
+            _resolved = _cppmega_resolve_mxfp8_sidecar_registry_entry(_entry)
+            if _resolved is None:
+                _cppmega_pop_mxfp8_sidecar_registry_key(_key)
+                return None
+            _sidecar, _persistent, _ = _resolved
+            _cppmega_pop_mxfp8_sidecar_registry_key(_key)
+            _cppmega_record_bwd_stat("mxfp8_tn_sidecar_consumed")
+            return _sidecar, False
 
         def _cppmega_get_mxfp8_sidecar(_x):
             _entry = _cppmega_get_mxfp8_sidecar_entry(_x)
@@ -428,7 +657,11 @@ if (
         def _cppmega_unregister_mxfp8_sidecar(_x):
             _key = _cppmega_mxfp8_sidecar_key(_x)
             if _key is not None:
-                _cppmega_mxfp8_tn_sidecar_registry.pop(_key, None)
+                _cppmega_pop_mxfp8_sidecar_registry_key(_key)
+            _sidecar = getattr(_x, _cppmega_mxfp8_tn_sidecar_attr, None)
+            if _sidecar is not None:
+                _cppmega_record_bwd_stat("mxfp8_tn_sidecar_consumed")
+            _cppmega_clear_mxfp8_sidecar_refs_tracked(_x, _sidecar)
 
         def _cppmega_mark_rowwise_transpose_operand(_x):
             setattr(_x, "_te_rowwise_transpose_for_backward_operand", True)
@@ -452,8 +685,11 @@ if (
             if _entry is None:
                 return _dst
             _sidecar, _persistent = _entry
-            setattr(_dst, _cppmega_mxfp8_tn_sidecar_attr, _sidecar)
-            setattr(_dst, _cppmega_mxfp8_tn_sidecar_persistent_attr, _persistent)
+            _cppmega_set_mxfp8_sidecar_refs(
+                _dst,
+                _sidecar,
+                persistent=_persistent,
+            )
             _cppmega_register_mxfp8_sidecar(_dst, _sidecar, persistent=_persistent)
             return _dst
 
@@ -534,23 +770,7 @@ if (
                                     "while swizzled scales were required"
                                 )
                 _cppmega_mark_rowwise_transpose_operand(_sidecar)
-                setattr(_out, "_te_rowwise_transpose_for_backward", _sidecar)
-                setattr(
-                    _out,
-                    "_te_rowwise_transpose_for_backward_unregister",
-                    _cppmega_unregister_mxfp8_sidecar,
-                )
-                setattr(_out, _cppmega_mxfp8_tn_sidecar_attr, _sidecar)
-                setattr(
-                    _out,
-                    "_cppmega_mxfp8_rowwise_transpose_unregister",
-                    _cppmega_unregister_mxfp8_sidecar,
-                )
-                # The transpose sidecar is scoped to the autograd use of this
-                # quantized tensor. Keeping even weight sidecars past first
-                # backward lookup can accumulate one large sidecar per layer
-                # per iteration when TE allocates fresh quantized workspaces.
-                setattr(_out, _cppmega_mxfp8_tn_sidecar_persistent_attr, False)
+                _cppmega_set_mxfp8_sidecar_refs(_out, _sidecar, persistent=False)
                 _cppmega_register_mxfp8_sidecar(_out, _sidecar, persistent=False)
                 if _te_mxfp8_bwd_debug and _cppmega_attach_debug_count[0] < 16:
                     _cppmega_attach_debug_count[0] += 1
@@ -667,23 +887,24 @@ if (
             _sidecar = _cppmega_get_mxfp8_sidecar(_x)
             if _sidecar is not None:
                 _cppmega_mark_rowwise_transpose_operand(_sidecar)
-                setattr(_x, _cppmega_mxfp8_tn_sidecar_attr, _sidecar)
-                _persistent = bool(
-                    getattr(_x, _cppmega_mxfp8_tn_sidecar_persistent_attr, False)
-                )
-                setattr(_x, _cppmega_mxfp8_tn_sidecar_persistent_attr, _persistent)
             if _sidecar is not None:
                 _cppmega_record_bwd_stat("mxfp8_tn_adapter_te_emit")
                 return _sidecar
             if (
                 _te_mxfp8_transpose_emit_backend == "te"
                 and _te_mxfp8_transpose_emit_strict
+                and not bool(getattr(_x, "_is_param", False))
             ):
                 raise ValueError(
                     "MXFP8 TN adapter is configured for TE transpose-emit, but operand "
                     "is missing the rowwise-transpose sidecar; "
                     f"{_cppmega_mxfp8_debug_desc(_x)}"
                 )
+            # Primary MXFP8 parameters do not pass through the BF16 quantizer,
+            # so they have no TE-emitted transpose sidecar.  Until the native
+            # SM120 loader can consume their compact columnwise storage, use a
+            # one-shot payload transpose in backward instead of keeping a
+            # persistent sidecar from forward.
             if getattr(_x, "_with_gemm_swizzled_scales", False):
                 raise ValueError("MXFP8 TN adapter requires compact, non-swizzled scales")
             _data = getattr(_x, "_columnwise_data", None)
@@ -694,6 +915,13 @@ if (
                 raise ValueError("MXFP8 TN adapter requires matrix-like columnwise data")
             if _scale.dim() != 2:
                 raise ValueError("MXFP8 TN adapter requires 2D compact columnwise scales")
+            warnings.warn(
+                "Copy-based MXFP8 transpose is deprecated. "
+                "Use cutlass_native backend (CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native) "
+                "which reads columnwise operands directly without materializing a transpose.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             _data_2d = _data.reshape(-1, _data.shape[-1])
             _rowwise_data = _data_2d.t().contiguous()
             _rowwise_scale = _scale.t().contiguous()

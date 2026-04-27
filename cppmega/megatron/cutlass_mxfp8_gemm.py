@@ -1,10 +1,9 @@
 """GB10 CUTLASS MXFP8 GEMM integration helpers.
 
-This module is intentionally narrow: it exposes the SM120/SM121 native MXFP8
-TN GEMM path behind a Python function that accepts TE-style MXFP8 rowwise
-payloads and compact rowwise E8M0 scales.  By default the extension uses a
-cppmega CUTLASS mainloop fork that reads compact scales directly; the older
-native-scale prepack path remains available for A/B profiling.
+This module exposes the SM120/SM121 native MXFP8 TN GEMM path behind a Python
+function that accepts TE-style MXFP8 rowwise payloads and compact rowwise E8M0
+scales.  The CUTLASS extension uses a cppmega mainloop fork that reads compact
+scales directly.
 """
 
 from __future__ import annotations
@@ -19,12 +18,6 @@ import torch
 _CUDA_EXT: Any | None = None
 _CUDA_EXT_ERROR: BaseException | None = None
 _CUTLASS_ROOT = Path(os.environ.get("CPPMEGA_CUTLASS_ROOT", "/home/dave/vllm/.deps/cutlass-src"))
-_SCALE_BACKEND = os.environ.get("CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND", "compact")
-if _SCALE_BACKEND not in ("compact", "prepack"):
-    raise RuntimeError(
-        "unsupported CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND="
-        f"{_SCALE_BACKEND!r}; expected compact or prepack"
-    )
 
 _SOURCE_ROWWISE = 0
 _SOURCE_COLUMNWISE_TRANSPOSE = 1
@@ -134,8 +127,7 @@ def tn_gemm(
         use_out = True
 
     ext = _load_cuda_ext()
-    entrypoint = ext.tn_gemm_compact_scale if _SCALE_BACKEND == "compact" else ext.tn_gemm
-    return entrypoint(
+    return ext.tn_gemm_compact_scale(
         _as_uint8_contiguous(a_rowwise_data),
         _as_uint8_contiguous(a_rowwise_scale_inv),
         _as_uint8_contiguous(b_rowwise_data),
@@ -149,24 +141,6 @@ def tn_gemm(
         float(alpha),
         float(1.0 if beta is None and accumulate else (0.0 if beta is None else beta)),
     )
-
-
-def _prepare_out(
-    out: torch.Tensor | None,
-    m: int,
-    n: int,
-    *,
-    device: torch.device,
-) -> tuple[torch.Tensor, bool]:
-    if out is None:
-        return torch.empty(0, device=device, dtype=torch.bfloat16), False
-    if out.dtype != torch.bfloat16:
-        raise TypeError(f"CUTLASS MXFP8 backend currently requires BF16 out, got {out.dtype}")
-    if out.numel() < m * n:
-        raise ValueError(f"out is too small for {m}x{n}")
-    if not out.is_contiguous():
-        raise ValueError("out must be contiguous")
-    return out, True
 
 
 def _tn_gemm_compact_direct(
@@ -196,7 +170,18 @@ def _tn_gemm_compact_direct(
     if b_source not in (_SOURCE_ROWWISE, _SOURCE_COLUMNWISE_TRANSPOSE):
         raise ValueError(f"unsupported B source {b_source}")
 
-    out_arg, use_out = _prepare_out(out, m, n, device=a_data.device)
+    if out is None:
+        out_arg = torch.empty(0, device=a_data.device, dtype=torch.bfloat16)
+        use_out = False
+    else:
+        if out.dtype != torch.bfloat16:
+            raise TypeError(f"CUTLASS MXFP8 backend currently requires BF16 out, got {out.dtype}")
+        if out.numel() < m * n:
+            raise ValueError(f"out is too small for {m}x{n}")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
+        out_arg = out
+        use_out = True
     ext = _load_cuda_ext()
     return ext.tn_gemm_compact_direct(
         _as_uint8_contiguous(a_data),
