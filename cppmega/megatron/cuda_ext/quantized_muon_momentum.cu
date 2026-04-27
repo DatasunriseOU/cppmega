@@ -13,9 +13,74 @@
 namespace {
 
 constexpr int kBlockSize = 256;
-constexpr int kThreads = 64;
+// Bumped from 64 -> 128 (2 -> 4 warps/block) to raise SM occupancy on the
+// quantized Muon update kernel. With kBlockSize=256, kItemsPerThread becomes 2
+// and the indexing pattern (tid + item * kThreads) still tiles the full block
+// exactly: items 0,1 cover lanes [0..127] and [128..255] for tid in [0,128).
+constexpr int kThreads = 128;
 constexpr int kItemsPerThread = kBlockSize / kThreads;
+constexpr int kWarpSize = 32;
+constexpr int kNumWarps = kThreads / kWarpSize;  // 4
 constexpr float kQMax = 127.0f;
+// Guard against denormal/tiny absmax values that would produce an inv_scale
+// large enough to overflow when multiplied by gradient magnitudes. The threshold
+// is well below any value that could realistically arise from bf16/fp16 inputs
+// (smallest bf16 normal is ~1.18e-38) yet large enough to prevent kQMax/x from
+// exploding to inf. Used only for inv_scale; the un-clamped absmax is still
+// stored back to the absmax buffer to preserve next-step accuracy.
+constexpr float kAbsmaxEps = 1e-30f;
+
+// Block-wide reduction over kThreads lanes that simultaneously computes the
+// max-of-absmax and the sum-of-sumsq. Two-stage: warp shuffle reduce, then a
+// final cross-warp shuffle reduce in warp 0. `scratch_max`/`scratch_sum` must
+// each point to at least kNumWarps floats of dynamic-size-irrelevant shared
+// memory. The result is broadcast to all threads via the scratch buffers
+// (lane-0 of warp-0 writes index 0 after the final reduction).
+__device__ __forceinline__ void block_reduce_max_sum(
+    float local_max,
+    float local_sum,
+    float* scratch_max,
+    float* scratch_sum,
+    float& out_max,
+    float& out_sum) {
+  const int tid = threadIdx.x;
+  const int lane = tid & (kWarpSize - 1);
+  const int warp_id = tid >> 5;
+
+  // Stage 1: intra-warp reduction via shuffles (no shared memory, no sync).
+  #pragma unroll
+  for (int mask = kWarpSize >> 1; mask > 0; mask >>= 1) {
+    local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, mask));
+    local_sum += __shfl_xor_sync(0xffffffffu, local_sum, mask);
+  }
+
+  // Stage 2: lane 0 of each warp publishes its warp result.
+  if (lane == 0) {
+    scratch_max[warp_id] = local_max;
+    scratch_sum[warp_id] = local_sum;
+  }
+  __syncthreads();
+
+  // Stage 3: warp 0 reduces the kNumWarps partials. Lanes >= kNumWarps load
+  // identity values so the shuffle reduction is correct regardless of mask.
+  if (warp_id == 0) {
+    float v_max = (lane < kNumWarps) ? scratch_max[lane] : 0.0f;
+    float v_sum = (lane < kNumWarps) ? scratch_sum[lane] : 0.0f;
+    #pragma unroll
+    for (int mask = kWarpSize >> 1; mask > 0; mask >>= 1) {
+      v_max = fmaxf(v_max, __shfl_xor_sync(0xffffffffu, v_max, mask));
+      v_sum += __shfl_xor_sync(0xffffffffu, v_sum, mask);
+    }
+    if (lane == 0) {
+      scratch_max[0] = v_max;
+      scratch_sum[0] = v_sum;
+    }
+  }
+  __syncthreads();
+
+  out_max = scratch_max[0];
+  out_sum = scratch_sum[0];
+}
 
 template <typename T>
 __device__ __forceinline__ float load_value(const T* ptr, int64_t offset);
@@ -81,8 +146,15 @@ __device__ __forceinline__ int tensor_for_block(
   return lo;
 }
 
+// __launch_bounds__(kThreads, minBlocksPerSM): with kThreads=128 we drop the
+// minimum-resident-blocks hint from 4 -> 2. Holding 4 resident 128-thread
+// blocks would require 512 threads/SM dedicated to this kernel, which over-
+// constrains register allocation on smaller SMs (e.g. SM_75/86) and forces
+// register spills. 2 is the natural choice for 128-thread blocks and still
+// gives 256 resident threads/SM, matching the previous (64-thread, 4-block)
+// configuration.
 template <typename GradT, typename QT, bool UnsignedStorage>
-__global__ __launch_bounds__(kThreads, 4) void qmuon_update_multi_kernel(
+__global__ __launch_bounds__(kThreads, 2) void qmuon_update_multi_kernel(
     const uintptr_t* __restrict__ q_ptrs,
     const uintptr_t* __restrict__ absmax_ptrs,
     const uintptr_t* __restrict__ grad_ptrs,
@@ -128,23 +200,21 @@ __global__ __launch_bounds__(kThreads, 4) void qmuon_update_multi_kernel(
     }
   }
 
-  __shared__ float reduce_max[kThreads];
-  __shared__ float reduce_sum[kThreads];
-  reduce_max[tid] = local_absmax;
-  reduce_sum[tid] = local_sumsq;
-  __syncthreads();
+  // Two-stage warp-shuffle reduction; the scratch buffers hold one float per
+  // warp (kNumWarps == 4 for kThreads=128), trivially small.
+  __shared__ float scratch_max[kNumWarps];
+  __shared__ float scratch_sum[kNumWarps];
+  float new_absmax = 0.0f;
+  float block_sumsq = 0.0f;
+  block_reduce_max_sum(
+      local_absmax, local_sumsq, scratch_max, scratch_sum, new_absmax, block_sumsq);
 
-#pragma unroll
-  for (int stride = kThreads >> 1; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      reduce_max[tid] = fmaxf(reduce_max[tid], reduce_max[tid + stride]);
-      reduce_sum[tid] += reduce_sum[tid + stride];
-    }
-    __syncthreads();
-  }
-
-  const float new_absmax = reduce_max[0];
-  const float inv_scale = new_absmax > 0.0f ? kQMax / new_absmax : 0.0f;
+  // Use the un-clamped new_absmax for absmax[]/next-step state, but a clamped
+  // value for inv_scale so that denormal-tiny absmax cannot blow up
+  // updated * inv_scale. If absmax sits at/below kAbsmaxEps the block is
+  // effectively zero, so emit inv_scale=0 (yielding all-zero quantized codes).
+  const float new_absmax_clamped = fmaxf(new_absmax, kAbsmaxEps);
+  const float inv_scale = new_absmax > kAbsmaxEps ? kQMax / new_absmax_clamped : 0.0f;
 #pragma unroll
   for (int item = 0; item < kItemsPerThread; ++item) {
     if (valid[item]) {
@@ -160,19 +230,21 @@ __global__ __launch_bounds__(kThreads, 4) void qmuon_update_multi_kernel(
   if (tid == 0) {
     absmax[local_block] = new_absmax;
     if (sumsq_out != nullptr) {
-      sumsq_out[global_block] = reduce_sum[0];
+      sumsq_out[global_block] = block_sumsq;
     }
     if (group_sumsq_out != nullptr) {
       const int64_t group_id = block_group_ids[global_block];
       if (group_id >= 0) {
-        atomicAdd(group_sumsq_out + group_id, reduce_sum[0]);
+        atomicAdd(group_sumsq_out + group_id, block_sumsq);
       }
     }
   }
 }
 
+// TODO: fuse update + scale via grid_group sync to remove the second kernel
+// launch and the global-memory round-trip of the gradient buffer.
 template <typename GradT>
-__global__ __launch_bounds__(kThreads, 4) void qmuon_scale_multi_by_group_kernel(
+__global__ __launch_bounds__(kThreads, 2) void qmuon_scale_multi_by_group_kernel(
     const uintptr_t* __restrict__ grad_ptrs,
     const int64_t* __restrict__ n_elements,
     const int64_t* __restrict__ block_offsets,
@@ -203,7 +275,7 @@ __global__ __launch_bounds__(kThreads, 4) void qmuon_scale_multi_by_group_kernel
 }
 
 template <typename GradT>
-__global__ __launch_bounds__(kThreads, 4) void qmuon_scale_multi_by_group_from_sumsq_kernel(
+__global__ __launch_bounds__(kThreads, 2) void qmuon_scale_multi_by_group_from_sumsq_kernel(
     const uintptr_t* __restrict__ grad_ptrs,
     const int64_t* __restrict__ n_elements,
     const int64_t* __restrict__ block_offsets,
