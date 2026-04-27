@@ -103,6 +103,9 @@ export CPPMEGA_TORCH_PROFILE_STEPS="${CPPMEGA_TORCH_PROFILE_STEPS:-2}"
 export CPPMEGA_TORCH_PROFILE_DIR="${CPPMEGA_TORCH_PROFILE_DIR:-/home/dave/logs/${RUN_ID}_torch_profile}"
 export CPPMEGA_NSYS_PROFILE="${CPPMEGA_NSYS_PROFILE:-0}"
 export CPPMEGA_NSYS_OUTPUT="${CPPMEGA_NSYS_OUTPUT:-/home/dave/logs/${RUN_ID}_nsys}"
+export CPPMEGA_CUDA_PROFILE="${CPPMEGA_CUDA_PROFILE:-0}"
+export CPPMEGA_CUDA_PROFILE_STEP_START="${CPPMEGA_CUDA_PROFILE_STEP_START:-3}"
+export CPPMEGA_CUDA_PROFILE_STEP_END="${CPPMEGA_CUDA_PROFILE_STEP_END:-4}"
 if [[ "${CPPMEGA_MEMORY_DEBUG}" == "1" ]]; then
   export NANOCHAT_MEMORY_DEBUG="${NANOCHAT_MEMORY_DEBUG:-1}"
 fi
@@ -587,6 +590,7 @@ echo "[local-quarter] fp8_param_gather=${CPPMEGA_FP8_PARAM_GATHER:-0} reuse_grad
 echo "[local-quarter] local_ddp_no_contig_grad_buffer=${CPPMEGA_LOCAL_DDP_DISABLE_CONTIGUOUS_GRAD_BUFFER}"
 echo "[local-quarter] torch_profile=${CPPMEGA_TORCH_PROFILE} profile_dir=${CPPMEGA_TORCH_PROFILE_DIR}"
 echo "[local-quarter] nsys_profile=${CPPMEGA_NSYS_PROFILE} nsys_output=${CPPMEGA_NSYS_OUTPUT}"
+echo "[local-quarter] cuda_profile=${CPPMEGA_CUDA_PROFILE} cuda_profile_steps=${CPPMEGA_CUDA_PROFILE_STEP_START}:${CPPMEGA_CUDA_PROFILE_STEP_END}"
 
 # shellcheck disable=SC2206
 DATA_ARGS=(--data-path ${CPPMEGA_DATA_PATH})
@@ -663,6 +667,14 @@ if [[ "${CPPMEGA_FP8_RECIPE}" != "off" ]]; then
     --fp8-amax-compute-algo max
   )
 fi
+PROFILE_ARGS=()
+if [[ "${CPPMEGA_CUDA_PROFILE}" == "1" ]]; then
+  PROFILE_ARGS+=(
+    --profile
+    --profile-step-start "${CPPMEGA_CUDA_PROFILE_STEP_START}"
+    --profile-step-end "${CPPMEGA_CUDA_PROFILE_STEP_END}"
+  )
+fi
 
 LAUNCH_PREFIX=()
 if [[ "${CPPMEGA_NSYS_PROFILE}" == "1" ]]; then
@@ -716,6 +728,7 @@ fi
   --transformer-impl transformer_engine \
   --use-flash-attn \
   --attention-backend flash \
+  "${PROFILE_ARGS[@]}" \
   "${TE_PRECISION_ARGS[@]}" \
   --spec "${CPPMEGA_SPEC_MODULE}" "${CPPMEGA_SPEC_FUNCTION}" \
   --cross-entropy-loss-fusion \
