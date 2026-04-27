@@ -25,12 +25,21 @@ MATERIALIZATION_STAT_KEYS = (
     "mxfp8_tn_adapter_missing_sidecar_copy",
     "mxfp8_norm_quantize_sidecar_bridge",
 )
-SIDECAR_REGISTRY_ZERO_KEYS = (
+SIDECAR_LIVE_ZERO_KEYS = (
     "mxfp8_tn_sidecar_registry_size",
     "mxfp8_tn_sidecar_registry_persistent",
+    "mxfp8_tn_sidecar_registry_current_bytes",
+    "mxfp8_tn_sidecar_tracked_attr_current_bytes",
 )
-SIDECAR_REGISTRY_STAT_KEYS = SIDECAR_REGISTRY_ZERO_KEYS + (
+SIDECAR_REGISTRY_ZERO_KEYS = SIDECAR_LIVE_ZERO_KEYS
+SIDECAR_REGISTRY_STAT_KEYS = SIDECAR_LIVE_ZERO_KEYS + (
     "mxfp8_tn_sidecar_registry_peak",
+    "mxfp8_tn_sidecar_registry_peak_bytes",
+    "mxfp8_tn_sidecar_tracked_attr_peak_bytes",
+    "mxfp8_tn_sidecar_attr_attached",
+    "mxfp8_tn_sidecar_attr_cleared",
+    "mxfp8_tn_sidecar_consumed",
+    "mxfp8_tn_sidecar_attr_attached_bytes",
 )
 ALL_STAT_KEYS = (
     ADAPTER_STAT_KEYS
@@ -84,7 +93,7 @@ def validate_probe_report(report: dict[str, Any]) -> list[str]:
             errors.append(f"{key}={stats.get(key)}; expected 0")
     if stats.get("fallback_reasons", {}) not in ({}, None):
         errors.append(f"fallback_reasons={stats.get('fallback_reasons')!r}; expected empty")
-    for key in SIDECAR_REGISTRY_ZERO_KEYS:
+    for key in SIDECAR_LIVE_ZERO_KEYS:
         if key not in stats:
             errors.append(f"{key} missing; expected 0")
         elif int(stats.get(key, -1)) != 0:

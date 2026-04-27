@@ -172,54 +172,9 @@ using CompactScaleStrideB = typename CompactScaleGemm::GemmKernel::StrideB;
 using CompactScaleStrideC = typename CompactScaleGemm::GemmKernel::StrideC;
 using CompactScaleStrideD = typename CompactScaleGemm::GemmKernel::StrideD;
 
-template <class Layout>
-__global__ void prepack_rowwise_scale_kernel(
-    uint8_t const* __restrict__ compact,
-    uint8_t* __restrict__ native,
-    Layout native_layout,
-    int rows,
-    int k_blocks,
-    int compact_ld) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = rows * k_blocks;
-  if (idx >= total) {
-    return;
-  }
-  int row = idx / k_blocks;
-  int kb = idx - row * k_blocks;
-  native[native_layout(row, kb * 32, 0)] = compact[row * compact_ld + kb];
-}
-
-template <class LayoutA, class LayoutB>
-__global__ void prepack_two_rowwise_scale_kernel(
-    uint8_t const* __restrict__ compact_a,
-    uint8_t* __restrict__ native_a,
-    LayoutA native_layout_a,
-    int rows_a,
-    int k_blocks_a,
-    int compact_ld_a,
-    uint8_t const* __restrict__ compact_b,
-    uint8_t* __restrict__ native_b,
-    LayoutB native_layout_b,
-    int rows_b,
-    int k_blocks_b,
-    int compact_ld_b) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total_a = rows_a * k_blocks_a;
-  int total_b = rows_b * k_blocks_b;
-  if (idx < total_a) {
-    int row = idx / k_blocks_a;
-    int kb = idx - row * k_blocks_a;
-    native_a[native_layout_a(row, kb * 32, 0)] = compact_a[row * compact_ld_a + kb];
-    return;
-  }
-  idx -= total_a;
-  if (idx < total_b) {
-    int row = idx / k_blocks_b;
-    int kb = idx - row * k_blocks_b;
-    native_b[native_layout_b(row, kb * 32, 0)] = compact_b[row * compact_ld_b + kb];
-  }
-}
+// =======================================================================
+// Validation helpers
+// =======================================================================
 
 void validate_inputs(
     at::Tensor const& A_u8,
@@ -295,74 +250,197 @@ void validate_direct_operand(
   }
 }
 
-struct CachedTensors {
-  at::Tensor native_SFA;
-  at::Tensor native_SFB;
+// =======================================================================
+// Workspace cache (CUTLASS workspace only; no native-SF prepack)
+// =======================================================================
+
+struct WorkspaceCacheEntry {
   at::Tensor workspace;
 };
 
-using CacheKey = std::tuple<int64_t, uintptr_t, int64_t, int64_t, int64_t>;
+using WorkspaceCacheKey = std::tuple<int64_t, uintptr_t, int64_t>;
 
-struct CacheKeyHash {
-  std::size_t operator()(CacheKey const& key) const {
+struct WorkspaceCacheKeyHash {
+  std::size_t operator()(WorkspaceCacheKey const& key) const {
     auto h = std::hash<int64_t>{}(std::get<0>(key));
     h ^= std::hash<uintptr_t>{}(std::get<1>(key)) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
     h ^= std::hash<int64_t>{}(std::get<2>(key)) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-    h ^= std::hash<int64_t>{}(std::get<3>(key)) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-    h ^= std::hash<int64_t>{}(std::get<4>(key)) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
     return h;
   }
 };
 
-std::mutex& cache_mutex() {
+std::mutex& ws_cache_mutex() {
   static std::mutex mutex;
   return mutex;
 }
 
-std::unordered_map<CacheKey, CachedTensors, CacheKeyHash>& tensor_cache() {
-  static std::unordered_map<CacheKey, CachedTensors, CacheKeyHash> cache;
+std::unordered_map<WorkspaceCacheKey, WorkspaceCacheEntry, WorkspaceCacheKeyHash>& ws_cache() {
+  static std::unordered_map<WorkspaceCacheKey, WorkspaceCacheEntry, WorkspaceCacheKeyHash> cache;
   return cache;
 }
 
-bool cache_enabled() {
-  char const* value = std::getenv("CPPMEGA_CUTLASS_MXFP8_CACHE");
-  return value == nullptr || std::string(value) != "0";
-}
-
-CachedTensors get_cached_tensors(
+at::Tensor get_cached_workspace(
     int64_t device_index,
     cudaStream_t stream,
-    int64_t native_sfa_elems,
-    int64_t native_sfb_elems,
     int64_t workspace_size,
     at::TensorOptions const& byte_options) {
-  auto allocate = [&]() {
-    CachedTensors tensors;
-    tensors.native_SFA = at::empty({native_sfa_elems}, byte_options);
-    tensors.native_SFB = at::empty({native_sfb_elems}, byte_options);
-    if (workspace_size > 0) {
-      tensors.workspace = at::empty({workspace_size}, byte_options);
-    }
-    return tensors;
-  };
-
-  if (!cache_enabled()) {
-    return allocate();
+  if (workspace_size == 0) {
+    return {};
   }
-
-  CacheKey key{
-      device_index,
-      reinterpret_cast<uintptr_t>(stream),
-      native_sfa_elems,
-      native_sfb_elems,
-      workspace_size};
-  std::lock_guard<std::mutex> lock(cache_mutex());
-  auto& cache = tensor_cache();
+  char const* env = std::getenv("CPPMEGA_CUTLASS_MXFP8_CACHE");
+  bool enabled = (env == nullptr || std::string(env) != "0");
+  if (!enabled) {
+    return at::empty({workspace_size}, byte_options);
+  }
+  WorkspaceCacheKey key{device_index, reinterpret_cast<uintptr_t>(stream), workspace_size};
+  std::lock_guard<std::mutex> lock(ws_cache_mutex());
+  auto& cache = ws_cache();
   auto it = cache.find(key);
-  if (it == cache.end()) {
-    it = cache.emplace(key, allocate()).first;
+  if (it != cache.end()) {
+    return it->second.workspace;
   }
-  return it->second;
+  auto tensor = at::empty({workspace_size}, byte_options);
+  cache[key] = WorkspaceCacheEntry{tensor};
+  return tensor;
+}
+
+// =======================================================================
+// Templated GEMM runners using compact-scale mainloop
+// =======================================================================
+
+template <class Gemm>
+at::Tensor run_compact_scale_gemm_impl(
+    at::Tensor const& A_u8,
+    at::Tensor const& SFA_u8,
+    at::Tensor const& B_u8,
+    at::Tensor const& SFB_u8,
+    int m, int n, int k,
+    at::Tensor& D,
+    float alpha, float beta, bool accumulate,
+    cudaStream_t stream) {
+
+  using StrideA = typename Gemm::GemmKernel::StrideA;
+  using StrideB = typename Gemm::GemmKernel::StrideB;
+  using StrideC = typename Gemm::GemmKernel::StrideC;
+  using StrideD = typename Gemm::GemmKernel::StrideD;
+  int l = 1;
+
+  StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, make_shape(m, k, l));
+  StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, make_shape(n, k, l));
+  StrideC stride_C = cutlass::make_cute_packed_stride(StrideC{}, make_shape(m, n, l));
+  StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, make_shape(m, n, l));
+
+  auto ptr_A = reinterpret_cast<KernelElementA const*>(A_u8.data_ptr<uint8_t>());
+  auto ptr_B = reinterpret_cast<KernelElementB const*>(B_u8.data_ptr<uint8_t>());
+  auto ptr_SFA = reinterpret_cast<KernelElementSF const*>(SFA_u8.data_ptr<uint8_t>());
+  auto ptr_SFB = reinterpret_cast<KernelElementSF const*>(SFB_u8.data_ptr<uint8_t>());
+  auto ptr_D = reinterpret_cast<ElementD*>(D.data_ptr<at::BFloat16>());
+  auto ptr_C = ptr_D;
+  float beta_f = accumulate ? beta : 0.0f;
+
+  typename Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k, l},
+      {
+          ptr_A, stride_A, ptr_B, stride_B,
+          ptr_SFA, static_cast<int64_t>(SFA_u8.size(1)),
+          ptr_SFB, static_cast<int64_t>(SFB_u8.size(1)),
+          false,
+          static_cast<int32_t>(kOperandRowwise), static_cast<int64_t>(A_u8.size(1)),
+          static_cast<int32_t>(kOperandRowwise), static_cast<int64_t>(B_u8.size(1)),
+      },
+      {{alpha, beta_f}, ptr_C, stride_C, ptr_D, stride_D}};
+
+  Gemm gemm;
+  cutlass::Status can_status = gemm.can_implement(arguments);
+  TORCH_CHECK(can_status == cutlass::Status::kSuccess,
+              "CUTLASS MXFP8 compact-scale can_implement failed: ",
+              cutlass_status_name(can_status));
+
+  size_t workspace_size = Gemm::get_workspace_size(arguments);
+  at::Tensor ws = get_cached_workspace(
+      A_u8.device().index(), stream,
+      static_cast<int64_t>(workspace_size),
+      at::TensorOptions().device(A_u8.device()).dtype(at::kByte));
+  void* workspace_ptr = workspace_size > 0 ? ws.data_ptr<uint8_t>() : nullptr;
+  cutlass::Status init_status = gemm.initialize(arguments, workspace_ptr, stream);
+  TORCH_CHECK(init_status == cutlass::Status::kSuccess,
+              "CUTLASS MXFP8 compact-scale initialize failed: ",
+              cutlass_status_name(init_status));
+  cutlass::Status run_status = gemm.run(stream);
+  TORCH_CHECK(run_status == cutlass::Status::kSuccess,
+              "CUTLASS MXFP8 compact-scale run failed: ",
+              cutlass_status_name(run_status));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return D;
+}
+
+template <class Gemm>
+at::Tensor run_compact_direct_gemm_impl(
+    at::Tensor const& A_u8,
+    at::Tensor const& SFA_u8,
+    at::Tensor const& B_u8,
+    at::Tensor const& SFB_u8,
+    int m, int n, int k,
+    int64_t a_source, int64_t a_data_ld, int64_t a_scale_ld,
+    int64_t b_source, int64_t b_data_ld, int64_t b_scale_ld,
+    at::Tensor& D,
+    float alpha, float beta, bool accumulate,
+    cudaStream_t stream) {
+
+  using StrideA = typename Gemm::GemmKernel::StrideA;
+  using StrideB = typename Gemm::GemmKernel::StrideB;
+  using StrideC = typename Gemm::GemmKernel::StrideC;
+  using StrideD = typename Gemm::GemmKernel::StrideD;
+  int l = 1;
+
+  StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, make_shape(m, k, l));
+  StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, make_shape(n, k, l));
+  StrideC stride_C = cutlass::make_cute_packed_stride(StrideC{}, make_shape(m, n, l));
+  StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, make_shape(m, n, l));
+
+  auto ptr_A = reinterpret_cast<KernelElementA const*>(A_u8.data_ptr<uint8_t>());
+  auto ptr_B = reinterpret_cast<KernelElementB const*>(B_u8.data_ptr<uint8_t>());
+  auto ptr_SFA = reinterpret_cast<KernelElementSF const*>(SFA_u8.data_ptr<uint8_t>());
+  auto ptr_SFB = reinterpret_cast<KernelElementSF const*>(SFB_u8.data_ptr<uint8_t>());
+  auto ptr_D = reinterpret_cast<ElementD*>(D.data_ptr<at::BFloat16>());
+  auto ptr_C = ptr_D;
+  float beta_f = accumulate ? beta : 0.0f;
+
+  typename Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k, l},
+      {
+          ptr_A, stride_A, ptr_B, stride_B,
+          ptr_SFA, a_scale_ld, ptr_SFB, b_scale_ld,
+          true,
+          static_cast<int32_t>(a_source), a_data_ld,
+          static_cast<int32_t>(b_source), b_data_ld,
+      },
+      {{alpha, beta_f}, ptr_C, stride_C, ptr_D, stride_D}};
+
+  Gemm gemm;
+  cutlass::Status can_status = gemm.can_implement(arguments);
+  TORCH_CHECK(can_status == cutlass::Status::kSuccess,
+              "CUTLASS MXFP8 compact direct can_implement failed: ",
+              cutlass_status_name(can_status));
+
+  size_t workspace_size = Gemm::get_workspace_size(arguments);
+  at::Tensor ws = get_cached_workspace(
+      A_u8.device().index(), stream,
+      static_cast<int64_t>(workspace_size),
+      at::TensorOptions().device(A_u8.device()).dtype(at::kByte));
+  void* workspace_ptr = workspace_size > 0 ? ws.data_ptr<uint8_t>() : nullptr;
+  cutlass::Status init_status = gemm.initialize(arguments, workspace_ptr, stream);
+  TORCH_CHECK(init_status == cutlass::Status::kSuccess,
+              "CUTLASS MXFP8 compact direct initialize failed: ",
+              cutlass_status_name(init_status));
+  cutlass::Status run_status = gemm.run(stream);
+  TORCH_CHECK(run_status == cutlass::Status::kSuccess,
+              "CUTLASS MXFP8 compact direct run failed: ",
+              cutlass_status_name(run_status));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return D;
 }
 
 #endif
@@ -370,118 +448,6 @@ CachedTensors get_cached_tensors(
 }  // namespace cppmega_cutlass_mxfp8
 
 using namespace cppmega_cutlass_mxfp8;
-
-at::Tensor cutlass_mxfp8_tn_gemm_cuda(
-    at::Tensor A_u8,
-    at::Tensor SFA_u8,
-    at::Tensor B_u8,
-    at::Tensor SFB_u8,
-    int64_t m64,
-    int64_t n64,
-    int64_t k64,
-    at::Tensor out,
-    bool use_out,
-    bool accumulate,
-    double alpha,
-    double beta) {
-#if !defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) && !defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
-  TORCH_CHECK(false, "CUTLASS SM120/SM121 MXFP8 backend was not compiled for this architecture");
-#else
-  TORCH_CHECK(m64 <= INT_MAX && n64 <= INT_MAX && k64 <= INT_MAX, "M/N/K exceed int");
-  int m = static_cast<int>(m64);
-  int n = static_cast<int>(n64);
-  int k = static_cast<int>(k64);
-  int k_blocks = k / 32;
-  int l = 1;
-
-  validate_inputs(A_u8, SFA_u8, B_u8, SFB_u8, m, n, k);
-  if (use_out) {
-    CHECK_CUDA(out);
-    CHECK_CONTIGUOUS(out);
-    TORCH_CHECK(out.scalar_type() == at::ScalarType::BFloat16, "out must be bfloat16");
-    TORCH_CHECK(out.numel() >= static_cast<int64_t>(m) * n, "out is too small");
-  }
-
-  c10::cuda::CUDAGuard device_guard(A_u8.device());
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
-
-  StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, make_shape(m, k, l));
-  StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, make_shape(n, k, l));
-  StrideC stride_C = cutlass::make_cute_packed_stride(StrideC{}, make_shape(m, n, l));
-  StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, make_shape(m, n, l));
-  LayoutSFA layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, l));
-  LayoutSFB layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, l));
-
-  int64_t native_sfa_elems = static_cast<int64_t>(size(filter_zeros(layout_SFA)));
-  int64_t native_sfb_elems = static_cast<int64_t>(size(filter_zeros(layout_SFB)));
-  auto byte_options = at::TensorOptions().device(A_u8.device()).dtype(at::kByte);
-
-  at::Tensor D = use_out
-      ? out.view({m, n})
-      : at::empty({m, n}, at::TensorOptions().device(A_u8.device()).dtype(at::kBFloat16));
-
-  auto ptr_A = reinterpret_cast<ElementAData const*>(A_u8.data_ptr<uint8_t>());
-  auto ptr_B = reinterpret_cast<ElementBData const*>(B_u8.data_ptr<uint8_t>());
-  auto ptr_D = reinterpret_cast<ElementD*>(D.data_ptr<at::BFloat16>());
-  auto ptr_C = use_out && accumulate ? ptr_D : ptr_D;
-  float beta_f = accumulate ? static_cast<float>(beta) : 0.0f;
-
-  typename Gemm::Arguments arguments{
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      {m, n, k, l},
-      {ptr_A, stride_A, ptr_B, stride_B, nullptr, layout_SFA, nullptr, layout_SFB},
-      {{static_cast<float>(alpha), beta_f}, ptr_C, stride_C, ptr_D, stride_D}};
-
-  Gemm gemm;
-  size_t workspace_size = Gemm::get_workspace_size(arguments);
-  auto cached = get_cached_tensors(
-      A_u8.device().index(),
-      stream,
-      native_sfa_elems,
-      native_sfb_elems,
-      static_cast<int64_t>(workspace_size),
-      byte_options);
-  at::Tensor native_SFA = cached.native_SFA;
-  at::Tensor native_SFB = cached.native_SFB;
-
-  constexpr int threads = 256;
-  int total_scale_elems = (m + n) * k_blocks;
-  int scale_blocks = (total_scale_elems + threads - 1) / threads;
-  prepack_two_rowwise_scale_kernel<<<scale_blocks, threads, 0, stream>>>(
-      SFA_u8.data_ptr<uint8_t>(),
-      native_SFA.data_ptr<uint8_t>(),
-      layout_SFA,
-      m,
-      k_blocks,
-      static_cast<int>(SFA_u8.size(1)),
-      SFB_u8.data_ptr<uint8_t>(),
-      native_SFB.data_ptr<uint8_t>(),
-      layout_SFB,
-      n,
-      k_blocks,
-      static_cast<int>(SFB_u8.size(1)));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-  auto ptr_SFA = reinterpret_cast<ElementSF const*>(native_SFA.data_ptr<uint8_t>());
-  auto ptr_SFB = reinterpret_cast<ElementSF const*>(native_SFB.data_ptr<uint8_t>());
-  arguments.mainloop.ptr_SFA = ptr_SFA;
-  arguments.mainloop.ptr_SFB = ptr_SFB;
-
-  cutlass::Status can_status = gemm.can_implement(arguments);
-  TORCH_CHECK(can_status == cutlass::Status::kSuccess,
-              "CUTLASS MXFP8 can_implement failed: ", cutlass_status_name(can_status));
-
-  void* workspace_ptr = workspace_size > 0 ? cached.workspace.data_ptr<uint8_t>() : nullptr;
-  cutlass::Status init_status = gemm.initialize(arguments, workspace_ptr, stream);
-  TORCH_CHECK(init_status == cutlass::Status::kSuccess,
-              "CUTLASS MXFP8 initialize failed: ", cutlass_status_name(init_status));
-  cutlass::Status run_status = gemm.run(stream);
-  TORCH_CHECK(run_status == cutlass::Status::kSuccess,
-              "CUTLASS MXFP8 run failed: ", cutlass_status_name(run_status));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return D;
-#endif
-}
 
 at::Tensor cutlass_mxfp8_tn_gemm_compact_scale_cuda(
     at::Tensor A_u8,
@@ -503,7 +469,6 @@ at::Tensor cutlass_mxfp8_tn_gemm_compact_scale_cuda(
   int m = static_cast<int>(m64);
   int n = static_cast<int>(n64);
   int k = static_cast<int>(k64);
-  int l = 1;
 
   validate_inputs(A_u8, SFA_u8, B_u8, SFB_u8, m, n, k);
   if (use_out) {
@@ -516,72 +481,16 @@ at::Tensor cutlass_mxfp8_tn_gemm_compact_scale_cuda(
   c10::cuda::CUDAGuard device_guard(A_u8.device());
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-  CompactScaleStrideA stride_A =
-      cutlass::make_cute_packed_stride(CompactScaleStrideA{}, make_shape(m, k, l));
-  CompactScaleStrideB stride_B =
-      cutlass::make_cute_packed_stride(CompactScaleStrideB{}, make_shape(n, k, l));
-  CompactScaleStrideC stride_C =
-      cutlass::make_cute_packed_stride(CompactScaleStrideC{}, make_shape(m, n, l));
-  CompactScaleStrideD stride_D =
-      cutlass::make_cute_packed_stride(CompactScaleStrideD{}, make_shape(m, n, l));
-
   at::Tensor D = use_out
       ? out.view({m, n})
       : at::empty({m, n}, at::TensorOptions().device(A_u8.device()).dtype(at::kBFloat16));
 
-  auto ptr_A = reinterpret_cast<KernelElementA const*>(A_u8.data_ptr<uint8_t>());
-  auto ptr_B = reinterpret_cast<KernelElementB const*>(B_u8.data_ptr<uint8_t>());
-  auto ptr_SFA = reinterpret_cast<KernelElementSF const*>(SFA_u8.data_ptr<uint8_t>());
-  auto ptr_SFB = reinterpret_cast<KernelElementSF const*>(SFB_u8.data_ptr<uint8_t>());
-  auto ptr_D = reinterpret_cast<ElementD*>(D.data_ptr<at::BFloat16>());
-  auto ptr_C = use_out && accumulate ? ptr_D : ptr_D;
+  float alpha_f = static_cast<float>(alpha);
   float beta_f = accumulate ? static_cast<float>(beta) : 0.0f;
 
-  typename CompactScaleGemm::Arguments arguments{
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      {m, n, k, l},
-      {
-          ptr_A,
-          stride_A,
-          ptr_B,
-          stride_B,
-          ptr_SFA,
-          static_cast<int64_t>(SFA_u8.size(1)),
-          ptr_SFB,
-          static_cast<int64_t>(SFB_u8.size(1)),
-          false,
-          static_cast<int32_t>(kOperandRowwise),
-          static_cast<int64_t>(A_u8.size(1)),
-          static_cast<int32_t>(kOperandRowwise),
-          static_cast<int64_t>(B_u8.size(1)),
-      },
-      {{static_cast<float>(alpha), beta_f}, ptr_C, stride_C, ptr_D, stride_D}};
-
-  CompactScaleGemm gemm;
-  cutlass::Status can_status = gemm.can_implement(arguments);
-  TORCH_CHECK(can_status == cutlass::Status::kSuccess,
-              "CUTLASS MXFP8 compact-scale can_implement failed: ",
-              cutlass_status_name(can_status));
-
-  size_t workspace_size = CompactScaleGemm::get_workspace_size(arguments);
-  auto cached = get_cached_tensors(
-      A_u8.device().index(),
-      stream,
-      0,
-      0,
-      static_cast<int64_t>(workspace_size),
-      at::TensorOptions().device(A_u8.device()).dtype(at::kByte));
-  void* workspace_ptr = workspace_size > 0 ? cached.workspace.data_ptr<uint8_t>() : nullptr;
-  cutlass::Status init_status = gemm.initialize(arguments, workspace_ptr, stream);
-  TORCH_CHECK(init_status == cutlass::Status::kSuccess,
-              "CUTLASS MXFP8 compact-scale initialize failed: ",
-              cutlass_status_name(init_status));
-  cutlass::Status run_status = gemm.run(stream);
-  TORCH_CHECK(run_status == cutlass::Status::kSuccess,
-              "CUTLASS MXFP8 compact-scale run failed: ",
-              cutlass_status_name(run_status));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return D;
+  return run_compact_scale_gemm_impl<CompactScaleGemm>(
+      A_u8, SFA_u8, B_u8, SFB_u8, m, n, k, D,
+      alpha_f, beta_f, accumulate, stream);
 #endif
 }
 
@@ -611,7 +520,6 @@ at::Tensor cutlass_mxfp8_tn_gemm_compact_direct_cuda(
   int m = static_cast<int>(m64);
   int n = static_cast<int>(n64);
   int k = static_cast<int>(k64);
-  int l = 1;
 
   TORCH_CHECK(m > 0 && n > 0 && k > 0, "m, n, k must be positive");
   TORCH_CHECK(m % 128 == 0 && n % 128 == 0 && k % 128 == 0,
@@ -629,71 +537,17 @@ at::Tensor cutlass_mxfp8_tn_gemm_compact_direct_cuda(
   c10::cuda::CUDAGuard device_guard(A_u8.device());
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-  CompactScaleStrideA stride_A =
-      cutlass::make_cute_packed_stride(CompactScaleStrideA{}, make_shape(m, k, l));
-  CompactScaleStrideB stride_B =
-      cutlass::make_cute_packed_stride(CompactScaleStrideB{}, make_shape(n, k, l));
-  CompactScaleStrideC stride_C =
-      cutlass::make_cute_packed_stride(CompactScaleStrideC{}, make_shape(m, n, l));
-  CompactScaleStrideD stride_D =
-      cutlass::make_cute_packed_stride(CompactScaleStrideD{}, make_shape(m, n, l));
-
   at::Tensor D = use_out
       ? out.view({m, n})
       : at::empty({m, n}, at::TensorOptions().device(A_u8.device()).dtype(at::kBFloat16));
 
-  auto ptr_A = reinterpret_cast<KernelElementA const*>(A_u8.data_ptr<uint8_t>());
-  auto ptr_B = reinterpret_cast<KernelElementB const*>(B_u8.data_ptr<uint8_t>());
-  auto ptr_SFA = reinterpret_cast<KernelElementSF const*>(SFA_u8.data_ptr<uint8_t>());
-  auto ptr_SFB = reinterpret_cast<KernelElementSF const*>(SFB_u8.data_ptr<uint8_t>());
-  auto ptr_D = reinterpret_cast<ElementD*>(D.data_ptr<at::BFloat16>());
-  auto ptr_C = use_out && accumulate ? ptr_D : ptr_D;
+  float alpha_f = static_cast<float>(alpha);
   float beta_f = accumulate ? static_cast<float>(beta) : 0.0f;
 
-  typename CompactScaleGemm::Arguments arguments{
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      {m, n, k, l},
-      {
-          ptr_A,
-          stride_A,
-          ptr_B,
-          stride_B,
-          ptr_SFA,
-          a_scale_ld,
-          ptr_SFB,
-          b_scale_ld,
-          true,
-          static_cast<int32_t>(a_source),
-          a_data_ld,
-          static_cast<int32_t>(b_source),
-          b_data_ld,
-      },
-      {{static_cast<float>(alpha), beta_f}, ptr_C, stride_C, ptr_D, stride_D}};
-
-  CompactScaleGemm gemm;
-  cutlass::Status can_status = gemm.can_implement(arguments);
-  TORCH_CHECK(can_status == cutlass::Status::kSuccess,
-              "CUTLASS MXFP8 compact direct can_implement failed: ",
-              cutlass_status_name(can_status));
-
-  size_t workspace_size = CompactScaleGemm::get_workspace_size(arguments);
-  auto cached = get_cached_tensors(
-      A_u8.device().index(),
-      stream,
-      0,
-      0,
-      static_cast<int64_t>(workspace_size),
-      at::TensorOptions().device(A_u8.device()).dtype(at::kByte));
-  void* workspace_ptr = workspace_size > 0 ? cached.workspace.data_ptr<uint8_t>() : nullptr;
-  cutlass::Status init_status = gemm.initialize(arguments, workspace_ptr, stream);
-  TORCH_CHECK(init_status == cutlass::Status::kSuccess,
-              "CUTLASS MXFP8 compact direct initialize failed: ",
-              cutlass_status_name(init_status));
-  cutlass::Status run_status = gemm.run(stream);
-  TORCH_CHECK(run_status == cutlass::Status::kSuccess,
-              "CUTLASS MXFP8 compact direct run failed: ",
-              cutlass_status_name(run_status));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return D;
+  return run_compact_direct_gemm_impl<CompactScaleGemm>(
+      A_u8, SFA_u8, B_u8, SFB_u8, m, n, k,
+      a_source, a_data_ld, a_scale_ld,
+      b_source, b_data_ld, b_scale_ld,
+      D, alpha_f, beta_f, accumulate, stream);
 #endif
 }

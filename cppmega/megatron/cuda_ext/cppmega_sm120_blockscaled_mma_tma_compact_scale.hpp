@@ -32,6 +32,7 @@
 #pragma once
 
 #include "cutlass/cutlass.h"
+#include "cutlass/arch/barrier.h"
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/pipeline/pipeline.hpp"
 #include "cutlass/gemm/dispatch_policy.hpp"
@@ -181,11 +182,19 @@ struct CollectiveMma<
   using ArchTag = typename DispatchPolicy::ArchTag;
 
   static constexpr int ThreadCount = size(TiledMma{});
+  // SM120 cooperative TMA schedule uses one producer warp-group.  The compact
+  // direct path keeps synchronization warp-local; full CTA sync would deadlock
+  // because consumer warp-groups do not execute this producer collective.
+  static constexpr int LoadThreadCount = 128;
 
   using MainloopPipeline = cutlass::PipelineTmaAsync<DispatchPolicy::Stages>;
+  using MainloopPipelineMK = cutlass::PipelineTmaAsync<DispatchPolicy::Stages>;
+  using MainloopPipelineNK = cutlass::PipelineTmaAsync<DispatchPolicy::Stages>;
 
   using PipelineParams = typename MainloopPipeline::Params;
   using PipelineState  = typename cutlass::PipelineState<DispatchPolicy::Stages>;
+  using PipelineStateMK = typename cutlass::PipelineState<DispatchPolicy::Stages>;
+  using PipelineStateNK = typename cutlass::PipelineState<DispatchPolicy::Stages>;
 
   // One threads per CTA are producers (1 for operand tile)
   static constexpr int NumProducerThreadEvents = 1;
@@ -263,13 +272,24 @@ struct CollectiveMma<
   using SmemAllocTypeA = cute::conditional_t<IsF8F6F4, uint8_t, typename TiledMma::ValTypeA>;
   using SmemAllocTypeB = cute::conditional_t<IsF8F6F4, uint8_t, typename TiledMma::ValTypeB>;
 
-  // Set the bytes transferred in this TMA transaction (may involve multiple issues)
-  static constexpr uint32_t TmaTransactionBytesMK = static_cast<uint32_t>(
+  static constexpr uint32_t ScaleTransactionBytesMK = static_cast<uint32_t>(
+    cutlass::bits_to_bytes(cosize(take<0,2>(SmemLayoutSFA{})) * cute::sizeof_bits_v<ElementSF>));
+
+  static constexpr uint32_t ScaleTransactionBytesNK = static_cast<uint32_t>(
+    cutlass::bits_to_bytes(cosize(take<0,2>(SmemLayoutSFB{})) * cute::sizeof_bits_v<ElementSF>));
+
+  static constexpr uint32_t PayloadTransactionBytesMK = static_cast<uint32_t>(
     cutlass::bits_to_bytes(size(take<0,2>(SmemLayoutA{})) * sizeof_bits<ElementA>::value));
 
-  static constexpr uint32_t TmaTransactionBytesNK = static_cast<uint32_t>(
+  static constexpr uint32_t PayloadTransactionBytesNK = static_cast<uint32_t>(
     cutlass::bits_to_bytes(size(take<0,2>(SmemLayoutB{})) * sizeof_bits<ElementB>::value));
 
+  // The CUTLASS pipeline barrier must cover every byte written into the stage,
+  // even when scales or payloads are produced by warp stores instead of TMA.
+  static constexpr uint32_t TmaTransactionBytesMK =
+      ScaleTransactionBytesMK + PayloadTransactionBytesMK;
+  static constexpr uint32_t TmaTransactionBytesNK =
+      ScaleTransactionBytesNK + PayloadTransactionBytesNK;
   static constexpr uint32_t TmaTransactionBytes = TmaTransactionBytesMK + TmaTransactionBytesNK;
 
   struct SharedStorage {
@@ -285,6 +305,8 @@ struct CollectiveMma<
 
   using TensorStorage = typename SharedStorage::TensorStorage;
   using PipelineStorage = typename SharedStorage::PipelineStorage;
+  using PipelineStorageMK = typename MainloopPipelineMK::SharedStorage;
+  using PipelineStorageNK = typename MainloopPipelineNK::SharedStorage;
 
   // Host side kernel arguments
   struct Arguments {
@@ -320,8 +342,8 @@ struct CollectiveMma<
         make_shape(shape<1>(TileShape{}), shape<2>(TileShape{})),
         _1{}));  // No programmatic multicast
 
-    TMA_A tma_load_a;
-    TMA_B tma_load_b;
+    alignas(64) TMA_A tma_load_a;
+    alignas(64) TMA_B tma_load_b;
     ElementA const* ptr_A{nullptr};
     ElementB const* ptr_B{nullptr};
     ElementSF const* ptr_SFA{nullptr};
@@ -337,6 +359,11 @@ struct CollectiveMma<
     uint32_t tma_transaction_bytes = TmaTransactionBytes;
     uint32_t tma_transaction_bytes_mk = TmaTransactionBytesMK;
     uint32_t tma_transaction_bytes_nk = TmaTransactionBytesNK;
+    uint32_t payload_transaction_bytes_mk = PayloadTransactionBytesMK;
+    uint32_t payload_transaction_bytes_nk = PayloadTransactionBytesNK;
+    uint32_t scale_transaction_bytes_mk = ScaleTransactionBytesMK;
+    uint32_t scale_transaction_bytes_nk = ScaleTransactionBytesNK;
+    uint32_t scale_transaction_bytes = ScaleTransactionBytesMK + ScaleTransactionBytesNK;
   };
 
   //
@@ -388,7 +415,12 @@ struct CollectiveMma<
       static_cast<int64_t>(K),
       TmaTransactionBytes,
       TmaTransactionBytesMK,
-      TmaTransactionBytesNK
+      TmaTransactionBytesNK,
+      PayloadTransactionBytesMK,
+      PayloadTransactionBytesNK,
+      ScaleTransactionBytesMK,
+      ScaleTransactionBytesNK,
+      ScaleTransactionBytesMK + ScaleTransactionBytesNK
     };
   }
 
@@ -590,7 +622,7 @@ struct CollectiveMma<
   /// Perform a collective-scoped matrix multiply-accumulate
   /// Producer Perspective
   template <
-    class TensorA, class TensorB,
+    class LoadInputs,
     class KTileIterator, class BlockCoord
   >
   CUTLASS_DEVICE void
@@ -598,7 +630,7 @@ struct CollectiveMma<
       Params const& params,
       MainloopPipeline pipeline,
       PipelineState smem_pipe_write,
-      cute::tuple<TensorA, TensorB> const& load_inputs,
+      LoadInputs const& load_inputs,
       BlockCoord const& blk_coord,
       KTileIterator k_tile_iter, int k_tile_count,
       int thread_idx,
@@ -643,46 +675,132 @@ struct CollectiveMma<
       constexpr int TileK = int(size<2>(TileShape{}));
       constexpr int Vec = SFVecSize;
       constexpr int KBlocks = TileK / Vec;
+      constexpr int ScaleVecBytes = 4;
+      static_assert(KBlocks % ScaleVecBytes == 0, "KBlocks must be divisible by scale vector width");
       int m_base = m_coord_i * TileM;
       int n_base = n_coord_i * TileN;
       int k_base_block = k_tile * KBlocks;
       int lane = thread_idx & 31;
+      auto ptr_SFA_u8 = reinterpret_cast<uint8_t const*>(params.ptr_SFA);
+      auto ptr_SFB_u8 = reinterpret_cast<uint8_t const*>(params.ptr_SFB);
+
+      auto store_sfa_m_contiguous = [&](int row_base, int kb, uint4 chunk) {
+        uint32_t word = chunk.x;
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sSFA(row_base + byte, kb * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+        word = chunk.y;
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sSFA(row_base + 4 + byte, kb * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+        word = chunk.z;
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sSFA(row_base + 8 + byte, kb * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+        word = chunk.w;
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sSFA(row_base + 12 + byte, kb * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+      };
+
+      auto store_sfb_n_contiguous = [&](int row_base, int kb, uint4 chunk) {
+        uint32_t word = chunk.x;
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sSFB(row_base + byte, kb * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+        word = chunk.y;
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sSFB(row_base + 4 + byte, kb * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+        word = chunk.z;
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sSFB(row_base + 8 + byte, kb * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+        word = chunk.w;
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sSFB(row_base + 12 + byte, kb * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+      };
+
+      auto store_sfa_k_contiguous = [&](int row, int kb_base, uint32_t word) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < ScaleVecBytes; ++byte) {
+          sSFA(row, (kb_base + byte) * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+      };
+
+      auto store_sfb_k_contiguous = [&](int row, int kb_base, uint32_t word) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < ScaleVecBytes; ++byte) {
+          sSFB(row, (kb_base + byte) * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+      };
 
       if (params.a_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose)) {
         // K-block major order makes each warp transaction read contiguous TE columnwise scale bytes.
-        for (int idx = lane; idx < TileM * KBlocks; idx += 32) {
-          int kb = idx / TileM;
-          int row = idx - kb * TileM;
+        constexpr int RowVectors = TileM / 16;
+        for (int idx = lane; idx < KBlocks * RowVectors; idx += 32) {
+          int kb = idx / RowVectors;
+          int row_vec = idx - kb * RowVectors;
+          int row_base = row_vec * 16;
           int64_t scale_offset =
-              static_cast<int64_t>(k_base_block + kb) * params.sfa_ld + (m_base + row);
-          sSFA(row, kb * Vec, write_stage) = params.ptr_SFA[scale_offset];
+              static_cast<int64_t>(k_base_block + kb) * params.sfa_ld + (m_base + row_base);
+          uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_SFA_u8 + scale_offset);
+          store_sfa_m_contiguous(row_base, kb, chunk);
         }
       } else {
-        for (int idx = lane; idx < TileM * KBlocks; idx += 32) {
-          int row = idx / KBlocks;
-          int kb = idx - row * KBlocks;
+        constexpr int KBlockVectors = KBlocks / ScaleVecBytes;
+        for (int idx = lane; idx < TileM * KBlockVectors; idx += 32) {
+          int row = idx / KBlockVectors;
+          int kb_vec = idx - row * KBlockVectors;
+          int kb_base = kb_vec * ScaleVecBytes;
           int64_t scale_offset =
-              static_cast<int64_t>(m_base + row) * params.sfa_ld + k_base_block + kb;
-          sSFA(row, kb * Vec, write_stage) = params.ptr_SFA[scale_offset];
+              static_cast<int64_t>(m_base + row) * params.sfa_ld + k_base_block + kb_base;
+          uint32_t word = *reinterpret_cast<uint32_t const*>(ptr_SFA_u8 + scale_offset);
+          store_sfa_k_contiguous(row, kb_base, word);
         }
       }
 
       if (params.b_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose)) {
         // K-block major order makes each warp transaction read contiguous TE columnwise scale bytes.
-        for (int idx = lane; idx < TileN * KBlocks; idx += 32) {
-          int kb = idx / TileN;
-          int row = idx - kb * TileN;
+        constexpr int RowVectors = TileN / 16;
+        for (int idx = lane; idx < KBlocks * RowVectors; idx += 32) {
+          int kb = idx / RowVectors;
+          int row_vec = idx - kb * RowVectors;
+          int row_base = row_vec * 16;
           int64_t scale_offset =
-              static_cast<int64_t>(k_base_block + kb) * params.sfb_ld + (n_base + row);
-          sSFB(row, kb * Vec, write_stage) = params.ptr_SFB[scale_offset];
+              static_cast<int64_t>(k_base_block + kb) * params.sfb_ld + (n_base + row_base);
+          uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_SFB_u8 + scale_offset);
+          store_sfb_n_contiguous(row_base, kb, chunk);
         }
       } else {
-        for (int idx = lane; idx < TileN * KBlocks; idx += 32) {
-          int row = idx / KBlocks;
-          int kb = idx - row * KBlocks;
+        constexpr int KBlockVectors = KBlocks / ScaleVecBytes;
+        for (int idx = lane; idx < TileN * KBlockVectors; idx += 32) {
+          int row = idx / KBlockVectors;
+          int kb_vec = idx - row * KBlockVectors;
+          int kb_base = kb_vec * ScaleVecBytes;
           int64_t scale_offset =
-              static_cast<int64_t>(n_base + row) * params.sfb_ld + k_base_block + kb;
-          sSFB(row, kb * Vec, write_stage) = params.ptr_SFB[scale_offset];
+              static_cast<int64_t>(n_base + row) * params.sfb_ld + k_base_block + kb_base;
+          uint32_t word = *reinterpret_cast<uint32_t const*>(ptr_SFB_u8 + scale_offset);
+          store_sfb_k_contiguous(row, kb_base, word);
         }
       }
     };
@@ -699,6 +817,36 @@ struct CollectiveMma<
       int lane = thread_idx & 31;
       auto ptr_A = reinterpret_cast<uint8_t const*>(params.ptr_A);
 
+      auto store_a_m_word = [&](int row_base, int kk, int byte_base, uint32_t word) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sA(row_base + byte_base + byte, kk, write_stage) =
+              static_cast<SmemAllocTypeA>((word >> (8 * byte)) & 0xffu);
+        }
+      };
+
+      auto store_a_m_contiguous = [&](int row_base, int kk, uint4 chunk) {
+        store_a_m_word(row_base, kk, 0, chunk.x);
+        store_a_m_word(row_base, kk, 4, chunk.y);
+        store_a_m_word(row_base, kk, 8, chunk.z);
+        store_a_m_word(row_base, kk, 12, chunk.w);
+      };
+
+      auto store_a_k_word = [&](int row, int kk_base, int byte_base, uint32_t word) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sA(row, kk_base + byte_base + byte, write_stage) =
+              static_cast<SmemAllocTypeA>((word >> (8 * byte)) & 0xffu);
+        }
+      };
+
+      auto store_a_k_contiguous = [&](int row, int kk_base, uint4 chunk) {
+        store_a_k_word(row, kk_base, 0, chunk.x);
+        store_a_k_word(row, kk_base, 4, chunk.y);
+        store_a_k_word(row, kk_base, 8, chunk.z);
+        store_a_k_word(row, kk_base, 12, chunk.w);
+      };
+
       if (params.a_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose)) {
         constexpr int RowVectors = TileM / VecBytes;
         for (int idx = lane; idx < TileK * RowVectors; idx += 32) {
@@ -708,31 +856,7 @@ struct CollectiveMma<
           int64_t payload_offset =
               static_cast<int64_t>(k_base + kk) * params.a_data_ld + (m_base + row_base);
           uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_A + payload_offset);
-
-          uint32_t word = chunk.x;
-          CUTLASS_PRAGMA_UNROLL
-          for (int byte = 0; byte < 4; ++byte) {
-            sA(row_base + byte, kk, write_stage) =
-                static_cast<SmemAllocTypeA>((word >> (8 * byte)) & 0xffu);
-          }
-          word = chunk.y;
-          CUTLASS_PRAGMA_UNROLL
-          for (int byte = 0; byte < 4; ++byte) {
-            sA(row_base + 4 + byte, kk, write_stage) =
-                static_cast<SmemAllocTypeA>((word >> (8 * byte)) & 0xffu);
-          }
-          word = chunk.z;
-          CUTLASS_PRAGMA_UNROLL
-          for (int byte = 0; byte < 4; ++byte) {
-            sA(row_base + 8 + byte, kk, write_stage) =
-                static_cast<SmemAllocTypeA>((word >> (8 * byte)) & 0xffu);
-          }
-          word = chunk.w;
-          CUTLASS_PRAGMA_UNROLL
-          for (int byte = 0; byte < 4; ++byte) {
-            sA(row_base + 12 + byte, kk, write_stage) =
-                static_cast<SmemAllocTypeA>((word >> (8 * byte)) & 0xffu);
-          }
+          store_a_m_contiguous(row_base, kk, chunk);
         }
       } else {
         constexpr int KVectors = TileK / VecBytes;
@@ -743,31 +867,7 @@ struct CollectiveMma<
           int64_t payload_offset =
               static_cast<int64_t>(m_base + row) * params.a_data_ld + k_base + kk_base;
           uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_A + payload_offset);
-
-          uint32_t word = chunk.x;
-          CUTLASS_PRAGMA_UNROLL
-          for (int byte = 0; byte < 4; ++byte) {
-            sA(row, kk_base + byte, write_stage) =
-                static_cast<SmemAllocTypeA>((word >> (8 * byte)) & 0xffu);
-          }
-          word = chunk.y;
-          CUTLASS_PRAGMA_UNROLL
-          for (int byte = 0; byte < 4; ++byte) {
-            sA(row, kk_base + 4 + byte, write_stage) =
-                static_cast<SmemAllocTypeA>((word >> (8 * byte)) & 0xffu);
-          }
-          word = chunk.z;
-          CUTLASS_PRAGMA_UNROLL
-          for (int byte = 0; byte < 4; ++byte) {
-            sA(row, kk_base + 8 + byte, write_stage) =
-                static_cast<SmemAllocTypeA>((word >> (8 * byte)) & 0xffu);
-          }
-          word = chunk.w;
-          CUTLASS_PRAGMA_UNROLL
-          for (int byte = 0; byte < 4; ++byte) {
-            sA(row, kk_base + 12 + byte, write_stage) =
-                static_cast<SmemAllocTypeA>((word >> (8 * byte)) & 0xffu);
-          }
+          store_a_k_contiguous(row, kk_base, chunk);
         }
       }
     };
@@ -784,6 +884,36 @@ struct CollectiveMma<
       int lane = thread_idx & 31;
       auto ptr_B = reinterpret_cast<uint8_t const*>(params.ptr_B);
 
+      auto store_b_n_word = [&](int row_base, int kk, int byte_base, uint32_t word) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sB(row_base + byte_base + byte, kk, write_stage) =
+              static_cast<SmemAllocTypeB>((word >> (8 * byte)) & 0xffu);
+        }
+      };
+
+      auto store_b_n_contiguous = [&](int row_base, int kk, uint4 chunk) {
+        store_b_n_word(row_base, kk, 0, chunk.x);
+        store_b_n_word(row_base, kk, 4, chunk.y);
+        store_b_n_word(row_base, kk, 8, chunk.z);
+        store_b_n_word(row_base, kk, 12, chunk.w);
+      };
+
+      auto store_b_k_word = [&](int row, int kk_base, int byte_base, uint32_t word) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sB(row, kk_base + byte_base + byte, write_stage) =
+              static_cast<SmemAllocTypeB>((word >> (8 * byte)) & 0xffu);
+        }
+      };
+
+      auto store_b_k_contiguous = [&](int row, int kk_base, uint4 chunk) {
+        store_b_k_word(row, kk_base, 0, chunk.x);
+        store_b_k_word(row, kk_base, 4, chunk.y);
+        store_b_k_word(row, kk_base, 8, chunk.z);
+        store_b_k_word(row, kk_base, 12, chunk.w);
+      };
+
       if (params.b_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose)) {
         constexpr int RowVectors = TileN / VecBytes;
         for (int idx = lane; idx < TileK * RowVectors; idx += 32) {
@@ -793,31 +923,7 @@ struct CollectiveMma<
           int64_t payload_offset =
               static_cast<int64_t>(k_base + kk) * params.b_data_ld + (n_base + row_base);
           uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_B + payload_offset);
-
-          uint32_t word = chunk.x;
-          CUTLASS_PRAGMA_UNROLL
-          for (int byte = 0; byte < 4; ++byte) {
-            sB(row_base + byte, kk, write_stage) =
-                static_cast<SmemAllocTypeB>((word >> (8 * byte)) & 0xffu);
-          }
-          word = chunk.y;
-          CUTLASS_PRAGMA_UNROLL
-          for (int byte = 0; byte < 4; ++byte) {
-            sB(row_base + 4 + byte, kk, write_stage) =
-                static_cast<SmemAllocTypeB>((word >> (8 * byte)) & 0xffu);
-          }
-          word = chunk.z;
-          CUTLASS_PRAGMA_UNROLL
-          for (int byte = 0; byte < 4; ++byte) {
-            sB(row_base + 8 + byte, kk, write_stage) =
-                static_cast<SmemAllocTypeB>((word >> (8 * byte)) & 0xffu);
-          }
-          word = chunk.w;
-          CUTLASS_PRAGMA_UNROLL
-          for (int byte = 0; byte < 4; ++byte) {
-            sB(row_base + 12 + byte, kk, write_stage) =
-                static_cast<SmemAllocTypeB>((word >> (8 * byte)) & 0xffu);
-          }
+          store_b_n_contiguous(row_base, kk, chunk);
         }
       } else {
         constexpr int KVectors = TileK / VecBytes;
@@ -828,31 +934,7 @@ struct CollectiveMma<
           int64_t payload_offset =
               static_cast<int64_t>(n_base + row) * params.b_data_ld + k_base + kk_base;
           uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_B + payload_offset);
-
-          uint32_t word = chunk.x;
-          CUTLASS_PRAGMA_UNROLL
-          for (int byte = 0; byte < 4; ++byte) {
-            sB(row, kk_base + byte, write_stage) =
-                static_cast<SmemAllocTypeB>((word >> (8 * byte)) & 0xffu);
-          }
-          word = chunk.y;
-          CUTLASS_PRAGMA_UNROLL
-          for (int byte = 0; byte < 4; ++byte) {
-            sB(row, kk_base + 4 + byte, write_stage) =
-                static_cast<SmemAllocTypeB>((word >> (8 * byte)) & 0xffu);
-          }
-          word = chunk.z;
-          CUTLASS_PRAGMA_UNROLL
-          for (int byte = 0; byte < 4; ++byte) {
-            sB(row, kk_base + 8 + byte, write_stage) =
-                static_cast<SmemAllocTypeB>((word >> (8 * byte)) & 0xffu);
-          }
-          word = chunk.w;
-          CUTLASS_PRAGMA_UNROLL
-          for (int byte = 0; byte < 4; ++byte) {
-            sB(row, kk_base + 12 + byte, write_stage) =
-                static_cast<SmemAllocTypeB>((word >> (8 * byte)) & 0xffu);
-          }
+          store_b_k_contiguous(row, kk_base, chunk);
         }
       }
     };
@@ -873,53 +955,47 @@ struct CollectiveMma<
       //
       // Copy gmem to smem for *k_tile_iter
       //
-      if (params.manual_payload_load) {
-        bool tma_payload_a =
-            params.a_source == static_cast<int32_t>(CppMegaCompactOperandSource::kRowwise) &&
-            params.a_data_ld == params.problem_k;
-        bool tma_payload_b =
-            params.b_source == static_cast<int32_t>(CppMegaCompactOperandSource::kRowwise) &&
-            params.b_data_ld == params.problem_k;
-        uint32_t manual_transaction_bytes = 0;
-        if (!tma_payload_a) {
-          manual_transaction_bytes += params.tma_transaction_bytes_mk;
-        }
-        if (!tma_payload_b) {
-          manual_transaction_bytes += params.tma_transaction_bytes_nk;
-        }
+      bool manual_payload_a =
+          params.manual_payload_load &&
+          params.a_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose);
+      bool manual_payload_b =
+          params.manual_payload_load &&
+          params.b_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose);
 
+      if (manual_payload_a || manual_payload_b) {
+        // Direct compact mode only needs manual payload stores for operands
+        // that arrive as TE columnwise-transpose storage.  Rowwise operands
+        // already match the CUTLASS TMA descriptor and should stay on TMA.
         using BarrierType = typename MainloopPipeline::ProducerBarrierType;
         BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
-        if (lane_predicate) {
-          if (tma_payload_a) {
-            copy(params.tma_load_a.with(*tma_barrier), tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,write_stage));
-          }
-          if (tma_payload_b) {
-            copy(params.tma_load_b.with(*tma_barrier), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,write_stage));
-          }
-        }
-        if (!tma_payload_a) {
+        uint32_t manual_transaction_bytes = params.scale_transaction_bytes;
+        if (manual_payload_a) {
           load_payload_tile_a(write_stage, *k_tile_iter);
+          manual_transaction_bytes += params.payload_transaction_bytes_mk;
+        } else if (lane_predicate) {
+          copy(params.tma_load_a.with(*tma_barrier), tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,write_stage));
         }
-        if (!tma_payload_b) {
+        if (manual_payload_b) {
           load_payload_tile_b(write_stage, *k_tile_iter);
+          manual_transaction_bytes += params.payload_transaction_bytes_nk;
+        } else if (lane_predicate) {
+          copy(params.tma_load_b.with(*tma_barrier), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,write_stage));
         }
-        if (manual_transaction_bytes > 0) {
-          __syncwarp();
-          cutlass::arch::fence_view_async_shared();
-          __syncwarp();
-        }
+        __syncwarp();
+        cutlass::arch::fence_view_async_shared();
+        __syncwarp();
         if (lane_predicate) {
-          if (manual_transaction_bytes > 0) {
-            cutlass::arch::ClusterTransactionBarrier::complete_transaction(
-                tma_barrier, block_rank_in_cluster, manual_transaction_bytes, 1);
-          }
+          cutlass::arch::ClusterTransactionBarrier::complete_transaction(
+              tma_barrier, block_rank_in_cluster, manual_transaction_bytes, 1);
         }
       } else if (lane_predicate) {
         using BarrierType = typename MainloopPipeline::ProducerBarrierType;
         BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
         copy(params.tma_load_a.with(*tma_barrier), tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,write_stage));
         copy(params.tma_load_b.with(*tma_barrier), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,write_stage));
+        cutlass::arch::fence_view_async_shared();
+        cutlass::arch::ClusterTransactionBarrier::complete_transaction(
+            tma_barrier, block_rank_in_cluster, params.scale_transaction_bytes, 1);
       }
 
       // Advance k tile
@@ -927,6 +1003,361 @@ struct CollectiveMma<
       ++smem_pipe_write;
     }
     __syncwarp();
+  }
+
+  // A/SFA half of the asymmetric producer path.  This mirrors CUTLASS'
+  // LoadMK role but keeps cppmega's compact TE scale/payload contract.
+  template <
+    class LoadInputs,
+    class KTileIterator, class BlockCoord
+  >
+  CUTLASS_DEVICE void
+  load_MK(
+      Params const& params,
+      MainloopPipelineMK pipeline,
+      PipelineStateMK smem_pipe_write,
+      LoadInputs const& load_inputs,
+      BlockCoord const& blk_coord,
+      KTileIterator k_tile_iter, int k_tile_count,
+      int thread_idx,
+      uint32_t block_rank_in_cluster,
+      TensorStorage& shared_tensors) {
+    int lane_predicate = cute::elect_one_sync();
+
+    Tensor sA = make_tensor(make_smem_ptr(shared_tensors.smem_A.begin()), SmemLayoutA{});
+    Tensor sSFA = make_tensor(make_smem_ptr(shared_tensors.smem_SFA.begin()), SmemLayoutSFA{});
+
+    auto [gA_mkl, gB_nkl] = load_inputs;
+    (void)gB_nkl;
+
+    auto block_tma_a = params.tma_load_a.get_slice(0);
+
+    auto [m_coord, n_coord, k_coord, l_coord] = blk_coord;
+    (void)n_coord;
+    (void)k_coord;
+    Tensor gA = gA_mkl(_,_,m_coord,_,l_coord);
+
+    Tensor tAgA = block_tma_a.partition_S(gA);
+    Tensor tAsA = block_tma_a.partition_D(sA);
+
+    int m_coord_i = int(m_coord);
+
+    auto load_sfa = [&](int write_stage, int k_tile) {
+      constexpr int TileM = int(size<0>(TileShape{}));
+      constexpr int TileK = int(size<2>(TileShape{}));
+      constexpr int Vec = SFVecSize;
+      constexpr int KBlocks = TileK / Vec;
+      constexpr int ScaleVecBytes = 4;
+      static_assert(KBlocks % ScaleVecBytes == 0, "KBlocks must be divisible by scale vector width");
+      int m_base = m_coord_i * TileM;
+      int k_base_block = k_tile * KBlocks;
+      int lane = thread_idx & 31;
+      auto ptr_SFA_u8 = reinterpret_cast<uint8_t const*>(params.ptr_SFA);
+
+      auto store_m_contiguous = [&](int row_base, int kb, uint4 chunk) {
+        uint32_t word = chunk.x;
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sSFA(row_base + byte, kb * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+        word = chunk.y;
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sSFA(row_base + 4 + byte, kb * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+        word = chunk.z;
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sSFA(row_base + 8 + byte, kb * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+        word = chunk.w;
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sSFA(row_base + 12 + byte, kb * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+      };
+
+      auto store_k_contiguous = [&](int row, int kb_base, uint32_t word) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < ScaleVecBytes; ++byte) {
+          sSFA(row, (kb_base + byte) * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+      };
+
+      if (params.a_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose)) {
+        constexpr int RowVectors = TileM / 16;
+        for (int idx = lane; idx < KBlocks * RowVectors; idx += 32) {
+          int kb = idx / RowVectors;
+          int row_vec = idx - kb * RowVectors;
+          int row_base = row_vec * 16;
+          int64_t scale_offset =
+              static_cast<int64_t>(k_base_block + kb) * params.sfa_ld + (m_base + row_base);
+          uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_SFA_u8 + scale_offset);
+          store_m_contiguous(row_base, kb, chunk);
+        }
+      } else {
+        constexpr int KBlockVectors = KBlocks / ScaleVecBytes;
+        for (int idx = lane; idx < TileM * KBlockVectors; idx += 32) {
+          int row = idx / KBlockVectors;
+          int kb_vec = idx - row * KBlockVectors;
+          int kb_base = kb_vec * ScaleVecBytes;
+          int64_t scale_offset =
+              static_cast<int64_t>(m_base + row) * params.sfa_ld + k_base_block + kb_base;
+          uint32_t word = *reinterpret_cast<uint32_t const*>(ptr_SFA_u8 + scale_offset);
+          store_k_contiguous(row, kb_base, word);
+        }
+      }
+    };
+
+    auto load_payload_a = [&](int write_stage, int k_tile) {
+      static_assert(IsF8F6F4, "cppmega compact direct payload loader only supports byte-packed SM120 f8/f6/f4 operands");
+      constexpr int TileM = int(size<0>(TileShape{}));
+      constexpr int TileK = int(size<2>(TileShape{}));
+      constexpr int VecBytes = 16;
+      int m_base = m_coord_i * TileM;
+      int k_base = k_tile * TileK;
+      int lane = thread_idx & 31;
+      auto ptr_A = reinterpret_cast<uint8_t const*>(params.ptr_A);
+
+      auto store_m_word = [&](int row_base, int kk, int byte_base, uint32_t word) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sA(row_base + byte_base + byte, kk, write_stage) =
+              static_cast<SmemAllocTypeA>((word >> (8 * byte)) & 0xffu);
+        }
+      };
+      auto store_m_contiguous = [&](int row_base, int kk, uint4 chunk) {
+        store_m_word(row_base, kk, 0, chunk.x);
+        store_m_word(row_base, kk, 4, chunk.y);
+        store_m_word(row_base, kk, 8, chunk.z);
+        store_m_word(row_base, kk, 12, chunk.w);
+      };
+
+      constexpr int RowVectors = TileM / VecBytes;
+      for (int idx = lane; idx < TileK * RowVectors; idx += 32) {
+        int kk = idx / RowVectors;
+        int row_vec = idx - kk * RowVectors;
+        int row_base = row_vec * VecBytes;
+        int64_t payload_offset =
+            static_cast<int64_t>(k_base + kk) * params.a_data_ld + (m_base + row_base);
+        uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_A + payload_offset);
+        store_m_contiguous(row_base, kk, chunk);
+      }
+    };
+
+    CUTLASS_PRAGMA_NO_UNROLL
+    for ( ; k_tile_count > 0; --k_tile_count) {
+      pipeline.producer_acquire(smem_pipe_write);
+
+      int write_stage = smem_pipe_write.index();
+      load_sfa(write_stage, *k_tile_iter);
+      __syncwarp();
+
+      bool manual_payload =
+          params.manual_payload_load &&
+          params.a_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose);
+      using BarrierType = typename MainloopPipelineMK::ProducerBarrierType;
+      BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
+      uint32_t manual_transaction_bytes = params.scale_transaction_bytes_mk;
+      if (manual_payload) {
+        load_payload_a(write_stage, *k_tile_iter);
+        manual_transaction_bytes += params.payload_transaction_bytes_mk;
+      } else if (lane_predicate) {
+        copy(params.tma_load_a.with(*tma_barrier), tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,write_stage));
+      }
+      __syncwarp();
+      cutlass::arch::fence_view_async_shared();
+      __syncwarp();
+      if (lane_predicate) {
+        cutlass::arch::ClusterTransactionBarrier::complete_transaction(
+            tma_barrier, block_rank_in_cluster, manual_transaction_bytes, 1);
+      }
+
+      ++k_tile_iter;
+      ++smem_pipe_write;
+    }
+  }
+
+  // B/SFB half of the asymmetric producer path.
+  template <
+    class LoadInputs,
+    class KTileIterator, class BlockCoord
+  >
+  CUTLASS_DEVICE void
+  load_NK(
+      Params const& params,
+      MainloopPipelineNK pipeline,
+      PipelineStateNK smem_pipe_write,
+      LoadInputs const& load_inputs,
+      BlockCoord const& blk_coord,
+      KTileIterator k_tile_iter, int k_tile_count,
+      int thread_idx,
+      uint32_t block_rank_in_cluster,
+      TensorStorage& shared_tensors) {
+    int lane_predicate = cute::elect_one_sync();
+
+    Tensor sB = make_tensor(make_smem_ptr(shared_tensors.smem_B.begin()), SmemLayoutB{});
+    Tensor sSFB = make_tensor(make_smem_ptr(shared_tensors.smem_SFB.begin()), SmemLayoutSFB{});
+
+    auto [gA_mkl, gB_nkl] = load_inputs;
+    (void)gA_mkl;
+
+    auto block_tma_b = params.tma_load_b.get_slice(0);
+
+    auto [m_coord, n_coord, k_coord, l_coord] = blk_coord;
+    (void)m_coord;
+    (void)k_coord;
+    Tensor gB = gB_nkl(_,_,n_coord,_,l_coord);
+
+    Tensor tBgB = block_tma_b.partition_S(gB);
+    Tensor tBsB = block_tma_b.partition_D(sB);
+
+    int n_coord_i = int(n_coord);
+
+    auto load_sfb = [&](int write_stage, int k_tile) {
+      constexpr int TileN = int(size<1>(TileShape{}));
+      constexpr int TileK = int(size<2>(TileShape{}));
+      constexpr int Vec = SFVecSize;
+      constexpr int KBlocks = TileK / Vec;
+      constexpr int ScaleVecBytes = 4;
+      static_assert(KBlocks % ScaleVecBytes == 0, "KBlocks must be divisible by scale vector width");
+      int n_base = n_coord_i * TileN;
+      int k_base_block = k_tile * KBlocks;
+      int lane = thread_idx & 31;
+      auto ptr_SFB_u8 = reinterpret_cast<uint8_t const*>(params.ptr_SFB);
+
+      auto store_n_contiguous = [&](int row_base, int kb, uint4 chunk) {
+        uint32_t word = chunk.x;
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sSFB(row_base + byte, kb * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+        word = chunk.y;
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sSFB(row_base + 4 + byte, kb * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+        word = chunk.z;
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sSFB(row_base + 8 + byte, kb * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+        word = chunk.w;
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sSFB(row_base + 12 + byte, kb * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+      };
+
+      auto store_k_contiguous = [&](int row, int kb_base, uint32_t word) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < ScaleVecBytes; ++byte) {
+          sSFB(row, (kb_base + byte) * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+      };
+
+      if (params.b_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose)) {
+        constexpr int RowVectors = TileN / 16;
+        for (int idx = lane; idx < KBlocks * RowVectors; idx += 32) {
+          int kb = idx / RowVectors;
+          int row_vec = idx - kb * RowVectors;
+          int row_base = row_vec * 16;
+          int64_t scale_offset =
+              static_cast<int64_t>(k_base_block + kb) * params.sfb_ld + (n_base + row_base);
+          uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_SFB_u8 + scale_offset);
+          store_n_contiguous(row_base, kb, chunk);
+        }
+      } else {
+        constexpr int KBlockVectors = KBlocks / ScaleVecBytes;
+        for (int idx = lane; idx < TileN * KBlockVectors; idx += 32) {
+          int row = idx / KBlockVectors;
+          int kb_vec = idx - row * KBlockVectors;
+          int kb_base = kb_vec * ScaleVecBytes;
+          int64_t scale_offset =
+              static_cast<int64_t>(n_base + row) * params.sfb_ld + k_base_block + kb_base;
+          uint32_t word = *reinterpret_cast<uint32_t const*>(ptr_SFB_u8 + scale_offset);
+          store_k_contiguous(row, kb_base, word);
+        }
+      }
+    };
+
+    auto load_payload_b = [&](int write_stage, int k_tile) {
+      static_assert(IsF8F6F4, "cppmega compact direct payload loader only supports byte-packed SM120 f8/f6/f4 operands");
+      constexpr int TileN = int(size<1>(TileShape{}));
+      constexpr int TileK = int(size<2>(TileShape{}));
+      constexpr int VecBytes = 16;
+      int n_base = n_coord_i * TileN;
+      int k_base = k_tile * TileK;
+      int lane = thread_idx & 31;
+      auto ptr_B = reinterpret_cast<uint8_t const*>(params.ptr_B);
+
+      auto store_n_word = [&](int row_base, int kk, int byte_base, uint32_t word) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sB(row_base + byte_base + byte, kk, write_stage) =
+              static_cast<SmemAllocTypeB>((word >> (8 * byte)) & 0xffu);
+        }
+      };
+      auto store_n_contiguous = [&](int row_base, int kk, uint4 chunk) {
+        store_n_word(row_base, kk, 0, chunk.x);
+        store_n_word(row_base, kk, 4, chunk.y);
+        store_n_word(row_base, kk, 8, chunk.z);
+        store_n_word(row_base, kk, 12, chunk.w);
+      };
+
+      constexpr int RowVectors = TileN / VecBytes;
+      for (int idx = lane; idx < TileK * RowVectors; idx += 32) {
+        int kk = idx / RowVectors;
+        int row_vec = idx - kk * RowVectors;
+        int row_base = row_vec * VecBytes;
+        int64_t payload_offset =
+            static_cast<int64_t>(k_base + kk) * params.b_data_ld + (n_base + row_base);
+        uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_B + payload_offset);
+        store_n_contiguous(row_base, kk, chunk);
+      }
+    };
+
+    CUTLASS_PRAGMA_NO_UNROLL
+    for ( ; k_tile_count > 0; --k_tile_count) {
+      pipeline.producer_acquire(smem_pipe_write);
+
+      int write_stage = smem_pipe_write.index();
+      load_sfb(write_stage, *k_tile_iter);
+      __syncwarp();
+
+      bool manual_payload =
+          params.manual_payload_load &&
+          params.b_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose);
+      using BarrierType = typename MainloopPipelineNK::ProducerBarrierType;
+      BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
+      uint32_t manual_transaction_bytes = params.scale_transaction_bytes_nk;
+      if (manual_payload) {
+        load_payload_b(write_stage, *k_tile_iter);
+        manual_transaction_bytes += params.payload_transaction_bytes_nk;
+      } else if (lane_predicate) {
+        copy(params.tma_load_b.with(*tma_barrier), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,write_stage));
+      }
+      __syncwarp();
+      cutlass::arch::fence_view_async_shared();
+      __syncwarp();
+      if (lane_predicate) {
+        cutlass::arch::ClusterTransactionBarrier::complete_transaction(
+            tma_barrier, block_rank_in_cluster, manual_transaction_bytes, 1);
+      }
+
+      ++k_tile_iter;
+      ++smem_pipe_write;
+    }
   }
 
   /// Perform a Producer Epilogue to prevent early exit of blocks in a Cluster
