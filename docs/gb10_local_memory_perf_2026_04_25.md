@@ -131,9 +131,16 @@ memory by about `5.33 GiB`.
 
 ## Profiler Notes
 
-PyTorch profiler was the reliable end-to-end capture in this session. The
+PyTorch profiler was the reliable end-to-end capture in this session. The old
 embedded `nsys` path produced reports but still missed part of the child CUDA
 timeline under `torch.distributed.run`.
+
+The local launcher now profiles the rank-0 worker through a `torchrun
+--no-python` wrapper and defaults Nsight Systems to `--nsys-capture-mode full`.
+Do not rely on the old implicit `cudaProfilerApi` range mode for Nsight Systems
+kernel tables on GB10/CUDA 13.2; it can collect CUDA launch APIs while dropping
+incomplete CUPTI kernel activity records. Use `full` or `delay` for `nsys`, and
+reserve the Megatron `--cuda-profile` range for `ncu`.
 
 Useful `nsys` artifacts:
 
@@ -163,9 +170,8 @@ _permute_kernel:                704.9 ms
 _sort_chunks_by_map_kernel:     481.9 ms
 ```
 
-Treat those `nsys` numbers as directional until we get a cleaner child-process
-capture or profile the training process without the `torch.distributed.run`
-wrapper.
+Treat the older `nsys` numbers above as directional. Reprofile with the typed
+launcher before using kernel percentages for new decisions.
 
 ## Next Bottlenecks
 

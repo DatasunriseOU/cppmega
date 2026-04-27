@@ -5,10 +5,7 @@
 #include <torch/extension.h>
 
 #include <cstdlib>
-#include <mutex>
 #include <string>
-#include <tuple>
-#include <unordered_map>
 
 #include "cute/tensor.hpp"
 
@@ -284,60 +281,6 @@ void validate_direct_operand(
 }
 
 // =======================================================================
-// Workspace cache (CUTLASS workspace only; no native-SF prepack)
-// =======================================================================
-
-struct WorkspaceCacheEntry {
-  at::Tensor workspace;
-};
-
-using WorkspaceCacheKey = std::tuple<int64_t, uintptr_t, int64_t>;
-
-struct WorkspaceCacheKeyHash {
-  std::size_t operator()(WorkspaceCacheKey const& key) const {
-    auto h = std::hash<int64_t>{}(std::get<0>(key));
-    h ^= std::hash<uintptr_t>{}(std::get<1>(key)) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-    h ^= std::hash<int64_t>{}(std::get<2>(key)) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-    return h;
-  }
-};
-
-std::mutex& ws_cache_mutex() {
-  static std::mutex mutex;
-  return mutex;
-}
-
-std::unordered_map<WorkspaceCacheKey, WorkspaceCacheEntry, WorkspaceCacheKeyHash>& ws_cache() {
-  static std::unordered_map<WorkspaceCacheKey, WorkspaceCacheEntry, WorkspaceCacheKeyHash> cache;
-  return cache;
-}
-
-at::Tensor get_cached_workspace(
-    int64_t device_index,
-    cudaStream_t stream,
-    int64_t workspace_size,
-    at::TensorOptions const& byte_options) {
-  if (workspace_size == 0) {
-    return {};
-  }
-  char const* env = std::getenv("CPPMEGA_CUTLASS_MXFP8_CACHE");
-  bool enabled = (env == nullptr || std::string(env) != "0");
-  if (!enabled) {
-    return at::empty({workspace_size}, byte_options);
-  }
-  WorkspaceCacheKey key{device_index, reinterpret_cast<uintptr_t>(stream), workspace_size};
-  std::lock_guard<std::mutex> lock(ws_cache_mutex());
-  auto& cache = ws_cache();
-  auto it = cache.find(key);
-  if (it != cache.end()) {
-    return it->second.workspace;
-  }
-  auto tensor = at::empty({workspace_size}, byte_options);
-  cache[key] = WorkspaceCacheEntry{tensor};
-  return tensor;
-}
-
-// =======================================================================
 // Templated GEMM runners using compact-scale mainloop
 // =======================================================================
 
@@ -349,7 +292,7 @@ at::Tensor run_compact_scale_gemm_impl(
     at::Tensor const& SFB_u8,
     int m, int n, int k,
     at::Tensor& D,
-    float alpha, float beta, bool accumulate,
+    float alpha, float beta,
     cudaStream_t stream) {
 
   using StrideA = typename Gemm::GemmKernel::StrideA;
@@ -368,8 +311,10 @@ at::Tensor run_compact_scale_gemm_impl(
   auto ptr_SFA = reinterpret_cast<KernelElementSF const*>(SFA_u8.data_ptr<uint8_t>());
   auto ptr_SFB = reinterpret_cast<KernelElementSF const*>(SFB_u8.data_ptr<uint8_t>());
   auto ptr_D = reinterpret_cast<ElementD*>(D.data_ptr<at::BFloat16>());
-  auto ptr_C = ptr_D;
-  float beta_f = accumulate ? beta : 0.0f;
+  // When beta == 0 the C operand is logically unused. Pass nullptr so the
+  // CUTLASS epilogue skips the C load entirely; otherwise an uninitialized
+  // out= tensor holding NaN could propagate as NaN * 0 = NaN.
+  ElementD* ptr_C = (beta == 0.0f) ? nullptr : ptr_D;
 
   typename Gemm::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kGemm,
@@ -382,7 +327,7 @@ at::Tensor run_compact_scale_gemm_impl(
           static_cast<int32_t>(kOperandRowwise), static_cast<int64_t>(A_u8.size(1)),
           static_cast<int32_t>(kOperandRowwise), static_cast<int64_t>(B_u8.size(1)),
       },
-      {{alpha, beta_f}, ptr_C, stride_C, ptr_D, stride_D}};
+      {{alpha, beta}, ptr_C, stride_C, ptr_D, stride_D}};
 
   Gemm gemm;
   cutlass::Status can_status = gemm.can_implement(arguments);
@@ -391,10 +336,11 @@ at::Tensor run_compact_scale_gemm_impl(
               cutlass_status_name(can_status));
 
   size_t workspace_size = Gemm::get_workspace_size(arguments);
-  at::Tensor ws = get_cached_workspace(
-      A_u8.device().index(), stream,
-      static_cast<int64_t>(workspace_size),
-      at::TensorOptions().device(A_u8.device()).dtype(at::kByte));
+  at::Tensor ws;
+  if (workspace_size > 0) {
+    ws = at::empty({static_cast<int64_t>(workspace_size)},
+                   at::TensorOptions().device(A_u8.device()).dtype(at::kByte));
+  }
   void* workspace_ptr = workspace_size > 0 ? ws.data_ptr<uint8_t>() : nullptr;
   cutlass::Status init_status = gemm.initialize(arguments, workspace_ptr, stream);
   TORCH_CHECK(init_status == cutlass::Status::kSuccess,
@@ -418,7 +364,7 @@ at::Tensor run_compact_direct_gemm_impl(
     int64_t a_source, int64_t a_data_ld, int64_t a_scale_ld,
     int64_t b_source, int64_t b_data_ld, int64_t b_scale_ld,
     at::Tensor& D,
-    float alpha, float beta, bool accumulate,
+    float alpha, float beta,
     cudaStream_t stream) {
 
   using StrideA = typename Gemm::GemmKernel::StrideA;
@@ -437,8 +383,8 @@ at::Tensor run_compact_direct_gemm_impl(
   auto ptr_SFA = reinterpret_cast<KernelElementSF const*>(SFA_u8.data_ptr<uint8_t>());
   auto ptr_SFB = reinterpret_cast<KernelElementSF const*>(SFB_u8.data_ptr<uint8_t>());
   auto ptr_D = reinterpret_cast<ElementD*>(D.data_ptr<at::BFloat16>());
-  auto ptr_C = ptr_D;
-  float beta_f = accumulate ? beta : 0.0f;
+  // See run_compact_scale_gemm_impl: skip the C load when beta == 0.
+  ElementD* ptr_C = (beta == 0.0f) ? nullptr : ptr_D;
 
   typename Gemm::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kGemm,
@@ -450,7 +396,7 @@ at::Tensor run_compact_direct_gemm_impl(
           static_cast<int32_t>(a_source), a_data_ld,
           static_cast<int32_t>(b_source), b_data_ld,
       },
-      {{alpha, beta_f}, ptr_C, stride_C, ptr_D, stride_D}};
+      {{alpha, beta}, ptr_C, stride_C, ptr_D, stride_D}};
 
   Gemm gemm;
   cutlass::Status can_status = gemm.can_implement(arguments);
@@ -459,10 +405,11 @@ at::Tensor run_compact_direct_gemm_impl(
               cutlass_status_name(can_status));
 
   size_t workspace_size = Gemm::get_workspace_size(arguments);
-  at::Tensor ws = get_cached_workspace(
-      A_u8.device().index(), stream,
-      static_cast<int64_t>(workspace_size),
-      at::TensorOptions().device(A_u8.device()).dtype(at::kByte));
+  at::Tensor ws;
+  if (workspace_size > 0) {
+    ws = at::empty({static_cast<int64_t>(workspace_size)},
+                   at::TensorOptions().device(A_u8.device()).dtype(at::kByte));
+  }
   void* workspace_ptr = workspace_size > 0 ? ws.data_ptr<uint8_t>() : nullptr;
   cutlass::Status init_status = gemm.initialize(arguments, workspace_ptr, stream);
   TORCH_CHECK(init_status == cutlass::Status::kSuccess,
@@ -518,12 +465,15 @@ at::Tensor cutlass_mxfp8_tn_gemm_compact_scale_cuda(
       ? out.view({m, n})
       : at::empty({m, n}, at::TensorOptions().device(A_u8.device()).dtype(at::kBFloat16));
 
+  // beta-gating against accumulate is enforced in the python wrapper; trust the
+  // value as passed here.
+  (void)accumulate;
   float alpha_f = static_cast<float>(alpha);
-  float beta_f = accumulate ? static_cast<float>(beta) : 0.0f;
+  float beta_f = static_cast<float>(beta);
 
   return run_compact_scale_gemm_impl<CompactScaleGemm>(
       A_u8, SFA_u8, B_u8, SFB_u8, m, n, k, D,
-      alpha_f, beta_f, accumulate, stream);
+      alpha_f, beta_f, stream);
 #endif
 }
 
@@ -574,14 +524,17 @@ at::Tensor cutlass_mxfp8_tn_gemm_compact_direct_cuda(
       ? out.view({m, n})
       : at::empty({m, n}, at::TensorOptions().device(A_u8.device()).dtype(at::kBFloat16));
 
+  // beta-gating against accumulate is enforced in the python wrapper; trust the
+  // value as passed here.
+  (void)accumulate;
   float alpha_f = static_cast<float>(alpha);
-  float beta_f = accumulate ? static_cast<float>(beta) : 0.0f;
+  float beta_f = static_cast<float>(beta);
 
   return run_compact_direct_gemm_impl<CompactScaleGemm>(
       A_u8, SFA_u8, B_u8, SFB_u8, m, n, k,
       a_source, a_data_ld, a_scale_ld,
       b_source, b_data_ld, b_scale_ld,
-      D, alpha_f, beta_f, accumulate, stream);
+      D, alpha_f, beta_f, stream);
 #endif
 }
 
@@ -632,13 +585,16 @@ at::Tensor cutlass_mxfp8_tn_gemm_compact_direct_asym_cuda(
       ? out.view({m, n})
       : at::empty({m, n}, at::TensorOptions().device(A_u8.device()).dtype(at::kBFloat16));
 
+  // beta-gating against accumulate is enforced in the python wrapper; trust the
+  // value as passed here.
+  (void)accumulate;
   float alpha_f = static_cast<float>(alpha);
-  float beta_f = accumulate ? static_cast<float>(beta) : 0.0f;
+  float beta_f = static_cast<float>(beta);
 
   return run_compact_direct_gemm_impl<CompactScaleAsymmetricGemm>(
       A_u8, SFA_u8, B_u8, SFB_u8, m, n, k,
       a_source, a_data_ld, a_scale_ld,
       b_source, b_data_ld, b_scale_ld,
-      D, alpha_f, beta_f, accumulate, stream);
+      D, alpha_f, beta_f, stream);
 #endif
 }

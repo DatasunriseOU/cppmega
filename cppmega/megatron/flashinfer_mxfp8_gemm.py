@@ -45,6 +45,10 @@ _CUDA_SOURCE = r"""
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_UINT8(x) TORCH_CHECK(x.scalar_type() == at::ScalarType::Byte, #x " must be uint8")
 
+// GEMM-swizzled scale factor index for SM120 TMA 128x4 scale tiles.
+// This replicates CUTLASS's TMA swizzle descriptor layout. If CUTLASS
+// changes its swizzle pattern for a new SM architecture, this function must be
+// updated in lockstep or scale factors will be silently misindexed.
 __device__ __forceinline__ int64_t gemm_swizzled_scale_idx(
     const int64_t i,
     const int64_t j,
@@ -129,7 +133,17 @@ void mxfp8_swizzle_rowwise_scale_cuda(
 
 @lru_cache(maxsize=1)
 def _load_cuda_ext() -> Any:
-    os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.1")
+    if "TORCH_CUDA_ARCH_LIST" not in os.environ:
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability()
+            if (major, minor) == (12, 1):
+                os.environ["TORCH_CUDA_ARCH_LIST"] = "12.1a"
+            elif (major, minor) == (12, 0):
+                os.environ["TORCH_CUDA_ARCH_LIST"] = "12.0a"
+            else:
+                os.environ["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}"
+        else:
+            os.environ["TORCH_CUDA_ARCH_LIST"] = "12.1a"
     return load_inline(
         name="cppmega_flashinfer_mxfp8_scale_cuda",
         cpp_sources=[_CPP_SOURCE],
@@ -140,12 +154,29 @@ def _load_cuda_ext() -> Any:
     )
 
 
+@lru_cache(maxsize=1)
+def _load_flashinfer_mm() -> Any:
+    from flashinfer import mm_mxfp8
+
+    return mm_mxfp8
+
+
 def _rowwise_matrix(tensor: Any) -> tuple[torch.Tensor, torch.Tensor, bool]:
     data = getattr(tensor, "_rowwise_data", None)
     scale = getattr(tensor, "_rowwise_scale_inv", None)
     fp8_dtype = getattr(tensor, "_fp8_dtype", None)
-    if "E4M3" not in str(fp8_dtype):
-        raise ValueError(f"FlashInfer MXFP8 backend expects E4M3 payloads, got {fp8_dtype}")
+    try:
+        import transformer_engine_torch as tex
+
+        if fp8_dtype != tex.DType.kFloat8E4M3:
+            raise ValueError(
+                f"FlashInfer MXFP8 backend expects E4M3 payloads, got {fp8_dtype}"
+            )
+    except ImportError:
+        if "E4M3" not in str(fp8_dtype):
+            raise ValueError(
+                f"FlashInfer MXFP8 backend expects E4M3 payloads, got {fp8_dtype}"
+            )
     if not isinstance(data, torch.Tensor) or not isinstance(scale, torch.Tensor):
         raise ValueError("MXFP8 FlashInfer backend requires rowwise data and scales")
     if data.dtype != torch.uint8 or scale.dtype != torch.uint8:
@@ -218,6 +249,16 @@ def _scale_for_rowwise_matrix(
     with_gemm_swizzled_scales: bool,
 ) -> torch.Tensor:
     if with_gemm_swizzled_scales:
+        k_blocks = (cols + 31) // 32
+        padded_rows = ((rows + 127) // 128) * 128
+        padded_k_blocks = ((k_blocks + 3) // 4) * 4
+        expected = padded_rows * padded_k_blocks
+        if scale.numel() != expected:
+            raise ValueError(
+                f"pre-swizzled scale has {scale.numel()} elements, "
+                f"expected {expected} (padded_rows={padded_rows}, "
+                f"padded_k_blocks={padded_k_blocks})"
+            )
         return scale.reshape(-1)
     return swizzle_rowwise_scale(scale, rows, cols)
 
@@ -299,9 +340,7 @@ def _mm_mxfp8(
     out: torch.Tensor | None,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    from flashinfer import mm_mxfp8
-
-    return mm_mxfp8(
+    return _load_flashinfer_mm()(
         _as_fp8_payload(a_data),
         _as_fp8_payload(b_data),
         a_scale,
