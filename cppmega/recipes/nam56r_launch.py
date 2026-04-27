@@ -18,8 +18,12 @@ def build_nam56r_megatron_native_args(
     enable_mla: bool = True,
     enable_mtp: bool = False,
     mtp_mode: str = "gpt",
+    mtp_num_predictors: int = 1,
     enable_fim: bool = False,
     enable_moe: bool = False,
+    moe_expert_model_parallel_size: int = 1,
+    moe_token_dispatcher_type: str = "flex",
+    moe_router_dtype: str | None = "fp32",
     enable_dsa: bool = False,
     dsa_indexer_dtype: str = "bf16",
     dsa_indexer_topk: int = 256,
@@ -37,8 +41,12 @@ def build_nam56r_megatron_native_args(
         use_mla=enable_mla,
         use_mtp=enable_mtp,
         mtp_mode=mtp_mode,
+        mtp_num_predictors=mtp_num_predictors,
         use_fim=enable_fim,
         use_moe=enable_moe,
+        moe_expert_model_parallel_size=moe_expert_model_parallel_size,
+        moe_token_dispatcher_type=moe_token_dispatcher_type,
+        moe_router_dtype=moe_router_dtype,
         use_dsa=enable_dsa,
         dsa_indexer_dtype=dsa_indexer_dtype,
         dsa_indexer_topk=dsa_indexer_topk,
@@ -103,11 +111,29 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pattern", default="AEMEAEMEAEMR")
     parser.add_argument("--depth", type=int, default=52)
     parser.add_argument("--mtp-depths", type=int, default=0)
+    parser.add_argument(
+        "--mtp-num-predictors",
+        type=int,
+        default=None,
+        help="MTP predictor count for --mtp-num-layers; defaults to --mtp-depths when set",
+    )
     parser.add_argument("--enable-mla", action="store_true")
     parser.add_argument("--enable-mtp", action="store_true")
     parser.add_argument("--mtp-mode", choices=("gpt", "hybrid"), default="gpt")
     parser.add_argument("--enable-fim", action="store_true")
     parser.add_argument("--enable-moe", action="store_true")
+    parser.add_argument("--moe-expert-model-parallel-size", type=int, default=1)
+    parser.add_argument(
+        "--moe-token-dispatcher-type",
+        choices=("flex", "alltoall", "allgather"),
+        default="flex",
+    )
+    parser.add_argument(
+        "--moe-router-dtype",
+        choices=("fp32", "none"),
+        default="fp32",
+        help="Router probability dtype flag; 'none' omits --moe-router-dtype",
+    )
     parser.add_argument("--enable-dsa", action="store_true")
     parser.add_argument(
         "--dsa-indexer-dtype",
@@ -130,8 +156,16 @@ def main() -> int:
         enable_mla=args.enable_mla,
         enable_mtp=args.enable_mtp,
         mtp_mode=args.mtp_mode,
+        mtp_num_predictors=(
+            args.mtp_num_predictors
+            if args.mtp_num_predictors is not None
+            else max(args.mtp_depths, 1)
+        ),
         enable_fim=args.enable_fim,
         enable_moe=args.enable_moe,
+        moe_expert_model_parallel_size=args.moe_expert_model_parallel_size,
+        moe_token_dispatcher_type=args.moe_token_dispatcher_type,
+        moe_router_dtype=None if args.moe_router_dtype == "none" else args.moe_router_dtype,
         enable_dsa=args.enable_dsa,
         dsa_indexer_dtype=args.dsa_indexer_dtype,
     )

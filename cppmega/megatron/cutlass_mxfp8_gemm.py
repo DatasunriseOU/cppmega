@@ -2,8 +2,9 @@
 
 This module is intentionally narrow: it exposes the SM120/SM121 native MXFP8
 TN GEMM path behind a Python function that accepts TE-style MXFP8 rowwise
-payloads and compact rowwise E8M0 scales.  The scale tensors are repacked to
-CUTLASS' native SM1xx scale layout inside the extension.
+payloads and compact rowwise E8M0 scales.  By default the extension uses a
+cppmega CUTLASS mainloop fork that reads compact scales directly; the older
+native-scale prepack path remains available for A/B profiling.
 """
 
 from __future__ import annotations
@@ -18,6 +19,15 @@ import torch
 _CUDA_EXT: Any | None = None
 _CUDA_EXT_ERROR: BaseException | None = None
 _CUTLASS_ROOT = Path(os.environ.get("CPPMEGA_CUTLASS_ROOT", "/home/dave/vllm/.deps/cutlass-src"))
+_SCALE_BACKEND = os.environ.get("CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND", "compact")
+if _SCALE_BACKEND not in ("compact", "prepack"):
+    raise RuntimeError(
+        "unsupported CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND="
+        f"{_SCALE_BACKEND!r}; expected compact or prepack"
+    )
+
+_SOURCE_ROWWISE = 0
+_SOURCE_COLUMNWISE_TRANSPOSE = 1
 
 
 def _as_uint8_contiguous(tensor: torch.Tensor) -> torch.Tensor:
@@ -124,7 +134,8 @@ def tn_gemm(
         use_out = True
 
     ext = _load_cuda_ext()
-    return ext.tn_gemm(
+    entrypoint = ext.tn_gemm_compact_scale if _SCALE_BACKEND == "compact" else ext.tn_gemm
+    return entrypoint(
         _as_uint8_contiguous(a_rowwise_data),
         _as_uint8_contiguous(a_rowwise_scale_inv),
         _as_uint8_contiguous(b_rowwise_data),
@@ -137,4 +148,173 @@ def tn_gemm(
         bool(accumulate),
         float(alpha),
         float(1.0 if beta is None and accumulate else (0.0 if beta is None else beta)),
+    )
+
+
+def _prepare_out(
+    out: torch.Tensor | None,
+    m: int,
+    n: int,
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, bool]:
+    if out is None:
+        return torch.empty(0, device=device, dtype=torch.bfloat16), False
+    if out.dtype != torch.bfloat16:
+        raise TypeError(f"CUTLASS MXFP8 backend currently requires BF16 out, got {out.dtype}")
+    if out.numel() < m * n:
+        raise ValueError(f"out is too small for {m}x{n}")
+    if not out.is_contiguous():
+        raise ValueError("out must be contiguous")
+    return out, True
+
+
+def _tn_gemm_compact_direct(
+    a_data: torch.Tensor,
+    a_scale_inv: torch.Tensor,
+    b_data: torch.Tensor,
+    b_scale_inv: torch.Tensor,
+    *,
+    m: int,
+    n: int,
+    k: int,
+    a_source: int,
+    a_data_ld: int,
+    a_scale_ld: int,
+    b_source: int,
+    b_data_ld: int,
+    b_scale_ld: int,
+    out: torch.Tensor | None = None,
+    accumulate: bool = False,
+    alpha: float = 1.0,
+    beta: float | None = None,
+) -> torch.Tensor:
+    if not is_supported_shape(m, n, k):
+        raise ValueError(f"unsupported CUTLASS MXFP8 GB10 shape {m}x{n}x{k}; require multiples of 128")
+    if a_source not in (_SOURCE_ROWWISE, _SOURCE_COLUMNWISE_TRANSPOSE):
+        raise ValueError(f"unsupported A source {a_source}")
+    if b_source not in (_SOURCE_ROWWISE, _SOURCE_COLUMNWISE_TRANSPOSE):
+        raise ValueError(f"unsupported B source {b_source}")
+
+    out_arg, use_out = _prepare_out(out, m, n, device=a_data.device)
+    ext = _load_cuda_ext()
+    return ext.tn_gemm_compact_direct(
+        _as_uint8_contiguous(a_data),
+        _as_uint8_contiguous(a_scale_inv),
+        _as_uint8_contiguous(b_data),
+        _as_uint8_contiguous(b_scale_inv),
+        m,
+        n,
+        k,
+        int(a_source),
+        int(a_data_ld),
+        int(a_scale_ld),
+        int(b_source),
+        int(b_data_ld),
+        int(b_scale_ld),
+        out_arg,
+        use_out,
+        bool(accumulate),
+        float(alpha),
+        float(1.0 if beta is None and accumulate else (0.0 if beta is None else beta)),
+    )
+
+
+def dgrad_nn_gemm(
+    dy_rowwise_data: torch.Tensor,
+    dy_rowwise_scale_inv: torch.Tensor,
+    weight_colwise_data: torch.Tensor,
+    weight_colwise_scale_inv: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    accumulate: bool = False,
+    alpha: float = 1.0,
+    beta: float | None = None,
+) -> torch.Tensor:
+    """Run dgrad NN as TN without materializing ``weight.T``.
+
+    Computes ``dy[M, N] @ weight[N, K]``.  ``dy`` must be TE compact rowwise;
+    ``weight`` must be the original TE compact columnwise payload/scales.
+    """
+
+    if dy_rowwise_data.dim() != 2 or dy_rowwise_scale_inv.dim() != 2:
+        raise ValueError("dy rowwise payload/scales must be 2D")
+    if weight_colwise_data.dim() != 2 or weight_colwise_scale_inv.dim() != 2:
+        raise ValueError("weight columnwise payload/scales must be 2D")
+    m = int(dy_rowwise_data.shape[0])
+    k = int(dy_rowwise_data.shape[1])
+    if int(weight_colwise_data.shape[0]) != k:
+        raise ValueError(
+            "dgrad reduction mismatch: "
+            f"dy is {tuple(dy_rowwise_data.shape)}, weight is {tuple(weight_colwise_data.shape)}"
+        )
+    n = int(weight_colwise_data.shape[1])
+    return _tn_gemm_compact_direct(
+        dy_rowwise_data,
+        dy_rowwise_scale_inv,
+        weight_colwise_data,
+        weight_colwise_scale_inv,
+        m=m,
+        n=n,
+        k=k,
+        a_source=_SOURCE_ROWWISE,
+        a_data_ld=int(dy_rowwise_data.shape[1]),
+        a_scale_ld=int(dy_rowwise_scale_inv.shape[1]),
+        b_source=_SOURCE_COLUMNWISE_TRANSPOSE,
+        b_data_ld=int(weight_colwise_data.shape[1]),
+        b_scale_ld=int(weight_colwise_scale_inv.shape[1]),
+        out=out,
+        accumulate=accumulate,
+        alpha=alpha,
+        beta=beta,
+    )
+
+
+def wgrad_nt_gemm(
+    dy_colwise_data: torch.Tensor,
+    dy_colwise_scale_inv: torch.Tensor,
+    x_colwise_data: torch.Tensor,
+    x_colwise_scale_inv: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    accumulate: bool = False,
+    alpha: float = 1.0,
+    beta: float | None = None,
+) -> torch.Tensor:
+    """Run wgrad NT as TN without materializing ``dy.T`` or ``x.T``.
+
+    Computes ``dy.T[N, M] @ x[M, K]`` from original TE compact columnwise
+    payloads/scales for both operands.
+    """
+
+    if dy_colwise_data.dim() != 2 or dy_colwise_scale_inv.dim() != 2:
+        raise ValueError("dy columnwise payload/scales must be 2D")
+    if x_colwise_data.dim() != 2 or x_colwise_scale_inv.dim() != 2:
+        raise ValueError("x columnwise payload/scales must be 2D")
+    if int(dy_colwise_data.shape[0]) != int(x_colwise_data.shape[0]):
+        raise ValueError(
+            "wgrad reduction mismatch: "
+            f"dy is {tuple(dy_colwise_data.shape)}, x is {tuple(x_colwise_data.shape)}"
+        )
+    m = int(dy_colwise_data.shape[1])
+    n = int(x_colwise_data.shape[1])
+    k = int(dy_colwise_data.shape[0])
+    return _tn_gemm_compact_direct(
+        dy_colwise_data,
+        dy_colwise_scale_inv,
+        x_colwise_data,
+        x_colwise_scale_inv,
+        m=m,
+        n=n,
+        k=k,
+        a_source=_SOURCE_COLUMNWISE_TRANSPOSE,
+        a_data_ld=int(dy_colwise_data.shape[1]),
+        a_scale_ld=int(dy_colwise_scale_inv.shape[1]),
+        b_source=_SOURCE_COLUMNWISE_TRANSPOSE,
+        b_data_ld=int(x_colwise_data.shape[1]),
+        b_scale_ld=int(x_colwise_scale_inv.shape[1]),
+        out=out,
+        accumulate=accumulate,
+        alpha=alpha,
+        beta=beta,
     )

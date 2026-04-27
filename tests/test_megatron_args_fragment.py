@@ -61,11 +61,32 @@ def test_nam56r_launch_helper_uses_hybrid_mtp_fragment_for_mamba_lane():
     assert "--multi-token-prediction" not in fragment
 
 
+def test_nam56r_launch_helper_uses_requested_mtp_predictor_count():
+    plan = build_nam56r_feature_plan(
+        pattern="AEMEAEMEAEMR",
+        depth=52,
+        mtp_depths=2,
+    )
+    bundle = build_nam56r_megatron_native_args(
+        plan=plan,
+        enable_mtp=True,
+        mtp_mode="hybrid",
+        mtp_num_predictors=2,
+    )
+
+    assert "--mtp-num-layers 2" in bundle.to_shell_fragment()
+
+
 def test_nam56r_launch_cli_emits_native_fragment(capsys, monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["nam56r_launch", "--enable-mla", "--enable-dsa"])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["nam56r_launch", "--enable-mla", "--enable-dsa", "--enable-mtp", "--mtp-depths", "2"],
+    )
     exit_code = nam56r_launch.main()
     out = capsys.readouterr().out
 
     assert exit_code == 0
     assert "--multi-latent-attention" in out
     assert "--experimental-attention-variant dsa" in out
+    assert "--mtp-num-layers 2" in out

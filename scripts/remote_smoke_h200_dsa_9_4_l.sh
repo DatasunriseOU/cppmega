@@ -277,7 +277,9 @@ bundle = build_nam56r_megatron_native_args(
     enable_mla=True,
     enable_mtp=enable_mtp,
     mtp_mode="hybrid",
+    mtp_num_predictors=mtp_depths,
     enable_moe=True,
+    moe_expert_model_parallel_size=${EP_SIZE},
     enable_dsa=True,
 )
 print(bundle.to_shell_fragment())
@@ -285,20 +287,10 @@ PY
 )
 echo "NATIVE_ARGS (pre-sed): ${NATIVE_ARGS}"
 
-# Override --mtp-num-layers to match MTP_DEPTHS if >1.
-if [ "${MTP_DEPTHS}" -gt 1 ]; then
-  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--mtp-num-layers 1/--mtp-num-layers ${MTP_DEPTHS}/")
-fi
 
 # Override --expert-model-parallel-size to EP_SIZE (always runs for Stream L:
 # both variants set EP_SIZE >=2).
-if [ "${EP_SIZE}" != "1" ]; then
-  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--expert-model-parallel-size 1/--expert-model-parallel-size ${EP_SIZE}/")
-fi
 
-# Strip --dsa-indexer-dtype (cppmega-only flag not registered in Megatron's
-# argparser; actual FP8 behavior is controlled by CPPMEGA_DSA_INDEXER_DTYPE env).
-NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed 's/--dsa-indexer-dtype [a-z0-9]*//')
 
 # Confirm the substitution actually happened.
 if ! echo "${NATIVE_ARGS}" | grep -q -- "--expert-model-parallel-size ${EP_SIZE}"; then

@@ -288,7 +288,10 @@ bundle = build_nam56r_megatron_native_args(
     enable_mla=True,
     enable_mtp=enable_mtp,
     mtp_mode="hybrid",
+    mtp_num_predictors=mtp_depths,
     enable_moe=True,
+    moe_token_dispatcher_type="alltoall",
+    moe_router_dtype=None,
     enable_dsa=True,
 )
 print(bundle.to_shell_fragment())
@@ -296,15 +299,7 @@ PY
 )
 echo "NATIVE_ARGS (pre-sed): ${NATIVE_ARGS}"
 
-if [ "${MTP_DEPTHS}" -gt 1 ]; then
-  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--mtp-num-layers 1/--mtp-num-layers ${MTP_DEPTHS}/")
-fi
-
-NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed 's/ *--dsa-indexer-dtype [a-z0-9]*//')
-
-# EP=1: flex dispatcher requires TP*EP > 1, use alltoall
-NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--moe-token-dispatcher-type flex/--moe-token-dispatcher-type alltoall/")
-NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/ --moe-router-dtype fp32//")
+# EP=1: render alltoall directly through the helper.
 MOE_EXTRA_FLAGS="--moe-pad-expert-input-to-capacity --moe-expert-capacity-factor 1.0"
 
 echo "NATIVE_ARGS (post-sed): ${NATIVE_ARGS}"

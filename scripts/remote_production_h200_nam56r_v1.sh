@@ -324,24 +324,17 @@ bundle = build_nam56r_megatron_native_args(
     enable_mla=True,
     enable_mtp=enable_mtp,
     mtp_mode="hybrid",
+    mtp_num_predictors=mtp_depths,
     enable_moe=True,
     enable_dsa=True,
+    dsa_indexer_loss_coeff=${DSA_LOSS_COEFF},
 )
 print(bundle.to_shell_fragment())
 PY
 )
 echo "NATIVE_ARGS (pre-sed): ${NATIVE_ARGS}"
 
-# Override --mtp-num-layers to match MTP_DEPTHS if >1.
-if [ "${MTP_DEPTHS}" -gt 1 ]; then
-  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--mtp-num-layers 1/--mtp-num-layers ${MTP_DEPTHS}/")
-fi
 
-# Strip --dsa-indexer-dtype (cppmega-only flag not registered in Megatron's argparser).
-NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed 's/ *--dsa-indexer-dtype [a-z0-9]*//')
-
-# Override --dsa-indexer-loss-coeff to production value (0.001).
-NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--dsa-indexer-loss-coeff [0-9.]*/--dsa-indexer-loss-coeff ${DSA_LOSS_COEFF}/")
 
 # Confirm loss_coeff was set correctly.
 if ! echo "${NATIVE_ARGS}" | grep -q -- "--dsa-indexer-loss-coeff ${DSA_LOSS_COEFF}"; then
