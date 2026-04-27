@@ -261,9 +261,10 @@ def run_mxfp8_shim_probe(args: argparse.Namespace) -> CheckResult:
     env.update(
         {
             "CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER": "1",
-            "CPPMEGA_TE_MXFP8_BWD_BACKEND": "cutlass_native",
-            "CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND": "compact",
-            "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND": "off",
+            "CPPMEGA_TE_MXFP8_BWD_BACKEND": "te_tn_adapter",
+            "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND": "te",
+            "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED": "1",
+            "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT": "1",
             "CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK": "0",
             "CPPMEGA_TE_MXFP8_DGRAD_BF16": "0",
             "CPPMEGA_TE_MXFP8_WGRAD_BF16": "0",
@@ -308,7 +309,7 @@ def run_mxfp8_shim_probe(args: argparse.Namespace) -> CheckResult:
     return CheckResult(
         name="mxfp8_tn_adapter_probe",
         status="pass",
-        detail="shim routed MXFP8 backward through accepted backend with BF16 fallback/materialization counters at zero",
+        detail="shim routed MXFP8 backward through TE TN adapter with BF16 fallback and live sidecar counters at zero",
         data={"shim_stats": report.get("shim_stats")},
     )
 

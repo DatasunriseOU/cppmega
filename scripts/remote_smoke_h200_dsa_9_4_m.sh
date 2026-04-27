@@ -489,7 +489,7 @@ def model_provider(model_builder, pre_process=True, post_process=True, vp_stage=
 PY
 
 # Build hybrid layer pattern -- PP*VPP equal chunks separated by "|".
-HYBRID_PATTERN=$(python - <<PY
+HYBRID_LAYER_PATTERN=$(python - <<PY
 from cppmega.megatron.nam56r_lite_spec import build_default_hybrid_layer_pattern
 
 mtp_depths = ${MTP_DEPTHS}
@@ -512,7 +512,7 @@ if n_chunks > 1:
 print(main + (("/" + mtp_part) if mtp_part else ""))
 PY
 )
-echo "HYBRID_PATTERN: ${HYBRID_PATTERN}"
+echo "HYBRID_LAYER_PATTERN: ${HYBRID_LAYER_PATTERN}"
 
 # Native args (MLA + MoE + MTP + DSA).
 NATIVE_ARGS=$(python - <<PY
@@ -702,7 +702,7 @@ ${NSYS_CMD} python -m torch.distributed.run --nproc_per_node=8 "${WORKDIR}/pretr
   --no-persist-layer-norm \
   --no-masked-softmax-fusion \
   ${ROPE_FLAG} \
-  --hybrid-layer-pattern "${HYBRID_PATTERN}" \
+  --hybrid-layer-pattern "${HYBRID_LAYER_PATTERN}" \
   --hidden-size 4096 \
   --ffn-hidden-size 21504 \
   --num-attention-heads 32 \

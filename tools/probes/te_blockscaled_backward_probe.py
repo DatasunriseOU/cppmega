@@ -78,7 +78,7 @@ def _record_success(
         "name": name,
         "status": status,
         "shape": list(out.shape),
-        "finite": bool(torch.isfinite(out).all().item()),
+        "finite": torch.isfinite(out).all().item(),
         "max_abs": _max_abs(out, ref),
         "rel_l2": rel_l2,
     }
@@ -88,6 +88,7 @@ def _record_failure(name: str, exc: BaseException) -> dict[str, Any]:
     return {
         "name": name,
         "status": "fail",
+        "finite": None,
         "error_type": type(exc).__name__,
         "error": str(exc).splitlines()[0],
     }
@@ -107,6 +108,7 @@ def _try_gemm(
         gemm_fn,
         *args,
         rel_l2_limit=rel_l2_limit,
+        warmup=True,
         **kwargs,
     )
     return row
@@ -118,9 +120,13 @@ def _try_gemm_capture(
     gemm_fn: Any,
     *args: Any,
     rel_l2_limit: float | None = None,
+    warmup: bool = True,
     **kwargs: Any,
 ) -> tuple[dict[str, Any], torch.Tensor | None]:
     try:
+        if warmup:
+            _warmup_out, *_ = gemm_fn(*args, **kwargs)
+            torch.cuda.synchronize()
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
@@ -553,9 +559,76 @@ def _run_cutlass_direct_microbench(
         "iters": iters,
         "dgrad_elapsed_ms": dgrad_ms,
         "wgrad_elapsed_ms": wgrad_ms,
-        "dgrad": _record_success("mxfp8_cutlass_direct_microbench_dgrad", dgrad_out, refs["dgrad"]),
-        "wgrad": _record_success("mxfp8_cutlass_direct_microbench_wgrad", wgrad_out, refs["wgrad"]),
+        "dgrad": _record_success(
+            "mxfp8_cutlass_direct_microbench_dgrad",
+            dgrad_out,
+            refs["dgrad"],
+            rel_l2_limit=0.15,
+        ),
+        "wgrad": _record_success(
+            "mxfp8_cutlass_direct_microbench_wgrad",
+            wgrad_out,
+            refs["wgrad"],
+            rel_l2_limit=0.15,
+        ),
         "shim_stats_delta": _numeric_stats_delta(stats_before, stats_after),
+    }
+
+
+def _run_mxfp8_adapter_microbench(
+    refs: dict[str, torch.Tensor],
+    weight_t: Any,
+    x_t: Any,
+    dy_t: Any,
+    dyq: Any,
+    *,
+    warmup: int,
+    iters: int,
+) -> dict[str, Any]:
+    out_dgrad = torch.empty_like(refs["dgrad"], dtype=torch.bfloat16)
+    out_wgrad = torch.empty_like(refs["wgrad"], dtype=torch.bfloat16)
+    dgrad_out, dgrad_ms = _time_repeated_gemm(
+        general_gemm,
+        weight_t,
+        dyq,
+        warmup=warmup,
+        iters=iters,
+        out=out_dgrad,
+        out_dtype=torch.bfloat16,
+        layout="TN",
+        grad=True,
+        use_split_accumulator=False,
+    )
+    wgrad_out, wgrad_ms = _time_repeated_gemm(
+        general_gemm,
+        x_t,
+        dy_t,
+        warmup=warmup,
+        iters=iters,
+        out=out_wgrad,
+        out_dtype=torch.bfloat16,
+        layout="TN",
+        grad=True,
+        use_split_accumulator=False,
+    )
+    return {
+        "backend": "te_tn_adapter_pretransposed",
+        "warmup": warmup,
+        "iters": iters,
+        "dgrad_elapsed_ms": dgrad_ms,
+        "wgrad_elapsed_ms": wgrad_ms,
+        "dgrad": _record_success(
+            "mxfp8_adapter_microbench_dgrad",
+            dgrad_out,
+            refs["dgrad"],
+            rel_l2_limit=0.15,
+        ),
+        "wgrad": _record_success(
+            "mxfp8_adapter_microbench_wgrad",
+            wgrad_out,
+            refs["wgrad"],
+            rel_l2_limit=0.15,
+        ),
     }
 
 
@@ -563,6 +636,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     shim_module = None
     wrapped_general_gemm = None
     if args.use_shim:
+        os.environ["CPPMEGA_TE_MXFP8_BWD_BACKEND"] = args.mxfp8_bwd_backend
         os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER", "1")
         os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK", "0")
         os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_DEBUG", "1")
@@ -584,6 +658,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     mxfp8_emit_bytes: dict[str, Any] | None = None
     cutlass_direct_microbench: dict[str, Any] | None = None
+    mxfp8_adapter_microbench: dict[str, Any] | None = None
 
     if args.format in ("mxfp8", "both"):
         xq = _mxfp8_quantize(x, columnwise=True)
@@ -686,32 +761,32 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         )
 
         if wrapped_general_gemm is not None:
-            results.append(
-                _try_gemm(
-                    "mxfp8_dgrad_shim_NN_to_TN",
-                    refs["dgrad"],
-                    wrapped_general_gemm,
-                    wq,
-                    dyq,
-                    out_dtype=torch.bfloat16,
-                    layout="NN",
-                    grad=True,
-                    use_split_accumulator=False,
-                )
+            row, _ = _try_gemm_capture(
+                "mxfp8_dgrad_shim_NN_to_TN",
+                refs["dgrad"],
+                wrapped_general_gemm,
+                wq,
+                dyq,
+                out_dtype=torch.bfloat16,
+                layout="NN",
+                grad=True,
+                use_split_accumulator=False,
+                warmup=False,
             )
-            results.append(
-                _try_gemm(
-                    "mxfp8_wgrad_shim_NT_to_TN",
-                    refs["wgrad"],
-                    wrapped_general_gemm,
-                    xq,
-                    dyq,
-                    out_dtype=torch.bfloat16,
-                    layout="NT",
-                    grad=True,
-                    use_split_accumulator=False,
-                )
+            results.append(row)
+            row, _ = _try_gemm_capture(
+                "mxfp8_wgrad_shim_NT_to_TN",
+                refs["wgrad"],
+                wrapped_general_gemm,
+                xq,
+                dyq,
+                out_dtype=torch.bfloat16,
+                layout="NT",
+                grad=True,
+                use_split_accumulator=False,
+                warmup=False,
             )
+            results.append(row)
             if args.microbench_cutlass_direct:
                 try:
                     cutlass_direct_microbench = _run_cutlass_direct_microbench(
@@ -729,6 +804,22 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                         "mxfp8_cutlass_direct_microbench",
                         exc,
                     )
+        if args.microbench_adapter:
+            try:
+                mxfp8_adapter_microbench = _run_mxfp8_adapter_microbench(
+                    refs,
+                    weight_t,
+                    x_t,
+                    dy_t,
+                    dyq,
+                    warmup=args.microbench_warmup,
+                    iters=args.microbench_iters,
+                )
+            except Exception as exc:  # pragma: no cover - this is a probe
+                mxfp8_adapter_microbench = _record_failure(
+                    "mxfp8_adapter_microbench",
+                    exc,
+                )
 
     if args.format in ("nvfp4", "both"):
         xq = _nvfp4_quantize(x, columnwise=True, is_weight=False)
@@ -793,6 +884,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         report["mxfp8_transpose_emit_prototype_bytes"] = mxfp8_emit_bytes
     if cutlass_direct_microbench is not None:
         report["mxfp8_cutlass_direct_microbench"] = cutlass_direct_microbench
+    if mxfp8_adapter_microbench is not None:
+        report["mxfp8_adapter_microbench"] = mxfp8_adapter_microbench
     if shim_module is not None and hasattr(shim_module, "cppmega_te_mxfp8_bwd_stats_snapshot"):
         report["shim_stats"] = shim_module.cppmega_te_mxfp8_bwd_stats_snapshot()
     return report
@@ -809,6 +902,15 @@ def main() -> None:
         "--use-shim",
         action="store_true",
         help="Load scripts/cppmega_fp8_shim.py and verify NN/NT calls are routed by the shim.",
+    )
+    parser.add_argument(
+        "--mxfp8-bwd-backend",
+        choices=("te_tn_adapter", "cutlass_native"),
+        default="te_tn_adapter",
+        help=(
+            "MXFP8 backward backend to install before loading the cppmega shim. "
+            "This replaces the legacy CPPMEGA_TE_MXFP8_BWD_BACKEND probe override."
+        ),
     )
     parser.add_argument(
         "--probe-nocopy",
@@ -850,6 +952,11 @@ def main() -> None:
             "time repeated direct-loader dgrad/wgrad calls with preallocated outputs "
             "and report shim counter deltas."
         ),
+    )
+    parser.add_argument(
+        "--microbench-adapter",
+        action="store_true",
+        help="Time repeated pretransposed TE TN adapter calls with preallocated outputs.",
     )
     parser.add_argument("--microbench-warmup", type=int, default=10)
     parser.add_argument("--microbench-iters", type=int, default=100)
