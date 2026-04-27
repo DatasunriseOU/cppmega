@@ -68,8 +68,14 @@ import torch
 
 _SAVE_HNEW_ENV = "CPPMEGA_M2RNN_SAVE_HNEW"
 _BWD_CHUNK_SIZE_ENV = "CPPMEGA_M2RNN_BWD_CHUNK_SIZE"
+_FWD_AUTOTUNE_ENV = "CPPMEGA_M2RNN_FWD_AUTOTUNE"
+_FWD_NUM_WARPS_ENV = "CPPMEGA_M2RNN_FWD_NUM_WARPS"
+_FWD_NUM_STAGES_ENV = "CPPMEGA_M2RNN_FWD_NUM_STAGES"
 _DEFAULT_SAVE_HNEW = False
 _DEFAULT_BWD_CHUNK_SIZE = 64
+_DEFAULT_FWD_AUTOTUNE = False
+_DEFAULT_FWD_NUM_WARPS = 4
+_DEFAULT_FWD_NUM_STAGES = 3
 
 
 @dataclass(frozen=True)
@@ -83,10 +89,16 @@ class M2RNNRuntimeConfig:
     # Backward chunk length for checkpointed recompute.  Larger chunks reduce
     # kernel-launch overhead but increase the reusable y_chunk temporary.
     bwd_chunk_size: int = _DEFAULT_BWD_CHUNK_SIZE
+    # Forward autotune is opt-in because full-run Nsight captures include the
+    # Triton benchmark launches; the GB10 NAM56R shape consistently picked
+    # num_warps=4, which is now the default fixed launch.
+    fwd_autotune: bool = _DEFAULT_FWD_AUTOTUNE
+    fwd_num_warps: int = _DEFAULT_FWD_NUM_WARPS
+    fwd_num_stages: int = _DEFAULT_FWD_NUM_STAGES
 
 
 _M2RNN_RUNTIME_CONFIG_CACHE: (
-    tuple[tuple[str | None, str | None], M2RNNRuntimeConfig] | None
+    tuple[tuple[str | None, str | None, str | None, str | None, str | None], M2RNNRuntimeConfig] | None
 ) = None
 
 
@@ -103,6 +115,16 @@ def _env_int(raw: str | None, default: int) -> int:
         return max(1, int(raw))
     except ValueError:
         return default
+
+
+def _env_int_choice(raw: str | None, default: int, choices: set[int]) -> int:
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value in choices else default
 
 
 def reset_m2rnn_runtime_config_cache() -> None:
@@ -124,6 +146,9 @@ def get_m2rnn_runtime_config() -> M2RNNRuntimeConfig:
     raw_env = (
         os.environ.get(_SAVE_HNEW_ENV),
         os.environ.get(_BWD_CHUNK_SIZE_ENV),
+        os.environ.get(_FWD_AUTOTUNE_ENV),
+        os.environ.get(_FWD_NUM_WARPS_ENV),
+        os.environ.get(_FWD_NUM_STAGES_ENV),
     )
     cached = _M2RNN_RUNTIME_CONFIG_CACHE
     if cached is not None and cached[0] == raw_env:
@@ -132,6 +157,13 @@ def get_m2rnn_runtime_config() -> M2RNNRuntimeConfig:
     config = M2RNNRuntimeConfig(
         save_hnew=_env_flag(raw_env[0], _DEFAULT_SAVE_HNEW),
         bwd_chunk_size=_env_int(raw_env[1], _DEFAULT_BWD_CHUNK_SIZE),
+        fwd_autotune=_env_flag(raw_env[2], _DEFAULT_FWD_AUTOTUNE),
+        fwd_num_warps=_env_int_choice(
+            raw_env[3], _DEFAULT_FWD_NUM_WARPS, {1, 2, 4, 8, 16}
+        ),
+        fwd_num_stages=_env_int_choice(
+            raw_env[4], _DEFAULT_FWD_NUM_STAGES, {1, 2, 3, 4}
+        ),
     )
     _M2RNN_RUNTIME_CONFIG_CACHE = (raw_env, config)
     return config
@@ -179,7 +211,6 @@ if TRITON_AVAILABLE:
     # needs ~10-20 GB GPU workspace while the model already fills 100+ GB.
     _M2RNN_AUTOTUNE_KEY = ["SEQ", "NHEADS", "K_DIM", "V_DIM"]
 
-    @triton.autotune(configs=_M2RNN_AUTOTUNE_CONFIGS, key=_M2RNN_AUTOTUNE_KEY)
     @triton.jit
     def _m2rnn_fwd_kernel(
         q_ptr,
@@ -345,6 +376,11 @@ if TRITON_AVAILABLE:
             + offs_v[None, :] * hf_sv,
             h,
         )
+
+    _m2rnn_fwd_kernel_autotuned = triton.autotune(
+        configs=_M2RNN_AUTOTUNE_CONFIGS,
+        key=_M2RNN_AUTOTUNE_KEY,
+    )(_m2rnn_fwd_kernel)
 
     @triton.autotune(configs=_M2RNN_AUTOTUNE_CONFIGS, key=_M2RNN_AUTOTUNE_KEY)
     @triton.jit
@@ -955,8 +991,7 @@ class _M2RNNFn(torch.autograd.Function):
         h_final = torch.empty(B, H, K_DIM, V_DIM, device=q.device, dtype=q.dtype)
 
         grid = (B, H)
-
-        _m2rnn_fwd_kernel[grid](
+        fwd_args = (
             q_c,
             k_c,
             v_c,
@@ -967,6 +1002,8 @@ class _M2RNNFn(torch.autograd.Function):
             h_new_save,
             out,
             h_final,
+        )
+        fwd_kwargs = dict(
             HAS_H0=has_h0,
             SAVE_HNEW=save_hnew,
             BWD_CHUNK_SIZE=chunk_size,
@@ -994,6 +1031,15 @@ class _M2RNNFn(torch.autograd.Function):
             out_sb=out.stride(0), out_ss=out.stride(1), out_sh=out.stride(2), out_sv=out.stride(3),
             hf_sb=h_final.stride(0), hf_sh=h_final.stride(1), hf_sk=h_final.stride(2), hf_sv=h_final.stride(3),
         )
+        if runtime_config.fwd_autotune:
+            _m2rnn_fwd_kernel_autotuned[grid](*fwd_args, **fwd_kwargs)
+        else:
+            _m2rnn_fwd_kernel[grid](
+                *fwd_args,
+                **fwd_kwargs,
+                num_warps=runtime_config.fwd_num_warps,
+                num_stages=runtime_config.fwd_num_stages,
+            )
 
         ctx.save_for_backward(q_c, k_c, v_c, W_c, xf_c, h0_c, checkpoints, h_new_save)
         ctx.has_h0 = has_h0

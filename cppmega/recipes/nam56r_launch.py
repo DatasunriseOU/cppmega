@@ -22,7 +22,8 @@ def build_nam56r_megatron_native_args(
     enable_fim: bool = False,
     enable_moe: bool = False,
     moe_expert_model_parallel_size: int = 1,
-    moe_token_dispatcher_type: str = "flex",
+    moe_token_dispatcher_type: str = "alltoall",
+    moe_flex_dispatcher_backend: str = "deepep",
     moe_router_dtype: str | None = "fp32",
     enable_dsa: bool = False,
     dsa_indexer_dtype: str = "bf16",
@@ -46,6 +47,7 @@ def build_nam56r_megatron_native_args(
         use_moe=enable_moe,
         moe_expert_model_parallel_size=moe_expert_model_parallel_size,
         moe_token_dispatcher_type=moe_token_dispatcher_type,
+        moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
         moe_router_dtype=moe_router_dtype,
         use_dsa=enable_dsa,
         dsa_indexer_dtype=dsa_indexer_dtype,
@@ -126,7 +128,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--moe-token-dispatcher-type",
         choices=("flex", "alltoall", "allgather"),
-        default="flex",
+        default="alltoall",
+    )
+    parser.add_argument(
+        "--moe-flex-dispatcher-backend",
+        choices=("deepep", "hybridep"),
+        default="deepep",
     )
     parser.add_argument(
         "--moe-router-dtype",
@@ -165,6 +172,7 @@ def main() -> int:
         enable_moe=args.enable_moe,
         moe_expert_model_parallel_size=args.moe_expert_model_parallel_size,
         moe_token_dispatcher_type=args.moe_token_dispatcher_type,
+        moe_flex_dispatcher_backend=args.moe_flex_dispatcher_backend,
         moe_router_dtype=None if args.moe_router_dtype == "none" else args.moe_router_dtype,
         enable_dsa=args.enable_dsa,
         dsa_indexer_dtype=args.dsa_indexer_dtype,

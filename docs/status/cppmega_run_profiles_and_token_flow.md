@@ -92,6 +92,20 @@ That is no longer allowed.  `MTP_DEPTHS` must be passed into the helper as
 than by string replacement.  `tests/test_remote_profile_contract.py` enforces
 that remote launchers do not rewrite `--mtp-num-layers` after rendering.
 
+MoE dispatcher contract:
+
+- `NATIVE_ARGS` owns the single `--moe-token-dispatcher-type` flag. Launchers
+  must not append a second dispatcher flag after rendering the typed profile.
+- `alltoall` is the safe default and the local GB10 `TP=EP=1` lane.
+- `flex` is explicit only: set `moe_expert_model_parallel_size > 1`,
+  `moe_router_dtype=fp32`, and render `--moe-flex-dispatcher-backend`
+  (`deepep` or `hybridep`). Megatron raises if the selected backend is missing;
+  there is no silent fallback to alltoall.
+- `cppmega.megatron.moe_dispatcher_patch` skips identity local-expert chunk
+  sorts in the alltoall `TP=EP=1` case, removing no-op fused sort launches from
+  local GB10 MoE layers. Set `CPPMEGA_MOE_SKIP_IDENTITY_CHUNK_SORT=0` for A/B
+  profiling.
+
 ## Local GB10 Quarter Shape
 
 Current `local_gb10_quarter` profile:
@@ -160,7 +174,8 @@ E = MoE block
     FP32 when DeepEP/flex is active because DeepEP weighted dispatch expects
     FP32 top-k weights/probabilities
   token dispatch:
-    local GB10 EP=1 uses alltoall override; H200 EP lanes use flex/DeepEP
+    local GB10 EP=1 uses alltoall; H200 EP lanes use alltoall unless a typed
+    profile explicitly selects flex with deepep/hybridep and fp32 router probs
   expert GEMMs:
     BF16/tensorwise-FP8 TE GEMM path depending profile and hardware
   output: BF16 [B, S, H]
@@ -274,7 +289,7 @@ Long-term path:
 
 ## Validation Receipt
 
-The current local MTP=2 + Liger CE smoke:
+Previous local MTP=2 + Liger CE smoke:
 
 ```text
 initial MTP=2 Liger log: /home/dave/logs/gb10_mtp2_liger_smoke_20260426_2115.log
@@ -286,6 +301,13 @@ peak torch max allocated: 28392.57 MB
 peak torch max reserved: 30526.00 MB
 hot-step speed: about 5.5 s/iter at 4 * 4096 tokens = about 3.0k tok/s
 ```
+
+The typed local GB10 profile now renders `CPPMEGA_MTP_CE_KERNEL=cce`. Focused
+standalone proof is in `tools/probes/linear_ce_probe.py`: on GB10, the
+shared-weight 3-call CCE `reduction="sum"` pattern was finite with loss rel
+error `9.78e-08`, and the synthetic BF16 CE timing favored CCE over Liger
+(`118 ms` exact CCE sum-masked vs `380 ms` Liger mean-broadcast on
+`[4096,3584] x [65536,3584]`).
 
 The current local MXFP8 TE-transpose Linear backward receipt:
 
