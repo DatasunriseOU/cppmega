@@ -25,7 +25,6 @@ MtpCEKernel = Literal["native", "liger", "off"]
 Fp8Recipe = Literal["off", "tensorwise", "mxfp8"]
 Mxfp8BackwardBackend = Literal["te_tn_adapter", "cutlass_native"]
 Mxfp8TransposeEmitBackend = Literal["auto", "te", "off"]
-CutlassMxfp8ScaleBackend = Literal["compact", "prepack"]
 ParamStorage = Literal["auto", "bf16", "mxfp8"]
 SparseMlaMode = Literal["tilelang", "gather_scatter", "pytorch"]
 MoeDispatcher = Literal["flex", "alltoall", "allgather"]
@@ -88,8 +87,10 @@ class TrainingProfile:
 class PrecisionProfile:
     """Precision and kernel-route choices for the launch."""
 
-    # Tensorwise FP8 is the accepted local GB10 correctness lane.  MXFP8 is still
-    # probe-only because backward needs the TN adapter/CUTLASS workarounds.
+    # Tensorwise FP8 is the conservative GB10 lane.  MXFP8 routes backward
+    # through the TE TN adapter and TE transpose-emission path by default; the
+    # native CUTLASS loader is still an explicit experiment until the local
+    # CUTLASS headers and SM120 schedules are pinned.
     fp8_recipe: Fp8Recipe = "tensorwise"
     sparse_mla_fp8_quant: str = "te_tensorwise"
     # Flash attention is mandatory when available for full attention/MLA blocks.
@@ -104,7 +105,6 @@ class PrecisionProfile:
     mxfp8_transpose_emit_backend: Mxfp8TransposeEmitBackend = "te"
     mxfp8_transpose_emit_swizzled: bool = True
     mxfp8_transpose_emit_strict: bool = True
-    cutlass_mxfp8_scale_backend: CutlassMxfp8ScaleBackend = "compact"
     # Megatron's MXFP8 param-gather path requires distributed optimizer/FSDP.
     # Keep it as an explicit profile choice so single-GB10 local runs do not
     # accidentally enable an incompatible distributed-param contract.
@@ -153,6 +153,11 @@ class RuntimePatchProfile:
     mamba_num_groups: int = 8
     mamba_recompute: bool = True
     dsa_sparse_mode: SparseMlaMode = "tilelang"
+    # NOTE: same name as ModelProfile.dsa_indexer_loss_coeff but semantically
+    # distinct — this is the env-var string passed to import-time shim patches,
+    # while ModelProfile's is the float fed to the --dsa-indexer-loss-coeff
+    # Megatron launcher arg.  Not the same value; be deliberate about which you
+    # assign.
     dsa_indexer_loss_coeff: str = "0"
     dsa_skip_indexer_loss: bool = True
     ngram_hash_enabled: bool = True
@@ -274,15 +279,13 @@ def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProf
             name="local_gb10_quarter",
             description="Single-GB10 NAM56R-quarter correctness/profiling lane",
         )
-    profile.model = ModelProfile()
-    profile.training = TrainingProfile()
-    profile.precision = PrecisionProfile()
-    profile.optimizer = OptimizerProfile()
+    # Single-GB10 has TP=EP=1, so Megatron's Flex dispatcher is invalid here.
+    # Keep this in the typed profile instead of relying on a shell fallback.
+    profile.model.moe_token_dispatcher_type = "alltoall"
     profile.runtime = RuntimePatchProfile(
         mtp_ce_kernel="liger",
         acknowledge_liger_mtp_ce_deprecated=True,
     )
-    profile.profiling = ProfilingProfile()
     return profile
 
 
@@ -351,6 +354,7 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         "CPPMEGA_PP_SIZE": str(profile.model.pipeline_model_parallel_size),
         "CPPMEGA_VPP_SIZE": str(profile.model.virtual_pipeline_model_parallel_size),
         "CPPMEGA_EP_SIZE": str(profile.model.moe_expert_model_parallel_size),
+        "CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE": profile.model.moe_token_dispatcher_type,
         "CPPMEGA_SEQ_LENGTH": str(profile.training.seq_length),
         "CPPMEGA_MAX_POSITION_EMBEDDINGS": str(profile.training.seq_length),
         "CPPMEGA_MICRO_BATCH_SIZE": str(profile.training.micro_batch_size),
@@ -424,7 +428,6 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         ),
         "CPPMEGA_CUDA_PROFILE_STEP_END": str(profile.profiling.cuda_profile_step_end),
         "HYBRID_LAYER_PATTERN": profile.hybrid_layer_pattern(),
-        "HYBRID_PATTERN": profile.hybrid_layer_pattern(),
         "NATIVE_ARGS": profile.native_args_fragment(),
     }
     if profile.runtime.mtp_ce_kernel == "liger" and profile.runtime.acknowledge_liger_mtp_ce_deprecated:
@@ -448,9 +451,6 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                 ),
                 "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT": _bool(
                     profile.precision.mxfp8_transpose_emit_strict
-                ),
-                "CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND": (
-                    profile.precision.cutlass_mxfp8_scale_backend
                 ),
                 "CPPMEGA_FP8_PARAM_GATHER": _bool(profile.precision.fp8_param_gather),
                 "CPPMEGA_REUSE_GRAD_BUF_FOR_MXFP8_PARAM_AG": _bool(
@@ -511,8 +511,6 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.precision.mxfp8_transpose_emit_swizzled = args.mxfp8_transpose_emit_swizzled
     if args.mxfp8_transpose_emit_strict is not None:
         profile.precision.mxfp8_transpose_emit_strict = args.mxfp8_transpose_emit_strict
-    if args.cutlass_mxfp8_scale_backend is not None:
-        profile.precision.cutlass_mxfp8_scale_backend = args.cutlass_mxfp8_scale_backend
     if args.fp8_param_gather is not None:
         profile.precision.fp8_param_gather = args.fp8_param_gather
     if args.reuse_grad_buf_for_mxfp8_param_ag is not None:
@@ -548,6 +546,13 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
     if args.cuda_profile_step_end is not None:
         profile.profiling.cuda_profile = True
         profile.profiling.cuda_profile_step_end = args.cuda_profile_step_end
+    if profile.profiling.cuda_profile:
+        start = profile.profiling.cuda_profile_step_start
+        end = profile.profiling.cuda_profile_step_end
+        if start >= end:
+            raise ValueError(
+                f"cuda_profile_step_start ({start}) must be < cuda_profile_step_end ({end})"
+            )
     return profile
 
 
@@ -590,11 +595,6 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--mxfp8-transpose-emit-backend",
         choices=("auto", "te", "off"),
-        default=None,
-    )
-    parser.add_argument(
-        "--cutlass-mxfp8-scale-backend",
-        choices=("compact", "prepack"),
         default=None,
     )
     fp8_param_gather = parser.add_mutually_exclusive_group()
