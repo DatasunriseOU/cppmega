@@ -162,6 +162,7 @@ def _tn_gemm_compact_direct(
     accumulate: bool = False,
     alpha: float = 1.0,
     beta: float | None = None,
+    asymmetric: bool = False,
 ) -> torch.Tensor:
     if not is_supported_shape(m, n, k):
         raise ValueError(f"unsupported CUTLASS MXFP8 GB10 shape {m}x{n}x{k}; require multiples of 128")
@@ -183,7 +184,8 @@ def _tn_gemm_compact_direct(
         out_arg = out
         use_out = True
     ext = _load_cuda_ext()
-    return ext.tn_gemm_compact_direct(
+    entrypoint = ext.tn_gemm_compact_direct_asym if asymmetric else ext.tn_gemm_compact_direct
+    return entrypoint(
         _as_uint8_contiguous(a_data),
         _as_uint8_contiguous(a_scale_inv),
         _as_uint8_contiguous(b_data),
@@ -215,6 +217,7 @@ def dgrad_nn_gemm(
     accumulate: bool = False,
     alpha: float = 1.0,
     beta: float | None = None,
+    asymmetric: bool = False,
 ) -> torch.Tensor:
     """Run dgrad NN as TN without materializing ``weight.T``.
 
@@ -252,6 +255,7 @@ def dgrad_nn_gemm(
         accumulate=accumulate,
         alpha=alpha,
         beta=beta,
+        asymmetric=asymmetric,
     )
 
 
@@ -265,6 +269,7 @@ def wgrad_nt_gemm(
     accumulate: bool = False,
     alpha: float = 1.0,
     beta: float | None = None,
+    asymmetric: bool = False,
 ) -> torch.Tensor:
     """Run wgrad NT as TN without materializing ``dy.T`` or ``x.T``.
 
@@ -302,4 +307,5 @@ def wgrad_nt_gemm(
         accumulate=accumulate,
         alpha=alpha,
         beta=beta,
+        asymmetric=asymmetric,
     )
