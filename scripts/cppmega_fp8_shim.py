@@ -103,7 +103,9 @@ if os.environ.get("CPPMEGA_ALLOW_TE_MXFP8_SM12", "0") == "1":
 # Linear backward paths can fail in cuBLASLt on sm_12.x. Keep this opt-in and
 # narrow.
 #
-# Preferred experimental path:
+# Preferred experimental path, configured by cppmega.recipes.run_profiles and
+# rendered as CPPMEGA_* only because this shim is imported before Megatron args
+# are available:
 #   CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER=1
 # retargets compact MXFP8 columnwise payloads as rowwise transposed operands
 # and rewrites Linear backward GEMMs to the GB10-supported TN layout:
@@ -113,10 +115,13 @@ if os.environ.get("CPPMEGA_ALLOW_TE_MXFP8_SM12", "0") == "1":
 # Backend selection:
 #   CPPMEGA_TE_MXFP8_BWD_BACKEND=te_tn_adapter      # default, TE TN GEMM
 #   CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native     # GB10 CUTLASS SM120/121
+#   CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND=compact     # direct compact-scale mainloop
+#   CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND=prepack     # old native-scale prepack A/B
 #
-# The CUTLASS backend is intentionally integrated before the no-materialization
-# mainloop is finished.  It uses native SM1xx scale prepack and currently still
-# relies on rowwise-transpose operands where CUTLASS TMA requires them.
+# The CUTLASS backend uses a cppmega SM120 mainloop fork by default.  Regular
+# TN keeps stock A/B TMA with compact scale copies in the mainloop; backward
+# NN/NT uses a manual payload+scale loader so original compact TE columnwise
+# operands do not need rowwise-transpose sidecars.
 #
 # If the adapter cannot be used for a specific call (missing columnwise payload,
 # swizzled scales, non-MXFP8 tensor, unsupported overlap), the BF16/dequantized
@@ -135,11 +140,27 @@ if _te_mxfp8_bwd_backend not in ("te_tn_adapter", "cutlass_native"):
         "Unsupported CPPMEGA_TE_MXFP8_BWD_BACKEND="
         f"{_te_mxfp8_bwd_backend!r}; expected te_tn_adapter or cutlass_native"
     )
+_te_mxfp8_transpose_emit_default = (
+    "off" if _te_mxfp8_bwd_backend == "cutlass_native" else "auto"
+)
 _te_mxfp8_transpose_emit_backend = os.environ.get(
-    "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND", "auto"
+    "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND",
+    _te_mxfp8_transpose_emit_default,
 ).lower()
+if _te_mxfp8_transpose_emit_backend not in ("auto", "te", "off"):
+    raise RuntimeError(
+        "Unsupported CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND="
+        f"{_te_mxfp8_transpose_emit_backend!r}; expected auto, te, or off"
+    )
 _te_mxfp8_transpose_emit_strict = os.environ.get(
     "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT", "0"
+) == "1"
+_te_mxfp8_transpose_emit_swizzled_default = (
+    "0" if _te_mxfp8_bwd_backend == "cutlass_native" else "1"
+)
+_te_mxfp8_transpose_emit_swizzled = os.environ.get(
+    "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED",
+    _te_mxfp8_transpose_emit_swizzled_default,
 ) == "1"
 _te_mxfp8_bwd_allow_bf16_fallback = os.environ.get(
     "CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK",
@@ -216,6 +237,9 @@ if (
             "mxfp8_tn_adapter_dgrad": 0,
             "mxfp8_tn_adapter_wgrad": 0,
             "mxfp8_tn_adapter_te_emit": 0,
+            "mxfp8_tn_adapter_saved_transpose_operand": 0,
+            "mxfp8_tn_adapter_te_emit_swizzled": 0,
+            "mxfp8_tn_adapter_te_emit_swizzled_unavailable": 0,
             "mxfp8_tn_adapter_copy_transpose": 0,
             "mxfp8_tn_adapter_missing_sidecar_copy": 0,
             "mxfp8_tn_adapter_te_emit_failed": 0,
@@ -297,7 +321,11 @@ if (
         _cppmega_quantize_weight_debug_count = [0]
         _cppmega_attach_debug_count = [0]
         _cppmega_mxfp8_tn_sidecar_registry = {}
-        _cppmega_mxfp8_tn_sidecar_registry_limit = 256
+        # Forward can create hundreds of MXFP8 transpose sidecars before the
+        # matching backward GEMM consumes the earliest ones. Keep enough entries
+        # for the full local NAM56R-quarter graph; entries are still one-shot
+        # and are removed on lookup in backward.
+        _cppmega_mxfp8_tn_sidecar_registry_limit = 8192
         _cppmega_mxfp8_tn_sidecar_registry_peak = [0]
 
         def _cppmega_is_mxfp8_tensor(_x):
@@ -397,6 +425,16 @@ if (
             _entry = _cppmega_get_mxfp8_sidecar_entry(_x)
             return None if _entry is None else _entry[0]
 
+        def _cppmega_unregister_mxfp8_sidecar(_x):
+            _key = _cppmega_mxfp8_sidecar_key(_x)
+            if _key is not None:
+                _cppmega_mxfp8_tn_sidecar_registry.pop(_key, None)
+
+        def _cppmega_mark_rowwise_transpose_operand(_x):
+            setattr(_x, "_te_rowwise_transpose_for_backward_operand", True)
+            setattr(_x, "_cppmega_mxfp8_rowwise_transpose_operand", True)
+            return _x
+
         def _cppmega_propagate_mxfp8_sidecar(_src, _dst):
             if not (_cppmega_is_mxfp8_tensor(_src) and _cppmega_is_mxfp8_tensor(_dst)):
                 return _dst
@@ -442,16 +480,72 @@ if (
                 return _out
             try:
                 with _torch.no_grad():
-                    _sidecar = _quantizer.quantize_rowwise_transpose(
-                        _source,
-                        _columnwise_scale,
-                        fake_dtype=getattr(
-                            _out,
-                            "_dtype",
-                            getattr(_out, "dtype", _source.dtype),
-                        ),
+                    _fake_dtype = getattr(
+                        _out,
+                        "_dtype",
+                        getattr(_out, "dtype", _source.dtype),
                     )
+                    _transpose_kwargs = {"fake_dtype": _fake_dtype}
+                    if _te_mxfp8_transpose_emit_swizzled:
+                        _transpose_kwargs["with_gemm_swizzled_scales"] = True
+                    try:
+                        _sidecar = _quantizer.quantize_rowwise_transpose(
+                            _source,
+                            _columnwise_scale,
+                            **_transpose_kwargs,
+                        )
+                    except TypeError as _type_exc:
+                        if (
+                            not _te_mxfp8_transpose_emit_swizzled
+                            or "with_gemm_swizzled_scales" not in str(_type_exc)
+                        ):
+                            raise
+                        if (
+                            _te_mxfp8_transpose_emit_backend == "te"
+                            and _te_mxfp8_transpose_emit_strict
+                        ):
+                            raise
+                        _cppmega_record_bwd_stat(
+                            "mxfp8_tn_adapter_te_emit_swizzled_unavailable",
+                            "missing_quantize_rowwise_transpose_swizzle_arg",
+                        )
+                        _transpose_kwargs.pop("with_gemm_swizzled_scales", None)
+                        _sidecar = _quantizer.quantize_rowwise_transpose(
+                            _source,
+                            _columnwise_scale,
+                            **_transpose_kwargs,
+                        )
+                    if _te_mxfp8_transpose_emit_swizzled:
+                        if getattr(_sidecar, "_with_gemm_swizzled_scales", False):
+                            _cppmega_record_bwd_stat(
+                                "mxfp8_tn_adapter_te_emit_swizzled"
+                            )
+                        else:
+                            _cppmega_record_bwd_stat(
+                                "mxfp8_tn_adapter_te_emit_swizzled_unavailable",
+                                "compact_transpose_emit_returned",
+                            )
+                            if (
+                                _te_mxfp8_transpose_emit_backend == "te"
+                                and _te_mxfp8_transpose_emit_strict
+                            ):
+                                raise RuntimeError(
+                                    "TE MXFP8 transpose emit returned compact scales "
+                                    "while swizzled scales were required"
+                                )
+                _cppmega_mark_rowwise_transpose_operand(_sidecar)
+                setattr(_out, "_te_rowwise_transpose_for_backward", _sidecar)
+                setattr(
+                    _out,
+                    "_te_rowwise_transpose_for_backward_unregister",
+                    _cppmega_unregister_mxfp8_sidecar,
+                )
                 setattr(_out, _cppmega_mxfp8_tn_sidecar_attr, _sidecar)
+                setattr(
+                    _out,
+                    "_cppmega_mxfp8_rowwise_transpose_unregister",
+                    _cppmega_unregister_mxfp8_sidecar,
+                )
                 # The transpose sidecar is scoped to the autograd use of this
                 # quantized tensor. Keeping even weight sidecars past first
                 # backward lookup can accumulate one large sidecar per layer
@@ -565,8 +659,14 @@ if (
         def _cppmega_mxfp8_colwise_as_rowwise_transpose(_x):
             if not _cppmega_is_mxfp8_tensor(_x):
                 raise TypeError(f"expected MXFP8 tensor, got {type(_x).__name__}")
+            if getattr(_x, "_te_rowwise_transpose_for_backward_operand", False) or getattr(
+                _x, "_cppmega_mxfp8_rowwise_transpose_operand", False
+            ):
+                _cppmega_record_bwd_stat("mxfp8_tn_adapter_saved_transpose_operand")
+                return _x
             _sidecar = _cppmega_get_mxfp8_sidecar(_x)
             if _sidecar is not None:
+                _cppmega_mark_rowwise_transpose_operand(_sidecar)
                 setattr(_x, _cppmega_mxfp8_tn_sidecar_attr, _sidecar)
                 _persistent = bool(
                     getattr(_x, _cppmega_mxfp8_tn_sidecar_persistent_attr, False)
@@ -635,13 +735,36 @@ if (
             _scale = getattr(_x, "_rowwise_scale_inv", None)
             if not isinstance(_data, _torch.Tensor) or not isinstance(_scale, _torch.Tensor):
                 raise ValueError("MXFP8 CUTLASS backend requires rowwise data and scales")
-            if _data.dim() != 2 or _scale.dim() != 2:
-                raise ValueError("MXFP8 CUTLASS backend requires 2D rowwise payloads")
+            if _data.dim() < 2 or _scale.dim() != 2:
+                raise ValueError(
+                    "MXFP8 CUTLASS backend requires matrix-like rowwise payloads "
+                    f"and 2D scales; {_cppmega_mxfp8_debug_desc(_x)}"
+                )
             if _data.dtype != _torch.uint8 or _scale.dtype != _torch.uint8:
                 raise ValueError("MXFP8 CUTLASS backend requires uint8 payloads/scales")
+            if _data.dim() > 2:
+                _data = _data.reshape(-1, _data.shape[-1])
             return _data, _scale
 
-        def _cppmega_cutlass_tn_gemm(_a, _b, _kwargs):
+        def _cppmega_mxfp8_colwise_payload_and_scale(_x):
+            if getattr(_x, "_with_gemm_swizzled_scales", False):
+                raise ValueError("MXFP8 CUTLASS direct backend requires compact, non-swizzled scales")
+            _data = getattr(_x, "_columnwise_data", None)
+            _scale = getattr(_x, "_columnwise_scale_inv", None)
+            if not isinstance(_data, _torch.Tensor) or not isinstance(_scale, _torch.Tensor):
+                raise ValueError("MXFP8 CUTLASS direct backend requires columnwise data and scales")
+            if _data.dim() < 2 or _scale.dim() != 2:
+                raise ValueError(
+                    "MXFP8 CUTLASS direct backend requires matrix-like columnwise payloads "
+                    f"and 2D scales; {_cppmega_mxfp8_debug_desc(_x)}"
+                )
+            if _data.dtype != _torch.uint8 or _scale.dtype != _torch.uint8:
+                raise ValueError("MXFP8 CUTLASS direct backend requires uint8 payloads/scales")
+            if _data.dim() > 2:
+                _data = _data.reshape(-1, _data.shape[-1])
+            return _data, _scale
+
+        def _cppmega_cutlass_kwargs(_kwargs):
             _out_dtype = _kwargs.get("out_dtype", _torch.bfloat16)
             _out = _kwargs.get("out", None)
             if _out_dtype is not None and _out_dtype != _torch.bfloat16:
@@ -652,7 +775,14 @@ if (
                 raise ValueError("CUTLASS MXFP8 backend does not fuse GELU")
             if _kwargs.get("quantization_params", None) is not None:
                 raise ValueError("CUTLASS MXFP8 backend does not quantize GEMM outputs")
+            return {
+                "out": _out,
+                "accumulate": bool(_kwargs.get("accumulate", False)),
+                "alpha": float(_kwargs.get("alpha", 1.0)),
+                "beta": _kwargs.get("beta", None),
+            }
 
+        def _cppmega_cutlass_tn_gemm(_a, _b, _kwargs):
             _a_data, _a_scale = _cppmega_mxfp8_rowwise_payload_and_scale(_a)
             _b_data, _b_scale = _cppmega_mxfp8_rowwise_payload_and_scale(_b)
             _cutlass = _cppmega_load_cutlass_mxfp8_module()
@@ -661,10 +791,33 @@ if (
                 _a_scale,
                 _b_data,
                 _b_scale,
-                out=_out,
-                accumulate=bool(_kwargs.get("accumulate", False)),
-                alpha=float(_kwargs.get("alpha", 1.0)),
-                beta=_kwargs.get("beta", None),
+                **_cppmega_cutlass_kwargs(_kwargs),
+            )
+            return _result, None, None, None
+
+        def _cppmega_cutlass_dgrad_nn_gemm(_weight, _dy, _kwargs):
+            _dy_data, _dy_scale = _cppmega_mxfp8_rowwise_payload_and_scale(_dy)
+            _weight_data, _weight_scale = _cppmega_mxfp8_colwise_payload_and_scale(_weight)
+            _cutlass = _cppmega_load_cutlass_mxfp8_module()
+            _result = _cutlass.dgrad_nn_gemm(
+                _dy_data,
+                _dy_scale,
+                _weight_data,
+                _weight_scale,
+                **_cppmega_cutlass_kwargs(_kwargs),
+            )
+            return _result, None, None, None
+
+        def _cppmega_cutlass_wgrad_nt_gemm(_x, _dy, _kwargs):
+            _dy_data, _dy_scale = _cppmega_mxfp8_colwise_payload_and_scale(_dy)
+            _x_data, _x_scale = _cppmega_mxfp8_colwise_payload_and_scale(_x)
+            _cutlass = _cppmega_load_cutlass_mxfp8_module()
+            _result = _cutlass.wgrad_nt_gemm(
+                _dy_data,
+                _dy_scale,
+                _x_data,
+                _x_scale,
+                **_cppmega_cutlass_kwargs(_kwargs),
             )
             return _result, None, None, None
 
@@ -684,15 +837,12 @@ if (
 
             if _layout == "NN":
                 # dgrad: dy[M, N] @ weight[N, K].
-                # CUTLASS TN consumes A[M, N] and B[K, N] rowwise.
-                _weight_t = _cppmega_mxfp8_colwise_as_rowwise_transpose(_args[0])
-                _dy = _args[1]
-                return True, _cppmega_cutlass_tn_gemm(_dy, _weight_t, _kwargs)
+                # CUTLASS direct consumes dy rowwise and aliases original
+                # compact TE weight columnwise storage as logical weight.T.
+                return True, _cppmega_cutlass_dgrad_nn_gemm(_args[0], _args[1], _kwargs)
 
             # wgrad: dy.T[N, M] @ x[M, K].
-            _x_t = _cppmega_mxfp8_colwise_as_rowwise_transpose(_args[0])
-            _dy_t = _cppmega_mxfp8_colwise_as_rowwise_transpose(_args[1])
-            return True, _cppmega_cutlass_tn_gemm(_dy_t, _x_t, _kwargs)
+            return True, _cppmega_cutlass_wgrad_nt_gemm(_args[0], _args[1], _kwargs)
 
         def _cppmega_try_mxfp8_tn_adapter(_orig_general_gemm, _args, _kwargs):
             _layout = _kwargs.get("layout")
@@ -1174,6 +1324,7 @@ if (
             f"override_linear_precision={(False, _te_mxfp8_dgrad_bf16, _te_mxfp8_wgrad_bf16)}, "
             f"mxfp8_bwd_tn_adapter={_te_mxfp8_bwd_tn_adapter}, "
             f"mxfp8_transpose_emit_backend={_te_mxfp8_transpose_emit_backend}, "
+            f"mxfp8_transpose_emit_swizzled={_te_mxfp8_transpose_emit_swizzled}, "
             f"mxfp8_bwd_allow_bf16_fallback={_te_mxfp8_bwd_allow_bf16_fallback}, "
             f"gemm_modules={_patched_gemm_modules}, "
             f"grouped_gemm_modules={_patched_grouped_gemm_modules}, "

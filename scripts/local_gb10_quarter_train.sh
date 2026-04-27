@@ -16,6 +16,11 @@ NVSMI_LOG="${NVSMI_LOG:-${LOG%.log}.nvsmi.log}"
 
 source "${VENV}/bin/activate"
 
+RUN_PROFILE="${RUN_PROFILE:-local_gb10_quarter}"
+RUN_PROFILE_ARGS=("$@")
+eval "$(PYTHONPATH="${ROOT}:${MEGATRON_ROOT}:${PYTHONPATH:-}" \
+  python -m cppmega.recipes.run_profiles shell "${RUN_PROFILE}" "${RUN_PROFILE_ARGS[@]}")"
+
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/home/dave/.triton-cache}"
@@ -37,11 +42,23 @@ export CPPMEGA_DSA_SKIP_INDEXER_LOSS="${CPPMEGA_DSA_SKIP_INDEXER_LOSS:-1}"
 export CPPMEGA_SEQ_LENGTH="${CPPMEGA_SEQ_LENGTH:-4096}"
 export CPPMEGA_MAX_POSITION_EMBEDDINGS="${CPPMEGA_MAX_POSITION_EMBEDDINGS:-4096}"
 export CPPMEGA_FP8_RECIPE="${CPPMEGA_FP8_RECIPE:-tensorwise}"
+if [[ "${CPPMEGA_FP8_RECIPE}" != "off" && "${CPPMEGA_FP8_RECIPE}" != "tensorwise" && "${CPPMEGA_FP8_RECIPE}" != "mxfp8" ]]; then
+  echo "FATAL: CPPMEGA_FP8_RECIPE must be off, tensorwise, or mxfp8" >&2
+  exit 2
+fi
+if [[ -n "${CPPMEGA_TE_PRECISION_CONFIG_FILE:-}" && "${CPPMEGA_FP8_RECIPE}" != "mxfp8" ]]; then
+  echo "FATAL: CPPMEGA_TE_PRECISION_CONFIG_FILE requires CPPMEGA_FP8_RECIPE=mxfp8 in typed run profiles" >&2
+  exit 2
+fi
 if [[ "${CPPMEGA_FP8_RECIPE}" == "mxfp8" || -n "${CPPMEGA_TE_PRECISION_CONFIG_FILE:-}" ]]; then
   export CPPMEGA_ALLOW_TE_MXFP8_SM12="${CPPMEGA_ALLOW_TE_MXFP8_SM12:-1}"
   export CPPMEGA_PAD_MAMBA_IN_PROJ_FOR_MXFP8="${CPPMEGA_PAD_MAMBA_IN_PROJ_FOR_MXFP8:-1}"
   export CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER="${CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER:-1}"
-  export CPPMEGA_TE_MXFP8_BWD_BACKEND="${CPPMEGA_TE_MXFP8_BWD_BACKEND:-cutlass_native}"
+  export CPPMEGA_TE_MXFP8_BWD_BACKEND="${CPPMEGA_TE_MXFP8_BWD_BACKEND:-te_tn_adapter}"
+  export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND="${CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND:-te}"
+  export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED="${CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED:-1}"
+  export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT="${CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT:-1}"
+  export CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND="${CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND:-compact}"
   export CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK="${CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK:-0}"
   export CPPMEGA_TE_MXFP8_DGRAD_BF16="${CPPMEGA_TE_MXFP8_DGRAD_BF16:-0}"
   export CPPMEGA_TE_MXFP8_WGRAD_BF16="${CPPMEGA_TE_MXFP8_WGRAD_BF16:-0}"
@@ -49,8 +66,17 @@ if [[ "${CPPMEGA_FP8_RECIPE}" == "mxfp8" || -n "${CPPMEGA_TE_PRECISION_CONFIG_FI
 fi
 export CPPMEGA_SPEC_MODULE="${CPPMEGA_SPEC_MODULE:-cppmega.megatron.nam56r_noconv_spec}"
 export CPPMEGA_SPEC_FUNCTION="${CPPMEGA_SPEC_FUNCTION:-build_cppmega_nam56r_noconv_stack_spec}"
-export CPPMEGA_SPARSE_MLA_FP8_QUANT="te_tensorwise"
-export CPPMEGA_OPTIMIZER="muon"
+export CPPMEGA_SPARSE_MLA_FP8_QUANT="${CPPMEGA_SPARSE_MLA_FP8_QUANT:-te_tensorwise}"
+export CPPMEGA_OPTIMIZER="${CPPMEGA_OPTIMIZER:-muon}"
+export CPPMEGA_PARAM_STORAGE="${CPPMEGA_PARAM_STORAGE:-bf16}"
+if [[ "${CPPMEGA_PARAM_STORAGE}" != "bf16" && "${CPPMEGA_PARAM_STORAGE}" != "mxfp8" ]]; then
+  echo "FATAL: CPPMEGA_PARAM_STORAGE must be bf16 or mxfp8" >&2
+  exit 2
+fi
+if [[ "${CPPMEGA_PARAM_STORAGE}" == "mxfp8" && "${CPPMEGA_FP8_RECIPE}" != "mxfp8" ]]; then
+  echo "FATAL: mxfp8 param storage requires CPPMEGA_FP8_RECIPE=mxfp8" >&2
+  exit 2
+fi
 export CPPMEGA_MUON_MOMENTUM="${CPPMEGA_MUON_MOMENTUM:-0.95}"
 export CPPMEGA_MUON_SCALE_MODE="${CPPMEGA_MUON_SCALE_MODE:-spectral}"
 export CPPMEGA_MUON_NUM_NS_STEPS="${CPPMEGA_MUON_NUM_NS_STEPS:-5}"
@@ -59,17 +85,17 @@ export CPPMEGA_MUON_SCALAR_OPTIMIZER="${CPPMEGA_MUON_SCALAR_OPTIMIZER:-adam8bit}
 export CPPMEGA_MUON_QUANTIZED_MOMENTUM="${CPPMEGA_MUON_QUANTIZED_MOMENTUM:-1}"
 export CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE="${CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE:-int8}"
 export CPPMEGA_MUON_QUANTIZED_MOMENTUM_BLOCK_SIZE="${CPPMEGA_MUON_QUANTIZED_MOMENTUM_BLOCK_SIZE:-256}"
-export CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER=1
-export CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER=1
-export CPPMEGA_GRAD_REDUCE_IN_BF16=1
+export CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER="${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER:-1}"
+export CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER="${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER:-1}"
+export CPPMEGA_GRAD_REDUCE_IN_BF16="${CPPMEGA_GRAD_REDUCE_IN_BF16:-1}"
 export CPPMEGA_USE_DISTRIBUTED_OPTIMIZER="${CPPMEGA_USE_DISTRIBUTED_OPTIMIZER:-0}"
 export CPPMEGA_USE_PRECISION_AWARE_OPTIMIZER="${CPPMEGA_USE_PRECISION_AWARE_OPTIMIZER:-0}"
 # Aggressive local-GB10 rule: when precision-aware storage is used, never keep
 # a higher-precision choice when the next lower storage option exists.
-export CPPMEGA_MAIN_GRADS_DTYPE="bf16"
-export CPPMEGA_MAIN_PARAMS_DTYPE="fp16"
-export CPPMEGA_EXP_AVG_DTYPE="fp8"
-export CPPMEGA_EXP_AVG_SQ_DTYPE="fp8"
+export CPPMEGA_MAIN_GRADS_DTYPE="${CPPMEGA_MAIN_GRADS_DTYPE:-bf16}"
+export CPPMEGA_MAIN_PARAMS_DTYPE="${CPPMEGA_MAIN_PARAMS_DTYPE:-fp16}"
+export CPPMEGA_EXP_AVG_DTYPE="${CPPMEGA_EXP_AVG_DTYPE:-fp8}"
+export CPPMEGA_EXP_AVG_SQ_DTYPE="${CPPMEGA_EXP_AVG_SQ_DTYPE:-fp8}"
 export CPPMEGA_LOCAL_DDP_DISABLE_CONTIGUOUS_GRAD_BUFFER="${CPPMEGA_LOCAL_DDP_DISABLE_CONTIGUOUS_GRAD_BUFFER:-1}"
 export CPPMEGA_MEMORY_DEBUG="${CPPMEGA_MEMORY_DEBUG:-0}"
 export CPPMEGA_TORCH_PROFILE="${CPPMEGA_TORCH_PROFILE:-0}"
@@ -237,12 +263,37 @@ if os.environ.get("CPPMEGA_MEM_PROFILE", "0") == "1":
         total_bytes = 0
         by_category: dict[str, list[int]] = collections.defaultdict(lambda: [0, 0])
         by_dtype: dict[str, list[int]] = collections.defaultdict(lambda: [0, 0])
+        by_storage: dict[str, list[int]] = collections.defaultdict(lambda: [0, 0])
         top: list[tuple[int, int, str, str, tuple[int, ...]]] = []
 
         for model in models:
             for name, param in model.named_parameters():
                 numel = int(param.numel())
-                nbytes = int(numel * param.element_size())
+                quantized_bytes = 0
+                seen_storages = set()
+                for attr in (
+                    "_rowwise_data",
+                    "_rowwise_scale_inv",
+                    "_columnwise_data",
+                    "_columnwise_scale_inv",
+                    "_data",
+                    "_scale_inv",
+                ):
+                    tensor = getattr(param, attr, None)
+                    if tensor is None:
+                        continue
+                    try:
+                        storage = tensor.untyped_storage()
+                        key = (storage.data_ptr(), storage.nbytes())
+                        nbytes_attr = int(storage.nbytes())
+                    except Exception:
+                        key = (int(tensor.data_ptr()), int(tensor.numel()), tensor.dtype)
+                        nbytes_attr = int(tensor.numel() * tensor.element_size())
+                    if key in seen_storages:
+                        continue
+                    seen_storages.add(key)
+                    quantized_bytes += nbytes_attr
+                nbytes = quantized_bytes if quantized_bytes else int(numel * param.element_size())
                 total_numel += numel
                 total_bytes += nbytes
                 cat = _category(name)
@@ -251,6 +302,9 @@ if os.environ.get("CPPMEGA_MEM_PROFILE", "0") == "1":
                 dtype = str(param.dtype)
                 by_dtype[dtype][0] += numel
                 by_dtype[dtype][1] += nbytes
+                storage_kind = type(param).__name__ if quantized_bytes else dtype
+                by_storage[storage_kind][0] += numel
+                by_storage[storage_kind][1] += nbytes
                 top.append((numel, nbytes, name, dtype, tuple(param.shape)))
 
         print("\n[mem_profile] PARAMETER BREAKDOWN", flush=True)
@@ -270,6 +324,13 @@ if os.environ.get("CPPMEGA_MEM_PROFILE", "0") == "1":
         for dtype, (numel, nbytes) in sorted(by_dtype.items(), key=lambda x: -x[1][1]):
             print(
                 f"[mem_profile]   {dtype:18s} {numel:>15,} elems "
+                f"{_gib(nbytes):>8.3f} GiB",
+                flush=True,
+            )
+        print("[mem_profile] by_storage:", flush=True)
+        for storage, (numel, nbytes) in sorted(by_storage.items(), key=lambda x: -x[1][1]):
+            print(
+                f"[mem_profile]   {storage:18s} {numel:>15,} elems "
                 f"{_gib(nbytes):>8.3f} GiB",
                 flush=True,
             )
@@ -491,33 +552,8 @@ PY
 sed -i '1i import cppmega_local_quarter_shim  # local GB10 quarter train patches' \
   "${WORKDIR}/pretrain_mamba.py"
 
-HYBRID_LAYER_PATTERN="$(python - <<'PY'
-from cppmega.megatron.nam56r_lite_spec import build_default_hybrid_layer_pattern
-
-print(build_default_hybrid_layer_pattern(mtp_depths=1))
-PY
-)"
-
-NATIVE_ARGS="$(python - <<'PY'
-from cppmega.recipes.nam56r_launch import build_nam56r_megatron_native_args
-from cppmega.recipes.nam56r_megatron import build_nam56r_feature_plan
-import os
-
-plan = build_nam56r_feature_plan(
-    pattern=os.environ["CPPMEGA_NEM_PATTERN"],
-    depth=int(os.environ["CPPMEGA_LAYER_DEPTH"]),
-    mtp_depths=1,
-)
-bundle = build_nam56r_megatron_native_args(
-    plan=plan,
-    enable_mla=True,
-    enable_mtp=True,
-    mtp_mode="hybrid",
-    enable_moe=True,
-)
-print(bundle.to_shell_fragment())
-PY
-)"
+: "${HYBRID_LAYER_PATTERN:?run profile did not set HYBRID_LAYER_PATTERN}"
+: "${NATIVE_ARGS:?run profile did not set NATIVE_ARGS}"
 
 (
   while true; do
@@ -534,17 +570,20 @@ NVSMI_PID=$!
 
 echo "[local-quarter] log=${LOG}"
 echo "[local-quarter] nvsmi=${NVSMI_LOG}"
+echo "[local-quarter] run_profile=${CPPMEGA_RUN_PROFILE:-${RUN_PROFILE}}"
 echo "[local-quarter] data=${CPPMEGA_DATA_PATH}"
 echo "[local-quarter] depth=${CPPMEGA_LAYER_DEPTH} hidden=${CPPMEGA_HIDDEN_SIZE:-3584} ffn=${CPPMEGA_FFN_HIDDEN_SIZE:-18944} heads=${CPPMEGA_NUM_ATTN_HEADS:-28}"
 echo "[local-quarter] torch_extensions=${TORCH_EXTENSIONS_DIR}"
 echo "[local-quarter] fp8_recipe=${CPPMEGA_FP8_RECIPE}"
 echo "[local-quarter] spec=${CPPMEGA_SPEC_MODULE} ${CPPMEGA_SPEC_FUNCTION}"
 echo "[local-quarter] te_precision_config=${CPPMEGA_TE_PRECISION_CONFIG_FILE:-}"
-echo "[local-quarter] mxfp8_bwd_tn_adapter=${CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER:-0} mxfp8_bwd_backend=${CPPMEGA_TE_MXFP8_BWD_BACKEND:-te_tn_adapter} bf16_fallback=${CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK:-0} nvte_backward_override=${NVTE_BACKWARD_OVERRIDE:-}"
+echo "[local-quarter] mxfp8_bwd_tn_adapter=${CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER:-0} mxfp8_bwd_backend=${CPPMEGA_TE_MXFP8_BWD_BACKEND:-te_tn_adapter} transpose_emit=${CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND:-auto} transpose_emit_swizzled=${CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED:-auto} cutlass_scale_backend=${CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND:-compact} bf16_fallback=${CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK:-0} nvte_backward_override=${NVTE_BACKWARD_OVERRIDE:-}"
 echo "[local-quarter] sparse_mla_fp8_quant=${CPPMEGA_SPARSE_MLA_FP8_QUANT}"
-echo "[local-quarter] optimizer=${CPPMEGA_OPTIMIZER} muon_scalar=${CPPMEGA_MUON_SCALAR_OPTIMIZER}"
+echo "[local-quarter] mtp_depths=${MTP_DEPTHS} mtp_ce_kernel=${CPPMEGA_MTP_CE_KERNEL}"
+echo "[local-quarter] optimizer=${CPPMEGA_OPTIMIZER} param_storage=${CPPMEGA_PARAM_STORAGE} muon_scalar=${CPPMEGA_MUON_SCALAR_OPTIMIZER}"
 echo "[local-quarter] no_master_emerging=${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER} no_master_fallback=${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER} grad_reduce_bf16=${CPPMEGA_GRAD_REDUCE_IN_BF16}"
 echo "[local-quarter] dist_optimizer=${CPPMEGA_USE_DISTRIBUTED_OPTIMIZER} precision_aware=${CPPMEGA_USE_PRECISION_AWARE_OPTIMIZER}"
+echo "[local-quarter] fp8_param_gather=${CPPMEGA_FP8_PARAM_GATHER:-0} reuse_grad_buf_for_mxfp8_param_ag=${CPPMEGA_REUSE_GRAD_BUF_FOR_MXFP8_PARAM_AG:-1}"
 echo "[local-quarter] local_ddp_no_contig_grad_buffer=${CPPMEGA_LOCAL_DDP_DISABLE_CONTIGUOUS_GRAD_BUFFER}"
 echo "[local-quarter] torch_profile=${CPPMEGA_TORCH_PROFILE} profile_dir=${CPPMEGA_TORCH_PROFILE_DIR}"
 echo "[local-quarter] nsys_profile=${CPPMEGA_NSYS_PROFILE} nsys_output=${CPPMEGA_NSYS_OUTPUT}"
@@ -579,8 +618,25 @@ fi
 if [[ "${CPPMEGA_GRAD_REDUCE_IN_BF16}" == "1" || "${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER}" == "1" ]]; then
   OPTIMIZER_ARGS+=(--grad-reduce-in-bf16)
 fi
+if [[ "${CPPMEGA_PARAM_STORAGE}" == "mxfp8" ]]; then
+  if [[ "${CPPMEGA_FP8_PARAM_GATHER:-0}" == "1" ]]; then
+    echo "FATAL: CPPMEGA_PARAM_STORAGE=mxfp8 is the local no-master contract; do not combine with fp8-param-gather" >&2
+    exit 2
+  fi
+  OPTIMIZER_ARGS+=(--mxfp8-param-storage)
+fi
 if [[ "${CPPMEGA_USE_DISTRIBUTED_OPTIMIZER}" == "1" || "${CPPMEGA_USE_PRECISION_AWARE_OPTIMIZER}" == "1" ]]; then
   OPTIMIZER_ARGS+=(--use-distributed-optimizer)
+fi
+if [[ "${CPPMEGA_FP8_RECIPE}" == "mxfp8" && "${CPPMEGA_FP8_PARAM_GATHER:-0}" == "1" ]]; then
+  if [[ "${CPPMEGA_USE_DISTRIBUTED_OPTIMIZER}" != "1" && "${CPPMEGA_USE_PRECISION_AWARE_OPTIMIZER}" != "1" ]]; then
+    echo "FATAL: --fp8-param-gather requires distributed optimizer/FSDP; enable the typed optimizer profile first" >&2
+    exit 2
+  fi
+  OPTIMIZER_ARGS+=(--fp8-param-gather)
+  if [[ "${CPPMEGA_REUSE_GRAD_BUF_FOR_MXFP8_PARAM_AG:-0}" == "1" ]]; then
+    OPTIMIZER_ARGS+=(--reuse-grad-buf-for-mxfp8-param-ag)
+  fi
 fi
 if [[ "${CPPMEGA_USE_PRECISION_AWARE_OPTIMIZER}" == "1" ]]; then
   OPTIMIZER_ARGS+=(
@@ -597,6 +653,15 @@ fi
 TE_PRECISION_ARGS=()
 if [[ -n "${CPPMEGA_TE_PRECISION_CONFIG_FILE:-}" ]]; then
   TE_PRECISION_ARGS+=(--te-precision-config-file "${CPPMEGA_TE_PRECISION_CONFIG_FILE}")
+fi
+FP8_ARGS=()
+if [[ "${CPPMEGA_FP8_RECIPE}" != "off" ]]; then
+  FP8_ARGS+=(
+    --fp8-format hybrid
+    --fp8-recipe "${CPPMEGA_FP8_RECIPE}"
+    --fp8-amax-history-len 1024
+    --fp8-amax-compute-algo max
+  )
 fi
 
 LAUNCH_PREFIX=()
@@ -641,14 +706,12 @@ fi
   --min-lr "${CPPMEGA_MIN_LR:-1e-5}" \
   --lr-decay-style constant \
   --position-embedding-type rope \
+  --no-rope-fusion \
   --normalization RMSNorm \
   --disable-bias-linear \
   --untie-embeddings-and-output-weights \
   --bf16 \
-  --fp8-format hybrid \
-  --fp8-recipe "${CPPMEGA_FP8_RECIPE}" \
-  --fp8-amax-history-len 1024 \
-  --fp8-amax-compute-algo max \
+  "${FP8_ARGS[@]}" \
   --use-mcore-models \
   --transformer-impl transformer_engine \
   --use-flash-attn \

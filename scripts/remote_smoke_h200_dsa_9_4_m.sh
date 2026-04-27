@@ -521,35 +521,28 @@ from cppmega.recipes.nam56r_megatron import build_nam56r_feature_plan
 
 mtp_depths = ${MTP_DEPTHS}
 enable_mtp = mtp_depths > 0
+moe_dispatcher = "alltoall" if "${CPPMEGA_DISPATCHER_OVERRIDE:-}".startswith("alltoall") else "flex"
+moe_router_dtype = None if moe_dispatcher == "alltoall" else "fp32"
 plan = build_nam56r_feature_plan(pattern="AEMEAEMEAEMR", depth=52, mtp_depths=max(mtp_depths, 1))
 bundle = build_nam56r_megatron_native_args(
     plan=plan,
     enable_mla=True,
     enable_mtp=enable_mtp,
     mtp_mode="hybrid",
+    mtp_num_predictors=mtp_depths,
     enable_moe=True,
+    moe_expert_model_parallel_size=${EP_SIZE},
+    moe_token_dispatcher_type=moe_dispatcher,
+    moe_router_dtype=moe_router_dtype,
     enable_dsa=True,
+    dsa_indexer_loss_coeff=float("${CPPMEGA_DSA_INDEXER_LOSS_COEFF}"),
 )
 print(bundle.to_shell_fragment())
 PY
 )
 echo "NATIVE_ARGS (pre-sed): ${NATIVE_ARGS}"
 
-# Override --mtp-num-layers to match MTP_DEPTHS if >1.
-if [ "${MTP_DEPTHS}" -gt 1 ]; then
-  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--mtp-num-layers 1/--mtp-num-layers ${MTP_DEPTHS}/")
-fi
 
-# Strip --dsa-indexer-dtype from NATIVE_ARGS: it is a cppmega recipe arg, not
-# a Megatron CLI arg. The FP8 indexer behavior is controlled entirely by the
-# CPPMEGA_DSA_INDEXER_DTYPE env var and the shim's apply_dsa_fp8_patch().
-NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed 's/ *--dsa-indexer-dtype [a-z0-9]*//')
-
-# Override --expert-model-parallel-size to EP_SIZE (always runs for Stream M:
-# both variants set EP_SIZE >=2).
-if [ "${EP_SIZE}" != "1" ]; then
-  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--expert-model-parallel-size 1/--expert-model-parallel-size ${EP_SIZE}/")
-fi
 
 # Confirm the substitution actually happened.
 if ! echo "${NATIVE_ARGS}" | grep -q -- "--expert-model-parallel-size ${EP_SIZE}"; then
@@ -558,15 +551,8 @@ if ! echo "${NATIVE_ARGS}" | grep -q -- "--expert-model-parallel-size ${EP_SIZE}
 fi
 # EP=1 override: flex dispatcher requires TP*EP > 1, fall back to alltoall
 if [[ "${CPPMEGA_DISPATCHER_OVERRIDE:-}" == alltoall* ]]; then
-  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--moe-token-dispatcher-type flex/--moe-token-dispatcher-type alltoall/")
-  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/ --moe-router-dtype fp32//")
   MOE_EXTRA_FLAGS="--moe-pad-expert-input-to-capacity --moe-expert-capacity-factor 1.0"
   echo "NATIVE_ARGS (alltoall override for EP=1): dispatcher=alltoall"
-fi
-# Override dsa-indexer-loss-coeff in native args if env var set
-if [ "${CPPMEGA_DSA_INDEXER_LOSS_COEFF}" != "" ] && [ "${CPPMEGA_DSA_INDEXER_LOSS_COEFF}" != "0.001" ]; then
-  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--dsa-indexer-loss-coeff [0-9.e-]*/--dsa-indexer-loss-coeff ${CPPMEGA_DSA_INDEXER_LOSS_COEFF}/")
-  echo "NATIVE_ARGS: dsa-indexer-loss-coeff overridden to ${CPPMEGA_DSA_INDEXER_LOSS_COEFF}"
 fi
 echo "NATIVE_ARGS (post-sed): ${NATIVE_ARGS}"
 
