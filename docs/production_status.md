@@ -39,10 +39,11 @@ silent gradient corruption).
   `[sq, b, h, sk]` = ~5 GiB/layer × 9 layers = 45 GiB resident; fused
   `[b, sq, sk]` = 640 MiB/layer × 9 = 5.7 GiB). Unconditional since dd4da34
   — MBS=10 impossible without it regardless of CG_FLAGS.
-- **Do NOT enable**: `CPPMEGA_MTP_NATIVE_HOPPER_CE=1` — produces
-  `grad_norm=NaN`, Suspects #1+#2 both empirically refuted on bench3
-  (2026-04-14). Suspects #3-5 (shared-weight dual-bwd, mask handling,
-  dtype) under investigation
+- **Do NOT force on H200 production**: `CPPMEGA_MTP_NATIVE_HOPPER_CE=1` —
+  the old reduction=`none` path produced `grad_norm=NaN` on bench3
+  (2026-04-14). The current shim has a reduction=`sum`/ignore-index
+  mitigation, and GB10 can route `CPPMEGA_MTP_CE_KERNEL=cce` through that
+  path, but H200 native MTP CE still needs a retained finite-grad receipt.
 
 ## Europe (LOCATION_2) — BF16
 

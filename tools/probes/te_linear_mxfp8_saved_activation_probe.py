@@ -33,16 +33,29 @@ def _load_cppmega_fp8_shim() -> Any:
     return module
 
 
-def _set_mxfp8_profile_env() -> None:
+def _set_mxfp8_profile_env(backend: str | None) -> str:
     os.environ.setdefault("CPPMEGA_ALLOW_TE_MXFP8_SM12", "1")
     os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER", "1")
-    os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_BACKEND", "te_tn_adapter")
-    os.environ.setdefault("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND", "te")
-    os.environ.setdefault("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED", "1")
-    os.environ.setdefault("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT", "1")
+    if backend is not None:
+        os.environ["CPPMEGA_TE_MXFP8_BWD_BACKEND"] = backend
+    backend = os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_BACKEND", "te_tn_adapter")
+    no_sidecar = backend == "cutlass_native"
+    os.environ.setdefault(
+        "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND",
+        "off" if no_sidecar else "te",
+    )
+    os.environ.setdefault(
+        "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED",
+        "0" if no_sidecar else "1",
+    )
+    os.environ.setdefault(
+        "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT",
+        "0" if no_sidecar else "1",
+    )
     os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK", "0")
     os.environ.setdefault("CPPMEGA_TE_MXFP8_DGRAD_BF16", "0")
     os.environ.setdefault("CPPMEGA_TE_MXFP8_WGRAD_BF16", "0")
+    return backend
 
 
 def _saved_tensor_record(tensor: torch.Tensor) -> dict[str, Any]:
@@ -62,7 +75,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     if args.m % 32 or args.n % 32 or args.k % 32:
         raise SystemExit("--m, --n, and --k must be multiples of 32 for MXFP8")
 
-    _set_mxfp8_profile_env()
+    backend = _set_mxfp8_profile_env(args.backend)
     shim_module = _load_cppmega_fp8_shim()
 
     import transformer_engine.pytorch as te
@@ -101,16 +114,36 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     torch.cuda.synchronize()
 
     input_shape = [args.m, args.k]
+    weight_shape = [args.n, args.k]
+    weight_data_ptr = int(linear.weight.data_ptr())
     transpose_payload_shape = [args.k, args.m]
     saved_bf16_input = [
         rec
         for rec in saved_tensors
-        if rec["dtype"] == "torch.bfloat16" and rec["shape"] == input_shape
+        if (
+            rec["dtype"] == "torch.bfloat16"
+            and rec["shape"] == input_shape
+            and rec["data_ptr"] != weight_data_ptr
+        )
+    ]
+    saved_bf16_weight = [
+        rec
+        for rec in saved_tensors
+        if (
+            rec["dtype"] == "torch.bfloat16"
+            and rec["shape"] == weight_shape
+            and rec["data_ptr"] == weight_data_ptr
+        )
     ]
     saved_transpose_payload = [
         rec
         for rec in saved_tensors
         if rec["dtype"] == "torch.uint8" and rec["shape"] == transpose_payload_shape
+    ]
+    saved_input_columnwise_payload = [
+        rec
+        for rec in saved_tensors
+        if rec["dtype"] == "torch.uint8" and rec["shape"] == input_shape
     ]
 
     stats = (
@@ -124,8 +157,6 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     failures: list[str] = []
     if saved_bf16_input:
         failures.append("BF16 input-shaped activation was saved for Linear backward")
-    if not saved_transpose_payload:
-        failures.append("MXFP8 rowwise-transposed payload was not saved for Linear backward")
     if not finite_input_grad:
         failures.append("input gradient is not finite")
     if not finite_weight_grad:
@@ -135,15 +166,35 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         or int(stats.get("bf16_fallback_wgrad", 0)) != 0
     ):
         failures.append("MXFP8 backward used BF16 fallback")
-    if int(stats.get("mxfp8_tn_adapter_saved_transpose_operand", 0)) <= 0:
-        failures.append("TN adapter did not consume a saved transpose operand")
+
+    transpose_emit_backend = os.environ.get("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND", "")
+    direct_no_sidecar = backend == "cutlass_native" and transpose_emit_backend == "off"
+    if direct_no_sidecar:
+        if int(stats.get("mxfp8_cutlass_native_dgrad", 0)) <= 0:
+            failures.append("CUTLASS native backend did not handle dgrad")
+        if int(stats.get("mxfp8_cutlass_native_wgrad", 0)) <= 0:
+            failures.append("CUTLASS native backend did not handle wgrad")
+        if int(stats.get("mxfp8_tn_adapter_te_emit", 0)) != 0:
+            failures.append("no-sidecar backend emitted TE transpose operands")
+        if int(stats.get("mxfp8_tn_sidecar_attr_attached", 0)) != 0:
+            failures.append("no-sidecar backend attached MXFP8 transpose sidecars")
+    else:
+        if not saved_transpose_payload:
+            failures.append(
+                "MXFP8 rowwise-transposed payload was not saved for Linear backward"
+            )
+        if int(stats.get("mxfp8_tn_adapter_saved_transpose_operand", 0)) <= 0:
+            failures.append("TN adapter did not consume a saved transpose operand")
 
     return {
         "status": "pass" if not failures else "fail",
         "failures": failures,
+        "backend": backend,
         "shape": {"m": args.m, "n": args.n, "k": args.k},
         "saved_bf16_input_count": len(saved_bf16_input),
+        "saved_bf16_weight_count": len(saved_bf16_weight),
         "saved_transpose_payload_count": len(saved_transpose_payload),
+        "saved_input_columnwise_payload_count": len(saved_input_columnwise_payload),
         "finite_input_grad": finite_input_grad,
         "finite_weight_grad": finite_weight_grad,
         "saved_tensors": saved_tensors,
@@ -157,6 +208,12 @@ def main() -> None:
     parser.add_argument("--n", type=int, default=96)
     parser.add_argument("--k", type=int, default=128)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument(
+        "--backend",
+        choices=("te_tn_adapter", "flashinfer_cutlass", "cutlass_native"),
+        default=None,
+        help="Override CPPMEGA_TE_MXFP8_BWD_BACKEND before loading the shim.",
+    )
     args = parser.parse_args()
 
     report = _run(args)

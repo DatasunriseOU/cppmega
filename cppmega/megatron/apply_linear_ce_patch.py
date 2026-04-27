@@ -58,6 +58,29 @@ except ImportError:
     _cce_linear_cross_entropy = None  # type: ignore[assignment]
 
 
+def _cce_filter_eps_from_env():
+    """Return the CCE ``filter_eps`` setting requested by the environment.
+
+    ``None`` is the exact backward path and remains the default.  CCE's
+    upstream default ("high") lets ``_cce_backward_kernel`` skip low-impact
+    vocabulary blocks, which can be materially faster, but it is approximate.
+    Keep it opt-in until each training lane has a retained correctness receipt.
+    """
+
+    raw = os.environ.get("CPPMEGA_CCE_FILTER_EPS", "none").strip().lower()
+    if raw in ("", "none", "off", "false", "0"):
+        return None
+    if raw in ("auto", "high"):
+        return raw
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "CPPMEGA_CCE_FILTER_EPS must be one of none|auto|high or a float; "
+            f"got {raw!r}"
+        ) from exc
+
+
 def _native_dispatcher_supports(cc) -> bool:
     """Probe Megatron's native LinearCrossEntropy ``Platform()`` dispatcher.
 
@@ -235,6 +258,7 @@ def _install_cce_compute(LinearCrossEntropyModule, cc) -> None:
     import torch
 
     assert _cce_linear_cross_entropy is not None
+    filter_eps = _cce_filter_eps_from_env()
 
     def _cce_compute_linear_and_cross_entropy_loss(
         self,
@@ -270,10 +294,9 @@ def _install_cce_compute(LinearCrossEntropyModule, cc) -> None:
             ignore_index=ignore_index,
             softcap=None,
             reduction=reduction,
-            # Disable filter_eps: with a small/uncentered lm_head init the
-            # default "high" threshold can skip all backward blocks → zero
-            # gradients. Per nanochat CCE wrapper.
-            filter_eps=None,
+            # Exact by default. CPPMEGA_CCE_FILTER_EPS=high|auto|<float>
+            # enables CCE's approximate block-skip path for profiling lanes.
+            filter_eps=filter_eps,
         )
 
         if reduction == "none":
@@ -288,7 +311,8 @@ def _install_cce_compute(LinearCrossEntropyModule, cc) -> None:
     )
     print(
         f"[cppmega] LinearCrossEntropyModule routed to Apple CCE kernel "
-        f"(cc={cc[0]}.{cc[1]}, pre-Blackwell; supports reduction='none' in bwd)"
+        f"(cc={cc[0]}.{cc[1]}, pre-Blackwell; supports reduction='none' in bwd; "
+        f"filter_eps={filter_eps!r})"
     )
 
 

@@ -1,3 +1,7 @@
+from pathlib import Path
+
+import pytest
+
 from cppmega.recipes.run_profiles import (
     RunProfile,
     get_run_profile,
@@ -27,23 +31,62 @@ def test_h200_profile_renders_pipe_chunks_and_remote_native_overrides():
     assert env["HYBRID_LAYER_PATTERN"].count("|") == 3
     assert env["HYBRID_LAYER_PATTERN"].endswith("/*-/*-")
     assert env["CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE"] == "alltoall"
+    assert env["CPPMEGA_MOE_FLEX_DISPATCHER_BACKEND"] == "deepep"
     assert "--mtp-num-layers 2" in env["NATIVE_ARGS"]
     assert "--expert-model-parallel-size 4" in env["NATIVE_ARGS"]
     assert "--moe-token-dispatcher-type alltoall" in env["NATIVE_ARGS"]
     assert "--moe-router-dtype" not in env["NATIVE_ARGS"]
 
 
-def test_local_gb10_profile_owns_liger_ack_and_optimizer_defaults():
+def test_profile_can_render_explicit_flex_backend_for_ep_lanes():
+    profile = get_run_profile("h200_dsa_9_4_m")
+    profile.model.moe_expert_model_parallel_size = 4
+    profile.model.moe_token_dispatcher_type = "flex"
+    profile.model.moe_flex_dispatcher_backend = "hybridep"
+
+    env = profile_shell_assignments(profile)
+
+    assert env["CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE"] == "flex"
+    assert env["CPPMEGA_MOE_FLEX_DISPATCHER_BACKEND"] == "hybridep"
+    assert "--moe-token-dispatcher-type flex" in env["NATIVE_ARGS"]
+    assert "--moe-flex-dispatcher-backend hybridep" in env["NATIVE_ARGS"]
+    assert "--moe-router-dtype fp32" in env["NATIVE_ARGS"]
+
+
+def test_profile_rejects_flex_without_expert_parallelism():
+    profile = get_run_profile("local_gb10_quarter")
+    profile.model.moe_token_dispatcher_type = "flex"
+
+    with pytest.raises(ValueError, match="requires moe_expert_model_parallel_size > 1"):
+        profile_shell_assignments(profile)
+
+
+def test_profile_rejects_flex_without_fp32_router_probs():
+    profile = get_run_profile("h200_dsa_9_4_m")
+    profile.model.moe_expert_model_parallel_size = 4
+    profile.model.moe_token_dispatcher_type = "flex"
+    profile.model.moe_router_dtype = None
+
+    with pytest.raises(ValueError, match="requires moe_router_dtype=fp32"):
+        profile_shell_assignments(profile)
+
+
+def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     profile = get_run_profile("local_gb10_quarter")
     profile.precision.fp8_recipe = "mxfp8"
     env = profile_shell_assignments(profile)
 
-    assert env["CPPMEGA_MTP_CE_KERNEL"] == "liger"
-    assert env["CPPMEGA_I_UNDERSTAND_MTP_LIGER_CE_IS_DEPRECATED"] == "1"
+    assert env["CPPMEGA_MTP_CE_KERNEL"] == "cce"
+    assert "CPPMEGA_I_UNDERSTAND_MTP_LIGER_CE_IS_DEPRECATED" not in env
     assert env["CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE"] == "alltoall"
+    assert env["CPPMEGA_USE_FLASH_ATTN"] == "1"
+    assert env["CPPMEGA_ATTN_BACKEND"] == "auto"
+    assert env["CPPMEGA_DSA_FP8_ATTENTION"] == "0"
+    assert "--moe-token-dispatcher-type alltoall" in env["NATIVE_ARGS"]
     assert env["CPPMEGA_OPTIMIZER"] == "muon"
     assert env["CPPMEGA_PARAM_STORAGE"] == "mxfp8"
     assert env["CPPMEGA_FP8_FORMAT"] == "e4m3"
+    assert env["CPPMEGA_MUON_NUM_NS_STEPS"] == "3"
     assert env["CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE"] == "int8"
     assert env["CPPMEGA_TE_MXFP8_BWD_BACKEND"] == "flashinfer_cutlass"
     assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
@@ -96,10 +139,14 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
             "adam",
             "--param-storage",
             "bf16",
+            "--muon-num-ns-steps",
+            "5",
             "--fp8-recipe",
             "mxfp8",
             "--fp8-format",
             "e4m3",
+            "--attention-backend",
+            "fused",
             "--mxfp8-bwd-backend",
             "cutlass_native",
             "--mxfp8-transpose-emit-backend",
@@ -108,6 +155,14 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
             "--no-reuse-grad-buf-for-mxfp8-param-ag",
             "--no-mxfp8-transpose-emit-swizzled",
             "--no-mxfp8-transpose-emit-strict",
+            "--nsys-capture-mode",
+            "delay",
+            "--nsys-delay",
+            "15",
+            "--nsys-duration",
+            "5",
+            "--nsys-trace",
+            "cuda,nvtx,osrt",
         ],
     )
 
@@ -117,14 +172,49 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
     assert "export MTP_DEPTHS=1" in out
     assert "export CPPMEGA_OPTIMIZER=adam" in out
     assert "export CPPMEGA_PARAM_STORAGE=bf16" in out
+    assert "export CPPMEGA_MUON_NUM_NS_STEPS=5" in out
     assert "export CPPMEGA_FP8_FORMAT=e4m3" in out
+    assert "export CPPMEGA_ATTN_BACKEND=fused" in out
     assert "export CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native" in out
     assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=off" in out
     assert "export CPPMEGA_FP8_PARAM_GATHER=1" in out
     assert "export CPPMEGA_REUSE_GRAD_BUF_FOR_MXFP8_PARAM_AG=0" in out
     assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED=0" in out
     assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT=0" in out
+    assert "export CPPMEGA_NSYS_CAPTURE_MODE=delay" in out
+    assert "export CPPMEGA_NSYS_TRACE=cuda,nvtx,osrt" in out
+    assert "export CPPMEGA_NSYS_DELAY=15" in out
+    assert "export CPPMEGA_NSYS_DURATION=5" in out
     assert "--mtp-num-layers 1" in out
+
+
+def test_nsys_profile_defaults_to_full_capture_not_cuda_profiler_api():
+    profile = get_run_profile("local_gb10_quarter")
+    profile.profiling.nsys_profile = True
+
+    env = profile_shell_assignments(profile)
+
+    assert env["CPPMEGA_NSYS_CAPTURE_MODE"] == "full"
+    assert env["CPPMEGA_NSYS_TRACE"] == "cuda-sw,nvtx,osrt"
+
+
+def test_local_launcher_lets_native_args_own_moe_dispatcher_flag():
+    script = Path("scripts/local_gb10_quarter_train.sh").read_text()
+
+    assert '${NATIVE_ARGS} \\' in script
+    assert '--attention-backend "${CPPMEGA_ATTN_BACKEND}"' in script
+    assert 'FLASH_ATTN_ARGS+=(--use-flash-attn)' in script
+    assert "--attention-backend flash" not in script
+    assert '--moe-token-dispatcher-type "${CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE}"' not in script
+    assert "apply_moe_dispatcher_identity_sort_patch()" in script
+    assert "CPPMEGA_MUON_NUM_NS_STEPS:-3" in script
+
+
+def test_remote_gb10_launcher_preserves_muon_ns_override():
+    script = Path("scripts/remote_train_gb10_nam56r_single.sh").read_text()
+
+    assert "CPPMEGA_MUON_NUM_NS_STEPS:-3" in script
+    assert '--muon-num-ns-steps "${CPPMEGA_MUON_NUM_NS_STEPS}"' in script
 
 
 def test_local_gb10_quarter_mxfp8_defaults_to_flashinfer_cutlass():

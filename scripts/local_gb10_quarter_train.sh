@@ -37,6 +37,7 @@ export CPPMEGA_MAMBA3_MIMO="${CPPMEGA_MAMBA3_MIMO:-1}"
 export CPPMEGA_MAMBA_NUM_GROUPS="${CPPMEGA_MAMBA_NUM_GROUPS:-8}"
 export CPPMEGA_MAMBA_RECOMPUTE="${CPPMEGA_MAMBA_RECOMPUTE:-1}"
 export CPPMEGA_DSA_SPARSE_MODE="${CPPMEGA_DSA_SPARSE_MODE:-tilelang}"
+export CPPMEGA_DSA_FP8_ATTENTION="${CPPMEGA_DSA_FP8_ATTENTION:-0}"
 export CPPMEGA_DSA_INDEXER_LOSS_COEFF="${CPPMEGA_DSA_INDEXER_LOSS_COEFF:-0}"
 export CPPMEGA_DSA_SKIP_INDEXER_LOSS="${CPPMEGA_DSA_SKIP_INDEXER_LOSS:-1}"
 export CPPMEGA_SEQ_LENGTH="${CPPMEGA_SEQ_LENGTH:-4096}"
@@ -72,6 +73,19 @@ fi
 export CPPMEGA_SPEC_MODULE="${CPPMEGA_SPEC_MODULE:-cppmega.megatron.nam56r_noconv_spec}"
 export CPPMEGA_SPEC_FUNCTION="${CPPMEGA_SPEC_FUNCTION:-build_cppmega_nam56r_noconv_stack_spec}"
 export CPPMEGA_SPARSE_MLA_FP8_QUANT="${CPPMEGA_SPARSE_MLA_FP8_QUANT:-te_tensorwise}"
+export CPPMEGA_USE_FLASH_ATTN="${CPPMEGA_USE_FLASH_ATTN:-1}"
+if [[ "${CPPMEGA_USE_FLASH_ATTN}" != "0" && "${CPPMEGA_USE_FLASH_ATTN}" != "1" ]]; then
+  echo "FATAL: CPPMEGA_USE_FLASH_ATTN must be 0 or 1" >&2
+  exit 2
+fi
+export CPPMEGA_ATTN_BACKEND="${CPPMEGA_ATTN_BACKEND:-auto}"
+case "${CPPMEGA_ATTN_BACKEND}" in
+  auto|flash|fused|unfused) ;;
+  *)
+    echo "FATAL: CPPMEGA_ATTN_BACKEND must be auto, flash, fused, or unfused" >&2
+    exit 2
+    ;;
+esac
 export CPPMEGA_OPTIMIZER="${CPPMEGA_OPTIMIZER:-muon}"
 export CPPMEGA_PARAM_STORAGE="${CPPMEGA_PARAM_STORAGE:-bf16}"
 if [[ "${CPPMEGA_PARAM_STORAGE}" != "bf16" && "${CPPMEGA_PARAM_STORAGE}" != "mxfp8" ]]; then
@@ -84,7 +98,7 @@ if [[ "${CPPMEGA_PARAM_STORAGE}" == "mxfp8" && "${CPPMEGA_FP8_RECIPE}" != "mxfp8
 fi
 export CPPMEGA_MUON_MOMENTUM="${CPPMEGA_MUON_MOMENTUM:-0.95}"
 export CPPMEGA_MUON_SCALE_MODE="${CPPMEGA_MUON_SCALE_MODE:-spectral}"
-export CPPMEGA_MUON_NUM_NS_STEPS="${CPPMEGA_MUON_NUM_NS_STEPS:-5}"
+export CPPMEGA_MUON_NUM_NS_STEPS="${CPPMEGA_MUON_NUM_NS_STEPS:-3}"
 export CPPMEGA_MUON_TP_MODE="${CPPMEGA_MUON_TP_MODE:-blockwise}"
 export CPPMEGA_MUON_SCALAR_OPTIMIZER="${CPPMEGA_MUON_SCALAR_OPTIMIZER:-adam8bit}"
 export CPPMEGA_MUON_QUANTIZED_MOMENTUM="${CPPMEGA_MUON_QUANTIZED_MOMENTUM:-1}"
@@ -108,10 +122,15 @@ export CPPMEGA_TORCH_PROFILE_STEPS="${CPPMEGA_TORCH_PROFILE_STEPS:-2}"
 export CPPMEGA_TORCH_PROFILE_DIR="${CPPMEGA_TORCH_PROFILE_DIR:-/home/dave/logs/${RUN_ID}_torch_profile}"
 export CPPMEGA_NSYS_PROFILE="${CPPMEGA_NSYS_PROFILE:-0}"
 export CPPMEGA_NSYS_OUTPUT="${CPPMEGA_NSYS_OUTPUT:-/home/dave/logs/${RUN_ID}_nsys}"
+export CPPMEGA_NSYS_CAPTURE_MODE="${CPPMEGA_NSYS_CAPTURE_MODE:-full}"
+export CPPMEGA_NSYS_TRACE="${CPPMEGA_NSYS_TRACE:-cuda-sw,nvtx,osrt}"
+export CPPMEGA_NSYS_DELAY="${CPPMEGA_NSYS_DELAY:-0}"
+export CPPMEGA_NSYS_DURATION="${CPPMEGA_NSYS_DURATION:-0}"
 export CPPMEGA_CUDA_PROFILE="${CPPMEGA_CUDA_PROFILE:-0}"
 export CPPMEGA_CUDA_PROFILE_STEP_START="${CPPMEGA_CUDA_PROFILE_STEP_START:-3}"
 export CPPMEGA_CUDA_PROFILE_STEP_END="${CPPMEGA_CUDA_PROFILE_STEP_END:-4}"
-export CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE="${CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE:-flex}"
+export CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE="${CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE:-alltoall}"
+export CPPMEGA_MOE_FLEX_DISPATCHER_BACKEND="${CPPMEGA_MOE_FLEX_DISPATCHER_BACKEND:-deepep}"
 if [[ "${CPPMEGA_MEMORY_DEBUG}" == "1" ]]; then
   export NANOCHAT_MEMORY_DEBUG="${NANOCHAT_MEMORY_DEBUG:-1}"
 fi
@@ -143,6 +162,32 @@ PY
 python -m cppmega.megatron.preflight_smem_check
 
 cp "${MEGATRON_ROOT}/pretrain_mamba.py" "${WORKDIR}/pretrain_mamba.py"
+
+cat > "${WORKDIR}/sitecustomize.py" <<'PY'
+"""Local launcher-only hooks imported automatically by Python's site module."""
+
+from __future__ import annotations
+
+import atexit
+import os
+
+
+def _sync_cuda_for_nsys() -> None:
+    """Let CUPTI resolve GPU timestamps before Nsight Systems stops collection."""
+
+    try:
+        import torch
+
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            torch.cuda.synchronize()
+    except Exception:
+        # Profiling cleanup must never mask the training process exit status.
+        pass
+
+
+if os.environ.get("CPPMEGA_NSYS_PROFILE", "0") == "1":
+    atexit.register(_sync_cuda_for_nsys)
+PY
 
 cat > "${WORKDIR}/mamba_builders.py" <<'PY'
 from cppmega.megatron.mamba_builder import cppmega_mamba_builder as mamba_builder
@@ -187,8 +232,10 @@ from cppmega.megatron.apply_linear_ce_patch import (
     patch_mamba_output_layer_with_linear_ce,
 )
 from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_patch
+from cppmega.megatron.moe_dispatcher_patch import apply_moe_dispatcher_identity_sort_patch
 
 apply_dsa_indexer_fused_patch()
+apply_moe_dispatcher_identity_sort_patch()
 patch_mamba_output_layer_with_linear_ce()
 print("[local_quarter_shim] full GB10 training patches installed", file=sys.stderr)
 
@@ -563,6 +610,14 @@ sed -i '1i import cppmega_local_quarter_shim  # local GB10 quarter train patches
 
 : "${HYBRID_LAYER_PATTERN:?run profile did not set HYBRID_LAYER_PATTERN}"
 : "${NATIVE_ARGS:?run profile did not set NATIVE_ARGS}"
+case " ${NATIVE_ARGS} " in
+  *" --moe-token-dispatcher-type ${CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE} "*) ;;
+  *)
+    echo "FATAL: NATIVE_ARGS dispatcher does not match CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE=${CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE}" >&2
+    echo "NATIVE_ARGS=${NATIVE_ARGS}" >&2
+    exit 2
+    ;;
+esac
 
 (
   while true; do
@@ -587,15 +642,18 @@ echo "[local-quarter] fp8_format=${CPPMEGA_FP8_FORMAT} fp8_recipe=${CPPMEGA_FP8_
 echo "[local-quarter] spec=${CPPMEGA_SPEC_MODULE} ${CPPMEGA_SPEC_FUNCTION}"
 echo "[local-quarter] te_precision_config=${CPPMEGA_TE_PRECISION_CONFIG_FILE:-}"
 echo "[local-quarter] mxfp8_bwd_tn_adapter=${CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER:-0} mxfp8_bwd_backend=${CPPMEGA_TE_MXFP8_BWD_BACKEND:-te_tn_adapter} transpose_emit=${CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND:-auto} transpose_emit_swizzled=${CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED:-auto} cutlass_scale_backend=${CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND:-compact} bf16_fallback=${CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK:-0} nvte_backward_override=${NVTE_BACKWARD_OVERRIDE:-}"
-echo "[local-quarter] sparse_mla_fp8_quant=${CPPMEGA_SPARSE_MLA_FP8_QUANT}"
+echo "[local-quarter] sparse_mla_fp8_quant=${CPPMEGA_SPARSE_MLA_FP8_QUANT} dsa_fp8_attention=${CPPMEGA_DSA_FP8_ATTENTION}"
+echo "[local-quarter] attention_backend=${CPPMEGA_ATTN_BACKEND} use_flash_attn=${CPPMEGA_USE_FLASH_ATTN}"
+echo "[local-quarter] moe_dispatcher=${CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE} moe_flex_backend=${CPPMEGA_MOE_FLEX_DISPATCHER_BACKEND}"
 echo "[local-quarter] mtp_depths=${MTP_DEPTHS} mtp_ce_kernel=${CPPMEGA_MTP_CE_KERNEL}"
-echo "[local-quarter] optimizer=${CPPMEGA_OPTIMIZER} param_storage=${CPPMEGA_PARAM_STORAGE} muon_scalar=${CPPMEGA_MUON_SCALAR_OPTIMIZER}"
+echo "[local-quarter] optimizer=${CPPMEGA_OPTIMIZER} param_storage=${CPPMEGA_PARAM_STORAGE} muon_scalar=${CPPMEGA_MUON_SCALAR_OPTIMIZER} muon_ns_steps=${CPPMEGA_MUON_NUM_NS_STEPS}"
 echo "[local-quarter] no_master_emerging=${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER} no_master_fallback=${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER} grad_reduce_bf16=${CPPMEGA_GRAD_REDUCE_IN_BF16}"
 echo "[local-quarter] dist_optimizer=${CPPMEGA_USE_DISTRIBUTED_OPTIMIZER} precision_aware=${CPPMEGA_USE_PRECISION_AWARE_OPTIMIZER}"
 echo "[local-quarter] fp8_param_gather=${CPPMEGA_FP8_PARAM_GATHER:-0} reuse_grad_buf_for_mxfp8_param_ag=${CPPMEGA_REUSE_GRAD_BUF_FOR_MXFP8_PARAM_AG:-1}"
 echo "[local-quarter] local_ddp_no_contig_grad_buffer=${CPPMEGA_LOCAL_DDP_DISABLE_CONTIGUOUS_GRAD_BUFFER}"
 echo "[local-quarter] torch_profile=${CPPMEGA_TORCH_PROFILE} profile_dir=${CPPMEGA_TORCH_PROFILE_DIR}"
 echo "[local-quarter] nsys_profile=${CPPMEGA_NSYS_PROFILE} nsys_output=${CPPMEGA_NSYS_OUTPUT}"
+echo "[local-quarter] nsys_capture_mode=${CPPMEGA_NSYS_CAPTURE_MODE} nsys_trace=${CPPMEGA_NSYS_TRACE} nsys_delay=${CPPMEGA_NSYS_DELAY} nsys_duration=${CPPMEGA_NSYS_DURATION}"
 echo "[local-quarter] cuda_profile=${CPPMEGA_CUDA_PROFILE} cuda_profile_steps=${CPPMEGA_CUDA_PROFILE_STEP_START}:${CPPMEGA_CUDA_PROFILE_STEP_END}"
 
 # shellcheck disable=SC2206
@@ -673,6 +731,10 @@ if [[ "${CPPMEGA_FP8_RECIPE}" != "off" ]]; then
     --fp8-amax-compute-algo max
   )
 fi
+FLASH_ATTN_ARGS=()
+if [[ "${CPPMEGA_USE_FLASH_ATTN}" == "1" ]]; then
+  FLASH_ATTN_ARGS+=(--use-flash-attn)
+fi
 PROFILE_ARGS=()
 if [[ "${CPPMEGA_CUDA_PROFILE}" == "1" ]]; then
   PROFILE_ARGS+=(
@@ -682,22 +744,60 @@ if [[ "${CPPMEGA_CUDA_PROFILE}" == "1" ]]; then
   )
 fi
 
-LAUNCH_PREFIX=()
+TORCHRUN_EXTRA_ARGS=()
+TRAINING_ENTRY=("${WORKDIR}/pretrain_mamba.py")
 if [[ "${CPPMEGA_NSYS_PROFILE}" == "1" ]]; then
-  LAUNCH_PREFIX=(
+  case "${CPPMEGA_NSYS_CAPTURE_MODE}" in
+    full|delay|cudaProfilerApi) ;;
+    *)
+      echo "FATAL: CPPMEGA_NSYS_CAPTURE_MODE must be full, delay, or cudaProfilerApi" >&2
+      exit 2
+      ;;
+  esac
+  if [[ "${CPPMEGA_NSYS_CAPTURE_MODE}" == "delay" && "${CPPMEGA_NSYS_DURATION}" -lt 1 ]]; then
+    echo "FATAL: nsys capture mode 'delay' requires CPPMEGA_NSYS_DURATION >= 1" >&2
+    exit 2
+  fi
+  if [[ "${CPPMEGA_NSYS_CAPTURE_MODE}" == "cudaProfilerApi" ]]; then
+    echo "[local-quarter] WARNING: nsys cudaProfilerApi capture is known to drop CUDA kernel records on this GB10/CUDA 13.2 stack; use --nsys-capture-mode full or delay for kernel tables" >&2
+  fi
+  cat > "${WORKDIR}/nsys_rank0_wrapper.sh" <<'WRAPPER'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${LOCAL_RANK:-0}" == "0" ]]; then
+  cmd=(
     nsys profile
-    --trace=cuda,nvtx,osrt
-    --cuda-memory-usage=true
+    "--trace=${CPPMEGA_NSYS_TRACE}"
     --sample=none
     --cpuctxsw=none
-    --trace-fork-before-exec=true
+    --gpu-metrics-devices=none
+    --cuda-graph-trace=node
     --force-overwrite=true
     --wait=all
-    -o "${CPPMEGA_NSYS_OUTPUT}"
+    --export=none
+    "--output=${CPPMEGA_NSYS_OUTPUT}"
   )
+  if [[ "${CPPMEGA_NSYS_CAPTURE_MODE}" == "delay" ]]; then
+    cmd+=("--delay=${CPPMEGA_NSYS_DELAY}" "--duration=${CPPMEGA_NSYS_DURATION}")
+  elif [[ "${CPPMEGA_NSYS_CAPTURE_MODE}" == "cudaProfilerApi" ]]; then
+    cmd+=(
+      --capture-range=cudaProfilerApi
+      --capture-range-end=stop
+      --kill=none
+      --flush-on-cudaprofilerstop=true
+    )
+  fi
+  exec "${cmd[@]}" python "$@"
+else
+  exec python "$@"
+fi
+WRAPPER
+  chmod +x "${WORKDIR}/nsys_rank0_wrapper.sh"
+  TORCHRUN_EXTRA_ARGS+=(--no-python)
+  TRAINING_ENTRY=("${WORKDIR}/nsys_rank0_wrapper.sh" "${WORKDIR}/pretrain_mamba.py")
 fi
 
-"${LAUNCH_PREFIX[@]}" python -m torch.distributed.run --nproc_per_node=1 "${WORKDIR}/pretrain_mamba.py" \
+python -m torch.distributed.run --nproc_per_node=1 "${TORCHRUN_EXTRA_ARGS[@]}" "${TRAINING_ENTRY[@]}" \
   "${DATA_ARGS[@]}" \
   --tokenizer-type HuggingFaceTokenizer \
   --tokenizer-model "${CPPMEGA_TOKENIZER_MODEL}" \
@@ -732,8 +832,8 @@ fi
   "${FP8_ARGS[@]}" \
   --use-mcore-models \
   --transformer-impl transformer_engine \
-  --use-flash-attn \
-  --attention-backend flash \
+  "${FLASH_ATTN_ARGS[@]}" \
+  --attention-backend "${CPPMEGA_ATTN_BACKEND}" \
   "${PROFILE_ARGS[@]}" \
   "${TE_PRECISION_ARGS[@]}" \
   --spec "${CPPMEGA_SPEC_MODULE}" "${CPPMEGA_SPEC_FUNCTION}" \
@@ -745,7 +845,6 @@ fi
   --clip-grad 1.0 \
   "${OPTIMIZER_ARGS[@]}" \
   ${NATIVE_ARGS} \
-  --moe-token-dispatcher-type "${CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE}" \
   --save-interval 50000000 \
   --log-interval 1 \
   > "${LOG}" 2>&1

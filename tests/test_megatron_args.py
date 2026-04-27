@@ -20,6 +20,9 @@ def test_megatron_args_bundle_emits_native_mla_mtp_fim_moe_dsa_flags():
     assert "--multi-token-prediction" in bundle.args
     assert "--fim-rate" in bundle.args
     assert "--num-experts" in bundle.args
+    assert bundle.args[bundle.args.index("--moe-token-dispatcher-type") + 1] == "alltoall"
+    assert "--moe-permute-fusion" in bundle.args
+    assert "--moe-router-fusion" in bundle.args
     assert "--experimental-attention-variant" in bundle.args
     assert bundle.args[bundle.args.index("--experimental-attention-variant") + 1] == "dsa"
     # NOTE: ``--dsa-indexer-dtype`` is intentionally NOT emitted as a CLI flag;
@@ -70,6 +73,31 @@ def test_megatron_args_bundle_accepts_remote_moe_overrides_without_sed():
     assert bundle.args[bundle.args.index("--expert-model-parallel-size") + 1] == "4"
     assert bundle.args[bundle.args.index("--moe-token-dispatcher-type") + 1] == "alltoall"
     assert "--moe-router-dtype" not in bundle.args
+
+
+def test_megatron_args_bundle_emits_explicit_flex_backend():
+    plan = build_nam56r_feature_plan(pattern="AEMEAEMEAEMR", depth=52, mtp_depths=2)
+    bundle = build_megatron_args_bundle(
+        plan=plan,
+        use_moe=True,
+        moe_expert_model_parallel_size=4,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+    )
+
+    assert bundle.args[bundle.args.index("--moe-token-dispatcher-type") + 1] == "flex"
+    assert bundle.args[bundle.args.index("--moe-flex-dispatcher-backend") + 1] == "hybridep"
+
+
+def test_megatron_args_bundle_rejects_unknown_flex_backend():
+    plan = build_nam56r_feature_plan(pattern="AEMEAEMEAEMR", depth=52, mtp_depths=2)
+    with pytest.raises(ValueError, match="unsupported moe_flex_dispatcher_backend"):
+        build_megatron_args_bundle(
+            plan=plan,
+            use_moe=True,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="bad",
+        )
 
 
 def test_megatron_args_bundle_marks_custom_features_as_notes_only():
