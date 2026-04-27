@@ -106,6 +106,7 @@ export CPPMEGA_NSYS_OUTPUT="${CPPMEGA_NSYS_OUTPUT:-/home/dave/logs/${RUN_ID}_nsy
 export CPPMEGA_CUDA_PROFILE="${CPPMEGA_CUDA_PROFILE:-0}"
 export CPPMEGA_CUDA_PROFILE_STEP_START="${CPPMEGA_CUDA_PROFILE_STEP_START:-3}"
 export CPPMEGA_CUDA_PROFILE_STEP_END="${CPPMEGA_CUDA_PROFILE_STEP_END:-4}"
+export CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE="${CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE:-flex}"
 if [[ "${CPPMEGA_MEMORY_DEBUG}" == "1" ]]; then
   export NANOCHAT_MEMORY_DEBUG="${NANOCHAT_MEMORY_DEBUG:-1}"
 fi
@@ -739,7 +740,7 @@ fi
   --clip-grad 1.0 \
   "${OPTIMIZER_ARGS[@]}" \
   ${NATIVE_ARGS} \
-  --moe-token-dispatcher-type alltoall \
+  --moe-token-dispatcher-type "${CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE}" \
   --save-interval 50000000 \
   --log-interval 1 \
   > "${LOG}" 2>&1
