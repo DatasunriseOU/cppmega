@@ -133,12 +133,22 @@ constexpr int64_t kOperandColumnwiseTranspose =
     static_cast<int64_t>(
         cutlass::gemm::collective::CppMegaCompactOperandSource::kColumnwiseTranspose);
 
+// UseAuxiliaryLoad=true (5th template arg) splits the manual scale+payload
+// load across two producer warps: Mainloop role (warp 0) loads A+SFA, the
+// MainloopAux role (warp 3) loads B+SFB via load_auxiliary -> load_NK.
+// Gated in the SM90 cooperative kernel template by
+// detail::HasAuxiliaryLoad_v<DispatchPolicy>; our policy publishes it via
+// the bool template parameter. Measured 2.22x speedup on dgrad_nn manual
+// payload path (M=N=256,K=512: 120 us -> 54 us). The CollectiveMma
+// specialization in cppmega_sm120_blockscaled_mma_tma_compact_scale.hpp
+// was extended to accept the bool template arg so this matches.
 using CompactScaleDispatchPolicy =
     cutlass::gemm::collective::MainloopSm120TmaWarpSpecializedBlockScaledCompactScale<
         CollectiveMainloop::DispatchPolicy::Stages,
         CollectiveMainloop::DispatchPolicy::SchedulerPipelineStageCount,
         typename CollectiveMainloop::DispatchPolicy::ClusterShape,
-        typename CollectiveMainloop::DispatchPolicy::Schedule>;
+        typename CollectiveMainloop::DispatchPolicy::Schedule,
+        true>;
 
 using CompactScaleAsymmetricDispatchPolicy =
     cutlass::gemm::collective::MainloopSm120TmaWarpSpecializedBlockScaledCompactScale<
