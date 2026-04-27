@@ -56,8 +56,126 @@ deprecated; do not re-introduce it.
 from __future__ import annotations
 
 import os
+import sys as _sys
 import warnings
 import weakref as _weakref
+
+# -----------------------------------------------------------------------------
+# (-1) TransformerEngine version compatibility gate
+# -----------------------------------------------------------------------------
+# This shim deeply patches TE internals (MXFP8Quantizer.quantize,
+# update_quantized, transformer_engine_torch.split_quantize, the
+# TransformerEngineBaseModule.grad_output_preprocess static method, the
+# private general_gemm / general_grouped_gemm / quantize_weight /
+# apply_normalization / gather_along_first_dim helpers in
+# transformer_engine.pytorch.module.{linear,layernorm_linear,layernorm_mlp,
+# grouped_linear} and transformer_engine.pytorch.ops.basic.*).  All of
+# those attribute names and signatures are private TE API and have churned
+# between 2.13, 2.14 and the cppmega 2.16.0.dev0 fork.
+#
+# The list below tracks the TE versions we have actually validated cppmega
+# against on a GB10 box.  Newer/older versions are gated behind a warning
+# (default, so existing CI does not break) and an opt-in strict mode that
+# refuses to load.
+_SUPPORTED_TE_VERSIONS = (
+    "2.13",
+    "2.13.0",
+    "2.14",
+    "2.14.0",
+    "2.15",
+    "2.15.0",
+    "2.16.0.dev0",
+    "2.16.0",
+)
+
+
+def _cppmega_te_version_matches(version: str) -> bool:
+    """Return True if `version` matches one of `_SUPPORTED_TE_VERSIONS`.
+
+    Accepts both exact matches (`2.16.0.dev0`) and bare ``major.minor``
+    prefixes (`2.13` matches `2.13.1`, `2.13.0+abc`, etc.).
+    """
+    if version in _SUPPORTED_TE_VERSIONS:
+        return True
+    for _supported in _SUPPORTED_TE_VERSIONS:
+        if "." not in _supported:
+            continue
+        # Treat short "2.13" / "2.14" entries as major.minor wildcards.
+        _parts = _supported.split(".")
+        if len(_parts) == 2 and version.startswith(_supported + "."):
+            return True
+    return False
+
+
+def _check_te_version() -> None:
+    """Validate the installed TE version against `_SUPPORTED_TE_VERSIONS`.
+
+    Default behavior is a stderr warning so that the shim still loads on
+    untested TE builds (people may want to bring up newer TE).  The
+    opt-in env var `CPPMEGA_TE_VERSION_STRICT=1` upgrades the warning to
+    a `RuntimeError` so production launches fail loudly when TE drifts
+    from the validated set.
+    """
+    try:
+        import transformer_engine as _te
+    except ImportError:
+        print(
+            "[cppmega_fp8_shim] transformer_engine is not importable; "
+            "skipping TE version compatibility check. Most TE-dependent "
+            "patches in this shim will no-op.",
+            file=_sys.stderr,
+        )
+        return
+    except Exception as _te_import_exc:  # pragma: no cover - defensive
+        print(
+            "[cppmega_fp8_shim] transformer_engine import raised "
+            f"{type(_te_import_exc).__name__}: {_te_import_exc}; "
+            "skipping TE version compatibility check.",
+            file=_sys.stderr,
+        )
+        return
+
+    _version = getattr(_te, "__version__", None)
+    if _version is None:
+        _msg = (
+            "[cppmega_fp8_shim] transformer_engine has no __version__ "
+            "attribute; cannot validate against the cppmega-supported set "
+            f"{_SUPPORTED_TE_VERSIONS}. Patches may silently no-op."
+        )
+        if os.environ.get("CPPMEGA_TE_VERSION_STRICT", "0") == "1":
+            raise RuntimeError(
+                _msg + " Set CPPMEGA_TE_VERSION_STRICT=0 to override at "
+                "your own risk."
+            )
+        print(_msg, file=_sys.stderr)
+        return
+
+    if _cppmega_te_version_matches(str(_version)):
+        return
+
+    _msg = (
+        f"[cppmega_fp8_shim] Unsupported TransformerEngine version "
+        f"{_version!r}; cppmega_fp8_shim.py is pinned to "
+        f"{_SUPPORTED_TE_VERSIONS}. The shim's MXFP8/recipe/general_gemm "
+        "monkey-patches assume TE-internal attribute names and signatures "
+        "from those releases; on other versions, patches may silently "
+        "no-op (resulting in slow copy-based MXFP8 transpose paths) or "
+        "apply to renamed functions."
+    )
+    if os.environ.get("CPPMEGA_TE_VERSION_STRICT", "0") == "1":
+        raise RuntimeError(
+            _msg + " Set CPPMEGA_TE_VERSION_STRICT=0 to override at your "
+            "own risk."
+        )
+    print(
+        _msg
+        + " Set CPPMEGA_TE_VERSION_STRICT=1 to make this a hard failure.",
+        file=_sys.stderr,
+    )
+
+
+_check_te_version()
+
 
 _CPPMEGA_MXFP8_TN_SIDECAR_ATTR = "_cppmega_mxfp8_rowwise_transpose"
 _CPPMEGA_MXFP8_TN_SIDECAR_PERSISTENT_ATTR = (
@@ -112,6 +230,12 @@ if os.environ.get("CPPMEGA_ALLOW_TE_MXFP8_SM12", "0") == "1":
         import torch as _torch
         import transformer_engine.pytorch.quantization as _te_quantization
 
+        assert hasattr(_te_quantization, "check_mxfp8_support"), (
+            "transformer_engine.pytorch.quantization.check_mxfp8_support is "
+            "missing; cppmega_fp8_shim.py was tested against TE "
+            f"{_SUPPORTED_TE_VERSIONS} and patches this symbol directly. "
+            "If TE has been upgraded, the sm_12.x bypass needs to be ported."
+        )
         _orig_check_mxfp8_support = _te_quantization.check_mxfp8_support
 
         def _cppmega_check_mxfp8_support():
@@ -259,7 +383,14 @@ if (
 
         try:
             from transformer_engine.common.recipe import NVFP4BlockScaling as _TE_NVFP4Recipe
-        except Exception:  # pragma: no cover
+        except Exception as _nvfp4_import_exc:  # pragma: no cover
+            print(
+                "[cppmega_fp8_shim] NVFP4BlockScaling import skipped "
+                f"({type(_nvfp4_import_exc).__name__}: {_nvfp4_import_exc}); "
+                "NVFP4 recipe back-compat patches will not be installed. "
+                f"Tested against TE {_SUPPORTED_TE_VERSIONS}.",
+                file=_sys.stderr,
+            )
             _TE_NVFP4Recipe = None
 
         _cppmega_backward_override = _te_backward_override
@@ -377,6 +508,7 @@ if (
         _cppmega_mark_recipe(_TE_NVFP4Recipe)
         _cppmega_quantize_weight_debug_count = [0]
         _cppmega_attach_debug_count = [0]
+        _cppmega_attach_warned_missing_qrt = [False]
         _cppmega_mxfp8_tn_sidecar_registry = {}
         # Forward can create hundreds of MXFP8 transpose sidecars before the
         # matching backward GEMM consumes the earliest ones. Keep enough entries
@@ -719,6 +851,19 @@ if (
                 _cppmega_record_bwd_stat(
                     "mxfp8_tn_adapter_te_emit_failed", "missing_quantize_rowwise_transpose"
                 )
+                if not _cppmega_attach_warned_missing_qrt[0]:
+                    _cppmega_attach_warned_missing_qrt[0] = True
+                    print(
+                        "[cppmega_fp8_shim] WARNING: MXFP8Quantizer is missing "
+                        "quantize_rowwise_transpose; the TN adapter will fall "
+                        "through to the slow copy-based transpose path "
+                        "(see metric mxfp8_tn_adapter_copy_transpose). "
+                        "This requires the cppmega TE fork "
+                        "(jewelmusicee/TransformerEngine ref "
+                        "cppmega-mxfp8-transpose-emit). Tested against TE "
+                        f"{_SUPPORTED_TE_VERSIONS}.",
+                        file=_sys.stderr,
+                    )
                 return _out
             try:
                 with _torch.no_grad():
@@ -795,7 +940,20 @@ if (
                     raise
             return _out
 
+        assert hasattr(_TE_MXFP8Quantizer, "quantize"), (
+            "transformer_engine.pytorch.tensor.MXFP8Quantizer.quantize is "
+            "missing; cppmega_fp8_shim.py wraps this method to attach "
+            "rowwise-transpose sidecars. Tested against TE "
+            f"{_SUPPORTED_TE_VERSIONS}."
+        )
         _orig_mxfp8_quantize = getattr(_TE_MXFP8Quantizer, "quantize", None)
+        if _orig_mxfp8_quantize is None:
+            print(
+                "[cppmega_fp8_shim] WARNING: MXFP8Quantizer.quantize resolved "
+                "to None; rowwise-transpose sidecar patch will not be "
+                f"installed. Tested against TE {_SUPPORTED_TE_VERSIONS}.",
+                file=_sys.stderr,
+            )
         if _orig_mxfp8_quantize is not None and not getattr(
             _orig_mxfp8_quantize, "_cppmega_transpose_emit", False
         ):
@@ -808,7 +966,20 @@ if (
             _mxfp8_quantize_with_rowwise_transpose._cppmega_transpose_emit = True
             _TE_MXFP8Quantizer.quantize = _mxfp8_quantize_with_rowwise_transpose
 
+        assert hasattr(_TE_MXFP8Quantizer, "update_quantized"), (
+            "transformer_engine.pytorch.tensor.MXFP8Quantizer.update_quantized "
+            "is missing; cppmega_fp8_shim.py wraps this method to attach "
+            "rowwise-transpose sidecars after in-place re-quantization. "
+            f"Tested against TE {_SUPPORTED_TE_VERSIONS}."
+        )
         _orig_mxfp8_update_quantized = getattr(_TE_MXFP8Quantizer, "update_quantized", None)
+        if _orig_mxfp8_update_quantized is None:
+            print(
+                "[cppmega_fp8_shim] WARNING: MXFP8Quantizer.update_quantized "
+                "resolved to None; rowwise-transpose sidecar patch will not "
+                f"be installed. Tested against TE {_SUPPORTED_TE_VERSIONS}.",
+                file=_sys.stderr,
+            )
         if _orig_mxfp8_update_quantized is not None and not getattr(
             _orig_mxfp8_update_quantized, "_cppmega_transpose_emit", False
         ):
@@ -827,7 +998,20 @@ if (
                 _mxfp8_update_quantized_with_rowwise_transpose
             )
 
+        assert hasattr(_tex, "split_quantize"), (
+            "transformer_engine_torch.split_quantize is missing; "
+            "cppmega_fp8_shim.py wraps this C++-bound function to attach "
+            "rowwise-transpose sidecars to per-shard MXFP8 outputs. "
+            f"Tested against TE {_SUPPORTED_TE_VERSIONS}."
+        )
         _orig_tex_split_quantize = getattr(_tex, "split_quantize", None)
+        if _orig_tex_split_quantize is None:
+            print(
+                "[cppmega_fp8_shim] WARNING: transformer_engine_torch."
+                "split_quantize resolved to None; sidecar patch will not be "
+                f"installed. Tested against TE {_SUPPORTED_TE_VERSIONS}.",
+                file=_sys.stderr,
+            )
         if _orig_tex_split_quantize is not None and not getattr(
             _orig_tex_split_quantize, "_cppmega_transpose_emit", False
         ):
@@ -1442,6 +1626,25 @@ if (
         from transformer_engine.pytorch.module import base as _te_module_base
         from transformer_engine.pytorch.quantization import FP8GlobalStateManager as _TE_FP8State
 
+        assert hasattr(_te_module_base, "TransformerEngineBaseModule"), (
+            "transformer_engine.pytorch.module.base.TransformerEngineBaseModule "
+            "is missing; cppmega_fp8_shim.py patches its "
+            "grad_output_preprocess static method. Tested against TE "
+            f"{_SUPPORTED_TE_VERSIONS}."
+        )
+        assert hasattr(
+            _te_module_base.TransformerEngineBaseModule, "grad_output_preprocess"
+        ), (
+            "TransformerEngineBaseModule.grad_output_preprocess is missing; "
+            "cppmega_fp8_shim.py wraps this method to gate the BF16 backward "
+            f"override path. Tested against TE {_SUPPORTED_TE_VERSIONS}."
+        )
+        assert hasattr(_TE_FP8State, "get_fp8_recipe"), (
+            "FP8GlobalStateManager.get_fp8_recipe is missing; "
+            "cppmega_fp8_shim.py reads this to know whether to force "
+            "compact MXFP8 quantizer outputs. Tested against TE "
+            f"{_SUPPORTED_TE_VERSIONS}."
+        )
         _orig_grad_output_preprocess = (
             _te_module_base.TransformerEngineBaseModule.grad_output_preprocess
         )
@@ -1502,6 +1705,8 @@ if (
                 return
             _cppmega_force_compact_if_needed(_quantizers, _recipe)
 
+        _cppmega_get_quantizers_warned = [False]
+
         def _cppmega_wrap_get_quantizers(_module_cls):
             _orig_get_quantizers = getattr(_module_cls, "_get_quantizers", None)
             if _orig_get_quantizers is None or getattr(
@@ -1516,13 +1721,24 @@ if (
                     _recipe = _TE_FP8State.get_fp8_recipe()
                     for _q in (_quantizers[0], _quantizers[5]):
                         _cppmega_force_compact_many_if_needed(_q, _recipe)
-                except Exception:
-                    pass
+                except Exception as _gq_exc:
+                    if not _cppmega_get_quantizers_warned[0]:
+                        _cppmega_get_quantizers_warned[0] = True
+                        print(
+                            "[cppmega_fp8_shim] WARNING: _get_quantizers "
+                            "compact-MXFP8 patch swallowed an exception "
+                            f"({type(_gq_exc).__name__}: {_gq_exc}); "
+                            "subsequent occurrences will be silenced. "
+                            f"Tested against TE {_SUPPORTED_TE_VERSIONS}.",
+                            file=_sys.stderr,
+                        )
                 return _quantizers
 
             _get_quantizers._cppmega_backward_override = True
             _module_cls._get_quantizers = _get_quantizers
             return True
+
+        _cppmega_get_weight_quantizers_warned = [False]
 
         def _cppmega_wrap_get_weight_quantizers(_module_cls):
             _orig_get_weight_quantizers = getattr(_module_cls, "_get_weight_quantizers", None)
@@ -1538,8 +1754,17 @@ if (
                     _recipe = _TE_FP8State.get_fp8_recipe()
                     for _q in _quantizers:
                         _cppmega_force_compact_many_if_needed(_q, _recipe)
-                except Exception:
-                    pass
+                except Exception as _gwq_exc:
+                    if not _cppmega_get_weight_quantizers_warned[0]:
+                        _cppmega_get_weight_quantizers_warned[0] = True
+                        print(
+                            "[cppmega_fp8_shim] WARNING: _get_weight_quantizers"
+                            " compact-MXFP8 patch swallowed an exception "
+                            f"({type(_gwq_exc).__name__}: {_gwq_exc}); "
+                            "subsequent occurrences will be silenced. "
+                            f"Tested against TE {_SUPPORTED_TE_VERSIONS}.",
+                            file=_sys.stderr,
+                        )
                 return _quantizers
 
             _get_weight_quantizers._cppmega_mxfp8_compact = True
@@ -1689,8 +1914,19 @@ if (
                         _patched_quantizer_modules.append(_class_name)
                     if _class is not None and _cppmega_wrap_get_weight_quantizers(_class):
                         _patched_weight_quantizer_modules.append(_class_name)
-            except Exception:
-                pass
+            except Exception as _wrap_exc:
+                # Don't change the fallback semantics — the rest of the module
+                # list still gets a chance to install its patches — but make
+                # the skip visible so a TE rename doesn't silently demote the
+                # workload to the slow copy-based MXFP8 transpose path.
+                print(
+                    f"[cppmega_fp8_shim] WARNING: TE module {_module_name!r} "
+                    "could not be wrapped "
+                    f"({type(_wrap_exc).__name__}: {_wrap_exc}); MXFP8 "
+                    "backward patches will not apply to this module. "
+                    f"Tested against TE {_SUPPORTED_TE_VERSIONS}.",
+                    file=_sys.stderr,
+                )
 
         print(
             "[cppmega_fp8_shim] TE block-scaled backward override installed "
