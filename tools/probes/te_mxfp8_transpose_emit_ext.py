@@ -200,6 +200,9 @@ def load_extension() -> Any:
 def emit_transpose_from_bf16(
     source: torch.Tensor,
     columnwise_scale_inv: torch.Tensor,
+    *,
+    fp8_dtype: int | None = None,
+    with_gemm_swizzled_scales: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return ``(rowwise_data, rowwise_scale_inv)`` for ``source.T``.
 
@@ -239,6 +242,8 @@ def emit_transpose_from_bf16(
             tex = None
         te_op = getattr(tex, "mxfp8_scaling_transpose_cast", None) if tex is not None else None
         if te_op is not None:
+            if fp8_dtype is None:
+                fp8_dtype = int(tex.DType.kFloat8E4M3)
             te_op(
                 source,
                 columnwise_scale_inv,
@@ -246,12 +251,16 @@ def emit_transpose_from_bf16(
                 rowwise_scale_inv,
                 rows,
                 cols,
+                fp8_dtype,
+                bool(with_gemm_swizzled_scales),
             )
             return rowwise_data, rowwise_scale_inv
         if backend == "te":
             raise RuntimeError(
                 "patched TransformerEngine op mxfp8_scaling_transpose_cast is not available"
             )
+    if with_gemm_swizzled_scales:
+        raise RuntimeError("local probe fallback cannot emit GEMM-swizzled MXFP8 scales")
 
     load_extension().mxfp8_transpose_emit(
         source,

@@ -241,7 +241,12 @@ def _timed_mxfp8_columnwise_as_rowwise_transpose(tensor: Any) -> tuple[MXFP8Tens
     return transposed, float(start.elapsed_time(end))
 
 
-def _mxfp8_emit_rowwise_transpose_from_bf16(source: torch.Tensor, tensor: Any) -> MXFP8Tensor:
+def _mxfp8_emit_rowwise_transpose_from_bf16(
+    source: torch.Tensor,
+    tensor: Any,
+    *,
+    with_gemm_swizzled_scales: bool = False,
+) -> MXFP8Tensor:
     """Emit rowwise MXFP8 storage for ``source.T`` using TE columnwise scales."""
 
     if tensor._with_gemm_swizzled_scales:
@@ -255,10 +260,12 @@ def _mxfp8_emit_rowwise_transpose_from_bf16(source: torch.Tensor, tensor: Any) -
     rowwise_data, rowwise_scale_inv = ext.emit_transpose_from_bf16(
         source,
         tensor._columnwise_scale_inv,
+        fp8_dtype=int(tensor._fp8_dtype),
+        with_gemm_swizzled_scales=with_gemm_swizzled_scales,
     )
     quantizer = MXFP8Quantizer(tensor._fp8_dtype, rowwise=True, columnwise=False)
     quantizer.internal = True
-    quantizer.optimize_for_gemm = False
+    quantizer.optimize_for_gemm = bool(with_gemm_swizzled_scales)
     return MXFP8Tensor(
         shape=rowwise_data.shape,
         dtype=tensor._dtype,
@@ -269,21 +276,31 @@ def _mxfp8_emit_rowwise_transpose_from_bf16(source: torch.Tensor, tensor: Any) -
         columnwise_scale_inv=None,
         quantizer=quantizer,
         requires_grad=False,
-        with_gemm_swizzled_scales=False,
+        with_gemm_swizzled_scales=bool(with_gemm_swizzled_scales),
     )
 
 
 def _timed_mxfp8_emit_rowwise_transpose_from_bf16(
     source: torch.Tensor,
     tensor: Any,
+    *,
+    with_gemm_swizzled_scales: bool = False,
 ) -> tuple[MXFP8Tensor, float]:
-    _mxfp8_emit_rowwise_transpose_from_bf16(source, tensor)
+    _mxfp8_emit_rowwise_transpose_from_bf16(
+        source,
+        tensor,
+        with_gemm_swizzled_scales=with_gemm_swizzled_scales,
+    )
     torch.cuda.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
-    emitted = _mxfp8_emit_rowwise_transpose_from_bf16(source, tensor)
+    emitted = _mxfp8_emit_rowwise_transpose_from_bf16(
+        source,
+        tensor,
+        with_gemm_swizzled_scales=with_gemm_swizzled_scales,
+    )
     end.record()
     torch.cuda.synchronize()
     return emitted, float(start.elapsed_time(end))
@@ -498,6 +515,24 @@ def _time_repeated_gemm(
     return out, float(start.elapsed_time(end) / max(iters, 1))
 
 
+def _time_repeated_tensor_call(fn: Any, *, warmup: int, iters: int) -> tuple[torch.Tensor, float]:
+    out: torch.Tensor | None = None
+    for _ in range(warmup):
+        out = fn()
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        out = fn()
+    end.record()
+    torch.cuda.synchronize()
+    if out is None:
+        raise RuntimeError("timed call did not produce an output")
+    return out, float(start.elapsed_time(end) / max(iters, 1))
+
+
 def _run_cutlass_direct_microbench(
     wrapped_general_gemm: Any,
     shim_module: Any | None,
@@ -572,6 +607,105 @@ def _run_cutlass_direct_microbench(
             rel_l2_limit=0.15,
         ),
         "shim_stats_delta": _numeric_stats_delta(stats_before, stats_after),
+    }
+
+
+def _run_cutlass_direct_api_microbench(
+    refs: dict[str, torch.Tensor],
+    xq: Any,
+    wq: Any,
+    dyq: Any,
+    *,
+    warmup: int,
+    iters: int,
+) -> dict[str, Any]:
+    from cppmega.megatron import cutlass_mxfp8_gemm as cutlass
+
+    out_dgrad_base = torch.empty_like(refs["dgrad"], dtype=torch.bfloat16)
+    out_wgrad_base = torch.empty_like(refs["wgrad"], dtype=torch.bfloat16)
+    out_dgrad_asym = torch.empty_like(refs["dgrad"], dtype=torch.bfloat16)
+    out_wgrad_asym = torch.empty_like(refs["wgrad"], dtype=torch.bfloat16)
+
+    def _dgrad(*, asymmetric: bool, out: torch.Tensor) -> torch.Tensor:
+        return cutlass.dgrad_nn_gemm(
+            dyq._rowwise_data,
+            dyq._rowwise_scale_inv,
+            wq._columnwise_data,
+            wq._columnwise_scale_inv,
+            out=out,
+            asymmetric=asymmetric,
+        )
+
+    def _wgrad(*, asymmetric: bool, out: torch.Tensor) -> torch.Tensor:
+        return cutlass.wgrad_nt_gemm(
+            dyq._columnwise_data,
+            dyq._columnwise_scale_inv,
+            xq._columnwise_data,
+            xq._columnwise_scale_inv,
+            out=out,
+            asymmetric=asymmetric,
+        )
+
+    dgrad_base, dgrad_base_ms = _time_repeated_tensor_call(
+        lambda: _dgrad(asymmetric=False, out=out_dgrad_base),
+        warmup=warmup,
+        iters=iters,
+    )
+    wgrad_base, wgrad_base_ms = _time_repeated_tensor_call(
+        lambda: _wgrad(asymmetric=False, out=out_wgrad_base),
+        warmup=warmup,
+        iters=iters,
+    )
+    dgrad_asym, dgrad_asym_ms = _time_repeated_tensor_call(
+        lambda: _dgrad(asymmetric=True, out=out_dgrad_asym),
+        warmup=warmup,
+        iters=iters,
+    )
+    wgrad_asym, wgrad_asym_ms = _time_repeated_tensor_call(
+        lambda: _wgrad(asymmetric=True, out=out_wgrad_asym),
+        warmup=warmup,
+        iters=iters,
+    )
+
+    return {
+        "backend": "cutlass_native_direct_api",
+        "scale_backend": os.environ.get("CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND", "compact"),
+        "warmup": warmup,
+        "iters": iters,
+        "base": {
+            "dgrad_elapsed_ms": dgrad_base_ms,
+            "wgrad_elapsed_ms": wgrad_base_ms,
+            "dgrad": _record_success(
+                "mxfp8_cutlass_direct_api_base_dgrad",
+                dgrad_base,
+                refs["dgrad"],
+                rel_l2_limit=0.15,
+            ),
+            "wgrad": _record_success(
+                "mxfp8_cutlass_direct_api_base_wgrad",
+                wgrad_base,
+                refs["wgrad"],
+                rel_l2_limit=0.15,
+            ),
+        },
+        "asymmetric": {
+            "dgrad_elapsed_ms": dgrad_asym_ms,
+            "wgrad_elapsed_ms": wgrad_asym_ms,
+            "dgrad": _record_success(
+                "mxfp8_cutlass_direct_api_asymmetric_dgrad",
+                dgrad_asym,
+                refs["dgrad"],
+                rel_l2_limit=0.15,
+            ),
+            "wgrad": _record_success(
+                "mxfp8_cutlass_direct_api_asymmetric_wgrad",
+                wgrad_asym,
+                refs["wgrad"],
+                rel_l2_limit=0.15,
+            ),
+            "dgrad_max_abs_vs_base": _max_abs(dgrad_asym, dgrad_base),
+            "wgrad_max_abs_vs_base": _max_abs(wgrad_asym, wgrad_base),
+        },
     }
 
 
@@ -658,6 +792,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     mxfp8_emit_bytes: dict[str, Any] | None = None
     cutlass_direct_microbench: dict[str, Any] | None = None
+    cutlass_direct_api_microbench: dict[str, Any] | None = None
     mxfp8_adapter_microbench: dict[str, Any] | None = None
 
     if args.format in ("mxfp8", "both"):
@@ -804,6 +939,21 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                         "mxfp8_cutlass_direct_microbench",
                         exc,
                     )
+        if args.microbench_cutlass_direct_asymmetric:
+            try:
+                cutlass_direct_api_microbench = _run_cutlass_direct_api_microbench(
+                    refs,
+                    xq,
+                    wq,
+                    dyq,
+                    warmup=args.microbench_warmup,
+                    iters=args.microbench_iters,
+                )
+            except Exception as exc:  # pragma: no cover - this is a probe
+                cutlass_direct_api_microbench = _record_failure(
+                    "mxfp8_cutlass_direct_api_microbench",
+                    exc,
+                )
         if args.microbench_adapter:
             try:
                 mxfp8_adapter_microbench = _run_mxfp8_adapter_microbench(
@@ -884,6 +1034,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         report["mxfp8_transpose_emit_prototype_bytes"] = mxfp8_emit_bytes
     if cutlass_direct_microbench is not None:
         report["mxfp8_cutlass_direct_microbench"] = cutlass_direct_microbench
+    if cutlass_direct_api_microbench is not None:
+        report["mxfp8_cutlass_direct_api_microbench"] = cutlass_direct_api_microbench
     if mxfp8_adapter_microbench is not None:
         report["mxfp8_adapter_microbench"] = mxfp8_adapter_microbench
     if shim_module is not None and hasattr(shim_module, "cppmega_te_mxfp8_bwd_stats_snapshot"):
@@ -951,6 +1103,15 @@ def main() -> None:
             "When --use-shim and CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native are set, "
             "time repeated direct-loader dgrad/wgrad calls with preallocated outputs "
             "and report shim counter deltas."
+        ),
+    )
+    parser.add_argument(
+        "--microbench-cutlass-direct-asymmetric",
+        action="store_true",
+        help=(
+            "Time the low-level CUTLASS direct API with base and split MK/NK "
+            "asymmetric entrypoints side by side. This bypasses the shim and "
+            "uses explicit Python parameters rather than environment toggles."
         ),
     )
     parser.add_argument(
