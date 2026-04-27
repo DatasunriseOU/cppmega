@@ -21,6 +21,7 @@ import json
 import os
 from functools import lru_cache
 from pathlib import Path
+import sys
 import time
 from typing import Any, Literal
 
@@ -35,6 +36,7 @@ from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 def _load_cppmega_fp8_shim() -> Any:
     repo_root = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(repo_root))
     shim_path = repo_root / "scripts" / "cppmega_fp8_shim.py"
     spec = importlib.util.spec_from_file_location("cppmega_fp8_shim_probe", shim_path)
     if spec is None or spec.loader is None:
@@ -286,13 +288,6 @@ def _timed_mxfp8_emit_rowwise_transpose_from_bf16(
     *,
     with_gemm_swizzled_scales: bool = False,
 ) -> tuple[MXFP8Tensor, float]:
-    _mxfp8_emit_rowwise_transpose_from_bf16(
-        source,
-        tensor,
-        with_gemm_swizzled_scales=with_gemm_swizzled_scales,
-    )
-    torch.cuda.synchronize()
-
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -301,6 +296,52 @@ def _timed_mxfp8_emit_rowwise_transpose_from_bf16(
         tensor,
         with_gemm_swizzled_scales=with_gemm_swizzled_scales,
     )
+    end.record()
+    torch.cuda.synchronize()
+    return emitted, float(start.elapsed_time(end))
+
+
+def _mxfp8_prepack_existing_columnwise_as_swizzled_rowwise_transpose(tensor: Any) -> MXFP8Tensor:
+    """Emit GEMM-ready rowwise-transposed storage from an existing columnwise MXFP8 tensor."""
+
+    if tensor._with_gemm_swizzled_scales:
+        raise ValueError("MXFP8 producer prepack requires compact, non-swizzled source scales")
+    if tensor._columnwise_data is None or tensor._columnwise_scale_inv is None:
+        raise ValueError("MXFP8 tensor is missing columnwise payload/scales")
+    if tensor._columnwise_data.dim() < 2:
+        raise ValueError("MXFP8 producer prepack requires matrix-like columnwise data")
+    if tensor._columnwise_scale_inv.dim() != 2:
+        raise ValueError("MXFP8 producer prepack requires 2D compact columnwise scales")
+
+    ext = _load_mxfp8_transpose_emit_ext()
+    rowwise_data, rowwise_scale_inv = ext.transpose_payload_swizzle_scale(
+        tensor._columnwise_data.reshape(-1, tensor._columnwise_data.shape[-1]),
+        tensor._columnwise_scale_inv,
+    )
+    quantizer = MXFP8Quantizer(tensor._fp8_dtype, rowwise=True, columnwise=False)
+    quantizer.internal = True
+    quantizer.optimize_for_gemm = True
+    return MXFP8Tensor(
+        shape=rowwise_data.shape,
+        dtype=tensor._dtype,
+        fp8_dtype=tensor._fp8_dtype,
+        rowwise_data=rowwise_data,
+        rowwise_scale_inv=rowwise_scale_inv,
+        columnwise_data=None,
+        columnwise_scale_inv=None,
+        quantizer=quantizer,
+        requires_grad=False,
+        with_gemm_swizzled_scales=True,
+    )
+
+
+def _timed_mxfp8_prepack_existing_columnwise_as_swizzled_rowwise_transpose(
+    tensor: Any,
+) -> tuple[MXFP8Tensor, float]:
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    emitted = _mxfp8_prepack_existing_columnwise_as_swizzled_rowwise_transpose(tensor)
     end.record()
     torch.cuda.synchronize()
     return emitted, float(start.elapsed_time(end))
@@ -387,6 +428,145 @@ def _append_mxfp8_nocopy_probe_results(
         )
 
 
+def _compare_emit_variants(
+    results: list[dict[str, Any]],
+    emit_bytes: dict[str, Any],
+    refs: dict[str, torch.Tensor],
+    name_prefix: str,
+    a_bf16: torch.Tensor | None,
+    a_q: Any,
+    b_bf16: torch.Tensor | None,
+    b_q: Any,
+    ref_key: str,
+    emit_bytes_keys: tuple[str, str] | tuple[str],
+) -> None:
+    """Compare direct BF16->rowwise-transposed MXFP8 emission with copied TN adapter.
+
+    Handle one operand-pair (e.g. dgrad where only operand A emits from BF16) or two
+    operand-pairs (e.g. wgrad where both A and B emit from BF16).
+
+    When *bf16 is ``None`` for an operand the corresponding q-tensor is fed directly
+    to the GEMM without any copy / emit transform.
+    """
+
+    try:
+        # ---- copy adapter transpose ----
+        a_t_copy, a_copy_ms = _timed_mxfp8_columnwise_as_rowwise_transpose(a_q)
+        emit_bytes[emit_bytes_keys[0]]["copy_adapter_transpose_elapsed_ms"] = a_copy_ms
+
+        if b_bf16 is not None:
+            b_t_copy, b_copy_ms = _timed_mxfp8_columnwise_as_rowwise_transpose(b_q)
+            emit_bytes[emit_bytes_keys[1]]["copy_adapter_transpose_elapsed_ms"] = b_copy_ms
+        else:
+            b_t_copy = b_q
+
+        # ---- prepack transpose (swizzled from existing payload) ----
+        a_t_producer, a_producer_ms = (
+            _timed_mxfp8_prepack_existing_columnwise_as_swizzled_rowwise_transpose(a_q)
+        )
+        emit_bytes[emit_bytes_keys[0]][
+            "existing_payload_swizzled_prepack_elapsed_ms"
+        ] = a_producer_ms
+
+        if b_bf16 is not None:
+            b_t_producer, b_producer_ms = (
+                _timed_mxfp8_prepack_existing_columnwise_as_swizzled_rowwise_transpose(b_q)
+            )
+            emit_bytes[emit_bytes_keys[1]][
+                "existing_payload_swizzled_prepack_elapsed_ms"
+            ] = b_producer_ms
+        else:
+            b_t_producer = b_q
+
+        # ---- emit transpose from BF16 ----
+        if a_bf16 is not None:
+            a_t_emit, a_emit_ms = _timed_mxfp8_emit_rowwise_transpose_from_bf16(a_bf16, a_q)
+            emit_bytes[emit_bytes_keys[0]]["emit_elapsed_ms"] = a_emit_ms
+            a_t_emit_swizzled, a_swizzled_emit_ms = _timed_mxfp8_emit_rowwise_transpose_from_bf16(
+                a_bf16,
+                a_q,
+                with_gemm_swizzled_scales=True,
+            )
+            emit_bytes[emit_bytes_keys[0]]["swizzled_emit_elapsed_ms"] = a_swizzled_emit_ms
+        else:
+            a_t_emit = a_t_copy
+            a_t_emit_swizzled = a_t_copy
+
+        if b_bf16 is not None:
+            b_t_emit, b_emit_ms = _timed_mxfp8_emit_rowwise_transpose_from_bf16(b_bf16, b_q)
+            emit_bytes[emit_bytes_keys[1]]["emit_elapsed_ms"] = b_emit_ms
+            b_t_emit_swizzled, b_swizzled_emit_ms = _timed_mxfp8_emit_rowwise_transpose_from_bf16(
+                b_bf16,
+                b_q,
+                with_gemm_swizzled_scales=True,
+            )
+            emit_bytes[emit_bytes_keys[1]]["swizzled_emit_elapsed_ms"] = b_swizzled_emit_ms
+        else:
+            b_t_emit = b_q
+            b_t_emit_swizzled = b_q
+
+        # ---- GEMM captures ----
+        copy_row, copy_out = _try_gemm_capture(
+            f"mxfp8_{name_prefix}_adapter_TN_copy_for_emit_compare",
+            refs[ref_key],
+            general_gemm,
+            a_t_copy,
+            b_t_copy,
+            out_dtype=torch.bfloat16,
+            layout="TN",
+            grad=True,
+            use_split_accumulator=False,
+        )
+        emit_row, emit_out = _try_gemm_capture(
+            f"mxfp8_{name_prefix}_transpose_emit_TN",
+            refs[ref_key],
+            general_gemm,
+            a_t_emit,
+            b_t_emit,
+            out_dtype=torch.bfloat16,
+            layout="TN",
+            grad=True,
+            use_split_accumulator=False,
+        )
+        if copy_out is not None and emit_out is not None:
+            emit_row["max_abs_vs_copy_adapter"] = _max_abs(emit_out, copy_out)
+            emit_row["rel_l2_vs_copy_adapter"] = _rel_l2(emit_out, copy_out)
+        producer_row, producer_out = _try_gemm_capture(
+            f"mxfp8_{name_prefix}_existing_payload_swizzled_prepack_TN",
+            refs[ref_key],
+            general_gemm,
+            a_t_producer,
+            b_t_producer,
+            out_dtype=torch.bfloat16,
+            layout="TN",
+            grad=True,
+            use_split_accumulator=False,
+        )
+        if copy_out is not None and producer_out is not None:
+            producer_row["max_abs_vs_copy_adapter"] = _max_abs(producer_out, copy_out)
+            producer_row["rel_l2_vs_copy_adapter"] = _rel_l2(producer_out, copy_out)
+        swizzled_emit_row, swizzled_emit_out = _try_gemm_capture(
+            f"mxfp8_{name_prefix}_transpose_emit_swizzled_TN",
+            refs[ref_key],
+            general_gemm,
+            a_t_emit_swizzled,
+            b_t_emit_swizzled,
+            out_dtype=torch.bfloat16,
+            layout="TN",
+            grad=True,
+            use_split_accumulator=False,
+        )
+        if copy_out is not None and swizzled_emit_out is not None:
+            swizzled_emit_row["max_abs_vs_copy_adapter"] = _max_abs(swizzled_emit_out, copy_out)
+            swizzled_emit_row["rel_l2_vs_copy_adapter"] = _rel_l2(swizzled_emit_out, copy_out)
+        results.append(copy_row)
+        results.append(emit_row)
+        results.append(producer_row)
+        results.append(swizzled_emit_row)
+    except Exception as exc:  # pragma: no cover - this is a probe
+        results.append(_record_failure(f"mxfp8_{name_prefix}_transpose_emit_TN", exc))
+
+
 def _append_mxfp8_transpose_emit_probe_results(
     results: list[dict[str, Any]],
     refs: dict[str, torch.Tensor],
@@ -405,79 +585,31 @@ def _append_mxfp8_transpose_emit_probe_results(
         "wgrad_dy": _mxfp8_transpose_emit_bytes(dy, dyq),
     }
 
-    try:
-        weight_t_copy, copy_ms = _timed_mxfp8_columnwise_as_rowwise_transpose(wq)
-        emit_bytes["dgrad"]["copy_adapter_transpose_elapsed_ms"] = copy_ms
-        weight_t_emit, emit_ms = _timed_mxfp8_emit_rowwise_transpose_from_bf16(weight, wq)
-        emit_bytes["dgrad"]["emit_elapsed_ms"] = emit_ms
-        copy_row, copy_out = _try_gemm_capture(
-            "mxfp8_dgrad_adapter_TN_copy_for_emit_compare",
-            refs["dgrad"],
-            general_gemm,
-            weight_t_copy,
-            dyq,
-            out_dtype=torch.bfloat16,
-            layout="TN",
-            grad=True,
-            use_split_accumulator=False,
-        )
-        emit_row, emit_out = _try_gemm_capture(
-            "mxfp8_dgrad_transpose_emit_TN",
-            refs["dgrad"],
-            general_gemm,
-            weight_t_emit,
-            dyq,
-            out_dtype=torch.bfloat16,
-            layout="TN",
-            grad=True,
-            use_split_accumulator=False,
-        )
-        if copy_out is not None and emit_out is not None:
-            emit_row["max_abs_vs_copy_adapter"] = _max_abs(emit_out, copy_out)
-            emit_row["rel_l2_vs_copy_adapter"] = _rel_l2(emit_out, copy_out)
-        results.append(copy_row)
-        results.append(emit_row)
-    except Exception as exc:  # pragma: no cover - this is a probe
-        results.append(_record_failure("mxfp8_dgrad_transpose_emit_TN", exc))
+    _compare_emit_variants(
+        results,
+        emit_bytes,
+        refs,
+        name_prefix="dgrad",
+        a_bf16=weight,
+        a_q=wq,
+        b_bf16=None,
+        b_q=dyq,
+        ref_key="dgrad",
+        emit_bytes_keys=("dgrad",),
+    )
 
-    try:
-        x_t_copy, x_copy_ms = _timed_mxfp8_columnwise_as_rowwise_transpose(xq)
-        dy_t_copy, dy_copy_ms = _timed_mxfp8_columnwise_as_rowwise_transpose(dyq)
-        emit_bytes["wgrad_x"]["copy_adapter_transpose_elapsed_ms"] = x_copy_ms
-        emit_bytes["wgrad_dy"]["copy_adapter_transpose_elapsed_ms"] = dy_copy_ms
-        x_t_emit, x_emit_ms = _timed_mxfp8_emit_rowwise_transpose_from_bf16(x, xq)
-        dy_t_emit, dy_emit_ms = _timed_mxfp8_emit_rowwise_transpose_from_bf16(dy, dyq)
-        emit_bytes["wgrad_x"]["emit_elapsed_ms"] = x_emit_ms
-        emit_bytes["wgrad_dy"]["emit_elapsed_ms"] = dy_emit_ms
-        copy_row, copy_out = _try_gemm_capture(
-            "mxfp8_wgrad_adapter_TN_copy_for_emit_compare",
-            refs["wgrad"],
-            general_gemm,
-            x_t_copy,
-            dy_t_copy,
-            out_dtype=torch.bfloat16,
-            layout="TN",
-            grad=True,
-            use_split_accumulator=False,
-        )
-        emit_row, emit_out = _try_gemm_capture(
-            "mxfp8_wgrad_transpose_emit_TN",
-            refs["wgrad"],
-            general_gemm,
-            x_t_emit,
-            dy_t_emit,
-            out_dtype=torch.bfloat16,
-            layout="TN",
-            grad=True,
-            use_split_accumulator=False,
-        )
-        if copy_out is not None and emit_out is not None:
-            emit_row["max_abs_vs_copy_adapter"] = _max_abs(emit_out, copy_out)
-            emit_row["rel_l2_vs_copy_adapter"] = _rel_l2(emit_out, copy_out)
-        results.append(copy_row)
-        results.append(emit_row)
-    except Exception as exc:  # pragma: no cover - this is a probe
-        results.append(_record_failure("mxfp8_wgrad_transpose_emit_TN", exc))
+    _compare_emit_variants(
+        results,
+        emit_bytes,
+        refs,
+        name_prefix="wgrad",
+        a_bf16=x,
+        a_q=xq,
+        b_bf16=dy,
+        b_q=dyq,
+        ref_key="wgrad",
+        emit_bytes_keys=("wgrad_x", "wgrad_dy"),
+    )
 
     return emit_bytes
 
@@ -531,6 +663,42 @@ def _time_repeated_tensor_call(fn: Any, *, warmup: int, iters: int) -> tuple[tor
     if out is None:
         raise RuntimeError("timed call did not produce an output")
     return out, float(start.elapsed_time(end) / max(iters, 1))
+
+
+def _time_repeated_tensor_call_with_memory(
+    fn: Any,
+    *,
+    warmup: int,
+    iters: int,
+) -> tuple[Any, float, dict[str, int]]:
+    out: Any = None
+    for _ in range(warmup):
+        out = fn()
+    torch.cuda.synchronize()
+
+    torch.cuda.reset_peak_memory_stats()
+    before = int(torch.cuda.memory_allocated())
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        out = fn()
+    end.record()
+    torch.cuda.synchronize()
+    after = int(torch.cuda.memory_allocated())
+    peak = int(torch.cuda.max_memory_allocated())
+    if out is None:
+        raise RuntimeError("timed call did not produce an output")
+    return (
+        out,
+        float(start.elapsed_time(end) / max(iters, 1)),
+        {
+            "memory_allocated_before_bytes": before,
+            "memory_allocated_after_bytes": after,
+            "memory_allocated_delta_bytes": after - before,
+            "max_memory_allocated_delta_bytes": peak - before,
+        },
+    )
 
 
 def _run_cutlass_direct_microbench(
@@ -766,6 +934,154 @@ def _run_mxfp8_adapter_microbench(
     }
 
 
+def _run_flashinfer_mxfp8_microbench(
+    refs: dict[str, torch.Tensor],
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    xq: Any,
+    wq: Any,
+    *,
+    warmup: int,
+    iters: int,
+) -> dict[str, Any]:
+    """Time FlashInfer/CUTLASS MXFP8 GEMM using TE payloads and swizzled TE scales."""
+
+    from flashinfer import SfLayout, mm_mxfp8, mxfp8_quantize
+    from cppmega.megatron import flashinfer_mxfp8_gemm as cppmega_flashinfer
+
+    if xq._rowwise_data is None or xq._rowwise_scale_inv is None:
+        raise ValueError("xq is missing rowwise MXFP8 payload/scales")
+    if wq._rowwise_data is None or wq._rowwise_scale_inv is None:
+        raise ValueError("wq is missing rowwise MXFP8 payload/scales")
+
+    m, k = xq._rowwise_data.shape
+    n, wk = wq._rowwise_data.shape
+    if wk != k:
+        raise ValueError(f"weight K mismatch: x K={k}, weight K={wk}")
+
+    # TE stores MXFP8 payload bytes as uint8. PyTorch dtype view is zero-copy and
+    # lets FlashInfer accept the same storage as float8_e4m3fn.
+    a = xq._rowwise_data.view(torch.float8_e4m3fn)
+    b = wq._rowwise_data.view(torch.float8_e4m3fn).t()
+    a_descale, scale_swizzle_ms, scale_swizzle_memory = _time_repeated_tensor_call_with_memory(
+        lambda: cppmega_flashinfer.swizzle_rowwise_scale(xq._rowwise_scale_inv, m, k),
+        warmup=warmup,
+        iters=iters,
+    )
+    b_descale, weight_scale_swizzle_ms, weight_scale_swizzle_memory = (
+        _time_repeated_tensor_call_with_memory(
+            lambda: cppmega_flashinfer.swizzle_rowwise_scale(wq._rowwise_scale_inv, n, k),
+            warmup=warmup,
+            iters=iters,
+        )
+    )
+
+    def _plain_mxfp8(out: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+        return mm_mxfp8(
+            a,
+            b,
+            a_descale,
+            b_descale,
+            out=out,
+            out_dtype=out_dtype,
+            # FlashInfer's use_8x4_sf_layout=False selects the 1x1 kernel path
+            # for consuming already-swizzled 128x4 scales; the scales themselves
+            # ARE in 128x4 layout (swizzled above). The flag name is misleading.
+            use_8x4_sf_layout=False,
+            backend="cutlass",
+        )
+
+    out = torch.empty_like(refs["fprop"], dtype=torch.bfloat16)
+    te_payload_out, te_payload_gemm_ms, te_payload_gemm_memory = (
+        _time_repeated_tensor_call_with_memory(
+            lambda: _plain_mxfp8(out, torch.bfloat16),
+            warmup=warmup,
+            iters=iters,
+        )
+    )
+    out_fp16 = torch.empty_like(refs["fprop"], dtype=torch.float16)
+    te_payload_fp16_out, te_payload_fp16_gemm_ms, te_payload_fp16_gemm_memory = (
+        _time_repeated_tensor_call_with_memory(
+            lambda: _plain_mxfp8(out_fp16, torch.float16),
+            warmup=warmup,
+            iters=iters,
+        )
+    )
+
+    (native_a, native_a_descale), native_x_quantize_ms, native_x_quantize_memory = (
+        _time_repeated_tensor_call_with_memory(
+            lambda: mxfp8_quantize(x, sf_swizzle_layout=SfLayout.layout_128x4, backend="cuda"),
+            warmup=warmup,
+            iters=iters,
+        )
+    )
+    (native_w, native_w_descale), native_w_quantize_ms, native_w_quantize_memory = (
+        _time_repeated_tensor_call_with_memory(
+            lambda: mxfp8_quantize(weight, sf_swizzle_layout=SfLayout.layout_128x4, backend="cuda"),
+            warmup=warmup,
+            iters=iters,
+        )
+    )
+    native_out_buffer = torch.empty_like(refs["fprop"], dtype=torch.bfloat16)
+    native_out, native_gemm_ms, native_gemm_memory = _time_repeated_tensor_call_with_memory(
+        lambda: mm_mxfp8(
+            native_a,
+            native_w.t(),
+            native_a_descale,
+            native_w_descale,
+            out=native_out_buffer,
+            out_dtype=torch.bfloat16,
+            use_8x4_sf_layout=False,
+            backend="cutlass",
+        ),
+        warmup=warmup,
+        iters=iters,
+    )
+
+    row = _record_success(
+        "mxfp8_flashinfer_te_payload_cutlass",
+        te_payload_out,
+        refs["fprop"],
+        rel_l2_limit=0.15,
+    )
+    row["max_abs_vs_flashinfer_native_quantize"] = _max_abs(te_payload_out, native_out)
+    row["rel_l2_vs_flashinfer_native_quantize"] = _rel_l2(te_payload_out, native_out)
+    fp16_row = _record_success(
+        "mxfp8_flashinfer_te_payload_cutlass_fp16_out",
+        te_payload_fp16_out,
+        refs["fprop"],
+        rel_l2_limit=0.15,
+    )
+
+    return {
+        "backend": "flashinfer_cutlass_sm120",
+        "scale_layout": "SfLayout.layout_128x4",
+        "payload_source": "TE rowwise MXFP8 uint8 storage viewed as torch.float8_e4m3fn",
+        "epilogue_capabilities": cppmega_flashinfer.epilogue_capability_report(),
+        "warmup": warmup,
+        "iters": iters,
+        "te_payload_gemm_elapsed_ms": te_payload_gemm_ms,
+        "te_payload_gemm_memory": te_payload_gemm_memory,
+        "te_payload_fp16_out_gemm_elapsed_ms": te_payload_fp16_gemm_ms,
+        "te_payload_fp16_out_gemm_memory": te_payload_fp16_gemm_memory,
+        "te_x_scale_swizzle_elapsed_ms": scale_swizzle_ms,
+        "te_x_scale_swizzle_memory": scale_swizzle_memory,
+        "te_w_scale_swizzle_elapsed_ms": weight_scale_swizzle_ms,
+        "te_w_scale_swizzle_memory": weight_scale_swizzle_memory,
+        "te_scale_swizzle_2x_elapsed_ms": scale_swizzle_ms + weight_scale_swizzle_ms,
+        "flashinfer_native_x_quantize_elapsed_ms": native_x_quantize_ms,
+        "flashinfer_native_x_quantize_memory": native_x_quantize_memory,
+        "flashinfer_native_w_quantize_elapsed_ms": native_w_quantize_ms,
+        "flashinfer_native_w_quantize_memory": native_w_quantize_memory,
+        "flashinfer_native_quantize_2x_elapsed_ms": native_x_quantize_ms
+        + native_w_quantize_ms,
+        "flashinfer_native_gemm_elapsed_ms": native_gemm_ms,
+        "flashinfer_native_gemm_memory": native_gemm_memory,
+        "result": row,
+        "fp16_out_result": fp16_row,
+    }
+
+
 def _run(args: argparse.Namespace) -> dict[str, Any]:
     shim_module = None
     wrapped_general_gemm = None
@@ -794,6 +1110,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     cutlass_direct_microbench: dict[str, Any] | None = None
     cutlass_direct_api_microbench: dict[str, Any] | None = None
     mxfp8_adapter_microbench: dict[str, Any] | None = None
+    mxfp8_flashinfer_microbench: dict[str, Any] | None = None
 
     if args.format in ("mxfp8", "both"):
         xq = _mxfp8_quantize(x, columnwise=True)
@@ -970,6 +1287,22 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     "mxfp8_adapter_microbench",
                     exc,
                 )
+        if args.microbench_flashinfer:
+            try:
+                mxfp8_flashinfer_microbench = _run_flashinfer_mxfp8_microbench(
+                    refs,
+                    x,
+                    weight,
+                    xq,
+                    wq,
+                    warmup=args.microbench_warmup,
+                    iters=args.microbench_iters,
+                )
+            except Exception as exc:  # pragma: no cover - this is a probe
+                mxfp8_flashinfer_microbench = _record_failure(
+                    "mxfp8_flashinfer_microbench",
+                    exc,
+                )
 
     if args.format in ("nvfp4", "both"):
         xq = _nvfp4_quantize(x, columnwise=True, is_weight=False)
@@ -1038,6 +1371,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         report["mxfp8_cutlass_direct_api_microbench"] = cutlass_direct_api_microbench
     if mxfp8_adapter_microbench is not None:
         report["mxfp8_adapter_microbench"] = mxfp8_adapter_microbench
+    if mxfp8_flashinfer_microbench is not None:
+        report["mxfp8_flashinfer_microbench"] = mxfp8_flashinfer_microbench
     if shim_module is not None and hasattr(shim_module, "cppmega_te_mxfp8_bwd_stats_snapshot"):
         report["shim_stats"] = shim_module.cppmega_te_mxfp8_bwd_stats_snapshot()
     return report
@@ -1057,7 +1392,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--mxfp8-bwd-backend",
-        choices=("te_tn_adapter", "cutlass_native"),
+        choices=("te_tn_adapter", "flashinfer_cutlass", "cutlass_native"),
         default="te_tn_adapter",
         help=(
             "MXFP8 backward backend to install before loading the cppmega shim. "
@@ -1118,6 +1453,15 @@ def main() -> None:
         "--microbench-adapter",
         action="store_true",
         help="Time repeated pretransposed TE TN adapter calls with preallocated outputs.",
+    )
+    parser.add_argument(
+        "--microbench-flashinfer",
+        action="store_true",
+        help=(
+            "Time FlashInfer/CUTLASS MXFP8 GEMM using TE rowwise payloads plus "
+            "a producer scale-swizzle kernel, and compare against FlashInfer's "
+            "native swizzled quantizer."
+        ),
     )
     parser.add_argument("--microbench-warmup", type=int, default=10)
     parser.add_argument("--microbench-iters", type=int, default=100)

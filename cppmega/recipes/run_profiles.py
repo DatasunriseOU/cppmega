@@ -22,8 +22,9 @@ from cppmega.recipes.nam56r_launch import (
 from cppmega.recipes.nam56r_megatron import build_nam56r_feature_plan
 
 MtpCEKernel = Literal["native", "liger", "off"]
+Fp8Format = Literal["hybrid", "e4m3"]
 Fp8Recipe = Literal["off", "tensorwise", "mxfp8"]
-Mxfp8BackwardBackend = Literal["te_tn_adapter", "cutlass_native"]
+Mxfp8BackwardBackend = Literal["te_tn_adapter", "flashinfer_cutlass", "cutlass_native"]
 Mxfp8TransposeEmitBackend = Literal["auto", "te", "off"]
 ParamStorage = Literal["auto", "bf16", "mxfp8"]
 SparseMlaMode = Literal["tilelang", "gather_scatter", "pytorch"]
@@ -87,10 +88,13 @@ class TrainingProfile:
 class PrecisionProfile:
     """Precision and kernel-route choices for the launch."""
 
-    # Tensorwise FP8 is the conservative GB10 lane.  MXFP8 routes backward
-    # through the TE TN adapter and TE transpose-emission path by default; the
-    # native CUTLASS loader is still an explicit experiment until the local
-    # CUTLASS headers and SM120 schedules are pinned.
+    # Tensorwise FP8 is the conservative GB10 lane.  MXFP8 routes clean GEMMs
+    # through TE payload + FlashInfer/CUTLASS layout_128x4 by default; the old
+    # compact direct CUTLASS loader remains an explicit experiment.
+    # ``auto`` would hide the important contract here, so the resolved profile
+    # owns the exact TE fp8 format: tensorwise keeps HYBRID, while MXFP8 uses
+    # E4M3 because FlashInfer/CUTLASS ``mm_mxfp8`` accepts E4M3 payloads only.
+    fp8_format: Fp8Format = "hybrid"
     fp8_recipe: Fp8Recipe = "tensorwise"
     sparse_mla_fp8_quant: str = "te_tensorwise"
     # Flash attention is mandatory when available for full attention/MLA blocks.
@@ -101,7 +105,7 @@ class PrecisionProfile:
     allow_te_mxfp8_sm12: bool = True
     pad_mamba_in_proj_for_mxfp8: bool = True
     mxfp8_bwd_tn_adapter: bool = True
-    mxfp8_bwd_backend: Mxfp8BackwardBackend = "te_tn_adapter"
+    mxfp8_bwd_backend: Mxfp8BackwardBackend = "flashinfer_cutlass"
     mxfp8_transpose_emit_backend: Mxfp8TransposeEmitBackend = "te"
     mxfp8_transpose_emit_swizzled: bool = True
     mxfp8_transpose_emit_strict: bool = True
@@ -206,6 +210,13 @@ class RunProfile:
         if self.optimizer.param_storage == "auto":
             return "mxfp8" if self.precision.fp8_recipe == "mxfp8" else "bf16"
         return self.optimizer.param_storage
+
+    def resolved_fp8_format(self) -> Fp8Format:
+        """Return the TE FP8 format required by the selected FP8 recipe."""
+
+        if self.precision.fp8_recipe == "mxfp8":
+            return "e4m3"
+        return self.precision.fp8_format
 
     def hybrid_layer_pattern(self) -> str:
         """Return the Megatron hybrid-layer-pattern derived from model fields."""
@@ -370,6 +381,7 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         "CPPMEGA_NUM_ATTN_HEADS": str(profile.model.num_attention_heads),
         "CPPMEGA_SPEC_MODULE": profile.spec_module,
         "CPPMEGA_SPEC_FUNCTION": profile.spec_function,
+        "CPPMEGA_FP8_FORMAT": profile.resolved_fp8_format(),
         "CPPMEGA_FP8_RECIPE": profile.precision.fp8_recipe,
         "CPPMEGA_SPARSE_MLA_FP8_QUANT": profile.precision.sparse_mla_fp8_quant,
         "CPPMEGA_OPTIMIZER": profile.optimizer.optimizer,
@@ -503,6 +515,10 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.runtime.acknowledge_liger_mtp_ce_deprecated = args.mtp_ce_kernel == "liger"
     if args.fp8_recipe is not None:
         profile.precision.fp8_recipe = args.fp8_recipe
+        if args.fp8_recipe == "mxfp8" and args.fp8_format is None:
+            profile.precision.fp8_format = "e4m3"
+    if args.fp8_format is not None:
+        profile.precision.fp8_format = args.fp8_format
     if args.mxfp8_bwd_backend is not None:
         profile.precision.mxfp8_bwd_backend = args.mxfp8_bwd_backend
     if args.mxfp8_transpose_emit_backend is not None:
@@ -553,6 +569,11 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
             raise ValueError(
                 f"cuda_profile_step_start ({start}) must be < cuda_profile_step_end ({end})"
             )
+    if profile.precision.fp8_recipe == "mxfp8" and profile.precision.fp8_format != "e4m3":
+        raise ValueError(
+            "fp8_recipe=mxfp8 requires fp8_format=e4m3 because the "
+            "FlashInfer/CUTLASS MXFP8 path accepts E4M3 payloads only"
+        )
     return profile
 
 
@@ -586,10 +607,11 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--dsa-indexer-loss-coeff", type=float, default=None)
     parser.add_argument("--mtp-ce-kernel", choices=("native", "liger", "off"), default=None)
+    parser.add_argument("--fp8-format", choices=("hybrid", "e4m3"), default=None)
     parser.add_argument("--fp8-recipe", choices=("off", "tensorwise", "mxfp8"), default=None)
     parser.add_argument(
         "--mxfp8-bwd-backend",
-        choices=("te_tn_adapter", "cutlass_native"),
+        choices=("te_tn_adapter", "flashinfer_cutlass", "cutlass_native"),
         default=None,
     )
     parser.add_argument(
