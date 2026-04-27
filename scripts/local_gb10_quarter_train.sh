@@ -41,6 +41,11 @@ export CPPMEGA_DSA_INDEXER_LOSS_COEFF="${CPPMEGA_DSA_INDEXER_LOSS_COEFF:-0}"
 export CPPMEGA_DSA_SKIP_INDEXER_LOSS="${CPPMEGA_DSA_SKIP_INDEXER_LOSS:-1}"
 export CPPMEGA_SEQ_LENGTH="${CPPMEGA_SEQ_LENGTH:-4096}"
 export CPPMEGA_MAX_POSITION_EMBEDDINGS="${CPPMEGA_MAX_POSITION_EMBEDDINGS:-4096}"
+export CPPMEGA_FP8_FORMAT="${CPPMEGA_FP8_FORMAT:-hybrid}"
+if [[ "${CPPMEGA_FP8_FORMAT}" != "hybrid" && "${CPPMEGA_FP8_FORMAT}" != "e4m3" ]]; then
+  echo "FATAL: CPPMEGA_FP8_FORMAT must be hybrid or e4m3" >&2
+  exit 2
+fi
 export CPPMEGA_FP8_RECIPE="${CPPMEGA_FP8_RECIPE:-tensorwise}"
 if [[ "${CPPMEGA_FP8_RECIPE}" != "off" && "${CPPMEGA_FP8_RECIPE}" != "tensorwise" && "${CPPMEGA_FP8_RECIPE}" != "mxfp8" ]]; then
   echo "FATAL: CPPMEGA_FP8_RECIPE must be off, tensorwise, or mxfp8" >&2
@@ -578,7 +583,7 @@ echo "[local-quarter] run_profile=${CPPMEGA_RUN_PROFILE:-${RUN_PROFILE}}"
 echo "[local-quarter] data=${CPPMEGA_DATA_PATH}"
 echo "[local-quarter] depth=${CPPMEGA_LAYER_DEPTH} hidden=${CPPMEGA_HIDDEN_SIZE:-3584} ffn=${CPPMEGA_FFN_HIDDEN_SIZE:-18944} heads=${CPPMEGA_NUM_ATTN_HEADS:-28}"
 echo "[local-quarter] torch_extensions=${TORCH_EXTENSIONS_DIR}"
-echo "[local-quarter] fp8_recipe=${CPPMEGA_FP8_RECIPE}"
+echo "[local-quarter] fp8_format=${CPPMEGA_FP8_FORMAT} fp8_recipe=${CPPMEGA_FP8_RECIPE}"
 echo "[local-quarter] spec=${CPPMEGA_SPEC_MODULE} ${CPPMEGA_SPEC_FUNCTION}"
 echo "[local-quarter] te_precision_config=${CPPMEGA_TE_PRECISION_CONFIG_FILE:-}"
 echo "[local-quarter] mxfp8_bwd_tn_adapter=${CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER:-0} mxfp8_bwd_backend=${CPPMEGA_TE_MXFP8_BWD_BACKEND:-te_tn_adapter} transpose_emit=${CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND:-auto} transpose_emit_swizzled=${CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED:-auto} cutlass_scale_backend=${CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND:-compact} bf16_fallback=${CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK:-0} nvte_backward_override=${NVTE_BACKWARD_OVERRIDE:-}"
@@ -662,7 +667,7 @@ fi
 FP8_ARGS=()
 if [[ "${CPPMEGA_FP8_RECIPE}" != "off" ]]; then
   FP8_ARGS+=(
-    --fp8-format hybrid
+    --fp8-format "${CPPMEGA_FP8_FORMAT}"
     --fp8-recipe "${CPPMEGA_FP8_RECIPE}"
     --fp8-amax-history-len 1024
     --fp8-amax-compute-algo max

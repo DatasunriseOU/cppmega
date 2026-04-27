@@ -42,6 +42,12 @@ bash scripts/local_gb10_quarter_train.sh --fp8-recipe off --train-iters 4
 bash scripts/local_gb10_quarter_train.sh \
   --fp8-recipe mxfp8 \
   --param-storage mxfp8 \
+  --mxfp8-bwd-backend flashinfer_cutlass \
+  --mxfp8-transpose-emit-backend te \
+  --mxfp8-transpose-emit-swizzled \
+  --mxfp8-transpose-emit-strict
+bash scripts/local_gb10_quarter_train.sh \
+  --fp8-recipe mxfp8 \
   --mxfp8-bwd-backend te_tn_adapter \
   --mxfp8-transpose-emit-backend te \
   --mxfp8-transpose-emit-swizzled \
@@ -251,8 +257,11 @@ producer-warp payload/scale loader, which is correct but slow.
 
 Short-term performance path:
 
+- keep TE as the MXFP8 payload owner
 - use TE transpose emit or cached rowwise-transpose sidecars for backward
-- call `TN` GEMM so payload uses stock TMA
+- convert only compact rowwise scales to FlashInfer/CUTLASS `layout_128x4`
+  via the cppmega producer kernel
+- call FlashInfer/CUTLASS SM120 GEMM for clean MXFP8 GEMMs
 - keep direct no-sidecar only as a correctness/coverage path
 
 Long-term path:
@@ -297,4 +306,19 @@ MXFP8 stats:
   copy_transpose=0
   bf16_fallback_dgrad=0, bf16_fallback_wgrad=0
   sidecar_registry_size=0
+```
+
+The newer FlashInfer/CUTLASS backend keeps the same TE transpose-emission
+contract but replaces the slow direct compact-loader path:
+
+```text
+backend: CPPMEGA_TE_MXFP8_BWD_BACKEND=flashinfer_cutlass
+TE owns payload: rowwise MXFP8 uint8 storage
+producer: compact rowwise scale -> FlashInfer/CUTLASS layout_128x4 uint8 scale
+payload handoff: zero-copy uint8.view(torch.float8_e4m3fn)
+fprop: x rowwise payload + weight rowwise payload.T
+dgrad: dy rowwise payload + weight.T sidecar payload.T
+wgrad: dy.T sidecar payload + x.T sidecar payload.T
+BF16 fallback: disabled
+copy_transpose: zero in the accepted shim probe
 ```

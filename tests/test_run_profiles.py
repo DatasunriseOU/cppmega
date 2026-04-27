@@ -43,8 +43,9 @@ def test_local_gb10_profile_owns_liger_ack_and_optimizer_defaults():
     assert env["CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE"] == "alltoall"
     assert env["CPPMEGA_OPTIMIZER"] == "muon"
     assert env["CPPMEGA_PARAM_STORAGE"] == "mxfp8"
+    assert env["CPPMEGA_FP8_FORMAT"] == "e4m3"
     assert env["CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE"] == "int8"
-    assert env["CPPMEGA_TE_MXFP8_BWD_BACKEND"] == "te_tn_adapter"
+    assert env["CPPMEGA_TE_MXFP8_BWD_BACKEND"] == "flashinfer_cutlass"
     assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
     assert env["HYBRID_LAYER_PATTERN"].endswith("/*-/*-")
     assert "--mtp-num-layers 2" in env["NATIVE_ARGS"]
@@ -97,6 +98,8 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
             "bf16",
             "--fp8-recipe",
             "mxfp8",
+            "--fp8-format",
+            "e4m3",
             "--mxfp8-bwd-backend",
             "cutlass_native",
             "--mxfp8-transpose-emit-backend",
@@ -114,6 +117,7 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
     assert "export MTP_DEPTHS=1" in out
     assert "export CPPMEGA_OPTIMIZER=adam" in out
     assert "export CPPMEGA_PARAM_STORAGE=bf16" in out
+    assert "export CPPMEGA_FP8_FORMAT=e4m3" in out
     assert "export CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native" in out
     assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=off" in out
     assert "export CPPMEGA_FP8_PARAM_GATHER=1" in out
@@ -123,10 +127,10 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
     assert "--mtp-num-layers 1" in out
 
 
-def test_local_gb10_quarter_mxfp8_defaults_to_te_tn_adapter():
-    """The local_gb10_quarter profile defaults to the faster TE TN adapter."""
+def test_local_gb10_quarter_mxfp8_defaults_to_flashinfer_cutlass():
+    """The local_gb10_quarter profile defaults to TE payload + FlashInfer/CUTLASS."""
     profile = get_run_profile("local_gb10_quarter")
-    assert profile.precision.mxfp8_bwd_backend == "te_tn_adapter"
+    assert profile.precision.mxfp8_bwd_backend == "flashinfer_cutlass"
 
 
 def test_mxfp8_transpose_emit_defaults_to_te_for_tn_adapter():
@@ -135,3 +139,33 @@ def test_mxfp8_transpose_emit_defaults_to_te_for_tn_adapter():
     profile.precision.fp8_recipe = "mxfp8"
     env = profile_shell_assignments(profile)
     assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
+
+
+def test_tensorwise_fp8_keeps_hybrid_format():
+    profile = get_run_profile("local_gb10_quarter")
+    profile.precision.fp8_recipe = "tensorwise"
+    env = profile_shell_assignments(profile)
+
+    assert env["CPPMEGA_FP8_FORMAT"] == "hybrid"
+
+
+def test_mxfp8_rejects_hybrid_fp8_format(capsys, monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_profiles",
+            "shell",
+            "local_gb10_quarter",
+            "--fp8-recipe",
+            "mxfp8",
+            "--fp8-format",
+            "hybrid",
+        ],
+    )
+
+    try:
+        main()
+    except ValueError as exc:
+        assert "requires fp8_format=e4m3" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("mxfp8 + hybrid fp8 format must fail")
