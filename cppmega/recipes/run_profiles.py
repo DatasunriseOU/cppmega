@@ -21,7 +21,7 @@ from cppmega.recipes.nam56r_launch import (
 )
 from cppmega.recipes.nam56r_megatron import build_nam56r_feature_plan
 
-MtpCEKernel = Literal["native", "liger", "off"]
+MtpCEKernel = Literal["native", "cce", "liger", "off"]
 Fp8Format = Literal["hybrid", "e4m3"]
 Fp8Recipe = Literal["off", "tensorwise", "mxfp8"]
 Mxfp8BackwardBackend = Literal["te_tn_adapter", "flashinfer_cutlass", "cutlass_native"]
@@ -29,6 +29,9 @@ Mxfp8TransposeEmitBackend = Literal["auto", "te", "off"]
 ParamStorage = Literal["auto", "bf16", "mxfp8"]
 SparseMlaMode = Literal["tilelang", "gather_scatter", "pytorch"]
 MoeDispatcher = Literal["flex", "alltoall", "allgather"]
+MoeFlexBackend = Literal["deepep", "hybridep"]
+NsysCaptureMode = Literal["full", "delay", "cudaProfilerApi"]
+AttentionBackend = Literal["auto", "flash", "fused", "unfused"]
 
 
 @dataclass
@@ -58,7 +61,8 @@ class ModelProfile:
     virtual_pipeline_model_parallel_size: int = 1
     # Native MoE/DSA args.  Remote scripts used to mutate these with sed.
     moe_expert_model_parallel_size: int = 1
-    moe_token_dispatcher_type: MoeDispatcher = "flex"
+    moe_token_dispatcher_type: MoeDispatcher = "alltoall"
+    moe_flex_dispatcher_backend: MoeFlexBackend = "deepep"
     moe_router_dtype: str | None = "fp32"
     dsa_indexer_loss_coeff: float = 0.001
 
@@ -97,8 +101,11 @@ class PrecisionProfile:
     fp8_format: Fp8Format = "hybrid"
     fp8_recipe: Fp8Recipe = "tensorwise"
     sparse_mla_fp8_quant: str = "te_tensorwise"
-    # Flash attention is mandatory when available for full attention/MLA blocks.
+    # Keep --use-flash-attn enabled for accelerated TE attention paths, but let
+    # the launcher choose the concrete Megatron backend explicitly.  Local GB10
+    # overrides this to auto because forced flash currently selects FA4 on sm_121.
     use_flash_attention: bool = True
+    attention_backend: AttentionBackend = "flash"
     # These fields are consumed only when fp8_recipe == "mxfp8" or a TE precision
     # config requests block-scaled TE.  They are kept here so MXFP8 probes are
     # reproducible and do not reintroduce hidden BF16 backward bridges.
@@ -157,6 +164,7 @@ class RuntimePatchProfile:
     mamba_num_groups: int = 8
     mamba_recompute: bool = True
     dsa_sparse_mode: SparseMlaMode = "tilelang"
+    dsa_fp8_attention: bool = False
     # NOTE: same name as ModelProfile.dsa_indexer_loss_coeff but semantically
     # distinct — this is the env-var string passed to import-time shim patches,
     # while ModelProfile's is the float fed to the --dsa-indexer-loss-coeff
@@ -181,6 +189,14 @@ class ProfilingProfile:
     torch_profile: bool = False
     torch_profile_steps: int = 2
     nsys_profile: bool = False
+    # Nsight Systems CUDA-profiler capture ranges are unreliable on the local
+    # CUDA 13.2/GB10 stack: reports contain CUDA API ranges but no kernel
+    # activity records.  Hardware CUDA tracing has the same failure mode here,
+    # so default to software CUDA tracing and a full-process capture.
+    nsys_capture_mode: NsysCaptureMode = "full"
+    nsys_trace: str = "cuda-sw,nvtx,osrt"
+    nsys_delay: int = 0
+    nsys_duration: int = 0
     # Megatron cudaProfilerStart/Stop range used by external profilers such as
     # Nsight Compute.  Keep it separate from torch_profile/nsys_profile because
     # CUPTI permits only one active subscriber.
@@ -250,6 +266,22 @@ class RunProfile:
     def native_args_fragment(self) -> str:
         """Return the Megatron-native feature fragment derived from this profile."""
 
+        if (
+            self.model.moe_token_dispatcher_type == "flex"
+            and self.model.moe_expert_model_parallel_size <= 1
+        ):
+            raise ValueError(
+                "moe_token_dispatcher_type=flex requires "
+                "moe_expert_model_parallel_size > 1 in cppmega run profiles"
+            )
+        if (
+            self.model.moe_token_dispatcher_type == "flex"
+            and self.model.moe_router_dtype != "fp32"
+        ):
+            raise ValueError(
+                "moe_token_dispatcher_type=flex requires moe_router_dtype=fp32 "
+                "because DeepEP/HybridEP weighted dispatch consumes fp32 probabilities"
+            )
         plan = build_nam56r_feature_plan(
             pattern=self.model.pattern,
             depth=self.model.depth,
@@ -264,6 +296,7 @@ class RunProfile:
             enable_moe=True,
             moe_expert_model_parallel_size=self.model.moe_expert_model_parallel_size,
             moe_token_dispatcher_type=self.model.moe_token_dispatcher_type,
+            moe_flex_dispatcher_backend=self.model.moe_flex_dispatcher_backend,
             moe_router_dtype=self.model.moe_router_dtype,
             enable_dsa=True,
             dsa_indexer_loss_coeff=self.model.dsa_indexer_loss_coeff,
@@ -279,10 +312,10 @@ def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProf
     """Fill the local GB10 NAM56R-quarter profile.
 
     This is the default correctness lane used on the single-GB10 box: full
-    NAM56R width, quarter depth, real 4k clang data, MTP=2, Liger MTP CE, Flash
-    Attention, tensorwise FP8, no-master Muon, q8 Muon momentum, and disabled
-    contiguous local DDP grad buffer.  It intentionally favors debuggability and
-    memory pressure over production H200 throughput.
+    NAM56R width, quarter depth, real 4k clang data, MTP=2, CCE MTP CE, TE
+    attention auto routing, tensorwise FP8, no-master Muon, q8 Muon momentum,
+    and disabled contiguous local DDP grad buffer.  It intentionally favors
+    debuggability and memory pressure over production H200 throughput.
     """
 
     if profile is None:
@@ -293,9 +326,14 @@ def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProf
     # Single-GB10 has TP=EP=1, so Megatron's Flex dispatcher is invalid here.
     # Keep this in the typed profile instead of relying on a shell fallback.
     profile.model.moe_token_dispatcher_type = "alltoall"
+    profile.precision.attention_backend = "auto"
+    # The remaining BF16 GEMM hotspot on GB10 is Muon's Newton-Schulz loop.
+    # nanochat's comparable performance presets use 3 iterations; keep this as
+    # a typed profile default so runs can restore 5 with --muon-num-ns-steps 5.
+    profile.optimizer.muon_num_ns_steps = 3
     profile.runtime = RuntimePatchProfile(
-        mtp_ce_kernel="liger",
-        acknowledge_liger_mtp_ce_deprecated=True,
+        mtp_ce_kernel="cce",
+        acknowledge_liger_mtp_ce_deprecated=False,
     )
     return profile
 
@@ -366,6 +404,7 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         "CPPMEGA_VPP_SIZE": str(profile.model.virtual_pipeline_model_parallel_size),
         "CPPMEGA_EP_SIZE": str(profile.model.moe_expert_model_parallel_size),
         "CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE": profile.model.moe_token_dispatcher_type,
+        "CPPMEGA_MOE_FLEX_DISPATCHER_BACKEND": profile.model.moe_flex_dispatcher_backend,
         "CPPMEGA_SEQ_LENGTH": str(profile.training.seq_length),
         "CPPMEGA_MAX_POSITION_EMBEDDINGS": str(profile.training.seq_length),
         "CPPMEGA_MICRO_BATCH_SIZE": str(profile.training.micro_batch_size),
@@ -384,6 +423,8 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         "CPPMEGA_FP8_FORMAT": profile.resolved_fp8_format(),
         "CPPMEGA_FP8_RECIPE": profile.precision.fp8_recipe,
         "CPPMEGA_SPARSE_MLA_FP8_QUANT": profile.precision.sparse_mla_fp8_quant,
+        "CPPMEGA_USE_FLASH_ATTN": _bool(profile.precision.use_flash_attention),
+        "CPPMEGA_ATTN_BACKEND": profile.precision.attention_backend,
         "CPPMEGA_OPTIMIZER": profile.optimizer.optimizer,
         "CPPMEGA_PARAM_STORAGE": profile.resolved_param_storage(),
         "CPPMEGA_MUON_MOMENTUM": profile.optimizer.muon_momentum,
@@ -422,6 +463,7 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         "CPPMEGA_MAMBA_NUM_GROUPS": str(profile.runtime.mamba_num_groups),
         "CPPMEGA_MAMBA_RECOMPUTE": _bool(profile.runtime.mamba_recompute),
         "CPPMEGA_DSA_SPARSE_MODE": profile.runtime.dsa_sparse_mode,
+        "CPPMEGA_DSA_FP8_ATTENTION": _bool(profile.runtime.dsa_fp8_attention),
         "CPPMEGA_DSA_INDEXER_LOSS_COEFF": profile.runtime.dsa_indexer_loss_coeff,
         "CPPMEGA_DSA_SKIP_INDEXER_LOSS": _bool(profile.runtime.dsa_skip_indexer_loss),
         "CPPMEGA_NGRAM_HASH_ENABLED": _bool(profile.runtime.ngram_hash_enabled),
@@ -434,6 +476,10 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         "CPPMEGA_TORCH_PROFILE": _bool(profile.profiling.torch_profile),
         "CPPMEGA_TORCH_PROFILE_STEPS": str(profile.profiling.torch_profile_steps),
         "CPPMEGA_NSYS_PROFILE": _bool(profile.profiling.nsys_profile),
+        "CPPMEGA_NSYS_CAPTURE_MODE": profile.profiling.nsys_capture_mode,
+        "CPPMEGA_NSYS_TRACE": profile.profiling.nsys_trace,
+        "CPPMEGA_NSYS_DELAY": str(profile.profiling.nsys_delay),
+        "CPPMEGA_NSYS_DURATION": str(profile.profiling.nsys_duration),
         "CPPMEGA_CUDA_PROFILE": _bool(profile.profiling.cuda_profile),
         "CPPMEGA_CUDA_PROFILE_STEP_START": str(
             profile.profiling.cuda_profile_step_start
@@ -506,6 +552,8 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.model.moe_expert_model_parallel_size = args.expert_model_parallel_size
     if args.moe_token_dispatcher_type is not None:
         profile.model.moe_token_dispatcher_type = args.moe_token_dispatcher_type
+    if args.moe_flex_dispatcher_backend is not None:
+        profile.model.moe_flex_dispatcher_backend = args.moe_flex_dispatcher_backend
     if args.moe_router_dtype is not None:
         profile.model.moe_router_dtype = None if args.moe_router_dtype == "none" else args.moe_router_dtype
     if args.dsa_indexer_loss_coeff is not None:
@@ -519,6 +567,8 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
             profile.precision.fp8_format = "e4m3"
     if args.fp8_format is not None:
         profile.precision.fp8_format = args.fp8_format
+    if args.attention_backend is not None:
+        profile.precision.attention_backend = args.attention_backend
     if args.mxfp8_bwd_backend is not None:
         profile.precision.mxfp8_bwd_backend = args.mxfp8_bwd_backend
     if args.mxfp8_transpose_emit_backend is not None:
@@ -537,6 +587,10 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.optimizer.optimizer = args.optimizer
     if args.param_storage is not None:
         profile.optimizer.param_storage = args.param_storage
+    if args.muon_num_ns_steps is not None:
+        if args.muon_num_ns_steps < 1:
+            raise ValueError("--muon-num-ns-steps must be >= 1")
+        profile.optimizer.muon_num_ns_steps = args.muon_num_ns_steps
     if args.seq_length is not None:
         profile.training.seq_length = args.seq_length
     if args.micro_batch_size is not None:
@@ -554,6 +608,23 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.profiling.torch_profile = True
     if args.nsys_profile:
         profile.profiling.nsys_profile = True
+    if args.nsys_capture_mode is not None:
+        profile.profiling.nsys_profile = True
+        profile.profiling.nsys_capture_mode = args.nsys_capture_mode
+    if args.nsys_trace is not None:
+        profile.profiling.nsys_profile = True
+        profile.profiling.nsys_trace = args.nsys_trace
+    if args.nsys_delay is not None:
+        profile.profiling.nsys_profile = True
+        profile.profiling.nsys_delay = args.nsys_delay
+    if args.nsys_duration is not None:
+        profile.profiling.nsys_profile = True
+        profile.profiling.nsys_duration = args.nsys_duration
+    if profile.profiling.nsys_capture_mode != "delay":
+        profile.profiling.nsys_delay = 0
+        profile.profiling.nsys_duration = 0
+    elif profile.profiling.nsys_duration < 1:
+        raise ValueError("nsys_capture_mode=delay requires --nsys-duration >= 1")
     if args.cuda_profile:
         profile.profiling.cuda_profile = True
     if args.cuda_profile_step_start is not None:
@@ -601,6 +672,11 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         default=None,
     )
     parser.add_argument(
+        "--moe-flex-dispatcher-backend",
+        choices=("deepep", "hybridep"),
+        default=None,
+    )
+    parser.add_argument(
         "--moe-router-dtype",
         choices=("fp32", "none"),
         default=None,
@@ -609,6 +685,11 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mtp-ce-kernel", choices=("native", "liger", "off"), default=None)
     parser.add_argument("--fp8-format", choices=("hybrid", "e4m3"), default=None)
     parser.add_argument("--fp8-recipe", choices=("off", "tensorwise", "mxfp8"), default=None)
+    parser.add_argument(
+        "--attention-backend",
+        choices=("auto", "flash", "fused", "unfused"),
+        default=None,
+    )
     parser.add_argument(
         "--mxfp8-bwd-backend",
         choices=("te_tn_adapter", "flashinfer_cutlass", "cutlass_native"),
@@ -673,6 +754,12 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--optimizer", default=None)
     parser.add_argument("--param-storage", choices=("auto", "bf16", "mxfp8"), default=None)
+    parser.add_argument(
+        "--muon-num-ns-steps",
+        type=int,
+        default=None,
+        help="Override Newton-Schulz iterations for Muon in typed profiles.",
+    )
     parser.add_argument("--seq-length", type=int, default=None)
     parser.add_argument("--micro-batch-size", type=int, default=None)
     parser.add_argument("--global-batch-size", type=int, default=None)
@@ -681,6 +768,18 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mem-profile-steps", type=int, default=None)
     parser.add_argument("--torch-profile", action="store_true")
     parser.add_argument("--nsys-profile", action="store_true")
+    parser.add_argument(
+        "--nsys-capture-mode",
+        choices=("full", "delay", "cudaProfilerApi"),
+        default=None,
+        help=(
+            "Nsight Systems capture mode. Prefer full or delay; cudaProfilerApi "
+            "is kept only for external repros because it drops kernel records on GB10."
+        ),
+    )
+    parser.add_argument("--nsys-trace", default=None)
+    parser.add_argument("--nsys-delay", type=int, default=None)
+    parser.add_argument("--nsys-duration", type=int, default=None)
     parser.add_argument("--cuda-profile", action="store_true")
     parser.add_argument("--cuda-profile-step-start", type=int, default=None)
     parser.add_argument("--cuda-profile-step-end", type=int, default=None)

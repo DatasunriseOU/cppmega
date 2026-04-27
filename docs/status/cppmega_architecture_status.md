@@ -242,9 +242,10 @@ Current facts:
 - General shim direction: `scripts/cppmega_fp8_shim.py` defaults
   `CPPMEGA_MTP_CE_KERNEL=native`, installing `mtp_native_hopper_ce.py`.
 - Current local GB10 quarter default: the `local_gb10_quarter` typed run profile
-  sets `model.mtp_depths=2`, `runtime.mtp_ce_kernel="liger"`, and the explicit
-  Liger ACK. The shell launcher renders those profile fields instead of owning
-  separate MTP defaults.
+  sets `model.mtp_depths=2` and `runtime.mtp_ce_kernel="cce"`. The shim forces
+  `CPPMEGA_LINEAR_CE_KERNEL=cce` for that route, so MTP uses the same
+  `LinearCrossEntropyModule` API as the main head but lands on Apple CCE on
+  GB10 instead of the deprecated Liger MTP path.
 - H200 production status still says not to enable
   `CPPMEGA_MTP_NATIVE_HOPPER_CE=1`; it produced `grad_norm=NaN` and needs
   retained validation before becoming a default.
@@ -262,11 +263,17 @@ Needed validation before changing defaults:
   finite grad norms through main-head + MTP shared-weight multi-call, and it
   must beat or match the Liger/local path on memory and speed.
 - GB10: local depth-2 MTP default should keep logging `lm` and `mtp_1` losses
-  plus CE route/counter state. If native is tested locally, keep it opt-in and
-  record a separate log instead of overwriting the Liger default.
+  plus CE route/counter state. CCE standalone probes validate the shared-weight
+  three-call pattern, but a retained local training receipt should still be
+  recorded before treating the route as a production H200 replacement.
 
 ## Local Logs And Probe Receipts
 
+- `tools/probes/linear_ce_probe.py` on GB10, 2026-04-27:
+  CCE shared-weight 3-call `reduction="sum"` finite with loss rel error
+  `9.78e-08`; synthetic `[4096,3584] x [65536,3584]` BF16 timing was
+  CCE `none+mask` 131 ms, CCE `sum+masked` 118 ms, CCE `sum+filter=high`
+  75 ms, Liger mean-broadcast 380 ms.
 - `/home/dave/logs/gb10_100_tensorwise_mbs4_20260425_2025.log`
 - `/home/dave/logs/gb10_100_mamba_mxfp8_tn_mbs4_20260425_2034.log`
 - `/home/dave/logs/cutlass_mxfp8_gb10_integrated_micro_20260426.sqlite`

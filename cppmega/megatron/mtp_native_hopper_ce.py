@@ -90,6 +90,28 @@ def patch_mtp_native_hopper_ce() -> None:
         )
         return
 
+    # Install the main LinearCE class swap / backend route here as well as in
+    # launchers.  This makes CPPMEGA_MTP_CE_KERNEL=cce/native independent of
+    # import order: on GB10, apply_linear_ce_patch routes LinearCE to CCE; on
+    # supported H200/B200 stacks, auto can keep Megatron native.
+    try:
+        from cppmega.megatron.apply_linear_ce_patch import (
+            patch_mamba_output_layer_with_linear_ce,
+        )
+
+        patch_mamba_output_layer_with_linear_ce()
+    except Exception as exc:  # pragma: no cover
+        print(
+            f"[cppmega] MTP LinearCE patch aborted — main LinearCE route "
+            f"failed to install ({exc}).",
+            file=sys.stderr,
+        )
+        return
+
+    if getattr(MambaModel, "_cppmega_mtp_linear_ce_patched", False):
+        _install_process_mtp_loss_patch()
+        return
+
     # Wrap MambaModel.__init__ AFTER apply_linear_ce_patch ran so we see
     # the already-swapped output_layer and assert the config is coherent.
     _prev_init = MambaModel.__init__
@@ -147,6 +169,7 @@ def patch_mtp_native_hopper_ce() -> None:
             )
 
     MambaModel.__init__ = _patched_init
+    MambaModel._cppmega_mtp_linear_ce_patched = True
 
     # ------------------------------------------------------------------
     # Monkey-patch process_mtp_loss to avoid the PR #3345 reduction="none"

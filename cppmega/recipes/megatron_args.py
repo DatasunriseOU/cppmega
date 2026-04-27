@@ -51,7 +51,9 @@ def build_megatron_args_bundle(
     moe_ffn_hidden_size: int = 896,
     moe_shared_expert_intermediate_size: int = 1024,
     moe_grouped_gemm: bool = True,
-    moe_token_dispatcher_type: str = "flex",
+    moe_router_fusion: bool = True,
+    moe_token_dispatcher_type: str = "alltoall",
+    moe_flex_dispatcher_backend: str = "deepep",
     moe_router_dtype: str | None = "fp32",
     use_dsa: bool = False,
     dsa_indexer_n_heads: int = 32,
@@ -99,6 +101,10 @@ def build_megatron_args_bundle(
             raise ValueError(
                 f"unsupported moe_token_dispatcher_type: {moe_token_dispatcher_type!r}"
             )
+        if moe_flex_dispatcher_backend not in {"deepep", "hybridep"}:
+            raise ValueError(
+                f"unsupported moe_flex_dispatcher_backend: {moe_flex_dispatcher_backend!r}"
+            )
         args.extend(
             [
                 "--expert-model-parallel-size",
@@ -111,21 +117,22 @@ def build_megatron_args_bundle(
                 str(moe_ffn_hidden_size),
                 "--moe-shared-expert-intermediate-size",
                 str(moe_shared_expert_intermediate_size),
-                # DeepEP flex dispatcher: pre-allocated fixed buffers instead
-                # of Megatron's alltoall which creates 84-224 GiB gradient
-                # tensors at EP>2. DeepEP uses NVLink for intranode, NVSHMEM
-                # IBGDA for internode. Falls back to alltoall if deep_ep not
-                # installed. See https://github.com/deepseek-ai/DeepEP
+                # Safe default is alltoall.  Flex is an explicit DeepEP /
+                # HybridEP route and will fail fast if that backend is not
+                # installed; Megatron does not silently fall back to alltoall.
                 "--moe-token-dispatcher-type",
                 moe_token_dispatcher_type,
                 "--moe-permute-fusion",
             ]
         )
+        if moe_token_dispatcher_type == "flex":
+            args.extend(["--moe-flex-dispatcher-backend", moe_flex_dispatcher_backend])
         if moe_router_dtype:
             # DeepEP flex requires fp32 router probabilities.  EP=1/alltoall
             # local tests can omit this flag to exercise Megatron defaults.
             args.extend(["--moe-router-dtype", moe_router_dtype])
         args.extend(_bool_flag(moe_grouped_gemm, "--moe-grouped-gemm"))
+        args.extend(_bool_flag(moe_router_fusion, "--moe-router-fusion"))
 
     if use_dsa:
         if dsa_indexer_dtype != "bf16":
