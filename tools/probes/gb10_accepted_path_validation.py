@@ -29,6 +29,7 @@ if __package__:
     from .gb10_accepted_path_validation_helpers import (
         ADAPTER_STAT_KEYS,
         CUTLASS_STAT_KEYS,
+        FLASHINFER_STAT_KEYS,
         FALLBACK_STAT_KEYS,
         MATERIALIZATION_STAT_KEYS,
         SIDECAR_REGISTRY_ZERO_KEYS,
@@ -47,6 +48,7 @@ else:
     _HELPER_SPEC.loader.exec_module(_helpers)
     ADAPTER_STAT_KEYS = _helpers.ADAPTER_STAT_KEYS
     CUTLASS_STAT_KEYS = _helpers.CUTLASS_STAT_KEYS
+    FLASHINFER_STAT_KEYS = _helpers.FLASHINFER_STAT_KEYS
     FALLBACK_STAT_KEYS = _helpers.FALLBACK_STAT_KEYS
     MATERIALIZATION_STAT_KEYS = _helpers.MATERIALIZATION_STAT_KEYS
     SIDECAR_REGISTRY_ZERO_KEYS = _helpers.SIDECAR_REGISTRY_ZERO_KEYS
@@ -256,12 +258,14 @@ def run_mxfp8_shim_probe(args: argparse.Namespace) -> CheckResult:
         str(args.n),
         "--k",
         str(args.k),
+        "--mxfp8-bwd-backend",
+        "flashinfer_cutlass",
     ]
     env = _base_env()
     env.update(
         {
             "CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER": "1",
-            "CPPMEGA_TE_MXFP8_BWD_BACKEND": "te_tn_adapter",
+            "CPPMEGA_TE_MXFP8_BWD_BACKEND": "flashinfer_cutlass",
             "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND": "te",
             "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED": "1",
             "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT": "1",
@@ -309,7 +313,7 @@ def run_mxfp8_shim_probe(args: argparse.Namespace) -> CheckResult:
     return CheckResult(
         name="mxfp8_tn_adapter_probe",
         status="pass",
-        detail="shim routed MXFP8 backward through TE TN adapter with BF16 fallback and live sidecar counters at zero",
+        detail="shim routed MXFP8 backward through the accepted MXFP8 backend with BF16 fallback and live sidecar counters at zero",
         data={"shim_stats": report.get("shim_stats")},
     )
 
@@ -342,12 +346,14 @@ def run_mxfp8_te_emit_probe(args: argparse.Namespace) -> CheckResult:
         str(args.n),
         "--k",
         str(args.k),
+        "--mxfp8-bwd-backend",
+        "flashinfer_cutlass",
     ]
     env = _base_env()
     env.update(
         {
             "CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER": "1",
-            "CPPMEGA_TE_MXFP8_BWD_BACKEND": "te_tn_adapter",
+            "CPPMEGA_TE_MXFP8_BWD_BACKEND": "flashinfer_cutlass",
             "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND": "te",
             "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED": "1",
             "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT": "1",
@@ -425,23 +431,31 @@ def validate_training_log(path: Path) -> CheckResult:
             if int(counters.get(key, -1)) != 0:
                 errors.append(f"{key}={counters.get(key)}; expected 0")
         adapter_used = False
-        cutlass_used = False
-        for adapter_key, cutlass_key in zip(ADAPTER_STAT_KEYS, CUTLASS_STAT_KEYS):
+        direct_cutlass_used = False
+        flashinfer_used = False
+        for adapter_key, cutlass_key, flashinfer_key in zip(
+            ADAPTER_STAT_KEYS,
+            CUTLASS_STAT_KEYS,
+            FLASHINFER_STAT_KEYS,
+        ):
             adapter_count = int(counters.get(adapter_key, 0))
             cutlass_count = int(counters.get(cutlass_key, 0))
+            flashinfer_count = int(counters.get(flashinfer_key, 0))
             adapter_used = adapter_used or adapter_count > 0
-            cutlass_used = cutlass_used or cutlass_count > 0
-            if adapter_count <= 0 and cutlass_count <= 0:
+            direct_cutlass_used = direct_cutlass_used or cutlass_count > 0
+            flashinfer_used = flashinfer_used or flashinfer_count > 0
+            if adapter_count <= 0 and cutlass_count <= 0 and flashinfer_count <= 0:
                 errors.append(
                     f"{adapter_key}={counters.get(adapter_key)} and "
-                    f"{cutlass_key}={counters.get(cutlass_key)}; expected one >0"
+                    f"{cutlass_key}={counters.get(cutlass_key)} and "
+                    f"{flashinfer_key}={counters.get(flashinfer_key)}; expected one >0"
                 )
         for key in SIDECAR_REGISTRY_ZERO_KEYS:
             if key not in counters:
                 errors.append(f"{key} missing; expected 0")
             elif int(counters.get(key, -1)) != 0:
                 errors.append(f"{key}={counters.get(key)}; expected 0")
-        if cutlass_used and not adapter_used:
+        if direct_cutlass_used and not adapter_used and not flashinfer_used:
             for key in MATERIALIZATION_STAT_KEYS:
                 if int(counters.get(key, 0)) != 0:
                     errors.append(f"{key}={counters.get(key)}; expected 0 for cutlass_native")
