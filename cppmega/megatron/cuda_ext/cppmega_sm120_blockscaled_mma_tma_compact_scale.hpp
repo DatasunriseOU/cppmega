@@ -66,16 +66,44 @@ template<
   int Stages_,
   int SchedulerPipelineStageCount_,
   class ClusterShape_,
-  class KernelSchedule_
+  class KernelSchedule_,
+  bool UseAuxiliaryLoad_ = false
 >
 struct MainloopSm120TmaWarpSpecializedBlockScaledCompactScale {
   constexpr static int Stages = Stages_;
   constexpr static int SchedulerPipelineStageCount = SchedulerPipelineStageCount_;
   using ClusterShape = ClusterShape_;
   using Schedule = KernelSchedule_;
+  constexpr static bool UseAuxiliaryLoad = UseAuxiliaryLoad_;
   constexpr static int PipelineAsyncMmaStages = 0;
   using ArchTag = arch::Sm120;
 };
+
+} // namespace cutlass::gemm::collective
+
+namespace cutlass::gemm::kernel::detail {
+
+template<
+  int Stages,
+  int SchedulerPipelineStageCount,
+  class ClusterShape,
+  class KernelSchedule,
+  bool UseAuxiliaryLoad
+>
+struct HasAuxiliaryLoad<
+  cutlass::gemm::collective::MainloopSm120TmaWarpSpecializedBlockScaledCompactScale<
+    Stages,
+    SchedulerPipelineStageCount,
+    ClusterShape,
+    KernelSchedule,
+    UseAuxiliaryLoad
+  >
+> : cute::bool_constant<UseAuxiliaryLoad>{};
+
+} // namespace cutlass::gemm::kernel::detail
+
+namespace cutlass::gemm::collective {
+using namespace cute;
 
 template <
   int Stages,
@@ -196,8 +224,10 @@ struct CollectiveMma<
   using PipelineStateMK = typename cutlass::PipelineState<DispatchPolicy::Stages>;
   using PipelineStateNK = typename cutlass::PipelineState<DispatchPolicy::Stages>;
 
-  // One threads per CTA are producers (1 for operand tile)
-  static constexpr int NumProducerThreadEvents = 1;
+  // Generic cooperative split mode uses one TMA leader from the main producer
+  // warp plus 32 auxiliary warp arrivals for the B/SFB half. The default direct
+  // backend keeps the original single-producer path.
+  static constexpr int NumProducerThreadEvents = DispatchPolicy::UseAuxiliaryLoad ? 33 : 1;
 
   static_assert(rank(SmemLayoutAtomA{}) == 2, "SmemLayoutAtom must be rank 2 (M/N, K)");
   static_assert((size<0>(TileShape{}) % size<0>(SmemLayoutAtomA{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
@@ -669,7 +699,7 @@ struct CollectiveMma<
     int m_coord_i = int(m_coord);
     int n_coord_i = int(n_coord);
 
-    auto load_compact_scale_factors = [&](int write_stage, int k_tile) {
+    auto load_compact_scale_factors = [&](int write_stage, int k_tile, bool load_a, bool load_b) {
       constexpr int TileM = int(size<0>(TileShape{}));
       constexpr int TileN = int(size<1>(TileShape{}));
       constexpr int TileK = int(size<2>(TileShape{}));
@@ -754,53 +784,57 @@ struct CollectiveMma<
         }
       };
 
-      if (params.a_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose)) {
-        // K-block major order makes each warp transaction read contiguous TE columnwise scale bytes.
-        constexpr int RowVectors = TileM / 16;
-        for (int idx = lane; idx < KBlocks * RowVectors; idx += 32) {
-          int kb = idx / RowVectors;
-          int row_vec = idx - kb * RowVectors;
-          int row_base = row_vec * 16;
-          int64_t scale_offset =
-              static_cast<int64_t>(k_base_block + kb) * params.sfa_ld + (m_base + row_base);
-          uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_SFA_u8 + scale_offset);
-          store_sfa_m_contiguous(row_base, kb, chunk);
-        }
-      } else {
-        constexpr int KBlockVectors = KBlocks / ScaleVecBytes;
-        for (int idx = lane; idx < TileM * KBlockVectors; idx += 32) {
-          int row = idx / KBlockVectors;
-          int kb_vec = idx - row * KBlockVectors;
-          int kb_base = kb_vec * ScaleVecBytes;
-          int64_t scale_offset =
-              static_cast<int64_t>(m_base + row) * params.sfa_ld + k_base_block + kb_base;
-          uint32_t word = *reinterpret_cast<uint32_t const*>(ptr_SFA_u8 + scale_offset);
-          store_sfa_k_contiguous(row, kb_base, word);
+      if (load_a) {
+        if (params.a_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose)) {
+          // K-block major order makes each warp transaction read contiguous TE columnwise scale bytes.
+          constexpr int RowVectors = TileM / 16;
+          for (int idx = lane; idx < KBlocks * RowVectors; idx += 32) {
+            int kb = idx / RowVectors;
+            int row_vec = idx - kb * RowVectors;
+            int row_base = row_vec * 16;
+            int64_t scale_offset =
+                static_cast<int64_t>(k_base_block + kb) * params.sfa_ld + (m_base + row_base);
+            uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_SFA_u8 + scale_offset);
+            store_sfa_m_contiguous(row_base, kb, chunk);
+          }
+        } else {
+          constexpr int KBlockVectors = KBlocks / ScaleVecBytes;
+          for (int idx = lane; idx < TileM * KBlockVectors; idx += 32) {
+            int row = idx / KBlockVectors;
+            int kb_vec = idx - row * KBlockVectors;
+            int kb_base = kb_vec * ScaleVecBytes;
+            int64_t scale_offset =
+                static_cast<int64_t>(m_base + row) * params.sfa_ld + k_base_block + kb_base;
+            uint32_t word = *reinterpret_cast<uint32_t const*>(ptr_SFA_u8 + scale_offset);
+            store_sfa_k_contiguous(row, kb_base, word);
+          }
         }
       }
 
-      if (params.b_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose)) {
-        // K-block major order makes each warp transaction read contiguous TE columnwise scale bytes.
-        constexpr int RowVectors = TileN / 16;
-        for (int idx = lane; idx < KBlocks * RowVectors; idx += 32) {
-          int kb = idx / RowVectors;
-          int row_vec = idx - kb * RowVectors;
-          int row_base = row_vec * 16;
-          int64_t scale_offset =
-              static_cast<int64_t>(k_base_block + kb) * params.sfb_ld + (n_base + row_base);
-          uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_SFB_u8 + scale_offset);
-          store_sfb_n_contiguous(row_base, kb, chunk);
-        }
-      } else {
-        constexpr int KBlockVectors = KBlocks / ScaleVecBytes;
-        for (int idx = lane; idx < TileN * KBlockVectors; idx += 32) {
-          int row = idx / KBlockVectors;
-          int kb_vec = idx - row * KBlockVectors;
-          int kb_base = kb_vec * ScaleVecBytes;
-          int64_t scale_offset =
-              static_cast<int64_t>(n_base + row) * params.sfb_ld + k_base_block + kb_base;
-          uint32_t word = *reinterpret_cast<uint32_t const*>(ptr_SFB_u8 + scale_offset);
-          store_sfb_k_contiguous(row, kb_base, word);
+      if (load_b) {
+        if (params.b_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose)) {
+          // K-block major order makes each warp transaction read contiguous TE columnwise scale bytes.
+          constexpr int RowVectors = TileN / 16;
+          for (int idx = lane; idx < KBlocks * RowVectors; idx += 32) {
+            int kb = idx / RowVectors;
+            int row_vec = idx - kb * RowVectors;
+            int row_base = row_vec * 16;
+            int64_t scale_offset =
+                static_cast<int64_t>(k_base_block + kb) * params.sfb_ld + (n_base + row_base);
+            uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_SFB_u8 + scale_offset);
+            store_sfb_n_contiguous(row_base, kb, chunk);
+          }
+        } else {
+          constexpr int KBlockVectors = KBlocks / ScaleVecBytes;
+          for (int idx = lane; idx < TileN * KBlockVectors; idx += 32) {
+            int row = idx / KBlockVectors;
+            int kb_vec = idx - row * KBlockVectors;
+            int kb_base = kb_vec * ScaleVecBytes;
+            int64_t scale_offset =
+                static_cast<int64_t>(n_base + row) * params.sfb_ld + k_base_block + kb_base;
+            uint32_t word = *reinterpret_cast<uint32_t const*>(ptr_SFB_u8 + scale_offset);
+            store_sfb_k_contiguous(row, kb_base, word);
+          }
         }
       }
     };
@@ -949,7 +983,11 @@ struct CollectiveMma<
       __syncwarp();
 
       int write_stage = smem_pipe_write.index();
-      load_compact_scale_factors(write_stage, *k_tile_iter);
+      load_compact_scale_factors(
+          write_stage,
+          *k_tile_iter,
+          true,
+          !DispatchPolicy::UseAuxiliaryLoad);
       __syncwarp();
 
       //
@@ -959,43 +997,35 @@ struct CollectiveMma<
           params.manual_payload_load &&
           params.a_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose);
       bool manual_payload_b =
+          !DispatchPolicy::UseAuxiliaryLoad &&
           params.manual_payload_load &&
           params.b_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose);
 
-      if (manual_payload_a || manual_payload_b) {
-        // Direct compact mode only needs manual payload stores for operands
-        // that arrive as TE columnwise-transpose storage.  Rowwise operands
-        // already match the CUTLASS TMA descriptor and should stay on TMA.
-        using BarrierType = typename MainloopPipeline::ProducerBarrierType;
-        BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
-        uint32_t manual_transaction_bytes = params.scale_transaction_bytes;
-        if (manual_payload_a) {
-          load_payload_tile_a(write_stage, *k_tile_iter);
-          manual_transaction_bytes += params.payload_transaction_bytes_mk;
-        } else if (lane_predicate) {
-          copy(params.tma_load_a.with(*tma_barrier), tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,write_stage));
-        }
-        if (manual_payload_b) {
-          load_payload_tile_b(write_stage, *k_tile_iter);
-          manual_transaction_bytes += params.payload_transaction_bytes_nk;
-        } else if (lane_predicate) {
+      using BarrierType = typename MainloopPipeline::ProducerBarrierType;
+      BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
+      uint32_t manual_transaction_bytes = DispatchPolicy::UseAuxiliaryLoad
+          ? params.scale_transaction_bytes_mk
+          : params.scale_transaction_bytes;
+      if (manual_payload_a) {
+        load_payload_tile_a(write_stage, *k_tile_iter);
+        manual_transaction_bytes += params.payload_transaction_bytes_mk;
+      } else if (lane_predicate) {
+        copy(params.tma_load_a.with(*tma_barrier), tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,write_stage));
+      }
+      if (manual_payload_b) {
+        load_payload_tile_b(write_stage, *k_tile_iter);
+        manual_transaction_bytes += params.payload_transaction_bytes_nk;
+      } else if constexpr (!DispatchPolicy::UseAuxiliaryLoad) {
+        if (lane_predicate) {
           copy(params.tma_load_b.with(*tma_barrier), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,write_stage));
         }
-        __syncwarp();
-        cutlass::arch::fence_view_async_shared();
-        __syncwarp();
-        if (lane_predicate) {
-          cutlass::arch::ClusterTransactionBarrier::complete_transaction(
-              tma_barrier, block_rank_in_cluster, manual_transaction_bytes, 1);
-        }
-      } else if (lane_predicate) {
-        using BarrierType = typename MainloopPipeline::ProducerBarrierType;
-        BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
-        copy(params.tma_load_a.with(*tma_barrier), tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,write_stage));
-        copy(params.tma_load_b.with(*tma_barrier), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,write_stage));
-        cutlass::arch::fence_view_async_shared();
+      }
+      __syncwarp();
+      cutlass::arch::fence_view_async_shared();
+      __syncwarp();
+      if (lane_predicate) {
         cutlass::arch::ClusterTransactionBarrier::complete_transaction(
-            tma_barrier, block_rank_in_cluster, params.scale_transaction_bytes, 1);
+            tma_barrier, block_rank_in_cluster, manual_transaction_bytes, 1);
       }
 
       // Advance k tile
@@ -1198,7 +1228,8 @@ struct CollectiveMma<
       KTileIterator k_tile_iter, int k_tile_count,
       int thread_idx,
       uint32_t block_rank_in_cluster,
-      TensorStorage& shared_tensors) {
+      TensorStorage& shared_tensors,
+      bool commit_aux_arrivals = false) {
     int lane_predicate = cute::elect_one_sync();
 
     Tensor sB = make_tensor(make_smem_ptr(shared_tensors.smem_B.begin()), SmemLayoutB{});
@@ -1354,10 +1385,42 @@ struct CollectiveMma<
         cutlass::arch::ClusterTransactionBarrier::complete_transaction(
             tma_barrier, block_rank_in_cluster, manual_transaction_bytes, 1);
       }
+      if (commit_aux_arrivals) {
+        pipeline.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive_noinc);
+      }
 
       ++k_tile_iter;
       ++smem_pipe_write;
     }
+  }
+
+  template <
+    class LoadInputs,
+    class KTileIterator, class BlockCoord
+  >
+  CUTLASS_DEVICE void
+  load_auxiliary(
+      Params const& params,
+      MainloopPipeline pipeline,
+      PipelineState smem_pipe_write,
+      LoadInputs const& load_inputs,
+      BlockCoord const& blk_coord,
+      KTileIterator k_tile_iter, int k_tile_count,
+      int thread_idx,
+      uint32_t block_rank_in_cluster,
+      TensorStorage& shared_tensors) {
+    load_NK(
+      params,
+      pipeline,
+      smem_pipe_write,
+      load_inputs,
+      blk_coord,
+      k_tile_iter,
+      k_tile_count,
+      thread_idx,
+      block_rank_in_cluster,
+      shared_tensors,
+      true);
   }
 
   /// Perform a Producer Epilogue to prevent early exit of blocks in a Cluster
@@ -1561,9 +1624,165 @@ struct CollectiveMma<
     });
 }
 
+  /// Consumer path for CUTLASS' asymmetric DMA kernel wrapper.
+  template <
+    class FrgTensorC,
+    class KTileIterator,
+    class CtaTileCoord,
+    class ProblemShape_MNKL
+  >
+  CUTLASS_DEVICE void
+  mma(MainloopPipelineMK pipeline_mk,
+      PipelineStateMK smem_pipe_read_mk,
+      MainloopPipelineNK pipeline_nk,
+      PipelineStateNK smem_pipe_read_nk,
+      FrgTensorC& accum,
+      KTileIterator k_tile_iter,
+      int k_tile_count,
+      int thread_idx,
+      TensorStorage& shared_tensors,
+      [[maybe_unused]] Params const& params,
+      [[maybe_unused]] CtaTileCoord const& cta_tile_coord,
+      [[maybe_unused]] ProblemShape_MNKL const& problem_shape_MNKL) {
+    using namespace cute;
+
+    static_assert(is_rmem<FrgTensorC>::value, "C tensor must be rmem resident.");
+
+    clear(accum);
+
+    Tensor sA = make_tensor(make_smem_ptr(shared_tensors.smem_A.begin()), SmemLayoutA{});
+    Tensor sB = make_tensor(make_smem_ptr(shared_tensors.smem_B.begin()), SmemLayoutB{});
+    Tensor sSFA = make_tensor(make_smem_ptr(shared_tensors.smem_SFA.begin()), SmemLayoutSFA{});
+    Tensor sSFB = make_tensor(make_smem_ptr(shared_tensors.smem_SFB.begin()), SmemLayoutSFB{});
+
+    TiledMma tiled_mma;
+    auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
+
+    Tensor tCrA = thread_mma.partition_fragment_A(sA(_,_,Int<0>{}));
+    Tensor tCrB = thread_mma.partition_fragment_B(sB(_,_,Int<0>{}));
+    Tensor tCrSFA = partition_fragment_SFA(sSFA(_,_,Int<0>{}), thread_mma);
+    Tensor tCrSFB = partition_fragment_SFB(sSFB(_,_,Int<0>{}), thread_mma);
+
+    auto smem_tiled_copy_A = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
+    auto smem_thr_copy_A = smem_tiled_copy_A.get_thread_slice(thread_idx);
+    Tensor tCsA = smem_thr_copy_A.partition_S(as_position_independent_swizzle_tensor(sA));
+    Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
+
+    auto smem_tiled_copy_B = make_tiled_copy_B(SmemCopyAtomB{}, tiled_mma);
+    auto smem_thr_copy_B = smem_tiled_copy_B.get_thread_slice(thread_idx);
+    Tensor tCsB = smem_thr_copy_B.partition_S(as_position_independent_swizzle_tensor(sB));
+    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+
+    auto tile_shape_mnk = tile_shape(tiled_mma);
+    auto smem_tiled_copy_SFA = make_tiled_copy_impl(
+        SmemCopyAtomSFA{},
+        get_layoutSFA_TV(tiled_mma),
+        make_shape(size<0>(tile_shape_mnk), size<2>(tile_shape_mnk)));
+    auto smem_thr_copy_SFA = smem_tiled_copy_SFA.get_thread_slice(thread_idx);
+    Tensor tCsSFA = smem_thr_copy_SFA.partition_S(as_position_independent_swizzle_tensor(sSFA));
+    Tensor tCrSFA_copy_view = smem_thr_copy_SFA.retile_D(tCrSFA);
+
+    auto smem_tiled_copy_SFB = make_tiled_copy_impl(
+        SmemCopyAtomSFB{},
+        get_layoutSFB_TV(tiled_mma),
+        make_shape(size<1>(tile_shape_mnk), size<2>(tile_shape_mnk)));
+    auto smem_thr_copy_SFB = smem_tiled_copy_SFB.get_thread_slice(thread_idx);
+    Tensor tCsSFB = smem_thr_copy_SFB.partition_S(as_position_independent_swizzle_tensor(sSFB));
+    Tensor tCrSFB_copy_view = smem_thr_copy_SFB.retile_D(tCrSFB);
+
+    CUTE_STATIC_ASSERT_V(size<2>(tCsA) == size<2>(tCsB));
+    CUTE_STATIC_ASSERT_V(size<3>(tCsA) == Int<DispatchPolicy::Stages>{});
+    CUTE_STATIC_ASSERT_V(size<3>(tCsB) == Int<DispatchPolicy::Stages>{});
+
+    auto K_BLOCK_MAX = size<2>(tCrA);
+
+    int read_stage_mk = smem_pipe_read_mk.index();
+    int read_stage_nk = smem_pipe_read_nk.index();
+    auto tCsA_stage = tCsA(_,_,_,read_stage_mk);
+    auto tCsB_stage = tCsB(_,_,_,read_stage_nk);
+    auto tCsSFA_stage = tCsSFA(_,_,_,read_stage_mk);
+    auto tCsSFB_stage = tCsSFB(_,_,_,read_stage_nk);
+
+    auto wait_both = [&]() {
+      pipeline_mk.consumer_wait(smem_pipe_read_mk);
+      pipeline_nk.consumer_wait(smem_pipe_read_nk);
+    };
+
+    auto release_advance_both = [&]() {
+      pipeline_mk.consumer_release(smem_pipe_read_mk);
+      pipeline_nk.consumer_release(smem_pipe_read_nk);
+      ++smem_pipe_read_mk;
+      ++smem_pipe_read_nk;
+      read_stage_mk = smem_pipe_read_mk.index();
+      read_stage_nk = smem_pipe_read_nk.index();
+      tCsA_stage = tCsA(_,_,_,read_stage_mk);
+      tCsB_stage = tCsB(_,_,_,read_stage_nk);
+      tCsSFA_stage = tCsSFA(_,_,_,read_stage_mk);
+      tCsSFB_stage = tCsSFB(_,_,_,read_stage_nk);
+    };
+
+    auto copy_kblock = [&](auto k_block) {
+      copy(smem_tiled_copy_A, tCsA_stage(_,_,k_block), tCrA_copy_view(_,_,k_block));
+      copy(smem_tiled_copy_B, tCsB_stage(_,_,k_block), tCrB_copy_view(_,_,k_block));
+
+      using MMAOp = typename TiledMma::MMA_Op;
+      fp4_shift_A(MMAOp{}, tCrA_copy_view(_,_,k_block));
+      fp4_shift_B(MMAOp{}, tCrB_copy_view(_,_,k_block));
+
+      copy(tCsSFA_stage(_,_,k_block), tCrSFA_copy_view(_,_,k_block));
+      copy(tCsSFB_stage(_,_,k_block), tCrSFB_copy_view(_,_,k_block));
+    };
+
+    auto gemm_kblock = [&](auto k_block) {
+      cute::gemm(
+          tiled_mma,
+          make_zip_tensor(tCrA(_,_,k_block), tCrSFA(_,_,k_block)),
+          make_zip_tensor(tCrB(_,_,k_block), tCrSFB(_,_,k_block)),
+          accum);
+    };
+
+    wait_both();
+    copy_kblock(_0{});
+    CUTLASS_PRAGMA_NO_UNROLL
+    for ( ; k_tile_count > 1; --k_tile_count) {
+      for_each(make_int_sequence<K_BLOCK_MAX>{}, [&] (auto k_block) {
+        auto k_block_next = ((k_block + 1) == K_BLOCK_MAX) ? 0 : (k_block + 1);
+
+        if (k_block == K_BLOCK_MAX - 1) {
+          cutlass::arch::NamedBarrier::sync(
+              thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+          release_advance_both();
+          wait_both();
+        }
+
+        copy_kblock(k_block_next);
+        gemm_kblock(k_block);
+      });
+    }
+
+    for_each(make_int_sequence<K_BLOCK_MAX>{}, [&] (auto k_block) {
+      auto k_block_next = ((k_block + 1) == K_BLOCK_MAX) ? 0 : (k_block + 1);
+
+      if (k_block == K_BLOCK_MAX - 1) {
+        cutlass::arch::NamedBarrier::sync(
+            thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+        release_advance_both();
+      }
+
+      if (k_block_next > 0) {
+        copy_kblock(k_block_next);
+      }
+      gemm_kblock(k_block);
+    });
+  }
+
   /// Perform a Consumer Epilogue to release all buffers
   CUTLASS_DEVICE void
   mma_tail(MainloopPipeline, PipelineState, int) {
+  }
+
+  CUTLASS_DEVICE void
+  mma_tail(MainloopPipelineMK, PipelineStateMK, MainloopPipelineNK, PipelineStateNK, int) {
   }
 };
 
