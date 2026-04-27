@@ -25,6 +25,8 @@ Use one of these labels in new docs and in index rows:
 | Topic | Canonical doc | Notes |
 | --- | --- | --- |
 | Production configs and numbers | [../production_status.md](../production_status.md) | Current throughput, launch env, deprecated measurements. |
+| Cppmega architecture/status | [cppmega_architecture_status.md](cppmega_architecture_status.md) | Current precision paths, GB10/H200 caveats, and rationale. |
+| Typed run profiles and token flow | [cppmega_run_profiles_and_token_flow.md](cppmega_run_profiles_and_token_flow.md) | Dataclass run-profile contract, local GB10 token flow, dimensions, and precision boundaries. |
 | Reproducible launch commands | [../reproducible_runs.md](../reproducible_runs.md) | Single-command wrappers for validated configs. |
 | Porting rules | [../porting_policy.md](../porting_policy.md) | What to port, what to reuse upstream, validation order. |
 | FP8 path status | [../fp8_path_status.md](../fp8_path_status.md) | Current per-path FP8 support where still relevant. |

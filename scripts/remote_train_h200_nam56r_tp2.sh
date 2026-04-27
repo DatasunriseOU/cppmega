@@ -246,19 +246,14 @@ enable_mtp = mtp_depths > 0
 plan = build_nam56r_feature_plan(pattern="AEMEAEMEAEMR", depth=52, mtp_depths=max(mtp_depths, 1))
 bundle = build_nam56r_megatron_native_args(
     plan=plan, enable_mla=True, enable_mtp=enable_mtp,
-    mtp_mode="hybrid", enable_moe=True,
+    mtp_mode="hybrid", mtp_num_predictors=mtp_depths, enable_moe=True,
+    moe_expert_model_parallel_size=${EP_SIZE},
 )
 print(bundle.to_shell_fragment())
 PY
 )
 echo "NATIVE_ARGS: ${NATIVE_ARGS}"
 
-if [ "${EP_SIZE}" != "1" ]; then
-  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--expert-model-parallel-size 1/--expert-model-parallel-size ${EP_SIZE}/")
-fi
-if [ "${MTP_DEPTHS}" -gt 1 ]; then
-  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--mtp-num-layers 1/--mtp-num-layers ${MTP_DEPTHS}/")
-fi
 
 # CUDA graph flags
 CG_FLAGS=""
