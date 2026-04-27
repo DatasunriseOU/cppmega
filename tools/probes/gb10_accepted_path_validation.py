@@ -28,7 +28,9 @@ from typing import Any
 if __package__:
     from .gb10_accepted_path_validation_helpers import (
         ADAPTER_STAT_KEYS,
+        CUTLASS_STAT_KEYS,
         FALLBACK_STAT_KEYS,
+        MATERIALIZATION_STAT_KEYS,
         SIDECAR_REGISTRY_ZERO_KEYS,
         extract_first_json_object,
         parse_training_log,
@@ -44,7 +46,9 @@ else:
     _helpers = importlib.util.module_from_spec(_HELPER_SPEC)
     _HELPER_SPEC.loader.exec_module(_helpers)
     ADAPTER_STAT_KEYS = _helpers.ADAPTER_STAT_KEYS
+    CUTLASS_STAT_KEYS = _helpers.CUTLASS_STAT_KEYS
     FALLBACK_STAT_KEYS = _helpers.FALLBACK_STAT_KEYS
+    MATERIALIZATION_STAT_KEYS = _helpers.MATERIALIZATION_STAT_KEYS
     SIDECAR_REGISTRY_ZERO_KEYS = _helpers.SIDECAR_REGISTRY_ZERO_KEYS
     extract_first_json_object = _helpers.extract_first_json_object
     parse_training_log = _helpers.parse_training_log
@@ -257,6 +261,9 @@ def run_mxfp8_shim_probe(args: argparse.Namespace) -> CheckResult:
     env.update(
         {
             "CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER": "1",
+            "CPPMEGA_TE_MXFP8_BWD_BACKEND": "cutlass_native",
+            "CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND": "compact",
+            "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND": "off",
             "CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK": "0",
             "CPPMEGA_TE_MXFP8_DGRAD_BF16": "0",
             "CPPMEGA_TE_MXFP8_WGRAD_BF16": "0",
@@ -301,8 +308,105 @@ def run_mxfp8_shim_probe(args: argparse.Namespace) -> CheckResult:
     return CheckResult(
         name="mxfp8_tn_adapter_probe",
         status="pass",
-        detail="shim routed MXFP8 backward through TN adapter with BF16 fallback counters at zero",
+        detail="shim routed MXFP8 backward through accepted backend with BF16 fallback/materialization counters at zero",
         data={"shim_stats": report.get("shim_stats")},
+    )
+
+
+def run_mxfp8_te_emit_probe(args: argparse.Namespace) -> CheckResult:
+    if args.skip_mxfp8_probe or args.skip_te_emit_probe:
+        return CheckResult(
+            name="mxfp8_te_transpose_emit_probe",
+            status="skip",
+            detail="skipped by probe options",
+        )
+
+    available, reason = _probe_prereqs_available(args.probe_timeout_s)
+    if not available and not args.require_mxfp8_probe:
+        return CheckResult(
+            name="mxfp8_te_transpose_emit_probe",
+            status="skip",
+            detail=f"CUDA/TE probe prerequisites unavailable: {reason}",
+        )
+
+    cmd = [
+        sys.executable,
+        str(repo_root() / "tools" / "probes" / "te_blockscaled_backward_probe.py"),
+        "--format",
+        "mxfp8",
+        "--use-shim",
+        "--m",
+        str(args.m),
+        "--n",
+        str(args.n),
+        "--k",
+        str(args.k),
+    ]
+    env = _base_env()
+    env.update(
+        {
+            "CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER": "1",
+            "CPPMEGA_TE_MXFP8_BWD_BACKEND": "te_tn_adapter",
+            "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND": "te",
+            "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED": "1",
+            "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT": "1",
+            "CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK": "0",
+            "CPPMEGA_TE_MXFP8_DGRAD_BF16": "0",
+            "CPPMEGA_TE_MXFP8_WGRAD_BF16": "0",
+            "NVTE_BACKWARD_OVERRIDE": "none",
+            "CPPMEGA_TE_MXFP8_BWD_DEBUG": "1",
+        }
+    )
+    proc = subprocess.run(
+        cmd,
+        cwd=repo_root(),
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=args.probe_timeout_s,
+        check=False,
+    )
+    output = _combined_output(proc)
+    if proc.returncode != 0:
+        return CheckResult(
+            name="mxfp8_te_transpose_emit_probe",
+            status="fail",
+            detail="TE transpose-emission backward probe failed",
+            data={"returncode": proc.returncode, "output_tail": _tail(output)},
+        )
+    try:
+        report = extract_first_json_object(output)
+        errors = validate_probe_report(report)
+    except Exception as exc:
+        return CheckResult(
+            name="mxfp8_te_transpose_emit_probe",
+            status="fail",
+            detail=f"could not parse/validate probe output: {type(exc).__name__}: {exc}",
+            data={"output_tail": _tail(output)},
+        )
+    stats = report.get("shim_stats", {})
+    for key in (
+        "mxfp8_tn_adapter_copy_transpose",
+        "mxfp8_tn_adapter_missing_sidecar_copy",
+        "mxfp8_tn_adapter_te_emit_swizzled_unavailable",
+    ):
+        if int(stats.get(key, 0)) != 0:
+            errors.append(f"{key}={stats.get(key)}; expected 0 for TE transpose emit")
+    for key in ("mxfp8_tn_adapter_te_emit", "mxfp8_tn_adapter_te_emit_swizzled"):
+        if int(stats.get(key, 0)) <= 0:
+            errors.append(f"{key}={stats.get(key)}; expected >0 for TE transpose emit")
+    if errors:
+        return CheckResult(
+            name="mxfp8_te_transpose_emit_probe",
+            status="fail",
+            detail="TE transpose-emission counters did not satisfy acceptance checks",
+            data={"errors": errors, "shim_stats": stats},
+        )
+    return CheckResult(
+        name="mxfp8_te_transpose_emit_probe",
+        status="pass",
+        detail="TE emitted swizzled rowwise-transpose sidecars; BF16 fallback and adapter copy counters stayed zero",
+        data={"shim_stats": stats},
     )
 
 
@@ -319,14 +423,32 @@ def validate_training_log(path: Path) -> CheckResult:
         for key in FALLBACK_STAT_KEYS:
             if int(counters.get(key, -1)) != 0:
                 errors.append(f"{key}={counters.get(key)}; expected 0")
-        for key in ADAPTER_STAT_KEYS:
-            if int(counters.get(key, 0)) <= 0:
-                errors.append(f"{key}={counters.get(key)}; expected >0")
+        adapter_used = False
+        cutlass_used = False
+        for adapter_key, cutlass_key in zip(ADAPTER_STAT_KEYS, CUTLASS_STAT_KEYS):
+            adapter_count = int(counters.get(adapter_key, 0))
+            cutlass_count = int(counters.get(cutlass_key, 0))
+            adapter_used = adapter_used or adapter_count > 0
+            cutlass_used = cutlass_used or cutlass_count > 0
+            if adapter_count <= 0 and cutlass_count <= 0:
+                errors.append(
+                    f"{adapter_key}={counters.get(adapter_key)} and "
+                    f"{cutlass_key}={counters.get(cutlass_key)}; expected one >0"
+                )
         for key in SIDECAR_REGISTRY_ZERO_KEYS:
             if key not in counters:
                 errors.append(f"{key} missing; expected 0")
             elif int(counters.get(key, -1)) != 0:
                 errors.append(f"{key}={counters.get(key)}; expected 0")
+        if cutlass_used and not adapter_used:
+            for key in MATERIALIZATION_STAT_KEYS:
+                if int(counters.get(key, 0)) != 0:
+                    errors.append(f"{key}={counters.get(key)}; expected 0 for cutlass_native")
+            if int(counters.get("mxfp8_tn_sidecar_registry_peak", -1)) != 0:
+                errors.append(
+                    "mxfp8_tn_sidecar_registry_peak="
+                    f"{counters.get('mxfp8_tn_sidecar_registry_peak')}; expected 0 for cutlass_native"
+                )
     reasons = parsed.get("fallback_reasons")
     if reasons not in ({}, None):
         errors.append(f"fallback_reasons={reasons!r}; expected empty")
@@ -348,14 +470,15 @@ def validate_training_log(path: Path) -> CheckResult:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--skip-mxfp8-probe", action="store_true")
+    parser.add_argument("--skip-te-emit-probe", action="store_true")
     parser.add_argument(
         "--require-mxfp8-probe",
         action="store_true",
         help="Fail instead of skipping when CUDA/Transformer Engine prerequisites are unavailable.",
     )
     parser.add_argument("--probe-timeout-s", type=int, default=180)
-    parser.add_argument("--m", type=int, default=64)
-    parser.add_argument("--n", type=int, default=96)
+    parser.add_argument("--m", type=int, default=128)
+    parser.add_argument("--n", type=int, default=128)
     parser.add_argument("--k", type=int, default=128)
     parser.add_argument(
         "--train-log",
@@ -372,6 +495,7 @@ def main(argv: list[str] | None = None) -> int:
         check_dsa_gather_scatter_gate(),
         check_fp8_activation_legacy_gate(),
         run_mxfp8_shim_probe(args),
+        run_mxfp8_te_emit_probe(args),
     ]
     if args.train_log is not None:
         checks.append(validate_training_log(args.train_log))
@@ -379,7 +503,8 @@ def main(argv: list[str] | None = None) -> int:
     failed = any(check.status == "fail" for check in checks)
     if args.require_mxfp8_probe:
         failed = failed or any(
-            check.name == "mxfp8_tn_adapter_probe" and check.status == "skip"
+            check.name in ("mxfp8_tn_adapter_probe", "mxfp8_te_transpose_emit_probe")
+            and check.status == "skip"
             for check in checks
         )
 
