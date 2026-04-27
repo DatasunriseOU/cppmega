@@ -48,6 +48,40 @@ def _tex_info() -> dict[str, Any]:
     }
 
 
+def _check_swizzled_emit(
+    source: torch.Tensor,
+    columnwise_scale_inv: torch.Tensor,
+) -> dict[str, Any]:
+    import transformer_engine.common as te_common
+
+    te_common.load_framework_extension("torch")
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor import MXFP8Quantizer
+
+    quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+    quantizer.internal = True
+    compact = quantizer.quantize_rowwise_transpose(
+        source,
+        columnwise_scale_inv,
+        with_gemm_swizzled_scales=False,
+    )
+    swizzled = quantizer.quantize_rowwise_transpose(
+        source,
+        columnwise_scale_inv,
+        with_gemm_swizzled_scales=True,
+    )
+    tex.swizzle_scales_for_gemm_(compact)
+    torch.cuda.synchronize()
+    return {
+        "flag": bool(swizzled._with_gemm_swizzled_scales),
+        "payload_equal_to_compact": bool(torch.equal(compact._rowwise_data, swizzled._rowwise_data)),
+        "scale_equal_to_post_swizzle": bool(
+            torch.equal(compact._rowwise_scale_inv, swizzled._rowwise_scale_inv)
+        ),
+        "scale_shape": list(swizzled._rowwise_scale_inv.shape),
+    }
+
+
 def _run(args: argparse.Namespace) -> dict[str, Any]:
     if args.rows % 32 != 0:
         raise ValueError("--rows must be divisible by 32")
@@ -82,6 +116,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "tex": _tex_info(),
         "payload_equal": bool(torch.equal(probe_data, te_data)),
         "scale_equal": bool(torch.equal(probe_scale, te_scale)),
+        "swizzled_emit": _check_swizzled_emit(source, columnwise_scale_inv),
         "max_payload_abs_byte_delta": int(
             (probe_data.to(torch.int16) - te_data.to(torch.int16)).abs().max().item()
         ),

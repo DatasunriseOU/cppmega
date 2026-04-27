@@ -259,7 +259,9 @@ bundle = build_megatron_args_bundle(
     use_mla=True,
     use_mtp=enable_mtp,
     mtp_mode="hybrid",
+    mtp_num_predictors=mtp_depths,
     use_moe=True,
+    moe_expert_model_parallel_size=${EP},
     use_dsa=True,
     dsa_indexer_topk=256,
     dsa_indexer_loss_coeff=0.001,
@@ -269,16 +271,6 @@ print(bundle.to_shell_fragment())
 PYEOF
     )
 
-    # Override EP
-    if [ "${EP}" != "1" ]; then
-        NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--expert-model-parallel-size 1/--expert-model-parallel-size ${EP}/")
-    fi
-    # Override MTP depth
-    if [ "${MTP}" -gt 1 ]; then
-        NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--mtp-num-layers 1/--mtp-num-layers ${MTP}/")
-    fi
-    # Strip --dsa-indexer-dtype from NATIVE_ARGS (Megatron doesn't register it)
-    NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed 's/--dsa-indexer-dtype [a-z0-9]*//')
 
     echo "  NATIVE_ARGS: ${NATIVE_ARGS}"
 

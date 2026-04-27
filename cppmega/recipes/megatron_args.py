@@ -45,11 +45,14 @@ def build_megatron_args_bundle(
     mtp_num_predictors: int = 1,
     use_fim: bool = False,
     use_moe: bool = False,
+    moe_expert_model_parallel_size: int = 1,
     moe_num_experts: int = 16,
     moe_router_topk: int = 4,
     moe_ffn_hidden_size: int = 896,
     moe_shared_expert_intermediate_size: int = 1024,
     moe_grouped_gemm: bool = True,
+    moe_token_dispatcher_type: str = "flex",
+    moe_router_dtype: str | None = "fp32",
     use_dsa: bool = False,
     dsa_indexer_n_heads: int = 32,
     dsa_indexer_head_dim: int = 64,
@@ -92,10 +95,14 @@ def build_megatron_args_bundle(
         args.append("0.5")
 
     if use_moe:
+        if moe_token_dispatcher_type not in {"flex", "alltoall", "allgather"}:
+            raise ValueError(
+                f"unsupported moe_token_dispatcher_type: {moe_token_dispatcher_type!r}"
+            )
         args.extend(
             [
                 "--expert-model-parallel-size",
-                "1",
+                str(moe_expert_model_parallel_size),
                 "--num-experts",
                 str(moe_num_experts),
                 "--moe-router-topk",
@@ -110,13 +117,14 @@ def build_megatron_args_bundle(
                 # IBGDA for internode. Falls back to alltoall if deep_ep not
                 # installed. See https://github.com/deepseek-ai/DeepEP
                 "--moe-token-dispatcher-type",
-                "flex",
-                # DeepEP requires fp32 router probabilities (only supports float32).
-                "--moe-router-dtype",
-                "fp32",
+                moe_token_dispatcher_type,
                 "--moe-permute-fusion",
             ]
         )
+        if moe_router_dtype:
+            # DeepEP flex requires fp32 router probabilities.  EP=1/alltoall
+            # local tests can omit this flag to exercise Megatron defaults.
+            args.extend(["--moe-router-dtype", moe_router_dtype])
         args.extend(_bool_flag(moe_grouped_gemm, "--moe-grouped-gemm"))
 
     if use_dsa:

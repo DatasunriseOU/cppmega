@@ -17,6 +17,14 @@ FALLBACK_STAT_KEYS = ("bf16_fallback_dgrad", "bf16_fallback_wgrad")
 ADAPTER_STAT_KEYS = ("mxfp8_tn_adapter_dgrad", "mxfp8_tn_adapter_wgrad")
 CUTLASS_STAT_KEYS = ("mxfp8_cutlass_native_dgrad", "mxfp8_cutlass_native_wgrad")
 PASSTHROUGH_STAT_KEYS = ("native_passthrough_dgrad", "native_passthrough_wgrad")
+MATERIALIZATION_STAT_KEYS = (
+    "mxfp8_tn_adapter_te_emit",
+    "mxfp8_tn_adapter_te_emit_swizzled",
+    "mxfp8_tn_adapter_te_emit_swizzled_unavailable",
+    "mxfp8_tn_adapter_copy_transpose",
+    "mxfp8_tn_adapter_missing_sidecar_copy",
+    "mxfp8_norm_quantize_sidecar_bridge",
+)
 SIDECAR_REGISTRY_ZERO_KEYS = (
     "mxfp8_tn_sidecar_registry_size",
     "mxfp8_tn_sidecar_registry_persistent",
@@ -29,6 +37,7 @@ ALL_STAT_KEYS = (
     + CUTLASS_STAT_KEYS
     + FALLBACK_STAT_KEYS
     + PASSTHROUGH_STAT_KEYS
+    + MATERIALIZATION_STAT_KEYS
     + SIDECAR_REGISTRY_STAT_KEYS
 )
 
@@ -58,9 +67,13 @@ def validate_probe_report(report: dict[str, Any]) -> list[str]:
     for key in FALLBACK_STAT_KEYS:
         if int(stats.get(key, -1)) != 0:
             errors.append(f"{key}={stats.get(key)}; expected 0")
+    adapter_used = False
+    cutlass_used = False
     for adapter_key, cutlass_key in zip(ADAPTER_STAT_KEYS, CUTLASS_STAT_KEYS):
         adapter_count = int(stats.get(adapter_key, 0))
         cutlass_count = int(stats.get(cutlass_key, 0))
+        adapter_used = adapter_used or adapter_count > 0
+        cutlass_used = cutlass_used or cutlass_count > 0
         if adapter_count <= 0 and cutlass_count <= 0:
             errors.append(
                 f"{adapter_key}={stats.get(adapter_key)} and "
@@ -76,7 +89,16 @@ def validate_probe_report(report: dict[str, Any]) -> list[str]:
             errors.append(f"{key} missing; expected 0")
         elif int(stats.get(key, -1)) != 0:
             errors.append(f"{key}={stats.get(key)}; expected 0")
-    if int(stats.get("mxfp8_tn_sidecar_registry_peak", 0)) <= 0:
+    if cutlass_used and not adapter_used:
+        for key in MATERIALIZATION_STAT_KEYS:
+            if int(stats.get(key, 0)) != 0:
+                errors.append(f"{key}={stats.get(key)}; expected 0 for cutlass_native")
+        if int(stats.get("mxfp8_tn_sidecar_registry_peak", -1)) != 0:
+            errors.append(
+                "mxfp8_tn_sidecar_registry_peak="
+                f"{stats.get('mxfp8_tn_sidecar_registry_peak')}; expected 0 for cutlass_native"
+            )
+    elif int(stats.get("mxfp8_tn_sidecar_registry_peak", 0)) <= 0:
         errors.append(
             "mxfp8_tn_sidecar_registry_peak="
             f"{stats.get('mxfp8_tn_sidecar_registry_peak')}; expected >0"
@@ -93,6 +115,8 @@ def validate_probe_report(report: dict[str, Any]) -> list[str]:
             errors.append(f"missing probe result {name}")
         elif row.get("status") != "pass":
             errors.append(f"{name} status={row.get('status')!r}; expected pass")
+        elif row.get("finite") is False:
+            errors.append(f"{name} finite=False; expected finite output")
     return errors
 
 

@@ -218,23 +218,15 @@ bundle = build_nam56r_megatron_native_args(
     enable_mla=True,
     enable_mtp=enable_mtp,
     mtp_mode="hybrid",
+    mtp_num_predictors=mtp_depths,
     enable_moe=True,
+    moe_expert_model_parallel_size=${EP_SIZE},
 )
 print(bundle.to_shell_fragment())
 PY
 )
 echo "NATIVE_ARGS: ${NATIVE_ARGS}"
 
-# Override expert-model-parallel-size if EP_SIZE != 1
-# (build_megatron_args_bundle always emits --expert-model-parallel-size 1; we
-# string-replace to customize)
-if [ "${EP_SIZE}" != "1" ]; then
-  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--expert-model-parallel-size 1/--expert-model-parallel-size ${EP_SIZE}/")
-fi
-# If MTP_DEPTHS>1 ensure --mtp-num-layers matches
-if [ "${MTP_DEPTHS}" -gt 1 ]; then
-  NATIVE_ARGS=$(echo "${NATIVE_ARGS}" | sed "s/--mtp-num-layers 1/--mtp-num-layers ${MTP_DEPTHS}/")
-fi
 
 # VPP: no --num-layers-per-virtual-pipeline-stage flag when a pipe-separated
 # --hybrid-layer-pattern is supplied. Megatron infers VPP count from the number

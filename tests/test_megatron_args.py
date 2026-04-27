@@ -53,6 +53,25 @@ def test_megatron_args_bundle_uses_hybrid_mtp_contract_without_gpt_toggle():
     assert "--multi-token-prediction" not in bundle.args
 
 
+def test_megatron_args_bundle_accepts_remote_moe_overrides_without_sed():
+    plan = build_nam56r_feature_plan(pattern="AEMEAEMEAEMR", depth=52, mtp_depths=2)
+    bundle = build_megatron_args_bundle(
+        plan=plan,
+        use_mtp=True,
+        mtp_mode="hybrid",
+        mtp_num_predictors=2,
+        use_moe=True,
+        moe_expert_model_parallel_size=4,
+        moe_token_dispatcher_type="alltoall",
+        moe_router_dtype=None,
+    )
+
+    assert bundle.args[bundle.args.index("--mtp-num-layers") + 1] == "2"
+    assert bundle.args[bundle.args.index("--expert-model-parallel-size") + 1] == "4"
+    assert bundle.args[bundle.args.index("--moe-token-dispatcher-type") + 1] == "alltoall"
+    assert "--moe-router-dtype" not in bundle.args
+
+
 def test_megatron_args_bundle_marks_custom_features_as_notes_only():
     plan = build_nam56r_feature_plan(
         pattern="AEMEAEMEAEMR",

@@ -458,6 +458,106 @@ def _append_mxfp8_transpose_emit_probe_results(
     return emit_bytes
 
 
+def _numeric_stats_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, int]:
+    delta: dict[str, int] = {}
+    for key, after_value in after.items():
+        before_value = before.get(key, 0)
+        if isinstance(after_value, int) and isinstance(before_value, int):
+            delta[key] = after_value - before_value
+    return delta
+
+
+def _time_repeated_gemm(
+    gemm_fn: Any,
+    *args: Any,
+    warmup: int,
+    iters: int,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, float]:
+    out: torch.Tensor | None = None
+    for _ in range(warmup):
+        out, *_ = gemm_fn(*args, **kwargs)
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        out, *_ = gemm_fn(*args, **kwargs)
+    end.record()
+    torch.cuda.synchronize()
+    if out is None:
+        raise RuntimeError("timed GEMM did not produce an output")
+    return out, float(start.elapsed_time(end) / max(iters, 1))
+
+
+def _run_cutlass_direct_microbench(
+    wrapped_general_gemm: Any,
+    shim_module: Any | None,
+    refs: dict[str, torch.Tensor],
+    xq: Any,
+    wq: Any,
+    dyq: Any,
+    *,
+    warmup: int,
+    iters: int,
+) -> dict[str, Any]:
+    if os.environ.get("CPPMEGA_TE_MXFP8_BWD_BACKEND") != "cutlass_native":
+        raise ValueError(
+            "cutlass direct microbench requires CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native"
+        )
+
+    out_dgrad = torch.empty_like(refs["dgrad"], dtype=torch.bfloat16)
+    out_wgrad = torch.empty_like(refs["wgrad"], dtype=torch.bfloat16)
+    stats_before = (
+        shim_module.cppmega_te_mxfp8_bwd_stats_snapshot()
+        if shim_module is not None and hasattr(shim_module, "cppmega_te_mxfp8_bwd_stats_snapshot")
+        else {}
+    )
+
+    dgrad_out, dgrad_ms = _time_repeated_gemm(
+        wrapped_general_gemm,
+        wq,
+        dyq,
+        warmup=warmup,
+        iters=iters,
+        out=out_dgrad,
+        out_dtype=torch.bfloat16,
+        layout="NN",
+        grad=True,
+        use_split_accumulator=False,
+    )
+    wgrad_out, wgrad_ms = _time_repeated_gemm(
+        wrapped_general_gemm,
+        xq,
+        dyq,
+        warmup=warmup,
+        iters=iters,
+        out=out_wgrad,
+        out_dtype=torch.bfloat16,
+        layout="NT",
+        grad=True,
+        use_split_accumulator=False,
+    )
+
+    stats_after = (
+        shim_module.cppmega_te_mxfp8_bwd_stats_snapshot()
+        if shim_module is not None and hasattr(shim_module, "cppmega_te_mxfp8_bwd_stats_snapshot")
+        else {}
+    )
+    return {
+        "backend": os.environ.get("CPPMEGA_TE_MXFP8_BWD_BACKEND"),
+        "scale_backend": os.environ.get("CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND", "compact"),
+        "warmup": warmup,
+        "iters": iters,
+        "dgrad_elapsed_ms": dgrad_ms,
+        "wgrad_elapsed_ms": wgrad_ms,
+        "dgrad": _record_success("mxfp8_cutlass_direct_microbench_dgrad", dgrad_out, refs["dgrad"]),
+        "wgrad": _record_success("mxfp8_cutlass_direct_microbench_wgrad", wgrad_out, refs["wgrad"]),
+        "shim_stats_delta": _numeric_stats_delta(stats_before, stats_after),
+    }
+
+
 def _run(args: argparse.Namespace) -> dict[str, Any]:
     shim_module = None
     wrapped_general_gemm = None
@@ -482,6 +582,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     }
     results: list[dict[str, Any]] = []
     mxfp8_emit_bytes: dict[str, Any] | None = None
+    cutlass_direct_microbench: dict[str, Any] | None = None
 
     if args.format in ("mxfp8", "both"):
         xq = _mxfp8_quantize(x, columnwise=True)
@@ -610,6 +711,23 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     use_split_accumulator=False,
                 )
             )
+            if args.microbench_cutlass_direct:
+                try:
+                    cutlass_direct_microbench = _run_cutlass_direct_microbench(
+                        wrapped_general_gemm,
+                        shim_module,
+                        refs,
+                        xq,
+                        wq,
+                        dyq,
+                        warmup=args.microbench_warmup,
+                        iters=args.microbench_iters,
+                    )
+                except Exception as exc:  # pragma: no cover - this is a probe
+                    cutlass_direct_microbench = _record_failure(
+                        "mxfp8_cutlass_direct_microbench",
+                        exc,
+                    )
 
     if args.format in ("nvfp4", "both"):
         xq = _nvfp4_quantize(x, columnwise=True, is_weight=False)
@@ -672,6 +790,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         report["mxfp8_adapter_copy_bytes"] = mxfp8_copy_bytes
     if mxfp8_emit_bytes is not None:
         report["mxfp8_transpose_emit_prototype_bytes"] = mxfp8_emit_bytes
+    if cutlass_direct_microbench is not None:
+        report["mxfp8_cutlass_direct_microbench"] = cutlass_direct_microbench
     if shim_module is not None and hasattr(shim_module, "cppmega_te_mxfp8_bwd_stats_snapshot"):
         report["shim_stats"] = shim_module.cppmega_te_mxfp8_bwd_stats_snapshot()
     return report
@@ -721,6 +841,17 @@ def main() -> None:
             "--prototype-transpose-emit instead of falling back to the probe extension."
         ),
     )
+    parser.add_argument(
+        "--microbench-cutlass-direct",
+        action="store_true",
+        help=(
+            "When --use-shim and CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native are set, "
+            "time repeated direct-loader dgrad/wgrad calls with preallocated outputs "
+            "and report shim counter deltas."
+        ),
+    )
+    parser.add_argument("--microbench-warmup", type=int, default=10)
+    parser.add_argument("--microbench-iters", type=int, default=100)
     args = parser.parse_args()
 
     if args.require_te_transpose_emit:
@@ -732,6 +863,10 @@ def main() -> None:
         raise SystemExit("CUDA is required")
     if args.m % 32 or args.n % 32 or args.k % 32:
         raise SystemExit("m, n, and k must be multiples of 32 for this MXFP8 probe")
+    if args.microbench_cutlass_direct and not args.use_shim:
+        raise SystemExit("--microbench-cutlass-direct requires --use-shim")
+    if args.microbench_warmup < 0 or args.microbench_iters <= 0:
+        raise SystemExit("--microbench-warmup must be >= 0 and --microbench-iters must be > 0")
 
     print(json.dumps(_run(args), indent=2, sort_keys=True))
 
