@@ -28,6 +28,12 @@ Profiler constraints:
 - Do not combine torch profiler and nsys in one run. CUPTI permits only one
   active subscriber; the combined BF16 run showed
   `CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED`.
+- For Nsight Systems kernel tables on local GB10, use the worker wrapper with
+  `--nsys-capture-mode full` or `--nsys-capture-mode delay`. The
+  `cudaProfilerApi` range mode is not the default because on the local
+  CUDA 13.2 / Nsight Systems 2025.6 stack it can record CUDA launch APIs while
+  dropping incomplete CUPTI kernel activities, which makes
+  `cuda_gpu_kern_sum` empty or nearly empty.
 - NCU should capture the Megatron `cudaProfilerStart/Stop` range. Enable it via
   typed run-profile CLI fields such as `--cuda-profile`,
   `--cuda-profile-step-start`, and `--cuda-profile-step-end`.

@@ -56,8 +56,20 @@ deprecated; do not re-introduce it.
 from __future__ import annotations
 
 import os
+import sys as _sys
 import warnings
 import weakref as _weakref
+
+_SUPPORTED_TE_VERSIONS = (
+    "2.13",
+    "2.13.0",
+    "2.14",
+    "2.14.0",
+    "2.15",
+    "2.15.0",
+    "2.16.0.dev0",
+    "2.16.0",
+)
 
 _CPPMEGA_MXFP8_TN_SIDECAR_ATTR = "_cppmega_mxfp8_rowwise_transpose"
 _CPPMEGA_MXFP8_TN_SIDECAR_PERSISTENT_ATTR = (
@@ -90,12 +102,67 @@ def _cppmega_clear_mxfp8_sidecar_refs(_x) -> bool:
     return _cleared
 
 
+def _cppmega_te_version_matches(version: str) -> bool:
+    if version in _SUPPORTED_TE_VERSIONS:
+        return True
+    for _supported in _SUPPORTED_TE_VERSIONS:
+        _parts = _supported.split(".")
+        if len(_parts) == 2 and version.startswith(_supported + "."):
+            return True
+    return False
+
+
+def _check_te_version() -> None:
+    """Warn when this private-API shim is loaded against an unvalidated TE."""
+
+    try:
+        import transformer_engine as _te
+    except ImportError:
+        print(
+            "[cppmega_fp8_shim] transformer_engine is not importable; "
+            "skipping TE version compatibility check. TE-dependent patches "
+            "will no-op.",
+            file=_sys.stderr,
+        )
+        return
+    except Exception as _te_import_exc:  # pragma: no cover - defensive
+        print(
+            "[cppmega_fp8_shim] transformer_engine import raised "
+            f"{type(_te_import_exc).__name__}: {_te_import_exc}; "
+            "skipping TE version compatibility check.",
+            file=_sys.stderr,
+        )
+        return
+
+    _version = getattr(_te, "__version__", None)
+    if _version is None:
+        print(
+            "[cppmega_fp8_shim] transformer_engine has no __version__; "
+            "cannot validate against supported versions "
+            f"{_SUPPORTED_TE_VERSIONS}. Patches may silently no-op.",
+            file=_sys.stderr,
+        )
+        return
+    if _cppmega_te_version_matches(str(_version)):
+        return
+    print(
+        f"[cppmega_fp8_shim] Unsupported TransformerEngine version {_version!r}; "
+        f"cppmega_fp8_shim.py has been validated with {_SUPPORTED_TE_VERSIONS}. "
+        "MXFP8/recipe/general_gemm monkey-patches use private TE internals and "
+        "may silently fall back to slower copy-based transpose paths on other "
+        "versions.",
+        file=_sys.stderr,
+    )
+
+
 _raw_nvte_backward_override = os.environ.get("NVTE_BACKWARD_OVERRIDE", None)
 if _raw_nvte_backward_override in ("", "none", "None", "NONE"):
     # Older cppmega launchers used "none" as a sentinel to override scripts
     # that defaulted this variable to "dequantized". Fresh TE reads this env
     # while defining pydantic dataclasses, so normalize before any TE import.
     os.environ.pop("NVTE_BACKWARD_OVERRIDE", None)
+
+_check_te_version()
 
 
 # -----------------------------------------------------------------------------
@@ -1878,16 +1945,18 @@ except Exception as _exc:  # pragma: no cover
 # -----------------------------------------------------------------------------
 # (6) MTP fused linear cross-entropy route
 # -----------------------------------------------------------------------------
-# Default to Megatron's LinearCrossEntropyModule route.  On GB10 this is routed
-# to Apple CCE by cppmega.megatron.apply_linear_ce_patch; on supported Hopper /
-# Blackwell stacks it can use the native Megatron backend.  The old Liger/off
-# routes are fail-closed and require explicit archaeology ACK env vars.
+# Default to Megatron's LinearCrossEntropyModule route.  On GB10 this can be
+# forced to Apple CCE with CPPMEGA_MTP_CE_KERNEL=cce; on supported Hopper /
+# Blackwell stacks the native Megatron backend remains available.  The old
+# Liger/off routes are fail-closed and require explicit archaeology ACK env vars.
 
 try:
     from cppmega.megatron.deprecated_paths import require_deprecated_ack
 
     _mtp_ce_kernel = os.environ.get("CPPMEGA_MTP_CE_KERNEL", "native").lower()
     if _mtp_ce_kernel in ("native", "linear", "output_layer", "cce", "auto"):
+        if _mtp_ce_kernel == "cce":
+            os.environ.setdefault("CPPMEGA_LINEAR_CE_KERNEL", "cce")
         os.environ.setdefault("CPPMEGA_MTP_NATIVE_HOPPER_CE", "1")
         from cppmega.megatron.mtp_native_hopper_ce import patch_mtp_native_hopper_ce
         patch_mtp_native_hopper_ce()
@@ -1943,18 +2012,31 @@ def _cppmega_require_gather_scatter_ack(feature, reason):
 
 
 _sparse_mode = os.environ.get("CPPMEGA_DSA_SPARSE_MODE", "tilelang").strip().lower()
+_dsa_fp8_attention = os.environ.get("CPPMEGA_DSA_FP8_ATTENTION", "0") == "1"
 if _sparse_mode not in ("gather_scatter", "gather-scatter", "pytorch"):
     try:
         from megatron.core.transformer.experimental_attention_variant import dsa as _dsa_mod
 
         _existing_unfused = getattr(_dsa_mod, "unfused_dsa_fn", None)
+        from cppmega.megatron.sparse_mla_ops.sparse_mla import (
+            SparseMLA as _cppmega_sparse_mla_cls,
+            SparseMLA_FP8 as _cppmega_sparse_mla_fp8_cls,
+            sparse_mla_as_unfused_dsa as _sparse_mla_bf16_fn,
+            sparse_mla_fp8_as_unfused_dsa as _sparse_mla_fp8_fn,
+        )
+
+        if _dsa_fp8_attention:
+            _sparse_mla_fn = _sparse_mla_fp8_fn
+            _sparse_mla_cls = _cppmega_sparse_mla_fp8_cls
+            _sparse_mla_name = "SparseMLA_FP8"
+        else:
+            _sparse_mla_fn = _sparse_mla_bf16_fn
+            _sparse_mla_cls = _cppmega_sparse_mla_cls
+            _sparse_mla_name = "SparseMLA"
+
         if _existing_unfused is not None and not getattr(
             _existing_unfused, "__cppmega_sparse_dsa_patched__", False
         ):
-            from cppmega.megatron.sparse_mla_ops.sparse_mla import (
-                sparse_mla_as_unfused_dsa as _sparse_mla_fn,
-            )
-
             setattr(_sparse_mla_fn, "__cppmega_sparse_dsa_patched__", True)
             _dsa_mod.unfused_dsa_fn = _sparse_mla_fn
             print(
@@ -1963,6 +2045,12 @@ if _sparse_mode not in ("gather_scatter", "gather-scatter", "pytorch"):
             )
         else:
             print("[cppmega_fp8_shim] TileLang SparseMLA: already patched or unfused_dsa_fn not found")
+        if getattr(_dsa_mod, "SparseMLA", None) is not _sparse_mla_cls:
+            _dsa_mod.SparseMLA = _sparse_mla_cls
+            print(
+                "[cppmega_fp8_shim] TileLang SparseMLA applied "
+                f"(absorbed DSA SparseMLA -> cppmega {_sparse_mla_name})"
+            )
     except Exception as _exc:
         import sys
         print(f"[cppmega_fp8_shim] TileLang SparseMLA patch failed: {_exc}", file=sys.stderr)

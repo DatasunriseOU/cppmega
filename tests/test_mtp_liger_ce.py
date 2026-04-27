@@ -45,9 +45,12 @@ except ValueError:
     _HAS_LIGER = False
 
 _HAS_CUDA = False
+_CUDA_CC = None
 if _HAS_TORCH:
     import torch  # noqa: E402
     _HAS_CUDA = torch.cuda.is_available()
+    if _HAS_CUDA:
+        _CUDA_CC = torch.cuda.get_device_capability()
 
 # Liger actually requires triton at import time, and triton only imports on
 # CUDA boxes.  Probe the real import (not just find_spec) so Mac / CPU
@@ -62,6 +65,10 @@ if _HAS_LIGER and _HAS_CUDA:
     except Exception:
         _LIGER_IMPORTS = False
 
+_LIGER_NUMERICS_SUPPORTED = _LIGER_IMPORTS and (
+    _CUDA_CC is not None and _CUDA_CC[0] < 12
+)
+
 
 class TestMTPLigerCEStructure:
     """Structure / import tests that do not need a GPU."""
@@ -71,8 +78,11 @@ class TestMTPLigerCEStructure:
         assert callable(patch_mtp_loss_with_liger)
 
 @pytest.mark.skipif(
-    not _LIGER_IMPORTS,
-    reason="GPU test — requires CUDA + liger_kernel + triton",
+    not _LIGER_NUMERICS_SUPPORTED,
+    reason=(
+        "GPU test — requires CUDA + liger_kernel + triton on an accepted "
+        "Liger architecture; GB10 cc 12.x routes MTP CE through CCE"
+    ),
 )
 class TestMTPLigerCEGPU:
     """GPU-based numerical correctness tests for forward parity."""
@@ -241,8 +251,11 @@ def _small_inputs():
 
 
 @pytest.mark.skipif(
-    not _LIGER_IMPORTS,
-    reason="liger_kernel + CUDA + triton required",
+    not _LIGER_NUMERICS_SUPPORTED,
+    reason=(
+        "liger_kernel + CUDA + triton on an accepted Liger architecture "
+        "required; GB10 cc 12.x routes MTP CE through CCE"
+    ),
 )
 def test_mtp_liger_ce_backward_reduction_none(_small_inputs):
     """Demonstrate that Liger FLCE ``reduction='none'`` backward is CORRUPT.
@@ -320,8 +333,11 @@ def test_mtp_liger_ce_backward_reduction_none(_small_inputs):
 
 
 @pytest.mark.skipif(
-    not _LIGER_IMPORTS,
-    reason="liger_kernel + CUDA + triton required",
+    not _LIGER_NUMERICS_SUPPORTED,
+    reason=(
+        "liger_kernel + CUDA + triton on an accepted Liger architecture "
+        "required; GB10 cc 12.x routes MTP CE through CCE"
+    ),
 )
 def test_mtp_liger_ce_backward_reduction_mean(_small_inputs):
     """Control test: Liger FLCE ``reduction='mean'`` backward IS correct.
