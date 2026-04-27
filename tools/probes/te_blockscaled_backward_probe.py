@@ -78,6 +78,7 @@ def _record_success(
         "name": name,
         "status": status,
         "shape": list(out.shape),
+        "finite": bool(torch.isfinite(out).all().item()),
         "max_abs": _max_abs(out, ref),
         "rel_l2": rel_l2,
     }

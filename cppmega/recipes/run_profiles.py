@@ -172,6 +172,12 @@ class ProfilingProfile:
     torch_profile: bool = False
     torch_profile_steps: int = 2
     nsys_profile: bool = False
+    # Megatron cudaProfilerStart/Stop range used by external profilers such as
+    # Nsight Compute.  Keep it separate from torch_profile/nsys_profile because
+    # CUPTI permits only one active subscriber.
+    cuda_profile: bool = False
+    cuda_profile_step_start: int = 3
+    cuda_profile_step_end: int = 4
 
 
 @dataclass
@@ -412,6 +418,11 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         "CPPMEGA_TORCH_PROFILE": _bool(profile.profiling.torch_profile),
         "CPPMEGA_TORCH_PROFILE_STEPS": str(profile.profiling.torch_profile_steps),
         "CPPMEGA_NSYS_PROFILE": _bool(profile.profiling.nsys_profile),
+        "CPPMEGA_CUDA_PROFILE": _bool(profile.profiling.cuda_profile),
+        "CPPMEGA_CUDA_PROFILE_STEP_START": str(
+            profile.profiling.cuda_profile_step_start
+        ),
+        "CPPMEGA_CUDA_PROFILE_STEP_END": str(profile.profiling.cuda_profile_step_end),
         "HYBRID_LAYER_PATTERN": profile.hybrid_layer_pattern(),
         "HYBRID_PATTERN": profile.hybrid_layer_pattern(),
         "NATIVE_ARGS": profile.native_args_fragment(),
@@ -529,6 +540,14 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.profiling.torch_profile = True
     if args.nsys_profile:
         profile.profiling.nsys_profile = True
+    if args.cuda_profile:
+        profile.profiling.cuda_profile = True
+    if args.cuda_profile_step_start is not None:
+        profile.profiling.cuda_profile = True
+        profile.profiling.cuda_profile_step_start = args.cuda_profile_step_start
+    if args.cuda_profile_step_end is not None:
+        profile.profiling.cuda_profile = True
+        profile.profiling.cuda_profile_step_end = args.cuda_profile_step_end
     return profile
 
 
@@ -640,6 +659,9 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mem-profile-steps", type=int, default=None)
     parser.add_argument("--torch-profile", action="store_true")
     parser.add_argument("--nsys-profile", action="store_true")
+    parser.add_argument("--cuda-profile", action="store_true")
+    parser.add_argument("--cuda-profile-step-start", type=int, default=None)
+    parser.add_argument("--cuda-profile-step-end", type=int, default=None)
 
 
 def _build_parser() -> argparse.ArgumentParser:
