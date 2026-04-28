@@ -185,11 +185,16 @@ def m2rnn_pararnn_tiled_cuda_forward(
     h0_row = _make_h0_row(h0, B=B, H=H, K=K, V=V, device=q.device, dtype=torch.float32)
 
     Be = B * H * K
+    n_tiles = (S + int(config.tile_size) - 1) // int(config.tile_size)
     h = torch.zeros(Be, S, V, device=q.device, dtype=torch.float32)
+    tile_A = torch.empty(Be, n_tiles, V, V, device=q.device, dtype=torch.float32)
+    tile_b = torch.empty(Be, n_tiles, V, device=q.device, dtype=torch.float32)
+    tile_inputs = torch.empty_like(tile_b)
+    delta = torch.empty_like(h)
     ext = _load_cuda_ext()
 
     for _ in range(config.max_its):
-        tile_A, tile_b = ext.tile_summaries(
+        ext.tile_summaries_out(
             qf,
             kf,
             vf,
@@ -197,10 +202,12 @@ def m2rnn_pararnn_tiled_cuda_forward(
             xff,
             h.contiguous(),
             h0_row,
+            tile_A,
+            tile_b,
             int(config.tile_size),
         )
-        tile_inputs = _scan_tile_summaries(tile_A, tile_b)
-        delta = ext.apply_tile_prefixes(
+        ext.scan_tile_summaries_out(tile_A, tile_b, tile_inputs)
+        ext.apply_tile_prefixes_out(
             qf,
             kf,
             vf,
@@ -208,7 +215,8 @@ def m2rnn_pararnn_tiled_cuda_forward(
             xff,
             h.contiguous(),
             h0_row,
-            tile_inputs.contiguous(),
+            tile_inputs,
+            delta,
             int(config.tile_size),
         )
         h = h + float(config.omega_sor) * delta

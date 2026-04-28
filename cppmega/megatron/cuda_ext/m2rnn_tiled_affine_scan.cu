@@ -550,7 +550,47 @@ void check_problem_shapes(
   }
 }
 
-std::vector<at::Tensor> tile_summaries(
+void check_tile_summary_shapes(
+    const at::Tensor& tile_A,
+    const at::Tensor& tile_b,
+    int64_t Be,
+    int64_t n_tiles,
+    int64_t V) {
+  check_float_cuda_contiguous(tile_A, "tile_A");
+  check_float_cuda_contiguous(tile_b, "tile_b");
+  if (tile_A.dim() != 4 || tile_A.size(0) != Be || tile_A.size(1) != n_tiles ||
+      tile_A.size(2) != V || tile_A.size(3) != V) {
+    throw std::invalid_argument("tile_A shape must be (B*H*K, n_tiles, V, V)");
+  }
+  if (tile_b.dim() != 3 || tile_b.size(0) != Be || tile_b.size(1) != n_tiles ||
+      tile_b.size(2) != V) {
+    throw std::invalid_argument("tile_b shape must be (B*H*K, n_tiles, V)");
+  }
+  if (tile_A.device() != tile_b.device()) {
+    throw std::invalid_argument("tile_A and tile_b must be on the same CUDA device");
+  }
+}
+
+void check_tile_inputs_shape(
+    const at::Tensor& tile_inputs,
+    int64_t Be,
+    int64_t n_tiles,
+    int64_t V) {
+  check_float_cuda_contiguous(tile_inputs, "tile_inputs");
+  if (tile_inputs.dim() != 3 || tile_inputs.size(0) != Be || tile_inputs.size(1) != n_tiles ||
+      tile_inputs.size(2) != V) {
+    throw std::invalid_argument("tile_inputs shape must be (B*H*K, n_tiles, V)");
+  }
+}
+
+void check_delta_shape(const at::Tensor& delta, int64_t Be, int64_t S, int64_t V) {
+  check_float_cuda_contiguous(delta, "delta");
+  if (delta.dim() != 3 || delta.size(0) != Be || delta.size(1) != S || delta.size(2) != V) {
+    throw std::invalid_argument("delta shape must be (B*H*K, S, V)");
+  }
+}
+
+void tile_summaries_out(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
@@ -558,6 +598,8 @@ std::vector<at::Tensor> tile_summaries(
     const at::Tensor& xf,
     const at::Tensor& h_traj,
     const at::Tensor& h0_row,
+    const at::Tensor& tile_A,
+    const at::Tensor& tile_b,
     int64_t tile_size) {
   check_problem_shapes(q, k, v, W, xf, h_traj, h0_row, tile_size);
 
@@ -568,10 +610,8 @@ std::vector<at::Tensor> tile_summaries(
   const int64_t V = v.size(3);
 
   const int64_t n_tiles = div_up(S, tile_size);
-  auto opts = q.options();
   const int64_t Be = B * H * K;
-  at::Tensor tile_A = at::empty({Be, n_tiles, V, V}, opts);
-  at::Tensor tile_b = at::empty({Be, n_tiles, V}, opts);
+  check_tile_summary_shapes(tile_A, tile_b, Be, n_tiles, V);
 
   const c10::cuda::CUDAGuard device_guard(q.device());
   const int64_t blocks = Be * n_tiles;
@@ -593,11 +633,35 @@ std::vector<at::Tensor> tile_summaries(
       static_cast<int>(tile_size),
       static_cast<int>(n_tiles));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+std::vector<at::Tensor> tile_summaries(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& W,
+    const at::Tensor& xf,
+    const at::Tensor& h_traj,
+    const at::Tensor& h0_row,
+    int64_t tile_size) {
+  check_problem_shapes(q, k, v, W, xf, h_traj, h0_row, tile_size);
+
+  const int64_t B = q.size(0);
+  const int64_t S = q.size(1);
+  const int64_t H = q.size(2);
+  const int64_t K = q.size(3);
+  const int64_t V = v.size(3);
+  const int64_t n_tiles = div_up(S, tile_size);
+  const int64_t Be = B * H * K;
+  auto opts = q.options();
+  at::Tensor tile_A = at::empty({Be, n_tiles, V, V}, opts);
+  at::Tensor tile_b = at::empty({Be, n_tiles, V}, opts);
+  tile_summaries_out(q, k, v, W, xf, h_traj, h0_row, tile_A, tile_b, tile_size);
 
   return {tile_A, tile_b};
 }
 
-at::Tensor apply_tile_prefixes(
+void apply_tile_prefixes_out(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
@@ -606,9 +670,9 @@ at::Tensor apply_tile_prefixes(
     const at::Tensor& h_traj,
     const at::Tensor& h0_row,
     const at::Tensor& tile_inputs,
+    const at::Tensor& delta,
     int64_t tile_size) {
   check_problem_shapes(q, k, v, W, xf, h_traj, h0_row, tile_size);
-  check_float_cuda_contiguous(tile_inputs, "tile_inputs");
 
   const int64_t B = q.size(0);
   const int64_t S = q.size(1);
@@ -617,12 +681,8 @@ at::Tensor apply_tile_prefixes(
   const int64_t V = v.size(3);
   const int64_t Be = B * H * K;
   const int64_t n_tiles = div_up(S, tile_size);
-  if (tile_inputs.dim() != 3 || tile_inputs.size(0) != Be || tile_inputs.size(1) != n_tiles ||
-      tile_inputs.size(2) != V) {
-    throw std::invalid_argument("tile_inputs shape must be (B*H*K, n_tiles, V)");
-  }
-
-  at::Tensor delta = at::empty({Be, S, V}, q.options());
+  check_tile_inputs_shape(tile_inputs, Be, n_tiles, V);
+  check_delta_shape(delta, Be, S, V);
 
   const c10::cuda::CUDAGuard device_guard(q.device());
   const int64_t blocks = Be * n_tiles;
@@ -644,13 +704,36 @@ at::Tensor apply_tile_prefixes(
       static_cast<int>(tile_size),
       static_cast<int>(n_tiles));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+at::Tensor apply_tile_prefixes(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& W,
+    const at::Tensor& xf,
+    const at::Tensor& h_traj,
+    const at::Tensor& h0_row,
+    const at::Tensor& tile_inputs,
+    int64_t tile_size) {
+  check_problem_shapes(q, k, v, W, xf, h_traj, h0_row, tile_size);
+
+  const int64_t B = q.size(0);
+  const int64_t S = q.size(1);
+  const int64_t H = q.size(2);
+  const int64_t K = q.size(3);
+  const int64_t V = v.size(3);
+  const int64_t Be = B * H * K;
+  at::Tensor delta = at::empty({Be, S, V}, q.options());
+  apply_tile_prefixes_out(q, k, v, W, xf, h_traj, h0_row, tile_inputs, delta, tile_size);
 
   return delta;
 }
 
-at::Tensor scan_tile_summaries(
+void scan_tile_summaries_out(
     const at::Tensor& tile_A,
-    const at::Tensor& tile_b) {
+    const at::Tensor& tile_b,
+    const at::Tensor& tile_inputs) {
   check_float_cuda_contiguous(tile_A, "tile_A");
   check_float_cuda_contiguous(tile_b, "tile_b");
   if (tile_A.device() != tile_b.device()) {
@@ -673,8 +756,7 @@ at::Tensor scan_tile_summaries(
   if (Be < 1 || n_tiles < 1) {
     throw std::invalid_argument("tile_A/tile_b must contain at least one chain and one tile");
   }
-
-  at::Tensor tile_inputs = at::empty_like(tile_b);
+  check_tile_inputs_shape(tile_inputs, Be, n_tiles, V);
 
   const c10::cuda::CUDAGuard device_guard(tile_A.device());
   m2rnn_scan_tile_summaries_kernel<<<
@@ -688,6 +770,14 @@ at::Tensor scan_tile_summaries(
       static_cast<int>(V),
       static_cast<int>(n_tiles));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+at::Tensor scan_tile_summaries(
+    const at::Tensor& tile_A,
+    const at::Tensor& tile_b) {
+  check_float_cuda_contiguous(tile_b, "tile_b");
+  at::Tensor tile_inputs = at::empty_like(tile_b);
+  scan_tile_summaries_out(tile_A, tile_b, tile_inputs);
 
   return tile_inputs;
 }
@@ -746,7 +836,10 @@ std::vector<at::Tensor> local_tile_scan_debug(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("tile_summaries", &tile_summaries, "M2RNN local tile summaries (CUDA)");
+  m.def("tile_summaries_out", &tile_summaries_out, "M2RNN local tile summaries into preallocated outputs (CUDA)");
   m.def("scan_tile_summaries", &scan_tile_summaries, "M2RNN tile summary prefix scan (CUDA)");
+  m.def("scan_tile_summaries_out", &scan_tile_summaries_out, "M2RNN tile summary prefix scan into preallocated output (CUDA)");
   m.def("apply_tile_prefixes", &apply_tile_prefixes, "M2RNN recompute tile-prefix apply (CUDA)");
+  m.def("apply_tile_prefixes_out", &apply_tile_prefixes_out, "M2RNN recompute tile-prefix apply into preallocated output (CUDA)");
   m.def("local_tile_scan_debug", &local_tile_scan_debug, "M2RNN local tiled affine scan debug (CUDA)");
 }
