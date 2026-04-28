@@ -28,10 +28,22 @@ Danieli, Rodriguez, Sarabia, Suau, Zappella -- ParaRNN, 2025.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
+
+try:
+    from cppmega.megatron.m2rnn_pararnn_triton import (
+        PARARNN_TRITON_AVAILABLE as _PARARNN_TRITON_AVAILABLE,
+        pararnn_brent_kung_scan_triton as _scan_triton,
+        pararnn_residual_jac_chunk_triton as _residual_jac_triton,
+    )
+except ImportError:  # pragma: no cover -- triton-less envs
+    _PARARNN_TRITON_AVAILABLE = False
+    _residual_jac_triton = None  # type: ignore[assignment]
+    _scan_triton = None  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)
@@ -86,6 +98,19 @@ class PararnnConfig:
     # to ``max_its``.
     abs_tol: float = 0.0
     rel_tol: float = 0.0
+    # Inner-loop kernel:
+    #   "auto"   -- use Triton kernels when CUDA + fp32 + Triton is
+    #               available, else fall back to ``torch``.  Selected by
+    #               default; can be overridden via the
+    #               ``CPPMEGA_M2RNN_PARARNN_KERNEL`` env var.
+    #   "torch"  -- pure PyTorch path (slower, but works on CPU and for
+    #               fp64 reference parity tests).
+    #   "triton" -- force the Triton path; raises if unavailable.
+    kernel: str = "auto"
+    # BLOCK_C tile for the Triton residual+Jacobian kernel.  Lower values
+    # reduce per-program register pressure on small smem GPUs; the default
+    # 16 keeps the (BLOCK_C, V, V) intermediate at ~16 KiB for V=16.
+    triton_block_c: int = 16
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +160,50 @@ def _parallel_reduce_dense(
 # ---------------------------------------------------------------------------
 
 
+
+
+# ---------------------------------------------------------------------------
+# Kernel selection
+# ---------------------------------------------------------------------------
+
+
+def _select_kernel(config: "PararnnConfig", q_is_cuda: bool, q_is_fp32: bool) -> str:
+    """Pick the inner-loop kernel.  ``CPPMEGA_M2RNN_PARARNN_KERNEL`` overrides
+    ``config.kernel``; ``"auto"`` resolves to ``triton`` only when CUDA + fp32
+    + the Triton extension is importable.
+
+    The Triton kernels are fp32-only — autograd wrapping plus dtype dispatch
+    is Phase C work.  fp64 callers (parity tests, debugging) always get the
+    torch path.
+    """
+    env = os.environ.get("CPPMEGA_M2RNN_PARARNN_KERNEL")
+    choice = env if env else config.kernel
+    if choice == "torch":
+        return "torch"
+    if choice == "triton":
+        if not _PARARNN_TRITON_AVAILABLE:
+            raise RuntimeError(
+                "kernel='triton' requested but cppmega.megatron.m2rnn_pararnn_triton "
+                "is not importable (Triton missing?)"
+            )
+        if not q_is_cuda:
+            raise RuntimeError("kernel='triton' requires CUDA tensors")
+        if not q_is_fp32:
+            raise RuntimeError(
+                "kernel='triton' currently only supports fp32 compute; got non-fp32 "
+                "(use kernel='auto' or 'torch' for bf16/fp16/fp64 callers)"
+            )
+        return "triton"
+    if choice == "auto":
+        if (
+            _PARARNN_TRITON_AVAILABLE
+            and q_is_cuda
+            and q_is_fp32
+            and torch.cuda.is_available()
+        ):
+            return "triton"
+        return "torch"
+    raise ValueError(f"unknown kernel choice: {choice}")
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +338,30 @@ def m2rnn_pararnn_forward(
     chunk_size = config.chunk_size if config.chunk_size > 0 else S
     n_chunks = (S + chunk_size - 1) // chunk_size
 
+    kernel = _select_kernel(
+        config,
+        q_is_cuda=q.is_cuda,
+        q_is_fp32=(compute_dtype == torch.float32),
+    )
+    grad_enabled = torch.is_grad_enabled() and any(
+        t.requires_grad for t in (q, k, v, W, xf)
+    )
+    if kernel == "triton" and grad_enabled:
+        # Triton kernels do not have autograd registered; gradient flow would
+        # silently break.  Phase C wraps this in an autograd.Function with an
+        # IFT backward.  Until then: explicit "triton" raises (so users know
+        # they asked for the unsupported config); "auto" falls back to torch.
+        env = os.environ.get("CPPMEGA_M2RNN_PARARNN_KERNEL")
+        explicit = (env == "triton") or (config.kernel == "triton" and env != "torch")
+        if explicit:
+            raise RuntimeError(
+                "kernel='triton' is only supported under torch.no_grad() — "
+                "wrap your call site or use kernel='torch'/'auto' for "
+                "differentiable forward"
+            )
+        kernel = "torch"
+    use_triton = kernel == "triton"
+
     for newton_iter in range(config.max_its):
         prev_h_last = h0_row                                           # (Be, V)
         prev_delta_last = torch.zeros_like(h0_row)                     # (Be, V)
@@ -281,10 +374,21 @@ def m2rnn_pararnn_forward(
             x_c = x_proj[:, c_start:c_end]
             f_c = f_t[:, c_start:c_end]
 
-            residual_c, jac_c = _residual_jac_chunk(
-                h_chunk=h_c, x_chunk=x_c, f_chunk=f_c,
-                W_be=W_be, prev_h_last=prev_h_last,
-            )
+            if use_triton:
+                # Triton kernel needs contiguous fp32 inputs.  ``h_c``,
+                # ``x_c``, ``f_c`` are slices of larger tensors so they
+                # need ``.contiguous()`` to satisfy the kernel's stride
+                # assumptions.
+                residual_c, jac_c = _residual_jac_triton(
+                    h_c.contiguous(), x_c.contiguous(), f_c.contiguous(),
+                    W_be, prev_h_last.contiguous(),
+                    block_c=config.triton_block_c,
+                )
+            else:
+                residual_c, jac_c = _residual_jac_chunk(
+                    h_chunk=h_c, x_chunk=x_c, f_chunk=f_c,
+                    W_be=W_be, prev_h_last=prev_h_last,
+                )
             rhs_c = -residual_c                                        # (Be, C, V)
 
             if config.abs_tol > 0.0 or config.rel_tol > 0.0:
@@ -312,7 +416,10 @@ def m2rnn_pararnn_forward(
                 jac_c = jac_c.clone()
                 jac_c[:, 0] = 0
 
-            delta_c = _parallel_reduce_dense(jac_c, rhs_c.contiguous())
+            if use_triton:
+                delta_c = _scan_triton(jac_c, rhs_c.contiguous())
+            else:
+                delta_c = _parallel_reduce_dense(jac_c, rhs_c.contiguous())
             # Update h_traj for this chunk; out-of-place to keep autograd happy.
             h = torch.cat(
                 [h[:, :c_start], h_c + config.omega_sor * delta_c, h[:, c_end:]],

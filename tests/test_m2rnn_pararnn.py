@@ -396,3 +396,103 @@ def test_h0_propagation():
     )
     torch.testing.assert_close(out_par, out_ref, atol=1e-9, rtol=1e-9)
     torch.testing.assert_close(h_par, h_ref, atol=1e-9, rtol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Triton kernel parity (CUDA + fp32)
+# ---------------------------------------------------------------------------
+
+
+_CUDA = torch.cuda.is_available()
+try:
+    from cppmega.megatron.m2rnn_pararnn_triton import (
+        PARARNN_TRITON_AVAILABLE as _TRITON_AVAILABLE,
+    )
+except ImportError:
+    _TRITON_AVAILABLE = False
+
+_NEED_TRITON = pytest.mark.skipif(
+    not (_CUDA and _TRITON_AVAILABLE),
+    reason="Triton + CUDA required for pararnn Triton parity tests",
+)
+
+
+@_NEED_TRITON
+@pytest.mark.parametrize("S", [64, 128, 256])
+def test_triton_matches_torch_forward_fp32(S):
+    """Triton kernel forward must match the torch path within fp32 floor."""
+    device = "cuda"
+    B, H, k_dim, v_dim = 2, 4, 8, 16
+    dtype = torch.float32
+
+    q, k, v, W, xf = _make_inputs(B, S, H, k_dim, v_dim, device=device, dtype=dtype)
+
+    config_torch = PararnnConfig(max_its=8, kernel="torch")
+    config_triton = PararnnConfig(max_its=8, kernel="triton")
+
+    with torch.no_grad():
+        out_torch, h_torch = m2rnn_pararnn_forward(
+            q, k, v, W, xf, config=config_torch
+        )
+        out_triton, h_triton = m2rnn_pararnn_forward(
+            q, k, v, W, xf, config=config_triton
+        )
+
+    # fp32 floor + log(S) Brent-Kung accumulation: 1e-4 abs / 1e-5 rel
+    # is comfortable headroom; tighter tolerances catch real divergence.
+    torch.testing.assert_close(out_triton, out_torch, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(h_triton, h_torch, atol=1e-4, rtol=1e-4)
+
+
+@_NEED_TRITON
+def test_triton_matches_sequential_fp32():
+    """End-to-end: Triton path must match the sequential M2RNN reference."""
+    device = "cuda"
+    B, S, H, k_dim, v_dim = 1, 64, 2, 4, 16
+    dtype = torch.float32
+
+    q, k, v, W, xf = _make_inputs(B, S, H, k_dim, v_dim, device=device, dtype=dtype)
+    out_seq, h_seq = _torch_m2rnn_forward(q, k, v, W, xf)
+
+    with torch.no_grad():
+        out_triton, h_triton = m2rnn_pararnn_forward(
+            q, k, v, W, xf, config=PararnnConfig(max_its=10, kernel="triton"),
+        )
+
+    # The Newton solver converges to the fixed point of the recurrence,
+    # which IS the sequential output.  fp32 floor + Newton residual.
+    torch.testing.assert_close(out_triton, out_seq, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(h_triton, h_seq, atol=2e-3, rtol=2e-3)
+
+
+@_NEED_TRITON
+def test_triton_requires_no_grad():
+    """Calling the Triton path with grad enabled must raise (no autograd)."""
+    device = "cuda"
+    B, S, H, k_dim, v_dim = 1, 32, 2, 4, 16
+    dtype = torch.float32
+
+    q, k, v, W, xf = _make_inputs(B, S, H, k_dim, v_dim, device=device, dtype=dtype)
+    q.requires_grad_(True)
+
+    with pytest.raises(RuntimeError, match="torch.no_grad"):
+        m2rnn_pararnn_forward(
+            q, k, v, W, xf, config=PararnnConfig(max_its=4, kernel="triton"),
+        )
+
+
+@_NEED_TRITON
+def test_triton_auto_falls_back_for_fp64():
+    """kernel='auto' must pick torch (not triton) for fp64 inputs."""
+    device = "cuda"
+    B, S, H, k_dim, v_dim = 1, 32, 2, 4, 16
+    dtype = torch.float64  # triton kernel is fp32-only -- auto must skip
+
+    q, k, v, W, xf = _make_inputs(B, S, H, k_dim, v_dim, device=device, dtype=dtype)
+    out_seq, _ = _torch_m2rnn_forward(q, k, v, W, xf)
+
+    out_par, _ = m2rnn_pararnn_forward(
+        q, k, v, W, xf, config=PararnnConfig(max_its=8, kernel="auto"),
+    )
+    # Newton-converged → matches sequential to fp64 precision.
+    torch.testing.assert_close(out_par, out_seq, atol=1e-10, rtol=1e-10)
