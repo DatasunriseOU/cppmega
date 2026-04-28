@@ -8,6 +8,143 @@ Branch: `worker/m2rnn-tiled-triton`
 
 Base: `0b7acbc5d18dead10ad206ee5c111e2cb08ab1ef`
 
+## Fifth Optimization Cycle After `2ca204b`
+
+### Search Pass
+
+Local context reviewed:
+
+- This document's prior `2ca204b` notes: summary scan is only about 4-7% for
+  short one-tile profiles, while local/apply replay and fixed launch overhead
+  dominate.
+- `cppmega/megatron/m2rnn_pararnn_tiled_triton.py`: Triton path still used
+  local summary, summary scan, and apply kernels even when `num_tiles == 1`.
+- `scripts/bench_m2rnn_tiled_triton.py`: existing CUDA-event stage profiler and
+  fp32/bf16 sweep are sufficient for a narrow measured patch.
+
+Web/docs reviewed:
+
+- Triton language API: <https://triton-lang.org/main/python-api/triton.language.html>
+- Triton fused softmax tutorial:
+  <https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html>
+- Triton persistent matmul tutorial:
+  <https://triton-lang.org/main/getting-started/tutorials/09-persistent-matmul.html>
+- PyTorch persistent grouped GEMM blog:
+  <https://pytorch.org/blog/accelerating-moes-with-a-triton-persistent-cache-aware-grouped-gemm-kernel/>
+
+Takeaway: the small-S case is launch/intermediate-buffer dominated. For
+`num_tiles == 1`, the tile summary and carry scan are mathematically redundant:
+the incoming carry is zero, so apply replay can run directly in one kernel.
+
+### Baseline Profiling
+
+Environment:
+
+- GPU: NVIDIA GB10, compute capability 12.1
+- PyTorch: `2.13.0.dev20260417+cu132`
+- Triton: `3.7.0`
+
+Commands:
+
+```bash
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 16 --H 4 --K 16 --V 16 --tiles 16,32 --iters 1 --warmup 10 --repeat 100 --dtype fp32 --stage-profile
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 16 --H 4 --K 16 --V 16 --tiles 16,32 --iters 1 --warmup 10 --repeat 100 --dtype bf16 --stage-profile
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 32 --H 4 --K 16 --V 16 --tiles 32,64 --iters 1 --warmup 10 --repeat 100 --dtype fp32 --stage-profile
+```
+
+Captured rows before patch:
+
+| dtype | S | tile | num_tiles | full forward | local | scan | apply | scan pct |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| fp32 | 16 | 16 | 1 | 0.070 ms | 0.005150 ms | 0.000758 ms | 0.004998 ms | 6.95% |
+| fp32 | 16 | 32 | 1 | 0.074 ms | 0.006879 ms | 0.000767 ms | 0.006388 ms | 5.47% |
+| fp32 | 32 | 32 | 1 | 0.081 ms | 0.011432 ms | 0.000786 ms | 0.010264 ms | 3.50% |
+| bf16 | 16 | 16 | 1 | 0.111 ms | 0.005141 ms | 0.000785 ms | 0.004985 ms | 7.19% |
+| bf16 | 16 | 32 | 1 | 0.118 ms | 0.006925 ms | 0.000790 ms | 0.006413 ms | 5.59% |
+
+The `S=32,tile=64` stage-profile compile was stopped after roughly a minute;
+large `tl.static_range(64)` variants are not useful for this short interactive
+cycle.
+
+### Patch
+
+Changed `cppmega/megatron/m2rnn_pararnn_tiled_triton.py`:
+
+- Added `_one_tile_update_kernel`.
+- `_tiled_newton_delta` now dispatches to this kernel when the Triton path is
+  active and `num_tiles == 1`.
+- The fast path starts with zero carry, recomputes the local `M_t,b_t`, applies
+  the Newton update, and writes `h_next` in one launch.
+- Multi-tile fallback is unchanged.
+- Memory accounting now reports zero summary/carry bytes for one-tile solves.
+
+Added `tests/test_m2rnn_pararnn_tiled_triton.py::test_triton_one_tile_fast_path_matches_torch_streaming_cuda`.
+
+### Measured Result
+
+Direct kernel-sequence A/B, old three launches versus new one launch:
+
+| dtype | S | tile | old solve update | new solve update | max diff |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| fp32 | 16 | 16 | 0.019681 ms | 0.006467 ms | 0 |
+| bf16 | 16 | 16 | 0.019540 ms | 0.006457 ms | 0 |
+
+Full forward A/B using an in-script old path:
+
+| dtype | S | tile | iters | old full | new full | delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| fp32 | 16 | 16 | 1 | 0.084575 ms | 0.073594 ms | -13.0% |
+| fp32 | 16 | 16 | 3 | 0.133507 ms | 0.099195 ms | -25.7% |
+| fp32 | 32 | 32 | 3 | 0.132006 ms | 0.099179 ms | -24.9% |
+| bf16 | 16 | 16 | 1 | 0.103116 ms | 0.094852 ms | -8.0% |
+| bf16 | 16 | 16 | 3 | 0.156046 ms | 0.120632 ms | -22.7% |
+| bf16 | 32 | 32 | 3 | 0.154540 ms | 0.120697 ms | -21.9% |
+
+Regular benchmark after patch:
+
+```bash
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 16 --H 4 --K 16 --V 16 --tiles 16,32 --iters 1 --warmup 10 --repeat 100 --dtype fp32
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 16 --H 4 --K 16 --V 16 --tiles 16,32 --iters 1 --warmup 10 --repeat 100 --dtype bf16
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 32 --H 4 --K 16 --V 16 --tiles 32 --iters 1 --warmup 10 --repeat 100 --dtype fp32
+```
+
+| dtype | S | tile | latency | peak alloc |
+| --- | ---: | ---: | ---: | ---: |
+| fp32 | 16 | 16 | 0.075 ms | 32.28 MiB |
+| fp32 | 16 | 32 | 0.076 ms | 32.28 MiB |
+| fp32 | 32 | 32 | 0.076 ms | 32.48 MiB |
+| bf16 | 16 | 16 | 0.097 ms | 32.27 MiB |
+| bf16 | 16 | 32 | 0.099 ms | 32.27 MiB |
+
+The regular benchmark still includes input preparation and final output
+projection, so the kernel win is partly hidden at one Newton iteration. It
+becomes visible in the direct A/B and in `iters=3`.
+
+### Validation
+
+```bash
+pytest -q tests/test_m2rnn_pararnn_tiled_triton.py
+python tools/probes/m2rnn_pararnn_tiled_triton_probe.py --device cuda --dtype fp32 --B 1 --S 16 --H 1 --K 2 --V 4 --tile 16 --iters 3
+python tools/probes/m2rnn_pararnn_tiled_triton_probe.py --device cuda --dtype bf16 --B 1 --S 16 --H 1 --K 2 --V 4 --tile 16 --iters 3
+```
+
+Results:
+
+- `7 passed`.
+- fp32 probe parity: `max_out=1.788139e-06`, `max_h=1.594424e-06`.
+- bf16 probe parity: `max_out=0.000000e+00`, `max_h=0.000000e+00`.
+
+### No-Go Items For This Cycle
+
+- Hierarchical summary scan remains deprioritized: measured scan cost is only
+  about 3.5-7.2% for the relevant short profiles.
+- Reusable output buffer/prealloc API was not pursued because direct one-tile
+  fusion produced a measured solve-update win first; allocator savings are
+  small in the current regular benchmark peak numbers.
+- Dense ParaRNN versus tiled Triton decision-table integration is still useful,
+  but it is a benchmark-product task rather than the smallest measured kernel
+  patch for this cycle.
+
 ## Continuation After `e4f24be`
 
 ### Triton Docs / Examples Reviewed

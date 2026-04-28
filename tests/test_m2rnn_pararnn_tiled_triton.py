@@ -112,6 +112,23 @@ def test_triton_path_matches_torch_streaming_one_iteration_cuda():
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not TRITON_AVAILABLE,
+    reason="Triton tiled prototype requires CUDA and triton",
+)
+def test_triton_one_tile_fast_path_matches_torch_streaming_cuda():
+    B, S, H, K, V = 1, 16, 1, 2, 4
+    q, k, v, W, xf = _make_inputs(B, S, H, K, V, device="cuda", dtype=torch.float32, seed=5)
+
+    cfg_torch = TiledTritonConfig(max_its=3, tile_size=S, prefer_triton=False)
+    cfg_triton = TiledTritonConfig(max_its=3, tile_size=S, prefer_triton=True)
+    out_torch, h_torch = m2rnn_pararnn_tiled_triton_forward(q, k, v, W, xf, config=cfg_torch)
+    out_tri, h_tri = m2rnn_pararnn_tiled_triton_forward(q, k, v, W, xf, config=cfg_triton)
+
+    torch.testing.assert_close(out_tri, out_torch, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(h_tri, h_torch, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not TRITON_AVAILABLE,
     reason="Triton summary scan requires CUDA and triton",
 )
 def test_triton_summary_scan_matches_torch_cuda():

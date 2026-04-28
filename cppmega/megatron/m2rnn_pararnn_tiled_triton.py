@@ -109,6 +109,11 @@ def estimate_tiled_solve_memory(
     Be = B * H * K
     num_tiles = (S + tile_size - 1) // tile_size
     peak_tile = min(S, tile_size)
+    summary_bytes = 0
+    if num_tiles > 1:
+        summary_bytes = _nbytes(Be, num_tiles, V, V, itemsize=dtype_bytes) + _nbytes(
+            Be, num_tiles, V, itemsize=dtype_bytes
+        )
     return TiledSolveStats(
         B=B,
         S=S,
@@ -121,10 +126,9 @@ def estimate_tiled_solve_memory(
         dtype_bytes=dtype_bytes,
         full_A_bytes=_nbytes(Be, S, V, V, itemsize=dtype_bytes),
         peak_tile_A_bytes=_nbytes(Be, peak_tile, V, V, itemsize=dtype_bytes),
-        summary_bytes=_nbytes(Be, num_tiles, V, V, itemsize=dtype_bytes)
-        + _nbytes(Be, num_tiles, V, itemsize=dtype_bytes),
+        summary_bytes=summary_bytes,
         local_delta_bytes=0,
-        carry_bytes=_nbytes(Be, num_tiles, V, itemsize=dtype_bytes),
+        carry_bytes=0 if num_tiles == 1 else _nbytes(Be, num_tiles, V, itemsize=dtype_bytes),
     )
 
 
@@ -344,6 +348,62 @@ if TRITON_AVAILABLE:
             d = tl.where(vmask, d, 0.0)
             tl.store(h_next + be * S * V + t * V + offs, h_cur + omega_sor * d, mask=valid_t & vmask)
 
+    @triton.jit
+    def _one_tile_update_kernel(
+        h,
+        x_proj,
+        f_t,
+        W_be,
+        h0_row,
+        h_next,
+        omega_sor: tl.constexpr,
+        S: tl.constexpr,
+        V: tl.constexpr,
+        TILE: tl.constexpr,
+        BLOCK_V: tl.constexpr,
+    ):
+        be = tl.program_id(0)
+        offs = tl.arange(0, BLOCK_V)
+        rows = tl.arange(0, BLOCK_V)[:, None]
+        cols = tl.arange(0, BLOCK_V)[None, :]
+        vmask = offs < V
+        mmask = (rows < V) & (cols < V)
+        d = tl.zeros((BLOCK_V,), tl.float32)
+        Wt = tl.load(W_be + be * V * V + cols * V + rows, mask=mmask, other=0.0)
+        eye = rows == cols
+
+        for t in tl.static_range(0, TILE):
+            valid_t = t < S
+            h_cur = tl.load(h + be * S * V + t * V + offs, mask=valid_t & vmask, other=0.0)
+            h_prev = tl.load(
+                h + be * S * V + (t - 1) * V + offs,
+                mask=(valid_t & (t > 0) & vmask),
+                other=0.0,
+            )
+            h0v = tl.load(h0_row + be * V + offs, mask=valid_t & (t == 0) & vmask, other=0.0)
+            h_prev = tl.where(t == 0, h0v, h_prev)
+            x = tl.load(x_proj + be * S * V + t * V + offs, mask=valid_t & vmask, other=0.0)
+            fval = tl.load(f_t + be * S + t, mask=valid_t, other=0.0).to(tl.float32)
+
+            z = tl.sum(h_prev[None, :] * Wt, axis=1) + x
+            h_new = tl.inline_asm_elementwise(
+                asm="tanh.approx.f32 $0, $1;",
+                constraints="=f,f",
+                args=[z],
+                dtype=tl.float32,
+                is_pure=True,
+                pack=1,
+            )
+            one_minus_f = 1.0 - fval
+            residual = h_cur - fval * h_prev - one_minus_f * h_new
+            b = -residual
+            sech2 = 1.0 - h_new * h_new
+            M = tl.where(eye, fval, 0.0) + one_minus_f * sech2[:, None] * Wt
+            M = tl.where(mmask, M, 0.0)
+            d = tl.sum(M * d[None, :], axis=1) + b
+            d = tl.where(vmask, d, 0.0)
+            tl.store(h_next + be * S * V + t * V + offs, h_cur + omega_sor * d, mask=valid_t & vmask)
+
 
 def _assemble_tile_torch(
     h: torch.Tensor,
@@ -494,6 +554,24 @@ def _tiled_newton_delta(
     if use_triton:
         assert triton is not None
         block_v = max(16, triton.next_power_of_2(V))
+        if num_tiles == 1:
+            h_next = torch.empty_like(h)
+            _one_tile_update_kernel[(Be,)](
+                h,
+                x_proj,
+                f_t,
+                W_be,
+                h0_row,
+                h_next,
+                omega_sor,
+                S,
+                V,
+                tile_size,
+                block_v,
+                num_warps=1,
+            )
+            empty_summaries = torch.empty(0, device=h.device, dtype=h.dtype)
+            return h_next, empty_summaries, stats
         summaries_M = torch.empty(Be, num_tiles, V, V, device=h.device, dtype=h.dtype)
         summaries_b = torch.empty(Be, num_tiles, V, device=h.device, dtype=h.dtype)
         grid = (Be, num_tiles)
