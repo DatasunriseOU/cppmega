@@ -11,6 +11,12 @@ def test_runtime_config_honors_env_changes_after_import(monkeypatch):
     monkeypatch.delenv("CPPMEGA_M2RNN_FWD_AUTOTUNE", raising=False)
     monkeypatch.delenv("CPPMEGA_M2RNN_FWD_NUM_WARPS", raising=False)
     monkeypatch.delenv("CPPMEGA_M2RNN_FWD_NUM_STAGES", raising=False)
+    monkeypatch.delenv("CPPMEGA_M2RNN_BWD_NUM_WARPS", raising=False)
+    monkeypatch.delenv("CPPMEGA_M2RNN_BWD_NUM_STAGES", raising=False)
+    monkeypatch.delenv("CPPMEGA_M2RNN_BWD_MAXNREG", raising=False)
+    monkeypatch.delenv("CPPMEGA_M2RNN_RECOMPUTE_NUM_WARPS", raising=False)
+    monkeypatch.delenv("CPPMEGA_M2RNN_RECOMPUTE_NUM_STAGES", raising=False)
+    monkeypatch.delenv("CPPMEGA_M2RNN_RECOMPUTE_MAXNREG", raising=False)
     _mod.reset_m2rnn_runtime_config_cache()
 
     default_config = _mod.get_m2rnn_runtime_config()
@@ -19,12 +25,24 @@ def test_runtime_config_honors_env_changes_after_import(monkeypatch):
     assert default_config.fwd_autotune is False
     assert default_config.fwd_num_warps == 4
     assert default_config.fwd_num_stages == 3
+    assert default_config.bwd_num_warps == 4
+    assert default_config.bwd_num_stages == 3
+    assert default_config.bwd_maxnreg is None
+    assert default_config.recompute_num_warps == 4
+    assert default_config.recompute_num_stages == 3
+    assert default_config.recompute_maxnreg is None
 
     monkeypatch.setenv("CPPMEGA_M2RNN_SAVE_HNEW", "1")
     monkeypatch.setenv("CPPMEGA_M2RNN_BWD_CHUNK_SIZE", "8")
     monkeypatch.setenv("CPPMEGA_M2RNN_FWD_AUTOTUNE", "1")
     monkeypatch.setenv("CPPMEGA_M2RNN_FWD_NUM_WARPS", "8")
     monkeypatch.setenv("CPPMEGA_M2RNN_FWD_NUM_STAGES", "2")
+    monkeypatch.setenv("CPPMEGA_M2RNN_BWD_NUM_WARPS", "8")
+    monkeypatch.setenv("CPPMEGA_M2RNN_BWD_NUM_STAGES", "2")
+    monkeypatch.setenv("CPPMEGA_M2RNN_BWD_MAXNREG", "192")
+    monkeypatch.setenv("CPPMEGA_M2RNN_RECOMPUTE_NUM_WARPS", "2")
+    monkeypatch.setenv("CPPMEGA_M2RNN_RECOMPUTE_NUM_STAGES", "1")
+    monkeypatch.setenv("CPPMEGA_M2RNN_RECOMPUTE_MAXNREG", "96")
 
     updated_config = _mod.get_m2rnn_runtime_config()
     assert updated_config.save_hnew is True
@@ -32,6 +50,12 @@ def test_runtime_config_honors_env_changes_after_import(monkeypatch):
     assert updated_config.fwd_autotune is True
     assert updated_config.fwd_num_warps == 8
     assert updated_config.fwd_num_stages == 2
+    assert updated_config.bwd_num_warps == 8
+    assert updated_config.bwd_num_stages == 2
+    assert updated_config.bwd_maxnreg == 192
+    assert updated_config.recompute_num_warps == 2
+    assert updated_config.recompute_num_stages == 1
+    assert updated_config.recompute_maxnreg == 96
 
 
 def test_runtime_config_cache_can_be_reset(monkeypatch):
@@ -151,3 +175,68 @@ def test_runtime_config_parses_forward_launch_env_values(
     assert config.fwd_autotune is expected_autotune
     assert config.fwd_num_warps == expected_warps
     assert config.fwd_num_stages == expected_stages
+
+
+@pytest.mark.parametrize(
+    ("warps_raw", "expected_warps"),
+    [
+        (None, 4),
+        ("bad", 4),
+        ("3", 4),
+        ("1", 1),
+        ("16", 16),
+    ],
+)
+@pytest.mark.parametrize(
+    ("stages_raw", "expected_stages"),
+    [
+        (None, 3),
+        ("bad", 3),
+        ("0", 3),
+        ("1", 1),
+        ("4", 4),
+    ],
+)
+@pytest.mark.parametrize(
+    ("maxnreg_raw", "expected_maxnreg"),
+    [
+        (None, None),
+        ("", None),
+        ("bad", None),
+        ("0", None),
+        ("128", 128),
+    ],
+)
+def test_runtime_config_parses_backward_launch_env_values(
+    monkeypatch,
+    warps_raw,
+    expected_warps,
+    stages_raw,
+    expected_stages,
+    maxnreg_raw,
+    expected_maxnreg,
+):
+    import cppmega.megatron.m2rnn_triton as _mod
+
+    envs = [
+        ("CPPMEGA_M2RNN_BWD_NUM_WARPS", warps_raw),
+        ("CPPMEGA_M2RNN_BWD_NUM_STAGES", stages_raw),
+        ("CPPMEGA_M2RNN_BWD_MAXNREG", maxnreg_raw),
+        ("CPPMEGA_M2RNN_RECOMPUTE_NUM_WARPS", warps_raw),
+        ("CPPMEGA_M2RNN_RECOMPUTE_NUM_STAGES", stages_raw),
+        ("CPPMEGA_M2RNN_RECOMPUTE_MAXNREG", maxnreg_raw),
+    ]
+    for name, raw in envs:
+        if raw is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, raw)
+
+    _mod.reset_m2rnn_runtime_config_cache()
+    config = _mod.get_m2rnn_runtime_config()
+    assert config.bwd_num_warps == expected_warps
+    assert config.bwd_num_stages == expected_stages
+    assert config.bwd_maxnreg == expected_maxnreg
+    assert config.recompute_num_warps == expected_warps
+    assert config.recompute_num_stages == expected_stages
+    assert config.recompute_maxnreg == expected_maxnreg

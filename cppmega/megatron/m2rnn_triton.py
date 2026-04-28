@@ -52,6 +52,10 @@ Backward checkpoint strategy:
       h_prev + k + v + W.
     - CPPMEGA_M2RNN_SAVE_HNEW=1: fwd saves full h_new for debugging/perf
       parity, at the cost of another full (B, S, H, K, V) tensor.
+    Backward chunk launch tuning is exposed through
+    CPPMEGA_M2RNN_BWD_NUM_WARPS / CPPMEGA_M2RNN_BWD_NUM_STAGES and
+    CPPMEGA_M2RNN_RECOMPUTE_NUM_WARPS / CPPMEGA_M2RNN_RECOMPUTE_NUM_STAGES;
+    optional *_MAXNREG env vars pass Triton's maxnreg hint when set.
 
 Usage:
     from cppmega.megatron.m2rnn_triton import m2rnn_scan_triton
@@ -71,6 +75,12 @@ _BWD_CHUNK_SIZE_ENV = "CPPMEGA_M2RNN_BWD_CHUNK_SIZE"
 _FWD_AUTOTUNE_ENV = "CPPMEGA_M2RNN_FWD_AUTOTUNE"
 _FWD_NUM_WARPS_ENV = "CPPMEGA_M2RNN_FWD_NUM_WARPS"
 _FWD_NUM_STAGES_ENV = "CPPMEGA_M2RNN_FWD_NUM_STAGES"
+_BWD_NUM_WARPS_ENV = "CPPMEGA_M2RNN_BWD_NUM_WARPS"
+_BWD_NUM_STAGES_ENV = "CPPMEGA_M2RNN_BWD_NUM_STAGES"
+_BWD_MAXNREG_ENV = "CPPMEGA_M2RNN_BWD_MAXNREG"
+_RECOMPUTE_NUM_WARPS_ENV = "CPPMEGA_M2RNN_RECOMPUTE_NUM_WARPS"
+_RECOMPUTE_NUM_STAGES_ENV = "CPPMEGA_M2RNN_RECOMPUTE_NUM_STAGES"
+_RECOMPUTE_MAXNREG_ENV = "CPPMEGA_M2RNN_RECOMPUTE_MAXNREG"
 _BROADCAST_VIEWS_ENV = "CPPMEGA_M2RNN_BROADCAST_VIEWS"
 _BWD_REDUCE_BROADCAST_QK_ENV = "CPPMEGA_M2RNN_BWD_REDUCE_BROADCAST_QK"
 _DEFAULT_SAVE_HNEW = False
@@ -78,6 +88,10 @@ _DEFAULT_BWD_CHUNK_SIZE = 64
 _DEFAULT_FWD_AUTOTUNE = False
 _DEFAULT_FWD_NUM_WARPS = 4
 _DEFAULT_FWD_NUM_STAGES = 3
+_DEFAULT_BWD_NUM_WARPS = 4
+_DEFAULT_BWD_NUM_STAGES = 3
+_DEFAULT_RECOMPUTE_NUM_WARPS = 4
+_DEFAULT_RECOMPUTE_NUM_STAGES = 3
 _DEFAULT_BROADCAST_VIEWS = True
 _DEFAULT_BWD_REDUCE_BROADCAST_QK = True
 
@@ -99,6 +113,12 @@ class M2RNNRuntimeConfig:
     fwd_autotune: bool = _DEFAULT_FWD_AUTOTUNE
     fwd_num_warps: int = _DEFAULT_FWD_NUM_WARPS
     fwd_num_stages: int = _DEFAULT_FWD_NUM_STAGES
+    bwd_num_warps: int = _DEFAULT_BWD_NUM_WARPS
+    bwd_num_stages: int = _DEFAULT_BWD_NUM_STAGES
+    bwd_maxnreg: Optional[int] = None
+    recompute_num_warps: int = _DEFAULT_RECOMPUTE_NUM_WARPS
+    recompute_num_stages: int = _DEFAULT_RECOMPUTE_NUM_STAGES
+    recompute_maxnreg: Optional[int] = None
     # When q/k were broadcast from one original head, accumulate dq/dk directly
     # into single-head fp32 buffers instead of materializing expanded H-head
     # gradient tensors and reducing them afterwards.
@@ -106,7 +126,20 @@ class M2RNNRuntimeConfig:
 
 
 _M2RNN_RUNTIME_CONFIG_CACHE: tuple[
-    tuple[str | None, str | None, str | None, str | None, str | None, str | None],
+    tuple[
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+    ],
     M2RNNRuntimeConfig,
 ] | None = None
 
@@ -136,6 +169,16 @@ def _env_int_choice(raw: str | None, default: int, choices: set[int]) -> int:
     return value if value in choices else default
 
 
+def _env_optional_positive_int(raw: str | None) -> Optional[int]:
+    if raw is None or raw == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 def reset_m2rnn_runtime_config_cache() -> None:
     """Clear the parsed env cache used by ``get_m2rnn_runtime_config``."""
     global _M2RNN_RUNTIME_CONFIG_CACHE
@@ -158,6 +201,12 @@ def get_m2rnn_runtime_config() -> M2RNNRuntimeConfig:
         os.environ.get(_FWD_AUTOTUNE_ENV),
         os.environ.get(_FWD_NUM_WARPS_ENV),
         os.environ.get(_FWD_NUM_STAGES_ENV),
+        os.environ.get(_BWD_NUM_WARPS_ENV),
+        os.environ.get(_BWD_NUM_STAGES_ENV),
+        os.environ.get(_BWD_MAXNREG_ENV),
+        os.environ.get(_RECOMPUTE_NUM_WARPS_ENV),
+        os.environ.get(_RECOMPUTE_NUM_STAGES_ENV),
+        os.environ.get(_RECOMPUTE_MAXNREG_ENV),
         os.environ.get(_BWD_REDUCE_BROADCAST_QK_ENV),
     )
     cached = _M2RNN_RUNTIME_CONFIG_CACHE
@@ -174,8 +223,22 @@ def get_m2rnn_runtime_config() -> M2RNNRuntimeConfig:
         fwd_num_stages=_env_int_choice(
             raw_env[4], _DEFAULT_FWD_NUM_STAGES, {1, 2, 3, 4}
         ),
+        bwd_num_warps=_env_int_choice(
+            raw_env[5], _DEFAULT_BWD_NUM_WARPS, {1, 2, 4, 8, 16}
+        ),
+        bwd_num_stages=_env_int_choice(
+            raw_env[6], _DEFAULT_BWD_NUM_STAGES, {1, 2, 3, 4}
+        ),
+        bwd_maxnreg=_env_optional_positive_int(raw_env[7]),
+        recompute_num_warps=_env_int_choice(
+            raw_env[8], _DEFAULT_RECOMPUTE_NUM_WARPS, {1, 2, 4, 8, 16}
+        ),
+        recompute_num_stages=_env_int_choice(
+            raw_env[9], _DEFAULT_RECOMPUTE_NUM_STAGES, {1, 2, 3, 4}
+        ),
+        recompute_maxnreg=_env_optional_positive_int(raw_env[10]),
         bwd_reduce_broadcast_qk=_env_flag(
-            raw_env[5], _DEFAULT_BWD_REDUCE_BROADCAST_QK
+            raw_env[11], _DEFAULT_BWD_REDUCE_BROADCAST_QK
         ),
     )
     _M2RNN_RUNTIME_CONFIG_CACHE = (raw_env, config)
@@ -1094,6 +1157,12 @@ class _M2RNNFn(torch.autograd.Function):
         ctx.h0_dtype = h0_dtype
         ctx.save_hnew = save_hnew
         ctx.bwd_chunk_size = chunk_size
+        ctx.bwd_num_warps = runtime_config.bwd_num_warps
+        ctx.bwd_num_stages = runtime_config.bwd_num_stages
+        ctx.bwd_maxnreg = runtime_config.bwd_maxnreg
+        ctx.recompute_num_warps = runtime_config.recompute_num_warps
+        ctx.recompute_num_stages = runtime_config.recompute_num_stages
+        ctx.recompute_maxnreg = runtime_config.recompute_maxnreg
         ctx.bwd_reduce_broadcast_qk = runtime_config.bwd_reduce_broadcast_qk
         ctx.num_chunks = num_chunks
         ctx.orig_shapes = (q.shape, k.shape, v.shape, W.shape, xf.shape)
@@ -1105,6 +1174,12 @@ class _M2RNNFn(torch.autograd.Function):
         has_h0 = ctx.has_h0
         save_hnew = ctx.save_hnew
         chunk_size = ctx.bwd_chunk_size
+        bwd_num_warps = ctx.bwd_num_warps
+        bwd_num_stages = ctx.bwd_num_stages
+        bwd_maxnreg = ctx.bwd_maxnreg
+        recompute_num_warps = ctx.recompute_num_warps
+        recompute_num_stages = ctx.recompute_num_stages
+        recompute_maxnreg = ctx.recompute_maxnreg
         reduce_broadcast_qk = ctx.bwd_reduce_broadcast_qk
         num_chunks = ctx.num_chunks
         orig_q_shape, orig_k_shape, orig_v_shape, orig_W_shape, orig_xf_shape = ctx.orig_shapes
@@ -1148,6 +1223,18 @@ class _M2RNNFn(torch.autograd.Function):
         )
 
         grid = (B, H)
+        recompute_launch_kwargs = dict(
+            num_warps=recompute_num_warps,
+            num_stages=recompute_num_stages,
+        )
+        if recompute_maxnreg is not None:
+            recompute_launch_kwargs["maxnreg"] = recompute_maxnreg
+        bwd_launch_kwargs = dict(
+            num_warps=bwd_num_warps,
+            num_stages=bwd_num_stages,
+        )
+        if bwd_maxnreg is not None:
+            bwd_launch_kwargs["maxnreg"] = bwd_maxnreg
 
         for chunk_idx in range(num_chunks - 1, -1, -1):
             start = chunk_idx * chunk_size
@@ -1174,8 +1261,7 @@ class _M2RNNFn(torch.autograd.Function):
                 ckpt_sv=checkpoints.stride(4),
                 yc_sb=y_chunk.stride(0), yc_ss=y_chunk.stride(1),
                 yc_sh=y_chunk.stride(2), yc_sk=y_chunk.stride(3), yc_sv=y_chunk.stride(4),
-                num_warps=4,
-                num_stages=3,
+                **recompute_launch_kwargs,
             )
 
             _m2rnn_bwd_chunk_kernel[grid](
@@ -1222,8 +1308,7 @@ class _M2RNNFn(torch.autograd.Function):
                 dk_sb=dk.stride(0), dk_ss=dk.stride(1), dk_sh=dk.stride(2), dk_sk=dk.stride(3),
                 dv_sb=dv.stride(0), dv_ss=dv.stride(1), dv_sh=dv.stride(2), dv_sv=dv.stride(3),
                 dxf_sb=dxf.stride(0), dxf_ss=dxf.stride(1), dxf_sh=dxf.stride(2),
-                num_warps=4,
-                num_stages=3,
+                **bwd_launch_kwargs,
             )
 
         # Reduce dW slabs: (B*H, V, V) -> (H, V, V) by summing over batch.
