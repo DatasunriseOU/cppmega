@@ -10,6 +10,75 @@ import torch
 from cppmega.megatron import flashinfer_mxfp8_gemm
 
 
+def test_runner_config_defaults_to_flashinfer_api() -> None:
+    config = flashinfer_mxfp8_gemm.runner_config()
+
+    assert config.mode == "mm_mxfp8"
+    assert config.tactic == 0
+
+
+def test_runner_config_accepts_direct_alias() -> None:
+    config = flashinfer_mxfp8_gemm.runner_config("direct-runner", "2")
+
+    assert config.mode == "direct_tactic"
+    assert config.tactic == 2
+
+
+@pytest.mark.parametrize(
+    ("mode", "tactic", "match"),
+    [
+        ("bad", 0, "must be one of"),
+        ("direct_tactic", -1, "non-negative"),
+        ("direct_tactic", "x", "must be an integer"),
+    ],
+)
+def test_runner_config_rejects_invalid_values(mode, tactic, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        flashinfer_mxfp8_gemm.runner_config(mode, tactic)
+
+
+def test_runner_config_from_env_is_legacy_profile_bridge(monkeypatch) -> None:
+    monkeypatch.setenv("CPPMEGA_FLASHINFER_MXFP8_RUNNER", "direct_tactic")
+    monkeypatch.setenv("CPPMEGA_FLASHINFER_MXFP8_TACTIC", "3")
+
+    config = flashinfer_mxfp8_gemm.runner_config_from_env()
+
+    assert config.mode == "direct_tactic"
+    assert config.tactic == 3
+
+
+def test_mm_mxfp8_dispatches_to_direct_runner_mode(monkeypatch) -> None:
+    calls = []
+
+    def fake_direct(a_data, b_data, a_scale, b_scale, *, out, out_dtype, config):
+        calls.append((a_data, b_data, a_scale, b_scale, out, out_dtype, config))
+        return out
+
+    monkeypatch.setattr(flashinfer_mxfp8_gemm, "_mm_mxfp8_direct", fake_direct)
+    config = flashinfer_mxfp8_gemm.FlashinferMxfp8RunnerConfig(
+        mode="direct_tactic",
+        tactic=2,
+    )
+    a = torch.empty((4, 4), dtype=torch.uint8)
+    b = torch.empty((4, 4), dtype=torch.uint8)
+    scale = torch.empty((4,), dtype=torch.uint8)
+    out = torch.empty((4, 4), dtype=torch.bfloat16)
+
+    result = flashinfer_mxfp8_gemm._mm_mxfp8(
+        a,
+        b,
+        scale,
+        scale,
+        out=out,
+        out_dtype=torch.bfloat16,
+        config=config,
+    )
+
+    assert result is out
+    assert calls and calls[0][-2] == torch.bfloat16
+    assert calls[0][-1] is config
+
+
 def _normalize(**overrides):
     kwargs = {
         "out_dtype": torch.bfloat16,
