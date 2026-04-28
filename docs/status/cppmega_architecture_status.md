@@ -1,7 +1,7 @@
 # Cppmega Architecture And Precision Status
 
 Status: canonical
-Last updated: 2026-04-27
+Last updated: 2026-04-28
 Scope: durable rollup of the current cppmega architecture, precision routes,
 GB10/H200 caveats, and rationale behind the active paths.
 
@@ -38,7 +38,7 @@ the dated note as historical evidence.
 
 | Block | BF16 / base path | FP8 tensorwise path | MXFP8 / block-scaled path |
 | --- | --- | --- | --- |
-| Dense TE Linear / Mamba projections | Params and ordinary grads stay BF16 under `Float16Module`; no FP32 master params in the local no-master Muon path. | H200 bench3 uses TE FP8 tensorwise where beneficial. Local GB10 quarter also defaults to tensorwise FP8 while keeping BF16 params/grads. | Accepted for short local GB10 training through the `mxfp8` run-profile lane. `Float16Module` preserves TE `QuantizedTensor` params instead of dequantizing them during the BF16 wrapper cast, so TE GEMM weights are authoritative primary MXFP8 storage. Native GB10 Linear backward `NN`/`NT` still fails, so the accepted route rewrites to TN through `scripts/cppmega_fp8_shim.py` with TE rowwise-transpose emit and swizzled scales. For local non-FSDP Linear backward, TE saves that GEMM-ready MXFP8 operand instead of keeping the BF16 activation edge plus a separate transpose sidecar. `cutlass_native` is correctness/probe-only until it covers real TE wgrad operands at acceptable speed. |
+| Dense TE Linear / Mamba projections | Params and ordinary grads stay BF16 under `Float16Module`; no FP32 master params in the local no-master Muon path. | H200 bench3 uses TE FP8 tensorwise where beneficial. Local GB10 quarter also defaults to tensorwise FP8 while keeping BF16 params/grads. | Accepted for short local GB10 training through the `mxfp8` run-profile lane. `Float16Module` preserves TE `QuantizedTensor` params instead of dequantizing them during the BF16 wrapper cast, so TE GEMM weights are authoritative primary MXFP8 storage. Native GB10 Linear backward `NN`/`NT` still fails, so the accepted route rewrites to TN through `scripts/cppmega_fp8_shim.py` with FlashInfer/CUTLASS. For local non-FSDP `Linear` and `LayerNormLinear` backward, TE saves GEMM-ready MXFP8 operands inside autograd and parameter quantization no longer attaches forward-side transpose sidecars. `cutlass_native` is correctness/probe-only until it covers real TE wgrad operands at acceptable speed. |
 | SparseMLA / DSA main attention | `CPPMEGA_DSA_SPARSE_MODE=tilelang` replaces Megatron `unfused_dsa_fn` with TileLang SparseMLA and avoids full `[b*np,sq,sk]` score materialization. Gather-scatter is deprecated and ACK-gated. | `SparseMLA_FP8` consumes TE current/tensorwise `Float8Tensor` storage zero-copy where possible. The old local per-token requant path is removed/fail-fast because it materialized large BF16/FP32 temporaries. | QK-only and fused-forward MXFP8 prototypes exist behind `CPPMEGA_SPARSE_MLA_BLOCKSCALED_QK=1` and `CPPMEGA_SPARSE_MLA_BLOCKSCALED_FUSED=1`. They are not defaults: full training backward still lacks finite-gradient validation. |
 | DSA indexer / top-k | Current supported path is BF16 per-head fused accumulation in `dsa_indexer_fused_patch.py`; it removes the upstream `[sq,b,h,sk]` FP32 intermediate. | The old FP8 indexer path was removed. Tests reject `dsa_indexer_dtype="fp8"` in `tests/test_megatron_args.py`; the launcher should not emit `--dsa-indexer-dtype`. | No MXFP8 indexer path is accepted. The target is streaming top-k from the per-head accumulator, not block-scaled dense score materialization. |
 | MoE router / DeepEP | Router probabilities remain FP32 when flex/DeepEP is used. This is a DeepEP API fact, not an accidental precision leak. | TE FP8 can cover MoE GEMMs, but router dtype is still FP32 for flex. | No current MXFP8 MoE training default. DeepGEMM is not a GB10 drop-in; use TE/CUTLASS SM120 work only after the layout contract is explicit. |
@@ -80,11 +80,14 @@ The patched TE branch also contains
 `MXFP8Quantizer.quantize_rowwise_transpose()`. That emits real
 rowwise-transposed MXFP8 storage from the BF16 source plus compact columnwise
 scales. It removes adapter-side copying of an existing MXFP8 payload, but it is
-still materialized transposed storage. The current local TE `Linear` patch uses
-that storage as the saved backward input when no all-gather/offload/FSDP path is
-active, so the covered backward edge no longer holds the BF16 activation as its
-Linear saved tensor. This is a bridge toward authoritative MXFP8 activation
-storage, not proof that a descriptor-only no-transpose path exists.
+still materialized transposed storage. The current local TE `Linear` and
+`LayerNormLinear` patches use that storage, or a compact columnwise one-shot
+transpose when the BF16 source is unavailable, as the saved backward operand
+when no all-gather/offload/FSDP path is active. The covered backward edge no
+longer holds the BF16 activation as its Linear saved tensor, and the global shim
+no longer keeps parameter transpose sidecars alive across the forward pass. This
+is a bridge toward authoritative MXFP8 activation storage, not proof that a
+descriptor-only no-transpose path exists.
 
 ## Optimizer / Param-Storage Contract
 
@@ -116,24 +119,134 @@ loss: 11.65989 -> 11.11296 -> 9.180536 -> 7.473222
 hot steps 3-4: about 5.95-5.97 s/step, about 2.74k tok/s at 16,384 tok/step
 val/test at step 4: 6.834810 / 6.771402
 fallback: bf16_fallback_dgrad=0, bf16_fallback_wgrad=0
+
+log: /home/dave/logs/gb10_mxfp8_zero_sidecars_20260428_171130.log
+loss: 11.66119 -> 11.22491 -> 9.627202 -> 8.113233 -> 7.561619 -> 6.631005
+hot steps 3-6: 5.78-5.97 s/step, about 2.74-2.83k tok/s at 16,384 tok/step
+val/test at step 6: 5.908483 / 5.862091
+max allocated after step 2: 26468.95 MB
+fallback: bf16_fallback_dgrad=0, bf16_fallback_wgrad=0
+sidecars: mxfp8_tn_sidecar_attr_attached=0,
+          mxfp8_tn_sidecar_registry_peak=0,
+          mxfp8_tn_sidecar_registry_peak_bytes=0
+remaining bridge: mxfp8_tn_adapter_copy_transpose=3084 and
+                  mxfp8_tn_adapter_missing_sidecar_copy=3084 over 6 train steps
+
+log: /home/dave/logs/gb10_mxfp8_grouped_direct_smoke9_20260428_183814.log
+change: grouped MoE MXFP8 backward now uses direct compact operands
+step 1: lm loss 11.66119, mtp_1 loss 11.97334, mtp_2 loss 11.96537
+val/test after step 1: 10.66364 / 10.71262
+peak: max allocated 24050.16 MB, max reserved 24866 MB
+grouped direct: mxfp8_grouped_direct_dgrad=10,
+                mxfp8_grouped_direct_wgrad=10,
+                mxfp8_grouped_direct_miss_dgrad=0,
+                mxfp8_grouped_direct_miss_wgrad=0
+grouped fallback: mxfp8_grouped_transpose_copy_fallback_dgrad=0,
+                  mxfp8_grouped_transpose_copy_fallback_wgrad=0
+dense remaining bridge: mxfp8_tn_adapter_copy_transpose=34,
+                        mxfp8_tn_adapter_missing_sidecar_copy=34
+fallback: bf16_fallback_dgrad=0, bf16_fallback_wgrad=0,
+          native_passthrough_dgrad=0, native_passthrough_wgrad=0,
+          fallback_reasons={}
 ```
 
 MXFP8 primary weights do not by themselves cut model-param bytes in half
 because TE stores rowwise and columnwise payloads for GEMM use. The memory win
 comes from removing BF16 masters, saved BF16 Linear activations, and duplicated
-sidecars; the remaining target is to reduce the dual-layout/transpose storage
-without breaking TE backward.
+sidecars. The 2026-04-28 GB10 receipts removed persistent forward-side sidecars
+and then removed the grouped MoE transpose bridge. The remaining target is
+dense Linear: 34 one-step dense copies in the latest grouped-direct smoke, or
+3084 copies over the older 6-step receipt. The experimental dense
+compact-columnwise path is available through the typed profile flag
+`--mxfp8-compact-columnwise-backward`, but it is not the default because the
+current SM120 direct dense loader timed out on the full-model smoke.
+
+Current full-model MXFP8 token/storage path:
+
+- Tokens remain integer IDs. Embedding output, residual hidden tensors between
+  blocks, CE inputs, GEMM outputs, ordinary non-TE parameters, Mamba scan state,
+  DSA/indexer tensors, and local optimizer fallback state remain BF16 unless a
+  narrower block-level note says otherwise.
+- TE dense Linear / LayerNormLinear / GroupedLinear weights in the MXFP8 profile
+  are authoritative MXFP8 storage via `--mxfp8-param-storage`. They carry TE
+  rowwise and compact columnwise payload/scale storage; there is no FP32 master
+  copy in the local no-master Muon lane. The latest storage receipt still has
+  BF16 model storage for non-covered tensors.
+- Linear backward for covered non-FSDP edges saves GEMM-ready MXFP8 operands in
+  autograd instead of retaining the BF16 Linear input. This is materialized
+  MXFP8 transpose storage, counted by
+  `mxfp8_tn_adapter_saved_transpose_operand=408` in the latest full-model run,
+  not a persistent producer-side sidecar.
+- FP32 exists in kernel accumulators and reductions: GEMM tensor-core
+  accumulators, CE/loss reductions, attention reductions, router probabilities
+  when DeepEP/flex is active, DSA score/top-k work, and local Mamba scalar math.
+  Those are not persistent FP32 model parameters.
+- The latest full-model path is zero persistent sidecars, not zero-copy
+  end-to-end. `_cppmega_mxfp8_colwise_as_rowwise_transpose` still materializes
+  rowwise transposed MXFP8 payload/scale copies when only compact columnwise
+  storage is available, as shown by
+  `mxfp8_tn_adapter_copy_transpose=3084`,
+  `mxfp8_tn_adapter_missing_sidecar_copy=3084`, and
+  `mxfp8_norm_quantize_sidecar_bridge=100`.
 
 Current code reflects those facts:
 
 - `scripts/cppmega_fp8_shim.py` retargets MXFP8 backward to GB10-supported TN.
 - `cppmega/megatron/cutlass_mxfp8_gemm.py` exposes the narrow SM120/SM121
   CUTLASS TN entry points and direct original-columnwise helpers.
+- `cppmega/megatron/grouped_mxfp8_gemm.py` exposes the one-launch grouped
+  MXFP8 direct backend for MoE dgrad/wgrad. It consumes per-expert pointer
+  lists to avoid Python-side stacking and avoids
+  `_cppmega_mxfp8_colwise_as_rowwise_transpose`.
 - `cppmega/megatron/cuda_ext/cppmega_sm120_blockscaled_mma_tma_compact_scale.hpp`
   and `cppmega/megatron/cuda_ext/cutlass_mxfp8_gemm.cu` contain the local
   mainloop/loader work.
 - `tools/probes/gb10_accepted_path_validation.py` is the acceptance gate for
   zero BF16 fallback and zero native passthrough in GB10 MXFP8 runs.
+
+## Next MXFP8 Zero-Copy Acceptance Contract
+
+The next accepted grouped direct backend and dense compact-columnwise path must
+be accepted on counters, not on wrapper names:
+
+- Direct dense compact-columnwise use is evidenced by
+  `mxfp8_cutlass_native_dgrad>0` and `mxfp8_cutlass_native_wgrad>0`.
+- Grouped direct use is evidenced by `mxfp8_grouped_direct_dgrad>0`,
+  `mxfp8_grouped_direct_wgrad>0`,
+  `mxfp8_grouped_direct_miss_dgrad=0`,
+  `mxfp8_grouped_direct_miss_wgrad=0`,
+  `mxfp8_grouped_transpose_copy_fallback_dgrad=0`, and
+  `mxfp8_grouped_transpose_copy_fallback_wgrad=0`. A grouped TE call should
+  remain a grouped backend launch; do not accept per-expert Python unrolling as
+  the grouped path.
+- Accepted direct paths must make zero calls to
+  `_cppmega_mxfp8_colwise_as_rowwise_transpose` for dgrad/wgrad/grouped
+  operands. Counter evidence is all transpose/materialization counters at zero:
+  `mxfp8_tn_adapter_te_emit=0`,
+  `mxfp8_tn_adapter_te_emit_deferred=0`,
+  `mxfp8_tn_adapter_saved_transpose_operand=0`,
+  `mxfp8_tn_adapter_te_emit_swizzled=0`,
+  `mxfp8_tn_adapter_te_emit_swizzled_unavailable=0`,
+  `mxfp8_tn_adapter_copy_transpose=0`,
+  `mxfp8_tn_adapter_missing_sidecar_copy=0`, and
+  `mxfp8_norm_quantize_sidecar_bridge=0`.
+- No logical `x.T`, `dy.T`, or `weight.T` MXFP8 operand may be materialized as a
+  tensor for accepted direct paths. The backend must consume the original TE
+  compact columnwise payload/scales directly.
+- Persistent sidecar counters must stay zero:
+  `mxfp8_tn_sidecar_attr_attached=0`,
+  `mxfp8_tn_sidecar_attr_attached_bytes=0`,
+  `mxfp8_tn_sidecar_registry_size=0`,
+  `mxfp8_tn_sidecar_registry_persistent=0`,
+  `mxfp8_tn_sidecar_registry_peak=0`,
+  `mxfp8_tn_sidecar_registry_current_bytes=0`,
+  `mxfp8_tn_sidecar_registry_peak_bytes=0`,
+  `mxfp8_tn_sidecar_tracked_attr_current_bytes=0`, and
+  `mxfp8_tn_sidecar_tracked_attr_peak_bytes=0`.
+- Fallback/passthrough counters must stay zero:
+  `bf16_fallback_dgrad=0`, `bf16_fallback_wgrad=0`,
+  `native_passthrough_dgrad=0`, `native_passthrough_wgrad=0`, and
+  `fallback_reasons={}`.
 
 Evidence:
 

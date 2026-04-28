@@ -399,9 +399,14 @@ def run_mxfp8_te_emit_probe(args: argparse.Namespace) -> CheckResult:
     ):
         if int(stats.get(key, 0)) != 0:
             errors.append(f"{key}={stats.get(key)}; expected 0 for TE transpose emit")
-    for key in ("mxfp8_tn_adapter_te_emit", "mxfp8_tn_adapter_te_emit_swizzled"):
-        if int(stats.get(key, 0)) <= 0:
-            errors.append(f"{key}={stats.get(key)}; expected >0 for TE transpose emit")
+    if int(stats.get("mxfp8_tn_adapter_te_emit_swizzled", 0)) <= 0 and not (
+        int(stats.get("mxfp8_flashinfer_dgrad", 0)) > 0
+        and int(stats.get("mxfp8_flashinfer_wgrad", 0)) > 0
+    ):
+        errors.append(
+            "expected either TE swizzled transpose emit or compact-direct "
+            "FlashInfer/CUTLASS dgrad+wgrad hits"
+        )
     if errors:
         return CheckResult(
             name="mxfp8_te_transpose_emit_probe",
@@ -412,7 +417,7 @@ def run_mxfp8_te_emit_probe(args: argparse.Namespace) -> CheckResult:
     return CheckResult(
         name="mxfp8_te_transpose_emit_probe",
         status="pass",
-        detail="TE emitted swizzled rowwise-transpose sidecars; BF16 fallback and adapter copy counters stayed zero",
+        detail="MXFP8 backward used the accepted no-copy TE/FlashInfer path; BF16 fallback and adapter copy counters stayed zero",
         data={"shim_stats": stats},
     )
 
@@ -500,7 +505,134 @@ def run_mxfp8_te_linear_saved_operand_probe(args: argparse.Namespace) -> CheckRe
     )
 
 
-def validate_training_log(path: Path) -> CheckResult:
+def run_mxfp8_grouped_direct_microprobe(args: argparse.Namespace) -> CheckResult:
+    if not args.run_mxfp8_grouped_direct_microprobe:
+        return CheckResult(
+            name="mxfp8_grouped_direct_microprobe",
+            status="skip",
+            detail="skipped by default; pass --run-mxfp8-grouped-direct-microprobe",
+        )
+    if args.skip_mxfp8_probe:
+        return CheckResult(
+            name="mxfp8_grouped_direct_microprobe",
+            status="skip",
+            detail="skipped by --skip-mxfp8-probe",
+        )
+
+    cmd = [
+        sys.executable,
+        str(repo_root() / "tools" / "probes" / "mxfp8_grouped_direct_microprobe.py"),
+        "--experts",
+        str(args.microprobe_experts),
+        "--m",
+        str(args.m),
+        "--n",
+        str(args.n),
+        "--k",
+        str(args.k),
+        "--warmup",
+        str(args.microprobe_warmup),
+        "--iters",
+        str(args.microprobe_iters),
+    ]
+    proc = subprocess.run(
+        cmd,
+        cwd=repo_root(),
+        env=_base_env(),
+        text=True,
+        capture_output=True,
+        timeout=args.probe_timeout_s,
+        check=False,
+    )
+    output = _combined_output(proc)
+    try:
+        report = extract_first_json_object(output)
+    except Exception as exc:
+        return CheckResult(
+            name="mxfp8_grouped_direct_microprobe",
+            status="fail",
+            detail=f"could not parse microprobe output: {type(exc).__name__}: {exc}",
+            data={"returncode": proc.returncode, "output_tail": _tail(output)},
+        )
+    status = str(report.get("status", "fail"))
+    if status not in {"pass", "skip", "fail"}:
+        status = "fail"
+    if proc.returncode != 0 and status != "fail":
+        status = "fail"
+    details = {
+        "pass": "logical grouped direct backend matched the current transpose fallback",
+        "skip": f"microprobe skipped: {report.get('reason', 'unspecified reason')}",
+        "fail": "logical grouped direct backend did not satisfy microprobe checks",
+    }
+    return CheckResult(
+        name="mxfp8_grouped_direct_microprobe",
+        status=status,
+        detail=details[status],
+        data=report,
+    )
+
+
+def _threshold_errors(parsed: dict[str, Any], args: argparse.Namespace) -> list[str]:
+    breakdown = parsed.get("mxfp8_copy_breakdown")
+    if not isinstance(breakdown, dict):
+        return ["mxfp8_copy_breakdown missing"]
+    grouped = breakdown.get("grouped", {})
+    dense = breakdown.get("dense", {})
+    checks = (
+        (
+            "min_grouped_direct_hits",
+            "grouped direct hits",
+            grouped.get("direct_hits"),
+            ">=",
+        ),
+        (
+            "max_grouped_fallback_copies",
+            "grouped fallback copies",
+            grouped.get("fallback_copies"),
+            "<=",
+        ),
+        (
+            "min_dense_direct_hits",
+            "dense direct hits",
+            dense.get("direct_hits"),
+            ">=",
+        ),
+        (
+            "max_dense_fallback_copies",
+            "dense fallback copies",
+            dense.get("fallback_copies"),
+            "<=",
+        ),
+        (
+            "max_sidecar_registry_peak_bytes",
+            "sidecar registry peak bytes",
+            breakdown.get("sidecar_registry_peak_bytes"),
+            "<=",
+        ),
+        (
+            "max_cuda_allocated_bytes",
+            "max CUDA allocated bytes",
+            breakdown.get("max_cuda_allocated_bytes"),
+            "<=",
+        ),
+    )
+    errors: list[str] = []
+    for arg_name, label, value, op in checks:
+        threshold = getattr(args, arg_name, None)
+        if threshold is None:
+            continue
+        if value is None:
+            errors.append(f"{label} missing; threshold {op} {threshold} requested")
+            continue
+        numeric = int(value)
+        if op == ">=" and numeric < int(threshold):
+            errors.append(f"{label}={numeric}; expected >= {threshold}")
+        elif op == "<=" and numeric > int(threshold):
+            errors.append(f"{label}={numeric}; expected <= {threshold}")
+    return errors
+
+
+def validate_training_log(path: Path, args: argparse.Namespace) -> CheckResult:
     text = path.read_text(encoding="utf-8", errors="replace")
     parsed = parse_training_log(text)
     errors: list[str] = []
@@ -550,6 +682,7 @@ def validate_training_log(path: Path) -> CheckResult:
     reasons = parsed.get("fallback_reasons")
     if reasons not in ({}, None):
         errors.append(f"fallback_reasons={reasons!r}; expected empty")
+    errors.extend(_threshold_errors(parsed, args))
     if errors:
         return CheckResult(
             name="one_step_log_parse",
@@ -583,6 +716,50 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Optional one-step training log to parse for loss and MXFP8 counters.",
     )
+    parser.add_argument(
+        "--min-grouped-direct-hits",
+        type=int,
+        default=None,
+        help="Optional training-log acceptance threshold for grouped direct backend hits.",
+    )
+    parser.add_argument(
+        "--max-grouped-fallback-copies",
+        type=int,
+        default=None,
+        help="Optional training-log acceptance threshold for grouped transpose fallback copies.",
+    )
+    parser.add_argument(
+        "--min-dense-direct-hits",
+        type=int,
+        default=None,
+        help="Optional training-log acceptance threshold for dense direct backend hits.",
+    )
+    parser.add_argument(
+        "--max-dense-fallback-copies",
+        type=int,
+        default=None,
+        help="Optional training-log acceptance threshold for dense transpose fallback copies.",
+    )
+    parser.add_argument(
+        "--max-sidecar-registry-peak-bytes",
+        type=int,
+        default=None,
+        help="Optional training-log acceptance threshold for sidecar registry peak bytes.",
+    )
+    parser.add_argument(
+        "--max-cuda-allocated-bytes",
+        type=int,
+        default=None,
+        help="Optional training-log acceptance threshold for max CUDA allocated bytes.",
+    )
+    parser.add_argument(
+        "--run-mxfp8-grouped-direct-microprobe",
+        action="store_true",
+        help="Run the optional logical grouped current-vs-direct MXFP8 microprobe.",
+    )
+    parser.add_argument("--microprobe-experts", type=int, default=4)
+    parser.add_argument("--microprobe-warmup", type=int, default=5)
+    parser.add_argument("--microprobe-iters", type=int, default=20)
     return parser
 
 
@@ -595,9 +772,10 @@ def main(argv: list[str] | None = None) -> int:
         run_mxfp8_shim_probe(args),
         run_mxfp8_te_emit_probe(args),
         run_mxfp8_te_linear_saved_operand_probe(args),
+        run_mxfp8_grouped_direct_microprobe(args),
     ]
     if args.train_log is not None:
-        checks.append(validate_training_log(args.train_log))
+        checks.append(validate_training_log(args.train_log, args))
 
     failed = any(check.status == "fail" for check in checks)
     if args.require_mxfp8_probe:

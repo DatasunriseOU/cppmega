@@ -98,6 +98,7 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert env["CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE"] == "int8"
     assert env["CPPMEGA_TE_MXFP8_BWD_BACKEND"] == "flashinfer_cutlass"
     assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
+    assert env["CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD"] == "0"
     assert env["CPPMEGA_FLASHINFER_MXFP8_RUNNER"] == "mm_mxfp8"
     assert env["CPPMEGA_FLASHINFER_MXFP8_TACTIC"] == "0"
     assert env["HYBRID_LAYER_PATTERN"].endswith("/*-/*-")
@@ -161,6 +162,7 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
             "cutlass_native",
             "--mxfp8-transpose-emit-backend",
             "off",
+            "--mxfp8-compact-columnwise-backward",
             "--fp8-param-gather",
             "--no-reuse-grad-buf-for-mxfp8-param-ag",
             "--no-mxfp8-transpose-emit-swizzled",
@@ -194,6 +196,7 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
     assert "export CPPMEGA_ATTN_BACKEND=fused" in out
     assert "export CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native" in out
     assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=off" in out
+    assert "export CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=1" in out
     assert "export CPPMEGA_FP8_PARAM_GATHER=1" in out
     assert "export CPPMEGA_REUSE_GRAD_BUF_FOR_MXFP8_PARAM_AG=0" in out
     assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED=0" in out
@@ -280,6 +283,53 @@ def test_mxfp8_transpose_emit_defaults_to_te_for_tn_adapter():
     profile.precision.fp8_recipe = "mxfp8"
     env = profile_shell_assignments(profile)
     assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
+
+
+def test_mxfp8_docs_pin_zero_copy_acceptance_counters():
+    """The status docs should name the real MXFP8 counters, not vague wrappers."""
+    architecture_doc = Path("docs/status/cppmega_architecture_status.md").read_text()
+    token_flow_doc = Path("docs/status/cppmega_run_profiles_and_token_flow.md").read_text()
+    docs = f"{architecture_doc}\n{token_flow_doc}"
+
+    for needle in (
+        "/home/dave/logs/gb10_mxfp8_zero_sidecars_20260428_171130.log",
+        "/home/dave/logs/gb10_mxfp8_grouped_direct_smoke9_20260428_183814.log",
+        "mxfp8_flashinfer_dgrad=204",
+        "mxfp8_flashinfer_wgrad=204",
+        "mxfp8_grouped_direct_dgrad=10",
+        "mxfp8_grouped_direct_wgrad=10",
+        "mxfp8_grouped_direct_miss_dgrad=0",
+        "mxfp8_grouped_direct_miss_wgrad=0",
+        "mxfp8_grouped_transpose_copy_fallback_dgrad=0",
+        "mxfp8_grouped_transpose_copy_fallback_wgrad=0",
+        "mxfp8_tn_adapter_saved_transpose_operand=408",
+        "mxfp8_tn_adapter_copy_transpose=3084",
+        "mxfp8_tn_adapter_missing_sidecar_copy=3084",
+        "mxfp8_norm_quantize_sidecar_bridge=100",
+        "_cppmega_mxfp8_colwise_as_rowwise_transpose",
+        "--mxfp8-compact-columnwise-backward",
+        "mxfp8_cutlass_native_dgrad>0",
+        "mxfp8_cutlass_native_wgrad>0",
+        "mxfp8_grouped_direct_dgrad>0",
+        "mxfp8_grouped_direct_wgrad>0",
+        "mxfp8_grouped_direct_miss_dgrad=0",
+        "mxfp8_grouped_direct_miss_wgrad=0",
+        "mxfp8_tn_adapter_te_emit=0",
+        "mxfp8_tn_adapter_te_emit_deferred=0",
+        "mxfp8_tn_adapter_saved_transpose_operand=0",
+        "mxfp8_tn_adapter_copy_transpose=0",
+        "mxfp8_tn_adapter_missing_sidecar_copy=0",
+        "mxfp8_norm_quantize_sidecar_bridge=0",
+        "mxfp8_tn_sidecar_attr_attached=0",
+        "mxfp8_tn_sidecar_registry_peak=0",
+        "mxfp8_tn_sidecar_registry_peak_bytes=0",
+        "bf16_fallback_dgrad=0",
+        "bf16_fallback_wgrad=0",
+        "native_passthrough_dgrad=0",
+        "native_passthrough_wgrad=0",
+        "fallback_reasons={}",
+    ):
+        assert needle in docs
 
 
 def test_tensorwise_fp8_keeps_hybrid_format():
