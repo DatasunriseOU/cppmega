@@ -207,6 +207,485 @@ def _select_kernel(config: "PararnnConfig", q_is_cuda: bool, q_is_fp32: bool) ->
 
 
 # ---------------------------------------------------------------------------
+# Inner solver (works on already-broadcast Be-shaped tensors)
+# ---------------------------------------------------------------------------
+
+
+def _solve_fixed_point(
+    x_proj: torch.Tensor,   # (Be, S, V)
+    f_t: torch.Tensor,      # (Be, S)
+    W_be: torch.Tensor,     # (Be, V, V)
+    h0_row: torch.Tensor,   # (Be, V)
+    *,
+    config: PararnnConfig,
+    use_triton: bool,
+) -> torch.Tensor:
+    """Streaming chunked Newton solve. Returns ``h`` of shape (Be, S, V).
+
+    The caller is responsible for kernel selection and for running this under
+    ``torch.no_grad()`` when wrapping in an autograd.Function.
+    """
+    Be, S, V = x_proj.shape
+    chunk_size = config.chunk_size if config.chunk_size > 0 else S
+    n_chunks = (S + chunk_size - 1) // chunk_size
+
+    if config.init_strategy == "zero":
+        h = torch.zeros(Be, S, V, device=x_proj.device, dtype=x_proj.dtype)
+    elif config.init_strategy == "chunk":
+        h = torch.empty(Be, S, V, device=x_proj.device, dtype=x_proj.dtype)
+        h_cur = h0_row
+        for t in range(S):
+            z = torch.einsum("bv,bvj->bj", h_cur, W_be) + x_proj[:, t]
+            h_new = torch.tanh(z)
+            f_bcast = f_t[:, t, None]
+            h_cur = f_bcast * h_cur + (1.0 - f_bcast) * h_new
+            h[:, t] = h_cur
+    else:
+        raise ValueError(f"unknown init_strategy: {config.init_strategy}")
+
+    iter0_residual = 0.0
+    for newton_iter in range(config.max_its):
+        prev_h_last = h0_row
+        prev_delta_last = torch.zeros_like(h0_row)
+        max_residual = 0.0
+
+        for c_idx in range(n_chunks):
+            c_start = c_idx * chunk_size
+            c_end = min(c_start + chunk_size, S)
+            h_c = h[:, c_start:c_end]
+            x_c = x_proj[:, c_start:c_end]
+            f_c = f_t[:, c_start:c_end]
+
+            if use_triton:
+                residual_c, jac_c = _residual_jac_triton(
+                    h_c.contiguous(), x_c.contiguous(), f_c.contiguous(),
+                    W_be, prev_h_last.contiguous(),
+                    block_c=config.triton_block_c,
+                )
+            else:
+                residual_c, jac_c = _residual_jac_chunk(
+                    h_chunk=h_c, x_chunk=x_c, f_chunk=f_c,
+                    W_be=W_be, prev_h_last=prev_h_last,
+                )
+            rhs_c = -residual_c
+
+            if config.abs_tol > 0.0 or config.rel_tol > 0.0:
+                with torch.no_grad():
+                    chunk_max = residual_c.abs().amax().item()
+                if chunk_max > max_residual:
+                    max_residual = chunk_max
+
+            if c_start > 0:
+                rhs_c = rhs_c.clone()
+                rhs_c[:, 0] = rhs_c[:, 0] - torch.einsum(
+                    "bij,bj->bi", jac_c[:, 0], prev_delta_last,
+                )
+                jac_c = jac_c.clone()
+                jac_c[:, 0] = 0
+            else:
+                jac_c = jac_c.clone()
+                jac_c[:, 0] = 0
+
+            if use_triton:
+                delta_c = _scan_triton(jac_c, rhs_c.contiguous())
+            else:
+                delta_c = _parallel_reduce_dense(jac_c, rhs_c.contiguous())
+            h = torch.cat(
+                [h[:, :c_start], h_c + config.omega_sor * delta_c, h[:, c_end:]],
+                dim=1,
+            )
+
+            prev_h_last = h[:, c_end - 1]
+            prev_delta_last = delta_c[:, -1]
+
+        if config.abs_tol > 0.0 and max_residual < config.abs_tol:
+            break
+        if newton_iter == 0:
+            iter0_residual = max_residual
+        elif (
+            config.rel_tol > 0.0
+            and iter0_residual > 0.0
+            and max_residual / iter0_residual < config.rel_tol
+        ):
+            break
+
+    return h
+
+
+# ---------------------------------------------------------------------------
+# Adjoint solve for the IFT backward
+# ---------------------------------------------------------------------------
+
+
+def _solve_adjoint_chunked(
+    grad_h_star: torch.Tensor,  # (Be, S, V)
+    h_star: torch.Tensor,       # (Be, S, V) -- detached
+    x_proj: torch.Tensor,       # (Be, S, V)
+    f_t: torch.Tensor,          # (Be, S)
+    W_be: torch.Tensor,         # (Be, V, V)
+    h0_row: torch.Tensor,       # (Be, V)
+    *,
+    config: PararnnConfig,
+    use_triton: bool,
+) -> torch.Tensor:
+    """Adjoint solve for the IFT backward.
+
+    Solves ``(∂F/∂h)^T λ = -grad_h_star`` where ``∂F/∂h`` is the lower
+    bidiagonal block matrix produced by the same residual+Jacobian kernel
+    used in the forward Newton iteration. The transpose is upper bidiagonal,
+    so we time-reverse + transpose-jac and reuse the existing Brent-Kung
+    scan, walking chunks right-to-left.
+    """
+    Be, S, V = h_star.shape
+    chunk_size = config.chunk_size if config.chunk_size > 0 else S
+    n_chunks = (S + chunk_size - 1) // chunk_size
+
+    lam = torch.empty_like(h_star)
+
+    # next_lam_first: λ at the first time step of the chunk to the right (i.e.
+    # the chunk we just processed). For the last chunk it's zero.
+    next_lam_first = torch.zeros_like(h0_row)
+    # next_jac_first_T: jac[c_end]^T from the next chunk's first row, used to
+    # absorb cross-chunk coupling λ[t] = ... - jac[t+1]^T λ[t+1] at the
+    # boundary. For the last chunk it's zero (no row to its right).
+    next_jac_first_T = torch.zeros(Be, V, V, device=h_star.device, dtype=h_star.dtype)
+
+    for c_idx in range(n_chunks - 1, -1, -1):
+        c_start = c_idx * chunk_size
+        c_end = min(c_start + chunk_size, S)
+        C = c_end - c_start
+
+        # prev_h_last for this chunk: h_star[c_start - 1] or h0_row.
+        if c_start > 0:
+            prev_h_last_c = h_star[:, c_start - 1].contiguous()
+        else:
+            prev_h_last_c = h0_row
+
+        h_c = h_star[:, c_start:c_end].contiguous()
+        x_c = x_proj[:, c_start:c_end].contiguous()
+        f_c = f_t[:, c_start:c_end].contiguous()
+
+        if use_triton:
+            _, jac_c = _residual_jac_triton(
+                h_c, x_c, f_c, W_be, prev_h_last_c,
+                block_c=config.triton_block_c,
+            )
+        else:
+            _, jac_c = _residual_jac_chunk(
+                h_chunk=h_c, x_chunk=x_c, f_chunk=f_c,
+                W_be=W_be, prev_h_last=prev_h_last_c,
+            )
+
+        # Build the time-reversed transposed Jacobian system.
+        # Forward chunk: row t has identity on diagonal and jac[t] on the
+        # subdiagonal (column t-1). Transposed: row t has identity on
+        # diagonal and jac[t]^T on the superdiagonal (column t+1).
+        # After reversing time within the chunk (rev_t = C-1 - t), the
+        # superdiagonal becomes a subdiagonal, so the same Brent-Kung scan
+        # applies. The reversed-system "subdiagonal" at position rev_t is
+        # jac[rev_t + 1]^T (i.e. one step to the right in original indexing).
+        jac_T = jac_c.transpose(-1, -2)  # (Be, C, V, V)
+        # Build the reversed-jac tensor: for rev_t in [0, C-1], the
+        # subdiagonal block is the original jac at position (C-1 - rev_t) + 1
+        # = C - rev_t, transposed. For rev_t == 0 (last original timestep)
+        # there is no original t+1 within the chunk; this corresponds to the
+        # boundary with the chunk to the right and is handled via
+        # ``next_jac_first_T`` absorption below.
+        jac_rev = torch.empty_like(jac_T)
+        # rev_t = 0 corresponds to the last original timestep; its
+        # superdiagonal in the original system would be jac[C]^T (out of chunk
+        # bounds, lives in the next chunk). We zero this row so the scan sees
+        # a clean left boundary, then fold the cross-chunk coupling into rhs.
+        jac_rev[:, 0] = 0
+        if C > 1:
+            # rev_t in [1, C-1] -> original t = C-1 - rev_t, "next" original
+            # t+1 = C - rev_t. We need jac[C - rev_t]^T for rev_t in [1, C-1],
+            # i.e. jac_T at indices [C-1, C-2, ..., 1] -> flip jac_T[:, 1:C].
+            jac_rev[:, 1:C] = torch.flip(jac_T[:, 1:C], dims=[1])
+
+        # rhs in the reversed frame: rhs[rev_t] = -grad_h_star[c_start + (C-1-rev_t)].
+        rhs_rev = torch.flip(-grad_h_star[:, c_start:c_end], dims=[1]).contiguous()
+
+        # Cross-chunk coupling: at rev_t = 0 (= original t = c_end - 1) the
+        # superdiagonal is jac[c_end]^T · λ[c_end], which lives in the next
+        # chunk. Subtract it from the rhs at rev_t = 0.
+        if c_idx < n_chunks - 1:
+            rhs_rev = rhs_rev.clone()
+            rhs_rev[:, 0] = rhs_rev[:, 0] - torch.einsum(
+                "bij,bj->bi", next_jac_first_T, next_lam_first,
+            )
+
+        if use_triton:
+            lam_rev = _scan_triton(jac_rev, rhs_rev.contiguous())
+        else:
+            lam_rev = _parallel_reduce_dense(jac_rev, rhs_rev.contiguous())
+
+        # Un-reverse and store.
+        lam_c = torch.flip(lam_rev, dims=[1])
+        lam[:, c_start:c_end] = lam_c
+
+        # Carry to the next (left-of-current) chunk.
+        next_lam_first = lam_c[:, 0].contiguous()
+        next_jac_first_T = jac_T[:, 0].contiguous()
+
+    return lam
+
+
+# ---------------------------------------------------------------------------
+# Autograd Function with IFT backward
+# ---------------------------------------------------------------------------
+
+
+class _M2RNNPararnnFn(torch.autograd.Function):
+    """``m2rnn_pararnn_forward`` with an implicit-function-theorem backward.
+
+    Forward runs the existing Newton/scan solver under ``torch.no_grad()``;
+    backward solves the adjoint system ``(∂F/∂h)^T λ = -grad_h*`` using the
+    same Brent-Kung primitive (time-reversed, jac-transposed) and computes
+    parameter VJPs by differentiating the residual ``F`` once via
+    ``torch.autograd.grad``.
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v, W, xf, h0, config_obj):
+        B, S, n_q, k_dim = q.shape
+        n_k = k.size(-2)
+        n_v = v.size(-2)
+        n_w = W.size(0)
+        n_f = xf.size(-1)
+        v_dim = v.size(-1)
+        H = max(n_q, n_k, n_v, n_w, n_f)
+
+        # Broadcast head dims to the union.
+        q_b = q.repeat_interleave(H // n_q, dim=-2) if n_q != H else q
+        k_b = k.repeat_interleave(H // n_k, dim=-2) if n_k != H else k
+        v_b = v.repeat_interleave(H // n_v, dim=-2) if n_v != H else v
+        W_b = W.repeat_interleave(H // n_w, dim=0) if n_w != H else W
+        xf_b = xf.repeat_interleave(H // n_f, dim=-1) if n_f != H else xf
+
+        compute_dtype = torch.promote_types(torch.float32, q.dtype)
+        out_dtype = q.dtype
+
+        qf = q_b.to(compute_dtype)
+        kf = k_b.to(compute_dtype)
+        vf = v_b.to(compute_dtype)
+        Wf = W_b.to(compute_dtype)
+        xff = xf_b.to(compute_dtype)
+
+        Be = B * H * k_dim
+
+        x_proj = (kf[..., :, None] * vf[..., None, :])
+        x_proj = x_proj.permute(0, 2, 3, 1, 4).reshape(Be, S, v_dim).contiguous()
+        f_t = (
+            xff.permute(0, 2, 1)
+            .unsqueeze(2)
+            .expand(B, H, k_dim, S)
+            .reshape(Be, S)
+            .contiguous()
+        )
+        W_be = (
+            Wf.unsqueeze(0).unsqueeze(2)
+            .expand(B, H, k_dim, v_dim, v_dim)
+            .reshape(Be, v_dim, v_dim)
+            .contiguous()
+        )
+        if h0 is None:
+            h0_row = torch.zeros(Be, v_dim, device=q.device, dtype=compute_dtype)
+        else:
+            h0_row = h0.to(compute_dtype).reshape(Be, v_dim).contiguous()
+
+        kernel = _select_kernel(
+            config_obj,
+            q_is_cuda=q.is_cuda,
+            q_is_fp32=(compute_dtype == torch.float32),
+        )
+        use_triton = kernel == "triton"
+
+        with torch.no_grad():
+            h_star = _solve_fixed_point(
+                x_proj=x_proj, f_t=f_t, W_be=W_be, h0_row=h0_row,
+                config=config_obj, use_triton=use_triton,
+            )
+
+        h_btehv = h_star.view(B, H, k_dim, S, v_dim).permute(0, 3, 1, 2, 4)
+        out = torch.einsum("bshk,bshkv->bshv", qf, h_btehv)
+        h_final = h_btehv[:, -1].contiguous()
+
+        # Save for backward.
+        ctx.save_for_backward(q, k, v, W, xf, h0 if h0 is not None else torch.empty(0),
+                              h_star, qf)
+        ctx.h0_is_none = h0 is None
+        ctx.shapes = (B, S, n_q, n_k, n_v, n_w, n_f, H, k_dim, v_dim, Be)
+        ctx.dtypes = (compute_dtype, out_dtype)
+        ctx.config = config_obj
+        ctx.use_triton = use_triton
+
+        return out.to(out_dtype), h_final.to(out_dtype)
+
+    @staticmethod
+    def backward(ctx, grad_out, grad_h_final):
+        q, k, v, W, xf, h0_saved, h_star, qf = ctx.saved_tensors
+        h0 = None if ctx.h0_is_none else h0_saved
+        B, S, n_q, n_k, n_v, n_w, n_f, H, k_dim, v_dim = ctx.shapes[:10]
+        Be = ctx.shapes[10]
+        compute_dtype, _ = ctx.dtypes
+        config_obj = ctx.config
+        use_triton = ctx.use_triton
+
+        grad_out_f = grad_out.to(compute_dtype)
+        grad_h_final_f = (
+            grad_h_final.to(compute_dtype)
+            if grad_h_final is not None else None
+        )
+
+        # ----- output projection backward ------------------------------------
+        # out[b,s,h,v] = sum_k qf[b,s,h,k] * h_star_view[b,s,h,k,v]
+        # grad_qf_full[b,s,h,k] = sum_v grad_out[b,s,h,v] * h_star_view[b,s,h,k,v]
+        # grad_h*_full[b,s,h,k,v] = grad_out[b,s,h,v] * qf[b,s,h,k]
+        h_star_view = h_star.view(B, H, k_dim, S, v_dim).permute(0, 3, 1, 2, 4)
+        # (B, S, H, k_dim, V)
+        grad_qf_full = torch.einsum("bshv,bshkv->bshk", grad_out_f, h_star_view)
+        grad_h_star_full = torch.einsum(
+            "bshv,bshk->bshkv", grad_out_f, qf,
+        )  # (B, S, H, k_dim, V)
+        if grad_h_final_f is not None:
+            # grad_h_final has shape (B, H, k_dim, V); add to t = S-1.
+            grad_h_star_full[:, -1] = grad_h_star_full[:, -1] + grad_h_final_f.to(
+                compute_dtype
+            )
+        # Reshape to (Be, S, V) matching h_star.
+        # h_star_view permutation was (0, 3, 1, 2, 4); inverse gets us back to
+        # (B, H, k_dim, S, V) -> (Be, S, V).
+        grad_h_star = (
+            grad_h_star_full.permute(0, 2, 3, 1, 4)  # (B, H, k_dim, S, V)
+            .reshape(Be, S, v_dim).contiguous()
+        )
+
+        # ----- recompute the broadcast inputs we need for adjoint solve ------
+        q_b = q.repeat_interleave(H // n_q, dim=-2) if n_q != H else q
+        k_b = k.repeat_interleave(H // n_k, dim=-2) if n_k != H else k
+        v_b = v.repeat_interleave(H // n_v, dim=-2) if n_v != H else v
+        W_b = W.repeat_interleave(H // n_w, dim=0) if n_w != H else W
+        xf_b = xf.repeat_interleave(H // n_f, dim=-1) if n_f != H else xf
+
+        with torch.no_grad():
+            kf_d = k_b.to(compute_dtype)
+            vf_d = v_b.to(compute_dtype)
+            Wf_d = W_b.to(compute_dtype)
+            xff_d = xf_b.to(compute_dtype)
+            x_proj = (kf_d[..., :, None] * vf_d[..., None, :])
+            x_proj = x_proj.permute(0, 2, 3, 1, 4).reshape(Be, S, v_dim).contiguous()
+            f_t = (
+                xff_d.permute(0, 2, 1).unsqueeze(2)
+                .expand(B, H, k_dim, S).reshape(Be, S).contiguous()
+            )
+            W_be = (
+                Wf_d.unsqueeze(0).unsqueeze(2)
+                .expand(B, H, k_dim, v_dim, v_dim)
+                .reshape(Be, v_dim, v_dim).contiguous()
+            )
+            if h0 is None:
+                h0_row = torch.zeros(Be, v_dim, device=q.device, dtype=compute_dtype)
+            else:
+                h0_row = h0.to(compute_dtype).reshape(Be, v_dim).contiguous()
+
+            lam = _solve_adjoint_chunked(
+                grad_h_star=grad_h_star, h_star=h_star.detach(),
+                x_proj=x_proj, f_t=f_t, W_be=W_be, h0_row=h0_row,
+                config=config_obj, use_triton=use_triton,
+            )
+
+        # ----- parameter VJPs via autograd.grad against F --------------------
+        # Build F = h_star - f * h_prev - (1-f) * tanh(h_prev @ W + x_proj)
+        # with the parameters as differentiable inputs.
+        with torch.enable_grad():
+            k_var = k.detach().to(compute_dtype).requires_grad_(True)
+            v_var = v.detach().to(compute_dtype).requires_grad_(True)
+            W_var = W.detach().to(compute_dtype).requires_grad_(True)
+            xf_var = xf.detach().to(compute_dtype).requires_grad_(True)
+            if h0 is None:
+                h0_var = None
+            else:
+                h0_var = h0.detach().to(compute_dtype).requires_grad_(True)
+
+            # Broadcast within the autograd graph.
+            kb = k_var.repeat_interleave(H // n_k, dim=-2) if n_k != H else k_var
+            vb = v_var.repeat_interleave(H // n_v, dim=-2) if n_v != H else v_var
+            Wb = W_var.repeat_interleave(H // n_w, dim=0) if n_w != H else W_var
+            xfb = xf_var.repeat_interleave(H // n_f, dim=-1) if n_f != H else xf_var
+
+            x_proj_g = (kb[..., :, None] * vb[..., None, :])
+            x_proj_g = x_proj_g.permute(0, 2, 3, 1, 4).reshape(Be, S, v_dim)
+            f_t_g = (
+                xfb.permute(0, 2, 1).unsqueeze(2)
+                .expand(B, H, k_dim, S).reshape(Be, S)
+            )
+            W_be_g = (
+                Wb.unsqueeze(0).unsqueeze(2)
+                .expand(B, H, k_dim, v_dim, v_dim)
+                .reshape(Be, v_dim, v_dim)
+            )
+            if h0_var is None:
+                h0_row_g = torch.zeros(Be, v_dim, device=q.device, dtype=compute_dtype)
+            else:
+                h0_row_g = h0_var.reshape(Be, v_dim)
+
+            h_star_d = h_star.detach()
+            h_prev_g = torch.cat([h0_row_g[:, None, :], h_star_d[:, :-1, :]], dim=1)
+            z_g = torch.einsum("btv,bvw->btw", h_prev_g, W_be_g) + x_proj_g
+            h_new_g = torch.tanh(z_g)
+            f_b_g = f_t_g[..., None]
+            F = h_star_d - f_b_g * h_prev_g - (1.0 - f_b_g) * h_new_g
+
+            inputs = [k_var, v_var, W_var, xf_var]
+            if h0_var is not None:
+                inputs.append(h0_var)
+            grads = torch.autograd.grad(
+                F, inputs, grad_outputs=lam, allow_unused=False, retain_graph=False,
+            )
+
+        grad_k_b = grads[0]
+        grad_v_b = grads[1]
+        grad_W_b = grads[2]
+        grad_xf_b = grads[3]
+        grad_h0_b = grads[4] if h0_var is not None else None
+
+        # ----- grad_q (no IFT, direct from output projection) ----------------
+        # grad_qf_full lives at the broadcast shape (B, S, H, k_dim); reduce to
+        # the original (B, S, n_q, k_dim) by undoing repeat_interleave.
+        grad_q_b = grad_qf_full
+
+        def _undo_repeat_interleave(g, n_orig, full_dim):
+            """Undo ``repeat_interleave(H // n_orig, dim=full_dim)`` by summing
+            over the inner repeat groups.
+            """
+            if n_orig == H:
+                return g
+            r = H // n_orig
+            shape = list(g.shape)
+            assert shape[full_dim] == H
+            new_shape = shape[:full_dim] + [n_orig, r] + shape[full_dim + 1:]
+            return g.view(new_shape).sum(dim=full_dim + 1)
+
+        # grad_k/v/W/xf come from torch.autograd.grad against the un-broadcast
+        # variables -- broadcast reduction is already absorbed by autograd.
+        grad_q = _undo_repeat_interleave(grad_q_b, n_q, full_dim=2)
+        grad_k = grad_k_b
+        grad_v = grad_v_b
+        grad_W = grad_W_b
+        grad_xf = grad_xf_b
+
+        grad_q = grad_q.to(q.dtype)
+        grad_k = grad_k.to(k.dtype)
+        grad_v = grad_v.to(v.dtype)
+        grad_W = grad_W.to(W.dtype)
+        grad_xf = grad_xf.to(xf.dtype)
+        grad_h0 = grad_h0_b.to(h0.dtype) if grad_h0_b is not None else None
+
+        return grad_q, grad_k, grad_v, grad_W, grad_xf, grad_h0, None
+
+
+# ---------------------------------------------------------------------------
 # Public reference forward
 # ---------------------------------------------------------------------------
 
@@ -224,11 +703,23 @@ def m2rnn_pararnn_forward(
     """Newton + parallel-scan forward. Drop-in shape-compatible with
     ``_torch_m2rnn_forward`` from ``m2rnn_spec.py``.
 
+    Routes through :class:`_M2RNNPararnnFn` (autograd Function with an IFT
+    backward) whenever any input has ``requires_grad`` and grad is enabled;
+    otherwise runs the solver directly under ``no_grad``.
+
     Returns
     -------
     out: (B, S, H, v_dim)
     h_final: (B, H, k_dim, v_dim)
     """
+    grad_enabled = torch.is_grad_enabled() and any(
+        t is not None and t.requires_grad
+        for t in (q, k, v, W, xf, h0)
+    )
+    if grad_enabled:
+        return _M2RNNPararnnFn.apply(q, k, v, W, xf, h0, config)
+
+    # No-grad path: run solver directly without the autograd machinery.
     B, S, n_q, k_dim = q.shape
     n_k = k.size(-2)
     n_v = v.size(-2)
@@ -237,7 +728,6 @@ def m2rnn_pararnn_forward(
     v_dim = v.size(-1)
     H = max(n_q, n_k, n_v, n_w, n_f)
 
-    # Broadcast head dims to the union -- same convention as the reference.
     if n_q != H:
         q = q.repeat_interleave(H // n_q, dim=-2)
     if n_k != H:
@@ -249,10 +739,6 @@ def m2rnn_pararnn_forward(
     if n_f != H:
         xf = xf.repeat_interleave(H // n_f, dim=-1)
 
-    # Newton/scan math runs in at least fp32: we follow ParaRNN's CUDA
-    # wrappers, which up-cast jac+rhs to fp32 for bf16/fp16 inputs. fp64
-    # callers (tests, debugging) keep fp64 -- otherwise we'd cap precision
-    # at the fp32 floor (~1e-7), defeating the convergence guarantee.
     compute_dtype = torch.promote_types(torch.float32, q.dtype)
     out_dtype = q.dtype
 
@@ -264,191 +750,37 @@ def m2rnn_pararnn_forward(
 
     Be = B * H * k_dim
 
-    # ----- pre-compute x_proj = k * v  for every (b, s, h, k_idx)
-    # m2rnn step: h_new = tanh(h_{t-1} W + x_t) where x_t[k_idx, :] = k_t[k_idx] * v_t[:]
-    # -> for fixed (b, h, k_idx), x_proj[b, h, k_idx, s, v] = k[b, s, h, k_idx] * v[b, s, h, v].
-    # Permute to (Be, S, V).
-    x_proj = (
-        kf[..., :, None] * vf[..., None, :]
-    )  # (B, S, H, k_dim, v_dim)
+    x_proj = (kf[..., :, None] * vf[..., None, :])
     x_proj = x_proj.permute(0, 2, 3, 1, 4).reshape(Be, S, v_dim).contiguous()
-
-    # ----- broadcast forget to per-(b, h, k_idx, t)
-    # xf is (B, S, H); each k_idx of a head shares the same gate.
     f_t = (
-        xff.permute(0, 2, 1)  # (B, H, S)
-        .unsqueeze(2)         # (B, H, 1, S)
-        .expand(B, H, k_dim, S)
-        .reshape(Be, S)
-        .contiguous()
+        xff.permute(0, 2, 1).unsqueeze(2)
+        .expand(B, H, k_dim, S).reshape(Be, S).contiguous()
     )
-
-    # ----- per-row weight matrix; W is (H, V, V). For chain (b, h, k_idx)
-    # the weight is W[h] regardless of k_idx, so flatten to (Be, V, V).
     W_be = (
-        Wf.unsqueeze(0)        # (1, H, V, V)
-        .unsqueeze(2)          # (1, H, 1, V, V)
+        Wf.unsqueeze(0).unsqueeze(2)
         .expand(B, H, k_dim, v_dim, v_dim)
-        .reshape(Be, v_dim, v_dim)
-        .contiguous()
+        .reshape(Be, v_dim, v_dim).contiguous()
     )
-
-    # ----- initial h0 broadcast to per-row state (Be, V)
     if h0 is None:
         h0_row = torch.zeros(Be, v_dim, device=q.device, dtype=compute_dtype)
     else:
-        # h0: (B, H, k_dim, v_dim) -> (Be, V)
         h0_row = h0.to(compute_dtype).reshape(Be, v_dim).contiguous()
-
-    # ----- initial guess for the trajectory
-    if config.init_strategy == "zero":
-        h = torch.zeros(Be, S, v_dim, device=q.device, dtype=compute_dtype)
-    elif config.init_strategy == "chunk":
-        # cheap sequential sweep, useful when Newton needs a warm start.
-        h = torch.empty(Be, S, v_dim, device=q.device, dtype=compute_dtype)
-        h_cur = h0_row
-        for t in range(S):
-            z = torch.einsum("bv,bvj->bj", h_cur, W_be) + x_proj[:, t]
-            h_new = torch.tanh(z)
-            f_bcast = f_t[:, t, None]
-            h_cur = f_bcast * h_cur + (1.0 - f_bcast) * h_new
-            h[:, t] = h_cur
-    else:
-        raise ValueError(f"unknown init_strategy: {config.init_strategy}")
-
-    # ----- Newton iterations (streaming chunked) ----------------------------
-    # System per chain (size S):  I * dh_t + A_t * dh_{t-1} = -F_t.
-    # We never materialise the full (Be, S, V, V) Jacobian: each Newton iter
-    # walks the sequence chunk-by-chunk, building only the current chunk's
-    # residual + Jacobian, running within-chunk Brent-Kung in place, and
-    # propagating ``h_last`` (for the next chunk's residual) and
-    # ``delta_last`` (for the next chunk's row-0 absorption).
-    #
-    # Peak working memory:
-    #     residual_chunk + jac_chunk + h_chunk + rhs_chunk + delta_chunk
-    #   ~ 3 * Be * C * V (state-like) + Be * C * V * V (Jacobian)
-    # For B=4, S=4096, H=44, k=64, V=16, C=128: jac chunk = 1.4 GiB, state
-    # chunks ~85 MiB each. The previous full-S path materialised a 47 GiB
-    # Jacobian, which OOMs every GPU we ship to.
-    #
-    # Cross-chunk dependency makes this O(n_chunks + log C) sequential depth
-    # rather than O(log S). For S=4096 / C=128 that is 32 + 7 = 39 versus 12
-    # full-parallel; the trade is worth the memory saving and is what makes
-    # the Triton port (Phase B.2) viable on a single SM's smem budget.
-    chunk_size = config.chunk_size if config.chunk_size > 0 else S
-    n_chunks = (S + chunk_size - 1) // chunk_size
 
     kernel = _select_kernel(
         config,
         q_is_cuda=q.is_cuda,
         q_is_fp32=(compute_dtype == torch.float32),
     )
-    grad_enabled = torch.is_grad_enabled() and any(
-        t.requires_grad for t in (q, k, v, W, xf)
-    )
-    if kernel == "triton" and grad_enabled:
-        # Triton kernels do not have autograd registered; gradient flow would
-        # silently break.  Phase C wraps this in an autograd.Function with an
-        # IFT backward.  Until then: explicit "triton" raises (so users know
-        # they asked for the unsupported config); "auto" falls back to torch.
-        env = os.environ.get("CPPMEGA_M2RNN_PARARNN_KERNEL")
-        explicit = (env == "triton") or (config.kernel == "triton" and env != "torch")
-        if explicit:
-            raise RuntimeError(
-                "kernel='triton' is only supported under torch.no_grad() — "
-                "wrap your call site or use kernel='torch'/'auto' for "
-                "differentiable forward"
-            )
-        kernel = "torch"
     use_triton = kernel == "triton"
 
-    for newton_iter in range(config.max_its):
-        prev_h_last = h0_row                                           # (Be, V)
-        prev_delta_last = torch.zeros_like(h0_row)                     # (Be, V)
-        max_residual = 0.0  # for optional convergence check
+    h = _solve_fixed_point(
+        x_proj=x_proj, f_t=f_t, W_be=W_be, h0_row=h0_row,
+        config=config, use_triton=use_triton,
+    )
 
-        for c_idx in range(n_chunks):
-            c_start = c_idx * chunk_size
-            c_end = min(c_start + chunk_size, S)
-            h_c = h[:, c_start:c_end]                                  # (Be, C, V)
-            x_c = x_proj[:, c_start:c_end]
-            f_c = f_t[:, c_start:c_end]
-
-            if use_triton:
-                # Triton kernel needs contiguous fp32 inputs.  ``h_c``,
-                # ``x_c``, ``f_c`` are slices of larger tensors so they
-                # need ``.contiguous()`` to satisfy the kernel's stride
-                # assumptions.
-                residual_c, jac_c = _residual_jac_triton(
-                    h_c.contiguous(), x_c.contiguous(), f_c.contiguous(),
-                    W_be, prev_h_last.contiguous(),
-                    block_c=config.triton_block_c,
-                )
-            else:
-                residual_c, jac_c = _residual_jac_chunk(
-                    h_chunk=h_c, x_chunk=x_c, f_chunk=f_c,
-                    W_be=W_be, prev_h_last=prev_h_last,
-                )
-            rhs_c = -residual_c                                        # (Be, C, V)
-
-            if config.abs_tol > 0.0 or config.rel_tol > 0.0:
-                # Track max ||F_t||_inf across all chunks for the iter-level
-                # convergence check.
-                with torch.no_grad():
-                    chunk_max = residual_c.abs().amax().item()
-                if chunk_max > max_residual:
-                    max_residual = chunk_max
-
-            if c_start > 0:
-                # Absorb the previous chunk's tail delta into the first row's RHS.
-                rhs_c = rhs_c.clone()
-                rhs_c[:, 0] = rhs_c[:, 0] - torch.einsum(
-                    "bij,bj->bi", jac_c[:, 0], prev_delta_last,
-                )
-                # Zero the row-0 subdiagonal so the within-chunk scan sees a
-                # left boundary of zero (the absorbed delta is already in rhs).
-                jac_c = jac_c.clone()
-                jac_c[:, 0] = 0
-            else:
-                # First chunk: row-0 already references h0_row in the residual,
-                # so no delta to absorb. But the Brent-Kung scan still needs
-                # jac[0] zeroed for safety (matches apple's _reduction_step_dense).
-                jac_c = jac_c.clone()
-                jac_c[:, 0] = 0
-
-            if use_triton:
-                delta_c = _scan_triton(jac_c, rhs_c.contiguous())
-            else:
-                delta_c = _parallel_reduce_dense(jac_c, rhs_c.contiguous())
-            # Update h_traj for this chunk; out-of-place to keep autograd happy.
-            h = torch.cat(
-                [h[:, :c_start], h_c + config.omega_sor * delta_c, h[:, c_end:]],
-                dim=1,
-            )
-
-            # Carry forward for the next chunk.
-            prev_h_last = h[:, c_end - 1]                              # (Be, V)
-            prev_delta_last = delta_c[:, -1]                           # (Be, V)
-
-        # Iteration-level convergence check.
-        if config.abs_tol > 0.0 and max_residual < config.abs_tol:
-            break
-        if newton_iter == 0:
-            iter0_residual = max_residual
-        elif (
-            config.rel_tol > 0.0
-            and iter0_residual > 0.0
-            and max_residual / iter0_residual < config.rel_tol
-        ):
-            break
-
-    # ----- output projection: out_t = q_t @ h_t (per (b, h, k_idx, t))
-    # h is (Be=B*H*k_dim, S, V); q is (B, S, H, k_dim).
-    h_btehv = h.view(B, H, k_dim, S, v_dim).permute(0, 3, 1, 2, 4)  # (B, S, H, k_dim, V)
-    out = torch.einsum("bshk,bshkv->bshv", qf, h_btehv)  # (B, S, H, V)
-
-    # Final hidden state at t=S-1 in the (B, H, k_dim, V) layout.
-    h_final = h_btehv[:, -1].contiguous()  # (B, H, k_dim, V)
+    h_btehv = h.view(B, H, k_dim, S, v_dim).permute(0, 3, 1, 2, 4)
+    out = torch.einsum("bshk,bshkv->bshv", qf, h_btehv)
+    h_final = h_btehv[:, -1].contiguous()
 
     return out.to(out_dtype), h_final.to(out_dtype)
 

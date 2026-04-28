@@ -466,8 +466,9 @@ def test_triton_matches_sequential_fp32():
 
 
 @_NEED_TRITON
-def test_triton_requires_no_grad():
-    """Calling the Triton path with grad enabled must raise (no autograd)."""
+def test_triton_supports_grad_via_ift():
+    """Phase C: kernel='triton' under torch.enable_grad() must run the
+    autograd Function (IFT backward), not raise."""
     device = "cuda"
     B, S, H, k_dim, v_dim = 1, 32, 2, 4, 16
     dtype = torch.float32
@@ -475,10 +476,12 @@ def test_triton_requires_no_grad():
     q, k, v, W, xf = _make_inputs(B, S, H, k_dim, v_dim, device=device, dtype=dtype)
     q.requires_grad_(True)
 
-    with pytest.raises(RuntimeError, match="torch.no_grad"):
-        m2rnn_pararnn_forward(
-            q, k, v, W, xf, config=PararnnConfig(max_its=4, kernel="triton"),
-        )
+    out, _ = m2rnn_pararnn_forward(
+        q, k, v, W, xf, config=PararnnConfig(max_its=4, kernel="triton"),
+    )
+    out.sum().backward()
+    assert q.grad is not None
+    assert torch.isfinite(q.grad).all()
 
 
 @_NEED_TRITON
@@ -496,3 +499,122 @@ def test_triton_auto_falls_back_for_fp64():
     )
     # Newton-converged → matches sequential to fp64 precision.
     torch.testing.assert_close(out_par, out_seq, atol=1e-10, rtol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Phase C: IFT backward via torch.autograd.Function
+# ---------------------------------------------------------------------------
+
+
+def _ift_grad_check(*, kernel, dtype, device, atol, rtol, B=1, S=16, H=2,
+                     k_dim=4, v_dim=4, with_h0=False):
+    q, k, v, W, xf = _make_inputs(B, S, H, k_dim, v_dim, device=device, dtype=dtype)
+    target = torch.randn(B, S, H, v_dim, device=device, dtype=dtype)
+    h0 = (torch.randn(B, H, k_dim, v_dim, device=device, dtype=dtype) * 0.3
+          if with_h0 else None)
+
+    # Sequential reference grads.
+    q_s, k_s, v_s, W_s, xf_s = (t.clone().requires_grad_() for t in (q, k, v, W, xf))
+    h0_s = h0.clone().requires_grad_() if with_h0 else None
+    out_s, _ = _torch_m2rnn_forward(q_s, k_s, v_s, W_s, xf_s, h0=h0_s)
+    loss_s = (out_s - target).pow(2).mean()
+    loss_s.backward()
+
+    # IFT grads.
+    q_p, k_p, v_p, W_p, xf_p = (t.clone().requires_grad_() for t in (q, k, v, W, xf))
+    h0_p = h0.clone().requires_grad_() if with_h0 else None
+    out_p, _ = m2rnn_pararnn_forward(
+        q_p, k_p, v_p, W_p, xf_p, h0=h0_p,
+        config=PararnnConfig(max_its=10, kernel=kernel),
+    )
+    loss_p = (out_p - target).pow(2).mean()
+    loss_p.backward()
+
+    torch.testing.assert_close(q_p.grad, q_s.grad, atol=atol, rtol=rtol)
+    torch.testing.assert_close(k_p.grad, k_s.grad, atol=atol, rtol=rtol)
+    torch.testing.assert_close(v_p.grad, v_s.grad, atol=atol, rtol=rtol)
+    torch.testing.assert_close(W_p.grad, W_s.grad, atol=atol, rtol=rtol)
+    torch.testing.assert_close(xf_p.grad, xf_s.grad, atol=atol, rtol=rtol)
+    if with_h0:
+        torch.testing.assert_close(h0_p.grad, h0_s.grad, atol=atol, rtol=rtol)
+        return h0_p.grad
+
+
+def test_ift_backward_torch_kernel_matches_sequential():
+    """IFT backward (torch kernel, CPU fp64) matches sequential autograd
+    to a tighter tolerance than the original autograd-through-Newton path."""
+    _ift_grad_check(
+        kernel="torch", dtype=torch.float64, device="cpu",
+        atol=1e-9, rtol=1e-9,
+    )
+
+
+@_NEED_TRITON
+def test_ift_backward_triton_kernel_matches_sequential():
+    """IFT backward with the Triton kernel (CUDA fp32) matches the
+    sequential reference within the fp32 floor."""
+    _ift_grad_check(
+        kernel="triton", dtype=torch.float32, device="cuda",
+        atol=2e-3, rtol=2e-3, S=32, k_dim=8, v_dim=16,
+    )
+
+
+def test_ift_backward_h0_grad():
+    """Non-zero h0 with requires_grad: grad_h0 must be finite and non-zero."""
+    grad_h0 = _ift_grad_check(
+        kernel="torch", dtype=torch.float64, device="cpu",
+        atol=1e-9, rtol=1e-9, with_h0=True,
+    )
+    assert torch.isfinite(grad_h0).all()
+    assert grad_h0.abs().max() > 0
+
+
+def test_ift_backward_short_sequence_T1():
+    """T=1 sanity: adjoint solve degenerates to λ[0] = -grad_h*[0]."""
+    _ift_grad_check(
+        kernel="torch", dtype=torch.float64, device="cpu",
+        atol=1e-9, rtol=1e-9, S=1,
+    )
+
+
+def test_ift_backward_short_sequence_T2():
+    """T=2 sanity: smallest non-trivial adjoint coupling."""
+    _ift_grad_check(
+        kernel="torch", dtype=torch.float64, device="cpu",
+        atol=1e-9, rtol=1e-9, S=2,
+    )
+
+
+def test_ift_backward_broadcast_heads():
+    """n_q < H: backward must reduce over the broadcast axis to recover
+    the original (B, S, n_q, k_dim) gradient shape."""
+    device = "cpu"
+    dtype = torch.float64
+    B, S, k_dim, v_dim = 1, 16, 4, 4
+
+    g = torch.Generator(device=device).manual_seed(0)
+    q = torch.randn(B, S, 1, k_dim, generator=g, dtype=dtype) * 0.5
+    k = torch.randn(B, S, 2, k_dim, generator=g, dtype=dtype) * 0.5
+    v = torch.randn(B, S, 4, v_dim, generator=g, dtype=dtype) * 0.5
+    W = torch.randn(4, v_dim, v_dim, generator=g, dtype=dtype) * 0.2
+    xf = torch.sigmoid(torch.randn(B, S, 4, generator=g, dtype=dtype) - 0.5)
+    target = torch.randn(B, S, 4, v_dim, dtype=dtype)  # output shape (B,S,H=4,V)
+
+    q_s, k_s, v_s, W_s, xf_s = (t.clone().requires_grad_() for t in (q, k, v, W, xf))
+    out_s, _ = _torch_m2rnn_forward(q_s, k_s, v_s, W_s, xf_s)
+    (out_s - target).pow(2).mean().backward()
+
+    q_p, k_p, v_p, W_p, xf_p = (t.clone().requires_grad_() for t in (q, k, v, W, xf))
+    out_p, _ = m2rnn_pararnn_forward(
+        q_p, k_p, v_p, W_p, xf_p,
+        config=PararnnConfig(max_its=10, kernel="torch"),
+    )
+    (out_p - target).pow(2).mean().backward()
+
+    assert q_p.grad.shape == q.shape
+    assert k_p.grad.shape == k.shape
+    torch.testing.assert_close(q_p.grad, q_s.grad, atol=1e-9, rtol=1e-9)
+    torch.testing.assert_close(k_p.grad, k_s.grad, atol=1e-9, rtol=1e-9)
+    torch.testing.assert_close(v_p.grad, v_s.grad, atol=1e-9, rtol=1e-9)
+    torch.testing.assert_close(W_p.grad, W_s.grad, atol=1e-9, rtol=1e-9)
+    torch.testing.assert_close(xf_p.grad, xf_s.grad, atol=1e-9, rtol=1e-9)
