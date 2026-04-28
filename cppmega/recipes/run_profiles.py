@@ -26,6 +26,7 @@ Fp8Format = Literal["hybrid", "e4m3"]
 Fp8Recipe = Literal["off", "tensorwise", "mxfp8"]
 Mxfp8BackwardBackend = Literal["te_tn_adapter", "flashinfer_cutlass", "cutlass_native"]
 Mxfp8TransposeEmitBackend = Literal["auto", "te", "off"]
+Mxfp8FlashinferRunner = Literal["mm_mxfp8", "direct_tactic"]
 ParamStorage = Literal["auto", "bf16", "mxfp8"]
 SparseMlaMode = Literal["tilelang", "gather_scatter", "pytorch"]
 MoeDispatcher = Literal["flex", "alltoall", "allgather"]
@@ -92,9 +93,12 @@ class TrainingProfile:
 class PrecisionProfile:
     """Precision and kernel-route choices for the launch."""
 
-    # Tensorwise FP8 is the conservative GB10 lane.  MXFP8 routes clean GEMMs
-    # through TE payload + FlashInfer/CUTLASS layout_128x4 by default; the old
-    # compact direct CUTLASS loader remains an explicit experiment.
+    # Tensorwise FP8 is the conservative GB10 lane.  Dense MXFP8 Linear GEMMs
+    # route clean GEMM calls through TE payload + FlashInfer/CUTLASS
+    # layout_128x4 by default; the old compact direct CUTLASS loader remains
+    # an explicit experiment.  This is not the attention backend: attention is
+    # controlled separately by ``attention_backend`` and local GB10 pins it to
+    # patched FA4.
     # ``auto`` would hide the important contract here, so the resolved profile
     # owns the exact TE fp8 format: tensorwise keeps HYBRID, while MXFP8 uses
     # E4M3 because FlashInfer/CUTLASS ``mm_mxfp8`` accepts E4M3 payloads only.
@@ -103,7 +107,7 @@ class PrecisionProfile:
     sparse_mla_fp8_quant: str = "te_tensorwise"
     # Keep --use-flash-attn enabled for accelerated TE attention paths, but let
     # the launcher choose the concrete Megatron backend explicitly.  Local GB10
-    # overrides this to auto because forced flash currently selects FA4 on sm_121.
+    # pins this to flash through the patched FA4 SM120 source tree.
     use_flash_attention: bool = True
     attention_backend: AttentionBackend = "flash"
     # These fields are consumed only when fp8_recipe == "mxfp8" or a TE precision
@@ -116,6 +120,10 @@ class PrecisionProfile:
     mxfp8_transpose_emit_backend: Mxfp8TransposeEmitBackend = "te"
     mxfp8_transpose_emit_swizzled: bool = True
     mxfp8_transpose_emit_strict: bool = True
+    # FlashInfer's public mm_mxfp8 path owns autotuning. direct_tactic bypasses
+    # that layer and is only for shape/tactic probes when nsys shows overhead.
+    mxfp8_flashinfer_runner: Mxfp8FlashinferRunner = "mm_mxfp8"
+    mxfp8_flashinfer_tactic: int = 0
     # Megatron's MXFP8 param-gather path requires distributed optimizer/FSDP.
     # Keep it as an explicit profile choice so single-GB10 local runs do not
     # accidentally enable an incompatible distributed-param contract.
@@ -163,6 +171,7 @@ class RuntimePatchProfile:
     mamba3_mimo: bool = True
     mamba_num_groups: int = 8
     mamba_recompute: bool = True
+    noconv_mamba_chunk_size: int | None = None
     dsa_sparse_mode: SparseMlaMode = "tilelang"
     dsa_fp8_attention: bool = False
     # NOTE: same name as ModelProfile.dsa_indexer_loss_coeff but semantically
@@ -176,7 +185,17 @@ class RuntimePatchProfile:
     structure_enabled: bool = True
     structure_components: str = "core"
     mtp_ce_kernel: MtpCEKernel = "native"
+    # Experimental CCE launch fusion for main+MTP heads. Real GB10 A/B on
+    # 2026-04-28 was finite but slower, so this stays off unless explicitly
+    # requested by a profile/CLI override.
+    cce_fuse_main_mtp_ce: bool = False
     acknowledge_liger_mtp_ce_deprecated: bool = False
+    # Local source overrides that must be part of the typed launch contract.
+    # The GB10 FA4/TE fixes are source-tree patches, not installed PyPI wheels;
+    # without these roots first on PYTHONPATH the process can import a mixed
+    # flash-attn package and silently miss the SM120 guard/fallback fixes.
+    transformer_engine_source: str | None = "/home/dave/TransformerEngine"
+    flash_attention_source: str | None = "/home/dave/flash-attention-fa4"
 
 
 @dataclass
@@ -196,6 +215,10 @@ class ProfilingProfile:
     nsys_capture_mode: NsysCaptureMode = "full"
     nsys_trace: str = "cuda-sw,nvtx,osrt"
     nsys_delay: int = 0
+    # ``0`` means "collect from delay until normal process exit".  On the
+    # local GB10 stack, nsys --duration can terminate the wrapped torchrun child
+    # with SIGTERM after report generation, which makes an otherwise successful
+    # profile look failed to torch.distributed.run.
     nsys_duration: int = 0
     # Megatron cudaProfilerStart/Stop range used by external profilers such as
     # Nsight Compute.  Keep it separate from torch_profile/nsys_profile because
@@ -308,12 +331,18 @@ def _bool(value: bool) -> str:
     return "1" if value else "0"
 
 
+def _validate_noconv_mamba_chunk_size(value: int) -> int:
+    if value <= 0 or value & (value - 1):
+        raise ValueError("--noconv-mamba-chunk-size must be a positive power of two")
+    return value
+
+
 def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProfile:
     """Fill the local GB10 NAM56R-quarter profile.
 
     This is the default correctness lane used on the single-GB10 box: full
     NAM56R width, quarter depth, real 4k clang data, MTP=2, CCE MTP CE, TE
-    attention auto routing, tensorwise FP8, no-master Muon, q8 Muon momentum,
+    patched FA4 SM120 routing, tensorwise FP8, no-master Muon, q8 Muon momentum,
     and disabled contiguous local DDP grad buffer.  It intentionally favors
     debuggability and memory pressure over production H200 throughput.
     """
@@ -326,7 +355,7 @@ def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProf
     # Single-GB10 has TP=EP=1, so Megatron's Flex dispatcher is invalid here.
     # Keep this in the typed profile instead of relying on a shell fallback.
     profile.model.moe_token_dispatcher_type = "alltoall"
-    profile.precision.attention_backend = "auto"
+    profile.precision.attention_backend = "flash"
     # The remaining BF16 GEMM hotspot on GB10 is Muon's Newton-Schulz loop.
     # nanochat's comparable performance presets use 3 iterations; keep this as
     # a typed profile default so runs can restore 5 with --muon-num-ns-steps 5.
@@ -334,6 +363,7 @@ def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProf
     profile.runtime = RuntimePatchProfile(
         mtp_ce_kernel="cce",
         acknowledge_liger_mtp_ce_deprecated=False,
+        noconv_mamba_chunk_size=256,
     )
     return profile
 
@@ -470,6 +500,7 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         "CPPMEGA_STRUCTURE_ENABLED": _bool(profile.runtime.structure_enabled),
         "CPPMEGA_STRUCTURE_COMPONENTS": profile.runtime.structure_components,
         "CPPMEGA_MTP_CE_KERNEL": profile.runtime.mtp_ce_kernel,
+        "CPPMEGA_CCE_FUSE_MAIN_MTP_CE": _bool(profile.runtime.cce_fuse_main_mtp_ce),
         "CPPMEGA_MEMORY_DEBUG": _bool(profile.profiling.memory_debug),
         "CPPMEGA_MEM_PROFILE": _bool(profile.profiling.mem_profile),
         "CPPMEGA_MEM_PROFILE_STEPS": str(profile.profiling.mem_profile_steps),
@@ -488,6 +519,26 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         "HYBRID_LAYER_PATTERN": profile.hybrid_layer_pattern(),
         "NATIVE_ARGS": profile.native_args_fragment(),
     }
+    extra_pythonpath = [
+        path
+        for path in (
+            profile.runtime.flash_attention_source,
+            profile.runtime.transformer_engine_source,
+        )
+        if path
+    ]
+    if extra_pythonpath:
+        env["CPPMEGA_EXTRA_PYTHONPATH"] = ":".join(extra_pythonpath)
+        env["CPPMEGA_FLASH_ATTN_SOURCE_ROOT"] = (
+            profile.runtime.flash_attention_source or ""
+        )
+        env["CPPMEGA_TRANSFORMER_ENGINE_SOURCE_ROOT"] = (
+            profile.runtime.transformer_engine_source or ""
+        )
+    if profile.runtime.noconv_mamba_chunk_size is not None:
+        env["CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE"] = str(
+            _validate_noconv_mamba_chunk_size(profile.runtime.noconv_mamba_chunk_size)
+        )
     if profile.runtime.mtp_ce_kernel == "liger" and profile.runtime.acknowledge_liger_mtp_ce_deprecated:
         env["CPPMEGA_I_UNDERSTAND_MTP_LIGER_CE_IS_DEPRECATED"] = "1"
     if profile.precision.fp8_recipe == "mxfp8":
@@ -509,6 +560,12 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                 ),
                 "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT": _bool(
                     profile.precision.mxfp8_transpose_emit_strict
+                ),
+                "CPPMEGA_FLASHINFER_MXFP8_RUNNER": (
+                    profile.precision.mxfp8_flashinfer_runner
+                ),
+                "CPPMEGA_FLASHINFER_MXFP8_TACTIC": str(
+                    profile.precision.mxfp8_flashinfer_tactic
                 ),
                 "CPPMEGA_FP8_PARAM_GATHER": _bool(profile.precision.fp8_param_gather),
                 "CPPMEGA_REUSE_GRAD_BUF_FOR_MXFP8_PARAM_AG": _bool(
@@ -561,6 +618,12 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
     if args.mtp_ce_kernel is not None:
         profile.runtime.mtp_ce_kernel = args.mtp_ce_kernel
         profile.runtime.acknowledge_liger_mtp_ce_deprecated = args.mtp_ce_kernel == "liger"
+    if args.cce_fuse_main_mtp_ce is not None:
+        profile.runtime.cce_fuse_main_mtp_ce = args.cce_fuse_main_mtp_ce
+    if args.noconv_mamba_chunk_size is not None:
+        profile.runtime.noconv_mamba_chunk_size = _validate_noconv_mamba_chunk_size(
+            args.noconv_mamba_chunk_size
+        )
     if args.fp8_recipe is not None:
         profile.precision.fp8_recipe = args.fp8_recipe
         if args.fp8_recipe == "mxfp8" and args.fp8_format is None:
@@ -577,6 +640,12 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.precision.mxfp8_transpose_emit_swizzled = args.mxfp8_transpose_emit_swizzled
     if args.mxfp8_transpose_emit_strict is not None:
         profile.precision.mxfp8_transpose_emit_strict = args.mxfp8_transpose_emit_strict
+    if args.mxfp8_flashinfer_runner is not None:
+        profile.precision.mxfp8_flashinfer_runner = args.mxfp8_flashinfer_runner
+    if args.mxfp8_flashinfer_tactic is not None:
+        if args.mxfp8_flashinfer_tactic < 0:
+            raise ValueError("--mxfp8-flashinfer-tactic must be non-negative")
+        profile.precision.mxfp8_flashinfer_tactic = args.mxfp8_flashinfer_tactic
     if args.fp8_param_gather is not None:
         profile.precision.fp8_param_gather = args.fp8_param_gather
     if args.reuse_grad_buf_for_mxfp8_param_ag is not None:
@@ -623,8 +692,8 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
     if profile.profiling.nsys_capture_mode != "delay":
         profile.profiling.nsys_delay = 0
         profile.profiling.nsys_duration = 0
-    elif profile.profiling.nsys_duration < 1:
-        raise ValueError("nsys_capture_mode=delay requires --nsys-duration >= 1")
+    elif profile.profiling.nsys_duration < 0:
+        raise ValueError("nsys_capture_mode=delay requires --nsys-duration >= 0")
     if args.cuda_profile:
         profile.profiling.cuda_profile = True
     if args.cuda_profile_step_start is not None:
@@ -682,7 +751,26 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         default=None,
     )
     parser.add_argument("--dsa-indexer-loss-coeff", type=float, default=None)
-    parser.add_argument("--mtp-ce-kernel", choices=("native", "liger", "off"), default=None)
+    parser.add_argument("--mtp-ce-kernel", choices=("native", "cce", "liger", "off"), default=None)
+    cce_fuse = parser.add_mutually_exclusive_group()
+    cce_fuse.add_argument(
+        "--cce-fuse-main-mtp-ce",
+        action="store_true",
+        default=None,
+        dest="cce_fuse_main_mtp_ce",
+    )
+    cce_fuse.add_argument(
+        "--no-cce-fuse-main-mtp-ce",
+        action="store_false",
+        default=None,
+        dest="cce_fuse_main_mtp_ce",
+    )
+    parser.add_argument(
+        "--noconv-mamba-chunk-size",
+        type=int,
+        default=None,
+        help="Override the no-conv Mamba SSD scan chunk size for cppmega specs.",
+    )
     parser.add_argument("--fp8-format", choices=("hybrid", "e4m3"), default=None)
     parser.add_argument("--fp8-recipe", choices=("off", "tensorwise", "mxfp8"), default=None)
     parser.add_argument(
@@ -751,6 +839,18 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         default=None,
         dest="mxfp8_transpose_emit_strict",
+    )
+    parser.add_argument(
+        "--mxfp8-flashinfer-runner",
+        choices=("mm_mxfp8", "direct_tactic"),
+        default=None,
+        help="Select FlashInfer MXFP8 runner mode through the typed profile.",
+    )
+    parser.add_argument(
+        "--mxfp8-flashinfer-tactic",
+        type=int,
+        default=None,
+        help="CUTLASS direct runner tactic for explicit MXFP8 shape probes.",
     )
     parser.add_argument("--optimizer", default=None)
     parser.add_argument("--param-storage", choices=("auto", "bf16", "mxfp8"), default=None)
