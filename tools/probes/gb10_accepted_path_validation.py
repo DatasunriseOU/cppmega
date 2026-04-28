@@ -417,6 +417,89 @@ def run_mxfp8_te_emit_probe(args: argparse.Namespace) -> CheckResult:
     )
 
 
+def run_mxfp8_te_linear_saved_operand_probe(args: argparse.Namespace) -> CheckResult:
+    if args.skip_mxfp8_probe or args.skip_te_emit_probe:
+        return CheckResult(
+            name="mxfp8_te_linear_saved_operand_probe",
+            status="skip",
+            detail="skipped by probe options",
+        )
+
+    available, reason = _probe_prereqs_available(args.probe_timeout_s)
+    if not available and not args.require_mxfp8_probe:
+        return CheckResult(
+            name="mxfp8_te_linear_saved_operand_probe",
+            status="skip",
+            detail=f"CUDA/TE probe prerequisites unavailable: {reason}",
+        )
+
+    cmd = [
+        sys.executable,
+        str(repo_root() / "tools" / "probes" / "te_linear_mxfp8_saved_activation_probe.py"),
+        "--backend",
+        "flashinfer_cutlass",
+        "--m",
+        str(args.m),
+        "--n",
+        str(args.n),
+        "--k",
+        str(args.k),
+    ]
+    env = _base_env()
+    env.update(
+        {
+            "CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER": "1",
+            "CPPMEGA_TE_MXFP8_BWD_BACKEND": "flashinfer_cutlass",
+            "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND": "te",
+            "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED": "1",
+            "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT": "1",
+            "CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK": "0",
+            "CPPMEGA_TE_MXFP8_DGRAD_BF16": "0",
+            "CPPMEGA_TE_MXFP8_WGRAD_BF16": "0",
+            "NVTE_BACKWARD_OVERRIDE": "none",
+        }
+    )
+    proc = subprocess.run(
+        cmd,
+        cwd=repo_root(),
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=args.probe_timeout_s,
+        check=False,
+    )
+    output = _combined_output(proc)
+    if proc.returncode != 0:
+        return CheckResult(
+            name="mxfp8_te_linear_saved_operand_probe",
+            status="fail",
+            detail="te.Linear saved-operand probe failed",
+            data={"returncode": proc.returncode, "output_tail": _tail(output)},
+        )
+    try:
+        report = extract_first_json_object(output)
+    except Exception as exc:
+        return CheckResult(
+            name="mxfp8_te_linear_saved_operand_probe",
+            status="fail",
+            detail=f"could not parse probe output: {type(exc).__name__}: {exc}",
+            data={"output_tail": _tail(output)},
+        )
+    if report.get("status") != "pass":
+        return CheckResult(
+            name="mxfp8_te_linear_saved_operand_probe",
+            status="fail",
+            detail="te.Linear saved-operand report did not pass",
+            data=report,
+        )
+    return CheckResult(
+        name="mxfp8_te_linear_saved_operand_probe",
+        status="pass",
+        detail="TE Linear/autograd saved MXFP8 GEMM-ready operands with zero sidecar registry peak",
+        data={"shim_stats": report.get("shim_stats")},
+    )
+
+
 def validate_training_log(path: Path) -> CheckResult:
     text = path.read_text(encoding="utf-8", errors="replace")
     parsed = parse_training_log(text)
@@ -511,6 +594,7 @@ def main(argv: list[str] | None = None) -> int:
         check_fp8_activation_legacy_gate(),
         run_mxfp8_shim_probe(args),
         run_mxfp8_te_emit_probe(args),
+        run_mxfp8_te_linear_saved_operand_probe(args),
     ]
     if args.train_log is not None:
         checks.append(validate_training_log(args.train_log))
@@ -518,7 +602,12 @@ def main(argv: list[str] | None = None) -> int:
     failed = any(check.status == "fail" for check in checks)
     if args.require_mxfp8_probe:
         failed = failed or any(
-            check.name in ("mxfp8_tn_adapter_probe", "mxfp8_te_transpose_emit_probe")
+            check.name
+            in (
+                "mxfp8_tn_adapter_probe",
+                "mxfp8_te_transpose_emit_probe",
+                "mxfp8_te_linear_saved_operand_probe",
+            )
             and check.status == "skip"
             for check in checks
         )

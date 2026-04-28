@@ -9,13 +9,60 @@ from __future__ import annotations
 
 import os
 import inspect
+from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch.utils.cpp_extension import load_inline
 
 _SUPPORTED_OUT_DTYPES = (torch.bfloat16, torch.float16)
+_RUNNER_ENV = "CPPMEGA_FLASHINFER_MXFP8_RUNNER"
+_TACTIC_ENV = "CPPMEGA_FLASHINFER_MXFP8_TACTIC"
+_DEFAULT_RUNNER_MODE = "mm_mxfp8"
+
+RunnerMode = Literal["mm_mxfp8", "direct_tactic"]
+
+
+@dataclass(frozen=True)
+class FlashinferMxfp8RunnerConfig:
+    """Runtime selection for FlashInfer MXFP8 GEMM dispatch."""
+
+    mode: RunnerMode = _DEFAULT_RUNNER_MODE
+    tactic: int = 0
+
+
+def runner_config(
+    mode: str | None = None,
+    tactic: int | str | None = None,
+) -> FlashinferMxfp8RunnerConfig:
+    """Parse an explicit FlashInfer MXFP8 runner config."""
+
+    raw_mode = _DEFAULT_RUNNER_MODE if mode is None else str(mode).strip().lower()
+    raw_mode = raw_mode.replace("-", "_")
+    aliases = {
+        "default": "mm_mxfp8",
+        "flashinfer": "mm_mxfp8",
+        "mm": "mm_mxfp8",
+        "direct": "direct_tactic",
+        "direct_tactic0": "direct_tactic",
+        "direct_runner": "direct_tactic",
+    }
+    parsed_mode = aliases.get(raw_mode, raw_mode)
+    if parsed_mode not in ("mm_mxfp8", "direct_tactic"):
+        raise ValueError(
+            "FlashInfer MXFP8 runner mode must be one of "
+            f"mm_mxfp8,direct_tactic; got {raw_mode!r}"
+        )
+
+    raw_tactic = 0 if tactic is None else tactic
+    try:
+        parsed_tactic = int(raw_tactic)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"FlashInfer MXFP8 tactic must be an integer, got {raw_tactic!r}") from exc
+    if parsed_tactic < 0:
+        raise ValueError(f"FlashInfer MXFP8 tactic must be non-negative, got {parsed_tactic}")
+    return FlashinferMxfp8RunnerConfig(mode=parsed_mode, tactic=parsed_tactic)  # type: ignore[arg-type]
 
 
 _CPP_SOURCE = r"""
@@ -159,6 +206,27 @@ def _load_flashinfer_mm() -> Any:
     from flashinfer import mm_mxfp8
 
     return mm_mxfp8
+
+
+@lru_cache(maxsize=None)
+def _load_flashinfer_cutlass_runner(major: int) -> Any:
+    from flashinfer.gemm.gemm_base import get_cutlass_mxfp8_gemm_module
+
+    return get_cutlass_mxfp8_gemm_module(major).cutlass_mxfp8_gemm_runner()
+
+
+def runner_config_from_env() -> FlashinferMxfp8RunnerConfig:
+    """Return the launch-profile bridge FlashInfer MXFP8 runner mode.
+
+    Launchers should set these through ``RunProfile.precision`` rather than
+    ad-hoc shell state.  This helper exists because the TE monkey patch is still
+    imported before Megatron passes a normal Python config object around.
+    """
+
+    return runner_config(
+        os.environ.get(_RUNNER_ENV, _DEFAULT_RUNNER_MODE),
+        os.environ.get(_TACTIC_ENV, "0"),
+    )
 
 
 def _rowwise_matrix(tensor: Any) -> tuple[torch.Tensor, torch.Tensor, bool]:
@@ -331,6 +399,37 @@ def check_plain_gemm_kwargs(
     )
 
 
+def _mm_mxfp8_direct(
+    a_data: torch.Tensor,
+    b_data: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    *,
+    out: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    config: FlashinferMxfp8RunnerConfig | None = None,
+) -> torch.Tensor:
+    config = runner_config() if config is None else config
+    a = _as_fp8_payload(a_data)
+    b = _as_fp8_payload(b_data)
+    if out is None:
+        out = torch.empty((a.shape[0], b.shape[1]), device=a.device, dtype=out_dtype)
+
+    from flashinfer.gemm.gemm_base import DEFAULT_WORKSPACE_SIZE, _get_cache_buf
+
+    major, _minor = torch.cuda.get_device_capability(a.device)
+    workspace = _get_cache_buf(
+        "cppmega_flashinfer_mxfp8_direct_workspace",
+        DEFAULT_WORKSPACE_SIZE,
+        a.device,
+    )
+    runner = _load_flashinfer_cutlass_runner(major)
+    return runner.forward(
+        [a, b, a_scale, b_scale, out_dtype, out, workspace],
+        tactic=config.tactic,
+    )
+
+
 def _mm_mxfp8(
     a_data: torch.Tensor,
     b_data: torch.Tensor,
@@ -339,10 +438,26 @@ def _mm_mxfp8(
     *,
     out: torch.Tensor | None,
     out_dtype: torch.dtype,
+    config: FlashinferMxfp8RunnerConfig | None = None,
 ) -> torch.Tensor:
+    config = runner_config_from_env() if config is None else config
+    a = _as_fp8_payload(a_data)
+    b = _as_fp8_payload(b_data)
+    if config.mode == "direct_tactic":
+        if out is None:
+            out = torch.empty((a.shape[0], b.shape[1]), device=a.device, dtype=out_dtype)
+        return _mm_mxfp8_direct(
+            a_data,
+            b_data,
+            a_scale,
+            b_scale,
+            out=out,
+            out_dtype=out_dtype,
+            config=config,
+        )
     return _load_flashinfer_mm()(
-        _as_fp8_payload(a_data),
-        _as_fp8_payload(b_data),
+        a,
+        b,
         a_scale,
         b_scale,
         out=out,
@@ -358,6 +473,7 @@ def fprop_tn_gemm(
     *,
     out: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
+    config: FlashinferMxfp8RunnerConfig | None = None,
 ) -> torch.Tensor:
     """Compute TE ``layout='TN'`` fprop: ``x @ weight.T``."""
 
@@ -374,6 +490,7 @@ def fprop_tn_gemm(
         _scale_for_rowwise_matrix(w_scale, n, k, with_gemm_swizzled_scales=w_swizzled),
         out=out,
         out_dtype=_resolve_out_dtype(out, out_dtype),
+        config=config,
     )
 
 
@@ -383,6 +500,7 @@ def dgrad_nn_gemm(
     *,
     out: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
+    config: FlashinferMxfp8RunnerConfig | None = None,
 ) -> torch.Tensor:
     """Compute TE backward dgrad from ``weight.T`` sidecar and ``dy``."""
 
@@ -399,6 +517,7 @@ def dgrad_nn_gemm(
         _scale_for_rowwise_matrix(wt_scale, k, n, with_gemm_swizzled_scales=wt_swizzled),
         out=out,
         out_dtype=_resolve_out_dtype(out, out_dtype),
+        config=config,
     )
 
 
@@ -408,6 +527,7 @@ def wgrad_nt_gemm(
     *,
     out: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
+    config: FlashinferMxfp8RunnerConfig | None = None,
 ) -> torch.Tensor:
     """Compute TE backward wgrad from ``dy.T`` and ``x.T`` sidecars."""
 
@@ -424,6 +544,7 @@ def wgrad_nt_gemm(
         _scale_for_rowwise_matrix(x_t_scale, k, m, with_gemm_swizzled_scales=x_t_swizzled),
         out=out,
         out_dtype=_resolve_out_dtype(out, out_dtype),
+        config=config,
     )
 
 
@@ -436,9 +557,18 @@ def epilogue_capability_report() -> dict[str, Any]:
         mm_mxfp8_signature = str(inspect.signature(mm_mxfp8))
     except Exception as exc:  # pragma: no cover - host/package dependent
         mm_mxfp8_signature = f"unavailable: {type(exc).__name__}: {exc}"
+    try:
+        runner_config = runner_config_from_env()
+        runner_config_report: dict[str, Any] | str = {
+            "mode": runner_config.mode,
+            "tactic": runner_config.tactic,
+        }
+    except Exception as exc:
+        runner_config_report = f"invalid: {type(exc).__name__}: {exc}"
 
     return {
         "mm_mxfp8_signature": mm_mxfp8_signature,
+        "runner_config": runner_config_report,
         "cutlass_runner_inputs": [
             "a",
             "b",

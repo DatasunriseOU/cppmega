@@ -110,6 +110,7 @@ template <
   int SchedulerPipelineStageCount,
   class ClusterShape,
   class KernelScheduleType,
+  bool UseAuxiliaryLoad,
   class TileShape_,
   class ElementPairA_,
   class StridePairA_,
@@ -125,7 +126,12 @@ template <
   class SmemCopyAtomsB_,
   class TransformB_>
 struct CollectiveMma<
-    MainloopSm120TmaWarpSpecializedBlockScaledCompactScale<Stages, SchedulerPipelineStageCount, ClusterShape, KernelScheduleType>,
+    MainloopSm120TmaWarpSpecializedBlockScaledCompactScale<
+        Stages,
+        SchedulerPipelineStageCount,
+        ClusterShape,
+        KernelScheduleType,
+        UseAuxiliaryLoad>,
     TileShape_,
     ElementPairA_,
     StridePairA_,
@@ -143,7 +149,12 @@ struct CollectiveMma<
   //
   // Type Aliases
   //
-  using DispatchPolicy = MainloopSm120TmaWarpSpecializedBlockScaledCompactScale<Stages, SchedulerPipelineStageCount, ClusterShape, KernelScheduleType>;
+  using DispatchPolicy = MainloopSm120TmaWarpSpecializedBlockScaledCompactScale<
+      Stages,
+      SchedulerPipelineStageCount,
+      ClusterShape,
+      KernelScheduleType,
+      UseAuxiliaryLoad>;
   using TileShape = TileShape_;
   using ElementPairA = ElementPairA_;
   using ElementPairB = ElementPairB_;
