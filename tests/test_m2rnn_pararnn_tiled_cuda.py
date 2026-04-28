@@ -10,6 +10,8 @@ import torch
 from cppmega.megatron.m2rnn_pararnn import PararnnConfig, m2rnn_pararnn_forward
 from cppmega.megatron.m2rnn_pararnn_tiled_cuda import (
     TiledCudaPararnnConfig,
+    _scan_tile_summaries,
+    _scan_tile_summaries_python,
     local_tile_scan_debug,
     memory_accounting_bytes,
     m2rnn_pararnn_tiled_cuda_forward,
@@ -117,6 +119,23 @@ def test_local_tile_scan_matches_direct_sequential_delta_for_zero_guess():
     torch.testing.assert_close(local_prefix, expected_prefix, atol=8e-6, rtol=8e-6)
     torch.testing.assert_close(tile_A, expected_A, atol=8e-6, rtol=8e-6)
     torch.testing.assert_close(tile_b, expected_b, atol=8e-6, rtol=8e-6)
+
+
+def test_cuda_tile_summary_scan_matches_python_reference():
+    B, S, H, K, V = 1, 19, 2, 3, 16
+    tile_size = 5
+    q, k, v, W, xf = _make_inputs(B, S, H, K, V, seed=5)
+    Be = B * H * K
+    h = torch.zeros(Be, S, V, device="cuda", dtype=torch.float32)
+    h0 = torch.zeros(Be, V, device="cuda", dtype=torch.float32)
+
+    _, _, tile_A, tile_b = local_tile_scan_debug(q, k, v, W, xf, h, h0, tile_size=tile_size)
+    tile_inputs_cuda = _scan_tile_summaries(tile_A, tile_b)
+    tile_inputs_python = _scan_tile_summaries_python(tile_A, tile_b)
+    torch.cuda.synchronize()
+
+    assert tuple(tile_inputs_cuda.shape) == tuple(tile_b.shape)
+    torch.testing.assert_close(tile_inputs_cuda, tile_inputs_python, atol=8e-6, rtol=8e-6)
 
 
 def test_production_memory_accounting_excludes_local_prefix():

@@ -140,7 +140,7 @@ def main() -> int:
         "notes": [
             "CUDA kernel does not store per-token Jacobian A[B,S,H,K,V,V].",
             "Production path does not allocate local_prefix[Be,S,V,V]; apply kernel recomputes within-tile prefixes.",
-            "Tile summary scan is still in Python over tile_A/tile_b; local apply is CUDA.",
+            "Tile summary scan over tile_A/tile_b runs on CUDA; the Python loop is retained only as a test reference.",
             "Run with CPPMEGA_VERBOSE_EXT_BUILD=1 after clearing the torch extension cache to see ptxas register/spill lines.",
         ],
     }

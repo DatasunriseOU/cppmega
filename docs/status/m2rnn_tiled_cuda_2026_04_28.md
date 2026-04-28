@@ -2,7 +2,7 @@
 
 Worktree: `/home/dave/source/cppmega/.claude/worktrees/m2rnn-tiled-cuda`  
 Branch: `worker/m2rnn-tiled-cuda`  
-Base commit: `0b7acbc5d18dead10ad206ee5c111e2cb08ab1ef`
+Base commit for this continuation: `c26f237 feat(m2rnn): add tiled CUDA ParaRNN prototype`
 
 ## Scope
 
@@ -16,6 +16,9 @@ This is not the Apple one-thread-per-equation dense-Jacobian port:
 - The kernel does not materialize full per-token Jacobian
   `A[B,S,H,K,V,V]`.
 - The production summary kernel writes only tile summary `(A_tile,b_tile)`.
+- The tile summary scan over `(A_tile,b_tile)` now runs in the CUDA
+  extension; the previous Python `for tile: einsum(...)` path remains only as
+  a test/debug reference.
 - The production apply kernel receives scanned tile carries, recomputes the
   per-token local prefix inside the tile, and writes `delta[Be,S,V]`.
 - `local_prefix[Be,S,V,V]` is no longer allocated in the production forward
@@ -35,27 +38,40 @@ This is not the Apple one-thread-per-equation dense-Jacobian port:
 Device: NVIDIA GB10, CUDA capability `(12, 1)`, PyTorch
 `2.13.0.dev20260417+cu132`.
 
-Commands run:
+Commands run after the GPU summary-scan patch:
 
 ```bash
 python -m py_compile cppmega/megatron/m2rnn_pararnn_tiled_cuda.py tests/test_m2rnn_pararnn_tiled_cuda.py tools/probes/m2rnn_pararnn_tiled_cuda_probe.py
 CPPMEGA_VERBOSE_EXT_BUILD=1 pytest -q tests/test_m2rnn_pararnn_tiled_cuda.py -s
 CPPMEGA_VERBOSE_EXT_BUILD=1 python tools/probes/m2rnn_pararnn_tiled_cuda_probe.py --B 1 --S 33 --H 2 --K 4 --V 16 --tile-size 8 --max-its 6
+BENCH_B=1 BENCH_S=1024 BENCH_H=4 BENCH_K=32 BENCH_V=16 BENCH_WARMUP=1 BENCH_ITERS=3 BENCH_TORCH=0 python scripts/bench_m2rnn.py
 ```
 
 Results:
 
-- CUDA test run: `6 passed, 19 warnings`.
+- CUDA test run: `7 passed, 19 warnings`.
 - Probe exit code: pass.
+- Triton comparison bench for `B=1,S=1024,H=4,K=32,V=16,bf16`:
+  `triton fwd = 0.52 ms/iter`, `triton fwd+bwd = 2.62 ms/iter`.
 
 Probe parity for `B=1,S=33,H=2,K=4,V=16,tile=8,max_its=6`:
 
-- tiled CUDA vs sequential output max abs: `5.7220458984375e-06`
+- tiled CUDA vs sequential output max abs: `5.781650543212891e-06`
 - tiled CUDA vs sequential h_final max abs: `1.7434358596801758e-06`
 - PyTorch ParaRNN vs sequential output max abs: `1.4901161193847656e-07`
 - PyTorch ParaRNN vs sequential h_final max abs: `2.2351741790771484e-08`
-- prototype wall time, including Python summary scan overhead and CUDA
-  recompute apply: `239.15 ms`
+- prototype wall time, including CUDA summary scan and CUDA recompute apply:
+  `239.91 ms` on the small probe shape
+
+GB10 bf16 timing sweep for `B=1,S=1024,H=4,K=32,V=16,max_its=3`:
+
+| tile_size | before Python summary scan | after CUDA summary scan |
+| ---: | ---: | ---: |
+| 8 | 14.34 ms | 13.41 ms |
+| 16 | 12.46 ms | 11.66 ms |
+| 32 | 11.59 ms | 11.12 ms |
+| 64 | 11.36 ms | 11.21 ms |
+| 128 | 11.54 ms | 11.45 ms |
 
 ## ptxas / Resources
 
@@ -70,6 +86,10 @@ ptxas info    : Compiling entry function ... m2rnn_apply_tile_prefix_kernel ... 
 ptxas info    : Function properties ...
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 ptxas info    : Used 90 registers, used 1 barriers, 3520 bytes smem
+ptxas info    : Compiling entry function ... m2rnn_scan_tile_summaries_kernel ... for 'sm_121'
+ptxas info    : Function properties ...
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 26 registers, used 1 barriers, 128 bytes smem
 ptxas info    : Compiling entry function ... m2rnn_local_tile_scan_debug_kernel ... for 'sm_121'
 ptxas info    : Function properties ...
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
@@ -80,8 +100,10 @@ Resource summary:
 
 - summary kernel: `94` registers/thread, `3456` bytes smem, `0` spills
 - apply kernel: `90` registers/thread, `3520` bytes smem, `0` spills
+- tile summary scan kernel: `26` registers/thread, `128` bytes smem,
+  `0` spills
 - debug kernel: `96` registers/thread, `3456` bytes smem, `0` spills
-- launch bounds: `256` threads/block, min `2` blocks/SM for all three
+- launch bounds: `256` threads/block, min `2` blocks/SM for all four kernels
 
 ## Memory Accounting
 
@@ -107,7 +129,7 @@ Production accounting now keeps only:
 - `h_trajectory` or a recompute/checkpointed equivalent,
 - `delta` for the current Newton update,
 - `tile_A/tile_b` summaries,
-- scanned `tile_inputs[Be,n_tiles,V]`, currently produced by Python,
+- scanned `tile_inputs[Be,n_tiles,V]`, now produced by CUDA,
 - no production `local_prefix`.
 
 ## Input Dtypes
@@ -122,10 +144,10 @@ the quantized bf16 inputs.
 
 Remaining work:
 
-1. Replace the Python summary scan over `tile_A/tile_b` with a CUDA scan per
-   `(B,H,K)` chain.
-2. Fuse the Newton update (`h += omega * delta`) into the apply kernel or a
+1. Fuse the Newton update (`h += omega * delta`) into the apply kernel or a
    small CUDA update kernel.
+2. Replace the sequential per-chain summary scan kernel with a true parallel
+   tile-prefix composition if `n_tiles` becomes the dominant cost.
 3. Remove or gate the debug local-prefix entrypoint once local affine tests no
    longer need it.
 

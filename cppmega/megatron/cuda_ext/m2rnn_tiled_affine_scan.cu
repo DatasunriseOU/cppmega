@@ -295,6 +295,50 @@ __global__ __launch_bounds__(kThreads, 2) void m2rnn_apply_tile_prefix_kernel(
   }
 }
 
+__global__ __launch_bounds__(kThreads, 2) void m2rnn_scan_tile_summaries_kernel(
+    const float* __restrict__ tile_A,
+    const float* __restrict__ tile_b,
+    float* __restrict__ tile_inputs,
+    int V,
+    int n_tiles) {
+  const int tid = threadIdx.x;
+  const int64_t chain = static_cast<int64_t>(blockIdx.x);
+
+  __shared__ float carry[kMaxV];
+  __shared__ float next[kMaxV];
+
+  if (tid < V) {
+    carry[tid] = 0.0f;
+  }
+  __syncthreads();
+
+  for (int tile = 0; tile < n_tiles; ++tile) {
+    const int64_t tile_base = (chain * static_cast<int64_t>(n_tiles) + tile);
+    if (tid < V) {
+      tile_inputs[tile_base * V + tid] = carry[tid];
+    }
+    __syncthreads();
+
+    if (tid < V) {
+      const int i = tid;
+      float acc = tile_b[tile_base * V + i];
+#pragma unroll
+      for (int j = 0; j < kMaxV; ++j) {
+        if (j < V) {
+          acc += tile_A[(tile_base * V * V) + (i * V + j)] * carry[j];
+        }
+      }
+      next[i] = acc;
+    }
+    __syncthreads();
+
+    if (tid < V) {
+      carry[tid] = next[tid];
+    }
+    __syncthreads();
+  }
+}
+
 __global__ __launch_bounds__(kThreads, 2) void m2rnn_local_tile_scan_debug_kernel(
     const float* __restrict__ q,
     const float* __restrict__ k,
@@ -604,6 +648,50 @@ at::Tensor apply_tile_prefixes(
   return delta;
 }
 
+at::Tensor scan_tile_summaries(
+    const at::Tensor& tile_A,
+    const at::Tensor& tile_b) {
+  check_float_cuda_contiguous(tile_A, "tile_A");
+  check_float_cuda_contiguous(tile_b, "tile_b");
+  if (tile_A.device() != tile_b.device()) {
+    throw std::invalid_argument("tile_A and tile_b must be on the same CUDA device");
+  }
+  if (tile_A.dim() != 4 || tile_b.dim() != 3) {
+    throw std::invalid_argument("tile_A/tile_b ranks must be (Be,n_tiles,V,V)/(Be,n_tiles,V)");
+  }
+
+  const int64_t Be = tile_b.size(0);
+  const int64_t n_tiles = tile_b.size(1);
+  const int64_t V = tile_b.size(2);
+  if (tile_A.size(0) != Be || tile_A.size(1) != n_tiles || tile_A.size(2) != V ||
+      tile_A.size(3) != V) {
+    throw std::invalid_argument("tile_A shape must be (Be, n_tiles, V, V)");
+  }
+  if (V < 1 || V > kMaxV) {
+    throw std::invalid_argument("m2rnn tiled CUDA path requires 1 <= V <= 16");
+  }
+  if (Be < 1 || n_tiles < 1) {
+    throw std::invalid_argument("tile_A/tile_b must contain at least one chain and one tile");
+  }
+
+  at::Tensor tile_inputs = at::empty_like(tile_b);
+
+  const c10::cuda::CUDAGuard device_guard(tile_A.device());
+  m2rnn_scan_tile_summaries_kernel<<<
+      static_cast<unsigned int>(Be),
+      kThreads,
+      0,
+      at::cuda::getCurrentCUDAStream()>>>(
+      tile_A.data_ptr<float>(),
+      tile_b.data_ptr<float>(),
+      tile_inputs.data_ptr<float>(),
+      static_cast<int>(V),
+      static_cast<int>(n_tiles));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  return tile_inputs;
+}
+
 std::vector<at::Tensor> local_tile_scan_debug(
     const at::Tensor& q,
     const at::Tensor& k,
@@ -658,6 +746,7 @@ std::vector<at::Tensor> local_tile_scan_debug(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("tile_summaries", &tile_summaries, "M2RNN local tile summaries (CUDA)");
+  m.def("scan_tile_summaries", &scan_tile_summaries, "M2RNN tile summary prefix scan (CUDA)");
   m.def("apply_tile_prefixes", &apply_tile_prefixes, "M2RNN recompute tile-prefix apply (CUDA)");
   m.def("local_tile_scan_debug", &local_tile_scan_debug, "M2RNN local tiled affine scan debug (CUDA)");
 }

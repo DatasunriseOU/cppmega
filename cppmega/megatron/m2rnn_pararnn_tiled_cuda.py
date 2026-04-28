@@ -103,12 +103,18 @@ def _broadcast_heads(
 
 
 def _scan_tile_summaries(tile_A: torch.Tensor, tile_b: torch.Tensor) -> torch.Tensor:
-    """Return the input delta for every tile.
+    """Return the input delta for every tile using a CUDA summary scan.
 
     ``tile_A/tile_b`` describe ``tail = tile_A @ input + tile_b``.  The first
     tile starts from zero because the Newton correction has no state before
     ``t=0``; each later tile starts from the previous tile's tail.
     """
+
+    return _load_cuda_ext().scan_tile_summaries(tile_A.contiguous(), tile_b.contiguous())
+
+
+def _scan_tile_summaries_python(tile_A: torch.Tensor, tile_b: torch.Tensor) -> torch.Tensor:
+    """Reference implementation for tests/debugging."""
 
     Be, n_tiles, V = tile_b.shape
     tile_inputs = torch.empty_like(tile_b)
