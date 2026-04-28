@@ -133,10 +133,21 @@ def test_epilogue_capability_report_names_unsupported_contracts() -> None:
     report = flashinfer_mxfp8_gemm.epilogue_capability_report()
 
     assert "out_dtype" in report["supported"]
+    assert "dense_compact_columnwise_dgrad_wgrad" in report["supported"]
     assert "bias" in report["unsupported"]
     assert "gelu" in report["unsupported"]
     assert "output_quantization" in report["unsupported"]
     assert "comm_overlap" in report["unsupported"]
+    compact_report = report["dense_compact_columnwise"]
+    assert compact_report["backend"] == "cutlass_native_compact_direct"
+    assert compact_report["flashinfer_mm_mxfp8"] == {
+        "accepted": False,
+        "reason": "flashinfer_mm_mxfp8_no_compact_columnwise",
+        "detail": (
+            "FlashInfer mm_mxfp8 accepts rowwise operands plus layout_128x4 scales, "
+            "not TE compact columnwise operands."
+        ),
+    }
 
 
 # ---------------------------------------------------------------
@@ -171,6 +182,160 @@ def _te_e4m3_dtype():
         return tex.DType.kFloat8E4M3
     except ImportError:
         return "kFloat8E4M3"
+
+
+def _make_compact_mxfp8_tensor(
+    rows: int,
+    cols: int,
+    *,
+    rowwise: bool = True,
+    columnwise: bool = True,
+    swizzled: bool = False,
+) -> SimpleNamespace:
+    tensor = SimpleNamespace(
+        _fp8_dtype=_te_e4m3_dtype(),
+        _with_gemm_swizzled_scales=swizzled,
+    )
+    if rowwise:
+        tensor._rowwise_data = torch.empty((rows, cols), dtype=torch.uint8)
+        tensor._rowwise_scale_inv = torch.empty((rows, cols // 32), dtype=torch.uint8)
+    if columnwise:
+        tensor._columnwise_data = torch.empty((rows, cols), dtype=torch.uint8)
+        tensor._columnwise_scale_inv = torch.empty((rows // 32, cols), dtype=torch.uint8)
+    return tensor
+
+
+def test_dense_compact_columnwise_dgrad_status_accepts_metadata() -> None:
+    dy = _make_compact_mxfp8_tensor(256, 128, columnwise=False)
+    weight = _make_compact_mxfp8_tensor(128, 256, rowwise=False)
+
+    status = flashinfer_mxfp8_gemm.dense_compact_columnwise_dgrad_status(weight, dy)
+
+    assert status.accepted
+    assert status.reason == "accepted"
+    assert status.backend == "cutlass_native_compact_direct"
+
+
+def test_dense_compact_columnwise_wgrad_status_accepts_metadata() -> None:
+    dy = _make_compact_mxfp8_tensor(256, 128, rowwise=False)
+    x = _make_compact_mxfp8_tensor(256, 384, rowwise=False)
+
+    status = flashinfer_mxfp8_gemm.dense_compact_columnwise_wgrad_status(x, dy)
+
+    assert status.accepted
+    assert status.reason == "accepted"
+
+
+def test_dgrad_compact_columnwise_dispatches_original_tensors(monkeypatch) -> None:
+    from cppmega.megatron import cutlass_mxfp8_gemm as cutlass
+
+    dy = _make_compact_mxfp8_tensor(256, 128, columnwise=False)
+    weight = _make_compact_mxfp8_tensor(128, 256, rowwise=False)
+    sentinel = torch.empty((256, 256), dtype=torch.bfloat16)
+    calls = []
+
+    def fake_dgrad(dy_data, dy_scale, weight_data, weight_scale, **kwargs):
+        calls.append((dy_data, dy_scale, weight_data, weight_scale, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(cutlass, "dgrad_nn_gemm", fake_dgrad)
+
+    result = flashinfer_mxfp8_gemm.dgrad_nn_gemm_compact_columnwise(weight, dy)
+
+    assert result is sentinel
+    assert calls
+    assert calls[0][0] is dy._rowwise_data
+    assert calls[0][1] is dy._rowwise_scale_inv
+    assert calls[0][2] is weight._columnwise_data
+    assert calls[0][3] is weight._columnwise_scale_inv
+    assert calls[0][4]["out"] is None
+
+
+def test_wgrad_compact_columnwise_dispatches_original_tensors(monkeypatch) -> None:
+    from cppmega.megatron import cutlass_mxfp8_gemm as cutlass
+
+    dy = _make_compact_mxfp8_tensor(256, 128, rowwise=False)
+    x = _make_compact_mxfp8_tensor(256, 384, rowwise=False)
+    sentinel = torch.empty((128, 384), dtype=torch.bfloat16)
+    calls = []
+
+    def fake_wgrad(dy_data, dy_scale, x_data, x_scale, **kwargs):
+        calls.append((dy_data, dy_scale, x_data, x_scale, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(cutlass, "wgrad_nt_gemm", fake_wgrad)
+
+    result = flashinfer_mxfp8_gemm.wgrad_nt_gemm_compact_columnwise(x, dy)
+
+    assert result is sentinel
+    assert calls
+    assert calls[0][0] is dy._columnwise_data
+    assert calls[0][1] is dy._columnwise_scale_inv
+    assert calls[0][2] is x._columnwise_data
+    assert calls[0][3] is x._columnwise_scale_inv
+
+
+def test_legacy_dgrad_wrapper_prefers_compact_columnwise(monkeypatch) -> None:
+    dy = _make_compact_mxfp8_tensor(256, 128, columnwise=False)
+    weight = _make_compact_mxfp8_tensor(128, 256, rowwise=False)
+    sentinel = torch.empty((256, 256), dtype=torch.bfloat16)
+    calls = []
+
+    def fake_direct(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(flashinfer_mxfp8_gemm, "dgrad_nn_gemm_compact_columnwise", fake_direct)
+
+    result = flashinfer_mxfp8_gemm.dgrad_nn_gemm(weight, dy)
+
+    assert result is sentinel
+    assert calls[0][0] == (weight, dy)
+
+
+def test_legacy_wgrad_wrapper_prefers_compact_columnwise(monkeypatch) -> None:
+    dy = _make_compact_mxfp8_tensor(256, 128, rowwise=False)
+    x = _make_compact_mxfp8_tensor(256, 384, rowwise=False)
+    sentinel = torch.empty((128, 384), dtype=torch.bfloat16)
+    calls = []
+
+    def fake_direct(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(flashinfer_mxfp8_gemm, "wgrad_nt_gemm_compact_columnwise", fake_direct)
+
+    result = flashinfer_mxfp8_gemm.wgrad_nt_gemm(x, dy)
+
+    assert result is sentinel
+    assert calls[0][0] == (x, dy)
+
+
+def test_compact_columnwise_rejects_swizzled_scales_with_typed_reason() -> None:
+    dy = _make_compact_mxfp8_tensor(256, 128, columnwise=False)
+    weight = _make_compact_mxfp8_tensor(128, 256, rowwise=False, swizzled=True)
+
+    status = flashinfer_mxfp8_gemm.dense_compact_columnwise_dgrad_status(weight, dy)
+
+    assert not status.accepted
+    assert status.reason == "swizzled_scales"
+    with pytest.raises(flashinfer_mxfp8_gemm.CompactColumnwiseUnsupportedError) as exc:
+        flashinfer_mxfp8_gemm.dgrad_nn_gemm_compact_columnwise(weight, dy)
+    assert exc.value.reason == "swizzled_scales"
+
+
+def test_compact_columnwise_rejects_fp16_out_with_typed_reason() -> None:
+    dy = _make_compact_mxfp8_tensor(256, 128, rowwise=False)
+    x = _make_compact_mxfp8_tensor(256, 384, rowwise=False)
+
+    status = flashinfer_mxfp8_gemm.dense_compact_columnwise_wgrad_status(
+        x,
+        dy,
+        out_dtype=torch.float16,
+    )
+
+    assert not status.accepted
+    assert status.reason == "unsupported_out_dtype"
 
 
 def _make_rowwise_tensor(

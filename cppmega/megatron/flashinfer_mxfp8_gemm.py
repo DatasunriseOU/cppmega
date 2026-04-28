@@ -22,6 +22,27 @@ _TACTIC_ENV = "CPPMEGA_FLASHINFER_MXFP8_TACTIC"
 _DEFAULT_RUNNER_MODE = "mm_mxfp8"
 
 RunnerMode = Literal["mm_mxfp8", "direct_tactic"]
+CompactColumnwiseOp = Literal["dgrad_nn", "wgrad_nt"]
+CompactColumnwiseReason = Literal[
+    "accepted",
+    "missing_rowwise_data",
+    "missing_columnwise_data",
+    "swizzled_scales",
+    "bad_fp8_dtype",
+    "bad_payload_dtype",
+    "bad_payload_rank",
+    "bad_scale_rank",
+    "shape_mismatch",
+    "unsupported_shape",
+    "unsupported_out_dtype",
+    "bad_out",
+    "flashinfer_mm_mxfp8_no_compact_columnwise",
+]
+
+_COMPACT_COLUMNWISE_BACKEND = "cutlass_native_compact_direct"
+_PURE_FLASHINFER_COMPACT_REASON: CompactColumnwiseReason = (
+    "flashinfer_mm_mxfp8_no_compact_columnwise"
+)
 
 
 @dataclass(frozen=True)
@@ -30,6 +51,32 @@ class FlashinferMxfp8RunnerConfig:
 
     mode: RunnerMode = _DEFAULT_RUNNER_MODE
     tactic: int = 0
+
+
+@dataclass(frozen=True)
+class CompactColumnwiseBackendStatus:
+    """Feature-detection result for dense compact-columnwise backward GEMMs."""
+
+    op: CompactColumnwiseOp
+    accepted: bool
+    reason: CompactColumnwiseReason
+    detail: str = ""
+    backend: str = _COMPACT_COLUMNWISE_BACKEND
+
+
+class CompactColumnwiseUnsupportedError(RuntimeError):
+    """Raised when compact-columnwise dense backward cannot run without a copy."""
+
+    def __init__(self, status: CompactColumnwiseBackendStatus):
+        self.status = status
+        self.reason = status.reason
+        message = (
+            f"MXFP8 compact-columnwise {status.op} is unsupported by "
+            f"{status.backend}: {status.reason}"
+        )
+        if status.detail:
+            message = f"{message}: {status.detail}"
+        super().__init__(message)
 
 
 def runner_config(
@@ -229,9 +276,34 @@ def runner_config_from_env() -> FlashinferMxfp8RunnerConfig:
     )
 
 
-def _rowwise_matrix(tensor: Any) -> tuple[torch.Tensor, torch.Tensor, bool]:
-    data = getattr(tensor, "_rowwise_data", None)
-    scale = getattr(tensor, "_rowwise_scale_inv", None)
+def _compact_status(
+    op: CompactColumnwiseOp,
+    accepted: bool,
+    reason: CompactColumnwiseReason = "accepted",
+    detail: str = "",
+    *,
+    backend: str = _COMPACT_COLUMNWISE_BACKEND,
+) -> CompactColumnwiseBackendStatus:
+    return CompactColumnwiseBackendStatus(
+        op=op,
+        accepted=accepted,
+        reason=reason,
+        detail=detail,
+        backend=backend,
+    )
+
+
+def _unsupported_status(
+    op: CompactColumnwiseOp,
+    reason: CompactColumnwiseReason,
+    detail: str = "",
+    *,
+    backend: str = _COMPACT_COLUMNWISE_BACKEND,
+) -> CompactColumnwiseBackendStatus:
+    return _compact_status(op, False, reason, detail, backend=backend)
+
+
+def _validate_e4m3_fp8_dtype(tensor: Any) -> None:
     fp8_dtype = getattr(tensor, "_fp8_dtype", None)
     try:
         import transformer_engine_torch as tex
@@ -245,12 +317,47 @@ def _rowwise_matrix(tensor: Any) -> tuple[torch.Tensor, torch.Tensor, bool]:
             raise ValueError(
                 f"FlashInfer MXFP8 backend expects E4M3 payloads, got {fp8_dtype}"
             )
+
+
+def _fp8_dtype_status(
+    op: CompactColumnwiseOp,
+    tensor: Any,
+    operand_name: str,
+) -> CompactColumnwiseBackendStatus | None:
+    try:
+        _validate_e4m3_fp8_dtype(tensor)
+    except ValueError as exc:
+        return _unsupported_status(op, "bad_fp8_dtype", f"{operand_name}: {exc}")
+    return None
+
+
+def _rowwise_matrix(tensor: Any) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    _validate_e4m3_fp8_dtype(tensor)
+    data = getattr(tensor, "_rowwise_data", None)
+    scale = getattr(tensor, "_rowwise_scale_inv", None)
     if not isinstance(data, torch.Tensor) or not isinstance(scale, torch.Tensor):
         raise ValueError("MXFP8 FlashInfer backend requires rowwise data and scales")
     if data.dtype != torch.uint8 or scale.dtype != torch.uint8:
         raise ValueError("MXFP8 FlashInfer backend requires uint8 payloads/scales")
     if data.dim() < 2 or scale.dim() != 2:
         raise ValueError("MXFP8 FlashInfer backend requires matrix-like rowwise data and 2D scales")
+    if data.dim() > 2:
+        data = data.reshape(-1, data.shape[-1])
+    return data, scale, bool(getattr(tensor, "_with_gemm_swizzled_scales", False))
+
+
+def _columnwise_matrix(tensor: Any) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    _validate_e4m3_fp8_dtype(tensor)
+    data = getattr(tensor, "_columnwise_data", None)
+    scale = getattr(tensor, "_columnwise_scale_inv", None)
+    if not isinstance(data, torch.Tensor) or not isinstance(scale, torch.Tensor):
+        raise ValueError("MXFP8 FlashInfer backend requires columnwise data and scales")
+    if data.dtype != torch.uint8 or scale.dtype != torch.uint8:
+        raise ValueError("MXFP8 FlashInfer backend requires uint8 payloads/scales")
+    if data.dim() < 2:
+        raise ValueError("MXFP8 FlashInfer backend requires matrix-like columnwise data")
+    if scale.dim() != 2:
+        raise ValueError("MXFP8 FlashInfer backend requires 2D columnwise scales")
     if data.dim() > 2:
         data = data.reshape(-1, data.shape[-1])
     return data, scale, bool(getattr(tensor, "_with_gemm_swizzled_scales", False))
@@ -399,6 +506,295 @@ def check_plain_gemm_kwargs(
     )
 
 
+def _has_compact_columnwise_metadata(tensor: Any) -> bool:
+    return isinstance(getattr(tensor, "_columnwise_data", None), torch.Tensor) or isinstance(
+        getattr(tensor, "_columnwise_scale_inv", None),
+        torch.Tensor,
+    )
+
+
+def _is_rowwise_transpose_operand(tensor: Any) -> bool:
+    return bool(
+        getattr(tensor, "_te_rowwise_transpose_for_backward_operand", False)
+        or getattr(tensor, "_cppmega_mxfp8_rowwise_transpose_operand", False)
+    )
+
+
+def _rowwise_matrix_for_compact_status(
+    op: CompactColumnwiseOp,
+    tensor: Any,
+    operand_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, CompactColumnwiseBackendStatus | None]:
+    dtype_status = _fp8_dtype_status(op, tensor, operand_name)
+    if dtype_status is not None:
+        return torch.empty(0), torch.empty(0), dtype_status
+    if bool(getattr(tensor, "_with_gemm_swizzled_scales", False)):
+        return (
+            torch.empty(0),
+            torch.empty(0),
+            _unsupported_status(
+                op,
+                "swizzled_scales",
+                f"{operand_name} uses GEMM-swizzled scales; compact direct needs 2D TE scales",
+            ),
+        )
+    data = getattr(tensor, "_rowwise_data", None)
+    scale = getattr(tensor, "_rowwise_scale_inv", None)
+    if not isinstance(data, torch.Tensor) or not isinstance(scale, torch.Tensor):
+        return (
+            torch.empty(0),
+            torch.empty(0),
+            _unsupported_status(op, "missing_rowwise_data", f"{operand_name} lacks rowwise data/scales"),
+        )
+    if data.dtype != torch.uint8 or scale.dtype != torch.uint8:
+        return (
+            torch.empty(0),
+            torch.empty(0),
+            _unsupported_status(
+                op,
+                "bad_payload_dtype",
+                f"{operand_name} payload/scales must be uint8, got {data.dtype}/{scale.dtype}",
+            ),
+        )
+    if data.dim() < 2:
+        return (
+            torch.empty(0),
+            torch.empty(0),
+            _unsupported_status(op, "bad_payload_rank", f"{operand_name} payload must be matrix-like"),
+        )
+    if scale.dim() != 2:
+        return (
+            torch.empty(0),
+            torch.empty(0),
+            _unsupported_status(op, "bad_scale_rank", f"{operand_name} scales must be 2D compact scales"),
+        )
+    if data.dim() > 2:
+        data = data.reshape(-1, data.shape[-1])
+    return data, scale, None
+
+
+def _columnwise_matrix_for_compact_status(
+    op: CompactColumnwiseOp,
+    tensor: Any,
+    operand_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, CompactColumnwiseBackendStatus | None]:
+    dtype_status = _fp8_dtype_status(op, tensor, operand_name)
+    if dtype_status is not None:
+        return torch.empty(0), torch.empty(0), dtype_status
+    if bool(getattr(tensor, "_with_gemm_swizzled_scales", False)):
+        return (
+            torch.empty(0),
+            torch.empty(0),
+            _unsupported_status(
+                op,
+                "swizzled_scales",
+                f"{operand_name} uses GEMM-swizzled scales; compact direct needs 2D TE scales",
+            ),
+        )
+    data = getattr(tensor, "_columnwise_data", None)
+    scale = getattr(tensor, "_columnwise_scale_inv", None)
+    if not isinstance(data, torch.Tensor) or not isinstance(scale, torch.Tensor):
+        return (
+            torch.empty(0),
+            torch.empty(0),
+            _unsupported_status(
+                op,
+                "missing_columnwise_data",
+                f"{operand_name} lacks compact columnwise data/scales",
+            ),
+        )
+    if data.dtype != torch.uint8 or scale.dtype != torch.uint8:
+        return (
+            torch.empty(0),
+            torch.empty(0),
+            _unsupported_status(
+                op,
+                "bad_payload_dtype",
+                f"{operand_name} payload/scales must be uint8, got {data.dtype}/{scale.dtype}",
+            ),
+        )
+    if data.dim() < 2:
+        return (
+            torch.empty(0),
+            torch.empty(0),
+            _unsupported_status(op, "bad_payload_rank", f"{operand_name} payload must be matrix-like"),
+        )
+    if scale.dim() != 2:
+        return (
+            torch.empty(0),
+            torch.empty(0),
+            _unsupported_status(op, "bad_scale_rank", f"{operand_name} scales must be 2D compact scales"),
+        )
+    if data.dim() > 2:
+        data = data.reshape(-1, data.shape[-1])
+    return data, scale, None
+
+
+def _check_compact_out_status(
+    op: CompactColumnwiseOp,
+    out: torch.Tensor | None,
+    out_dtype: torch.dtype | None,
+    rows: int,
+    cols: int,
+) -> CompactColumnwiseBackendStatus | None:
+    try:
+        effective_out_dtype = _resolve_out_dtype(out, out_dtype)
+    except ValueError as exc:
+        return _unsupported_status(op, "unsupported_out_dtype", str(exc))
+    if effective_out_dtype != torch.bfloat16:
+        return _unsupported_status(
+            op,
+            "unsupported_out_dtype",
+            "compact-columnwise direct backend currently writes BF16 only",
+        )
+    if out is not None:
+        if not out.is_contiguous():
+            return _unsupported_status(op, "bad_out", "out must be contiguous")
+        if out.numel() < rows * cols:
+            return _unsupported_status(op, "bad_out", f"out is too small for {rows}x{cols}")
+    return None
+
+
+def dense_compact_columnwise_dgrad_status(
+    weight: Any,
+    dy: Any,
+    *,
+    out: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> CompactColumnwiseBackendStatus:
+    """Return whether dgrad NN can run from original compact columnwise weight."""
+
+    op: CompactColumnwiseOp = "dgrad_nn"
+    weight_data, weight_scale, status = _columnwise_matrix_for_compact_status(
+        op,
+        weight,
+        "weight",
+    )
+    if status is not None:
+        return status
+    dy_data, dy_scale, status = _rowwise_matrix_for_compact_status(op, dy, "dy")
+    if status is not None:
+        return status
+
+    m, reduction_n = (int(dy_data.shape[0]), int(dy_data.shape[1]))
+    if int(weight_data.shape[0]) != reduction_n:
+        return _unsupported_status(
+            op,
+            "shape_mismatch",
+            f"dy is {tuple(dy_data.shape)}, weight columnwise is {tuple(weight_data.shape)}",
+        )
+    k = int(weight_data.shape[1])
+    out_status = _check_compact_out_status(op, out, out_dtype, m, k)
+    if out_status is not None:
+        return out_status
+
+    from cppmega.megatron import cutlass_mxfp8_gemm as cutlass
+
+    if not cutlass.is_supported_shape(m, k, reduction_n):
+        return _unsupported_status(
+            op,
+            "unsupported_shape",
+            f"requires M/N/K multiples of 128, got {m}x{k}x{reduction_n}",
+        )
+    reduction_blocks = reduction_n // 32
+    if int(dy_scale.shape[0]) < m or int(dy_scale.shape[1]) < reduction_blocks:
+        return _unsupported_status(
+            op,
+            "shape_mismatch",
+            f"dy scale {tuple(dy_scale.shape)} is too small for {m}x{reduction_n}",
+        )
+    if int(weight_scale.shape[0]) < reduction_blocks or int(weight_scale.shape[1]) < k:
+        return _unsupported_status(
+            op,
+            "shape_mismatch",
+            f"weight columnwise scale {tuple(weight_scale.shape)} is too small for {reduction_n}x{k}",
+        )
+    return _compact_status(op, True)
+
+
+def dense_compact_columnwise_wgrad_status(
+    x: Any,
+    dy: Any,
+    *,
+    out: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> CompactColumnwiseBackendStatus:
+    """Return whether wgrad NT can run from original compact columnwise operands."""
+
+    op: CompactColumnwiseOp = "wgrad_nt"
+    x_data, x_scale, status = _columnwise_matrix_for_compact_status(op, x, "x")
+    if status is not None:
+        return status
+    dy_data, dy_scale, status = _columnwise_matrix_for_compact_status(op, dy, "dy")
+    if status is not None:
+        return status
+
+    if int(dy_data.shape[0]) != int(x_data.shape[0]):
+        return _unsupported_status(
+            op,
+            "shape_mismatch",
+            f"dy columnwise is {tuple(dy_data.shape)}, x columnwise is {tuple(x_data.shape)}",
+        )
+    m = int(dy_data.shape[1])
+    n = int(x_data.shape[1])
+    reduction_k = int(dy_data.shape[0])
+    out_status = _check_compact_out_status(op, out, out_dtype, m, n)
+    if out_status is not None:
+        return out_status
+
+    from cppmega.megatron import cutlass_mxfp8_gemm as cutlass
+
+    if not cutlass.is_supported_shape(m, n, reduction_k):
+        return _unsupported_status(
+            op,
+            "unsupported_shape",
+            f"requires M/N/K multiples of 128, got {m}x{n}x{reduction_k}",
+        )
+    reduction_blocks = reduction_k // 32
+    if int(dy_scale.shape[0]) < reduction_blocks or int(dy_scale.shape[1]) < m:
+        return _unsupported_status(
+            op,
+            "shape_mismatch",
+            f"dy columnwise scale {tuple(dy_scale.shape)} is too small for {reduction_k}x{m}",
+        )
+    if int(x_scale.shape[0]) < reduction_blocks or int(x_scale.shape[1]) < n:
+        return _unsupported_status(
+            op,
+            "shape_mismatch",
+            f"x columnwise scale {tuple(x_scale.shape)} is too small for {reduction_k}x{n}",
+        )
+    return _compact_status(op, True)
+
+
+def compact_columnwise_dgrad_status(
+    weight: Any,
+    dy: Any,
+    *,
+    out: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> CompactColumnwiseBackendStatus:
+    """Backward-compatible alias for dense compact-columnwise dgrad probing."""
+
+    return dense_compact_columnwise_dgrad_status(weight, dy, out=out, out_dtype=out_dtype)
+
+
+def compact_columnwise_wgrad_status(
+    x: Any,
+    dy: Any,
+    *,
+    out: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> CompactColumnwiseBackendStatus:
+    """Backward-compatible alias for dense compact-columnwise wgrad probing."""
+
+    return dense_compact_columnwise_wgrad_status(x, dy, out=out, out_dtype=out_dtype)
+
+
+def _raise_if_compact_unsupported(status: CompactColumnwiseBackendStatus) -> None:
+    if not status.accepted:
+        raise CompactColumnwiseUnsupportedError(status)
+
+
 def _mm_mxfp8_direct(
     a_data: torch.Tensor,
     b_data: torch.Tensor,
@@ -494,6 +890,82 @@ def fprop_tn_gemm(
     )
 
 
+def dgrad_nn_gemm_compact_columnwise(
+    weight: Any,
+    dy: Any,
+    *,
+    out: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    config: FlashinferMxfp8RunnerConfig | None = None,
+) -> torch.Tensor:
+    """Compute dgrad NN from original TE compact columnwise weight metadata.
+
+    This path does not materialize ``weight.T``.  It delegates to cppmega's
+    compact-direct CUTLASS backend, which aliases TE columnwise payload/scales
+    as the logical transposed B operand.
+    """
+
+    del config  # Signature compatibility; compact-direct CUTLASS has no tactic.
+    status = dense_compact_columnwise_dgrad_status(
+        weight,
+        dy,
+        out=out,
+        out_dtype=out_dtype,
+    )
+    _raise_if_compact_unsupported(status)
+    _resolve_out_dtype(out, out_dtype)
+    dy_data, dy_scale, _dy_swizzled = _rowwise_matrix(dy)
+    weight_data, weight_scale, _weight_swizzled = _columnwise_matrix(weight)
+
+    from cppmega.megatron import cutlass_mxfp8_gemm as cutlass
+
+    return cutlass.dgrad_nn_gemm(
+        dy_data,
+        dy_scale,
+        weight_data,
+        weight_scale,
+        out=out,
+    )
+
+
+def wgrad_nt_gemm_compact_columnwise(
+    x: Any,
+    dy: Any,
+    *,
+    out: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    config: FlashinferMxfp8RunnerConfig | None = None,
+) -> torch.Tensor:
+    """Compute wgrad NT from original TE compact columnwise x/dy metadata.
+
+    This path does not materialize ``x.T`` or ``dy.T``.  It delegates to
+    cppmega's compact-direct CUTLASS backend, which reads both operands through
+    the TE columnwise compact representation.
+    """
+
+    del config  # Signature compatibility; compact-direct CUTLASS has no tactic.
+    status = dense_compact_columnwise_wgrad_status(
+        x,
+        dy,
+        out=out,
+        out_dtype=out_dtype,
+    )
+    _raise_if_compact_unsupported(status)
+    _resolve_out_dtype(out, out_dtype)
+    x_data, x_scale, _x_swizzled = _columnwise_matrix(x)
+    dy_data, dy_scale, _dy_swizzled = _columnwise_matrix(dy)
+
+    from cppmega.megatron import cutlass_mxfp8_gemm as cutlass
+
+    return cutlass.wgrad_nt_gemm(
+        dy_data,
+        dy_scale,
+        x_data,
+        x_scale,
+        out=out,
+    )
+
+
 def dgrad_nn_gemm(
     weight_t: Any,
     dy: Any,
@@ -503,6 +975,23 @@ def dgrad_nn_gemm(
     config: FlashinferMxfp8RunnerConfig | None = None,
 ) -> torch.Tensor:
     """Compute TE backward dgrad from ``weight.T`` sidecar and ``dy``."""
+
+    if _has_compact_columnwise_metadata(weight_t) and not _is_rowwise_transpose_operand(weight_t):
+        status = dense_compact_columnwise_dgrad_status(
+            weight_t,
+            dy,
+            out=out,
+            out_dtype=out_dtype,
+        )
+        if status.accepted:
+            return dgrad_nn_gemm_compact_columnwise(
+                weight_t,
+                dy,
+                out=out,
+                out_dtype=out_dtype,
+                config=config,
+            )
+        raise CompactColumnwiseUnsupportedError(status)
 
     dy_data, dy_scale, dy_swizzled = _rowwise_matrix(dy)
     wt_data, wt_scale, wt_swizzled = _rowwise_matrix(weight_t)
@@ -530,6 +1019,27 @@ def wgrad_nt_gemm(
     config: FlashinferMxfp8RunnerConfig | None = None,
 ) -> torch.Tensor:
     """Compute TE backward wgrad from ``dy.T`` and ``x.T`` sidecars."""
+
+    if (
+        (_has_compact_columnwise_metadata(x_t) or _has_compact_columnwise_metadata(dy_t))
+        and not _is_rowwise_transpose_operand(x_t)
+        and not _is_rowwise_transpose_operand(dy_t)
+    ):
+        status = dense_compact_columnwise_wgrad_status(
+            x_t,
+            dy_t,
+            out=out,
+            out_dtype=out_dtype,
+        )
+        if status.accepted:
+            return wgrad_nt_gemm_compact_columnwise(
+                x_t,
+                dy_t,
+                out=out,
+                out_dtype=out_dtype,
+                config=config,
+            )
+        raise CompactColumnwiseUnsupportedError(status)
 
     dy_t_data, dy_t_scale, dy_t_swizzled = _rowwise_matrix(dy_t)
     x_t_data, x_t_scale, x_t_swizzled = _rowwise_matrix(x_t)
@@ -579,10 +1089,30 @@ def epilogue_capability_report() -> dict[str, Any]:
             "workspace_buffer",
         ],
         "sm120_binding": "mxfp8_gemm(mat1, mat2, mat1Scale, mat2Scale, out, workspace_buffer, tactic)",
+        "dense_compact_columnwise": {
+            "backend": _COMPACT_COLUMNWISE_BACKEND,
+            "direct_apis": [
+                "dgrad_nn_gemm_compact_columnwise",
+                "wgrad_nt_gemm_compact_columnwise",
+            ],
+            "status_apis": [
+                "dense_compact_columnwise_dgrad_status",
+                "dense_compact_columnwise_wgrad_status",
+            ],
+            "flashinfer_mm_mxfp8": {
+                "accepted": False,
+                "reason": _PURE_FLASHINFER_COMPACT_REASON,
+                "detail": "FlashInfer mm_mxfp8 accepts rowwise operands plus layout_128x4 scales, not TE compact columnwise operands.",
+            },
+        },
         "supported": {
             "preallocated_out": "passes out directly to mm_mxfp8",
             "out_dtype": "BF16 and FP16",
             "accumulate_beta0": "treated as overwrite; no C source is read",
+            "dense_compact_columnwise_dgrad_wgrad": (
+                "BF16 dgrad NN and wgrad NT through cppmega CUTLASS compact-direct "
+                "without materializing x.T/dy.T/weight.T"
+            ),
         },
         "unsupported": {
             "accumulate_beta_nonzero": "FlashInfer SM120 MXFP8 instantiates ElementC=void / no beta source",
@@ -590,5 +1120,9 @@ def epilogue_capability_report() -> dict[str, Any]:
             "gelu": "no activation or GELU input capture in mm_mxfp8",
             "output_quantization": "mm_mxfp8 only writes BF16/FP16 out tensors",
             "comm_overlap": "no ub/ub_type/extra_output/bulk_overlap contract in runner inputs",
+            _PURE_FLASHINFER_COMPACT_REASON: (
+                "pure FlashInfer mm_mxfp8 has no compact-columnwise operand source; "
+                "use the exposed compact-direct CUTLASS APIs or reject explicitly"
+            ),
         },
     }
