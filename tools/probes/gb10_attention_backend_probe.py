@@ -204,6 +204,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--smoke-seqlen", type=int, default=512)
     parser.add_argument("--smoke-heads", type=int, default=8)
+    parser.add_argument("--smoke-qk-dim", type=int, default=64)
+    parser.add_argument("--smoke-v-dim", type=int, default=64)
     return parser
 
 
@@ -269,8 +271,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                     backend,
                     seqlen=args.smoke_seqlen,
                     heads=args.smoke_heads,
-                    qk_dim=128,
-                    v_dim=64,
+                    qk_dim=args.smoke_qk_dim,
+                    v_dim=args.smoke_v_dim,
                 )
             )
 

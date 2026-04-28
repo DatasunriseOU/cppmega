@@ -34,9 +34,25 @@ def _make_mxfp8_operand(m: int, k: int, device: torch.device) -> tuple[torch.Ten
     return quantized._rowwise_data, quantized._rowwise_scale_inv
 
 
+def _make_mxfp8_tensor(m: int, k: int, device: torch.device):
+    """Create a TE MXFP8 tensor with compact rowwise and columnwise storage."""
+
+    quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
+    quantizer.internal = True
+    quantizer.optimize_for_gemm = False
+    source = (torch.randn((m, k), dtype=torch.bfloat16, device=device) * 0.01).contiguous()
+    return source, quantizer(source)
+
+
 def _make_b_operand(n: int, k: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     """B[N, K] is the second operand in TN layout (B is N-major)."""
     return _make_mxfp8_operand(n, k, device)
+
+
+def _rel_l2(a: torch.Tensor, b: torch.Tensor) -> float:
+    num = torch.linalg.vector_norm((a.float() - b.float()).reshape(-1))
+    den = torch.linalg.vector_norm(b.float().reshape(-1)).clamp_min(1e-12)
+    return float((num / den).item())
 
 
 class TestCutlassMxfp8Gemm:
@@ -123,3 +139,46 @@ class TestCutlassMxfp8Gemm:
                 torch.empty(0, device=device, dtype=torch.bfloat16),
                 False, False, 1.0, 0.0,
             )
+
+    def test_direct_backward_operands_match_materialized_tn_adapter(self) -> None:
+        """Direct TE compact columnwise loads match the current TN sidecar adapter."""
+
+        from cppmega.megatron import cutlass_mxfp8_gemm as cutlass
+
+        device = torch.device("cuda")
+        m = n = k = 128
+        x_ref, xq = _make_mxfp8_tensor(m, k, device)
+        w_ref, wq = _make_mxfp8_tensor(n, k, device)
+        dy_ref, dyq = _make_mxfp8_tensor(m, n, device)
+
+        direct_dgrad = cutlass.dgrad_nn_gemm(
+            dyq._rowwise_data,
+            dyq._rowwise_scale_inv,
+            wq._columnwise_data,
+            wq._columnwise_scale_inv,
+        )
+        adapter_dgrad = cutlass.tn_gemm(
+            dyq._rowwise_data,
+            dyq._rowwise_scale_inv,
+            wq._columnwise_data.t().contiguous(),
+            wq._columnwise_scale_inv.t().contiguous(),
+        )
+
+        direct_wgrad = cutlass.wgrad_nt_gemm(
+            dyq._columnwise_data,
+            dyq._columnwise_scale_inv,
+            xq._columnwise_data,
+            xq._columnwise_scale_inv,
+        )
+        adapter_wgrad = cutlass.tn_gemm(
+            dyq._columnwise_data.t().contiguous(),
+            dyq._columnwise_scale_inv.t().contiguous(),
+            xq._columnwise_data.t().contiguous(),
+            xq._columnwise_scale_inv.t().contiguous(),
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(direct_dgrad, adapter_dgrad, rtol=0, atol=0)
+        torch.testing.assert_close(direct_wgrad, adapter_wgrad, rtol=0, atol=0)
+        assert _rel_l2(direct_dgrad, dy_ref @ w_ref) < 0.15
+        assert _rel_l2(direct_wgrad, dy_ref.t() @ x_ref) < 0.15

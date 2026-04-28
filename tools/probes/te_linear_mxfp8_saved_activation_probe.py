@@ -185,6 +185,16 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             )
         if int(stats.get("mxfp8_tn_adapter_saved_transpose_operand", 0)) <= 0:
             failures.append("TN adapter did not consume a saved transpose operand")
+        if int(stats.get("mxfp8_tn_adapter_te_emit_deferred", 0)) <= 0:
+            failures.append("TE Linear did not defer eager sidecar emission")
+        for key in (
+            "mxfp8_tn_adapter_te_emit",
+            "mxfp8_tn_sidecar_attr_attached",
+            "mxfp8_tn_sidecar_registry_peak",
+            "mxfp8_tn_sidecar_registry_peak_bytes",
+        ):
+            if int(stats.get(key, 0)) != 0:
+                failures.append(f"{key}={stats.get(key)}; expected 0 for TE Linear deferred path")
 
     return {
         "status": "pass" if not failures else "fail",
@@ -205,7 +215,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--m", type=int, default=64)
-    parser.add_argument("--n", type=int, default=96)
+    parser.add_argument("--n", type=int, default=128)
     parser.add_argument("--k", type=int, default=128)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument(

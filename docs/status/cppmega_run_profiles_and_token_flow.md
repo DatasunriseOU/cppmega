@@ -13,9 +13,10 @@ Each profile is built by a setter function that fills a `RunProfile` dataclass:
 
 - `set_local_gb10_quarter_profile()`:
   single-GB10 correctness/profiling lane, 13 layers at NAM56R width,
-  real 4k clang data, MTP depth 2, Liger MTP CE, tensorwise FP8, Flash
-  Attention, no-master Muon, q8 Muon momentum, and local DDP contiguous grad
-  buffer disabled.
+  real 4k clang data, MTP depth 2, CCE MTP CE, tensorwise FP8, patched FA4
+  SM120 attention routing, no-master Muon, q8 Muon momentum, local DDP
+  contiguous grad buffer disabled, and explicit source roots for the local
+  `/home/dave/flash-attention-fa4` plus `/home/dave/TransformerEngine` forks.
 - `set_h200_dsa_9_4_m_profile()`:
   full-depth H200 production-target skeleton. Remote scripts still own
   machine-specific PP/VPP/EP orchestration, but the model-level contract is
@@ -153,7 +154,12 @@ hidden
 * = attention/MLA/DSA layer
   input:  BF16 [B, S, H]
   qkv/mla projections: TE Linear under BF16/tensorwise-FP8 recipe
-  full attention: Flash Attention when the layer is not DSA
+  full attention:
+    local GB10 defaults to attention_backend=flash and puts the patched
+    `/home/dave/flash-attention-fa4` tree first on PYTHONPATH.  This avoids
+    the mixed venv/source import path where `flash_attn.__init__` came from the
+    installed 2.8.3 wheel while SM120 CUTE modules came from the source tree.
+    Use `--attention-backend auto` only for explicit fallback repros.
   DSA path:
     indexer q/k accumulation:
       current accepted path keeps BF16 operands and accumulates into
@@ -192,20 +198,20 @@ M = Mamba3 / M2RNN-family block
 MTP predictor 1
   hidden in: BF16 [B, S, H]
   MTP local layer stack: attention + MLP over shifted targets
-  CE route: Liger fused linear CE for local GB10 profile
+  CE route: CCE fused linear CE for local GB10 profile
   logged loss: mtp_1 loss
 
 MTP predictor 2
   hidden in: BF16 [B, S, H]
   same local contract as predictor 1
-  CE route: Liger fused linear CE
+  CE route: CCE fused linear CE
   logged loss: mtp_2 loss
 
 main output head / CE
   hidden: BF16 [B, S, H]
   output weight: BF16 [V=65536, H=3584]
   local GB10 main head route:
-    native LCE rejects cc=12.1, so Apple CCE/Liger-compatible fallback is used
+    native LCE rejects cc=12.1, so Apple CCE fallback is used
   logits:
     fused CE avoids materializing full [B*S, V] logits as a persistent tensor
   reductions:
@@ -272,6 +278,8 @@ producer-warp payload/scale loader, which is correct but slow.
 
 Short-term performance path:
 
+- keep attention on the patched FA4 SM120 path; the following bullets are about
+  dense MXFP8 Linear GEMMs only, not attention
 - keep TE as the MXFP8 payload owner
 - use TE transpose emit or cached rowwise-transpose sidecars for backward
 - convert only compact rowwise scales to FlashInfer/CUTLASS `layout_128x4`
@@ -330,8 +338,10 @@ MXFP8 stats:
   sidecar_registry_size=0
 ```
 
-The newer FlashInfer/CUTLASS backend keeps the same TE transpose-emission
-contract but replaces the slow direct compact-loader path:
+The newer FlashInfer/CUTLASS dense-GEMM backend keeps the same TE
+transpose-emission contract but replaces the slow direct compact-loader path.
+This is not the attention backend; GB10 attention is already routed through the
+patched FA4 source tree by `attention_backend=flash`.
 
 ```text
 backend: CPPMEGA_TE_MXFP8_BWD_BACKEND=flashinfer_cutlass
@@ -344,3 +354,140 @@ wgrad: dy.T sidecar payload + x.T sidecar payload.T
 BF16 fallback: disabled
 copy_transpose: zero in the accepted shim probe
 ```
+
+## 2026-04-28 GB10 MXFP8 Profiling And Speed A/B
+
+Current baseline command family:
+
+```text
+bash scripts/local_gb10_quarter_train.sh --fp8-recipe mxfp8 --muon-num-ns-steps 3
+```
+
+Artifacts:
+
+```text
+torch+memory profile:
+  /home/dave/logs/gb10_mxfp8_teemit_torchmem_20260428_054124.log
+  /home/dave/logs/gb10_mxfp8_teemit_torchmem_20260428_054124_torch_profile/train_step_2_cuda_table.txt
+
+nsys full capture:
+  /home/dave/logs/gb10_mxfp8_ns3_nsys_20260428_055404_nsys.nsys-rep
+  /home/dave/logs/gb10_mxfp8_ns3_nsys_20260428_055404_cuda_gpu_kern_sum_cuda_gpu_kern_sum.csv
+
+nsys delayed hot capture:
+  /home/dave/logs/gb10_mxfp8_ns3_nsys_delay_exit_20260428_060936_nsys.nsys-rep
+  /home/dave/logs/gb10_mxfp8_ns3_nsys_delay_exit_20260428_060936_cuda_gpu_kern_sum_cuda_gpu_kern_sum.csv
+```
+
+The delayed `nsys` launcher now supports `--nsys-capture-mode delay` with
+`CPPMEGA_NSYS_DURATION=0`, meaning "start after delay and collect until normal
+process exit".  This avoids the previous `nsys --duration` SIGTERM tail where
+the report was generated but `torch.distributed.run` reported exit code 143.
+
+End-to-end 8-step A/B on real clang 4k data, 16,384 tokens/step:
+
+```text
+variant                     hot avg ms   tok/s   iter loss   val loss   test loss
+NS=3 correctness baseline      5653.4  2898.1    5.691503   5.144637    5.101255
+NS=2 speed experiment          5354.5  3059.8    6.044881   5.475146    5.426576
+```
+
+`NS=2` is about 5.3% faster, but the short-run loss regression is too large for
+the default correctness lane.  Keep `local_gb10_quarter` at `muon_num_ns_steps=3`;
+use `--muon-num-ns-steps 2` only as an explicit risky speed experiment.
+
+Other measured knobs:
+
+```text
+variant                         hot avg ms   tok/s    result
+MTP CE = CCE baseline              5641.1   2904.4   keep
+MTP CE = Liger                     5728.7   2860.0   slower
+Mamba no-conv chunk size = 512      5686.3   2881.3   slower
+Mamba no-conv chunk size = 128      5663.8   2892.7   slower and worse short loss
+```
+
+Hot `nsys` kernel ranking after warmup:
+
+```text
+_cce_backward_kernel                         ~17.8% to 19.7%
+FlashInfer/CUTLASS SM120 MXFP8 GEMM          ~13.6% to 15.1%
+BF16/CUTLASS GELU GEMM                       ~6% to 7%
+_cce_lse_forward_kernel                      ~5% to 6%
+TE mxfp8_scaling_transpose_cast              ~3.2% to 3.5%
+TE MXFP8 quantize_kernel                     ~3.1% to 3.2%
+FA4 attention backward                       ~1.5% to 1.7%
+```
+
+Immediate conclusion: forced FA4 is working and is not the current speed
+bottleneck.  The next real speed work is kernel work, not launcher knobs:
+reduce the 3-call CCE cost for main+2 MTP heads, reduce FlashInfer/CUTLASS
+MXFP8 GEMM overhead for the current shapes, and remove TE transpose/quantize
+launches by pushing GEMM-ready saved operands deeper into TE Linear/autograd.
+
+Follow-up worktree integrations from the same hotspot list:
+
+```text
+CCE main+2 MTP launch fusion:
+  status: implemented as RuntimePatchProfile.cce_fuse_main_mtp_ce / --cce-fuse-main-mtp-ce
+  default: off
+  correctness tests: scalar and per-token MTPLossAutoScaler parity
+  real A/B logs:
+    off: /home/dave/logs/gb10_cce_mtpfusion_off_20260428_155707.log
+    on:  /home/dave/logs/gb10_cce_mtpfusion_on_20260428_155932.log
+  hot iters 3-6:
+    off 5671.65 ms, 2888.75 tok/s, max allocated 28461 MB
+    on  5795.33 ms, 2827.11 tok/s, max allocated 28463 MB
+  conclusion: finite and numerically close, but slower on this short GB10 run;
+              keep it opt-in until the CCE kernel path itself is improved.
+
+TE saved-operand transpose deferral:
+  base:    /home/dave/logs/ab_te_linear_saved_operands_base_20260428_1603.log
+  patched: /home/dave/logs/ab_te_linear_saved_operands_patched_20260428_1608.log
+  max allocated after step 2: 28464.08 MB -> 28186.57 MB
+  sidecar peak bytes:        3623522304 -> 3553576960
+  hot iters 3-4:             5647.4 ms -> 5673.9 ms
+  conclusion: useful memory-direction hook, not a speed win yet.
+
+FlashInfer MXFP8 runner probe:
+  tool: tools/probes/flashinfer_mxfp8_gemm_shape_probe.py
+  control path: mm_mxfp8
+  probe path:   direct_tactic through explicit FlashinferMxfp8RunnerConfig
+  256x256x256:           0.0482 ms -> 0.0175 ms
+  16384x3584x3584:       2.0938 ms -> 2.1772 ms
+  16384x18944x3584:     44.8561 ms -> 44.5119 ms
+  16384x3584x18944:     27.8601 ms -> 27.8218 ms
+  conclusion: direct_tactic helps tiny probes and is near parity on big model
+              shapes; default remains mm_mxfp8 until e2e nsys proves a win.
+  e2e direct_tactic log:
+    /home/dave/logs/gb10_mxfp8_direct_tactic_e2e_20260428_161541.log
+  e2e vs mm_mxfp8 short control:
+    direct_tactic hot avg 5641.2 ms, 2904.3 tok/s, max 28.459 GiB
+    mm_mxfp8      hot avg 5671.6 ms, 2888.8 tok/s, max 27.794 GiB
+  e2e conclusion: +0.54% tok/s is not enough to pay for the higher peak and
+                  worse 6-step short loss; keep direct_tactic probe-only.
+```
+
+Speed comparison harness:
+
+```bash
+python tools/scripts/speed_compare.py \
+  --run ns2=/home/dave/logs/gb10_mxfp8_ns2_speed_20260428_054440.log \
+  --run ns3=/home/dave/logs/gb10_mxfp8_ns3_speed_20260428_054722.log \
+  --baseline ns2 \
+  --run-profile local_gb10_quarter \
+  --fp8-recipe mxfp8 \
+  --param-storage mxfp8 \
+  --mxfp8-bwd-backend flashinfer_cutlass \
+  --mxfp8-transpose-emit-backend te \
+  --mxfp8-transpose-emit-swizzled \
+  --mxfp8-transpose-emit-strict \
+  --hot-step-start 3 \
+  --nsys-kernel-csv ns3=/home/dave/logs/gb10_mxfp8_ns3_nsys_delay_exit_20260428_060936_cuda_gpu_kern_sum_cuda_gpu_kern_sum.csv \
+  --nsys-top-n 5
+```
+
+`tools/scripts/speed_compare.py` reuses
+`tools/profiling/compare_bf16_mxfp8.py` for train-log parsing and adds only
+multi-run deltas plus optional `cuda_gpu_kern_sum` parsing.  The `nsys` status
+is evidence metadata (`not_requested`, `csv_missing`, `no_kernel_rows`, `ok`),
+not a training pass/fail gate.
