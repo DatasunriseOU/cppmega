@@ -45,6 +45,22 @@ except ImportError:  # pragma: no cover
     _M2RNN_TRITON_AVAILABLE = False
     _m2rnn_scan_triton = None  # type: ignore[assignment]
 
+# Optional ParaRNN-style parallel-scan kernel (Newton + Brent-Kung reduction)
+# with an IFT backward.  Selected via ``CPPMEGA_M2RNN_KERNEL=pararnn``.  This
+# is a research path: forward+backward is heavier per step than the sequential
+# Triton kernel, but exposes log-depth parallelism that may help on very long
+# sequences or when the Triton scan saturates SM occupancy.
+try:
+    from cppmega.megatron.m2rnn_pararnn import (
+        PararnnConfig as _PararnnConfig,
+        m2rnn_pararnn_forward as _m2rnn_pararnn_forward,
+    )
+    _M2RNN_PARARNN_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _M2RNN_PARARNN_AVAILABLE = False
+    _PararnnConfig = None  # type: ignore[assignment]
+    _m2rnn_pararnn_forward = None  # type: ignore[assignment]
+
 
 def _softplus_decay_gate(x: torch.Tensor, A_log: torch.Tensor, dt_bias: torch.Tensor) -> torch.Tensor:
     x = F.softplus(x.float() + dt_bias)
@@ -229,6 +245,19 @@ class CppMegaM2RNNMixer(nn.Module):
 
         kernel_choice = os.environ.get("CPPMEGA_M2RNN_KERNEL", "triton")
         if (
+            kernel_choice == "pararnn"
+            and _M2RNN_PARARNN_AVAILABLE
+        ):
+            # ParaRNN auto-mode picks Triton fp32 kernels on CUDA + fp32, else
+            # falls back to the pure-PyTorch path. For bf16 callers the Triton
+            # kernels are gated out (Phase B kernels are fp32-only); the IFT
+            # backward casts up to fp32 for compute and back to input dtype
+            # at the boundaries.
+            cfg = _PararnnConfig(kernel="auto")
+            out, _ = _m2rnn_pararnn_forward(
+                q=q, k=k, v=v, W=self.state_weight, xf=f, config=cfg,
+            )
+        elif (
             kernel_choice == "triton"
             and _M2RNN_TRITON_AVAILABLE
             and q.is_cuda
