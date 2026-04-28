@@ -135,6 +135,30 @@ class TestFwdParity:
 
 
 class TestBwdParity:
+    def test_broadcast_single_heads_are_stride_zero_views(self):
+        try:
+            import triton  # noqa: F401
+        except ImportError:
+            pytest.skip("triton not available")
+        from cppmega.megatron.m2rnn_triton import _broadcast_heads
+
+        B, S, K, V = 1, 8, 16, 16
+        q, k, _v1, _W1, _xf1 = _make_inputs(B, S, 1, K, V, dtype=torch.float32)
+        _q1, _k1, v, W, xf = _make_inputs(B, S, 4, K, V, dtype=torch.float32)
+
+        q_b, k_b, v_b, W_b, xf_b, n = _broadcast_heads(q, k, v, W, xf)
+
+        assert n == 4
+        assert q_b.shape == (B, S, 4, K)
+        assert k_b.shape == (B, S, 4, K)
+        assert q_b.stride(-2) == 0
+        assert k_b.stride(-2) == 0
+        assert q_b.untyped_storage().data_ptr() == q.untyped_storage().data_ptr()
+        assert k_b.untyped_storage().data_ptr() == k.untyped_storage().data_ptr()
+        assert v_b is v
+        assert W_b is W
+        assert xf_b is xf
+
     def _check_bwd(self, B, S, H, K, V, *, rtol=1e-2):
         """Bwd parity: Triton (bf16) vs Reference (fp32, bf16 inputs cast up).
 

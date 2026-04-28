@@ -71,11 +71,13 @@ _BWD_CHUNK_SIZE_ENV = "CPPMEGA_M2RNN_BWD_CHUNK_SIZE"
 _FWD_AUTOTUNE_ENV = "CPPMEGA_M2RNN_FWD_AUTOTUNE"
 _FWD_NUM_WARPS_ENV = "CPPMEGA_M2RNN_FWD_NUM_WARPS"
 _FWD_NUM_STAGES_ENV = "CPPMEGA_M2RNN_FWD_NUM_STAGES"
+_BROADCAST_VIEWS_ENV = "CPPMEGA_M2RNN_BROADCAST_VIEWS"
 _DEFAULT_SAVE_HNEW = False
 _DEFAULT_BWD_CHUNK_SIZE = 64
 _DEFAULT_FWD_AUTOTUNE = False
 _DEFAULT_FWD_NUM_WARPS = 4
 _DEFAULT_FWD_NUM_STAGES = 3
+_DEFAULT_BROADCAST_VIEWS = True
 
 
 @dataclass(frozen=True)
@@ -932,17 +934,35 @@ def _broadcast_heads(
     n_f = xf.size(-1)
     n = max(n_q, n_k, n_v, n_w, n_f)
 
+    def _broadcast_head_tensor(x: torch.Tensor, cur_n: int, target_n: int, *, dim: int) -> torch.Tensor:
+        if cur_n == target_n:
+            return x
+        if cur_n == 1 and _env_flag(os.environ.get(_BROADCAST_VIEWS_ENV), _DEFAULT_BROADCAST_VIEWS):
+            shape = list(x.shape)
+            shape[dim] = target_n
+            return x.expand(*shape)
+        return x.repeat_interleave(target_n // cur_n, dim=dim)
+
     if n_q != n:
-        q = q.repeat_interleave(n // n_q, dim=-2)
+        q = _broadcast_head_tensor(q, n_q, n, dim=-2)
     if n_k != n:
-        k = k.repeat_interleave(n // n_k, dim=-2)
+        k = _broadcast_head_tensor(k, n_k, n, dim=-2)
     if n_v != n:
-        v = v.repeat_interleave(n // n_v, dim=-2)
+        v = _broadcast_head_tensor(v, n_v, n, dim=-2)
     if n_w != n:
-        W = W.repeat_interleave(n // n_w, dim=0)
+        W = _broadcast_head_tensor(W, n_w, n, dim=0)
     if n_f != n:
-        xf = xf.repeat_interleave(n // n_f, dim=-1)
+        xf = _broadcast_head_tensor(xf, n_f, n, dim=-1)
     return q, k, v, W, xf, n
+
+
+def _contiguous_unless_head_expanded(x: torch.Tensor, *, head_dim: int) -> torch.Tensor:
+    """Keep stride-0 head broadcasts as views; materialize other layouts."""
+    if head_dim < 0:
+        head_dim += x.ndim
+    if x.stride(head_dim) == 0:
+        return x
+    return x.contiguous()
 
 
 class _M2RNNFn(torch.autograd.Function):
@@ -956,12 +976,13 @@ class _M2RNNFn(torch.autograd.Function):
         B, S, _, K_DIM = q_b.shape
         V_DIM = v_b.size(-1)
 
-        # Require contiguous for predictable strides.
-        q_c = q_b.contiguous()
-        k_c = k_b.contiguous()
-        v_c = v_b.contiguous()
-        W_c = W_b.contiguous()
-        xf_c = xf_b.contiguous()
+        # Triton receives explicit strides, so production 1->H head broadcasts
+        # can stay as stride-0 views instead of materializing q/k copies.
+        q_c = _contiguous_unless_head_expanded(q_b, head_dim=-2)
+        k_c = _contiguous_unless_head_expanded(k_b, head_dim=-2)
+        v_c = _contiguous_unless_head_expanded(v_b, head_dim=-2)
+        W_c = _contiguous_unless_head_expanded(W_b, head_dim=0)
+        xf_c = _contiguous_unless_head_expanded(xf_b, head_dim=-1)
 
         if h0 is None:
             # Valid pointer for the Triton signature; not read when HAS_H0=False.
