@@ -14,8 +14,11 @@ Pipeline
 2. summary scan: Triton scan over tile summaries on CUDA, PyTorch fallback on
    CPU/debug paths.
 3. apply pass: replay each tile with the incoming carry to produce full
-   Newton deltas and immediately apply ``h += omega * delta``.  This pass
-   recomputes local ``M_t, b_t`` instead of storing per-token prefix matrices.
+   Newton deltas and immediately apply ``h += omega * delta``.  By default this
+   pass recomputes local ``M_t, b_t`` instead of storing per-token prefix
+   matrices.  An experimental mode stores compact per-token linearization
+   factors ``alpha_t`` and ``b_t`` to remove the nonlinear replay without
+   materialising full local prefixes.
 
 The CUDA path uses Triton for steps 1-3.  CPU, missing-Triton, and fp64
 debugging paths use the same streaming algorithm in PyTorch so unit tests can
@@ -50,6 +53,7 @@ class TiledTritonConfig:
     init_strategy: str = "zero"
     tile_size: int = 32
     prefer_triton: bool = True
+    cache_apply_coeffs: bool = False
 
 
 @dataclass(frozen=True)
@@ -68,6 +72,7 @@ class TiledSolveStats:
     full_A_bytes: int
     peak_tile_A_bytes: int
     summary_bytes: int
+    coeff_bytes: int
     local_delta_bytes: int
     carry_bytes: int
 
@@ -96,6 +101,7 @@ def estimate_tiled_solve_memory(
     V: int,
     tile_size: int,
     dtype: torch.dtype = torch.float32,
+    cache_apply_coeffs: bool = False,
 ) -> TiledSolveStats:
     """Return the core solve memory sizes.
 
@@ -114,6 +120,9 @@ def estimate_tiled_solve_memory(
         summary_bytes = _nbytes(Be, num_tiles, V, V, itemsize=dtype_bytes) + _nbytes(
             Be, num_tiles, V, itemsize=dtype_bytes
         )
+    coeff_bytes = 0
+    if cache_apply_coeffs and num_tiles > 1:
+        coeff_bytes = 2 * _nbytes(Be, S, V, itemsize=dtype_bytes)
     return TiledSolveStats(
         B=B,
         S=S,
@@ -127,6 +136,7 @@ def estimate_tiled_solve_memory(
         full_A_bytes=_nbytes(Be, S, V, V, itemsize=dtype_bytes),
         peak_tile_A_bytes=_nbytes(Be, peak_tile, V, V, itemsize=dtype_bytes),
         summary_bytes=summary_bytes,
+        coeff_bytes=coeff_bytes,
         local_delta_bytes=0,
         carry_bytes=0 if num_tiles == 1 else _nbytes(Be, num_tiles, V, itemsize=dtype_bytes),
     )
@@ -202,11 +212,14 @@ if TRITON_AVAILABLE:
         h0_row,
         summary_M,
         summary_b,
+        coeff_alpha,
+        coeff_b,
         S: tl.constexpr,
         V: tl.constexpr,
         NUM_TILES: tl.constexpr,
         TILE: tl.constexpr,
         BLOCK_V: tl.constexpr,
+        STORE_COEFFS: tl.constexpr,
     ):
         be = tl.program_id(0)
         tile_id = tl.program_id(1)
@@ -249,8 +262,13 @@ if TRITON_AVAILABLE:
             residual = h_cur - fval * h_prev - one_minus_f * h_new
             b = -residual
             sech2 = 1.0 - h_new * h_new
-            M = tl.where(eye, fval, 0.0) + one_minus_f * sech2[:, None] * Wt
+            alpha = one_minus_f * sech2
+            M = tl.where(eye, fval, 0.0) + alpha[:, None] * Wt
             M = tl.where(mmask, M, 0.0)
+            if STORE_COEFFS:
+                base_coeff = be * S * V + t * V
+                tl.store(coeff_alpha + base_coeff + offs, alpha, mask=valid_t & vmask)
+                tl.store(coeff_b + base_coeff + offs, b, mask=valid_t & vmask)
 
             P = tl.dot(M, P)
             c = tl.sum(M * c[None, :], axis=1) + b
@@ -345,6 +363,47 @@ if TRITON_AVAILABLE:
             M = tl.where(eye, fval, 0.0) + one_minus_f * sech2[:, None] * Wt
             M = tl.where(mmask, M, 0.0)
             d = tl.sum(M * d[None, :], axis=1) + b
+            d = tl.where(vmask, d, 0.0)
+            tl.store(h_next + be * S * V + t * V + offs, h_cur + omega_sor * d, mask=valid_t & vmask)
+
+    @triton.jit
+    def _apply_coeff_carry_kernel(
+        h,
+        f_t,
+        W_be,
+        coeff_alpha,
+        coeff_b,
+        carries,
+        h_next,
+        omega_sor: tl.constexpr,
+        S: tl.constexpr,
+        V: tl.constexpr,
+        NUM_TILES: tl.constexpr,
+        TILE: tl.constexpr,
+        BLOCK_V: tl.constexpr,
+    ):
+        be = tl.program_id(0)
+        tile_id = tl.program_id(1)
+        start = tile_id * TILE
+        offs = tl.arange(0, BLOCK_V)
+        rows = tl.arange(0, BLOCK_V)[:, None]
+        cols = tl.arange(0, BLOCK_V)[None, :]
+        vmask = offs < V
+        mmask = (rows < V) & (cols < V)
+        d = tl.load(carries + (be * NUM_TILES + tile_id) * V + offs, mask=vmask, other=0.0)
+        Wt = tl.load(W_be + be * V * V + cols * V + rows, mask=mmask, other=0.0)
+
+        for step in tl.static_range(0, TILE):
+            t = start + step
+            valid_t = t < S
+            h_cur = tl.load(h + be * S * V + t * V + offs, mask=valid_t & vmask, other=0.0)
+            fval = tl.load(f_t + be * S + t, mask=valid_t, other=0.0).to(tl.float32)
+            base_coeff = be * S * V + t * V
+            alpha = tl.load(coeff_alpha + base_coeff + offs, mask=valid_t & vmask, other=0.0)
+            b = tl.load(coeff_b + base_coeff + offs, mask=valid_t & vmask, other=0.0)
+
+            wd = tl.sum(Wt * d[None, :], axis=1)
+            d = fval * d + alpha * wd + b
             d = tl.where(vmask, d, 0.0)
             tl.store(h_next + be * S * V + t * V + offs, h_cur + omega_sor * d, mask=valid_t & vmask)
 
@@ -529,6 +588,7 @@ def _tiled_newton_delta(
     tile_size: int,
     prefer_triton: bool,
     omega_sor: float,
+    cache_apply_coeffs: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, TiledSolveStats]:
     Be, S, V = h.shape
     if tile_size <= 0:
@@ -542,6 +602,7 @@ def _tiled_newton_delta(
         V=V,
         tile_size=tile_size,
         dtype=h.dtype,
+        cache_apply_coeffs=cache_apply_coeffs,
     )
 
     use_triton = (
@@ -574,6 +635,12 @@ def _tiled_newton_delta(
             return h_next, empty_summaries, stats
         summaries_M = torch.empty(Be, num_tiles, V, V, device=h.device, dtype=h.dtype)
         summaries_b = torch.empty(Be, num_tiles, V, device=h.device, dtype=h.dtype)
+        if cache_apply_coeffs:
+            coeff_alpha = torch.empty(Be, S, V, device=h.device, dtype=h.dtype)
+            coeff_b = torch.empty(Be, S, V, device=h.device, dtype=h.dtype)
+        else:
+            coeff_alpha = torch.empty(0, device=h.device, dtype=h.dtype)
+            coeff_b = torch.empty(0, device=h.device, dtype=h.dtype)
         grid = (Be, num_tiles)
         _local_tile_kernel[grid](
             h,
@@ -583,31 +650,52 @@ def _tiled_newton_delta(
             h0_row,
             summaries_M,
             summaries_b,
+            coeff_alpha,
+            coeff_b,
             S,
             V,
             num_tiles,
             tile_size,
             block_v,
+            STORE_COEFFS=cache_apply_coeffs,
             num_warps=1,
         )
         carries = _scan_summaries_triton(summaries_M, summaries_b, block_v)
         h_next = torch.empty_like(h)
-        _apply_carry_kernel[grid](
-            h,
-            x_proj,
-            f_t,
-            W_be,
-            h0_row,
-            carries,
-            h_next,
-            omega_sor,
-            S,
-            V,
-            num_tiles,
-            tile_size,
-            block_v,
-            num_warps=1,
-        )
+        if cache_apply_coeffs:
+            _apply_coeff_carry_kernel[grid](
+                h,
+                f_t,
+                W_be,
+                coeff_alpha,
+                coeff_b,
+                carries,
+                h_next,
+                omega_sor,
+                S,
+                V,
+                num_tiles,
+                tile_size,
+                block_v,
+                num_warps=1,
+            )
+        else:
+            _apply_carry_kernel[grid](
+                h,
+                x_proj,
+                f_t,
+                W_be,
+                h0_row,
+                carries,
+                h_next,
+                omega_sor,
+                S,
+                V,
+                num_tiles,
+                tile_size,
+                block_v,
+                num_warps=1,
+            )
     else:
         summaries_M, summaries_b = _local_tiles_torch(h, x_proj, f_t, W_be, h0_row, tile_size)
         carries = _scan_summaries_torch(summaries_M, summaries_b)
@@ -659,6 +747,7 @@ def m2rnn_pararnn_tiled_triton_forward(
         V=V,
         tile_size=config.tile_size,
         dtype=qf.dtype,
+        cache_apply_coeffs=config.cache_apply_coeffs,
     )
     for _ in range(config.max_its):
         h, _summaries_M, _stats = _tiled_newton_delta(
@@ -670,6 +759,7 @@ def m2rnn_pararnn_tiled_triton_forward(
             tile_size=config.tile_size,
             prefer_triton=config.prefer_triton,
             omega_sor=config.omega_sor,
+            cache_apply_coeffs=config.cache_apply_coeffs,
         )
 
     h_bshkv = h.view(B, H, K, S, V).permute(0, 3, 1, 2, 4)

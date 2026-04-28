@@ -105,6 +105,7 @@ def _stage_profile(
     tile: int,
     warmup: int,
     repeat: int,
+    cache_apply_coeffs: bool,
 ) -> tuple[float, float, float, float]:
     if not (TRITON_AVAILABLE and q.is_cuda):
         raise RuntimeError("--stage-profile requires CUDA and Triton")
@@ -117,6 +118,12 @@ def _stage_profile(
     h = torch.zeros(Be, S, V, device=q.device, dtype=qf.dtype)
     summaries_M = torch.empty(Be, num_tiles, V, V, device=q.device, dtype=qf.dtype)
     summaries_b = torch.empty(Be, num_tiles, V, device=q.device, dtype=qf.dtype)
+    if cache_apply_coeffs:
+        coeff_alpha = torch.empty(Be, S, V, device=q.device, dtype=qf.dtype)
+        coeff_b = torch.empty(Be, S, V, device=q.device, dtype=qf.dtype)
+    else:
+        coeff_alpha = torch.empty(0, device=q.device, dtype=qf.dtype)
+        coeff_b = torch.empty(0, device=q.device, dtype=qf.dtype)
     carries = torch.empty(Be, num_tiles, V, device=q.device, dtype=qf.dtype)
     h_next = torch.empty_like(h)
     grid = (Be, num_tiles)
@@ -130,11 +137,14 @@ def _stage_profile(
             h0_row,
             summaries_M,
             summaries_b,
+            coeff_alpha,
+            coeff_b,
             S,
             V,
             num_tiles,
             tile,
             block_v,
+            STORE_COEFFS=cache_apply_coeffs,
             num_warps=1,
         )
 
@@ -150,22 +160,40 @@ def _stage_profile(
         )
 
     def apply_pass():
-        _tiled_impl._apply_carry_kernel[grid](
-            h,
-            x_proj,
-            f_t,
-            W_be,
-            h0_row,
-            carries,
-            h_next,
-            1.0,
-            S,
-            V,
-            num_tiles,
-            tile,
-            block_v,
-            num_warps=1,
-        )
+        if cache_apply_coeffs:
+            _tiled_impl._apply_coeff_carry_kernel[grid](
+                h,
+                f_t,
+                W_be,
+                coeff_alpha,
+                coeff_b,
+                carries,
+                h_next,
+                1.0,
+                S,
+                V,
+                num_tiles,
+                tile,
+                block_v,
+                num_warps=1,
+            )
+        else:
+            _tiled_impl._apply_carry_kernel[grid](
+                h,
+                x_proj,
+                f_t,
+                W_be,
+                h0_row,
+                carries,
+                h_next,
+                1.0,
+                S,
+                V,
+                num_tiles,
+                tile,
+                block_v,
+                num_warps=1,
+            )
 
     local_pass()
     summary_scan()
@@ -200,6 +228,7 @@ def main() -> None:
     parser.add_argument("--force-torch", action="store_true")
     parser.add_argument("--check-dense", action="store_true")
     parser.add_argument("--stage-profile", action="store_true")
+    parser.add_argument("--cache-apply-coeffs", action="store_true")
     args = parser.parse_args()
 
     profile = PROFILES[args.profile]
@@ -219,8 +248,14 @@ def main() -> None:
         f"profile={args.profile} device={args.device} dtype={dtype} "
         f"triton_available={TRITON_AVAILABLE} prefer_triton={prefer_triton}"
     )
-    print(f"shape B={B} S={S} H={H} K={K} V={V} iters={args.iters} tiles={tiles}")
-    print("tile,num_tiles,latency_ms,peak_alloc,full_A,peak_tile_A,summary,ratio")
+    print(
+        f"shape B={B} S={S} H={H} K={K} V={V} iters={args.iters} "
+        f"tiles={tiles} cache_apply_coeffs={args.cache_apply_coeffs}"
+    )
+    header = "tile,num_tiles,latency_ms,peak_alloc,full_A,peak_tile_A,summary,ratio"
+    if args.cache_apply_coeffs:
+        header += ",coeff"
+    print(header)
     if args.stage_profile:
         print("stage,tile,local_ms,scan_ms,apply_ms,total_ms,local_pct,scan_pct,apply_pct")
 
@@ -241,6 +276,7 @@ def main() -> None:
             init_strategy="zero",
             tile_size=tile,
             prefer_triton=prefer_triton,
+            cache_apply_coeffs=args.cache_apply_coeffs,
         )
 
         def run_once():
@@ -248,12 +284,23 @@ def main() -> None:
 
         elapsed_ms, peak_alloc = _measure(run_once, device=args.device, warmup=args.warmup, repeat=args.repeat)
         compute_dtype = torch.promote_types(torch.float32, dtype)
-        stats = estimate_tiled_solve_memory(B=B, S=S, H=H, K=K, V=V, tile_size=tile, dtype=compute_dtype)
+        stats = estimate_tiled_solve_memory(
+            B=B,
+            S=S,
+            H=H,
+            K=K,
+            V=V,
+            tile_size=tile,
+            dtype=compute_dtype,
+            cache_apply_coeffs=args.cache_apply_coeffs,
+        )
         line = (
             f"{tile},{stats.num_tiles},{elapsed_ms:.3f},{_bytes(peak_alloc)},"
             f"{_bytes(stats.full_A_bytes)},{_bytes(stats.peak_tile_A_bytes)},"
             f"{_bytes(stats.summary_bytes)},{stats.full_A_to_tile_ratio:.2f}x"
         )
+        if args.cache_apply_coeffs:
+            line += f",{_bytes(stats.coeff_bytes)}"
         if dense_ref is not None:
             out, h = run_once()
             max_out = (out.float() - dense_ref[0].float()).abs().max().item()
@@ -270,6 +317,7 @@ def main() -> None:
                 tile=tile,
                 warmup=args.warmup,
                 repeat=args.repeat,
+                cache_apply_coeffs=args.cache_apply_coeffs,
             )
             local_pct = 100.0 * local_ms / total_ms if total_ms > 0.0 else 0.0
             scan_pct = 100.0 * scan_ms / total_ms if total_ms > 0.0 else 0.0

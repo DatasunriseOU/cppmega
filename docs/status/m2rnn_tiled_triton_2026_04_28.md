@@ -155,6 +155,58 @@ remove the replayed local/apply work or use a different recurrence formulation;
 more SMs, more HBM, tile64, or `num_warps` tuning do not change the order of
 magnitude.
 
+## Compact Coeff Replay Test After `a95beeb`
+
+Question: can we change the algorithm without changing the Newton step
+semantics, remove the expensive nonlinear apply replay, and avoid full
+`local_prefix`?
+
+Implemented opt-in `TiledTritonConfig(cache_apply_coeffs=True)`. The local pass
+still computes the exact same per-token linearization, but stores only compact
+factors:
+
+- `alpha_t = (1 - f_t) * (1 - tanh(z_t)^2)`, shape `[Be,S,V]`
+- `b_t = -residual_t`, shape `[Be,S,V]`
+
+The apply pass then updates with:
+
+```text
+d_t = f_t * d_{t-1} + alpha_t * (W^T d_{t-1}) + b_t
+h_next_t = h_t + omega * d_t
+```
+
+This preserves the tiled Newton math and avoids storing the full per-token
+`[Be,S,V,V]` local prefix. It does not remove the intra-tile sequential scan;
+it only removes the second `tanh/residual/sech2` construction.
+
+Validation:
+
+```bash
+python -m py_compile cppmega/megatron/m2rnn_pararnn_tiled_triton.py \
+  scripts/bench_m2rnn_tiled_triton.py
+pytest -q tests/test_m2rnn_pararnn_tiled_triton.py
+```
+
+Result: `8 passed`.
+
+GB10 timing, `B=2,S=4096,H=44,K=64,V=16,bf16,max_its=1,tile=64`:
+
+| path | latency | peak alloc | coeff memory | local | scan | apply |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| replay default | 113.238 ms | 4.82 GiB | 0 | 28.062 ms | 1.842 ms | 26.958 ms |
+| cached coeffs | 132.536 ms | 7.57 GiB | 2.75 GiB | 40.000 ms | 1.870 ms | 36.605 ms |
+
+Conclusion: compact coefficient caching is a semantic-preserving algorithm
+change, but it is slower on GB10 and raises memory by 2.75 GiB at the production
+NAM56R shape. The extra global writes/reads outweigh the saved nonlinear replay.
+This closes the obvious "no full local_prefix but no recompute" variant as a
+production candidate. The only exact ways left are the known tradeoff triangle:
+
+- store full per-token prefix/local coefficients and pay memory bandwidth;
+- recompute local coefficients and pay replay;
+- run the sequence as a persistent recurrence and give up sequence
+  parallelism.
+
 ## Sixth Optimization Cycle After `ed2c702`
 
 ### Search Pass

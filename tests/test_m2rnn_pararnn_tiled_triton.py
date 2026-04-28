@@ -114,6 +114,28 @@ def test_triton_path_matches_torch_streaming_one_iteration_cuda():
     not torch.cuda.is_available() or not TRITON_AVAILABLE,
     reason="Triton tiled prototype requires CUDA and triton",
 )
+def test_triton_cached_apply_coeffs_match_replay_cuda():
+    B, S, H, K, V = 1, 23, 1, 2, 4
+    q, k, v, W, xf = _make_inputs(B, S, H, K, V, device="cuda", dtype=torch.float32, seed=6)
+
+    cfg_replay = TiledTritonConfig(max_its=2, tile_size=7, prefer_triton=True)
+    cfg_cached = TiledTritonConfig(
+        max_its=2,
+        tile_size=7,
+        prefer_triton=True,
+        cache_apply_coeffs=True,
+    )
+    out_replay, h_replay = m2rnn_pararnn_tiled_triton_forward(q, k, v, W, xf, config=cfg_replay)
+    out_cached, h_cached = m2rnn_pararnn_tiled_triton_forward(q, k, v, W, xf, config=cfg_cached)
+
+    torch.testing.assert_close(out_cached, out_replay, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(h_cached, h_replay, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not TRITON_AVAILABLE,
+    reason="Triton tiled prototype requires CUDA and triton",
+)
 def test_triton_one_tile_fast_path_matches_torch_streaming_cuda():
     B, S, H, K, V = 1, 16, 1, 2, 4
     q, k, v, W, xf = _make_inputs(B, S, H, K, V, device="cuda", dtype=torch.float32, seed=5)
