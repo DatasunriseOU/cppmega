@@ -169,8 +169,12 @@ def test_tilelang_summary_apply_matches_full_pararnn_scan_cuda(tile_len):
 
     torch.testing.assert_close(out_tiled, out_full, atol=2e-6, rtol=2e-6)
     torch.testing.assert_close(h_tiled, h_full, atol=2e-6, rtol=2e-6)
-    assert stats.backend_used == "tilelang-summary+tilelang-apply"
+    assert stats.backend_used in (
+        "tilelang-summary+triton-scan+tilelang-apply",
+        "tilelang-summary+tilelang-scan+tilelang-apply",
+    )
     assert stats.tilelang_summary_used
+    assert stats.triton_scan_used or stats.tilelang_scan_used
     assert stats.tilelang_apply_used
     assert stats.torch_materialized_tile_jac_elements == 0
 
@@ -207,6 +211,10 @@ def test_tilelang_bf16_callers_use_fp32_solve_buffers_cuda():
 
     assert out_tiled.dtype == torch.bfloat16
     assert h_tiled.dtype == torch.bfloat16
-    assert stats.backend_used == "tilelang-summary+tilelang-apply"
+    assert stats.backend_used in (
+        "tilelang-summary+triton-scan+tilelang-apply",
+        "tilelang-summary+tilelang-scan+tilelang-apply",
+    )
+    assert stats.triton_scan_used or stats.tilelang_scan_used
     torch.testing.assert_close(out_tiled.float(), out_full.float(), atol=8e-3, rtol=8e-3)
     torch.testing.assert_close(h_tiled.float(), h_full.float(), atol=8e-3, rtol=8e-3)

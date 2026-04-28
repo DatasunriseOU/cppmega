@@ -162,6 +162,132 @@ python -m pytest tests/test_preflight_smem_check.py -q
 
 - TileLang kernels are fixed to `V=16`, CUDA, fp32 solve buffers, and tile lengths `16/32/64`.
 - bf16 caller coverage exists via fp32 staging, not native bf16 TileLang kernel tensors.
-- Inter-tile summary scan is still PyTorch.
+- Inter-tile summary scan now has a GPU path: Triton first, TileLang scan fallback,
+  then PyTorch fallback if GPU scan compilation/runtime fails.
 - The apply pass is no-local-prefix but sequential inside each tile. This proves the memory path; it is not yet faster than the full PyTorch ParaRNN scan on the small probe.
 - TileLang emits a deprecation warning for `TL_DISABLE_TMA_LOWER`; this branch keeps the pass config because it is consistent with the existing TileLang kernels in the repo.
+
+## Continuation Update - M2RNN TileLang Scan Optimization
+
+### TileLang/Triton Docs and Local Examples Read
+
+- Web docs: <https://tilelang.com/autoapi/tilelang/language/loop/index.html>,
+  <https://www.tilelang.com/autoapi/tilelang/analysis/nested_loop_checker/index.html>,
+  <https://www.tilelang.com/autoapi/tilelang/layout/fragment/index.html>,
+  <https://tilelang.com/autoapi/tilelang/jit/index.html>,
+  <https://www.tilelang.com/get_started/targets.html>,
+  <https://www.tilelang.com/programming_guides/autotuning.html>.
+- Local docs/examples:
+  `/home/dave/tilelang-build/docs/programming_guides/control_flow.md`,
+  `/home/dave/tilelang-build/docs/get_started/targets.md`,
+  `/home/dave/tilelang-build/docs/get_started/Installation.md`,
+  `/home/dave/tilelang-build/examples/gdn/example_cumsum.py`,
+  `/home/dave/tilelang-build/tilelang/language/reduce_op.py`,
+  `/home/dave/tilelang-build/tilelang/jit/__init__.py`,
+  `/home/dave/tilelang-build/tilelang/cache/__init__.py`.
+- Takeaways:
+  1. `T.serial` is safest inside fragment-heavy recurrence code; nested/adjacent
+     `T.Parallel` has semantic restrictions and can trigger layout inference
+     failures when mixed with tile ops.
+  2. `T.Fragment` controls register/fragment mapping and can be attached to
+     parallel loop layout, but the current V=16 recurrence stays conservative
+     with serial fragment loops.
+  3. TileLang exposes `T.cumsum` for local block prefix work, as shown in
+     `examples/gdn/example_cumsum.py`, but affine matrix summary scan is custom.
+  4. TileLang JIT/cache is keyed through `tilelang.cache.cached`; target strings
+     keep keys deterministic, and compile flags/pass configs flow through
+     `tilelang.jit`.
+  5. The default compile cache is `~/.tilelang/cache`; `TL_DISABLE_TMA_LOWER`
+     is deprecated in this TileLang build but remains used by existing kernels.
+
+### Profiling Findings
+
+Baseline before this patch, command:
+
+```text
+PYTHONPATH=. python tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py --backend tilelang --no-fallback --sweep-tile-lens --B 1 --S 65 --H 2 --K 4 --V 16 --max-its 3 --benchmark --warmup 2 --repeats 5
+```
+
+Prior status result:
+
+```text
+tile_len=16 tiled_ms=4.106
+tile_len=32 tiled_ms=2.247
+tile_len=64 tiled_ms=3.998
+```
+
+Stage timing on GB10 showed why `tile_len=32` is around 2.2 ms: per Newton
+iteration, the summary kernel dominates.
+
+```text
+S=65, Be=8, V=16
+tile_len=16 n_tiles=5 summary_gpu_ms=1.2759 apply_gpu_ms=0.0281 scan_torch_wall_ms=0.1198 scan_triton_wall_ms=0.0055 full_forward_wall_ms=3.9797
+tile_len=32 n_tiles=3 summary_gpu_ms=0.7098 apply_gpu_ms=0.0550 scan_torch_wall_ms=0.0746 scan_triton_wall_ms=0.0055 full_forward_wall_ms=2.2209
+tile_len=64 n_tiles=2 summary_gpu_ms=1.2128 apply_gpu_ms=0.1090 scan_torch_wall_ms=0.0514 scan_triton_wall_ms=0.0054 full_forward_wall_ms=3.9637
+```
+
+So `tile_len=32` is best because it balances fewer tiles than 16 with less
+serial per-CTA work than 64. Launch/JIT is not in the hot timing after warmup;
+allocation was about 0.004 ms for the small probe. The remaining major cost is
+the serial V=16 fragment summary recurrence, especially the `P_next = -J @ P`
+work inside every token.
+
+### Patch
+
+- Added a PyTorch-free GPU inter-tile scan:
+  Triton first, TileLang scan fallback, PyTorch fallback.
+- Kept the TileLang summary/apply kernels and no-local-prefix apply path intact.
+- Kept bf16 callers on the existing fp32 solve-buffer policy; outputs still cast
+  back to the caller dtype.
+- cuTile is not used.
+
+After patch:
+
+```text
+PYTHONPATH=. python tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py --backend tilelang --no-fallback --sweep-tile-lens --B 1 --S 65 --H 2 --K 4 --V 16 --max-its 3 --benchmark --warmup 10 --repeats 50 --dtype float32
+
+tile_len=16 backend_used=tilelang-summary+triton-scan+tilelang-apply tiled_ms=4.065 full_pararnn_ms=1.713
+tile_len=32 backend_used=tilelang-summary+triton-scan+tilelang-apply tiled_ms=2.216 full_pararnn_ms=1.704
+tile_len=64 backend_used=tilelang-summary+triton-scan+tilelang-apply tiled_ms=3.977 full_pararnn_ms=1.704
+max error vs full ParaRNN: out=1.564622e-07, h=1.192093e-07
+```
+
+bf16 caller probe:
+
+```text
+PYTHONPATH=. python tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py --backend tilelang --no-fallback --tile-len 32 --B 1 --S 33 --H 1 --K 2 --V 16 --max-its 2 --dtype bfloat16
+
+backend_used=tilelang-summary+triton-scan+tilelang-apply
+out_max_diff_vs_full_pararnn=0.000000e+00
+h_max_diff_vs_full_pararnn=0.000000e+00
+torch_materialized_tile_jac_elements=0
+```
+
+### Validation
+
+Passed:
+
+```text
+PYTHONPATH=. python -m py_compile cppmega/megatron/m2rnn_pararnn_tiled_tilelang.py tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py
+PYTHONPATH=. python -m pytest tests/test_m2rnn_pararnn_tiled_tilelang.py -q
+PYTHONPATH=. python -m pytest tests/test_m2rnn_pararnn.py tests/test_m2rnn_pararnn_tiled_tilelang.py -q
+PYTHONPATH=. python -m pytest tests/test_preflight_smem_check.py -q
+```
+
+Observed:
+
+```text
+9 passed
+22 passed
+16 passed
+```
+
+### Remaining Limits After This Patch
+
+- Summary/apply remain fixed to CUDA fp32 solve buffers with `V=16` and
+  `tile_len in {16,32,64}`.
+- Triton scan compiles per `n_tiles` constexpr; TileLang scan and PyTorch scan
+  remain fallback paths.
+- The path is still slower than full PyTorch ParaRNN on the small probe because
+  summary dominates; the next useful optimization is reducing or parallelizing
+  the serial V=16 summary fragment work.

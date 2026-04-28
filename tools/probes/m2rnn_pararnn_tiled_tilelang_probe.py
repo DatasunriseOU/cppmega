@@ -95,6 +95,8 @@ def _run_case(args, *, tile_len: int, dtype: torch.dtype, device: str) -> None:
     print(f"tilelang_attempted={stats.tilelang_attempted}")
     print(f"tilelang_used={stats.tilelang_used}")
     print(f"tilelang_summary_used={stats.tilelang_summary_used}")
+    print(f"triton_scan_used={stats.triton_scan_used}")
+    print(f"tilelang_scan_used={stats.tilelang_scan_used}")
     print(f"tilelang_apply_used={stats.tilelang_apply_used}")
     print(f"out_max_diff_vs_full_pararnn={_max_diff(out_tiled, out_full):.6e}")
     print(f"h_max_diff_vs_full_pararnn={_max_diff(h_tiled, h_full):.6e}")

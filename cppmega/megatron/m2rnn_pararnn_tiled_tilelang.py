@@ -4,7 +4,7 @@ This variant keeps the Newton Jacobian blocks local to a sequence tile.  A
 Newton iteration is split into:
 
 1. assemble each tile's affine summary ``delta_tail = A_tile @ carry + b_tile``;
-2. scan the tile summaries in PyTorch to get one carry per tile;
+2. scan the tile summaries on GPU to get one carry per tile;
 3. re-assemble each tile and stream the carry application to write deltas.
 
 The full ``A[B, S, H, K, V, V]`` tensor is never materialized.  The optional
@@ -29,6 +29,16 @@ from cppmega.megatron.m2rnn_pararnn import (
     _parallel_reduce_dense,
     m2rnn_pararnn_forward,
 )
+
+try:
+    import triton
+    import triton.language as tl
+
+    TRITON_AVAILABLE = True
+except ImportError:  # pragma: no cover - triton-less envs
+    triton = None  # type: ignore[assignment]
+    tl = None  # type: ignore[assignment]
+    TRITON_AVAILABLE = False
 
 
 Backend = Literal["auto", "torch", "tilelang"]
@@ -65,10 +75,16 @@ class TiledTileLangStats:
     tilelang_used: bool = False
     tilelang_summary_attempted: bool = False
     tilelang_summary_used: bool = False
+    triton_scan_attempted: bool = False
+    triton_scan_used: bool = False
+    tilelang_scan_attempted: bool = False
+    tilelang_scan_used: bool = False
     tilelang_apply_attempted: bool = False
     tilelang_apply_used: bool = False
     tilelang_compile_log: str = ""
     tilelang_summary_compile_log: str = ""
+    triton_scan_compile_log: str = ""
+    tilelang_scan_compile_log: str = ""
     tilelang_apply_compile_log: str = ""
     torch_materialized_tile_jac_elements: int = 0
 
@@ -271,6 +287,120 @@ def _scan_tile_summaries(
         carries[:, tile_idx] = carry
         carry = torch.einsum("bij,bj->bi", summary_A[:, tile_idx], carry) + summary_b[:, tile_idx]
     return carries, carry
+
+
+if TRITON_AVAILABLE:
+
+    @triton.jit
+    def _triton_scan_kernel(
+        SummaryA,
+        SummaryB,
+        Carries,
+        N_TILES: tl.constexpr,
+        V: tl.constexpr,
+    ):
+        be_i = tl.program_id(0)
+        offs = tl.arange(0, 16)
+        rows = tl.arange(0, 16)[:, None]
+        cols = tl.arange(0, 16)[None, :]
+        carry = tl.full((16,), 0.0, tl.float32)
+
+        for tile_i in tl.static_range(0, N_TILES):
+            tl.store(Carries + be_i * N_TILES * V + tile_i * V + offs, carry)
+            mat = tl.load(
+                SummaryA
+                + be_i * N_TILES * V * V
+                + tile_i * V * V
+                + rows * V
+                + cols
+            )
+            bias = tl.load(SummaryB + be_i * N_TILES * V + tile_i * V + offs)
+            carry = tl.sum(mat * carry[None, :], axis=1) + bias
+
+
+def _try_triton_scan(
+    summary_A: torch.Tensor,
+    summary_b: torch.Tensor,
+    carries: torch.Tensor,
+) -> tuple[bool, str]:
+    if not TRITON_AVAILABLE:
+        return False, "triton is not importable"
+    log = io.StringIO()
+    try:
+        _triton_scan_kernel[(summary_A.size(0),)](
+            summary_A,
+            summary_b,
+            carries,
+            N_TILES=summary_A.size(1),
+            V=summary_A.size(2),
+            num_warps=1,
+        )
+        return True, ""
+    except Exception:
+        log.write(traceback.format_exc())
+        return False, log.getvalue()
+
+
+@lru_cache(maxsize=1)
+def _tilelang_scan_kernel():
+    import tilelang
+    from tilelang import language as T
+
+    V = 16
+    be = T.dynamic("be")
+    n_tiles = T.dynamic("n_tiles")
+
+    @tilelang.jit(
+        pass_configs={
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+            tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
+        },
+    )
+    def kernel_builder():
+        @T.prim_func
+        def main(
+            SummaryA: T.Tensor([be, n_tiles, V, V], T.float32),
+            SummaryB: T.Tensor([be, n_tiles, V], T.float32),
+            Carries: T.Tensor([be, n_tiles, V], T.float32),
+        ):
+            with T.Kernel(be, threads=128) as be_i:
+                carry = T.alloc_fragment([V], T.float32)
+                carry_next = T.alloc_fragment([V], T.float32)
+
+                for vi in T.serial(V):
+                    carry[vi] = 0.0
+
+                for tile_i in T.serial(n_tiles):
+                    for vi in T.serial(V):
+                        Carries[be_i, tile_i, vi] = carry[vi]
+
+                    for vi in T.serial(V):
+                        carry_next[vi] = SummaryB[be_i, tile_i, vi]
+                        for vj in T.serial(V):
+                            carry_next[vi] += SummaryA[be_i, tile_i, vi, vj] * carry[vj]
+
+                    for vi in T.serial(V):
+                        carry[vi] = carry_next[vi]
+
+        return main
+
+    return kernel_builder()
+
+
+def _try_tilelang_scan(
+    summary_A: torch.Tensor,
+    summary_b: torch.Tensor,
+    carries: torch.Tensor,
+) -> tuple[bool, str]:
+    log = io.StringIO()
+    try:
+        kernel = _tilelang_scan_kernel()
+        kernel(summary_A, summary_b, carries)
+        return True, ""
+    except Exception:
+        log.write(traceback.format_exc())
+        return False, log.getvalue()
 
 
 def _tilelang_eligible(
@@ -606,6 +736,7 @@ def m2rnn_pararnn_tiled_tilelang_forward(
     )
 
     use_tilelang_summary = _tilelang_eligible(config, x_proj, v_dim)
+    use_tilelang_scan = _tilelang_eligible(config, x_proj, v_dim)
     use_tilelang_apply = _tilelang_eligible(config, x_proj, v_dim)
     for _ in range(config.max_its):
         summary_A = torch.empty(Be, n_tiles, v_dim, v_dim, device=x_proj.device, dtype=x_proj.dtype)
@@ -656,7 +787,41 @@ def m2rnn_pararnn_tiled_tilelang_forward(
                 max_summary,
             )
 
-        carries, _final_delta = _scan_tile_summaries(summary_A, summary_b)
+        carries = torch.empty(Be, n_tiles, v_dim, device=x_proj.device, dtype=x_proj.dtype)
+        if use_tilelang_scan:
+            stats.tilelang_attempted = True
+            stats.triton_scan_attempted = True
+            ok, compile_log = _try_triton_scan(summary_A, summary_b, carries)
+            if ok:
+                stats.tilelang_used = True
+                stats.triton_scan_used = True
+            else:
+                stats.triton_scan_compile_log = compile_log
+                stats.tilelang_scan_attempted = True
+                ok, compile_log = _try_tilelang_scan(summary_A, summary_b, carries)
+                if ok:
+                    stats.tilelang_used = True
+                    stats.tilelang_scan_used = True
+                else:
+                    stats.tilelang_scan_compile_log = compile_log
+                    use_tilelang_scan = False
+
+            if not (stats.triton_scan_used or stats.tilelang_scan_used):
+                stats.tilelang_compile_log = "\n".join(
+                    log
+                    for log in (
+                        stats.tilelang_summary_compile_log,
+                        stats.triton_scan_compile_log,
+                        stats.tilelang_scan_compile_log,
+                        stats.tilelang_apply_compile_log,
+                    )
+                    if log
+                )
+                if config.backend == "tilelang" and not config.allow_tilelang_fallback:
+                    raise RuntimeError("M2RNN GPU scan kernel failed") from None
+
+        if not use_tilelang_scan:
+            carries, _final_delta = _scan_tile_summaries(summary_A, summary_b)
         delta = torch.empty_like(h)
         if use_tilelang_apply:
             stats.tilelang_attempted = True
@@ -682,7 +847,12 @@ def m2rnn_pararnn_tiled_tilelang_forward(
                 stats.tilelang_apply_compile_log = compile_log
                 stats.tilelang_compile_log = "\n".join(
                     log
-                    for log in (stats.tilelang_summary_compile_log, stats.tilelang_apply_compile_log)
+                    for log in (
+                        stats.tilelang_summary_compile_log,
+                        stats.triton_scan_compile_log,
+                        stats.tilelang_scan_compile_log,
+                        stats.tilelang_apply_compile_log,
+                    )
                     if log
                 )
                 if config.backend == "tilelang" and not config.allow_tilelang_fallback:
@@ -705,8 +875,12 @@ def m2rnn_pararnn_tiled_tilelang_forward(
                 max_apply,
             )
 
-        if stats.tilelang_summary_used and stats.tilelang_apply_used:
-            stats.backend_used = "tilelang-summary+tilelang-apply"
+        gpu_scan_used = stats.triton_scan_used or stats.tilelang_scan_used
+        if stats.tilelang_summary_used and gpu_scan_used and stats.tilelang_apply_used:
+            scan_backend = "triton-scan" if stats.triton_scan_used else "tilelang-scan"
+            stats.backend_used = f"tilelang-summary+{scan_backend}+tilelang-apply"
+        elif stats.tilelang_summary_used and stats.tilelang_apply_used:
+            stats.backend_used = "tilelang-summary+torch-scan+tilelang-apply"
         elif stats.tilelang_summary_used:
             stats.backend_used = "tilelang-summary+torch-apply"
         elif stats.tilelang_apply_used:
