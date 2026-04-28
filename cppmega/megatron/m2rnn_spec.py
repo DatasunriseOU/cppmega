@@ -45,6 +45,13 @@ except ImportError:  # pragma: no cover
     _M2RNN_TRITON_AVAILABLE = False
     _m2rnn_scan_triton = None  # type: ignore[assignment]
 
+# Newton-linearized parallel scan import.  CPPMEGA_M2RNN_KERNEL=newton selects
+# the O(log C) Newton + Blelloch scan path for intra-chunk parallelism.
+try:
+    from cppmega.megatron.m2rnn_newton_scan import m2rnn_scan_newton as _m2rnn_scan_newton
+except ImportError:  # pragma: no cover
+    _m2rnn_scan_newton = None
+
 
 def _softplus_decay_gate(x: torch.Tensor, A_log: torch.Tensor, dt_bias: torch.Tensor) -> torch.Tensor:
     x = F.softplus(x.float() + dt_bias)
@@ -229,6 +236,12 @@ class CppMegaM2RNNMixer(nn.Module):
 
         kernel_choice = os.environ.get("CPPMEGA_M2RNN_KERNEL", "triton")
         if (
+            kernel_choice == "newton"
+            and _m2rnn_scan_newton is not None
+            and q.is_cuda
+        ):
+            out, _ = _m2rnn_scan_newton(q=q, k=k, v=v, W=self.state_weight, xf=f)
+        elif (
             kernel_choice == "triton"
             and _M2RNN_TRITON_AVAILABLE
             and q.is_cuda
