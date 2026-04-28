@@ -42,6 +42,7 @@ except ImportError:  # pragma: no cover - triton-less envs
 
 
 Backend = Literal["auto", "torch", "tilelang"]
+SummaryVariant = Literal["serial", "parallel_shared_old"]
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ class TiledTileLangConfig:
     tile_len: int = 32
     backend: Backend = "auto"
     allow_tilelang_fallback: bool = True
+    summary_variant: SummaryVariant = "serial"
 
 
 @dataclass
@@ -104,6 +106,8 @@ def _validate_config(config: TiledTileLangConfig) -> None:
         raise ValueError(f"max_its must be non-negative, got {config.max_its}")
     if config.backend not in ("auto", "torch", "tilelang"):
         raise ValueError(f"unknown backend: {config.backend}")
+    if config.summary_variant not in ("serial", "parallel_shared_old"):
+        raise ValueError(f"unknown summary_variant: {config.summary_variant}")
 
 
 def _broadcast_inputs(
@@ -517,6 +521,109 @@ def _tilelang_summary_kernel(tile_len: int):
     return kernel_builder()
 
 
+@lru_cache(maxsize=8)
+def _tilelang_summary_parallel_shared_old_kernel(tile_len: int):
+    import tilelang
+    from tilelang import language as T
+
+    V = 16
+    be = T.dynamic("be")
+    seq = T.dynamic("seq")
+    n_tiles = T.dynamic("n_tiles")
+
+    @tilelang.jit(
+        pass_configs={
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+            tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE: True,
+        },
+    )
+    def kernel_builder():
+        mat_layout = T.Fragment(
+            [V, V],
+            forward_thread_fn=lambda i, j: (i * V + j) % 128,
+            forward_index_fn=lambda i, j: (i * V + j) // 128,
+        )
+
+        @T.prim_func
+        def main(
+            H: T.Tensor([be, seq, V], T.float32),
+            X: T.Tensor([be, seq, V], T.float32),
+            F: T.Tensor([be, seq], T.float32),
+            W: T.Tensor([be, V, V], T.float32),
+            H0: T.Tensor([be, V], T.float32),
+            SummaryA: T.Tensor([be, n_tiles, V, V], T.float32),
+            SummaryB: T.Tensor([be, n_tiles, V], T.float32),
+        ):
+            with T.Kernel(be, n_tiles, threads=128) as (be_i, tile_i):
+                W_shared = T.alloc_shared([V, V], T.float32)
+                P_old = T.alloc_shared([V, V], T.float32)
+                b_old = T.alloc_shared([V], T.float32)
+                P_next = T.alloc_fragment([V, V], T.float32)
+                b_next = T.alloc_fragment([V], T.float32)
+                h_prev = T.alloc_fragment([V], T.float32)
+                z = T.alloc_fragment([V], T.float32)
+                h_new = T.alloc_fragment([V], T.float32)
+                rhs = T.alloc_fragment([V], T.float32)
+
+                T.copy(W[be_i, 0:V, 0:V], W_shared)
+
+                for i, j in T.Parallel(V, V, loop_layout=mat_layout):
+                    P_old[i, j] = T.if_then_else(i == j, 1.0, 0.0)
+                for i in T.serial(V):
+                    b_old[i] = 0.0
+
+                for local_t in T.serial(tile_len):
+                    s_i = tile_i * tile_len + local_t
+                    if s_i < seq:
+                        f_i = F[be_i, s_i]
+                        for vi in T.serial(V):
+                            if s_i == 0:
+                                h_prev[vi] = H0[be_i, vi]
+                            else:
+                                h_prev[vi] = H[be_i, s_i - 1, vi]
+
+                        for vi in T.serial(V):
+                            z[vi] = X[be_i, s_i, vi]
+                            for vj in T.unroll(V):
+                                z[vi] += h_prev[vj] * W_shared[vj, vi]
+                            h_new[vi] = T.tanh(z[vi])
+                            rhs[vi] = -(
+                                H[be_i, s_i, vi]
+                                - f_i * h_prev[vi]
+                                - (1.0 - f_i) * h_new[vi]
+                            )
+
+                        for vi, vj in T.Parallel(V, V, loop_layout=mat_layout):
+                            sech2 = 1.0 - h_new[vi] * h_new[vi]
+                            P_next[vi, vj] = 0.0
+                            for vk in T.unroll(V):
+                                P_next[vi, vj] += (
+                                    T.if_then_else(vk == vi, f_i, 0.0)
+                                    + (1.0 - f_i) * sech2 * W_shared[vk, vi]
+                                ) * P_old[vk, vj]
+
+                        for vi in T.serial(V):
+                            sech2 = 1.0 - h_new[vi] * h_new[vi]
+                            b_next[vi] = rhs[vi] + f_i * b_old[vi]
+                            for vk in T.unroll(V):
+                                b_next[vi] += (1.0 - f_i) * sech2 * W_shared[vk, vi] * b_old[vk]
+
+                        for vi, vj in T.Parallel(V, V, loop_layout=mat_layout):
+                            P_old[vi, vj] = P_next[vi, vj]
+                        for vi in T.serial(V):
+                            b_old[vi] = b_next[vi]
+
+                for vi, vj in T.Parallel(V, V, loop_layout=mat_layout):
+                    SummaryA[be_i, tile_i, vi, vj] = P_old[vi, vj]
+                for vi in T.serial(V):
+                    SummaryB[be_i, tile_i, vi] = b_old[vi]
+
+        return main
+
+    return kernel_builder()
+
+
 def _try_tilelang_summary(
     h: torch.Tensor,
     x_proj: torch.Tensor,
@@ -526,10 +633,14 @@ def _try_tilelang_summary(
     summary_A: torch.Tensor,
     summary_b: torch.Tensor,
     tile_len: int,
+    summary_variant: SummaryVariant = "serial",
 ) -> tuple[bool, str]:
     log = io.StringIO()
     try:
-        kernel = _tilelang_summary_kernel(tile_len)
+        if summary_variant == "parallel_shared_old":
+            kernel = _tilelang_summary_parallel_shared_old_kernel(tile_len)
+        else:
+            kernel = _tilelang_summary_kernel(tile_len)
         kernel(h, x_proj, f_t, W_be, h0_row, summary_A, summary_b)
         return True, ""
     except Exception:
@@ -749,6 +860,7 @@ def m2rnn_pararnn_tiled_tilelang_forward(
                 summary_A,
                 summary_b,
                 config.tile_len,
+                config.summary_variant,
             )
             if ok:
                 stats.backend_used = "tilelang-summary+pending-apply"
@@ -871,13 +983,18 @@ def m2rnn_pararnn_tiled_tilelang_forward(
             )
 
         gpu_scan_used = stats.triton_scan_used or stats.tilelang_scan_used
+        summary_backend = (
+            "tilelang-summary-parallel-shared-old"
+            if config.summary_variant == "parallel_shared_old"
+            else "tilelang-summary"
+        )
         if stats.tilelang_summary_used and gpu_scan_used and stats.tilelang_apply_used:
             scan_backend = "triton-scan" if stats.triton_scan_used else "tilelang-scan"
-            stats.backend_used = f"tilelang-summary+{scan_backend}+tilelang-apply"
+            stats.backend_used = f"{summary_backend}+{scan_backend}+tilelang-apply"
         elif stats.tilelang_summary_used and stats.tilelang_apply_used:
-            stats.backend_used = "tilelang-summary+torch-scan+tilelang-apply"
+            stats.backend_used = f"{summary_backend}+torch-scan+tilelang-apply"
         elif stats.tilelang_summary_used:
-            stats.backend_used = "tilelang-summary+torch-apply"
+            stats.backend_used = f"{summary_backend}+torch-apply"
         elif stats.tilelang_apply_used:
             stats.backend_used = "torch-summary+tilelang-apply"
         else:

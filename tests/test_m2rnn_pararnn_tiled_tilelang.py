@@ -218,3 +218,43 @@ def test_tilelang_bf16_callers_use_fp32_solve_buffers_cuda():
     assert stats.triton_scan_used or stats.tilelang_scan_used
     torch.testing.assert_close(out_tiled.float(), out_full.float(), atol=8e-3, rtol=8e-3)
     torch.testing.assert_close(h_tiled.float(), h_full.float(), atol=8e-3, rtol=8e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for TileLang kernels")
+def test_tilelang_parallel_shared_old_summary_variant_cuda():
+    pytest.importorskip("tilelang")
+    device = "cuda"
+    dtype = torch.float32
+    q, k, v, W, xf = _make_inputs(1, 65, 2, 4, 16, device=device, dtype=dtype)
+
+    out_tiled, h_tiled, stats = m2rnn_pararnn_tiled_tilelang_forward(
+        q,
+        k,
+        v,
+        W,
+        xf,
+        config=TiledTileLangConfig(
+            max_its=3,
+            tile_len=16,
+            backend="tilelang",
+            allow_tilelang_fallback=False,
+            summary_variant="parallel_shared_old",
+        ),
+        return_stats=True,
+    )
+    out_full, h_full = m2rnn_pararnn_forward(
+        q,
+        k,
+        v,
+        W,
+        xf,
+        config=PararnnConfig(max_its=3, chunk_size=0),
+    )
+
+    assert stats.backend_used in (
+        "tilelang-summary-parallel-shared-old+triton-scan+tilelang-apply",
+        "tilelang-summary-parallel-shared-old+tilelang-scan+tilelang-apply",
+    )
+    assert stats.torch_materialized_tile_jac_elements == 0
+    torch.testing.assert_close(out_tiled, out_full, atol=2e-6, rtol=2e-6)
+    torch.testing.assert_close(h_tiled, h_full, atol=2e-6, rtol=2e-6)

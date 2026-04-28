@@ -22,6 +22,12 @@ from cppmega.megatron.m2rnn_pararnn_tiled_tilelang import (
     m2rnn_pararnn_tiled_tilelang_forward,
 )
 
+try:
+    from cppmega.megatron.m2rnn_triton import TRITON_AVAILABLE, m2rnn_scan_triton
+except Exception:  # pragma: no cover - diagnostic probe
+    TRITON_AVAILABLE = False
+    m2rnn_scan_triton = None  # type: ignore[assignment]
+
 
 def _make_inputs(B, S, H, k_dim, v_dim, *, device, dtype, seed):
     g = torch.Generator(device=device).manual_seed(seed)
@@ -106,6 +112,7 @@ def _print_stage_breakdown(args, q, k, v, W, xf, *, tile_len: int, device: str) 
         summary_A,
         summary_b,
         tile_len,
+        args.summary_variant,
     )
     if not ok:
         print("stage_breakdown_unavailable=tilelang_summary_failed")
@@ -125,6 +132,7 @@ def _print_stage_breakdown(args, q, k, v, W, xf, *, tile_len: int, device: str) 
             summary_A,
             summary_b,
             tile_len,
+            args.summary_variant,
         ),
         warmup=args.stage_warmup,
         repeats=args.stage_repeats,
@@ -176,6 +184,7 @@ def _run_case(args, *, tile_len: int, dtype: torch.dtype, device: str) -> None:
         tile_len=tile_len,
         backend=args.backend,
         allow_tilelang_fallback=not args.no_fallback,
+        summary_variant=args.summary_variant,
     )
     out_tiled, h_tiled, stats = m2rnn_pararnn_tiled_tilelang_forward(
         q,
@@ -194,6 +203,17 @@ def _run_case(args, *, tile_len: int, dtype: torch.dtype, device: str) -> None:
         xf,
         config=PararnnConfig(max_its=args.max_its, chunk_size=0),
     )
+    triton_status = "unavailable"
+    out_triton = None
+    h_triton = None
+    if device == "cuda" and TRITON_AVAILABLE and m2rnn_scan_triton is not None:
+        try:
+            out_triton, h_triton = m2rnn_scan_triton(q, k, v, W, xf)
+            triton_status = "ok"
+        except Exception as exc:  # pragma: no cover - diagnostic probe
+            triton_status = f"failed:{type(exc).__name__}: {exc}"
+    elif device != "cuda":
+        triton_status = "requires_cuda"
 
     if device == "cuda":
         torch.cuda.synchronize()
@@ -209,6 +229,12 @@ def _run_case(args, *, tile_len: int, dtype: torch.dtype, device: str) -> None:
     print(f"tilelang_apply_used={stats.tilelang_apply_used}")
     print(f"out_max_diff_vs_full_pararnn={_max_diff(out_tiled, out_full):.6e}")
     print(f"h_max_diff_vs_full_pararnn={_max_diff(h_tiled, h_full):.6e}")
+    print(f"triton_path={triton_status}")
+    if out_triton is not None and h_triton is not None:
+        print(f"full_pararnn_out_max_diff_vs_triton={_max_diff(out_full, out_triton):.6e}")
+        print(f"full_pararnn_h_max_diff_vs_triton={_max_diff(h_full, h_triton):.6e}")
+        print(f"tilelang_out_max_diff_vs_triton={_max_diff(out_tiled, out_triton):.6e}")
+        print(f"tilelang_h_max_diff_vs_triton={_max_diff(h_tiled, h_triton):.6e}")
     print(f"be={stats.be} s={stats.s} v_dim={stats.v_dim} n_tiles={stats.n_tiles}")
     print(f"max_tile_jac_elements={stats.max_tile_jac_elements}")
     print(f"torch_materialized_tile_jac_elements={stats.torch_materialized_tile_jac_elements}")
@@ -238,8 +264,22 @@ def _run_case(args, *, tile_len: int, dtype: torch.dtype, device: str) -> None:
             warmup=args.warmup,
             repeats=args.repeats,
         )
+        if device == "cuda" and TRITON_AVAILABLE and m2rnn_scan_triton is not None:
+            try:
+                triton_ms = _time_forward(
+                    lambda: m2rnn_scan_triton(q, k, v, W, xf),
+                    device=device,
+                    warmup=args.warmup,
+                    repeats=args.repeats,
+                )
+            except Exception:
+                triton_ms = None
+        else:
+            triton_ms = None
         print(f"tiled_ms={tiled_ms:.3f}")
         print(f"full_pararnn_ms={full_ms:.3f}")
+        if triton_ms is not None:
+            print(f"triton_scan_ms={triton_ms:.3f}")
 
     if stats.tilelang_compile_log:
         print("tilelang_compile_log_begin")
@@ -251,6 +291,11 @@ def _run_case(args, *, tile_len: int, dtype: torch.dtype, device: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=["auto", "torch", "tilelang"], default="auto")
+    parser.add_argument(
+        "--summary-variant",
+        choices=["serial", "parallel_shared_old"],
+        default="serial",
+    )
     parser.add_argument("--tile-len", type=int, choices=[16, 32, 64], default=32)
     parser.add_argument("--sweep-tile-lens", action="store_true")
     parser.add_argument("--B", type=int, default=1)

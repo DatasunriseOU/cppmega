@@ -611,3 +611,173 @@ PYTHONPATH=. python tools/probes/tilelang_m2rnn_fragment_parallel_probe.py
 ```
 
 fails with the `P: [vk, vj] and [vi, vj]` `LayoutInference` blocker above.
+
+## Optimization Cycle 5 - Parallel Summary Workaround
+
+### Sources Read
+
+- Web/MCP:
+  - <https://tilelang.com/autoapi/tilelang/analysis/fragment_loop_checker/index.html>
+  - <https://tilelang.com/autoapi/tilelang/language/loop/index.html>
+  - <https://www.tilelang.com/autoapi/tilelang/layout/fragment/index.html>
+  - <https://github.com/tile-ai/tilelang/pull/1495>
+- Local TileLang:
+  - `/home/dave/tilelang-build/docs/get_started/overview.md`
+  - `/home/dave/tilelang-build/examples/gdn/example_chunk_o.py`
+  - `/home/dave/tilelang-build/examples/kda/chunk_inter_solve_fused.py`
+  - `/home/dave/tilelang-build/tilelang/language/loop.py`
+  - `/home/dave/tilelang-build/tilelang/layout/fragment.py`
+
+Takeaways:
+
+1. `T.Parallel(..., loop_layout=T.Fragment(...))` must cover the outermost
+   parallel loop and the fragment `InputDim` must match the loop nest rank.
+2. Fragment buffers inside `T.Parallel` are still subject to stricter access
+   validation; simply splitting `P_old` and `P_new` as two register fragments
+   does not make a reduction-axis read pattern legal.
+3. Moving the old prefix matrix out of fragment memory and into shared memory
+   avoids the fragment access-map conflict while keeping the new VxV result in
+   a parallel fragment store.
+
+### Minimal Probes
+
+The original mixed-access diagnostic still fails as expected:
+
+```text
+PYTHONPATH=. python tools/probes/tilelang_m2rnn_fragment_parallel_probe.py --variant mixed
+
+tvm.error.InternalError:
+Check failed: (StructuralEqual()(it->second.indices, indices)) is false:
+P: [vk, vj] and [vi, vj]
+```
+
+The two-register-fragment coefficient rewrite removes the direct `[vi,vj]`
+read but still fails layout inference:
+
+```text
+PYTHONPATH=. python tools/probes/tilelang_m2rnn_fragment_parallel_probe.py --variant coeff
+
+tvm.error.InternalError:
+Check failed: (analyzer_->CanProveEqual(abs(source->scale), 1)) is false
+```
+
+The practical workaround compiles and launches:
+
+```text
+PYTHONPATH=. python tools/probes/tilelang_m2rnn_fragment_parallel_probe.py --variant shared-old
+
+fragment_parallel_probe=ok variant=shared-old
+```
+
+Interpretation: `P_old` as shared memory plus `P_next` as a fragment is a real
+TileLang workaround for this recurrence. The pure two-fragment register
+workaround remains blocked in `tilelang=0.1.8+cuda.gitf309d814`.
+
+### Patch
+
+- Added `summary_variant` to `TiledTileLangConfig`:
+  - `serial` keeps the previous conservative register-fragment summary path.
+  - `parallel_shared_old` is opt-in and uses shared memory for `P_old`/`b_old`,
+    computes `P_next[vi,vj]` in `T.Parallel(V,V)`, then copies the result back
+    for the next token.
+- Added `--summary-variant` to
+  `tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py`.
+- The probe now reports the Triton recurrence path, when importable, on the
+  same shape as full ParaRNN and TileLang.
+- Added a CUDA correctness test for the opt-in summary variant.
+- cuTile was not used.
+
+### Measurements
+
+Cycle-local serial baseline:
+
+```text
+PYTHONPATH=. python tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py \
+  --backend tilelang --no-fallback --tile-len 32 --summary-variant serial \
+  --B 1 --S 65 --H 2 --K 4 --V 16 --max-its 3 --dtype float32 \
+  --stage-breakdown --stage-warmup 10 --stage-repeats 30 \
+  --benchmark --warmup 5 --repeats 20
+
+stage_breakdown tile_len=32 n_tiles=3 summary_gpu_ms=0.6321 scan_triton_gpu_ms=0.0064 apply_gpu_ms=0.0348
+tiled_ms=2.374
+full_pararnn_ms=1.713
+triton_scan_ms=0.038
+```
+
+Opt-in shared-old result, same shape:
+
+```text
+PYTHONPATH=. python tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py \
+  --backend tilelang --no-fallback --tile-len 32 --summary-variant parallel_shared_old \
+  --B 1 --S 65 --H 2 --K 4 --V 16 --max-its 3 --dtype float32 \
+  --stage-breakdown --stage-warmup 10 --stage-repeats 30 \
+  --benchmark --warmup 5 --repeats 20
+
+stage_breakdown tile_len=32 n_tiles=3 summary_gpu_ms=0.0474 scan_triton_gpu_ms=0.0066 apply_gpu_ms=0.0467
+tiled_ms=0.366
+full_pararnn_ms=1.701
+triton_scan_ms=0.036
+out_max_diff_vs_full_pararnn=1.490116e-07
+h_max_diff_vs_full_pararnn=1.192093e-07
+tilelang_out_max_diff_vs_triton=4.917383e-06
+tilelang_h_max_diff_vs_triton=5.245209e-06
+```
+
+Clean fp32 sweep on `S=65`:
+
+```text
+PYTHONPATH=. python tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py \
+  --backend tilelang --no-fallback --sweep-tile-lens \
+  --summary-variant parallel_shared_old \
+  --B 1 --S 65 --H 2 --K 4 --V 16 --max-its 3 --dtype float32 \
+  --stage-breakdown --stage-warmup 10 --stage-repeats 50 \
+  --benchmark --warmup 10 --repeats 50
+
+tile_len=16 summary_gpu_ms=0.0211 apply_gpu_ms=0.0181 tiled_ms=0.155 full_pararnn_ms=1.714 triton_scan_ms=0.066
+tile_len=32 summary_gpu_ms=0.0410 apply_gpu_ms=0.0350 tiled_ms=0.582 full_pararnn_ms=1.688 triton_scan_ms=0.066
+tile_len=64 summary_gpu_ms=0.1281 apply_gpu_ms=0.1158 tiled_ms=1.028 full_pararnn_ms=1.677 triton_scan_ms=0.036
+```
+
+bf16 caller probe:
+
+```text
+PYTHONPATH=. python tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py \
+  --backend tilelang --no-fallback --tile-len 32 \
+  --summary-variant parallel_shared_old \
+  --B 1 --S 33 --H 1 --K 2 --V 16 --max-its 2 --dtype bfloat16 \
+  --benchmark --warmup 5 --repeats 20
+
+backend_used=tilelang-summary-parallel-shared-old+triton-scan+tilelang-apply
+out_max_diff_vs_full_pararnn=0.000000e+00
+h_max_diff_vs_full_pararnn=0.000000e+00
+tiled_ms=0.374
+full_pararnn_ms=1.053
+triton_scan_ms=0.045
+```
+
+### Validation
+
+Passed:
+
+```text
+PYTHONPATH=. python -m py_compile cppmega/megatron/m2rnn_pararnn_tiled_tilelang.py tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py tools/probes/tilelang_m2rnn_fragment_parallel_probe.py
+PYTHONPATH=. python -m pytest tests/test_m2rnn_pararnn_tiled_tilelang.py -q
+PYTHONPATH=. python -m pytest tests/test_m2rnn_pararnn.py tests/test_m2rnn_pararnn_tiled_tilelang.py -q
+```
+
+Observed:
+
+```text
+10 passed
+23 passed
+```
+
+### Recommendation
+
+Do not mark the TileLang branch backup-only anymore. The shared-old workaround
+turns the summary stage from the bottleneck into a small cost and makes the
+tiled TileLang path faster than full ParaRNN on the probe. Keep it opt-in for
+now because it uses more shared memory and the exact Triton recurrence path is
+still faster on these small shapes. Next useful work is to promote
+`parallel_shared_old` to the default only after a larger NAM56R-shaped memory
+and occupancy sweep.
