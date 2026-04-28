@@ -255,6 +255,12 @@ def main() -> int:
     parser.add_argument("--sweep-tile-lens", action="store_true")
     parser.add_argument("--B", type=int, default=1)
     parser.add_argument("--S", type=int, default=64)
+    parser.add_argument(
+        "--sweep-S",
+        type=str,
+        default="",
+        help="comma-separated sequence lengths to run; overrides --S for each case",
+    )
     parser.add_argument("--H", type=int, default=2)
     parser.add_argument("--K", type=int, default=4)
     parser.add_argument("--V", type=int, default=16)
@@ -285,8 +291,19 @@ def main() -> int:
         print(f"tilelang_import_failed={type(exc).__name__}: {exc}")
 
     tile_lens = [16, 32, 64] if args.sweep_tile_lens else [args.tile_len]
-    for tile_len in tile_lens:
-        _run_case(args, tile_len=tile_len, dtype=dtype, device=device)
+    seq_lens = (
+        [int(item) for item in args.sweep_S.split(",") if item.strip()]
+        if args.sweep_S
+        else [args.S]
+    )
+    base_s = args.S
+    for seq_len in seq_lens:
+        args.S = seq_len
+        if len(seq_lens) > 1:
+            print(f"sweep_S={seq_len}")
+        for tile_len in tile_lens:
+            _run_case(args, tile_len=tile_len, dtype=dtype, device=device)
+    args.S = base_s
     return 0
 
 

@@ -476,7 +476,7 @@ def _tilelang_summary_kernel(tile_len: int):
 
                         for vi in T.serial(V):
                             z[vi] = X[be_i, s_i, vi]
-                            for vj in T.serial(V):
+                            for vj in T.unroll(V):
                                 z[vi] += h_prev[vj] * W_shared[vj, vi]
                             h_new[vi] = T.tanh(z[vi])
                             rhs[vi] = -(
@@ -489,7 +489,7 @@ def _tilelang_summary_kernel(tile_len: int):
                             for vj in T.serial(V):
                                 sech2 = 1.0 - h_new[vi] * h_new[vi]
                                 P_next[vi, vj] = f_i * P[vi, vj]
-                                for vk in T.serial(V):
+                                for vk in T.unroll(V):
                                     P_next[vi, vj] += (
                                         (1.0 - f_i) * sech2 * W_shared[vk, vi] * P[vk, vj]
                                     )
@@ -497,7 +497,7 @@ def _tilelang_summary_kernel(tile_len: int):
                         for vi in T.serial(V):
                             sech2 = 1.0 - h_new[vi] * h_new[vi]
                             b_next[vi] = rhs[vi] + f_i * b[vi]
-                            for vk in T.serial(V):
+                            for vk in T.unroll(V):
                                 b_next[vi] += (1.0 - f_i) * sech2 * W_shared[vk, vi] * b[vk]
 
                         for vi in T.serial(V):
@@ -591,7 +591,7 @@ def _tilelang_apply_kernel(tile_len: int):
 
                         for vi in T.serial(V):
                             z[vi] = X[be_i, s_i, vi]
-                            for vj in T.serial(V):
+                            for vj in T.unroll(V):
                                 z[vi] += h_prev[vj] * W_shared[vj, vi]
                             h_new[vi] = T.tanh(z[vi])
                             rhs[vi] = -(
@@ -603,7 +603,7 @@ def _tilelang_apply_kernel(tile_len: int):
                         for vi in T.serial(V):
                             sech2 = 1.0 - h_new[vi] * h_new[vi]
                             delta_cur[vi] = rhs[vi] + f_i * delta_prev[vi]
-                            for vj in T.serial(V):
+                            for vj in T.unroll(V):
                                 delta_cur[vi] += (
                                     (1.0 - f_i) * sech2 * W_shared[vj, vi] * delta_prev[vj]
                                 )

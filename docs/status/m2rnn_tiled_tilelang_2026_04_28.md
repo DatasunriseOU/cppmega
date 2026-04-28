@@ -441,3 +441,173 @@ Observed:
 - `T.cumsum` does not directly apply to the affine matrix summary recurrence.
 - The path is closer but still slower than full PyTorch ParaRNN for the tiny
   `S=65` probe; summary remains the dominant stage.
+
+## Optimization Cycle 4 - Explicit Layout Probe and V-Reduction Unroll
+
+### Sources Read
+
+- Web/MCP:
+  - <https://tilelang.com/autoapi/tilelang/language/loop/index.html>
+  - <https://tilelang.com/autoapi/tilelang/analysis/fragment_loop_checker/index.html>
+  - <https://github.com/tile-ai/tilelang/pull/1539>
+- Local TileLang:
+  - `/home/dave/tilelang-build/tilelang/language/loop.py`
+  - `/home/dave/tilelang-build/tilelang/layout/fragment.py`
+  - `/home/dave/tilelang-build/docs/programming_guides/control_flow.md`
+  - `/home/dave/tilelang-build/src/transform/parallel_loop_layout_validator.h`
+  - `/home/dave/tilelang-build/src/op/parallel.cc`
+
+Takeaways:
+
+1. `T.Parallel(..., loop_layout=T.Fragment(...))` attaches the
+   `parallel_loop_layout` annotation to the outermost parallel loop. The
+   fragment `InputDim` must match the number of nested parallel extents.
+2. After layout inference, all parallel loops need a layout annotation, and
+   nested annotations are only legal on the outermost parallel loop.
+3. Fragment loops have stricter rules than shared/global loops. The local
+   `fragment_loop_checker` docs call out non-symbolic range requirements, and
+   the C++ `ParallelOpNode::ValidateCandidateAgainstFragments` path rejects
+   inconsistent fragment access maps.
+
+### Profiling Before Patch
+
+Cycle-local baseline:
+
+```text
+PYTHONPATH=. python tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py --backend tilelang --no-fallback --tile-len 32 --B 1 --S 65 --H 2 --K 4 --V 16 --max-its 3 --benchmark --warmup 10 --repeats 50 --stage-breakdown --stage-warmup 10 --stage-repeats 50 --dtype float32
+
+stage_breakdown tile_len=32 n_tiles=3 summary_gpu_ms=0.6249 scan_triton_gpu_ms=0.0063 apply_gpu_ms=0.0345
+tiled_ms=2.355
+full_pararnn_ms=1.719
+out_max_diff_vs_full_pararnn=1.490116e-07
+h_max_diff_vs_full_pararnn=1.192093e-07
+```
+
+### Patch
+
+- Added explicit `T.unroll(V)` to the innermost V=16 reduction loops in
+  TileLang summary/apply:
+  - `z = X + h_prev @ W`
+  - `P_next = f*P + (1-f)*diag(sech2)W^T P`
+  - `b_next = rhs + f*b + (1-f)*diag(sech2)W^T b`
+  - `delta_cur = rhs + f*delta_prev + (1-f)*diag(sech2)W^T delta_prev`
+- Added `--sweep-S` to the probe harness so larger sequence-length stage
+  timing can be captured in one run.
+- Added `tools/probes/tilelang_m2rnn_fragment_parallel_probe.py`, a minimal
+  explicit `loop_layout=T.Fragment(...)` probe for the VxV summary update.
+
+The production summary/apply kernels still keep no local `J` and no outside
+tile `J`. cuTile is not used.
+
+### Explicit Fragment Layout Blocker
+
+The minimal explicit-layout probe:
+
+```text
+PYTHONPATH=. python tools/probes/tilelang_m2rnn_fragment_parallel_probe.py
+```
+
+fails during `LayoutInference`, before runtime:
+
+```text
+tvm.error.InternalError: Check failed: (StructuralEqual()(it->second.indices, indices)) is false: P: [vk, vj] and [vi, vj]
+```
+
+This is with an explicit two-dimensional layout:
+
+```python
+T.Fragment(
+    [16, 16],
+    forward_thread_fn=lambda i, j: (i * 16 + j) % 128,
+    forward_index_fn=lambda i, j: (i * 16 + j) // 128,
+)
+```
+
+Interpretation: the parallel VxV update wants each `(vi, vj)` lane to read
+`P[vk, vj]` across `vk`, while the same fragment is also accessed as
+`P[vi, vj]`. TileLang records those as inconsistent access maps for one local
+fragment inside the same `T.Parallel` region. This keeps the serial-fragment
+summary fallback as the safe production path.
+
+### Results After Patch
+
+Small S, direct comparison:
+
+```text
+PYTHONPATH=. python tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py --backend tilelang --no-fallback --tile-len 32 --B 1 --S 65 --H 2 --K 4 --V 16 --max-its 3 --benchmark --warmup 10 --repeats 50 --stage-breakdown --stage-warmup 10 --stage-repeats 50 --dtype float32
+
+stage_breakdown tile_len=32 n_tiles=3 summary_gpu_ms=0.6220 scan_triton_gpu_ms=0.0063 apply_gpu_ms=0.0346
+tiled_ms=2.010
+full_pararnn_ms=1.700
+out_max_diff_vs_full_pararnn=1.490116e-07
+h_max_diff_vs_full_pararnn=1.192093e-07
+```
+
+The isolated summary stage is effectively unchanged, which means LLVM/NVRTC
+was likely already unrolling or optimizing these constant-size reductions.
+End-to-end tile32 improved in this run from 2.355 ms to 2.010 ms, but the stage
+numbers show the remaining real blocker is still summary recurrence work, not
+scan or apply.
+
+Larger S and tile32/64 stage breakdown:
+
+```text
+PYTHONPATH=. python tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py --backend tilelang --no-fallback --sweep-tile-lens --sweep-S 65,129,257 --B 1 --H 2 --K 4 --V 16 --max-its 3 --benchmark --warmup 10 --repeats 50 --stage-breakdown --stage-warmup 10 --stage-repeats 50 --dtype float32
+```
+
+Observed summary/apply/end-to-end:
+
+```text
+S=65  tile16 summary=1.1288 apply=0.0180 tiled=3.508 full=1.689
+S=65  tile32 summary=0.6575 apply=0.0347 tiled=2.087 full=1.682
+S=65  tile64 summary=1.1542 apply=0.0683 tiled=3.575 full=1.691
+
+S=129 tile16 summary=2.6829 apply=0.0273 tiled=8.230 full=1.895
+S=129 tile32 summary=2.2171 apply=0.0350 tiled=6.835 full=1.897
+S=129 tile64 summary=1.2443 apply=0.0682 tiled=3.993 full=1.893
+
+S=257 tile16 summary=6.4579 apply=0.0438 tiled=19.614 full=2.092
+S=257 tile32 summary=5.2386 apply=0.0532 tiled=16.012 full=2.095
+S=257 tile64 summary=4.4087 apply=0.0679 tiled=13.527 full=2.084
+```
+
+For larger S, tile64 wins because it launches fewer summary CTAs despite more
+serial work per CTA. Scan remains about `0.006 ms`, and apply remains below
+`0.07 ms`; summary dominates.
+
+bf16 caller probe:
+
+```text
+PYTHONPATH=. python tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py --backend tilelang --no-fallback --tile-len 32 --B 1 --S 33 --H 1 --K 2 --V 16 --max-its 2 --dtype bfloat16 --benchmark --warmup 5 --repeats 20
+
+backend_used=tilelang-summary+triton-scan+tilelang-apply
+out_max_diff_vs_full_pararnn=0.000000e+00
+h_max_diff_vs_full_pararnn=0.000000e+00
+tiled_ms=1.240
+full_pararnn_ms=1.037
+```
+
+### Validation
+
+Passed:
+
+```text
+python -m py_compile cppmega/megatron/m2rnn_pararnn_tiled_tilelang.py tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py
+PYTHONPATH=. python -m pytest tests/test_m2rnn_pararnn_tiled_tilelang.py -q
+PYTHONPATH=. python -m pytest tests/test_m2rnn_pararnn.py tests/test_m2rnn_pararnn_tiled_tilelang.py -q
+```
+
+Observed:
+
+```text
+9 passed
+22 passed
+```
+
+Expected failing diagnostic probe:
+
+```text
+PYTHONPATH=. python tools/probes/tilelang_m2rnn_fragment_parallel_probe.py
+```
+
+fails with the `P: [vk, vj] and [vi, vj]` `LayoutInference` blocker above.
