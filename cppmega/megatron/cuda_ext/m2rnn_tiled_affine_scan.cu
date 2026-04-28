@@ -12,6 +12,8 @@ namespace {
 
 constexpr int kMaxV = 16;
 constexpr int kThreads = 256;
+constexpr int kWarpRowThreads = 512;
+constexpr unsigned int kFullWarpMask = 0xffffffffu;
 
 __device__ __forceinline__ int64_t div_floor_i64(int64_t x, int64_t y) {
   return x / y;
@@ -290,6 +292,264 @@ __global__ __launch_bounds__(kThreads, 2) void m2rnn_apply_tile_prefix_kernel(
     }
     if (tid < V * V) {
       M[tid] = M_next[tid];
+    }
+    __syncthreads();
+  }
+}
+
+__device__ __forceinline__ float warp_sum(float x) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    x += __shfl_down_sync(kFullWarpMask, x, offset);
+  }
+  return x;
+}
+
+__global__ __launch_bounds__(kWarpRowThreads, 1) void m2rnn_tile_summary_v16_warprow_kernel(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ W,
+    const float* __restrict__ xf,
+    const float* __restrict__ h_traj,
+    const float* __restrict__ h0_row,
+    float* __restrict__ tile_A,
+    float* __restrict__ tile_b,
+    int B,
+    int S,
+    int H,
+    int K,
+    int tile_size,
+    int n_tiles) {
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int64_t block = static_cast<int64_t>(blockIdx.x);
+  const int tile = static_cast<int>(block % n_tiles);
+  const int64_t chain = div_floor_i64(block, n_tiles);
+
+  const int k_idx = static_cast<int>(chain % K);
+  const int h = static_cast<int>((chain / K) % H);
+  const int b = static_cast<int>(chain / (static_cast<int64_t>(H) * K));
+  const int start = tile * tile_size;
+  const int end = min(start + tile_size, S);
+
+  __shared__ float M[kMaxV * kMaxV];
+  __shared__ float M_next[kMaxV * kMaxV];
+  __shared__ float P[kMaxV * kMaxV];
+  __shared__ float d[kMaxV];
+  __shared__ float d_next[kMaxV];
+  __shared__ float h_prev[kMaxV];
+  __shared__ float z[kMaxV];
+  __shared__ float h_new[kMaxV];
+  __shared__ float rhs[kMaxV];
+
+  if (warp < kMaxV && lane < kMaxV) {
+    M[warp * kMaxV + lane] = warp == lane ? 1.0f : 0.0f;
+  }
+  if (tid < kMaxV) {
+    d[tid] = 0.0f;
+  }
+  __syncthreads();
+
+  for (int s = start; s < end; ++s) {
+    if (tid < kMaxV) {
+      h_prev[tid] = s == 0 ? h0_row[(chain * kMaxV) + tid]
+                           : h_traj[((chain * S + (s - 1)) * kMaxV) + tid];
+    }
+    __syncthreads();
+
+    if (warp < kMaxV) {
+      const int i = warp;
+      float acc = lane < kMaxV ? h_prev[lane] * W[((h * kMaxV + lane) * kMaxV) + i] : 0.0f;
+      acc = warp_sum(acc);
+      if (lane == 0) {
+        const float k_val = k[(((static_cast<int64_t>(b) * S + s) * H + h) * K) + k_idx];
+        const float v_val = v[(((static_cast<int64_t>(b) * S + s) * H + h) * kMaxV) + i];
+        z[i] = acc + k_val * v_val;
+      }
+    }
+    __syncthreads();
+
+    if (tid < kMaxV) {
+      const int i = tid;
+      const float f = xf[(static_cast<int64_t>(b) * S + s) * H + h];
+      const float h_t = h_traj[((chain * S + s) * kMaxV) + i];
+      const float tanh_z = tanhf(z[i]);
+      h_new[i] = tanh_z;
+      rhs[i] = -h_t + f * h_prev[i] + (1.0f - f) * tanh_z;
+    }
+    __syncthreads();
+
+    if (warp < kMaxV && lane < kMaxV) {
+      const int i = warp;
+      const int j = lane;
+      const float f = xf[(static_cast<int64_t>(b) * S + s) * H + h];
+      const float sech2 = 1.0f - h_new[i] * h_new[i];
+      const float wji = W[((h * kMaxV + j) * kMaxV) + i];
+      P[i * kMaxV + j] = (i == j ? f : 0.0f) + (1.0f - f) * sech2 * wji;
+    }
+    __syncthreads();
+
+    if (warp < kMaxV) {
+      const int i = warp;
+      float acc = lane < kMaxV ? P[i * kMaxV + lane] * d[lane] : 0.0f;
+      acc = warp_sum(acc);
+      if (lane == 0) {
+        d_next[i] = rhs[i] + acc;
+      }
+    }
+
+    if (warp < kMaxV && lane < kMaxV) {
+      const int i = warp;
+      const int j = lane;
+      float acc = 0.0f;
+#pragma unroll
+      for (int m = 0; m < kMaxV; ++m) {
+        acc += P[i * kMaxV + m] * M[m * kMaxV + j];
+      }
+      M_next[i * kMaxV + j] = acc;
+    }
+    __syncthreads();
+
+    if (tid < kMaxV) {
+      d[tid] = d_next[tid];
+    }
+    if (warp < kMaxV && lane < kMaxV) {
+      M[warp * kMaxV + lane] = M_next[warp * kMaxV + lane];
+    }
+    __syncthreads();
+  }
+
+  if (tid < kMaxV) {
+    tile_b[((chain * n_tiles + tile) * kMaxV) + tid] = d[tid];
+  }
+  if (warp < kMaxV && lane < kMaxV) {
+    tile_A[(((chain * n_tiles + tile) * kMaxV * kMaxV) + (warp * kMaxV + lane))] =
+        M[warp * kMaxV + lane];
+  }
+}
+
+__global__ __launch_bounds__(kWarpRowThreads, 1) void m2rnn_apply_tile_prefix_v16_warprow_kernel(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ W,
+    const float* __restrict__ xf,
+    const float* __restrict__ h_traj,
+    const float* __restrict__ h0_row,
+    const float* __restrict__ tile_inputs,
+    float* __restrict__ delta,
+    int B,
+    int S,
+    int H,
+    int K,
+    int tile_size,
+    int n_tiles) {
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int64_t block = static_cast<int64_t>(blockIdx.x);
+  const int tile = static_cast<int>(block % n_tiles);
+  const int64_t chain = div_floor_i64(block, n_tiles);
+
+  const int k_idx = static_cast<int>(chain % K);
+  const int h = static_cast<int>((chain / K) % H);
+  const int b = static_cast<int>(chain / (static_cast<int64_t>(H) * K));
+  const int start = tile * tile_size;
+  const int end = min(start + tile_size, S);
+
+  __shared__ float M[kMaxV * kMaxV];
+  __shared__ float M_next[kMaxV * kMaxV];
+  __shared__ float P[kMaxV * kMaxV];
+  __shared__ float d[kMaxV];
+  __shared__ float d_next[kMaxV];
+  __shared__ float carry[kMaxV];
+  __shared__ float h_prev[kMaxV];
+  __shared__ float z[kMaxV];
+  __shared__ float h_new[kMaxV];
+  __shared__ float rhs[kMaxV];
+
+  if (warp < kMaxV && lane < kMaxV) {
+    M[warp * kMaxV + lane] = warp == lane ? 1.0f : 0.0f;
+  }
+  if (tid < kMaxV) {
+    d[tid] = 0.0f;
+    carry[tid] = tile_inputs[((chain * n_tiles + tile) * kMaxV) + tid];
+  }
+  __syncthreads();
+
+  for (int s = start; s < end; ++s) {
+    if (tid < kMaxV) {
+      h_prev[tid] = s == 0 ? h0_row[(chain * kMaxV) + tid]
+                           : h_traj[((chain * S + (s - 1)) * kMaxV) + tid];
+    }
+    __syncthreads();
+
+    if (warp < kMaxV) {
+      const int i = warp;
+      float acc = lane < kMaxV ? h_prev[lane] * W[((h * kMaxV + lane) * kMaxV) + i] : 0.0f;
+      acc = warp_sum(acc);
+      if (lane == 0) {
+        const float k_val = k[(((static_cast<int64_t>(b) * S + s) * H + h) * K) + k_idx];
+        const float v_val = v[(((static_cast<int64_t>(b) * S + s) * H + h) * kMaxV) + i];
+        z[i] = acc + k_val * v_val;
+      }
+    }
+    __syncthreads();
+
+    if (tid < kMaxV) {
+      const int i = tid;
+      const float f = xf[(static_cast<int64_t>(b) * S + s) * H + h];
+      const float h_t = h_traj[((chain * S + s) * kMaxV) + i];
+      const float tanh_z = tanhf(z[i]);
+      h_new[i] = tanh_z;
+      rhs[i] = -h_t + f * h_prev[i] + (1.0f - f) * tanh_z;
+    }
+    __syncthreads();
+
+    if (warp < kMaxV && lane < kMaxV) {
+      const int i = warp;
+      const int j = lane;
+      const float f = xf[(static_cast<int64_t>(b) * S + s) * H + h];
+      const float sech2 = 1.0f - h_new[i] * h_new[i];
+      const float wji = W[((h * kMaxV + j) * kMaxV) + i];
+      P[i * kMaxV + j] = (i == j ? f : 0.0f) + (1.0f - f) * sech2 * wji;
+    }
+    __syncthreads();
+
+    if (warp < kMaxV) {
+      const int i = warp;
+      float acc = lane < kMaxV ? P[i * kMaxV + lane] * d[lane] : 0.0f;
+      acc = warp_sum(acc);
+      if (lane == 0) {
+        d_next[i] = rhs[i] + acc;
+      }
+    }
+
+    if (warp < kMaxV && lane < kMaxV) {
+      const int i = warp;
+      const int j = lane;
+      float acc = 0.0f;
+#pragma unroll
+      for (int m = 0; m < kMaxV; ++m) {
+        acc += P[i * kMaxV + m] * M[m * kMaxV + j];
+      }
+      M_next[i * kMaxV + j] = acc;
+    }
+    __syncthreads();
+
+    if (warp < kMaxV) {
+      const int i = warp;
+      float prefix = lane < kMaxV ? M_next[i * kMaxV + lane] * carry[lane] : 0.0f;
+      prefix = warp_sum(prefix);
+      if (lane == 0) {
+        d[i] = d_next[i];
+        delta[((chain * S + s) * kMaxV) + i] = d_next[i] + prefix;
+      }
+    }
+    if (warp < kMaxV && lane < kMaxV) {
+      M[warp * kMaxV + lane] = M_next[warp * kMaxV + lane];
     }
     __syncthreads();
   }
@@ -635,6 +895,57 @@ void tile_summaries_out(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void tile_summaries_v16_warprow_out(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& W,
+    const at::Tensor& xf,
+    const at::Tensor& h_traj,
+    const at::Tensor& h0_row,
+    const at::Tensor& tile_A,
+    const at::Tensor& tile_b,
+    int64_t tile_size) {
+  check_problem_shapes(q, k, v, W, xf, h_traj, h0_row, tile_size);
+
+  const int64_t B = q.size(0);
+  const int64_t S = q.size(1);
+  const int64_t H = q.size(2);
+  const int64_t K = q.size(3);
+  const int64_t V = v.size(3);
+  if (V != kMaxV) {
+    throw std::invalid_argument("m2rnn V=16 warprow summary requires V == 16");
+  }
+
+  const int64_t n_tiles = div_up(S, tile_size);
+  const int64_t Be = B * H * K;
+  check_tile_summary_shapes(tile_A, tile_b, Be, n_tiles, V);
+
+  const c10::cuda::CUDAGuard device_guard(q.device());
+  const int64_t blocks = Be * n_tiles;
+  m2rnn_tile_summary_v16_warprow_kernel<<<
+      static_cast<unsigned int>(blocks),
+      kWarpRowThreads,
+      0,
+      at::cuda::getCurrentCUDAStream()>>>(
+      q.data_ptr<float>(),
+      k.data_ptr<float>(),
+      v.data_ptr<float>(),
+      W.data_ptr<float>(),
+      xf.data_ptr<float>(),
+      h_traj.data_ptr<float>(),
+      h0_row.data_ptr<float>(),
+      tile_A.data_ptr<float>(),
+      tile_b.data_ptr<float>(),
+      static_cast<int>(B),
+      static_cast<int>(S),
+      static_cast<int>(H),
+      static_cast<int>(K),
+      static_cast<int>(tile_size),
+      static_cast<int>(n_tiles));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 std::vector<at::Tensor> tile_summaries(
     const at::Tensor& q,
     const at::Tensor& k,
@@ -701,6 +1012,57 @@ void apply_tile_prefixes_out(
       static_cast<int>(H),
       static_cast<int>(K),
       static_cast<int>(V),
+      static_cast<int>(tile_size),
+      static_cast<int>(n_tiles));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void apply_tile_prefixes_v16_warprow_out(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& W,
+    const at::Tensor& xf,
+    const at::Tensor& h_traj,
+    const at::Tensor& h0_row,
+    const at::Tensor& tile_inputs,
+    const at::Tensor& delta,
+    int64_t tile_size) {
+  check_problem_shapes(q, k, v, W, xf, h_traj, h0_row, tile_size);
+
+  const int64_t B = q.size(0);
+  const int64_t S = q.size(1);
+  const int64_t H = q.size(2);
+  const int64_t K = q.size(3);
+  const int64_t V = v.size(3);
+  if (V != kMaxV) {
+    throw std::invalid_argument("m2rnn V=16 warprow apply requires V == 16");
+  }
+  const int64_t Be = B * H * K;
+  const int64_t n_tiles = div_up(S, tile_size);
+  check_tile_inputs_shape(tile_inputs, Be, n_tiles, V);
+  check_delta_shape(delta, Be, S, V);
+
+  const c10::cuda::CUDAGuard device_guard(q.device());
+  const int64_t blocks = Be * n_tiles;
+  m2rnn_apply_tile_prefix_v16_warprow_kernel<<<
+      static_cast<unsigned int>(blocks),
+      kWarpRowThreads,
+      0,
+      at::cuda::getCurrentCUDAStream()>>>(
+      q.data_ptr<float>(),
+      k.data_ptr<float>(),
+      v.data_ptr<float>(),
+      W.data_ptr<float>(),
+      xf.data_ptr<float>(),
+      h_traj.data_ptr<float>(),
+      h0_row.data_ptr<float>(),
+      tile_inputs.data_ptr<float>(),
+      delta.data_ptr<float>(),
+      static_cast<int>(B),
+      static_cast<int>(S),
+      static_cast<int>(H),
+      static_cast<int>(K),
       static_cast<int>(tile_size),
       static_cast<int>(n_tiles));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -837,9 +1199,11 @@ std::vector<at::Tensor> local_tile_scan_debug(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("tile_summaries", &tile_summaries, "M2RNN local tile summaries (CUDA)");
   m.def("tile_summaries_out", &tile_summaries_out, "M2RNN local tile summaries into preallocated outputs (CUDA)");
+  m.def("tile_summaries_v16_warprow_out", &tile_summaries_v16_warprow_out, "M2RNN V=16 warp-per-row tile summaries into preallocated outputs (CUDA)");
   m.def("scan_tile_summaries", &scan_tile_summaries, "M2RNN tile summary prefix scan (CUDA)");
   m.def("scan_tile_summaries_out", &scan_tile_summaries_out, "M2RNN tile summary prefix scan into preallocated output (CUDA)");
   m.def("apply_tile_prefixes", &apply_tile_prefixes, "M2RNN recompute tile-prefix apply (CUDA)");
   m.def("apply_tile_prefixes_out", &apply_tile_prefixes_out, "M2RNN recompute tile-prefix apply into preallocated output (CUDA)");
+  m.def("apply_tile_prefixes_v16_warprow_out", &apply_tile_prefixes_v16_warprow_out, "M2RNN V=16 warp-per-row recompute tile-prefix apply into preallocated output (CUDA)");
   m.def("local_tile_scan_debug", &local_tile_scan_debug, "M2RNN local tiled affine scan debug (CUDA)");
 }

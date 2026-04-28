@@ -23,6 +23,7 @@ from cppmega.megatron.m2rnn_pararnn_tiled_cuda import (  # noqa: E402
     _broadcast_heads,
     _load_cuda_ext,
     _make_h0_row,
+    _use_warprow_v16,
     m2rnn_pararnn_tiled_cuda_forward,
 )
 
@@ -86,6 +87,14 @@ def _profile_once(args: argparse.Namespace, q, k, v, W, xf, ext) -> dict[str, ob
     h0_row = _make_h0_row(None, B=B, H=H, K=K, V=V, device=q.device, dtype=torch.float32)
     Be = B * H * K
     n_tiles = (S + args.tile_size - 1) // args.tile_size
+    if _use_warprow_v16(V, args.tile_size):
+        summary_out = ext.tile_summaries_v16_warprow_out
+        apply_out = ext.apply_tile_prefixes_v16_warprow_out
+        kernel_variant = "v16_warprow"
+    else:
+        summary_out = ext.tile_summaries_out
+        apply_out = ext.apply_tile_prefixes_out
+        kernel_variant = "baseline"
 
     (h, gpu_ms, wall_ms) = _event_time_ms(lambda: torch.zeros(Be, S, V, device=q.device, dtype=torch.float32))
     stages["h_alloc_gpu_ms"].append(gpu_ms)
@@ -104,9 +113,7 @@ def _profile_once(args: argparse.Namespace, q, k, v, W, xf, ext) -> dict[str, ob
 
     for _ in range(args.max_its):
         (_, gpu_ms, wall_ms) = _event_time_ms(
-            lambda: ext.tile_summaries_out(
-                qf, kf, vf, Wf, xff, h.contiguous(), h0_row, tile_A, tile_b, args.tile_size
-            )
+            lambda: summary_out(qf, kf, vf, Wf, xff, h.contiguous(), h0_row, tile_A, tile_b, args.tile_size)
         )
         stages["summary_gpu_ms"].append(gpu_ms)
         wall["summary_wall_ms"].append(wall_ms)
@@ -118,7 +125,7 @@ def _profile_once(args: argparse.Namespace, q, k, v, W, xf, ext) -> dict[str, ob
         wall["scan_wall_ms"].append(wall_ms)
 
         (_, gpu_ms, wall_ms) = _event_time_ms(
-            lambda: ext.apply_tile_prefixes_out(
+            lambda: apply_out(
                 qf,
                 kf,
                 vf,
@@ -153,6 +160,7 @@ def _profile_once(args: argparse.Namespace, q, k, v, W, xf, ext) -> dict[str, ob
     return {
         "stage_gpu_ms": {name: _stats(values) for name, values in stages.items()},
         "stage_wall_ms": {name: _stats(values) for name, values in wall.items()},
+        "kernel_variant": kernel_variant,
         "output_checksum": float(out.float().sum().detach().cpu()),
         "h_final_checksum": float(h_final.float().sum().detach().cpu()),
     }
@@ -236,6 +244,7 @@ def main() -> int:
             "max_its": args.max_its,
             "dtype": args.dtype,
         },
+        "kernel_variant": results[0]["kernel_variant"],
         "extension_load_ms": extension_load_ms,
         "whole_forward_wall_ms": _stats(whole_values),
         "stage_gpu_ms": {

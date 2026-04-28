@@ -365,3 +365,209 @@ Most promising next work:
    avoid cross-tile races; the naive one-kernel write-next-h variant was worse.
 3. Explore reducing the duplicate summary/apply recomputation rather than
    optimizing scan or Python dispatch.
+
+## Optimization Cycle 4 - 2026-04-28
+
+Continuation base requested by user: `fd5742e`.  No git commit was created.
+
+### Search / References
+
+Local context reviewed:
+
+- `cppmega/megatron/cuda_ext/m2rnn_tiled_affine_scan.cu`
+- `cppmega/megatron/m2rnn_pararnn_tiled_cuda.py`
+- `tools/probes/m2rnn_tiled_cuda_stage_profile.py`
+- `tools/probes/m2rnn_pararnn_tiled_cuda_probe.py`
+- prior sections in this status file
+
+External CUDA docs searched before patching:
+
+- CUDA Cooperative Groups: `tiled_partition` creates fixed-size subgroups; group
+  creation and collectives are collective operations all participating threads
+  must reach.  https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cooperative-groups.html
+- CUDA C++ Programming Guide, Cooperative Groups API: `thread_block_tile` exposes
+  `shfl`, `shfl_down`, `shfl_xor`, `sync`, and notes that templated tile sizes
+  enable better compile-time optimization.  https://docs.nvidia.com/cuda/archive/12.1.0/cuda-c-programming-guide/index.html
+- CUDA C++ Programming Guide, Occupancy Calculator: `cudaOccupancy*` APIs and
+  Nsight Compute occupancy reporting convert active blocks to active warps and
+  occupancy.  https://docs.nvidia.com/cuda/archive/12.1.0/cuda-c-programming-guide/index.html
+- CUB/CCCL docs: CUB provides warp-wide and block-wide collectives such as
+  `WarpScan` and `BlockScan`, but the measured bottleneck here is summary/apply
+  math, not tile scan.  https://nvidia.github.io/cccl/unstable/cub/index.html
+
+### Baseline Profile
+
+Command:
+
+```bash
+CPPMEGA_VERBOSE_EXT_BUILD=0 python tools/probes/m2rnn_tiled_cuda_stage_profile.py \
+  --B 1 --S 1024 --H 4 --K 32 --V 16 --tile-size 32 --max-its 3 \
+  --warmup 1 --iters 3 --dtype bf16 --json /tmp/m2rnn_cycle4_baseline_stage.json
+```
+
+GB10 bf16 target shape, default kernels:
+
+| Stage | Mean ms |
+| --- | ---: |
+| summary, per Newton | 1.702 |
+| scan, per Newton | 0.022 |
+| apply, per Newton | 1.874 |
+| update, per Newton | 0.134 |
+| whole forward wall | 11.215 |
+
+Nsight Compute command:
+
+```bash
+ncu --target-processes all \
+  --kernel-name 'regex:m2rnn_.*(tile_summary|apply_tile_prefix).*' \
+  --launch-count 6 --section LaunchStats --section Occupancy \
+  python tools/probes/m2rnn_tiled_cuda_stage_profile.py \
+  --B 1 --S 1024 --H 4 --K 32 --V 16 --tile-size 32 \
+  --max-its 3 --warmup 0 --iters 1 --dtype bf16
+```
+
+Nsight result for both default hot kernels:
+
+| Kernel | Threads/block | Registers/thread | Static smem | Theoretical occupancy | Achieved occupancy | Limiter |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `m2rnn_tile_summary_kernel` | 256 | 94 | 3.46 KiB | 33.33% | ~33.08% | registers |
+| `m2rnn_apply_tile_prefix_kernel` | 256 | 90 | 3.52 KiB | 33.33% | ~33.09% | registers |
+
+Diagnosis: the one-block-per-chain/tile strategy launches enough blocks
+(`4096` blocks, `42.67` waves/SM), but each block is register-limited to two
+active blocks/SM.  Within each token step, only `V=16` threads do the vector
+matvec/rhs/d update work, while the `VxV` transition update uses 256 threads
+with a serial length-16 reduction per output element and full block barriers
+between every phase.  Scan is still negligible; Python is not the bottleneck.
+
+### Patch: V=16 Warp-Per-Row Variant
+
+Added opt-in experimental kernels:
+
+- `m2rnn_tile_summary_v16_warprow_kernel`
+- `m2rnn_apply_tile_prefix_v16_warprow_kernel`
+
+They map one warp to each matrix/vector row for `V=16`, use warp shuffle
+reductions for the vector matvec, `d_next`, and carry prefix dot products, and
+keep the existing fp32 accumulator behavior.  The variant is disabled by
+default and selected with:
+
+```bash
+CPPMEGA_M2RNN_WARPROW_V16=1
+```
+
+`tools/probes/m2rnn_tiled_cuda_stage_profile.py` now reports
+`kernel_variant` and profiles the selected extension entrypoints.
+
+### ptxas / Resources
+
+Verbose extension build emitted:
+
+```text
+m2rnn_apply_tile_prefix_v16_warprow_kernel:
+  0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  Used 72 registers, used 1 barriers, 3520 bytes smem
+m2rnn_tile_summary_v16_warprow_kernel:
+  0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+  Used 74 registers, used 1 barriers, 3456 bytes smem
+m2rnn_apply_tile_prefix_kernel:
+  Used 90 registers, 0 spills
+m2rnn_tile_summary_kernel:
+  Used 94 registers, 0 spills
+```
+
+The new variant reduced registers but not occupancy.
+
+Nsight Compute for the opt-in variant:
+
+```bash
+CPPMEGA_M2RNN_WARPROW_V16=1 ncu --target-processes all \
+  --kernel-name 'regex:m2rnn_.*v16_warprow.*' --launch-count 6 \
+  --section LaunchStats --section Occupancy \
+  python tools/probes/m2rnn_tiled_cuda_stage_profile.py \
+  --B 1 --S 1024 --H 4 --K 32 --V 16 --tile-size 32 \
+  --max-its 3 --warmup 0 --iters 1 --dtype bf16
+```
+
+| Kernel | Threads/block | Registers/thread | Static smem | Theoretical occupancy | Achieved occupancy | Limiter |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `m2rnn_tile_summary_v16_warprow_kernel` | 512 | 74 | 3.46 KiB | 33.33% | ~33.31% | registers + smem |
+| `m2rnn_apply_tile_prefix_v16_warprow_kernel` | 512 | 72 | 3.52 KiB | 33.33% | ~33.33% | registers + smem |
+
+### Timings
+
+Opt-in variant command:
+
+```bash
+CPPMEGA_VERBOSE_EXT_BUILD=0 CPPMEGA_M2RNN_WARPROW_V16=1 \
+  python tools/probes/m2rnn_tiled_cuda_stage_profile.py \
+  --B 1 --S 1024 --H 4 --K 32 --V 16 --tile-size 32 \
+  --max-its 3 --warmup 1 --iters 3 --dtype bf16 \
+  --json /tmp/m2rnn_cycle4_warprow_stage.json
+```
+
+| Stage | Default mean ms | `v16_warprow` mean ms |
+| --- | ---: | ---: |
+| summary, per Newton | 1.702 | 2.633 |
+| scan, per Newton | 0.022 | 0.021 |
+| apply, per Newton | 1.874 | 3.056 |
+| update, per Newton | 0.134 | 0.126 |
+| whole forward wall | 11.215 | 17.490 |
+
+The new strategy is slower on GB10.  It does parallelize the small row
+reductions, but the dominant `M_next = P @ M` work still has one lane per
+output element doing a length-16 serial reduction.  The larger 512-thread block
+does not increase active warps/SM, and it doubles launched thread count for the
+same 256 active matrix elements per token.  Therefore the variant does not beat
+the old path and remains default-off.
+
+### Correctness / Tests
+
+Commands:
+
+```bash
+python -m py_compile \
+  cppmega/megatron/m2rnn_pararnn_tiled_cuda.py \
+  tools/probes/m2rnn_tiled_cuda_stage_profile.py \
+  tests/test_m2rnn_pararnn_tiled_cuda.py
+
+CPPMEGA_VERBOSE_EXT_BUILD=0 pytest -q tests/test_m2rnn_pararnn_tiled_cuda.py -s
+
+CPPMEGA_VERBOSE_EXT_BUILD=0 CPPMEGA_M2RNN_WARPROW_V16=1 \
+  pytest -q tests/test_m2rnn_pararnn_tiled_cuda.py -s
+
+CPPMEGA_VERBOSE_EXT_BUILD=0 python tools/probes/m2rnn_pararnn_tiled_cuda_probe.py \
+  --B 1 --S 33 --H 2 --K 4 --V 16 --tile-size 8 --max-its 6 \
+  --json /tmp/m2rnn_cycle4_default_probe.json
+
+CPPMEGA_VERBOSE_EXT_BUILD=1 CPPMEGA_M2RNN_WARPROW_V16=1 \
+  python tools/probes/m2rnn_pararnn_tiled_cuda_probe.py \
+  --B 1 --S 17 --H 2 --K 4 --V 16 --tile-size 8 --max-its 4 \
+  --json /tmp/m2rnn_cycle4_warprow_probe.json
+
+BENCH_B=1 BENCH_S=1024 BENCH_H=4 BENCH_K=32 BENCH_V=16 \
+  BENCH_WARMUP=1 BENCH_ITERS=3 BENCH_TORCH=0 python scripts/bench_m2rnn.py
+```
+
+Results:
+
+- default pytest: `7 passed, 19 warnings`
+- opt-in warprow pytest: `7 passed, 19 warnings`
+- default probe parity vs sequential: output max abs
+  `5.781650543212891e-06`, h_final max abs
+  `1.7434358596801758e-06`
+- opt-in probe parity vs sequential: output max abs
+  `5.334615707397461e-06`, h_final max abs
+  `3.516674041748047e-06`
+- Triton comparison bench on target shape: fwd `0.51 ms/iter`,
+  fwd+bwd `2.06 ms/iter`
+
+### Conclusion
+
+The current CUDA path is slow because the hot work is still the duplicated
+summary/apply recurrent tile math, not scan, allocation, or Python dispatch.
+The block strategy is poor for the small vector phases, but simply mapping one
+warp per row does not improve active occupancy or the `P @ M` inner loop, so it
+regresses total time.  The next promising strategy should attack the matrix
+composition itself: split the length-16 `P @ M` reductions across lanes or
+avoid recomputing the full dense prefix in both summary and apply.

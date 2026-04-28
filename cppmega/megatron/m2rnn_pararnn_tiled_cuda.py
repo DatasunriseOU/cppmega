@@ -125,6 +125,12 @@ def _scan_tile_summaries_python(tile_A: torch.Tensor, tile_b: torch.Tensor) -> t
     return tile_inputs
 
 
+def _use_warprow_v16(V: int, tile_size: int) -> bool:
+    """Opt-in experimental V=16 CUDA kernels using one warp per matrix row."""
+
+    return V == 16 and os.environ.get("CPPMEGA_M2RNN_WARPROW_V16", "0") == "1"
+
+
 def _make_h0_row(
     h0: Optional[torch.Tensor],
     *,
@@ -194,7 +200,14 @@ def m2rnn_pararnn_tiled_cuda_forward(
     ext = _load_cuda_ext()
 
     for _ in range(config.max_its):
-        ext.tile_summaries_out(
+        if _use_warprow_v16(V, int(config.tile_size)):
+            summary_out = ext.tile_summaries_v16_warprow_out
+            apply_out = ext.apply_tile_prefixes_v16_warprow_out
+        else:
+            summary_out = ext.tile_summaries_out
+            apply_out = ext.apply_tile_prefixes_out
+
+        summary_out(
             qf,
             kf,
             vf,
@@ -207,7 +220,7 @@ def m2rnn_pararnn_tiled_cuda_forward(
             int(config.tile_size),
         )
         ext.scan_tile_summaries_out(tile_A, tile_b, tile_inputs)
-        ext.apply_tile_prefixes_out(
+        apply_out(
             qf,
             kf,
             vf,
