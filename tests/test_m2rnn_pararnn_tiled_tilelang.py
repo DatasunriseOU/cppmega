@@ -12,6 +12,7 @@ from cppmega.megatron.m2rnn_pararnn_tiled_tilelang import (
     TiledTileLangConfig,
     m2rnn_pararnn_tiled_tilelang_forward,
 )
+from cppmega.megatron import m2rnn_pararnn_tiled_tilelang as tiled_impl
 
 
 def _torch_m2rnn_forward(q, k, v, W, xf, *, h0=None):
@@ -136,6 +137,37 @@ def test_tiled_memory_contract_reports_tile_bounded_jacobian():
     assert stats.torch_materialized_tile_jac_elements == be * tile_len * v_dim * v_dim
 
 
+def test_shared_old_summary_falls_back_to_serial_tilelang_variant(monkeypatch):
+    calls = []
+
+    def fake_try_summary(*args):
+        variant = args[-1]
+        calls.append(variant)
+        if variant == "parallel_shared_old":
+            return False, "shared failed"
+        return True, ""
+
+    monkeypatch.setattr(tiled_impl, "_try_tilelang_summary", fake_try_summary)
+
+    dummy = torch.empty(1)
+    ok, compile_log, variant = tiled_impl._try_tilelang_summary_with_serial_fallback(
+        dummy,
+        dummy,
+        dummy,
+        dummy,
+        dummy,
+        dummy,
+        dummy,
+        16,
+        "parallel_shared_old",
+    )
+
+    assert ok
+    assert compile_log == "shared failed"
+    assert variant == "serial"
+    assert calls == ["parallel_shared_old", "serial"]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for TileLang kernels")
 @pytest.mark.parametrize("tile_len", [16, 32, 64])
 def test_tilelang_summary_apply_matches_full_pararnn_scan_cuda(tile_len):
@@ -170,6 +202,8 @@ def test_tilelang_summary_apply_matches_full_pararnn_scan_cuda(tile_len):
     torch.testing.assert_close(out_tiled, out_full, atol=2e-6, rtol=2e-6)
     torch.testing.assert_close(h_tiled, h_full, atol=2e-6, rtol=2e-6)
     assert stats.backend_used in (
+        "tilelang-summary-parallel-shared-old+triton-scan+tilelang-apply",
+        "tilelang-summary-parallel-shared-old+tilelang-scan+tilelang-apply",
         "tilelang-summary+triton-scan+tilelang-apply",
         "tilelang-summary+tilelang-scan+tilelang-apply",
     )
@@ -212,6 +246,8 @@ def test_tilelang_bf16_callers_use_fp32_solve_buffers_cuda():
     assert out_tiled.dtype == torch.bfloat16
     assert h_tiled.dtype == torch.bfloat16
     assert stats.backend_used in (
+        "tilelang-summary-parallel-shared-old+triton-scan+tilelang-apply",
+        "tilelang-summary-parallel-shared-old+tilelang-scan+tilelang-apply",
         "tilelang-summary+triton-scan+tilelang-apply",
         "tilelang-summary+tilelang-scan+tilelang-apply",
     )

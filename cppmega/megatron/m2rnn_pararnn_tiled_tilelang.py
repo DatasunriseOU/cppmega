@@ -55,7 +55,7 @@ class TiledTileLangConfig:
     tile_len: int = 32
     backend: Backend = "auto"
     allow_tilelang_fallback: bool = True
-    summary_variant: SummaryVariant = "serial"
+    summary_variant: SummaryVariant = "parallel_shared_old"
 
 
 @dataclass
@@ -648,6 +648,47 @@ def _try_tilelang_summary(
         return False, log.getvalue()
 
 
+def _try_tilelang_summary_with_serial_fallback(
+    h: torch.Tensor,
+    x_proj: torch.Tensor,
+    f_t: torch.Tensor,
+    W_be: torch.Tensor,
+    h0_row: torch.Tensor,
+    summary_A: torch.Tensor,
+    summary_b: torch.Tensor,
+    tile_len: int,
+    summary_variant: SummaryVariant,
+) -> tuple[bool, str, SummaryVariant]:
+    ok, compile_log = _try_tilelang_summary(
+        h,
+        x_proj,
+        f_t,
+        W_be,
+        h0_row,
+        summary_A,
+        summary_b,
+        tile_len,
+        summary_variant,
+    )
+    if ok or summary_variant != "parallel_shared_old":
+        return ok, compile_log, summary_variant
+
+    serial_ok, serial_log = _try_tilelang_summary(
+        h,
+        x_proj,
+        f_t,
+        W_be,
+        h0_row,
+        summary_A,
+        summary_b,
+        tile_len,
+        "serial",
+    )
+    if serial_ok:
+        return True, compile_log, "serial"
+    return False, compile_log + "\nserial_summary_fallback_failed:\n" + serial_log, summary_variant
+
+
 @lru_cache(maxsize=8)
 def _tilelang_apply_kernel(tile_len: int):
     import tilelang
@@ -844,6 +885,7 @@ def m2rnn_pararnn_tiled_tilelang_forward(
     use_tilelang_summary = _tilelang_eligible(config, x_proj, v_dim)
     use_tilelang_scan = _tilelang_eligible(config, x_proj, v_dim)
     use_tilelang_apply = _tilelang_eligible(config, x_proj, v_dim)
+    active_summary_variant = config.summary_variant
     for _ in range(config.max_its):
         summary_A = torch.empty(Be, n_tiles, v_dim, v_dim, device=x_proj.device, dtype=x_proj.dtype)
         summary_b = torch.empty(Be, n_tiles, v_dim, device=x_proj.device, dtype=x_proj.dtype)
@@ -851,7 +893,7 @@ def m2rnn_pararnn_tiled_tilelang_forward(
         if use_tilelang_summary:
             stats.tilelang_attempted = True
             stats.tilelang_summary_attempted = True
-            ok, compile_log = _try_tilelang_summary(
+            ok, compile_log, summary_variant_used = _try_tilelang_summary_with_serial_fallback(
                 h,
                 x_proj,
                 f_t,
@@ -860,10 +902,15 @@ def m2rnn_pararnn_tiled_tilelang_forward(
                 summary_A,
                 summary_b,
                 config.tile_len,
-                config.summary_variant,
+                active_summary_variant,
             )
             if ok:
-                stats.backend_used = "tilelang-summary+pending-apply"
+                active_summary_variant = summary_variant_used
+                stats.backend_used = (
+                    "tilelang-summary-parallel-shared-old+pending-apply"
+                    if summary_variant_used == "parallel_shared_old"
+                    else "tilelang-summary+pending-apply"
+                )
                 stats.tilelang_used = True
                 stats.tilelang_summary_used = True
                 stats.max_tile_jac_elements = max(
@@ -985,7 +1032,7 @@ def m2rnn_pararnn_tiled_tilelang_forward(
         gpu_scan_used = stats.triton_scan_used or stats.tilelang_scan_used
         summary_backend = (
             "tilelang-summary-parallel-shared-old"
-            if config.summary_variant == "parallel_shared_old"
+            if active_summary_variant == "parallel_shared_old"
             else "tilelang-summary"
         )
         if stats.tilelang_summary_used and gpu_scan_used and stats.tilelang_apply_used:

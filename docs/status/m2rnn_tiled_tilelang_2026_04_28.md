@@ -781,3 +781,142 @@ now because it uses more shared memory and the exact Triton recurrence path is
 still faster on these small shapes. Next useful work is to promote
 `parallel_shared_old` to the default only after a larger NAM56R-shaped memory
 and occupancy sweep.
+
+## Optimization Cycle 6 - Shared-Old Default Candidate
+
+### Sources Read
+
+- Web docs:
+  - <https://www.tilelang.com/programming_guides/instructions.html>
+  - <https://tilelang.com/autoapi/tilelang/language/copy/index.html>
+  - <https://tilelang.com/autoapi/tilelang/language/loop/index.html>
+  - <https://www.tilelang.com/autoapi/tilelang/layout/fragment/index.html>
+  - <https://www.tilelang.com/programming_guides/autotuning.html>
+- Local TileLang:
+  - `/home/dave/tilelang-build/examples/linear_attention/example_mamba_chunk_scan.py`
+  - `/home/dave/tilelang-build/examples/kda/chunk_inter_solve_fused.py`
+  - `/home/dave/tilelang-build/examples/gemm/example_gemm_autotune.py`
+  - `/home/dave/tilelang-build/tilelang/language/loop.py`
+  - `/home/dave/tilelang-build/tilelang/language/copy_op.py`
+  - `/home/dave/tilelang-build/tilelang/transform/pass_config.py`
+
+Takeaways:
+
+1. `T.copy` is the right primitive for global/shared/fragment tile movement;
+   TileLang handles coalescing and safe boundary legalization, with `loop_layout`
+   available for SIMT copies.
+2. `T.Parallel(..., loop_layout=T.Fragment(...))` is supported, but the fragment
+   input dimensionality and access maps must be consistent. This matches the
+   previous layout-inference failures for mixed `P[vk,vj]` and `P[vi,vj]`.
+3. TileLang autotune exists, but this kernel's useful choice space is currently
+   small (`tile_len` 16/32/64 and summary variant). A static default is lower
+   risk until apply-side work is improved.
+
+### Profiling
+
+Environment:
+
+```text
+device=NVIDIA GB10
+torch=2.13.0.dev20260417+cu132
+tilelang=0.1.8+cuda.gitf309d814
+triton=importable
+```
+
+Serial summary baseline:
+
+```text
+S=512 Be=16 fp32
+tile16 summary=68.0183ms apply=0.3084ms tiled=206.829ms full=25.617ms triton=0.700ms
+tile32 summary=52.1386ms apply=0.1775ms tiled=199.107ms full=24.644ms triton=0.705ms
+tile64 summary=63.4690ms apply=0.3249ms tiled=193.384ms full=25.434ms triton=0.715ms
+```
+
+Shared-old summary:
+
+```text
+S=128 Be=16 fp32
+tile16 summary=0.0527ms apply=0.0449ms tiled=0.797ms full=3.533ms triton=0.527ms
+tile32 summary=0.0653ms apply=0.0536ms tiled=0.867ms full=3.261ms triton=0.525ms
+tile64 summary=0.0818ms apply=0.0702ms tiled=1.451ms full=3.233ms triton=0.524ms
+
+S=512 Be=16 fp32
+tile16 summary=0.3046ms apply=0.2695ms tiled=2.500ms full=20.526ms triton=0.649ms
+tile32 summary=0.3129ms apply=0.2877ms tiled=2.594ms full=19.825ms triton=0.649ms
+tile64 summary=0.4569ms apply=0.3001ms tiled=2.679ms full=19.856ms triton=0.660ms
+```
+
+Larger bf16 caller sweep:
+
+```text
+S=512 Be=64 bf16
+tile16 summary=1.6419ms apply=1.2184ms tiled=8.988ms full=119.399ms triton=0.660ms
+tile32 summary=1.6089ms apply=1.2109ms tiled=9.598ms full=119.422ms triton=0.660ms
+tile64 summary=1.6390ms apply=1.3741ms tiled=9.769ms full=119.870ms triton=0.640ms
+
+S=1024 Be=64 bf16
+tile16 summary=4.1703ms apply=3.2549ms tiled=22.874ms full=315.767ms triton=1.589ms
+tile32 summary=4.1475ms apply=3.2557ms tiled=22.879ms full=317.873ms triton=1.584ms
+tile64 summary=3.7641ms apply=3.1130ms tiled=23.719ms full=315.724ms triton=1.488ms
+```
+
+After warm cache, default probe now selects shared-old without an explicit
+`--summary-variant`:
+
+```text
+backend_used=tilelang-summary-parallel-shared-old+triton-scan+tilelang-apply
+summary_gpu_ms=0.0418 scan_triton_gpu_ms=0.0017 apply_gpu_ms=0.0358
+tiled_ms=0.719 full_pararnn_ms=2.170 triton_scan_ms=0.509
+```
+
+### Patch
+
+- Made `TiledTileLangConfig.summary_variant` default to
+  `parallel_shared_old`.
+- Updated the probe CLI default to match the production config.
+- Added `_try_tilelang_summary_with_serial_fallback`: if shared-old compile or
+  launch fails, the old serial TileLang summary kernel is tried before falling
+  back to PyTorch.
+- Updated CUDA backend assertions to allow the new default backend string.
+- Added a CPU unit test for shared-old -> serial TileLang summary fallback.
+- Tried a parallel/shared apply variant, but it produced TileLang ThreadSync
+  warnings and no measured speedup, so it was not kept.
+
+### Correctness and Validation
+
+Observed correctness:
+
+```text
+fp32 S=512 Be=16 max diff vs full ParaRNN:
+out <= 2.682209e-07, h <= 9.313226e-08
+
+bf16 S=1024 Be=64 max diff vs full ParaRNN:
+out <= 1.953125e-03, h <= 1.907349e-06
+```
+
+Passed:
+
+```text
+python -m py_compile cppmega/megatron/m2rnn_pararnn_tiled_tilelang.py tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py
+python -m pytest tests/test_m2rnn_pararnn_tiled_tilelang.py -q
+python -m pytest tests/test_m2rnn_pararnn.py tests/test_m2rnn_pararnn_tiled_tilelang.py -q
+```
+
+Observed:
+
+```text
+11 passed
+24 passed
+```
+
+### Default Recommendation
+
+`parallel_shared_old` should be the default for the current eligible TileLang
+path (`CUDA`, fp32 solve buffers, `V=16`, `tile_len in {16,32,64}`). It is
+orders of magnitude faster than the serial TileLang summary and is stable
+across fp32/bf16 caller probes. Keep the serial TileLang summary and PyTorch
+paths as fallbacks.
+
+It is not yet a full Triton replacement. Triton recurrence is still materially
+faster in the tested shapes, especially larger `Be/S`. The next production
+blocker is apply-side and per-token recurrence work, not the inter-tile scan.

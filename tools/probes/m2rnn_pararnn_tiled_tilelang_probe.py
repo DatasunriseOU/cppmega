@@ -119,7 +119,16 @@ def _print_stage_breakdown(args, q, k, v, W, xf, *, tile_len: int, device: str) 
         print(log.rstrip())
         return
     tiled_impl._try_triton_scan(summary_A, summary_b, carries)
-    tiled_impl._try_tilelang_apply(h, x_proj, f_t, W_be, h0_row, carries, delta, tile_len)
+    tiled_impl._try_tilelang_apply(
+        h,
+        x_proj,
+        f_t,
+        W_be,
+        h0_row,
+        carries,
+        delta,
+        tile_len,
+    )
     torch.cuda.synchronize()
 
     summary_ms = _time_cuda_kernel(
@@ -294,7 +303,7 @@ def main() -> int:
     parser.add_argument(
         "--summary-variant",
         choices=["serial", "parallel_shared_old"],
-        default="serial",
+        default="parallel_shared_old",
     )
     parser.add_argument("--tile-len", type=int, choices=[16, 32, 64], default=32)
     parser.add_argument("--sweep-tile-lens", action="store_true")
