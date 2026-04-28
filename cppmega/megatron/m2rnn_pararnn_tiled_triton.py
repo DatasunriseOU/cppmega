@@ -48,7 +48,7 @@ class TiledTritonConfig:
     max_its: int = 3
     omega_sor: float = 1.0
     init_strategy: str = "zero"
-    tile_size: int = 64
+    tile_size: int = 32
     prefer_triton: bool = True
 
 

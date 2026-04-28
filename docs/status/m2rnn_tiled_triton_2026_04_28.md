@@ -275,3 +275,114 @@ to compare tile sizes, not to claim end-to-end training throughput.
    extra reshape/einsum overhead.
 3. Add custom autograd or derive backward through the tiled solve.
 4. Benchmark tile sizes and register pressure on full H200/GB10 production shapes.
+
+## Third Optimization Cycle After `6ee0687`
+
+### Docs / MCP / Web Search
+
+Checked before code changes:
+
+- Triton `tl.associative_scan` API:
+  <https://triton-lang.org/main/python-api/generated/triton.language.associative_scan.html>
+- Triton `tl.static_range` API:
+  <https://triton-lang.org/main/python-api/generated/triton.language.static_range.html>
+- Triton `tl.range` API and `loop_unroll_factor` knob:
+  <https://triton-lang.org/main/python-api/generated/triton.language.range.html>
+- Triton persistent matmul tutorial:
+  <https://triton-lang.org/main/getting-started/tutorials/09-persistent-matmul.html>
+- Triton MLIR `tt.scan` op reference:
+  <https://triton-lang.org/main/dialects/TritonOps.html#tt-scan-triton-scanop>
+- GitHub `tl.associative_scan` multi-input PR:
+  <https://github.com/openai/triton/pull/2947>
+- GitHub `tl.range` loop unroll PR:
+  <https://github.com/triton-lang/triton/pull/4662>
+
+Brave MCP search returned exhausted API credits during this pass, so Exa MCP
+and web search were used for the GitHub/docs references above. Local docs/code
+search confirmed the current split: local tile and apply dominate `gb10-small`,
+while summary scan remains small.
+
+### Baseline Profiling
+
+Commands:
+
+```bash
+python -u scripts/bench_m2rnn_tiled_triton.py --profile gb10-small --tiles 16,32 --iters 1 --warmup 5 --repeat 50 --dtype fp32
+python -u scripts/bench_m2rnn_tiled_triton.py --profile gb10-small --tiles 16,32 --iters 1 --warmup 5 --repeat 50 --dtype bf16
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 4096 --H 4 --K 16 --V 16 --tiles 16,32 --iters 1 --warmup 5 --repeat 30 --dtype fp32
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 4096 --H 4 --K 16 --V 16 --tiles 16,32 --iters 1 --warmup 5 --repeat 30 --dtype bf16
+```
+
+| shape | dtype | tile 16 | tile 32 |
+| --- | --- | ---: | ---: |
+| `B=1,S=512,H=4,K=16,V=16` | fp32 | 0.167 ms | 0.120 ms |
+| `B=1,S=512,H=4,K=16,V=16` | bf16 | 0.174 ms | 0.119 ms |
+| `B=1,S=4096,H=4,K=16,V=16` | fp32 | 1.232 ms | 1.152 ms |
+| `B=1,S=4096,H=4,K=16,V=16` | bf16 | 1.240 ms | 1.186 ms |
+
+### Recompute Experiments
+
+Two approaches were tested and intentionally not shipped:
+
+1. Cache per-token vector coefficients `b` and `alpha=(1-f)*sech2` as two
+   `[Be,S,V]` fp32 tensors. This keeps the memory contract well below the
+   forbidden `[Be,S,V,V]` local prefix/full-A form, but GB10 runtime got worse:
+   small tile32 fp32 rose to 0.308 ms and `S=4096` tile32 fp32 rose to
+   3.314 ms because the extra global stores/loads dominated.
+2. Recompute reduction in apply as `f*d + alpha*(Wt@d) + b` without materialized
+   `M`. This was also slower in the measured kernels, so it was reverted.
+
+### Shipped Patch
+
+The only code change shipped in this cycle is conservative: the
+`TiledTritonConfig` default `tile_size` is now 32 instead of 64. This avoids the
+large default `tl.static_range(64)` specialization for callers that do not pass
+an explicit tile. Explicit tile sweeps remain available.
+
+Large `tile64` first-use checks on the `S=4096` shape spent over a minute in
+compile/progress before producing timings. The explicit tile16/32 runs complete
+quickly, and tile32 was consistently the better explicit choice on the larger
+shape in this pass.
+
+### After Profiling
+
+Same commands as baseline, after reverting the losing recompute experiments and
+keeping only the default tile change:
+
+| shape | dtype | tile 16 | tile 32 |
+| --- | --- | ---: | ---: |
+| `B=1,S=512,H=4,K=16,V=16` | fp32 | 0.104 ms | 0.105 ms |
+| `B=1,S=512,H=4,K=16,V=16` | bf16 | 0.117 ms | 0.118 ms |
+| `B=1,S=4096,H=4,K=16,V=16` | fp32 | 1.190 ms | 1.125 ms |
+| `B=1,S=4096,H=4,K=16,V=16` | bf16 | 1.243 ms | 1.154 ms |
+
+The after rows are warm-cache microbenchmarks; the main functional change is
+the default tile selection, not an explicit-tile kernel rewrite.
+
+### Parity / Tests
+
+```bash
+python -m py_compile cppmega/megatron/m2rnn_pararnn_tiled_triton.py scripts/bench_m2rnn_tiled_triton.py tools/probes/m2rnn_pararnn_tiled_triton_probe.py
+pytest -q tests/test_m2rnn_pararnn_tiled_triton.py
+python tools/probes/m2rnn_pararnn_tiled_triton_probe.py --device cuda --dtype fp32 --B 1 --S 32 --H 1 --K 2 --V 4 --tile 8 --iters 1
+python tools/probes/m2rnn_pararnn_tiled_triton_probe.py --device cuda --dtype bf16 --B 1 --S 32 --H 1 --K 2 --V 4 --tile 8 --iters 2
+```
+
+Results:
+
+- `py_compile`: passed.
+- `tests/test_m2rnn_pararnn_tiled_triton.py`: 6 passed.
+- CUDA fp32 probe: `max_out=2.801418e-06`, `max_h=5.736947e-07`.
+- CUDA bf16 probe: `max_out=1.907349e-06`, `max_h=0.000000e+00`.
+
+### Remaining Blockers
+
+- The best way to remove double recompute is not obvious on GB10: vector cache
+  and direct apply algebra both lost. A fused local-summary/apply path may still
+  make sense for `num_tiles == 1`, but it does not address `S=512/4096`.
+- Hierarchical/global summary scan remains unimplemented. For the measured
+  GB10 shapes, tile32 still spends more time in local/apply than in the scan, so
+  this was not the highest-return patch for this cycle.
+- `tl.static_range(TILE)` still hurts compile for 64/128. The next safe step is
+  a separate kernel variant using `tl.range(..., loop_unroll_factor=...)` for
+  large tiles, with explicit correctness/perf gating.
