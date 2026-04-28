@@ -58,14 +58,34 @@ class PararnnConfig:
             of one O(C) sequential pass.
     """
 
-    max_its: int = 3
+    # ParaRNN paper uses 3 for stable LSTM/GRU; with the M2RNN identity-ish
+    # init (W ~ I + small perturbation) Newton needs more iterations to
+    # drive the residual to the fp32 floor. Empirically (S=128, k=V=16,
+    # W = eye + noise*randn, fp64):
+    #   noise=0.001: iter 6 -> 1.18e-5,  iter 8 -> 9e-16  (converges)
+    #   noise=0.010: iter 6 -> 1.54e-3,  iter 8 -> 2e-11   (converges, slower)
+    #   noise=0.050: iter 6 -> 2.64,     iter 10 -> 4.2e-1 (poorly conditioned)
+    # Default 8 covers realistic M2RNN init (noise ~ 0.01 from the residual
+    # scheme); poorly-conditioned regimes (noise ~ 0.05) need omega_sor < 1
+    # or explicit abs_tol/rel_tol convergence flags. ParaRNN's stable-LSTM
+    # default of 3 is wrong for identity-ish recurrences.
+    max_its: int = 8
     omega_sor: float = 1.0
     init_strategy: str = "zero"
-    # Chunk size for the streaming reduction. S > chunk_size triggers the
-    # chunked path which never materialises the full (Be, S, V, V) Jacobian.
-    # 0 disables chunking (use only when S * Be * V^2 fits comfortably in
-    # device memory). 128 keeps peak Jacobian under ~150 MB at NAM56R dims.
+    # Chunk size for the streaming Newton/reduce path. Each Newton iteration
+    # processes the sequence chunk-by-chunk, building the (Be, chunk_size, V, V)
+    # Jacobian on the fly so peak Jacobian memory is O(Be * chunk_size * V^2)
+    # rather than O(Be * S * V^2). 0 disables chunking and rebuilds the
+    # full-S Jacobian per iteration -- only safe when Be * S * V^2 * 4 bytes
+    # fits comfortably in device memory.
     chunk_size: int = 128
+    # Optional residual-norm convergence checks. ``abs_tol > 0`` triggers
+    # an extra forward pass per Newton iteration; the iteration breaks as
+    # soon as max_t ||F_t||_inf < abs_tol or that norm divided by the
+    # iteration-0 norm < rel_tol. Default disabled -- callers fall back
+    # to ``max_its``.
+    abs_tol: float = 0.0
+    rel_tol: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -108,55 +128,6 @@ def _parallel_reduce_dense(
     return rhs
 
 
-def _chunked_reduce_dense(
-    jac: torch.Tensor,    # (Be, S, V, V)
-    rhs: torch.Tensor,    # (Be, S, V)
-    chunk_size: int,
-) -> torch.Tensor:
-    """Streaming chunked reduction: solves the same bidiagonal system as
-    ``_parallel_reduce_dense`` but processes the sequence in chunks of
-    ``chunk_size`` so peak Jacobian memory is O(Be * chunk * V^2) instead
-    of O(Be * S * V^2).
-
-    Algorithm
-    ---------
-    For each chunk c covering [c*C, (c+1)*C):
-      1. The chunk-local first row's subdiagonal block gives the link to
-         the previous chunk. We absorb the propagated previous-chunk
-         delta into rhs[c*C] via -= jac[c*C] @ prev_delta, then zero
-         jac[c*C] so the within-chunk scan treats the chunk as
-         starting from zero state.
-      2. Run the standard Brent-Kung scan inside the chunk.
-      3. The chunk's last delta becomes prev_delta for the next chunk.
-
-    This is sequential across chunks (n_chunks steps) but parallel
-    inside each chunk (log2(C) steps), giving O(n_chunks + log C)
-    sequential depth versus O(log S) for the full-S scan. The win is
-    memory: peak working tensor is one chunk's (Be, C, V, V), not the
-    whole (Be, S, V, V).
-
-    Output is exact to the full-S scan (no approximation).
-    """
-    Be, S, V, _ = jac.shape
-    out = torch.empty_like(rhs)
-    prev_delta = torch.zeros(Be, V, device=jac.device, dtype=jac.dtype)
-
-    for c_start in range(0, S, chunk_size):
-        c_end = min(c_start + chunk_size, S)
-        # clone() because the Brent-Kung step mutates in place.
-        jac_c = jac[:, c_start:c_end].clone()
-        rhs_c = rhs[:, c_start:c_end].clone()
-
-        # Absorb the previous chunk's tail delta into the first row.
-        if c_start > 0:
-            rhs_c[:, 0] -= torch.einsum("bij,bj->bi", jac_c[:, 0], prev_delta)
-        jac_c[:, 0] = 0  # the within-chunk scan now sees a zero left boundary
-
-        delta_c = _parallel_reduce_dense(jac_c, rhs_c)
-        out[:, c_start:c_end] = delta_c
-        prev_delta = delta_c[:, -1]
-
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -164,49 +135,6 @@ def _chunked_reduce_dense(
 # ---------------------------------------------------------------------------
 
 
-def _m2rnn_residual_and_jacobian(
-    h_traj: torch.Tensor,  # (Be, S, V)
-    x_proj: torch.Tensor,  # (Be, S, V)
-    f: torch.Tensor,  # (Be, S)
-    W: torch.Tensor,  # (V, V)
-    h0: torch.Tensor,  # (Be, V)
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute F_t = h_t - f_t * h_{t-1} - (1 - f_t) * tanh(h_{t-1} @ W + x_t)
-    and the subdiagonal Jacobian A_t = dF_t / dh_{t-1} for every t.
-
-    Returns
-    -------
-    residual: (Be, S, V)
-    jac:      (Be, S, V, V)
-    h_new:    (Be, S, V) -- the candidate value tanh(...), kept so the
-                            caller can reuse it in initialisation logic.
-    """
-    Be, S, V = h_traj.shape
-
-    # h_{t-1} for t=0..S-1; h_{-1} = h0 (or zeros).
-    h_prev = torch.cat([h0[:, None, :], h_traj[:, :-1, :]], dim=1)  # (Be, S, V)
-
-    z = h_prev @ W + x_proj  # (Be, S, V)
-    h_new = torch.tanh(z)
-
-    f_b = f[..., None]  # (Be, S, 1) -- broadcast over V
-    residual = h_traj - f_b * h_prev - (1.0 - f_b) * h_new  # (Be, S, V)
-
-    # A_t[i, j] = -f_t * delta_ij - (1 - f_t) * sech^2(z_i) * W[j, i]
-    #          = -f_t * I - (1 - f_t) * diag(sech^2(z)) @ W^T
-    sech2 = 1.0 - h_new * h_new  # (Be, S, V) -- 1 - tanh^2 = sech^2
-    eye_v = torch.eye(V, device=W.device, dtype=W.dtype)
-    f_bb = f[..., None, None]  # (Be, S, 1, 1)
-
-    # outer: sech2[..., i, None] * W.T[None, None, i, j] gives (Be, S, V, V)
-    # broadcasting carefully:
-    #   sech2 reshape (Be, S, V, 1)  *  W.T reshape (1, 1, V, V) -> (Be, S, V, V)
-    # producing entry [i, j] = sech2_i * W.T[i, j] = sech2_i * W[j, i].
-    nonlin_block = sech2[..., :, None] * W.t()[None, None, :, :]  # (Be, S, V, V)
-
-    jac = -f_bb * eye_v[None, None, :, :] - (1.0 - f_bb) * nonlin_block
-
-    return residual, jac, h_new
 
 
 # ---------------------------------------------------------------------------
@@ -319,25 +247,93 @@ def m2rnn_pararnn_forward(
     else:
         raise ValueError(f"unknown init_strategy: {config.init_strategy}")
 
-    # ----- Newton iterations -----
-    # System per chain (size S):  I * dh_t + A_t * dh_{t-1} = -F_t,  dh_0 driven by h0_row.
-    # Each Newton step assembles A_t and -F_t from the current trajectory and
-    # runs _parallel_reduce_dense to recover dh in O(log S) depth.
-    use_chunked = config.chunk_size > 0 and S > config.chunk_size
-    for _ in range(config.max_its):
-        residual, jac, _h_new = _m2rnn_residual_and_jacobian_be(
-            h_traj=h,
-            x_proj=x_proj,
-            f=f_t,
-            W_be=W_be,
-            h0_row=h0_row,
-        )
-        rhs = -residual  # (Be, S, V)
-        if use_chunked:
-            delta = _chunked_reduce_dense(jac, rhs, config.chunk_size)
-        else:
-            delta = _parallel_reduce_dense(jac.contiguous(), rhs.contiguous())
-        h = h + config.omega_sor * delta
+    # ----- Newton iterations (streaming chunked) ----------------------------
+    # System per chain (size S):  I * dh_t + A_t * dh_{t-1} = -F_t.
+    # We never materialise the full (Be, S, V, V) Jacobian: each Newton iter
+    # walks the sequence chunk-by-chunk, building only the current chunk's
+    # residual + Jacobian, running within-chunk Brent-Kung in place, and
+    # propagating ``h_last`` (for the next chunk's residual) and
+    # ``delta_last`` (for the next chunk's row-0 absorption).
+    #
+    # Peak working memory:
+    #     residual_chunk + jac_chunk + h_chunk + rhs_chunk + delta_chunk
+    #   ~ 3 * Be * C * V (state-like) + Be * C * V * V (Jacobian)
+    # For B=4, S=4096, H=44, k=64, V=16, C=128: jac chunk = 1.4 GiB, state
+    # chunks ~85 MiB each. The previous full-S path materialised a 47 GiB
+    # Jacobian, which OOMs every GPU we ship to.
+    #
+    # Cross-chunk dependency makes this O(n_chunks + log C) sequential depth
+    # rather than O(log S). For S=4096 / C=128 that is 32 + 7 = 39 versus 12
+    # full-parallel; the trade is worth the memory saving and is what makes
+    # the Triton port (Phase B.2) viable on a single SM's smem budget.
+    chunk_size = config.chunk_size if config.chunk_size > 0 else S
+    n_chunks = (S + chunk_size - 1) // chunk_size
+
+    for newton_iter in range(config.max_its):
+        prev_h_last = h0_row                                           # (Be, V)
+        prev_delta_last = torch.zeros_like(h0_row)                     # (Be, V)
+        max_residual = 0.0  # for optional convergence check
+
+        for c_idx in range(n_chunks):
+            c_start = c_idx * chunk_size
+            c_end = min(c_start + chunk_size, S)
+            h_c = h[:, c_start:c_end]                                  # (Be, C, V)
+            x_c = x_proj[:, c_start:c_end]
+            f_c = f_t[:, c_start:c_end]
+
+            residual_c, jac_c = _residual_jac_chunk(
+                h_chunk=h_c, x_chunk=x_c, f_chunk=f_c,
+                W_be=W_be, prev_h_last=prev_h_last,
+            )
+            rhs_c = -residual_c                                        # (Be, C, V)
+
+            if config.abs_tol > 0.0 or config.rel_tol > 0.0:
+                # Track max ||F_t||_inf across all chunks for the iter-level
+                # convergence check.
+                with torch.no_grad():
+                    chunk_max = residual_c.abs().amax().item()
+                if chunk_max > max_residual:
+                    max_residual = chunk_max
+
+            if c_start > 0:
+                # Absorb the previous chunk's tail delta into the first row's RHS.
+                rhs_c = rhs_c.clone()
+                rhs_c[:, 0] = rhs_c[:, 0] - torch.einsum(
+                    "bij,bj->bi", jac_c[:, 0], prev_delta_last,
+                )
+                # Zero the row-0 subdiagonal so the within-chunk scan sees a
+                # left boundary of zero (the absorbed delta is already in rhs).
+                jac_c = jac_c.clone()
+                jac_c[:, 0] = 0
+            else:
+                # First chunk: row-0 already references h0_row in the residual,
+                # so no delta to absorb. But the Brent-Kung scan still needs
+                # jac[0] zeroed for safety (matches apple's _reduction_step_dense).
+                jac_c = jac_c.clone()
+                jac_c[:, 0] = 0
+
+            delta_c = _parallel_reduce_dense(jac_c, rhs_c.contiguous())
+            # Update h_traj for this chunk; out-of-place to keep autograd happy.
+            h = torch.cat(
+                [h[:, :c_start], h_c + config.omega_sor * delta_c, h[:, c_end:]],
+                dim=1,
+            )
+
+            # Carry forward for the next chunk.
+            prev_h_last = h[:, c_end - 1]                              # (Be, V)
+            prev_delta_last = delta_c[:, -1]                           # (Be, V)
+
+        # Iteration-level convergence check.
+        if config.abs_tol > 0.0 and max_residual < config.abs_tol:
+            break
+        if newton_iter == 0:
+            iter0_residual = max_residual
+        elif (
+            config.rel_tol > 0.0
+            and iter0_residual > 0.0
+            and max_residual / iter0_residual < config.rel_tol
+        ):
+            break
 
     # ----- output projection: out_t = q_t @ h_t (per (b, h, k_idx, t))
     # h is (Be=B*H*k_dim, S, V); q is (B, S, H, k_dim).
@@ -350,33 +346,48 @@ def m2rnn_pararnn_forward(
     return out.to(out_dtype), h_final.to(out_dtype)
 
 
-def _m2rnn_residual_and_jacobian_be(
-    h_traj: torch.Tensor,   # (Be, S, V)
-    x_proj: torch.Tensor,   # (Be, S, V)
-    f: torch.Tensor,        # (Be, S)
-    W_be: torch.Tensor,     # (Be, V, V) -- per-row weight (heads broadcast)
-    h0_row: torch.Tensor,   # (Be, V)
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Per-row variant: each chain has its own W (so we batch-mm)."""
-    Be, S, V = h_traj.shape
+def _residual_jac_chunk(
+    h_chunk: torch.Tensor,    # (Be, C, V) -- current Newton iterate over chunk
+    x_chunk: torch.Tensor,    # (Be, C, V)
+    f_chunk: torch.Tensor,    # (Be, C)
+    W_be: torch.Tensor,       # (Be, V, V) -- per-chain weight
+    prev_h_last: torch.Tensor,  # (Be, V) -- h_{c_start - 1} from previous chunk
+                                #            (or h0_row for the first chunk)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-chunk Newton residual + subdiagonal Jacobian.
 
-    h_prev = torch.cat([h0_row[:, None, :], h_traj[:, :-1, :]], dim=1)  # (Be, S, V)
+    Identical math to the full-S assembly, but operates on one chunk at a
+    time given the previous chunk's tail state. This is the streaming
+    primitive that lets us run Newton without materialising the full
+    (Be, S, V, V) Jacobian.
 
-    # z[t] = h_{t-1} @ W_be   per row (Be, V) @ (Be, V, V) -> (Be, V), all t.
-    z = torch.einsum("btv,bvw->btw", h_prev, W_be) + x_proj  # (Be, S, V)
+    Returns
+    -------
+    residual: (Be, C, V)
+    jac:      (Be, C, V, V)
+    """
+    Be, C, V = h_chunk.shape
+
+    # h_{t-1} for t in [c_start, c_end): chunk's own [:-1] preceded by prev_h_last.
+    h_prev = torch.cat(
+        [prev_h_last[:, None, :], h_chunk[:, :-1, :]], dim=1,
+    )                                                              # (Be, C, V)
+
+    # z[t] = h_{t-1} @ W_be (per-chain bmm)
+    z = torch.einsum("btv,bvw->btw", h_prev, W_be) + x_chunk       # (Be, C, V)
     h_new = torch.tanh(z)
 
-    f_b = f[..., None]
-    residual = h_traj - f_b * h_prev - (1.0 - f_b) * h_new
+    f_b = f_chunk[..., None]                                       # (Be, C, 1)
+    residual = h_chunk - f_b * h_prev - (1.0 - f_b) * h_new        # (Be, C, V)
 
-    sech2 = 1.0 - h_new * h_new                    # (Be, S, V)
+    # A_t[i, j] = -f_t * delta_ij - (1 - f_t) * sech^2(z_i) * W[j, i]
+    #          = -f_t * I - (1 - f_t) * diag(sech^2(z)) @ W^T
+    sech2 = 1.0 - h_new * h_new                                    # (Be, C, V)
     eye_v = torch.eye(V, device=W_be.device, dtype=W_be.dtype)
-    f_bb = f[..., None, None]                      # (Be, S, 1, 1)
+    f_bb = f_chunk[..., None, None]                                # (Be, C, 1, 1)
 
-    # Per-chain W^T: (Be, V, V)
-    Wt_be = W_be.transpose(-1, -2)                 # (Be, V, V)
-    # nonlin_block[t, i, j] = sech2[t, i] * Wt_be[i, j] = sech2[t, i] * W[j, i]
-    nonlin_block = sech2[..., :, None] * Wt_be[:, None, :, :]  # (Be, S, V, V)
+    Wt_be = W_be.transpose(-1, -2)                                 # (Be, V, V)
+    nonlin_block = sech2[..., :, None] * Wt_be[:, None, :, :]      # (Be, C, V, V)
 
     jac = -f_bb * eye_v[None, None, :, :] - (1.0 - f_bb) * nonlin_block
-    return residual, jac, h_new
+    return residual, jac

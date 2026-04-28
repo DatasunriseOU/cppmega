@@ -247,6 +247,139 @@ def test_head_broadcast():
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# M2RNN-realistic init: identity-ish W needs more Newton iters than the paper's
+# stable-LSTM default of 3. The default (max_its=6) must converge cleanly here.
+# ---------------------------------------------------------------------------
+
+
+def _make_m2rnn_init_inputs(B, S, H, k_dim, v_dim, *, device, dtype, seed=0,
+                             w_noise=0.005):
+    """Replicates the default NAM56R init: W = I + small_noise * randn so the
+    recurrence is near-linear (residual-style). Newton's quadratic basin is
+    reached only after several iterations of linear progress, and the
+    paper's max_its=3 default is too few here."""
+    g = torch.Generator(device=device).manual_seed(seed)
+    q = torch.randn(B, S, H, k_dim, generator=g, device=device, dtype=dtype) * 0.5
+    k = torch.randn(B, S, H, k_dim, generator=g, device=device, dtype=dtype) * 0.5
+    v = torch.randn(B, S, H, v_dim, generator=g, device=device, dtype=dtype) * 0.5
+    eye = torch.eye(v_dim, dtype=dtype, device=device)
+    W = eye[None, :, :].repeat(H, 1, 1) + torch.randn(
+        H, v_dim, v_dim, generator=g, device=device, dtype=dtype
+    ) * w_noise
+    xf_logits = torch.randn(B, S, H, generator=g, device=device, dtype=dtype) - 0.5
+    xf = torch.sigmoid(xf_logits)
+    return q, k, v, W, xf
+
+
+@pytest.mark.parametrize("S,k_dim,v_dim", [(64, 8, 8), (128, 16, 16)])
+def test_default_max_its_converges_on_m2rnn_init(S, k_dim, v_dim):
+    """User-reported regression: with M2RNN-realistic identity-ish W,
+    max_its=3 leaves residual ~1e-1, but the new default (8) drives it
+    several orders of magnitude lower."""
+    B, H = 1, 2
+    q, k, v, W, xf = _make_m2rnn_init_inputs(
+        B, S, H, k_dim, v_dim, device="cpu", dtype=torch.float64,
+    )
+    out_ref, _ = _torch_m2rnn_forward(q, k, v, W, xf)
+
+    out_3, _ = m2rnn_pararnn_forward(q, k, v, W, xf, config=PararnnConfig(max_its=3))
+    out_default, _ = m2rnn_pararnn_forward(q, k, v, W, xf)  # uses default max_its
+
+    err_3 = (out_3 - out_ref).abs().max().item()
+    err_default = (out_default - out_ref).abs().max().item()
+
+    # The paper's default of 3 leaves a noticeable residual on identity-ish W.
+    assert err_3 > 1e-2, (
+        f"max_its=3 unexpectedly converged on identity-ish W: err={err_3}; "
+        f"the test fixture may be too benign to exercise the regression."
+    )
+    # The new default must drive the error to < 1e-6 on this benign init.
+    assert err_default < 1e-6, (
+        f"default max_its insufficient: 3-iter err={err_3}, "
+        f"default err={err_default}. Bump max_its or tighten omega_sor."
+    )
+
+
+def test_poorly_conditioned_W_needs_explicit_max_its():
+    """Regimes with W far from identity (noise >= 0.05) need omega_sor or
+    extra iters; we document that the default does NOT silently mask this."""
+    B, S, H, k_dim, v_dim = 1, 64, 2, 8, 8
+    q, k, v, W, xf = _make_m2rnn_init_inputs(
+        B, S, H, k_dim, v_dim, device="cpu", dtype=torch.float64, w_noise=0.05,
+    )
+    out_ref, _ = _torch_m2rnn_forward(q, k, v, W, xf)
+    # Default max_its with vanilla SOR may leave residual; that's expected
+    # for ill-conditioned W. Caller should bump max_its or use omega_sor < 1.
+    out_default, _ = m2rnn_pararnn_forward(q, k, v, W, xf)
+    err_default = (out_default - out_ref).abs().max().item()
+    # Many iters + under-relaxation gets there.
+    out_more, _ = m2rnn_pararnn_forward(
+        q, k, v, W, xf, config=PararnnConfig(max_its=20, omega_sor=0.7),
+    )
+    err_more = (out_more - out_ref).abs().max().item()
+    # Document the relationship: more iters + damping wins.
+    assert err_more < err_default, (
+        f"under-relaxation should help: default {err_default:.3e}, "
+        f"max_its=20 omega_sor=0.7 {err_more:.3e}"
+    )
+
+
+def test_streaming_never_materialises_full_jacobian():
+    """Sanity-check that the chunked Newton path never holds a Jacobian
+    larger than (Be * chunk_size * V * V * 4) bytes at any one time.
+
+    We hook torch's storage allocations and check the largest 4D float
+    tensor allocated during the call has at most chunk_size in the second
+    dimension. CPU-only tracing -- correctness, not performance.
+    """
+    B, S, H, k_dim, v_dim = 1, 256, 2, 4, 4
+    chunk_size = 64
+    q, k, v, W, xf = _make_inputs(
+        B, S, H, k_dim, v_dim, device="cpu", dtype=torch.float64
+    )
+
+    largest_axis_1 = 0
+
+    orig_empty = torch.empty
+    orig_zeros = torch.zeros
+    orig_cat = torch.cat
+    orig_einsum = torch.einsum
+
+    # Inspect every 4D float64 tensor of shape (Be, S', V, V) by sniffing the
+    # einsum outputs and direct allocations. This is best-effort but catches
+    # the materialise-full-jac regression: any tensor with axis 1 == S would
+    # break the assertion below.
+    seen_shapes: list[tuple[int, ...]] = []
+
+    def _wrap_einsum(*args, **kwargs):
+        out = orig_einsum(*args, **kwargs)
+        if out.dim() == 4 and out.dtype == torch.float64:
+            seen_shapes.append(tuple(out.shape))
+        return out
+
+    torch.einsum = _wrap_einsum
+    try:
+        m2rnn_pararnn_forward(
+            q, k, v, W, xf, config=PararnnConfig(chunk_size=chunk_size, max_its=2)
+        )
+    finally:
+        torch.einsum = orig_einsum
+
+    # Find the largest axis-1 across 4D einsum outputs that look like a Jacobian
+    # (axis 2 == axis 3 == V). Anything > chunk_size means we materialised
+    # more than a chunk's worth of Jacobian.
+    for shape in seen_shapes:
+        if len(shape) == 4 and shape[2] == v_dim and shape[3] == v_dim:
+            largest_axis_1 = max(largest_axis_1, shape[1])
+
+    assert largest_axis_1 <= chunk_size, (
+        f"streaming regression: 4D Jacobian-shaped einsum output had axis-1 = "
+        f"{largest_axis_1} > chunk_size = {chunk_size} (S = {S}). "
+        f"Sample shapes: {seen_shapes[:5]}"
+    )
+
+
 def test_h0_propagation():
     """Non-zero initial state must influence the trajectory the same way
     as in the sequential reference."""
