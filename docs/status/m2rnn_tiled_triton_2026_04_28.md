@@ -8,6 +8,147 @@ Branch: `worker/m2rnn-tiled-triton`
 
 Base: `0b7acbc5d18dead10ad206ee5c111e2cb08ab1ef`
 
+## Continuation After `e4f24be`
+
+### Triton Docs / Examples Reviewed
+
+Primary/near-primary sources checked before changing code:
+
+- Triton `tl.associative_scan` API:
+  <https://triton-lang.org/main/python-api/generated/triton.language.associative_scan.html>
+- Triton language index, scan/reduction APIs:
+  <https://triton-lang.org/main/python-api/triton.language.html>
+- Triton fused softmax tutorial:
+  <https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html>
+- Triton persistent matmul tutorial:
+  <https://triton-lang.org/main/getting-started/tutorials/09-persistent-matmul.html>
+- Triton discussion/example using `tl.associative_scan` for roll/shift:
+  <https://github.com/triton-lang/triton/discussions/4472>
+
+Concrete takeaways:
+
+1. `tl.associative_scan` supports tuple inputs and custom `@triton.jit`
+   combine functions, so an affine summary operator `(M2 @ M1, M2 @ b1 + b2)`
+   is expressible inside one program.
+2. `tl.associative_scan` scans along an in-block tensor axis; it does not by
+   itself create a multi-program/global prefix over arbitrary tile summaries.
+   A hierarchical scan would still need an additional inter-block level.
+3. The fused softmax tutorial's central lesson applies here: for bandwidth and
+   launch-bound chains, avoid writing intermediate tensors that are consumed
+   immediately by the next operation.
+4. The persistent matmul tutorial demonstrates reducing launch/work scheduling
+   overhead by keeping programs resident and iterating over tiles.  That is a
+   longer-term direction for local tile/apply; it is larger than today's patch.
+5. The current bottleneck is not the existing sequential summary scan at
+   `gb10-small`/tile 16; local tile assembly and apply replay dominate the
+   kernel split.
+
+### GB10 Baseline / Bottleneck
+
+Environment:
+
+- GPU: NVIDIA GB10, compute capability 12.1
+- PyTorch: `2.13.0.dev20260417+cu132`
+- Triton: `3.7.0`
+
+First attempted command:
+
+```bash
+python scripts/bench_m2rnn_tiled_triton.py --profile gb10-small --tiles 16,32,64,128 --iters 1 --warmup 10 --repeat 50 --dtype fp32 --check-dense
+```
+
+This was stopped because dense parity at `S=512` spent more than a minute in
+the dense reference before producing useful kernel timings.  Parity was checked
+separately on smaller shapes.
+
+Useful before benchmark:
+
+```bash
+python -u scripts/bench_m2rnn_tiled_triton.py --profile gb10-small --tiles 16,32,64,128 --iters 1 --warmup 2 --repeat 5 --dtype fp32
+```
+
+The tile 64/128 part was stopped after tile 32 because large unrolled
+`tl.static_range(TILE)` variants were spending too long in compile/progress for
+this interactive pass.  Before rows captured:
+
+| tile | num_tiles | before latency | before peak alloc |
+| ---: | ---: | ---: | ---: |
+| 16 | 32 | 0.154 ms | 46.58 MiB |
+| 32 | 16 | 0.147 ms | 45.58 MiB |
+
+One-off CUDA event stage split, tile 16, fp32, after JIT warmup:
+
+| stage | before |
+| --- | ---: |
+| local tile kernel | 0.041788 ms |
+| summary scan kernel | 0.007659 ms |
+| apply-carry kernel | 0.026049 ms |
+| separate PyTorch update | 0.003962 ms |
+
+Interpretation: summary scan is small for this profile. The real easy waste was
+an unused `local_delta` write/allocation plus a separate `h + omega * delta`
+update after the apply kernel.
+
+### Optimization Patch
+
+Changed `cppmega/megatron/m2rnn_pararnn_tiled_triton.py`:
+
+- Removed unused `local_delta` allocation and stores from the Triton local tile
+  kernel and PyTorch fallback.
+- Fused Newton update into the apply-carry kernel/fallback:
+  `h_next = h + omega_sor * delta`.
+- The public bf16 contract is unchanged: bf16 inputs are promoted to fp32 for
+  solve accumulation and outputs are cast back to the input dtype.
+- `local_delta_bytes` in memory accounting is now zero because the buffer is no
+  longer allocated.
+
+After stage split, tile 16, fp32:
+
+| stage | before | after |
+| --- | ---: | ---: |
+| local tile kernel | 0.041788 ms | 0.038375 ms |
+| summary scan kernel | 0.007659 ms | 0.007672 ms |
+| apply/update kernel | 0.026049 ms + 0.003962 ms | 0.026059 ms |
+
+After benchmark:
+
+```bash
+python -u scripts/bench_m2rnn_tiled_triton.py --profile gb10-small --tiles 16,32 --iters 1 --warmup 2 --repeat 20 --dtype fp32
+python -u scripts/bench_m2rnn_tiled_triton.py --profile gb10-small --tiles 16,32 --iters 1 --warmup 2 --repeat 20 --dtype bf16
+```
+
+| dtype | tile | num_tiles | after latency | after peak alloc |
+| --- | ---: | ---: | ---: | ---: |
+| fp32 | 16 | 32 | 0.109 ms | 40.83 MiB |
+| fp32 | 32 | 16 | 0.109 ms | 39.70 MiB |
+| bf16 | 16 | 32 | 0.127 ms | 40.76 MiB |
+| bf16 | 32 | 16 | 0.121 ms | 39.63 MiB |
+
+Measured against the captured fp32 before rows:
+
+| tile | before | after | delta |
+| ---: | ---: | ---: | ---: |
+| 16 | 0.154 ms | 0.109 ms | -29.2% |
+| 32 | 0.147 ms | 0.109 ms | -25.9% |
+
+Parity after patch:
+
+```bash
+python tools/probes/m2rnn_pararnn_tiled_triton_probe.py --device cuda --dtype fp32 --B 1 --S 32 --H 1 --K 2 --V 4 --tile 8 --iters 1
+python tools/probes/m2rnn_pararnn_tiled_triton_probe.py --device cuda --dtype bf16 --B 1 --S 32 --H 1 --K 2 --V 4 --tile 8 --iters 2
+```
+
+- fp32: `max_out=2.801418e-06`, `max_h=5.736947e-07`
+- bf16: `max_out=1.907349e-06`, `max_h=0.000000e+00`
+
+Tests:
+
+```bash
+pytest -q tests/test_m2rnn_pararnn_tiled_triton.py
+```
+
+Result: `6 passed`.
+
 ## What Changed
 
 Added an isolated tiled/streaming Newton linear solve prototype in
@@ -22,7 +163,7 @@ Implemented pipeline:
    - one program per `(B * H * K, sequence_tile)`;
    - assembles `M_t = -A_t` and `b_t = -F_t` inside the tile;
    - computes inclusive affine prefix under zero boundary;
-   - writes local deltas and tile summary `(M_tile, b_tile)`.
+   - writes tile summary `(M_tile, b_tile)`.
 2. Triton tile-summary scan across sequence tiles on CUDA:
    - one program per `(B * H * K)` chain;
    - sequential scan over `num_tiles` stays on GPU;
@@ -31,7 +172,7 @@ Implemented pipeline:
    - replays the tile;
    - recomputes local `M_t, b_t`;
    - starts from the scanned incoming carry;
-   - writes full Newton `delta`.
+   - writes the updated hidden state `h_next = h + omega_sor * delta`.
 4. CPU / missing-Triton fallback uses the same streaming algorithm in PyTorch.
 5. bf16 input/output path:
    - q/k/v/W/xf may be bf16;

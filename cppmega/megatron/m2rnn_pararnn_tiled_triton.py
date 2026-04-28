@@ -9,13 +9,13 @@ live longer than a kernel/chunk are tile summaries with shape
 Pipeline
 --------
 1. local tile pass: assemble ``M_t = -A_t`` and ``b_t = -F_t`` inside one
-   sequence tile, run the zero-boundary affine prefix, write local deltas and a
-   tile summary ``(M_tile, b_tile)``.
+   sequence tile, run the zero-boundary affine prefix, and write a tile summary
+   ``(M_tile, b_tile)``.
 2. summary scan: Triton scan over tile summaries on CUDA, PyTorch fallback on
    CPU/debug paths.
 3. apply pass: replay each tile with the incoming carry to produce full
-   Newton deltas.  This pass recomputes local ``M_t, b_t`` instead of storing
-   per-token prefix matrices.
+   Newton deltas and immediately apply ``h += omega * delta``.  This pass
+   recomputes local ``M_t, b_t`` instead of storing per-token prefix matrices.
 
 The CUDA path uses Triton for steps 1-3.  CPU, missing-Triton, and fp64
 debugging paths use the same streaming algorithm in PyTorch so unit tests can
@@ -123,7 +123,7 @@ def estimate_tiled_solve_memory(
         peak_tile_A_bytes=_nbytes(Be, peak_tile, V, V, itemsize=dtype_bytes),
         summary_bytes=_nbytes(Be, num_tiles, V, V, itemsize=dtype_bytes)
         + _nbytes(Be, num_tiles, V, itemsize=dtype_bytes),
-        local_delta_bytes=_nbytes(Be, S, V, itemsize=dtype_bytes),
+        local_delta_bytes=0,
         carry_bytes=_nbytes(Be, num_tiles, V, itemsize=dtype_bytes),
     )
 
@@ -196,7 +196,6 @@ if TRITON_AVAILABLE:
         f_t,
         W_be,
         h0_row,
-        local_delta,
         summary_M,
         summary_b,
         S: tl.constexpr,
@@ -252,7 +251,6 @@ if TRITON_AVAILABLE:
             P = tl.dot(M, P)
             c = tl.sum(M * c[None, :], axis=1) + b
             c = tl.where(vmask, c, 0.0)
-            tl.store(local_delta + be * S * V + t * V + offs, c, mask=valid_t & vmask)
 
         base_m = (be * NUM_TILES + tile_id) * V * V
         base_b = (be * NUM_TILES + tile_id) * V
@@ -293,7 +291,8 @@ if TRITON_AVAILABLE:
         W_be,
         h0_row,
         carries,
-        delta,
+        h_next,
+        omega_sor: tl.constexpr,
         S: tl.constexpr,
         V: tl.constexpr,
         NUM_TILES: tl.constexpr,
@@ -343,7 +342,7 @@ if TRITON_AVAILABLE:
             M = tl.where(mmask, M, 0.0)
             d = tl.sum(M * d[None, :], axis=1) + b
             d = tl.where(vmask, d, 0.0)
-            tl.store(delta + be * S * V + t * V + offs, d, mask=valid_t & vmask)
+            tl.store(h_next + be * S * V + t * V + offs, h_cur + omega_sor * d, mask=valid_t & vmask)
 
 
 def _assemble_tile_torch(
@@ -384,10 +383,9 @@ def _local_tiles_torch(
     W_be: torch.Tensor,
     h0_row: torch.Tensor,
     tile_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     Be, S, V = h.shape
     num_tiles = (S + tile_size - 1) // tile_size
-    local_delta = torch.empty_like(h)
     summaries_M = torch.empty(Be, num_tiles, V, V, device=h.device, dtype=h.dtype)
     summaries_b = torch.empty(Be, num_tiles, V, device=h.device, dtype=h.dtype)
     eye = torch.eye(V, device=h.device, dtype=h.dtype).expand(Be, V, V)
@@ -401,10 +399,9 @@ def _local_tiles_torch(
         for j in range(end - start):
             P = torch.bmm(M[:, j], P)
             c = torch.bmm(M[:, j], c[:, :, None]).squeeze(-1) + b[:, j]
-            local_delta[:, start + j] = c
         summaries_M[:, tile_id] = P
         summaries_b[:, tile_id] = c
-    return local_delta, summaries_M, summaries_b
+    return summaries_M, summaries_b
 
 
 def _scan_summaries_torch(
@@ -448,17 +445,18 @@ def _apply_carries_torch(
     h0_row: torch.Tensor,
     carries: torch.Tensor,
     tile_size: int,
+    omega_sor: float,
 ) -> torch.Tensor:
     Be, S, _ = h.shape
-    delta = torch.empty_like(h)
+    h_next = torch.empty_like(h)
     for tile_id, start in enumerate(range(0, S, tile_size)):
         end = min(start + tile_size, S)
         M, b = _assemble_tile_torch(h, x_proj, f_t, W_be, h0_row, start, end)
         d = carries[:, tile_id]
         for j in range(end - start):
             d = torch.bmm(M[:, j], d[:, :, None]).squeeze(-1) + b[:, j]
-            delta[:, start + j] = d
-    return delta
+            h_next[:, start + j] = h[:, start + j] + omega_sor * d
+    return h_next
 
 
 def _tiled_newton_delta(
@@ -470,7 +468,8 @@ def _tiled_newton_delta(
     *,
     tile_size: int,
     prefer_triton: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, TiledSolveStats]:
+    omega_sor: float,
+) -> tuple[torch.Tensor, torch.Tensor, TiledSolveStats]:
     Be, S, V = h.shape
     if tile_size <= 0:
         raise ValueError("tile_size must be positive")
@@ -495,7 +494,6 @@ def _tiled_newton_delta(
     if use_triton:
         assert triton is not None
         block_v = max(16, triton.next_power_of_2(V))
-        local_delta = torch.empty_like(h)
         summaries_M = torch.empty(Be, num_tiles, V, V, device=h.device, dtype=h.dtype)
         summaries_b = torch.empty(Be, num_tiles, V, device=h.device, dtype=h.dtype)
         grid = (Be, num_tiles)
@@ -505,7 +503,6 @@ def _tiled_newton_delta(
             f_t,
             W_be,
             h0_row,
-            local_delta,
             summaries_M,
             summaries_b,
             S,
@@ -516,7 +513,7 @@ def _tiled_newton_delta(
             num_warps=1,
         )
         carries = _scan_summaries_triton(summaries_M, summaries_b, block_v)
-        delta = torch.empty_like(h)
+        h_next = torch.empty_like(h)
         _apply_carry_kernel[grid](
             h,
             x_proj,
@@ -524,7 +521,8 @@ def _tiled_newton_delta(
             W_be,
             h0_row,
             carries,
-            delta,
+            h_next,
+            omega_sor,
             S,
             V,
             num_tiles,
@@ -533,13 +531,11 @@ def _tiled_newton_delta(
             num_warps=1,
         )
     else:
-        local_delta, summaries_M, summaries_b = _local_tiles_torch(
-            h, x_proj, f_t, W_be, h0_row, tile_size
-        )
+        summaries_M, summaries_b = _local_tiles_torch(h, x_proj, f_t, W_be, h0_row, tile_size)
         carries = _scan_summaries_torch(summaries_M, summaries_b)
-        delta = _apply_carries_torch(h, x_proj, f_t, W_be, h0_row, carries, tile_size)
+        h_next = _apply_carries_torch(h, x_proj, f_t, W_be, h0_row, carries, tile_size, omega_sor)
 
-    return delta, local_delta, summaries_M, stats
+    return h_next, summaries_M, stats
 
 
 def m2rnn_pararnn_tiled_triton_forward(
@@ -587,7 +583,7 @@ def m2rnn_pararnn_tiled_triton_forward(
         dtype=qf.dtype,
     )
     for _ in range(config.max_its):
-        delta, _local_delta, _summaries_M, _stats = _tiled_newton_delta(
+        h, _summaries_M, _stats = _tiled_newton_delta(
             h,
             x_proj,
             f_t,
@@ -595,8 +591,8 @@ def m2rnn_pararnn_tiled_triton_forward(
             h0_row,
             tile_size=config.tile_size,
             prefer_triton=config.prefer_triton,
+            omega_sor=config.omega_sor,
         )
-        h = h + config.omega_sor * delta
 
     h_bshkv = h.view(B, H, K, S, V).permute(0, 3, 1, 2, 4)
     out = torch.einsum("bshk,bshkv->bshv", qf, h_bshkv)
