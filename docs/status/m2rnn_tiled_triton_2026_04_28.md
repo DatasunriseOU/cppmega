@@ -386,3 +386,165 @@ Results:
 - `tl.static_range(TILE)` still hurts compile for 64/128. The next safe step is
   a separate kernel variant using `tl.range(..., loop_unroll_factor=...)` for
   large tiles, with explicit correctness/perf gating.
+
+## Fourth Optimization Cycle After `0494da7`
+
+### Docs / MCP / Web / Local Search
+
+Local search covered the tiled Triton implementation, benchmark, tests, and this
+status doc (`m2rnn_pararnn_tiled_triton.py`,
+`scripts/bench_m2rnn_tiled_triton.py`, and
+`tests/test_m2rnn_pararnn_tiled_triton.py`).
+Brave MCP search was attempted for Triton loop/autotune docs, but the provider
+returned exhausted credits, so the external references below use direct web
+search/opened official Triton docs.
+
+External sources checked before changing code:
+
+- Triton `tl.range` API:
+  <https://triton-lang.org/main/python-api/generated/triton.language.range.html>
+  - relevant because `loop_unroll_factor`, `num_stages`, `flatten`, and LICM
+    controls are only available on `tl.range`.
+- Triton `tl.static_range` API:
+  <https://triton-lang.org/main/python-api/generated/triton.language.static_range.html>
+  - documents that it guides the compiler to aggressively unroll loops.
+- Triton `autotune` API:
+  <https://triton-lang.org/main/python-api/generated/triton.autotune.html>
+  - important caveat: autotune evaluates configs by running kernels multiple
+    times, which is awkward for update/apply kernels unless reset/restore hooks
+    are carefully used.
+- Triton `heuristics` API:
+  <https://triton-lang.org/main/python-api/generated/triton.heuristics.html>
+  - useful for meta-parameter selection when autotune is too expensive or not
+    applicable.
+- Triton fused softmax tutorial:
+  <https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html>
+  - used for the occupancy/num_warps tuning reminder and the same "avoid
+    unnecessary DRAM traffic" principle already applied in this path.
+
+### Baseline / Profiling
+
+Environment:
+
+- GPU: NVIDIA GB10, compute capability 12.1
+- PyTorch: `2.13.0.dev20260417+cu132`
+- Triton: `3.7.0`
+
+Full forward baseline commands:
+
+```bash
+python -u scripts/bench_m2rnn_tiled_triton.py --profile gb10-small --tiles 16,32 --iters 1 --warmup 5 --repeat 60 --dtype fp32
+python -u scripts/bench_m2rnn_tiled_triton.py --profile gb10-small --tiles 16,32 --iters 1 --warmup 5 --repeat 60 --dtype bf16
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 4096 --H 4 --K 16 --V 16 --tiles 16,32 --iters 1 --warmup 5 --repeat 40 --dtype fp32
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 4096 --H 4 --K 16 --V 16 --tiles 16,32 --iters 1 --warmup 5 --repeat 40 --dtype bf16
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 8192 --H 4 --K 16 --V 16 --tiles 16,32 --iters 1 --warmup 5 --repeat 25 --dtype fp32
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 8192 --H 4 --K 16 --V 16 --tiles 16,32 --iters 1 --warmup 5 --repeat 25 --dtype bf16
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 4096 --H 8 --K 32 --V 16 --tiles 16,32 --iters 1 --warmup 3 --repeat 20 --dtype fp32
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 4096 --H 8 --K 32 --V 16 --tiles 16,32 --iters 1 --warmup 3 --repeat 20 --dtype bf16
+```
+
+| shape | dtype | tile16 | tile32 |
+| --- | --- | ---: | ---: |
+| `B=1,S=512,H=4,K=16,V=16` | fp32 | 0.105 ms | 0.105 ms |
+| `B=1,S=512,H=4,K=16,V=16` | bf16 | 0.117 ms | 0.117 ms |
+| `B=1,S=4096,H=4,K=16,V=16` | fp32 | 1.205 ms | 1.132 ms |
+| `B=1,S=4096,H=4,K=16,V=16` | bf16 | 1.257 ms | 1.177 ms |
+| `B=1,S=8192,H=4,K=16,V=16` | fp32 | 6.004 ms | 5.473 ms |
+| `B=1,S=8192,H=4,K=16,V=16` | bf16 | 6.035 ms | 5.771 ms |
+| `B=1,S=4096,H=8,K=32,V=16` | fp32 | 5.048 ms | 4.913 ms |
+| `B=1,S=4096,H=8,K=32,V=16` | bf16 | 5.113 ms | 4.946 ms |
+
+Interpretation: tile32 remains the robust default among tile16/32. Tile64 can
+win slightly after compilation on `S=512/4096`, but it is not robust enough to
+make the default: `S=8192,tile64` spent more than a minute without returning a
+timing and was killed.
+
+### Hierarchical Scan Check
+
+Added a benchmark-script stage profiler so the local/scan/apply split can be
+reproduced without ad-hoc snippets:
+
+```bash
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 4096 --H 4 --K 16 --V 16 --tiles 32 --iters 1 --warmup 10 --repeat 80 --dtype fp32 --stage-profile
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 8192 --H 4 --K 16 --V 16 --tiles 32 --iters 1 --warmup 10 --repeat 50 --dtype fp32 --stage-profile
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 4096 --H 8 --K 32 --V 16 --tiles 32 --iters 1 --warmup 8 --repeat 40 --dtype fp32 --stage-profile
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 8192 --H 8 --K 32 --V 16 --tiles 32 --iters 1 --warmup 5 --repeat 25 --dtype fp32 --stage-profile
+```
+
+| shape | local | scan | apply | stage sum | scan share |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `S=4096,H=4,K=16,Be=64` | 0.376894 ms | 0.034900 ms | 0.346736 ms | 0.758530 ms | 4.60% |
+| `S=8192,H=4,K=16,Be=64` | 0.759608 ms | 0.064470 ms | 0.690934 ms | 1.515012 ms | 4.26% |
+| `S=4096,H=8,K=32,Be=256` | 1.241892 ms | 0.168243 ms | 1.206270 ms | 2.616406 ms | 6.43% |
+| `S=8192,H=8,K=32,Be=256` | 5.431620 ms | 0.698976 ms | 5.222426 ms | 11.353021 ms | 6.16% |
+
+Conclusion: sequential per-chain summary scan is not the primary bottleneck on
+GB10 for these shapes. A perfect hierarchical scan would only recover the scan
+share above, while local tile assembly and apply replay dominate. No complex
+hierarchical scan patch was made in this cycle.
+
+### Tuning Attempts Not Shipped
+
+- Replacing local/apply `tl.static_range(0, TILE)` with
+  `tl.range(0, TILE, loop_unroll_factor=1)` reduced unroll/compile pressure but
+  made `S=512,H=4,K=16,V=16` tile32 fp32 slower: `0.105 ms -> 0.241 ms`.
+- `loop_unroll_factor=4` also lost: tile32 fp32 `0.146 ms`.
+- `loop_unroll_factor=8` was mixed: tile16 fp32 `0.117 ms`, but tile32 fp32
+  `0.250 ms`.
+- Summary scan `num_warps=2` was not robust. Same-process A/B showed small wins
+  on some rows but a loss on `S=4096,H=8,K=32`, so the kernel remains
+  `num_warps=1`.
+
+### Shipped Patch
+
+Changed `scripts/bench_m2rnn_tiled_triton.py` only:
+
+- Added `--stage-profile`.
+- It reports per-tile `local_ms`, `scan_ms`, `apply_ms`, summed kernel-stage
+  time, and scan percentage.
+- This is intentionally a measurement patch, not a production-kernel change:
+  profiling showed hierarchical scan is not high-return enough yet, and the
+  tested runtime/compile tweaks were not robust.
+
+### After / Validation
+
+After full-forward commands:
+
+```bash
+python -u scripts/bench_m2rnn_tiled_triton.py --profile gb10-small --tiles 16,32 --iters 1 --warmup 5 --repeat 60 --dtype fp32
+python -u scripts/bench_m2rnn_tiled_triton.py --profile gb10-small --tiles 16,32 --iters 1 --warmup 5 --repeat 60 --dtype bf16
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 4096 --H 4 --K 16 --V 16 --tiles 16,32 --iters 1 --warmup 5 --repeat 40 --dtype fp32
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 4096 --H 4 --K 16 --V 16 --tiles 16,32 --iters 1 --warmup 5 --repeat 40 --dtype bf16
+```
+
+| shape | dtype | tile16 | tile32 |
+| --- | --- | ---: | ---: |
+| `B=1,S=512,H=4,K=16,V=16` | fp32 | 0.103 ms | 0.104 ms |
+| `B=1,S=512,H=4,K=16,V=16` | bf16 | 0.117 ms | 0.117 ms |
+| `B=1,S=4096,H=4,K=16,V=16` | fp32 | 1.251 ms | 1.154 ms |
+| `B=1,S=4096,H=4,K=16,V=16` | bf16 | 1.258 ms | 1.152 ms |
+
+Correctness / tests:
+
+```bash
+python -m py_compile cppmega/megatron/m2rnn_pararnn_tiled_triton.py scripts/bench_m2rnn_tiled_triton.py tools/probes/m2rnn_pararnn_tiled_triton_probe.py
+pytest -q tests/test_m2rnn_pararnn_tiled_triton.py
+python tools/probes/m2rnn_pararnn_tiled_triton_probe.py --device cuda --dtype fp32 --B 1 --S 32 --H 1 --K 2 --V 4 --tile 8 --iters 1
+python tools/probes/m2rnn_pararnn_tiled_triton_probe.py --device cuda --dtype bf16 --B 1 --S 32 --H 1 --K 2 --V 4 --tile 8 --iters 2
+```
+
+Results:
+
+- `py_compile`: passed.
+- `tests/test_m2rnn_pararnn_tiled_triton.py`: 6 passed.
+- CUDA fp32 probe: `max_out=2.801418e-06`, `max_h=5.736947e-07`.
+- CUDA bf16 probe: `max_out=1.907349e-06`, `max_h=0.000000e+00`.
+
+### Current Blockers
+
+- Hierarchical scan is measurable but not dominant on GB10; local/apply replay
+  remains the larger target.
+- `tl.range` unroll controls are not a drop-in replacement for local/apply
+  `static_range` on tile32; runtime losses were too large.
+- Tile64 runtime can be good after compilation, but first-use/progress behavior
+  at `S=8192` is bad enough that tile32 remains the safer default.
