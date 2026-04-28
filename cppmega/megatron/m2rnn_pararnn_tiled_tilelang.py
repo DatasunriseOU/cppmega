@@ -446,6 +446,7 @@ def _tilelang_summary_kernel(tile_len: int):
             SummaryB: T.Tensor([be, n_tiles, V], T.float32),
         ):
             with T.Kernel(be, n_tiles, threads=128) as (be_i, tile_i):
+                W_shared = T.alloc_shared([V, V], T.float32)
                 P = T.alloc_fragment([V, V], T.float32)
                 P_next = T.alloc_fragment([V, V], T.float32)
                 b = T.alloc_fragment([V], T.float32)
@@ -454,7 +455,8 @@ def _tilelang_summary_kernel(tile_len: int):
                 z = T.alloc_fragment([V], T.float32)
                 h_new = T.alloc_fragment([V], T.float32)
                 rhs = T.alloc_fragment([V], T.float32)
-                J = T.alloc_fragment([V, V], T.float32)
+
+                T.copy(W[be_i, 0:V, 0:V], W_shared)
 
                 for i in T.serial(V):
                     for j in T.serial(V):
@@ -475,7 +477,7 @@ def _tilelang_summary_kernel(tile_len: int):
                         for vi in T.serial(V):
                             z[vi] = X[be_i, s_i, vi]
                             for vj in T.serial(V):
-                                z[vi] += h_prev[vj] * W[be_i, vj, vi]
+                                z[vi] += h_prev[vj] * W_shared[vj, vi]
                             h_new[vi] = T.tanh(z[vi])
                             rhs[vi] = -(
                                 H[be_i, s_i, vi]
@@ -485,22 +487,18 @@ def _tilelang_summary_kernel(tile_len: int):
 
                         for vi in T.serial(V):
                             for vj in T.serial(V):
-                                diag = T.if_then_else(vi == vj, 1.0, 0.0)
                                 sech2 = 1.0 - h_new[vi] * h_new[vi]
-                                J[vi, vj] = (
-                                    -f_i * diag - (1.0 - f_i) * sech2 * W[be_i, vj, vi]
-                                )
-
-                        for vi in T.serial(V):
-                            for vj in T.serial(V):
-                                P_next[vi, vj] = 0.0
+                                P_next[vi, vj] = f_i * P[vi, vj]
                                 for vk in T.serial(V):
-                                    P_next[vi, vj] += -J[vi, vk] * P[vk, vj]
+                                    P_next[vi, vj] += (
+                                        (1.0 - f_i) * sech2 * W_shared[vk, vi] * P[vk, vj]
+                                    )
 
                         for vi in T.serial(V):
-                            b_next[vi] = rhs[vi]
+                            sech2 = 1.0 - h_new[vi] * h_new[vi]
+                            b_next[vi] = rhs[vi] + f_i * b[vi]
                             for vk in T.serial(V):
-                                b_next[vi] -= J[vi, vk] * b[vk]
+                                b_next[vi] += (1.0 - f_i) * sech2 * W_shared[vk, vi] * b[vk]
 
                         for vi in T.serial(V):
                             for vj in T.serial(V):
@@ -568,13 +566,15 @@ def _tilelang_apply_kernel(tile_len: int):
             Delta: T.Tensor([be, seq, V], T.float32),
         ):
             with T.Kernel(be, n_tiles, threads=128) as (be_i, tile_i):
+                W_shared = T.alloc_shared([V, V], T.float32)
                 h_prev = T.alloc_fragment([V], T.float32)
                 z = T.alloc_fragment([V], T.float32)
                 h_new = T.alloc_fragment([V], T.float32)
                 rhs = T.alloc_fragment([V], T.float32)
-                J = T.alloc_fragment([V, V], T.float32)
                 delta_prev = T.alloc_fragment([V], T.float32)
                 delta_cur = T.alloc_fragment([V], T.float32)
+
+                T.copy(W[be_i, 0:V, 0:V], W_shared)
 
                 for vi in T.serial(V):
                     delta_prev[vi] = Carries[be_i, tile_i, vi]
@@ -592,7 +592,7 @@ def _tilelang_apply_kernel(tile_len: int):
                         for vi in T.serial(V):
                             z[vi] = X[be_i, s_i, vi]
                             for vj in T.serial(V):
-                                z[vi] += h_prev[vj] * W[be_i, vj, vi]
+                                z[vi] += h_prev[vj] * W_shared[vj, vi]
                             h_new[vi] = T.tanh(z[vi])
                             rhs[vi] = -(
                                 H[be_i, s_i, vi]
@@ -601,17 +601,12 @@ def _tilelang_apply_kernel(tile_len: int):
                             )
 
                         for vi in T.serial(V):
+                            sech2 = 1.0 - h_new[vi] * h_new[vi]
+                            delta_cur[vi] = rhs[vi] + f_i * delta_prev[vi]
                             for vj in T.serial(V):
-                                diag = T.if_then_else(vi == vj, 1.0, 0.0)
-                                sech2 = 1.0 - h_new[vi] * h_new[vi]
-                                J[vi, vj] = (
-                                    -f_i * diag - (1.0 - f_i) * sech2 * W[be_i, vj, vi]
+                                delta_cur[vi] += (
+                                    (1.0 - f_i) * sech2 * W_shared[vj, vi] * delta_prev[vj]
                                 )
-
-                        for vi in T.serial(V):
-                            delta_cur[vi] = rhs[vi]
-                            for vj in T.serial(V):
-                                delta_cur[vi] -= J[vi, vj] * delta_prev[vj]
 
                         for vi in T.serial(V):
                             Delta[be_i, s_i, vi] = delta_cur[vi]

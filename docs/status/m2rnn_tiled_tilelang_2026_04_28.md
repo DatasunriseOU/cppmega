@@ -291,3 +291,153 @@ Observed:
 - The path is still slower than full PyTorch ParaRNN on the small probe because
   summary dominates; the next useful optimization is reducing or parallelizing
   the serial V=16 summary fragment work.
+
+## Third Optimization Cycle - Summary Kernel Structure
+
+### TileLang Docs, Examples, and Issues Read
+
+- Official docs:
+  <https://www.tilelang.com/get_started/overview.html>,
+  <https://tilelang.com/autoapi/tilelang/language/loop/index.html>,
+  <https://www.tilelang.com/programming_guides/instructions.html>,
+  <https://www.tilelang.com/autoapi/tilelang/layout/fragment/index.html>,
+  <https://tilelang.com/tutorials/debug_tools_for_tilelang.html>.
+- GitHub/release references:
+  <https://github.com/tile-ai/tilelang/releases> (noted `T.cumsum`,
+  flexible parallel/local-buffer-in-`T.Parallel`, and layout inference changes),
+  <https://github.com/tile-ai/tilelang/releases/tag/v0.1.9>,
+  <https://github.com/tile-ai/tilelang/pull/1426>,
+  <https://github.com/tile-ai/tilelang/blob/main/examples/deepseek_mla/README.md>.
+- Local docs/examples/source:
+  `/home/dave/tilelang-build/docs/get_started/overview.md`,
+  `/home/dave/tilelang-build/docs/programming_guides/language_basics.md`,
+  `/home/dave/tilelang-build/docs/programming_guides/instructions.md`,
+  `/home/dave/tilelang-build/docs/deeplearning_operators/gemv.md`,
+  `/home/dave/tilelang-build/examples/gdn/example_cumsum.py`,
+  `/home/dave/tilelang-build/examples/gdn/example_wy_fast.py`,
+  `/home/dave/tilelang-build/tilelang/language/loop.py`,
+  `/home/dave/tilelang-build/tilelang/language/reduce_op.py`,
+  `/home/dave/tilelang-build/tilelang/layout/fragment.py`,
+  `/home/dave/tilelang-build/tilelang/language/copy_op.py`.
+- Takeaways:
+  1. `T.Parallel(..., loop_layout=T.Fragment(...))` can explicitly annotate
+     fragment layout, but nested parallel layout must be attached only to the
+     outermost loop and must match input dimensionality. This matches the
+     earlier mixed serial/parallel layout-inference blocker, so this cycle did
+     not reintroduce parallel fragment writes in the recurrence.
+  2. `T.cumsum` is useful for local additive prefix scans, but the tile summary
+     is an affine matrix recurrence, so it does not directly replace the custom
+     `P,b` recurrence.
+  3. `T.copy(..., loop_layout=...)` and shared staging are documented/local
+     patterns for reducing global-memory pressure without adding fragment
+     layout constraints to the recurrence math.
+
+### Profiling Before Patch
+
+Baseline command:
+
+```text
+PYTHONPATH=. python tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py --backend tilelang --no-fallback --sweep-tile-lens --B 1 --S 65 --H 2 --K 4 --V 16 --max-its 3 --benchmark --warmup 10 --repeats 30 --dtype float32
+```
+
+Before patch:
+
+```text
+tile_len=16 tiled_ms=4.020 full_pararnn_ms=1.714
+tile_len=32 tiled_ms=2.318 full_pararnn_ms=1.714
+tile_len=64 tiled_ms=3.973 full_pararnn_ms=1.709
+max error vs full ParaRNN: out=1.564622e-07, h=1.192093e-07
+```
+
+Manual stage timing before patch:
+
+```text
+tile_len=16 n_tiles=5 summary_gpu_ms=1.3024 scan_triton_gpu_ms=0.0061 apply_gpu_ms=0.0280
+tile_len=32 n_tiles=3 summary_gpu_ms=0.7160 scan_triton_gpu_ms=0.0061 apply_gpu_ms=0.0550
+tile_len=64 n_tiles=2 summary_gpu_ms=1.2144 scan_triton_gpu_ms=0.0061 apply_gpu_ms=0.1090
+```
+
+### Patch
+
+- Rewrote TileLang summary/apply math to use the structure of
+  `-J = fI + (1-f)diag(sech2)W^T` directly, avoiding the local `J[V,V]`
+  fragment and its serial construction.
+- Staged each CTA's `W_be[be,:,:]` into shared memory once with `T.copy`, then
+  reused it for `z`, summary `P/b`, and apply `delta` dot products.
+- Added `--stage-breakdown`, `--stage-warmup`, and `--stage-repeats` to
+  `tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py` for reproducible kernel
+  stage timing.
+- Tried precomputing `(1-f)*sech2` into an `alpha[V]` fragment; it compiled but
+  worsened register/layout pressure (`tile32` summary around 1.54 ms), so that
+  sub-attempt was not kept.
+
+### Results After Patch
+
+Stage breakdown command:
+
+```text
+PYTHONPATH=. python tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py --backend tilelang --no-fallback --tile-len 32 --B 1 --S 65 --H 2 --K 4 --V 16 --max-its 3 --dtype float32 --stage-breakdown --stage-warmup 10 --stage-repeats 50
+```
+
+Observed:
+
+```text
+stage_breakdown tile_len=32 n_tiles=3 summary_gpu_ms=0.6441 scan_triton_gpu_ms=0.0062 apply_gpu_ms=0.0404
+out_max_diff_vs_full_pararnn=1.490116e-07
+h_max_diff_vs_full_pararnn=1.192093e-07
+```
+
+Manual single-kernel timing after patch was slightly lower when run standalone:
+
+```text
+tile_len=32 n_tiles=3 summary_gpu_ms=0.6043 scan_triton_gpu_ms=0.0061 apply_gpu_ms=0.0344
+```
+
+End-to-end benchmark after patch:
+
+```text
+PYTHONPATH=. python tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py --backend tilelang --no-fallback --sweep-tile-lens --B 1 --S 65 --H 2 --K 4 --V 16 --max-its 3 --benchmark --warmup 10 --repeats 30 --dtype float32
+
+tile_len=16 tiled_ms=3.627 full_pararnn_ms=1.687
+tile_len=32 tiled_ms=2.046 full_pararnn_ms=1.688
+tile_len=64 tiled_ms=3.566 full_pararnn_ms=1.688
+max error vs full ParaRNN: out=1.490116e-07, h=1.192093e-07
+```
+
+bf16 caller probe still uses fp32 solve buffers:
+
+```text
+PYTHONPATH=. python tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py --backend tilelang --no-fallback --tile-len 32 --B 1 --S 33 --H 1 --K 2 --V 16 --max-its 2 --dtype bfloat16
+
+backend_used=tilelang-summary+triton-scan+tilelang-apply
+out_max_diff_vs_full_pararnn=0.000000e+00
+h_max_diff_vs_full_pararnn=0.000000e+00
+torch_materialized_tile_jac_elements=0
+```
+
+### Validation
+
+Passed:
+
+```text
+PYTHONPATH=. python -m py_compile cppmega/megatron/m2rnn_pararnn_tiled_tilelang.py tools/probes/m2rnn_pararnn_tiled_tilelang_probe.py
+PYTHONPATH=. python -m pytest tests/test_m2rnn_pararnn_tiled_tilelang.py -q
+PYTHONPATH=. python -m pytest tests/test_m2rnn_pararnn.py tests/test_m2rnn_pararnn_tiled_tilelang.py -q
+```
+
+Observed:
+
+```text
+9 passed
+22 passed
+```
+
+### Remaining Blockers
+
+- The summary kernel is still serial over the V=16 recurrence inside each CTA.
+  Explicit `T.Parallel` fragment writes remain risky without a carefully
+  constructed matching `loop_layout=T.Fragment(...)`; the prior mixed
+  parallel/serial attempt failed layout inference.
+- `T.cumsum` does not directly apply to the affine matrix summary recurrence.
+- The path is closer but still slower than full PyTorch ParaRNN for the tiny
+  `S=65` probe; summary remains the dominant stage.

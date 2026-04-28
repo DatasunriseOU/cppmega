@@ -16,6 +16,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from cppmega.megatron.m2rnn_pararnn import PararnnConfig, m2rnn_pararnn_forward
+from cppmega.megatron import m2rnn_pararnn_tiled_tilelang as tiled_impl
 from cppmega.megatron.m2rnn_pararnn_tiled_tilelang import (
     TiledTileLangConfig,
     m2rnn_pararnn_tiled_tilelang_forward,
@@ -51,6 +52,111 @@ def _time_forward(fn, *, device: str, warmup: int, repeats: int) -> float:
     return (time.perf_counter() - t0) * 1000.0 / repeats
 
 
+def _time_cuda_kernel(fn, *, warmup: int, repeats: int) -> float:
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(repeats):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / repeats
+
+
+def _print_stage_breakdown(args, q, k, v, W, xf, *, tile_len: int, device: str) -> None:
+    if device != "cuda":
+        print("stage_breakdown_unavailable=requires_cuda")
+        return
+
+    (
+        _qf,
+        x_proj,
+        f_t,
+        W_be,
+        h0_row,
+        _q_broadcast,
+        _B,
+        S,
+        _H,
+        _k_dim,
+    ) = tiled_impl._prepare_flat_problem(q, k, v, W, xf, None)
+    h = tiled_impl._initial_guess(
+        x_proj,
+        f_t,
+        W_be,
+        h0_row,
+        init_strategy="zero",
+    )
+    be, _seq, v_dim = x_proj.shape
+    n_tiles = math.ceil(S / tile_len)
+    summary_A = torch.empty(be, n_tiles, v_dim, v_dim, device=device, dtype=x_proj.dtype)
+    summary_b = torch.empty(be, n_tiles, v_dim, device=device, dtype=x_proj.dtype)
+    carries = torch.empty(be, n_tiles, v_dim, device=device, dtype=x_proj.dtype)
+    delta = torch.empty_like(h)
+
+    ok, log = tiled_impl._try_tilelang_summary(
+        h,
+        x_proj,
+        f_t,
+        W_be,
+        h0_row,
+        summary_A,
+        summary_b,
+        tile_len,
+    )
+    if not ok:
+        print("stage_breakdown_unavailable=tilelang_summary_failed")
+        print(log.rstrip())
+        return
+    tiled_impl._try_triton_scan(summary_A, summary_b, carries)
+    tiled_impl._try_tilelang_apply(h, x_proj, f_t, W_be, h0_row, carries, delta, tile_len)
+    torch.cuda.synchronize()
+
+    summary_ms = _time_cuda_kernel(
+        lambda: tiled_impl._try_tilelang_summary(
+            h,
+            x_proj,
+            f_t,
+            W_be,
+            h0_row,
+            summary_A,
+            summary_b,
+            tile_len,
+        ),
+        warmup=args.stage_warmup,
+        repeats=args.stage_repeats,
+    )
+    scan_ms = _time_cuda_kernel(
+        lambda: tiled_impl._try_triton_scan(summary_A, summary_b, carries),
+        warmup=args.stage_warmup,
+        repeats=args.stage_repeats,
+    )
+    apply_ms = _time_cuda_kernel(
+        lambda: tiled_impl._try_tilelang_apply(
+            h,
+            x_proj,
+            f_t,
+            W_be,
+            h0_row,
+            carries,
+            delta,
+            tile_len,
+        ),
+        warmup=args.stage_warmup,
+        repeats=args.stage_repeats,
+    )
+    print(
+        "stage_breakdown "
+        f"tile_len={tile_len} n_tiles={n_tiles} "
+        f"summary_gpu_ms={summary_ms:.4f} "
+        f"scan_triton_gpu_ms={scan_ms:.4f} "
+        f"apply_gpu_ms={apply_ms:.4f}"
+    )
+
+
 def _run_case(args, *, tile_len: int, dtype: torch.dtype, device: str) -> None:
     q, k, v, W, xf = _make_inputs(
         args.B,
@@ -62,6 +168,9 @@ def _run_case(args, *, tile_len: int, dtype: torch.dtype, device: str) -> None:
         dtype=dtype,
         seed=args.seed,
     )
+    if args.stage_breakdown:
+        _print_stage_breakdown(args, q, k, v, W, xf, tile_len=tile_len, device=device)
+
     config = TiledTileLangConfig(
         max_its=args.max_its,
         tile_len=tile_len,
@@ -155,6 +264,9 @@ def main() -> int:
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=10)
+    parser.add_argument("--stage-breakdown", action="store_true")
+    parser.add_argument("--stage-warmup", type=int, default=10)
+    parser.add_argument("--stage-repeats", type=int, default=50)
     parser.add_argument("--no-fallback", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
