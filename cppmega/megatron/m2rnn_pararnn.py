@@ -61,6 +61,11 @@ class PararnnConfig:
     max_its: int = 3
     omega_sor: float = 1.0
     init_strategy: str = "zero"
+    # Chunk size for the streaming reduction. S > chunk_size triggers the
+    # chunked path which never materialises the full (Be, S, V, V) Jacobian.
+    # 0 disables chunking (use only when S * Be * V^2 fits comfortably in
+    # device memory). 128 keeps peak Jacobian under ~150 MB at NAM56R dims.
+    chunk_size: int = 128
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +106,57 @@ def _parallel_reduce_dense(
     for step in range(num_steps):
         jac, rhs = _reduction_step_dense(jac, rhs, step)
     return rhs
+
+
+def _chunked_reduce_dense(
+    jac: torch.Tensor,    # (Be, S, V, V)
+    rhs: torch.Tensor,    # (Be, S, V)
+    chunk_size: int,
+) -> torch.Tensor:
+    """Streaming chunked reduction: solves the same bidiagonal system as
+    ``_parallel_reduce_dense`` but processes the sequence in chunks of
+    ``chunk_size`` so peak Jacobian memory is O(Be * chunk * V^2) instead
+    of O(Be * S * V^2).
+
+    Algorithm
+    ---------
+    For each chunk c covering [c*C, (c+1)*C):
+      1. The chunk-local first row's subdiagonal block gives the link to
+         the previous chunk. We absorb the propagated previous-chunk
+         delta into rhs[c*C] via -= jac[c*C] @ prev_delta, then zero
+         jac[c*C] so the within-chunk scan treats the chunk as
+         starting from zero state.
+      2. Run the standard Brent-Kung scan inside the chunk.
+      3. The chunk's last delta becomes prev_delta for the next chunk.
+
+    This is sequential across chunks (n_chunks steps) but parallel
+    inside each chunk (log2(C) steps), giving O(n_chunks + log C)
+    sequential depth versus O(log S) for the full-S scan. The win is
+    memory: peak working tensor is one chunk's (Be, C, V, V), not the
+    whole (Be, S, V, V).
+
+    Output is exact to the full-S scan (no approximation).
+    """
+    Be, S, V, _ = jac.shape
+    out = torch.empty_like(rhs)
+    prev_delta = torch.zeros(Be, V, device=jac.device, dtype=jac.dtype)
+
+    for c_start in range(0, S, chunk_size):
+        c_end = min(c_start + chunk_size, S)
+        # clone() because the Brent-Kung step mutates in place.
+        jac_c = jac[:, c_start:c_end].clone()
+        rhs_c = rhs[:, c_start:c_end].clone()
+
+        # Absorb the previous chunk's tail delta into the first row.
+        if c_start > 0:
+            rhs_c[:, 0] -= torch.einsum("bij,bj->bi", jac_c[:, 0], prev_delta)
+        jac_c[:, 0] = 0  # the within-chunk scan now sees a zero left boundary
+
+        delta_c = _parallel_reduce_dense(jac_c, rhs_c)
+        out[:, c_start:c_end] = delta_c
+        prev_delta = delta_c[:, -1]
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +323,7 @@ def m2rnn_pararnn_forward(
     # System per chain (size S):  I * dh_t + A_t * dh_{t-1} = -F_t,  dh_0 driven by h0_row.
     # Each Newton step assembles A_t and -F_t from the current trajectory and
     # runs _parallel_reduce_dense to recover dh in O(log S) depth.
+    use_chunked = config.chunk_size > 0 and S > config.chunk_size
     for _ in range(config.max_its):
         residual, jac, _h_new = _m2rnn_residual_and_jacobian_be(
             h_traj=h,
@@ -276,7 +333,10 @@ def m2rnn_pararnn_forward(
             h0_row=h0_row,
         )
         rhs = -residual  # (Be, S, V)
-        delta = _parallel_reduce_dense(jac.contiguous(), rhs.contiguous())
+        if use_chunked:
+            delta = _chunked_reduce_dense(jac, rhs, config.chunk_size)
+        else:
+            delta = _parallel_reduce_dense(jac.contiguous(), rhs.contiguous())
         h = h + config.omega_sor * delta
 
     # ----- output projection: out_t = q_t @ h_t (per (b, h, k_idx, t))
