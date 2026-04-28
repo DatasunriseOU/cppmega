@@ -80,7 +80,15 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert "CPPMEGA_I_UNDERSTAND_MTP_LIGER_CE_IS_DEPRECATED" not in env
     assert env["CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE"] == "alltoall"
     assert env["CPPMEGA_USE_FLASH_ATTN"] == "1"
-    assert env["CPPMEGA_ATTN_BACKEND"] == "auto"
+    assert env["CPPMEGA_ATTN_BACKEND"] == "flash"
+    assert env["CPPMEGA_EXTRA_PYTHONPATH"].split(":")[:2] == [
+        "/home/dave/flash-attention-fa4",
+        "/home/dave/TransformerEngine",
+    ]
+    assert env["CPPMEGA_FLASH_ATTN_SOURCE_ROOT"] == "/home/dave/flash-attention-fa4"
+    assert env["CPPMEGA_TRANSFORMER_ENGINE_SOURCE_ROOT"] == "/home/dave/TransformerEngine"
+    assert env["CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE"] == "256"
+    assert env["CPPMEGA_CCE_FUSE_MAIN_MTP_CE"] == "0"
     assert env["CPPMEGA_DSA_FP8_ATTENTION"] == "0"
     assert "--moe-token-dispatcher-type alltoall" in env["NATIVE_ARGS"]
     assert env["CPPMEGA_OPTIMIZER"] == "muon"
@@ -90,6 +98,8 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert env["CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE"] == "int8"
     assert env["CPPMEGA_TE_MXFP8_BWD_BACKEND"] == "flashinfer_cutlass"
     assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
+    assert env["CPPMEGA_FLASHINFER_MXFP8_RUNNER"] == "mm_mxfp8"
+    assert env["CPPMEGA_FLASHINFER_MXFP8_TACTIC"] == "0"
     assert env["HYBRID_LAYER_PATTERN"].endswith("/*-/*-")
     assert "--mtp-num-layers 2" in env["NATIVE_ARGS"]
 
@@ -163,6 +173,13 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
             "5",
             "--nsys-trace",
             "cuda,nvtx,osrt",
+            "--noconv-mamba-chunk-size",
+            "128",
+            "--cce-fuse-main-mtp-ce",
+            "--mxfp8-flashinfer-runner",
+            "direct_tactic",
+            "--mxfp8-flashinfer-tactic",
+            "2",
         ],
     )
 
@@ -185,6 +202,10 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
     assert "export CPPMEGA_NSYS_TRACE=cuda,nvtx,osrt" in out
     assert "export CPPMEGA_NSYS_DELAY=15" in out
     assert "export CPPMEGA_NSYS_DURATION=5" in out
+    assert "export CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE=128" in out
+    assert "export CPPMEGA_CCE_FUSE_MAIN_MTP_CE=1" in out
+    assert "export CPPMEGA_FLASHINFER_MXFP8_RUNNER=direct_tactic" in out
+    assert "export CPPMEGA_FLASHINFER_MXFP8_TACTIC=2" in out
     assert "--mtp-num-layers 1" in out
 
 
@@ -198,6 +219,23 @@ def test_nsys_profile_defaults_to_full_capture_not_cuda_profiler_api():
     assert env["CPPMEGA_NSYS_TRACE"] == "cuda-sw,nvtx,osrt"
 
 
+def test_nsys_delay_can_capture_until_normal_process_exit():
+    profile = get_run_profile("local_gb10_quarter")
+    profile.profiling.nsys_profile = True
+    profile.profiling.nsys_capture_mode = "delay"
+    profile.profiling.nsys_delay = 115
+    profile.profiling.nsys_duration = 0
+
+    env = profile_shell_assignments(profile)
+    script = Path("scripts/local_gb10_quarter_train.sh").read_text()
+
+    assert env["CPPMEGA_NSYS_CAPTURE_MODE"] == "delay"
+    assert env["CPPMEGA_NSYS_DELAY"] == "115"
+    assert env["CPPMEGA_NSYS_DURATION"] == "0"
+    assert 'cmd+=("--delay=${CPPMEGA_NSYS_DELAY}")' in script
+    assert 'if [[ "${CPPMEGA_NSYS_DURATION}" -gt 0 ]]' in script
+
+
 def test_local_launcher_lets_native_args_own_moe_dispatcher_flag():
     script = Path("scripts/local_gb10_quarter_train.sh").read_text()
 
@@ -208,6 +246,15 @@ def test_local_launcher_lets_native_args_own_moe_dispatcher_flag():
     assert '--moe-token-dispatcher-type "${CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE}"' not in script
     assert "apply_moe_dispatcher_identity_sort_patch()" in script
     assert "CPPMEGA_MUON_NUM_NS_STEPS:-3" in script
+    assert "CPPMEGA_EXTRA_PYTHONPATH" in script
+    assert "flash_attn import:" in script
+
+
+def test_fp8_shim_bridges_noconv_mamba_chunk_config():
+    shim = Path("scripts/cppmega_fp8_shim.py").read_text()
+
+    assert "CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE" in shim
+    assert "cppmega_noconv_mamba_chunk_size" in shim
 
 
 def test_remote_gb10_launcher_preserves_muon_ns_override():
@@ -215,12 +262,16 @@ def test_remote_gb10_launcher_preserves_muon_ns_override():
 
     assert "CPPMEGA_MUON_NUM_NS_STEPS:-3" in script
     assert '--muon-num-ns-steps "${CPPMEGA_MUON_NUM_NS_STEPS}"' in script
+    assert "CPPMEGA_ATTN_BACKEND='${CPPMEGA_ATTN_BACKEND:-auto}'" in script
+    assert '--attention-backend "${CPPMEGA_ATTN_BACKEND}"' in script
+    assert "--attention-backend flash" not in script
 
 
 def test_local_gb10_quarter_mxfp8_defaults_to_flashinfer_cutlass():
     """The local_gb10_quarter profile defaults to TE payload + FlashInfer/CUTLASS."""
     profile = get_run_profile("local_gb10_quarter")
     assert profile.precision.mxfp8_bwd_backend == "flashinfer_cutlass"
+    assert profile.precision.mxfp8_flashinfer_runner == "mm_mxfp8"
 
 
 def test_mxfp8_transpose_emit_defaults_to_te_for_tn_adapter():
@@ -237,6 +288,14 @@ def test_tensorwise_fp8_keeps_hybrid_format():
     env = profile_shell_assignments(profile)
 
     assert env["CPPMEGA_FP8_FORMAT"] == "hybrid"
+
+
+def test_noconv_mamba_chunk_size_rejects_non_power_of_two():
+    profile = get_run_profile("local_gb10_quarter")
+    profile.runtime.noconv_mamba_chunk_size = 192
+
+    with pytest.raises(ValueError, match="positive power of two"):
+        profile_shell_assignments(profile)
 
 
 def test_mxfp8_rejects_hybrid_fp8_format(capsys, monkeypatch):

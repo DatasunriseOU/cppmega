@@ -21,6 +21,8 @@ FLASHINFER_FPROP_STAT_KEYS = ("mxfp8_flashinfer_fprop",)
 PASSTHROUGH_STAT_KEYS = ("native_passthrough_dgrad", "native_passthrough_wgrad")
 MATERIALIZATION_STAT_KEYS = (
     "mxfp8_tn_adapter_te_emit",
+    "mxfp8_tn_adapter_te_emit_deferred",
+    "mxfp8_tn_adapter_saved_transpose_operand",
     "mxfp8_tn_adapter_te_emit_swizzled",
     "mxfp8_tn_adapter_te_emit_swizzled_unavailable",
     "mxfp8_tn_adapter_copy_transpose",

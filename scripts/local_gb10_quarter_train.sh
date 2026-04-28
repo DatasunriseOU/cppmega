@@ -78,7 +78,7 @@ if [[ "${CPPMEGA_USE_FLASH_ATTN}" != "0" && "${CPPMEGA_USE_FLASH_ATTN}" != "1" ]
   echo "FATAL: CPPMEGA_USE_FLASH_ATTN must be 0 or 1" >&2
   exit 2
 fi
-export CPPMEGA_ATTN_BACKEND="${CPPMEGA_ATTN_BACKEND:-auto}"
+export CPPMEGA_ATTN_BACKEND="${CPPMEGA_ATTN_BACKEND:-flash}"
 case "${CPPMEGA_ATTN_BACKEND}" in
   auto|flash|fused|unfused) ;;
   *)
@@ -150,13 +150,46 @@ trap cleanup EXIT
 export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${WORKDIR}/torch_extensions}"
 mkdir -p "${TORCH_EXTENSIONS_DIR}"
 
-export PYTHONPATH="${WORKDIR}:${ROOT}/scripts:${ROOT}:${MEGATRON_ROOT}:${PYTHONPATH:-}"
+export PYTHONPATH="${WORKDIR}:${ROOT}/scripts:${ROOT}:${MEGATRON_ROOT}${CPPMEGA_EXTRA_PYTHONPATH:+:${CPPMEGA_EXTRA_PYTHONPATH}}:${PYTHONPATH:-}"
 
 python - <<PY
 import cppmega
 path = cppmega.__file__
 assert path.startswith("${ROOT}/"), path
 print("[local-quarter] cppmega import:", path)
+
+import os
+from pathlib import Path
+
+
+def _assert_source_root(module_name: str, module_file: str | None, source_root: str) -> None:
+    if not source_root:
+        return
+    if module_file is None:
+        raise AssertionError(f"{module_name} has no __file__; expected under {source_root}")
+    resolved_file = Path(module_file).resolve()
+    resolved_root = Path(source_root).resolve()
+    if not resolved_file.is_relative_to(resolved_root):
+        raise AssertionError(
+            f"{module_name} resolved to {resolved_file}, expected under {resolved_root}"
+        )
+
+
+import flash_attn
+import transformer_engine
+
+_assert_source_root(
+    "flash_attn",
+    getattr(flash_attn, "__file__", None),
+    os.environ.get("CPPMEGA_FLASH_ATTN_SOURCE_ROOT", ""),
+)
+_assert_source_root(
+    "transformer_engine",
+    getattr(transformer_engine, "__file__", None),
+    os.environ.get("CPPMEGA_TRANSFORMER_ENGINE_SOURCE_ROOT", ""),
+)
+print("[local-quarter] flash_attn import:", getattr(flash_attn, "__file__", None))
+print("[local-quarter] transformer_engine import:", getattr(transformer_engine, "__file__", None))
 PY
 
 python -m cppmega.megatron.preflight_smem_check
@@ -644,6 +677,7 @@ echo "[local-quarter] te_precision_config=${CPPMEGA_TE_PRECISION_CONFIG_FILE:-}"
 echo "[local-quarter] mxfp8_bwd_tn_adapter=${CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER:-0} mxfp8_bwd_backend=${CPPMEGA_TE_MXFP8_BWD_BACKEND:-te_tn_adapter} transpose_emit=${CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND:-auto} transpose_emit_swizzled=${CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED:-auto} cutlass_scale_backend=${CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND:-compact} bf16_fallback=${CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK:-0} nvte_backward_override=${NVTE_BACKWARD_OVERRIDE:-}"
 echo "[local-quarter] sparse_mla_fp8_quant=${CPPMEGA_SPARSE_MLA_FP8_QUANT} dsa_fp8_attention=${CPPMEGA_DSA_FP8_ATTENTION}"
 echo "[local-quarter] attention_backend=${CPPMEGA_ATTN_BACKEND} use_flash_attn=${CPPMEGA_USE_FLASH_ATTN}"
+echo "[local-quarter] extra_pythonpath=${CPPMEGA_EXTRA_PYTHONPATH:-}"
 echo "[local-quarter] moe_dispatcher=${CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE} moe_flex_backend=${CPPMEGA_MOE_FLEX_DISPATCHER_BACKEND}"
 echo "[local-quarter] mtp_depths=${MTP_DEPTHS} mtp_ce_kernel=${CPPMEGA_MTP_CE_KERNEL}"
 echo "[local-quarter] optimizer=${CPPMEGA_OPTIMIZER} param_storage=${CPPMEGA_PARAM_STORAGE} muon_scalar=${CPPMEGA_MUON_SCALAR_OPTIMIZER} muon_ns_steps=${CPPMEGA_MUON_NUM_NS_STEPS}"
@@ -754,8 +788,8 @@ if [[ "${CPPMEGA_NSYS_PROFILE}" == "1" ]]; then
       exit 2
       ;;
   esac
-  if [[ "${CPPMEGA_NSYS_CAPTURE_MODE}" == "delay" && "${CPPMEGA_NSYS_DURATION}" -lt 1 ]]; then
-    echo "FATAL: nsys capture mode 'delay' requires CPPMEGA_NSYS_DURATION >= 1" >&2
+  if [[ "${CPPMEGA_NSYS_CAPTURE_MODE}" == "delay" && "${CPPMEGA_NSYS_DURATION}" -lt 0 ]]; then
+    echo "FATAL: nsys capture mode 'delay' requires CPPMEGA_NSYS_DURATION >= 0" >&2
     exit 2
   fi
   if [[ "${CPPMEGA_NSYS_CAPTURE_MODE}" == "cudaProfilerApi" ]]; then
@@ -778,7 +812,10 @@ if [[ "${LOCAL_RANK:-0}" == "0" ]]; then
     "--output=${CPPMEGA_NSYS_OUTPUT}"
   )
   if [[ "${CPPMEGA_NSYS_CAPTURE_MODE}" == "delay" ]]; then
-    cmd+=("--delay=${CPPMEGA_NSYS_DELAY}" "--duration=${CPPMEGA_NSYS_DURATION}")
+    cmd+=("--delay=${CPPMEGA_NSYS_DELAY}")
+    if [[ "${CPPMEGA_NSYS_DURATION}" -gt 0 ]]; then
+      cmd+=("--duration=${CPPMEGA_NSYS_DURATION}")
+    fi
   elif [[ "${CPPMEGA_NSYS_CAPTURE_MODE}" == "cudaProfilerApi" ]]; then
     cmd+=(
       --capture-range=cudaProfilerApi

@@ -63,6 +63,273 @@ import os
 import sys
 
 
+_FUSED_MAIN_MTP_CCE_LOSS_ATTR = "_cppmega_fused_main_mtp_cce_loss"
+_FUSED_MAIN_MTP_CCE_LOGGED = False
+
+
+def _env_flag_enabled(name: str, default: str = "1") -> bool:
+    raw = os.environ.get(name, default).strip().lower()
+    return raw not in ("", "0", "false", "off", "none", "no")
+
+
+def _linear_ce_backend(output_layer) -> str | None:
+    compute = getattr(output_layer, "_compute_linear_and_cross_entropy_loss", None)
+    backend = getattr(compute, "_cppmega_linear_ce_backend", None)
+    if backend is not None:
+        return backend
+    return getattr(output_layer.__class__, "_cppmega_linear_ce_backend", None)
+
+
+def _can_use_cce_main_mtp_fusion(output_layer, config, scale_logits_fn) -> bool:
+    if not _env_flag_enabled("CPPMEGA_CCE_FUSE_MAIN_MTP_CE", "0"):
+        return False
+    if scale_logits_fn is not None:
+        return False
+    if not (
+        getattr(config, "cross_entropy_loss_fusion", False)
+        and getattr(config, "cross_entropy_fusion_impl", None) == "linear"
+    ):
+        return False
+    if (getattr(config, "mtp_num_layers", None) or 0) <= 0:
+        return False
+    return _linear_ce_backend(output_layer) == "cce"
+
+
+def fused_main_mtp_cce_loss(
+    *,
+    hidden_states,
+    labels,
+    loss_mask,
+    output_layer,
+    output_weight,
+    runtime_gather_output,
+    is_training,
+    config,
+    cp_group=None,
+    packed_seq_params=None,
+    scale_logits_fn=None,
+):
+    """Return main per-token loss with MTP loss attached, or ``None``.
+
+    This is an opt-in GB10/CCE-only launch fusion
+    (``CPPMEGA_CCE_FUSE_MAIN_MTP_CE=1``) for the hot path where the incoming
+    hidden states contain the main head plus all MTP depths:
+
+        ``[(1 + mtp_num_layers) * seq, batch, hidden]``.
+
+    Instead of calling CCE once for the main head and once per MTP depth, we
+    build one concatenated label tensor and call CCE a single time with
+    ``reduction="none"``.  The main slice is returned to Megatron's regular
+    loss function.  The MTP slices are reduced to the same scalar losses that
+    the existing ``reduction="sum"`` MTP shim used, then attached through
+    ``MTPLossAutoScaler`` so MTP gradients still flow during the main backward.
+    """
+    if labels is None or not _can_use_cce_main_mtp_fusion(output_layer, config, scale_logits_fn):
+        return None
+
+    import torch
+
+    from megatron.core import parallel_state
+    from megatron.core.transformer.multi_token_prediction import (
+        MTPLossAutoScaler,
+        MTPLossLoggingHelper,
+        roll_tensor,
+    )
+
+    mtp_num_layers = int(getattr(config, "mtp_num_layers", None) or 0)
+    batch, seq = labels.shape
+    expected_hidden0 = (1 + mtp_num_layers) * seq
+    if hidden_states.shape[0] != expected_hidden0 or hidden_states.shape[1] != batch:
+        return None
+
+    if loss_mask is None:
+        loss_mask = torch.ones_like(labels)
+
+    mtp_labels = labels.clone()
+    mtp_loss_mask = loss_mask
+    original_num_tokens = mtp_loss_mask.sum()
+
+    all_labels = [labels]
+    mtp_num_tokens = []
+    ignore_index = -100
+    for _mtp_layer_number in range(mtp_num_layers):
+        mtp_labels, _ = roll_tensor(
+            mtp_labels,
+            shifts=-1,
+            dims=-1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+        )
+        mtp_loss_mask, num_tokens = roll_tensor(
+            mtp_loss_mask,
+            shifts=-1,
+            dims=-1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+        )
+        all_labels.append(
+            torch.where(
+                mtp_loss_mask.bool(),
+                mtp_labels,
+                torch.full_like(mtp_labels, ignore_index),
+            )
+        )
+        mtp_num_tokens.append(num_tokens)
+
+    fused_labels = torch.cat(all_labels, dim=-1)
+    fused_loss = output_layer(
+        hidden_states,
+        weight=output_weight,
+        runtime_gather_output=runtime_gather_output,
+        output_cross_entropy_loss=True,
+        labels=fused_labels,
+        reduction="none",
+        ignore_index=ignore_index,
+    )
+
+    if fused_loss.shape != fused_labels.shape:
+        raise RuntimeError(
+            "[cppmega] fused main+MTP CCE expected loss shape "
+            f"{tuple(fused_labels.shape)} but got {tuple(fused_loss.shape)}"
+        )
+
+    main_loss = fused_loss[:, :seq].contiguous()
+    mtp_losses = fused_loss[:, seq:].reshape(batch, mtp_num_layers, seq)
+    mtp_loss_scale = config.mtp_loss_scaling_factor / mtp_num_layers
+
+    total_mtp_loss = None
+    for mtp_layer_number in range(mtp_num_layers):
+        mtp_loss_sum = mtp_losses[:, mtp_layer_number, :].sum()
+        num_tokens = mtp_num_tokens[mtp_layer_number]
+
+        if is_training:
+            mtp_loss_for_log = (
+                mtp_loss_sum * (num_tokens > 0).to(mtp_loss_sum.dtype)
+            ) / num_tokens.clamp(min=1)
+            MTPLossLoggingHelper.save_loss_to_tracker(
+                mtp_loss_for_log,
+                mtp_layer_number,
+                mtp_num_layers,
+                avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+            )
+
+        if config.calculate_per_token_loss:
+            num_tokens_safe = num_tokens.clamp(min=1)
+            mtp_loss_normalized = (
+                mtp_loss_scale * mtp_loss_sum * (original_num_tokens / num_tokens_safe)
+            )
+        else:
+            mtp_loss_normalized = mtp_loss_scale * mtp_loss_sum / num_tokens.clamp(min=1)
+
+        total_mtp_loss = (
+            mtp_loss_normalized
+            if total_mtp_loss is None
+            else total_mtp_loss + mtp_loss_normalized
+        )
+
+    if total_mtp_loss is not None:
+        main_loss = MTPLossAutoScaler.apply(main_loss, total_mtp_loss)
+
+    return main_loss
+
+
+def attach_fused_main_mtp_cce_loss(
+    *,
+    hidden_states,
+    labels,
+    loss_mask,
+    output_layer,
+    output_weight,
+    runtime_gather_output,
+    is_training,
+    config,
+    cp_group=None,
+    packed_seq_params=None,
+    scale_logits_fn=None,
+):
+    """Attach fused CCE main loss to the main hidden slice, or return ``None``."""
+    global _FUSED_MAIN_MTP_CCE_LOGGED
+
+    main_loss = fused_main_mtp_cce_loss(
+        hidden_states=hidden_states,
+        labels=labels,
+        loss_mask=loss_mask,
+        output_layer=output_layer,
+        output_weight=output_weight,
+        runtime_gather_output=runtime_gather_output,
+        is_training=is_training,
+        config=config,
+        cp_group=cp_group,
+        packed_seq_params=packed_seq_params,
+        scale_logits_fn=scale_logits_fn,
+    )
+    if main_loss is None:
+        return None
+
+    hidden_states_list = hidden_states.chunk(1 + int(config.mtp_num_layers), dim=0)
+    hidden_main = hidden_states_list[0]
+    setattr(hidden_main, _FUSED_MAIN_MTP_CCE_LOSS_ATTR, main_loss)
+    if not _FUSED_MAIN_MTP_CCE_LOGGED:
+        _FUSED_MAIN_MTP_CCE_LOGGED = True
+        print(
+            "[cppmega] CCE main+MTP CE launch fusion active: "
+            f"1 call covers main + {config.mtp_num_layers} MTP depths"
+        )
+    return hidden_main
+
+
+def _install_linear_ce_forward_cache_patch(LinearCrossEntropyModule) -> None:
+    """Let the standard main-head call consume a fused main+MTP CCE loss."""
+    if getattr(LinearCrossEntropyModule, "_cppmega_fused_cce_cache_patched", False):
+        return
+
+    _orig_forward = LinearCrossEntropyModule.forward
+
+    def _forward_with_fused_cce_cache(
+        self,
+        input_,
+        weight=None,
+        runtime_gather_output=None,
+        output_cross_entropy_loss=False,
+        labels=None,
+        reduction="none",
+        ignore_index=-100,
+    ):
+        if output_cross_entropy_loss:
+            cached_loss = getattr(input_, _FUSED_MAIN_MTP_CCE_LOSS_ATTR, None)
+            if cached_loss is not None:
+                try:
+                    delattr(input_, _FUSED_MAIN_MTP_CCE_LOSS_ATTR)
+                except Exception:
+                    setattr(input_, _FUSED_MAIN_MTP_CCE_LOSS_ATTR, None)
+                if labels is not None and tuple(cached_loss.shape) != tuple(labels.shape):
+                    raise RuntimeError(
+                        "[cppmega] fused main+MTP CCE cached loss shape "
+                        f"{tuple(cached_loss.shape)} does not match labels "
+                        f"{tuple(labels.shape)}"
+                    )
+                if reduction != "none":
+                    raise RuntimeError(
+                        "[cppmega] fused main+MTP CCE cache only supports "
+                        f"the main reduction='none' path, got {reduction!r}"
+                    )
+                return cached_loss
+
+        return _orig_forward(
+            self,
+            input_,
+            weight=weight,
+            runtime_gather_output=runtime_gather_output,
+            output_cross_entropy_loss=output_cross_entropy_loss,
+            labels=labels,
+            reduction=reduction,
+            ignore_index=ignore_index,
+        )
+
+    LinearCrossEntropyModule.forward = _forward_with_fused_cce_cache
+    LinearCrossEntropyModule._cppmega_fused_cce_cache_patched = True
+
+
 def patch_mtp_native_hopper_ce() -> None:
     """Verify the native MTP linear-CE fusion path is wired and log the route.
 
@@ -89,6 +356,8 @@ def patch_mtp_native_hopper_ce() -> None:
             file=sys.stderr,
         )
         return
+
+    _install_linear_ce_forward_cache_patch(LinearCrossEntropyModule)
 
     # Install the main LinearCE class swap / backend route here as well as in
     # launchers.  This makes CPPMEGA_MTP_CE_KERNEL=cce/native independent of
@@ -244,6 +513,22 @@ def _install_process_mtp_loss_patch() -> None:
                 packed_seq_params=packed_seq_params,
                 scale_logits_fn=scale_logits_fn,
             )
+
+        fused_hidden_states = attach_fused_main_mtp_cce_loss(
+            hidden_states=hidden_states,
+            labels=labels,
+            loss_mask=loss_mask,
+            output_layer=output_layer,
+            output_weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+            is_training=is_training,
+            config=config,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            scale_logits_fn=scale_logits_fn,
+        )
+        if fused_hidden_states is not None:
+            return fused_hidden_states
 
         # Fused branch — rewritten with reduction="sum" to sidestep the
         # transpose round-trip NaN bug on shared-weight multi-call.

@@ -133,12 +133,16 @@ constexpr int64_t kOperandColumnwiseTranspose =
     static_cast<int64_t>(
         cutlass::gemm::collective::CppMegaCompactOperandSource::kColumnwiseTranspose);
 
+// Split the manual scale+payload fill across the CUTLASS main producer and
+// auxiliary producer roles. The direct compact-scale backend is still opt-in,
+// but this avoids making one producer warp serialize both operands.
 using CompactScaleDispatchPolicy =
     cutlass::gemm::collective::MainloopSm120TmaWarpSpecializedBlockScaledCompactScale<
         CollectiveMainloop::DispatchPolicy::Stages,
         CollectiveMainloop::DispatchPolicy::SchedulerPipelineStageCount,
         typename CollectiveMainloop::DispatchPolicy::ClusterShape,
-        typename CollectiveMainloop::DispatchPolicy::Schedule>;
+        typename CollectiveMainloop::DispatchPolicy::Schedule,
+        true>;
 
 using CompactScaleAsymmetricDispatchPolicy =
     cutlass::gemm::collective::MainloopSm120TmaWarpSpecializedBlockScaledCompactScale<

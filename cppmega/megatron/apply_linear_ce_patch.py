@@ -306,9 +306,12 @@ def _install_cce_compute(LinearCrossEntropyModule, cc) -> None:
             return loss
         raise ValueError(f"Unsupported reduction: {reduction}")
 
+    _cce_compute_linear_and_cross_entropy_loss._cppmega_linear_ce_backend = "cce"
+    _cce_compute_linear_and_cross_entropy_loss._cppmega_cce_filter_eps = filter_eps
     LinearCrossEntropyModule._compute_linear_and_cross_entropy_loss = (
         _cce_compute_linear_and_cross_entropy_loss
     )
+    LinearCrossEntropyModule._cppmega_linear_ce_backend = "cce"
     print(
         f"[cppmega] LinearCrossEntropyModule routed to Apple CCE kernel "
         f"(cc={cc[0]}.{cc[1]}, pre-Blackwell; supports reduction='none' in bwd; "
@@ -422,9 +425,13 @@ def _install_liger_nonfused_compute(
             return per_token_loss.sum()
         raise ValueError(f"Unsupported reduction: {reduction}")
 
+    _liger_nonfused_compute_linear_and_cross_entropy_loss._cppmega_linear_ce_backend = (
+        "liger_nonfused"
+    )
     LinearCrossEntropyModule._compute_linear_and_cross_entropy_loss = (
         _liger_nonfused_compute_linear_and_cross_entropy_loss
     )
+    LinearCrossEntropyModule._cppmega_linear_ce_backend = "liger_nonfused"
     print(
         f"[cppmega] LinearCrossEntropyModule routed to Liger NON-FUSED kernel "
         f"(cc={cc[0]}.{cc[1]}, fix path #2; PR #680 reduction='none' bwd fix; "
@@ -506,9 +513,11 @@ def _install_liger_compute(
             return liger_loss_scalar.expand(b, s).contiguous()
         raise ValueError(f"Unsupported reduction: {reduction}")
 
+    _liger_compute_linear_and_cross_entropy_loss._cppmega_linear_ce_backend = "liger"
     LinearCrossEntropyModule._compute_linear_and_cross_entropy_loss = (
         _liger_compute_linear_and_cross_entropy_loss
     )
+    LinearCrossEntropyModule._cppmega_linear_ce_backend = "liger"
     print(
         f"[cppmega] LinearCrossEntropyModule routed to Liger kernel "
         f"(cc={cc[0]}.{cc[1]}, pre-Blackwell; using reduction='mean' + "

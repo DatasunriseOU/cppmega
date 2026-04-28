@@ -16,20 +16,18 @@ the dated note as historical evidence.
   `docs/production_status.md`.
 - Local GB10 is a correctness/probe lane, not the production throughput lane.
   The current local default is the typed `local_gb10_quarter` run profile in
-  `cppmega/recipes/run_profiles.py`: MTP depth 2, Liger MTP CE,
+  `cppmega/recipes/run_profiles.py`: MTP depth 2, CCE MTP CE,
   `--bf16 --fp8-format hybrid --fp8-recipe tensorwise`, Muon q8 momentum,
   no-master BF16 optimizer storage, DSA TileLang sparse attention, and the
-  explicit deprecated-path ACK carried by that profile.
+  attention backend set to `flash` through the patched FA4 SM120 source tree.
 - For `--fp8-recipe mxfp8`, the typed profile now resolves
   `optimizer.param_storage=auto` to primary MXFP8 parameter storage and emits
   Megatron `--mxfp8-param-storage`.  This sets `TransformerConfig.fp8_param`
   without distributed `--fp8-param-gather`.
-- This GB10-local MTP default is deliberately different from older docs and
-  from the generic shim direction. `scripts/cppmega_fp8_shim.py` defaults
-  `CPPMEGA_MTP_CE_KERNEL=native`, and `docs/deprecated_path_gates_2026_04_25.md`
-  lists native as the replacement. The local GB10 launcher overrides that
-  because native MTP CE still has a validation gap and Liger is the known local
-  memory-constrained path.
+- This GB10-local MTP default is deliberately different from older docs:
+  `scripts/cppmega_fp8_shim.py` now routes `CPPMEGA_MTP_CE_KERNEL=cce` through
+  the main LinearCE path. Deprecated Liger MTP CE requires an explicit ACK and is
+  no longer emitted by the typed local profile.
 - `cppmega/recipes/nam56r_launch.py` now passes `mtp_num_predictors` through to
   `build_megatron_args_bundle()`. The run profile sets one `model.mtp_depths`
   field, and that field drives both the hybrid layer-pattern suffix and
@@ -45,7 +43,7 @@ the dated note as historical evidence.
 | DSA indexer / top-k | Current supported path is BF16 per-head fused accumulation in `dsa_indexer_fused_patch.py`; it removes the upstream `[sq,b,h,sk]` FP32 intermediate. | The old FP8 indexer path was removed. Tests reject `dsa_indexer_dtype="fp8"` in `tests/test_megatron_args.py`; the launcher should not emit `--dsa-indexer-dtype`. | No MXFP8 indexer path is accepted. The target is streaming top-k from the per-head accumulator, not block-scaled dense score materialization. |
 | MoE router / DeepEP | Router probabilities remain FP32 when flex/DeepEP is used. This is a DeepEP API fact, not an accidental precision leak. | TE FP8 can cover MoE GEMMs, but router dtype is still FP32 for flex. | No current MXFP8 MoE training default. DeepGEMM is not a GB10 drop-in; use TE/CUTLASS SM120 work only after the layout contract is explicit. |
 | Mamba / M2RNN scan state | Mamba no-conv parameters are stored BF16 after wrapping, with transient FP32 `A_log.float()` / `dt_bias.float()`. M2RNN still has FP32 recurrent checkpoints/backward accumulators. | FP8 correctness passed for the main Mamba3 paths on H200, but scan kernels themselves are not magically MXFP8; TE covers surrounding linears. | MXFP8 is limited to selected TE projection/GEMM boundaries. It is not a scan-state format. |
-| MTP head / CE | Global preferred direction is native/LinearCE, but H200 native MTP CE remains blocked by NaN validation. | Local GB10 currently chooses Liger MTP CE with depth 2 for memory. This is a launcher-local exception with an ACK, not a global default. | No MXFP8-specific MTP path is accepted. MTP validation is about CE routing and shared-weight backward correctness, not block-scaled GEMM alone. |
+| MTP head / CE | Global preferred direction is native/LinearCE/CCE; H200 native MTP CE remains blocked by NaN validation. | Local GB10 currently chooses CCE MTP CE with depth 2 through the typed profile. Deprecated Liger MTP CE is ACK-gated and not a default. | No MXFP8-specific MTP path is accepted. MTP validation is about CE routing and shared-weight backward correctness, not block-scaled GEMM alone. |
 
 ## TE MXFP8 Linear And CUTLASS GB10 Layout Boundary
 
@@ -170,6 +168,8 @@ Short-term path:
 - Keep H200 on the known BF16 / FP8 tensorwise production lanes.
 - Keep local GB10 default on tensorwise FP8 plus BF16 storage unless an
   MXFP8-specific probe is being run.
+- Keep GB10 attention on patched FA4.  The `flashinfer_cutlass` name below is
+  the dense MXFP8 Linear GEMM backward backend, not an attention backend.
 - For GB10 MXFP8 experiments, use typed profile arguments, for example
   `bash scripts/local_gb10_quarter_train.sh --fp8-recipe mxfp8
   --mxfp8-bwd-backend te_tn_adapter --mxfp8-transpose-emit-backend te

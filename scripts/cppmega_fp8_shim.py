@@ -179,6 +179,11 @@ if os.environ.get("CPPMEGA_ALLOW_TE_MXFP8_SM12", "0") == "1":
         import torch as _torch
         import transformer_engine.pytorch.quantization as _te_quantization
 
+        assert hasattr(_te_quantization, "check_mxfp8_support"), (
+            "transformer_engine.pytorch.quantization.check_mxfp8_support is "
+            "missing; cppmega_fp8_shim.py patches this symbol directly. "
+            f"Tested against TE {_SUPPORTED_TE_VERSIONS}."
+        )
         _orig_check_mxfp8_support = _te_quantization.check_mxfp8_support
 
         def _cppmega_check_mxfp8_support():
@@ -212,7 +217,9 @@ if os.environ.get("CPPMEGA_ALLOW_TE_MXFP8_SM12", "0") == "1":
 #   dgrad: general_gemm(weight.T_mxfp8, dy_mxfp8, layout="TN")
 #   wgrad: general_gemm(x.T_mxfp8, dy.T_mxfp8, layout="TN")
 #
-# Backend selection:
+# Dense MXFP8 Linear GEMM backend selection.  Do not confuse this with
+# Megatron/TE attention backend selection: local GB10 attention is pinned to
+# patched FA4 by the typed run profile.
 #   CPPMEGA_TE_MXFP8_BWD_BACKEND=te_tn_adapter       # TE TN GEMM
 #   CPPMEGA_TE_MXFP8_BWD_BACKEND=flashinfer_cutlass  # TE payload + FlashInfer SM120
 #   CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native      # old direct compact loader
@@ -323,10 +330,18 @@ if (
         from transformer_engine.common.recipe import MXFP8BlockScaling as _TE_MXFP8Recipe
         from transformer_engine.pytorch.tensor import MXFP8Quantizer as _TE_MXFP8Quantizer
         from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor as _TE_MXFP8Tensor
+        from transformer_engine.pytorch.module import linear as _TE_LINEAR_MODULE
 
         try:
             from transformer_engine.common.recipe import NVFP4BlockScaling as _TE_NVFP4Recipe
-        except Exception:  # pragma: no cover
+        except Exception as _nvfp4_import_exc:  # pragma: no cover
+            print(
+                "[cppmega_fp8_shim] NVFP4BlockScaling import skipped "
+                f"({type(_nvfp4_import_exc).__name__}: {_nvfp4_import_exc}); "
+                "NVFP4 recipe back-compat patches will not be installed. "
+                f"Tested against TE {_SUPPORTED_TE_VERSIONS}.",
+                file=_sys.stderr,
+            )
             _TE_NVFP4Recipe = None
 
         _cppmega_backward_override = _te_backward_override
@@ -339,6 +354,7 @@ if (
             "mxfp8_tn_adapter_dgrad": 0,
             "mxfp8_tn_adapter_wgrad": 0,
             "mxfp8_tn_adapter_te_emit": 0,
+            "mxfp8_tn_adapter_te_emit_deferred": 0,
             "mxfp8_tn_adapter_saved_transpose_operand": 0,
             "mxfp8_tn_adapter_te_emit_swizzled": 0,
             "mxfp8_tn_adapter_te_emit_swizzled_unavailable": 0,
@@ -444,6 +460,11 @@ if (
         _cppmega_mark_recipe(_TE_NVFP4Recipe)
         _cppmega_quantize_weight_debug_count = [0]
         _cppmega_attach_debug_count = [0]
+        _cppmega_attach_warned_missing_qrt = [False]
+        _te_linear_deferred_saved_operand = hasattr(
+            _TE_LINEAR_MODULE,
+            "_make_rowwise_transpose_for_backward",
+        )
         _cppmega_mxfp8_tn_sidecar_registry = {}
         # Forward can create hundreds of MXFP8 transpose sidecars before the
         # matching backward GEMM consumes the earliest ones. Keep enough entries
@@ -780,12 +801,28 @@ if (
             _columnwise_scale = getattr(_out, "_columnwise_scale_inv", None)
             if _columnwise_scale is None:
                 return _out
+            if getattr(_quantizer, "_te_skip_eager_rowwise_transpose_for_backward", False):
+                _cppmega_record_bwd_stat("mxfp8_tn_adapter_te_emit_deferred")
+                return _out
             if getattr(_out, _cppmega_mxfp8_tn_sidecar_attr, None) is not None:
                 return _out
             if not hasattr(_quantizer, "quantize_rowwise_transpose"):
                 _cppmega_record_bwd_stat(
                     "mxfp8_tn_adapter_te_emit_failed", "missing_quantize_rowwise_transpose"
                 )
+                if not _cppmega_attach_warned_missing_qrt[0]:
+                    _cppmega_attach_warned_missing_qrt[0] = True
+                    print(
+                        "[cppmega_fp8_shim] WARNING: MXFP8Quantizer is missing "
+                        "quantize_rowwise_transpose; the TN adapter will fall "
+                        "through to the slow copy-based transpose path "
+                        "(see metric mxfp8_tn_adapter_copy_transpose). "
+                        "This requires the cppmega TE fork "
+                        "(jewelmusicee/TransformerEngine ref "
+                        "cppmega-mxfp8-transpose-emit). Tested against TE "
+                        f"{_SUPPORTED_TE_VERSIONS}.",
+                        file=_sys.stderr,
+                    )
                 return _out
             try:
                 with _torch.no_grad():
@@ -862,7 +899,20 @@ if (
                     raise
             return _out
 
+        assert hasattr(_TE_MXFP8Quantizer, "quantize"), (
+            "transformer_engine.pytorch.tensor.MXFP8Quantizer.quantize is "
+            "missing; cppmega_fp8_shim.py wraps this method to attach "
+            "rowwise-transpose sidecars. Tested against TE "
+            f"{_SUPPORTED_TE_VERSIONS}."
+        )
         _orig_mxfp8_quantize = getattr(_TE_MXFP8Quantizer, "quantize", None)
+        if _orig_mxfp8_quantize is None:
+            print(
+                "[cppmega_fp8_shim] WARNING: MXFP8Quantizer.quantize resolved "
+                "to None; rowwise-transpose sidecar patch will not be "
+                f"installed. Tested against TE {_SUPPORTED_TE_VERSIONS}.",
+                file=_sys.stderr,
+            )
         if _orig_mxfp8_quantize is not None and not getattr(
             _orig_mxfp8_quantize, "_cppmega_transpose_emit", False
         ):
@@ -875,7 +925,20 @@ if (
             _mxfp8_quantize_with_rowwise_transpose._cppmega_transpose_emit = True
             _TE_MXFP8Quantizer.quantize = _mxfp8_quantize_with_rowwise_transpose
 
+        assert hasattr(_TE_MXFP8Quantizer, "update_quantized"), (
+            "transformer_engine.pytorch.tensor.MXFP8Quantizer.update_quantized "
+            "is missing; cppmega_fp8_shim.py wraps this method to attach "
+            "rowwise-transpose sidecars after in-place re-quantization. "
+            f"Tested against TE {_SUPPORTED_TE_VERSIONS}."
+        )
         _orig_mxfp8_update_quantized = getattr(_TE_MXFP8Quantizer, "update_quantized", None)
+        if _orig_mxfp8_update_quantized is None:
+            print(
+                "[cppmega_fp8_shim] WARNING: MXFP8Quantizer.update_quantized "
+                "resolved to None; rowwise-transpose sidecar patch will not "
+                f"be installed. Tested against TE {_SUPPORTED_TE_VERSIONS}.",
+                file=_sys.stderr,
+            )
         if _orig_mxfp8_update_quantized is not None and not getattr(
             _orig_mxfp8_update_quantized, "_cppmega_transpose_emit", False
         ):
@@ -894,7 +957,20 @@ if (
                 _mxfp8_update_quantized_with_rowwise_transpose
             )
 
+        assert hasattr(_tex, "split_quantize"), (
+            "transformer_engine_torch.split_quantize is missing; "
+            "cppmega_fp8_shim.py wraps this C++-bound function to attach "
+            "rowwise-transpose sidecars to per-shard MXFP8 outputs. "
+            f"Tested against TE {_SUPPORTED_TE_VERSIONS}."
+        )
         _orig_tex_split_quantize = getattr(_tex, "split_quantize", None)
+        if _orig_tex_split_quantize is None:
+            print(
+                "[cppmega_fp8_shim] WARNING: transformer_engine_torch."
+                "split_quantize resolved to None; sidecar patch will not be "
+                f"installed. Tested against TE {_SUPPORTED_TE_VERSIONS}.",
+                file=_sys.stderr,
+            )
         if _orig_tex_split_quantize is not None and not getattr(
             _orig_tex_split_quantize, "_cppmega_transpose_emit", False
         ):
@@ -963,26 +1039,33 @@ if (
             if _sidecar is not None:
                 _cppmega_record_bwd_stat("mxfp8_tn_adapter_te_emit")
                 return _sidecar
-            if (
+            _strict_missing_sidecar = (
                 _te_mxfp8_transpose_emit_backend == "te"
                 and _te_mxfp8_transpose_emit_strict
                 and not bool(getattr(_x, "_is_param", False))
-            ):
-                raise ValueError(
-                    "MXFP8 TN adapter is configured for TE transpose-emit, but operand "
-                    "is missing the rowwise-transpose sidecar; "
-                    f"{_cppmega_mxfp8_debug_desc(_x)}"
-                )
+            )
             # Primary MXFP8 parameters do not pass through the BF16 quantizer,
             # so they have no TE-emitted transpose sidecar.  Until the native
             # SM120 loader can consume their compact columnwise storage, use a
             # one-shot payload transpose in backward instead of keeping a
             # persistent sidecar from forward.
             if getattr(_x, "_with_gemm_swizzled_scales", False):
+                if _strict_missing_sidecar:
+                    raise ValueError(
+                        "MXFP8 TN adapter is configured for TE transpose-emit, but operand "
+                        "is missing the rowwise-transpose sidecar and uses GEMM-swizzled "
+                        f"scales; {_cppmega_mxfp8_debug_desc(_x)}"
+                    )
                 raise ValueError("MXFP8 TN adapter requires compact, non-swizzled scales")
             _data = getattr(_x, "_columnwise_data", None)
             _scale = getattr(_x, "_columnwise_scale_inv", None)
             if _data is None or _scale is None:
+                if _strict_missing_sidecar:
+                    raise ValueError(
+                        "MXFP8 TN adapter is configured for TE transpose-emit, but operand "
+                        "is missing both rowwise-transpose sidecar and compact columnwise "
+                        f"payload; {_cppmega_mxfp8_debug_desc(_x)}"
+                    )
                 raise ValueError("MXFP8 TN adapter requires columnwise data and scales")
             if _data.dim() < 2:
                 raise ValueError("MXFP8 TN adapter requires matrix-like columnwise data")
@@ -1509,6 +1592,25 @@ if (
         from transformer_engine.pytorch.module import base as _te_module_base
         from transformer_engine.pytorch.quantization import FP8GlobalStateManager as _TE_FP8State
 
+        assert hasattr(_te_module_base, "TransformerEngineBaseModule"), (
+            "transformer_engine.pytorch.module.base.TransformerEngineBaseModule "
+            "is missing; cppmega_fp8_shim.py patches its "
+            "grad_output_preprocess static method. Tested against TE "
+            f"{_SUPPORTED_TE_VERSIONS}."
+        )
+        assert hasattr(
+            _te_module_base.TransformerEngineBaseModule, "grad_output_preprocess"
+        ), (
+            "TransformerEngineBaseModule.grad_output_preprocess is missing; "
+            "cppmega_fp8_shim.py wraps this method to gate the BF16 backward "
+            f"override path. Tested against TE {_SUPPORTED_TE_VERSIONS}."
+        )
+        assert hasattr(_TE_FP8State, "get_fp8_recipe"), (
+            "FP8GlobalStateManager.get_fp8_recipe is missing; "
+            "cppmega_fp8_shim.py reads this to know whether to force "
+            "compact MXFP8 quantizer outputs. Tested against TE "
+            f"{_SUPPORTED_TE_VERSIONS}."
+        )
         _orig_grad_output_preprocess = (
             _te_module_base.TransformerEngineBaseModule.grad_output_preprocess
         )
@@ -1553,7 +1655,7 @@ if (
                 _grad_output_preprocess
             )
 
-        def _cppmega_force_compact_if_needed(_quantizer, _recipe):
+        def _cppmega_force_compact_if_needed(_quantizer, _recipe, *, _role=None):
             if (
                 _quantizer is not None
                 and _te_mxfp8_bwd_tn_adapter
@@ -1561,13 +1663,41 @@ if (
                 and hasattr(_quantizer, "optimize_for_gemm")
             ):
                 _quantizer.optimize_for_gemm = False
+                if hasattr(_quantizer, "quantize_rowwise_transpose"):
+                    _emit_enabled = _te_mxfp8_transpose_emit_backend in ("auto", "te")
+                    setattr(
+                        _quantizer,
+                        "_te_rowwise_transpose_for_backward_enabled",
+                        _emit_enabled,
+                    )
+                    setattr(
+                        _quantizer,
+                        "_te_rowwise_transpose_for_backward_with_gemm_swizzled_scales",
+                        bool(_te_mxfp8_transpose_emit_swizzled),
+                    )
+                    setattr(
+                        _quantizer,
+                        "_te_rowwise_transpose_for_backward_strict",
+                        bool(_te_mxfp8_transpose_emit_strict),
+                    )
+                    setattr(
+                        _quantizer,
+                        "_te_skip_eager_rowwise_transpose_for_backward",
+                        bool(
+                            _emit_enabled
+                            and _te_linear_deferred_saved_operand
+                            and _role in ("input", "grad_output", "weight")
+                        ),
+                    )
 
-        def _cppmega_force_compact_many_if_needed(_quantizers, _recipe):
+        def _cppmega_force_compact_many_if_needed(_quantizers, _recipe, *, _role=None):
             if isinstance(_quantizers, (list, tuple)):
                 for _quantizer in _quantizers:
-                    _cppmega_force_compact_many_if_needed(_quantizer, _recipe)
+                    _cppmega_force_compact_many_if_needed(_quantizer, _recipe, _role=_role)
                 return
-            _cppmega_force_compact_if_needed(_quantizers, _recipe)
+            _cppmega_force_compact_if_needed(_quantizers, _recipe, _role=_role)
+
+        _cppmega_get_quantizers_warned = [False]
 
         def _cppmega_wrap_get_quantizers(_module_cls):
             _orig_get_quantizers = getattr(_module_cls, "_get_quantizers", None)
@@ -1581,15 +1711,34 @@ if (
                 _quantizers = _orig_get_quantizers(self, *args, **kwargs)
                 try:
                     _recipe = _TE_FP8State.get_fp8_recipe()
-                    for _q in (_quantizers[0], _quantizers[5]):
-                        _cppmega_force_compact_many_if_needed(_q, _recipe)
-                except Exception:
-                    pass
+                    _cppmega_force_compact_many_if_needed(
+                        _quantizers[0],
+                        _recipe,
+                        _role="input",
+                    )
+                    _cppmega_force_compact_many_if_needed(
+                        _quantizers[5],
+                        _recipe,
+                        _role="grad_output",
+                    )
+                except Exception as _gq_exc:
+                    if not _cppmega_get_quantizers_warned[0]:
+                        _cppmega_get_quantizers_warned[0] = True
+                        print(
+                            "[cppmega_fp8_shim] WARNING: _get_quantizers "
+                            "compact-MXFP8 patch swallowed an exception "
+                            f"({type(_gq_exc).__name__}: {_gq_exc}); "
+                            "subsequent occurrences will be silenced. "
+                            f"Tested against TE {_SUPPORTED_TE_VERSIONS}.",
+                            file=_sys.stderr,
+                        )
                 return _quantizers
 
             _get_quantizers._cppmega_backward_override = True
             _module_cls._get_quantizers = _get_quantizers
             return True
+
+        _cppmega_get_weight_quantizers_warned = [False]
 
         def _cppmega_wrap_get_weight_quantizers(_module_cls):
             _orig_get_weight_quantizers = getattr(_module_cls, "_get_weight_quantizers", None)
@@ -1604,9 +1753,18 @@ if (
                 try:
                     _recipe = _TE_FP8State.get_fp8_recipe()
                     for _q in _quantizers:
-                        _cppmega_force_compact_many_if_needed(_q, _recipe)
-                except Exception:
-                    pass
+                        _cppmega_force_compact_many_if_needed(_q, _recipe, _role="weight")
+                except Exception as _gwq_exc:
+                    if not _cppmega_get_weight_quantizers_warned[0]:
+                        _cppmega_get_weight_quantizers_warned[0] = True
+                        print(
+                            "[cppmega_fp8_shim] WARNING: _get_weight_quantizers "
+                            "compact-MXFP8 patch swallowed an exception "
+                            f"({type(_gwq_exc).__name__}: {_gwq_exc}); "
+                            "subsequent occurrences will be silenced. "
+                            f"Tested against TE {_SUPPORTED_TE_VERSIONS}.",
+                            file=_sys.stderr,
+                        )
                 return _quantizers
 
             _get_weight_quantizers._cppmega_mxfp8_compact = True
@@ -1690,6 +1848,27 @@ if (
                     and isinstance(output_quantizer, _TE_MXFP8Quantizer)
                     and _te_mxfp8_transpose_emit_backend in ("auto", "te")
                 ):
+                    if _te_linear_deferred_saved_operand:
+                        setattr(
+                            output_quantizer,
+                            "_te_rowwise_transpose_for_backward_enabled",
+                            True,
+                        )
+                        setattr(
+                            output_quantizer,
+                            "_te_rowwise_transpose_for_backward_with_gemm_swizzled_scales",
+                            bool(_te_mxfp8_transpose_emit_swizzled),
+                        )
+                        setattr(
+                            output_quantizer,
+                            "_te_rowwise_transpose_for_backward_strict",
+                            bool(_te_mxfp8_transpose_emit_strict),
+                        )
+                        setattr(
+                            output_quantizer,
+                            "_te_skip_eager_rowwise_transpose_for_backward",
+                            True,
+                        )
                     _ln_out, _mu, _rsigma = _orig_apply_normalization(
                         inputmat,
                         ln_out,
@@ -1756,8 +1935,15 @@ if (
                         _patched_quantizer_modules.append(_class_name)
                     if _class is not None and _cppmega_wrap_get_weight_quantizers(_class):
                         _patched_weight_quantizer_modules.append(_class_name)
-            except Exception:
-                pass
+            except Exception as _wrap_exc:
+                print(
+                    f"[cppmega_fp8_shim] WARNING: TE module {_module_name!r} "
+                    "could not be wrapped "
+                    f"({type(_wrap_exc).__name__}: {_wrap_exc}); MXFP8 "
+                    "backward patches will not apply to this module. "
+                    f"Tested against TE {_SUPPORTED_TE_VERSIONS}.",
+                    file=_sys.stderr,
+                )
 
         print(
             "[cppmega_fp8_shim] TE block-scaled backward override installed "
@@ -1800,11 +1986,12 @@ except Exception as _exc:  # pragma: no cover
 
 
 # -----------------------------------------------------------------------------
-# (2) Optional MIMO config patch (env-driven)
+# (2) Optional Mamba config patch (profile/env bridge)
 # -----------------------------------------------------------------------------
 _mimo_on = os.environ.get("CPPMEGA_MAMBA3_MIMO", "0") == "1"
 _num_groups_override = os.environ.get("CPPMEGA_MAMBA_NUM_GROUPS", "")
-if _mimo_on or _num_groups_override:
+_noconv_chunk_override = os.environ.get("CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE", "")
+if _mimo_on or _num_groups_override or _noconv_chunk_override:
     try:
         from megatron.core.transformer.transformer_config import TransformerConfig
         _orig_post_init = TransformerConfig.__post_init__
@@ -1819,6 +2006,18 @@ if _mimo_on or _num_groups_override:
                     import sys
                     print(f"[cppmega_fp8_shim] mamba_num_groups override failed: {_e}", file=sys.stderr)
             _orig_post_init(self)
+            if _noconv_chunk_override:
+                try:
+                    _chunk = int(_noconv_chunk_override)
+                    if _chunk <= 0 or _chunk & (_chunk - 1):
+                        raise ValueError("must be a positive power of two")
+                    object.__setattr__(self, "cppmega_noconv_mamba_chunk_size", _chunk)
+                except Exception as _e:
+                    import sys
+                    print(
+                        f"[cppmega_fp8_shim] noconv Mamba chunk override failed: {_e}",
+                        file=sys.stderr,
+                    )
             if _mimo_on:
                 if not getattr(self, "cppmega_mamba3_is_mimo", False):
                     object.__setattr__(self, "cppmega_mamba3_is_mimo", True)
@@ -1832,9 +2031,14 @@ if _mimo_on or _num_groups_override:
             print("[cppmega_fp8_shim] MIMO patch installed (rank=4, chunk=16)")
         if _num_groups_override:
             print(f"[cppmega_fp8_shim] mamba_num_groups override arm set -> {_num_groups_override}")
+        if _noconv_chunk_override:
+            print(
+                "[cppmega_fp8_shim] no-conv Mamba chunk override arm set -> "
+                f"{_noconv_chunk_override}"
+            )
     except Exception as _exc:  # pragma: no cover
         import sys
-        print(f"[cppmega_fp8_shim] MIMO patch failed: {_exc}", file=sys.stderr)
+        print(f"[cppmega_fp8_shim] Mamba config patch failed: {_exc}", file=sys.stderr)
 
 
 # -----------------------------------------------------------------------------
@@ -1845,7 +2049,7 @@ try:
     _TC_BASE_GETATTR = getattr(TransformerConfig, "__getattr__", None)
 
     def _cppmega_getattr(self, name):
-        if name.startswith("cppmega_mamba3_"):
+        if name.startswith(("cppmega_mamba3_", "cppmega_noconv_mamba_")):
             raise AttributeError(name)
         if _TC_BASE_GETATTR is not None:
             return _TC_BASE_GETATTR(self, name)
