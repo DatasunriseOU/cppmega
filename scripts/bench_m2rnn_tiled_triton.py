@@ -222,7 +222,7 @@ def main() -> None:
     print(f"shape B={B} S={S} H={H} K={K} V={V} iters={args.iters} tiles={tiles}")
     print("tile,num_tiles,latency_ms,peak_alloc,full_A,peak_tile_A,summary,ratio")
     if args.stage_profile:
-        print("stage,tile,local_ms,scan_ms,apply_ms,total_ms,scan_pct")
+        print("stage,tile,local_ms,scan_ms,apply_ms,total_ms,local_pct,scan_pct,apply_pct")
 
     dense_ref = None
     if args.check_dense:
@@ -271,11 +271,13 @@ def main() -> None:
                 warmup=args.warmup,
                 repeat=args.repeat,
             )
+            local_pct = 100.0 * local_ms / total_ms if total_ms > 0.0 else 0.0
             scan_pct = 100.0 * scan_ms / total_ms if total_ms > 0.0 else 0.0
+            apply_pct = 100.0 * apply_ms / total_ms if total_ms > 0.0 else 0.0
             print(
                 "stage,"
                 f"{tile},{local_ms:.6f},{scan_ms:.6f},{apply_ms:.6f},"
-                f"{total_ms:.6f},{scan_pct:.2f}"
+                f"{total_ms:.6f},{local_pct:.2f},{scan_pct:.2f},{apply_pct:.2f}"
             )
 
 

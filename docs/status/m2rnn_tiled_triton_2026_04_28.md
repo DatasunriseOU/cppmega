@@ -8,6 +8,153 @@ Branch: `worker/m2rnn-tiled-triton`
 
 Base: `0b7acbc5d18dead10ad206ee5c111e2cb08ab1ef`
 
+## H200 Feasibility Pass After `7ba45f4`
+
+### Search Pass
+
+Local context reviewed:
+
+- `cppmega/megatron/m2rnn_pararnn_tiled_triton.py`: bf16 callers are promoted to
+  fp32 for the Newton solve; the tiled path materializes `x_proj`, keeps only
+  tile summaries/carries for multi-tile solves, and replays the local recurrence
+  in the apply pass. It still does not materialize full `local_prefix` or full
+  `[Be,S,V,V]` Jacobians.
+- `scripts/bench_m2rnn_tiled_triton.py`: stage profiler existed, but only
+  printed `scan_pct`; this pass extended it to print local/scan/apply
+  percentages.
+- `docs/status/m2rnn_fwd_nsys_isolation_2026_04_27.md`: production Triton
+  `m2rnn_scan_triton` is a persistent per-`(batch, head)` recurrence kernel and
+  avoids full recurrent-state saves in the normal path.
+
+External docs checked:
+
+- Triton persistent matmul tutorial:
+  <https://triton-lang.org/main/getting-started/tutorials/09-persistent-matmul.html>
+  - persistent scheduling, TMA, and warp specialization are useful patterns for
+    matmul-like work, but the current ParaRNN prototype's expensive part is
+    scalar recurrence replay plus affine-summary traffic, not a large tensor
+    core matmul.
+- Triton `tl.associative_scan` API:
+  <https://triton-lang.org/main/python-api/generated/triton.language.associative_scan.html>
+  - tuple scans are expressible inside one Triton program, but this does not
+    remove the inter-tile/global prefix dependency across programs.
+- NVIDIA Hopper tuning guide:
+  <https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html>
+  - high-priority advice is still to parallelize sequential code, minimize
+    redundant global-memory accesses, and tune launch configuration. Hopper
+    occupancy remains bounded by 64 warps/SM, 64K registers/SM, and 255
+    registers/thread.
+- NVIDIA H200 specs:
+  <https://www.nvidia.com/en-in/data-center/h200/>
+  - H200 SXM is 141 GB HBM3e, 4.8 TB/s memory bandwidth, 1,979 TFLOPS BF16
+    tensor core with sparsity, and 3,958 TFLOPS FP8 tensor core with sparsity.
+- PyTorch CUDA Graphs blog:
+  <https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/>
+  - CUDA Graphs can remove CPU launch overhead for capture-safe static shapes,
+    but they do not reduce device-side local/apply replay work.
+
+### GB10 Profiling
+
+Environment:
+
+- GPU: NVIDIA GB10, compute capability 12.1
+- PyTorch: `2.13.0.dev20260417+cu132`
+- Triton: `3.7.0`
+
+Production baseline on the same shape:
+
+```bash
+BENCH_B=2 BENCH_S=4096 BENCH_H=44 BENCH_K=64 BENCH_V=16 \
+  BENCH_WARMUP=5 BENCH_ITERS=10 BENCH_TORCH=0 \
+  python -u scripts/bench_m2rnn.py
+```
+
+Result:
+
+| impl | latency |
+| --- | ---: |
+| production Triton fwd | 10.46 ms |
+| production Triton fwd+bwd | 19.22 ms |
+
+Full tiled forward, `B=2,S=4096,H=44,K=64,V=16,bf16,max_its=1`:
+
+```bash
+python -u scripts/bench_m2rnn_tiled_triton.py \
+  --B 2 --S 4096 --H 44 --K 64 --V 16 \
+  --tiles 16,32,64 --iters 1 --warmup 5 --repeat 10 --dtype bf16
+```
+
+| tile | num tiles | latency | peak alloc | summary | full-A avoided ratio |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | 256 | 124.721 ms | 5.98 GiB | 1.46 GiB | 256x |
+| 32 | 128 | 116.526 ms | 5.20 GiB | 748 MiB | 128x |
+| 64 | 64 | 113.017 ms | 4.82 GiB | 374 MiB | 64x |
+
+Warm-cache stage-only split for the same shape, `num_warps=1`:
+
+| tile | local | scan | apply | stage total | local pct | scan pct | apply pct |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | 67.770 ms | 15.971 ms | 65.807 ms | 149.548 ms | 45.32% | 10.68% | 44.00% |
+| 32 | 61.902 ms | 6.933 ms | 62.882 ms | 131.716 ms | 47.00% | 5.26% | 47.74% |
+| 64 | 60.475 ms | 3.934 ms | 59.163 ms | 123.572 ms | 48.94% | 3.18% | 47.88% |
+
+The isolated stage sum is not directly comparable to full-forward latency
+because each stage is measured in repeated isolation, but the percentages are
+clear: local construction and apply replay dominate; summary scan is already a
+single-digit percentage for tile32/tile64.
+
+### Tuning Attempt
+
+Tried the H200-oriented low-risk knob: tile size and Triton `num_warps`.
+
+Completed warm-cache stage rows:
+
+These rows came from a separate one-off `num_warps` probe and are used only
+for relative launch-shape comparison; do not mix the absolute times with the
+stage-profile table above.
+
+| tile | num_warps | local | scan | apply | total |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | 1 | 28.363 ms | 3.801 ms | 28.615 ms | 60.780 ms |
+| 32 | 2 | 68.638 ms | 3.726 ms | 54.092 ms | 126.456 ms |
+| 32 | 4 | 107.993 ms | 3.785 ms | 76.053 ms | 187.831 ms |
+| 64 | 1 | 27.868 ms | 1.848 ms | 27.121 ms | 56.837 ms |
+
+The `tile64,num_warps=2` one-off compile was stopped after roughly two minutes.
+The completed rows are enough to reject a `num_warps>1` runtime patch: this
+small-`V` recurrence wants one warp per CTA on GB10, and larger CTAs increase
+local/apply time instead of exposing useful parallelism.
+
+Tile64 is a small full-forward win over tile32 at this shape
+(`113.017 ms` vs `116.526 ms`, about 3.0%) and uses less summary/carry memory.
+It still remains roughly `10.8x` slower than production forward on the same
+GB10 shape (`113.017 / 10.46`). This is not a meaningful runtime patch.
+
+### H200 Hypothesis
+
+H200 helps capacity and bandwidth, but not enough for this algorithmic shape:
+
+- H200's 4.8 TB/s HBM is useful for the summary/carry traffic, but the summary
+  scan is only 3-5% at tile32/tile64. Even making scan free would not close the
+  gap to production.
+- Local and apply together are about 95-97% of the stage work at tile32/tile64.
+  They both redo the same per-token fp32 affine/tanh/residual work; H200 cannot
+  turn that into the single sequential persistent recurrence used by the
+  production kernel.
+- 8 GPUs do not parallelize one layer's sequence recurrence for a single tensor
+  parallel shard unless the algorithm is changed. Data/pipeline parallelism can
+  run more microbatches or layers concurrently, but each rank still pays the
+  extra local+apply work for its shard.
+- CUDA Graphs may reduce host launch overhead for static training, but the
+  measured tiled path is dominated by device kernels measured with CUDA events,
+  not Python launch overhead.
+
+Conclusion: do not continue this tiled ParaRNN Triton path as a production
+candidate unless the algorithm changes. A viable next attempt would need to
+remove the replayed local/apply work or use a different recurrence formulation;
+more SMs, more HBM, tile64, or `num_warps` tuning do not change the order of
+magnitude.
+
 ## Sixth Optimization Cycle After `ed2c702`
 
 ### Search Pass
