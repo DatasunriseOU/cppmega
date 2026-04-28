@@ -220,6 +220,12 @@ class TestNam56rNoconvSpecSource:
         assert "CppMegaM2RNNMixer" in text
         assert "r_layer_indices" in text
 
+    def test_passes_optional_noconv_chunk_size_to_mixer(self):
+        text = _read_spec_source()
+        assert "cppmega_noconv_mamba_chunk_size" in text
+        assert "noconv_chunk_size" in text
+        assert 'mixer_kwargs["chunk_size"] = noconv_chunk_size' in text
+
     def test_defines_build_function(self):
         text = _read_spec_source()
         assert "def build_cppmega_nam56r_noconv_stack_spec" in text
@@ -292,6 +298,6 @@ def test_selector_signature_matches_te_spec():
     params = set(sig.parameters.keys())
     required = {
         "self", "config", "d_model", "submodules", "layer_number",
-        "pg_collection", "pp_layer_offset", "r_layer_indices",
+        "pg_collection", "pp_layer_offset", "r_layer_indices", "noconv_chunk_size",
     }
     assert required.issubset(params), f"Missing params: {required - params}"

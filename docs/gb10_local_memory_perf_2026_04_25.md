@@ -1,8 +1,9 @@
 # GB10 Local Memory And Perf Session - 2026-04-25
 
 This note records the local single-GB10 changes and measurements for the
-NAM56R-quarter debug run. The run uses real 4k clang data, FlashAttention, Muon,
-bf16 no-master fallback, and quantized Muon momentum.
+NAM56R-quarter debug run. The run uses real 4k clang data, patched FA4 SM120
+attention routing on GB10 layers, Muon, bf16 no-master fallback, and quantized
+Muon momentum.
 
 ## Implemented In cppmega
 
@@ -13,7 +14,12 @@ bf16 no-master fallback, and quantized Muon momentum.
   a test that the default forward allocates checkpoints, not full `y`.
 - `scripts/local_gb10_quarter_train.sh`:
   - defaults `MEGATRON_BIAS_GELU_IMPL=te`;
-  - keeps FlashAttention pinned with `--use-flash-attn --attention-backend flash`;
+  - keeps `--use-flash-attn` enabled and lets the typed profile choose
+    `--attention-backend`; local GB10 now defaults to `flash` through the
+    patched `/home/dave/flash-attention-fa4` source tree, with `auto` reserved
+    for explicit fallback repros;
+  - prepends typed source roots from `CPPMEGA_EXTRA_PYTHONPATH` so MXFP8 and
+    BF16 runs use the same patched FlashAttention/TransformerEngine imports;
   - makes scalar fallback selectable via `CPPMEGA_MUON_SCALAR_OPTIMIZER`;
   - passes `--muon-quantized-momentum-block-size`;
   - hard-pins precision-aware storage, when enabled, to

@@ -65,6 +65,7 @@ class CppMegaNoConvSelectiveMambaMixer(nn.Module):
         pg_collection=None,
         pp_layer_offset: int = 0,
         r_layer_indices: Iterable[int] = (),
+        noconv_chunk_size: int | None = None,
     ) -> None:
         super().__init__()
         indices = frozenset(int(i) for i in r_layer_indices)
@@ -83,20 +84,36 @@ class CppMegaNoConvSelectiveMambaMixer(nn.Module):
             # positionally; pass via kwargs so the Mamba3 B/C mixer can duck-type
             # on ``MambaMixerSubmodules`` (same ``in_proj`` / ``out_proj`` shape
             # as ``NoConvMambaMixerSubmodules``).
-            self.impl = NoConvMamba3BCMixer(
-                config=config,
-                submodules=submodules,
-                d_model=d_model,
-                layer_number=layer_number,
-                pg_collection=pg_collection,
-                pp_layer_offset=pp_layer_offset,
-            )
+            mixer_kwargs = {
+                "config": config,
+                "submodules": submodules,
+                "d_model": d_model,
+                "layer_number": layer_number,
+                "pg_collection": pg_collection,
+                "pp_layer_offset": pp_layer_offset,
+            }
+            if noconv_chunk_size is not None:
+                mixer_kwargs["chunk_size"] = noconv_chunk_size
+            self.impl = NoConvMamba3BCMixer(**mixer_kwargs)
 
     def forward(self, *args, **kwargs):
         return self.impl(*args, **kwargs)
 
     def mamba_state_shapes_per_request(self):
         return self.impl.mamba_state_shapes_per_request()
+
+
+def _get_noconv_mamba_chunk_size(config) -> int | None:
+    raw = getattr(config, "cppmega_noconv_mamba_chunk_size", None)
+    if raw in (None, ""):
+        return None
+    chunk_size = int(raw)
+    if chunk_size <= 0 or chunk_size & (chunk_size - 1):
+        raise ValueError(
+            "cppmega_noconv_mamba_chunk_size must be a positive power of two, "
+            f"got {chunk_size}"
+        )
+    return chunk_size
 
 
 def build_cppmega_nam56r_noconv_stack_spec(config):
@@ -115,6 +132,10 @@ def build_cppmega_nam56r_noconv_stack_spec(config):
     r_layer_indices = load_r_layer_indices()
     upstream = mamba_stack_spec.submodules
     upstream_mamba_sub = upstream.mamba_layer.submodules
+    mixer_params = {"r_layer_indices": r_layer_indices}
+    noconv_chunk_size = _get_noconv_mamba_chunk_size(config)
+    if noconv_chunk_size is not None:
+        mixer_params["noconv_chunk_size"] = noconv_chunk_size
 
     submodules_kwargs = dict(
         mamba_layer=ModuleSpec(
@@ -130,7 +151,7 @@ def build_cppmega_nam56r_noconv_stack_spec(config):
                     # Megatron's ``MambaMixerSubmodules``, so we reuse the
                     # upstream TE-fused linear specs.
                     submodules=upstream_mamba_sub.mixer.submodules,
-                    params={"r_layer_indices": r_layer_indices},
+                    params=mixer_params,
                 ),
                 mamba_bda=upstream_mamba_sub.mamba_bda,
             ),
