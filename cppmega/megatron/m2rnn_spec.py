@@ -33,6 +33,10 @@ try:
         TRITON_AVAILABLE as _M2RNN_TRITON_AVAILABLE,
         m2rnn_scan_triton as _m2rnn_scan_triton,
     )
+    from cppmega.megatron.m2rnn_chunk_triton import (
+        m2rnn_scan_triton_chunked as _m2rnn_scan_triton_chunked,
+    )
+    _M2RNN_CHUNK_TRITON_AVAILABLE = True
 except ImportError:  # pragma: no cover
     import warnings
     warnings.warn(
@@ -44,6 +48,8 @@ except ImportError:  # pragma: no cover
     )
     _M2RNN_TRITON_AVAILABLE = False
     _m2rnn_scan_triton = None  # type: ignore[assignment]
+    _M2RNN_CHUNK_TRITON_AVAILABLE = False
+    _m2rnn_scan_triton_chunked = None  # type: ignore[assignment]
 
 
 def _softplus_decay_gate(x: torch.Tensor, A_log: torch.Tensor, dt_bias: torch.Tensor) -> torch.Tensor:
@@ -234,6 +240,12 @@ class CppMegaM2RNNMixer(nn.Module):
             and q.is_cuda
         ):
             out, _ = _m2rnn_scan_triton(q=q, k=k, v=v, W=self.state_weight, xf=f)
+        elif (
+            kernel_choice == "chunked"
+            and _M2RNN_CHUNK_TRITON_AVAILABLE
+            and q.is_cuda
+        ):
+            out, _ = _m2rnn_scan_triton_chunked(q=q, k=k, v=v, W=self.state_weight, xf=f)
         else:
             out, _ = _torch_m2rnn_forward(q=q, k=k, v=v, W=self.state_weight, xf=f)
         if self.D is not None:
