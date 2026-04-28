@@ -19,6 +19,22 @@ __device__ __forceinline__ int64_t div_floor_i64(int64_t x, int64_t y) {
   return x / y;
 }
 
+template <bool UseApproxTanh>
+__device__ __forceinline__ float m2rnn_tanhf(float x) {
+  if constexpr (UseApproxTanh) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 750)
+    float y;
+    asm("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+#else
+    return tanhf(x);
+#endif
+  } else {
+    return tanhf(x);
+  }
+}
+
+template <bool UseApproxTanh>
 __global__ __launch_bounds__(kThreads, 2) void m2rnn_tile_summary_kernel(
     const float* __restrict__ q,
     const float* __restrict__ k,
@@ -97,7 +113,7 @@ __global__ __launch_bounds__(kThreads, 2) void m2rnn_tile_summary_kernel(
       const int i = tid;
       const float f = xf[(static_cast<int64_t>(b) * S + s) * H + h];
       const float h_t = h_traj[((chain * S + s) * V) + i];
-      const float tanh_z = tanhf(z[i]);
+      const float tanh_z = m2rnn_tanhf<UseApproxTanh>(z[i]);
       h_new[i] = tanh_z;
       rhs[i] = -h_t + f * h_prev[i] + (1.0f - f) * tanh_z;
     }
@@ -156,6 +172,7 @@ __global__ __launch_bounds__(kThreads, 2) void m2rnn_tile_summary_kernel(
   }
 }
 
+template <bool UseApproxTanh>
 __global__ __launch_bounds__(kThreads, 2) void m2rnn_apply_tile_prefix_kernel(
     const float* __restrict__ q,
     const float* __restrict__ k,
@@ -236,7 +253,7 @@ __global__ __launch_bounds__(kThreads, 2) void m2rnn_apply_tile_prefix_kernel(
       const int i = tid;
       const float f = xf[(static_cast<int64_t>(b) * S + s) * H + h];
       const float h_t = h_traj[((chain * S + s) * V) + i];
-      const float tanh_z = tanhf(z[i]);
+      const float tanh_z = m2rnn_tanhf<UseApproxTanh>(z[i]);
       h_new[i] = tanh_z;
       rhs[i] = -h_t + f * h_prev[i] + (1.0f - f) * tanh_z;
     }
@@ -305,6 +322,7 @@ __device__ __forceinline__ float warp_sum(float x) {
   return x;
 }
 
+template <bool UseApproxTanh>
 __global__ __launch_bounds__(kWarpRowThreads, 1) void m2rnn_tile_summary_v16_warprow_kernel(
     const float* __restrict__ q,
     const float* __restrict__ k,
@@ -375,7 +393,7 @@ __global__ __launch_bounds__(kWarpRowThreads, 1) void m2rnn_tile_summary_v16_war
       const int i = tid;
       const float f = xf[(static_cast<int64_t>(b) * S + s) * H + h];
       const float h_t = h_traj[((chain * S + s) * kMaxV) + i];
-      const float tanh_z = tanhf(z[i]);
+      const float tanh_z = m2rnn_tanhf<UseApproxTanh>(z[i]);
       h_new[i] = tanh_z;
       rhs[i] = -h_t + f * h_prev[i] + (1.0f - f) * tanh_z;
     }
@@ -430,6 +448,7 @@ __global__ __launch_bounds__(kWarpRowThreads, 1) void m2rnn_tile_summary_v16_war
   }
 }
 
+template <bool UseApproxTanh>
 __global__ __launch_bounds__(kWarpRowThreads, 1) void m2rnn_apply_tile_prefix_v16_warprow_kernel(
     const float* __restrict__ q,
     const float* __restrict__ k,
@@ -502,7 +521,7 @@ __global__ __launch_bounds__(kWarpRowThreads, 1) void m2rnn_apply_tile_prefix_v1
       const int i = tid;
       const float f = xf[(static_cast<int64_t>(b) * S + s) * H + h];
       const float h_t = h_traj[((chain * S + s) * kMaxV) + i];
-      const float tanh_z = tanhf(z[i]);
+      const float tanh_z = m2rnn_tanhf<UseApproxTanh>(z[i]);
       h_new[i] = tanh_z;
       rhs[i] = -h_t + f * h_prev[i] + (1.0f - f) * tanh_z;
     }
@@ -850,7 +869,7 @@ void check_delta_shape(const at::Tensor& delta, int64_t Be, int64_t S, int64_t V
   }
 }
 
-void tile_summaries_out(
+void tile_summaries_out_impl(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
@@ -860,7 +879,8 @@ void tile_summaries_out(
     const at::Tensor& h0_row,
     const at::Tensor& tile_A,
     const at::Tensor& tile_b,
-    int64_t tile_size) {
+    int64_t tile_size,
+    bool use_approx_tanh) {
   check_problem_shapes(q, k, v, W, xf, h_traj, h0_row, tile_size);
 
   const int64_t B = q.size(0);
@@ -875,27 +895,47 @@ void tile_summaries_out(
 
   const c10::cuda::CUDAGuard device_guard(q.device());
   const int64_t blocks = Be * n_tiles;
-  m2rnn_tile_summary_kernel<<<static_cast<unsigned int>(blocks), kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
-      q.data_ptr<float>(),
-      k.data_ptr<float>(),
-      v.data_ptr<float>(),
-      W.data_ptr<float>(),
-      xf.data_ptr<float>(),
-      h_traj.data_ptr<float>(),
-      h0_row.data_ptr<float>(),
-      tile_A.data_ptr<float>(),
-      tile_b.data_ptr<float>(),
-      static_cast<int>(B),
-      static_cast<int>(S),
-      static_cast<int>(H),
-      static_cast<int>(K),
-      static_cast<int>(V),
-      static_cast<int>(tile_size),
-      static_cast<int>(n_tiles));
+  if (use_approx_tanh) {
+    m2rnn_tile_summary_kernel<true><<<static_cast<unsigned int>(blocks), kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        q.data_ptr<float>(),
+        k.data_ptr<float>(),
+        v.data_ptr<float>(),
+        W.data_ptr<float>(),
+        xf.data_ptr<float>(),
+        h_traj.data_ptr<float>(),
+        h0_row.data_ptr<float>(),
+        tile_A.data_ptr<float>(),
+        tile_b.data_ptr<float>(),
+        static_cast<int>(B),
+        static_cast<int>(S),
+        static_cast<int>(H),
+        static_cast<int>(K),
+        static_cast<int>(V),
+        static_cast<int>(tile_size),
+        static_cast<int>(n_tiles));
+  } else {
+    m2rnn_tile_summary_kernel<false><<<static_cast<unsigned int>(blocks), kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        q.data_ptr<float>(),
+        k.data_ptr<float>(),
+        v.data_ptr<float>(),
+        W.data_ptr<float>(),
+        xf.data_ptr<float>(),
+        h_traj.data_ptr<float>(),
+        h0_row.data_ptr<float>(),
+        tile_A.data_ptr<float>(),
+        tile_b.data_ptr<float>(),
+        static_cast<int>(B),
+        static_cast<int>(S),
+        static_cast<int>(H),
+        static_cast<int>(K),
+        static_cast<int>(V),
+        static_cast<int>(tile_size),
+        static_cast<int>(n_tiles));
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void tile_summaries_v16_warprow_out(
+void tile_summaries_out(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
@@ -906,6 +946,35 @@ void tile_summaries_v16_warprow_out(
     const at::Tensor& tile_A,
     const at::Tensor& tile_b,
     int64_t tile_size) {
+  tile_summaries_out_impl(q, k, v, W, xf, h_traj, h0_row, tile_A, tile_b, tile_size, false);
+}
+
+void tile_summaries_approx_tanh_out(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& W,
+    const at::Tensor& xf,
+    const at::Tensor& h_traj,
+    const at::Tensor& h0_row,
+    const at::Tensor& tile_A,
+    const at::Tensor& tile_b,
+    int64_t tile_size) {
+  tile_summaries_out_impl(q, k, v, W, xf, h_traj, h0_row, tile_A, tile_b, tile_size, true);
+}
+
+void tile_summaries_v16_warprow_out_impl(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& W,
+    const at::Tensor& xf,
+    const at::Tensor& h_traj,
+    const at::Tensor& h0_row,
+    const at::Tensor& tile_A,
+    const at::Tensor& tile_b,
+    int64_t tile_size,
+    bool use_approx_tanh) {
   check_problem_shapes(q, k, v, W, xf, h_traj, h0_row, tile_size);
 
   const int64_t B = q.size(0);
@@ -923,27 +992,78 @@ void tile_summaries_v16_warprow_out(
 
   const c10::cuda::CUDAGuard device_guard(q.device());
   const int64_t blocks = Be * n_tiles;
-  m2rnn_tile_summary_v16_warprow_kernel<<<
-      static_cast<unsigned int>(blocks),
-      kWarpRowThreads,
-      0,
-      at::cuda::getCurrentCUDAStream()>>>(
-      q.data_ptr<float>(),
-      k.data_ptr<float>(),
-      v.data_ptr<float>(),
-      W.data_ptr<float>(),
-      xf.data_ptr<float>(),
-      h_traj.data_ptr<float>(),
-      h0_row.data_ptr<float>(),
-      tile_A.data_ptr<float>(),
-      tile_b.data_ptr<float>(),
-      static_cast<int>(B),
-      static_cast<int>(S),
-      static_cast<int>(H),
-      static_cast<int>(K),
-      static_cast<int>(tile_size),
-      static_cast<int>(n_tiles));
+  if (use_approx_tanh) {
+    m2rnn_tile_summary_v16_warprow_kernel<true><<<
+        static_cast<unsigned int>(blocks),
+        kWarpRowThreads,
+        0,
+        at::cuda::getCurrentCUDAStream()>>>(
+        q.data_ptr<float>(),
+        k.data_ptr<float>(),
+        v.data_ptr<float>(),
+        W.data_ptr<float>(),
+        xf.data_ptr<float>(),
+        h_traj.data_ptr<float>(),
+        h0_row.data_ptr<float>(),
+        tile_A.data_ptr<float>(),
+        tile_b.data_ptr<float>(),
+        static_cast<int>(B),
+        static_cast<int>(S),
+        static_cast<int>(H),
+        static_cast<int>(K),
+        static_cast<int>(tile_size),
+        static_cast<int>(n_tiles));
+  } else {
+    m2rnn_tile_summary_v16_warprow_kernel<false><<<
+        static_cast<unsigned int>(blocks),
+        kWarpRowThreads,
+        0,
+        at::cuda::getCurrentCUDAStream()>>>(
+        q.data_ptr<float>(),
+        k.data_ptr<float>(),
+        v.data_ptr<float>(),
+        W.data_ptr<float>(),
+        xf.data_ptr<float>(),
+        h_traj.data_ptr<float>(),
+        h0_row.data_ptr<float>(),
+        tile_A.data_ptr<float>(),
+        tile_b.data_ptr<float>(),
+        static_cast<int>(B),
+        static_cast<int>(S),
+        static_cast<int>(H),
+        static_cast<int>(K),
+        static_cast<int>(tile_size),
+        static_cast<int>(n_tiles));
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void tile_summaries_v16_warprow_out(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& W,
+    const at::Tensor& xf,
+    const at::Tensor& h_traj,
+    const at::Tensor& h0_row,
+    const at::Tensor& tile_A,
+    const at::Tensor& tile_b,
+    int64_t tile_size) {
+  tile_summaries_v16_warprow_out_impl(q, k, v, W, xf, h_traj, h0_row, tile_A, tile_b, tile_size, false);
+}
+
+void tile_summaries_v16_warprow_approx_tanh_out(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& W,
+    const at::Tensor& xf,
+    const at::Tensor& h_traj,
+    const at::Tensor& h0_row,
+    const at::Tensor& tile_A,
+    const at::Tensor& tile_b,
+    int64_t tile_size) {
+  tile_summaries_v16_warprow_out_impl(q, k, v, W, xf, h_traj, h0_row, tile_A, tile_b, tile_size, true);
 }
 
 std::vector<at::Tensor> tile_summaries(
@@ -972,7 +1092,7 @@ std::vector<at::Tensor> tile_summaries(
   return {tile_A, tile_b};
 }
 
-void apply_tile_prefixes_out(
+void apply_tile_prefixes_out_impl(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
@@ -982,7 +1102,8 @@ void apply_tile_prefixes_out(
     const at::Tensor& h0_row,
     const at::Tensor& tile_inputs,
     const at::Tensor& delta,
-    int64_t tile_size) {
+    int64_t tile_size,
+    bool use_approx_tanh) {
   check_problem_shapes(q, k, v, W, xf, h_traj, h0_row, tile_size);
 
   const int64_t B = q.size(0);
@@ -997,27 +1118,47 @@ void apply_tile_prefixes_out(
 
   const c10::cuda::CUDAGuard device_guard(q.device());
   const int64_t blocks = Be * n_tiles;
-  m2rnn_apply_tile_prefix_kernel<<<static_cast<unsigned int>(blocks), kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
-      q.data_ptr<float>(),
-      k.data_ptr<float>(),
-      v.data_ptr<float>(),
-      W.data_ptr<float>(),
-      xf.data_ptr<float>(),
-      h_traj.data_ptr<float>(),
-      h0_row.data_ptr<float>(),
-      tile_inputs.data_ptr<float>(),
-      delta.data_ptr<float>(),
-      static_cast<int>(B),
-      static_cast<int>(S),
-      static_cast<int>(H),
-      static_cast<int>(K),
-      static_cast<int>(V),
-      static_cast<int>(tile_size),
-      static_cast<int>(n_tiles));
+  if (use_approx_tanh) {
+    m2rnn_apply_tile_prefix_kernel<true><<<static_cast<unsigned int>(blocks), kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        q.data_ptr<float>(),
+        k.data_ptr<float>(),
+        v.data_ptr<float>(),
+        W.data_ptr<float>(),
+        xf.data_ptr<float>(),
+        h_traj.data_ptr<float>(),
+        h0_row.data_ptr<float>(),
+        tile_inputs.data_ptr<float>(),
+        delta.data_ptr<float>(),
+        static_cast<int>(B),
+        static_cast<int>(S),
+        static_cast<int>(H),
+        static_cast<int>(K),
+        static_cast<int>(V),
+        static_cast<int>(tile_size),
+        static_cast<int>(n_tiles));
+  } else {
+    m2rnn_apply_tile_prefix_kernel<false><<<static_cast<unsigned int>(blocks), kThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        q.data_ptr<float>(),
+        k.data_ptr<float>(),
+        v.data_ptr<float>(),
+        W.data_ptr<float>(),
+        xf.data_ptr<float>(),
+        h_traj.data_ptr<float>(),
+        h0_row.data_ptr<float>(),
+        tile_inputs.data_ptr<float>(),
+        delta.data_ptr<float>(),
+        static_cast<int>(B),
+        static_cast<int>(S),
+        static_cast<int>(H),
+        static_cast<int>(K),
+        static_cast<int>(V),
+        static_cast<int>(tile_size),
+        static_cast<int>(n_tiles));
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void apply_tile_prefixes_v16_warprow_out(
+void apply_tile_prefixes_out(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
@@ -1028,6 +1169,35 @@ void apply_tile_prefixes_v16_warprow_out(
     const at::Tensor& tile_inputs,
     const at::Tensor& delta,
     int64_t tile_size) {
+  apply_tile_prefixes_out_impl(q, k, v, W, xf, h_traj, h0_row, tile_inputs, delta, tile_size, false);
+}
+
+void apply_tile_prefixes_approx_tanh_out(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& W,
+    const at::Tensor& xf,
+    const at::Tensor& h_traj,
+    const at::Tensor& h0_row,
+    const at::Tensor& tile_inputs,
+    const at::Tensor& delta,
+    int64_t tile_size) {
+  apply_tile_prefixes_out_impl(q, k, v, W, xf, h_traj, h0_row, tile_inputs, delta, tile_size, true);
+}
+
+void apply_tile_prefixes_v16_warprow_out_impl(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& W,
+    const at::Tensor& xf,
+    const at::Tensor& h_traj,
+    const at::Tensor& h0_row,
+    const at::Tensor& tile_inputs,
+    const at::Tensor& delta,
+    int64_t tile_size,
+    bool use_approx_tanh) {
   check_problem_shapes(q, k, v, W, xf, h_traj, h0_row, tile_size);
 
   const int64_t B = q.size(0);
@@ -1045,27 +1215,78 @@ void apply_tile_prefixes_v16_warprow_out(
 
   const c10::cuda::CUDAGuard device_guard(q.device());
   const int64_t blocks = Be * n_tiles;
-  m2rnn_apply_tile_prefix_v16_warprow_kernel<<<
-      static_cast<unsigned int>(blocks),
-      kWarpRowThreads,
-      0,
-      at::cuda::getCurrentCUDAStream()>>>(
-      q.data_ptr<float>(),
-      k.data_ptr<float>(),
-      v.data_ptr<float>(),
-      W.data_ptr<float>(),
-      xf.data_ptr<float>(),
-      h_traj.data_ptr<float>(),
-      h0_row.data_ptr<float>(),
-      tile_inputs.data_ptr<float>(),
-      delta.data_ptr<float>(),
-      static_cast<int>(B),
-      static_cast<int>(S),
-      static_cast<int>(H),
-      static_cast<int>(K),
-      static_cast<int>(tile_size),
-      static_cast<int>(n_tiles));
+  if (use_approx_tanh) {
+    m2rnn_apply_tile_prefix_v16_warprow_kernel<true><<<
+        static_cast<unsigned int>(blocks),
+        kWarpRowThreads,
+        0,
+        at::cuda::getCurrentCUDAStream()>>>(
+        q.data_ptr<float>(),
+        k.data_ptr<float>(),
+        v.data_ptr<float>(),
+        W.data_ptr<float>(),
+        xf.data_ptr<float>(),
+        h_traj.data_ptr<float>(),
+        h0_row.data_ptr<float>(),
+        tile_inputs.data_ptr<float>(),
+        delta.data_ptr<float>(),
+        static_cast<int>(B),
+        static_cast<int>(S),
+        static_cast<int>(H),
+        static_cast<int>(K),
+        static_cast<int>(tile_size),
+        static_cast<int>(n_tiles));
+  } else {
+    m2rnn_apply_tile_prefix_v16_warprow_kernel<false><<<
+        static_cast<unsigned int>(blocks),
+        kWarpRowThreads,
+        0,
+        at::cuda::getCurrentCUDAStream()>>>(
+        q.data_ptr<float>(),
+        k.data_ptr<float>(),
+        v.data_ptr<float>(),
+        W.data_ptr<float>(),
+        xf.data_ptr<float>(),
+        h_traj.data_ptr<float>(),
+        h0_row.data_ptr<float>(),
+        tile_inputs.data_ptr<float>(),
+        delta.data_ptr<float>(),
+        static_cast<int>(B),
+        static_cast<int>(S),
+        static_cast<int>(H),
+        static_cast<int>(K),
+        static_cast<int>(tile_size),
+        static_cast<int>(n_tiles));
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void apply_tile_prefixes_v16_warprow_out(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& W,
+    const at::Tensor& xf,
+    const at::Tensor& h_traj,
+    const at::Tensor& h0_row,
+    const at::Tensor& tile_inputs,
+    const at::Tensor& delta,
+    int64_t tile_size) {
+  apply_tile_prefixes_v16_warprow_out_impl(q, k, v, W, xf, h_traj, h0_row, tile_inputs, delta, tile_size, false);
+}
+
+void apply_tile_prefixes_v16_warprow_approx_tanh_out(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& W,
+    const at::Tensor& xf,
+    const at::Tensor& h_traj,
+    const at::Tensor& h0_row,
+    const at::Tensor& tile_inputs,
+    const at::Tensor& delta,
+    int64_t tile_size) {
+  apply_tile_prefixes_v16_warprow_out_impl(q, k, v, W, xf, h_traj, h0_row, tile_inputs, delta, tile_size, true);
 }
 
 at::Tensor apply_tile_prefixes(
@@ -1199,11 +1420,15 @@ std::vector<at::Tensor> local_tile_scan_debug(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("tile_summaries", &tile_summaries, "M2RNN local tile summaries (CUDA)");
   m.def("tile_summaries_out", &tile_summaries_out, "M2RNN local tile summaries into preallocated outputs (CUDA)");
+  m.def("tile_summaries_approx_tanh_out", &tile_summaries_approx_tanh_out, "M2RNN local tile summaries with tanh.approx into preallocated outputs (CUDA)");
   m.def("tile_summaries_v16_warprow_out", &tile_summaries_v16_warprow_out, "M2RNN V=16 warp-per-row tile summaries into preallocated outputs (CUDA)");
+  m.def("tile_summaries_v16_warprow_approx_tanh_out", &tile_summaries_v16_warprow_approx_tanh_out, "M2RNN V=16 warp-per-row tile summaries with tanh.approx into preallocated outputs (CUDA)");
   m.def("scan_tile_summaries", &scan_tile_summaries, "M2RNN tile summary prefix scan (CUDA)");
   m.def("scan_tile_summaries_out", &scan_tile_summaries_out, "M2RNN tile summary prefix scan into preallocated output (CUDA)");
   m.def("apply_tile_prefixes", &apply_tile_prefixes, "M2RNN recompute tile-prefix apply (CUDA)");
   m.def("apply_tile_prefixes_out", &apply_tile_prefixes_out, "M2RNN recompute tile-prefix apply into preallocated output (CUDA)");
+  m.def("apply_tile_prefixes_approx_tanh_out", &apply_tile_prefixes_approx_tanh_out, "M2RNN recompute tile-prefix apply with tanh.approx into preallocated output (CUDA)");
   m.def("apply_tile_prefixes_v16_warprow_out", &apply_tile_prefixes_v16_warprow_out, "M2RNN V=16 warp-per-row recompute tile-prefix apply into preallocated output (CUDA)");
+  m.def("apply_tile_prefixes_v16_warprow_approx_tanh_out", &apply_tile_prefixes_v16_warprow_approx_tanh_out, "M2RNN V=16 warp-per-row recompute tile-prefix apply with tanh.approx into preallocated output (CUDA)");
   m.def("local_tile_scan_debug", &local_tile_scan_debug, "M2RNN local tiled affine scan debug (CUDA)");
 }

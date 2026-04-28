@@ -12,6 +12,7 @@ from cppmega.megatron.m2rnn_pararnn_tiled_cuda import (
     TiledCudaPararnnConfig,
     _scan_tile_summaries,
     _scan_tile_summaries_python,
+    _use_approx_tanh,
     _use_warprow_v16,
     local_tile_scan_debug,
     memory_accounting_bytes,
@@ -32,6 +33,17 @@ def test_warprow_v16_stays_opt_in(monkeypatch):
     monkeypatch.setenv("CPPMEGA_M2RNN_WARPROW_V16", "1")
     assert _use_warprow_v16(V=16, tile_size=32) is True
     assert _use_warprow_v16(V=8, tile_size=32) is False
+
+
+def test_approx_tanh_stays_opt_in(monkeypatch):
+    monkeypatch.delenv("CPPMEGA_M2RNN_APPROX_TANH", raising=False)
+    assert _use_approx_tanh() is False
+
+    monkeypatch.setenv("CPPMEGA_M2RNN_APPROX_TANH", "0")
+    assert _use_approx_tanh() is False
+
+    monkeypatch.setenv("CPPMEGA_M2RNN_APPROX_TANH", "1")
+    assert _use_approx_tanh() is True
 
 
 def _torch_m2rnn_forward(q, k, v, W, xf, *, h0=None):

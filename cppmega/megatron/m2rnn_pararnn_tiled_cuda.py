@@ -131,6 +131,12 @@ def _use_warprow_v16(V: int, tile_size: int) -> bool:
     return V == 16 and os.environ.get("CPPMEGA_M2RNN_WARPROW_V16", "0") == "1"
 
 
+def _use_approx_tanh() -> bool:
+    """Opt in to CUDA ``tanh.approx.f32`` to mirror Triton's fast path."""
+
+    return os.environ.get("CPPMEGA_M2RNN_APPROX_TANH", "0") == "1"
+
+
 def _make_h0_row(
     h0: Optional[torch.Tensor],
     *,
@@ -200,12 +206,19 @@ def m2rnn_pararnn_tiled_cuda_forward(
     ext = _load_cuda_ext()
 
     for _ in range(config.max_its):
+        use_approx_tanh = _use_approx_tanh()
         if _use_warprow_v16(V, int(config.tile_size)):
             summary_out = ext.tile_summaries_v16_warprow_out
             apply_out = ext.apply_tile_prefixes_v16_warprow_out
+            if use_approx_tanh:
+                summary_out = ext.tile_summaries_v16_warprow_approx_tanh_out
+                apply_out = ext.apply_tile_prefixes_v16_warprow_approx_tanh_out
         else:
             summary_out = ext.tile_summaries_out
             apply_out = ext.apply_tile_prefixes_out
+            if use_approx_tanh:
+                summary_out = ext.tile_summaries_approx_tanh_out
+                apply_out = ext.apply_tile_prefixes_approx_tanh_out
 
         summary_out(
             qf,

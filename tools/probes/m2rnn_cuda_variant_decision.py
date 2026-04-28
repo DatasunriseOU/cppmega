@@ -219,14 +219,26 @@ def main() -> int:
     q, k, v, W, xf = _make_inputs(args.B, args.S, args.H, args.K, args.V, dtype, args.seed)
     config = TiledCudaPararnnConfig(max_its=args.max_its, tile_size=args.tile_size)
 
-    with _temporary_env("CPPMEGA_M2RNN_WARPROW_V16", None):
+    with _temporary_env("CPPMEGA_M2RNN_WARPROW_V16", None), _temporary_env("CPPMEGA_M2RNN_APPROX_TANH", None):
         default = _time_cuda_fn(
             lambda: m2rnn_pararnn_tiled_cuda_forward(q, k, v, W, xf, config=config),
             warmup=args.warmup,
             iters=args.iters,
         )
-    with _temporary_env("CPPMEGA_M2RNN_WARPROW_V16", "1"):
+    with _temporary_env("CPPMEGA_M2RNN_WARPROW_V16", None), _temporary_env("CPPMEGA_M2RNN_APPROX_TANH", "1"):
+        approx_tanh = _time_cuda_fn(
+            lambda: m2rnn_pararnn_tiled_cuda_forward(q, k, v, W, xf, config=config),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+    with _temporary_env("CPPMEGA_M2RNN_WARPROW_V16", "1"), _temporary_env("CPPMEGA_M2RNN_APPROX_TANH", None):
         warprow = _time_cuda_fn(
+            lambda: m2rnn_pararnn_tiled_cuda_forward(q, k, v, W, xf, config=config),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
+    with _temporary_env("CPPMEGA_M2RNN_WARPROW_V16", "1"), _temporary_env("CPPMEGA_M2RNN_APPROX_TANH", "1"):
+        warprow_approx_tanh = _time_cuda_fn(
             lambda: m2rnn_pararnn_tiled_cuda_forward(q, k, v, W, xf, config=config),
             warmup=args.warmup,
             iters=args.iters,
@@ -242,12 +254,14 @@ def main() -> int:
     variants = []
     for name, values in (
         ("cuda_default", default),
+        ("cuda_approx_tanh_opt_in", approx_tanh),
         ("cuda_v16_warprow_opt_in", warprow),
+        ("cuda_v16_warprow_approx_tanh_opt_in", warprow_approx_tanh),
         ("triton_reference", triton),
     ):
         event_ms = float(values["event_ms_per_iter"])
         decision = "active_reference" if name == "triton_reference" else "default"
-        if name == "cuda_v16_warprow_opt_in":
+        if name.startswith("cuda_") and name != "cuda_default":
             decision = _variant_decision(default_event, event_ms, args.threshold)
         variants.append(
             {
@@ -258,7 +272,10 @@ def main() -> int:
             }
         )
 
-    best_cuda = min(variants[:2], key=lambda row: float(row["event_ms_per_iter"]))
+    best_cuda = min(
+        [row for row in variants if str(row["name"]).startswith("cuda_")],
+        key=lambda row: float(row["event_ms_per_iter"]),
+    )
     recommendation = "pause_cuda_production_work_keep_resource_diagnostic_branch"
     if best_cuda["name"] != "cuda_default" and best_cuda["decision"] == "continue_candidate":
         recommendation = f"continue_cuda_candidate_{best_cuda['name']}"

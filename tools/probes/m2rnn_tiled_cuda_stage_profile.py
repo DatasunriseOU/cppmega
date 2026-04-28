@@ -23,6 +23,7 @@ from cppmega.megatron.m2rnn_pararnn_tiled_cuda import (  # noqa: E402
     _broadcast_heads,
     _load_cuda_ext,
     _make_h0_row,
+    _use_approx_tanh,
     _use_warprow_v16,
     m2rnn_pararnn_tiled_cuda_forward,
 )
@@ -87,14 +88,23 @@ def _profile_once(args: argparse.Namespace, q, k, v, W, xf, ext) -> dict[str, ob
     h0_row = _make_h0_row(None, B=B, H=H, K=K, V=V, device=q.device, dtype=torch.float32)
     Be = B * H * K
     n_tiles = (S + args.tile_size - 1) // args.tile_size
+    use_approx_tanh = _use_approx_tanh()
     if _use_warprow_v16(V, args.tile_size):
         summary_out = ext.tile_summaries_v16_warprow_out
         apply_out = ext.apply_tile_prefixes_v16_warprow_out
         kernel_variant = "v16_warprow"
+        if use_approx_tanh:
+            summary_out = ext.tile_summaries_v16_warprow_approx_tanh_out
+            apply_out = ext.apply_tile_prefixes_v16_warprow_approx_tanh_out
+            kernel_variant = "v16_warprow_approx_tanh"
     else:
         summary_out = ext.tile_summaries_out
         apply_out = ext.apply_tile_prefixes_out
         kernel_variant = "baseline"
+        if use_approx_tanh:
+            summary_out = ext.tile_summaries_approx_tanh_out
+            apply_out = ext.apply_tile_prefixes_approx_tanh_out
+            kernel_variant = "baseline_approx_tanh"
 
     (h, gpu_ms, wall_ms) = _event_time_ms(lambda: torch.zeros(Be, S, V, device=q.device, dtype=torch.float32))
     stages["h_alloc_gpu_ms"].append(gpu_ms)
