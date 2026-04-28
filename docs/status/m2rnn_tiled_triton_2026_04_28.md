@@ -8,6 +8,182 @@ Branch: `worker/m2rnn-tiled-triton`
 
 Base: `0b7acbc5d18dead10ad206ee5c111e2cb08ab1ef`
 
+## Sixth Optimization Cycle After `ed2c702`
+
+### Search Pass
+
+Local context reviewed:
+
+- `cppmega/megatron/m2rnn_pararnn_tiled_triton.py`: current strong path is
+  zero/local-prefix-free, GPU summary scan, fused update, and the one-tile fast
+  path from `ed2c702`.
+- `scripts/bench_m2rnn_tiled_triton.py`: existing full-latency and stage split
+  are sufficient for kernel timing, but do not produce a dense/tiled/optional
+  TileLang decision table.
+- Prior notes in this file: tile64 has high first-use compile cost from
+  `tl.static_range(64)`, and tile32 became the conservative default.
+- Repo search found no importable in-tree M2RNN TileLang shared-old callable;
+  the new decision tool therefore accepts an optional `MODULE:FUNC` hook.
+
+External sources checked:
+
+- Triton debugging guide:
+  <https://triton-lang.org/main/programming-guide/chapter-3/debugging.html>
+  - `TRITON_INTERPRET=1`, `device_assert`, and compute-sanitizer remain the
+    practical debug path.
+- Triton persistent matmul tutorial:
+  <https://triton-lang.org/main/getting-started/tutorials/09-persistent-matmul.html>
+  - persistent scheduling and `launch_metadata` are useful patterns, but a
+    persistent rewrite is larger than a safe one-cycle patch.
+- `tl.associative_scan` API:
+  <https://triton-lang.org/main/python-api/generated/triton.language.associative_scan.html>
+  - tuple-input custom scans are expressible inside one program; they do not
+    remove the need for an inter-program/global prefix across tile summaries.
+- `triton.heuristics` API:
+  <https://triton-lang.org/main/python-api/generated/triton.heuristics.html>
+  - useful when autotune is too expensive, but this pass did not find a robust
+    runtime tile heuristic worth shipping.
+- `triton.jit` API:
+  <https://triton-lang.org/main/python-api/generated/triton.jit.html>
+  - `launch_metadata` is available for future profiler naming/metadata.
+
+### Baseline Profiling
+
+Environment:
+
+- GPU: NVIDIA GB10, compute capability 12.1
+- PyTorch: `2.13.0.dev20260417+cu132`
+- Triton: `3.7.0`
+
+Main commands:
+
+```bash
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 16 --H 4 --K 16 --V 16 --tiles 16,32,64 --iters 1 --warmup 10 --repeat 100 --dtype fp32
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 16 --H 4 --K 16 --V 16 --tiles 16,32,64 --iters 1 --warmup 10 --repeat 100 --dtype bf16
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 32 --H 4 --K 16 --V 16 --tiles 16,32,64 --iters 1 --warmup 10 --repeat 100 --dtype fp32
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 32 --H 4 --K 16 --V 16 --tiles 16,32,64 --iters 1 --warmup 10 --repeat 100 --dtype bf16
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 512 --H 4 --K 16 --V 16 --tiles 16,32,64 --iters 1 --warmup 5 --repeat 50 --dtype fp32
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 512 --H 4 --K 16 --V 16 --tiles 16,32,64 --iters 1 --warmup 5 --repeat 50 --dtype bf16
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 4096 --H 4 --K 16 --V 16 --tiles 16,32,64 --iters 1 --warmup 5 --repeat 20 --dtype fp32
+python -u scripts/bench_m2rnn_tiled_triton.py --B 1 --S 8192 --H 4 --K 16 --V 16 --tiles 16,32,64 --iters 1 --warmup 5 --repeat 20 --dtype fp32
+```
+
+Warm-cache full forward latency:
+
+| dtype | S | tile16 | tile32 | tile64 |
+| --- | ---: | ---: | ---: | ---: |
+| fp32 | 16 | 0.075 ms | 0.075 ms | 0.075 ms |
+| bf16 | 16 | 0.097 ms | 0.095 ms | 0.095 ms |
+| fp32 | 32 | 0.092 ms | 0.073 ms | 0.074 ms |
+| bf16 | 32 | 0.113 ms | 0.094 ms | 0.095 ms |
+| fp32 | 512 | 0.104 ms | 0.105 ms | 0.101 ms |
+| bf16 | 512 | 0.118 ms | 0.118 ms | 0.116 ms |
+| fp32 | 4096 | 1.196 ms | 1.099 ms | 1.121 ms |
+| bf16 | 4096 | 1.311 ms | 1.162 ms | 1.144 ms |
+| fp32 | 8192 | 2.677 ms | 2.463 ms | 2.470 ms |
+| bf16 | 8192 | 2.764 ms | 2.535 ms | 2.534 ms |
+
+Stage-profile examples:
+
+| dtype | S | tile | local | scan | apply | scan pct |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| fp32 | 16 | 16 | 0.005222 ms | 0.000775 ms | 0.005184 ms | 6.93% |
+| fp32 | 16 | 32 | 0.007043 ms | 0.000779 ms | 0.006536 ms | 5.42% |
+| fp32 | 512 | 16 | 0.038595 ms | 0.008196 ms | 0.026797 ms | 11.14% |
+| fp32 | 512 | 32 | 0.042775 ms | 0.004437 ms | 0.028685 ms | 5.85% |
+| fp32 | 4096 | 16 | 0.573722 ms | 0.074182 ms | 0.564925 ms | 6.12% |
+| fp32 | 4096 | 32 | 0.319517 ms | 0.029658 ms | 0.307760 ms | 4.51% |
+| bf16 | 8192 | 16 | 1.380285 ms | 0.550342 ms | 1.444944 ms | 16.30% |
+| bf16 | 8192 | 32 | 1.351267 ms | 0.074330 ms | 1.360131 ms | 2.67% |
+
+Tile64 stage profiling was intentionally not completed for this cycle: the
+stage profiler uses the old local/scan/apply kernels and first-use compilation
+for `TILE=64` repeatedly spent around 1-2 minutes. Full-forward tile64 was
+measured after compilation and is included above.
+
+### Decision
+
+No runtime patch shipped:
+
+- A tile-size heuristic is not robust enough. Tile64 is sometimes a small
+  warm-cache win, but it still carries a large compile cost and previous cycles
+  already moved the default away from 64 for that reason.
+- Tile16 is useful for compile/debug loops but did not beat tile32 or tile64 at
+  target shapes.
+- Summary scan is still not the main long-shape cost for tile32; local/apply
+  dominate. The next runtime attempt should target less replay or a large-tile
+  loop form with lower compile cost, not a blind tile default change.
+
+### Tooling Patch
+
+Added `scripts/bench_m2rnn_pararnn_decision.py`:
+
+- Emits CSV rows for dense ParaRNN, tiled Triton tile sweeps, and an optional
+  TileLang/shared-old callable passed as `--tilelang-callable MODULE:FUNC`.
+- Dense reference is gated by `--dense-max-S` so long sequences do not stall the
+  sweep.
+- Reports latency, peak allocation, summary bytes, num tiles, and max
+  `out`/`h_final` errors when a dense reference is available.
+- Prints per-shape best tiled tile decisions to stderr.
+
+Decision-tool command:
+
+```bash
+python -u scripts/bench_m2rnn_pararnn_decision.py --sizes 16,32,512,4096,8192 --tiles 16,32,64 --dtypes fp32,bf16 --B 1 --H 4 --K 16 --V 16 --iters 1 --warmup 5 --repeat 20 --dense-max-S 32
+```
+
+Selected rows:
+
+| impl | dtype | S | tile | latency | max_out | max_h |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| dense | fp32 | 16 | - | 0.396560 ms | 0 | 0 |
+| tiled | fp32 | 16 | 64 | 0.075522 ms | 6.005168e-06 | 3.695488e-06 |
+| dense | fp32 | 32 | - | 0.439400 ms | 0 | 0 |
+| tiled | fp32 | 32 | 64 | 0.074320 ms | 9.298325e-06 | 5.841255e-06 |
+| tiled | fp32 | 512 | 64 | 0.102627 ms | - | - |
+| tiled | fp32 | 4096 | 64 | 1.131525 ms | - | - |
+| tiled | fp32 | 8192 | 64 | 2.462307 ms | - | - |
+| dense | bf16 | 16 | - | 0.410250 ms | 0 | 0 |
+| tiled | bf16 | 16 | 64 | 0.095298 ms | 7.629395e-06 | 6.103516e-05 |
+| dense | bf16 | 32 | - | 0.458032 ms | 0 | 0 |
+| tiled | bf16 | 32 | 64 | 0.095488 ms | 9.765625e-04 | 9.765625e-04 |
+| tiled | bf16 | 512 | 64 | 0.130867 ms | - | - |
+| tiled | bf16 | 4096 | 64 | 1.144227 ms | - | - |
+| tiled | bf16 | 8192 | 64 | 2.532525 ms | - | - |
+
+The tool reported `tilelang_status=not_requested`; repo search found no
+in-tree shared-old callable to import automatically.
+
+### Validation
+
+```bash
+python -m py_compile scripts/bench_m2rnn_pararnn_decision.py scripts/bench_m2rnn_tiled_triton.py cppmega/megatron/m2rnn_pararnn_tiled_triton.py
+python -u scripts/bench_m2rnn_pararnn_decision.py --sizes 16,32 --tiles 16,32 --dtypes fp32,bf16 --B 1 --H 1 --K 2 --V 4 --iters 1 --warmup 2 --repeat 5 --dense-max-S 32
+pytest -q tests/test_m2rnn_pararnn_tiled_triton.py
+```
+
+Results:
+
+- `py_compile`: passed.
+- Decision smoke: passed, with fp32 max errors <= `1.817942e-06` and bf16 max
+  errors `0.0` on the small smoke shape.
+- `tests/test_m2rnn_pararnn_tiled_triton.py`: 7 passed.
+
+### CUDA Copy Notes
+
+CUDA should copy the Triton mapping rather than the Python wrapper:
+
+- One program/block per `Be = B * H * K` row and tile id for local/apply.
+- Keep `V` in registers, load `W^T` once per row/tile, and compute
+  `z = W^T h_prev + x`.
+- Preserve the one-tile fast path: start carry at zero and write updated
+  `h_next` in one launch, with no summary/carry buffers.
+- For multi-tile, keep only tile summaries `(M_tile, b_tile)` plus carries;
+  do not materialize `[Be,S,V,V]`.
+- Be cautious with tile64: warm-cache runtime can win, but compile cost is high
+  with fully unrolled `static_range(64)`. CUDA can copy the arithmetic mapping
+  while using a normal loop/unroll policy.
+
 ## Fifth Optimization Cycle After `2ca204b`
 
 ### Search Pass
