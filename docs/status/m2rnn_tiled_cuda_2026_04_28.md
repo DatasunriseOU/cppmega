@@ -571,3 +571,176 @@ warp per row does not improve active occupancy or the `P @ M` inner loop, so it
 regresses total time.  The next promising strategy should attack the matrix
 composition itself: split the length-16 `P @ M` reductions across lanes or
 avoid recomputing the full dense prefix in both summary and apply.
+
+## Optimization Cycle 5 - 2026-04-28
+
+Continuation base requested by user: `c3a22a4`.  No git commit was created.
+
+### Search / References
+
+Local context reviewed:
+
+- `cppmega/megatron/m2rnn_pararnn_tiled_cuda.py`
+- `cppmega/megatron/cuda_ext/m2rnn_tiled_affine_scan.cu`
+- `tools/probes/m2rnn_tiled_cuda_stage_profile.py`
+- `tools/probes/m2rnn_pararnn_tiled_cuda_probe.py`
+- `tests/test_m2rnn_pararnn_tiled_cuda.py`
+- prior sections in this status file
+
+External CUDA/CUB references checked before patching:
+
+- NVIDIA CUDA Occupancy Calculator: occupancy is active warps divided by
+  maximum warps, and registers/shared memory constrain active blocks per SM.
+  https://docs.nvidia.com/cuda/archive/11.7.1/cuda-occupancy-calculator/index.html
+- CUDA C++ Programming Guide: occupancy APIs such as
+  `cudaOccupancyMaxActiveBlocksPerMultiprocessor` predict active blocks from
+  block size and shared memory, then derive active warps/occupancy.
+  https://docs.nvidia.com/cuda/archive/12.4.1/cuda-c-programming-guide/index.html
+- CUDA C++ Best Practices Guide: register allocation and shared-memory
+  partitioning make occupancy/resource tradeoffs architecture dependent.
+  https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html
+- CCCL/CUB `WarpScan`: useful for warp-wide collectives, but not directly
+  decisive here because the measured scan stage remains negligible.
+  https://nvidia.github.io/cccl/cub/api/classcub_1_1WarpScan.html
+
+### Decision Probe / Patch
+
+Added `tools/probes/m2rnn_cuda_variant_decision.py`.  It compares, on the same
+input tensors and shape:
+
+- default tiled CUDA,
+- opt-in `CPPMEGA_M2RNN_WARPROW_V16=1`,
+- Triton reference forward.
+
+The probe emits JSON and a Markdown decision doc:
+
+- `docs/status/m2rnn_cuda_variant_decision_2026_04_28.md`
+
+It encodes the decision rule for this branch: a CUDA candidate must beat the
+default CUDA path by more than `20%` on CUDA-event timing before it becomes a
+production follow-up candidate.  Otherwise the CUDA branch stays
+resource/diagnostic and Triton remains the active path.
+
+The probe now refuses to run by default if `nvidia-smi` reports unrelated CUDA
+compute processes.  This was added after later retry runs were polluted by
+concurrent `pretrain_mamba.py`, kernel bench, and pytest processes on the same
+GB10.
+
+Added a unit test that proves the slow warprow path stays opt-in:
+
+- no env var: disabled,
+- `CPPMEGA_M2RNN_WARPROW_V16=0`: disabled,
+- `CPPMEGA_M2RNN_WARPROW_V16=1` with `V=16`: enabled,
+- `V!=16`: disabled even with the env var.
+
+### Timings
+
+Uncontended Cycle 5 decision probe:
+
+```bash
+CPPMEGA_VERBOSE_EXT_BUILD=0 python tools/probes/m2rnn_cuda_variant_decision.py \
+  --B 1 --S 1024 --H 4 --K 32 --V 16 --tile-size 32 --max-its 3 \
+  --warmup 2 --iters 5 \
+  --json /tmp/m2rnn_cycle5_decision.json \
+  --markdown docs/status/m2rnn_cuda_variant_decision_2026_04_28.md
+```
+
+| Variant | CUDA event ms/iter | Wall ms/iter | Speedup vs default event | Decision |
+| --- | ---: | ---: | ---: | --- |
+| default CUDA | 11.256 | 11.257 | 1.00x | default |
+| `v16_warprow` opt-in | 17.425 | 17.425 | 0.65x | diagnostic only |
+| Triton reference | 0.500 | 0.501 | 22.50x | active reference |
+
+Stage profiler, same target shape, default CUDA:
+
+```bash
+CPPMEGA_VERBOSE_EXT_BUILD=0 python tools/probes/m2rnn_tiled_cuda_stage_profile.py \
+  --B 1 --S 1024 --H 4 --K 32 --V 16 --tile-size 32 --max-its 3 \
+  --warmup 2 --iters 3 --dtype bf16 \
+  --json /tmp/m2rnn_cycle5_default_stage.json
+```
+
+Clean run before later GPU contention: summary `1.824 ms`, scan `0.035 ms`,
+apply `2.072 ms`, update `0.132 ms` per Newton iteration; whole forward
+`12.51 ms` in that stage-profiler run.  The aggregate decision probe above is
+the canonical same-input CUDA/Triton comparison.
+
+Stage profiler for opt-in warprow:
+
+```bash
+CPPMEGA_VERBOSE_EXT_BUILD=0 CPPMEGA_M2RNN_WARPROW_V16=1 \
+  python tools/probes/m2rnn_tiled_cuda_stage_profile.py \
+  --B 1 --S 1024 --H 4 --K 32 --V 16 --tile-size 32 --max-its 3 \
+  --warmup 2 --iters 3 --dtype bf16 \
+  --json /tmp/m2rnn_cycle5_warprow_stage.json
+```
+
+Warprow stage profile: summary `2.632 ms`, scan `0.023 ms`, apply
+`3.068 ms`, update `0.121 ms` per Newton iteration; whole forward `17.50 ms`.
+
+### ptxas / Resources
+
+Fresh extension build command:
+
+```bash
+rm -rf /tmp/cppmega_m2rnn_cycle5_ext
+TORCH_EXTENSIONS_DIR=/tmp/cppmega_m2rnn_cycle5_ext CPPMEGA_VERBOSE_EXT_BUILD=1 \
+  python tools/probes/m2rnn_pararnn_tiled_cuda_probe.py \
+  --B 1 --S 17 --H 2 --K 4 --V 16 --tile-size 8 --max-its 4 \
+  --json /tmp/m2rnn_cycle5_ptxas_probe.json
+```
+
+ptxas emitted:
+
+| Kernel | Registers/thread | Static smem | Spills |
+| --- | ---: | ---: | ---: |
+| `m2rnn_tile_summary_kernel` | 94 | 3456 B | 0 |
+| `m2rnn_apply_tile_prefix_kernel` | 90 | 3520 B | 0 |
+| `m2rnn_scan_tile_summaries_kernel` | 26 | 128 B | 0 |
+| `m2rnn_tile_summary_v16_warprow_kernel` | 74 | 3456 B | 0 |
+| `m2rnn_apply_tile_prefix_v16_warprow_kernel` | 72 | 3520 B | 0 |
+| `m2rnn_local_tile_scan_debug_kernel` | 96 | 3456 B | 0 |
+
+The resource picture did not change from Cycle 4: warprow reduces registers
+but increases launched threads/block and remains slower.
+
+### Row-Block Prototype Decision
+
+The proposed one-block-per-`(Be,tile,row)` summary-row prototype was not kept.
+It is not a safe small patch for this algorithm because each row update at
+token `s+1` depends on the full previous `d[16]` and every row of `M[16,16]`.
+Separate CUDA blocks cannot exchange shared tile state or synchronize inside
+the token loop.  A correct row-block split would need extra global intermediate
+state or one launch per token step, which reintroduces the large prefix storage
+or fine-grained launch overhead this branch is trying to avoid.
+
+### Correctness / Tests
+
+Commands:
+
+```bash
+python -m py_compile \
+  cppmega/megatron/m2rnn_pararnn_tiled_cuda.py \
+  tests/test_m2rnn_pararnn_tiled_cuda.py \
+  tools/probes/m2rnn_tiled_cuda_stage_profile.py \
+  tools/probes/m2rnn_cuda_variant_decision.py
+
+CPPMEGA_VERBOSE_EXT_BUILD=0 pytest -q tests/test_m2rnn_pararnn_tiled_cuda.py -s
+
+CPPMEGA_VERBOSE_EXT_BUILD=0 CPPMEGA_M2RNN_WARPROW_V16=1 \
+  pytest -q tests/test_m2rnn_pararnn_tiled_cuda.py -s
+```
+
+Results:
+
+- `py_compile`: pass
+- default pytest: `8 passed, 19 warnings`
+- opt-in warprow pytest: `8 passed, 19 warnings`
+
+### Recommendation
+
+Pause CUDA production optimization for this branch.  Keep it as a
+resource/diagnostic implementation and do not add more slow CUDA variants
+unless a new strategy first clears the `>20%` improvement threshold over
+default CUDA on an idle GPU.  Triton remains the active path for target
+execution.

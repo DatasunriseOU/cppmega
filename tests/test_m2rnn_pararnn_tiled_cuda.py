@@ -12,6 +12,7 @@ from cppmega.megatron.m2rnn_pararnn_tiled_cuda import (
     TiledCudaPararnnConfig,
     _scan_tile_summaries,
     _scan_tile_summaries_python,
+    _use_warprow_v16,
     local_tile_scan_debug,
     memory_accounting_bytes,
     m2rnn_pararnn_tiled_cuda_forward,
@@ -19,6 +20,18 @@ from cppmega.megatron.m2rnn_pararnn_tiled_cuda import (
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+def test_warprow_v16_stays_opt_in(monkeypatch):
+    monkeypatch.delenv("CPPMEGA_M2RNN_WARPROW_V16", raising=False)
+    assert _use_warprow_v16(V=16, tile_size=32) is False
+
+    monkeypatch.setenv("CPPMEGA_M2RNN_WARPROW_V16", "0")
+    assert _use_warprow_v16(V=16, tile_size=32) is False
+
+    monkeypatch.setenv("CPPMEGA_M2RNN_WARPROW_V16", "1")
+    assert _use_warprow_v16(V=16, tile_size=32) is True
+    assert _use_warprow_v16(V=8, tile_size=32) is False
 
 
 def _torch_m2rnn_forward(q, k, v, W, xf, *, h0=None):
