@@ -169,15 +169,29 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 
     transpose_emit_backend = os.environ.get("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND", "")
     direct_no_sidecar = backend == "cutlass_native" and transpose_emit_backend == "off"
-    if direct_no_sidecar:
-        if int(stats.get("mxfp8_cutlass_native_dgrad", 0)) <= 0:
-            failures.append("CUTLASS native backend did not handle dgrad")
-        if int(stats.get("mxfp8_cutlass_native_wgrad", 0)) <= 0:
-            failures.append("CUTLASS native backend did not handle wgrad")
+    flashinfer_compact_direct = (
+        backend == "flashinfer_cutlass"
+        and int(stats.get("mxfp8_flashinfer_dgrad", 0)) > 0
+        and int(stats.get("mxfp8_flashinfer_wgrad", 0)) > 0
+        and int(stats.get("mxfp8_tn_adapter_copy_transpose", 0)) == 0
+    )
+    if direct_no_sidecar or flashinfer_compact_direct:
+        if direct_no_sidecar:
+            if int(stats.get("mxfp8_cutlass_native_dgrad", 0)) <= 0:
+                failures.append("CUTLASS native backend did not handle dgrad")
+            if int(stats.get("mxfp8_cutlass_native_wgrad", 0)) <= 0:
+                failures.append("CUTLASS native backend did not handle wgrad")
+        else:
+            if int(stats.get("mxfp8_flashinfer_dgrad", 0)) <= 0:
+                failures.append("FlashInfer/CUTLASS compact-direct backend did not handle dgrad")
+            if int(stats.get("mxfp8_flashinfer_wgrad", 0)) <= 0:
+                failures.append("FlashInfer/CUTLASS compact-direct backend did not handle wgrad")
         if int(stats.get("mxfp8_tn_adapter_te_emit", 0)) != 0:
-            failures.append("no-sidecar backend emitted TE transpose operands")
+            failures.append("compact-direct backend emitted TE transpose operands")
         if int(stats.get("mxfp8_tn_sidecar_attr_attached", 0)) != 0:
-            failures.append("no-sidecar backend attached MXFP8 transpose sidecars")
+            failures.append("compact-direct backend attached MXFP8 transpose sidecars")
+        if int(stats.get("mxfp8_tn_sidecar_registry_peak", 0)) != 0:
+            failures.append("compact-direct backend used the sidecar registry")
     else:
         if not saved_transpose_payload:
             failures.append(

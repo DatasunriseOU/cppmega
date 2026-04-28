@@ -1,7 +1,7 @@
 # Cppmega Run Profiles And Token Flow
 
 Status: canonical
-Last updated: 2026-04-27
+Last updated: 2026-04-28
 Scope: typed run-profile contract, local GB10 token flow, and precision/layout
 boundaries for the current NAM56R-quarter debug lane.
 
@@ -220,13 +220,29 @@ main output head / CE
 
 ## Precision Boundaries
 
-Persistent storage in the local profile:
+Persistent storage in the local tensorwise/BF16 profile:
 
 - model parameters: BF16 after Megatron `Float16Module`
 - ordinary hidden activations: BF16 between blocks
 - optimizer main params: no FP32 master in the local no-master Muon lane
 - Muon momentum: q8 data plus block absmax metadata
 - fallback optimizer state: low-memory state selected by the profile
+
+Persistent storage in the local MXFP8 profile:
+
+- TE dense Linear / LayerNormLinear / GroupedLinear weights are primary MXFP8
+  tensors through `--mxfp8-param-storage`, not BF16 tensors with an external
+  sidecar and not distributed `--fp8-param-gather` storage.
+- TE MXFP8 weights keep both rowwise and compact columnwise payload/scale
+  storage for GEMM use. The latest storage receipt still includes BF16 model
+  storage for non-covered tensors.
+- Ordinary hidden activations between blocks, CE inputs, non-TE parameters,
+  Mamba scan/state tensors, DSA/indexer tensors, and the BF16 outputs of dense
+  GEMMs remain BF16.
+- Covered non-FSDP Linear backward edges save GEMM-ready MXFP8
+  rowwise-transposed operands in autograd instead of saving the BF16 Linear
+  input. That saved operand is real materialized MXFP8 storage, not a persistent
+  producer-side sidecar.
 
 Non-persistent higher precision:
 
@@ -241,13 +257,14 @@ must set those coherently; a TE precision config without the rendered
 `fp8_recipe=mxfp8` profile value is rejected by the local launcher.
 
 The accepted local MXFP8 Linear backward probe path no longer saves a BF16
-Linear input plus an MXFP8 transpose sidecar for the covered non-FSDP case.
-Local TE `Linear` now prefers a GEMM-ready MXFP8 rowwise-transposed saved input
-operand when the quantizer emitted one during forward. The original compact
-columnwise activation is not kept for that Linear backward edge, and the shim
-unregisters the transient sidecar so long runs do not accumulate stale registry
-entries. This currently applies only when no backward input all-gather, CPU
-offload, or FSDP scatter is involved.
+Linear input plus a producer-side MXFP8 transpose sidecar for the covered
+non-FSDP case. Local TE `Linear` and `LayerNormLinear` now prefer a GEMM-ready
+MXFP8 rowwise-transposed saved operand inside autograd. Parameter quantization
+also defers transpose creation instead of attaching forward-side sidecars. This
+currently applies only when no backward input all-gather, CPU offload, or FSDP
+scatter is involved. The full-model GB10 path still has an on-demand
+copy-transpose bridge through `_cppmega_mxfp8_colwise_as_rowwise_transpose`
+when only compact columnwise MXFP8 storage is available.
 
 ## GB10 MXFP8 Layout Boundary
 
@@ -281,7 +298,8 @@ Short-term performance path:
 - keep attention on the patched FA4 SM120 path; the following bullets are about
   dense MXFP8 Linear GEMMs only, not attention
 - keep TE as the MXFP8 payload owner
-- use TE transpose emit or cached rowwise-transpose sidecars for backward
+- use TE/autograd saved rowwise-transpose operands for covered Linear backward
+  edges
 - convert only compact rowwise scales to FlashInfer/CUTLASS `layout_128x4`
   via the cppmega producer kernel
 - call FlashInfer/CUTLASS SM120 GEMM for clean MXFP8 GEMMs
@@ -349,11 +367,140 @@ TE owns payload: rowwise MXFP8 uint8 storage
 producer: compact rowwise scale -> FlashInfer/CUTLASS layout_128x4 uint8 scale
 payload handoff: zero-copy uint8.view(torch.float8_e4m3fn)
 fprop: x rowwise payload + weight rowwise payload.T
-dgrad: dy rowwise payload + weight.T sidecar payload.T
-wgrad: dy.T sidecar payload + x.T sidecar payload.T
+dgrad: dy rowwise payload + weight.T saved/on-demand payload.T
+wgrad: dy.T saved/on-demand payload + x.T saved/on-demand payload.T
 BF16 fallback: disabled
-copy_transpose: zero in the accepted shim probe
+copy_transpose: zero in the accepted isolated Linear probe; nonzero in the
+                full model where the adapter still bridges compact columnwise
+                storage on demand
 ```
+
+Latest full-model zero-sidecar receipt:
+
+```text
+log: /home/dave/logs/gb10_mxfp8_zero_sidecars_20260428_171130.log
+profile: local_gb10_quarter, real clang semantic 4k data
+steps: 6 train + validation + test
+MTP: mtp_1 and mtp_2 losses logged, NaN iterations: 0
+lm loss: 11.66119 -> 6.631005 over 6 train steps
+validation loss: 5.908483
+test loss: 5.862091
+hot-step time: 5894.1, 5850.2, 5971.4, 5783.1 ms for steps 3-6
+hot-step speed: about 2.74k-2.83k tokens/s at 4 * 4096 tokens
+max allocated after step 2: 26468.95 MB
+MXFP8 stats:
+  mxfp8_tn_adapter_dgrad=60, mxfp8_tn_adapter_wgrad=60
+  mxfp8_flashinfer_dgrad=204, mxfp8_flashinfer_wgrad=204
+  mxfp8_flashinfer_fprop=0
+  bf16_fallback_dgrad=0, bf16_fallback_wgrad=0
+  native_passthrough_dgrad=0, native_passthrough_wgrad=0
+  fallback_reasons={}
+  mxfp8_tn_sidecar_attr_attached=0
+  mxfp8_tn_sidecar_attr_attached_bytes=0
+  mxfp8_tn_sidecar_registry_size=0
+  mxfp8_tn_sidecar_registry_persistent=0
+  mxfp8_tn_sidecar_registry_peak=0
+  mxfp8_tn_sidecar_registry_current_bytes=0
+  mxfp8_tn_sidecar_registry_peak_bytes=0
+  mxfp8_tn_sidecar_tracked_attr_current_bytes=0
+  mxfp8_tn_sidecar_tracked_attr_peak_bytes=0
+  mxfp8_tn_adapter_te_emit=0
+  mxfp8_tn_adapter_te_emit_deferred=4850
+  mxfp8_tn_adapter_saved_transpose_operand=408
+  mxfp8_tn_adapter_copy_transpose=3084
+  mxfp8_tn_adapter_missing_sidecar_copy=3084
+  mxfp8_norm_quantize_sidecar_bridge=100
+```
+
+This receipt proves zero persistent sidecars for the covered full-model run. It
+does not prove zero-copy MXFP8 backward: the saved-transpose and copy-transpose
+counters above show where the current bridge still materializes rowwise
+transposed operands.
+
+Latest grouped-direct full-model smoke:
+
+```text
+log: /home/dave/logs/gb10_mxfp8_grouped_direct_smoke9_20260428_183814.log
+profile: local_gb10_quarter, real clang semantic 4k data
+steps: 1 train + validation + test
+lm loss: 11.66119
+mtp_1 / mtp_2 loss: 11.97334 / 11.96537
+validation / test loss: 10.66364 / 10.71262
+max allocated / reserved: 24050.16 MB / 24866 MB
+MXFP8 stats:
+  mxfp8_flashinfer_dgrad=34, mxfp8_flashinfer_wgrad=34
+  mxfp8_grouped_direct_dgrad=10, mxfp8_grouped_direct_wgrad=10
+  mxfp8_grouped_direct_miss_dgrad=0, mxfp8_grouped_direct_miss_wgrad=0
+  mxfp8_grouped_transpose_copy_fallback_dgrad=0
+  mxfp8_grouped_transpose_copy_fallback_wgrad=0
+  mxfp8_tn_adapter_copy_transpose=34
+  mxfp8_tn_adapter_missing_sidecar_copy=34
+  bf16_fallback_dgrad=0, bf16_fallback_wgrad=0
+  native_passthrough_dgrad=0, native_passthrough_wgrad=0
+  fallback_reasons={}
+```
+
+This receipt proves the grouped MoE dgrad/wgrad bridge no longer calls
+`_cppmega_mxfp8_colwise_as_rowwise_transpose` and no longer materializes
+per-expert transpose operands. The remaining copies are dense Linear copies.
+The dense compact-columnwise path is wired behind
+`--mxfp8-compact-columnwise-backward`; it is opt-in because the current dense
+direct SM120 loader was correct but too slow on the full-model smoke.
+
+## Next MXFP8 Acceptance Contract
+
+The next accepted grouped direct backend and dense compact-columnwise path must
+clear this counter contract on real `local_gb10_quarter` MXFP8 logs:
+
+```text
+dense direct backend used:
+  mxfp8_cutlass_native_dgrad>0
+  mxfp8_cutlass_native_wgrad>0
+
+grouped direct backend used:
+  mxfp8_grouped_direct_dgrad>0
+  mxfp8_grouped_direct_wgrad>0
+  mxfp8_grouped_direct_miss_dgrad=0
+  mxfp8_grouped_direct_miss_wgrad=0
+  mxfp8_grouped_transpose_copy_fallback_dgrad=0
+  mxfp8_grouped_transpose_copy_fallback_wgrad=0
+
+no transpose/copy materialization:
+  zero calls to _cppmega_mxfp8_colwise_as_rowwise_transpose on accepted direct paths
+  no x.T, dy.T, or weight.T MXFP8 tensor materialization
+  mxfp8_tn_adapter_te_emit=0
+  mxfp8_tn_adapter_te_emit_deferred=0
+  mxfp8_tn_adapter_saved_transpose_operand=0
+  mxfp8_tn_adapter_te_emit_swizzled=0
+  mxfp8_tn_adapter_te_emit_swizzled_unavailable=0
+  mxfp8_tn_adapter_copy_transpose=0
+  mxfp8_tn_adapter_missing_sidecar_copy=0
+  mxfp8_norm_quantize_sidecar_bridge=0
+
+no persistent sidecars:
+  mxfp8_tn_sidecar_attr_attached=0
+  mxfp8_tn_sidecar_attr_attached_bytes=0
+  mxfp8_tn_sidecar_registry_size=0
+  mxfp8_tn_sidecar_registry_persistent=0
+  mxfp8_tn_sidecar_registry_peak=0
+  mxfp8_tn_sidecar_registry_current_bytes=0
+  mxfp8_tn_sidecar_registry_peak_bytes=0
+  mxfp8_tn_sidecar_tracked_attr_current_bytes=0
+  mxfp8_tn_sidecar_tracked_attr_peak_bytes=0
+
+no fallback/passthrough:
+  bf16_fallback_dgrad=0
+  bf16_fallback_wgrad=0
+  native_passthrough_dgrad=0
+  native_passthrough_wgrad=0
+  fallback_reasons={}
+```
+
+Grouped direct is accepted only if one TE grouped GEMM call remains one grouped
+backend launch. A Python wrapper that loops experts, calls
+`_cppmega_mxfp8_colwise_as_rowwise_transpose`, or builds per-expert `x.T`,
+`dy.T`, or `weight.T` operands is not the accepted grouped direct path even if
+the numerical loss is finite.
 
 ## 2026-04-28 GB10 MXFP8 Profiling And Speed A/B
 

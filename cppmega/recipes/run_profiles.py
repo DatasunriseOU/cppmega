@@ -120,6 +120,12 @@ class PrecisionProfile:
     mxfp8_transpose_emit_backend: Mxfp8TransposeEmitBackend = "te"
     mxfp8_transpose_emit_swizzled: bool = True
     mxfp8_transpose_emit_strict: bool = True
+    # Experimental dense Linear backward mode: TE saves original compact
+    # columnwise MXFP8 operands and lets the cppmega compact-direct backend
+    # read them directly.  This removes the dense rowwise-transpose copies, but
+    # the current SM120 direct loader is slower than the TE-transpose TN path on
+    # full-model GB10 runs, so keep it opt-in until the loader/mainloop is fixed.
+    mxfp8_compact_columnwise_backward: bool = False
     # FlashInfer's public mm_mxfp8 path owns autotuning. direct_tactic bypasses
     # that layer and is only for shape/tactic probes when nsys shows overhead.
     mxfp8_flashinfer_runner: Mxfp8FlashinferRunner = "mm_mxfp8"
@@ -561,6 +567,9 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                 "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT": _bool(
                     profile.precision.mxfp8_transpose_emit_strict
                 ),
+                "CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD": _bool(
+                    profile.precision.mxfp8_compact_columnwise_backward
+                ),
                 "CPPMEGA_FLASHINFER_MXFP8_RUNNER": (
                     profile.precision.mxfp8_flashinfer_runner
                 ),
@@ -640,6 +649,10 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.precision.mxfp8_transpose_emit_swizzled = args.mxfp8_transpose_emit_swizzled
     if args.mxfp8_transpose_emit_strict is not None:
         profile.precision.mxfp8_transpose_emit_strict = args.mxfp8_transpose_emit_strict
+    if args.mxfp8_compact_columnwise_backward is not None:
+        profile.precision.mxfp8_compact_columnwise_backward = (
+            args.mxfp8_compact_columnwise_backward
+        )
     if args.mxfp8_flashinfer_runner is not None:
         profile.precision.mxfp8_flashinfer_runner = args.mxfp8_flashinfer_runner
     if args.mxfp8_flashinfer_tactic is not None:
@@ -839,6 +852,23 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         default=None,
         dest="mxfp8_transpose_emit_strict",
+    )
+    compact_columnwise_backward = parser.add_mutually_exclusive_group()
+    compact_columnwise_backward.add_argument(
+        "--mxfp8-compact-columnwise-backward",
+        action="store_true",
+        default=None,
+        dest="mxfp8_compact_columnwise_backward",
+        help=(
+            "Experimental: save dense TE Linear backward operands in original "
+            "compact-columnwise MXFP8 form and route to cppmega direct backend."
+        ),
+    )
+    compact_columnwise_backward.add_argument(
+        "--no-mxfp8-compact-columnwise-backward",
+        action="store_false",
+        default=None,
+        dest="mxfp8_compact_columnwise_backward",
     )
     parser.add_argument(
         "--mxfp8-flashinfer-runner",
