@@ -21,3 +21,6 @@ nam56r_grid/
 ckpt/
 checkpoints/
 
+# Claude Code local state (worktrees, scheduled tasks, external mounts).
+.claude/
+
