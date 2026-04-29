@@ -22,9 +22,10 @@ Plan P1 from `reference_mamba_ssm_optimization_plan.md` (revised):
   fwd TileLang kernels from True -> False, so the TileLang compiler emits
   TMA + warp-specialized code for the forward pass only.
 
-This patch is **opt-in** via the env var `CPPMEGA_MAMBA3_P1=1`. Import of this
-module does NOT patch anything. Call `apply_all()` explicitly or run the
-module as a script.
+This patch is **opt-in** via the env vars `CPPMEGA_MAMBA3_P1=1` and
+`MAMBA3_P1_ALLOW_FILE_MUTATION=1`. Import of this module does NOT patch
+anything. `apply_all()` and script mode refuse to mutate files unless both
+flags are set.
 
 The patch is idempotent — safe to run multiple times. After applying it
 verifies each target file contains the expected flipped flags and raises
@@ -47,7 +48,8 @@ TODO: revisit bwd kernels once TileLang TMA lower handles InputDim > 2
 shared-memory descriptors.
 
 Usage:
-    python -m cppmega.megatron.upstream_patches.apply_mamba3_mimo_p1_patches
+    CPPMEGA_MAMBA3_P1=1 MAMBA3_P1_ALLOW_FILE_MUTATION=1 \
+        python -m cppmega.megatron.upstream_patches.apply_mamba3_mimo_p1_patches
 """
 
 from __future__ import annotations
@@ -284,6 +286,20 @@ def _do_patch() -> None:
     print("Restart training to recompile kernels with TMA + warp specialization.")
 
 
+def _env_true(name: str) -> bool:
+    return os.environ.get(name, "0") in ("1", "true", "True")
+
+
+def _require_file_mutation_allowed() -> None:
+    if _env_true("CPPMEGA_MAMBA3_P1") and _env_true("MAMBA3_P1_ALLOW_FILE_MUTATION"):
+        return
+    raise RuntimeError(
+        "Refusing to mutate live mamba_ssm TileLang sources. Set both "
+        "CPPMEGA_MAMBA3_P1=1 and MAMBA3_P1_ALLOW_FILE_MUTATION=1 only for "
+        "a bounded experiment, then reinstall the mamba fork to restore."
+    )
+
+
 def apply_all() -> None:
     """Apply P1 patches to the live mamba_ssm installation.
 
@@ -315,6 +331,8 @@ def apply_all() -> None:
          desync race that bit us earlier (see `_ensure_aggressive_merge`
          for the line-count-preserving fix).
     """
+    _require_file_mutation_allowed()
+
     try:
         import torch.distributed as dist
         dist_available = True
@@ -392,14 +410,13 @@ def apply_all() -> None:
 
 def apply_if_requested() -> bool:
     """Env-gated entry point. Returns True if patches were applied."""
-    if os.environ.get("CPPMEGA_MAMBA3_P1", "0") not in ("1", "true", "True"):
+    if not _env_true("CPPMEGA_MAMBA3_P1"):
         return False
     apply_all()
     return True
 
 
 if __name__ == "__main__":
-    # Script mode always applies (env gate is for library-side import).
     try:
         apply_all()
     except Exception as exc:
