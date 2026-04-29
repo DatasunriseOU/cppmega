@@ -96,7 +96,7 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert env["CPPMEGA_FP8_FORMAT"] == "e4m3"
     assert env["CPPMEGA_MUON_NUM_NS_STEPS"] == "3"
     assert env["CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE"] == "int8"
-    assert env["CPPMEGA_TE_MXFP8_BWD_BACKEND"] == "flashinfer_cutlass"
+    assert env["CPPMEGA_TE_MXFP8_BWD_BACKEND"] == "te_tn_adapter"
     assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
     assert env["CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD"] == "0"
     assert env["CPPMEGA_FLASHINFER_MXFP8_RUNNER"] == "mm_mxfp8"
@@ -311,10 +311,10 @@ def test_remote_gb10_launcher_preserves_muon_ns_override():
     assert "--attention-backend flash" not in script
 
 
-def test_local_gb10_quarter_mxfp8_defaults_to_flashinfer_cutlass():
-    """The local_gb10_quarter profile defaults to TE payload + FlashInfer/CUTLASS."""
+def test_local_gb10_quarter_mxfp8_defaults_to_measured_te_tn_backend():
+    """The local_gb10_quarter profile defaults to the fastest measured GB10 MXFP8 backend."""
     profile = get_run_profile("local_gb10_quarter")
-    assert profile.precision.mxfp8_bwd_backend == "flashinfer_cutlass"
+    assert profile.precision.mxfp8_bwd_backend == "te_tn_adapter"
     assert profile.precision.mxfp8_flashinfer_runner == "mm_mxfp8"
     assert profile.precision.mxfp8_grouped_direct_backward is False
 

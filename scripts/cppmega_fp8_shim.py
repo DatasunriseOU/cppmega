@@ -2238,7 +2238,7 @@ if (
                     _patched_gather_modules.append(_module_name.rsplit(".", 1)[-1])
                 if _cppmega_wrap_apply_normalization(_mod):
                     _patched_norm_modules.append(_module_name.rsplit(".", 1)[-1])
-                for _class_name in ("Linear", "LayerNormLinear", "GroupedLinear"):
+                for _class_name in ("Linear", "LayerNormLinear", "LayerNormMLP", "GroupedLinear"):
                     _class = getattr(_mod, _class_name, None)
                     if _class is not None and _cppmega_wrap_get_quantizers(_class):
                         _patched_quantizer_modules.append(_class_name)

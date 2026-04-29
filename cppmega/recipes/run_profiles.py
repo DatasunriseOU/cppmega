@@ -94,9 +94,10 @@ class PrecisionProfile:
     """Precision and kernel-route choices for the launch."""
 
     # Tensorwise FP8 is the conservative GB10 lane.  Dense MXFP8 Linear GEMMs
-    # route clean GEMM calls through TE payload + FlashInfer/CUTLASS
-    # layout_128x4 by default; the old compact direct CUTLASS loader remains
-    # an explicit experiment.  This is not the attention backend: attention is
+    # can route clean GEMM calls through TE payload + FlashInfer/CUTLASS
+    # layout_128x4, while profile setters may choose a faster measured backend
+    # for a specific machine.  The old compact direct CUTLASS loader remains an
+    # explicit experiment.  This is not the attention backend: attention is
     # controlled separately by ``attention_backend`` and local GB10 pins it to
     # patched FA4.
     # ``auto`` would hide the important contract here, so the resolved profile
@@ -367,6 +368,11 @@ def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProf
     # Keep this in the typed profile instead of relying on a shell fallback.
     profile.model.moe_token_dispatcher_type = "alltoall"
     profile.precision.attention_backend = "flash"
+    # GB10 MXFP8 profiler runs on 2026-04-29 showed FlashInfer/CUTLASS backward
+    # spending ~878 ms/step in 68 GEMMs, while the TE TN adapter cut steady
+    # step time by ~8% with no BF16 fallback.  Keep FlashInfer selectable via
+    # --mxfp8-bwd-backend for targeted kernel probes.
+    profile.precision.mxfp8_bwd_backend = "te_tn_adapter"
     # The remaining BF16 GEMM hotspot on GB10 is Muon's Newton-Schulz loop.
     # nanochat's comparable performance presets use 3 iterations; keep this as
     # a typed profile default so runs can restore 5 with --muon-num-ns-steps 5.
