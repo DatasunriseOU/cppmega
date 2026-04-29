@@ -1,0 +1,22 @@
+--- a/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
++++ b/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
+@@ -895,16 +895,11 @@
+                 T.copy(dPsi_frag, dPsi_acc)
+ 
+                 # Compute Psi_V
+-                PsiV_frag = T.alloc_fragment([chunk_size, R, P], dtype)
+-                T.clear(PsiV_frag)
+-                for cs, p in T.Parallel(chunk_size, P):
+-                    for r in T.serial(R):
+-                        PsiV_frag[cs, r, p] += v_frag[cs, p] * Psi_frag[r, p]
+-                # NOTE: Tilelang unable to perform gemm with reshaped PsiV_frag
+-                # so have to copy to smem
++                # Keep PsiV on-chip but avoid the intermediate [chunk_size, R, P]
++                # fragment: all downstream consumers require the shared 2D layout.
+                 PsiV_shared  = T.alloc_shared([fused_chunk_size, P], dtype)
+                 for cs, r, p in T.Parallel(chunk_size, R, P):
+-                    PsiV_shared[cs*R + r, p] = PsiV_frag[cs, r, p]
++                    PsiV_shared[cs*R + r, p] = v_frag[cs, p] * Psi_frag[r, p]
+ 
+                 # Compute dqk_from_diag, which is the contribution to dQ/dK from qk_dot:
+                 dqk_from_diag_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], accum_dtype)
