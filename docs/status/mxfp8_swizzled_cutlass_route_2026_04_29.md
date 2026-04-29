@@ -48,6 +48,48 @@ The route removed dense copy fallback, but each dense backward GEMM still pays
 scale-layout conversion. That dominates the model and makes it slower than both
 BF16 and the TE-TN MXFP8 default.
 
+## Nsight Evidence
+
+The current 4-step Nsight captures show why the lower-precision path is not yet
+faster end-to-end:
+
+| Capture | Kernel family | Total time over capture | Instances | Comment |
+| --- | ---: | ---: | ---: | --- |
+| BF16 | `_cce_backward_kernel` | ~5.58 s | 4 | Dominant CE backward cost remains. |
+| MXFP8 TE-TN | `_cce_backward_kernel` | ~4.98 s | 4 | CCE is slightly better, but not the blocker. |
+| MXFP8 TE-TN | block-scaled CUTLASS GEMM | ~3.51 s | 1635 | Real MXFP8 GEMM work. |
+| MXFP8 TE-TN | `quantize_mxfp8_kernel` | ~1.07 s | 4066 | Quantization launch/work tax that BF16 does not pay. |
+| MXFP8 TE-TN | `mxfp8_scaling_transpose_cast_kernel` | ~0.37 s | 1052 | Transpose/scale preparation tax. |
+| MXFP8 TE-TN | `dequantize_mxfp8_kernel` | ~0.22 s | 2328 | Remaining bridge/dequantization tax. |
+
+Nsight logs:
+
+```text
+/home/dave/logs/wave4a_bf16_nsys_cudasw_4step_current_20260429_cuda_gpu_kern_sum_base.txt
+/home/dave/logs/wave4a_mxfp8_tetn_nsys_cudasw_4step_20260429_cuda_gpu_kern_sum_base.txt
+```
+
+This is the current performance model: MXFP8 GEMMs can be fast in isolation,
+but the model still pays too many separate quantize / transpose / swizzle
+launches around them.
+
+## Rejected Producer Attempt
+
+Wave2A added a TE-side normalization transpose emitter and removed the local
+`mxfp8_norm_quantize_sidecar_bridge` for `LayerNormLinear` / `LayerNormMLP`.
+It is not accepted as-is:
+
+```text
+TE worktree: /home/dave/TransformerEngine-wave2-agentA, commit 1e739500
+cppmega worktree: /home/dave/source/cppmega-wave2-agentA, commit 81cad85
+```
+
+The implementation left the generic `te.Linear` copy-transpose probe failing
+and the scoped norm microbench regressed from `0.1558 ms` BF16 to `1.0165 ms`
+MXFP8. The useful lesson is architectural: producer-side GEMM-ready operands
+are the right target, but adding another standalone transpose/swizzle kernel in
+the norm path is not enough.
+
 ## Next Required Fix
 
 Do not make this route default until one of these is true:
