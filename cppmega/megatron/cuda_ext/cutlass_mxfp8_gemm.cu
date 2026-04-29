@@ -186,6 +186,19 @@ using CompactScaleAsymmetricAColumnwiseSmemDispatchPolicy =
         false,
         true>;
 
+using CompactScaleAsymmetricAColumnwiseSmemBTmaEarlyDispatchPolicy =
+    cutlass::gemm::collective::MainloopSm120TmaWarpSpecializedBlockScaledCompactScale<
+        CollectiveMainloop::DispatchPolicy::Stages,
+        CollectiveMainloop::DispatchPolicy::SchedulerPipelineStageCount,
+        typename CollectiveMainloop::DispatchPolicy::ClusterShape,
+        cutlass::gemm::KernelTmaWarpSpecializedCooperativeSparseBlockScaledSm120<
+            CollectiveMainloop::DispatchPolicy::SchedulerPipelineStageCount,
+            false>,
+        false,
+        false,
+        true,
+        true>;
+
 using CompactScaleCollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
     CompactScaleDispatchPolicy,
     ThreadBlockShape,
@@ -313,6 +326,23 @@ using CompactScaleAsymmetricAColumnwiseSmemCollectiveMainloop = cutlass::gemm::c
     typename CollectiveMainloop::SmemCopyAtomsB,
     cute::identity>;
 
+using CompactScaleAsymmetricAColumnwiseSmemBTmaEarlyCollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+    CompactScaleAsymmetricAColumnwiseSmemBTmaEarlyDispatchPolicy,
+    ThreadBlockShape,
+    cute::tuple<KernelElementA, KernelElementSF>,
+    cute::tuple<StrideA, LayoutSFA>,
+    cute::tuple<KernelElementB, KernelElementSF>,
+    cute::tuple<StrideB, LayoutSFB>,
+    typename CollectiveMainloop::TiledMma,
+    typename CollectiveMainloop::GmemTiledCopyPairA,
+    typename CollectiveMainloop::SmemLayoutAtomsA,
+    typename CollectiveMainloop::SmemCopyAtomsA,
+    cute::identity,
+    typename CollectiveMainloop::GmemTiledCopyPairB,
+    typename CollectiveMainloop::SmemLayoutAtomsB,
+    typename CollectiveMainloop::SmemCopyAtomsB,
+    cute::identity>;
+
 using CompactScaleAsymmetricAColumnwiseSmemGemmKernel = cutlass::gemm::kernel::GemmUniversal<
     Shape<int, int, int, int>,
     CompactScaleAsymmetricAColumnwiseSmemCollectiveMainloop,
@@ -320,6 +350,14 @@ using CompactScaleAsymmetricAColumnwiseSmemGemmKernel = cutlass::gemm::kernel::G
     cutlass::gemm::StreamKScheduler>;
 using CompactScaleAsymmetricAColumnwiseSmemGemm =
     cutlass::gemm::device::GemmUniversalAdapter<CompactScaleAsymmetricAColumnwiseSmemGemmKernel>;
+
+using CompactScaleAsymmetricAColumnwiseSmemBTmaEarlyGemmKernel = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int, int, int, int>,
+    CompactScaleAsymmetricAColumnwiseSmemBTmaEarlyCollectiveMainloop,
+    CollectiveEpilogue,
+    cutlass::gemm::StreamKScheduler>;
+using CompactScaleAsymmetricAColumnwiseSmemBTmaEarlyGemm =
+    cutlass::gemm::device::GemmUniversalAdapter<CompactScaleAsymmetricAColumnwiseSmemBTmaEarlyGemmKernel>;
 
 // =======================================================================
 // Validation helpers
@@ -440,6 +478,95 @@ void validate_swizzled_rowwise_inputs(
               SFB_u8.numel(), ", need at least ", expected_sfb);
 }
 
+__device__ __forceinline__ int64_t rowwise_gemm_swizzled_scale_offset(
+    int row,
+    int k_block,
+    int rows,
+    int k) {
+  // Matches the TE/CUTLASS MXFP8 rowwise scale transform:
+  //   scale.view(rows/128, 4, 32, k/128, 4)
+  //        .permute(0, 3, 2, 1, 4)
+  //        .contiguous()
+  int row_tile = row / 128;
+  int row_in_tile = row - row_tile * 128;
+  int row_group = row_in_tile / 32;
+  int row_lane = row_in_tile - row_group * 32;
+  int k_group = k_block / 4;
+  int k_lane = k_block - k_group * 4;
+  int k_groups = k / 128;
+  (void)rows;
+  return (((static_cast<int64_t>(row_tile) * k_groups + k_group) * 32 + row_lane) * 4 +
+          row_group) * 4 + k_lane;
+}
+
+__global__ void prepare_wgrad_stock_a_tile_kernel(
+    uint8_t const* __restrict__ dy_colwise,
+    uint8_t const* __restrict__ dy_colwise_scale,
+    uint8_t* __restrict__ a_tile,
+    uint8_t* __restrict__ sfa_tile,
+    int m_start,
+    int tile_m,
+    int k,
+    int dy_data_ld,
+    int dy_scale_ld) {
+  constexpr int kTile = 32;
+  constexpr int kBlockRows = 8;
+  __shared__ uint8_t transpose_tile[kTile][kTile + 1];
+
+  int row_base = blockIdx.x * kTile;
+  int k_base = blockIdx.y * kTile;
+  int tx = threadIdx.x;
+  int ty = threadIdx.y;
+
+  for (int j = 0; j < kTile; j += kBlockRows) {
+    int row = row_base + tx;
+    int kk = k_base + ty + j;
+    transpose_tile[ty + j][tx] =
+        dy_colwise[static_cast<int64_t>(kk) * dy_data_ld + (m_start + row)];
+  }
+  __syncthreads();
+
+  for (int j = 0; j < kTile; j += kBlockRows) {
+    int row = row_base + ty + j;
+    int kk = k_base + tx;
+    a_tile[static_cast<int64_t>(row) * k + kk] = transpose_tile[tx][ty + j];
+  }
+
+  int k_blocks = k / 32;
+  int64_t thread =
+      (static_cast<int64_t>(blockIdx.y) * gridDim.x + blockIdx.x) * blockDim.x * blockDim.y +
+      threadIdx.y * blockDim.x + threadIdx.x;
+  int64_t stride = static_cast<int64_t>(blockDim.x) * blockDim.y * gridDim.x * gridDim.y;
+  int64_t scale_elems = static_cast<int64_t>(tile_m) * k_blocks;
+  for (int64_t idx = thread; idx < scale_elems; idx += stride) {
+    int k_block = static_cast<int>(idx / tile_m);
+    int row = static_cast<int>(idx - static_cast<int64_t>(k_block) * tile_m);
+    int64_t src = static_cast<int64_t>(k_block) * dy_scale_ld + (m_start + row);
+    int64_t dst = rowwise_gemm_swizzled_scale_offset(row, k_block, tile_m, k);
+    sfa_tile[dst] = dy_colwise_scale[src];
+  }
+}
+
+__global__ void prepare_wgrad_stock_b_scale_tile_kernel(
+    uint8_t const* __restrict__ x_t_rowwise_scale,
+    uint8_t* __restrict__ sfb_tile,
+    int n_start,
+    int tile_n,
+    int k,
+    int x_t_scale_ld) {
+  int64_t thread = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  int k_blocks = k / 32;
+  int64_t scale_elems = static_cast<int64_t>(tile_n) * k_blocks;
+  for (int64_t idx = thread; idx < scale_elems; idx += stride) {
+    int row = static_cast<int>(idx / k_blocks);
+    int k_block = static_cast<int>(idx - static_cast<int64_t>(row) * k_blocks);
+    int64_t src = static_cast<int64_t>(n_start + row) * x_t_scale_ld + k_block;
+    int64_t dst = rowwise_gemm_swizzled_scale_offset(row, k_block, tile_n, k);
+    sfb_tile[dst] = x_t_rowwise_scale[src];
+  }
+}
+
 // =======================================================================
 // Templated GEMM runners using compact-scale mainloop
 // =======================================================================
@@ -452,6 +579,8 @@ at::Tensor run_compact_scale_gemm_impl(
     at::Tensor const& SFB_u8,
     int m, int n, int k,
     at::Tensor& D,
+    int64_t d_offset,
+    int64_t d_ld,
     float alpha, float beta,
     cudaStream_t stream) {
 
@@ -465,12 +594,16 @@ at::Tensor run_compact_scale_gemm_impl(
   StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, make_shape(n, k, l));
   StrideC stride_C = cutlass::make_cute_packed_stride(StrideC{}, make_shape(m, n, l));
   StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, make_shape(m, n, l));
+  if (d_ld > 0) {
+    cute::get<0>(stride_C) = d_ld;
+    cute::get<0>(stride_D) = d_ld;
+  }
 
   auto ptr_A = reinterpret_cast<KernelElementA const*>(A_u8.data_ptr<uint8_t>());
   auto ptr_B = reinterpret_cast<KernelElementB const*>(B_u8.data_ptr<uint8_t>());
   auto ptr_SFA = reinterpret_cast<KernelElementSF const*>(SFA_u8.data_ptr<uint8_t>());
   auto ptr_SFB = reinterpret_cast<KernelElementSF const*>(SFB_u8.data_ptr<uint8_t>());
-  auto ptr_D = reinterpret_cast<ElementD*>(D.data_ptr<at::BFloat16>());
+  auto ptr_D = reinterpret_cast<ElementD*>(D.data_ptr<at::BFloat16>()) + d_offset;
   // When beta == 0 the C operand is logically unused. Pass nullptr so the
   // CUTLASS epilogue skips the C load entirely; otherwise an uninitialized
   // out= tensor holding NaN could propagate as NaN * 0 = NaN.
@@ -522,6 +655,8 @@ at::Tensor run_swizzled_scale_gemm_impl(
     at::Tensor const& SFB_u8,
     int m, int n, int k,
     at::Tensor& D,
+    int64_t d_offset,
+    int64_t d_ld,
     float alpha, float beta,
     cudaStream_t stream) {
 
@@ -538,6 +673,10 @@ at::Tensor run_swizzled_scale_gemm_impl(
   StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, make_shape(n, k, l));
   StrideC stride_C = cutlass::make_cute_packed_stride(StrideC{}, make_shape(m, n, l));
   StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, make_shape(m, n, l));
+  if (d_ld > 0) {
+    cute::get<0>(stride_C) = d_ld;
+    cute::get<0>(stride_D) = d_ld;
+  }
   LayoutSFA layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, l));
   LayoutSFB layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, l));
 
@@ -545,7 +684,7 @@ at::Tensor run_swizzled_scale_gemm_impl(
   auto ptr_B = reinterpret_cast<KernelElementB const*>(B_u8.data_ptr<uint8_t>());
   auto ptr_SFA = reinterpret_cast<KernelElementSF const*>(SFA_u8.data_ptr<uint8_t>());
   auto ptr_SFB = reinterpret_cast<KernelElementSF const*>(SFB_u8.data_ptr<uint8_t>());
-  auto ptr_D = reinterpret_cast<ElementD*>(D.data_ptr<at::BFloat16>());
+  auto ptr_D = reinterpret_cast<ElementD*>(D.data_ptr<at::BFloat16>()) + d_offset;
   ElementD* ptr_C = (beta == 0.0f) ? nullptr : ptr_D;
 
   typename Gemm::Arguments arguments{
@@ -712,6 +851,7 @@ at::Tensor cutlass_mxfp8_tn_gemm_compact_scale_cuda(
 
   return run_compact_scale_gemm_impl<CompactScaleGemm>(
       A_u8, SFA_u8, B_u8, SFB_u8, m, n, k, D,
+      0, 0,
       alpha_f, beta_f, stream);
 #endif
 }
@@ -819,7 +959,168 @@ at::Tensor cutlass_mxfp8_tn_gemm_swizzled_scale_cuda(
 
   return run_swizzled_scale_gemm_impl<Gemm>(
       A_u8, SFA_u8, B_u8, SFB_u8, m, n, k, D,
+      0, 0,
       alpha_f, beta_f, stream);
+#endif
+}
+
+at::Tensor cutlass_mxfp8_tn_gemm_swizzled_scale_strided_cuda(
+    at::Tensor A_u8,
+    at::Tensor SFA_u8,
+    at::Tensor B_u8,
+    at::Tensor SFB_u8,
+    int64_t m64,
+    int64_t n64,
+    int64_t k64,
+    at::Tensor out,
+    int64_t out_ld,
+    int64_t out_offset,
+    bool accumulate,
+    double alpha,
+    double beta) {
+#if !defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) && !defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  TORCH_CHECK(false, "CUTLASS SM120/SM121 MXFP8 swizzled-scale strided probe was not compiled for this architecture");
+#else
+  TORCH_CHECK(m64 <= INT_MAX && n64 <= INT_MAX && k64 <= INT_MAX, "M/N/K exceed int");
+  int m = static_cast<int>(m64);
+  int n = static_cast<int>(n64);
+  int k = static_cast<int>(k64);
+
+  validate_swizzled_rowwise_inputs(A_u8, SFA_u8, B_u8, SFB_u8, m, n, k);
+  CHECK_CUDA(out);
+  CHECK_CONTIGUOUS(out);
+  TORCH_CHECK(out.scalar_type() == at::ScalarType::BFloat16, "out must be bfloat16");
+  TORCH_CHECK(out_ld >= n, "out_ld must be >= tile N");
+  TORCH_CHECK(out_offset >= 0, "out_offset must be non-negative");
+  TORCH_CHECK(out.numel() >= out_offset + static_cast<int64_t>(m - 1) * out_ld + n,
+              "out is too small for strided tile");
+
+  c10::cuda::CUDAGuard device_guard(A_u8.device());
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+  at::Tensor D = out;
+
+  (void)accumulate;
+  float alpha_f = static_cast<float>(alpha);
+  float beta_f = static_cast<float>(beta);
+
+  return run_swizzled_scale_gemm_impl<Gemm>(
+      A_u8, SFA_u8, B_u8, SFB_u8, m, n, k, D,
+      out_offset, out_ld,
+      alpha_f, beta_f, stream);
+#endif
+}
+
+void cutlass_mxfp8_prepare_wgrad_stock_a_tile_cuda(
+    at::Tensor dy_colwise_u8,
+    at::Tensor dy_colwise_scale_u8,
+    at::Tensor a_tile_u8,
+    at::Tensor sfa_tile_u8,
+    int64_t m_start64,
+    int64_t tile_m64,
+    int64_t k64,
+    int64_t dy_data_ld64,
+    int64_t dy_scale_ld64) {
+#if !defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) && !defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  TORCH_CHECK(false, "CUTLASS SM120/SM121 MXFP8 stock-tile prepare kernel was not compiled for this architecture");
+#else
+  TORCH_CHECK(m_start64 >= 0, "m_start must be non-negative");
+  TORCH_CHECK(tile_m64 > 0 && k64 > 0, "tile_m and k must be positive");
+  TORCH_CHECK(tile_m64 <= INT_MAX && k64 <= INT_MAX &&
+              dy_data_ld64 <= INT_MAX && dy_scale_ld64 <= INT_MAX,
+              "tile_m/k/leading dimensions exceed int");
+  int m_start = static_cast<int>(m_start64);
+  int tile_m = static_cast<int>(tile_m64);
+  int k = static_cast<int>(k64);
+  int dy_data_ld = static_cast<int>(dy_data_ld64);
+  int dy_scale_ld = static_cast<int>(dy_scale_ld64);
+  TORCH_CHECK(tile_m % 128 == 0 && k % 128 == 0,
+              "A stock tile prepare requires tile_m and K multiples of 128");
+  CHECK_CUDA(dy_colwise_u8);
+  CHECK_CUDA(dy_colwise_scale_u8);
+  CHECK_CUDA(a_tile_u8);
+  CHECK_CUDA(sfa_tile_u8);
+  CHECK_CONTIGUOUS(dy_colwise_u8);
+  CHECK_CONTIGUOUS(dy_colwise_scale_u8);
+  CHECK_CONTIGUOUS(a_tile_u8);
+  CHECK_CONTIGUOUS(sfa_tile_u8);
+  CHECK_UINT8(dy_colwise_u8);
+  CHECK_UINT8(dy_colwise_scale_u8);
+  CHECK_UINT8(a_tile_u8);
+  CHECK_UINT8(sfa_tile_u8);
+  TORCH_CHECK(dy_colwise_u8.numel() >= static_cast<int64_t>(k - 1) * dy_data_ld + m_start + tile_m,
+              "dy_colwise_u8 is too small for requested tile");
+  TORCH_CHECK(dy_colwise_scale_u8.numel() >= static_cast<int64_t>(k / 32 - 1) * dy_scale_ld + m_start + tile_m,
+              "dy_colwise_scale_u8 is too small for requested tile");
+  TORCH_CHECK(a_tile_u8.numel() >= static_cast<int64_t>(tile_m) * k,
+              "a_tile_u8 is too small");
+  TORCH_CHECK(sfa_tile_u8.numel() >= static_cast<int64_t>(tile_m) * (k / 32),
+              "sfa_tile_u8 is too small");
+
+  c10::cuda::CUDAGuard device_guard(dy_colwise_u8.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dim3 block(32, 8, 1);
+  dim3 grid(tile_m / 32, k / 32, 1);
+  prepare_wgrad_stock_a_tile_kernel<<<grid, block, 0, stream>>>(
+      dy_colwise_u8.data_ptr<uint8_t>(),
+      dy_colwise_scale_u8.data_ptr<uint8_t>(),
+      a_tile_u8.data_ptr<uint8_t>(),
+      sfa_tile_u8.data_ptr<uint8_t>(),
+      m_start,
+      tile_m,
+      k,
+      dy_data_ld,
+      dy_scale_ld);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
+}
+
+void cutlass_mxfp8_prepare_wgrad_stock_b_scale_tile_cuda(
+    at::Tensor x_t_rowwise_scale_u8,
+    at::Tensor sfb_tile_u8,
+    int64_t n_start64,
+    int64_t tile_n64,
+    int64_t k64,
+    int64_t x_t_scale_ld64) {
+#if !defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) && !defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  TORCH_CHECK(false, "CUTLASS SM120/SM121 MXFP8 stock B-scale prepare kernel was not compiled for this architecture");
+#else
+  TORCH_CHECK(n_start64 >= 0, "n_start must be non-negative");
+  TORCH_CHECK(tile_n64 > 0 && k64 > 0, "tile_n and k must be positive");
+  TORCH_CHECK(tile_n64 <= INT_MAX && k64 <= INT_MAX && x_t_scale_ld64 <= INT_MAX,
+              "tile_n/k/leading dimension exceed int");
+  int n_start = static_cast<int>(n_start64);
+  int tile_n = static_cast<int>(tile_n64);
+  int k = static_cast<int>(k64);
+  int x_t_scale_ld = static_cast<int>(x_t_scale_ld64);
+  TORCH_CHECK(tile_n % 128 == 0 && k % 128 == 0,
+              "B stock scale tile prepare requires tile_n and K multiples of 128");
+  CHECK_CUDA(x_t_rowwise_scale_u8);
+  CHECK_CUDA(sfb_tile_u8);
+  CHECK_CONTIGUOUS(x_t_rowwise_scale_u8);
+  CHECK_CONTIGUOUS(sfb_tile_u8);
+  CHECK_UINT8(x_t_rowwise_scale_u8);
+  CHECK_UINT8(sfb_tile_u8);
+  TORCH_CHECK(x_t_rowwise_scale_u8.numel() >=
+                  static_cast<int64_t>(n_start + tile_n - 1) * x_t_scale_ld + (k / 32),
+              "x_t_rowwise_scale_u8 is too small for requested tile");
+  TORCH_CHECK(sfb_tile_u8.numel() >= static_cast<int64_t>(tile_n) * (k / 32),
+              "sfb_tile_u8 is too small");
+
+  c10::cuda::CUDAGuard device_guard(x_t_rowwise_scale_u8.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  int64_t work = static_cast<int64_t>(tile_n) * (k / 32);
+  int threads = 256;
+  int64_t blocks64 = (work + threads - 1) / threads;
+  int blocks = static_cast<int>(blocks64 > 1024 ? 1024 : blocks64);
+  prepare_wgrad_stock_b_scale_tile_kernel<<<blocks, threads, 0, stream>>>(
+      x_t_rowwise_scale_u8.data_ptr<uint8_t>(),
+      sfb_tile_u8.data_ptr<uint8_t>(),
+      n_start,
+      tile_n,
+      k,
+      x_t_scale_ld);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 #endif
 }
 
@@ -938,6 +1239,69 @@ at::Tensor cutlass_mxfp8_tn_gemm_compact_direct_a_col_smem_asym_cuda(
   float beta_f = static_cast<float>(beta);
 
   return run_compact_direct_gemm_impl<CompactScaleAsymmetricAColumnwiseSmemGemm>(
+      A_u8, SFA_u8, B_u8, SFB_u8, m, n, k,
+      a_source, a_data_ld, a_scale_ld,
+      b_source, b_data_ld, b_scale_ld,
+      D, alpha_f, beta_f, stream);
+#endif
+}
+
+at::Tensor cutlass_mxfp8_tn_gemm_compact_direct_a_col_smem_b_tma_early_asym_cuda(
+    at::Tensor A_u8,
+    at::Tensor SFA_u8,
+    at::Tensor B_u8,
+    at::Tensor SFB_u8,
+    int64_t m64,
+    int64_t n64,
+    int64_t k64,
+    int64_t a_source,
+    int64_t a_data_ld,
+    int64_t a_scale_ld,
+    int64_t b_source,
+    int64_t b_data_ld,
+    int64_t b_scale_ld,
+    at::Tensor out,
+    bool use_out,
+    bool accumulate,
+    double alpha,
+    double beta) {
+#if !defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) && !defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  TORCH_CHECK(false, "CUTLASS SM120/SM121 MXFP8 compact direct A-columnwise-smem B-TMA-early asymmetric backend was not compiled for this architecture");
+#else
+  TORCH_CHECK(m64 <= INT_MAX && n64 <= INT_MAX && k64 <= INT_MAX, "M/N/K exceed int");
+  int m = static_cast<int>(m64);
+  int n = static_cast<int>(n64);
+  int k = static_cast<int>(k64);
+
+  TORCH_CHECK(m > 0 && n > 0 && k > 0, "m, n, k must be positive");
+  TORCH_CHECK(m % 128 == 0 && n % 128 == 0 && k % 128 == 0,
+              "CUTLASS MXFP8 compact direct A-columnwise-smem B-TMA-early asymmetric backend currently requires M/N/K multiples of 128, got ",
+              m, "x", n, "x", k);
+  TORCH_CHECK(a_source == kOperandColumnwiseTranspose,
+              "A-columnwise-smem B-TMA-early backend requires A source to be columnwise-transpose");
+  TORCH_CHECK(b_source == kOperandRowwise,
+              "A-columnwise-smem B-TMA-early backend requires B source to be rowwise");
+  validate_direct_operand(A_u8, SFA_u8, m, k, a_source, a_data_ld, a_scale_ld, "A");
+  validate_direct_operand(B_u8, SFB_u8, n, k, b_source, b_data_ld, b_scale_ld, "B");
+  if (use_out) {
+    CHECK_CUDA(out);
+    CHECK_CONTIGUOUS(out);
+    TORCH_CHECK(out.scalar_type() == at::ScalarType::BFloat16, "out must be bfloat16");
+    TORCH_CHECK(out.numel() >= static_cast<int64_t>(m) * n, "out is too small");
+  }
+
+  c10::cuda::CUDAGuard device_guard(A_u8.device());
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+  at::Tensor D = use_out
+      ? out.view({m, n})
+      : at::empty({m, n}, at::TensorOptions().device(A_u8.device()).dtype(at::kBFloat16));
+
+  (void)accumulate;
+  float alpha_f = static_cast<float>(alpha);
+  float beta_f = static_cast<float>(beta);
+
+  return run_compact_direct_gemm_impl<CompactScaleAsymmetricAColumnwiseSmemBTmaEarlyGemm>(
       A_u8, SFA_u8, B_u8, SFB_u8, m, n, k,
       a_source, a_data_ld, a_scale_ld,
       b_source, b_data_ld, b_scale_ld,

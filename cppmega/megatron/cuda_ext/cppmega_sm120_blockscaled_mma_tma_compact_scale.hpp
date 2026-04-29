@@ -82,7 +82,8 @@ template<
   class KernelSchedule_,
   bool UseAuxiliaryLoad_ = false,
   bool UseNoCopyBTma_ = false,
-  bool UseAColumnwiseSmemLayout_ = false
+  bool UseAColumnwiseSmemLayout_ = false,
+  bool UseBTmaEarly_ = false
 >
 struct MainloopSm120TmaWarpSpecializedBlockScaledCompactScale {
   constexpr static int Stages = Stages_;
@@ -92,6 +93,7 @@ struct MainloopSm120TmaWarpSpecializedBlockScaledCompactScale {
   constexpr static bool UseAuxiliaryLoad = UseAuxiliaryLoad_;
   constexpr static bool UseNoCopyBTma = UseNoCopyBTma_;
   constexpr static bool UseAColumnwiseSmemLayout = UseAColumnwiseSmemLayout_;
+  constexpr static bool UseBTmaEarly = UseBTmaEarly_;
   constexpr static int PipelineAsyncMmaStages = 0;
   using ArchTag = arch::Sm120;
 };
@@ -107,7 +109,8 @@ template<
   class KernelSchedule,
   bool UseAuxiliaryLoad,
   bool UseNoCopyBTma,
-  bool UseAColumnwiseSmemLayout
+  bool UseAColumnwiseSmemLayout,
+  bool UseBTmaEarly
 >
 struct HasAuxiliaryLoad<
   cutlass::gemm::collective::MainloopSm120TmaWarpSpecializedBlockScaledCompactScale<
@@ -117,7 +120,8 @@ struct HasAuxiliaryLoad<
     KernelSchedule,
     UseAuxiliaryLoad,
     UseNoCopyBTma,
-    UseAColumnwiseSmemLayout
+    UseAColumnwiseSmemLayout,
+    UseBTmaEarly
   >
 > : cute::bool_constant<UseAuxiliaryLoad>{};
 
@@ -134,6 +138,7 @@ template <
   bool UseAuxiliaryLoad,
   bool UseNoCopyBTma,
   bool UseAColumnwiseSmemLayout,
+  bool UseBTmaEarly,
   class TileShape_,
   class ElementPairA_,
   class StridePairA_,
@@ -156,7 +161,8 @@ struct CollectiveMma<
         KernelScheduleType,
         UseAuxiliaryLoad,
         UseNoCopyBTma,
-        UseAColumnwiseSmemLayout>,
+        UseAColumnwiseSmemLayout,
+        UseBTmaEarly>,
     TileShape_,
     ElementPairA_,
     StridePairA_,
@@ -181,7 +187,8 @@ struct CollectiveMma<
       KernelScheduleType,
       UseAuxiliaryLoad,
       UseNoCopyBTma,
-      UseAColumnwiseSmemLayout>;
+      UseAColumnwiseSmemLayout,
+      UseBTmaEarly>;
   using TileShape = TileShape_;
   using ElementPairA = ElementPairA_;
   using ElementPairB = ElementPairB_;
@@ -1563,20 +1570,27 @@ struct CollectiveMma<
           DispatchPolicy::UseAColumnwiseSmemLayout &&
           params.a_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose) &&
           params.b_source == static_cast<int32_t>(CppMegaCompactOperandSource::kRowwise);
-      if (split_a_producer) {
-        load_sfa_a_odd_rows(write_stage, *k_tile_iter);
-      }
-      load_sfb(write_stage, *k_tile_iter);
-      if (!split_a_producer) {
-        __syncwarp();
-      }
-
       bool manual_payload =
           !DispatchPolicy::UseNoCopyBTma &&
           params.manual_payload_load &&
           params.b_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose);
       using BarrierType = typename MainloopPipelineNK::ProducerBarrierType;
       BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
+      bool issue_b_tma_early =
+          DispatchPolicy::UseBTmaEarly &&
+          split_a_producer &&
+          !manual_payload;
+      if (split_a_producer) {
+        load_sfa_a_odd_rows(write_stage, *k_tile_iter);
+      }
+      if (issue_b_tma_early && lane_predicate) {
+        copy(params.tma_load_b.with(*tma_barrier), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,write_stage));
+      }
+      load_sfb(write_stage, *k_tile_iter);
+      if (!split_a_producer) {
+        __syncwarp();
+      }
+
       uint32_t manual_transaction_bytes = params.scale_transaction_bytes_nk;
       if (split_a_producer) {
         load_payload_a_odd_rows(write_stage, *k_tile_iter);
@@ -1584,7 +1598,7 @@ struct CollectiveMma<
       if (manual_payload) {
         load_payload_b(write_stage, *k_tile_iter);
         manual_transaction_bytes += params.payload_transaction_bytes_nk;
-      } else if (lane_predicate) {
+      } else if (!issue_b_tma_early && lane_predicate) {
         copy(params.tma_load_b.with(*tma_barrier), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,write_stage));
       }
       __syncwarp();

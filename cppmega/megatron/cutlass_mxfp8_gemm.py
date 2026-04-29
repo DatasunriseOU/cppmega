@@ -183,6 +183,7 @@ def _tn_gemm_compact_direct(
     beta: float | None = None,
     asymmetric: bool = True,
     a_columnwise_smem: bool = False,
+    a_columnwise_smem_b_tma_early: bool = False,
 ) -> torch.Tensor:
     if not is_supported_shape(m, n, k):
         raise ValueError(f"unsupported CUTLASS MXFP8 GB10 shape {m}x{n}x{k}; require multiples of 128")
@@ -207,7 +208,15 @@ def _tn_gemm_compact_direct(
     beta_f = _resolve_beta(beta, bool(accumulate))
 
     ext = _load_cuda_ext()
-    if a_columnwise_smem:
+    if a_columnwise_smem_b_tma_early:
+        if not asymmetric:
+            raise ValueError("A-columnwise-smem B-TMA-early direct path requires asymmetric=True")
+        if a_source != _SOURCE_COLUMNWISE_TRANSPOSE:
+            raise ValueError("A-columnwise-smem B-TMA-early direct path requires A columnwise-transpose source")
+        if b_source != _SOURCE_ROWWISE:
+            raise ValueError("A-columnwise-smem B-TMA-early direct path requires B rowwise source")
+        entrypoint = ext.tn_gemm_compact_direct_a_col_smem_b_tma_early_asym
+    elif a_columnwise_smem:
         if not asymmetric:
             raise ValueError("A-columnwise-smem direct path requires asymmetric=True")
         if a_source != _SOURCE_COLUMNWISE_TRANSPOSE:
@@ -405,6 +414,56 @@ def tn_gemm_swizzled_scale(
     )
 
 
+def _tn_gemm_swizzled_scale_strided(
+    a_rowwise_data: torch.Tensor,
+    a_gemm_scale_inv: torch.Tensor,
+    b_rowwise_data: torch.Tensor,
+    b_gemm_scale_inv: torch.Tensor,
+    *,
+    m: int,
+    n: int,
+    k: int,
+    out: torch.Tensor,
+    out_ld: int,
+    out_offset: int,
+    accumulate: bool = False,
+    alpha: float = 1.0,
+    beta: float | None = None,
+) -> torch.Tensor:
+    """Run the stock swizzled-scale GEMM into a row-major output tile."""
+
+    if not is_supported_shape(m, n, k):
+        raise ValueError(f"unsupported CUTLASS MXFP8 GB10 shape {m}x{n}x{k}; require multiples of 128")
+    if out.dtype != torch.bfloat16:
+        raise TypeError(f"CUTLASS MXFP8 backend currently requires BF16 out, got {out.dtype}")
+    if not out.is_contiguous():
+        raise ValueError("out must be contiguous")
+    if out_ld < n:
+        raise ValueError(f"out_ld must be >= N tile, got {out_ld} < {n}")
+    if out_offset < 0:
+        raise ValueError("out_offset must be non-negative")
+    if out.numel() < out_offset + (m - 1) * out_ld + n:
+        raise ValueError("out is too small for requested strided GEMM tile")
+
+    beta_f = _resolve_beta(beta, bool(accumulate))
+    ext = _load_cuda_ext()
+    return ext.tn_gemm_swizzled_scale_strided(
+        _as_uint8_contiguous(a_rowwise_data),
+        _as_uint8_contiguous(a_gemm_scale_inv),
+        _as_uint8_contiguous(b_rowwise_data),
+        _as_uint8_contiguous(b_gemm_scale_inv),
+        int(m),
+        int(n),
+        int(k),
+        out,
+        int(out_ld),
+        int(out_offset),
+        bool(accumulate),
+        float(alpha),
+        beta_f,
+    )
+
+
 def wgrad_nt_gemm(
     dy_colwise_data: torch.Tensor,
     dy_colwise_scale_inv: torch.Tensor,
@@ -468,6 +527,7 @@ def wgrad_nt_gemm_x_rowwise_transpose(
     alpha: float = 1.0,
     beta: float | None = None,
     asymmetric: bool = True,
+    b_tma_early: bool = False,
 ) -> torch.Tensor:
     """Run wgrad NT when ``x.T`` is already saved as rowwise MXFP8.
 
@@ -508,5 +568,132 @@ def wgrad_nt_gemm_x_rowwise_transpose(
         alpha=alpha,
         beta=beta,
         asymmetric=asymmetric,
-        a_columnwise_smem=True,
+        a_columnwise_smem=not b_tma_early,
+        a_columnwise_smem_b_tma_early=b_tma_early,
     )
+
+
+def wgrad_nt_gemm_streaming_swizzled_stock(
+    dy_colwise_data: torch.Tensor,
+    dy_colwise_scale_inv: torch.Tensor,
+    x_t_rowwise_data: torch.Tensor,
+    x_t_rowwise_scale_inv: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    accumulate: bool = False,
+    alpha: float = 1.0,
+    beta: float | None = None,
+    tile_m: int = 1024,
+    tile_n: int = 2048,
+    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Probe stock CUTLASS wgrad path with bounded streaming scratch.
+
+    Computes ``dy.T[N, M] @ x[M, K]`` through the stock swizzled-scale CUTLASS
+    mainloop per output tile. It prepares only one ``dy.T`` payload/scale tile
+    and one ``x.T`` scale tile at a time, avoiding full materialized
+    ``dy.T``/GEMM-scale sidecars. The tradeoff is many GEMM launches, so this is
+    experimental and is not used by default.
+    """
+
+    if dy_colwise_data.dim() != 2 or dy_colwise_scale_inv.dim() != 2:
+        raise ValueError("dy columnwise payload/scales must be 2D")
+    if x_t_rowwise_data.dim() != 2 or x_t_rowwise_scale_inv.dim() != 2:
+        raise ValueError("x.T rowwise payload/scales must be 2D")
+    if int(dy_colwise_data.shape[0]) != int(x_t_rowwise_data.shape[1]):
+        raise ValueError(
+            "wgrad reduction mismatch: "
+            f"dy is {tuple(dy_colwise_data.shape)}, x.T is {tuple(x_t_rowwise_data.shape)}"
+        )
+    if accumulate and out is None:
+        raise ValueError("streaming swizzled stock accumulate=True requires an explicit out tensor")
+
+    m = int(dy_colwise_data.shape[1])
+    n = int(x_t_rowwise_data.shape[0])
+    k = int(dy_colwise_data.shape[0])
+    if not is_supported_shape(m, n, k):
+        raise ValueError(f"unsupported CUTLASS MXFP8 GB10 shape {m}x{n}x{k}; require multiples of 128")
+    if tile_m <= 0 or tile_n <= 0 or tile_m % 128 or tile_n % 128:
+        raise ValueError("tile_m and tile_n must be positive multiples of 128")
+    if int(dy_colwise_scale_inv.shape[0]) < k // 32 or int(dy_colwise_scale_inv.shape[1]) < m:
+        raise ValueError("dy columnwise scale shape is too small")
+    if int(x_t_rowwise_scale_inv.shape[0]) < n or int(x_t_rowwise_scale_inv.shape[1]) < k // 32:
+        raise ValueError("x.T rowwise scale shape is too small")
+
+    if out is None:
+        result = torch.empty((m, n), device=dy_colwise_data.device, dtype=torch.bfloat16)
+    else:
+        if out.dtype != torch.bfloat16:
+            raise TypeError(f"CUTLASS MXFP8 backend currently requires BF16 out, got {out.dtype}")
+        if out.numel() < m * n:
+            raise ValueError(f"out is too small for {m}x{n}")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
+        result = out.view(m, n)
+
+    beta_f = _resolve_beta(beta, bool(accumulate))
+    ext = _load_cuda_ext()
+    max_tile_m = min(tile_m, m)
+    max_tile_n = min(tile_n, n)
+    if scratch is None:
+        a_tile = torch.empty((max_tile_m, k), device=dy_colwise_data.device, dtype=torch.uint8)
+        sfa_tile = torch.empty((max_tile_m, k // 32), device=dy_colwise_data.device, dtype=torch.uint8)
+        sfb_tile = torch.empty((max_tile_n, k // 32), device=dy_colwise_data.device, dtype=torch.uint8)
+    else:
+        a_tile, sfa_tile, sfb_tile = scratch
+        expected = ((max_tile_m, k), (max_tile_m, k // 32), (max_tile_n, k // 32))
+        actual = (tuple(a_tile.shape), tuple(sfa_tile.shape), tuple(sfb_tile.shape))
+        if actual != expected:
+            raise ValueError(f"streaming scratch shape mismatch: expected {expected}, got {actual}")
+        for name, tensor in (
+            ("a_tile", a_tile),
+            ("sfa_tile", sfa_tile),
+            ("sfb_tile", sfb_tile),
+        ):
+            if tensor.dtype != torch.uint8 or tensor.device != dy_colwise_data.device or not tensor.is_contiguous():
+                raise ValueError(f"{name} scratch must be contiguous uint8 on the input device")
+
+    dy_data = _as_uint8_contiguous(dy_colwise_data)
+    dy_scale = _as_uint8_contiguous(dy_colwise_scale_inv)
+    x_t_data = _as_uint8_contiguous(x_t_rowwise_data)
+    x_t_scale = _as_uint8_contiguous(x_t_rowwise_scale_inv)
+
+    for m_start in range(0, m, tile_m):
+        cur_m = min(tile_m, m - m_start)
+        ext.prepare_wgrad_stock_a_tile(
+            dy_data,
+            dy_scale,
+            a_tile,
+            sfa_tile,
+            int(m_start),
+            int(cur_m),
+            int(k),
+            int(dy_data.shape[1]),
+            int(dy_scale.shape[1]),
+        )
+        for n_start in range(0, n, tile_n):
+            cur_n = min(tile_n, n - n_start)
+            ext.prepare_wgrad_stock_b_scale_tile(
+                x_t_scale,
+                sfb_tile,
+                int(n_start),
+                int(cur_n),
+                int(k),
+                int(x_t_scale.shape[1]),
+            )
+            _tn_gemm_swizzled_scale_strided(
+                a_tile,
+                sfa_tile,
+                x_t_data[n_start : n_start + cur_n, :],
+                sfb_tile,
+                m=cur_m,
+                n=cur_n,
+                k=k,
+                out=result,
+                out_ld=n,
+                out_offset=m_start * n + n_start,
+                accumulate=accumulate,
+                alpha=alpha,
+                beta=beta_f,
+            )
+    return result
