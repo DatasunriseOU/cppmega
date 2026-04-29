@@ -185,8 +185,135 @@ if triton is not None and tl is not None:
             mask=(offs_r[:, None] < R) & (offs_n[None, :] < N),
         )
 
+    @triton.jit
+    def _rr_diag_post_chunk_kernel(
+        DOUT,
+        Q,
+        K,
+        V,
+        Q_BIAS,
+        K_BIAS,
+        MIMO_V,
+        MIMO_O,
+        QK_DOT,
+        DT,
+        TRAP,
+        DK,
+        DQ,
+        DGAMMA_DIAG,
+        B: tl.constexpr,
+        S: tl.constexpr,
+        H: tl.constexpr,
+        G: tl.constexpr,
+        N: tl.constexpr,
+        P: tl.constexpr,
+        R: tl.constexpr,
+        CHUNK: tl.constexpr,
+        NCHUNKS: tl.constexpr,
+        BLOCK_R: tl.constexpr,
+        BLOCK_P: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        chunk_id = pid % NCHUNKS
+        tmp = pid // NCHUNKS
+        h = tmp % H
+        b = tmp // H
+        h_qk = h // (H // G)
+        chunk_start = chunk_id * CHUNK
+
+        offs_r = tl.arange(0, BLOCK_R)
+        offs_p = tl.arange(0, BLOCK_P)
+        offs_n = tl.arange(0, BLOCK_N)
+        mimo_base = h * R * P
+        bias_base = h * R * N
+
+        for local_cs in tl.static_range(0, CHUNK):
+            s = chunk_start + local_cs
+            valid_s = s < S
+            dout_base = ((b * S + s) * H + h) * P
+            dphi = tl.load(
+                DOUT + dout_base + offs_p[None, :],
+                mask=valid_s & (offs_p[None, :] < P),
+                other=0.0,
+            ).to(tl.float32) * tl.load(
+                MIMO_O + mimo_base + offs_r[:, None] * P + offs_p[None, :],
+                mask=(offs_r[:, None] < R) & (offs_p[None, :] < P),
+                other=0.0,
+            ).to(tl.float32)
+            psiv = tl.load(
+                V + dout_base + offs_p[:, None],
+                mask=valid_s & (offs_p[:, None] < P),
+                other=0.0,
+            ).to(tl.float32) * tl.load(
+                MIMO_V + mimo_base + offs_r[None, :] * P + offs_p[:, None],
+                mask=(offs_p[:, None] < P) & (offs_r[None, :] < R),
+                other=0.0,
+            ).to(tl.float32)
+            dqk = tl.dot(dphi, psiv, input_precision="ieee", out_dtype=tl.float32)
+
+            qk_base = ((b * H + h) * S + s) * R * R
+            qk = tl.load(
+                QK_DOT + qk_base + offs_r[:, None] * R + offs_r[None, :],
+                mask=valid_s & (offs_r[:, None] < R) & (offs_r[None, :] < R),
+                other=0.0,
+            ).to(tl.float32)
+            dg = tl.sum(tl.sum(dqk * qk, axis=0), axis=0)
+            tl.store(DGAMMA_DIAG + (b * H + h) * S + s, dg, mask=valid_s)
+
+            gamma_base = (b * H + h) * S + s
+            dt = tl.load(DT + gamma_base, mask=valid_s, other=0.0).to(tl.float32)
+            trap = tl.load(TRAP + gamma_base, mask=valid_s, other=0.0).to(tl.float32)
+            gamma = dt * tl.sigmoid(trap)
+            scaled = dqk * gamma
+
+            q_base = ((b * S * R + s * R) * G + h_qk) * N
+            q_pre = tl.load(
+                Q + q_base + offs_r[:, None] * G * N + offs_n[None, :],
+                mask=valid_s & (offs_r[:, None] < R) & (offs_n[None, :] < N),
+                other=0.0,
+            ).to(tl.float32) + tl.load(
+                Q_BIAS + bias_base + offs_r[:, None] * N + offs_n[None, :],
+                mask=(offs_r[:, None] < R) & (offs_n[None, :] < N),
+                other=0.0,
+            ).to(tl.float32)
+            k_pre = tl.load(
+                K + q_base + offs_r[:, None] * G * N + offs_n[None, :],
+                mask=valid_s & (offs_r[:, None] < R) & (offs_n[None, :] < N),
+                other=0.0,
+            ).to(tl.float32) + tl.load(
+                K_BIAS + bias_base + offs_r[:, None] * N + offs_n[None, :],
+                mask=(offs_r[:, None] < R) & (offs_n[None, :] < N),
+                other=0.0,
+            ).to(tl.float32)
+            dk_delta = tl.dot(tl.trans(scaled), q_pre, input_precision="ieee", out_dtype=tl.float32)
+            dq_delta = tl.dot(scaled, k_pre, input_precision="ieee", out_dtype=tl.float32)
+
+            out_base = ((b * S * R + s * R) * H + h) * N
+            dk_old = tl.load(
+                DK + out_base + offs_r[:, None] * H * N + offs_n[None, :],
+                mask=valid_s & (offs_r[:, None] < R) & (offs_n[None, :] < N),
+                other=0.0,
+            ).to(tl.float32)
+            dq_old = tl.load(
+                DQ + out_base + offs_r[:, None] * H * N + offs_n[None, :],
+                mask=valid_s & (offs_r[:, None] < R) & (offs_n[None, :] < N),
+                other=0.0,
+            ).to(tl.float32)
+            tl.store(
+                DK + out_base + offs_r[:, None] * H * N + offs_n[None, :],
+                dk_old + dk_delta,
+                mask=valid_s & (offs_r[:, None] < R) & (offs_n[None, :] < N),
+            )
+            tl.store(
+                DQ + out_base + offs_r[:, None] * H * N + offs_n[None, :],
+                dq_old + dq_delta,
+                mask=valid_s & (offs_r[:, None] < R) & (offs_n[None, :] < N),
+            )
+
 else:
     _rr_diag_post_kernel = None
+    _rr_diag_post_chunk_kernel = None
 
 
 @dataclass(frozen=True)
@@ -276,6 +403,20 @@ VARIANTS: dict[str, dict[str, Any]] = {
         "bb_threads": 256,
         "bb_num_stages": 0,
         "post_diag_triton": True,
+    },
+    "stage2_rr_diag_triton_chunk": {
+        "patch": "stage2_force_nontma",
+        "patch_files": [
+            "mamba3_bwd_stage2_force_nontma.patch",
+            "mamba3_bwd_stage2_rr_diag_skip.patch",
+        ],
+        "flattened_inputs": True,
+        "flat_qk_dot": True,
+        "bf_threads": 128,
+        "bf_num_stages": 1,
+        "bb_threads": 256,
+        "bb_num_stages": 0,
+        "post_diag_triton": "chunk",
     },
 }
 
@@ -832,6 +973,71 @@ def _apply_rr_diag_post_triton(
     )
 
 
+def _apply_rr_diag_post_triton_chunk(
+    shape: Shape,
+    inputs: dict[str, Any],
+    outputs: dict[str, Any],
+    *,
+    flattened_inputs: bool,
+) -> None:
+    if not flattened_inputs:
+        raise RuntimeError("stage2_rr_diag_triton_chunk expects flattened Q/K inputs")
+    if triton is None or _rr_diag_post_chunk_kernel is None:
+        raise RuntimeError("triton is not importable; cannot run rr_diag chunk post-kernel")
+
+    import math
+
+    block_p = triton.next_power_of_2(shape.P)
+    block_n = triton.next_power_of_2(shape.N)
+    nchunks = math.ceil(shape.S / shape.chunk)
+    grid = (shape.B * shape.H * nchunks,)
+    _rr_diag_post_chunk_kernel[grid](
+        inputs["dout"],
+        inputs["q_flat"],
+        inputs["k_flat"],
+        inputs["v"],
+        inputs["q_bias"],
+        inputs["k_bias"],
+        inputs["mimo_v"],
+        inputs["mimo_o"],
+        outputs["qk_dot"],
+        inputs["dt"],
+        inputs["trap"],
+        outputs["dk"],
+        outputs["dq"],
+        outputs["dgamma_diag"],
+        shape.B,
+        shape.S,
+        shape.H,
+        shape.G,
+        shape.N,
+        shape.P,
+        shape.R,
+        shape.chunk,
+        nchunks,
+        16,
+        block_p,
+        block_n,
+        num_warps=4,
+    )
+
+
+def _apply_rr_diag_post(
+    shape: Shape,
+    inputs: dict[str, Any],
+    outputs: dict[str, Any],
+    *,
+    flattened_inputs: bool,
+    post_diag_triton: Any,
+) -> None:
+    if post_diag_triton is True:
+        _apply_rr_diag_post_triton(shape, inputs, outputs, flattened_inputs=flattened_inputs)
+    elif post_diag_triton == "chunk":
+        _apply_rr_diag_post_triton_chunk(shape, inputs, outputs, flattened_inputs=flattened_inputs)
+    elif post_diag_triton:
+        raise RuntimeError(f"unknown post_diag_triton mode: {post_diag_triton!r}")
+
+
 def _run_pair(
     shape: Shape,
     bf_kernel: Any,
@@ -849,7 +1055,13 @@ def _run_pair(
     bf_kernel(*bf_args)
     bb_kernel(*bb_args)
     if post_diag_triton:
-        _apply_rr_diag_post_triton(shape, inputs, outputs, flattened_inputs=flattened_inputs)
+        _apply_rr_diag_post(
+            shape,
+            inputs,
+            outputs,
+            flattened_inputs=flattened_inputs,
+            post_diag_triton=post_diag_triton,
+        )
     torch.cuda.synchronize()
     return outputs
 
@@ -922,13 +1134,25 @@ def _time_pair(
     def run_bb() -> None:
         bb_kernel(*bb_args)
         if post_diag_triton:
-            _apply_rr_diag_post_triton(shape, inputs, outputs, flattened_inputs=flattened_inputs)
+            _apply_rr_diag_post(
+                shape,
+                inputs,
+                outputs,
+                flattened_inputs=flattened_inputs,
+                post_diag_triton=post_diag_triton,
+            )
 
     def run_chain() -> None:
         bf_kernel(*bf_args)
         bb_kernel(*bb_args)
         if post_diag_triton:
-            _apply_rr_diag_post_triton(shape, inputs, outputs, flattened_inputs=flattened_inputs)
+            _apply_rr_diag_post(
+                shape,
+                inputs,
+                outputs,
+                flattened_inputs=flattened_inputs,
+                post_diag_triton=post_diag_triton,
+            )
 
     bf_kernel(*bf_args)
     torch.cuda.synchronize()
