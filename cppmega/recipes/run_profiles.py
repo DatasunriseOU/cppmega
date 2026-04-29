@@ -430,6 +430,16 @@ def get_run_profile(name: str) -> RunProfile:
 def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
     """Render the profile to shell assignments consumed by legacy launchers."""
 
+    if (
+        profile.precision.fp8_recipe == "mxfp8"
+        and profile.precision.mxfp8_compact_columnwise_backward
+        and profile.precision.mxfp8_bwd_backend != "cutlass_native"
+    ):
+        raise ValueError(
+            "mxfp8_compact_columnwise_backward requires "
+            "mxfp8_bwd_backend='cutlass_native'"
+        )
+
     env: dict[str, str] = {
         "CPPMEGA_RUN_PROFILE": profile.name,
         "CPPMEGA_NEM_PATTERN": profile.model.pattern,
@@ -653,6 +663,14 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.precision.mxfp8_compact_columnwise_backward = (
             args.mxfp8_compact_columnwise_backward
         )
+        if args.mxfp8_compact_columnwise_backward:
+            if args.mxfp8_bwd_backend is None:
+                profile.precision.mxfp8_bwd_backend = "cutlass_native"
+            elif args.mxfp8_bwd_backend != "cutlass_native":
+                raise ValueError(
+                    "--mxfp8-compact-columnwise-backward requires "
+                    "--mxfp8-bwd-backend cutlass_native"
+                )
     if args.mxfp8_flashinfer_runner is not None:
         profile.precision.mxfp8_flashinfer_runner = args.mxfp8_flashinfer_runner
     if args.mxfp8_flashinfer_tactic is not None:
