@@ -1,4 +1,4 @@
-"""Bounded Modal benchmark for Mamba3 MIMO stage-2 force-nonTMA WS.
+"""Bounded Modal benchmark for Mamba3 MIMO bwd_bwd streaming live-set rewrite.
 
 Compares two non-production variants on Hopper GPUs:
   * baseline: upstream non-TMA/non-WS TileLang kernels
@@ -15,17 +15,17 @@ compact summary for run logs. It does not change production defaults.
 Run examples:
 
     GHCR_TAG=785c3fd CPPMEGA_MODAL_GPU=H200:2 timeout 10m \
-        modal run scripts/modal_mamba3_stage2_force_nontma_benchmark.py \
+        modal run scripts/modal_mamba3_bwd_bwd_streaming_live_set_benchmark.py \
         --shape-csv representative --iters 8 --warmup 2
 
     GHCR_TAG=785c3fd CPPMEGA_MODAL_GPU=H200:2 timeout 12m \
-        modal run scripts/modal_mamba3_stage2_force_nontma_benchmark.py \
+        modal run scripts/modal_mamba3_bwd_bwd_streaming_live_set_benchmark.py \
         --shape-csv productionish --iters 4 --warmup 1
 
     GHCR_TAG=785c3fd CPPMEGA_MODAL_GPU=H200:2 timeout 15m \
-        modal run scripts/modal_mamba3_stage2_force_nontma_benchmark.py \
+        modal run scripts/modal_mamba3_bwd_bwd_streaming_live_set_benchmark.py \
         --shape-csv productionish \
-        --variant-csv baseline,stage2_bf1_bb0,streaming_live_set_bf1_bb0,streaming_live_set_bf1_bb1 \
+        --variant-csv stage2_bf1_bb0,streaming_live_set_bf1_bb0,streaming_live_set_bf1_bb1 \
         --torch-profile \
         --iters 4 --warmup 1
 """
@@ -48,11 +48,11 @@ GHCR_REF = f"{GHCR_REPO}:{GHCR_TAG}"
 GPU_SPEC = os.environ.get("CPPMEGA_MODAL_GPU", "H200:2")
 BENCH_VOLUME_NAME = os.environ.get("CPPMEGA_MODAL_BENCH_VOLUME", "cppmega-mamba3-benchmarks")
 
-APP_NAME = "cppmega-mamba3-stage2-force-nontma-benchmark"
+APP_NAME = "cppmega-mamba3-bwd-bwd-streaming-live-set-benchmark"
 SOURCE_ROOT = "/opt/state-spaces-mamba"
 CPPMEGA_ROOT = "/opt/cppmega"
 BENCH_ROOT = "/benchmarks"
-BENCH_PREFIX = "mamba3_stage2_force_nontma_benchmark"
+BENCH_PREFIX = "mamba3_bwd_bwd_streaming_live_set_benchmark"
 
 bench_volume = modal.Volume.from_name(BENCH_VOLUME_NAME, create_if_missing=True)
 
@@ -255,8 +255,6 @@ def _selected_variants(variant_csv: str) -> list[str]:
         variants.append(name)
     if not variants:
         raise ValueError("at least one variant is required")
-    if "baseline" not in variants:
-        variants.insert(0, "baseline")
     return variants
 
 
@@ -960,25 +958,29 @@ def _strip_tensors(result: dict[str, Any]) -> dict[str, Any]:
 
 def _compare_shape(shape_result: dict[str, Any]) -> dict[str, Any]:
     variants = {entry["variant"]: entry for entry in shape_result["variants"]}
-    baseline = variants.get("baseline")
-    if not baseline or baseline.get("status") != "ok":
+    reference = next((entry for entry in shape_result["variants"] if entry.get("status") == "ok"), None)
+    if not reference:
         return {"status": "missing_ok_baseline"}
 
-    comparisons: dict[str, Any] = {"status": "ok", "vs_baseline": {}}
+    comparisons: dict[str, Any] = {
+        "status": "ok",
+        "baseline_variant": reference["variant"],
+        "vs_baseline": {},
+    }
     for variant_name, variant_result in variants.items():
-        if variant_name == "baseline":
+        if variant_name == reference["variant"]:
             continue
         if variant_result.get("status") != "ok":
             comparisons["vs_baseline"][variant_name] = {"status": "missing_ok_variant"}
             continue
         diffs = _compare_outputs(
             Shape(**shape_result["shape"]),
-            baseline["correctness_outputs"],
+            reference["correctness_outputs"],
             variant_result["correctness_outputs"],
         )
         speedups: dict[str, float | None] = {}
         for phase in ("bwd_fwd", "bwd_bwd", "chain"):
-            base_mean = baseline["elapsed"][phase]["mean_ms"]
+            base_mean = reference["elapsed"][phase]["mean_ms"]
             cand_mean = variant_result["elapsed"][phase]["mean_ms"]
             speedups[phase] = base_mean / cand_mean if cand_mean else None
         comparisons["vs_baseline"][variant_name] = {
@@ -1166,7 +1168,7 @@ def run_benchmark(
 def main(
     run_id: str | None = None,
     shape_csv: str = "representative",
-    variant_csv: str = "baseline,stage2_force_nontma",
+    variant_csv: str = "baseline,stage2_bf1_bb0,streaming_live_set_bf1_bb0,streaming_live_set_bf1_bb1",
     warmup: int = 2,
     iters: int = 8,
     torch_profile: bool = False,

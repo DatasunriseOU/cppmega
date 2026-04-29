@@ -1,0 +1,58 @@
+--- a/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
++++ b/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
+@@ -856 +856,2 @@
+-                dPsiV_D_fused_frag = T.alloc_fragment([fused_chunk_size, P], accum_dtype)
++                # Streaming live-set rewrite: update dPsiV_frag in-place instead
++                # of keeping a second full [chunk*R, P] accumulator live.
+@@ -861,3 +862 @@
+-                        dPsiV_D_fused_frag[csr, p] = dPsiV_frag[csr, p] + dPhiO_shared[csr, p]*D_frag
+-                else:
+-                    T.copy(dPsiV_frag, dPsiV_D_fused_frag)
++                        dPsiV_frag[csr, p] += dPhiO_shared[csr, p] * D_frag
+@@ -876,2 +875,2 @@
+-                        dPsiV_D_fused_frag[csr, p] += dPhiO_shared[csr_out, p] * qk_dot_shared[cs, r_out * R + r_in] * gamma_dPsiV_frag[cs]
+-                T.copy(dPsiV_D_fused_frag, dPsiV_combined_shared)
++                        dPsiV_frag[csr, p] += dPhiO_shared[csr_out, p] * qk_dot_shared[cs, r_out * R + r_in] * gamma_dPsiV_frag[cs]
++                T.copy(dPsiV_frag, dPsiV_combined_shared)
+@@ -897,8 +896,3 @@
+-                # Compute Psi_V
+-                PsiV_frag = T.alloc_fragment([chunk_size, R, P], dtype)
+-                T.clear(PsiV_frag)
+-                for cs, p in T.Parallel(chunk_size, P):
+-                    for r in T.serial(R):
+-                        PsiV_frag[cs, r, p] += v_frag[cs, p] * Psi_frag[r, p]
+-                # NOTE: Tilelang unable to perform gemm with reshaped PsiV_frag
+-                # so have to copy to smem
++                # Compute Psi_V directly in shared memory. This removes the
++                # full [chunk, R, P] PsiV_frag that only existed as a staging
++                # buffer before the GEMMs below.
+@@ -907 +901 @@
+-                    PsiV_shared[cs*R + r, p] = PsiV_frag[cs, r, p]
++                    PsiV_shared[cs*R + r, p] = v_frag[cs, p] * Psi_frag[r, p]
+@@ -912,5 +905,0 @@
+-                # Compute dgamma_diag.
+-                # TMA-fix: dgamma_diag_prereduce_frag flattened to [chunk_size, R*R] to
+-                # match the 2D qk_dot_shared. The reduce_sum below no longer needs a view.
+-                dgamma_diag_prereduce_frag = T.alloc_fragment([chunk_size, R * R], accum_dtype)
+-                T.copy(qk_dot_shared, dgamma_diag_prereduce_frag)
+@@ -918,3 +907,2 @@
+-                for cs, r_out, r_in in T.Parallel(chunk_size, R, R):
+-                    dgamma_diag_prereduce_frag[cs, r_out * R + r_in] *= dqk_from_diag_shared[cs*R + r_out, cs*R + r_in]
+-
++                # Streaming reduce over the per-step R x R diagonal blocks
++                # instead of materializing [chunk, R*R] prereduce storage.
+@@ -922,6 +910,8 @@
+-                T.reduce_sum(
+-                    dgamma_diag_prereduce_frag,
+-                    dgamma_diag_reduced_frag,
+-                    dim=-1,
+-                    clear=True
+-                    )
++                T.clear(dgamma_diag_reduced_frag)
++                for cs in T.Parallel(chunk_size):
++                    for r_out in T.serial(R):
++                        for r_in in T.serial(R):
++                            dgamma_diag_reduced_frag[cs] += (
++                                qk_dot_shared[cs, r_out * R + r_in]
++                                * dqk_from_diag_shared[cs*R + r_out, cs*R + r_in]
++                            )
