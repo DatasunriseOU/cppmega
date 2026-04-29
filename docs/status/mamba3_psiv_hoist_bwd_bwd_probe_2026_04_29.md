@@ -189,13 +189,65 @@ Notes:
 - A production patch still needs a decision on whether to keep this as a local
   backward intermediate or promote a fuller fwd/bwd saved PsiV cache API.
 
-## Worth Production Work?
+## Parent Follow-Up: Productionish A/B
 
-Tentative: worth one productionish H200 A/B, not yet worth production
-integration. The change is small, compiles on H200, is bit-exact on the reduced
-shape, and attacks the exact P3-identified live range. The likely gain is still
-bounded because only `PsiV_frag` and the multiply loop are removed while
-`v_frag`, `Psi_frag`, and `PsiV_shared` remain, and the patch adds a global
-memory write/read of `[B, H, S * R, P]`. Production work should require a
-productionish shape run layered on the stage2 force-nonTMA patch and a
-neutral-to-positive end-to-end timing result.
+After the agent handoff, the harness was corrected so `after_stage2` compares
+`stage2` vs `stage2+PsiV`, instead of comparing patched output against the
+unpatched upstream source. The remote function now receives `shape_name`,
+`warmup`, `iters`, and `patch_mode` as explicit Modal call arguments, because
+container-side re-import does not inherit local shell environment defaults.
+
+Command:
+
+```text
+GHCR_TAG=785c3fd \
+CPPMEGA_MODAL_GPU=H200:1 \
+CPPMEGA_PSIV_SHAPE=productionish \
+CPPMEGA_PSIV_WARMUP=1 \
+CPPMEGA_PSIV_ITERS=4 \
+timeout 900s \
+modal run scripts/modal_mamba3_psiv_hoist_probe.py
+```
+
+App:
+
+- `ap-AoxLO9oHniZSgmbwwcJ2n9`
+- state after run: stopped
+
+Device:
+
+- GPU: `NVIDIA H200`, capability `(9, 0)`, device count `1`
+- image: `ghcr.io/jewelmusicee/cppmega:785c3fd`
+- Torch: `2.13.0.dev20260426+cu132`
+- CUDA: `13.2`
+
+Shape:
+
+```text
+B=4, S=4096, H=32, G=1, N=64, P=128, R=4, chunk=16
+```
+
+Correctness:
+
+- all returned non-None tensors were bit-exact vs stage2:
+  `dQ`, `dK`, `dV`, `dADT`, `dDT`, `dTrap`, `dQ_bias`, `dK_bias`,
+  `dMIMO_V`, `dMIMO_Out`, `dAngles`.
+
+Timing:
+
+| Variant | Warmup | Iters | Mean ms |
+| --- | ---: | ---: | ---: |
+| stage2 | 1 | 4 | 6.1175 |
+| stage2+PsiV | 1 | 4 | 6.2702 |
+
+Read:
+
+Current PsiV-hoist is a **discard** for production. It is correct and removes
+the local `PsiV_frag = v * Psi` recompute, but the `[B, H, S*R, P]` global cache
+write/read is more expensive than the saved recompute/live fragment on the
+productionish H200 shape.
+
+The remaining useful lesson is narrower: PsiV hoist only becomes attractive if
+we can keep it on-chip, fuse it into an already-needed state buffer, or remove
+more than just `PsiV_frag`. The standalone global cache variant should not be
+integrated.
