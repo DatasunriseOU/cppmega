@@ -245,3 +245,149 @@ Recommended next wave:
 3. If P_TILE variants still compile only at 64, focus on reducing global scratch
    traffic or splitting state passing from full-P reductions rather than trying
    `num_stages=1` on the current monolithic loop.
+
+## Wave 2 - DSTATES_PTILE Minimal Scratch-Copy Legality
+
+Status: `evidence`
+
+Branch: `worker/mamba3-ptile-layout-tma`
+
+Base: `d543a4a`
+
+Cutoff: stopped launching new experiments at user request after the minimal
+scratch-copy probe and one clean full-kernel `P_TILE=32` smoke. The full
+`P_TILE=32/64/128` matrix did not complete, so there is no clean productionish
+table for this wave.
+
+### Added Reproducer
+
+- `scripts/modal_tilelang_dstates_ptile_copy_probe.py`
+
+The script is a self-contained Modal H200 harness for four minimal copy forms:
+
+- `rank2_dynamic_fragment`: global rank-2 `[B*H*N, P]` scratch with dynamic
+  `p_start = p_block * P_TILE`, copied directly to a fragment and back.
+- `rank2_dynamic_shared`: the same rank-2 dynamic `p_start` descriptor copied
+  global -> shared -> fragment -> shared -> global.
+- `rank5_static_fragment`: DSTATES-like rank-5 `[B,H,n_p_tiles,N,P_TILE]`
+  descriptor copied directly to a fragment and back.
+- `rank5_static_shared`: the same rank-5 descriptor copied global -> shared ->
+  fragment -> shared -> global.
+
+Each form is compiled/run with:
+
+- TMA lowering enabled and disabled.
+- Per-copy `disable_tma=False` and `disable_tma=True`.
+- Shape `B=1,H=2,N=16,P=128,P_TILE=64`, dtype `bfloat16`.
+
+Local validation:
+
+```text
+python -m py_compile scripts/modal_tilelang_dstates_ptile_copy_probe.py
+```
+
+### Minimal H200 Scratch-Copy Probe
+
+Command:
+
+```text
+GHCR_TAG=785c3fd CPPMEGA_MODAL_GPU=H200:1 timeout 1200 modal run \
+  scripts/modal_tilelang_dstates_ptile_copy_probe.py
+```
+
+App: `ap-2oU8mhmbIIIudNjGLlzfg3`, stopped normally.
+
+Image/device:
+
+- `ghcr.io/jewelmusicee/cppmega:785c3fd`
+- `NVIDIA H200`, capability `(9, 0)`, device count `1`
+- Torch `2.13.0.dev20260426+cu132`, CUDA `13.2`
+- TileLang `0.1.8+cu132.gitf309d814`
+
+Result: all 16 combinations compiled and ran a roundtrip smoke with
+`max_abs=0.0` and exact `allclose_0=true`.
+
+| form | TMA lower | per-copy `disable_tma` | compile | run | TMA source markers |
+| --- | --- | --- | --- | --- | --- |
+| `rank2_dynamic_fragment` | on/off | false/true | ok | exact roundtrip | no TMA load/store |
+| `rank2_dynamic_shared` | on | false | ok | exact roundtrip | `tma_store_count=3`, no TMA load |
+| `rank2_dynamic_shared` | on | true | ok | exact roundtrip | no TMA load/store |
+| `rank2_dynamic_shared` | off | false/true | ok | exact roundtrip | no TMA load/store |
+| `rank5_static_fragment` | on/off | false/true | ok | exact roundtrip | no TMA load/store |
+| `rank5_static_shared` | on | false | ok | exact roundtrip | `tma_store_count=3`, no TMA load |
+| `rank5_static_shared` | on | true | ok | exact roundtrip | no TMA load/store |
+| `rank5_static_shared` | off | false/true | ok | exact roundtrip | no TMA load/store |
+
+Legal minimal forms:
+
+- Rank-2 flattened global scratch with dynamic `p_start` indexing is legal for
+  both fragment-direct and shared-staged copies.
+- Rank-5 DSTATES-like scratch is legal for both fragment-direct and
+  shared-staged copies.
+- Per-copy `disable_tma=True` is legal in the minimal reproducer and suppresses
+  the TMA store lowering on shared-staged global stores.
+
+Illegal minimal forms:
+
+- None found in the isolated reproducer. The Wave 1
+  `target function must be a PrimFunc but got <class 'NoneType'>` blocker does
+  not reproduce from scratch-copy legality alone.
+
+### Full Cross-P Retest
+
+No scratch-guard edits were applied. The full harness used the existing
+`mamba3_bwd_stage2_force_nontma.patch` plus
+`mamba3_bwd_bwd_crossp_accum_prototype.patch`.
+
+Clean smoke:
+
+```text
+GHCR_TAG=785c3fd CPPMEGA_MODAL_GPU=H200:2 timeout 1500 modal run \
+  scripts/modal_mamba3_bwd_bwd_crossp_accum.py \
+  --shape-csv smoke_p128 --warmup 0 --iters 1 \
+  --p-tile 32 --crossp-num-stages 0
+```
+
+App: `ap-UxkhUKErJcz4o0kdV1h3vF`, stopped normally.
+
+| shape | P_TILE | correctness | stage2 bwd_bwd | cross-P bwd_bwd | slowdown | scratch | source markers |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | --- |
+| `smoke_p128` | 32 | `12/12` allclose | `0.3110 ms` | `0.4236 ms` | `1.362x` | `64 KiB` | cross-P `tma_load_count=0`, `tma_store_count=0`, `dynamic_scratch_tma_guarded=false` |
+
+Comparison points:
+
+- Versus Wave 1 / d543 `P_TILE=64` smoke (`0.4006 ms`), this `P_TILE=32`
+  smoke is about `1.057x` slower.
+- The Wave 1 / d543 productionish reference remains stage2 `3.7137 ms`,
+  cross-P `4.9808 ms`; Wave 2 did not reach productionish retests before
+  cutoff.
+
+Blocked/incomplete full retests:
+
+| variant | app | result |
+| --- | --- | --- |
+| `P_TILE=64`, first retry | `ap-y4qGZnHG7MQuJ2DgLQBHU7` | Modal stopped before import completed; no SUMMARY_JSON and no kernel verdict. |
+| `P_TILE=64`, second retry | `ap-6hC2ck7AJAIfsMzQbVM2kG` | Interrupted during TileLang/NVCC compile with `KeyboardInterrupt` and `RemoteError`; no SUMMARY_JSON and no kernel verdict. |
+| `P_TILE=128` | not launched | Cutoff arrived before launch. |
+| productionish `P_TILE=32/64/128` | not launched | Cutoff arrived before productionish matrix. |
+
+Modal cleanup: all apps launched by this wave are stopped with `0` tasks. The
+pre-existing deployed `cppmega-pre...` app was left untouched.
+
+### Wave 2 Read
+
+The minimal legality target was successful: scratch-copy forms are not the
+isolated cause of `PrimFunc None`. The remaining blocker is integration-specific
+in the full cross-P kernel or in the prior scratch-guard edit context.
+
+Wave 3 recommendation:
+
+1. Keep the new minimal scratch-copy probe as a regression harness.
+2. Resume full-kernel retest from `P_TILE=64` and `P_TILE=128` without changing
+   scratch guards; use longer Modal timeouts or a prewarmed compile cache to
+   avoid the NVCC interruption seen here.
+3. If `P_TILE=64/128` compile cleanly, run the productionish table for
+   `P_TILE=32/64/128` against stage2 and d543/f77 references.
+4. Do not spend Wave 3 on isolated scratch `disable_tma=True`; the standalone
+   forms are legal. Focus on the full-kernel interaction around pipeline layout,
+   scratch copy placement, and prior scratch-guard transformations.
