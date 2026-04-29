@@ -43,6 +43,7 @@ _COMPACT_COLUMNWISE_BACKEND = "cutlass_native_compact_direct"
 _PURE_FLASHINFER_COMPACT_REASON: CompactColumnwiseReason = (
     "flashinfer_mm_mxfp8_no_compact_columnwise"
 )
+_SWIZZLED_SCALE_CACHE_ATTR = "_cppmega_flashinfer_mxfp8_swizzled_scale_cache"
 
 
 @dataclass(frozen=True)
@@ -416,7 +417,43 @@ def swizzle_rowwise_scale(
     return out
 
 
-def _scale_for_rowwise_matrix(
+def _swizzled_scale_numel(rows: int, cols: int) -> int:
+    k_blocks = (cols + 31) // 32
+    padded_rows = ((rows + 127) // 128) * 128
+    padded_k_blocks = ((k_blocks + 3) // 4) * 4
+    return padded_rows * padded_k_blocks
+
+
+def _validate_pre_swizzled_scale(scale: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    expected = _swizzled_scale_numel(rows, cols)
+    if scale.numel() != expected:
+        k_blocks = (cols + 31) // 32
+        padded_rows = ((rows + 127) // 128) * 128
+        padded_k_blocks = ((k_blocks + 3) // 4) * 4
+        raise ValueError(
+            f"pre-swizzled scale has {scale.numel()} elements, "
+            f"expected {expected} (padded_rows={padded_rows}, "
+            f"padded_k_blocks={padded_k_blocks})"
+        )
+    return scale.reshape(-1)
+
+
+def _rowwise_scale_cache_key(scale: torch.Tensor, rows: int, cols: int) -> tuple[Any, ...]:
+    version = int(getattr(scale, "_version", -1))
+    return (
+        int(scale.data_ptr()),
+        int(scale.storage_offset()),
+        tuple(int(dim) for dim in scale.shape),
+        tuple(int(stride) for stride in scale.stride()),
+        str(scale.device),
+        int(rows),
+        int(cols),
+        version,
+    )
+
+
+def _scale_for_rowwise_tensor(
+    tensor: Any | None,
     scale: torch.Tensor,
     rows: int,
     cols: int,
@@ -424,18 +461,47 @@ def _scale_for_rowwise_matrix(
     with_gemm_swizzled_scales: bool,
 ) -> torch.Tensor:
     if with_gemm_swizzled_scales:
-        k_blocks = (cols + 31) // 32
-        padded_rows = ((rows + 127) // 128) * 128
-        padded_k_blocks = ((k_blocks + 3) // 4) * 4
-        expected = padded_rows * padded_k_blocks
-        if scale.numel() != expected:
-            raise ValueError(
-                f"pre-swizzled scale has {scale.numel()} elements, "
-                f"expected {expected} (padded_rows={padded_rows}, "
-                f"padded_k_blocks={padded_k_blocks})"
-            )
-        return scale.reshape(-1)
-    return swizzle_rowwise_scale(scale, rows, cols)
+        return _validate_pre_swizzled_scale(scale, rows, cols)
+
+    cache_key = _rowwise_scale_cache_key(scale, rows, cols)
+    expected = _swizzled_scale_numel(rows, cols)
+    if tensor is not None:
+        cached = getattr(tensor, _SWIZZLED_SCALE_CACHE_ATTR, None)
+        if isinstance(cached, tuple) and len(cached) == 2:
+            cached_key, cached_scale = cached
+            if (
+                cached_key == cache_key
+                and isinstance(cached_scale, torch.Tensor)
+                and cached_scale.dtype == torch.uint8
+                and cached_scale.device == scale.device
+                and cached_scale.dim() == 1
+                and cached_scale.numel() == expected
+            ):
+                return cached_scale
+
+    swizzled = swizzle_rowwise_scale(scale, rows, cols)
+    if tensor is not None:
+        try:
+            setattr(tensor, _SWIZZLED_SCALE_CACHE_ATTR, (cache_key, swizzled))
+        except Exception:
+            pass
+    return swizzled
+
+
+def _scale_for_rowwise_matrix(
+    scale: torch.Tensor,
+    rows: int,
+    cols: int,
+    *,
+    with_gemm_swizzled_scales: bool,
+) -> torch.Tensor:
+    return _scale_for_rowwise_tensor(
+        None,
+        scale,
+        rows,
+        cols,
+        with_gemm_swizzled_scales=with_gemm_swizzled_scales,
+    )
 
 
 def normalize_gemm_kwargs(
@@ -882,8 +948,8 @@ def fprop_tn_gemm(
     return _mm_mxfp8(
         x_data,
         w_data.t(),
-        _scale_for_rowwise_matrix(x_scale, m, k, with_gemm_swizzled_scales=x_swizzled),
-        _scale_for_rowwise_matrix(w_scale, n, k, with_gemm_swizzled_scales=w_swizzled),
+        _scale_for_rowwise_tensor(x, x_scale, m, k, with_gemm_swizzled_scales=x_swizzled),
+        _scale_for_rowwise_tensor(weight, w_scale, n, k, with_gemm_swizzled_scales=w_swizzled),
         out=out,
         out_dtype=_resolve_out_dtype(out, out_dtype),
         config=config,
@@ -1008,8 +1074,14 @@ def dgrad_nn_gemm(
     return _mm_mxfp8(
         dy_data,
         wt_data.t(),
-        _scale_for_rowwise_matrix(dy_scale, m, n, with_gemm_swizzled_scales=dy_swizzled),
-        _scale_for_rowwise_matrix(wt_scale, k, n, with_gemm_swizzled_scales=wt_swizzled),
+        _scale_for_rowwise_tensor(dy, dy_scale, m, n, with_gemm_swizzled_scales=dy_swizzled),
+        _scale_for_rowwise_tensor(
+            weight_t,
+            wt_scale,
+            k,
+            n,
+            with_gemm_swizzled_scales=wt_swizzled,
+        ),
         out=out,
         out_dtype=_resolve_out_dtype(out, out_dtype),
         config=config,
@@ -1056,8 +1128,20 @@ def wgrad_nt_gemm(
     return _mm_mxfp8(
         dy_t_data,
         x_t_data.t(),
-        _scale_for_rowwise_matrix(dy_t_scale, n, m, with_gemm_swizzled_scales=dy_t_swizzled),
-        _scale_for_rowwise_matrix(x_t_scale, k, m, with_gemm_swizzled_scales=x_t_swizzled),
+        _scale_for_rowwise_tensor(
+            dy_t,
+            dy_t_scale,
+            n,
+            m,
+            with_gemm_swizzled_scales=dy_t_swizzled,
+        ),
+        _scale_for_rowwise_tensor(
+            x_t,
+            x_t_scale,
+            k,
+            m,
+            with_gemm_swizzled_scales=x_t_swizzled,
+        ),
         out=out,
         out_dtype=_resolve_out_dtype(out, out_dtype),
         config=config,

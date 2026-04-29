@@ -35,11 +35,24 @@ def _rel_l2(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((torch.linalg.vector_norm((a.float() - b.float()).reshape(-1)) / den).item())
 
 
+def _tflops(m: int, n: int, k: int, elapsed_ms: float) -> float:
+    return float((2 * m * n * k) / (elapsed_ms * 1.0e9))
+
+
 def _quantize_rowwise(tensor: torch.Tensor) -> Any:
     quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
     quantizer.internal = True
     quantizer.optimize_for_gemm = False
     return quantizer(tensor)
+
+
+def _clear_swizzled_scale_cache(*tensors: Any) -> None:
+    cache_attr = flashinfer_mxfp8_gemm._SWIZZLED_SCALE_CACHE_ATTR  # noqa: SLF001
+    for tensor in tensors:
+        try:
+            delattr(tensor, cache_attr)
+        except AttributeError:
+            pass
 
 
 def _run(args: argparse.Namespace) -> dict[str, Any]:
@@ -77,6 +90,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 warmup=args.warmup,
                 iters=args.iters,
             )
+            row["tflops"] = _tflops(args.m, args.n, args.k, row["elapsed_ms"])
             current = out.detach().clone()
             row["finite"] = bool(torch.isfinite(current).all().item())
             if baseline is None:
@@ -113,15 +127,85 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                     warmup=args.warmup,
                     iters=args.iters,
                 )
+                row["tflops"] = _tflops(args.m, args.n, args.k, row["elapsed_ms"])
             except Exception as exc:  # pragma: no cover - host/backend-specific probe path
                 row["error_type"] = type(exc).__name__
                 row["error"] = str(exc).splitlines()[0]
             tactics.append(row)
 
+    wrapper_modes: list[dict[str, Any]] = []
+    if args.include_wrapper_cache_probe:
+        wrapper_out = torch.empty((args.m, args.n), device=device, dtype=torch.bfloat16)
+        config = flashinfer_mxfp8_gemm.runner_config("mm_mxfp8", args.tactic)
+
+        def run_wrapper_forced_reswizzle() -> None:
+            _clear_swizzled_scale_cache(xq, wq)
+            flashinfer_mxfp8_gemm.fprop_tn_gemm(
+                wq,
+                xq,
+                out=wrapper_out,
+                out_dtype=torch.bfloat16,
+                config=config,
+            )
+
+        def run_wrapper_cached() -> None:
+            flashinfer_mxfp8_gemm.fprop_tn_gemm(
+                wq,
+                xq,
+                out=wrapper_out,
+                out_dtype=torch.bfloat16,
+                config=config,
+            )
+
+        for name, fn in (
+            ("wrapper_forced_reswizzle", run_wrapper_forced_reswizzle),
+            ("wrapper_cached_scales", run_wrapper_cached),
+        ):
+            _clear_swizzled_scale_cache(xq, wq)
+            row = {"mode": name}
+            try:
+                row["elapsed_ms"] = _time_cuda(fn, warmup=args.warmup, iters=args.iters)
+                row["tflops"] = _tflops(args.m, args.n, args.k, row["elapsed_ms"])
+                row["finite"] = bool(torch.isfinite(wrapper_out).all().item())
+                if baseline is not None:
+                    row["max_abs_vs_pre_swizzled"] = float((wrapper_out - baseline).abs().max().item())
+                    row["rel_l2_vs_pre_swizzled"] = _rel_l2(wrapper_out, baseline)
+                cache_attr = flashinfer_mxfp8_gemm._SWIZZLED_SCALE_CACHE_ATTR  # noqa: SLF001
+                row["x_cache_present"] = bool(hasattr(xq, cache_attr))
+                row["w_cache_present"] = bool(hasattr(wq, cache_attr))
+            except Exception as exc:  # pragma: no cover - host/backend-specific probe path
+                row["error_type"] = type(exc).__name__
+                row["error"] = str(exc).splitlines()[0]
+            wrapper_modes.append(row)
+
+    scale_swizzle: dict[str, Any] | None = None
+    if args.include_scale_swizzle_timing:
+        scale_swizzle = {}
+        for name, scale, rows, cols in (
+            ("x", xq._rowwise_scale_inv, args.m, args.k),
+            ("weight", wq._rowwise_scale_inv, args.n, args.k),
+        ):
+            scale_swizzle[name] = _time_cuda(
+                lambda scale=scale, rows=rows, cols=cols: flashinfer_mxfp8_gemm.swizzle_rowwise_scale(
+                    scale,
+                    rows,
+                    cols,
+                ),
+                warmup=args.warmup,
+                iters=args.iters,
+            )
+
     bf16_ref: dict[str, Any] | None = None
     if args.include_bf16_ref and baseline is not None:
-        ref = x @ weight.t()
+        ref = torch.empty((args.m, args.n), device=device, dtype=torch.bfloat16)
+        elapsed_ms = _time_cuda(
+            lambda: torch.mm(x, weight.t(), out=ref),
+            warmup=args.warmup,
+            iters=args.iters,
+        )
         bf16_ref = {
+            "elapsed_ms": elapsed_ms,
+            "tflops": _tflops(args.m, args.n, args.k, elapsed_ms),
             "max_abs": float((baseline - ref).abs().max().item()),
             "rel_l2": _rel_l2(baseline, ref),
         }
@@ -133,6 +217,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "iters": args.iters,
         "modes": modes,
         "tactics": tactics,
+        "wrapper_modes": wrapper_modes,
+        "scale_swizzle_ms": scale_swizzle,
         "bf16_ref": bf16_ref,
     }
 
@@ -149,6 +235,8 @@ def main() -> int:
     parser.add_argument("--tactic", type=int, default=0)
     parser.add_argument("--try-all-tactics", action="store_true")
     parser.add_argument("--include-bf16-ref", action="store_true")
+    parser.add_argument("--include-wrapper-cache-probe", action="store_true")
+    parser.add_argument("--include-scale-swizzle-timing", action="store_true")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():

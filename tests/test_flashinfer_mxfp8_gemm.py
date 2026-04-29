@@ -423,3 +423,95 @@ def test_scale_for_rowwise_matrix_rejects_bad_pre_swizzled_shape() -> None:
             cols=128,
             with_gemm_swizzled_scales=True,
         )
+
+
+def test_scale_for_rowwise_tensor_caches_compact_swizzle(monkeypatch) -> None:
+    rows, cols = 128, 128
+    owner = SimpleNamespace()
+    scale = torch.empty((rows, cols // 32), dtype=torch.uint8)
+    swizzled = torch.empty((rows * (cols // 32),), dtype=torch.uint8)
+    calls = []
+
+    def fake_swizzle(scale_arg, rows_arg, cols_arg):
+        calls.append((scale_arg, rows_arg, cols_arg))
+        return swizzled
+
+    monkeypatch.setattr(flashinfer_mxfp8_gemm, "swizzle_rowwise_scale", fake_swizzle)
+
+    first = flashinfer_mxfp8_gemm._scale_for_rowwise_tensor(
+        owner,
+        scale,
+        rows,
+        cols,
+        with_gemm_swizzled_scales=False,
+    )
+    second = flashinfer_mxfp8_gemm._scale_for_rowwise_tensor(
+        owner,
+        scale,
+        rows,
+        cols,
+        with_gemm_swizzled_scales=False,
+    )
+
+    assert first is swizzled
+    assert second is swizzled
+    assert calls == [(scale, rows, cols)]
+
+
+def test_scale_for_rowwise_tensor_cache_invalidates_on_scale_mutation(monkeypatch) -> None:
+    rows, cols = 128, 128
+    owner = SimpleNamespace()
+    scale = torch.zeros((rows, cols // 32), dtype=torch.uint8)
+    swizzled_outputs = [
+        torch.empty((rows * (cols // 32),), dtype=torch.uint8),
+        torch.empty((rows * (cols // 32),), dtype=torch.uint8),
+    ]
+    calls = []
+
+    def fake_swizzle(scale_arg, rows_arg, cols_arg):
+        calls.append((scale_arg, rows_arg, cols_arg))
+        return swizzled_outputs[len(calls) - 1]
+
+    monkeypatch.setattr(flashinfer_mxfp8_gemm, "swizzle_rowwise_scale", fake_swizzle)
+
+    first = flashinfer_mxfp8_gemm._scale_for_rowwise_tensor(
+        owner,
+        scale,
+        rows,
+        cols,
+        with_gemm_swizzled_scales=False,
+    )
+    scale[0, 0] = 1
+    second = flashinfer_mxfp8_gemm._scale_for_rowwise_tensor(
+        owner,
+        scale,
+        rows,
+        cols,
+        with_gemm_swizzled_scales=False,
+    )
+
+    assert first is swizzled_outputs[0]
+    assert second is swizzled_outputs[1]
+    assert len(calls) == 2
+
+
+def test_scale_for_rowwise_tensor_uses_pre_swizzled_scale_without_cache(monkeypatch) -> None:
+    rows, cols = 128, 128
+    owner = SimpleNamespace()
+    swizzled = torch.empty((rows * (cols // 32),), dtype=torch.uint8)
+
+    def fake_swizzle(*_args, **_kwargs):
+        raise AssertionError("pre-swizzled scale should not be re-swizzled")
+
+    monkeypatch.setattr(flashinfer_mxfp8_gemm, "swizzle_rowwise_scale", fake_swizzle)
+
+    result = flashinfer_mxfp8_gemm._scale_for_rowwise_tensor(
+        owner,
+        swizzled,
+        rows,
+        cols,
+        with_gemm_swizzled_scales=True,
+    )
+
+    assert result.data_ptr() == swizzled.data_ptr()
+    assert not hasattr(owner, flashinfer_mxfp8_gemm._SWIZZLED_SCALE_CACHE_ATTR)
