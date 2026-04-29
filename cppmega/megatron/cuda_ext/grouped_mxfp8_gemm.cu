@@ -16,6 +16,7 @@ namespace cppmega_grouped_mxfp8 {
 
 constexpr int64_t kNumExperts = 16;
 constexpr int64_t kBlock = 32;
+constexpr int kThreadsPerBlock = 128;
 
 __device__ __forceinline__ float ue8m0_to_float(uint8_t x) {
   if (x == 0xff) {
@@ -27,27 +28,33 @@ __device__ __forceinline__ float ue8m0_to_float(uint8_t x) {
   return __uint_as_float(static_cast<uint32_t>(x) << 23);
 }
 
+__device__ __forceinline__ uint8_t load_u8(uint8_t const* ptr, int64_t offset) {
+  return __ldg(ptr + offset);
+}
+
 __device__ __forceinline__ float e4m3fn_to_float(uint8_t x) {
   uint8_t magnitude = x & 0x7f;
   if (magnitude == 0) {
     return (x & 0x80) ? -0.0f : 0.0f;
   }
+  uint32_t sign = static_cast<uint32_t>(x & 0x80) << 24;
   int exp = (magnitude >> 3) & 0x0f;
   int mant = magnitude & 0x07;
   if (exp == 0x0f && mant == 0x07) {
     return __uint_as_float(0x7fffffff);
   }
-  float value;
   if (exp == 0) {
-    value = ldexpf(static_cast<float>(mant), -9);
-  } else {
-    value = ldexpf(1.0f + static_cast<float>(mant) * 0.125f, exp - 7);
+    float value = static_cast<float>(mant) * 0x1p-9f;
+    return (x & 0x80) ? -value : value;
   }
-  return (x & 0x80) ? -value : value;
+  uint32_t bits = sign |
+      (static_cast<uint32_t>(exp + 120) << 23) |
+      (static_cast<uint32_t>(mant) << 20);
+  return __uint_as_float(bits);
 }
 
 __device__ __forceinline__ int find_expert_for_row(
-    int64_t row,
+    int row,
     int64_t const* __restrict__ expert_offsets) {
 #pragma unroll
   for (int expert = 0; expert < kNumExperts; ++expert) {
@@ -65,29 +72,37 @@ __global__ void dgrad_nn_kernel(
     uint8_t const* __restrict__ sf_weight,
     int64_t const* __restrict__ expert_offsets,
     __nv_bfloat16* __restrict__ out,
-    int64_t total_rows,
-    int64_t n,
-    int64_t k,
-    int64_t n_blocks,
+    int total_rows,
+    int n,
+    int k,
+    int n_blocks,
     float alpha,
     float beta,
-    int64_t total_outputs) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int total_outputs) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= total_outputs) {
     return;
   }
-  int64_t row = idx / k;
-  int64_t col = idx - row * k;
+  int row = idx / k;
+  int col = idx - row * k;
   int expert = find_expert_for_row(row, expert_offsets);
 
   float accum = 0.0f;
-  for (int64_t red = 0; red < n; ++red) {
-    float lhs = e4m3fn_to_float(dy[row * n + red]) *
-        ue8m0_to_float(sf_dy[row * n_blocks + red / kBlock]);
-    int64_t weight_idx = (static_cast<int64_t>(expert) * n + red) * k + col;
-    int64_t weight_sf_idx = (static_cast<int64_t>(expert) * n_blocks + red / kBlock) * k + col;
-    float rhs = e4m3fn_to_float(weight[weight_idx]) * ue8m0_to_float(sf_weight[weight_sf_idx]);
-    accum += lhs * rhs;
+  int64_t dy_row = static_cast<int64_t>(row) * n;
+  int64_t weight_expert = static_cast<int64_t>(expert) * n * k;
+  int64_t weight_sf_expert = static_cast<int64_t>(expert) * n_blocks * k;
+  for (int red_base = 0; red_base < n; red_base += kBlock) {
+    int red_block = red_base / kBlock;
+    float dy_scale = ue8m0_to_float(sf_dy[row * n_blocks + red_block]);
+    float scale = dy_scale *
+        ue8m0_to_float(sf_weight[weight_sf_expert + static_cast<int64_t>(red_block) * k + col]);
+#pragma unroll
+    for (int r = 0; r < kBlock; ++r) {
+      int red = red_base + r;
+      float lhs = e4m3fn_to_float(dy[dy_row + red]);
+      float rhs = e4m3fn_to_float(weight[weight_expert + static_cast<int64_t>(red) * k + col]);
+      accum += lhs * rhs * scale;
+    }
   }
 
   float result = alpha * accum;
@@ -106,39 +121,49 @@ __global__ void wgrad_nt_kernel(
     int64_t const* __restrict__ scale_offsets,
     bool use_scale_offsets,
     __nv_bfloat16* __restrict__ out,
-    int64_t total_rows,
-    int64_t n,
-    int64_t k,
+    int total_rows,
+    int n,
+    int k,
     float alpha,
     float beta,
-    int64_t total_outputs) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (idx >= total_outputs) {
+    int per_expert_outputs) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= per_expert_outputs) {
     return;
   }
-  int64_t col_k = idx % k;
-  int64_t tmp = idx / k;
-  int64_t col_n = tmp % n;
-  int64_t expert = tmp / n;
-  int64_t start = expert_offsets[expert];
-  int64_t end = expert_offsets[expert + 1];
-  int64_t scale_start = use_scale_offsets ? scale_offsets[expert] : 0;
+  int col_k = idx % k;
+  int col_n = idx / k;
+  int expert = blockIdx.y;
+  int start = static_cast<int>(expert_offsets[expert]);
+  int end = static_cast<int>(expert_offsets[expert + 1]);
+  int scale_start = use_scale_offsets ? static_cast<int>(scale_offsets[expert]) : 0;
 
   float accum = 0.0f;
-  for (int64_t row = start; row < end; ++row) {
-    int64_t row_block = use_scale_offsets ? scale_start + (row - start) / kBlock : row / kBlock;
-    float lhs = e4m3fn_to_float(dy[row * n + col_n]) *
-        ue8m0_to_float(sf_dy[row_block * n + col_n]);
-    float rhs = e4m3fn_to_float(x[row * k + col_k]) *
-        ue8m0_to_float(sf_x[row_block * k + col_k]);
-    accum += lhs * rhs;
+  int row = start;
+  while (row < end) {
+    int row_block = use_scale_offsets ? scale_start + (row - start) / kBlock : row / kBlock;
+    int block_end = use_scale_offsets
+        ? start + ((row - start) / kBlock + 1) * kBlock
+        : (row / kBlock + 1) * kBlock;
+    if (block_end > end) {
+      block_end = end;
+    }
+    float dy_scale = ue8m0_to_float(load_u8(sf_dy, static_cast<int64_t>(row_block) * n + col_n));
+    float scale = dy_scale *
+        ue8m0_to_float(load_u8(sf_x, static_cast<int64_t>(row_block) * k + col_k));
+    for (; row < block_end; ++row) {
+      float lhs = e4m3fn_to_float(load_u8(dy, static_cast<int64_t>(row) * n + col_n));
+      float rhs = e4m3fn_to_float(load_u8(x, static_cast<int64_t>(row) * k + col_k));
+      accum += lhs * rhs * scale;
+    }
   }
 
   float result = alpha * accum;
+  int out_idx = (expert * n + col_n) * k + col_k;
   if (beta != 0.0f) {
-    result += beta * __bfloat162float(out[idx]);
+    result += beta * __bfloat162float(out[out_idx]);
   }
-  out[idx] = __float2bfloat16_rn(result);
+  out[out_idx] = __float2bfloat16_rn(result);
 }
 
 __global__ void dgrad_nn_ptrs_kernel(
@@ -148,21 +173,21 @@ __global__ void dgrad_nn_ptrs_kernel(
     uint64_t const* __restrict__ sf_weight_ptrs,
     int64_t const* __restrict__ expert_offsets,
     __nv_bfloat16* __restrict__ out,
-    int64_t total_rows,
-    int64_t n,
-    int64_t k,
-    int64_t n_blocks,
+    int total_rows,
+    int n,
+    int k,
+    int n_blocks,
     float alpha,
     float beta,
-    int64_t total_outputs) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int total_outputs) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= total_outputs) {
     return;
   }
-  int64_t row = idx / k;
-  int64_t col = idx - row * k;
+  int row = idx / k;
+  int col = idx - row * k;
   int expert = find_expert_for_row(row, expert_offsets);
-  int64_t local_row = row - expert_offsets[expert];
+  int local_row = row - static_cast<int>(expert_offsets[expert]);
 
   auto const* dy = reinterpret_cast<uint8_t const*>(dy_ptrs[expert]);
   auto const* sf_dy = reinterpret_cast<uint8_t const*>(sf_dy_ptrs[expert]);
@@ -170,12 +195,19 @@ __global__ void dgrad_nn_ptrs_kernel(
   auto const* sf_weight = reinterpret_cast<uint8_t const*>(sf_weight_ptrs[expert]);
 
   float accum = 0.0f;
-  for (int64_t red = 0; red < n; ++red) {
-    float lhs = e4m3fn_to_float(dy[local_row * n + red]) *
-        ue8m0_to_float(sf_dy[local_row * n_blocks + red / kBlock]);
-    float rhs = e4m3fn_to_float(weight[red * k + col]) *
-        ue8m0_to_float(sf_weight[(red / kBlock) * k + col]);
-    accum += lhs * rhs;
+  int64_t dy_row = static_cast<int64_t>(local_row) * n;
+  for (int red_base = 0; red_base < n; red_base += kBlock) {
+    int red_block = red_base / kBlock;
+    float dy_scale = ue8m0_to_float(sf_dy[local_row * n_blocks + red_block]);
+    float scale = dy_scale *
+        ue8m0_to_float(sf_weight[static_cast<int64_t>(red_block) * k + col]);
+#pragma unroll
+    for (int r = 0; r < kBlock; ++r) {
+      int red = red_base + r;
+      float lhs = e4m3fn_to_float(dy[dy_row + red]);
+      float rhs = e4m3fn_to_float(weight[static_cast<int64_t>(red) * k + col]);
+      accum += lhs * rhs * scale;
+    }
   }
 
   float result = alpha * accum;
@@ -192,21 +224,20 @@ __global__ void wgrad_nt_ptrs_kernel(
     uint64_t const* __restrict__ sf_x_ptrs,
     uint64_t const* __restrict__ out_ptrs,
     int64_t const* __restrict__ expert_offsets,
-    int64_t n,
-    int64_t k,
+    int n,
+    int k,
     float alpha,
     float beta,
-    int64_t total_outputs) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (idx >= total_outputs) {
+    int per_expert_outputs) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= per_expert_outputs) {
     return;
   }
-  int64_t col_k = idx % k;
-  int64_t tmp = idx / k;
-  int64_t col_n = tmp % n;
-  int64_t expert = tmp / n;
-  int64_t start = expert_offsets[expert];
-  int64_t end = expert_offsets[expert + 1];
+  int col_k = idx % k;
+  int col_n = idx / k;
+  int expert = blockIdx.y;
+  int start = static_cast<int>(expert_offsets[expert]);
+  int end = static_cast<int>(expert_offsets[expert + 1]);
 
   auto const* dy = reinterpret_cast<uint8_t const*>(dy_ptrs[expert]);
   auto const* sf_dy = reinterpret_cast<uint8_t const*>(sf_dy_ptrs[expert]);
@@ -215,14 +246,21 @@ __global__ void wgrad_nt_ptrs_kernel(
   auto* out = reinterpret_cast<__nv_bfloat16*>(out_ptrs[expert]);
 
   float accum = 0.0f;
-  for (int64_t row = start; row < end; ++row) {
-    int64_t local_row = row - start;
-    int64_t row_block = local_row / kBlock;
-    float lhs = e4m3fn_to_float(dy[local_row * n + col_n]) *
-        ue8m0_to_float(sf_dy[row_block * n + col_n]);
-    float rhs = e4m3fn_to_float(x[local_row * k + col_k]) *
-        ue8m0_to_float(sf_x[row_block * k + col_k]);
-    accum += lhs * rhs;
+  int rows = end - start;
+  for (int local_base = 0; local_base < rows; local_base += kBlock) {
+    int row_block = local_base / kBlock;
+    int local_end = local_base + kBlock;
+    if (local_end > rows) {
+      local_end = rows;
+    }
+    float dy_scale = ue8m0_to_float(load_u8(sf_dy, static_cast<int64_t>(row_block) * n + col_n));
+    float scale = dy_scale *
+        ue8m0_to_float(load_u8(sf_x, static_cast<int64_t>(row_block) * k + col_k));
+    for (int local_row = local_base; local_row < local_end; ++local_row) {
+      float lhs = e4m3fn_to_float(load_u8(dy, static_cast<int64_t>(local_row) * n + col_n));
+      float rhs = e4m3fn_to_float(load_u8(x, static_cast<int64_t>(local_row) * k + col_k));
+      accum += lhs * rhs * scale;
+    }
   }
 
   float result = alpha * accum;
@@ -330,7 +368,8 @@ at::Tensor grouped_mxfp8_dgrad_nn_cuda(
       : at::empty({total_rows, k}, at::TensorOptions().device(dy_u8.device()).dtype(at::kBFloat16));
 
   int64_t total_outputs = total_rows * k;
-  constexpr int threads = 256;
+  TORCH_CHECK(total_outputs <= INT_MAX, "dgrad total output elements must fit int");
+  constexpr int threads = kThreadsPerBlock;
   int blocks = static_cast<int>((total_outputs + threads - 1) / threads);
   auto stream = at::cuda::getCurrentCUDAStream();
   dgrad_nn_kernel<<<blocks, threads, 0, stream>>>(
@@ -340,13 +379,13 @@ at::Tensor grouped_mxfp8_dgrad_nn_cuda(
       sf_weight_u8.data_ptr<uint8_t>(),
       expert_offsets.data_ptr<int64_t>(),
       reinterpret_cast<__nv_bfloat16*>(result.data_ptr<at::BFloat16>()),
-      total_rows,
-      n,
-      k,
-      n_blocks,
+      static_cast<int>(total_rows),
+      static_cast<int>(n),
+      static_cast<int>(k),
+      static_cast<int>(n_blocks),
       static_cast<float>(alpha),
       static_cast<float>(beta),
-      total_outputs);
+      static_cast<int>(total_outputs));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   (void)accumulate;
   return result;
@@ -418,11 +457,12 @@ at::Tensor grouped_mxfp8_wgrad_nt_cuda(
       ? out
       : at::empty({kNumExperts, n, k}, at::TensorOptions().device(dy_u8.device()).dtype(at::kBFloat16));
 
-  int64_t total_outputs = kNumExperts * n * k;
-  constexpr int threads = 256;
-  int blocks = static_cast<int>((total_outputs + threads - 1) / threads);
+  int64_t per_expert_outputs = n * k;
+  TORCH_CHECK(per_expert_outputs <= INT_MAX, "wgrad per-expert output elements must fit int");
+  constexpr int threads = kThreadsPerBlock;
+  int blocks = static_cast<int>((per_expert_outputs + threads - 1) / threads);
   auto stream = at::cuda::getCurrentCUDAStream();
-  wgrad_nt_kernel<<<blocks, threads, 0, stream>>>(
+  wgrad_nt_kernel<<<dim3(blocks, kNumExperts, 1), threads, 0, stream>>>(
       dy_u8.data_ptr<uint8_t>(),
       sf_dy_u8.data_ptr<uint8_t>(),
       x_u8.data_ptr<uint8_t>(),
@@ -431,12 +471,12 @@ at::Tensor grouped_mxfp8_wgrad_nt_cuda(
       use_scale_offsets ? scale_offsets.data_ptr<int64_t>() : nullptr,
       use_scale_offsets,
       reinterpret_cast<__nv_bfloat16*>(result.data_ptr<at::BFloat16>()),
-      total_rows,
-      n,
-      k,
+      static_cast<int>(total_rows),
+      static_cast<int>(n),
+      static_cast<int>(k),
       static_cast<float>(alpha),
       static_cast<float>(beta),
-      total_outputs);
+      static_cast<int>(per_expert_outputs));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   (void)accumulate;
   return result;
@@ -480,8 +520,9 @@ at::Tensor grouped_mxfp8_dgrad_nn_ptrs_cuda(
       ? out
       : at::empty({total_rows, k}, at::TensorOptions().device(dy_ptrs.device()).dtype(at::kBFloat16));
 
+  constexpr int threads = kThreadsPerBlock;
   int64_t total_outputs = total_rows * k;
-  constexpr int threads = 256;
+  TORCH_CHECK(total_outputs <= INT_MAX, "dgrad total output elements must fit int");
   int blocks = static_cast<int>((total_outputs + threads - 1) / threads);
   auto stream = at::cuda::getCurrentCUDAStream();
   dgrad_nn_ptrs_kernel<<<blocks, threads, 0, stream>>>(
@@ -491,13 +532,13 @@ at::Tensor grouped_mxfp8_dgrad_nn_ptrs_cuda(
       reinterpret_cast<uint64_t const*>(sf_weight_ptrs.data_ptr<int64_t>()),
       expert_offsets.data_ptr<int64_t>(),
       reinterpret_cast<__nv_bfloat16*>(result.data_ptr<at::BFloat16>()),
-      total_rows,
-      n,
-      k,
-      ceil_div(n, kBlock),
+      static_cast<int>(total_rows),
+      static_cast<int>(n),
+      static_cast<int>(k),
+      static_cast<int>(ceil_div(n, kBlock)),
       static_cast<float>(alpha),
       static_cast<float>(beta),
-      total_outputs);
+      static_cast<int>(total_outputs));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   (void)accumulate;
   return result;
@@ -530,22 +571,23 @@ void grouped_mxfp8_wgrad_nt_ptrs_cuda(
   validate_common_shape(total_rows, n, k);
 
   c10::cuda::CUDAGuard device_guard(dy_ptrs.device());
-  int64_t total_outputs = kNumExperts * n * k;
-  constexpr int threads = 256;
-  int blocks = static_cast<int>((total_outputs + threads - 1) / threads);
+  int64_t per_expert_outputs = n * k;
+  TORCH_CHECK(per_expert_outputs <= INT_MAX, "wgrad per-expert output elements must fit int");
+  constexpr int threads = kThreadsPerBlock;
+  int blocks = static_cast<int>((per_expert_outputs + threads - 1) / threads);
   auto stream = at::cuda::getCurrentCUDAStream();
-  wgrad_nt_ptrs_kernel<<<blocks, threads, 0, stream>>>(
+  wgrad_nt_ptrs_kernel<<<dim3(blocks, kNumExperts, 1), threads, 0, stream>>>(
       reinterpret_cast<uint64_t const*>(dy_ptrs.data_ptr<int64_t>()),
       reinterpret_cast<uint64_t const*>(sf_dy_ptrs.data_ptr<int64_t>()),
       reinterpret_cast<uint64_t const*>(x_ptrs.data_ptr<int64_t>()),
       reinterpret_cast<uint64_t const*>(sf_x_ptrs.data_ptr<int64_t>()),
       reinterpret_cast<uint64_t const*>(out_ptrs.data_ptr<int64_t>()),
       expert_offsets.data_ptr<int64_t>(),
-      n,
-      k,
+      static_cast<int>(n),
+      static_cast<int>(k),
       static_cast<float>(alpha),
       static_cast<float>(beta),
-      total_outputs);
+      static_cast<int>(per_expert_outputs));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   (void)accumulate;
 }
