@@ -99,3 +99,15 @@ slower than baseline in this bounded run.
 
 Next optimization work should focus on reducing `bwd_bwd` overhead without
 returning to the `num_stages=2` shared-memory overflow.
+
+## Follow-Up: Profile Matrix
+
+A later H200 torch-profiler matrix showed the better production candidate is
+`bf_num_stages=1`, `bb_num_stages=0`: keep WS/TMA for `bwd_fwd`, but leave
+`bwd_bwd` on the non-WS path. That mode keeps correctness bit-for-bit against
+baseline and was about 1.6-1.9% faster than baseline chain in bounded
+productionish runs.
+
+Detailed result:
+
+- `docs/status/mamba3_stage2_force_nontma_profile_matrix_2026_04_29.md`

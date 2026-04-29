@@ -2,10 +2,9 @@
 
 Compares two non-production variants on Hopper GPUs:
   * baseline: upstream non-TMA/non-WS TileLang kernels
-  * stage2_force_nontma: qk_shared_direct + bf/bb num_stages=1, with only
-    small float32 vector slice copies forced off TMA. num_stages=1 keeps WS
-    enabled while staying under Hopper dynamic shared memory limits on the
-    productionish shape.
+  * stage2_force_nontma: qk_shared_direct + bf_num_stages=1 / bb_num_stages=0,
+    with only small float32 vector slice copies forced off TMA. This keeps the
+    useful bwd_fwd WS/TMA path while leaving bwd_bwd on the faster non-WS path.
 
 The harness writes full JSON/CSV/source artifacts to a Modal Volume and prints a
 compact summary for run logs. It does not change production defaults.
@@ -19,6 +18,13 @@ Run examples:
     GHCR_TAG=785c3fd CPPMEGA_MODAL_GPU=H200:2 timeout 12m \
         modal run scripts/modal_mamba3_stage2_force_nontma_benchmark.py \
         --shape-csv productionish --iters 4 --warmup 1
+
+    GHCR_TAG=785c3fd CPPMEGA_MODAL_GPU=H200:2 timeout 15m \
+        modal run scripts/modal_mamba3_stage2_force_nontma_benchmark.py \
+        --shape-csv productionish \
+        --variant-csv baseline,stage2_bf1_bb0,stage2_bf0_bb1,stage2_force_nontma \
+        --torch-profile \
+        --iters 4 --warmup 1
 """
 
 from __future__ import annotations
@@ -86,6 +92,26 @@ VARIANTS: dict[str, dict[str, Any]] = {
         "flat_qk_dot": True,
         "bf_threads": 128,
         "bf_num_stages": 1,
+        "bb_threads": 256,
+        "bb_num_stages": 0,
+    },
+    "stage2_bf1_bb0": {
+        "patch": "stage2_force_nontma",
+        "patch_file": "mamba3_bwd_stage2_force_nontma.patch",
+        "flattened_inputs": True,
+        "flat_qk_dot": True,
+        "bf_threads": 128,
+        "bf_num_stages": 1,
+        "bb_threads": 256,
+        "bb_num_stages": 0,
+    },
+    "stage2_bf0_bb1": {
+        "patch": "stage2_force_nontma",
+        "patch_file": "mamba3_bwd_stage2_force_nontma.patch",
+        "flattened_inputs": True,
+        "flat_qk_dot": True,
+        "bf_threads": 128,
+        "bf_num_stages": 0,
         "bb_threads": 256,
         "bb_num_stages": 1,
     },
@@ -192,6 +218,21 @@ def _selected_shapes(shape_csv: str) -> list[Shape]:
     if not shapes:
         raise ValueError("at least one shape is required")
     return shapes
+
+
+def _selected_variants(variant_csv: str) -> list[str]:
+    variants: list[str] = []
+    for name in [part.strip() for part in variant_csv.split(",")]:
+        if not name:
+            continue
+        if name not in VARIANTS:
+            raise ValueError(f"unknown variant {name!r}; choose one of {sorted(VARIANTS)}")
+        variants.append(name)
+    if not variants:
+        raise ValueError("at least one variant is required")
+    if "baseline" not in variants:
+        variants.insert(0, "baseline")
+    return variants
 
 
 def _apply_patch(dst: str, patch_name: str) -> dict[str, Any]:
@@ -678,6 +719,57 @@ def _time_pair(
     }
 
 
+def _profile_with_torch_profiler(
+    variant: str,
+    shape: Shape,
+    bf_kernel: Any,
+    bb_kernel: Any,
+    inputs: dict[str, Any],
+    artifact_dir: str,
+    *,
+    flattened_inputs: bool,
+    flat_qk_dot: bool,
+) -> dict[str, Any]:
+    import traceback
+
+    import torch
+
+    trace_path = os.path.join(artifact_dir, f"{shape.name}_{variant}_torch_trace.json")
+    table_path = os.path.join(artifact_dir, f"{shape.name}_{variant}_torch_cuda_table.txt")
+    try:
+        outputs = _empty_outputs(shape, flat_qk_dot)
+        bf_args, bb_args = _kernel_args(shape, inputs, outputs, flattened_inputs=flattened_inputs)
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+        ) as prof:
+            for _ in range(3):
+                with torch.profiler.record_function(f"{variant}.bwd_fwd"):
+                    torch.cuda.nvtx.range_push(f"{variant}.bwd_fwd")
+                    bf_kernel(*bf_args)
+                    torch.cuda.nvtx.range_pop()
+                with torch.profiler.record_function(f"{variant}.bwd_bwd"):
+                    torch.cuda.nvtx.range_push(f"{variant}.bwd_bwd")
+                    bb_kernel(*bb_args)
+                    torch.cuda.nvtx.range_pop()
+                prof.step()
+        torch.cuda.synchronize()
+        prof.export_chrome_trace(trace_path)
+        table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=50)
+        with open(table_path, "w", encoding="utf-8") as handle:
+            handle.write(table)
+        return {"status": "ok", "trace": trace_path, "table": table_path}
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "status": "failed",
+            "exception_type": type(exc).__name__,
+            "exception": str(exc),
+            "traceback_tail": traceback.format_exc()[-4000:],
+        }
+
+
 def _compare_outputs(shape: Shape, baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
     names = [
         "dmimo_o",
@@ -745,6 +837,7 @@ def _benchmark_variant(
     *,
     warmup: int,
     iters: int,
+    torch_profile: bool,
 ) -> dict[str, Any]:
     import time
     import traceback
@@ -796,6 +889,17 @@ def _benchmark_variant(
             warmup=warmup,
             iters=iters,
         )
+        if torch_profile:
+            result["torch_profiler"] = _profile_with_torch_profiler(
+                variant,
+                shape,
+                bf_kernel,
+                bb_kernel,
+                inputs,
+                variant_dir,
+                flattened_inputs=bool(cfg["flattened_inputs"]),
+                flat_qk_dot=bool(cfg["flat_qk_dot"]),
+            )
         result["max_memory_allocated_gib"] = torch.cuda.max_memory_allocated() / (1024**3)
         result["max_memory_reserved_gib"] = torch.cuda.max_memory_reserved() / (1024**3)
         result["status"] = "ok"
@@ -877,6 +981,7 @@ def _summarize_report(report: dict[str, Any]) -> dict[str, Any]:
                 "bwd_bwd_ws": variant["tilelang_source"]["bwd_bwd"]["producer_guard"],
                 "bwd_fwd_tma_loads": variant["tilelang_source"]["bwd_fwd"]["tma_load_count"],
                 "bwd_bwd_tma_loads": variant["tilelang_source"]["bwd_bwd"]["tma_load_count"],
+                "torch_profiler": variant.get("torch_profiler"),
             }
         summary_shapes.append(row)
     return {
@@ -937,13 +1042,15 @@ def _write_summary_csv(summary: dict[str, Any], csv_path: str) -> None:
                 )
 
 
-@app.function(image=_image(), gpu=GPU_SPEC, timeout=600, volumes={BENCH_ROOT: bench_volume})
+@app.function(image=_image(), gpu=GPU_SPEC, timeout=1200, volumes={BENCH_ROOT: bench_volume})
 def run_benchmark(
     requested_gpu: str,
     run_id: str | None,
     shape_csv: str,
+    variant_csv: str,
     warmup: int,
     iters: int,
+    torch_profile: bool,
 ) -> dict[str, Any]:
     import time
 
@@ -962,10 +1069,18 @@ def run_benchmark(
         "artifact_dir": run_dir,
         "device": _device_report(requested_gpu),
         "tilelang": _tilelang_report(),
-        "settings": {"shape_csv": shape_csv, "warmup": warmup, "iters": iters, "variants": list(VARIANTS)},
+        "settings": {
+            "shape_csv": shape_csv,
+            "variant_csv": variant_csv,
+            "warmup": warmup,
+            "iters": iters,
+            "torch_profile": torch_profile,
+            "variants": _selected_variants(variant_csv),
+        },
         "shapes": [],
     }
 
+    selected_variants = _selected_variants(variant_csv)
     for shape in _selected_shapes(shape_csv):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -978,7 +1093,7 @@ def run_benchmark(
             "variants": [],
             "status": "ok",
         }
-        for variant in VARIANTS:
+        for variant in selected_variants:
             _reset_mamba_imports()
             torch.cuda.empty_cache()
             variant_result = _benchmark_variant(
@@ -988,6 +1103,7 @@ def run_benchmark(
                 shape_dir,
                 warmup=warmup,
                 iters=iters,
+                torch_profile=torch_profile,
             )
             shape_result["variants"].append(variant_result)
             if variant_result.get("status") != "ok":
@@ -1015,10 +1131,12 @@ def run_benchmark(
 def main(
     run_id: str | None = None,
     shape_csv: str = "representative",
+    variant_csv: str = "baseline,stage2_force_nontma",
     warmup: int = 2,
     iters: int = 8,
+    torch_profile: bool = False,
 ) -> None:
-    result = run_benchmark.remote(GPU_SPEC, run_id, shape_csv, warmup, iters)
+    result = run_benchmark.remote(GPU_SPEC, run_id, shape_csv, variant_csv, warmup, iters, torch_profile)
     print("SUMMARY_JSON_START")
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
     print("SUMMARY_JSON_END")
