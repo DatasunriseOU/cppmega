@@ -35,6 +35,21 @@ wheels:
     produces:
       - flash_attn-*.whl
 
+  # flash-attn-4 (CuTe-DSL pure-Python wheel, JIT kernels via nvidia-cutlass-dsl).
+  # Pinned to a specific master SHA because we apply a vendored patch series
+  # for sm_121/GB10 correctness; bump only after re-verifying the patch series.
+  # See upstream_prs/flash_attn_inflight/README.md.
+  flash_attn_4:
+    repo: Dao-AILab/flash-attention
+    ref: b995b246d9c2493a8629ef8c657c4bf992c67e0b
+    version: 0.0.0
+    subdir: flash_attn/cute
+    patches_dir: upstream_prs/flash_attn_inflight
+    build: |
+      pip wheel . --no-build-isolation -w /wheels
+    produces:
+      - flash_attn_4-*.whl
+
   mamba_ssm:
     repo: state-spaces/mamba
     ref: 31f3d7b

@@ -287,19 +287,78 @@ def _single_out_tensor(out: Any, *, shape: tuple[int, ...]) -> torch.Tensor | No
     return tensor
 
 
-def _m_splits_from_kwargs(kwargs: dict[str, Any], *, num_groups: int) -> list[int]:
+def _m_splits_arg_from_kwargs(kwargs: dict[str, Any], *, num_groups: int) -> torch.Tensor | list[int]:
     m_splits = kwargs.get("m_splits")
     if m_splits is None:
         raise ValueError("grouped direct requires m_splits")
     if isinstance(m_splits, torch.Tensor):
-        values = [int(v) for v in m_splits.detach().cpu().tolist()]
-    else:
-        values = [int(v) for v in m_splits]
+        if m_splits.dim() != 1:
+            raise ValueError("m_splits must be 1D")
+        if int(m_splits.numel()) != num_groups:
+            raise ValueError(f"m_splits must have {num_groups} entries, got {int(m_splits.numel())}")
+        if m_splits.dtype not in (torch.int32, torch.int64):
+            raise TypeError(f"m_splits must be int32 or int64, got {m_splits.dtype}")
+        return m_splits
+
+    values = [int(v) for v in m_splits]
     if len(values) != num_groups:
         raise ValueError(f"m_splits must have {num_groups} entries, got {len(values)}")
     if any(v < 0 for v in values):
         raise ValueError("m_splits must be non-negative")
     return values
+
+
+def _row_splits_from_tensors(tensors: Sequence[torch.Tensor], *, name: str) -> list[int]:
+    if len(tensors) != _EXPECTED_NUM_EXPERTS:
+        raise ValueError(f"{name} must have {_EXPECTED_NUM_EXPERTS} tensors")
+    return [int(tensor.shape[0]) for tensor in tensors]
+
+
+def _m_splits_from_grouped_rows(
+    kwargs: dict[str, Any],
+    row_tensors: Sequence[torch.Tensor],
+    *,
+    name: str,
+    num_groups: int,
+) -> list[int]:
+    m_splits = _m_splits_arg_from_kwargs(kwargs, num_groups=num_groups)
+    row_splits = _row_splits_from_tensors(row_tensors, name=name)
+    if isinstance(m_splits, torch.Tensor):
+        if not m_splits.is_cuda:
+            values = [int(v) for v in m_splits.detach().to(device="cpu", dtype=torch.int64).tolist()]
+            if values != row_splits:
+                raise ValueError(f"m_splits must match {name} row counts")
+        return row_splits
+    if m_splits != row_splits:
+        raise ValueError(f"m_splits must match {name} row counts")
+    return row_splits
+
+
+def _offsets_from_grouped_rows(
+    row_tensors: Sequence[torch.Tensor],
+    expert_offsets: torch.Tensor | Sequence[int],
+    *,
+    name: str,
+) -> tuple[list[int], list[int]]:
+    row_splits = _row_splits_from_tensors(row_tensors, name=name)
+    offsets = _offsets_from_splits(row_splits)
+    if isinstance(expert_offsets, torch.Tensor):
+        if expert_offsets.dim() != 1:
+            raise ValueError("expert_offsets must be 1D")
+        expected_len = _EXPECTED_NUM_EXPERTS + 1
+        if int(expert_offsets.numel()) != expected_len:
+            raise ValueError(f"expert_offsets must have {expected_len} entries")
+        if expert_offsets.dtype != torch.int64:
+            raise TypeError(f"expert_offsets must be int64, got {expert_offsets.dtype}")
+        if not expert_offsets.is_cuda:
+            values = [int(v) for v in expert_offsets.detach().to(device="cpu", dtype=torch.int64).tolist()]
+            if values != offsets:
+                raise ValueError(f"expert_offsets must match {name} row counts")
+    else:
+        values = [int(v) for v in expert_offsets]
+        if values != offsets:
+            raise ValueError(f"expert_offsets must match {name} row counts")
+    return offsets, row_splits
 
 
 def _offsets_from_splits(m_splits: Sequence[int]) -> list[int]:
@@ -427,9 +486,9 @@ def try_grouped_direct(
 ) -> tuple[bool, torch.Tensor | str]:
     """Try the zero-transpose grouped MXFP8 backend for TE grouped backward.
 
-    The function is intentionally fail-closed: it only accepts operands whose
-    compact payloads/scales can be viewed as one contiguous grouped storage.
-    It never calls the rowwise-transpose bridge and never stacks/cats payloads.
+    The function is intentionally fail-closed: it only accepts per-expert
+    compact payloads/scales that the pointer kernels can consume directly. It
+    never calls the rowwise-transpose bridge and never stacks/cats payloads.
     """
 
     try:
@@ -440,11 +499,6 @@ def try_grouped_direct(
             return False, f"expected_{_EXPECTED_NUM_EXPERTS}_experts"
         _out_dtype_from_grouped_args(args, kwargs)
         _ensure_no_grouped_epilogue(kwargs)
-        m_splits = _m_splits_from_kwargs(kwargs, num_groups=_EXPECTED_NUM_EXPERTS)
-        offsets = _offsets_from_splits(m_splits)
-        total_rows = int(offsets[-1])
-        if total_rows <= 0:
-            return False, "empty_grouped_token_batch"
         accumulate = bool(kwargs.get("accumulate", False))
         alpha = float(kwargs.get("alpha", 1.0))
         beta = kwargs.get("beta", None)
@@ -454,6 +508,16 @@ def try_grouped_direct(
             dy_scale_items = _attrs_from_list(B, "_rowwise_scale_inv", name="dy_scale")
             weight_items = _attrs_from_list(A, "_columnwise_data", name="weight")
             weight_scale_items = _attrs_from_list(A, "_columnwise_scale_inv", name="weight_scale")
+            m_splits = _m_splits_from_grouped_rows(
+                kwargs,
+                dy_items,
+                name="dy",
+                num_groups=_EXPECTED_NUM_EXPERTS,
+            )
+            offsets = _offsets_from_splits(m_splits)
+            total_rows = int(offsets[-1])
+            if total_rows <= 0:
+                return False, "empty_grouped_token_batch"
             total_rows_checked, n, k = _check_dgrad_list_shapes(
                 dy=dy_items,
                 dy_scale=dy_scale_items,
@@ -484,6 +548,16 @@ def try_grouped_direct(
         dy_scale_items = _attrs_from_list(B, "_columnwise_scale_inv", name="dy_scale")
         x_items = _attrs_from_list(A, "_columnwise_data", name="x")
         x_scale_items = _attrs_from_list(A, "_columnwise_scale_inv", name="x_scale")
+        m_splits = _m_splits_from_grouped_rows(
+            kwargs,
+            dy_items,
+            name="dy",
+            num_groups=_EXPECTED_NUM_EXPERTS,
+        )
+        offsets = _offsets_from_splits(m_splits)
+        total_rows = int(offsets[-1])
+        if total_rows <= 0:
+            return False, "empty_grouped_token_batch"
         out_items = list(out)
         for idx, tensor in enumerate(out_items):
             if not isinstance(tensor, torch.Tensor):
@@ -676,12 +750,11 @@ def dgrad_nn_gemm_list(
         for tensor in tensors:
             _check_uint8_cuda_contiguous(tensor, name)
 
-    if isinstance(expert_offsets, torch.Tensor):
-        offsets_cpu = expert_offsets.detach().to(device="cpu", dtype=torch.int64)
-        offsets_values = [int(v) for v in offsets_cpu.tolist()]
-    else:
-        offsets_values = [int(v) for v in expert_offsets]
-    m_splits = [offsets_values[i + 1] - offsets_values[i] for i in range(_EXPECTED_NUM_EXPERTS)]
+    offsets_values, m_splits = _offsets_from_grouped_rows(
+        dy,
+        expert_offsets,
+        name="dy_rowwise_data",
+    )
     total_rows, n, k = _check_dgrad_list_shapes(
         dy=dy,
         dy_scale=dy_scale,
@@ -861,12 +934,11 @@ def wgrad_nt_gemm_list(
         if tensor.device != device or tensor.dtype != torch.bfloat16 or not tensor.is_contiguous():
             raise ValueError(f"out[{idx}] must be CUDA contiguous BF16 on {device}")
 
-    if isinstance(expert_offsets, torch.Tensor):
-        offsets_cpu = expert_offsets.detach().to(device="cpu", dtype=torch.int64)
-        offsets_values = [int(v) for v in offsets_cpu.tolist()]
-    else:
-        offsets_values = [int(v) for v in expert_offsets]
-    m_splits = [offsets_values[i + 1] - offsets_values[i] for i in range(_EXPECTED_NUM_EXPERTS)]
+    offsets_values, m_splits = _offsets_from_grouped_rows(
+        dy,
+        expert_offsets,
+        name="dy_colwise_data",
+    )
     total_rows, n, k = _check_wgrad_list_shapes(
         dy=dy,
         dy_scale=dy_scale,
@@ -893,6 +965,7 @@ def wgrad_nt_gemm_list(
         bool(accumulate),
         float(alpha),
         beta_f,
+        total_rows,
         n,
         k,
     )

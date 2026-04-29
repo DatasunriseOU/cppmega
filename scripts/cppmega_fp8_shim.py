@@ -287,6 +287,9 @@ _te_mxfp8_transpose_emit_swizzled = os.environ.get(
 _te_mxfp8_compact_columnwise_backward = os.environ.get(
     "CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD", "0"
 ) == "1"
+_te_mxfp8_grouped_direct_backward = os.environ.get(
+    "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD", "0"
+) == "1"
 _te_mxfp8_bwd_allow_bf16_fallback = os.environ.get(
     "CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK",
     "1"
@@ -1371,6 +1374,14 @@ if (
                 "CompactColumnwiseUnsupportedError",
                 ValueError,
             )
+            if not _te_mxfp8_compact_columnwise_backward:
+                _weight_t = _cppmega_mxfp8_colwise_as_rowwise_transpose(_weight)
+                _result = _flashinfer.dgrad_nn_gemm(
+                    _weight_t,
+                    _dy,
+                    **_cppmega_flashinfer_kwargs(_kwargs),
+                )
+                return _result, None, None, None
             try:
                 _result = _flashinfer.dgrad_nn_gemm(
                     _weight,
@@ -1393,9 +1404,10 @@ if (
                 "CompactColumnwiseUnsupportedError",
                 ValueError,
             )
-            if _cppmega_is_mxfp8_rowwise_transpose_operand(
+            _has_saved_transpose = _cppmega_is_mxfp8_rowwise_transpose_operand(
                 _x
-            ) or _cppmega_is_mxfp8_rowwise_transpose_operand(_dy):
+            ) or _cppmega_is_mxfp8_rowwise_transpose_operand(_dy)
+            if _has_saved_transpose or not _te_mxfp8_compact_columnwise_backward:
                 _x_t = _cppmega_mxfp8_colwise_as_rowwise_transpose(_x)
                 _dy_t = _cppmega_mxfp8_colwise_as_rowwise_transpose(_dy)
                 _x_t_shape = _cppmega_mxfp8_rowwise_2d_shape(_x_t)
@@ -1628,54 +1640,57 @@ if (
                 ):
                     return _orig_general_grouped_gemm(A, B, out, *args, **kwargs)
 
-                # The grouped direct backend owns compact TE MXFP8 storage
-                # directly. Do not resolve transpose sidecars on this path.
                 _op_kind = "dgrad" if _layout == "NN" else "wgrad"
-                _direct_reason = None
-                try:
-                    _direct_ok, _direct_result = _cppmega_try_grouped_mxfp8_direct(
-                        A,
-                        B,
-                        out,
-                        args,
-                        kwargs,
-                    )
-                    if _direct_ok:
-                        _cppmega_record_bwd_stat(f"mxfp8_grouped_direct_{_op_kind}")
-                        if _te_mxfp8_bwd_debug:
-                            print(
-                                "[cppmega_fp8_shim] MXFP8 grouped direct "
-                                f"{_op_kind} layout={_layout}"
+                if _te_mxfp8_grouped_direct_backward:
+                    # The grouped direct backend owns compact TE MXFP8 storage
+                    # directly. Do not resolve transpose sidecars on this path.
+                    _direct_reason = None
+                    try:
+                        _direct_ok, _direct_result = _cppmega_try_grouped_mxfp8_direct(
+                            A,
+                            B,
+                            out,
+                            args,
+                            kwargs,
+                        )
+                        if _direct_ok:
+                            _cppmega_record_bwd_stat(
+                                f"mxfp8_grouped_direct_{_op_kind}"
                             )
-                        if (
-                            isinstance(_direct_result, tuple)
-                            and len(_direct_result) == 3
-                        ):
+                            if _te_mxfp8_bwd_debug:
+                                print(
+                                    "[cppmega_fp8_shim] MXFP8 grouped direct "
+                                    f"{_op_kind} layout={_layout}"
+                                )
+                            if (
+                                isinstance(_direct_result, tuple)
+                                and len(_direct_result) == 3
+                            ):
+                                return _direct_result
+                            if _layout == "NN":
+                                if isinstance(_direct_result, _torch.Tensor):
+                                    return [_direct_result], [None] * len(A), None
+                                return _direct_result
+                            if isinstance(_direct_result, (list, tuple)) or isinstance(
+                                _direct_result, _torch.Tensor
+                            ):
+                                return _direct_result, [None] * len(A), None
                             return _direct_result
-                        if _layout == "NN":
-                            if isinstance(_direct_result, _torch.Tensor):
-                                return [_direct_result], [None] * len(A), None
-                            return _direct_result
-                        if isinstance(_direct_result, (list, tuple)) or isinstance(
-                            _direct_result, _torch.Tensor
-                        ):
-                            return _direct_result, [None] * len(A), None
-                        return _direct_result
-                    _direct_reason = str(_direct_result)
-                except Exception as _direct_exc:  # pragma: no cover
-                    _direct_reason = (
-                        "grouped_direct_unavailable:"
-                        f"{type(_direct_exc).__name__}: {_direct_exc}"
+                        _direct_reason = str(_direct_result)
+                    except Exception as _direct_exc:  # pragma: no cover
+                        _direct_reason = (
+                            "grouped_direct_unavailable:"
+                            f"{type(_direct_exc).__name__}: {_direct_exc}"
+                        )
+                    _cppmega_record_bwd_stat(
+                        f"mxfp8_grouped_direct_miss_{_op_kind}",
+                        _direct_reason,
                     )
-                _cppmega_record_bwd_stat(
-                    f"mxfp8_grouped_direct_miss_{_op_kind}",
-                    _direct_reason,
-                )
-                if _te_mxfp8_bwd_debug:
-                    print(
-                        "[cppmega_fp8_shim] MXFP8 grouped direct fallback "
-                        f"{_op_kind}: {_direct_reason}"
-                    )
+                    if _te_mxfp8_bwd_debug:
+                        print(
+                            "[cppmega_fp8_shim] MXFP8 grouped direct fallback "
+                            f"{_op_kind}: {_direct_reason}"
+                        )
 
                 def _convert_mxfp8_list(_items):
                     _converted = []
@@ -2247,6 +2262,7 @@ if (
             f"mxfp8_transpose_emit_backend={_te_mxfp8_transpose_emit_backend}, "
             f"mxfp8_transpose_emit_swizzled={_te_mxfp8_transpose_emit_swizzled}, "
             f"mxfp8_compact_columnwise_backward={_te_mxfp8_compact_columnwise_backward}, "
+            f"mxfp8_grouped_direct_backward={_te_mxfp8_grouped_direct_backward}, "
             f"mxfp8_bwd_allow_bf16_fallback={_te_mxfp8_bwd_allow_bf16_fallback}, "
             f"gemm_modules={_patched_gemm_modules}, "
             f"grouped_gemm_modules={_patched_grouped_gemm_modules}, "

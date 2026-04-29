@@ -126,6 +126,11 @@ class PrecisionProfile:
     # the current SM120 direct loader is slower than the TE-transpose TN path on
     # full-model GB10 runs, so keep it opt-in until the loader/mainloop is fixed.
     mxfp8_compact_columnwise_backward: bool = False
+    # Experimental MoE grouped backward mode: consumes grouped compact MXFP8
+    # operands directly.  Keep this separate from dense compact-columnwise
+    # because the current grouped direct kernels save memory but are slower than
+    # the grouped TN adapter on GB10 full-model smoke runs.
+    mxfp8_grouped_direct_backward: bool = False
     # FlashInfer's public mm_mxfp8 path owns autotuning. direct_tactic bypasses
     # that layer and is only for shape/tactic probes when nsys shows overhead.
     mxfp8_flashinfer_runner: Mxfp8FlashinferRunner = "mm_mxfp8"
@@ -580,6 +585,9 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                 "CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD": _bool(
                     profile.precision.mxfp8_compact_columnwise_backward
                 ),
+                "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD": _bool(
+                    profile.precision.mxfp8_grouped_direct_backward
+                ),
                 "CPPMEGA_FLASHINFER_MXFP8_RUNNER": (
                     profile.precision.mxfp8_flashinfer_runner
                 ),
@@ -671,6 +679,10 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
                     "--mxfp8-compact-columnwise-backward requires "
                     "--mxfp8-bwd-backend cutlass_native"
                 )
+    if args.mxfp8_grouped_direct_backward is not None:
+        profile.precision.mxfp8_grouped_direct_backward = (
+            args.mxfp8_grouped_direct_backward
+        )
     if args.mxfp8_flashinfer_runner is not None:
         profile.precision.mxfp8_flashinfer_runner = args.mxfp8_flashinfer_runner
     if args.mxfp8_flashinfer_tactic is not None:
@@ -887,6 +899,23 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         default=None,
         dest="mxfp8_compact_columnwise_backward",
+    )
+    grouped_direct_backward = parser.add_mutually_exclusive_group()
+    grouped_direct_backward.add_argument(
+        "--mxfp8-grouped-direct-backward",
+        action="store_true",
+        default=None,
+        dest="mxfp8_grouped_direct_backward",
+        help=(
+            "Experimental: route grouped/MoE MXFP8 backward directly through "
+            "cppmega compact grouped kernels instead of the grouped TN adapter."
+        ),
+    )
+    grouped_direct_backward.add_argument(
+        "--no-mxfp8-grouped-direct-backward",
+        action="store_false",
+        default=None,
+        dest="mxfp8_grouped_direct_backward",
     )
     parser.add_argument(
         "--mxfp8-flashinfer-runner",

@@ -18,14 +18,19 @@ class _FakeMXFP8Tensor:
         self._with_gemm_swizzled_scales = False
 
 
-def _fresh_grouped_shim(monkeypatch):
+def _fresh_grouped_shim(monkeypatch, *, grouped_direct: bool = False):
     for key in (
         "CPPMEGA_TE_MXFP8_DGRAD_BF16",
         "CPPMEGA_TE_MXFP8_WGRAD_BF16",
         "NVTE_BACKWARD_OVERRIDE",
+        "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD",
     ):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER", "1")
+    monkeypatch.setenv(
+        "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD",
+        "1" if grouped_direct else "0",
+    )
     monkeypatch.setenv("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND", "off")
     monkeypatch.setenv("CPPMEGA_TE_VERSION_STRICT", "0")
     monkeypatch.setattr(atexit, "register", lambda func, *args, **kwargs: func)
@@ -64,7 +69,7 @@ def _wrap_fake_grouped_module(shim):
 
 
 def test_grouped_mxfp8_direct_hits_bypass_transpose_and_sidecars(monkeypatch):
-    shim = _fresh_grouped_shim(monkeypatch)
+    shim = _fresh_grouped_shim(monkeypatch, grouped_direct=True)
 
     def fail_sidecar_path(*_args, **_kwargs):
         raise AssertionError("direct grouped MXFP8 path touched transpose sidecars")
@@ -136,7 +141,7 @@ def test_grouped_mxfp8_direct_hits_bypass_transpose_and_sidecars(monkeypatch):
 
 
 def test_grouped_mxfp8_direct_missing_backend_api_counts_explicit_fallback(monkeypatch):
-    shim = _fresh_grouped_shim(monkeypatch)
+    shim = _fresh_grouped_shim(monkeypatch, grouped_direct=True)
     _reset_bwd_stats(shim)
 
     fake_backend = ModuleType("cppmega.megatron.grouped_mxfp8_gemm")

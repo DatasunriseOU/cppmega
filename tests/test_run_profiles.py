@@ -316,6 +316,7 @@ def test_local_gb10_quarter_mxfp8_defaults_to_flashinfer_cutlass():
     profile = get_run_profile("local_gb10_quarter")
     assert profile.precision.mxfp8_bwd_backend == "flashinfer_cutlass"
     assert profile.precision.mxfp8_flashinfer_runner == "mm_mxfp8"
+    assert profile.precision.mxfp8_grouped_direct_backward is False
 
 
 def test_mxfp8_transpose_emit_defaults_to_te_for_tn_adapter():
@@ -324,6 +325,7 @@ def test_mxfp8_transpose_emit_defaults_to_te_for_tn_adapter():
     profile.precision.fp8_recipe = "mxfp8"
     env = profile_shell_assignments(profile)
     assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
+    assert env["CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD"] == "0"
 
 
 def test_mxfp8_docs_pin_zero_copy_acceptance_counters():

@@ -21,6 +21,7 @@ on:
     paths:
       - STACK.lock
       - upstream_prs/*.patch
+      - upstream_prs/flash_attn_inflight/*.patch
       - .github/workflows/build-wheels.yml
 
 permissions:
@@ -78,6 +79,16 @@ jobs:
             submodules: "false"
             patch: upstream_prs/flash_attn_setup_sm120f.patch
             extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
+          # flash-attn-4 — CuTe-DSL JIT package (no nvcc at build time).
+          # Patches in upstream_prs/flash_attn_inflight/ vendor four open
+          # upstream PRs that fix sm_121/GB10 install + dispatch correctness.
+          - name: flash_attn_4
+            repo: Dao-AILab/flash-attention
+            ref: b995b246d9c2493a8629ef8c657c4bf992c67e0b
+            submodules: "false"
+            subdir: flash_attn/cute
+            patches_dir: upstream_prs/flash_attn_inflight
+            extra_env: ""
           - name: mamba_ssm
             repo: state-spaces/mamba
             ref: 31f3d7b
@@ -227,6 +238,19 @@ jobs:
         run: |
           cd src
           git apply --verbose "$GITHUB_WORKSPACE/${{ matrix.patch }}"
+
+      - name: Apply patches dir
+        if: matrix.patches_dir
+        # Apply all top-level *.patch files in the directory in lexicographic
+        # order. Sub-directories (e.g. `deferred/`) are intentionally skipped.
+        run: |
+          set -euo pipefail
+          cd src
+          shopt -s nullglob
+          for p in "$GITHUB_WORKSPACE/${{ matrix.patches_dir }}"/*.patch; do
+            echo "Applying: $(basename "$p")"
+            git apply --verbose "$p"
+          done
 
       - name: Build wheel
         run: |

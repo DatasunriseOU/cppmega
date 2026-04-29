@@ -65,6 +65,7 @@ import sys
 
 _FUSED_MAIN_MTP_CCE_LOSS_ATTR = "_cppmega_fused_main_mtp_cce_loss"
 _FUSED_MAIN_MTP_CCE_LOGGED = False
+_FUSED_MAIN_MTP_CCE_DECLINE_REASONS_LOGGED: set[str] = set()
 
 
 def _env_flag_enabled(name: str, default: str = "1") -> bool:
@@ -77,22 +78,46 @@ def _linear_ce_backend(output_layer) -> str | None:
     backend = getattr(compute, "_cppmega_linear_ce_backend", None)
     if backend is not None:
         return backend
+    backend = getattr(output_layer, "_cppmega_linear_ce_backend", None)
+    if backend is not None:
+        return backend
     return getattr(output_layer.__class__, "_cppmega_linear_ce_backend", None)
+
+
+def _log_fused_main_mtp_cce_decline(reason: str) -> None:
+    if reason in _FUSED_MAIN_MTP_CCE_DECLINE_REASONS_LOGGED:
+        return
+    _FUSED_MAIN_MTP_CCE_DECLINE_REASONS_LOGGED.add(reason)
+    print(
+        "[cppmega] CCE main+MTP CE launch fusion requested but inactive: "
+        f"{reason}"
+    )
 
 
 def _can_use_cce_main_mtp_fusion(output_layer, config, scale_logits_fn) -> bool:
     if not _env_flag_enabled("CPPMEGA_CCE_FUSE_MAIN_MTP_CE", "0"):
         return False
     if scale_logits_fn is not None:
+        _log_fused_main_mtp_cce_decline("scale_logits_fn is active")
         return False
     if not (
         getattr(config, "cross_entropy_loss_fusion", False)
         and getattr(config, "cross_entropy_fusion_impl", None) == "linear"
     ):
+        _log_fused_main_mtp_cce_decline(
+            "config does not enable linear cross-entropy fusion"
+        )
         return False
     if (getattr(config, "mtp_num_layers", None) or 0) <= 0:
+        _log_fused_main_mtp_cce_decline("config.mtp_num_layers <= 0")
         return False
-    return _linear_ce_backend(output_layer) == "cce"
+    backend = _linear_ce_backend(output_layer)
+    if backend != "cce":
+        _log_fused_main_mtp_cce_decline(
+            f"LinearCE backend is {backend!r}, expected 'cce'"
+        )
+        return False
+    return True
 
 
 def fused_main_mtp_cce_loss(
@@ -124,7 +149,11 @@ def fused_main_mtp_cce_loss(
     the existing ``reduction="sum"`` MTP shim used, then attached through
     ``MTPLossAutoScaler`` so MTP gradients still flow during the main backward.
     """
-    if labels is None or not _can_use_cce_main_mtp_fusion(output_layer, config, scale_logits_fn):
+    if labels is None:
+        if _env_flag_enabled("CPPMEGA_CCE_FUSE_MAIN_MTP_CE", "0"):
+            _log_fused_main_mtp_cce_decline("labels is None")
+        return None
+    if not _can_use_cce_main_mtp_fusion(output_layer, config, scale_logits_fn):
         return None
 
     import torch
@@ -140,6 +169,11 @@ def fused_main_mtp_cce_loss(
     batch, seq = labels.shape
     expected_hidden0 = (1 + mtp_num_layers) * seq
     if hidden_states.shape[0] != expected_hidden0 or hidden_states.shape[1] != batch:
+        _log_fused_main_mtp_cce_decline(
+            "hidden/label shape mismatch "
+            f"(hidden={tuple(hidden_states.shape)}, labels={tuple(labels.shape)}, "
+            f"mtp_num_layers={mtp_num_layers})"
+        )
         return None
 
     if loss_mask is None:

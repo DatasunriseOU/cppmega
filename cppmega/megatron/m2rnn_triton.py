@@ -947,7 +947,7 @@ def _broadcast_heads(
 
 class _M2RNNFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, W, xf, h0):
+    def forward(ctx, q, k, v, W, xf, h0, runtime_config):
         assert TRITON_AVAILABLE, "Triton is required for m2rnn_scan_triton"
         assert q.is_cuda, "m2rnn_scan_triton requires CUDA tensors"
 
@@ -974,7 +974,8 @@ class _M2RNNFn(torch.autograd.Function):
             has_h0 = True
             h0_dtype = h0.dtype
 
-        runtime_config = get_m2rnn_runtime_config()
+        if runtime_config is None:
+            runtime_config = get_m2rnn_runtime_config()
         save_hnew = runtime_config.save_hnew
         chunk_size = runtime_config.bwd_chunk_size
         num_chunks = (S + chunk_size - 1) // chunk_size
@@ -1041,7 +1042,7 @@ class _M2RNNFn(torch.autograd.Function):
                 num_stages=runtime_config.fwd_num_stages,
             )
 
-        ctx.save_for_backward(q_c, k_c, v_c, W_c, xf_c, h0_c, checkpoints, h_new_save)
+        ctx.save_for_backward(q_c, k_c, v_c, W_c, xf_c, checkpoints, h_new_save)
         ctx.has_h0 = has_h0
         ctx.h0_dtype = h0_dtype
         ctx.save_hnew = save_hnew
@@ -1052,7 +1053,7 @@ class _M2RNNFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, dh_final):
-        q_c, k_c, v_c, W_c, xf_c, _h0_c, checkpoints, h_new_save = ctx.saved_tensors
+        q_c, k_c, v_c, W_c, xf_c, checkpoints, h_new_save = ctx.saved_tensors
         has_h0 = ctx.has_h0
         save_hnew = ctx.save_hnew
         chunk_size = ctx.bwd_chunk_size
@@ -1065,14 +1066,20 @@ class _M2RNNFn(torch.autograd.Function):
         if dout is None:
             dout_c = torch.zeros(B, S, H, V_DIM, device=q_c.device, dtype=q_c.dtype)
         else:
-            dout_c = dout.contiguous()
+            # The chunk bwd kernel accepts explicit dout strides.  Keeping
+            # expanded/non-contiguous grad outputs avoids materializing a full
+            # B*S*H*V copy for common losses such as out.sum().
+            dout_c = dout
 
         if dh_final is None:
             dh_carry = torch.zeros(B, H, K_DIM, V_DIM, device=q_c.device, dtype=torch.float32)
         else:
             # The chunk kernels overwrite this tensor with the carry for the
             # previous chunk, so never mutate autograd's incoming grad tensor.
-            dh_carry = dh_final.to(torch.float32).contiguous().clone()
+            if dh_final.dtype == torch.float32 and dh_final.is_contiguous():
+                dh_carry = dh_final.clone()
+            else:
+                dh_carry = dh_final.to(dtype=torch.float32).contiguous()
 
         dq = torch.empty_like(q_c)
         dk = torch.empty_like(k_c)
@@ -1177,7 +1184,7 @@ class _M2RNNFn(torch.autograd.Function):
 
         dh0_out = dh_carry.to(ctx.h0_dtype) if has_h0 else None
 
-        return dq_out, dk_out, dv_out, dW_out, dxf_out, dh0_out
+        return dq_out, dk_out, dv_out, dW_out, dxf_out, dh0_out, None
 
 
 def _unbroadcast_heads(grad: torch.Tensor, orig_n: int, dim: int) -> torch.Tensor:
@@ -1209,6 +1216,7 @@ def m2rnn_scan_triton(
     xf: torch.Tensor,
     *,
     h0: Optional[torch.Tensor] = None,
+    runtime_config: Optional[M2RNNRuntimeConfig] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused Triton M²RNN scan, drop-in replacement for
     ``cppmega.megatron.m2rnn_spec._torch_m2rnn_forward``.
@@ -1226,4 +1234,4 @@ def m2rnn_scan_triton(
     """
     if not TRITON_AVAILABLE:
         raise RuntimeError("Triton is not available; cannot run m2rnn_scan_triton")
-    return _M2RNNFn.apply(q, k, v, W, xf, h0)
+    return _M2RNNFn.apply(q, k, v, W, xf, h0, runtime_config)

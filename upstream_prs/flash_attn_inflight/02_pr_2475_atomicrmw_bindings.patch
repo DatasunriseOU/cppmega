@@ -1,0 +1,59 @@
+diff --git a/flash_attn/cute/utils.py b/flash_attn/cute/utils.py
+index a39230520e4..b8a8b1b7371 100644
+--- a/flash_attn/cute/utils.py
++++ b/flash_attn/cute/utils.py
+@@ -89,6 +89,11 @@ def _get_disable_2cta_default() -> bool:
+     return _fa_disable_2cta_enabled or _fa_disable_2cta_cuda12
+ 
+ 
++def _nvvm_atomicrmw_accepts_res(fn: Callable = nvvm.atomicrmw) -> bool:
++    """Handle CUTLASS DSL bindings with and without an explicit result type."""
++    return "res" in inspect.signature(fn).parameters
++
++
+ def _compute_base_hash(func: Callable) -> str:
+     """Compute hash from source code or bytecode and closure values."""
+     try:
+@@ -451,9 +456,15 @@ def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=
+     #     is_align_stack=False,
+     #     asm_dialect=llvm.AsmDialect.AD_ATT,
+     # )
+-    nvvm.atomicrmw(
+-        res=T.f32(), op=nvvm.AtomicOpKind.FADD, ptr=gmem_ptr.llvm_ptr, a=Float32(a).ir_value()
+-    )
++    atomicrmw_kwargs = {
++        "op": nvvm.AtomicOpKind.FADD,
++        "ptr": gmem_ptr.llvm_ptr,
++        "a": Float32(a).ir_value(loc=loc, ip=ip),
++    }
++    if _nvvm_atomicrmw_accepts_res():
++        nvvm.atomicrmw(res=T.f32(), **atomicrmw_kwargs)
++    else:
++        nvvm.atomicrmw(**atomicrmw_kwargs)
+ 
+ 
+ @dsl_user_op
+diff --git a/tests/cute/test_utils.py b/tests/cute/test_utils.py
+index 189eb86957d..0f5fe09f700 100644
+--- a/tests/cute/test_utils.py
++++ b/tests/cute/test_utils.py
+@@ -211,3 +211,19 @@ def counting_getsource(*args, **kwargs):
+         assert call_count[0] == 0, f"getsource was called {call_count[0]} times"
+         assert hash1 == hash2 == hash3 == "inductor-generated-hash"
+ 
++
++class TestNvvmAtomicRmwCompat:
++    """Tests for CUTLASS DSL atomicrmw signature compatibility."""
++
++    def test_detects_atomicrmw_result_type_argument(self):
++        def atomicrmw_with_res(res, op, ptr, a, *, b=None, loc=None, ip=None):
++            return res, op, ptr, a, b, loc, ip
++
++        assert cute_utils._nvvm_atomicrmw_accepts_res(atomicrmw_with_res)
++
++    def test_detects_atomicrmw_without_result_type_argument(self):
++        def atomicrmw_without_res(op, ptr, a, *, b=None, loc=None, ip=None):
++            return op, ptr, a, b, loc, ip
++
++        assert not cute_utils._nvvm_atomicrmw_accepts_res(atomicrmw_without_res)
++

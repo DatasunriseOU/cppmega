@@ -280,6 +280,42 @@ class TestBwdParity:
         assert rel(W1.grad, W2.grad) < 1e-4
         assert rel(xf1.grad, xf2.grad) < 1e-4
 
+    def test_bwd_fp32_expanded_dout(self):
+        """Backward accepts zero-stride dout without materializing a copy."""
+        try:
+            import triton  # noqa: F401
+        except ImportError:
+            pytest.skip("triton not available")
+        from cppmega.megatron.m2rnn_triton import m2rnn_scan_triton
+
+        B, S, H, K, V = 1, 64, 2, 16, 16
+        q0, k0, v0, W0, xf0 = _make_inputs(B, S, H, K, V, dtype=torch.float32, seed=17)
+
+        def leaves(src):
+            return [x.detach().clone().requires_grad_(True) for x in src]
+
+        q1, k1, v1, W1, xf1 = leaves([q0, k0, v0, W0, xf0])
+        q2, k2, v2, W2, xf2 = leaves([q0, k0, v0, W0, xf0])
+
+        out_ref, _ = _torch_m2rnn_forward(q1, k1, v1, W1, xf1)
+        out_tri, _ = m2rnn_scan_triton(q2, k2, v2, W2, xf2)
+
+        g = torch.ones((), device=out_ref.device, dtype=out_ref.dtype).expand_as(out_ref)
+        assert any(stride == 0 for stride in g.stride())
+
+        out_ref.backward(g)
+        out_tri.backward(g)
+
+        def rel(a, b):
+            denom = a.abs().max().item() + 1e-12
+            return (a - b).abs().max().item() / denom
+
+        assert rel(q1.grad, q2.grad) < 1e-4
+        assert rel(k1.grad, k2.grad) < 1e-4
+        assert rel(v1.grad, v2.grad) < 1e-4
+        assert rel(W1.grad, W2.grad) < 1e-4
+        assert rel(xf1.grad, xf2.grad) < 1e-4
+
     def test_bwd_fp32_with_h0_across_chunks(self, monkeypatch):
         """Exercise checkpointed backward carry propagation into h0 grad."""
         try:
