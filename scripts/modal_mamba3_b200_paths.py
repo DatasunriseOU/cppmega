@@ -1,19 +1,24 @@
-"""Modal B200/SM100 probe for Mamba3 MIMO kernel paths.
+"""Modal B200+/SM100 probe for Mamba3 MIMO kernel paths.
 
 This harness is intentionally separate from the Hopper Hoist-PsiV dry-run:
 
-* only requests B200-family Modal specs (`B200+:2`, `B200:2`, `B200:1`);
+* requests Modal's exact flexible Blackwell spec, `gpu="B200+"`;
 * does not patch `mamba_ssm` or cppmega production defaults;
 * uses source-overlay Mamba3 TileLang to measure today's baseline on SM100;
 * records B200-specific go/no-go signals for TileLang, cuTile/CuTe DSL,
   Hugging Face kernel replacement candidates, and Hoist-PsiV write cost.
+* writes stage results to a Modal Volume so detached runs remain inspectable.
 
 Examples:
 
-    modal run scripts/modal_mamba3_b200_paths.py
-    CPPMEGA_MAMBA3_B200_SPECS=B200:1 modal run scripts/modal_mamba3_b200_paths.py
-    CPPMEGA_MAMBA3_B200_SPECS=B200+:2,B200:2,B200:1 modal run scripts/modal_mamba3_b200_paths.py
-    GHCR_TAG=785c3fd CPPMEGA_MAMBA3_B200_SPECS=B200:1 modal run scripts/modal_mamba3_b200_paths.py
+    GHCR_TAG=785c3fd modal run scripts/modal_mamba3_b200_paths.py
+    GHCR_TAG=785c3fd modal run --detach scripts/modal_mamba3_b200_paths.py::run_b200_plus
+    GHCR_TAG=785c3fd modal run scripts/modal_mamba3_b200_paths.py --run-id manual_b200_plus_001
+
+After a detached run starts, inspect:
+
+    modal app logs <app-id> -f
+    modal volume get cppmega-mamba3-b200-plus-logging /mamba3_b200_plus/<run_id> ./modal_b200_plus_<run_id>
 
 If Modal accepts a spec but provisioning does not allocate a container, stop
 the app and paste the app id/status into the companion status doc.
@@ -26,7 +31,10 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import textwrap
+import time
+import uuid
 from typing import Any, Callable
 
 import modal
@@ -35,11 +43,17 @@ GHCR_REPO = os.environ.get("GHCR_REPO", "ghcr.io/jewelmusicee/cppmega")
 GHCR_TAG = os.environ.get("GHCR_TAG", "latest")
 GHCR_REF = f"{GHCR_REPO}:{GHCR_TAG}"
 
-APP_NAME = "cppmega-mamba3-b200-paths"
+APP_NAME = "cppmega-mamba3-b200-plus-paths"
 SOURCE_ROOT = "/opt/state-spaces-mamba"
 CPPMEGA_ROOT = "/opt/cppmega"
+RESULTS_VOLUME_NAME = os.environ.get(
+    "CPPMEGA_MAMBA3_B200_RESULTS_VOLUME",
+    "cppmega-mamba3-b200-plus-logging",
+)
+RESULTS_MOUNT = "/vol"
+RESULTS_SUBDIR = "mamba3_b200_plus"
 
-DEFAULT_SPECS = ("B200+:2", "B200:2", "B200:1")
+DEFAULT_SPECS = ("B200+",)
 SPEC_ENV = "CPPMEGA_MAMBA3_B200_SPECS"
 
 
@@ -64,6 +78,95 @@ def _image() -> modal.Image:
 
 
 app = modal.App(APP_NAME)
+results_vol = modal.Volume.from_name(RESULTS_VOLUME_NAME, create_if_missing=True)
+
+
+def _new_run_id() -> str:
+    import datetime
+
+    stamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    return f"{stamp}_{uuid.uuid4().hex[:8]}"
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, tuple):
+        return list(value)
+    return str(value)
+
+
+def _run_dir(run_id: str) -> pathlib.Path:
+    return pathlib.Path(RESULTS_MOUNT) / RESULTS_SUBDIR / run_id
+
+
+def _volume_cli_path(run_id: str) -> str:
+    return f"/{RESULTS_SUBDIR}/{run_id}"
+
+
+def _commit_results() -> None:
+    try:
+        results_vol.commit()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[volume] commit failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+def _write_json_artifact(run_id: str, rel_path: str, payload: Any) -> pathlib.Path:
+    path = _run_dir(run_id) / rel_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=_json_default) + "\n")
+    return path
+
+
+def _append_event(run_id: str, event: dict[str, Any]) -> None:
+    path = _run_dir(run_id) / "events.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {"ts": time.time(), **event}
+    with path.open("a") as f:
+        f.write(json.dumps(record, sort_keys=True, default=_json_default) + "\n")
+
+
+def _record_stage(
+    run_id: str,
+    results: dict[str, Any],
+    name: str,
+    fn: Callable[[], Any],
+) -> None:
+    import traceback
+
+    print(f"[stage:start] {name}", flush=True)
+    _append_event(run_id, {"event": "stage_start", "stage": name})
+    _commit_results()
+    t0 = time.time()
+    try:
+        payload = fn()
+        status = "ok"
+    except Exception as exc:  # noqa: BLE001
+        status = "crashed"
+        payload = {
+            "status": status,
+            "exception_type": type(exc).__name__,
+            "exception_short": textwrap.shorten(str(exc), width=1000),
+            "traceback_tail": traceback.format_exc()[-4000:],
+        }
+    elapsed = round(time.time() - t0, 3)
+    if isinstance(payload, dict):
+        payload.setdefault("status", status)
+        payload.setdefault("elapsed_sec", elapsed)
+    else:
+        payload = {"status": status, "elapsed_sec": elapsed, "value": payload}
+    results[name] = payload
+    artifact = _write_json_artifact(run_id, f"stages/{name}.json", payload)
+    _append_event(
+        run_id,
+        {
+            "event": "stage_done",
+            "stage": name,
+            "status": status,
+            "elapsed_sec": elapsed,
+            "artifact": str(artifact),
+        },
+    )
+    _commit_results()
+    print(f"[stage:done] {name} status={status} elapsed_sec={elapsed}", flush=True)
 
 
 def _install_source_paths() -> None:
@@ -466,42 +569,82 @@ def _audit_hf_kernel_candidates() -> dict[str, Any]:
     return out
 
 
-def _run_probe(requested_gpu: str) -> dict[str, Any]:
+def _run_probe(requested_gpu: str, run_id: str = "") -> dict[str, Any]:
     _install_source_paths()
-    return {
-        "device": _device_report(requested_gpu),
-        "patch_sites": _probe_patch_sites(),
-        "psiv_costs": _benchmark_psiv_costs(),
-        "tilelang_bwd_split": _benchmark_tilelang_bwd_split(),
-        "cutile_cute_possibility": _inspect_cutile_cute_possibility(),
-        "hf_kernel_candidates": _audit_hf_kernel_candidates(),
+    run_id = run_id or _new_run_id()
+    result_dir = _run_dir(run_id)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    print(
+        f"[run:start] run_id={run_id} requested_gpu={requested_gpu} image={GHCR_REF}",
+        flush=True,
+    )
+    print(f"[run:volume] {RESULTS_VOLUME_NAME}:{_volume_cli_path(run_id)}", flush=True)
+    print(
+        "[run:volume-get] "
+        f"modal volume get {RESULTS_VOLUME_NAME} {_volume_cli_path(run_id)} ./modal_b200_plus_{run_id}",
+        flush=True,
+    )
+
+    results: dict[str, Any] = {
+        "run_id": run_id,
+        "status": "running",
+        "app_name": APP_NAME,
+        "requested_gpu_spec": requested_gpu,
+        "image_ref": GHCR_REF,
+        "results_volume": RESULTS_VOLUME_NAME,
+        "results_volume_path": _volume_cli_path(run_id),
+        "results_mount_path": str(result_dir),
     }
+    _write_json_artifact(run_id, "metadata.json", results)
+    _append_event(run_id, {"event": "run_start", "requested_gpu": requested_gpu, "image_ref": GHCR_REF})
+    _commit_results()
+
+    stages: list[tuple[str, Callable[[], Any]]] = [
+        ("device", lambda: _device_report(requested_gpu)),
+        ("patch_sites", _probe_patch_sites),
+        ("psiv_costs", _benchmark_psiv_costs),
+        ("tilelang_bwd_split", _benchmark_tilelang_bwd_split),
+        ("cutile_cute_possibility", _inspect_cutile_cute_possibility),
+        ("hf_kernel_candidates", _audit_hf_kernel_candidates),
+    ]
+    for name, fn in stages:
+        _record_stage(run_id, results, name, fn)
+        _write_json_artifact(run_id, "result.partial.json", results)
+        _commit_results()
+
+    crashed = [
+        name
+        for name, payload in results.items()
+        if isinstance(payload, dict) and payload.get("status") == "crashed"
+    ]
+    results["status"] = "partial" if crashed else "ok"
+    results["crashed_stages"] = crashed
+    _append_event(run_id, {"event": "run_done", "status": results["status"], "crashed_stages": crashed})
+    _write_json_artifact(run_id, "result.json", results)
+    _commit_results()
+    print(f"[run:done] run_id={run_id} status={results['status']}", flush=True)
+    print(json.dumps(results, indent=2, sort_keys=True, default=_json_default), flush=True)
+    return results
 
 
-@app.function(image=_image(), gpu="B200+:2", timeout=2400)
-def run_b200_plus_2() -> dict[str, Any]:
-    return _run_probe("B200+:2")
+@app.function(
+    image=_image(),
+    gpu="B200+",
+    timeout=2400,
+    volumes={RESULTS_MOUNT: results_vol},
+    retries=0,
+)
+def run_b200_plus(run_id: str = "") -> dict[str, Any]:
+    return _run_probe("B200+", run_id)
 
 
-@app.function(image=_image(), gpu="B200:2", timeout=2400)
-def run_b200_2() -> dict[str, Any]:
-    return _run_probe("B200:2")
-
-
-@app.function(image=_image(), gpu="B200:1", timeout=2400)
-def run_b200_1() -> dict[str, Any]:
-    return _run_probe("B200:1")
-
-
-_RUNNERS: dict[str, Callable[[], Any]] = {
-    "B200+:2": run_b200_plus_2.remote,
-    "B200:2": run_b200_2.remote,
-    "B200:1": run_b200_1.remote,
+_RUNNERS: dict[str, Callable[[str], Any]] = {
+    "B200+": run_b200_plus.remote,
 }
 
 
-def _selected_specs() -> list[str]:
-    raw = os.environ.get(SPEC_ENV)
+def _selected_specs(raw: str | None = None) -> list[str]:
+    raw = raw if raw is not None else os.environ.get(SPEC_ENV)
     if not raw:
         return list(DEFAULT_SPECS)
     specs = [item.strip() for item in raw.split(",") if item.strip()]
@@ -512,17 +655,24 @@ def _selected_specs() -> list[str]:
 
 
 @app.local_entrypoint()
-def main() -> None:
+def main(run_id: str = "", specs: str = "") -> None:
     results: dict[str, Any] = {}
-    for spec in _selected_specs():
-        print(f"=== Modal Mamba3 B200 probe: {spec} ===", flush=True)
+    selected = _selected_specs(specs or None)
+    for index, spec in enumerate(selected):
+        spec_run_id = run_id if run_id and len(selected) == 1 else run_id or _new_run_id()
+        if run_id and len(selected) > 1:
+            spec_run_id = f"{run_id}_{index}_{spec.replace('+', 'plus').replace(':', '_')}"
+        print(f"=== Modal Mamba3 B200 probe: {spec} run_id={spec_run_id} ===", flush=True)
         try:
-            results[spec] = _RUNNERS[spec]()
+            results[spec] = _RUNNERS[spec](spec_run_id)
         except Exception as exc:  # noqa: BLE001
             results[spec] = {
                 "status": "local_or_remote_exception",
                 "exception_type": type(exc).__name__,
                 "exception_short": textwrap.shorten(str(exc), width=1000),
+                "run_id": spec_run_id,
+                "results_volume": RESULTS_VOLUME_NAME,
+                "results_volume_path": _volume_cli_path(spec_run_id),
             }
         print(json.dumps({spec: results[spec]}, indent=2, sort_keys=True, default=str), flush=True)
     print("=== combined ===")
