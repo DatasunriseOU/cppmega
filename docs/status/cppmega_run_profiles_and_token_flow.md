@@ -445,7 +445,45 @@ This receipt proves the grouped MoE dgrad/wgrad bridge no longer calls
 per-expert transpose operands. The remaining copies are dense Linear copies.
 The dense compact-columnwise path is wired behind
 `--mxfp8-compact-columnwise-backward`; it is opt-in because the current dense
-direct SM120 loader was correct but too slow on the full-model smoke.
+direct SM120 loader is correct but too slow for the default lane.
+
+Latest dense compact-columnwise full-model smoke:
+
+```text
+log: /home/dave/logs/gb10_mxfp8_dense_compact_native5_20260428_224251.log
+profile: local_gb10_quarter, real clang semantic 4k data
+command delta: --fp8-recipe mxfp8 --mxfp8-compact-columnwise-backward
+steps: 1 train + validation + test
+lm loss: 11.66117
+mtp_1 / mtp_2 loss: 11.97331 / 11.96518
+validation / test loss: 10.68362 / 10.72901
+iteration time: 241558.2 ms
+max allocated / reserved: 24017.47 MB / 25202 MB
+MXFP8 stats:
+  mxfp8_cutlass_native_dgrad=34, mxfp8_cutlass_native_wgrad=34
+  mxfp8_flashinfer_dgrad=0, mxfp8_flashinfer_wgrad=0
+  mxfp8_grouped_direct_dgrad=10, mxfp8_grouped_direct_wgrad=10
+  mxfp8_grouped_direct_miss_dgrad=0, mxfp8_grouped_direct_miss_wgrad=0
+  mxfp8_grouped_transpose_copy_fallback_dgrad=0
+  mxfp8_grouped_transpose_copy_fallback_wgrad=0
+  mxfp8_tn_adapter_copy_transpose=0
+  mxfp8_tn_adapter_missing_sidecar_copy=0
+  mxfp8_tn_adapter_saved_transpose_operand=0
+  mxfp8_tn_sidecar_registry_peak=0
+  mxfp8_norm_quantize_sidecar_bridge=35
+  bf16_fallback_dgrad=0, bf16_fallback_wgrad=0
+  native_passthrough_dgrad=0, native_passthrough_wgrad=0
+  fallback_reasons={}
+```
+
+This receipt clears the 34 dense Linear copy-transpose calls from the previous
+one-step grouped-direct smoke. It is not a performance acceptance yet:
+iteration time regressed from `177950.9 ms` in the accidental
+FlashInfer/copy route to `241558.2 ms`, and peak memory only moved from about
+`24049 MB` to `24017 MB`. The remaining visible bridge is
+`mxfp8_norm_quantize_sidecar_bridge=35`; the dense dgrad/wgrad copies are gone,
+but the compact-columnwise loader/mainloop still needs speed work before this
+becomes a default.
 
 ## Next MXFP8 Acceptance Contract
 
