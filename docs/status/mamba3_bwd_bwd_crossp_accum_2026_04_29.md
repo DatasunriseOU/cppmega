@@ -391,3 +391,91 @@ Wave 3 recommendation:
 4. Do not spend Wave 3 on isolated scratch `disable_tma=True`; the standalone
    forms are legal. Focus on the full-kernel interaction around pipeline layout,
    scratch copy placement, and prior scratch-guard transformations.
+
+## Wave 3 - Full-Kernel P_TILE Matrix Attempt
+
+Status: `cutoff_incomplete`
+
+Branch: `worker/mamba3-ptile-layout-tma`
+
+Harness update:
+
+- `scripts/modal_mamba3_bwd_bwd_crossp_accum.py` now accepts `--run-id`.
+- Each remote run writes `report.json` to Modal volume
+  `cppmega-mamba3-benchmarks/mamba3_bwd_bwd_crossp_accum/<run_id>/`.
+- The local entrypoint also has `--spawn-only` for `modal run --detach`, which
+  avoided local RPC disconnects killing long TileLang/NVCC compiles.
+
+No scratch-guard edits were applied. The full harness used
+`mamba3_bwd_stage2_force_nontma.patch` plus
+`mamba3_bwd_bwd_crossp_accum_prototype.patch`.
+
+### Completed Smoke Runs
+
+Commands used the detached/spawn path, one variant per app:
+
+```text
+GHCR_TAG=785c3fd CPPMEGA_MODAL_GPU=H200:2 modal run --detach \
+  scripts/modal_mamba3_bwd_bwd_crossp_accum.py --spawn-only \
+  --run-id wave3_smoke_p128_ptile32_dspawn1 \
+  --shape-csv smoke_p128 --warmup 0 --iters 1 \
+  --p-tile 32 --crossp-num-stages 0
+
+GHCR_TAG=785c3fd CPPMEGA_MODAL_GPU=H200:2 modal run --detach \
+  scripts/modal_mamba3_bwd_bwd_crossp_accum.py --spawn-only \
+  --run-id wave3_smoke_p128_ptile64_dspawn1 \
+  --shape-csv smoke_p128 --warmup 0 --iters 1 \
+  --p-tile 64 --crossp-num-stages 0
+```
+
+| shape | P_TILE | app | status | correctness | stage2 bwd_bwd | cross-P bwd_bwd | slowdown | scratch | cross-P source markers |
+| --- | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| `smoke_p128` | 32 | `ap-1qIdttCKabrRdLADafQd5y` | ok | `12/12` allclose | `0.3186 ms` | `0.4477 ms` | `1.405x` | `64 KiB` | hash `9e3a4504169e9cb71510754b574dd7ecea7b7d9d091891209aef0cee68e5c9e0`, TMA load/store `0/0`, mbarrier `0`, launch bounds `(256,1)`, `dynamic_scratch_tma_guarded=false` |
+| `smoke_p128` | 64 | `ap-YxVpvOoTTPTWpxKxBWCtuL` | ok | `12/12` allclose | `0.3399 ms` | `0.4385 ms` | `1.290x` | `64 KiB` | hash `729a7667a0902ebc5e82e84344d4a0d9b8a2ea809860a08a9384632397bab43e`, TMA load/store `0/0`, mbarrier `0`, launch bounds `(256,1)`, `dynamic_scratch_tma_guarded=false` |
+| `smoke_p128` | 128 | not launched | blocked | cutoff | - | - | - | - | user cutoff arrived before launch |
+
+Baseline source hashes:
+
+- `P_TILE=32` run stage2: `140adea38491302a2e2516af331ca48537538b821a8c26c2472739f12af9844d`
+- `P_TILE=64` run stage2: `34aa8f1e82424ce2a48d25d5827a3864e031bf7d01326952237322c1540c2630`
+
+### Interruption Log
+
+Before switching to `--detach --spawn-only`, two direct local RPC attempts did
+not produce kernel verdicts:
+
+| run id | app | result |
+| --- | --- | --- |
+| `wave3_smoke_p128_ptile32` | `ap-oSR4Ffp7FP4E3giFrDJUsI` | Modal stopped during baseline `mamba_mimo_bwd_bwd_kernel` compile with `KeyboardInterrupt` in `tilelang/tileop/gemm/__init__.py`; no `SUMMARY_JSON`, no `report.json`. |
+| `wave3_smoke_p128_ptile32_r1` | `ap-8RfODp06sGEf05zSQJWt0V` | Immediate Modal `RemoteError` after object creation; app logs only `Stopping app - user stopped from CLI`; no kernel verdict. |
+
+`modal run --detach` with `.remote()` was also rejected by Modal's own warning:
+detached `.remote()` calls may be canceled when the local caller disconnects.
+The working orchestration is `modal run --detach ... --spawn-only`.
+
+### Cutoff Read
+
+The requested full matrix is incomplete because the user cutoff arrived after
+`P_TILE=64` smoke completed and before launching `P_TILE=128` or productionish.
+No productionish Wave 3 runs were launched.
+
+From the completed clean smoke rows, `P_TILE=64` is the best of the two tested
+variants but still slower than stage2. There is no evidence yet that P tiling
+recovers performance; however, Lane B cannot be formally declared dead until
+`P_TILE=128` smoke is run, because that is the full-P ownership case.
+
+Wave 4 recommendation:
+
+1. Start with exactly one detached/spawn smoke run:
+   `P_TILE=128`, `shape_csv=smoke_p128`, `warmup=0`, `iters=1`.
+2. If it compiles and is correct, run productionish only for the best smoke row
+   among `P_TILE=64` and `P_TILE=128`; skip `P_TILE=32` productionish unless a
+   repeat smoke contradicts the slower result.
+3. If `P_TILE=128` is also slower than stage2, declare Lane B dead for P-tiling
+   and pivot away from the monolithic P-tiled cross-P accumulator. The next
+   pivot should be a two-kernel split or state-passing/scratch-traffic reduction,
+   not TMA/WS.
+
+Modal cleanup: after cutoff, `modal app list` showed all
+`cppmega-mamba3-bwd-bwd-crossp-accum` apps stopped with `0` tasks. The
+pre-existing deployed `cppmega-pre...` app was left untouched.

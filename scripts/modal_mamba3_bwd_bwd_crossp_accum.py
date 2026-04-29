@@ -28,10 +28,13 @@ GHCR_REPO = os.environ.get("GHCR_REPO", "ghcr.io/jewelmusicee/cppmega")
 GHCR_TAG = os.environ.get("GHCR_TAG", "785c3fd")
 GHCR_REF = f"{GHCR_REPO}:{GHCR_TAG}"
 GPU_SPEC = os.environ.get("CPPMEGA_MODAL_GPU", "H200:2")
+BENCH_VOLUME_NAME = os.environ.get("CPPMEGA_MODAL_BENCH_VOLUME", "cppmega-mamba3-benchmarks")
 
 APP_NAME = "cppmega-mamba3-bwd-bwd-crossp-accum"
 SOURCE_ROOT = "/opt/state-spaces-mamba"
 CPPMEGA_ROOT = "/opt/cppmega"
+BENCH_ROOT = "/benchmarks"
+BENCH_PREFIX = "mamba3_bwd_bwd_crossp_accum"
 
 
 @dataclass(frozen=True)
@@ -84,6 +87,7 @@ def _image() -> modal.Image:
 
 
 app = modal.App(APP_NAME)
+bench_volume = modal.Volume.from_name(BENCH_VOLUME_NAME, create_if_missing=True)
 
 
 def _install_source_paths() -> None:
@@ -539,25 +543,35 @@ def _selected_shapes(shape_csv: str) -> list[Shape]:
     return selected
 
 
-@app.function(image=_image(), gpu=GPU_SPEC, timeout=1800)
+@app.function(image=_image(), gpu=GPU_SPEC, timeout=1800, volumes={BENCH_ROOT: bench_volume})
 def run_probe(
     requested_gpu: str,
+    run_id: str | None,
     shape_csv: str,
     warmup: int,
     iters: int,
     p_tile: int,
     crossp_num_stages: int,
 ) -> dict[str, Any]:
+    import time
     import traceback
 
+    run_id = run_id or time.strftime("%Y%m%d_%H%M%S")
+    run_rel = f"{BENCH_PREFIX}/{run_id}"
+    run_dir = os.path.join(BENCH_ROOT, run_rel)
+    os.makedirs(run_dir, exist_ok=True)
     try:
         _install_source_paths()
         _reset_mamba_imports()
-        print(f"[crossp] run_probe start shape_csv={shape_csv}", flush=True)
+        print(f"[crossp] run_probe start run_id={run_id} shape_csv={shape_csv}", flush=True)
         device = _device_report(requested_gpu)
         print(f"[crossp] device ready {device.get('device')}", flush=True)
-        return {
+        report = {
+            "run_id": run_id,
             "app_name": APP_NAME,
+            "volume": BENCH_VOLUME_NAME,
+            "volume_relpath": f"/{run_rel}",
+            "artifact_dir": run_dir,
             "device": device,
             "settings": {
                 "shape_csv": shape_csv,
@@ -572,24 +586,40 @@ def run_probe(
             ],
         }
     except BaseException as exc:  # noqa: BLE001
-        return {
+        report = {
+            "run_id": run_id,
             "app_name": APP_NAME,
+            "volume": BENCH_VOLUME_NAME,
+            "volume_relpath": f"/{run_rel}",
+            "artifact_dir": run_dir,
             "top_level_status": "crashed",
             "exception_type": type(exc).__name__,
             "exception": str(exc),
             "traceback_tail": traceback.format_exc()[-8000:],
         }
+    report["artifacts"] = {"report_json": os.path.join(run_dir, "report.json")}
+    with open(report["artifacts"]["report_json"], "w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2, sort_keys=True, default=str)
+    bench_volume.commit()
+    return report
 
 
 @app.local_entrypoint()
 def main(
+    run_id: str | None = None,
     shape_csv: str = "tiny",
     warmup: int = 1,
     iters: int = 2,
     p_tile: int = 64,
     crossp_num_stages: int = 0,
+    spawn_only: bool = False,
 ) -> None:
-    result = run_probe.remote(GPU_SPEC, shape_csv, warmup, iters, p_tile, crossp_num_stages)
+    if spawn_only:
+        call = run_probe.spawn(GPU_SPEC, run_id, shape_csv, warmup, iters, p_tile, crossp_num_stages)
+        print(f"SPAWNED_CALL_ID={call.object_id}")
+        print(f"RUN_ID={run_id}")
+        return
+    result = run_probe.remote(GPU_SPEC, run_id, shape_csv, warmup, iters, p_tile, crossp_num_stages)
     print("SUMMARY_JSON_START")
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
     print("SUMMARY_JSON_END")
