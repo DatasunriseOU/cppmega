@@ -22,6 +22,23 @@ The reproducer needs only `tilelang` + `mamba_ssm` importable — the
 FloorMod crash fires inside the `LayoutInference` TIR pass, which runs on
 host before any CUDA codegen, so a CUDA device is **not** required.
 
+## Companion diagonal specialization
+
+This pack also carries an isolated Mamba3 `bwd_bwd` diagonal-path prototype:
+
+- `mamba3_bwd_bwd_rr_diag_tilelang.patch` replaces the full
+  `(chunk_size * R, chunk_size * R)` `dqk_from_diag` product with per-time
+  `(R, R)` work and feeds `DGAMMA_DIAG`, `DK`, and `DQ`.
+- `rr_diag_specialization.py` validates the same replacement against the full
+  fused diagonal extraction and includes a Triton companion microkernel.
+- `scripts/modal_mamba3_rr_diag_benchmark.py` runs the isolated benchmark on
+  Modal H200.
+
+The productionish H200 isolated run (`B=4,S=4096,H=32,N=64,P=128,R=4`) measured
+`6.8915 ms` for the full torch diagonal baseline vs `2.6902 ms` for the Triton
+R x R companion, with max output diffs <= `1.19e-6`. See
+`docs/status/mamba3_bwd_bwd_rr_diag_specialization_2026_04_29.md`.
+
 ## Expected output — bug present (current TileLang main)
 
 ```
