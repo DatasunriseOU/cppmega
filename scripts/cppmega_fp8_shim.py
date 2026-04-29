@@ -1200,7 +1200,10 @@ if (
             _data = getattr(_x, "_columnwise_data", None)
             _scale = getattr(_x, "_columnwise_scale_inv", None)
             if not isinstance(_data, _torch.Tensor) or not isinstance(_scale, _torch.Tensor):
-                raise ValueError("MXFP8 CUTLASS direct backend requires columnwise data and scales")
+                raise ValueError(
+                    "MXFP8 CUTLASS direct backend requires columnwise data and scales; "
+                    f"{_cppmega_mxfp8_debug_desc(_x)}"
+                )
             if _data.dim() < 2 or _scale.dim() != 2:
                 raise ValueError(
                     "MXFP8 CUTLASS direct backend requires matrix-like columnwise payloads "
@@ -1234,11 +1237,37 @@ if (
             _a_data, _a_scale = _cppmega_mxfp8_rowwise_payload_and_scale(_a)
             _b_data, _b_scale = _cppmega_mxfp8_rowwise_payload_and_scale(_b)
             _cutlass = _cppmega_load_cutlass_mxfp8_module()
-            _result = _cutlass.tn_gemm(
+            _result = _cutlass.tn_gemm_direct_rowwise(
                 _a_data,
                 _a_scale,
                 _b_data,
                 _b_scale,
+                **_cppmega_cutlass_kwargs(_kwargs),
+            )
+            return _result, None, None, None
+
+        def _cppmega_cutlass_dgrad_nn_from_rowwise_transpose(_weight_t, _dy, _kwargs):
+            # weight_t is logical weight.T in rowwise MXFP8 storage. CUTLASS TN
+            # wants A[M, N]=dy and B[K, N]=weight_t to produce dX[M, K].
+            return _cppmega_cutlass_tn_gemm(_dy, _weight_t, _kwargs)
+
+        def _cppmega_cutlass_wgrad_nt_from_rowwise_transpose(_x_t, _dy_t, _kwargs):
+            # x_t is logical x.T[K, M], dy_t is logical dy.T[N, M].
+            # CUTLASS TN wants A[N, M]=dy_t and B[K, M]=x_t to produce dW[N, K].
+            return _cppmega_cutlass_tn_gemm(_dy_t, _x_t, _kwargs)
+
+        def _cppmega_cutlass_wgrad_nt_from_x_rowwise_transpose(_x_t, _dy, _kwargs):
+            # x_t is logical x.T[K, M] in rowwise MXFP8 storage while dy is the
+            # original compact-columnwise [M, N] operand. The mixed-source
+            # direct kernel reads dy as dy.T and x_t directly.
+            _dy_data, _dy_scale = _cppmega_mxfp8_colwise_payload_and_scale(_dy)
+            _x_data, _x_scale = _cppmega_mxfp8_rowwise_payload_and_scale(_x_t)
+            _cutlass = _cppmega_load_cutlass_mxfp8_module()
+            _result = _cutlass.wgrad_nt_gemm_x_rowwise_transpose(
+                _dy_data,
+                _dy_scale,
+                _x_data,
+                _x_scale,
                 **_cppmega_cutlass_kwargs(_kwargs),
             )
             return _result, None, None, None
@@ -1287,9 +1316,29 @@ if (
                 # dgrad: dy[M, N] @ weight[N, K].
                 # CUTLASS direct consumes dy rowwise and aliases original
                 # compact TE weight columnwise storage as logical weight.T.
+                if _cppmega_is_mxfp8_rowwise_transpose_operand(_args[0]):
+                    return True, _cppmega_cutlass_dgrad_nn_from_rowwise_transpose(
+                        _args[0],
+                        _args[1],
+                        _kwargs,
+                    )
                 return True, _cppmega_cutlass_dgrad_nn_gemm(_args[0], _args[1], _kwargs)
 
             # wgrad: dy.T[N, M] @ x[M, K].
+            if _cppmega_is_mxfp8_rowwise_transpose_operand(
+                _args[0]
+            ) and _cppmega_is_mxfp8_rowwise_transpose_operand(_args[1]):
+                return True, _cppmega_cutlass_wgrad_nt_from_rowwise_transpose(
+                    _args[0],
+                    _args[1],
+                    _kwargs,
+                )
+            if _cppmega_is_mxfp8_rowwise_transpose_operand(_args[0]):
+                return True, _cppmega_cutlass_wgrad_nt_from_x_rowwise_transpose(
+                    _args[0],
+                    _args[1],
+                    _kwargs,
+                )
             return True, _cppmega_cutlass_wgrad_nt_gemm(_args[0], _args[1], _kwargs)
 
         def _cppmega_flashinfer_kwargs(_kwargs):
