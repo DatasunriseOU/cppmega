@@ -55,6 +55,27 @@ def _rel_l2(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((num / den).item())
 
 
+def _swizzle_rowwise_scale_cpu(rowwise_scale: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    """Small test-only implementation of CUTLASS/TE MXFP8 rowwise scale swizzle."""
+
+    k_blocks = (cols + 31) // 32
+    padded_rows = ((rows + 127) // 128) * 128
+    padded_k_blocks = ((k_blocks + 3) // 4) * 4
+    num_tiles_x = (cols + 127) // 128
+    src = rowwise_scale.detach().cpu()
+    out = torch.zeros((padded_rows * padded_k_blocks,), dtype=torch.uint8)
+    for row in range(rows):
+        for k_block in range(k_blocks):
+            tile_idx_x = k_block // 4
+            tile_idx_y = row // 128
+            idx_in_tile_x = k_block % 4
+            idx_in_tile_y = row % 128
+            swizzled_idx = (tile_idx_y * num_tiles_x + tile_idx_x) * 512
+            swizzled_idx += (idx_in_tile_y % 32) * 16 + (idx_in_tile_y // 32) * 4 + idx_in_tile_x
+            out[swizzled_idx] = src[row, k_block]
+    return out.reshape(padded_rows, padded_k_blocks).to(rowwise_scale.device)
+
+
 class TestCutlassMxfp8Gemm:
     """Basic sanity checks for the CUTLASS MXFP8 TN GEMM entry point."""
 
@@ -182,3 +203,79 @@ class TestCutlassMxfp8Gemm:
         torch.testing.assert_close(direct_wgrad, adapter_wgrad, rtol=0, atol=0)
         assert _rel_l2(direct_dgrad, dy_ref @ w_ref) < 0.15
         assert _rel_l2(direct_wgrad, dy_ref.t() @ x_ref) < 0.15
+
+    def test_rowwise_swizzled_scale_entrypoint_matches_compact_direct(self) -> None:
+        """Stock CUTLASS swizzled-scale probe matches compact-direct rowwise GEMM."""
+
+        from cppmega.megatron import cutlass_mxfp8_gemm as cutlass
+
+        device = torch.device("cuda")
+        m = n = k = 128
+        x_ref, xq = _make_mxfp8_tensor(m, k, device)
+        w_ref, wq = _make_mxfp8_tensor(n, k, device)
+        a_scale = _swizzle_rowwise_scale_cpu(xq._rowwise_scale_inv, m, k)
+        b_scale = _swizzle_rowwise_scale_cpu(wq._rowwise_scale_inv, n, k)
+
+        swizzled = cutlass.tn_gemm_swizzled_scale(
+            xq._rowwise_data,
+            a_scale,
+            wq._rowwise_data,
+            b_scale,
+        )
+        compact = cutlass.tn_gemm_direct_rowwise(
+            xq._rowwise_data,
+            xq._rowwise_scale_inv,
+            wq._rowwise_data,
+            wq._rowwise_scale_inv,
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(swizzled, compact, rtol=0, atol=0)
+        assert _rel_l2(swizzled, x_ref @ w_ref.t()) < 0.15
+
+    def test_mixed_wgrad_accepts_saved_x_rowwise_transpose(self) -> None:
+        """wgrad direct path can consume saved ``x.T`` without a dense copy."""
+
+        from cppmega.megatron import cutlass_mxfp8_gemm as cutlass
+
+        device = torch.device("cuda")
+        m = n = k = 128
+        x_ref, xq = _make_mxfp8_tensor(m, k, device)
+        dy_ref, dyq = _make_mxfp8_tensor(m, n, device)
+
+        x_t_data = xq._columnwise_data.t().contiguous()
+        x_t_scale = xq._columnwise_scale_inv.t().contiguous()
+        mixed_wgrad = cutlass.wgrad_nt_gemm_x_rowwise_transpose(
+            dyq._columnwise_data,
+            dyq._columnwise_scale_inv,
+            x_t_data,
+            x_t_scale,
+        )
+        legacy_wgrad = cutlass._tn_gemm_compact_direct(
+            dyq._columnwise_data,
+            dyq._columnwise_scale_inv,
+            x_t_data,
+            x_t_scale,
+            m=n,
+            n=k,
+            k=m,
+            a_source=cutlass._SOURCE_COLUMNWISE_TRANSPOSE,
+            a_data_ld=int(dyq._columnwise_data.shape[1]),
+            a_scale_ld=int(dyq._columnwise_scale_inv.shape[1]),
+            b_source=cutlass._SOURCE_ROWWISE,
+            b_data_ld=int(x_t_data.shape[1]),
+            b_scale_ld=int(x_t_scale.shape[1]),
+            asymmetric=True,
+            a_columnwise_smem=False,
+        )
+        adapter_wgrad = cutlass.tn_gemm(
+            dyq._columnwise_data.t().contiguous(),
+            dyq._columnwise_scale_inv.t().contiguous(),
+            x_t_data,
+            x_t_scale,
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(mixed_wgrad, legacy_wgrad, rtol=0, atol=0)
+        torch.testing.assert_close(mixed_wgrad, adapter_wgrad, rtol=0, atol=0)
+        assert _rel_l2(mixed_wgrad, dy_ref.t() @ x_ref) < 0.15

@@ -249,6 +249,7 @@ def test_dgrad_compact_columnwise_dispatches_original_tensors(monkeypatch) -> No
     assert calls[0][2] is weight._columnwise_data
     assert calls[0][3] is weight._columnwise_scale_inv
     assert calls[0][4]["out"] is None
+    assert calls[0][4]["asymmetric"] is True
 
 
 def test_wgrad_compact_columnwise_dispatches_original_tensors(monkeypatch) -> None:
@@ -273,6 +274,7 @@ def test_wgrad_compact_columnwise_dispatches_original_tensors(monkeypatch) -> No
     assert calls[0][1] is dy._columnwise_scale_inv
     assert calls[0][2] is x._columnwise_data
     assert calls[0][3] is x._columnwise_scale_inv
+    assert calls[0][4]["asymmetric"] is True
 
 
 def test_legacy_dgrad_wrapper_prefers_compact_columnwise(monkeypatch) -> None:

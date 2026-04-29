@@ -181,7 +181,8 @@ def _tn_gemm_compact_direct(
     accumulate: bool = False,
     alpha: float = 1.0,
     beta: float | None = None,
-    asymmetric: bool = False,
+    asymmetric: bool = True,
+    a_columnwise_smem: bool = False,
 ) -> torch.Tensor:
     if not is_supported_shape(m, n, k):
         raise ValueError(f"unsupported CUTLASS MXFP8 GB10 shape {m}x{n}x{k}; require multiples of 128")
@@ -206,7 +207,14 @@ def _tn_gemm_compact_direct(
     beta_f = _resolve_beta(beta, bool(accumulate))
 
     ext = _load_cuda_ext()
-    entrypoint = ext.tn_gemm_compact_direct_asym if asymmetric else ext.tn_gemm_compact_direct
+    if a_columnwise_smem:
+        if not asymmetric:
+            raise ValueError("A-columnwise-smem direct path requires asymmetric=True")
+        if a_source != _SOURCE_COLUMNWISE_TRANSPOSE:
+            raise ValueError("A-columnwise-smem direct path requires A columnwise-transpose source")
+        entrypoint = ext.tn_gemm_compact_direct_a_col_smem_asym
+    else:
+        entrypoint = ext.tn_gemm_compact_direct_asym if asymmetric else ext.tn_gemm_compact_direct
     return entrypoint(
         _as_uint8_contiguous(a_data),
         _as_uint8_contiguous(a_scale_inv),
@@ -239,7 +247,7 @@ def dgrad_nn_gemm(
     accumulate: bool = False,
     alpha: float = 1.0,
     beta: float | None = None,
-    asymmetric: bool = False,
+    asymmetric: bool = True,
 ) -> torch.Tensor:
     """Run dgrad NN as TN without materializing ``weight.T``.
 
@@ -281,6 +289,122 @@ def dgrad_nn_gemm(
     )
 
 
+def tn_gemm_direct_rowwise(
+    a_rowwise_data: torch.Tensor,
+    a_rowwise_scale_inv: torch.Tensor,
+    b_rowwise_data: torch.Tensor,
+    b_rowwise_scale_inv: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    accumulate: bool = False,
+    alpha: float = 1.0,
+    beta: float | None = None,
+    asymmetric: bool = True,
+) -> torch.Tensor:
+    """Run TN GEMM through the compact-direct asymmetric scheduler.
+
+    Inputs are logical ``A[M, K]`` and ``B[N, K]`` in compact rowwise MXFP8
+    storage; the returned BF16 tensor is ``A @ B.T``. This shares the same
+    stable GB10 scheduler as mixed compact-columnwise backward routes.
+    """
+
+    if a_rowwise_data.dim() != 2 or a_rowwise_scale_inv.dim() != 2:
+        raise ValueError("A rowwise payload/scales must be 2D")
+    if b_rowwise_data.dim() != 2 or b_rowwise_scale_inv.dim() != 2:
+        raise ValueError("B rowwise payload/scales must be 2D")
+    m = int(a_rowwise_data.shape[0])
+    k = int(a_rowwise_data.shape[1])
+    n = int(b_rowwise_data.shape[0])
+    if int(b_rowwise_data.shape[1]) != k:
+        raise ValueError(
+            f"K mismatch: A is {tuple(a_rowwise_data.shape)}, B is {tuple(b_rowwise_data.shape)}"
+        )
+    return _tn_gemm_compact_direct(
+        a_rowwise_data,
+        a_rowwise_scale_inv,
+        b_rowwise_data,
+        b_rowwise_scale_inv,
+        m=m,
+        n=n,
+        k=k,
+        a_source=_SOURCE_ROWWISE,
+        a_data_ld=int(a_rowwise_data.shape[1]),
+        a_scale_ld=int(a_rowwise_scale_inv.shape[1]),
+        b_source=_SOURCE_ROWWISE,
+        b_data_ld=int(b_rowwise_data.shape[1]),
+        b_scale_ld=int(b_rowwise_scale_inv.shape[1]),
+        out=out,
+        accumulate=accumulate,
+        alpha=alpha,
+        beta=beta,
+        asymmetric=asymmetric,
+    )
+
+
+def tn_gemm_swizzled_scale(
+    a_rowwise_data: torch.Tensor,
+    a_gemm_scale_inv: torch.Tensor,
+    b_rowwise_data: torch.Tensor,
+    b_gemm_scale_inv: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    accumulate: bool = False,
+    alpha: float = 1.0,
+    beta: float | None = None,
+) -> torch.Tensor:
+    """Probe TN GEMM with rowwise payloads and GEMM-swizzled MXFP8 scales.
+
+    This bypasses cppmega's compact-scale producer and lets the stock CUTLASS
+    block-scaled mainloop consume scale factors in the hardware layout emitted
+    by TE or by the local swizzle probe.
+    """
+
+    if a_rowwise_data.dim() != 2 or b_rowwise_data.dim() != 2:
+        raise ValueError("rowwise payload tensors must be 2D")
+    if a_gemm_scale_inv.dtype != torch.uint8 or b_gemm_scale_inv.dtype != torch.uint8:
+        raise TypeError("GEMM-swizzled MXFP8 scales must be uint8 tensors")
+
+    m = int(a_rowwise_data.shape[0])
+    k = int(a_rowwise_data.shape[1])
+    n = int(b_rowwise_data.shape[0])
+    if int(b_rowwise_data.shape[1]) != k:
+        raise ValueError(
+            f"K mismatch: A is {tuple(a_rowwise_data.shape)}, B is {tuple(b_rowwise_data.shape)}"
+        )
+    if not is_supported_shape(m, n, k):
+        raise ValueError(f"unsupported CUTLASS MXFP8 GB10 shape {m}x{n}x{k}; require multiples of 128")
+
+    if out is None:
+        out_arg = torch.empty(0, device=a_rowwise_data.device, dtype=torch.bfloat16)
+        use_out = False
+    else:
+        if out.dtype != torch.bfloat16:
+            raise TypeError(f"CUTLASS MXFP8 backend currently requires BF16 out, got {out.dtype}")
+        if out.numel() < m * n:
+            raise ValueError(f"out is too small for {m}x{n}")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
+        out_arg = out
+        use_out = True
+
+    beta_f = _resolve_beta(beta, bool(accumulate))
+    ext = _load_cuda_ext()
+    return ext.tn_gemm_swizzled_scale(
+        _as_uint8_contiguous(a_rowwise_data),
+        _as_uint8_contiguous(a_gemm_scale_inv),
+        _as_uint8_contiguous(b_rowwise_data),
+        _as_uint8_contiguous(b_gemm_scale_inv),
+        m,
+        n,
+        k,
+        out_arg,
+        use_out,
+        bool(accumulate),
+        float(alpha),
+        beta_f,
+    )
+
+
 def wgrad_nt_gemm(
     dy_colwise_data: torch.Tensor,
     dy_colwise_scale_inv: torch.Tensor,
@@ -291,7 +415,7 @@ def wgrad_nt_gemm(
     accumulate: bool = False,
     alpha: float = 1.0,
     beta: float | None = None,
-    asymmetric: bool = False,
+    asymmetric: bool = True,
 ) -> torch.Tensor:
     """Run wgrad NT as TN without materializing ``dy.T`` or ``x.T``.
 
@@ -330,4 +454,59 @@ def wgrad_nt_gemm(
         alpha=alpha,
         beta=beta,
         asymmetric=asymmetric,
+    )
+
+
+def wgrad_nt_gemm_x_rowwise_transpose(
+    dy_colwise_data: torch.Tensor,
+    dy_colwise_scale_inv: torch.Tensor,
+    x_t_rowwise_data: torch.Tensor,
+    x_t_rowwise_scale_inv: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    accumulate: bool = False,
+    alpha: float = 1.0,
+    beta: float | None = None,
+    asymmetric: bool = True,
+) -> torch.Tensor:
+    """Run wgrad NT when ``x.T`` is already saved as rowwise MXFP8.
+
+    Computes ``dy.T[N, M] @ x[M, K]``. ``dy`` is the original compact
+    columnwise tensor, while ``x_t`` is the logical transpose ``[K, M]`` in
+    rowwise storage. This avoids materializing ``dy.T`` or re-reading ``x`` as
+    compact columnwise.
+    """
+
+    if dy_colwise_data.dim() != 2 or dy_colwise_scale_inv.dim() != 2:
+        raise ValueError("dy columnwise payload/scales must be 2D")
+    if x_t_rowwise_data.dim() != 2 or x_t_rowwise_scale_inv.dim() != 2:
+        raise ValueError("x.T rowwise payload/scales must be 2D")
+    if int(dy_colwise_data.shape[0]) != int(x_t_rowwise_data.shape[1]):
+        raise ValueError(
+            "wgrad reduction mismatch: "
+            f"dy is {tuple(dy_colwise_data.shape)}, x.T is {tuple(x_t_rowwise_data.shape)}"
+        )
+    m = int(dy_colwise_data.shape[1])
+    n = int(x_t_rowwise_data.shape[0])
+    k = int(dy_colwise_data.shape[0])
+    return _tn_gemm_compact_direct(
+        dy_colwise_data,
+        dy_colwise_scale_inv,
+        x_t_rowwise_data,
+        x_t_rowwise_scale_inv,
+        m=m,
+        n=n,
+        k=k,
+        a_source=_SOURCE_COLUMNWISE_TRANSPOSE,
+        a_data_ld=int(dy_colwise_data.shape[1]),
+        a_scale_ld=int(dy_colwise_scale_inv.shape[1]),
+        b_source=_SOURCE_ROWWISE,
+        b_data_ld=int(x_t_rowwise_data.shape[1]),
+        b_scale_ld=int(x_t_rowwise_scale_inv.shape[1]),
+        out=out,
+        accumulate=accumulate,
+        alpha=alpha,
+        beta=beta,
+        asymmetric=asymmetric,
+        a_columnwise_smem=True,
     )
