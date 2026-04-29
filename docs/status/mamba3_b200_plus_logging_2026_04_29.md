@@ -9,17 +9,21 @@ No production defaults were changed.
 
 ## Harness Update
 
-Updated `scripts/modal_mamba3_b200_paths.py` to request Modal's exact flexible
-Blackwell GPU string:
+Updated `scripts/modal_mamba3_b200_paths.py` to request Modal's flexible
+Blackwell GPU type with explicit quantity syntax:
 
 ```python
+@app.function(..., gpu="B200+:2", ...)
+def run_b200_plus_2(...)
+
 @app.function(..., gpu="B200+", ...)
 def run_b200_plus(...)
 ```
 
-The old default specs `B200+:2`, `B200:2`, and `B200:1` are no longer the
-default path for this harness. `CPPMEGA_MAMBA3_B200_SPECS` now accepts only
-`B200+`.
+Default specs are now `B200+:2,B200+`: two-GPU flexible Blackwell is primary,
+and single-GPU `B200+` is the fallback. The harness keeps separate remote
+functions for both specs so the Modal SDK sees literal `gpu=` strings.
+`B200:2` and `B200:1` remain intentionally out of the default path.
 
 Results are written stage-by-stage to Modal Volume
 `cppmega-mamba3-b200-plus-logging`:
@@ -42,7 +46,7 @@ The remote function also prints `[run:*]` and `[stage:*]` markers to stdout, so
 `modal app logs <app-id>` is enough to identify whether a container actually
 started.
 
-## B200+ Attempt
+## Earlier B200+ Single-GPU Attempt
 
 Command:
 
@@ -83,7 +87,13 @@ modal volume ls cppmega-mamba3-b200-plus-logging /
 
 ## How To Re-Poll Or Re-Run
 
-Launch a new detached attempt:
+Launch the primary two-GPU attempt:
+
+```bash
+GHCR_TAG=785c3fd modal run --detach scripts/modal_mamba3_b200_paths.py::run_b200_plus_2 --run-id <run_id>
+```
+
+Launch the single-GPU fallback:
 
 ```bash
 GHCR_TAG=785c3fd modal run --detach scripts/modal_mamba3_b200_paths.py::run_b200_plus --run-id <run_id>
@@ -121,11 +131,55 @@ Stop an accepted-but-not-provisioned app:
 modal app stop --yes <app-id>
 ```
 
-## Current Status
+## Status After Earlier Attempt
 
-Current status: **B200+ accepted, no container allocated**.
+Earlier status: **B200+ accepted, no container allocated**.
 
 No B200/B300 CUDA device report, TileLang baseline, PsiV write timing, or
 Mamba3 TileLang split timing was obtained in this attempt. The next useful
 signal is any run whose logs show `[run:start]`; after that, the Volume should
 contain per-stage JSON even if a later benchmark crashes.
+
+## Corrected B200+ Attempts
+
+Correction: Modal's flexible Blackwell type is `B200+`; the `:n` suffix is the
+GPU count. For this task the primary request is therefore `B200+:2`, with
+`B200+` as the single-GPU fallback.
+
+Primary command:
+
+```bash
+GHCR_TAG=785c3fd timeout 240s modal run --detach scripts/modal_mamba3_b200_paths.py::run_b200_plus_2 --run-id b200_plus2_785c3fd_20260429_2
+```
+
+Fallback command:
+
+```bash
+GHCR_TAG=785c3fd timeout 240s modal run --detach scripts/modal_mamba3_b200_paths.py::run_b200_plus --run-id b200_plus1_785c3fd_20260429_2
+```
+
+Results:
+
+| Requested GPU | Run ID | App ID | Created | Stopped | Final state | Tasks | Log tail | Volume artifacts |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `B200+:2` | `b200_plus2_785c3fd_20260429_2` | `ap-pJDL36lOBa1HlLg6vQfaae` | `2026-04-29 11:03:20 UTC` | `2026-04-29 11:05:40 UTC` | `stopped` | `0` | only `Stopping app - user stopped from CLI.` | none |
+| `B200+` | `b200_plus1_785c3fd_20260429_2` | `ap-zZWAqMpHkqfYshH785weqJ` | `2026-04-29 11:03:43 UTC` | `2026-04-29 11:05:40 UTC` | `stopped` | `0` | only `Stopping app - user stopped from CLI.` | none |
+
+Both apps were accepted by Modal and created the expected functions
+`run_b200_plus_2` and `run_b200_plus`, but neither allocated a function
+container during the wait window. There were no `[run:start]` markers and no
+remote writes to `cppmega-mamba3-b200-plus-logging`.
+
+Commands used for verification:
+
+```bash
+modal app logs ap-pJDL36lOBa1HlLg6vQfaae --timestamps --show-function-call-id --show-container-id --tail 100
+modal app logs ap-zZWAqMpHkqfYshH785weqJ --timestamps --show-function-call-id --show-container-id --tail 100
+modal app list --json
+modal volume ls cppmega-mamba3-b200-plus-logging /
+modal app stop --yes ap-pJDL36lOBa1HlLg6vQfaae
+modal app stop --yes ap-zZWAqMpHkqfYshH785weqJ
+```
+
+Updated current status: **`B200+:2` primary and `B200+` fallback both accepted,
+but neither got a container**.

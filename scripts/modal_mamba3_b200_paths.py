@@ -2,7 +2,8 @@
 
 This harness is intentionally separate from the Hopper Hoist-PsiV dry-run:
 
-* requests Modal's exact flexible Blackwell spec, `gpu="B200+"`;
+* requests Modal's flexible Blackwell specs (`gpu="B200+:2"` primary,
+  `gpu="B200+"` single-GPU fallback);
 * does not patch `mamba_ssm` or cppmega production defaults;
 * uses source-overlay Mamba3 TileLang to measure today's baseline on SM100;
 * records B200-specific go/no-go signals for TileLang, cuTile/CuTe DSL,
@@ -12,6 +13,7 @@ This harness is intentionally separate from the Hopper Hoist-PsiV dry-run:
 Examples:
 
     GHCR_TAG=785c3fd modal run scripts/modal_mamba3_b200_paths.py
+    GHCR_TAG=785c3fd modal run --detach scripts/modal_mamba3_b200_paths.py::run_b200_plus_2
     GHCR_TAG=785c3fd modal run --detach scripts/modal_mamba3_b200_paths.py::run_b200_plus
     GHCR_TAG=785c3fd modal run scripts/modal_mamba3_b200_paths.py --run-id manual_b200_plus_001
 
@@ -53,7 +55,7 @@ RESULTS_VOLUME_NAME = os.environ.get(
 RESULTS_MOUNT = "/vol"
 RESULTS_SUBDIR = "mamba3_b200_plus"
 
-DEFAULT_SPECS = ("B200+",)
+DEFAULT_SPECS = ("B200+:2", "B200+")
 SPEC_ENV = "CPPMEGA_MAMBA3_B200_SPECS"
 
 
@@ -629,6 +631,17 @@ def _run_probe(requested_gpu: str, run_id: str = "") -> dict[str, Any]:
 
 @app.function(
     image=_image(),
+    gpu="B200+:2",
+    timeout=2400,
+    volumes={RESULTS_MOUNT: results_vol},
+    retries=0,
+)
+def run_b200_plus_2(run_id: str = "") -> dict[str, Any]:
+    return _run_probe("B200+:2", run_id)
+
+
+@app.function(
+    image=_image(),
     gpu="B200+",
     timeout=2400,
     volumes={RESULTS_MOUNT: results_vol},
@@ -639,6 +652,7 @@ def run_b200_plus(run_id: str = "") -> dict[str, Any]:
 
 
 _RUNNERS: dict[str, Callable[[str], Any]] = {
+    "B200+:2": run_b200_plus_2.remote,
     "B200+": run_b200_plus.remote,
 }
 
