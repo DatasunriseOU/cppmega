@@ -26,6 +26,7 @@ Fp8Format = Literal["hybrid", "e4m3"]
 Fp8Recipe = Literal["off", "tensorwise", "mxfp8"]
 Mxfp8BackwardBackend = Literal["te_tn_adapter", "flashinfer_cutlass", "cutlass_native"]
 Mxfp8TransposeEmitBackend = Literal["auto", "te", "off"]
+Mxfp8CutlassScaleBackend = Literal["compact", "prepack", "swizzled"]
 Mxfp8FlashinferRunner = Literal["mm_mxfp8", "direct_tactic"]
 ParamStorage = Literal["auto", "bf16", "mxfp8"]
 SparseMlaMode = Literal["tilelang", "gather_scatter", "pytorch"]
@@ -120,6 +121,11 @@ class PrecisionProfile:
     mxfp8_transpose_emit_backend: Mxfp8TransposeEmitBackend = "te"
     mxfp8_transpose_emit_swizzled: bool = True
     mxfp8_transpose_emit_strict: bool = True
+    # ``compact`` uses the manual compact-scale CUTLASS mainloop. ``swizzled``
+    # keeps compact primary tensors for TE transpose emit, then routes
+    # GEMM-ready rowwise-transpose sidecars through the stock SM120
+    # blockscaled CUTLASS mainloop.
+    mxfp8_cutlass_scale_backend: Mxfp8CutlassScaleBackend = "compact"
     # Experimental dense Linear backward mode: TE saves original compact
     # columnwise MXFP8 operands and lets the cppmega compact-direct backend
     # read them directly.  This removes the dense rowwise-transpose copies, but
@@ -444,6 +450,24 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
             "mxfp8_compact_columnwise_backward requires "
             "mxfp8_bwd_backend='cutlass_native'"
         )
+    if (
+        profile.precision.fp8_recipe == "mxfp8"
+        and profile.precision.mxfp8_cutlass_scale_backend == "swizzled"
+        and profile.precision.mxfp8_bwd_backend != "cutlass_native"
+    ):
+        raise ValueError(
+            "mxfp8_cutlass_scale_backend='swizzled' requires "
+            "mxfp8_bwd_backend='cutlass_native'"
+        )
+    if (
+        profile.precision.fp8_recipe == "mxfp8"
+        and profile.precision.mxfp8_cutlass_scale_backend == "swizzled"
+        and profile.precision.mxfp8_compact_columnwise_backward
+    ):
+        raise ValueError(
+            "mxfp8_cutlass_scale_backend='swizzled' is incompatible with "
+            "mxfp8_compact_columnwise_backward"
+        )
 
     env: dict[str, str] = {
         "CPPMEGA_RUN_PROFILE": profile.name,
@@ -582,6 +606,9 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                 "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT": _bool(
                     profile.precision.mxfp8_transpose_emit_strict
                 ),
+                "CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND": (
+                    profile.precision.mxfp8_cutlass_scale_backend
+                ),
                 "CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD": _bool(
                     profile.precision.mxfp8_compact_columnwise_backward
                 ),
@@ -661,6 +688,21 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.precision.attention_backend = args.attention_backend
     if args.mxfp8_bwd_backend is not None:
         profile.precision.mxfp8_bwd_backend = args.mxfp8_bwd_backend
+    if args.mxfp8_cutlass_scale_backend is not None:
+        profile.precision.mxfp8_cutlass_scale_backend = args.mxfp8_cutlass_scale_backend
+        if args.mxfp8_cutlass_scale_backend == "swizzled":
+            if args.mxfp8_bwd_backend is None:
+                profile.precision.mxfp8_bwd_backend = "cutlass_native"
+            elif args.mxfp8_bwd_backend != "cutlass_native":
+                raise ValueError(
+                    "--mxfp8-cutlass-scale-backend swizzled requires "
+                    "--mxfp8-bwd-backend cutlass_native"
+                )
+            if args.mxfp8_transpose_emit_backend is None:
+                profile.precision.mxfp8_transpose_emit_backend = "te"
+            if args.mxfp8_transpose_emit_swizzled is None:
+                profile.precision.mxfp8_transpose_emit_swizzled = True
+            profile.precision.mxfp8_compact_columnwise_backward = False
     if args.mxfp8_transpose_emit_backend is not None:
         profile.precision.mxfp8_transpose_emit_backend = args.mxfp8_transpose_emit_backend
     if args.mxfp8_transpose_emit_swizzled is not None:
@@ -825,6 +867,15 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         "--mxfp8-bwd-backend",
         choices=("te_tn_adapter", "flashinfer_cutlass", "cutlass_native"),
         default=None,
+    )
+    parser.add_argument(
+        "--mxfp8-cutlass-scale-backend",
+        choices=("compact", "prepack", "swizzled"),
+        default=None,
+        help=(
+            "CUTLASS-native MXFP8 scale route. swizzled uses TE-emitted "
+            "GEMM-ready rowwise-transpose sidecars with stock SM120 CUTLASS."
+        ),
     )
     parser.add_argument(
         "--mxfp8-transpose-emit-backend",

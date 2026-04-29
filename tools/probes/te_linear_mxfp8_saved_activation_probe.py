@@ -175,12 +175,26 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         and int(stats.get("mxfp8_flashinfer_wgrad", 0)) > 0
         and int(stats.get("mxfp8_tn_adapter_copy_transpose", 0)) == 0
     )
-    if direct_no_sidecar or flashinfer_compact_direct:
+    cutlass_stock_swizzled = (
+        backend == "cutlass_native"
+        and os.environ.get("CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND", "") == "swizzled"
+        and int(stats.get("mxfp8_cutlass_native_dgrad", 0)) > 0
+        and int(stats.get("mxfp8_cutlass_native_wgrad", 0)) > 0
+        and int(stats.get("mxfp8_cutlass_native_stock_swizzled", 0)) >= 2
+    )
+    if direct_no_sidecar or flashinfer_compact_direct or cutlass_stock_swizzled:
         if direct_no_sidecar:
             if int(stats.get("mxfp8_cutlass_native_dgrad", 0)) <= 0:
                 failures.append("CUTLASS native backend did not handle dgrad")
             if int(stats.get("mxfp8_cutlass_native_wgrad", 0)) <= 0:
                 failures.append("CUTLASS native backend did not handle wgrad")
+        elif cutlass_stock_swizzled:
+            if not saved_transpose_payload:
+                failures.append(
+                    "CUTLASS stock-swizzled backend did not save rowwise-transposed payloads"
+                )
+            if int(stats.get("mxfp8_cutlass_native_stock_scale_swizzle", 0)) <= 0:
+                failures.append("CUTLASS stock-swizzled backend did not pack compact dy scale")
         else:
             if int(stats.get("mxfp8_flashinfer_dgrad", 0)) <= 0:
                 failures.append("FlashInfer/CUTLASS compact-direct backend did not handle dgrad")
