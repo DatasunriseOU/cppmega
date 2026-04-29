@@ -1,0 +1,120 @@
+--- a/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
++++ b/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
+@@ -1170,6 +1170,117 @@ def mamba_mimo_bwd_bwd(
+ 
+     return mamba_mimo_bwd_bwd_kernel
+ 
++
++@tilelang.jit(
++    out_idx=[],
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: False,
++        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
++    })
++def mamba_mimo_bwd_bwd_dgamma_diag_probe(
++    B,
++    S,
++    H,
++    N,
++    P,
++    R,
++    reduceO,
++    chunk_size: int = 16,
++    dtype: str = 'float16',
++    threads: int = 128,
++    num_stages: int = 0,
++) -> torch.Tensor:
++    """Chunk-local dgamma/qk-dot slice split out of bwd_bwd for live-set probing.
++
++    This is intentionally a reduced-output probe. It validates whether the
++    dPhiO/PsiV/qk_dot diagonal subgraph can compile and run as an isolated kernel
++    without carrying the reverse state path's state buffers or Q/K live set.
++    """
++
++    accum_dtype = 'float32'
++    nchunks = tilelang.cdiv(S, chunk_size)
++    fused_chunk_size = chunk_size * R
++
++    if reduceO:
++        DOUT_shape = (B, S, H, P)
++    else:
++        DOUT_shape = (B, S, R, H, P)
++
++    @T.prim_func
++    def mamba_mimo_bwd_bwd_dgamma_diag_probe_kernel(
++            DOUT: T.Tensor(DOUT_shape, dtype),  # type: ignore
++            V: T.Tensor([B, S, H, P], dtype),  # type: ignore
++            MIMO_V: T.Tensor([H, R, P], T.float32),  # type: ignore
++            MIMO_O: T.Tensor([H, R, P], T.float32),  # type: ignore
++            QK_DOT: T.Tensor([B, H, S, R * R], dtype),  # type: ignore
++            DGAMMA_DIAG: T.Tensor([B, H, S], T.float32),  # type: ignore
++            ):
++        with T.Kernel(H, B, threads=threads) as (i_h, i_b):
++            dout_shared = T.alloc_shared([chunk_size, P], dtype)
++            dPhiO_shared = T.alloc_shared([fused_chunk_size, P], dtype)
++            v_shared = T.alloc_shared([chunk_size, P], dtype)
++            PsiV_shared = T.alloc_shared([fused_chunk_size, P], dtype)
++            qk_dot_shared = T.alloc_shared([chunk_size, R * R], dtype)
++            dqk_from_diag_shared = T.alloc_shared([fused_chunk_size, fused_chunk_size], accum_dtype)
++
++            noswizzle_annot = threads == 256 and (N <= 32 or P >= 128)
++            if not noswizzle_annot:
++                T.annotate_layout({
++                    dout_shared: tilelang.layout.make_swizzled_layout(dout_shared),
++                    dPhiO_shared: tilelang.layout.make_swizzled_layout(dPhiO_shared),
++                    v_shared: tilelang.layout.make_swizzled_layout(v_shared),
++                    PsiV_shared: tilelang.layout.make_swizzled_layout(PsiV_shared),
++                    dqk_from_diag_shared: tilelang.layout.make_swizzled_layout(dqk_from_diag_shared),
++                })
++            T.use_swizzle(10, "row")
++            T.no_set_max_nreg()
++
++            Phi_frag = T.alloc_fragment([R, P], dtype)
++            if reduceO:
++                T.copy(MIMO_O[i_h, :, :], Phi_frag)
++            Psi_frag = T.alloc_fragment([R, P], dtype)
++            T.copy(MIMO_V[i_h, :, :], Psi_frag)
++
++            for chunk_idx in T.Pipelined(0, nchunks, num_stages=num_stages):
++                chunk_start = chunk_idx * chunk_size
++
++                dPhiO_frag = T.alloc_fragment([chunk_size, R, P], dtype)
++                if reduceO:
++                    T.copy(DOUT[i_b, chunk_start:chunk_start+chunk_size, i_h, :], dout_shared)
++                    for cs, r, p in T.Parallel(chunk_size, R, P):
++                        dPhiO_frag[cs, r, p] = dout_shared[cs, p] * Phi_frag[r, p]
++                else:
++                    for cs, r, p in T.Parallel(chunk_size, R, P):
++                        dPhiO_frag[cs, r, p] = DOUT[i_b, chunk_start + cs, r, i_h, p]
++                T.copy(T.view(dPhiO_frag, shape=[fused_chunk_size, P]), dPhiO_shared)
++
++                T.copy(V[i_b, chunk_start:chunk_start+chunk_size, i_h, :], v_shared)
++                v_frag = T.alloc_fragment([chunk_size, P], accum_dtype)
++                T.copy(v_shared, v_frag)
++                PsiV_frag = T.alloc_fragment([chunk_size, R, P], dtype)
++                T.clear(PsiV_frag)
++                for cs, p in T.Parallel(chunk_size, P):
++                    for r in T.serial(R):
++                        PsiV_frag[cs, r, p] += v_frag[cs, p] * Psi_frag[r, p]
++                for cs, r, p in T.Parallel(chunk_size, R, P):
++                    PsiV_shared[cs * R + r, p] = PsiV_frag[cs, r, p]
++
++                dqk_from_diag_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], accum_dtype)
++                T.gemm(dPhiO_shared, PsiV_shared, dqk_from_diag_frag, transpose_B=True, clear_accum=True)
++                T.copy(dqk_from_diag_frag, dqk_from_diag_shared)
++
++                T.copy(QK_DOT[i_b, i_h, chunk_start:chunk_start+chunk_size, :], qk_dot_shared)
++                dgamma_diag_prereduce_frag = T.alloc_fragment([chunk_size, R * R], accum_dtype)
++                T.copy(qk_dot_shared, dgamma_diag_prereduce_frag)
++                for cs, r_out, r_in in T.Parallel(chunk_size, R, R):
++                    dgamma_diag_prereduce_frag[cs, r_out * R + r_in] *= dqk_from_diag_shared[cs * R + r_out, cs * R + r_in]
++
++                dgamma_diag_reduced_frag = T.alloc_fragment([chunk_size], accum_dtype)
++                T.reduce_sum(dgamma_diag_prereduce_frag, dgamma_diag_reduced_frag, dim=-1, clear=True)
++                T.copy(dgamma_diag_reduced_frag, DGAMMA_DIAG[i_b, i_h, chunk_start:chunk_start+chunk_size], disable_tma=True)
++
++    return mamba_mimo_bwd_bwd_dgamma_diag_probe_kernel
++
+ 
+ def mamba_mimo_bwd_combined(
+         dout,
