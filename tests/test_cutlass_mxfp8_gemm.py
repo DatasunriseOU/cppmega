@@ -182,3 +182,50 @@ class TestCutlassMxfp8Gemm:
         torch.testing.assert_close(direct_wgrad, adapter_wgrad, rtol=0, atol=0)
         assert _rel_l2(direct_dgrad, dy_ref @ w_ref) < 0.15
         assert _rel_l2(direct_wgrad, dy_ref.t() @ x_ref) < 0.15
+
+    def test_mixed_wgrad_accepts_saved_x_rowwise_transpose(self) -> None:
+        """wgrad direct path can consume saved ``x.T`` without a dense copy."""
+
+        from cppmega.megatron import cutlass_mxfp8_gemm as cutlass
+
+        device = torch.device("cuda")
+        m = n = k = 128
+        x_ref, xq = _make_mxfp8_tensor(m, k, device)
+        dy_ref, dyq = _make_mxfp8_tensor(m, n, device)
+
+        x_t_data = xq._columnwise_data.t().contiguous()
+        x_t_scale = xq._columnwise_scale_inv.t().contiguous()
+        mixed_wgrad = cutlass.wgrad_nt_gemm_x_rowwise_transpose(
+            dyq._columnwise_data,
+            dyq._columnwise_scale_inv,
+            x_t_data,
+            x_t_scale,
+        )
+        legacy_wgrad = cutlass._tn_gemm_compact_direct(
+            dyq._columnwise_data,
+            dyq._columnwise_scale_inv,
+            x_t_data,
+            x_t_scale,
+            m=n,
+            n=k,
+            k=m,
+            a_source=cutlass._SOURCE_COLUMNWISE_TRANSPOSE,
+            a_data_ld=int(dyq._columnwise_data.shape[1]),
+            a_scale_ld=int(dyq._columnwise_scale_inv.shape[1]),
+            b_source=cutlass._SOURCE_ROWWISE,
+            b_data_ld=int(x_t_data.shape[1]),
+            b_scale_ld=int(x_t_scale.shape[1]),
+            asymmetric=True,
+            a_columnwise_smem=False,
+        )
+        adapter_wgrad = cutlass.tn_gemm(
+            dyq._columnwise_data.t().contiguous(),
+            dyq._columnwise_scale_inv.t().contiguous(),
+            x_t_data,
+            x_t_scale,
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(mixed_wgrad, legacy_wgrad, rtol=0, atol=0)
+        torch.testing.assert_close(mixed_wgrad, adapter_wgrad, rtol=0, atol=0)
+        assert _rel_l2(mixed_wgrad, dy_ref.t() @ x_ref) < 0.15
