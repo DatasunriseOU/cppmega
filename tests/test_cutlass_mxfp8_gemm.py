@@ -251,6 +251,13 @@ class TestCutlassMxfp8Gemm:
             x_t_data,
             x_t_scale,
         )
+        early_wgrad = cutlass.wgrad_nt_gemm_x_rowwise_transpose(
+            dyq._columnwise_data,
+            dyq._columnwise_scale_inv,
+            x_t_data,
+            x_t_scale,
+            b_tma_early=True,
+        )
         legacy_wgrad = cutlass._tn_gemm_compact_direct(
             dyq._columnwise_data,
             dyq._columnwise_scale_inv,
@@ -277,5 +284,37 @@ class TestCutlassMxfp8Gemm:
         torch.cuda.synchronize()
 
         torch.testing.assert_close(mixed_wgrad, legacy_wgrad, rtol=0, atol=0)
+        torch.testing.assert_close(early_wgrad, mixed_wgrad, rtol=0, atol=0)
         torch.testing.assert_close(mixed_wgrad, adapter_wgrad, rtol=0, atol=0)
         assert _rel_l2(mixed_wgrad, dy_ref.t() @ x_ref) < 0.15
+
+    def test_streaming_swizzled_stock_wgrad_matches_sidecar_stock(self) -> None:
+        """Streaming stock probe avoids full dy.T sidecars and matches stock GEMM."""
+
+        from cppmega.megatron import cutlass_mxfp8_gemm as cutlass
+
+        device = torch.device("cuda")
+        m = n = k = 128
+        x_ref, xq = _make_mxfp8_tensor(m, k, device)
+        dy_ref, dyq = _make_mxfp8_tensor(m, n, device)
+
+        x_t_data = xq._columnwise_data.t().contiguous()
+        x_t_scale = xq._columnwise_scale_inv.t().contiguous()
+        streaming = cutlass.wgrad_nt_gemm_streaming_swizzled_stock(
+            dyq._columnwise_data,
+            dyq._columnwise_scale_inv,
+            x_t_data,
+            x_t_scale,
+            tile_m=128,
+            tile_n=128,
+        )
+        stock_sidecar = cutlass.tn_gemm_swizzled_scale(
+            dyq._columnwise_data.t().contiguous(),
+            _swizzle_rowwise_scale_cpu(dyq._columnwise_scale_inv.t().contiguous(), n, m),
+            x_t_data,
+            _swizzle_rowwise_scale_cpu(x_t_scale, k, m),
+        )
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(streaming, stock_sidecar, rtol=0, atol=0)
+        assert _rel_l2(streaming, dy_ref.t() @ x_ref) < 0.15
