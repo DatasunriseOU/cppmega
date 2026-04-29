@@ -115,6 +115,19 @@ VARIANTS: dict[str, dict[str, Any]] = {
         "bb_threads": 256,
         "bb_num_stages": 1,
     },
+    "stage2_rr_diag": {
+        "patch": "stage2_force_nontma",
+        "patch_files": [
+            "mamba3_bwd_stage2_force_nontma.patch",
+            "mamba3_bwd_stage2_rr_diag.patch",
+        ],
+        "flattened_inputs": True,
+        "flat_qk_dot": True,
+        "bf_threads": 128,
+        "bf_num_stages": 1,
+        "bb_threads": 256,
+        "bb_num_stages": 0,
+    },
 }
 
 
@@ -346,11 +359,17 @@ def _prepare_variant(variant: str) -> tuple[str, dict[str, Any]]:
         return dst, meta
 
     if patch_kind == "stage2_force_nontma":
-        patch_file = str(VARIANTS[variant].get("patch_file", "mamba3_bwd_stage2_force_nontma.patch"))
-        patch_meta = _apply_patch(dst, patch_file)
-        meta.update({"patch": patch_file, **patch_meta})
-        if patch_meta["patch_rc"] != 0:
-            return dst, meta
+        patch_files = VARIANTS[variant].get("patch_files")
+        if patch_files is None:
+            patch_files = [str(VARIANTS[variant].get("patch_file", "mamba3_bwd_stage2_force_nontma.patch"))]
+        patch_results = []
+        for patch_file in patch_files:
+            patch_meta = _apply_patch(dst, str(patch_file))
+            patch_results.append(patch_meta)
+            if patch_meta["patch_rc"] != 0:
+                meta.update({"patch": str(patch_file), "patch_results": patch_results, **patch_meta})
+                return dst, meta
+        meta.update({"patch": ",".join(str(name) for name in patch_files), "patch_results": patch_results})
         meta["replacement_counts"] = _apply_text_replacements(dst, [])
     else:
         patch_meta = _apply_patch(dst, "mamba3_bwd_layout_fix.patch")

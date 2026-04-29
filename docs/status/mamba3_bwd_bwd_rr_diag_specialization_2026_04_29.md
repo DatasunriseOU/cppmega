@@ -184,3 +184,49 @@ as a new variant, then compare against `baseline` and `stage2_force_nontma`:
 - then on productionish with `bb_num_stages=0`,
 - keep `dk_intrachunk` / `dq_intrachunk` full local-masked until a separate
   triangular local specialization exists.
+
+## Full-Kernel Stage2 Smoke Follow-Up
+
+After the isolated result, the stage2-aware patch
+`mamba3_bwd_stage2_rr_diag.patch` was added and tested in the existing full
+`mamba_mimo_bwd_fwd + mamba_mimo_bwd_bwd` Modal harness.
+
+Run:
+
+```text
+GHCR_TAG=785c3fd CPPMEGA_MODAL_GPU=H200:2 timeout 1200s \
+modal run scripts/modal_mamba3_stage2_force_nontma_benchmark.py \
+  --run-id stage2_rr_diag_full_smoke_20260429_1 \
+  --shape-csv smoke \
+  --variant-csv baseline,stage2_force_nontma,stage2_rr_diag \
+  --warmup 1 \
+  --iters 3
+```
+
+Modal app:
+
+- `ap-QTJyZ9qE4OEtZUlAox24Ql`
+- state after run: completed/stopped
+
+Artifacts:
+
+- `/benchmarks/mamba3_stage2_force_nontma_benchmark/stage2_rr_diag_full_smoke_20260429_1/report.json`
+- `/benchmarks/mamba3_stage2_force_nontma_benchmark/stage2_rr_diag_full_smoke_20260429_1/summary.csv`
+- `/benchmarks/mamba3_stage2_force_nontma_benchmark/stage2_rr_diag_full_smoke_20260429_1/summary.json`
+
+Shape: `smoke` (`B=1,S=256,H=4,G=1,N=64,P=64,R=4`)
+
+| variant | bwd_fwd ms | bwd_bwd ms | chain ms | correctness vs baseline |
+| --- | ---: | ---: | ---: | ---: |
+| baseline | 0.0806 | 0.1638 | 0.2301 | reference |
+| stage2 `(bf=1,bb=0)` | 0.0820 | 0.1635 | 0.2293 | 0.0 |
+| stage2 + R x R diag | 0.0831 | 0.5519 | 0.6206 | 7.28e-12 |
+
+Read: the full-kernel TileLang patch is mathematically correct, but not viable
+as written. The serial `for p in T.serial(P)` accumulation trades away the FLOP
+reduction and makes `bwd_bwd` about 3.37x slower even on smoke. Do not run
+productionish with this exact TileLang patch.
+
+The algorithmic direction remains useful only if the R x R diagonal block is
+implemented with a parallel reduction or a separate fused microkernel, not with a
+serial P loop inside the TileLang bwd_bwd body.
