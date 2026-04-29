@@ -1,0 +1,545 @@
+--- a/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
++++ b/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
+@@ -1342,3 +1342,542 @@
+             ddA, ddt, dtrap, dq_bias_tilelang, dk_bias_tilelang,
+             dmimo_v, dmimo_z, dmimo_o, dangles, 
+             dD, dz_tilelang)
++
++
++
++@tilelang.jit(
++    out_idx=[],
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
++    })
++def mamba_mimo_bwd_bwd_ptile_crossp_accum(
++    B,
++    S,
++    H,
++    G,
++    N,
++    P,
++    R,
++    hasZ,
++    hasD,
++    reduceO,
++    chunk_size: int = 16,
++    rotary_dim_divisor: int = 4,
++    dtype: str = 'float16',
++    threads: int = 256,
++    num_stages: int = 0,
++    p_tile: int = 64,
++) -> torch.Tensor:
++    """P_TILE bwd_bwd prototype with explicit cross-P accumulators.
++
++    The loop-carried dstates are stored in a caller-provided scratch tensor,
++    one [N, P_TILE] tile at a time. Per-chunk cross-P products are accumulated
++    into full [fused,fused] / [fused,N] fragments before any DK/DQ/DDA* writes.
++    """
++
++    accum_dtype = 'float32'
++    nchunks = tilelang.cdiv(S, chunk_size)
++    tail_len = S % chunk_size
++    fused_chunk_size = chunk_size * R
++    P_TILE = p_tile
++    n_p_tiles = P // P_TILE
++
++    if P % P_TILE != 0:
++        raise ValueError("mamba_mimo_bwd_bwd_ptile_crossp_accum requires P % p_tile == 0")
++
++    if reduceO:
++        DOUT_shape = (B, S, H, P)
++    else:
++        DOUT_shape = (B, S, R, H, P)
++
++    @T.prim_func
++    def mamba_mimo_bwd_bwd_ptile_crossp_accum_kernel(
++            DOUT: T.Tensor(DOUT_shape, dtype),  # type: ignore
++            Q: T.Tensor([B, S * R, G, N], dtype),  # type: ignore
++            K: T.Tensor([B, S * R, G, N], dtype),  # type: ignore
++            V: T.Tensor([B, S, H, P], dtype),  # type: ignore
++            Q_BIAS: T.Tensor([H, R, N], T.float32),  # type: ignore
++            K_BIAS: T.Tensor([H, R, N], T.float32),  # type: ignore
++            MIMO_V: T.Tensor([H, R, P], T.float32), # type: ignore
++            MIMO_O: T.Tensor([H, R, P], T.float32), # type: ignore
++            DK: T.Tensor([B, S*R, H, N], dtype),  # type: ignore
++            DV: T.Tensor([B, S, H, P], dtype),  # type: ignore
++            DMIMO_V: T.Tensor([B, H, R, P], T.float32), # type: ignore
++            STATES: T.Tensor([B, H, nchunks, N, P], dtype), # type: ignore
++            DQ: T.Tensor([B, S*R, H, N], dtype),  # type: ignore
++
++            Z: T.Tensor([B, S, H, P], dtype),  # type: ignore
++            MIMO_Z: T.Tensor([H, R, P], T.float32), # type: ignore
++            ANGLES: T.Tensor([B, S, H, N//rotary_dim_divisor], T.float32), # type: ignore
++            DA_CS: T.Tensor([B, H, S], T.float32), # type: ignore
++            DA_CS_REV: T.Tensor([B, H, S], T.float32), # type: ignore
++            DT: T.Tensor([B, H, S], T.float32), # type: ignore
++            TRAP: T.Tensor([B, H, S], dtype), # type: ignore
++            DFACTOR: T.Tensor([B, H, S], T.float32), # type: ignore
++            DGAMMA_DIAG: T.Tensor([B, H, S], T.float32), # type: ignore
++            DANGLES: T.Tensor([B, S, H, N//rotary_dim_divisor], T.float32), # type: ignore
++            D: T.Tensor([H], T.float32), # type: ignore
++            DD: T.Tensor([B, H], T.float32), # type: ignore
++
++            QK_DOT: T.Tensor([B, H, S, R * R], dtype), # type: ignore
++            DDA: T.Tensor([B, H, S], T.float32), # type: ignore
++            DSSDA: T.Tensor([B, H, nchunks, chunk_size, chunk_size], T.float32), # type: ignore
++            DDA_CS_REV: T.Tensor([B, H, S], T.float32), # type: ignore
++            DDA_CS: T.Tensor([B, H, S], T.float32), # type: ignore
++
++            SEGSUM: T.Tensor([B, H, nchunks, chunk_size, chunk_size], T.float32), # type: ignore
++            DSTATES_PTILE: T.Tensor([B, H, n_p_tiles, N, P_TILE], dtype), # type: ignore
++            ):
++        with T.Kernel(H, B, threads=threads) as (i_h, i_b):
++            i_h_qk = i_h // (H // G)
++
++            q_shared = T.alloc_shared([fused_chunk_size, N], dtype)
++            k_shared = T.alloc_shared([fused_chunk_size, N], dtype)
++            q_pre_rot_shared = T.alloc_shared([fused_chunk_size, N], dtype)
++            k_pre_rot_shared = T.alloc_shared([fused_chunk_size, N], dtype)
++            k_pre_trap_shared = T.alloc_shared([fused_chunk_size, N], dtype)
++            lkq_masked__or__dkq_masked_shared = T.alloc_shared([fused_chunk_size, fused_chunk_size], dtype)
++            dqk_from_diag_shared = T.alloc_shared([fused_chunk_size, fused_chunk_size], accum_dtype)
++            dk_shared = T.alloc_shared([fused_chunk_size, N], dtype)
++            dq_shared = T.alloc_shared([fused_chunk_size, N], dtype)
++            qk_dot_shared = T.alloc_shared([chunk_size, R * R], dtype)
++            trap_scale_shared = T.alloc_shared([chunk_size], dtype)
++            dA_cs_shared = T.alloc_shared([chunk_size], T.float32)
++            dangle_dk__or__dq_shared = T.alloc_shared([fused_chunk_size, N//rotary_dim_divisor], T.float32)
++
++            dPhiO_shared_tile = T.alloc_shared([fused_chunk_size, P_TILE], dtype)
++            dPsiV_combined_shared_tile = T.alloc_shared([fused_chunk_size, P_TILE], dtype)
++            PsiV_shared_tile = T.alloc_shared([fused_chunk_size, P_TILE], dtype)
++            dstates_shared_tile = T.alloc_shared([N, P_TILE], dtype)
++            states_shared_tile = T.alloc_shared([N, P_TILE], dtype)
++            v_shared_tile = T.alloc_shared([chunk_size, P_TILE], dtype)
++
++            T.use_swizzle(10, "row")
++            T.no_set_max_nreg()
++
++            q_bias_frag = T.alloc_fragment([R, N], dtype)
++            k_bias_frag = T.alloc_fragment([R, N], dtype)
++            T.copy(Q_BIAS[i_h, :, :], q_bias_frag)
++            T.copy(K_BIAS[i_h, :, :], k_bias_frag)
++
++            for p_block, n, p in T.Parallel(n_p_tiles, N, P_TILE):
++                DSTATES_PTILE[i_b, i_h, p_block, n, p] = 0.0
++            for r, p in T.Parallel(R, P):
++                DMIMO_V[i_b, i_h, r, p] = 0.0
++
++            if hasD:
++                dD_frag = T.alloc_fragment([1], accum_dtype)
++                T.clear(dD_frag)
++
++            for chunk_idx_rev in T.Pipelined(0, nchunks, num_stages=num_stages):
++                chunk_idx = nchunks - 1 - chunk_idx_rev
++                chunk_start = chunk_idx * chunk_size
++                fused_chunk_start = chunk_start * R
++
++                trap_shifted_frag = T.alloc_fragment([chunk_size], T.float32)
++                dt_shifted_frag = T.alloc_fragment([chunk_size], dtype)
++                for cs in T.Parallel(chunk_size):
++                    trap_shifted_frag[cs] = T.if_then_else(
++                        chunk_start + cs + 1 < S,
++                        TRAP[i_b, i_h, chunk_start + cs + 1],
++                        0.0,
++                    )
++                    dt_shifted_frag[cs] = T.if_then_else(
++                        chunk_start + cs + 1 < S,
++                        DT[i_b, i_h, chunk_start + cs + 1],
++                        0.0,
++                    )
++                shifted_gamma_frag = T.alloc_fragment([chunk_size], dtype)
++                for cs in T.Parallel(chunk_size):
++                    shifted_gamma_frag[cs] = T.if_then_else(
++                        chunk_start + cs < (S - 1),
++                        dt_shifted_frag[cs] * T.sigmoid(-trap_shifted_frag[cs]),
++                        0.0,
++                    )
++
++                trap_frag = T.alloc_fragment([chunk_size], T.float32)
++                T.copy(TRAP[i_b, i_h, chunk_start: chunk_start+chunk_size], trap_frag, disable_tma=True)
++                dt_frag = T.alloc_fragment([chunk_size], dtype)
++                T.copy(DT[i_b, i_h, chunk_start: chunk_start+chunk_size], dt_frag, disable_tma=True)
++                gamma_frag = T.alloc_fragment([chunk_size], T.float32)
++                for cs in T.Parallel(chunk_size):
++                    gamma_frag[cs] = dt_frag[cs] * T.sigmoid(trap_frag[cs])
++                gamma_cached_frag = T.alloc_fragment([chunk_size], T.float32)
++                T.copy(gamma_frag, gamma_cached_frag)
++                trap_scale_frag = T.alloc_fragment([chunk_size], dtype)
++                for cs in T.Parallel(chunk_size):
++                    trap_scale_frag[cs] = gamma_frag[cs] + shifted_gamma_frag[cs]
++                T.copy(trap_scale_frag, trap_scale_shared)
++
++                T.copy(Q[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, i_h_qk, :], q_shared)
++                q_frag = T.alloc_fragment([fused_chunk_size, N], dtype)
++                T.copy(q_shared, q_frag)
++                for cs, r, n in T.Parallel(chunk_size, R, N):
++                    q_frag[cs * R + r, n] += q_bias_frag[r, n]
++                T.copy(q_frag, q_shared)
++                T.copy(q_shared, q_pre_rot_shared)
++
++                angles_frag = T.alloc_fragment([chunk_size, N//rotary_dim_divisor], T.float32)
++                T.copy(ANGLES[i_b, chunk_start:chunk_start+chunk_size, i_h, :], angles_frag)
++                q_first_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
++                q_second_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
++                for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
++                    q_first_half_frag[cs, r, n] = q_shared[cs*R + r, n]
++                    q_second_half_frag[cs, r, n] = q_shared[cs*R + r, N//2 + n]
++                for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
++                    q_shared[cs*R + r, n] = T.cos(angles_frag[cs, n]) * q_first_half_frag[cs, r, n] - T.sin(angles_frag[cs, n]) * q_second_half_frag[cs, r, n]
++                    q_shared[cs*R + r, N//2 + n] = T.sin(angles_frag[cs, n]) * q_first_half_frag[cs, r, n] + T.cos(angles_frag[cs, n]) * q_second_half_frag[cs, r, n]
++
++                T.copy(K[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, i_h_qk, :], k_pre_trap_shared)
++                k_frag = T.alloc_fragment([fused_chunk_size, N], dtype)
++                T.copy(k_pre_trap_shared, k_frag)
++                for cs, r, n in T.Parallel(chunk_size, R, N):
++                    k_frag[cs * R + r, n] += k_bias_frag[r, n]
++                T.copy(k_frag, k_pre_trap_shared)
++                T.copy(k_pre_trap_shared, k_pre_rot_shared)
++
++                k_first_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
++                k_second_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
++                for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
++                    k_first_half_frag[cs, r, n] = k_pre_trap_shared[cs*R + r, n]
++                    k_second_half_frag[cs, r, n] = k_pre_trap_shared[cs*R + r, N//2 + n]
++                for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
++                    k_pre_trap_shared[cs*R + r, n] = T.cos(angles_frag[cs, n]) * k_first_half_frag[cs, r, n] - T.sin(angles_frag[cs, n]) * k_second_half_frag[cs, r, n]
++                    k_pre_trap_shared[cs*R + r, N//2 + n] = T.sin(angles_frag[cs, n]) * k_first_half_frag[cs, r, n] + T.cos(angles_frag[cs, n]) * k_second_half_frag[cs, r, n]
++
++                k_trap_scaled_frag = T.alloc_fragment([fused_chunk_size, N], dtype)
++                T.copy(k_pre_trap_shared, k_trap_scaled_frag)
++                for csr, n in T.Parallel(fused_chunk_size, N):
++                    k_trap_scaled_frag[csr, n] *= trap_scale_shared[csr//R]
++                T.copy(k_trap_scaled_frag, k_shared)
++
++                lkq_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], accum_dtype)
++                T.gemm(k_shared, q_shared, lkq_frag, transpose_B=True, clear_accum=True)
++                for csr_i, csr_j in T.Parallel(fused_chunk_size, fused_chunk_size):
++                    lkq_frag[csr_i, csr_j] = T.if_then_else(
++                        csr_i//R < csr_j//R,
++                        lkq_frag[csr_i, csr_j] * T.exp(SEGSUM[i_b, i_h, chunk_idx, csr_j//R, csr_i//R]),
++                        0.0,
++                    )
++                T.copy(lkq_frag, lkq_masked__or__dkq_masked_shared)
++
++                T.copy(QK_DOT[i_b, i_h, chunk_start:chunk_start+chunk_size, :], qk_dot_shared)
++
++                dqk_from_diag_acc = T.alloc_fragment([fused_chunk_size, fused_chunk_size], accum_dtype)
++                dk_acc = T.alloc_fragment([fused_chunk_size, N], accum_dtype)
++                dk_intrachunk_acc = T.alloc_fragment([fused_chunk_size, fused_chunk_size], accum_dtype)
++                dq_acc = T.alloc_fragment([fused_chunk_size, N], accum_dtype)
++                ddA_state_passing = T.alloc_fragment([1], T.float32)
++                T.clear(dqk_from_diag_acc)
++                T.clear(dk_acc)
++                T.clear(dk_intrachunk_acc)
++                T.clear(dq_acc)
++                T.clear(ddA_state_passing)
++
++                for p_block in T.serial(n_p_tiles):
++                    p_start = p_block * P_TILE
++
++                    T.copy(DSTATES_PTILE[i_b, i_h, p_block, :, :], dstates_shared_tile)
++                    dstates_frag_tile = T.alloc_fragment([N, P_TILE], accum_dtype)
++                    T.copy(dstates_shared_tile, dstates_frag_tile)
++
++                    Psi_frag_tile = T.alloc_fragment([R, P_TILE], dtype)
++                    Phi_frag_tile = T.alloc_fragment([R, P_TILE], dtype)
++                    for r, p in T.Parallel(R, P_TILE):
++                        Psi_frag_tile[r, p] = MIMO_V[i_h, r, p_start + p]
++                        if reduceO:
++                            Phi_frag_tile[r, p] = MIMO_O[i_h, r, p_start + p]
++
++                    for cs, p in T.Parallel(chunk_size, P_TILE):
++                        v_shared_tile[cs, p] = V[i_b, chunk_start + cs, i_h, p_start + p]
++
++                    dPhiO_frag_tile = T.alloc_fragment([chunk_size, R, P_TILE], dtype)
++                    if reduceO:
++                        dout_frag_tile = T.alloc_fragment([chunk_size, P_TILE], dtype)
++                        for cs, p in T.Parallel(chunk_size, P_TILE):
++                            dout_frag_tile[cs, p] = DOUT[i_b, chunk_start + cs, i_h, p_start + p]
++                        for cs, r, p in T.Parallel(chunk_size, R, P_TILE):
++                            dPhiO_frag_tile[cs, r, p] = dout_frag_tile[cs, p] * Phi_frag_tile[r, p]
++                    else:
++                        for cs, r, p in T.Parallel(chunk_size, R, P_TILE):
++                            dPhiO_frag_tile[cs, r, p] = DOUT[i_b, chunk_start + cs, r, i_h, p_start + p]
++
++                    if hasZ:
++                        Zeta_frag_tile = T.alloc_fragment([R, P_TILE], dtype)
++                        z_frag_tile = T.alloc_fragment([chunk_size, P_TILE], dtype)
++                        for r, p in T.Parallel(R, P_TILE):
++                            Zeta_frag_tile[r, p] = MIMO_Z[i_h, r, p_start + p]
++                        for cs, p in T.Parallel(chunk_size, P_TILE):
++                            z_frag_tile[cs, p] = Z[i_b, chunk_start + cs, i_h, p_start + p]
++                        for cs, r, p in T.Parallel(chunk_size, R, P_TILE):
++                            tmp = z_frag_tile[cs, p] * Zeta_frag_tile[r, p] * 0.5
++                            dPhiO_frag_tile[cs, r, p] *= tmp * T.tanh(tmp) + tmp
++
++                    T.copy(T.view(dPhiO_frag_tile, shape=[fused_chunk_size, P_TILE]), dPhiO_shared_tile)
++
++                    if hasD:
++                        v_dD_frag_tile = T.alloc_fragment([chunk_size, P_TILE], accum_dtype)
++                        Psi_dD_frag_tile = T.alloc_fragment([R, P_TILE], accum_dtype)
++                        T.copy(v_shared_tile, v_dD_frag_tile)
++                        T.copy(Psi_frag_tile, Psi_dD_frag_tile)
++                        for cs, r, p in T.Parallel(chunk_size, R, P_TILE):
++                            dPhiO_frag_tile[cs, r, p] *= v_dD_frag_tile[cs, p] * Psi_dD_frag_tile[r, p]
++                        T.reduce_sum(T.view(dPhiO_frag_tile, shape=[fused_chunk_size * P_TILE]), dD_frag, clear=False)
++
++                    dPsiV_frag_tile = T.alloc_fragment([fused_chunk_size, P_TILE], accum_dtype)
++                    T.gemm(k_shared, dstates_shared_tile, dPsiV_frag_tile, clear_accum=True)
++                    dA_cs_rev_frag = T.alloc_fragment([chunk_size], T.float32)
++                    T.copy(DA_CS_REV[i_b, i_h, chunk_start:chunk_start+chunk_size], dA_cs_rev_frag, disable_tma=True)
++                    for csr, p in T.Parallel(fused_chunk_size, P_TILE):
++                        dPsiV_frag_tile[csr, p] *= T.exp(dA_cs_rev_frag[csr//R])
++
++                    T.gemm(lkq_masked__or__dkq_masked_shared, dPhiO_shared_tile, dPsiV_frag_tile, clear_accum=False)
++
++                    dPsiV_D_fused_frag_tile = T.alloc_fragment([fused_chunk_size, P_TILE], accum_dtype)
++                    if hasD:
++                        D_frag = T.alloc_var(T.float32)
++                        T.copy(D[i_h], D_frag)
++                        for csr, p in T.Parallel(fused_chunk_size, P_TILE):
++                            dPsiV_D_fused_frag_tile[csr, p] = dPsiV_frag_tile[csr, p] + dPhiO_shared_tile[csr, p] * D_frag
++                    else:
++                        T.copy(dPsiV_frag_tile, dPsiV_D_fused_frag_tile)
++                    gamma_dPsiV_frag = T.alloc_fragment([chunk_size], dtype)
++                    T.copy(gamma_frag, gamma_dPsiV_frag)
++                    for cs, r_in, p in T.Parallel(chunk_size, R, P_TILE):
++                        csr = cs * R + r_in
++                        for r_out in T.serial(R):
++                            csr_out = cs * R + r_out
++                            dPsiV_D_fused_frag_tile[csr, p] += dPhiO_shared_tile[csr_out, p] * qk_dot_shared[cs, r_out * R + r_in] * gamma_dPsiV_frag[cs]
++                    T.copy(dPsiV_D_fused_frag_tile, dPsiV_combined_shared_tile)
++
++                    dv_frag_tile = T.alloc_fragment([chunk_size, P_TILE], dtype)
++                    T.clear(dv_frag_tile)
++                    for cs, p in T.Parallel(chunk_size, P_TILE):
++                        for r in T.serial(R):
++                            dv_frag_tile[cs, p] += dPsiV_combined_shared_tile[cs*R + r, p] * Psi_frag_tile[r, p]
++                    for cs, p in T.Parallel(chunk_size, P_TILE):
++                        DV[i_b, chunk_start + cs, i_h, p_start + p] = dv_frag_tile[cs, p]
++
++                    dPsi_frag_tile = T.alloc_fragment([R, P_TILE], accum_dtype)
++                    for r, p in T.Parallel(R, P_TILE):
++                        dPsi_frag_tile[r, p] = DMIMO_V[i_b, i_h, r, p_start + p]
++                    v_frag_tile = T.alloc_fragment([chunk_size, P_TILE], accum_dtype)
++                    T.copy(v_shared_tile, v_frag_tile)
++                    for r, p in T.Parallel(R, P_TILE):
++                        for cs in T.serial(chunk_size):
++                            dPsi_frag_tile[r, p] += dPsiV_combined_shared_tile[cs*R + r, p] * v_frag_tile[cs, p]
++                    for r, p in T.Parallel(R, P_TILE):
++                        DMIMO_V[i_b, i_h, r, p_start + p] = dPsi_frag_tile[r, p]
++
++                    PsiV_frag_tile = T.alloc_fragment([chunk_size, R, P_TILE], dtype)
++                    T.clear(PsiV_frag_tile)
++                    for cs, p in T.Parallel(chunk_size, P_TILE):
++                        for r in T.serial(R):
++                            PsiV_frag_tile[cs, r, p] += v_frag_tile[cs, p] * Psi_frag_tile[r, p]
++                    for cs, r, p in T.Parallel(chunk_size, R, P_TILE):
++                        PsiV_shared_tile[cs*R + r, p] = PsiV_frag_tile[cs, r, p]
++
++                    T.gemm(dPhiO_shared_tile, PsiV_shared_tile, dqk_from_diag_acc, transpose_B=True, clear_accum=False)
++                    T.gemm(PsiV_shared_tile, dstates_shared_tile, dk_acc, transpose_B=True, clear_accum=False)
++                    T.gemm(PsiV_shared_tile, dPhiO_shared_tile, dk_intrachunk_acc, transpose_B=True, clear_accum=False)
++
++                    for n, p in T.Parallel(N, P_TILE):
++                        states_shared_tile[n, p] = STATES[i_b, i_h, chunk_idx, n, p_start + p]
++                    T.gemm(dPhiO_shared_tile, states_shared_tile, dq_acc, transpose_B=True, clear_accum=False)
++
++                    states_frag_tile = T.alloc_fragment([N, P_TILE], T.float32)
++                    T.copy(states_shared_tile, states_frag_tile)
++                    ddA_state_passing_prereduce_frag_tile = T.alloc_fragment([N, P_TILE], T.float32)
++                    da_cs_sum = T.alloc_var(T.float32)
++                    if tail_len > 0 and chunk_idx == nchunks - 1:
++                        T.copy(DA_CS[i_b, i_h, S - 1], da_cs_sum)
++                    else:
++                        T.copy(DA_CS[i_b, i_h, chunk_start+chunk_size-1], da_cs_sum)
++                    for n, p in T.Parallel(N, P_TILE):
++                        ddA_state_passing_prereduce_frag_tile[n, p] = (
++                            states_frag_tile[n, p]
++                            * dstates_frag_tile[n, p]
++                            * T.exp(da_cs_sum)
++                        )
++                    T.reduce_sum(
++                        T.view(ddA_state_passing_prereduce_frag_tile, shape=[N * P_TILE]),
++                        ddA_state_passing,
++                        dim=-1,
++                        clear=False,
++                    )
++
++                    for n, p in T.Parallel(N, P_TILE):
++                        dstates_frag_tile[n, p] *= T.exp(da_cs_sum)
++                    dPhiO_scaled_frag_tile = T.alloc_fragment([fused_chunk_size, P_TILE], dtype)
++                    T.copy(dPhiO_shared_tile, dPhiO_scaled_frag_tile)
++                    dA_cs_dPhiO_frag = T.alloc_fragment([chunk_size], T.float32)
++                    T.copy(DA_CS[i_b, i_h, chunk_start:chunk_start+chunk_size], dA_cs_shared, disable_tma=True)
++                    T.copy(dA_cs_shared, dA_cs_dPhiO_frag)
++                    for csr, p in T.Parallel(fused_chunk_size, P_TILE):
++                        dPhiO_scaled_frag_tile[csr, p] *= T.exp(dA_cs_dPhiO_frag[csr//R])
++                    T.gemm(q_shared, dPhiO_scaled_frag_tile, dstates_frag_tile, transpose_A=True, clear_accum=False)
++                    T.copy(dstates_frag_tile, DSTATES_PTILE[i_b, i_h, p_block, :, :])
++
++                dgamma_diag_prereduce_frag = T.alloc_fragment([chunk_size, R * R], accum_dtype)
++                T.copy(qk_dot_shared, dgamma_diag_prereduce_frag)
++                T.copy(dqk_from_diag_acc, dqk_from_diag_shared)
++                for cs, r_out, r_in in T.Parallel(chunk_size, R, R):
++                    dgamma_diag_prereduce_frag[cs, r_out * R + r_in] *= dqk_from_diag_shared[cs*R + r_out, cs*R + r_in]
++                dgamma_diag_reduced_frag = T.alloc_fragment([chunk_size], accum_dtype)
++                T.reduce_sum(dgamma_diag_prereduce_frag, dgamma_diag_reduced_frag, dim=-1, clear=True)
++                T.copy(dgamma_diag_reduced_frag, DGAMMA_DIAG[i_b, i_h, chunk_start:chunk_start+chunk_size], disable_tma=True)
++
++                gamma_qk_frag = T.alloc_fragment([chunk_size], accum_dtype)
++                T.copy(gamma_cached_frag, gamma_qk_frag)
++                for csr_i, csr_j in T.Parallel(fused_chunk_size, fused_chunk_size):
++                    dqk_from_diag_acc[csr_i, csr_j] *= gamma_qk_frag[csr_i//R]
++                T.copy(dqk_from_diag_acc, dqk_from_diag_shared)
++
++                ddA_state_kv_prereduce_frag = T.alloc_fragment([fused_chunk_size, N], accum_dtype)
++                T.copy(k_shared, ddA_state_kv_prereduce_frag)
++                for csr, n in T.Parallel(fused_chunk_size, N):
++                    ddA_state_kv_prereduce_frag[csr, n] *= dk_acc[csr, n]
++                ddA_state_kv_frag = T.alloc_fragment([chunk_size], accum_dtype)
++                T.reduce_sum(T.view(ddA_state_kv_prereduce_frag, shape=[chunk_size, R*N]), ddA_state_kv_frag, dim=-1, clear=True)
++                T.copy(ddA_state_kv_frag, DDA_CS_REV[i_b, i_h, chunk_start:chunk_start+chunk_size], disable_tma=True)
++
++                dA_cs_rev_dk_frag = T.alloc_fragment([chunk_size], T.float32)
++                T.copy(DA_CS_REV[i_b, i_h, chunk_start:chunk_start+chunk_size], dA_cs_rev_dk_frag, disable_tma=True)
++                for cs in T.Parallel(chunk_size):
++                    dA_cs_rev_dk_frag[cs] = T.exp(dA_cs_rev_dk_frag[cs])
++                for csr, n in T.Parallel(fused_chunk_size, N):
++                    dk_acc[csr, n] *= dA_cs_rev_dk_frag[csr//R]
++
++                kq_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], dtype)
++                T.copy(lkq_masked__or__dkq_masked_shared, kq_frag)
++                for csr_i, csr_j in T.Parallel(fused_chunk_size, fused_chunk_size):
++                    kq_frag[csr_i, csr_j] *= dk_intrachunk_acc[csr_i, csr_j]
++                kq_frag_reshaped = T.view(kq_frag, shape=[fused_chunk_size, chunk_size, R])
++                interchunk_dda_prereduce_frag = T.alloc_fragment([fused_chunk_size, chunk_size], accum_dtype)
++                T.reduce_sum(kq_frag_reshaped, interchunk_dda_prereduce_frag, dim=-1, clear=True)
++                interchunk_dda_prereduce_frag_reshaped = T.view(interchunk_dda_prereduce_frag, shape=[chunk_size, R, chunk_size])
++                interchunk_dda_frag = T.alloc_fragment([chunk_size, chunk_size], accum_dtype)
++                T.reduce_sum(interchunk_dda_prereduce_frag_reshaped, interchunk_dda_frag, dim=1, clear=True)
++                T.copy(interchunk_dda_frag, DSSDA[i_b, i_h, chunk_idx, :, :])
++
++                for csr_i, csr_j in T.Parallel(fused_chunk_size, fused_chunk_size):
++                    dk_intrachunk_acc[csr_i, csr_j] = T.if_then_else(
++                        csr_i//R < csr_j//R,
++                        dk_intrachunk_acc[csr_i, csr_j] * T.exp(SEGSUM[i_b, i_h, chunk_idx, csr_j//R, csr_i//R]),
++                        0.0,
++                    )
++                T.copy(dk_intrachunk_acc, lkq_masked__or__dkq_masked_shared)
++                T.copy(dk_acc, dk_shared)
++                dk_nodiag_frag = T.alloc_fragment([fused_chunk_size, N], accum_dtype)
++                T.copy(dk_shared, dk_nodiag_frag)
++                T.gemm(lkq_masked__or__dkq_masked_shared, q_shared, dk_nodiag_frag, clear_accum=False)
++
++                k_factor_frag = T.alloc_fragment([chunk_size, R, N], accum_dtype)
++                T.copy(k_pre_trap_shared, T.view(k_factor_frag, shape=[fused_chunk_size, N]))
++                dfactor_prereduce_frag = T.alloc_fragment([chunk_size, R, N], accum_dtype)
++                for cs, r, n in T.Parallel(chunk_size, R, N):
++                    dfactor_prereduce_frag[cs, r, n] = k_factor_frag[cs, r, n] * dk_nodiag_frag[cs*R + r, n]
++                dfactor_frag = T.alloc_fragment([chunk_size], accum_dtype)
++                T.reduce_sum(T.view(dfactor_prereduce_frag, shape=[chunk_size, R*N]), dfactor_frag, dim=-1, clear=True)
++                T.copy(dfactor_frag, DFACTOR[i_b, i_h, chunk_start:chunk_start+chunk_size], disable_tma=True)
++
++                trap_scale_dk_frag = T.alloc_fragment([chunk_size], dtype)
++                T.copy(trap_scale_shared, trap_scale_dk_frag)
++                for csr, n in T.Parallel(fused_chunk_size, N):
++                    dk_nodiag_frag[csr, n] *= trap_scale_dk_frag[csr//R]
++                T.copy(dk_nodiag_frag, dk_shared)
++
++                dda_frag = T.alloc_fragment([chunk_size], T.float32)
++                for cs in T.Parallel(chunk_size):
++                    dda_frag[cs] = ddA_state_passing[0]
++                T.copy(dda_frag, DDA[i_b, i_h, chunk_start:chunk_start+chunk_size], disable_tma=True)
++
++                dda_cs_prereduce_frag = T.alloc_fragment([fused_chunk_size, N], accum_dtype)
++                T.copy(q_shared, dda_cs_prereduce_frag)
++                for csr, n in T.Parallel(fused_chunk_size, N):
++                    dda_cs_prereduce_frag[csr, n] *= dq_acc[csr, n]
++                dda_cs_frag = T.alloc_fragment([chunk_size], accum_dtype)
++                T.reduce_sum(T.view(dda_cs_prereduce_frag, shape=[chunk_size, R*N]), dda_cs_frag, dim=-1, clear=True)
++                T.copy(dda_cs_frag, DDA_CS[i_b, i_h, chunk_start:chunk_start+chunk_size], disable_tma=True)
++
++                dA_cs_dq_frag = T.alloc_fragment([chunk_size], T.float32)
++                T.copy(DA_CS[i_b, i_h, chunk_start:chunk_start+chunk_size], dA_cs_shared, disable_tma=True)
++                T.copy(dA_cs_shared, dA_cs_dq_frag)
++                for csr, n in T.Parallel(fused_chunk_size, N):
++                    dq_acc[csr, n] *= T.exp(dA_cs_dq_frag[csr//R])
++                T.copy(dq_acc, dq_shared)
++                dq_combined_frag = T.alloc_fragment([fused_chunk_size, N], accum_dtype)
++                T.copy(dq_shared, dq_combined_frag)
++                T.gemm(lkq_masked__or__dkq_masked_shared, k_shared, dq_combined_frag, transpose_A=True, clear_accum=False)
++                T.copy(dq_combined_frag, dq_shared)
++
++                angles_dk_frag = T.alloc_fragment([chunk_size, N//rotary_dim_divisor], T.float32)
++                T.copy(ANGLES[i_b, chunk_start:chunk_start+chunk_size, i_h, :], angles_dk_frag)
++                dk_first_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
++                dk_second_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
++                k_prerot_first_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
++                k_prerot_second_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
++                for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
++                    dk_first_half_frag[cs, r, n] = dk_shared[cs*R + r, n]
++                    dk_second_half_frag[cs, r, n] = dk_shared[cs*R + r, N//2 + n]
++                    k_prerot_first_half_frag[cs, r, n] = k_pre_rot_shared[cs*R + r, n]
++                    k_prerot_second_half_frag[cs, r, n] = k_pre_rot_shared[cs*R + r, N//2 + n]
++                dangle_dk_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], T.float32)
++                for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
++                    dangle_dk_frag[cs, r, n] = dk_first_half_frag[cs, r, n] * (-k_prerot_first_half_frag[cs, r, n] * T.sin(angles_dk_frag[cs, n]) - k_prerot_second_half_frag[cs, r, n] * T.cos(angles_dk_frag[cs, n])) + dk_second_half_frag[cs, r, n] * (k_prerot_first_half_frag[cs, r, n] * T.cos(angles_dk_frag[cs, n]) - k_prerot_second_half_frag[cs, r, n] * T.sin(angles_dk_frag[cs, n]))
++                T.copy(T.view(dangle_dk_frag, shape=[fused_chunk_size, N//rotary_dim_divisor]), dangle_dk__or__dq_shared)
++                for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
++                    dk_shared[cs*R + r, n] = T.cos(angles_dk_frag[cs, n]) * dk_first_half_frag[cs, r, n] + T.sin(angles_dk_frag[cs, n]) * dk_second_half_frag[cs, r, n]
++                    dk_shared[cs*R + r, N//2 + n] = -T.sin(angles_dk_frag[cs, n]) * dk_first_half_frag[cs, r, n] + T.cos(angles_dk_frag[cs, n]) * dk_second_half_frag[cs, r, n]
++
++                dk_combined_frag = T.alloc_fragment([fused_chunk_size, N], accum_dtype)
++                T.copy(dk_shared, dk_combined_frag)
++                q_dk_frag = T.alloc_fragment([fused_chunk_size, N], accum_dtype)
++                T.copy(q_pre_rot_shared, q_dk_frag)
++                q_dk_frag_reshaped = T.view(q_dk_frag, [chunk_size, R, N])
++                for csr_in, n in T.Parallel(fused_chunk_size, N):
++                    cs = csr_in // R
++                    for r_out in T.serial(R):
++                        csr_out = cs * R + r_out
++                        dk_combined_frag[csr_in, n] += dqk_from_diag_shared[csr_out, csr_in] * q_dk_frag_reshaped[cs, r_out, n]
++                T.copy(dk_combined_frag, DK[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, i_h, :])
++
++                angles_dq_frag = T.alloc_fragment([chunk_size, N//rotary_dim_divisor], T.float32)
++                T.copy(ANGLES[i_b, chunk_start:chunk_start+chunk_size, i_h, :], angles_dq_frag)
++                dq_first_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
++                dq_second_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
++                for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
++                    dq_first_half_frag[cs, r, n] = dq_shared[cs*R + r, n]
++                    dq_second_half_frag[cs, r, n] = dq_shared[cs*R + r, N//2 + n]
++                q_prerot_first_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
++                q_prerot_second_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
++                for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
++                    q_prerot_first_half_frag[cs, r, n] = q_pre_rot_shared[cs*R + r, n]
++                    q_prerot_second_half_frag[cs, r, n] = q_pre_rot_shared[cs*R + r, N//2 + n]
++                dangle_dq_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], T.float32)
++                T.copy(dangle_dk__or__dq_shared, T.view(dangle_dq_frag, shape=[fused_chunk_size, N//rotary_dim_divisor]))
++                for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
++                    dangle_dq_frag[cs, r, n] += dq_first_half_frag[cs, r, n] * (-q_prerot_first_half_frag[cs, r, n] * T.sin(angles_dq_frag[cs, n]) - q_prerot_second_half_frag[cs, r, n] * T.cos(angles_dq_frag[cs, n])) + dq_second_half_frag[cs, r, n] * (q_prerot_first_half_frag[cs, r, n] * T.cos(angles_dq_frag[cs, n]) - q_prerot_second_half_frag[cs, r, n] * T.sin(angles_dq_frag[cs, n]))
++                dangle_frag_reduced = T.alloc_fragment([chunk_size, N//rotary_dim_divisor], T.float32)
++                T.clear(dangle_frag_reduced)
++                for cs, n in T.Parallel(chunk_size, N//rotary_dim_divisor):
++                    for r in T.serial(R):
++                        dangle_frag_reduced[cs, n] += dangle_dq_frag[cs, r, n]
++                T.copy(dangle_frag_reduced, DANGLES[i_b, chunk_start:chunk_start+chunk_size, i_h, :])
++                for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
++                    dq_shared[cs*R + r, n] = T.cos(angles_dk_frag[cs, n]) * dq_first_half_frag[cs, r, n] + T.sin(angles_dk_frag[cs, n]) * dq_second_half_frag[cs, r, n]
++                    dq_shared[cs*R + r, N//2 + n] = -T.sin(angles_dk_frag[cs, n]) * dq_first_half_frag[cs, r, n] + T.cos(angles_dk_frag[cs, n]) * dq_second_half_frag[cs, r, n]
++                T.copy(dq_shared, dq_combined_frag)
++                for csr_out, n in T.Parallel(fused_chunk_size, N):
++                    cs = csr_out // R
++                    for r_in in T.serial(R):
++                        csr_in = cs * R + r_in
++                        dq_combined_frag[csr_out, n] += dqk_from_diag_shared[csr_out, csr_in] * k_pre_rot_shared[csr_in, n]
++                T.copy(dq_combined_frag, DQ[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, i_h, :])
++
++            if hasD:
++                T.copy(dD_frag, DD[i_b, i_h])
++
++    return mamba_mimo_bwd_bwd_ptile_crossp_accum_kernel
