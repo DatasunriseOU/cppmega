@@ -3,9 +3,9 @@
 Companion to `cppmega/megatron/mamba3_psiv_cache.py`.
 Design: `docs/mamba3_mimo_p2_psiv_cache_design.md`.
 
-Status: non-mutating probe implemented; mutating patch application is still
-disabled. This lets us inspect the source tree and verify expected edit sites
-without touching installed packages or upstream checkouts.
+Status: production patch application is still disabled. This module includes
+non-mutating probes plus an explicit temp-source A/B patch helper for Hopper
+experiments. The A/B helper is deliberately not called by `apply_all()`.
 
 This file mirrors the structure of `apply_mamba3_mimo_p1_patches.py` (atomic
 writes, idempotence, rank-0-only flock, line-count-preserving edits) so the
@@ -77,6 +77,25 @@ class PatchSiteProbe:
             f"fwd_psiv={self.fwd_psiv_materializations} "
             f"bwd_psiv={self.bwd_psiv_materializations} "
             f"dstates_updates={self.bwd_dstates_updates}"
+        )
+
+
+@dataclass(frozen=True)
+class HopperPsiVABPatchResult:
+    """Counts from patching a temporary TileLang source tree for A/B only."""
+
+    root: Path
+    fwd_files_patched: int
+    bwd_files_patched: int
+    fwd_store_sites: int
+    bwd_load_sites: int
+    files: tuple[str, ...]
+
+    def summary(self) -> str:
+        return (
+            f"{self.root} temp Hopper PsiV A/B patch: "
+            f"fwd_files={self.fwd_files_patched} bwd_files={self.bwd_files_patched} "
+            f"fwd_store_sites={self.fwd_store_sites} bwd_load_sites={self.bwd_load_sites}"
         )
 
 
@@ -191,6 +210,153 @@ def probe_patch_sites(root: str | os.PathLike[str] | None = None) -> PatchSitePr
 def probe_all_candidate_roots() -> list[PatchSiteProbe]:
     """Inspect every candidate root without modifying files."""
     return [probe_patch_sites(root) for root in _candidate_roots()]
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write patched source atomically after a syntax check."""
+    tmp_path = path.with_name(f"{path.name}.cppmega_p2.tmp.{os.getpid()}")
+    tmp_path.write_text(content)
+    import py_compile
+
+    try:
+        py_compile.compile(str(tmp_path), doraise=True)
+    except py_compile.PyCompileError as exc:
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError(f"Patched kernel {path} has Python syntax error: {exc}") from exc
+    os.replace(tmp_path, path)
+
+
+def _replace_exact(text: str, old: str, new: str, *, expected: int, label: str) -> tuple[str, int]:
+    count = text.count(old)
+    if count != expected:
+        raise RuntimeError(f"{label}: expected {expected} occurrence(s), found {count}")
+    return text.replace(old, new), count
+
+
+def _patch_regular_fwd_for_ab(path: Path) -> int:
+    """Add a PsiV_out tensor and write existing PsiV fragments to it.
+
+    This targets `mamba3_mimo_fwd.py` only and is for temp-source benchmarking.
+    It intentionally does not modify wrapper/autograd defaults.
+    """
+    text = path.read_text()
+    if "PSI_V_OUT: T.Tensor([B, S, H, R, P], dtype)" in text:
+        return text.count("# cppmega P2 Hopper PsiV A/B store")
+
+    text, sig_count = _replace_exact(
+        text,
+        "            MIMO_V: T.Tensor([H, R, P], T.float32), # type: ignore\n"
+        "            MIMO_O: T.Tensor([H, R, P], T.float32), # type: ignore\n",
+        "            MIMO_V: T.Tensor([H, R, P], T.float32), # type: ignore\n"
+        "            PSI_V_OUT: T.Tensor([B, S, H, R, P], dtype),  # cppmega P2 Hopper PsiV A/B\n"
+        "            MIMO_O: T.Tensor([H, R, P], T.float32), # type: ignore\n",
+        expected=1,
+        label=f"{path.name} fwd kernel signature",
+    )
+    text, store_count = _replace_exact(
+        text,
+        "                PsiV_reshaped_frag = T.view(PsiV_frag, shape=[fused_chunk_size, P])\n"
+        "                T.copy(PsiV_reshaped_frag, PsiV_shared)\n",
+        "                PsiV_reshaped_frag = T.view(PsiV_frag, shape=[fused_chunk_size, P])\n"
+        "                T.copy(PsiV_reshaped_frag, PsiV_shared)\n"
+        "                for cs, r, p in T.Parallel(chunk_size, R, P):\n"
+        "                    PSI_V_OUT[i_b, chunk_start + cs, i_h, r, p] = PsiV_frag[cs, r, p]  # cppmega P2 Hopper PsiV A/B store\n",
+        expected=1,
+        label=f"{path.name} fwd PsiV store",
+    )
+    _atomic_write_text(path, text)
+    return min(sig_count, store_count)
+
+
+def _patch_regular_bwd_for_ab(path: Path) -> int:
+    """Patch regular non-varlen bwd_fwd/bwd_bwd to consume PsiV_in.
+
+    The patch is intentionally narrow:
+      * bwd_fwd loads precomputed PsiV directly into `PsiV_shared`.
+      * bwd_bwd keeps V and MIMO_V for dV/dMIMO_V, but loads precomputed PsiV
+        for the later dqk/dK path instead of rematerializing `v * Psi`.
+
+    This is a measurable Hopper A/B experiment, not production integration.
+    """
+    text = path.read_text()
+    if "PSI_V_IN: T.Tensor([B, S, H, R, P], dtype)" in text:
+        return text.count("# cppmega P2 Hopper PsiV A/B load")
+
+    text, sig_count = _replace_exact(
+        text,
+        "            MIMO_V: T.Tensor([H, R, P], T.float32), # type: ignore\n"
+        "            MIMO_O: T.Tensor([H, R, P], T.float32), # type: ignore\n",
+        "            MIMO_V: T.Tensor([H, R, P], T.float32), # type: ignore\n"
+        "            PSI_V_IN: T.Tensor([B, S, H, R, P], dtype),  # cppmega P2 Hopper PsiV A/B\n"
+        "            MIMO_O: T.Tensor([H, R, P], T.float32), # type: ignore\n",
+        expected=2,
+        label=f"{path.name} bwd kernel signatures",
+    )
+    text, bwd_fwd_count = _replace_exact(
+        text,
+        "                # --- Up-Project V and Prepare Biased Q/K ---\n"
+        "                PsiV_frag = T.alloc_fragment([chunk_size, R, P], dtype)\n"
+        "\n"
+        "                T.copy(V[i_b, chunk_start:chunk_start+chunk_size, i_h, :], v_shared)\n"
+        "                for cs, r, p in T.Parallel(chunk_size, R, P):\n"
+        "                    PsiV_frag[cs, r, p] = v_shared[cs, p] * Psi_frag[r, p]\n"
+        "                PsiV_reshaped_frag = T.view(PsiV_frag, shape=[fused_chunk_size, P])\n"
+        "                T.copy(PsiV_reshaped_frag, PsiV_shared)\n",
+        "                # --- Load precomputed PsiV and Prepare Biased Q/K ---\n"
+        "                for cs, r, p in T.Parallel(chunk_size, R, P):\n"
+        "                    PsiV_shared[cs * R + r, p] = PSI_V_IN[i_b, chunk_start + cs, i_h, r, p]  # cppmega P2 Hopper PsiV A/B load\n",
+        expected=1,
+        label=f"{path.name} bwd_fwd PsiV load",
+    )
+    text, bwd_bwd_count = _replace_exact(
+        text,
+        "                # Compute Psi_V\n"
+        "                PsiV_frag = T.alloc_fragment([chunk_size, R, P], dtype)\n"
+        "                T.clear(PsiV_frag)\n"
+        "                for cs, p in T.Parallel(chunk_size, P):\n"
+        "                    for r in T.serial(R):\n"
+        "                        PsiV_frag[cs, r, p] += v_frag[cs, p] * Psi_frag[r, p]\n"
+        "                # NOTE: Tilelang unable to perform gemm with reshaped PsiV_frag\n"
+        "                # so have to copy to smem\n"
+        "                PsiV_shared  = T.alloc_shared([fused_chunk_size, P], dtype)\n"
+        "                for cs, r, p in T.Parallel(chunk_size, R, P):\n"
+        "                    PsiV_shared[cs*R + r, p] = PsiV_frag[cs, r, p]\n",
+        "                # Load precomputed PsiV for dqk/dK paths.\n"
+        "                PsiV_shared  = T.alloc_shared([fused_chunk_size, P], dtype)\n"
+        "                for cs, r, p in T.Parallel(chunk_size, R, P):\n"
+        "                    PsiV_shared[cs * R + r, p] = PSI_V_IN[i_b, chunk_start + cs, i_h, r, p]  # cppmega P2 Hopper PsiV A/B load\n",
+        expected=1,
+        label=f"{path.name} bwd_bwd PsiV load",
+    )
+    _atomic_write_text(path, text)
+    return bwd_fwd_count + bwd_bwd_count
+
+
+def patch_source_tree_for_hopper_psiv_ab(root: str | os.PathLike[str]) -> HopperPsiVABPatchResult:
+    """Patch a temporary source tree for the non-TMA Hopper Hoist-PsiV A/B.
+
+    `root` must point at `.../mamba_ssm/ops/tilelang/mamba3`. The function
+    mutates only that explicit temp tree. It does not discover or patch
+    site-packages, does not honor env gates, and is not used by production
+    `apply_all()`.
+    """
+    base = Path(root)
+    fwd_path = base / "mamba3_mimo_fwd.py"
+    bwd_path = base / "mamba3_mimo_bwd.py"
+    for path in (fwd_path, bwd_path):
+        if not path.exists():
+            raise RuntimeError(f"Kernel file missing for Hopper PsiV A/B patch: {path}")
+
+    fwd_sites = _patch_regular_fwd_for_ab(fwd_path)
+    bwd_sites = _patch_regular_bwd_for_ab(bwd_path)
+    return HopperPsiVABPatchResult(
+        root=base,
+        fwd_files_patched=1,
+        bwd_files_patched=1,
+        fwd_store_sites=fwd_sites,
+        bwd_load_sites=bwd_sites,
+        files=("mamba3_mimo_fwd.py", "mamba3_mimo_bwd.py"),
+    )
 
 
 def apply_all() -> None:

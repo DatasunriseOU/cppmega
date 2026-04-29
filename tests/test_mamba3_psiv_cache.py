@@ -160,6 +160,74 @@ def test_patch_site_probe_reads_static_source(tmp_path):
     assert result.bwd_dstates_updates == 2
 
 
+def test_hopper_psiv_ab_patch_mutates_temp_tree_only(tmp_path):
+    from cppmega.megatron.upstream_patches.apply_mamba3_p2_psiv_patches import (
+        patch_source_tree_for_hopper_psiv_ab,
+    )
+
+    fwd_text = """
+def outer_fwd():
+    def kernel(
+            MIMO_V: T.Tensor([H, R, P], T.float32), # type: ignore
+            MIMO_O: T.Tensor([H, R, P], T.float32), # type: ignore
+            ):
+        for i in []:
+                PsiV_reshaped_frag = T.view(PsiV_frag, shape=[fused_chunk_size, P])
+                T.copy(PsiV_reshaped_frag, PsiV_shared)
+"""
+    bwd_text = """
+def outer_bwd_fwd():
+    def kernel(
+            MIMO_V: T.Tensor([H, R, P], T.float32), # type: ignore
+            MIMO_O: T.Tensor([H, R, P], T.float32), # type: ignore
+            ):
+        for i in []:
+                # --- Up-Project V and Prepare Biased Q/K ---
+                PsiV_frag = T.alloc_fragment([chunk_size, R, P], dtype)
+
+                T.copy(V[i_b, chunk_start:chunk_start+chunk_size, i_h, :], v_shared)
+                for cs, r, p in T.Parallel(chunk_size, R, P):
+                    PsiV_frag[cs, r, p] = v_shared[cs, p] * Psi_frag[r, p]
+                PsiV_reshaped_frag = T.view(PsiV_frag, shape=[fused_chunk_size, P])
+                T.copy(PsiV_reshaped_frag, PsiV_shared)
+
+def outer_bwd_bwd():
+    def kernel(
+            MIMO_V: T.Tensor([H, R, P], T.float32), # type: ignore
+            MIMO_O: T.Tensor([H, R, P], T.float32), # type: ignore
+            ):
+        for i in []:
+                # Compute Psi_V
+                PsiV_frag = T.alloc_fragment([chunk_size, R, P], dtype)
+                T.clear(PsiV_frag)
+                for cs, p in T.Parallel(chunk_size, P):
+                    for r in T.serial(R):
+                        PsiV_frag[cs, r, p] += v_frag[cs, p] * Psi_frag[r, p]
+                # NOTE: Tilelang unable to perform gemm with reshaped PsiV_frag
+                # so have to copy to smem
+                PsiV_shared  = T.alloc_shared([fused_chunk_size, P], dtype)
+                for cs, r, p in T.Parallel(chunk_size, R, P):
+                    PsiV_shared[cs*R + r, p] = PsiV_frag[cs, r, p]
+"""
+    (tmp_path / "mamba3_mimo_fwd.py").write_text(fwd_text)
+    (tmp_path / "mamba3_mimo_bwd.py").write_text(bwd_text)
+
+    result = patch_source_tree_for_hopper_psiv_ab(tmp_path)
+    assert result.fwd_store_sites == 1
+    assert result.bwd_load_sites == 2
+
+    fwd_patched = (tmp_path / "mamba3_mimo_fwd.py").read_text()
+    bwd_patched = (tmp_path / "mamba3_mimo_bwd.py").read_text()
+    assert "PSI_V_OUT" in fwd_patched
+    assert "PSI_V_IN" in bwd_patched
+    assert fwd_patched.count("# cppmega P2 Hopper PsiV A/B store") == 1
+    assert bwd_patched.count("# cppmega P2 Hopper PsiV A/B load") == 2
+
+    again = patch_source_tree_for_hopper_psiv_ab(tmp_path)
+    assert again.fwd_store_sites == 1
+    assert again.bwd_load_sites == 2
+
+
 # ---------------------------------------------------------------------------
 # Test 4 — gate-on-without-kernel-impl raises (primary safety contract)
 # ---------------------------------------------------------------------------
