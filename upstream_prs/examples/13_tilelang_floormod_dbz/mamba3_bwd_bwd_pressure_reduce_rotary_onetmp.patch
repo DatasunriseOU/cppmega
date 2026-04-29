@@ -1,0 +1,39 @@
+--- a/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
++++ b/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
+@@ -777,10 +777,9 @@
+-                q_first_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
+-                q_second_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
+-                for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
+-                    q_first_half_frag[cs, r, n] = q_shared[cs*R + r, n]
+-                    q_second_half_frag[cs, r, n] = q_shared[cs*R + r, N//2 + n]
++                q_rot_tmp_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
+                 angles_frag = T.alloc_fragment([chunk_size, N//rotary_dim_divisor], T.float32)
+                 T.copy(ANGLES[i_b, chunk_start:chunk_start+chunk_size, i_h, :], angles_frag)
+                 for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
+-                    q_shared[cs*R + r, n] = T.cos(angles_frag[cs, n]) * q_first_half_frag[cs, r, n] - T.sin(angles_frag[cs, n]) * q_second_half_frag[cs, r, n]
+-                    q_shared[cs*R + r, N//2 + n] = T.sin(angles_frag[cs, n]) * q_first_half_frag[cs, r, n] + T.cos(angles_frag[cs, n]) * q_second_half_frag[cs, r, n]
++                    q_rot_tmp_frag[cs, r, n] = T.cos(angles_frag[cs, n]) * q_shared[cs*R + r, n] - T.sin(angles_frag[cs, n]) * q_shared[cs*R + r, N//2 + n]
++                for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
++                    q_shared[cs*R + r, N//2 + n] = T.sin(angles_frag[cs, n]) * q_shared[cs*R + r, n] + T.cos(angles_frag[cs, n]) * q_shared[cs*R + r, N//2 + n]
++                for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
++                    q_shared[cs*R + r, n] = q_rot_tmp_frag[cs, r, n]
+@@ -798,14 +797,13 @@
+                 for csr, n in T.Parallel(fused_chunk_size, N):
+                     k_pre_rot_shared[csr, n] = k_pre_trap_shared[csr, n]
+                 # Apply rotary to k (access via 2D index [cs*R + r, n]):
+-                k_first_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
+-                k_second_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
++                k_rot_tmp_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
++                for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
++                    k_rot_tmp_frag[cs, r, n] = T.cos(angles_frag[cs, n]) * k_pre_trap_shared[cs*R + r, n] - T.sin(angles_frag[cs, n]) * k_pre_trap_shared[cs*R + r, N//2 + n]
+                 for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
+-                    k_first_half_frag[cs, r, n] = k_pre_trap_shared[cs*R + r, n]
+-                    k_second_half_frag[cs, r, n] = k_pre_trap_shared[cs*R + r, N//2 + n]
++                    k_pre_trap_shared[cs*R + r, N//2 + n] = T.sin(angles_frag[cs, n]) * k_pre_trap_shared[cs*R + r, n] + T.cos(angles_frag[cs, n]) * k_pre_trap_shared[cs*R + r, N//2 + n]
+                 for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
+-                    k_pre_trap_shared[cs*R + r, n] = T.cos(angles_frag[cs, n]) * k_first_half_frag[cs, r, n] - T.sin(angles_frag[cs, n]) * k_second_half_frag[cs, r, n]
+-                    k_pre_trap_shared[cs*R + r, N//2 + n] = T.sin(angles_frag[cs, n]) * k_first_half_frag[cs, r, n] + T.cos(angles_frag[cs, n]) * k_second_half_frag[cs, r, n]
++                    k_pre_trap_shared[cs*R + r, n] = k_rot_tmp_frag[cs, r, n]
+                 # Apply Trap-specific scaling:
+                 k_trap_scaled_frag = T.alloc_fragment([fused_chunk_size, N], dtype)
+                 T.copy(k_pre_trap_shared, k_trap_scaled_frag)
