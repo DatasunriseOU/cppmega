@@ -54,13 +54,15 @@ def smoke() -> dict:
     import mamba_ssm  # noqa: F401
     import causal_conv1d  # noqa: F401
     import fast_hadamard_transform  # noqa: F401
-    import tilelang  # noqa: F401
+    import tilelang
     import qoptim_cuda  # noqa: F401
 
     return {
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
         "te": transformer_engine.__version__,
+        "tilelang": getattr(tilelang, "__version__", None),
+        "tilelang_file": getattr(tilelang, "__file__", None),
         "device_count": torch.cuda.device_count(),
         "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "image_ref": GHCR_REF,
@@ -68,7 +70,47 @@ def smoke() -> dict:
     }
 
 
+@app.function(
+    image=cppmega_prebuilt_image(),
+    timeout=300,
+)
+def versions() -> dict:
+    """Report package/source versions from the GHCR image without allocating GPU."""
+    import importlib.metadata as md
+    import os
+
+    import torch
+    import transformer_engine
+    import flash_attn
+    import mamba_ssm
+    import tilelang
+    import cppmega
+
+    def dist_version(name: str) -> str | None:
+        try:
+            return md.version(name)
+        except md.PackageNotFoundError:
+            return None
+
+    return {
+        "image_ref": GHCR_REF,
+        "torch": torch.__version__,
+        "torch_cuda": torch.version.cuda,
+        "te": transformer_engine.__version__,
+        "flash_attn": getattr(flash_attn, "__version__", None),
+        "mamba_ssm": getattr(mamba_ssm, "__version__", None),
+        "tilelang": getattr(tilelang, "__version__", None),
+        "tilelang_dist": dist_version("tilelang"),
+        "tilelang_file": getattr(tilelang, "__file__", None),
+        "cppmega_file": getattr(cppmega, "__file__", None),
+        "cppmega_has_git": os.path.exists("/opt/cppmega/.git"),
+    }
+
+
 @app.local_entrypoint()
 def main() -> None:
-    result = smoke.remote()
+    if os.environ.get("CPPMEGA_MODAL_MODE") == "versions":
+        result = versions.remote()
+    else:
+        result = smoke.remote()
     print(result)
