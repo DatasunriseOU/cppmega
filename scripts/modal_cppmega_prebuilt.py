@@ -22,6 +22,7 @@ import modal
 GHCR_REPO = os.environ.get("GHCR_REPO", "ghcr.io/jewelmusicee/cppmega")
 GHCR_TAG = os.environ.get("GHCR_TAG", "latest")
 GHCR_REF = f"{GHCR_REPO}:{GHCR_TAG}"
+GPU_SPEC = os.environ.get("CPPMEGA_MODAL_GPU", "H100:2")
 
 
 def cppmega_prebuilt_image() -> modal.Image:
@@ -40,7 +41,7 @@ app = modal.App("cppmega-prebuilt-smoke")
 
 @app.function(
     image=cppmega_prebuilt_image(),
-    gpu="H100",
+    gpu=GPU_SPEC,
     timeout=600,
 )
 def smoke() -> dict:
@@ -60,8 +61,10 @@ def smoke() -> dict:
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
         "te": transformer_engine.__version__,
+        "device_count": torch.cuda.device_count(),
         "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "image_ref": GHCR_REF,
+        "gpu_spec": GPU_SPEC,
     }
 
 
