@@ -123,6 +123,12 @@ at::Tensor cutlass_mxfp8_tn_gemm_swizzled_scale_strided_cuda(
     double alpha,
     double beta);
 
+void cutlass_mxfp8_swizzle_rowwise_scale_cuda(
+    at::Tensor rowwise_scale_u8,
+    at::Tensor output_swizzled_scale_u8,
+    int64_t rows,
+    int64_t cols);
+
 void cutlass_mxfp8_prepare_wgrad_stock_a_tile_cuda(
     at::Tensor dy_colwise_u8,
     at::Tensor dy_colwise_scale_u8,
@@ -171,6 +177,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "tn_gemm_swizzled_scale_strided",
       &cutlass_mxfp8_tn_gemm_swizzled_scale_strided_cuda,
       "Probe-only CUTLASS SM120/SM121 MXFP8 TN GEMM with strided row-major output");
+  m.def(
+      "swizzle_rowwise_scale",
+      &cutlass_mxfp8_swizzle_rowwise_scale_cuda,
+      "Pack compact rowwise MXFP8 E8M0 scales into the SM120/SM121 GEMM layout");
   m.def(
       "prepare_wgrad_stock_a_tile",
       &cutlass_mxfp8_prepare_wgrad_stock_a_tile_cuda,

@@ -98,6 +98,7 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert env["CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE"] == "int8"
     assert env["CPPMEGA_TE_MXFP8_BWD_BACKEND"] == "te_tn_adapter"
     assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
+    assert env["CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND"] == "compact"
     assert env["CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD"] == "0"
     assert env["CPPMEGA_FLASHINFER_MXFP8_RUNNER"] == "mm_mxfp8"
     assert env["CPPMEGA_FLASHINFER_MXFP8_TACTIC"] == "0"
@@ -246,6 +247,49 @@ def test_compact_columnwise_rejects_non_cutlass_backend(monkeypatch):
             "--mxfp8-bwd-backend",
             "flashinfer_cutlass",
             "--mxfp8-compact-columnwise-backward",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="requires --mxfp8-bwd-backend cutlass_native"):
+        main()
+
+
+def test_swizzled_cutlass_scale_cli_selects_cutlass_native(capsys, monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_profiles",
+            "shell",
+            "local_gb10_quarter",
+            "--fp8-recipe",
+            "mxfp8",
+            "--mxfp8-cutlass-scale-backend",
+            "swizzled",
+        ],
+    )
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "export CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native" in out
+    assert "export CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND=swizzled" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=te" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED=1" in out
+    assert "export CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=0" in out
+
+
+def test_swizzled_cutlass_scale_rejects_non_cutlass_backend(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_profiles",
+            "shell",
+            "local_gb10_quarter",
+            "--fp8-recipe",
+            "mxfp8",
+            "--mxfp8-bwd-backend",
+            "flashinfer_cutlass",
+            "--mxfp8-cutlass-scale-backend",
+            "swizzled",
         ],
     )
 

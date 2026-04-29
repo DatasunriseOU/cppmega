@@ -238,6 +238,7 @@ if os.environ.get("CPPMEGA_ALLOW_TE_MXFP8_SM12", "0") == "1":
 #   CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native      # old direct compact loader
 #   CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND=compact     # direct compact-scale mainloop
 #   CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND=prepack     # old native-scale prepack A/B
+#   CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND=swizzled    # stock CUTLASS + GEMM-ready scales
 #
 # The CUTLASS backend uses a cppmega SM120 mainloop fork by default.  Regular
 # TN keeps stock A/B TMA with compact scale copies in the mainloop; backward
@@ -262,8 +263,22 @@ if _te_mxfp8_bwd_backend not in ("te_tn_adapter", "flashinfer_cutlass", "cutlass
         f"{_te_mxfp8_bwd_backend!r}; expected te_tn_adapter, flashinfer_cutlass, "
         "or cutlass_native"
     )
+_cutlass_mxfp8_scale_backend = os.environ.get(
+    "CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND", "compact"
+).lower()
+if _cutlass_mxfp8_scale_backend not in ("compact", "prepack", "swizzled"):
+    raise RuntimeError(
+        "Unsupported CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND="
+        f"{_cutlass_mxfp8_scale_backend!r}; expected compact, prepack, or swizzled"
+    )
+_cutlass_mxfp8_stock_swizzled = (
+    _te_mxfp8_bwd_backend == "cutlass_native"
+    and _cutlass_mxfp8_scale_backend == "swizzled"
+)
 _te_mxfp8_transpose_emit_default = (
-    "off" if _te_mxfp8_bwd_backend == "cutlass_native" else "auto"
+    "auto"
+    if _cutlass_mxfp8_stock_swizzled
+    else ("off" if _te_mxfp8_bwd_backend == "cutlass_native" else "auto")
 )
 _te_mxfp8_transpose_emit_backend = os.environ.get(
     "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND",
@@ -278,15 +293,19 @@ _te_mxfp8_transpose_emit_strict = os.environ.get(
     "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT", "0"
 ) == "1"
 _te_mxfp8_transpose_emit_swizzled_default = (
-    "0" if _te_mxfp8_bwd_backend == "cutlass_native" else "1"
+    "1"
+    if _cutlass_mxfp8_stock_swizzled
+    else ("0" if _te_mxfp8_bwd_backend == "cutlass_native" else "1")
 )
 _te_mxfp8_transpose_emit_swizzled = os.environ.get(
     "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED",
     _te_mxfp8_transpose_emit_swizzled_default,
 ) == "1"
-_te_mxfp8_compact_columnwise_backward = os.environ.get(
-    "CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD", "0"
-) == "1"
+_te_mxfp8_compact_columnwise_backward = (
+    False
+    if _cutlass_mxfp8_stock_swizzled
+    else os.environ.get("CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD", "0") == "1"
+)
 _te_mxfp8_grouped_direct_backward = os.environ.get(
     "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD", "0"
 ) == "1"
@@ -387,6 +406,8 @@ if (
             "mxfp8_tn_sidecar_attr_attached_bytes": 0,
             "mxfp8_cutlass_native_dgrad": 0,
             "mxfp8_cutlass_native_wgrad": 0,
+            "mxfp8_cutlass_native_stock_swizzled": 0,
+            "mxfp8_cutlass_native_stock_scale_swizzle": 0,
             "mxfp8_flashinfer_fprop": 0,
             "mxfp8_flashinfer_fprop_fallback": 0,
             "mxfp8_flashinfer_dgrad": 0,
@@ -1218,6 +1239,16 @@ if (
                 _data = _data.reshape(-1, _data.shape[-1])
             return _data, _scale
 
+        def _cppmega_cutlass_rowwise_scale_for_stock(_cutlass, _scale, _data, _is_swizzled):
+            if _is_swizzled:
+                return _scale
+            _cppmega_record_bwd_stat("mxfp8_cutlass_native_stock_scale_swizzle")
+            return _cutlass.swizzle_rowwise_scale(
+                _scale,
+                int(_data.shape[0]),
+                int(_data.shape[1]),
+            )
+
         def _cppmega_cutlass_kwargs(_kwargs):
             _out_dtype = _kwargs.get("out_dtype", _torch.bfloat16)
             _out = _kwargs.get("out", None)
@@ -1240,13 +1271,35 @@ if (
             _a_data, _a_scale = _cppmega_mxfp8_rowwise_payload_and_scale(_a)
             _b_data, _b_scale = _cppmega_mxfp8_rowwise_payload_and_scale(_b)
             _cutlass = _cppmega_load_cutlass_mxfp8_module()
-            _result = _cutlass.tn_gemm_direct_rowwise(
-                _a_data,
-                _a_scale,
-                _b_data,
-                _b_scale,
-                **_cppmega_cutlass_kwargs(_kwargs),
-            )
+            if _cutlass_mxfp8_stock_swizzled:
+                _a_scale = _cppmega_cutlass_rowwise_scale_for_stock(
+                    _cutlass,
+                    _a_scale,
+                    _a_data,
+                    bool(getattr(_a, "_with_gemm_swizzled_scales", False)),
+                )
+                _b_scale = _cppmega_cutlass_rowwise_scale_for_stock(
+                    _cutlass,
+                    _b_scale,
+                    _b_data,
+                    bool(getattr(_b, "_with_gemm_swizzled_scales", False)),
+                )
+                _cppmega_record_bwd_stat("mxfp8_cutlass_native_stock_swizzled")
+                _result = _cutlass.tn_gemm_swizzled_scale(
+                    _a_data,
+                    _a_scale,
+                    _b_data,
+                    _b_scale,
+                    **_cppmega_cutlass_kwargs(_kwargs),
+                )
+            else:
+                _result = _cutlass.tn_gemm_direct_rowwise(
+                    _a_data,
+                    _a_scale,
+                    _b_data,
+                    _b_scale,
+                    **_cppmega_cutlass_kwargs(_kwargs),
+                )
             return _result, None, None, None
 
         def _cppmega_cutlass_dgrad_nn_from_rowwise_transpose(_weight_t, _dy, _kwargs):
@@ -1325,6 +1378,8 @@ if (
                         _args[1],
                         _kwargs,
                     )
+                if _cutlass_mxfp8_stock_swizzled:
+                    return False, "missing_gemm_ready_rowwise_transpose_for_dgrad"
                 return True, _cppmega_cutlass_dgrad_nn_gemm(_args[0], _args[1], _kwargs)
 
             # wgrad: dy.T[N, M] @ x[M, K].
@@ -1336,6 +1391,8 @@ if (
                     _args[1],
                     _kwargs,
                 )
+            if _cutlass_mxfp8_stock_swizzled:
+                return False, "missing_gemm_ready_rowwise_transpose_for_wgrad"
             if _cppmega_is_mxfp8_rowwise_transpose_operand(_args[0]):
                 return True, _cppmega_cutlass_wgrad_nt_from_x_rowwise_transpose(
                     _args[0],
@@ -2261,6 +2318,7 @@ if (
             f"mxfp8_bwd_tn_adapter={_te_mxfp8_bwd_tn_adapter}, "
             f"mxfp8_transpose_emit_backend={_te_mxfp8_transpose_emit_backend}, "
             f"mxfp8_transpose_emit_swizzled={_te_mxfp8_transpose_emit_swizzled}, "
+            f"cutlass_mxfp8_scale_backend={_cutlass_mxfp8_scale_backend}, "
             f"mxfp8_compact_columnwise_backward={_te_mxfp8_compact_columnwise_backward}, "
             f"mxfp8_grouped_direct_backward={_te_mxfp8_grouped_direct_backward}, "
             f"mxfp8_bwd_allow_bf16_fallback={_te_mxfp8_bwd_allow_bf16_fallback}, "
