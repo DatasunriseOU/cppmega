@@ -2,8 +2,10 @@
 
 Compares two non-production variants on Hopper GPUs:
   * baseline: upstream non-TMA/non-WS TileLang kernels
-  * stage2_force_nontma: qk_shared_direct + bf/bb num_stages=2, with only
-    small float32 vector slice copies forced off TMA
+  * stage2_force_nontma: qk_shared_direct + bf/bb num_stages=1, with only
+    small float32 vector slice copies forced off TMA. num_stages=1 keeps WS
+    enabled while staying under Hopper dynamic shared memory limits on the
+    productionish shape.
 
 The harness writes full JSON/CSV/source artifacts to a Modal Volume and prints a
 compact summary for run logs. It does not change production defaults.
@@ -83,9 +85,9 @@ VARIANTS: dict[str, dict[str, Any]] = {
         "flattened_inputs": True,
         "flat_qk_dot": True,
         "bf_threads": 128,
-        "bf_num_stages": 2,
+        "bf_num_stages": 1,
         "bb_threads": 256,
-        "bb_num_stages": 2,
+        "bb_num_stages": 1,
     },
 }
 

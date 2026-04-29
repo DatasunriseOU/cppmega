@@ -355,10 +355,10 @@
          dtype,
          bf_threads=128,
 -        bf_num_stages=0,
-+        bf_num_stages=2,
++        bf_num_stages=1,
          bb_threads=256,
 -        bb_num_stages=0,
-+        bb_num_stages=2,
++        bb_num_stages=1,
          ):
      # TileLang kernel expects contiguous last-dim strides for DOUT.
      B, S, R, G, N = q.shape

@@ -131,3 +131,20 @@ Smoke summary:
 
 The previous stage2 failure signature did not recur: no TMA descriptor 716 and
 no `CUDA_ERROR_MISALIGNED_ADDRESS` appeared in the H200 smoke output.
+
+## Follow-Up: Smem-Safe Default
+
+The `(2,2)` path later crashed on the productionish shape at launch time with:
+
+```text
+Failed to set the allowed dynamic shared memory size to 231712
+```
+
+The patch default was therefore moved to `bf_num_stages=1` and
+`bb_num_stages=1`. The earlier smoke matrix already showed `(1,1)` keeps WS in
+both kernels, and the follow-up H200 benchmark confirms the productionish shape
+now launches successfully.
+
+Detailed result:
+
+- `docs/status/mamba3_stage2_force_nontma_smemsafe_2026_04_29.md`
