@@ -27,6 +27,9 @@ def full_bwd_bwd_pytorch(
     chunk_size=16,
     R=4,
     rotary_dim_divisor=4,
+    dstates_before_chunks=None,  # optional (B, H, nchunks, N, P) fp32 split handoff
+    return_dstates_before=False,
+    skip_dstates_update=False,
 ):
     B, S, R_dim, G, N = q_raw.shape
     H = mimo_v.shape[0]
@@ -149,9 +152,16 @@ def full_bwd_bwd_pytorch(
     DANG_o = torch.zeros(B, H, nchunks, cs, rdim, dtype=torch.float32, device=dev)
 
     dstates = torch.zeros(B, H, N, P, dtype=torch.float32, device=dev)
+    captured_dstates = None
+    if return_dstates_before:
+        captured_dstates = torch.empty(B, H, nchunks, N, P, dtype=torch.float32, device=dev)
 
     for crev in range(nchunks):
         ci = nchunks - 1 - crev
+        if dstates_before_chunks is not None:
+            dstates = dstates_before_chunks[:, :, ci].float()
+        if captured_dstates is not None:
+            captured_dstates[:, :, ci].copy_(dstates)
 
         q_c = q_all[:, :, ci]         # (B,H,fcs,N)
         k_c = k_all[:, :, ci]         # trap-scaled, rotated
@@ -316,10 +326,12 @@ def full_bwd_bwd_pytorch(
 
         DQ_o[:, :, ci] = dq_inv
 
-        # Update dstates
-        dstates = dstates * torch.exp(da_cs_sum).unsqueeze(-1).unsqueeze(-1)
-        dPhiO_scaled = dPh_c * exp_cs_fcs
-        dstates = dstates + torch.matmul(q_c.transpose(-1,-2), dPhiO_scaled)
+        # Update dstates. A split pass2 can skip this because dstates are provided
+        # independently for each chunk via dstates_before_chunks.
+        if not skip_dstates_update:
+            dstates = dstates * torch.exp(da_cs_sum).unsqueeze(-1).unsqueeze(-1)
+            dPhiO_scaled = dPh_c * exp_cs_fcs
+            dstates = dstates + torch.matmul(q_c.transpose(-1,-2), dPhiO_scaled)
 
     # Format outputs
     # DK TileLang shape: (B, S*R, H, N)
@@ -333,7 +345,7 @@ def full_bwd_bwd_pytorch(
     DV_f = DV_o.permute(0, 2, 3, 1, 4).reshape(B, S, H, P).to(dtype)
     DANG_f = DANG_o.permute(0, 2, 3, 1, 4).reshape(B, S, H, rdim)
 
-    return {
+    result = {
         'DK': DK_f,
         'DQ': DQ_f,
         'DV': DV_f,
@@ -346,3 +358,143 @@ def full_bwd_bwd_pytorch(
         'DDA': DDA_o.view(B, H, S),
         'DANGLES': DANG_f,
     }
+    if captured_dstates is not None:
+        result['DSTATES_BEFORE_CHUNKS'] = captured_dstates
+    return result
+
+
+def compute_dstates_before_chunks_pytorch(
+    dout,
+    q_raw,
+    q_bias,
+    mimo_o,
+    angles,
+    dA_cs,
+    chunk_size=16,
+    rotary_dim_divisor=4,
+):
+    """Pass1 prototype: compute dstates on entry to every reverse chunk.
+
+    This is the minimal correctness handoff for a bwd_bwd state/chunk split. It
+    deliberately computes only the loop-carried state recurrence:
+
+        dstates_in[c] = state entering chunk c from later chunks
+        dstates = dstates * exp(dA_cs chunk sum) + Q_c^T @ dPhiO_scaled
+
+    The production TileLang pass would write the returned fp32 tensor to gmem and
+    pass2 would consume it chunk-independently.
+    """
+    B, S, R_dim, G, N = q_raw.shape
+    H, R_bias, _ = q_bias.shape
+    P = dout.shape[-1]
+    if R_bias != R_dim:
+        raise ValueError(f"q_bias R={R_bias} does not match q R={R_dim}")
+    if mimo_o is None:
+        raise NotImplementedError("prototype currently covers reduceO=True, matching H200 harness")
+
+    cs = chunk_size
+    if S % cs != 0:
+        raise NotImplementedError("prototype assumes S is divisible by chunk_size")
+    nchunks = S // cs
+    fcs = cs * R_dim
+    dev = q_raw.device
+    rdim = N // rotary_dim_divisor
+    heads_per_group = H // G
+
+    q_all = torch.empty(B, H, nchunks, fcs, N, dtype=torch.float32, device=dev)
+    for ih in range(H):
+        ih_qk = ih // heads_per_group
+        q_h = q_raw[:, :, :, ih_qk, :].float() + q_bias[ih].unsqueeze(0).unsqueeze(0).float()
+        q_h = q_h.view(B, nchunks, cs, R_dim, N)
+        ang_h = angles[:, :, ih, :].view(B, nchunks, cs, rdim)
+        cos_a = torch.cos(ang_h).unsqueeze(3)
+        sin_a = torch.sin(ang_h).unsqueeze(3)
+        qf = q_h[..., :rdim]
+        qs = q_h[..., N // 2:N // 2 + rdim]
+        q_rot = q_h.clone()
+        q_rot[..., :rdim] = cos_a * qf - sin_a * qs
+        q_rot[..., N // 2:N // 2 + rdim] = sin_a * qf + cos_a * qs
+        q_all[:, ih] = q_rot.reshape(B, nchunks, fcs, N)
+
+    dout_ch = dout.view(B, nchunks, cs, H, P).permute(0, 3, 1, 2, 4).float()
+    dPhiO = dout_ch.unsqueeze(4) * mimo_o[None, :, None, None, :, :].float()
+    dPhiO_flat = dPhiO.reshape(B, H, nchunks, fcs, P)
+    dA_cs_ch = dA_cs.view(B, H, nchunks, cs)
+
+    dstates = torch.zeros(B, H, N, P, dtype=torch.float32, device=dev)
+    dstates_before = torch.empty(B, H, nchunks, N, P, dtype=torch.float32, device=dev)
+    for crev in range(nchunks):
+        ci = nchunks - 1 - crev
+        dstates_before[:, :, ci].copy_(dstates)
+        dac_c = dA_cs_ch[:, :, ci]
+        da_cs_sum = dac_c[:, :, -1]
+        exp_cs_fcs = torch.exp(dac_c).repeat_interleave(R_dim, dim=-1).unsqueeze(-1)
+        dstates = dstates * torch.exp(da_cs_sum).unsqueeze(-1).unsqueeze(-1)
+        dstates = dstates + torch.matmul(q_all[:, :, ci].transpose(-1, -2), dPhiO_flat[:, :, ci] * exp_cs_fcs)
+    return dstates_before
+
+
+def full_bwd_bwd_pytorch_state_chunk_split(
+    dout,
+    q_raw,
+    k_raw,
+    v,
+    q_bias,
+    k_bias,
+    mimo_v,
+    mimo_o,
+    angles,
+    dA_cs,
+    dA_cs_rev,
+    dt,
+    trap,
+    D,
+    segsum,
+    states,
+    qk_dot,
+    chunk_size=16,
+    R=4,
+    rotary_dim_divisor=4,
+):
+    """Correctness prototype for pass1/pass2 bwd_bwd split.
+
+    Pass1 computes fp32 dstates-before-chunk. Pass2 consumes that tensor and
+    computes the same stitched outputs as the monolithic reference without a
+    loop-carried dstates recurrence.
+    """
+    dstates_before = compute_dstates_before_chunks_pytorch(
+        dout,
+        q_raw,
+        q_bias,
+        mimo_o,
+        angles,
+        dA_cs,
+        chunk_size=chunk_size,
+        rotary_dim_divisor=rotary_dim_divisor,
+    )
+    result = full_bwd_bwd_pytorch(
+        dout,
+        q_raw,
+        k_raw,
+        v,
+        q_bias,
+        k_bias,
+        mimo_v,
+        mimo_o,
+        angles,
+        dA_cs,
+        dA_cs_rev,
+        dt,
+        trap,
+        D,
+        segsum,
+        states,
+        qk_dot,
+        chunk_size=chunk_size,
+        R=R,
+        rotary_dim_divisor=rotary_dim_divisor,
+        dstates_before_chunks=dstates_before,
+        skip_dstates_update=True,
+    )
+    result["DSTATES_BEFORE_CHUNKS"] = dstates_before
+    return result
