@@ -197,9 +197,9 @@ class RuntimePatchProfile:
     structure_enabled: bool = True
     structure_components: str = "core"
     mtp_ce_kernel: MtpCEKernel = "native"
-    # Experimental CCE launch fusion for main+MTP heads. Real GB10 A/B on
-    # 2026-04-28 was finite but slower, so this stays off unless explicitly
-    # requested by a profile/CLI override.
+    # CCE launch fusion for main+MTP heads. Keep the base profile disabled;
+    # measured launch profiles can opt in when one CCE call beats separate
+    # main + MTP-depth calls.
     cce_fuse_main_mtp_ce: bool = False
     acknowledge_liger_mtp_ce_deprecated: bool = False
     # Local source overrides that must be part of the typed launch contract.
@@ -353,10 +353,10 @@ def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProf
     """Fill the local GB10 NAM56R-quarter profile.
 
     This is the default correctness lane used on the single-GB10 box: full
-    NAM56R width, quarter depth, real 4k clang data, MTP=2, CCE MTP CE, TE
-    patched FA4 SM120 routing, tensorwise FP8, no-master Muon, q8 Muon momentum,
-    and disabled contiguous local DDP grad buffer.  It intentionally favors
-    debuggability and memory pressure over production H200 throughput.
+    NAM56R width, quarter depth, real 4k clang data, MTP=2, fused main+MTP CCE,
+    TE patched FA4 SM120 routing, tensorwise FP8, no-master Muon, q8 Muon
+    momentum, and disabled contiguous local DDP grad buffer. It intentionally
+    favors debuggability and memory pressure over production H200 throughput.
     """
 
     if profile is None:
@@ -379,6 +379,7 @@ def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProf
     profile.optimizer.muon_num_ns_steps = 3
     profile.runtime = RuntimePatchProfile(
         mtp_ce_kernel="cce",
+        cce_fuse_main_mtp_ce=True,
         acknowledge_liger_mtp_ce_deprecated=False,
         noconv_mamba_chunk_size=256,
     )

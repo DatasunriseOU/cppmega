@@ -88,7 +88,7 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert env["CPPMEGA_FLASH_ATTN_SOURCE_ROOT"] == "/home/dave/flash-attention-fa4"
     assert env["CPPMEGA_TRANSFORMER_ENGINE_SOURCE_ROOT"] == "/home/dave/TransformerEngine"
     assert env["CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE"] == "256"
-    assert env["CPPMEGA_CCE_FUSE_MAIN_MTP_CE"] == "0"
+    assert env["CPPMEGA_CCE_FUSE_MAIN_MTP_CE"] == "1"
     assert env["CPPMEGA_DSA_FP8_ATTENTION"] == "0"
     assert "--moe-token-dispatcher-type alltoall" in env["NATIVE_ARGS"]
     assert env["CPPMEGA_OPTIMIZER"] == "muon"
