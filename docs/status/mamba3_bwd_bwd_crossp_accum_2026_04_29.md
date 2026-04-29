@@ -479,3 +479,69 @@ Wave 4 recommendation:
 Modal cleanup: after cutoff, `modal app list` showed all
 `cppmega-mamba3-bwd-bwd-crossp-accum` apps stopped with `0` tasks. The
 pre-existing deployed `cppmega-pre...` app was left untouched.
+
+## Wave 4 - Lane B Closeout
+
+Status: `closed_dead`
+
+Branch: `worker/mamba3-ptile-layout-tma`
+
+No harness or kernel changes were made in Wave 4. Runs used the existing
+detached/spawn harness and wrote `report.json` to Modal Volume
+`cppmega-mamba3-benchmarks`.
+
+Commands:
+
+```text
+GHCR_TAG=785c3fd CPPMEGA_MODAL_GPU=H200:2 modal run --detach \
+  scripts/modal_mamba3_bwd_bwd_crossp_accum.py --spawn-only \
+  --run-id wave4_smoke_p128_ptile128_dspawn1 \
+  --shape-csv smoke_p128 --warmup 0 --iters 1 \
+  --p-tile 128 --crossp-num-stages 0
+
+GHCR_TAG=785c3fd CPPMEGA_MODAL_GPU=H200:2 modal run --detach \
+  scripts/modal_mamba3_bwd_bwd_crossp_accum.py --spawn-only \
+  --run-id wave4_productionish_ptile64_dspawn1 \
+  --shape-csv productionish --warmup 2 --iters 6 \
+  --p-tile 64 --crossp-num-stages 0
+
+GHCR_TAG=785c3fd CPPMEGA_MODAL_GPU=H200:2 modal run --detach \
+  scripts/modal_mamba3_bwd_bwd_crossp_accum.py --spawn-only \
+  --run-id wave4_productionish_ptile128_dspawn1 \
+  --shape-csv productionish --warmup 2 --iters 6 \
+  --p-tile 128 --crossp-num-stages 0
+```
+
+Artifacts:
+
+- `/benchmarks/mamba3_bwd_bwd_crossp_accum/wave4_smoke_p128_ptile128_dspawn1/report.json`
+- `/benchmarks/mamba3_bwd_bwd_crossp_accum/wave4_productionish_ptile64_dspawn1/report.json`
+- `/benchmarks/mamba3_bwd_bwd_crossp_accum/wave4_productionish_ptile128_dspawn1/report.json`
+
+Smoke matrix:
+
+| shape | P_TILE | run/app | status | correctness | stage2 bwd_bwd | cross-P bwd_bwd | slowdown | scratch | cross-P source markers |
+| --- | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| `smoke_p128` | 32 | Wave 3 `ap-1qIdttCKabrRdLADafQd5y` | ok | `12/12` allclose | `0.3186 ms` | `0.4477 ms` | `1.405x` | `64 KiB` | TMA load/store `0/0`, mbarrier `0`, launch bounds `(256,1)`, `dynamic_scratch_tma_guarded=false` |
+| `smoke_p128` | 64 | Wave 3 `ap-YxVpvOoTTPTWpxKxBWCtuL` | ok | `12/12` allclose | `0.3399 ms` | `0.4385 ms` | `1.290x` | `64 KiB` | TMA load/store `0/0`, mbarrier `0`, launch bounds `(256,1)`, `dynamic_scratch_tma_guarded=false` |
+| `smoke_p128` | 128 | Wave 4 `ap-wP6xpi6k3Oq7an86mIYef2` | ok | `12/12` allclose | `0.3359 ms` | `0.3813 ms` | `1.135x` | `64 KiB` | hash `eddce278314dc802d36634bb9e140e873d217cecce35eca9efa60948dcb17d33`, TMA load/store `0/0`, mbarrier `0`, launch bounds `(256,1)`, `dynamic_scratch_tma_guarded=false` |
+
+Productionish matrix:
+
+| shape | P_TILE | run/app | status | correctness | stage2 bwd_bwd | cross-P bwd_bwd | slowdown | scratch | cross-P source markers |
+| --- | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| `productionish` | 64 | `wave4_productionish_ptile64_dspawn1` / `ap-sZ5cqtHjWnZkqUQ4pnylxE` | ok | `12/12` allclose | `3.6972 ms` | `4.9464 ms` | `1.338x` | `2 MiB` | hash `fdb7188c19c3ff4cccab8ecb0db906a2d9bc38ab55cb3e2dcbb0a1cbf39f13e1`, TMA load/store `0/0`, mbarrier `0`, launch bounds `(256,1)`, `dynamic_scratch_tma_guarded=false` |
+| `productionish` | 128 | `wave4_productionish_ptile128_dspawn1` / `ap-jJeiRhbxgE1aB5xsY9s4U7` | ok | `12/12` allclose | `3.7179 ms` | `4.4565 ms` | `1.199x` | `2 MiB` | hash `109c34f7e0497314b38aeca27c4f01ecb6ba2a4d3f9928c5422bc83b994e5120`, TMA load/store `0/0`, mbarrier `0`, launch bounds `(256,1)`, `dynamic_scratch_tma_guarded=false` |
+
+`P_TILE=32` productionish was intentionally skipped: its clean smoke row was
+already slower than both `P_TILE=64` and `P_TILE=128`, so it was not a cheap
+candidate winner.
+
+Lane B verdict: P-tiling is dead for the monolithic cross-P accumulator. The
+best row is `P_TILE=128`, but it remains slower than stage2 on both smoke
+(`1.135x`) and productionish (`1.199x`). Do not spend more cycles on P_TILE
+layout/TMA/WS variants in this lane; the next viable pivot is reducing
+state-passing/scratch traffic or splitting the work across kernels.
+
+Modal cleanup: all Wave 4 apps were stopped after reports were collected. The
+pre-existing deployed `cppmega-pre...` app was left untouched.
