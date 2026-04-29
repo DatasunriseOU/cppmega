@@ -284,6 +284,9 @@ _te_mxfp8_transpose_emit_swizzled = os.environ.get(
     "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED",
     _te_mxfp8_transpose_emit_swizzled_default,
 ) == "1"
+_te_mxfp8_grad_output_eager_transpose = os.environ.get(
+    "CPPMEGA_TE_MXFP8_GRAD_OUTPUT_EAGER_TRANSPOSE", "1"
+) == "1"
 _te_mxfp8_compact_columnwise_backward = os.environ.get(
     "CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD", "0"
 ) == "1"
@@ -1985,7 +1988,13 @@ if (
                         bool(
                             _emit_enabled
                             and _te_linear_deferred_saved_operand
-                            and _role in ("input", "grad_output", "weight")
+                            and (
+                                _role in ("input", "grouped_grad_output", "weight")
+                                or (
+                                    _role == "grad_output"
+                                    and not _te_mxfp8_grad_output_eager_transpose
+                                )
+                            )
                         ),
                     )
                     setattr(
@@ -2015,6 +2024,11 @@ if (
                 _quantizers = _orig_get_quantizers(self, *args, **kwargs)
                 try:
                     _recipe = _TE_FP8State.get_fp8_recipe()
+                    _grad_output_role = (
+                        "grouped_grad_output"
+                        if type(self).__name__ == "GroupedLinear"
+                        else "grad_output"
+                    )
                     _cppmega_force_compact_many_if_needed(
                         _quantizers[0],
                         _recipe,
@@ -2023,7 +2037,7 @@ if (
                     _cppmega_force_compact_many_if_needed(
                         _quantizers[5],
                         _recipe,
-                        _role="grad_output",
+                        _role=_grad_output_role,
                     )
                 except Exception as _gq_exc:
                     if not _cppmega_get_quantizers_warned[0]:
@@ -2261,6 +2275,7 @@ if (
             f"mxfp8_bwd_tn_adapter={_te_mxfp8_bwd_tn_adapter}, "
             f"mxfp8_transpose_emit_backend={_te_mxfp8_transpose_emit_backend}, "
             f"mxfp8_transpose_emit_swizzled={_te_mxfp8_transpose_emit_swizzled}, "
+            f"mxfp8_grad_output_eager_transpose={_te_mxfp8_grad_output_eager_transpose}, "
             f"mxfp8_compact_columnwise_backward={_te_mxfp8_compact_columnwise_backward}, "
             f"mxfp8_grouped_direct_backward={_te_mxfp8_grouped_direct_backward}, "
             f"mxfp8_bwd_allow_bf16_fallback={_te_mxfp8_bwd_allow_bf16_fallback}, "
