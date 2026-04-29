@@ -14,13 +14,15 @@ What these tests will verify (in order):
        with `CPPMEGA_MAMBA3_P2_PSIV_CACHE` unset, module does nothing +
        raises no side-effects.
 
-  3. `test_gate_on_without_impl_raises`:
-       with gate ON but no implementation landed, every entrypoint MUST
-       raise NotImplementedError (per `feedback_no_silent_fallbacks.md`).
-       Today's default behaviour — this test passes as a guard against
-       accidentally shipping a silently-broken gate.
+  3. `test_phase_a_precompute_matches_reference`:
+       Phase-A materializer computes `V * MIMO_V` with the same dtype cast the
+       TileLang kernel uses.
 
-  4. `test_phase_a_matches_baseline` (SKIP until Phase A lands):
+  4. `test_gate_on_without_kernel_impl_raises`:
+       with gate ON but no TileLang integration landed, kernel wrappers MUST
+       raise NotImplementedError (per `feedback_no_silent_fallbacks.md`).
+
+  5. `test_phase_a_matches_baseline` (SKIP until kernel path exists):
        call upstream mamba3_mimo with materialised PsiV vs baseline;
        outputs bit-identical (or ≤1e-3 rel_err from float reorder).
 
@@ -70,6 +72,23 @@ def test_estimate_cache_bytes_matches_design_doc():
     )
 
 
+def test_estimate_state_checkpoint_bytes_matches_p3_doc():
+    from cppmega.megatron.mamba3_psiv_cache import estimate_state_checkpoint_bytes
+
+    bytes_per_sample = estimate_state_checkpoint_bytes(
+        batch=1,
+        seqlen=8192,
+        nheads=16,
+        dstate=64,
+        headdim_v=64,
+        dtype=torch.float32,
+        chunk_size=32,
+        num_layers=1,
+    )
+    # B * H * (S/chunk) * N * P * fp32
+    assert bytes_per_sample == 1 * 16 * 256 * 64 * 64 * 4
+
+
 # ---------------------------------------------------------------------------
 # Test 2 — gate-off is silent (import OK, is_enabled=False)
 # ---------------------------------------------------------------------------
@@ -87,30 +106,72 @@ def test_gate_off_is_silent(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Test 3 — gate-on-without-impl raises (the primary safety contract)
+# Test 3 — Phase-A materialization helper
 # ---------------------------------------------------------------------------
 
-def test_gate_on_without_impl_raises(monkeypatch):
-    """If someone flips the gate today, every entrypoint must crash loudly.
+def test_phase_a_precompute_matches_reference():
+    from cppmega.megatron.mamba3_psiv_cache import precompute_psi_v
 
-    This is the main anti-silent-fallback guardrail. The test PASSES today
-    and MUST continue passing after Phase A lands (for the Phase B/C
-    entrypoints that remain unimplemented at that point). Only after the
-    full impl ships + is verified on H200 should this test be updated.
-    """
+    V = torch.arange(2 * 3 * 4 * 5, dtype=torch.bfloat16).reshape(2, 3, 4, 5)
+    mimo_v = torch.arange(4 * 2 * 5, dtype=torch.float32).reshape(4, 2, 5) / 10.0
+    got = precompute_psi_v(V, mimo_v)
+    expected = V.unsqueeze(3) * mimo_v.to(dtype=V.dtype).unsqueeze(0).unsqueeze(0)
+
+    assert got.shape == (2, 3, 4, 2, 5)
+    assert got.dtype == V.dtype
+    assert got.is_contiguous()
+    torch.testing.assert_close(got, expected)
+
+
+def test_psiv_cache_pool_reuses_released_tensor():
+    from cppmega.megatron.mamba3_psiv_cache import PsiVCachePool
+
+    pool = PsiVCachePool()
+    first = pool.acquire(1, 8, 2, 4, 4, torch.bfloat16, torch.device("cpu"))
+    first_id = id(first)
+    pool.release(first)
+    second = pool.acquire(1, 8, 2, 4, 4, torch.bfloat16, torch.device("cpu"))
+    assert id(second) == first_id
+
+
+def test_patch_site_probe_reads_static_source(tmp_path):
+    from cppmega.megatron.upstream_patches.apply_mamba3_p2_psiv_patches import probe_patch_sites
+
+    files = {
+        "mamba3_mimo_fwd.py": "PsiV_frag = T.alloc_fragment\n",
+        "mamba3_mimo_fwd_varlen.py": "PsiV_frag = T.alloc_fragment\n",
+        "mamba3_mimo_bwd.py": (
+            "PsiV_frag = T.alloc_fragment\n"
+            "T.gemm(q_shared, dPhiO_scaled_frag, dstates_frag\n"
+        ),
+        "mamba3_mimo_bwd_varlen.py": (
+            "PsiV_frag = T.alloc_fragment\n"
+            "T.gemm(q_shared, dPhiO_scaled_frag, dstates_frag\n"
+        ),
+        "mamba3_mimo.py": "class _Mamba3Function:\n    pass\nctx.save_for_backward()\n",
+    }
+    for name, text in files.items():
+        (tmp_path / name).write_text(text)
+
+    result = probe_patch_sites(tmp_path)
+    assert result.ready_for_patch_skeleton is True
+    assert result.fwd_psiv_materializations == 2
+    assert result.bwd_psiv_materializations == 2
+    assert result.bwd_dstates_updates == 2
+
+
+# ---------------------------------------------------------------------------
+# Test 4 — gate-on-without-kernel-impl raises (primary safety contract)
+# ---------------------------------------------------------------------------
+
+def test_gate_on_without_kernel_impl_raises(monkeypatch):
+    """If someone flips the gate today, kernel entrypoints must crash loudly."""
     monkeypatch.setenv("CPPMEGA_MAMBA3_P2_PSIV_CACHE", "1")
     import importlib
 
     import cppmega.megatron.mamba3_psiv_cache as mod
     importlib.reload(mod)
     assert mod.is_enabled() is True
-
-    # Phase A entrypoint
-    with pytest.raises(NotImplementedError):
-        mod.precompute_psi_v(
-            torch.zeros(1, 8, 2, 4),  # V (B,S,H,P) — tiny, never actually used
-            torch.zeros(2, 4, 4),      # mimo_v (H,R,P)
-        )
 
     # Phase B/C wrappers
     with pytest.raises(NotImplementedError):
@@ -120,13 +181,9 @@ def test_gate_on_without_impl_raises(monkeypatch):
     with pytest.raises(NotImplementedError):
         mod.backward_bwd_with_cache(lambda *a, **kw: None)
 
-    # Pool construction must also raise immediately
-    with pytest.raises(NotImplementedError):
-        mod.PsiVCachePool()
-
 
 # ---------------------------------------------------------------------------
-# Test 4 — Phase A reproducer (skipped until implemented)
+# Test 5 — Phase A reproducer (skipped until kernel path exists)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(
