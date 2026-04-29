@@ -38,7 +38,7 @@ the dated note as historical evidence.
 
 | Block | BF16 / base path | FP8 tensorwise path | MXFP8 / block-scaled path |
 | --- | --- | --- | --- |
-| Dense TE Linear / Mamba projections | Params and ordinary grads stay BF16 under `Float16Module`; no FP32 master params in the local no-master Muon path. | H200 bench3 uses TE FP8 tensorwise where beneficial. Local GB10 quarter also defaults to tensorwise FP8 while keeping BF16 params/grads. | Accepted for short local GB10 training through the `mxfp8` run-profile lane. `Float16Module` preserves TE `QuantizedTensor` params instead of dequantizing them during the BF16 wrapper cast, so TE GEMM weights are authoritative primary MXFP8 storage. Native GB10 Linear backward `NN`/`NT` still fails, so the accepted route rewrites to TN through `scripts/cppmega_fp8_shim.py` with FlashInfer/CUTLASS. For local non-FSDP `Linear` and `LayerNormLinear` backward, TE saves GEMM-ready MXFP8 operands inside autograd and parameter quantization no longer attaches forward-side transpose sidecars. `cutlass_native` is correctness/probe-only until it covers real TE wgrad operands at acceptable speed. |
+| Dense TE Linear / Mamba projections | Params and ordinary grads stay BF16 under `Float16Module`; no FP32 master params in the local no-master Muon path. | H200 bench3 uses TE FP8 tensorwise where beneficial. Local GB10 quarter also defaults to tensorwise FP8 while keeping BF16 params/grads. | Accepted for short local GB10 training through the `mxfp8` run-profile lane. `Float16Module` preserves TE `QuantizedTensor` params instead of dequantizing them during the BF16 wrapper cast, so TE GEMM weights are authoritative primary MXFP8 storage. Native GB10 Linear backward `NN`/`NT` still fails, so the accepted default route rewrites to TN through `scripts/cppmega_fp8_shim.py` with FlashInfer/CUTLASS. The opt-in `--mxfp8-compact-columnwise-backward` route now covers real dense dgrad/wgrad operands with `cutlass_native` and clears the 34 one-step dense copy-transpose calls, but it is slower than the default and stays probe-only for performance. |
 | SparseMLA / DSA main attention | `CPPMEGA_DSA_SPARSE_MODE=tilelang` replaces Megatron `unfused_dsa_fn` with TileLang SparseMLA and avoids full `[b*np,sq,sk]` score materialization. Gather-scatter is deprecated and ACK-gated. | `SparseMLA_FP8` consumes TE current/tensorwise `Float8Tensor` storage zero-copy where possible. The old local per-token requant path is removed/fail-fast because it materialized large BF16/FP32 temporaries. | QK-only and fused-forward MXFP8 prototypes exist behind `CPPMEGA_SPARSE_MLA_BLOCKSCALED_QK=1` and `CPPMEGA_SPARSE_MLA_BLOCKSCALED_FUSED=1`. They are not defaults: full training backward still lacks finite-gradient validation. |
 | DSA indexer / top-k | Current supported path is BF16 per-head fused accumulation in `dsa_indexer_fused_patch.py`; it removes the upstream `[sq,b,h,sk]` FP32 intermediate. | The old FP8 indexer path was removed. Tests reject `dsa_indexer_dtype="fp8"` in `tests/test_megatron_args.py`; the launcher should not emit `--dsa-indexer-dtype`. | No MXFP8 indexer path is accepted. The target is streaming top-k from the per-head accumulator, not block-scaled dense score materialization. |
 | MoE router / DeepEP | Router probabilities remain FP32 when flex/DeepEP is used. This is a DeepEP API fact, not an accidental precision leak. | TE FP8 can cover MoE GEMMs, but router dtype is still FP32 for flex. | No current MXFP8 MoE training default. DeepGEMM is not a GB10 drop-in; use TE/CUTLASS SM120 work only after the layout contract is explicit. |
@@ -159,7 +159,40 @@ dense Linear: 34 one-step dense copies in the latest grouped-direct smoke, or
 3084 copies over the older 6-step receipt. The experimental dense
 compact-columnwise path is available through the typed profile flag
 `--mxfp8-compact-columnwise-backward`, but it is not the default because the
-current SM120 direct dense loader timed out on the full-model smoke.
+current SM120 direct dense loader is slower than the default FlashInfer/copy
+route on the full-model smoke.
+
+Latest dense compact-columnwise receipt:
+
+```text
+log: /home/dave/logs/gb10_mxfp8_dense_compact_native5_20260428_224251.log
+change: dense Linear MXFP8 backward uses direct compact-columnwise operands
+step 1: lm loss 11.66117, mtp_1 loss 11.97331, mtp_2 loss 11.96518
+val/test after step 1: 10.68362 / 10.72901
+iteration time: 241558.2 ms
+peak: max allocated 24017.47 MB, max reserved 25202 MB
+dense direct: mxfp8_cutlass_native_dgrad=34,
+              mxfp8_cutlass_native_wgrad=34
+dense old route: mxfp8_flashinfer_dgrad=0,
+                 mxfp8_flashinfer_wgrad=0
+copy bridge: mxfp8_tn_adapter_copy_transpose=0,
+             mxfp8_tn_adapter_missing_sidecar_copy=0,
+             mxfp8_tn_adapter_saved_transpose_operand=0
+grouped direct: mxfp8_grouped_direct_dgrad=10,
+                mxfp8_grouped_direct_wgrad=10,
+                mxfp8_grouped_direct_miss_dgrad=0,
+                mxfp8_grouped_direct_miss_wgrad=0
+remaining bridge: mxfp8_norm_quantize_sidecar_bridge=35
+fallback: bf16_fallback_dgrad=0, bf16_fallback_wgrad=0,
+          native_passthrough_dgrad=0, native_passthrough_wgrad=0,
+          fallback_reasons={}
+```
+
+This is a copy-contract win, not a speed win: the previous one-step route with
+the dense FlashInfer/copy bridge took `177950.9 ms` and peaked at about
+`24049 MB`, while this dense direct run took `241558.2 ms` and peaked at
+`24017 MB`. The next dense work is loader/mainloop performance, not another
+wrapper.
 
 Current full-model MXFP8 token/storage path:
 

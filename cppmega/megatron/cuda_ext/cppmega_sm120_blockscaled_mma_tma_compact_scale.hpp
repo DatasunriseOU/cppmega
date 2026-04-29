@@ -60,6 +60,19 @@ enum class CppMegaCompactOperandSource : int32_t {
   kColumnwiseTranspose = 1,
 };
 
+// TE compact columnwise B payload is physically [K, N] row-major. For the
+// logical TN operand [N, K], those bytes alias a column-major B tensor, but the
+// SM120 TMA descriptor still needs the K-contiguous shared-memory basis. This
+// tag lets cppmega select that descriptor path without changing normal CUTLASS
+// row/column-major instantiations.
+using CppMegaNoCopyBStride = cute::Stride<cute::Int<1>, int64_t, int64_t>;
+
+template <class Stride>
+struct CppMegaUsesNoCopyBStride : cute::false_type {};
+
+template <>
+struct CppMegaUsesNoCopyBStride<CppMegaNoCopyBStride> : cute::true_type {};
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<
@@ -67,7 +80,9 @@ template<
   int SchedulerPipelineStageCount_,
   class ClusterShape_,
   class KernelSchedule_,
-  bool UseAuxiliaryLoad_ = false
+  bool UseAuxiliaryLoad_ = false,
+  bool UseNoCopyBTma_ = false,
+  bool UseAColumnwiseSmemLayout_ = false
 >
 struct MainloopSm120TmaWarpSpecializedBlockScaledCompactScale {
   constexpr static int Stages = Stages_;
@@ -75,6 +90,8 @@ struct MainloopSm120TmaWarpSpecializedBlockScaledCompactScale {
   using ClusterShape = ClusterShape_;
   using Schedule = KernelSchedule_;
   constexpr static bool UseAuxiliaryLoad = UseAuxiliaryLoad_;
+  constexpr static bool UseNoCopyBTma = UseNoCopyBTma_;
+  constexpr static bool UseAColumnwiseSmemLayout = UseAColumnwiseSmemLayout_;
   constexpr static int PipelineAsyncMmaStages = 0;
   using ArchTag = arch::Sm120;
 };
@@ -88,7 +105,9 @@ template<
   int SchedulerPipelineStageCount,
   class ClusterShape,
   class KernelSchedule,
-  bool UseAuxiliaryLoad
+  bool UseAuxiliaryLoad,
+  bool UseNoCopyBTma,
+  bool UseAColumnwiseSmemLayout
 >
 struct HasAuxiliaryLoad<
   cutlass::gemm::collective::MainloopSm120TmaWarpSpecializedBlockScaledCompactScale<
@@ -96,7 +115,9 @@ struct HasAuxiliaryLoad<
     SchedulerPipelineStageCount,
     ClusterShape,
     KernelSchedule,
-    UseAuxiliaryLoad
+    UseAuxiliaryLoad,
+    UseNoCopyBTma,
+    UseAColumnwiseSmemLayout
   >
 > : cute::bool_constant<UseAuxiliaryLoad>{};
 
@@ -111,6 +132,8 @@ template <
   class ClusterShape,
   class KernelScheduleType,
   bool UseAuxiliaryLoad,
+  bool UseNoCopyBTma,
+  bool UseAColumnwiseSmemLayout,
   class TileShape_,
   class ElementPairA_,
   class StridePairA_,
@@ -131,7 +154,9 @@ struct CollectiveMma<
         SchedulerPipelineStageCount,
         ClusterShape,
         KernelScheduleType,
-        UseAuxiliaryLoad>,
+        UseAuxiliaryLoad,
+        UseNoCopyBTma,
+        UseAColumnwiseSmemLayout>,
     TileShape_,
     ElementPairA_,
     StridePairA_,
@@ -154,7 +179,9 @@ struct CollectiveMma<
       SchedulerPipelineStageCount,
       ClusterShape,
       KernelScheduleType,
-      UseAuxiliaryLoad>;
+      UseAuxiliaryLoad,
+      UseNoCopyBTma,
+      UseAColumnwiseSmemLayout>;
   using TileShape = TileShape_;
   using ElementPairA = ElementPairA_;
   using ElementPairB = ElementPairB_;
@@ -257,11 +284,17 @@ struct CollectiveMma<
   using SmemLayoutA = decltype(tile_to_shape(
       SmemLayoutAtomA{},
       make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{}),
-      conditional_t< ::cutlass::gemm::detail::is_major<0,StrideA>(), Step<_2,_1,_3>, Step<_1,_2,_3>>{}));
+      conditional_t<
+          DispatchPolicy::UseAColumnwiseSmemLayout,
+          Step<_2,_1,_3>,
+          conditional_t< ::cutlass::gemm::detail::is_major<0,StrideA>(), Step<_2,_1,_3>, Step<_1,_2,_3>>>{}));
   using SmemLayoutB = decltype(tile_to_shape(
       SmemLayoutAtomB{},
       make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{}),
-      conditional_t< ::cutlass::gemm::detail::is_major<0,StrideB>(), Step<_2,_1,_3>, Step<_1,_2,_3>>{}));
+      conditional_t<
+          DispatchPolicy::UseNoCopyBTma,
+          Step<_1,_2,_3>,
+          conditional_t< ::cutlass::gemm::detail::is_major<0,StrideB>(), Step<_2,_1,_3>, Step<_1,_2,_3>>>{}));
 
   // SmemLayoutAtomSFA and SmemLayoutAtomSFB are for whole CTA tiles. We add the number of pipeline stages here.
   // The number of pipeline stages is the same as the number of pipeline stages from AB Load <-> MainLoop
@@ -1008,6 +1041,7 @@ struct CollectiveMma<
           params.manual_payload_load &&
           params.a_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose);
       bool manual_payload_b =
+          !DispatchPolicy::UseNoCopyBTma &&
           !DispatchPolicy::UseAuxiliaryLoad &&
           params.manual_payload_load &&
           params.b_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose);
@@ -1083,7 +1117,7 @@ struct CollectiveMma<
 
     int m_coord_i = int(m_coord);
 
-    auto load_sfa = [&](int write_stage, int k_tile) {
+    auto load_sfa = [&](int write_stage, int k_tile, bool split_a_producer) {
       constexpr int TileM = int(size<0>(TileShape{}));
       constexpr int TileK = int(size<2>(TileShape{}));
       constexpr int Vec = SFVecSize;
@@ -1132,14 +1166,40 @@ struct CollectiveMma<
 
       if (params.a_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose)) {
         constexpr int RowVectors = TileM / 16;
-        for (int idx = lane; idx < KBlocks * RowVectors; idx += 32) {
-          int kb = idx / RowVectors;
-          int row_vec = idx - kb * RowVectors;
-          int row_base = row_vec * 16;
-          int64_t scale_offset =
-              static_cast<int64_t>(k_base_block + kb) * params.sfa_ld + (m_base + row_base);
-          uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_SFA_u8 + scale_offset);
-          store_m_contiguous(row_base, kb, chunk);
+        if constexpr (DispatchPolicy::UseAColumnwiseSmemLayout) {
+          static_assert(RowVectors % 2 == 0, "split A producer expects an even row-vector count");
+          if (split_a_producer) {
+            constexpr int SplitRowVectors = RowVectors / 2;
+            for (int idx = lane; idx < SplitRowVectors * KBlocks; idx += 32) {
+              int row_vec = (idx / KBlocks) * 2;
+              int kb = idx - (idx / KBlocks) * KBlocks;
+              int row_base = row_vec * 16;
+              int64_t scale_offset =
+                  static_cast<int64_t>(k_base_block + kb) * params.sfa_ld + (m_base + row_base);
+              uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_SFA_u8 + scale_offset);
+              store_m_contiguous(row_base, kb, chunk);
+            }
+          } else {
+            for (int idx = lane; idx < KBlocks * RowVectors; idx += 32) {
+              int kb = idx / RowVectors;
+              int row_vec = idx - kb * RowVectors;
+              int row_base = row_vec * 16;
+              int64_t scale_offset =
+                  static_cast<int64_t>(k_base_block + kb) * params.sfa_ld + (m_base + row_base);
+              uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_SFA_u8 + scale_offset);
+              store_m_contiguous(row_base, kb, chunk);
+            }
+          }
+        } else {
+          for (int idx = lane; idx < KBlocks * RowVectors; idx += 32) {
+            int kb = idx / RowVectors;
+            int row_vec = idx - kb * RowVectors;
+            int row_base = row_vec * 16;
+            int64_t scale_offset =
+                static_cast<int64_t>(k_base_block + kb) * params.sfa_ld + (m_base + row_base);
+            uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_SFA_u8 + scale_offset);
+            store_m_contiguous(row_base, kb, chunk);
+          }
         }
       } else {
         constexpr int KBlockVectors = KBlocks / ScaleVecBytes;
@@ -1155,7 +1215,7 @@ struct CollectiveMma<
       }
     };
 
-    auto load_payload_a = [&](int write_stage, int k_tile) {
+    auto load_payload_a = [&](int write_stage, int k_tile, bool split_a_producer) {
       static_assert(IsF8F6F4, "cppmega compact direct payload loader only supports byte-packed SM120 f8/f6/f4 operands");
       constexpr int TileM = int(size<0>(TileShape{}));
       constexpr int TileK = int(size<2>(TileShape{}));
@@ -1180,14 +1240,40 @@ struct CollectiveMma<
       };
 
       constexpr int RowVectors = TileM / VecBytes;
-      for (int idx = lane; idx < TileK * RowVectors; idx += 32) {
-        int kk = idx / RowVectors;
-        int row_vec = idx - kk * RowVectors;
-        int row_base = row_vec * VecBytes;
-        int64_t payload_offset =
-            static_cast<int64_t>(k_base + kk) * params.a_data_ld + (m_base + row_base);
-        uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_A + payload_offset);
-        store_m_contiguous(row_base, kk, chunk);
+      if constexpr (DispatchPolicy::UseAColumnwiseSmemLayout) {
+        static_assert(RowVectors % 2 == 0, "split A producer expects an even row-vector count");
+        if (split_a_producer) {
+          constexpr int SplitRowVectors = RowVectors / 2;
+          for (int idx = lane; idx < SplitRowVectors * TileK; idx += 32) {
+            int row_vec = (idx / TileK) * 2;
+            int kk = idx - (idx / TileK) * TileK;
+            int row_base = row_vec * VecBytes;
+            int64_t payload_offset =
+                static_cast<int64_t>(k_base + kk) * params.a_data_ld + (m_base + row_base);
+            uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_A + payload_offset);
+            store_m_contiguous(row_base, kk, chunk);
+          }
+        } else {
+          for (int idx = lane; idx < RowVectors * TileK; idx += 32) {
+            int row_vec = idx / TileK;
+            int kk = idx - row_vec * TileK;
+            int row_base = row_vec * VecBytes;
+            int64_t payload_offset =
+                static_cast<int64_t>(k_base + kk) * params.a_data_ld + (m_base + row_base);
+            uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_A + payload_offset);
+            store_m_contiguous(row_base, kk, chunk);
+          }
+        }
+      } else {
+        for (int idx = lane; idx < TileK * RowVectors; idx += 32) {
+          int kk = idx / RowVectors;
+          int row_vec = idx - kk * RowVectors;
+          int row_base = row_vec * VecBytes;
+          int64_t payload_offset =
+              static_cast<int64_t>(k_base + kk) * params.a_data_ld + (m_base + row_base);
+          uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_A + payload_offset);
+          store_m_contiguous(row_base, kk, chunk);
+        }
       }
     };
 
@@ -1196,8 +1282,14 @@ struct CollectiveMma<
       pipeline.producer_acquire(smem_pipe_write);
 
       int write_stage = smem_pipe_write.index();
-      load_sfa(write_stage, *k_tile_iter);
-      __syncwarp();
+      bool split_a_producer =
+          DispatchPolicy::UseAColumnwiseSmemLayout &&
+          params.a_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose) &&
+          params.b_source == static_cast<int32_t>(CppMegaCompactOperandSource::kRowwise);
+      load_sfa(write_stage, *k_tile_iter, split_a_producer);
+      if (!split_a_producer) {
+        __syncwarp();
+      }
 
       bool manual_payload =
           params.manual_payload_load &&
@@ -1206,7 +1298,7 @@ struct CollectiveMma<
       BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
       uint32_t manual_transaction_bytes = params.scale_transaction_bytes_mk;
       if (manual_payload) {
-        load_payload_a(write_stage, *k_tile_iter);
+        load_payload_a(write_stage, *k_tile_iter, split_a_producer);
         manual_transaction_bytes += params.payload_transaction_bytes_mk;
       } else if (lane_predicate) {
         copy(params.tma_load_a.with(*tma_barrier), tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,write_stage));
@@ -1243,7 +1335,9 @@ struct CollectiveMma<
       bool commit_aux_arrivals = false) {
     int lane_predicate = cute::elect_one_sync();
 
+    Tensor sA = make_tensor(make_smem_ptr(shared_tensors.smem_A.begin()), SmemLayoutA{});
     Tensor sB = make_tensor(make_smem_ptr(shared_tensors.smem_B.begin()), SmemLayoutB{});
+    Tensor sSFA = make_tensor(make_smem_ptr(shared_tensors.smem_SFA.begin()), SmemLayoutSFA{});
     Tensor sSFB = make_tensor(make_smem_ptr(shared_tensors.smem_SFB.begin()), SmemLayoutSFB{});
 
     auto [gA_mkl, gB_nkl] = load_inputs;
@@ -1252,14 +1346,105 @@ struct CollectiveMma<
     auto block_tma_b = params.tma_load_b.get_slice(0);
 
     auto [m_coord, n_coord, k_coord, l_coord] = blk_coord;
-    (void)m_coord;
     (void)k_coord;
     Tensor gB = gB_nkl(_,_,n_coord,_,l_coord);
 
     Tensor tBgB = block_tma_b.partition_S(gB);
     Tensor tBsB = block_tma_b.partition_D(sB);
 
+    int m_coord_i = int(m_coord);
     int n_coord_i = int(n_coord);
+
+    auto load_sfa_a_odd_rows = [&](int write_stage, int k_tile) {
+      constexpr int TileM = int(size<0>(TileShape{}));
+      constexpr int TileK = int(size<2>(TileShape{}));
+      constexpr int Vec = SFVecSize;
+      constexpr int KBlocks = TileK / Vec;
+      constexpr int RowVectors = TileM / 16;
+      static_assert(RowVectors % 2 == 0, "split A producer expects an even row-vector count");
+      constexpr int SplitRowVectors = RowVectors / 2;
+      int m_base = m_coord_i * TileM;
+      int k_base_block = k_tile * KBlocks;
+      int lane = thread_idx & 31;
+      auto ptr_SFA_u8 = reinterpret_cast<uint8_t const*>(params.ptr_SFA);
+
+      auto store_m_contiguous = [&](int row_base, int kb, uint4 chunk) {
+        uint32_t word = chunk.x;
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sSFA(row_base + byte, kb * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+        word = chunk.y;
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sSFA(row_base + 4 + byte, kb * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+        word = chunk.z;
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sSFA(row_base + 8 + byte, kb * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+        word = chunk.w;
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sSFA(row_base + 12 + byte, kb * Vec, write_stage) =
+              ElementSF::bitcast(static_cast<uint8_t>((word >> (8 * byte)) & 0xffu));
+        }
+      };
+
+      for (int idx = lane; idx < SplitRowVectors * KBlocks; idx += 32) {
+        int split_row_vec = idx / KBlocks;
+        int row_vec = split_row_vec * 2 + 1;
+        int kb = idx - split_row_vec * KBlocks;
+        int row_base = row_vec * 16;
+        int64_t scale_offset =
+            static_cast<int64_t>(k_base_block + kb) * params.sfa_ld + (m_base + row_base);
+        uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_SFA_u8 + scale_offset);
+        store_m_contiguous(row_base, kb, chunk);
+      }
+    };
+
+    auto load_payload_a_odd_rows = [&](int write_stage, int k_tile) {
+      static_assert(IsF8F6F4, "cppmega compact direct payload loader only supports byte-packed SM120 f8/f6/f4 operands");
+      constexpr int TileM = int(size<0>(TileShape{}));
+      constexpr int TileK = int(size<2>(TileShape{}));
+      constexpr int VecBytes = 16;
+      constexpr int RowVectors = TileM / VecBytes;
+      static_assert(RowVectors % 2 == 0, "split A producer expects an even row-vector count");
+      constexpr int SplitRowVectors = RowVectors / 2;
+      int m_base = m_coord_i * TileM;
+      int k_base = k_tile * TileK;
+      int lane = thread_idx & 31;
+      auto ptr_A = reinterpret_cast<uint8_t const*>(params.ptr_A);
+
+      auto store_m_word = [&](int row_base, int kk, int byte_base, uint32_t word) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          sA(row_base + byte_base + byte, kk, write_stage) =
+              static_cast<SmemAllocTypeA>((word >> (8 * byte)) & 0xffu);
+        }
+      };
+      auto store_m_contiguous = [&](int row_base, int kk, uint4 chunk) {
+        store_m_word(row_base, kk, 0, chunk.x);
+        store_m_word(row_base, kk, 4, chunk.y);
+        store_m_word(row_base, kk, 8, chunk.z);
+        store_m_word(row_base, kk, 12, chunk.w);
+      };
+
+      for (int idx = lane; idx < SplitRowVectors * TileK; idx += 32) {
+        int split_row_vec = idx / TileK;
+        int row_vec = split_row_vec * 2 + 1;
+        int kk = idx - split_row_vec * TileK;
+        int row_base = row_vec * VecBytes;
+        int64_t payload_offset =
+            static_cast<int64_t>(k_base + kk) * params.a_data_ld + (m_base + row_base);
+        uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_A + payload_offset);
+        store_m_contiguous(row_base, kk, chunk);
+      }
+    };
 
     auto load_sfb = [&](int write_stage, int k_tile) {
       constexpr int TileN = int(size<1>(TileShape{}));
@@ -1374,15 +1559,28 @@ struct CollectiveMma<
       pipeline.producer_acquire(smem_pipe_write);
 
       int write_stage = smem_pipe_write.index();
+      bool split_a_producer =
+          DispatchPolicy::UseAColumnwiseSmemLayout &&
+          params.a_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose) &&
+          params.b_source == static_cast<int32_t>(CppMegaCompactOperandSource::kRowwise);
+      if (split_a_producer) {
+        load_sfa_a_odd_rows(write_stage, *k_tile_iter);
+      }
       load_sfb(write_stage, *k_tile_iter);
-      __syncwarp();
+      if (!split_a_producer) {
+        __syncwarp();
+      }
 
       bool manual_payload =
+          !DispatchPolicy::UseNoCopyBTma &&
           params.manual_payload_load &&
           params.b_source == static_cast<int32_t>(CppMegaCompactOperandSource::kColumnwiseTranspose);
       using BarrierType = typename MainloopPipelineNK::ProducerBarrierType;
       BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
       uint32_t manual_transaction_bytes = params.scale_transaction_bytes_nk;
+      if (split_a_producer) {
+        load_payload_a_odd_rows(write_stage, *k_tile_iter);
+      }
       if (manual_payload) {
         load_payload_b(write_stage, *k_tile_iter);
         manual_transaction_bytes += params.payload_transaction_bytes_nk;

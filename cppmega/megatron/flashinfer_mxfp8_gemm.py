@@ -925,6 +925,11 @@ def dgrad_nn_gemm_compact_columnwise(
         weight_data,
         weight_scale,
         out=out,
+        # The cooperative auxiliary-load scheduler can deadlock on GB10 once
+        # dense Linear dgrad spans more than the first persistent tile wave.
+        # The split MK/NK asymmetric mainloop keeps the no-sidecar compact
+        # loader path stable for full-model dense shapes.
+        asymmetric=True,
     )
 
 
@@ -963,6 +968,7 @@ def wgrad_nt_gemm_compact_columnwise(
         x_data,
         x_scale,
         out=out,
+        asymmetric=True,
     )
 
 

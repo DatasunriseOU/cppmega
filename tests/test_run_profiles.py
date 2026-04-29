@@ -212,6 +212,47 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
     assert "--mtp-num-layers 1" in out
 
 
+def test_compact_columnwise_cli_selects_cutlass_native_when_backend_implicit(
+    capsys,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_profiles",
+            "shell",
+            "local_gb10_quarter",
+            "--fp8-recipe",
+            "mxfp8",
+            "--mxfp8-compact-columnwise-backward",
+        ],
+    )
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "export CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=1" in out
+    assert "export CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native" in out
+
+
+def test_compact_columnwise_rejects_non_cutlass_backend(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_profiles",
+            "shell",
+            "local_gb10_quarter",
+            "--fp8-recipe",
+            "mxfp8",
+            "--mxfp8-bwd-backend",
+            "flashinfer_cutlass",
+            "--mxfp8-compact-columnwise-backward",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="requires --mxfp8-bwd-backend cutlass_native"):
+        main()
+
+
 def test_nsys_profile_defaults_to_full_capture_not_cuda_profiler_api():
     profile = get_run_profile("local_gb10_quarter")
     profile.profiling.nsys_profile = True
