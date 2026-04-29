@@ -39,6 +39,13 @@ from typing import Any
 
 import modal
 
+try:
+    import triton
+    import triton.language as tl
+except Exception:  # noqa: BLE001
+    triton = None
+    tl = None
+
 GHCR_REPO = os.environ.get("GHCR_REPO", "ghcr.io/jewelmusicee/cppmega")
 GHCR_TAG = os.environ.get("GHCR_TAG", "785c3fd")
 GHCR_REF = f"{GHCR_REPO}:{GHCR_TAG}"
@@ -52,6 +59,134 @@ BENCH_ROOT = "/benchmarks"
 BENCH_PREFIX = "mamba3_stage2_force_nontma_benchmark"
 
 bench_volume = modal.Volume.from_name(BENCH_VOLUME_NAME, create_if_missing=True)
+
+
+if triton is not None and tl is not None:
+
+    @triton.jit
+    def _rr_diag_post_kernel(
+        DOUT,
+        Q,
+        K,
+        V,
+        Q_BIAS,
+        K_BIAS,
+        MIMO_V,
+        MIMO_O,
+        QK_DOT,
+        DT,
+        TRAP,
+        DK,
+        DQ,
+        DGAMMA_DIAG,
+        B: tl.constexpr,
+        S: tl.constexpr,
+        H: tl.constexpr,
+        G: tl.constexpr,
+        N: tl.constexpr,
+        P: tl.constexpr,
+        R: tl.constexpr,
+        BLOCK_R: tl.constexpr,
+        BLOCK_P: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        s = pid % S
+        tmp = pid // S
+        h = tmp % H
+        b = tmp // H
+        h_qk = h // (H // G)
+
+        offs_r = tl.arange(0, BLOCK_R)
+        offs_p = tl.arange(0, BLOCK_P)
+        offs_n = tl.arange(0, BLOCK_N)
+
+        dout_base = ((b * S + s) * H + h) * P
+        mimo_base = h * R * P
+        v_base = dout_base
+        dphi = tl.load(
+            DOUT + dout_base + offs_p[None, :],
+            mask=offs_p[None, :] < P,
+            other=0.0,
+        ).to(tl.float32) * tl.load(
+            MIMO_O + mimo_base + offs_r[:, None] * P + offs_p[None, :],
+            mask=(offs_r[:, None] < R) & (offs_p[None, :] < P),
+            other=0.0,
+        ).to(tl.float32)
+        psiv = tl.load(
+            V + v_base + offs_p[:, None],
+            mask=offs_p[:, None] < P,
+            other=0.0,
+        ).to(tl.float32) * tl.load(
+            MIMO_V + mimo_base + offs_r[None, :] * P + offs_p[:, None],
+            mask=(offs_p[:, None] < P) & (offs_r[None, :] < R),
+            other=0.0,
+        ).to(tl.float32)
+        dqk = tl.dot(dphi, psiv, input_precision="ieee", out_dtype=tl.float32)
+
+        qk_base = ((b * H + h) * S + s) * R * R
+        qk = tl.load(
+            QK_DOT + qk_base + offs_r[:, None] * R + offs_r[None, :],
+            mask=(offs_r[:, None] < R) & (offs_r[None, :] < R),
+            other=0.0,
+        ).to(tl.float32)
+        dg = tl.sum(tl.sum(dqk * qk, axis=0), axis=0)
+        tl.store(DGAMMA_DIAG + (b * H + h) * S + s, dg)
+
+        gamma_base = (b * H + h) * S + s
+        dt = tl.load(DT + gamma_base).to(tl.float32)
+        trap = tl.load(TRAP + gamma_base).to(tl.float32)
+        gamma = dt * tl.sigmoid(trap)
+        scaled = dqk * gamma
+
+        q_base = ((b * S * R + s * R) * G + h_qk) * N
+        k_base = q_base
+        bias_base = h * R * N
+        q_pre = tl.load(
+            Q + q_base + offs_r[:, None] * G * N + offs_n[None, :],
+            mask=(offs_r[:, None] < R) & (offs_n[None, :] < N),
+            other=0.0,
+        ).to(tl.float32) + tl.load(
+            Q_BIAS + bias_base + offs_r[:, None] * N + offs_n[None, :],
+            mask=(offs_r[:, None] < R) & (offs_n[None, :] < N),
+            other=0.0,
+        ).to(tl.float32)
+        k_pre = tl.load(
+            K + k_base + offs_r[:, None] * G * N + offs_n[None, :],
+            mask=(offs_r[:, None] < R) & (offs_n[None, :] < N),
+            other=0.0,
+        ).to(tl.float32) + tl.load(
+            K_BIAS + bias_base + offs_r[:, None] * N + offs_n[None, :],
+            mask=(offs_r[:, None] < R) & (offs_n[None, :] < N),
+            other=0.0,
+        ).to(tl.float32)
+        dk_delta = tl.dot(tl.trans(scaled), q_pre, input_precision="ieee", out_dtype=tl.float32)
+        dq_delta = tl.dot(scaled, k_pre, input_precision="ieee", out_dtype=tl.float32)
+
+        out_base = ((b * S * R + s * R) * H + h) * N
+        dk_old = tl.load(
+            DK + out_base + offs_r[:, None] * H * N + offs_n[None, :],
+            mask=(offs_r[:, None] < R) & (offs_n[None, :] < N),
+            other=0.0,
+        ).to(tl.float32)
+        dq_old = tl.load(
+            DQ + out_base + offs_r[:, None] * H * N + offs_n[None, :],
+            mask=(offs_r[:, None] < R) & (offs_n[None, :] < N),
+            other=0.0,
+        ).to(tl.float32)
+        tl.store(
+            DK + out_base + offs_r[:, None] * H * N + offs_n[None, :],
+            dk_old + dk_delta,
+            mask=(offs_r[:, None] < R) & (offs_n[None, :] < N),
+        )
+        tl.store(
+            DQ + out_base + offs_r[:, None] * H * N + offs_n[None, :],
+            dq_old + dq_delta,
+            mask=(offs_r[:, None] < R) & (offs_n[None, :] < N),
+        )
+
+else:
+    _rr_diag_post_kernel = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +262,20 @@ VARIANTS: dict[str, dict[str, Any]] = {
         "bf_num_stages": 1,
         "bb_threads": 256,
         "bb_num_stages": 0,
+    },
+    "stage2_rr_diag_triton": {
+        "patch": "stage2_force_nontma",
+        "patch_files": [
+            "mamba3_bwd_stage2_force_nontma.patch",
+            "mamba3_bwd_stage2_rr_diag_skip.patch",
+        ],
+        "flattened_inputs": True,
+        "flat_qk_dot": True,
+        "bf_threads": 128,
+        "bf_num_stages": 1,
+        "bb_threads": 256,
+        "bb_num_stages": 0,
+        "post_diag_triton": True,
     },
 }
 
@@ -639,6 +788,50 @@ def _kernel_args(
     return bf_args, bb_args
 
 
+def _apply_rr_diag_post_triton(
+    shape: Shape,
+    inputs: dict[str, Any],
+    outputs: dict[str, Any],
+    *,
+    flattened_inputs: bool,
+) -> None:
+    if not flattened_inputs:
+        raise RuntimeError("stage2_rr_diag_triton expects flattened Q/K inputs")
+    if triton is None or _rr_diag_post_kernel is None:
+        raise RuntimeError("triton is not importable; cannot run rr_diag post-kernel")
+
+    block_p = triton.next_power_of_2(shape.P)
+    block_n = triton.next_power_of_2(shape.N)
+    grid = (shape.B * shape.H * shape.S,)
+    _rr_diag_post_kernel[grid](
+        inputs["dout"],
+        inputs["q_flat"],
+        inputs["k_flat"],
+        inputs["v"],
+        inputs["q_bias"],
+        inputs["k_bias"],
+        inputs["mimo_v"],
+        inputs["mimo_o"],
+        outputs["qk_dot"],
+        inputs["dt"],
+        inputs["trap"],
+        outputs["dk"],
+        outputs["dq"],
+        outputs["dgamma_diag"],
+        shape.B,
+        shape.S,
+        shape.H,
+        shape.G,
+        shape.N,
+        shape.P,
+        shape.R,
+        16,
+        block_p,
+        block_n,
+        num_warps=4,
+    )
+
+
 def _run_pair(
     shape: Shape,
     bf_kernel: Any,
@@ -647,6 +840,7 @@ def _run_pair(
     *,
     flattened_inputs: bool,
     flat_qk_dot: bool,
+    post_diag_triton: bool = False,
 ) -> dict[str, Any]:
     import torch
 
@@ -654,6 +848,8 @@ def _run_pair(
     bf_args, bb_args = _kernel_args(shape, inputs, outputs, flattened_inputs=flattened_inputs)
     bf_kernel(*bf_args)
     bb_kernel(*bb_args)
+    if post_diag_triton:
+        _apply_rr_diag_post_triton(shape, inputs, outputs, flattened_inputs=flattened_inputs)
     torch.cuda.synchronize()
     return outputs
 
@@ -711,6 +907,7 @@ def _time_pair(
     *,
     flattened_inputs: bool,
     flat_qk_dot: bool,
+    post_diag_triton: bool,
     warmup: int,
     iters: int,
 ) -> dict[str, Any]:
@@ -724,10 +921,14 @@ def _time_pair(
 
     def run_bb() -> None:
         bb_kernel(*bb_args)
+        if post_diag_triton:
+            _apply_rr_diag_post_triton(shape, inputs, outputs, flattened_inputs=flattened_inputs)
 
     def run_chain() -> None:
         bf_kernel(*bf_args)
         bb_kernel(*bb_args)
+        if post_diag_triton:
+            _apply_rr_diag_post_triton(shape, inputs, outputs, flattened_inputs=flattened_inputs)
 
     bf_kernel(*bf_args)
     torch.cuda.synchronize()
@@ -897,6 +1098,7 @@ def _benchmark_variant(
             inputs,
             flattened_inputs=bool(cfg["flattened_inputs"]),
             flat_qk_dot=bool(cfg["flat_qk_dot"]),
+            post_diag_triton=bool(cfg.get("post_diag_triton", False)),
         )
         result["elapsed"] = _time_pair(
             shape,
@@ -905,6 +1107,7 @@ def _benchmark_variant(
             inputs,
             flattened_inputs=bool(cfg["flattened_inputs"]),
             flat_qk_dot=bool(cfg["flat_qk_dot"]),
+            post_diag_triton=bool(cfg.get("post_diag_triton", False)),
             warmup=warmup,
             iters=iters,
         )
