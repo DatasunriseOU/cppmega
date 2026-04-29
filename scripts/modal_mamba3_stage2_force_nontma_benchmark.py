@@ -418,6 +418,20 @@ VARIANTS: dict[str, dict[str, Any]] = {
         "bb_num_stages": 0,
         "post_diag_triton": "chunk",
     },
+    "stage2_rr_diag_cuda": {
+        "patch": "stage2_force_nontma",
+        "patch_files": [
+            "mamba3_bwd_stage2_force_nontma.patch",
+            "mamba3_bwd_stage2_rr_diag_skip.patch",
+        ],
+        "flattened_inputs": True,
+        "flat_qk_dot": True,
+        "bf_threads": 128,
+        "bf_num_stages": 1,
+        "bb_threads": 256,
+        "bb_num_stages": 0,
+        "post_diag_cuda": True,
+    },
 }
 
 
@@ -1022,20 +1036,66 @@ def _apply_rr_diag_post_triton_chunk(
     )
 
 
+def _apply_rr_diag_post_cuda(
+    shape: Shape,
+    inputs: dict[str, Any],
+    outputs: dict[str, Any],
+    *,
+    flattened_inputs: bool,
+) -> None:
+    if not flattened_inputs:
+        raise RuntimeError("stage2_rr_diag_cuda expects flattened Q/K inputs")
+
+    import pathlib
+    import sys
+
+    bench_dir = pathlib.Path(CPPMEGA_ROOT) / "upstream_prs/examples/13_tilelang_floormod_dbz"
+    bench_dir_str = str(bench_dir)
+    if bench_dir_str not in sys.path:
+        sys.path.insert(0, bench_dir_str)
+
+    from rr_diag_cuda_extension import stage2_rr_diag_post_cuda
+
+    stage2_rr_diag_post_cuda(
+        dout=inputs["dout"],
+        q_flat=inputs["q_flat"],
+        k_flat=inputs["k_flat"],
+        v=inputs["v"],
+        q_bias=inputs["q_bias"],
+        k_bias=inputs["k_bias"],
+        mimo_v=inputs["mimo_v"],
+        mimo_o=inputs["mimo_o"],
+        qk_dot=outputs["qk_dot"],
+        dt=inputs["dt"],
+        trap=inputs["trap"],
+        dk=outputs["dk"],
+        dq=outputs["dq"],
+        dgamma_diag=outputs["dgamma_diag"],
+    )
+
+
 def _apply_rr_diag_post(
     shape: Shape,
     inputs: dict[str, Any],
     outputs: dict[str, Any],
     *,
     flattened_inputs: bool,
-    post_diag_triton: Any,
+    post_diag: Any,
 ) -> None:
-    if post_diag_triton is True:
+    if post_diag is True:
         _apply_rr_diag_post_triton(shape, inputs, outputs, flattened_inputs=flattened_inputs)
-    elif post_diag_triton == "chunk":
+    elif post_diag == "chunk":
         _apply_rr_diag_post_triton_chunk(shape, inputs, outputs, flattened_inputs=flattened_inputs)
-    elif post_diag_triton:
-        raise RuntimeError(f"unknown post_diag_triton mode: {post_diag_triton!r}")
+    elif post_diag == "cuda":
+        _apply_rr_diag_post_cuda(shape, inputs, outputs, flattened_inputs=flattened_inputs)
+    elif post_diag:
+        raise RuntimeError(f"unknown post-diag mode: {post_diag!r}")
+
+
+def _post_diag_mode(config: dict[str, Any]) -> Any:
+    if config.get("post_diag_cuda"):
+        return "cuda"
+    return config.get("post_diag_triton", False)
 
 
 def _run_pair(
@@ -1046,7 +1106,7 @@ def _run_pair(
     *,
     flattened_inputs: bool,
     flat_qk_dot: bool,
-    post_diag_triton: bool = False,
+    post_diag: Any = False,
 ) -> dict[str, Any]:
     import torch
 
@@ -1054,13 +1114,13 @@ def _run_pair(
     bf_args, bb_args = _kernel_args(shape, inputs, outputs, flattened_inputs=flattened_inputs)
     bf_kernel(*bf_args)
     bb_kernel(*bb_args)
-    if post_diag_triton:
+    if post_diag:
         _apply_rr_diag_post(
             shape,
             inputs,
             outputs,
             flattened_inputs=flattened_inputs,
-            post_diag_triton=post_diag_triton,
+            post_diag=post_diag,
         )
     torch.cuda.synchronize()
     return outputs
@@ -1119,7 +1179,7 @@ def _time_pair(
     *,
     flattened_inputs: bool,
     flat_qk_dot: bool,
-    post_diag_triton: bool,
+    post_diag: Any,
     warmup: int,
     iters: int,
 ) -> dict[str, Any]:
@@ -1133,25 +1193,25 @@ def _time_pair(
 
     def run_bb() -> None:
         bb_kernel(*bb_args)
-        if post_diag_triton:
+        if post_diag:
             _apply_rr_diag_post(
                 shape,
                 inputs,
                 outputs,
                 flattened_inputs=flattened_inputs,
-                post_diag_triton=post_diag_triton,
+                post_diag=post_diag,
             )
 
     def run_chain() -> None:
         bf_kernel(*bf_args)
         bb_kernel(*bb_args)
-        if post_diag_triton:
+        if post_diag:
             _apply_rr_diag_post(
                 shape,
                 inputs,
                 outputs,
                 flattened_inputs=flattened_inputs,
-                post_diag_triton=post_diag_triton,
+                post_diag=post_diag,
             )
 
     bf_kernel(*bf_args)
@@ -1173,6 +1233,7 @@ def _profile_with_torch_profiler(
     *,
     flattened_inputs: bool,
     flat_qk_dot: bool,
+    post_diag: Any,
 ) -> dict[str, Any]:
     import traceback
 
@@ -1197,6 +1258,14 @@ def _profile_with_torch_profiler(
                 with torch.profiler.record_function(f"{variant}.bwd_bwd"):
                     torch.cuda.nvtx.range_push(f"{variant}.bwd_bwd")
                     bb_kernel(*bb_args)
+                    if post_diag:
+                        _apply_rr_diag_post(
+                            shape,
+                            inputs,
+                            outputs,
+                            flattened_inputs=flattened_inputs,
+                            post_diag=post_diag,
+                        )
                     torch.cuda.nvtx.range_pop()
                 prof.step()
         torch.cuda.synchronize()
@@ -1290,6 +1359,7 @@ def _benchmark_variant(
 
     t0 = time.time()
     cfg = VARIANTS[variant]
+    post_diag = _post_diag_mode(cfg)
     result: dict[str, Any] = {"variant": variant, "config": cfg}
     try:
         variant_dir = os.path.join(shape_dir, variant)
@@ -1322,7 +1392,7 @@ def _benchmark_variant(
             inputs,
             flattened_inputs=bool(cfg["flattened_inputs"]),
             flat_qk_dot=bool(cfg["flat_qk_dot"]),
-            post_diag_triton=bool(cfg.get("post_diag_triton", False)),
+            post_diag=post_diag,
         )
         result["elapsed"] = _time_pair(
             shape,
@@ -1331,7 +1401,7 @@ def _benchmark_variant(
             inputs,
             flattened_inputs=bool(cfg["flattened_inputs"]),
             flat_qk_dot=bool(cfg["flat_qk_dot"]),
-            post_diag_triton=bool(cfg.get("post_diag_triton", False)),
+            post_diag=post_diag,
             warmup=warmup,
             iters=iters,
         )
@@ -1345,6 +1415,7 @@ def _benchmark_variant(
                 variant_dir,
                 flattened_inputs=bool(cfg["flattened_inputs"]),
                 flat_qk_dot=bool(cfg["flat_qk_dot"]),
+                post_diag=post_diag,
             )
         result["max_memory_allocated_gib"] = torch.cuda.max_memory_allocated() / (1024**3)
         result["max_memory_reserved_gib"] = torch.cuda.max_memory_reserved() / (1024**3)
@@ -1420,6 +1491,7 @@ def _summarize_report(report: dict[str, Any]) -> dict[str, Any]:
                 continue
             row["variants"][variant["variant"]] = {
                 "status": "ok",
+                "post_diag": _post_diag_mode(variant["config"]) or None,
                 "bwd_fwd_mean_ms": variant["elapsed"]["bwd_fwd"]["mean_ms"],
                 "bwd_bwd_mean_ms": variant["elapsed"]["bwd_bwd"]["mean_ms"],
                 "chain_mean_ms": variant["elapsed"]["chain"]["mean_ms"],
