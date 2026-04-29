@@ -14,6 +14,7 @@ Run examples:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -387,19 +388,27 @@ def _time_cuda_events(fn: Any, *, warmup: int, iters: int) -> dict[str, Any]:
     }
 
 
-def _source_markers(kernel: Any) -> dict[str, Any]:
+def _source_markers(kernel: Any, consumer_threads: int) -> dict[str, Any]:
     source = kernel.get_kernel_source()
+    launch_bounds = sorted(set(re.findall(r"__launch_bounds__\((\d+),\s*(\d+)\)", source)))
+    launch_bound_threads = {int(item[0]) for item in launch_bounds}
+    producer_guard = f"if ({consumer_threads} <= ((int)threadIdx.x))"
     return {
         "source_chars": len(source),
+        "source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
         "tma_load_count": source.count("tl::tma_load"),
         "tma_store_count": source.count("tl::tma_store"),
-        "launch_bounds": sorted(set(re.findall(r"__launch_bounds__\((\d+),\s*(\d+)\)", source))),
+        "mbarrier_wait_count": source.count("mbarrier_wait"),
+        "launch_bounds": launch_bounds,
+        "producer_guard": producer_guard in source,
+        "expected_ws_launch_bound": any(bound > consumer_threads for bound in launch_bound_threads),
         "has_crossp_name": "ptile_crossp_accum" in source,
         "has_scratch": "DSTATES_PTILE" in source,
+        "dynamic_scratch_tma_guarded": "DSTATES_PTILE[i_b, i_h, p_block, :, :], dstates_shared_tile, disable_tma=True" in source,
     }
 
 
-def _run_shape(shape: Shape, warmup: int, iters: int, p_tile: int) -> dict[str, Any]:
+def _run_shape(shape: Shape, warmup: int, iters: int, p_tile: int, crossp_num_stages: int) -> dict[str, Any]:
     import time
     import traceback
 
@@ -409,7 +418,12 @@ def _run_shape(shape: Shape, warmup: int, iters: int, p_tile: int) -> dict[str, 
     t0 = time.time()
     path, prep = _prepare_module()
     print(f"[crossp] prepared shape={shape.name} patch_rc={prep['patch_rc']}", flush=True)
-    result: dict[str, Any] = {"shape": asdict(shape), "prepare": prep, "p_tile": p_tile}
+    result: dict[str, Any] = {
+        "shape": asdict(shape),
+        "prepare": prep,
+        "p_tile": p_tile,
+        "crossp_num_stages": crossp_num_stages,
+    }
     if prep["patch_rc"] != 0:
         result["status"] = "patch_failed"
         return result
@@ -447,7 +461,7 @@ def _run_shape(shape: Shape, warmup: int, iters: int, p_tile: int) -> dict[str, 
             torch.cuda.synchronize()
             baseline_bb_status = {
                 "status": "ok",
-                "source": _source_markers(baseline_bb),
+                "source": _source_markers(baseline_bb, 256),
                 "elapsed": _time_cuda_events(lambda: baseline_bb(*_bb_args(inputs, baseline_outputs)), warmup=warmup, iters=iters),
             }
         except Exception as exc:  # noqa: BLE001
@@ -459,7 +473,7 @@ def _run_shape(shape: Shape, warmup: int, iters: int, p_tile: int) -> dict[str, 
             }
 
         print(f"[crossp] compiling crossp bb shape={shape.name}", flush=True)
-        crossp_kernel = mod.mamba_mimo_bwd_bwd_ptile_crossp_accum(*common, 256, 0, p_tile)
+        crossp_kernel = mod.mamba_mimo_bwd_bwd_ptile_crossp_accum(*common, 256, crossp_num_stages, p_tile)
         print(f"[crossp] compiled crossp bb shape={shape.name}", flush=True)
         candidate_outputs = _empty_outputs(shape)
         scratch = torch.empty(
@@ -486,7 +500,7 @@ def _run_shape(shape: Shape, warmup: int, iters: int, p_tile: int) -> dict[str, 
                 "status": "ok",
                 "baseline_bwd_bwd": baseline_bb_status,
                 "crossp_bwd_bwd": {
-                    "source": _source_markers(crossp_kernel),
+                    "source": _source_markers(crossp_kernel, 256),
                     "elapsed": _time_cuda_events(
                         lambda: crossp_kernel(*_bb_args(inputs, candidate_outputs), scratch),
                         warmup=warmup,
@@ -526,7 +540,14 @@ def _selected_shapes(shape_csv: str) -> list[Shape]:
 
 
 @app.function(image=_image(), gpu=GPU_SPEC, timeout=1800)
-def run_probe(requested_gpu: str, shape_csv: str, warmup: int, iters: int, p_tile: int) -> dict[str, Any]:
+def run_probe(
+    requested_gpu: str,
+    shape_csv: str,
+    warmup: int,
+    iters: int,
+    p_tile: int,
+    crossp_num_stages: int,
+) -> dict[str, Any]:
     import traceback
 
     try:
@@ -543,8 +564,12 @@ def run_probe(requested_gpu: str, shape_csv: str, warmup: int, iters: int, p_til
                 "warmup": warmup,
                 "iters": iters,
                 "p_tile": p_tile,
+                "crossp_num_stages": crossp_num_stages,
             },
-            "results": [_run_shape(shape, warmup, iters, p_tile) for shape in _selected_shapes(shape_csv)],
+            "results": [
+                _run_shape(shape, warmup, iters, p_tile, crossp_num_stages)
+                for shape in _selected_shapes(shape_csv)
+            ],
         }
     except BaseException as exc:  # noqa: BLE001
         return {
@@ -557,8 +582,14 @@ def run_probe(requested_gpu: str, shape_csv: str, warmup: int, iters: int, p_til
 
 
 @app.local_entrypoint()
-def main(shape_csv: str = "tiny", warmup: int = 1, iters: int = 2, p_tile: int = 64) -> None:
-    result = run_probe.remote(GPU_SPEC, shape_csv, warmup, iters, p_tile)
+def main(
+    shape_csv: str = "tiny",
+    warmup: int = 1,
+    iters: int = 2,
+    p_tile: int = 64,
+    crossp_num_stages: int = 0,
+) -> None:
+    result = run_probe.remote(GPU_SPEC, shape_csv, warmup, iters, p_tile, crossp_num_stages)
     print("SUMMARY_JSON_START")
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
     print("SUMMARY_JSON_END")

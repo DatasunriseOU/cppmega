@@ -142,3 +142,106 @@ The next useful work is optimization, not correctness:
   split where `dstates` and cross-P accumulators have clearer ownership.
 - Consider a specialized `P=128,P_TILE=64` path with two live dstates tiles if
   the target is H200 only and smem/register pressure permits it.
+
+## Wave 1 - P_TILE/Layout/TMA Attempt
+
+Branch: `worker/mamba3-ptile-layout-tma`
+
+Base evidence target: `f77c8f0`, where productionish `P_TILE=64` was
+correct but slow:
+
+- Stage2 bwd_bwd: `3.6930 ms`
+- Cross-P bwd_bwd: `4.9561 ms`
+- Slowdown vs stage2: `1.342x`
+- Scratch: `2 MiB`
+
+Code outcome: no kernel semantic change was kept. The harness now exposes
+`--crossp-num-stages` and records stronger source markers
+(`source_sha256`, TMA load/store count, mbarrier count, launch bounds, and
+WS producer guard detection). The default stays `crossp_num_stages=0`, because
+that is the only correctness-capable mode found in this wave.
+
+### H200 Validation
+
+Image/device:
+
+- `ghcr.io/jewelmusicee/cppmega:785c3fd`
+- `NVIDIA H200`, capability `(9, 0)`, device count `2`
+- Torch `2.13.0.dev20260426+cu132`, CUDA `13.2`
+
+Smoke command:
+
+```text
+CPPMEGA_MODAL_GPU=H200:2 timeout 1500 modal run \
+  scripts/modal_mamba3_bwd_bwd_crossp_accum.py \
+  --shape-csv smoke_p128 --warmup 0 --iters 1 \
+  --p-tile 64 --crossp-num-stages 0
+```
+
+App: `ap-kHUyyHSkv0Mc2lJ3u5MwgO`, stopped normally.
+
+| shape | P_TILE | stages | correctness | stage2 ms | cross-P ms | scratch | source markers |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | --- |
+| `smoke_p128` | 64 | 0 | `12/12` allclose | `0.3117` | `0.4006` | `64 KiB` | cross-P `tma_load_count=0`, `producer_guard=false`, launch bounds `(256,1)` |
+
+Productionish command:
+
+```text
+CPPMEGA_MODAL_GPU=H200:2 timeout 1800 modal run \
+  scripts/modal_mamba3_bwd_bwd_crossp_accum.py \
+  --shape-csv productionish --warmup 2 --iters 6 \
+  --p-tile 64 --crossp-num-stages 0
+```
+
+App: `ap-ZO61TVAnuzFCpIQUwZckma`, stopped normally.
+
+| shape | P_TILE | stages | correctness | stage2 ms | cross-P ms | slowdown vs stage2 | vs f77 cross-P | scratch |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| `productionish` | 64 | 0 | `12/12` allclose | `3.7137` | `4.9808` | `1.341x` | `1.005x` slower | `2 MiB` |
+
+Productionish samples:
+
+- Stage2: `3.7116, 3.7128, 3.7141, 3.7169, 3.7149, 3.7117`
+- Cross-P: `4.9914, 4.9832, 4.9740, 4.9745, 4.9792, 4.9823`
+
+Source markers for productionish:
+
+- Stage2 bwd_bwd: `tma_load_count=0`, `tma_store_count=0`,
+  `mbarrier_wait_count=0`, `producer_guard=false`, launch bounds `(256,1)`,
+  source hash `a0d4658c56a0717080a59df2ecc9a5e75f25980683b081b9b7606682eb7166cf`.
+- Cross-P bwd_bwd: `tma_load_count=0`, `tma_store_count=0`,
+  `mbarrier_wait_count=0`, `producer_guard=false`, launch bounds `(256,1)`,
+  source hash `6101d21f2bd78d644d209d23a676dc40f226a12675926c568a8b466114455a18`.
+
+### Blocked Variants
+
+No performance win was found before cutoff.
+
+| variant | app | result |
+| --- | --- | --- |
+| TMA+WS pass_configs on cross-P | `ap-ec0qSMP2jCagbyO66xu7cs`, `ap-ANV25CfKNjO9P3079VxSgE` | Remote worker exited before SUMMARY_JSON; tiny isolated the crash to import of the patched module after setting cross-P `TL_DISABLE_WARP_SPECIALIZED=False`. |
+| TMA-only plus scratch TMA guards | `ap-tvtnvIKMzQzJYAH6hqu5Z4` | Import succeeded, but cross-P compile failed: `target function must be a PrimFunc but got <class 'NoneType'>`. |
+| Scratch `DSTATES_PTILE` per-copy `disable_tma=True` with safe pass configs | `ap-wTxLNiUTF6rdKHVjmyPhqT` | `P_TILE=64` smoke compile failed with the same `PrimFunc None` error; the guard edit was reverted. |
+| `P_TILE=32`/`128` under the scratch-guard variant | `ap-bWKS4E3X869v73kU8l5f3Z`, `ap-Gtpi3UYf4GnEQV6MZt5HjY` | Compile failed with `PrimFunc None`. This is not a clean verdict on P_TILE alone because the scratch guard was present. |
+| `crossp_num_stages=1`, TMA/WS disabled | `ap-TrKGIP5GWwx9dFPM1CAJCd` | Compile failed in pipeline planning: overlapping writes to `q_shared` in stages 8 and 11. |
+
+Modal cleanup: after cutoff, `modal app list` showed all
+`cppmega-mamba3-bwd-bwd-crossp-accum` apps stopped with `0` tasks. One unrelated
+deployed `cppmega-pre...` app was left untouched.
+
+### Read For Next Wave
+
+Wave 1 did not return performance. The current cross-P design remains
+correctness-capable only in the f77 mode: `P_TILE=64`, `num_stages=0`,
+TMA/WS disabled. The main blocker is not just throughput; several seemingly
+small TileLang changes fail before source generation.
+
+Recommended next wave:
+
+1. Do not start by enabling WS on the full cross-P kernel. First isolate a
+   minimal kernel containing the `DSTATES_PTILE` scratch copy and prove which
+   `T.copy(..., disable_tma=...)` forms lower to a PrimFunc.
+2. After that, retest `P_TILE=32/128` without the scratch-guard confounder.
+3. If P_TILE variants still compile only at 64, focus on reducing global scratch
+   traffic or splitting state passing from full-P reductions rather than trying
+   `num_stages=1` on the current monolithic loop.
