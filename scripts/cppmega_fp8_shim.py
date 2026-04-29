@@ -351,6 +351,11 @@ if (
         from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor as _TE_MXFP8Tensor
         from transformer_engine.pytorch.module import linear as _TE_LINEAR_MODULE
 
+        _te_native_mxfp8_norm_transpose = (
+            hasattr(_TE_MXFP8Quantizer, "make_rowwise_transpose_from_columnwise")
+            and hasattr(_tex, "mxfp8_transpose_from_columnwise")
+        )
+
         try:
             from transformer_engine.common.recipe import NVFP4BlockScaling as _TE_NVFP4Recipe
         except Exception as _nvfp4_import_exc:  # pragma: no cover
@@ -2128,6 +2133,8 @@ if (
             return True
 
         def _cppmega_wrap_apply_normalization(_module):
+            if _te_native_mxfp8_norm_transpose:
+                return False
             _orig_apply_normalization = getattr(_module, "apply_normalization", None)
             if _orig_apply_normalization is None or getattr(
                 _orig_apply_normalization, "_cppmega_transpose_emit", False
@@ -2261,6 +2268,7 @@ if (
             f"mxfp8_bwd_tn_adapter={_te_mxfp8_bwd_tn_adapter}, "
             f"mxfp8_transpose_emit_backend={_te_mxfp8_transpose_emit_backend}, "
             f"mxfp8_transpose_emit_swizzled={_te_mxfp8_transpose_emit_swizzled}, "
+            f"mxfp8_native_norm_transpose={_te_native_mxfp8_norm_transpose}, "
             f"mxfp8_compact_columnwise_backward={_te_mxfp8_compact_columnwise_backward}, "
             f"mxfp8_grouped_direct_backward={_te_mxfp8_grouped_direct_backward}, "
             f"mxfp8_bwd_allow_bf16_fallback={_te_mxfp8_bwd_allow_bf16_fallback}, "
