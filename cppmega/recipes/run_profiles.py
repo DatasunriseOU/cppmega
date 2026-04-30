@@ -164,12 +164,14 @@ class OptimizerProfile:
     param_storage: ParamStorage = "auto"
     muon_momentum: str = "0.95"
     muon_scale_mode: str = "spectral"
+    muon_fp32_matmul_prec: str = "medium"
     muon_num_ns_steps: int = 5
     muon_tp_mode: str = "blockwise"
     muon_scalar_optimizer: str = "adam8bit"
     muon_quantized_momentum: bool = True
     muon_quantized_momentum_dtype: str = "int8"
     muon_quantized_momentum_block_size: int = 256
+    muon_dtype_audit: bool = False
     use_bf16_no_master_emerging_optimizer: bool = True
     use_bf16_no_master_emerging_fallback_optimizer: bool = True
     grad_reduce_in_bf16: bool = True
@@ -511,6 +513,7 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         "CPPMEGA_PARAM_STORAGE": profile.resolved_param_storage(),
         "CPPMEGA_MUON_MOMENTUM": profile.optimizer.muon_momentum,
         "CPPMEGA_MUON_SCALE_MODE": profile.optimizer.muon_scale_mode,
+        "CPPMEGA_MUON_FP32_MATMUL_PREC": profile.optimizer.muon_fp32_matmul_prec,
         "CPPMEGA_MUON_NUM_NS_STEPS": str(profile.optimizer.muon_num_ns_steps),
         "CPPMEGA_MUON_TP_MODE": profile.optimizer.muon_tp_mode,
         "CPPMEGA_MUON_SCALAR_OPTIMIZER": profile.optimizer.muon_scalar_optimizer,
@@ -521,6 +524,7 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         "CPPMEGA_MUON_QUANTIZED_MOMENTUM_BLOCK_SIZE": str(
             profile.optimizer.muon_quantized_momentum_block_size
         ),
+        "CPPMEGA_MUON_DTYPE_AUDIT": _bool(profile.optimizer.muon_dtype_audit),
         "CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER": _bool(
             profile.optimizer.use_bf16_no_master_emerging_optimizer
         ),
@@ -748,10 +752,14 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.optimizer.optimizer = args.optimizer
     if args.param_storage is not None:
         profile.optimizer.param_storage = args.param_storage
+    if args.muon_fp32_matmul_prec is not None:
+        profile.optimizer.muon_fp32_matmul_prec = args.muon_fp32_matmul_prec
     if args.muon_num_ns_steps is not None:
         if args.muon_num_ns_steps < 1:
             raise ValueError("--muon-num-ns-steps must be >= 1")
         profile.optimizer.muon_num_ns_steps = args.muon_num_ns_steps
+    if args.muon_dtype_audit is not None:
+        profile.optimizer.muon_dtype_audit = args.muon_dtype_audit
     if args.seq_length is not None:
         profile.training.seq_length = args.seq_length
     if args.micro_batch_size is not None:
@@ -991,10 +999,30 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--optimizer", default=None)
     parser.add_argument("--param-storage", choices=("auto", "bf16", "mxfp8"), default=None)
     parser.add_argument(
+        "--muon-fp32-matmul-prec",
+        choices=("low", "medium", "high"),
+        default=None,
+        help="Forward Megatron's typed Muon Newton-Schulz matmul precision choice.",
+    )
+    parser.add_argument(
         "--muon-num-ns-steps",
         type=int,
         default=None,
         help="Override Newton-Schulz iterations for Muon in typed profiles.",
+    )
+    muon_dtype_audit = parser.add_mutually_exclusive_group()
+    muon_dtype_audit.add_argument(
+        "--muon-dtype-audit",
+        action="store_true",
+        default=None,
+        dest="muon_dtype_audit",
+        help="Print qMuon/Newton-Schulz dtype counters at process exit.",
+    )
+    muon_dtype_audit.add_argument(
+        "--no-muon-dtype-audit",
+        action="store_false",
+        default=None,
+        dest="muon_dtype_audit",
     )
     parser.add_argument("--seq-length", type=int, default=None)
     parser.add_argument("--micro-batch-size", type=int, default=None)
