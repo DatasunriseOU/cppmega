@@ -4,6 +4,7 @@ Modes:
   * ``cute-check`` builds a bounded overlay with NVIDIA CuTe DSL and
     quack-kernels, then reports import viability.
   * ``cute-gemm`` runs the existing single-GEMM CuTe DSL WGMMA smoke on H200.
+  * ``cute-lkq-chain`` runs the Wave 5 LKQ/state tile-chain CuTe probe.
   * ``quack-gemm`` runs a minimal CuTe DSL WGMMA GEMM through quack-kernels.
   * ``wmma-smoke`` runs the CUDA WMMA fallback correctness and timing probe.
 """
@@ -181,6 +182,38 @@ def cute_single_gemm_h200() -> dict[str, Any]:
 
 
 @app.function(image=_cute_image(), gpu=GPU_SPEC, timeout=30 * 60)
+def cute_lkq_chain_h200(iters: int = 100, warmup: int = 10) -> dict[str, Any]:
+    import contextlib
+    import io
+    import os
+    import traceback
+
+    os.environ["CUTE_DSL_ARCH"] = "sm_90a"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    stdout = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stdout):
+            from cppmega.megatron.cute_dsl_mimo.lkq_tile_chain_test import (
+                run_lkq_tile_chain,
+            )
+
+            result = run_lkq_tile_chain(bench_iters=iters, bench_warmup=warmup)
+        error = None
+    except BaseException as exc:  # noqa: BLE001
+        traceback.print_exc(file=stdout)
+        result = {"passed": False, "timings": None}
+        error = f"{type(exc).__name__}: {exc}"
+    return {
+        "image_ref": GHCR_REF,
+        "gpu_spec": GPU_SPEC,
+        "passed": bool(result.get("passed", False)),
+        "result": result,
+        "error": error,
+        "output": stdout.getvalue()[-16000:],
+    }
+
+
+@app.function(image=_cute_image(), gpu=GPU_SPEC, timeout=30 * 60)
 def quack_gemm_h200(
     m: int = 64, n: int = 64, k: int = 64, iters: int = 1000
 ) -> dict[str, Any]:
@@ -319,6 +352,8 @@ def main(
         result: Any = cute_stack_check.remote()
     elif mode == "cute-gemm":
         result = cute_single_gemm_h200.remote()
+    elif mode == "cute-lkq-chain":
+        result = cute_lkq_chain_h200.remote(iters, 10)
     elif mode == "quack-gemm":
         result = quack_gemm_h200.remote(m, n, k, iters)
     elif mode == "wmma-smoke":
@@ -327,9 +362,13 @@ def main(
         result = {
             "cute_check": cute_stack_check.remote(),
             "cute_gemm": cute_single_gemm_h200.remote(),
+            "cute_lkq_chain": cute_lkq_chain_h200.remote(iters, 10),
             "quack_gemm": quack_gemm_h200.remote(m, n, k, iters),
             "wmma_smoke": wmma_smoke_h200.remote(shape),
         }
     else:
-        raise ValueError("mode must be one of: cute-check, cute-gemm, quack-gemm, wmma-smoke, all")
+        raise ValueError(
+            "mode must be one of: cute-check, cute-gemm, cute-lkq-chain, "
+            "quack-gemm, wmma-smoke, all"
+        )
     print(json.dumps(result, indent=2, sort_keys=True))
