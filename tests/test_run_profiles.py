@@ -83,10 +83,13 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert env["CPPMEGA_ATTN_BACKEND"] == "flash"
     assert env["CPPMEGA_EXTRA_PYTHONPATH"].split(":")[:2] == [
         "/home/dave/flash-attention-fa4",
-        "/home/dave/TransformerEngine",
+        "/home/dave/TransformerEngine-wave6-swizzled-producer",
     ]
     assert env["CPPMEGA_FLASH_ATTN_SOURCE_ROOT"] == "/home/dave/flash-attention-fa4"
-    assert env["CPPMEGA_TRANSFORMER_ENGINE_SOURCE_ROOT"] == "/home/dave/TransformerEngine"
+    assert (
+        env["CPPMEGA_TRANSFORMER_ENGINE_SOURCE_ROOT"]
+        == "/home/dave/TransformerEngine-wave6-swizzled-producer"
+    )
     assert env["CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE"] == "256"
     assert env["CPPMEGA_CCE_FUSE_MAIN_MTP_CE"] == "1"
     assert env["CPPMEGA_DSA_FP8_ATTENTION"] == "0"
@@ -98,6 +101,7 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert env["CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE"] == "int8"
     assert env["CPPMEGA_TE_MXFP8_BWD_BACKEND"] == "te_tn_adapter"
     assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
+    assert env["CPPMEGA_TE_MXFP8_NORM_TRANSPOSE_EMIT_BRIDGE"] == "0"
     assert env["CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD"] == "0"
     assert env["CPPMEGA_FLASHINFER_MXFP8_RUNNER"] == "mm_mxfp8"
     assert env["CPPMEGA_FLASHINFER_MXFP8_TACTIC"] == "0"
@@ -325,6 +329,7 @@ def test_mxfp8_transpose_emit_defaults_to_te_for_tn_adapter():
     profile.precision.fp8_recipe = "mxfp8"
     env = profile_shell_assignments(profile)
     assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
+    assert env["CPPMEGA_TE_MXFP8_NORM_TRANSPOSE_EMIT_BRIDGE"] == "0"
     assert env["CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD"] == "0"
 
 

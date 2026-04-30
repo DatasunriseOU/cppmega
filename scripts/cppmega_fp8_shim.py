@@ -284,6 +284,9 @@ _te_mxfp8_transpose_emit_swizzled = os.environ.get(
     "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED",
     _te_mxfp8_transpose_emit_swizzled_default,
 ) == "1"
+_te_mxfp8_norm_transpose_emit_bridge = os.environ.get(
+    "CPPMEGA_TE_MXFP8_NORM_TRANSPOSE_EMIT_BRIDGE", "0"
+) == "1"
 _te_mxfp8_compact_columnwise_backward = os.environ.get(
     "CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD", "0"
 ) == "1"
@@ -2149,6 +2152,7 @@ if (
             ):
                 if (
                     _te_mxfp8_bwd_tn_adapter
+                    and _te_mxfp8_norm_transpose_emit_bridge
                     and isinstance(output_quantizer, _TE_MXFP8Quantizer)
                     and _te_mxfp8_transpose_emit_backend in ("auto", "te")
                 ):
@@ -2261,6 +2265,7 @@ if (
             f"mxfp8_bwd_tn_adapter={_te_mxfp8_bwd_tn_adapter}, "
             f"mxfp8_transpose_emit_backend={_te_mxfp8_transpose_emit_backend}, "
             f"mxfp8_transpose_emit_swizzled={_te_mxfp8_transpose_emit_swizzled}, "
+            f"mxfp8_norm_transpose_emit_bridge={_te_mxfp8_norm_transpose_emit_bridge}, "
             f"mxfp8_compact_columnwise_backward={_te_mxfp8_compact_columnwise_backward}, "
             f"mxfp8_grouped_direct_backward={_te_mxfp8_grouped_direct_backward}, "
             f"mxfp8_bwd_allow_bf16_fallback={_te_mxfp8_bwd_allow_bf16_fallback}, "

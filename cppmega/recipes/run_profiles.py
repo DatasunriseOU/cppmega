@@ -121,6 +121,10 @@ class PrecisionProfile:
     mxfp8_transpose_emit_backend: Mxfp8TransposeEmitBackend = "te"
     mxfp8_transpose_emit_swizzled: bool = True
     mxfp8_transpose_emit_strict: bool = True
+    # Keep this off by default: forcing all quantized norm outputs through a
+    # high-precision bridge has hung prior GB10 runs. Producer-side TE patches
+    # should create saved operands where high-precision sources already exist.
+    mxfp8_norm_transpose_emit_bridge: bool = False
     # Experimental dense Linear backward mode: TE saves original compact
     # columnwise MXFP8 operands and lets the cppmega compact-direct backend
     # read them directly.  This removes the dense rowwise-transpose copies, but
@@ -206,7 +210,7 @@ class RuntimePatchProfile:
     # The GB10 FA4/TE fixes are source-tree patches, not installed PyPI wheels;
     # without these roots first on PYTHONPATH the process can import a mixed
     # flash-attn package and silently miss the SM120 guard/fallback fixes.
-    transformer_engine_source: str | None = "/home/dave/TransformerEngine"
+    transformer_engine_source: str | None = "/home/dave/TransformerEngine-wave6-swizzled-producer"
     flash_attention_source: str | None = "/home/dave/flash-attention-fa4"
 
 
@@ -589,6 +593,9 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                 "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT": _bool(
                     profile.precision.mxfp8_transpose_emit_strict
                 ),
+                "CPPMEGA_TE_MXFP8_NORM_TRANSPOSE_EMIT_BRIDGE": _bool(
+                    profile.precision.mxfp8_norm_transpose_emit_bridge
+                ),
                 "CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD": _bool(
                     profile.precision.mxfp8_compact_columnwise_backward
                 ),
@@ -674,6 +681,10 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.precision.mxfp8_transpose_emit_swizzled = args.mxfp8_transpose_emit_swizzled
     if args.mxfp8_transpose_emit_strict is not None:
         profile.precision.mxfp8_transpose_emit_strict = args.mxfp8_transpose_emit_strict
+    if args.mxfp8_norm_transpose_emit_bridge is not None:
+        profile.precision.mxfp8_norm_transpose_emit_bridge = (
+            args.mxfp8_norm_transpose_emit_bridge
+        )
     if args.mxfp8_compact_columnwise_backward is not None:
         profile.precision.mxfp8_compact_columnwise_backward = (
             args.mxfp8_compact_columnwise_backward
@@ -889,6 +900,23 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         default=None,
         dest="mxfp8_transpose_emit_strict",
+    )
+    norm_emit_bridge = parser.add_mutually_exclusive_group()
+    norm_emit_bridge.add_argument(
+        "--mxfp8-norm-transpose-emit-bridge",
+        action="store_true",
+        default=None,
+        dest="mxfp8_norm_transpose_emit_bridge",
+        help=(
+            "Experimental: force quantized norm outputs through a high-precision "
+            "bridge so TE can attach MXFP8 rowwise-transpose sidecars."
+        ),
+    )
+    norm_emit_bridge.add_argument(
+        "--no-mxfp8-norm-transpose-emit-bridge",
+        action="store_false",
+        default=None,
+        dest="mxfp8_norm_transpose_emit_bridge",
     )
     compact_columnwise_backward = parser.add_mutually_exclusive_group()
     compact_columnwise_backward.add_argument(
