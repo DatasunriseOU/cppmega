@@ -32,8 +32,14 @@ GROUPED_DIRECT_STAT_KEYS = (
     "mxfp8_grouped_direct_wgrad",
     "mxfp8_grouped_direct_miss_dgrad",
     "mxfp8_grouped_direct_miss_wgrad",
+    "mxfp8_grouped_gemm_ready_dgrad",
+    "mxfp8_grouped_gemm_ready_wgrad",
+    "mxfp8_grouped_gemm_ready_miss_dgrad",
+    "mxfp8_grouped_gemm_ready_miss_wgrad",
     "mxfp8_grouped_transpose_copy_fallback_dgrad",
     "mxfp8_grouped_transpose_copy_fallback_wgrad",
+    "mxfp8_dense_gemm_ready_dgrad",
+    "mxfp8_dense_gemm_ready_wgrad",
     "mxfp8_dense_copy_fallback_dgrad",
     "mxfp8_dense_copy_fallback_wgrad",
 )
@@ -43,8 +49,11 @@ MATERIALIZATION_STAT_KEYS = (
     "mxfp8_tn_adapter_saved_transpose_operand",
     "mxfp8_tn_adapter_te_emit_swizzled",
     "mxfp8_tn_adapter_te_emit_swizzled_unavailable",
+    "mxfp8_dense_grad_output_transpose_emit",
+    "mxfp8_dense_grad_output_transpose_emit_failed",
     "mxfp8_tn_adapter_copy_transpose",
     "mxfp8_tn_adapter_missing_sidecar_copy",
+    "mxfp8_tn_adapter_missing_sidecar_strict",
     "mxfp8_norm_quantize_sidecar_bridge",
 )
 SIDECAR_LIVE_ZERO_KEYS = (
@@ -322,6 +331,7 @@ def _build_mxfp8_copy_breakdown(text: str, counters: dict[str, int]) -> dict[str
             "mxfp8_grouped_flashinfer_dgrad",
             "mxfp8_flashinfer_grouped_dgrad",
             "mxfp8_grouped_direct_dgrad",
+            "mxfp8_grouped_gemm_ready_dgrad",
         )
     )
     grouped_wgrad_direct_hits = sum(
@@ -332,6 +342,7 @@ def _build_mxfp8_copy_breakdown(text: str, counters: dict[str, int]) -> dict[str
             "mxfp8_grouped_flashinfer_wgrad",
             "mxfp8_flashinfer_grouped_wgrad",
             "mxfp8_grouped_direct_wgrad",
+            "mxfp8_grouped_gemm_ready_wgrad",
         )
     )
 

@@ -414,6 +414,45 @@ def tn_gemm_swizzled_scale(
     )
 
 
+def swizzle_rowwise_scale(
+    rowwise_scale_inv: torch.Tensor,
+    rows: int,
+    cols: int,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Pack compact rowwise MXFP8 scales into CUTLASS SM120 GEMM layout."""
+
+    rows = int(rows)
+    cols = int(cols)
+    if rows <= 0 or cols <= 0 or rows % 128 or cols % 128:
+        raise ValueError(
+            f"MXFP8 scale swizzle requires positive 128-multiple rows/cols, got {rows}x{cols}"
+        )
+    if rowwise_scale_inv.dtype != torch.uint8:
+        raise TypeError(f"rowwise_scale_inv must be uint8, got {rowwise_scale_inv.dtype}")
+    if rowwise_scale_inv.dim() != 2:
+        raise ValueError("rowwise_scale_inv must be 2D compact rowwise scales")
+    expected = rows * (cols // 32)
+    if out is None:
+        out = torch.empty((expected,), device=rowwise_scale_inv.device, dtype=torch.uint8)
+    else:
+        if out.dtype != torch.uint8:
+            raise TypeError(f"out must be uint8, got {out.dtype}")
+        if out.device != rowwise_scale_inv.device:
+            raise ValueError("out must be on the same device as rowwise_scale_inv")
+        if out.dim() != 1 or out.numel() < expected:
+            raise ValueError(f"out must be 1D with at least {expected} elements")
+    ext = _load_cuda_ext()
+    ext.swizzle_rowwise_scale(
+        _as_uint8_contiguous(rowwise_scale_inv),
+        out,
+        rows,
+        cols,
+    )
+    return out
+
+
 def _tn_gemm_swizzled_scale_strided(
     a_rowwise_data: torch.Tensor,
     a_gemm_scale_inv: torch.Tensor,

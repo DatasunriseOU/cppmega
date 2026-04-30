@@ -25,6 +25,21 @@ at::Tensor qmuon_update_multi_with_group_sumsq_cuda_(
     double beta,
     bool unsigned_storage);
 
+at::Tensor qmuon_update_with_sumsq_no_grad_cuda_(
+    at::Tensor q,
+    at::Tensor absmax,
+    at::Tensor grad,
+    double beta,
+    bool unsigned_storage);
+
+void qmuon_emit_mxfp8_carrier_from_quantized_cuda_(
+    at::Tensor q,
+    at::Tensor absmax,
+    at::Tensor rowwise_data,
+    at::Tensor rowwise_scale,
+    at::Tensor inv_norm,
+    bool unsigned_storage);
+
 void qmuon_scale_multi_by_group_cuda_(
     std::vector<at::Tensor> grad_tensors,
     at::Tensor block_group_ids,
@@ -49,6 +64,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "update_multi_with_group_sumsq_",
       &qmuon_update_multi_with_group_sumsq_cuda_,
       "Blockwise quantized Muon momentum update plus grouped sumsq for sliced NS normalization");
+  m.def(
+      "update_with_sumsq_no_grad_",
+      &qmuon_update_with_sumsq_no_grad_cuda_,
+      "Blockwise quantized Muon momentum update plus per-block sumsq without writing grad scratch");
+  m.def(
+      "emit_mxfp8_carrier_from_quantized_",
+      &qmuon_emit_mxfp8_carrier_from_quantized_cuda_,
+      "Emit rowwise MXFP8 carrier payload/scales from quantized Muon momentum");
   m.def(
       "scale_multi_by_group_",
       &qmuon_scale_multi_by_group_cuda_,

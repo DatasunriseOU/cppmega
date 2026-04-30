@@ -51,6 +51,7 @@ void grouped_mxfp8_wgrad_nt_ptrs_cuda(
     bool accumulate,
     double alpha,
     double beta,
+    int64_t total_rows,
     int64_t n,
     int64_t k);
 

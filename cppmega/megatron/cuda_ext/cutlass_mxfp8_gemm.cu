@@ -499,6 +499,25 @@ __device__ __forceinline__ int64_t rowwise_gemm_swizzled_scale_offset(
           row_group) * 4 + k_lane;
 }
 
+__global__ void swizzle_rowwise_scale_kernel(
+    uint8_t const* __restrict__ rowwise_scale,
+    uint8_t* __restrict__ output_swizzled_scale,
+    int rows,
+    int cols,
+    int scale_ld) {
+  int k_blocks = cols / 32;
+  int64_t total = static_cast<int64_t>(rows) * k_blocks;
+  int64_t thread = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (int64_t idx = thread; idx < total; idx += stride) {
+    int row = static_cast<int>(idx / k_blocks);
+    int k_block = static_cast<int>(idx - static_cast<int64_t>(row) * k_blocks);
+    int64_t src = static_cast<int64_t>(row) * scale_ld + k_block;
+    int64_t dst = rowwise_gemm_swizzled_scale_offset(row, k_block, rows, cols);
+    output_swizzled_scale[dst] = rowwise_scale[src];
+  }
+}
+
 __global__ void prepare_wgrad_stock_a_tile_kernel(
     uint8_t const* __restrict__ dy_colwise,
     uint8_t const* __restrict__ dy_colwise_scale,
@@ -1008,6 +1027,53 @@ at::Tensor cutlass_mxfp8_tn_gemm_swizzled_scale_strided_cuda(
       A_u8, SFA_u8, B_u8, SFB_u8, m, n, k, D,
       out_offset, out_ld,
       alpha_f, beta_f, stream);
+#endif
+}
+
+void cutlass_mxfp8_swizzle_rowwise_scale_cuda(
+    at::Tensor rowwise_scale_u8,
+    at::Tensor output_swizzled_scale_u8,
+    int64_t rows64,
+    int64_t cols64) {
+#if !defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) && !defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  TORCH_CHECK(false, "CUTLASS SM120/SM121 MXFP8 scale swizzle kernel was not compiled for this architecture");
+#else
+  TORCH_CHECK(rows64 > 0 && cols64 > 0, "rows and cols must be positive");
+  TORCH_CHECK(rows64 <= INT_MAX && cols64 <= INT_MAX, "rows/cols exceed int");
+  int rows = static_cast<int>(rows64);
+  int cols = static_cast<int>(cols64);
+  TORCH_CHECK(rows % 128 == 0 && cols % 128 == 0,
+              "MXFP8 scale swizzle requires row and K dimensions that are multiples of 128, got ",
+              rows, "x", cols);
+  CHECK_CUDA(rowwise_scale_u8);
+  CHECK_CUDA(output_swizzled_scale_u8);
+  CHECK_CONTIGUOUS(rowwise_scale_u8);
+  CHECK_CONTIGUOUS(output_swizzled_scale_u8);
+  CHECK_UINT8(rowwise_scale_u8);
+  CHECK_UINT8(output_swizzled_scale_u8);
+  TORCH_CHECK(rowwise_scale_u8.dim() == 2, "rowwise_scale_u8 must be 2D compact scales");
+  int k_blocks = cols / 32;
+  int scale_ld = static_cast<int>(rowwise_scale_u8.size(1));
+  TORCH_CHECK(rowwise_scale_u8.size(0) >= rows && scale_ld >= k_blocks,
+              "rowwise_scale_u8 is too small for requested logical matrix");
+  int64_t expected = static_cast<int64_t>(rows) * k_blocks;
+  TORCH_CHECK(output_swizzled_scale_u8.dim() == 1 &&
+                  output_swizzled_scale_u8.numel() >= expected,
+              "output_swizzled_scale_u8 must be a 1D tensor with at least ",
+              expected, " elements");
+
+  c10::cuda::CUDAGuard device_guard(rowwise_scale_u8.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  int threads = 256;
+  int64_t blocks64 = (expected + threads - 1) / threads;
+  int blocks = static_cast<int>(blocks64 > 1024 ? 1024 : blocks64);
+  swizzle_rowwise_scale_kernel<<<blocks, threads, 0, stream>>>(
+      rowwise_scale_u8.data_ptr<uint8_t>(),
+      output_swizzled_scale_u8.data_ptr<uint8_t>(),
+      rows,
+      cols,
+      scale_ld);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 #endif
 }
 

@@ -233,6 +233,21 @@ class TestCutlassMxfp8Gemm:
         torch.testing.assert_close(swizzled, compact, rtol=0, atol=0)
         assert _rel_l2(swizzled, x_ref @ w_ref.t()) < 0.15
 
+    def test_cutlass_swizzle_rowwise_scale_matches_cpu_layout(self) -> None:
+        """CUDA helper packs compact rowwise scales into the stock GEMM layout."""
+
+        from cppmega.megatron import cutlass_mxfp8_gemm as cutlass
+
+        device = torch.device("cuda")
+        m = k = 128
+        _, xq = _make_mxfp8_tensor(m, k, device)
+        expected = _swizzle_rowwise_scale_cpu(xq._rowwise_scale_inv, m, k).reshape(-1)
+
+        actual = cutlass.swizzle_rowwise_scale(xq._rowwise_scale_inv, m, k)
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_mixed_wgrad_accepts_saved_x_rowwise_transpose(self) -> None:
         """wgrad direct path can consume saved ``x.T`` without a dense copy."""
 

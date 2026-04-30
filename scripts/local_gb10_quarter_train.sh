@@ -33,6 +33,7 @@ export CPPMEGA_DSA_A_LAYER_RANKS="${CPPMEGA_DSA_A_LAYER_RANKS:-1,2,3}"
 export CPPMEGA_NGRAM_HASH_ENABLED="${CPPMEGA_NGRAM_HASH_ENABLED:-1}"
 export CPPMEGA_STRUCTURE_ENABLED="${CPPMEGA_STRUCTURE_ENABLED:-1}"
 export CPPMEGA_STRUCTURE_COMPONENTS="${CPPMEGA_STRUCTURE_COMPONENTS:-core}"
+export CPPMEGA_CCE_FILTER_EPS="${CPPMEGA_CCE_FILTER_EPS:-none}"
 export CPPMEGA_MAMBA3_MIMO="${CPPMEGA_MAMBA3_MIMO:-1}"
 export CPPMEGA_MAMBA_NUM_GROUPS="${CPPMEGA_MAMBA_NUM_GROUPS:-8}"
 export CPPMEGA_MAMBA_RECOMPUTE="${CPPMEGA_MAMBA_RECOMPUTE:-1}"
@@ -99,11 +100,13 @@ fi
 export CPPMEGA_MUON_MOMENTUM="${CPPMEGA_MUON_MOMENTUM:-0.95}"
 export CPPMEGA_MUON_SCALE_MODE="${CPPMEGA_MUON_SCALE_MODE:-spectral}"
 export CPPMEGA_MUON_NUM_NS_STEPS="${CPPMEGA_MUON_NUM_NS_STEPS:-3}"
+export CPPMEGA_MUON_NS_CARRIER="${CPPMEGA_MUON_NS_CARRIER:-bf16}"
 export CPPMEGA_MUON_TP_MODE="${CPPMEGA_MUON_TP_MODE:-blockwise}"
 export CPPMEGA_MUON_SCALAR_OPTIMIZER="${CPPMEGA_MUON_SCALAR_OPTIMIZER:-adam8bit}"
 export CPPMEGA_MUON_QUANTIZED_MOMENTUM="${CPPMEGA_MUON_QUANTIZED_MOMENTUM:-1}"
 export CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE="${CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE:-int8}"
 export CPPMEGA_MUON_QUANTIZED_MOMENTUM_BLOCK_SIZE="${CPPMEGA_MUON_QUANTIZED_MOMENTUM_BLOCK_SIZE:-256}"
+export CPPMEGA_MUON_DTYPE_AUDIT="${CPPMEGA_MUON_DTYPE_AUDIT:-0}"
 export CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER="${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER:-1}"
 export CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER="${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER:-1}"
 export CPPMEGA_GRAD_REDUCE_IN_BF16="${CPPMEGA_GRAD_REDUCE_IN_BF16:-1}"
@@ -270,6 +273,14 @@ from cppmega.megatron.moe_dispatcher_patch import apply_moe_dispatcher_identity_
 apply_dsa_indexer_fused_patch()
 apply_moe_dispatcher_identity_sort_patch()
 patch_mamba_output_layer_with_linear_ce()
+if os.environ.get("CPPMEGA_MUON_DTYPE_AUDIT", "0") == "1":
+    from cppmega.megatron.muon_dtype_audit import (
+        MuonDtypeAuditConfig,
+        install_muon_dtype_audit,
+    )
+
+    install_muon_dtype_audit(MuonDtypeAuditConfig(enabled=True, log_at_exit=True))
+    print("[local_quarter_shim] Muon dtype audit installed", file=sys.stderr)
 print("[local_quarter_shim] full GB10 training patches installed", file=sys.stderr)
 
 
@@ -679,8 +690,8 @@ echo "[local-quarter] sparse_mla_fp8_quant=${CPPMEGA_SPARSE_MLA_FP8_QUANT} dsa_f
 echo "[local-quarter] attention_backend=${CPPMEGA_ATTN_BACKEND} use_flash_attn=${CPPMEGA_USE_FLASH_ATTN}"
 echo "[local-quarter] extra_pythonpath=${CPPMEGA_EXTRA_PYTHONPATH:-}"
 echo "[local-quarter] moe_dispatcher=${CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE} moe_flex_backend=${CPPMEGA_MOE_FLEX_DISPATCHER_BACKEND}"
-echo "[local-quarter] mtp_depths=${MTP_DEPTHS} mtp_ce_kernel=${CPPMEGA_MTP_CE_KERNEL}"
-echo "[local-quarter] optimizer=${CPPMEGA_OPTIMIZER} param_storage=${CPPMEGA_PARAM_STORAGE} muon_scalar=${CPPMEGA_MUON_SCALAR_OPTIMIZER} muon_ns_steps=${CPPMEGA_MUON_NUM_NS_STEPS}"
+echo "[local-quarter] mtp_depths=${MTP_DEPTHS} mtp_ce_kernel=${CPPMEGA_MTP_CE_KERNEL} cce_filter_eps=${CPPMEGA_CCE_FILTER_EPS}"
+echo "[local-quarter] optimizer=${CPPMEGA_OPTIMIZER} param_storage=${CPPMEGA_PARAM_STORAGE} muon_scalar=${CPPMEGA_MUON_SCALAR_OPTIMIZER} muon_ns_steps=${CPPMEGA_MUON_NUM_NS_STEPS} muon_ns_carrier=${CPPMEGA_MUON_NS_CARRIER} muon_dtype_audit=${CPPMEGA_MUON_DTYPE_AUDIT}"
 echo "[local-quarter] no_master_emerging=${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER} no_master_fallback=${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER} grad_reduce_bf16=${CPPMEGA_GRAD_REDUCE_IN_BF16}"
 echo "[local-quarter] dist_optimizer=${CPPMEGA_USE_DISTRIBUTED_OPTIMIZER} precision_aware=${CPPMEGA_USE_PRECISION_AWARE_OPTIMIZER}"
 echo "[local-quarter] fp8_param_gather=${CPPMEGA_FP8_PARAM_GATHER:-0} reuse_grad_buf_for_mxfp8_param_ag=${CPPMEGA_REUSE_GRAD_BUF_FOR_MXFP8_PARAM_AG:-1}"

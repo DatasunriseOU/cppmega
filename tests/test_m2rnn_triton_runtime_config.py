@@ -11,6 +11,8 @@ def test_runtime_config_honors_env_changes_after_import(monkeypatch):
     monkeypatch.delenv("CPPMEGA_M2RNN_FWD_AUTOTUNE", raising=False)
     monkeypatch.delenv("CPPMEGA_M2RNN_FWD_NUM_WARPS", raising=False)
     monkeypatch.delenv("CPPMEGA_M2RNN_FWD_NUM_STAGES", raising=False)
+    monkeypatch.delenv("CPPMEGA_M2RNN_BROADCAST_VIEWS", raising=False)
+    monkeypatch.delenv("CPPMEGA_M2RNN_BWD_REDUCE_BROADCAST_QK", raising=False)
     _mod.reset_m2rnn_runtime_config_cache()
 
     default_config = _mod.get_m2rnn_runtime_config()
@@ -19,12 +21,16 @@ def test_runtime_config_honors_env_changes_after_import(monkeypatch):
     assert default_config.fwd_autotune is False
     assert default_config.fwd_num_warps == 4
     assert default_config.fwd_num_stages == 3
+    assert default_config.broadcast_views is True
+    assert default_config.bwd_reduce_broadcast_qk is False
 
     monkeypatch.setenv("CPPMEGA_M2RNN_SAVE_HNEW", "1")
     monkeypatch.setenv("CPPMEGA_M2RNN_BWD_CHUNK_SIZE", "8")
     monkeypatch.setenv("CPPMEGA_M2RNN_FWD_AUTOTUNE", "1")
     monkeypatch.setenv("CPPMEGA_M2RNN_FWD_NUM_WARPS", "8")
     monkeypatch.setenv("CPPMEGA_M2RNN_FWD_NUM_STAGES", "2")
+    monkeypatch.setenv("CPPMEGA_M2RNN_BROADCAST_VIEWS", "0")
+    monkeypatch.setenv("CPPMEGA_M2RNN_BWD_REDUCE_BROADCAST_QK", "0")
 
     updated_config = _mod.get_m2rnn_runtime_config()
     assert updated_config.save_hnew is True
@@ -32,6 +38,8 @@ def test_runtime_config_honors_env_changes_after_import(monkeypatch):
     assert updated_config.fwd_autotune is True
     assert updated_config.fwd_num_warps == 8
     assert updated_config.fwd_num_stages == 2
+    assert updated_config.broadcast_views is False
+    assert updated_config.bwd_reduce_broadcast_qk is False
 
 
 def test_runtime_config_cache_can_be_reset(monkeypatch):
@@ -151,3 +159,45 @@ def test_runtime_config_parses_forward_launch_env_values(
     assert config.fwd_autotune is expected_autotune
     assert config.fwd_num_warps == expected_warps
     assert config.fwd_num_stages == expected_stages
+
+
+@pytest.mark.parametrize(
+    ("views_raw", "expected_views"),
+    [
+        (None, True),
+        ("1", True),
+        ("0", False),
+        ("true", False),
+    ],
+)
+@pytest.mark.parametrize(
+    ("reduce_raw", "expected_reduce"),
+    [
+        (None, False),
+        ("1", True),
+        ("0", False),
+        ("true", False),
+    ],
+)
+def test_runtime_config_parses_broadcast_env_values(
+    monkeypatch,
+    views_raw,
+    expected_views,
+    reduce_raw,
+    expected_reduce,
+):
+    import cppmega.megatron.m2rnn_triton as _mod
+
+    if views_raw is None:
+        monkeypatch.delenv("CPPMEGA_M2RNN_BROADCAST_VIEWS", raising=False)
+    else:
+        monkeypatch.setenv("CPPMEGA_M2RNN_BROADCAST_VIEWS", views_raw)
+    if reduce_raw is None:
+        monkeypatch.delenv("CPPMEGA_M2RNN_BWD_REDUCE_BROADCAST_QK", raising=False)
+    else:
+        monkeypatch.setenv("CPPMEGA_M2RNN_BWD_REDUCE_BROADCAST_QK", reduce_raw)
+
+    _mod.reset_m2rnn_runtime_config_cache()
+    config = _mod.get_m2rnn_runtime_config()
+    assert config.broadcast_views is expected_views
+    assert config.bwd_reduce_broadcast_qk is expected_reduce

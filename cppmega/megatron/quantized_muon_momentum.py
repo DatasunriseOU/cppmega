@@ -1,8 +1,9 @@
 """Prototype quantized Muon momentum storage.
 
-This module intentionally stops at the momentum-buffer boundary.  It does not
-wire into Megatron optimizers; callers can feed the returned bf16 scratch into
-the existing low-memory Newton-Schulz path.
+This module intentionally keeps production qMuon behavior explicit.  The
+standard optimizer path can feed the returned low-precision scratch into the
+existing Newton-Schulz path, while the MXFP8 carrier helpers are opt-in probe
+APIs for measuring a non-BF16 Newton-Schulz carrier.
 """
 
 from __future__ import annotations
@@ -42,6 +43,22 @@ class QuantizedMuonMomentum:
     @property
     def unsigned(self) -> bool:
         return self.data.dtype == torch.uint8
+
+
+@dataclass(frozen=True)
+class QuantizedMuonMxfp8Carrier:
+    """Rowwise MXFP8 payload emitted from quantized Muon momentum.
+
+    `rowwise_data` contains raw E4M3 bytes with the same logical 2D shape as the
+    source tensor. `rowwise_scale_inv` contains compact E8M0 block-scale bytes,
+    one per 32 consecutive values along the last dimension.  The byte stores the
+    scale exponent used for dequantization by MXFP8 GEMM kernels.
+    """
+
+    rowwise_data: torch.Tensor
+    rowwise_scale_inv: torch.Tensor
+    rows: int
+    cols: int
 
 
 @dataclass(frozen=True)
@@ -194,6 +211,24 @@ def empty_quantized_momentum_like(
     return QuantizedMuonMomentum(data=data, absmax=absmax, block_size=block_size)
 
 
+def empty_mxfp8_carrier_like(tensor: torch.Tensor) -> QuantizedMuonMxfp8Carrier:
+    """Allocate rowwise MXFP8 carrier storage for a 2D Muon tensor."""
+
+    if tensor.ndim != 2:
+        raise ValueError(f"MXFP8 Muon carrier requires a 2D tensor, got {tensor.ndim}D")
+    rows, cols = int(tensor.shape[0]), int(tensor.shape[1])
+    if cols % 32 != 0:
+        raise ValueError(f"MXFP8 Muon carrier requires cols divisible by 32, got {cols}")
+    rowwise_data = torch.empty((rows, cols), device=tensor.device, dtype=torch.uint8)
+    rowwise_scale_inv = torch.empty((rows, cols // 32), device=tensor.device, dtype=torch.uint8)
+    return QuantizedMuonMxfp8Carrier(
+        rowwise_data=rowwise_data,
+        rowwise_scale_inv=rowwise_scale_inv,
+        rows=rows,
+        cols=cols,
+    )
+
+
 def dequantize_momentum(
     state: QuantizedMuonMomentum,
     *,
@@ -212,6 +247,30 @@ def dequantize_momentum(
     block_ids = torch.arange(flat.numel(), device=flat.device, dtype=torch.long) // state.block_size
     values = q.to(torch.float32) * (state.absmax[block_ids] / QMAX)
     return values.reshape_as(state.data).to(dtype)
+
+
+def dequantize_mxfp8_carrier(
+    carrier: QuantizedMuonMxfp8Carrier,
+    *,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Dequantize a rowwise MXFP8 carrier with torch ops for tests/probes."""
+
+    _validate_mxfp8_carrier(carrier)
+    if not hasattr(torch, "float8_e4m3fn"):
+        raise RuntimeError("torch.float8_e4m3fn is required to dequantize MXFP8 carriers")
+    fp8_values = carrier.rowwise_data.view(torch.float8_e4m3fn).to(torch.float32)
+    scale_exp = carrier.rowwise_scale_inv.to(torch.int16)
+    scales = torch.where(
+        scale_exp == 0,
+        torch.zeros_like(scale_exp, dtype=torch.float32),
+        torch.pow(
+            torch.full_like(scale_exp, 2, dtype=torch.float32),
+            scale_exp.to(torch.float32) - 127.0,
+        ),
+    )
+    scale_values = torch.repeat_interleave(scales, 32, dim=1)[:, : carrier.cols]
+    return (fp8_values * scale_values).to(dtype)
 
 
 def quantize_momentum_(
@@ -317,6 +376,63 @@ def quantized_muon_momentum_update_multi_(
     for state, grad in zip(states, grads):
         quantized_muon_momentum_update_(state, grad, beta=beta, scratch=grad)
     return grads
+
+
+def quantized_muon_momentum_update_mxfp8_carrier_(
+    state: QuantizedMuonMomentum,
+    grad: torch.Tensor,
+    carrier: QuantizedMuonMxfp8Carrier,
+    *,
+    beta: float,
+    eps: float = 1e-7,
+    normalize: bool = True,
+) -> torch.Tensor:
+    """Update qMuon state and emit normalized rowwise MXFP8 carrier storage.
+
+    This probe path does not write the updated momentum into ``grad`` and does
+    not allocate a BF16 scratch tensor.  It uses FP32 per-256-value block sums to
+    compute the Frobenius norm, then emits the quantized state as an MXFP8
+    carrier scaled by the reciprocal norm.  The returned scalar tensor is the
+    inverse norm used for carrier emission.
+    """
+
+    _validate_update_inputs(state, grad, beta, scratch=None)
+    _validate_mxfp8_carrier(carrier)
+    if grad.shape != carrier.rowwise_data.shape:
+        raise ValueError(
+            f"grad shape {tuple(grad.shape)} must match carrier shape "
+            f"{tuple(carrier.rowwise_data.shape)}"
+        )
+    if grad.ndim != 2:
+        raise ValueError(f"MXFP8 Muon carrier update requires a 2D grad, got {grad.ndim}D")
+    if not grad.is_cuda:
+        raise RuntimeError("MXFP8 Muon carrier update currently requires CUDA tensors")
+    if not _can_use_cuda_ext([state], [grad]):
+        raise RuntimeError("MXFP8 Muon carrier update requires the CUDA extension")
+    if eps <= 0.0:
+        raise ValueError(f"eps must be positive, got {eps}")
+
+    ext = _load_cuda_ext()
+    partial_sumsq = ext.update_with_sumsq_no_grad_(
+        state.data,
+        state.absmax,
+        grad,
+        float(beta),
+        bool(state.unsigned),
+    )
+    if normalize:
+        inv_norm = partial_sumsq.sum().clamp_min(eps * eps).rsqrt()
+    else:
+        inv_norm = torch.ones((), device=grad.device, dtype=torch.float32)
+    ext.emit_mxfp8_carrier_from_quantized_(
+        state.data,
+        state.absmax,
+        carrier.rowwise_data,
+        carrier.rowwise_scale_inv,
+        inv_norm,
+        bool(state.unsigned),
+    )
+    return inv_norm
 
 
 def quantized_muon_momentum_update_multi_with_sumsq_(
@@ -602,6 +718,34 @@ def _validate_update_inputs(
             raise ValueError(f"scratch must be bfloat16, got {scratch.dtype}")
         if not scratch.is_contiguous():
             raise ValueError("scratch must be contiguous for the prototype Triton kernel")
+
+
+def _validate_mxfp8_carrier(carrier: QuantizedMuonMxfp8Carrier) -> None:
+    if carrier.rows <= 0 or carrier.cols <= 0:
+        raise ValueError(f"carrier rows/cols must be positive, got {carrier.rows}x{carrier.cols}")
+    if carrier.cols % 32 != 0:
+        raise ValueError(f"carrier cols must be divisible by 32, got {carrier.cols}")
+    if carrier.rowwise_data.shape != (carrier.rows, carrier.cols):
+        raise ValueError(
+            "carrier.rowwise_data must have shape "
+            f"({carrier.rows}, {carrier.cols}), got {tuple(carrier.rowwise_data.shape)}"
+        )
+    expected_scale_shape = (carrier.rows, carrier.cols // 32)
+    if carrier.rowwise_scale_inv.shape != expected_scale_shape:
+        raise ValueError(
+            f"carrier.rowwise_scale_inv must have shape {expected_scale_shape}, "
+            f"got {tuple(carrier.rowwise_scale_inv.shape)}"
+        )
+    if carrier.rowwise_data.dtype != torch.uint8:
+        raise ValueError(f"carrier.rowwise_data must be uint8, got {carrier.rowwise_data.dtype}")
+    if carrier.rowwise_scale_inv.dtype != torch.uint8:
+        raise ValueError(
+            f"carrier.rowwise_scale_inv must be uint8, got {carrier.rowwise_scale_inv.dtype}"
+        )
+    if carrier.rowwise_data.device != carrier.rowwise_scale_inv.device:
+        raise ValueError("carrier payload and scale tensors must be on the same device")
+    if not carrier.rowwise_data.is_contiguous() or not carrier.rowwise_scale_inv.is_contiguous():
+        raise ValueError("carrier payload and scale tensors must be contiguous")
 
 
 def _validate_multi_update(

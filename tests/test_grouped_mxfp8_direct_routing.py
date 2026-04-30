@@ -18,14 +18,20 @@ class _FakeMXFP8Tensor:
         self._with_gemm_swizzled_scales = False
 
 
-def _fresh_grouped_shim(monkeypatch):
+def _fresh_grouped_shim(monkeypatch, *, grouped_direct: bool = False):
     for key in (
         "CPPMEGA_TE_MXFP8_DGRAD_BF16",
         "CPPMEGA_TE_MXFP8_WGRAD_BF16",
         "NVTE_BACKWARD_OVERRIDE",
+        "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD",
+        "CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD",
     ):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER", "1")
+    monkeypatch.setenv(
+        "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD",
+        "1" if grouped_direct else "0",
+    )
     monkeypatch.setenv("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND", "off")
     monkeypatch.setenv("CPPMEGA_TE_VERSION_STRICT", "0")
     monkeypatch.setattr(atexit, "register", lambda func, *args, **kwargs: func)
@@ -63,8 +69,72 @@ def _wrap_fake_grouped_module(shim):
     return module, orig_calls
 
 
+def _mark_rowwise_transpose(tensor):
+    tensor._te_rowwise_transpose_for_backward_operand = True
+    return tensor
+
+
+@pytest.mark.parametrize(
+    ("layout", "op_kind", "mark_a", "mark_b"),
+    [
+        ("NN", "dgrad", True, False),
+        ("NT", "wgrad", True, True),
+    ],
+)
+def test_grouped_mxfp8_gemm_ready_route_uses_existing_operands_without_copy(
+    monkeypatch,
+    layout,
+    op_kind,
+    mark_a,
+    mark_b,
+):
+    shim = _fresh_grouped_shim(monkeypatch, grouped_direct=False)
+    _reset_bwd_stats(shim)
+
+    def fail_copy_bridge(*_args, **_kwargs):
+        raise AssertionError("GEMM-ready grouped path used the transpose-copy bridge")
+
+    monkeypatch.setattr(
+        shim,
+        "_cppmega_mxfp8_colwise_as_rowwise_transpose",
+        fail_copy_bridge,
+    )
+
+    module, orig_calls = _wrap_fake_grouped_module(shim)
+    A = [_FakeMXFP8Tensor(f"{layout}-A0"), _FakeMXFP8Tensor(f"{layout}-A1")]
+    B = [_FakeMXFP8Tensor(f"{layout}-B0"), _FakeMXFP8Tensor(f"{layout}-B1")]
+    if mark_a:
+        A = [_mark_rowwise_transpose(item) for item in A]
+    if mark_b:
+        B = [_mark_rowwise_transpose(item) for item in B]
+
+    result = module.general_grouped_gemm(
+        A,
+        B,
+        object(),
+        "splits",
+        layout=layout,
+        grad=True,
+    )
+
+    assert result == "fallback-result"
+    assert len(orig_calls) == 1
+    call_A, call_B, _out, call_args, call_kwargs = orig_calls[0]
+    assert call_A == A
+    assert call_B == B
+    assert call_args == ("splits",)
+    assert call_kwargs["layout"] == "TN"
+    assert call_kwargs["use_split_accumulator"] is False
+
+    stats = shim.cppmega_te_mxfp8_bwd_stats
+    assert stats[f"mxfp8_grouped_gemm_ready_{op_kind}"] == 1
+    assert stats[f"mxfp8_grouped_gemm_ready_miss_{op_kind}"] == 0
+    assert stats[f"mxfp8_grouped_transpose_copy_fallback_{op_kind}"] == 0
+    assert stats["mxfp8_tn_adapter_copy_transpose"] == 0
+
+
 def test_grouped_mxfp8_direct_hits_bypass_transpose_and_sidecars(monkeypatch):
-    shim = _fresh_grouped_shim(monkeypatch)
+    shim = _fresh_grouped_shim(monkeypatch, grouped_direct=True)
 
     def fail_sidecar_path(*_args, **_kwargs):
         raise AssertionError("direct grouped MXFP8 path touched transpose sidecars")
@@ -136,7 +206,7 @@ def test_grouped_mxfp8_direct_hits_bypass_transpose_and_sidecars(monkeypatch):
 
 
 def test_grouped_mxfp8_direct_missing_backend_api_counts_explicit_fallback(monkeypatch):
-    shim = _fresh_grouped_shim(monkeypatch)
+    shim = _fresh_grouped_shim(monkeypatch, grouped_direct=True)
     _reset_bwd_stats(shim)
 
     fake_backend = ModuleType("cppmega.megatron.grouped_mxfp8_gemm")

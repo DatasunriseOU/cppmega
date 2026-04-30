@@ -55,6 +55,7 @@ def _set_mxfp8_profile_env(backend: str | None) -> str:
     os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK", "0")
     os.environ.setdefault("CPPMEGA_TE_MXFP8_DGRAD_BF16", "0")
     os.environ.setdefault("CPPMEGA_TE_MXFP8_WGRAD_BF16", "0")
+    os.environ.setdefault("CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS", "1")
     return backend
 
 

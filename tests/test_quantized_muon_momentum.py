@@ -7,9 +7,12 @@ from cppmega.megatron.quantized_muon_momentum import (
     TRITON_AVAILABLE,
     QuantizedMuonNormSegment,
     build_quantized_muon_norm_plan,
+    dequantize_mxfp8_carrier,
     dequantize_momentum,
+    empty_mxfp8_carrier_like,
     empty_quantized_momentum_like,
     quantize_momentum_,
+    quantized_muon_momentum_update_mxfp8_carrier_,
     quantized_muon_momentum_update_multi_and_normalize_groups_,
     quantized_muon_momentum_update_multi_and_normalize_,
     quantized_muon_momentum_update_multi_with_group_sumsq_,
@@ -82,6 +85,74 @@ def test_quantized_momentum_can_reuse_grad_as_scratch():
 
     assert returned is grad
     torch.testing.assert_close(grad, expected, atol=4.0e-3, rtol=0.0)
+
+
+def test_mxfp8_carrier_layout_is_uint8_rowwise():
+    device = "cuda"
+    tensor = torch.empty((128, 256), device=device, dtype=torch.float16)
+
+    carrier = empty_mxfp8_carrier_like(tensor)
+
+    assert carrier.rowwise_data.shape == tensor.shape
+    assert carrier.rowwise_data.dtype == torch.uint8
+    assert carrier.rowwise_scale_inv.shape == (128, 8)
+    assert carrier.rowwise_scale_inv.dtype == torch.uint8
+    assert carrier.rows == 128
+    assert carrier.cols == 256
+
+
+def test_mxfp8_carrier_update_avoids_bf16_scratch_and_matches_normalized_momentum():
+    device = "cuda"
+    beta = 0.95
+    gen = torch.Generator(device=device).manual_seed(86420)
+    old_m = 0.2 * torch.randn((128, 256), device=device, dtype=torch.float16, generator=gen)
+    grad = 0.2 * torch.randn(old_m.shape, device=device, dtype=torch.float16, generator=gen)
+
+    state = empty_quantized_momentum_like(old_m)
+    quantize_momentum_(state, old_m)
+    old_dequant = dequantize_momentum(state)
+    expected_update = beta * old_dequant + (1.0 - beta) * grad.float()
+    inv_expected = expected_update.square().sum().clamp_min(1e-14).rsqrt()
+    carrier = empty_mxfp8_carrier_like(grad)
+
+    inv_norm = quantized_muon_momentum_update_mxfp8_carrier_(
+        state,
+        grad,
+        carrier,
+        beta=beta,
+    )
+    dequant = dequantize_mxfp8_carrier(carrier)
+
+    torch.testing.assert_close(inv_norm, inv_expected, rtol=2.0e-5, atol=1.0e-8)
+    diff = (dequant - expected_update * inv_expected).abs()
+    assert diff.max().item() < 2.0e-2
+    assert diff.mean().item() < 8.0e-4
+    assert carrier.rowwise_data.dtype == torch.uint8
+    assert carrier.rowwise_scale_inv.dtype == torch.uint8
+    assert grad.dtype == torch.float16
+
+
+def test_mxfp8_carrier_update_supports_rows_above_legacy_grid_y_limit():
+    device = "cuda"
+    rows = 65536
+    cols = 32
+    grad = torch.full((rows, cols), 0.125, device=device, dtype=torch.float16)
+    state = empty_quantized_momentum_like(grad)
+    carrier = empty_mxfp8_carrier_like(grad)
+
+    inv_norm = quantized_muon_momentum_update_mxfp8_carrier_(
+        state,
+        grad,
+        carrier,
+        beta=0.0,
+    )
+
+    torch.cuda.synchronize()
+    assert inv_norm.dtype == torch.float32
+    assert carrier.rowwise_data.shape == (rows, cols)
+    assert carrier.rowwise_scale_inv.shape == (rows, 1)
+    assert torch.isfinite(inv_norm).all()
+    assert bool((carrier.rowwise_data != 0).any().item())
 
 
 def test_cuda_multi_update_reuses_grads_for_several_tensors():

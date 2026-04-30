@@ -3,10 +3,12 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_fp16.h>
 #include <torch/extension.h>
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -21,6 +23,7 @@ constexpr int kWarpSize = 32;
 constexpr int kNumWarps = kThreads / kWarpSize;
 constexpr float kQMax = 127.0f;
 constexpr float kAbsmaxEps = 1e-30f;
+constexpr float kFloat8E4M3Max = 448.0f;
 
 template <typename T>
 __device__ __forceinline__ float load_value(const T* ptr, int64_t offset);
@@ -67,6 +70,24 @@ __device__ __forceinline__ int nearest_i8(float x) {
   float rounded = x >= 0.0f ? floorf(x + 0.5f) : ceilf(x - 0.5f);
   rounded = fminf(fmaxf(rounded, -127.0f), 127.0f);
   return static_cast<int>(rounded);
+}
+
+__device__ __forceinline__ uint8_t e8m0_scale_byte(float absmax) {
+  if (!(absmax > 0.0f) || !isfinite(absmax)) {
+    return 0;
+  }
+  const float raw_scale = absmax / kFloat8E4M3Max;
+  int exp = 0;
+  const float mantissa = frexpf(raw_scale, &exp);
+  int ceil_log2 = (mantissa == 0.5f) ? (exp - 1) : exp;
+  int biased = ceil_log2 + 127;
+  biased = biased < 1 ? 1 : biased;
+  biased = biased > 254 ? 254 : biased;
+  return static_cast<uint8_t>(biased);
+}
+
+__device__ __forceinline__ float e8m0_reciprocal(uint8_t scale_byte) {
+  return scale_byte == 0 ? 0.0f : exp2f(127.0f - static_cast<float>(scale_byte));
 }
 
 __device__ __forceinline__ int tensor_for_block(
@@ -126,6 +147,115 @@ __device__ __forceinline__ void block_reduce_max_sum(
 
   out_max = scratch_max[0];
   out_sum = scratch_sum[0];
+}
+
+template <typename GradT, typename QT, bool UnsignedStorage>
+__global__ __launch_bounds__(kThreads, 2) void qmuon_update_sumsq_no_grad_kernel(
+    QT* __restrict__ q,
+    float* __restrict__ absmax,
+    const GradT* __restrict__ grad,
+    float* __restrict__ sumsq_out,
+    int64_t n,
+    float beta) {
+  const int64_t block = static_cast<int64_t>(blockIdx.x);
+  const int tid = threadIdx.x;
+  const float old_absmax = absmax[block];
+  float updated[kItemsPerThread];
+  int64_t elements[kItemsPerThread];
+  bool valid[kItemsPerThread];
+  float local_absmax = 0.0f;
+  float local_sumsq = 0.0f;
+
+#pragma unroll
+  for (int item = 0; item < kItemsPerThread; ++item) {
+    elements[item] = block * kBlockSize + tid + item * kThreads;
+    valid[item] = elements[item] < n;
+    updated[item] = 0.0f;
+    if (valid[item]) {
+      int qi = static_cast<int>(q[elements[item]]);
+      if constexpr (UnsignedStorage) {
+        qi -= 128;
+      }
+      const float old_m = static_cast<float>(qi) * old_absmax / kQMax;
+      const float g = load_value<GradT>(grad, elements[item]);
+      updated[item] = beta * old_m + (1.0f - beta) * g;
+      local_absmax = fmaxf(local_absmax, fabsf(updated[item]));
+      local_sumsq += updated[item] * updated[item];
+    }
+  }
+
+  __shared__ float scratch_max[kNumWarps];
+  __shared__ float scratch_sum[kNumWarps];
+  float new_absmax = 0.0f;
+  float block_sumsq = 0.0f;
+  block_reduce_max_sum(
+      local_absmax, local_sumsq, scratch_max, scratch_sum, new_absmax, block_sumsq);
+
+  const float new_absmax_clamped = fmaxf(new_absmax, kAbsmaxEps);
+  const float inv_scale = new_absmax > kAbsmaxEps ? kQMax / new_absmax_clamped : 0.0f;
+#pragma unroll
+  for (int item = 0; item < kItemsPerThread; ++item) {
+    if (valid[item]) {
+      const int q_new = nearest_i8(updated[item] * inv_scale);
+      if constexpr (UnsignedStorage) {
+        q[elements[item]] = static_cast<QT>(q_new + 128);
+      } else {
+        q[elements[item]] = static_cast<QT>(q_new);
+      }
+    }
+  }
+  if (tid == 0) {
+    absmax[block] = new_absmax;
+    sumsq_out[block] = block_sumsq;
+  }
+}
+
+template <typename QT, bool UnsignedStorage>
+__global__ __launch_bounds__(32, 8) void qmuon_emit_mxfp8_carrier_kernel(
+    const QT* __restrict__ q,
+    const float* __restrict__ absmax,
+    uint8_t* __restrict__ rowwise_data,
+    uint8_t* __restrict__ rowwise_scale,
+    const float* __restrict__ inv_norm,
+    int64_t rows,
+    int64_t cols,
+    int64_t scale_ld,
+    int64_t n) {
+  const int64_t blocks_per_row = cols / 32;
+  const int64_t linear_block = static_cast<int64_t>(blockIdx.x);
+  const int64_t row = linear_block / blocks_per_row;
+  const int64_t k_block = linear_block - row * blocks_per_row;
+  const int lane = threadIdx.x;
+  const int64_t col = k_block * 32 + lane;
+  const bool valid = row < rows && col < cols;
+  const int64_t element = row * cols + col;
+
+  float value = 0.0f;
+  float local_absmax = 0.0f;
+  if (valid && element < n) {
+    int qi = static_cast<int>(q[element]);
+    if constexpr (UnsignedStorage) {
+      qi -= 128;
+    }
+    const int64_t q_block = element / kBlockSize;
+    value = static_cast<float>(qi) * absmax[q_block] / kQMax * inv_norm[0];
+    local_absmax = fabsf(value);
+  }
+
+#pragma unroll
+  for (int mask = kWarpSize >> 1; mask > 0; mask >>= 1) {
+    local_absmax = fmaxf(local_absmax, __shfl_xor_sync(0xffffffffu, local_absmax, mask));
+  }
+  const uint8_t scale_byte = e8m0_scale_byte(local_absmax);
+  if (lane == 0) {
+    rowwise_scale[row * scale_ld + k_block] = scale_byte;
+  }
+
+  if (valid) {
+    const float scaled = value * e8m0_reciprocal(scale_byte);
+    const __nv_fp8_e4m3 fp8_value(scaled);
+    rowwise_data[element] = *reinterpret_cast<const uint8_t*>(&fp8_value);
+  }
 }
 
 template <typename GradT, typename QT, bool UnsignedStorage>
@@ -318,6 +448,67 @@ void validate_tensor_lists(
   }
 }
 
+void validate_single_update_no_grad(
+    const at::Tensor& q,
+    const at::Tensor& absmax,
+    const at::Tensor& grad,
+    double beta,
+    bool unsigned_storage) {
+  TORCH_CHECK(q.is_cuda() && absmax.is_cuda() && grad.is_cuda(), "all tensors must be CUDA");
+  TORCH_CHECK(q.device() == absmax.device() && q.device() == grad.device(),
+              "all tensors must be on the same CUDA device");
+  TORCH_CHECK(q.scalar_type() == (unsigned_storage ? at::kByte : at::kChar),
+              "q tensor dtype must match unsigned_storage");
+  TORCH_CHECK(absmax.scalar_type() == at::kFloat, "absmax must be float32");
+  TORCH_CHECK(
+      grad.scalar_type() == at::kBFloat16 || grad.scalar_type() == at::kHalf ||
+          grad.scalar_type() == at::kFloat,
+      "grad must be bf16, fp16, or fp32");
+  TORCH_CHECK(q.is_contiguous() && absmax.is_contiguous() && grad.is_contiguous(),
+              "q, absmax, and grad must be contiguous");
+  TORCH_CHECK(q.sizes() == grad.sizes(), "q and grad shapes must match");
+  TORCH_CHECK(beta >= 0.0 && beta <= 1.0, "beta must be in [0, 1], got ", beta);
+  const int64_t expected_blocks = div_up(q.numel(), kBlockSize);
+  TORCH_CHECK(absmax.numel() == expected_blocks,
+              "absmax has ", absmax.numel(), " entries, expected ", expected_blocks);
+}
+
+void validate_mxfp8_carrier(
+    const at::Tensor& q,
+    const at::Tensor& absmax,
+    const at::Tensor& rowwise_data,
+    const at::Tensor& rowwise_scale,
+    const at::Tensor& inv_norm,
+    bool unsigned_storage) {
+  TORCH_CHECK(q.is_cuda() && absmax.is_cuda() && rowwise_data.is_cuda() &&
+                  rowwise_scale.is_cuda() && inv_norm.is_cuda(),
+              "all tensors must be CUDA");
+  TORCH_CHECK(q.device() == absmax.device() && q.device() == rowwise_data.device() &&
+                  q.device() == rowwise_scale.device() && q.device() == inv_norm.device(),
+              "all tensors must be on the same CUDA device");
+  TORCH_CHECK(q.scalar_type() == (unsigned_storage ? at::kByte : at::kChar),
+              "q tensor dtype must match unsigned_storage");
+  TORCH_CHECK(absmax.scalar_type() == at::kFloat, "absmax must be float32");
+  TORCH_CHECK(rowwise_data.scalar_type() == at::kByte, "rowwise_data must be uint8");
+  TORCH_CHECK(rowwise_scale.scalar_type() == at::kByte, "rowwise_scale must be uint8");
+  TORCH_CHECK(inv_norm.scalar_type() == at::kFloat, "inv_norm must be float32");
+  TORCH_CHECK(q.is_contiguous() && absmax.is_contiguous() && rowwise_data.is_contiguous() &&
+                  rowwise_scale.is_contiguous() && inv_norm.is_contiguous(),
+              "q, absmax, carrier, and inv_norm tensors must be contiguous");
+  TORCH_CHECK(rowwise_data.dim() == 2, "rowwise_data must be 2D");
+  TORCH_CHECK(rowwise_scale.dim() == 2, "rowwise_scale must be 2D");
+  TORCH_CHECK(q.sizes() == rowwise_data.sizes(), "q and rowwise_data shapes must match");
+  const int64_t rows = rowwise_data.size(0);
+  const int64_t cols = rowwise_data.size(1);
+  TORCH_CHECK(cols > 0 && cols % 32 == 0, "rowwise_data cols must be divisible by 32");
+  TORCH_CHECK(rowwise_scale.size(0) == rows, "rowwise_scale rows must match rowwise_data");
+  TORCH_CHECK(rowwise_scale.size(1) >= cols / 32, "rowwise_scale cols must be at least cols/32");
+  TORCH_CHECK(inv_norm.numel() == 1, "inv_norm must be a scalar tensor");
+  const int64_t expected_blocks = div_up(q.numel(), kBlockSize);
+  TORCH_CHECK(absmax.numel() == expected_blocks,
+              "absmax has ", absmax.numel(), " entries, expected ", expected_blocks);
+}
+
 template <typename GradT, typename QT, bool UnsignedStorage>
 void launch_update(
     const int64_t* d_q_ptrs,
@@ -344,6 +535,53 @@ void launch_update(
           group_sumsq_out.defined() ? group_sumsq_out.data_ptr<float>() : nullptr,
           num_tensors,
           beta);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename GradT, typename QT, bool UnsignedStorage>
+void launch_update_sumsq_no_grad(
+    const at::Tensor& q,
+    const at::Tensor& absmax,
+    const at::Tensor& grad,
+    const at::Tensor& sumsq_out,
+    float beta,
+    cudaStream_t stream) {
+  qmuon_update_sumsq_no_grad_kernel<GradT, QT, UnsignedStorage>
+      <<<static_cast<unsigned int>(sumsq_out.numel()), kThreads, 0, stream>>>(
+          reinterpret_cast<QT*>(q.data_ptr()),
+          absmax.data_ptr<float>(),
+          reinterpret_cast<const GradT*>(grad.data_ptr()),
+          sumsq_out.data_ptr<float>(),
+          q.numel(),
+          beta);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename QT, bool UnsignedStorage>
+void launch_emit_mxfp8_carrier(
+    const at::Tensor& q,
+    const at::Tensor& absmax,
+    const at::Tensor& rowwise_data,
+    const at::Tensor& rowwise_scale,
+    const at::Tensor& inv_norm,
+    cudaStream_t stream) {
+  const int64_t rows = rowwise_data.size(0);
+  const int64_t cols = rowwise_data.size(1);
+  const int64_t total_blocks = rows * (cols / 32);
+  TORCH_CHECK(
+      total_blocks <= static_cast<int64_t>(std::numeric_limits<unsigned int>::max()),
+      "MXFP8 carrier emit grid is too large: rows=", rows, " cols=", cols);
+  const dim3 grid(static_cast<unsigned int>(total_blocks));
+  qmuon_emit_mxfp8_carrier_kernel<QT, UnsignedStorage><<<grid, 32, 0, stream>>>(
+      reinterpret_cast<const QT*>(q.data_ptr()),
+      absmax.data_ptr<float>(),
+      rowwise_data.data_ptr<uint8_t>(),
+      rowwise_scale.data_ptr<uint8_t>(),
+      inv_norm.data_ptr<float>(),
+      rows,
+      cols,
+      rowwise_scale.size(1),
+      q.numel());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -392,6 +630,70 @@ void launch_scale_by_group_from_sumsq(
 }
 
 }  // namespace
+
+at::Tensor qmuon_update_with_sumsq_no_grad_cuda_(
+    at::Tensor q,
+    at::Tensor absmax,
+    at::Tensor grad,
+    double beta,
+    bool unsigned_storage) {
+  validate_single_update_no_grad(q, absmax, grad, beta, unsigned_storage);
+  c10::cuda::CUDAGuard device_guard(q.device());
+  const auto device = q.device();
+  const int64_t total_blocks = div_up(q.numel(), kBlockSize);
+  at::Tensor sumsq_out = at::empty(
+      {total_blocks}, at::TensorOptions().device(device).dtype(at::kFloat));
+  if (total_blocks == 0) {
+    return sumsq_out;
+  }
+
+  auto stream = at::cuda::getCurrentCUDAStream(device.index()).stream();
+  const float beta_f = static_cast<float>(beta);
+  const auto grad_dtype = grad.scalar_type();
+  if (unsigned_storage) {
+    if (grad_dtype == at::kBFloat16) {
+      launch_update_sumsq_no_grad<__nv_bfloat16, uint8_t, true>(
+          q, absmax, grad, sumsq_out, beta_f, stream);
+    } else if (grad_dtype == at::kHalf) {
+      launch_update_sumsq_no_grad<__half, uint8_t, true>(
+          q, absmax, grad, sumsq_out, beta_f, stream);
+    } else {
+      launch_update_sumsq_no_grad<float, uint8_t, true>(
+          q, absmax, grad, sumsq_out, beta_f, stream);
+    }
+  } else {
+    if (grad_dtype == at::kBFloat16) {
+      launch_update_sumsq_no_grad<__nv_bfloat16, int8_t, false>(
+          q, absmax, grad, sumsq_out, beta_f, stream);
+    } else if (grad_dtype == at::kHalf) {
+      launch_update_sumsq_no_grad<__half, int8_t, false>(
+          q, absmax, grad, sumsq_out, beta_f, stream);
+    } else {
+      launch_update_sumsq_no_grad<float, int8_t, false>(
+          q, absmax, grad, sumsq_out, beta_f, stream);
+    }
+  }
+  return sumsq_out;
+}
+
+void qmuon_emit_mxfp8_carrier_from_quantized_cuda_(
+    at::Tensor q,
+    at::Tensor absmax,
+    at::Tensor rowwise_data,
+    at::Tensor rowwise_scale,
+    at::Tensor inv_norm,
+    bool unsigned_storage) {
+  validate_mxfp8_carrier(q, absmax, rowwise_data, rowwise_scale, inv_norm, unsigned_storage);
+  c10::cuda::CUDAGuard device_guard(q.device());
+  auto stream = at::cuda::getCurrentCUDAStream(q.device().index()).stream();
+  if (unsigned_storage) {
+    launch_emit_mxfp8_carrier<uint8_t, true>(
+        q, absmax, rowwise_data, rowwise_scale, inv_norm, stream);
+  } else {
+    launch_emit_mxfp8_carrier<int8_t, false>(
+        q, absmax, rowwise_data, rowwise_scale, inv_norm, stream);
+  }
+}
 
 at::Tensor qmuon_update_multi_impl_(
     std::vector<at::Tensor> q_tensors,

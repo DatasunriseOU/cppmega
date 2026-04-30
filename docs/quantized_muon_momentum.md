@@ -1,11 +1,13 @@
 # Quantized Muon Momentum
 
-Status date: 2026-04-25.
+Status date: 2026-04-30.
 
 This note documents the current cppmega prototype for memory-reduced Muon
-momentum. The goal is to replace the persistent BF16 Muon momentum tensor with
-blockwise 8-bit state while still feeding the existing BF16 low-memory
-Newton-Schulz path.
+momentum. The production-shaped optimizer path replaces the persistent BF16
+Muon momentum tensor with blockwise 8-bit state while still feeding the
+existing BF16 low-memory Newton-Schulz path. Wave18B adds a staged MXFP8 carrier
+probe for removing that BF16 handoff, but it is not yet wired into full model
+training.
 
 ## What Exists
 
@@ -18,7 +20,9 @@ Implementation:
 Tests and benchmark:
 
 - `tests/test_quantized_muon_momentum.py`
+- `tests/test_muon_dtype_audit.py`
 - `scripts/bench_quantized_muon_momentum.py`
+- `tools/probes/qmuon_mxfp8_carrier_ns_probe.py`
 
 The state format is:
 
@@ -38,10 +42,16 @@ The CUDA extension provides two production-shaped update paths:
   variant for fused QKV and sharded tensors. It accumulates one sumsq per
   logical norm group, optionally all-reduces those sums over a tensor-parallel
   process group, then scales every block by its group norm.
+- `quantized_muon_momentum_update_mxfp8_carrier_`: Wave18B single-tensor probe
+  path. It updates q8 state and emits a normalized rowwise MXFP8 carrier
+  (`uint8` E4M3 payload plus `uint8` E8M0 inverse scales) without overwriting
+  the grad tensor with BF16 scratch.
 
 The important property is that the BF16 grad buffer is reused as the
 Newton-Schulz input. There is no separate persistent BF16 momentum tensor and
-no separate BF16 scratch allocation in the intended path.
+no separate BF16 scratch allocation in the intended grouped path. The Wave18B
+carrier probe is the first step toward removing this BF16 NS input, but the
+Megatron optimizer still uses the grouped BF16 handoff today.
 
 ## Algorithm
 
@@ -64,6 +74,56 @@ For each 256-element block:
 
 The CUDA kernel uses a bitsandbytes-style element layout: 64 threads per block,
 4 elements per thread, for 256 elements per quantization block.
+
+## Wave18B MXFP8 Carrier Probe
+
+The Wave18B branch adds a non-BF16 carrier building block:
+
+```text
+q8 state + grad -> q8 state + normalized MXFP8 carrier
+```
+
+Carrier layout:
+
+- `carrier.rowwise_data`: `torch.uint8`, same 2D shape as the source tensor,
+  storing E4M3 payload bytes.
+- `carrier.rowwise_scale_inv`: `torch.uint8`, shape `(rows, ceil(cols / 32))`,
+  storing E8M0 inverse scales.
+- `carrier.inv_norm`: `torch.float32`, one scalar inverse Frobenius norm.
+
+Locked GB10 microprobe:
+
+```text
+/home/dave/logs/wave18B_qmuon_mxfp8_carrier_probe_20260430_002.log
+carrier_gram_rel_l2=0.00172372
+carrier_finite=True
+gram_finite=True
+q_update_emit_plus_mxfp8_gram=2.0756 ms
+bf16_update_norm_gram=3.8241 ms
+speedup_vs_bf16=1.842x
+```
+
+Audit evidence:
+
+```text
+/home/dave/logs/wave18B_qmuon_mxfp8_carrier_audit_20260430_001.log
+bf16_owned_path_observed=0
+qmuon_mxfp8_carrier_update_calls=1
+qmuon_carrier_rowwise_data_dtype_uint8_tensors=1
+qmuon_carrier_rowwise_scale_dtype_uint8_tensors=1
+qmuon_carrier_inv_norm_dtype_float32_tensors=1
+qmuon_grad_dtype_float16_tensors=1
+```
+
+Current limit: this is a one-tensor microprobe, not a full optimizer route.
+The existing CUTLASS MXFP8 helper still requires BF16 output for the Gram GEMM,
+so the carrier storage is non-BF16 but the full Newton-Schulz computation is
+not yet strict no-BF16.
+
+See
+`docs/status/qmuon_mxfp8_carrier_wave18B_2026_04_30.md`
+for the staged `TensorParallelMuon.step` / `TensorParallelMuon.orthogonalize`
+integration plan and acceptance gate.
 
 ## Grouped QKV And Sharding
 

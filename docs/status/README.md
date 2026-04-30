@@ -33,9 +33,16 @@ Use one of these labels in new docs and in index rows:
 | GB10 hardware facts | [../gb10_sm121_hardware.md](../gb10_sm121_hardware.md) | Hardware capability reference. |
 | GB10 software stack | [../gb10_software_stack.md](../gb10_software_stack.md) | Library and toolchain compatibility. |
 | Dense GB10 MXFP8/NVFP4 | [../gb10_dense_mxfp8_status_2026_04_25.md](../gb10_dense_mxfp8_status_2026_04_25.md) | Dated file, but currently canonical for this narrow topic. |
+| Quantized Muon momentum | [../quantized_muon_momentum.md](../quantized_muon_momentum.md) | q8 momentum state, BF16 owned path status, and Wave18B MXFP8 carrier probe. |
 | Upstream bugs | [../upstream_bugs.md](../upstream_bugs.md) | Known upstream issues and local workarounds. |
 | Data preparation | [../data_preparation.md](../data_preparation.md) | Dataset/tokenizer pipeline. |
 | Long-context roadmap | [../long_context_roadmap.md](../long_context_roadmap.md) | Context-length thresholds and deferred work. |
+
+## Active Dated Notes
+
+| Topic | Note | Status | Notes |
+| --- | --- | --- | --- |
+| qMuon MXFP8 carrier | [qmuon_mxfp8_carrier_wave18B_2026_04_30.md](qmuon_mxfp8_carrier_wave18B_2026_04_30.md) | active | Probe/audit evidence and exact staged integration point for `TensorParallelMuon`. |
 
 ## Retention Rules
 

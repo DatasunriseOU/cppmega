@@ -51,6 +51,8 @@ def test_backend_source_does_not_use_transpose_bridge() -> None:
     assert "_cppmega_mxfp8_colwise_as_rowwise_transpose" not in text
     assert ".t(" not in text
     assert ".transpose(" not in text
+    assert "expert_offsets[kNumExperts].item" not in text
+    assert "m_splits.detach().cpu().tolist()" not in text
     assert "Python loop over experts" in text
 
 
@@ -89,6 +91,13 @@ def _split_rows(data: torch.Tensor, counts: list[int]) -> list[torch.Tensor]:
     return parts
 
 
+def _offset_values(counts: list[int]) -> list[int]:
+    offsets = [0]
+    for count in counts:
+        offsets.append(offsets[-1] + int(count))
+    return offsets
+
+
 def _wrap(
     *,
     rowwise_data: torch.Tensor | None = None,
@@ -106,6 +115,95 @@ def _wrap(
     if columnwise_scale is not None:
         tensor._columnwise_scale_inv = columnwise_scale
     return tensor
+
+
+def test_wgrad_list_binding_passes_total_rows_without_cuda_offset_item(monkeypatch) -> None:
+    counts = [1] * 16
+    n = 32
+    k = 64
+    dy = [torch.empty((count, n), dtype=torch.uint8) for count in counts]
+    x = [torch.empty((count, k), dtype=torch.uint8) for count in counts]
+    dy_scale = [torch.empty(((count + 31) // 32, n), dtype=torch.uint8) for count in counts]
+    x_scale = [torch.empty(((count + 31) // 32, k), dtype=torch.uint8) for count in counts]
+    out = [torch.empty((n, k), dtype=torch.bfloat16) for _ in counts]
+    offsets = torch.tensor(_offset_values(counts), dtype=torch.int64)
+    calls = []
+
+    class FakeExt:
+        def wgrad_nt_ptrs(self, *args):
+            calls.append(args)
+
+    monkeypatch.setattr(grouped, "_check_uint8_cuda_contiguous", lambda _tensor, _name: None)
+    monkeypatch.setattr(grouped, "_load_cuda_ext", lambda: FakeExt())
+
+    result = grouped.wgrad_nt_gemm_list(
+        dy,
+        dy_scale,
+        x,
+        x_scale,
+        offsets,
+        out=out,
+    )
+
+    assert all(actual is expected for actual, expected in zip(result, out))
+    assert len(calls) == 1
+    args = calls[0]
+    assert args[9] == sum(counts)
+    assert args[10] == n
+    assert args[11] == k
+
+
+@requires_cuda
+def test_try_grouped_direct_cuda_m_splits_uses_shape_offsets_without_cpu_readback(monkeypatch) -> None:
+    counts = [1] * 16
+    total = sum(counts)
+    n = 32
+    k = 64
+    m_splits = torch.tensor(counts, dtype=torch.int64, device="cuda")
+    captured = {}
+    sentinel = object()
+
+    A = [
+        _wrap(
+            columnwise_data=torch.empty((n, k), dtype=torch.uint8),
+            columnwise_scale=torch.empty((n // 32, k), dtype=torch.uint8),
+        )
+        for _ in counts
+    ]
+    B = [
+        _wrap(
+            rowwise_data=torch.empty((count, n), dtype=torch.uint8),
+            rowwise_scale=torch.empty((count, n // 32), dtype=torch.uint8),
+        )
+        for count in counts
+    ]
+    out = [torch.empty((total, k), dtype=torch.bfloat16)]
+
+    def fail_cpu(self):
+        raise AssertionError("direct grouped path read CUDA m_splits on CPU")
+
+    def fake_dgrad_nn_gemm_list(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return sentinel
+
+    monkeypatch.setattr(torch.Tensor, "cpu", fail_cpu)
+    monkeypatch.setattr(grouped, "dgrad_nn_gemm_list", fake_dgrad_nn_gemm_list)
+
+    ok, result = grouped.try_grouped_direct(
+        A,
+        B,
+        out,
+        layout="NN",
+        grad=True,
+        m_splits=m_splits,
+        out_dtype=torch.bfloat16,
+    )
+
+    assert ok, result
+    assert result is sentinel
+    assert captured["args"][4] == _offset_values(counts)
+    assert captured["kwargs"]["out"] is out[0]
 
 
 @requires_cuda

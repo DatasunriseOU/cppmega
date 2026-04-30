@@ -513,6 +513,7 @@ void grouped_mxfp8_wgrad_nt_ptrs_cuda(
     bool accumulate,
     double alpha,
     double beta,
+    int64_t total_rows,
     int64_t n,
     int64_t k) {
   validate_ptrs(dy_ptrs, "dy_ptrs");
@@ -526,7 +527,7 @@ void grouped_mxfp8_wgrad_nt_ptrs_cuda(
   validate_device_match(dy_ptrs, sf_x_ptrs, "sf_x_ptrs");
   validate_device_match(dy_ptrs, out_ptrs, "out_ptrs");
   validate_device_match(dy_ptrs, expert_offsets, "expert_offsets");
-  validate_common_shape(expert_offsets[kNumExperts].item<int64_t>(), n, k);
+  validate_common_shape(total_rows, n, k);
 
   c10::cuda::CUDAGuard device_guard(dy_ptrs.device());
   int64_t total_outputs = kNumExperts * n * k;
