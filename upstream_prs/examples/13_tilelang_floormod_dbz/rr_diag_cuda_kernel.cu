@@ -108,6 +108,56 @@ __device__ void wmma_gemm_bf16_row_row(
   }
 }
 
+__device__ void wmma_gemm_bf16_row_row_upper_k(
+    const __nv_bfloat16* __restrict__ a,
+    const __nv_bfloat16* __restrict__ b,
+    float* __restrict__ c,
+    int m_tiles,
+    int n_tiles,
+    int k_tiles,
+    int lda,
+    int ldb,
+    int ldc,
+    bool accumulate) {
+  using namespace nvcuda;
+  constexpr int kWmma = 16;
+  const int warp_id = threadIdx.x / 32;
+  const int warp_count = blockDim.x / 32;
+  const int total_tiles = m_tiles * n_tiles;
+  for (int tile = warp_id; tile < total_tiles; tile += warp_count) {
+    const int tile_m = tile / n_tiles;
+    const int tile_n = tile - tile_m * n_tiles;
+    wmma::fragment<wmma::accumulator, kWmma, kWmma, kWmma, float> acc_frag;
+    if (accumulate) {
+      wmma::load_matrix_sync(
+          acc_frag,
+          c + (tile_m * kWmma) * ldc + tile_n * kWmma,
+          ldc,
+          wmma::mem_row_major);
+    } else {
+      wmma::fill_fragment(acc_frag, 0.0f);
+    }
+    for (int tile_k = tile_m; tile_k < k_tiles; ++tile_k) {
+      wmma::fragment<wmma::matrix_a, kWmma, kWmma, kWmma, __nv_bfloat16, wmma::row_major> a_frag;
+      wmma::fragment<wmma::matrix_b, kWmma, kWmma, kWmma, __nv_bfloat16, wmma::row_major> b_frag;
+      wmma::load_matrix_sync(
+          a_frag,
+          a + (tile_m * kWmma) * lda + tile_k * kWmma,
+          lda);
+      wmma::load_matrix_sync(
+          b_frag,
+          b + (tile_k * kWmma) * ldb + tile_n * kWmma,
+          ldb);
+      wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+    }
+    wmma::store_matrix_sync(
+        c + (tile_m * kWmma) * ldc + tile_n * kWmma,
+        acc_frag,
+        ldc,
+        wmma::mem_row_major);
+  }
+}
+
 __device__ void wmma_gemm_bf16_row_col(
     const __nv_bfloat16* __restrict__ a,
     const __nv_bfloat16* __restrict__ b_col_major,
@@ -1615,8 +1665,6 @@ __global__ void stage2_mono_wmma_lkq_dphi_chunk_owner_kernel(
   cursor += static_cast<int64_t>(kFusedChunk) * P * sizeof(__nv_bfloat16);
   __nv_bfloat16* psi_s = reinterpret_cast<__nv_bfloat16*>(cursor);
   cursor += static_cast<int64_t>(kFusedChunk) * P * sizeof(__nv_bfloat16);
-  __nv_bfloat16* lkq_masked_s = reinterpret_cast<__nv_bfloat16*>(cursor);
-  cursor += static_cast<int64_t>(kFusedChunk) * kFusedChunk * sizeof(__nv_bfloat16);
   cursor = reinterpret_cast<unsigned char*>(
       (reinterpret_cast<uintptr_t>(cursor) + alignof(float) - 1) &
       ~(static_cast<uintptr_t>(alignof(float) - 1)));
@@ -1703,6 +1751,7 @@ __global__ void stage2_mono_wmma_lkq_dphi_chunk_owner_kernel(
       false);
   __syncthreads();
 
+  __nv_bfloat16* lkq_masked_s = q_t_s;
   for (int idx = tid; idx < kFusedChunk * kFusedChunk; idx += blockDim.x) {
     const int row = idx / kFusedChunk;
     const int col = idx - row * kFusedChunk;
@@ -1776,7 +1825,7 @@ __global__ void stage2_mono_wmma_lkq_dphi_chunk_owner_kernel(
   __syncthreads();
 
   // Tensor core downstream apply: dPsi += masked(LKQ) @ dPhi.
-  wmma_gemm_bf16_row_row(
+  wmma_gemm_bf16_row_row_upper_k(
       lkq_masked_s,
       dphi_s,
       accum_s,
@@ -2924,10 +2973,9 @@ size_t mono_state_lkq_d_smem_bytes() {
 size_t mono_wmma_lkq_dphi_smem_bytes(int P) {
   const size_t bf16_bytes =
       (static_cast<size_t>(kFusedChunk) * 64 +          // K
-       static_cast<size_t>(64) * kFusedChunk +          // Q^T
+       static_cast<size_t>(64) * kFusedChunk +          // Q^T, then masked LKQ
        static_cast<size_t>(kFusedChunk) * P +           // dPhi
-       static_cast<size_t>(kFusedChunk) * P +           // PsiV
-       static_cast<size_t>(kFusedChunk) * kFusedChunk)  // masked LKQ
+       static_cast<size_t>(kFusedChunk) * P)            // PsiV
       * sizeof(__nv_bfloat16);
   const size_t float_bytes =
       (static_cast<size_t>(kFusedChunk) * kFusedChunk +  // raw LKQ
@@ -3755,7 +3803,9 @@ py::dict stage2_mono_wmma_lkq_dphi_chunk_owner_metadata_for_shape(int P) {
   out["fused_chunk"] = kFusedChunk;
   out["owner"] = "B,H,chunk";
   out["outputs"] = "DV, per-chunk DMIMO_V, DSSDA";
-  out["tensor_core_gemms"] = "LKQ=K@Q^T, dki=PsiV@dPhi^T, state=K@dstates, dPsi+=masked(LKQ)@dPhi";
+  out["tensor_core_gemms"] =
+      "LKQ=K@Q^T, dki=PsiV@dPhi^T, state=K@dstates, triangular-pruned dPsi+=masked(LKQ)@dPhi";
+  out["masked_lkq_smem"] = "reuses dead Q^T bf16 tile storage";
   out["dynamic_smem_bytes"] = static_cast<int64_t>(smem_bytes);
   out["num_regs"] = attrs.numRegs;
   out["static_smem_bytes"] = static_cast<int64_t>(attrs.sharedSizeBytes);
