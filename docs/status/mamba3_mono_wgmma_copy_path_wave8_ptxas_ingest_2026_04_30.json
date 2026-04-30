@@ -1,0 +1,55 @@
+{
+  "coverage": "representative 12-logical-tile CUDA/CuTe uint4 copy probe; compiler/resource evidence for the narrow path, not full WGMMA timing",
+  "date": "2026-04-30",
+  "dynamic_smem_bytes_from_probe_contract": 98304,
+  "evidence": "mamba3_mono_wgmma_copy_path_wave8_ptxas_ingest_2026_04_30",
+  "failures": [],
+  "kernel_name": "mamba3_wave8_narrow_copy_12tile_probe",
+  "metadata": {
+    "dynamic_smem_bytes": 98304,
+    "registers_per_thread": 40,
+    "spill_loads_bytes": 0,
+    "spill_stores_bytes": 0,
+    "static_smem_bytes": 0
+  },
+  "ptxas_evidence": {
+    "dynamic_smem_note": "ptxas -v reports registers, spills, and static shared memory. dynamic_smem_bytes must come from the kernel launch/probe receipt.",
+    "entries": [
+      {
+        "function": "mamba3_wave8_narrow_copy_12tile_probe",
+        "registers_per_thread": 40,
+        "spill_loads_bytes": 0,
+        "spill_stores_bytes": 0,
+        "stack_frame_bytes": 0,
+        "static_smem_bytes": 0
+      }
+    ],
+    "failures": [],
+    "metadata": {
+      "dynamic_smem_bytes": 98304,
+      "registers_per_thread": 40,
+      "spill_loads_bytes": 0,
+      "spill_stores_bytes": 0,
+      "static_smem_bytes": 0
+    },
+    "raw_log_line_count": 6,
+    "raw_log_path": null,
+    "raw_log_sha256": "1c15ad6672733f8d29c624a3bca7abffcd4a79b6b79c8dbb99ba9afdb23a0bcb",
+    "selected_function": "mamba3_wave8_narrow_copy_12tile_probe",
+    "status": "parsed"
+  },
+  "ptxas_output_excerpt": [
+    "ptxas info    : 12 bytes gmem",
+    "ptxas info    : Compiling entry function 'mamba3_wave8_narrow_copy_12tile_probe' for 'sm_121'",
+    "ptxas info    : Function properties for mamba3_wave8_narrow_copy_12tile_probe",
+    "    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads",
+    "ptxas info    : Used 40 registers, used 1 barriers",
+    "ptxas info    : Compile time = 15.850 ms"
+  ],
+  "raw_log_line_count": 6,
+  "raw_log_path": null,
+  "raw_log_sha256": "1c15ad6672733f8d29c624a3bca7abffcd4a79b6b79c8dbb99ba9afdb23a0bcb",
+  "schema": "mamba3_wave8_ptxas_ingest_v1",
+  "source_path": null,
+  "status": "parsed"
+}
