@@ -133,6 +133,83 @@ def test_component_record_json_computes_projection_budget() -> None:
     assert "dmimo_v" in projection["missing_slots"]
 
 
+def test_micro_gemm_only_correct_candidate_gets_zero_production_credit() -> None:
+    records = candidate_component_records_from_json(
+        {
+            "candidate_component_records": [
+                {
+                    "candidate_id": "cute_micro_gemm_cheating_receipt",
+                    "implementation_class": "cute_dsl_handwritten_wgmma_micro_gemm",
+                    "receipt_scope": "micro_gemm_only",
+                    "shape": "cute_gemm_64x64x64",
+                    "projected_bwd_bwd_ms": 1.0,
+                    "covered_slots": list(BWD_BWD_OUTPUT_NAMES),
+                    "correctness": {"full_boundary_pass": True, "max_abs": 0.0},
+                    "hardware_tags": ["H200"],
+                    "metadata": {
+                        "registers_per_thread": 64,
+                        "dynamic_smem_bytes": 32768,
+                        "active_blocks_per_sm": 2,
+                        "theoretical_occupancy": 0.5,
+                    },
+                    "modal_hygiene": {
+                        "status": "pass",
+                        "active_same_campaign_count": 0,
+                    },
+                    "reference": {"stage2_bwd_bwd_ms": 3.70674},
+                }
+            ]
+        }
+    )
+
+    projection = component_record_projection(records[0])
+    gate = projection["production_gate"]
+
+    assert gate["production_credit"] is False
+    assert gate["production_credit_ms"] == 0.0
+    assert gate["credited_output_slots"] == []
+    assert gate["rejection_reasons"] == ["micro_gemm_only_receipt"]
+
+
+def test_incomplete_slot_coverage_rejects_boundary_candidate() -> None:
+    covered = [name for name in BWD_BWD_OUTPUT_NAMES if name != "dda_cs"]
+    records = candidate_component_records_from_json(
+        {
+            "candidate_component_records": [
+                {
+                    "candidate_id": "mono_missing_one_slot",
+                    "implementation_class": "cuda_monolithic_bwd_bwd",
+                    "receipt_scope": "bwd_bwd_component",
+                    "shape": "productionish",
+                    "projected_bwd_bwd_ms": 1.0,
+                    "covered_slots": covered,
+                    "correctness": {"full_boundary_pass": True, "max_abs": 0.0},
+                    "hardware_tags": ["H200"],
+                    "metadata": {
+                        "regs_per_thread": 64,
+                        "static_smem_bytes": 16384,
+                        "active_blocks_per_sm": 4,
+                        "occupancy": 0.5,
+                    },
+                    "modal_hygiene": {
+                        "status": "pass",
+                        "active_same_campaign_count": 0,
+                    },
+                    "reference": {"stage2_bwd_bwd_ms": 3.70674},
+                }
+            ]
+        }
+    )
+
+    projection = component_record_projection(records[0])
+    gate = projection["production_gate"]
+
+    assert gate["production_credit"] is False
+    assert gate["rejection_reasons"] == ["missing_required_output_slots"]
+    assert gate["missing_output_slots"] == ["dda_cs"]
+    assert gate["resource_metadata"]["status"] == "pass"
+
+
 def test_component_record_markdown_fence_and_shape_filter() -> None:
     markdown = """
 Status text.
@@ -243,6 +320,24 @@ def test_wave3_wave4_receipt_file_gates_current_research_numbers() -> None:
     assert by_id["wave3_cute_handwritten_wgmma_wrong_numerics"]["correctness"][
         "max_abs"
     ] == pytest.approx(17.318359)
+
+    cute_micro = component_record_projection(
+        by_id["wave4_cute_handwritten_wgmma_micro_gemm_correct"]
+    )
+    assert cute_micro["projection_status"] == "missing_timing"
+    assert cute_micro["covered_slots"] == []
+    assert cute_micro["production_gate"]["production_credit"] is False
+    assert cute_micro["production_gate"]["production_credit_ms"] == 0.0
+    assert cute_micro["production_gate"]["credited_output_slots"] == []
+    assert "micro_gemm_only_receipt" in cute_micro["production_gate"]["rejection_reasons"]
+    assert "h200_hardware_tag_missing" not in cute_micro["production_gate"]["rejection_reasons"]
+    assert "modal_hygiene_not_clean" not in cute_micro["production_gate"]["rejection_reasons"]
+    assert by_id["wave4_cute_handwritten_wgmma_micro_gemm_correct"][
+        "hardware_tags"
+    ] == ["H200"]
+    assert by_id["wave4_cute_handwritten_wgmma_micro_gemm_correct"][
+        "modal_hygiene"
+    ]["active_same_campaign_count"] == 0
 
     wgmma_plan = component_record_projection(by_id["wave3_wgmma_plan_budget"])
     assert wgmma_plan["projection_status"] == "missing_timing"

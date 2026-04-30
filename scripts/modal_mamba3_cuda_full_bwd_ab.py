@@ -451,7 +451,7 @@ def _component_record_slot_results(record: dict[str, Any]) -> dict[str, dict[str
             "ref_absmax": correctness.get("ref_absmax"),
             "rel_to_ref_absmax": correctness.get("rel_to_ref_absmax"),
             "full_boundary_pass": False,
-            "coverage": "reported by external Lane A/B/C component record",
+            "coverage": "reported by external Lane A/B/C/D component record",
             "note": "component coverage must be rechecked at the integrated call boundary",
         }
     return results
@@ -465,6 +465,10 @@ def _component_candidate_reports(
     reports: list[dict[str, Any]] = []
     for record in filter_candidate_component_records_for_shape(component_records, shape):
         slot_results = _component_record_slot_results(record)
+        projection = component_record_projection(
+            record,
+            reference=projection_reference,
+        )
         reports.append(
             {
                 "candidate_id": record["candidate_id"],
@@ -477,11 +481,11 @@ def _component_candidate_reports(
                 ),
                 "source": record.get("source"),
                 "components": record.get("components"),
-                "projection": component_record_projection(
-                    record,
-                    reference=projection_reference,
-                ),
+                "projection": projection,
+                "production_gate": projection["production_gate"],
                 "memory_peak_gib": record.get("memory_peak_gib"),
+                "hardware_tags": record.get("hardware_tags") or [],
+                "modal_hygiene": record.get("modal_hygiene") or {},
                 "slot_results": slot_results,
                 "slot_summary": summarize_slot_results(slot_results),
                 "missing_for_full_replacement": record.get("missing_slots"),
@@ -781,6 +785,7 @@ def _write_summary_csv(summary: dict[str, Any], csv_path: str) -> None:
                 "component_candidate_ids",
                 "component_candidate_projected_bwd_bwd_ms",
                 "component_candidate_remaining_budget_ms",
+                "component_candidate_production_credit",
                 "future_monolithic_candidate_ids",
             ],
         )
@@ -815,6 +820,14 @@ def _write_summary_csv(summary: dict[str, Any], csv_path: str) -> None:
                 (
                     f"{item.get('candidate_id')}="
                     f"{item.get('projection', {}).get('remaining_budget_ms_to_equal_stage2_bwd_bwd')}"
+                )
+                for item in component_reports
+                if item.get("candidate_id")
+            ]
+            component_credit = [
+                (
+                    f"{item.get('candidate_id')}="
+                    f"{item.get('production_gate', {}).get('production_credit')}"
                 )
                 for item in component_reports
                 if item.get("candidate_id")
@@ -866,6 +879,7 @@ def _write_summary_csv(summary: dict[str, Any], csv_path: str) -> None:
                     ),
                     "component_candidate_projected_bwd_bwd_ms": ";".join(component_projected),
                     "component_candidate_remaining_budget_ms": ";".join(component_budget),
+                    "component_candidate_production_credit": ";".join(component_credit),
                     "future_monolithic_candidate_ids": ",".join(
                         str(item) for item in future_ids if item
                     ),
@@ -1313,6 +1327,7 @@ def _local_schema_dry_run(
                         "role": config["role"],
                         "status": "schema_dry_run",
                         "projection": projection,
+                        "production_gate": projection["production_gate"],
                         "slot_results": slot_results,
                         "slot_summary": summarize_slot_results(slot_results),
                     }

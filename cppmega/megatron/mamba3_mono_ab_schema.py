@@ -131,6 +131,34 @@ FULL_CHAIN_COMPARE_NAMES = tuple(
     spec.name for spec in (*BWD_FWD_HANDOFF_SPECS, *BWD_BWD_OUTPUT_SPECS)
 )
 BWD_BWD_OUTPUT_NAMES = tuple(spec.name for spec in BWD_BWD_OUTPUT_SPECS)
+OPTIONAL_HARDWARE_TAGS = ("H100", "H200", "B200")
+PRODUCTION_RESOURCE_METADATA_FIELDS = (
+    "registers_per_thread",
+    "smem_bytes",
+    "active_blocks_per_sm",
+    "theoretical_occupancy",
+)
+
+_RESOURCE_METADATA_ALIASES = {
+    "registers_per_thread": ("registers_per_thread", "regs_per_thread"),
+    "smem_bytes": (
+        "smem_bytes",
+        "shared_memory_bytes",
+        "dynamic_smem_bytes",
+        "static_smem_bytes",
+    ),
+    "active_blocks_per_sm": ("active_blocks_per_sm", "blocks_per_sm"),
+    "theoretical_occupancy": ("theoretical_occupancy", "occupancy"),
+}
+_MICRO_GEMM_SCOPE_MARKERS = (
+    "micro_gemm",
+    "micro-gemm",
+    "single_gemm",
+    "single-gemm",
+    "cute_gemm",
+    "64x64x64",
+)
+_MODAL_HYGIENE_PASS_STATUSES = {"pass", "passed", "ok", "clean", "stopped"}
 
 _COMPONENT_RECORD_PAYLOAD_KEYS = (
     "mamba3_mono_ab_component_records",
@@ -220,6 +248,56 @@ def _shape_name(value: Any) -> str | None:
         return str(name).strip() if name else None
     name = str(value).strip()
     return name or None
+
+
+def _normalize_hardware_tags(raw: dict[str, Any], metadata: dict[str, Any]) -> list[str]:
+    values: list[Any] = []
+    for mapping in (raw, metadata):
+        for key in ("hardware_tags", "gpu_tags", "devices", "device", "gpu"):
+            if key in mapping:
+                values.extend(_as_list(mapping[key]))
+
+    found: set[str] = set()
+    for value in values:
+        text = str(value).upper()
+        for tag in OPTIONAL_HARDWARE_TAGS:
+            if tag in text:
+                found.add(tag)
+    return [tag for tag in OPTIONAL_HARDWARE_TAGS if tag in found]
+
+
+def _metadata_lookup(metadata: dict[str, Any], logical_field: str) -> Any:
+    for key in _RESOURCE_METADATA_ALIASES[logical_field]:
+        value = metadata.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _receipt_scope_from_raw(
+    raw: dict[str, Any],
+    *,
+    implementation_class: str,
+    shape_name: str | None,
+    components: list[dict[str, Any]],
+    metadata: dict[str, Any],
+) -> str:
+    explicit = raw.get("receipt_scope") or metadata.get("receipt_scope")
+    if explicit:
+        return str(explicit)
+
+    haystack = " ".join(
+        str(item)
+        for item in (
+            implementation_class,
+            shape_name or "",
+            raw.get("candidate_id") or raw.get("id") or raw.get("name") or "",
+            *(component.get("component_id", "") for component in components),
+        )
+    ).lower()
+    if any(marker in haystack for marker in _MICRO_GEMM_SCOPE_MARKERS):
+        return "micro_gemm_only"
+    return "bwd_bwd_component"
 
 
 def _payload_records(payload: Any) -> list[dict[str, Any]]:
@@ -385,6 +463,14 @@ def normalize_candidate_component_record(
         raise ValueError("candidate component record requires candidate_id, id, or name")
 
     components = _components_from_raw(raw)
+    implementation_class = str(raw.get("implementation_class", "lane_component_record"))
+    shape_name = _shape_name(raw.get("shape"))
+    metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+    metadata = dict(metadata)
+    modal_hygiene = raw.get("modal_hygiene") or metadata.get("modal_hygiene") or {}
+    if not isinstance(modal_hygiene, dict):
+        modal_hygiene = {"status": str(modal_hygiene)}
+
     covered_slots = set(
         _slot_list(raw.get("covered_slots") or raw.get("slots") or raw.get("outputs"))
     )
@@ -415,7 +501,6 @@ def normalize_candidate_component_record(
     if max_abs is not None:
         correctness.setdefault("max_abs", max_abs)
 
-    metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
     gate_budget = (
         raw.get("gate_budget")
         or raw.get("ab_gate_budget")
@@ -429,8 +514,15 @@ def normalize_candidate_component_record(
         "candidate_id": str(candidate_id),
         "display_name": str(raw.get("display_name") or str(candidate_id).replace("_", " ")),
         "role": str(raw.get("role", "external_component_candidate")),
-        "implementation_class": str(raw.get("implementation_class", "lane_component_record")),
-        "shape": _shape_name(raw.get("shape")),
+        "implementation_class": implementation_class,
+        "shape": shape_name,
+        "receipt_scope": _receipt_scope_from_raw(
+            raw,
+            implementation_class=implementation_class,
+            shape_name=shape_name,
+            components=components,
+            metadata=metadata,
+        ),
         "status": str(raw.get("status", "reported")),
         "source": source,
         "components": components,
@@ -451,6 +543,8 @@ def normalize_candidate_component_record(
         "correctness": correctness,
         "reference": _normalize_reference(raw),
         "metadata": metadata,
+        "hardware_tags": _normalize_hardware_tags(raw, metadata),
+        "modal_hygiene": modal_hygiene,
         "gate_budget": gate_budget,
         "note": str(raw.get("note", "")),
     }
@@ -547,6 +641,153 @@ def filter_candidate_component_records_for_shape(
     ]
 
 
+def _resource_metadata_gate(record: dict[str, Any]) -> dict[str, Any]:
+    metadata = record.get("metadata") or {}
+    present: dict[str, Any] = {}
+    missing: list[str] = []
+    for field in PRODUCTION_RESOURCE_METADATA_FIELDS:
+        value = _metadata_lookup(metadata, field)
+        if value is None:
+            missing.append(field)
+        else:
+            present[field] = value
+    return {
+        "status": "pass" if not missing else "missing",
+        "required_fields": list(PRODUCTION_RESOURCE_METADATA_FIELDS),
+        "present": present,
+        "missing": missing,
+    }
+
+
+def _modal_hygiene_gate(record: dict[str, Any]) -> dict[str, Any]:
+    hygiene = record.get("modal_hygiene") or {}
+    if not isinstance(hygiene, dict) or not hygiene:
+        return {"status": "missing", "required": "clean final Modal app state"}
+
+    status = str(
+        hygiene.get("status")
+        or hygiene.get("verdict")
+        or hygiene.get("cleanup_status")
+        or ""
+    ).lower()
+    active_count = None
+    for key in (
+        "active_same_campaign_count",
+        "active_total",
+        "active_cppmega_mamba3",
+        "running_or_nonzero_tasks",
+    ):
+        if hygiene.get(key) is not None:
+            active_count = int(hygiene[key])
+            break
+
+    if status in _MODAL_HYGIENE_PASS_STATUSES or active_count == 0:
+        gate_status = "pass"
+    elif active_count is not None and active_count > 0:
+        gate_status = "fail"
+    else:
+        gate_status = "missing"
+    return {
+        "status": gate_status,
+        "reported_status": status or None,
+        "active_count": active_count,
+        "required": "clean final Modal app state",
+    }
+
+
+def _is_micro_gemm_record(record: dict[str, Any]) -> bool:
+    haystack = " ".join(
+        str(item)
+        for item in (
+            record.get("receipt_scope", ""),
+            record.get("implementation_class", ""),
+            record.get("shape", ""),
+            record.get("candidate_id", ""),
+            *(component.get("component_id", "") for component in record.get("components", [])),
+        )
+    ).lower()
+    return any(marker in haystack for marker in _MICRO_GEMM_SCOPE_MARKERS)
+
+
+def production_candidate_gate(
+    record: dict[str, Any],
+    *,
+    projection: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the fail-closed production eligibility verdict for a receipt."""
+
+    projection = projection or {}
+    covered = set(record.get("covered_slots") or [])
+    explicit_missing = set(record.get("missing_slots") or [])
+    missing_slots = [
+        name
+        for name in BWD_BWD_OUTPUT_NAMES
+        if name not in covered or name in explicit_missing
+    ]
+    correctness = record.get("correctness") or {}
+    resource_gate = _resource_metadata_gate(record)
+    modal_gate = _modal_hygiene_gate(record)
+    hardware_tags = list(record.get("hardware_tags") or [])
+
+    total_ms = projection.get("projected_bwd_bwd_ms")
+    reference = record.get("reference") or {}
+    gate_budget = record.get("gate_budget") or {}
+    budget_ms = (
+        projection.get("stage2_bwd_bwd_ms")
+        or reference.get("stage2_bwd_bwd_ms")
+        or gate_budget.get("yellow_full_kernel_ms")
+        or gate_budget.get("red_full_kernel_ms")
+    )
+    if total_ms is None:
+        performance_status = "missing_timing"
+    elif budget_ms is None:
+        performance_status = "missing_budget"
+    elif float(total_ms) <= float(budget_ms):
+        performance_status = "pass"
+    else:
+        performance_status = "fail"
+
+    rejection_reasons: list[str] = []
+    if _is_micro_gemm_record(record):
+        rejection_reasons.append("micro_gemm_only_receipt")
+    if missing_slots:
+        rejection_reasons.append("missing_required_output_slots")
+    if correctness.get("full_boundary_pass") is not True:
+        rejection_reasons.append("full_boundary_correctness_not_reported")
+    if resource_gate["status"] != "pass":
+        rejection_reasons.append("resource_metadata_incomplete")
+    if "H200" not in hardware_tags:
+        rejection_reasons.append("h200_hardware_tag_missing")
+    if modal_gate["status"] != "pass":
+        rejection_reasons.append("modal_hygiene_not_clean")
+    if performance_status != "pass":
+        rejection_reasons.append("performance_budget_not_met")
+
+    production_credit = not rejection_reasons
+    return {
+        "production_credit": production_credit,
+        "production_credit_ms": float(total_ms) if production_credit else 0.0,
+        "credited_output_slots": list(BWD_BWD_OUTPUT_NAMES) if production_credit else [],
+        "rejection_reasons": rejection_reasons,
+        "receipt_scope": record.get("receipt_scope"),
+        "required_output_slots": list(BWD_BWD_OUTPUT_NAMES),
+        "missing_output_slots": missing_slots,
+        "full_boundary_correctness": correctness.get("full_boundary_pass") is True,
+        "resource_metadata": resource_gate,
+        "hardware_tags": {
+            "reported": hardware_tags,
+            "allowed_optional_tags": list(OPTIONAL_HARDWARE_TAGS),
+            "h200_required_for_h200_budget": True,
+        },
+        "modal_hygiene": modal_gate,
+        "performance_budget": {
+            "status": performance_status,
+            "projected_bwd_bwd_ms": total_ms,
+            "budget_ms": budget_ms,
+        },
+    }
+
+
 def component_record_projection(
     record: dict[str, Any],
     *,
@@ -603,7 +844,7 @@ def component_record_projection(
     ref_allocated = ref.get("stage2_max_memory_allocated_gib")
     ref_reserved = ref.get("stage2_max_memory_reserved_gib")
 
-    return {
+    projection = {
         "candidate_id": record.get("candidate_id"),
         "shape": record.get("shape"),
         "projection_status": "missing_timing" if total_ms is None else "projected",
@@ -643,6 +884,11 @@ def component_record_projection(
             and bool(record.get("correctness", {}).get("full_boundary_pass"))
         ),
     }
+    projection["production_gate"] = production_candidate_gate(
+        record,
+        projection=projection,
+    )
+    return projection
 
 
 def _dim_value(expr: str, shape: Shape) -> int:
@@ -742,11 +988,28 @@ def readiness_gates() -> list[dict[str, str]]:
     return [
         {
             "gate": "full_boundary_correctness",
-            "requirement": "all bwd_bwd output slots match main_guarded_stage2 within declared tolerance",
+            "requirement": (
+                "all real mamba_mimo_bwd_bwd output slots match "
+                "main_guarded_stage2 within declared tolerance"
+            ),
         },
         {
             "gate": "no_missing_work",
             "requirement": "off-time/state work plus full DK/DQ/DV/DMIMO_V/scalar outputs are implemented in-kernel",
+        },
+        {
+            "gate": "reject_micro_gemm_only",
+            "requirement": (
+                "correct CuTe/CUDA micro-GEMM receipts are component receipts only; "
+                "they earn zero production credit until mapped to the real output slots"
+            ),
+        },
+        {
+            "gate": "resource_metadata",
+            "requirement": (
+                "registers/thread, shared-memory bytes, active blocks/SM, and "
+                "theoretical occupancy are reported for the integrated candidate"
+            ),
         },
         {
             "gate": "memory",
@@ -761,8 +1024,15 @@ def readiness_gates() -> list[dict[str, str]]:
             "requirement": "H200 smoke and productionish A/B pass against main_guarded_stage2",
         },
         {
+            "gate": "hardware_tags",
+            "requirement": (
+                "receipts may tag H100/H200/B200 evidence; H200 evidence is "
+                "required before consuming the H200 production budget"
+            ),
+        },
+        {
             "gate": "portability",
-            "requirement": "H100 smoke or another agreed portability smoke passes",
+            "requirement": "H100 smoke, B200 smoke, or another agreed portability smoke passes",
         },
         {
             "gate": "training_ab",
@@ -842,12 +1112,14 @@ def candidate_configs(
     ]
 
     for record in component_records:
+        projection = component_record_projection(record)
         configs.append(
             {
                 "candidate_id": record["candidate_id"],
                 "display_name": record["display_name"],
                 "role": record["role"],
                 "implementation_class": record["implementation_class"],
+                "receipt_scope": record["receipt_scope"],
                 "source": record["source"],
                 "shape": record["shape"],
                 "status": record["status"],
@@ -857,12 +1129,15 @@ def candidate_configs(
                     "covered_slots": record["covered_slots"],
                     "missing_slots": record["missing_slots"],
                 },
-                "component_projection": component_record_projection(record),
+                "component_projection": projection,
+                "production_gate": projection["production_gate"],
                 "boundary_contract": {
                     "required_outputs": list(BWD_BWD_OUTPUT_NAMES),
                     "readiness_gates": readiness_gates(),
                 },
                 "metadata": record.get("metadata") or {},
+                "hardware_tags": record.get("hardware_tags") or [],
+                "modal_hygiene": record.get("modal_hygiene") or {},
                 "gate_budget": record.get("gate_budget") or {},
             }
         )

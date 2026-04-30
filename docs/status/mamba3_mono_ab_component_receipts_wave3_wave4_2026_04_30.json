@@ -20,6 +20,12 @@
       "status": "available"
     },
     {
+      "doc": "docs/status/mamba3_mono_cute_chunk_wave4_2026_04_30.md",
+      "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cute-chunk",
+      "source_commit": "dc532db",
+      "status": "available"
+    },
+    {
       "doc": "docs/status/mamba3_mono_wgmma_plan_wave3_2026_04_30.md",
       "receipt_json": "docs/status/mamba3_mono_wgmma_plan_wave3_receipt_2026_04_30.json",
       "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-triton-model",
@@ -114,6 +120,78 @@
         }
       },
       "note": "CuTe stack is viable and quack-gemm is exact for 64x64x64, but the in-repo hand-written CuTe WGMMA kernel has wrong numerics and earns no production gate credit."
+    },
+    {
+      "candidate_id": "wave4_cute_handwritten_wgmma_micro_gemm_correct",
+      "display_name": "Wave4 hand-written CuTe WGMMA micro-GEMM correct",
+      "role": "external_component_candidate",
+      "implementation_class": "cute_dsl_handwritten_wgmma_micro_gemm",
+      "shape": "cute_gemm_64x64x64",
+      "receipt_scope": "micro_gemm_only",
+      "status": "correct_micro_gemm_only",
+      "hardware_tags": [
+        "H200"
+      ],
+      "source": {
+        "lane": "mono-cute-chunk",
+        "branch": "worker/mamba3-mono-cute-chunk",
+        "commit": "dc532db",
+        "doc": "docs/status/mamba3_mono_cute_chunk_wave4_2026_04_30.md",
+        "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cute-chunk"
+      },
+      "components": [
+        {
+          "component_id": "handwritten_cute_wgmma_64x64x64_scalar_copy",
+          "mean_ms": 0.02825424,
+          "launches": 1,
+          "covered_slots": [],
+          "include_in_projection": false,
+          "status": "correct_micro_gemm",
+          "note": "Single 64x64x64 BF16 CuTe WGMMA smoke. It does not write any real Mamba3 bwd_bwd output slot."
+        }
+      ],
+      "correctness": {
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "full_boundary_pass": false,
+        "micro_gemm_pass": true,
+        "details": {
+          "shape": "M=N=K=64 BF16",
+          "identity_transpose_max_abs": 0.0,
+          "structured_mod_max_abs": 0.0,
+          "random_seed_42_max_abs": 0.0,
+          "compile_first_launch_s": 0.82,
+          "timing_us_per_iter": 28.25424,
+          "throughput_tflops": 0.0186
+        }
+      },
+      "reference": {
+        "stage2_bwd_bwd_ms": 3.70674
+      },
+      "metadata": {
+        "copy_strategy": "scalar_bf16_gmem_smem",
+        "accumulator": "fp32_wgmma",
+        "resource_metadata_status": "not_reported_for_integrated_mamba3_boundary"
+      },
+      "modal_hygiene": {
+        "status": "pass",
+        "active_same_campaign_count": 0,
+        "apps": [
+          {
+            "app_id": "ap-SZhp2YPr82ZDy0PzvRwzUM",
+            "description": "cute-gemm",
+            "state": "stopped",
+            "tasks": 0
+          },
+          {
+            "app_id": "ap-OdDXzbiA0H0DzWiOr5dlFL",
+            "description": "cute-check",
+            "state": "stopped",
+            "tasks": 0
+          }
+        ]
+      },
+      "note": "Correct CuTe micro-GEMM receipt only. The production gate must assign zero production credit until this covers the real bwd_bwd output slots, reports integrated resource metadata, and beats the H200 TileLang budget."
     },
     {
       "candidate_id": "wave3_wgmma_plan_budget",
