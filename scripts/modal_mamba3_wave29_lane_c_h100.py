@@ -5,8 +5,9 @@ Runs only H100 component shapes. The script compares:
 * installed baseline mamba_ssm TileLang source
 * current guarded stage2 force-nonTMA patch, bf=1,bb=0
 
-It also records allocator/reserved-memory deltas and wraps split-kernel timing
-loops in NVTX ranges so later nsys/ncu runs can reuse the same entry point.
+It also records allocator/reserved-memory deltas and can wrap targeted
+stage2 split-kernel timing loops in NVTX ranges or CUDA profiler API windows
+so later nsys/ncu runs can reuse the same entry point.
 """
 # ruff: noqa: E402
 
@@ -227,7 +228,39 @@ def _split_once(mod, args):
     return bf, bb, (states, qk_dot, dk, dv, dmimo_v, dq, dfactor, dgamma_diag, dangles, dD, ddA, dSSdA, ddA_cs_rev, ddA_cs, q_flat, k_flat)
 
 
-def _bench_split(mod, args, warmup, iters):
+def _truthy_env(name):
+    return os.environ.get(name, "0") in ("1", "true", "True", "yes", "on")
+
+
+def _profile_targets():
+    raw = os.environ.get("CPPMEGA_MAMBA3_STAGE2_PROFILE_TARGET", "stage2_current")
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _profile_targeted(variant_name):
+    targets = _profile_targets()
+    return "*" in targets or variant_name in targets
+
+
+def _cuda_profiler_start(events, label):
+    try:
+        torch.cuda.cudart().cudaProfilerStart()
+        events.append({"label": label, "event": "cudaProfilerStart", "ok": True})
+        return True
+    except Exception as exc:
+        events.append({"label": label, "event": "cudaProfilerStart", "ok": False, "error": str(exc)})
+        return False
+
+
+def _cuda_profiler_stop(events, label):
+    try:
+        torch.cuda.cudart().cudaProfilerStop()
+        events.append({"label": label, "event": "cudaProfilerStop", "ok": True})
+    except Exception as exc:
+        events.append({"label": label, "event": "cudaProfilerStop", "ok": False, "error": str(exc)})
+
+
+def _bench_split(mod, variant_name, shape_name, args, warmup, iters):
     bf, bb, bufs = _split_once(mod, args)
     states, qk_dot, dk, dv, dmimo_v, dq, dfactor, dgamma_diag, dangles, dD, ddA, dSSdA, ddA_cs_rev, ddA_cs, q_flat, k_flat = bufs
     B, S, R, G, N = args["q"].shape
@@ -245,31 +278,47 @@ def _bench_split(mod, args, warmup, iters):
            args["dA_cs"], args["dA_cs_rev"], args["dt"], args["trap"], dfactor,
            dgamma_diag, dangles, args["D"], dD, qk_dot, ddA, dSSdA, ddA_cs_rev,
            ddA_cs, args["segsum"])
-    enable_nvtx = os.environ.get("CPPMEGA_MAMBA3_STAGE2_PROFILE_NVTX", "0") in ("1", "true", "True")
+    targeted = _profile_targeted(variant_name)
+    enable_nvtx = _truthy_env("CPPMEGA_MAMBA3_STAGE2_PROFILE_NVTX") and targeted
+    enable_cuda_profile = _truthy_env("CPPMEGA_MAMBA3_STAGE2_PROFILE_CUDA") and targeted
+    profiler_events = []
     def time_fn(label, fn):
+        range_base = f"mamba3_stage2:{variant_name}:{shape_name}:{label}"
         for _ in range(warmup):
             if enable_nvtx:
-                torch.cuda.nvtx.range_push(f"warmup:{label}")
+                torch.cuda.nvtx.range_push(f"{range_base}:warmup")
             fn()
             if enable_nvtx:
                 torch.cuda.nvtx.range_pop()
         torch.cuda.synchronize()
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
+        if enable_cuda_profile:
+            _cuda_profiler_start(profiler_events, f"{range_base}:bench")
         start.record()
-        for _ in range(iters):
-            if enable_nvtx:
-                torch.cuda.nvtx.range_push(f"bench:{label}")
-            fn()
-            if enable_nvtx:
-                torch.cuda.nvtx.range_pop()
+        for i in range(iters):
+            pushed = False
+            try:
+                if enable_nvtx:
+                    torch.cuda.nvtx.range_push(f"{range_base}:bench:{i}")
+                    pushed = True
+                fn()
+            finally:
+                if pushed:
+                    torch.cuda.nvtx.range_pop()
         end.record()
         torch.cuda.synchronize()
+        if enable_cuda_profile:
+            _cuda_profiler_stop(profiler_events, f"{range_base}:bench")
         return start.elapsed_time(end) / iters
     return {
         "bwd_fwd_ms": time_fn("bwd_fwd", run_bf),
         "bwd_bwd_ms": time_fn("bwd_bwd", run_bb),
         "nvtx_enabled": enable_nvtx,
+        "cuda_profile_enabled": enable_cuda_profile,
+        "profile_targeted": targeted,
+        "profile_target": sorted(_profile_targets()),
+        "profiler_events": profiler_events,
     }
 
 
@@ -303,6 +352,8 @@ def main():
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
         "profile_nvtx": os.environ.get("CPPMEGA_MAMBA3_STAGE2_PROFILE_NVTX", "0"),
+        "profile_cuda": os.environ.get("CPPMEGA_MAMBA3_STAGE2_PROFILE_CUDA", "0"),
+        "profile_target": os.environ.get("CPPMEGA_MAMBA3_STAGE2_PROFILE_TARGET", "stage2_current"),
         "installed_mamba3_bwd": str(installed),
         "patch_path": str(PATCH_PATH),
         "variants": {},
@@ -330,7 +381,7 @@ def main():
         for name in ("baseline", "stage2_current"):
             args = _inputs(shape)
             chain = _bench_combined(modules[name], args, warmup=2, iters=8)
-            split = _bench_split(modules[name], args, warmup=2, iters=8)
+            split = _bench_split(modules[name], name, shape["name"], args, warmup=2, iters=8)
             shape_result["bench"][name] = {**chain, **split}
             del args
             torch.cuda.empty_cache()
@@ -349,7 +400,12 @@ if __name__ == "__main__":
     timeout=3600,
     volumes={"/vol": results_vol},
 )
-def run_bench(run_id: str, profile_nvtx: bool = False) -> dict[str, Any]:
+def run_bench(
+    run_id: str,
+    profile_nvtx: bool = False,
+    cuda_profile: bool = False,
+    profile_target: str = "stage2_current",
+) -> dict[str, Any]:
     out_dir = pathlib.Path("/vol") / BENCH_DIR.lstrip("/") / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
     progress_file = out_dir / "progress.txt"
@@ -364,6 +420,10 @@ def run_bench(run_id: str, profile_nvtx: bool = False) -> dict[str, Any]:
     child_env["PYTHONPATH"] = "/opt/cppmega:/opt/megatron-lm"
     if profile_nvtx:
         child_env["CPPMEGA_MAMBA3_STAGE2_PROFILE_NVTX"] = "1"
+    if cuda_profile:
+        child_env["CPPMEGA_MAMBA3_STAGE2_PROFILE_CUDA"] = "1"
+    if profile_target:
+        child_env["CPPMEGA_MAMBA3_STAGE2_PROFILE_TARGET"] = profile_target
 
     # Verify the production applier gates against the installed source path.
     mark("applier_noop_start")
@@ -493,10 +553,12 @@ def main(
     run_id: str = "wave29_lane_c_h100",
     verify_applier: bool = False,
     profile_nvtx: bool = False,
+    cuda_profile: bool = False,
+    profile_target: str = "stage2_current",
 ):
     result = (
         verify_applier_mutation.remote()
         if verify_applier
-        else run_bench.remote(run_id, profile_nvtx)
+        else run_bench.remote(run_id, profile_nvtx, cuda_profile, profile_target)
     )
     print(json.dumps(result, indent=2, sort_keys=True))
