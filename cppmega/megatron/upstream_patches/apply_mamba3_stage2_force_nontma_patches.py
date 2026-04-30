@@ -214,7 +214,26 @@ def rollback() -> None:
     )
 
 
-def _run_once_with_local_rank_guard(fn) -> None:
+def _is_stage2_patch_applied() -> bool:
+    try:
+        path = _find_mamba3_bwd_file()
+        if not _is_patched(path.read_text()):
+            return False
+        _validate_patched(path)
+        return True
+    except Exception:
+        return False
+
+
+def _is_stage2_patch_absent() -> bool:
+    try:
+        text = _find_mamba3_bwd_file().read_text()
+        return not _is_patched(text) and not _has_partial_stage2_markers(text)
+    except Exception:
+        return False
+
+
+def _run_once_with_local_rank_guard(fn, is_done=None) -> None:
     try:
         import torch.distributed as dist
     except Exception:
@@ -264,7 +283,9 @@ def _run_once_with_local_rank_guard(fn) -> None:
             with open(lock_path) as lock_fh:
                 fcntl.flock(lock_fh.fileno(), fcntl.LOCK_SH)
                 try:
-                    if sentinel in lock_fh.read():
+                    if sentinel in lock_fh.read() and (
+                        is_done is None or is_done()
+                    ):
                         return
                 finally:
                     fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
@@ -277,7 +298,7 @@ def _run_once_with_local_rank_guard(fn) -> None:
 def apply_all() -> None:
     """Apply the stage2 patch if explicit mutation gates are set."""
     if os.environ.get(_ROLLBACK_FLAG, "0") in ("1", "true", "True"):
-        _run_once_with_local_rank_guard(rollback)
+        _run_once_with_local_rank_guard(rollback, _is_stage2_patch_absent)
         return
     if os.environ.get(_ENV_FLAG, "0") not in ("1", "true", "True"):
         print(f"  SKIP {_ENV_FLAG} is not set")
@@ -286,7 +307,7 @@ def apply_all() -> None:
         raise RuntimeError(
             f"Refusing to mutate installed mamba_ssm without {_ALLOW_MUTATION_FLAG}=1"
         )
-    _run_once_with_local_rank_guard(_do_patch)
+    _run_once_with_local_rank_guard(_do_patch, _is_stage2_patch_applied)
 
 
 def apply_if_requested() -> bool:
