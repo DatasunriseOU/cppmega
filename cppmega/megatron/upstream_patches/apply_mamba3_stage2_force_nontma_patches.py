@@ -49,6 +49,12 @@ _PATCHED_MARKERS = {
     "direct_qk": "qk_dot_shared[cs, r_out * R + r_in]",
 }
 
+_STRUCTURAL_PATCHED_MARKERS = {
+    name: marker
+    for name, marker in _PATCHED_MARKERS.items()
+    if name in ("flat_q", "flat_qk", "direct_qk")
+}
+
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[3]
@@ -84,8 +90,11 @@ def _is_patched(text: str) -> bool:
 
 
 def _has_partial_stage2_markers(text: str) -> bool:
-    count = sum(marker in text for marker in _PATCHED_MARKERS.values())
-    return 0 < count < len(_PATCHED_MARKERS)
+    structural_count = sum(marker in text for marker in _STRUCTURAL_PATCHED_MARKERS.values())
+    if structural_count == 0:
+        return False
+    full_count = sum(marker in text for marker in _PATCHED_MARKERS.values())
+    return full_count < len(_PATCHED_MARKERS)
 
 
 def _validate_patched(path: Path) -> None:
