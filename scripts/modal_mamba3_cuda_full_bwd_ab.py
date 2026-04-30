@@ -11,7 +11,8 @@ Run examples:
         --dry-run-schema \
         --shape-csv smoke \
         --monolithic-candidate-csv mono_chunk_v0 \
-        --candidate-record-path-csv docs/status/lane_a_component_record.md
+        --candidate-record-path-csv docs/status/lane_a_component_record.md \
+        --modal-hygiene-enforcement fail
 
     GHCR_TAG=785c3fd CPPMEGA_MODAL_GPU=H200 timeout 900s \
         modal run scripts/modal_mamba3_cuda_full_bwd_ab.py \

@@ -1,3 +1,7 @@
+from pathlib import Path
+
+import pytest
+
 from cppmega.megatron.mamba3_mono_ab_schema import (
     BWD_BWD_OUTPUT_NAMES,
     MAIN_GUARDED_STAGE2_COMMIT,
@@ -13,6 +17,9 @@ from cppmega.megatron.mamba3_mono_ab_schema import (
     slot_schema,
     summarize_slot_results,
 )
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_boundary_slot_shapes_for_smoke() -> None:
@@ -172,3 +179,38 @@ def test_candidate_configs_include_component_records_without_duplicate_future() 
     assert by_id["mono_lane_c"]["component_projection"]["projected_bwd_bwd_ms"] == 2.5
     assert by_id["mono_future"]["role"] == "future_monolithic_candidate"
     assert [config["candidate_id"] for config in configs].count("mono_lane_c") == 1
+
+
+def test_wave2_wave3_receipt_file_covers_reported_component_numbers() -> None:
+    receipt_path = (
+        REPO_ROOT
+        / "docs/status/mamba3_mono_ab_component_receipts_wave2_wave3_2026_04_30.json"
+    )
+    records = candidate_component_records_from_json(receipt_path.read_text(encoding="utf-8"))
+    by_id = {record["candidate_id"]: record for record in records}
+
+    wmma = component_record_projection(by_id["wave2_cuda_wmma_state_lkq_d"])
+    assert wmma["projected_bwd_bwd_ms"] == pytest.approx(8.919168281555176)
+    assert wmma["covered_slots"] == ["dv", "dmimo_v", "dssda"]
+    assert wmma["remaining_budget_ms_to_equal_stage2_bwd_bwd"] == pytest.approx(
+        -5.212428281555176
+    )
+
+    triton = component_record_projection(by_id["wave2_triton_pruned_lower_bound"])
+    assert triton["projected_bwd_bwd_ms"] == pytest.approx(8.79331)
+    assert triton["covered_slots"] == []
+    assert triton["missing_slots"] == list(BWD_BWD_OUTPUT_NAMES)
+
+    wave3_diag = component_record_projection(by_id["wave3_rr_diag_timestep_cta"])
+    assert wave3_diag["projected_bwd_bwd_ms"] == pytest.approx(2.6777)
+    assert wave3_diag["covered_slots"] == ["dk", "dq", "dgamma_diag"]
+
+    productionish_records = filter_candidate_component_records_for_shape(
+        records,
+        "productionish",
+    )
+    assert {record["candidate_id"] for record in productionish_records} == {
+        "wave2_cuda_wmma_state_lkq_d",
+        "wave2_triton_pruned_lower_bound",
+        "wave3_rr_diag_timestep_cta",
+    }

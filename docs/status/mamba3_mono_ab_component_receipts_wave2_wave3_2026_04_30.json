@@ -1,0 +1,170 @@
+{
+  "schema_version": "mamba3-mono-ab/v1",
+  "receipt_set": "mamba3-mono-ab-wave3-ingested-component-receipts",
+  "canonical_gate": {
+    "shape": "productionish",
+    "stage2_bwd_bwd_ms": 3.70674,
+    "wave9_covered_subset_ms": 2.48042,
+    "remaining_budget_ms": 1.22632,
+    "note": "Production H200 budget from docs/status/mamba3_cuda_bwd_bwd_10wave_summary_2026_04_30.md."
+  },
+  "candidate_component_records": [
+    {
+      "candidate_id": "wave2_cuda_wmma_state_lkq_d",
+      "display_name": "Wave2 CUDA WMMA state/LKQ/D chunk owner",
+      "role": "external_component_candidate",
+      "implementation_class": "cuda_wmma_chunk_owner",
+      "shape": "productionish",
+      "status": "negative_receipt",
+      "source": {
+        "lane": "mono-cuda-chunk",
+        "branch": "worker/mamba3-mono-cuda-chunk",
+        "doc": "docs/status/mamba3_mono_cuda_chunk_wave2_2026_04_30.md",
+        "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cuda-chunk"
+      },
+      "components": [
+        {
+          "component_id": "wmma_state_lkq_d_chunk_owner",
+          "mean_ms": 8.919168281555176,
+          "launches": 1,
+          "covered_slots": [
+            "dv",
+            "dmimo_v",
+            "dssda"
+          ],
+          "status": "reported",
+          "note": "H200 productionish WMMA slice; output contract is DV, per-chunk DMIMO_V, and DSSDA."
+        }
+      ],
+      "correctness": {
+        "max_abs": 4.76837158203125e-07,
+        "full_boundary_pass": false,
+        "details": {
+          "dv_vs_bf16_staged_ref": 4.76837158203125e-07,
+          "per_chunk_dmimo_v_vs_bf16_staged_ref": 3.069544618483633e-10,
+          "dssda_vs_bf16_staged_ref": 3.1086244689504383e-15
+        }
+      },
+      "reference": {
+        "stage2_bwd_bwd_ms": 3.70674
+      },
+      "note": "Already 2.406x slower than the full TileLang bwd_bwd reference before adding the rest of the boundary."
+    },
+    {
+      "candidate_id": "wave2_triton_pruned_lower_bound",
+      "display_name": "Wave2 Triton tile-pruned checksum lower bound",
+      "role": "external_component_candidate",
+      "implementation_class": "triton_pruned_owner_model",
+      "shape": "productionish",
+      "status": "negative_lower_bound",
+      "source": {
+        "lane": "mono-triton-model",
+        "branch": "worker/mamba3-mono-triton-model",
+        "doc": "docs/status/mamba3_mono_triton_pruned_wave2_2026_04_30.md",
+        "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-triton-model"
+      },
+      "components": [
+        {
+          "component_id": "tile_pruned_checksum_owner",
+          "mean_ms": 8.79331,
+          "launches": 1,
+          "covered_slots": [],
+          "status": "reported_lower_bound",
+          "note": "Checksum lower bound only; no full output stores and no official bwd_bwd slot coverage."
+        }
+      ],
+      "correctness": {
+        "max_abs": 7.650852e-04,
+        "full_boundary_pass": false,
+        "details": {
+          "productionish_batched_checksum_max_abs_delta": 7.650852e-04
+        }
+      },
+      "reference": {
+        "stage2_bwd_bwd_ms": 3.70674
+      },
+      "note": "Measured tile-pruned model is slower than TileLang before writing required outputs."
+    },
+    {
+      "candidate_id": "wave2_wmma_fallback_smoke",
+      "display_name": "Wave2 CuTe-lane WMMA fallback smoke",
+      "role": "external_component_candidate",
+      "implementation_class": "cuda_wmma_fallback_smoke",
+      "shape": "wmma_fallback_smoke_b1_s64_h4_p64",
+      "status": "smoke_only",
+      "source": {
+        "lane": "mono-cute-chunk",
+        "branch": "worker/mamba3-mono-cute-chunk",
+        "doc": "docs/status/mamba3_mono_cute_chunk_wave2_2026_04_30.md",
+        "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cute-chunk"
+      },
+      "components": [
+        {
+          "component_id": "preallocated_no_zero_wmma_fallback",
+          "mean_ms": 0.1556128,
+          "launches": 1,
+          "covered_slots": [
+            "dk",
+            "dv",
+            "dmimo_v",
+            "dq"
+          ],
+          "status": "reported_smoke",
+          "note": "Custom small smoke shape B=1,S=64,H=4,P=64; not comparable to productionish."
+        }
+      ],
+      "correctness": {
+        "max_abs": 8.9966e-04,
+        "full_boundary_pass": false,
+        "details": {
+          "dv": 3.6819e-04,
+          "dmimo_v": 8.9966e-04,
+          "dk_diag": 5.7446e-10,
+          "dq_diag": 5.1250e-10,
+          "lkq_checksum": 3.8743e-06
+        }
+      },
+      "note": "Smoke receipt only; next gate is standard smoke and productionish component timing."
+    },
+    {
+      "candidate_id": "wave3_rr_diag_timestep_cta",
+      "display_name": "Wave3 R x R diagonal timestep CTA",
+      "role": "external_component_candidate",
+      "implementation_class": "triton_rr_diag_microkernel",
+      "shape": "productionish",
+      "status": "partial_positive_microbench",
+      "source": {
+        "lane": "rr-diag-microkernel",
+        "branch": "worker/mamba3-rr-diag-microkernel",
+        "doc": "docs/status/mamba3_rr_diag_microkernel_wave3_2026_04_29.md"
+      },
+      "components": [
+        {
+          "component_id": "rr_diag_timestep_cta",
+          "mean_ms": 2.6777,
+          "launches": 1,
+          "covered_slots": [
+            "dk",
+            "dq",
+            "dgamma_diag"
+          ],
+          "status": "reported",
+          "note": "Standalone same-time R x R diagonal microbench; integration still required."
+        }
+      ],
+      "correctness": {
+        "max_abs": 1.19e-06,
+        "full_boundary_pass": false,
+        "details": {
+          "dgamma_diag": 1.19e-06,
+          "dk_delta": 7.15e-07,
+          "dq_delta": 7.15e-07
+        }
+      },
+      "reference": {
+        "stage2_bwd_bwd_ms": 3.70674
+      },
+      "note": "Positive as an isolated microkernel, but slower than the current covered-subset allocation for the same slots."
+    }
+  ]
+}
