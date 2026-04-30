@@ -271,3 +271,147 @@ def stage2_rr_diag_chunk_warp_owner_cuda_metadata(dout: torch.Tensor) -> dict[st
         return {}
     ext = _load_extension()
     return ext.stage2_rr_diag_chunk_warp_owner_metadata(dout)
+
+
+def stage2_qk_dv_chunk_warp_owner_cuda(
+    *,
+    dout: torch.Tensor,
+    mimo_v: torch.Tensor,
+    mimo_o: torch.Tensor,
+    qk_dot: torch.Tensor,
+    dt: torch.Tensor,
+    trap: torch.Tensor,
+    chunk_size: int = 16,
+) -> torch.Tensor:
+    """Run the wave7 qk_dot -> dPsiV -> dV chunk-warp consumer."""
+
+    if not dout.is_cuda:
+        raise RuntimeError("stage2 qk/dV chunk-warp CUDA path requires CUDA tensors")
+    ext = _load_extension()
+    return ext.stage2_qk_dv_chunk_warp_owner(
+        dout,
+        mimo_v,
+        mimo_o,
+        qk_dot,
+        dt,
+        trap,
+        chunk_size,
+    )
+
+
+def stage2_qk_dv_chunk_warp_owner_cuda_out(
+    *,
+    dout: torch.Tensor,
+    mimo_v: torch.Tensor,
+    mimo_o: torch.Tensor,
+    qk_dot: torch.Tensor,
+    dt: torch.Tensor,
+    trap: torch.Tensor,
+    dv_delta: torch.Tensor,
+    chunk_size: int = 16,
+) -> None:
+    if not dout.is_cuda:
+        raise RuntimeError("stage2 qk/dV chunk-warp CUDA path requires CUDA tensors")
+    ext = _load_extension()
+    ext.stage2_qk_dv_chunk_warp_owner_out(
+        dout,
+        mimo_v,
+        mimo_o,
+        qk_dot,
+        dt,
+        trap,
+        dv_delta,
+        chunk_size,
+    )
+
+
+def stage2_qk_dv_chunk_warp_owner_cuda_metadata(dout: torch.Tensor) -> dict[str, Any]:
+    if not dout.is_cuda:
+        return {}
+    ext = _load_extension()
+    return ext.stage2_qk_dv_chunk_warp_owner_metadata(dout)
+
+
+def stage2_rr_diag_qk_dv_chunk_warp_owner_cuda(
+    *,
+    dout: torch.Tensor,
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v: torch.Tensor,
+    q_bias: torch.Tensor,
+    k_bias: torch.Tensor,
+    mimo_v: torch.Tensor,
+    mimo_o: torch.Tensor,
+    qk_dot: torch.Tensor,
+    dt: torch.Tensor,
+    trap: torch.Tensor,
+    chunk_size: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the wave7 combined diagonal plus qk/dV chunk-warp prototype."""
+
+    if not dout.is_cuda:
+        raise RuntimeError("stage2 combined chunk-warp CUDA path requires CUDA tensors")
+    ext = _load_extension()
+    return ext.stage2_rr_diag_qk_dv_chunk_warp_owner(
+        dout,
+        q_flat,
+        k_flat,
+        v,
+        q_bias,
+        k_bias,
+        mimo_v,
+        mimo_o,
+        qk_dot,
+        dt,
+        trap,
+        chunk_size,
+    )
+
+
+def stage2_rr_diag_qk_dv_chunk_warp_owner_cuda_out(
+    *,
+    dout: torch.Tensor,
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v: torch.Tensor,
+    q_bias: torch.Tensor,
+    k_bias: torch.Tensor,
+    mimo_v: torch.Tensor,
+    mimo_o: torch.Tensor,
+    qk_dot: torch.Tensor,
+    dt: torch.Tensor,
+    trap: torch.Tensor,
+    dgamma_diag: torch.Tensor,
+    dk_delta: torch.Tensor,
+    dq_delta: torch.Tensor,
+    dv_delta: torch.Tensor,
+    chunk_size: int = 16,
+) -> None:
+    if not dout.is_cuda:
+        raise RuntimeError("stage2 combined chunk-warp CUDA path requires CUDA tensors")
+    ext = _load_extension()
+    ext.stage2_rr_diag_qk_dv_chunk_warp_owner_out(
+        dout,
+        q_flat,
+        k_flat,
+        v,
+        q_bias,
+        k_bias,
+        mimo_v,
+        mimo_o,
+        qk_dot,
+        dt,
+        trap,
+        dgamma_diag,
+        dk_delta,
+        dq_delta,
+        dv_delta,
+        chunk_size,
+    )
+
+
+def stage2_rr_diag_qk_dv_chunk_warp_owner_cuda_metadata(dout: torch.Tensor) -> dict[str, Any]:
+    if not dout.is_cuda:
+        return {}
+    ext = _load_extension()
+    return ext.stage2_rr_diag_qk_dv_chunk_warp_owner_metadata(dout)
