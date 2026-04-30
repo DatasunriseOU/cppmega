@@ -15,6 +15,7 @@ from cppmega.megatron.fastmtp_layer import (
     get_fastmtp_depth,
     get_fastmtp_lambda,
 )
+from cppmega.megatron.mxfp8_storage_islands import apply_mxfp8_storage_islands_from_env
 
 
 class CppMegaMambaModel(MambaModel):
@@ -32,6 +33,7 @@ class CppMegaMambaModel(MambaModel):
                 scatter_to_sequence_parallel=True,
                 tp_group=self.pg_collection.tp,
             )
+        apply_mxfp8_storage_islands_from_env(self)
         # FastMTP: when enabled on the post_process stage, create our own MTP
         # layer. This works WITHOUT Megatron's MTP pipeline stages -- the
         # hybrid_layer_pattern should have mtp_depths=0 and --mtp-num-layers

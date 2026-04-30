@@ -6,6 +6,7 @@ from megatron.core import tensor_parallel
 from megatron.core.models.gpt.gpt_model import GPTModel
 
 from cppmega.megatron.custom_embedding import CppMegaLanguageModelEmbedding
+from cppmega.megatron.mxfp8_storage_islands import apply_mxfp8_storage_islands_from_env
 
 
 class CppMegaGPTModel(GPTModel):
@@ -21,6 +22,7 @@ class CppMegaGPTModel(GPTModel):
                 scatter_to_sequence_parallel=True,
                 tp_group=self.pg_collection.tp,
             )
+        apply_mxfp8_storage_islands_from_env(self)
 
     def set_cppmega_structure_inputs(self, structure_inputs):
         self._cppmega_structure_inputs = structure_inputs

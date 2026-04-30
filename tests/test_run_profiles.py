@@ -183,6 +183,14 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
             "direct_tactic",
             "--mxfp8-flashinfer-tactic",
             "2",
+            "--mxfp8-storage-islands",
+            "trainable_mxfp8",
+            "--no-mxfp8-storage-island-ngram-table",
+            "--mxfp8-storage-island-ngram-out-proj",
+            "--mxfp8-storage-island-structure-table",
+            "--no-mxfp8-storage-island-pad-rows",
+            "--no-mxfp8-storage-island-pad-columns",
+            "--mxfp8-storage-island-columnwise",
         ],
     )
 
@@ -210,6 +218,15 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
     assert "export CPPMEGA_CCE_FUSE_MAIN_MTP_CE=1" in out
     assert "export CPPMEGA_FLASHINFER_MXFP8_RUNNER=direct_tactic" in out
     assert "export CPPMEGA_FLASHINFER_MXFP8_TACTIC=2" in out
+    assert "export CPPMEGA_MXFP8_STORAGE_ISLANDS=trainable_mxfp8" in out
+    assert "export CPPMEGA_MXFP8_STORAGE_ISLAND_EMBEDDING=1" in out
+    assert "export CPPMEGA_MXFP8_STORAGE_ISLAND_OUTPUT_LAYER=1" in out
+    assert "export CPPMEGA_MXFP8_STORAGE_ISLAND_NGRAM_TABLE=0" in out
+    assert "export CPPMEGA_MXFP8_STORAGE_ISLAND_NGRAM_OUT_PROJ=1" in out
+    assert "export CPPMEGA_MXFP8_STORAGE_ISLAND_STRUCTURE_TABLE=1" in out
+    assert "export CPPMEGA_MXFP8_STORAGE_ISLAND_PAD_ROWS=0" in out
+    assert "export CPPMEGA_MXFP8_STORAGE_ISLAND_PAD_COLUMNS=0" in out
+    assert "export CPPMEGA_MXFP8_STORAGE_ISLAND_COLUMNWISE=1" in out
     assert "--mtp-num-layers 1" in out
 
 
@@ -370,6 +387,46 @@ def test_mxfp8_transpose_emit_defaults_to_te_for_tn_adapter():
     env = profile_shell_assignments(profile)
     assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
     assert env["CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD"] == "0"
+    assert env["CPPMEGA_MXFP8_STORAGE_ISLANDS"] == "off"
+
+
+def test_mxfp8_storage_islands_render_typed_profile_env():
+    profile = get_run_profile("local_gb10_quarter")
+    profile.precision.fp8_recipe = "mxfp8"
+    profile.precision.mxfp8_storage_islands = "trainable_mxfp8"
+    profile.precision.mxfp8_storage_island_ngram_out_proj = True
+    profile.precision.mxfp8_storage_island_structure_table = True
+
+    env = profile_shell_assignments(profile)
+
+    assert env["CPPMEGA_MXFP8_STORAGE_ISLANDS"] == "trainable_mxfp8"
+    assert env["CPPMEGA_MXFP8_STORAGE_ISLAND_EMBEDDING"] == "1"
+    assert env["CPPMEGA_MXFP8_STORAGE_ISLAND_OUTPUT_LAYER"] == "1"
+    assert env["CPPMEGA_MXFP8_STORAGE_ISLAND_NGRAM_TABLE"] == "1"
+    assert env["CPPMEGA_MXFP8_STORAGE_ISLAND_NGRAM_OUT_PROJ"] == "1"
+    assert env["CPPMEGA_MXFP8_STORAGE_ISLAND_STRUCTURE_TABLE"] == "1"
+    assert env["CPPMEGA_MXFP8_STORAGE_ISLAND_STRUCTURE_UP_PROJ"] == "1"
+    assert env["CPPMEGA_MXFP8_STORAGE_ISLAND_PAD_ROWS"] == "1"
+    assert env["CPPMEGA_MXFP8_STORAGE_ISLAND_PAD_COLUMNS"] == "1"
+    assert env["CPPMEGA_MXFP8_STORAGE_ISLAND_COLUMNWISE"] == "0"
+
+
+def test_mxfp8_storage_islands_require_mxfp8_recipe():
+    profile = get_run_profile("local_gb10_quarter")
+    profile.precision.fp8_recipe = "tensorwise"
+    profile.precision.mxfp8_storage_islands = "trainable_mxfp8"
+
+    with pytest.raises(ValueError, match="requires fp8_recipe=mxfp8"):
+        profile_shell_assignments(profile)
+
+
+def test_mxfp8_storage_islands_rejects_frozen_probe_mode():
+    profile = get_run_profile("local_gb10_quarter")
+    profile.precision.fp8_recipe = "mxfp8"
+    profile.precision.mxfp8_storage_islands = "frozen_mxfp8"  # type: ignore[assignment]
+
+    with pytest.raises(ValueError, match="off\\|trainable_mxfp8"):
+        profile_shell_assignments(profile)
 
 
 def test_mxfp8_docs_pin_zero_copy_acceptance_counters():

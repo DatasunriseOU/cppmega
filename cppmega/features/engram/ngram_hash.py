@@ -149,6 +149,8 @@ class CppMegaNgramHashEmbedding(nn.Module):
         unified_indices = self._hash_all(token_ids)
         batch, num_tables, seq = unified_indices.shape
         flat_embeddings = F.embedding(unified_indices.reshape(-1), self.unified_table.weight)
+        if flat_embeddings.shape[-1] != self.embed_dim:
+            flat_embeddings = flat_embeddings[..., : self.embed_dim]
         embeddings = flat_embeddings.view(batch, num_tables, seq, self.embed_dim)
         embeddings = embeddings.permute(0, 2, 1, 3).reshape(
             batch,
