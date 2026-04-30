@@ -1,4 +1,6 @@
 .claude/
+.venv
+te-mxfp8-transpose-cast-pr
 tests/__pycache__/*
 cppmega/features/m2rnn/__pycache__/*
 cppmega/features/mamba3/__pycache__/*
