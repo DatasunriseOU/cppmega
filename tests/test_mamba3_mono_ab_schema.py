@@ -217,6 +217,127 @@ def test_local_component_speedup_gets_zero_credit_without_integrated_timing() ->
     assert gate["performance_budget"]["status"] == "pass"
 
 
+def test_low_live_set_cuda_timing_regression_gets_zero_production_credit() -> None:
+    records = candidate_component_records_from_json(
+        {
+            "candidate_component_records": [
+                {
+                    "candidate_id": "wave7_cuda_row_stream_low_live_set",
+                    "implementation_class": "cuda_row_stream_low_live_set",
+                    "receipt_scope": "bwd_bwd_component",
+                    "shape": "productionish",
+                    "projected_bwd_bwd_ms": 179.76535034179688,
+                    "covered_slots": list(BWD_BWD_OUTPUT_NAMES),
+                    "correctness": {"full_boundary_pass": True, "max_abs": 0.0},
+                    "hardware_tags": ["H200"],
+                    "metadata": {
+                        "timing_scope": "integrated_full_bwd_bwd",
+                        "registers_per_thread": 125,
+                        "dynamic_smem_bytes": 42244,
+                        "active_blocks_per_sm": 2,
+                        "theoretical_occupancy": 0.25,
+                        "total_ctas": 32768,
+                        "h200_sm_count": 132,
+                    },
+                    "modal_hygiene": {
+                        "status": "pass",
+                        "active_same_campaign_count": 0,
+                    },
+                    "reference": {"stage2_bwd_bwd_ms": 3.70674},
+                }
+            ]
+        }
+    )
+
+    projection = component_record_projection(records[0])
+    gate = projection["production_gate"]
+
+    assert projection["projected_bwd_bwd_ms"] == pytest.approx(179.76535034179688)
+    assert projection["ratio_vs_stage2_bwd_bwd"] == pytest.approx(
+        179.76535034179688 / 3.70674
+    )
+    assert gate["resource_metadata"]["status"] == "pass"
+    assert gate["cta_count_occupancy"]["status"] == "pass"
+    assert gate["cta_count_occupancy"]["ctas_per_sm"] == pytest.approx(32768 / 132)
+    assert gate["integrated_timing"]["status"] == "pass"
+    assert gate["performance_budget"]["status"] == "fail"
+    assert gate["production_credit"] is False
+    assert gate["production_credit_ms"] == 0.0
+    assert gate["credited_output_slots"] == []
+    assert gate["rejection_reasons"] == ["performance_budget_not_met"]
+
+
+def test_cute_one_chunk_fusion_is_promising_but_zero_production_credit() -> None:
+    records = candidate_component_records_from_json(
+        {
+            "candidate_component_records": [
+                {
+                    "candidate_id": "wave7_cute_fused_state_apply_consumers_one_chunk",
+                    "implementation_class": (
+                        "cute_dsl_fused_state_apply_consumers_one_chunk"
+                    ),
+                    "receipt_scope": "local_component_speedup",
+                    "shape": "cute_lkq_chain_tile",
+                    "status": "promising_research_only",
+                    "projected_bwd_bwd_ms": 0.063419,
+                    "covered_slots": [],
+                    "correctness": {
+                        "full_boundary_pass": False,
+                        "one_chunk_fused_consumer_pass": True,
+                        "max_abs": 7.8604e-07,
+                        "tolerance": 1e-5,
+                    },
+                    "hardware_tags": ["H200"],
+                    "metadata": {
+                        "timing_scope": "one_chunk_local_tile_chain",
+                        "integrated_full_slot_timing": False,
+                        "registers_per_thread": 64,
+                        "dynamic_smem_bytes": 32768,
+                        "active_blocks_per_sm": 4,
+                        "theoretical_occupancy": 0.5,
+                        "total_ctas": 264,
+                        "h200_sm_count": 132,
+                        "removed_global_outputs_for_fused_path": [
+                            "LKQ",
+                            "state",
+                            "apply",
+                            "dpsi",
+                        ],
+                    },
+                    "modal_hygiene": {
+                        "status": "pass",
+                        "active_same_campaign_count": 0,
+                    },
+                    "reference": {"stage2_bwd_bwd_ms": 3.70674},
+                }
+            ]
+        }
+    )
+
+    projection = component_record_projection(records[0])
+    gate = projection["production_gate"]
+
+    assert records[0]["status"] == "promising_research_only"
+    assert records[0]["correctness"]["one_chunk_fused_consumer_pass"] is True
+    assert records[0]["correctness"]["max_abs"] <= records[0]["correctness"]["tolerance"]
+    assert records[0]["metadata"]["removed_global_outputs_for_fused_path"] == [
+        "LKQ",
+        "state",
+        "apply",
+        "dpsi",
+    ]
+    assert projection["projected_bwd_bwd_ms"] == pytest.approx(0.063419)
+    assert projection["covered_slots"] == []
+    assert gate["production_credit"] is False
+    assert gate["production_credit_ms"] == 0.0
+    assert gate["credited_output_slots"] == []
+    assert "non_integrated_timing_receipt" in gate["rejection_reasons"]
+    assert "missing_required_output_slots" in gate["rejection_reasons"]
+    assert "full_boundary_correctness_not_reported" in gate["rejection_reasons"]
+    assert gate["integrated_timing"]["status"] == "local_component_only"
+    assert gate["performance_budget"]["status"] == "pass"
+
+
 def test_incomplete_slot_coverage_rejects_boundary_candidate() -> None:
     covered = [name for name in BWD_BWD_OUTPUT_NAMES if name != "dda_cs"]
     records = candidate_component_records_from_json(
@@ -499,6 +620,48 @@ def test_wave3_wave4_receipt_file_gates_current_research_numbers() -> None:
         "fused_chain_us"
     ] == pytest.approx(63.550)
 
+    row_stream = component_record_projection(
+        by_id["wave7_cuda_row_stream_low_live_set"]
+    )
+    row_gate = row_stream["production_gate"]
+    assert row_stream["projected_bwd_bwd_ms"] == pytest.approx(179.76535034179688)
+    assert row_stream["covered_slots"] == ["dv", "dmimo_v", "dssda"]
+    assert row_gate["production_credit"] is False
+    assert row_gate["production_credit_ms"] == 0.0
+    assert "performance_budget_not_met" in row_gate["rejection_reasons"]
+    assert row_gate["cta_count_occupancy"]["status"] == "pass"
+    assert row_gate["resource_metadata"]["present"]["active_blocks_per_sm"] == 2
+    assert by_id["wave7_cuda_row_stream_low_live_set"]["metadata"][
+        "ratio_vs_tilelang_stage2_bwd_bwd"
+    ] == pytest.approx(48.496886844450074)
+    assert by_id["wave7_cuda_row_stream_low_live_set"]["correctness"][
+        "subset_pass"
+    ] is True
+
+    cute_consumers = component_record_projection(
+        by_id["wave7_cute_fused_state_apply_consumers_one_chunk"]
+    )
+    cute_consumers_gate = cute_consumers["production_gate"]
+    assert by_id["wave7_cute_fused_state_apply_consumers_one_chunk"]["status"] == (
+        "promising_research_only"
+    )
+    assert cute_consumers["projected_bwd_bwd_ms"] == pytest.approx(0.063419)
+    assert cute_consumers["covered_slots"] == []
+    assert cute_consumers_gate["production_credit"] is False
+    assert cute_consumers_gate["production_credit_ms"] == 0.0
+    assert "non_integrated_timing_receipt" in cute_consumers_gate["rejection_reasons"]
+    assert "missing_required_output_slots" in cute_consumers_gate["rejection_reasons"]
+    assert cute_consumers_gate["integrated_timing"]["status"] == "local_component_only"
+    assert by_id["wave7_cute_fused_state_apply_consumers_one_chunk"]["correctness"][
+        "one_chunk_fused_consumer_pass"
+    ] is True
+    assert by_id["wave7_cute_fused_state_apply_consumers_one_chunk"]["metadata"][
+        "fused_consumer_us"
+    ] == pytest.approx(63.419)
+    assert by_id["wave7_cute_fused_state_apply_consumers_one_chunk"]["metadata"][
+        "removed_global_outputs_for_fused_path"
+    ] == ["LKQ", "state", "apply", "dpsi"]
+
     productionish_records = filter_candidate_component_records_for_shape(
         records,
         "productionish",
@@ -508,6 +671,7 @@ def test_wave3_wave4_receipt_file_gates_current_research_numbers() -> None:
         "wave3_wgmma_plan_budget",
         "wave4_rr_diag_cuda_timestep_cta",
         "wave5_cuda_scan_owner_dv_dmimov_dssda",
+        "wave7_cuda_row_stream_low_live_set",
     }
 
 

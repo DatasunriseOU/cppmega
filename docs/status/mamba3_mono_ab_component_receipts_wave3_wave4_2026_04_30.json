@@ -1,6 +1,6 @@
 {
   "schema_version": "mamba3-mono-ab/v1",
-  "receipt_set": "mamba3-mono-ab-wave7-ingested-component-receipts",
+  "receipt_set": "mamba3-mono-ab-wave8-ingested-component-receipts",
   "canonical_gate": {
     "shape": "productionish",
     "stage2_bwd_bwd_ms": 3.70674,
@@ -30,6 +30,18 @@
       "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cute-chunk",
       "source_commit": "f163df8",
       "status": "available_research_progress"
+    },
+    {
+      "doc": "docs/status/mamba3_mono_cuda_chunk_wave7_2026_04_30.md",
+      "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cuda-chunk",
+      "source_commit": "a73439f",
+      "status": "available_rejected_context"
+    },
+    {
+      "doc": "docs/status/mamba3_mono_cute_chunk_wave7_2026_04_30.md",
+      "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cute-chunk",
+      "source_commit": "2a1467a",
+      "status": "available_promising_research_progress"
     },
     {
       "doc": "docs/status/mamba3_mono_cuda_chunk_wave6_2026_04_30.md",
@@ -295,6 +307,196 @@
         ]
       },
       "note": "Useful research progress only. The fused path removes the tested LKQ global output and improves the local tile chain from 104.710 us to 63.550 us, but it still has scalar copies, does not write the full bwd_bwd output-slot boundary, lacks integrated resource/CTA/memory metadata, and earns zero production credit."
+    },
+    {
+      "candidate_id": "wave7_cuda_row_stream_low_live_set",
+      "display_name": "Wave7 CUDA row-stream low-live-set",
+      "role": "external_component_candidate",
+      "implementation_class": "cuda_row_stream_low_live_set",
+      "shape": "productionish",
+      "receipt_scope": "bwd_bwd_component",
+      "status": "rejected_scalar_recompute_dead_end",
+      "hardware_tags": [
+        "H200"
+      ],
+      "source": {
+        "lane": "mono-cuda-chunk",
+        "branch": "worker/mamba3-mono-cuda-chunk",
+        "commit": "a73439f",
+        "doc": "docs/status/mamba3_mono_cuda_chunk_wave7_2026_04_30.md",
+        "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cuda-chunk"
+      },
+      "components": [
+        {
+          "component_id": "row_stream_dv_dmimov_dssda",
+          "mean_ms": 179.76535034179688,
+          "launches": 2,
+          "covered_slots": [
+            "dv",
+            "dmimo_v",
+            "dssda"
+          ],
+          "status": "reported_subset_correct_regressed",
+          "note": "H200 productionish row-stream subset with one main kernel plus DMIMO_V reduction. Low live-set reaches 2 blocks/SM, but scalar row recompute regresses runtime massively."
+        }
+      ],
+      "correctness": {
+        "max_abs": 4.76837158203125e-07,
+        "full_boundary_pass": false,
+        "subset_pass": true,
+        "details": {
+          "h200_productionish_vs_bf16_staged_torch_ref": {
+            "dv_delta": 4.76837158203125e-07,
+            "dmimo_v_delta": 1.862645149230957e-09,
+            "dssda_delta": 2.6645352591003757e-15
+          },
+          "h200_productionish_vs_wave1_fp32_ref": {
+            "dv_delta": 9.5367431640625e-07,
+            "dmimo_v_delta": 5.432055331766605e-06,
+            "dssda_delta": 3.33111316308532e-11
+          }
+        }
+      },
+      "reference": {
+        "stage2_bwd_bwd_ms": 3.70674
+      },
+      "metadata": {
+        "owner": "B,H,chunk row-stream",
+        "timing_scope": "component_subset_productionish",
+        "owner_ctas": 32768,
+        "reduction_ctas": 512,
+        "total_ctas": 32768,
+        "h200_sm_count": 132,
+        "ctas_per_sm_at_132_sms": 248.24242424242425,
+        "dynamic_smem_bytes": 42244,
+        "registers_per_thread": 125,
+        "active_blocks_per_sm": 2,
+        "theoretical_occupancy": 0.25,
+        "theoretical_occupancy_pct": 25.0,
+        "full_lkq_live_elements": 0,
+        "streamed_lkq_row_elements": 64,
+        "dmimov_scratch_mib": 64,
+        "ratio_vs_tilelang_stage2_bwd_bwd": 48.496886844450074
+      },
+      "modal_hygiene": {
+        "status": "pass",
+        "active_same_campaign_count": 0,
+        "apps": [
+          {
+            "app_id": "ap-7ZbpQdpx4rORGO6W0uBMKa",
+            "description": "wave7 row-stream smoke",
+            "state": "stopped",
+            "tasks": 0
+          },
+          {
+            "app_id": "ap-8voLXcCUJDZ50heMw5kzaR",
+            "description": "wave7 row-stream productionish",
+            "state": "stopped",
+            "tasks": 0
+          },
+          {
+            "app_id": "ap-mr53XCj8cEiJcqXH3p62RX",
+            "description": "wave7 row-stream verbose smoke",
+            "state": "stopped",
+            "tasks": 0
+          }
+        ]
+      },
+      "note": "Research-only negative receipt. The low-live-set schedule proves 2 active H200 blocks/SM is attainable without full LKQ residency, but scalar LKQ row recompute makes productionish runtime 179.765 ms, 48.5x slower than the 3.70674 ms TileLang stage2 budget."
+    },
+    {
+      "candidate_id": "wave7_cute_fused_state_apply_consumers_one_chunk",
+      "display_name": "Wave7 CuTe fused state/apply consumers one-chunk",
+      "role": "external_component_candidate",
+      "implementation_class": "cute_dsl_fused_state_apply_consumers_one_chunk",
+      "shape": "cute_lkq_chain_tile",
+      "receipt_scope": "local_component_speedup",
+      "status": "promising_research_only",
+      "hardware_tags": [
+        "H200"
+      ],
+      "source": {
+        "lane": "mono-cute-chunk",
+        "branch": "worker/mamba3-mono-cute-chunk",
+        "commit": "2a1467a",
+        "doc": "docs/status/mamba3_mono_cute_chunk_wave7_2026_04_30.md",
+        "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cute-chunk"
+      },
+      "components": [
+        {
+          "component_id": "fused_state_apply_consumers_one_chunk",
+          "mean_ms": 0.063419,
+          "launches": 1,
+          "covered_slots": [],
+          "status": "reported_one_chunk_speedup",
+          "note": "H200 fixed 64x64x64 one-chunk CuTe path. LKQ, state, apply, and dpsi no longer round-trip through global memory for the tested path, but this is not an integrated full bwd_bwd boundary timing."
+        }
+      ],
+      "correctness": {
+        "max_abs": 7.8604e-07,
+        "tolerance": 1e-05,
+        "full_boundary_pass": false,
+        "one_chunk_fused_consumer_pass": true,
+        "details": {
+          "structured_mod": {
+            "dv": 0.0,
+            "dmimo_v": 0.0
+          },
+          "random_seed": {
+            "dv": 7.8604e-07,
+            "dmimo_v": 4.3958e-07
+          },
+          "removed_global_outputs_for_fused_path": [
+            "LKQ",
+            "state",
+            "apply",
+            "dpsi"
+          ]
+        }
+      },
+      "reference": {
+        "stage2_bwd_bwd_ms": 3.70674
+      },
+      "metadata": {
+        "timing_scope": "one_chunk_local_tile_chain",
+        "integrated_full_slot_timing": false,
+        "tile_shape": "64x64x64",
+        "scalar_chain_us": 105.939,
+        "wave6_fused_apply_us": 71.36,
+        "fused_consumer_us": 63.419,
+        "local_speedup_vs_scalar": 1.67046,
+        "local_speedup_vs_wave6_fused_apply": 1.12522,
+        "iters": 20,
+        "compile_first_launch_s": 2.771,
+        "scalar_throughput_tflops": 0.0148,
+        "fused_consumer_throughput_tflops": 0.0251,
+        "copy_strategy": "scalar_bf16_universal_g2s_s2g",
+        "removed_global_outputs_for_fused_path": [
+          "LKQ",
+          "state",
+          "apply",
+          "dpsi"
+        ],
+        "remaining_global_outputs": [
+          "DV",
+          "DMIMO_V"
+        ],
+        "resource_metadata_status": "not_reported_for_integrated_mamba3_boundary"
+      },
+      "modal_hygiene": {
+        "status": "pass",
+        "active_same_campaign_count": 0,
+        "apps": [
+          {
+            "app_id": "ap-aq6JYUbEUesFRqr8FVSkoz",
+            "description": "cppmega-mamba3-mono-chunk-wave7-lane-b-codex-h200",
+            "state": "stopped",
+            "tasks": 0,
+            "stopped_at": "2026-04-30 11:44:20+00:00"
+          }
+        ]
+      },
+      "note": "Promising CuTe research receipt only. The one-chunk path removes global LKQ/state/apply/dpsi materialization and passes the 1e-5 local tolerance at 63.419 us/chain, but it is local-only, uses scalar copies/consumers, lacks full-boundary integrated timing, and earns zero production credit."
     },
     {
       "candidate_id": "wave5_cuda_scan_owner_dv_dmimov_dssda",
