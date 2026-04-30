@@ -48,10 +48,11 @@ def _load_extension() -> Any:
     p_tile = _env_int("RR_DIAG_DMIMO_P_TILE", 32)
     unroll = _env_int("RR_DIAG_DMIMO_UNROLL", 1)
     broadcast_qk = _env_flag("RR_DIAG_DMIMO_BROADCAST_QK", 0)
+    mono_p_tile = _env_int("RR_DIAG_MONO_P_TILE", 32)
     if threads % 32 != 0:
         raise RuntimeError(f"RR_DIAG_THREADS must be a warp multiple, got {threads}")
     suffix = _safe_suffix(os.environ.get("RR_DIAG_CUDA_EXT_SUFFIX", ""))
-    name = f"rr_diag_cuda_ext_wave10_t{threads}_p{p_tile}_u{unroll}_b{broadcast_qk}"
+    name = f"rr_diag_cuda_ext_wave11_t{threads}_p{p_tile}_u{unroll}_b{broadcast_qk}_m{mono_p_tile}"
     if suffix:
         name = f"{name}_{suffix}"
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "9.0")
@@ -67,6 +68,7 @@ def _load_extension() -> Any:
             f"-DRR_DIAG_DMIMO_P_TILE={p_tile}",
             f"-DRR_DIAG_DMIMO_UNROLL={unroll}",
             f"-DRR_DIAG_DMIMO_BROADCAST_QK={broadcast_qk}",
+            f"-DRR_DIAG_MONO_P_TILE={mono_p_tile}",
         ],
         extra_cflags=["-O3"],
         verbose=bool(int(os.environ.get("RR_DIAG_CUDA_VERBOSE_BUILD", "0"))),
@@ -738,3 +740,96 @@ def stage2_rr_diag_qk_dv_dmimo_v_owner_cuda_metadata(dout: torch.Tensor) -> dict
         return {}
     ext = _load_extension()
     return ext.stage2_rr_diag_qk_dv_dmimo_v_owner_metadata(dout)
+
+
+def stage2_mono_state_lkq_d_chunk_owner_cuda(
+    *,
+    dout: torch.Tensor,
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v: torch.Tensor,
+    q_bias: torch.Tensor,
+    k_bias: torch.Tensor,
+    mimo_v: torch.Tensor,
+    mimo_o: torch.Tensor,
+    dstates: torch.Tensor,
+    da_cs_rev: torch.Tensor,
+    segsum: torch.Tensor,
+    D: torch.Tensor,
+    chunk_size: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the Wave 1 monolithic state/LKQ/D chunk-owner prototype.
+
+    The returned tuple is ``(dv_delta, dmimo_v_chunk_delta, dssda_delta)``.
+    ``dmimo_v_chunk_delta`` is intentionally per-chunk; this first prototype
+    proves local intermediate reuse before choosing the final cross-chunk
+    reduction owner.
+    """
+
+    if not dout.is_cuda:
+        raise RuntimeError("stage2 monolithic chunk CUDA path requires CUDA tensors")
+    ext = _load_extension()
+    return ext.stage2_mono_state_lkq_d_chunk_owner(
+        dout,
+        q_flat,
+        k_flat,
+        v,
+        q_bias,
+        k_bias,
+        mimo_v,
+        mimo_o,
+        dstates,
+        da_cs_rev,
+        segsum,
+        D,
+        chunk_size,
+    )
+
+
+def stage2_mono_state_lkq_d_chunk_owner_cuda_out(
+    *,
+    dout: torch.Tensor,
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v: torch.Tensor,
+    q_bias: torch.Tensor,
+    k_bias: torch.Tensor,
+    mimo_v: torch.Tensor,
+    mimo_o: torch.Tensor,
+    dstates: torch.Tensor,
+    da_cs_rev: torch.Tensor,
+    segsum: torch.Tensor,
+    D: torch.Tensor,
+    dv_delta: torch.Tensor,
+    dmimo_v_chunk_delta: torch.Tensor,
+    dssda_delta: torch.Tensor,
+    chunk_size: int = 16,
+) -> None:
+    if not dout.is_cuda:
+        raise RuntimeError("stage2 monolithic chunk CUDA path requires CUDA tensors")
+    ext = _load_extension()
+    ext.stage2_mono_state_lkq_d_chunk_owner_out(
+        dout,
+        q_flat,
+        k_flat,
+        v,
+        q_bias,
+        k_bias,
+        mimo_v,
+        mimo_o,
+        dstates,
+        da_cs_rev,
+        segsum,
+        D,
+        dv_delta,
+        dmimo_v_chunk_delta,
+        dssda_delta,
+        chunk_size,
+    )
+
+
+def stage2_mono_state_lkq_d_chunk_owner_cuda_metadata(dout: torch.Tensor) -> dict[str, Any]:
+    if not dout.is_cuda:
+        return {}
+    ext = _load_extension()
+    return ext.stage2_mono_state_lkq_d_chunk_owner_metadata(dout)

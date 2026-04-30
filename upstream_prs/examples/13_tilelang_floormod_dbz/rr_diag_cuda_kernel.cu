@@ -25,17 +25,23 @@ constexpr int kChunk = 16;
 #ifndef RR_DIAG_DMIMO_BROADCAST_QK
 #define RR_DIAG_DMIMO_BROADCAST_QK 0
 #endif
+#ifndef RR_DIAG_MONO_P_TILE
+#define RR_DIAG_MONO_P_TILE 32
+#endif
 constexpr int kThreads = RR_DIAG_THREADS;
 constexpr int kWarps = kThreads / 32;
 constexpr int kPtile = RR_DIAG_DMIMO_P_TILE;
 constexpr int kDmimoUnroll = RR_DIAG_DMIMO_UNROLL;
 constexpr int kDmimoBroadcastQk = RR_DIAG_DMIMO_BROADCAST_QK;
+constexpr int kMonoPtile = RR_DIAG_MONO_P_TILE;
 constexpr int kDqkElems = kR * kR;
+constexpr int kFusedChunk = kChunk * kR;
 static_assert(kThreads > 0 && kThreads % 32 == 0, "RR_DIAG_THREADS must be a positive warp multiple");
 static_assert(kWarps > 0, "RR_DIAG_THREADS must provide at least one warp");
 static_assert(kPtile > 0, "RR_DIAG_DMIMO_P_TILE must be positive");
 static_assert(kDmimoUnroll > 0, "RR_DIAG_DMIMO_UNROLL must be positive");
 static_assert(kDmimoBroadcastQk == 0 || kDmimoBroadcastQk == 1, "RR_DIAG_DMIMO_BROADCAST_QK must be 0 or 1");
+static_assert(kMonoPtile > 0, "RR_DIAG_MONO_P_TILE must be positive");
 
 template <typename scalar_t>
 __device__ __forceinline__ float load_as_float(const scalar_t* ptr, int64_t offset) {
@@ -1262,6 +1268,207 @@ __global__ void stage2_rr_diag_qk_dv_dmimo_v_owner_kernel(
       ptiles);
 }
 
+template <typename scalar_t>
+__global__ void stage2_mono_state_lkq_d_chunk_owner_kernel(
+    const scalar_t* __restrict__ dout,
+    const scalar_t* __restrict__ q_flat,
+    const scalar_t* __restrict__ k_flat,
+    const scalar_t* __restrict__ v,
+    const float* __restrict__ q_bias,
+    const float* __restrict__ k_bias,
+    const float* __restrict__ mimo_v,
+    const float* __restrict__ mimo_o,
+    const scalar_t* __restrict__ dstates,
+    const float* __restrict__ da_cs_rev,
+    const float* __restrict__ segsum,
+    const float* __restrict__ D,
+    scalar_t* __restrict__ dv_delta,
+    float* __restrict__ dmimo_v_chunk_delta,
+    float* __restrict__ dssda_delta,
+    int64_t total_programs,
+    int B,
+    int S,
+    int H,
+    int G,
+    int N,
+    int P,
+    int R,
+    int nchunks,
+    int chunk_size) {
+  extern __shared__ float smem[];
+  float* lkq_s = smem;
+  float* dssda_s = lkq_s + kFusedChunk * kFusedChunk;
+  float* dpsi_s = dssda_s + kChunk * kChunk;
+
+  const int tid = threadIdx.x;
+  const int64_t pid = static_cast<int64_t>(blockIdx.x);
+  if (pid >= total_programs || R != kR || chunk_size != kChunk || blockDim.x != kThreads) {
+    return;
+  }
+
+  const int chunk = static_cast<int>(pid % nchunks);
+  const int64_t bh = pid / nchunks;
+  const int h = static_cast<int>(bh % H);
+  const int b = static_cast<int>(bh / H);
+  if (b >= B) {
+    return;
+  }
+
+  const int h_per_group = H / G;
+  const int h_qk = h / h_per_group;
+  const int chunk_start = chunk * kChunk;
+  const int64_t qk_flat_base = static_cast<int64_t>(b) * S * R * G * N + h_qk * N;
+  const int64_t bias_base = static_cast<int64_t>(h) * R * N;
+  const int64_t mimo_base = static_cast<int64_t>(h) * R * P;
+  const int64_t dstates_base = (((static_cast<int64_t>(b) * H + h) * nchunks + chunk) * N) * P;
+  const int64_t seg_base = (((static_cast<int64_t>(b) * H + h) * nchunks + chunk) * kChunk) * kChunk;
+  const int64_t dssda_base = seg_base;
+  const float d_value = D[h];
+
+  for (int e = tid; e < kFusedChunk * kFusedChunk; e += blockDim.x) {
+    const int row = e / kFusedChunk;
+    const int col = e - row * kFusedChunk;
+    const int cs_i = row / kR;
+    const int r_i = row - cs_i * kR;
+    const int cs_j = col / kR;
+    const int r_j = col - cs_j * kR;
+    const int s_i = chunk_start + cs_i;
+    const int s_j = chunk_start + cs_j;
+
+    float acc = 0.0f;
+    if (s_i < S && s_j < S) {
+      const int64_t k_row = qk_flat_base + (static_cast<int64_t>(s_i) * R + r_i) * G * N;
+      const int64_t q_row = qk_flat_base + (static_cast<int64_t>(s_j) * R + r_j) * G * N;
+      const int64_t k_bias_row = bias_base + static_cast<int64_t>(r_i) * N;
+      const int64_t q_bias_row = bias_base + static_cast<int64_t>(r_j) * N;
+      for (int n = 0; n < N; ++n) {
+        const float k_val = load_as_float(k_flat, k_row + n) + k_bias[k_bias_row + n];
+        const float q_val = load_as_float(q_flat, q_row + n) + q_bias[q_bias_row + n];
+        acc += k_val * q_val;
+      }
+    }
+    lkq_s[e] = acc;
+  }
+
+  for (int idx = tid; idx < kChunk * kChunk; idx += blockDim.x) {
+    dssda_s[idx] = 0.0f;
+  }
+  __syncthreads();
+
+  for (int e = tid; e < kFusedChunk * kFusedChunk; e += blockDim.x) {
+    const int row = e / kFusedChunk;
+    const int col = e - row * kFusedChunk;
+    const int cs_i = row / kR;
+    const int r_i = row - cs_i * kR;
+    const int cs_j = col / kR;
+    const int r_j = col - cs_j * kR;
+    const int s_i = chunk_start + cs_i;
+    const int s_j = chunk_start + cs_j;
+    if (s_i >= S || s_j >= S) {
+      continue;
+    }
+
+    const int64_t psi_timestep_base = ((static_cast<int64_t>(b) * S + s_i) * H + h) * P;
+    const int64_t dphi_timestep_base = ((static_cast<int64_t>(b) * S + s_j) * H + h) * P;
+    float dki = 0.0f;
+    for (int p = 0; p < P; ++p) {
+      const float psi = load_as_float(v, psi_timestep_base + p) *
+          mimo_v[mimo_base + static_cast<int64_t>(r_i) * P + p];
+      const float dphi = load_as_float(dout, dphi_timestep_base + p) *
+          mimo_o[mimo_base + static_cast<int64_t>(r_j) * P + p];
+      dki += psi * dphi;
+    }
+    atomicAdd(&dssda_s[cs_i * kChunk + cs_j], lkq_s[e] * dki);
+  }
+  __syncthreads();
+
+  for (int idx = tid; idx < kChunk * kChunk; idx += blockDim.x) {
+    const int cs_i = idx / kChunk;
+    const int cs_j = idx - cs_i * kChunk;
+    dssda_delta[dssda_base + cs_i * kChunk + cs_j] = dssda_s[idx];
+  }
+  __syncthreads();
+
+  for (int p0 = 0; p0 < P; p0 += kMonoPtile) {
+    const int tile_cols = (P - p0 < kMonoPtile) ? (P - p0) : kMonoPtile;
+
+    for (int idx = tid; idx < kFusedChunk * kMonoPtile; idx += blockDim.x) {
+      const int row = idx / kMonoPtile;
+      const int p_rel = idx - row * kMonoPtile;
+      const int p = p0 + p_rel;
+      const int cs_i = row / kR;
+      const int r_i = row - cs_i * kR;
+      const int s_i = chunk_start + cs_i;
+      float value = 0.0f;
+
+      if (p_rel < tile_cols && s_i < S) {
+        const int64_t k_row = qk_flat_base + (static_cast<int64_t>(s_i) * R + r_i) * G * N;
+        const int64_t k_bias_row = bias_base + static_cast<int64_t>(r_i) * N;
+        for (int n = 0; n < N; ++n) {
+          const float k_val = load_as_float(k_flat, k_row + n) + k_bias[k_bias_row + n];
+          const float ds = load_as_float(dstates, dstates_base + static_cast<int64_t>(n) * P + p);
+          value += k_val * ds;
+        }
+        value *= __expf(da_cs_rev[(static_cast<int64_t>(b) * H + h) * S + s_i]);
+
+        for (int col = 0; col < kFusedChunk; ++col) {
+          const int cs_j = col / kR;
+          const int r_j = col - cs_j * kR;
+          const int s_j = chunk_start + cs_j;
+          if (s_j < S && cs_i < cs_j) {
+            const float dphi = load_as_float(dout, ((static_cast<int64_t>(b) * S + s_j) * H + h) * P + p) *
+                mimo_o[mimo_base + static_cast<int64_t>(r_j) * P + p];
+            const float seg = __expf(segsum[seg_base + cs_i * kChunk + cs_j]);
+            value += lkq_s[row * kFusedChunk + col] * seg * dphi;
+          }
+        }
+
+        const float dphi_self = load_as_float(dout, ((static_cast<int64_t>(b) * S + s_i) * H + h) * P + p) *
+            mimo_o[mimo_base + static_cast<int64_t>(r_i) * P + p];
+        value += d_value * dphi_self;
+      }
+
+      dpsi_s[idx] = value;
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < kChunk * kMonoPtile; idx += blockDim.x) {
+      const int cs = idx / kMonoPtile;
+      const int p_rel = idx - cs * kMonoPtile;
+      const int p = p0 + p_rel;
+      const int s = chunk_start + cs;
+      if (p_rel < tile_cols && s < S) {
+        float dv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < kR; ++r) {
+          dv += dpsi_s[(cs * kR + r) * kMonoPtile + p_rel] *
+              mimo_v[mimo_base + static_cast<int64_t>(r) * P + p];
+        }
+        dv_delta[((static_cast<int64_t>(b) * S + s) * H + h) * P + p] = static_cast<scalar_t>(dv);
+      }
+    }
+
+    for (int idx = tid; idx < kR * kMonoPtile; idx += blockDim.x) {
+      const int r = idx / kMonoPtile;
+      const int p_rel = idx - r * kMonoPtile;
+      const int p = p0 + p_rel;
+      if (p_rel < tile_cols) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int cs = 0; cs < kChunk; ++cs) {
+          const int s = chunk_start + cs;
+          if (s < S) {
+            const float v_p = load_as_float(v, ((static_cast<int64_t>(b) * S + s) * H + h) * P + p);
+            acc += dpsi_s[(cs * kR + r) * kMonoPtile + p_rel] * v_p;
+          }
+        }
+        dmimo_v_chunk_delta[(((static_cast<int64_t>(b) * H + h) * nchunks + chunk) * R + r) * P + p] = acc;
+      }
+    }
+    __syncthreads();
+  }
+}
+
 void check_input(const at::Tensor& tensor, const char* name, at::ScalarType dtype) {
   TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
   TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
@@ -2353,6 +2560,225 @@ std::vector<at::Tensor> stage2_rr_diag_qk_dv_dmimo_v_owner(
   return {dgamma_diag, dk_delta, dq_delta, dv_delta, dmimo_v_delta};
 }
 
+size_t mono_state_lkq_d_smem_bytes() {
+  return sizeof(float) *
+      (kFusedChunk * kFusedChunk + kChunk * kChunk + kFusedChunk * kMonoPtile);
+}
+
+void validate_stage2_mono_state_lkq_d_inputs(
+    const at::Tensor& dout,
+    const at::Tensor& q_flat,
+    const at::Tensor& k_flat,
+    const at::Tensor& v,
+    const at::Tensor& q_bias,
+    const at::Tensor& k_bias,
+    const at::Tensor& mimo_v,
+    const at::Tensor& mimo_o,
+    const at::Tensor& dstates,
+    const at::Tensor& da_cs_rev,
+    const at::Tensor& segsum,
+    const at::Tensor& D,
+    int chunk_size) {
+  check_input(dout, "dout", dout.scalar_type());
+  check_input(q_flat, "q_flat", dout.scalar_type());
+  check_input(k_flat, "k_flat", dout.scalar_type());
+  check_input(v, "v", dout.scalar_type());
+  check_input(dstates, "dstates", dout.scalar_type());
+  TORCH_CHECK(q_bias.is_cuda() && q_bias.is_contiguous(), "q_bias must be contiguous CUDA");
+  TORCH_CHECK(k_bias.is_cuda() && k_bias.is_contiguous(), "k_bias must be contiguous CUDA");
+  TORCH_CHECK(mimo_v.is_cuda() && mimo_v.is_contiguous(), "mimo_v must be contiguous CUDA");
+  TORCH_CHECK(mimo_o.is_cuda() && mimo_o.is_contiguous(), "mimo_o must be contiguous CUDA");
+  TORCH_CHECK(da_cs_rev.is_cuda() && da_cs_rev.is_contiguous(), "da_cs_rev must be contiguous CUDA");
+  TORCH_CHECK(segsum.is_cuda() && segsum.is_contiguous(), "segsum must be contiguous CUDA");
+  TORCH_CHECK(D.is_cuda() && D.is_contiguous(), "D must be contiguous CUDA");
+  TORCH_CHECK(q_bias.scalar_type() == at::kFloat, "q_bias must be fp32");
+  TORCH_CHECK(k_bias.scalar_type() == at::kFloat, "k_bias must be fp32");
+  TORCH_CHECK(mimo_v.scalar_type() == at::kFloat, "mimo_v must be fp32");
+  TORCH_CHECK(mimo_o.scalar_type() == at::kFloat, "mimo_o must be fp32");
+  TORCH_CHECK(da_cs_rev.scalar_type() == at::kFloat, "da_cs_rev must be fp32");
+  TORCH_CHECK(segsum.scalar_type() == at::kFloat, "segsum must be fp32");
+  TORCH_CHECK(D.scalar_type() == at::kFloat, "D must be fp32");
+  TORCH_CHECK(chunk_size == kChunk, "monolithic chunk owner currently specializes chunk_size=16, got ", chunk_size);
+
+  TORCH_CHECK(dout.dim() == 4, "dout must have shape [B, S, H, P]");
+  const int B = static_cast<int>(dout.size(0));
+  const int S = static_cast<int>(dout.size(1));
+  const int H = static_cast<int>(dout.size(2));
+  const int P = static_cast<int>(dout.size(3));
+  const int nchunks = (S + chunk_size - 1) / chunk_size;
+  TORCH_CHECK(v.sizes() == dout.sizes(), "v shape mismatch");
+  TORCH_CHECK(q_bias.dim() == 3, "q_bias must have shape [H, R, N]");
+  TORCH_CHECK(k_bias.sizes() == q_bias.sizes(), "k_bias shape mismatch");
+
+  const int R = static_cast<int>(q_bias.size(1));
+  const int N = static_cast<int>(q_bias.size(2));
+  TORCH_CHECK(R == kR, "monolithic CUDA chunk kernel currently specializes R=4, got R=", R);
+  TORCH_CHECK(q_flat.dim() == 4, "q_flat must have shape [B, S*R, G, N]");
+  const int G = static_cast<int>(q_flat.size(2));
+  TORCH_CHECK(G > 0 && H % G == 0, "H must be divisible by G");
+  TORCH_CHECK(q_flat.sizes() == at::IntArrayRef({B, S * R, G, N}), "q_flat shape mismatch");
+  TORCH_CHECK(k_flat.sizes() == q_flat.sizes(), "k_flat shape mismatch");
+  TORCH_CHECK(mimo_v.sizes() == at::IntArrayRef({H, R, P}), "mimo_v shape mismatch");
+  TORCH_CHECK(mimo_o.sizes() == mimo_v.sizes(), "mimo_o shape mismatch");
+  TORCH_CHECK(dstates.sizes() == at::IntArrayRef({B, H, nchunks, N, P}), "dstates shape mismatch");
+  TORCH_CHECK(da_cs_rev.sizes() == at::IntArrayRef({B, H, S}), "da_cs_rev shape mismatch");
+  TORCH_CHECK(
+      segsum.sizes() == at::IntArrayRef({B, H, nchunks, chunk_size, chunk_size}),
+      "segsum shape mismatch");
+  TORCH_CHECK(D.sizes() == at::IntArrayRef({H}), "D shape mismatch");
+}
+
+void stage2_mono_state_lkq_d_chunk_owner_out(
+    const at::Tensor& dout,
+    const at::Tensor& q_flat,
+    const at::Tensor& k_flat,
+    const at::Tensor& v,
+    const at::Tensor& q_bias,
+    const at::Tensor& k_bias,
+    const at::Tensor& mimo_v,
+    const at::Tensor& mimo_o,
+    const at::Tensor& dstates,
+    const at::Tensor& da_cs_rev,
+    const at::Tensor& segsum,
+    const at::Tensor& D,
+    const at::Tensor& dv_delta,
+    const at::Tensor& dmimo_v_chunk_delta,
+    const at::Tensor& dssda_delta,
+    int chunk_size) {
+  validate_stage2_mono_state_lkq_d_inputs(
+      dout,
+      q_flat,
+      k_flat,
+      v,
+      q_bias,
+      k_bias,
+      mimo_v,
+      mimo_o,
+      dstates,
+      da_cs_rev,
+      segsum,
+      D,
+      chunk_size);
+  check_input(dv_delta, "dv_delta", dout.scalar_type());
+  TORCH_CHECK(
+      dmimo_v_chunk_delta.is_cuda() && dmimo_v_chunk_delta.is_contiguous(),
+      "dmimo_v_chunk_delta must be contiguous CUDA");
+  TORCH_CHECK(dssda_delta.is_cuda() && dssda_delta.is_contiguous(), "dssda_delta must be contiguous CUDA");
+  TORCH_CHECK(dmimo_v_chunk_delta.scalar_type() == at::kFloat, "dmimo_v_chunk_delta must be fp32");
+  TORCH_CHECK(dssda_delta.scalar_type() == at::kFloat, "dssda_delta must be fp32");
+
+  const int B = static_cast<int>(dout.size(0));
+  const int S = static_cast<int>(dout.size(1));
+  const int H = static_cast<int>(dout.size(2));
+  const int P = static_cast<int>(dout.size(3));
+  const int R = static_cast<int>(q_bias.size(1));
+  const int N = static_cast<int>(q_bias.size(2));
+  const int G = static_cast<int>(q_flat.size(2));
+  const int nchunks = (S + chunk_size - 1) / chunk_size;
+  TORCH_CHECK(dv_delta.sizes() == at::IntArrayRef({B, S, H, P}), "dv_delta shape mismatch");
+  TORCH_CHECK(
+      dmimo_v_chunk_delta.sizes() == at::IntArrayRef({B, H, nchunks, R, P}),
+      "dmimo_v_chunk_delta shape mismatch");
+  TORCH_CHECK(
+      dssda_delta.sizes() == at::IntArrayRef({B, H, nchunks, chunk_size, chunk_size}),
+      "dssda_delta shape mismatch");
+
+  const int64_t total_programs = static_cast<int64_t>(B) * H * nchunks;
+  const dim3 grid(static_cast<unsigned int>(total_programs));
+  const dim3 block(kThreads);
+  const size_t smem_bytes = mono_state_lkq_d_smem_bytes();
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, dout.scalar_type(), "stage2_mono_state_lkq_d_chunk_owner_out", [&] {
+    stage2_mono_state_lkq_d_chunk_owner_kernel<scalar_t><<<grid, block, smem_bytes, stream>>>(
+        dout.data_ptr<scalar_t>(),
+        q_flat.data_ptr<scalar_t>(),
+        k_flat.data_ptr<scalar_t>(),
+        v.data_ptr<scalar_t>(),
+        q_bias.data_ptr<float>(),
+        k_bias.data_ptr<float>(),
+        mimo_v.data_ptr<float>(),
+        mimo_o.data_ptr<float>(),
+        dstates.data_ptr<scalar_t>(),
+        da_cs_rev.data_ptr<float>(),
+        segsum.data_ptr<float>(),
+        D.data_ptr<float>(),
+        dv_delta.data_ptr<scalar_t>(),
+        dmimo_v_chunk_delta.data_ptr<float>(),
+        dssda_delta.data_ptr<float>(),
+        total_programs,
+        B,
+        S,
+        H,
+        G,
+        N,
+        P,
+        R,
+        nchunks,
+        chunk_size);
+  });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+std::vector<at::Tensor> stage2_mono_state_lkq_d_chunk_owner(
+    const at::Tensor& dout,
+    const at::Tensor& q_flat,
+    const at::Tensor& k_flat,
+    const at::Tensor& v,
+    const at::Tensor& q_bias,
+    const at::Tensor& k_bias,
+    const at::Tensor& mimo_v,
+    const at::Tensor& mimo_o,
+    const at::Tensor& dstates,
+    const at::Tensor& da_cs_rev,
+    const at::Tensor& segsum,
+    const at::Tensor& D,
+    int chunk_size) {
+  validate_stage2_mono_state_lkq_d_inputs(
+      dout,
+      q_flat,
+      k_flat,
+      v,
+      q_bias,
+      k_bias,
+      mimo_v,
+      mimo_o,
+      dstates,
+      da_cs_rev,
+      segsum,
+      D,
+      chunk_size);
+
+  const int B = static_cast<int>(dout.size(0));
+  const int S = static_cast<int>(dout.size(1));
+  const int H = static_cast<int>(dout.size(2));
+  const int P = static_cast<int>(dout.size(3));
+  const int R = static_cast<int>(q_bias.size(1));
+  const int nchunks = (S + chunk_size - 1) / chunk_size;
+  auto f32_opts = dout.options().dtype(at::kFloat);
+  at::Tensor dv_delta = at::empty({B, S, H, P}, dout.options());
+  at::Tensor dmimo_v_chunk_delta = at::empty({B, H, nchunks, R, P}, f32_opts);
+  at::Tensor dssda_delta = at::empty({B, H, nchunks, chunk_size, chunk_size}, f32_opts);
+  stage2_mono_state_lkq_d_chunk_owner_out(
+      dout,
+      q_flat,
+      k_flat,
+      v,
+      q_bias,
+      k_bias,
+      mimo_v,
+      mimo_o,
+      dstates,
+      da_cs_rev,
+      segsum,
+      D,
+      dv_delta,
+      dmimo_v_chunk_delta,
+      dssda_delta,
+      chunk_size);
+  return {dv_delta, dmimo_v_chunk_delta, dssda_delta};
+}
+
 template <typename scalar_t>
 py::dict metadata_for_dtype() {
   cudaFuncAttributes attrs{};
@@ -2740,6 +3166,46 @@ py::dict stage2_rr_diag_qk_dv_dmimo_v_owner_metadata_for_dtype() {
   return out;
 }
 
+template <typename scalar_t>
+py::dict stage2_mono_state_lkq_d_chunk_owner_metadata_for_dtype() {
+  cudaFuncAttributes attrs{};
+  C10_CUDA_CHECK(cudaFuncGetAttributes(&attrs, stage2_mono_state_lkq_d_chunk_owner_kernel<scalar_t>));
+
+  int device = 0;
+  C10_CUDA_CHECK(cudaGetDevice(&device));
+  cudaDeviceProp prop{};
+  C10_CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+
+  const size_t smem_bytes = mono_state_lkq_d_smem_bytes();
+  int active_blocks = 0;
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &active_blocks, stage2_mono_state_lkq_d_chunk_owner_kernel<scalar_t>, kThreads, smem_bytes));
+
+  py::dict out;
+  out["threads_per_block"] = kThreads;
+  out["warps_per_block"] = kWarps;
+  out["chunk_size"] = kChunk;
+  out["fused_chunk"] = kFusedChunk;
+  out["mono_p_tile"] = kMonoPtile;
+  out["owner"] = "B,H,chunk";
+  out["outputs"] = "DV, per-chunk DMIMO_V, DSSDA";
+  out["dynamic_smem_bytes"] = static_cast<int64_t>(smem_bytes);
+  out["num_regs"] = attrs.numRegs;
+  out["static_smem_bytes"] = static_cast<int64_t>(attrs.sharedSizeBytes);
+  out["const_bytes"] = static_cast<int64_t>(attrs.constSizeBytes);
+  out["local_bytes"] = static_cast<int64_t>(attrs.localSizeBytes);
+  out["max_threads_per_block"] = attrs.maxThreadsPerBlock;
+  out["ptx_version"] = attrs.ptxVersion;
+  out["binary_version"] = attrs.binaryVersion;
+  out["active_blocks_per_sm"] = active_blocks;
+  out["active_threads_per_sm"] = active_blocks * kThreads;
+  out["max_threads_per_sm"] = prop.maxThreadsPerMultiProcessor;
+  out["theoretical_occupancy_pct"] =
+      100.0 * static_cast<double>(active_blocks * kThreads) /
+      static_cast<double>(prop.maxThreadsPerMultiProcessor);
+  return out;
+}
+
 py::dict stage2_rr_diag_chunk_warp_owner_metadata(const at::Tensor& dout) {
   TORCH_CHECK(dout.is_cuda(), "dout must be CUDA");
   py::dict out;
@@ -2799,6 +3265,15 @@ py::dict stage2_rr_diag_qk_dv_dmimo_v_owner_metadata(const at::Tensor& dout) {
   py::dict out;
   AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, dout.scalar_type(), "stage2_rr_diag_qk_dv_dmimo_v_owner_metadata", [&] {
     out = stage2_rr_diag_qk_dv_dmimo_v_owner_metadata_for_dtype<scalar_t>();
+  });
+  return out;
+}
+
+py::dict stage2_mono_state_lkq_d_chunk_owner_metadata(const at::Tensor& dout) {
+  TORCH_CHECK(dout.is_cuda(), "dout must be CUDA");
+  py::dict out;
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, dout.scalar_type(), "stage2_mono_state_lkq_d_chunk_owner_metadata", [&] {
+    out = stage2_mono_state_lkq_d_chunk_owner_metadata_for_dtype<scalar_t>();
   });
   return out;
 }
@@ -2903,4 +3378,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "stage2_rr_diag_qk_dv_dmimo_v_owner_metadata",
       &stage2_rr_diag_qk_dv_dmimo_v_owner_metadata,
       "One-launch diagonal plus qk_dot dV and DMIMO_V owner kernel metadata");
+  m.def(
+      "stage2_mono_state_lkq_d_chunk_owner",
+      &stage2_mono_state_lkq_d_chunk_owner,
+      "Wave 1 monolithic state/LKQ/D chunk-owner kernel");
+  m.def(
+      "stage2_mono_state_lkq_d_chunk_owner_out",
+      &stage2_mono_state_lkq_d_chunk_owner_out,
+      "In-place-output Wave 1 monolithic state/LKQ/D chunk-owner kernel");
+  m.def(
+      "stage2_mono_state_lkq_d_chunk_owner_metadata",
+      &stage2_mono_state_lkq_d_chunk_owner_metadata,
+      "Wave 1 monolithic state/LKQ/D chunk-owner kernel metadata");
 }
