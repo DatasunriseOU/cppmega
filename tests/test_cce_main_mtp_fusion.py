@@ -252,6 +252,41 @@ def test_fused_main_mtp_cce_loss_matches_upstream_per_token_autoscaler(
     assert torch.allclose(fused_weight_grad, ref_layer.weight.grad, atol=1e-6, rtol=1e-6)
 
 
+def test_fused_main_mtp_cce_loss_cp1_fast_path_skips_roll_tensor(monkeypatch):
+    monkeypatch.setenv("CPPMEGA_CCE_FUSE_MAIN_MTP_CE", "1")
+    torch.manual_seed(8765)
+
+    from megatron.core.transformer import multi_token_prediction as mtp_mod
+    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
+
+    def _unexpected_roll_tensor(*_args, **_kwargs):
+        raise AssertionError("CP=1 fused CCE path should not call roll_tensor")
+
+    monkeypatch.setattr(mtp_mod, "roll_tensor", _unexpected_roll_tensor)
+
+    batch, seq, hidden, vocab, mtp_depth = 2, 6, 5, 19, 2
+    hidden_states = torch.randn((1 + mtp_depth) * seq, batch, hidden, requires_grad=True)
+    labels = torch.randint(0, vocab, (batch, seq))
+    loss_mask = torch.ones(batch, seq)
+    loss_mask[:, -2:] = 0
+
+    MTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
+    output_layer = _FakeCceOutputLayer(torch.randn(vocab, hidden))
+    fused_loss_tokens = fused_main_mtp_cce_loss(
+        hidden_states=hidden_states,
+        labels=labels,
+        loss_mask=loss_mask,
+        output_layer=output_layer,
+        output_weight=output_layer.weight,
+        runtime_gather_output=False,
+        is_training=False,
+        config=_config(mtp_depth),
+    )
+
+    assert fused_loss_tokens is not None
+    assert fused_loss_tokens.shape == labels.shape
+
+
 def test_attached_fused_loss_is_consumed_by_linear_ce_forward(monkeypatch):
     monkeypatch.setenv("CPPMEGA_CCE_FUSE_MAIN_MTP_CE", "1")
     torch.manual_seed(5678)

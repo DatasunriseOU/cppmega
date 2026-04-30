@@ -120,6 +120,46 @@ def _can_use_cce_main_mtp_fusion(output_layer, config, scale_logits_fn) -> bool:
     return True
 
 
+def _cp_group_size(cp_group) -> int:
+    if cp_group is None:
+        return 1
+    try:
+        return int(cp_group.size())
+    except Exception:
+        return 2
+
+
+def _can_use_local_mtp_shift(cp_group, packed_seq_params) -> bool:
+    return packed_seq_params is None and _cp_group_size(cp_group) == 1
+
+
+def _build_local_main_mtp_cce_labels(
+    labels, loss_mask, mtp_num_layers: int, ignore_index: int
+):
+    """Build fused main+MTP labels for CP=1 without generic roll/cat helpers."""
+    batch, seq = labels.shape
+    fused_labels = labels.new_empty((batch, (1 + mtp_num_layers) * seq))
+    fused_labels[:, :seq].copy_(labels)
+
+    mtp_num_tokens = []
+    for mtp_layer_number in range(mtp_num_layers):
+        shift = mtp_layer_number + 1
+        dst = fused_labels[:, shift * seq : (shift + 1) * seq]
+        valid = max(seq - shift, 0)
+        if valid > 0:
+            src_labels = labels[:, shift:]
+            src_mask = loss_mask[:, shift:]
+            dst[:, :valid].copy_(src_labels)
+            dst[:, :valid].masked_fill_(~src_mask.bool(), ignore_index)
+            mtp_num_tokens.append(src_mask.sum())
+        else:
+            mtp_num_tokens.append(loss_mask.sum() * 0)
+        if valid < seq:
+            dst[:, valid:].fill_(ignore_index)
+
+    return fused_labels, mtp_num_tokens
+
+
 def fused_main_mtp_cce_loss(
     *,
     hidden_states,
@@ -179,38 +219,43 @@ def fused_main_mtp_cce_loss(
     if loss_mask is None:
         loss_mask = torch.ones_like(labels)
 
-    mtp_labels = labels.clone()
-    mtp_loss_mask = loss_mask
-    original_num_tokens = mtp_loss_mask.sum()
-
-    all_labels = [labels]
-    mtp_num_tokens = []
     ignore_index = -100
-    for _mtp_layer_number in range(mtp_num_layers):
-        mtp_labels, _ = roll_tensor(
-            mtp_labels,
-            shifts=-1,
-            dims=-1,
-            cp_group=cp_group,
-            packed_seq_params=packed_seq_params,
-        )
-        mtp_loss_mask, num_tokens = roll_tensor(
-            mtp_loss_mask,
-            shifts=-1,
-            dims=-1,
-            cp_group=cp_group,
-            packed_seq_params=packed_seq_params,
-        )
-        all_labels.append(
-            torch.where(
-                mtp_loss_mask.bool(),
-                mtp_labels,
-                torch.full_like(mtp_labels, ignore_index),
-            )
-        )
-        mtp_num_tokens.append(num_tokens)
+    original_num_tokens = loss_mask.sum()
 
-    fused_labels = torch.cat(all_labels, dim=-1)
+    if _can_use_local_mtp_shift(cp_group, packed_seq_params):
+        fused_labels, mtp_num_tokens = _build_local_main_mtp_cce_labels(
+            labels, loss_mask, mtp_num_layers, ignore_index
+        )
+    else:
+        mtp_labels = labels.clone()
+        mtp_loss_mask = loss_mask
+        all_labels = [labels]
+        mtp_num_tokens = []
+        for _mtp_layer_number in range(mtp_num_layers):
+            mtp_labels, _ = roll_tensor(
+                mtp_labels,
+                shifts=-1,
+                dims=-1,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+            )
+            mtp_loss_mask, num_tokens = roll_tensor(
+                mtp_loss_mask,
+                shifts=-1,
+                dims=-1,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+            )
+            all_labels.append(
+                torch.where(
+                    mtp_loss_mask.bool(),
+                    mtp_labels,
+                    torch.full_like(mtp_labels, ignore_index),
+                )
+            )
+            mtp_num_tokens.append(num_tokens)
+
+        fused_labels = torch.cat(all_labels, dim=-1)
     fused_loss = output_layer(
         hidden_states,
         weight=output_weight,
