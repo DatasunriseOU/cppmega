@@ -11,6 +11,7 @@ from typing import Any
 
 
 SCHEMA_VERSION = "mamba3-mono-ab/v1"
+TRAINING_AB_STUB_VERSION = "mamba3-guarded-stage2-training-ab/v1"
 MAIN_GUARDED_STAGE2_COMMIT = "bc8c3f9"
 MAIN_GUARDED_STAGE2_DOC = "docs/status/mamba3_stage2_prod_control_2026_04_29.md"
 MAIN_GUARDED_STAGE2_MODULE = (
@@ -414,6 +415,16 @@ def normalize_candidate_component_record(
     if max_abs is not None:
         correctness.setdefault("max_abs", max_abs)
 
+    metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+    gate_budget = (
+        raw.get("gate_budget")
+        or raw.get("ab_gate_budget")
+        or raw.get("budget")
+        or {}
+    )
+    if not isinstance(gate_budget, dict):
+        gate_budget = {}
+
     return {
         "candidate_id": str(candidate_id),
         "display_name": str(raw.get("display_name") or str(candidate_id).replace("_", " ")),
@@ -439,6 +450,8 @@ def normalize_candidate_component_record(
         "memory_peak_gib": _normalize_memory(raw),
         "correctness": correctness,
         "reference": _normalize_reference(raw),
+        "metadata": metadata,
+        "gate_budget": gate_budget,
         "note": str(raw.get("note", "")),
     }
 
@@ -624,6 +637,7 @@ def component_record_projection(
             ),
         },
         "missing_component_timings": missing_timing,
+        "gate_budget": record.get("gate_budget") or {},
         "full_boundary_ready": (
             not record.get("missing_slots")
             and bool(record.get("correctness", {}).get("full_boundary_pass"))
@@ -848,6 +862,8 @@ def candidate_configs(
                     "required_outputs": list(BWD_BWD_OUTPUT_NAMES),
                     "readiness_gates": readiness_gates(),
                 },
+                "metadata": record.get("metadata") or {},
+                "gate_budget": record.get("gate_budget") or {},
             }
         )
 
@@ -986,4 +1002,71 @@ def summarize_slot_results(slot_results: dict[str, dict[str, Any]]) -> dict[str,
         "failed": failed,
         "partial": partial,
         "missing": missing,
+    }
+
+
+def guarded_stage2_training_ab_stub(
+    *,
+    run_id: str = "mamba3_stage2_guarded_train_ab",
+    train_iters: int = 100,
+    remote_script: str = "scripts/remote_production_h200_nam56r_v1.sh",
+) -> dict[str, Any]:
+    """Return a command receipt for a default-off guarded stage2 training A/B."""
+
+    run_id = run_id.strip() or "mamba3_stage2_guarded_train_ab"
+    patch_module = MAIN_GUARDED_STAGE2_MODULE
+    rollback = (
+        "PYTHONPATH=. CPPMEGA_MAMBA3_STAGE2_FORCE_NONTMA_ROLLBACK=1 "
+        f"python -m {patch_module}"
+    )
+    apply_stage2 = (
+        "PYTHONPATH=. CPPMEGA_MAMBA3_STAGE2_FORCE_NONTMA=1 "
+        "MAMBA3_STAGE2_FORCE_NONTMA_ALLOW_FILE_MUTATION=1 "
+        f"python -m {patch_module}"
+    )
+    baseline = (
+        f"RUN_ID={run_id}_baseline TRAIN_ITERS={train_iters} "
+        f"VARIANT=tilelang bash {remote_script}"
+    )
+    candidate = (
+        f"RUN_ID={run_id}_stage2_bf1bb0 TRAIN_ITERS={train_iters} "
+        f"VARIANT=tilelang bash {remote_script}"
+    )
+    return {
+        "schema_version": TRAINING_AB_STUB_VERSION,
+        "run_id": run_id,
+        "production_defaults_changed": False,
+        "reference": {
+            "candidate_id": "main_guarded_stage2",
+            "commit": MAIN_GUARDED_STAGE2_COMMIT,
+            "module": MAIN_GUARDED_STAGE2_MODULE,
+            "doc": MAIN_GUARDED_STAGE2_DOC,
+            "bf_num_stages": 1,
+            "bb_num_stages": 0,
+        },
+        "checklist": [
+            "serialize baseline and stage2 runs on the same host because the stage2 patch mutates installed mamba_ssm source",
+            "rollback before the baseline leg and after the candidate leg",
+            "apply stage2 only with CPPMEGA_MAMBA3_STAGE2_FORCE_NONTMA=1 and MAMBA3_STAGE2_FORCE_NONTMA_ALLOW_FILE_MUTATION=1",
+            "record git commit, image tag, dataset path, tokenizer path, train/eval iterations, loss, tok/s, max memory, and any NaN/OOM",
+            "treat the result as guarded A/B evidence only; it does not enable stage2 by default",
+        ],
+        "launcher_stub": {
+            "baseline_leg": [
+                rollback,
+                baseline,
+            ],
+            "candidate_leg": [
+                apply_stage2,
+                candidate,
+                rollback,
+            ],
+        },
+        "comparison_fields": [
+            "loss curve / final loss",
+            "tokens_per_second",
+            "max_memory_allocated_gib",
+            "max_memory_reserved_gib",
+            "failures_or_restarts",
+        ],
     }

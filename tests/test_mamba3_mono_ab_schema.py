@@ -11,6 +11,7 @@ from cppmega.megatron.mamba3_mono_ab_schema import (
     component_record_projection,
     cuda_subset_slot_results,
     filter_candidate_component_records_for_shape,
+    guarded_stage2_training_ab_stub,
     memory_accounting,
     selected_shapes,
     slot_results_from_diffs,
@@ -214,3 +215,71 @@ def test_wave2_wave3_receipt_file_covers_reported_component_numbers() -> None:
         "wave2_triton_pruned_lower_bound",
         "wave3_rr_diag_timestep_cta",
     }
+
+
+def test_wave3_wave4_receipt_file_gates_current_research_numbers() -> None:
+    receipt_path = (
+        REPO_ROOT
+        / "docs/status/mamba3_mono_ab_component_receipts_wave3_wave4_2026_04_30.json"
+    )
+    records = candidate_component_records_from_json(receipt_path.read_text(encoding="utf-8"))
+    by_id = {record["candidate_id"]: record for record in records}
+
+    wmma = component_record_projection(by_id["wave3_cuda_wmma_triangular_chunk_owner"])
+    assert wmma["projected_bwd_bwd_ms"] == pytest.approx(8.467136001586914)
+    assert wmma["covered_slots"] == ["dv", "dmimo_v", "dssda"]
+    assert wmma["remaining_budget_ms_to_equal_stage2_bwd_bwd"] == pytest.approx(
+        -4.760396001586914
+    )
+
+    cute = component_record_projection(
+        by_id["wave3_cute_handwritten_wgmma_wrong_numerics"]
+    )
+    assert cute["projection_status"] == "missing_timing"
+    assert cute["covered_slots"] == []
+    assert by_id["wave3_cute_handwritten_wgmma_wrong_numerics"]["status"] == (
+        "failed_correctness"
+    )
+    assert by_id["wave3_cute_handwritten_wgmma_wrong_numerics"]["correctness"][
+        "max_abs"
+    ] == pytest.approx(17.318359)
+
+    wgmma_plan = component_record_projection(by_id["wave3_wgmma_plan_budget"])
+    assert wgmma_plan["projection_status"] == "missing_timing"
+    assert wgmma_plan["gate_budget"]["green_full_kernel_ms"] == pytest.approx(3.35)
+    assert wgmma_plan["gate_budget"]["chunk_owner_main_body_ms"] == pytest.approx(3.2)
+    assert wgmma_plan["gate_budget"]["chunk_owner_dmimov_reducer_ms"] == pytest.approx(
+        0.05
+    )
+
+    wave4_diag = component_record_projection(by_id["wave4_rr_diag_cuda_timestep_cta"])
+    assert wave4_diag["projected_bwd_bwd_ms"] == pytest.approx(2.0560)
+    assert wave4_diag["covered_slots"] == ["dk", "dq", "dgamma_diag"]
+
+    productionish_records = filter_candidate_component_records_for_shape(
+        records,
+        "productionish",
+    )
+    assert {record["candidate_id"] for record in productionish_records} == {
+        "wave3_cuda_wmma_triangular_chunk_owner",
+        "wave3_wgmma_plan_budget",
+        "wave4_rr_diag_cuda_timestep_cta",
+    }
+
+
+def test_guarded_stage2_training_ab_stub_is_opt_in_and_reversible() -> None:
+    stub = guarded_stage2_training_ab_stub(run_id="wave4_train_ab", train_iters=12)
+
+    assert stub["production_defaults_changed"] is False
+    assert stub["reference"]["commit"] == MAIN_GUARDED_STAGE2_COMMIT
+    assert stub["reference"]["bb_num_stages"] == 0
+
+    commands = "\n".join(
+        command
+        for leg in stub["launcher_stub"].values()
+        for command in leg
+    )
+    assert "MAMBA3_STAGE2_FORCE_NONTMA_ALLOW_FILE_MUTATION=1" in commands
+    assert "CPPMEGA_MAMBA3_STAGE2_FORCE_NONTMA_ROLLBACK=1" in commands
+    assert "RUN_ID=wave4_train_ab_baseline TRAIN_ITERS=12" in commands
+    assert "RUN_ID=wave4_train_ab_stage2_bf1bb0 TRAIN_ITERS=12" in commands

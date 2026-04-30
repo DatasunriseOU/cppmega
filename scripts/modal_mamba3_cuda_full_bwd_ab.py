@@ -60,6 +60,7 @@ from cppmega.megatron.mamba3_mono_ab_schema import (
     cuda_subset_slot_results,
     empty_slot_results,
     filter_candidate_component_records_for_shape,
+    guarded_stage2_training_ab_stub,
     load_candidate_component_records,
     memory_accounting,
     normalize_candidate_component_records,
@@ -1388,6 +1389,7 @@ def main(
     cuda_iters: int = 10,
     seed: int = 20260430,
     dry_run_schema: bool = False,
+    print_training_ab_stub: bool = False,
     modal_hygiene: bool = True,
     modal_auto_stop: bool = True,
     modal_hygiene_enforcement: str = "warn",
@@ -1408,7 +1410,16 @@ def main(
             campaign_prefixes=campaign_prefixes,
         )
 
-    if dry_run_schema:
+    if print_training_ab_stub:
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": run_id or "training_ab_stub",
+            "training_ab_stub": guarded_stage2_training_ab_stub(
+                run_id=run_id or "mamba3_stage2_guarded_train_ab",
+            ),
+            "candidate_component_records": component_records,
+        }
+    elif dry_run_schema:
         result = _local_schema_dry_run(
             GPU_SPEC,
             run_id,
