@@ -17,7 +17,8 @@ LKQ is only spilled to swizzled shared memory inside the kernel.
 The Wave 7 fused-consumer mode keeps state/apply on-chip as BF16 shared-memory
 tiles and writes only DV/DMIMO_V to global memory.  The Wave 8 mode lifts that
 same path into a bounded reverse multi-chunk scan owner with a loop-carried
-state update.
+state update.  The Wave 9 mode adds the same-time qk diagonal contribution to
+the fused multi-chunk consumers.
 """
 
 from __future__ import annotations
@@ -66,6 +67,8 @@ class MultiChunkInputs:
     k: torch.Tensor
     q: torch.Tensor
     dphi: torch.Tensor
+    qk_dot: torch.Tensor
+    gamma: torch.Tensor
     v: torch.Tensor
     mimo_v: torch.Tensor
 
@@ -91,6 +94,23 @@ def _structured3(
     row = torch.arange(rows, dtype=torch.float32, device="cuda")[None, :, None]
     col = torch.arange(cols, dtype=torch.float32, device="cuda")[None, None, :]
     return (((chunk * a + row * b + col * c) % mod) - (mod // 2)) / denom
+
+
+def _structured_qk(
+    chunks: int,
+    *,
+    a: int,
+    b: int,
+    c: int,
+    d: int,
+    mod: int,
+    denom: float,
+) -> torch.Tensor:
+    chunk = torch.arange(chunks, dtype=torch.float32, device="cuda")[:, None, None, None]
+    t = torch.arange(CHUNK_SIZE, dtype=torch.float32, device="cuda")[None, :, None, None]
+    r_out = torch.arange(RANK, dtype=torch.float32, device="cuda")[None, None, :, None]
+    r_in = torch.arange(RANK, dtype=torch.float32, device="cuda")[None, None, None, :]
+    return (((chunk * a + t * b + r_out * c + r_in * d) % mod) - (mod // 2)) / denom
 
 
 def _make_cases(seed: int) -> list[ChainInputs]:
@@ -126,6 +146,12 @@ def _make_multi_cases(seed: int, nchunks: int) -> list[MultiChunkInputs]:
         k=_structured3(nchunks, FCS, N, a=5, b=3, c=7, mod=23, denom=16.0).to(torch.bfloat16),
         q=_structured3(nchunks, FCS, N, a=-3, b=11, c=2, mod=29, denom=18.0).to(torch.bfloat16),
         dphi=_structured3(nchunks, FCS, P, a=13, b=-5, c=17, mod=31, denom=24.0).to(torch.bfloat16),
+        qk_dot=_structured_qk(
+            nchunks, a=3, b=-7, c=11, d=5, mod=41, denom=96.0
+        ).to(torch.bfloat16),
+        gamma=_structured3(nchunks, CHUNK_SIZE, 1, a=5, b=-3, c=0, mod=23, denom=128.0)
+        .squeeze(-1)
+        .contiguous(),
         v=_structured3(nchunks, CHUNK_SIZE, P, a=7, b=2, c=5, mod=37, denom=64.0).to(torch.bfloat16),
         mimo_v=_structured(RANK, P, a=17, b=-3, mod=37, denom=64.0).to(torch.bfloat16),
     )
@@ -137,6 +163,8 @@ def _make_multi_cases(seed: int, nchunks: int) -> list[MultiChunkInputs]:
         k=(torch.randn(nchunks, FCS, N, dtype=torch.bfloat16, device="cuda") * scale),
         q=(torch.randn(nchunks, FCS, N, dtype=torch.bfloat16, device="cuda") * scale),
         dphi=(torch.randn(nchunks, FCS, P, dtype=torch.bfloat16, device="cuda") * scale),
+        qk_dot=(torch.randn(nchunks, CHUNK_SIZE, RANK, RANK, dtype=torch.bfloat16, device="cuda") * scale),
+        gamma=(torch.randn(nchunks, CHUNK_SIZE, dtype=torch.float32, device="cuda") * scale),
         v=(torch.randn(nchunks, CHUNK_SIZE, P, dtype=torch.bfloat16, device="cuda") * scale),
         mimo_v=(torch.randn(RANK, P, dtype=torch.bfloat16, device="cuda") * scale),
     )
@@ -171,6 +199,17 @@ def _scalar_consumers(
     dv = (dpsi_t * mimo_v.float()[None, :, :]).sum(dim=1)
     dmimo_v = (dpsi_t * v.float()[:, None, :]).sum(dim=0)
     return dv, dmimo_v
+
+
+def _qk_diag_contrib(
+    qk_dot: torch.Tensor,
+    gamma: torch.Tensor,
+    dphi: torch.Tensor,
+) -> torch.Tensor:
+    dphi_r = dphi.float().view(CHUNK_SIZE, RANK, P)
+    contrib = torch.einsum("toi,top->tip", qk_dot.float(), dphi_r)
+    contrib = contrib * gamma.float()[:, None, None]
+    return contrib.reshape(FCS, P)
 
 
 def _max_abs(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -213,7 +252,8 @@ def _multi_reference(
         lkq = (inputs.k[c].float() @ inputs.q[c].float().T).to(torch.bfloat16)
         masked_lkq = (lkq.float() * mask_bf16.float()).to(torch.bfloat16)
         apply = (masked_lkq.float() @ inputs.dphi[c].float()).to(torch.bfloat16)
-        dpsi = state.float() + apply.float()
+        qk_contrib = _qk_diag_contrib(inputs.qk_dot[c], inputs.gamma[c], inputs.dphi[c])
+        dpsi = state.float() + apply.float() + qk_contrib
         dv_c, dmimo_c = _scalar_consumers(dpsi, inputs.v[c], inputs.mimo_v)
         dv[c] = dv_c
         dmimo_v += dmimo_c
@@ -228,6 +268,12 @@ def _multi_reference(
         "dmimo_v": dmimo_v,
         "carry_t": carry_t,
         "dpsi_checksums_rev": dpsi_checksums,
+        "qk_diag_checksum": float(
+            sum(
+                _qk_diag_contrib(inputs.qk_dot[c], inputs.gamma[c], inputs.dphi[c]).sum()
+                for c in range(inputs.nchunks)
+            ).item()
+        ),
     }
 
 
@@ -379,6 +425,8 @@ def _run_case_multi_chunk_fused(
         inputs.q.contiguous(),
         q_t,
         dphi_t,
+        inputs.qk_dot.contiguous(),
+        inputs.gamma.contiguous(),
         inputs.v.contiguous(),
         inputs.mimo_v.contiguous(),
         dv,
@@ -400,6 +448,7 @@ def _run_case_multi_chunk_fused(
         "apply_global_materialized": False,
         "dpsi_global_materialized": False,
         "loop_carried_state": "carry_t += dPhi.T @ Q in FP32 registers, BF16-spilled only for state GEMM",
+        "qk_diag_contribution": "dpsi[t,r,p] += gamma[t] * sum_o qk_dot[t,o,r] * dPhi[t,o,p]",
         "remaining_global": [
             "DV FP32 output tensor for all chunks",
             "DMIMO_V FP32 output tile",
@@ -415,6 +464,7 @@ def _run_case_multi_chunk_fused(
         "dmimo_v_row0": [float(x) for x in dmimo_v[0, :4].tolist()],
         "ref_dmimo_v_row0": [float(x) for x in ref["dmimo_v"][0, :4].tolist()],
         "dpsi_checksums_rev": ref["dpsi_checksums_rev"],
+        "qk_diag_checksum": ref["qk_diag_checksum"],
     }
 
 
@@ -592,6 +642,8 @@ def _time_chain_multi_chunk_fused(
             inputs.q,
             q_t,
             dphi_t,
+            inputs.qk_dot,
+            inputs.gamma,
             inputs.v,
             inputs.mimo_v,
             dv,
@@ -644,7 +696,7 @@ def run_lkq_tile_chain(
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the CuTe LKQ tile chain probe")
 
-    print("Wave 8: CuTe LKQ/state chain with bounded multi-chunk scan owner")
+    print("Wave 9: CuTe LKQ/state chain with bounded multi-chunk scan owner + qk diag")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"shape: chunk={CHUNK_SIZE} rank={RANK} fcs={FCS} N={N} P={P}")
     print(f"atol: {atol}")
@@ -652,6 +704,7 @@ def run_lkq_tile_chain(
     print("wave6_fused_path: LKQ is R2S-spilled to swizzled smem only, no LKQ gmem output")
     print("wave7_fused_path: state/apply stay in swizzled smem, DV/DMIMO_V computed in-kernel")
     print(f"wave8_multi_chunk_counts: {list(multi_chunk_counts)}")
+    print("wave9_multi_chunk_semantics: same-time qk_dot/gamma contribution included in fused consumers")
 
     mask_bf16 = _future_mask_bf16()
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -747,6 +800,7 @@ def run_lkq_tile_chain(
             for name, value in multi_result["diffs"].items():
                 print(f"  {name}: max_abs={value:.6f}")
             print(f"  loop_carried_state: {multi_result['loop_carried_state']}")
+            print(f"  qk_diag_contribution: {multi_result['qk_diag_contribution']}")
             print(f"  dv_chunk0_row0[:4]: {multi_result['dv_chunk0_row0']}")
             print(f"  ref_chunk0_row0[:4]: {multi_result['ref_dv_chunk0_row0']}")
             print(f"  dmimo_v_row0[:4]: {multi_result['dmimo_v_row0']}")
@@ -828,7 +882,7 @@ def run_lkq_tile_chain(
             "Wave6 path: state BF16 tile from scalar-copy CuTe GEMM",
             "Wave6 path: apply BF16 tile output from fused masked-apply kernel",
             "Wave7 path: DV and DMIMO_V final FP32 output tiles only",
-            "Wave8 path: DV FP32 tensor for all chunks and accumulated DMIMO_V FP32 tile only",
+            "Wave9 path: DV FP32 tensor for all chunks and accumulated DMIMO_V FP32 tile only",
             "Harness input-layout tensors: DStates.T and DPh.T",
             "Wave8 harness input-layout tensors: Q.T and DPh.T",
         ],
