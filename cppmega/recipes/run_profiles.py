@@ -28,6 +28,7 @@ Mxfp8BackwardBackend = Literal["te_tn_adapter", "flashinfer_cutlass", "cutlass_n
 Mxfp8TransposeEmitBackend = Literal["auto", "te", "off"]
 Mxfp8CutlassScaleBackend = Literal["compact", "prepack", "swizzled"]
 Mxfp8FlashinferRunner = Literal["mm_mxfp8", "direct_tactic"]
+Mxfp8MaterializationPolicy = Literal["materialized_transpose", "compact_columnwise"]
 ParamStorage = Literal["auto", "bf16", "mxfp8"]
 SparseMlaMode = Literal["tilelang", "gather_scatter", "pytorch"]
 MoeDispatcher = Literal["flex", "alltoall", "allgather"]
@@ -119,6 +120,11 @@ class PrecisionProfile:
     pad_mamba_in_proj_for_mxfp8: bool = True
     mxfp8_bwd_tn_adapter: bool = True
     mxfp8_bwd_backend: Mxfp8BackwardBackend = "flashinfer_cutlass"
+    # Controls the TE Linear/autograd backward operand contract.  The
+    # materialized path saves or emits logical x.T/dy.T/weight.T MXFP8 operands
+    # for a TN adapter.  The compact path saves original compact-columnwise
+    # operands and requires a backend that consumes them directly.
+    mxfp8_materialization_policy: Mxfp8MaterializationPolicy = "materialized_transpose"
     mxfp8_transpose_emit_backend: Mxfp8TransposeEmitBackend = "te"
     mxfp8_transpose_emit_swizzled: bool = True
     mxfp8_transpose_emit_strict: bool = True
@@ -374,11 +380,17 @@ def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProf
     # Keep this in the typed profile instead of relying on a shell fallback.
     profile.model.moe_token_dispatcher_type = "alltoall"
     profile.precision.attention_backend = "flash"
-    # GB10 MXFP8 profiler runs on 2026-04-29 showed FlashInfer/CUTLASS backward
-    # spending ~878 ms/step in 68 GEMMs, while the TE TN adapter cut steady
-    # step time by ~8% with no BF16 fallback.  Keep FlashInfer selectable via
-    # --mxfp8-bwd-backend for targeted kernel probes.
-    profile.precision.mxfp8_bwd_backend = "te_tn_adapter"
+    # Wave13B pins local MXFP8 probes to the no-materialized-transpose contract:
+    # TE saves compact MXFP8 operands and cppmega consumes the original
+    # columnwise payloads/scales directly.  The old TE-TN materialized route is
+    # still selectable with --mxfp8-materialization-policy materialized_transpose.
+    profile.precision.mxfp8_materialization_policy = "compact_columnwise"
+    profile.precision.mxfp8_bwd_backend = "cutlass_native"
+    profile.precision.mxfp8_transpose_emit_backend = "off"
+    profile.precision.mxfp8_transpose_emit_swizzled = False
+    profile.precision.mxfp8_transpose_emit_strict = False
+    profile.precision.mxfp8_compact_columnwise_backward = True
+    profile.precision.mxfp8_grouped_direct_backward = True
     # The remaining BF16 GEMM hotspot on GB10 is Muon's Newton-Schulz loop.
     # nanochat's comparable performance presets use 3 iterations; keep this as
     # a typed profile default so runs can restore 5 with --muon-num-ns-steps 5.
@@ -388,6 +400,7 @@ def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProf
         cce_fuse_main_mtp_ce=True,
         acknowledge_liger_mtp_ce_deprecated=False,
         noconv_mamba_chunk_size=256,
+        transformer_engine_source="/home/dave/source/TransformerEngine-wave13B-te-linear-no-materialize",
     )
     return profile
 
@@ -448,6 +461,37 @@ def get_run_profile(name: str) -> RunProfile:
 def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
     """Render the profile to shell assignments consumed by legacy launchers."""
 
+    if profile.precision.mxfp8_materialization_policy == "compact_columnwise":
+        if profile.precision.mxfp8_bwd_backend != "cutlass_native":
+            raise ValueError(
+                "mxfp8_materialization_policy='compact_columnwise' requires "
+                "mxfp8_bwd_backend='cutlass_native'"
+            )
+        if profile.precision.mxfp8_transpose_emit_backend != "off":
+            raise ValueError(
+                "mxfp8_materialization_policy='compact_columnwise' requires "
+                "mxfp8_transpose_emit_backend='off'"
+            )
+        if profile.precision.mxfp8_transpose_emit_swizzled:
+            raise ValueError(
+                "mxfp8_materialization_policy='compact_columnwise' requires "
+                "mxfp8_transpose_emit_swizzled=False"
+            )
+        if profile.precision.mxfp8_transpose_emit_strict:
+            raise ValueError(
+                "mxfp8_materialization_policy='compact_columnwise' requires "
+                "mxfp8_transpose_emit_strict=False"
+            )
+        if not profile.precision.mxfp8_compact_columnwise_backward:
+            raise ValueError(
+                "mxfp8_materialization_policy='compact_columnwise' requires "
+                "mxfp8_compact_columnwise_backward=True"
+            )
+        if not profile.precision.mxfp8_grouped_direct_backward:
+            raise ValueError(
+                "mxfp8_materialization_policy='compact_columnwise' requires "
+                "mxfp8_grouped_direct_backward=True"
+            )
     if (
         profile.precision.fp8_recipe == "mxfp8"
         and profile.precision.mxfp8_compact_columnwise_backward
@@ -604,6 +648,9 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                     profile.precision.mxfp8_bwd_tn_adapter
                 ),
                 "CPPMEGA_TE_MXFP8_BWD_BACKEND": profile.precision.mxfp8_bwd_backend,
+                "CPPMEGA_TE_MXFP8_MATERIALIZATION_POLICY": (
+                    profile.precision.mxfp8_materialization_policy
+                ),
                 "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND": (
                     profile.precision.mxfp8_transpose_emit_backend
                 ),
@@ -695,6 +742,18 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.precision.attention_backend = args.attention_backend
     if args.mxfp8_bwd_backend is not None:
         profile.precision.mxfp8_bwd_backend = args.mxfp8_bwd_backend
+        if args.mxfp8_bwd_backend != "cutlass_native":
+            profile.precision.mxfp8_materialization_policy = "materialized_transpose"
+            if args.mxfp8_transpose_emit_backend is None:
+                profile.precision.mxfp8_transpose_emit_backend = "te"
+            if args.mxfp8_transpose_emit_swizzled is None:
+                profile.precision.mxfp8_transpose_emit_swizzled = True
+            if args.mxfp8_transpose_emit_strict is None:
+                profile.precision.mxfp8_transpose_emit_strict = True
+            if args.mxfp8_compact_columnwise_backward is None:
+                profile.precision.mxfp8_compact_columnwise_backward = False
+            if args.mxfp8_grouped_direct_backward is None:
+                profile.precision.mxfp8_grouped_direct_backward = False
     if args.mxfp8_cutlass_scale_backend is not None:
         profile.precision.mxfp8_cutlass_scale_backend = args.mxfp8_cutlass_scale_backend
         if args.mxfp8_cutlass_scale_backend == "swizzled":
@@ -710,6 +769,40 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
             if args.mxfp8_transpose_emit_swizzled is None:
                 profile.precision.mxfp8_transpose_emit_swizzled = True
             profile.precision.mxfp8_compact_columnwise_backward = False
+            if args.mxfp8_grouped_direct_backward is None:
+                profile.precision.mxfp8_grouped_direct_backward = False
+            profile.precision.mxfp8_materialization_policy = "materialized_transpose"
+    if args.mxfp8_materialization_policy is not None:
+        profile.precision.mxfp8_materialization_policy = args.mxfp8_materialization_policy
+        if args.mxfp8_materialization_policy == "compact_columnwise":
+            if args.mxfp8_bwd_backend is None:
+                profile.precision.mxfp8_bwd_backend = "cutlass_native"
+            elif args.mxfp8_bwd_backend != "cutlass_native":
+                raise ValueError(
+                    "--mxfp8-materialization-policy compact_columnwise requires "
+                    "--mxfp8-bwd-backend cutlass_native"
+                )
+            if args.mxfp8_transpose_emit_backend is None:
+                profile.precision.mxfp8_transpose_emit_backend = "off"
+            if args.mxfp8_transpose_emit_swizzled is None:
+                profile.precision.mxfp8_transpose_emit_swizzled = False
+            if args.mxfp8_transpose_emit_strict is None:
+                profile.precision.mxfp8_transpose_emit_strict = False
+            profile.precision.mxfp8_compact_columnwise_backward = True
+            profile.precision.mxfp8_grouped_direct_backward = True
+        else:
+            if args.mxfp8_bwd_backend is None:
+                profile.precision.mxfp8_bwd_backend = "te_tn_adapter"
+            if args.mxfp8_transpose_emit_backend is None:
+                profile.precision.mxfp8_transpose_emit_backend = "te"
+            if args.mxfp8_transpose_emit_swizzled is None:
+                profile.precision.mxfp8_transpose_emit_swizzled = True
+            if args.mxfp8_transpose_emit_strict is None:
+                profile.precision.mxfp8_transpose_emit_strict = True
+            if args.mxfp8_compact_columnwise_backward is None:
+                profile.precision.mxfp8_compact_columnwise_backward = False
+            if args.mxfp8_grouped_direct_backward is None:
+                profile.precision.mxfp8_grouped_direct_backward = False
     if args.mxfp8_transpose_emit_backend is not None:
         profile.precision.mxfp8_transpose_emit_backend = args.mxfp8_transpose_emit_backend
     if args.mxfp8_transpose_emit_swizzled is not None:
@@ -728,6 +821,14 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
                     "--mxfp8-compact-columnwise-backward requires "
                     "--mxfp8-bwd-backend cutlass_native"
                 )
+            profile.precision.mxfp8_materialization_policy = "compact_columnwise"
+            if args.mxfp8_transpose_emit_backend is None:
+                profile.precision.mxfp8_transpose_emit_backend = "off"
+            if args.mxfp8_transpose_emit_swizzled is None:
+                profile.precision.mxfp8_transpose_emit_swizzled = False
+            if args.mxfp8_transpose_emit_strict is None:
+                profile.precision.mxfp8_transpose_emit_strict = False
+            profile.precision.mxfp8_grouped_direct_backward = True
     if args.mxfp8_grouped_direct_backward is not None:
         profile.precision.mxfp8_grouped_direct_backward = (
             args.mxfp8_grouped_direct_backward
@@ -883,6 +984,15 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
             "CUTLASS-native MXFP8 scale route. swizzled uses GEMM-ready "
             "rowwise-transpose operands with the stock SM120 block-scaled "
             "CUTLASS mainloop."
+        ),
+    )
+    parser.add_argument(
+        "--mxfp8-materialization-policy",
+        choices=("materialized_transpose", "compact_columnwise"),
+        default=None,
+        help=(
+            "Select whether MXFP8 Linear backward uses materialized transpose "
+            "operands or original compact-columnwise operands."
         ),
     )
     parser.add_argument(

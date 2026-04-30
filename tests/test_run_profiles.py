@@ -83,10 +83,13 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert env["CPPMEGA_ATTN_BACKEND"] == "flash"
     assert env["CPPMEGA_EXTRA_PYTHONPATH"].split(":")[:2] == [
         "/home/dave/flash-attention-fa4",
-        "/home/dave/TransformerEngine",
+        "/home/dave/source/TransformerEngine-wave13B-te-linear-no-materialize",
     ]
     assert env["CPPMEGA_FLASH_ATTN_SOURCE_ROOT"] == "/home/dave/flash-attention-fa4"
-    assert env["CPPMEGA_TRANSFORMER_ENGINE_SOURCE_ROOT"] == "/home/dave/TransformerEngine"
+    assert (
+        env["CPPMEGA_TRANSFORMER_ENGINE_SOURCE_ROOT"]
+        == "/home/dave/source/TransformerEngine-wave13B-te-linear-no-materialize"
+    )
     assert env["CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE"] == "256"
     assert env["CPPMEGA_CCE_FUSE_MAIN_MTP_CE"] == "1"
     assert env["CPPMEGA_DSA_FP8_ATTENTION"] == "0"
@@ -96,10 +99,12 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert env["CPPMEGA_FP8_FORMAT"] == "e4m3"
     assert env["CPPMEGA_MUON_NUM_NS_STEPS"] == "3"
     assert env["CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE"] == "int8"
-    assert env["CPPMEGA_TE_MXFP8_BWD_BACKEND"] == "te_tn_adapter"
-    assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
+    assert env["CPPMEGA_TE_MXFP8_MATERIALIZATION_POLICY"] == "compact_columnwise"
+    assert env["CPPMEGA_TE_MXFP8_BWD_BACKEND"] == "cutlass_native"
+    assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "off"
     assert env["CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND"] == "compact"
-    assert env["CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD"] == "0"
+    assert env["CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD"] == "1"
+    assert env["CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD"] == "1"
     assert env["CPPMEGA_FLASHINFER_MXFP8_RUNNER"] == "mm_mxfp8"
     assert env["CPPMEGA_FLASHINFER_MXFP8_TACTIC"] == "0"
     assert env["HYBRID_LAYER_PATTERN"].endswith("/*-/*-")
@@ -233,6 +238,11 @@ def test_compact_columnwise_cli_selects_cutlass_native_when_backend_implicit(
     out = capsys.readouterr().out
     assert "export CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=1" in out
     assert "export CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native" in out
+    assert "export CPPMEGA_TE_MXFP8_MATERIALIZATION_POLICY=compact_columnwise" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=off" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED=0" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT=0" in out
+    assert "export CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD=1" in out
 
 
 def test_compact_columnwise_rejects_non_cutlass_backend(monkeypatch):
@@ -275,6 +285,7 @@ def test_swizzled_cutlass_scale_cli_selects_cutlass_native(capsys, monkeypatch):
     assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=te" in out
     assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED=1" in out
     assert "export CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=0" in out
+    assert "export CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD=0" in out
 
 
 def test_swizzled_cutlass_scale_rejects_non_cutlass_backend(monkeypatch):
@@ -355,21 +366,56 @@ def test_remote_gb10_launcher_preserves_muon_ns_override():
     assert "--attention-backend flash" not in script
 
 
-def test_local_gb10_quarter_mxfp8_defaults_to_measured_te_tn_backend():
-    """The local_gb10_quarter profile defaults to the fastest measured GB10 MXFP8 backend."""
+def test_local_gb10_quarter_mxfp8_defaults_to_no_materialize_backend():
+    """The local_gb10_quarter MXFP8 lane defaults to the zero-materialization contract."""
     profile = get_run_profile("local_gb10_quarter")
-    assert profile.precision.mxfp8_bwd_backend == "te_tn_adapter"
-    assert profile.precision.mxfp8_flashinfer_runner == "mm_mxfp8"
-    assert profile.precision.mxfp8_grouped_direct_backward is False
+    assert profile.precision.mxfp8_materialization_policy == "compact_columnwise"
+    assert profile.precision.mxfp8_bwd_backend == "cutlass_native"
+    assert profile.precision.mxfp8_transpose_emit_backend == "off"
+    assert profile.precision.mxfp8_transpose_emit_swizzled is False
+    assert profile.precision.mxfp8_transpose_emit_strict is False
+    assert profile.precision.mxfp8_compact_columnwise_backward is True
+    assert profile.precision.mxfp8_grouped_direct_backward is True
 
 
-def test_mxfp8_transpose_emit_defaults_to_te_for_tn_adapter():
-    """The default MXFP8 backward path uses TE transpose emission."""
+def test_mxfp8_default_shell_uses_compact_columnwise_no_materialize():
+    """The default MXFP8 shell exports keep transpose/materialization disabled."""
     profile = get_run_profile("local_gb10_quarter")
     profile.precision.fp8_recipe = "mxfp8"
     env = profile_shell_assignments(profile)
-    assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
-    assert env["CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD"] == "0"
+    assert env["CPPMEGA_TE_MXFP8_MATERIALIZATION_POLICY"] == "compact_columnwise"
+    assert env["CPPMEGA_TE_MXFP8_BWD_BACKEND"] == "cutlass_native"
+    assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "off"
+    assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED"] == "0"
+    assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT"] == "0"
+    assert env["CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD"] == "1"
+    assert env["CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD"] == "1"
+
+
+def test_mxfp8_materialized_policy_restores_te_tn_adapter_defaults(capsys, monkeypatch):
+    """A/B profiles can still request the old TE-TN materialized route explicitly."""
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_profiles",
+            "shell",
+            "local_gb10_quarter",
+            "--fp8-recipe",
+            "mxfp8",
+            "--mxfp8-materialization-policy",
+            "materialized_transpose",
+        ],
+    )
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "export CPPMEGA_TE_MXFP8_MATERIALIZATION_POLICY=materialized_transpose" in out
+    assert "export CPPMEGA_TE_MXFP8_BWD_BACKEND=te_tn_adapter" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=te" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED=1" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT=1" in out
+    assert "export CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=0" in out
+    assert "export CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD=0" in out
 
 
 def test_mxfp8_docs_pin_zero_copy_acceptance_counters():

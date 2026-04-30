@@ -1,7 +1,7 @@
 # Cppmega Architecture And Precision Status
 
 Status: canonical
-Last updated: 2026-04-28
+Last updated: 2026-04-30
 Scope: durable rollup of the current cppmega architecture, precision routes,
 GB10/H200 caveats, and rationale behind the active paths.
 
@@ -24,6 +24,16 @@ the dated note as historical evidence.
   `optimizer.param_storage=auto` to primary MXFP8 parameter storage and emits
   Megatron `--mxfp8-param-storage`.  This sets `TransformerConfig.fp8_param`
   without distributed `--fp8-param-gather`.
+- Wave13B local MXFP8 defaults now select the TE source worktree
+  `/home/dave/source/TransformerEngine-wave13B-te-linear-no-materialize` and
+  the typed no-materialization policy:
+  `mxfp8_materialization_policy=compact_columnwise`,
+  `mxfp8_bwd_backend=cutlass_native`,
+  `mxfp8_transpose_emit_backend=off`,
+  `mxfp8_compact_columnwise_backward=True`, and
+  `mxfp8_grouped_direct_backward=True`.  The older TE-TN materialized route is
+  still available for A/B with
+  `--mxfp8-materialization-policy materialized_transpose`.
 - This GB10-local MTP default is deliberately different from older docs:
   `scripts/cppmega_fp8_shim.py` now routes `CPPMEGA_MTP_CE_KERNEL=cce` through
   the main LinearCE path. Deprecated Liger MTP CE requires an explicit ACK and is
@@ -38,7 +48,7 @@ the dated note as historical evidence.
 
 | Block | BF16 / base path | FP8 tensorwise path | MXFP8 / block-scaled path |
 | --- | --- | --- | --- |
-| Dense TE Linear / Mamba projections | Params and ordinary grads stay BF16 under `Float16Module`; no FP32 master params in the local no-master Muon path. | H200 bench3 uses TE FP8 tensorwise where beneficial. Local GB10 quarter also defaults to tensorwise FP8 while keeping BF16 params/grads. | Accepted for short local GB10 training through the `mxfp8` run-profile lane. `Float16Module` preserves TE `QuantizedTensor` params instead of dequantizing them during the BF16 wrapper cast, so TE GEMM weights are authoritative primary MXFP8 storage. Native GB10 Linear backward `NN`/`NT` still fails, so the accepted default route rewrites to TN through `scripts/cppmega_fp8_shim.py` with FlashInfer/CUTLASS. The opt-in `--mxfp8-compact-columnwise-backward` route now covers real dense dgrad/wgrad operands with `cutlass_native` and clears the 34 one-step dense copy-transpose calls, but it is slower than the default and stays probe-only for performance. |
+| Dense TE Linear / Mamba projections | Params and ordinary grads stay BF16 under `Float16Module`; no FP32 master params in the local no-master Muon path. | H200 bench3 uses TE FP8 tensorwise where beneficial. Local GB10 quarter also defaults to tensorwise FP8 while keeping BF16 params/grads. | Wave13B changes the local MXFP8 profile default to the no-materialization contract: TE Linear/LayerNormLinear/LayerNormMLP/GroupedLinear save compact MXFP8 storage for backward, and cppmega consumes original columnwise operands with `cutlass_native` plus grouped direct. `Float16Module` still preserves TE `QuantizedTensor` params as authoritative primary MXFP8 storage. Native GB10 Linear backward `NN`/`NT` still fails, so any fallback to native or BF16 remains a failure signal. The old `--mxfp8-materialization-policy materialized_transpose` TE-TN route is retained for A/B; it was faster in prior GB10 full-model measurements than the current compact direct loader. |
 | SparseMLA / DSA main attention | `CPPMEGA_DSA_SPARSE_MODE=tilelang` replaces Megatron `unfused_dsa_fn` with TileLang SparseMLA and avoids full `[b*np,sq,sk]` score materialization. Gather-scatter is deprecated and ACK-gated. | `SparseMLA_FP8` consumes TE current/tensorwise `Float8Tensor` storage zero-copy where possible. The old local per-token requant path is removed/fail-fast because it materialized large BF16/FP32 temporaries. | QK-only and fused-forward MXFP8 prototypes exist behind `CPPMEGA_SPARSE_MLA_BLOCKSCALED_QK=1` and `CPPMEGA_SPARSE_MLA_BLOCKSCALED_FUSED=1`. They are not defaults: full training backward still lacks finite-gradient validation. |
 | DSA indexer / top-k | Current supported path is BF16 per-head fused accumulation in `dsa_indexer_fused_patch.py`; it removes the upstream `[sq,b,h,sk]` FP32 intermediate. | The old FP8 indexer path was removed. Tests reject `dsa_indexer_dtype="fp8"` in `tests/test_megatron_args.py`; the launcher should not emit `--dsa-indexer-dtype`. | No MXFP8 indexer path is accepted. The target is streaming top-k from the per-head accumulator, not block-scaled dense score materialization. |
 | MoE router / DeepEP | Router probabilities remain FP32 when flex/DeepEP is used. This is a DeepEP API fact, not an accidental precision leak. | TE FP8 can cover MoE GEMMs, but router dtype is still FP32 for flex. | No current MXFP8 MoE training default. DeepGEMM is not a GB10 drop-in; use TE/CUTLASS SM120 work only after the layout contract is explicit. |
@@ -88,6 +98,30 @@ longer holds the BF16 activation as its Linear saved tensor, and the global shim
 no longer keeps parameter transpose sidecars alive across the forward pass. This
 is a bridge toward authoritative MXFP8 activation storage, not proof that a
 descriptor-only no-transpose path exists.
+
+Wave13B adds the next TE-side contract in an isolated worktree:
+`/home/dave/source/TransformerEngine-wave13B-te-linear-no-materialize`.
+When the cppmega quantizer flag
+`_te_compact_columnwise_for_backward_enabled=True` is present, TE skips
+`quantize_rowwise_transpose()` and `_copy_columnwise_as_rowwise_transpose...`
+at Linear, LayerNormLinear, LayerNormMLP, and GroupedLinear save sites. Backward
+then passes original compact MXFP8 operands to the cppmega direct backends:
+dgrad consumes `dy` rowwise plus `weight` compact columnwise, while wgrad
+consumes `x` compact columnwise plus `dy` compact columnwise. Acceptance for
+this lane requires `mxfp8_cutlass_native_dgrad>0`,
+`mxfp8_cutlass_native_wgrad>0`, `mxfp8_grouped_direct_dgrad>0`,
+`mxfp8_grouped_direct_wgrad>0`, `mxfp8_grouped_direct_miss_dgrad=0`,
+`mxfp8_grouped_direct_miss_wgrad=0`, `mxfp8_tn_adapter_te_emit=0`,
+`mxfp8_tn_adapter_te_emit_deferred=0`,
+`mxfp8_tn_adapter_saved_transpose_operand=0`,
+`mxfp8_tn_adapter_copy_transpose=0`,
+`mxfp8_tn_adapter_missing_sidecar_copy=0`,
+`mxfp8_norm_quantize_sidecar_bridge=0`,
+`mxfp8_tn_sidecar_attr_attached=0`,
+`mxfp8_tn_sidecar_registry_peak=0`,
+`mxfp8_tn_sidecar_registry_peak_bytes=0`, `bf16_fallback_dgrad=0`,
+`bf16_fallback_wgrad=0`, `native_passthrough_dgrad=0`,
+`native_passthrough_wgrad=0`, and `fallback_reasons={}`.
 
 ## Optimizer / Param-Storage Contract
 
@@ -316,14 +350,13 @@ Short-term path:
   MXFP8-specific probe is being run.
 - Keep GB10 attention on patched FA4.  The `flashinfer_cutlass` name below is
   the dense MXFP8 Linear GEMM backward backend, not an attention backend.
-- For GB10 MXFP8 experiments, use typed profile arguments, for example
-  `bash scripts/local_gb10_quarter_train.sh --fp8-recipe mxfp8
-  --mxfp8-bwd-backend te_tn_adapter --mxfp8-transpose-emit-backend te
-  --mxfp8-transpose-emit-swizzled --mxfp8-transpose-emit-strict`, then run
-  `tools/probes/gb10_accepted_path_validation.py`.
-- Treat direct no-sidecar CUTLASS as accepted only for probe
-  coverage/correctness, not for real train, until it handles the real TE wgrad
-  columnwise operand shape/layouts.
+- For Wave13B GB10 MXFP8 experiments, the typed default is
+  `bash scripts/local_gb10_quarter_train.sh --fp8-recipe mxfp8`; use
+  `--mxfp8-materialization-policy materialized_transpose` only for A/B against
+  the old TE-TN route, then run `tools/probes/gb10_accepted_path_validation.py`.
+- Treat compact-columnwise direct CUTLASS as accepted only for
+  coverage/correctness, not for real train, until the SM120 direct loader beats
+  the materialized TE-TN baseline.
 
 Long-term path:
 

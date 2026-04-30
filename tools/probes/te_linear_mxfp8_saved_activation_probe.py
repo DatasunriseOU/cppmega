@@ -41,6 +41,10 @@ def _set_mxfp8_profile_env(backend: str | None) -> str:
     backend = os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_BACKEND", "te_tn_adapter")
     no_sidecar = backend == "cutlass_native"
     os.environ.setdefault(
+        "CPPMEGA_TE_MXFP8_MATERIALIZATION_POLICY",
+        "compact_columnwise" if no_sidecar else "materialized_transpose",
+    )
+    os.environ.setdefault(
         "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND",
         "off" if no_sidecar else "te",
     )
@@ -51,6 +55,18 @@ def _set_mxfp8_profile_env(backend: str | None) -> str:
     os.environ.setdefault(
         "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT",
         "0" if no_sidecar else "1",
+    )
+    os.environ.setdefault(
+        "CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD",
+        "1" if no_sidecar else "0",
+    )
+    os.environ.setdefault(
+        "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD",
+        "1" if no_sidecar else "0",
+    )
+    os.environ.setdefault(
+        "CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND",
+        "compact",
     )
     os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK", "0")
     os.environ.setdefault("CPPMEGA_TE_MXFP8_DGRAD_BF16", "0")
@@ -117,6 +133,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     weight_shape = [args.n, args.k]
     weight_data_ptr = int(linear.weight.data_ptr())
     transpose_payload_shape = [args.k, args.m]
+    transpose_shape_is_ambiguous = transpose_payload_shape == input_shape
     saved_bf16_input = [
         rec
         for rec in saved_tensors
@@ -188,10 +205,26 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 failures.append("FlashInfer/CUTLASS compact-direct backend did not handle wgrad")
         if int(stats.get("mxfp8_tn_adapter_te_emit", 0)) != 0:
             failures.append("compact-direct backend emitted TE transpose operands")
+        if int(stats.get("mxfp8_tn_adapter_te_emit_deferred", 0)) != 0:
+            failures.append("compact-direct backend deferred TE transpose operands")
+        if int(stats.get("mxfp8_tn_adapter_saved_transpose_operand", 0)) != 0:
+            failures.append("compact-direct backend saved rowwise-transpose operands")
+        if int(stats.get("mxfp8_tn_adapter_copy_transpose", 0)) != 0:
+            failures.append("compact-direct backend copied MXFP8 transpose operands")
+        if int(stats.get("mxfp8_tn_adapter_missing_sidecar_copy", 0)) != 0:
+            failures.append("compact-direct backend copied missing sidecar operands")
+        if int(stats.get("mxfp8_norm_quantize_sidecar_bridge", 0)) != 0:
+            failures.append("compact-direct backend used BF16 norm quantize sidecar bridge")
         if int(stats.get("mxfp8_tn_sidecar_attr_attached", 0)) != 0:
             failures.append("compact-direct backend attached MXFP8 transpose sidecars")
         if int(stats.get("mxfp8_tn_sidecar_registry_peak", 0)) != 0:
             failures.append("compact-direct backend used the sidecar registry")
+        if int(stats.get("mxfp8_tn_sidecar_registry_peak_bytes", 0)) != 0:
+            failures.append("compact-direct backend retained sidecar registry bytes")
+        if saved_transpose_payload and not transpose_shape_is_ambiguous:
+            failures.append("compact-direct backend saved rowwise-transpose payload tensors")
+        if not saved_input_columnwise_payload:
+            failures.append("compact-direct backend did not save compact columnwise input payloads")
     else:
         if not saved_transpose_payload:
             failures.append(
@@ -228,9 +261,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--m", type=int, default=64)
+    parser.add_argument("--m", type=int, default=128)
     parser.add_argument("--n", type=int, default=128)
-    parser.add_argument("--k", type=int, default=128)
+    parser.add_argument("--k", type=int, default=256)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument(
         "--backend",

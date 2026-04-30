@@ -1,7 +1,7 @@
 # Cppmega Run Profiles And Token Flow
 
 Status: canonical
-Last updated: 2026-04-28
+Last updated: 2026-04-30
 Scope: typed run-profile contract, local GB10 token flow, and precision/layout
 boundaries for the current NAM56R-quarter debug lane.
 
@@ -16,7 +16,9 @@ Each profile is built by a setter function that fills a `RunProfile` dataclass:
   real 4k clang data, MTP depth 2, CCE MTP CE, tensorwise FP8, patched FA4
   SM120 attention routing, no-master Muon, q8 Muon momentum, local DDP
   contiguous grad buffer disabled, and explicit source roots for the local
-  `/home/dave/flash-attention-fa4` plus `/home/dave/TransformerEngine` forks.
+  `/home/dave/flash-attention-fa4` plus
+  `/home/dave/source/TransformerEngine-wave13B-te-linear-no-materialize`
+  worktrees.
 - `set_h200_dsa_9_4_m_profile()`:
   full-depth H200 production-target skeleton. Remote scripts still own
   machine-specific PP/VPP/EP orchestration, but the model-level contract is
@@ -49,15 +51,10 @@ bash scripts/local_gb10_quarter_train.sh \
   --mxfp8-transpose-emit-strict
 bash scripts/local_gb10_quarter_train.sh \
   --fp8-recipe mxfp8 \
-  --mxfp8-bwd-backend te_tn_adapter \
-  --mxfp8-transpose-emit-backend te \
-  --mxfp8-transpose-emit-swizzled \
-  --mxfp8-transpose-emit-strict
+  --mxfp8-materialization-policy materialized_transpose
 bash scripts/local_gb10_quarter_train.sh \
   --fp8-recipe mxfp8 \
-  --mxfp8-bwd-backend cutlass_native \
-  --mxfp8-transpose-emit-backend off \
-  --cutlass-mxfp8-scale-backend compact
+  --mxfp8-materialization-policy compact_columnwise
 ```
 
 Those flags are forwarded to `cppmega.recipes.run_profiles shell ...` and mutate
@@ -66,6 +63,18 @@ The rendered `CPPMEGA_*` values are an internal transport for import-time
 shims only; operator-facing precision/backend choices must be added as
 `RunProfile` dataclass fields plus CLI overrides instead of documented as raw
 environment-variable recipes.
+
+For Wave13B, `PrecisionProfile.mxfp8_materialization_policy` is the typed
+source of truth for TE MXFP8 backward operand materialization:
+
+- `compact_columnwise`: local MXFP8 default. Exports
+  `CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native`,
+  `CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=off`,
+  `CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=1`, and
+  `CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD=1`.
+- `materialized_transpose`: explicit A/B path for the older TE-TN route.
+  Exports `CPPMEGA_TE_MXFP8_BWD_BACKEND=te_tn_adapter` and TE transpose emit
+  enabled.
 
 `optimizer.param_storage` is the optimizer/model-storage contract:
 
