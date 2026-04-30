@@ -135,6 +135,27 @@ To apply manually:
 python -m cppmega.megatron.upstream_patches.apply_mamba3_mimo_p1_patches
 ```
 
+## Mamba3 bwd_bwd Wave32 vectorized diag experiment (opt-in)
+
+`apply_mamba3_bwd_bwd_vectorized_patches.py` is a default-off source
+experiment layered on top of the stage2 force-nonTMA patch. It computes
+same-step `R x R` diagonal blocks with a per-step vectorized `R*R x P`
+product plus `T.reduce_sum` microkernel and stages them in `[chunk, R * R]`
+shared memory for `DGAMMA/DK/DQ`.
+
+Env-gated:
+```bash
+CPPMEGA_MAMBA3_BWD_BWD_VECTORIZED_DIAG=1 \
+MAMBA3_BWD_BWD_VECTORIZED_DIAG_ALLOW_FILE_MUTATION=1 \
+python -m cppmega.megatron.upstream_patches.apply_mamba3_bwd_bwd_vectorized_patches
+```
+
+Rollback:
+```bash
+CPPMEGA_MAMBA3_BWD_BWD_VECTORIZED_DIAG_ROLLBACK=1 \
+python -m cppmega.megatron.upstream_patches.apply_mamba3_bwd_bwd_vectorized_patches
+```
+
 ## DualPipeV integration (opt-in, separate script)
 
 `apply_dualpipev_patch.py` hooks Megatron's `setup_model_and_optimizer`

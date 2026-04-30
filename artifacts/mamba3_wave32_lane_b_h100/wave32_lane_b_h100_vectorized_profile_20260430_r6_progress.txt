@@ -1,0 +1,6 @@
+1777565184.354 start
+1777565186.365 applier_noop_start
+1777565188.069 applier_noop_done rc=0
+1777565190.202 applier_gated_start
+1777565192.132 applier_gated_done rc=1
+1777565193.810 bench_start
