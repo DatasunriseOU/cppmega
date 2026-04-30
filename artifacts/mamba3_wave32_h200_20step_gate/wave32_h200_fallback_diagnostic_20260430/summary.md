@@ -1,0 +1,3 @@
+| case | class | variant | TE backend | stage2 applied | status | steps seen | tok/sec excl first | avg step ms excl first | peak alloc GiB | peak reserved GiB | final lm loss | final grad norm | nan iters | reached Mamba bwd | log |
+| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| fallback_auto_full | diagnostic | grouped_head_bwd_baseline | FusedAttention | no | ok | 1 | 97.853 | 334868.300 | 54.864 | 55.668 | 11.406640 | nan | 0 | yes | /vol/benchmarks/mamba3_wave32_h200_20step_gate/wave32_h200_fallback_diagnostic_20260430/fallback_auto_full_grouped_head_bwd_baseline.log |

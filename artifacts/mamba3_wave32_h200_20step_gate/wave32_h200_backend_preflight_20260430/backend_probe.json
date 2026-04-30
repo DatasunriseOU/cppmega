@@ -1,0 +1,86 @@
+{
+  "backend_probe": {
+    "device_capabilities": [
+      [
+        9,
+        0
+      ],
+      [
+        9,
+        0
+      ]
+    ],
+    "device_count": 2,
+    "fa3_usable": false,
+    "fa4_detected_paths": [],
+    "fa4_source_root": null,
+    "fa4_usable": false,
+    "flash_attn_3_module": {
+      "error": null,
+      "has_flash_attn_func": false,
+      "has_flash_attn_varlen_func": false,
+      "installed": false,
+      "module": "flash_attn_3",
+      "origin": null,
+      "version": null
+    },
+    "flash_attn_3_version": null,
+    "flash_attn_4_module": {
+      "error": null,
+      "has_flash_attn_func": false,
+      "has_flash_attn_varlen_func": false,
+      "installed": false,
+      "module": "flash_attn_4",
+      "origin": null,
+      "version": null
+    },
+    "flash_attn_4_version": null,
+    "flash_attn_distribution_version": "2.8.3",
+    "flash_attn_interface_module": {
+      "error": null,
+      "has_flash_attn_func": false,
+      "has_flash_attn_varlen_func": false,
+      "installed": false,
+      "module": "flash_attn_interface",
+      "origin": null,
+      "version": null
+    },
+    "flash_attn_module": {
+      "error": null,
+      "file": "/usr/local/lib/python3.13/dist-packages/flash_attn/__init__.py",
+      "has_flash_attn_func": true,
+      "has_flash_attn_varlen_func": true,
+      "installed": true,
+      "module": "flash_attn",
+      "origin": "/usr/local/lib/python3.13/dist-packages/flash_attn/__init__.py",
+      "version": "2.8.3"
+    },
+    "flash_attn_package_interface_module": {
+      "error": null,
+      "file": "/usr/local/lib/python3.13/dist-packages/flash_attn/flash_attn_interface.py",
+      "has_flash_attn_func": true,
+      "has_flash_attn_varlen_func": true,
+      "installed": true,
+      "module": "flash_attn.flash_attn_interface",
+      "origin": "/usr/local/lib/python3.13/dist-packages/flash_attn/flash_attn_interface.py",
+      "version": null
+    },
+    "gpu_names": [
+      "NVIDIA H200",
+      "NVIDIA H200"
+    ],
+    "policy": {
+      "blocked_reason": "FA3_MISSING_OR_UNUSABLE",
+      "family": "hopper",
+      "production_required_backend": "FA3",
+      "production_usable": false
+    },
+    "te_selected_backend": "not_exercised_in_backend_probe",
+    "torch": "2.13.0.dev20260426+cu132",
+    "torch_cuda": "13.2",
+    "transformer_engine_version": "2.16.0.dev0+8e19460b"
+  },
+  "gpu_spec": "H200:2",
+  "image_ref": "ghcr.io/jewelmusicee/cppmega:785c3fd",
+  "run_id": "wave32_h200_backend_preflight_20260430"
+}
