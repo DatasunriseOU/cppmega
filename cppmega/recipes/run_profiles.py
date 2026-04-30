@@ -134,6 +134,11 @@ class PrecisionProfile:
     # the current SM120 direct loader is slower than the TE-transpose TN path on
     # full-model GB10 runs, so keep it opt-in until the loader/mainloop is fixed.
     mxfp8_compact_columnwise_backward: bool = False
+    # Dense TE backward uses patched TE/cppmega hooks to save or emit
+    # GEMM-ready rowwise-transposed MXFP8 operands at the producing operation.
+    # This covers Linear/LayerNormLinear saved activations and backward
+    # grad-output producers, avoiding the deprecated copy-transpose bridge.
+    mxfp8_dense_saved_operands: bool = True
     # Experimental MoE grouped backward mode: consumes grouped compact MXFP8
     # operands directly.  Keep this separate from dense compact-columnwise
     # because the current grouped direct kernels save memory but are slower than
@@ -628,6 +633,9 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                 "CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD": _bool(
                     profile.precision.mxfp8_compact_columnwise_backward
                 ),
+                "CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS": _bool(
+                    profile.precision.mxfp8_dense_saved_operands
+                ),
                 "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD": _bool(
                     profile.precision.mxfp8_grouped_direct_backward
                 ),
@@ -740,6 +748,8 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
                     "--mxfp8-compact-columnwise-backward requires "
                     "--mxfp8-bwd-backend cutlass_native"
                 )
+    if args.mxfp8_dense_saved_operands is not None:
+        profile.precision.mxfp8_dense_saved_operands = args.mxfp8_dense_saved_operands
     if args.mxfp8_grouped_direct_backward is not None:
         profile.precision.mxfp8_grouped_direct_backward = (
             args.mxfp8_grouped_direct_backward
@@ -978,6 +988,23 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         default=None,
         dest="mxfp8_compact_columnwise_backward",
+    )
+    dense_saved_operands = parser.add_mutually_exclusive_group()
+    dense_saved_operands.add_argument(
+        "--mxfp8-dense-saved-operands",
+        action="store_true",
+        default=None,
+        dest="mxfp8_dense_saved_operands",
+        help=(
+            "Use patched TE/cppmega hooks to save or emit GEMM-ready dense "
+            "MXFP8 backward operands at their producers."
+        ),
+    )
+    dense_saved_operands.add_argument(
+        "--no-mxfp8-dense-saved-operands",
+        action="store_false",
+        default=None,
+        dest="mxfp8_dense_saved_operands",
     )
     grouped_direct_backward = parser.add_mutually_exclusive_group()
     grouped_direct_backward.add_argument(
