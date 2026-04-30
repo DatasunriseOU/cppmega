@@ -34,6 +34,7 @@ MoeDispatcher = Literal["flex", "alltoall", "allgather"]
 MoeFlexBackend = Literal["deepep", "hybridep"]
 NsysCaptureMode = Literal["full", "delay", "cudaProfilerApi"]
 AttentionBackend = Literal["auto", "flash", "fused", "unfused"]
+DsaIndexerLossMode = Literal["dense", "sparse_topk", "off"]
 
 
 @dataclass
@@ -67,6 +68,9 @@ class ModelProfile:
     moe_flex_dispatcher_backend: MoeFlexBackend = "deepep"
     moe_router_dtype: str | None = "fp32"
     dsa_indexer_loss_coeff: float = 0.001
+    # dense: Megatron's legacy dense FP32 KL path. sparse_topk: fused top-k
+    # sparse KL when available, with dense fallback counted. off: no indexer KL.
+    dsa_indexer_loss_mode: DsaIndexerLossMode = "dense"
 
 
 @dataclass
@@ -192,11 +196,9 @@ class RuntimePatchProfile:
     noconv_mamba_chunk_size: int | None = None
     dsa_sparse_mode: SparseMlaMode = "tilelang"
     dsa_fp8_attention: bool = False
-    # NOTE: same name as ModelProfile.dsa_indexer_loss_coeff but semantically
-    # distinct — this is the env-var string passed to import-time shim patches,
-    # while ModelProfile's is the float fed to the --dsa-indexer-loss-coeff
-    # Megatron launcher arg.  Not the same value; be deliberate about which you
-    # assign.
+    # Deprecated compatibility fields.  Rendered DSA indexer-loss env vars are
+    # resolved from ModelProfile.dsa_indexer_loss_mode so shell/runtime state
+    # cannot diverge from --dsa-indexer-loss-coeff again.
     dsa_indexer_loss_coeff: str = "0"
     dsa_skip_indexer_loss: bool = True
     ngram_hash_enabled: bool = True
@@ -275,6 +277,23 @@ class RunProfile:
             return "e4m3"
         return self.precision.fp8_format
 
+    def resolved_dsa_indexer_loss_coeff(self) -> float:
+        """Return the concrete Megatron DSA indexer-loss coefficient."""
+
+        if self.model.dsa_indexer_loss_mode == "off":
+            return 0.0
+        return self.model.dsa_indexer_loss_coeff
+
+    def resolved_dsa_indexer_use_sparse_loss(self) -> bool:
+        """Return whether Megatron should use sparse top-k DSA indexer loss."""
+
+        return self.model.dsa_indexer_loss_mode == "sparse_topk"
+
+    def resolved_dsa_skip_indexer_loss(self) -> bool:
+        """Return whether runtime shims should treat indexer loss as disabled."""
+
+        return self.model.dsa_indexer_loss_mode == "off"
+
     def hybrid_layer_pattern(self) -> str:
         """Return the Megatron hybrid-layer-pattern derived from model fields."""
 
@@ -340,7 +359,7 @@ class RunProfile:
             moe_flex_dispatcher_backend=self.model.moe_flex_dispatcher_backend,
             moe_router_dtype=self.model.moe_router_dtype,
             enable_dsa=True,
-            dsa_indexer_loss_coeff=self.model.dsa_indexer_loss_coeff,
+            dsa_indexer_loss_coeff=self.resolved_dsa_indexer_loss_coeff(),
         )
         return bundle.to_shell_fragment()
 
@@ -373,6 +392,9 @@ def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProf
     # Single-GB10 has TP=EP=1, so Megatron's Flex dispatcher is invalid here.
     # Keep this in the typed profile instead of relying on a shell fallback.
     profile.model.moe_token_dispatcher_type = "alltoall"
+    # The local lane uses normal training data, not a dedicated DSA pretraining
+    # stage.  Keep the FP32 dense indexer KL path off unless explicitly selected.
+    profile.model.dsa_indexer_loss_mode = "off"
     profile.precision.attention_backend = "flash"
     # GB10 MXFP8 profiler runs on 2026-04-29 showed FlashInfer/CUTLASS backward
     # spending ~878 ms/step in 68 GEMMs, while the TE TN adapter cut steady
@@ -476,6 +498,10 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
             "mxfp8_compact_columnwise_backward"
         )
 
+    dsa_indexer_loss_coeff = profile.resolved_dsa_indexer_loss_coeff()
+    dsa_indexer_use_sparse_loss = profile.resolved_dsa_indexer_use_sparse_loss()
+    dsa_skip_indexer_loss = profile.resolved_dsa_skip_indexer_loss()
+
     env: dict[str, str] = {
         "CPPMEGA_RUN_PROFILE": profile.name,
         "CPPMEGA_NEM_PATTERN": profile.model.pattern,
@@ -546,8 +572,10 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         "CPPMEGA_MAMBA_RECOMPUTE": _bool(profile.runtime.mamba_recompute),
         "CPPMEGA_DSA_SPARSE_MODE": profile.runtime.dsa_sparse_mode,
         "CPPMEGA_DSA_FP8_ATTENTION": _bool(profile.runtime.dsa_fp8_attention),
-        "CPPMEGA_DSA_INDEXER_LOSS_COEFF": profile.runtime.dsa_indexer_loss_coeff,
-        "CPPMEGA_DSA_SKIP_INDEXER_LOSS": _bool(profile.runtime.dsa_skip_indexer_loss),
+        "CPPMEGA_DSA_INDEXER_LOSS_MODE": profile.model.dsa_indexer_loss_mode,
+        "CPPMEGA_DSA_INDEXER_LOSS_COEFF": str(dsa_indexer_loss_coeff),
+        "CPPMEGA_DSA_INDEXER_USE_SPARSE_LOSS": _bool(dsa_indexer_use_sparse_loss),
+        "CPPMEGA_DSA_SKIP_INDEXER_LOSS": _bool(dsa_skip_indexer_loss),
         "CPPMEGA_NGRAM_HASH_ENABLED": _bool(profile.runtime.ngram_hash_enabled),
         "CPPMEGA_STRUCTURE_ENABLED": _bool(profile.runtime.structure_enabled),
         "CPPMEGA_STRUCTURE_COMPONENTS": profile.runtime.structure_components,
@@ -676,6 +704,8 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.model.moe_router_dtype = None if args.moe_router_dtype == "none" else args.moe_router_dtype
     if args.dsa_indexer_loss_coeff is not None:
         profile.model.dsa_indexer_loss_coeff = args.dsa_indexer_loss_coeff
+    if args.dsa_indexer_loss_mode is not None:
+        profile.model.dsa_indexer_loss_mode = args.dsa_indexer_loss_mode
     if args.mtp_ce_kernel is not None:
         profile.runtime.mtp_ce_kernel = args.mtp_ce_kernel
         profile.runtime.acknowledge_liger_mtp_ce_deprecated = args.mtp_ce_kernel == "liger"
@@ -843,6 +873,14 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         default=None,
     )
     parser.add_argument("--dsa-indexer-loss-coeff", type=float, default=None)
+    parser.add_argument(
+        "--dsa-indexer-loss-mode",
+        choices=("dense", "sparse_topk", "off"),
+        default=None,
+        help=(
+            "Select DSA indexer KL route: dense FP32, fused sparse top-k, or off."
+        ),
+    )
     parser.add_argument("--mtp-ce-kernel", choices=("native", "cce", "liger", "off"), default=None)
     cce_fuse = parser.add_mutually_exclusive_group()
     cce_fuse.add_argument(

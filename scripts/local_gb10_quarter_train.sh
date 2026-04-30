@@ -38,8 +38,17 @@ export CPPMEGA_MAMBA_NUM_GROUPS="${CPPMEGA_MAMBA_NUM_GROUPS:-8}"
 export CPPMEGA_MAMBA_RECOMPUTE="${CPPMEGA_MAMBA_RECOMPUTE:-1}"
 export CPPMEGA_DSA_SPARSE_MODE="${CPPMEGA_DSA_SPARSE_MODE:-tilelang}"
 export CPPMEGA_DSA_FP8_ATTENTION="${CPPMEGA_DSA_FP8_ATTENTION:-0}"
+export CPPMEGA_DSA_INDEXER_LOSS_MODE="${CPPMEGA_DSA_INDEXER_LOSS_MODE:-off}"
 export CPPMEGA_DSA_INDEXER_LOSS_COEFF="${CPPMEGA_DSA_INDEXER_LOSS_COEFF:-0}"
+export CPPMEGA_DSA_INDEXER_USE_SPARSE_LOSS="${CPPMEGA_DSA_INDEXER_USE_SPARSE_LOSS:-0}"
 export CPPMEGA_DSA_SKIP_INDEXER_LOSS="${CPPMEGA_DSA_SKIP_INDEXER_LOSS:-1}"
+case "${CPPMEGA_DSA_INDEXER_LOSS_MODE}" in
+  dense|sparse_topk|off) ;;
+  *)
+    echo "FATAL: CPPMEGA_DSA_INDEXER_LOSS_MODE must be dense, sparse_topk, or off" >&2
+    exit 2
+    ;;
+esac
 export CPPMEGA_SEQ_LENGTH="${CPPMEGA_SEQ_LENGTH:-4096}"
 export CPPMEGA_MAX_POSITION_EMBEDDINGS="${CPPMEGA_MAX_POSITION_EMBEDDINGS:-4096}"
 export CPPMEGA_FP8_FORMAT="${CPPMEGA_FP8_FORMAT:-hybrid}"
@@ -676,6 +685,7 @@ echo "[local-quarter] spec=${CPPMEGA_SPEC_MODULE} ${CPPMEGA_SPEC_FUNCTION}"
 echo "[local-quarter] te_precision_config=${CPPMEGA_TE_PRECISION_CONFIG_FILE:-}"
 echo "[local-quarter] mxfp8_bwd_tn_adapter=${CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER:-0} mxfp8_bwd_backend=${CPPMEGA_TE_MXFP8_BWD_BACKEND:-te_tn_adapter} transpose_emit=${CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND:-auto} transpose_emit_swizzled=${CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED:-auto} cutlass_scale_backend=${CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND:-compact} bf16_fallback=${CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK:-0} nvte_backward_override=${NVTE_BACKWARD_OVERRIDE:-}"
 echo "[local-quarter] sparse_mla_fp8_quant=${CPPMEGA_SPARSE_MLA_FP8_QUANT} dsa_fp8_attention=${CPPMEGA_DSA_FP8_ATTENTION}"
+echo "[local-quarter] dsa_indexer_loss_mode=${CPPMEGA_DSA_INDEXER_LOSS_MODE} coeff=${CPPMEGA_DSA_INDEXER_LOSS_COEFF} sparse_loss=${CPPMEGA_DSA_INDEXER_USE_SPARSE_LOSS} skip=${CPPMEGA_DSA_SKIP_INDEXER_LOSS}"
 echo "[local-quarter] attention_backend=${CPPMEGA_ATTN_BACKEND} use_flash_attn=${CPPMEGA_USE_FLASH_ATTN}"
 echo "[local-quarter] extra_pythonpath=${CPPMEGA_EXTRA_PYTHONPATH:-}"
 echo "[local-quarter] moe_dispatcher=${CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE} moe_flex_backend=${CPPMEGA_MOE_FLEX_DISPATCHER_BACKEND}"

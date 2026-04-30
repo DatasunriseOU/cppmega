@@ -2360,7 +2360,9 @@ except Exception as _exc:  # pragma: no cover
 _mimo_on = os.environ.get("CPPMEGA_MAMBA3_MIMO", "0") == "1"
 _num_groups_override = os.environ.get("CPPMEGA_MAMBA_NUM_GROUPS", "")
 _noconv_chunk_override = os.environ.get("CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE", "")
-if _mimo_on or _num_groups_override or _noconv_chunk_override:
+_dsa_indexer_loss_mode = os.environ.get("CPPMEGA_DSA_INDEXER_LOSS_MODE", "dense").strip().lower()
+_dsa_indexer_use_sparse_loss = os.environ.get("CPPMEGA_DSA_INDEXER_USE_SPARSE_LOSS", "0") == "1"
+if _mimo_on or _num_groups_override or _noconv_chunk_override or _dsa_indexer_use_sparse_loss:
     try:
         from megatron.core.transformer.transformer_config import TransformerConfig
         _orig_post_init = TransformerConfig.__post_init__
@@ -2394,6 +2396,8 @@ if _mimo_on or _num_groups_override or _noconv_chunk_override:
                     object.__setattr__(self, "cppmega_mamba3_mimo_rank", 4)
                 if not getattr(self, "cppmega_mamba3_chunk_size", None):
                     object.__setattr__(self, "cppmega_mamba3_chunk_size", 16)
+            if _dsa_indexer_use_sparse_loss:
+                object.__setattr__(self, "dsa_indexer_use_sparse_loss", True)
 
         TransformerConfig.__post_init__ = _cppmega_mimo_post_init
         if _mimo_on:
@@ -2404,6 +2408,11 @@ if _mimo_on or _num_groups_override or _noconv_chunk_override:
             print(
                 "[cppmega_fp8_shim] no-conv Mamba chunk override arm set -> "
                 f"{_noconv_chunk_override}"
+            )
+        if _dsa_indexer_use_sparse_loss:
+            print(
+                "[cppmega_fp8_shim] DSA sparse top-k indexer loss enabled "
+                f"(mode={_dsa_indexer_loss_mode})"
             )
     except Exception as _exc:  # pragma: no cover
         import sys

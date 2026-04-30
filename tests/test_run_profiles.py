@@ -90,7 +90,12 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert env["CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE"] == "256"
     assert env["CPPMEGA_CCE_FUSE_MAIN_MTP_CE"] == "1"
     assert env["CPPMEGA_DSA_FP8_ATTENTION"] == "0"
+    assert env["CPPMEGA_DSA_INDEXER_LOSS_MODE"] == "off"
+    assert env["CPPMEGA_DSA_INDEXER_LOSS_COEFF"] == "0.0"
+    assert env["CPPMEGA_DSA_INDEXER_USE_SPARSE_LOSS"] == "0"
+    assert env["CPPMEGA_DSA_SKIP_INDEXER_LOSS"] == "1"
     assert "--moe-token-dispatcher-type alltoall" in env["NATIVE_ARGS"]
+    assert "--dsa-indexer-loss-coeff 0.0" in env["NATIVE_ARGS"]
     assert env["CPPMEGA_OPTIMIZER"] == "muon"
     assert env["CPPMEGA_PARAM_STORAGE"] == "mxfp8"
     assert env["CPPMEGA_FP8_FORMAT"] == "e4m3"
@@ -125,6 +130,33 @@ def test_profile_can_render_pure_bf16_precision_lane():
     assert env["CPPMEGA_FP8_RECIPE"] == "off"
     assert env["CPPMEGA_PARAM_STORAGE"] == "bf16"
     assert "CPPMEGA_TE_MXFP8_BWD_BACKEND" not in env
+
+
+def test_dsa_indexer_sparse_loss_profile_renders_config_bridge():
+    profile = get_run_profile("local_gb10_quarter")
+    profile.model.dsa_indexer_loss_mode = "sparse_topk"
+
+    env = profile_shell_assignments(profile)
+
+    assert env["CPPMEGA_DSA_INDEXER_LOSS_MODE"] == "sparse_topk"
+    assert env["CPPMEGA_DSA_INDEXER_LOSS_COEFF"] == "0.001"
+    assert env["CPPMEGA_DSA_INDEXER_USE_SPARSE_LOSS"] == "1"
+    assert env["CPPMEGA_DSA_SKIP_INDEXER_LOSS"] == "0"
+    assert "--dsa-indexer-loss-coeff 0.001" in env["NATIVE_ARGS"]
+
+
+def test_h200_profile_keeps_dense_dsa_indexer_loss_by_default():
+    profile = get_run_profile("h200_dsa_9_4_m")
+    profile.model.moe_expert_model_parallel_size = 4
+    profile.model.moe_token_dispatcher_type = "alltoall"
+
+    env = profile_shell_assignments(profile)
+
+    assert env["CPPMEGA_DSA_INDEXER_LOSS_MODE"] == "dense"
+    assert env["CPPMEGA_DSA_INDEXER_LOSS_COEFF"] == "0.001"
+    assert env["CPPMEGA_DSA_INDEXER_USE_SPARSE_LOSS"] == "0"
+    assert env["CPPMEGA_DSA_SKIP_INDEXER_LOSS"] == "0"
+    assert "--dsa-indexer-loss-coeff 0.001" in env["NATIVE_ARGS"]
 
 
 def test_render_shell_quotes_profile_values():
@@ -183,6 +215,8 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
             "direct_tactic",
             "--mxfp8-flashinfer-tactic",
             "2",
+            "--dsa-indexer-loss-mode",
+            "sparse_topk",
         ],
     )
 
@@ -210,6 +244,9 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
     assert "export CPPMEGA_CCE_FUSE_MAIN_MTP_CE=1" in out
     assert "export CPPMEGA_FLASHINFER_MXFP8_RUNNER=direct_tactic" in out
     assert "export CPPMEGA_FLASHINFER_MXFP8_TACTIC=2" in out
+    assert "export CPPMEGA_DSA_INDEXER_LOSS_MODE=sparse_topk" in out
+    assert "export CPPMEGA_DSA_INDEXER_USE_SPARSE_LOSS=1" in out
+    assert "export CPPMEGA_DSA_SKIP_INDEXER_LOSS=0" in out
     assert "--mtp-num-layers 1" in out
 
 
@@ -335,6 +372,8 @@ def test_local_launcher_lets_native_args_own_moe_dispatcher_flag():
     assert "apply_moe_dispatcher_identity_sort_patch()" in script
     assert "CPPMEGA_MUON_NUM_NS_STEPS:-3" in script
     assert "CPPMEGA_EXTRA_PYTHONPATH" in script
+    assert "CPPMEGA_DSA_INDEXER_LOSS_MODE:-off" in script
+    assert "dsa_indexer_loss_mode=" in script
     assert "flash_attn import:" in script
 
 
@@ -343,6 +382,8 @@ def test_fp8_shim_bridges_noconv_mamba_chunk_config():
 
     assert "CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE" in shim
     assert "cppmega_noconv_mamba_chunk_size" in shim
+    assert "CPPMEGA_DSA_INDEXER_USE_SPARSE_LOSS" in shim
+    assert "dsa_indexer_use_sparse_loss" in shim
 
 
 def test_remote_gb10_launcher_preserves_muon_ns_override():

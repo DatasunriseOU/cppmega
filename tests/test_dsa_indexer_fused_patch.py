@@ -12,7 +12,11 @@ from __future__ import annotations
 
 import torch
 
-from cppmega.megatron.dsa_indexer_fused_patch import compute_index_scores_fused_bf16
+from cppmega.megatron.dsa_indexer_fused_patch import (
+    compute_index_scores_fused_bf16,
+    get_dsa_indexer_stats,
+    reset_dsa_indexer_stats,
+)
 
 
 def _upstream_reference(
@@ -31,6 +35,7 @@ def _upstream_reference(
 
 
 def test_fused_matches_reference_bf16_relu():
+    reset_dsa_indexer_stats()
     torch.manual_seed(0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     sq, sk, b, h, d = 128, 128, 2, 8, 64
@@ -51,6 +56,13 @@ def test_fused_matches_reference_bf16_relu():
     rel_err = abs_err / max(ref_abs, 1e-6)
     print(f"relu=True abs_err={abs_err:.3e} rel_err={rel_err:.3e}")
     assert rel_err < 1e-3, f"rel_err {rel_err} too high"
+    stats = get_dsa_indexer_stats()
+    assert stats["index_scores_calls"] == 1
+    assert stats["index_scores_q_bfloat16"] == 1
+    assert stats["index_scores_k_bfloat16"] == 1
+    assert stats["index_scores_weights_bfloat16"] == 1
+    assert stats["index_scores_fp32_output_elems"] == b * sq * sk
+    assert stats["index_scores_fp32_full_intermediate_avoided_elems"] == sq * b * h * sk
 
 
 def test_fused_matches_reference_bf16_no_relu():
