@@ -164,6 +164,7 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
             "--mxfp8-transpose-emit-backend",
             "off",
             "--mxfp8-compact-columnwise-backward",
+            "--no-mxfp8-grouped-gemm-ready-backward",
             "--fp8-param-gather",
             "--no-reuse-grad-buf-for-mxfp8-param-ag",
             "--no-mxfp8-transpose-emit-swizzled",
@@ -198,6 +199,7 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
     assert "export CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native" in out
     assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=off" in out
     assert "export CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=1" in out
+    assert "export CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD=0" in out
     assert "export CPPMEGA_FP8_PARAM_GATHER=1" in out
     assert "export CPPMEGA_REUSE_GRAD_BUF_FOR_MXFP8_PARAM_AG=0" in out
     assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED=0" in out
@@ -370,6 +372,7 @@ def test_mxfp8_transpose_emit_defaults_to_te_for_tn_adapter():
     env = profile_shell_assignments(profile)
     assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
     assert env["CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD"] == "0"
+    assert env["CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD"] == "1"
 
 
 def test_mxfp8_docs_pin_zero_copy_acceptance_counters():

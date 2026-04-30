@@ -138,6 +138,10 @@ class PrecisionProfile:
     # because the current grouped direct kernels save memory but are slower than
     # the grouped TN adapter on GB10 full-model smoke runs.
     mxfp8_grouped_direct_backward: bool = False
+    # Preferred grouped/MoE backward route: if TE has already saved GEMM-ready
+    # rowwise-transposed MXFP8 operands, call grouped TN GEMM directly and avoid
+    # the copy bridge.  This is distinct from compact direct kernels above.
+    mxfp8_grouped_gemm_ready_backward: bool = True
     # FlashInfer's public mm_mxfp8 path owns autotuning. direct_tactic bypasses
     # that layer and is only for shape/tactic probes when nsys shows overhead.
     mxfp8_flashinfer_runner: Mxfp8FlashinferRunner = "mm_mxfp8"
@@ -622,6 +626,9 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                 "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD": _bool(
                     profile.precision.mxfp8_grouped_direct_backward
                 ),
+                "CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD": _bool(
+                    profile.precision.mxfp8_grouped_gemm_ready_backward
+                ),
                 "CPPMEGA_FLASHINFER_MXFP8_RUNNER": (
                     profile.precision.mxfp8_flashinfer_runner
                 ),
@@ -731,6 +738,10 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
     if args.mxfp8_grouped_direct_backward is not None:
         profile.precision.mxfp8_grouped_direct_backward = (
             args.mxfp8_grouped_direct_backward
+        )
+    if args.mxfp8_grouped_gemm_ready_backward is not None:
+        profile.precision.mxfp8_grouped_gemm_ready_backward = (
+            args.mxfp8_grouped_gemm_ready_backward
         )
     if args.mxfp8_flashinfer_runner is not None:
         profile.precision.mxfp8_flashinfer_runner = args.mxfp8_flashinfer_runner
@@ -975,6 +986,23 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         default=None,
         dest="mxfp8_grouped_direct_backward",
+    )
+    grouped_gemm_ready_backward = parser.add_mutually_exclusive_group()
+    grouped_gemm_ready_backward.add_argument(
+        "--mxfp8-grouped-gemm-ready-backward",
+        action="store_true",
+        default=None,
+        dest="mxfp8_grouped_gemm_ready_backward",
+        help=(
+            "Route grouped/MoE MXFP8 backward through TE grouped TN when "
+            "GEMM-ready rowwise-transposed operands already exist."
+        ),
+    )
+    grouped_gemm_ready_backward.add_argument(
+        "--no-mxfp8-grouped-gemm-ready-backward",
+        action="store_false",
+        default=None,
+        dest="mxfp8_grouped_gemm_ready_backward",
     )
     parser.add_argument(
         "--mxfp8-flashinfer-runner",
