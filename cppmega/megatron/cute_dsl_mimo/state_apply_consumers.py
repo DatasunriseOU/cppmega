@@ -18,6 +18,11 @@ WGMMA B operand for the next chunk's ``K @ DStates`` product.  It also includes
 the same-time qk diagonal contribution to the scalar ``dpsi`` consumers:
 
   carry_t = exp(dA_cs_last) * carry_t + (dPhi * exp(dA_cs)).T @ Q
+
+For the multi-chunk path, ``state + apply + D*dPhi + qk_diag`` is converted to
+BF16 before the DV / DMIMO_V consumers.  That mirrors the production TileLang
+``dPsiV_D.to(bf16)`` shared-memory boundary without materializing dPsiV_D in
+global memory.
 """
 
 from __future__ import annotations
@@ -537,6 +542,7 @@ class MultiChunkStateApplyConsumersWGMMA(StateApplyConsumersWGMMA):
                             * Float32(gQKDot_c[t, r_out, r])
                             * Float32(sDPhT[p, f_out])
                         )
+                    dpsi = Float32(self.dtype(dpsi))
                     acc += dpsi * Float32(gMimoV[r, p])
                 gDV_c[t, p] = acc
 
@@ -557,6 +563,7 @@ class MultiChunkStateApplyConsumersWGMMA(StateApplyConsumersWGMMA):
                             * Float32(gQKDot_c[t, r_out, r])
                             * Float32(sDPhT[p, f_out])
                         )
+                    dpsi = Float32(self.dtype(dpsi))
                     acc += dpsi * Float32(gV_c[t, p])
                 gDMimoV[r, p] = Float32(gDMimoV[r, p]) + acc
 

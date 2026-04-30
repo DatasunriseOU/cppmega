@@ -298,7 +298,10 @@ def _multi_reference(
         apply = (masked_lkq.float() @ inputs.dphi[c].float()).to(torch.bfloat16)
         qk_contrib = _qk_diag_contrib(inputs.qk_dot[c], inputs.gamma[c], inputs.dphi[c])
         d_contrib = inputs.d.float()[0] * inputs.dphi[c].float()
-        dpsi = state.float() + apply.float() + d_contrib + qk_contrib
+        dpsi_pre_boundary = state.float() + apply.float() + d_contrib + qk_contrib
+        # Production TileLang semantics round the combined dPsiV_D value through
+        # BF16 shared memory before the DV / DMIMO_V consumers.
+        dpsi = dpsi_pre_boundary.to(torch.bfloat16).float()
         dv_c, dmimo_c = _scalar_consumers(dpsi, inputs.v[c], inputs.mimo_v)
         dv[c] = dv_c
         dmimo_v += dmimo_c
@@ -507,10 +510,12 @@ def _run_case_multi_chunk_fused(
         "dA_state_scaling": "state = BF16((K @ BF16(carry).T) * exp(dA_cs_rev[t]))",
         "segsum_lkq_scaling": "masked LKQ = BF16((K @ Q.T) * exp(segsum[col_t,row_t])) for row_t < col_t",
         "qk_diag_contribution": "dpsi[t,r,p] += gamma[t] * sum_o qk_dot[t,o,r] * dPhi[t,o,p]",
-        "d_direct_contribution": "dpsi[f,p] += D * dPhi[f,p] before DV/DMIMO_V consumers",
+        "d_direct_contribution": "dpsi[f,p] += D * dPhi[f,p] before the combined BF16 boundary",
+        "dpsiv_d_bf16_boundary": "BF16(state + apply + D*dPhi + qk_diag) before DV/DMIMO_V consumers",
         "remaining_global": [
             "DV FP32 output tensor for all chunks",
             "DMIMO_V FP32 output tile",
+            "No global dPsiV_D tensor; BF16 boundary is local to the fused consumers",
             "Harness input-layout tensors: Q.T and DPh.T",
         ],
         "diffs": diffs,
@@ -783,6 +788,7 @@ def run_lkq_tile_chain(
     print("wave9_multi_chunk_semantics: same-time qk_dot/gamma contribution included in fused consumers")
     print("wave10_multi_chunk_semantics: dA_cs_rev state scale, segsum LKQ scale, scaled carry update")
     print("wave29_multi_chunk_semantics: direct D*dPhi contribution included in fused consumers")
+    print("wave30_multi_chunk_semantics: combined dPsiV_D BF16 boundary before DV/DMIMO_V")
 
     mask_bf16 = _future_mask_bf16()
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -883,6 +889,7 @@ def run_lkq_tile_chain(
             print(f"  segsum_lkq_scaling: {multi_result['segsum_lkq_scaling']}")
             print(f"  qk_diag_contribution: {multi_result['qk_diag_contribution']}")
             print(f"  d_direct_contribution: {multi_result['d_direct_contribution']}")
+            print(f"  dpsiv_d_bf16_boundary: {multi_result['dpsiv_d_bf16_boundary']}")
             print(f"  dv_chunk0_row0[:4]: {multi_result['dv_chunk0_row0']}")
             print(f"  ref_chunk0_row0[:4]: {multi_result['ref_dv_chunk0_row0']}")
             print(f"  dmimo_v_row0[:4]: {multi_result['dmimo_v_row0']}")
@@ -981,11 +988,14 @@ def run_lkq_tile_chain(
         "lkq_global_materialized_for_tested_fused_path": False,
         "state_apply_global_materialized_for_fused_consumer_path": False,
         "d_direct_contribution_for_multi_chunk_path": True,
+        "dpsiv_d_bf16_boundary_for_multi_chunk_path": True,
+        "dpsiv_d_global_materialized_for_multi_chunk_path": False,
         "fused_path_remaining_global": [
             "Wave6 path: state BF16 tile from scalar-copy CuTe GEMM",
             "Wave6 path: apply BF16 tile output from fused masked-apply kernel",
             "Wave7 path: DV and DMIMO_V final FP32 output tiles only",
             "Wave29 path: DV FP32 tensor for all chunks and accumulated DMIMO_V FP32 tile only",
+            "Wave30 path: combined dPsiV_D BF16 boundary stays local to consumer loops",
             "Harness input-layout tensors: DStates.T and DPh.T",
             "Wave8 harness input-layout tensors: Q.T and DPh.T",
         ],
