@@ -1,9 +1,10 @@
-"""Modal H100 harness for Mamba3 stage2 TileLang production checks.
+"""Modal H100 harness for Mamba3 Wave31 bwd_bwd live-set checks.
 
 Runs only H100 component shapes. The script compares:
 
 * installed baseline mamba_ssm TileLang source
 * current guarded stage2 force-nonTMA patch, bf=1,bb=0
+* Wave31 late dqk-from-diag recompute candidate for bwd_bwd
 
 It also records allocator/reserved-memory deltas and can wrap targeted
 stage2 split-kernel timing loops in NVTX ranges or CUDA profiler API windows
@@ -24,9 +25,9 @@ import modal
 
 _REPO_ROOT = pathlib.Path(__file__).parent.parent
 
-APP_NAME = "cppmega-wave29-lane-c-h100"
+APP_NAME = "cppmega-wave31-lane-b-h100"
 RESULTS_VOL = "cppmega-mamba3-benchmarks"
-BENCH_DIR = "/benchmarks/mamba3_wave29_lane_c_h100"
+BENCH_DIR = "/benchmarks/mamba3_wave31_lane_b_h100"
 GHCR_REPO = os.environ.get("GHCR_REPO", "ghcr.io/jewelmusicee/cppmega")
 GHCR_TAG = os.environ.get("GHCR_TAG", "785c3fd")
 GHCR_REF = f"{GHCR_REPO}:{GHCR_TAG}"
@@ -70,6 +71,7 @@ from mamba_ssm.ops.triton.mamba3.mamba3_mimo_utils import compute_dacs_segsum_tr
 
 
 PATCH_PATH = pathlib.Path("/opt/cppmega/upstream_prs/examples/13_tilelang_floormod_dbz/mamba3_bwd_stage2_force_nontma.patch")
+LIVE_SET_PATCH_PATH = pathlib.Path("/opt/cppmega/upstream_prs/examples/14_mamba3_bwd_bwd_live_set/mamba3_bwd_bwd_late_dqk_recompute.patch")
 
 def _mamba_bwd_path():
     spec = importlib.util.find_spec("mamba_ssm.ops.tilelang.mamba3")
@@ -98,12 +100,31 @@ def _apply_stage2_patch(src, dst):
         )
 
 
+def _apply_live_set_patch(src, dst):
+    _apply_stage2_patch(src, dst)
+    proc = subprocess.run(
+        ["patch", "--ignore-whitespace", "-p4", str(dst)],
+        input=LIVE_SET_PATCH_PATH.read_bytes(),
+        cwd=dst.parent,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "wave31 live-set patch failed\n"
+            + proc.stdout.decode(errors="replace")[-4000:]
+            + proc.stderr.decode(errors="replace")[-4000:]
+        )
+
+
 def _make_variant(src, name, workdir):
     dst = workdir / f"mamba3_mimo_bwd_{name}.py"
     if name == "baseline":
         shutil.copy2(src, dst)
     elif name == "stage2_current":
         _apply_stage2_patch(src, dst)
+    elif name == "wave31_late_dqk_recompute":
+        _apply_live_set_patch(src, dst)
     else:
         raise ValueError(f"unknown variant: {name}")
     return dst
@@ -335,12 +356,7 @@ def _diff(a, b):
 
 def main():
     installed = _mamba_bwd_path()
-    workdir = pathlib.Path(tempfile.mkdtemp(prefix="wave29_lane_c_h100_"))
-    variant_paths = {
-        name: _make_variant(installed, name, workdir)
-        for name in ("baseline", "stage2_current")
-    }
-    modules = {name: _load_module(path, name) for name, path in variant_paths.items()}
+    workdir = pathlib.Path(tempfile.mkdtemp(prefix="wave31_lane_b_h100_"))
     shapes = [
         {"name": "smoke", "B": 1, "S": 128, "H": 4, "G": 1, "N": 64, "P": 64, "R": 4, "chunk_size": 16, "seed": 1},
         {"name": "representative", "B": 2, "S": 512, "H": 8, "G": 1, "N": 64, "P": 64, "R": 4, "chunk_size": 16, "seed": 2},
@@ -356,9 +372,16 @@ def main():
         "profile_target": os.environ.get("CPPMEGA_MAMBA3_STAGE2_PROFILE_TARGET", "stage2_current"),
         "installed_mamba3_bwd": str(installed),
         "patch_path": str(PATCH_PATH),
+        "live_set_patch_path": str(LIVE_SET_PATCH_PATH),
         "variants": {},
         "shapes": [],
     }
+    variant_names = ("baseline", "stage2_current", "wave31_late_dqk_recompute")
+    variant_paths = {
+        name: _make_variant(installed, name, workdir)
+        for name in variant_names
+    }
+    modules = {name: _load_module(path, name) for name, path in variant_paths.items()}
     for name, path in variant_paths.items():
         text = path.read_text()
         results["variants"][name] = {
@@ -367,18 +390,22 @@ def main():
             "bb_num_stages_0": "bb_num_stages=0" in text,
             "disable_tma_count": text.count("disable_tma=True"),
             "shared_vector_staging_count": text.count("dA_cs_rev_shared") + text.count("dA_cs_shared"),
+            "diag_microkernel": "dqk_diag_shared = T.alloc_shared([chunk_size, R, R], accum_dtype)" in text,
+            "dqk_from_diag_shared_alloc": "dqk_from_diag_shared = T.alloc_shared" in text,
         }
     for shape in shapes:
         shape_result = {"shape": shape, "bench": {}, "diffs": {}}
         args = _inputs(shape)
         outputs = {}
-        for name in ("baseline", "stage2_current"):
+        for name in variant_names:
             outputs[name] = _run_combined(modules[name], args)
             torch.cuda.synchronize()
         shape_result["diffs"]["stage2_current_vs_baseline"] = _diff(outputs["baseline"], outputs["stage2_current"])
+        shape_result["diffs"]["wave31_vs_baseline"] = _diff(outputs["baseline"], outputs["wave31_late_dqk_recompute"])
+        shape_result["diffs"]["wave31_vs_stage2_current"] = _diff(outputs["stage2_current"], outputs["wave31_late_dqk_recompute"])
         del outputs
         torch.cuda.empty_cache()
-        for name in ("baseline", "stage2_current"):
+        for name in variant_names:
             args = _inputs(shape)
             chain = _bench_combined(modules[name], args, warmup=2, iters=8)
             split = _bench_split(modules[name], name, shape["name"], args, warmup=2, iters=8)
@@ -550,11 +577,11 @@ def verify_applier_mutation() -> dict[str, Any]:
 
 @app.local_entrypoint()
 def main(
-    run_id: str = "wave29_lane_c_h100",
+    run_id: str = "wave31_lane_b_h100",
     verify_applier: bool = False,
     profile_nvtx: bool = False,
     cuda_profile: bool = False,
-    profile_target: str = "stage2_current",
+    profile_target: str = "wave31_late_dqk_recompute",
 ):
     result = (
         verify_applier_mutation.remote()

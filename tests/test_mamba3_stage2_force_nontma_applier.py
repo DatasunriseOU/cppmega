@@ -1,4 +1,5 @@
 from cppmega.megatron.upstream_patches import apply_mamba3_stage2_force_nontma_patches as applier
+from cppmega.megatron.upstream_patches import apply_mamba3_bwd_bwd_live_set_patches as live_set
 
 
 def _patched_text() -> str:
@@ -44,3 +45,29 @@ def test_stage2_done_predicates_reject_partial_states(tmp_path, monkeypatch):
 
     assert not applier._is_stage2_patch_applied()
     assert not applier._is_stage2_patch_absent()
+
+
+def test_live_set_markers_accept_late_recompute_candidate():
+    text = "\n".join(
+        [
+            *applier._PATCHED_MARKERS.values(),
+            *["disable_tma=True"] * 10,
+            *live_set._PATCHED_MARKERS.values(),
+        ]
+    )
+
+    assert live_set._is_patched(text)
+    assert not live_set._has_partial_markers(text)
+
+
+def test_live_set_markers_reject_stale_shared_tile():
+    text = "\n".join(
+        [
+            *applier._PATCHED_MARKERS.values(),
+            *["disable_tma=True"] * 10,
+            *live_set._PATCHED_MARKERS.values(),
+            "dqk_from_diag_shared = T.alloc_shared([fused_chunk_size, fused_chunk_size], accum_dtype)",
+        ]
+    )
+
+    assert not live_set._is_patched(text)
