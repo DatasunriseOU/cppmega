@@ -833,3 +833,90 @@ def stage2_mono_state_lkq_d_chunk_owner_cuda_metadata(dout: torch.Tensor) -> dic
         return {}
     ext = _load_extension()
     return ext.stage2_mono_state_lkq_d_chunk_owner_metadata(dout)
+
+
+def stage2_mono_wmma_lkq_dphi_chunk_owner_cuda(
+    *,
+    dout: torch.Tensor,
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v: torch.Tensor,
+    q_bias: torch.Tensor,
+    k_bias: torch.Tensor,
+    mimo_v: torch.Tensor,
+    mimo_o: torch.Tensor,
+    dstates: torch.Tensor,
+    da_cs_rev: torch.Tensor,
+    segsum: torch.Tensor,
+    D: torch.Tensor,
+    chunk_size: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the Wave 2 WMMA state/LKQ/D chunk-owner prototype."""
+
+    if not dout.is_cuda:
+        raise RuntimeError("stage2 monolithic WMMA chunk CUDA path requires CUDA tensors")
+    ext = _load_extension()
+    return ext.stage2_mono_wmma_lkq_dphi_chunk_owner(
+        dout,
+        q_flat,
+        k_flat,
+        v,
+        q_bias,
+        k_bias,
+        mimo_v,
+        mimo_o,
+        dstates,
+        da_cs_rev,
+        segsum,
+        D,
+        chunk_size,
+    )
+
+
+def stage2_mono_wmma_lkq_dphi_chunk_owner_cuda_out(
+    *,
+    dout: torch.Tensor,
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v: torch.Tensor,
+    q_bias: torch.Tensor,
+    k_bias: torch.Tensor,
+    mimo_v: torch.Tensor,
+    mimo_o: torch.Tensor,
+    dstates: torch.Tensor,
+    da_cs_rev: torch.Tensor,
+    segsum: torch.Tensor,
+    D: torch.Tensor,
+    dv_delta: torch.Tensor,
+    dmimo_v_chunk_delta: torch.Tensor,
+    dssda_delta: torch.Tensor,
+    chunk_size: int = 16,
+) -> None:
+    if not dout.is_cuda:
+        raise RuntimeError("stage2 monolithic WMMA chunk CUDA path requires CUDA tensors")
+    ext = _load_extension()
+    ext.stage2_mono_wmma_lkq_dphi_chunk_owner_out(
+        dout,
+        q_flat,
+        k_flat,
+        v,
+        q_bias,
+        k_bias,
+        mimo_v,
+        mimo_o,
+        dstates,
+        da_cs_rev,
+        segsum,
+        D,
+        dv_delta,
+        dmimo_v_chunk_delta,
+        dssda_delta,
+        chunk_size,
+    )
+
+
+def stage2_mono_wmma_lkq_dphi_chunk_owner_cuda_metadata(dout: torch.Tensor) -> dict[str, Any]:
+    if not dout.is_cuda:
+        return {}
+    ext = _load_extension()
+    return ext.stage2_mono_wmma_lkq_dphi_chunk_owner_metadata(dout)
