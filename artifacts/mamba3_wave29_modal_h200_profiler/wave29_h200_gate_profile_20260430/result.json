@@ -1,0 +1,143 @@
+{
+  "applier_final_rollback": {
+    "action": "rollback",
+    "kernel": {
+      "alloc_shared_count": 40,
+      "bb_num_stages_0": true,
+      "bb_num_stages_1": false,
+      "bf_num_stages_1": false,
+      "copy_count": 136,
+      "disable_tma_count": 0,
+      "flat_q": false,
+      "flat_qk": false,
+      "path": "/usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py"
+    },
+    "returncode": 1,
+    "stderr": "/usr/local/lib/python3.13/dist-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.\n  import pynvml  # type: ignore[import]\nFAIL: No backup found at /usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py.cppmega_stage2_force_nontma.bak and reverse patch failed. Reinstall mamba_ssm to restore the upstream kernel file.\n",
+    "stdout": "[mamba3_stage2_force_nontma] local_rank=0 rank=? mutating file\nMamba3 bwd kernel path: /usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py\n"
+  },
+  "applier_noop": {
+    "action": "noop",
+    "kernel": {
+      "alloc_shared_count": 40,
+      "bb_num_stages_0": true,
+      "bb_num_stages_1": false,
+      "bf_num_stages_1": false,
+      "copy_count": 136,
+      "disable_tma_count": 0,
+      "flat_q": false,
+      "flat_qk": false,
+      "path": "/usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py"
+    },
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "  SKIP CPPMEGA_MAMBA3_STAGE2_FORCE_NONTMA is not set\n"
+  },
+  "applier_pre_rollback": {
+    "action": "rollback",
+    "kernel": {
+      "alloc_shared_count": 40,
+      "bb_num_stages_0": true,
+      "bb_num_stages_1": false,
+      "bf_num_stages_1": false,
+      "copy_count": 136,
+      "disable_tma_count": 0,
+      "flat_q": false,
+      "flat_qk": false,
+      "path": "/usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py"
+    },
+    "returncode": 1,
+    "stderr": "/usr/local/lib/python3.13/dist-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.\n  import pynvml  # type: ignore[import]\nFAIL: No backup found at /usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py.cppmega_stage2_force_nontma.bak and reverse patch failed. Reinstall mamba_ssm to restore the upstream kernel file.\n",
+    "stdout": "[mamba3_stage2_force_nontma] local_rank=0 rank=? mutating file\nMamba3 bwd kernel path: /usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py\n"
+  },
+  "blocker": {
+    "log": "/vol/benchmarks/mamba3_wave29_modal_h200_profiler/wave29_h200_gate_profile_20260430/baseline.log",
+    "returncode": 1,
+    "status": "crash",
+    "tail": "[rank0]:     return self._call_impl(*args, **kwargs)\n[rank0]:            ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n[rank0]:   File \"/usr/local/lib/python3.13/dist-packages/torch/nn/modules/module.py\", line 1789, in _call_impl\n[rank0]:     return forward_call(*args, **kwargs)\n[rank0]:   File \"/opt/megatron-lm/megatron/core/ssm/mamba_block.py\", line 329, in forward\n[rank0]:     hidden_states, _ = layer(\n[rank0]:                        ~~~~~^\n[rank0]:         hidden_states=hidden_states,\n[rank0]:         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]:     ...<5 lines>...\n[rank0]:         padding_mask=padding_mask,\n[rank0]:         ^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]:     )\n[rank0]:     ^\n[rank0]:   File \"/opt/megatron-lm/megatron/core/transformer/transformer_layer.py\", line 1341, in __call__\n[rank0]:     return super().__call__(*args, **kwargs)\n[rank0]:            ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n[rank0]:   File \"/opt/megatron-lm/megatron/core/transformer/module.py\", line 365, in __call__\n[rank0]:     return super().__call__(*args, **kwargs)\n[rank0]:            ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n[rank0]:   File \"/usr/local/lib/python3.13/dist-packages/torch/nn/modules/module.py\", line 1778, in _wrapped_call_impl\n[rank0]:     return self._call_impl(*args, **kwargs)\n[rank0]:            ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n[rank0]:   File \"/usr/local/lib/python3.13/dist-packages/torch/nn/modules/module.py\", line 1789, in _call_impl\n[rank0]:     return forward_call(*args, **kwargs)\n[rank0]:   File \"/opt/megatron-lm/megatron/core/transformer/transformer_layer.py\", line 712, in forward\n[rank0]:     hidden_states, context = self._forward_attention(*args, **kwargs)\n[rank0]:                              ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n[rank0]:   File \"/opt/megatron-lm/megatron/core/transformer/transformer_layer.py\", line 620, in _forward_attention\n[rank0]:     attention_output_with_bias = self.self_attention(\n[rank0]:         input_layernorm_output,\n[rank0]:     ...<8 lines>...\n[rank0]:         sequence_len_offset=sequence_len_offset,\n[rank0]:     )\n[rank0]:   File \"/usr/local/lib/python3.13/dist-packages/torch/nn/modules/module.py\", line 1778, in _wrapped_call_impl\n[rank0]:     return self._call_impl(*args, **kwargs)\n[rank0]:            ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n[rank0]:   File \"/usr/local/lib/python3.13/dist-packages/torch/nn/modules/module.py\", line 1789, in _call_impl\n[rank0]:     return forward_call(*args, **kwargs)\n[rank0]:   File \"/opt/cppmega/cppmega/megatron/mla_shared.py\", line 48, in forward\n[rank0]:     return super().forward(*args, rotary_pos_emb=None, **kwargs)\n[rank0]:            ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]:   File \"/opt/megatron-lm/megatron/core/transformer/multi_latent_attention.py\", line 314, in forward\n[rank0]:     core_attn_out = self.core_attention(\n[rank0]:         query,\n[rank0]:     ...<5 lines>...\n[rank0]:         **extra_kwargs,\n[rank0]:     )\n[rank0]:   File \"/usr/local/lib/python3.13/dist-packages/torch/nn/modules/module.py\", line 1778, in _wrapped_call_impl\n[rank0]:     return self._call_impl(*args, **kwargs)\n[rank0]:            ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n[rank0]:   File \"/usr/local/lib/python3.13/dist-packages/torch/nn/modules/module.py\", line 1789, in _call_impl\n[rank0]:     return forward_call(*args, **kwargs)\n[rank0]:   File \"/opt/megatron-lm/megatron/core/extensions/transformer_engine.py\", line 1627, in forward\n[rank0]:     core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)\n[rank0]:   File \"/usr/local/lib/python3.13/dist-packages/transformer_engine/pytorch/jit.py\", line 67, in wrapper\n[rank0]:     return disabled_f(*args, **kwargs)\n[rank0]:   File \"/usr/local/lib/python3.13/dist-packages/torch/_dynamo/external_utils.py\", line 226, in nonrecursive_disable_wrapper\n[rank0]:     return fn(*args, **kwargs)\n[rank0]:   File \"/usr/local/lib/python3.13/dist-packages/transformer_engine/pytorch/attention/dot_product_attention/dot_product_attention.py\", line 1497, in forward\n[rank0]:     raise ValueError(\n[rank0]:     ...<3 lines>...\n[rank0]:     )\n[rank0]: ValueError: No dot product attention backend is available for the provided inputs. Please run with NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2 to find out the reasons for disabling all backends.\n[production_peak_mem] rank=0 device=0 peak_alloc_gib=16.983 peak_reserved_gib=17.107\n[rank0]:[W430 13:50:53.657474903 ProcessGroupNCCL.cpp:1647] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())\nW0430 13:50:55.293000 334 torch/distributed/elastic/multiprocessing/api.py:1014] Sending process 362 closing signal SIGTERM\nE0430 13:50:55.566000 334 torch/distributed/elastic/multiprocessing/api.py:988] failed (exitcode: 1) local_rank: 0 (pid: 361) of binary: /usr/bin/python\nTraceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/local/lib/python3.13/dist-packages/torch/distributed/run.py\", line 1020, in <module>\n    main()\n    ~~~~^^\n  File \"/usr/local/lib/python3.13/dist-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py\", line 367, in wrapper\n    return f(*args, **kwargs)\n  File \"/usr/local/lib/python3.13/dist-packages/torch/distributed/run.py\", line 1016, in main\n    run(args)\n    ~~~^^^^^^\n  File \"/usr/local/lib/python3.13/dist-packages/torch/distributed/run.py\", line 1007, in run\n    elastic_launch(\n    ~~~~~~~~~~~~~~~\n        config=config,\n        ~~~~~~~~~~~~~~\n        entrypoint=cmd,\n        ~~~~~~~~~~~~~~~\n    )(*cmd_args)\n    ~^^^^^^^^^^^\n  File \"/usr/local/lib/python3.13/dist-packages/torch/distributed/launcher/api.py\", line 194, in __call__\n    return launch_agent(\n        self._config,\n    ...<2 lines>...\n        health_check_server=self._health_check_server,\n    )\n  File \"/usr/local/lib/python3.13/dist-packages/torch/distributed/launcher/api.py\", line 383, in launch_agent\n    raise ChildFailedError(\n    ...<2 lines>...\n    )\ntorch.distributed.elastic.multiprocessing.errors.ChildFailedError: \n============================================================\n/tmp/wave29_h200_gate_profile_20260430/pretrain_mamba.py FAILED\n------------------------------------------------------------\nFailures:\n[1]:\n  time      : 2026-04-30_13:50:55\n  host      : localhost\n  rank      : 1 (local_rank: 1)\n  exitcode  : -15 (pid: 362)  (SIGTERM)\n  error_file: <N/A>\n  traceback : Signal 15 (SIGTERM) received by PID 362\n------------------------------------------------------------\nRoot Cause (first observed failure):\n[0]:\n  time      : 2026-04-30_13:50:55\n  host      : localhost\n  rank      : 0 (local_rank: 0)\n  exitcode  : 1 (pid: 361) \n  error_file: <N/A>\n  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html\n============================================================",
+    "variant": "baseline"
+  },
+  "command_meta": {
+    "dsa_loss_coeff": 0.001,
+    "ep": 1,
+    "gbs": 8,
+    "gpu_spec": "H200:2",
+    "hybrid_layer_pattern": "*EME*EME*EMM*|EME*EME*EMM*E|ME*EME*EMM*EM|E*EME*EMM*EME/*-/*-",
+    "mbs": 1,
+    "mtp_depths": 2,
+    "nproc_per_node": 2,
+    "pp": 2,
+    "profile_mode": true,
+    "seq_len": 4096,
+    "tokens_per_iter": 32768,
+    "tp": 1,
+    "vpp": 2
+  },
+  "dataset": {
+    "data_path": "/vol/mock_data/clang_semantic_4k_v10_train_text_document",
+    "kind": "synthetic_full_shape_mock_data",
+    "note": "real dataset not present on Modal volume; generated indexed mock text and kept NAM56R full model/sequence boundary",
+    "tokenizer": "/vol/mock_tokenizer"
+  },
+  "final_kernel": {
+    "alloc_shared_count": 40,
+    "bb_num_stages_0": true,
+    "bb_num_stages_1": false,
+    "bf_num_stages_1": false,
+    "copy_count": 136,
+    "disable_tma_count": 0,
+    "flat_q": false,
+    "flat_qk": false,
+    "path": "/usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py"
+  },
+  "gpu_spec": "H200:2",
+  "image_ref": "ghcr.io/jewelmusicee/cppmega:785c3fd",
+  "preflight_kernel": {
+    "alloc_shared_count": 40,
+    "bb_num_stages_0": true,
+    "bb_num_stages_1": false,
+    "bf_num_stages_1": false,
+    "copy_count": 136,
+    "disable_tma_count": 0,
+    "flat_q": false,
+    "flat_qk": false,
+    "path": "/usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py"
+  },
+  "profile_mode": true,
+  "requested_train_iters": 20,
+  "run_id": "wave29_h200_gate_profile_20260430",
+  "variants": [
+    {
+      "kernel": {
+        "alloc_shared_count": 40,
+        "bb_num_stages_0": true,
+        "bb_num_stages_1": false,
+        "bf_num_stages_1": false,
+        "copy_count": 136,
+        "disable_tma_count": 0,
+        "flat_q": false,
+        "flat_qk": false,
+        "path": "/usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py"
+      },
+      "metrics": {
+        "avg_step_elapsed_ms": null,
+        "iterations_seen": 0,
+        "last_120_lines": "[rank0]:     return self._call_impl(*args, **kwargs)\n[rank0]:            ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n[rank0]:   File \"/usr/local/lib/python3.13/dist-packages/torch/nn/modules/module.py\", line 1789, in _call_impl\n[rank0]:     return forward_call(*args, **kwargs)\n[rank0]:   File \"/opt/megatron-lm/megatron/core/ssm/mamba_block.py\", line 329, in forward\n[rank0]:     hidden_states, _ = layer(\n[rank0]:                        ~~~~~^\n[rank0]:         hidden_states=hidden_states,\n[rank0]:         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]:     ...<5 lines>...\n[rank0]:         padding_mask=padding_mask,\n[rank0]:         ^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]:     )\n[rank0]:     ^\n[rank0]:   File \"/opt/megatron-lm/megatron/core/transformer/transformer_layer.py\", line 1341, in __call__\n[rank0]:     return super().__call__(*args, **kwargs)\n[rank0]:            ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n[rank0]:   File \"/opt/megatron-lm/megatron/core/transformer/module.py\", line 365, in __call__\n[rank0]:     return super().__call__(*args, **kwargs)\n[rank0]:            ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n[rank0]:   File \"/usr/local/lib/python3.13/dist-packages/torch/nn/modules/module.py\", line 1778, in _wrapped_call_impl\n[rank0]:     return self._call_impl(*args, **kwargs)\n[rank0]:            ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n[rank0]:   File \"/usr/local/lib/python3.13/dist-packages/torch/nn/modules/module.py\", line 1789, in _call_impl\n[rank0]:     return forward_call(*args, **kwargs)\n[rank0]:   File \"/opt/megatron-lm/megatron/core/transformer/transformer_layer.py\", line 712, in forward\n[rank0]:     hidden_states, context = self._forward_attention(*args, **kwargs)\n[rank0]:                              ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n[rank0]:   File \"/opt/megatron-lm/megatron/core/transformer/transformer_layer.py\", line 620, in _forward_attention\n[rank0]:     attention_output_with_bias = self.self_attention(\n[rank0]:         input_layernorm_output,\n[rank0]:     ...<8 lines>...\n[rank0]:         sequence_len_offset=sequence_len_offset,\n[rank0]:     )\n[rank0]:   File \"/usr/local/lib/python3.13/dist-packages/torch/nn/modules/module.py\", line 1778, in _wrapped_call_impl\n[rank0]:     return self._call_impl(*args, **kwargs)\n[rank0]:            ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n[rank0]:   File \"/usr/local/lib/python3.13/dist-packages/torch/nn/modules/module.py\", line 1789, in _call_impl\n[rank0]:     return forward_call(*args, **kwargs)\n[rank0]:   File \"/opt/cppmega/cppmega/megatron/mla_shared.py\", line 48, in forward\n[rank0]:     return super().forward(*args, rotary_pos_emb=None, **kwargs)\n[rank0]:            ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n[rank0]:   File \"/opt/megatron-lm/megatron/core/transformer/multi_latent_attention.py\", line 314, in forward\n[rank0]:     core_attn_out = self.core_attention(\n[rank0]:         query,\n[rank0]:     ...<5 lines>...\n[rank0]:         **extra_kwargs,\n[rank0]:     )\n[rank0]:   File \"/usr/local/lib/python3.13/dist-packages/torch/nn/modules/module.py\", line 1778, in _wrapped_call_impl\n[rank0]:     return self._call_impl(*args, **kwargs)\n[rank0]:            ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n[rank0]:   File \"/usr/local/lib/python3.13/dist-packages/torch/nn/modules/module.py\", line 1789, in _call_impl\n[rank0]:     return forward_call(*args, **kwargs)\n[rank0]:   File \"/opt/megatron-lm/megatron/core/extensions/transformer_engine.py\", line 1627, in forward\n[rank0]:     core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)\n[rank0]:   File \"/usr/local/lib/python3.13/dist-packages/transformer_engine/pytorch/jit.py\", line 67, in wrapper\n[rank0]:     return disabled_f(*args, **kwargs)\n[rank0]:   File \"/usr/local/lib/python3.13/dist-packages/torch/_dynamo/external_utils.py\", line 226, in nonrecursive_disable_wrapper\n[rank0]:     return fn(*args, **kwargs)\n[rank0]:   File \"/usr/local/lib/python3.13/dist-packages/transformer_engine/pytorch/attention/dot_product_attention/dot_product_attention.py\", line 1497, in forward\n[rank0]:     raise ValueError(\n[rank0]:     ...<3 lines>...\n[rank0]:     )\n[rank0]: ValueError: No dot product attention backend is available for the provided inputs. Please run with NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=2 to find out the reasons for disabling all backends.\n[production_peak_mem] rank=0 device=0 peak_alloc_gib=16.983 peak_reserved_gib=17.107\n[rank0]:[W430 13:50:53.657474903 ProcessGroupNCCL.cpp:1647] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())\nW0430 13:50:55.293000 334 torch/distributed/elastic/multiprocessing/api.py:1014] Sending process 362 closing signal SIGTERM\nE0430 13:50:55.566000 334 torch/distributed/elastic/multiprocessing/api.py:988] failed (exitcode: 1) local_rank: 0 (pid: 361) of binary: /usr/bin/python\nTraceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/usr/local/lib/python3.13/dist-packages/torch/distributed/run.py\", line 1020, in <module>\n    main()\n    ~~~~^^\n  File \"/usr/local/lib/python3.13/dist-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py\", line 367, in wrapper\n    return f(*args, **kwargs)\n  File \"/usr/local/lib/python3.13/dist-packages/torch/distributed/run.py\", line 1016, in main\n    run(args)\n    ~~~^^^^^^\n  File \"/usr/local/lib/python3.13/dist-packages/torch/distributed/run.py\", line 1007, in run\n    elastic_launch(\n    ~~~~~~~~~~~~~~~\n        config=config,\n        ~~~~~~~~~~~~~~\n        entrypoint=cmd,\n        ~~~~~~~~~~~~~~~\n    )(*cmd_args)\n    ~^^^^^^^^^^^\n  File \"/usr/local/lib/python3.13/dist-packages/torch/distributed/launcher/api.py\", line 194, in __call__\n    return launch_agent(\n        self._config,\n    ...<2 lines>...\n        health_check_server=self._health_check_server,\n    )\n  File \"/usr/local/lib/python3.13/dist-packages/torch/distributed/launcher/api.py\", line 383, in launch_agent\n    raise ChildFailedError(\n    ...<2 lines>...\n    )\ntorch.distributed.elastic.multiprocessing.errors.ChildFailedError: \n============================================================\n/tmp/wave29_h200_gate_profile_20260430/pretrain_mamba.py FAILED\n------------------------------------------------------------\nFailures:\n[1]:\n  time      : 2026-04-30_13:50:55\n  host      : localhost\n  rank      : 1 (local_rank: 1)\n  exitcode  : -15 (pid: 362)  (SIGTERM)\n  error_file: <N/A>\n  traceback : Signal 15 (SIGTERM) received by PID 362\n------------------------------------------------------------\nRoot Cause (first observed failure):\n[0]:\n  time      : 2026-04-30_13:50:55\n  host      : localhost\n  rank      : 0 (local_rank: 0)\n  exitcode  : 1 (pid: 361) \n  error_file: <N/A>\n  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html\n============================================================",
+        "last_step_elapsed_ms": null,
+        "peak_alloc_gib": 16.983,
+        "peak_reserved_gib": 17.107,
+        "step_elapsed_ms": [],
+        "tok_sec_from_last_step": null,
+        "tok_sec_reported_last": null
+      },
+      "run": {
+        "elapsed_s": 35.091,
+        "log": "/vol/benchmarks/mamba3_wave29_modal_h200_profiler/wave29_h200_gate_profile_20260430/baseline.log",
+        "returncode": 1,
+        "status": "crash",
+        "timed_out": false
+      },
+      "variant": "baseline"
+    }
+  ]
+}

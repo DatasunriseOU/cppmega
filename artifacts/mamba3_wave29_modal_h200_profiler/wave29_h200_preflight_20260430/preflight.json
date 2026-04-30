@@ -1,0 +1,94 @@
+{
+  "applier_apply": {
+    "action": "apply",
+    "kernel": {
+      "alloc_shared_count": 40,
+      "bb_num_stages_0": true,
+      "bb_num_stages_1": false,
+      "bf_num_stages_1": true,
+      "copy_count": 138,
+      "disable_tma_count": 13,
+      "flat_q": true,
+      "flat_qk": true,
+      "path": "/usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py"
+    },
+    "returncode": 0,
+    "stderr": "/usr/local/lib/python3.13/dist-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.\n  import pynvml  # type: ignore[import]\n",
+    "stdout": "[mamba3_stage2_force_nontma] local_rank=0 rank=? mutating file\nMamba3 bwd kernel path: /usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py\n  DONE backup written: /usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py.cppmega_stage2_force_nontma.bak\n  DONE stage2 force-nonTMA patch applied\n  Active default: bf_num_stages=1, bb_num_stages=0\n"
+  },
+  "applier_final_rollback": {
+    "action": "rollback",
+    "kernel": {
+      "alloc_shared_count": 40,
+      "bb_num_stages_0": true,
+      "bb_num_stages_1": false,
+      "bf_num_stages_1": false,
+      "copy_count": 136,
+      "disable_tma_count": 0,
+      "flat_q": false,
+      "flat_qk": false,
+      "path": "/usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py"
+    },
+    "returncode": 0,
+    "stderr": "/usr/local/lib/python3.13/dist-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.\n  import pynvml  # type: ignore[import]\n",
+    "stdout": "[mamba3_stage2_force_nontma] local_rank=0 rank=? mutating file\nMamba3 bwd kernel path: /usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py\n  DONE restored backup: /usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py.cppmega_stage2_force_nontma.bak\n"
+  },
+  "applier_noop": {
+    "action": "noop",
+    "kernel": {
+      "alloc_shared_count": 40,
+      "bb_num_stages_0": true,
+      "bb_num_stages_1": false,
+      "bf_num_stages_1": false,
+      "copy_count": 136,
+      "disable_tma_count": 0,
+      "flat_q": false,
+      "flat_qk": false,
+      "path": "/usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py"
+    },
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "  SKIP CPPMEGA_MAMBA3_STAGE2_FORCE_NONTMA is not set\n"
+  },
+  "applier_pre_rollback": {
+    "action": "rollback",
+    "kernel": {
+      "alloc_shared_count": 40,
+      "bb_num_stages_0": true,
+      "bb_num_stages_1": false,
+      "bf_num_stages_1": false,
+      "copy_count": 136,
+      "disable_tma_count": 0,
+      "flat_q": false,
+      "flat_qk": false,
+      "path": "/usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py"
+    },
+    "returncode": 1,
+    "stderr": "/usr/local/lib/python3.13/dist-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.\n  import pynvml  # type: ignore[import]\nFAIL: No backup found at /usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py.cppmega_stage2_force_nontma.bak and reverse patch failed. Reinstall mamba_ssm to restore the upstream kernel file.\n",
+    "stdout": "[mamba3_stage2_force_nontma] local_rank=0 rank=? mutating file\nMamba3 bwd kernel path: /usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py\n"
+  },
+  "device_count": 2,
+  "final_kernel": {
+    "alloc_shared_count": 40,
+    "bb_num_stages_0": true,
+    "bb_num_stages_1": false,
+    "bf_num_stages_1": false,
+    "copy_count": 136,
+    "disable_tma_count": 0,
+    "flat_q": false,
+    "flat_qk": false,
+    "path": "/usr/local/lib/python3.13/dist-packages/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py"
+  },
+  "gpu_names": [
+    "NVIDIA H200",
+    "NVIDIA H200"
+  ],
+  "gpu_spec": "H200:2",
+  "image_ref": "ghcr.io/jewelmusicee/cppmega:785c3fd",
+  "run_id": "wave29_h200_preflight_20260430",
+  "tilelang": "0.1.8+cu132.gitf309d814",
+  "tilelang_file": "/usr/local/lib/python3.13/dist-packages/tilelang/__init__.py",
+  "torch": "2.13.0.dev20260426+cu132",
+  "torch_cuda": "13.2",
+  "transformer_engine": "2.16.0.dev0+8e19460b"
+}
