@@ -45,8 +45,16 @@ GPU_SPEC = "H200:2"
 
 _CASES: dict[str, dict[str, Any]] = {
     "te_flash_full": {
-        "description": "Wave29 production-shape attention path with TE debug enabled.",
+        "description": "Negative control: forced flash path with TE debug enabled; expected to reject MLA.",
         "attention_backend": "flash",
+        "use_flash_attn": True,
+        "seq_len": 4096,
+        "cuda_graph": True,
+        "production_throughput": False,
+    },
+    "mla_auto_full": {
+        "description": "Stable full-shape MLA gate: TE attention_backend=auto at full NAM56R boundary.",
+        "attention_backend": "auto",
         "use_flash_attn": True,
         "seq_len": 4096,
         "cuda_graph": True,
@@ -563,7 +571,7 @@ def _build_train_cmd(
     dataset: dict[str, str],
     train_iters: int,
     profile: bool,
-    case_label: str = "te_flash_full",
+    case_label: str = "mla_auto_full",
 ) -> tuple[list[str], dict[str, Any]]:
     case = dict(_CASES[case_label])
     env = _base_env()
@@ -772,8 +780,15 @@ def _parse_log(log_path: pathlib.Path, tokens_per_iter: int) -> dict[str, Any]:
     te_rejection_lines = [
         line
         for line in te_debug_lines
-        if re.search(r"(disable|reject|unavailable|not available|not supported|reason|no .*backend)", line, re.I)
+        if re.search(r"(disabl|reject|unavailable|not available|not supported|reason|no .*backend)", line, re.I)
     ]
+    te_available_backends = None
+    te_selected_backend = None
+    for line in te_debug_lines:
+        if "Available backends =" in line:
+            te_available_backends = line.split("Available backends =", 1)[1].strip().rstrip(".")
+        if "Selected backend =" in line:
+            te_selected_backend = line.split("Selected backend =", 1)[1].strip().rstrip(".")
     mamba_backward_markers = [
         line
         for line in text.splitlines()
@@ -790,6 +805,9 @@ def _parse_log(log_path: pathlib.Path, tokens_per_iter: int) -> dict[str, Any]:
         "peak_reserved_gib": max(peak_reserved) if peak_reserved else None,
         "te_debug_lines": te_debug_lines[-120:],
         "te_rejection_lines": te_rejection_lines[-80:],
+        "te_available_backends_last": te_available_backends,
+        "te_selected_backend_last": te_selected_backend,
+        "te_flash_mla_rejected": any("FlashAttention" in line and "MLA" in line for line in te_rejection_lines),
         "mamba_backward_marker_lines": mamba_backward_markers[-80:],
         "reached_mamba_backward": bool(mamba_backward_markers) or bool(elapsed_ms) or bool(iterations),
         "last_120_lines": "\n".join(text.splitlines()[-120:]),
@@ -799,18 +817,20 @@ def _parse_log(log_path: pathlib.Path, tokens_per_iter: int) -> dict[str, Any]:
 def _write_summary(out_dir: pathlib.Path, result: dict[str, Any]) -> None:
     rows = result.get("variants", [])
     lines = [
-        "| case | variant | production throughput | status | steps seen | tok/sec | avg step ms | peak alloc GiB | peak reserved GiB | reached Mamba bwd | log |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+        "| case | variant | production throughput | requested attn | selected attn | status | steps seen | tok/sec | avg step ms | peak alloc GiB | peak reserved GiB | reached Mamba bwd | log |",
+        "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |",
     ]
     for row in rows:
         metrics = row.get("metrics", {})
         meta = row.get("command_meta", result.get("command_meta", {}))
         tok = metrics.get("tok_sec_reported_last") or metrics.get("tok_sec_from_last_step")
         lines.append(
-            "| {case} | {variant} | {prod} | {status} | {steps} | {tok} | {avg_ms} | {peak_alloc} | {peak_reserved} | {mamba_bwd} | {log} |".format(
+            "| {case} | {variant} | {prod} | {requested_attn} | {selected_attn} | {status} | {steps} | {tok} | {avg_ms} | {peak_alloc} | {peak_reserved} | {mamba_bwd} | {log} |".format(
                 case=meta.get("case_label", ""),
                 variant=row.get("variant"),
                 prod="yes" if meta.get("production_throughput") else "no",
+                requested_attn=meta.get("attention_backend", ""),
+                selected_attn=metrics.get("te_selected_backend_last") or "",
                 status=row.get("run", {}).get("status"),
                 steps=metrics.get("iterations_seen", 0),
                 tok="" if tok is None else f"{tok:.3f}",
@@ -894,7 +914,7 @@ def gate(
     run_id: str = "",
     train_iters: int = 20,
     profile: bool = False,
-    case_label: str = "te_flash_full",
+    case_label: str = "mla_auto_full",
     timeout_per_variant_s: int = 10800,
 ) -> dict[str, Any]:
     if train_iters < 20:
@@ -1086,7 +1106,7 @@ def main(
     train_iters: int = 20,
     profile: bool = False,
     preflight_only: bool = False,
-    case_label: str = "te_flash_full",
+    case_label: str = "mla_auto_full",
     timeout_per_variant_s: int = 10800,
 ) -> None:
     if preflight_only:
@@ -1107,7 +1127,7 @@ def launch_gate(
     run_id: str = "",
     train_iters: int = 20,
     profile: bool = False,
-    case_label: str = "te_flash_full",
+    case_label: str = "mla_auto_full",
     timeout_per_variant_s: int = 10800,
 ) -> None:
     result = gate.remote(run_id or f"gate_{_utc_stamp()}", train_iters, profile, case_label, timeout_per_variant_s)
