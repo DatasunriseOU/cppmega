@@ -625,6 +625,16 @@ CCE main+2 MTP launch fusion:
   conclusion: finite and numerically close, but slower on this short GB10 run;
               keep it opt-in until the CCE kernel path itself is improved.
 
+CCE MTP-only launch packing:
+  status: implemented as RuntimePatchProfile.cce_mtp_fusion_mode="mtp_only"
+  default: local_gb10_quarter selects mtp_only; legacy main_mtp remains opt-in
+  kernel-call delta: main+2 MTP CCE calls 3 -> 2
+                     (main CE remains separate; MTP depths pack into one call)
+  correctness tests: scalar/per-token MTPLossAutoScaler parity and process-level
+                     call-count coverage
+  real A/B: not run in Wave14A; GB10 profiling lock was occupied by other
+            agents' 6-step jobs
+
 TE saved-operand transpose deferral:
   base:    /home/dave/logs/ab_te_linear_saved_operands_base_20260428_1603.log
   patched: /home/dave/logs/ab_te_linear_saved_operands_patched_20260428_1608.log

@@ -22,6 +22,7 @@ from cppmega.recipes.nam56r_launch import (
 from cppmega.recipes.nam56r_megatron import build_nam56r_feature_plan
 
 MtpCEKernel = Literal["native", "cce", "liger", "off"]
+CceMtpFusionMode = Literal["off", "main_mtp", "mtp_only"]
 Fp8Format = Literal["hybrid", "e4m3"]
 Fp8Recipe = Literal["off", "tensorwise", "mxfp8"]
 Mxfp8BackwardBackend = Literal["te_tn_adapter", "flashinfer_cutlass", "cutlass_native"]
@@ -207,6 +208,10 @@ class RuntimePatchProfile:
     # measured launch profiles can opt in when one CCE call beats separate
     # main + MTP-depth calls.
     cce_fuse_main_mtp_ce: bool = False
+    # Exact CCE packing mode for MTP losses. ``main_mtp`` is the original
+    # one-call experiment; ``mtp_only`` keeps the main CE call separate and
+    # packs only MTP depths into one CCE call.
+    cce_mtp_fusion_mode: CceMtpFusionMode = "off"
     acknowledge_liger_mtp_ce_deprecated: bool = False
     # Local source overrides that must be part of the typed launch contract.
     # The GB10 FA4/TE fixes are source-tree patches, not installed PyPI wheels;
@@ -385,7 +390,8 @@ def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProf
     profile.optimizer.muon_num_ns_steps = 3
     profile.runtime = RuntimePatchProfile(
         mtp_ce_kernel="cce",
-        cce_fuse_main_mtp_ce=True,
+        cce_fuse_main_mtp_ce=False,
+        cce_mtp_fusion_mode="mtp_only",
         acknowledge_liger_mtp_ce_deprecated=False,
         noconv_mamba_chunk_size=256,
     )
@@ -552,6 +558,7 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         "CPPMEGA_STRUCTURE_ENABLED": _bool(profile.runtime.structure_enabled),
         "CPPMEGA_STRUCTURE_COMPONENTS": profile.runtime.structure_components,
         "CPPMEGA_MTP_CE_KERNEL": profile.runtime.mtp_ce_kernel,
+        "CPPMEGA_CCE_MTP_FUSION_MODE": profile.runtime.cce_mtp_fusion_mode,
         "CPPMEGA_CCE_FUSE_MAIN_MTP_CE": _bool(profile.runtime.cce_fuse_main_mtp_ce),
         "CPPMEGA_MEMORY_DEBUG": _bool(profile.profiling.memory_debug),
         "CPPMEGA_MEM_PROFILE": _bool(profile.profiling.mem_profile),
@@ -681,6 +688,15 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.runtime.acknowledge_liger_mtp_ce_deprecated = args.mtp_ce_kernel == "liger"
     if args.cce_fuse_main_mtp_ce is not None:
         profile.runtime.cce_fuse_main_mtp_ce = args.cce_fuse_main_mtp_ce
+        if args.cce_fuse_main_mtp_ce:
+            profile.runtime.cce_mtp_fusion_mode = "main_mtp"
+        elif profile.runtime.cce_mtp_fusion_mode == "main_mtp":
+            profile.runtime.cce_mtp_fusion_mode = "off"
+    if args.cce_mtp_fusion_mode is not None:
+        profile.runtime.cce_mtp_fusion_mode = args.cce_mtp_fusion_mode
+        profile.runtime.cce_fuse_main_mtp_ce = (
+            args.cce_mtp_fusion_mode == "main_mtp"
+        )
     if args.noconv_mamba_chunk_size is not None:
         profile.runtime.noconv_mamba_chunk_size = _validate_noconv_mamba_chunk_size(
             args.noconv_mamba_chunk_size
@@ -856,6 +872,11 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         default=None,
         dest="cce_fuse_main_mtp_ce",
+    )
+    parser.add_argument(
+        "--cce-mtp-fusion-mode",
+        choices=("off", "main_mtp", "mtp_only"),
+        default=None,
     )
     parser.add_argument(
         "--noconv-mamba-chunk-size",

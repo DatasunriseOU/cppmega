@@ -12,7 +12,9 @@ from cppmega.megatron import mtp_native_hopper_ce as mtp_ce_mod
 from cppmega.megatron.mtp_native_hopper_ce import (
     _install_process_mtp_loss_patch,
     _install_linear_ce_forward_cache_patch,
+    _cce_mtp_fusion_mode,
     attach_fused_main_mtp_cce_loss,
+    attach_fused_mtp_only_cce_loss,
     fused_main_mtp_cce_loss,
 )
 
@@ -84,6 +86,13 @@ def _main_loss_total(loss_tokens, loss_mask, calculate_per_token_loss):
     if calculate_per_token_loss:
         return total
     return total / loss_mask.sum().clamp(min=1)
+
+
+def test_cce_mtp_fusion_mode_typed_knob_overrides_legacy_bool(monkeypatch):
+    monkeypatch.setenv("CPPMEGA_CCE_FUSE_MAIN_MTP_CE", "1")
+    monkeypatch.setenv("CPPMEGA_CCE_MTP_FUSION_MODE", "mtp_only")
+
+    assert _cce_mtp_fusion_mode() == "mtp_only"
 
 
 def _separate_upstream_per_token_autoscaler_total(
@@ -252,6 +261,67 @@ def test_fused_main_mtp_cce_loss_matches_upstream_per_token_autoscaler(
     assert torch.allclose(fused_weight_grad, ref_layer.weight.grad, atol=1e-6, rtol=1e-6)
 
 
+@pytest.mark.parametrize("calculate_per_token_loss", [False, True])
+def test_fused_mtp_only_cce_loss_matches_upstream_autoscaler(
+    monkeypatch, calculate_per_token_loss
+):
+    monkeypatch.setenv("CPPMEGA_CCE_MTP_FUSION_MODE", "mtp_only")
+    torch.manual_seed(8765)
+
+    batch, seq, hidden, vocab, mtp_depth = 2, 6, 5, 19, 2
+    hidden_states = torch.randn((1 + mtp_depth) * seq, batch, hidden, requires_grad=True)
+    weight = torch.randn(vocab, hidden)
+    labels = torch.randint(0, vocab, (batch, seq))
+    loss_mask = torch.ones(batch, seq)
+    loss_mask[:, -2:] = 0
+
+    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
+
+    cfg = _config(mtp_depth, calculate_per_token_loss=calculate_per_token_loss)
+    MTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
+    fused_layer = _FakeCceOutputLayer(weight.detach().clone())
+    hidden_main = attach_fused_mtp_only_cce_loss(
+        hidden_states=hidden_states,
+        labels=labels,
+        loss_mask=loss_mask,
+        output_layer=fused_layer,
+        output_weight=fused_layer.weight,
+        runtime_gather_output=False,
+        is_training=False,
+        config=cfg,
+    )
+    assert hidden_main is not None
+    fused_main_loss = fused_layer(
+        hidden_main,
+        output_cross_entropy_loss=True,
+        labels=labels,
+        reduction="none",
+        ignore_index=-100,
+    )
+    fused_total = _main_loss_total(
+        fused_main_loss, loss_mask, calculate_per_token_loss
+    )
+    fused_total.backward()
+    fused_hidden_grad = hidden_states.grad.detach().clone()
+    fused_weight_grad = fused_layer.weight.grad.detach().clone()
+
+    hidden_ref = hidden_states.detach().clone().requires_grad_(True)
+    ref_layer = _FakeCceOutputLayer(weight.detach().clone())
+    MTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
+    ref_total = _separate_upstream_per_token_autoscaler_total(
+        hidden_states=hidden_ref,
+        labels=labels,
+        loss_mask=loss_mask,
+        output_layer=ref_layer,
+        cfg=cfg,
+    )
+    ref_total.backward()
+
+    assert torch.allclose(fused_total, ref_total, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(fused_hidden_grad, hidden_ref.grad, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(fused_weight_grad, ref_layer.weight.grad, atol=1e-6, rtol=1e-6)
+
+
 def test_attached_fused_loss_is_consumed_by_linear_ce_forward(monkeypatch):
     monkeypatch.setenv("CPPMEGA_CCE_FUSE_MAIN_MTP_CE", "1")
     torch.manual_seed(5678)
@@ -378,6 +448,87 @@ def test_process_mtp_loss_fused_cce_path_feeds_main_cache(monkeypatch):
 
         assert output_layer.calls == 1
         assert cached_main_loss.shape == labels.shape
+    finally:
+        for _name, (mod, fn) in original_process_refs.items():
+            setattr(mod, "process_mtp_loss", fn)
+
+
+def test_process_mtp_loss_mtp_only_path_packs_mtp_calls(monkeypatch):
+    monkeypatch.setenv("CPPMEGA_CCE_MTP_FUSION_MODE", "mtp_only")
+    torch.manual_seed(7890)
+
+    import sys
+
+    from megatron.core.transformer import multi_token_prediction as mtp_mod
+    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
+
+    rebind_targets = (
+        "megatron.core.transformer.multi_token_prediction",
+        "megatron.core.models.mamba.mamba_model",
+        "megatron.core.models.gpt.gpt_model",
+        "megatron.core.models.common.language_module.language_module",
+    )
+    original_process_refs = {}
+    for name in rebind_targets:
+        mod = sys.modules.get(name)
+        if mod is not None and hasattr(mod, "process_mtp_loss"):
+            original_process_refs[name] = (mod, getattr(mod, "process_mtp_loss"))
+
+    original = getattr(
+        mtp_mod.process_mtp_loss,
+        "_cppmega_original",
+        mtp_mod.process_mtp_loss,
+    )
+    mtp_mod.process_mtp_loss = original
+
+    class CountingCceOutputLayer(_FakeCceOutputLayer):
+        def __init__(self, weight: torch.Tensor):
+            super().__init__(weight)
+            self.calls = 0
+
+        def forward(self, *args, **kwargs):
+            self.calls += 1
+            return super().forward(*args, **kwargs)
+
+    def _fallback_ce(*_args, **_kwargs):
+        raise AssertionError("fallback CE path should not run")
+
+    try:
+        _install_process_mtp_loss_patch()
+
+        batch, seq, hidden, vocab, mtp_depth = 2, 5, 4, 17, 2
+        hidden_states = torch.randn(
+            (1 + mtp_depth) * seq,
+            batch,
+            hidden,
+            requires_grad=True,
+        )
+        labels = torch.randint(0, vocab, (batch, seq))
+        loss_mask = torch.ones(batch, seq)
+        output_layer = CountingCceOutputLayer(torch.randn(vocab, hidden))
+
+        MTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
+        hidden_main = mtp_mod.process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=labels,
+            loss_mask=loss_mask,
+            output_layer=output_layer,
+            output_weight=output_layer.weight,
+            runtime_gather_output=False,
+            is_training=False,
+            compute_language_model_loss=_fallback_ce,
+            config=_config(mtp_depth),
+        )
+
+        assert output_layer.calls == 1
+        _ = output_layer(
+            hidden_main,
+            output_cross_entropy_loss=True,
+            labels=labels,
+            reduction="none",
+            ignore_index=-100,
+        )
+        assert output_layer.calls == 2
     finally:
         for _name, (mod, fn) in original_process_refs.items():
             setattr(mod, "process_mtp_loss", fn)

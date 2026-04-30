@@ -88,7 +88,8 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert env["CPPMEGA_FLASH_ATTN_SOURCE_ROOT"] == "/home/dave/flash-attention-fa4"
     assert env["CPPMEGA_TRANSFORMER_ENGINE_SOURCE_ROOT"] == "/home/dave/TransformerEngine"
     assert env["CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE"] == "256"
-    assert env["CPPMEGA_CCE_FUSE_MAIN_MTP_CE"] == "1"
+    assert env["CPPMEGA_CCE_MTP_FUSION_MODE"] == "mtp_only"
+    assert env["CPPMEGA_CCE_FUSE_MAIN_MTP_CE"] == "0"
     assert env["CPPMEGA_DSA_FP8_ATTENTION"] == "0"
     assert "--moe-token-dispatcher-type alltoall" in env["NATIVE_ARGS"]
     assert env["CPPMEGA_OPTIMIZER"] == "muon"
@@ -179,6 +180,8 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
             "--noconv-mamba-chunk-size",
             "128",
             "--cce-fuse-main-mtp-ce",
+            "--cce-mtp-fusion-mode",
+            "mtp_only",
             "--mxfp8-flashinfer-runner",
             "direct_tactic",
             "--mxfp8-flashinfer-tactic",
@@ -207,7 +210,8 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
     assert "export CPPMEGA_NSYS_DELAY=15" in out
     assert "export CPPMEGA_NSYS_DURATION=5" in out
     assert "export CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE=128" in out
-    assert "export CPPMEGA_CCE_FUSE_MAIN_MTP_CE=1" in out
+    assert "export CPPMEGA_CCE_MTP_FUSION_MODE=mtp_only" in out
+    assert "export CPPMEGA_CCE_FUSE_MAIN_MTP_CE=0" in out
     assert "export CPPMEGA_FLASHINFER_MXFP8_RUNNER=direct_tactic" in out
     assert "export CPPMEGA_FLASHINFER_MXFP8_TACTIC=2" in out
     assert "--mtp-num-layers 1" in out
