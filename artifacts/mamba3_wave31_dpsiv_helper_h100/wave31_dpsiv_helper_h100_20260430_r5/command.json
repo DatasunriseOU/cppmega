@@ -1,0 +1,29 @@
+{
+  "argv": [
+    "python",
+    "/opt/cppmega/tools/probes/mamba3_wave31_dpsiv_d_boundary_probe.py",
+    "--tiles",
+    "512",
+    "--cs",
+    "128",
+    "--r",
+    "2",
+    "--p",
+    "128",
+    "--warmup",
+    "20",
+    "--iters",
+    "100",
+    "--json",
+    "/vol/benchmarks/mamba3_wave31_dpsiv_helper_h100/wave31_dpsiv_helper_h100_20260430_r5/probe.json",
+    "--verbose-build"
+  ],
+  "env": {
+    "MAX_JOBS": "1",
+    "PYTHONPATH": "/opt/cppmega:/opt/megatron-lm",
+    "TORCH_CUDA_ARCH_LIST": "9.0",
+    "TORCH_EXTENSIONS_DIR": "/cache/torch_extensions/mamba3_wave31_dpsiv_helper_h100/wave31_dpsiv_helper_h100_20260430_r5"
+  },
+  "ghcr_ref": "ghcr.io/jewelmusicee/cppmega:785c3fd",
+  "gpu": "H100"
+}
