@@ -99,3 +99,175 @@ def stage2_rr_diag_post_cuda_metadata(dout: torch.Tensor) -> dict[str, Any]:
         return {}
     ext = _load_extension()
     return ext.stage2_rr_diag_post_metadata(dout)
+
+
+def stage2_rr_diag_chunk_owner_cuda(
+    *,
+    dout: torch.Tensor,
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v: torch.Tensor,
+    q_bias: torch.Tensor,
+    k_bias: torch.Tensor,
+    mimo_v: torch.Tensor,
+    mimo_o: torch.Tensor,
+    qk_dot: torch.Tensor,
+    dt: torch.Tensor,
+    trap: torch.Tensor,
+    chunk_size: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the wave6 chunk-owner diagonal slice kernel.
+
+    Returns ``(dgamma_diag, dk_delta, dq_delta)`` using the same production
+    tensor layouts as the stage2 bwd_bwd benchmark.  Unlike the wave5 post
+    kernel, this writes diagonal DK/DQ contributions directly instead of
+    reloading and adding into an already-stored bwd_bwd output tensor.
+    """
+
+    if not dout.is_cuda:
+        raise RuntimeError("stage2 chunk-owner CUDA path requires CUDA tensors")
+    ext = _load_extension()
+    return ext.stage2_rr_diag_chunk_owner(
+        dout,
+        q_flat,
+        k_flat,
+        v,
+        q_bias,
+        k_bias,
+        mimo_v,
+        mimo_o,
+        qk_dot,
+        dt,
+        trap,
+        chunk_size,
+    )
+
+
+def stage2_rr_diag_chunk_owner_cuda_out(
+    *,
+    dout: torch.Tensor,
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v: torch.Tensor,
+    q_bias: torch.Tensor,
+    k_bias: torch.Tensor,
+    mimo_v: torch.Tensor,
+    mimo_o: torch.Tensor,
+    qk_dot: torch.Tensor,
+    dt: torch.Tensor,
+    trap: torch.Tensor,
+    dgamma_diag: torch.Tensor,
+    dk_delta: torch.Tensor,
+    dq_delta: torch.Tensor,
+    chunk_size: int = 16,
+) -> None:
+    if not dout.is_cuda:
+        raise RuntimeError("stage2 chunk-owner CUDA path requires CUDA tensors")
+    ext = _load_extension()
+    ext.stage2_rr_diag_chunk_owner_out(
+        dout,
+        q_flat,
+        k_flat,
+        v,
+        q_bias,
+        k_bias,
+        mimo_v,
+        mimo_o,
+        qk_dot,
+        dt,
+        trap,
+        dgamma_diag,
+        dk_delta,
+        dq_delta,
+        chunk_size,
+    )
+
+
+def stage2_rr_diag_chunk_owner_cuda_metadata(dout: torch.Tensor) -> dict[str, Any]:
+    if not dout.is_cuda:
+        return {}
+    ext = _load_extension()
+    return ext.stage2_rr_diag_chunk_owner_metadata(dout)
+
+
+def stage2_rr_diag_chunk_warp_owner_cuda(
+    *,
+    dout: torch.Tensor,
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v: torch.Tensor,
+    q_bias: torch.Tensor,
+    k_bias: torch.Tensor,
+    mimo_v: torch.Tensor,
+    mimo_o: torch.Tensor,
+    qk_dot: torch.Tensor,
+    dt: torch.Tensor,
+    trap: torch.Tensor,
+    chunk_size: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the wave6 one-warp-per-timestep chunk-owner variant."""
+
+    if not dout.is_cuda:
+        raise RuntimeError("stage2 chunk-warp CUDA path requires CUDA tensors")
+    ext = _load_extension()
+    return ext.stage2_rr_diag_chunk_warp_owner(
+        dout,
+        q_flat,
+        k_flat,
+        v,
+        q_bias,
+        k_bias,
+        mimo_v,
+        mimo_o,
+        qk_dot,
+        dt,
+        trap,
+        chunk_size,
+    )
+
+
+def stage2_rr_diag_chunk_warp_owner_cuda_out(
+    *,
+    dout: torch.Tensor,
+    q_flat: torch.Tensor,
+    k_flat: torch.Tensor,
+    v: torch.Tensor,
+    q_bias: torch.Tensor,
+    k_bias: torch.Tensor,
+    mimo_v: torch.Tensor,
+    mimo_o: torch.Tensor,
+    qk_dot: torch.Tensor,
+    dt: torch.Tensor,
+    trap: torch.Tensor,
+    dgamma_diag: torch.Tensor,
+    dk_delta: torch.Tensor,
+    dq_delta: torch.Tensor,
+    chunk_size: int = 16,
+) -> None:
+    if not dout.is_cuda:
+        raise RuntimeError("stage2 chunk-warp CUDA path requires CUDA tensors")
+    ext = _load_extension()
+    ext.stage2_rr_diag_chunk_warp_owner_out(
+        dout,
+        q_flat,
+        k_flat,
+        v,
+        q_bias,
+        k_bias,
+        mimo_v,
+        mimo_o,
+        qk_dot,
+        dt,
+        trap,
+        dgamma_diag,
+        dk_delta,
+        dq_delta,
+        chunk_size,
+    )
+
+
+def stage2_rr_diag_chunk_warp_owner_cuda_metadata(dout: torch.Tensor) -> dict[str, Any]:
+    if not dout.is_cuda:
+        return {}
+    ext = _load_extension()
+    return ext.stage2_rr_diag_chunk_warp_owner_metadata(dout)
