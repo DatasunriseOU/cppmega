@@ -911,6 +911,11 @@ def production_candidate_gate(
         rejection_reasons.append("micro_gemm_only_receipt")
     if integrated_timing_gate["local_component_speedup_only"]:
         rejection_reasons.append("non_integrated_timing_receipt")
+    if (
+        integrated_timing_gate["status"] != "pass"
+        and "non_integrated_timing_receipt" not in rejection_reasons
+    ):
+        rejection_reasons.append("non_integrated_timing_receipt")
     if missing_slots:
         rejection_reasons.append("missing_required_output_slots")
     if correctness.get("full_boundary_pass") is not True:

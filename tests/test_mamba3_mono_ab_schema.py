@@ -170,7 +170,10 @@ def test_micro_gemm_only_correct_candidate_gets_zero_production_credit() -> None
     assert gate["production_credit"] is False
     assert gate["production_credit_ms"] == 0.0
     assert gate["credited_output_slots"] == []
-    assert gate["rejection_reasons"] == ["micro_gemm_only_receipt"]
+    assert gate["rejection_reasons"] == [
+        "micro_gemm_only_receipt",
+        "non_integrated_timing_receipt",
+    ]
 
 
 def test_local_component_speedup_gets_zero_credit_without_integrated_timing() -> None:
@@ -267,6 +270,52 @@ def test_low_live_set_cuda_timing_regression_gets_zero_production_credit() -> No
     assert gate["rejection_reasons"] == ["performance_budget_not_met"]
 
 
+def test_reported_component_timing_gets_zero_credit_without_integrated_marker() -> None:
+    records = candidate_component_records_from_json(
+        {
+            "candidate_component_records": [
+                {
+                    "candidate_id": "full_slots_but_component_timing_only",
+                    "implementation_class": "cuda_component_subset",
+                    "receipt_scope": "bwd_bwd_component",
+                    "shape": "productionish",
+                    "projected_bwd_bwd_ms": 1.0,
+                    "covered_slots": list(BWD_BWD_OUTPUT_NAMES),
+                    "correctness": {"full_boundary_pass": True, "max_abs": 0.0},
+                    "hardware_tags": ["H200"],
+                    "metadata": {
+                        "timing_scope": "component_subset_productionish",
+                        "registers_per_thread": 64,
+                        "dynamic_smem_bytes": 32768,
+                        "active_blocks_per_sm": 4,
+                        "theoretical_occupancy": 0.5,
+                        "total_ctas": 264,
+                        "h200_sm_count": 132,
+                    },
+                    "modal_hygiene": {
+                        "status": "pass",
+                        "active_same_campaign_count": 0,
+                    },
+                    "reference": {"stage2_bwd_bwd_ms": 3.70674},
+                }
+            ]
+        }
+    )
+
+    projection = component_record_projection(records[0])
+    gate = projection["production_gate"]
+
+    assert gate["integrated_timing"]["status"] == "reported"
+    assert gate["integrated_timing"]["integrated_full_slot_timing"] is False
+    assert gate["performance_budget"]["status"] == "pass"
+    assert gate["missing_output_slots"] == []
+    assert gate["full_boundary_correctness"] is True
+    assert gate["production_credit"] is False
+    assert gate["production_credit_ms"] == 0.0
+    assert gate["credited_output_slots"] == []
+    assert gate["rejection_reasons"] == ["non_integrated_timing_receipt"]
+
+
 def test_cute_one_chunk_fusion_is_promising_but_zero_production_credit() -> None:
     records = candidate_component_records_from_json(
         {
@@ -353,6 +402,7 @@ def test_incomplete_slot_coverage_rejects_boundary_candidate() -> None:
                     "correctness": {"full_boundary_pass": True, "max_abs": 0.0},
                     "hardware_tags": ["H200"],
                     "metadata": {
+                        "timing_scope": "integrated_full_bwd_bwd",
                         "regs_per_thread": 64,
                         "static_smem_bytes": 16384,
                         "active_blocks_per_sm": 4,
@@ -662,6 +712,88 @@ def test_wave3_wave4_receipt_file_gates_current_research_numbers() -> None:
         "removed_global_outputs_for_fused_path"
     ] == ["LKQ", "state", "apply", "dpsi"]
 
+    tile_stream = component_record_projection(
+        by_id["wave8_cuda_tile_stream_wmma_subset"]
+    )
+    tile_stream_gate = tile_stream["production_gate"]
+    assert tile_stream["projected_bwd_bwd_ms"] == pytest.approx(11.180607795715332)
+    assert tile_stream["covered_slots"] == ["dv", "dmimo_v", "dssda"]
+    assert tile_stream_gate["production_credit"] is False
+    assert tile_stream_gate["production_credit_ms"] == 0.0
+    assert "non_integrated_timing_receipt" in tile_stream_gate["rejection_reasons"]
+    assert "missing_required_output_slots" in tile_stream_gate["rejection_reasons"]
+    assert "full_boundary_correctness_not_reported" in tile_stream_gate["rejection_reasons"]
+    assert "performance_budget_not_met" in tile_stream_gate["rejection_reasons"]
+    assert tile_stream_gate["resource_metadata"]["status"] == "pass"
+    assert tile_stream_gate["cta_count_occupancy"]["status"] == "pass"
+    assert by_id["wave8_cuda_tile_stream_wmma_subset"]["metadata"][
+        "registers_per_thread"
+    ] == 72
+    assert by_id["wave8_cuda_tile_stream_wmma_subset"]["metadata"][
+        "dynamic_smem_bytes"
+    ] == 50692
+    assert by_id["wave8_cuda_tile_stream_wmma_subset"]["metadata"][
+        "active_blocks_per_sm"
+    ] == 3
+    assert by_id["wave8_cuda_tile_stream_wmma_subset"]["metadata"][
+        "ratio_vs_tilelang_stage2_bwd_bwd"
+    ] == pytest.approx(3.0162913491950696)
+
+    cute_multichunk = component_record_projection(
+        by_id["wave8_cute_multichunk_state_apply_consumers"]
+    )
+    cute_multichunk_gate = cute_multichunk["production_gate"]
+    assert cute_multichunk["projected_bwd_bwd_ms"] == pytest.approx(0.078264)
+    assert cute_multichunk["covered_slots"] == []
+    assert cute_multichunk_gate["production_credit"] is False
+    assert "non_integrated_timing_receipt" in cute_multichunk_gate["rejection_reasons"]
+    assert "missing_required_output_slots" in cute_multichunk_gate["rejection_reasons"]
+    assert by_id["wave8_cute_multichunk_state_apply_consumers"]["correctness"][
+        "chunks_passed"
+    ] == [2, 4, 8]
+    assert by_id["wave8_cute_multichunk_state_apply_consumers"]["metadata"][
+        "timings_us"
+    ]["chunks_2_scan"] == pytest.approx(76.171)
+    assert by_id["wave8_cute_multichunk_state_apply_consumers"]["metadata"][
+        "timings_us"
+    ]["chunks_4_scan"] == pytest.approx(78.264)
+    assert by_id["wave8_cute_multichunk_state_apply_consumers"]["metadata"][
+        "timings_us"
+    ]["chunks_8_scan"] == pytest.approx(77.262)
+    assert by_id["wave8_cute_multichunk_state_apply_consumers"]["metadata"][
+        "removed_global_outputs_for_fused_path"
+    ] == ["LKQ", "state", "apply", "dpsi"]
+
+    copy_path = component_record_projection(by_id["wave8_wgmma_copy_path_12tile_uint4"])
+    copy_path_gate = copy_path["production_gate"]
+    assert copy_path["projection_status"] == "missing_timing"
+    assert copy_path["covered_slots"] == []
+    assert copy_path_gate["production_credit"] is False
+    assert copy_path_gate["production_credit_ms"] == 0.0
+    assert "non_integrated_timing_receipt" in copy_path_gate["rejection_reasons"]
+    assert "missing_required_output_slots" in copy_path_gate["rejection_reasons"]
+    assert by_id["wave8_wgmma_copy_path_12tile_uint4"]["correctness"][
+        "copy_evidence_pass"
+    ] is True
+    assert by_id["wave8_wgmma_copy_path_12tile_uint4"]["metadata"][
+        "logical_tile_count"
+    ] == 12
+    assert by_id["wave8_wgmma_copy_path_12tile_uint4"]["metadata"][
+        "vector_type"
+    ] == "uint4"
+    assert by_id["wave8_wgmma_copy_path_12tile_uint4"]["metadata"][
+        "registers_per_thread"
+    ] == 40
+    assert by_id["wave8_wgmma_copy_path_12tile_uint4"]["metadata"][
+        "spill_stores_bytes"
+    ] == 0
+    assert by_id["wave8_wgmma_copy_path_12tile_uint4"]["metadata"][
+        "spill_loads_bytes"
+    ] == 0
+    assert by_id["wave8_wgmma_copy_path_12tile_uint4"]["metadata"][
+        "dynamic_smem_bytes"
+    ] == 98304
+
     productionish_records = filter_candidate_component_records_for_shape(
         records,
         "productionish",
@@ -672,6 +804,7 @@ def test_wave3_wave4_receipt_file_gates_current_research_numbers() -> None:
         "wave4_rr_diag_cuda_timestep_cta",
         "wave5_cuda_scan_owner_dv_dmimov_dssda",
         "wave7_cuda_row_stream_low_live_set",
+        "wave8_cuda_tile_stream_wmma_subset",
     }
 
 
