@@ -1,4 +1,4 @@
-"""Modal H200 runner for the wave8 chunk-owner CUDA bwd_bwd prototype."""
+"""Modal H200 runner for the wave9 CUDA bwd_bwd ownership prototype."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ GHCR_REPO = os.environ.get("GHCR_REPO", "ghcr.io/jewelmusicee/cppmega")
 GHCR_TAG = os.environ.get("GHCR_TAG", "785c3fd")
 GHCR_REF = f"{GHCR_REPO}:{GHCR_TAG}"
 GPU_SPEC = os.environ.get("CPPMEGA_MODAL_GPU", "H200")
-APP_NAME = "cppmega-mamba3-rr-diag-wave8-chunk-owner-cuda"
+APP_NAME = "cppmega-mamba3-rr-diag-wave9-output-owner-cuda"
 CPPMEGA_ROOT = "/opt/cppmega"
 
 
