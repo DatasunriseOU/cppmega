@@ -27,6 +27,7 @@ Fp8Recipe = Literal["off", "tensorwise", "mxfp8"]
 Mxfp8BackwardBackend = Literal["te_tn_adapter", "flashinfer_cutlass", "cutlass_native"]
 Mxfp8TransposeEmitBackend = Literal["auto", "te", "off"]
 Mxfp8CutlassScaleBackend = Literal["compact", "prepack", "swizzled"]
+Mxfp8DeferredEmitSchedule = Literal["inline", "side_stream"]
 Mxfp8FlashinferRunner = Literal["mm_mxfp8", "direct_tactic"]
 ParamStorage = Literal["auto", "bf16", "mxfp8"]
 SparseMlaMode = Literal["tilelang", "gather_scatter", "pytorch"]
@@ -122,6 +123,10 @@ class PrecisionProfile:
     mxfp8_transpose_emit_backend: Mxfp8TransposeEmitBackend = "te"
     mxfp8_transpose_emit_swizzled: bool = True
     mxfp8_transpose_emit_strict: bool = True
+    # Controls where TE Linear's saved MXFP8 rowwise-transpose emits run.
+    # inline is the known-good path. side_stream schedules TE's existing
+    # kernels on a CUDA side stream and waits at TN-adapter consumption.
+    mxfp8_deferred_emit_schedule: Mxfp8DeferredEmitSchedule = "inline"
     # ``compact`` uses the manual compact-scale CUTLASS mainloop. ``swizzled``
     # keeps compact primary tensors for TE transpose emit, then routes
     # GEMM-ready rowwise-transpose operands through the stock SM120
@@ -613,6 +618,9 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                 "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT": _bool(
                     profile.precision.mxfp8_transpose_emit_strict
                 ),
+                "CPPMEGA_TE_MXFP8_DEFERRED_EMIT_SCHEDULE": (
+                    profile.precision.mxfp8_deferred_emit_schedule
+                ),
                 "CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND": (
                     profile.precision.mxfp8_cutlass_scale_backend
                 ),
@@ -716,6 +724,8 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.precision.mxfp8_transpose_emit_swizzled = args.mxfp8_transpose_emit_swizzled
     if args.mxfp8_transpose_emit_strict is not None:
         profile.precision.mxfp8_transpose_emit_strict = args.mxfp8_transpose_emit_strict
+    if args.mxfp8_deferred_emit_schedule is not None:
+        profile.precision.mxfp8_deferred_emit_schedule = args.mxfp8_deferred_emit_schedule
     if args.mxfp8_compact_columnwise_backward is not None:
         profile.precision.mxfp8_compact_columnwise_backward = (
             args.mxfp8_compact_columnwise_backward
@@ -889,6 +899,15 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         "--mxfp8-transpose-emit-backend",
         choices=("auto", "te", "off"),
         default=None,
+    )
+    parser.add_argument(
+        "--mxfp8-deferred-emit-schedule",
+        choices=("inline", "side_stream"),
+        default=None,
+        help=(
+            "Schedule TE Linear saved MXFP8 rowwise-transpose emits inline "
+            "or on a CUDA side stream with event waits before TN GEMMs."
+        ),
     )
     fp8_param_gather = parser.add_mutually_exclusive_group()
     fp8_param_gather.add_argument(

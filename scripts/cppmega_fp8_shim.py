@@ -301,6 +301,14 @@ _te_mxfp8_transpose_emit_swizzled = os.environ.get(
     "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED",
     _te_mxfp8_transpose_emit_swizzled_default,
 ) == "1"
+_te_mxfp8_deferred_emit_schedule = os.environ.get(
+    "CPPMEGA_TE_MXFP8_DEFERRED_EMIT_SCHEDULE", "inline"
+).lower()
+if _te_mxfp8_deferred_emit_schedule not in ("inline", "side_stream"):
+    raise RuntimeError(
+        "Unsupported CPPMEGA_TE_MXFP8_DEFERRED_EMIT_SCHEDULE="
+        f"{_te_mxfp8_deferred_emit_schedule!r}; expected inline or side_stream"
+    )
 _te_mxfp8_compact_columnwise_backward = (
     False
     if _cutlass_mxfp8_stock_swizzled
@@ -368,6 +376,9 @@ if (
         from transformer_engine.common.recipe import MXFP8BlockScaling as _TE_MXFP8Recipe
         from transformer_engine.pytorch.tensor import MXFP8Quantizer as _TE_MXFP8Quantizer
         from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor as _TE_MXFP8Tensor
+        from transformer_engine.pytorch.tensor.storage.mxfp8_tensor_storage import (
+            MXFP8TensorStorage as _TE_MXFP8TensorStorage,
+        )
         from transformer_engine.pytorch.module import linear as _TE_LINEAR_MODULE
 
         try:
@@ -399,6 +410,11 @@ if (
             "mxfp8_tn_adapter_copy_transpose": 0,
             "mxfp8_tn_adapter_missing_sidecar_copy": 0,
             "mxfp8_tn_adapter_te_emit_failed": 0,
+            "mxfp8_async_transpose_scheduled": 0,
+            "mxfp8_async_transpose_bf16_emit": 0,
+            "mxfp8_async_transpose_uint8_copy": 0,
+            "mxfp8_async_transpose_waits": 0,
+            "mxfp8_async_transpose_inline_fallback": 0,
             "mxfp8_norm_quantize_sidecar_bridge": 0,
             "mxfp8_tn_sidecar_attr_attached": 0,
             "mxfp8_tn_sidecar_attr_cleared": 0,
@@ -452,6 +468,12 @@ if (
                 )
                 _snapshot["mxfp8_tn_sidecar_tracked_attr_peak_bytes"] = (
                     _cppmega_mxfp8_tn_sidecar_attr_peak_bytes[0]
+                )
+            except NameError:
+                pass
+            try:
+                _snapshot["mxfp8_async_transpose_stream_count"] = len(
+                    _cppmega_mxfp8_async_transpose_streams
                 )
             except NameError:
                 pass
@@ -524,6 +546,294 @@ if (
         _cppmega_mxfp8_tn_sidecar_registry_peak_bytes = [0]
         _cppmega_mxfp8_tn_sidecar_attr_bytes = [0]
         _cppmega_mxfp8_tn_sidecar_attr_peak_bytes = [0]
+        _cppmega_mxfp8_async_transpose_enabled = (
+            _te_mxfp8_deferred_emit_schedule == "side_stream"
+            and _te_mxfp8_bwd_tn_adapter
+            and _te_mxfp8_transpose_emit_backend in ("auto", "te")
+            and _te_linear_deferred_saved_operand
+        )
+        _cppmega_mxfp8_async_transpose_event_attr = (
+            "_cppmega_mxfp8_transpose_ready_event"
+        )
+        _cppmega_mxfp8_async_transpose_stream_attr = (
+            "_cppmega_mxfp8_transpose_ready_stream"
+        )
+        _cppmega_mxfp8_async_transpose_streams = {}
+
+        def _cppmega_mxfp8_stream_device_key(_device):
+            _device = _torch.device(_device)
+            if _device.type != "cuda":
+                return None
+            if _device.index is not None:
+                return int(_device.index)
+            return int(_torch.cuda.current_device())
+
+        def _cppmega_mxfp8_async_stream(_device):
+            _key = _cppmega_mxfp8_stream_device_key(_device)
+            if _key is None:
+                return None
+            _stream = _cppmega_mxfp8_async_transpose_streams.get(_key)
+            if _stream is None:
+                _stream = _torch.cuda.Stream(device=_key)
+                _cppmega_mxfp8_async_transpose_streams[_key] = _stream
+            return _stream
+
+        def _cppmega_record_stream_if_possible(_tensor, _stream):
+            if not isinstance(_tensor, _torch.Tensor) or _stream is None:
+                return
+            try:
+                _tensor.record_stream(_stream)
+            except Exception:
+                pass
+
+        def _cppmega_mark_mxfp8_transpose_ready_event(_storage, _event, _stream):
+            setattr(_storage, _cppmega_mxfp8_async_transpose_event_attr, _event)
+            setattr(_storage, _cppmega_mxfp8_async_transpose_stream_attr, _stream)
+            return _storage
+
+        def _cppmega_wait_mxfp8_transpose_ready(_x):
+            _event = getattr(_x, _cppmega_mxfp8_async_transpose_event_attr, None)
+            if _event is None:
+                return _x
+            _data = getattr(_x, "_rowwise_data", None)
+            if isinstance(_data, _torch.Tensor) and _data.is_cuda:
+                _torch.cuda.current_stream(_data.device).wait_event(_event)
+            else:
+                try:
+                    _event.synchronize()
+                except Exception:
+                    pass
+            for _attr in (
+                _cppmega_mxfp8_async_transpose_event_attr,
+                _cppmega_mxfp8_async_transpose_stream_attr,
+            ):
+                if not hasattr(_x, _attr):
+                    continue
+                try:
+                    delattr(_x, _attr)
+                except Exception:
+                    try:
+                        setattr(_x, _attr, None)
+                    except Exception:
+                        pass
+            _cppmega_record_bwd_stat("mxfp8_async_transpose_waits")
+            return _x
+
+        def _cppmega_mxfp8_storage_from_tensor(_tensor):
+            _storage = _TE_MXFP8TensorStorage(
+                rowwise_data=getattr(_tensor, "_rowwise_data", None),
+                rowwise_scale_inv=getattr(_tensor, "_rowwise_scale_inv", None),
+                columnwise_data=getattr(_tensor, "_columnwise_data", None),
+                columnwise_scale_inv=getattr(_tensor, "_columnwise_scale_inv", None),
+                fp8_dtype=getattr(_tensor, "_fp8_dtype", None),
+                quantizer=getattr(_tensor, "_quantizer", None),
+                with_gemm_swizzled_scales=bool(
+                    getattr(_tensor, "_with_gemm_swizzled_scales", False)
+                ),
+                fake_dtype=getattr(_tensor, "_dtype", getattr(_tensor, "dtype", _torch.bfloat16)),
+            )
+            for _attr in (
+                "_te_rowwise_transpose_for_backward_operand",
+                "_cppmega_mxfp8_rowwise_transpose_operand",
+                _cppmega_mxfp8_async_transpose_event_attr,
+                _cppmega_mxfp8_async_transpose_stream_attr,
+            ):
+                if hasattr(_tensor, _attr):
+                    try:
+                        setattr(_storage, _attr, getattr(_tensor, _attr))
+                    except Exception:
+                        pass
+            return _storage
+
+        def _cppmega_install_async_deferred_emit_helpers(_module):
+            if not _cppmega_mxfp8_async_transpose_enabled:
+                return False
+            _patched = False
+            _orig_make = getattr(_module, "_make_rowwise_transpose_for_backward", None)
+            if _orig_make is not None and not getattr(
+                _orig_make, "_cppmega_async_deferred_emit", False
+            ):
+
+                @_functools.wraps(_orig_make)
+                def _make_rowwise_transpose_for_backward_async(source, tensor, quantizer):
+                    if not (
+                        isinstance(source, _torch.Tensor)
+                        and isinstance(tensor, _TE_MXFP8TensorStorage)
+                        and isinstance(quantizer, _TE_MXFP8Quantizer)
+                        and source.is_cuda
+                        and getattr(
+                            quantizer,
+                            "_te_rowwise_transpose_for_backward_enabled",
+                            False,
+                        )
+                    ):
+                        return _orig_make(source, tensor, quantizer)
+                    _strict = bool(
+                        getattr(
+                            quantizer,
+                            "_te_rowwise_transpose_for_backward_strict",
+                            False,
+                        )
+                    )
+                    try:
+                        if getattr(tensor, "_with_gemm_swizzled_scales", False):
+                            raise ValueError(
+                                "source MXFP8 tensor already has GEMM-swizzled scales"
+                            )
+                        _columnwise_scale_inv = getattr(tensor, "_columnwise_scale_inv", None)
+                        if not isinstance(_columnwise_scale_inv, _torch.Tensor):
+                            raise ValueError(
+                                "source MXFP8 tensor is missing compact columnwise scales"
+                            )
+                        if not hasattr(quantizer, "quantize_rowwise_transpose"):
+                            raise AttributeError(
+                                "MXFP8Quantizer.quantize_rowwise_transpose is unavailable"
+                            )
+                        _stream = _cppmega_mxfp8_async_stream(source.device)
+                        if _stream is None:
+                            return _orig_make(source, tensor, quantizer)
+                        _current_stream = _torch.cuda.current_stream(source.device)
+                        _stream.wait_stream(_current_stream)
+                        _fake_dtype = getattr(
+                            tensor,
+                            "_dtype",
+                            getattr(tensor, "dtype", source.dtype),
+                        )
+                        _transpose_kwargs = {"fake_dtype": _fake_dtype}
+                        if getattr(
+                            quantizer,
+                            "_te_rowwise_transpose_for_backward_with_gemm_swizzled_scales",
+                            False,
+                        ):
+                            _transpose_kwargs["with_gemm_swizzled_scales"] = True
+                        with _torch.cuda.stream(_stream):
+                            with _torch.no_grad():
+                                _transpose = quantizer.quantize_rowwise_transpose(
+                                    source,
+                                    _columnwise_scale_inv,
+                                    **_transpose_kwargs,
+                                )
+                            _event = _torch.cuda.Event(enable_timing=False)
+                            _event.record(_stream)
+                        _cppmega_record_stream_if_possible(source, _stream)
+                        _cppmega_record_stream_if_possible(_columnwise_scale_inv, _stream)
+                        _cppmega_mark_rowwise_transpose_operand(_transpose)
+                        _storage = _cppmega_mxfp8_storage_from_tensor(_transpose)
+                        _cppmega_mark_mxfp8_transpose_ready_event(
+                            _storage,
+                            _event,
+                            _stream,
+                        )
+                        _cppmega_record_bwd_stat("mxfp8_async_transpose_scheduled")
+                        _cppmega_record_bwd_stat("mxfp8_async_transpose_bf16_emit")
+                        return _storage
+                    except Exception as _async_exc:
+                        _cppmega_record_bwd_stat(
+                            "mxfp8_async_transpose_inline_fallback",
+                            f"bf16_emit:{type(_async_exc).__name__}: {_async_exc}",
+                        )
+                        if _strict:
+                            raise RuntimeError(
+                                "Failed to schedule MXFP8 rowwise-transposed Linear "
+                                "backward operand"
+                            ) from _async_exc
+                        return _orig_make(source, tensor, quantizer)
+
+                _make_rowwise_transpose_for_backward_async._cppmega_async_deferred_emit = (
+                    True
+                )
+                setattr(
+                    _module,
+                    "_make_rowwise_transpose_for_backward",
+                    _make_rowwise_transpose_for_backward_async,
+                )
+                _patched = True
+
+            _orig_copy = getattr(
+                _module, "_copy_columnwise_as_rowwise_transpose_for_backward", None
+            )
+            if _orig_copy is not None and not getattr(
+                _orig_copy, "_cppmega_async_deferred_emit", False
+            ):
+
+                @_functools.wraps(_orig_copy)
+                def _copy_columnwise_as_rowwise_transpose_for_backward_async(tensor):
+                    if not isinstance(tensor, _TE_MXFP8TensorStorage):
+                        return _orig_copy(tensor)
+                    try:
+                        if getattr(tensor, "_with_gemm_swizzled_scales", False):
+                            return _orig_copy(tensor)
+                        _columnwise_data = getattr(tensor, "_columnwise_data", None)
+                        _columnwise_scale_inv = getattr(tensor, "_columnwise_scale_inv", None)
+                        if not (
+                            isinstance(_columnwise_data, _torch.Tensor)
+                            and isinstance(_columnwise_scale_inv, _torch.Tensor)
+                            and _columnwise_data.is_cuda
+                            and _columnwise_scale_inv.is_cuda
+                            and _columnwise_data.dim() >= 2
+                            and _columnwise_scale_inv.dim() == 2
+                        ):
+                            return _orig_copy(tensor)
+                        _stream = _cppmega_mxfp8_async_stream(_columnwise_data.device)
+                        if _stream is None:
+                            return _orig_copy(tensor)
+                        _current_stream = _torch.cuda.current_stream(_columnwise_data.device)
+                        _stream.wait_stream(_current_stream)
+                        with _torch.cuda.stream(_stream):
+                            _columnwise_2d = _columnwise_data.reshape(
+                                -1,
+                                _columnwise_data.shape[-1],
+                            )
+                            if not _columnwise_2d.is_contiguous():
+                                _columnwise_2d = _columnwise_2d.contiguous()
+                            _rowwise_data = _columnwise_2d.t().contiguous()
+                            _scale = _columnwise_scale_inv
+                            if not _scale.is_contiguous():
+                                _scale = _scale.contiguous()
+                            _rowwise_scale_inv = _scale.t().contiguous()
+                            _event = _torch.cuda.Event(enable_timing=False)
+                            _event.record(_stream)
+                        _cppmega_record_stream_if_possible(_columnwise_data, _stream)
+                        _cppmega_record_stream_if_possible(_columnwise_scale_inv, _stream)
+                        _storage = _TE_MXFP8TensorStorage(
+                            rowwise_data=_rowwise_data,
+                            rowwise_scale_inv=_rowwise_scale_inv,
+                            columnwise_data=None,
+                            columnwise_scale_inv=None,
+                            fp8_dtype=tensor._fp8_dtype,
+                            quantizer=tensor._quantizer,
+                            with_gemm_swizzled_scales=False,
+                            fake_dtype=tensor._dtype,
+                        )
+                        _cppmega_mark_rowwise_transpose_operand(_storage)
+                        _cppmega_mark_mxfp8_transpose_ready_event(
+                            _storage,
+                            _event,
+                            _stream,
+                        )
+                        _cppmega_record_bwd_stat("mxfp8_async_transpose_scheduled")
+                        _cppmega_record_bwd_stat("mxfp8_async_transpose_uint8_copy")
+                        return _storage
+                    except Exception as _async_exc:
+                        _cppmega_record_bwd_stat(
+                            "mxfp8_async_transpose_inline_fallback",
+                            f"uint8_copy:{type(_async_exc).__name__}: {_async_exc}",
+                        )
+                        if _te_mxfp8_transpose_emit_strict:
+                            raise
+                        return _orig_copy(tensor)
+
+                _copy_columnwise_as_rowwise_transpose_for_backward_async._cppmega_async_deferred_emit = (
+                    True
+                )
+                setattr(
+                    _module,
+                    "_copy_columnwise_as_rowwise_transpose_for_backward",
+                    _copy_columnwise_as_rowwise_transpose_for_backward_async,
+                )
+                _patched = True
+
+            return _patched
 
         def _cppmega_is_mxfp8_tensor(_x):
             return "MXFP8" in type(_x).__name__
@@ -1088,13 +1398,13 @@ if (
                 or getattr(_x, "_cppmega_mxfp8_rowwise_transpose_operand", False)
             ):
                 _cppmega_record_bwd_stat("mxfp8_tn_adapter_saved_transpose_operand")
-                return _x
+                return _cppmega_wait_mxfp8_transpose_ready(_x)
             _sidecar = None if _ignore_saved else _cppmega_get_mxfp8_sidecar(_x)
             if _sidecar is not None:
                 _cppmega_mark_rowwise_transpose_operand(_sidecar)
             if _sidecar is not None:
                 _cppmega_record_bwd_stat("mxfp8_tn_adapter_te_emit")
-                return _sidecar
+                return _cppmega_wait_mxfp8_transpose_ready(_sidecar)
             _strict_missing_sidecar = (
                 _te_mxfp8_transpose_emit_backend == "te"
                 and _te_mxfp8_transpose_emit_strict
@@ -2273,6 +2583,7 @@ if (
         _patched_quantize_weight_modules = []
         _patched_gather_modules = []
         _patched_norm_modules = []
+        _patched_async_deferred_emit_modules = []
         for _module_name in (
             "transformer_engine.pytorch.module.linear",
             "transformer_engine.pytorch.module.layernorm_linear",
@@ -2295,6 +2606,10 @@ if (
                     _patched_gather_modules.append(_module_name.rsplit(".", 1)[-1])
                 if _cppmega_wrap_apply_normalization(_mod):
                     _patched_norm_modules.append(_module_name.rsplit(".", 1)[-1])
+                if _cppmega_install_async_deferred_emit_helpers(_mod):
+                    _patched_async_deferred_emit_modules.append(
+                        _module_name.rsplit(".", 1)[-1]
+                    )
                 for _class_name in ("Linear", "LayerNormLinear", "LayerNormMLP", "GroupedLinear"):
                     _class = getattr(_mod, _class_name, None)
                     if _class is not None and _cppmega_wrap_get_quantizers(_class):
@@ -2318,6 +2633,8 @@ if (
             f"mxfp8_bwd_tn_adapter={_te_mxfp8_bwd_tn_adapter}, "
             f"mxfp8_transpose_emit_backend={_te_mxfp8_transpose_emit_backend}, "
             f"mxfp8_transpose_emit_swizzled={_te_mxfp8_transpose_emit_swizzled}, "
+            f"mxfp8_deferred_emit_schedule={_te_mxfp8_deferred_emit_schedule}, "
+            f"mxfp8_async_deferred_emit={_cppmega_mxfp8_async_transpose_enabled}, "
             f"cutlass_mxfp8_scale_backend={_cutlass_mxfp8_scale_backend}, "
             f"mxfp8_compact_columnwise_backward={_te_mxfp8_compact_columnwise_backward}, "
             f"mxfp8_grouped_direct_backward={_te_mxfp8_grouped_direct_backward}, "
@@ -2328,7 +2645,8 @@ if (
             f"weight_quantizer_modules={_patched_weight_quantizer_modules}, "
             f"quantize_weight_modules={_patched_quantize_weight_modules}, "
             f"gather_modules={_patched_gather_modules}, "
-            f"norm_modules={_patched_norm_modules})"
+            f"norm_modules={_patched_norm_modules}, "
+            f"async_deferred_emit_modules={_patched_async_deferred_emit_modules})"
         )
     except Exception as _exc:  # pragma: no cover
         import sys

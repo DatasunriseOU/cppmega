@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import importlib
+import sys
+
 import pytest
 import torch
 
@@ -35,6 +38,44 @@ def test_clear_mxfp8_sidecar_refs_removes_all_producer_references(monkeypatch):
     assert not hasattr(tensor, "_cppmega_mxfp8_rowwise_transpose_persistent")
 
     assert not _cppmega_clear_mxfp8_sidecar_refs(tensor)
+
+
+def test_async_transpose_ready_wait_synchronizes_and_clears_marker(monkeypatch):
+    for key in (
+        "CPPMEGA_TE_MXFP8_DGRAD_BF16",
+        "CPPMEGA_TE_MXFP8_WGRAD_BF16",
+        "CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK",
+    ):
+        monkeypatch.setenv(key, "0")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER", "1")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_DEFERRED_EMIT_SCHEDULE", "side_stream")
+    monkeypatch.setenv("NVTE_BACKWARD_OVERRIDE", "none")
+    monkeypatch.delitem(sys.modules, "scripts.cppmega_fp8_shim", raising=False)
+    try:
+        shim = importlib.import_module("scripts.cppmega_fp8_shim")
+    except Exception as exc:
+        pytest.skip(f"cppmega_fp8_shim MXFP8 path unavailable: {exc}")
+    if not hasattr(shim, "_cppmega_wait_mxfp8_transpose_ready"):
+        pytest.skip("MXFP8 async wait helper was not installed")
+
+    class _Event:
+        def __init__(self):
+            self.synchronized = False
+
+        def synchronize(self):
+            self.synchronized = True
+
+    event = _Event()
+    tensor = _Dummy()
+    tensor._rowwise_data = torch.empty((2, 2), dtype=torch.uint8)
+    setattr(tensor, "_cppmega_mxfp8_transpose_ready_event", event)
+    setattr(tensor, "_cppmega_mxfp8_transpose_ready_stream", object())
+
+    assert shim._cppmega_wait_mxfp8_transpose_ready(tensor) is tensor
+    assert event.synchronized
+    assert not hasattr(tensor, "_cppmega_mxfp8_transpose_ready_event")
+    assert not hasattr(tensor, "_cppmega_mxfp8_transpose_ready_stream")
+    assert shim.cppmega_te_mxfp8_bwd_stats["mxfp8_async_transpose_waits"] >= 1
 
 
 def test_te_linear_consumed_sidecar_removes_producer_references(monkeypatch):
