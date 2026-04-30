@@ -684,6 +684,7 @@ echo "[local-quarter] optimizer=${CPPMEGA_OPTIMIZER} param_storage=${CPPMEGA_PAR
 echo "[local-quarter] no_master_emerging=${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER} no_master_fallback=${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER} grad_reduce_bf16=${CPPMEGA_GRAD_REDUCE_IN_BF16}"
 echo "[local-quarter] dist_optimizer=${CPPMEGA_USE_DISTRIBUTED_OPTIMIZER} precision_aware=${CPPMEGA_USE_PRECISION_AWARE_OPTIMIZER}"
 echo "[local-quarter] fp8_param_gather=${CPPMEGA_FP8_PARAM_GATHER:-0} reuse_grad_buf_for_mxfp8_param_ag=${CPPMEGA_REUSE_GRAD_BUF_FOR_MXFP8_PARAM_AG:-1}"
+echo "[local-quarter] mxfp8_storage_islands=${CPPMEGA_MXFP8_STORAGE_ISLANDS:-off} embedding=${CPPMEGA_MXFP8_STORAGE_ISLAND_EMBEDDING:-1} output_layer=${CPPMEGA_MXFP8_STORAGE_ISLAND_OUTPUT_LAYER:-1} ngram_table=${CPPMEGA_MXFP8_STORAGE_ISLAND_NGRAM_TABLE:-1} pad_columns=${CPPMEGA_MXFP8_STORAGE_ISLAND_PAD_COLUMNS:-1} columnwise=${CPPMEGA_MXFP8_STORAGE_ISLAND_COLUMNWISE:-0}"
 echo "[local-quarter] local_ddp_no_contig_grad_buffer=${CPPMEGA_LOCAL_DDP_DISABLE_CONTIGUOUS_GRAD_BUFFER}"
 echo "[local-quarter] torch_profile=${CPPMEGA_TORCH_PROFILE} profile_dir=${CPPMEGA_TORCH_PROFILE_DIR}"
 echo "[local-quarter] nsys_profile=${CPPMEGA_NSYS_PROFILE} nsys_output=${CPPMEGA_NSYS_OUTPUT}"

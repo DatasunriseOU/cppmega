@@ -54,3 +54,26 @@ def test_ngram_hash_embedding_backward_reaches_unified_table():
 
     assert module.unified_table.weight.grad is not None
     assert torch.isfinite(module.unified_table.weight.grad).all().item()
+
+
+def test_ngram_hash_embedding_accepts_padded_table_feature_dim():
+    module = CppMegaNgramHashEmbedding(
+        hidden_size=16,
+        orders=(2,),
+        num_heads=2,
+        table_size=257,
+        embed_dim=16,
+    )
+    padded_weight = torch.nn.Parameter(
+        torch.zeros(module.unified_table.num_embeddings, 32)
+    )
+    with torch.no_grad():
+        padded_weight[:, :16].copy_(module.unified_table.weight)
+        module.out_proj.weight.fill_(1.0)
+    module.unified_table.weight = padded_weight
+    module.unified_table.embedding_dim = 32
+    token_ids = torch.tensor([[1, 5, 7, 9]], dtype=torch.long)
+
+    out = module(token_ids)
+
+    assert out.shape == (1, 4, 16)

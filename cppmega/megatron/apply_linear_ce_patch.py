@@ -167,10 +167,11 @@ def _patch_linear_ce_route_to_liger() -> None:
     cc = torch.cuda.get_device_capability(dev)
 
     kernel_pref = os.environ.get("CPPMEGA_LINEAR_CE_KERNEL", "auto").lower()
+    storage_islands = os.environ.get("CPPMEGA_MXFP8_STORAGE_ISLANDS", "off").lower() != "off"
 
     # "auto": use native path when the dispatcher accepts this cc.
     # Explicit "liger" / "cce" force the fallback regardless of cc.
-    if kernel_pref == "auto" and _native_dispatcher_supports(cc):
+    if kernel_pref == "auto" and not storage_islands and _native_dispatcher_supports(cc):
         path = (
             "hopper (PR #3345)" if cc[0] == 9
             else "blackwell" if cc[0] == 10
@@ -272,6 +273,9 @@ def _install_cce_compute(LinearCrossEntropyModule, cc) -> None:
         s, b, hdim = hidden.shape
         labels_sb = labels.transpose(0, 1).contiguous().reshape(-1)
         hidden_2d = hidden.contiguous().reshape(s * b, hdim)
+        from cppmega.megatron.mxfp8_storage_islands import maybe_dequantize_te_tensor
+
+        weight = maybe_dequantize_te_tensor(weight)
         weight = weight.contiguous()
 
         # CCE's backward only accepts bf16/fp16 hidden states.
@@ -390,6 +394,9 @@ def _install_liger_nonfused_compute(
         s, b, hdim = hidden.shape
         labels_sb = labels.transpose(0, 1).contiguous().reshape(-1)  # [s*b]
         hidden_2d = hidden.contiguous().reshape(s * b, hdim)         # [s*b, h]
+        from cppmega.megatron.mxfp8_storage_islands import maybe_dequantize_te_tensor
+
+        weight = maybe_dequantize_te_tensor(weight)
 
         # Materialize logits via standard ColumnParallelLinear-style matmul.
         # NOTE: weight.shape == [V, h], so logits = hidden_2d @ weight.T.
@@ -480,6 +487,9 @@ def _install_liger_compute(
         s, b, hdim = hidden.shape
         labels_sb = labels.transpose(0, 1).contiguous().reshape(-1)
         hidden_2d = hidden.contiguous().reshape(s * b, hdim)
+        from cppmega.megatron.mxfp8_storage_islands import maybe_dequantize_te_tensor
+
+        weight = maybe_dequantize_te_tensor(weight)
         weight = weight.contiguous()
 
         liger_loss_scalar, _, _ = LigerFusedLinearCrossEntropyFunction.apply(

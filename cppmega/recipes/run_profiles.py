@@ -28,6 +28,7 @@ Mxfp8BackwardBackend = Literal["te_tn_adapter", "flashinfer_cutlass", "cutlass_n
 Mxfp8TransposeEmitBackend = Literal["auto", "te", "off"]
 Mxfp8CutlassScaleBackend = Literal["compact", "prepack", "swizzled"]
 Mxfp8FlashinferRunner = Literal["mm_mxfp8", "direct_tactic"]
+Mxfp8StorageIslandMode = Literal["off", "frozen_mxfp8"]
 ParamStorage = Literal["auto", "bf16", "mxfp8"]
 SparseMlaMode = Literal["tilelang", "gather_scatter", "pytorch"]
 MoeDispatcher = Literal["flex", "alltoall", "allgather"]
@@ -147,6 +148,20 @@ class PrecisionProfile:
     # accidentally enable an incompatible distributed-param contract.
     fp8_param_gather: bool = False
     reuse_grad_buf_for_mxfp8_param_ag: bool = True
+    # Explicit profiling lane for non-TE storage islands.  ``frozen_mxfp8``
+    # quantizes embedding/output/ngram-table parameters to MXFP8 and freezes
+    # them so we can measure the no-persistent-BF16 memory floor.  This is not
+    # a default training path; it exists to quantify the remaining gap.
+    mxfp8_storage_islands: Mxfp8StorageIslandMode = "off"
+    mxfp8_storage_island_embedding: bool = True
+    mxfp8_storage_island_output_layer: bool = True
+    mxfp8_storage_island_ngram_table: bool = True
+    mxfp8_storage_island_ngram_out_proj: bool = False
+    mxfp8_storage_island_structure_table: bool = False
+    mxfp8_storage_island_structure_up_proj: bool = False
+    mxfp8_storage_island_pad_rows: bool = True
+    mxfp8_storage_island_pad_columns: bool = True
+    mxfp8_storage_island_columnwise: bool = False
     mxfp8_bwd_allow_bf16_fallback: bool = False
     mxfp8_dgrad_bf16: bool = False
     mxfp8_wgrad_bf16: bool = False
@@ -475,6 +490,14 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
             "mxfp8_cutlass_scale_backend='swizzled' is incompatible with "
             "mxfp8_compact_columnwise_backward"
         )
+    if (
+        profile.precision.mxfp8_storage_islands != "off"
+        and profile.precision.fp8_recipe != "mxfp8"
+    ):
+        raise ValueError(
+            "mxfp8_storage_islands requires fp8_recipe=mxfp8; "
+            "it is a TE MXFP8 profiling lane"
+        )
 
     env: dict[str, str] = {
         "CPPMEGA_RUN_PROFILE": profile.name,
@@ -632,6 +655,36 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                 "CPPMEGA_REUSE_GRAD_BUF_FOR_MXFP8_PARAM_AG": _bool(
                     profile.precision.reuse_grad_buf_for_mxfp8_param_ag
                 ),
+                "CPPMEGA_MXFP8_STORAGE_ISLANDS": (
+                    profile.precision.mxfp8_storage_islands
+                ),
+                "CPPMEGA_MXFP8_STORAGE_ISLAND_EMBEDDING": _bool(
+                    profile.precision.mxfp8_storage_island_embedding
+                ),
+                "CPPMEGA_MXFP8_STORAGE_ISLAND_OUTPUT_LAYER": _bool(
+                    profile.precision.mxfp8_storage_island_output_layer
+                ),
+                "CPPMEGA_MXFP8_STORAGE_ISLAND_NGRAM_TABLE": _bool(
+                    profile.precision.mxfp8_storage_island_ngram_table
+                ),
+                "CPPMEGA_MXFP8_STORAGE_ISLAND_NGRAM_OUT_PROJ": _bool(
+                    profile.precision.mxfp8_storage_island_ngram_out_proj
+                ),
+                "CPPMEGA_MXFP8_STORAGE_ISLAND_STRUCTURE_TABLE": _bool(
+                    profile.precision.mxfp8_storage_island_structure_table
+                ),
+                "CPPMEGA_MXFP8_STORAGE_ISLAND_STRUCTURE_UP_PROJ": _bool(
+                    profile.precision.mxfp8_storage_island_structure_up_proj
+                ),
+                "CPPMEGA_MXFP8_STORAGE_ISLAND_PAD_ROWS": _bool(
+                    profile.precision.mxfp8_storage_island_pad_rows
+                ),
+                "CPPMEGA_MXFP8_STORAGE_ISLAND_PAD_COLUMNS": _bool(
+                    profile.precision.mxfp8_storage_island_pad_columns
+                ),
+                "CPPMEGA_MXFP8_STORAGE_ISLAND_COLUMNWISE": _bool(
+                    profile.precision.mxfp8_storage_island_columnwise
+                ),
                 "CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK": _bool(
                     profile.precision.mxfp8_bwd_allow_bf16_fallback
                 ),
@@ -744,6 +797,44 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.precision.reuse_grad_buf_for_mxfp8_param_ag = (
             args.reuse_grad_buf_for_mxfp8_param_ag
         )
+    if args.mxfp8_storage_islands is not None:
+        profile.precision.mxfp8_storage_islands = args.mxfp8_storage_islands
+    if args.mxfp8_storage_island_embedding is not None:
+        profile.precision.mxfp8_storage_island_embedding = (
+            args.mxfp8_storage_island_embedding
+        )
+    if args.mxfp8_storage_island_output_layer is not None:
+        profile.precision.mxfp8_storage_island_output_layer = (
+            args.mxfp8_storage_island_output_layer
+        )
+    if args.mxfp8_storage_island_ngram_table is not None:
+        profile.precision.mxfp8_storage_island_ngram_table = (
+            args.mxfp8_storage_island_ngram_table
+        )
+    if args.mxfp8_storage_island_ngram_out_proj is not None:
+        profile.precision.mxfp8_storage_island_ngram_out_proj = (
+            args.mxfp8_storage_island_ngram_out_proj
+        )
+    if args.mxfp8_storage_island_structure_table is not None:
+        profile.precision.mxfp8_storage_island_structure_table = (
+            args.mxfp8_storage_island_structure_table
+        )
+    if args.mxfp8_storage_island_structure_up_proj is not None:
+        profile.precision.mxfp8_storage_island_structure_up_proj = (
+            args.mxfp8_storage_island_structure_up_proj
+        )
+    if args.mxfp8_storage_island_pad_rows is not None:
+        profile.precision.mxfp8_storage_island_pad_rows = (
+            args.mxfp8_storage_island_pad_rows
+        )
+    if args.mxfp8_storage_island_pad_columns is not None:
+        profile.precision.mxfp8_storage_island_pad_columns = (
+            args.mxfp8_storage_island_pad_columns
+        )
+    if args.mxfp8_storage_island_columnwise is not None:
+        profile.precision.mxfp8_storage_island_columnwise = (
+            args.mxfp8_storage_island_columnwise
+        )
     if args.optimizer is not None:
         profile.optimizer.optimizer = args.optimizer
     if args.param_storage is not None:
@@ -806,6 +897,11 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
             "fp8_recipe=mxfp8 requires fp8_format=e4m3 because the "
             "FlashInfer/CUTLASS MXFP8 path accepts E4M3 payloads only"
         )
+    if (
+        profile.precision.mxfp8_storage_islands != "off"
+        and profile.precision.fp8_recipe != "mxfp8"
+    ):
+        raise ValueError("--mxfp8-storage-islands requires --fp8-recipe mxfp8")
     return profile
 
 
@@ -915,6 +1011,141 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         default=None,
         dest="reuse_grad_buf_for_mxfp8_param_ag",
+    )
+    parser.add_argument(
+        "--mxfp8-storage-islands",
+        choices=("off", "frozen_mxfp8"),
+        default=None,
+        help=(
+            "Profiling lane for non-TE BF16 islands. frozen_mxfp8 stores "
+            "selected embedding/output/ngram parameters as frozen MXFP8."
+        ),
+    )
+    storage_island_embedding = parser.add_mutually_exclusive_group()
+    storage_island_embedding.add_argument(
+        "--mxfp8-storage-island-embedding",
+        action="store_true",
+        default=None,
+        dest="mxfp8_storage_island_embedding",
+    )
+    storage_island_embedding.add_argument(
+        "--no-mxfp8-storage-island-embedding",
+        action="store_false",
+        default=None,
+        dest="mxfp8_storage_island_embedding",
+    )
+    storage_island_output = parser.add_mutually_exclusive_group()
+    storage_island_output.add_argument(
+        "--mxfp8-storage-island-output-layer",
+        action="store_true",
+        default=None,
+        dest="mxfp8_storage_island_output_layer",
+    )
+    storage_island_output.add_argument(
+        "--no-mxfp8-storage-island-output-layer",
+        action="store_false",
+        default=None,
+        dest="mxfp8_storage_island_output_layer",
+    )
+    storage_island_ngram_table = parser.add_mutually_exclusive_group()
+    storage_island_ngram_table.add_argument(
+        "--mxfp8-storage-island-ngram-table",
+        action="store_true",
+        default=None,
+        dest="mxfp8_storage_island_ngram_table",
+    )
+    storage_island_ngram_table.add_argument(
+        "--no-mxfp8-storage-island-ngram-table",
+        action="store_false",
+        default=None,
+        dest="mxfp8_storage_island_ngram_table",
+    )
+    storage_island_ngram_out_proj = parser.add_mutually_exclusive_group()
+    storage_island_ngram_out_proj.add_argument(
+        "--mxfp8-storage-island-ngram-out-proj",
+        action="store_true",
+        default=None,
+        dest="mxfp8_storage_island_ngram_out_proj",
+    )
+    storage_island_ngram_out_proj.add_argument(
+        "--no-mxfp8-storage-island-ngram-out-proj",
+        action="store_false",
+        default=None,
+        dest="mxfp8_storage_island_ngram_out_proj",
+    )
+    storage_island_structure_table = parser.add_mutually_exclusive_group()
+    storage_island_structure_table.add_argument(
+        "--mxfp8-storage-island-structure-table",
+        action="store_true",
+        default=None,
+        dest="mxfp8_storage_island_structure_table",
+    )
+    storage_island_structure_table.add_argument(
+        "--no-mxfp8-storage-island-structure-table",
+        action="store_false",
+        default=None,
+        dest="mxfp8_storage_island_structure_table",
+    )
+    storage_island_structure_up_proj = parser.add_mutually_exclusive_group()
+    storage_island_structure_up_proj.add_argument(
+        "--mxfp8-storage-island-structure-up-proj",
+        action="store_true",
+        default=None,
+        dest="mxfp8_storage_island_structure_up_proj",
+    )
+    storage_island_structure_up_proj.add_argument(
+        "--no-mxfp8-storage-island-structure-up-proj",
+        action="store_false",
+        default=None,
+        dest="mxfp8_storage_island_structure_up_proj",
+    )
+    storage_island_pad_rows = parser.add_mutually_exclusive_group()
+    storage_island_pad_rows.add_argument(
+        "--mxfp8-storage-island-pad-rows",
+        action="store_true",
+        default=None,
+        dest="mxfp8_storage_island_pad_rows",
+    )
+    storage_island_pad_rows.add_argument(
+        "--no-mxfp8-storage-island-pad-rows",
+        action="store_false",
+        default=None,
+        dest="mxfp8_storage_island_pad_rows",
+    )
+    storage_island_pad_columns = parser.add_mutually_exclusive_group()
+    storage_island_pad_columns.add_argument(
+        "--mxfp8-storage-island-pad-columns",
+        action="store_true",
+        default=None,
+        dest="mxfp8_storage_island_pad_columns",
+        help=(
+            "Pad embedding-table feature dimensions up to MXFP8's 32-wide "
+            "block requirement, then slice back in the owning feature module."
+        ),
+    )
+    storage_island_pad_columns.add_argument(
+        "--no-mxfp8-storage-island-pad-columns",
+        action="store_false",
+        default=None,
+        dest="mxfp8_storage_island_pad_columns",
+    )
+    storage_island_columnwise = parser.add_mutually_exclusive_group()
+    storage_island_columnwise.add_argument(
+        "--mxfp8-storage-island-columnwise",
+        action="store_true",
+        default=None,
+        dest="mxfp8_storage_island_columnwise",
+        help=(
+            "Also store columnwise MXFP8 payloads for frozen islands. Disabled "
+            "by default because frozen embeddings/heads only need rowwise "
+            "dequantization."
+        ),
+    )
+    storage_island_columnwise.add_argument(
+        "--no-mxfp8-storage-island-columnwise",
+        action="store_false",
+        default=None,
+        dest="mxfp8_storage_island_columnwise",
     )
     emit_swizzled = parser.add_mutually_exclusive_group()
     emit_swizzled.add_argument(
