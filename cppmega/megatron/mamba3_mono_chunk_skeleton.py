@@ -112,6 +112,73 @@ def mono_chunk_skeleton(
     )
 
 
+def allocate_outputs(
+    q: torch.Tensor,
+    dout: torch.Tensor,
+    *,
+    chunk_size: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate the skeleton output tuple without launching the kernel."""
+
+    B, S, H, R, N = q.shape
+    P = dout.shape[-1]
+    nchunks = S // chunk_size
+    opts = {"device": q.device, "dtype": torch.float32}
+    return (
+        torch.zeros((B, S, H, P), **opts),
+        torch.zeros((B, H, R, P), **opts),
+        torch.zeros((B, S, H, R, N), **opts),
+        torch.zeros((B, S, H, R, N), **opts),
+        torch.zeros((B, H, nchunks), **opts),
+    )
+
+
+def mono_chunk_skeleton_out(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    dout: torch.Tensor,
+    v: torch.Tensor,
+    mimo_v: torch.Tensor,
+    mimo_o: torch.Tensor,
+    qk_dot: torch.Tensor,
+    dt: torch.Tensor,
+    trap: torch.Tensor,
+    dstates: torch.Tensor,
+    outputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    chunk_size: int = 16,
+    zero_outputs: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the CUDA skeleton into caller-provided outputs.
+
+    This is primarily for benchmarking: with ``zero_outputs=False`` the timed
+    loop avoids allocation and memset kernels and measures the chunk kernel
+    launch itself.
+    """
+
+    ext = _load_cuda_ext()
+    dv, dmimo_v, dk_diag, dq_diag, lkq_checksum = outputs
+    return ext.mono_chunk_skeleton_out(
+        q.contiguous(),
+        k.contiguous(),
+        dout.contiguous(),
+        v.contiguous(),
+        mimo_v.contiguous(),
+        mimo_o.contiguous(),
+        qk_dot.contiguous(),
+        dt.contiguous(),
+        trap.contiguous(),
+        dstates.contiguous(),
+        dv,
+        dmimo_v,
+        dk_diag,
+        dq_diag,
+        lkq_checksum,
+        int(chunk_size),
+        bool(zero_outputs),
+    )
+
+
 def kernel_metadata() -> dict[str, Any]:
     """Static metadata for docs and smoke output."""
 

@@ -306,37 +306,60 @@ void validate_inputs(
   TORCH_CHECK(P > 0 && P <= 128, "skeleton requires 1 <= P <= 128");
 }
 
-}  // namespace cppmega_mamba3_mono
+void validate_outputs(
+    const at::Tensor& dv,
+    const at::Tensor& dmimo_v,
+    const at::Tensor& dk_diag,
+    const at::Tensor& dq_diag,
+    const at::Tensor& lkq_checksum,
+    int64_t B,
+    int64_t S,
+    int64_t H,
+    int64_t P,
+    int64_t nchunks) {
+  CHECK_CUDA(dv);
+  CHECK_CUDA(dmimo_v);
+  CHECK_CUDA(dk_diag);
+  CHECK_CUDA(dq_diag);
+  CHECK_CUDA(lkq_checksum);
+  CHECK_CONTIGUOUS(dv);
+  CHECK_CONTIGUOUS(dmimo_v);
+  CHECK_CONTIGUOUS(dk_diag);
+  CHECK_CONTIGUOUS(dq_diag);
+  CHECK_CONTIGUOUS(lkq_checksum);
+  CHECK_FLOAT(dv);
+  CHECK_FLOAT(dmimo_v);
+  CHECK_FLOAT(dk_diag);
+  CHECK_FLOAT(dq_diag);
+  CHECK_FLOAT(lkq_checksum);
+  TORCH_CHECK(dv.sizes() == at::IntArrayRef({B, S, H, P}), "dv shape mismatch");
+  TORCH_CHECK(dmimo_v.sizes() == at::IntArrayRef({B, H, kRank, P}), "dmimo_v shape mismatch");
+  TORCH_CHECK(dk_diag.sizes() == at::IntArrayRef({B, S, H, kRank, kN}), "dk_diag shape mismatch");
+  TORCH_CHECK(dq_diag.sizes() == at::IntArrayRef({B, S, H, kRank, kN}), "dq_diag shape mismatch");
+  TORCH_CHECK(lkq_checksum.sizes() == at::IntArrayRef({B, H, nchunks}), "lkq_checksum shape mismatch");
+}
 
-std::vector<at::Tensor> mamba3_mono_chunk_skeleton_cuda(
-    at::Tensor q,
-    at::Tensor k,
-    at::Tensor dout,
-    at::Tensor v,
-    at::Tensor mimo_v,
-    at::Tensor mimo_o,
-    at::Tensor qk_dot,
-    at::Tensor dt,
-    at::Tensor trap,
-    at::Tensor dstates,
-    int64_t chunk_size) {
-  using namespace cppmega_mamba3_mono;
-  validate_inputs(q, k, dout, v, mimo_v, mimo_o, qk_dot, dt, trap, dstates, chunk_size);
-  c10::cuda::CUDAGuard device_guard(q.device());
-
-  int B = static_cast<int>(q.size(0));
-  int S = static_cast<int>(q.size(1));
-  int H = static_cast<int>(q.size(2));
-  int P = static_cast<int>(dout.size(3));
-  int nchunks = S / kChunk;
-
-  auto opts_f = q.options().dtype(at::kFloat);
-  at::Tensor dv = at::zeros({B, S, H, P}, opts_f);
-  at::Tensor dmimo_v = at::zeros({B, H, kRank, P}, opts_f);
-  at::Tensor dk_diag = at::zeros({B, S, H, kRank, kN}, opts_f);
-  at::Tensor dq_diag = at::zeros({B, S, H, kRank, kN}, opts_f);
-  at::Tensor lkq_checksum = at::zeros({B, H, nchunks}, opts_f);
-
+void launch_mono_chunk_kernel(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& dout,
+    const at::Tensor& v,
+    const at::Tensor& mimo_v,
+    const at::Tensor& mimo_o,
+    const at::Tensor& qk_dot,
+    const at::Tensor& dt,
+    const at::Tensor& trap,
+    const at::Tensor& dstates,
+    at::Tensor& dv,
+    at::Tensor& dmimo_v,
+    at::Tensor& dk_diag,
+    at::Tensor& dq_diag,
+    at::Tensor& lkq_checksum,
+    int B,
+    int S,
+    int H,
+    int P,
+    int nchunks) {
   size_t smem_bytes = shared_storage_bytes(P);
   cudaError_t attr_status = cudaFuncSetAttribute(
       mono_chunk_kernel,
@@ -373,6 +396,92 @@ std::vector<at::Tensor> mamba3_mono_chunk_skeleton_cuda(
       P,
       nchunks);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+}  // namespace cppmega_mamba3_mono
+
+std::vector<at::Tensor> mamba3_mono_chunk_skeleton_cuda(
+    at::Tensor q,
+    at::Tensor k,
+    at::Tensor dout,
+    at::Tensor v,
+    at::Tensor mimo_v,
+    at::Tensor mimo_o,
+    at::Tensor qk_dot,
+    at::Tensor dt,
+    at::Tensor trap,
+    at::Tensor dstates,
+    int64_t chunk_size) {
+  using namespace cppmega_mamba3_mono;
+  validate_inputs(q, k, dout, v, mimo_v, mimo_o, qk_dot, dt, trap, dstates, chunk_size);
+  c10::cuda::CUDAGuard device_guard(q.device());
+
+  int B = static_cast<int>(q.size(0));
+  int S = static_cast<int>(q.size(1));
+  int H = static_cast<int>(q.size(2));
+  int P = static_cast<int>(dout.size(3));
+  int nchunks = S / kChunk;
+
+  auto opts_f = q.options().dtype(at::kFloat);
+  at::Tensor dv = at::zeros({B, S, H, P}, opts_f);
+  at::Tensor dmimo_v = at::zeros({B, H, kRank, P}, opts_f);
+  at::Tensor dk_diag = at::zeros({B, S, H, kRank, kN}, opts_f);
+  at::Tensor dq_diag = at::zeros({B, S, H, kRank, kN}, opts_f);
+  at::Tensor lkq_checksum = at::zeros({B, H, nchunks}, opts_f);
+
+  launch_mono_chunk_kernel(
+      q, k, dout, v, mimo_v, mimo_o, qk_dot, dt, trap, dstates,
+      dv, dmimo_v, dk_diag, dq_diag, lkq_checksum,
+      B, S, H, P, nchunks);
+  return {dv, dmimo_v, dk_diag, dq_diag, lkq_checksum};
+}
+
+std::vector<at::Tensor> mamba3_mono_chunk_skeleton_out_cuda(
+    at::Tensor q,
+    at::Tensor k,
+    at::Tensor dout,
+    at::Tensor v,
+    at::Tensor mimo_v,
+    at::Tensor mimo_o,
+    at::Tensor qk_dot,
+    at::Tensor dt,
+    at::Tensor trap,
+    at::Tensor dstates,
+    at::Tensor dv,
+    at::Tensor dmimo_v,
+    at::Tensor dk_diag,
+    at::Tensor dq_diag,
+    at::Tensor lkq_checksum,
+    int64_t chunk_size,
+    bool zero_outputs) {
+  using namespace cppmega_mamba3_mono;
+  validate_inputs(q, k, dout, v, mimo_v, mimo_o, qk_dot, dt, trap, dstates, chunk_size);
+  c10::cuda::CUDAGuard device_guard(q.device());
+
+  int B = static_cast<int>(q.size(0));
+  int S = static_cast<int>(q.size(1));
+  int H = static_cast<int>(q.size(2));
+  int P = static_cast<int>(dout.size(3));
+  int nchunks = S / kChunk;
+  validate_outputs(dv, dmimo_v, dk_diag, dq_diag, lkq_checksum, B, S, H, P, nchunks);
+  TORCH_CHECK(dv.device() == q.device(), "dv must be on the same device as q");
+  TORCH_CHECK(dmimo_v.device() == q.device(), "dmimo_v must be on the same device as q");
+  TORCH_CHECK(dk_diag.device() == q.device(), "dk_diag must be on the same device as q");
+  TORCH_CHECK(dq_diag.device() == q.device(), "dq_diag must be on the same device as q");
+  TORCH_CHECK(lkq_checksum.device() == q.device(), "lkq_checksum must be on the same device as q");
+
+  if (zero_outputs) {
+    dv.zero_();
+    dmimo_v.zero_();
+    dk_diag.zero_();
+    dq_diag.zero_();
+    lkq_checksum.zero_();
+  }
+
+  launch_mono_chunk_kernel(
+      q, k, dout, v, mimo_v, mimo_o, qk_dot, dt, trap, dstates,
+      dv, dmimo_v, dk_diag, dq_diag, lkq_checksum,
+      B, S, H, P, nchunks);
   return {dv, dmimo_v, dk_diag, dq_diag, lkq_checksum};
 }
 

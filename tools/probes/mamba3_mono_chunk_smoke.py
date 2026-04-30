@@ -15,8 +15,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from cppmega.megatron.mamba3_mono_chunk_skeleton import (
+    allocate_outputs,
     kernel_metadata,
     mono_chunk_skeleton,
+    mono_chunk_skeleton_out,
 )
 
 
@@ -134,6 +136,60 @@ def _max_abs(ref: torch.Tensor, got: torch.Tensor) -> float:
     return float((ref.float() - got.float()).abs().max().item())
 
 
+def _timed_kernel_only(
+    inputs: dict[str, torch.Tensor],
+    *,
+    chunk_size: int,
+    warmup: int,
+    iters: int,
+) -> dict[str, Any]:
+    outputs = allocate_outputs(inputs["q"], inputs["dout"], chunk_size=chunk_size)
+    mono_chunk_skeleton_out(**inputs, outputs=outputs, chunk_size=chunk_size, zero_outputs=True)
+    torch.cuda.synchronize()
+
+    for _ in range(warmup):
+        mono_chunk_skeleton_out(**inputs, outputs=outputs, chunk_size=chunk_size, zero_outputs=False)
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        mono_chunk_skeleton_out(**inputs, outputs=outputs, chunk_size=chunk_size, zero_outputs=False)
+    end.record()
+    torch.cuda.synchronize()
+
+    elapsed_us = start.elapsed_time(end) * 1000.0
+    per_iter_us = elapsed_us / iters
+    B, S, H, R, N = inputs["q"].shape
+    P = inputs["dout"].shape[-1]
+    nchunks = S // chunk_size
+    fcs = chunk_size * R
+    lkq_flops = B * H * nchunks * (2 * fcs * fcs * N)
+    future_pairs = R * R * chunk_size * (chunk_size - 1) // 2
+    lkq_apply_flops = B * H * nchunks * (2 * future_pairs * P)
+    k_state_flops = B * H * nchunks * (2 * fcs * N * P)
+
+    def tflops(flops: int) -> float:
+        return float(flops / (per_iter_us * 1e-6) / 1e12)
+
+    return {
+        "mode": "preallocated_no_zero",
+        "warmup": warmup,
+        "iters": iters,
+        "kernel_us": per_iter_us,
+        "estimated_lkq_tflops": tflops(lkq_flops),
+        "estimated_lkq_plus_apply_tflops": tflops(lkq_flops + lkq_apply_flops),
+        "estimated_lkq_apply_tflops": tflops(lkq_apply_flops),
+        "estimated_k_state_tflops": tflops(k_state_flops),
+        "flops_per_iter": {
+            "lkq_wmma": int(lkq_flops),
+            "lkq_apply": int(lkq_apply_flops),
+            "k_state": int(k_state_flops),
+        },
+    }
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA smoke requested but torch.cuda.is_available() is false")
@@ -155,14 +211,30 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     got = mono_chunk_skeleton(**inputs, chunk_size=args.chunk)
     if args.device == "cuda":
         torch.cuda.synchronize()
-    ref = _reference(inputs, args.chunk)
-    if args.device == "cuda":
-        torch.cuda.synchronize()
 
-    names = ("dv", "dmimo_v", "dk_diag", "dq_diag", "lkq_checksum")
-    diffs = {name: _max_abs(r, g) for name, r, g in zip(names, ref, got)}
-    passed = all(value <= args.atol for value in diffs.values())
-    return {
+    diffs = {}
+    passed = None
+    if not args.skip_reference:
+        ref = _reference(inputs, args.chunk)
+        if args.device == "cuda":
+            torch.cuda.synchronize()
+
+        names = ("dv", "dmimo_v", "dk_diag", "dq_diag", "lkq_checksum")
+        diffs = {name: _max_abs(r, g) for name, r, g in zip(names, ref, got)}
+        passed = all(value <= args.atol for value in diffs.values())
+
+    timings = None
+    if args.bench_iters:
+        if args.device != "cuda":
+            raise RuntimeError("--bench-iters requires --device cuda")
+        timings = _timed_kernel_only(
+            inputs,
+            chunk_size=args.chunk,
+            warmup=args.bench_warmup,
+            iters=args.bench_iters,
+        )
+
+    result = {
         "passed": passed,
         "atol": args.atol,
         "diffs": diffs,
@@ -178,6 +250,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         },
         "metadata": metadata,
     }
+    if timings is not None:
+        result["timings"] = timings
+    return result
 
 
 def parse_args() -> argparse.Namespace:
@@ -193,6 +268,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260430)
     parser.add_argument("--atol", type=float, default=8e-3)
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--skip-reference", action="store_true")
+    parser.add_argument("--bench-iters", type=int, default=0)
+    parser.add_argument("--bench-warmup", type=int, default=20)
     return parser.parse_args()
 
 
