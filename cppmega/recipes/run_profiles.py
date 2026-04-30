@@ -24,7 +24,12 @@ from cppmega.recipes.nam56r_megatron import build_nam56r_feature_plan
 MtpCEKernel = Literal["native", "cce", "liger", "off"]
 Fp8Format = Literal["hybrid", "e4m3"]
 Fp8Recipe = Literal["off", "tensorwise", "mxfp8"]
-Mxfp8BackwardBackend = Literal["te_tn_adapter", "flashinfer_cutlass", "cutlass_native"]
+Mxfp8BackwardBackend = Literal[
+    "te_tn_adapter",
+    "flashinfer_cutlass",
+    "cutlass_native",
+    "wave16c_streaming_stock",
+]
 Mxfp8TransposeEmitBackend = Literal["auto", "te", "off"]
 Mxfp8CutlassScaleBackend = Literal["compact", "prepack", "swizzled"]
 Mxfp8FlashinferRunner = Literal["mm_mxfp8", "direct_tactic"]
@@ -133,6 +138,10 @@ class PrecisionProfile:
     # the current SM120 direct loader is slower than the TE-transpose TN path on
     # full-model GB10 runs, so keep it opt-in until the loader/mainloop is fixed.
     mxfp8_compact_columnwise_backward: bool = False
+    # Wave16C dense Linear experiment: save compact-columnwise operands but run
+    # dense dgrad/wgrad through bounded stock-CUTLASS tile scratch instead of
+    # full rowwise-transpose sidecars. Selected with
+    # mxfp8_bwd_backend="wave16c_streaming_stock"; defaults stay unchanged.
     # Experimental MoE grouped backward mode: consumes grouped compact MXFP8
     # operands directly.  Keep this separate from dense compact-columnwise
     # because the current grouped direct kernels save memory but are slower than
@@ -451,11 +460,12 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
     if (
         profile.precision.fp8_recipe == "mxfp8"
         and profile.precision.mxfp8_compact_columnwise_backward
-        and profile.precision.mxfp8_bwd_backend != "cutlass_native"
+        and profile.precision.mxfp8_bwd_backend
+        not in ("cutlass_native", "wave16c_streaming_stock")
     ):
         raise ValueError(
             "mxfp8_compact_columnwise_backward requires "
-            "mxfp8_bwd_backend='cutlass_native'"
+            "mxfp8_bwd_backend='cutlass_native' or 'wave16c_streaming_stock'"
         )
     if (
         profile.precision.fp8_recipe == "mxfp8"
@@ -470,11 +480,22 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         profile.precision.fp8_recipe == "mxfp8"
         and profile.precision.mxfp8_cutlass_scale_backend == "swizzled"
         and profile.precision.mxfp8_compact_columnwise_backward
+        and profile.precision.mxfp8_bwd_backend != "wave16c_streaming_stock"
     ):
         raise ValueError(
             "mxfp8_cutlass_scale_backend='swizzled' is incompatible with "
             "mxfp8_compact_columnwise_backward"
         )
+
+    mxfp8_transpose_emit_backend = profile.precision.mxfp8_transpose_emit_backend
+    mxfp8_transpose_emit_swizzled = profile.precision.mxfp8_transpose_emit_swizzled
+    mxfp8_compact_columnwise_backward = (
+        profile.precision.mxfp8_compact_columnwise_backward
+    )
+    if profile.precision.mxfp8_bwd_backend == "wave16c_streaming_stock":
+        mxfp8_transpose_emit_backend = "off"
+        mxfp8_transpose_emit_swizzled = False
+        mxfp8_compact_columnwise_backward = True
 
     env: dict[str, str] = {
         "CPPMEGA_RUN_PROFILE": profile.name,
@@ -605,10 +626,10 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                 ),
                 "CPPMEGA_TE_MXFP8_BWD_BACKEND": profile.precision.mxfp8_bwd_backend,
                 "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND": (
-                    profile.precision.mxfp8_transpose_emit_backend
+                    mxfp8_transpose_emit_backend
                 ),
                 "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED": _bool(
-                    profile.precision.mxfp8_transpose_emit_swizzled
+                    mxfp8_transpose_emit_swizzled
                 ),
                 "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT": _bool(
                     profile.precision.mxfp8_transpose_emit_strict
@@ -617,7 +638,7 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                     profile.precision.mxfp8_cutlass_scale_backend
                 ),
                 "CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD": _bool(
-                    profile.precision.mxfp8_compact_columnwise_backward
+                    mxfp8_compact_columnwise_backward
                 ),
                 "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD": _bool(
                     profile.precision.mxfp8_grouped_direct_backward
@@ -695,6 +716,12 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.precision.attention_backend = args.attention_backend
     if args.mxfp8_bwd_backend is not None:
         profile.precision.mxfp8_bwd_backend = args.mxfp8_bwd_backend
+        if args.mxfp8_bwd_backend == "wave16c_streaming_stock":
+            if args.mxfp8_transpose_emit_backend is None:
+                profile.precision.mxfp8_transpose_emit_backend = "off"
+            if args.mxfp8_transpose_emit_swizzled is None:
+                profile.precision.mxfp8_transpose_emit_swizzled = False
+            profile.precision.mxfp8_compact_columnwise_backward = True
     if args.mxfp8_cutlass_scale_backend is not None:
         profile.precision.mxfp8_cutlass_scale_backend = args.mxfp8_cutlass_scale_backend
         if args.mxfp8_cutlass_scale_backend == "swizzled":
@@ -723,10 +750,13 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         if args.mxfp8_compact_columnwise_backward:
             if args.mxfp8_bwd_backend is None:
                 profile.precision.mxfp8_bwd_backend = "cutlass_native"
-            elif args.mxfp8_bwd_backend != "cutlass_native":
+            elif args.mxfp8_bwd_backend not in (
+                "cutlass_native",
+                "wave16c_streaming_stock",
+            ):
                 raise ValueError(
                     "--mxfp8-compact-columnwise-backward requires "
-                    "--mxfp8-bwd-backend cutlass_native"
+                    "--mxfp8-bwd-backend cutlass_native or wave16c_streaming_stock"
                 )
     if args.mxfp8_grouped_direct_backward is not None:
         profile.precision.mxfp8_grouped_direct_backward = (
@@ -872,7 +902,12 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--mxfp8-bwd-backend",
-        choices=("te_tn_adapter", "flashinfer_cutlass", "cutlass_native"),
+        choices=(
+            "te_tn_adapter",
+            "flashinfer_cutlass",
+            "cutlass_native",
+            "wave16c_streaming_stock",
+        ),
         default=None,
     )
     parser.add_argument(

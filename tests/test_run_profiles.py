@@ -235,6 +235,28 @@ def test_compact_columnwise_cli_selects_cutlass_native_when_backend_implicit(
     assert "export CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native" in out
 
 
+def test_wave16c_backend_is_typed_and_forces_no_transpose_emit(capsys, monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_profiles",
+            "shell",
+            "local_gb10_quarter",
+            "--fp8-recipe",
+            "mxfp8",
+            "--mxfp8-bwd-backend",
+            "wave16c_streaming_stock",
+        ],
+    )
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "export CPPMEGA_TE_MXFP8_BWD_BACKEND=wave16c_streaming_stock" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=off" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED=0" in out
+    assert "export CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=1" in out
+
+
 def test_compact_columnwise_rejects_non_cutlass_backend(monkeypatch):
     monkeypatch.setattr(
         "sys.argv",

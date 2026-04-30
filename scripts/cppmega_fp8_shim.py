@@ -236,6 +236,7 @@ if os.environ.get("CPPMEGA_ALLOW_TE_MXFP8_SM12", "0") == "1":
 #   CPPMEGA_TE_MXFP8_BWD_BACKEND=te_tn_adapter       # TE TN GEMM
 #   CPPMEGA_TE_MXFP8_BWD_BACKEND=flashinfer_cutlass  # TE payload + FlashInfer SM120
 #   CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native      # old direct compact loader
+#   CPPMEGA_TE_MXFP8_BWD_BACKEND=wave16c_streaming_stock  # bounded stock CUTLASS tiles
 #   CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND=compact     # direct compact-scale mainloop
 #   CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND=prepack     # old native-scale prepack A/B
 #   CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND=swizzled    # stock CUTLASS + GEMM-ready scales
@@ -257,11 +258,16 @@ _te_mxfp8_bwd_tn_adapter = os.environ.get("CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER", "0"
 _te_mxfp8_bwd_backend = os.environ.get(
     "CPPMEGA_TE_MXFP8_BWD_BACKEND", "te_tn_adapter"
 ).lower()
-if _te_mxfp8_bwd_backend not in ("te_tn_adapter", "flashinfer_cutlass", "cutlass_native"):
+if _te_mxfp8_bwd_backend not in (
+    "te_tn_adapter",
+    "flashinfer_cutlass",
+    "cutlass_native",
+    "wave16c_streaming_stock",
+):
     raise RuntimeError(
         "Unsupported CPPMEGA_TE_MXFP8_BWD_BACKEND="
         f"{_te_mxfp8_bwd_backend!r}; expected te_tn_adapter, flashinfer_cutlass, "
-        "or cutlass_native"
+        "cutlass_native, or wave16c_streaming_stock"
     )
 _cutlass_mxfp8_scale_backend = os.environ.get(
     "CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND", "compact"
@@ -275,15 +281,33 @@ _cutlass_mxfp8_stock_swizzled = (
     _te_mxfp8_bwd_backend == "cutlass_native"
     and _cutlass_mxfp8_scale_backend == "swizzled"
 )
+_te_mxfp8_wave16c_streaming_stock = (
+    _te_mxfp8_bwd_backend == "wave16c_streaming_stock"
+)
 _te_mxfp8_transpose_emit_default = (
     "auto"
     if _cutlass_mxfp8_stock_swizzled
-    else ("off" if _te_mxfp8_bwd_backend == "cutlass_native" else "auto")
+    else (
+        "off"
+        if _te_mxfp8_bwd_backend in ("cutlass_native", "wave16c_streaming_stock")
+        else "auto"
+    )
 )
 _te_mxfp8_transpose_emit_backend = os.environ.get(
     "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND",
     _te_mxfp8_transpose_emit_default,
 ).lower()
+if (
+    _te_mxfp8_wave16c_streaming_stock
+    and _te_mxfp8_transpose_emit_backend != "off"
+):
+    print(
+        "[cppmega_fp8_shim] wave16c_streaming_stock forces "
+        "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=off to avoid dense "
+        "rowwise-transpose sidecar materialization",
+        file=_sys.stderr,
+    )
+    _te_mxfp8_transpose_emit_backend = "off"
 if _te_mxfp8_transpose_emit_backend not in ("auto", "te", "off"):
     raise RuntimeError(
         "Unsupported CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND="
@@ -295,7 +319,11 @@ _te_mxfp8_transpose_emit_strict = os.environ.get(
 _te_mxfp8_transpose_emit_swizzled_default = (
     "1"
     if _cutlass_mxfp8_stock_swizzled
-    else ("0" if _te_mxfp8_bwd_backend == "cutlass_native" else "1")
+    else (
+        "0"
+        if _te_mxfp8_bwd_backend in ("cutlass_native", "wave16c_streaming_stock")
+        else "1"
+    )
 )
 _te_mxfp8_transpose_emit_swizzled = os.environ.get(
     "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED",
@@ -304,7 +332,11 @@ _te_mxfp8_transpose_emit_swizzled = os.environ.get(
 _te_mxfp8_compact_columnwise_backward = (
     False
     if _cutlass_mxfp8_stock_swizzled
-    else os.environ.get("CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD", "0") == "1"
+    else (
+        _te_mxfp8_wave16c_streaming_stock
+        or os.environ.get("CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD", "0")
+        == "1"
+    )
 )
 _te_mxfp8_grouped_direct_backward = os.environ.get(
     "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD", "0"
@@ -408,6 +440,10 @@ if (
             "mxfp8_cutlass_native_wgrad": 0,
             "mxfp8_cutlass_native_stock_swizzled": 0,
             "mxfp8_cutlass_native_stock_scale_swizzle": 0,
+            "mxfp8_wave16c_streaming_stock_dgrad": 0,
+            "mxfp8_wave16c_streaming_stock_wgrad": 0,
+            "mxfp8_wave16c_streaming_stock_miss_dgrad": 0,
+            "mxfp8_wave16c_streaming_stock_miss_wgrad": 0,
             "mxfp8_flashinfer_fprop": 0,
             "mxfp8_flashinfer_fprop_fallback": 0,
             "mxfp8_flashinfer_dgrad": 0,
@@ -1354,6 +1390,64 @@ if (
             )
             return _result, None, None, None
 
+        def _cppmega_wave16c_dgrad_nn_gemm(_weight, _dy, _kwargs):
+            if getattr(_dy, "_with_gemm_swizzled_scales", False):
+                raise ValueError(
+                    "wave16c_streaming_stock dgrad requires compact rowwise dy scales"
+                )
+            _dy_data, _dy_scale = _cppmega_mxfp8_rowwise_payload_and_scale(_dy)
+            _weight_data, _weight_scale = _cppmega_mxfp8_colwise_payload_and_scale(
+                _weight
+            )
+            _cutlass = _cppmega_load_cutlass_mxfp8_module()
+            _result = _cutlass.dgrad_nn_gemm_streaming_swizzled_stock(
+                _dy_data,
+                _dy_scale,
+                _weight_data,
+                _weight_scale,
+                **_cppmega_cutlass_kwargs(_kwargs),
+            )
+            return _result, None, None, None
+
+        def _cppmega_wave16c_wgrad_nt_gemm(_x, _dy, _kwargs):
+            _dy_data, _dy_scale = _cppmega_mxfp8_colwise_payload_and_scale(_dy)
+            _x_data, _x_scale = _cppmega_mxfp8_colwise_payload_and_scale(_x)
+            _cutlass = _cppmega_load_cutlass_mxfp8_module()
+            _result = _cutlass.wgrad_nt_gemm_streaming_swizzled_stock_colwise(
+                _dy_data,
+                _dy_scale,
+                _x_data,
+                _x_scale,
+                **_cppmega_cutlass_kwargs(_kwargs),
+            )
+            return _result, None, None, None
+
+        def _cppmega_try_mxfp8_wave16c_streaming_stock(_args, _kwargs):
+            _layout = _kwargs.get("layout")
+            if _layout not in ("NN", "NT"):
+                return False, f"unsupported_layout:{_layout}"
+            if len(_args) < 2:
+                return False, "missing_operands"
+            if _cppmega_has_comm_overlap(_kwargs):
+                return False, "comm_overlap_not_covered"
+            if not (
+                _cppmega_is_mxfp8_tensor(_args[0])
+                and _cppmega_is_mxfp8_tensor(_args[1])
+            ):
+                return False, "non_mxfp8_operands"
+
+            if _layout == "NN":
+                return True, _cppmega_wave16c_dgrad_nn_gemm(
+                    _args[0],
+                    _args[1],
+                    _kwargs,
+                )
+            return True, _cppmega_wave16c_wgrad_nt_gemm(
+                _args[0],
+                _args[1],
+                _kwargs,
+            )
+
         def _cppmega_try_mxfp8_cutlass_native(_args, _kwargs):
             _layout = _kwargs.get("layout")
             if _layout not in ("NN", "NT"):
@@ -1616,6 +1710,15 @@ if (
             if _cppmega_has_comm_overlap(_kwargs):
                 return False, "comm_overlap_not_covered"
 
+            if _te_mxfp8_bwd_backend == "wave16c_streaming_stock":
+                try:
+                    return _cppmega_try_mxfp8_wave16c_streaming_stock(_args, _kwargs)
+                except Exception as _wave16c_exc:  # pragma: no cover
+                    return (
+                        False,
+                        "wave16c_streaming_stock_unavailable:"
+                        f"{type(_wave16c_exc).__name__}: {_wave16c_exc}",
+                    )
             if _te_mxfp8_bwd_backend == "cutlass_native":
                 try:
                     return _cppmega_try_mxfp8_cutlass_native(_args, _kwargs)
@@ -1884,6 +1987,10 @@ if (
                         if _adapted_ok:
                             if _te_mxfp8_bwd_backend == "cutlass_native":
                                 _cppmega_record_bwd_stat(f"mxfp8_cutlass_native_{_op_kind}")
+                            elif _te_mxfp8_bwd_backend == "wave16c_streaming_stock":
+                                _cppmega_record_bwd_stat(
+                                    f"mxfp8_wave16c_streaming_stock_{_op_kind}"
+                                )
                             elif _te_mxfp8_bwd_backend == "flashinfer_cutlass":
                                 _cppmega_record_bwd_stat(f"mxfp8_flashinfer_{_op_kind}")
                             else:
@@ -1902,6 +2009,11 @@ if (
                     except Exception as _adapter_exc:  # pragma: no cover
                         _fallback_reason = (
                             f"{type(_adapter_exc).__name__}: {_adapter_exc}"
+                        )
+                    if _te_mxfp8_bwd_backend == "wave16c_streaming_stock":
+                        _cppmega_record_bwd_stat(
+                            f"mxfp8_wave16c_streaming_stock_miss_{_op_kind}",
+                            _fallback_reason,
                         )
                     if _te_mxfp8_bwd_allow_bf16_fallback:
                         _cppmega_record_bwd_stat(
@@ -2316,6 +2428,7 @@ if (
             f"(backward_override={_cppmega_backward_override}, "
             f"override_linear_precision={(False, _te_mxfp8_dgrad_bf16, _te_mxfp8_wgrad_bf16)}, "
             f"mxfp8_bwd_tn_adapter={_te_mxfp8_bwd_tn_adapter}, "
+            f"mxfp8_bwd_backend={_te_mxfp8_bwd_backend}, "
             f"mxfp8_transpose_emit_backend={_te_mxfp8_transpose_emit_backend}, "
             f"mxfp8_transpose_emit_swizzled={_te_mxfp8_transpose_emit_swizzled}, "
             f"cutlass_mxfp8_scale_backend={_cutlass_mxfp8_scale_backend}, "

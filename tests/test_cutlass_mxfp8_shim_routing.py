@@ -16,7 +16,16 @@ class _FakeRowwiseMXFP8:
         self._with_gemm_swizzled_scales = swizzled
 
 
-def _fresh_shim(monkeypatch, *, scale_backend: str):
+class _FakeDenseMXFP8:
+    def __init__(self, *, swizzled: bool = False):
+        self._rowwise_data = torch.empty((128, 128), dtype=torch.uint8)
+        self._rowwise_scale_inv = torch.empty((128, 4), dtype=torch.uint8)
+        self._columnwise_data = torch.empty((128, 128), dtype=torch.uint8)
+        self._columnwise_scale_inv = torch.empty((4, 128), dtype=torch.uint8)
+        self._with_gemm_swizzled_scales = swizzled
+
+
+def _fresh_shim(monkeypatch, *, scale_backend: str, backend: str = "cutlass_native"):
     for key in (
         "CPPMEGA_TE_MXFP8_DGRAD_BF16",
         "CPPMEGA_TE_MXFP8_WGRAD_BF16",
@@ -25,7 +34,7 @@ def _fresh_shim(monkeypatch, *, scale_backend: str):
     ):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER", "1")
-    monkeypatch.setenv("CPPMEGA_TE_MXFP8_BWD_BACKEND", "cutlass_native")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_BWD_BACKEND", backend)
     monkeypatch.setenv("CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND", scale_backend)
     monkeypatch.setenv("CPPMEGA_TE_VERSION_STRICT", "0")
     monkeypatch.setattr(atexit, "register", lambda func, *args, **kwargs: func)
@@ -119,3 +128,105 @@ def test_compact_cutlass_route_keeps_direct_rowwise_gemm(monkeypatch):
     assert calls[0][1] is a._rowwise_scale_inv
     assert calls[0][2] is b._rowwise_data
     assert calls[0][3] is b._rowwise_scale_inv
+
+
+def test_wave16c_dgrad_route_uses_colwise_weight_without_transpose(monkeypatch):
+    shim = _fresh_shim(
+        monkeypatch,
+        scale_backend="compact",
+        backend="wave16c_streaming_stock",
+    )
+    weight = _FakeDenseMXFP8()
+    dy = _FakeDenseMXFP8()
+    calls = []
+
+    def dgrad_nn_gemm_streaming_swizzled_stock(
+        dy_data,
+        dy_scale,
+        weight_data,
+        weight_scale,
+        **kwargs,
+    ):
+        calls.append((dy_data, dy_scale, weight_data, weight_scale, kwargs))
+        return "wave16c-dgrad"
+
+    monkeypatch.setattr(
+        shim,
+        "_cppmega_mxfp8_colwise_as_rowwise_transpose",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("wave16c route must not request a rowwise transpose")
+        ),
+    )
+    monkeypatch.setattr(
+        shim,
+        "_cppmega_cutlass_mxfp8_module",
+        [SimpleNamespace(dgrad_nn_gemm_streaming_swizzled_stock=dgrad_nn_gemm_streaming_swizzled_stock)],
+    )
+
+    ok, result = shim._cppmega_try_mxfp8_tn_adapter(
+        None,
+        [weight, dy],
+        {"layout": "NN", "grad": True, "out_dtype": torch.bfloat16},
+    )
+
+    assert ok is True
+    assert result[0] == "wave16c-dgrad"
+    assert len(calls) == 1
+    assert calls[0][0] is dy._rowwise_data
+    assert calls[0][1] is dy._rowwise_scale_inv
+    assert calls[0][2] is weight._columnwise_data
+    assert calls[0][3] is weight._columnwise_scale_inv
+
+
+def test_wave16c_wgrad_route_uses_colwise_operands_without_transpose(monkeypatch):
+    shim = _fresh_shim(
+        monkeypatch,
+        scale_backend="compact",
+        backend="wave16c_streaming_stock",
+    )
+    x = _FakeDenseMXFP8()
+    dy = _FakeDenseMXFP8()
+    calls = []
+
+    def wgrad_nt_gemm_streaming_swizzled_stock_colwise(
+        dy_data,
+        dy_scale,
+        x_data,
+        x_scale,
+        **kwargs,
+    ):
+        calls.append((dy_data, dy_scale, x_data, x_scale, kwargs))
+        return "wave16c-wgrad"
+
+    monkeypatch.setattr(
+        shim,
+        "_cppmega_mxfp8_colwise_as_rowwise_transpose",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("wave16c route must not request a rowwise transpose")
+        ),
+    )
+    monkeypatch.setattr(
+        shim,
+        "_cppmega_cutlass_mxfp8_module",
+        [
+            SimpleNamespace(
+                wgrad_nt_gemm_streaming_swizzled_stock_colwise=(
+                    wgrad_nt_gemm_streaming_swizzled_stock_colwise
+                )
+            )
+        ],
+    )
+
+    ok, result = shim._cppmega_try_mxfp8_tn_adapter(
+        None,
+        [x, dy],
+        {"layout": "NT", "grad": True, "out_dtype": torch.bfloat16},
+    )
+
+    assert ok is True
+    assert result[0] == "wave16c-wgrad"
+    assert len(calls) == 1
+    assert calls[0][0] is dy._columnwise_data
+    assert calls[0][1] is dy._columnwise_scale_inv
+    assert calls[0][2] is x._columnwise_data
+    assert calls[0][3] is x._columnwise_scale_inv

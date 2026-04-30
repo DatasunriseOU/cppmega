@@ -13,6 +13,10 @@ GEMM-swizzled ``x.T`` scale tensor.
 The ``streaming_swizzled_stock`` backend reuses the stock swizzled-scale GEMM,
 but only prepares tile-local GEMM-ready scratch: ``dy.T`` payload+scale for one
 M tile and ``x.T`` scale for one N tile.
+
+The ``streaming_swizzled_stock_colwise`` backend is the Wave16C dense Linear
+probe: both ``dy`` and ``x`` stay in original compact-columnwise TE storage and
+only bounded tile-local payload+scale scratch is prepared.
 """
 
 from __future__ import annotations
@@ -103,6 +107,20 @@ def _make_streaming_scratch(
     )
 
 
+def _make_streaming_colwise_scratch(
+    tile_m: int,
+    tile_n: int,
+    k: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty((tile_m, k), device=device, dtype=torch.uint8),
+        torch.empty((tile_m, k // 32), device=device, dtype=torch.uint8),
+        torch.empty((tile_n, k), device=device, dtype=torch.uint8),
+        torch.empty((tile_n, k // 32), device=device, dtype=torch.uint8),
+    )
+
+
 def _run(args: argparse.Namespace) -> dict[str, Any]:
     torch.manual_seed(args.seed)
     reduction = args.reduction
@@ -120,8 +138,11 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 
     xq = _quantize_mxfp8(x)
     dyq = _quantize_mxfp8(dy)
-    x_t_data = xq._columnwise_data.t().contiguous()
-    x_t_scale = xq._columnwise_scale_inv.t().contiguous()
+    x_t_data: torch.Tensor | None = None
+    x_t_scale: torch.Tensor | None = None
+    if args.backend != "streaming_swizzled_stock_colwise":
+        x_t_data = xq._columnwise_data.t().contiguous()
+        x_t_scale = xq._columnwise_scale_inv.t().contiguous()
     out = torch.empty((out_n, out_k), device=device, dtype=torch.bfloat16)
     torch.cuda.synchronize()
     cutlass._load_cuda_ext()
@@ -131,8 +152,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     backend_setup_elapsed_ms = 0.0
     backend_extra_tensors: list[tuple[str, torch.Tensor]] = []
     streaming_scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+    streaming_colwise_scratch: (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None
+    ) = None
 
     if args.backend == "te_emit_swizzled_stock":
+        assert x_t_scale is not None
         setup_start = torch.cuda.Event(enable_timing=True)
         setup_end = torch.cuda.Event(enable_timing=True)
         setup_start.record()
@@ -159,13 +184,30 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             ("a_tile_gemm_scale_inv_scratch", streaming_scratch[1]),
             ("b_tile_gemm_scale_inv_scratch", streaming_scratch[2]),
         ]
+    if args.backend == "streaming_swizzled_stock_colwise":
+        max_tile_m = min(args.tile_m, out_n)
+        max_tile_n = min(args.tile_n, out_k)
+        streaming_colwise_scratch = _make_streaming_colwise_scratch(
+            max_tile_m,
+            max_tile_n,
+            reduction,
+            device,
+        )
+        backend_extra_tensors = [
+            ("a_tile_rowwise_data_scratch", streaming_colwise_scratch[0]),
+            ("a_tile_gemm_scale_inv_scratch", streaming_colwise_scratch[1]),
+            ("b_tile_rowwise_data_scratch", streaming_colwise_scratch[2]),
+            ("b_tile_gemm_scale_inv_scratch", streaming_colwise_scratch[3]),
+        ]
 
     allocated_after_setup_bytes = int(torch.cuda.memory_allocated())
 
     def mixed_wgrad() -> torch.Tensor:
+        nonlocal x_t_data, x_t_scale
         if args.backend == "te_emit_swizzled_stock":
             assert dy_t is not None
             assert x_t_scale_swizzled is not None
+            assert x_t_data is not None
             return cutlass.tn_gemm_swizzled_scale(
                 dy_t._rowwise_data,
                 dy_t._rowwise_scale_inv,
@@ -176,6 +218,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 
         if args.backend == "streaming_swizzled_stock":
             assert streaming_scratch is not None
+            assert x_t_data is not None
+            assert x_t_scale is not None
             return cutlass.wgrad_nt_gemm_streaming_swizzled_stock(
                 dyq._columnwise_data,
                 dyq._columnwise_scale_inv,
@@ -187,6 +231,22 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 scratch=streaming_scratch,
             )
 
+        if args.backend == "streaming_swizzled_stock_colwise":
+            assert streaming_colwise_scratch is not None
+            return cutlass.wgrad_nt_gemm_streaming_swizzled_stock_colwise(
+                dyq._columnwise_data,
+                dyq._columnwise_scale_inv,
+                xq._columnwise_data,
+                xq._columnwise_scale_inv,
+                out=out,
+                tile_m=args.tile_m,
+                tile_n=args.tile_n,
+                scratch=streaming_colwise_scratch,
+            )
+
+        if x_t_data is None or x_t_scale is None:
+            x_t_data = xq._columnwise_data.t().contiguous()
+            x_t_scale = xq._columnwise_scale_inv.t().contiguous()
         a_columnwise_smem = args.backend == "a_col_smem_scalar"
         a_columnwise_smem_b_tma_early = args.backend == "a_col_smem_b_tma_early"
         return cutlass._tn_gemm_compact_direct(
@@ -213,6 +273,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     if args.check_parity:
         mixed_wgrad()
         candidate = out.detach().clone()
+        if x_t_data is None or x_t_scale is None:
+            x_t_data = xq._columnwise_data.t().contiguous()
+            x_t_scale = xq._columnwise_scale_inv.t().contiguous()
         direct = cutlass.wgrad_nt_gemm_x_rowwise_transpose(
             dyq._columnwise_data,
             dyq._columnwise_scale_inv,
@@ -249,12 +312,14 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "device": torch.cuda.get_device_name(),
         "shape": {
             "dy": [reduction, out_n],
+            "x": [reduction, out_k],
             "x_t": [out_k, reduction],
             "logical_gemm": [out_n, out_k, reduction],
         },
         "warmup": args.warmup,
         "iters": args.iters,
         "backend": args.backend,
+        "materializes_x_t_for_backend": args.backend != "streaming_swizzled_stock_colwise",
         "tile": {"m": args.tile_m, "n": args.tile_n},
         "finite": finite,
         "parity_vs_direct": parity,
@@ -302,6 +367,7 @@ def main() -> None:
             "a_col_smem_b_tma_early",
             "te_emit_swizzled_stock",
             "streaming_swizzled_stock",
+            "streaming_swizzled_stock_colwise",
         ),
         default="legacy",
     )
