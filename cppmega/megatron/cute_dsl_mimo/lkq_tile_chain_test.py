@@ -14,6 +14,8 @@ CTA:
 The scalar correctness mode keeps the Wave 5 LKQ/masked-LKQ global tensors.
 The fused mode uses a two-WGMMA CuTe tile for ``future_mask(lkq) @ dPhi`` so
 LKQ is only spilled to swizzled shared memory inside the kernel.
+The Wave 7 fused-consumer mode keeps state/apply on-chip as BF16 shared-memory
+tiles and writes only DV/DMIMO_V to global memory.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ import torch
 
 from cppmega.megatron.cute_dsl_mimo.masked_lkq_apply import run_masked_lkq_apply
 from cppmega.megatron.cute_dsl_mimo.single_gemm_test import run_single_gemm
+from cppmega.megatron.cute_dsl_mimo.state_apply_consumers import run_state_apply_consumers
 
 
 CHUNK_SIZE = 16
@@ -220,6 +223,54 @@ def _run_case_fused_masked_apply(
     }
 
 
+def _run_case_fused_state_apply_consumers(
+    inputs: ChainInputs,
+    mask_bf16: torch.Tensor,
+    stream: cuda.CUstream,
+) -> dict[str, Any]:
+    dv = torch.empty((CHUNK_SIZE, P), dtype=torch.float32, device="cuda")
+    dmimo_v = torch.empty((RANK, P), dtype=torch.float32, device="cuda")
+    run_state_apply_consumers(
+        FCS,
+        RANK,
+        CHUNK_SIZE,
+        inputs.k.contiguous(),
+        inputs.q.contiguous(),
+        inputs.dstates.T.contiguous(),
+        inputs.dphi.T.contiguous(),
+        inputs.v.contiguous(),
+        inputs.mimo_v.contiguous(),
+        dv,
+        dmimo_v,
+        stream,
+    )
+    torch.cuda.synchronize()
+
+    ref = _reference(inputs, mask_bf16)
+    diffs = {
+        "dv": _max_abs(dv, ref["dv"]),
+        "dmimo_v": _max_abs(dmimo_v, ref["dmimo_v"]),
+    }
+    return {
+        "mode": "fused_state_apply_consumers",
+        "lkq_global_materialized": False,
+        "state_global_materialized": False,
+        "apply_global_materialized": False,
+        "remaining_global": [
+            "DV FP32 output tile",
+            "DMIMO_V FP32 output tile",
+            "pre-transposed DStates.T/DPh.T input-layout tensors in the harness",
+        ],
+        "diffs": diffs,
+        "dv_checksum": float(dv.float().sum().item()),
+        "dmimo_v_checksum": float(dmimo_v.float().sum().item()),
+        "dv_row0": [float(x) for x in dv[0, :4].tolist()],
+        "ref_dv_row0": [float(x) for x in ref["dv"][0, :4].tolist()],
+        "dmimo_v_row0": [float(x) for x in dmimo_v[0, :4].tolist()],
+        "ref_dmimo_v_row0": [float(x) for x in ref["dmimo_v"][0, :4].tolist()],
+    }
+
+
 def _time_chain(
     inputs: ChainInputs,
     mask_bf16: torch.Tensor,
@@ -314,6 +365,65 @@ def _time_chain_fused_masked_apply(
     }
 
 
+def _time_chain_fused_state_apply_consumers(
+    inputs: ChainInputs,
+    stream: cuda.CUstream,
+    *,
+    warmup: int,
+    iters: int,
+) -> dict[str, Any]:
+    dv = torch.empty((CHUNK_SIZE, P), dtype=torch.float32, device="cuda")
+    dmimo_v = torch.empty((RANK, P), dtype=torch.float32, device="cuda")
+    dstates_t = inputs.dstates.T.contiguous()
+    dphi_t = inputs.dphi.T.contiguous()
+
+    def launch_once() -> None:
+        run_state_apply_consumers(
+            FCS,
+            RANK,
+            CHUNK_SIZE,
+            inputs.k,
+            inputs.q,
+            dstates_t,
+            dphi_t,
+            inputs.v,
+            inputs.mimo_v,
+            dv,
+            dmimo_v,
+            stream,
+        )
+
+    for _ in range(warmup):
+        launch_once()
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        launch_once()
+    end.record()
+    torch.cuda.synchronize()
+
+    elapsed_us = start.elapsed_time(end) * 1000.0
+    per_iter_us = elapsed_us / iters
+    gemm_flops = 2 * FCS * P * N + 2 * FCS * FCS * N + 2 * FCS * P * FCS
+    consumer_flops = 2 * CHUNK_SIZE * RANK * P + 2 * RANK * CHUNK_SIZE * P
+    flops = gemm_flops + consumer_flops
+    return {
+        "mode": "fused_state_apply_consumers",
+        "warmup": warmup,
+        "iters": iters,
+        "chain_us": per_iter_us,
+        "estimated_tile_flops": flops,
+        "estimated_tile_tflops": float(flops / (per_iter_us * 1e-6) / 1e12),
+        "lkq_global_materialized": False,
+        "state_global_materialized": False,
+        "apply_global_materialized": False,
+        "launches_per_chain": 1,
+    }
+
+
 def run_lkq_tile_chain(
     *,
     seed: int = 20260430,
@@ -324,12 +434,13 @@ def run_lkq_tile_chain(
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the CuTe LKQ tile chain probe")
 
-    print("Wave 6: CuTe LKQ/state chain with fused masked-apply tile")
+    print("Wave 7: CuTe LKQ/state chain with fused state/apply consumers")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"shape: chunk={CHUNK_SIZE} rank={RANK} fcs={FCS} N={N} P={P}")
     print(f"atol: {atol}")
     print(f"copy_strategy: scalar BF16 universal copies inherited from SingleGemmWGMMA")
-    print("fused_path: LKQ is R2S-spilled to swizzled smem only, no LKQ gmem output")
+    print("wave6_fused_path: LKQ is R2S-spilled to swizzled smem only, no LKQ gmem output")
+    print("wave7_fused_path: state/apply stay in swizzled smem, DV/DMIMO_V computed in-kernel")
 
     mask_bf16 = _future_mask_bf16()
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -349,12 +460,29 @@ def run_lkq_tile_chain(
         fused_warm,
         stream,
     )
+    warm_dv = torch.empty((CHUNK_SIZE, P), dtype=torch.float32, device="cuda")
+    warm_dmimo_v = torch.empty((RANK, P), dtype=torch.float32, device="cuda")
+    run_state_apply_consumers(
+        FCS,
+        RANK,
+        CHUNK_SIZE,
+        first.k.contiguous(),
+        first.q.contiguous(),
+        first.dstates.T.contiguous(),
+        first.dphi.T.contiguous(),
+        first.v.contiguous(),
+        first.mimo_v.contiguous(),
+        warm_dv,
+        warm_dmimo_v,
+        stream,
+    )
     torch.cuda.synchronize()
     compile_s = time.time() - t0
-    print(f"compile_plus_first_lkq_and_fused_apply_launch_s: {compile_s:.3f}")
+    print(f"compile_plus_first_lkq_fused_apply_and_consumer_launch_s: {compile_s:.3f}")
 
     scalar_cases: dict[str, Any] = {}
     fused_cases: dict[str, Any] = {}
+    fused_consumer_cases: dict[str, Any] = {}
     passed = True
     for case in _make_cases(seed):
         scalar_result = _run_case_scalar(case, mask_bf16, stream)
@@ -380,6 +508,19 @@ def run_lkq_tile_chain(
         print(f"  ref_row0[:4]:  {fused_result['ref_dpsi_row0']}")
         print(f"  ideal_dpsi_bf16_chain_delta={fused_result['ideal_dpsi_max_abs']:.6f}")
 
+        consumer_result = _run_case_fused_state_apply_consumers(case, mask_bf16, stream)
+        fused_consumer_cases[case.name] = consumer_result
+        consumer_pass = all(value <= atol for value in consumer_result["diffs"].values())
+        passed = passed and consumer_pass
+        print(f"Fused state/apply consumer case {case.name}: {'PASS' if consumer_pass else 'FAIL'}")
+        for name, value in consumer_result["diffs"].items():
+            print(f"  {name}: max_abs={value:.6f}")
+        print(f"  lkq_global_materialized: {consumer_result['lkq_global_materialized']}")
+        print(f"  state_global_materialized: {consumer_result['state_global_materialized']}")
+        print(f"  apply_global_materialized: {consumer_result['apply_global_materialized']}")
+        print(f"  dv_row0[:4]: {consumer_result['dv_row0']}")
+        print(f"  ref_dv_row0[:4]:  {consumer_result['ref_dv_row0']}")
+
     timings = None
     if bench_iters > 0:
         timing_case = _make_cases(seed)[-1]
@@ -396,9 +537,16 @@ def run_lkq_tile_chain(
             warmup=bench_warmup,
             iters=bench_iters,
         )
+        fused_consumer_timing = _time_chain_fused_state_apply_consumers(
+            timing_case,
+            stream,
+            warmup=bench_warmup,
+            iters=bench_iters,
+        )
         timings = {
             "scalar_copy": scalar_timing,
             "fused_masked_apply": fused_timing,
+            "fused_state_apply_consumers": fused_consumer_timing,
         }
         print(
             f"Scalar timing: {scalar_timing['chain_us']:.3f} us/chain "
@@ -409,22 +557,29 @@ def run_lkq_tile_chain(
             f"({bench_iters} iters, no LKQ gmem/torch mask)"
         )
         print(
+            f"Fused state/apply consumer timing: {fused_consumer_timing['chain_us']:.3f} us/chain "
+            f"({bench_iters} iters, no LKQ/state/apply gmem outputs)"
+        )
+        print(
             "Estimated tile throughput: "
             f"scalar={scalar_timing['estimated_tile_tflops']:.4f} TFLOP/s "
-            f"fused={fused_timing['estimated_tile_tflops']:.4f} TFLOP/s"
+            f"fused_apply={fused_timing['estimated_tile_tflops']:.4f} TFLOP/s "
+            f"fused_consumers={fused_consumer_timing['estimated_tile_tflops']:.4f} TFLOP/s"
         )
 
     print(f"{'PASS' if passed else 'FAIL'}: LKQ/state chain correctness")
     return {
         "passed": bool(passed),
         "atol": atol,
-        "compile_plus_first_lkq_and_fused_apply_launch_s": compile_s,
+        "compile_plus_first_lkq_fused_apply_and_consumer_launch_s": compile_s,
         "copy_strategy": "scalar_bf16_universal_g2s_s2g",
         "lkq_global_materialized_for_tested_fused_path": False,
+        "state_apply_global_materialized_for_fused_consumer_path": False,
         "fused_path_remaining_global": [
-            "state BF16 tile from scalar-copy CuTe GEMM",
-            "apply BF16 tile output from fused masked-apply kernel",
-            "dpsi/DV/DMIMO_V torch-side scalar correctness consumers",
+            "Wave6 path: state BF16 tile from scalar-copy CuTe GEMM",
+            "Wave6 path: apply BF16 tile output from fused masked-apply kernel",
+            "Wave7 path: DV and DMIMO_V final FP32 output tiles only",
+            "Harness input-layout tensors: DStates.T and DPh.T",
         ],
         "shape": {
             "chunk": CHUNK_SIZE,
@@ -435,6 +590,7 @@ def run_lkq_tile_chain(
         },
         "scalar_cases": scalar_cases,
         "fused_cases": fused_cases,
+        "fused_consumer_cases": fused_consumer_cases,
         "timings": timings,
     }
 

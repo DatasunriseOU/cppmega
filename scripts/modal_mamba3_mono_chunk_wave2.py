@@ -5,7 +5,7 @@ Modes:
     quack-kernels, then reports import viability.
   * ``cute-gemm`` runs the existing single-GEMM CuTe DSL WGMMA smoke on H200.
   * ``cute-lkq-chain`` runs the LKQ/state CuTe probe, including the Wave 6
-    fused masked-apply tile.
+    fused masked-apply tile and Wave 7 fused state/apply consumer path.
   * ``quack-gemm`` runs a minimal CuTe DSL WGMMA GEMM through quack-kernels.
   * ``wmma-smoke`` runs the CUDA WMMA fallback correctness and timing probe.
 """
@@ -25,7 +25,13 @@ GHCR_TAG = os.environ.get("GHCR_TAG", "785c3fd")
 GHCR_REF = f"{GHCR_REPO}:{GHCR_TAG}"
 GPU_SPEC = os.environ.get("CPPMEGA_MODAL_GPU", "H200")
 CPPMEGA_ROOT = "/opt/cppmega"
-APP_NAME = "cppmega-mamba3-mono-chunk-wave2-" + re.sub(r"[^0-9A-Za-z]+", "-", GPU_SPEC).lower()
+APP_SUFFIX = os.environ.get("CPPMEGA_MODAL_APP_SUFFIX", "wave7-lane-b")
+DEFAULT_APP_NAME = "cppmega-mamba3-mono-chunk-" + "-".join(
+    re.sub(r"[^0-9A-Za-z]+", "-", part).strip("-").lower()
+    for part in (APP_SUFFIX, GPU_SPEC)
+    if part
+)
+APP_NAME = os.environ.get("CPPMEGA_MODAL_APP_NAME", DEFAULT_APP_NAME)
 
 
 def _repo_overlay(image: modal.Image) -> modal.Image:
