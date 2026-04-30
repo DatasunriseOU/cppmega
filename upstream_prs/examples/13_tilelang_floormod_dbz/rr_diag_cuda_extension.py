@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -13,21 +14,59 @@ from torch.utils.cpp_extension import load
 _EXTENSION: Any | None = None
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, got {raw!r}") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be positive, got {value}")
+    return value
+
+
+def _env_flag(name: str, default: int) -> int:
+    value = int(os.environ.get(name, str(default)))
+    if value not in (0, 1):
+        raise RuntimeError(f"{name} must be 0 or 1, got {value}")
+    return value
+
+
+def _safe_suffix(value: str) -> str:
+    return re.sub(r"[^0-9A-Za-z_]+", "_", value)
+
+
 def _load_extension() -> Any:
     global _EXTENSION
     if _EXTENSION is not None:
         return _EXTENSION
 
     this_dir = Path(__file__).resolve().parent
+    threads = _env_int("RR_DIAG_THREADS", 256)
+    p_tile = _env_int("RR_DIAG_DMIMO_P_TILE", 32)
+    unroll = _env_int("RR_DIAG_DMIMO_UNROLL", 1)
+    broadcast_qk = _env_flag("RR_DIAG_DMIMO_BROADCAST_QK", 0)
+    if threads % 32 != 0:
+        raise RuntimeError(f"RR_DIAG_THREADS must be a warp multiple, got {threads}")
+    suffix = _safe_suffix(os.environ.get("RR_DIAG_CUDA_EXT_SUFFIX", ""))
+    name = f"rr_diag_cuda_ext_wave10_t{threads}_p{p_tile}_u{unroll}_b{broadcast_qk}"
+    if suffix:
+        name = f"{name}_{suffix}"
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "9.0")
     _EXTENSION = load(
-        name="rr_diag_cuda_ext_wave9",
+        name=name,
         sources=[str(this_dir / "rr_diag_cuda_kernel.cu")],
         extra_cuda_cflags=[
             "-O3",
             "--use_fast_math",
             "-lineinfo",
             "--ptxas-options=-v",
+            f"-DRR_DIAG_THREADS={threads}",
+            f"-DRR_DIAG_DMIMO_P_TILE={p_tile}",
+            f"-DRR_DIAG_DMIMO_UNROLL={unroll}",
+            f"-DRR_DIAG_DMIMO_BROADCAST_QK={broadcast_qk}",
         ],
         extra_cflags=["-O3"],
         verbose=bool(int(os.environ.get("RR_DIAG_CUDA_VERBOSE_BUILD", "0"))),

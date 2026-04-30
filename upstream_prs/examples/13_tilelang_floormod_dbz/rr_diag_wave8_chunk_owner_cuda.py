@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
@@ -71,6 +72,22 @@ COMPARISON_CONTEXT: dict[str, Any] = {
     "sidecar_dmimo_v_output_owner_all_r_productionish_ms": 0.53634,
     "sidecar_wave7_plus_dmimo_v_output_owner_all_r_projection_ms": 2.45093,
 }
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return int(raw)
+
+
+def _tuning_config() -> dict[str, int]:
+    return {
+        "threads_per_block": _env_int("RR_DIAG_THREADS", 256),
+        "dmimo_v_p_tile": _env_int("RR_DIAG_DMIMO_P_TILE", 32),
+        "dmimo_v_s_unroll": _env_int("RR_DIAG_DMIMO_UNROLL", 1),
+        "dmimo_v_broadcast_qk": _env_int("RR_DIAG_DMIMO_BROADCAST_QK", 0),
+    }
 
 
 def _max_diff_tensor(ref: torch.Tensor, got: torch.Tensor) -> float:
@@ -188,16 +205,19 @@ def combined_wave9_output_owner_cuda(
 
 
 def _cta_model(shape: Shape) -> dict[str, Any]:
+    tuning = _tuning_config()
+    p_tile = tuning["dmimo_v_p_tile"]
     chunk_ctas = shape.B * shape.H * shape.nchunks
     dmimo_sequence_ctas = shape.B * shape.H * shape.R
-    dmimo_output_owner_ctas = shape.B * shape.H * math.ceil(shape.P / 32)
+    dmimo_output_owner_ctas = shape.B * shape.H * math.ceil(shape.P / p_tile)
     wave8_total_ctas = chunk_ctas + dmimo_sequence_ctas
     wave9_total_ctas = chunk_ctas + dmimo_output_owner_ctas
     return {
+        "tuning": tuning,
         "chunk_owner_ctas": chunk_ctas,
         "dmimo_v_sequence_owner_ctas": dmimo_sequence_ctas,
         "dmimo_v_output_owner_all_r_ctas": dmimo_output_owner_ctas,
-        "dmimo_v_output_owner_p_tile": 32,
+        "dmimo_v_output_owner_p_tile": p_tile,
         "wave8_sequence_total_ctas": wave8_total_ctas,
         "wave9_output_owner_total_ctas": wave9_total_ctas,
         "wave8_sequence_total_ctas_per_sm_at_132_sms": wave8_total_ctas / 132.0,
@@ -448,6 +468,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 chunk_size=shape.chunk,
             )
 
+        def run_wave10_two_launch_output_owner() -> None:
+            run_wave7_combined()
+            run_qk_dmimo_v_output_owner()
+
         timings["wave6_chunk_warp_owner_diag_slice"] = timer(run_diag, warmup=args.warmup, iters=args.iters)
         timings["wave7_chunk_warp_qk_dv_consumer_slice"] = timer(
             run_qk_dv, warmup=args.warmup, iters=args.iters
@@ -466,6 +490,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         timings["wave9_output_owner_diag_plus_qk_dv_plus_dmimo_v_total_slice"] = timer(
             run_wave9_output_owner_combined, warmup=args.warmup, iters=args.iters
+        )
+        timings["wave10_two_launch_wave7_plus_output_owner_dmimo_v_total_slice"] = timer(
+            run_wave10_two_launch_output_owner, warmup=args.warmup, iters=args.iters
         )
     else:
         qk_dv_ref = qk_dv_torch_reference(inputs, shape)
@@ -491,6 +518,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     wave9_output_owner_ms = timings.get("wave9_output_owner_diag_plus_qk_dv_plus_dmimo_v_total_slice", {}).get(
         "mean_ms"
     )
+    wave10_two_launch_ms = timings.get("wave10_two_launch_wave7_plus_output_owner_dmimo_v_total_slice", {}).get(
+        "mean_ms"
+    )
     if (
         diag_ms
         and qk_dv_ms
@@ -509,6 +539,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         timings["wave9_output_owner_diag_plus_qk_dv_plus_dmimo_v_total_slice"][
             "delta_ms_vs_wave8_sequence_combined"
         ] = wave9_output_owner_ms - wave8_sequence_ms
+        if wave10_two_launch_ms:
+            timings["wave10_two_launch_wave7_plus_output_owner_dmimo_v_total_slice"][
+                "delta_ms_vs_wave9_one_launch_combined"
+            ] = wave10_two_launch_ms - wave9_output_owner_ms
+            timings["wave10_two_launch_wave7_plus_output_owner_dmimo_v_total_slice"][
+                "delta_ms_vs_wave7_plus_dmimo_component_sum"
+            ] = wave10_two_launch_ms - (wave7_ms + output_owner_dmimo_ms)
         timings["wave8_sequence_diag_plus_qk_dv_plus_dmimo_v_total_slice"]["component_sum_ms"] = (
             diag_ms + qk_dv_ms + sequence_dmimo_ms
         )
@@ -535,10 +572,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             timings["wave9_output_owner_diag_plus_qk_dv_plus_dmimo_v_total_slice"][
                 "margin_ms_vs_stage2_bf1_bb0_bwd_bwd_prod"
             ] = base - wave9_output_owner_ms
+            if wave10_two_launch_ms:
+                timings["wave10_two_launch_wave7_plus_output_owner_dmimo_v_total_slice"][
+                    "ratio_vs_stage2_bf1_bb0_bwd_bwd_prod"
+                ] = wave10_two_launch_ms / base
+                timings["wave10_two_launch_wave7_plus_output_owner_dmimo_v_total_slice"][
+                    "margin_ms_vs_stage2_bf1_bb0_bwd_bwd_prod"
+                ] = base - wave10_two_launch_ms
 
     return {
         "shape_name": args.shape or "custom",
         "shape": asdict(shape),
+        "tuning_config": _tuning_config(),
         "device": str(device),
         "dtype": args.dtype,
         "torch": torch.__version__,
@@ -549,9 +594,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "correctness": correctness,
         "timings": timings,
         "read": [
-            "Wave9 replaces the main combined DMIMO_V branch with the all-R output-owner mapping from the sidecar.",
+            "Wave10 keeps the all-R output-owner DMIMO_V branch and makes its p-tile/thread/unroll choices compile-time tunable.",
+            "The output-owner body hoists per-output mimo_o values; warp broadcast for gamma/qk is a compile-time sweep option.",
             "The old wave8 sequence-owner combined kernel remains available for direct timing comparison.",
-            "The new combined variant is still one CUDA launch: chunk-warp CTAs for wave7 outputs plus B,H,Ptile CTAs for all-R DMIMO_V tiles.",
+            "The one-launch combined variant is still chunk-warp CTAs for wave7 outputs plus B,H,Ptile CTAs for all-R DMIMO_V tiles.",
+            "A two-launch wave7-plus-DMIMO timing is included to expose register/occupancy costs from mixing CTA types in one kernel.",
             "The DMIMO_V slice covers the qk_dot same-time contribution; state/LKQ/D contributions are still outside this prototype.",
         ],
     }

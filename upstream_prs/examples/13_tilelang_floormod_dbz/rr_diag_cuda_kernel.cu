@@ -13,9 +13,29 @@ namespace {
 
 constexpr int kR = 4;
 constexpr int kChunk = 16;
-constexpr int kThreads = 128;
-constexpr int kPtile = 32;
+#ifndef RR_DIAG_THREADS
+#define RR_DIAG_THREADS 256
+#endif
+#ifndef RR_DIAG_DMIMO_P_TILE
+#define RR_DIAG_DMIMO_P_TILE 32
+#endif
+#ifndef RR_DIAG_DMIMO_UNROLL
+#define RR_DIAG_DMIMO_UNROLL 1
+#endif
+#ifndef RR_DIAG_DMIMO_BROADCAST_QK
+#define RR_DIAG_DMIMO_BROADCAST_QK 0
+#endif
+constexpr int kThreads = RR_DIAG_THREADS;
+constexpr int kWarps = kThreads / 32;
+constexpr int kPtile = RR_DIAG_DMIMO_P_TILE;
+constexpr int kDmimoUnroll = RR_DIAG_DMIMO_UNROLL;
+constexpr int kDmimoBroadcastQk = RR_DIAG_DMIMO_BROADCAST_QK;
 constexpr int kDqkElems = kR * kR;
+static_assert(kThreads > 0 && kThreads % 32 == 0, "RR_DIAG_THREADS must be a positive warp multiple");
+static_assert(kWarps > 0, "RR_DIAG_THREADS must provide at least one warp");
+static_assert(kPtile > 0, "RR_DIAG_DMIMO_P_TILE must be positive");
+static_assert(kDmimoUnroll > 0, "RR_DIAG_DMIMO_UNROLL must be positive");
+static_assert(kDmimoBroadcastQk == 0 || kDmimoBroadcastQk == 1, "RR_DIAG_DMIMO_BROADCAST_QK must be 0 or 1");
 
 template <typename scalar_t>
 __device__ __forceinline__ float load_as_float(const scalar_t* ptr, int64_t offset) {
@@ -474,7 +494,7 @@ __global__ void stage2_rr_diag_chunk_warp_owner_kernel(
   const int64_t bias_base = static_cast<int64_t>(h) * R * N;
 
 #pragma unroll
-  for (int batch = 0; batch < kChunk; batch += 4) {
+  for (int batch = 0; batch < kChunk; batch += kWarps) {
     const int local_cs = batch + warp;
     const int s = chunk_start + local_cs;
     if (local_cs >= kChunk || s >= S) {
@@ -603,7 +623,7 @@ __global__ void stage2_qk_dv_chunk_warp_owner_kernel(
   const int64_t mimo_base = static_cast<int64_t>(h) * R * P;
 
 #pragma unroll
-  for (int batch = 0; batch < kChunk; batch += 4) {
+  for (int batch = 0; batch < kChunk; batch += kWarps) {
     const int local_cs = batch + warp;
     const int s = chunk_start + local_cs;
     if (local_cs >= kChunk || s >= S) {
@@ -713,6 +733,7 @@ __device__ __forceinline__ void stage2_qk_dmimo_v_output_owner_rvec_body(
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int group = tid >> 5;
+  const unsigned full_mask = 0xffffffffu;
   if (pid >= total_programs || R != kR || blockDim.x != kThreads) {
     return;
   }
@@ -720,47 +741,90 @@ __device__ __forceinline__ void stage2_qk_dmimo_v_output_owner_rvec_body(
   const int ptile = static_cast<int>(pid % ptiles);
   const int h = static_cast<int>((pid / ptiles) % H);
   const int b = static_cast<int>(pid / (ptiles * static_cast<int64_t>(H)));
-  const int p = ptile * kPtile + lane;
+  const int tile_start = ptile * kPtile;
+  const int64_t mimo_base = static_cast<int64_t>(h) * R * P;
 
-  float acc[kR];
 #pragma unroll
-  for (int r = 0; r < kR; ++r) {
-    acc[r] = 0.0f;
-  }
+  for (int p_group = 0; p_group < kPtile; p_group += 32) {
+    const int p_rel = p_group + lane;
+    const int p = tile_start + p_rel;
+    const bool valid = b < B && p_rel < kPtile && p < P;
+    const unsigned active_mask = __ballot_sync(full_mask, valid);
 
-  if (b < B && p < P) {
-    const int64_t mimo_base = static_cast<int64_t>(h) * R * P;
-    for (int s = group; s < S; s += 4) {
-      const int64_t bhs = (static_cast<int64_t>(b) * H + h) * S + s;
-      const float gamma = dt[bhs] / (1.0f + __expf(-load_as_float(trap, bhs)));
-      const int64_t timestep_base = ((static_cast<int64_t>(b) * S + s) * H + h) * P + p;
-      const float base = load_as_float(dout, timestep_base) * load_as_float(v, timestep_base) * gamma;
-      const int64_t qk_base = bhs * kDqkElems;
+    float acc[kR];
+    float mimo_o_p[kR];
 #pragma unroll
-      for (int r_out = 0; r_out < kR; ++r_out) {
-        const float dphi = base * mimo_o[mimo_base + r_out * static_cast<int64_t>(P) + p];
+    for (int r = 0; r < kR; ++r) {
+      acc[r] = 0.0f;
+      mimo_o_p[r] = 0.0f;
+    }
+
+    if (valid) {
 #pragma unroll
-        for (int r_in = 0; r_in < kR; ++r_in) {
-          acc[r_in] += dphi * load_as_float(qk_dot, qk_base + r_out * kR + r_in);
+      for (int r = 0; r < kR; ++r) {
+        mimo_o_p[r] = mimo_o[mimo_base + r * static_cast<int64_t>(P) + p];
+      }
+
+      for (int s_base = group; s_base < S; s_base += kWarps * kDmimoUnroll) {
+#pragma unroll
+        for (int u = 0; u < kDmimoUnroll; ++u) {
+          const int s = s_base + u * kWarps;
+          if (s < S) {
+            const int64_t bhs = (static_cast<int64_t>(b) * H + h) * S + s;
+#if RR_DIAG_DMIMO_BROADCAST_QK
+            float gamma = 0.0f;
+            if (lane == 0) {
+              gamma = dt[bhs] / (1.0f + __expf(-load_as_float(trap, bhs)));
+            }
+            gamma = __shfl_sync(active_mask, gamma, 0);
+#else
+            const float gamma = dt[bhs] / (1.0f + __expf(-load_as_float(trap, bhs)));
+#endif
+
+            const int64_t timestep_base = ((static_cast<int64_t>(b) * S + s) * H + h) * P + p;
+            const float base =
+                load_as_float(dout, timestep_base) * load_as_float(v, timestep_base) * gamma;
+            const int64_t qk_base = bhs * kDqkElems;
+#pragma unroll
+            for (int r_out = 0; r_out < kR; ++r_out) {
+              const float dphi = base * mimo_o_p[r_out];
+#pragma unroll
+              for (int r_in = 0; r_in < kR; ++r_in) {
+#if RR_DIAG_DMIMO_BROADCAST_QK
+                float qk = 0.0f;
+                if (lane == 0) {
+                  qk = load_as_float(qk_dot, qk_base + r_out * kR + r_in);
+                }
+                qk = __shfl_sync(active_mask, qk, 0);
+#else
+                const float qk = load_as_float(qk_dot, qk_base + r_out * kR + r_in);
+#endif
+                acc[r_in] += dphi * qk;
+              }
+            }
+          }
         }
       }
     }
-  }
 
-#pragma unroll
-  for (int r = 0; r < kR; ++r) {
-    smem[r * kThreads + tid] = acc[r];
-  }
-  __syncthreads();
-
-  if (group == 0 && b < B && p < P) {
 #pragma unroll
     for (int r = 0; r < kR; ++r) {
-      const float total =
-          smem[r * kThreads + lane] + smem[r * kThreads + 32 + lane] +
-          smem[r * kThreads + 64 + lane] + smem[r * kThreads + 96 + lane];
-      dmimo_v_delta[((static_cast<int64_t>(b) * H + h) * R + r) * P + p] = total;
+      smem[r * kThreads + tid] = acc[r];
     }
+    __syncthreads();
+
+    if (group == 0 && valid) {
+#pragma unroll
+      for (int r = 0; r < kR; ++r) {
+        float total = 0.0f;
+#pragma unroll
+        for (int g = 0; g < kWarps; ++g) {
+          total += smem[r * kThreads + g * 32 + lane];
+        }
+        dmimo_v_delta[((static_cast<int64_t>(b) * H + h) * R + r) * P + p] = total;
+      }
+    }
+    __syncthreads();
   }
 }
 
@@ -850,7 +914,7 @@ __device__ __forceinline__ void stage2_rr_diag_qk_dv_chunk_warp_owner_body(
   const int64_t bias_base = static_cast<int64_t>(h) * R * N;
 
 #pragma unroll
-  for (int batch = 0; batch < kChunk; batch += 4) {
+  for (int batch = 0; batch < kChunk; batch += kWarps) {
     const int local_cs = batch + warp;
     const int s = chunk_start + local_cs;
     if (local_cs >= kChunk || s >= S) {
@@ -2435,8 +2499,8 @@ py::dict stage2_chunk_warp_owner_metadata_for_dtype() {
 
   py::dict out;
   out["threads_per_block"] = kThreads;
-  out["warps_per_block"] = kThreads / 32;
-  out["timesteps_per_warp_batch"] = kThreads / 32;
+  out["warps_per_block"] = kWarps;
+  out["timesteps_per_warp_batch"] = kWarps;
   out["chunk_size"] = kChunk;
   out["dynamic_smem_bytes"] = 0;
   out["num_regs"] = attrs.numRegs;
@@ -2471,8 +2535,8 @@ py::dict stage2_qk_dv_chunk_warp_owner_metadata_for_dtype() {
 
   py::dict out;
   out["threads_per_block"] = kThreads;
-  out["warps_per_block"] = kThreads / 32;
-  out["timesteps_per_warp_batch"] = kThreads / 32;
+  out["warps_per_block"] = kWarps;
+  out["timesteps_per_warp_batch"] = kWarps;
   out["chunk_size"] = kChunk;
   out["dynamic_smem_bytes"] = 0;
   out["num_regs"] = attrs.numRegs;
@@ -2543,6 +2607,9 @@ py::dict stage2_qk_dmimo_v_output_owner_rvec_metadata_for_dtype() {
   out["threads_per_block"] = kThreads;
   out["owner"] = "B,H,Ptile all-R";
   out["p_tile"] = kPtile;
+  out["s_unroll"] = kDmimoUnroll;
+  out["broadcast_qk"] = kDmimoBroadcastQk;
+  out["warps_per_block"] = kWarps;
   out["dynamic_smem_bytes"] = 0;
   out["num_regs"] = attrs.numRegs;
   out["static_smem_bytes"] = static_cast<int64_t>(attrs.sharedSizeBytes);
@@ -2576,8 +2643,8 @@ py::dict stage2_rr_diag_qk_dv_chunk_warp_owner_metadata_for_dtype() {
 
   py::dict out;
   out["threads_per_block"] = kThreads;
-  out["warps_per_block"] = kThreads / 32;
-  out["timesteps_per_warp_batch"] = kThreads / 32;
+  out["warps_per_block"] = kWarps;
+  out["timesteps_per_warp_batch"] = kWarps;
   out["chunk_size"] = kChunk;
   out["dynamic_smem_bytes"] = 0;
   out["num_regs"] = attrs.numRegs;
@@ -2612,8 +2679,8 @@ py::dict stage2_rr_diag_qk_dv_dmimo_v_sequence_owner_metadata_for_dtype() {
 
   py::dict out;
   out["threads_per_block"] = kThreads;
-  out["warps_per_block"] = kThreads / 32;
-  out["timesteps_per_warp_batch"] = kThreads / 32;
+  out["warps_per_block"] = kWarps;
+  out["timesteps_per_warp_batch"] = kWarps;
   out["chunk_size"] = kChunk;
   out["dmimo_v_owner"] = "B,H,R";
   out["dynamic_smem_bytes"] = 0;
@@ -2649,11 +2716,13 @@ py::dict stage2_rr_diag_qk_dv_dmimo_v_owner_metadata_for_dtype() {
 
   py::dict out;
   out["threads_per_block"] = kThreads;
-  out["warps_per_block"] = kThreads / 32;
-  out["timesteps_per_warp_batch"] = kThreads / 32;
+  out["warps_per_block"] = kWarps;
+  out["timesteps_per_warp_batch"] = kWarps;
   out["chunk_size"] = kChunk;
   out["dmimo_v_owner"] = "B,H,Ptile all-R";
   out["dmimo_v_p_tile"] = kPtile;
+  out["dmimo_v_s_unroll"] = kDmimoUnroll;
+  out["dmimo_v_broadcast_qk"] = kDmimoBroadcastQk;
   out["dynamic_smem_bytes"] = 0;
   out["num_regs"] = attrs.numRegs;
   out["static_smem_bytes"] = static_cast<int64_t>(attrs.sharedSizeBytes);
