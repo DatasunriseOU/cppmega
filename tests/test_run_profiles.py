@@ -89,6 +89,7 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert env["CPPMEGA_TRANSFORMER_ENGINE_SOURCE_ROOT"] == "/home/dave/TransformerEngine"
     assert env["CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE"] == "256"
     assert env["CPPMEGA_CCE_FUSE_MAIN_MTP_CE"] == "1"
+    assert env["CPPMEGA_CCE_FILTER_EPS"] == "none"
     assert env["CPPMEGA_DSA_FP8_ATTENTION"] == "0"
     assert "--moe-token-dispatcher-type alltoall" in env["NATIVE_ARGS"]
     assert env["CPPMEGA_OPTIMIZER"] == "muon"
@@ -179,6 +180,8 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
             "--noconv-mamba-chunk-size",
             "128",
             "--cce-fuse-main-mtp-ce",
+            "--cce-filter-eps",
+            "high",
             "--mxfp8-flashinfer-runner",
             "direct_tactic",
             "--mxfp8-flashinfer-tactic",
@@ -208,6 +211,7 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
     assert "export CPPMEGA_NSYS_DURATION=5" in out
     assert "export CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE=128" in out
     assert "export CPPMEGA_CCE_FUSE_MAIN_MTP_CE=1" in out
+    assert "export CPPMEGA_CCE_FILTER_EPS=high" in out
     assert "export CPPMEGA_FLASHINFER_MXFP8_RUNNER=direct_tactic" in out
     assert "export CPPMEGA_FLASHINFER_MXFP8_TACTIC=2" in out
     assert "--mtp-num-layers 1" in out
@@ -432,6 +436,14 @@ def test_noconv_mamba_chunk_size_rejects_non_power_of_two():
     profile.runtime.noconv_mamba_chunk_size = 192
 
     with pytest.raises(ValueError, match="positive power of two"):
+        profile_shell_assignments(profile)
+
+
+def test_cce_filter_eps_rejects_invalid_value():
+    profile = get_run_profile("local_gb10_quarter")
+    profile.runtime.cce_filter_eps = "not-a-filter"
+
+    with pytest.raises(ValueError, match="cce-filter-eps"):
         profile_shell_assignments(profile)
 
 

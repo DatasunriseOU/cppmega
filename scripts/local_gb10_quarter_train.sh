@@ -131,6 +131,7 @@ export CPPMEGA_CUDA_PROFILE_STEP_START="${CPPMEGA_CUDA_PROFILE_STEP_START:-3}"
 export CPPMEGA_CUDA_PROFILE_STEP_END="${CPPMEGA_CUDA_PROFILE_STEP_END:-4}"
 export CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE="${CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE:-alltoall}"
 export CPPMEGA_MOE_FLEX_DISPATCHER_BACKEND="${CPPMEGA_MOE_FLEX_DISPATCHER_BACKEND:-deepep}"
+export CPPMEGA_CCE_FILTER_EPS="${CPPMEGA_CCE_FILTER_EPS:-none}"
 if [[ "${CPPMEGA_MEMORY_DEBUG}" == "1" ]]; then
   export NANOCHAT_MEMORY_DEBUG="${NANOCHAT_MEMORY_DEBUG:-1}"
 fi
@@ -679,7 +680,7 @@ echo "[local-quarter] sparse_mla_fp8_quant=${CPPMEGA_SPARSE_MLA_FP8_QUANT} dsa_f
 echo "[local-quarter] attention_backend=${CPPMEGA_ATTN_BACKEND} use_flash_attn=${CPPMEGA_USE_FLASH_ATTN}"
 echo "[local-quarter] extra_pythonpath=${CPPMEGA_EXTRA_PYTHONPATH:-}"
 echo "[local-quarter] moe_dispatcher=${CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE} moe_flex_backend=${CPPMEGA_MOE_FLEX_DISPATCHER_BACKEND}"
-echo "[local-quarter] mtp_depths=${MTP_DEPTHS} mtp_ce_kernel=${CPPMEGA_MTP_CE_KERNEL}"
+echo "[local-quarter] mtp_depths=${MTP_DEPTHS} mtp_ce_kernel=${CPPMEGA_MTP_CE_KERNEL} cce_filter_eps=${CPPMEGA_CCE_FILTER_EPS}"
 echo "[local-quarter] optimizer=${CPPMEGA_OPTIMIZER} param_storage=${CPPMEGA_PARAM_STORAGE} muon_scalar=${CPPMEGA_MUON_SCALAR_OPTIMIZER} muon_ns_steps=${CPPMEGA_MUON_NUM_NS_STEPS}"
 echo "[local-quarter] no_master_emerging=${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER} no_master_fallback=${CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER} grad_reduce_bf16=${CPPMEGA_GRAD_REDUCE_IN_BF16}"
 echo "[local-quarter] dist_optimizer=${CPPMEGA_USE_DISTRIBUTED_OPTIMIZER} precision_aware=${CPPMEGA_USE_PRECISION_AWARE_OPTIMIZER}"
