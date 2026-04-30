@@ -30,6 +30,7 @@ Mxfp8CutlassScaleBackend = Literal["compact", "prepack", "swizzled"]
 Mxfp8FlashinferRunner = Literal["mm_mxfp8", "direct_tactic"]
 ParamStorage = Literal["auto", "bf16", "mxfp8"]
 MuonNsCarrier = Literal["bf16", "mxfp8_probe"]
+CceFilterEps = Literal["none", "auto", "high"]
 SparseMlaMode = Literal["tilelang", "gather_scatter", "pytorch"]
 MoeDispatcher = Literal["flex", "alltoall", "allgather"]
 MoeFlexBackend = Literal["deepep", "hybridep"]
@@ -214,6 +215,9 @@ class RuntimePatchProfile:
     # measured launch profiles can opt in when one CCE call beats separate
     # main + MTP-depth calls.
     cce_fuse_main_mtp_ce: bool = False
+    # Apple CCE's approximate block filtering knob. Keep it typed here so
+    # performance lanes can A/B exact vs approximate CE without ad hoc env.
+    cce_filter_eps: CceFilterEps | str = "none"
     acknowledge_liger_mtp_ce_deprecated: bool = False
     # Local source overrides that must be part of the typed launch contract.
     # The GB10 FA4/TE fixes are source-tree patches, not installed PyPI wheels;
@@ -362,6 +366,19 @@ def _validate_noconv_mamba_chunk_size(value: int) -> int:
     return value
 
 
+def _validate_cce_filter_eps(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in ("none", "auto", "high"):
+        return normalized
+    try:
+        parsed = float(normalized)
+    except ValueError as exc:
+        raise ValueError("--cce-filter-eps must be none|auto|high or a positive float") from exc
+    if parsed <= 0:
+        raise ValueError("--cce-filter-eps float must be positive")
+    return normalized
+
+
 def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProfile:
     """Fill the local GB10 NAM56R-quarter profile.
 
@@ -393,6 +410,7 @@ def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProf
     profile.runtime = RuntimePatchProfile(
         mtp_ce_kernel="cce",
         cce_fuse_main_mtp_ce=True,
+        cce_filter_eps="high",
         acknowledge_liger_mtp_ce_deprecated=False,
         noconv_mamba_chunk_size=256,
     )
@@ -562,6 +580,7 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         "CPPMEGA_STRUCTURE_COMPONENTS": profile.runtime.structure_components,
         "CPPMEGA_MTP_CE_KERNEL": profile.runtime.mtp_ce_kernel,
         "CPPMEGA_CCE_FUSE_MAIN_MTP_CE": _bool(profile.runtime.cce_fuse_main_mtp_ce),
+        "CPPMEGA_CCE_FILTER_EPS": profile.runtime.cce_filter_eps,
         "CPPMEGA_MEMORY_DEBUG": _bool(profile.profiling.memory_debug),
         "CPPMEGA_MEM_PROFILE": _bool(profile.profiling.mem_profile),
         "CPPMEGA_MEM_PROFILE_STEPS": str(profile.profiling.mem_profile_steps),
@@ -693,6 +712,8 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.runtime.acknowledge_liger_mtp_ce_deprecated = args.mtp_ce_kernel == "liger"
     if args.cce_fuse_main_mtp_ce is not None:
         profile.runtime.cce_fuse_main_mtp_ce = args.cce_fuse_main_mtp_ce
+    if args.cce_filter_eps is not None:
+        profile.runtime.cce_filter_eps = _validate_cce_filter_eps(args.cce_filter_eps)
     if args.noconv_mamba_chunk_size is not None:
         profile.runtime.noconv_mamba_chunk_size = _validate_noconv_mamba_chunk_size(
             args.noconv_mamba_chunk_size
@@ -876,6 +897,14 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         default=None,
         dest="cce_fuse_main_mtp_ce",
+    )
+    parser.add_argument(
+        "--cce-filter-eps",
+        default=None,
+        help=(
+            "Apple CCE filter_eps for exact/approximate CE A/B: none, auto, "
+            "high, or a positive float."
+        ),
     )
     parser.add_argument(
         "--noconv-mamba-chunk-size",

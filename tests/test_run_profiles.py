@@ -89,6 +89,7 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert env["CPPMEGA_TRANSFORMER_ENGINE_SOURCE_ROOT"] == "/home/dave/TransformerEngine"
     assert env["CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE"] == "256"
     assert env["CPPMEGA_CCE_FUSE_MAIN_MTP_CE"] == "1"
+    assert env["CPPMEGA_CCE_FILTER_EPS"] == "high"
     assert env["CPPMEGA_DSA_FP8_ATTENTION"] == "0"
     assert "--moe-token-dispatcher-type alltoall" in env["NATIVE_ARGS"]
     assert env["CPPMEGA_OPTIMIZER"] == "muon"
@@ -182,6 +183,8 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
             "--noconv-mamba-chunk-size",
             "128",
             "--cce-fuse-main-mtp-ce",
+            "--cce-filter-eps",
+            "high",
             "--mxfp8-flashinfer-runner",
             "direct_tactic",
             "--mxfp8-flashinfer-tactic",
@@ -217,6 +220,7 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
     assert "export CPPMEGA_NSYS_DURATION=5" in out
     assert "export CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE=128" in out
     assert "export CPPMEGA_CCE_FUSE_MAIN_MTP_CE=1" in out
+    assert "export CPPMEGA_CCE_FILTER_EPS=high" in out
     assert "export CPPMEGA_FLASHINFER_MXFP8_RUNNER=direct_tactic" in out
     assert "export CPPMEGA_FLASHINFER_MXFP8_TACTIC=2" in out
     assert "--mtp-num-layers 1" in out
@@ -345,6 +349,7 @@ def test_local_launcher_lets_native_args_own_moe_dispatcher_flag():
     assert "CPPMEGA_MUON_NUM_NS_STEPS:-3" in script
     assert "CPPMEGA_MUON_NS_CARRIER:-bf16" in script
     assert "CPPMEGA_MUON_DTYPE_AUDIT:-0" in script
+    assert "CPPMEGA_CCE_FILTER_EPS:-none" in script
     assert "install_muon_dtype_audit" in script
     assert "CPPMEGA_EXTRA_PYTHONPATH" in script
     assert "flash_attn import:" in script
