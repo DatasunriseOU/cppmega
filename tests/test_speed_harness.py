@@ -25,6 +25,7 @@ Theoretical memory footprints not yet supported for hybrid Mamba-Transformer mod
 [Rank 0] (after 1 iterations) memory (MB) | allocated: 1024.00 | max allocated: 2048.00 | reserved: 3072.00 | max reserved: 4096.00
  [2026-04-28 00:00:02] iteration        2/       3 | consumed samples:            4 | elapsed time per iteration (ms): {step2_ms:.1f} | learning rate: 1.000000E-04 | global batch size:     2 | lm loss: 2.000000E+00 | loss scale: 1.0 | grad norm: 1.0 | number of skipped iterations:   0 | number of nan iterations:   0 |
  [2026-04-28 00:00:03] iteration        3/       3 | consumed samples:            6 | elapsed time per iteration (ms): {step3_ms:.1f} | learning rate: 1.000000E-04 | global batch size:     2 | lm loss: {final_loss:.6E} | loss scale: 1.0 | grad norm: 1.0 | number of skipped iterations:   0 | number of nan iterations:   0 |
+[production_peak_mem] rank=0 device=0 peak_alloc_gib=3.250 peak_reserved_gib=4.500
  validation loss at iteration 3 on validation set | lm loss value: 1.250000E+00 |
  validation loss at iteration 3 on test set | lm loss value: 1.750000E+00 |
 """
@@ -74,6 +75,7 @@ def test_speed_comparison_reuses_profile_tokens_when_log_lacks_seq_length(tmp_pa
     assert report.runs[0].tokens_per_step == 2048
     assert report.runs[0].hot_step_avg_ms == 750.0
     assert report.runs[0].tok_per_sec == pytest.approx(2730.667, abs=0.001)
+    assert report.runs[0].max_alloc_gib == 3.25
     assert report.deltas_vs_baseline["candidate"].tok_per_sec_pct == pytest.approx(50.0)
     assert report.runs[1].nsys.status == "ok"
     assert report.runs[1].nsys.top_kernels[0].name == "_cce_backward_kernel"
