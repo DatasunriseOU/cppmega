@@ -351,6 +351,7 @@ path = pathlib.Path(next(iter(spec.submodule_search_locations))) / "mamba3_mimo_
 text = path.read_text()
 print(json.dumps({
     "path": str(path),
+    "gqa_bwd": "elif H % G == 0:" in text and "G must divide H" in text,
     "flat_q": "Q: T.Tensor([B, S * R, G, N], dtype)" in text,
     "flat_qk": "QK_DOT: T.Tensor([B, H, S, R * R], dtype)" in text,
     "bf_num_stages_1": "bf_num_stages=1" in text,
@@ -384,6 +385,34 @@ def _applier(action: str, env: dict[str, str]) -> dict[str, Any]:
         raise ValueError(action)
     proc = _run_capture(
         [sys.executable, "-m", "cppmega.megatron.upstream_patches.apply_mamba3_stage2_force_nontma_patches"],
+        applier_env,
+    )
+    return {
+        "action": action,
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "kernel": _kernel_status(env),
+    }
+
+
+def _gqa_applier(action: str, env: dict[str, str]) -> dict[str, Any]:
+    applier_env = env.copy()
+    if action == "noop":
+        applier_env.pop("CPPMEGA_MAMBA3_GQA_BWD", None)
+        applier_env.pop("MAMBA3_GQA_BWD_ALLOW_FILE_MUTATION", None)
+        applier_env.pop("CPPMEGA_MAMBA3_GQA_BWD_ROLLBACK", None)
+    elif action == "apply":
+        applier_env["CPPMEGA_MAMBA3_GQA_BWD"] = "1"
+        applier_env["MAMBA3_GQA_BWD_ALLOW_FILE_MUTATION"] = "1"
+        applier_env.pop("CPPMEGA_MAMBA3_GQA_BWD_ROLLBACK", None)
+    elif action == "rollback":
+        applier_env["CPPMEGA_MAMBA3_GQA_BWD_ROLLBACK"] = "1"
+        applier_env.pop("CPPMEGA_MAMBA3_GQA_BWD", None)
+    else:
+        raise ValueError(action)
+    proc = _run_capture(
+        [sys.executable, "-m", "cppmega.megatron.upstream_patches.apply_mamba3_gqa_bwd_patches"],
         applier_env,
     )
     return {
@@ -812,6 +841,10 @@ def preflight(run_id: str = "") -> dict[str, Any]:
     env = _base_env()
     gpu_names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
     noop = _applier("noop", env)
+    gqa_noop = _gqa_applier("noop", env)
+    gqa_rollback = _gqa_applier("rollback", env)
+    gqa_apply = _gqa_applier("apply", env)
+    gqa_final_rollback = _gqa_applier("rollback", env)
     rollback = _applier("rollback", env)
     apply = _applier("apply", env)
     final_rollback = _applier("rollback", env)
@@ -826,6 +859,10 @@ def preflight(run_id: str = "") -> dict[str, Any]:
         "transformer_engine": transformer_engine.__version__,
         "tilelang": getattr(tilelang, "__version__", None),
         "tilelang_file": getattr(tilelang, "__file__", None),
+        "gqa_applier_noop": gqa_noop,
+        "gqa_applier_pre_rollback": gqa_rollback,
+        "gqa_applier_apply": gqa_apply,
+        "gqa_applier_final_rollback": gqa_final_rollback,
         "applier_noop": noop,
         "applier_pre_rollback": rollback,
         "applier_apply": apply,
@@ -885,8 +922,14 @@ def gate(
     }
 
     noop = _applier("noop", env)
+    gqa_noop = _gqa_applier("noop", env)
+    gqa_pre_rollback = _gqa_applier("rollback", env)
+    gqa_apply = _gqa_applier("apply", env)
     pre_rollback = _applier("rollback", env)
     result["applier_noop"] = noop
+    result["gqa_applier_noop"] = gqa_noop
+    result["gqa_applier_pre_rollback"] = gqa_pre_rollback
+    result["gqa_applier_apply"] = gqa_apply
     result["applier_pre_rollback"] = pre_rollback
 
     try:
@@ -918,6 +961,7 @@ def gate(
                 break
     finally:
         result["applier_final_rollback"] = _applier("rollback", env)
+        result["gqa_applier_final_rollback"] = _gqa_applier("rollback", env)
         result["final_kernel"] = _kernel_status(env)
         _write_summary(out_dir, result)
         results_vol.commit()
@@ -971,6 +1015,9 @@ def debug_sweep(
     }
 
     result["applier_noop"] = _applier("noop", env)
+    result["gqa_applier_noop"] = _gqa_applier("noop", env)
+    result["gqa_applier_pre_rollback"] = _gqa_applier("rollback", env)
+    result["gqa_applier_apply"] = _gqa_applier("apply", env)
     result["applier_pre_rollback"] = _applier("rollback", env)
 
     try:
@@ -1019,6 +1066,7 @@ def debug_sweep(
                     break
     finally:
         result["applier_final_rollback"] = _applier("rollback", env)
+        result["gqa_applier_final_rollback"] = _gqa_applier("rollback", env)
         result["final_kernel"] = _kernel_status(env)
         _write_summary(out_dir, result)
         results_vol.commit()
