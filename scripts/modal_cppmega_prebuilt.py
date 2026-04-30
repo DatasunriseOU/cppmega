@@ -50,7 +50,9 @@ def smoke() -> dict:
     import torch
     import transformer_engine
     import transformer_engine.pytorch  # noqa: F401
-    import flash_attn  # noqa: F401
+    import flash_attn
+    import flash_attn.cute  # noqa: F401  -- FA4 cute python module
+    import flash_attn_3
     import mamba_ssm  # noqa: F401
     import causal_conv1d  # noqa: F401
     import fast_hadamard_transform  # noqa: F401
@@ -69,6 +71,8 @@ def smoke() -> dict:
         "tilelang": getattr(tilelang, "__version__", None),
         "tilelang_file": getattr(tilelang, "__file__", None),
         "cutlass": getattr(cutlass, "__version__", None),
+        "flash_attn": getattr(flash_attn, "__version__", None),
+        "flash_attn_3": getattr(flash_attn_3, "__version__", None),
         "device_count": torch.cuda.device_count(),
         "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "image_ref": GHCR_REF,

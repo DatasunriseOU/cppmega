@@ -86,15 +86,20 @@ ENV CUDA_HOME=/usr/local/cuda \
     PYTHONPATH=/opt/megatron-lm:/opt/cppmega
 
 # Smoke-import to fail fast on ABI mismatches at build time.
+# Note: flash_attn ships FA2 (kernels) + FA4 (flash_attn.cute python module);
+# flash_attn_3 is the separate FA3 hopper package. Both co-install fine.
 RUN python -c "\
 import torch; print('torch', torch.__version__); \
 import transformer_engine; print('te', transformer_engine.__version__); \
 import transformer_engine.pytorch; \
-import flash_attn, mamba_ssm, causal_conv1d, fast_hadamard_transform, tilelang, qoptim_cuda; \
+import flash_attn; import flash_attn.cute; \
+import flash_attn_3; \
+import mamba_ssm, causal_conv1d, fast_hadamard_transform, tilelang, qoptim_cuda; \
 import cutlass; import cutlass.cute as cute; \
 from cutlass.utils import LayoutEnum, SmemAllocator; \
 import quack; from quack import sm90_utils, copy_utils, layout_utils, mx_utils; \
-print('OK — cutlass', cutlass.__version__ if hasattr(cutlass,'__version__') else '(no __version__)')"
+print('OK — cutlass', cutlass.__version__ if hasattr(cutlass,'__version__') else '(no __version__)', \
+      'fa', flash_attn.__version__, 'fa3', flash_attn_3.__version__ if hasattr(flash_attn_3,'__version__') else '(no __version__)')"
 
 WORKDIR /workspace
 CMD ["python"]

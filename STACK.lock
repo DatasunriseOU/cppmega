@@ -24,16 +24,31 @@ wheels:
       - transformer_engine-*.whl
 
   flash_attn:
-    repo: Dao-AILab/flash-attention
-    ref: v2.8.3
-    version: 2.8.3
-    patches:
-      - upstream_prs/flash_attn_setup_sm120f.patch
+    # Our fork @ cppmega/fa4-gb10-fixes = upstream b86e0cc + 3 cute python
+    # patches (sm_120 score_mod, sm_121a Arch fix, dQ_single_wg gating).
+    # Ships FA2 cuda kernels + FA4 (flash_attn.cute) python module in one wheel.
+    repo: jewelmusicee/flash-attention
+    ref: cppmega/fa4-gb10-fixes
+    version: 2.x.x+cppmega-fa4-gb10
     build: |
       MAX_JOBS=1 NVCC_THREADS=2 \
         pip wheel . --no-build-isolation -w /wheels
     produces:
       - flash_attn-*.whl
+
+  flash_attn_3:
+    # FA3 (Hopper) from hopper/ subdir of the same fork. PACKAGE_NAME=flash_attn_3
+    # so it co-installs with flash_attn (FA2/FA4) without conflict. For H100/H200
+    # on Modal — useless for B200/GB10 but ships for code parity.
+    repo: jewelmusicee/flash-attention
+    ref: cppmega/fa4-gb10-fixes
+    version: 3.x
+    subdir: hopper
+    build: |
+      MAX_JOBS=1 NVCC_THREADS=2 FLASH_ATTENTION_FORCE_BUILD=TRUE \
+        pip wheel . --no-build-isolation -w /wheels
+    produces:
+      - flash_attn_3-*.whl
 
   mamba_ssm:
     repo: state-spaces/mamba

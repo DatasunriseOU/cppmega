@@ -73,11 +73,23 @@ jobs:
             # nothing useful in the logs. TE has 100s of .cu files * 3 archs.
             extra_env: "NVTE_FRAMEWORK=pytorch MAX_JOBS=1 NVCC_THREADS=2"
           - name: flash_attn
-            repo: Dao-AILab/flash-attention
-            ref: v2.8.3
+            # Our fork carries the cppmega/fa4-gb10-fixes branch on top of
+            # upstream b86e0cc — sm_120 score_mod, sm_121a Arch fix in
+            # FlashAttentionForwardSm120.__init__, dQ_single_wg gating.
+            # Builds the FA2 cuda kernels + FA4 cute python module in one wheel.
+            repo: jewelmusicee/flash-attention
+            ref: cppmega/fa4-gb10-fixes
             submodules: "false"
-            patch: upstream_prs/flash_attn_setup_sm120f.patch
             extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
+          - name: flash_attn_3
+            # Hopper FA3 path from the same fork (subdir hopper/), separate
+            # PACKAGE_NAME=flash_attn_3 so it co-installs with flash_attn FA2/FA4.
+            # Useful for H100/H200 on Modal. Compiled for sm_90 only by default.
+            repo: jewelmusicee/flash-attention
+            ref: cppmega/fa4-gb10-fixes
+            submodules: "false"
+            subdir: hopper
+            extra_env: "MAX_JOBS=1 NVCC_THREADS=2 FLASH_ATTENTION_FORCE_BUILD=TRUE"
           - name: mamba_ssm
             repo: state-spaces/mamba
             ref: 31f3d7b
