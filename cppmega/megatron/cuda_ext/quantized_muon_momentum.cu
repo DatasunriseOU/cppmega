@@ -8,6 +8,7 @@
 #include <torch/extension.h>
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -220,8 +221,10 @@ __global__ __launch_bounds__(32, 8) void qmuon_emit_mxfp8_carrier_kernel(
     int64_t cols,
     int64_t scale_ld,
     int64_t n) {
-  const int64_t row = static_cast<int64_t>(blockIdx.y);
-  const int64_t k_block = static_cast<int64_t>(blockIdx.x);
+  const int64_t blocks_per_row = cols / 32;
+  const int64_t linear_block = static_cast<int64_t>(blockIdx.x);
+  const int64_t row = linear_block / blocks_per_row;
+  const int64_t k_block = linear_block - row * blocks_per_row;
   const int lane = threadIdx.x;
   const int64_t col = k_block * 32 + lane;
   const bool valid = row < rows && col < cols;
@@ -564,7 +567,11 @@ void launch_emit_mxfp8_carrier(
     cudaStream_t stream) {
   const int64_t rows = rowwise_data.size(0);
   const int64_t cols = rowwise_data.size(1);
-  const dim3 grid(static_cast<unsigned int>(cols / 32), static_cast<unsigned int>(rows));
+  const int64_t total_blocks = rows * (cols / 32);
+  TORCH_CHECK(
+      total_blocks <= static_cast<int64_t>(std::numeric_limits<unsigned int>::max()),
+      "MXFP8 carrier emit grid is too large: rows=", rows, " cols=", cols);
+  const dim3 grid(static_cast<unsigned int>(total_blocks));
   qmuon_emit_mxfp8_carrier_kernel<QT, UnsignedStorage><<<grid, 32, 0, stream>>>(
       reinterpret_cast<const QT*>(q.data_ptr()),
       absmax.data_ptr<float>(),
