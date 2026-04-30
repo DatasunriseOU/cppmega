@@ -4,10 +4,11 @@ Runs only H100 component shapes. The script compares:
 
 * installed baseline mamba_ssm TileLang source
 * current guarded stage2 force-nonTMA patch, bf=1,bb=0
-* Lane C direct-fragment candidate on top of that patch
+* Lane C shared-reuse candidate on top of that patch
 
-The candidate removes two bwd_bwd shared-memory vector temporaries by copying
-the non-TMA vector loads directly into fragments.
+The candidate keeps the bwd_bwd shared vectors because they are reused later,
+but removes two first-use fragment stages by reading those shared vectors
+directly at the first consumer.
 """
 # ruff: noqa: E402
 
@@ -70,18 +71,34 @@ from mamba_ssm.ops.triton.mamba3.mamba3_mimo_utils import compute_dacs_segsum_tr
 
 PATCH_PATH = pathlib.Path("/opt/cppmega/upstream_prs/examples/13_tilelang_floormod_dbz/mamba3_bwd_stage2_force_nontma.patch")
 
-DIRECT_FRAGMENT_REPLACEMENTS = [
+SHARED_REUSE_REPLACEMENTS = [
     (
+        "                dA_cs_rev_frag = T.alloc_fragment([chunk_size], T.float32)\n"
         "                dA_cs_rev_shared = T.alloc_shared([chunk_size], T.float32)\n"
         "                T.copy(DA_CS_REV[i_b, i_h, chunk_start:chunk_start+chunk_size], dA_cs_rev_shared, disable_tma=True)\n"
         "                T.copy(dA_cs_rev_shared, dA_cs_rev_frag)\n",
-        "                T.copy(DA_CS_REV[i_b, i_h, chunk_start:chunk_start+chunk_size], dA_cs_rev_frag, disable_tma=True)\n",
+        "                dA_cs_rev_shared = T.alloc_shared([chunk_size], T.float32)\n"
+        "                T.copy(DA_CS_REV[i_b, i_h, chunk_start:chunk_start+chunk_size], dA_cs_rev_shared, disable_tma=True)\n",
+    ),
+    (
+        "                    dPsiV_frag[csr, p] *= T.exp(dA_cs_rev_frag[csr//R])\n",
+        "                    dPsiV_frag[csr, p] *= T.exp(dA_cs_rev_shared[csr//R])\n",
+    ),
+    (
+        "                dA_cs_dq_frag = T.alloc_fragment([chunk_size], T.float32)\n"
+        "                dA_cs_shared = T.alloc_shared([chunk_size], T.float32)\n",
+        "                dA_cs_shared = T.alloc_shared([chunk_size], T.float32)\n",
     ),
     (
         "                dA_cs_shared = T.alloc_shared([chunk_size], T.float32)\n\n"
         "                T.copy(DA_CS[i_b, i_h, chunk_start:chunk_start+chunk_size], dA_cs_shared, disable_tma=True)\n"
         "                T.copy(dA_cs_shared, dA_cs_dq_frag)\n",
-        "                T.copy(DA_CS[i_b, i_h, chunk_start:chunk_start+chunk_size], dA_cs_dq_frag, disable_tma=True)\n",
+        "                dA_cs_shared = T.alloc_shared([chunk_size], T.float32)\n\n"
+        "                T.copy(DA_CS[i_b, i_h, chunk_start:chunk_start+chunk_size], dA_cs_shared, disable_tma=True)\n",
+    ),
+    (
+        "                    dq_frag[csr, n] *= T.exp(dA_cs_dq_frag[csr//R])\n",
+        "                    dq_frag[csr, n] *= T.exp(dA_cs_shared[csr//R])\n",
     ),
 ]
 
@@ -119,9 +136,9 @@ def _make_variant(src, name, workdir):
         shutil.copy2(src, dst)
     else:
         _apply_stage2_patch(src, dst)
-        if name == "lane_c_direct_frag":
+        if name == "lane_c_shared_reuse":
             text = dst.read_text()
-            for old, new in DIRECT_FRAGMENT_REPLACEMENTS:
+            for old, new in SHARED_REUSE_REPLACEMENTS:
                 if old not in text:
                     raise RuntimeError(f"replacement marker missing for {name}")
                 text = text.replace(old, new)
@@ -287,7 +304,7 @@ def main():
     workdir = pathlib.Path(tempfile.mkdtemp(prefix="wave28_lane_c_h100_"))
     variant_paths = {
         name: _make_variant(installed, name, workdir)
-        for name in ("baseline", "stage2_current", "lane_c_direct_frag")
+        for name in ("baseline", "stage2_current", "lane_c_shared_reuse")
     }
     modules = {name: _load_module(path, name) for name, path in variant_paths.items()}
     shapes = [
@@ -308,7 +325,7 @@ def main():
             "path": str(path),
             "bf_num_stages_1": "bf_num_stages=1" in text,
             "bb_num_stages_0": "bb_num_stages=0" in text,
-            "direct_fragment_candidate": name == "lane_c_direct_frag",
+            "shared_reuse_candidate": name == "lane_c_shared_reuse",
             "disable_tma_count": text.count("disable_tma=True"),
             "shared_vector_staging_count": text.count("dA_cs_rev_shared") + text.count("dA_cs_shared"),
         }
@@ -316,14 +333,14 @@ def main():
         shape_result = {"shape": shape, "bench": {}, "diffs": {}}
         args = _inputs(shape)
         outputs = {}
-        for name in ("baseline", "stage2_current", "lane_c_direct_frag"):
+        for name in ("baseline", "stage2_current", "lane_c_shared_reuse"):
             outputs[name] = _run_combined(modules[name], args)
             torch.cuda.synchronize()
         shape_result["diffs"]["stage2_current_vs_baseline"] = _diff(outputs["baseline"], outputs["stage2_current"])
-        shape_result["diffs"]["lane_c_vs_stage2_current"] = _diff(outputs["stage2_current"], outputs["lane_c_direct_frag"])
+        shape_result["diffs"]["lane_c_vs_stage2_current"] = _diff(outputs["stage2_current"], outputs["lane_c_shared_reuse"])
         del outputs
         torch.cuda.empty_cache()
-        for name in ("baseline", "stage2_current", "lane_c_direct_frag"):
+        for name in ("baseline", "stage2_current", "lane_c_shared_reuse"):
             args = _inputs(shape)
             chain = _bench_combined(modules[name], args, warmup=2, iters=8)
             split = _bench_split(modules[name], args, warmup=2, iters=8)
