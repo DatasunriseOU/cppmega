@@ -17,7 +17,7 @@ The multi-chunk tile extends that path into a reverse scan owner.  It carries
 WGMMA B operand for the next chunk's ``K @ DStates`` product.  It also includes
 the same-time qk diagonal contribution to the scalar ``dpsi`` consumers:
 
-  carry_t += dPhi.T @ Q
+  carry_t = exp(dA_cs_last) * carry_t + (dPhi * exp(dA_cs)).T @ Q
 """
 
 from __future__ import annotations
@@ -311,6 +311,57 @@ def run_state_apply_consumers(
 class MultiChunkStateApplyConsumersWGMMA(StateApplyConsumersWGMMA):
     """One-CTA reverse scan-owner prototype for a fixed small chunk count."""
 
+    @cute.jit
+    def _apply_future_mask_scaled(
+        self,
+        acc_lkq: cute.Tensor,
+        coord_lkq: cute.Tensor,
+        gSegsum: cute.Tensor,
+    ) -> None:
+        for i in cutlass.range(cute.size(coord_lkq), unroll_full=True):
+            row_t = coord_lkq[i][0] // self.rank
+            col_t = coord_lkq[i][1] // self.rank
+            if row_t < col_t:
+                acc_lkq[i] = acc_lkq[i] * cute.exp(Float32(gSegsum[col_t, row_t]))
+            else:
+                acc_lkq[i] = 0.0
+
+    @cute.jit
+    def _scale_acc_rows_by_exp(
+        self,
+        acc: cute.Tensor,
+        coord: cute.Tensor,
+        gScale: cute.Tensor,
+    ) -> None:
+        for i in cutlass.range(cute.size(coord), unroll_full=True):
+            row_t = coord[i][0] // self.rank
+            acc[i] = acc[i] * cute.exp(Float32(gScale[row_t]))
+
+    @cute.jit
+    def _scale_acc_by_scalar(self, acc: cute.Tensor, scale: Float32) -> None:
+        for i in cutlass.range(cute.size(acc), unroll_full=True):
+            acc[i] = acc[i] * scale
+
+    @cute.jit
+    def _fill_scaled_dphi_t(
+        self,
+        gDPhT: cute.Tensor,
+        gDACS: cute.Tensor,
+        sDPhScaledT: cute.Tensor,
+        tidx: cutlass.Int32,
+    ) -> None:
+        dim = self.dim
+        rank = self.rank
+        for tile in cutlass.range_constexpr(32):
+            linear = tile * self.num_threads + tidx
+            p = linear // dim
+            f = linear - p * dim
+            t = f // rank
+            scale = cute.exp(Float32(gDACS[t]))
+            sDPhScaledT[p, f] = sDPhScaledT.element_type(
+                Float32(gDPhT[p, f]) * scale
+            )
+
     @cute.kernel
     def kernel(
         self,
@@ -318,6 +369,9 @@ class MultiChunkStateApplyConsumersWGMMA(StateApplyConsumersWGMMA):
         gQ: cute.Tensor,
         gQT: cute.Tensor,
         gDPhT: cute.Tensor,
+        gDACS: cute.Tensor,
+        gDACSRev: cute.Tensor,
+        gSegsum: cute.Tensor,
         gQKDot: cute.Tensor,
         gGamma: cute.Tensor,
         gV: cute.Tensor,
@@ -337,6 +391,9 @@ class MultiChunkStateApplyConsumersWGMMA(StateApplyConsumersWGMMA):
         gQ_all = gQ[None, None, None]
         gQT_all = gQT[None, None, None]
         gDPhT_all = gDPhT[None, None, None]
+        gDACS_all = gDACS[None, None]
+        gDACSRev_all = gDACSRev[None, None]
+        gSegsum_all = gSegsum[None, None, None]
         gQKDot_all = gQKDot[None, None, None, None]
         gGamma_all = gGamma[None, None]
         gV_all = gV[None, None, None]
@@ -348,6 +405,7 @@ class MultiChunkStateApplyConsumersWGMMA(StateApplyConsumersWGMMA):
         sQ = smem.allocate_tensor(self.dtype, s_layout.outer, swizzle=s_layout.inner)
         sQT = smem.allocate_tensor(self.dtype, s_layout.outer, swizzle=s_layout.inner)
         sDPhT = smem.allocate_tensor(self.dtype, s_layout.outer, swizzle=s_layout.inner)
+        sDPhScaledT = smem.allocate_tensor(self.dtype, s_layout.outer, swizzle=s_layout.inner)
         sCarryT = smem.allocate_tensor(self.dtype, s_layout.outer, swizzle=s_layout.inner)
 
         # After producer operands are consumed:
@@ -383,6 +441,9 @@ class MultiChunkStateApplyConsumersWGMMA(StateApplyConsumersWGMMA):
             gQ_c = gQ_all[chunk_idx, None, None]
             gQT_c = gQT_all[chunk_idx, None, None]
             gDPhT_c = gDPhT_all[chunk_idx, None, None]
+            gDACS_c = gDACS_all[chunk_idx, None]
+            gDACSRev_c = gDACSRev_all[chunk_idx, None]
+            gSegsum_c = gSegsum_all[chunk_idx, None, None]
             gQKDot_c = gQKDot_all[chunk_idx, None, None, None]
             gGamma_c = gGamma_all[chunk_idx, None]
 
@@ -390,6 +451,9 @@ class MultiChunkStateApplyConsumersWGMMA(StateApplyConsumersWGMMA):
             cute.copy(copy_g2s, thr_g2s.partition_S(gQ_c), thr_g2s.partition_D(sQ))
             cute.copy(copy_g2s, thr_g2s.partition_S(gQT_c), thr_g2s.partition_D(sQT))
             cute.copy(copy_g2s, thr_g2s.partition_S(gDPhT_c), thr_g2s.partition_D(sDPhT))
+            arch.sync_threads()
+
+            self._fill_scaled_dphi_t(gDPhT_c, gDACS_c, sDPhScaledT, tidx)
             arch.sync_threads()
 
             self._spill_acc_bf16(tiled_mma, acc_carry_t, sCarryT, tidx, True)
@@ -402,6 +466,8 @@ class MultiChunkStateApplyConsumersWGMMA(StateApplyConsumersWGMMA):
             )
             acc_state = cute.make_rmem_tensor(wg_mma.partition_shape_C((dim, dim)), Float32)
             sm90_utils.gemm(tiled_mma, acc_state, tA_state, tB_state, zero_init=True, wg_wait=0)
+            coord_state = wg_mma.partition_C(cute.make_identity_tensor((dim, dim)))
+            self._scale_acc_rows_by_exp(acc_state, coord_state, gDACSRev_c)
 
             # GEMM2: LKQ = K @ Q.T, masked before BF16 shared-memory spill.
             _, tA_lkq, tB_lkq = sm90_utils.partition_fragment_ABC(
@@ -411,7 +477,7 @@ class MultiChunkStateApplyConsumersWGMMA(StateApplyConsumersWGMMA):
             sm90_utils.gemm(tiled_mma, acc_lkq, tA_lkq, tB_lkq, zero_init=True, wg_wait=0)
 
             coord_lkq = wg_mma.partition_C(cute.make_identity_tensor((dim, dim)))
-            self._apply_future_mask(acc_lkq, coord_lkq)
+            self._apply_future_mask_scaled(acc_lkq, coord_lkq, gSegsum_c)
 
             self._spill_acc_bf16(tiled_mma, acc_state, sState, tidx, True)
             self._spill_acc_bf16(tiled_mma, acc_lkq, sLKQ, tidx, True)
@@ -473,11 +539,13 @@ class MultiChunkStateApplyConsumersWGMMA(StateApplyConsumersWGMMA):
             arch.sync_threads()
 
             # Loop-carried update for the next older chunk:
-            # carry_t += dPhi.T @ Q.  Q_T is a harness-side transpose used to
-            # keep the B operand K-major and avoid the MN-major smem descriptor
-            # issue already hit in the wider P4 prototype.
+            # carry_t = exp(dA_cs_last) * carry_t + (dPhi * exp(dA_cs)).T @ Q.
+            # Q_T is a harness-side transpose used to keep the B operand K-major
+            # and avoid the MN-major smem descriptor issue already hit in P4.
+            carry_decay = cute.exp(Float32(gDACS_c[chunk_size - 1]))
+            self._scale_acc_by_scalar(acc_carry_t, carry_decay)
             _, tA_carry, tB_carry = sm90_utils.partition_fragment_ABC(
-                wg_mma, shape_mnk, sDPhT, sQT
+                wg_mma, shape_mnk, sDPhScaledT, sQT
             )
             sm90_utils.gemm(
                 tiled_mma,
@@ -496,6 +564,9 @@ class MultiChunkStateApplyConsumersWGMMA(StateApplyConsumersWGMMA):
         mQ: cute.Tensor,
         mQT: cute.Tensor,
         mDPhT: cute.Tensor,
+        mDACS: cute.Tensor,
+        mDACSRev: cute.Tensor,
+        mSegsum: cute.Tensor,
         mQKDot: cute.Tensor,
         mGamma: cute.Tensor,
         mV: cute.Tensor,
@@ -532,6 +603,9 @@ class MultiChunkStateApplyConsumersWGMMA(StateApplyConsumersWGMMA):
             mQ,
             mQT,
             mDPhT,
+            mDACS,
+            mDACSRev,
+            mSegsum,
             mQKDot,
             mGamma,
             mV,
@@ -556,6 +630,9 @@ def run_multi_chunk_state_apply_consumers(
     q: object,
     q_t: object,
     dphi_t: object,
+    dA_cs: object,
+    dA_cs_rev: object,
+    segsum: object,
     qk_dot: object,
     gamma: object,
     v: object,
@@ -628,6 +705,9 @@ def run_multi_chunk_state_apply_consumers(
             fake_bf16_3d((nchunks, dim, dim)),
             fake_bf16_3d((nchunks, dim, dim)),
             fake_bf16_3d((nchunks, dim, dim)),
+            fake_f32_2d((nchunks, chunk_size)),
+            fake_f32_2d((nchunks, chunk_size)),
+            fake_f32_3d((nchunks, chunk_size, chunk_size)),
             fake_bf16_4d((nchunks, chunk_size, rank, rank)),
             fake_f32_2d((nchunks, chunk_size)),
             fake_bf16_3d((nchunks, chunk_size, dim)),
@@ -644,6 +724,9 @@ def run_multi_chunk_state_apply_consumers(
         dl(q),
         dl(q_t),
         dl(dphi_t),
+        dl(dA_cs),
+        dl(dA_cs_rev),
+        dl(segsum),
         dl(qk_dot),
         dl(gamma),
         dl(v),

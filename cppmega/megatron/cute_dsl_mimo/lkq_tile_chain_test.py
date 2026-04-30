@@ -17,8 +17,8 @@ LKQ is only spilled to swizzled shared memory inside the kernel.
 The Wave 7 fused-consumer mode keeps state/apply on-chip as BF16 shared-memory
 tiles and writes only DV/DMIMO_V to global memory.  The Wave 8 mode lifts that
 same path into a bounded reverse multi-chunk scan owner with a loop-carried
-state update.  The Wave 9 mode adds the same-time qk diagonal contribution to
-the fused multi-chunk consumers.
+state update.  Wave 9 adds the same-time qk diagonal contribution; Wave 10 adds
+dA/segsum/carry scaling semantics to the fused multi-chunk consumers.
 """
 
 from __future__ import annotations
@@ -67,6 +67,9 @@ class MultiChunkInputs:
     k: torch.Tensor
     q: torch.Tensor
     dphi: torch.Tensor
+    dA_cs: torch.Tensor
+    dA_cs_rev: torch.Tensor
+    segsum: torch.Tensor
     qk_dot: torch.Tensor
     gamma: torch.Tensor
     v: torch.Tensor
@@ -146,6 +149,15 @@ def _make_multi_cases(seed: int, nchunks: int) -> list[MultiChunkInputs]:
         k=_structured3(nchunks, FCS, N, a=5, b=3, c=7, mod=23, denom=16.0).to(torch.bfloat16),
         q=_structured3(nchunks, FCS, N, a=-3, b=11, c=2, mod=29, denom=18.0).to(torch.bfloat16),
         dphi=_structured3(nchunks, FCS, P, a=13, b=-5, c=17, mod=31, denom=24.0).to(torch.bfloat16),
+        dA_cs=_structured3(nchunks, CHUNK_SIZE, 1, a=3, b=5, c=0, mod=17, denom=160.0)
+        .squeeze(-1)
+        .contiguous(),
+        dA_cs_rev=_structured3(nchunks, CHUNK_SIZE, 1, a=-5, b=7, c=0, mod=19, denom=192.0)
+        .squeeze(-1)
+        .contiguous(),
+        segsum=_structured3(
+            nchunks, CHUNK_SIZE, CHUNK_SIZE, a=7, b=-3, c=5, mod=23, denom=192.0
+        ).contiguous(),
         qk_dot=_structured_qk(
             nchunks, a=3, b=-7, c=11, d=5, mod=41, denom=96.0
         ).to(torch.bfloat16),
@@ -163,6 +175,9 @@ def _make_multi_cases(seed: int, nchunks: int) -> list[MultiChunkInputs]:
         k=(torch.randn(nchunks, FCS, N, dtype=torch.bfloat16, device="cuda") * scale),
         q=(torch.randn(nchunks, FCS, N, dtype=torch.bfloat16, device="cuda") * scale),
         dphi=(torch.randn(nchunks, FCS, P, dtype=torch.bfloat16, device="cuda") * scale),
+        dA_cs=(torch.randn(nchunks, CHUNK_SIZE, dtype=torch.float32, device="cuda") * scale),
+        dA_cs_rev=(torch.randn(nchunks, CHUNK_SIZE, dtype=torch.float32, device="cuda") * scale),
+        segsum=(torch.randn(nchunks, CHUNK_SIZE, CHUNK_SIZE, dtype=torch.float32, device="cuda") * scale),
         qk_dot=(torch.randn(nchunks, CHUNK_SIZE, RANK, RANK, dtype=torch.bfloat16, device="cuda") * scale),
         gamma=(torch.randn(nchunks, CHUNK_SIZE, dtype=torch.float32, device="cuda") * scale),
         v=(torch.randn(nchunks, CHUNK_SIZE, P, dtype=torch.bfloat16, device="cuda") * scale),
@@ -212,6 +227,28 @@ def _qk_diag_contrib(
     return contrib.reshape(FCS, P)
 
 
+def _scaled_future_lkq(
+    k: torch.Tensor,
+    q: torch.Tensor,
+    segsum: torch.Tensor,
+) -> torch.Tensor:
+    idx = torch.arange(FCS, device=k.device)
+    row_t = idx // RANK
+    col_t = idx // RANK
+    future = row_t[:, None] < col_t[None, :]
+    seg_exp = torch.exp(segsum[col_t[None, :], row_t[:, None]])
+    lkq = k.float() @ q.float().T
+    return (lkq * future.float() * seg_exp).to(torch.bfloat16)
+
+
+def _scaled_dphi_for_carry(
+    dphi: torch.Tensor,
+    dA_cs: torch.Tensor,
+) -> torch.Tensor:
+    exp_cs = torch.exp(dA_cs).repeat_interleave(RANK)[:, None]
+    return (dphi.float() * exp_cs).to(torch.bfloat16).float()
+
+
 def _max_abs(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((a.float() - b.float()).abs().max().item())
 
@@ -248,9 +285,9 @@ def _multi_reference(
 
     for c in range(inputs.nchunks - 1, -1, -1):
         carry_t_bf = carry_t.to(torch.bfloat16).float()
-        state = (inputs.k[c].float() @ carry_t_bf.T).to(torch.bfloat16)
-        lkq = (inputs.k[c].float() @ inputs.q[c].float().T).to(torch.bfloat16)
-        masked_lkq = (lkq.float() * mask_bf16.float()).to(torch.bfloat16)
+        exp_rev = torch.exp(inputs.dA_cs_rev[c]).repeat_interleave(RANK)[:, None]
+        state = ((inputs.k[c].float() @ carry_t_bf.T) * exp_rev).to(torch.bfloat16)
+        masked_lkq = _scaled_future_lkq(inputs.k[c], inputs.q[c], inputs.segsum[c])
         apply = (masked_lkq.float() @ inputs.dphi[c].float()).to(torch.bfloat16)
         qk_contrib = _qk_diag_contrib(inputs.qk_dot[c], inputs.gamma[c], inputs.dphi[c])
         dpsi = state.float() + apply.float() + qk_contrib
@@ -261,7 +298,8 @@ def _multi_reference(
 
         # The CuTe prototype carries DStates.T directly so the next state GEMM
         # can consume it as the K-major B operand.
-        carry_t += inputs.dphi[c].float().T @ inputs.q[c].float()
+        carry_t = carry_t * torch.exp(inputs.dA_cs[c, -1])
+        carry_t += _scaled_dphi_for_carry(inputs.dphi[c], inputs.dA_cs[c]).T @ inputs.q[c].float()
 
     return {
         "dv": dv,
@@ -425,6 +463,9 @@ def _run_case_multi_chunk_fused(
         inputs.q.contiguous(),
         q_t,
         dphi_t,
+        inputs.dA_cs.contiguous(),
+        inputs.dA_cs_rev.contiguous(),
+        inputs.segsum.contiguous(),
         inputs.qk_dot.contiguous(),
         inputs.gamma.contiguous(),
         inputs.v.contiguous(),
@@ -447,7 +488,9 @@ def _run_case_multi_chunk_fused(
         "state_global_materialized": False,
         "apply_global_materialized": False,
         "dpsi_global_materialized": False,
-        "loop_carried_state": "carry_t += dPhi.T @ Q in FP32 registers, BF16-spilled only for state GEMM",
+        "loop_carried_state": "carry_t = exp(dA_last) * carry_t + BF16(dPhi * exp(dA)).T @ Q in FP32 registers",
+        "dA_state_scaling": "state = BF16((K @ BF16(carry).T) * exp(dA_cs_rev[t]))",
+        "segsum_lkq_scaling": "masked LKQ = BF16((K @ Q.T) * exp(segsum[col_t,row_t])) for row_t < col_t",
         "qk_diag_contribution": "dpsi[t,r,p] += gamma[t] * sum_o qk_dot[t,o,r] * dPhi[t,o,p]",
         "remaining_global": [
             "DV FP32 output tensor for all chunks",
@@ -642,6 +685,9 @@ def _time_chain_multi_chunk_fused(
             inputs.q,
             q_t,
             dphi_t,
+            inputs.dA_cs,
+            inputs.dA_cs_rev,
+            inputs.segsum,
             inputs.qk_dot,
             inputs.gamma,
             inputs.v,
@@ -696,7 +742,7 @@ def run_lkq_tile_chain(
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the CuTe LKQ tile chain probe")
 
-    print("Wave 9: CuTe LKQ/state chain with bounded multi-chunk scan owner + qk diag")
+    print("Wave 10: CuTe LKQ/state chain with bounded multi-chunk scan owner + qk/dA scaling")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"shape: chunk={CHUNK_SIZE} rank={RANK} fcs={FCS} N={N} P={P}")
     print(f"atol: {atol}")
@@ -705,6 +751,7 @@ def run_lkq_tile_chain(
     print("wave7_fused_path: state/apply stay in swizzled smem, DV/DMIMO_V computed in-kernel")
     print(f"wave8_multi_chunk_counts: {list(multi_chunk_counts)}")
     print("wave9_multi_chunk_semantics: same-time qk_dot/gamma contribution included in fused consumers")
+    print("wave10_multi_chunk_semantics: dA_cs_rev state scale, segsum LKQ scale, scaled carry update")
 
     mask_bf16 = _future_mask_bf16()
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -800,6 +847,8 @@ def run_lkq_tile_chain(
             for name, value in multi_result["diffs"].items():
                 print(f"  {name}: max_abs={value:.6f}")
             print(f"  loop_carried_state: {multi_result['loop_carried_state']}")
+            print(f"  dA_state_scaling: {multi_result['dA_state_scaling']}")
+            print(f"  segsum_lkq_scaling: {multi_result['segsum_lkq_scaling']}")
             print(f"  qk_diag_contribution: {multi_result['qk_diag_contribution']}")
             print(f"  dv_chunk0_row0[:4]: {multi_result['dv_chunk0_row0']}")
             print(f"  ref_chunk0_row0[:4]: {multi_result['ref_dv_chunk0_row0']}")
@@ -882,7 +931,7 @@ def run_lkq_tile_chain(
             "Wave6 path: state BF16 tile from scalar-copy CuTe GEMM",
             "Wave6 path: apply BF16 tile output from fused masked-apply kernel",
             "Wave7 path: DV and DMIMO_V final FP32 output tiles only",
-            "Wave9 path: DV FP32 tensor for all chunks and accumulated DMIMO_V FP32 tile only",
+            "Wave10 path: DV FP32 tensor for all chunks and accumulated DMIMO_V FP32 tile only",
             "Harness input-layout tensors: DStates.T and DPh.T",
             "Wave8 harness input-layout tensors: Q.T and DPh.T",
         ],
