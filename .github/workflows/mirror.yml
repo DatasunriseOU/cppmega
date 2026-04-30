@@ -34,7 +34,11 @@ jobs:
             "https://x-access-token:${MIRROR_PAT}@github.com/DatasunriseOU/cppmega.git" upstream.git
           cd upstream.git
           # Push main only (don't mirror branches/tags that don't belong here).
+          # IMPORTANT: push with MIRROR_PAT (not GITHUB_TOKEN). Pushes performed
+          # via the workflow's GITHUB_TOKEN do NOT trigger downstream workflows
+          # (GH anti-loop policy), so build-image would never auto-rebuild after
+          # a Dockerfile change. Using a PAT removes that suppression.
           git push --force \
-            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/jewelmusicee/cppmega.git" \
+            "https://x-access-token:${MIRROR_PAT}@github.com/jewelmusicee/cppmega.git" \
             +refs/heads/main:refs/heads/main
           echo "Synced $(git rev-parse --short main) from DatasunriseOU."
