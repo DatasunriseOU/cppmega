@@ -135,6 +135,64 @@ class TestFwdParity:
 
 
 class TestBwdParity:
+    def test_broadcast_single_heads_are_stride_zero_views(self):
+        try:
+            import triton  # noqa: F401
+        except ImportError:
+            pytest.skip("triton not available")
+        from cppmega.megatron.m2rnn_triton import _broadcast_heads
+
+        B, S, K, V = 1, 8, 16, 16
+        q, k, _v1, _W1, _xf1 = _make_inputs(B, S, 1, K, V, dtype=torch.float32)
+        _q1, _k1, v, W, xf = _make_inputs(B, S, 4, K, V, dtype=torch.float32)
+
+        q_b, k_b, v_b, W_b, xf_b, n = _broadcast_heads(
+            q,
+            k,
+            v,
+            W,
+            xf,
+            broadcast_views=True,
+        )
+
+        assert n == 4
+        assert q_b.shape == (B, S, 4, K)
+        assert k_b.shape == (B, S, 4, K)
+        assert q_b.stride(-2) == 0
+        assert k_b.stride(-2) == 0
+        assert q_b.untyped_storage().data_ptr() == q.untyped_storage().data_ptr()
+        assert k_b.untyped_storage().data_ptr() == k.untyped_storage().data_ptr()
+        assert v_b is v
+        assert W_b is W
+        assert xf_b is xf
+
+    def test_broadcast_views_can_be_disabled(self):
+        try:
+            import triton  # noqa: F401
+        except ImportError:
+            pytest.skip("triton not available")
+        from cppmega.megatron.m2rnn_triton import _broadcast_heads
+
+        B, S, K, V = 1, 8, 16, 16
+        q, k, _v1, _W1, _xf1 = _make_inputs(B, S, 1, K, V, dtype=torch.float32)
+        _q1, _k1, v, W, xf = _make_inputs(B, S, 4, K, V, dtype=torch.float32)
+
+        q_b, k_b, *_ = _broadcast_heads(
+            q,
+            k,
+            v,
+            W,
+            xf,
+            broadcast_views=False,
+        )
+
+        assert q_b.shape == (B, S, 4, K)
+        assert k_b.shape == (B, S, 4, K)
+        assert q_b.stride(-2) != 0
+        assert k_b.stride(-2) != 0
+        assert q_b.untyped_storage().data_ptr() != q.untyped_storage().data_ptr()
+        assert k_b.untyped_storage().data_ptr() != k.untyped_storage().data_ptr()
+
     def _check_bwd(self, B, S, H, K, V, *, rtol=1e-2):
         """Bwd parity: Triton (bf16) vs Reference (fp32, bf16 inputs cast up).
 
@@ -246,6 +304,117 @@ class TestBwdParity:
         assert W.grad.shape == W.shape, f"dW shape {W.grad.shape} != W shape {W.shape}"
         assert xf.grad.shape == xf.shape, f"dxf shape {xf.grad.shape} != xf shape {xf.shape}"
 
+    def test_bwd_reduced_broadcast_qk_matches_legacy(self, monkeypatch):
+        try:
+            import triton  # noqa: F401
+        except ImportError:
+            pytest.skip("triton not available")
+        import cppmega.megatron.m2rnn_triton as _mod
+
+        B, S, K, V = 1, 64, 16, 16
+        n_q = 1
+        n_k = 1
+        n_v = 4
+        n_w = 4
+        n_f = 4
+        dtype = torch.float32
+        device = "cuda"
+        g = torch.Generator(device=device).manual_seed(31)
+        q0 = torch.randn(B, S, n_q, K, device=device, dtype=dtype, generator=g)
+        k0 = torch.randn(B, S, n_k, K, device=device, dtype=dtype, generator=g)
+        v0 = torch.randn(B, S, n_v, V, device=device, dtype=dtype, generator=g)
+        W0 = (
+            torch.eye(V, device=device, dtype=dtype)
+            .unsqueeze(0)
+            .expand(n_w, -1, -1)
+            .contiguous()
+            .clone()
+        )
+        W0 += 0.05 * torch.randn(W0.shape, device=device, dtype=dtype, generator=g)
+        xf0 = torch.sigmoid(
+            torch.randn(B, S, n_f, device=device, dtype=dtype, generator=g)
+        )
+        grad_out = torch.randn(B, S, n_v, V, device=device, dtype=dtype, generator=g)
+
+        def run(flag):
+            monkeypatch.setenv(
+                "CPPMEGA_M2RNN_BWD_REDUCE_BROADCAST_QK",
+                "1" if flag else "0",
+            )
+            _mod.reset_m2rnn_runtime_config_cache()
+            q = q0.detach().clone().requires_grad_(True)
+            k = k0.detach().clone().requires_grad_(True)
+            v = v0.detach().clone().requires_grad_(True)
+            W = W0.detach().clone().requires_grad_(True)
+            xf = xf0.detach().clone().requires_grad_(True)
+            out, _ = _mod.m2rnn_scan_triton(q, k, v, W, xf)
+            (out * grad_out).sum().backward()
+            return q.grad, k.grad, v.grad, W.grad, xf.grad
+
+        reduced = run(True)
+        legacy = run(False)
+
+        for name, reduced_grad, legacy_grad in zip(
+            ("dq", "dk", "dv", "dW", "dxf"),
+            reduced,
+            legacy,
+        ):
+            assert reduced_grad.shape == legacy_grad.shape, f"{name}: shape mismatch"
+            diff = (reduced_grad - legacy_grad).abs().max().item()
+            mag = legacy_grad.abs().max().item() + 1e-12
+            assert diff / mag < 1e-4, (
+                f"{name}: rel={diff / mag:.4e}, abs={diff:.4e}, mag={mag:.4e}"
+            )
+
+    def test_bwd_broadcast_qk_value_parity(self):
+        try:
+            import triton  # noqa: F401
+        except ImportError:
+            pytest.skip("triton not available")
+        from cppmega.megatron.m2rnn_triton import m2rnn_scan_triton
+
+        B, S, K, V = 1, 64, 16, 16
+        H = 4
+        dtype = torch.float32
+        device = "cuda"
+        g = torch.Generator(device=device).manual_seed(41)
+        q0 = torch.randn(B, S, 1, K, device=device, dtype=dtype, generator=g)
+        k0 = torch.randn(B, S, 1, K, device=device, dtype=dtype, generator=g)
+        v0 = torch.randn(B, S, H, V, device=device, dtype=dtype, generator=g)
+        W0 = (
+            torch.eye(V, device=device, dtype=dtype)
+            .unsqueeze(0)
+            .expand(H, -1, -1)
+            .contiguous()
+            .clone()
+        )
+        W0 += 0.05 * torch.randn(W0.shape, device=device, dtype=dtype, generator=g)
+        xf0 = torch.sigmoid(torch.randn(B, S, H, device=device, dtype=dtype, generator=g))
+
+        def leaves(src):
+            return [x.detach().clone().requires_grad_(True) for x in src]
+
+        q_ref, k_ref, v_ref, W_ref, xf_ref = leaves([q0, k0, v0, W0, xf0])
+        q_tri, k_tri, v_tri, W_tri, xf_tri = leaves([q0, k0, v0, W0, xf0])
+        out_ref, _ = _torch_m2rnn_forward(q_ref, k_ref, v_ref, W_ref, xf_ref)
+        out_tri, _ = m2rnn_scan_triton(q_tri, k_tri, v_tri, W_tri, xf_tri)
+        grad_out = torch.randn(out_ref.shape, device=device, dtype=dtype, generator=g)
+        (out_ref * grad_out).sum().backward()
+        (out_tri * grad_out).sum().backward()
+
+        for name, ref_grad, tri_grad in (
+            ("dq", q_ref.grad, q_tri.grad),
+            ("dk", k_ref.grad, k_tri.grad),
+            ("dv", v_ref.grad, v_tri.grad),
+            ("dW", W_ref.grad, W_tri.grad),
+            ("dxf", xf_ref.grad, xf_tri.grad),
+        ):
+            diff = (ref_grad - tri_grad).abs().max().item()
+            mag = ref_grad.abs().max().item() + 1e-12
+            assert diff / mag < 1e-4, (
+                f"{name}: rel={diff / mag:.4e}, abs={diff:.4e}, mag={mag:.4e}"
+            )
+
     def test_bwd_fp32(self):
         """fp32 bwd parity — tight bound showing the kernel math is correct."""
         try:
@@ -269,6 +438,42 @@ class TestBwdParity:
         g = torch.randn_like(out_ref)
         (out_ref * g).sum().backward()
         (out_tri * g).sum().backward()
+
+        def rel(a, b):
+            denom = a.abs().max().item() + 1e-12
+            return (a - b).abs().max().item() / denom
+
+        assert rel(q1.grad, q2.grad) < 1e-4
+        assert rel(k1.grad, k2.grad) < 1e-4
+        assert rel(v1.grad, v2.grad) < 1e-4
+        assert rel(W1.grad, W2.grad) < 1e-4
+        assert rel(xf1.grad, xf2.grad) < 1e-4
+
+    def test_bwd_fp32_expanded_dout(self):
+        """Backward accepts zero-stride dout without materializing a copy."""
+        try:
+            import triton  # noqa: F401
+        except ImportError:
+            pytest.skip("triton not available")
+        from cppmega.megatron.m2rnn_triton import m2rnn_scan_triton
+
+        B, S, H, K, V = 1, 64, 2, 16, 16
+        q0, k0, v0, W0, xf0 = _make_inputs(B, S, H, K, V, dtype=torch.float32, seed=17)
+
+        def leaves(src):
+            return [x.detach().clone().requires_grad_(True) for x in src]
+
+        q1, k1, v1, W1, xf1 = leaves([q0, k0, v0, W0, xf0])
+        q2, k2, v2, W2, xf2 = leaves([q0, k0, v0, W0, xf0])
+
+        out_ref, _ = _torch_m2rnn_forward(q1, k1, v1, W1, xf1)
+        out_tri, _ = m2rnn_scan_triton(q2, k2, v2, W2, xf2)
+
+        g = torch.ones((), device=out_ref.device, dtype=out_ref.dtype).expand_as(out_ref)
+        assert any(stride == 0 for stride in g.stride())
+
+        out_ref.backward(g)
+        out_tri.backward(g)
 
         def rel(a, b):
             denom = a.abs().max().item() + 1e-12

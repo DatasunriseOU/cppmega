@@ -238,6 +238,7 @@ if os.environ.get("CPPMEGA_ALLOW_TE_MXFP8_SM12", "0") == "1":
 #   CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native      # old direct compact loader
 #   CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND=compact     # direct compact-scale mainloop
 #   CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND=prepack     # old native-scale prepack A/B
+#   CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND=swizzled    # stock CUTLASS + GEMM-ready scales
 #
 # The CUTLASS backend uses a cppmega SM120 mainloop fork by default.  Regular
 # TN keeps stock A/B TMA with compact scale copies in the mainloop; backward
@@ -262,8 +263,22 @@ if _te_mxfp8_bwd_backend not in ("te_tn_adapter", "flashinfer_cutlass", "cutlass
         f"{_te_mxfp8_bwd_backend!r}; expected te_tn_adapter, flashinfer_cutlass, "
         "or cutlass_native"
     )
+_cutlass_mxfp8_scale_backend = os.environ.get(
+    "CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND", "compact"
+).lower()
+if _cutlass_mxfp8_scale_backend not in ("compact", "prepack", "swizzled"):
+    raise RuntimeError(
+        "Unsupported CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND="
+        f"{_cutlass_mxfp8_scale_backend!r}; expected compact, prepack, or swizzled"
+    )
+_cutlass_mxfp8_stock_swizzled = (
+    _te_mxfp8_bwd_backend == "cutlass_native"
+    and _cutlass_mxfp8_scale_backend == "swizzled"
+)
 _te_mxfp8_transpose_emit_default = (
-    "off" if _te_mxfp8_bwd_backend == "cutlass_native" else "auto"
+    "auto"
+    if _cutlass_mxfp8_stock_swizzled
+    else ("off" if _te_mxfp8_bwd_backend == "cutlass_native" else "auto")
 )
 _te_mxfp8_transpose_emit_backend = os.environ.get(
     "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND",
@@ -278,14 +293,27 @@ _te_mxfp8_transpose_emit_strict = os.environ.get(
     "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT", "0"
 ) == "1"
 _te_mxfp8_transpose_emit_swizzled_default = (
-    "0" if _te_mxfp8_bwd_backend == "cutlass_native" else "1"
+    "1"
+    if _cutlass_mxfp8_stock_swizzled
+    else ("0" if _te_mxfp8_bwd_backend == "cutlass_native" else "1")
 )
 _te_mxfp8_transpose_emit_swizzled = os.environ.get(
     "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED",
     _te_mxfp8_transpose_emit_swizzled_default,
 ) == "1"
-_te_mxfp8_compact_columnwise_backward = os.environ.get(
-    "CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD", "0"
+_te_mxfp8_compact_columnwise_backward = (
+    False
+    if _cutlass_mxfp8_stock_swizzled
+    else os.environ.get("CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD", "0") == "1"
+)
+_te_mxfp8_dense_saved_operands = os.environ.get(
+    "CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS", "0"
+) == "1"
+_te_mxfp8_grouped_direct_backward = os.environ.get(
+    "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD", "0"
+) == "1"
+_te_mxfp8_grouped_gemm_ready_backward = os.environ.get(
+    "CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD", "1"
 ) == "1"
 _te_mxfp8_bwd_allow_bf16_fallback = os.environ.get(
     "CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK",
@@ -374,8 +402,11 @@ if (
             "mxfp8_tn_adapter_saved_transpose_operand": 0,
             "mxfp8_tn_adapter_te_emit_swizzled": 0,
             "mxfp8_tn_adapter_te_emit_swizzled_unavailable": 0,
+            "mxfp8_dense_grad_output_transpose_emit": 0,
+            "mxfp8_dense_grad_output_transpose_emit_failed": 0,
             "mxfp8_tn_adapter_copy_transpose": 0,
             "mxfp8_tn_adapter_missing_sidecar_copy": 0,
+            "mxfp8_tn_adapter_missing_sidecar_strict": 0,
             "mxfp8_tn_adapter_te_emit_failed": 0,
             "mxfp8_norm_quantize_sidecar_bridge": 0,
             "mxfp8_tn_sidecar_attr_attached": 0,
@@ -384,6 +415,8 @@ if (
             "mxfp8_tn_sidecar_attr_attached_bytes": 0,
             "mxfp8_cutlass_native_dgrad": 0,
             "mxfp8_cutlass_native_wgrad": 0,
+            "mxfp8_cutlass_native_stock_swizzled": 0,
+            "mxfp8_cutlass_native_stock_scale_swizzle": 0,
             "mxfp8_flashinfer_fprop": 0,
             "mxfp8_flashinfer_fprop_fallback": 0,
             "mxfp8_flashinfer_dgrad": 0,
@@ -392,8 +425,14 @@ if (
             "mxfp8_grouped_direct_wgrad": 0,
             "mxfp8_grouped_direct_miss_dgrad": 0,
             "mxfp8_grouped_direct_miss_wgrad": 0,
+            "mxfp8_grouped_gemm_ready_dgrad": 0,
+            "mxfp8_grouped_gemm_ready_wgrad": 0,
+            "mxfp8_grouped_gemm_ready_miss_dgrad": 0,
+            "mxfp8_grouped_gemm_ready_miss_wgrad": 0,
             "mxfp8_grouped_transpose_copy_fallback_dgrad": 0,
             "mxfp8_grouped_transpose_copy_fallback_wgrad": 0,
+            "mxfp8_dense_gemm_ready_dgrad": 0,
+            "mxfp8_dense_gemm_ready_wgrad": 0,
             "mxfp8_dense_copy_fallback_dgrad": 0,
             "mxfp8_dense_copy_fallback_wgrad": 0,
             "bf16_fallback_dgrad": 0,
@@ -489,6 +528,13 @@ if (
             _TE_LINEAR_MODULE,
             "_make_rowwise_transpose_for_backward",
         )
+        if _te_mxfp8_dense_saved_operands and not _te_linear_deferred_saved_operand:
+            raise RuntimeError(
+                "CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS=1 requires the cppmega "
+                "TransformerEngine Linear saved-MXFP8 operand hook "
+                "_make_rowwise_transpose_for_backward. Use the patched TE source "
+                "tree or disable dense saved operands."
+            )
         _cppmega_mxfp8_tn_sidecar_registry = {}
         # Forward can create hundreds of MXFP8 transpose sidecars before the
         # matching backward GEMM consumes the earliest ones. Keep enough entries
@@ -699,6 +745,26 @@ if (
                     _cppmega_mxfp8_tn_sidecar_attr_bytes[0],
                 )
 
+        def _cppmega_set_mxfp8_sidecar_refs_untracked(_x, _sidecar):
+            _old_sidecar = getattr(_x, _cppmega_mxfp8_tn_sidecar_attr, None)
+            if _old_sidecar is None:
+                _old_sidecar = getattr(_x, "_te_rowwise_transpose_for_backward", None)
+            if _old_sidecar is not None and _old_sidecar is not _sidecar:
+                _cppmega_clear_mxfp8_sidecar_refs_tracked(_x, _old_sidecar)
+            setattr(_x, "_te_rowwise_transpose_for_backward", _sidecar)
+            setattr(
+                _x,
+                "_te_rowwise_transpose_for_backward_unregister",
+                _cppmega_unregister_mxfp8_sidecar,
+            )
+            setattr(_x, _cppmega_mxfp8_tn_sidecar_attr, _sidecar)
+            setattr(
+                _x,
+                "_cppmega_mxfp8_rowwise_transpose_unregister",
+                _cppmega_unregister_mxfp8_sidecar,
+            )
+            setattr(_x, _cppmega_mxfp8_tn_sidecar_persistent_attr, False)
+
         def _cppmega_clear_mxfp8_sidecar_refs_tracked(_x, _sidecar=None):
             if _sidecar is None:
                 _sidecar = getattr(_x, _cppmega_mxfp8_tn_sidecar_attr, None)
@@ -811,7 +877,14 @@ if (
             _cppmega_register_mxfp8_sidecar(_dst, _sidecar, persistent=_persistent)
             return _dst
 
-        def _cppmega_attach_mxfp8_rowwise_transpose(_out, _quantizer, _source):
+        def _cppmega_attach_mxfp8_rowwise_transpose(
+            _out,
+            _quantizer,
+            _source,
+            *,
+            _force: bool = False,
+            _track: bool = True,
+        ):
             if not (
                 _te_mxfp8_bwd_tn_adapter
                 and _te_mxfp8_transpose_emit_backend in ("auto", "te")
@@ -832,7 +905,10 @@ if (
             _columnwise_scale = getattr(_out, "_columnwise_scale_inv", None)
             if _columnwise_scale is None:
                 return _out
-            if getattr(_quantizer, "_te_skip_eager_rowwise_transpose_for_backward", False):
+            if (
+                getattr(_quantizer, "_te_skip_eager_rowwise_transpose_for_backward", False)
+                and not _force
+            ):
                 _cppmega_record_bwd_stat("mxfp8_tn_adapter_te_emit_deferred")
                 return _out
             if getattr(_out, _cppmega_mxfp8_tn_sidecar_attr, None) is not None:
@@ -911,8 +987,11 @@ if (
                                     "while swizzled scales were required"
                                 )
                 _cppmega_mark_rowwise_transpose_operand(_sidecar)
-                _cppmega_set_mxfp8_sidecar_refs(_out, _sidecar, persistent=False)
-                _cppmega_register_mxfp8_sidecar(_out, _sidecar, persistent=False)
+                if _track:
+                    _cppmega_set_mxfp8_sidecar_refs(_out, _sidecar, persistent=False)
+                    _cppmega_register_mxfp8_sidecar(_out, _sidecar, persistent=False)
+                else:
+                    _cppmega_set_mxfp8_sidecar_refs_untracked(_out, _sidecar)
                 if _te_mxfp8_bwd_debug and _cppmega_attach_debug_count[0] < 16:
                     _cppmega_attach_debug_count[0] += 1
                     print(
@@ -1041,6 +1120,7 @@ if (
                             _out,
                             _quantizer,
                             _source,
+                            _force=not _torch.is_grad_enabled(),
                         )
                     _start += _size
                 return _outputs
@@ -1103,6 +1183,16 @@ if (
                 raise ValueError("MXFP8 TN adapter requires matrix-like columnwise data")
             if _scale.dim() != 2:
                 raise ValueError("MXFP8 TN adapter requires 2D compact columnwise scales")
+            if _strict_missing_sidecar and _te_mxfp8_dense_saved_operands:
+                _cppmega_record_bwd_stat(
+                    "mxfp8_tn_adapter_missing_sidecar_strict",
+                    "missing_gemm_ready_dense_transpose",
+                )
+                raise ValueError(
+                    "MXFP8 dense saved operands require a GEMM-ready rowwise "
+                    "transpose sidecar/operand; refusing the copy-transpose "
+                    f"fallback for {_cppmega_mxfp8_debug_desc(_x)}"
+                )
             warnings.warn(
                 "Copy-based MXFP8 transpose is deprecated. "
                 "Use cutlass_native backend (CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native) "
@@ -1149,6 +1239,16 @@ if (
                 getattr(_x, "_te_rowwise_transpose_for_backward_operand", False)
                 or getattr(_x, "_cppmega_mxfp8_rowwise_transpose_operand", False)
             )
+
+        def _cppmega_has_gemm_ready_dense_transpose(_x):
+            if not _cppmega_is_mxfp8_tensor(_x):
+                return False
+            if _cppmega_is_mxfp8_rowwise_transpose_operand(_x):
+                return True
+            try:
+                return _cppmega_peek_mxfp8_sidecar(_x) is not None
+            except NameError:
+                return False
 
         _cppmega_cutlass_mxfp8_module = [None]
         _cppmega_flashinfer_mxfp8_module = [None]
@@ -1215,6 +1315,16 @@ if (
                 _data = _data.reshape(-1, _data.shape[-1])
             return _data, _scale
 
+        def _cppmega_cutlass_rowwise_scale_for_stock(_cutlass, _scale, _data, _is_swizzled):
+            if _is_swizzled:
+                return _scale
+            _cppmega_record_bwd_stat("mxfp8_cutlass_native_stock_scale_swizzle")
+            return _cutlass.swizzle_rowwise_scale(
+                _scale,
+                int(_data.shape[0]),
+                int(_data.shape[1]),
+            )
+
         def _cppmega_cutlass_kwargs(_kwargs):
             _out_dtype = _kwargs.get("out_dtype", _torch.bfloat16)
             _out = _kwargs.get("out", None)
@@ -1237,13 +1347,35 @@ if (
             _a_data, _a_scale = _cppmega_mxfp8_rowwise_payload_and_scale(_a)
             _b_data, _b_scale = _cppmega_mxfp8_rowwise_payload_and_scale(_b)
             _cutlass = _cppmega_load_cutlass_mxfp8_module()
-            _result = _cutlass.tn_gemm_direct_rowwise(
-                _a_data,
-                _a_scale,
-                _b_data,
-                _b_scale,
-                **_cppmega_cutlass_kwargs(_kwargs),
-            )
+            if _cutlass_mxfp8_stock_swizzled:
+                _a_scale = _cppmega_cutlass_rowwise_scale_for_stock(
+                    _cutlass,
+                    _a_scale,
+                    _a_data,
+                    bool(getattr(_a, "_with_gemm_swizzled_scales", False)),
+                )
+                _b_scale = _cppmega_cutlass_rowwise_scale_for_stock(
+                    _cutlass,
+                    _b_scale,
+                    _b_data,
+                    bool(getattr(_b, "_with_gemm_swizzled_scales", False)),
+                )
+                _cppmega_record_bwd_stat("mxfp8_cutlass_native_stock_swizzled")
+                _result = _cutlass.tn_gemm_swizzled_scale(
+                    _a_data,
+                    _a_scale,
+                    _b_data,
+                    _b_scale,
+                    **_cppmega_cutlass_kwargs(_kwargs),
+                )
+            else:
+                _result = _cutlass.tn_gemm_direct_rowwise(
+                    _a_data,
+                    _a_scale,
+                    _b_data,
+                    _b_scale,
+                    **_cppmega_cutlass_kwargs(_kwargs),
+                )
             return _result, None, None, None
 
         def _cppmega_cutlass_dgrad_nn_from_rowwise_transpose(_weight_t, _dy, _kwargs):
@@ -1322,6 +1454,8 @@ if (
                         _args[1],
                         _kwargs,
                     )
+                if _cutlass_mxfp8_stock_swizzled:
+                    return False, "missing_gemm_ready_rowwise_transpose_for_dgrad"
                 return True, _cppmega_cutlass_dgrad_nn_gemm(_args[0], _args[1], _kwargs)
 
             # wgrad: dy.T[N, M] @ x[M, K].
@@ -1333,6 +1467,8 @@ if (
                     _args[1],
                     _kwargs,
                 )
+            if _cutlass_mxfp8_stock_swizzled:
+                return False, "missing_gemm_ready_rowwise_transpose_for_wgrad"
             if _cppmega_is_mxfp8_rowwise_transpose_operand(_args[0]):
                 return True, _cppmega_cutlass_wgrad_nt_from_x_rowwise_transpose(
                     _args[0],
@@ -1371,6 +1507,14 @@ if (
                 "CompactColumnwiseUnsupportedError",
                 ValueError,
             )
+            if not _te_mxfp8_compact_columnwise_backward:
+                _weight_t = _cppmega_mxfp8_colwise_as_rowwise_transpose(_weight)
+                _result = _flashinfer.dgrad_nn_gemm(
+                    _weight_t,
+                    _dy,
+                    **_cppmega_flashinfer_kwargs(_kwargs),
+                )
+                return _result, None, None, None
             try:
                 _result = _flashinfer.dgrad_nn_gemm(
                     _weight,
@@ -1393,9 +1537,10 @@ if (
                 "CompactColumnwiseUnsupportedError",
                 ValueError,
             )
-            if _cppmega_is_mxfp8_rowwise_transpose_operand(
+            _has_saved_transpose = _cppmega_is_mxfp8_rowwise_transpose_operand(
                 _x
-            ) or _cppmega_is_mxfp8_rowwise_transpose_operand(_dy):
+            ) or _cppmega_is_mxfp8_rowwise_transpose_operand(_dy)
+            if _has_saved_transpose or not _te_mxfp8_compact_columnwise_backward:
                 _x_t = _cppmega_mxfp8_colwise_as_rowwise_transpose(_x)
                 _dy_t = _cppmega_mxfp8_colwise_as_rowwise_transpose(_dy)
                 _x_t_shape = _cppmega_mxfp8_rowwise_2d_shape(_x_t)
@@ -1534,11 +1679,114 @@ if (
                     f"{_type_exc}"
                 ) from _type_exc
 
+        def _cppmega_peek_mxfp8_sidecar(_x):
+            _sidecar = getattr(_x, _cppmega_mxfp8_tn_sidecar_attr, None)
+            if _sidecar is not None:
+                return _sidecar
+            _key = _cppmega_mxfp8_sidecar_key(_x)
+            _entry = _cppmega_mxfp8_tn_sidecar_registry.get(_key)
+            if _entry is None:
+                return None
+            _resolved = _cppmega_resolve_mxfp8_sidecar_registry_entry(_entry)
+            if _resolved is None:
+                return None
+            return _resolved[0]
+
+        def _cppmega_has_gemm_ready_grouped_transpose(_item):
+            if not _cppmega_is_mxfp8_tensor(_item):
+                return False
+            if _cppmega_is_mxfp8_rowwise_transpose_operand(_item):
+                return True
+            if _cppmega_peek_mxfp8_sidecar(_item) is not None:
+                return True
+            return False
+
+        def _cppmega_take_gemm_ready_grouped_transpose(_item):
+            if _cppmega_is_mxfp8_rowwise_transpose_operand(_item):
+                _cppmega_record_bwd_stat("mxfp8_tn_adapter_saved_transpose_operand")
+                return _item
+            _sidecar = _cppmega_get_mxfp8_sidecar(_item)
+            if _sidecar is None:
+                raise ValueError("missing_gemm_ready_grouped_transpose")
+            _cppmega_mark_rowwise_transpose_operand(_sidecar)
+            _cppmega_record_bwd_stat("mxfp8_tn_adapter_te_emit")
+            return _sidecar
+
+        def _cppmega_try_grouped_mxfp8_gemm_ready(
+            _orig_general_grouped_gemm,
+            A,
+            B,
+            out,
+            _args,
+            _kwargs,
+        ):
+            _layout = _kwargs.get("layout", "TN")
+            if _layout not in ("NN", "NT"):
+                return False, f"unsupported_layout:{_layout}"
+            if not _te_mxfp8_grouped_gemm_ready_backward:
+                return False, "grouped_gemm_ready_disabled"
+            if _cppmega_has_comm_overlap(_kwargs):
+                return False, "comm_overlap_not_covered"
+            if not (_cppmega_all_mxfp8_operands(A) and _cppmega_all_mxfp8_operands(B)):
+                return False, "non_mxfp8_grouped_operands"
+
+            needs_transpose = A if _layout == "NN" else tuple(A) + tuple(B)
+            missing = [
+                _idx
+                for _idx, _item in enumerate(needs_transpose)
+                if not _cppmega_has_gemm_ready_grouped_transpose(_item)
+            ]
+            if missing:
+                if _te_mxfp8_bwd_debug:
+                    _missing_idx = missing[0]
+                    _missing_item = needs_transpose[_missing_idx]
+                    return (
+                        False,
+                        "missing_gemm_ready_grouped_transpose:"
+                        f"{_missing_idx}:"
+                        f" roles={getattr(_missing_item, '_te_mxfp8_grouped_linear_roles', None)}"
+                        f" layouts={getattr(_missing_item, '_te_mxfp8_grouped_linear_layouts', None)}"
+                        f" operands={getattr(_missing_item, '_te_mxfp8_grouped_linear_operands', None)}"
+                        f" grouped_no_mat={getattr(_missing_item, '_te_mxfp8_grouped_linear_no_transpose_materialization', None)}"
+                        f" {_cppmega_mxfp8_debug_desc(_missing_item)}",
+                    )
+                return False, f"missing_gemm_ready_grouped_transpose:{missing[0]}"
+
+            _new_kwargs = dict(_kwargs)
+            _new_kwargs["layout"] = "TN"
+            _new_kwargs["use_split_accumulator"] = False
+            if _layout == "NN":
+                _new_A = [_cppmega_take_gemm_ready_grouped_transpose(_item) for _item in A]
+                return True, _orig_general_grouped_gemm(
+                    _new_A,
+                    B,
+                    out,
+                    *_args,
+                    **_new_kwargs,
+                )
+
+            _new_A = [_cppmega_take_gemm_ready_grouped_transpose(_item) for _item in A]
+            _new_B = [_cppmega_take_gemm_ready_grouped_transpose(_item) for _item in B]
+            return True, _orig_general_grouped_gemm(
+                _new_A,
+                _new_B,
+                out,
+                *_args,
+                **_new_kwargs,
+            )
+
         def _cppmega_try_mxfp8_tn_adapter(_orig_general_gemm, _args, _kwargs):
             _layout = _kwargs.get("layout")
             if not _te_mxfp8_bwd_tn_adapter:
                 return False, "adapter_disabled"
-            if not _kwargs.get("grad", False):
+            _saved_operand_call = (
+                _te_mxfp8_dense_saved_operands
+                and len(_args) >= 2
+                and _layout in ("NN", "NT")
+                and _cppmega_is_mxfp8_tensor(_args[0])
+                and _cppmega_is_mxfp8_tensor(_args[1])
+            )
+            if not (_kwargs.get("grad", False) or _saved_operand_call):
                 return False, "not_backward_gemm"
             if _layout not in ("NN", "NT"):
                 return False, f"unsupported_layout:{_layout}"
@@ -1610,6 +1858,7 @@ if (
                 _orig_general_grouped_gemm, "_cppmega_blockscaled_bwd", False
             ):
                 return False
+            _grouped_wrapper_module_name = getattr(_module, "__name__", type(_module).__name__)
 
             @_functools.wraps(_orig_general_grouped_gemm)
             def _general_grouped_gemm(A, B, out, *args, **kwargs):
@@ -1628,54 +1877,105 @@ if (
                 ):
                     return _orig_general_grouped_gemm(A, B, out, *args, **kwargs)
 
-                # The grouped direct backend owns compact TE MXFP8 storage
-                # directly. Do not resolve transpose sidecars on this path.
                 _op_kind = "dgrad" if _layout == "NN" else "wgrad"
-                _direct_reason = None
+                _gemm_ready_reason = None
                 try:
-                    _direct_ok, _direct_result = _cppmega_try_grouped_mxfp8_direct(
-                        A,
-                        B,
-                        out,
-                        args,
-                        kwargs,
+                    _gemm_ready_ok, _gemm_ready_result = (
+                        _cppmega_try_grouped_mxfp8_gemm_ready(
+                            _orig_general_grouped_gemm,
+                            A,
+                            B,
+                            out,
+                            args,
+                            kwargs,
+                        )
                     )
-                    if _direct_ok:
-                        _cppmega_record_bwd_stat(f"mxfp8_grouped_direct_{_op_kind}")
+                    if _gemm_ready_ok:
+                        _cppmega_record_bwd_stat(
+                            f"mxfp8_grouped_gemm_ready_{_op_kind}"
+                        )
                         if _te_mxfp8_bwd_debug:
                             print(
-                                "[cppmega_fp8_shim] MXFP8 grouped direct "
-                                f"{_op_kind} layout={_layout}"
+                                "[cppmega_fp8_shim] MXFP8 grouped GEMM-ready "
+                                f"{_op_kind} layout={_layout}->TN"
                             )
-                        if (
-                            isinstance(_direct_result, tuple)
-                            and len(_direct_result) == 3
-                        ):
-                            return _direct_result
-                        if _layout == "NN":
-                            if isinstance(_direct_result, _torch.Tensor):
-                                return [_direct_result], [None] * len(A), None
-                            return _direct_result
-                        if isinstance(_direct_result, (list, tuple)) or isinstance(
-                            _direct_result, _torch.Tensor
-                        ):
-                            return _direct_result, [None] * len(A), None
-                        return _direct_result
-                    _direct_reason = str(_direct_result)
-                except Exception as _direct_exc:  # pragma: no cover
-                    _direct_reason = (
-                        "grouped_direct_unavailable:"
-                        f"{type(_direct_exc).__name__}: {_direct_exc}"
+                        return _gemm_ready_result
+                    _gemm_ready_reason = str(_gemm_ready_result)
+                    if _te_mxfp8_bwd_debug:
+                        _gemm_ready_reason = (
+                            f"module={_grouped_wrapper_module_name}: "
+                            f"{_gemm_ready_reason}"
+                        )
+                except Exception as _gemm_ready_exc:  # pragma: no cover
+                    _gemm_ready_reason = (
+                        "grouped_gemm_ready_unavailable:"
+                        f"{type(_gemm_ready_exc).__name__}: {_gemm_ready_exc}"
                     )
+                    if _te_mxfp8_bwd_debug:
+                        _gemm_ready_reason = (
+                            f"module={_grouped_wrapper_module_name}: "
+                            f"{_gemm_ready_reason}"
+                        )
                 _cppmega_record_bwd_stat(
-                    f"mxfp8_grouped_direct_miss_{_op_kind}",
-                    _direct_reason,
+                    f"mxfp8_grouped_gemm_ready_miss_{_op_kind}",
+                    _gemm_ready_reason,
                 )
                 if _te_mxfp8_bwd_debug:
                     print(
-                        "[cppmega_fp8_shim] MXFP8 grouped direct fallback "
-                        f"{_op_kind}: {_direct_reason}"
+                        "[cppmega_fp8_shim] MXFP8 grouped GEMM-ready skip "
+                        f"{_op_kind}: {_gemm_ready_reason}"
                     )
+
+                if _te_mxfp8_grouped_direct_backward:
+                    # The grouped direct backend owns compact TE MXFP8 storage
+                    # directly. Do not resolve transpose sidecars on this path.
+                    _direct_reason = None
+                    try:
+                        _direct_ok, _direct_result = _cppmega_try_grouped_mxfp8_direct(
+                            A,
+                            B,
+                            out,
+                            args,
+                            kwargs,
+                        )
+                        if _direct_ok:
+                            _cppmega_record_bwd_stat(
+                                f"mxfp8_grouped_direct_{_op_kind}"
+                            )
+                            if _te_mxfp8_bwd_debug:
+                                print(
+                                    "[cppmega_fp8_shim] MXFP8 grouped direct "
+                                    f"{_op_kind} layout={_layout}"
+                                )
+                            if (
+                                isinstance(_direct_result, tuple)
+                                and len(_direct_result) == 3
+                            ):
+                                return _direct_result
+                            if _layout == "NN":
+                                if isinstance(_direct_result, _torch.Tensor):
+                                    return [_direct_result], [None] * len(A), None
+                                return _direct_result
+                            if isinstance(_direct_result, (list, tuple)) or isinstance(
+                                _direct_result, _torch.Tensor
+                            ):
+                                return _direct_result, [None] * len(A), None
+                            return _direct_result
+                        _direct_reason = str(_direct_result)
+                    except Exception as _direct_exc:  # pragma: no cover
+                        _direct_reason = (
+                            "grouped_direct_unavailable:"
+                            f"{type(_direct_exc).__name__}: {_direct_exc}"
+                        )
+                    _cppmega_record_bwd_stat(
+                        f"mxfp8_grouped_direct_miss_{_op_kind}",
+                        _direct_reason,
+                    )
+                    if _te_mxfp8_bwd_debug:
+                        print(
+                            "[cppmega_fp8_shim] MXFP8 grouped direct fallback "
+                            f"{_op_kind}: {_direct_reason}"
+                        )
 
                 def _convert_mxfp8_list(_items):
                     _converted = []
@@ -1789,11 +2089,18 @@ if (
 
                 _is_target_bwd = (
                     len(_args) >= 2
-                    and _kwargs.get("grad", False)
                     and _layout in ("NN", "NT")
                     and (
                         _cppmega_is_block_scaled_tensor(_args[0])
                         or _cppmega_is_block_scaled_tensor(_args[1])
+                    )
+                    and (
+                        _kwargs.get("grad", False)
+                        or (
+                            _te_mxfp8_dense_saved_operands
+                            and _cppmega_is_mxfp8_tensor(_args[0])
+                            and _cppmega_is_mxfp8_tensor(_args[1])
+                        )
                     )
                 )
                 if not _is_target_bwd:
@@ -1806,24 +2113,42 @@ if (
                 ):
                     _fallback_reason = None
                     try:
+                        _copy_before = int(
+                            _cppmega_te_bwd_stats.get(
+                                "mxfp8_tn_adapter_copy_transpose", 0
+                            )
+                        )
                         _adapted_ok, _adapted_result = _cppmega_try_mxfp8_tn_adapter(
                             _orig_general_gemm, _args, _kwargs
                         )
                         if _adapted_ok:
+                            _copy_delta = (
+                                int(
+                                    _cppmega_te_bwd_stats.get(
+                                        "mxfp8_tn_adapter_copy_transpose", 0
+                                    )
+                                )
+                                - _copy_before
+                            )
                             if _te_mxfp8_bwd_backend == "cutlass_native":
                                 _cppmega_record_bwd_stat(f"mxfp8_cutlass_native_{_op_kind}")
                             elif _te_mxfp8_bwd_backend == "flashinfer_cutlass":
                                 _cppmega_record_bwd_stat(f"mxfp8_flashinfer_{_op_kind}")
                             else:
-                                _cppmega_record_bwd_stat(
-                                    f"mxfp8_dense_copy_fallback_{_op_kind}"
-                                )
+                                if _copy_delta > 0:
+                                    _cppmega_record_bwd_stat(
+                                        f"mxfp8_dense_copy_fallback_{_op_kind}"
+                                    )
+                                else:
+                                    _cppmega_record_bwd_stat(
+                                        f"mxfp8_dense_gemm_ready_{_op_kind}"
+                                    )
                                 _cppmega_record_bwd_stat(f"mxfp8_tn_adapter_{_op_kind}")
                             if _te_mxfp8_bwd_debug:
                                 print(
                                     "[cppmega_fp8_shim] MXFP8 backward backend "
                                     f"{_te_mxfp8_bwd_backend} {_op_kind} "
-                                    f"layout={_layout}->TN"
+                                    f"layout={_layout}->TN copy_delta={_copy_delta}"
                                 )
                             return _adapted_result
                         _fallback_reason = str(_adapted_result)
@@ -1898,6 +2223,88 @@ if (
         _orig_grad_output_preprocess = (
             _te_module_base.TransformerEngineBaseModule.grad_output_preprocess
         )
+
+        def _cppmega_ctx_requires_dense_wgrad(_ctx):
+            return bool(
+                getattr(_ctx, "requires_wgrad", False)
+                or getattr(_ctx, "fc1_weight_requires_grad", False)
+                or getattr(_ctx, "fc2_weight_requires_grad", False)
+            )
+
+        def _cppmega_flattened_lastdim_shape(_tensor):
+            if not isinstance(_tensor, _torch.Tensor) or _tensor.dim() < 1:
+                return None
+            return (int(_tensor.numel() // _tensor.shape[-1]), int(_tensor.shape[-1]))
+
+        def _cppmega_attach_dense_grad_output_transpose(
+            _ctx,
+            _source_grad_output,
+            _grad_output,
+            _quantizer,
+            _row_parallel_mode,
+        ):
+            if not (
+                _te_mxfp8_bwd_tn_adapter
+                and _te_mxfp8_dense_saved_operands
+                and _te_mxfp8_transpose_emit_backend in ("auto", "te")
+                and _cppmega_ctx_requires_dense_wgrad(_ctx)
+                and isinstance(_quantizer, _TE_MXFP8Quantizer)
+                and _cppmega_is_mxfp8_tensor(_grad_output)
+                and isinstance(_source_grad_output, _torch.Tensor)
+                and not _cppmega_is_block_scaled_tensor(_source_grad_output)
+            ):
+                return _grad_output
+            if _cppmega_has_gemm_ready_dense_transpose(_grad_output):
+                return _grad_output
+
+            _source_shape = _cppmega_flattened_lastdim_shape(_source_grad_output)
+            _grad_shape = _cppmega_flattened_lastdim_shape(
+                getattr(_grad_output, "_columnwise_data", None)
+            )
+            if _source_shape is not None and _grad_shape is not None:
+                # _grad_output is already flattened by TE. The source may still
+                # be [sequence, batch, hidden], but the logical 2D shapes must
+                # match for scale reuse.
+                if _source_shape != _grad_shape:
+                    _reason = (
+                        "dense_grad_output_source_shape_mismatch:"
+                        f"{_source_shape}!={_grad_shape}"
+                    )
+                    _cppmega_record_bwd_stat(
+                        "mxfp8_dense_grad_output_transpose_emit_failed",
+                        _reason,
+                    )
+                    if _te_mxfp8_transpose_emit_backend == "te":
+                        raise RuntimeError(
+                            "Cannot emit MXFP8 dense wgrad grad-output transpose: "
+                            f"{_reason}"
+                        )
+                    return _grad_output
+
+            _before = _cppmega_has_gemm_ready_dense_transpose(_grad_output)
+            _out = _cppmega_attach_mxfp8_rowwise_transpose(
+                _grad_output,
+                _quantizer,
+                _source_grad_output,
+                _force=True,
+                _track=False,
+            )
+            _after = _cppmega_has_gemm_ready_dense_transpose(_out)
+            if _after and not _before:
+                _cppmega_record_bwd_stat("mxfp8_dense_grad_output_transpose_emit")
+            elif not _after:
+                _reason = "dense_grad_output_transpose_emit_missing"
+                _cppmega_record_bwd_stat(
+                    "mxfp8_dense_grad_output_transpose_emit_failed",
+                    _reason,
+                )
+                if _te_mxfp8_transpose_emit_backend == "te":
+                    raise RuntimeError(
+                        "MXFP8 dense wgrad grad-output transpose emit did not "
+                        "produce a GEMM-ready operand"
+                    )
+            return _out
+
         if not getattr(_orig_grad_output_preprocess, "_cppmega_blockscaled_bwd", False):
 
             def _grad_output_preprocess(ctx, grad_output, row_parallel_mode, quantizer):
@@ -1909,9 +2316,18 @@ if (
                 ):
                     # Let TE quantize grad_output normally. The TN adapter
                     # needs both rowwise and compact columnwise MXFP8 payloads.
-                    return _orig_grad_output_preprocess(
+                    _source_grad_output = grad_output
+                    _processed_grad_output, _grad_bias = _orig_grad_output_preprocess(
                         ctx, grad_output, row_parallel_mode, quantizer
                     )
+                    _processed_grad_output = _cppmega_attach_dense_grad_output_transpose(
+                        ctx,
+                        _source_grad_output,
+                        _processed_grad_output,
+                        quantizer,
+                        row_parallel_mode,
+                    )
+                    return _processed_grad_output, _grad_bias
                 if (
                     getattr(ctx, "fp8", False)
                     and _cppmega_is_block_scaled_recipe(_recipe)
@@ -1969,6 +2385,7 @@ if (
                         "_te_skip_eager_rowwise_transpose_for_backward",
                         bool(
                             _emit_enabled
+                            and _te_mxfp8_dense_saved_operands
                             and _te_linear_deferred_saved_operand
                             and _role in ("input", "grad_output", "weight")
                         ),
@@ -2000,16 +2417,26 @@ if (
                 _quantizers = _orig_get_quantizers(self, *args, **kwargs)
                 try:
                     _recipe = _TE_FP8State.get_fp8_recipe()
-                    _cppmega_force_compact_many_if_needed(
-                        _quantizers[0],
-                        _recipe,
-                        _role="input",
+                    _role_slots = (
+                        ((0, "input"), (5, "grad_output"))
+                        if len(_quantizers) <= 6
+                        else (
+                            (0, "input"),
+                            (5, "grad_output"),
+                            # LayerNormMLP's FC2 activation producer has no
+                            # saved-operand hook in TE. Keep source-time emit
+                            # eager there while still forcing compact scales.
+                            (6, "input_eager"),
+                            (11, "grad_output"),
+                        )
                     )
-                    _cppmega_force_compact_many_if_needed(
-                        _quantizers[5],
-                        _recipe,
-                        _role="grad_output",
-                    )
+                    for _idx, _role in _role_slots:
+                        if _idx < len(_quantizers):
+                            _cppmega_force_compact_many_if_needed(
+                                _quantizers[_idx],
+                                _recipe,
+                                _role=_role,
+                            )
                 except Exception as _gq_exc:
                     if not _cppmega_get_quantizers_warned[0]:
                         _cppmega_get_quantizers_warned[0] = True
@@ -2058,6 +2485,96 @@ if (
 
             _get_weight_quantizers._cppmega_mxfp8_compact = True
             _module_cls._get_weight_quantizers = _get_weight_quantizers
+            return True
+
+        def _cppmega_configure_basic_grouped_linear_quantizers(_self, _recipe=None):
+            if _recipe is None:
+                try:
+                    _recipe = _TE_FP8State.get_fp8_recipe()
+                except Exception:
+                    _recipe = None
+            if not _cppmega_is_mxfp8_recipe(_recipe):
+                return
+            _num_groups = int(getattr(_self, "num_groups", 0) or 0)
+            _get_quantizer = getattr(_self, "get_quantizer", None)
+            if not callable(_get_quantizer):
+                return
+            for _group_idx in range(_num_groups):
+                for _direction, _index, _role in (
+                    ("forward", 2 * _group_idx, "grouped_input"),
+                    ("forward", 2 * _group_idx + 1, "grouped_weight"),
+                    ("backward", _group_idx, "grouped_grad_output"),
+                ):
+                    try:
+                        _quantizer = _get_quantizer(_direction, _index)
+                    except Exception:
+                        continue
+                    _cppmega_force_compact_if_needed(_quantizer, _recipe, _role=_role)
+
+        def _cppmega_wrap_basic_grouped_linear_quantizers(_module_cls):
+            _wrapped = False
+            _orig_pre_fuser_forward = getattr(_module_cls, "pre_fuser_forward", None)
+            if _orig_pre_fuser_forward is not None and not getattr(
+                _orig_pre_fuser_forward,
+                "_cppmega_mxfp8_grouped_emit",
+                False,
+            ):
+
+                @_functools.wraps(_orig_pre_fuser_forward)
+                def _pre_fuser_forward(self, *args, **kwargs):
+                    _result = _orig_pre_fuser_forward(self, *args, **kwargs)
+                    _cppmega_configure_basic_grouped_linear_quantizers(self)
+                    return _result
+
+                _pre_fuser_forward._cppmega_mxfp8_grouped_emit = True
+                _module_cls.pre_fuser_forward = _pre_fuser_forward
+                _wrapped = True
+
+            _orig_reset_recipe_state = getattr(_module_cls, "reset_recipe_state", None)
+            if _orig_reset_recipe_state is not None and not getattr(
+                _orig_reset_recipe_state,
+                "_cppmega_mxfp8_grouped_emit",
+                False,
+            ):
+
+                @_functools.wraps(_orig_reset_recipe_state)
+                def _reset_recipe_state(self, *args, **kwargs):
+                    _result = _orig_reset_recipe_state(self, *args, **kwargs)
+                    _cppmega_configure_basic_grouped_linear_quantizers(
+                        self,
+                        kwargs.get("recipe", None),
+                    )
+                    return _result
+
+                _reset_recipe_state._cppmega_mxfp8_grouped_emit = True
+                _module_cls.reset_recipe_state = _reset_recipe_state
+                _wrapped = True
+
+            return _wrapped
+
+        def _cppmega_wrap_grouped_linear_compact_preference(_module):
+            _orig_prefer = getattr(
+                _module,
+                "_prefer_compact_columnwise_for_backward",
+                None,
+            )
+            if _orig_prefer is None or getattr(
+                _orig_prefer,
+                "_cppmega_grouped_mxfp8_prefer",
+                False,
+            ):
+                return False
+
+            @_functools.wraps(_orig_prefer)
+            def _prefer_compact_columnwise_for_backward(*_quantizers):
+                if not _te_mxfp8_compact_columnwise_backward:
+                    return False
+                return _orig_prefer(*_quantizers)
+
+            _prefer_compact_columnwise_for_backward._cppmega_grouped_mxfp8_prefer = True
+            _module._prefer_compact_columnwise_for_backward = (
+                _prefer_compact_columnwise_for_backward
+            )
             return True
 
         def _cppmega_wrap_quantize_weight(_module):
@@ -2137,7 +2654,7 @@ if (
                     and isinstance(output_quantizer, _TE_MXFP8Quantizer)
                     and _te_mxfp8_transpose_emit_backend in ("auto", "te")
                 ):
-                    if _te_linear_deferred_saved_operand:
+                    if _te_mxfp8_dense_saved_operands and _te_linear_deferred_saved_operand:
                         setattr(
                             output_quantizer,
                             "_te_rowwise_transpose_for_backward_enabled",
@@ -2223,12 +2740,23 @@ if (
                     _patched_gather_modules.append(_module_name.rsplit(".", 1)[-1])
                 if _cppmega_wrap_apply_normalization(_mod):
                     _patched_norm_modules.append(_module_name.rsplit(".", 1)[-1])
-                for _class_name in ("Linear", "LayerNormLinear", "GroupedLinear"):
+                if (
+                    _module_name.endswith(".module.grouped_linear")
+                    and _cppmega_wrap_grouped_linear_compact_preference(_mod)
+                ):
+                    _patched_quantizer_modules.append("GroupedLinear.compact_prefer")
+                for _class_name in ("Linear", "LayerNormLinear", "LayerNormMLP", "GroupedLinear"):
                     _class = getattr(_mod, _class_name, None)
                     if _class is not None and _cppmega_wrap_get_quantizers(_class):
                         _patched_quantizer_modules.append(_class_name)
                     if _class is not None and _cppmega_wrap_get_weight_quantizers(_class):
                         _patched_weight_quantizer_modules.append(_class_name)
+                    if (
+                        _module_name.endswith(".ops.basic.grouped_linear")
+                        and _class is not None
+                        and _cppmega_wrap_basic_grouped_linear_quantizers(_class)
+                    ):
+                        _patched_quantizer_modules.append(f"{_class_name}.basic_grouped")
             except Exception as _wrap_exc:
                 print(
                     f"[cppmega_fp8_shim] WARNING: TE module {_module_name!r} "
@@ -2246,7 +2774,11 @@ if (
             f"mxfp8_bwd_tn_adapter={_te_mxfp8_bwd_tn_adapter}, "
             f"mxfp8_transpose_emit_backend={_te_mxfp8_transpose_emit_backend}, "
             f"mxfp8_transpose_emit_swizzled={_te_mxfp8_transpose_emit_swizzled}, "
+            f"cutlass_mxfp8_scale_backend={_cutlass_mxfp8_scale_backend}, "
             f"mxfp8_compact_columnwise_backward={_te_mxfp8_compact_columnwise_backward}, "
+            f"mxfp8_dense_saved_operands={_te_mxfp8_dense_saved_operands}, "
+            f"mxfp8_grouped_gemm_ready_backward={_te_mxfp8_grouped_gemm_ready_backward}, "
+            f"mxfp8_grouped_direct_backward={_te_mxfp8_grouped_direct_backward}, "
             f"mxfp8_bwd_allow_bf16_fallback={_te_mxfp8_bwd_allow_bf16_fallback}, "
             f"gemm_modules={_patched_gemm_modules}, "
             f"grouped_gemm_modules={_patched_grouped_gemm_modules}, "

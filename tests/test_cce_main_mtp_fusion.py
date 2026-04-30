@@ -8,7 +8,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from cppmega.megatron import mtp_native_hopper_ce as mtp_ce_mod
 from cppmega.megatron.mtp_native_hopper_ce import (
+    _install_process_mtp_loss_patch,
     _install_linear_ce_forward_cache_patch,
     attach_fused_main_mtp_cce_loss,
     fused_main_mtp_cce_loss,
@@ -296,7 +298,94 @@ def test_attached_fused_loss_is_consumed_by_linear_ce_forward(monkeypatch):
     assert cached.shape == labels.shape
 
 
-def test_fused_main_mtp_cce_loss_declines_non_cce_backend():
+def test_process_mtp_loss_fused_cce_path_feeds_main_cache(monkeypatch):
+    monkeypatch.setenv("CPPMEGA_CCE_FUSE_MAIN_MTP_CE", "1")
+    torch.manual_seed(6789)
+
+    import sys
+
+    from megatron.core.transformer import multi_token_prediction as mtp_mod
+    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
+
+    rebind_targets = (
+        "megatron.core.transformer.multi_token_prediction",
+        "megatron.core.models.mamba.mamba_model",
+        "megatron.core.models.gpt.gpt_model",
+        "megatron.core.models.common.language_module.language_module",
+    )
+    original_process_refs = {}
+    for name in rebind_targets:
+        mod = sys.modules.get(name)
+        if mod is not None and hasattr(mod, "process_mtp_loss"):
+            original_process_refs[name] = (mod, getattr(mod, "process_mtp_loss"))
+
+    original = getattr(
+        mtp_mod.process_mtp_loss,
+        "_cppmega_original",
+        mtp_mod.process_mtp_loss,
+    )
+    mtp_mod.process_mtp_loss = original
+
+    class CountingCceOutputLayer(_FakeCceOutputLayer):
+        def __init__(self, weight: torch.Tensor):
+            super().__init__(weight)
+            self.calls = 0
+
+        def forward(self, *args, **kwargs):
+            self.calls += 1
+            return super().forward(*args, **kwargs)
+
+    _install_linear_ce_forward_cache_patch(CountingCceOutputLayer)
+
+    def _fallback_ce(*_args, **_kwargs):
+        raise AssertionError("fallback CE path should not run")
+
+    try:
+        _install_process_mtp_loss_patch()
+
+        batch, seq, hidden, vocab, mtp_depth = 2, 5, 4, 17, 2
+        hidden_states = torch.randn(
+            (1 + mtp_depth) * seq,
+            batch,
+            hidden,
+            requires_grad=True,
+        )
+        labels = torch.randint(0, vocab, (batch, seq))
+        loss_mask = torch.ones(batch, seq)
+        output_layer = CountingCceOutputLayer(torch.randn(vocab, hidden))
+
+        MTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
+        hidden_main = mtp_mod.process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=labels,
+            loss_mask=loss_mask,
+            output_layer=output_layer,
+            output_weight=output_layer.weight,
+            runtime_gather_output=False,
+            is_training=False,
+            compute_language_model_loss=_fallback_ce,
+            config=_config(mtp_depth),
+        )
+
+        assert output_layer.calls == 1
+        cached_main_loss = output_layer(
+            hidden_main,
+            output_cross_entropy_loss=True,
+            labels=labels,
+            reduction="none",
+            ignore_index=-100,
+        )
+
+        assert output_layer.calls == 1
+        assert cached_main_loss.shape == labels.shape
+    finally:
+        for _name, (mod, fn) in original_process_refs.items():
+            setattr(mod, "process_mtp_loss", fn)
+
+
+def test_fused_main_mtp_cce_loss_declines_non_cce_backend(monkeypatch, capsys):
+    monkeypatch.setenv("CPPMEGA_CCE_FUSE_MAIN_MTP_CE", "1")
+    mtp_ce_mod._FUSED_MAIN_MTP_CCE_DECLINE_REASONS_LOGGED.clear()
     output_layer = torch.nn.Module()
     output_layer._cppmega_linear_ce_backend = "liger"
     loss = fused_main_mtp_cce_loss(
@@ -310,3 +399,4 @@ def test_fused_main_mtp_cce_loss_declines_non_cce_backend():
         config=_config(mtp_num_layers=2),
     )
     assert loss is None
+    assert "LinearCE backend is 'liger'" in capsys.readouterr().out

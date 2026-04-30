@@ -88,17 +88,22 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert env["CPPMEGA_FLASH_ATTN_SOURCE_ROOT"] == "/home/dave/flash-attention-fa4"
     assert env["CPPMEGA_TRANSFORMER_ENGINE_SOURCE_ROOT"] == "/home/dave/TransformerEngine"
     assert env["CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE"] == "256"
-    assert env["CPPMEGA_CCE_FUSE_MAIN_MTP_CE"] == "0"
+    assert env["CPPMEGA_CCE_FUSE_MAIN_MTP_CE"] == "1"
+    assert env["CPPMEGA_CCE_FILTER_EPS"] == "high"
     assert env["CPPMEGA_DSA_FP8_ATTENTION"] == "0"
     assert "--moe-token-dispatcher-type alltoall" in env["NATIVE_ARGS"]
     assert env["CPPMEGA_OPTIMIZER"] == "muon"
     assert env["CPPMEGA_PARAM_STORAGE"] == "mxfp8"
     assert env["CPPMEGA_FP8_FORMAT"] == "e4m3"
     assert env["CPPMEGA_MUON_NUM_NS_STEPS"] == "3"
+    assert env["CPPMEGA_MUON_NS_CARRIER"] == "bf16"
+    assert env["CPPMEGA_MUON_DTYPE_AUDIT"] == "0"
     assert env["CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE"] == "int8"
-    assert env["CPPMEGA_TE_MXFP8_BWD_BACKEND"] == "flashinfer_cutlass"
+    assert env["CPPMEGA_TE_MXFP8_BWD_BACKEND"] == "te_tn_adapter"
     assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
+    assert env["CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND"] == "compact"
     assert env["CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD"] == "0"
+    assert env["CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS"] == "1"
     assert env["CPPMEGA_FLASHINFER_MXFP8_RUNNER"] == "mm_mxfp8"
     assert env["CPPMEGA_FLASHINFER_MXFP8_TACTIC"] == "0"
     assert env["HYBRID_LAYER_PATTERN"].endswith("/*-/*-")
@@ -163,6 +168,8 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
             "--mxfp8-transpose-emit-backend",
             "off",
             "--mxfp8-compact-columnwise-backward",
+            "--no-mxfp8-dense-saved-operands",
+            "--no-mxfp8-grouped-gemm-ready-backward",
             "--fp8-param-gather",
             "--no-reuse-grad-buf-for-mxfp8-param-ag",
             "--no-mxfp8-transpose-emit-swizzled",
@@ -178,10 +185,15 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
             "--noconv-mamba-chunk-size",
             "128",
             "--cce-fuse-main-mtp-ce",
+            "--cce-filter-eps",
+            "high",
             "--mxfp8-flashinfer-runner",
             "direct_tactic",
             "--mxfp8-flashinfer-tactic",
             "2",
+            "--muon-ns-carrier",
+            "mxfp8_probe",
+            "--muon-dtype-audit",
         ],
     )
 
@@ -192,11 +204,15 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
     assert "export CPPMEGA_OPTIMIZER=adam" in out
     assert "export CPPMEGA_PARAM_STORAGE=bf16" in out
     assert "export CPPMEGA_MUON_NUM_NS_STEPS=5" in out
+    assert "export CPPMEGA_MUON_NS_CARRIER=mxfp8_probe" in out
+    assert "export CPPMEGA_MUON_DTYPE_AUDIT=1" in out
     assert "export CPPMEGA_FP8_FORMAT=e4m3" in out
     assert "export CPPMEGA_ATTN_BACKEND=fused" in out
     assert "export CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native" in out
     assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=off" in out
     assert "export CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=1" in out
+    assert "export CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS=0" in out
+    assert "export CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD=0" in out
     assert "export CPPMEGA_FP8_PARAM_GATHER=1" in out
     assert "export CPPMEGA_REUSE_GRAD_BUF_FOR_MXFP8_PARAM_AG=0" in out
     assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED=0" in out
@@ -207,6 +223,7 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
     assert "export CPPMEGA_NSYS_DURATION=5" in out
     assert "export CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE=128" in out
     assert "export CPPMEGA_CCE_FUSE_MAIN_MTP_CE=1" in out
+    assert "export CPPMEGA_CCE_FILTER_EPS=high" in out
     assert "export CPPMEGA_FLASHINFER_MXFP8_RUNNER=direct_tactic" in out
     assert "export CPPMEGA_FLASHINFER_MXFP8_TACTIC=2" in out
     assert "--mtp-num-layers 1" in out
@@ -253,6 +270,49 @@ def test_compact_columnwise_rejects_non_cutlass_backend(monkeypatch):
         main()
 
 
+def test_swizzled_cutlass_scale_cli_selects_cutlass_native(capsys, monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_profiles",
+            "shell",
+            "local_gb10_quarter",
+            "--fp8-recipe",
+            "mxfp8",
+            "--mxfp8-cutlass-scale-backend",
+            "swizzled",
+        ],
+    )
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "export CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native" in out
+    assert "export CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND=swizzled" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=te" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED=1" in out
+    assert "export CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=0" in out
+
+
+def test_swizzled_cutlass_scale_rejects_non_cutlass_backend(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_profiles",
+            "shell",
+            "local_gb10_quarter",
+            "--fp8-recipe",
+            "mxfp8",
+            "--mxfp8-bwd-backend",
+            "flashinfer_cutlass",
+            "--mxfp8-cutlass-scale-backend",
+            "swizzled",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="requires --mxfp8-bwd-backend cutlass_native"):
+        main()
+
+
 def test_nsys_profile_defaults_to_full_capture_not_cuda_profiler_api():
     profile = get_run_profile("local_gb10_quarter")
     profile.profiling.nsys_profile = True
@@ -290,6 +350,10 @@ def test_local_launcher_lets_native_args_own_moe_dispatcher_flag():
     assert '--moe-token-dispatcher-type "${CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE}"' not in script
     assert "apply_moe_dispatcher_identity_sort_patch()" in script
     assert "CPPMEGA_MUON_NUM_NS_STEPS:-3" in script
+    assert "CPPMEGA_MUON_NS_CARRIER:-bf16" in script
+    assert "CPPMEGA_MUON_DTYPE_AUDIT:-0" in script
+    assert "CPPMEGA_CCE_FILTER_EPS:-none" in script
+    assert "install_muon_dtype_audit" in script
     assert "CPPMEGA_EXTRA_PYTHONPATH" in script
     assert "flash_attn import:" in script
 
@@ -311,11 +375,13 @@ def test_remote_gb10_launcher_preserves_muon_ns_override():
     assert "--attention-backend flash" not in script
 
 
-def test_local_gb10_quarter_mxfp8_defaults_to_flashinfer_cutlass():
-    """The local_gb10_quarter profile defaults to TE payload + FlashInfer/CUTLASS."""
+def test_local_gb10_quarter_mxfp8_defaults_to_measured_te_tn_backend():
+    """The local_gb10_quarter profile defaults to the fastest measured GB10 MXFP8 backend."""
     profile = get_run_profile("local_gb10_quarter")
-    assert profile.precision.mxfp8_bwd_backend == "flashinfer_cutlass"
+    assert profile.precision.mxfp8_bwd_backend == "te_tn_adapter"
     assert profile.precision.mxfp8_flashinfer_runner == "mm_mxfp8"
+    assert profile.precision.mxfp8_dense_saved_operands is True
+    assert profile.precision.mxfp8_grouped_direct_backward is False
 
 
 def test_mxfp8_transpose_emit_defaults_to_te_for_tn_adapter():
@@ -324,6 +390,9 @@ def test_mxfp8_transpose_emit_defaults_to_te_for_tn_adapter():
     profile.precision.fp8_recipe = "mxfp8"
     env = profile_shell_assignments(profile)
     assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
+    assert env["CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS"] == "1"
+    assert env["CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD"] == "0"
+    assert env["CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD"] == "1"
 
 
 def test_mxfp8_docs_pin_zero_copy_acceptance_counters():

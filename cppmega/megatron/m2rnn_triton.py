@@ -71,11 +71,15 @@ _BWD_CHUNK_SIZE_ENV = "CPPMEGA_M2RNN_BWD_CHUNK_SIZE"
 _FWD_AUTOTUNE_ENV = "CPPMEGA_M2RNN_FWD_AUTOTUNE"
 _FWD_NUM_WARPS_ENV = "CPPMEGA_M2RNN_FWD_NUM_WARPS"
 _FWD_NUM_STAGES_ENV = "CPPMEGA_M2RNN_FWD_NUM_STAGES"
+_BROADCAST_VIEWS_ENV = "CPPMEGA_M2RNN_BROADCAST_VIEWS"
+_BWD_REDUCE_BROADCAST_QK_ENV = "CPPMEGA_M2RNN_BWD_REDUCE_BROADCAST_QK"
 _DEFAULT_SAVE_HNEW = False
 _DEFAULT_BWD_CHUNK_SIZE = 64
 _DEFAULT_FWD_AUTOTUNE = False
 _DEFAULT_FWD_NUM_WARPS = 4
 _DEFAULT_FWD_NUM_STAGES = 3
+_DEFAULT_BROADCAST_VIEWS = True
+_DEFAULT_BWD_REDUCE_BROADCAST_QK = False
 
 
 @dataclass(frozen=True)
@@ -95,11 +99,29 @@ class M2RNNRuntimeConfig:
     fwd_autotune: bool = _DEFAULT_FWD_AUTOTUNE
     fwd_num_warps: int = _DEFAULT_FWD_NUM_WARPS
     fwd_num_stages: int = _DEFAULT_FWD_NUM_STAGES
+    # Keep 1->H head broadcasts as stride-0 views instead of materializing
+    # repeat_interleave tensors.  Production M2RNN uses one q/k head broadcast
+    # to many value/state heads, so this removes large pre-kernel copies.
+    broadcast_views: bool = _DEFAULT_BROADCAST_VIEWS
+    # Experimental: when q/k were broadcast from one original head, accumulate
+    # dq/dk directly into single-head fp32 buffers instead of materializing
+    # expanded H-head gradient tensors and reducing them afterwards.  This is
+    # not a default because it changes the reduction order/precision.
+    bwd_reduce_broadcast_qk: bool = _DEFAULT_BWD_REDUCE_BROADCAST_QK
 
 
-_M2RNN_RUNTIME_CONFIG_CACHE: (
-    tuple[tuple[str | None, str | None, str | None, str | None, str | None], M2RNNRuntimeConfig] | None
-) = None
+_M2RNN_RUNTIME_CONFIG_CACHE: tuple[
+    tuple[
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+    ],
+    M2RNNRuntimeConfig,
+] | None = None
 
 
 def _env_flag(raw: str | None, default: bool) -> bool:
@@ -149,6 +171,8 @@ def get_m2rnn_runtime_config() -> M2RNNRuntimeConfig:
         os.environ.get(_FWD_AUTOTUNE_ENV),
         os.environ.get(_FWD_NUM_WARPS_ENV),
         os.environ.get(_FWD_NUM_STAGES_ENV),
+        os.environ.get(_BROADCAST_VIEWS_ENV),
+        os.environ.get(_BWD_REDUCE_BROADCAST_QK_ENV),
     )
     cached = _M2RNN_RUNTIME_CONFIG_CACHE
     if cached is not None and cached[0] == raw_env:
@@ -163,6 +187,10 @@ def get_m2rnn_runtime_config() -> M2RNNRuntimeConfig:
         ),
         fwd_num_stages=_env_int_choice(
             raw_env[4], _DEFAULT_FWD_NUM_STAGES, {1, 2, 3, 4}
+        ),
+        broadcast_views=_env_flag(raw_env[5], _DEFAULT_BROADCAST_VIEWS),
+        bwd_reduce_broadcast_qk=_env_flag(
+            raw_env[6], _DEFAULT_BWD_REDUCE_BROADCAST_QK
         ),
     )
     _M2RNN_RUNTIME_CONFIG_CACHE = (raw_env, config)
@@ -748,6 +776,8 @@ if TRITON_AVAILABLE:
         # runtime chunk coordinate
         start,
         SAVE_HNEW: tl.constexpr,
+        DQ_REDUCE_HEADS: tl.constexpr,
+        DK_REDUCE_HEADS: tl.constexpr,
         CHUNK_LEN: tl.constexpr,
         NHEADS: tl.constexpr,
         K_DIM: tl.constexpr,
@@ -877,14 +907,28 @@ if TRITON_AVAILABLE:
 
             dh = xf_s * dh + dh_from_mm
 
-            tl.store(
-                dq_ptr + b * dq_sb + s * dq_ss + h_idx * dq_sh + offs_k * dq_sk,
-                dq_s,
-            )
-            tl.store(
-                dk_ptr + b * dk_sb + s * dk_ss + h_idx * dk_sh + offs_k * dk_sk,
-                dk_s,
-            )
+            if DQ_REDUCE_HEADS:
+                tl.atomic_add(
+                    dq_ptr + b * dq_sb + s * dq_ss + offs_k * dq_sk,
+                    dq_s,
+                    sem="relaxed",
+                )
+            else:
+                tl.store(
+                    dq_ptr + b * dq_sb + s * dq_ss + h_idx * dq_sh + offs_k * dq_sk,
+                    dq_s,
+                )
+            if DK_REDUCE_HEADS:
+                tl.atomic_add(
+                    dk_ptr + b * dk_sb + s * dk_ss + offs_k * dk_sk,
+                    dk_s,
+                    sem="relaxed",
+                )
+            else:
+                tl.store(
+                    dk_ptr + b * dk_sb + s * dk_ss + h_idx * dk_sh + offs_k * dk_sk,
+                    dk_s,
+                )
             tl.store(
                 dv_ptr + b * dv_sb + s * dv_ss + h_idx * dv_sh + offs_v * dv_sv,
                 dv_s,
@@ -922,6 +966,8 @@ def _broadcast_heads(
     v: torch.Tensor,
     W: torch.Tensor,
     xf: torch.Tensor,
+    *,
+    broadcast_views: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Broadcast all head counts to the common maximum (same logic as
     ``_torch_m2rnn_forward``)."""
@@ -932,36 +978,74 @@ def _broadcast_heads(
     n_f = xf.size(-1)
     n = max(n_q, n_k, n_v, n_w, n_f)
 
+    def _broadcast_head_tensor(
+        x: torch.Tensor,
+        cur_n: int,
+        target_n: int,
+        *,
+        dim: int,
+    ) -> torch.Tensor:
+        if cur_n == target_n:
+            return x
+        if cur_n == 1 and broadcast_views:
+            shape = list(x.shape)
+            shape[dim] = target_n
+            return x.expand(*shape)
+        return x.repeat_interleave(target_n // cur_n, dim=dim)
+
     if n_q != n:
-        q = q.repeat_interleave(n // n_q, dim=-2)
+        q = _broadcast_head_tensor(q, n_q, n, dim=-2)
     if n_k != n:
-        k = k.repeat_interleave(n // n_k, dim=-2)
+        k = _broadcast_head_tensor(k, n_k, n, dim=-2)
     if n_v != n:
-        v = v.repeat_interleave(n // n_v, dim=-2)
+        v = _broadcast_head_tensor(v, n_v, n, dim=-2)
     if n_w != n:
-        W = W.repeat_interleave(n // n_w, dim=0)
+        W = _broadcast_head_tensor(W, n_w, n, dim=0)
     if n_f != n:
-        xf = xf.repeat_interleave(n // n_f, dim=-1)
+        xf = _broadcast_head_tensor(xf, n_f, n, dim=-1)
     return q, k, v, W, xf, n
+
+
+def _contiguous_unless_head_expanded(
+    x: torch.Tensor,
+    *,
+    head_dim: int,
+) -> torch.Tensor:
+    """Keep stride-0 head broadcasts as views; materialize other layouts."""
+    if head_dim < 0:
+        head_dim += x.ndim
+    if x.stride(head_dim) == 0:
+        return x
+    return x.contiguous()
 
 
 class _M2RNNFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, W, xf, h0):
+    def forward(ctx, q, k, v, W, xf, h0, runtime_config):
         assert TRITON_AVAILABLE, "Triton is required for m2rnn_scan_triton"
         assert q.is_cuda, "m2rnn_scan_triton requires CUDA tensors"
 
-        q_b, k_b, v_b, W_b, xf_b, H = _broadcast_heads(q, k, v, W, xf)
+        if runtime_config is None:
+            runtime_config = get_m2rnn_runtime_config()
+        q_b, k_b, v_b, W_b, xf_b, H = _broadcast_heads(
+            q,
+            k,
+            v,
+            W,
+            xf,
+            broadcast_views=runtime_config.broadcast_views,
+        )
 
         B, S, _, K_DIM = q_b.shape
         V_DIM = v_b.size(-1)
 
-        # Require contiguous for predictable strides.
-        q_c = q_b.contiguous()
-        k_c = k_b.contiguous()
-        v_c = v_b.contiguous()
-        W_c = W_b.contiguous()
-        xf_c = xf_b.contiguous()
+        # Triton receives explicit strides, so production 1->H head broadcasts
+        # can stay as stride-0 views instead of materializing q/k copies.
+        q_c = _contiguous_unless_head_expanded(q_b, head_dim=-2)
+        k_c = _contiguous_unless_head_expanded(k_b, head_dim=-2)
+        v_c = _contiguous_unless_head_expanded(v_b, head_dim=-2)
+        W_c = _contiguous_unless_head_expanded(W_b, head_dim=0)
+        xf_c = _contiguous_unless_head_expanded(xf_b, head_dim=-1)
 
         if h0 is None:
             # Valid pointer for the Triton signature; not read when HAS_H0=False.
@@ -974,7 +1058,6 @@ class _M2RNNFn(torch.autograd.Function):
             has_h0 = True
             h0_dtype = h0.dtype
 
-        runtime_config = get_m2rnn_runtime_config()
         save_hnew = runtime_config.save_hnew
         chunk_size = runtime_config.bwd_chunk_size
         num_chunks = (S + chunk_size - 1) // chunk_size
@@ -1041,41 +1124,60 @@ class _M2RNNFn(torch.autograd.Function):
                 num_stages=runtime_config.fwd_num_stages,
             )
 
-        ctx.save_for_backward(q_c, k_c, v_c, W_c, xf_c, h0_c, checkpoints, h_new_save)
+        ctx.save_for_backward(q_c, k_c, v_c, W_c, xf_c, checkpoints, h_new_save)
         ctx.has_h0 = has_h0
         ctx.h0_dtype = h0_dtype
         ctx.save_hnew = save_hnew
         ctx.bwd_chunk_size = chunk_size
+        ctx.bwd_reduce_broadcast_qk = runtime_config.bwd_reduce_broadcast_qk
         ctx.num_chunks = num_chunks
         ctx.orig_shapes = (q.shape, k.shape, v.shape, W.shape, xf.shape)
         return out, h_final
 
     @staticmethod
     def backward(ctx, dout, dh_final):
-        q_c, k_c, v_c, W_c, xf_c, _h0_c, checkpoints, h_new_save = ctx.saved_tensors
+        q_c, k_c, v_c, W_c, xf_c, checkpoints, h_new_save = ctx.saved_tensors
         has_h0 = ctx.has_h0
         save_hnew = ctx.save_hnew
         chunk_size = ctx.bwd_chunk_size
+        reduce_broadcast_qk = ctx.bwd_reduce_broadcast_qk
         num_chunks = ctx.num_chunks
         orig_q_shape, orig_k_shape, orig_v_shape, orig_W_shape, orig_xf_shape = ctx.orig_shapes
 
         B, S, H, K_DIM = q_c.shape
         V_DIM = v_c.size(-1)
+        reduce_q_heads = reduce_broadcast_qk and orig_q_shape[-2] == 1 and H > 1
+        reduce_k_heads = reduce_broadcast_qk and orig_k_shape[-2] == 1 and H > 1
 
         if dout is None:
             dout_c = torch.zeros(B, S, H, V_DIM, device=q_c.device, dtype=q_c.dtype)
         else:
-            dout_c = dout.contiguous()
+            # The chunk bwd kernel accepts explicit dout strides.  Keeping
+            # expanded/non-contiguous grad outputs avoids materializing a full
+            # B*S*H*V copy for common losses such as out.sum().
+            dout_c = dout
 
         if dh_final is None:
             dh_carry = torch.zeros(B, H, K_DIM, V_DIM, device=q_c.device, dtype=torch.float32)
         else:
             # The chunk kernels overwrite this tensor with the carry for the
             # previous chunk, so never mutate autograd's incoming grad tensor.
-            dh_carry = dh_final.to(torch.float32).contiguous().clone()
+            if dh_final.dtype == torch.float32 and dh_final.is_contiguous():
+                dh_carry = dh_final.clone()
+            else:
+                dh_carry = dh_final.to(dtype=torch.float32).contiguous()
 
-        dq = torch.empty_like(q_c)
-        dk = torch.empty_like(k_c)
+        qk_reduce_dtype = torch.float32
+        dq = (
+            torch.zeros(B, S, 1, K_DIM, device=q_c.device, dtype=qk_reduce_dtype)
+            if reduce_q_heads
+            else torch.empty_like(q_c)
+        )
+        dk = (
+            torch.zeros(B, S, 1, K_DIM, device=k_c.device, dtype=qk_reduce_dtype)
+            if reduce_k_heads
+            else torch.empty_like(k_c)
+        )
         dv = torch.empty_like(v_c)
         dxf = torch.empty_like(xf_c)
         # Per-(batch*head) dW slabs; chunk kernels accumulate into these and
@@ -1134,6 +1236,8 @@ class _M2RNNFn(torch.autograd.Function):
                 dxf,
                 start,
                 SAVE_HNEW=save_hnew,
+                DQ_REDUCE_HEADS=reduce_q_heads,
+                DK_REDUCE_HEADS=reduce_k_heads,
                 CHUNK_LEN=chunk_len,
                 NHEADS=H,
                 K_DIM=K_DIM,
@@ -1169,15 +1273,23 @@ class _M2RNNFn(torch.autograd.Function):
         # Collapse broadcasted dims back to original shapes. If the original
         # tensor had fewer heads and was repeat_interleaved, sum the expanded
         # grad back to the original head count.
-        dq_out = _unbroadcast_heads(dq, orig_q_shape[-2], dim=-2)
-        dk_out = _unbroadcast_heads(dk, orig_k_shape[-2], dim=-2)
+        dq_out = (
+            dq.to(q_c.dtype)
+            if reduce_q_heads
+            else _unbroadcast_heads(dq, orig_q_shape[-2], dim=-2)
+        )
+        dk_out = (
+            dk.to(k_c.dtype)
+            if reduce_k_heads
+            else _unbroadcast_heads(dk, orig_k_shape[-2], dim=-2)
+        )
         dv_out = _unbroadcast_heads(dv, orig_v_shape[-2], dim=-2)
         dW_out = _unbroadcast_heads(dW, orig_W_shape[0], dim=0)
         dxf_out = _unbroadcast_heads(dxf, orig_xf_shape[-1], dim=-1)
 
         dh0_out = dh_carry.to(ctx.h0_dtype) if has_h0 else None
 
-        return dq_out, dk_out, dv_out, dW_out, dxf_out, dh0_out
+        return dq_out, dk_out, dv_out, dW_out, dxf_out, dh0_out, None
 
 
 def _unbroadcast_heads(grad: torch.Tensor, orig_n: int, dim: int) -> torch.Tensor:
@@ -1209,6 +1321,7 @@ def m2rnn_scan_triton(
     xf: torch.Tensor,
     *,
     h0: Optional[torch.Tensor] = None,
+    runtime_config: Optional[M2RNNRuntimeConfig] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused Triton M²RNN scan, drop-in replacement for
     ``cppmega.megatron.m2rnn_spec._torch_m2rnn_forward``.
@@ -1226,4 +1339,4 @@ def m2rnn_scan_triton(
     """
     if not TRITON_AVAILABLE:
         raise RuntimeError("Triton is not available; cannot run m2rnn_scan_triton")
-    return _M2RNNFn.apply(q, k, v, W, xf, h0)
+    return _M2RNNFn.apply(q, k, v, W, xf, h0, runtime_config)

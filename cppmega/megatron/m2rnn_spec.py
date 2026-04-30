@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import os
 
 import torch
 import torch.nn.functional as F
@@ -22,14 +21,16 @@ from cppmega.megatron.mamba_local_spec import CppMegaLocalMambaStack
 # Fused Triton M²RNN kernel (replaces the pure-Python seq loop below).  When
 # available, ``m2rnn_scan_triton`` is a drop-in for ``_torch_m2rnn_forward``
 # and delivers ~40x fwd speedup on GB10 / ~100x on H200 at NAM56R dims
-# (B=2, S=4096, H=8, K=64, V=16).  Set ``CPPMEGA_M2RNN_KERNEL=torch`` to
-# force the slow reference path for debugging / A-B comparison.
+# (B=2, S=4096, H=8, K=64, V=16).  Set the typed ``m2rnn_kernel`` config
+# field (or legacy ``CPPMEGA_M2RNN_KERNEL=torch`` before model construction)
+# to force the slow reference path for debugging / A-B comparison.
 # Triton M²RNN kernel import.  The torch fallback path is NOT a silent
 # degradation — it's an explicit debug/parity reference selected via
 # CPPMEGA_M2RNN_KERNEL=torch.  If Triton is missing on a GPU host,
 # training will use the 460× slower Python scan and print a loud warning.
 try:
     from cppmega.megatron.m2rnn_triton import (
+        M2RNNRuntimeConfig as _M2RNNRuntimeConfig,
         TRITON_AVAILABLE as _M2RNN_TRITON_AVAILABLE,
         m2rnn_scan_triton as _m2rnn_scan_triton,
     )
@@ -44,6 +45,7 @@ except ImportError:  # pragma: no cover
     )
     _M2RNN_TRITON_AVAILABLE = False
     _m2rnn_scan_triton = None  # type: ignore[assignment]
+    _M2RNNRuntimeConfig = None  # type: ignore[assignment]
 
 
 def _softplus_decay_gate(x: torch.Tensor, A_log: torch.Tensor, dt_bias: torch.Tensor) -> torch.Tensor:
@@ -119,6 +121,20 @@ class CppMegaM2RNNMixer(nn.Module):
         self.kernel_size = m2rnn.conv_kernel
         self.use_residual = m2rnn.use_residual
         self.use_xma = m2rnn.use_xma
+        self.kernel_choice = m2rnn.runtime_kernel
+        self.runtime_config = (
+            _M2RNNRuntimeConfig(
+                save_hnew=m2rnn.runtime_save_hnew,
+                bwd_chunk_size=m2rnn.runtime_bwd_chunk_size,
+                fwd_autotune=m2rnn.runtime_fwd_autotune,
+                fwd_num_warps=m2rnn.runtime_fwd_num_warps,
+                fwd_num_stages=m2rnn.runtime_fwd_num_stages,
+                broadcast_views=m2rnn.runtime_broadcast_views,
+                bwd_reduce_broadcast_qk=m2rnn.runtime_bwd_reduce_broadcast_qk,
+            )
+            if _M2RNNRuntimeConfig is not None
+            else None
+        )
 
         n_heads_default = max(1, self.hidden_size // (self.k_head_dim + self.v_head_dim))
         self.num_q_heads = getattr(config, "m2rnn_num_q_heads", 1)
@@ -227,13 +243,19 @@ class CppMegaM2RNNMixer(nn.Module):
         v_start = k_start + self.k_dim
         v = conv_input[..., v_start : v_start + self.v_dim].view(batch, seq, self.num_v_heads, self.v_head_dim)
 
-        kernel_choice = os.environ.get("CPPMEGA_M2RNN_KERNEL", "triton")
         if (
-            kernel_choice == "triton"
+            self.kernel_choice == "triton"
             and _M2RNN_TRITON_AVAILABLE
             and q.is_cuda
         ):
-            out, _ = _m2rnn_scan_triton(q=q, k=k, v=v, W=self.state_weight, xf=f)
+            out, _ = _m2rnn_scan_triton(
+                q=q,
+                k=k,
+                v=v,
+                W=self.state_weight,
+                xf=f,
+                runtime_config=self.runtime_config,
+            )
         else:
             out, _ = _torch_m2rnn_forward(q=q, k=k, v=v, W=self.state_weight, xf=f)
         if self.D is not None:

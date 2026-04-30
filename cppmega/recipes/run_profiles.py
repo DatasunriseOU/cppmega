@@ -26,8 +26,11 @@ Fp8Format = Literal["hybrid", "e4m3"]
 Fp8Recipe = Literal["off", "tensorwise", "mxfp8"]
 Mxfp8BackwardBackend = Literal["te_tn_adapter", "flashinfer_cutlass", "cutlass_native"]
 Mxfp8TransposeEmitBackend = Literal["auto", "te", "off"]
+Mxfp8CutlassScaleBackend = Literal["compact", "prepack", "swizzled"]
 Mxfp8FlashinferRunner = Literal["mm_mxfp8", "direct_tactic"]
 ParamStorage = Literal["auto", "bf16", "mxfp8"]
+MuonNsCarrier = Literal["bf16", "mxfp8_probe"]
+CceFilterEps = Literal["none", "auto", "high"]
 SparseMlaMode = Literal["tilelang", "gather_scatter", "pytorch"]
 MoeDispatcher = Literal["flex", "alltoall", "allgather"]
 MoeFlexBackend = Literal["deepep", "hybridep"]
@@ -94,9 +97,10 @@ class PrecisionProfile:
     """Precision and kernel-route choices for the launch."""
 
     # Tensorwise FP8 is the conservative GB10 lane.  Dense MXFP8 Linear GEMMs
-    # route clean GEMM calls through TE payload + FlashInfer/CUTLASS
-    # layout_128x4 by default; the old compact direct CUTLASS loader remains
-    # an explicit experiment.  This is not the attention backend: attention is
+    # can route clean GEMM calls through TE payload + FlashInfer/CUTLASS
+    # layout_128x4, while profile setters may choose a faster measured backend
+    # for a specific machine.  The old compact direct CUTLASS loader remains an
+    # explicit experiment.  This is not the attention backend: attention is
     # controlled separately by ``attention_backend`` and local GB10 pins it to
     # patched FA4.
     # ``auto`` would hide the important contract here, so the resolved profile
@@ -120,12 +124,31 @@ class PrecisionProfile:
     mxfp8_transpose_emit_backend: Mxfp8TransposeEmitBackend = "te"
     mxfp8_transpose_emit_swizzled: bool = True
     mxfp8_transpose_emit_strict: bool = True
+    # ``compact`` uses the manual compact-scale CUTLASS mainloop. ``swizzled``
+    # keeps compact primary tensors for TE transpose emit, then routes
+    # GEMM-ready rowwise-transpose operands through the stock SM120
+    # block-scaled CUTLASS mainloop.
+    mxfp8_cutlass_scale_backend: Mxfp8CutlassScaleBackend = "compact"
     # Experimental dense Linear backward mode: TE saves original compact
     # columnwise MXFP8 operands and lets the cppmega compact-direct backend
     # read them directly.  This removes the dense rowwise-transpose copies, but
     # the current SM120 direct loader is slower than the TE-transpose TN path on
     # full-model GB10 runs, so keep it opt-in until the loader/mainloop is fixed.
     mxfp8_compact_columnwise_backward: bool = False
+    # Dense TE backward uses patched TE/cppmega hooks to save or emit
+    # GEMM-ready rowwise-transposed MXFP8 operands at the producing operation.
+    # This covers Linear/LayerNormLinear saved activations and backward
+    # grad-output producers, avoiding the deprecated copy-transpose bridge.
+    mxfp8_dense_saved_operands: bool = True
+    # Experimental MoE grouped backward mode: consumes grouped compact MXFP8
+    # operands directly.  Keep this separate from dense compact-columnwise
+    # because the current grouped direct kernels save memory but are slower than
+    # the grouped TN adapter on GB10 full-model smoke runs.
+    mxfp8_grouped_direct_backward: bool = False
+    # Preferred grouped/MoE backward route: if TE has already saved GEMM-ready
+    # rowwise-transposed MXFP8 operands, call grouped TN GEMM directly and avoid
+    # the copy bridge.  This is distinct from compact direct kernels above.
+    mxfp8_grouped_gemm_ready_backward: bool = True
     # FlashInfer's public mm_mxfp8 path owns autotuning. direct_tactic bypasses
     # that layer and is only for shape/tactic probes when nsys shows overhead.
     mxfp8_flashinfer_runner: Mxfp8FlashinferRunner = "mm_mxfp8"
@@ -153,11 +176,13 @@ class OptimizerProfile:
     muon_momentum: str = "0.95"
     muon_scale_mode: str = "spectral"
     muon_num_ns_steps: int = 5
+    muon_ns_carrier: MuonNsCarrier = "bf16"
     muon_tp_mode: str = "blockwise"
     muon_scalar_optimizer: str = "adam8bit"
     muon_quantized_momentum: bool = True
     muon_quantized_momentum_dtype: str = "int8"
     muon_quantized_momentum_block_size: int = 256
+    muon_dtype_audit: bool = False
     use_bf16_no_master_emerging_optimizer: bool = True
     use_bf16_no_master_emerging_fallback_optimizer: bool = True
     grad_reduce_in_bf16: bool = True
@@ -191,10 +216,13 @@ class RuntimePatchProfile:
     structure_enabled: bool = True
     structure_components: str = "core"
     mtp_ce_kernel: MtpCEKernel = "native"
-    # Experimental CCE launch fusion for main+MTP heads. Real GB10 A/B on
-    # 2026-04-28 was finite but slower, so this stays off unless explicitly
-    # requested by a profile/CLI override.
+    # CCE launch fusion for main+MTP heads. Keep the base profile disabled;
+    # measured launch profiles can opt in when one CCE call beats separate
+    # main + MTP-depth calls.
     cce_fuse_main_mtp_ce: bool = False
+    # Apple CCE's approximate block filtering knob. Keep it typed here so
+    # performance lanes can A/B exact vs approximate CE without ad hoc env.
+    cce_filter_eps: CceFilterEps | str = "none"
     acknowledge_liger_mtp_ce_deprecated: bool = False
     # Local source overrides that must be part of the typed launch contract.
     # The GB10 FA4/TE fixes are source-tree patches, not installed PyPI wheels;
@@ -343,14 +371,27 @@ def _validate_noconv_mamba_chunk_size(value: int) -> int:
     return value
 
 
+def _validate_cce_filter_eps(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in ("none", "auto", "high"):
+        return normalized
+    try:
+        parsed = float(normalized)
+    except ValueError as exc:
+        raise ValueError("--cce-filter-eps must be none|auto|high or a positive float") from exc
+    if parsed <= 0:
+        raise ValueError("--cce-filter-eps float must be positive")
+    return normalized
+
+
 def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProfile:
     """Fill the local GB10 NAM56R-quarter profile.
 
     This is the default correctness lane used on the single-GB10 box: full
-    NAM56R width, quarter depth, real 4k clang data, MTP=2, CCE MTP CE, TE
-    patched FA4 SM120 routing, tensorwise FP8, no-master Muon, q8 Muon momentum,
-    and disabled contiguous local DDP grad buffer.  It intentionally favors
-    debuggability and memory pressure over production H200 throughput.
+    NAM56R width, quarter depth, real 4k clang data, MTP=2, fused main+MTP CCE,
+    TE patched FA4 SM120 routing, tensorwise FP8, no-master Muon, q8 Muon
+    momentum, and disabled contiguous local DDP grad buffer. It intentionally
+    favors debuggability and memory pressure over production H200 throughput.
     """
 
     if profile is None:
@@ -362,12 +403,19 @@ def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProf
     # Keep this in the typed profile instead of relying on a shell fallback.
     profile.model.moe_token_dispatcher_type = "alltoall"
     profile.precision.attention_backend = "flash"
+    # GB10 MXFP8 profiler runs on 2026-04-29 showed FlashInfer/CUTLASS backward
+    # spending ~878 ms/step in 68 GEMMs, while the TE TN adapter cut steady
+    # step time by ~8% with no BF16 fallback.  Keep FlashInfer selectable via
+    # --mxfp8-bwd-backend for targeted kernel probes.
+    profile.precision.mxfp8_bwd_backend = "te_tn_adapter"
     # The remaining BF16 GEMM hotspot on GB10 is Muon's Newton-Schulz loop.
     # nanochat's comparable performance presets use 3 iterations; keep this as
     # a typed profile default so runs can restore 5 with --muon-num-ns-steps 5.
     profile.optimizer.muon_num_ns_steps = 3
     profile.runtime = RuntimePatchProfile(
         mtp_ce_kernel="cce",
+        cce_fuse_main_mtp_ce=True,
+        cce_filter_eps="high",
         acknowledge_liger_mtp_ce_deprecated=False,
         noconv_mamba_chunk_size=256,
     )
@@ -439,6 +487,24 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
             "mxfp8_compact_columnwise_backward requires "
             "mxfp8_bwd_backend='cutlass_native'"
         )
+    if (
+        profile.precision.fp8_recipe == "mxfp8"
+        and profile.precision.mxfp8_cutlass_scale_backend == "swizzled"
+        and profile.precision.mxfp8_bwd_backend != "cutlass_native"
+    ):
+        raise ValueError(
+            "mxfp8_cutlass_scale_backend='swizzled' requires "
+            "mxfp8_bwd_backend='cutlass_native'"
+        )
+    if (
+        profile.precision.fp8_recipe == "mxfp8"
+        and profile.precision.mxfp8_cutlass_scale_backend == "swizzled"
+        and profile.precision.mxfp8_compact_columnwise_backward
+    ):
+        raise ValueError(
+            "mxfp8_cutlass_scale_backend='swizzled' is incompatible with "
+            "mxfp8_compact_columnwise_backward"
+        )
 
     env: dict[str, str] = {
         "CPPMEGA_RUN_PROFILE": profile.name,
@@ -476,6 +542,7 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         "CPPMEGA_MUON_MOMENTUM": profile.optimizer.muon_momentum,
         "CPPMEGA_MUON_SCALE_MODE": profile.optimizer.muon_scale_mode,
         "CPPMEGA_MUON_NUM_NS_STEPS": str(profile.optimizer.muon_num_ns_steps),
+        "CPPMEGA_MUON_NS_CARRIER": profile.optimizer.muon_ns_carrier,
         "CPPMEGA_MUON_TP_MODE": profile.optimizer.muon_tp_mode,
         "CPPMEGA_MUON_SCALAR_OPTIMIZER": profile.optimizer.muon_scalar_optimizer,
         "CPPMEGA_MUON_QUANTIZED_MOMENTUM": _bool(profile.optimizer.muon_quantized_momentum),
@@ -485,6 +552,7 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         "CPPMEGA_MUON_QUANTIZED_MOMENTUM_BLOCK_SIZE": str(
             profile.optimizer.muon_quantized_momentum_block_size
         ),
+        "CPPMEGA_MUON_DTYPE_AUDIT": _bool(profile.optimizer.muon_dtype_audit),
         "CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER": _bool(
             profile.optimizer.use_bf16_no_master_emerging_optimizer
         ),
@@ -517,6 +585,7 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         "CPPMEGA_STRUCTURE_COMPONENTS": profile.runtime.structure_components,
         "CPPMEGA_MTP_CE_KERNEL": profile.runtime.mtp_ce_kernel,
         "CPPMEGA_CCE_FUSE_MAIN_MTP_CE": _bool(profile.runtime.cce_fuse_main_mtp_ce),
+        "CPPMEGA_CCE_FILTER_EPS": profile.runtime.cce_filter_eps,
         "CPPMEGA_MEMORY_DEBUG": _bool(profile.profiling.memory_debug),
         "CPPMEGA_MEM_PROFILE": _bool(profile.profiling.mem_profile),
         "CPPMEGA_MEM_PROFILE_STEPS": str(profile.profiling.mem_profile_steps),
@@ -577,8 +646,20 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                 "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT": _bool(
                     profile.precision.mxfp8_transpose_emit_strict
                 ),
+                "CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND": (
+                    profile.precision.mxfp8_cutlass_scale_backend
+                ),
                 "CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD": _bool(
                     profile.precision.mxfp8_compact_columnwise_backward
+                ),
+                "CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS": _bool(
+                    profile.precision.mxfp8_dense_saved_operands
+                ),
+                "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD": _bool(
+                    profile.precision.mxfp8_grouped_direct_backward
+                ),
+                "CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD": _bool(
+                    profile.precision.mxfp8_grouped_gemm_ready_backward
                 ),
                 "CPPMEGA_FLASHINFER_MXFP8_RUNNER": (
                     profile.precision.mxfp8_flashinfer_runner
@@ -639,6 +720,8 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.runtime.acknowledge_liger_mtp_ce_deprecated = args.mtp_ce_kernel == "liger"
     if args.cce_fuse_main_mtp_ce is not None:
         profile.runtime.cce_fuse_main_mtp_ce = args.cce_fuse_main_mtp_ce
+    if args.cce_filter_eps is not None:
+        profile.runtime.cce_filter_eps = _validate_cce_filter_eps(args.cce_filter_eps)
     if args.noconv_mamba_chunk_size is not None:
         profile.runtime.noconv_mamba_chunk_size = _validate_noconv_mamba_chunk_size(
             args.noconv_mamba_chunk_size
@@ -653,6 +736,21 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.precision.attention_backend = args.attention_backend
     if args.mxfp8_bwd_backend is not None:
         profile.precision.mxfp8_bwd_backend = args.mxfp8_bwd_backend
+    if args.mxfp8_cutlass_scale_backend is not None:
+        profile.precision.mxfp8_cutlass_scale_backend = args.mxfp8_cutlass_scale_backend
+        if args.mxfp8_cutlass_scale_backend == "swizzled":
+            if args.mxfp8_bwd_backend is None:
+                profile.precision.mxfp8_bwd_backend = "cutlass_native"
+            elif args.mxfp8_bwd_backend != "cutlass_native":
+                raise ValueError(
+                    "--mxfp8-cutlass-scale-backend swizzled requires "
+                    "--mxfp8-bwd-backend cutlass_native"
+                )
+            if args.mxfp8_transpose_emit_backend is None:
+                profile.precision.mxfp8_transpose_emit_backend = "te"
+            if args.mxfp8_transpose_emit_swizzled is None:
+                profile.precision.mxfp8_transpose_emit_swizzled = True
+            profile.precision.mxfp8_compact_columnwise_backward = False
     if args.mxfp8_transpose_emit_backend is not None:
         profile.precision.mxfp8_transpose_emit_backend = args.mxfp8_transpose_emit_backend
     if args.mxfp8_transpose_emit_swizzled is not None:
@@ -671,6 +769,16 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
                     "--mxfp8-compact-columnwise-backward requires "
                     "--mxfp8-bwd-backend cutlass_native"
                 )
+    if args.mxfp8_dense_saved_operands is not None:
+        profile.precision.mxfp8_dense_saved_operands = args.mxfp8_dense_saved_operands
+    if args.mxfp8_grouped_direct_backward is not None:
+        profile.precision.mxfp8_grouped_direct_backward = (
+            args.mxfp8_grouped_direct_backward
+        )
+    if args.mxfp8_grouped_gemm_ready_backward is not None:
+        profile.precision.mxfp8_grouped_gemm_ready_backward = (
+            args.mxfp8_grouped_gemm_ready_backward
+        )
     if args.mxfp8_flashinfer_runner is not None:
         profile.precision.mxfp8_flashinfer_runner = args.mxfp8_flashinfer_runner
     if args.mxfp8_flashinfer_tactic is not None:
@@ -691,6 +799,10 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         if args.muon_num_ns_steps < 1:
             raise ValueError("--muon-num-ns-steps must be >= 1")
         profile.optimizer.muon_num_ns_steps = args.muon_num_ns_steps
+    if args.muon_ns_carrier is not None:
+        profile.optimizer.muon_ns_carrier = args.muon_ns_carrier
+    if args.muon_dtype_audit is not None:
+        profile.optimizer.muon_dtype_audit = args.muon_dtype_audit
     if args.seq_length is not None:
         profile.training.seq_length = args.seq_length
     if args.micro_batch_size is not None:
@@ -797,6 +909,14 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         dest="cce_fuse_main_mtp_ce",
     )
     parser.add_argument(
+        "--cce-filter-eps",
+        default=None,
+        help=(
+            "Apple CCE filter_eps for exact/approximate CE A/B: none, auto, "
+            "high, or a positive float."
+        ),
+    )
+    parser.add_argument(
         "--noconv-mamba-chunk-size",
         type=int,
         default=None,
@@ -813,6 +933,16 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         "--mxfp8-bwd-backend",
         choices=("te_tn_adapter", "flashinfer_cutlass", "cutlass_native"),
         default=None,
+    )
+    parser.add_argument(
+        "--mxfp8-cutlass-scale-backend",
+        choices=("compact", "prepack", "swizzled"),
+        default=None,
+        help=(
+            "CUTLASS-native MXFP8 scale route. swizzled uses GEMM-ready "
+            "rowwise-transpose operands with the stock SM120 block-scaled "
+            "CUTLASS mainloop."
+        ),
     )
     parser.add_argument(
         "--mxfp8-transpose-emit-backend",
@@ -888,6 +1018,57 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         default=None,
         dest="mxfp8_compact_columnwise_backward",
     )
+    dense_saved_operands = parser.add_mutually_exclusive_group()
+    dense_saved_operands.add_argument(
+        "--mxfp8-dense-saved-operands",
+        action="store_true",
+        default=None,
+        dest="mxfp8_dense_saved_operands",
+        help=(
+            "Use patched TE/cppmega hooks to save or emit GEMM-ready dense "
+            "MXFP8 backward operands at their producers."
+        ),
+    )
+    dense_saved_operands.add_argument(
+        "--no-mxfp8-dense-saved-operands",
+        action="store_false",
+        default=None,
+        dest="mxfp8_dense_saved_operands",
+    )
+    grouped_direct_backward = parser.add_mutually_exclusive_group()
+    grouped_direct_backward.add_argument(
+        "--mxfp8-grouped-direct-backward",
+        action="store_true",
+        default=None,
+        dest="mxfp8_grouped_direct_backward",
+        help=(
+            "Experimental: route grouped/MoE MXFP8 backward directly through "
+            "cppmega compact grouped kernels instead of the grouped TN adapter."
+        ),
+    )
+    grouped_direct_backward.add_argument(
+        "--no-mxfp8-grouped-direct-backward",
+        action="store_false",
+        default=None,
+        dest="mxfp8_grouped_direct_backward",
+    )
+    grouped_gemm_ready_backward = parser.add_mutually_exclusive_group()
+    grouped_gemm_ready_backward.add_argument(
+        "--mxfp8-grouped-gemm-ready-backward",
+        action="store_true",
+        default=None,
+        dest="mxfp8_grouped_gemm_ready_backward",
+        help=(
+            "Route grouped/MoE MXFP8 backward through TE grouped TN when "
+            "GEMM-ready rowwise-transposed operands already exist."
+        ),
+    )
+    grouped_gemm_ready_backward.add_argument(
+        "--no-mxfp8-grouped-gemm-ready-backward",
+        action="store_false",
+        default=None,
+        dest="mxfp8_grouped_gemm_ready_backward",
+    )
     parser.add_argument(
         "--mxfp8-flashinfer-runner",
         choices=("mm_mxfp8", "direct_tactic"),
@@ -907,6 +1088,29 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=None,
         help="Override Newton-Schulz iterations for Muon in typed profiles.",
+    )
+    parser.add_argument(
+        "--muon-ns-carrier",
+        choices=("bf16", "mxfp8_probe"),
+        default=None,
+        help=(
+            "Select Muon Newton-Schulz carrier contract. mxfp8_probe is an "
+            "opt-in microprobe knob and does not change production optimizer math."
+        ),
+    )
+    muon_dtype_audit = parser.add_mutually_exclusive_group()
+    muon_dtype_audit.add_argument(
+        "--muon-dtype-audit",
+        action="store_true",
+        default=None,
+        dest="muon_dtype_audit",
+        help="Print qMuon/Newton-Schulz dtype counters at process exit.",
+    )
+    muon_dtype_audit.add_argument(
+        "--no-muon-dtype-audit",
+        action="store_false",
+        default=None,
+        dest="muon_dtype_audit",
     )
     parser.add_argument("--seq-length", type=int, default=None)
     parser.add_argument("--micro-batch-size", type=int, default=None)
