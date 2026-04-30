@@ -1,9 +1,22 @@
-"""Modal AB harness for the Mamba3 full-CUDA bwd_bwd candidate.
+"""Modal AB harness for Mamba3 monolithic bwd_bwd production candidates.
 
 This intentionally uses CUDA events, source metadata, and torch memory counters
-only.  It does not require NCU.
+only.  It does not require NCU.  The report schema compares the main guarded
+stage2 production reference, the prior covered CUDA subset, and named future
+monolithic candidates against the same shape/config/output-slot contract.
 
 Run examples:
+
+    CPPMEGA_MODAL_GPU=H200 modal run scripts/modal_mamba3_cuda_full_bwd_ab.py \
+        --dry-run-schema \
+        --shape-csv smoke \
+        --monolithic-candidate-csv mono_chunk_v0
+
+    GHCR_TAG=785c3fd CPPMEGA_MODAL_GPU=H200 timeout 900s \
+        modal run scripts/modal_mamba3_cuda_full_bwd_ab.py \
+        --run-id mono_ab_wave1_h200_smoke_20260430_1 \
+        --shape-csv smoke \
+        --iters 1 --warmup 0 --cuda-iters 1 --cuda-warmup 0
 
     GHCR_TAG=785c3fd CPPMEGA_MODAL_GPU=H200 timeout 1800s \
         modal run scripts/modal_mamba3_cuda_full_bwd_ab.py \
@@ -29,10 +42,27 @@ from __future__ import annotations
 import csv
 import json
 import os
+import subprocess
 from dataclasses import asdict
 from typing import Any
 
 import modal
+
+from cppmega.megatron.mamba3_mono_ab_schema import (
+    BWD_BWD_OUTPUT_NAMES,
+    MAIN_GUARDED_STAGE2_COMMIT,
+    SCHEMA_VERSION,
+    candidate_configs,
+    coerce_shape,
+    cuda_subset_slot_results,
+    empty_slot_results,
+    memory_accounting,
+    readiness_gates,
+    selected_shapes as selected_schema_shapes,
+    slot_results_from_diffs,
+    slot_schema,
+    summarize_slot_results,
+)
 
 
 GHCR_REPO = os.environ.get("GHCR_REPO", "ghcr.io/jewelmusicee/cppmega")
@@ -253,6 +283,161 @@ def _compact_stats(stats: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
+def _ab_schema_for_shape(
+    shape: dict[str, Any],
+    monolithic_candidate_csv: str,
+) -> dict[str, Any]:
+    shape_obj = coerce_shape(shape)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "shape": shape_obj.to_dict(),
+        "candidate_configs": candidate_configs(monolithic_candidate_csv),
+        "boundary_slots": slot_schema(shape_obj),
+        "memory_accounting": memory_accounting(shape_obj),
+        "readiness_gates": readiness_gates(),
+    }
+
+
+def _find_tilelang_variant(
+    tilelang_variants: dict[str, dict[str, Any]],
+    names: tuple[str, ...],
+) -> dict[str, Any] | None:
+    for name in names:
+        variant = tilelang_variants.get(name)
+        if variant:
+            return variant
+    return None
+
+
+def _timing_for_variant(variant: dict[str, Any] | None) -> dict[str, Any]:
+    if not variant:
+        return {}
+    elapsed = variant.get("elapsed", {})
+    return {
+        "bwd_fwd_ms": _compact_stats(elapsed.get("bwd_fwd")),
+        "bwd_bwd_ms": _compact_stats(elapsed.get("bwd_bwd")),
+        "chain_ms": _compact_stats(elapsed.get("chain")),
+    }
+
+
+def _memory_for_variant(variant: dict[str, Any] | None) -> dict[str, Any]:
+    if not variant:
+        return {}
+    return {
+        "max_memory_allocated_gib": variant.get("max_memory_allocated_gib"),
+        "max_memory_reserved_gib": variant.get("max_memory_reserved_gib"),
+    }
+
+
+def _stage2_candidate_report(
+    tilelang_variants: dict[str, dict[str, Any]],
+    tilelang_comparison: dict[str, Any] | None,
+) -> dict[str, Any]:
+    stage2 = _find_tilelang_variant(tilelang_variants, ("stage2_bf1_bb0", "stage2_force_nontma"))
+    variant_name = stage2.get("variant") if stage2 else "stage2_bf1_bb0"
+    compare = (tilelang_comparison or {}).get("vs_baseline", {}).get(variant_name, {})
+    diffs = compare.get("diffs") or {}
+    if diffs:
+        slot_results = slot_results_from_diffs(diffs, atol=0.0)
+    else:
+        slot_results = empty_slot_results(
+            "not_reported",
+            f"{variant_name} was not compared against baseline in this run",
+        )
+    return {
+        "candidate_id": "main_guarded_stage2",
+        "role": "production_reference",
+        "source_commit": MAIN_GUARDED_STAGE2_COMMIT,
+        "variant": variant_name,
+        "status": stage2.get("status") if stage2 else "missing",
+        "timings": _timing_for_variant(stage2),
+        "memory_peak_gib": _memory_for_variant(stage2),
+        "slot_results": slot_results,
+        "slot_summary": summarize_slot_results(slot_results),
+        "comparison_vs_baseline": {
+            "status": compare.get("status"),
+            "speedup": compare.get("speedup"),
+            "max_main_grad_abs_diff": compare.get("max_main_grad_abs_diff"),
+        },
+    }
+
+
+def _cuda_subset_candidate_report(
+    cuda_result: dict[str, Any],
+    replacement_estimate: dict[str, Any],
+) -> dict[str, Any]:
+    dmimov_sidecar = replacement_estimate.get("dmimov_sidecar", {})
+    slot_results = cuda_subset_slot_results(
+        cuda_result.get("correctness", {}),
+        dmimov_sidecar_receipt=bool(dmimov_sidecar.get("measured")),
+    )
+    return {
+        "candidate_id": "cuda_covered_subset_wave9",
+        "role": "prior_component_floor",
+        "status": cuda_result.get("status"),
+        "boundary_status": "partial_only",
+        "timings": _cuda_timing_summary(cuda_result),
+        "component_timings_ms": replacement_estimate.get("component_timings_ms"),
+        "replacement_estimate": {
+            key: replacement_estimate.get(key)
+            for key in (
+                "current_candidate_ratio_vs_tilelang_bwd_bwd",
+                "current_candidate_speedup_floor_vs_tilelang_bwd_bwd",
+                "remaining_budget_ms_to_equal_tilelang_bwd_bwd",
+                "candidate_plus_qk_dmimov_ratio_vs_tilelang_bwd_bwd",
+                "candidate_plus_qk_dmimov_speedup_floor_vs_tilelang_bwd_bwd",
+                "remaining_budget_after_qk_dmimov_to_equal_tilelang_bwd_bwd",
+                "stage2_chain_floor_speedup",
+                "stage2_chain_with_current_plus_qk_dmimov_speedup",
+            )
+            if key in replacement_estimate
+        },
+        "memory_peak_gib": replacement_estimate.get("memory_peak_gib"),
+        "slot_results": slot_results,
+        "slot_summary": summarize_slot_results(slot_results),
+        "missing_for_full_replacement": replacement_estimate.get("missing_for_full_replacement"),
+    }
+
+
+def _future_monolithic_candidate_reports(
+    monolithic_candidate_csv: str,
+) -> list[dict[str, Any]]:
+    reports: list[dict[str, Any]] = []
+    for config in candidate_configs(monolithic_candidate_csv):
+        if config.get("role") != "future_monolithic_candidate":
+            continue
+        slot_results = empty_slot_results(
+            "not_run",
+            "reserved schema slot for a future monolithic mamba_mimo_bwd_bwd candidate",
+        )
+        reports.append(
+            {
+                "candidate_id": config["candidate_id"],
+                "role": config["role"],
+                "status": "pending_integration",
+                "boundary_status": "not_run",
+                "expected_output_slots": list(BWD_BWD_OUTPUT_NAMES),
+                "slot_results": slot_results,
+                "slot_summary": summarize_slot_results(slot_results),
+            }
+        )
+    return reports
+
+
+def _candidate_reports_for_shape(
+    tilelang_variants: dict[str, dict[str, Any]],
+    tilelang_comparison: dict[str, Any] | None,
+    cuda_result: dict[str, Any],
+    replacement_estimate: dict[str, Any],
+    monolithic_candidate_csv: str,
+) -> list[dict[str, Any]]:
+    return [
+        _stage2_candidate_report(tilelang_variants, tilelang_comparison),
+        _cuda_subset_candidate_report(cuda_result, replacement_estimate),
+        *_future_monolithic_candidate_reports(monolithic_candidate_csv),
+    ]
+
+
 def _tree_max_abs(value: Any) -> float | None:
     values: list[float] = []
 
@@ -429,6 +614,7 @@ def _summarize_shape(shape_result: dict[str, Any]) -> dict[str, Any]:
         "shape": shape_result["shape"]["name"],
         "status": shape_result["status"],
         "estimated_tensor_bytes": shape_result.get("estimated_tensor_bytes"),
+        "ab_schema": shape_result.get("ab_schema"),
         "tilelang": tilelang_summary,
         "tilelang_comparison": shape_result.get("tilelang_comparison"),
         "cuda": {
@@ -439,17 +625,22 @@ def _summarize_shape(shape_result: dict[str, Any]) -> dict[str, Any]:
             "metadata": shape_result.get("cuda_result", {}).get("metadata"),
         },
         "replacement_estimate": shape_result.get("replacement_estimate"),
+        "candidate_reports": shape_result.get("candidate_reports"),
     }
 
 
 def _summarize_report(report: dict[str, Any]) -> dict[str, Any]:
     return {
+        "schema_version": report.get("schema_version"),
         "run_id": report["run_id"],
         "volume": report["volume"],
         "volume_relpath": report["volume_relpath"],
         "device": report["device"],
         "settings": report["settings"],
         "artifacts": report["artifacts"],
+        "candidate_configs": report.get("candidate_configs"),
+        "readiness_gates": report.get("readiness_gates"),
+        "modal_hygiene_policy": report.get("modal_hygiene_policy"),
         "shapes": [_summarize_shape(shape) for shape in report["shapes"]],
     }
 
@@ -474,12 +665,30 @@ def _write_summary_csv(summary: dict[str, Any], csv_path: str) -> None:
                 "remaining_budget_after_qk_dmimov_ms",
                 "stage2_chain_floor_speedup",
                 "stage2_chain_plus_qk_dmimov_floor_speedup",
+                "bwd_bwd_output_mib",
+                "main_guarded_stage2_full_boundary_pass",
+                "main_guarded_stage2_full_boundary_pass_count",
+                "cuda_subset_partial_slots",
+                "cuda_subset_missing_slots",
+                "future_monolithic_candidate_ids",
             ],
         )
         writer.writeheader()
         for shape in summary["shapes"]:
             estimate = shape.get("replacement_estimate", {})
             components = estimate.get("component_timings_ms", {})
+            memory = shape.get("ab_schema", {}).get("memory_accounting", {})
+            reports = {
+                item.get("candidate_id"): item
+                for item in (shape.get("candidate_reports") or [])
+            }
+            stage2_slots = reports.get("main_guarded_stage2", {}).get("slot_summary", {})
+            cuda_slots = reports.get("cuda_covered_subset_wave9", {}).get("slot_summary", {})
+            future_ids = [
+                item.get("candidate_id")
+                for item in (shape.get("candidate_reports") or [])
+                if item.get("role") == "future_monolithic_candidate"
+            ]
             writer.writerow(
                 {
                     "shape": shape["shape"],
@@ -513,6 +722,18 @@ def _write_summary_csv(summary: dict[str, Any], csv_path: str) -> None:
                     "stage2_chain_plus_qk_dmimov_floor_speedup": estimate.get(
                         "stage2_chain_with_current_plus_qk_dmimov_speedup"
                     ),
+                    "bwd_bwd_output_mib": memory.get("bwd_bwd_output_mib"),
+                    "main_guarded_stage2_full_boundary_pass": stage2_slots.get(
+                        "full_boundary_pass"
+                    ),
+                    "main_guarded_stage2_full_boundary_pass_count": stage2_slots.get(
+                        "full_boundary_pass_count"
+                    ),
+                    "cuda_subset_partial_slots": ",".join(cuda_slots.get("partial") or []),
+                    "cuda_subset_missing_slots": ",".join(cuda_slots.get("missing") or []),
+                    "future_monolithic_candidate_ids": ",".join(
+                        str(item) for item in future_ids if item
+                    ),
                 }
             )
 
@@ -523,6 +744,7 @@ def run_ab_remote(
     run_id: str | None,
     shape_csv: str,
     tilelang_variant_csv: str,
+    monolithic_candidate_csv: str,
     warmup: int,
     iters: int,
     cuda_warmup: int,
@@ -545,15 +767,26 @@ def run_ab_remote(
     os.makedirs(run_dir, exist_ok=True)
 
     report: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "volume": BENCH_VOLUME_NAME,
         "volume_relpath": f"/{run_rel}",
         "artifact_dir": run_dir,
         "device": stage2._device_report(requested_gpu),
         "tilelang": stage2._tilelang_report(),
+        "candidate_configs": candidate_configs(monolithic_candidate_csv),
+        "readiness_gates": readiness_gates(),
+        "modal_hygiene_policy": {
+            "safe_auto_stop_scope": (
+                "local entrypoint stops only exact-name apps with zero tasks after "
+                "the remote call returns"
+            ),
+            "app_name": APP_NAME,
+        },
         "settings": {
             "shape_csv": shape_csv,
             "tilelang_variant_csv": tilelang_variant_csv,
+            "monolithic_candidate_csv": monolithic_candidate_csv,
             "warmup": warmup,
             "iters": iters,
             "cuda_warmup": cuda_warmup,
@@ -655,6 +888,17 @@ def run_ab_remote(
             cuda_result,
             shape_result["shape"],
         )
+        shape_result["ab_schema"] = _ab_schema_for_shape(
+            shape_result["shape"],
+            monolithic_candidate_csv,
+        )
+        shape_result["candidate_reports"] = _candidate_reports_for_shape(
+            tilelang_by_name,
+            tilelang_comparison,
+            cuda_result,
+            shape_result["replacement_estimate"],
+            monolithic_candidate_csv,
+        )
         report["shapes"].append(shape_result)
 
     report["artifacts"] = {
@@ -672,28 +916,234 @@ def run_ab_remote(
     return summary
 
 
+def _modal_tasks(entry: dict[str, Any]) -> int | None:
+    raw = str(entry.get("Tasks", "")).strip()
+    if raw.isdigit():
+        return int(raw)
+    return None
+
+
+def _compact_modal_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "app_id": entry.get("App ID"),
+        "description": entry.get("Description"),
+        "state": entry.get("State"),
+        "tasks": _modal_tasks(entry),
+        "created_at": entry.get("Created at"),
+        "stopped_at": entry.get("Stopped at"),
+    }
+
+
+def _modal_app_list() -> dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            ["modal", "app", "list", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "status": "failed",
+            "exception_type": type(exc).__name__,
+            "exception": str(exc),
+        }
+    if proc.returncode != 0:
+        return {
+            "status": "failed",
+            "returncode": proc.returncode,
+            "stdout_tail": proc.stdout[-2000:],
+            "stderr_tail": proc.stderr[-2000:],
+        }
+    try:
+        entries = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        return {
+            "status": "failed",
+            "exception_type": type(exc).__name__,
+            "exception": str(exc),
+            "stdout_tail": proc.stdout[-2000:],
+        }
+    return {"status": "ok", "entries": entries}
+
+
+def _modal_hygiene_check(phase: str, *, auto_stop: bool) -> dict[str, Any]:
+    listed = _modal_app_list()
+    result: dict[str, Any] = {
+        "phase": phase,
+        "app_name": APP_NAME,
+        "auto_stop_requested": auto_stop,
+        "list_status": listed.get("status"),
+    }
+    if listed.get("status") != "ok":
+        result["list_error"] = listed
+        return result
+
+    entries = listed.get("entries") or []
+    owned = [
+        entry
+        for entry in entries
+        if entry.get("Description") == APP_NAME
+    ]
+    non_stopped = [
+        entry
+        for entry in entries
+        if str(entry.get("State", "")).lower() != "stopped"
+    ]
+    safe_to_stop = [
+        entry
+        for entry in owned
+        if str(entry.get("State", "")).lower() != "stopped"
+        and _modal_tasks(entry) == 0
+        and entry.get("App ID")
+    ]
+    blocked = [
+        entry
+        for entry in owned
+        if str(entry.get("State", "")).lower() != "stopped"
+        and _modal_tasks(entry) != 0
+    ]
+    result.update(
+        {
+            "owned_entries": [_compact_modal_entry(entry) for entry in owned],
+            "non_stopped_entries": [_compact_modal_entry(entry) for entry in non_stopped],
+            "safe_to_stop": [_compact_modal_entry(entry) for entry in safe_to_stop],
+            "blocked_owned_entries": [_compact_modal_entry(entry) for entry in blocked],
+            "stopped": [],
+        }
+    )
+    if not auto_stop:
+        return result
+
+    for entry in safe_to_stop:
+        app_id = str(entry["App ID"])
+        proc = subprocess.run(
+            ["modal", "app", "stop", "--yes", app_id],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        result["stopped"].append(
+            {
+                "app_id": app_id,
+                "returncode": proc.returncode,
+                "stdout_tail": proc.stdout[-1000:],
+                "stderr_tail": proc.stderr[-1000:],
+            }
+        )
+    if result["stopped"]:
+        result["after_stop"] = _modal_hygiene_check(f"{phase}_after_stop", auto_stop=False)
+    return result
+
+
+def _local_schema_dry_run(
+    requested_gpu: str,
+    run_id: str | None,
+    shape_csv: str,
+    tilelang_variant_csv: str,
+    monolithic_candidate_csv: str,
+    seed: int,
+) -> dict[str, Any]:
+    configs = candidate_configs(monolithic_candidate_csv)
+    shapes: list[dict[str, Any]] = []
+    for shape in selected_schema_shapes(shape_csv):
+        reports = []
+        for config in configs:
+            slot_results = empty_slot_results(
+                "not_run",
+                "schema dry-run only; no Modal remote function was started",
+            )
+            reports.append(
+                {
+                    "candidate_id": config["candidate_id"],
+                    "role": config["role"],
+                    "status": "schema_dry_run",
+                    "slot_results": slot_results,
+                    "slot_summary": summarize_slot_results(slot_results),
+                }
+            )
+        shapes.append(
+            {
+                "shape": shape.name,
+                "status": "schema_dry_run",
+                "ab_schema": _ab_schema_for_shape(shape.to_dict(), monolithic_candidate_csv),
+                "candidate_reports": reports,
+            }
+        )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": run_id or "schema_dry_run",
+        "volume": BENCH_VOLUME_NAME,
+        "volume_relpath": None,
+        "device": {
+            "requested_gpu_spec": requested_gpu,
+            "dry_run_schema": True,
+        },
+        "settings": {
+            "shape_csv": shape_csv,
+            "tilelang_variant_csv": tilelang_variant_csv,
+            "monolithic_candidate_csv": monolithic_candidate_csv,
+            "seed": seed,
+        },
+        "artifacts": {},
+        "candidate_configs": configs,
+        "readiness_gates": readiness_gates(),
+        "modal_hygiene_policy": {
+            "safe_auto_stop_scope": "dry-run did not start a Modal app",
+            "app_name": APP_NAME,
+        },
+        "shapes": shapes,
+    }
+
+
 @app.local_entrypoint()
 def main(
     run_id: str | None = None,
     shape_csv: str = "smoke,productionish",
     tilelang_variant_csv: str = "baseline,stage2_bf1_bb0",
+    monolithic_candidate_csv: str = "monolithic_chunk_candidate",
     warmup: int = 2,
     iters: int = 6,
     cuda_warmup: int = 3,
     cuda_iters: int = 10,
     seed: int = 20260430,
+    dry_run_schema: bool = False,
+    modal_hygiene: bool = True,
+    modal_auto_stop: bool = True,
 ) -> None:
-    result = run_ab_remote.remote(
-        GPU_SPEC,
-        run_id,
-        shape_csv,
-        tilelang_variant_csv,
-        warmup,
-        iters,
-        cuda_warmup,
-        cuda_iters,
-        seed,
-    )
+    hygiene: dict[str, Any] = {}
+    if modal_hygiene:
+        hygiene["before"] = _modal_hygiene_check("before", auto_stop=False)
+
+    if dry_run_schema:
+        result = _local_schema_dry_run(
+            GPU_SPEC,
+            run_id,
+            shape_csv,
+            tilelang_variant_csv,
+            monolithic_candidate_csv,
+            seed,
+        )
+    else:
+        result = run_ab_remote.remote(
+            GPU_SPEC,
+            run_id,
+            shape_csv,
+            tilelang_variant_csv,
+            monolithic_candidate_csv,
+            warmup,
+            iters,
+            cuda_warmup,
+            cuda_iters,
+            seed,
+        )
+
+    if modal_hygiene:
+        hygiene["after"] = _modal_hygiene_check("after", auto_stop=modal_auto_stop)
+        result["local_modal_hygiene"] = hygiene
+
     print("SUMMARY_JSON_START")
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
     print("SUMMARY_JSON_END")
