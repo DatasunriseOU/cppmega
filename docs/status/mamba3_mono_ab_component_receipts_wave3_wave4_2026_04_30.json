@@ -1,6 +1,6 @@
 {
   "schema_version": "mamba3-mono-ab/v1",
-  "receipt_set": "mamba3-mono-ab-wave5-ingested-component-receipts",
+  "receipt_set": "mamba3-mono-ab-wave7-ingested-component-receipts",
   "canonical_gate": {
     "shape": "productionish",
     "stage2_bwd_bwd_ms": 3.70674,
@@ -24,6 +24,18 @@
       "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cute-chunk",
       "source_commit": "dc532db",
       "status": "available"
+    },
+    {
+      "doc": "docs/status/mamba3_mono_cute_chunk_wave6_2026_04_30.md",
+      "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cute-chunk",
+      "source_commit": "f163df8",
+      "status": "available_research_progress"
+    },
+    {
+      "doc": "docs/status/mamba3_mono_cuda_chunk_wave6_2026_04_30.md",
+      "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cuda-chunk",
+      "source_commit": "8de4d0f",
+      "status": "available_rejected_context"
     },
     {
       "doc": "docs/status/mamba3_mono_wgmma_plan_wave3_2026_04_30.md",
@@ -198,6 +210,91 @@
         ]
       },
       "note": "Correct CuTe micro-GEMM receipt only. The production gate must assign zero production credit until this covers the real bwd_bwd output slots, reports integrated resource metadata, and beats the H200 TileLang budget."
+    },
+    {
+      "candidate_id": "wave6_cute_fused_masked_lkq_apply_tile_chain",
+      "display_name": "Wave6 CuTe fused masked LKQ apply tile chain",
+      "role": "external_component_candidate",
+      "implementation_class": "cute_dsl_masked_lkq_apply_tile_chain",
+      "shape": "cute_lkq_chain_tile",
+      "receipt_scope": "local_component_speedup",
+      "status": "correct_local_speedup_research_only",
+      "hardware_tags": [
+        "H200"
+      ],
+      "source": {
+        "lane": "mono-cute-chunk",
+        "branch": "worker/mamba3-mono-cute-chunk",
+        "commit": "f163df8",
+        "doc": "docs/status/mamba3_mono_cute_chunk_wave6_2026_04_30.md",
+        "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cute-chunk"
+      },
+      "components": [
+        {
+          "component_id": "fused_masked_lkq_apply_tile_chain",
+          "mean_ms": 0.06355,
+          "launches": 1,
+          "covered_slots": [],
+          "status": "reported_local_speedup",
+          "note": "H200 fixed 64x64x64 tile chain. LKQ no longer round-trips through global memory for the tested fused path, but it writes only the BF16 apply tile and does not cover any real bwd_bwd output slot."
+        }
+      ],
+      "correctness": {
+        "max_abs": 7.6294e-06,
+        "tolerance": 1e-05,
+        "full_boundary_pass": false,
+        "local_tile_chain_pass": true,
+        "details": {
+          "structured_mod": "all checked diffs 0.0",
+          "random_seed_state": 7.6294e-06,
+          "random_seed_apply": 0.0,
+          "random_seed_dpsi": 7.6294e-06,
+          "random_seed_dv": 7.8604e-07,
+          "random_seed_dmimo_v": 4.3958e-07,
+          "lkq_global_output_eliminated_for_fused_path": true
+        }
+      },
+      "reference": {
+        "stage2_bwd_bwd_ms": 3.70674
+      },
+      "metadata": {
+        "timing_scope": "local_tile_chain",
+        "integrated_full_slot_timing": false,
+        "tile_shape": "64x64x64",
+        "scalar_chain_us": 104.71,
+        "fused_chain_us": 63.55,
+        "local_speedup_vs_scalar": 1.64768,
+        "iters": 20,
+        "compile_first_launch_s": 1.274,
+        "scalar_throughput_tflops": 0.015,
+        "fused_throughput_tflops": 0.0247,
+        "copy_strategy": "scalar_bf16_universal_g2s_s2g",
+        "remaining_global_tiles": [
+          "state",
+          "apply"
+        ],
+        "torch_side_consumers_remaining": [
+          "dpsi",
+          "dv",
+          "dmimo_v"
+        ],
+        "resource_metadata_status": "not_reported_for_integrated_mamba3_boundary"
+      },
+      "modal_hygiene": {
+        "status": "pass",
+        "active_same_campaign_count": 0,
+        "description_reuse_warning": "Wave6 used the older wave2 Modal app description pattern; future runs must use unique wave/run app descriptions for clean attribution.",
+        "apps": [
+          {
+            "app_id": "ap-OTeVyEbeKiPQYGelwEWYgD",
+            "description": "cppmega-mamba3-mono-chunk-wave2-h200",
+            "state": "stopped",
+            "tasks": 0,
+            "stopped_at": "2026-04-30 11:28:34+00:00"
+          }
+        ]
+      },
+      "note": "Useful research progress only. The fused path removes the tested LKQ global output and improves the local tile chain from 104.710 us to 63.550 us, but it still has scalar copies, does not write the full bwd_bwd output-slot boundary, lacks integrated resource/CTA/memory metadata, and earns zero production credit."
     },
     {
       "candidate_id": "wave5_cuda_scan_owner_dv_dmimov_dssda",

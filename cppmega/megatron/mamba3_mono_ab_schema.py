@@ -185,6 +185,21 @@ _MICRO_GEMM_SCOPE_MARKERS = (
     "cute_gemm",
     "64x64x64",
 )
+_LOCAL_SPEEDUP_SCOPE_MARKERS = (
+    "local_component_speedup",
+    "component_speedup",
+    "local_speedup",
+    "tile_chain",
+    "lkq_chain",
+    "masked_lkq_apply",
+)
+_INTEGRATED_FULL_SLOT_TIMING_MARKERS = (
+    "integrated_full_bwd_bwd",
+    "integrated_full_slot_bwd_bwd",
+    "full_slot_integrated_timing",
+    "full_bwd_bwd_boundary",
+    "monolithic_bwd_bwd_boundary",
+)
 _MODAL_HYGIENE_PASS_STATUSES = {"pass", "passed", "ok", "clean", "stopped"}
 
 _COMPONENT_RECORD_PAYLOAD_KEYS = (
@@ -788,6 +803,69 @@ def _is_micro_gemm_record(record: dict[str, Any]) -> bool:
     return any(marker in haystack for marker in _MICRO_GEMM_SCOPE_MARKERS)
 
 
+def _is_local_speedup_record(record: dict[str, Any]) -> bool:
+    metadata = record.get("metadata") or {}
+    haystack = " ".join(
+        str(item)
+        for item in (
+            record.get("receipt_scope", ""),
+            record.get("implementation_class", ""),
+            record.get("shape", ""),
+            record.get("candidate_id", ""),
+            record.get("status", ""),
+            metadata.get("timing_scope", ""),
+            metadata.get("receipt_scope", ""),
+            *(component.get("component_id", "") for component in record.get("components", [])),
+            *(component.get("note", "") for component in record.get("components", [])),
+        )
+    ).lower()
+    return any(marker in haystack for marker in _LOCAL_SPEEDUP_SCOPE_MARKERS)
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "pass", "passed"}
+
+
+def _integrated_timing_gate(
+    record: dict[str, Any],
+    *,
+    total_ms: float | None,
+) -> dict[str, Any]:
+    metadata = record.get("metadata") or {}
+    timing_scope = str(
+        metadata.get("timing_scope")
+        or metadata.get("integrated_timing_scope")
+        or record.get("timing_scope")
+        or record.get("receipt_scope")
+        or ""
+    ).lower()
+    explicit_integrated = (
+        _truthy(metadata.get("integrated_full_slot_timing"))
+        or _truthy(metadata.get("integrated_timing"))
+        or any(marker in timing_scope for marker in _INTEGRATED_FULL_SLOT_TIMING_MARKERS)
+    )
+    local_only = _is_local_speedup_record(record) and not explicit_integrated
+    if local_only:
+        status = "local_component_only"
+    elif total_ms is None:
+        status = "missing_timing"
+    elif explicit_integrated:
+        status = "pass"
+    else:
+        status = "reported"
+    return {
+        "status": status,
+        "timing_scope": timing_scope or None,
+        "integrated_full_slot_timing": explicit_integrated,
+        "local_component_speedup_only": local_only,
+        "required": "full-slot integrated bwd_bwd timing for production credit",
+    }
+
+
 def production_candidate_gate(
     record: dict[str, Any],
     *,
@@ -810,6 +888,7 @@ def production_candidate_gate(
     hardware_tags = list(record.get("hardware_tags") or [])
 
     total_ms = projection.get("projected_bwd_bwd_ms")
+    integrated_timing_gate = _integrated_timing_gate(record, total_ms=total_ms)
     reference = record.get("reference") or {}
     gate_budget = record.get("gate_budget") or {}
     budget_ms = (
@@ -830,6 +909,8 @@ def production_candidate_gate(
     rejection_reasons: list[str] = []
     if _is_micro_gemm_record(record):
         rejection_reasons.append("micro_gemm_only_receipt")
+    if integrated_timing_gate["local_component_speedup_only"]:
+        rejection_reasons.append("non_integrated_timing_receipt")
     if missing_slots:
         rejection_reasons.append("missing_required_output_slots")
     if correctness.get("full_boundary_pass") is not True:
@@ -865,6 +946,7 @@ def production_candidate_gate(
             "h200_required_for_h200_budget": True,
         },
         "modal_hygiene": modal_gate,
+        "integrated_timing": integrated_timing_gate,
         "performance_budget": {
             "status": performance_status,
             "projected_bwd_bwd_ms": total_ms,
@@ -1087,6 +1169,13 @@ def readiness_gates() -> list[dict[str, str]]:
             "requirement": (
                 "correct CuTe/CUDA micro-GEMM receipts are component receipts only; "
                 "they earn zero production credit until mapped to the real output slots"
+            ),
+        },
+        {
+            "gate": "reject_local_component_speedup_only",
+            "requirement": (
+                "local tile/component speedups earn zero production credit until "
+                "they become full-slot integrated bwd_bwd timing receipts"
             ),
         },
         {

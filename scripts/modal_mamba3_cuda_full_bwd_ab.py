@@ -1136,6 +1136,36 @@ def _modal_entry_matches_campaign(
     return any(description.startswith(prefix) for prefix in campaign_prefixes)
 
 
+def _modal_description_reuse_warnings(
+    entries: list[dict[str, Any]],
+    campaign_prefixes: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    by_description: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        description = str(entry.get("Description") or "").strip()
+        if not description:
+            continue
+        if description != APP_NAME and not _modal_entry_matches_campaign(
+            entry,
+            campaign_prefixes,
+        ):
+            continue
+        by_description.setdefault(description, []).append(entry)
+    return [
+        {
+            "description": description,
+            "count": len(matches),
+            "entries": [_compact_modal_entry(entry) for entry in matches],
+            "warning": (
+                "Modal app descriptions should be unique per wave/run; reused "
+                "descriptions make cleanup and receipt attribution ambiguous"
+            ),
+        }
+        for description, matches in sorted(by_description.items())
+        if len(matches) > 1
+    ]
+
+
 def _modal_app_list() -> dict[str, Any]:
     try:
         proc = subprocess.run(
@@ -1228,6 +1258,10 @@ def _modal_hygiene_check(
             "same_campaign_active_entries": [
                 _compact_modal_entry(entry) for entry in same_campaign_active
             ],
+            "reused_description_warnings": _modal_description_reuse_warnings(
+                entries,
+                campaign_prefixes,
+            ),
             "safe_to_stop": [_compact_modal_entry(entry) for entry in safe_to_stop],
             "blocked_owned_entries": [_compact_modal_entry(entry) for entry in blocked],
             "stopped": [],
@@ -1279,6 +1313,7 @@ def _modal_hygiene_verdict(
     terminal = _modal_hygiene_terminal_check(check)
     list_status = terminal.get("list_status")
     active = terminal.get("same_campaign_active_entries") or []
+    reused_descriptions = terminal.get("reused_description_warnings") or []
     if enforcement == "off":
         status = "off"
     elif list_status != "ok":
@@ -1301,6 +1336,16 @@ def _modal_hygiene_verdict(
         )
     else:
         message = "Modal hygiene passed: no active same-campaign apps remain"
+    if reused_descriptions:
+        descriptions = [
+            str(item.get("description"))
+            for item in reused_descriptions
+            if item.get("description")
+        ]
+        message += (
+            "; warning: reused Modal app description(s): "
+            + ", ".join(descriptions)
+        )
 
     return {
         "status": status,
@@ -1308,6 +1353,8 @@ def _modal_hygiene_verdict(
         "phase": terminal.get("phase"),
         "active_same_campaign_count": len(active),
         "active_same_campaign_entries": active,
+        "reused_description_count": len(reused_descriptions),
+        "reused_description_warnings": reused_descriptions,
         "message": message,
     }
 
