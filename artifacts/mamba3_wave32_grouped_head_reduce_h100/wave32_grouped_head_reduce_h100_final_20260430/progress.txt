@@ -1,0 +1,8 @@
+1777564005.626 start
+1777564006.505 shape_start smoke_hpg2
+1777564010.272 shape_done smoke_hpg2
+1777564011.071 shape_start half_seq_hpg16
+1777564012.826 shape_done half_seq_hpg16
+1777564013.747 shape_start fullish_seq4096_hpg16
+1777564015.464 shape_done fullish_seq4096_hpg16
+1777564017.129 done
