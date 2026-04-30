@@ -47,6 +47,17 @@ MATERIALIZATION_STAT_KEYS = (
     "mxfp8_tn_adapter_missing_sidecar_copy",
     "mxfp8_norm_quantize_sidecar_bridge",
 )
+BATCHED_TRANSPOSE_STAT_KEYS = (
+    "mxfp8_batched_transpose_flushes",
+    "mxfp8_batched_transpose_operands",
+    "mxfp8_batched_transpose_bf16_emit_operands",
+    "mxfp8_batched_transpose_uint8_copy_operands",
+    "mxfp8_batched_transpose_max_pending",
+    "mxfp8_batched_transpose_current_pending",
+    "mxfp8_batched_transpose_current_pending_bytes",
+    "mxfp8_batched_transpose_pending_bytes_peak",
+    "mxfp8_batched_transpose_flush_failures",
+)
 SIDECAR_LIVE_ZERO_KEYS = (
     "mxfp8_tn_sidecar_registry_size",
     "mxfp8_tn_sidecar_registry_persistent",
@@ -72,6 +83,7 @@ ALL_STAT_KEYS = (
     + FALLBACK_STAT_KEYS
     + PASSTHROUGH_STAT_KEYS
     + MATERIALIZATION_STAT_KEYS
+    + BATCHED_TRANSPOSE_STAT_KEYS
     + SIDECAR_REGISTRY_STAT_KEYS
 )
 

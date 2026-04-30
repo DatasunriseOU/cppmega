@@ -301,6 +301,28 @@ _te_mxfp8_transpose_emit_swizzled = os.environ.get(
     "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED",
     _te_mxfp8_transpose_emit_swizzled_default,
 ) == "1"
+
+
+def _cppmega_positive_int_env(_name: str, _default: int) -> int:
+    _raw = os.environ.get(_name, str(_default))
+    try:
+        _value = int(_raw)
+    except (TypeError, ValueError) as _exc:
+        raise RuntimeError(f"{_name} must be a positive integer, got {_raw!r}") from _exc
+    if _value < 1:
+        raise RuntimeError(f"{_name} must be a positive integer, got {_raw!r}")
+    return _value
+
+
+_te_mxfp8_deferred_emit_batching = os.environ.get(
+    "CPPMEGA_TE_MXFP8_DEFERRED_EMIT_BATCHING", "0"
+) == "1"
+_te_mxfp8_deferred_emit_max_pending_mib = _cppmega_positive_int_env(
+    "CPPMEGA_TE_MXFP8_DEFERRED_EMIT_MAX_PENDING_MIB", 1024
+)
+_te_mxfp8_deferred_emit_max_pending_operands = _cppmega_positive_int_env(
+    "CPPMEGA_TE_MXFP8_DEFERRED_EMIT_MAX_PENDING_OPERANDS", 64
+)
 _te_mxfp8_compact_columnwise_backward = (
     False
     if _cutlass_mxfp8_stock_swizzled
@@ -368,6 +390,9 @@ if (
         from transformer_engine.common.recipe import MXFP8BlockScaling as _TE_MXFP8Recipe
         from transformer_engine.pytorch.tensor import MXFP8Quantizer as _TE_MXFP8Quantizer
         from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor as _TE_MXFP8Tensor
+        from transformer_engine.pytorch.tensor.storage.mxfp8_tensor_storage import (
+            MXFP8TensorStorage as _TE_MXFP8TensorStorage,
+        )
         from transformer_engine.pytorch.module import linear as _TE_LINEAR_MODULE
 
         try:
@@ -418,6 +443,13 @@ if (
             "mxfp8_grouped_direct_miss_wgrad": 0,
             "mxfp8_grouped_transpose_copy_fallback_dgrad": 0,
             "mxfp8_grouped_transpose_copy_fallback_wgrad": 0,
+            "mxfp8_batched_transpose_flushes": 0,
+            "mxfp8_batched_transpose_operands": 0,
+            "mxfp8_batched_transpose_bf16_emit_operands": 0,
+            "mxfp8_batched_transpose_uint8_copy_operands": 0,
+            "mxfp8_batched_transpose_max_pending": 0,
+            "mxfp8_batched_transpose_pending_bytes_peak": 0,
+            "mxfp8_batched_transpose_flush_failures": 0,
             "mxfp8_dense_copy_fallback_dgrad": 0,
             "mxfp8_dense_copy_fallback_wgrad": 0,
             "bf16_fallback_dgrad": 0,
@@ -452,6 +484,15 @@ if (
                 )
                 _snapshot["mxfp8_tn_sidecar_tracked_attr_peak_bytes"] = (
                     _cppmega_mxfp8_tn_sidecar_attr_peak_bytes[0]
+                )
+            except NameError:
+                pass
+            try:
+                _snapshot["mxfp8_batched_transpose_current_pending"] = len(
+                    _cppmega_mxfp8_pending_transpose_entries
+                )
+                _snapshot["mxfp8_batched_transpose_current_pending_bytes"] = (
+                    _cppmega_mxfp8_pending_transpose_bytes[0]
                 )
             except NameError:
                 pass
@@ -524,6 +565,412 @@ if (
         _cppmega_mxfp8_tn_sidecar_registry_peak_bytes = [0]
         _cppmega_mxfp8_tn_sidecar_attr_bytes = [0]
         _cppmega_mxfp8_tn_sidecar_attr_peak_bytes = [0]
+        _cppmega_mxfp8_batched_transpose_enabled = (
+            _te_mxfp8_deferred_emit_batching
+            and _te_mxfp8_bwd_tn_adapter
+            and _te_mxfp8_bwd_backend == "te_tn_adapter"
+            and _te_mxfp8_transpose_emit_backend in ("auto", "te")
+            and _te_linear_deferred_saved_operand
+            and not _te_mxfp8_compact_columnwise_backward
+        )
+        _cppmega_mxfp8_pending_transpose_entries = []
+        _cppmega_mxfp8_pending_transpose_bytes = [0]
+        _cppmega_mxfp8_batched_transpose_module = [None]
+        _cppmega_mxfp8_batched_transpose_max_pending_bytes = (
+            int(_te_mxfp8_deferred_emit_max_pending_mib) * 1024 * 1024
+        )
+
+        def _cppmega_tensor_nbytes(_tensor):
+            if not isinstance(_tensor, _torch.Tensor):
+                return 0
+            try:
+                return int(_tensor.untyped_storage().nbytes())
+            except Exception:
+                return int(_tensor.numel() * _tensor.element_size())
+
+        def _cppmega_pending_transpose_entry_nbytes(_entry):
+            _seen = set()
+            _total = 0
+            for _key in ("output_rowwise_data", "output_rowwise_scale_inv"):
+                _tensor = _entry.get(_key)
+                if not isinstance(_tensor, _torch.Tensor):
+                    continue
+                try:
+                    _storage = _tensor.untyped_storage()
+                    _ptr = int(_storage.data_ptr())
+                    if _ptr in _seen:
+                        continue
+                    _seen.add(_ptr)
+                    _total += int(_storage.nbytes())
+                except Exception:
+                    _total += int(_tensor.numel() * _tensor.element_size())
+            return _total
+
+        def _cppmega_load_batched_transpose_module():
+            if _cppmega_mxfp8_batched_transpose_module[0] is not None:
+                return _cppmega_mxfp8_batched_transpose_module[0]
+            from cppmega.megatron import mxfp8_batched_transpose as _batched_transpose
+
+            _cppmega_mxfp8_batched_transpose_module[0] = _batched_transpose
+            return _batched_transpose
+
+        def _cppmega_make_mxfp8_rowwise_transpose_storage(
+            _source_2d,
+            _columnwise_scale_inv,
+            _fp8_dtype,
+            _quantizer,
+            _fake_dtype,
+            *,
+            _with_gemm_swizzled_scales,
+        ):
+            _rows = int(_source_2d.shape[0])
+            _cols = int(_source_2d.shape[1])
+            _rowwise_data = _torch.empty(
+                (_cols, _rows),
+                dtype=_torch.uint8,
+                device=_source_2d.device,
+            )
+            _rowwise_scale_inv = _torch.empty(
+                (
+                    int(_columnwise_scale_inv.shape[1]),
+                    int(_columnwise_scale_inv.shape[0]),
+                ),
+                dtype=_torch.uint8,
+                device=_source_2d.device,
+            )
+            _storage_quantizer = _quantizer
+            try:
+                _storage_quantizer = _quantizer.copy()
+                _storage_quantizer.set_usage(rowwise=True, columnwise=False)
+                _storage_quantizer.optimize_for_gemm = bool(_with_gemm_swizzled_scales)
+            except Exception:
+                pass
+            _storage = _TE_MXFP8TensorStorage(
+                rowwise_data=_rowwise_data,
+                rowwise_scale_inv=_rowwise_scale_inv,
+                columnwise_data=None,
+                columnwise_scale_inv=None,
+                fp8_dtype=_fp8_dtype,
+                quantizer=_storage_quantizer,
+                with_gemm_swizzled_scales=bool(_with_gemm_swizzled_scales),
+                fake_dtype=_fake_dtype,
+            )
+            _cppmega_mark_rowwise_transpose_operand(_storage)
+            return _storage
+
+        def _cppmega_fallback_fill_pending_mxfp8_transpose(_entry):
+            _kind = int(_entry["kind"])
+            if _kind == 0:
+                _transpose_kwargs = {"fake_dtype": _entry["fake_dtype"]}
+                if _entry.get("with_gemm_swizzled_scales", False):
+                    _transpose_kwargs["with_gemm_swizzled_scales"] = True
+                with _torch.no_grad():
+                    _fallback = _entry["quantizer"].quantize_rowwise_transpose(
+                        _entry["input"],
+                        _entry["columnwise_scale_inv"],
+                        **_transpose_kwargs,
+                    )
+                _entry["output_rowwise_data"].copy_(_fallback._rowwise_data)
+                _entry["output_rowwise_scale_inv"].copy_(_fallback._rowwise_scale_inv)
+                return
+            if _kind == 1:
+                _entry["output_rowwise_data"].copy_(
+                    _entry["input"].t().contiguous()
+                )
+                _entry["output_rowwise_scale_inv"].copy_(
+                    _entry["columnwise_scale_inv"].t().contiguous()
+                )
+                return
+            raise ValueError(f"unknown MXFP8 pending transpose kind {_kind}")
+
+        def _cppmega_flush_pending_mxfp8_batched_transposes(_reason=None):
+            if not _cppmega_mxfp8_pending_transpose_entries:
+                return
+            _entries = list(_cppmega_mxfp8_pending_transpose_entries)
+            _cppmega_mxfp8_pending_transpose_entries.clear()
+            _cppmega_mxfp8_pending_transpose_bytes[0] = 0
+            try:
+                _module = _cppmega_load_batched_transpose_module()
+                _groups = {}
+                for _entry in _entries:
+                    _input = _entry["input"]
+                    _scale = _entry["columnwise_scale_inv"]
+                    _key = (
+                        int(_entry["kind"]),
+                        tuple(_input.shape),
+                        tuple(_scale.shape),
+                        bool(_entry.get("with_gemm_swizzled_scales", False)),
+                    )
+                    _groups.setdefault(_key, []).append(_entry)
+                for _group_entries in _groups.values():
+                    _module.batched_transpose(_group_entries)
+                    _cppmega_record_bwd_stat("mxfp8_batched_transpose_flushes")
+                _cppmega_te_bwd_stats["mxfp8_batched_transpose_operands"] += len(
+                    _entries
+                )
+                for _entry in _entries:
+                    if int(_entry["kind"]) == 0:
+                        _cppmega_record_bwd_stat(
+                            "mxfp8_batched_transpose_bf16_emit_operands"
+                        )
+                    elif int(_entry["kind"]) == 1:
+                        _cppmega_record_bwd_stat(
+                            "mxfp8_batched_transpose_uint8_copy_operands"
+                        )
+                if _te_mxfp8_bwd_debug:
+                    print(
+                        "[cppmega_fp8_shim] flushed MXFP8 batched transposes "
+                        f"count={len(_entries)} groups={len(_groups)} reason={_reason}"
+                    )
+            except Exception as _flush_exc:
+                _cppmega_record_bwd_stat(
+                    "mxfp8_batched_transpose_flush_failures",
+                    f"{type(_flush_exc).__name__}: {_flush_exc}",
+                )
+                if _te_mxfp8_transpose_emit_strict:
+                    raise
+                for _entry in _entries:
+                    _cppmega_fallback_fill_pending_mxfp8_transpose(_entry)
+
+        def _cppmega_enqueue_mxfp8_batched_transpose(_entry):
+            _entry_bytes = _cppmega_pending_transpose_entry_nbytes(_entry)
+            _cppmega_mxfp8_pending_transpose_entries.append(_entry)
+            _cppmega_mxfp8_pending_transpose_bytes[0] += _entry_bytes
+            _cppmega_te_bwd_stats["mxfp8_batched_transpose_max_pending"] = max(
+                _cppmega_te_bwd_stats["mxfp8_batched_transpose_max_pending"],
+                len(_cppmega_mxfp8_pending_transpose_entries),
+            )
+            _cppmega_te_bwd_stats["mxfp8_batched_transpose_pending_bytes_peak"] = max(
+                _cppmega_te_bwd_stats["mxfp8_batched_transpose_pending_bytes_peak"],
+                _cppmega_mxfp8_pending_transpose_bytes[0],
+            )
+            if (
+                len(_cppmega_mxfp8_pending_transpose_entries)
+                >= int(_te_mxfp8_deferred_emit_max_pending_operands)
+                or _cppmega_mxfp8_pending_transpose_bytes[0]
+                >= _cppmega_mxfp8_batched_transpose_max_pending_bytes
+            ):
+                _cppmega_flush_pending_mxfp8_batched_transposes("threshold")
+
+        def _cppmega_is_supported_batched_emit_source(_source_2d):
+            return (
+                isinstance(_source_2d, _torch.Tensor)
+                and _source_2d.is_cuda
+                and _source_2d.dtype == _torch.bfloat16
+                and _source_2d.dim() == 2
+                and int(_source_2d.shape[0]) % 32 == 0
+                and int(_source_2d.shape[1]) % 32 == 0
+                and _source_2d.is_contiguous()
+            )
+
+        def _cppmega_install_batched_deferred_emit_helpers(_module):
+            _patched = False
+            _orig_make = getattr(_module, "_make_rowwise_transpose_for_backward", None)
+            if _orig_make is not None and not getattr(
+                _orig_make, "_cppmega_batched_deferred_emit", False
+            ):
+
+                @_functools.wraps(_orig_make)
+                def _make_rowwise_transpose_for_backward_batched(
+                    source,
+                    tensor,
+                    quantizer,
+                ):
+                    if not _cppmega_mxfp8_batched_transpose_enabled:
+                        return _orig_make(source, tensor, quantizer)
+                    if not (
+                        isinstance(source, _torch.Tensor)
+                        and isinstance(tensor, _TE_MXFP8TensorStorage)
+                        and isinstance(quantizer, _TE_MXFP8Quantizer)
+                        and getattr(
+                            quantizer,
+                            "_te_rowwise_transpose_for_backward_enabled",
+                            False,
+                        )
+                    ):
+                        return _orig_make(source, tensor, quantizer)
+                    _strict = bool(
+                        getattr(
+                            quantizer,
+                            "_te_rowwise_transpose_for_backward_strict",
+                            False,
+                        )
+                    )
+                    try:
+                        if getattr(tensor, "_with_gemm_swizzled_scales", False):
+                            raise ValueError(
+                                "source MXFP8 tensor already has GEMM-swizzled scales"
+                            )
+                        if (
+                            source.dtype != _torch.bfloat16
+                            or not source.is_cuda
+                            or source.dim() < 2
+                            or not source.is_contiguous()
+                            or _cppmega_is_block_scaled_tensor(source)
+                        ):
+                            return _orig_make(source, tensor, quantizer)
+                        _columnwise_scale_inv = getattr(
+                            tensor, "_columnwise_scale_inv", None
+                        )
+                        if not isinstance(_columnwise_scale_inv, _torch.Tensor):
+                            raise ValueError(
+                                "source MXFP8 tensor is missing compact columnwise scales"
+                            )
+                        if _columnwise_scale_inv.dtype != _torch.uint8:
+                            raise TypeError("columnwise scales must be uint8")
+                        if _columnwise_scale_inv.dim() != 2:
+                            raise ValueError("columnwise scales must be 2D")
+                        if not _columnwise_scale_inv.is_contiguous():
+                            return _orig_make(source, tensor, quantizer)
+                        _fp8_dtype = getattr(tensor, "_fp8_dtype", None)
+                        try:
+                            _is_e4m3 = int(_fp8_dtype) == int(_tex.DType.kFloat8E4M3)
+                        except Exception:
+                            _is_e4m3 = False
+                        if not _is_e4m3:
+                            return _orig_make(source, tensor, quantizer)
+                        _source_2d = source.reshape(-1, source.shape[-1])
+                        if not _cppmega_is_supported_batched_emit_source(_source_2d):
+                            return _orig_make(source, tensor, quantizer)
+                        _rows = int(_source_2d.shape[0])
+                        _cols = int(_source_2d.shape[1])
+                        if (
+                            int(_columnwise_scale_inv.shape[0]) < _rows // 32
+                            or int(_columnwise_scale_inv.shape[1]) < _cols
+                            or int(_columnwise_scale_inv.shape[0]) % 4 != 0
+                            or int(_columnwise_scale_inv.shape[1]) % 128 != 0
+                        ):
+                            return _orig_make(source, tensor, quantizer)
+                        _fake_dtype = getattr(
+                            tensor,
+                            "_dtype",
+                            getattr(tensor, "dtype", source.dtype),
+                        )
+                        _with_swizzled = bool(
+                            getattr(
+                                quantizer,
+                                "_te_rowwise_transpose_for_backward_with_gemm_swizzled_scales",
+                                False,
+                            )
+                        )
+                        _storage = _cppmega_make_mxfp8_rowwise_transpose_storage(
+                            _source_2d,
+                            _columnwise_scale_inv,
+                            _fp8_dtype,
+                            quantizer,
+                            _fake_dtype,
+                            _with_gemm_swizzled_scales=_with_swizzled,
+                        )
+                        _cppmega_enqueue_mxfp8_batched_transpose(
+                            {
+                                "kind": 0,
+                                "input": _source_2d,
+                                "columnwise_scale_inv": _columnwise_scale_inv,
+                                "output_rowwise_data": _storage._rowwise_data,
+                                "output_rowwise_scale_inv": _storage._rowwise_scale_inv,
+                                "with_gemm_swizzled_scales": _with_swizzled,
+                                "quantizer": quantizer,
+                                "fake_dtype": _fake_dtype,
+                            }
+                        )
+                        return _storage
+                    except Exception as _queue_exc:
+                        if _strict:
+                            raise RuntimeError(
+                                "Failed to queue MXFP8 rowwise-transposed Linear "
+                                "backward operand"
+                            ) from _queue_exc
+                        return _orig_make(source, tensor, quantizer)
+
+                _make_rowwise_transpose_for_backward_batched._cppmega_batched_deferred_emit = (
+                    True
+                )
+                setattr(
+                    _module,
+                    "_make_rowwise_transpose_for_backward",
+                    _make_rowwise_transpose_for_backward_batched,
+                )
+                _patched = True
+
+            _orig_copy = getattr(
+                _module, "_copy_columnwise_as_rowwise_transpose_for_backward", None
+            )
+            if _orig_copy is not None and not getattr(
+                _orig_copy, "_cppmega_batched_deferred_emit", False
+            ):
+
+                @_functools.wraps(_orig_copy)
+                def _copy_columnwise_as_rowwise_transpose_for_backward_batched(tensor):
+                    if not _cppmega_mxfp8_batched_transpose_enabled:
+                        return _orig_copy(tensor)
+                    try:
+                        if not isinstance(tensor, _TE_MXFP8TensorStorage):
+                            return _orig_copy(tensor)
+                        if getattr(tensor, "_with_gemm_swizzled_scales", False):
+                            return _orig_copy(tensor)
+                        _columnwise_data = getattr(tensor, "_columnwise_data", None)
+                        _columnwise_scale_inv = getattr(
+                            tensor, "_columnwise_scale_inv", None
+                        )
+                        if not (
+                            isinstance(_columnwise_data, _torch.Tensor)
+                            and isinstance(_columnwise_scale_inv, _torch.Tensor)
+                            and _columnwise_data.is_cuda
+                            and _columnwise_scale_inv.is_cuda
+                            and _columnwise_data.dtype == _torch.uint8
+                            and _columnwise_scale_inv.dtype == _torch.uint8
+                            and _columnwise_data.dim() >= 2
+                            and _columnwise_scale_inv.dim() == 2
+                            and _columnwise_data.is_contiguous()
+                            and _columnwise_scale_inv.is_contiguous()
+                        ):
+                            return _orig_copy(tensor)
+                        _columnwise_2d = _columnwise_data.reshape(
+                            -1, _columnwise_data.shape[-1]
+                        )
+                        if (
+                            int(_columnwise_2d.shape[0]) % 32 != 0
+                            or int(_columnwise_2d.shape[1]) % 32 != 0
+                        ):
+                            return _orig_copy(tensor)
+                        _storage = _cppmega_make_mxfp8_rowwise_transpose_storage(
+                            _columnwise_2d,
+                            _columnwise_scale_inv,
+                            tensor._fp8_dtype,
+                            tensor._quantizer,
+                            tensor._dtype,
+                            _with_gemm_swizzled_scales=False,
+                        )
+                        _cppmega_enqueue_mxfp8_batched_transpose(
+                            {
+                                "kind": 1,
+                                "input": _columnwise_2d,
+                                "columnwise_scale_inv": _columnwise_scale_inv,
+                                "output_rowwise_data": _storage._rowwise_data,
+                                "output_rowwise_scale_inv": _storage._rowwise_scale_inv,
+                                "with_gemm_swizzled_scales": False,
+                            }
+                        )
+                        return _storage
+                    except Exception:
+                        if _te_mxfp8_transpose_emit_strict:
+                            raise
+                        return _orig_copy(tensor)
+
+                _copy_columnwise_as_rowwise_transpose_for_backward_batched._cppmega_batched_deferred_emit = (
+                    True
+                )
+                setattr(
+                    _module,
+                    "_copy_columnwise_as_rowwise_transpose_for_backward",
+                    _copy_columnwise_as_rowwise_transpose_for_backward_batched,
+                )
+                _patched = True
+            return _patched
+
+        _atexit.register(
+            lambda: _cppmega_flush_pending_mxfp8_batched_transposes("atexit")
+        )
 
         def _cppmega_is_mxfp8_tensor(_x):
             return "MXFP8" in type(_x).__name__
@@ -1616,6 +2063,8 @@ if (
             if _cppmega_has_comm_overlap(_kwargs):
                 return False, "comm_overlap_not_covered"
 
+            _cppmega_flush_pending_mxfp8_batched_transposes("dense_backward_gemm")
+
             if _te_mxfp8_bwd_backend == "cutlass_native":
                 try:
                     return _cppmega_try_mxfp8_cutlass_native(_args, _kwargs)
@@ -1696,6 +2145,8 @@ if (
                     _cppmega_any_mxfp8_operand(A) or _cppmega_any_mxfp8_operand(B)
                 ):
                     return _orig_general_grouped_gemm(A, B, out, *args, **kwargs)
+
+                _cppmega_flush_pending_mxfp8_batched_transposes("grouped_backward_gemm")
 
                 _op_kind = "dgrad" if _layout == "NN" else "wgrad"
                 if _te_mxfp8_grouped_direct_backward:
@@ -2273,6 +2724,7 @@ if (
         _patched_quantize_weight_modules = []
         _patched_gather_modules = []
         _patched_norm_modules = []
+        _patched_deferred_emit_modules = []
         for _module_name in (
             "transformer_engine.pytorch.module.linear",
             "transformer_engine.pytorch.module.layernorm_linear",
@@ -2283,6 +2735,10 @@ if (
         ):
             try:
                 _mod = __import__(_module_name, fromlist=["general_gemm"])
+                if _cppmega_install_batched_deferred_emit_helpers(_mod):
+                    _patched_deferred_emit_modules.append(
+                        _module_name.rsplit(".", 1)[-1]
+                    )
                 if _cppmega_wrap_general_gemm(_mod):
                     _patched_gemm_modules.append(_module_name.rsplit(".", 1)[-1])
                 if _cppmega_wrap_general_grouped_gemm(_mod):
@@ -2318,6 +2774,10 @@ if (
             f"mxfp8_bwd_tn_adapter={_te_mxfp8_bwd_tn_adapter}, "
             f"mxfp8_transpose_emit_backend={_te_mxfp8_transpose_emit_backend}, "
             f"mxfp8_transpose_emit_swizzled={_te_mxfp8_transpose_emit_swizzled}, "
+            f"mxfp8_deferred_emit_batching={_te_mxfp8_deferred_emit_batching}, "
+            f"mxfp8_batched_transpose_enabled={_cppmega_mxfp8_batched_transpose_enabled}, "
+            f"mxfp8_deferred_emit_max_pending_mib={_te_mxfp8_deferred_emit_max_pending_mib}, "
+            f"mxfp8_deferred_emit_max_pending_operands={_te_mxfp8_deferred_emit_max_pending_operands}, "
             f"cutlass_mxfp8_scale_backend={_cutlass_mxfp8_scale_backend}, "
             f"mxfp8_compact_columnwise_backward={_te_mxfp8_compact_columnwise_backward}, "
             f"mxfp8_grouped_direct_backward={_te_mxfp8_grouped_direct_backward}, "
@@ -2328,7 +2788,8 @@ if (
             f"weight_quantizer_modules={_patched_weight_quantizer_modules}, "
             f"quantize_weight_modules={_patched_quantize_weight_modules}, "
             f"gather_modules={_patched_gather_modules}, "
-            f"norm_modules={_patched_norm_modules})"
+            f"norm_modules={_patched_norm_modules}, "
+            f"deferred_emit_modules={_patched_deferred_emit_modules})"
         )
     except Exception as _exc:  # pragma: no cover
         import sys

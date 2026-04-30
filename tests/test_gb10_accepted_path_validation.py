@@ -287,6 +287,31 @@ def test_training_log_parser_reports_grouped_direct_routing_counters():
     assert parsed["mxfp8_copy_breakdown"]["grouped"]["current_hits"] == 1
 
 
+def test_training_log_parser_reports_batched_transpose_counters():
+    stats = {
+        "mxfp8_batched_transpose_flushes": 1750,
+        "mxfp8_batched_transpose_operands": 2808,
+        "mxfp8_batched_transpose_bf16_emit_operands": 1578,
+        "mxfp8_batched_transpose_uint8_copy_operands": 1230,
+        "mxfp8_batched_transpose_max_pending": 64,
+        "mxfp8_batched_transpose_current_pending": 0,
+        "mxfp8_batched_transpose_current_pending_bytes": 0,
+        "mxfp8_batched_transpose_pending_bytes_peak": 1088575488,
+        "mxfp8_batched_transpose_flush_failures": 0,
+        "fallback_reasons": {},
+    }
+    log = """
+        [cppmega_fp8_shim] TE block-scaled backward stats: {stats}
+    """.format(stats=stats)
+
+    parsed = parse_training_log(log)
+
+    for key, value in stats.items():
+        if key != "fallback_reasons":
+            assert parsed["counters"][key] == value
+    assert parsed["fallback_reasons"] == {}
+
+
 def test_probe_cli_smoke_checks_deprecated_paths_fail_closed_without_ack():
     proc = _run_probe_cli("--skip-mxfp8-probe")
     output = f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"

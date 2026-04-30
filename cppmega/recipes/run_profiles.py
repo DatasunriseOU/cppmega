@@ -138,6 +138,12 @@ class PrecisionProfile:
     # because the current grouped direct kernels save memory but are slower than
     # the grouped TN adapter on GB10 full-model smoke runs.
     mxfp8_grouped_direct_backward: bool = False
+    # Batch TE Linear's deferred MXFP8 rowwise-transpose emits at autograd save
+    # points. This targets launch overhead from many small quantize/transpose
+    # saves without adding producer-side sidecars.
+    mxfp8_deferred_emit_batching: bool = False
+    mxfp8_deferred_emit_max_pending_mib: int = 1024
+    mxfp8_deferred_emit_max_pending_operands: int = 64
     # FlashInfer's public mm_mxfp8 path owns autotuning. direct_tactic bypasses
     # that layer and is only for shape/tactic probes when nsys shows overhead.
     mxfp8_flashinfer_runner: Mxfp8FlashinferRunner = "mm_mxfp8"
@@ -475,6 +481,11 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
             "mxfp8_cutlass_scale_backend='swizzled' is incompatible with "
             "mxfp8_compact_columnwise_backward"
         )
+    if profile.precision.fp8_recipe == "mxfp8":
+        if profile.precision.mxfp8_deferred_emit_max_pending_mib < 1:
+            raise ValueError("mxfp8_deferred_emit_max_pending_mib must be >= 1")
+        if profile.precision.mxfp8_deferred_emit_max_pending_operands < 1:
+            raise ValueError("mxfp8_deferred_emit_max_pending_operands must be >= 1")
 
     env: dict[str, str] = {
         "CPPMEGA_RUN_PROFILE": profile.name,
@@ -622,6 +633,15 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                 "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD": _bool(
                     profile.precision.mxfp8_grouped_direct_backward
                 ),
+                "CPPMEGA_TE_MXFP8_DEFERRED_EMIT_BATCHING": _bool(
+                    profile.precision.mxfp8_deferred_emit_batching
+                ),
+                "CPPMEGA_TE_MXFP8_DEFERRED_EMIT_MAX_PENDING_MIB": str(
+                    profile.precision.mxfp8_deferred_emit_max_pending_mib
+                ),
+                "CPPMEGA_TE_MXFP8_DEFERRED_EMIT_MAX_PENDING_OPERANDS": str(
+                    profile.precision.mxfp8_deferred_emit_max_pending_operands
+                ),
                 "CPPMEGA_FLASHINFER_MXFP8_RUNNER": (
                     profile.precision.mxfp8_flashinfer_runner
                 ),
@@ -731,6 +751,22 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
     if args.mxfp8_grouped_direct_backward is not None:
         profile.precision.mxfp8_grouped_direct_backward = (
             args.mxfp8_grouped_direct_backward
+        )
+    if args.mxfp8_deferred_emit_batching is not None:
+        profile.precision.mxfp8_deferred_emit_batching = (
+            args.mxfp8_deferred_emit_batching
+        )
+    if args.mxfp8_deferred_emit_max_pending_mib is not None:
+        if args.mxfp8_deferred_emit_max_pending_mib < 1:
+            raise ValueError("--mxfp8-deferred-emit-max-pending-mib must be >= 1")
+        profile.precision.mxfp8_deferred_emit_max_pending_mib = (
+            args.mxfp8_deferred_emit_max_pending_mib
+        )
+    if args.mxfp8_deferred_emit_max_pending_operands is not None:
+        if args.mxfp8_deferred_emit_max_pending_operands < 1:
+            raise ValueError("--mxfp8-deferred-emit-max-pending-operands must be >= 1")
+        profile.precision.mxfp8_deferred_emit_max_pending_operands = (
+            args.mxfp8_deferred_emit_max_pending_operands
         )
     if args.mxfp8_flashinfer_runner is not None:
         profile.precision.mxfp8_flashinfer_runner = args.mxfp8_flashinfer_runner
@@ -975,6 +1011,35 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         default=None,
         dest="mxfp8_grouped_direct_backward",
+    )
+    deferred_emit_batching = parser.add_mutually_exclusive_group()
+    deferred_emit_batching.add_argument(
+        "--mxfp8-deferred-emit-batching",
+        action="store_true",
+        default=None,
+        dest="mxfp8_deferred_emit_batching",
+        help=(
+            "Batch deferred MXFP8 Linear saved-transpose emits before backward "
+            "GEMMs to reduce per-operand launch overhead."
+        ),
+    )
+    deferred_emit_batching.add_argument(
+        "--no-mxfp8-deferred-emit-batching",
+        action="store_false",
+        default=None,
+        dest="mxfp8_deferred_emit_batching",
+    )
+    parser.add_argument(
+        "--mxfp8-deferred-emit-max-pending-mib",
+        type=int,
+        default=None,
+        help="Flush deferred MXFP8 emit batches after this many queued MiB.",
+    )
+    parser.add_argument(
+        "--mxfp8-deferred-emit-max-pending-operands",
+        type=int,
+        default=None,
+        help="Flush deferred MXFP8 emit batches after this many queued operands.",
     )
     parser.add_argument(
         "--mxfp8-flashinfer-runner",

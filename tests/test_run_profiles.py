@@ -100,6 +100,9 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
     assert env["CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND"] == "compact"
     assert env["CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD"] == "0"
+    assert env["CPPMEGA_TE_MXFP8_DEFERRED_EMIT_BATCHING"] == "0"
+    assert env["CPPMEGA_TE_MXFP8_DEFERRED_EMIT_MAX_PENDING_MIB"] == "1024"
+    assert env["CPPMEGA_TE_MXFP8_DEFERRED_EMIT_MAX_PENDING_OPERANDS"] == "64"
     assert env["CPPMEGA_FLASHINFER_MXFP8_RUNNER"] == "mm_mxfp8"
     assert env["CPPMEGA_FLASHINFER_MXFP8_TACTIC"] == "0"
     assert env["HYBRID_LAYER_PATTERN"].endswith("/*-/*-")
@@ -168,6 +171,11 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
             "--no-reuse-grad-buf-for-mxfp8-param-ag",
             "--no-mxfp8-transpose-emit-swizzled",
             "--no-mxfp8-transpose-emit-strict",
+            "--no-mxfp8-deferred-emit-batching",
+            "--mxfp8-deferred-emit-max-pending-mib",
+            "64",
+            "--mxfp8-deferred-emit-max-pending-operands",
+            "3",
             "--nsys-capture-mode",
             "delay",
             "--nsys-delay",
@@ -202,6 +210,9 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
     assert "export CPPMEGA_REUSE_GRAD_BUF_FOR_MXFP8_PARAM_AG=0" in out
     assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED=0" in out
     assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT=0" in out
+    assert "export CPPMEGA_TE_MXFP8_DEFERRED_EMIT_BATCHING=0" in out
+    assert "export CPPMEGA_TE_MXFP8_DEFERRED_EMIT_MAX_PENDING_MIB=64" in out
+    assert "export CPPMEGA_TE_MXFP8_DEFERRED_EMIT_MAX_PENDING_OPERANDS=3" in out
     assert "export CPPMEGA_NSYS_CAPTURE_MODE=delay" in out
     assert "export CPPMEGA_NSYS_TRACE=cuda,nvtx,osrt" in out
     assert "export CPPMEGA_NSYS_DELAY=15" in out
