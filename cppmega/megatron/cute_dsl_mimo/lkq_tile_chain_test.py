@@ -37,6 +37,10 @@ import torch
 from cppmega.megatron.cute_dsl_mimo.masked_lkq_apply import run_masked_lkq_apply
 from cppmega.megatron.cute_dsl_mimo.single_gemm_test import run_single_gemm
 from cppmega.megatron.cute_dsl_mimo.state_apply_consumers import (
+    WAVE10_UINT4_BF16_ELEMENTS,
+    WAVE10_UINT4_COPY_BITS,
+    WAVE10_UINT4_COPY_BYTES,
+    multi_chunk_copy_bits,
     run_multi_chunk_state_apply_consumers,
     run_state_apply_consumers,
 )
@@ -746,7 +750,19 @@ def run_lkq_tile_chain(
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"shape: chunk={CHUNK_SIZE} rank={RANK} fcs={FCS} N={N} P={P}")
     print(f"atol: {atol}")
-    print(f"copy_strategy: scalar BF16 universal copies inherited from SingleGemmWGMMA")
+    active_multi_copy_bits = multi_chunk_copy_bits()
+    uint4_enabled = active_multi_copy_bits == WAVE10_UINT4_COPY_BITS
+    copy_strategy = (
+        "wave10_uint4_128bit_g2s_multi_chunk_opt_in"
+        if uint4_enabled
+        else "scalar_bf16_universal_g2s_s2g"
+    )
+    print(f"copy_strategy: {copy_strategy}")
+    print(
+        "wave10_copy_contract: "
+        f"{WAVE10_UINT4_COPY_BITS} bits, {WAVE10_UINT4_COPY_BYTES} bytes, "
+        f"{WAVE10_UINT4_BF16_ELEMENTS} BF16 elements per lane"
+    )
     print("wave6_fused_path: LKQ is R2S-spilled to swizzled smem only, no LKQ gmem output")
     print("wave7_fused_path: state/apply stay in swizzled smem, DV/DMIMO_V computed in-kernel")
     print(f"wave8_multi_chunk_counts: {list(multi_chunk_counts)}")
@@ -924,7 +940,20 @@ def run_lkq_tile_chain(
         "passed": bool(passed),
         "atol": atol,
         "compile_plus_first_lkq_fused_apply_and_consumer_launch_s": compile_s,
-        "copy_strategy": "scalar_bf16_universal_g2s_s2g",
+        "copy_strategy": copy_strategy,
+        "wave10_copy_contract": {
+            "enabled": uint4_enabled,
+            "active_multi_chunk_copy_bits": active_multi_copy_bits,
+            "copy_bits": WAVE10_UINT4_COPY_BITS,
+            "copy_bytes": WAVE10_UINT4_COPY_BYTES,
+            "bf16_elements_per_copy": WAVE10_UINT4_BF16_ELEMENTS,
+            "tile_rows": FCS,
+            "tile_cols": N,
+            "row_bytes": N * 2,
+            "vectors_per_row": (N * 2) // WAVE10_UINT4_COPY_BYTES,
+            "vectors_per_tile": (FCS * N * 2) // WAVE10_UINT4_COPY_BYTES,
+            "guard_source": "mamba3-mono-triton-model commit 65ef653 Wave10 copy evidence",
+        },
         "lkq_global_materialized_for_tested_fused_path": False,
         "state_apply_global_materialized_for_fused_consumer_path": False,
         "fused_path_remaining_global": [

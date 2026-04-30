@@ -46,6 +46,9 @@ def _repo_overlay(image: modal.Image) -> modal.Image:
                 "CPPMEGA_IMAGE_REF": GHCR_REF,
                 "CPPMEGA_MODAL_GPU": GPU_SPEC,
                 "CUTE_DSL_ARCH": "sm_90a",
+                "CPPMEGA_MAMBA3_CUTE_MULTI_UINT4_G2S": os.environ.get(
+                    "CPPMEGA_MAMBA3_CUTE_MULTI_UINT4_G2S", "0"
+                ),
             }
         )
     )

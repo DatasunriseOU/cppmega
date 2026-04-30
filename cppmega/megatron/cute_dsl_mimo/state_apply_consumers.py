@@ -41,15 +41,35 @@ from quack import copy_utils, layout_utils, sm90_utils
 from cppmega.megatron.cute_dsl_mimo.single_gemm_test import _make_row_major_tiled_copy
 
 
+WAVE10_UINT4_COPY_BITS = 128
+WAVE10_UINT4_COPY_BYTES = WAVE10_UINT4_COPY_BITS // 8
+WAVE10_UINT4_BF16_ELEMENTS = WAVE10_UINT4_COPY_BITS // BFloat16.width
+WAVE10_UINT4_ENV = "CPPMEGA_MAMBA3_CUTE_MULTI_UINT4_G2S"
+
+
+def multi_chunk_copy_bits() -> int:
+    if os.environ.get(WAVE10_UINT4_ENV, "0").lower() in {"1", "true", "yes", "on"}:
+        return WAVE10_UINT4_COPY_BITS
+    return BFloat16.width
+
+
 class StateApplyConsumersWGMMA:
     """One-CTA fused state/apply/consumer tile for the fixed 64x64 probe."""
 
-    def __init__(self, dim: int = 64, rank: int = 4, chunk_size: int = 16, dtype=BFloat16):
+    def __init__(
+        self,
+        dim: int = 64,
+        rank: int = 4,
+        chunk_size: int = 16,
+        dtype=BFloat16,
+        g2s_copy_bits: int | None = None,
+    ):
         self.dim = dim
         self.rank = rank
         self.chunk_size = chunk_size
         self.dtype = dtype
         self.num_threads = 128
+        self.g2s_copy_bits = self.dtype.width if g2s_copy_bits is None else g2s_copy_bits
 
     @cute.jit
     def _apply_future_mask(self, acc_lkq: cute.Tensor, coord_lkq: cute.Tensor) -> None:
@@ -215,7 +235,7 @@ class StateApplyConsumersWGMMA:
             self.dtype,
             dim,
             self.num_threads,
-            copy_bits=self.dtype.width,
+            copy_bits=self.g2s_copy_bits,
         )
 
         self.kernel(
@@ -238,7 +258,7 @@ class StateApplyConsumersWGMMA:
 
 
 _CACHE: dict[tuple[int, int, int], object] = {}
-_CACHE_MULTI: dict[tuple[int, int, int, int], object] = {}
+_CACHE_MULTI: dict[tuple[int, int, int, int, int], object] = {}
 
 
 def run_state_apply_consumers(
@@ -595,7 +615,7 @@ class MultiChunkStateApplyConsumersWGMMA(StateApplyConsumersWGMMA):
             self.dtype,
             dim,
             self.num_threads,
-            copy_bits=self.dtype.width,
+            copy_bits=self.g2s_copy_bits,
         )
 
         self.kernel(
@@ -649,10 +669,11 @@ def run_multi_chunk_state_apply_consumers(
     if nchunks not in (2, 4, 8):
         raise ValueError("multi-chunk prototype currently supports nchunks in {2, 4, 8}")
 
-    key = (dim, rank, chunk_size, nchunks)
+    copy_bits = multi_chunk_copy_bits()
+    key = (dim, rank, chunk_size, nchunks, copy_bits)
     compiled = _CACHE_MULTI.get(key)
     if compiled is None:
-        obj = MultiChunkStateApplyConsumersWGMMA(dim, rank, chunk_size, BFloat16)
+        obj = MultiChunkStateApplyConsumersWGMMA(dim, rank, chunk_size, BFloat16, copy_bits)
 
         def fake_bf16_2d(shape: tuple[int, int]) -> cute.Tensor:
             return make_fake_tensor(
