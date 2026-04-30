@@ -21,18 +21,23 @@ from typing import Any
 
 import modal
 
-from scripts.modal_cppmega_base import cppmega_base_image
-
 _REPO_ROOT = pathlib.Path(__file__).parent.parent
 
 APP_NAME = "cppmega-wave28-lane-c-h100"
 RESULTS_VOL = "cppmega-mamba3-benchmarks"
 BENCH_DIR = "/benchmarks/mamba3_wave28_lane_c_h100"
+GHCR_REPO = os.environ.get("GHCR_REPO", "ghcr.io/jewelmusicee/cppmega")
+GHCR_TAG = os.environ.get("GHCR_TAG", "785c3fd")
+GHCR_REF = f"{GHCR_REPO}:{GHCR_TAG}"
 
 
 def _image() -> modal.Image:
     return (
-        cppmega_base_image()
+        modal.Image.from_registry(
+            GHCR_REF,
+            secret=modal.Secret.from_name("ghcr-pull"),
+            add_python=None,
+        )
         .env({"PYTHONPATH": "/opt/cppmega:/opt/megatron-lm"})
         .add_local_dir(str(_REPO_ROOT / "cppmega"), remote_path="/opt/cppmega/cppmega")
         .add_local_dir(
