@@ -41,6 +41,10 @@ def _set_mxfp8_profile_env(backend: str | None) -> str:
     backend = os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_BACKEND", "te_tn_adapter")
     no_sidecar = backend == "cutlass_native"
     os.environ.setdefault(
+        "CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS",
+        "0" if no_sidecar else "1",
+    )
+    os.environ.setdefault(
         "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND",
         "off" if no_sidecar else "te",
     )
@@ -201,6 +205,18 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             failures.append("TN adapter did not consume a saved transpose operand")
         if int(stats.get("mxfp8_tn_adapter_te_emit_deferred", 0)) <= 0:
             failures.append("TE Linear did not defer eager sidecar emission")
+        for key in (
+            "mxfp8_tn_adapter_copy_transpose",
+            "mxfp8_tn_adapter_missing_sidecar_copy",
+            "mxfp8_dense_copy_fallback_dgrad",
+            "mxfp8_dense_copy_fallback_wgrad",
+        ):
+            if int(stats.get(key, 0)) != 0:
+                failures.append(f"{key}={stats.get(key)}; expected 0 for saved MXFP8 operands")
+        if backend == "te_tn_adapter":
+            for key in ("mxfp8_dense_gemm_ready_dgrad", "mxfp8_dense_gemm_ready_wgrad"):
+                if int(stats.get(key, 0)) <= 0:
+                    failures.append(f"{key}={stats.get(key)}; expected >0")
         for key in (
             "mxfp8_tn_adapter_te_emit",
             "mxfp8_tn_sidecar_attr_attached",

@@ -200,6 +200,52 @@ def test_probe_json_parser_accepts_flashinfer_zero_sidecar_backend():
     assert validate_probe_report(report) == []
 
 
+def test_probe_json_parser_accepts_te_tn_saved_dense_operands():
+    stdout = """
+{
+  "results": [
+    {"name": "mxfp8_dgrad_shim_NN_to_TN", "status": "pass"},
+    {"name": "mxfp8_wgrad_shim_NT_to_TN", "status": "pass"}
+  ],
+  "shim_stats": {
+    "mxfp8_tn_adapter_dgrad": 1,
+    "mxfp8_tn_adapter_wgrad": 1,
+    "mxfp8_dense_gemm_ready_dgrad": 1,
+    "mxfp8_dense_gemm_ready_wgrad": 1,
+    "mxfp8_dense_copy_fallback_dgrad": 0,
+    "mxfp8_dense_copy_fallback_wgrad": 0,
+    "mxfp8_tn_adapter_te_emit": 0,
+    "mxfp8_tn_adapter_te_emit_deferred": 4,
+    "mxfp8_tn_adapter_saved_transpose_operand": 3,
+    "mxfp8_tn_adapter_te_emit_swizzled": 0,
+    "mxfp8_tn_adapter_te_emit_swizzled_unavailable": 0,
+    "mxfp8_tn_adapter_copy_transpose": 0,
+    "mxfp8_tn_adapter_missing_sidecar_copy": 0,
+    "mxfp8_norm_quantize_sidecar_bridge": 0,
+    "bf16_fallback_dgrad": 0,
+    "bf16_fallback_wgrad": 0,
+    "native_passthrough_dgrad": 0,
+    "native_passthrough_wgrad": 0,
+    "mxfp8_tn_sidecar_registry_size": 0,
+    "mxfp8_tn_sidecar_registry_persistent": 0,
+    "mxfp8_tn_sidecar_registry_peak": 0,
+    "mxfp8_tn_sidecar_registry_current_bytes": 0,
+    "mxfp8_tn_sidecar_registry_peak_bytes": 0,
+    "mxfp8_tn_sidecar_tracked_attr_current_bytes": 0,
+    "mxfp8_tn_sidecar_tracked_attr_peak_bytes": 0,
+    "mxfp8_tn_sidecar_attr_attached": 0,
+    "mxfp8_tn_sidecar_attr_cleared": 0,
+    "mxfp8_tn_sidecar_consumed": 0,
+    "mxfp8_tn_sidecar_attr_attached_bytes": 0,
+    "fallback_reasons": {}
+  }
+}
+"""
+    report = extract_first_json_object(stdout)
+
+    assert validate_probe_report(report) == []
+
+
 def test_training_log_parser_accepts_loss_and_counter_formats():
     log = """
 	iteration 1 | lm loss: 1.165876E+01 | mtp_1 loss: 1.164849E+01
@@ -285,6 +331,32 @@ def test_training_log_parser_reports_grouped_direct_routing_counters():
     assert parsed["fallback_reasons"] == {"unsupported_shape": 1}
     assert parsed["mxfp8_copy_breakdown"]["grouped"]["direct_hits"] == 5
     assert parsed["mxfp8_copy_breakdown"]["grouped"]["current_hits"] == 1
+
+
+def test_training_log_parser_counts_dense_gemm_ready_as_direct_hits():
+    stats = {
+        "mxfp8_tn_adapter_dgrad": 2,
+        "mxfp8_tn_adapter_wgrad": 2,
+        "mxfp8_dense_gemm_ready_dgrad": 2,
+        "mxfp8_dense_gemm_ready_wgrad": 2,
+        "mxfp8_dense_copy_fallback_dgrad": 0,
+        "mxfp8_dense_copy_fallback_wgrad": 0,
+        "mxfp8_tn_adapter_copy_transpose": 0,
+        "mxfp8_tn_sidecar_registry_peak_bytes": 0,
+        "fallback_reasons": {},
+    }
+    log = """
+        [cppmega_fp8_shim] TE block-scaled backward stats: {stats}
+        [Rank 0] (after 1 iterations) memory (MB) | allocated: 1024.00 | max allocated: 2048.00
+    """.format(stats=stats)
+
+    parsed = parse_training_log(log)
+    dense = parsed["mxfp8_copy_breakdown"]["dense"]
+
+    assert dense["current_hits"] == 4
+    assert dense["direct_hits"] == 4
+    assert dense["fallback_copies"] == 0
+    assert parsed["profile_readiness"]["direct_backend_observed"] is True
 
 
 def test_probe_cli_smoke_checks_deprecated_paths_fail_closed_without_ack():

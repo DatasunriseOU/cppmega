@@ -38,6 +38,12 @@ GROUPED_DIRECT_STAT_KEYS = (
     "mxfp8_grouped_gemm_ready_miss_wgrad",
     "mxfp8_grouped_transpose_copy_fallback_dgrad",
     "mxfp8_grouped_transpose_copy_fallback_wgrad",
+)
+DENSE_GEMM_READY_STAT_KEYS = (
+    "mxfp8_dense_gemm_ready_dgrad",
+    "mxfp8_dense_gemm_ready_wgrad",
+)
+DENSE_COPY_FALLBACK_STAT_KEYS = (
     "mxfp8_dense_copy_fallback_dgrad",
     "mxfp8_dense_copy_fallback_wgrad",
 )
@@ -47,6 +53,7 @@ MATERIALIZATION_STAT_KEYS = (
     "mxfp8_tn_adapter_saved_transpose_operand",
     "mxfp8_tn_adapter_te_emit_swizzled",
     "mxfp8_tn_adapter_te_emit_swizzled_unavailable",
+    "mxfp8_tn_adapter_backward_copy_sidecar",
     "mxfp8_tn_adapter_copy_transpose",
     "mxfp8_tn_adapter_missing_sidecar_copy",
     "mxfp8_norm_quantize_sidecar_bridge",
@@ -73,6 +80,8 @@ ALL_STAT_KEYS = (
     + FLASHINFER_STAT_KEYS
     + FLASHINFER_FPROP_STAT_KEYS
     + GROUPED_DIRECT_STAT_KEYS
+    + DENSE_GEMM_READY_STAT_KEYS
+    + DENSE_COPY_FALLBACK_STAT_KEYS
     + FALLBACK_STAT_KEYS
     + PASSTHROUGH_STAT_KEYS
     + MATERIALIZATION_STAT_KEYS
@@ -312,11 +321,21 @@ def _build_mxfp8_copy_breakdown(text: str, counters: dict[str, int]) -> dict[str
         unattributed_copies = total_copy_transpose - grouped_fallback_copies - dense_expected_fallback_copies
         dense_copy_source = "copy_transpose_counter_minus_grouped"
 
-    dense_dgrad_direct_hits = _counter(counters, "mxfp8_cutlass_native_dgrad") + _counter(
-        counters, "mxfp8_flashinfer_dgrad"
+    dense_dgrad_direct_hits = sum(
+        _counter(counters, key)
+        for key in (
+            "mxfp8_cutlass_native_dgrad",
+            "mxfp8_flashinfer_dgrad",
+            "mxfp8_dense_gemm_ready_dgrad",
+        )
     )
-    dense_wgrad_direct_hits = _counter(counters, "mxfp8_cutlass_native_wgrad") + _counter(
-        counters, "mxfp8_flashinfer_wgrad"
+    dense_wgrad_direct_hits = sum(
+        _counter(counters, key)
+        for key in (
+            "mxfp8_cutlass_native_wgrad",
+            "mxfp8_flashinfer_wgrad",
+            "mxfp8_dense_gemm_ready_wgrad",
+        )
     )
     grouped_dgrad_direct_hits = sum(
         _counter(counters, key)

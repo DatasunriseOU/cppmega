@@ -442,7 +442,7 @@ def run_mxfp8_te_linear_saved_operand_probe(args: argparse.Namespace) -> CheckRe
         sys.executable,
         str(repo_root() / "tools" / "probes" / "te_linear_mxfp8_saved_activation_probe.py"),
         "--backend",
-        "flashinfer_cutlass",
+        "te_tn_adapter",
         "--m",
         str(args.m),
         "--n",
@@ -454,7 +454,8 @@ def run_mxfp8_te_linear_saved_operand_probe(args: argparse.Namespace) -> CheckRe
     env.update(
         {
             "CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER": "1",
-            "CPPMEGA_TE_MXFP8_BWD_BACKEND": "flashinfer_cutlass",
+            "CPPMEGA_TE_MXFP8_BWD_BACKEND": "te_tn_adapter",
+            "CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS": "1",
             "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND": "te",
             "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED": "1",
             "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT": "1",

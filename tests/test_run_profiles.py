@@ -100,6 +100,7 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
     assert env["CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND"] == "compact"
     assert env["CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD"] == "0"
+    assert env["CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS"] == "0"
     assert env["CPPMEGA_FLASHINFER_MXFP8_RUNNER"] == "mm_mxfp8"
     assert env["CPPMEGA_FLASHINFER_MXFP8_TACTIC"] == "0"
     assert env["HYBRID_LAYER_PATTERN"].endswith("/*-/*-")
@@ -164,6 +165,7 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
             "--mxfp8-transpose-emit-backend",
             "off",
             "--mxfp8-compact-columnwise-backward",
+            "--mxfp8-dense-saved-operands",
             "--no-mxfp8-grouped-gemm-ready-backward",
             "--fp8-param-gather",
             "--no-reuse-grad-buf-for-mxfp8-param-ag",
@@ -199,6 +201,7 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
     assert "export CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native" in out
     assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=off" in out
     assert "export CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=1" in out
+    assert "export CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS=1" in out
     assert "export CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD=0" in out
     assert "export CPPMEGA_FP8_PARAM_GATHER=1" in out
     assert "export CPPMEGA_REUSE_GRAD_BUF_FOR_MXFP8_PARAM_AG=0" in out
@@ -362,6 +365,7 @@ def test_local_gb10_quarter_mxfp8_defaults_to_measured_te_tn_backend():
     profile = get_run_profile("local_gb10_quarter")
     assert profile.precision.mxfp8_bwd_backend == "te_tn_adapter"
     assert profile.precision.mxfp8_flashinfer_runner == "mm_mxfp8"
+    assert profile.precision.mxfp8_dense_saved_operands is False
     assert profile.precision.mxfp8_grouped_direct_backward is False
 
 
@@ -371,6 +375,7 @@ def test_mxfp8_transpose_emit_defaults_to_te_for_tn_adapter():
     profile.precision.fp8_recipe = "mxfp8"
     env = profile_shell_assignments(profile)
     assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
+    assert env["CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS"] == "0"
     assert env["CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD"] == "0"
     assert env["CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD"] == "1"
 
