@@ -10,6 +10,8 @@ _RUNTIME_ENV = [
     "CPPMEGA_M2RNN_FWD_AUTOTUNE",
     "CPPMEGA_M2RNN_FWD_NUM_WARPS",
     "CPPMEGA_M2RNN_FWD_NUM_STAGES",
+    "CPPMEGA_M2RNN_BROADCAST_VIEWS",
+    "CPPMEGA_M2RNN_BWD_REDUCE_BROADCAST_QK",
 ]
 
 
@@ -49,6 +51,8 @@ def test_build_cppmega_m2rnn_config_maps_runtime_fields(monkeypatch):
         m2rnn_fwd_autotune=True,
         m2rnn_fwd_num_warps=8,
         m2rnn_fwd_num_stages=2,
+        m2rnn_broadcast_views=False,
+        m2rnn_bwd_reduce_broadcast_qk=False,
     )
 
     config = build_cppmega_m2rnn_config(megatron_config)
@@ -59,6 +63,8 @@ def test_build_cppmega_m2rnn_config_maps_runtime_fields(monkeypatch):
     assert config.runtime_fwd_autotune is True
     assert config.runtime_fwd_num_warps == 8
     assert config.runtime_fwd_num_stages == 2
+    assert config.runtime_broadcast_views is False
+    assert config.runtime_bwd_reduce_broadcast_qk is False
 
 
 def test_build_cppmega_m2rnn_config_maps_env_runtime_fallback(monkeypatch):
@@ -68,6 +74,8 @@ def test_build_cppmega_m2rnn_config_maps_env_runtime_fallback(monkeypatch):
     monkeypatch.setenv("CPPMEGA_M2RNN_FWD_AUTOTUNE", "1")
     monkeypatch.setenv("CPPMEGA_M2RNN_FWD_NUM_WARPS", "16")
     monkeypatch.setenv("CPPMEGA_M2RNN_FWD_NUM_STAGES", "4")
+    monkeypatch.setenv("CPPMEGA_M2RNN_BROADCAST_VIEWS", "0")
+    monkeypatch.setenv("CPPMEGA_M2RNN_BWD_REDUCE_BROADCAST_QK", "0")
 
     config = build_cppmega_m2rnn_config(SimpleNamespace(hidden_size=512))
 
@@ -77,3 +85,5 @@ def test_build_cppmega_m2rnn_config_maps_env_runtime_fallback(monkeypatch):
     assert config.runtime_fwd_autotune is True
     assert config.runtime_fwd_num_warps == 16
     assert config.runtime_fwd_num_stages == 4
+    assert config.runtime_broadcast_views is False
+    assert config.runtime_bwd_reduce_broadcast_qk is False

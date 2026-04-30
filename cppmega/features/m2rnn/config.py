@@ -12,6 +12,8 @@ _DEFAULT_BWD_CHUNK_SIZE = 64
 _DEFAULT_FWD_AUTOTUNE = False
 _DEFAULT_FWD_NUM_WARPS = 4
 _DEFAULT_FWD_NUM_STAGES = 3
+_DEFAULT_BROADCAST_VIEWS = True
+_DEFAULT_BWD_REDUCE_BROADCAST_QK = False
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,8 @@ class CppMegaM2RNNConfig:
     runtime_fwd_autotune: bool = _DEFAULT_FWD_AUTOTUNE
     runtime_fwd_num_warps: int = _DEFAULT_FWD_NUM_WARPS
     runtime_fwd_num_stages: int = _DEFAULT_FWD_NUM_STAGES
+    runtime_broadcast_views: bool = _DEFAULT_BROADCAST_VIEWS
+    runtime_bwd_reduce_broadcast_qk: bool = _DEFAULT_BWD_REDUCE_BROADCAST_QK
 
 
 def _raw_config_or_env(megatron_config, attr: str, env_name: str, default):
@@ -144,5 +148,23 @@ def build_cppmega_m2rnn_config(megatron_config, *, d_model: int | None = None) -
             ),
             _DEFAULT_FWD_NUM_STAGES,
             {1, 2, 3, 4},
+        ),
+        runtime_broadcast_views=_as_bool(
+            _raw_config_or_env(
+                megatron_config,
+                "m2rnn_broadcast_views",
+                "CPPMEGA_M2RNN_BROADCAST_VIEWS",
+                _DEFAULT_BROADCAST_VIEWS,
+            ),
+            _DEFAULT_BROADCAST_VIEWS,
+        ),
+        runtime_bwd_reduce_broadcast_qk=_as_bool(
+            _raw_config_or_env(
+                megatron_config,
+                "m2rnn_bwd_reduce_broadcast_qk",
+                "CPPMEGA_M2RNN_BWD_REDUCE_BROADCAST_QK",
+                _DEFAULT_BWD_REDUCE_BROADCAST_QK,
+            ),
+            _DEFAULT_BWD_REDUCE_BROADCAST_QK,
         ),
     )

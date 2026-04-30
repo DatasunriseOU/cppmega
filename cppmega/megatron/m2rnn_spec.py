@@ -129,6 +129,8 @@ class CppMegaM2RNNMixer(nn.Module):
                 fwd_autotune=m2rnn.runtime_fwd_autotune,
                 fwd_num_warps=m2rnn.runtime_fwd_num_warps,
                 fwd_num_stages=m2rnn.runtime_fwd_num_stages,
+                broadcast_views=m2rnn.runtime_broadcast_views,
+                bwd_reduce_broadcast_qk=m2rnn.runtime_bwd_reduce_broadcast_qk,
             )
             if _M2RNNRuntimeConfig is not None
             else None
