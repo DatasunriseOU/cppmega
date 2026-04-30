@@ -10,24 +10,26 @@
 #include <vector>
 
 #include "cute/tensor.hpp"
+#include "mamba3_wgmma_wave10_copy_guards.hpp"
 
 namespace {
 
-constexpr int kTileRows = 64;
-constexpr int kTileCols = 64;
-constexpr int kBf16Bytes = 2;
-constexpr int kVectorBytes = 16;
-constexpr int kLogicalTileCount = 12;
-constexpr int kGlobalTileCount = 10;
-constexpr int kLocalStageTileCount = 2;
-constexpr int kTileElements = kTileRows * kTileCols;
-constexpr int kTileBytes = kTileElements * kBf16Bytes;
-constexpr int kVectorsPerTile = kTileBytes / kVectorBytes;
-constexpr int kElementsPerVector = kVectorBytes / kBf16Bytes;
-constexpr int kTotalVectors = kLogicalTileCount * kVectorsPerTile;
-constexpr int kTotalElements = kLogicalTileCount * kTileElements;
-constexpr int kDynamicSmemBytes = kLogicalTileCount * kTileBytes;
+constexpr int kTileRows = mamba3_wave10_copy::kTileRows;
+constexpr int kTileCols = mamba3_wave10_copy::kTileCols;
+constexpr int kBf16Bytes = mamba3_wave10_copy::kBf16Bytes;
+constexpr int kVectorBytes = mamba3_wave10_copy::kVectorBytes;
+constexpr int kLogicalTileCount = mamba3_wave10_copy::kLogicalTileCount;
+constexpr int kGlobalTileCount = mamba3_wave10_copy::kGlobalTileCount;
+constexpr int kLocalStageTileCount = mamba3_wave10_copy::kLocalStageTileCount;
+constexpr int kTileElements = mamba3_wave10_copy::kTileElements;
+constexpr int kTileBytes = mamba3_wave10_copy::kTileBytes;
+constexpr int kVectorsPerTile = mamba3_wave10_copy::kVectorsPerTile;
+constexpr int kElementsPerVector = mamba3_wave10_copy::kElementsPerVector;
+constexpr int kTotalVectors = mamba3_wave10_copy::kTotalVectors;
+constexpr int kTotalElements = mamba3_wave10_copy::kTotalElements;
+constexpr int kDynamicSmemBytes = mamba3_wave10_copy::kDynamicSmemBytes;
 
+static_assert(mamba3_wave10_copy::kStaticLayoutGuardsPass);
 static_assert(kTileBytes == 8192);
 static_assert(kVectorsPerTile == 512);
 static_assert(kTileCols * kBf16Bytes == 128);
@@ -126,20 +128,16 @@ extern "C" __global__ void mamba3_wave9_uint4_copy_12tile_probe(
   auto* local_stage_vectors = reinterpret_cast<const uint4*>(local_stage_src);
   auto* dst_vectors = reinterpret_cast<uint4*>(dst);
 
-  __shared__ int block_alignment_failed;
+  __shared__ int block_guard_bits;
   if (threadIdx.x == 0) {
-    const uintptr_t alignment_bits =
-        reinterpret_cast<uintptr_t>(global_src) |
-        reinterpret_cast<uintptr_t>(local_stage_src) |
-        reinterpret_cast<uintptr_t>(dst) |
-        reinterpret_cast<uintptr_t>(smem_bytes);
-    block_alignment_failed = ((alignment_bits & (kVectorBytes - 1)) != 0);
-    if (block_alignment_failed) {
-      atomicOr(status, 1);
+    block_guard_bits = mamba3_wave10_copy::runtime_guard_bits(
+        global_src, local_stage_src, dst, smem_bytes, blockDim.x);
+    if (block_guard_bits != mamba3_wave10_copy::kGuardStatusOk) {
+      atomicOr(status, block_guard_bits);
     }
   }
   __syncthreads();
-  if (block_alignment_failed) {
+  if (block_guard_bits != mamba3_wave10_copy::kGuardStatusOk) {
     return;
   }
 
@@ -229,7 +227,7 @@ int main(int argc, char** argv) {
           "cudaDeviceGetAttribute(max dynamic shared memory opt-in)")) {
     return 2;
   }
-  if (max_dynamic_smem_optin < kDynamicSmemBytes) {
+  if (!mamba3_wave10_copy::dynamic_smem_optin_guard(max_dynamic_smem_optin)) {
     print_failure_json("dynamic_smem_cap", "device cannot opt in to 98304 bytes of dynamic shared memory");
     return 2;
   }

@@ -1,0 +1,477 @@
+{
+  "blockers": [],
+  "branch": "worker/mamba3-mono-triton-model",
+  "checks": {
+    "alignment_layout": {
+      "failures": [],
+      "pass": true,
+      "status": "pass",
+      "tile_count": 12,
+      "tiles_covered": [
+        "K",
+        "Q",
+        "K_T",
+        "Q_T",
+        "state_panel_p0",
+        "state_panel_p1",
+        "dPhiO_panel_p0",
+        "dPhiO_panel_p1",
+        "PsiV_panel_p0",
+        "PsiV_panel_p1",
+        "dstates_panel_p0",
+        "dstates_panel_p1"
+      ]
+    },
+    "guard_contract": {
+      "failures": [],
+      "pass": true,
+      "status": "pass"
+    },
+    "ptxas_resource": {
+      "failures": [],
+      "metadata": {
+        "dynamic_smem_bytes": 98304,
+        "registers_per_thread": 40,
+        "spill_loads_bytes": 0,
+        "spill_stores_bytes": 0,
+        "static_smem_bytes": 16
+      },
+      "pass": true,
+      "schema": {
+        "expected_dynamic_smem_bytes": 118784,
+        "kill_registers_per_thread": 224,
+        "registers_per_thread_max": 192,
+        "required_fields": [
+          "registers_per_thread",
+          "static_smem_bytes",
+          "dynamic_smem_bytes",
+          "spill_stores_bytes",
+          "spill_loads_bytes"
+        ],
+        "spill_loads_bytes_max": 0,
+        "spill_stores_bytes_max": 0,
+        "total_smem_bytes_max": 118784
+      },
+      "status": "pass",
+      "total_smem_bytes": 98320,
+      "variant": "narrow_vector_128b_safe_attempt"
+    },
+    "runtime_probe": {
+      "failures": [],
+      "pass": true,
+      "status": "pass"
+    }
+  },
+  "date": "2026-04-30",
+  "decision": {
+    "recommendation": "integrate_vector_path_next",
+    "summary": "Integrate the 12-tile uint4 vector copy into the CuTe lane next; keep TMA as a fallback path, not the primary next step.",
+    "tma_fallback": "fallback_only_if_integrated_cute_lane_regresses_correctness_resources_or_timing",
+    "vector_path_ready": true
+  },
+  "guard_contract": {
+    "api_sketch": {
+      "copy_helper_signature": "template <class GlobalTiles, class LocalStageTiles, class SmemTiles> CUTE_DEVICE void copy_12tile_uint4_to_smem(GlobalTiles const& global_tiles, LocalStageTiles const& local_stage_tiles, SmemTiles& smem_tiles, int chunk_idx, int* status)",
+      "device_guard": "mamba3_wave10_copy::runtime_guard_bits(global_src, local_stage_src, dst, smem, block_threads)",
+      "guard_header": "tools/probes/mamba3_wgmma_wave10_copy_guards.hpp",
+      "sequence": [
+        "run static layout assertions and runtime guard bit checks",
+        "copy ten global 64x64 bf16 tiles as uint4 lanes into SMEM",
+        "copy two CTA-local dstates 64x64 bf16 panels as uint4 lanes into SMEM",
+        "__syncthreads() before WGMMA reads the staging buffer",
+        "run the CuTe/WGMMA math using the physical layouts described in the receipt",
+        "__syncthreads() before the next chunk reuses the 12-tile SMEM buffer"
+      ],
+      "status_word": "int bitmask using mamba3_wave10_copy::GuardStatusBits"
+    },
+    "constants": {
+      "dtype": "bf16",
+      "dtype_bytes": 2,
+      "dynamic_smem_bytes": 98304,
+      "global_tile_count": 10,
+      "local_stage_tile_count": 2,
+      "logical_tile_count": 12,
+      "row_bytes": 128,
+      "tile_bytes": 8192,
+      "tile_cols": 64,
+      "tile_rows": 64,
+      "vector_bytes": 16,
+      "vector_type": "uint4",
+      "vectors_per_chunk": 6144,
+      "vectors_per_row": 8,
+      "vectors_per_tile": 512
+    },
+    "date": "2026-04-30",
+    "expected_data_layouts": {
+      "destination": "12 contiguous 64x64 bf16 physical SMEM tiles, each with 128-byte rows and 512 uint4 lanes",
+      "global_source_tiles_per_chunk": 10,
+      "local_stage_tiles_per_chunk": 2,
+      "tiles": [
+        {
+          "destination_expr": "sK physical row-major/swizzled 64x64 tile",
+          "destination_space": "smem",
+          "layout_kind": "row_major_or_swizzled_physical_128b_rows",
+          "name": "K",
+          "panel_offset_alignment_bytes": 128,
+          "row_bytes": 128,
+          "row_stride_alignment_bytes": 128,
+          "source_expr": "K[b,h,chunk_idx*16 + t, n] as a 64x64 fused-row tile",
+          "source_space": "global",
+          "tma_candidate": true,
+          "transpose_layout_proof": null,
+          "vector_bytes": 16,
+          "vector_type": "uint4",
+          "vectors_per_tile": 512
+        },
+        {
+          "destination_expr": "sQ physical row-major/swizzled 64x64 tile",
+          "destination_space": "smem",
+          "layout_kind": "row_major_or_swizzled_physical_128b_rows",
+          "name": "Q",
+          "panel_offset_alignment_bytes": 128,
+          "row_bytes": 128,
+          "row_stride_alignment_bytes": 128,
+          "source_expr": "Q[b,h,chunk_idx*16 + t, n] as a 64x64 fused-row tile",
+          "source_space": "global",
+          "tma_candidate": true,
+          "transpose_layout_proof": null,
+          "vector_bytes": 16,
+          "vector_type": "uint4",
+          "vectors_per_tile": 512
+        },
+        {
+          "destination_expr": "sK_T physical 128B-row swizzled transpose operand",
+          "destination_space": "smem",
+          "layout_kind": "transpose_operand_physical_128b_rows",
+          "name": "K_T",
+          "panel_offset_alignment_bytes": 128,
+          "row_bytes": 128,
+          "row_stride_alignment_bytes": 128,
+          "source_expr": "K tile copied with a CuTe layout that materializes or views K_T in SMEM",
+          "source_space": "global",
+          "tma_candidate": true,
+          "transpose_layout_proof": {
+            "failure_mode": "If generated code materializes this operand as one BF16 store per logical column, this proof is invalid and the receipt must fail.",
+            "logical_to_physical_map": "physical(row=n, col=m) is consumed as logical K_T[m,n]",
+            "per_column_scalar_scatter": false,
+            "physical_layout": "GMMA-B operand tile with 128-byte physical rows",
+            "physical_row_bytes": 128,
+            "physical_row_elements": 64,
+            "proof": "The transpose is represented by the CuTe/GMMA operand layout, not by a per-column 2-byte scatter.  Each emitted uint4 lane writes eight contiguous BF16 values on a 128-byte physical row.",
+            "source_tile": "K",
+            "status": "pass",
+            "tile_name": "K_T",
+            "vector_compatible": true,
+            "vector_lane_bytes": 16,
+            "vector_lane_elements": 8
+          },
+          "vector_bytes": 16,
+          "vector_type": "uint4",
+          "vectors_per_tile": 512
+        },
+        {
+          "destination_expr": "sQ_T physical 128B-row swizzled transpose operand",
+          "destination_space": "smem",
+          "layout_kind": "transpose_operand_physical_128b_rows",
+          "name": "Q_T",
+          "panel_offset_alignment_bytes": 128,
+          "row_bytes": 128,
+          "row_stride_alignment_bytes": 128,
+          "source_expr": "Q tile copied with a CuTe layout that materializes or views Q_T in SMEM",
+          "source_space": "global",
+          "tma_candidate": true,
+          "transpose_layout_proof": {
+            "failure_mode": "If generated code materializes this operand as one BF16 store per logical column, this proof is invalid and the receipt must fail.",
+            "logical_to_physical_map": "physical(row=n, col=m) is consumed as logical Q_T[m,n]",
+            "per_column_scalar_scatter": false,
+            "physical_layout": "GMMA-B operand tile with 128-byte physical rows",
+            "physical_row_bytes": 128,
+            "physical_row_elements": 64,
+            "proof": "The transpose is represented by the CuTe/GMMA operand layout, not by a per-column 2-byte scatter.  Each emitted uint4 lane writes eight contiguous BF16 values on a 128-byte physical row.",
+            "source_tile": "Q",
+            "status": "pass",
+            "tile_name": "Q_T",
+            "vector_compatible": true,
+            "vector_lane_bytes": 16,
+            "vector_lane_elements": 8
+          },
+          "vector_bytes": 16,
+          "vector_type": "uint4",
+          "vectors_per_tile": 512
+        },
+        {
+          "destination_expr": "sStatePanel p0 physical row-major/swizzled 64x64 tile",
+          "destination_space": "smem",
+          "layout_kind": "row_major_or_swizzled_physical_128b_rows",
+          "name": "state_panel_p0",
+          "panel_offset_alignment_bytes": 128,
+          "row_bytes": 128,
+          "row_stride_alignment_bytes": 128,
+          "source_expr": "states[b,h,n,p=0:64] panel",
+          "source_space": "global",
+          "tma_candidate": true,
+          "transpose_layout_proof": null,
+          "vector_bytes": 16,
+          "vector_type": "uint4",
+          "vectors_per_tile": 512
+        },
+        {
+          "destination_expr": "sStatePanel p1 physical row-major/swizzled 64x64 tile",
+          "destination_space": "smem",
+          "layout_kind": "row_major_or_swizzled_physical_128b_rows",
+          "name": "state_panel_p1",
+          "panel_offset_alignment_bytes": 128,
+          "row_bytes": 128,
+          "row_stride_alignment_bytes": 128,
+          "source_expr": "states[b,h,n,p=64:128] panel",
+          "source_space": "global",
+          "tma_candidate": true,
+          "transpose_layout_proof": null,
+          "vector_bytes": 16,
+          "vector_type": "uint4",
+          "vectors_per_tile": 512
+        },
+        {
+          "destination_expr": "sDPhPanel p0 physical row-major/swizzled 64x64 tile",
+          "destination_space": "smem",
+          "layout_kind": "row_major_or_swizzled_physical_128b_rows",
+          "name": "dPhiO_panel_p0",
+          "panel_offset_alignment_bytes": 128,
+          "row_bytes": 128,
+          "row_stride_alignment_bytes": 128,
+          "source_expr": "dPhiO[b,h,chunk_idx*16 + t,p=0:64] panel",
+          "source_space": "global",
+          "tma_candidate": true,
+          "transpose_layout_proof": null,
+          "vector_bytes": 16,
+          "vector_type": "uint4",
+          "vectors_per_tile": 512
+        },
+        {
+          "destination_expr": "sDPhPanel p1 physical row-major/swizzled 64x64 tile",
+          "destination_space": "smem",
+          "layout_kind": "row_major_or_swizzled_physical_128b_rows",
+          "name": "dPhiO_panel_p1",
+          "panel_offset_alignment_bytes": 128,
+          "row_bytes": 128,
+          "row_stride_alignment_bytes": 128,
+          "source_expr": "dPhiO[b,h,chunk_idx*16 + t,p=64:128] panel",
+          "source_space": "global",
+          "tma_candidate": true,
+          "transpose_layout_proof": null,
+          "vector_bytes": 16,
+          "vector_type": "uint4",
+          "vectors_per_tile": 512
+        },
+        {
+          "destination_expr": "sPsiPanel p0 physical row-major/swizzled 64x64 tile",
+          "destination_space": "smem",
+          "layout_kind": "row_major_or_swizzled_physical_128b_rows",
+          "name": "PsiV_panel_p0",
+          "panel_offset_alignment_bytes": 128,
+          "row_bytes": 128,
+          "row_stride_alignment_bytes": 128,
+          "source_expr": "PsiV[b,h,chunk_idx*16 + t,p=0:64] panel",
+          "source_space": "global",
+          "tma_candidate": true,
+          "transpose_layout_proof": null,
+          "vector_bytes": 16,
+          "vector_type": "uint4",
+          "vectors_per_tile": 512
+        },
+        {
+          "destination_expr": "sPsiPanel p1 physical row-major/swizzled 64x64 tile",
+          "destination_space": "smem",
+          "layout_kind": "row_major_or_swizzled_physical_128b_rows",
+          "name": "PsiV_panel_p1",
+          "panel_offset_alignment_bytes": 128,
+          "row_bytes": 128,
+          "row_stride_alignment_bytes": 128,
+          "source_expr": "PsiV[b,h,chunk_idx*16 + t,p=64:128] panel",
+          "source_space": "global",
+          "tma_candidate": true,
+          "transpose_layout_proof": null,
+          "vector_bytes": 16,
+          "vector_type": "uint4",
+          "vectors_per_tile": 512
+        },
+        {
+          "destination_expr": "sDStatePanel p0 physical row-major/swizzled 64x64 tile",
+          "destination_space": "smem",
+          "layout_kind": "row_major_or_swizzled_physical_128b_rows",
+          "name": "dstates_panel_p0",
+          "panel_offset_alignment_bytes": 128,
+          "row_bytes": 128,
+          "row_stride_alignment_bytes": 128,
+          "source_expr": "CTA-local dstates[n,p=0:64] loop-carried panel",
+          "source_space": "cta_local",
+          "tma_candidate": false,
+          "transpose_layout_proof": null,
+          "vector_bytes": 16,
+          "vector_type": "uint4",
+          "vectors_per_tile": 512
+        },
+        {
+          "destination_expr": "sDStatePanel p1 physical row-major/swizzled 64x64 tile",
+          "destination_space": "smem",
+          "layout_kind": "row_major_or_swizzled_physical_128b_rows",
+          "name": "dstates_panel_p1",
+          "panel_offset_alignment_bytes": 128,
+          "row_bytes": 128,
+          "row_stride_alignment_bytes": 128,
+          "source_expr": "CTA-local dstates[n,p=64:128] loop-carried panel",
+          "source_space": "cta_local",
+          "tma_candidate": false,
+          "transpose_layout_proof": null,
+          "vector_bytes": 16,
+          "vector_type": "uint4",
+          "vectors_per_tile": 512
+        }
+      ]
+    },
+    "failure_modes": [
+      {
+        "detected_by": "runtime_guard_bits status word",
+        "mode": "misaligned_source_or_destination",
+        "required_action": "do not launch the vector path for that generated layout; use scalar repair or TMA fallback"
+      },
+      {
+        "detected_by": "row_stride_guard and panel_offset_guard in generated CuTe code",
+        "mode": "row_or_panel_stride_not_16b_aligned",
+        "required_action": "fix the layout mapping before enabling uint4 lanes"
+      },
+      {
+        "detected_by": "Wave8 transpose_layout_proof and generated-code inspection",
+        "mode": "kt_qt_scalar_scatter",
+        "required_action": "keep K_T/Q_T as physical-layout/view operands or fall back to TMA descriptor smoke"
+      },
+      {
+        "detected_by": "guard contract and codegen review; no 64x64 bf16 tile has a tail",
+        "mode": "masked_tail_or_scalar_cleanup_emitted",
+        "required_action": "remove the tail path from this specialization before integration"
+      },
+      {
+        "detected_by": "dynamic_smem_optin_guard",
+        "mode": "smem_optin_too_small",
+        "required_action": "skip vector path on that target; do not use H200-only capacity assumptions"
+      },
+      {
+        "detected_by": "ptxas metadata and focused compile test",
+        "mode": "resource_regression",
+        "required_action": "keep TMA fallback active if registers exceed budget or any spill appears"
+      },
+      {
+        "detected_by": "byte equality against scalar CUDA reference",
+        "mode": "runtime_correctness_regression",
+        "required_action": "block integration and switch the next lane run to TMA fallback investigation"
+      }
+    ],
+    "guard_conditions": {
+      "compile_time": [
+        "tile shape is 64x64 bf16",
+        "row_bytes == 128 and tile_bytes == 8192",
+        "vector copy lane is 16 bytes, eight contiguous bf16 values",
+        "row_bytes and tile_bytes have zero vector tail",
+        "logical tile split is 10 global-source tiles plus 2 CTA-local-stage tiles",
+        "dynamic SMEM contract is 98304 bytes for the 12-tile staging buffer"
+      ],
+      "layout": [
+        "K, Q, state, dPhiO, PsiV, and dstates panels use 128-byte physical rows",
+        "K_T and Q_T are CuTe/GMMA physical-layout or view operands",
+        "K_T and Q_T are not per-column 2-byte BF16 scatters",
+        "no masked tail or scalar cleanup path is emitted for these 64x64 tiles"
+      ],
+      "resource": [
+        "ptxas registers/thread stays at or below the Wave6 narrow-vector budget",
+        "ptxas spill stores and loads are zero",
+        "total reported SMEM stays within the narrow-vector budget"
+      ],
+      "runtime": [
+        "global source base pointer is 16-byte aligned",
+        "CTA-local stage source base pointer is 16-byte aligned",
+        "destination/staging pointer is 16-byte aligned",
+        "dynamic SMEM base pointer is 16-byte aligned",
+        "emitted row stride remains 128 bytes and a multiple of 16",
+        "panel offsets remain multiples of 16 bytes",
+        "block_threads is a positive warp multiple",
+        "device opt-in dynamic SMEM capacity is at least 98304 bytes"
+      ],
+      "synchronization": [
+        "__syncthreads() after the 12-tile SMEM load before WGMMA consumption",
+        "__syncthreads() after the destination write before reusing the staging buffer"
+      ]
+    },
+    "guard_header": {
+      "consumed_by": "tools/probes/mamba3_wgmma_wave9_copy_probe.cu",
+      "generated_by": "tools/probes/mamba3_wgmma_wave10_copy_integration.py",
+      "path": "tools/probes/mamba3_wgmma_wave10_copy_guards.hpp",
+      "schema_comment": "mamba3_wave10_copy_guard_header_v1",
+      "sha256": "105666711ce563700444b02a136f42e53682ce06ca18ef279c55816ac1ac9b87"
+    },
+    "schema": "mamba3_wave10_cute_vector_copy_guard_contract_v1"
+  },
+  "receipt": "mamba3_mono_wgmma_copy_path_wave10_cute_integration_2026_04_30",
+  "schema": "mamba3_wave10_cute_vector_copy_integration_v1",
+  "source_evidence": {
+    "ptxas": {
+      "kernel_name": "mamba3_wave9_uint4_copy_12tile_probe",
+      "metadata": {
+        "dynamic_smem_bytes": 98304,
+        "registers_per_thread": 40,
+        "spill_loads_bytes": 0,
+        "spill_stores_bytes": 0,
+        "static_smem_bytes": 16
+      }
+    },
+    "runtime": {
+      "correctness": {
+        "comparison": "byte_equal_to_scalar_cuda_kernel",
+        "first_mismatch_index": null,
+        "mismatched_elements": 0,
+        "scalar_checksum_fnv1a64": 7518092082649847683,
+        "status": "pass",
+        "status_word": 0,
+        "vector_checksum_fnv1a64": 7518092082649847683
+      },
+      "device": {
+        "compute_capability": "12.1",
+        "max_dynamic_smem_optin_bytes": 101376,
+        "multiprocessor_count": 48,
+        "name": "NVIDIA GB10"
+      },
+      "launch": {
+        "block_threads": 256,
+        "chunks": 128,
+        "dynamic_smem_bytes": 98304,
+        "grid_blocks": 96
+      },
+      "timing": {
+        "copy_stage_bytes_per_iteration": 25165824,
+        "logical_payload_bytes_per_iteration": 12582912,
+        "scalar_avg_us": 227.399206,
+        "scalar_effective_gib_s_payload_bytes": 51.533821,
+        "speedup_vs_scalar_time": 1.690932,
+        "status": "measured",
+        "timed_iterations": 40,
+        "vector_avg_us": 134.481597,
+        "vector_effective_gib_s_copy_stage_bytes": 174.280352,
+        "warmup_iterations": 5
+      }
+    },
+    "wave9_ptxas_ingest": "docs/status/mamba3_mono_wgmma_copy_path_wave9_ptxas_ingest_2026_04_30.json",
+    "wave9_runtime_result": "docs/status/mamba3_mono_wgmma_copy_path_wave9_runtime_2026_04_30.json"
+  },
+  "source_receipts": [
+    "docs/status/mamba3_mono_wgmma_copy_path_wave8_receipt_2026_04_30.json",
+    "docs/status/mamba3_mono_wgmma_copy_path_wave9_receipt_2026_04_30.json"
+  ],
+  "status": "pass_cute_integration_ready_vector_first",
+  "validation": {
+    "check_command": "python tools/probes/mamba3_wgmma_wave10_copy_integration.py --runtime-result docs/status/mamba3_mono_wgmma_copy_path_wave9_runtime_2026_04_30.json --ptxas-ingest docs/status/mamba3_mono_wgmma_copy_path_wave9_ptxas_ingest_2026_04_30.json --check docs/status/mamba3_mono_wgmma_copy_path_wave10_receipt_2026_04_30.json --check-guard-header tools/probes/mamba3_wgmma_wave10_copy_guards.hpp --check-guide docs/status/mamba3_mono_wgmma_copy_path_wave10_cute_integration_2026_04_30.md",
+    "generated_by": "tools/probes/mamba3_wgmma_wave10_copy_integration.py",
+    "guard_header": "tools/probes/mamba3_wgmma_wave10_copy_guards.hpp",
+    "guide": "docs/status/mamba3_mono_wgmma_copy_path_wave10_cute_integration_2026_04_30.md",
+    "receipt": "docs/status/mamba3_mono_wgmma_copy_path_wave10_receipt_2026_04_30.json",
+    "write_command": "python tools/probes/mamba3_wgmma_wave10_copy_integration.py --runtime-result docs/status/mamba3_mono_wgmma_copy_path_wave9_runtime_2026_04_30.json --ptxas-ingest docs/status/mamba3_mono_wgmma_copy_path_wave9_ptxas_ingest_2026_04_30.json --write docs/status/mamba3_mono_wgmma_copy_path_wave10_receipt_2026_04_30.json --write-guard-header tools/probes/mamba3_wgmma_wave10_copy_guards.hpp --write-guide docs/status/mamba3_mono_wgmma_copy_path_wave10_cute_integration_2026_04_30.md"
+  }
+}
