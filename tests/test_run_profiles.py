@@ -95,6 +95,8 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert env["CPPMEGA_PARAM_STORAGE"] == "mxfp8"
     assert env["CPPMEGA_FP8_FORMAT"] == "e4m3"
     assert env["CPPMEGA_MUON_NUM_NS_STEPS"] == "3"
+    assert env["CPPMEGA_MUON_NS_CARRIER"] == "bf16"
+    assert env["CPPMEGA_MUON_DTYPE_AUDIT"] == "0"
     assert env["CPPMEGA_MUON_QUANTIZED_MOMENTUM_DTYPE"] == "int8"
     assert env["CPPMEGA_TE_MXFP8_BWD_BACKEND"] == "te_tn_adapter"
     assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
@@ -184,6 +186,9 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
             "direct_tactic",
             "--mxfp8-flashinfer-tactic",
             "2",
+            "--muon-ns-carrier",
+            "mxfp8_probe",
+            "--muon-dtype-audit",
         ],
     )
 
@@ -194,6 +199,8 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
     assert "export CPPMEGA_OPTIMIZER=adam" in out
     assert "export CPPMEGA_PARAM_STORAGE=bf16" in out
     assert "export CPPMEGA_MUON_NUM_NS_STEPS=5" in out
+    assert "export CPPMEGA_MUON_NS_CARRIER=mxfp8_probe" in out
+    assert "export CPPMEGA_MUON_DTYPE_AUDIT=1" in out
     assert "export CPPMEGA_FP8_FORMAT=e4m3" in out
     assert "export CPPMEGA_ATTN_BACKEND=fused" in out
     assert "export CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native" in out
@@ -336,6 +343,9 @@ def test_local_launcher_lets_native_args_own_moe_dispatcher_flag():
     assert '--moe-token-dispatcher-type "${CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE}"' not in script
     assert "apply_moe_dispatcher_identity_sort_patch()" in script
     assert "CPPMEGA_MUON_NUM_NS_STEPS:-3" in script
+    assert "CPPMEGA_MUON_NS_CARRIER:-bf16" in script
+    assert "CPPMEGA_MUON_DTYPE_AUDIT:-0" in script
+    assert "install_muon_dtype_audit" in script
     assert "CPPMEGA_EXTRA_PYTHONPATH" in script
     assert "flash_attn import:" in script
 
