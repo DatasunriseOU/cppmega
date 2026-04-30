@@ -295,6 +295,11 @@ def _parse_memory_records(text: str) -> list[MemoryRecord]:
         rf"reserved:\s*(?P<reserved>{NUMBER_RE}) \| "
         rf"max reserved:\s*(?P<max_reserved>{NUMBER_RE})"
     )
+    peak_re = re.compile(
+        rf"\[(?P<tag>production_peak_mem|stream_m_peak_mem)\].*?"
+        rf"peak_alloc_gib=(?P<max_alloc>{NUMBER_RE})\s+"
+        rf"peak_reserved_gib=(?P<max_reserved>{NUMBER_RE})"
+    )
     for line in text.splitlines():
         match = mem_re.search(line)
         if match:
@@ -317,6 +322,16 @@ def _parse_memory_records(text: str) -> list[MemoryRecord]:
                     reserved_gib=float(match.group("reserved")) * MIB / GIB,
                     max_alloc_gib=float(match.group("max_alloc")) * MIB / GIB,
                     max_reserved_gib=float(match.group("max_reserved")) * MIB / GIB,
+                )
+            )
+            continue
+        match = peak_re.search(line)
+        if match:
+            records.append(
+                MemoryRecord(
+                    tag=match.group("tag"),
+                    max_alloc_gib=float(match.group("max_alloc")),
+                    max_reserved_gib=float(match.group("max_reserved")),
                 )
             )
     return records
