@@ -1,8 +1,12 @@
 from cppmega.megatron.mamba3_mono_ab_schema import (
     BWD_BWD_OUTPUT_NAMES,
     MAIN_GUARDED_STAGE2_COMMIT,
+    candidate_component_records_from_json,
+    candidate_component_records_from_markdown,
     candidate_configs,
+    component_record_projection,
     cuda_subset_slot_results,
+    filter_candidate_component_records_for_shape,
     memory_accounting,
     selected_shapes,
     slot_results_from_diffs,
@@ -77,3 +81,94 @@ def test_cuda_subset_results_remain_partial() -> None:
     assert summary["full_boundary_pass"] is False
     assert set(summary["partial"]) == {"dk", "dq", "dv", "dmimo_v", "dgamma_diag"}
     assert "dd" in summary["missing"]
+
+
+def test_component_record_json_computes_projection_budget() -> None:
+    records = candidate_component_records_from_json(
+        {
+            "candidate_component_records": [
+                {
+                    "candidate_id": "lane_a_diag_qkdv",
+                    "lane": "A",
+                    "shape": "productionish",
+                    "components": [
+                        {
+                            "component_id": "diag",
+                            "mean_ms": 1.0,
+                            "covered_slots": ["dk", "dq", "dgamma_diag"],
+                        },
+                        {
+                            "component_id": "qkdv",
+                            "mean_ms": 0.5,
+                            "covered_slots": ["dv"],
+                        },
+                    ],
+                    "reference": {
+                        "stage2_bwd_fwd_ms": 2.0,
+                        "stage2_bwd_bwd_ms": 3.0,
+                        "stage2_chain_ms": 5.5,
+                    },
+                }
+            ]
+        }
+    )
+
+    projection = component_record_projection(records[0])
+
+    assert projection["projected_bwd_bwd_ms"] == 1.5
+    assert projection["remaining_budget_ms_to_equal_stage2_bwd_bwd"] == 1.5
+    assert projection["ratio_vs_stage2_bwd_bwd"] == 0.5
+    assert projection["speedup_floor_vs_stage2_bwd_bwd"] == 2.0
+    assert projection["stage2_chain_with_candidate_floor_ms"] == 3.5
+    assert projection["stage2_chain_speedup_floor"] == 5.5 / 3.5
+    assert projection["covered_slots"] == ["dk", "dv", "dq", "dgamma_diag"]
+    assert "dmimo_v" in projection["missing_slots"]
+
+
+def test_component_record_markdown_fence_and_shape_filter() -> None:
+    markdown = """
+Status text.
+
+```json
+{
+  "mamba3_mono_ab_component_records": [
+    {
+      "candidate_id": "lane_b_dmimov",
+      "lane": "B",
+      "shape": "smoke",
+      "mean_ms": 0.25,
+      "covered_slots": ["dmimo_v"]
+    }
+  ]
+}
+```
+"""
+    records = candidate_component_records_from_markdown(
+        markdown,
+        source_path="docs/status/lane_b.md",
+    )
+
+    assert records[0]["candidate_id"] == "lane_b_dmimov"
+    assert records[0]["source"]["doc"] == "docs/status/lane_b.md"
+    assert filter_candidate_component_records_for_shape(records, "smoke") == records
+    assert filter_candidate_component_records_for_shape(records, "productionish") == []
+
+
+def test_candidate_configs_include_component_records_without_duplicate_future() -> None:
+    records = candidate_component_records_from_json(
+        [
+            {
+                "candidate_id": "mono_lane_c",
+                "shape": "productionish",
+                "mean_ms": 2.5,
+                "covered_slots": ["dk"],
+            }
+        ]
+    )
+    configs = candidate_configs("mono_lane_c,mono_future", records)
+    by_id = {config["candidate_id"]: config for config in configs}
+
+    assert by_id["mono_lane_c"]["role"] == "external_component_candidate"
+    assert by_id["mono_lane_c"]["component_projection"]["projected_bwd_bwd_ms"] == 2.5
+    assert by_id["mono_future"]["role"] == "future_monolithic_candidate"
+    assert [config["candidate_id"] for config in configs].count("mono_lane_c") == 1

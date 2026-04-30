@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import math
+import json
+import re
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 
@@ -128,6 +131,13 @@ FULL_CHAIN_COMPARE_NAMES = tuple(
 )
 BWD_BWD_OUTPUT_NAMES = tuple(spec.name for spec in BWD_BWD_OUTPUT_SPECS)
 
+_COMPONENT_RECORD_PAYLOAD_KEYS = (
+    "mamba3_mono_ab_component_records",
+    "candidate_component_records",
+    "component_records",
+)
+_COMPONENT_RECORD_FENCE_RE = re.compile(r"```([^\n`]*)\n(.*?)\n```", re.DOTALL)
+
 
 def coerce_shape(value: Shape | dict[str, Any]) -> Shape:
     if isinstance(value, Shape):
@@ -158,6 +168,467 @@ def selected_shapes(shape_csv: str) -> list[Shape]:
     if not shapes:
         raise ValueError("at least one shape is required")
     return shapes
+
+
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
+
+
+def _as_str_list(value: Any) -> list[str]:
+    return [str(item).strip() for item in _as_list(value) if str(item).strip()]
+
+
+def _slot_list(value: Any) -> list[str]:
+    requested = [item.lower() for item in _as_str_list(value)]
+    invalid = [item for item in requested if item not in BWD_BWD_OUTPUT_NAMES]
+    if invalid:
+        raise ValueError(
+            f"unknown bwd_bwd output slot(s) {invalid!r}; "
+            f"choose from {list(BWD_BWD_OUTPUT_NAMES)!r}"
+        )
+    return [name for name in BWD_BWD_OUTPUT_NAMES if name in requested]
+
+
+def _float_field(mapping: dict[str, Any], names: tuple[str, ...]) -> float | None:
+    for name in names:
+        if name in mapping and mapping[name] is not None:
+            return float(mapping[name])
+    return None
+
+
+def _int_field(mapping: dict[str, Any], names: tuple[str, ...], default: int = 0) -> int:
+    for name in names:
+        if name in mapping and mapping[name] is not None:
+            return int(mapping[name])
+    return default
+
+
+def _shape_name(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, Shape):
+        return value.name
+    if isinstance(value, dict):
+        name = value.get("name")
+        return str(name).strip() if name else None
+    name = str(value).strip()
+    return name or None
+
+
+def _payload_records(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        records = payload
+    elif isinstance(payload, dict):
+        records = []
+        for key in _COMPONENT_RECORD_PAYLOAD_KEYS:
+            if key in payload:
+                records = payload[key]
+                break
+        if not records and any(key in payload for key in ("candidate_id", "id", "name")):
+            records = [payload]
+    else:
+        records = []
+    if not isinstance(records, list):
+        raise ValueError("candidate component record payload must be a list or record object")
+    return [record for record in records if isinstance(record, dict)]
+
+
+def _components_from_raw(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_components = (
+        raw.get("components")
+        or raw.get("component_records")
+        or raw.get("timing_components")
+        or []
+    )
+    if isinstance(raw_components, dict):
+        raw_components = [
+            {"component_id": key, **(value if isinstance(value, dict) else {"mean_ms": value})}
+            for key, value in raw_components.items()
+        ]
+    if not raw_components:
+        total_ms = _float_field(
+            raw,
+            (
+                "projected_bwd_bwd_ms",
+                "candidate_bwd_bwd_ms",
+                "component_total_ms",
+                "total_ms",
+                "combined_ms",
+                "mean_ms",
+                "ms",
+            ),
+        )
+        if total_ms is None:
+            return []
+        raw_components = [
+            {
+                "component_id": raw.get("component_id") or "total",
+                "mean_ms": total_ms,
+                "launches": raw.get("launches", 1),
+                "covered_slots": raw.get("covered_slots"),
+            }
+        ]
+
+    components: list[dict[str, Any]] = []
+    for idx, item in enumerate(raw_components):
+        if not isinstance(item, dict):
+            item = {"component_id": f"component_{idx}", "mean_ms": item}
+        component_id = (
+            item.get("component_id")
+            or item.get("id")
+            or item.get("name")
+            or f"component_{idx}"
+        )
+        mean_ms = _float_field(item, ("mean_ms", "elapsed_ms", "ms", "time_ms"))
+        components.append(
+            {
+                "component_id": str(component_id),
+                "mean_ms": mean_ms,
+                "launches": _int_field(item, ("launches", "launch_count"), default=1),
+                "covered_slots": _slot_list(
+                    item.get("covered_slots")
+                    or item.get("slots")
+                    or item.get("outputs")
+                ),
+                "include_in_projection": bool(item.get("include_in_projection", True)),
+                "status": str(item.get("status", "reported")),
+                "note": str(item.get("note", "")),
+            }
+        )
+    return components
+
+
+def _normalize_memory(raw: dict[str, Any]) -> dict[str, Any]:
+    memory = raw.get("memory_peak_gib") or raw.get("memory") or {}
+    if not isinstance(memory, dict):
+        memory = {"max_memory_allocated_gib": memory}
+    out = dict(memory)
+    allocated = _float_field(
+        raw,
+        (
+            "max_memory_allocated_gib",
+            "peak_allocated_gib",
+            "allocated_gib",
+        ),
+    )
+    reserved = _float_field(
+        raw,
+        (
+            "max_memory_reserved_gib",
+            "peak_reserved_gib",
+            "reserved_gib",
+        ),
+    )
+    if allocated is not None:
+        out["max_memory_allocated_gib"] = allocated
+    if reserved is not None:
+        out["max_memory_reserved_gib"] = reserved
+    return out
+
+
+def _normalize_reference(raw: dict[str, Any]) -> dict[str, Any]:
+    reference = (
+        raw.get("reference")
+        or raw.get("stage2_reference")
+        or raw.get("tilelang_reference")
+        or {}
+    )
+    if not isinstance(reference, dict):
+        reference = {}
+    out = dict(reference)
+    fields = {
+        "stage2_bwd_fwd_ms": (
+            "stage2_bwd_fwd_ms",
+            "tilelang_stage2_bwd_fwd_ms",
+            "reference_bwd_fwd_ms",
+        ),
+        "stage2_bwd_bwd_ms": (
+            "stage2_bwd_bwd_ms",
+            "tilelang_stage2_bwd_bwd_ms",
+            "reference_bwd_bwd_ms",
+        ),
+        "stage2_chain_ms": (
+            "stage2_chain_ms",
+            "tilelang_stage2_chain_ms",
+            "reference_chain_ms",
+        ),
+        "stage2_max_memory_allocated_gib": (
+            "stage2_max_memory_allocated_gib",
+            "tilelang_stage2_max_memory_allocated_gib",
+        ),
+        "stage2_max_memory_reserved_gib": (
+            "stage2_max_memory_reserved_gib",
+            "tilelang_stage2_max_memory_reserved_gib",
+        ),
+    }
+    for out_name, names in fields.items():
+        value = _float_field(raw, names)
+        if value is not None:
+            out[out_name] = value
+    return out
+
+
+def normalize_candidate_component_record(
+    raw: dict[str, Any],
+    *,
+    source_path: str | None = None,
+) -> dict[str, Any]:
+    candidate_id = raw.get("candidate_id") or raw.get("id") or raw.get("name")
+    if not candidate_id:
+        raise ValueError("candidate component record requires candidate_id, id, or name")
+
+    components = _components_from_raw(raw)
+    covered_slots = set(
+        _slot_list(raw.get("covered_slots") or raw.get("slots") or raw.get("outputs"))
+    )
+    for component in components:
+        covered_slots.update(component["covered_slots"])
+    ordered_covered = [name for name in BWD_BWD_OUTPUT_NAMES if name in covered_slots]
+    explicit_missing = raw.get("missing_slots")
+    missing_slots = (
+        _slot_list(explicit_missing)
+        if explicit_missing is not None
+        else [name for name in BWD_BWD_OUTPUT_NAMES if name not in covered_slots]
+    )
+
+    source = raw.get("source") if isinstance(raw.get("source"), dict) else {}
+    source = dict(source)
+    if raw.get("lane") is not None:
+        source.setdefault("lane", raw["lane"])
+    if raw.get("doc") is not None:
+        source.setdefault("doc", raw["doc"])
+    if raw.get("commit") is not None:
+        source.setdefault("commit", raw["commit"])
+    if source_path:
+        source.setdefault("doc", source_path)
+
+    correctness = raw.get("correctness") if isinstance(raw.get("correctness"), dict) else {}
+    correctness = dict(correctness)
+    max_abs = _float_field(raw, ("correctness_max_abs", "max_abs"))
+    if max_abs is not None:
+        correctness.setdefault("max_abs", max_abs)
+
+    return {
+        "candidate_id": str(candidate_id),
+        "display_name": str(raw.get("display_name") or str(candidate_id).replace("_", " ")),
+        "role": str(raw.get("role", "external_component_candidate")),
+        "implementation_class": str(raw.get("implementation_class", "lane_component_record")),
+        "shape": _shape_name(raw.get("shape")),
+        "status": str(raw.get("status", "reported")),
+        "source": source,
+        "components": components,
+        "covered_slots": ordered_covered,
+        "missing_slots": missing_slots,
+        "projected_bwd_bwd_ms": _float_field(
+            raw,
+            (
+                "projected_bwd_bwd_ms",
+                "candidate_bwd_bwd_ms",
+                "component_total_ms",
+                "total_ms",
+                "combined_ms",
+            ),
+        ),
+        "launches": _int_field(raw, ("launches", "launch_count"), default=0),
+        "memory_peak_gib": _normalize_memory(raw),
+        "correctness": correctness,
+        "reference": _normalize_reference(raw),
+        "note": str(raw.get("note", "")),
+    }
+
+
+def normalize_candidate_component_records(records: Any) -> list[dict[str, Any]]:
+    return [
+        normalize_candidate_component_record(record)
+        for record in _payload_records(records)
+    ]
+
+
+def candidate_component_records_from_json(
+    value: str | dict[str, Any] | list[Any],
+    *,
+    source_path: str | None = None,
+) -> list[dict[str, Any]]:
+    payload = json.loads(value) if isinstance(value, str) else value
+    return [
+        normalize_candidate_component_record(record, source_path=source_path)
+        for record in _payload_records(payload)
+    ]
+
+
+def candidate_component_records_from_markdown(
+    text: str,
+    *,
+    source_path: str | None = None,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for info, body in _COMPONENT_RECORD_FENCE_RE.findall(text):
+        info_l = info.lower()
+        if not (
+            "json" in info_l
+            or "mamba3-mono-ab" in info_l
+            or "candidate" in info_l
+        ):
+            continue
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+        payload_records = _payload_records(payload)
+        if payload_records:
+            records.extend(
+                normalize_candidate_component_record(record, source_path=source_path)
+                for record in payload_records
+            )
+    return records
+
+
+def load_candidate_component_records(
+    path_csv: str | None = None,
+    json_text: str | None = None,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    if json_text and json_text.strip():
+        records.extend(candidate_component_records_from_json(json_text))
+    for raw_path in _as_str_list(path_csv):
+        path = Path(raw_path)
+        text = path.read_text(encoding="utf-8")
+        if path.suffix.lower() == ".json":
+            path_records = candidate_component_records_from_json(text, source_path=str(path))
+        else:
+            try:
+                path_records = candidate_component_records_from_json(text, source_path=str(path))
+            except json.JSONDecodeError:
+                path_records = candidate_component_records_from_markdown(
+                    text,
+                    source_path=str(path),
+                )
+        if not path_records:
+            raise ValueError(
+                f"{path} did not contain candidate component records; add a JSON "
+                "payload or a fenced JSON block with candidate_component_records"
+            )
+        records.extend(path_records)
+    return records
+
+
+def filter_candidate_component_records_for_shape(
+    records: list[dict[str, Any]],
+    shape_like: Shape | dict[str, Any] | str,
+) -> list[dict[str, Any]]:
+    shape_name = (
+        _shape_name(shape_like)
+        if isinstance(shape_like, str)
+        else coerce_shape(shape_like).name
+    )
+    return [
+        record
+        for record in records
+        if record.get("shape") in (None, "", shape_name)
+    ]
+
+
+def component_record_projection(
+    record: dict[str, Any],
+    *,
+    reference: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    ref = dict(record.get("reference") or {})
+    if reference:
+        ref.update({key: value for key, value in reference.items() if value is not None})
+
+    component_sum = 0.0
+    component_count = 0
+    component_launches = 0
+    missing_timing: list[str] = []
+    for component in record.get("components", []):
+        if not component.get("include_in_projection", True):
+            continue
+        component_launches += int(component.get("launches") or 0)
+        mean_ms = component.get("mean_ms")
+        if mean_ms is None:
+            missing_timing.append(str(component.get("component_id")))
+            continue
+        component_sum += float(mean_ms)
+        component_count += 1
+
+    total_ms = record.get("projected_bwd_bwd_ms")
+    if total_ms is None and component_count:
+        total_ms = component_sum
+    if total_ms is not None:
+        total_ms = float(total_ms)
+
+    launch_count = int(record.get("launches") or 0) or component_launches
+    stage2_bwd_bwd_ms = ref.get("stage2_bwd_bwd_ms")
+    stage2_bwd_fwd_ms = ref.get("stage2_bwd_fwd_ms")
+    stage2_chain_ms = ref.get("stage2_chain_ms")
+
+    ratio = None
+    speedup = None
+    remaining = None
+    if total_ms is not None and stage2_bwd_bwd_ms:
+        ratio = total_ms / float(stage2_bwd_bwd_ms)
+        speedup = float(stage2_bwd_bwd_ms) / total_ms if total_ms > 0 else None
+        remaining = float(stage2_bwd_bwd_ms) - total_ms
+
+    chain_floor_ms = None
+    chain_speedup = None
+    if total_ms is not None and stage2_bwd_fwd_ms is not None:
+        chain_floor_ms = float(stage2_bwd_fwd_ms) + total_ms
+        if stage2_chain_ms and chain_floor_ms > 0:
+            chain_speedup = float(stage2_chain_ms) / chain_floor_ms
+
+    memory = record.get("memory_peak_gib") or {}
+    candidate_allocated = memory.get("max_memory_allocated_gib")
+    candidate_reserved = memory.get("max_memory_reserved_gib")
+    ref_allocated = ref.get("stage2_max_memory_allocated_gib")
+    ref_reserved = ref.get("stage2_max_memory_reserved_gib")
+
+    return {
+        "candidate_id": record.get("candidate_id"),
+        "shape": record.get("shape"),
+        "projection_status": "missing_timing" if total_ms is None else "projected",
+        "component_total_ms": component_sum if component_count else None,
+        "projected_bwd_bwd_ms": total_ms,
+        "launch_count": launch_count,
+        "covered_slots": list(record.get("covered_slots") or []),
+        "missing_slots": list(record.get("missing_slots") or []),
+        "coverage_fraction": (
+            len(record.get("covered_slots") or []) / len(BWD_BWD_OUTPUT_NAMES)
+        ),
+        "stage2_bwd_bwd_ms": stage2_bwd_bwd_ms,
+        "ratio_vs_stage2_bwd_bwd": ratio,
+        "speedup_floor_vs_stage2_bwd_bwd": speedup,
+        "remaining_budget_ms_to_equal_stage2_bwd_bwd": remaining,
+        "stage2_bwd_fwd_ms": stage2_bwd_fwd_ms,
+        "stage2_chain_ms": stage2_chain_ms,
+        "stage2_chain_with_candidate_floor_ms": chain_floor_ms,
+        "stage2_chain_speedup_floor": chain_speedup,
+        "memory_peak_gib": memory,
+        "memory_delta_vs_stage2_gib": {
+            "allocated": (
+                float(candidate_allocated) - float(ref_allocated)
+                if candidate_allocated is not None and ref_allocated is not None
+                else None
+            ),
+            "reserved": (
+                float(candidate_reserved) - float(ref_reserved)
+                if candidate_reserved is not None and ref_reserved is not None
+                else None
+            ),
+        },
+        "missing_component_timings": missing_timing,
+        "full_boundary_ready": (
+            not record.get("missing_slots")
+            and bool(record.get("correctness", {}).get("full_boundary_pass"))
+        ),
+    }
 
 
 def _dim_value(expr: str, shape: Shape) -> int:
@@ -290,7 +761,11 @@ def readiness_gates() -> list[dict[str, str]]:
     ]
 
 
-def candidate_configs(monolithic_candidate_csv: str | None = None) -> list[dict[str, Any]]:
+def candidate_configs(
+    monolithic_candidate_csv: str | None = None,
+    component_records: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    component_records = normalize_candidate_component_records(component_records or [])
     configs: list[dict[str, Any]] = [
         {
             "candidate_id": "main_guarded_stage2",
@@ -352,12 +827,39 @@ def candidate_configs(monolithic_candidate_csv: str | None = None) -> list[dict[
         },
     ]
 
+    for record in component_records:
+        configs.append(
+            {
+                "candidate_id": record["candidate_id"],
+                "display_name": record["display_name"],
+                "role": record["role"],
+                "implementation_class": record["implementation_class"],
+                "source": record["source"],
+                "shape": record["shape"],
+                "status": record["status"],
+                "config": {
+                    "expected_call_boundary": "mamba_mimo_bwd_bwd",
+                    "component_records": record["components"],
+                    "covered_slots": record["covered_slots"],
+                    "missing_slots": record["missing_slots"],
+                },
+                "component_projection": component_record_projection(record),
+                "boundary_contract": {
+                    "required_outputs": list(BWD_BWD_OUTPUT_NAMES),
+                    "readiness_gates": readiness_gates(),
+                },
+            }
+        )
+
+    component_candidate_ids = {record["candidate_id"] for record in component_records}
     names = [
         item.strip()
         for item in (monolithic_candidate_csv or "monolithic_chunk_candidate").split(",")
         if item.strip()
     ]
     for name in names:
+        if name in component_candidate_ids:
+            continue
         configs.append(
             {
                 "candidate_id": name,

@@ -10,7 +10,8 @@ Run examples:
     CPPMEGA_MODAL_GPU=H200 modal run scripts/modal_mamba3_cuda_full_bwd_ab.py \
         --dry-run-schema \
         --shape-csv smoke \
-        --monolithic-candidate-csv mono_chunk_v0
+        --monolithic-candidate-csv mono_chunk_v0 \
+        --candidate-record-path-csv docs/status/lane_a_component_record.md
 
     GHCR_TAG=785c3fd CPPMEGA_MODAL_GPU=H200 timeout 900s \
         modal run scripts/modal_mamba3_cuda_full_bwd_ab.py \
@@ -53,10 +54,14 @@ from cppmega.megatron.mamba3_mono_ab_schema import (
     MAIN_GUARDED_STAGE2_COMMIT,
     SCHEMA_VERSION,
     candidate_configs,
+    component_record_projection,
     coerce_shape,
     cuda_subset_slot_results,
     empty_slot_results,
+    filter_candidate_component_records_for_shape,
+    load_candidate_component_records,
     memory_accounting,
+    normalize_candidate_component_records,
     readiness_gates,
     selected_shapes as selected_schema_shapes,
     slot_results_from_diffs,
@@ -72,6 +77,7 @@ GPU_SPEC = os.environ.get("CPPMEGA_MODAL_GPU", "H200")
 BENCH_VOLUME_NAME = os.environ.get("CPPMEGA_MODAL_BENCH_VOLUME", "cppmega-mamba3-benchmarks")
 
 APP_NAME = "cppmega-mamba3-cuda-full-bwd-ab"
+DEFAULT_MODAL_CAMPAIGN_PREFIX_CSV = "cppmega-mamba3-"
 SOURCE_ROOT = "/opt/state-spaces-mamba"
 CPPMEGA_ROOT = "/opt/cppmega"
 BENCH_ROOT = "/benchmarks"
@@ -286,12 +292,26 @@ def _compact_stats(stats: dict[str, Any] | None) -> dict[str, Any] | None:
 def _ab_schema_for_shape(
     shape: dict[str, Any],
     monolithic_candidate_csv: str,
+    component_records: list[dict[str, Any]] | None = None,
+    projection_reference: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     shape_obj = coerce_shape(shape)
+    shape_component_records = filter_candidate_component_records_for_shape(
+        component_records or [],
+        shape_obj,
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "shape": shape_obj.to_dict(),
-        "candidate_configs": candidate_configs(monolithic_candidate_csv),
+        "candidate_configs": candidate_configs(
+            monolithic_candidate_csv,
+            shape_component_records,
+        ),
+        "candidate_component_records": shape_component_records,
+        "candidate_component_projections": [
+            component_record_projection(record, reference=projection_reference)
+            for record in shape_component_records
+        ],
         "boundary_slots": slot_schema(shape_obj),
         "memory_accounting": memory_accounting(shape_obj),
         "readiness_gates": readiness_gates(),
@@ -317,6 +337,23 @@ def _timing_for_variant(variant: dict[str, Any] | None) -> dict[str, Any]:
         "bwd_fwd_ms": _compact_stats(elapsed.get("bwd_fwd")),
         "bwd_bwd_ms": _compact_stats(elapsed.get("bwd_bwd")),
         "chain_ms": _compact_stats(elapsed.get("chain")),
+    }
+
+
+def _projection_reference_for_stage2(
+    tilelang_variants: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    stage2 = _find_tilelang_variant(tilelang_variants, ("stage2_bf1_bb0", "stage2_force_nontma"))
+    if not stage2 or stage2.get("status") != "ok":
+        stage2 = tilelang_variants.get("baseline")
+    if not stage2:
+        return {}
+    return {
+        "stage2_bwd_fwd_ms": _mean_ms(stage2, "bwd_fwd"),
+        "stage2_bwd_bwd_ms": _mean_ms(stage2, "bwd_bwd"),
+        "stage2_chain_ms": _mean_ms(stage2, "chain"),
+        "stage2_max_memory_allocated_gib": stage2.get("max_memory_allocated_gib"),
+        "stage2_max_memory_reserved_gib": stage2.get("max_memory_reserved_gib"),
     }
 
 
@@ -399,12 +436,72 @@ def _cuda_subset_candidate_report(
     }
 
 
-def _future_monolithic_candidate_reports(
-    monolithic_candidate_csv: str,
+def _component_record_slot_results(record: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    results = empty_slot_results(
+        "missing",
+        "not covered by the candidate component record",
+    )
+    correctness = record.get("correctness") or {}
+    for slot_name in record.get("covered_slots") or []:
+        results[slot_name] = {
+            "status": "partial_component_record",
+            "max_abs": correctness.get("max_abs"),
+            "ref_absmax": correctness.get("ref_absmax"),
+            "rel_to_ref_absmax": correctness.get("rel_to_ref_absmax"),
+            "full_boundary_pass": False,
+            "coverage": "reported by external Lane A/B/C component record",
+            "note": "component coverage must be rechecked at the integrated call boundary",
+        }
+    return results
+
+
+def _component_candidate_reports(
+    component_records: list[dict[str, Any]],
+    shape: dict[str, Any],
+    projection_reference: dict[str, Any],
 ) -> list[dict[str, Any]]:
     reports: list[dict[str, Any]] = []
+    for record in filter_candidate_component_records_for_shape(component_records, shape):
+        slot_results = _component_record_slot_results(record)
+        reports.append(
+            {
+                "candidate_id": record["candidate_id"],
+                "role": record["role"],
+                "status": record["status"],
+                "boundary_status": (
+                    "full_boundary_claim"
+                    if not record.get("missing_slots")
+                    else "partial_component_record"
+                ),
+                "source": record.get("source"),
+                "components": record.get("components"),
+                "projection": component_record_projection(
+                    record,
+                    reference=projection_reference,
+                ),
+                "memory_peak_gib": record.get("memory_peak_gib"),
+                "slot_results": slot_results,
+                "slot_summary": summarize_slot_results(slot_results),
+                "missing_for_full_replacement": record.get("missing_slots"),
+                "note": record.get("note"),
+            }
+        )
+    return reports
+
+
+def _future_monolithic_candidate_reports(
+    monolithic_candidate_csv: str,
+    component_records: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    reports: list[dict[str, Any]] = []
+    component_ids = {
+        record["candidate_id"]
+        for record in normalize_candidate_component_records(component_records or [])
+    }
     for config in candidate_configs(monolithic_candidate_csv):
         if config.get("role") != "future_monolithic_candidate":
+            continue
+        if config["candidate_id"] in component_ids:
             continue
         slot_results = empty_slot_results(
             "not_run",
@@ -430,11 +527,19 @@ def _candidate_reports_for_shape(
     cuda_result: dict[str, Any],
     replacement_estimate: dict[str, Any],
     monolithic_candidate_csv: str,
+    component_records: list[dict[str, Any]] | None = None,
+    shape: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    projection_reference = _projection_reference_for_stage2(tilelang_variants)
     return [
         _stage2_candidate_report(tilelang_variants, tilelang_comparison),
         _cuda_subset_candidate_report(cuda_result, replacement_estimate),
-        *_future_monolithic_candidate_reports(monolithic_candidate_csv),
+        *_component_candidate_reports(
+            component_records or [],
+            shape or {},
+            projection_reference,
+        ),
+        *_future_monolithic_candidate_reports(monolithic_candidate_csv, component_records),
     ]
 
 
@@ -639,6 +744,7 @@ def _summarize_report(report: dict[str, Any]) -> dict[str, Any]:
         "settings": report["settings"],
         "artifacts": report["artifacts"],
         "candidate_configs": report.get("candidate_configs"),
+        "candidate_component_records": report.get("candidate_component_records"),
         "readiness_gates": report.get("readiness_gates"),
         "modal_hygiene_policy": report.get("modal_hygiene_policy"),
         "shapes": [_summarize_shape(shape) for shape in report["shapes"]],
@@ -670,6 +776,9 @@ def _write_summary_csv(summary: dict[str, Any], csv_path: str) -> None:
                 "main_guarded_stage2_full_boundary_pass_count",
                 "cuda_subset_partial_slots",
                 "cuda_subset_missing_slots",
+                "component_candidate_ids",
+                "component_candidate_projected_bwd_bwd_ms",
+                "component_candidate_remaining_budget_ms",
                 "future_monolithic_candidate_ids",
             ],
         )
@@ -688,6 +797,25 @@ def _write_summary_csv(summary: dict[str, Any], csv_path: str) -> None:
                 item.get("candidate_id")
                 for item in (shape.get("candidate_reports") or [])
                 if item.get("role") == "future_monolithic_candidate"
+            ]
+            component_reports = [
+                item
+                for item in (shape.get("candidate_reports") or [])
+                if item.get("role") == "external_component_candidate"
+            ]
+            component_ids = [item.get("candidate_id") for item in component_reports]
+            component_projected = [
+                f"{item.get('candidate_id')}={item.get('projection', {}).get('projected_bwd_bwd_ms')}"
+                for item in component_reports
+                if item.get("candidate_id")
+            ]
+            component_budget = [
+                (
+                    f"{item.get('candidate_id')}="
+                    f"{item.get('projection', {}).get('remaining_budget_ms_to_equal_stage2_bwd_bwd')}"
+                )
+                for item in component_reports
+                if item.get("candidate_id")
             ]
             writer.writerow(
                 {
@@ -731,6 +859,11 @@ def _write_summary_csv(summary: dict[str, Any], csv_path: str) -> None:
                     ),
                     "cuda_subset_partial_slots": ",".join(cuda_slots.get("partial") or []),
                     "cuda_subset_missing_slots": ",".join(cuda_slots.get("missing") or []),
+                    "component_candidate_ids": ",".join(
+                        str(item) for item in component_ids if item
+                    ),
+                    "component_candidate_projected_bwd_bwd_ms": ";".join(component_projected),
+                    "component_candidate_remaining_budget_ms": ";".join(component_budget),
                     "future_monolithic_candidate_ids": ",".join(
                         str(item) for item in future_ids if item
                     ),
@@ -745,6 +878,7 @@ def run_ab_remote(
     shape_csv: str,
     tilelang_variant_csv: str,
     monolithic_candidate_csv: str,
+    candidate_records_json: str,
     warmup: int,
     iters: int,
     cuda_warmup: int,
@@ -760,6 +894,9 @@ def run_ab_remote(
     stage2 = _load_stage2_benchlib()
     stage2._install_source_paths()
     wave7 = _load_wave7_cuda()
+    component_records = normalize_candidate_component_records(
+        json.loads(candidate_records_json or "[]")
+    )
 
     run_id = run_id or time.strftime("%Y%m%d_%H%M%S")
     run_rel = f"{BENCH_PREFIX}/{run_id}"
@@ -774,19 +911,22 @@ def run_ab_remote(
         "artifact_dir": run_dir,
         "device": stage2._device_report(requested_gpu),
         "tilelang": stage2._tilelang_report(),
-        "candidate_configs": candidate_configs(monolithic_candidate_csv),
+        "candidate_configs": candidate_configs(monolithic_candidate_csv, component_records),
+        "candidate_component_records": component_records,
         "readiness_gates": readiness_gates(),
         "modal_hygiene_policy": {
             "safe_auto_stop_scope": (
-                "local entrypoint stops only exact-name apps with zero tasks after "
-                "the remote call returns"
+                "local entrypoint stops only exact-name apps with zero tasks; "
+                "same-campaign active apps are reported for warn/fail gating"
             ),
             "app_name": APP_NAME,
+            "same_campaign_prefix_csv": DEFAULT_MODAL_CAMPAIGN_PREFIX_CSV,
         },
         "settings": {
             "shape_csv": shape_csv,
             "tilelang_variant_csv": tilelang_variant_csv,
             "monolithic_candidate_csv": monolithic_candidate_csv,
+            "candidate_component_record_count": len(component_records),
             "warmup": warmup,
             "iters": iters,
             "cuda_warmup": cuda_warmup,
@@ -888,9 +1028,12 @@ def run_ab_remote(
             cuda_result,
             shape_result["shape"],
         )
+        projection_reference = _projection_reference_for_stage2(tilelang_by_name)
         shape_result["ab_schema"] = _ab_schema_for_shape(
             shape_result["shape"],
             monolithic_candidate_csv,
+            component_records,
+            projection_reference,
         )
         shape_result["candidate_reports"] = _candidate_reports_for_shape(
             tilelang_by_name,
@@ -898,6 +1041,8 @@ def run_ab_remote(
             cuda_result,
             shape_result["replacement_estimate"],
             monolithic_candidate_csv,
+            component_records,
+            shape_result["shape"],
         )
         report["shapes"].append(shape_result)
 
@@ -934,6 +1079,27 @@ def _compact_modal_entry(entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _modal_campaign_prefixes(prefix_csv: str) -> tuple[str, ...]:
+    prefixes = tuple(item.strip() for item in prefix_csv.split(",") if item.strip())
+    return prefixes or tuple(
+        item.strip()
+        for item in DEFAULT_MODAL_CAMPAIGN_PREFIX_CSV.split(",")
+        if item.strip()
+    )
+
+
+def _modal_entry_active(entry: dict[str, Any]) -> bool:
+    return str(entry.get("State", "")).lower() != "stopped"
+
+
+def _modal_entry_matches_campaign(
+    entry: dict[str, Any],
+    campaign_prefixes: tuple[str, ...],
+) -> bool:
+    description = str(entry.get("Description") or "")
+    return any(description.startswith(prefix) for prefix in campaign_prefixes)
+
+
 def _modal_app_list() -> dict[str, Any]:
     try:
         proc = subprocess.run(
@@ -968,11 +1134,20 @@ def _modal_app_list() -> dict[str, Any]:
     return {"status": "ok", "entries": entries}
 
 
-def _modal_hygiene_check(phase: str, *, auto_stop: bool) -> dict[str, Any]:
+def _modal_hygiene_check(
+    phase: str,
+    *,
+    auto_stop: bool,
+    campaign_prefixes: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    campaign_prefixes = campaign_prefixes or _modal_campaign_prefixes(
+        DEFAULT_MODAL_CAMPAIGN_PREFIX_CSV
+    )
     listed = _modal_app_list()
     result: dict[str, Any] = {
         "phase": phase,
         "app_name": APP_NAME,
+        "same_campaign_prefixes": list(campaign_prefixes),
         "auto_stop_requested": auto_stop,
         "list_status": listed.get("status"),
     }
@@ -989,25 +1164,34 @@ def _modal_hygiene_check(phase: str, *, auto_stop: bool) -> dict[str, Any]:
     non_stopped = [
         entry
         for entry in entries
-        if str(entry.get("State", "")).lower() != "stopped"
+        if _modal_entry_active(entry)
+    ]
+    same_campaign_active = [
+        entry
+        for entry in entries
+        if _modal_entry_active(entry)
+        and _modal_entry_matches_campaign(entry, campaign_prefixes)
     ]
     safe_to_stop = [
         entry
         for entry in owned
-        if str(entry.get("State", "")).lower() != "stopped"
+        if _modal_entry_active(entry)
         and _modal_tasks(entry) == 0
         and entry.get("App ID")
     ]
     blocked = [
         entry
         for entry in owned
-        if str(entry.get("State", "")).lower() != "stopped"
+        if _modal_entry_active(entry)
         and _modal_tasks(entry) != 0
     ]
     result.update(
         {
             "owned_entries": [_compact_modal_entry(entry) for entry in owned],
             "non_stopped_entries": [_compact_modal_entry(entry) for entry in non_stopped],
+            "same_campaign_active_entries": [
+                _compact_modal_entry(entry) for entry in same_campaign_active
+            ],
             "safe_to_stop": [_compact_modal_entry(entry) for entry in safe_to_stop],
             "blocked_owned_entries": [_compact_modal_entry(entry) for entry in blocked],
             "stopped": [],
@@ -1034,8 +1218,62 @@ def _modal_hygiene_check(phase: str, *, auto_stop: bool) -> dict[str, Any]:
             }
         )
     if result["stopped"]:
-        result["after_stop"] = _modal_hygiene_check(f"{phase}_after_stop", auto_stop=False)
+        result["after_stop"] = _modal_hygiene_check(
+            f"{phase}_after_stop",
+            auto_stop=False,
+            campaign_prefixes=campaign_prefixes,
+        )
     return result
+
+
+def _modal_hygiene_terminal_check(check: dict[str, Any]) -> dict[str, Any]:
+    terminal = check
+    while isinstance(terminal.get("after_stop"), dict):
+        terminal = terminal["after_stop"]
+    return terminal
+
+
+def _modal_hygiene_verdict(
+    check: dict[str, Any],
+    enforcement: str,
+) -> dict[str, Any]:
+    enforcement = enforcement.lower().strip()
+    if enforcement not in {"off", "warn", "fail"}:
+        raise ValueError("modal_hygiene_enforcement must be one of off, warn, fail")
+    terminal = _modal_hygiene_terminal_check(check)
+    list_status = terminal.get("list_status")
+    active = terminal.get("same_campaign_active_entries") or []
+    if enforcement == "off":
+        status = "off"
+    elif list_status != "ok":
+        status = "fail" if enforcement == "fail" else "warn"
+    elif active:
+        status = "fail" if enforcement == "fail" else "warn"
+    else:
+        status = "pass"
+
+    if list_status != "ok":
+        message = "Modal hygiene could not list apps after run"
+    elif active:
+        descriptions = [
+            str(entry.get("description") or entry.get("app_id"))
+            for entry in active
+        ]
+        message = (
+            "Modal hygiene found active same-campaign app(s): "
+            + ", ".join(descriptions)
+        )
+    else:
+        message = "Modal hygiene passed: no active same-campaign apps remain"
+
+    return {
+        "status": status,
+        "enforcement": enforcement,
+        "phase": terminal.get("phase"),
+        "active_same_campaign_count": len(active),
+        "active_same_campaign_entries": active,
+        "message": message,
+    }
 
 
 def _local_schema_dry_run(
@@ -1044,13 +1282,40 @@ def _local_schema_dry_run(
     shape_csv: str,
     tilelang_variant_csv: str,
     monolithic_candidate_csv: str,
+    component_records: list[dict[str, Any]],
     seed: int,
 ) -> dict[str, Any]:
-    configs = candidate_configs(monolithic_candidate_csv)
+    configs = candidate_configs(monolithic_candidate_csv, component_records)
     shapes: list[dict[str, Any]] = []
     for shape in selected_schema_shapes(shape_csv):
         reports = []
         for config in configs:
+            if config["candidate_id"] in {
+                record["candidate_id"] for record in component_records
+            }:
+                matching = [
+                    record
+                    for record in filter_candidate_component_records_for_shape(
+                        component_records,
+                        shape,
+                    )
+                    if record["candidate_id"] == config["candidate_id"]
+                ]
+                if not matching:
+                    continue
+                projection = component_record_projection(matching[0])
+                slot_results = _component_record_slot_results(matching[0])
+                reports.append(
+                    {
+                        "candidate_id": config["candidate_id"],
+                        "role": config["role"],
+                        "status": "schema_dry_run",
+                        "projection": projection,
+                        "slot_results": slot_results,
+                        "slot_summary": summarize_slot_results(slot_results),
+                    }
+                )
+                continue
             slot_results = empty_slot_results(
                 "not_run",
                 "schema dry-run only; no Modal remote function was started",
@@ -1068,7 +1333,11 @@ def _local_schema_dry_run(
             {
                 "shape": shape.name,
                 "status": "schema_dry_run",
-                "ab_schema": _ab_schema_for_shape(shape.to_dict(), monolithic_candidate_csv),
+                "ab_schema": _ab_schema_for_shape(
+                    shape.to_dict(),
+                    monolithic_candidate_csv,
+                    component_records,
+                ),
                 "candidate_reports": reports,
             }
         )
@@ -1085,14 +1354,20 @@ def _local_schema_dry_run(
             "shape_csv": shape_csv,
             "tilelang_variant_csv": tilelang_variant_csv,
             "monolithic_candidate_csv": monolithic_candidate_csv,
+            "candidate_component_record_count": len(component_records),
             "seed": seed,
         },
         "artifacts": {},
         "candidate_configs": configs,
+        "candidate_component_records": component_records,
         "readiness_gates": readiness_gates(),
         "modal_hygiene_policy": {
-            "safe_auto_stop_scope": "dry-run did not start a Modal app",
+            "safe_auto_stop_scope": (
+                "dry-run does not invoke the remote GPU function; local hygiene "
+                "may still stop the modal run ephemeral app"
+            ),
             "app_name": APP_NAME,
+            "same_campaign_prefix_csv": DEFAULT_MODAL_CAMPAIGN_PREFIX_CSV,
         },
         "shapes": shapes,
     }
@@ -1104,6 +1379,8 @@ def main(
     shape_csv: str = "smoke,productionish",
     tilelang_variant_csv: str = "baseline,stage2_bf1_bb0",
     monolithic_candidate_csv: str = "monolithic_chunk_candidate",
+    candidate_record_path_csv: str = "",
+    candidate_record_json: str = "",
     warmup: int = 2,
     iters: int = 6,
     cuda_warmup: int = 3,
@@ -1112,10 +1389,23 @@ def main(
     dry_run_schema: bool = False,
     modal_hygiene: bool = True,
     modal_auto_stop: bool = True,
+    modal_hygiene_enforcement: str = "warn",
+    modal_campaign_prefix_csv: str = DEFAULT_MODAL_CAMPAIGN_PREFIX_CSV,
 ) -> None:
+    component_records = load_candidate_component_records(
+        candidate_record_path_csv,
+        candidate_record_json,
+    )
+    candidate_records_json = json.dumps(component_records, sort_keys=True)
+
     hygiene: dict[str, Any] = {}
+    campaign_prefixes = _modal_campaign_prefixes(modal_campaign_prefix_csv)
     if modal_hygiene:
-        hygiene["before"] = _modal_hygiene_check("before", auto_stop=False)
+        hygiene["before"] = _modal_hygiene_check(
+            "before",
+            auto_stop=False,
+            campaign_prefixes=campaign_prefixes,
+        )
 
     if dry_run_schema:
         result = _local_schema_dry_run(
@@ -1124,6 +1414,7 @@ def main(
             shape_csv,
             tilelang_variant_csv,
             monolithic_candidate_csv,
+            component_records,
             seed,
         )
     else:
@@ -1133,6 +1424,7 @@ def main(
             shape_csv,
             tilelang_variant_csv,
             monolithic_candidate_csv,
+            candidate_records_json,
             warmup,
             iters,
             cuda_warmup,
@@ -1140,10 +1432,23 @@ def main(
             seed,
         )
 
+    hygiene_exit_message = None
     if modal_hygiene:
-        hygiene["after"] = _modal_hygiene_check("after", auto_stop=modal_auto_stop)
+        hygiene["after"] = _modal_hygiene_check(
+            "after",
+            auto_stop=modal_auto_stop,
+            campaign_prefixes=campaign_prefixes,
+        )
+        hygiene["verdict"] = _modal_hygiene_verdict(
+            hygiene["after"],
+            modal_hygiene_enforcement,
+        )
         result["local_modal_hygiene"] = hygiene
+        if hygiene["verdict"]["status"] == "fail":
+            hygiene_exit_message = hygiene["verdict"]["message"]
 
     print("SUMMARY_JSON_START")
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
     print("SUMMARY_JSON_END")
+    if hygiene_exit_message:
+        raise SystemExit(hygiene_exit_message)
