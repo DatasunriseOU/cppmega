@@ -1,6 +1,7 @@
 # Mamba3 Mono WGMMA Plan Wave4 - 2026-04-30
 
-Status: executable schedule skeleton / receipt validator for Lane A/B
+Status: executable schedule skeleton / receipt validator for Lane A/B, Wave5
+Lane C copy-strategy update
 Canonical: no
 Branch: `worker/mamba3-mono-triton-model`
 
@@ -12,7 +13,8 @@ chunks, keep `dstates` and `DMIMO_V[R,P]` local, use SM90 BF16
 once, build `dk_intra` once, and feed `dk_intra.T` from an SMEM view/copy.
 
 Wave4 makes that plan executable for Lane A/B with a CPU-only generator and
-validator:
+validator. Wave5 Lane C extends the same receipt with copy-strategy variants
+and resource gates:
 
 - `tools/probes/mamba3_wgmma_wave4_schedule.py`
 - `docs/status/mamba3_mono_wgmma_plan_wave4_receipt_2026_04_30.json`
@@ -158,6 +160,67 @@ Lane A/B must report actual ptxas registers/thread, static SMEM, dynamic SMEM,
 and spills. Any local-memory spill in the hot CTA is a kill even if the static
 estimate is under budget.
 
+## Wave5 Lane C Copy Strategy
+
+Primary source notes used for the receipt:
+
+- NVIDIA's CUDA Programming Guide describes TMA as bulk/bulk-tensor
+  asynchronous copy on compute capability 9.0+, with tensor maps for
+  multi-dimensional copies and shared-memory-barrier completion:
+  <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-copies.html>.
+- The libcu++ PTX wrapper notes that `cp.async.bulk` source/destination
+  pointers must be 16-byte aligned and copy sizes must be multiples of 16:
+  <https://nvidia.github.io/cccl/libcudacxx/ptx/instructions/cp_async_bulk.html>.
+- CUTLASS CuTe TMA tensors use descriptors/tensor-map coordinates, not
+  ordinary GMEM pointers, so descriptor construction is a separate gate:
+  <https://docs.nvidia.com/cutlass/4.3.2/media/docs/cpp/cute/0z_tma_tensors.html>.
+- CuTe DSL exposes tiled TMA atom construction for GMEM/SMEM tiles via the
+  cpasync API:
+  <https://docs.nvidia.com/cutlass/4.2.1/media/docs/pythonDSL/cute_dsl_api/cute_nvgpu_cpasync.html>.
+
+The large-copy ledger now covers only the WGMMA operand tile movements. Of the
+12 large tile movements per chunk, 10 are TMA/cp.async-eligible global tile
+copies and 2 are CTA-local `dstates` staging movements. Tiny BHS/vector slices
+(`DDA`, `DFACTOR`, `DGAMMA_DIAG`, scalar traps/rotary slices, etc.) also stay
+off TMA because prior Stage2 probes showed descriptor failures on those small
+vector paths.
+
+| copy scope | value |
+| --- | ---: |
+| large tile | `64x64 bf16` = `8192 B` |
+| large tiles per chunk | `12` |
+| TMA/cp.async-eligible global tiles per chunk | `10` |
+| CTA-local `dstates` stage tiles per chunk | `2` |
+| large-copy bytes per chunk | `98304 B` / `96 KiB` |
+| TMA/cp.async-eligible bytes per chunk | `81920 B` / `80 KiB` |
+| CTA-local stage bytes per chunk | `16384 B` / `16 KiB` |
+| large-copy bytes per CTA stream | `25165824 B` / `24 MiB` |
+| large-copy bytes over grid | `3221225472 B` / `3072 MiB` |
+
+Receipt variants:
+
+| variant | status | copy ops/chunk | dynamic SMEM | regs/thread estimate | gate |
+| --- | --- | ---: | ---: | ---: | --- |
+| `scalar_bf16_correct_baseline` | correctness only | `49152` BF16 scalar copies | `118784 B` | `188` | proves WGMMA math and output wiring; fails production timing gate |
+| `narrow_vector_128b_safe_attempt` | safe attempt | `6144` 16-byte copies | `118784 B` | `192` | allowed into timing only with 16-byte alignment proof, no tails, and no spills |
+| `tma_cp_async_target` | production target | `10` bulk global tile copies + `2` local stages | `131072 B` | `184` | only variant allowed to claim green if descriptors, mbarriers, resources, and timing pass |
+
+Scalar-copy CuTe WGMMA remains the known-correct baseline from Wave4 context:
+`64x64x64` BF16 is correct at about `28.254 us`, which is far too slow to be a
+production copy path. The narrow-vector attempt cuts large-tile copy
+instructions by `8x` but lands exactly on the `192` register/thread pass
+budget, so ptxas metadata decides whether it survives. The TMA/cp.async target
+cuts the 10 global tile copies to one bulk operation per 64x64 tile before
+setup overhead; the 2 CTA-local `dstates` stages remain ordinary/vector SMEM
+staging, never TMA descriptors.
+
+Resource implication for TMA/cp.async: the receipt reserves `4 KiB` of
+async-control SMEM plus one extra `8 KiB` ping-pong tile. That reaches the
+`128 KiB` dynamic-SMEM pass budget exactly. A second independent ping-pong tile
+would raise the estimate to `139264 B` (`136 KiB`): below the `160 KiB` kill
+budget but outside the green/yellow resource gate unless the base SMEM plan is
+tightened or ptxas/resource metadata justifies a waiver.
+
 ## Output And Bytes/FMA
 
 Preferred scan-owner output writes:
@@ -194,8 +257,12 @@ Pass:
 - preferred owner is exactly one CTA per `(B,H)` stream with reverse chunks;
 - `LKQ` and `dk_intra` are each built once per chunk;
 - `dk_intra.T` uses SMEM view/copy, not another GMMA build;
+- copy strategy is declared as `scalar_bf16_correct_baseline`,
+  `narrow_vector_128b_safe_attempt`, or `tma_cp_async_target`;
 - no global `dPsiV`, `LKQ`, `dk_intra`, `DK`, `DQ`, or `DMIMO_V` partial
   temp is materialized;
+- TMA/cp.async is restricted to large aligned global 64x64 BF16 tiles;
+  `dstates` local stages and tiny scalar/vector slices remain non-TMA;
 - dynamic SMEM is `<=128 KiB` including guard, registers/thread `<=192`, and
   no local-memory spills;
 - productionish H200 timing is green at `<=3.35 ms`, or at least yellow at
@@ -208,12 +275,15 @@ Kill:
   path;
 - any silent owner mix where `dstates` is both loop-carried local state and a
   precomputed chunk input;
+- any production timing claim using the scalar BF16 copy baseline;
+- any TMA descriptor failure, missing async mbarrier wait/fence, TMA use on
+  local `dstates`, or TMA use on tiny vector slices;
 - dynamic SMEM `>160 KiB`, registers/thread `>224`, or local-memory spills;
 - productionish H200 full-kernel timing `>3.70674 ms` after correctness;
 - claiming the `96.38B` / `113.56B` ideal FMA receipt without diagonal 4x4
   causal split or equivalent proof.
 
-## Lane A/B Next
+## Lane A/B/C Next
 
 Lane A should implement the CuTe/CUDA skeleton in this order:
 
@@ -233,3 +303,16 @@ Lane B should wire the receipt validator into the gate:
 3. Reject any implementation whose component receipt does not match the
    single-build `LKQ`, single-build `dk_intra`, SMEM-transpose `dk_intra.T`,
    local `dstates`, and final-only `DMIMO_V` contract.
+
+Lane C / Wave6 should turn the copy receipt into implementation evidence:
+
+1. Keep the scalar BF16 path as a correctness-only baseline and attach the
+   current `28.254 us` single-GEMM receipt to the check output.
+2. Implement the `narrow_vector_128b_safe_attempt` in the monolithic skeleton,
+   prove 16-byte alignment/tail-free copies, and record ptxas regs/smem/spills.
+3. Prototype the `tma_cp_async_target` for the 10 global tile copies only:
+   descriptor/tensor-map build, expected-byte mbarrier accounting, wait/fence
+   before WGMMA consumes SMEM, and no TMA for CTA-local `dstates` or tiny
+   scalar/vector slices.
+4. If one-stage TMA/cp.async consumes the full `128 KiB` SMEM budget, reduce
+   the base alias plan before adding another ping-pong tile.

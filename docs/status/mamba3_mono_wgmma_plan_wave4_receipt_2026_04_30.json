@@ -68,11 +68,165 @@
       "receipt": "Preferred scan owner updates dstates locally with Q.T @ dPhiO before the next reverse chunk."
     }
   ],
+  "copy_strategy_variants": {
+    "documentation_sources": [
+      {
+        "name": "CUDA Programming Guide - asynchronous data copies",
+        "receipt_note": "TMA is modeled as bulk/bulk-tensor async copy on CC 9.0+; bulk tensor copies require a tensor map and shared-memory barrier completion.",
+        "url": "https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-copies.html"
+      },
+      {
+        "name": "libcu++ PTX cp.async.bulk wrappers",
+        "receipt_note": "cp.async.bulk requires 16-byte aligned source/destination and a size that is a multiple of 16 bytes.",
+        "url": "https://nvidia.github.io/cccl/libcudacxx/ptx/instructions/cp_async_bulk.html"
+      },
+      {
+        "name": "CUTLASS CuTe TMA tensors",
+        "receipt_note": "TMA consumes descriptor/tensor-map coordinates, not ordinary gmem pointers; descriptor construction is therefore a separate implementation gate.",
+        "url": "https://docs.nvidia.com/cutlass/4.3.2/media/docs/cpp/cute/0z_tma_tensors.html"
+      },
+      {
+        "name": "CuTe DSL cpasync submodule",
+        "receipt_note": "make_tiled_tma_atom builds a TMA copy atom for GMEM/SMEM tiles from a gmem tensor, smem layout, and CTA tiler.",
+        "url": "https://docs.nvidia.com/cutlass/4.2.1/media/docs/pythonDSL/cute_dsl_api/cute_nvgpu_cpasync.html"
+      }
+    ],
+    "resource_budget": {
+      "async_control_smem_reserve_bytes": 4096,
+      "base_dynamic_smem_bytes": 118784,
+      "kill_dynamic_smem_bytes": 163840,
+      "kill_regs_per_thread": 224,
+      "one_extra_tile_stage_bytes": 8192,
+      "pass_dynamic_smem_bytes": 131072,
+      "pass_regs_per_thread": 192,
+      "tma_one_stage_dynamic_smem_bytes": 131072,
+      "tma_two_stage_dynamic_smem_bytes": 139264
+    },
+    "scope": {
+      "large_copy_bytes_grid": 3221225472,
+      "large_copy_bytes_per_chunk": 98304,
+      "large_copy_bytes_per_cta_stream": 25165824,
+      "large_copy_mib_grid": 3072.0,
+      "large_copy_mib_per_cta_stream": 24.0,
+      "large_copy_tiles_per_chunk": 12,
+      "large_tile_bytes": 8192,
+      "large_tile_shape": "64x64 bf16",
+      "local_or_smem_stage_bytes_per_chunk": 16384,
+      "local_or_smem_stage_tiles_per_chunk": 2,
+      "tiny_vector_policy": "DDA/DFACTOR/DGAMMA/DSSDA/DANGLES scalar/vector slices are excluded from TMA; copy them with ordinary or narrow-vector code only.",
+      "tma_eligible_global_copy_bytes_per_chunk": 81920,
+      "tma_eligible_global_tiles_per_chunk": 10
+    },
+    "variants": [
+      {
+        "copy_instruction_unit_bytes": 2,
+        "copy_instructions_per_chunk": 49152,
+        "copy_kind": "ordinary per-element BF16 gmem->smem/smem->gmem copies through registers",
+        "estimated_dynamic_smem_bytes": 118784,
+        "estimated_regs_per_thread_full_dstates": 188,
+        "evidence": {
+          "measured_microbench_us_64x64x64": 28.254,
+          "wave5_user_context": "64x64x64 scalar-copy CuTe WGMMA GEMM is correct at about 28.254 us."
+        },
+        "fail_gates": [
+          "Any production/yellow/green timing claim based on this copy path.",
+          "Any local-memory spill caused by scalar staging values."
+        ],
+        "large_copy_bytes_grid": 3221225472,
+        "large_copy_bytes_per_chunk": 98304,
+        "large_tile_ops_per_chunk": 12,
+        "local_or_smem_stage_tile_ops_per_chunk": 2,
+        "name": "scalar_bf16_correct_baseline",
+        "pass_gates": [
+          "All output slots match the scalar BF16 reference smoke.",
+          "The single-GEMM CuTe WGMMA scalar-copy baseline stays correct.",
+          "Receipt labels timing as a baseline and does not claim production speed."
+        ],
+        "production_gate": "fails performance gate; allowed only to prove WGMMA math and output wiring",
+        "resource_implication": "No async-control SMEM and no extra staging. Register pressure remains below the 192-reg pass budget, but the copy instruction count is too high.",
+        "status": "correctness_baseline_only",
+        "tma_eligible_global_tile_ops_per_chunk": 10
+      },
+      {
+        "copy_instruction_unit_bytes": 16,
+        "copy_instructions_per_chunk": 6144,
+        "copy_kind": "CuTe CopyUniversalOp-style 128-bit vector copies for aligned contiguous BF16 tiles",
+        "estimated_dynamic_smem_bytes": 118784,
+        "estimated_regs_per_thread_full_dstates": 192,
+        "evidence": {
+          "copy_instruction_reduction_vs_scalar": "8x fewer large-tile copy instructions",
+          "single_tile_vector_copies": 512
+        },
+        "fail_gates": [
+          "Any masked vector tail on the 64x64 BF16 tiles.",
+          "Any bank-conflict or layout fix that adds an independent 64x64 SMEM tile.",
+          "ptxas registers/thread >192 after vector copy integration."
+        ],
+        "large_copy_bytes_grid": 3221225472,
+        "large_copy_bytes_per_chunk": 98304,
+        "large_tile_ops_per_chunk": 12,
+        "local_or_smem_stage_tile_ops_per_chunk": 2,
+        "name": "narrow_vector_128b_safe_attempt",
+        "pass_gates": [
+          "Every vectorized source and destination pointer is at least 16-byte aligned.",
+          "Every large tile has no tail path: 8192-byte tiles are copied as 512 x 16-byte lanes.",
+          "Small scalar/vector slices stay on ordinary non-TMA copies.",
+          "ptxas registers/thread <=192 and no spills."
+        ],
+        "production_gate": "may enter timing gate after correctness, alignment proof, ptxas <=192 regs/thread, and zero spills",
+        "resource_implication": "Same SMEM footprint as scalar baseline. Register estimate lands exactly on the 192-reg pass budget, so ptxas metadata is mandatory before widening lifetimes.",
+        "status": "safe_attempt",
+        "tma_eligible_global_tile_ops_per_chunk": 10
+      },
+      {
+        "copy_instruction_unit_bytes": 8192,
+        "copy_instructions_per_chunk": 12,
+        "copy_kind": "TMA bulk-tensor or cp.async.bulk path for 10 global 64x64 BF16 tiles; ordinary/vector staging for 2 CTA-local dstates panels and tiny scalar slices",
+        "estimated_dynamic_smem_bytes": 131072,
+        "estimated_regs_per_thread_full_dstates": 184,
+        "evidence": {
+          "async_control_smem_reserve_bytes": 4096,
+          "copy_instruction_reduction_vs_scalar": "4096x fewer large-tile copy instructions before setup overhead",
+          "copy_instruction_reduction_vs_vector": "512x fewer large-tile copy instructions before setup overhead",
+          "local_dstates_stage_tile_ops_per_chunk": 2,
+          "single_pingpong_tile_bytes": 8192,
+          "tma_eligible_global_tile_ops_per_chunk": 10
+        },
+        "fail_gates": [
+          "Any TMA descriptor/tensor-map init failure.",
+          "Any missing mbarrier expected-byte update or wait before WGMMA consumes SMEM.",
+          "Trying to build a TMA descriptor for CTA-local dstates.",
+          "Using TMA for tiny scalar/vector slices that previously triggered descriptor failures.",
+          "More than one extra 8 KiB ping-pong tile without reducing the base SMEM plan.",
+          "Dynamic SMEM >128 KiB for a claimed green/yellow timing sample."
+        ],
+        "large_copy_bytes_grid": 3221225472,
+        "large_copy_bytes_per_chunk": 98304,
+        "large_tile_ops_per_chunk": 12,
+        "local_or_smem_stage_tile_ops_per_chunk": 2,
+        "name": "tma_cp_async_target",
+        "pass_gates": [
+          "TMA tensor-map/descriptor construction succeeds for every large tile layout.",
+          "cp.async.bulk uses 16-byte aligned source/destination and 16-byte-multiple sizes.",
+          "Low-level cp.async.bulk calls pair mbarrier expected-byte accounting with wait/fence.",
+          "Only global 64x64 BF16 tiles use TMA/cp.async; dstates local stages and tiny BHS/vector slices stay non-TMA.",
+          "Dynamic SMEM <=128 KiB, ptxas registers/thread <=192, and no spills.",
+          "Full productionish H200 timing is <=3.35 ms for green or <=3.70674 ms for yellow."
+        ],
+        "production_gate": "only variant allowed to claim the green target if descriptors, mbarriers, resources, and timing all pass",
+        "resource_implication": "Reserves 4 KiB for async-control state plus one 8 KiB ping-pong tile. This reaches the 128 KiB dynamic-SMEM pass ceiling exactly; a second extra tile stage exceeds the pass budget and needs a measured waiver.",
+        "status": "production_target",
+        "tma_eligible_global_tile_ops_per_chunk": 10
+      }
+    ]
+  },
   "criteria": {
     "kill": [
       "Any duplicate LKQ, dk_intra, or dk_intra.T GMMA build.",
       "Any [B,H,nchunks,R,P] DMIMO_V partial output in the preferred scan-owner path.",
       "Any silent owner mix where dstates is treated both as a loop-carried local and as precomputed chunk input.",
+      "Any production timing claim using the scalar BF16 copy baseline.",
+      "Any TMA descriptor failure, missing async mbarrier wait/fence, TMA use on local dstates, or TMA use on tiny vector slices.",
       "Dynamic SMEM >160 KiB, ptxas registers/thread >224, or any local-memory spill in the hot CTA.",
       "Full-kernel timing >3.70674 ms on productionish H200 after correctness.",
       "Claiming ideal 96.38B/113.56B FMA without diagonal 4x4 causal split or equivalent no-work-lower-triangle proof."
@@ -81,7 +235,9 @@
       "Correctness smoke covers every output slot: DV, DK, DQ, DMIMO_V, five BHS scalars, DSSDA, DANGLES.",
       "Preferred owner is one CTA per (B,H) stream with reverse chunk loop and CTA-local dstates plus DMIMO_V[R,P].",
       "LKQ and dk_intra are each built once per chunk; dk_intra.T is fed from SMEM view/copy.",
+      "The copy strategy is declared as scalar_bf16_correct_baseline, narrow_vector_128b_safe_attempt, or tma_cp_async_target.",
       "No global dPsiV, LKQ, dk_intra, DK, DQ intermediate, or DMIMO_V partial tensor is materialized.",
+      "TMA/cp.async is restricted to large aligned global 64x64 BF16 tiles; dstates local stages and tiny vector/scalar slices stay non-TMA.",
       "Dynamic SMEM <=128 KiB including alignment guard; ptxas registers/thread <=192 with no local-memory spills.",
       "Reported timing is green at <=3.35 ms or at least yellow at <=3.70674 ms against TileLang."
     ],

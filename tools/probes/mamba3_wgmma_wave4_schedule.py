@@ -3,7 +3,10 @@
 This is a CPU-only schedule generator for the Mamba3 mono ``bwd_bwd`` rewrite.
 It turns the Wave3 plan into concrete CTA ownership, GMMA-equivalent counts,
 shared-memory accounting, register-pressure estimates, output slots, and
-pass/kill criteria for Lane A/B implementation work.
+pass/kill criteria for Lane A/B implementation work.  Wave5/Lane C adds the
+copy-strategy ledger that decides which CuTe/CUDA copy path is a correctness
+baseline, which path is a safe vector attempt, and which path is allowed to
+claim the production TMA/cp.async target.
 """
 
 from __future__ import annotations
@@ -33,6 +36,8 @@ GMMA_K = 16
 FMA_PER_M64N64K16 = GMMA_M * GMMA_N * GMMA_K
 H200_SMEM_BUDGET_BYTES = 128 * 1024
 H200_SMEM_KILL_BYTES = 160 * 1024
+CP_ASYNC_BULK_ALIGNMENT_BYTES = 16
+ASYNC_CONTROL_SMEM_RESERVE_BYTES = 4 * 1024
 
 
 @dataclass(frozen=True)
@@ -65,6 +70,27 @@ class OutputSlot:
     bytes: int
     owner: str
     cadence: str
+
+
+@dataclass(frozen=True)
+class CopyStrategyVariant:
+    name: str
+    status: str
+    copy_kind: str
+    large_tile_ops_per_chunk: int
+    tma_eligible_global_tile_ops_per_chunk: int
+    local_or_smem_stage_tile_ops_per_chunk: int
+    copy_instructions_per_chunk: int
+    copy_instruction_unit_bytes: int
+    large_copy_bytes_per_chunk: int
+    large_copy_bytes_grid: int
+    estimated_dynamic_smem_bytes: int
+    estimated_regs_per_thread_full_dstates: int
+    production_gate: str
+    resource_implication: str
+    pass_gates: list[str]
+    fail_gates: list[str]
+    evidence: dict[str, Any]
 
 
 def _shape() -> Shape:
@@ -270,6 +296,238 @@ def _output_slots(shape: Shape, bytes_model: dict[str, int]) -> list[OutputSlot]
         OutputSlot("DDA", "[B,H,S]", "fp32", shape.B * shape.H * shape.S * FP32_BYTES, "(B,H,chunk)", "once per chunk"),
         OutputSlot("DANGLES", "[B,S,H,N/4]", "fp32", bytes_model["dangles_output_bytes"], "(B,H,chunk)", "once per chunk"),
     ]
+
+
+def _copy_documentation_sources() -> list[dict[str, str]]:
+    return [
+        {
+            "name": "CUDA Programming Guide - asynchronous data copies",
+            "url": "https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-copies.html",
+            "receipt_note": (
+                "TMA is modeled as bulk/bulk-tensor async copy on CC 9.0+; "
+                "bulk tensor copies require a tensor map and shared-memory barrier completion."
+            ),
+        },
+        {
+            "name": "libcu++ PTX cp.async.bulk wrappers",
+            "url": "https://nvidia.github.io/cccl/libcudacxx/ptx/instructions/cp_async_bulk.html",
+            "receipt_note": (
+                "cp.async.bulk requires 16-byte aligned source/destination and a size "
+                "that is a multiple of 16 bytes."
+            ),
+        },
+        {
+            "name": "CUTLASS CuTe TMA tensors",
+            "url": "https://docs.nvidia.com/cutlass/4.3.2/media/docs/cpp/cute/0z_tma_tensors.html",
+            "receipt_note": (
+                "TMA consumes descriptor/tensor-map coordinates, not ordinary gmem pointers; "
+                "descriptor construction is therefore a separate implementation gate."
+            ),
+        },
+        {
+            "name": "CuTe DSL cpasync submodule",
+            "url": "https://docs.nvidia.com/cutlass/4.2.1/media/docs/pythonDSL/cute_dsl_api/cute_nvgpu_cpasync.html",
+            "receipt_note": (
+                "make_tiled_tma_atom builds a TMA copy atom for GMEM/SMEM tiles "
+                "from a gmem tensor, smem layout, and CTA tiler."
+            ),
+        },
+    ]
+
+
+def _large_copy_tiles_per_chunk(shape: Shape) -> int:
+    return _tma_eligible_global_tiles_per_chunk(shape) + _local_stage_tiles_per_chunk(shape)
+
+
+def _tma_eligible_global_tiles_per_chunk(shape: Shape) -> int:
+    p_panels = math.ceil(shape.P / GMMA_N)
+    chunk_wide_tiles = 4  # K, Q, K_T, Q_T
+    global_panel_tiles = 3 * p_panels  # state, dPhiO, PsiV for each P panel
+    return chunk_wide_tiles + global_panel_tiles
+
+
+def _local_stage_tiles_per_chunk(shape: Shape) -> int:
+    return math.ceil(shape.P / GMMA_N)  # loop-carried dstates panels are CTA-local
+
+
+def _copy_strategy_variants(
+    shape: Shape,
+    *,
+    base_dynamic_smem_bytes: int,
+    base_regs_per_thread_full_dstates: int,
+) -> dict[str, Any]:
+    chunks = shape.B * shape.H * shape.nchunks
+    tile_bytes = GMMA_M * GMMA_N * BF16_BYTES
+    large_tile_ops = _large_copy_tiles_per_chunk(shape)
+    bytes_per_chunk = large_tile_ops * tile_bytes
+    bytes_grid = bytes_per_chunk * chunks
+    vector_unit_bytes = CP_ASYNC_BULK_ALIGNMENT_BYTES
+    scalar_unit_bytes = BF16_BYTES
+    tma_single_stage_bytes = tile_bytes
+    tma_eligible_tiles = _tma_eligible_global_tiles_per_chunk(shape)
+    local_stage_tiles = _local_stage_tiles_per_chunk(shape)
+
+    variants = [
+        CopyStrategyVariant(
+            name="scalar_bf16_correct_baseline",
+            status="correctness_baseline_only",
+            copy_kind="ordinary per-element BF16 gmem->smem/smem->gmem copies through registers",
+            large_tile_ops_per_chunk=large_tile_ops,
+            tma_eligible_global_tile_ops_per_chunk=tma_eligible_tiles,
+            local_or_smem_stage_tile_ops_per_chunk=local_stage_tiles,
+            copy_instructions_per_chunk=bytes_per_chunk // scalar_unit_bytes,
+            copy_instruction_unit_bytes=scalar_unit_bytes,
+            large_copy_bytes_per_chunk=bytes_per_chunk,
+            large_copy_bytes_grid=bytes_grid,
+            estimated_dynamic_smem_bytes=base_dynamic_smem_bytes,
+            estimated_regs_per_thread_full_dstates=base_regs_per_thread_full_dstates + 8,
+            production_gate="fails performance gate; allowed only to prove WGMMA math and output wiring",
+            resource_implication=(
+                "No async-control SMEM and no extra staging. Register pressure remains below "
+                "the 192-reg pass budget, but the copy instruction count is too high."
+            ),
+            pass_gates=[
+                "All output slots match the scalar BF16 reference smoke.",
+                "The single-GEMM CuTe WGMMA scalar-copy baseline stays correct.",
+                "Receipt labels timing as a baseline and does not claim production speed.",
+            ],
+            fail_gates=[
+                "Any production/yellow/green timing claim based on this copy path.",
+                "Any local-memory spill caused by scalar staging values.",
+            ],
+            evidence={
+                "wave5_user_context": "64x64x64 scalar-copy CuTe WGMMA GEMM is correct at about 28.254 us.",
+                "measured_microbench_us_64x64x64": 28.254,
+            },
+        ),
+        CopyStrategyVariant(
+            name="narrow_vector_128b_safe_attempt",
+            status="safe_attempt",
+            copy_kind="CuTe CopyUniversalOp-style 128-bit vector copies for aligned contiguous BF16 tiles",
+            large_tile_ops_per_chunk=large_tile_ops,
+            tma_eligible_global_tile_ops_per_chunk=tma_eligible_tiles,
+            local_or_smem_stage_tile_ops_per_chunk=local_stage_tiles,
+            copy_instructions_per_chunk=bytes_per_chunk // vector_unit_bytes,
+            copy_instruction_unit_bytes=vector_unit_bytes,
+            large_copy_bytes_per_chunk=bytes_per_chunk,
+            large_copy_bytes_grid=bytes_grid,
+            estimated_dynamic_smem_bytes=base_dynamic_smem_bytes,
+            estimated_regs_per_thread_full_dstates=base_regs_per_thread_full_dstates + 12,
+            production_gate=(
+                "may enter timing gate after correctness, alignment proof, ptxas <=192 regs/thread, "
+                "and zero spills"
+            ),
+            resource_implication=(
+                "Same SMEM footprint as scalar baseline. Register estimate lands exactly on the "
+                "192-reg pass budget, so ptxas metadata is mandatory before widening lifetimes."
+            ),
+            pass_gates=[
+                "Every vectorized source and destination pointer is at least 16-byte aligned.",
+                "Every large tile has no tail path: 8192-byte tiles are copied as 512 x 16-byte lanes.",
+                "Small scalar/vector slices stay on ordinary non-TMA copies.",
+                "ptxas registers/thread <=192 and no spills.",
+            ],
+            fail_gates=[
+                "Any masked vector tail on the 64x64 BF16 tiles.",
+                "Any bank-conflict or layout fix that adds an independent 64x64 SMEM tile.",
+                "ptxas registers/thread >192 after vector copy integration.",
+            ],
+            evidence={
+                "copy_instruction_reduction_vs_scalar": "8x fewer large-tile copy instructions",
+                "single_tile_vector_copies": tile_bytes // vector_unit_bytes,
+            },
+        ),
+        CopyStrategyVariant(
+            name="tma_cp_async_target",
+            status="production_target",
+            copy_kind=(
+                "TMA bulk-tensor or cp.async.bulk path for 10 global 64x64 BF16 tiles; "
+                "ordinary/vector staging for 2 CTA-local dstates panels and tiny scalar slices"
+            ),
+            large_tile_ops_per_chunk=large_tile_ops,
+            tma_eligible_global_tile_ops_per_chunk=tma_eligible_tiles,
+            local_or_smem_stage_tile_ops_per_chunk=local_stage_tiles,
+            copy_instructions_per_chunk=large_tile_ops,
+            copy_instruction_unit_bytes=tile_bytes,
+            large_copy_bytes_per_chunk=bytes_per_chunk,
+            large_copy_bytes_grid=bytes_grid,
+            estimated_dynamic_smem_bytes=(
+                base_dynamic_smem_bytes + ASYNC_CONTROL_SMEM_RESERVE_BYTES + tma_single_stage_bytes
+            ),
+            estimated_regs_per_thread_full_dstates=base_regs_per_thread_full_dstates + 4,
+            production_gate=(
+                "only variant allowed to claim the green target if descriptors, mbarriers, "
+                "resources, and timing all pass"
+            ),
+            resource_implication=(
+                "Reserves 4 KiB for async-control state plus one 8 KiB ping-pong tile. "
+                "This reaches the 128 KiB dynamic-SMEM pass ceiling exactly; a second "
+                "extra tile stage exceeds the pass budget and needs a measured waiver."
+            ),
+            pass_gates=[
+                "TMA tensor-map/descriptor construction succeeds for every large tile layout.",
+                "cp.async.bulk uses 16-byte aligned source/destination and 16-byte-multiple sizes.",
+                "Low-level cp.async.bulk calls pair mbarrier expected-byte accounting with wait/fence.",
+                "Only global 64x64 BF16 tiles use TMA/cp.async; dstates local stages and tiny BHS/vector slices stay non-TMA.",
+                "Dynamic SMEM <=128 KiB, ptxas registers/thread <=192, and no spills.",
+                "Full productionish H200 timing is <=3.35 ms for green or <=3.70674 ms for yellow.",
+            ],
+            fail_gates=[
+                "Any TMA descriptor/tensor-map init failure.",
+                "Any missing mbarrier expected-byte update or wait before WGMMA consumes SMEM.",
+                "Trying to build a TMA descriptor for CTA-local dstates.",
+                "Using TMA for tiny scalar/vector slices that previously triggered descriptor failures.",
+                "More than one extra 8 KiB ping-pong tile without reducing the base SMEM plan.",
+                "Dynamic SMEM >128 KiB for a claimed green/yellow timing sample.",
+            ],
+            evidence={
+                "copy_instruction_reduction_vs_scalar": "4096x fewer large-tile copy instructions before setup overhead",
+                "copy_instruction_reduction_vs_vector": "512x fewer large-tile copy instructions before setup overhead",
+                "async_control_smem_reserve_bytes": ASYNC_CONTROL_SMEM_RESERVE_BYTES,
+                "tma_eligible_global_tile_ops_per_chunk": tma_eligible_tiles,
+                "local_dstates_stage_tile_ops_per_chunk": local_stage_tiles,
+                "single_pingpong_tile_bytes": tma_single_stage_bytes,
+            },
+        ),
+    ]
+
+    return {
+        "scope": {
+            "large_tile_shape": "64x64 bf16",
+            "large_tile_bytes": tile_bytes,
+            "large_copy_tiles_per_chunk": large_tile_ops,
+            "tma_eligible_global_tiles_per_chunk": tma_eligible_tiles,
+            "local_or_smem_stage_tiles_per_chunk": local_stage_tiles,
+            "large_copy_bytes_per_chunk": bytes_per_chunk,
+            "tma_eligible_global_copy_bytes_per_chunk": tma_eligible_tiles * tile_bytes,
+            "local_or_smem_stage_bytes_per_chunk": local_stage_tiles * tile_bytes,
+            "large_copy_bytes_grid": bytes_grid,
+            "large_copy_mib_grid": _mib(bytes_grid),
+            "large_copy_bytes_per_cta_stream": bytes_per_chunk * shape.nchunks,
+            "large_copy_mib_per_cta_stream": _mib(bytes_per_chunk * shape.nchunks),
+            "tiny_vector_policy": (
+                "DDA/DFACTOR/DGAMMA/DSSDA/DANGLES scalar/vector slices are excluded from TMA; "
+                "copy them with ordinary or narrow-vector code only."
+            ),
+        },
+        "resource_budget": {
+            "base_dynamic_smem_bytes": base_dynamic_smem_bytes,
+            "pass_dynamic_smem_bytes": H200_SMEM_BUDGET_BYTES,
+            "kill_dynamic_smem_bytes": H200_SMEM_KILL_BYTES,
+            "pass_regs_per_thread": 192,
+            "kill_regs_per_thread": 224,
+            "async_control_smem_reserve_bytes": ASYNC_CONTROL_SMEM_RESERVE_BYTES,
+            "one_extra_tile_stage_bytes": tma_single_stage_bytes,
+            "tma_one_stage_dynamic_smem_bytes": (
+                base_dynamic_smem_bytes + ASYNC_CONTROL_SMEM_RESERVE_BYTES + tma_single_stage_bytes
+            ),
+            "tma_two_stage_dynamic_smem_bytes": (
+                base_dynamic_smem_bytes + ASYNC_CONTROL_SMEM_RESERVE_BYTES + 2 * tma_single_stage_bytes
+            ),
+        },
+        "variants": [asdict(variant) for variant in variants],
+        "documentation_sources": _copy_documentation_sources(),
+    }
 
 
 def _component_receipt(shape: Shape, fma: dict[str, Any], optional_dstates_update_fma: int) -> list[dict[str, Any]]:
@@ -502,7 +760,9 @@ def _criteria() -> dict[str, Any]:
             "Correctness smoke covers every output slot: DV, DK, DQ, DMIMO_V, five BHS scalars, DSSDA, DANGLES.",
             "Preferred owner is one CTA per (B,H) stream with reverse chunk loop and CTA-local dstates plus DMIMO_V[R,P].",
             "LKQ and dk_intra are each built once per chunk; dk_intra.T is fed from SMEM view/copy.",
+            "The copy strategy is declared as scalar_bf16_correct_baseline, narrow_vector_128b_safe_attempt, or tma_cp_async_target.",
             "No global dPsiV, LKQ, dk_intra, DK, DQ intermediate, or DMIMO_V partial tensor is materialized.",
+            "TMA/cp.async is restricted to large aligned global 64x64 BF16 tiles; dstates local stages and tiny vector/scalar slices stay non-TMA.",
             "Dynamic SMEM <=128 KiB including alignment guard; ptxas registers/thread <=192 with no local-memory spills.",
             "Reported timing is green at <=3.35 ms or at least yellow at <=3.70674 ms against TileLang.",
         ],
@@ -510,6 +770,8 @@ def _criteria() -> dict[str, Any]:
             "Any duplicate LKQ, dk_intra, or dk_intra.T GMMA build.",
             "Any [B,H,nchunks,R,P] DMIMO_V partial output in the preferred scan-owner path.",
             "Any silent owner mix where dstates is treated both as a loop-carried local and as precomputed chunk input.",
+            "Any production timing claim using the scalar BF16 copy baseline.",
+            "Any TMA descriptor failure, missing async mbarrier wait/fence, TMA use on local dstates, or TMA use on tiny vector slices.",
             "Dynamic SMEM >160 KiB, ptxas registers/thread >224, or any local-memory spill in the hot CTA.",
             "Full-kernel timing >3.70674 ms on productionish H200 after correctness.",
             "Claiming ideal 96.38B/113.56B FMA without diagonal 4x4 causal split or equivalent no-work-lower-triangle proof.",
@@ -532,6 +794,8 @@ def build_receipt() -> dict[str, Any]:
     memory = _memory_model(shape)
     bytes_model = _bytes_model(shape)
     products = _gmma_products(shape)
+    smem_plan = _smem_plan(shape)
+    register_pressure = _register_pressure_estimate(shape)
     optional_dstates_update_fma = shape.B * shape.H * shape.nchunks * shape.N * shape.fcs * shape.P
     scan_owner_ideal_with_dstates = (
         fma["monolithic_causal_apply_total_fma"] + optional_dstates_update_fma
@@ -582,9 +846,14 @@ def build_receipt() -> dict[str, Any]:
         },
         "schedule_steps": _schedule_steps(),
         "gmma_counts": _gmma_counts(shape, products),
-        "smem_plan": _smem_plan(shape),
-        "register_pressure_estimate": _register_pressure_estimate(shape),
+        "smem_plan": smem_plan,
+        "register_pressure_estimate": register_pressure,
         "output_slots": [asdict(slot) for slot in _output_slots(shape, bytes_model)],
+        "copy_strategy_variants": _copy_strategy_variants(
+            shape,
+            base_dynamic_smem_bytes=smem_plan["peak_with_alignment_guard_bytes"],
+            base_regs_per_thread_full_dstates=register_pressure["estimated_regs_per_thread_full_dstates"],
+        ),
         "output_bytes": {
             "per_chunk_scan_output_bytes_excluding_final_dmimov": bytes_model["per_chunk_scan_output_bytes"],
             "per_cta_stream_scan_output_bytes_including_final_dmimov": bytes_model[
@@ -657,6 +926,32 @@ def _validate_receipt(receipt: dict[str, Any]) -> None:
     slot_sum = sum(slot["bytes"] for slot in receipt["output_slots"])
     assert slot_sum == receipt["output_bytes"]["scan_owner_required_output_write_bytes"]
     assert receipt["bytes_per_fma"]["scan_owner_ideal_plus_dstates_output_write_bytes_per_fma"] < 0.0067
+    copy_scope = receipt["copy_strategy_variants"]["scope"]
+    assert copy_scope["large_copy_tiles_per_chunk"] == 12
+    assert copy_scope["tma_eligible_global_tiles_per_chunk"] == 10
+    assert copy_scope["local_or_smem_stage_tiles_per_chunk"] == 2
+    assert copy_scope["large_copy_bytes_per_chunk"] == 98304
+    assert copy_scope["tma_eligible_global_copy_bytes_per_chunk"] == 81920
+    assert copy_scope["local_or_smem_stage_bytes_per_chunk"] == 16384
+    variants = {
+        variant["name"]: variant for variant in receipt["copy_strategy_variants"]["variants"]
+    }
+    assert set(variants) == {
+        "scalar_bf16_correct_baseline",
+        "narrow_vector_128b_safe_attempt",
+        "tma_cp_async_target",
+    }
+    assert variants["scalar_bf16_correct_baseline"]["copy_instructions_per_chunk"] == 49152
+    assert variants["narrow_vector_128b_safe_attempt"]["copy_instructions_per_chunk"] == 6144
+    assert variants["tma_cp_async_target"]["copy_instructions_per_chunk"] == 12
+    assert (
+        receipt["copy_strategy_variants"]["resource_budget"]["tma_one_stage_dynamic_smem_bytes"]
+        == H200_SMEM_BUDGET_BYTES
+    )
+    assert (
+        receipt["copy_strategy_variants"]["resource_budget"]["tma_two_stage_dynamic_smem_bytes"]
+        > H200_SMEM_BUDGET_BYTES
+    )
 
 
 def _canonical(data: dict[str, Any]) -> str:
@@ -671,6 +966,8 @@ def _render_skeleton(receipt: dict[str, Any]) -> str:
 // Preferred grid: <<<B*H={shape["B"] * shape["H"]} CTAs>>>; each CTA loops {shape["nchunks"]} chunks in reverse.
 // Per chunk dense full-mask GMMA ops: {totals["full_mask_dense_m64n64k16_ops_per_chunk_excluding_scan_update"]}; scan update adds {totals["scan_dstates_update_dense_m64n64k16_ops_per_chunk"]}.
 // Ideal triangular GMMA-equivalent ops with scan update: {totals["scan_owner_ideal_m64n64k16_equiv_ops_per_chunk_with_update"]}.
+// Copy strategies: scalar_bf16_correct_baseline (correctness only), narrow_vector_128b_safe_attempt, tma_cp_async_target.
+// TMA/cp.async is only for aligned global 64x64 BF16 tiles; dstates local stages and tiny scalar/vector slices stay non-TMA.
 
 cta_bh = blockIdx.x;
 b = cta_bh / H;
@@ -679,7 +976,7 @@ init_local_dstates_NxP();
 init_local_dmimov_RxP();
 
 for (int chunk_idx = nchunks - 1; chunk_idx >= 0; --chunk_idx) {{
-  load_smem_K_Q_and_transpose_views(b, h, chunk_idx);
+  load_smem_K_Q_and_transpose_views_with_declared_copy_strategy(b, h, chunk_idx);
   build_LKQ_once_with_gmma_m64n64k16();
 
   for (int p_panel = 0; p_panel < 2; ++p_panel) {{

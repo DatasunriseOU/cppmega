@@ -38,7 +38,48 @@ def test_wave4_schedule_receipt_bytes_and_gates() -> None:
     kill = "\n".join(receipt["criteria"]["kill"])
     assert "duplicate LKQ" in kill
     assert "DMIMO_V partial" in kill
+    assert "scalar BF16 copy baseline" in kill
+    assert "TMA descriptor failure" in kill
     assert "Full-kernel timing >3.70674 ms" in kill
+
+
+def test_wave4_copy_strategy_variants_and_resources() -> None:
+    receipt = wave4.build_receipt()
+    copy_receipt = receipt["copy_strategy_variants"]
+
+    scope = copy_receipt["scope"]
+    assert scope["large_copy_tiles_per_chunk"] == 12
+    assert scope["tma_eligible_global_tiles_per_chunk"] == 10
+    assert scope["local_or_smem_stage_tiles_per_chunk"] == 2
+    assert scope["large_copy_bytes_per_chunk"] == 98304
+    assert scope["tma_eligible_global_copy_bytes_per_chunk"] == 81920
+    assert scope["local_or_smem_stage_bytes_per_chunk"] == 16384
+    assert scope["large_copy_mib_grid"] == 3072.0
+
+    variants = {variant["name"]: variant for variant in copy_receipt["variants"]}
+    assert set(variants) == {
+        "scalar_bf16_correct_baseline",
+        "narrow_vector_128b_safe_attempt",
+        "tma_cp_async_target",
+    }
+
+    assert variants["scalar_bf16_correct_baseline"]["copy_instructions_per_chunk"] == 49152
+    assert variants["scalar_bf16_correct_baseline"]["production_gate"].startswith("fails performance gate")
+    assert variants["narrow_vector_128b_safe_attempt"]["copy_instructions_per_chunk"] == 6144
+    assert variants["narrow_vector_128b_safe_attempt"]["estimated_regs_per_thread_full_dstates"] == 192
+    assert variants["tma_cp_async_target"]["copy_instructions_per_chunk"] == 12
+    assert variants["tma_cp_async_target"]["tma_eligible_global_tile_ops_per_chunk"] == 10
+    assert variants["tma_cp_async_target"]["local_or_smem_stage_tile_ops_per_chunk"] == 2
+    assert variants["tma_cp_async_target"]["estimated_dynamic_smem_bytes"] == 131072
+
+    budget = copy_receipt["resource_budget"]
+    assert budget["tma_one_stage_dynamic_smem_bytes"] == budget["pass_dynamic_smem_bytes"]
+    assert budget["tma_two_stage_dynamic_smem_bytes"] > budget["pass_dynamic_smem_bytes"]
+    assert budget["tma_two_stage_dynamic_smem_bytes"] < budget["kill_dynamic_smem_bytes"]
+
+    sources = {source["name"] for source in copy_receipt["documentation_sources"]}
+    assert "CUDA Programming Guide - asynchronous data copies" in sources
+    assert "CUTLASS CuTe TMA tensors" in sources
 
 
 def test_wave4_schedule_check_mode(tmp_path: Path) -> None:
