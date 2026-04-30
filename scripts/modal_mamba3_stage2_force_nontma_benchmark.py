@@ -22,7 +22,7 @@ Run examples:
     GHCR_TAG=785c3fd CPPMEGA_MODAL_GPU=H200:2 timeout 15m \
         modal run scripts/modal_mamba3_stage2_force_nontma_benchmark.py \
         --shape-csv productionish \
-        --variant-csv baseline,stage2_bf1_bb0,stage2_bf0_bb1,stage2_force_nontma \
+        --variant-csv baseline,stage2_bf1_bb0,stage2_bf1_bb0_diag_reuse \
         --torch-profile \
         --iters 4 --warmup 1
 """
@@ -45,7 +45,8 @@ GHCR_REF = f"{GHCR_REPO}:{GHCR_TAG}"
 GPU_SPEC = os.environ.get("CPPMEGA_MODAL_GPU", "H200:2")
 BENCH_VOLUME_NAME = os.environ.get("CPPMEGA_MODAL_BENCH_VOLUME", "cppmega-mamba3-benchmarks")
 
-APP_NAME = "cppmega-mamba3-stage2-force-nontma-benchmark"
+APP_NAME = os.environ.get("CPPMEGA_MODAL_APP_NAME", "cppmega-mamba3-stage2-force-nontma-benchmark")
+AUTO_ADD_BASELINE = os.environ.get("CPPMEGA_STAGE2_AUTO_BASELINE", "1") != "0"
 SOURCE_ROOT = "/opt/state-spaces-mamba"
 CPPMEGA_ROOT = "/opt/cppmega"
 BENCH_ROOT = "/benchmarks"
@@ -105,6 +106,17 @@ VARIANTS: dict[str, dict[str, Any]] = {
         "bb_threads": 256,
         "bb_num_stages": 0,
     },
+    "stage2_bf1_bb0_diag_reuse": {
+        "patch": "stage2_force_nontma_diag_reuse",
+        "patch_file": "mamba3_bwd_stage2_force_nontma.patch",
+        "diag_reuse_patch_file": "mamba3_bwd_stage2_diag_reuse.patch",
+        "flattened_inputs": True,
+        "flat_qk_dot": True,
+        "bf_threads": 128,
+        "bf_num_stages": 1,
+        "bb_threads": 256,
+        "bb_num_stages": 0,
+    },
     "stage2_bf0_bb1": {
         "patch": "stage2_force_nontma",
         "patch_file": "mamba3_bwd_stage2_force_nontma.patch",
@@ -129,6 +141,7 @@ def _image() -> modal.Image:
             "GHCR_REPO": GHCR_REPO,
             "GHCR_TAG": GHCR_TAG,
             "CPPMEGA_IMAGE_REF": GHCR_REF,
+            "CPPMEGA_STAGE2_AUTO_BASELINE": "1" if AUTO_ADD_BASELINE else "0",
         }
     )
     img = img.add_local_dir("cppmega", f"{CPPMEGA_ROOT}/cppmega", copy=True)
@@ -230,7 +243,7 @@ def _selected_variants(variant_csv: str) -> list[str]:
         variants.append(name)
     if not variants:
         raise ValueError("at least one variant is required")
-    if "baseline" not in variants:
+    if AUTO_ADD_BASELINE and "baseline" not in variants:
         variants.insert(0, "baseline")
     return variants
 
@@ -345,12 +358,20 @@ def _prepare_variant(variant: str) -> tuple[str, dict[str, Any]]:
     if patch_kind is None:
         return dst, meta
 
-    if patch_kind == "stage2_force_nontma":
+    if patch_kind in ("stage2_force_nontma", "stage2_force_nontma_diag_reuse"):
         patch_file = str(VARIANTS[variant].get("patch_file", "mamba3_bwd_stage2_force_nontma.patch"))
         patch_meta = _apply_patch(dst, patch_file)
         meta.update({"patch": patch_file, **patch_meta})
         if patch_meta["patch_rc"] != 0:
             return dst, meta
+        if patch_kind == "stage2_force_nontma_diag_reuse":
+            diag_patch_file = str(VARIANTS[variant].get("diag_reuse_patch_file", "mamba3_bwd_stage2_diag_reuse.patch"))
+            diag_patch_meta = _apply_patch(dst, diag_patch_file)
+            meta["diag_reuse_patch"] = diag_patch_file
+            meta["diag_reuse_patch_meta"] = diag_patch_meta
+            if diag_patch_meta["patch_rc"] != 0:
+                meta["patch_rc"] = diag_patch_meta["patch_rc"]
+                return dst, meta
         meta["replacement_counts"] = _apply_text_replacements(dst, [])
     else:
         patch_meta = _apply_patch(dst, "mamba3_bwd_layout_fix.patch")
@@ -925,33 +946,43 @@ def _strip_tensors(result: dict[str, Any]) -> dict[str, Any]:
 
 def _compare_shape(shape_result: dict[str, Any]) -> dict[str, Any]:
     variants = {entry["variant"]: entry for entry in shape_result["variants"]}
-    baseline = variants.get("baseline")
-    if not baseline or baseline.get("status") != "ok":
-        return {"status": "missing_ok_baseline"}
 
-    comparisons: dict[str, Any] = {"status": "ok", "vs_baseline": {}}
-    for variant_name, variant_result in variants.items():
-        if variant_name == "baseline":
-            continue
-        if variant_result.get("status") != "ok":
-            comparisons["vs_baseline"][variant_name] = {"status": "missing_ok_variant"}
-            continue
-        diffs = _compare_outputs(
-            Shape(**shape_result["shape"]),
-            baseline["correctness_outputs"],
-            variant_result["correctness_outputs"],
-        )
-        speedups: dict[str, float | None] = {}
-        for phase in ("bwd_fwd", "bwd_bwd", "chain"):
-            base_mean = baseline["elapsed"][phase]["mean_ms"]
-            cand_mean = variant_result["elapsed"][phase]["mean_ms"]
-            speedups[phase] = base_mean / cand_mean if cand_mean else None
-        comparisons["vs_baseline"][variant_name] = {
-            "status": "ok",
-            "speedup": speedups,
-            "diffs": diffs,
-            "max_main_grad_abs_diff": _max_main_grad_diff(diffs),
-        }
+    def compare_against(reference_name: str) -> dict[str, Any]:
+        reference = variants.get(reference_name)
+        if not reference or reference.get("status") != "ok":
+            return {"status": "missing_ok_reference", "reference": reference_name}
+
+        out: dict[str, Any] = {"status": "ok", "reference": reference_name, "variants": {}}
+        for variant_name, variant_result in variants.items():
+            if variant_name == reference_name:
+                continue
+            if variant_result.get("status") != "ok":
+                out["variants"][variant_name] = {"status": "missing_ok_variant"}
+                continue
+            diffs = _compare_outputs(
+                Shape(**shape_result["shape"]),
+                reference["correctness_outputs"],
+                variant_result["correctness_outputs"],
+            )
+            speedups: dict[str, float | None] = {}
+            for phase in ("bwd_fwd", "bwd_bwd", "chain"):
+                ref_mean = reference["elapsed"][phase]["mean_ms"]
+                cand_mean = variant_result["elapsed"][phase]["mean_ms"]
+                speedups[phase] = ref_mean / cand_mean if cand_mean else None
+            out["variants"][variant_name] = {
+                "status": "ok",
+                "speedup": speedups,
+                "diffs": diffs,
+                "max_main_grad_abs_diff": _max_main_grad_diff(diffs),
+            }
+        return out
+
+    comparisons: dict[str, Any] = {
+        "status": "ok",
+        "vs_baseline": compare_against("baseline"),
+    }
+    if "stage2_bf1_bb0" in variants:
+        comparisons["vs_stage2_bf1_bb0"] = compare_against("stage2_bf1_bb0")
     return comparisons
 
 
@@ -963,6 +994,7 @@ def _summarize_report(report: dict[str, Any]) -> dict[str, Any]:
             "status": shape_result["status"],
             "variants": {},
             "comparisons": shape_result.get("comparison", {}).get("vs_baseline", {}),
+            "comparisons_vs_stage2_bf1_bb0": shape_result.get("comparison", {}).get("vs_stage2_bf1_bb0", {}),
         }
         for variant in shape_result["variants"]:
             if variant.get("status") != "ok":
@@ -1018,7 +1050,7 @@ def _write_summary_csv(summary: dict[str, Any], csv_path: str) -> None:
         )
         writer.writeheader()
         for shape in summary["shapes"]:
-            comparisons = shape.get("comparisons", {})
+            comparisons = shape.get("comparisons", {}).get("variants", {})
             for variant, data in shape["variants"].items():
                 compare = comparisons.get(variant, {})
                 speedup = compare.get("speedup", {})
