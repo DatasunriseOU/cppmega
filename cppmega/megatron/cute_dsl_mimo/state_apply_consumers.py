@@ -394,6 +394,7 @@ class MultiChunkStateApplyConsumersWGMMA(StateApplyConsumersWGMMA):
         gSegsum: cute.Tensor,
         gQKDot: cute.Tensor,
         gGamma: cute.Tensor,
+        gD: cute.Tensor,
         gV: cute.Tensor,
         gMimoV: cute.Tensor,
         gDV: cute.Tensor,
@@ -416,6 +417,7 @@ class MultiChunkStateApplyConsumersWGMMA(StateApplyConsumersWGMMA):
         gSegsum_all = gSegsum[None, None, None]
         gQKDot_all = gQKDot[None, None, None, None]
         gGamma_all = gGamma[None, None]
+        direct_d = Float32(gD[0])
         gV_all = gV[None, None, None]
         gDV_all = gDV[None, None, None]
         nchunks = cute.size(gK_all.shape[0])
@@ -526,6 +528,7 @@ class MultiChunkStateApplyConsumersWGMMA(StateApplyConsumersWGMMA):
                 for r in cutlass.range_constexpr(4):
                     f = t * rank + r
                     dpsi = Float32(sState[f, p]) + Float32(sApply[f, p])
+                    dpsi += direct_d * Float32(sDPhT[p, f])
                     gamma = Float32(gGamma_c[t])
                     for r_out in cutlass.range_constexpr(4):
                         f_out = t * rank + r_out
@@ -545,6 +548,7 @@ class MultiChunkStateApplyConsumersWGMMA(StateApplyConsumersWGMMA):
                 for t in cutlass.range_constexpr(16):
                     f = t * rank + r
                     dpsi = Float32(sState[f, p]) + Float32(sApply[f, p])
+                    dpsi += direct_d * Float32(sDPhT[p, f])
                     gamma = Float32(gGamma_c[t])
                     for r_out in cutlass.range_constexpr(4):
                         f_out = t * rank + r_out
@@ -589,6 +593,7 @@ class MultiChunkStateApplyConsumersWGMMA(StateApplyConsumersWGMMA):
         mSegsum: cute.Tensor,
         mQKDot: cute.Tensor,
         mGamma: cute.Tensor,
+        mD: cute.Tensor,
         mV: cute.Tensor,
         mMimoV: cute.Tensor,
         mDV: cute.Tensor,
@@ -628,6 +633,7 @@ class MultiChunkStateApplyConsumersWGMMA(StateApplyConsumersWGMMA):
             mSegsum,
             mQKDot,
             mGamma,
+            mD,
             mV,
             mMimoV,
             mDV,
@@ -655,6 +661,7 @@ def run_multi_chunk_state_apply_consumers(
     segsum: object,
     qk_dot: object,
     gamma: object,
+    d: object,
     v: object,
     mimo_v: object,
     dv: object,
@@ -712,6 +719,14 @@ def run_multi_chunk_state_apply_consumers(
                 assumed_align=16,
             )
 
+        def fake_f32_1d(shape: tuple[int]) -> cute.Tensor:
+            return make_fake_tensor(
+                Float32,
+                shape,
+                stride=(1,),
+                assumed_align=16,
+            )
+
         def fake_f32_3d(shape: tuple[int, int, int]) -> cute.Tensor:
             return make_fake_tensor(
                 Float32,
@@ -731,6 +746,7 @@ def run_multi_chunk_state_apply_consumers(
             fake_f32_3d((nchunks, chunk_size, chunk_size)),
             fake_bf16_4d((nchunks, chunk_size, rank, rank)),
             fake_f32_2d((nchunks, chunk_size)),
+            fake_f32_1d((1,)),
             fake_bf16_3d((nchunks, chunk_size, dim)),
             fake_bf16_2d((rank, dim)),
             fake_f32_3d((nchunks, chunk_size, dim)),
@@ -750,6 +766,7 @@ def run_multi_chunk_state_apply_consumers(
         dl(segsum),
         dl(qk_dot),
         dl(gamma),
+        dl(d),
         dl(v),
         dl(mimo_v),
         dl(dv),

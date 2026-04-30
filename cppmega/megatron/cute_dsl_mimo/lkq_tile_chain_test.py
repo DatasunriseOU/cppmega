@@ -76,6 +76,7 @@ class MultiChunkInputs:
     segsum: torch.Tensor
     qk_dot: torch.Tensor
     gamma: torch.Tensor
+    d: torch.Tensor
     v: torch.Tensor
     mimo_v: torch.Tensor
 
@@ -168,6 +169,7 @@ def _make_multi_cases(seed: int, nchunks: int) -> list[MultiChunkInputs]:
         gamma=_structured3(nchunks, CHUNK_SIZE, 1, a=5, b=-3, c=0, mod=23, denom=128.0)
         .squeeze(-1)
         .contiguous(),
+        d=torch.tensor([0.125], dtype=torch.float32, device="cuda"),
         v=_structured3(nchunks, CHUNK_SIZE, P, a=7, b=2, c=5, mod=37, denom=64.0).to(torch.bfloat16),
         mimo_v=_structured(RANK, P, a=17, b=-3, mod=37, denom=64.0).to(torch.bfloat16),
     )
@@ -184,6 +186,7 @@ def _make_multi_cases(seed: int, nchunks: int) -> list[MultiChunkInputs]:
         segsum=(torch.randn(nchunks, CHUNK_SIZE, CHUNK_SIZE, dtype=torch.float32, device="cuda") * scale),
         qk_dot=(torch.randn(nchunks, CHUNK_SIZE, RANK, RANK, dtype=torch.bfloat16, device="cuda") * scale),
         gamma=(torch.randn(nchunks, CHUNK_SIZE, dtype=torch.float32, device="cuda") * scale),
+        d=(torch.randn(1, dtype=torch.float32, device="cuda") * scale),
         v=(torch.randn(nchunks, CHUNK_SIZE, P, dtype=torch.bfloat16, device="cuda") * scale),
         mimo_v=(torch.randn(RANK, P, dtype=torch.bfloat16, device="cuda") * scale),
     )
@@ -294,7 +297,8 @@ def _multi_reference(
         masked_lkq = _scaled_future_lkq(inputs.k[c], inputs.q[c], inputs.segsum[c])
         apply = (masked_lkq.float() @ inputs.dphi[c].float()).to(torch.bfloat16)
         qk_contrib = _qk_diag_contrib(inputs.qk_dot[c], inputs.gamma[c], inputs.dphi[c])
-        dpsi = state.float() + apply.float() + qk_contrib
+        d_contrib = inputs.d.float()[0] * inputs.dphi[c].float()
+        dpsi = state.float() + apply.float() + d_contrib + qk_contrib
         dv_c, dmimo_c = _scalar_consumers(dpsi, inputs.v[c], inputs.mimo_v)
         dv[c] = dv_c
         dmimo_v += dmimo_c
@@ -313,6 +317,12 @@ def _multi_reference(
         "qk_diag_checksum": float(
             sum(
                 _qk_diag_contrib(inputs.qk_dot[c], inputs.gamma[c], inputs.dphi[c]).sum()
+                for c in range(inputs.nchunks)
+            ).item()
+        ),
+        "d_direct_checksum": float(
+            sum(
+                (inputs.d.float()[0] * inputs.dphi[c].float()).sum()
                 for c in range(inputs.nchunks)
             ).item()
         ),
@@ -472,6 +482,7 @@ def _run_case_multi_chunk_fused(
         inputs.segsum.contiguous(),
         inputs.qk_dot.contiguous(),
         inputs.gamma.contiguous(),
+        inputs.d.contiguous(),
         inputs.v.contiguous(),
         inputs.mimo_v.contiguous(),
         dv,
@@ -496,6 +507,7 @@ def _run_case_multi_chunk_fused(
         "dA_state_scaling": "state = BF16((K @ BF16(carry).T) * exp(dA_cs_rev[t]))",
         "segsum_lkq_scaling": "masked LKQ = BF16((K @ Q.T) * exp(segsum[col_t,row_t])) for row_t < col_t",
         "qk_diag_contribution": "dpsi[t,r,p] += gamma[t] * sum_o qk_dot[t,o,r] * dPhi[t,o,p]",
+        "d_direct_contribution": "dpsi[f,p] += D * dPhi[f,p] before DV/DMIMO_V consumers",
         "remaining_global": [
             "DV FP32 output tensor for all chunks",
             "DMIMO_V FP32 output tile",
@@ -512,6 +524,7 @@ def _run_case_multi_chunk_fused(
         "ref_dmimo_v_row0": [float(x) for x in ref["dmimo_v"][0, :4].tolist()],
         "dpsi_checksums_rev": ref["dpsi_checksums_rev"],
         "qk_diag_checksum": ref["qk_diag_checksum"],
+        "d_direct_checksum": ref["d_direct_checksum"],
     }
 
 
@@ -694,6 +707,7 @@ def _time_chain_multi_chunk_fused(
             inputs.segsum,
             inputs.qk_dot,
             inputs.gamma,
+            inputs.d,
             inputs.v,
             inputs.mimo_v,
             dv,
@@ -746,7 +760,7 @@ def run_lkq_tile_chain(
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the CuTe LKQ tile chain probe")
 
-    print("Wave 10: CuTe LKQ/state chain with bounded multi-chunk scan owner + qk/dA scaling")
+    print("Wave 29: CuTe LKQ/state chain with bounded multi-chunk scan owner + qk/dA/D scaling")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"shape: chunk={CHUNK_SIZE} rank={RANK} fcs={FCS} N={N} P={P}")
     print(f"atol: {atol}")
@@ -768,9 +782,11 @@ def run_lkq_tile_chain(
     print(f"wave8_multi_chunk_counts: {list(multi_chunk_counts)}")
     print("wave9_multi_chunk_semantics: same-time qk_dot/gamma contribution included in fused consumers")
     print("wave10_multi_chunk_semantics: dA_cs_rev state scale, segsum LKQ scale, scaled carry update")
+    print("wave29_multi_chunk_semantics: direct D*dPhi contribution included in fused consumers")
 
     mask_bf16 = _future_mask_bf16()
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    torch.cuda.reset_peak_memory_stats()
 
     # Compile the shared 64x64x64 tile before collecting case diagnostics.
     t0 = time.time()
@@ -866,6 +882,7 @@ def run_lkq_tile_chain(
             print(f"  dA_state_scaling: {multi_result['dA_state_scaling']}")
             print(f"  segsum_lkq_scaling: {multi_result['segsum_lkq_scaling']}")
             print(f"  qk_diag_contribution: {multi_result['qk_diag_contribution']}")
+            print(f"  d_direct_contribution: {multi_result['d_direct_contribution']}")
             print(f"  dv_chunk0_row0[:4]: {multi_result['dv_chunk0_row0']}")
             print(f"  ref_chunk0_row0[:4]: {multi_result['ref_dv_chunk0_row0']}")
             print(f"  dmimo_v_row0[:4]: {multi_result['dmimo_v_row0']}")
@@ -936,6 +953,13 @@ def run_lkq_tile_chain(
         )
 
     print(f"{'PASS' if passed else 'FAIL'}: LKQ/state chain correctness")
+    peak_allocated_bytes = int(torch.cuda.max_memory_allocated())
+    peak_reserved_bytes = int(torch.cuda.max_memory_reserved())
+    print(
+        "peak_cuda_memory: "
+        f"allocated={peak_allocated_bytes / (1024 ** 2):.2f} MiB "
+        f"reserved={peak_reserved_bytes / (1024 ** 2):.2f} MiB"
+    )
     return {
         "passed": bool(passed),
         "atol": atol,
@@ -956,11 +980,12 @@ def run_lkq_tile_chain(
         },
         "lkq_global_materialized_for_tested_fused_path": False,
         "state_apply_global_materialized_for_fused_consumer_path": False,
+        "d_direct_contribution_for_multi_chunk_path": True,
         "fused_path_remaining_global": [
             "Wave6 path: state BF16 tile from scalar-copy CuTe GEMM",
             "Wave6 path: apply BF16 tile output from fused masked-apply kernel",
             "Wave7 path: DV and DMIMO_V final FP32 output tiles only",
-            "Wave10 path: DV FP32 tensor for all chunks and accumulated DMIMO_V FP32 tile only",
+            "Wave29 path: DV FP32 tensor for all chunks and accumulated DMIMO_V FP32 tile only",
             "Harness input-layout tensors: DStates.T and DPh.T",
             "Wave8 harness input-layout tensors: Q.T and DPh.T",
         ],
@@ -977,6 +1002,12 @@ def run_lkq_tile_chain(
         "fused_consumer_cases": fused_consumer_cases,
         "multi_chunk_cases": multi_chunk_cases,
         "multi_chunk_compile_plus_correctness_s": multi_compile_s,
+        "peak_cuda_memory": {
+            "allocated_bytes": peak_allocated_bytes,
+            "allocated_mib": peak_allocated_bytes / (1024 ** 2),
+            "reserved_bytes": peak_reserved_bytes,
+            "reserved_mib": peak_reserved_bytes / (1024 ** 2),
+        },
         "timings": timings,
     }
 
