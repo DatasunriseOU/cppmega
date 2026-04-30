@@ -1,7 +1,7 @@
-"""Fused CuTe tile for state/apply plus DV/DMIMO_V consumers.
+"""Fused CuTe tiles for state/apply plus DV/DMIMO_V consumers.
 
-This is the next bounded scan-owner probe after ``masked_lkq_apply``.  It keeps
-the three 64x64 BF16 WGMMA products in one CTA:
+The one-chunk tile is the next bounded scan-owner probe after
+``masked_lkq_apply``.  It keeps the three 64x64 BF16 WGMMA products in one CTA:
 
   1. state = K @ DStates
   2. lkq   = future_mask(K @ Q.T)
@@ -11,6 +11,12 @@ the three 64x64 BF16 WGMMA products in one CTA:
 5/6 tile-chain semantics, but neither tile is written to global memory.  The
 kernel then computes the scalar DV and DMIMO_V consumers in-kernel and writes
 only those final FP32 outputs.
+
+The multi-chunk tile extends that path into a reverse scan owner.  It carries
+``DStates.T`` in registers as ``carry_t`` so it can be spilled directly as the
+WGMMA B operand for the next chunk's ``K @ DStates`` product:
+
+  carry_t += dPhi.T @ Q
 """
 
 from __future__ import annotations
@@ -231,6 +237,7 @@ class StateApplyConsumersWGMMA:
 
 
 _CACHE: dict[tuple[int, int, int], object] = {}
+_CACHE_MULTI: dict[tuple[int, int, int, int], object] = {}
 
 
 def run_state_apply_consumers(
@@ -291,6 +298,307 @@ def run_state_apply_consumers(
         dl(k),
         dl(q),
         dl(dstates_t),
+        dl(dphi_t),
+        dl(v),
+        dl(mimo_v),
+        dl(dv),
+        dl(dmimo_v),
+        stream,
+    )
+
+
+class MultiChunkStateApplyConsumersWGMMA(StateApplyConsumersWGMMA):
+    """One-CTA reverse scan-owner prototype for a fixed small chunk count."""
+
+    @cute.kernel
+    def kernel(
+        self,
+        gK: cute.Tensor,
+        gQ: cute.Tensor,
+        gQT: cute.Tensor,
+        gDPhT: cute.Tensor,
+        gV: cute.Tensor,
+        gMimoV: cute.Tensor,
+        gDV: cute.Tensor,
+        gDMimoV: cute.Tensor,
+        tiled_mma: cute.TiledMma,
+        s_layout: cute.ComposedLayout,
+        copy_g2s: cute.TiledCopy,
+    ) -> None:
+        tidx = arch.thread_idx()[0]
+        dim = self.dim
+        rank = self.rank
+        chunk_size = self.chunk_size
+
+        gK_all = gK[None, None, None]
+        gQ_all = gQ[None, None, None]
+        gQT_all = gQT[None, None, None]
+        gDPhT_all = gDPhT[None, None, None]
+        gV_all = gV[None, None, None]
+        gDV_all = gDV[None, None, None]
+        nchunks = cute.size(gK_all.shape[0])
+
+        smem = SmemAllocator()
+        sK = smem.allocate_tensor(self.dtype, s_layout.outer, swizzle=s_layout.inner)
+        sQ = smem.allocate_tensor(self.dtype, s_layout.outer, swizzle=s_layout.inner)
+        sQT = smem.allocate_tensor(self.dtype, s_layout.outer, swizzle=s_layout.inner)
+        sDPhT = smem.allocate_tensor(self.dtype, s_layout.outer, swizzle=s_layout.inner)
+        sCarryT = smem.allocate_tensor(self.dtype, s_layout.outer, swizzle=s_layout.inner)
+
+        # After producer operands are consumed:
+        #   sK becomes BF16 state
+        #   sQ first holds BF16 masked LKQ, then BF16 apply
+        sState = sK
+        sLKQ = sQ
+        sApply = sQ
+
+        thr_g2s = copy_g2s.get_slice(tidx)
+        wg_mma = tiled_mma.get_slice(tidx)
+        shape_mnk = (dim, dim, dim)
+
+        # carry_t stores DStates.T as (P, N), matching the WGMMA B operand for
+        # state = K @ DStates.  It starts at zero for the bounded production
+        # scan prototype and is updated after each reverse chunk.
+        acc_carry_t = cute.make_rmem_tensor(
+            wg_mma.partition_shape_C((dim, dim)), Float32
+        )
+        acc_carry_t.fill(0.0)
+
+        for tile in cutlass.range_constexpr(2):
+            linear = tile * self.num_threads + tidx
+            r = linear // dim
+            p = linear - r * dim
+            gDMimoV[r, p] = Float32(0.0)
+        arch.sync_threads()
+
+        for chunk_rev in cutlass.range(nchunks, unroll=1):
+            chunk_idx = nchunks - 1 - chunk_rev
+
+            gK_c = gK_all[chunk_idx, None, None]
+            gQ_c = gQ_all[chunk_idx, None, None]
+            gQT_c = gQT_all[chunk_idx, None, None]
+            gDPhT_c = gDPhT_all[chunk_idx, None, None]
+
+            cute.copy(copy_g2s, thr_g2s.partition_S(gK_c), thr_g2s.partition_D(sK))
+            cute.copy(copy_g2s, thr_g2s.partition_S(gQ_c), thr_g2s.partition_D(sQ))
+            cute.copy(copy_g2s, thr_g2s.partition_S(gQT_c), thr_g2s.partition_D(sQT))
+            cute.copy(copy_g2s, thr_g2s.partition_S(gDPhT_c), thr_g2s.partition_D(sDPhT))
+            arch.sync_threads()
+
+            self._spill_acc_bf16(tiled_mma, acc_carry_t, sCarryT, tidx, True)
+            arch.fence_view_async_shared()
+            arch.sync_threads()
+
+            # GEMM1: state = K @ carry, where sCarryT holds carry.T.
+            _, tA_state, tB_state = sm90_utils.partition_fragment_ABC(
+                wg_mma, shape_mnk, sK, sCarryT
+            )
+            acc_state = cute.make_rmem_tensor(wg_mma.partition_shape_C((dim, dim)), Float32)
+            sm90_utils.gemm(tiled_mma, acc_state, tA_state, tB_state, zero_init=True, wg_wait=0)
+
+            # GEMM2: LKQ = K @ Q.T, masked before BF16 shared-memory spill.
+            _, tA_lkq, tB_lkq = sm90_utils.partition_fragment_ABC(
+                wg_mma, shape_mnk, sK, sQ
+            )
+            acc_lkq = cute.make_rmem_tensor(wg_mma.partition_shape_C((dim, dim)), Float32)
+            sm90_utils.gemm(tiled_mma, acc_lkq, tA_lkq, tB_lkq, zero_init=True, wg_wait=0)
+
+            coord_lkq = wg_mma.partition_C(cute.make_identity_tensor((dim, dim)))
+            self._apply_future_mask(acc_lkq, coord_lkq)
+
+            self._spill_acc_bf16(tiled_mma, acc_state, sState, tidx, True)
+            self._spill_acc_bf16(tiled_mma, acc_lkq, sLKQ, tidx, True)
+            arch.fence_view_async_shared()
+            arch.sync_threads()
+
+            # GEMM3: apply = masked(LKQ) @ dPhi == masked(LKQ) @ DPhT.T.
+            _, tA_apply, tB_apply = sm90_utils.partition_fragment_ABC(
+                wg_mma, shape_mnk, sLKQ, sDPhT
+            )
+            acc_apply = cute.make_rmem_tensor(wg_mma.partition_shape_C((dim, dim)), Float32)
+            sm90_utils.gemm(tiled_mma, acc_apply, tA_apply, tB_apply, zero_init=True, wg_wait=0)
+
+            self._spill_acc_bf16(tiled_mma, acc_apply, sApply, tidx, True)
+            arch.fence_view_async_shared()
+            arch.sync_threads()
+
+            gDV_c = gDV_all[chunk_idx, None, None]
+            gV_c = gV_all[chunk_idx, None, None]
+
+            for tile in cutlass.range_constexpr(8):
+                linear = tile * self.num_threads + tidx
+                t = linear // dim
+                p = linear - t * dim
+                acc = Float32(0.0)
+                for r in cutlass.range_constexpr(4):
+                    f = t * rank + r
+                    dpsi = Float32(sState[f, p]) + Float32(sApply[f, p])
+                    acc += dpsi * Float32(gMimoV[r, p])
+                gDV_c[t, p] = acc
+
+            for tile in cutlass.range_constexpr(2):
+                linear = tile * self.num_threads + tidx
+                r = linear // dim
+                p = linear - r * dim
+                acc = Float32(0.0)
+                for t in cutlass.range_constexpr(16):
+                    f = t * rank + r
+                    dpsi = Float32(sState[f, p]) + Float32(sApply[f, p])
+                    acc += dpsi * Float32(gV_c[t, p])
+                gDMimoV[r, p] = Float32(gDMimoV[r, p]) + acc
+
+            arch.sync_threads()
+
+            # Loop-carried update for the next older chunk:
+            # carry_t += dPhi.T @ Q.  Q_T is a harness-side transpose used to
+            # keep the B operand K-major and avoid the MN-major smem descriptor
+            # issue already hit in the wider P4 prototype.
+            _, tA_carry, tB_carry = sm90_utils.partition_fragment_ABC(
+                wg_mma, shape_mnk, sDPhT, sQT
+            )
+            sm90_utils.gemm(
+                tiled_mma,
+                acc_carry_t,
+                tA_carry,
+                tB_carry,
+                zero_init=False,
+                wg_wait=0,
+            )
+            arch.sync_threads()
+
+    @cute.jit
+    def __call__(
+        self,
+        mK: cute.Tensor,
+        mQ: cute.Tensor,
+        mQT: cute.Tensor,
+        mDPhT: cute.Tensor,
+        mV: cute.Tensor,
+        mMimoV: cute.Tensor,
+        mDV: cute.Tensor,
+        mDMimoV: cute.Tensor,
+        stream: cuda.CUstream,
+    ) -> None:
+        dim = self.dim
+        tiled_mma = sm90_utils_basic.make_trivial_tiled_mma(
+            self.dtype,
+            self.dtype,
+            warpgroup.OperandMajorMode.K,
+            warpgroup.OperandMajorMode.K,
+            Float32,
+            (1, 1, 1),
+            (dim, dim),
+            warpgroup.OperandSource.SMEM,
+        )
+        s_layout = sm90_utils.make_smem_layout(
+            self.dtype,
+            LayoutEnum.ROW_MAJOR,
+            (dim, dim),
+        )
+        copy_g2s = _make_row_major_tiled_copy(
+            self.dtype,
+            dim,
+            self.num_threads,
+            copy_bits=self.dtype.width,
+        )
+
+        self.kernel(
+            mK,
+            mQ,
+            mQT,
+            mDPhT,
+            mV,
+            mMimoV,
+            mDV,
+            mDMimoV,
+            tiled_mma,
+            s_layout,
+            copy_g2s,
+        ).launch(
+            grid=(1, 1, 1),
+            block=(self.num_threads, 1, 1),
+            stream=stream,
+        )
+
+
+def run_multi_chunk_state_apply_consumers(
+    dim: int,
+    rank: int,
+    chunk_size: int,
+    k: object,
+    q: object,
+    q_t: object,
+    dphi_t: object,
+    v: object,
+    mimo_v: object,
+    dv: object,
+    dmimo_v: object,
+    stream: cuda.CUstream,
+) -> None:
+    nchunks = int(k.shape[0])
+    if (dim, rank, chunk_size) != (64, 4, 16):
+        raise ValueError(
+            "MultiChunkStateApplyConsumersWGMMA currently specializes dim=64, rank=4, chunk_size=16"
+        )
+    if nchunks not in (2, 4, 8):
+        raise ValueError("multi-chunk prototype currently supports nchunks in {2, 4, 8}")
+
+    key = (dim, rank, chunk_size, nchunks)
+    compiled = _CACHE_MULTI.get(key)
+    if compiled is None:
+        obj = MultiChunkStateApplyConsumersWGMMA(dim, rank, chunk_size, BFloat16)
+
+        def fake_bf16_2d(shape: tuple[int, int]) -> cute.Tensor:
+            return make_fake_tensor(
+                BFloat16,
+                shape,
+                stride=(shape[1], 1),
+                assumed_align=16,
+            )
+
+        def fake_bf16_3d(shape: tuple[int, int, int]) -> cute.Tensor:
+            return make_fake_tensor(
+                BFloat16,
+                shape,
+                stride=(shape[1] * shape[2], shape[2], 1),
+                assumed_align=16,
+            )
+
+        def fake_f32_2d(shape: tuple[int, int]) -> cute.Tensor:
+            return make_fake_tensor(
+                Float32,
+                shape,
+                stride=(shape[1], 1),
+                assumed_align=16,
+            )
+
+        def fake_f32_3d(shape: tuple[int, int, int]) -> cute.Tensor:
+            return make_fake_tensor(
+                Float32,
+                shape,
+                stride=(shape[1] * shape[2], shape[2], 1),
+                assumed_align=16,
+            )
+
+        compiled = cute.compile(
+            obj,
+            fake_bf16_3d((nchunks, dim, dim)),
+            fake_bf16_3d((nchunks, dim, dim)),
+            fake_bf16_3d((nchunks, dim, dim)),
+            fake_bf16_3d((nchunks, dim, dim)),
+            fake_bf16_3d((nchunks, chunk_size, dim)),
+            fake_bf16_2d((rank, dim)),
+            fake_f32_3d((nchunks, chunk_size, dim)),
+            fake_f32_2d((rank, dim)),
+            stream,
+        )
+        _CACHE_MULTI[key] = compiled
+
+    dl = lambda tensor: from_dlpack(tensor, assumed_align=16)
+    compiled(
+        dl(k),
+        dl(q),
+        dl(q_t),
         dl(dphi_t),
         dl(v),
         dl(mimo_v),

@@ -5,7 +5,8 @@ Modes:
     quack-kernels, then reports import viability.
   * ``cute-gemm`` runs the existing single-GEMM CuTe DSL WGMMA smoke on H200.
   * ``cute-lkq-chain`` runs the LKQ/state CuTe probe, including the Wave 6
-    fused masked-apply tile and Wave 7 fused state/apply consumer path.
+    fused masked-apply tile, Wave 7 fused state/apply consumer path, and Wave 8
+    bounded multi-chunk scan-owner path.
   * ``quack-gemm`` runs a minimal CuTe DSL WGMMA GEMM through quack-kernels.
   * ``wmma-smoke`` runs the CUDA WMMA fallback correctness and timing probe.
 """
@@ -25,7 +26,7 @@ GHCR_TAG = os.environ.get("GHCR_TAG", "785c3fd")
 GHCR_REF = f"{GHCR_REPO}:{GHCR_TAG}"
 GPU_SPEC = os.environ.get("CPPMEGA_MODAL_GPU", "H200")
 CPPMEGA_ROOT = "/opt/cppmega"
-APP_SUFFIX = os.environ.get("CPPMEGA_MODAL_APP_SUFFIX", "wave7-lane-b")
+APP_SUFFIX = os.environ.get("CPPMEGA_MODAL_APP_SUFFIX", "wave8-lane-b")
 DEFAULT_APP_NAME = "cppmega-mamba3-mono-chunk-" + "-".join(
     re.sub(r"[^0-9A-Za-z]+", "-", part).strip("-").lower()
     for part in (APP_SUFFIX, GPU_SPEC)
@@ -216,7 +217,7 @@ def cute_lkq_chain_h200(iters: int = 100, warmup: int = 10) -> dict[str, Any]:
         "passed": bool(result.get("passed", False)),
         "result": result,
         "error": error,
-        "output": stdout.getvalue()[-16000:],
+        "output": stdout.getvalue()[-24000:],
     }
 
 
