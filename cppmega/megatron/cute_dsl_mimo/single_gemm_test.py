@@ -8,6 +8,7 @@ import os
 os.environ.setdefault('CUTE_DSL_ARCH', 'sm_90a')
 os.environ.setdefault('CUDA_VISIBLE_DEVICES', '1')
 
+import math
 import torch
 import time
 
@@ -24,6 +25,34 @@ import cutlass.utils.hopper_helpers as sm90_utils_basic
 from quack import sm90_utils, copy_utils
 
 import cuda.bindings.driver as cuda
+
+
+def _make_row_major_tiled_copy(
+    dtype, major_mode_size: int, num_threads: int, copy_bits: int = 128
+):
+    """Build a 2D row-major copy tiler matching CuTe DSL 4.4.x examples."""
+    copy_elems = copy_bits // dtype.width
+    if major_mode_size % copy_elems != 0:
+        raise ValueError(
+            f"major_mode_size={major_mode_size} must be divisible by copy_elems={copy_elems}"
+        )
+    loads_per_cache_line = 128 * 8 // copy_bits
+    threads_per_row = major_mode_size // copy_elems
+    if threads_per_row > loads_per_cache_line:
+        threads_per_row = math.gcd(threads_per_row, loads_per_cache_line)
+    if num_threads % threads_per_row != 0:
+        raise ValueError(
+            f"num_threads={num_threads} must be divisible by threads_per_row={threads_per_row}"
+        )
+    copy_atom = cute.make_copy_atom(
+        CopyUniversalOp(), dtype, num_bits_per_copy=copy_bits
+    )
+    thread_layout = cute.make_layout(
+        (num_threads // threads_per_row, threads_per_row),
+        stride=(threads_per_row, 1),
+    )
+    value_layout = cute.make_layout((1, copy_elems))
+    return cute.make_tiled_copy_tv(copy_atom, thread_layout, value_layout)
 
 
 class SingleGemmWGMMA:
@@ -43,7 +72,7 @@ class SingleGemmWGMMA:
         tiled_mma: cute.TiledMma,
         sA_layout: cute.ComposedLayout,
         sB_layout: cute.ComposedLayout,
-        sC_layout: cute.Layout,
+        sC_layout: cute.ComposedLayout,
         copy_g2s: cute.TiledCopy,
         copy_s2g: cute.TiledCopy,
     ):
@@ -109,17 +138,15 @@ class SingleGemmWGMMA:
         sB_layout = sm90_utils.make_smem_layout(
             self.dtype, LayoutEnum.ROW_MAJOR, (N, K)
         )
-        sC_layout = cute.make_layout((M, N), stride=(N, 1))
+        sC_layout = sm90_utils.make_smem_layout(
+            self.dtype, LayoutEnum.ROW_MAJOR, (M, N)
+        )
 
-        vec = 128 // self.dtype.width  # 8
-        copy_atom = cute.make_copy_atom(
-            CopyUniversalOp(), self.dtype, num_bits_per_copy=128
+        copy_g2s = _make_row_major_tiled_copy(
+            self.dtype, K, self.num_threads, copy_bits=128
         )
-        copy_g2s = cute.make_tiled_copy_tv(
-            copy_atom, cute.make_layout(self.num_threads), cute.make_layout(vec)
-        )
-        copy_s2g = cute.make_tiled_copy_tv(
-            copy_atom, cute.make_layout(self.num_threads), cute.make_layout(vec)
+        copy_s2g = _make_row_major_tiled_copy(
+            self.dtype, N, self.num_threads, copy_bits=128
         )
 
         self.kernel(
