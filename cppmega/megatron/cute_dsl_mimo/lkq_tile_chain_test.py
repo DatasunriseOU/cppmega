@@ -11,8 +11,9 @@ CTA:
   4. dpsi = state + apply
   5. DV / DMIMO_V scalar consumers from dpsi
 
-The intermediate LKQ and apply tiles are BF16 to mirror the current
-register-to-shared spill boundary used by the CuTe prototypes.
+The scalar correctness mode keeps the Wave 5 LKQ/masked-LKQ global tensors.
+The fused mode uses a two-WGMMA CuTe tile for ``future_mask(lkq) @ dPhi`` so
+LKQ is only spilled to swizzled shared memory inside the kernel.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 import cuda.bindings.driver as cuda
 import torch
 
+from cppmega.megatron.cute_dsl_mimo.masked_lkq_apply import run_masked_lkq_apply
 from cppmega.megatron.cute_dsl_mimo.single_gemm_test import run_single_gemm
 
 
@@ -135,7 +137,7 @@ def _reference(inputs: ChainInputs, mask_bf16: torch.Tensor) -> dict[str, torch.
     }
 
 
-def _run_case(
+def _run_case_scalar(
     inputs: ChainInputs,
     mask_bf16: torch.Tensor,
     stream: cuda.CUstream,
@@ -162,9 +164,56 @@ def _run_case(
         "dmimo_v": _max_abs(dmimo_v, ref["dmimo_v"]),
     }
     return {
+        "mode": "scalar_copy_cute_tiles_plus_torch_mask",
+        "lkq_global_materialized": True,
         "diffs": diffs,
         "ideal_dpsi_max_abs": _max_abs(dpsi, ref["ideal_dpsi"]),
         "lkq_checksum": float(lkq.float().sum().item()),
+        "dpsi_checksum": float(dpsi.float().sum().item()),
+        "dpsi_row0": [float(x) for x in dpsi[0, :4].tolist()],
+        "ref_dpsi_row0": [float(x) for x in ref["dpsi"][0, :4].tolist()],
+    }
+
+
+def _run_case_fused_masked_apply(
+    inputs: ChainInputs,
+    mask_bf16: torch.Tensor,
+    stream: cuda.CUstream,
+) -> dict[str, Any]:
+    state = _run_tile(inputs.k, inputs.dstates.T.contiguous(), stream)
+    apply = torch.empty((FCS, P), dtype=torch.bfloat16, device="cuda")
+    run_masked_lkq_apply(
+        FCS,
+        RANK,
+        inputs.k.contiguous(),
+        inputs.q.contiguous(),
+        inputs.dphi.T.contiguous(),
+        apply,
+        stream,
+    )
+    torch.cuda.synchronize()
+
+    dpsi = state.float() + apply.float()
+    dv, dmimo_v = _scalar_consumers(dpsi, inputs.v, inputs.mimo_v)
+    ref = _reference(inputs, mask_bf16)
+
+    diffs = {
+        "state": _max_abs(state, ref["state"]),
+        "apply": _max_abs(apply, ref["apply"]),
+        "dpsi": _max_abs(dpsi, ref["dpsi"]),
+        "dv": _max_abs(dv, ref["dv"]),
+        "dmimo_v": _max_abs(dmimo_v, ref["dmimo_v"]),
+    }
+    return {
+        "mode": "state_scalar_plus_fused_masked_lkq_apply",
+        "lkq_global_materialized": False,
+        "remaining_global": [
+            "state BF16 tile from scalar-copy CuTe GEMM",
+            "apply BF16 tile output from fused masked-apply kernel",
+            "dpsi/DV/DMIMO_V torch-side scalar correctness consumers",
+        ],
+        "diffs": diffs,
+        "ideal_dpsi_max_abs": _max_abs(dpsi, ref["ideal_dpsi"]),
         "dpsi_checksum": float(dpsi.float().sum().item()),
         "dpsi_row0": [float(x) for x in dpsi[0, :4].tolist()],
         "ref_dpsi_row0": [float(x) for x in ref["dpsi"][0, :4].tolist()],
@@ -222,6 +271,49 @@ def _time_chain(
     }
 
 
+def _time_chain_fused_masked_apply(
+    inputs: ChainInputs,
+    stream: cuda.CUstream,
+    *,
+    warmup: int,
+    iters: int,
+) -> dict[str, Any]:
+    state = torch.empty((FCS, P), dtype=torch.bfloat16, device="cuda")
+    apply = torch.empty((FCS, P), dtype=torch.bfloat16, device="cuda")
+    dstates_t = inputs.dstates.T.contiguous()
+    dphi_t = inputs.dphi.T.contiguous()
+
+    def launch_once() -> None:
+        run_single_gemm(FCS, P, N, inputs.k, dstates_t, state, stream)
+        run_masked_lkq_apply(FCS, RANK, inputs.k, inputs.q, dphi_t, apply, stream)
+
+    for _ in range(warmup):
+        launch_once()
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        launch_once()
+    end.record()
+    torch.cuda.synchronize()
+
+    elapsed_us = start.elapsed_time(end) * 1000.0
+    per_iter_us = elapsed_us / iters
+    flops = 2 * FCS * P * N + 2 * FCS * FCS * N + 2 * FCS * P * FCS
+    return {
+        "mode": "state_scalar_plus_fused_masked_lkq_apply",
+        "warmup": warmup,
+        "iters": iters,
+        "chain_us": per_iter_us,
+        "estimated_tile_flops": flops,
+        "estimated_tile_tflops": float(flops / (per_iter_us * 1e-6) / 1e12),
+        "lkq_global_materialized": False,
+        "launches_per_chain": 2,
+    }
+
+
 def run_lkq_tile_chain(
     *,
     seed: int = 20260430,
@@ -232,11 +324,12 @@ def run_lkq_tile_chain(
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the CuTe LKQ tile chain probe")
 
-    print("Wave 5: CuTe LKQ/state tile chain from scalar-copy 64x64 BF16 GEMM")
+    print("Wave 6: CuTe LKQ/state chain with fused masked-apply tile")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"shape: chunk={CHUNK_SIZE} rank={RANK} fcs={FCS} N={N} P={P}")
     print(f"atol: {atol}")
     print(f"copy_strategy: scalar BF16 universal copies inherited from SingleGemmWGMMA")
+    print("fused_path: LKQ is R2S-spilled to swizzled smem only, no LKQ gmem output")
 
     mask_bf16 = _future_mask_bf16()
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -246,45 +339,93 @@ def run_lkq_tile_chain(
     first = _make_cases(seed)[0]
     warm = torch.empty((FCS, FCS), dtype=torch.bfloat16, device="cuda")
     run_single_gemm(FCS, FCS, N, first.k, first.q, warm, stream)
+    fused_warm = torch.empty((FCS, P), dtype=torch.bfloat16, device="cuda")
+    run_masked_lkq_apply(
+        FCS,
+        RANK,
+        first.k.contiguous(),
+        first.q.contiguous(),
+        first.dphi.T.contiguous(),
+        fused_warm,
+        stream,
+    )
     torch.cuda.synchronize()
     compile_s = time.time() - t0
-    print(f"compile_plus_first_lkq_launch_s: {compile_s:.3f}")
+    print(f"compile_plus_first_lkq_and_fused_apply_launch_s: {compile_s:.3f}")
 
-    cases: dict[str, Any] = {}
+    scalar_cases: dict[str, Any] = {}
+    fused_cases: dict[str, Any] = {}
     passed = True
     for case in _make_cases(seed):
-        result = _run_case(case, mask_bf16, stream)
-        cases[case.name] = result
-        case_pass = all(value <= atol for value in result["diffs"].values())
-        passed = passed and case_pass
-        print(f"Case {case.name}: {'PASS' if case_pass else 'FAIL'}")
-        for name, value in result["diffs"].items():
+        scalar_result = _run_case_scalar(case, mask_bf16, stream)
+        scalar_cases[case.name] = scalar_result
+        scalar_pass = all(value <= atol for value in scalar_result["diffs"].values())
+        passed = passed and scalar_pass
+        print(f"Scalar case {case.name}: {'PASS' if scalar_pass else 'FAIL'}")
+        for name, value in scalar_result["diffs"].items():
             print(f"  {name}: max_abs={value:.6f}")
-        print(f"  dpsi_row0[:4]: {result['dpsi_row0']}")
-        print(f"  ref_row0[:4]:  {result['ref_dpsi_row0']}")
-        print(f"  ideal_dpsi_bf16_chain_delta={result['ideal_dpsi_max_abs']:.6f}")
+        print(f"  dpsi_row0[:4]: {scalar_result['dpsi_row0']}")
+        print(f"  ref_row0[:4]:  {scalar_result['ref_dpsi_row0']}")
+        print(f"  ideal_dpsi_bf16_chain_delta={scalar_result['ideal_dpsi_max_abs']:.6f}")
+
+        fused_result = _run_case_fused_masked_apply(case, mask_bf16, stream)
+        fused_cases[case.name] = fused_result
+        fused_pass = all(value <= atol for value in fused_result["diffs"].values())
+        passed = passed and fused_pass
+        print(f"Fused masked-apply case {case.name}: {'PASS' if fused_pass else 'FAIL'}")
+        for name, value in fused_result["diffs"].items():
+            print(f"  {name}: max_abs={value:.6f}")
+        print(f"  lkq_global_materialized: {fused_result['lkq_global_materialized']}")
+        print(f"  dpsi_row0[:4]: {fused_result['dpsi_row0']}")
+        print(f"  ref_row0[:4]:  {fused_result['ref_dpsi_row0']}")
+        print(f"  ideal_dpsi_bf16_chain_delta={fused_result['ideal_dpsi_max_abs']:.6f}")
 
     timings = None
     if bench_iters > 0:
-        timings = _time_chain(
-            _make_cases(seed)[-1],
+        timing_case = _make_cases(seed)[-1]
+        scalar_timing = _time_chain(
+            timing_case,
             mask_bf16,
             stream,
             warmup=bench_warmup,
             iters=bench_iters,
         )
+        fused_timing = _time_chain_fused_masked_apply(
+            timing_case,
+            stream,
+            warmup=bench_warmup,
+            iters=bench_iters,
+        )
+        timings = {
+            "scalar_copy": scalar_timing,
+            "fused_masked_apply": fused_timing,
+        }
         print(
-            f"Timing: {timings['chain_us']:.3f} us/chain "
+            f"Scalar timing: {scalar_timing['chain_us']:.3f} us/chain "
             f"({bench_iters} iters, includes torch mask)"
         )
-        print(f"Estimated tile throughput: {timings['estimated_tile_tflops']:.4f} TFLOP/s")
+        print(
+            f"Fused masked-apply timing: {fused_timing['chain_us']:.3f} us/chain "
+            f"({bench_iters} iters, no LKQ gmem/torch mask)"
+        )
+        print(
+            "Estimated tile throughput: "
+            f"scalar={scalar_timing['estimated_tile_tflops']:.4f} TFLOP/s "
+            f"fused={fused_timing['estimated_tile_tflops']:.4f} TFLOP/s"
+        )
 
     print(f"{'PASS' if passed else 'FAIL'}: LKQ/state chain correctness")
     return {
         "passed": bool(passed),
         "atol": atol,
-        "compile_plus_first_lkq_launch_s": compile_s,
+        "compile_plus_first_lkq_and_fused_apply_launch_s": compile_s,
         "copy_strategy": "scalar_bf16_universal_g2s_s2g",
+        "lkq_global_materialized_for_tested_fused_path": False,
+        "fused_path_remaining_global": [
+            "state BF16 tile from scalar-copy CuTe GEMM",
+            "apply BF16 tile output from fused masked-apply kernel",
+            "dpsi/DV/DMIMO_V torch-side scalar correctness consumers",
+        ],
         "shape": {
             "chunk": CHUNK_SIZE,
             "rank": RANK,
@@ -292,7 +433,8 @@ def run_lkq_tile_chain(
             "N": N,
             "P": P,
         },
-        "cases": cases,
+        "scalar_cases": scalar_cases,
+        "fused_cases": fused_cases,
         "timings": timings,
     }
 

@@ -4,7 +4,8 @@ Modes:
   * ``cute-check`` builds a bounded overlay with NVIDIA CuTe DSL and
     quack-kernels, then reports import viability.
   * ``cute-gemm`` runs the existing single-GEMM CuTe DSL WGMMA smoke on H200.
-  * ``cute-lkq-chain`` runs the Wave 5 LKQ/state tile-chain CuTe probe.
+  * ``cute-lkq-chain`` runs the LKQ/state CuTe probe, including the Wave 6
+    fused masked-apply tile.
   * ``quack-gemm`` runs a minimal CuTe DSL WGMMA GEMM through quack-kernels.
   * ``wmma-smoke`` runs the CUDA WMMA fallback correctness and timing probe.
 """
