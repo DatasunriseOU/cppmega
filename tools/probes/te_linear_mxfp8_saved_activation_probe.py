@@ -38,7 +38,7 @@ def _set_mxfp8_profile_env(backend: str | None) -> str:
     os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER", "1")
     if backend is not None:
         os.environ["CPPMEGA_TE_MXFP8_BWD_BACKEND"] = backend
-    backend = os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_BACKEND", "te_tn_adapter")
+    backend = os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_BACKEND", "cutlass_native")
     no_sidecar = backend == "cutlass_native"
     os.environ.setdefault(
         "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND",
@@ -51,6 +51,10 @@ def _set_mxfp8_profile_env(backend: str | None) -> str:
     os.environ.setdefault(
         "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT",
         "0" if no_sidecar else "1",
+    )
+    os.environ.setdefault(
+        "CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD",
+        "1" if no_sidecar else "0",
     )
     os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK", "0")
     os.environ.setdefault("CPPMEGA_TE_MXFP8_DGRAD_BF16", "0")
@@ -116,7 +120,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     input_shape = [args.m, args.k]
     weight_shape = [args.n, args.k]
     weight_data_ptr = int(linear.weight.data_ptr())
-    transpose_payload_shape = [args.k, args.m]
+    input_transpose_payload_shape = [args.k, args.m]
+    input_columnwise_scale_shape = [args.m // 32, args.k]
+    input_transpose_scale_shape = [args.k, args.m // 32]
     saved_bf16_input = [
         rec
         for rec in saved_tensors
@@ -135,15 +141,25 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             and rec["data_ptr"] == weight_data_ptr
         )
     ]
-    saved_transpose_payload = [
+    saved_input_transpose_payload = [
         rec
         for rec in saved_tensors
-        if rec["dtype"] == "torch.uint8" and rec["shape"] == transpose_payload_shape
+        if rec["dtype"] == "torch.uint8" and rec["shape"] == input_transpose_payload_shape
     ]
     saved_input_columnwise_payload = [
         rec
         for rec in saved_tensors
         if rec["dtype"] == "torch.uint8" and rec["shape"] == input_shape
+    ]
+    saved_input_columnwise_scale = [
+        rec
+        for rec in saved_tensors
+        if rec["dtype"] == "torch.uint8" and rec["shape"] == input_columnwise_scale_shape
+    ]
+    saved_input_transpose_scale = [
+        rec
+        for rec in saved_tensors
+        if rec["dtype"] == "torch.uint8" and rec["shape"] == input_transpose_scale_shape
     ]
 
     stats = (
@@ -168,7 +184,14 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         failures.append("MXFP8 backward used BF16 fallback")
 
     transpose_emit_backend = os.environ.get("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND", "")
-    direct_no_sidecar = backend == "cutlass_native" and transpose_emit_backend == "off"
+    compact_columnwise_backward = (
+        os.environ.get("CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD", "0") == "1"
+    )
+    direct_no_sidecar = (
+        backend == "cutlass_native"
+        and transpose_emit_backend == "off"
+        and compact_columnwise_backward
+    )
     flashinfer_compact_direct = (
         backend == "flashinfer_cutlass"
         and int(stats.get("mxfp8_flashinfer_dgrad", 0)) > 0
@@ -188,12 +211,22 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 failures.append("FlashInfer/CUTLASS compact-direct backend did not handle wgrad")
         if int(stats.get("mxfp8_tn_adapter_te_emit", 0)) != 0:
             failures.append("compact-direct backend emitted TE transpose operands")
+        if int(stats.get("mxfp8_tn_adapter_saved_transpose_operand", 0)) != 0:
+            failures.append("compact-direct backend consumed a saved transpose operand")
+        if int(stats.get("mxfp8_te_autograd_make_transpose", 0)) != 0:
+            failures.append("TE autograd emitted a rowwise-transpose MXFP8 operand")
+        if int(stats.get("mxfp8_te_autograd_copy_transpose", 0)) != 0:
+            failures.append("TE autograd materialized a rowwise-transpose MXFP8 operand")
+        if saved_input_transpose_payload:
+            failures.append("TE autograd saved an input.T MXFP8 payload")
+        if saved_input_transpose_scale:
+            failures.append("TE autograd saved an input.T MXFP8 scale tensor")
         if int(stats.get("mxfp8_tn_sidecar_attr_attached", 0)) != 0:
             failures.append("compact-direct backend attached MXFP8 transpose sidecars")
         if int(stats.get("mxfp8_tn_sidecar_registry_peak", 0)) != 0:
             failures.append("compact-direct backend used the sidecar registry")
     else:
-        if not saved_transpose_payload:
+        if not saved_input_transpose_payload:
             failures.append(
                 "MXFP8 rowwise-transposed payload was not saved for Linear backward"
             )
@@ -214,11 +247,16 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "status": "pass" if not failures else "fail",
         "failures": failures,
         "backend": backend,
+        "transpose_emit_backend": transpose_emit_backend,
+        "compact_columnwise_backward": compact_columnwise_backward,
         "shape": {"m": args.m, "n": args.n, "k": args.k},
         "saved_bf16_input_count": len(saved_bf16_input),
         "saved_bf16_weight_count": len(saved_bf16_weight),
-        "saved_transpose_payload_count": len(saved_transpose_payload),
+        "saved_transpose_payload_count": len(saved_input_transpose_payload),
+        "saved_input_transpose_payload_count": len(saved_input_transpose_payload),
+        "saved_input_transpose_scale_count": len(saved_input_transpose_scale),
         "saved_input_columnwise_payload_count": len(saved_input_columnwise_payload),
+        "saved_input_columnwise_scale_count": len(saved_input_columnwise_scale),
         "finite_input_grad": finite_input_grad,
         "finite_weight_grad": finite_weight_grad,
         "saved_tensors": saved_tensors,
@@ -228,7 +266,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--m", type=int, default=64)
+    parser.add_argument("--m", type=int, default=256)
     parser.add_argument("--n", type=int, default=128)
     parser.add_argument("--k", type=int, default=128)
     parser.add_argument("--seed", type=int, default=123)

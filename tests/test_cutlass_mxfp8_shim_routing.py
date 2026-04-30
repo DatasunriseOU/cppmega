@@ -119,3 +119,49 @@ def test_compact_cutlass_route_keeps_direct_rowwise_gemm(monkeypatch):
     assert calls[0][1] is a._rowwise_scale_inv
     assert calls[0][2] is b._rowwise_data
     assert calls[0][3] is b._rowwise_scale_inv
+
+
+def test_te_autograd_copy_transpose_counter_wraps_module_helper(monkeypatch):
+    shim = _fresh_shim(monkeypatch, scale_backend="compact")
+    calls = []
+
+    def copy_columnwise_as_rowwise_transpose(tensor):
+        calls.append(tensor)
+        return "transpose-storage"
+
+    module = SimpleNamespace(
+        _copy_columnwise_as_rowwise_transpose_for_backward=(
+            copy_columnwise_as_rowwise_transpose
+        )
+    )
+
+    assert shim._cppmega_wrap_te_autograd_copy_transpose(module) is True
+    assert shim._cppmega_wrap_te_autograd_copy_transpose(module) is False
+
+    result = module._copy_columnwise_as_rowwise_transpose_for_backward("payload")
+
+    assert result == "transpose-storage"
+    assert calls == ["payload"]
+    assert shim.cppmega_te_mxfp8_bwd_stats["mxfp8_te_autograd_copy_transpose"] == 1
+
+
+def test_te_autograd_make_transpose_counter_wraps_module_helper(monkeypatch):
+    shim = _fresh_shim(monkeypatch, scale_backend="compact")
+    calls = []
+
+    def make_rowwise_transpose(source, tensor, quantizer):
+        calls.append((source, tensor, quantizer))
+        return "made-transpose-storage"
+
+    module = SimpleNamespace(
+        _make_rowwise_transpose_for_backward=make_rowwise_transpose,
+    )
+
+    assert shim._cppmega_wrap_te_autograd_make_transpose(module) is True
+    assert shim._cppmega_wrap_te_autograd_make_transpose(module) is False
+
+    result = module._make_rowwise_transpose_for_backward("source", "tensor", "quantizer")
+
+    assert result == "made-transpose-storage"
+    assert calls == [("source", "tensor", "quantizer")]
+    assert shim.cppmega_te_mxfp8_bwd_stats["mxfp8_te_autograd_make_transpose"] == 1

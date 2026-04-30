@@ -397,6 +397,8 @@ if (
             "mxfp8_tn_adapter_te_emit_swizzled": 0,
             "mxfp8_tn_adapter_te_emit_swizzled_unavailable": 0,
             "mxfp8_tn_adapter_copy_transpose": 0,
+            "mxfp8_te_autograd_make_transpose": 0,
+            "mxfp8_te_autograd_copy_transpose": 0,
             "mxfp8_tn_adapter_missing_sidecar_copy": 0,
             "mxfp8_tn_adapter_te_emit_failed": 0,
             "mxfp8_norm_quantize_sidecar_bridge": 0,
@@ -2184,6 +2186,52 @@ if (
             _module.gather_along_first_dim = _gather_along_first_dim_with_sidecar
             return True
 
+        def _cppmega_wrap_te_autograd_copy_transpose(_module):
+            _orig_copy = getattr(
+                _module,
+                "_copy_columnwise_as_rowwise_transpose_for_backward",
+                None,
+            )
+            if _orig_copy is None or getattr(_orig_copy, "_cppmega_copy_transpose_counter", False):
+                return False
+
+            @_functools.wraps(_orig_copy)
+            def _copy_columnwise_as_rowwise_transpose_with_counter(*args, **kwargs):
+                _result = _orig_copy(*args, **kwargs)
+                if _result is not None:
+                    _cppmega_record_bwd_stat("mxfp8_te_autograd_copy_transpose")
+                return _result
+
+            _copy_columnwise_as_rowwise_transpose_with_counter._cppmega_copy_transpose_counter = True
+            _module._copy_columnwise_as_rowwise_transpose_for_backward = (
+                _copy_columnwise_as_rowwise_transpose_with_counter
+            )
+            return True
+
+        def _cppmega_wrap_te_autograd_make_transpose(_module):
+            _orig_make = getattr(
+                _module,
+                "_make_rowwise_transpose_for_backward",
+                None,
+            )
+            if _orig_make is None or getattr(
+                _orig_make,
+                "_cppmega_make_transpose_counter",
+                False,
+            ):
+                return False
+
+            @_functools.wraps(_orig_make)
+            def _make_rowwise_transpose_with_counter(*args, **kwargs):
+                _result = _orig_make(*args, **kwargs)
+                if _result is not None:
+                    _cppmega_record_bwd_stat("mxfp8_te_autograd_make_transpose")
+                return _result
+
+            _make_rowwise_transpose_with_counter._cppmega_make_transpose_counter = True
+            _module._make_rowwise_transpose_for_backward = _make_rowwise_transpose_with_counter
+            return True
+
         def _cppmega_wrap_apply_normalization(_module):
             _orig_apply_normalization = getattr(_module, "apply_normalization", None)
             if _orig_apply_normalization is None or getattr(
@@ -2273,6 +2321,8 @@ if (
         _patched_quantize_weight_modules = []
         _patched_gather_modules = []
         _patched_norm_modules = []
+        _patched_make_transpose_modules = []
+        _patched_copy_transpose_modules = []
         for _module_name in (
             "transformer_engine.pytorch.module.linear",
             "transformer_engine.pytorch.module.layernorm_linear",
@@ -2293,6 +2343,10 @@ if (
                     _patched_quantize_weight_modules.append(_module_name.rsplit(".", 1)[-1])
                 if _cppmega_wrap_gather_along_first_dim(_mod):
                     _patched_gather_modules.append(_module_name.rsplit(".", 1)[-1])
+                if _cppmega_wrap_te_autograd_make_transpose(_mod):
+                    _patched_make_transpose_modules.append(_module_name.rsplit(".", 1)[-1])
+                if _cppmega_wrap_te_autograd_copy_transpose(_mod):
+                    _patched_copy_transpose_modules.append(_module_name.rsplit(".", 1)[-1])
                 if _cppmega_wrap_apply_normalization(_mod):
                     _patched_norm_modules.append(_module_name.rsplit(".", 1)[-1])
                 for _class_name in ("Linear", "LayerNormLinear", "LayerNormMLP", "GroupedLinear"):
@@ -2328,6 +2382,8 @@ if (
             f"weight_quantizer_modules={_patched_weight_quantizer_modules}, "
             f"quantize_weight_modules={_patched_quantize_weight_modules}, "
             f"gather_modules={_patched_gather_modules}, "
+            f"make_transpose_modules={_patched_make_transpose_modules}, "
+            f"copy_transpose_modules={_patched_copy_transpose_modules}, "
             f"norm_modules={_patched_norm_modules})"
         )
     except Exception as _exc:  # pragma: no cover

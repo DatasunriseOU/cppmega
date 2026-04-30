@@ -96,9 +96,11 @@ class PrecisionProfile:
 
     # Tensorwise FP8 is the conservative GB10 lane.  Dense MXFP8 Linear GEMMs
     # can route clean GEMM calls through TE payload + FlashInfer/CUTLASS
-    # layout_128x4, while profile setters may choose a faster measured backend
-    # for a specific machine.  The old compact direct CUTLASS loader remains an
-    # explicit experiment.  This is not the attention backend: attention is
+    # layout_128x4, while profile setters may choose a backend for a specific
+    # machine.  Compact-columnwise CUTLASS is the no-materialization MXFP8
+    # backward route: it keeps saved TE Linear operands in GEMM-ready MXFP8
+    # storage rather than BF16 or rowwise-transpose sidecars.  This is not the
+    # attention backend: attention is
     # controlled separately by ``attention_backend`` and local GB10 pins it to
     # patched FA4.
     # ``auto`` would hide the important contract here, so the resolved profile
@@ -127,16 +129,14 @@ class PrecisionProfile:
     # GEMM-ready rowwise-transpose operands through the stock SM120
     # block-scaled CUTLASS mainloop.
     mxfp8_cutlass_scale_backend: Mxfp8CutlassScaleBackend = "compact"
-    # Experimental dense Linear backward mode: TE saves original compact
-    # columnwise MXFP8 operands and lets the cppmega compact-direct backend
-    # read them directly.  This removes the dense rowwise-transpose copies, but
-    # the current SM120 direct loader is slower than the TE-transpose TN path on
-    # full-model GB10 runs, so keep it opt-in until the loader/mainloop is fixed.
+    # Dense Linear backward mode: TE saves original compact columnwise MXFP8
+    # operands and lets the cppmega compact-direct backend read them directly.
+    # This removes rowwise-transpose copies from TE Linear autograd.  Profile
+    # setters decide whether this should be the default for a machine.
     mxfp8_compact_columnwise_backward: bool = False
-    # Experimental MoE grouped backward mode: consumes grouped compact MXFP8
-    # operands directly.  Keep this separate from dense compact-columnwise
-    # because the current grouped direct kernels save memory but are slower than
-    # the grouped TN adapter on GB10 full-model smoke runs.
+    # MoE grouped backward mode: consumes grouped compact MXFP8 operands
+    # directly.  Keep this separate from dense compact-columnwise because the
+    # grouped direct kernels have a different performance envelope.
     mxfp8_grouped_direct_backward: bool = False
     # FlashInfer's public mm_mxfp8 path owns autotuning. direct_tactic bypasses
     # that layer and is only for shape/tactic probes when nsys shows overhead.
@@ -374,11 +374,17 @@ def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProf
     # Keep this in the typed profile instead of relying on a shell fallback.
     profile.model.moe_token_dispatcher_type = "alltoall"
     profile.precision.attention_backend = "flash"
-    # GB10 MXFP8 profiler runs on 2026-04-29 showed FlashInfer/CUTLASS backward
-    # spending ~878 ms/step in 68 GEMMs, while the TE TN adapter cut steady
-    # step time by ~8% with no BF16 fallback.  Keep FlashInfer selectable via
-    # --mxfp8-bwd-backend for targeted kernel probes.
-    profile.precision.mxfp8_bwd_backend = "te_tn_adapter"
+    # Wave10A MXFP8 acceptance lane: avoid BF16 saved activations and avoid
+    # TE Linear rowwise-transpose sidecars/copies by saving compact columnwise
+    # MXFP8 operands and routing backward GEMMs through cppmega's direct
+    # CUTLASS path.  The older TE-TN sidecar lane remains selectable with
+    # --mxfp8-bwd-backend te_tn_adapter for A/B profiles.
+    profile.precision.mxfp8_bwd_backend = "cutlass_native"
+    profile.precision.mxfp8_transpose_emit_backend = "off"
+    profile.precision.mxfp8_transpose_emit_swizzled = False
+    profile.precision.mxfp8_transpose_emit_strict = False
+    profile.precision.mxfp8_compact_columnwise_backward = True
+    profile.precision.mxfp8_grouped_direct_backward = True
     # The remaining BF16 GEMM hotspot on GB10 is Muon's Newton-Schulz loop.
     # nanochat's comparable performance presets use 3 iterations; keep this as
     # a typed profile default so runs can restore 5 with --muon-num-ns-steps 5.
@@ -695,6 +701,29 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.precision.attention_backend = args.attention_backend
     if args.mxfp8_bwd_backend is not None:
         profile.precision.mxfp8_bwd_backend = args.mxfp8_bwd_backend
+        if args.mxfp8_bwd_backend == "cutlass_native":
+            if args.mxfp8_cutlass_scale_backend != "swizzled":
+                if args.mxfp8_transpose_emit_backend is None:
+                    profile.precision.mxfp8_transpose_emit_backend = "off"
+                if args.mxfp8_transpose_emit_swizzled is None:
+                    profile.precision.mxfp8_transpose_emit_swizzled = False
+                if args.mxfp8_transpose_emit_strict is None:
+                    profile.precision.mxfp8_transpose_emit_strict = False
+                if args.mxfp8_compact_columnwise_backward is None:
+                    profile.precision.mxfp8_compact_columnwise_backward = True
+                if args.mxfp8_grouped_direct_backward is None:
+                    profile.precision.mxfp8_grouped_direct_backward = True
+        else:
+            if args.mxfp8_transpose_emit_backend is None:
+                profile.precision.mxfp8_transpose_emit_backend = "te"
+            if args.mxfp8_transpose_emit_swizzled is None:
+                profile.precision.mxfp8_transpose_emit_swizzled = True
+            if args.mxfp8_transpose_emit_strict is None:
+                profile.precision.mxfp8_transpose_emit_strict = True
+            if args.mxfp8_compact_columnwise_backward is None:
+                profile.precision.mxfp8_compact_columnwise_backward = False
+            if args.mxfp8_grouped_direct_backward is None:
+                profile.precision.mxfp8_grouped_direct_backward = False
     if args.mxfp8_cutlass_scale_backend is not None:
         profile.precision.mxfp8_cutlass_scale_backend = args.mxfp8_cutlass_scale_backend
         if args.mxfp8_cutlass_scale_backend == "swizzled":
@@ -709,6 +738,8 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
                 profile.precision.mxfp8_transpose_emit_backend = "te"
             if args.mxfp8_transpose_emit_swizzled is None:
                 profile.precision.mxfp8_transpose_emit_swizzled = True
+            if args.mxfp8_transpose_emit_strict is None:
+                profile.precision.mxfp8_transpose_emit_strict = True
             profile.precision.mxfp8_compact_columnwise_backward = False
     if args.mxfp8_transpose_emit_backend is not None:
         profile.precision.mxfp8_transpose_emit_backend = args.mxfp8_transpose_emit_backend
@@ -728,6 +759,12 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
                     "--mxfp8-compact-columnwise-backward requires "
                     "--mxfp8-bwd-backend cutlass_native"
                 )
+            if args.mxfp8_transpose_emit_backend is None:
+                profile.precision.mxfp8_transpose_emit_backend = "off"
+            if args.mxfp8_transpose_emit_swizzled is None:
+                profile.precision.mxfp8_transpose_emit_swizzled = False
+            if args.mxfp8_transpose_emit_strict is None:
+                profile.precision.mxfp8_transpose_emit_strict = False
     if args.mxfp8_grouped_direct_backward is not None:
         profile.precision.mxfp8_grouped_direct_backward = (
             args.mxfp8_grouped_direct_backward

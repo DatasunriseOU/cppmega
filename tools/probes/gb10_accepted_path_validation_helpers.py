@@ -44,6 +44,8 @@ MATERIALIZATION_STAT_KEYS = (
     "mxfp8_tn_adapter_te_emit_swizzled",
     "mxfp8_tn_adapter_te_emit_swizzled_unavailable",
     "mxfp8_tn_adapter_copy_transpose",
+    "mxfp8_te_autograd_make_transpose",
+    "mxfp8_te_autograd_copy_transpose",
     "mxfp8_tn_adapter_missing_sidecar_copy",
     "mxfp8_norm_quantize_sidecar_bridge",
 )
@@ -294,11 +296,20 @@ def _build_mxfp8_copy_breakdown(text: str, counters: dict[str, int]) -> dict[str
     dense_expected_fallback_copies = dense_adapter_dgrad_hits + (2 * dense_adapter_wgrad_hits)
 
     grouped_fallback_copies = grouped_dgrad_copies + grouped_wgrad_copies
-    total_copy_transpose = (
+    shim_copy_transpose = (
         _counter(counters, "mxfp8_tn_adapter_copy_transpose")
         if "mxfp8_tn_adapter_copy_transpose" in counters
         else None
     )
+    te_autograd_copy_transpose = (
+        _counter(counters, "mxfp8_te_autograd_copy_transpose")
+        if "mxfp8_te_autograd_copy_transpose" in counters
+        else None
+    )
+    if shim_copy_transpose is None and te_autograd_copy_transpose is None:
+        total_copy_transpose = None
+    else:
+        total_copy_transpose = (shim_copy_transpose or 0) + (te_autograd_copy_transpose or 0)
     if total_copy_transpose is None:
         dense_fallback_copies = dense_expected_fallback_copies
         unattributed_copies: int | None = None
@@ -306,7 +317,7 @@ def _build_mxfp8_copy_breakdown(text: str, counters: dict[str, int]) -> dict[str
     else:
         dense_fallback_copies = max(total_copy_transpose - grouped_fallback_copies, 0)
         unattributed_copies = total_copy_transpose - grouped_fallback_copies - dense_expected_fallback_copies
-        dense_copy_source = "copy_transpose_counter_minus_grouped"
+        dense_copy_source = "copy_transpose_counters_minus_grouped"
 
     dense_dgrad_direct_hits = _counter(counters, "mxfp8_cutlass_native_dgrad") + _counter(
         counters, "mxfp8_flashinfer_dgrad"
@@ -343,6 +354,8 @@ def _build_mxfp8_copy_breakdown(text: str, counters: dict[str, int]) -> dict[str
     return {
         "total_copy_transpose": total_copy_transpose,
         "copy_counts_by_source": {
+            "shim": shim_copy_transpose,
+            "te_autograd": te_autograd_copy_transpose,
             "grouped_dgrad": grouped_dgrad_copies,
             "grouped_wgrad": grouped_wgrad_copies,
             "grouped_total": grouped_fallback_copies,
@@ -384,7 +397,7 @@ def _build_profile_readiness(
     if not counters:
         missing.append("mxfp8_counters")
     if copy_breakdown.get("total_copy_transpose") is None:
-        missing.append("mxfp8_tn_adapter_copy_transpose")
+        missing.append("mxfp8_copy_transpose_counter")
     if copy_breakdown.get("sidecar_registry_peak_bytes") is None:
         missing.append("mxfp8_tn_sidecar_registry_peak_bytes")
     if copy_breakdown.get("max_cuda_allocated_bytes") is None:
