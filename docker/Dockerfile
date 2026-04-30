@@ -56,6 +56,14 @@ RUN python -m pip install --pre --extra-index-url ${TORCH_INDEX} \
         apache-tvm-ffi==0.1.9 \
         nvidia-nccl-cu13
 
+# --- CuTe DSL + quack (Python-only, JIT-compiled kernels) -------------------
+# nvidia-cutlass-dsl 4.4.2 includes the SM120/121 StageCountAutoCarveout fix
+# (CUTLASS issue #3144) needed for GB10. quack is the Dao-AILab CuTe-DSL
+# kernel library; only on GitHub, not PyPI.
+RUN python -m pip install --no-cache-dir \
+        "nvidia-cutlass-dsl==4.4.2" \
+        "git+https://github.com/Dao-AILab/quack.git"
+
 # --- prebuilt wheels (this layer changes whenever any wheel is rebuilt) -----
 COPY wheels/ /tmp/wheels/
 RUN python -m pip install --no-deps /tmp/wheels/*.whl && rm -rf /tmp/wheels
@@ -83,7 +91,10 @@ import torch; print('torch', torch.__version__); \
 import transformer_engine; print('te', transformer_engine.__version__); \
 import transformer_engine.pytorch; \
 import flash_attn, mamba_ssm, causal_conv1d, fast_hadamard_transform, tilelang, qoptim_cuda; \
-print('OK')"
+import cutlass; import cutlass.cute as cute; \
+from cutlass.utils import LayoutEnum, SmemAllocator; \
+import quack; from quack import sm90_utils, copy_utils, layout_utils, mx_utils; \
+print('OK — cutlass', cutlass.__version__ if hasattr(cutlass,'__version__') else '(no __version__)')"
 
 WORKDIR /workspace
 CMD ["python"]

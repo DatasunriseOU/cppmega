@@ -56,6 +56,11 @@ def smoke() -> dict:
     import fast_hadamard_transform  # noqa: F401
     import tilelang
     import qoptim_cuda  # noqa: F401
+    import cutlass
+    import cutlass.cute as cute  # noqa: F401
+    from cutlass.utils import LayoutEnum, SmemAllocator  # noqa: F401
+    import quack  # noqa: F401
+    from quack import sm90_utils, copy_utils, layout_utils, mx_utils  # noqa: F401
 
     return {
         "torch": torch.__version__,
@@ -63,6 +68,7 @@ def smoke() -> dict:
         "te": transformer_engine.__version__,
         "tilelang": getattr(tilelang, "__version__", None),
         "tilelang_file": getattr(tilelang, "__file__", None),
+        "cutlass": getattr(cutlass, "__version__", None),
         "device_count": torch.cuda.device_count(),
         "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "image_ref": GHCR_REF,
