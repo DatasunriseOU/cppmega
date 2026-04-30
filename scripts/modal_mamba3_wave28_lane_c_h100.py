@@ -408,7 +408,67 @@ def run_bench(run_id: str) -> dict[str, Any]:
     return result
 
 
+@app.function(image=image, gpu="H100", timeout=600)
+def verify_applier_mutation() -> dict[str, Any]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "/opt/cppmega:/opt/megatron-lm"
+    env["CPPMEGA_MAMBA3_STAGE2_FORCE_NONTMA"] = "1"
+    env["MAMBA3_STAGE2_FORCE_NONTMA_ALLOW_FILE_MUTATION"] = "1"
+
+    find_code = (
+        "import importlib.util, pathlib;"
+        "spec=importlib.util.find_spec('mamba_ssm.ops.tilelang.mamba3');"
+        "p=pathlib.Path(next(iter(spec.submodule_search_locations))) / 'mamba3_mimo_bwd.py';"
+        "print(p)"
+    )
+    path_proc = subprocess.run(
+        ["python", "-c", find_code],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    kernel_path = pathlib.Path(path_proc.stdout.strip())
+    original = kernel_path.read_bytes()
+
+    apply_proc = subprocess.run(
+        ["python", "-m", "cppmega.megatron.upstream_patches.apply_mamba3_stage2_force_nontma_patches"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    text = kernel_path.read_text()
+    patched = {
+        "flat_q": "Q: T.Tensor([B, S * R, G, N], dtype)" in text,
+        "flat_qk": "QK_DOT: T.Tensor([B, H, S, R * R], dtype)" in text,
+        "bf_num_stages_1": "bf_num_stages=1" in text,
+        "bb_num_stages_0": "bb_num_stages=0" in text,
+        "disable_tma_count": text.count("disable_tma=True"),
+    }
+
+    rollback_env = env.copy()
+    rollback_env["CPPMEGA_MAMBA3_STAGE2_FORCE_NONTMA_ROLLBACK"] = "1"
+    rollback_proc = subprocess.run(
+        ["python", "-m", "cppmega.megatron.upstream_patches.apply_mamba3_stage2_force_nontma_patches"],
+        env=rollback_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    restored = kernel_path.read_bytes() == original
+    return {
+        "kernel_path": str(kernel_path),
+        "apply_returncode": apply_proc.returncode,
+        "apply_output": apply_proc.stdout + apply_proc.stderr,
+        "patched": patched,
+        "rollback_returncode": rollback_proc.returncode,
+        "rollback_output": rollback_proc.stdout + rollback_proc.stderr,
+        "restored_original_bytes": restored,
+    }
+
+
 @app.local_entrypoint()
-def main(run_id: str = "wave28_lane_c_h100"):
-    result = run_bench.remote(run_id)
+def main(run_id: str = "wave28_lane_c_h100", verify_applier: bool = False):
+    result = verify_applier_mutation.remote() if verify_applier else run_bench.remote(run_id)
     print(json.dumps(result, indent=2, sort_keys=True))
