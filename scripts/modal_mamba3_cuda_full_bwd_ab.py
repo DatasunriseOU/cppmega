@@ -7,19 +7,19 @@ Run examples:
 
     GHCR_TAG=785c3fd CPPMEGA_MODAL_GPU=H200 timeout 1800s \
         modal run scripts/modal_mamba3_cuda_full_bwd_ab.py \
-        --run-id wave8_h200_prod_20260430_1 \
+        --run-id wave9_h200_prod_20260430_1 \
         --shape-csv smoke,productionish \
         --iters 6 --warmup 2 --cuda-iters 10 --cuda-warmup 3
 
     GHCR_TAG=785c3fd CPPMEGA_MODAL_GPU=H100:2 timeout 900s \
         modal run scripts/modal_mamba3_cuda_full_bwd_ab.py \
-        --run-id wave8_h100_smoke_20260430_1 \
+        --run-id wave9_h100_smoke_20260430_1 \
         --shape-csv smoke \
         --iters 2 --warmup 1 --cuda-iters 5 --cuda-warmup 1
 
     GHCR_TAG=785c3fd CPPMEGA_MODAL_GPU=B200:1 timeout 900s \
         modal run scripts/modal_mamba3_cuda_full_bwd_ab.py \
-        --run-id wave8_b200_smoke_20260430_1 \
+        --run-id wave9_b200_smoke_20260430_1 \
         --shape-csv smoke \
         --iters 2 --warmup 1 --cuda-iters 5 --cuda-warmup 1
 """
@@ -48,6 +48,50 @@ BENCH_ROOT = "/benchmarks"
 BENCH_PREFIX = "mamba3_cuda_full_bwd_ab"
 
 bench_volume = modal.Volume.from_name(BENCH_VOLUME_NAME, create_if_missing=True)
+
+
+DMIMOV_SIDECAR_SOURCE: dict[str, Any] = {
+    "source_worktree": "worker/mamba3-cuda-dmimo-reduce",
+    "source_commit": "9308289",
+    "doc": "docs/status/mamba3_cuda_dmimo_reduce_wave8_2026_04_30.md",
+    "scope": (
+        "qk_dot same-time DMIMO_V contribution only; full state/intra-chunk "
+        "DMIMO_V terms are still outside this sidecar"
+    ),
+    "h200_productionish": {
+        "device": "NVIDIA H200",
+        "shape": "productionish",
+        "tilelang_stage2_bf1_bb0_bwd_bwd_ms": 3.70674,
+        "wave7_diag_plus_qk_dv_ms": 1.91459,
+        "wave7_refreshed_in_sidecar_ms": 1.92434,
+        "qk_dmimov_output_owner_all_r_ms": 0.53634,
+        "projected_wave7_plus_qk_dmimov_ms": 2.45093,
+        "projected_ratio_vs_tilelang_stage2": 0.661,
+        "correctness_max_abs": 1.066e-13,
+        "metadata": {
+            "regs_per_thread": 40,
+            "static_smem_bytes": 2048,
+            "active_blocks_per_sm": 12,
+            "occupancy": 0.75,
+        },
+    },
+    "h100_smoke": {
+        "device": "NVIDIA H100 80GB HBM3",
+        "shape": "smoke",
+        "wave7_diag_plus_qk_dv_ms": 0.03193600028753281,
+        "qk_dmimov_output_owner_all_r_ms": 0.026003200188279153,
+        "two_pass_total_ms": 0.016627199575304986,
+        "atomic_chunk_ms": 0.020524800196290015,
+        "output_owner_single_r_ms": 0.023174399882555007,
+        "correctness_max_abs": 2.665e-15,
+        "metadata": {
+            "regs_per_thread": 40,
+            "static_smem_bytes": 2048,
+            "active_blocks_per_sm": 12,
+            "occupancy": 0.75,
+        },
+    },
+}
 
 
 def _image() -> modal.Image:
@@ -149,6 +193,56 @@ def _mean_ms(variant: dict[str, Any] | None, phase: str) -> float | None:
     return variant.get("elapsed", {}).get(phase, {}).get("mean_ms")
 
 
+def _shape_memory_model(shape: dict[str, Any]) -> dict[str, Any]:
+    b = int(shape["B"])
+    s = int(shape["S"])
+    h = int(shape["H"])
+    r = int(shape["R"])
+    p = int(shape["P"])
+    chunk = int(shape["chunk"])
+    nchunks = (s + chunk - 1) // chunk
+    output_bytes = b * h * r * p * 4
+    partial_bytes = b * h * nchunks * r * p * 4
+    atomic_adds = b * h * nchunks * r * p
+    timestep_contributions = b * h * s * r * p
+    return {
+        "dmimo_v_output_bytes": output_bytes,
+        "dmimo_v_output_mib": output_bytes / (1024**2),
+        "atomic_chunk_extra_temp_bytes": 0,
+        "atomic_chunk_global_atomic_adds": atomic_adds,
+        "two_pass_partial_bytes": partial_bytes,
+        "two_pass_partial_mib": partial_bytes / (1024**2),
+        "two_pass_extra_global_rw_bytes": partial_bytes * 2 + output_bytes,
+        "two_pass_extra_global_rw_mib": (partial_bytes * 2 + output_bytes) / (1024**2),
+        "output_owner_all_r_extra_temp_bytes": 0,
+        "raw_timestep_dmimov_contributions": timestep_contributions,
+    }
+
+
+def _dmimov_sidecar_for_shape(shape: dict[str, Any]) -> dict[str, Any]:
+    measured = None
+    if shape.get("name") == "productionish":
+        measured = DMIMOV_SIDECAR_SOURCE["h200_productionish"]
+    return {
+        "source": {
+            key: DMIMOV_SIDECAR_SOURCE[key]
+            for key in ("source_worktree", "source_commit", "doc", "scope")
+        },
+        "available_receipts": {
+            key: DMIMOV_SIDECAR_SOURCE[key]
+            for key in ("h200_productionish", "h100_smoke")
+        },
+        "measured": measured,
+        "memory_model": _shape_memory_model(shape),
+        "launch_accounting": {
+            "standalone_output_owner_all_r_launches": 1,
+            "wave7_plus_dmimov_sidecar_bwd_bwd_launches": 2,
+            "stage2_bwd_fwd_plus_wave7_plus_dmimov_sidecar_chain_launches": 3,
+            "production_single_bwd_bwd_replacement_target_launches": 1,
+        },
+    }
+
+
 def _compact_stats(stats: dict[str, Any] | None) -> dict[str, Any] | None:
     if not stats:
         return None
@@ -203,6 +297,7 @@ def _cuda_timing_summary(cuda_result: dict[str, Any]) -> dict[str, Any]:
 def _replacement_estimate(
     tilelang_variants: dict[str, dict[str, Any]],
     cuda_result: dict[str, Any],
+    shape: dict[str, Any],
 ) -> dict[str, Any]:
     baseline = tilelang_variants.get("baseline")
     stage2 = tilelang_variants.get("stage2_bf1_bb0")
@@ -225,11 +320,19 @@ def _replacement_estimate(
     floor_chain_ms = None
     if stage2_bf_ms is not None and combined_ms is not None:
         floor_chain_ms = stage2_bf_ms + combined_ms
+    dmimov_sidecar = _dmimov_sidecar_for_shape(shape)
+    dmimov_measured = dmimov_sidecar.get("measured")
+    dmimov_all_r_ms = (
+        dmimov_measured.get("qk_dmimov_output_owner_all_r_ms") if dmimov_measured else None
+    )
+    combined_plus_dmimov_ms = None
+    if combined_ms is not None and dmimov_all_r_ms is not None:
+        combined_plus_dmimov_ms = combined_ms + dmimov_all_r_ms
 
     estimate: dict[str, Any] = {
         "validity": (
             "incomplete floor: current CUDA candidate covers DGAMMA_DIAG, DK/DQ diagonal "
-            "contributions, and qk_dot->dPsiV->DV only"
+            "contributions, qk_dot->dPsiV->DV, and sidecar qk_dot->DMIMO_V only"
         ),
         "tilelang_reference_variant": stage2_ref["variant"] if stage2_ref else None,
         "tilelang_baseline_bwd_bwd_ms": _mean_ms(baseline, "bwd_bwd"),
@@ -241,13 +344,23 @@ def _replacement_estimate(
             "wave7_qk_dv": qk_dv_ms,
             "component_sum_two_launches": component_sum_ms,
             "combined_one_launch_current_candidate": combined_ms,
+            "qk_dmimov_output_owner_all_r_sidecar": dmimov_all_r_ms,
+            "combined_plus_qk_dmimov_sidecar": combined_plus_dmimov_ms,
         },
         "launch_counts": {
             "tilelang_bwd_bwd": 1,
             "cuda_component_sum": 2,
             "cuda_combined_current_candidate": 1,
+            "cuda_combined_plus_qk_dmimov_sidecar": (
+                dmimov_sidecar["launch_accounting"]["wave7_plus_dmimov_sidecar_bwd_bwd_launches"]
+            ),
             "stage2_chain": 2,
             "stage2_chain_with_current_incomplete_cuda_floor": 2,
+            "stage2_chain_with_current_plus_qk_dmimov_sidecar": (
+                dmimov_sidecar["launch_accounting"][
+                    "stage2_bwd_fwd_plus_wave7_plus_dmimov_sidecar_chain_launches"
+                ]
+            ),
         },
         "memory_peak_gib": {
             "tilelang_baseline_allocated": baseline.get("max_memory_allocated_gib") if baseline else None,
@@ -257,10 +370,11 @@ def _replacement_estimate(
             "cuda_components_allocated": cuda_result.get("memory", {}).get("max_memory_allocated_gib"),
             "cuda_components_reserved": cuda_result.get("memory", {}).get("max_memory_reserved_gib"),
         },
+        "dmimov_sidecar": dmimov_sidecar,
         "missing_for_full_replacement": [
             "off-time intra-chunk/state work",
             "full DK/DQ/DV accumulation, not only same-time diagonal/qk-dV slices",
-            "DMIMO_V cross-chunk reduction or alternate ownership",
+            "full DMIMO_V accumulation, not only the qk_dot same-time sidecar slice",
             "dfactor/dangles/dd/dda/dssda/dda_cs_rev/dda_cs outputs",
             "production integration in the real bwd_bwd call boundary",
         ],
@@ -269,9 +383,29 @@ def _replacement_estimate(
         estimate["current_candidate_ratio_vs_tilelang_bwd_bwd"] = combined_ms / stage2_bb_ms
         estimate["current_candidate_speedup_floor_vs_tilelang_bwd_bwd"] = stage2_bb_ms / combined_ms
         estimate["remaining_budget_ms_to_equal_tilelang_bwd_bwd"] = stage2_bb_ms - combined_ms
+    if stage2_bb_ms is not None and combined_plus_dmimov_ms is not None:
+        estimate["candidate_plus_qk_dmimov_ratio_vs_tilelang_bwd_bwd"] = (
+            combined_plus_dmimov_ms / stage2_bb_ms
+        )
+        estimate["candidate_plus_qk_dmimov_speedup_floor_vs_tilelang_bwd_bwd"] = (
+            stage2_bb_ms / combined_plus_dmimov_ms
+        )
+        estimate["remaining_budget_after_qk_dmimov_to_equal_tilelang_bwd_bwd"] = (
+            stage2_bb_ms - combined_plus_dmimov_ms
+        )
     if floor_chain_ms is not None and stage2_chain_ms is not None:
         estimate["stage2_chain_with_current_incomplete_cuda_floor_ms"] = floor_chain_ms
         estimate["stage2_chain_floor_speedup"] = stage2_chain_ms / floor_chain_ms
+    if (
+        stage2_bf_ms is not None
+        and combined_plus_dmimov_ms is not None
+        and stage2_chain_ms is not None
+    ):
+        dmimov_floor_chain_ms = stage2_bf_ms + combined_plus_dmimov_ms
+        estimate["stage2_chain_with_current_plus_qk_dmimov_floor_ms"] = dmimov_floor_chain_ms
+        estimate["stage2_chain_with_current_plus_qk_dmimov_speedup"] = (
+            stage2_chain_ms / dmimov_floor_chain_ms
+        )
     return estimate
 
 
@@ -331,10 +465,15 @@ def _write_summary_csv(summary: dict[str, Any], csv_path: str) -> None:
                 "cuda_wave6_diag_ms",
                 "cuda_wave7_qk_dv_ms",
                 "cuda_combined_ms",
+                "qk_dmimov_output_owner_all_r_sidecar_ms",
+                "cuda_combined_plus_qk_dmimov_ms",
                 "cuda_component_sum_ms",
                 "cuda_ratio_vs_stage2_bwd_bwd",
                 "remaining_budget_ms_to_equal_stage2_bwd_bwd",
+                "cuda_plus_qk_dmimov_ratio_vs_stage2_bwd_bwd",
+                "remaining_budget_after_qk_dmimov_ms",
                 "stage2_chain_floor_speedup",
+                "stage2_chain_plus_qk_dmimov_floor_speedup",
             ],
         )
         writer.writeheader()
@@ -351,6 +490,12 @@ def _write_summary_csv(summary: dict[str, Any], csv_path: str) -> None:
                     "cuda_wave6_diag_ms": components.get("wave6_diag"),
                     "cuda_wave7_qk_dv_ms": components.get("wave7_qk_dv"),
                     "cuda_combined_ms": components.get("combined_one_launch_current_candidate"),
+                    "qk_dmimov_output_owner_all_r_sidecar_ms": components.get(
+                        "qk_dmimov_output_owner_all_r_sidecar"
+                    ),
+                    "cuda_combined_plus_qk_dmimov_ms": components.get(
+                        "combined_plus_qk_dmimov_sidecar"
+                    ),
                     "cuda_component_sum_ms": components.get("component_sum_two_launches"),
                     "cuda_ratio_vs_stage2_bwd_bwd": estimate.get(
                         "current_candidate_ratio_vs_tilelang_bwd_bwd"
@@ -358,7 +503,16 @@ def _write_summary_csv(summary: dict[str, Any], csv_path: str) -> None:
                     "remaining_budget_ms_to_equal_stage2_bwd_bwd": estimate.get(
                         "remaining_budget_ms_to_equal_tilelang_bwd_bwd"
                     ),
+                    "cuda_plus_qk_dmimov_ratio_vs_stage2_bwd_bwd": estimate.get(
+                        "candidate_plus_qk_dmimov_ratio_vs_tilelang_bwd_bwd"
+                    ),
+                    "remaining_budget_after_qk_dmimov_ms": estimate.get(
+                        "remaining_budget_after_qk_dmimov_to_equal_tilelang_bwd_bwd"
+                    ),
                     "stage2_chain_floor_speedup": estimate.get("stage2_chain_floor_speedup"),
+                    "stage2_chain_plus_qk_dmimov_floor_speedup": estimate.get(
+                        "stage2_chain_with_current_plus_qk_dmimov_speedup"
+                    ),
                 }
             )
 
@@ -496,7 +650,11 @@ def run_ab_remote(
             "tilelang_comparison": tilelang_comparison,
             "cuda_result": cuda_result,
         }
-        shape_result["replacement_estimate"] = _replacement_estimate(tilelang_by_name, cuda_result)
+        shape_result["replacement_estimate"] = _replacement_estimate(
+            tilelang_by_name,
+            cuda_result,
+            shape_result["shape"],
+        )
         report["shapes"].append(shape_result)
 
     report["artifacts"] = {
