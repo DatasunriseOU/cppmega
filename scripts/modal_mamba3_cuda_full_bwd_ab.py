@@ -786,6 +786,8 @@ def _write_summary_csv(summary: dict[str, Any], csv_path: str) -> None:
                 "component_candidate_projected_bwd_bwd_ms",
                 "component_candidate_remaining_budget_ms",
                 "component_candidate_production_credit",
+                "component_candidate_cta_count_gate",
+                "component_candidate_rejection_reasons",
                 "future_monolithic_candidate_ids",
             ],
         )
@@ -828,6 +830,22 @@ def _write_summary_csv(summary: dict[str, Any], csv_path: str) -> None:
                 (
                     f"{item.get('candidate_id')}="
                     f"{item.get('production_gate', {}).get('production_credit')}"
+                )
+                for item in component_reports
+                if item.get("candidate_id")
+            ]
+            component_cta_gate = [
+                (
+                    f"{item.get('candidate_id')}="
+                    f"{item.get('production_gate', {}).get('cta_count_occupancy', {}).get('status')}"
+                )
+                for item in component_reports
+                if item.get("candidate_id")
+            ]
+            component_rejections = [
+                (
+                    f"{item.get('candidate_id')}="
+                    f"{','.join(item.get('production_gate', {}).get('rejection_reasons') or [])}"
                 )
                 for item in component_reports
                 if item.get("candidate_id")
@@ -880,6 +898,8 @@ def _write_summary_csv(summary: dict[str, Any], csv_path: str) -> None:
                     "component_candidate_projected_bwd_bwd_ms": ";".join(component_projected),
                     "component_candidate_remaining_budget_ms": ";".join(component_budget),
                     "component_candidate_production_credit": ";".join(component_credit),
+                    "component_candidate_cta_count_gate": ";".join(component_cta_gate),
+                    "component_candidate_rejection_reasons": ";".join(component_rejections),
                     "future_monolithic_candidate_ids": ",".join(
                         str(item) for item in future_ids if item
                     ),

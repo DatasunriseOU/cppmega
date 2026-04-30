@@ -132,6 +132,7 @@ FULL_CHAIN_COMPARE_NAMES = tuple(
 )
 BWD_BWD_OUTPUT_NAMES = tuple(spec.name for spec in BWD_BWD_OUTPUT_SPECS)
 OPTIONAL_HARDWARE_TAGS = ("H100", "H200", "B200")
+DEFAULT_H200_SM_COUNT = 132
 PRODUCTION_RESOURCE_METADATA_FIELDS = (
     "registers_per_thread",
     "smem_bytes",
@@ -148,7 +149,33 @@ _RESOURCE_METADATA_ALIASES = {
         "static_smem_bytes",
     ),
     "active_blocks_per_sm": ("active_blocks_per_sm", "blocks_per_sm"),
-    "theoretical_occupancy": ("theoretical_occupancy", "occupancy"),
+    "theoretical_occupancy": (
+        "theoretical_occupancy",
+        "occupancy",
+        "theoretical_occupancy_pct",
+        "occupancy_pct",
+    ),
+}
+_CTA_METADATA_ALIASES = {
+    "total_ctas": (
+        "total_ctas",
+        "cta_count",
+        "grid_ctas",
+        "total_CTA_count",
+        "total_CTAs",
+        "scan_owner_ctas",
+        "chunk_owner_ctas",
+        "total_blocks",
+        "grid_blocks",
+    ),
+    "ctas_per_sm": (
+        "ctas_per_sm",
+        "cta_per_sm",
+        "ctas_per_sm_at_132_sms",
+        "scan_owner_ctas_per_sm_at_132_sms",
+        "chunk_owner_ctas_per_sm_at_132_sms",
+    ),
+    "sm_count": ("sm_count", "sms", "gpu_sm_count", "h200_sm_count"),
 }
 _MICRO_GEMM_SCOPE_MARKERS = (
     "micro_gemm",
@@ -266,12 +293,26 @@ def _normalize_hardware_tags(raw: dict[str, Any], metadata: dict[str, Any]) -> l
     return [tag for tag in OPTIONAL_HARDWARE_TAGS if tag in found]
 
 
-def _metadata_lookup(metadata: dict[str, Any], logical_field: str) -> Any:
-    for key in _RESOURCE_METADATA_ALIASES[logical_field]:
-        value = metadata.get(key)
+def _lookup_alias(mapping: dict[str, Any], names: tuple[str, ...]) -> Any:
+    for key in names:
+        value = mapping.get(key)
         if value not in (None, ""):
             return value
     return None
+
+
+def _metadata_lookup(metadata: dict[str, Any], logical_field: str) -> Any:
+    return _lookup_alias(metadata, _RESOURCE_METADATA_ALIASES[logical_field])
+
+
+def _metadata_float(metadata: dict[str, Any], aliases: tuple[str, ...]) -> float | None:
+    value = _lookup_alias(metadata, aliases)
+    return float(value) if value is not None else None
+
+
+def _metadata_int(metadata: dict[str, Any], aliases: tuple[str, ...]) -> int | None:
+    value = _lookup_alias(metadata, aliases)
+    return int(float(value)) if value is not None else None
 
 
 def _receipt_scope_from_raw(
@@ -659,6 +700,44 @@ def _resource_metadata_gate(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _cta_count_occupancy_gate(record: dict[str, Any]) -> dict[str, Any]:
+    metadata = record.get("metadata") or {}
+    total_ctas = _metadata_int(metadata, _CTA_METADATA_ALIASES["total_ctas"])
+    sm_count = (
+        _metadata_int(metadata, _CTA_METADATA_ALIASES["sm_count"])
+        or DEFAULT_H200_SM_COUNT
+    )
+    ctas_per_sm = _metadata_float(metadata, _CTA_METADATA_ALIASES["ctas_per_sm"])
+    if ctas_per_sm is None and total_ctas is not None and sm_count > 0:
+        ctas_per_sm = total_ctas / sm_count
+
+    occupancy = _metadata_lookup(metadata, "theoretical_occupancy")
+    occupancy_fraction = float(occupancy) if occupancy is not None else None
+    if occupancy_fraction is not None and occupancy_fraction > 1.0:
+        occupancy_fraction /= 100.0
+
+    if total_ctas is None:
+        status = "missing"
+    elif (
+        total_ctas < sm_count
+        or (ctas_per_sm is not None and ctas_per_sm < 1.0)
+    ):
+        status = "underfilled"
+    else:
+        status = "pass"
+
+    return {
+        "status": status,
+        "total_ctas": total_ctas,
+        "sm_count": sm_count,
+        "ctas_per_sm": ctas_per_sm,
+        "minimum_total_ctas": sm_count,
+        "minimum_ctas_per_sm": 1.0,
+        "theoretical_occupancy": occupancy_fraction,
+        "required": "at least one CTA per H200 SM plus reported theoretical occupancy",
+    }
+
+
 def _modal_hygiene_gate(record: dict[str, Any]) -> dict[str, Any]:
     hygiene = record.get("modal_hygiene") or {}
     if not isinstance(hygiene, dict) or not hygiene:
@@ -726,6 +805,7 @@ def production_candidate_gate(
     ]
     correctness = record.get("correctness") or {}
     resource_gate = _resource_metadata_gate(record)
+    cta_gate = _cta_count_occupancy_gate(record)
     modal_gate = _modal_hygiene_gate(record)
     hardware_tags = list(record.get("hardware_tags") or [])
 
@@ -756,6 +836,10 @@ def production_candidate_gate(
         rejection_reasons.append("full_boundary_correctness_not_reported")
     if resource_gate["status"] != "pass":
         rejection_reasons.append("resource_metadata_incomplete")
+    if cta_gate["status"] == "underfilled":
+        rejection_reasons.append("cta_count_underfilled")
+    elif cta_gate["status"] != "pass":
+        rejection_reasons.append("cta_count_missing")
     if "H200" not in hardware_tags:
         rejection_reasons.append("h200_hardware_tag_missing")
     if modal_gate["status"] != "pass":
@@ -774,6 +858,7 @@ def production_candidate_gate(
         "missing_output_slots": missing_slots,
         "full_boundary_correctness": correctness.get("full_boundary_pass") is True,
         "resource_metadata": resource_gate,
+        "cta_count_occupancy": cta_gate,
         "hardware_tags": {
             "reported": hardware_tags,
             "allowed_optional_tags": list(OPTIONAL_HARDWARE_TAGS),
@@ -1009,6 +1094,13 @@ def readiness_gates() -> list[dict[str, str]]:
             "requirement": (
                 "registers/thread, shared-memory bytes, active blocks/SM, and "
                 "theoretical occupancy are reported for the integrated candidate"
+            ),
+        },
+        {
+            "gate": "cta_count_occupancy",
+            "requirement": (
+                "integrated candidate reports total CTA count and can launch at "
+                "least one CTA per H200 SM; theoretical occupancy is reported"
             ),
         },
         {

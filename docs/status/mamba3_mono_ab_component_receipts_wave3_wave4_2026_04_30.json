@@ -1,6 +1,6 @@
 {
   "schema_version": "mamba3-mono-ab/v1",
-  "receipt_set": "mamba3-mono-ab-wave4-ingested-component-receipts",
+  "receipt_set": "mamba3-mono-ab-wave5-ingested-component-receipts",
   "canonical_gate": {
     "shape": "productionish",
     "stage2_bwd_bwd_ms": 3.70674,
@@ -34,6 +34,12 @@
     {
       "doc": "docs/status/mamba3_rr_diag_microkernel_wave4_2026_04_29.md",
       "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-ab-prod",
+      "status": "available"
+    },
+    {
+      "doc": "docs/status/mamba3_mono_cuda_chunk_wave5_2026_04_30.md",
+      "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cuda-chunk",
+      "source_commit": "a3bb497",
       "status": "available"
     }
   ],
@@ -192,6 +198,87 @@
         ]
       },
       "note": "Correct CuTe micro-GEMM receipt only. The production gate must assign zero production credit until this covers the real bwd_bwd output slots, reports integrated resource metadata, and beats the H200 TileLang budget."
+    },
+    {
+      "candidate_id": "wave5_cuda_scan_owner_dv_dmimov_dssda",
+      "display_name": "Wave5 CUDA scan-owner DV/DMIMO_V/DSSDA",
+      "role": "external_component_candidate",
+      "implementation_class": "cuda_scan_owner_bh_component",
+      "shape": "productionish",
+      "receipt_scope": "bwd_bwd_component",
+      "status": "partial_correct_research_rejected",
+      "hardware_tags": [
+        "H200"
+      ],
+      "source": {
+        "lane": "mono-cuda-chunk",
+        "branch": "worker/mamba3-mono-cuda-chunk",
+        "commit": "a3bb497",
+        "doc": "docs/status/mamba3_mono_cuda_chunk_wave5_2026_04_30.md",
+        "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cuda-chunk"
+      },
+      "components": [
+        {
+          "component_id": "scan_owner_dv_dmimov_dssda",
+          "mean_ms": 14.08131217956543,
+          "launches": 1,
+          "covered_slots": [
+            "dv",
+            "dmimo_v",
+            "dssda"
+          ],
+          "status": "reported_subset_correct",
+          "note": "H200 productionish scan-owner slice: one CTA owns one (B,H) scan and writes DV, final DMIMO_V, and DSSDA. DK/DQ and scalar outputs are not covered."
+        }
+      ],
+      "correctness": {
+        "max_abs": 4.76837158203125e-07,
+        "full_boundary_pass": false,
+        "subset_pass": true,
+        "details": {
+          "h200_productionish_vs_bf16_staged_torch_ref": {
+            "dv_delta": 4.76837158203125e-07,
+            "dmimo_v_delta": 2.561137080192566e-09,
+            "dssda_delta": 2.6645352591003757e-15
+          },
+          "h200_productionish_vs_wave1_fp32_ref": {
+            "dv_delta": 9.5367431640625e-07,
+            "dmimo_v_delta": 5.432055331766605e-06,
+            "dssda_delta": 3.33120198092729e-11
+          },
+          "dk_dq_covered": false
+        }
+      },
+      "reference": {
+        "stage2_bwd_bwd_ms": 3.70674
+      },
+      "metadata": {
+        "owner": "B,H scan",
+        "total_ctas": 128,
+        "h200_sm_count": 132,
+        "ctas_per_sm_at_132_sms": 0.9696969696969697,
+        "chunks_per_cta": 256,
+        "logical_chunk_visits": 32768,
+        "p_panels_per_chunk": 2,
+        "registers_per_thread": 190,
+        "dynamic_smem_bytes": 68612,
+        "active_blocks_per_sm": 1,
+        "theoretical_occupancy": 0.125,
+        "theoretical_occupancy_pct": 12.5
+      },
+      "modal_hygiene": {
+        "status": "pass",
+        "active_same_campaign_count": 0,
+        "apps": [
+          {
+            "app_id": "ap-0hNvO9jVO5y9g6iHzlWKdS",
+            "description": "mamba3-mono-cuda-chunk-wave5",
+            "state": "stopped",
+            "tasks": 0
+          }
+        ]
+      },
+      "note": "Useful scan-owner correctness/resource skeleton only. It is 3.80x slower than TileLang stage2 bwd_bwd, launches only 128 CTAs for 132 H200 SMs, and lacks DK/DQ plus the rest of the full bwd_bwd boundary."
     },
     {
       "candidate_id": "wave3_wgmma_plan_budget",

@@ -151,6 +151,8 @@ def test_micro_gemm_only_correct_candidate_gets_zero_production_credit() -> None
                         "dynamic_smem_bytes": 32768,
                         "active_blocks_per_sm": 2,
                         "theoretical_occupancy": 0.5,
+                        "total_ctas": 256,
+                        "h200_sm_count": 132,
                     },
                     "modal_hygiene": {
                         "status": "pass",
@@ -190,6 +192,8 @@ def test_incomplete_slot_coverage_rejects_boundary_candidate() -> None:
                         "static_smem_bytes": 16384,
                         "active_blocks_per_sm": 4,
                         "occupancy": 0.5,
+                        "total_ctas": 264,
+                        "h200_sm_count": 132,
                     },
                     "modal_hygiene": {
                         "status": "pass",
@@ -208,6 +212,62 @@ def test_incomplete_slot_coverage_rejects_boundary_candidate() -> None:
     assert gate["rejection_reasons"] == ["missing_required_output_slots"]
     assert gate["missing_output_slots"] == ["dda_cs"]
     assert gate["resource_metadata"]["status"] == "pass"
+    assert gate["cta_count_occupancy"]["status"] == "pass"
+
+
+def test_underfilled_scan_owner_subset_gets_zero_production_credit() -> None:
+    records = candidate_component_records_from_json(
+        {
+            "candidate_component_records": [
+                {
+                    "candidate_id": "wave5_cuda_scan_owner_dv_dmimov_dssda",
+                    "implementation_class": "cuda_scan_owner_bh_component",
+                    "shape": "productionish",
+                    "projected_bwd_bwd_ms": 14.08131217956543,
+                    "covered_slots": ["dv", "dmimo_v", "dssda"],
+                    "correctness": {
+                        "full_boundary_pass": False,
+                        "subset_pass": True,
+                        "max_abs": 4.76837158203125e-07,
+                    },
+                    "hardware_tags": ["H200"],
+                    "metadata": {
+                        "registers_per_thread": 190,
+                        "dynamic_smem_bytes": 68612,
+                        "active_blocks_per_sm": 1,
+                        "theoretical_occupancy": 0.125,
+                        "total_ctas": 128,
+                        "h200_sm_count": 132,
+                    },
+                    "modal_hygiene": {
+                        "status": "pass",
+                        "active_same_campaign_count": 0,
+                    },
+                    "reference": {"stage2_bwd_bwd_ms": 3.70674},
+                }
+            ]
+        }
+    )
+
+    projection = component_record_projection(records[0])
+    gate = projection["production_gate"]
+
+    assert projection["projected_bwd_bwd_ms"] == pytest.approx(14.08131217956543)
+    assert projection["covered_slots"] == ["dv", "dmimo_v", "dssda"]
+    assert gate["production_credit"] is False
+    assert gate["production_credit_ms"] == 0.0
+    assert gate["credited_output_slots"] == []
+    assert "missing_required_output_slots" in gate["rejection_reasons"]
+    assert "full_boundary_correctness_not_reported" in gate["rejection_reasons"]
+    assert "cta_count_underfilled" in gate["rejection_reasons"]
+    assert "performance_budget_not_met" in gate["rejection_reasons"]
+    assert "dk" in gate["missing_output_slots"]
+    assert "dq" in gate["missing_output_slots"]
+    assert gate["resource_metadata"]["status"] == "pass"
+    assert gate["cta_count_occupancy"]["status"] == "underfilled"
+    assert gate["cta_count_occupancy"]["total_ctas"] == 128
+    assert gate["cta_count_occupancy"]["minimum_total_ctas"] == 132
+    assert gate["cta_count_occupancy"]["ctas_per_sm"] == pytest.approx(128 / 132)
 
 
 def test_component_record_markdown_fence_and_shape_filter() -> None:
@@ -351,6 +411,25 @@ def test_wave3_wave4_receipt_file_gates_current_research_numbers() -> None:
     assert wave4_diag["projected_bwd_bwd_ms"] == pytest.approx(2.0560)
     assert wave4_diag["covered_slots"] == ["dk", "dq", "dgamma_diag"]
 
+    scan_owner = component_record_projection(
+        by_id["wave5_cuda_scan_owner_dv_dmimov_dssda"]
+    )
+    scan_gate = scan_owner["production_gate"]
+    assert scan_owner["projected_bwd_bwd_ms"] == pytest.approx(14.08131217956543)
+    assert scan_owner["covered_slots"] == ["dv", "dmimo_v", "dssda"]
+    assert scan_gate["production_credit"] is False
+    assert scan_gate["production_credit_ms"] == 0.0
+    assert "dk" in scan_gate["missing_output_slots"]
+    assert "dq" in scan_gate["missing_output_slots"]
+    assert "missing_required_output_slots" in scan_gate["rejection_reasons"]
+    assert "cta_count_underfilled" in scan_gate["rejection_reasons"]
+    assert scan_gate["cta_count_occupancy"]["status"] == "underfilled"
+    assert scan_gate["cta_count_occupancy"]["total_ctas"] == 128
+    assert scan_gate["cta_count_occupancy"]["minimum_total_ctas"] == 132
+    assert by_id["wave5_cuda_scan_owner_dv_dmimov_dssda"]["correctness"][
+        "subset_pass"
+    ] is True
+
     productionish_records = filter_candidate_component_records_for_shape(
         records,
         "productionish",
@@ -359,6 +438,7 @@ def test_wave3_wave4_receipt_file_gates_current_research_numbers() -> None:
         "wave3_cuda_wmma_triangular_chunk_owner",
         "wave3_wgmma_plan_budget",
         "wave4_rr_diag_cuda_timestep_cta",
+        "wave5_cuda_scan_owner_dv_dmimov_dssda",
     }
 
 
