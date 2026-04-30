@@ -24,6 +24,7 @@ def _fresh_grouped_shim(monkeypatch, *, grouped_direct: bool = False):
         "CPPMEGA_TE_MXFP8_WGRAD_BF16",
         "NVTE_BACKWARD_OVERRIDE",
         "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD",
+        "CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD",
     ):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER", "1")
@@ -66,6 +67,70 @@ def _wrap_fake_grouped_module(shim):
     module = SimpleNamespace(general_grouped_gemm=general_grouped_gemm)
     assert shim._cppmega_wrap_general_grouped_gemm(module)
     return module, orig_calls
+
+
+def _mark_rowwise_transpose(tensor):
+    tensor._te_rowwise_transpose_for_backward_operand = True
+    return tensor
+
+
+@pytest.mark.parametrize(
+    ("layout", "op_kind", "mark_a", "mark_b"),
+    [
+        ("NN", "dgrad", True, False),
+        ("NT", "wgrad", True, True),
+    ],
+)
+def test_grouped_mxfp8_gemm_ready_route_uses_existing_operands_without_copy(
+    monkeypatch,
+    layout,
+    op_kind,
+    mark_a,
+    mark_b,
+):
+    shim = _fresh_grouped_shim(monkeypatch, grouped_direct=False)
+    _reset_bwd_stats(shim)
+
+    def fail_copy_bridge(*_args, **_kwargs):
+        raise AssertionError("GEMM-ready grouped path used the transpose-copy bridge")
+
+    monkeypatch.setattr(
+        shim,
+        "_cppmega_mxfp8_colwise_as_rowwise_transpose",
+        fail_copy_bridge,
+    )
+
+    module, orig_calls = _wrap_fake_grouped_module(shim)
+    A = [_FakeMXFP8Tensor(f"{layout}-A0"), _FakeMXFP8Tensor(f"{layout}-A1")]
+    B = [_FakeMXFP8Tensor(f"{layout}-B0"), _FakeMXFP8Tensor(f"{layout}-B1")]
+    if mark_a:
+        A = [_mark_rowwise_transpose(item) for item in A]
+    if mark_b:
+        B = [_mark_rowwise_transpose(item) for item in B]
+
+    result = module.general_grouped_gemm(
+        A,
+        B,
+        object(),
+        "splits",
+        layout=layout,
+        grad=True,
+    )
+
+    assert result == "fallback-result"
+    assert len(orig_calls) == 1
+    call_A, call_B, _out, call_args, call_kwargs = orig_calls[0]
+    assert call_A == A
+    assert call_B == B
+    assert call_args == ("splits",)
+    assert call_kwargs["layout"] == "TN"
+    assert call_kwargs["use_split_accumulator"] is False
+
+    stats = shim.cppmega_te_mxfp8_bwd_stats
+    assert stats[f"mxfp8_grouped_gemm_ready_{op_kind}"] == 1
+    assert stats[f"mxfp8_grouped_gemm_ready_miss_{op_kind}"] == 0
+    assert stats[f"mxfp8_grouped_transpose_copy_fallback_{op_kind}"] == 0
+    assert stats["mxfp8_tn_adapter_copy_transpose"] == 0
 
 
 def test_grouped_mxfp8_direct_hits_bypass_transpose_and_sidecars(monkeypatch):
