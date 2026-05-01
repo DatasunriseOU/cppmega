@@ -84,11 +84,14 @@ jobs:
           - name: flash_attn_3
             # Hopper FA3 path from the same fork (subdir hopper/), separate
             # PACKAGE_NAME=flash_attn_3 so it co-installs with flash_attn FA2/FA4.
-            # Useful for H100/H200 on Modal. Compiled for sm_90 only by default.
+            # Useful for H100/H200 on Modal. ONLY sm_90 — building for 10.0 / 12.1
+            # is wasted (kernels don't apply) and triples compile time, which
+            # blows the 5h50m timeout (cancelled at 5h51m on full arch list).
             repo: jewelmusicee/flash-attention
             ref: cppmega/fa4-gb10-fixes
             submodules: "false"
             subdir: hopper
+            arch_override: "9.0"
             extra_env: "MAX_JOBS=1 NVCC_THREADS=2 FLASH_ATTENTION_FORCE_BUILD=TRUE"
           - name: mamba_ssm
             repo: state-spaces/mamba
@@ -190,8 +193,12 @@ jobs:
       - name: Configure nvcc → gcc-15
         run: |
           echo "NVCC_PREPEND_FLAGS=--compiler-bindir=/usr/bin/g++-15 --allow-unsupported-compiler" >> "$GITHUB_ENV"
-          echo "TORCH_CUDA_ARCH_LIST=${{ env.TORCH_CUDA_ARCH_LIST }}" >> "$GITHUB_ENV"
+          # Per-matrix arch_override wins over the global TORCH_CUDA_ARCH_LIST
+          # (e.g. flash_attn_3 hopper-only sm_90, no 10.0/12.1).
+          ARCH="${{ matrix.arch_override || env.TORCH_CUDA_ARCH_LIST }}"
+          echo "TORCH_CUDA_ARCH_LIST=${ARCH}" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=/usr/local/cuda-13.2/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "Using TORCH_CUDA_ARCH_LIST=${ARCH}"
 
       - name: Restore ccache
         uses: actions/cache@v4
