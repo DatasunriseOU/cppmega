@@ -165,10 +165,29 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install gcc-15 + ccache
+        # add-apt-repository hits Launchpad's API which periodically goes down
+        # (we lost a full run cycle when PPA returned 'TimeoutError: Connection
+        # timed out'). Retry up to 5 times with backoff. After PPA succeeds,
+        # apt-get update can also fail transiently; retry separately.
         run: |
-          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
-          sudo apt-get update
-          sudo apt-get install -y gcc-15 g++-15 ccache ninja-build
+          set -euo pipefail
+          retry() {
+            local max=${1:-5}; shift
+            local n=0
+            until "$@"; do
+              n=$((n+1))
+              if [ "$n" -ge "$max" ]; then
+                echo "::error::Command failed after $max attempts: $*"
+                return 1
+              fi
+              local sleep_s=$((10 * n))
+              echo "::warning::Attempt $n/$max failed; retrying in ${sleep_s}s: $*"
+              sleep "$sleep_s"
+            done
+          }
+          retry 5 sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          retry 3 sudo apt-get update
+          retry 3 sudo apt-get install -y gcc-15 g++-15 ccache ninja-build
           sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-15 90
           sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-15 90
           gcc --version
