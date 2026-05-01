@@ -259,14 +259,22 @@ jobs:
         # /usr/lib/ccache/<tool> -> ccache; ccache then exec's the real binary.
         run: |
           sudo mkdir -p /usr/lib/ccache
-          for tool in cc gcc g++ c++ gcc-15 g++-15 nvcc; do
+          for tool in cc gcc g++ c++ gcc-15 g++-15 gcc-14 g++-14 nvcc; do
             sudo ln -sf /usr/bin/ccache /usr/lib/ccache/$tool
           done
           echo "/usr/lib/ccache" >> "$GITHUB_PATH"
 
-      - name: Configure nvcc → gcc-15
+      - name: Configure nvcc → host gcc
+        # Detect which gcc is actually installed (preferred gcc-15 from PPA, or
+        # gcc-14 fallback if Launchpad was down). Use a local `g++` symlink so
+        # nvcc's --compiler-bindir always resolves regardless of which version.
         run: |
-          echo "NVCC_PREPEND_FLAGS=--compiler-bindir=/usr/bin/g++-15 --allow-unsupported-compiler" >> "$GITHUB_ENV"
+          set -euo pipefail
+          if command -v g++-15 >/dev/null 2>&1; then HOSTCXX=/usr/bin/g++-15
+          elif command -v g++-14 >/dev/null 2>&1; then HOSTCXX=/usr/bin/g++-14
+          else echo "::error::Neither g++-15 nor g++-14 found"; exit 1; fi
+          echo "Using host C++ for nvcc: $HOSTCXX"
+          echo "NVCC_PREPEND_FLAGS=--compiler-bindir=${HOSTCXX} --allow-unsupported-compiler" >> "$GITHUB_ENV"
           # Per-matrix arch_override wins over the global TORCH_CUDA_ARCH_LIST
           # (e.g. flash_attn_3 hopper-only sm_90, no 10.0/12.1).
           ARCH="${{ matrix.arch_override || env.TORCH_CUDA_ARCH_LIST }}"
