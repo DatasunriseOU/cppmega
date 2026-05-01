@@ -164,73 +164,49 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install gcc-15 + ccache
-        # `add-apt-repository ppa:...` calls Launchpad's REST API (api.launchpad.net)
-        # to validate the PPA before adding it. That host has been flaking for hours
-        # ('TimeoutError: Connection timed out'), and even 5 retries didn't help.
-        # Bypass it entirely: write the apt source line manually and import the
-        # signing key from keyserver.ubuntu.com (separate host, has been up).
-        # Falls back to a hardcoded ASCII-armored key if the keyserver is also down.
+      - name: Install gcc-15 + ccache (vendored debs)
+        # We pulled gcc-15 .debs from Ubuntu questing (25.10) main archive
+        # once and uploaded them as a release asset on this repo. This avoids
+        # the chronically flaky Launchpad PPA (api.launchpad.net + ppa.launchpad
+        # content.net both regularly time out / return 503 from GH runners,
+        # blocking every wheel build for hours).
+        # Source: archive.ubuntu.com/ubuntu/pool/main/g/gcc-15/ (15.2.0-4ubuntu4)
+        # Release: github.com/jewelmusicee/cppmega/releases/tag/${TOOLCHAIN_TAG}
+        env:
+          TOOLCHAIN_TAG: toolchain-gcc-15-15.2.0-4ubuntu4
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          retry() {
-            local max=${1:-5}; shift
-            local n=0
-            until "$@"; do
-              n=$((n+1))
-              if [ "$n" -ge "$max" ]; then
-                echo "::error::Command failed after $max attempts: $*"
-                return 1
-              fi
-              local sleep_s=$((10 * n))
-              echo "::warning::Attempt $n/$max failed; retrying in ${sleep_s}s: $*"
-              sleep "$sleep_s"
-            done
-          }
-          CODENAME=$(lsb_release -cs)
-          KEY_FPR=60C317803A41BA51845E371A1E9377A2BA9EF27F
-          sudo install -d -m 0755 /etc/apt/keyrings
-          # Try keyserver.ubuntu.com first; fall back to keys.openpgp.org.
-          if ! retry 3 bash -c "curl -fsSL --max-time 30 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${KEY_FPR}' | sudo gpg --dearmor --yes -o /etc/apt/keyrings/ubuntu-toolchain-r.gpg"; then
-            echo "::warning::keyserver.ubuntu.com unreachable; trying keys.openpgp.org"
-            retry 3 bash -c "curl -fsSL --max-time 30 'https://keys.openpgp.org/vks/v1/by-fingerprint/${KEY_FPR}' | sudo gpg --dearmor --yes -o /etc/apt/keyrings/ubuntu-toolchain-r.gpg"
-          fi
-          echo "deb [signed-by=/etc/apt/keyrings/ubuntu-toolchain-r.gpg] https://ppa.launchpadcontent.net/ubuntu-toolchain-r/test/ubuntu ${CODENAME} main" \
-            | sudo tee /etc/apt/sources.list.d/ubuntu-toolchain-r-test.list
-          # ppa.launchpadcontent.net (Launchpad's CDN) intermittently returns 503
-          # Service Unavailable. apt-get update doesn't fail-hard on a per-repo
-          # 503 — it just emits a W: warning and proceeds with stale state, after
-          # which `gcc-15` "Unable to locate package". So we wrap update+verify
-          # in a single retry: only declare success when the PPA's InRelease has
-          # actually been fetched. Configure apt with internal retries too.
-          PPA_URL="https://ppa.launchpadcontent.net/ubuntu-toolchain-r/test/ubuntu/dists/${CODENAME}/InRelease"
-          ppa_ready() {
-            set +e
-            sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update 2>&1 | tee /tmp/apt-update.log
-            if grep -q "Failed to fetch ${PPA_URL}" /tmp/apt-update.log; then return 1; fi
-            apt-cache policy gcc-15 2>/dev/null | grep -q ubuntu-toolchain
-          }
-          # Up to ~15 min of total wait for Launchpad's CDN to come back.
-          n=0; until ppa_ready; do
-            n=$((n+1))
-            if [ "$n" -ge 8 ]; then
-              echo "::error::Launchpad PPA still unreachable after 8 attempts; falling back to gcc-14 from noble main"
-              sudo rm -f /etc/apt/sources.list.d/ubuntu-toolchain-r-test.list
-              sudo apt-get -o Acquire::Retries=5 update
-              sudo apt-get install -y gcc-14 g++-14 ccache ninja-build
-              sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 90
-              sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-14 90
-              gcc --version
-              exit 0
-            fi
-            sleep_s=$((30 * n))
-            echo "::warning::PPA InRelease not ready (attempt ${n}/8); sleeping ${sleep_s}s"
-            sleep "$sleep_s"
-          done
-          retry 3 sudo apt-get install -y gcc-15 g++-15 ccache ninja-build
+          mkdir -p /tmp/gcc15
+          cd /tmp/gcc15
+          # Download from our own release (GitHub's CDN, very stable). One blob,
+          # no PPA, no add-apt-repository, no Launchpad anywhere in the path.
+          gh release download "$TOOLCHAIN_TAG" \
+              --repo jewelmusicee/cppmega \
+              --pattern 'gcc-15-noble-amd64.tar.gz'
+          tar xzf gcc-15-noble-amd64.tar.gz
+          sha256sum -c SHA256SUMS
+          # Install ccache + ninja from noble main (no PPA needed for these).
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get install -y ccache ninja-build
+          # dpkg -i in dependency order. All deps (libgmp10, libisl23, libmpc3,
+          # libmpfr6, libzstd1, zlib1g, binutils) are already in noble main.
+          # libcc1-0 from gcc-15 replaces the noble libcc1-0 (14.2.0) — fine.
+          sudo dpkg -i \
+              gcc-15-base_*.deb \
+              libcc1-0_*.deb \
+              libgcc-15-dev_*.deb \
+              libstdc++-15-dev_*.deb \
+              cpp-15-x86-64-linux-gnu_*.deb \
+              cpp-15_*.deb \
+              gcc-15-x86-64-linux-gnu_*.deb \
+              gcc-15_*.deb \
+              g++-15-x86-64-linux-gnu_*.deb \
+              g++-15_*.deb
           sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-15 90
           sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-15 90
           gcc --version
+          g++ --version
 
       - name: Install CUDA ${{ env.CUDA_VERSION }} (apt from NVIDIA repo)
         run: |
@@ -264,17 +240,9 @@ jobs:
           done
           echo "/usr/lib/ccache" >> "$GITHUB_PATH"
 
-      - name: Configure nvcc → host gcc
-        # Detect which gcc is actually installed (preferred gcc-15 from PPA, or
-        # gcc-14 fallback if Launchpad was down). Use a local `g++` symlink so
-        # nvcc's --compiler-bindir always resolves regardless of which version.
+      - name: Configure nvcc → gcc-15
         run: |
-          set -euo pipefail
-          if command -v g++-15 >/dev/null 2>&1; then HOSTCXX=/usr/bin/g++-15
-          elif command -v g++-14 >/dev/null 2>&1; then HOSTCXX=/usr/bin/g++-14
-          else echo "::error::Neither g++-15 nor g++-14 found"; exit 1; fi
-          echo "Using host C++ for nvcc: $HOSTCXX"
-          echo "NVCC_PREPEND_FLAGS=--compiler-bindir=${HOSTCXX} --allow-unsupported-compiler" >> "$GITHUB_ENV"
+          echo "NVCC_PREPEND_FLAGS=--compiler-bindir=/usr/bin/g++-15 --allow-unsupported-compiler" >> "$GITHUB_ENV"
           # Per-matrix arch_override wins over the global TORCH_CUDA_ARCH_LIST
           # (e.g. flash_attn_3 hopper-only sm_90, no 10.0/12.1).
           ARCH="${{ matrix.arch_override || env.TORCH_CUDA_ARCH_LIST }}"
