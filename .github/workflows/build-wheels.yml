@@ -82,17 +82,32 @@ jobs:
             submodules: "false"
             extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
           - name: flash_attn_3
-            # Hopper FA3 path from the same fork (subdir hopper/), separate
-            # PACKAGE_NAME=flash_attn_3 so it co-installs with flash_attn FA2/FA4.
-            # Useful for H100/H200 on Modal. ONLY sm_90 — building for 10.0 / 12.1
-            # is wasted (kernels don't apply) and triples compile time, which
-            # blows the 5h50m timeout (cancelled at 5h51m on full arch list).
+            # Hopper FA3 path from the same fork (subdir hopper/). Trimmed to
+            # training essentials only: bf16+fp8, hdim 64/128, varlen+backward.
+            # Drop fp16, hdim 96/192/256, paged/append KV (inference), local,
+            # softcap, packgqa, cluster, hdimdiff64/192. Even at sm_90 + MAX_JOBS=1
+            # the full kernel matrix runs ~6h+ on free runners — cancelled at
+            # 5h51m on previous runs. The trimmed set fits in <1h.
             repo: jewelmusicee/flash-attention
             ref: cppmega/fa4-gb10-fixes
             submodules: "false"
             subdir: hopper
             arch_override: "9.0"
-            extra_env: "MAX_JOBS=1 NVCC_THREADS=2 FLASH_ATTENTION_FORCE_BUILD=TRUE"
+            extra_env: >-
+              MAX_JOBS=1 NVCC_THREADS=2 FLASH_ATTENTION_FORCE_BUILD=TRUE
+              FLASH_ATTENTION_DISABLE_FP16=TRUE
+              FLASH_ATTENTION_DISABLE_HDIM96=TRUE
+              FLASH_ATTENTION_DISABLE_HDIM192=TRUE
+              FLASH_ATTENTION_DISABLE_HDIM256=TRUE
+              FLASH_ATTENTION_DISABLE_PAGEDKV=TRUE
+              FLASH_ATTENTION_DISABLE_APPENDKV=TRUE
+              FLASH_ATTENTION_DISABLE_LOCAL=TRUE
+              FLASH_ATTENTION_DISABLE_SOFTCAP=TRUE
+              FLASH_ATTENTION_DISABLE_PACKGQA=TRUE
+              FLASH_ATTENTION_DISABLE_CLUSTER=TRUE
+              FLASH_ATTENTION_DISABLE_HDIMDIFF64=TRUE
+              FLASH_ATTENTION_DISABLE_HDIMDIFF192=TRUE
+              FLASH_ATTENTION_DISABLE_SPLIT=TRUE
           - name: mamba_ssm
             repo: state-spaces/mamba
             ref: 31f3d7b
@@ -251,19 +266,34 @@ jobs:
         run: |
           set -euo pipefail
           BUILD_DIR="src${{ matrix.subdir && format('/{0}', matrix.subdir) || '' }}"
-          mkdir -p wheels
+          mkdir -p wheels logs
+          LOG="$GITHUB_WORKSPACE/logs/build-${{ matrix.name }}.log"
           cd "$BUILD_DIR"
+          # Tee build output to a file. Runner's per-step blob expires fast
+          # (Azure cleanup hits within ~30 min for some jobs); the artifact
+          # below keeps it for 30 days regardless.
           env ${{ matrix.extra_env }} \
-            pip wheel . --no-build-isolation --no-deps -w "$GITHUB_WORKSPACE/wheels" -v
+            pip wheel . --no-build-isolation --no-deps -w "$GITHUB_WORKSPACE/wheels" -v 2>&1 | tee "$LOG"
 
       - name: ccache stats
         if: always()
         run: ccache -s
 
       - name: List wheels
+        if: success()
         run: ls -lh wheels/
 
+      - name: Upload build log (always, even on failure/cancel)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-${{ matrix.name }}
+          path: logs/
+          retention-days: 30
+          if-no-files-found: warn
+
       - name: Upload wheels artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.name }}
