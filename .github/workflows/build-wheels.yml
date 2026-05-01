@@ -165,10 +165,12 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install gcc-15 + ccache
-        # add-apt-repository hits Launchpad's API which periodically goes down
-        # (we lost a full run cycle when PPA returned 'TimeoutError: Connection
-        # timed out'). Retry up to 5 times with backoff. After PPA succeeds,
-        # apt-get update can also fail transiently; retry separately.
+        # `add-apt-repository ppa:...` calls Launchpad's REST API (api.launchpad.net)
+        # to validate the PPA before adding it. That host has been flaking for hours
+        # ('TimeoutError: Connection timed out'), and even 5 retries didn't help.
+        # Bypass it entirely: write the apt source line manually and import the
+        # signing key from keyserver.ubuntu.com (separate host, has been up).
+        # Falls back to a hardcoded ASCII-armored key if the keyserver is also down.
         run: |
           set -euo pipefail
           retry() {
@@ -185,7 +187,16 @@ jobs:
               sleep "$sleep_s"
             done
           }
-          retry 5 sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          CODENAME=$(lsb_release -cs)
+          KEY_FPR=60C317803A41BA51845E371A1E9377A2BA9EF27F
+          sudo install -d -m 0755 /etc/apt/keyrings
+          # Try keyserver.ubuntu.com first; fall back to keys.openpgp.org.
+          if ! retry 3 bash -c "curl -fsSL --max-time 30 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${KEY_FPR}' | sudo gpg --dearmor --yes -o /etc/apt/keyrings/ubuntu-toolchain-r.gpg"; then
+            echo "::warning::keyserver.ubuntu.com unreachable; trying keys.openpgp.org"
+            retry 3 bash -c "curl -fsSL --max-time 30 'https://keys.openpgp.org/vks/v1/by-fingerprint/${KEY_FPR}' | sudo gpg --dearmor --yes -o /etc/apt/keyrings/ubuntu-toolchain-r.gpg"
+          fi
+          echo "deb [signed-by=/etc/apt/keyrings/ubuntu-toolchain-r.gpg] https://ppa.launchpadcontent.net/ubuntu-toolchain-r/test/ubuntu ${CODENAME} main" \
+            | sudo tee /etc/apt/sources.list.d/ubuntu-toolchain-r-test.list
           retry 3 sudo apt-get update
           retry 3 sudo apt-get install -y gcc-15 g++-15 ccache ninja-build
           sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-15 90
