@@ -346,6 +346,8 @@ jobs:
           after=$(grep -c '_sm80\.cu' setup.py || true)
           echo "trimmed $((before - after)) kernel sources ($before → $after); survivors:"
           grep '_sm80\.cu' setup.py | sed 's/^/  /'
+
+      - name: Build wheel
         run: |
           set -euo pipefail
           BUILD_DIR="src${{ matrix.subdir && format('/{0}', matrix.subdir) || '' }}"
