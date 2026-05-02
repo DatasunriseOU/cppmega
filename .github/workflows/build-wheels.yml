@@ -277,9 +277,21 @@ jobs:
           ccache -z
 
       - name: Install torch ${{ env.TORCH_VERSION }}
+        # download.pytorch.org sometimes drops the connection mid-stream on
+        # the big CUDA wheels (IncompleteRead on nvidia_cublas-*.whl, ~400 MB).
+        # --retries 10 + --timeout 60 makes pip retry the whole package on
+        # ProtocolError. Wrap in a shell loop too in case pip exits before retrying.
         run: |
+          set -euo pipefail
           pip install --upgrade pip setuptools wheel
-          pip install --pre --extra-index-url ${{ env.TORCH_INDEX }} "torch==${{ env.TORCH_VERSION }}"
+          n=0; until pip install --pre --retries 10 --timeout 60 \
+                       --extra-index-url ${{ env.TORCH_INDEX }} \
+                       "torch==${{ env.TORCH_VERSION }}"; do
+            n=$((n+1))
+            [ "$n" -ge 5 ] && { echo "::error::torch install failed after 5 attempts"; exit 1; }
+            echo "::warning::torch install attempt $n failed; retrying in $((30*n))s"
+            sleep $((30 * n))
+          done
           python -c "import torch; print(torch.__version__, torch.version.cuda)"
 
       - name: Install build deps
@@ -288,7 +300,7 @@ jobs:
         # numpy must be present for torch's tensor_numpy.cpp at build time.
         # z3-solver: tilelang's CMake calls 'import z3' during configure (FindZ3.cmake).
         # cython: tilelang ships a .pyx module (jit/adapter/cython/cython_wrapper.pyx).
-        run: pip install ninja packaging pybind11 cmake numpy einops scikit-build-core setuptools-scm "z3-solver>=4.13.0" cython
+        run: pip install --retries 10 --timeout 60 ninja packaging pybind11 cmake numpy einops scikit-build-core setuptools-scm "z3-solver>=4.13.0" cython
 
       - name: Clone source (any ref — branch / tag / SHA)
         run: |
