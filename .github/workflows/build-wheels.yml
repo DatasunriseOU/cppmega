@@ -77,10 +77,17 @@ jobs:
             # upstream b86e0cc — sm_120 score_mod, sm_121a Arch fix in
             # FlashAttentionForwardSm120.__init__, dQ_single_wg gating.
             # Builds the FA2 cuda kernels + FA4 cute python module in one wheel.
+            #
+            # NVCC_THREADS=1 (not 2): with 2, 7-GB ubuntu-latest runners OOM-kill
+            # the job at ~58 min mid-build (job ends with conclusion=null on the
+            # Build-wheel step + post-steps don't run — classic abrupt host kill).
+            # FA2 also doesn't expose FLASH_ATTENTION_DISABLE_* knobs the way FA3
+            # does, so trimming the kernel matrix isn't an option here — only RAM
+            # control is. Build is slower at threads=1 but stable.
             repo: jewelmusicee/flash-attention
             ref: cppmega/fa4-gb10-fixes
             submodules: "false"
-            extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
+            extra_env: "MAX_JOBS=1 NVCC_THREADS=1"
           - name: flash_attn_3
             # Hopper FA3 path from the same fork (subdir hopper/). Trimmed to
             # training essentials only: bf16+fp8, hdim 64/128, varlen+backward.
