@@ -334,27 +334,18 @@ jobs:
         run: |
           set -euo pipefail
           cd src
-          python <<'PY'
-          import re, pathlib
-          p = pathlib.Path("setup.py")
-          src = p.read_text()
-          # Drop any line that references a flash_{fwd,bwd}_hdim<N>_<dtype>_*.cu
-          # source unless it's bf16 hdim 64 or 128.
-          keep = re.compile(r"flash_(?:fwd|bwd)_hdim(?:64|128)_bf16(?:_causal)?_sm80\.cu")
-          drop = re.compile(r"flash_(?:fwd|bwd)_hdim\d+_(?:fp16|bf16)(?:_causal)?_sm80\.cu")
-          out = []
-          dropped = 0
-          for line in src.splitlines():
-              if drop.search(line) and not keep.search(line):
-                  dropped += 1
-                  continue
-              out.append(line)
-          p.write_text("\n".join(out) + "\n")
-          print(f"trimmed {dropped} kernel sources; remaining .cu refs:")
-          for line in out:
-              if "_sm80.cu" in line:
-                  print("  " + line.strip())
-          PY
+          # Drop unwanted kernel sources from setup.py's hardcoded list.
+          # FA2 has fwd, bwd, AND fwd_split (paged-KV inference) families.
+          # 1) all fp16 variants (fwd/bwd/fwd_split). 2) all hdims except 64,128.
+          # 3) all fwd_split (paged-KV — inference path, cppmega doesn't use).
+          # Survivors: flash_{fwd,bwd}_hdim{64,128}_bf16{,_causal}_sm80.cu = 8 files.
+          before=$(grep -c '_sm80\.cu' setup.py || true)
+          sed -i -E '/csrc\/flash_attn\/src\/flash_(fwd|bwd|fwd_split)_hdim[0-9]+_fp16(_causal)?_sm80\.cu/d' setup.py
+          sed -i -E '/csrc\/flash_attn\/src\/flash_(fwd|bwd|fwd_split)_hdim(32|96|192|256)_bf16(_causal)?_sm80\.cu/d' setup.py
+          sed -i -E '/csrc\/flash_attn\/src\/flash_fwd_split_hdim(64|128)_bf16(_causal)?_sm80\.cu/d' setup.py
+          after=$(grep -c '_sm80\.cu' setup.py || true)
+          echo "trimmed $((before - after)) kernel sources ($before → $after); survivors:"
+          grep '_sm80\.cu' setup.py | sed 's/^/  /'
         run: |
           set -euo pipefail
           BUILD_DIR="src${{ matrix.subdir && format('/{0}', matrix.subdir) || '' }}"
