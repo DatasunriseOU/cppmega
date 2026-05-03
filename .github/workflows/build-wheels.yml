@@ -105,6 +105,18 @@ jobs:
             # softcap, packgqa, cluster, hdimdiff64/192. Even at sm_90 + MAX_JOBS=1
             # the full kernel matrix runs ~6h+ on free runners — cancelled at
             # 5h51m on previous runs. The trimmed set fits in <1h.
+            #
+            # DISABLE_SM80=TRUE is critical: even though we set arch_override=9.0,
+            # leaving SM8x enabled pulls sm_80 .cu sources AND causes setup.py to
+            # instantiate \`run_mha_fwd_constexpr<Arch=80, ..., PackGQA=true, ...>\`.
+            # That template's e4m3 dispatch branch hardcodes \`<90, e4m3, ...>\` in
+            # the run_mha_fwd_<> call — so the compiler emits an undefined
+            # reference to \`run_mha_fwd_<90, e4m3, 64, 64, ..., PackGQA=true>\`
+            # even though we built with DISABLE_PACKGQA. Result: \`_C.abi3.so\`
+            # ImportError on \`undefined symbol\` at smoke test time. Locking
+            # ARCH_SWITCH to 90 (via DISABLE_SM8x → defined when SM80=TRUE)
+            # prevents the sm80 instantiation entirely, and PackGQA collapses to
+            # false everywhere for arch=90.
             repo: jewelmusicee/flash-attention
             ref: cppmega/fa4-gb10-fixes
             submodules: "false"
@@ -112,6 +124,7 @@ jobs:
             arch_override: "9.0"
             extra_env: >-
               MAX_JOBS=1 NVCC_THREADS=2 FLASH_ATTENTION_FORCE_BUILD=TRUE
+              FLASH_ATTENTION_DISABLE_SM80=TRUE
               FLASH_ATTENTION_DISABLE_FP16=TRUE
               FLASH_ATTENTION_DISABLE_HDIM96=TRUE
               FLASH_ATTENTION_DISABLE_HDIM192=TRUE
