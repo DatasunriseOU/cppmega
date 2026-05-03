@@ -78,14 +78,13 @@ jobs:
             # FlashAttentionForwardSm120.__init__, dQ_single_wg gating.
             # Builds the FA2 cuda kernels + FA4 cute python module in one wheel.
             #
-            # NVCC_THREADS=1 + MAX_JOBS=2: two parallel nvcc invocations each
-            # with one device codegen thread. Per-process RAM peak ~3 GB, so
-            # 6 GB total fits the 7-GB ubuntu-latest cap. NVCC_THREADS=2 alone
-            # OOM-killed the runner at ~58 min (peak 6+ GB per process). Single
-            # MAX_JOBS=1 NVCC_THREADS=1 is RAM-stable but too slow: with the
-            # trimmed 12-kernel matrix it still hit the 350-min job timeout.
-            # Two parallel single-threaded nvccs ~halve wall time without
-            # blowing the cap.
+            # MAX_JOBS=1 NVCC_THREADS=1 is the only RAM-stable combo on the
+            # 7-GB runner. NVCC_THREADS=2 OOM-killed at 58 min (single nvcc
+            # peaked >6 GB). MAX_JOBS=2 NVCC_THREADS=1 also OOM-killed at
+            # 13 min (two parallel nvccs went over the cap). Wall time at
+            # MAX_JOBS=1/THREADS=1 is the constraint; we keep it under
+            # 350 min by trimming the kernel matrix to 8 files (drop splitkv,
+            # patch dispatcher in trim step to avoid undefined references).
             #
             # arch_override is sm_120 only. cppmega architecture priority:
             #   - H100/H200: covered by flash_attn_3 (FA3 hopper)
@@ -97,7 +96,7 @@ jobs:
             ref: cppmega/fa4-gb10-fixes
             submodules: "false"
             arch_override: "12.1"
-            extra_env: "MAX_JOBS=2 NVCC_THREADS=1"
+            extra_env: "MAX_JOBS=1 NVCC_THREADS=1"
           - name: flash_attn_3
             # Hopper FA3 path from the same fork (subdir hopper/). Trimmed to
             # training essentials only: bf16+fp8, hdim 64/128, varlen+backward.
@@ -352,14 +351,17 @@ jobs:
           set -euo pipefail
           cd src
           # 1) Drop unwanted kernel sources from setup.py's hardcoded list.
-          # FA2 has fwd, bwd, AND fwd_split (split-KV) families. The dispatcher
-          # in flash_api.cpp picks fwd vs fwd_split based on params.num_splits,
-          # so BOTH families are needed for hdims we keep — dropping fwd_split
-          # produced an undefined symbol on \`run_mha_fwd_splitkv_dispatch\`.
-          # Survivors: flash_{fwd,bwd,fwd_split}_hdim{64,128}_bf16{,_causal}_sm80.cu = 12.
+          # FA2 has fwd, bwd, AND fwd_split families. The fwd_split is the
+          # splitkv path (dispatched at runtime when num_splits > 1, used by
+          # mha_fwd_kvcache). cppmega's training only needs num_splits==1
+          # fwd+bwd; keeping fwd_split makes the build overflow the 350-min
+          # timeout. Drop it AND patch the call site (step 3) so the
+          # dispatcher stops referencing run_mha_fwd_splitkv_dispatch<>.
+          # Survivors: flash_{fwd,bwd}_hdim{64,128}_bf16{,_causal}_sm80.cu = 8.
           before=$(grep -c '_sm80\.cu' setup.py || true)
           sed -i -E '/csrc\/flash_attn\/src\/flash_(fwd|bwd|fwd_split)_hdim[0-9]+_fp16(_causal)?_sm80\.cu/d' setup.py
           sed -i -E '/csrc\/flash_attn\/src\/flash_(fwd|bwd|fwd_split)_hdim(32|96|192|256)_bf16(_causal)?_sm80\.cu/d' setup.py
+          sed -i -E '/csrc\/flash_attn\/src\/flash_fwd_split_hdim(64|128)_bf16(_causal)?_sm80\.cu/d' setup.py
           after=$(grep -c '_sm80\.cu' setup.py || true)
           echo "trimmed $((before - after)) kernel sources ($before → $after)"
           # 2) Restrict HEADDIM_SWITCH to only the kHeadDim={64,128} branches.
@@ -384,7 +386,14 @@ jobs:
               }                                  \
             }()
           EOF
-          echo "HEADDIM_SWITCH restricted to {64,128}; survivors:"
+          # 3) Disable the splitkv dispatch path in flash_api.cpp. Without
+          # this, run_mha_fwd_splitkv_dispatch<T, kHeadDim, IsCausal> is
+          # referenced from the dispatcher → undefined symbol in .so since
+          # we dropped the splitkv .cu sources. cppmega doesn't use the
+          # kvcache path (inference-only), so a runtime check is fine.
+          sed -i 's|run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, Is_causal>(params, stream);|TORCH_CHECK(false, "flash_attn splitkv path disabled in cppmega CI build");|' \
+              csrc/flash_attn/flash_api.cpp
+          echo "HEADDIM_SWITCH restricted to {64,128}; splitkv dispatch stubbed; survivors:"
           grep '_sm80\.cu' setup.py | sed 's/^/  /'
 
       - name: Build wheel
