@@ -341,23 +341,48 @@ jobs:
         # blew the 350-min job timeout three runs in a row.
         # cppmega's training path uses bf16 + hdim 64 (Mamba3) and hdim 128
         # (TE attention). Drop fp16 entirely + drop hdims 32/96/192/256 →
-        # 8 .cu files (1 dtype × 2 hdims × 2 causal × 2 dirs) instead of 48,
-        # ~6x faster. Won't break cppmega — those code paths aren't called.
+        # 8 .cu files instead of 48, ~6x faster.
+        #
+        # We must ALSO trim HEADDIM_SWITCH in static_switch.h: the macro
+        # expands all 6 hdim if-branches, each referencing run_mha_fwd_<T,
+        # hdim, ...>. With kernels missing, those become undefined refs in
+        # the .so → ImportError at runtime. Same gotcha as FA3.
         if: matrix.name == 'flash_attn'
         run: |
           set -euo pipefail
           cd src
-          # Drop unwanted kernel sources from setup.py's hardcoded list.
+          # 1) Drop unwanted kernel sources from setup.py's hardcoded list.
           # FA2 has fwd, bwd, AND fwd_split (paged-KV inference) families.
-          # 1) all fp16 variants (fwd/bwd/fwd_split). 2) all hdims except 64,128.
-          # 3) all fwd_split (paged-KV — inference path, cppmega doesn't use).
-          # Survivors: flash_{fwd,bwd}_hdim{64,128}_bf16{,_causal}_sm80.cu = 8 files.
+          # Survivors: flash_{fwd,bwd}_hdim{64,128}_bf16{,_causal}_sm80.cu = 8.
           before=$(grep -c '_sm80\.cu' setup.py || true)
           sed -i -E '/csrc\/flash_attn\/src\/flash_(fwd|bwd|fwd_split)_hdim[0-9]+_fp16(_causal)?_sm80\.cu/d' setup.py
           sed -i -E '/csrc\/flash_attn\/src\/flash_(fwd|bwd|fwd_split)_hdim(32|96|192|256)_bf16(_causal)?_sm80\.cu/d' setup.py
           sed -i -E '/csrc\/flash_attn\/src\/flash_fwd_split_hdim(64|128)_bf16(_causal)?_sm80\.cu/d' setup.py
           after=$(grep -c '_sm80\.cu' setup.py || true)
-          echo "trimmed $((before - after)) kernel sources ($before → $after); survivors:"
+          echo "trimmed $((before - after)) kernel sources ($before → $after)"
+          # 2) Restrict HEADDIM_SWITCH to only the kHeadDim={64,128} branches.
+          # Append #undef + new macro definition at end of static_switch.h —
+          # any subsequent #include picks up the override.
+          cat >> csrc/flash_attn/src/static_switch.h <<'EOF'
+
+          // cppmega CI trim: keep only the kHeadDim branches whose .cu
+          // sources are still in the build (bf16 + hdim 64/128). Without
+          // this, the original macro's hdim 32/96/192/256 if-branches
+          // generate run_mha_fwd_<T, hdim, ...> references with no matching
+          // template instantiation → ImportError on undefined symbol.
+          #undef HEADDIM_SWITCH
+          #define HEADDIM_SWITCH(HEADDIM, ...)   \
+            [&] {                                \
+              if (HEADDIM <= 64) {               \
+                constexpr static int kHeadDim = 64;  \
+                return __VA_ARGS__();            \
+              } else if (HEADDIM <= 128) {       \
+                constexpr static int kHeadDim = 128; \
+                return __VA_ARGS__();            \
+              }                                  \
+            }()
+          EOF
+          echo "HEADDIM_SWITCH restricted to {64,128}; survivors:"
           grep '_sm80\.cu' setup.py | sed 's/^/  /'
 
       - name: Build wheel
