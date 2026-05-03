@@ -78,16 +78,16 @@ jobs:
             # FlashAttentionForwardSm120.__init__, dQ_single_wg gating.
             # Builds the FA2 cuda kernels + FA4 cute python module in one wheel.
             #
-            # NVCC_THREADS=1 (not 2): with 2, 7-GB ubuntu-latest runners OOM-kill
-            # the job at ~58 min mid-build (job ends with conclusion=null on the
-            # Build-wheel step + post-steps don't run — classic abrupt host kill).
-            # Threads=1 is RAM-stable but doubles wall time, and at 3 archs that
-            # blew through the 350-min job limit (cancelled with FA2 still
-            # compiling).
+            # NVCC_THREADS=1 + MAX_JOBS=2: two parallel nvcc invocations each
+            # with one device codegen thread. Per-process RAM peak ~3 GB, so
+            # 6 GB total fits the 7-GB ubuntu-latest cap. NVCC_THREADS=2 alone
+            # OOM-killed the runner at ~58 min (peak 6+ GB per process). Single
+            # MAX_JOBS=1 NVCC_THREADS=1 is RAM-stable but too slow: with the
+            # trimmed 12-kernel matrix it still hit the 350-min job timeout.
+            # Two parallel single-threaded nvccs ~halve wall time without
+            # blowing the cap.
             #
-            # arch_override is sm_120 only. Two-arch (sm_100 + sm_120) still
-            # blew the 350-min timeout at MAX_JOBS=1 NVCC_THREADS=1 (two cancels
-            # in a row). Architecture priority for cppmega:
+            # arch_override is sm_120 only. cppmega architecture priority:
             #   - H100/H200: covered by flash_attn_3 (FA3 hopper)
             #   - B200:      primary path is FA4 cute python (same wheel,
             #                JIT-compiled at runtime — no arch list needed)
@@ -97,7 +97,7 @@ jobs:
             ref: cppmega/fa4-gb10-fixes
             submodules: "false"
             arch_override: "12.1"
-            extra_env: "MAX_JOBS=1 NVCC_THREADS=1"
+            extra_env: "MAX_JOBS=2 NVCC_THREADS=1"
           - name: flash_attn_3
             # Hopper FA3 path from the same fork (subdir hopper/). Trimmed to
             # training essentials only: bf16+fp8, hdim 64/128, varlen+backward.
