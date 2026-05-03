@@ -352,12 +352,14 @@ jobs:
           set -euo pipefail
           cd src
           # 1) Drop unwanted kernel sources from setup.py's hardcoded list.
-          # FA2 has fwd, bwd, AND fwd_split (paged-KV inference) families.
-          # Survivors: flash_{fwd,bwd}_hdim{64,128}_bf16{,_causal}_sm80.cu = 8.
+          # FA2 has fwd, bwd, AND fwd_split (split-KV) families. The dispatcher
+          # in flash_api.cpp picks fwd vs fwd_split based on params.num_splits,
+          # so BOTH families are needed for hdims we keep — dropping fwd_split
+          # produced an undefined symbol on \`run_mha_fwd_splitkv_dispatch\`.
+          # Survivors: flash_{fwd,bwd,fwd_split}_hdim{64,128}_bf16{,_causal}_sm80.cu = 12.
           before=$(grep -c '_sm80\.cu' setup.py || true)
           sed -i -E '/csrc\/flash_attn\/src\/flash_(fwd|bwd|fwd_split)_hdim[0-9]+_fp16(_causal)?_sm80\.cu/d' setup.py
           sed -i -E '/csrc\/flash_attn\/src\/flash_(fwd|bwd|fwd_split)_hdim(32|96|192|256)_bf16(_causal)?_sm80\.cu/d' setup.py
-          sed -i -E '/csrc\/flash_attn\/src\/flash_fwd_split_hdim(64|128)_bf16(_causal)?_sm80\.cu/d' setup.py
           after=$(grep -c '_sm80\.cu' setup.py || true)
           echo "trimmed $((before - after)) kernel sources ($before → $after)"
           # 2) Restrict HEADDIM_SWITCH to only the kHeadDim={64,128} branches.
