@@ -243,7 +243,8 @@ The next accepted grouped direct backend and dense compact-columnwise path must
 be accepted on counters, not on wrapper names:
 
 - Direct dense compact-columnwise use is evidenced by
-  `mxfp8_cutlass_native_dgrad>0` and `mxfp8_cutlass_native_wgrad>0`.
+  `mxfp8_cutlass_native_dgrad>0`, `mxfp8_cutlass_native_wgrad>0`, and
+  `mxfp8_linear_contract_v1_compact_columnwise_operand_consumed>0`.
 - Grouped direct use is evidenced by `mxfp8_grouped_direct_dgrad>0`,
   `mxfp8_grouped_direct_wgrad>0`,
   `mxfp8_grouped_direct_miss_dgrad=0`,

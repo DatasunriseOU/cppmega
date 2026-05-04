@@ -494,6 +494,7 @@ clear this counter contract on real `local_gb10_quarter` MXFP8 logs:
 dense direct backend used:
   mxfp8_cutlass_native_dgrad>0
   mxfp8_cutlass_native_wgrad>0
+  mxfp8_linear_contract_v1_compact_columnwise_operand_consumed>0
 
 grouped direct backend used:
   mxfp8_grouped_direct_dgrad>0
