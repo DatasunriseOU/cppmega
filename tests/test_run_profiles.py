@@ -281,6 +281,26 @@ def test_compact_columnwise_rejects_non_cutlass_backend(monkeypatch):
         main()
 
 
+def test_mxfp8_linear_kernel_contract_compact_direct_rejects_wrong_backend(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_profiles",
+            "shell",
+            "local_gb10_quarter",
+            "--fp8-recipe",
+            "mxfp8",
+            "--mxfp8-bwd-backend",
+            "flashinfer_cutlass",
+            "--mxfp8-linear-kernel-contract",
+            "compact_direct_v1",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="requires --mxfp8-bwd-backend cutlass_native"):
+        main()
+
+
 def test_compact_direct_contract_selects_required_direct_defaults(capsys, monkeypatch):
     monkeypatch.setattr(
         "sys.argv",
