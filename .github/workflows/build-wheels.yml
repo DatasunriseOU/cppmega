@@ -364,16 +364,16 @@ jobs:
           sed -i -E '/csrc\/flash_attn\/src\/flash_fwd_split_hdim(64|128)_bf16(_causal)?_sm80\.cu/d' setup.py
           after=$(grep -c '_sm80\.cu' setup.py || true)
           echo "trimmed $((before - after)) kernel sources ($before → $after)"
-          # 2) Restrict HEADDIM_SWITCH to only the kHeadDim={64,128} branches.
-          # Append #undef + new macro definition at end of static_switch.h —
-          # any subsequent #include picks up the override.
+          # 2) Restrict HEADDIM_SWITCH to {64,128} and FP16_SWITCH to bf16
+          # only. Append #undef + new definitions at end of static_switch.h
+          # — any subsequent #include picks up the override. Without these,
+          # the original macros expand all 6 hdim and both fp16/bf16
+          # branches, generating run_mha_fwd_<T, hdim, ...> references with
+          # no matching template instantiation → ImportError on undefined
+          # symbol.
           cat >> csrc/flash_attn/src/static_switch.h <<'EOF'
 
-          // cppmega CI trim: keep only the kHeadDim branches whose .cu
-          // sources are still in the build (bf16 + hdim 64/128). Without
-          // this, the original macro's hdim 32/96/192/256 if-branches
-          // generate run_mha_fwd_<T, hdim, ...> references with no matching
-          // template instantiation → ImportError on undefined symbol.
+          // cppmega CI trim: kernel sources only include bf16 + hdim 64/128.
           #undef HEADDIM_SWITCH
           #define HEADDIM_SWITCH(HEADDIM, ...)   \
             [&] {                                \
@@ -384,6 +384,12 @@ jobs:
                 constexpr static int kHeadDim = 128; \
                 return __VA_ARGS__();            \
               }                                  \
+            }()
+          #undef FP16_SWITCH
+          #define FP16_SWITCH(COND, ...)         \
+            [&] {                                \
+              using elem_type = cutlass::bfloat16_t; \
+              return __VA_ARGS__();              \
             }()
           EOF
           # 3) Disable the splitkv dispatch path in flash_api.cpp. Without
