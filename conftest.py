@@ -40,7 +40,7 @@ def _ensure_module_spec(name: str) -> None:
     """
     try:
         mod = importlib.import_module(name)
-    except ImportError:
+    except (ImportError, FileNotFoundError):
         # Module genuinely not installed — individual tests that need it
         # will fail with a clear error. Don't mask that at collection time.
         return

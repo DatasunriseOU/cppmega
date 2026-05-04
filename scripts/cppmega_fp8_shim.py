@@ -71,35 +71,12 @@ _SUPPORTED_TE_VERSIONS = (
     "2.16.0",
 )
 
-_CPPMEGA_MXFP8_TN_SIDECAR_ATTR = "_cppmega_mxfp8_rowwise_transpose"
-_CPPMEGA_MXFP8_TN_SIDECAR_PERSISTENT_ATTR = (
-    "_cppmega_mxfp8_rowwise_transpose_persistent"
+from cppmega.megatron.mxfp8_sidecar_refs import (
+    MXFP8_TN_SIDECAR_ATTR as _CPPMEGA_MXFP8_TN_SIDECAR_ATTR,
+    MXFP8_TN_SIDECAR_PERSISTENT_ATTR as _CPPMEGA_MXFP8_TN_SIDECAR_PERSISTENT_ATTR,
+    MXFP8_TN_SIDECAR_REF_ATTRS as _CPPMEGA_MXFP8_TN_SIDECAR_REF_ATTRS,
+    clear_mxfp8_sidecar_refs as _cppmega_clear_mxfp8_sidecar_refs,
 )
-_CPPMEGA_MXFP8_TN_SIDECAR_REF_ATTRS = (
-    "_te_rowwise_transpose_for_backward",
-    "_te_rowwise_transpose_for_backward_unregister",
-    _CPPMEGA_MXFP8_TN_SIDECAR_ATTR,
-    "_cppmega_mxfp8_rowwise_transpose_unregister",
-    _CPPMEGA_MXFP8_TN_SIDECAR_PERSISTENT_ATTR,
-)
-
-
-def _cppmega_clear_mxfp8_sidecar_refs(_x) -> bool:
-    """Drop producer-side references to a consumed MXFP8 transpose sidecar."""
-
-    _cleared = False
-    for _attr in _CPPMEGA_MXFP8_TN_SIDECAR_REF_ATTRS:
-        if not hasattr(_x, _attr):
-            continue
-        try:
-            delattr(_x, _attr)
-        except Exception:
-            try:
-                setattr(_x, _attr, None)
-            except Exception:
-                continue
-        _cleared = True
-    return _cleared
 
 
 def _cppmega_te_version_matches(version: str) -> bool:
@@ -309,6 +286,56 @@ _te_mxfp8_compact_columnwise_backward = (
 _te_mxfp8_dense_saved_operands = os.environ.get(
     "CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS", "0"
 ) == "1"
+_te_mxfp8_linear_kernel_contract = os.environ.get(
+    "CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT", "legacy"
+).lower()
+if _te_mxfp8_linear_kernel_contract not in (
+    "legacy",
+    "gemm_ready_v1",
+    "gemm_ready_v1_dense_only",
+    "compact_direct_v1",
+):
+    raise RuntimeError(
+        "Unsupported CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT="
+        f"{_te_mxfp8_linear_kernel_contract!r}; expected legacy, gemm_ready_v1, "
+        "gemm_ready_v1_dense_only, or compact_direct_v1"
+    )
+if _te_mxfp8_linear_kernel_contract == "compact_direct_v1":
+    if _te_mxfp8_bwd_backend != "cutlass_native":
+        raise RuntimeError(
+            "compact_direct_v1 MXFP8 Linear contract requires "
+            "CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native"
+        )
+    _te_mxfp8_compact_columnwise_backward = True
+    _te_mxfp8_dense_saved_operands = False
+    _te_mxfp8_transpose_emit_backend = "off"
+    _te_mxfp8_transpose_emit_strict = False
+    _te_mxfp8_transpose_emit_swizzled = False
+_te_mxfp8_linear_gemm_ready_v1 = _te_mxfp8_linear_kernel_contract in (
+    "gemm_ready_v1",
+    "gemm_ready_v1_dense_only",
+)
+_te_mxfp8_linear_gemm_ready_v1_dense_only = (
+    _te_mxfp8_linear_kernel_contract == "gemm_ready_v1_dense_only"
+)
+_te_mxfp8_linear_gemm_ready_v1_full = (
+    _te_mxfp8_linear_kernel_contract == "gemm_ready_v1"
+)
+_te_mxfp8_linear_gemm_ready_v1_compact_dense = _te_mxfp8_linear_gemm_ready_v1
+if _te_mxfp8_linear_gemm_ready_v1_compact_dense:
+    _te_mxfp8_compact_columnwise_backward = True
+    _te_mxfp8_dense_saved_operands = True
+    _te_mxfp8_transpose_emit_backend = "off"
+    _te_mxfp8_transpose_emit_strict = False
+    _te_mxfp8_transpose_emit_swizzled = False
+_te_mxfp8_grouped_quantize_producer = os.environ.get(
+    "CPPMEGA_TE_MXFP8_GROUPED_QUANTIZE_PRODUCER", "single_output"
+).lower()
+if _te_mxfp8_grouped_quantize_producer not in ("single_output", "multi_output"):
+    raise RuntimeError(
+        "Unsupported CPPMEGA_TE_MXFP8_GROUPED_QUANTIZE_PRODUCER="
+        f"{_te_mxfp8_grouped_quantize_producer!r}; expected single_output or multi_output"
+    )
 _te_mxfp8_grouped_direct_backward = os.environ.get(
     "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD", "0"
 ) == "1"
@@ -400,6 +427,7 @@ if (
             "mxfp8_tn_adapter_te_emit": 0,
             "mxfp8_tn_adapter_te_emit_deferred": 0,
             "mxfp8_tn_adapter_saved_transpose_operand": 0,
+            "mxfp8_tn_adapter_direct_saved_operand": 0,
             "mxfp8_tn_adapter_te_emit_swizzled": 0,
             "mxfp8_tn_adapter_te_emit_swizzled_unavailable": 0,
             "mxfp8_dense_grad_output_transpose_emit": 0,
@@ -429,6 +457,10 @@ if (
             "mxfp8_grouped_gemm_ready_wgrad": 0,
             "mxfp8_grouped_gemm_ready_miss_dgrad": 0,
             "mxfp8_grouped_gemm_ready_miss_wgrad": 0,
+            "mxfp8_grouped_quantize_producer_single_output": 0,
+            "mxfp8_grouped_quantize_producer_multi_output": 0,
+            "mxfp8_grouped_quantize_producer_multi_output_consumed": 0,
+            "mxfp8_grouped_quantize_producer_multi_output_missing_api": 0,
             "mxfp8_grouped_transpose_copy_fallback_dgrad": 0,
             "mxfp8_grouped_transpose_copy_fallback_wgrad": 0,
             "mxfp8_dense_gemm_ready_dgrad": 0,
@@ -712,6 +744,14 @@ if (
                 _cppmega_pop_mxfp8_sidecar_registry_key(_key)
 
         def _cppmega_set_mxfp8_sidecar_refs(_x, _sidecar, *, persistent=False):
+            if _te_mxfp8_linear_kernel_contract == "compact_direct_v1":
+                _cppmega_record_bwd_stat(
+                    "mxfp8_tn_adapter_te_emit_failed",
+                    "compact_direct_v1_forbids_sidecar_attach",
+                )
+                raise RuntimeError(
+                    "compact_direct_v1 forbids MXFP8 rowwise-transpose sidecars"
+                )
             # GEMM-ready transpose sidecars are a backward operand cache, not a
             # second persistent weight cache.  Keeping them past the first
             # consumer defeats the MXFP8 saved-activation memory goal.
@@ -813,6 +853,26 @@ if (
                 )
 
         def _cppmega_get_mxfp8_sidecar_entry(_x):
+            _direct_saved = getattr(
+                _x,
+                "_te_gemm_ready_rowwise_transpose_for_backward",
+                None,
+            )
+            if _direct_saved is not None:
+                _cppmega_mark_rowwise_transpose_operand(_direct_saved)
+                try:
+                    delattr(_x, "_te_gemm_ready_rowwise_transpose_for_backward")
+                except Exception:
+                    try:
+                        setattr(
+                            _x,
+                            "_te_gemm_ready_rowwise_transpose_for_backward",
+                            None,
+                        )
+                    except Exception:
+                        pass
+                _cppmega_record_bwd_stat("mxfp8_tn_adapter_direct_saved_operand")
+                return _direct_saved, False
             _sidecar = getattr(_x, _cppmega_mxfp8_tn_sidecar_attr, None)
             _key = _cppmega_mxfp8_sidecar_key(_x)
             if _sidecar is not None:
@@ -851,6 +911,75 @@ if (
             setattr(_x, "_te_rowwise_transpose_for_backward_operand", True)
             setattr(_x, "_cppmega_mxfp8_rowwise_transpose_operand", True)
             return _x
+
+        def _cppmega_patch_te_linear_direct_saved_operand():
+            _orig_get_rowwise_transpose = getattr(
+                _TE_LINEAR_MODULE,
+                "_get_rowwise_transpose_for_backward",
+                None,
+            )
+            if _orig_get_rowwise_transpose is None or getattr(
+                _orig_get_rowwise_transpose,
+                "_cppmega_direct_saved_operand",
+                False,
+            ):
+                return False
+
+            _to_storage = getattr(
+                _TE_LINEAR_MODULE,
+                "_mxfp8_tensor_to_storage_for_backward",
+                None,
+            )
+
+            @_functools.wraps(_orig_get_rowwise_transpose)
+            def _get_rowwise_transpose_for_backward(tensor):
+                if tensor is not None:
+                    _direct_saved = getattr(
+                        tensor,
+                        "_te_gemm_ready_rowwise_transpose_for_backward",
+                        None,
+                    )
+                    if _direct_saved is not None:
+                        _cppmega_mark_rowwise_transpose_operand(_direct_saved)
+                        try:
+                            delattr(
+                                tensor,
+                                "_te_gemm_ready_rowwise_transpose_for_backward",
+                            )
+                        except Exception:
+                            try:
+                                setattr(
+                                    tensor,
+                                    "_te_gemm_ready_rowwise_transpose_for_backward",
+                                    None,
+                                )
+                            except Exception:
+                                pass
+                        _cppmega_record_bwd_stat(
+                            "mxfp8_tn_adapter_direct_saved_operand"
+                        )
+                        if callable(_to_storage):
+                            return _to_storage(_direct_saved)
+                        return _direct_saved
+                return _orig_get_rowwise_transpose(tensor)
+
+            _get_rowwise_transpose_for_backward._cppmega_direct_saved_operand = True
+            _TE_LINEAR_MODULE._get_rowwise_transpose_for_backward = (
+                _get_rowwise_transpose_for_backward
+            )
+            return True
+
+        _cppmega_patch_te_linear_direct_saved_operand()
+
+        def _cppmega_is_linear_contract_v1_producer_operand(_x):
+            return bool(
+                _te_mxfp8_linear_gemm_ready_v1
+                and getattr(
+                    _x,
+                    "_cppmega_linear_contract_v1_producer_counted",
+                    False,
+                )
+            )
 
         def _cppmega_propagate_mxfp8_sidecar(_src, _dst):
             if not (_cppmega_is_mxfp8_tensor(_src) and _cppmega_is_mxfp8_tensor(_dst)):
@@ -1085,6 +1214,95 @@ if (
             _orig_tex_split_quantize, "_cppmega_transpose_emit", False
         ):
 
+            def _cppmega_split_quantize_multi_output_with_rowwise_transpose(
+                tensor,
+                split_sections,
+                quantizers,
+                *args,
+                **kwargs,
+            ):
+                _multi_output_name = "mxfp8_split_quantize_with_rowwise_transpose"
+                _multi_output = getattr(_tex, _multi_output_name, None)
+                if _multi_output is None:
+                    _cppmega_record_bwd_stat(
+                        "mxfp8_grouped_quantize_producer_multi_output_missing_api",
+                        f"transformer_engine_torch.{_multi_output_name}",
+                    )
+                    raise RuntimeError(
+                        "CPPMEGA_TE_MXFP8_GROUPED_QUANTIZE_PRODUCER=multi_output "
+                        f"requires transformer_engine_torch.{_multi_output_name}. "
+                        "The installed TransformerEngine exposes only per-output "
+                        "split_quantize, so this profile would hide producer "
+                        "launch/materialization overhead. Apply the TE fused "
+                        "multi-output producer patch or use single_output."
+                    )
+                _disable_bulk_allocation = bool(
+                    kwargs.pop("disable_bulk_allocation", False)
+                )
+                _transpose_scales_with_gemm_swizzled = bool(
+                    kwargs.pop(
+                        "transpose_scales_with_gemm_swizzled",
+                        _te_mxfp8_transpose_emit_swizzled,
+                    )
+                )
+                if kwargs:
+                    raise RuntimeError(
+                        "MXFP8 multi-output grouped quantize producer got "
+                        f"unsupported keyword arguments: {sorted(kwargs)}"
+                    )
+                if args:
+                    raise RuntimeError(
+                        "MXFP8 multi-output grouped quantize producer does not "
+                        "support extra positional arguments beyond tensor, "
+                        "split_sections, quantizers"
+                    )
+                _outputs = _multi_output(
+                    tensor,
+                    split_sections,
+                    quantizers,
+                    _disable_bulk_allocation,
+                    _transpose_scales_with_gemm_swizzled,
+                )
+                if not isinstance(_outputs, (list, tuple)):
+                    raise RuntimeError(
+                        "MXFP8 multi-output grouped quantize producer returned "
+                        f"{type(_outputs).__name__}, expected list/tuple"
+                    )
+                _cppmega_record_bwd_stat(
+                    "mxfp8_grouped_quantize_producer_multi_output"
+                )
+                _consumed = 0
+                for _out in _outputs:
+                    if not _cppmega_is_mxfp8_tensor(_out):
+                        continue
+                    _operand = getattr(
+                        _out,
+                        "_te_gemm_ready_rowwise_transpose_for_backward",
+                        None,
+                    )
+                    if _operand is not None and _cppmega_is_mxfp8_tensor(_operand):
+                        _cppmega_mark_rowwise_transpose_operand(_operand)
+                        _cppmega_set_mxfp8_sidecar_refs(
+                            _out,
+                            _operand,
+                            persistent=False,
+                        )
+                        _cppmega_record_bwd_stat(
+                            "mxfp8_grouped_quantize_producer_multi_output_consumed"
+                        )
+                        _consumed += 1
+                    elif _cppmega_is_mxfp8_rowwise_transpose_operand(_out):
+                        _cppmega_record_bwd_stat(
+                            "mxfp8_grouped_quantize_producer_multi_output_consumed"
+                        )
+                        _consumed += 1
+                if _outputs and _consumed == 0:
+                    raise RuntimeError(
+                        "MXFP8 multi-output grouped quantize producer returned no "
+                        "GEMM-ready rowwise-transpose operands"
+                    )
+                return _outputs
+
             @_functools.wraps(_orig_tex_split_quantize)
             def _split_quantize_with_rowwise_transpose(
                 tensor,
@@ -1093,6 +1311,21 @@ if (
                 *args,
                 **kwargs,
             ):
+                if (
+                    _te_mxfp8_grouped_quantize_producer == "multi_output"
+                    and _te_mxfp8_bwd_tn_adapter
+                    and _te_mxfp8_transpose_emit_backend in ("auto", "te")
+                    and isinstance(tensor, _torch.Tensor)
+                    and isinstance(split_sections, (list, tuple))
+                    and isinstance(quantizers, (list, tuple))
+                ):
+                    return _cppmega_split_quantize_multi_output_with_rowwise_transpose(
+                        tensor,
+                        split_sections,
+                        quantizers,
+                        *args,
+                        **kwargs,
+                    )
                 _outputs = _orig_tex_split_quantize(
                     tensor,
                     split_sections,
@@ -1122,6 +1355,9 @@ if (
                             _source,
                             _force=not _torch.is_grad_enabled(),
                         )
+                        _cppmega_record_bwd_stat(
+                            "mxfp8_grouped_quantize_producer_single_output"
+                        )
                     _start += _size
                 return _outputs
 
@@ -1143,7 +1379,16 @@ if (
                 getattr(_x, "_te_rowwise_transpose_for_backward_operand", False)
                 or getattr(_x, "_cppmega_mxfp8_rowwise_transpose_operand", False)
             ):
-                _cppmega_record_bwd_stat("mxfp8_tn_adapter_saved_transpose_operand")
+                if _te_mxfp8_linear_kernel_contract == "compact_direct_v1":
+                    _cppmega_record_bwd_stat(
+                        "mxfp8_tn_adapter_saved_transpose_operand",
+                        "compact_direct_v1_forbids_saved_transpose_operand",
+                    )
+                    raise ValueError(
+                        "compact_direct_v1 forbids saved rowwise-transposed MXFP8 operands"
+                    )
+                if not _cppmega_is_linear_contract_v1_producer_operand(_x):
+                    _cppmega_record_bwd_stat("mxfp8_tn_adapter_saved_transpose_operand")
                 return _x
             _sidecar = None if _ignore_saved else _cppmega_get_mxfp8_sidecar(_x)
             if _sidecar is not None:
@@ -1183,6 +1428,15 @@ if (
                 raise ValueError("MXFP8 TN adapter requires matrix-like columnwise data")
             if _scale.dim() != 2:
                 raise ValueError("MXFP8 TN adapter requires 2D compact columnwise scales")
+            if _te_mxfp8_linear_kernel_contract == "compact_direct_v1":
+                _cppmega_record_bwd_stat(
+                    "mxfp8_tn_adapter_missing_sidecar_strict",
+                    "compact_direct_v1_forbids_copy_transpose",
+                )
+                raise ValueError(
+                    "compact_direct_v1 requires the direct compact-columnwise backend; "
+                    "refusing copy-transpose materialization"
+                )
             if _strict_missing_sidecar and _te_mxfp8_dense_saved_operands:
                 _cppmega_record_bwd_stat(
                     "mxfp8_tn_adapter_missing_sidecar_strict",
@@ -1680,6 +1934,13 @@ if (
                 ) from _type_exc
 
         def _cppmega_peek_mxfp8_sidecar(_x):
+            _direct_saved = getattr(
+                _x,
+                "_te_gemm_ready_rowwise_transpose_for_backward",
+                None,
+            )
+            if _direct_saved is not None:
+                return _direct_saved
             _sidecar = getattr(_x, _cppmega_mxfp8_tn_sidecar_attr, None)
             if _sidecar is not None:
                 return _sidecar
@@ -1703,7 +1964,8 @@ if (
 
         def _cppmega_take_gemm_ready_grouped_transpose(_item):
             if _cppmega_is_mxfp8_rowwise_transpose_operand(_item):
-                _cppmega_record_bwd_stat("mxfp8_tn_adapter_saved_transpose_operand")
+                if not _cppmega_is_linear_contract_v1_producer_operand(_item):
+                    _cppmega_record_bwd_stat("mxfp8_tn_adapter_saved_transpose_operand")
                 return _item
             _sidecar = _cppmega_get_mxfp8_sidecar(_item)
             if _sidecar is None:
@@ -2392,6 +2654,16 @@ if (
                     )
                     setattr(
                         _quantizer,
+                        "_te_dual_output_quantize_for_backward_enabled",
+                        bool(
+                            _emit_enabled
+                            and _te_mxfp8_dense_saved_operands
+                            and _te_linear_deferred_saved_operand
+                            and _role in ("input", "grad_output")
+                        ),
+                    )
+                    setattr(
+                        _quantizer,
                         "_te_compact_columnwise_for_backward_enabled",
                         bool(_te_mxfp8_compact_columnwise_backward),
                     )
@@ -2775,6 +3047,7 @@ if (
             f"mxfp8_transpose_emit_backend={_te_mxfp8_transpose_emit_backend}, "
             f"mxfp8_transpose_emit_swizzled={_te_mxfp8_transpose_emit_swizzled}, "
             f"cutlass_mxfp8_scale_backend={_cutlass_mxfp8_scale_backend}, "
+            f"mxfp8_linear_kernel_contract={_te_mxfp8_linear_kernel_contract}, "
             f"mxfp8_compact_columnwise_backward={_te_mxfp8_compact_columnwise_backward}, "
             f"mxfp8_dense_saved_operands={_te_mxfp8_dense_saved_operands}, "
             f"mxfp8_grouped_gemm_ready_backward={_te_mxfp8_grouped_gemm_ready_backward}, "

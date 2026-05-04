@@ -18,28 +18,125 @@ class _FakeMXFP8Tensor:
         self._with_gemm_swizzled_scales = False
 
 
-def _fresh_grouped_shim(monkeypatch, *, grouped_direct: bool = False):
+def _fresh_grouped_shim(
+    monkeypatch,
+    *,
+    grouped_direct: bool = False,
+    grouped_quantize_producer: str = "single_output",
+    linear_kernel_contract: str = "legacy",
+    bwd_backend: str = "flashinfer_cutlass",
+    skip_import_failures: bool = True,
+    tex_split_quantize=None,
+    tex_multi_output_quantize=None,
+):
     for key in (
         "CPPMEGA_TE_MXFP8_DGRAD_BF16",
         "CPPMEGA_TE_MXFP8_WGRAD_BF16",
         "NVTE_BACKWARD_OVERRIDE",
         "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD",
         "CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD",
+        "CPPMEGA_TE_MXFP8_GROUPED_QUANTIZE_PRODUCER",
+        "CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT",
+        "CPPMEGA_TE_MXFP8_BWD_BACKEND",
     ):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER", "1")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_BWD_BACKEND", bwd_backend)
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT", linear_kernel_contract)
     monkeypatch.setenv(
         "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD",
         "1" if grouped_direct else "0",
     )
-    monkeypatch.setenv("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND", "off")
+    monkeypatch.setenv(
+        "CPPMEGA_TE_MXFP8_GROUPED_QUANTIZE_PRODUCER",
+        grouped_quantize_producer,
+    )
+    monkeypatch.setenv(
+        "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND",
+        "te" if grouped_quantize_producer == "multi_output" else "off",
+    )
     monkeypatch.setenv("CPPMEGA_TE_VERSION_STRICT", "0")
     monkeypatch.setattr(atexit, "register", lambda func, *args, **kwargs: func)
     monkeypatch.delitem(sys.modules, "scripts.cppmega_fp8_shim", raising=False)
 
+    class FakeMXFP8Quantizer:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        def quantize(self, tensor, *args, **kwargs):
+            return _FakeMXFP8Tensor("quantized")
+
+        def update_quantized(self, src, dst, *args, **kwargs):
+            return dst
+
+    fake_te = ModuleType("transformer_engine")
+    fake_te.__version__ = "2.16.0.dev0"
+    fake_te.__path__ = []
+    fake_common = ModuleType("transformer_engine.common")
+    fake_recipe = ModuleType("transformer_engine.common.recipe")
+    fake_recipe.MXFP8BlockScaling = type("MXFP8BlockScaling", (), {})
+    fake_recipe.NVFP4BlockScaling = type("NVFP4BlockScaling", (), {})
+    fake_pytorch = ModuleType("transformer_engine.pytorch")
+    fake_tensor = ModuleType("transformer_engine.pytorch.tensor")
+    fake_tensor.MXFP8Quantizer = FakeMXFP8Quantizer
+    fake_mxfp8_tensor = ModuleType("transformer_engine.pytorch.tensor.mxfp8_tensor")
+    fake_mxfp8_tensor.MXFP8Tensor = _FakeMXFP8Tensor
+    fake_module = ModuleType("transformer_engine.pytorch.module")
+    fake_linear = ModuleType("transformer_engine.pytorch.module.linear")
+    fake_quantization = ModuleType("transformer_engine.pytorch.quantization")
+    fake_quantization.FP8GlobalStateManager = type("FP8GlobalStateManager", (), {})
+    fake_tex = ModuleType("transformer_engine_torch")
+    fake_dsa_parent = ModuleType(
+        "megatron.core.transformer.experimental_attention_variant"
+    )
+    fake_dsa = ModuleType("megatron.core.transformer.experimental_attention_variant.dsa")
+    fake_dsa.unfused_dsa_fn = lambda *args, **kwargs: None
+    fake_sparse_mla = ModuleType("cppmega.megatron.sparse_mla_ops.sparse_mla")
+    fake_sparse_mla.SparseMLA = type("SparseMLA", (), {})
+    fake_sparse_mla.SparseMLA_FP8 = type("SparseMLA_FP8", (), {})
+    fake_sparse_mla.sparse_mla_as_unfused_dsa = lambda *args, **kwargs: None
+    fake_sparse_mla.sparse_mla_fp8_as_unfused_dsa = lambda *args, **kwargs: None
+
+    if tex_split_quantize is None:
+
+        def tex_split_quantize(tensor, split_sections, quantizers, *args, **kwargs):
+            return [_FakeMXFP8Tensor(f"split{i}") for i, _ in enumerate(split_sections)]
+
+    fake_tex.split_quantize = tex_split_quantize
+    if tex_multi_output_quantize is not None:
+        fake_tex.mxfp8_split_quantize_with_rowwise_transpose = tex_multi_output_quantize
+
+    fake_common.recipe = fake_recipe
+    fake_pytorch.tensor = fake_tensor
+    fake_pytorch.module = fake_module
+    fake_te.common = fake_common
+    fake_te.pytorch = fake_pytorch
+    fake_module.linear = fake_linear
+    fake_dsa_parent.dsa = fake_dsa
+
+    for name, module in {
+        "transformer_engine": fake_te,
+        "transformer_engine.common": fake_common,
+        "transformer_engine.common.recipe": fake_recipe,
+        "transformer_engine.pytorch": fake_pytorch,
+        "transformer_engine.pytorch.tensor": fake_tensor,
+        "transformer_engine.pytorch.tensor.mxfp8_tensor": fake_mxfp8_tensor,
+        "transformer_engine.pytorch.module": fake_module,
+        "transformer_engine.pytorch.module.linear": fake_linear,
+        "transformer_engine.pytorch.quantization": fake_quantization,
+        "transformer_engine_torch": fake_tex,
+        "megatron.core.transformer.experimental_attention_variant": fake_dsa_parent,
+        "megatron.core.transformer.experimental_attention_variant.dsa": fake_dsa,
+        "cppmega.megatron.sparse_mla_ops.sparse_mla": fake_sparse_mla,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
     try:
         shim = importlib.import_module("scripts.cppmega_fp8_shim")
     except Exception as exc:  # pragma: no cover - host dependency guard
+        if not skip_import_failures:
+            raise
         pytest.skip(
             "cppmega_fp8_shim MXFP8 path unavailable: "
             f"{type(exc).__name__}: {exc}"
@@ -248,3 +345,103 @@ def test_grouped_mxfp8_direct_missing_backend_api_counts_explicit_fallback(monke
         "grouped MXFP8 backend exposes neither try_grouped_direct" in reason
         for reason in stats["fallback_reasons"]
     )
+
+
+def test_grouped_mxfp8_multi_output_producer_sets_consumed_operands(monkeypatch):
+    class FakeQuantizer:
+        pass
+
+    quantizers = [FakeQuantizer(), FakeQuantizer()]
+    outputs = [_FakeMXFP8Tensor("out0"), _FakeMXFP8Tensor("out1")]
+    operands = [_FakeMXFP8Tensor("out0.T"), _FakeMXFP8Tensor("out1.T")]
+    for output, operand in zip(outputs, operands):
+        output._te_gemm_ready_rowwise_transpose_for_backward = operand
+
+    def fused_multi_output(*args):
+        assert args == (tensor, [2, 2], quantizers, False, True)
+        return outputs
+
+    def fail_original_split(*_args, **_kwargs):
+        raise AssertionError("multi-output path called original split_quantize")
+
+    shim = _fresh_grouped_shim(
+        monkeypatch,
+        grouped_direct=False,
+        grouped_quantize_producer="multi_output",
+        tex_split_quantize=fail_original_split,
+        tex_multi_output_quantize=fused_multi_output,
+    )
+    _reset_bwd_stats(shim)
+    tensor = shim._torch.empty((4, 2), device="cpu")
+
+    result = shim._tex.split_quantize(tensor, [2, 2], quantizers)
+
+    assert result == outputs
+    for operand in operands:
+        assert getattr(operand, "_te_rowwise_transpose_for_backward_operand", False)
+
+    stats = shim.cppmega_te_mxfp8_bwd_stats
+    assert stats["mxfp8_grouped_quantize_producer_multi_output"] == 1
+    assert stats["mxfp8_grouped_quantize_producer_multi_output_consumed"] == 2
+    assert stats["mxfp8_grouped_quantize_producer_single_output"] == 0
+    assert stats["mxfp8_grouped_quantize_producer_multi_output_missing_api"] == 0
+    assert stats["mxfp8_tn_adapter_saved_transpose_operand"] == 0
+    assert stats["mxfp8_tn_adapter_copy_transpose"] == 0
+    snapshot = shim.cppmega_te_mxfp8_bwd_stats_snapshot()
+    assert snapshot["mxfp8_tn_sidecar_registry_persistent"] == 0
+
+
+def test_grouped_mxfp8_multi_output_producer_missing_api_fails_fast(
+    monkeypatch,
+):
+    class FakeQuantizer:
+        pass
+
+    def fail_original_split(*_args, **_kwargs):
+        raise AssertionError("missing multi-output API must not call original split_quantize")
+
+    shim = _fresh_grouped_shim(
+        monkeypatch,
+        grouped_direct=False,
+        grouped_quantize_producer="multi_output",
+        tex_split_quantize=fail_original_split,
+    )
+    _reset_bwd_stats(shim)
+
+    with pytest.raises(RuntimeError, match="requires transformer_engine_torch"):
+        shim._tex.split_quantize(
+            shim._torch.empty((4, 2), device="cpu"),
+            [2, 2],
+            [FakeQuantizer(), FakeQuantizer()],
+        )
+
+    stats = shim.cppmega_te_mxfp8_bwd_stats
+    assert stats["mxfp8_grouped_quantize_producer_multi_output_missing_api"] == 1
+    assert stats["mxfp8_grouped_quantize_producer_multi_output"] == 0
+
+
+def test_compact_direct_linear_contract_rejects_sidecar_attach(monkeypatch):
+    shim = _fresh_grouped_shim(
+        monkeypatch,
+        linear_kernel_contract="compact_direct_v1",
+        bwd_backend="cutlass_native",
+    )
+    _reset_bwd_stats(shim)
+
+    with pytest.raises(RuntimeError, match="forbids MXFP8 rowwise-transpose sidecars"):
+        shim._cppmega_set_mxfp8_sidecar_refs(_FakeMXFP8Tensor("source"), object())
+
+    assert shim.cppmega_te_mxfp8_bwd_stats["mxfp8_tn_adapter_te_emit_failed"] == 1
+
+
+def test_compact_direct_linear_contract_rejects_wrong_backend(monkeypatch):
+    with pytest.raises(
+        RuntimeError,
+        match="requires CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native",
+    ):
+        _fresh_grouped_shim(
+            monkeypatch,
+            linear_kernel_contract="compact_direct_v1",
+            bwd_backend="flashinfer_cutlass",
+            skip_import_failures=False,
+        )
