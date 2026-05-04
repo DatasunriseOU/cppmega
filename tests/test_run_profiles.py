@@ -452,6 +452,24 @@ def test_mxfp8_grouped_quantize_producer_cli_is_typed(capsys, monkeypatch):
     assert "export CPPMEGA_TE_MXFP8_GROUPED_QUANTIZE_PRODUCER=multi_output" in rendered
 
 
+def test_mxfp8_grouped_quantize_producer_cli_rejects_unknown(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_profiles",
+            "shell",
+            "local_gb10_quarter",
+            "--fp8-recipe",
+            "mxfp8",
+            "--mxfp8-grouped-quantize-producer",
+            "hidden_env_mode",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        main()
+
+
 def test_mxfp8_docs_pin_zero_copy_acceptance_counters():
     """The status docs should name the real MXFP8 counters, not vague wrappers."""
     architecture_doc = Path("docs/status/cppmega_architecture_status.md").read_text()
