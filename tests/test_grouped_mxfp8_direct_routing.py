@@ -23,6 +23,7 @@ def _fresh_grouped_shim(
     *,
     grouped_direct: bool = False,
     grouped_quantize_producer: str = "single_output",
+    linear_contract: str = "legacy",
     tex_split_quantize=None,
     tex_multi_output_quantize=None,
 ):
@@ -33,8 +34,10 @@ def _fresh_grouped_shim(
         "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD",
         "CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD",
         "CPPMEGA_TE_MXFP8_GROUPED_QUANTIZE_PRODUCER",
+        "CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT",
     ):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT", linear_contract)
     monkeypatch.setenv("CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER", "1")
     monkeypatch.setenv(
         "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD",

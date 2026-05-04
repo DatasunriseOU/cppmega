@@ -472,6 +472,46 @@ def test_mxfp8_grouped_quantize_producer_cli_rejects_unknown(monkeypatch):
         main()
 
 
+def test_mxfp8_linear_kernel_contract_is_typed_profile_knob(capsys, monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_profiles",
+            "shell",
+            "local_gb10_quarter",
+            "--fp8-recipe",
+            "mxfp8",
+            "--mxfp8-linear-kernel-contract",
+            "gemm_ready_v1",
+        ],
+    )
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "export CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT=gemm_ready_v1" in out
+
+
+def test_runtime_source_roots_are_typed_profile_knobs(capsys, monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_profiles",
+            "shell",
+            "local_gb10_quarter",
+            "--transformer-engine-source",
+            "",
+            "--flash-attention-source",
+            "/tmp/fa4",
+        ],
+    )
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "export CPPMEGA_TRANSFORMER_ENGINE_SOURCE_ROOT=''" in out
+    assert "export CPPMEGA_EXTRA_PYTHONPATH=/tmp/fa4" in out
+    assert "export CPPMEGA_FLASH_ATTN_SOURCE_ROOT=/tmp/fa4" in out
+
+
 def test_mxfp8_docs_pin_zero_copy_acceptance_counters():
     """The status docs should name the real MXFP8 counters, not vague wrappers."""
     architecture_doc = Path("docs/status/cppmega_architecture_status.md").read_text()
