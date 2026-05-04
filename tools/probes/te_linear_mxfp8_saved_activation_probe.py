@@ -198,18 +198,43 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             failures.append(
                 "MXFP8 rowwise-transposed payload was not saved for Linear backward"
             )
-        if int(stats.get("mxfp8_tn_adapter_saved_transpose_operand", 0)) <= 0:
-            failures.append("TN adapter did not consume a saved transpose operand")
-        if int(stats.get("mxfp8_tn_adapter_te_emit_deferred", 0)) <= 0:
-            failures.append("TE Linear did not defer eager sidecar emission")
-        for key in (
-            "mxfp8_tn_adapter_te_emit",
-            "mxfp8_tn_sidecar_attr_attached",
-            "mxfp8_tn_sidecar_registry_peak",
-            "mxfp8_tn_sidecar_registry_peak_bytes",
-        ):
-            if int(stats.get(key, 0)) != 0:
-                failures.append(f"{key}={stats.get(key)}; expected 0 for TE Linear deferred path")
+        linear_contract = os.environ.get(
+            "CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT",
+            "legacy",
+        )
+        if linear_contract.startswith("gemm_ready_v1"):
+            if int(stats.get("mxfp8_linear_contract_v1_producer_operand", 0)) <= 0:
+                failures.append("Linear contract v1 did not consume producer operands")
+            for key in (
+                "mxfp8_linear_contract_v1_blocked_transpose_emit",
+                "mxfp8_linear_contract_v1_blocked_copy_bridge",
+                "mxfp8_linear_contract_v1_blocked_te_make",
+                "mxfp8_tn_adapter_te_emit",
+                "mxfp8_tn_adapter_copy_transpose",
+                "mxfp8_tn_adapter_missing_sidecar_copy",
+                "mxfp8_tn_sidecar_attr_attached",
+                "mxfp8_tn_sidecar_registry_peak",
+                "mxfp8_tn_sidecar_registry_peak_bytes",
+            ):
+                if int(stats.get(key, 0)) != 0:
+                    failures.append(
+                        f"{key}={stats.get(key)}; expected 0 for Linear contract v1"
+                    )
+        else:
+            if int(stats.get("mxfp8_tn_adapter_saved_transpose_operand", 0)) <= 0:
+                failures.append("TN adapter did not consume a saved transpose operand")
+            if int(stats.get("mxfp8_tn_adapter_te_emit_deferred", 0)) <= 0:
+                failures.append("TE Linear did not defer eager sidecar emission")
+            for key in (
+                "mxfp8_tn_adapter_te_emit",
+                "mxfp8_tn_sidecar_attr_attached",
+                "mxfp8_tn_sidecar_registry_peak",
+                "mxfp8_tn_sidecar_registry_peak_bytes",
+            ):
+                if int(stats.get(key, 0)) != 0:
+                    failures.append(
+                        f"{key}={stats.get(key)}; expected 0 for TE Linear deferred path"
+                    )
 
     return {
         "status": "pass" if not failures else "fail",
