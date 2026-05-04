@@ -393,6 +393,25 @@ def test_mxfp8_transpose_emit_defaults_to_te_for_tn_adapter():
     assert env["CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS"] == "1"
     assert env["CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD"] == "0"
     assert env["CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD"] == "1"
+    assert env["CPPMEGA_TE_MXFP8_GROUPED_QUANTIZE_PRODUCER"] == "single_output"
+
+
+def test_mxfp8_grouped_quantize_producer_cli_is_typed(capsys, monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_profiles.py",
+            "shell",
+            "local_gb10_quarter",
+            "--fp8-recipe",
+            "mxfp8",
+            "--mxfp8-grouped-quantize-producer",
+            "multi_output",
+        ],
+    )
+    assert main() == 0
+    rendered = capsys.readouterr().out
+    assert "export CPPMEGA_TE_MXFP8_GROUPED_QUANTIZE_PRODUCER=multi_output" in rendered
 
 
 def test_mxfp8_docs_pin_zero_copy_acceptance_counters():
