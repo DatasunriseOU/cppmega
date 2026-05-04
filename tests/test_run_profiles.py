@@ -210,6 +210,9 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
     assert "export CPPMEGA_ATTN_BACKEND=fused" in out
     assert "export CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native" in out
     assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=off" in out
+    assert (
+        "export CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT=saved_transpose" in out
+    )
     assert "export CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=1" in out
     assert "export CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS=0" in out
     assert "export CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD=0" in out
@@ -268,6 +271,72 @@ def test_compact_columnwise_rejects_non_cutlass_backend(monkeypatch):
 
     with pytest.raises(ValueError, match="requires --mxfp8-bwd-backend cutlass_native"):
         main()
+
+
+def test_linear_kernel_compact_contract_sets_direct_no_sidecar_defaults(
+    capsys,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_profiles",
+            "shell",
+            "local_gb10_quarter",
+            "--fp8-recipe",
+            "mxfp8",
+            "--mxfp8-linear-kernel-contract",
+            "compact_columnwise_direct",
+        ],
+    )
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "export CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=off" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED=0" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT=0" in out
+    assert "export CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=1" in out
+    assert "export CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS=0" in out
+    assert (
+        "export CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT="
+        "compact_columnwise_direct" in out
+    )
+
+
+def test_linear_kernel_compact_contract_rejects_sidecar_backend(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_profiles",
+            "shell",
+            "local_gb10_quarter",
+            "--fp8-recipe",
+            "mxfp8",
+            "--mxfp8-bwd-backend",
+            "te_tn_adapter",
+            "--mxfp8-linear-kernel-contract",
+            "compact_columnwise_direct",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="requires --mxfp8-bwd-backend cutlass_native"):
+        main()
+
+
+def test_linear_kernel_compact_contract_rejects_invalid_profile_combination():
+    profile = get_run_profile("local_gb10_quarter")
+    profile.precision.fp8_recipe = "mxfp8"
+    profile.precision.mxfp8_linear_kernel_contract = "compact_columnwise_direct"
+    profile.precision.mxfp8_bwd_backend = "cutlass_native"
+    profile.precision.mxfp8_compact_columnwise_backward = True
+    profile.precision.mxfp8_dense_saved_operands = True
+    profile.precision.mxfp8_transpose_emit_backend = "off"
+    profile.precision.mxfp8_transpose_emit_swizzled = False
+    profile.precision.mxfp8_transpose_emit_strict = False
+
+    with pytest.raises(ValueError, match="mxfp8_dense_saved_operands=False"):
+        profile_shell_assignments(profile)
 
 
 def test_swizzled_cutlass_scale_cli_selects_cutlass_native(capsys, monkeypatch):
@@ -390,6 +459,7 @@ def test_mxfp8_transpose_emit_defaults_to_te_for_tn_adapter():
     profile.precision.fp8_recipe = "mxfp8"
     env = profile_shell_assignments(profile)
     assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
+    assert env["CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT"] == "saved_transpose"
     assert env["CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS"] == "1"
     assert env["CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD"] == "0"
     assert env["CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD"] == "1"

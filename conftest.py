@@ -40,9 +40,11 @@ def _ensure_module_spec(name: str) -> None:
     """
     try:
         mod = importlib.import_module(name)
-    except ImportError:
-        # Module genuinely not installed — individual tests that need it
-        # will fail with a clear error. Don't mask that at collection time.
+    except (ImportError, FileNotFoundError):
+        # Module genuinely not installed, or present without required shared
+        # objects such as a local Transformer Engine source tree. Individual
+        # tests that need it will fail/skip with a clear error; CPU-only tests
+        # should still collect.
         return
 
     if getattr(mod, "__spec__", None) is None:

@@ -26,6 +26,7 @@ Fp8Format = Literal["hybrid", "e4m3"]
 Fp8Recipe = Literal["off", "tensorwise", "mxfp8"]
 Mxfp8BackwardBackend = Literal["te_tn_adapter", "flashinfer_cutlass", "cutlass_native"]
 Mxfp8TransposeEmitBackend = Literal["auto", "te", "off"]
+Mxfp8LinearKernelContract = Literal["saved_transpose", "compact_columnwise_direct"]
 Mxfp8CutlassScaleBackend = Literal["compact", "prepack", "swizzled"]
 Mxfp8FlashinferRunner = Literal["mm_mxfp8", "direct_tactic"]
 ParamStorage = Literal["auto", "bf16", "mxfp8"]
@@ -124,6 +125,11 @@ class PrecisionProfile:
     mxfp8_transpose_emit_backend: Mxfp8TransposeEmitBackend = "te"
     mxfp8_transpose_emit_swizzled: bool = True
     mxfp8_transpose_emit_strict: bool = True
+    # Saved operand contract for dense TE Linear/autograd MXFP8 backward.
+    # saved_transpose is the existing GEMM-ready rowwise-transpose path.
+    # compact_columnwise_direct saves compact TE columnwise operands only and
+    # requires a direct backend that does not materialize BF16 or sidecars.
+    mxfp8_linear_kernel_contract: Mxfp8LinearKernelContract = "saved_transpose"
     # ``compact`` uses the manual compact-scale CUTLASS mainloop. ``swizzled``
     # keeps compact primary tensors for TE transpose emit, then routes
     # GEMM-ready rowwise-transpose operands through the stock SM120
@@ -480,6 +486,41 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
 
     if (
         profile.precision.fp8_recipe == "mxfp8"
+        and profile.precision.mxfp8_linear_kernel_contract
+        == "compact_columnwise_direct"
+    ):
+        if profile.precision.mxfp8_bwd_backend != "cutlass_native":
+            raise ValueError(
+                "mxfp8_linear_kernel_contract='compact_columnwise_direct' "
+                "requires mxfp8_bwd_backend='cutlass_native'"
+            )
+        if not profile.precision.mxfp8_compact_columnwise_backward:
+            raise ValueError(
+                "mxfp8_linear_kernel_contract='compact_columnwise_direct' "
+                "requires mxfp8_compact_columnwise_backward=True"
+            )
+        if profile.precision.mxfp8_dense_saved_operands:
+            raise ValueError(
+                "mxfp8_linear_kernel_contract='compact_columnwise_direct' "
+                "requires mxfp8_dense_saved_operands=False"
+            )
+        if profile.precision.mxfp8_transpose_emit_backend != "off":
+            raise ValueError(
+                "mxfp8_linear_kernel_contract='compact_columnwise_direct' "
+                "requires mxfp8_transpose_emit_backend='off'"
+            )
+        if profile.precision.mxfp8_transpose_emit_swizzled:
+            raise ValueError(
+                "mxfp8_linear_kernel_contract='compact_columnwise_direct' "
+                "requires mxfp8_transpose_emit_swizzled=False"
+            )
+        if profile.precision.mxfp8_transpose_emit_strict:
+            raise ValueError(
+                "mxfp8_linear_kernel_contract='compact_columnwise_direct' "
+                "requires mxfp8_transpose_emit_strict=False"
+            )
+    if (
+        profile.precision.fp8_recipe == "mxfp8"
         and profile.precision.mxfp8_compact_columnwise_backward
         and profile.precision.mxfp8_bwd_backend != "cutlass_native"
     ):
@@ -646,6 +687,9 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                 "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT": _bool(
                     profile.precision.mxfp8_transpose_emit_strict
                 ),
+                "CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT": (
+                    profile.precision.mxfp8_linear_kernel_contract
+                ),
                 "CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND": (
                     profile.precision.mxfp8_cutlass_scale_backend
                 ),
@@ -757,6 +801,25 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.precision.mxfp8_transpose_emit_swizzled = args.mxfp8_transpose_emit_swizzled
     if args.mxfp8_transpose_emit_strict is not None:
         profile.precision.mxfp8_transpose_emit_strict = args.mxfp8_transpose_emit_strict
+    if args.mxfp8_linear_kernel_contract is not None:
+        contract = args.mxfp8_linear_kernel_contract
+        profile.precision.mxfp8_linear_kernel_contract = contract
+        if contract == "compact_columnwise_direct":
+            if args.mxfp8_bwd_backend is None:
+                profile.precision.mxfp8_bwd_backend = "cutlass_native"
+            elif args.mxfp8_bwd_backend != "cutlass_native":
+                raise ValueError(
+                    "--mxfp8-linear-kernel-contract compact_columnwise_direct "
+                    "requires --mxfp8-bwd-backend cutlass_native"
+                )
+            profile.precision.mxfp8_compact_columnwise_backward = True
+            profile.precision.mxfp8_dense_saved_operands = False
+            if args.mxfp8_transpose_emit_backend is None:
+                profile.precision.mxfp8_transpose_emit_backend = "off"
+            if args.mxfp8_transpose_emit_swizzled is None:
+                profile.precision.mxfp8_transpose_emit_swizzled = False
+            if args.mxfp8_transpose_emit_strict is None:
+                profile.precision.mxfp8_transpose_emit_strict = False
     if args.mxfp8_compact_columnwise_backward is not None:
         profile.precision.mxfp8_compact_columnwise_backward = (
             args.mxfp8_compact_columnwise_backward
@@ -1000,6 +1063,16 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         default=None,
         dest="mxfp8_transpose_emit_strict",
+    )
+    parser.add_argument(
+        "--mxfp8-linear-kernel-contract",
+        choices=("saved_transpose", "compact_columnwise_direct"),
+        default=None,
+        help=(
+            "Select the TE Linear/autograd MXFP8 saved-operand contract. "
+            "compact_columnwise_direct disables saved transpose operands and "
+            "requires the direct compact-columnwise backend."
+        ),
     )
     compact_columnwise_backward = parser.add_mutually_exclusive_group()
     compact_columnwise_backward.add_argument(
