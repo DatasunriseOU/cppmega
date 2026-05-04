@@ -104,6 +104,7 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert env["CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND"] == "compact"
     assert env["CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD"] == "0"
     assert env["CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS"] == "1"
+    assert env["CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT"] == "legacy"
     assert env["CPPMEGA_FLASHINFER_MXFP8_RUNNER"] == "mm_mxfp8"
     assert env["CPPMEGA_FLASHINFER_MXFP8_TACTIC"] == "0"
     assert env["HYBRID_LAYER_PATTERN"].endswith("/*-/*-")
@@ -169,6 +170,8 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
             "off",
             "--mxfp8-compact-columnwise-backward",
             "--no-mxfp8-dense-saved-operands",
+            "--mxfp8-linear-kernel-contract",
+            "gemm_ready_v1_dense_only",
             "--no-mxfp8-grouped-gemm-ready-backward",
             "--fp8-param-gather",
             "--no-reuse-grad-buf-for-mxfp8-param-ag",
@@ -184,6 +187,10 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
             "cuda,nvtx,osrt",
             "--noconv-mamba-chunk-size",
             "128",
+            "--transformer-engine-source",
+            "/tmp/te",
+            "--flash-attention-source",
+            "/tmp/fa",
             "--cce-fuse-main-mtp-ce",
             "--cce-filter-eps",
             "high",
@@ -212,6 +219,7 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
     assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=off" in out
     assert "export CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=1" in out
     assert "export CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS=0" in out
+    assert "export CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT=gemm_ready_v1_dense_only" in out
     assert "export CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD=0" in out
     assert "export CPPMEGA_FP8_PARAM_GATHER=1" in out
     assert "export CPPMEGA_REUSE_GRAD_BUF_FOR_MXFP8_PARAM_AG=0" in out
@@ -222,6 +230,9 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
     assert "export CPPMEGA_NSYS_DELAY=15" in out
     assert "export CPPMEGA_NSYS_DURATION=5" in out
     assert "export CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE=128" in out
+    assert "export CPPMEGA_EXTRA_PYTHONPATH=/tmp/fa:/tmp/te" in out
+    assert "export CPPMEGA_TRANSFORMER_ENGINE_SOURCE_ROOT=/tmp/te" in out
+    assert "export CPPMEGA_FLASH_ATTN_SOURCE_ROOT=/tmp/fa" in out
     assert "export CPPMEGA_CCE_FUSE_MAIN_MTP_CE=1" in out
     assert "export CPPMEGA_CCE_FILTER_EPS=high" in out
     assert "export CPPMEGA_FLASHINFER_MXFP8_RUNNER=direct_tactic" in out
@@ -391,8 +402,29 @@ def test_mxfp8_transpose_emit_defaults_to_te_for_tn_adapter():
     env = profile_shell_assignments(profile)
     assert env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "te"
     assert env["CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS"] == "1"
+    assert env["CPPMEGA_TE_MXFP8_GROUPED_QUANTIZE_PRODUCER"] == "single_output"
     assert env["CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD"] == "0"
     assert env["CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD"] == "1"
+
+
+def test_mxfp8_grouped_quantize_producer_cli_is_typed(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_profiles",
+            "shell",
+            "local_gb10_quarter",
+            "--fp8-recipe",
+            "mxfp8",
+            "--mxfp8-grouped-quantize-producer",
+            "multi_output",
+        ],
+    )
+
+    main()
+    rendered = capsys.readouterr().out
+
+    assert "export CPPMEGA_TE_MXFP8_GROUPED_QUANTIZE_PRODUCER=multi_output" in rendered
 
 
 def test_mxfp8_docs_pin_zero_copy_acceptance_counters():
