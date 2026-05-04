@@ -27,6 +27,12 @@ Fp8Recipe = Literal["off", "tensorwise", "mxfp8"]
 Mxfp8BackwardBackend = Literal["te_tn_adapter", "flashinfer_cutlass", "cutlass_native"]
 Mxfp8TransposeEmitBackend = Literal["auto", "te", "off"]
 Mxfp8CutlassScaleBackend = Literal["compact", "prepack", "swizzled"]
+Mxfp8LinearKernelContract = Literal[
+    "legacy",
+    "gemm_ready_v1",
+    "gemm_ready_v1_dense_only",
+]
+Mxfp8GroupedQuantizeProducer = Literal["single_output", "multi_output"]
 Mxfp8FlashinferRunner = Literal["mm_mxfp8", "direct_tactic"]
 ParamStorage = Literal["auto", "bf16", "mxfp8"]
 MuonNsCarrier = Literal["bf16", "mxfp8_probe"]
@@ -118,6 +124,10 @@ class PrecisionProfile:
     # config requests block-scaled TE.  They are kept here so MXFP8 probes are
     # reproducible and do not reintroduce hidden BF16 backward bridges.
     allow_te_mxfp8_sm12: bool = True
+    # TE's specialized MXFP8 cast-only quantize path is guarded by the upstream
+    # ENABLE_CAST_ONLY switch. Keep it typed so rowwise-transpose producer tests
+    # do not depend on an out-of-band shell env override.
+    mxfp8_te_cast_only_fast_path: bool = False
     pad_mamba_in_proj_for_mxfp8: bool = True
     mxfp8_bwd_tn_adapter: bool = True
     mxfp8_bwd_backend: Mxfp8BackwardBackend = "flashinfer_cutlass"
@@ -140,6 +150,16 @@ class PrecisionProfile:
     # This covers Linear/LayerNormLinear saved activations and backward
     # grad-output producers, avoiding the deprecated copy-transpose bridge.
     mxfp8_dense_saved_operands: bool = True
+    # Strict Linear kernel contract. legacy keeps the older fallback hooks
+    # available, gemm_ready_v1 requires producer-attached rowwise-transposed
+    # MXFP8 operands everywhere, and gemm_ready_v1_dense_only applies strict
+    # only to dense Linear while explicitly counting grouped/MoE exclusions.
+    mxfp8_linear_kernel_contract: Mxfp8LinearKernelContract = "legacy"
+    # ``single_output`` uses TE's per-tensor quantize_rowwise_transpose producer
+    # once per grouped shard. ``multi_output`` is reserved for a TE C++ op that
+    # accepts all split outputs in one call; keep it explicit so launch-count
+    # probes cannot silently report the single-output bridge as fused.
+    mxfp8_grouped_quantize_producer: Mxfp8GroupedQuantizeProducer = "single_output"
     # Experimental MoE grouped backward mode: consumes grouped compact MXFP8
     # operands directly.  Keep this separate from dense compact-columnwise
     # because the current grouped direct kernels save memory but are slower than
@@ -382,6 +402,28 @@ def _validate_cce_filter_eps(value: str) -> str:
     if parsed <= 0:
         raise ValueError("--cce-filter-eps float must be positive")
     return normalized
+
+
+def _validate_mxfp8_linear_kernel_contract(value: str) -> Mxfp8LinearKernelContract:
+    normalized = value.strip().lower()
+    if normalized not in ("legacy", "gemm_ready_v1", "gemm_ready_v1_dense_only"):
+        raise ValueError(
+            "--mxfp8-linear-kernel-contract must be legacy, gemm_ready_v1, "
+            "or gemm_ready_v1_dense_only"
+        )
+    return normalized  # type: ignore[return-value]
+
+
+def _validate_mxfp8_grouped_quantize_producer(
+    value: str,
+) -> Mxfp8GroupedQuantizeProducer:
+    normalized = value.strip().lower()
+    if normalized not in ("single_output", "multi_output"):
+        raise ValueError(
+            "--mxfp8-grouped-quantize-producer must be single_output or "
+            "multi_output"
+        )
+    return normalized  # type: ignore[return-value]
 
 
 def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProfile:
@@ -630,6 +672,7 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         env.update(
             {
                 "CPPMEGA_ALLOW_TE_MXFP8_SM12": _bool(profile.precision.allow_te_mxfp8_sm12),
+                "ENABLE_CAST_ONLY": _bool(profile.precision.mxfp8_te_cast_only_fast_path),
                 "CPPMEGA_PAD_MAMBA_IN_PROJ_FOR_MXFP8": _bool(
                     profile.precision.pad_mamba_in_proj_for_mxfp8
                 ),
@@ -654,6 +697,12 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                 ),
                 "CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS": _bool(
                     profile.precision.mxfp8_dense_saved_operands
+                ),
+                "CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT": (
+                    profile.precision.mxfp8_linear_kernel_contract
+                ),
+                "CPPMEGA_TE_MXFP8_GROUPED_QUANTIZE_PRODUCER": (
+                    profile.precision.mxfp8_grouped_quantize_producer
                 ),
                 "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD": _bool(
                     profile.precision.mxfp8_grouped_direct_backward
@@ -726,6 +775,10 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.runtime.noconv_mamba_chunk_size = _validate_noconv_mamba_chunk_size(
             args.noconv_mamba_chunk_size
         )
+    if args.transformer_engine_source is not None:
+        profile.runtime.transformer_engine_source = args.transformer_engine_source
+    if args.flash_attention_source is not None:
+        profile.runtime.flash_attention_source = args.flash_attention_source
     if args.fp8_recipe is not None:
         profile.precision.fp8_recipe = args.fp8_recipe
         if args.fp8_recipe == "mxfp8" and args.fp8_format is None:
@@ -736,6 +789,10 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.precision.attention_backend = args.attention_backend
     if args.mxfp8_bwd_backend is not None:
         profile.precision.mxfp8_bwd_backend = args.mxfp8_bwd_backend
+    if args.mxfp8_te_cast_only_fast_path is not None:
+        profile.precision.mxfp8_te_cast_only_fast_path = (
+            args.mxfp8_te_cast_only_fast_path
+        )
     if args.mxfp8_cutlass_scale_backend is not None:
         profile.precision.mxfp8_cutlass_scale_backend = args.mxfp8_cutlass_scale_backend
         if args.mxfp8_cutlass_scale_backend == "swizzled":
@@ -771,6 +828,16 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
                 )
     if args.mxfp8_dense_saved_operands is not None:
         profile.precision.mxfp8_dense_saved_operands = args.mxfp8_dense_saved_operands
+    if args.mxfp8_linear_kernel_contract is not None:
+        profile.precision.mxfp8_linear_kernel_contract = (
+            _validate_mxfp8_linear_kernel_contract(args.mxfp8_linear_kernel_contract)
+        )
+    if args.mxfp8_grouped_quantize_producer is not None:
+        profile.precision.mxfp8_grouped_quantize_producer = (
+            _validate_mxfp8_grouped_quantize_producer(
+                args.mxfp8_grouped_quantize_producer
+            )
+        )
     if args.mxfp8_grouped_direct_backward is not None:
         profile.precision.mxfp8_grouped_direct_backward = (
             args.mxfp8_grouped_direct_backward
@@ -922,6 +989,16 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Override the no-conv Mamba SSD scan chunk size for cppmega specs.",
     )
+    parser.add_argument(
+        "--transformer-engine-source",
+        default=None,
+        help="Override the TransformerEngine source root prepended by the typed profile.",
+    )
+    parser.add_argument(
+        "--flash-attention-source",
+        default=None,
+        help="Override the flash-attn source root prepended by the typed profile.",
+    )
     parser.add_argument("--fp8-format", choices=("hybrid", "e4m3"), default=None)
     parser.add_argument("--fp8-recipe", choices=("off", "tensorwise", "mxfp8"), default=None)
     parser.add_argument(
@@ -933,6 +1010,23 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         "--mxfp8-bwd-backend",
         choices=("te_tn_adapter", "flashinfer_cutlass", "cutlass_native"),
         default=None,
+    )
+    te_cast_only_fast_path = parser.add_mutually_exclusive_group()
+    te_cast_only_fast_path.add_argument(
+        "--mxfp8-te-cast-only-fast-path",
+        action="store_true",
+        default=None,
+        dest="mxfp8_te_cast_only_fast_path",
+        help=(
+            "Enable TE's specialized MXFP8 cast-only quantize kernels through "
+            "the typed profile."
+        ),
+    )
+    te_cast_only_fast_path.add_argument(
+        "--no-mxfp8-te-cast-only-fast-path",
+        action="store_false",
+        default=None,
+        dest="mxfp8_te_cast_only_fast_path",
     )
     parser.add_argument(
         "--mxfp8-cutlass-scale-backend",
@@ -1034,6 +1128,27 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         default=None,
         dest="mxfp8_dense_saved_operands",
+    )
+    parser.add_argument(
+        "--mxfp8-linear-kernel-contract",
+        choices=("legacy", "gemm_ready_v1", "gemm_ready_v1_dense_only"),
+        default=None,
+        help=(
+            "MXFP8 Linear backward producer contract. gemm_ready_v1 requires "
+            "GEMM-ready rowwise-transposed producer operands everywhere; "
+            "gemm_ready_v1_dense_only applies strict only to dense Linear and "
+            "counts grouped/MoE exclusions."
+        ),
+    )
+    parser.add_argument(
+        "--mxfp8-grouped-quantize-producer",
+        choices=("single_output", "multi_output"),
+        default=None,
+        help=(
+            "Grouped MXFP8 split-quantize producer contract. multi_output "
+            "requires a TE C++ batched producer API; single_output uses the "
+            "current one producer launch per grouped shard."
+        ),
     )
     grouped_direct_backward = parser.add_mutually_exclusive_group()
     grouped_direct_backward.add_argument(
