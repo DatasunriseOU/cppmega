@@ -1,0 +1,979 @@
+{
+  "schema_version": "mamba3-mono-ab/v1",
+  "receipt_set": "mamba3-mono-ab-wave8-ingested-component-receipts",
+  "canonical_gate": {
+    "shape": "productionish",
+    "stage2_bwd_bwd_ms": 3.70674,
+    "wave9_covered_subset_ms": 2.48042,
+    "remaining_budget_ms": 1.22632,
+    "note": "Production H200 budget from docs/status/mamba3_cuda_bwd_bwd_10wave_summary_2026_04_30.md."
+  },
+  "source_receipts": [
+    {
+      "doc": "docs/status/mamba3_mono_cuda_chunk_wave3_2026_04_30.md",
+      "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cuda-chunk",
+      "status": "available"
+    },
+    {
+      "doc": "docs/status/mamba3_mono_cute_chunk_wave3_2026_04_30.md",
+      "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cute-chunk",
+      "status": "available"
+    },
+    {
+      "doc": "docs/status/mamba3_mono_cute_chunk_wave4_2026_04_30.md",
+      "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cute-chunk",
+      "source_commit": "dc532db",
+      "status": "available"
+    },
+    {
+      "doc": "docs/status/mamba3_mono_cute_chunk_wave6_2026_04_30.md",
+      "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cute-chunk",
+      "source_commit": "f163df8",
+      "status": "available_research_progress"
+    },
+    {
+      "doc": "docs/status/mamba3_mono_cuda_chunk_wave7_2026_04_30.md",
+      "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cuda-chunk",
+      "source_commit": "a73439f",
+      "status": "available_rejected_context"
+    },
+    {
+      "doc": "docs/status/mamba3_mono_cute_chunk_wave7_2026_04_30.md",
+      "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cute-chunk",
+      "source_commit": "2a1467a",
+      "status": "available_promising_research_progress"
+    },
+    {
+      "doc": "docs/status/mamba3_mono_cuda_chunk_wave8_2026_04_30.md",
+      "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cuda-chunk",
+      "source_commit": "e8a67b5",
+      "status": "available_rejected_context"
+    },
+    {
+      "doc": "docs/status/mamba3_mono_cute_chunk_wave8_2026_04_30.md",
+      "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cute-chunk",
+      "source_commit": "130b935",
+      "status": "available_promising_research_progress"
+    },
+    {
+      "doc": "docs/status/mamba3_mono_wgmma_copy_path_wave8_2026_04_30.md",
+      "receipt_json": "docs/status/mamba3_mono_wgmma_copy_path_wave8_receipt_2026_04_30.json",
+      "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-triton-model",
+      "source_commit": "b0aff52",
+      "status": "available_copy_evidence_only"
+    },
+    {
+      "doc": "docs/status/mamba3_mono_cuda_chunk_wave6_2026_04_30.md",
+      "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cuda-chunk",
+      "source_commit": "8de4d0f",
+      "status": "available_rejected_context"
+    },
+    {
+      "doc": "docs/status/mamba3_mono_wgmma_plan_wave3_2026_04_30.md",
+      "receipt_json": "docs/status/mamba3_mono_wgmma_plan_wave3_receipt_2026_04_30.json",
+      "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-triton-model",
+      "status": "available"
+    },
+    {
+      "doc": "docs/status/mamba3_rr_diag_microkernel_wave4_2026_04_29.md",
+      "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-ab-prod",
+      "status": "available"
+    },
+    {
+      "doc": "docs/status/mamba3_mono_cuda_chunk_wave5_2026_04_30.md",
+      "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cuda-chunk",
+      "source_commit": "a3bb497",
+      "status": "available"
+    }
+  ],
+  "candidate_component_records": [
+    {
+      "candidate_id": "wave3_cuda_wmma_triangular_chunk_owner",
+      "display_name": "Wave3 CUDA WMMA triangular chunk owner",
+      "role": "external_component_candidate",
+      "implementation_class": "cuda_wmma_triangular_chunk_owner",
+      "shape": "productionish",
+      "status": "negative_receipt",
+      "source": {
+        "lane": "mono-cuda-chunk",
+        "branch": "worker/mamba3-mono-cuda-chunk",
+        "doc": "docs/status/mamba3_mono_cuda_chunk_wave3_2026_04_30.md",
+        "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cuda-chunk"
+      },
+      "components": [
+        {
+          "component_id": "wmma_triangular_chunk_owner",
+          "mean_ms": 8.467136001586914,
+          "launches": 1,
+          "covered_slots": [
+            "dv",
+            "dmimo_v",
+            "dssda"
+          ],
+          "status": "reported",
+          "note": "H200 productionish Wave3 WMMA triangular chunk-owner slice."
+        }
+      ],
+      "correctness": {
+        "max_abs": 4.76837158203125e-07,
+        "full_boundary_pass": false,
+        "details": {
+          "dv_vs_bf16_staged_ref": 4.76837158203125e-07,
+          "per_chunk_dmimo_v_vs_bf16_staged_ref": 3.069544618483633e-10,
+          "dssda_vs_bf16_staged_ref": 3.1086244689504383e-15
+        }
+      },
+      "reference": {
+        "stage2_bwd_bwd_ms": 3.70674
+      },
+      "metadata": {
+        "registers_per_thread": 72,
+        "dynamic_smem_bytes": 98308,
+        "active_blocks_per_sm": 2,
+        "theoretical_occupancy": 0.25
+      },
+      "note": "Current WMMA receipt is improved from Wave2 but still 2.284x slower than the full TileLang stage2 bwd_bwd reference."
+    },
+    {
+      "candidate_id": "wave3_cute_handwritten_wgmma_wrong_numerics",
+      "display_name": "Wave3 hand-written CuTe WGMMA wrong numerics",
+      "role": "external_component_candidate",
+      "implementation_class": "cute_dsl_handwritten_wgmma_probe",
+      "shape": "cute_gemm_64x64x64",
+      "status": "failed_correctness",
+      "source": {
+        "lane": "mono-cute-chunk",
+        "branch": "worker/mamba3-mono-cute-chunk",
+        "doc": "docs/status/mamba3_mono_cute_chunk_wave3_2026_04_30.md",
+        "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cute-chunk"
+      },
+      "components": [
+        {
+          "component_id": "handwritten_cute_wgmma_64x64x64",
+          "mean_ms": null,
+          "launches": 1,
+          "covered_slots": [],
+          "include_in_projection": false,
+          "status": "wrong_numerics",
+          "note": "Compiles and launches, but C tile layout/epilogue/data-ordering is wrong."
+        }
+      ],
+      "correctness": {
+        "max_abs": 17.318359,
+        "max_rel": 0.615764,
+        "full_boundary_pass": false,
+        "details": {
+          "shape": "M=N=K=64 BF16",
+          "first_printed_slice_matched_reference": true,
+          "quack_gemm_same_shape_correct": true
+        }
+      },
+      "note": "CuTe stack is viable and quack-gemm is exact for 64x64x64, but the in-repo hand-written CuTe WGMMA kernel has wrong numerics and earns no production gate credit."
+    },
+    {
+      "candidate_id": "wave4_cute_handwritten_wgmma_micro_gemm_correct",
+      "display_name": "Wave4 hand-written CuTe WGMMA micro-GEMM correct",
+      "role": "external_component_candidate",
+      "implementation_class": "cute_dsl_handwritten_wgmma_micro_gemm",
+      "shape": "cute_gemm_64x64x64",
+      "receipt_scope": "micro_gemm_only",
+      "status": "correct_micro_gemm_only",
+      "hardware_tags": [
+        "H200"
+      ],
+      "source": {
+        "lane": "mono-cute-chunk",
+        "branch": "worker/mamba3-mono-cute-chunk",
+        "commit": "dc532db",
+        "doc": "docs/status/mamba3_mono_cute_chunk_wave4_2026_04_30.md",
+        "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cute-chunk"
+      },
+      "components": [
+        {
+          "component_id": "handwritten_cute_wgmma_64x64x64_scalar_copy",
+          "mean_ms": 0.02825424,
+          "launches": 1,
+          "covered_slots": [],
+          "include_in_projection": false,
+          "status": "correct_micro_gemm",
+          "note": "Single 64x64x64 BF16 CuTe WGMMA smoke. It does not write any real Mamba3 bwd_bwd output slot."
+        }
+      ],
+      "correctness": {
+        "max_abs": 0.0,
+        "max_rel": 0.0,
+        "full_boundary_pass": false,
+        "micro_gemm_pass": true,
+        "details": {
+          "shape": "M=N=K=64 BF16",
+          "identity_transpose_max_abs": 0.0,
+          "structured_mod_max_abs": 0.0,
+          "random_seed_42_max_abs": 0.0,
+          "compile_first_launch_s": 0.82,
+          "timing_us_per_iter": 28.25424,
+          "throughput_tflops": 0.0186
+        }
+      },
+      "reference": {
+        "stage2_bwd_bwd_ms": 3.70674
+      },
+      "metadata": {
+        "copy_strategy": "scalar_bf16_gmem_smem",
+        "accumulator": "fp32_wgmma",
+        "resource_metadata_status": "not_reported_for_integrated_mamba3_boundary"
+      },
+      "modal_hygiene": {
+        "status": "pass",
+        "active_same_campaign_count": 0,
+        "apps": [
+          {
+            "app_id": "ap-SZhp2YPr82ZDy0PzvRwzUM",
+            "description": "cute-gemm",
+            "state": "stopped",
+            "tasks": 0
+          },
+          {
+            "app_id": "ap-OdDXzbiA0H0DzWiOr5dlFL",
+            "description": "cute-check",
+            "state": "stopped",
+            "tasks": 0
+          }
+        ]
+      },
+      "note": "Correct CuTe micro-GEMM receipt only. The production gate must assign zero production credit until this covers the real bwd_bwd output slots, reports integrated resource metadata, and beats the H200 TileLang budget."
+    },
+    {
+      "candidate_id": "wave6_cute_fused_masked_lkq_apply_tile_chain",
+      "display_name": "Wave6 CuTe fused masked LKQ apply tile chain",
+      "role": "external_component_candidate",
+      "implementation_class": "cute_dsl_masked_lkq_apply_tile_chain",
+      "shape": "cute_lkq_chain_tile",
+      "receipt_scope": "local_component_speedup",
+      "status": "correct_local_speedup_research_only",
+      "hardware_tags": [
+        "H200"
+      ],
+      "source": {
+        "lane": "mono-cute-chunk",
+        "branch": "worker/mamba3-mono-cute-chunk",
+        "commit": "f163df8",
+        "doc": "docs/status/mamba3_mono_cute_chunk_wave6_2026_04_30.md",
+        "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cute-chunk"
+      },
+      "components": [
+        {
+          "component_id": "fused_masked_lkq_apply_tile_chain",
+          "mean_ms": 0.06355,
+          "launches": 1,
+          "covered_slots": [],
+          "status": "reported_local_speedup",
+          "note": "H200 fixed 64x64x64 tile chain. LKQ no longer round-trips through global memory for the tested fused path, but it writes only the BF16 apply tile and does not cover any real bwd_bwd output slot."
+        }
+      ],
+      "correctness": {
+        "max_abs": 7.6294e-06,
+        "tolerance": 1e-05,
+        "full_boundary_pass": false,
+        "local_tile_chain_pass": true,
+        "details": {
+          "structured_mod": "all checked diffs 0.0",
+          "random_seed_state": 7.6294e-06,
+          "random_seed_apply": 0.0,
+          "random_seed_dpsi": 7.6294e-06,
+          "random_seed_dv": 7.8604e-07,
+          "random_seed_dmimo_v": 4.3958e-07,
+          "lkq_global_output_eliminated_for_fused_path": true
+        }
+      },
+      "reference": {
+        "stage2_bwd_bwd_ms": 3.70674
+      },
+      "metadata": {
+        "timing_scope": "local_tile_chain",
+        "integrated_full_slot_timing": false,
+        "tile_shape": "64x64x64",
+        "scalar_chain_us": 104.71,
+        "fused_chain_us": 63.55,
+        "local_speedup_vs_scalar": 1.64768,
+        "iters": 20,
+        "compile_first_launch_s": 1.274,
+        "scalar_throughput_tflops": 0.015,
+        "fused_throughput_tflops": 0.0247,
+        "copy_strategy": "scalar_bf16_universal_g2s_s2g",
+        "remaining_global_tiles": [
+          "state",
+          "apply"
+        ],
+        "torch_side_consumers_remaining": [
+          "dpsi",
+          "dv",
+          "dmimo_v"
+        ],
+        "resource_metadata_status": "not_reported_for_integrated_mamba3_boundary"
+      },
+      "modal_hygiene": {
+        "status": "pass",
+        "active_same_campaign_count": 0,
+        "description_reuse_warning": "Wave6 used the older wave2 Modal app description pattern; future runs must use unique wave/run app descriptions for clean attribution.",
+        "apps": [
+          {
+            "app_id": "ap-OTeVyEbeKiPQYGelwEWYgD",
+            "description": "cppmega-mamba3-mono-chunk-wave2-h200",
+            "state": "stopped",
+            "tasks": 0,
+            "stopped_at": "2026-04-30 11:28:34+00:00"
+          }
+        ]
+      },
+      "note": "Useful research progress only. The fused path removes the tested LKQ global output and improves the local tile chain from 104.710 us to 63.550 us, but it still has scalar copies, does not write the full bwd_bwd output-slot boundary, lacks integrated resource/CTA/memory metadata, and earns zero production credit."
+    },
+    {
+      "candidate_id": "wave7_cuda_row_stream_low_live_set",
+      "display_name": "Wave7 CUDA row-stream low-live-set",
+      "role": "external_component_candidate",
+      "implementation_class": "cuda_row_stream_low_live_set",
+      "shape": "productionish",
+      "receipt_scope": "bwd_bwd_component",
+      "status": "rejected_scalar_recompute_dead_end",
+      "hardware_tags": [
+        "H200"
+      ],
+      "source": {
+        "lane": "mono-cuda-chunk",
+        "branch": "worker/mamba3-mono-cuda-chunk",
+        "commit": "a73439f",
+        "doc": "docs/status/mamba3_mono_cuda_chunk_wave7_2026_04_30.md",
+        "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cuda-chunk"
+      },
+      "components": [
+        {
+          "component_id": "row_stream_dv_dmimov_dssda",
+          "mean_ms": 179.76535034179688,
+          "launches": 2,
+          "covered_slots": [
+            "dv",
+            "dmimo_v",
+            "dssda"
+          ],
+          "status": "reported_subset_correct_regressed",
+          "note": "H200 productionish row-stream subset with one main kernel plus DMIMO_V reduction. Low live-set reaches 2 blocks/SM, but scalar row recompute regresses runtime massively."
+        }
+      ],
+      "correctness": {
+        "max_abs": 4.76837158203125e-07,
+        "full_boundary_pass": false,
+        "subset_pass": true,
+        "details": {
+          "h200_productionish_vs_bf16_staged_torch_ref": {
+            "dv_delta": 4.76837158203125e-07,
+            "dmimo_v_delta": 1.862645149230957e-09,
+            "dssda_delta": 2.6645352591003757e-15
+          },
+          "h200_productionish_vs_wave1_fp32_ref": {
+            "dv_delta": 9.5367431640625e-07,
+            "dmimo_v_delta": 5.432055331766605e-06,
+            "dssda_delta": 3.33111316308532e-11
+          }
+        }
+      },
+      "reference": {
+        "stage2_bwd_bwd_ms": 3.70674
+      },
+      "metadata": {
+        "owner": "B,H,chunk row-stream",
+        "timing_scope": "component_subset_productionish",
+        "owner_ctas": 32768,
+        "reduction_ctas": 512,
+        "total_ctas": 32768,
+        "h200_sm_count": 132,
+        "ctas_per_sm_at_132_sms": 248.24242424242425,
+        "dynamic_smem_bytes": 42244,
+        "registers_per_thread": 125,
+        "active_blocks_per_sm": 2,
+        "theoretical_occupancy": 0.25,
+        "theoretical_occupancy_pct": 25.0,
+        "full_lkq_live_elements": 0,
+        "streamed_lkq_row_elements": 64,
+        "dmimov_scratch_mib": 64,
+        "ratio_vs_tilelang_stage2_bwd_bwd": 48.496886844450074
+      },
+      "modal_hygiene": {
+        "status": "pass",
+        "active_same_campaign_count": 0,
+        "apps": [
+          {
+            "app_id": "ap-7ZbpQdpx4rORGO6W0uBMKa",
+            "description": "wave7 row-stream smoke",
+            "state": "stopped",
+            "tasks": 0
+          },
+          {
+            "app_id": "ap-8voLXcCUJDZ50heMw5kzaR",
+            "description": "wave7 row-stream productionish",
+            "state": "stopped",
+            "tasks": 0
+          },
+          {
+            "app_id": "ap-mr53XCj8cEiJcqXH3p62RX",
+            "description": "wave7 row-stream verbose smoke",
+            "state": "stopped",
+            "tasks": 0
+          }
+        ]
+      },
+      "note": "Research-only negative receipt. The low-live-set schedule proves 2 active H200 blocks/SM is attainable without full LKQ residency, but scalar LKQ row recompute makes productionish runtime 179.765 ms, 48.5x slower than the 3.70674 ms TileLang stage2 budget."
+    },
+    {
+      "candidate_id": "wave7_cute_fused_state_apply_consumers_one_chunk",
+      "display_name": "Wave7 CuTe fused state/apply consumers one-chunk",
+      "role": "external_component_candidate",
+      "implementation_class": "cute_dsl_fused_state_apply_consumers_one_chunk",
+      "shape": "cute_lkq_chain_tile",
+      "receipt_scope": "local_component_speedup",
+      "status": "promising_research_only",
+      "hardware_tags": [
+        "H200"
+      ],
+      "source": {
+        "lane": "mono-cute-chunk",
+        "branch": "worker/mamba3-mono-cute-chunk",
+        "commit": "2a1467a",
+        "doc": "docs/status/mamba3_mono_cute_chunk_wave7_2026_04_30.md",
+        "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cute-chunk"
+      },
+      "components": [
+        {
+          "component_id": "fused_state_apply_consumers_one_chunk",
+          "mean_ms": 0.063419,
+          "launches": 1,
+          "covered_slots": [],
+          "status": "reported_one_chunk_speedup",
+          "note": "H200 fixed 64x64x64 one-chunk CuTe path. LKQ, state, apply, and dpsi no longer round-trip through global memory for the tested path, but this is not an integrated full bwd_bwd boundary timing."
+        }
+      ],
+      "correctness": {
+        "max_abs": 7.8604e-07,
+        "tolerance": 1e-05,
+        "full_boundary_pass": false,
+        "one_chunk_fused_consumer_pass": true,
+        "details": {
+          "structured_mod": {
+            "dv": 0.0,
+            "dmimo_v": 0.0
+          },
+          "random_seed": {
+            "dv": 7.8604e-07,
+            "dmimo_v": 4.3958e-07
+          },
+          "removed_global_outputs_for_fused_path": [
+            "LKQ",
+            "state",
+            "apply",
+            "dpsi"
+          ]
+        }
+      },
+      "reference": {
+        "stage2_bwd_bwd_ms": 3.70674
+      },
+      "metadata": {
+        "timing_scope": "one_chunk_local_tile_chain",
+        "integrated_full_slot_timing": false,
+        "tile_shape": "64x64x64",
+        "scalar_chain_us": 105.939,
+        "wave6_fused_apply_us": 71.36,
+        "fused_consumer_us": 63.419,
+        "local_speedup_vs_scalar": 1.67046,
+        "local_speedup_vs_wave6_fused_apply": 1.12522,
+        "iters": 20,
+        "compile_first_launch_s": 2.771,
+        "scalar_throughput_tflops": 0.0148,
+        "fused_consumer_throughput_tflops": 0.0251,
+        "copy_strategy": "scalar_bf16_universal_g2s_s2g",
+        "removed_global_outputs_for_fused_path": [
+          "LKQ",
+          "state",
+          "apply",
+          "dpsi"
+        ],
+        "remaining_global_outputs": [
+          "DV",
+          "DMIMO_V"
+        ],
+        "resource_metadata_status": "not_reported_for_integrated_mamba3_boundary"
+      },
+      "modal_hygiene": {
+        "status": "pass",
+        "active_same_campaign_count": 0,
+        "apps": [
+          {
+            "app_id": "ap-aq6JYUbEUesFRqr8FVSkoz",
+            "description": "cppmega-mamba3-mono-chunk-wave7-lane-b-codex-h200",
+            "state": "stopped",
+            "tasks": 0,
+            "stopped_at": "2026-04-30 11:44:20+00:00"
+          }
+        ]
+      },
+      "note": "Promising CuTe research receipt only. The one-chunk path removes global LKQ/state/apply/dpsi materialization and passes the 1e-5 local tolerance at 63.419 us/chain, but it is local-only, uses scalar copies/consumers, lacks full-boundary integrated timing, and earns zero production credit."
+    },
+    {
+      "candidate_id": "wave8_cuda_tile_stream_wmma_subset",
+      "display_name": "Wave8 CUDA tile-stream WMMA subset",
+      "role": "external_component_candidate",
+      "implementation_class": "cuda_tile_stream_wmma_subset",
+      "shape": "productionish",
+      "receipt_scope": "bwd_bwd_component",
+      "status": "rejected_research_only",
+      "hardware_tags": [
+        "H200"
+      ],
+      "source": {
+        "lane": "mono-cuda-chunk",
+        "branch": "worker/mamba3-mono-cuda-chunk",
+        "commit": "e8a67b5",
+        "doc": "docs/status/mamba3_mono_cuda_chunk_wave8_2026_04_30.md",
+        "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cuda-chunk"
+      },
+      "components": [
+        {
+          "component_id": "tile_stream_wmma_dv_dmimov_dssda",
+          "mean_ms": 11.180607795715332,
+          "launches": 2,
+          "covered_slots": [
+            "dv",
+            "dmimo_v",
+            "dssda"
+          ],
+          "status": "reported_subset_correct_too_slow",
+          "note": "H200 productionish tile-stream WMMA subset plus final DMIMO_V reduction. Correct for DV/final DMIMO_V/DSSDA, but still missing DK/DQ and scalar outputs."
+        }
+      ],
+      "correctness": {
+        "max_abs": 4.76837158203125e-07,
+        "full_boundary_pass": false,
+        "subset_pass": true,
+        "details": {
+          "h200_productionish_vs_bf16_staged_torch_ref": {
+            "dv_delta": 4.76837158203125e-07,
+            "dmimo_v_delta": 1.979060471057892e-09,
+            "dssda_delta": 2.6645352591003757e-15
+          },
+          "h200_productionish_vs_wave1_fp32_ref": {
+            "dv_delta": 9.5367431640625e-07,
+            "dmimo_v_delta": 5.432288162410259e-06,
+            "dssda_delta": 3.33120198092729e-11
+          }
+        }
+      },
+      "reference": {
+        "stage2_bwd_bwd_ms": 3.70674
+      },
+      "metadata": {
+        "owner": "B,H,chunk,P64 tile-stream",
+        "timing_scope": "component_subset_productionish",
+        "owner_ctas": 65536,
+        "total_ctas": 65536,
+        "h200_sm_count": 132,
+        "ctas_per_sm_at_132_sms": 496.4848484848485,
+        "dynamic_smem_bytes": 50692,
+        "registers_per_thread": 72,
+        "active_blocks_per_sm": 3,
+        "theoretical_occupancy": 0.375,
+        "theoretical_occupancy_pct": 37.5,
+        "full_lkq_live_elements": 0,
+        "streamed_lkq_live_elements": 256,
+        "dki_tensor_core": true,
+        "ratio_vs_tilelang_stage2_bwd_bwd": 3.0162913491950696,
+        "speedup_vs_wave7_row_stream": 16.07831645885004,
+        "ptxas_sm90_main": {
+          "registers_per_thread": 72,
+          "spill_stores_bytes": 0,
+          "spill_loads_bytes": 0,
+          "barriers": 1
+        },
+        "ptxas_sm90_reduction": {
+          "registers_per_thread": 32,
+          "spill_stores_bytes": 0,
+          "spill_loads_bytes": 0
+        }
+      },
+      "modal_hygiene": {
+        "status": "pass",
+        "active_same_campaign_count": 0,
+        "apps": [
+          {
+            "app_id": "ap-jxl2mIyaIIouSoXwypOHvD",
+            "description": "wave8 tile-stream WMMA verbose smoke",
+            "state": "stopped",
+            "tasks": 0
+          },
+          {
+            "app_id": "ap-pZJvjK6R1XW9kOFTP5rfMp",
+            "description": "wave8 tile-stream WMMA productionish",
+            "state": "stopped",
+            "tasks": 0
+          }
+        ]
+      },
+      "note": "Research-only negative receipt. The tile-stream WMMA path preserves tensor-core work and reaches 3 active H200 blocks/SM with 72 regs/thread and 50692 B dynamic smem, but the subset takes 11.180607795715332 ms, 3.016x slower than the full TileLang stage2 bwd_bwd, and it still lacks the full output-slot boundary."
+    },
+    {
+      "candidate_id": "wave8_cute_multichunk_state_apply_consumers",
+      "display_name": "Wave8 CuTe multi-chunk fused state/apply consumers",
+      "role": "external_component_candidate",
+      "implementation_class": "cute_dsl_multichunk_state_apply_consumers",
+      "shape": "cute_lkq_multichunk_scan",
+      "receipt_scope": "local_component_speedup",
+      "status": "promising_research_only",
+      "hardware_tags": [
+        "H200"
+      ],
+      "source": {
+        "lane": "mono-cute-chunk",
+        "branch": "worker/mamba3-mono-cute-chunk",
+        "commit": "130b935",
+        "doc": "docs/status/mamba3_mono_cute_chunk_wave8_2026_04_30.md",
+        "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cute-chunk"
+      },
+      "projected_bwd_bwd_ms": 0.078264,
+      "components": [
+        {
+          "component_id": "multichunk_fused_scan_best_reported",
+          "mean_ms": 0.078264,
+          "launches": 1,
+          "covered_slots": [],
+          "status": "reported_local_scan_speedup",
+          "note": "H200 bounded multi-chunk local scan timing, not full bwd_bwd boundary timing."
+        }
+      ],
+      "correctness": {
+        "max_abs": 2.082e-06,
+        "tolerance": 1e-05,
+        "full_boundary_pass": false,
+        "multi_chunk_fused_scan_pass": true,
+        "chunks_passed": [
+          2,
+          4,
+          8
+        ],
+        "details": {
+          "chunks_2": {
+            "dv_delta": 3.638e-12,
+            "dmimo_v_delta": 5.821e-11
+          },
+          "chunks_4": {
+            "dv_delta": 1.455e-11,
+            "dmimo_v_delta": 1.164e-10
+          },
+          "chunks_8": {
+            "dv_delta": 2.082e-06,
+            "dmimo_v_delta": 1.647e-06
+          }
+        }
+      },
+      "reference": {
+        "stage2_bwd_bwd_ms": 3.70674
+      },
+      "metadata": {
+        "timing_scope": "local_multichunk_scan",
+        "integrated_full_slot_timing": false,
+        "tile_shape": "64x64 BF16",
+        "chunks_supported": [
+          2,
+          4,
+          8
+        ],
+        "timings_us": {
+          "chunks_2_scan": 76.171,
+          "chunks_4_scan": 78.264,
+          "chunks_8_scan": 77.262,
+          "wave7_one_chunk": 75.445,
+          "scalar_tiles_torch_mask": 131.182,
+          "wave6_fused_masked_apply": 78.728
+        },
+        "removed_global_outputs_for_fused_path": [
+          "LKQ",
+          "state",
+          "apply",
+          "dpsi"
+        ],
+        "remaining_missing_production_work": [
+          "full boundary integration",
+          "dA and chunk state scaling",
+          "diagonal contributions",
+          "qk contributions",
+          "full scalar outputs",
+          "internalized harness transposes"
+        ],
+        "copy_strategy": "scalar_bf16_universal_g2s",
+        "global_outputs_remaining": [
+          "DV",
+          "DMIMO_V"
+        ]
+      },
+      "modal_hygiene": {
+        "status": "pass",
+        "active_same_campaign_count": 0,
+        "apps": [
+          {
+            "app_id": "ap-tzdaTm79HGuhiUolb9cHO0",
+            "description": "cppmega-mamba3-mono-chunk-wave8-lane-b-codex-20260430-h200-b",
+            "state": "stopped",
+            "tasks": 0,
+            "stopped_at": "2026-04-30 12:02:52+00:00"
+          }
+        ]
+      },
+      "note": "Promising CuTe research receipt only. The 2/4/8 chunk fused scan keeps LKQ/state/apply/dpsi off global memory and passes the local 1e-5 tolerance at about 76-78 us/scan, but it is bounded/local, uses scalar copies, lacks dA/diag/qk/scalar outputs, and earns zero production credit."
+    },
+    {
+      "candidate_id": "wave8_wgmma_copy_path_12tile_uint4",
+      "display_name": "Wave8 WGMMA 12-tile uint4 copy evidence",
+      "role": "external_component_candidate",
+      "implementation_class": "wgmma_copy_path_evidence",
+      "shape": "copy_12tile_64x64_bf16",
+      "receipt_scope": "copy_path_evidence_only",
+      "status": "copy_evidence_pass_research_only",
+      "source": {
+        "lane": "mono-triton-model",
+        "branch": "worker/mamba3-mono-triton-model",
+        "commit": "b0aff52",
+        "doc": "docs/status/mamba3_mono_wgmma_copy_path_wave8_2026_04_30.md",
+        "receipt_json": "docs/status/mamba3_mono_wgmma_copy_path_wave8_receipt_2026_04_30.json",
+        "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-triton-model"
+      },
+      "components": [
+        {
+          "component_id": "uint4_copy_12tile_probe",
+          "mean_ms": null,
+          "launches": 0,
+          "covered_slots": [],
+          "include_in_projection": false,
+          "status": "copy_evidence_pass",
+          "note": "12 logical 64x64 bf16 tile copy proof with retained ptxas metadata; not a bwd_bwd timing receipt."
+        }
+      ],
+      "correctness": {
+        "full_boundary_pass": false,
+        "copy_evidence_pass": true,
+        "details": {
+          "logical_tile_count": 12,
+          "tiles_covered": [
+            "K",
+            "K_T",
+            "PsiV_panel_p0",
+            "PsiV_panel_p1",
+            "Q",
+            "Q_T",
+            "dPhiO_panel_p0",
+            "dPhiO_panel_p1",
+            "dstates_panel_p0",
+            "dstates_panel_p1",
+            "state_panel_p0",
+            "state_panel_p1"
+          ],
+          "alignment_layout_status": "pass",
+          "ptxas_status": "parsed"
+        }
+      },
+      "reference": {
+        "stage2_bwd_bwd_ms": 3.70674
+      },
+      "metadata": {
+        "timing_scope": "copy_path_evidence_only",
+        "integrated_full_slot_timing": false,
+        "vector_type": "uint4",
+        "vector_bytes": 16,
+        "copy_bytes_per_chunk": 98304,
+        "copy_vectors_per_chunk": 6144,
+        "logical_tile_count": 12,
+        "tile_bytes": 8192,
+        "row_bytes": 128,
+        "row_stride_alignment_bytes": 128,
+        "runtime_global_alignment_guard": true,
+        "runtime_smem_alignment_guard": true,
+        "kt_qt_vector_compatible_layout": true,
+        "cuda_arch": "sm_121",
+        "registers_per_thread": 40,
+        "static_smem_bytes": 0,
+        "dynamic_smem_bytes": 98304,
+        "spill_stores_bytes": 0,
+        "spill_loads_bytes": 0
+      },
+      "note": "Copy-lane evidence only. The 12-tile uint4 proof passes alignment/layout checks and compiles with ptxas at 40 regs/thread, 0 spills, and 98304 B dynamic smem, but it has no output-slot coverage, no full-boundary integrated timing, and no production credit."
+    },
+    {
+      "candidate_id": "wave5_cuda_scan_owner_dv_dmimov_dssda",
+      "display_name": "Wave5 CUDA scan-owner DV/DMIMO_V/DSSDA",
+      "role": "external_component_candidate",
+      "implementation_class": "cuda_scan_owner_bh_component",
+      "shape": "productionish",
+      "receipt_scope": "bwd_bwd_component",
+      "status": "partial_correct_research_rejected",
+      "hardware_tags": [
+        "H200"
+      ],
+      "source": {
+        "lane": "mono-cuda-chunk",
+        "branch": "worker/mamba3-mono-cuda-chunk",
+        "commit": "a3bb497",
+        "doc": "docs/status/mamba3_mono_cuda_chunk_wave5_2026_04_30.md",
+        "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-cuda-chunk"
+      },
+      "components": [
+        {
+          "component_id": "scan_owner_dv_dmimov_dssda",
+          "mean_ms": 14.08131217956543,
+          "launches": 1,
+          "covered_slots": [
+            "dv",
+            "dmimo_v",
+            "dssda"
+          ],
+          "status": "reported_subset_correct",
+          "note": "H200 productionish scan-owner slice: one CTA owns one (B,H) scan and writes DV, final DMIMO_V, and DSSDA. DK/DQ and scalar outputs are not covered."
+        }
+      ],
+      "correctness": {
+        "max_abs": 4.76837158203125e-07,
+        "full_boundary_pass": false,
+        "subset_pass": true,
+        "details": {
+          "h200_productionish_vs_bf16_staged_torch_ref": {
+            "dv_delta": 4.76837158203125e-07,
+            "dmimo_v_delta": 2.561137080192566e-09,
+            "dssda_delta": 2.6645352591003757e-15
+          },
+          "h200_productionish_vs_wave1_fp32_ref": {
+            "dv_delta": 9.5367431640625e-07,
+            "dmimo_v_delta": 5.432055331766605e-06,
+            "dssda_delta": 3.33120198092729e-11
+          },
+          "dk_dq_covered": false
+        }
+      },
+      "reference": {
+        "stage2_bwd_bwd_ms": 3.70674
+      },
+      "metadata": {
+        "owner": "B,H scan",
+        "total_ctas": 128,
+        "h200_sm_count": 132,
+        "ctas_per_sm_at_132_sms": 0.9696969696969697,
+        "chunks_per_cta": 256,
+        "logical_chunk_visits": 32768,
+        "p_panels_per_chunk": 2,
+        "registers_per_thread": 190,
+        "dynamic_smem_bytes": 68612,
+        "active_blocks_per_sm": 1,
+        "theoretical_occupancy": 0.125,
+        "theoretical_occupancy_pct": 12.5
+      },
+      "modal_hygiene": {
+        "status": "pass",
+        "active_same_campaign_count": 0,
+        "apps": [
+          {
+            "app_id": "ap-0hNvO9jVO5y9g6iHzlWKdS",
+            "description": "mamba3-mono-cuda-chunk-wave5",
+            "state": "stopped",
+            "tasks": 0
+          }
+        ]
+      },
+      "note": "Useful scan-owner correctness/resource skeleton only. It is 3.80x slower than TileLang stage2 bwd_bwd, launches only 128 CTAs for 132 H200 SMs, and lacks DK/DQ plus the rest of the full bwd_bwd boundary."
+    },
+    {
+      "candidate_id": "wave3_wgmma_plan_budget",
+      "display_name": "Wave3 CuTe/Hopper WGMMA plan budget",
+      "role": "external_component_candidate",
+      "implementation_class": "wgmma_design_receipt",
+      "shape": "productionish",
+      "status": "design_receipt",
+      "source": {
+        "lane": "mono-triton-model",
+        "branch": "worker/mamba3-mono-triton-model",
+        "doc": "docs/status/mamba3_mono_wgmma_plan_wave3_2026_04_30.md",
+        "receipt_json": "docs/status/mamba3_mono_wgmma_plan_wave3_receipt_2026_04_30.json",
+        "source_worktree": "/home/dave/source/cppmega/.claude/worktrees/mamba3-mono-triton-model"
+      },
+      "components": [
+        {
+          "component_id": "wgmma_plan_only",
+          "mean_ms": null,
+          "launches": 0,
+          "covered_slots": [],
+          "include_in_projection": false,
+          "status": "design_only",
+          "note": "Budget receipt only; not a measured runtime candidate."
+        }
+      ],
+      "reference": {
+        "stage2_bwd_bwd_ms": 3.70674
+      },
+      "gate_budget": {
+        "green_full_kernel_ms": 3.35,
+        "yellow_full_kernel_ms": 3.70674,
+        "red_full_kernel_ms": 3.70674,
+        "chunk_owner_main_body_ms": 3.2,
+        "chunk_owner_dmimov_reducer_ms": 0.05,
+        "scan_owner_main_body_ms": 3.3
+      },
+      "metadata": {
+        "modeled_fma_ideal_triangular": 96376717312,
+        "modeled_fma_wave2_4step_tile_pruned": 101745426432,
+        "modeled_fma_monolithic_full_mask": 114630328320,
+        "scan_owner_required_output_write_mib": 714.25,
+        "chunk_owner_required_output_write_mib": 778.25
+      },
+      "note": "Lane D WGMMA design budget: green <=3.35 ms, yellow <=3.70674 ms, chunk-owner main body <=3.20 ms plus <=0.05 ms reducer, scan-owner <=3.30 ms."
+    },
+    {
+      "candidate_id": "wave4_rr_diag_cuda_timestep_cta",
+      "display_name": "Wave4 CUDA R x R diagonal timestep CTA",
+      "role": "external_component_candidate",
+      "implementation_class": "cuda_rr_diag_microkernel",
+      "shape": "productionish",
+      "status": "partial_positive_microbench",
+      "source": {
+        "lane": "rr-diag-microkernel",
+        "branch": "worker/mamba3-rr-diag-microkernel",
+        "doc": "docs/status/mamba3_rr_diag_microkernel_wave4_2026_04_29.md"
+      },
+      "components": [
+        {
+          "component_id": "rr_diag_cuda_timestep_cta",
+          "mean_ms": 2.056,
+          "launches": 1,
+          "covered_slots": [
+            "dk",
+            "dq",
+            "dgamma_diag"
+          ],
+          "status": "reported",
+          "note": "Standalone H200 productionish R x R diagonal microbench; integration still required."
+        }
+      ],
+      "correctness": {
+        "max_abs": 7.15e-07,
+        "full_boundary_pass": false,
+        "details": {
+          "cuda_rr_vs_full_dgamma_diag": 7.15e-07,
+          "cuda_rr_vs_full_dk_delta": 4.77e-07,
+          "cuda_rr_vs_full_dq_delta": 4.77e-07
+        }
+      },
+      "reference": {
+        "stage2_bwd_bwd_ms": 3.70674
+      },
+      "metadata": {
+        "registers_per_thread": 40,
+        "dynamic_smem_bytes": 8256,
+        "active_blocks_per_sm": 12,
+        "theoretical_occupancy": 0.75
+      },
+      "note": "Wave4 improves the old Wave3 R x R microbench, but it is still a partial same-time slice and not a full bwd_bwd boundary replacement."
+    }
+  ]
+}
