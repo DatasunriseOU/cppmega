@@ -14,11 +14,14 @@ def test_acceptance_harness_builds_typed_bf16_and_mxfp8_commands(tmp_path):
 
     bf16 = build_command(matrix.bf16, stamp)
     mxfp8 = build_command(matrix.mxfp8, stamp)
+    mxfp8_direct = build_command(matrix.mxfp8_direct, stamp)
 
     assert bf16.label == "bf16_train_20step"
     assert mxfp8.label == "mxfp8_train_20step"
+    assert mxfp8_direct.label == "mxfp8_direct_train_20step"
     assert bf16.log == tmp_path / "unit_bf16_train_20step_20260501_000000.log"
     assert mxfp8.log == tmp_path / "unit_mxfp8_train_20step_20260501_000000.log"
+    assert mxfp8_direct.log == tmp_path / "unit_mxfp8_direct_train_20step_20260501_000000.log"
 
     assert bf16.profile_env["CPPMEGA_FP8_RECIPE"] == "off"
     assert bf16.profile_env["CPPMEGA_PARAM_STORAGE"] == "bf16"
@@ -34,6 +37,12 @@ def test_acceptance_harness_builds_typed_bf16_and_mxfp8_commands(tmp_path):
     assert mxfp8.profile_env["CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS"] == "1"
     assert mxfp8.profile_env["CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD"] == "1"
 
+    assert mxfp8_direct.profile_env["CPPMEGA_TE_MXFP8_BWD_BACKEND"] == "cutlass_native"
+    assert mxfp8_direct.profile_env["CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT"] == "compact_direct_v1"
+    assert mxfp8_direct.profile_env["CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD"] == "1"
+    assert mxfp8_direct.profile_env["CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS"] == "0"
+    assert mxfp8_direct.profile_env["CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND"] == "off"
+
     assert "flock /tmp/cppmega_gpu_profile.lock" in mxfp8.flocked_command
     assert "scripts/local_gb10_quarter_train.sh" in mxfp8.flocked_command
     assert "export CPPMEGA_FP8_RECIPE=mxfp8" in mxfp8.command
@@ -47,18 +56,22 @@ def test_acceptance_harness_profiler_modes_are_separate_commands(tmp_path):
     assert labels == [
         "bf16_train_20step",
         "mxfp8_train_20step",
+        "mxfp8_direct_train_20step",
         "bf16_torch_20step",
         "mxfp8_torch_20step",
+        "mxfp8_direct_torch_20step",
         "bf16_nsys_20step",
         "mxfp8_nsys_20step",
+        "mxfp8_direct_nsys_20step",
         "bf16_ncu_20step",
         "mxfp8_ncu_20step",
+        "mxfp8_direct_ncu_20step",
     ]
-    assert commands[2].profile_env["CPPMEGA_TORCH_PROFILE"] == "1"
-    assert commands[4].profile_env["CPPMEGA_NSYS_PROFILE"] == "1"
-    assert commands[6].profile_env["CPPMEGA_CUDA_PROFILE"] == "1"
-    assert commands[6].profile_env["CPPMEGA_CUDA_PROFILE_STEP_START"] == "3"
-    assert commands[6].profile_env["CPPMEGA_CUDA_PROFILE_STEP_END"] == "4"
+    assert commands[3].profile_env["CPPMEGA_TORCH_PROFILE"] == "1"
+    assert commands[6].profile_env["CPPMEGA_NSYS_PROFILE"] == "1"
+    assert commands[9].profile_env["CPPMEGA_CUDA_PROFILE"] == "1"
+    assert commands[9].profile_env["CPPMEGA_CUDA_PROFILE_STEP_START"] == "3"
+    assert commands[9].profile_env["CPPMEGA_CUDA_PROFILE_STEP_END"] == "4"
 
 
 def test_acceptance_harness_rejects_unknown_extra_profile_args(tmp_path):

@@ -43,7 +43,7 @@ DEFAULT_LOCK = Path("/tmp/cppmega_gpu_profile.lock")
 DEFAULT_LAUNCHER = Path("scripts/local_gb10_quarter_train.sh")
 
 
-AcceptanceLane = Literal["bf16", "mxfp8"]
+AcceptanceLane = Literal["bf16", "mxfp8", "mxfp8_direct"]
 ProfilerMode = Literal["none", "torch", "nsys", "ncu"]
 
 
@@ -84,17 +84,19 @@ class AcceptanceRunSpec:
 
 @dataclass(frozen=True)
 class AcceptanceMatrix:
-    """BF16/MXFP8 run matrix for correctness, memory, and profiler artifacts."""
+    """BF16/current-MXFP8/direct-MXFP8 correctness and profiler matrix."""
 
     bf16: AcceptanceRunSpec
     mxfp8: AcceptanceRunSpec
+    mxfp8_direct: AcceptanceRunSpec
     profilers: tuple[ProfilerMode, ...] = ("torch", "nsys", "ncu")
 
     def all_specs(self) -> tuple[AcceptanceRunSpec, ...]:
-        specs: list[AcceptanceRunSpec] = [self.bf16, self.mxfp8]
+        specs: list[AcceptanceRunSpec] = [self.bf16, self.mxfp8, self.mxfp8_direct]
         for mode in self.profilers:
             specs.append(replace(self.bf16, profiler=mode))
             specs.append(replace(self.mxfp8, profiler=mode))
+            specs.append(replace(self.mxfp8_direct, profiler=mode))
         return tuple(specs)
 
 
@@ -131,6 +133,14 @@ def _profile_for_spec(spec: AcceptanceRunSpec) -> RunProfile:
         profile.precision.mxfp8_wgrad_bf16 = False
         profile.precision.mxfp8_dense_saved_operands = True
         profile.precision.mxfp8_grouped_gemm_ready_backward = True
+        if spec.lane == "mxfp8_direct":
+            profile.precision.mxfp8_bwd_backend = "cutlass_native"
+            profile.precision.mxfp8_linear_kernel_contract = "compact_direct_v1"
+            profile.precision.mxfp8_compact_columnwise_backward = True
+            profile.precision.mxfp8_dense_saved_operands = False
+            profile.precision.mxfp8_transpose_emit_backend = "off"
+            profile.precision.mxfp8_transpose_emit_swizzled = False
+            profile.precision.mxfp8_transpose_emit_strict = False
 
     if spec.profiler == "torch":
         profile.profiling.torch_profile = True
@@ -226,6 +236,7 @@ def build_default_matrix(steps: int, log_dir: Path, run_id_prefix: str) -> Accep
     return AcceptanceMatrix(
         bf16=replace(base, lane="bf16"),
         mxfp8=replace(base, lane="mxfp8"),
+        mxfp8_direct=replace(base, lane="mxfp8_direct"),
     )
 
 
@@ -278,6 +289,12 @@ def _build_parser() -> argparse.ArgumentParser:
     compare = sub.add_parser("compare", help="parse two completed train logs")
     compare.add_argument("--bf16-log", type=Path, required=True)
     compare.add_argument("--mxfp8-log", type=Path, required=True)
+    compare.add_argument(
+        "--mxfp8-direct-log",
+        type=Path,
+        default=None,
+        help="optional compact_direct_v1 log; emits a second BF16-relative comparison",
+    )
     compare.add_argument("--hot-step-start", type=int, default=3)
     compare.add_argument("--hot-step-end", type=int, default=None)
     compare.add_argument("--format", choices=("table", "json"), default="table")
@@ -303,7 +320,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             hot_step_start=args.hot_step_start,
             hot_step_end=args.hot_step_end,
         )
-        print(render_json(report) if args.format == "json" else render_table(report))
+        if args.mxfp8_direct_log is None:
+            print(render_json(report) if args.format == "json" else render_table(report))
+            return 0
+        direct_report = build_comparison_report(
+            bf16=LogInput(label="bf16", log=args.bf16_log.expanduser()),
+            mxfp8=LogInput(label="mxfp8_direct", log=args.mxfp8_direct_log.expanduser()),
+            hot_step_start=args.hot_step_start,
+            hot_step_end=args.hot_step_end,
+        )
+        if args.format == "json":
+            print(
+                json.dumps(
+                    {"current_mxfp8": asdict(report), "direct_mxfp8": asdict(direct_report)},
+                    indent=2,
+                    default=str,
+                )
+            )
+        else:
+            print("[current_mxfp8]")
+            print(render_table(report))
+            print("\n[direct_mxfp8]")
+            print(render_table(direct_report))
         return 0
 
     commands = _planned_from_args(args)
