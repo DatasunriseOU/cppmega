@@ -508,6 +508,7 @@ no transpose/copy materialization:
   no x.T, dy.T, or weight.T MXFP8 tensor materialization
   mxfp8_tn_adapter_te_emit=0
   mxfp8_tn_adapter_te_emit_deferred=0
+  mxfp8_linear_contract_v1_gemm_ready_operand_consumed>0
   mxfp8_tn_adapter_saved_transpose_operand=0
   mxfp8_tn_adapter_te_emit_swizzled=0
   mxfp8_tn_adapter_te_emit_swizzled_unavailable=0
