@@ -56,6 +56,11 @@ def _set_mxfp8_profile_env(backend: str | None) -> str:
     os.environ.setdefault("CPPMEGA_TE_MXFP8_DGRAD_BF16", "0")
     os.environ.setdefault("CPPMEGA_TE_MXFP8_WGRAD_BF16", "0")
     os.environ.setdefault("CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS", "1")
+    if os.environ.get("CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT", "legacy").startswith(
+        "gemm_ready_v1"
+    ):
+        os.environ.setdefault("CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD", "1")
+        os.environ.setdefault("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND", "off")
     return backend
 
 
@@ -176,17 +181,31 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         and int(stats.get("mxfp8_flashinfer_wgrad", 0)) > 0
         and int(stats.get("mxfp8_tn_adapter_copy_transpose", 0)) == 0
     )
-    if direct_no_sidecar or flashinfer_compact_direct:
+    linear_contract = os.environ.get(
+        "CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT",
+        "legacy",
+    )
+    compact_contract = linear_contract.startswith("gemm_ready_v1")
+    if direct_no_sidecar or flashinfer_compact_direct or compact_contract:
         if direct_no_sidecar:
             if int(stats.get("mxfp8_cutlass_native_dgrad", 0)) <= 0:
                 failures.append("CUTLASS native backend did not handle dgrad")
             if int(stats.get("mxfp8_cutlass_native_wgrad", 0)) <= 0:
                 failures.append("CUTLASS native backend did not handle wgrad")
-        else:
+        elif flashinfer_compact_direct:
             if int(stats.get("mxfp8_flashinfer_dgrad", 0)) <= 0:
                 failures.append("FlashInfer/CUTLASS compact-direct backend did not handle dgrad")
             if int(stats.get("mxfp8_flashinfer_wgrad", 0)) <= 0:
                 failures.append("FlashInfer/CUTLASS compact-direct backend did not handle wgrad")
+        if compact_contract:
+            if saved_transpose_payload:
+                failures.append("Linear contract v1 saved a transpose payload")
+            if not saved_input_columnwise_payload:
+                failures.append("Linear contract v1 did not save compact MXFP8 input payload")
+            if int(stats.get("mxfp8_linear_contract_v1_compact_columnwise_operand_consumed", 0)) <= 0:
+                failures.append("Linear contract v1 did not consume compact-columnwise operands")
+            if int(stats.get("mxfp8_tn_adapter_saved_transpose_operand", 0)) != 0:
+                failures.append("Linear contract v1 consumed saved transpose operands")
         if int(stats.get("mxfp8_tn_adapter_te_emit", 0)) != 0:
             failures.append("compact-direct backend emitted TE transpose operands")
         if int(stats.get("mxfp8_tn_sidecar_attr_attached", 0)) != 0:
@@ -198,18 +217,42 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             failures.append(
                 "MXFP8 rowwise-transposed payload was not saved for Linear backward"
             )
-        if int(stats.get("mxfp8_tn_adapter_saved_transpose_operand", 0)) <= 0:
-            failures.append("TN adapter did not consume a saved transpose operand")
-        if int(stats.get("mxfp8_tn_adapter_te_emit_deferred", 0)) <= 0:
-            failures.append("TE Linear did not defer eager sidecar emission")
-        for key in (
-            "mxfp8_tn_adapter_te_emit",
-            "mxfp8_tn_sidecar_attr_attached",
-            "mxfp8_tn_sidecar_registry_peak",
-            "mxfp8_tn_sidecar_registry_peak_bytes",
-        ):
-            if int(stats.get(key, 0)) != 0:
-                failures.append(f"{key}={stats.get(key)}; expected 0 for TE Linear deferred path")
+        if linear_contract.startswith("gemm_ready_v1"):
+            if int(stats.get("mxfp8_linear_contract_v1_producer_operand", 0)) <= 0:
+                failures.append("Linear contract v1 did not consume producer operands")
+            if int(stats.get("mxfp8_linear_contract_v1_gemm_ready_operand_consumed", 0)) <= 0:
+                failures.append("Linear contract v1 did not route GEMM-ready operands into backward")
+            for key in (
+                "mxfp8_linear_contract_v1_blocked_transpose_emit",
+                "mxfp8_linear_contract_v1_blocked_copy_bridge",
+                "mxfp8_linear_contract_v1_blocked_te_make",
+                "mxfp8_tn_adapter_te_emit",
+                "mxfp8_tn_adapter_saved_transpose_operand",
+                "mxfp8_tn_adapter_copy_transpose",
+                "mxfp8_tn_adapter_missing_sidecar_copy",
+                "mxfp8_tn_sidecar_attr_attached",
+                "mxfp8_tn_sidecar_registry_peak",
+                "mxfp8_tn_sidecar_registry_peak_bytes",
+            ):
+                if int(stats.get(key, 0)) != 0:
+                    failures.append(
+                        f"{key}={stats.get(key)}; expected 0 for Linear contract v1"
+                    )
+        else:
+            if int(stats.get("mxfp8_tn_adapter_saved_transpose_operand", 0)) <= 0:
+                failures.append("TN adapter did not consume a saved transpose operand")
+            if int(stats.get("mxfp8_tn_adapter_te_emit_deferred", 0)) <= 0:
+                failures.append("TE Linear did not defer eager sidecar emission")
+            for key in (
+                "mxfp8_tn_adapter_te_emit",
+                "mxfp8_tn_sidecar_attr_attached",
+                "mxfp8_tn_sidecar_registry_peak",
+                "mxfp8_tn_sidecar_registry_peak_bytes",
+            ):
+                if int(stats.get(key, 0)) != 0:
+                    failures.append(
+                        f"{key}={stats.get(key)}; expected 0 for TE Linear deferred path"
+                    )
 
     return {
         "status": "pass" if not failures else "fail",
