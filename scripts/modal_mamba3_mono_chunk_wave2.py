@@ -1,0 +1,387 @@
+"""Modal Wave 2 harness for Mamba3 monolithic CuTe/WMMA chunk work.
+
+Modes:
+  * ``cute-check`` builds a bounded overlay with NVIDIA CuTe DSL and
+    quack-kernels, then reports import viability.
+  * ``cute-gemm`` runs the existing single-GEMM CuTe DSL WGMMA smoke on H200.
+  * ``cute-lkq-chain`` runs the LKQ/state CuTe probe, including the Wave 6
+    fused masked-apply tile, Wave 7 fused state/apply consumer path, Wave 8
+    bounded multi-chunk scan-owner path, Wave 9 qk diagonal addend, and Wave
+    10 dA/segsum/carry scaling.
+  * ``quack-gemm`` runs a minimal CuTe DSL WGMMA GEMM through quack-kernels.
+  * ``wmma-smoke`` runs the CUDA WMMA fallback correctness and timing probe.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from typing import Any
+
+import modal
+
+
+GHCR_REPO = os.environ.get("GHCR_REPO", "ghcr.io/jewelmusicee/cppmega")
+GHCR_TAG = os.environ.get("GHCR_TAG", "785c3fd")
+GHCR_REF = f"{GHCR_REPO}:{GHCR_TAG}"
+GPU_SPEC = os.environ.get("CPPMEGA_MODAL_GPU", "H200")
+CPPMEGA_ROOT = "/opt/cppmega"
+APP_SUFFIX = os.environ.get("CPPMEGA_MODAL_APP_SUFFIX", "wave10-lane-b")
+DEFAULT_APP_NAME = "cppmega-mamba3-mono-chunk-" + "-".join(
+    re.sub(r"[^0-9A-Za-z]+", "-", part).strip("-").lower()
+    for part in (APP_SUFFIX, GPU_SPEC)
+    if part
+)
+APP_NAME = os.environ.get("CPPMEGA_MODAL_APP_NAME", DEFAULT_APP_NAME)
+
+
+def _repo_overlay(image: modal.Image) -> modal.Image:
+    return (
+        image.add_local_dir("cppmega", f"{CPPMEGA_ROOT}/cppmega", copy=True)
+        .add_local_dir("tools", f"{CPPMEGA_ROOT}/tools", copy=True)
+        .env(
+            {
+                "PYTHONPATH": CPPMEGA_ROOT,
+                "CPPMEGA_IMAGE_REF": GHCR_REF,
+                "CPPMEGA_MODAL_GPU": GPU_SPEC,
+                "CUTE_DSL_ARCH": "sm_90a",
+                "CPPMEGA_MAMBA3_CUTE_MULTI_UINT4_G2S": os.environ.get(
+                    "CPPMEGA_MAMBA3_CUTE_MULTI_UINT4_G2S", "0"
+                ),
+            }
+        )
+    )
+
+
+def _base_image() -> modal.Image:
+    image: Any = modal.Image.from_registry(
+        GHCR_REF,
+        secret=modal.Secret.from_name("ghcr-pull"),
+        add_python=None,
+    )
+    return _repo_overlay(image)
+
+
+def _cute_image() -> modal.Image:
+    image: Any = modal.Image.from_registry(
+        GHCR_REF,
+        secret=modal.Secret.from_name("ghcr-pull"),
+        add_python=None,
+    )
+    image = image.pip_install(
+        "nvidia-cutlass-dsl==4.4.2",
+        "quack-kernels==0.3.10",
+        extra_index_url="https://pypi.nvidia.com",
+    )
+    return _repo_overlay(image)
+
+
+app = modal.App(APP_NAME)
+
+
+def _package_version(name: str) -> str | None:
+    import importlib.metadata as md
+
+    try:
+        return md.version(name)
+    except md.PackageNotFoundError:
+        return None
+
+
+def _module_spec(module: str) -> str | None:
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec(module)
+    except Exception as exc:  # noqa: BLE001
+        return f"{type(exc).__name__}: {exc}"
+    return None if spec is None else str(spec.origin)
+
+
+@app.function(image=_cute_image(), timeout=20 * 60)
+def cute_stack_check() -> dict[str, Any]:
+    import os
+    import sys
+
+    modules = [
+        "cutlass",
+        "cutlass.cute",
+        "cutlass.cute.runtime",
+        "cuda.bindings.driver",
+        "quack",
+        "quack.sm90_utils",
+        "quack.copy_utils",
+        "quack.layout_utils",
+        "torch",
+    ]
+    specs = {module: _module_spec(module) for module in modules}
+    import_error = None
+    api_error = None
+    try:
+        import cutlass
+        import cutlass.cute as cute
+        from cutlass.cute.runtime import from_dlpack, make_fake_tensor
+        from quack import copy_utils, layout_utils, sm90_utils
+
+        _ = (
+            cutlass,
+            cute,
+            from_dlpack,
+            make_fake_tensor,
+            sm90_utils,
+            copy_utils,
+            layout_utils,
+        )
+    except Exception as exc:  # noqa: BLE001
+        import_error = f"{type(exc).__name__}: {exc}"
+    try:
+        import cutlass.cute as cute
+
+        required = ("kernel", "jit", "compile")
+        missing = [name for name in required if not hasattr(cute, name)]
+        api_error = None if not missing else f"missing cutlass.cute APIs: {missing}"
+    except Exception as exc:  # noqa: BLE001
+        api_error = f"{type(exc).__name__}: {exc}"
+
+    return {
+        "image_ref": GHCR_REF,
+        "python": sys.version,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "specs": specs,
+        "versions": {
+            "nvidia-cutlass-dsl": _package_version("nvidia-cutlass-dsl"),
+            "nvidia-cutlass-dsl-libs-base": _package_version("nvidia-cutlass-dsl-libs-base"),
+            "quack-kernels": _package_version("quack-kernels"),
+            "cuda-python": _package_version("cuda-python"),
+            "cuda-bindings": _package_version("cuda-bindings"),
+            "torch": _package_version("torch"),
+        },
+        "import_error": import_error,
+        "api_error": api_error,
+        "cute_viable": import_error is None and api_error is None,
+    }
+
+
+@app.function(image=_cute_image(), gpu=GPU_SPEC, timeout=30 * 60)
+def cute_single_gemm_h200() -> dict[str, Any]:
+    import contextlib
+    import io
+    import os
+    import traceback
+
+    os.environ["CUTE_DSL_ARCH"] = "sm_90a"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    stdout = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stdout):
+            from cppmega.megatron.cute_dsl_mimo.single_gemm_test import run_phase1
+
+            passed, per_iter_us = run_phase1()
+        error = None
+    except BaseException as exc:  # noqa: BLE001
+        traceback.print_exc(file=stdout)
+        passed = False
+        per_iter_us = None
+        error = f"{type(exc).__name__}: {exc}"
+    return {
+        "image_ref": GHCR_REF,
+        "gpu_spec": GPU_SPEC,
+        "passed": bool(passed),
+        "per_iter_us": per_iter_us,
+        "error": error,
+        "output": stdout.getvalue()[-12000:],
+    }
+
+
+@app.function(image=_cute_image(), gpu=GPU_SPEC, timeout=30 * 60)
+def cute_lkq_chain_h200(iters: int = 100, warmup: int = 10) -> dict[str, Any]:
+    import contextlib
+    import io
+    import os
+    import traceback
+
+    os.environ["CUTE_DSL_ARCH"] = "sm_90a"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    stdout = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stdout):
+            from cppmega.megatron.cute_dsl_mimo.lkq_tile_chain_test import (
+                run_lkq_tile_chain,
+            )
+
+            result = run_lkq_tile_chain(bench_iters=iters, bench_warmup=warmup)
+        error = None
+    except BaseException as exc:  # noqa: BLE001
+        traceback.print_exc(file=stdout)
+        result = {"passed": False, "timings": None}
+        error = f"{type(exc).__name__}: {exc}"
+    return {
+        "image_ref": GHCR_REF,
+        "gpu_spec": GPU_SPEC,
+        "passed": bool(result.get("passed", False)),
+        "result": result,
+        "error": error,
+        "output": stdout.getvalue()[-24000:],
+    }
+
+
+@app.function(image=_cute_image(), gpu=GPU_SPEC, timeout=30 * 60)
+def quack_gemm_h200(
+    m: int = 64, n: int = 64, k: int = 64, iters: int = 1000
+) -> dict[str, Any]:
+    import contextlib
+    import io
+    import os
+    import time
+    import traceback
+
+    os.environ["CUTE_DSL_ARCH"] = "sm_90a"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    stdout = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stdout):
+            import torch
+            from quack.gemm_interface import gemm
+
+            print(f"quack CuTe WGMMA GEMM {m}x{n}x{k} BF16 on sm_90a")
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+            torch.manual_seed(42)
+            a = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+            b = torch.randn(k, n, dtype=torch.bfloat16, device="cuda")
+            out = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
+            ref = (a.float() @ b.float()).to(torch.bfloat16)
+
+            t0 = time.time()
+            gemm(a, b, out=out, tuned=False)
+            torch.cuda.synchronize()
+            compile_s = time.time() - t0
+
+            max_abs = (out.float() - ref.float()).abs().max().item()
+            rel = max_abs / max(ref.float().abs().max().item(), 1.0)
+            print(f"compile_plus_first_launch_s: {compile_s:.3f}")
+            print(f"max_abs: {max_abs:.6f}")
+            print(f"max_rel: {rel:.6f}")
+            print(f"out[0,:4]: {out[0, :4]}")
+            print(f"ref[0,:4]: {ref[0, :4]}")
+
+            passed = max_abs < 1.0
+            per_iter_us = None
+            tflops = None
+            if passed:
+                for _ in range(10):
+                    gemm(a, b, out=out, tuned=False)
+                torch.cuda.synchronize()
+
+                start_ev = torch.cuda.Event(enable_timing=True)
+                end_ev = torch.cuda.Event(enable_timing=True)
+                start_ev.record()
+                for _ in range(iters):
+                    gemm(a, b, out=out, tuned=False)
+                end_ev.record()
+                torch.cuda.synchronize()
+                elapsed_ms = start_ev.elapsed_time(end_ev)
+                per_iter_us = elapsed_ms * 1000.0 / iters
+                tflops = (2 * m * n * k) / (per_iter_us * 1e-6) / 1e12
+                print(f"timing_us: {per_iter_us:.4f} ({iters} iters)")
+                print(f"throughput_tflops: {tflops:.4f}")
+        error = None
+    except BaseException as exc:  # noqa: BLE001
+        traceback.print_exc(file=stdout)
+        passed = False
+        per_iter_us = None
+        tflops = None
+        max_abs = None
+        rel = None
+        compile_s = None
+        error = f"{type(exc).__name__}: {exc}"
+    return {
+        "image_ref": GHCR_REF,
+        "gpu_spec": GPU_SPEC,
+        "shape": {"m": m, "n": n, "k": k},
+        "passed": bool(passed),
+        "compile_plus_first_launch_s": compile_s,
+        "max_abs": max_abs,
+        "max_rel": rel,
+        "per_iter_us": per_iter_us,
+        "tflops": tflops,
+        "error": error,
+        "output": stdout.getvalue()[-12000:],
+    }
+
+
+@app.function(image=_base_image(), gpu=GPU_SPEC, timeout=30 * 60)
+def wmma_smoke_h200(shape: str) -> dict[str, Any]:
+    import os
+    import shlex
+    import subprocess
+    import sys
+
+    env = os.environ.copy()
+    env.setdefault("MAX_JOBS", "2")
+    env.setdefault("CPPMEGA_VERBOSE_EXT_BUILD", "1")
+    env.setdefault("TORCH_EXTENSIONS_DIR", "/tmp/cppmega_mamba3_mono_chunk_ext")
+    cmd = [
+        sys.executable,
+        "tools/probes/mamba3_mono_chunk_smoke.py",
+        *shlex.split(shape),
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        cwd=CPPMEGA_ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+    )
+    lines: list[str] = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        lines.append(line)
+        if len(lines) > 1200:
+            lines = lines[-1200:]
+    returncode = proc.wait()
+    return {
+        "image_ref": GHCR_REF,
+        "gpu_spec": GPU_SPEC,
+        "returncode": returncode,
+        "shape": shape,
+        "output": "".join(lines)[-16000:],
+    }
+
+
+@app.local_entrypoint()
+def main(
+    mode: str = "cute-check",
+    shape: str = "--B 1 --S 64 --H 4 --P 64 --bench-iters 100 --bench-warmup 20",
+    m: int = 64,
+    n: int = 64,
+    k: int = 64,
+    iters: int = 1000,
+) -> None:
+    if mode == "cute-check":
+        result: Any = cute_stack_check.remote()
+    elif mode == "cute-gemm":
+        result = cute_single_gemm_h200.remote()
+    elif mode == "cute-lkq-chain":
+        result = cute_lkq_chain_h200.remote(iters, 10)
+    elif mode == "quack-gemm":
+        result = quack_gemm_h200.remote(m, n, k, iters)
+    elif mode == "wmma-smoke":
+        result = wmma_smoke_h200.remote(shape)
+    elif mode == "all":
+        result = {
+            "cute_check": cute_stack_check.remote(),
+            "cute_gemm": cute_single_gemm_h200.remote(),
+            "cute_lkq_chain": cute_lkq_chain_h200.remote(iters, 10),
+            "quack_gemm": quack_gemm_h200.remote(m, n, k, iters),
+            "wmma_smoke": wmma_smoke_h200.remote(shape),
+        }
+    else:
+        raise ValueError(
+            "mode must be one of: cute-check, cute-gemm, cute-lkq-chain, "
+            "quack-gemm, wmma-smoke, all"
+        )
+    print(json.dumps(result, indent=2, sort_keys=True))
