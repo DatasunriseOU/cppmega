@@ -1,0 +1,39 @@
+ninja_required_version = 1.3
+cxx = c++
+nvcc = /usr/local/cuda/bin/nvcc
+
+cflags = -DTORCH_EXTENSION_NAME=cppmega_cutlass_mxfp8_gemm_cuda -DTORCH_API_INCLUDE_EXTENSION_H -I/home/dave/vllm/.deps/cutlass-src/include -I/home/dave/vllm/.deps/cutlass-src/tools/util/include -isystem /home/dave/cppmega-venv/lib/python3.13/site-packages/torch/include -isystem /home/dave/cppmega-venv/lib/python3.13/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /home/dave/.local/share/uv/python/cpython-3.13.11-linux-aarch64-gnu/include/python3.13 -fPIC -std=c++20 -O2 -std=c++17
+post_cflags = 
+cuda_cflags = -DTORCH_EXTENSION_NAME=cppmega_cutlass_mxfp8_gemm_cuda -DTORCH_API_INCLUDE_EXTENSION_H -I/home/dave/vllm/.deps/cutlass-src/include -I/home/dave/vllm/.deps/cutlass-src/tools/util/include -isystem /home/dave/cppmega-venv/lib/python3.13/site-packages/torch/include -isystem /home/dave/cppmega-venv/lib/python3.13/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/cuda/include -isystem /home/dave/.local/share/uv/python/cpython-3.13.11-linux-aarch64-gnu/include/python3.13 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_121a,code=sm_121a --compiler-options '-fPIC' -O2 -std=c++17 --expt-relaxed-constexpr --expt-extended-lambda
+cuda_post_cflags = 
+cuda_dlink_post_cflags = 
+sycl_dlink_post_cflags = 
+ldflags = -shared -L/home/dave/cppmega-venv/lib/python3.13/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/usr/local/cuda/lib64 -lcudart
+
+rule compile
+  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
+  depfile = $out.d
+  deps = gcc
+
+rule cuda_compile
+  depfile = $out.d
+  deps = gcc
+  command = $nvcc -MD -MF $out.d $cuda_cflags -c $in -o $out $cuda_post_cflags
+
+
+
+
+
+rule link
+  command = $cxx $in $ldflags -o $out
+
+build cutlass_mxfp8_gemm.o: compile /home/dave/source/cppmega-dense-mxfp8-direct-20260501/cppmega/megatron/cuda_ext/cutlass_mxfp8_gemm.cpp
+build cutlass_mxfp8_gemm.cuda.o: cuda_compile /home/dave/source/cppmega-dense-mxfp8-direct-20260501/cppmega/megatron/cuda_ext/cutlass_mxfp8_gemm.cu
+
+
+
+
+
+build cppmega_cutlass_mxfp8_gemm_cuda.so: link cutlass_mxfp8_gemm.o cutlass_mxfp8_gemm.cuda.o
+
+default cppmega_cutlass_mxfp8_gemm_cuda.so

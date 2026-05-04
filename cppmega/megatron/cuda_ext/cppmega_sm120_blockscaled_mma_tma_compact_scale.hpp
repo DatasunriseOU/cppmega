@@ -83,7 +83,8 @@ template<
   bool UseAuxiliaryLoad_ = false,
   bool UseNoCopyBTma_ = false,
   bool UseAColumnwiseSmemLayout_ = false,
-  bool UseBTmaEarly_ = false
+  bool UseBTmaEarly_ = false,
+  bool UseAColumnwiseKVectorLoad_ = false
 >
 struct MainloopSm120TmaWarpSpecializedBlockScaledCompactScale {
   constexpr static int Stages = Stages_;
@@ -94,6 +95,7 @@ struct MainloopSm120TmaWarpSpecializedBlockScaledCompactScale {
   constexpr static bool UseNoCopyBTma = UseNoCopyBTma_;
   constexpr static bool UseAColumnwiseSmemLayout = UseAColumnwiseSmemLayout_;
   constexpr static bool UseBTmaEarly = UseBTmaEarly_;
+  constexpr static bool UseAColumnwiseKVectorLoad = UseAColumnwiseKVectorLoad_;
   constexpr static int PipelineAsyncMmaStages = 0;
   using ArchTag = arch::Sm120;
 };
@@ -110,7 +112,8 @@ template<
   bool UseAuxiliaryLoad,
   bool UseNoCopyBTma,
   bool UseAColumnwiseSmemLayout,
-  bool UseBTmaEarly
+  bool UseBTmaEarly,
+  bool UseAColumnwiseKVectorLoad
 >
 struct HasAuxiliaryLoad<
   cutlass::gemm::collective::MainloopSm120TmaWarpSpecializedBlockScaledCompactScale<
@@ -121,7 +124,8 @@ struct HasAuxiliaryLoad<
     UseAuxiliaryLoad,
     UseNoCopyBTma,
     UseAColumnwiseSmemLayout,
-    UseBTmaEarly
+    UseBTmaEarly,
+    UseAColumnwiseKVectorLoad
   >
 > : cute::bool_constant<UseAuxiliaryLoad>{};
 
@@ -139,6 +143,7 @@ template <
   bool UseNoCopyBTma,
   bool UseAColumnwiseSmemLayout,
   bool UseBTmaEarly,
+  bool UseAColumnwiseKVectorLoad,
   class TileShape_,
   class ElementPairA_,
   class StridePairA_,
@@ -162,7 +167,8 @@ struct CollectiveMma<
         UseAuxiliaryLoad,
         UseNoCopyBTma,
         UseAColumnwiseSmemLayout,
-        UseBTmaEarly>,
+        UseBTmaEarly,
+        UseAColumnwiseKVectorLoad>,
     TileShape_,
     ElementPairA_,
     StridePairA_,
@@ -188,7 +194,8 @@ struct CollectiveMma<
       UseAuxiliaryLoad,
       UseNoCopyBTma,
       UseAColumnwiseSmemLayout,
-      UseBTmaEarly>;
+      UseBTmaEarly,
+      UseAColumnwiseKVectorLoad>;
   using TileShape = TileShape_;
   using ElementPairA = ElementPairA_;
   using ElementPairB = ElementPairB_;
@@ -1246,19 +1253,57 @@ struct CollectiveMma<
         store_m_word(row_base, kk, 12, chunk.w);
       };
 
+      auto store_k_vector_direct = [&](int row, int kk_base, uint4 chunk) {
+        int smem_offset = int(SmemLayoutA{}(row, kk_base, write_stage));
+        *reinterpret_cast<uint4*>(shared_tensors.smem_A.begin() + smem_offset) = chunk;
+      };
+
+      auto load_k_vector_for_row = [&](int row, int kk_base) {
+        uint32_t words[4] = {0u, 0u, 0u, 0u};
+        CUTLASS_PRAGMA_UNROLL
+        for (int word_idx = 0; word_idx < 4; ++word_idx) {
+          uint32_t word = 0u;
+          CUTLASS_PRAGMA_UNROLL
+          for (int byte = 0; byte < 4; ++byte) {
+            int kk_delta = word_idx * 4 + byte;
+            int64_t payload_offset =
+                static_cast<int64_t>(k_base + kk_base + kk_delta) * params.a_data_ld +
+                (m_base + row);
+            uint32_t value = static_cast<uint32_t>(*(ptr_A + payload_offset));
+            word |= value << (8 * byte);
+          }
+          words[word_idx] = word;
+        }
+        uint4 chunk{words[0], words[1], words[2], words[3]};
+        store_k_vector_direct(row, kk_base, chunk);
+      };
+
       constexpr int RowVectors = TileM / VecBytes;
       if constexpr (DispatchPolicy::UseAColumnwiseSmemLayout) {
         static_assert(RowVectors % 2 == 0, "split A producer expects an even row-vector count");
         if (split_a_producer) {
           constexpr int SplitRowVectors = RowVectors / 2;
-          for (int idx = lane; idx < SplitRowVectors * TileK; idx += 32) {
-            int row_vec = (idx / TileK) * 2;
-            int kk = idx - (idx / TileK) * TileK;
-            int row_base = row_vec * VecBytes;
-            int64_t payload_offset =
-                static_cast<int64_t>(k_base + kk) * params.a_data_ld + (m_base + row_base);
-            uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_A + payload_offset);
-            store_m_contiguous(row_base, kk, chunk);
+          if constexpr (DispatchPolicy::UseAColumnwiseKVectorLoad) {
+            constexpr int KVectors = TileK / VecBytes;
+            for (int idx = lane; idx < SplitRowVectors * VecBytes * KVectors; idx += 32) {
+              int row_vector_k = idx / KVectors;
+              int k_vec = idx - row_vector_k * KVectors;
+              int split_row_vec = row_vector_k / VecBytes;
+              int row_byte = row_vector_k - split_row_vec * VecBytes;
+              int row = split_row_vec * 2 * VecBytes + row_byte;
+              int kk_base = k_vec * VecBytes;
+              load_k_vector_for_row(row, kk_base);
+            }
+          } else {
+            for (int idx = lane; idx < SplitRowVectors * TileK; idx += 32) {
+              int row_vec = (idx / TileK) * 2;
+              int kk = idx - (idx / TileK) * TileK;
+              int row_base = row_vec * VecBytes;
+              int64_t payload_offset =
+                  static_cast<int64_t>(k_base + kk) * params.a_data_ld + (m_base + row_base);
+              uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_A + payload_offset);
+              store_m_contiguous(row_base, kk, chunk);
+            }
           }
         } else {
           for (int idx = lane; idx < RowVectors * TileK; idx += 32) {

@@ -94,6 +94,26 @@ at::Tensor cutlass_mxfp8_tn_gemm_compact_direct_a_col_smem_b_tma_early_asym_cuda
     double alpha,
     double beta);
 
+at::Tensor cutlass_mxfp8_tn_gemm_compact_direct_a_col_smem_kvec_b_tma_early_asym_cuda(
+    at::Tensor A_u8,
+    at::Tensor SFA_u8,
+    at::Tensor B_u8,
+    at::Tensor SFB_u8,
+    int64_t m,
+    int64_t n,
+    int64_t k,
+    int64_t a_source,
+    int64_t a_data_ld,
+    int64_t a_scale_ld,
+    int64_t b_source,
+    int64_t b_data_ld,
+    int64_t b_scale_ld,
+    at::Tensor out,
+    bool use_out,
+    bool accumulate,
+    double alpha,
+    double beta);
+
 at::Tensor cutlass_mxfp8_tn_gemm_swizzled_scale_cuda(
     at::Tensor A_u8,
     at::Tensor SFA_u8,
@@ -169,6 +189,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "tn_gemm_compact_direct_a_col_smem_b_tma_early_asym",
       &cutlass_mxfp8_tn_gemm_compact_direct_a_col_smem_b_tma_early_asym_cuda,
       "Experimental CUTLASS SM120/SM121 MXFP8 TN GEMM with A-columnwise compact shared-memory layout and early rowwise-B TMA issue");
+  m.def(
+      "tn_gemm_compact_direct_a_col_smem_kvec_b_tma_early_asym",
+      &cutlass_mxfp8_tn_gemm_compact_direct_a_col_smem_kvec_b_tma_early_asym_cuda,
+      "Experimental CUTLASS SM120/SM121 MXFP8 TN GEMM with A-columnwise k-vector compact shared-memory stores and early rowwise-B TMA issue");
   m.def(
       "tn_gemm_swizzled_scale",
       &cutlass_mxfp8_tn_gemm_swizzled_scale_cuda,

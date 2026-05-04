@@ -24,18 +24,53 @@ import time
 from typing import Any
 
 import torch
-import transformer_engine  # noqa: F401 - loads TE common libs before TE torch extension
-import transformer_engine_torch as tex
-from transformer_engine.pytorch.tensor import MXFP8Quantizer
 
-from cppmega.megatron import cutlass_mxfp8_gemm as cutlass
+
+def _load_cutlass_backend() -> Any:
+    from cppmega.megatron import cutlass_mxfp8_gemm as cutlass
+
+    return cutlass
+
+
+def _load_te_quantizer() -> tuple[Any, Any]:
+    import transformer_engine  # noqa: F401 - loads TE common libs before TE torch extension
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor import MXFP8Quantizer
+
+    return tex, MXFP8Quantizer
 
 
 def _quantize_mxfp8(tensor: torch.Tensor) -> Any:
+    tex, MXFP8Quantizer = _load_te_quantizer()
     quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
     quantizer.internal = True
     quantizer.optimize_for_gemm = False
     return quantizer(tensor)
+
+
+class _SyntheticMXFP8:
+    def __init__(self, rowwise_data: torch.Tensor, rowwise_scale_inv: torch.Tensor) -> None:
+        self._rowwise_data = rowwise_data
+        self._rowwise_scale_inv = rowwise_scale_inv
+        self._columnwise_data = rowwise_data
+        self._columnwise_scale_inv = torch.full(
+            (rowwise_data.shape[0] // 32, rowwise_data.shape[1]),
+            127,
+            device=rowwise_data.device,
+            dtype=torch.uint8,
+        )
+
+
+def _synthetic_mxfp8(rows: int, cols: int, *, device: torch.device) -> _SyntheticMXFP8:
+    if cols % 32:
+        raise ValueError("synthetic MXFP8 cols must be a multiple of 32")
+    # Restrict synthetic payloads to finite E4M3 values so direct variants can
+    # be compared for exact output parity without depending on TransformerEngine.
+    finite_e4m3 = torch.tensor([0, 48, 56, 184], device=device, dtype=torch.uint8)
+    data_idx = torch.randint(0, int(finite_e4m3.numel()), (rows, cols), device=device, dtype=torch.int64)
+    data = finite_e4m3[data_idx]
+    scale = torch.full((rows, cols // 32), 127, device=device, dtype=torch.uint8)
+    return _SyntheticMXFP8(data, scale)
 
 
 def _time_call(fn: Any) -> float:
@@ -78,6 +113,7 @@ def _emit_transposed_dy_swizzled(
     dy: torch.Tensor,
     dy_colwise_scale_inv: torch.Tensor,
 ) -> Any:
+    tex, MXFP8Quantizer = _load_te_quantizer()
     quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
     quantizer.internal = True
     quantizer.optimize_for_gemm = False
@@ -104,6 +140,7 @@ def _make_streaming_scratch(
 
 
 def _run(args: argparse.Namespace) -> dict[str, Any]:
+    cutlass = _load_cutlass_backend()
     torch.manual_seed(args.seed)
     reduction = args.reduction
     out_n = args.out_n
@@ -118,8 +155,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     dy = (torch.randn((reduction, out_n), device=device, dtype=torch.bfloat16) * 0.01).contiguous()
     torch.cuda.synchronize()
 
-    xq = _quantize_mxfp8(x)
-    dyq = _quantize_mxfp8(dy)
+    if args.synthetic_compact:
+        xq = _synthetic_mxfp8(reduction, out_k, device=device)
+        dyq = _synthetic_mxfp8(reduction, out_n, device=device)
+    else:
+        xq = _quantize_mxfp8(x)
+        dyq = _quantize_mxfp8(dy)
     x_t_data = xq._columnwise_data.t().contiguous()
     x_t_scale = xq._columnwise_scale_inv.t().contiguous()
     out = torch.empty((out_n, out_k), device=device, dtype=torch.bfloat16)
@@ -133,6 +174,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     streaming_scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
     if args.backend == "te_emit_swizzled_stock":
+        if args.synthetic_compact:
+            raise SystemExit("te_emit_swizzled_stock requires TE quantized tensors; omit --synthetic-compact")
         setup_start = torch.cuda.Event(enable_timing=True)
         setup_end = torch.cuda.Event(enable_timing=True)
         setup_start.record()
@@ -189,6 +232,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 
         a_columnwise_smem = args.backend == "a_col_smem_scalar"
         a_columnwise_smem_b_tma_early = args.backend == "a_col_smem_b_tma_early"
+        a_columnwise_smem_kvec_b_tma_early = args.backend == "a_col_smem_kvec_b_tma_early"
         return cutlass._tn_gemm_compact_direct(
             dyq._columnwise_data,
             dyq._columnwise_scale_inv,
@@ -207,18 +251,37 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             asymmetric=True,
             a_columnwise_smem=a_columnwise_smem,
             a_columnwise_smem_b_tma_early=a_columnwise_smem_b_tma_early,
+            a_columnwise_smem_kvec_b_tma_early=a_columnwise_smem_kvec_b_tma_early,
         )
 
     parity: dict[str, Any] | None = None
     if args.check_parity:
         mixed_wgrad()
         candidate = out.detach().clone()
-        direct = cutlass.wgrad_nt_gemm_x_rowwise_transpose(
-            dyq._columnwise_data,
-            dyq._columnwise_scale_inv,
-            x_t_data,
-            x_t_scale,
-        )
+        if args.synthetic_compact:
+            direct = cutlass._tn_gemm_compact_direct(
+                dyq._columnwise_data,
+                dyq._columnwise_scale_inv,
+                x_t_data,
+                x_t_scale,
+                m=out_n,
+                n=out_k,
+                k=reduction,
+                a_source=cutlass._SOURCE_COLUMNWISE_TRANSPOSE,
+                a_data_ld=int(dyq._columnwise_data.shape[1]),
+                a_scale_ld=int(dyq._columnwise_scale_inv.shape[1]),
+                b_source=cutlass._SOURCE_ROWWISE,
+                b_data_ld=int(x_t_data.shape[1]),
+                b_scale_ld=int(x_t_scale.shape[1]),
+                a_columnwise_smem=True,
+            )
+        else:
+            direct = cutlass.wgrad_nt_gemm_x_rowwise_transpose(
+                dyq._columnwise_data,
+                dyq._columnwise_scale_inv,
+                x_t_data,
+                x_t_scale,
+            )
         torch.cuda.synchronize()
         parity = {
             "exact": bool(torch.equal(candidate, direct)),
@@ -300,12 +363,18 @@ def main() -> None:
             "legacy",
             "a_col_smem_scalar",
             "a_col_smem_b_tma_early",
+            "a_col_smem_kvec_b_tma_early",
             "te_emit_swizzled_stock",
             "streaming_swizzled_stock",
         ),
         default="legacy",
     )
     parser.add_argument("--check-parity", action="store_true")
+    parser.add_argument(
+        "--synthetic-compact",
+        action="store_true",
+        help="Use synthetic uint8 compact rowwise/columnwise tensors and skip TransformerEngine imports.",
+    )
     parser.add_argument("--samples", action="store_true")
     parser.add_argument(
         "--cuda-profiler-range",

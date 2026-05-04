@@ -184,6 +184,7 @@ def _tn_gemm_compact_direct(
     asymmetric: bool = True,
     a_columnwise_smem: bool = False,
     a_columnwise_smem_b_tma_early: bool = False,
+    a_columnwise_smem_kvec_b_tma_early: bool = False,
 ) -> torch.Tensor:
     if not is_supported_shape(m, n, k):
         raise ValueError(f"unsupported CUTLASS MXFP8 GB10 shape {m}x{n}x{k}; require multiples of 128")
@@ -208,7 +209,15 @@ def _tn_gemm_compact_direct(
     beta_f = _resolve_beta(beta, bool(accumulate))
 
     ext = _load_cuda_ext()
-    if a_columnwise_smem_b_tma_early:
+    if a_columnwise_smem_kvec_b_tma_early:
+        if not asymmetric:
+            raise ValueError("A-columnwise-smem k-vector B-TMA-early direct path requires asymmetric=True")
+        if a_source != _SOURCE_COLUMNWISE_TRANSPOSE:
+            raise ValueError("A-columnwise-smem k-vector B-TMA-early direct path requires A columnwise-transpose source")
+        if b_source != _SOURCE_ROWWISE:
+            raise ValueError("A-columnwise-smem k-vector B-TMA-early direct path requires B rowwise source")
+        entrypoint = ext.tn_gemm_compact_direct_a_col_smem_kvec_b_tma_early_asym
+    elif a_columnwise_smem_b_tma_early:
         if not asymmetric:
             raise ValueError("A-columnwise-smem B-TMA-early direct path requires asymmetric=True")
         if a_source != _SOURCE_COLUMNWISE_TRANSPOSE:
