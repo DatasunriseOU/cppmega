@@ -1,0 +1,30 @@
+--- a/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
++++ b/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
+@@ -926,9 +926,15 @@
+                     clear=True
+                     )
+                 T.copy(dgamma_diag_reduced_frag, DGAMMA_DIAG[i_b, i_h, chunk_start:chunk_start+chunk_size], disable_tma=True)
+-                # Apply shifted gamma to dqk:
++                # Reuse raw dqk_from_diag for the intrachunk DK/DQ surface:
++                # PsiV @ dPhiO.T == (dPhiO @ PsiV.T).T.
++                dk_intrachunk_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], accum_dtype)
++                for csr_i, csr_j in T.Parallel(fused_chunk_size, fused_chunk_size):
++                    dk_intrachunk_frag[csr_i, csr_j] = dqk_from_diag_frag[csr_j, csr_i]
++
++                # Apply shifted gamma to dqk for the final diagonal Q/K contribution.
+                 gamma_qk_frag = T.alloc_fragment([chunk_size], accum_dtype)
+-                T.copy(gamma_cached_frag, gamma_qk_frag) # Apply shifted gamma
++                T.copy(gamma_cached_frag, gamma_qk_frag)
+                 for csr_i, csr_j in T.Parallel(fused_chunk_size, fused_chunk_size):
+                     dqk_from_diag_frag[csr_i, csr_j] *= gamma_qk_frag[csr_i//R]
+                 T.copy(dqk_from_diag_frag, dqk_from_diag_shared)
+@@ -956,8 +962,7 @@
+                 for csr, n in T.Parallel(fused_chunk_size, N):
+                     dk_frag[csr, n] *= dA_cs_rev_dk_frag[csr//R]
+ 
+-                dk_intrachunk_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], accum_dtype)
+-                T.gemm(PsiV_shared, dPhiO_shared, dk_intrachunk_frag, transpose_B=True, clear_accum=True)
++                # dk_intrachunk_frag already holds raw dqk_from_diag.T.
+ 
+                 # Compute contribution to ddA from intrachunk (part 2 of 4)
+                 kq_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], dtype)
