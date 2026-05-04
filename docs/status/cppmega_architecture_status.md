@@ -257,6 +257,8 @@ be accepted on counters, not on wrapper names:
   operands. Counter evidence is all transpose/materialization counters at zero:
   `mxfp8_tn_adapter_te_emit=0`,
   `mxfp8_tn_adapter_te_emit_deferred=0`,
+  `mxfp8_linear_contract_v1_gemm_ready_operand_consumed>0` for the TE Linear
+  v1 contract,
   `mxfp8_tn_adapter_saved_transpose_operand=0`,
   `mxfp8_tn_adapter_te_emit_swizzled=0`,
   `mxfp8_tn_adapter_te_emit_swizzled_unavailable=0`,
