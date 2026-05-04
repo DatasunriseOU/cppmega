@@ -249,6 +249,58 @@ def test_compact_columnwise_cli_selects_cutlass_native_when_backend_implicit(
     out = capsys.readouterr().out
     assert "export CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=1" in out
     assert "export CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=off" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED=0" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT=0" in out
+    assert "export CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS=0" in out
+
+
+def test_linear_kernel_contract_cli_selects_strict_no_sidecar_defaults(
+    capsys,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_profiles",
+            "shell",
+            "local_gb10_quarter",
+            "--fp8-recipe",
+            "mxfp8",
+            "--mxfp8-linear-kernel-contract",
+            "gemm_ready_v1",
+        ],
+    )
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "export CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT=gemm_ready_v1" in out
+    assert "export CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native" in out
+    assert "export CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=1" in out
+    assert "export CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS=0" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=off" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED=0" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT=0" in out
+
+
+def test_linear_kernel_contract_rejects_non_cutlass_backend(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_profiles",
+            "shell",
+            "local_gb10_quarter",
+            "--fp8-recipe",
+            "mxfp8",
+            "--mxfp8-bwd-backend",
+            "flashinfer_cutlass",
+            "--mxfp8-linear-kernel-contract",
+            "gemm_ready_v1",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="requires --mxfp8-bwd-backend cutlass_native"):
+        main()
 
 
 def test_compact_columnwise_rejects_non_cutlass_backend(monkeypatch):
