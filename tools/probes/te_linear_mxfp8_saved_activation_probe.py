@@ -41,6 +41,12 @@ def _set_mxfp8_profile_env(backend: str | None) -> str:
     backend = os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_BACKEND", "te_tn_adapter")
     no_sidecar = backend == "cutlass_native"
     os.environ.setdefault(
+        "CPPMEGA_TE_MXFP8_MATERIALIZATION_POLICY",
+        "compact_columnwise" if no_sidecar else "materialized_transpose",
+    )
+    if no_sidecar:
+        os.environ.setdefault("CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD", "1")
+    os.environ.setdefault(
         "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND",
         "off" if no_sidecar else "te",
     )
@@ -187,12 +193,21 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 failures.append("FlashInfer/CUTLASS compact-direct backend did not handle dgrad")
             if int(stats.get("mxfp8_flashinfer_wgrad", 0)) <= 0:
                 failures.append("FlashInfer/CUTLASS compact-direct backend did not handle wgrad")
-        if int(stats.get("mxfp8_tn_adapter_te_emit", 0)) != 0:
-            failures.append("compact-direct backend emitted TE transpose operands")
-        if int(stats.get("mxfp8_tn_sidecar_attr_attached", 0)) != 0:
-            failures.append("compact-direct backend attached MXFP8 transpose sidecars")
-        if int(stats.get("mxfp8_tn_sidecar_registry_peak", 0)) != 0:
-            failures.append("compact-direct backend used the sidecar registry")
+        for key in (
+            "mxfp8_tn_adapter_te_emit",
+            "mxfp8_tn_adapter_te_emit_deferred",
+            "mxfp8_tn_adapter_saved_transpose_operand",
+            "mxfp8_tn_adapter_copy_transpose",
+            "mxfp8_tn_adapter_missing_sidecar_copy",
+            "mxfp8_norm_quantize_sidecar_bridge",
+            "mxfp8_tn_sidecar_attr_attached",
+            "mxfp8_tn_sidecar_registry_peak",
+            "mxfp8_tn_sidecar_registry_peak_bytes",
+            "bf16_fallback_dgrad",
+            "bf16_fallback_wgrad",
+        ):
+            if int(stats.get(key, 0)) != 0:
+                failures.append(f"{key}={stats.get(key)}; expected 0 for no-sidecar path")
     else:
         if not saved_transpose_payload:
             failures.append(
