@@ -3,6 +3,10 @@
 This is intentionally smaller than an end-to-end training run.  It exercises
 the main-head + MTP shared-weight pattern with CCE reduction="sum" masked
 labels, then times CCE and optionally Liger on one synthetic CE shape.
+
+The ``--include-main-mtp`` mode measures the launch-count question directly:
+main head plus N MTP heads as separate CCE calls versus one concatenated CCE
+call matching ``CPPMEGA_CCE_FUSE_MAIN_MTP_CE=1``.
 """
 
 from __future__ import annotations
@@ -51,6 +55,196 @@ def _time_cuda(fn, iters: int) -> tuple[list[float], float]:
         times.append(start.elapsed_time(end))
         peak_gib = max(peak_gib, torch.cuda.max_memory_allocated() / 2**30)
     return times, peak_gib
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values)
+
+
+def _median(values: list[float]) -> float:
+    sorted_values = sorted(values)
+    mid = len(sorted_values) // 2
+    if len(sorted_values) % 2:
+        return sorted_values[mid]
+    return (sorted_values[mid - 1] + sorted_values[mid]) / 2.0
+
+
+def _masked_mtp_labels(
+    labels: torch.Tensor,
+    loss_mask: torch.Tensor,
+    mtp_depth: int,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    mtp_labels = labels.clone()
+    mtp_mask = loss_mask.clone()
+    masked_labels: list[torch.Tensor] = []
+    masks: list[torch.Tensor] = []
+    for _ in range(mtp_depth):
+        mtp_labels = torch.roll(mtp_labels, shifts=-1, dims=-1)
+        mtp_labels[:, -1] = 0
+        mtp_mask = torch.roll(mtp_mask, shifts=-1, dims=-1)
+        mtp_mask[:, -1] = 0
+        masked_labels.append(
+            torch.where(
+                mtp_mask.bool(),
+                mtp_labels,
+                torch.full_like(mtp_labels, IGNORE_INDEX),
+            )
+        )
+        masks.append(mtp_mask.clone())
+    return masked_labels, masks
+
+
+def run_main_mtp_call_count_timing(args: argparse.Namespace, filter_eps: Any) -> None:
+    """Time separate main+MTP CCE calls against one concatenated CCE call."""
+
+    torch.manual_seed(20260501)
+    device = "cuda"
+    dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
+    batch, seq, hidden, vocab, mtp_depth = (
+        args.batch,
+        args.seq,
+        args.hidden,
+        args.vocab,
+        args.mtp_depth,
+    )
+    total_seq = (1 + mtp_depth) * seq
+
+    hidden_base = torch.randn(total_seq, batch, hidden, device=device, dtype=dtype) * 0.2
+    weight_base = torch.randn(vocab, hidden, device=device, dtype=dtype) * 0.02
+    labels = torch.randint(0, vocab, (batch, seq), device=device)
+    loss_mask = (torch.rand(batch, seq, device=device) > args.mask_prob).float()
+    mtp_labels, mtp_masks = _masked_mtp_labels(labels, loss_mask, mtp_depth)
+    fused_labels = torch.cat([labels, *mtp_labels], dim=-1)
+
+    def _flatten_targets(targets: torch.Tensor) -> torch.Tensor:
+        return targets.transpose(0, 1).contiguous().reshape(-1)
+
+    labels_1d = _flatten_targets(labels)
+    mtp_labels_1d = [_flatten_targets(targets) for targets in mtp_labels]
+    fused_labels_1d = _flatten_targets(fused_labels)
+    main_mask_1d = loss_mask.transpose(0, 1).contiguous().reshape(-1)
+    mtp_masks_1d = [mask.transpose(0, 1).contiguous().reshape(-1) for mask in mtp_masks]
+
+    mtp_scale = args.mtp_loss_scale / max(mtp_depth, 1)
+
+    def separate_calls() -> None:
+        hidden_t = hidden_base.detach().clone().requires_grad_(True)
+        weight_t = weight_base.detach().clone().requires_grad_(True)
+
+        total = cce_linear_cross_entropy(
+            hidden_t[:seq].contiguous().reshape(seq * batch, hidden),
+            weight_t,
+            labels_1d,
+            reduction="none",
+            ignore_index=IGNORE_INDEX,
+            filter_eps=filter_eps,
+        )
+        loss = (total * main_mask_1d).sum()
+        for depth_idx in range(mtp_depth):
+            mtp_sum = cce_linear_cross_entropy(
+                hidden_t[(depth_idx + 1) * seq : (depth_idx + 2) * seq]
+                .contiguous()
+                .reshape(seq * batch, hidden),
+                weight_t,
+                mtp_labels_1d[depth_idx],
+                reduction="sum",
+                ignore_index=IGNORE_INDEX,
+                filter_eps=filter_eps,
+            )
+            num_tokens = mtp_masks_1d[depth_idx].sum().clamp(min=1)
+            loss = loss + mtp_scale * mtp_sum / num_tokens
+        loss.backward()
+
+    def fused_one_call() -> None:
+        _run_fused_one_call()
+
+    def _run_fused_one_call() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden_t = hidden_base.detach().clone().requires_grad_(True)
+        weight_t = weight_base.detach().clone().requires_grad_(True)
+        fused_loss = cce_linear_cross_entropy(
+            hidden_t.contiguous().reshape(total_seq * batch, hidden),
+            weight_t,
+            fused_labels_1d,
+            reduction="none",
+            ignore_index=IGNORE_INDEX,
+            filter_eps=filter_eps,
+        )
+        fused_loss = fused_loss.reshape(total_seq, batch).transpose(0, 1).contiguous()
+        main_loss = (fused_loss[:, :seq] * loss_mask).sum()
+        mtp_loss = fused_loss[:, seq:].reshape(batch, mtp_depth, seq)
+        loss = main_loss
+        for depth_idx in range(mtp_depth):
+            mtp_sum = mtp_loss[:, depth_idx, :].sum()
+            num_tokens = mtp_masks[depth_idx].sum().clamp(min=1)
+            loss = loss + mtp_scale * mtp_sum / num_tokens
+        loss.backward()
+        return loss.detach(), hidden_t.grad.detach(), weight_t.grad.detach()
+
+    def _run_separate_calls() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden_t = hidden_base.detach().clone().requires_grad_(True)
+        weight_t = weight_base.detach().clone().requires_grad_(True)
+
+        total = cce_linear_cross_entropy(
+            hidden_t[:seq].contiguous().reshape(seq * batch, hidden),
+            weight_t,
+            labels_1d,
+            reduction="none",
+            ignore_index=IGNORE_INDEX,
+            filter_eps=filter_eps,
+        )
+        loss = (total * main_mask_1d).sum()
+        for depth_idx in range(mtp_depth):
+            mtp_sum = cce_linear_cross_entropy(
+                hidden_t[(depth_idx + 1) * seq : (depth_idx + 2) * seq]
+                .contiguous()
+                .reshape(seq * batch, hidden),
+                weight_t,
+                mtp_labels_1d[depth_idx],
+                reduction="sum",
+                ignore_index=IGNORE_INDEX,
+                filter_eps=filter_eps,
+            )
+            num_tokens = mtp_masks_1d[depth_idx].sum().clamp(min=1)
+            loss = loss + mtp_scale * mtp_sum / num_tokens
+        loss.backward()
+        return loss.detach(), hidden_t.grad.detach(), weight_t.grad.detach()
+
+    print(
+        "[main_mtp] "
+        f"batch={batch} seq={seq} mtp_depth={mtp_depth} hidden={hidden} "
+        f"vocab={vocab} dtype={dtype} filter_eps={filter_eps!r}"
+    )
+    if args.check_main_mtp_correctness:
+        separate_loss, separate_hidden_grad, separate_weight_grad = _run_separate_calls()
+        fused_loss, fused_hidden_grad, fused_weight_grad = _run_fused_one_call()
+        torch.cuda.synchronize()
+        loss_rel = abs(fused_loss.item() - separate_loss.item()) / max(
+            abs(separate_loss.item()), 1.0
+        )
+        print(
+            "  correctness: "
+            f"loss_rel={loss_rel:.3e} "
+            f"grad_hidden_rel_l2={_rel_l2(fused_hidden_grad, separate_hidden_grad):.3e} "
+            f"grad_weight_rel_l2={_rel_l2(fused_weight_grad, separate_weight_grad):.3e}"
+        )
+    results: dict[str, tuple[list[float], float]] = {}
+    for name, fn in (
+        ("separate_main_plus_mtp_calls", separate_calls),
+        ("fused_one_cce_call", fused_one_call),
+    ):
+        times, peak_gib = _time_cuda(fn, args.iters)
+        results[name] = (times, peak_gib)
+        print(
+            f"  {name}: avg_ms={_mean(times):.2f} median_ms={_median(times):.2f} "
+            f"times_ms={[round(t, 2) for t in times]} peak_gib={peak_gib:.3f}"
+        )
+
+    separate_avg = _mean(results["separate_main_plus_mtp_calls"][0])
+    fused_avg = _mean(results["fused_one_cce_call"][0])
+    print(
+        "  fused_vs_separate: "
+        f"delta_ms={fused_avg - separate_avg:.2f} speedup={separate_avg / fused_avg:.3f}x"
+    )
 
 
 def run_shared_weight_correctness(dtype: torch.dtype) -> None:
@@ -225,11 +419,18 @@ def run_liger_timing(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokens", type=int, default=4096)
+    parser.add_argument("--batch", type=int, default=2)
+    parser.add_argument("--seq", type=int, default=2048)
+    parser.add_argument("--mtp-depth", type=int, default=2)
     parser.add_argument("--hidden", type=int, default=3584)
     parser.add_argument("--vocab", type=int, default=65536)
     parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--filter-eps", default="high")
+    parser.add_argument("--mask-prob", type=float, default=0.1)
+    parser.add_argument("--mtp-loss-scale", type=float, default=0.1)
+    parser.add_argument("--include-main-mtp", action="store_true")
+    parser.add_argument("--check-main-mtp-correctness", action="store_true")
     parser.add_argument("--include-liger", action="store_true")
     args = parser.parse_args()
 
@@ -242,6 +443,9 @@ def main() -> None:
         f"cc={torch.cuda.get_device_capability()} dtype={dtype}"
     )
     run_shared_weight_correctness(dtype)
+    filter_eps = _filter_eps(args.filter_eps)
+    if args.include_main_mtp:
+        run_main_mtp_call_count_timing(args, filter_eps)
     run_cce_timing(args, _filter_eps(args.filter_eps))
     if args.include_liger:
         run_liger_timing(args)
