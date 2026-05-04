@@ -1,0 +1,66 @@
+{
+  "blockers": [],
+  "command": [
+    "<tmp>/mamba3_wgmma_wave9_copy_probe",
+    "--chunks=128",
+    "--warmup=5",
+    "--iters=40",
+    "--block-threads=256"
+  ],
+  "constants": {
+    "copy_bytes_per_chunk": 98304,
+    "dtype": "bf16",
+    "dtype_bytes": 2,
+    "dynamic_smem_bytes": 98304,
+    "global_tile_count": 10,
+    "local_stage_tile_count": 2,
+    "logical_tile_count": 12,
+    "tile_cols": 64,
+    "tile_rows": 64,
+    "vector_bytes": 16,
+    "vector_type": "uint4",
+    "vectors_per_chunk": 6144,
+    "vectors_per_tile": 512
+  },
+  "correctness": {
+    "comparison": "byte_equal_to_scalar_cuda_kernel",
+    "first_mismatch_index": null,
+    "mismatched_elements": 0,
+    "scalar_checksum_fnv1a64": 7518092082649847683,
+    "status": "pass",
+    "status_word": 0,
+    "vector_checksum_fnv1a64": 7518092082649847683
+  },
+  "date": "2026-04-30",
+  "device": {
+    "compute_capability": "12.1",
+    "max_dynamic_smem_optin_bytes": 101376,
+    "multiprocessor_count": 48,
+    "name": "NVIDIA GB10"
+  },
+  "evidence": "mamba3_mono_wgmma_copy_path_wave9_runtime_2026_04_30",
+  "kernel_name": "mamba3_wave9_uint4_copy_12tile_probe",
+  "launch": {
+    "block_threads": 256,
+    "chunks": 128,
+    "dynamic_smem_bytes": 98304,
+    "grid_blocks": 96
+  },
+  "returncode": 0,
+  "scalar_reference_kernel": "mamba3_wave9_scalar_copy_12tile_reference",
+  "schema": "mamba3_wave9_runtime_probe_v1",
+  "status": "pass",
+  "stderr_tail": [],
+  "timing": {
+    "copy_stage_bytes_per_iteration": 25165824,
+    "logical_payload_bytes_per_iteration": 12582912,
+    "scalar_avg_us": 227.399206,
+    "scalar_effective_gib_s_payload_bytes": 51.533821,
+    "speedup_vs_scalar_time": 1.690932,
+    "status": "measured",
+    "timed_iterations": 40,
+    "vector_avg_us": 134.481597,
+    "vector_effective_gib_s_copy_stage_bytes": 174.280352,
+    "warmup_iterations": 5
+  }
+}

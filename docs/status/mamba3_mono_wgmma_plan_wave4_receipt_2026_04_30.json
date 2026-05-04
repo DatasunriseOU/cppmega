@@ -1,0 +1,776 @@
+{
+  "branch": "worker/mamba3-mono-triton-model",
+  "bytes_per_fma": {
+    "chunk_owner_ideal_output_write_bytes_per_fma": 0.008467338324,
+    "scan_owner_full_mask_plus_dstates_output_write_bytes_per_fma": 0.005681998982,
+    "scan_owner_ideal_plus_dstates_output_write_bytes_per_fma": 0.006595349782,
+    "scan_owner_wave2_4step_plus_dstates_output_write_bytes_per_fma": 0.00629761233
+  },
+  "component_receipt": [
+    {
+      "component": "state_dpsi",
+      "fma": 17179869184,
+      "receipt": "K @ dstates_panel runs once per P panel and feeds dPsiV."
+    },
+    {
+      "component": "lkq_once",
+      "fma": 8589934592,
+      "receipt": "LKQ is built once per chunk and reused for dPsiV and DSSDA."
+    },
+    {
+      "component": "lkq_apply_to_dphi",
+      "fma": 8053063680,
+      "receipt": "Causal apply only; implementation must report full-mask, 4-step, or ideal diagonal-split mode."
+    },
+    {
+      "component": "qk_dpsi_once_for_dv_and_dmimov",
+      "fma": 1073741824,
+      "receipt": "qk_dot same-time contribution is computed once and feeds DV plus local DMIMO_V."
+    },
+    {
+      "component": "dv_and_dmimov_r_reductions",
+      "fma": 536870912,
+      "receipt": "DV is stored per chunk; DMIMO_V[R,P] remains CTA-local and writes once."
+    },
+    {
+      "component": "dk_state",
+      "fma": 17179869184,
+      "receipt": "PsiV @ dstates.T feeds DK and DDA_CS_REV."
+    },
+    {
+      "component": "dk_intra_once",
+      "fma": 17179869184,
+      "receipt": "dk_intra is built once and reused for DGAMMA_DIAG, DSSDA, DK, and DQ."
+    },
+    {
+      "component": "dk_intra_apply_to_q",
+      "fma": 4026531840,
+      "receipt": "Causal dk_intra @ Q apply feeds DK."
+    },
+    {
+      "component": "dq_state",
+      "fma": 17179869184,
+      "receipt": "dPhiO @ states.T feeds DQ and DDA_CS."
+    },
+    {
+      "component": "dk_intra_t_apply_to_k",
+      "fma": 4026531840,
+      "receipt": "DQ intra uses transpose SMEM view/copy; no second dk_intra GMMA build."
+    },
+    {
+      "component": "scalar_elementwise_reductions",
+      "fma": 1350565888,
+      "receipt": "Trap, rotary, DSSDA, DANGLES, DDA, and vector reductions are not TMA-tiny copies."
+    },
+    {
+      "component": "scan_dstates_update",
+      "fma": 17179869184,
+      "receipt": "Preferred scan owner updates dstates locally with Q.T @ dPhiO before the next reverse chunk."
+    }
+  ],
+  "copy_strategy_variants": {
+    "documentation_sources": [
+      {
+        "name": "CUDA Programming Guide - asynchronous data copies",
+        "receipt_note": "TMA is modeled as bulk/bulk-tensor async copy on CC 9.0+; bulk tensor copies require a tensor map and shared-memory barrier completion.",
+        "url": "https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-copies.html"
+      },
+      {
+        "name": "libcu++ PTX cp.async.bulk wrappers",
+        "receipt_note": "cp.async.bulk requires 16-byte aligned source/destination and a size that is a multiple of 16 bytes.",
+        "url": "https://nvidia.github.io/cccl/libcudacxx/ptx/instructions/cp_async_bulk.html"
+      },
+      {
+        "name": "CUTLASS CuTe TMA tensors",
+        "receipt_note": "TMA consumes descriptor/tensor-map coordinates, not ordinary gmem pointers; descriptor construction is therefore a separate implementation gate.",
+        "url": "https://docs.nvidia.com/cutlass/4.3.2/media/docs/cpp/cute/0z_tma_tensors.html"
+      },
+      {
+        "name": "CuTe DSL cpasync submodule",
+        "receipt_note": "make_tiled_tma_atom builds a TMA copy atom for GMEM/SMEM tiles from a gmem tensor, smem layout, and CTA tiler.",
+        "url": "https://docs.nvidia.com/cutlass/4.2.1/media/docs/pythonDSL/cute_dsl_api/cute_nvgpu_cpasync.html"
+      }
+    ],
+    "resource_budget": {
+      "async_control_smem_reserve_bytes": 4096,
+      "base_dynamic_smem_bytes": 118784,
+      "kill_dynamic_smem_bytes": 163840,
+      "kill_regs_per_thread": 224,
+      "one_extra_tile_stage_bytes": 8192,
+      "pass_dynamic_smem_bytes": 131072,
+      "pass_regs_per_thread": 192,
+      "tma_one_stage_dynamic_smem_bytes": 131072,
+      "tma_two_stage_dynamic_smem_bytes": 139264
+    },
+    "scope": {
+      "large_copy_bytes_grid": 3221225472,
+      "large_copy_bytes_per_chunk": 98304,
+      "large_copy_bytes_per_cta_stream": 25165824,
+      "large_copy_mib_grid": 3072.0,
+      "large_copy_mib_per_cta_stream": 24.0,
+      "large_copy_tiles_per_chunk": 12,
+      "large_tile_bytes": 8192,
+      "large_tile_shape": "64x64 bf16",
+      "local_or_smem_stage_bytes_per_chunk": 16384,
+      "local_or_smem_stage_tiles_per_chunk": 2,
+      "tiny_vector_policy": "DDA/DFACTOR/DGAMMA/DSSDA/DANGLES scalar/vector slices are excluded from TMA; copy them with ordinary or narrow-vector code only.",
+      "tma_eligible_global_copy_bytes_per_chunk": 81920,
+      "tma_eligible_global_tiles_per_chunk": 10
+    },
+    "variants": [
+      {
+        "copy_instruction_unit_bytes": 2,
+        "copy_instructions_per_chunk": 49152,
+        "copy_kind": "ordinary per-element BF16 gmem->smem/smem->gmem copies through registers",
+        "estimated_dynamic_smem_bytes": 118784,
+        "estimated_regs_per_thread_full_dstates": 188,
+        "evidence": {
+          "measured_microbench_us_64x64x64": 28.254,
+          "wave5_user_context": "64x64x64 scalar-copy CuTe WGMMA GEMM is correct at about 28.254 us."
+        },
+        "fail_gates": [
+          "Any production/yellow/green timing claim based on this copy path.",
+          "Any local-memory spill caused by scalar staging values."
+        ],
+        "large_copy_bytes_grid": 3221225472,
+        "large_copy_bytes_per_chunk": 98304,
+        "large_tile_ops_per_chunk": 12,
+        "local_or_smem_stage_tile_ops_per_chunk": 2,
+        "name": "scalar_bf16_correct_baseline",
+        "pass_gates": [
+          "All output slots match the scalar BF16 reference smoke.",
+          "The single-GEMM CuTe WGMMA scalar-copy baseline stays correct.",
+          "Receipt labels timing as a baseline and does not claim production speed."
+        ],
+        "production_gate": "fails performance gate; allowed only to prove WGMMA math and output wiring",
+        "resource_implication": "No async-control SMEM and no extra staging. Register pressure remains below the 192-reg pass budget, but the copy instruction count is too high.",
+        "status": "correctness_baseline_only",
+        "tma_eligible_global_tile_ops_per_chunk": 10
+      },
+      {
+        "copy_instruction_unit_bytes": 16,
+        "copy_instructions_per_chunk": 6144,
+        "copy_kind": "CuTe CopyUniversalOp-style 128-bit vector copies for aligned contiguous BF16 tiles",
+        "estimated_dynamic_smem_bytes": 118784,
+        "estimated_regs_per_thread_full_dstates": 192,
+        "evidence": {
+          "copy_instruction_reduction_vs_scalar": "8x fewer large-tile copy instructions",
+          "single_tile_vector_copies": 512
+        },
+        "fail_gates": [
+          "Any masked vector tail on the 64x64 BF16 tiles.",
+          "Any bank-conflict or layout fix that adds an independent 64x64 SMEM tile.",
+          "ptxas registers/thread >192 after vector copy integration."
+        ],
+        "large_copy_bytes_grid": 3221225472,
+        "large_copy_bytes_per_chunk": 98304,
+        "large_tile_ops_per_chunk": 12,
+        "local_or_smem_stage_tile_ops_per_chunk": 2,
+        "name": "narrow_vector_128b_safe_attempt",
+        "pass_gates": [
+          "Every vectorized source and destination pointer is at least 16-byte aligned.",
+          "Every large tile has no tail path: 8192-byte tiles are copied as 512 x 16-byte lanes.",
+          "Small scalar/vector slices stay on ordinary non-TMA copies.",
+          "ptxas registers/thread <=192 and no spills."
+        ],
+        "production_gate": "may enter timing gate after correctness, alignment proof, ptxas <=192 regs/thread, and zero spills",
+        "resource_implication": "Same SMEM footprint as scalar baseline. Register estimate lands exactly on the 192-reg pass budget, so ptxas metadata is mandatory before widening lifetimes.",
+        "status": "safe_attempt",
+        "tma_eligible_global_tile_ops_per_chunk": 10
+      },
+      {
+        "copy_instruction_unit_bytes": 8192,
+        "copy_instructions_per_chunk": 12,
+        "copy_kind": "TMA bulk-tensor or cp.async.bulk path for 10 global 64x64 BF16 tiles; ordinary/vector staging for 2 CTA-local dstates panels and tiny scalar slices",
+        "estimated_dynamic_smem_bytes": 131072,
+        "estimated_regs_per_thread_full_dstates": 184,
+        "evidence": {
+          "async_control_smem_reserve_bytes": 4096,
+          "copy_instruction_reduction_vs_scalar": "4096x fewer large-tile copy instructions before setup overhead",
+          "copy_instruction_reduction_vs_vector": "512x fewer large-tile copy instructions before setup overhead",
+          "local_dstates_stage_tile_ops_per_chunk": 2,
+          "single_pingpong_tile_bytes": 8192,
+          "tma_eligible_global_tile_ops_per_chunk": 10
+        },
+        "fail_gates": [
+          "Any TMA descriptor/tensor-map init failure.",
+          "Any missing mbarrier expected-byte update or wait before WGMMA consumes SMEM.",
+          "Trying to build a TMA descriptor for CTA-local dstates.",
+          "Using TMA for tiny scalar/vector slices that previously triggered descriptor failures.",
+          "More than one extra 8 KiB ping-pong tile without reducing the base SMEM plan.",
+          "Dynamic SMEM >128 KiB for a claimed green/yellow timing sample."
+        ],
+        "large_copy_bytes_grid": 3221225472,
+        "large_copy_bytes_per_chunk": 98304,
+        "large_tile_ops_per_chunk": 12,
+        "local_or_smem_stage_tile_ops_per_chunk": 2,
+        "name": "tma_cp_async_target",
+        "pass_gates": [
+          "TMA tensor-map/descriptor construction succeeds for every large tile layout.",
+          "cp.async.bulk uses 16-byte aligned source/destination and 16-byte-multiple sizes.",
+          "Low-level cp.async.bulk calls pair mbarrier expected-byte accounting with wait/fence.",
+          "Only global 64x64 BF16 tiles use TMA/cp.async; dstates local stages and tiny BHS/vector slices stay non-TMA.",
+          "Dynamic SMEM <=128 KiB, ptxas registers/thread <=192, and no spills.",
+          "Full productionish H200 timing is <=3.35 ms for green or <=3.70674 ms for yellow."
+        ],
+        "production_gate": "only variant allowed to claim the green target if descriptors, mbarriers, resources, and timing all pass",
+        "resource_implication": "Reserves 4 KiB for async-control state plus one 8 KiB ping-pong tile. This reaches the 128 KiB dynamic-SMEM pass ceiling exactly; a second extra tile stage exceeds the pass budget and needs a measured waiver.",
+        "status": "production_target",
+        "tma_eligible_global_tile_ops_per_chunk": 10
+      }
+    ]
+  },
+  "criteria": {
+    "kill": [
+      "Any duplicate LKQ, dk_intra, or dk_intra.T GMMA build.",
+      "Any [B,H,nchunks,R,P] DMIMO_V partial output in the preferred scan-owner path.",
+      "Any silent owner mix where dstates is treated both as a loop-carried local and as precomputed chunk input.",
+      "Any production timing claim using the scalar BF16 copy baseline.",
+      "Any TMA descriptor failure, missing async mbarrier wait/fence, TMA use on local dstates, or TMA use on tiny vector slices.",
+      "Dynamic SMEM >160 KiB, ptxas registers/thread >224, or any local-memory spill in the hot CTA.",
+      "Full-kernel timing >3.70674 ms on productionish H200 after correctness.",
+      "Claiming ideal 96.38B/113.56B FMA without diagonal 4x4 causal split or equivalent no-work-lower-triangle proof."
+    ],
+    "pass": [
+      "Correctness smoke covers every output slot: DV, DK, DQ, DMIMO_V, five BHS scalars, DSSDA, DANGLES.",
+      "Preferred owner is one CTA per (B,H) stream with reverse chunk loop and CTA-local dstates plus DMIMO_V[R,P].",
+      "LKQ and dk_intra are each built once per chunk; dk_intra.T is fed from SMEM view/copy.",
+      "The copy strategy is declared as scalar_bf16_correct_baseline, narrow_vector_128b_safe_attempt, or tma_cp_async_target.",
+      "No global dPsiV, LKQ, dk_intra, DK, DQ intermediate, or DMIMO_V partial tensor is materialized.",
+      "TMA/cp.async is restricted to large aligned global 64x64 BF16 tiles; dstates local stages and tiny vector/scalar slices stay non-TMA.",
+      "Dynamic SMEM <=128 KiB including alignment guard; ptxas registers/thread <=192 with no local-memory spills.",
+      "Reported timing is green at <=3.35 ms or at least yellow at <=3.70674 ms against TileLang."
+    ],
+    "timing_ms": {
+      "chunk_owner_dmimov_reducer": 0.05,
+      "chunk_owner_main_body": 3.2,
+      "green_full_kernel": 3.35,
+      "red_full_kernel_above": 3.70674,
+      "scan_owner_main_body": 3.3,
+      "yellow_full_kernel": 3.70674
+    }
+  },
+  "date": "2026-04-30",
+  "gmma_counts": {
+    "atom": "SM90 BF16 GMMA m64n64k16 -> fp32 accumulator",
+    "fma_per_m64n64k16_op": 65536,
+    "products": [
+      {
+        "component": "state_dpsi",
+        "dense_m64n64k16_ops_grid": 262144,
+        "dense_m64n64k16_ops_per_chunk": 8,
+        "ideal_m64n64k16_equiv_ops_grid": 262144.0,
+        "ideal_m64n64k16_equiv_ops_per_chunk": 8.0,
+        "notes": "Run once per P panel; dstates is loop-carried by the scan CTA.",
+        "shape": "K[64,64] @ dstates[64,64] for each P panel",
+        "tile_pruned_m64n64k16_equiv_ops_grid": 262144.0,
+        "tile_pruned_m64n64k16_equiv_ops_per_chunk": 8.0,
+        "useful_fma_per_chunk_ideal": 524288
+      },
+      {
+        "component": "lkq_once",
+        "dense_m64n64k16_ops_grid": 131072,
+        "dense_m64n64k16_ops_per_chunk": 4,
+        "ideal_m64n64k16_equiv_ops_grid": 131072.0,
+        "ideal_m64n64k16_equiv_ops_per_chunk": 4.0,
+        "notes": "Build exactly once per chunk; DSSDA consumes the full unmasked product.",
+        "shape": "K[64,64] @ Q_T[64,64] -> LKQ[64,64]",
+        "tile_pruned_m64n64k16_equiv_ops_grid": 131072.0,
+        "tile_pruned_m64n64k16_equiv_ops_per_chunk": 4.0,
+        "useful_fma_per_chunk_ideal": 262144
+      },
+      {
+        "component": "lkq_apply_to_dphi",
+        "dense_m64n64k16_ops_grid": 262144,
+        "dense_m64n64k16_ops_per_chunk": 8,
+        "ideal_m64n64k16_equiv_ops_grid": 122880.0,
+        "ideal_m64n64k16_equiv_ops_per_chunk": 3.75,
+        "notes": "Ideal path requires 4x4 timestep subtile apply; full dense fallback is 8 ops/chunk.",
+        "shape": "causal(LKQ)[64,64] @ dPhiO[64,64] for each P panel",
+        "tile_pruned_m64n64k16_equiv_ops_grid": 163840.0,
+        "tile_pruned_m64n64k16_equiv_ops_per_chunk": 5.0,
+        "useful_fma_per_chunk_ideal": 245760
+      },
+      {
+        "component": "dk_state",
+        "dense_m64n64k16_ops_grid": 262144,
+        "dense_m64n64k16_ops_per_chunk": 8,
+        "ideal_m64n64k16_equiv_ops_grid": 262144.0,
+        "ideal_m64n64k16_equiv_ops_per_chunk": 8.0,
+        "notes": "Consumes both P panels and feeds DDA_CS_REV plus DK.",
+        "shape": "PsiV[64,128] @ dstates_T[128,64] -> DK state[64,64]",
+        "tile_pruned_m64n64k16_equiv_ops_grid": 262144.0,
+        "tile_pruned_m64n64k16_equiv_ops_per_chunk": 8.0,
+        "useful_fma_per_chunk_ideal": 524288
+      },
+      {
+        "component": "dk_intra_once",
+        "dense_m64n64k16_ops_grid": 262144,
+        "dense_m64n64k16_ops_per_chunk": 8,
+        "ideal_m64n64k16_equiv_ops_grid": 262144.0,
+        "ideal_m64n64k16_equiv_ops_per_chunk": 8.0,
+        "notes": "Build exactly once; feeds DGAMMA_DIAG, DSSDA, DK, and DQ.",
+        "shape": "PsiV[64,128] @ dPhiO_T[128,64] -> dk_intra[64,64]",
+        "tile_pruned_m64n64k16_equiv_ops_grid": 262144.0,
+        "tile_pruned_m64n64k16_equiv_ops_per_chunk": 8.0,
+        "useful_fma_per_chunk_ideal": 524288
+      },
+      {
+        "component": "dk_intra_apply_to_q",
+        "dense_m64n64k16_ops_grid": 131072,
+        "dense_m64n64k16_ops_per_chunk": 4,
+        "ideal_m64n64k16_equiv_ops_grid": 61440.0,
+        "ideal_m64n64k16_equiv_ops_per_chunk": 1.875,
+        "notes": "Same causal frontier as LKQ apply; diagonal must split to claim ideal.",
+        "shape": "causal(dk_intra)[64,64] @ Q[64,64] -> DK intra[64,64]",
+        "tile_pruned_m64n64k16_equiv_ops_grid": 81920.0,
+        "tile_pruned_m64n64k16_equiv_ops_per_chunk": 2.5,
+        "useful_fma_per_chunk_ideal": 122880
+      },
+      {
+        "component": "dq_state",
+        "dense_m64n64k16_ops_grid": 262144,
+        "dense_m64n64k16_ops_per_chunk": 8,
+        "ideal_m64n64k16_equiv_ops_grid": 262144.0,
+        "ideal_m64n64k16_equiv_ops_per_chunk": 8.0,
+        "notes": "Consumes both P panels and feeds DDA_CS plus DQ.",
+        "shape": "dPhiO[64,128] @ states_T[128,64] -> DQ state[64,64]",
+        "tile_pruned_m64n64k16_equiv_ops_grid": 262144.0,
+        "tile_pruned_m64n64k16_equiv_ops_per_chunk": 8.0,
+        "useful_fma_per_chunk_ideal": 524288
+      },
+      {
+        "component": "dk_intra_t_apply_to_k",
+        "dense_m64n64k16_ops_grid": 131072,
+        "dense_m64n64k16_ops_per_chunk": 4,
+        "ideal_m64n64k16_equiv_ops_grid": 61440.0,
+        "ideal_m64n64k16_equiv_ops_per_chunk": 1.875,
+        "notes": "Input must be an SMEM transpose view/copy of dk_intra, not a second GMMA build.",
+        "shape": "causal(dk_intra)_T[64,64] @ K[64,64] -> DQ intra[64,64]",
+        "tile_pruned_m64n64k16_equiv_ops_grid": 81920.0,
+        "tile_pruned_m64n64k16_equiv_ops_per_chunk": 2.5,
+        "useful_fma_per_chunk_ideal": 122880
+      },
+      {
+        "component": "scan_dstates_update",
+        "dense_m64n64k16_ops_grid": 262144,
+        "dense_m64n64k16_ops_per_chunk": 8,
+        "ideal_m64n64k16_equiv_ops_grid": 262144.0,
+        "ideal_m64n64k16_equiv_ops_per_chunk": 8.0,
+        "notes": "Scan-owner only; updates CTA-local dstates for the next reverse chunk.",
+        "shape": "Q_T[64,64] @ dPhiO[64,64] for each P panel",
+        "tile_pruned_m64n64k16_equiv_ops_grid": 262144.0,
+        "tile_pruned_m64n64k16_equiv_ops_per_chunk": 8.0,
+        "useful_fma_per_chunk_ideal": 524288
+      }
+    ],
+    "totals": {
+      "full_mask_dense_m64n64k16_ops_grid_excluding_scan_update": 1703936,
+      "full_mask_dense_m64n64k16_ops_per_chunk_excluding_scan_update": 52,
+      "full_mask_dense_m64n64k16_ops_per_cta_stream_excluding_scan_update": 13312,
+      "ideal_triangular_m64n64k16_equiv_ops_grid_excluding_scan_update": 1425408.0,
+      "ideal_triangular_m64n64k16_equiv_ops_per_chunk_excluding_scan_update": 43.5,
+      "ideal_triangular_m64n64k16_equiv_ops_per_cta_stream_excluding_scan_update": 11136.0,
+      "scan_dstates_update_dense_m64n64k16_ops_per_chunk": 8,
+      "scan_owner_full_mask_dense_m64n64k16_ops_grid_with_update": 1966080,
+      "scan_owner_full_mask_dense_m64n64k16_ops_per_chunk_with_update": 60,
+      "scan_owner_ideal_m64n64k16_equiv_ops_grid_with_update": 1687552.0,
+      "scan_owner_ideal_m64n64k16_equiv_ops_per_chunk_with_update": 51.5,
+      "scan_owner_wave2_4step_m64n64k16_equiv_ops_per_chunk_with_update": 54.0,
+      "wave2_4step_m64n64k16_equiv_ops_grid_excluding_scan_update": 1507328.0,
+      "wave2_4step_m64n64k16_equiv_ops_per_chunk_excluding_scan_update": 46.0
+    }
+  },
+  "modeled_fma": {
+    "components_ideal_triangular": {
+      "dk_intra_apply_to_q_full_mask": 4026531840,
+      "dk_intra_once_for_dgamma_dssda_dk_dq": 17179869184,
+      "dk_intra_transpose_apply_to_k_full_mask": 4026531840,
+      "dk_state": 17179869184,
+      "dq_state": 17179869184,
+      "dv_and_dmimov_r_reductions": 536870912,
+      "lkq_apply_to_dphi_full_mask": 8053063680,
+      "lkq_once": 8589934592,
+      "qk_dpsi_once_for_dv_and_dmimov": 1073741824,
+      "scalar_elementwise_reductions": 1350565888,
+      "state_dpsi": 17179869184
+    },
+    "global_temps_avoided_by_cuda_owner_mib": {
+      "dk_fp32_temp": 512.0,
+      "dk_intra_fp32_temp": 512.0,
+      "dpsi_bf16_temp": 512.0,
+      "dq_fp32_temp": 512.0,
+      "lkq_fp32_temp": 512.0,
+      "state_dpsi_fp32_temp": 1024.0
+    },
+    "ideal_triangular_apply": 96376717312,
+    "monolithic_full_mask": 114630328320,
+    "optional_scan_owner_dstates_update": 17179869184,
+    "scan_owner_full_mask_plus_dstates_update": 131810197504,
+    "scan_owner_ideal_plus_dstates_update": 113556586496,
+    "scan_owner_wave2_4step_plus_dstates_update": 118925295616,
+    "separate_recompute": 125367746560,
+    "wave2_4step_tile_pruned": 101745426432
+  },
+  "output_bytes": {
+    "chunk_owner_required_output_write_bytes": 816054272,
+    "chunk_owner_required_output_write_mib": 778.25,
+    "dmimov_partial_bytes": 67108864,
+    "dmimov_partial_mib": 64.0,
+    "dmimov_reducer_extra_rw_bytes": 134479872,
+    "dmimov_reducer_extra_rw_mib": 128.25,
+    "per_chunk_scan_output_bytes_excluding_final_dmimov": 22848,
+    "per_cta_stream_scan_output_bytes_including_final_dmimov": 5851136,
+    "scan_owner_required_output_write_bytes": 748945408,
+    "scan_owner_required_output_write_mib": 714.25
+  },
+  "output_slots": [
+    {
+      "bytes": 134217728,
+      "cadence": "once per chunk/P panel",
+      "dtype": "bf16",
+      "name": "DV",
+      "owner": "(B,H,chunk) within scan CTA",
+      "shape": "[B,S,H,P]"
+    },
+    {
+      "bytes": 268435456,
+      "cadence": "once per chunk",
+      "dtype": "bf16",
+      "name": "DK",
+      "owner": "(B,H,chunk) within scan CTA",
+      "shape": "[B,S*R,H,N]"
+    },
+    {
+      "bytes": 268435456,
+      "cadence": "once per chunk",
+      "dtype": "bf16",
+      "name": "DQ",
+      "owner": "(B,H,chunk) within scan CTA",
+      "shape": "[B,S*R,H,N]"
+    },
+    {
+      "bytes": 262144,
+      "cadence": "once after reverse scan",
+      "dtype": "fp32",
+      "name": "DMIMO_V",
+      "owner": "(B,H) scan CTA",
+      "shape": "[B,H,R,P]"
+    },
+    {
+      "bytes": 2097152,
+      "cadence": "once per chunk",
+      "dtype": "fp32",
+      "name": "DDA_CS",
+      "owner": "(B,H,chunk)",
+      "shape": "[B,H,S]"
+    },
+    {
+      "bytes": 2097152,
+      "cadence": "once per chunk",
+      "dtype": "fp32",
+      "name": "DDA_CS_REV",
+      "owner": "(B,H,chunk)",
+      "shape": "[B,H,S]"
+    },
+    {
+      "bytes": 2097152,
+      "cadence": "once per chunk",
+      "dtype": "fp32",
+      "name": "DFACTOR",
+      "owner": "(B,H,chunk)",
+      "shape": "[B,H,S]"
+    },
+    {
+      "bytes": 2097152,
+      "cadence": "once per chunk",
+      "dtype": "fp32",
+      "name": "DGAMMA_DIAG",
+      "owner": "(B,H,chunk)",
+      "shape": "[B,H,S]"
+    },
+    {
+      "bytes": 33554432,
+      "cadence": "once per chunk",
+      "dtype": "fp32",
+      "name": "DSSDA",
+      "owner": "(B,H,chunk)",
+      "shape": "[B,H,nchunks,chunk,chunk]"
+    },
+    {
+      "bytes": 2097152,
+      "cadence": "once per chunk",
+      "dtype": "fp32",
+      "name": "DDA",
+      "owner": "(B,H,chunk)",
+      "shape": "[B,H,S]"
+    },
+    {
+      "bytes": 33554432,
+      "cadence": "once per chunk",
+      "dtype": "fp32",
+      "name": "DANGLES",
+      "owner": "(B,H,chunk)",
+      "shape": "[B,S,H,N/4]"
+    }
+  ],
+  "ownership": {
+    "fallback": {
+      "allowed_only_if": "upstream provides correct per-chunk dstates handoff",
+      "cta_count": 32768,
+      "extra_global_bytes": 134479872,
+      "extra_global_mib": 128.25,
+      "name": "chunk_owner_bh_chunk"
+    },
+    "preferred": {
+      "chunk_iterations_per_cta": 256,
+      "chunk_order": "reverse: 255 downto 0",
+      "cta_count": 128,
+      "dmimov": "CTA-local R x P fp32 accumulator, final store only",
+      "dstates": "CTA-local loop-carried N x P state",
+      "name": "scan_owner_bh_stream"
+    }
+  },
+  "receipt": "mamba3_mono_wgmma_plan_wave4_2026_04_30",
+  "register_pressure_estimate": {
+    "accumulator_regs_per_64x64_fp32_tile_per_thread": 32,
+    "danger_regs_per_thread_with_third_live_accumulator": 212,
+    "dmimov_regs_per_thread_if_distributed": 4,
+    "dstates_regs_per_thread_if_full_np_local": 64,
+    "dstates_regs_per_thread_if_panelized": 32,
+    "estimated_regs_per_thread_full_dstates": 180,
+    "estimated_regs_per_thread_panelized": 148,
+    "kill_budget_regs_per_thread": 224,
+    "pass_budget_regs_per_thread": 192,
+    "receipt": "Panelize dstates or spill to SMEM if ptxas exceeds 192 regs/thread; any local-memory spill is a kill.",
+    "warpgroup_threads": 128
+  },
+  "schedule_steps": [
+    {
+      "action": "CTA owns one (b,h) stream; chunk loop is for chunk_idx=nchunks-1 downto 0.",
+      "name": "map_cta",
+      "order": 0,
+      "requires": [
+        "dstates local to CTA",
+        "DMIMO_V[R,P] local to CTA"
+      ]
+    },
+    {
+      "action": "Load/copy K, Q, K_T, Q_T, dPhiO/PsiV/state panels into SMEM views.",
+      "name": "load_chunk_operands",
+      "order": 1,
+      "requires": [
+        "K-major legal SMEM operands",
+        "no TMA for tiny vector slices"
+      ]
+    },
+    {
+      "action": "Issue K @ Q_T GMMA, keep fp32 for scalar products, downcast to sLKQ for causal apply.",
+      "name": "build_lkq_once",
+      "order": 2,
+      "requires": [
+        "exactly one LKQ build per chunk"
+      ]
+    },
+    {
+      "action": "For P panels 0..1, run K @ dstates_panel, causal LKQ @ dPhiO_panel, qk contribution, DV store, and local DMIMO_V accumulation.",
+      "name": "dpsi_dv_dmimov_panels",
+      "order": 3,
+      "requires": [
+        "P split as two n64 panels",
+        "DMIMO_V final output only"
+      ]
+    },
+    {
+      "action": "Run PsiV @ dstates.T, accumulate DDA_CS_REV and DK state contribution.",
+      "name": "build_dk_state",
+      "order": 4,
+      "requires": [
+        "dstates still local"
+      ]
+    },
+    {
+      "action": "Run PsiV @ dPhiO.T once, keep fp32 for scalar products, downcast to sDKI for DK/DQ applies.",
+      "name": "build_dk_intra_once",
+      "order": 5,
+      "requires": [
+        "exactly one dk_intra build per chunk"
+      ]
+    },
+    {
+      "action": "Use causal dk_intra @ Q for DK and transpose SMEM view/copy of dk_intra for causal dk_intra.T @ K for DQ.",
+      "name": "dk_dq_outputs",
+      "order": 6,
+      "requires": [
+        "no duplicate dk_intra.T GMMA build",
+        "causal schedule is declared"
+      ]
+    },
+    {
+      "action": "Store scalar outputs, then run Q.T @ dPhiO panel updates for CTA-local dstates.",
+      "name": "scan_state_update_and_scalar_stores",
+      "order": 7,
+      "requires": [
+        "reverse scan state is ready for next chunk"
+      ]
+    },
+    {
+      "action": "After chunk loop, store DMIMO_V[B,H,R,P] once.",
+      "name": "final_stream_store",
+      "order": 8,
+      "requires": [
+        "no [B,H,nchunks,R,P] partial tensor"
+      ]
+    }
+  ],
+  "shape": {
+    "B": 4,
+    "G": 1,
+    "H": 32,
+    "N": 64,
+    "P": 128,
+    "R": 4,
+    "S": 4096,
+    "chunk": 16,
+    "chunk_bodies": 32768,
+    "fused_chunk_rows": 64,
+    "nchunks": 256,
+    "p_panels": 2
+  },
+  "smem_plan": {
+    "aliased_peak_bytes": 86016,
+    "aliased_peak_kib": 84.0,
+    "buffers": [
+      {
+        "alias_group": "operand_a",
+        "bytes": 8192,
+        "dtype": "bf16",
+        "lifetime": "chunk",
+        "name": "sK",
+        "notes": "",
+        "shape": "64x64"
+      },
+      {
+        "alias_group": "operand_b",
+        "bytes": 8192,
+        "dtype": "bf16",
+        "lifetime": "chunk",
+        "name": "sQ",
+        "notes": "",
+        "shape": "64x64"
+      },
+      {
+        "alias_group": "transpose_operand",
+        "bytes": 8192,
+        "dtype": "bf16",
+        "lifetime": "chunk",
+        "name": "sQ_T",
+        "notes": "",
+        "shape": "64x64"
+      },
+      {
+        "alias_group": "transpose_operand",
+        "bytes": 8192,
+        "dtype": "bf16",
+        "lifetime": "chunk",
+        "name": "sK_T",
+        "notes": "",
+        "shape": "64x64"
+      },
+      {
+        "alias_group": "state_panel",
+        "bytes": 8192,
+        "dtype": "bf16",
+        "lifetime": "P panel",
+        "name": "sDStatePanel",
+        "notes": "",
+        "shape": "64x64"
+      },
+      {
+        "alias_group": "state_panel",
+        "bytes": 8192,
+        "dtype": "bf16",
+        "lifetime": "P panel",
+        "name": "sStatePanel",
+        "notes": "",
+        "shape": "64x64"
+      },
+      {
+        "alias_group": "p_operand",
+        "bytes": 8192,
+        "dtype": "bf16",
+        "lifetime": "P panel stream",
+        "name": "sDPhPanel",
+        "notes": "",
+        "shape": "64x64"
+      },
+      {
+        "alias_group": "p_operand",
+        "bytes": 8192,
+        "dtype": "bf16",
+        "lifetime": "P panel stream",
+        "name": "sPsiPanel",
+        "notes": "",
+        "shape": "64x64"
+      },
+      {
+        "alias_group": null,
+        "bytes": 8192,
+        "dtype": "bf16",
+        "lifetime": "after LKQ build through DSSDA and dPsiV",
+        "name": "sLKQ",
+        "notes": "",
+        "shape": "64x64"
+      },
+      {
+        "alias_group": null,
+        "bytes": 8192,
+        "dtype": "bf16",
+        "lifetime": "after dk_intra build through DK/DQ",
+        "name": "sDKI",
+        "notes": "",
+        "shape": "64x64"
+      },
+      {
+        "alias_group": "dki_transpose",
+        "bytes": 8192,
+        "dtype": "bf16",
+        "lifetime": "DQ transpose feed",
+        "name": "sDKI_T",
+        "notes": "May be a view; if copied, alias over sOut/dead operand storage.",
+        "shape": "64x64"
+      },
+      {
+        "alias_group": "out_alias",
+        "bytes": 8192,
+        "dtype": "bf16",
+        "lifetime": "C-store staging",
+        "name": "sOut",
+        "notes": "Alias over dead sK when legal.",
+        "shape": "64x64"
+      },
+      {
+        "alias_group": null,
+        "bytes": 4096,
+        "dtype": "mixed",
+        "lifetime": "chunk",
+        "name": "qk_scalar_scratch",
+        "notes": "",
+        "shape": "<=1024 fp32/bf16 scalars"
+      }
+    ],
+    "kill_budget_bytes": 163840,
+    "logical_unique_buffer_bytes": 102400,
+    "logical_unique_buffer_kib": 100.0,
+    "pass_budget_bytes": 131072,
+    "peak_with_alignment_guard_bytes": 118784,
+    "peak_with_alignment_guard_kib": 116.0,
+    "receipt": "Target <=128 KiB dynamic SMEM. sOut aliases dead sK; sDKI_T is a view or aliases staging storage if copied."
+  },
+  "source_receipt": "docs/status/mamba3_mono_wgmma_plan_wave3_receipt_2026_04_30.json",
+  "status": "executable_schedule_receipt_for_lane_a_b",
+  "validation": {
+    "check_command": "python tools/probes/mamba3_wgmma_wave4_schedule.py --check docs/status/mamba3_mono_wgmma_plan_wave4_receipt_2026_04_30.json",
+    "generated_by": "tools/probes/mamba3_wgmma_wave4_schedule.py"
+  }
+}

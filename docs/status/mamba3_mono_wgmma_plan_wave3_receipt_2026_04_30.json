@@ -1,0 +1,132 @@
+{
+  "ab_gate_budget": {
+    "chunk_owner_dmimov_reducer_ms": 0.05,
+    "chunk_owner_main_body_ms": 3.2,
+    "green_full_kernel_ms": 3.35,
+    "notes": [
+      "Green is roughly 10% faster than TileLang 3.70674 ms.",
+      "Yellow means faster than TileLang but without enough margin to ship.",
+      "Any duplicate LKQ/dk_intra/dki.T GMMA path fails the A gate regardless of timing."
+    ],
+    "red_full_kernel_ms": 3.70674,
+    "scan_owner_main_body_ms": 3.3,
+    "yellow_full_kernel_ms": 3.70674
+  },
+  "branch": "worker/mamba3-mono-triton-model",
+  "date": "2026-04-30",
+  "modeled_bytes": {
+    "chunk_owner_required_output_write_bytes": 816054272,
+    "chunk_owner_required_output_write_mib": 778.25,
+    "dk_output_bytes": 268435456,
+    "dmimov_output_bytes": 262144,
+    "dmimov_partial_bytes": 67108864,
+    "dmimov_reducer_extra_rw_bytes": 134479872,
+    "dmimov_reducer_extra_rw_mib": 128.25,
+    "dq_output_bytes": 268435456,
+    "dv_output_bytes": 134217728,
+    "global_temps_avoided_by_cuda_owner_mib": {
+      "dk_fp32_temp": 512.0,
+      "dk_intra_fp32_temp": 512.0,
+      "dpsi_bf16_temp": 512.0,
+      "dq_fp32_temp": 512.0,
+      "lkq_fp32_temp": 512.0,
+      "state_dpsi_fp32_temp": 1024.0
+    },
+    "scalar_outputs_bytes": 77594624,
+    "scan_owner_required_output_write_bytes": 748945408,
+    "scan_owner_required_output_write_mib": 714.25
+  },
+  "modeled_fma": {
+    "components_ideal_triangular": {
+      "dk_intra_apply_to_q_full_mask": 4026531840,
+      "dk_intra_once_for_dgamma_dssda_dk_dq": 17179869184,
+      "dk_intra_transpose_apply_to_k_full_mask": 4026531840,
+      "dk_state": 17179869184,
+      "dq_state": 17179869184,
+      "dv_and_dmimov_r_reductions": 536870912,
+      "lkq_apply_to_dphi_full_mask": 8053063680,
+      "lkq_once": 8589934592,
+      "qk_dpsi_once_for_dv_and_dmimov": 1073741824,
+      "scalar_elementwise_reductions": 1350565888,
+      "state_dpsi": 17179869184
+    },
+    "components_wave2_4step_tile_pruned": {
+      "dk_intra_apply_to_q_full_mask": 5368709120,
+      "dk_intra_once_for_dgamma_dssda_dk_dq": 17179869184,
+      "dk_intra_transpose_apply_to_k_full_mask": 5368709120,
+      "dk_state": 17179869184,
+      "dq_state": 17179869184,
+      "dv_and_dmimov_r_reductions": 536870912,
+      "lkq_apply_to_dphi_full_mask": 10737418240,
+      "lkq_once": 8589934592,
+      "qk_dpsi_once_for_dv_and_dmimov": 1073741824,
+      "scalar_elementwise_reductions": 1350565888,
+      "state_dpsi": 17179869184
+    },
+    "ideal_triangular_apply": 96376717312,
+    "monolithic_full_mask": 114630328320,
+    "optional_scan_owner_dstates_update": 17179869184,
+    "reuse_savings_vs_separate": 10737418240,
+    "scan_owner_ideal_plus_dstates_update": 113556586496,
+    "separate_recompute": 125367746560,
+    "tile_pruned_over_ideal": 5368709120,
+    "triangular_savings_vs_separate": 28991029248,
+    "wave2_4step_tile_pruned": 101745426432
+  },
+  "receipt": "mamba3_mono_wgmma_plan_wave3_2026_04_30",
+  "reference_timings_ms": {
+    "tilelang_stage2_bf1_bb0_bwd_bwd": 3.70674,
+    "wave1_triton_full_mask_checksum_lower_bound": 4.53881,
+    "wave2_triton_tile_pruned_checksum_lower_bound": 8.79331,
+    "wave8_cuda_diag_qk_dmimov_before_state_lkq_d": 2.45093
+  },
+  "required_outputs": [
+    "DV[B,S,H,P] bf16",
+    "DK[B,S*R,H,N] bf16",
+    "DQ[B,S*R,H,N] bf16",
+    "DMIMO_V[B,H,R,P] fp32",
+    "DDA_CS[B,H,S] fp32",
+    "DDA_CS_REV[B,H,S] fp32",
+    "DFACTOR[B,H,S] fp32",
+    "DGAMMA_DIAG[B,H,S] fp32",
+    "DSSDA[B,H,nchunks,chunk,chunk] fp32",
+    "DDA[B,H,S] fp32",
+    "DANGLES[B,S,H,N/4] fp32"
+  ],
+  "shape": {
+    "B": 4,
+    "G": 1,
+    "H": 32,
+    "N": 64,
+    "P": 128,
+    "R": 4,
+    "S": 4096,
+    "chunk": 16,
+    "chunk_bodies": 32768,
+    "fused_chunk_rows": 64,
+    "nchunks": 256
+  },
+  "source_models": {
+    "wave1_doc": "docs/status/mamba3_mono_triton_reuse_wave1_2026_04_30.md",
+    "wave1_model": "upstream_prs/examples/13_tilelang_floormod_dbz/rr_diag_wave1_mono_triton_reuse_model.py",
+    "wave2_doc": "docs/status/mamba3_mono_triton_pruned_wave2_2026_04_30.md",
+    "wave2_model": "upstream_prs/examples/13_tilelang_floormod_dbz/rr_diag_wave2_mono_triton_pruned_model.py"
+  },
+  "status": "design_receipt_for_lane_d",
+  "wgmma_schedule": {
+    "chunk_iterations_per_cta": 256,
+    "cta_count_preferred": 128,
+    "fallback_cta_owner": "one CTA owns one (B,H,chunk) body if dstates is precomputed upstream",
+    "gmma_atom": "SM90 BF16 GMMA m64n64k16 -> fp32 accum",
+    "k_tiling": "all hot products use K=64 or K=128 as four/eight k16 GMMA groups",
+    "no_duplicate_fma_requirements": [
+      "LKQ is built once per chunk body",
+      "dk_intra is built once per chunk body",
+      "dki.T for DQ is supplied by a transpose smem view/copy, not by a second GMMA",
+      "below-frontier causal apply tiles issue no GMMA"
+    ],
+    "p_tiling": "P=128 split into two n64 panels; do not use one resident m64n128 accumulator for all consumers",
+    "preferred_cta_owner": "one CTA owns one (B,H) stream and iterates chunks in reverse",
+    "triangular_schedule": "4x4 timestep tiles; compute all LKQ/dk_intra for DSSDA, apply only tiles with row_time < col_time, split diagonal into 4x4 lane subtiles"
+  }
+}

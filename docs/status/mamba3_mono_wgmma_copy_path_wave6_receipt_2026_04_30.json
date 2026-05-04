@@ -1,0 +1,841 @@
+{
+  "branch": "worker/mamba3-mono-triton-model",
+  "date": "2026-04-30",
+  "documentation_sources": [
+    {
+      "name": "CUDA Programming Guide - asynchronous data copies",
+      "receipt_note": "TMA handles one-dimensional and multidimensional bulk async copies; global-to-shared TMA read completion is tracked by shared-memory barriers, and low-level cp.async.bulk requires explicit expected-byte accounting.",
+      "url": "https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-copies.html"
+    },
+    {
+      "name": "libcu++ PTX cp.async.bulk wrappers",
+      "receipt_note": "The wrapper documents the 16-byte source/destination alignment and 16-byte size-multiple requirements used by this receipt.",
+      "url": "https://nvidia.github.io/cccl/libcudacxx/ptx/instructions/cp_async_bulk.html"
+    },
+    {
+      "name": "CUTLASS CuTe TMA tensors",
+      "receipt_note": "CuTe TMA uses tensor-map/descriptor coordinates; descriptor construction is therefore a separate pass/fail gate from ordinary pointer copies.",
+      "url": "https://docs.nvidia.com/cutlass/4.3.2/media/docs/cpp/cute/0z_tma_tensors.html"
+    },
+    {
+      "name": "CuTe DSL cpasync submodule",
+      "receipt_note": "The CuTe DSL exposes tiled TMA atom construction and descriptor copy helpers for the Wave7 implementation prototype.",
+      "url": "https://docs.nvidia.com/cutlass/4.2.1/media/docs/pythonDSL/cute_dsl_api/cute_nvgpu_cpasync.html"
+    }
+  ],
+  "narrow_vector_128b_safe_attempt": {
+    "alignment_and_tail_static_pass": true,
+    "can_enter_timing_gate": false,
+    "copy_instruction_unit_bytes": 16,
+    "copy_instructions_per_chunk": 6144,
+    "fail_conditions": [
+      "any source or destination pointer lacks a 16-byte alignment proof",
+      "any tile emits a masked tail or scalar cleanup path",
+      "any swizzled-SMEM layout maps a 16-byte vector lane across non-contiguous fragments",
+      "ptxas metadata is missing, registers/thread >192, total SMEM >118784 B, or any spill byte is reported"
+    ],
+    "global_copy_bytes_per_chunk": 81920,
+    "global_tile_vectors_per_chunk": 5120,
+    "large_copy_bytes_per_chunk": 98304,
+    "local_stage_bytes_per_chunk": 16384,
+    "local_tile_vectors_per_chunk": 1024,
+    "pass_conditions": [
+      "all 12 large tile movements have row_bytes=128, tile_bytes=8192, and 16-byte vector lanes with no row/tile tail",
+      "K_T and Q_T use a vector-compatible physical SMEM layout/view, not per-column 2-byte scatter",
+      "runtime base-alignment guards are present for every vectorized source and destination",
+      "ptxas registers/thread <=192, total SMEM <=118784 B for this variant, and spill loads/stores are zero"
+    ],
+    "ptxas_resource_check": {
+      "failures": [
+        "ptxas metadata must report registers_per_thread, static_smem_bytes, dynamic_smem_bytes, spill stores, and spill loads"
+      ],
+      "metadata": null,
+      "pass": false,
+      "schema": {
+        "expected_dynamic_smem_bytes": 118784,
+        "kill_registers_per_thread": 224,
+        "registers_per_thread_max": 192,
+        "required_fields": [
+          "registers_per_thread",
+          "static_smem_bytes",
+          "dynamic_smem_bytes",
+          "spill_stores_bytes",
+          "spill_loads_bytes"
+        ],
+        "spill_loads_bytes_max": 0,
+        "spill_stores_bytes_max": 0,
+        "total_smem_bytes_max": 118784
+      },
+      "status": "missing_ptxas_metadata",
+      "variant": "narrow_vector_128b_safe_attempt"
+    },
+    "runtime_alignment_guards": [
+      "assert every vectorized global base pointer % 16 == 0",
+      "assert every vectorized SMEM base pointer % 16 == 0",
+      "assert emitted row/panel strides preserve 16-byte offset alignment",
+      "assert no masked vector-tail path appears in generated code"
+    ],
+    "static_failures": [],
+    "status": "static_pass_compile_metadata_required",
+    "tile_proofs": [
+      {
+        "destination_base_alignment_required_bytes": 16,
+        "destination_expr": "sK physical row-major/swizzled 64x64 tile",
+        "destination_space": "smem",
+        "dtype": "bf16",
+        "name": "K",
+        "offset_alignment_proof": "row_bytes=128 and panel offsets are multiples of 64 bf16 elements, so every row/panel offset is a multiple of 16 bytes once the base pointer passes ptr % 16 == 0",
+        "requires_runtime_base_alignment_assert": true,
+        "row_bytes": 128,
+        "row_tail_bytes": 0,
+        "smem_layout": "128B-row GMMA operand swizzle or a CuTe layout with equivalent 16B-contiguous physical lanes",
+        "smem_swizzle_atom_bytes": 128,
+        "source_base_alignment_required_bytes": 16,
+        "source_expr": "K[b,h,chunk_idx*16 + t, n] as a 64x64 fused-row tile",
+        "source_space": "global",
+        "swizzled_smem_compatible": true,
+        "swizzled_smem_proof": "64 bf16 values per row is exactly 128 bytes; a 16-byte vector lane divides the 128B swizzle atom and never crosses a row or swizzle-atom boundary",
+        "tile_bytes": 8192,
+        "tile_shape": "64x64 bf16",
+        "tile_tail_bytes": 0,
+        "tma_candidate": true,
+        "vector_bytes": 16,
+        "vector_copy_fail_conditions": [
+          "source or destination base pointer is not 16-byte aligned at runtime",
+          "the generated CuTe layout maps one 16-byte vector lane across non-contiguous SMEM fragments",
+          "a masked tail branch is emitted for this 64x64 BF16 tile"
+        ],
+        "vector_copy_static_pass": true,
+        "vectors_per_row": 8,
+        "vectors_per_tile": 512
+      },
+      {
+        "destination_base_alignment_required_bytes": 16,
+        "destination_expr": "sQ physical row-major/swizzled 64x64 tile",
+        "destination_space": "smem",
+        "dtype": "bf16",
+        "name": "Q",
+        "offset_alignment_proof": "row_bytes=128 and panel offsets are multiples of 64 bf16 elements, so every row/panel offset is a multiple of 16 bytes once the base pointer passes ptr % 16 == 0",
+        "requires_runtime_base_alignment_assert": true,
+        "row_bytes": 128,
+        "row_tail_bytes": 0,
+        "smem_layout": "128B-row GMMA operand swizzle or a CuTe layout with equivalent 16B-contiguous physical lanes",
+        "smem_swizzle_atom_bytes": 128,
+        "source_base_alignment_required_bytes": 16,
+        "source_expr": "Q[b,h,chunk_idx*16 + t, n] as a 64x64 fused-row tile",
+        "source_space": "global",
+        "swizzled_smem_compatible": true,
+        "swizzled_smem_proof": "64 bf16 values per row is exactly 128 bytes; a 16-byte vector lane divides the 128B swizzle atom and never crosses a row or swizzle-atom boundary",
+        "tile_bytes": 8192,
+        "tile_shape": "64x64 bf16",
+        "tile_tail_bytes": 0,
+        "tma_candidate": true,
+        "vector_bytes": 16,
+        "vector_copy_fail_conditions": [
+          "source or destination base pointer is not 16-byte aligned at runtime",
+          "the generated CuTe layout maps one 16-byte vector lane across non-contiguous SMEM fragments",
+          "a masked tail branch is emitted for this 64x64 BF16 tile"
+        ],
+        "vector_copy_static_pass": true,
+        "vectors_per_row": 8,
+        "vectors_per_tile": 512
+      },
+      {
+        "destination_base_alignment_required_bytes": 16,
+        "destination_expr": "sK_T physical 128B-row swizzled transpose operand",
+        "destination_space": "smem",
+        "dtype": "bf16",
+        "name": "K_T",
+        "offset_alignment_proof": "row_bytes=128 and panel offsets are multiples of 64 bf16 elements, so every row/panel offset is a multiple of 16 bytes once the base pointer passes ptr % 16 == 0",
+        "requires_runtime_base_alignment_assert": true,
+        "row_bytes": 128,
+        "row_tail_bytes": 0,
+        "smem_layout": "128B-row GMMA operand swizzle or a CuTe layout with equivalent 16B-contiguous physical lanes",
+        "smem_swizzle_atom_bytes": 128,
+        "source_base_alignment_required_bytes": 16,
+        "source_expr": "K tile copied with a CuTe layout that materializes or views K_T in SMEM",
+        "source_space": "global",
+        "swizzled_smem_compatible": true,
+        "swizzled_smem_proof": "64 bf16 values per row is exactly 128 bytes; a 16-byte vector lane divides the 128B swizzle atom and never crosses a row or swizzle-atom boundary",
+        "tile_bytes": 8192,
+        "tile_shape": "64x64 bf16",
+        "tile_tail_bytes": 0,
+        "tma_candidate": true,
+        "vector_bytes": 16,
+        "vector_copy_fail_conditions": [
+          "source or destination base pointer is not 16-byte aligned at runtime",
+          "the generated CuTe layout maps one 16-byte vector lane across non-contiguous SMEM fragments",
+          "a masked tail branch is emitted for this 64x64 BF16 tile",
+          "the transpose operand is implemented as per-column 2-byte SMEM scatter instead of a vector-compatible physical layout/view"
+        ],
+        "vector_copy_static_pass": true,
+        "vectors_per_row": 8,
+        "vectors_per_tile": 512
+      },
+      {
+        "destination_base_alignment_required_bytes": 16,
+        "destination_expr": "sQ_T physical 128B-row swizzled transpose operand",
+        "destination_space": "smem",
+        "dtype": "bf16",
+        "name": "Q_T",
+        "offset_alignment_proof": "row_bytes=128 and panel offsets are multiples of 64 bf16 elements, so every row/panel offset is a multiple of 16 bytes once the base pointer passes ptr % 16 == 0",
+        "requires_runtime_base_alignment_assert": true,
+        "row_bytes": 128,
+        "row_tail_bytes": 0,
+        "smem_layout": "128B-row GMMA operand swizzle or a CuTe layout with equivalent 16B-contiguous physical lanes",
+        "smem_swizzle_atom_bytes": 128,
+        "source_base_alignment_required_bytes": 16,
+        "source_expr": "Q tile copied with a CuTe layout that materializes or views Q_T in SMEM",
+        "source_space": "global",
+        "swizzled_smem_compatible": true,
+        "swizzled_smem_proof": "64 bf16 values per row is exactly 128 bytes; a 16-byte vector lane divides the 128B swizzle atom and never crosses a row or swizzle-atom boundary",
+        "tile_bytes": 8192,
+        "tile_shape": "64x64 bf16",
+        "tile_tail_bytes": 0,
+        "tma_candidate": true,
+        "vector_bytes": 16,
+        "vector_copy_fail_conditions": [
+          "source or destination base pointer is not 16-byte aligned at runtime",
+          "the generated CuTe layout maps one 16-byte vector lane across non-contiguous SMEM fragments",
+          "a masked tail branch is emitted for this 64x64 BF16 tile",
+          "the transpose operand is implemented as per-column 2-byte SMEM scatter instead of a vector-compatible physical layout/view"
+        ],
+        "vector_copy_static_pass": true,
+        "vectors_per_row": 8,
+        "vectors_per_tile": 512
+      },
+      {
+        "destination_base_alignment_required_bytes": 16,
+        "destination_expr": "sStatePanel p0 physical row-major/swizzled 64x64 tile",
+        "destination_space": "smem",
+        "dtype": "bf16",
+        "name": "state_panel_p0",
+        "offset_alignment_proof": "row_bytes=128 and panel offsets are multiples of 64 bf16 elements, so every row/panel offset is a multiple of 16 bytes once the base pointer passes ptr % 16 == 0",
+        "requires_runtime_base_alignment_assert": true,
+        "row_bytes": 128,
+        "row_tail_bytes": 0,
+        "smem_layout": "128B-row GMMA operand swizzle or a CuTe layout with equivalent 16B-contiguous physical lanes",
+        "smem_swizzle_atom_bytes": 128,
+        "source_base_alignment_required_bytes": 16,
+        "source_expr": "states[b,h,n,p=0:64] panel",
+        "source_space": "global",
+        "swizzled_smem_compatible": true,
+        "swizzled_smem_proof": "64 bf16 values per row is exactly 128 bytes; a 16-byte vector lane divides the 128B swizzle atom and never crosses a row or swizzle-atom boundary",
+        "tile_bytes": 8192,
+        "tile_shape": "64x64 bf16",
+        "tile_tail_bytes": 0,
+        "tma_candidate": true,
+        "vector_bytes": 16,
+        "vector_copy_fail_conditions": [
+          "source or destination base pointer is not 16-byte aligned at runtime",
+          "the generated CuTe layout maps one 16-byte vector lane across non-contiguous SMEM fragments",
+          "a masked tail branch is emitted for this 64x64 BF16 tile"
+        ],
+        "vector_copy_static_pass": true,
+        "vectors_per_row": 8,
+        "vectors_per_tile": 512
+      },
+      {
+        "destination_base_alignment_required_bytes": 16,
+        "destination_expr": "sStatePanel p1 physical row-major/swizzled 64x64 tile",
+        "destination_space": "smem",
+        "dtype": "bf16",
+        "name": "state_panel_p1",
+        "offset_alignment_proof": "row_bytes=128 and panel offsets are multiples of 64 bf16 elements, so every row/panel offset is a multiple of 16 bytes once the base pointer passes ptr % 16 == 0",
+        "requires_runtime_base_alignment_assert": true,
+        "row_bytes": 128,
+        "row_tail_bytes": 0,
+        "smem_layout": "128B-row GMMA operand swizzle or a CuTe layout with equivalent 16B-contiguous physical lanes",
+        "smem_swizzle_atom_bytes": 128,
+        "source_base_alignment_required_bytes": 16,
+        "source_expr": "states[b,h,n,p=64:128] panel",
+        "source_space": "global",
+        "swizzled_smem_compatible": true,
+        "swizzled_smem_proof": "64 bf16 values per row is exactly 128 bytes; a 16-byte vector lane divides the 128B swizzle atom and never crosses a row or swizzle-atom boundary",
+        "tile_bytes": 8192,
+        "tile_shape": "64x64 bf16",
+        "tile_tail_bytes": 0,
+        "tma_candidate": true,
+        "vector_bytes": 16,
+        "vector_copy_fail_conditions": [
+          "source or destination base pointer is not 16-byte aligned at runtime",
+          "the generated CuTe layout maps one 16-byte vector lane across non-contiguous SMEM fragments",
+          "a masked tail branch is emitted for this 64x64 BF16 tile"
+        ],
+        "vector_copy_static_pass": true,
+        "vectors_per_row": 8,
+        "vectors_per_tile": 512
+      },
+      {
+        "destination_base_alignment_required_bytes": 16,
+        "destination_expr": "sDPhPanel p0 physical row-major/swizzled 64x64 tile",
+        "destination_space": "smem",
+        "dtype": "bf16",
+        "name": "dPhiO_panel_p0",
+        "offset_alignment_proof": "row_bytes=128 and panel offsets are multiples of 64 bf16 elements, so every row/panel offset is a multiple of 16 bytes once the base pointer passes ptr % 16 == 0",
+        "requires_runtime_base_alignment_assert": true,
+        "row_bytes": 128,
+        "row_tail_bytes": 0,
+        "smem_layout": "128B-row GMMA operand swizzle or a CuTe layout with equivalent 16B-contiguous physical lanes",
+        "smem_swizzle_atom_bytes": 128,
+        "source_base_alignment_required_bytes": 16,
+        "source_expr": "dPhiO[b,h,chunk_idx*16 + t,p=0:64] panel",
+        "source_space": "global",
+        "swizzled_smem_compatible": true,
+        "swizzled_smem_proof": "64 bf16 values per row is exactly 128 bytes; a 16-byte vector lane divides the 128B swizzle atom and never crosses a row or swizzle-atom boundary",
+        "tile_bytes": 8192,
+        "tile_shape": "64x64 bf16",
+        "tile_tail_bytes": 0,
+        "tma_candidate": true,
+        "vector_bytes": 16,
+        "vector_copy_fail_conditions": [
+          "source or destination base pointer is not 16-byte aligned at runtime",
+          "the generated CuTe layout maps one 16-byte vector lane across non-contiguous SMEM fragments",
+          "a masked tail branch is emitted for this 64x64 BF16 tile"
+        ],
+        "vector_copy_static_pass": true,
+        "vectors_per_row": 8,
+        "vectors_per_tile": 512
+      },
+      {
+        "destination_base_alignment_required_bytes": 16,
+        "destination_expr": "sDPhPanel p1 physical row-major/swizzled 64x64 tile",
+        "destination_space": "smem",
+        "dtype": "bf16",
+        "name": "dPhiO_panel_p1",
+        "offset_alignment_proof": "row_bytes=128 and panel offsets are multiples of 64 bf16 elements, so every row/panel offset is a multiple of 16 bytes once the base pointer passes ptr % 16 == 0",
+        "requires_runtime_base_alignment_assert": true,
+        "row_bytes": 128,
+        "row_tail_bytes": 0,
+        "smem_layout": "128B-row GMMA operand swizzle or a CuTe layout with equivalent 16B-contiguous physical lanes",
+        "smem_swizzle_atom_bytes": 128,
+        "source_base_alignment_required_bytes": 16,
+        "source_expr": "dPhiO[b,h,chunk_idx*16 + t,p=64:128] panel",
+        "source_space": "global",
+        "swizzled_smem_compatible": true,
+        "swizzled_smem_proof": "64 bf16 values per row is exactly 128 bytes; a 16-byte vector lane divides the 128B swizzle atom and never crosses a row or swizzle-atom boundary",
+        "tile_bytes": 8192,
+        "tile_shape": "64x64 bf16",
+        "tile_tail_bytes": 0,
+        "tma_candidate": true,
+        "vector_bytes": 16,
+        "vector_copy_fail_conditions": [
+          "source or destination base pointer is not 16-byte aligned at runtime",
+          "the generated CuTe layout maps one 16-byte vector lane across non-contiguous SMEM fragments",
+          "a masked tail branch is emitted for this 64x64 BF16 tile"
+        ],
+        "vector_copy_static_pass": true,
+        "vectors_per_row": 8,
+        "vectors_per_tile": 512
+      },
+      {
+        "destination_base_alignment_required_bytes": 16,
+        "destination_expr": "sPsiPanel p0 physical row-major/swizzled 64x64 tile",
+        "destination_space": "smem",
+        "dtype": "bf16",
+        "name": "PsiV_panel_p0",
+        "offset_alignment_proof": "row_bytes=128 and panel offsets are multiples of 64 bf16 elements, so every row/panel offset is a multiple of 16 bytes once the base pointer passes ptr % 16 == 0",
+        "requires_runtime_base_alignment_assert": true,
+        "row_bytes": 128,
+        "row_tail_bytes": 0,
+        "smem_layout": "128B-row GMMA operand swizzle or a CuTe layout with equivalent 16B-contiguous physical lanes",
+        "smem_swizzle_atom_bytes": 128,
+        "source_base_alignment_required_bytes": 16,
+        "source_expr": "PsiV[b,h,chunk_idx*16 + t,p=0:64] panel",
+        "source_space": "global",
+        "swizzled_smem_compatible": true,
+        "swizzled_smem_proof": "64 bf16 values per row is exactly 128 bytes; a 16-byte vector lane divides the 128B swizzle atom and never crosses a row or swizzle-atom boundary",
+        "tile_bytes": 8192,
+        "tile_shape": "64x64 bf16",
+        "tile_tail_bytes": 0,
+        "tma_candidate": true,
+        "vector_bytes": 16,
+        "vector_copy_fail_conditions": [
+          "source or destination base pointer is not 16-byte aligned at runtime",
+          "the generated CuTe layout maps one 16-byte vector lane across non-contiguous SMEM fragments",
+          "a masked tail branch is emitted for this 64x64 BF16 tile"
+        ],
+        "vector_copy_static_pass": true,
+        "vectors_per_row": 8,
+        "vectors_per_tile": 512
+      },
+      {
+        "destination_base_alignment_required_bytes": 16,
+        "destination_expr": "sPsiPanel p1 physical row-major/swizzled 64x64 tile",
+        "destination_space": "smem",
+        "dtype": "bf16",
+        "name": "PsiV_panel_p1",
+        "offset_alignment_proof": "row_bytes=128 and panel offsets are multiples of 64 bf16 elements, so every row/panel offset is a multiple of 16 bytes once the base pointer passes ptr % 16 == 0",
+        "requires_runtime_base_alignment_assert": true,
+        "row_bytes": 128,
+        "row_tail_bytes": 0,
+        "smem_layout": "128B-row GMMA operand swizzle or a CuTe layout with equivalent 16B-contiguous physical lanes",
+        "smem_swizzle_atom_bytes": 128,
+        "source_base_alignment_required_bytes": 16,
+        "source_expr": "PsiV[b,h,chunk_idx*16 + t,p=64:128] panel",
+        "source_space": "global",
+        "swizzled_smem_compatible": true,
+        "swizzled_smem_proof": "64 bf16 values per row is exactly 128 bytes; a 16-byte vector lane divides the 128B swizzle atom and never crosses a row or swizzle-atom boundary",
+        "tile_bytes": 8192,
+        "tile_shape": "64x64 bf16",
+        "tile_tail_bytes": 0,
+        "tma_candidate": true,
+        "vector_bytes": 16,
+        "vector_copy_fail_conditions": [
+          "source or destination base pointer is not 16-byte aligned at runtime",
+          "the generated CuTe layout maps one 16-byte vector lane across non-contiguous SMEM fragments",
+          "a masked tail branch is emitted for this 64x64 BF16 tile"
+        ],
+        "vector_copy_static_pass": true,
+        "vectors_per_row": 8,
+        "vectors_per_tile": 512
+      },
+      {
+        "destination_base_alignment_required_bytes": 16,
+        "destination_expr": "sDStatePanel p0 physical row-major/swizzled 64x64 tile",
+        "destination_space": "smem",
+        "dtype": "bf16",
+        "name": "dstates_panel_p0",
+        "offset_alignment_proof": "row_bytes=128 and panel offsets are multiples of 64 bf16 elements, so every row/panel offset is a multiple of 16 bytes once the base pointer passes ptr % 16 == 0",
+        "requires_runtime_base_alignment_assert": true,
+        "row_bytes": 128,
+        "row_tail_bytes": 0,
+        "smem_layout": "128B-row GMMA operand swizzle or a CuTe layout with equivalent 16B-contiguous physical lanes",
+        "smem_swizzle_atom_bytes": 128,
+        "source_base_alignment_required_bytes": 16,
+        "source_expr": "CTA-local dstates[n,p=0:64] loop-carried panel",
+        "source_space": "cta_local",
+        "swizzled_smem_compatible": true,
+        "swizzled_smem_proof": "64 bf16 values per row is exactly 128 bytes; a 16-byte vector lane divides the 128B swizzle atom and never crosses a row or swizzle-atom boundary",
+        "tile_bytes": 8192,
+        "tile_shape": "64x64 bf16",
+        "tile_tail_bytes": 0,
+        "tma_candidate": false,
+        "vector_bytes": 16,
+        "vector_copy_fail_conditions": [
+          "source or destination base pointer is not 16-byte aligned at runtime",
+          "the generated CuTe layout maps one 16-byte vector lane across non-contiguous SMEM fragments",
+          "a masked tail branch is emitted for this 64x64 BF16 tile"
+        ],
+        "vector_copy_static_pass": true,
+        "vectors_per_row": 8,
+        "vectors_per_tile": 512
+      },
+      {
+        "destination_base_alignment_required_bytes": 16,
+        "destination_expr": "sDStatePanel p1 physical row-major/swizzled 64x64 tile",
+        "destination_space": "smem",
+        "dtype": "bf16",
+        "name": "dstates_panel_p1",
+        "offset_alignment_proof": "row_bytes=128 and panel offsets are multiples of 64 bf16 elements, so every row/panel offset is a multiple of 16 bytes once the base pointer passes ptr % 16 == 0",
+        "requires_runtime_base_alignment_assert": true,
+        "row_bytes": 128,
+        "row_tail_bytes": 0,
+        "smem_layout": "128B-row GMMA operand swizzle or a CuTe layout with equivalent 16B-contiguous physical lanes",
+        "smem_swizzle_atom_bytes": 128,
+        "source_base_alignment_required_bytes": 16,
+        "source_expr": "CTA-local dstates[n,p=64:128] loop-carried panel",
+        "source_space": "cta_local",
+        "swizzled_smem_compatible": true,
+        "swizzled_smem_proof": "64 bf16 values per row is exactly 128 bytes; a 16-byte vector lane divides the 128B swizzle atom and never crosses a row or swizzle-atom boundary",
+        "tile_bytes": 8192,
+        "tile_shape": "64x64 bf16",
+        "tile_tail_bytes": 0,
+        "tma_candidate": false,
+        "vector_bytes": 16,
+        "vector_copy_fail_conditions": [
+          "source or destination base pointer is not 16-byte aligned at runtime",
+          "the generated CuTe layout maps one 16-byte vector lane across non-contiguous SMEM fragments",
+          "a masked tail branch is emitted for this 64x64 BF16 tile"
+        ],
+        "vector_copy_static_pass": true,
+        "vectors_per_row": 8,
+        "vectors_per_tile": 512
+      }
+    ],
+    "variant": "narrow_vector_128b_safe_attempt",
+    "vectors_per_tile": 512
+  },
+  "receipt": "mamba3_mono_wgmma_copy_path_wave6_2026_04_30",
+  "source_receipt": "docs/status/mamba3_mono_wgmma_plan_wave4_receipt_2026_04_30.json",
+  "static_tile_model": {
+    "non_tma_large_tile_count": 2,
+    "row_bytes": 128,
+    "row_tail_bytes": 0,
+    "smem_swizzle_atom_bytes": 128,
+    "swizzle_compatibility_condition": "row_bytes == 128 and vector_bytes divides the 128B SMEM swizzle atom",
+    "tile_bytes": 8192,
+    "tile_cols": 64,
+    "tile_rows": 64,
+    "tile_shape": "64x64 bf16",
+    "tile_tail_bytes": 0,
+    "tma_candidate_tile_count": 10,
+    "vector_bytes": 16,
+    "vectors_per_row": 8,
+    "vectors_per_tile": 512
+  },
+  "status": "lane_c_copy_path_static_receipt_and_resource_gate",
+  "tma_cp_async_target": {
+    "can_claim_green_or_yellow": false,
+    "descriptor_bytes_per_chunk": 81920,
+    "descriptor_count": 10,
+    "descriptor_prototypes": [
+      {
+        "box_bytes": 8192,
+        "box_dim_elements": [
+          64,
+          64
+        ],
+        "descriptor_static_pass": true,
+        "destination_smem": "sK physical row-major/swizzled 64x64 tile",
+        "element_type": "bf16",
+        "expected_mbarrier_bytes": 8192,
+        "fail_conditions": [
+          "descriptor construction fails or silently falls back to scalar copies",
+          "descriptor emits a different SMEM physical layout than the GMMA operand expects",
+          "expected-byte accounting is missing or not equal to the copied tile bytes",
+          "this tile is replaced by a tiny vector/scalar TMA descriptor path"
+        ],
+        "pass_conditions": [
+          "descriptor/tensor-map construction succeeds for this source tensor and SMEM layout",
+          "global base pointer, shared base pointer, and transfer size satisfy 16-byte alignment",
+          "mbarrier expected-byte count is exactly 8192 for this tile before the wait",
+          "WGMMA does not consume the destination SMEM tile before the barrier wait/fence completes"
+        ],
+        "rank": 2,
+        "source_tensor": "K[b,h,chunk_idx*16 + t, n] as a 64x64 fused-row tile",
+        "swizzle_mode": "CU_TENSOR_MAP_SWIZZLE_128B or CuTe equivalent 128B GMMA SMEM swizzle",
+        "tensor_map_required": true,
+        "tile_name": "K"
+      },
+      {
+        "box_bytes": 8192,
+        "box_dim_elements": [
+          64,
+          64
+        ],
+        "descriptor_static_pass": true,
+        "destination_smem": "sQ physical row-major/swizzled 64x64 tile",
+        "element_type": "bf16",
+        "expected_mbarrier_bytes": 8192,
+        "fail_conditions": [
+          "descriptor construction fails or silently falls back to scalar copies",
+          "descriptor emits a different SMEM physical layout than the GMMA operand expects",
+          "expected-byte accounting is missing or not equal to the copied tile bytes",
+          "this tile is replaced by a tiny vector/scalar TMA descriptor path"
+        ],
+        "pass_conditions": [
+          "descriptor/tensor-map construction succeeds for this source tensor and SMEM layout",
+          "global base pointer, shared base pointer, and transfer size satisfy 16-byte alignment",
+          "mbarrier expected-byte count is exactly 8192 for this tile before the wait",
+          "WGMMA does not consume the destination SMEM tile before the barrier wait/fence completes"
+        ],
+        "rank": 2,
+        "source_tensor": "Q[b,h,chunk_idx*16 + t, n] as a 64x64 fused-row tile",
+        "swizzle_mode": "CU_TENSOR_MAP_SWIZZLE_128B or CuTe equivalent 128B GMMA SMEM swizzle",
+        "tensor_map_required": true,
+        "tile_name": "Q"
+      },
+      {
+        "box_bytes": 8192,
+        "box_dim_elements": [
+          64,
+          64
+        ],
+        "descriptor_static_pass": true,
+        "destination_smem": "sK_T physical 128B-row swizzled transpose operand",
+        "element_type": "bf16",
+        "expected_mbarrier_bytes": 8192,
+        "fail_conditions": [
+          "descriptor construction fails or silently falls back to scalar copies",
+          "descriptor emits a different SMEM physical layout than the GMMA operand expects",
+          "expected-byte accounting is missing or not equal to the copied tile bytes",
+          "this tile is replaced by a tiny vector/scalar TMA descriptor path"
+        ],
+        "pass_conditions": [
+          "descriptor/tensor-map construction succeeds for this source tensor and SMEM layout",
+          "global base pointer, shared base pointer, and transfer size satisfy 16-byte alignment",
+          "mbarrier expected-byte count is exactly 8192 for this tile before the wait",
+          "WGMMA does not consume the destination SMEM tile before the barrier wait/fence completes"
+        ],
+        "rank": 2,
+        "source_tensor": "K tile copied with a CuTe layout that materializes or views K_T in SMEM",
+        "swizzle_mode": "CU_TENSOR_MAP_SWIZZLE_128B or CuTe equivalent 128B GMMA SMEM swizzle",
+        "tensor_map_required": true,
+        "tile_name": "K_T"
+      },
+      {
+        "box_bytes": 8192,
+        "box_dim_elements": [
+          64,
+          64
+        ],
+        "descriptor_static_pass": true,
+        "destination_smem": "sQ_T physical 128B-row swizzled transpose operand",
+        "element_type": "bf16",
+        "expected_mbarrier_bytes": 8192,
+        "fail_conditions": [
+          "descriptor construction fails or silently falls back to scalar copies",
+          "descriptor emits a different SMEM physical layout than the GMMA operand expects",
+          "expected-byte accounting is missing or not equal to the copied tile bytes",
+          "this tile is replaced by a tiny vector/scalar TMA descriptor path"
+        ],
+        "pass_conditions": [
+          "descriptor/tensor-map construction succeeds for this source tensor and SMEM layout",
+          "global base pointer, shared base pointer, and transfer size satisfy 16-byte alignment",
+          "mbarrier expected-byte count is exactly 8192 for this tile before the wait",
+          "WGMMA does not consume the destination SMEM tile before the barrier wait/fence completes"
+        ],
+        "rank": 2,
+        "source_tensor": "Q tile copied with a CuTe layout that materializes or views Q_T in SMEM",
+        "swizzle_mode": "CU_TENSOR_MAP_SWIZZLE_128B or CuTe equivalent 128B GMMA SMEM swizzle",
+        "tensor_map_required": true,
+        "tile_name": "Q_T"
+      },
+      {
+        "box_bytes": 8192,
+        "box_dim_elements": [
+          64,
+          64
+        ],
+        "descriptor_static_pass": true,
+        "destination_smem": "sStatePanel p0 physical row-major/swizzled 64x64 tile",
+        "element_type": "bf16",
+        "expected_mbarrier_bytes": 8192,
+        "fail_conditions": [
+          "descriptor construction fails or silently falls back to scalar copies",
+          "descriptor emits a different SMEM physical layout than the GMMA operand expects",
+          "expected-byte accounting is missing or not equal to the copied tile bytes",
+          "this tile is replaced by a tiny vector/scalar TMA descriptor path"
+        ],
+        "pass_conditions": [
+          "descriptor/tensor-map construction succeeds for this source tensor and SMEM layout",
+          "global base pointer, shared base pointer, and transfer size satisfy 16-byte alignment",
+          "mbarrier expected-byte count is exactly 8192 for this tile before the wait",
+          "WGMMA does not consume the destination SMEM tile before the barrier wait/fence completes"
+        ],
+        "rank": 2,
+        "source_tensor": "states[b,h,n,p=0:64] panel",
+        "swizzle_mode": "CU_TENSOR_MAP_SWIZZLE_128B or CuTe equivalent 128B GMMA SMEM swizzle",
+        "tensor_map_required": true,
+        "tile_name": "state_panel_p0"
+      },
+      {
+        "box_bytes": 8192,
+        "box_dim_elements": [
+          64,
+          64
+        ],
+        "descriptor_static_pass": true,
+        "destination_smem": "sStatePanel p1 physical row-major/swizzled 64x64 tile",
+        "element_type": "bf16",
+        "expected_mbarrier_bytes": 8192,
+        "fail_conditions": [
+          "descriptor construction fails or silently falls back to scalar copies",
+          "descriptor emits a different SMEM physical layout than the GMMA operand expects",
+          "expected-byte accounting is missing or not equal to the copied tile bytes",
+          "this tile is replaced by a tiny vector/scalar TMA descriptor path"
+        ],
+        "pass_conditions": [
+          "descriptor/tensor-map construction succeeds for this source tensor and SMEM layout",
+          "global base pointer, shared base pointer, and transfer size satisfy 16-byte alignment",
+          "mbarrier expected-byte count is exactly 8192 for this tile before the wait",
+          "WGMMA does not consume the destination SMEM tile before the barrier wait/fence completes"
+        ],
+        "rank": 2,
+        "source_tensor": "states[b,h,n,p=64:128] panel",
+        "swizzle_mode": "CU_TENSOR_MAP_SWIZZLE_128B or CuTe equivalent 128B GMMA SMEM swizzle",
+        "tensor_map_required": true,
+        "tile_name": "state_panel_p1"
+      },
+      {
+        "box_bytes": 8192,
+        "box_dim_elements": [
+          64,
+          64
+        ],
+        "descriptor_static_pass": true,
+        "destination_smem": "sDPhPanel p0 physical row-major/swizzled 64x64 tile",
+        "element_type": "bf16",
+        "expected_mbarrier_bytes": 8192,
+        "fail_conditions": [
+          "descriptor construction fails or silently falls back to scalar copies",
+          "descriptor emits a different SMEM physical layout than the GMMA operand expects",
+          "expected-byte accounting is missing or not equal to the copied tile bytes",
+          "this tile is replaced by a tiny vector/scalar TMA descriptor path"
+        ],
+        "pass_conditions": [
+          "descriptor/tensor-map construction succeeds for this source tensor and SMEM layout",
+          "global base pointer, shared base pointer, and transfer size satisfy 16-byte alignment",
+          "mbarrier expected-byte count is exactly 8192 for this tile before the wait",
+          "WGMMA does not consume the destination SMEM tile before the barrier wait/fence completes"
+        ],
+        "rank": 2,
+        "source_tensor": "dPhiO[b,h,chunk_idx*16 + t,p=0:64] panel",
+        "swizzle_mode": "CU_TENSOR_MAP_SWIZZLE_128B or CuTe equivalent 128B GMMA SMEM swizzle",
+        "tensor_map_required": true,
+        "tile_name": "dPhiO_panel_p0"
+      },
+      {
+        "box_bytes": 8192,
+        "box_dim_elements": [
+          64,
+          64
+        ],
+        "descriptor_static_pass": true,
+        "destination_smem": "sDPhPanel p1 physical row-major/swizzled 64x64 tile",
+        "element_type": "bf16",
+        "expected_mbarrier_bytes": 8192,
+        "fail_conditions": [
+          "descriptor construction fails or silently falls back to scalar copies",
+          "descriptor emits a different SMEM physical layout than the GMMA operand expects",
+          "expected-byte accounting is missing or not equal to the copied tile bytes",
+          "this tile is replaced by a tiny vector/scalar TMA descriptor path"
+        ],
+        "pass_conditions": [
+          "descriptor/tensor-map construction succeeds for this source tensor and SMEM layout",
+          "global base pointer, shared base pointer, and transfer size satisfy 16-byte alignment",
+          "mbarrier expected-byte count is exactly 8192 for this tile before the wait",
+          "WGMMA does not consume the destination SMEM tile before the barrier wait/fence completes"
+        ],
+        "rank": 2,
+        "source_tensor": "dPhiO[b,h,chunk_idx*16 + t,p=64:128] panel",
+        "swizzle_mode": "CU_TENSOR_MAP_SWIZZLE_128B or CuTe equivalent 128B GMMA SMEM swizzle",
+        "tensor_map_required": true,
+        "tile_name": "dPhiO_panel_p1"
+      },
+      {
+        "box_bytes": 8192,
+        "box_dim_elements": [
+          64,
+          64
+        ],
+        "descriptor_static_pass": true,
+        "destination_smem": "sPsiPanel p0 physical row-major/swizzled 64x64 tile",
+        "element_type": "bf16",
+        "expected_mbarrier_bytes": 8192,
+        "fail_conditions": [
+          "descriptor construction fails or silently falls back to scalar copies",
+          "descriptor emits a different SMEM physical layout than the GMMA operand expects",
+          "expected-byte accounting is missing or not equal to the copied tile bytes",
+          "this tile is replaced by a tiny vector/scalar TMA descriptor path"
+        ],
+        "pass_conditions": [
+          "descriptor/tensor-map construction succeeds for this source tensor and SMEM layout",
+          "global base pointer, shared base pointer, and transfer size satisfy 16-byte alignment",
+          "mbarrier expected-byte count is exactly 8192 for this tile before the wait",
+          "WGMMA does not consume the destination SMEM tile before the barrier wait/fence completes"
+        ],
+        "rank": 2,
+        "source_tensor": "PsiV[b,h,chunk_idx*16 + t,p=0:64] panel",
+        "swizzle_mode": "CU_TENSOR_MAP_SWIZZLE_128B or CuTe equivalent 128B GMMA SMEM swizzle",
+        "tensor_map_required": true,
+        "tile_name": "PsiV_panel_p0"
+      },
+      {
+        "box_bytes": 8192,
+        "box_dim_elements": [
+          64,
+          64
+        ],
+        "descriptor_static_pass": true,
+        "destination_smem": "sPsiPanel p1 physical row-major/swizzled 64x64 tile",
+        "element_type": "bf16",
+        "expected_mbarrier_bytes": 8192,
+        "fail_conditions": [
+          "descriptor construction fails or silently falls back to scalar copies",
+          "descriptor emits a different SMEM physical layout than the GMMA operand expects",
+          "expected-byte accounting is missing or not equal to the copied tile bytes",
+          "this tile is replaced by a tiny vector/scalar TMA descriptor path"
+        ],
+        "pass_conditions": [
+          "descriptor/tensor-map construction succeeds for this source tensor and SMEM layout",
+          "global base pointer, shared base pointer, and transfer size satisfy 16-byte alignment",
+          "mbarrier expected-byte count is exactly 8192 for this tile before the wait",
+          "WGMMA does not consume the destination SMEM tile before the barrier wait/fence completes"
+        ],
+        "rank": 2,
+        "source_tensor": "PsiV[b,h,chunk_idx*16 + t,p=64:128] panel",
+        "swizzle_mode": "CU_TENSOR_MAP_SWIZZLE_128B or CuTe equivalent 128B GMMA SMEM swizzle",
+        "tensor_map_required": true,
+        "tile_name": "PsiV_panel_p1"
+      }
+    ],
+    "descriptor_static_failures": [],
+    "descriptor_static_pass": true,
+    "dynamic_smem_target_bytes": 131072,
+    "dynamic_smem_target_mib": 0.125,
+    "expected_mbarrier_bytes_per_chunk": 81920,
+    "fail_conditions": [
+      "any descriptor/tensor-map build fails for K, Q, K_T, Q_T, state, dPhiO, or PsiV tiles",
+      "any TMA descriptor is attempted for CTA-local dstates or tiny scalar/vector slices",
+      "expected mbarrier bytes differ from copied bytes or a wait/fence is missing",
+      "dynamic/resource metadata exceeds 131072 B SMEM, exceeds 192 registers/thread, or reports any spill"
+    ],
+    "non_tma_large_tiles": [
+      "dstates_panel_p0",
+      "dstates_panel_p1"
+    ],
+    "pass_conditions": [
+      "exactly 10 global 64x64 BF16 tiles have descriptor/tensor-map prototypes",
+      "exactly 2 CTA-local dstates stages remain non-TMA",
+      "mbarrier expected-byte accounting equals 81920 B/chunk across the 10 descriptors",
+      "WGMMA waits on the async barrier/fence before consuming every TMA-fed SMEM tile",
+      "ptxas registers/thread <=192, total SMEM <=131072 B, and spill loads/stores are zero"
+    ],
+    "ptxas_resource_check": {
+      "failures": [
+        "ptxas metadata must report registers_per_thread, static_smem_bytes, dynamic_smem_bytes, spill stores, and spill loads"
+      ],
+      "metadata": null,
+      "pass": false,
+      "schema": {
+        "expected_dynamic_smem_bytes": 131072,
+        "kill_registers_per_thread": 224,
+        "registers_per_thread_max": 192,
+        "required_fields": [
+          "registers_per_thread",
+          "static_smem_bytes",
+          "dynamic_smem_bytes",
+          "spill_stores_bytes",
+          "spill_loads_bytes"
+        ],
+        "spill_loads_bytes_max": 0,
+        "spill_stores_bytes_max": 0,
+        "total_smem_bytes_max": 131072
+      },
+      "status": "missing_ptxas_metadata",
+      "variant": "tma_cp_async_target"
+    },
+    "status": "descriptor_static_plan_compile_smoke_required",
+    "variant": "tma_cp_async_target"
+  },
+  "updated_gates": {
+    "narrow_vector_128b_safe_attempt": [
+      "static alignment/tail proof must pass for all 12 large tile movements",
+      "K_T/Q_T transpose operands must prove vector-compatible swizzled SMEM layout/view",
+      "runtime ptr%16 guards are required before enabling the vector path",
+      "ptxas resource metadata fields are mandatory: registers/thread, static SMEM, dynamic SMEM, spill stores, spill loads",
+      "timing gate is blocked unless ptxas <=192 regs/thread, total SMEM <=118784 B, and spills are zero"
+    ],
+    "tma_cp_async_target": [
+      "descriptor/tensor-map prototypes cover only the 10 global 64x64 BF16 tiles",
+      "CTA-local dstates stages and tiny scalar/vector slices are explicitly non-TMA",
+      "mbarrier expected bytes must equal 81920 B/chunk and waits/fences must precede WGMMA use",
+      "green/yellow timing claims require ptxas <=192 regs/thread, total SMEM <=131072 B, and zero spills"
+    ]
+  },
+  "validation": {
+    "check_command": "python tools/probes/mamba3_wgmma_wave6_copy_path.py --check docs/status/mamba3_mono_wgmma_copy_path_wave6_receipt_2026_04_30.json",
+    "generated_by": "tools/probes/mamba3_wgmma_wave6_copy_path.py",
+    "optional_ptxas_metadata": "python tools/probes/mamba3_wgmma_wave6_copy_path.py --ptxas-metadata ptxas.json"
+  },
+  "wave5_ledger": {
+    "large_copy_bytes_per_chunk": 98304,
+    "large_copy_tiles_per_chunk": 12,
+    "local_or_smem_stage_bytes_per_chunk": 16384,
+    "local_or_smem_stage_tiles_per_chunk": 2,
+    "tma_eligible_global_copy_bytes_per_chunk": 81920,
+    "tma_eligible_global_tiles_per_chunk": 10
+  }
+}

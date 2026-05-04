@@ -1,0 +1,72 @@
+--- a/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
++++ b/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
+@@ -907,31 +907,13 @@
+                     PsiV_shared[cs*R + r, p] = PsiV_frag[cs, r, p]
+ 
+                 # Compute dqk_from_diag, which is the contribution to dQ/dK from qk_dot:
+-                dqk_from_diag_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], accum_dtype)
+-                T.gemm(dPhiO_shared, PsiV_shared, dqk_from_diag_frag, transpose_B=True, clear_accum=True) # (cs*r_out, cs*r_in)
+-                # Compute dgamma_diag.
+-                # TMA-fix: dgamma_diag_prereduce_frag flattened to [chunk_size, R*R] to
+-                # match the 2D qk_dot_shared. The reduce_sum below no longer needs a view.
+-                dgamma_diag_prereduce_frag = T.alloc_fragment([chunk_size, R * R], accum_dtype)
+-                T.copy(qk_dot_shared, dgamma_diag_prereduce_frag)
+-                T.copy(dqk_from_diag_frag, dqk_from_diag_shared)
+-                for cs, r_out, r_in in T.Parallel(chunk_size, R, R):
+-                    dgamma_diag_prereduce_frag[cs, r_out * R + r_in] *= dqk_from_diag_shared[cs*R + r_out, cs*R + r_in]
+-
+-                dgamma_diag_reduced_frag = T.alloc_fragment([chunk_size], accum_dtype)
+-                T.reduce_sum(
+-                    dgamma_diag_prereduce_frag,
+-                    dgamma_diag_reduced_frag,
+-                    dim=-1,
+-                    clear=True
+-                    )
+-                T.copy(dgamma_diag_reduced_frag, DGAMMA_DIAG[i_b, i_h, chunk_start:chunk_start+chunk_size], disable_tma=True)
+-                # Apply shifted gamma to dqk:
+-                gamma_qk_frag = T.alloc_fragment([chunk_size], accum_dtype)
+-                T.copy(gamma_cached_frag, gamma_qk_frag) # Apply shifted gamma
+-                for csr_i, csr_j in T.Parallel(fused_chunk_size, fused_chunk_size):
+-                    dqk_from_diag_frag[csr_i, csr_j] *= gamma_qk_frag[csr_i//R]
+-                T.copy(dqk_from_diag_frag, dqk_from_diag_shared)
++                # R x R diagonal dqk is reconstructed by the companion Triton
++                # post-kernel.  This TileLang variant deliberately skips the
++                # full [chunk_size * R, chunk_size * R] GEMM and writes only
++                # non-diagonal-path DK/DQ terms below.
++                dgamma_diag_zero_frag = T.alloc_fragment([chunk_size], accum_dtype)
++                T.clear(dgamma_diag_zero_frag)
++                T.copy(dgamma_diag_zero_frag, DGAMMA_DIAG[i_b, i_h, chunk_start:chunk_start+chunk_size], disable_tma=True)
+ 
+                 # --- dK Path + ddA Terms ---
+                 dk_frag = T.alloc_fragment([fused_chunk_size, N], accum_dtype)
+@@ -1085,15 +1067,7 @@
+                 dk_combined_frag = T.alloc_fragment([fused_chunk_size, N], accum_dtype)
+                 T.copy(dk_shared, dk_combined_frag)
+ 
+-                # Compute the effect of dqk_from_diag
+-                q_dk_frag = T.alloc_fragment([fused_chunk_size, N], accum_dtype) # Keeping q_dk_frag in accum_dtype to avoid casting instructions
+-                T.copy(q_pre_rot_shared, q_dk_frag) # NOTE: we need to use the pre-rotated version of q
+-                q_dk_frag_reshaped = T.view(q_dk_frag, [chunk_size, R, N])
+-                for csr_in, n in T.Parallel(fused_chunk_size, N):
+-                    cs = csr_in // R
+-                    for r_out in T.serial(R):
+-                        csr_out = cs*R + r_out
+-                        dk_combined_frag[csr_in, n] += dqk_from_diag_shared[csr_out, csr_in] * q_dk_frag_reshaped[cs, r_out, n]  
++
+                 # Copy to gmem:
+                 T.copy(dk_combined_frag, DK[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, i_h, :])
+ 
+@@ -1129,12 +1103,7 @@
+                     dq_shared[cs*R + r, N//2 + n] = -T.sin(angles_dk_frag[cs, n]) * dq_first_half_frag[cs, r, n] + T.cos(angles_dk_frag[cs, n]) * dq_second_half_frag[cs, r, n]
+                 T.copy(dq_shared, dq_frag)
+ 
+-                # Compute the effect of dqk_from_diag
+-                for csr_out, n in T.Parallel(fused_chunk_size, N):
+-                    cs = csr_out // R
+-                    for r_in in T.serial(R):
+-                        csr_in = cs*R + r_in
+-                        dq_frag[csr_out, n] += dqk_from_diag_shared[csr_out, csr_in] * k_pre_rot_shared[csr_in, n]
++
+                 # Copy to gmem:
+                 T.copy(dq_frag, DQ[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, i_h, :])
+ 

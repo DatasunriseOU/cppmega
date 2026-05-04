@@ -1,0 +1,184 @@
+{
+  "branch": "worker/mamba3-mono-triton-model",
+  "compile_probe": {
+    "command": "python tools/probes/mamba3_wgmma_wave7_copy_evidence.py --compile-probe --cuda-arch sm_121",
+    "status": "not_run"
+  },
+  "date": "2026-04-30",
+  "narrow_vector_128b_safe_attempt": {
+    "alignment_evidence_check": {
+      "evidence": null,
+      "failures": [
+        "attach runtime/base alignment and generated-layout evidence for the 128-bit copy attempt"
+      ],
+      "pass": false,
+      "required_fields": [
+        "vector_bytes",
+        "tile_rows",
+        "tile_cols",
+        "dtype_bytes",
+        "row_bytes",
+        "tile_bytes",
+        "row_tail_bytes",
+        "tile_tail_bytes",
+        "global_base_alignment_bytes",
+        "smem_base_alignment_bytes",
+        "runtime_global_alignment_guard",
+        "runtime_smem_alignment_guard",
+        "row_stride_alignment_bytes",
+        "uses_16b_contiguous_vector_type",
+        "masked_tail_path_present",
+        "tiles_covered",
+        "kt_qt_vector_compatible_layout"
+      ],
+      "status": "missing_alignment_evidence"
+    },
+    "can_promote_wave6_gate": false,
+    "ptxas_evidence": {
+      "dynamic_smem_note": "ptxas -v reports registers, spills, and static shared memory. dynamic_smem_bytes must come from the kernel launch/probe receipt.",
+      "failures": [
+        "attach raw ptxas --verbose output with registers, static smem, spill stores, and spill loads",
+        "attach dynamic_smem_bytes from the kernel launch/probe receipt"
+      ],
+      "metadata": null,
+      "required_fields": [
+        "raw_ptxas_output",
+        "registers_per_thread",
+        "static_smem_bytes",
+        "dynamic_smem_bytes",
+        "spill_stores_bytes",
+        "spill_loads_bytes"
+      ],
+      "status": "missing_ptxas_log"
+    },
+    "ptxas_resource_check": {
+      "failures": [
+        "ptxas metadata must report registers_per_thread, static_smem_bytes, dynamic_smem_bytes, spill stores, and spill loads"
+      ],
+      "metadata": null,
+      "pass": false,
+      "schema": {
+        "expected_dynamic_smem_bytes": 118784,
+        "kill_registers_per_thread": 224,
+        "registers_per_thread_max": 192,
+        "required_fields": [
+          "registers_per_thread",
+          "static_smem_bytes",
+          "dynamic_smem_bytes",
+          "spill_stores_bytes",
+          "spill_loads_bytes"
+        ],
+        "spill_loads_bytes_max": 0,
+        "spill_stores_bytes_max": 0,
+        "total_smem_bytes_max": 118784
+      },
+      "status": "missing_ptxas_metadata",
+      "variant": "narrow_vector_128b_safe_attempt"
+    },
+    "required_evidence_fields": {
+      "alignment": [
+        "vector_bytes",
+        "tile_rows",
+        "tile_cols",
+        "dtype_bytes",
+        "row_bytes",
+        "tile_bytes",
+        "row_tail_bytes",
+        "tile_tail_bytes",
+        "global_base_alignment_bytes",
+        "smem_base_alignment_bytes",
+        "runtime_global_alignment_guard",
+        "runtime_smem_alignment_guard",
+        "row_stride_alignment_bytes",
+        "uses_16b_contiguous_vector_type",
+        "masked_tail_path_present",
+        "tiles_covered",
+        "kt_qt_vector_compatible_layout"
+      ],
+      "ptxas": [
+        "raw ptxas --verbose output",
+        "registers_per_thread",
+        "static_smem_bytes",
+        "dynamic_smem_bytes",
+        "spill_stores_bytes",
+        "spill_loads_bytes"
+      ]
+    },
+    "status": "fail"
+  },
+  "receipt": "mamba3_mono_wgmma_copy_path_wave7_evidence_2026_04_30",
+  "scope": {
+    "copy_attempt": "128-bit vector copy for 64x64 BF16 Wave6 tiles",
+    "local_compile_probe_coverage": "minimal one-tile CUDA/CuTe uint4 copy probe only; not the full monolithic WGMMA kernel",
+    "promotion_rule": "ptxas resource check and full Wave6 alignment/layout evidence must both pass",
+    "variant": "narrow_vector_128b_safe_attempt"
+  },
+  "source_receipt": "docs/status/mamba3_mono_wgmma_copy_path_wave6_receipt_2026_04_30.json",
+  "status": "fail_missing_or_incomplete_copy_evidence",
+  "tma_descriptor_smoke_checklist": [
+    {
+      "evidence_required": "descriptor/tensor-map construction succeeds for exactly the 10 global Wave6 tiles",
+      "expected_tiles": [
+        "K",
+        "Q",
+        "K_T",
+        "Q_T",
+        "state_panel_p0",
+        "state_panel_p1",
+        "dPhiO_panel_p0",
+        "dPhiO_panel_p1",
+        "PsiV_panel_p0",
+        "PsiV_panel_p1"
+      ],
+      "forbidden_tiles": [
+        "dstates_panel_p0",
+        "dstates_panel_p1",
+        "tiny scalar/vector slices"
+      ],
+      "id": "descriptor_scope",
+      "status": "required"
+    },
+    {
+      "evidence_required": "each descriptor reports rank=2, box_dim_elements=[64, 64], element_type=bf16",
+      "expected_box_bytes_per_tile": 8192,
+      "expected_descriptor_bytes_per_chunk": 81920,
+      "id": "descriptor_shape",
+      "status": "required"
+    },
+    {
+      "evidence_required": "global base pointer, shared base pointer, and transfer size are 16-byte aligned for every descriptor",
+      "id": "alignment",
+      "required_alignment_bytes": 16,
+      "status": "required"
+    },
+    {
+      "evidence_required": "mbarrier expected-byte accounting is programmed before each TMA wait",
+      "expected_bytes_per_chunk": 81920,
+      "expected_bytes_per_tile": 8192,
+      "id": "mbarrier_expected_bytes",
+      "status": "required"
+    },
+    {
+      "evidence_required": "generated code waits/fences on the async barrier before WGMMA consumes every TMA-fed SMEM tile",
+      "id": "wait_fence_ordering",
+      "status": "required"
+    },
+    {
+      "evidence_required": "ptxas metadata for the TMA variant has <=192 registers/thread, <=131072 total SMEM bytes, and zero spills",
+      "id": "resource_gate",
+      "max_registers_per_thread": 192,
+      "max_total_smem_bytes": 131072,
+      "status": "required"
+    }
+  ],
+  "validation": {
+    "generated_by": "tools/probes/mamba3_wgmma_wave7_copy_evidence.py",
+    "ingest_command": "python tools/probes/mamba3_wgmma_wave7_copy_evidence.py --ptxas-log ptxas.log --dynamic-smem-bytes 118784 --alignment-evidence alignment.json",
+    "placeholder_check_command": "python tools/probes/mamba3_wgmma_wave7_copy_evidence.py --check docs/status/mamba3_mono_wgmma_copy_path_wave7_receipt_2026_04_30.json"
+  },
+  "wave8_recommendation": [
+    "Promote the narrow-vector path only after this receipt carries both parsed ptxas output and full Wave6 tile alignment evidence.",
+    "Keep the TMA path behind the descriptor smoke checklist until descriptor scope, mbarrier bytes, wait/fence ordering, and ptxas resources are receipted.",
+    "Treat a minimal one-tile compile probe as compiler/toolchain evidence, not as full monolithic-kernel timing evidence."
+  ]
+}

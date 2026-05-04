@@ -1,0 +1,36 @@
+{
+  "branch": "worker/mamba3-mono-triton-model",
+  "command": [
+    "/usr/local/cuda/bin/nvcc",
+    "-std=c++17",
+    "-arch=sm_121",
+    "-I/home/dave/cppmega-venv/lib/python3.13/site-packages/flashinfer/data/cutlass/include",
+    "--ptxas-options=-v",
+    "-c",
+    "tools/probes/mamba3_wgmma_wave7_copy_probe.cu"
+  ],
+  "coverage": "minimal one-tile CUDA/CuTe uint4 copy probe; this is compiler/toolchain evidence only, not full monolithic Mamba3 WGMMA coverage",
+  "cuda_arch": "sm_121",
+  "date": "2026-04-30",
+  "dynamic_smem_bytes_from_probe_contract": 8192,
+  "ptxas_output_excerpt": [
+    "ptxas info    : 12 bytes gmem",
+    "ptxas info    : Compiling entry function 'mamba3_wave7_narrow_copy_probe' for 'sm_121'",
+    "ptxas info    : Function properties for mamba3_wave7_narrow_copy_probe",
+    "    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads",
+    "ptxas info    : Used 40 registers, used 1 barriers",
+    "ptxas info    : Compile time = 8.802 ms"
+  ],
+  "resource_metadata": {
+    "dynamic_smem_bytes": 8192,
+    "registers_per_thread": 40,
+    "spill_loads_bytes": 0,
+    "spill_stores_bytes": 0,
+    "static_smem_bytes": 0
+  },
+  "status": "compiled",
+  "wave6_narrow_resource_gate": {
+    "pass": true,
+    "total_smem_bytes": 8192
+  }
+}
