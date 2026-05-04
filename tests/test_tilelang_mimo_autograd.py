@@ -23,6 +23,10 @@ if not torch.cuda.is_available():
 # ---------------------------------------------------------------------------
 # Imports (heavy -- triggers TileLang JIT on first use)
 # ---------------------------------------------------------------------------
+pytest.importorskip(
+    "mamba_ssm.ops.tilelang.mamba3.mamba3_mimo",
+    reason="upstream mamba_ssm.ops.tilelang not installed in this env",
+)
 from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo as upstream_mimo
 from cppmega.megatron.tilelang_mimo_autograd import cppmega_tilelang_mimo_combined
 
