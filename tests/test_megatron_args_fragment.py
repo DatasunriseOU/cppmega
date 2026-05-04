@@ -77,6 +77,24 @@ def test_nam56r_launch_helper_uses_requested_mtp_predictor_count():
     assert "--mtp-num-layers 2" in bundle.to_shell_fragment()
 
 
+def test_nam56r_launch_helper_controls_moe_router_fusion():
+    plan = build_nam56r_feature_plan(pattern="AEMEAEMEAEMR", depth=52)
+
+    enabled = build_nam56r_megatron_native_args(
+        plan=plan,
+        enable_moe=True,
+        moe_router_fusion=True,
+    ).to_shell_fragment()
+    disabled = build_nam56r_megatron_native_args(
+        plan=plan,
+        enable_moe=True,
+        moe_router_fusion=False,
+    ).to_shell_fragment()
+
+    assert "--moe-router-fusion" in enabled
+    assert "--moe-router-fusion" not in disabled
+
+
 def test_nam56r_launch_cli_emits_native_fragment(capsys, monkeypatch):
     monkeypatch.setattr(
         sys,

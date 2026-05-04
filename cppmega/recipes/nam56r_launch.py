@@ -25,6 +25,7 @@ def build_nam56r_megatron_native_args(
     moe_token_dispatcher_type: str = "alltoall",
     moe_flex_dispatcher_backend: str = "deepep",
     moe_router_dtype: str | None = "fp32",
+    moe_router_fusion: bool = True,
     enable_dsa: bool = False,
     dsa_indexer_dtype: str = "bf16",
     dsa_indexer_topk: int = 256,
@@ -49,6 +50,7 @@ def build_nam56r_megatron_native_args(
         moe_token_dispatcher_type=moe_token_dispatcher_type,
         moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
         moe_router_dtype=moe_router_dtype,
+        moe_router_fusion=moe_router_fusion,
         use_dsa=enable_dsa,
         dsa_indexer_dtype=dsa_indexer_dtype,
         dsa_indexer_topk=dsa_indexer_topk,
@@ -141,6 +143,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default="fp32",
         help="Router probability dtype flag; 'none' omits --moe-router-dtype",
     )
+    router_fusion = parser.add_mutually_exclusive_group()
+    router_fusion.add_argument(
+        "--moe-router-fusion",
+        action="store_true",
+        default=True,
+        dest="moe_router_fusion",
+    )
+    router_fusion.add_argument(
+        "--no-moe-router-fusion",
+        action="store_false",
+        dest="moe_router_fusion",
+    )
     parser.add_argument("--enable-dsa", action="store_true")
     parser.add_argument(
         "--dsa-indexer-dtype",
@@ -174,6 +188,7 @@ def main() -> int:
         moe_token_dispatcher_type=args.moe_token_dispatcher_type,
         moe_flex_dispatcher_backend=args.moe_flex_dispatcher_backend,
         moe_router_dtype=None if args.moe_router_dtype == "none" else args.moe_router_dtype,
+        moe_router_fusion=args.moe_router_fusion,
         enable_dsa=args.enable_dsa,
         dsa_indexer_dtype=args.dsa_indexer_dtype,
     )

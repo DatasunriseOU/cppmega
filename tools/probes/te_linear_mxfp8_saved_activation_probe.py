@@ -13,6 +13,8 @@ from typing import Any
 
 import torch
 
+from cppmega.recipes.run_profiles import RunProfile, profile_shell_assignments
+
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
@@ -33,30 +35,49 @@ def _load_cppmega_fp8_shim() -> Any:
     return module
 
 
-def _set_mxfp8_profile_env(backend: str | None) -> str:
-    os.environ.setdefault("CPPMEGA_ALLOW_TE_MXFP8_SM12", "1")
-    os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER", "1")
-    if backend is not None:
+def _set_mxfp8_profile_env(
+    backend: str | None,
+    linear_kernel_contract: str,
+) -> tuple[str, str]:
+    profile = RunProfile(
+        name="te_linear_mxfp8_saved_activation_probe",
+        description="Focused TE Linear MXFP8 saved-operand contract probe.",
+    )
+    precision = profile.precision
+    precision.fp8_recipe = "mxfp8"
+    precision.allow_te_mxfp8_sm12 = True
+    precision.mxfp8_te_cast_only_fast_path = True
+    precision.mxfp8_bwd_tn_adapter = True
+    precision.mxfp8_bwd_backend = backend or "te_tn_adapter"
+    precision.mxfp8_transpose_emit_backend = (
+        "off" if precision.mxfp8_bwd_backend == "cutlass_native" else "te"
+    )
+    precision.mxfp8_transpose_emit_swizzled = precision.mxfp8_bwd_backend != "cutlass_native"
+    precision.mxfp8_transpose_emit_strict = precision.mxfp8_bwd_backend != "cutlass_native"
+    precision.mxfp8_bwd_allow_bf16_fallback = False
+    precision.mxfp8_dgrad_bf16 = False
+    precision.mxfp8_wgrad_bf16 = False
+    precision.mxfp8_dense_saved_operands = True
+    precision.mxfp8_linear_kernel_contract = linear_kernel_contract  # type: ignore[assignment]
+    if linear_kernel_contract == "compact_direct_v1":
+        if backend is not None and backend != "cutlass_native":
+            raise SystemExit(
+                "--linear-kernel-contract compact_direct_v1 requires "
+                "--backend cutlass_native"
+            )
+        precision.mxfp8_bwd_backend = "cutlass_native"
+        precision.mxfp8_compact_columnwise_backward = True
+        precision.mxfp8_dense_saved_operands = False
+        precision.mxfp8_transpose_emit_backend = "off"
+        precision.mxfp8_transpose_emit_swizzled = False
+        precision.mxfp8_transpose_emit_strict = False
+
+    rendered = profile_shell_assignments(profile)
+    for key, value in rendered.items():
+        os.environ.setdefault(key, value)
+    if backend is not None and linear_kernel_contract != "compact_direct_v1":
         os.environ["CPPMEGA_TE_MXFP8_BWD_BACKEND"] = backend
-    backend = os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_BACKEND", "te_tn_adapter")
-    no_sidecar = backend == "cutlass_native"
-    os.environ.setdefault(
-        "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND",
-        "off" if no_sidecar else "te",
-    )
-    os.environ.setdefault(
-        "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED",
-        "0" if no_sidecar else "1",
-    )
-    os.environ.setdefault(
-        "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT",
-        "0" if no_sidecar else "1",
-    )
-    os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK", "0")
-    os.environ.setdefault("CPPMEGA_TE_MXFP8_DGRAD_BF16", "0")
-    os.environ.setdefault("CPPMEGA_TE_MXFP8_WGRAD_BF16", "0")
-    os.environ.setdefault("CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS", "1")
-    return backend
+    return os.environ["CPPMEGA_TE_MXFP8_BWD_BACKEND"], linear_kernel_contract
 
 
 def _saved_tensor_record(tensor: torch.Tensor) -> dict[str, Any]:
@@ -76,7 +97,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     if args.m % 32 or args.n % 32 or args.k % 32:
         raise SystemExit("--m, --n, and --k must be multiples of 32 for MXFP8")
 
-    backend = _set_mxfp8_profile_env(args.backend)
+    backend, linear_kernel_contract = _set_mxfp8_profile_env(
+        args.backend,
+        args.linear_kernel_contract,
+    )
     shim_module = _load_cppmega_fp8_shim()
 
     import transformer_engine.pytorch as te
@@ -169,7 +193,11 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         failures.append("MXFP8 backward used BF16 fallback")
 
     transpose_emit_backend = os.environ.get("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND", "")
-    direct_no_sidecar = backend == "cutlass_native" and transpose_emit_backend == "off"
+    direct_no_sidecar = (
+        linear_kernel_contract == "compact_direct_v1"
+        and backend == "cutlass_native"
+        and transpose_emit_backend == "off"
+    )
     flashinfer_compact_direct = (
         backend == "flashinfer_cutlass"
         and int(stats.get("mxfp8_flashinfer_dgrad", 0)) > 0
@@ -193,12 +221,27 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             failures.append("compact-direct backend attached MXFP8 transpose sidecars")
         if int(stats.get("mxfp8_tn_sidecar_registry_peak", 0)) != 0:
             failures.append("compact-direct backend used the sidecar registry")
+        for key in (
+            "bf16_fallback_dgrad",
+            "bf16_fallback_wgrad",
+            "mxfp8_tn_adapter_copy_transpose",
+            "mxfp8_tn_adapter_missing_sidecar_copy",
+            "mxfp8_tn_adapter_saved_transpose_operand",
+            "mxfp8_tn_adapter_te_emit_deferred",
+            "mxfp8_tn_sidecar_attr_attached",
+            "mxfp8_tn_sidecar_registry_peak_bytes",
+        ):
+            if int(stats.get(key, 0)) != 0:
+                failures.append(f"{key}={stats.get(key)}; expected 0 for compact-direct lane")
     else:
         if not saved_transpose_payload:
             failures.append(
                 "MXFP8 rowwise-transposed payload was not saved for Linear backward"
             )
-        if int(stats.get("mxfp8_tn_adapter_saved_transpose_operand", 0)) <= 0:
+        saved_operand_count = int(
+            stats.get("mxfp8_tn_adapter_saved_transpose_operand", 0)
+        ) + int(stats.get("mxfp8_tn_adapter_direct_saved_operand", 0))
+        if saved_operand_count <= 0:
             failures.append("TN adapter did not consume a saved transpose operand")
         if int(stats.get("mxfp8_tn_adapter_te_emit_deferred", 0)) <= 0:
             failures.append("TE Linear did not defer eager sidecar emission")
@@ -215,6 +258,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "status": "pass" if not failures else "fail",
         "failures": failures,
         "backend": backend,
+        "linear_kernel_contract": linear_kernel_contract,
         "shape": {"m": args.m, "n": args.n, "k": args.k},
         "saved_bf16_input_count": len(saved_bf16_input),
         "saved_bf16_weight_count": len(saved_bf16_weight),
@@ -238,6 +282,17 @@ def main() -> None:
         choices=("te_tn_adapter", "flashinfer_cutlass", "cutlass_native"),
         default=None,
         help="Override CPPMEGA_TE_MXFP8_BWD_BACKEND before loading the shim.",
+    )
+    parser.add_argument(
+        "--linear-kernel-contract",
+        choices=(
+            "legacy",
+            "gemm_ready_v1",
+            "gemm_ready_v1_dense_only",
+            "compact_direct_v1",
+        ),
+        default="gemm_ready_v1",
+        help="Typed MXFP8 Linear saved-operand contract rendered by run profiles.",
     )
     args = parser.parse_args()
 

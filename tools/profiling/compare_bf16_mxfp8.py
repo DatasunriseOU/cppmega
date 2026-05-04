@@ -95,6 +95,8 @@ class RunSummary:
     setup_alloc_bytes: int | None
     max_alloc_gib: float | None
     max_alloc_bytes: int | None
+    max_reserved_gib: float | None
+    max_reserved_bytes: int | None
     param_total_numel: int | None
     param_bytes_gib: float | None
     param_bytes: int | None
@@ -462,6 +464,10 @@ def summarize_run(inputs: LogInput, hot_step_start: int, hot_step_end: int | Non
     )
     max_alloc_values = [record.max_alloc_gib for record in memory if record.max_alloc_gib is not None]
     max_alloc_gib = max(max_alloc_values) if max_alloc_values else None
+    max_reserved_values = [
+        record.max_reserved_gib for record in memory if record.max_reserved_gib is not None
+    ]
+    max_reserved_gib = max(max_reserved_values) if max_reserved_values else None
 
     # nvidia-smi is not the allocator max, but keeping it as an artifact-derived
     # warning source makes missing monitor logs visible in JSON without adding a
@@ -487,6 +493,8 @@ def summarize_run(inputs: LogInput, hot_step_start: int, hot_step_end: int | Non
         setup_alloc_bytes=_gib_to_bytes(setup_record.alloc_gib if setup_record else None),
         max_alloc_gib=_round_float(max_alloc_gib, 3),
         max_alloc_bytes=_gib_to_bytes(max_alloc_gib),
+        max_reserved_gib=_round_float(max_reserved_gib, 3),
+        max_reserved_bytes=_gib_to_bytes(max_reserved_gib),
         param_total_numel=total_numel,
         param_bytes_gib=_round_float(_bytes_to_gib(param_bytes), 3),
         param_bytes=param_bytes,
@@ -528,6 +536,9 @@ def build_comparison_report(
         "tok_per_sec": _delta(mxfp8_summary.tok_per_sec, bf16_summary.tok_per_sec),
         "setup_alloc_gib": _delta(mxfp8_summary.setup_alloc_gib, bf16_summary.setup_alloc_gib),
         "max_alloc_gib": _delta(mxfp8_summary.max_alloc_gib, bf16_summary.max_alloc_gib),
+        "max_reserved_gib": _delta(
+            mxfp8_summary.max_reserved_gib, bf16_summary.max_reserved_gib
+        ),
         "param_bytes_gib": _delta(mxfp8_summary.param_bytes_gib, bf16_summary.param_bytes_gib),
         "final_train_loss": _delta(mxfp8_summary.final_train_loss, bf16_summary.final_train_loss),
         "final_val_loss": _delta(mxfp8_summary.final_val_loss, bf16_summary.final_val_loss),
@@ -598,6 +609,12 @@ def render_table(report: ComparisonReport) -> str:
             _format_delta(report.deltas["max_alloc_gib"], " GiB"),
         ),
         _table_row(
+            "max_reserved_gib",
+            _format_float(bf16.max_reserved_gib),
+            _format_float(mxfp8.max_reserved_gib),
+            _format_delta(report.deltas["max_reserved_gib"], " GiB"),
+        ),
+        _table_row(
             "param_bytes_gib",
             _format_float(bf16.param_bytes_gib),
             _format_float(mxfp8.param_bytes_gib),
@@ -653,6 +670,19 @@ def render_table(report: ComparisonReport) -> str:
                         ),
                         " GiB",
                     ),
+                )
+            )
+
+    counter_names = sorted(set(bf16.mxfp8_counters) | set(mxfp8.mxfp8_counters))
+    if counter_names:
+        lines.extend(["", "MXFP8 acceptance counters:"])
+        for name in counter_names:
+            lines.append(
+                _table_row(
+                    f"  {name}",
+                    _format_int(bf16.mxfp8_counters.get(name)),
+                    _format_int(mxfp8.mxfp8_counters.get(name)),
+                    "-",
                 )
             )
 

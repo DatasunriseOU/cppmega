@@ -47,3 +47,21 @@ def test_identity_chunk_sort_patch_preserves_non_identity_sort():
     expected_probs = torch.cat((probs[3:6], probs[0:2], probs[2:3]), dim=0)
     assert torch.equal(sorted_tokens, expected_tokens)
     assert torch.equal(sorted_probs, expected_probs)
+
+
+def test_identity_chunk_sort_patch_does_not_skip_mismatched_split_total():
+    assert apply_moe_dispatcher_identity_sort_patch(force=True)
+
+    from megatron.core.transformer.moe import moe_utils
+
+    tokens = torch.arange(12).view(6, 2)
+    probs = torch.arange(6, dtype=torch.float32)
+    split_sizes = torch.tensor([2, 1, 1])
+    sorted_idxs = torch.arange(3)
+
+    try:
+        moe_utils.sort_chunks_by_idxs(tokens, split_sizes, sorted_idxs, probs=probs, fused=False)
+    except RuntimeError as exc:
+        assert "split_sizes" in str(exc) or "split_with_sizes" in str(exc)
+    else:  # pragma: no cover - would mean the guard incorrectly skipped sorting.
+        raise AssertionError("mismatched split total must not use identity skip")
