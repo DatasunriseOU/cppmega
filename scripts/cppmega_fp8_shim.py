@@ -71,35 +71,12 @@ _SUPPORTED_TE_VERSIONS = (
     "2.16.0",
 )
 
-_CPPMEGA_MXFP8_TN_SIDECAR_ATTR = "_cppmega_mxfp8_rowwise_transpose"
-_CPPMEGA_MXFP8_TN_SIDECAR_PERSISTENT_ATTR = (
-    "_cppmega_mxfp8_rowwise_transpose_persistent"
+from cppmega.megatron.mxfp8_sidecar_refs import (
+    MXFP8_TN_SIDECAR_ATTR as _CPPMEGA_MXFP8_TN_SIDECAR_ATTR,
+    MXFP8_TN_SIDECAR_PERSISTENT_ATTR as _CPPMEGA_MXFP8_TN_SIDECAR_PERSISTENT_ATTR,
+    MXFP8_TN_SIDECAR_REF_ATTRS as _CPPMEGA_MXFP8_TN_SIDECAR_REF_ATTRS,
+    clear_mxfp8_sidecar_refs as _cppmega_clear_mxfp8_sidecar_refs,
 )
-_CPPMEGA_MXFP8_TN_SIDECAR_REF_ATTRS = (
-    "_te_rowwise_transpose_for_backward",
-    "_te_rowwise_transpose_for_backward_unregister",
-    _CPPMEGA_MXFP8_TN_SIDECAR_ATTR,
-    "_cppmega_mxfp8_rowwise_transpose_unregister",
-    _CPPMEGA_MXFP8_TN_SIDECAR_PERSISTENT_ATTR,
-)
-
-
-def _cppmega_clear_mxfp8_sidecar_refs(_x) -> bool:
-    """Drop producer-side references to a consumed MXFP8 transpose sidecar."""
-
-    _cleared = False
-    for _attr in _CPPMEGA_MXFP8_TN_SIDECAR_REF_ATTRS:
-        if not hasattr(_x, _attr):
-            continue
-        try:
-            delattr(_x, _attr)
-        except Exception:
-            try:
-                setattr(_x, _attr, None)
-            except Exception:
-                continue
-        _cleared = True
-    return _cleared
 
 
 def _cppmega_te_version_matches(version: str) -> bool:

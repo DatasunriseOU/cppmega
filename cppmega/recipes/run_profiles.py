@@ -27,6 +27,11 @@ Fp8Recipe = Literal["off", "tensorwise", "mxfp8"]
 Mxfp8BackwardBackend = Literal["te_tn_adapter", "flashinfer_cutlass", "cutlass_native"]
 Mxfp8TransposeEmitBackend = Literal["auto", "te", "off"]
 Mxfp8CutlassScaleBackend = Literal["compact", "prepack", "swizzled"]
+Mxfp8LinearKernelContract = Literal[
+    "legacy",
+    "gemm_ready_v1",
+    "gemm_ready_v1_dense_only",
+]
 Mxfp8FlashinferRunner = Literal["mm_mxfp8", "direct_tactic"]
 ParamStorage = Literal["auto", "bf16", "mxfp8"]
 MuonNsCarrier = Literal["bf16", "mxfp8_probe"]
@@ -140,6 +145,12 @@ class PrecisionProfile:
     # This covers Linear/LayerNormLinear saved activations and backward
     # grad-output producers, avoiding the deprecated copy-transpose bridge.
     mxfp8_dense_saved_operands: bool = True
+    # Strict Linear backward contract. ``legacy`` keeps fallback bridges
+    # available. ``gemm_ready_v1`` requires direct compact-columnwise operands
+    # or producer-attached GEMM-ready operands and disables dense sidecar saves.
+    # ``gemm_ready_v1_dense_only`` applies the same strictness only to dense
+    # Linear while counting grouped/MoE exclusions.
+    mxfp8_linear_kernel_contract: Mxfp8LinearKernelContract = "legacy"
     # Experimental MoE grouped backward mode: consumes grouped compact MXFP8
     # operands directly.  Keep this separate from dense compact-columnwise
     # because the current grouped direct kernels save memory but are slower than
@@ -384,6 +395,16 @@ def _validate_cce_filter_eps(value: str) -> str:
     return normalized
 
 
+def _validate_mxfp8_linear_kernel_contract(value: str) -> Mxfp8LinearKernelContract:
+    normalized = value.strip().lower()
+    if normalized not in ("legacy", "gemm_ready_v1", "gemm_ready_v1_dense_only"):
+        raise ValueError(
+            "--mxfp8-linear-kernel-contract must be legacy, gemm_ready_v1, "
+            "or gemm_ready_v1_dense_only"
+        )
+    return normalized  # type: ignore[return-value]
+
+
 def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProfile:
     """Fill the local GB10 NAM56R-quarter profile.
 
@@ -505,6 +526,40 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
             "mxfp8_cutlass_scale_backend='swizzled' is incompatible with "
             "mxfp8_compact_columnwise_backward"
         )
+    if (
+        profile.precision.fp8_recipe == "mxfp8"
+        and profile.precision.mxfp8_linear_kernel_contract != "legacy"
+    ):
+        if profile.precision.mxfp8_bwd_backend != "cutlass_native":
+            raise ValueError(
+                "mxfp8_linear_kernel_contract requires "
+                "mxfp8_bwd_backend='cutlass_native'"
+            )
+        if not profile.precision.mxfp8_compact_columnwise_backward:
+            raise ValueError(
+                "mxfp8_linear_kernel_contract requires "
+                "mxfp8_compact_columnwise_backward=True"
+            )
+        if profile.precision.mxfp8_dense_saved_operands:
+            raise ValueError(
+                "mxfp8_linear_kernel_contract requires "
+                "mxfp8_dense_saved_operands=False"
+            )
+        if profile.precision.mxfp8_transpose_emit_backend != "off":
+            raise ValueError(
+                "mxfp8_linear_kernel_contract requires "
+                "mxfp8_transpose_emit_backend='off'"
+            )
+        if profile.precision.mxfp8_transpose_emit_swizzled:
+            raise ValueError(
+                "mxfp8_linear_kernel_contract requires "
+                "mxfp8_transpose_emit_swizzled=False"
+            )
+        if profile.precision.mxfp8_transpose_emit_strict:
+            raise ValueError(
+                "mxfp8_linear_kernel_contract requires "
+                "mxfp8_transpose_emit_strict=False"
+            )
 
     env: dict[str, str] = {
         "CPPMEGA_RUN_PROFILE": profile.name,
@@ -655,6 +710,9 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                 "CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS": _bool(
                     profile.precision.mxfp8_dense_saved_operands
                 ),
+                "CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT": (
+                    profile.precision.mxfp8_linear_kernel_contract
+                ),
                 "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD": _bool(
                     profile.precision.mxfp8_grouped_direct_backward
                 ),
@@ -769,8 +827,37 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
                     "--mxfp8-compact-columnwise-backward requires "
                     "--mxfp8-bwd-backend cutlass_native"
                 )
+            if args.mxfp8_dense_saved_operands is None:
+                profile.precision.mxfp8_dense_saved_operands = False
+            if args.mxfp8_transpose_emit_backend is None:
+                profile.precision.mxfp8_transpose_emit_backend = "off"
+            if args.mxfp8_transpose_emit_swizzled is None:
+                profile.precision.mxfp8_transpose_emit_swizzled = False
+            if args.mxfp8_transpose_emit_strict is None:
+                profile.precision.mxfp8_transpose_emit_strict = False
     if args.mxfp8_dense_saved_operands is not None:
         profile.precision.mxfp8_dense_saved_operands = args.mxfp8_dense_saved_operands
+    if args.mxfp8_linear_kernel_contract is not None:
+        profile.precision.mxfp8_linear_kernel_contract = (
+            _validate_mxfp8_linear_kernel_contract(args.mxfp8_linear_kernel_contract)
+        )
+        if profile.precision.mxfp8_linear_kernel_contract != "legacy":
+            if args.mxfp8_bwd_backend is None:
+                profile.precision.mxfp8_bwd_backend = "cutlass_native"
+            elif args.mxfp8_bwd_backend != "cutlass_native":
+                raise ValueError(
+                    "--mxfp8-linear-kernel-contract requires "
+                    "--mxfp8-bwd-backend cutlass_native"
+                )
+            profile.precision.mxfp8_compact_columnwise_backward = True
+            if args.mxfp8_dense_saved_operands is None:
+                profile.precision.mxfp8_dense_saved_operands = False
+            if args.mxfp8_transpose_emit_backend is None:
+                profile.precision.mxfp8_transpose_emit_backend = "off"
+            if args.mxfp8_transpose_emit_swizzled is None:
+                profile.precision.mxfp8_transpose_emit_swizzled = False
+            if args.mxfp8_transpose_emit_strict is None:
+                profile.precision.mxfp8_transpose_emit_strict = False
     if args.mxfp8_grouped_direct_backward is not None:
         profile.precision.mxfp8_grouped_direct_backward = (
             args.mxfp8_grouped_direct_backward
@@ -1034,6 +1121,16 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         default=None,
         dest="mxfp8_dense_saved_operands",
+    )
+    parser.add_argument(
+        "--mxfp8-linear-kernel-contract",
+        choices=("legacy", "gemm_ready_v1", "gemm_ready_v1_dense_only"),
+        default=None,
+        help=(
+            "Strict MXFP8 Linear backward operand contract. Non-legacy modes "
+            "select cutlass_native compact-columnwise backward, disable dense "
+            "saved operands, and forbid transpose sidecar emission."
+        ),
     )
     grouped_direct_backward = parser.add_mutually_exclusive_group()
     grouped_direct_backward.add_argument(

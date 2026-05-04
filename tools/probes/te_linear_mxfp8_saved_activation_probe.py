@@ -55,7 +55,15 @@ def _set_mxfp8_profile_env(backend: str | None) -> str:
     os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK", "0")
     os.environ.setdefault("CPPMEGA_TE_MXFP8_DGRAD_BF16", "0")
     os.environ.setdefault("CPPMEGA_TE_MXFP8_WGRAD_BF16", "0")
-    os.environ.setdefault("CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS", "1")
+    os.environ.setdefault(
+        "CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT",
+        "gemm_ready_v1" if no_sidecar else "legacy",
+    )
+    os.environ.setdefault(
+        "CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD",
+        "1" if no_sidecar else "0",
+    )
+    os.environ.setdefault("CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS", "0" if no_sidecar else "1")
     return backend
 
 
@@ -169,7 +177,12 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         failures.append("MXFP8 backward used BF16 fallback")
 
     transpose_emit_backend = os.environ.get("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND", "")
-    direct_no_sidecar = backend == "cutlass_native" and transpose_emit_backend == "off"
+    operand_contract = os.environ.get("CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT", "legacy")
+    direct_no_sidecar = (
+        backend == "cutlass_native"
+        and transpose_emit_backend == "off"
+        and operand_contract != "legacy"
+    )
     flashinfer_compact_direct = (
         backend == "flashinfer_cutlass"
         and int(stats.get("mxfp8_flashinfer_dgrad", 0)) > 0
@@ -189,10 +202,18 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
                 failures.append("FlashInfer/CUTLASS compact-direct backend did not handle wgrad")
         if int(stats.get("mxfp8_tn_adapter_te_emit", 0)) != 0:
             failures.append("compact-direct backend emitted TE transpose operands")
+        if int(stats.get("mxfp8_tn_adapter_saved_transpose_operand", 0)) != 0:
+            failures.append("compact-direct backend consumed saved transpose operands")
+        if int(stats.get("mxfp8_tn_adapter_te_emit_deferred", 0)) != 0:
+            failures.append("compact-direct backend deferred TE transpose emission")
         if int(stats.get("mxfp8_tn_sidecar_attr_attached", 0)) != 0:
             failures.append("compact-direct backend attached MXFP8 transpose sidecars")
         if int(stats.get("mxfp8_tn_sidecar_registry_peak", 0)) != 0:
             failures.append("compact-direct backend used the sidecar registry")
+        if int(stats.get("mxfp8_tn_sidecar_registry_peak_bytes", 0)) != 0:
+            failures.append("compact-direct backend allocated sidecar registry bytes")
+        if saved_transpose_payload:
+            failures.append("compact-direct backend saved rowwise-transposed payload")
     else:
         if not saved_transpose_payload:
             failures.append(
