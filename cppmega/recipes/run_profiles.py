@@ -27,6 +27,7 @@ Fp8Recipe = Literal["off", "tensorwise", "mxfp8"]
 Mxfp8BackwardBackend = Literal["te_tn_adapter", "flashinfer_cutlass", "cutlass_native"]
 Mxfp8TransposeEmitBackend = Literal["auto", "te", "off"]
 Mxfp8CutlassScaleBackend = Literal["compact", "prepack", "swizzled"]
+Mxfp8GroupedQuantizeProducer = Literal["single_output", "multi_output"]
 Mxfp8FlashinferRunner = Literal["mm_mxfp8", "direct_tactic"]
 ParamStorage = Literal["auto", "bf16", "mxfp8"]
 MuonNsCarrier = Literal["bf16", "mxfp8_probe"]
@@ -149,6 +150,11 @@ class PrecisionProfile:
     # rowwise-transposed MXFP8 operands, call grouped TN GEMM directly and avoid
     # the copy bridge.  This is distinct from compact direct kernels above.
     mxfp8_grouped_gemm_ready_backward: bool = True
+    # ``single_output`` wraps TE split_quantize and emits one GEMM-ready
+    # rowwise-transposed operand per split. ``multi_output`` requires a TE C++
+    # op that emits all split outputs and their GEMM-ready operands in one
+    # launch; selecting it must fail if that op is missing.
+    mxfp8_grouped_quantize_producer: Mxfp8GroupedQuantizeProducer = "single_output"
     # FlashInfer's public mm_mxfp8 path owns autotuning. direct_tactic bypasses
     # that layer and is only for shape/tactic probes when nsys shows overhead.
     mxfp8_flashinfer_runner: Mxfp8FlashinferRunner = "mm_mxfp8"
@@ -661,6 +667,9 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                 "CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD": _bool(
                     profile.precision.mxfp8_grouped_gemm_ready_backward
                 ),
+                "CPPMEGA_TE_MXFP8_GROUPED_QUANTIZE_PRODUCER": (
+                    profile.precision.mxfp8_grouped_quantize_producer
+                ),
                 "CPPMEGA_FLASHINFER_MXFP8_RUNNER": (
                     profile.precision.mxfp8_flashinfer_runner
                 ),
@@ -778,6 +787,10 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
     if args.mxfp8_grouped_gemm_ready_backward is not None:
         profile.precision.mxfp8_grouped_gemm_ready_backward = (
             args.mxfp8_grouped_gemm_ready_backward
+        )
+    if args.mxfp8_grouped_quantize_producer is not None:
+        profile.precision.mxfp8_grouped_quantize_producer = (
+            args.mxfp8_grouped_quantize_producer
         )
     if args.mxfp8_flashinfer_runner is not None:
         profile.precision.mxfp8_flashinfer_runner = args.mxfp8_flashinfer_runner
@@ -1068,6 +1081,15 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         default=None,
         dest="mxfp8_grouped_gemm_ready_backward",
+    )
+    parser.add_argument(
+        "--mxfp8-grouped-quantize-producer",
+        choices=("single_output", "multi_output"),
+        default=None,
+        help=(
+            "Select the grouped/MoE MXFP8 split producer. multi_output requires "
+            "a TE fused split_quantize+rowwise-transpose producer API."
+        ),
     )
     parser.add_argument(
         "--mxfp8-flashinfer-runner",

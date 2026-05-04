@@ -315,6 +315,14 @@ _te_mxfp8_grouped_direct_backward = os.environ.get(
 _te_mxfp8_grouped_gemm_ready_backward = os.environ.get(
     "CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD", "1"
 ) == "1"
+_te_mxfp8_grouped_quantize_producer = os.environ.get(
+    "CPPMEGA_TE_MXFP8_GROUPED_QUANTIZE_PRODUCER", "single_output"
+)
+if _te_mxfp8_grouped_quantize_producer not in ("single_output", "multi_output"):
+    raise RuntimeError(
+        "Unsupported CPPMEGA_TE_MXFP8_GROUPED_QUANTIZE_PRODUCER="
+        f"{_te_mxfp8_grouped_quantize_producer!r}; expected single_output or multi_output"
+    )
 _te_mxfp8_bwd_allow_bf16_fallback = os.environ.get(
     "CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK",
     "1"
@@ -429,6 +437,10 @@ if (
             "mxfp8_grouped_gemm_ready_wgrad": 0,
             "mxfp8_grouped_gemm_ready_miss_dgrad": 0,
             "mxfp8_grouped_gemm_ready_miss_wgrad": 0,
+            "mxfp8_grouped_quantize_producer_single_output": 0,
+            "mxfp8_grouped_quantize_producer_multi_output": 0,
+            "mxfp8_grouped_quantize_producer_multi_output_consumed": 0,
+            "mxfp8_grouped_quantize_producer_multi_output_missing_api": 0,
             "mxfp8_grouped_transpose_copy_fallback_dgrad": 0,
             "mxfp8_grouped_transpose_copy_fallback_wgrad": 0,
             "mxfp8_dense_gemm_ready_dgrad": 0,
@@ -1085,6 +1097,98 @@ if (
             _orig_tex_split_quantize, "_cppmega_transpose_emit", False
         ):
 
+            def _cppmega_split_quantize_multi_output_with_rowwise_transpose(
+                tensor,
+                split_sections,
+                quantizers,
+                *args,
+                **kwargs,
+            ):
+                _multi_output = getattr(
+                    _tex,
+                    "mxfp8_split_quantize_with_rowwise_transpose",
+                    None,
+                )
+                if _multi_output is None:
+                    _cppmega_record_bwd_stat(
+                        "mxfp8_grouped_quantize_producer_multi_output_missing_api"
+                    )
+                    raise RuntimeError(
+                        "CPPMEGA_TE_MXFP8_GROUPED_QUANTIZE_PRODUCER=multi_output "
+                        "requires transformer_engine_torch."
+                        "mxfp8_split_quantize_with_rowwise_transpose. The "
+                        "installed TE exposes only split_quantize, so this "
+                        "profile would silently fall back to per-split producer "
+                        "launches. Install/apply the TE fused multi-output "
+                        "producer patch or select single_output."
+                    )
+                _disable_bulk_allocation = bool(
+                    kwargs.pop("disable_bulk_allocation", False)
+                )
+                _transpose_scales_with_gemm_swizzled = bool(
+                    kwargs.pop(
+                        "transpose_scales_with_gemm_swizzled",
+                        _te_mxfp8_transpose_emit_swizzled,
+                    )
+                )
+                if kwargs:
+                    raise RuntimeError(
+                        "MXFP8 multi-output grouped quantize producer got "
+                        f"unsupported keyword arguments: {sorted(kwargs)}"
+                    )
+                if args:
+                    raise RuntimeError(
+                        "MXFP8 multi-output grouped quantize producer does not "
+                        "support extra positional arguments beyond tensor, "
+                        "split_sections, quantizers"
+                    )
+                _outputs = _multi_output(
+                    tensor,
+                    split_sections,
+                    quantizers,
+                    _disable_bulk_allocation,
+                    _transpose_scales_with_gemm_swizzled,
+                )
+                if not isinstance(_outputs, (list, tuple)):
+                    raise RuntimeError(
+                        "MXFP8 multi-output grouped quantize producer returned "
+                        f"{type(_outputs).__name__}, expected list/tuple"
+                    )
+                _cppmega_record_bwd_stat(
+                    "mxfp8_grouped_quantize_producer_multi_output"
+                )
+                _consumed = 0
+                for _out in _outputs:
+                    if not _cppmega_is_mxfp8_tensor(_out):
+                        continue
+                    _operand = getattr(
+                        _out,
+                        "_te_gemm_ready_rowwise_transpose_for_backward",
+                        None,
+                    )
+                    if _operand is not None and _cppmega_is_mxfp8_tensor(_operand):
+                        _cppmega_mark_rowwise_transpose_operand(_operand)
+                        _cppmega_set_mxfp8_sidecar_refs(
+                            _out,
+                            _operand,
+                            persistent=False,
+                        )
+                        _cppmega_record_bwd_stat(
+                            "mxfp8_grouped_quantize_producer_multi_output_consumed"
+                        )
+                        _consumed += 1
+                    elif _cppmega_is_mxfp8_rowwise_transpose_operand(_out):
+                        _cppmega_record_bwd_stat(
+                            "mxfp8_grouped_quantize_producer_multi_output_consumed"
+                        )
+                        _consumed += 1
+                if _outputs and _consumed == 0:
+                    raise RuntimeError(
+                        "MXFP8 multi-output grouped quantize producer returned no "
+                        "GEMM-ready rowwise-transpose operands"
+                    )
+                return _outputs
+
             @_functools.wraps(_orig_tex_split_quantize)
             def _split_quantize_with_rowwise_transpose(
                 tensor,
@@ -1093,6 +1197,35 @@ if (
                 *args,
                 **kwargs,
             ):
+                if _te_mxfp8_grouped_quantize_producer == "multi_output":
+                    if not (
+                        _te_mxfp8_bwd_tn_adapter
+                        and _te_mxfp8_transpose_emit_backend in ("auto", "te")
+                    ):
+                        raise RuntimeError(
+                            "CPPMEGA_TE_MXFP8_GROUPED_QUANTIZE_PRODUCER=multi_output "
+                            "requires CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER=1 and "
+                            "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=auto|te; "
+                            "refusing to fall back to single_output."
+                        )
+                    if not (
+                        isinstance(tensor, _torch.Tensor)
+                        and isinstance(split_sections, (list, tuple))
+                        and isinstance(quantizers, (list, tuple))
+                    ):
+                        raise RuntimeError(
+                            "CPPMEGA_TE_MXFP8_GROUPED_QUANTIZE_PRODUCER=multi_output "
+                            "requires split_quantize(tensor: torch.Tensor, "
+                            "split_sections: list|tuple, quantizers: list|tuple); "
+                            "refusing to fall back to single_output."
+                        )
+                    return _cppmega_split_quantize_multi_output_with_rowwise_transpose(
+                        tensor,
+                        split_sections,
+                        quantizers,
+                        *args,
+                        **kwargs,
+                    )
                 _outputs = _orig_tex_split_quantize(
                     tensor,
                     split_sections,
@@ -1121,6 +1254,9 @@ if (
                             _quantizer,
                             _source,
                             _force=not _torch.is_grad_enabled(),
+                        )
+                        _cppmega_record_bwd_stat(
+                            "mxfp8_grouped_quantize_producer_single_output"
                         )
                     _start += _size
                 return _outputs
