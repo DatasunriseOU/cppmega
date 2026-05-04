@@ -199,6 +199,20 @@ using CompactScaleAsymmetricAColumnwiseSmemBTmaEarlyDispatchPolicy =
         true,
         true>;
 
+using CompactScaleAsymmetricAColumnwiseSmemKVectorBTmaEarlyDispatchPolicy =
+    cutlass::gemm::collective::MainloopSm120TmaWarpSpecializedBlockScaledCompactScale<
+        CollectiveMainloop::DispatchPolicy::Stages,
+        CollectiveMainloop::DispatchPolicy::SchedulerPipelineStageCount,
+        typename CollectiveMainloop::DispatchPolicy::ClusterShape,
+        cutlass::gemm::KernelTmaWarpSpecializedCooperativeSparseBlockScaledSm120<
+            CollectiveMainloop::DispatchPolicy::SchedulerPipelineStageCount,
+            false>,
+        false,
+        false,
+        true,
+        true,
+        true>;
+
 using CompactScaleCollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
     CompactScaleDispatchPolicy,
     ThreadBlockShape,
@@ -343,6 +357,23 @@ using CompactScaleAsymmetricAColumnwiseSmemBTmaEarlyCollectiveMainloop = cutlass
     typename CollectiveMainloop::SmemCopyAtomsB,
     cute::identity>;
 
+using CompactScaleAsymmetricAColumnwiseSmemKVectorBTmaEarlyCollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+    CompactScaleAsymmetricAColumnwiseSmemKVectorBTmaEarlyDispatchPolicy,
+    ThreadBlockShape,
+    cute::tuple<KernelElementA, KernelElementSF>,
+    cute::tuple<StrideA, LayoutSFA>,
+    cute::tuple<KernelElementB, KernelElementSF>,
+    cute::tuple<StrideB, LayoutSFB>,
+    typename CollectiveMainloop::TiledMma,
+    typename CollectiveMainloop::GmemTiledCopyPairA,
+    typename CollectiveMainloop::SmemLayoutAtomsA,
+    typename CollectiveMainloop::SmemCopyAtomsA,
+    cute::identity,
+    typename CollectiveMainloop::GmemTiledCopyPairB,
+    typename CollectiveMainloop::SmemLayoutAtomsB,
+    typename CollectiveMainloop::SmemCopyAtomsB,
+    cute::identity>;
+
 using CompactScaleAsymmetricAColumnwiseSmemGemmKernel = cutlass::gemm::kernel::GemmUniversal<
     Shape<int, int, int, int>,
     CompactScaleAsymmetricAColumnwiseSmemCollectiveMainloop,
@@ -358,6 +389,14 @@ using CompactScaleAsymmetricAColumnwiseSmemBTmaEarlyGemmKernel = cutlass::gemm::
     cutlass::gemm::StreamKScheduler>;
 using CompactScaleAsymmetricAColumnwiseSmemBTmaEarlyGemm =
     cutlass::gemm::device::GemmUniversalAdapter<CompactScaleAsymmetricAColumnwiseSmemBTmaEarlyGemmKernel>;
+
+using CompactScaleAsymmetricAColumnwiseSmemKVectorBTmaEarlyGemmKernel = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int, int, int, int>,
+    CompactScaleAsymmetricAColumnwiseSmemKVectorBTmaEarlyCollectiveMainloop,
+    CollectiveEpilogue,
+    cutlass::gemm::StreamKScheduler>;
+using CompactScaleAsymmetricAColumnwiseSmemKVectorBTmaEarlyGemm =
+    cutlass::gemm::device::GemmUniversalAdapter<CompactScaleAsymmetricAColumnwiseSmemKVectorBTmaEarlyGemmKernel>;
 
 // =======================================================================
 // Validation helpers
@@ -1368,6 +1407,69 @@ at::Tensor cutlass_mxfp8_tn_gemm_compact_direct_a_col_smem_b_tma_early_asym_cuda
   float beta_f = static_cast<float>(beta);
 
   return run_compact_direct_gemm_impl<CompactScaleAsymmetricAColumnwiseSmemBTmaEarlyGemm>(
+      A_u8, SFA_u8, B_u8, SFB_u8, m, n, k,
+      a_source, a_data_ld, a_scale_ld,
+      b_source, b_data_ld, b_scale_ld,
+      D, alpha_f, beta_f, stream);
+#endif
+}
+
+at::Tensor cutlass_mxfp8_tn_gemm_compact_direct_a_col_smem_kvec_b_tma_early_asym_cuda(
+    at::Tensor A_u8,
+    at::Tensor SFA_u8,
+    at::Tensor B_u8,
+    at::Tensor SFB_u8,
+    int64_t m64,
+    int64_t n64,
+    int64_t k64,
+    int64_t a_source,
+    int64_t a_data_ld,
+    int64_t a_scale_ld,
+    int64_t b_source,
+    int64_t b_data_ld,
+    int64_t b_scale_ld,
+    at::Tensor out,
+    bool use_out,
+    bool accumulate,
+    double alpha,
+    double beta) {
+#if !defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) && !defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+  TORCH_CHECK(false, "CUTLASS SM120/SM121 MXFP8 compact direct A-columnwise-smem k-vector B-TMA-early asymmetric backend was not compiled for this architecture");
+#else
+  TORCH_CHECK(m64 <= INT_MAX && n64 <= INT_MAX && k64 <= INT_MAX, "M/N/K exceed int");
+  int m = static_cast<int>(m64);
+  int n = static_cast<int>(n64);
+  int k = static_cast<int>(k64);
+
+  TORCH_CHECK(m > 0 && n > 0 && k > 0, "m, n, k must be positive");
+  TORCH_CHECK(m % 128 == 0 && n % 128 == 0 && k % 128 == 0,
+              "CUTLASS MXFP8 compact direct A-columnwise-smem k-vector B-TMA-early asymmetric backend currently requires M/N/K multiples of 128, got ",
+              m, "x", n, "x", k);
+  TORCH_CHECK(a_source == kOperandColumnwiseTranspose,
+              "A-columnwise-smem k-vector B-TMA-early backend requires A source to be columnwise-transpose");
+  TORCH_CHECK(b_source == kOperandRowwise,
+              "A-columnwise-smem k-vector B-TMA-early backend requires B source to be rowwise");
+  validate_direct_operand(A_u8, SFA_u8, m, k, a_source, a_data_ld, a_scale_ld, "A");
+  validate_direct_operand(B_u8, SFB_u8, n, k, b_source, b_data_ld, b_scale_ld, "B");
+  if (use_out) {
+    CHECK_CUDA(out);
+    CHECK_CONTIGUOUS(out);
+    TORCH_CHECK(out.scalar_type() == at::ScalarType::BFloat16, "out must be bfloat16");
+    TORCH_CHECK(out.numel() >= static_cast<int64_t>(m) * n, "out is too small");
+  }
+
+  c10::cuda::CUDAGuard device_guard(A_u8.device());
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+  at::Tensor D = use_out
+      ? out.view({m, n})
+      : at::empty({m, n}, at::TensorOptions().device(A_u8.device()).dtype(at::kBFloat16));
+
+  (void)accumulate;
+  float alpha_f = static_cast<float>(alpha);
+  float beta_f = static_cast<float>(beta);
+
+  return run_compact_direct_gemm_impl<CompactScaleAsymmetricAColumnwiseSmemKVectorBTmaEarlyGemm>(
       A_u8, SFA_u8, B_u8, SFB_u8, m, n, k,
       a_source, a_data_ld, a_scale_ld,
       b_source, b_data_ld, b_scale_ld,
