@@ -263,6 +263,19 @@ if _te_mxfp8_bwd_backend not in ("te_tn_adapter", "flashinfer_cutlass", "cutlass
         f"{_te_mxfp8_bwd_backend!r}; expected te_tn_adapter, flashinfer_cutlass, "
         "or cutlass_native"
     )
+_te_mxfp8_linear_kernel_contract = os.environ.get(
+    "CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT",
+    "saved_transpose",
+).lower()
+if _te_mxfp8_linear_kernel_contract not in (
+    "saved_transpose",
+    "compact_columnwise_direct",
+):
+    raise RuntimeError(
+        "Unsupported CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT="
+        f"{_te_mxfp8_linear_kernel_contract!r}; expected saved_transpose or "
+        "compact_columnwise_direct"
+    )
 _cutlass_mxfp8_scale_backend = os.environ.get(
     "CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND", "compact"
 ).lower()
@@ -309,6 +322,38 @@ _te_mxfp8_compact_columnwise_backward = (
 _te_mxfp8_dense_saved_operands = os.environ.get(
     "CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS", "0"
 ) == "1"
+if _te_mxfp8_linear_kernel_contract == "compact_columnwise_direct":
+    if _te_mxfp8_bwd_backend != "cutlass_native":
+        raise RuntimeError(
+            "CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT=compact_columnwise_direct "
+            "requires CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native"
+        )
+    if not _te_mxfp8_compact_columnwise_backward:
+        raise RuntimeError(
+            "CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT=compact_columnwise_direct "
+            "requires CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=1"
+        )
+    if _te_mxfp8_dense_saved_operands:
+        raise RuntimeError(
+            "CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT=compact_columnwise_direct "
+            "forbids CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS=1 because that "
+            "path saves GEMM-ready transpose operands."
+        )
+    if _te_mxfp8_transpose_emit_backend != "off":
+        raise RuntimeError(
+            "CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT=compact_columnwise_direct "
+            "requires CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=off"
+        )
+    if _te_mxfp8_transpose_emit_swizzled:
+        raise RuntimeError(
+            "CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT=compact_columnwise_direct "
+            "requires CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED=0"
+        )
+    if _te_mxfp8_transpose_emit_strict:
+        raise RuntimeError(
+            "CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT=compact_columnwise_direct "
+            "requires CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT=0"
+        )
 _te_mxfp8_grouped_direct_backward = os.environ.get(
     "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD", "0"
 ) == "1"
@@ -2774,6 +2819,7 @@ if (
             f"mxfp8_bwd_tn_adapter={_te_mxfp8_bwd_tn_adapter}, "
             f"mxfp8_transpose_emit_backend={_te_mxfp8_transpose_emit_backend}, "
             f"mxfp8_transpose_emit_swizzled={_te_mxfp8_transpose_emit_swizzled}, "
+            f"mxfp8_linear_kernel_contract={_te_mxfp8_linear_kernel_contract}, "
             f"cutlass_mxfp8_scale_backend={_cutlass_mxfp8_scale_backend}, "
             f"mxfp8_compact_columnwise_backward={_te_mxfp8_compact_columnwise_backward}, "
             f"mxfp8_dense_saved_operands={_te_mxfp8_dense_saved_operands}, "

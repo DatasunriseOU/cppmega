@@ -41,6 +41,12 @@ def _set_mxfp8_profile_env(backend: str | None) -> str:
     backend = os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_BACKEND", "te_tn_adapter")
     no_sidecar = backend == "cutlass_native"
     os.environ.setdefault(
+        "CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT",
+        "compact_columnwise_direct" if no_sidecar else "saved_transpose",
+    )
+    if no_sidecar:
+        os.environ.setdefault("CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD", "1")
+    os.environ.setdefault(
         "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND",
         "off" if no_sidecar else "te",
     )
@@ -55,7 +61,7 @@ def _set_mxfp8_profile_env(backend: str | None) -> str:
     os.environ.setdefault("CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK", "0")
     os.environ.setdefault("CPPMEGA_TE_MXFP8_DGRAD_BF16", "0")
     os.environ.setdefault("CPPMEGA_TE_MXFP8_WGRAD_BF16", "0")
-    os.environ.setdefault("CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS", "1")
+    os.environ.setdefault("CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS", "0" if no_sidecar else "1")
     return backend
 
 
@@ -68,6 +74,45 @@ def _saved_tensor_record(tensor: torch.Tensor) -> dict[str, Any]:
         "nbytes": int(tensor.numel() * tensor.element_size()),
         "data_ptr": int(tensor.data_ptr()) if tensor.is_cuda else 0,
     }
+
+
+def _counter(stats: dict[str, Any], key: str) -> int:
+    return int(stats.get(key, 0))
+
+
+def _validate_compact_direct_contract(
+    stats: dict[str, Any],
+    *,
+    saved_transpose_payload: list[dict[str, Any]],
+    cutlass_native: bool,
+) -> list[str]:
+    failures: list[str] = []
+    if cutlass_native:
+        if _counter(stats, "mxfp8_cutlass_native_dgrad") <= 0:
+            failures.append("CUTLASS native backend did not handle dgrad")
+        if _counter(stats, "mxfp8_cutlass_native_wgrad") <= 0:
+            failures.append("CUTLASS native backend did not handle wgrad")
+    else:
+        if _counter(stats, "mxfp8_flashinfer_dgrad") <= 0:
+            failures.append("FlashInfer/CUTLASS compact-direct backend did not handle dgrad")
+        if _counter(stats, "mxfp8_flashinfer_wgrad") <= 0:
+            failures.append("FlashInfer/CUTLASS compact-direct backend did not handle wgrad")
+    for key in (
+        "bf16_fallback_dgrad",
+        "bf16_fallback_wgrad",
+        "mxfp8_tn_adapter_te_emit",
+        "mxfp8_tn_adapter_saved_transpose_operand",
+        "mxfp8_tn_adapter_te_emit_deferred",
+        "mxfp8_tn_adapter_copy_transpose",
+        "mxfp8_tn_sidecar_attr_attached",
+        "mxfp8_tn_sidecar_registry_peak",
+        "mxfp8_tn_sidecar_registry_peak_bytes",
+    ):
+        if _counter(stats, key) != 0:
+            failures.append(f"{key}={stats.get(key)}; expected 0 for compact-direct contract")
+    if saved_transpose_payload:
+        failures.append("compact-direct backend saved rowwise-transposed payload")
+    return failures
 
 
 def _run(args: argparse.Namespace) -> dict[str, Any]:
@@ -162,45 +207,41 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         failures.append("input gradient is not finite")
     if not finite_weight_grad:
         failures.append("weight gradient is not finite")
-    if (
-        int(stats.get("bf16_fallback_dgrad", 0)) != 0
-        or int(stats.get("bf16_fallback_wgrad", 0)) != 0
-    ):
+    if _counter(stats, "bf16_fallback_dgrad") != 0 or _counter(stats, "bf16_fallback_wgrad") != 0:
         failures.append("MXFP8 backward used BF16 fallback")
 
     transpose_emit_backend = os.environ.get("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND", "")
-    direct_no_sidecar = backend == "cutlass_native" and transpose_emit_backend == "off"
+    linear_kernel_contract = os.environ.get(
+        "CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT",
+        "saved_transpose",
+    )
+    direct_no_sidecar = (
+        backend == "cutlass_native"
+        and transpose_emit_backend == "off"
+        and linear_kernel_contract == "compact_columnwise_direct"
+    )
     flashinfer_compact_direct = (
         backend == "flashinfer_cutlass"
-        and int(stats.get("mxfp8_flashinfer_dgrad", 0)) > 0
-        and int(stats.get("mxfp8_flashinfer_wgrad", 0)) > 0
-        and int(stats.get("mxfp8_tn_adapter_copy_transpose", 0)) == 0
+        and _counter(stats, "mxfp8_flashinfer_dgrad") > 0
+        and _counter(stats, "mxfp8_flashinfer_wgrad") > 0
+        and _counter(stats, "mxfp8_tn_adapter_copy_transpose") == 0
     )
     if direct_no_sidecar or flashinfer_compact_direct:
-        if direct_no_sidecar:
-            if int(stats.get("mxfp8_cutlass_native_dgrad", 0)) <= 0:
-                failures.append("CUTLASS native backend did not handle dgrad")
-            if int(stats.get("mxfp8_cutlass_native_wgrad", 0)) <= 0:
-                failures.append("CUTLASS native backend did not handle wgrad")
-        else:
-            if int(stats.get("mxfp8_flashinfer_dgrad", 0)) <= 0:
-                failures.append("FlashInfer/CUTLASS compact-direct backend did not handle dgrad")
-            if int(stats.get("mxfp8_flashinfer_wgrad", 0)) <= 0:
-                failures.append("FlashInfer/CUTLASS compact-direct backend did not handle wgrad")
-        if int(stats.get("mxfp8_tn_adapter_te_emit", 0)) != 0:
-            failures.append("compact-direct backend emitted TE transpose operands")
-        if int(stats.get("mxfp8_tn_sidecar_attr_attached", 0)) != 0:
-            failures.append("compact-direct backend attached MXFP8 transpose sidecars")
-        if int(stats.get("mxfp8_tn_sidecar_registry_peak", 0)) != 0:
-            failures.append("compact-direct backend used the sidecar registry")
+        failures.extend(
+            _validate_compact_direct_contract(
+                stats,
+                saved_transpose_payload=saved_transpose_payload,
+                cutlass_native=direct_no_sidecar,
+            )
+        )
     else:
         if not saved_transpose_payload:
             failures.append(
                 "MXFP8 rowwise-transposed payload was not saved for Linear backward"
             )
-        if int(stats.get("mxfp8_tn_adapter_saved_transpose_operand", 0)) <= 0:
+        if _counter(stats, "mxfp8_tn_adapter_saved_transpose_operand") <= 0:
             failures.append("TN adapter did not consume a saved transpose operand")
-        if int(stats.get("mxfp8_tn_adapter_te_emit_deferred", 0)) <= 0:
+        if _counter(stats, "mxfp8_tn_adapter_te_emit_deferred") <= 0:
             failures.append("TE Linear did not defer eager sidecar emission")
         for key in (
             "mxfp8_tn_adapter_te_emit",
@@ -208,7 +249,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             "mxfp8_tn_sidecar_registry_peak",
             "mxfp8_tn_sidecar_registry_peak_bytes",
         ):
-            if int(stats.get(key, 0)) != 0:
+            if _counter(stats, key) != 0:
                 failures.append(f"{key}={stats.get(key)}; expected 0 for TE Linear deferred path")
 
     return {

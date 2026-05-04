@@ -42,6 +42,70 @@ def _fresh_shim(monkeypatch, *, scale_backend: str):
     return shim
 
 
+def _import_shim_expect_error(monkeypatch, *, match: str):
+    for key in (
+        "CPPMEGA_TE_MXFP8_DGRAD_BF16",
+        "CPPMEGA_TE_MXFP8_WGRAD_BF16",
+        "NVTE_BACKWARD_OVERRIDE",
+        "CPPMEGA_CUTLASS_MXFP8_SCALE_BACKEND",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_BWD_TN_ADAPTER", "1")
+    monkeypatch.setenv(
+        "CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT",
+        "compact_columnwise_direct",
+    )
+    monkeypatch.setenv("CPPMEGA_TE_VERSION_STRICT", "0")
+    monkeypatch.setattr(atexit, "register", lambda func, *args, **kwargs: func)
+    monkeypatch.delitem(sys.modules, "scripts.cppmega_fp8_shim", raising=False)
+    with pytest.raises(RuntimeError, match=match):
+        importlib.import_module("scripts.cppmega_fp8_shim")
+
+
+def test_compact_direct_linear_contract_rejects_non_cutlass_backend(monkeypatch):
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_BWD_BACKEND", "te_tn_adapter")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD", "1")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND", "off")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED", "0")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT", "0")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS", "0")
+
+    _import_shim_expect_error(monkeypatch, match="BWD_BACKEND=cutlass_native")
+
+
+def test_compact_direct_linear_contract_rejects_missing_compact_direct(monkeypatch):
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_BWD_BACKEND", "cutlass_native")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD", "0")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND", "off")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED", "0")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT", "0")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS", "0")
+
+    _import_shim_expect_error(monkeypatch, match="COMPACT_COLUMNWISE_BACKWARD=1")
+
+
+def test_compact_direct_linear_contract_rejects_saved_operands(monkeypatch):
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_BWD_BACKEND", "cutlass_native")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD", "1")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND", "off")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED", "0")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT", "0")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS", "1")
+
+    _import_shim_expect_error(monkeypatch, match="DENSE_SAVED_OPERANDS=1")
+
+
+def test_compact_direct_linear_contract_rejects_transpose_emit(monkeypatch):
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_BWD_BACKEND", "cutlass_native")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD", "1")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND", "te")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED", "0")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT", "0")
+    monkeypatch.setenv("CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS", "0")
+
+    _import_shim_expect_error(monkeypatch, match="TRANSPOSE_EMIT_BACKEND=off")
+
+
 def test_swizzled_cutlass_route_uses_stock_gemm_and_packs_only_compact_scale(
     monkeypatch,
 ):
