@@ -1177,9 +1177,9 @@ struct CollectiveMma<
           static_assert(RowVectors % 2 == 0, "split A producer expects an even row-vector count");
           if (split_a_producer) {
             constexpr int SplitRowVectors = RowVectors / 2;
-            for (int idx = lane; idx < SplitRowVectors * KBlocks; idx += 32) {
-              int row_vec = (idx / KBlocks) * 2;
-              int kb = idx - (idx / KBlocks) * KBlocks;
+            for (int idx = lane; idx < KBlocks * SplitRowVectors; idx += 32) {
+              int kb = idx / SplitRowVectors;
+              int row_vec = (idx - kb * SplitRowVectors) * 2;
               int row_base = row_vec * 16;
               int64_t scale_offset =
                   static_cast<int64_t>(k_base_block + kb) * params.sfa_ld + (m_base + row_base);
@@ -1251,9 +1251,9 @@ struct CollectiveMma<
         static_assert(RowVectors % 2 == 0, "split A producer expects an even row-vector count");
         if (split_a_producer) {
           constexpr int SplitRowVectors = RowVectors / 2;
-          for (int idx = lane; idx < SplitRowVectors * TileK; idx += 32) {
-            int row_vec = (idx / TileK) * 2;
-            int kk = idx - (idx / TileK) * TileK;
+          for (int idx = lane; idx < TileK * SplitRowVectors; idx += 32) {
+            int kk = idx / SplitRowVectors;
+            int row_vec = (idx - kk * SplitRowVectors) * 2;
             int row_base = row_vec * VecBytes;
             int64_t payload_offset =
                 static_cast<int64_t>(k_base + kk) * params.a_data_ld + (m_base + row_base);
@@ -1261,9 +1261,9 @@ struct CollectiveMma<
             store_m_contiguous(row_base, kk, chunk);
           }
         } else {
-          for (int idx = lane; idx < RowVectors * TileK; idx += 32) {
-            int row_vec = idx / TileK;
-            int kk = idx - row_vec * TileK;
+          for (int idx = lane; idx < TileK * RowVectors; idx += 32) {
+            int kk = idx / RowVectors;
+            int row_vec = idx - kk * RowVectors;
             int row_base = row_vec * VecBytes;
             int64_t payload_offset =
                 static_cast<int64_t>(k_base + kk) * params.a_data_ld + (m_base + row_base);
@@ -1402,10 +1402,10 @@ struct CollectiveMma<
         }
       };
 
-      for (int idx = lane; idx < SplitRowVectors * KBlocks; idx += 32) {
-        int split_row_vec = idx / KBlocks;
+      for (int idx = lane; idx < KBlocks * SplitRowVectors; idx += 32) {
+        int kb = idx / SplitRowVectors;
+        int split_row_vec = idx - kb * SplitRowVectors;
         int row_vec = split_row_vec * 2 + 1;
-        int kb = idx - split_row_vec * KBlocks;
         int row_base = row_vec * 16;
         int64_t scale_offset =
             static_cast<int64_t>(k_base_block + kb) * params.sfa_ld + (m_base + row_base);
@@ -1441,10 +1441,10 @@ struct CollectiveMma<
         store_m_word(row_base, kk, 12, chunk.w);
       };
 
-      for (int idx = lane; idx < SplitRowVectors * TileK; idx += 32) {
-        int split_row_vec = idx / TileK;
+      for (int idx = lane; idx < TileK * SplitRowVectors; idx += 32) {
+        int kk = idx / SplitRowVectors;
+        int split_row_vec = idx - kk * SplitRowVectors;
         int row_vec = split_row_vec * 2 + 1;
-        int kk = idx - split_row_vec * TileK;
         int row_base = row_vec * VecBytes;
         int64_t payload_offset =
             static_cast<int64_t>(k_base + kk) * params.a_data_ld + (m_base + row_base);
