@@ -40,9 +40,12 @@ def _ensure_module_spec(name: str) -> None:
     """
     try:
         mod = importlib.import_module(name)
-    except ImportError:
+    except (ImportError, FileNotFoundError, OSError):
         # Module genuinely not installed — individual tests that need it
         # will fail with a clear error. Don't mask that at collection time.
+        # Editable Transformer Engine builds can also expose Python modules
+        # before their shared libraries exist; that is equivalent for this
+        # optional eager import.
         return
 
     if getattr(mod, "__spec__", None) is None:
