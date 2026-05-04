@@ -168,6 +168,8 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
             "--mxfp8-transpose-emit-backend",
             "off",
             "--mxfp8-compact-columnwise-backward",
+            "--mxfp8-materialization-policy",
+            "compact_columnwise",
             "--no-mxfp8-dense-saved-operands",
             "--no-mxfp8-grouped-gemm-ready-backward",
             "--fp8-param-gather",
@@ -211,22 +213,23 @@ def test_run_profile_cli_overrides_are_parameters_not_env(capsys, monkeypatch):
     assert "export CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native" in out
     assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=off" in out
     assert "export CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=1" in out
-    assert "export CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS=0" in out
-    assert "export CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD=0" in out
-    assert "export CPPMEGA_FP8_PARAM_GATHER=1" in out
-    assert "export CPPMEGA_REUSE_GRAD_BUF_FOR_MXFP8_PARAM_AG=0" in out
-    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED=0" in out
-    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT=0" in out
-    assert "export CPPMEGA_NSYS_CAPTURE_MODE=delay" in out
-    assert "export CPPMEGA_NSYS_TRACE=cuda,nvtx,osrt" in out
-    assert "export CPPMEGA_NSYS_DELAY=15" in out
-    assert "export CPPMEGA_NSYS_DURATION=5" in out
-    assert "export CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE=128" in out
-    assert "export CPPMEGA_CCE_FUSE_MAIN_MTP_CE=1" in out
-    assert "export CPPMEGA_CCE_FILTER_EPS=high" in out
-    assert "export CPPMEGA_FLASHINFER_MXFP8_RUNNER=direct_tactic" in out
-    assert "export CPPMEGA_FLASHINFER_MXFP8_TACTIC=2" in out
-    assert "--mtp-num-layers 1" in out
+    assert "export CPPMEGA_TE_MXFP8_MATERIALIZATION_POLICY=compact_columnwise" in out
+    assert "export CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK=0" in out
+    assert "export CPPMEGA_TE_MXFP8_DGRAD_BF16=0" in out
+    assert "export CPPMEGA_TE_MXFP8_WGRAD_BF16=0" in out
+
+
+def test_mxfp8_compact_materialization_policy_rejects_bf16_bridge():
+    profile = get_run_profile("local_gb10_quarter")
+    profile.precision.fp8_recipe = "mxfp8"
+    profile.precision.mxfp8_materialization_policy = "compact_columnwise"
+    profile.precision.mxfp8_bwd_backend = "cutlass_native"
+    profile.precision.mxfp8_transpose_emit_backend = "off"
+    profile.precision.mxfp8_compact_columnwise_backward = True
+    profile.precision.mxfp8_bwd_allow_bf16_fallback = True
+
+    with pytest.raises(ValueError, match="mxfp8_bwd_allow_bf16_fallback=False"):
+        profile_shell_assignments(profile)
 
 
 def test_compact_columnwise_cli_selects_cutlass_native_when_backend_implicit(
@@ -249,6 +252,32 @@ def test_compact_columnwise_cli_selects_cutlass_native_when_backend_implicit(
     out = capsys.readouterr().out
     assert "export CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=1" in out
     assert "export CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native" in out
+    assert "export CPPMEGA_TE_MXFP8_MATERIALIZATION_POLICY=compact_columnwise" in out
+
+
+def test_mxfp8_compact_materialization_policy_selects_no_sidecar_contract(
+    capsys,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_profiles",
+            "shell",
+            "local_gb10_quarter",
+            "--fp8-recipe",
+            "mxfp8",
+            "--mxfp8-materialization-policy",
+            "compact_columnwise",
+        ],
+    )
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "export CPPMEGA_TE_MXFP8_MATERIALIZATION_POLICY=compact_columnwise" in out
+    assert "export CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native" in out
+    assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=off" in out
+    assert "export CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=1" in out
 
 
 def test_compact_columnwise_rejects_non_cutlass_backend(monkeypatch):

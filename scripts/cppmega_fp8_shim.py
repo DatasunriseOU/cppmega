@@ -315,6 +315,33 @@ _te_mxfp8_grouped_direct_backward = os.environ.get(
 _te_mxfp8_grouped_gemm_ready_backward = os.environ.get(
     "CPPMEGA_TE_MXFP8_GROUPED_GEMM_READY_BACKWARD", "1"
 ) == "1"
+_te_mxfp8_materialization_policy = os.environ.get(
+    "CPPMEGA_TE_MXFP8_MATERIALIZATION_POLICY", "materialized_transpose"
+).lower()
+if _te_mxfp8_materialization_policy not in (
+    "materialized_transpose",
+    "compact_columnwise",
+):
+    raise RuntimeError(
+        "Unsupported CPPMEGA_TE_MXFP8_MATERIALIZATION_POLICY="
+        f"{_te_mxfp8_materialization_policy!r}; expected materialized_transpose "
+        "or compact_columnwise"
+    )
+_te_mxfp8_no_sidecar_contract = _te_mxfp8_materialization_policy == "compact_columnwise"
+if _te_mxfp8_no_sidecar_contract and (
+    _te_mxfp8_bwd_backend != "cutlass_native"
+    or _te_mxfp8_transpose_emit_backend != "off"
+    or not _te_mxfp8_compact_columnwise_backward
+    or _te_mxfp8_dgrad_bf16
+    or _te_mxfp8_wgrad_bf16
+):
+    raise RuntimeError(
+        "CPPMEGA_TE_MXFP8_MATERIALIZATION_POLICY=compact_columnwise requires "
+        "CPPMEGA_TE_MXFP8_BWD_BACKEND=cutlass_native, "
+        "CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=off, and "
+        "CPPMEGA_TE_MXFP8_COMPACT_COLUMNWISE_BACKWARD=1, with "
+        "CPPMEGA_TE_MXFP8_DGRAD_BF16=0 and CPPMEGA_TE_MXFP8_WGRAD_BF16=0"
+    )
 _te_mxfp8_bwd_allow_bf16_fallback = os.environ.get(
     "CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK",
     "1"
@@ -325,6 +352,12 @@ _te_mxfp8_bwd_allow_bf16_fallback = os.environ.get(
     )
     else "0",
 ) == "1"
+if _te_mxfp8_no_sidecar_contract and _te_mxfp8_bwd_allow_bf16_fallback:
+    raise RuntimeError(
+        "CPPMEGA_TE_MXFP8_MATERIALIZATION_POLICY=compact_columnwise forbids "
+        "CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK=1; the selected backend must "
+        "consume compact MXFP8 backward operands directly."
+    )
 _te_mxfp8_bwd_debug = os.environ.get("CPPMEGA_TE_MXFP8_BWD_DEBUG", "0") == "1"
 _te_blockscaled_dequantized_backward = (
     _te_mxfp8_dgrad_bf16
@@ -885,6 +918,8 @@ if (
             _force: bool = False,
             _track: bool = True,
         ):
+            if _te_mxfp8_no_sidecar_contract:
+                return _out
             if not (
                 _te_mxfp8_bwd_tn_adapter
                 and _te_mxfp8_transpose_emit_backend in ("auto", "te")
@@ -1139,6 +1174,17 @@ if (
         def _cppmega_mxfp8_colwise_as_rowwise_transpose(_x, *, _ignore_saved=False):
             if not _cppmega_is_mxfp8_tensor(_x):
                 raise TypeError(f"expected MXFP8 tensor, got {type(_x).__name__}")
+            if _te_mxfp8_no_sidecar_contract:
+                _cppmega_record_bwd_stat(
+                    "mxfp8_tn_adapter_missing_sidecar_strict",
+                    "compact_columnwise_forbids_colwise_as_rowwise_transpose",
+                )
+                raise ValueError(
+                    "MXFP8 compact-columnwise materialization policy forbids "
+                    "rowwise-transpose sidecars and copy-transpose fallback; "
+                    "the selected backward backend must consume compact operands "
+                    f"directly for {_cppmega_mxfp8_debug_desc(_x)}"
+                )
             if not _ignore_saved and (
                 getattr(_x, "_te_rowwise_transpose_for_backward_operand", False)
                 or getattr(_x, "_cppmega_mxfp8_rowwise_transpose_operand", False)
@@ -1152,9 +1198,12 @@ if (
                 _cppmega_record_bwd_stat("mxfp8_tn_adapter_te_emit")
                 return _sidecar
             _strict_missing_sidecar = (
-                _te_mxfp8_transpose_emit_backend == "te"
-                and _te_mxfp8_transpose_emit_strict
-                and not bool(getattr(_x, "_is_param", False))
+                _te_mxfp8_no_sidecar_contract
+                or (
+                    _te_mxfp8_transpose_emit_backend == "te"
+                    and _te_mxfp8_transpose_emit_strict
+                    and not bool(getattr(_x, "_is_param", False))
+                )
             )
             # Primary MXFP8 parameters do not pass through the BF16 quantizer,
             # so they have no TE-emitted transpose sidecar.  Until the native
@@ -1183,13 +1232,21 @@ if (
                 raise ValueError("MXFP8 TN adapter requires matrix-like columnwise data")
             if _scale.dim() != 2:
                 raise ValueError("MXFP8 TN adapter requires 2D compact columnwise scales")
-            if _strict_missing_sidecar and _te_mxfp8_dense_saved_operands:
+            if _strict_missing_sidecar and (
+                _te_mxfp8_dense_saved_operands or _te_mxfp8_no_sidecar_contract
+            ):
                 _cppmega_record_bwd_stat(
                     "mxfp8_tn_adapter_missing_sidecar_strict",
-                    "missing_gemm_ready_dense_transpose",
+                    "compact_columnwise_forbids_transpose_materialization"
+                    if _te_mxfp8_no_sidecar_contract
+                    else "missing_gemm_ready_dense_transpose",
                 )
                 raise ValueError(
-                    "MXFP8 dense saved operands require a GEMM-ready rowwise "
+                    "MXFP8 compact-columnwise materialization policy forbids "
+                    "GEMM-ready transpose sidecars and copy-transpose fallback; "
+                    f"backend must consume compact operands directly for {_cppmega_mxfp8_debug_desc(_x)}"
+                    if _te_mxfp8_no_sidecar_contract
+                    else "MXFP8 dense saved operands require a GEMM-ready rowwise "
                     "transpose sidecar/operand; refusing the copy-transpose "
                     f"fallback for {_cppmega_mxfp8_debug_desc(_x)}"
                 )
@@ -1521,7 +1578,13 @@ if (
                     _dy,
                     **_cppmega_flashinfer_kwargs(_kwargs),
                 )
-            except _compact_unsupported:
+            except _compact_unsupported as _compact_exc:
+                if _te_mxfp8_no_sidecar_contract:
+                    _cppmega_record_bwd_stat(
+                        "mxfp8_tn_adapter_missing_sidecar_strict",
+                        f"flashinfer_dgrad_compact_unsupported:{_compact_exc}",
+                    )
+                    raise
                 _weight_t = _cppmega_mxfp8_colwise_as_rowwise_transpose(_weight)
                 _result = _flashinfer.dgrad_nn_gemm(
                     _weight_t,
@@ -1566,7 +1629,13 @@ if (
                     _dy,
                     **_cppmega_flashinfer_kwargs(_kwargs),
                 )
-            except _compact_unsupported:
+            except _compact_unsupported as _compact_exc:
+                if _te_mxfp8_no_sidecar_contract:
+                    _cppmega_record_bwd_stat(
+                        "mxfp8_tn_adapter_missing_sidecar_strict",
+                        f"flashinfer_wgrad_compact_unsupported:{_compact_exc}",
+                    )
+                    raise
                 _x_t = _cppmega_mxfp8_colwise_as_rowwise_transpose(_x)
                 _dy_t = _cppmega_mxfp8_colwise_as_rowwise_transpose(_dy)
                 _x_t_shape = _cppmega_mxfp8_rowwise_2d_shape(_x_t)

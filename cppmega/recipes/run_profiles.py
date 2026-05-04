@@ -28,6 +28,7 @@ Mxfp8BackwardBackend = Literal["te_tn_adapter", "flashinfer_cutlass", "cutlass_n
 Mxfp8TransposeEmitBackend = Literal["auto", "te", "off"]
 Mxfp8CutlassScaleBackend = Literal["compact", "prepack", "swizzled"]
 Mxfp8FlashinferRunner = Literal["mm_mxfp8", "direct_tactic"]
+Mxfp8MaterializationPolicy = Literal["materialized_transpose", "compact_columnwise"]
 ParamStorage = Literal["auto", "bf16", "mxfp8"]
 MuonNsCarrier = Literal["bf16", "mxfp8_probe"]
 CceFilterEps = Literal["none", "auto", "high"]
@@ -153,6 +154,13 @@ class PrecisionProfile:
     # that layer and is only for shape/tactic probes when nsys shows overhead.
     mxfp8_flashinfer_runner: Mxfp8FlashinferRunner = "mm_mxfp8"
     mxfp8_flashinfer_tactic: int = 0
+    # Backward operand storage contract. ``materialized_transpose`` is the
+    # measured GB10 default today: TE emits GEMM-ready transposed MXFP8 operands
+    # for the TN adapter. ``compact_columnwise`` is the acceptance/no-sidecar
+    # contract: TE Linear/autograd saves compact MXFP8 operands only and the
+    # backward backend must consume them directly, with no BF16 saved activation
+    # and no x.T/dy.T/weight.T transpose materialization fallback.
+    mxfp8_materialization_policy: Mxfp8MaterializationPolicy = "materialized_transpose"
     # Megatron's MXFP8 param-gather path requires distributed optimizer/FSDP.
     # Keep it as an explicit profile choice so single-GB10 local runs do not
     # accidentally enable an incompatible distributed-param contract.
@@ -505,6 +513,34 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
             "mxfp8_cutlass_scale_backend='swizzled' is incompatible with "
             "mxfp8_compact_columnwise_backward"
         )
+    if profile.precision.fp8_recipe == "mxfp8":
+        _policy = profile.precision.mxfp8_materialization_policy
+        if _policy == "compact_columnwise":
+            if profile.precision.mxfp8_bwd_backend != "cutlass_native":
+                raise ValueError(
+                    "mxfp8_materialization_policy='compact_columnwise' requires "
+                    "mxfp8_bwd_backend='cutlass_native'"
+                )
+            if profile.precision.mxfp8_transpose_emit_backend != "off":
+                raise ValueError(
+                    "mxfp8_materialization_policy='compact_columnwise' requires "
+                    "mxfp8_transpose_emit_backend='off'"
+                )
+            if not profile.precision.mxfp8_compact_columnwise_backward:
+                raise ValueError(
+                    "mxfp8_materialization_policy='compact_columnwise' requires "
+                    "mxfp8_compact_columnwise_backward=True"
+                )
+            if profile.precision.mxfp8_bwd_allow_bf16_fallback:
+                raise ValueError(
+                    "mxfp8_materialization_policy='compact_columnwise' requires "
+                    "mxfp8_bwd_allow_bf16_fallback=False"
+                )
+            if profile.precision.mxfp8_dgrad_bf16 or profile.precision.mxfp8_wgrad_bf16:
+                raise ValueError(
+                    "mxfp8_materialization_policy='compact_columnwise' requires "
+                    "mxfp8_dgrad_bf16=False and mxfp8_wgrad_bf16=False"
+                )
 
     env: dict[str, str] = {
         "CPPMEGA_RUN_PROFILE": profile.name,
@@ -667,6 +703,9 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                 "CPPMEGA_FLASHINFER_MXFP8_TACTIC": str(
                     profile.precision.mxfp8_flashinfer_tactic
                 ),
+                "CPPMEGA_TE_MXFP8_MATERIALIZATION_POLICY": (
+                    profile.precision.mxfp8_materialization_policy
+                ),
                 "CPPMEGA_FP8_PARAM_GATHER": _bool(profile.precision.fp8_param_gather),
                 "CPPMEGA_REUSE_GRAD_BUF_FOR_MXFP8_PARAM_AG": _bool(
                     profile.precision.reuse_grad_buf_for_mxfp8_param_ag
@@ -769,6 +808,15 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
                     "--mxfp8-compact-columnwise-backward requires "
                     "--mxfp8-bwd-backend cutlass_native"
                 )
+            if args.mxfp8_materialization_policy is None:
+                profile.precision.mxfp8_materialization_policy = "compact_columnwise"
+            if args.mxfp8_transpose_emit_backend is None:
+                profile.precision.mxfp8_transpose_emit_backend = "off"
+            elif args.mxfp8_transpose_emit_backend != "off":
+                raise ValueError(
+                    "--mxfp8-compact-columnwise-backward requires "
+                    "--mxfp8-transpose-emit-backend off"
+                )
     if args.mxfp8_dense_saved_operands is not None:
         profile.precision.mxfp8_dense_saved_operands = args.mxfp8_dense_saved_operands
     if args.mxfp8_grouped_direct_backward is not None:
@@ -785,6 +833,24 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         if args.mxfp8_flashinfer_tactic < 0:
             raise ValueError("--mxfp8-flashinfer-tactic must be non-negative")
         profile.precision.mxfp8_flashinfer_tactic = args.mxfp8_flashinfer_tactic
+    if args.mxfp8_materialization_policy is not None:
+        profile.precision.mxfp8_materialization_policy = args.mxfp8_materialization_policy
+        if args.mxfp8_materialization_policy == "compact_columnwise":
+            if args.mxfp8_bwd_backend is None:
+                profile.precision.mxfp8_bwd_backend = "cutlass_native"
+            elif args.mxfp8_bwd_backend != "cutlass_native":
+                raise ValueError(
+                    "--mxfp8-materialization-policy compact_columnwise requires "
+                    "--mxfp8-bwd-backend cutlass_native"
+                )
+            if args.mxfp8_transpose_emit_backend is None:
+                profile.precision.mxfp8_transpose_emit_backend = "off"
+            elif args.mxfp8_transpose_emit_backend != "off":
+                raise ValueError(
+                    "--mxfp8-materialization-policy compact_columnwise requires "
+                    "--mxfp8-transpose-emit-backend off"
+                )
+            profile.precision.mxfp8_compact_columnwise_backward = True
     if args.fp8_param_gather is not None:
         profile.precision.fp8_param_gather = args.fp8_param_gather
     if args.reuse_grad_buf_for_mxfp8_param_ag is not None:
@@ -1080,6 +1146,15 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=None,
         help="CUTLASS direct runner tactic for explicit MXFP8 shape probes.",
+    )
+    parser.add_argument(
+        "--mxfp8-materialization-policy",
+        choices=("materialized_transpose", "compact_columnwise"),
+        default=None,
+        help=(
+            "MXFP8 Linear backward operand storage contract. compact_columnwise "
+            "is the no-sidecar acceptance path and forbids transpose materialization."
+        ),
     )
     parser.add_argument("--optimizer", default=None)
     parser.add_argument("--param-storage", choices=("auto", "bf16", "mxfp8"), default=None)
