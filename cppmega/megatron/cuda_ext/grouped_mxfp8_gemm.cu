@@ -185,6 +185,53 @@ __global__ void dgrad_nn_ptrs_kernel(
   out[idx] = __float2bfloat16_rn(result);
 }
 
+__global__ void dgrad_nn_ptrs_by_expert_kernel(
+    uint64_t const* __restrict__ dy_ptrs,
+    uint64_t const* __restrict__ sf_dy_ptrs,
+    uint64_t const* __restrict__ weight_ptrs,
+    uint64_t const* __restrict__ sf_weight_ptrs,
+    int64_t const* __restrict__ expert_offsets,
+    __nv_bfloat16* __restrict__ out,
+    int64_t n,
+    int64_t k,
+    int64_t n_blocks,
+    float alpha,
+    float beta) {
+  int expert = static_cast<int>(blockIdx.z);
+  int64_t start = expert_offsets[expert];
+  int64_t end = expert_offsets[expert + 1];
+  int64_t local_outputs = (end - start) * k;
+  int64_t local_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (local_idx >= local_outputs) {
+    return;
+  }
+
+  int64_t local_row = local_idx / k;
+  int64_t col = local_idx - local_row * k;
+  int64_t global_row = start + local_row;
+
+  auto const* dy = reinterpret_cast<uint8_t const*>(dy_ptrs[expert]);
+  auto const* sf_dy = reinterpret_cast<uint8_t const*>(sf_dy_ptrs[expert]);
+  auto const* weight = reinterpret_cast<uint8_t const*>(weight_ptrs[expert]);
+  auto const* sf_weight = reinterpret_cast<uint8_t const*>(sf_weight_ptrs[expert]);
+
+  float accum = 0.0f;
+  for (int64_t red = 0; red < n; ++red) {
+    float lhs = e4m3fn_to_float(dy[local_row * n + red]) *
+        ue8m0_to_float(sf_dy[local_row * n_blocks + red / kBlock]);
+    float rhs = e4m3fn_to_float(weight[red * k + col]) *
+        ue8m0_to_float(sf_weight[(red / kBlock) * k + col]);
+    accum += lhs * rhs;
+  }
+
+  int64_t out_idx = global_row * k + col;
+  float result = alpha * accum;
+  if (beta != 0.0f) {
+    result += beta * __bfloat162float(out[out_idx]);
+  }
+  out[out_idx] = __float2bfloat16_rn(result);
+}
+
 __global__ void wgrad_nt_ptrs_kernel(
     uint64_t const* __restrict__ dy_ptrs,
     uint64_t const* __restrict__ sf_dy_ptrs,
@@ -455,7 +502,8 @@ at::Tensor grouped_mxfp8_dgrad_nn_ptrs_cuda(
     double beta,
     int64_t total_rows,
     int64_t n,
-    int64_t k) {
+    int64_t k,
+    int64_t max_rows_per_expert) {
   validate_ptrs(dy_ptrs, "dy_ptrs");
   validate_ptrs(sf_dy_ptrs, "sf_dy_ptrs");
   validate_ptrs(weight_ptrs, "weight_ptrs");
@@ -466,6 +514,8 @@ at::Tensor grouped_mxfp8_dgrad_nn_ptrs_cuda(
   validate_device_match(dy_ptrs, sf_weight_ptrs, "sf_weight_ptrs");
   validate_device_match(dy_ptrs, expert_offsets, "expert_offsets");
   validate_common_shape(total_rows, n, k);
+  TORCH_CHECK(max_rows_per_expert > 0, "max_rows_per_expert must be positive");
+  TORCH_CHECK(max_rows_per_expert <= total_rows, "max_rows_per_expert cannot exceed total_rows");
   TORCH_CHECK(use_out || beta == 0.0, "nonzero beta requires out");
   if (use_out) {
     CHECK_CUDA(out);
@@ -498,6 +548,68 @@ at::Tensor grouped_mxfp8_dgrad_nn_ptrs_cuda(
       static_cast<float>(alpha),
       static_cast<float>(beta),
       total_outputs);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  (void)accumulate;
+  return result;
+}
+
+at::Tensor grouped_mxfp8_dgrad_nn_ptrs_by_expert_cuda(
+    at::Tensor dy_ptrs,
+    at::Tensor sf_dy_ptrs,
+    at::Tensor weight_ptrs,
+    at::Tensor sf_weight_ptrs,
+    at::Tensor expert_offsets,
+    at::Tensor out,
+    bool use_out,
+    bool accumulate,
+    double alpha,
+    double beta,
+    int64_t total_rows,
+    int64_t n,
+    int64_t k,
+    int64_t max_rows_per_expert) {
+  validate_ptrs(dy_ptrs, "dy_ptrs");
+  validate_ptrs(sf_dy_ptrs, "sf_dy_ptrs");
+  validate_ptrs(weight_ptrs, "weight_ptrs");
+  validate_ptrs(sf_weight_ptrs, "sf_weight_ptrs");
+  validate_offsets(expert_offsets);
+  validate_device_match(dy_ptrs, sf_dy_ptrs, "sf_dy_ptrs");
+  validate_device_match(dy_ptrs, weight_ptrs, "weight_ptrs");
+  validate_device_match(dy_ptrs, sf_weight_ptrs, "sf_weight_ptrs");
+  validate_device_match(dy_ptrs, expert_offsets, "expert_offsets");
+  validate_common_shape(total_rows, n, k);
+  TORCH_CHECK(max_rows_per_expert > 0, "max_rows_per_expert must be positive");
+  TORCH_CHECK(max_rows_per_expert <= total_rows, "max_rows_per_expert must not exceed total_rows");
+  TORCH_CHECK(use_out || beta == 0.0, "nonzero beta requires out");
+  if (use_out) {
+    CHECK_CUDA(out);
+    CHECK_CONTIGUOUS(out);
+    CHECK_BF16(out);
+    validate_device_match(dy_ptrs, out, "out");
+    TORCH_CHECK(out.sizes() == at::IntArrayRef({total_rows, k}), "out must have shape [T,K]");
+  }
+
+  c10::cuda::CUDAGuard device_guard(dy_ptrs.device());
+  at::Tensor result = use_out
+      ? out
+      : at::empty({total_rows, k}, at::TensorOptions().device(dy_ptrs.device()).dtype(at::kBFloat16));
+
+  constexpr int threads = 256;
+  int blocks_x = static_cast<int>((max_rows_per_expert * k + threads - 1) / threads);
+  dim3 grid(blocks_x, 1, kNumExperts);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dgrad_nn_ptrs_by_expert_kernel<<<grid, threads, 0, stream>>>(
+      reinterpret_cast<uint64_t const*>(dy_ptrs.data_ptr<int64_t>()),
+      reinterpret_cast<uint64_t const*>(sf_dy_ptrs.data_ptr<int64_t>()),
+      reinterpret_cast<uint64_t const*>(weight_ptrs.data_ptr<int64_t>()),
+      reinterpret_cast<uint64_t const*>(sf_weight_ptrs.data_ptr<int64_t>()),
+      expert_offsets.data_ptr<int64_t>(),
+      reinterpret_cast<__nv_bfloat16*>(result.data_ptr<at::BFloat16>()),
+      n,
+      k,
+      ceil_div(n, kBlock),
+      static_cast<float>(alpha),
+      static_cast<float>(beta));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   (void)accumulate;
   return result;

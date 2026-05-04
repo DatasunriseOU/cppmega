@@ -39,7 +39,24 @@ at::Tensor grouped_mxfp8_dgrad_nn_ptrs_cuda(
     double beta,
     int64_t total_rows,
     int64_t n,
-    int64_t k);
+    int64_t k,
+    int64_t max_rows_per_expert);
+
+at::Tensor grouped_mxfp8_dgrad_nn_ptrs_by_expert_cuda(
+    at::Tensor dy_ptrs,
+    at::Tensor sf_dy_ptrs,
+    at::Tensor weight_ptrs,
+    at::Tensor sf_weight_ptrs,
+    at::Tensor expert_offsets,
+    at::Tensor out,
+    bool use_out,
+    bool accumulate,
+    double alpha,
+    double beta,
+    int64_t total_rows,
+    int64_t n,
+    int64_t k,
+    int64_t max_rows_per_expert);
 
 void grouped_mxfp8_wgrad_nt_ptrs_cuda(
     at::Tensor dy_ptrs,
@@ -68,6 +85,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "dgrad_nn_ptrs",
       &grouped_mxfp8_dgrad_nn_ptrs_cuda,
       "Grouped MXFP8 dgrad NN direct compact per-expert pointer kernel");
+  m.def(
+      "dgrad_nn_ptrs_by_expert",
+      &grouped_mxfp8_dgrad_nn_ptrs_by_expert_cuda,
+      "Grouped MXFP8 dgrad NN direct compact per-expert grid kernel");
   m.def(
       "wgrad_nt_ptrs",
       &grouped_mxfp8_wgrad_nt_ptrs_cuda,

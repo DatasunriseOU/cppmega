@@ -1,9 +1,12 @@
 """Small runtime patches for Megatron MoE token movement.
 
-The local GB10 lane uses the Megatron alltoall dispatcher with TP=EP=1.  In
-that topology the dispatcher still asks Transformer Engine to sort local expert
+The local GB10 lane may use the Megatron alltoall dispatcher with TP=EP=1.  In
+some topologies the dispatcher asks Transformer Engine to sort local expert
 chunks even though the chunk permutation is identity.  Skipping that no-op sort
-removes two fused sort launches per MoE layer without changing token order.
+removes two fused sort launches per MoE layer, but it is only valid when the
+dispatcher has already expanded the token/expert splits to match the grouped
+linear input.  Keep the optimization opt-in until every routed-expert path has
+that contract.
 """
 
 from __future__ import annotations
@@ -54,14 +57,25 @@ def is_identity_permutation(sorted_idxs: torch.Tensor) -> bool:
     return result
 
 
+def _split_sizes_match_input(input: torch.Tensor, split_sizes: torch.Tensor) -> bool:
+    """Return True when a no-op chunk reorder can preserve the input as-is."""
+
+    if split_sizes.dim() != 1:
+        return False
+    if split_sizes.is_cuda and torch.cuda.is_current_stream_capturing():
+        return False
+    total = int(split_sizes.detach().sum().cpu().item())
+    return total == int(input.shape[0])
+
+
 def apply_moe_dispatcher_identity_sort_patch(*, force: bool = False) -> bool:
     """Patch Megatron's MoE chunk sorter to skip identity permutations.
 
-    Returns True when the patch is installed.  The patch is enabled by default;
-    set ``CPPMEGA_MOE_SKIP_IDENTITY_CHUNK_SORT=0`` to disable it for A/B runs.
+    Returns True when the patch is installed.  The patch is disabled by default;
+    set ``CPPMEGA_MOE_SKIP_IDENTITY_CHUNK_SORT=1`` to enable it for A/B runs.
     """
 
-    if os.environ.get(_ENV_FLAG, "1") != "1" and not force:
+    if os.environ.get(_ENV_FLAG, "0") != "1" and not force:
         return False
 
     try:
@@ -81,6 +95,7 @@ def apply_moe_dispatcher_identity_sort_patch(*, force: bool = False) -> bool:
         if (
             input.is_contiguous()
             and (probs is None or probs.is_contiguous())
+            and _split_sizes_match_input(input, split_sizes)
             and is_identity_permutation(sorted_idxs)
         ):
             return input, probs

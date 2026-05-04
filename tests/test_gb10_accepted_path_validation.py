@@ -109,6 +109,53 @@ def test_probe_json_parser_accepts_cutlass_native_backend():
     assert validate_probe_report(report) == []
 
 
+def test_probe_json_parser_rejects_cutlass_native_sidecar_peak():
+    stdout = """
+{
+  "results": [
+    {"name": "mxfp8_dgrad_shim_NN_to_TN", "status": "pass"},
+    {"name": "mxfp8_wgrad_shim_NT_to_TN", "status": "pass"}
+  ],
+	  "shim_stats": {
+	    "mxfp8_tn_adapter_dgrad": 0,
+	    "mxfp8_tn_adapter_wgrad": 0,
+            "mxfp8_cutlass_native_dgrad": 1,
+            "mxfp8_cutlass_native_wgrad": 1,
+            "mxfp8_tn_adapter_te_emit": 0,
+            "mxfp8_tn_adapter_te_emit_deferred": 0,
+            "mxfp8_tn_adapter_saved_transpose_operand": 0,
+            "mxfp8_tn_adapter_saved_transpose_rejected": 0,
+            "mxfp8_tn_adapter_copy_transpose": 0,
+	    "mxfp8_tn_adapter_missing_sidecar_copy": 0,
+	    "mxfp8_norm_quantize_sidecar_bridge": 0,
+	    "bf16_fallback_dgrad": 0,
+	    "bf16_fallback_wgrad": 0,
+	    "native_passthrough_dgrad": 0,
+	    "native_passthrough_wgrad": 0,
+	    "mxfp8_tn_sidecar_registry_size": 0,
+	    "mxfp8_tn_sidecar_registry_persistent": 0,
+	    "mxfp8_tn_sidecar_registry_peak": 1,
+	    "mxfp8_tn_sidecar_registry_current_bytes": 0,
+	    "mxfp8_tn_sidecar_registry_peak_bytes": 65536,
+	    "mxfp8_tn_sidecar_tracked_attr_current_bytes": 0,
+	    "mxfp8_tn_sidecar_tracked_attr_peak_bytes": 65536,
+	    "mxfp8_tn_sidecar_attr_attached": 1,
+	    "mxfp8_tn_sidecar_attr_cleared": 1,
+	    "mxfp8_tn_sidecar_consumed": 1,
+	    "mxfp8_tn_sidecar_attr_attached_bytes": 65536,
+	    "fallback_reasons": {}
+	  }
+	}
+"""
+    report = extract_first_json_object(stdout)
+
+    errors = validate_probe_report(report)
+
+    assert "mxfp8_tn_sidecar_registry_peak=1; expected 0 for compact_direct_v1" in errors
+    assert "mxfp8_tn_sidecar_registry_peak_bytes=65536; expected 0 for compact_direct_v1" in errors
+    assert "mxfp8_tn_sidecar_attr_attached=1; expected 0 for compact_direct_v1" in errors
+
+
 def test_probe_json_parser_accepts_flashinfer_cutlass_backend():
     stdout = """
 {

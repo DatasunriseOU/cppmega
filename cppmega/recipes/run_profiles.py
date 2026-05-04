@@ -27,6 +27,13 @@ Fp8Recipe = Literal["off", "tensorwise", "mxfp8"]
 Mxfp8BackwardBackend = Literal["te_tn_adapter", "flashinfer_cutlass", "cutlass_native"]
 Mxfp8TransposeEmitBackend = Literal["auto", "te", "off"]
 Mxfp8CutlassScaleBackend = Literal["compact", "prepack", "swizzled"]
+Mxfp8GroupedQuantizeProducer = Literal["single_output", "multi_output"]
+Mxfp8LinearKernelContract = Literal[
+    "legacy",
+    "gemm_ready_v1",
+    "gemm_ready_v1_dense_only",
+    "compact_direct_v1",
+]
 Mxfp8FlashinferRunner = Literal["mm_mxfp8", "direct_tactic"]
 ParamStorage = Literal["auto", "bf16", "mxfp8"]
 MuonNsCarrier = Literal["bf16", "mxfp8_probe"]
@@ -35,6 +42,8 @@ SparseMlaMode = Literal["tilelang", "gather_scatter", "pytorch"]
 MoeDispatcher = Literal["flex", "alltoall", "allgather"]
 MoeFlexBackend = Literal["deepep", "hybridep"]
 NsysCaptureMode = Literal["full", "delay", "cudaProfilerApi"]
+NsysLaunchMode = Literal["external_torchrun", "rank0_wrapper"]
+NcuTargetProcesses = Literal["all", "application-only"]
 AttentionBackend = Literal["auto", "flash", "fused", "unfused"]
 
 
@@ -68,6 +77,12 @@ class ModelProfile:
     moe_token_dispatcher_type: MoeDispatcher = "alltoall"
     moe_flex_dispatcher_backend: MoeFlexBackend = "deepep"
     moe_router_dtype: str | None = "fp32"
+    # Fused routing is a Megatron/TE fast path, but local GB10 MXFP8 runs have
+    # hit a dropless alltoall mismatch where grouped input rows are expanded by
+    # top-k while per-expert splits sum to the unexpanded token count. Keep the
+    # route in the typed profile so local correctness lanes can disable it
+    # without hidden shell edits while H200 profiles may opt back in.
+    moe_router_fusion: bool = True
     dsa_indexer_loss_coeff: float = 0.001
 
 
@@ -118,6 +133,9 @@ class PrecisionProfile:
     # config requests block-scaled TE.  They are kept here so MXFP8 probes are
     # reproducible and do not reintroduce hidden BF16 backward bridges.
     allow_te_mxfp8_sm12: bool = True
+    # TE's specialized MXFP8 cast-only quantize path is guarded by ENABLE_CAST_ONLY.
+    # Keep it typed so probes and launchers do not rely on a hidden shell knob.
+    mxfp8_te_cast_only_fast_path: bool = False
     pad_mamba_in_proj_for_mxfp8: bool = True
     mxfp8_bwd_tn_adapter: bool = True
     mxfp8_bwd_backend: Mxfp8BackwardBackend = "flashinfer_cutlass"
@@ -140,6 +158,18 @@ class PrecisionProfile:
     # This covers Linear/LayerNormLinear saved activations and backward
     # grad-output producers, avoiding the deprecated copy-transpose bridge.
     mxfp8_dense_saved_operands: bool = True
+    # Strict Linear kernel contract. legacy keeps the older fallback hooks
+    # available. gemm_ready_v1 requires producer-attached GEMM-ready or compact
+    # columnwise operands for Linear backward. gemm_ready_v1_dense_only applies
+    # that strict contract only to dense Linear and counts grouped exclusions.
+    # compact_direct_v1 is the no-materialization acceptance lane: consume
+    # compact-columnwise operands directly and forbid transpose sidecars.
+    mxfp8_linear_kernel_contract: Mxfp8LinearKernelContract = "legacy"
+    # ``single_output`` wraps TE split_quantize and emits one GEMM-ready
+    # rowwise-transposed operand per split. ``multi_output`` requires a TE C++
+    # op that emits all split outputs and their GEMM-ready operands in one
+    # launch; selecting it must fail if that op is missing.
+    mxfp8_grouped_quantize_producer: Mxfp8GroupedQuantizeProducer = "single_output"
     # Experimental MoE grouped backward mode: consumes grouped compact MXFP8
     # operands directly.  Keep this separate from dense compact-columnwise
     # because the current grouped direct kernels save memory but are slower than
@@ -247,7 +277,12 @@ class ProfilingProfile:
     # activity records.  Hardware CUDA tracing has the same failure mode here,
     # so default to software CUDA tracing and a full-process capture.
     nsys_capture_mode: NsysCaptureMode = "full"
+    # Torch distributed must be launched under Nsight Systems, not the reverse:
+    # wrapping rank 0 inside torchrun can produce valid CUDA API ranges but an
+    # empty cuda_gpu_kern_sum table.  Keep the old mode explicit for repro only.
+    nsys_launch_mode: NsysLaunchMode = "external_torchrun"
     nsys_trace: str = "cuda-sw,nvtx,osrt"
+    nsys_cuda_trace_scope: str = "process-tree"
     nsys_delay: int = 0
     # ``0`` means "collect from delay until normal process exit".  On the
     # local GB10 stack, nsys --duration can terminate the wrapped torchrun child
@@ -260,6 +295,15 @@ class ProfilingProfile:
     cuda_profile: bool = False
     cuda_profile_step_start: int = 3
     cuda_profile_step_end: int = 4
+    # Nsight Compute is a separate profiler pass.  It should consume the same
+    # Megatron cudaProfilerStart/Stop window used by ``cuda_profile`` and profile
+    # torch.distributed child processes, otherwise the root torchrun process is
+    # captured while worker kernels are missed.
+    ncu_profile: bool = False
+    ncu_set: str = "basic"
+    ncu_launch_count: int = 64
+    ncu_target_processes: NcuTargetProcesses = "all"
+    ncu_profile_from_start: bool = False
 
 
 @dataclass
@@ -355,6 +399,7 @@ class RunProfile:
             moe_token_dispatcher_type=self.model.moe_token_dispatcher_type,
             moe_flex_dispatcher_backend=self.model.moe_flex_dispatcher_backend,
             moe_router_dtype=self.model.moe_router_dtype,
+            moe_router_fusion=self.model.moe_router_fusion,
             enable_dsa=True,
             dsa_indexer_loss_coeff=self.model.dsa_indexer_loss_coeff,
         )
@@ -384,6 +429,20 @@ def _validate_cce_filter_eps(value: str) -> str:
     return normalized
 
 
+def _validate_mxfp8_linear_kernel_contract(value: str) -> Mxfp8LinearKernelContract:
+    normalized = value.strip().lower()
+    if normalized not in (
+        "legacy",
+        "gemm_ready_v1",
+        "gemm_ready_v1_dense_only",
+        "compact_direct_v1",
+    ):
+        raise ValueError(
+            "--mxfp8-linear-kernel-contract must be legacy, gemm_ready_v1, "
+            "gemm_ready_v1_dense_only, or compact_direct_v1"
+        )
+    return normalized  # type: ignore[return-value]
+
 def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProfile:
     """Fill the local GB10 NAM56R-quarter profile.
 
@@ -402,6 +461,7 @@ def set_local_gb10_quarter_profile(profile: RunProfile | None = None) -> RunProf
     # Single-GB10 has TP=EP=1, so Megatron's Flex dispatcher is invalid here.
     # Keep this in the typed profile instead of relying on a shell fallback.
     profile.model.moe_token_dispatcher_type = "alltoall"
+    profile.model.moe_router_fusion = False
     profile.precision.attention_backend = "flash"
     # GB10 MXFP8 profiler runs on 2026-04-29 showed FlashInfer/CUTLASS backward
     # spending ~878 ms/step in 68 GEMMs, while the TE TN adapter cut steady
@@ -505,6 +565,40 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
             "mxfp8_cutlass_scale_backend='swizzled' is incompatible with "
             "mxfp8_compact_columnwise_backward"
         )
+    if (
+        profile.precision.fp8_recipe == "mxfp8"
+        and profile.precision.mxfp8_linear_kernel_contract == "compact_direct_v1"
+    ):
+        if profile.precision.mxfp8_bwd_backend != "cutlass_native":
+            raise ValueError(
+                "mxfp8_linear_kernel_contract=compact_direct_v1 requires "
+                "mxfp8_bwd_backend='cutlass_native'"
+            )
+        if not profile.precision.mxfp8_compact_columnwise_backward:
+            raise ValueError(
+                "mxfp8_linear_kernel_contract=compact_direct_v1 requires "
+                "mxfp8_compact_columnwise_backward=True"
+            )
+        if profile.precision.mxfp8_dense_saved_operands:
+            raise ValueError(
+                "mxfp8_linear_kernel_contract=compact_direct_v1 requires "
+                "mxfp8_dense_saved_operands=False"
+            )
+        if profile.precision.mxfp8_transpose_emit_backend != "off":
+            raise ValueError(
+                "mxfp8_linear_kernel_contract=compact_direct_v1 requires "
+                "mxfp8_transpose_emit_backend='off'"
+            )
+        if profile.precision.mxfp8_transpose_emit_swizzled:
+            raise ValueError(
+                "mxfp8_linear_kernel_contract=compact_direct_v1 requires "
+                "mxfp8_transpose_emit_swizzled=False"
+            )
+        if profile.precision.mxfp8_transpose_emit_strict:
+            raise ValueError(
+                "mxfp8_linear_kernel_contract=compact_direct_v1 requires "
+                "mxfp8_transpose_emit_strict=False"
+            )
 
     env: dict[str, str] = {
         "CPPMEGA_RUN_PROFILE": profile.name,
@@ -593,7 +687,9 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         "CPPMEGA_TORCH_PROFILE_STEPS": str(profile.profiling.torch_profile_steps),
         "CPPMEGA_NSYS_PROFILE": _bool(profile.profiling.nsys_profile),
         "CPPMEGA_NSYS_CAPTURE_MODE": profile.profiling.nsys_capture_mode,
+        "CPPMEGA_NSYS_LAUNCH_MODE": profile.profiling.nsys_launch_mode,
         "CPPMEGA_NSYS_TRACE": profile.profiling.nsys_trace,
+        "CPPMEGA_NSYS_CUDA_TRACE_SCOPE": profile.profiling.nsys_cuda_trace_scope,
         "CPPMEGA_NSYS_DELAY": str(profile.profiling.nsys_delay),
         "CPPMEGA_NSYS_DURATION": str(profile.profiling.nsys_duration),
         "CPPMEGA_CUDA_PROFILE": _bool(profile.profiling.cuda_profile),
@@ -601,6 +697,13 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
             profile.profiling.cuda_profile_step_start
         ),
         "CPPMEGA_CUDA_PROFILE_STEP_END": str(profile.profiling.cuda_profile_step_end),
+        "CPPMEGA_NCU_PROFILE": _bool(profile.profiling.ncu_profile),
+        "CPPMEGA_NCU_SET": profile.profiling.ncu_set,
+        "CPPMEGA_NCU_LAUNCH_COUNT": str(profile.profiling.ncu_launch_count),
+        "CPPMEGA_NCU_TARGET_PROCESSES": profile.profiling.ncu_target_processes,
+        "CPPMEGA_NCU_PROFILE_FROM_START": _bool(
+            profile.profiling.ncu_profile_from_start
+        ),
         "HYBRID_LAYER_PATTERN": profile.hybrid_layer_pattern(),
         "NATIVE_ARGS": profile.native_args_fragment(),
     }
@@ -630,6 +733,7 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         env.update(
             {
                 "CPPMEGA_ALLOW_TE_MXFP8_SM12": _bool(profile.precision.allow_te_mxfp8_sm12),
+                "ENABLE_CAST_ONLY": _bool(profile.precision.mxfp8_te_cast_only_fast_path),
                 "CPPMEGA_PAD_MAMBA_IN_PROJ_FOR_MXFP8": _bool(
                     profile.precision.pad_mamba_in_proj_for_mxfp8
                 ),
@@ -654,6 +758,12 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                 ),
                 "CPPMEGA_TE_MXFP8_DENSE_SAVED_OPERANDS": _bool(
                     profile.precision.mxfp8_dense_saved_operands
+                ),
+                "CPPMEGA_TE_MXFP8_LINEAR_KERNEL_CONTRACT": (
+                    profile.precision.mxfp8_linear_kernel_contract
+                ),
+                "CPPMEGA_TE_MXFP8_GROUPED_QUANTIZE_PRODUCER": (
+                    profile.precision.mxfp8_grouped_quantize_producer
                 ),
                 "CPPMEGA_TE_MXFP8_GROUPED_DIRECT_BACKWARD": _bool(
                     profile.precision.mxfp8_grouped_direct_backward
@@ -713,6 +823,8 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.model.moe_flex_dispatcher_backend = args.moe_flex_dispatcher_backend
     if args.moe_router_dtype is not None:
         profile.model.moe_router_dtype = None if args.moe_router_dtype == "none" else args.moe_router_dtype
+    if args.moe_router_fusion is not None:
+        profile.model.moe_router_fusion = args.moe_router_fusion
     if args.dsa_indexer_loss_coeff is not None:
         profile.model.dsa_indexer_loss_coeff = args.dsa_indexer_loss_coeff
     if args.mtp_ce_kernel is not None:
@@ -726,6 +838,10 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.runtime.noconv_mamba_chunk_size = _validate_noconv_mamba_chunk_size(
             args.noconv_mamba_chunk_size
         )
+    if args.transformer_engine_source is not None:
+        profile.runtime.transformer_engine_source = args.transformer_engine_source
+    if args.flash_attention_source is not None:
+        profile.runtime.flash_attention_source = args.flash_attention_source
     if args.fp8_recipe is not None:
         profile.precision.fp8_recipe = args.fp8_recipe
         if args.fp8_recipe == "mxfp8" and args.fp8_format is None:
@@ -736,6 +852,8 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
         profile.precision.attention_backend = args.attention_backend
     if args.mxfp8_bwd_backend is not None:
         profile.precision.mxfp8_bwd_backend = args.mxfp8_bwd_backend
+    if args.mxfp8_te_cast_only_fast_path is not None:
+        profile.precision.mxfp8_te_cast_only_fast_path = args.mxfp8_te_cast_only_fast_path
     if args.mxfp8_cutlass_scale_backend is not None:
         profile.precision.mxfp8_cutlass_scale_backend = args.mxfp8_cutlass_scale_backend
         if args.mxfp8_cutlass_scale_backend == "swizzled":
@@ -762,6 +880,8 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
             args.mxfp8_compact_columnwise_backward
         )
         if args.mxfp8_compact_columnwise_backward:
+            if args.mxfp8_linear_kernel_contract is None:
+                profile.precision.mxfp8_linear_kernel_contract = "compact_direct_v1"
             if args.mxfp8_bwd_backend is None:
                 profile.precision.mxfp8_bwd_backend = "cutlass_native"
             elif args.mxfp8_bwd_backend != "cutlass_native":
@@ -769,8 +889,41 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
                     "--mxfp8-compact-columnwise-backward requires "
                     "--mxfp8-bwd-backend cutlass_native"
                 )
+            if args.mxfp8_dense_saved_operands is None:
+                profile.precision.mxfp8_dense_saved_operands = False
+            if args.mxfp8_transpose_emit_backend is None:
+                profile.precision.mxfp8_transpose_emit_backend = "off"
+            if args.mxfp8_transpose_emit_swizzled is None:
+                profile.precision.mxfp8_transpose_emit_swizzled = False
+            if args.mxfp8_transpose_emit_strict is None:
+                profile.precision.mxfp8_transpose_emit_strict = False
     if args.mxfp8_dense_saved_operands is not None:
         profile.precision.mxfp8_dense_saved_operands = args.mxfp8_dense_saved_operands
+    if args.mxfp8_linear_kernel_contract is not None:
+        profile.precision.mxfp8_linear_kernel_contract = (
+            _validate_mxfp8_linear_kernel_contract(args.mxfp8_linear_kernel_contract)
+        )
+        if profile.precision.mxfp8_linear_kernel_contract == "compact_direct_v1":
+            if args.mxfp8_bwd_backend is None:
+                profile.precision.mxfp8_bwd_backend = "cutlass_native"
+            elif args.mxfp8_bwd_backend != "cutlass_native":
+                raise ValueError(
+                    "--mxfp8-linear-kernel-contract compact_direct_v1 requires "
+                    "--mxfp8-bwd-backend cutlass_native"
+                )
+            profile.precision.mxfp8_compact_columnwise_backward = True
+            if args.mxfp8_dense_saved_operands is None:
+                profile.precision.mxfp8_dense_saved_operands = False
+            if args.mxfp8_transpose_emit_backend is None:
+                profile.precision.mxfp8_transpose_emit_backend = "off"
+            if args.mxfp8_transpose_emit_swizzled is None:
+                profile.precision.mxfp8_transpose_emit_swizzled = False
+            if args.mxfp8_transpose_emit_strict is None:
+                profile.precision.mxfp8_transpose_emit_strict = False
+    if args.mxfp8_grouped_quantize_producer is not None:
+        profile.precision.mxfp8_grouped_quantize_producer = (
+            args.mxfp8_grouped_quantize_producer
+        )
     if args.mxfp8_grouped_direct_backward is not None:
         profile.precision.mxfp8_grouped_direct_backward = (
             args.mxfp8_grouped_direct_backward
@@ -823,9 +976,15 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
     if args.nsys_capture_mode is not None:
         profile.profiling.nsys_profile = True
         profile.profiling.nsys_capture_mode = args.nsys_capture_mode
+    if args.nsys_launch_mode is not None:
+        profile.profiling.nsys_profile = True
+        profile.profiling.nsys_launch_mode = args.nsys_launch_mode
     if args.nsys_trace is not None:
         profile.profiling.nsys_profile = True
         profile.profiling.nsys_trace = args.nsys_trace
+    if args.nsys_cuda_trace_scope is not None:
+        profile.profiling.nsys_profile = True
+        profile.profiling.nsys_cuda_trace_scope = args.nsys_cuda_trace_scope
     if args.nsys_delay is not None:
         profile.profiling.nsys_profile = True
         profile.profiling.nsys_delay = args.nsys_delay
@@ -852,6 +1011,27 @@ def apply_cli_overrides(profile: RunProfile, args: argparse.Namespace) -> RunPro
             raise ValueError(
                 f"cuda_profile_step_start ({start}) must be < cuda_profile_step_end ({end})"
             )
+    if args.ncu_profile:
+        profile.profiling.ncu_profile = True
+        profile.profiling.cuda_profile = True
+    if args.ncu_set is not None:
+        profile.profiling.ncu_profile = True
+        profile.profiling.ncu_set = args.ncu_set
+        profile.profiling.cuda_profile = True
+    if args.ncu_launch_count is not None:
+        if args.ncu_launch_count < 1:
+            raise ValueError("--ncu-launch-count must be >= 1")
+        profile.profiling.ncu_profile = True
+        profile.profiling.ncu_launch_count = args.ncu_launch_count
+        profile.profiling.cuda_profile = True
+    if args.ncu_target_processes is not None:
+        profile.profiling.ncu_profile = True
+        profile.profiling.ncu_target_processes = args.ncu_target_processes
+        profile.profiling.cuda_profile = True
+    if args.ncu_profile_from_start is not None:
+        profile.profiling.ncu_profile = True
+        profile.profiling.ncu_profile_from_start = args.ncu_profile_from_start
+        profile.profiling.cuda_profile = True
     if profile.precision.fp8_recipe == "mxfp8" and profile.precision.fp8_format != "e4m3":
         raise ValueError(
             "fp8_recipe=mxfp8 requires fp8_format=e4m3 because the "
@@ -893,6 +1073,19 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         choices=("fp32", "none"),
         default=None,
     )
+    router_fusion = parser.add_mutually_exclusive_group()
+    router_fusion.add_argument(
+        "--moe-router-fusion",
+        action="store_true",
+        default=None,
+        dest="moe_router_fusion",
+    )
+    router_fusion.add_argument(
+        "--no-moe-router-fusion",
+        action="store_false",
+        default=None,
+        dest="moe_router_fusion",
+    )
     parser.add_argument("--dsa-indexer-loss-coeff", type=float, default=None)
     parser.add_argument("--mtp-ce-kernel", choices=("native", "cce", "liger", "off"), default=None)
     cce_fuse = parser.add_mutually_exclusive_group()
@@ -922,6 +1115,16 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Override the no-conv Mamba SSD scan chunk size for cppmega specs.",
     )
+    parser.add_argument(
+        "--transformer-engine-source",
+        default=None,
+        help="Override the TransformerEngine source root prepended by the typed profile.",
+    )
+    parser.add_argument(
+        "--flash-attention-source",
+        default=None,
+        help="Override the flash-attn source root prepended by the typed profile.",
+    )
     parser.add_argument("--fp8-format", choices=("hybrid", "e4m3"), default=None)
     parser.add_argument("--fp8-recipe", choices=("off", "tensorwise", "mxfp8"), default=None)
     parser.add_argument(
@@ -933,6 +1136,20 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         "--mxfp8-bwd-backend",
         choices=("te_tn_adapter", "flashinfer_cutlass", "cutlass_native"),
         default=None,
+    )
+    te_cast_only_fast_path = parser.add_mutually_exclusive_group()
+    te_cast_only_fast_path.add_argument(
+        "--mxfp8-te-cast-only-fast-path",
+        action="store_true",
+        default=None,
+        dest="mxfp8_te_cast_only_fast_path",
+        help="Enable TE's specialized MXFP8 cast-only quantize kernels.",
+    )
+    te_cast_only_fast_path.add_argument(
+        "--no-mxfp8-te-cast-only-fast-path",
+        action="store_false",
+        default=None,
+        dest="mxfp8_te_cast_only_fast_path",
     )
     parser.add_argument(
         "--mxfp8-cutlass-scale-backend",
@@ -1035,6 +1252,31 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
         default=None,
         dest="mxfp8_dense_saved_operands",
     )
+    parser.add_argument(
+        "--mxfp8-linear-kernel-contract",
+        choices=(
+            "legacy",
+            "gemm_ready_v1",
+            "gemm_ready_v1_dense_only",
+            "compact_direct_v1",
+        ),
+        default=None,
+        help=(
+            "MXFP8 Linear backward producer contract. gemm_ready_v1 requires "
+            "producer-attached GEMM-ready or compact-columnwise operands; "
+            "gemm_ready_v1_dense_only applies strict only to dense Linear; "
+            "compact_direct_v1 forbids transpose sidecars and copy materialization."
+        ),
+    )
+    parser.add_argument(
+        "--mxfp8-grouped-quantize-producer",
+        choices=("single_output", "multi_output"),
+        default=None,
+        help=(
+            "Select the grouped/MoE MXFP8 split producer. multi_output requires "
+            "a TE fused split_quantize+rowwise-transpose producer API."
+        ),
+    )
     grouped_direct_backward = parser.add_mutually_exclusive_group()
     grouped_direct_backward.add_argument(
         "--mxfp8-grouped-direct-backward",
@@ -1129,12 +1371,47 @@ def _add_common_profile_overrides(parser: argparse.ArgumentParser) -> None:
             "is kept only for external repros because it drops kernel records on GB10."
         ),
     )
+    parser.add_argument(
+        "--nsys-launch-mode",
+        choices=("external_torchrun", "rank0_wrapper"),
+        default=None,
+        help=(
+            "Where Nsight Systems wraps torch.distributed.run. The default "
+            "external_torchrun mode is required for valid CUDA kernel tables."
+        ),
+    )
     parser.add_argument("--nsys-trace", default=None)
+    parser.add_argument(
+        "--nsys-cuda-trace-scope",
+        choices=("process-tree", "system-wide"),
+        default=None,
+    )
     parser.add_argument("--nsys-delay", type=int, default=None)
     parser.add_argument("--nsys-duration", type=int, default=None)
     parser.add_argument("--cuda-profile", action="store_true")
     parser.add_argument("--cuda-profile-step-start", type=int, default=None)
     parser.add_argument("--cuda-profile-step-end", type=int, default=None)
+    parser.add_argument("--ncu-profile", action="store_true")
+    parser.add_argument("--ncu-set", default=None)
+    parser.add_argument("--ncu-launch-count", type=int, default=None)
+    parser.add_argument(
+        "--ncu-target-processes",
+        choices=("all", "application-only"),
+        default=None,
+    )
+    ncu_from_start = parser.add_mutually_exclusive_group()
+    ncu_from_start.add_argument(
+        "--ncu-profile-from-start",
+        action="store_true",
+        default=None,
+        dest="ncu_profile_from_start",
+    )
+    ncu_from_start.add_argument(
+        "--ncu-profile-from-cuda-start-stop",
+        action="store_false",
+        default=None,
+        dest="ncu_profile_from_start",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:

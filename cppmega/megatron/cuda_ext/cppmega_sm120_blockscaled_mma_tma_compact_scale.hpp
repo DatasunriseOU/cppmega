@@ -1227,6 +1227,8 @@ struct CollectiveMma<
       constexpr int TileM = int(size<0>(TileShape{}));
       constexpr int TileK = int(size<2>(TileShape{}));
       constexpr int VecBytes = 16;
+      constexpr int KVecBytes = 16;
+      static_assert(TileK % KVecBytes == 0, "A-columnwise vector store path expects TileK divisible by 16");
       int m_base = m_coord_i * TileM;
       int k_base = k_tile * TileK;
       int lane = thread_idx & 31;
@@ -1245,11 +1247,81 @@ struct CollectiveMma<
         store_m_word(row_base, kk, 8, chunk.z);
         store_m_word(row_base, kk, 12, chunk.w);
       };
+      auto pack_component_byte = [](uint32_t v0, uint32_t v1, uint32_t v2, uint32_t v3, int byte) {
+        int shift = byte * 8;
+        return ((v0 >> shift) & 0xffu) |
+               (((v1 >> shift) & 0xffu) << 8) |
+               (((v2 >> shift) & 0xffu) << 16) |
+               (((v3 >> shift) & 0xffu) << 24);
+      };
+      auto store_k_vector = [&](int row, int kk_base, uint4 packed) {
+        auto offset = SmemLayoutA{}(row, kk_base, write_stage);
+        *reinterpret_cast<uint4*>(shared_tensors.smem_A.begin() + offset) = packed;
+      };
+      auto store_k_vectorized_from_columnwise = [&](int row_base, int kk_base) {
+        uint4 c0 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 0) * params.a_data_ld + (m_base + row_base));
+        uint4 c1 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 1) * params.a_data_ld + (m_base + row_base));
+        uint4 c2 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 2) * params.a_data_ld + (m_base + row_base));
+        uint4 c3 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 3) * params.a_data_ld + (m_base + row_base));
+        uint4 c4 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 4) * params.a_data_ld + (m_base + row_base));
+        uint4 c5 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 5) * params.a_data_ld + (m_base + row_base));
+        uint4 c6 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 6) * params.a_data_ld + (m_base + row_base));
+        uint4 c7 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 7) * params.a_data_ld + (m_base + row_base));
+        uint4 c8 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 8) * params.a_data_ld + (m_base + row_base));
+        uint4 c9 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 9) * params.a_data_ld + (m_base + row_base));
+        uint4 c10 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 10) * params.a_data_ld + (m_base + row_base));
+        uint4 c11 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 11) * params.a_data_ld + (m_base + row_base));
+        uint4 c12 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 12) * params.a_data_ld + (m_base + row_base));
+        uint4 c13 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 13) * params.a_data_ld + (m_base + row_base));
+        uint4 c14 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 14) * params.a_data_ld + (m_base + row_base));
+        uint4 c15 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 15) * params.a_data_ld + (m_base + row_base));
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          store_k_vector(row_base + byte, kk_base, uint4{
+              pack_component_byte(c0.x, c1.x, c2.x, c3.x, byte),
+              pack_component_byte(c4.x, c5.x, c6.x, c7.x, byte),
+              pack_component_byte(c8.x, c9.x, c10.x, c11.x, byte),
+              pack_component_byte(c12.x, c13.x, c14.x, c15.x, byte)});
+          store_k_vector(row_base + 4 + byte, kk_base, uint4{
+              pack_component_byte(c0.y, c1.y, c2.y, c3.y, byte),
+              pack_component_byte(c4.y, c5.y, c6.y, c7.y, byte),
+              pack_component_byte(c8.y, c9.y, c10.y, c11.y, byte),
+              pack_component_byte(c12.y, c13.y, c14.y, c15.y, byte)});
+          store_k_vector(row_base + 8 + byte, kk_base, uint4{
+              pack_component_byte(c0.z, c1.z, c2.z, c3.z, byte),
+              pack_component_byte(c4.z, c5.z, c6.z, c7.z, byte),
+              pack_component_byte(c8.z, c9.z, c10.z, c11.z, byte),
+              pack_component_byte(c12.z, c13.z, c14.z, c15.z, byte)});
+          store_k_vector(row_base + 12 + byte, kk_base, uint4{
+              pack_component_byte(c0.w, c1.w, c2.w, c3.w, byte),
+              pack_component_byte(c4.w, c5.w, c6.w, c7.w, byte),
+              pack_component_byte(c8.w, c9.w, c10.w, c11.w, byte),
+              pack_component_byte(c12.w, c13.w, c14.w, c15.w, byte)});
+        }
+      };
 
       constexpr int RowVectors = TileM / VecBytes;
       if constexpr (DispatchPolicy::UseAColumnwiseSmemLayout) {
         static_assert(RowVectors % 2 == 0, "split A producer expects an even row-vector count");
-        if (split_a_producer) {
+        if constexpr (DispatchPolicy::UseBTmaEarly) {
+          if (split_a_producer) {
+            constexpr int SplitRowVectors = RowVectors / 2;
+            constexpr int KVectors = TileK / KVecBytes;
+            for (int idx = lane; idx < SplitRowVectors * KVectors; idx += 32) {
+              int row_vec = (idx / KVectors) * 2;
+              int k_vec = idx - (idx / KVectors) * KVectors;
+              store_k_vectorized_from_columnwise(row_vec * VecBytes, k_vec * KVecBytes);
+            }
+          } else {
+            constexpr int KVectors = TileK / KVecBytes;
+            for (int idx = lane; idx < RowVectors * KVectors; idx += 32) {
+              int row_vec = idx / KVectors;
+              int k_vec = idx - row_vec * KVectors;
+              store_k_vectorized_from_columnwise(row_vec * VecBytes, k_vec * KVecBytes);
+            }
+          }
+        } else if (split_a_producer) {
           constexpr int SplitRowVectors = RowVectors / 2;
           for (int idx = lane; idx < SplitRowVectors * TileK; idx += 32) {
             int row_vec = (idx / TileK) * 2;
@@ -1419,6 +1491,8 @@ struct CollectiveMma<
       constexpr int TileM = int(size<0>(TileShape{}));
       constexpr int TileK = int(size<2>(TileShape{}));
       constexpr int VecBytes = 16;
+      constexpr int KVecBytes = 16;
+      static_assert(TileK % KVecBytes == 0, "A-columnwise vector store path expects TileK divisible by 16");
       constexpr int RowVectors = TileM / VecBytes;
       static_assert(RowVectors % 2 == 0, "split A producer expects an even row-vector count");
       constexpr int SplitRowVectors = RowVectors / 2;
@@ -1440,16 +1514,79 @@ struct CollectiveMma<
         store_m_word(row_base, kk, 8, chunk.z);
         store_m_word(row_base, kk, 12, chunk.w);
       };
+      auto pack_component_byte = [](uint32_t v0, uint32_t v1, uint32_t v2, uint32_t v3, int byte) {
+        int shift = byte * 8;
+        return ((v0 >> shift) & 0xffu) |
+               (((v1 >> shift) & 0xffu) << 8) |
+               (((v2 >> shift) & 0xffu) << 16) |
+               (((v3 >> shift) & 0xffu) << 24);
+      };
+      auto store_k_vector = [&](int row, int kk_base, uint4 packed) {
+        auto offset = SmemLayoutA{}(row, kk_base, write_stage);
+        *reinterpret_cast<uint4*>(shared_tensors.smem_A.begin() + offset) = packed;
+      };
+      auto store_k_vectorized_from_columnwise = [&](int row_base, int kk_base) {
+        uint4 c0 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 0) * params.a_data_ld + (m_base + row_base));
+        uint4 c1 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 1) * params.a_data_ld + (m_base + row_base));
+        uint4 c2 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 2) * params.a_data_ld + (m_base + row_base));
+        uint4 c3 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 3) * params.a_data_ld + (m_base + row_base));
+        uint4 c4 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 4) * params.a_data_ld + (m_base + row_base));
+        uint4 c5 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 5) * params.a_data_ld + (m_base + row_base));
+        uint4 c6 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 6) * params.a_data_ld + (m_base + row_base));
+        uint4 c7 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 7) * params.a_data_ld + (m_base + row_base));
+        uint4 c8 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 8) * params.a_data_ld + (m_base + row_base));
+        uint4 c9 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 9) * params.a_data_ld + (m_base + row_base));
+        uint4 c10 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 10) * params.a_data_ld + (m_base + row_base));
+        uint4 c11 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 11) * params.a_data_ld + (m_base + row_base));
+        uint4 c12 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 12) * params.a_data_ld + (m_base + row_base));
+        uint4 c13 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 13) * params.a_data_ld + (m_base + row_base));
+        uint4 c14 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 14) * params.a_data_ld + (m_base + row_base));
+        uint4 c15 = *reinterpret_cast<uint4 const*>(ptr_A + static_cast<int64_t>(k_base + kk_base + 15) * params.a_data_ld + (m_base + row_base));
 
-      for (int idx = lane; idx < SplitRowVectors * TileK; idx += 32) {
-        int split_row_vec = idx / TileK;
-        int row_vec = split_row_vec * 2 + 1;
-        int kk = idx - split_row_vec * TileK;
-        int row_base = row_vec * VecBytes;
-        int64_t payload_offset =
-            static_cast<int64_t>(k_base + kk) * params.a_data_ld + (m_base + row_base);
-        uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_A + payload_offset);
-        store_m_contiguous(row_base, kk, chunk);
+        CUTLASS_PRAGMA_UNROLL
+        for (int byte = 0; byte < 4; ++byte) {
+          store_k_vector(row_base + byte, kk_base, uint4{
+              pack_component_byte(c0.x, c1.x, c2.x, c3.x, byte),
+              pack_component_byte(c4.x, c5.x, c6.x, c7.x, byte),
+              pack_component_byte(c8.x, c9.x, c10.x, c11.x, byte),
+              pack_component_byte(c12.x, c13.x, c14.x, c15.x, byte)});
+          store_k_vector(row_base + 4 + byte, kk_base, uint4{
+              pack_component_byte(c0.y, c1.y, c2.y, c3.y, byte),
+              pack_component_byte(c4.y, c5.y, c6.y, c7.y, byte),
+              pack_component_byte(c8.y, c9.y, c10.y, c11.y, byte),
+              pack_component_byte(c12.y, c13.y, c14.y, c15.y, byte)});
+          store_k_vector(row_base + 8 + byte, kk_base, uint4{
+              pack_component_byte(c0.z, c1.z, c2.z, c3.z, byte),
+              pack_component_byte(c4.z, c5.z, c6.z, c7.z, byte),
+              pack_component_byte(c8.z, c9.z, c10.z, c11.z, byte),
+              pack_component_byte(c12.z, c13.z, c14.z, c15.z, byte)});
+          store_k_vector(row_base + 12 + byte, kk_base, uint4{
+              pack_component_byte(c0.w, c1.w, c2.w, c3.w, byte),
+              pack_component_byte(c4.w, c5.w, c6.w, c7.w, byte),
+              pack_component_byte(c8.w, c9.w, c10.w, c11.w, byte),
+              pack_component_byte(c12.w, c13.w, c14.w, c15.w, byte)});
+        }
+      };
+
+      if constexpr (DispatchPolicy::UseBTmaEarly) {
+        constexpr int KVectors = TileK / KVecBytes;
+        for (int idx = lane; idx < SplitRowVectors * KVectors; idx += 32) {
+          int split_row_vec = idx / KVectors;
+          int row_vec = split_row_vec * 2 + 1;
+          int k_vec = idx - split_row_vec * KVectors;
+          store_k_vectorized_from_columnwise(row_vec * VecBytes, k_vec * KVecBytes);
+        }
+      } else {
+        for (int idx = lane; idx < SplitRowVectors * TileK; idx += 32) {
+          int split_row_vec = idx / TileK;
+          int row_vec = split_row_vec * 2 + 1;
+          int kk = idx - split_row_vec * TileK;
+          int row_base = row_vec * VecBytes;
+          int64_t payload_offset =
+              static_cast<int64_t>(k_base + kk) * params.a_data_ld + (m_base + row_base);
+          uint4 chunk = *reinterpret_cast<uint4 const*>(ptr_A + payload_offset);
+          store_m_contiguous(row_base, kk, chunk);
+        }
       }
     };
 

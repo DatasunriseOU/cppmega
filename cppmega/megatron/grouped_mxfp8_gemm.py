@@ -40,6 +40,7 @@ class GroupedMxfp8MicrobenchConfig:
     warmup: int = 5
     iters: int = 20
     seed: int = 123
+    compare_legacy_dgrad: bool = True
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -777,6 +778,99 @@ def dgrad_nn_gemm_list(
         accumulate=bool(accumulate),
         beta=beta_f,
     )
+    ext = _load_cuda_ext()
+    entrypoint = getattr(ext, "dgrad_nn_ptrs_by_expert", None)
+    if entrypoint is None:
+        return ext.dgrad_nn_ptrs(
+            _ptr_tensor(dy, device=device, name="dy_rowwise_data"),
+            _ptr_tensor(dy_scale, device=device, name="dy_rowwise_scale_inv"),
+            _ptr_tensor(weight, device=device, name="weight_colwise_data"),
+            _ptr_tensor(weight_scale, device=device, name="weight_colwise_scale_inv"),
+            offsets,
+            out_arg,
+            use_out,
+            bool(accumulate),
+            float(alpha),
+            beta_f,
+            total_rows,
+            n,
+            k,
+        )
+    return entrypoint(
+        _ptr_tensor(dy, device=device, name="dy_rowwise_data"),
+        _ptr_tensor(dy_scale, device=device, name="dy_rowwise_scale_inv"),
+        _ptr_tensor(weight, device=device, name="weight_colwise_data"),
+        _ptr_tensor(weight_scale, device=device, name="weight_colwise_scale_inv"),
+        offsets,
+        out_arg,
+        use_out,
+        bool(accumulate),
+        float(alpha),
+        beta_f,
+        total_rows,
+        n,
+        k,
+        max(int(v) for v in m_splits),
+    )
+
+
+def dgrad_nn_gemm_list_legacy_offset_search(
+    dy_rowwise_data: Sequence[torch.Tensor],
+    dy_rowwise_scale_inv: Sequence[torch.Tensor],
+    weight_colwise_data: Sequence[torch.Tensor],
+    weight_colwise_scale_inv: Sequence[torch.Tensor],
+    expert_offsets: torch.Tensor | Sequence[int],
+    *,
+    out: torch.Tensor | None = None,
+    accumulate: bool = False,
+    alpha: float = 1.0,
+    beta: float | None = None,
+) -> torch.Tensor:
+    """Legacy list dgrad path kept only for microbench before/after timing."""
+
+    dy = list(dy_rowwise_data)
+    dy_scale = list(dy_rowwise_scale_inv)
+    weight = list(weight_colwise_data)
+    weight_scale = list(weight_colwise_scale_inv)
+    if len(dy) != _EXPECTED_NUM_EXPERTS:
+        raise ValueError(f"expected {_EXPECTED_NUM_EXPERTS} dy tensors")
+    device = dy[0].device
+    for name, tensors in (
+        ("dy_rowwise_data", dy),
+        ("dy_rowwise_scale_inv", dy_scale),
+        ("weight_colwise_data", weight),
+        ("weight_colwise_scale_inv", weight_scale),
+    ):
+        _check_same_device(tensors, device=device, name=name)
+        for tensor in tensors:
+            _check_uint8_cuda_contiguous(tensor, name)
+    offsets_values, m_splits = _offsets_from_grouped_rows(
+        dy,
+        expert_offsets,
+        name="dy_rowwise_data",
+    )
+    total_rows, n, k = _check_dgrad_list_shapes(
+        dy=dy,
+        dy_scale=dy_scale,
+        weight=weight,
+        weight_scale=weight_scale,
+        m_splits=m_splits,
+    )
+    _validate_16_expert_shape(total_rows, n, k, _EXPECTED_NUM_EXPERTS)
+    offsets = _prepare_expert_offsets(
+        offsets_values,
+        total_rows=total_rows,
+        num_experts=_EXPECTED_NUM_EXPERTS,
+        device=device,
+    )
+    beta_f = _resolve_beta(beta, bool(accumulate))
+    out_arg, use_out = _prepare_out(
+        out,
+        shape=(total_rows, k),
+        device=device,
+        accumulate=bool(accumulate),
+        beta=beta_f,
+    )
     return _load_cuda_ext().dgrad_nn_ptrs(
         _ptr_tensor(dy, device=device, name="dy_rowwise_data"),
         _ptr_tensor(dy_scale, device=device, name="dy_rowwise_scale_inv"),
@@ -982,6 +1076,7 @@ def backend_capability_report() -> dict[str, Any]:
         "apis": {
             "dgrad_nn_gemm": "dy rowwise [T,N] + weight columnwise [16,N,K] -> BF16 [T,K]",
             "wgrad_nt_gemm": "dy columnwise [T,N] + x columnwise [T,K] -> BF16 [16,N,K]",
+            "dgrad_nn_gemm_list": "per-expert pointer path; one launch with grid.z=expert, no offset search",
         },
         "launches_per_call": 1,
         "restrictions": {
@@ -1071,6 +1166,34 @@ def microbench(config: GroupedMxfp8MicrobenchConfig | None = None) -> dict[str, 
     dgrad_out = torch.empty((config.total_tokens, config.k), dtype=torch.bfloat16, device=device)
     wgrad_out = torch.empty((config.num_experts, config.n, config.k), dtype=torch.bfloat16, device=device)
 
+    dy_list = [
+        dy[int(offsets[idx].item()) : int(offsets[idx + 1].item())].contiguous()
+        for idx in range(config.num_experts)
+    ]
+    dy_row_scale_list = [
+        scale_rowwise[int(offsets[idx].item()) : int(offsets[idx + 1].item())].contiguous()
+        for idx in range(config.num_experts)
+    ]
+    row_blocks_per_expert = [
+        _ceil_div(int(offsets[idx + 1].item()) - int(offsets[idx].item()), _MXFP8_BLOCK)
+        for idx in range(config.num_experts)
+    ]
+    dy_col_scale_list = [
+        torch.full((row_blocks_per_expert[idx], config.n), 127, dtype=torch.uint8, device=device)
+        for idx in range(config.num_experts)
+    ]
+    x_col_scale_list = [
+        torch.full((row_blocks_per_expert[idx], config.k), 127, dtype=torch.uint8, device=device)
+        for idx in range(config.num_experts)
+    ]
+    x_list = [
+        x[int(offsets[idx].item()) : int(offsets[idx + 1].item())].contiguous()
+        for idx in range(config.num_experts)
+    ]
+    weight_list = [weight[idx].contiguous() for idx in range(config.num_experts)]
+    weight_scale_list = [scale_weight[idx].contiguous() for idx in range(config.num_experts)]
+    wgrad_out_list = [torch.empty((config.n, config.k), dtype=torch.bfloat16, device=device) for _ in range(config.num_experts)]
+
     dgrad_ms = _time_cuda(
         lambda: dgrad_nn_gemm(dy, scale_rowwise, weight, scale_weight, offsets, out=dgrad_out),
         warmup=config.warmup,
@@ -1081,11 +1204,52 @@ def microbench(config: GroupedMxfp8MicrobenchConfig | None = None) -> dict[str, 
         warmup=config.warmup,
         iters=config.iters,
     )
+    dgrad_list_ms = _time_cuda(
+        lambda: dgrad_nn_gemm_list(
+            dy_list,
+            dy_row_scale_list,
+            weight_list,
+            weight_scale_list,
+            offsets,
+            out=dgrad_out,
+        ),
+        warmup=config.warmup,
+        iters=config.iters,
+    )
+    dgrad_list_legacy_ms = None
+    if config.compare_legacy_dgrad:
+        dgrad_list_legacy_ms = _time_cuda(
+            lambda: dgrad_nn_gemm_list_legacy_offset_search(
+                dy_list,
+                dy_row_scale_list,
+                weight_list,
+                weight_scale_list,
+                offsets,
+                out=dgrad_out,
+            ),
+            warmup=config.warmup,
+            iters=config.iters,
+        )
+    wgrad_list_ms = _time_cuda(
+        lambda: wgrad_nt_gemm_list(
+            dy_list,
+            dy_col_scale_list,
+            x_list,
+            x_col_scale_list,
+            offsets,
+            out=wgrad_out_list,
+        ),
+        warmup=config.warmup,
+        iters=config.iters,
+    )
     return {
         "available": True,
         "config": asdict(config),
         "dgrad_ms": dgrad_ms,
+        "dgrad_list_by_expert_ms": dgrad_list_ms,
+        "dgrad_list_legacy_offset_search_ms": dgrad_list_legacy_ms,
         "wgrad_ms": wgrad_ms,
+        "wgrad_list_ptrs_ms": wgrad_list_ms,
         "capability": backend_capability_report(),
     }
 
@@ -1098,6 +1262,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--k", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--no-compare-legacy-dgrad", dest="compare_legacy_dgrad", action="store_false")
     args = parser.parse_args(argv)
     if args.microbench:
         report = microbench(
@@ -1107,6 +1272,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 k=args.k,
                 warmup=args.warmup,
                 iters=args.iters,
+                compare_legacy_dgrad=args.compare_legacy_dgrad,
             )
         )
     else:
