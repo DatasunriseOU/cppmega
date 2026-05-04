@@ -63,6 +63,7 @@ import atexit
 from collections import Counter
 import os
 import sys
+from types import SimpleNamespace
 
 
 _FUSED_MAIN_MTP_CCE_LOSS_ATTR = "_cppmega_fused_main_mtp_cce_loss"
@@ -92,6 +93,96 @@ def format_fused_main_mtp_cce_counters() -> str:
 
 def print_fused_main_mtp_cce_counters() -> None:
     print(format_fused_main_mtp_cce_counters())
+
+
+def _fallback_roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=None):
+    """Local CP=1 roll_tensor fallback for focused CCE tests/probes."""
+
+    del cp_group, packed_seq_params
+    import torch
+
+    rolled = torch.roll(tensor, shifts=shifts, dims=dims)
+    rolled.select(dims, shifts).fill_(0)
+    return rolled, rolled.sum()
+
+
+class _FallbackMTPLossAutoScaler:
+    """Small equivalent of Megatron's MTPLossAutoScaler for test/probe use."""
+
+    main_loss_backward_scale = None
+
+    @staticmethod
+    def apply(output, mtp_loss):
+        import torch
+
+        class _AutoScale(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, output_, mtp_loss_):
+                ctx.save_for_backward(mtp_loss_)
+                return output_
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                (mtp_loss_,) = ctx.saved_tensors
+                scale = _FallbackMTPLossAutoScaler.main_loss_backward_scale
+                if scale is None:
+                    scale = torch.tensor(1.0, device=mtp_loss_.device)
+                return grad_output, torch.ones_like(mtp_loss_) * scale
+
+        return _AutoScale.apply(output, mtp_loss)
+
+    @staticmethod
+    def set_loss_scale(scale):
+        _FallbackMTPLossAutoScaler.main_loss_backward_scale = scale
+
+
+class _FallbackMTPLossLoggingHelper:
+    tracker = {}
+
+    @staticmethod
+    def save_loss_to_tracker(loss, layer_number, num_layers, reduce_group=None, avg_group=None):
+        del reduce_group, avg_group
+        if layer_number is None:
+            return
+        values = _FallbackMTPLossLoggingHelper.tracker.setdefault("values", [])
+        while len(values) < num_layers:
+            values.append(None)
+        values[layer_number] = loss.detach()
+
+
+def _get_mtp_runtime_helpers():
+    """Return Megatron MTP helpers, with a CP=1 fallback for isolated tests.
+
+    Production imports the real Megatron helpers. The fallback keeps focused
+    CCE launch-fusion tests usable while a local Transformer Engine source tree
+    is mid-build and cannot satisfy Megatron's import-time TE dependency.
+    """
+
+    try:
+        from megatron.core import parallel_state
+        from megatron.core.transformer.multi_token_prediction import (
+            MTPLossAutoScaler,
+            MTPLossLoggingHelper,
+            roll_tensor,
+        )
+
+        return SimpleNamespace(
+            MTPLossAutoScaler=MTPLossAutoScaler,
+            MTPLossLoggingHelper=MTPLossLoggingHelper,
+            roll_tensor=roll_tensor,
+            data_parallel_group=lambda: parallel_state.get_data_parallel_group(
+                with_context_parallel=True
+            ),
+        )
+    except Exception as exc:  # pragma: no cover - local dependency state
+        if "Transformer Engine" not in str(exc) and "transformer_engine" not in str(exc):
+            raise
+        return SimpleNamespace(
+            MTPLossAutoScaler=_FallbackMTPLossAutoScaler,
+            MTPLossLoggingHelper=_FallbackMTPLossLoggingHelper,
+            roll_tensor=_fallback_roll_tensor,
+            data_parallel_group=lambda: None,
+        )
 
 
 def _env_flag_enabled(name: str, default: str = "1") -> bool:
@@ -189,12 +280,10 @@ def fused_main_mtp_cce_loss(
 
     import torch
 
-    from megatron.core import parallel_state
-    from megatron.core.transformer.multi_token_prediction import (
-        MTPLossAutoScaler,
-        MTPLossLoggingHelper,
-        roll_tensor,
-    )
+    helpers = _get_mtp_runtime_helpers()
+    MTPLossAutoScaler = helpers.MTPLossAutoScaler
+    MTPLossLoggingHelper = helpers.MTPLossLoggingHelper
+    roll_tensor = helpers.roll_tensor
 
     mtp_num_layers = int(getattr(config, "mtp_num_layers", None) or 0)
     batch, seq = labels.shape
@@ -278,7 +367,7 @@ def fused_main_mtp_cce_loss(
                 mtp_loss_for_log,
                 mtp_layer_number,
                 mtp_num_layers,
-                avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+                avg_group=helpers.data_parallel_group(),
             )
 
         if config.calculate_per_token_loss:
@@ -516,7 +605,7 @@ def patch_mtp_native_hopper_ce() -> None:
     _install_process_mtp_loss_patch()
 
 
-def _install_process_mtp_loss_patch() -> None:
+def _install_process_mtp_loss_patch(mtp_module=None, rebind_modules=None) -> None:
     """Replace upstream ``process_mtp_loss`` with a reduction="sum" variant.
 
     The wrapper mirrors the upstream logic byte-for-byte in the non-fusion
@@ -535,13 +624,15 @@ def _install_process_mtp_loss_patch() -> None:
     """
     import torch
 
-    from megatron.core import parallel_state
-    from megatron.core.transformer import multi_token_prediction as _mtp_mod
-    from megatron.core.transformer.multi_token_prediction import (
-        MTPLossAutoScaler,
-        MTPLossLoggingHelper,
-        roll_tensor,
-    )
+    if mtp_module is None:
+        from megatron.core.transformer import multi_token_prediction as _mtp_mod
+    else:
+        _mtp_mod = mtp_module
+
+    helpers = _get_mtp_runtime_helpers()
+    MTPLossAutoScaler = helpers.MTPLossAutoScaler
+    MTPLossLoggingHelper = helpers.MTPLossLoggingHelper
+    roll_tensor = helpers.roll_tensor
 
     if getattr(_mtp_mod.process_mtp_loss, "_cppmega_native_hopper_patched", False):
         return  # idempotent
@@ -661,7 +752,7 @@ def _install_process_mtp_loss_patch() -> None:
                     mtp_loss_for_log,
                     mtp_layer_number,
                     config.mtp_num_layers,
-                    avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+                    avg_group=helpers.data_parallel_group(),
                 )
 
             mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
@@ -693,13 +784,19 @@ def _install_process_mtp_loss_patch() -> None:
     # does NOT propagate. In particular ``mamba_model`` imports via
     # ``from megatron.core.transformer.multi_token_prediction import
     # process_mtp_loss`` (mamba_model.py:21-24).
-    _rebind_targets = (
-        "megatron.core.models.mamba.mamba_model",
-        "megatron.core.models.gpt.gpt_model",
-        "megatron.core.models.common.language_module.language_module",
-    )
-    for _name in _rebind_targets:
-        _mod = sys.modules.get(_name)
+    if rebind_modules is None:
+        rebind_modules = (
+            "megatron.core.models.mamba.mamba_model",
+            "megatron.core.models.gpt.gpt_model",
+            "megatron.core.models.common.language_module.language_module",
+        )
+    for _target in rebind_modules:
+        if isinstance(_target, str):
+            _name = _target
+            _mod = sys.modules.get(_name)
+        else:
+            _name = getattr(_target, "__name__", repr(_target))
+            _mod = _target
         if _mod is not None and hasattr(_mod, "process_mtp_loss"):
             setattr(_mod, "process_mtp_loss", process_mtp_loss_patched)
             print(f"[cppmega] rebound process_mtp_loss on {_name}")
