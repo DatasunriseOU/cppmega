@@ -1,0 +1,58 @@
+/usr/local/lib/python3.13/dist-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+[15:59:54] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dstates_shared, merging to smaller granularity
+[15:59:54] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dPhiO_shared, merging to smaller granularity
+[15:59:54] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dstates_shared, merging to smaller granularity
+[15:59:55] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dPhiO_shared, merging to smaller granularity
+[15:59:55] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer q_shared, merging to smaller granularity
+[15:59:55] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dPhiO_shared, merging to smaller granularity
+[15:59:55] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer k_shared, merging to smaller granularity
+[15:59:55] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer q_shared, merging to smaller granularity
+[16:00:47] /home/runner/work/cppmega/cppmega/src/src/transform/producer_consumer_ws.cc:2358: Warning: [WS] candidate found, applying MVB + WS
+[16:00:47] /home/runner/work/cppmega/cppmega/src/src/transform/producer_consumer_ws.cc:2393: Warning: [WS] transformation applied successfully
+[16:01:06] /home/runner/work/cppmega/cppmega/src/src/transform/producer_consumer_ws.cc:2355: Warning: [WS] skipped: no TMA copies in pipeline loop
+[16:01:06] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dstates_shared, merging to smaller granularity
+[16:01:06] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dPhiO_shared, merging to smaller granularity
+[16:01:06] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dstates_shared, merging to smaller granularity
+[16:01:06] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dPhiO_shared, merging to smaller granularity
+[16:01:06] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer q_shared, merging to smaller granularity
+[16:01:06] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dPhiO_shared, merging to smaller granularity
+[16:01:06] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer k_shared, merging to smaller granularity
+[16:01:06] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer q_shared, merging to smaller granularity
+[16:01:55] /home/runner/work/cppmega/cppmega/src/src/transform/producer_consumer_ws.cc:2355: Warning: [WS] skipped: no TMA copies in pipeline loop
+[16:01:55] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dstates_shared, merging to smaller granularity
+[16:01:55] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dstates_shared, merging to smaller granularity
+[16:01:55] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dPhiO_shared, merging to smaller granularity
+[16:01:55] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer q_shared, merging to smaller granularity
+[16:01:55] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dPhiO_shared, merging to smaller granularity
+[16:01:55] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer k_shared, merging to smaller granularity
+[16:01:55] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer q_shared, merging to smaller granularity
+[16:02:35] /home/runner/work/cppmega/cppmega/src/src/transform/thread_storage_sync.cc:1036: Warning: [ThreadSync] Hoisting sync from inside if to before if. Condition is not safe for in-if sync: thread_binding % 4 * 8 + thread_binding % 16 // 4 * 2 + thread_binding // 128 == 0
+[16:03:01] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dstates_shared, merging to smaller granularity
+[16:03:01] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dPhiO_shared, merging to smaller granularity
+[16:03:01] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dstates_shared, merging to smaller granularity
+[16:03:01] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dPhiO_shared, merging to smaller granularity
+[16:03:01] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer q_shared, merging to smaller granularity
+[16:03:01] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dPhiO_shared, merging to smaller granularity
+[16:03:01] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer k_shared, merging to smaller granularity
+[16:03:01] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer q_shared, merging to smaller granularity
+[16:03:49] /home/runner/work/cppmega/cppmega/src/src/transform/producer_consumer_ws.cc:2358: Warning: [WS] candidate found, applying MVB + WS
+[16:03:50] /home/runner/work/cppmega/cppmega/src/src/transform/producer_consumer_ws.cc:2393: Warning: [WS] transformation applied successfully
+[16:04:08] /home/runner/work/cppmega/cppmega/src/src/transform/producer_consumer_ws.cc:2355: Warning: [WS] skipped: no TMA copies in pipeline loop
+[16:04:08] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dstates_shared, merging to smaller granularity
+[16:04:08] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dPhiO_shared, merging to smaller granularity
+[16:04:08] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dstates_shared, merging to smaller granularity
+[16:04:08] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dPhiO_shared, merging to smaller granularity
+[16:04:08] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer q_shared, merging to smaller granularity
+[16:04:08] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dPhiO_shared, merging to smaller granularity
+[16:04:08] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer k_shared, merging to smaller granularity
+[16:04:08] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer q_shared, merging to smaller granularity
+[16:04:57] /home/runner/work/cppmega/cppmega/src/src/transform/producer_consumer_ws.cc:2355: Warning: [WS] skipped: no TMA copies in pipeline loop
+[16:04:57] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dstates_shared, merging to smaller granularity
+[16:04:57] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dstates_shared, merging to smaller granularity
+[16:04:58] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dPhiO_shared, merging to smaller granularity
+[16:04:58] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer q_shared, merging to smaller granularity
+[16:04:58] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer dPhiO_shared, merging to smaller granularity
+[16:04:58] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer k_shared, merging to smaller granularity
+[16:04:58] /home/runner/work/cppmega/cppmega/src/src/transform/layout_inference.cc:236: Warning: Swizzle layout conflict for buffer q_shared, merging to smaller granularity
+[16:05:37] /home/runner/work/cppmega/cppmega/src/src/transform/thread_storage_sync.cc:1036: Warning: [ThreadSync] Hoisting sync from inside if to before if. Condition is not safe for in-if sync: thread_binding % 4 * 8 + thread_binding % 16 // 4 * 2 + thread_binding // 128 == 0

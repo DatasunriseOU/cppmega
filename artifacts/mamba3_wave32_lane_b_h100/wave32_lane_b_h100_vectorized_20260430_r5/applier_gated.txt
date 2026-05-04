@@ -1,0 +1,1 @@
+FAIL: Refusing to mutate installed mamba_ssm without MAMBA3_BWD_BWD_VECTORIZED_DIAG_ALLOW_FILE_MUTATION=1

@@ -1,0 +1,63 @@
+{
+  "candidate": "dpsiv_d_bf16_boundary",
+  "compiled": true,
+  "correctness": {
+    "atol": 0.03125,
+    "exact": false,
+    "max_abs_vs_torch_bf16_reference": 0.03125,
+    "mismatch_count": 443,
+    "within_tolerance": true
+  },
+  "cuda": "13.2",
+  "effective_bandwidth_gib_s": 1046.094571555075,
+  "gate": {
+    "capability": [
+      9,
+      0
+    ],
+    "name": "NVIDIA H100 80GB HBM3",
+    "ok": true,
+    "reason": "ok"
+  },
+  "host": "modal",
+  "memory": {
+    "after_bench": {
+      "allocated_bytes": 235929600,
+      "max_allocated_bytes": 235929600,
+      "max_reserved_bytes": 236978176,
+      "reserved_bytes": 236978176
+    },
+    "allocated_inputs_outputs": {
+      "allocated_bytes": 135266304,
+      "max_allocated_bytes": 135266304,
+      "max_reserved_bytes": 136314880,
+      "reserved_bytes": 136314880
+    },
+    "peak_allocated_delta_bytes": 0,
+    "scratch_bytes": 0,
+    "theoretical_bytes": {
+      "global_scratch": 0,
+      "read_d_fp32": 262144,
+      "read_dphi_bf16": 33554432,
+      "read_dpsiv_fp32": 67108864,
+      "read_gamma_fp32": 262144,
+      "read_qk_dot_bf16": 524288,
+      "write_out_bf16": 33554432
+    }
+  },
+  "ptxas": "emitted to stderr by --verbose-build via -Xptxas=-v",
+  "python": "3.13.13",
+  "shape": {
+    "cs": 128,
+    "p": 128,
+    "r": 2,
+    "tiles": 512
+  },
+  "status": "GO_COMPILED_H100",
+  "time_unix": 1777560959,
+  "timing_ms": {
+    "kernel": 0.12042559623718262,
+    "torch_reference": 0.7321955108642578
+  },
+  "torch": "2.13.0.dev20260426+cu132"
+}

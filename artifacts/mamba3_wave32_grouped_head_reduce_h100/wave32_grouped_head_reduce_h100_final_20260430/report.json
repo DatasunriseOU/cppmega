@@ -1,0 +1,184 @@
+{
+  "capability": [
+    9,
+    0
+  ],
+  "cuda_version": "13.2",
+  "device_count": 1,
+  "gpu_name": "NVIDIA H100 80GB HBM3",
+  "iters": 100,
+  "run_id": "wave32_grouped_head_reduce_h100_final_20260430",
+  "shapes": [
+    {
+      "bench": {
+        "torch": {
+          "cuda_ms": 0.024691519737243654,
+          "effective_gib_s": 474.60626663347614,
+          "end_alloc_mib_delta": 4.0,
+          "end_reserved_mib_delta": 0.0,
+          "label": "torch_view_sum_pair",
+          "logical_gib_per_iter": 0.01171875,
+          "out0_mib": 2.0,
+          "out1_mib": 2.0,
+          "peak_alloc_mib_delta": 8.0,
+          "peak_reserved_mib_delta": 0.0,
+          "wall_ms": 0.02573058999999489
+        },
+        "triton": {
+          "cuda_ms": 4.062718811035157,
+          "effective_gib_s": 2.8844600242009197,
+          "end_alloc_mib_delta": 4.0,
+          "end_reserved_mib_delta": 0.0,
+          "label": "triton_fused_pair",
+          "logical_gib_per_iter": 0.01171875,
+          "out0_mib": 2.0,
+          "out1_mib": 2.0,
+          "peak_alloc_mib_delta": 8.0,
+          "peak_reserved_mib_delta": 0.0,
+          "wall_ms": 4.063326889999992
+        },
+        "triton_minus_torch_ms": 4.038027291297913,
+        "triton_peak_alloc_mib_delta_minus_torch": 0.0,
+        "triton_speedup_vs_torch": 0.006077585204808305
+      },
+      "correctness_vs_torch": {
+        "dk": {
+          "max_abs": 0.0,
+          "mean_abs": 0.0
+        },
+        "dq": {
+          "max_abs": 0.0,
+          "mean_abs": 0.0
+        }
+      },
+      "heads_per_group": 2,
+      "input_mib_pair": 8.0,
+      "output_mib_pair": 4.0,
+      "shape": {
+        "B": 1,
+        "G": 8,
+        "H": 16,
+        "N": 64,
+        "R": 4,
+        "S": 512,
+        "name": "smoke_hpg2",
+        "seed": 1
+      }
+    },
+    {
+      "bench": {
+        "torch": {
+          "cuda_ms": 0.20773984909057616,
+          "effective_gib_s": 2557.285000088601,
+          "end_alloc_mib_delta": 32.0,
+          "end_reserved_mib_delta": 64.0,
+          "label": "torch_view_sum_pair",
+          "logical_gib_per_iter": 0.53125,
+          "out0_mib": 16.0,
+          "out1_mib": 16.0,
+          "peak_alloc_mib_delta": 64.0,
+          "peak_reserved_mib_delta": 64.0,
+          "wall_ms": 0.20827329999999478
+        },
+        "triton": {
+          "cuda_ms": 4.106624145507812,
+          "effective_gib_s": 129.3641641349448,
+          "end_alloc_mib_delta": 32.0,
+          "end_reserved_mib_delta": 64.0,
+          "label": "triton_fused_pair",
+          "logical_gib_per_iter": 0.53125,
+          "out0_mib": 16.0,
+          "out1_mib": 16.0,
+          "peak_alloc_mib_delta": 64.0,
+          "peak_reserved_mib_delta": 64.0,
+          "wall_ms": 4.107053709999988
+        },
+        "triton_minus_torch_ms": 3.898884296417236,
+        "triton_peak_alloc_mib_delta_minus_torch": 0.0,
+        "triton_speedup_vs_torch": 0.050586525995523685
+      },
+      "correctness_vs_torch": {
+        "dk": {
+          "max_abs": 0.0,
+          "mean_abs": 0.0
+        },
+        "dq": {
+          "max_abs": 0.0,
+          "mean_abs": 0.0
+        }
+      },
+      "heads_per_group": 16,
+      "input_mib_pair": 512.0,
+      "output_mib_pair": 32.0,
+      "shape": {
+        "B": 2,
+        "G": 8,
+        "H": 128,
+        "N": 64,
+        "R": 4,
+        "S": 2048,
+        "name": "half_seq_hpg16",
+        "seed": 2
+      }
+    },
+    {
+      "bench": {
+        "torch": {
+          "cuda_ms": 0.3992015838623047,
+          "effective_gib_s": 2661.562586300972,
+          "end_alloc_mib_delta": 64.0,
+          "end_reserved_mib_delta": 128.0,
+          "label": "torch_view_sum_pair",
+          "logical_gib_per_iter": 1.0625,
+          "out0_mib": 32.0,
+          "out1_mib": 32.0,
+          "peak_alloc_mib_delta": 128.0,
+          "peak_reserved_mib_delta": 128.0,
+          "wall_ms": 0.39977790000000013
+        },
+        "triton": {
+          "cuda_ms": 4.192783813476563,
+          "effective_gib_s": 253.411586971139,
+          "end_alloc_mib_delta": 64.0,
+          "end_reserved_mib_delta": 128.0,
+          "label": "triton_fused_pair",
+          "logical_gib_per_iter": 1.0625,
+          "out0_mib": 32.0,
+          "out1_mib": 32.0,
+          "peak_alloc_mib_delta": 128.0,
+          "peak_reserved_mib_delta": 128.0,
+          "wall_ms": 4.193260559999992
+        },
+        "triton_minus_torch_ms": 3.793582229614258,
+        "triton_peak_alloc_mib_delta_minus_torch": 0.0,
+        "triton_speedup_vs_torch": 0.09521158295335425
+      },
+      "correctness_vs_torch": {
+        "dk": {
+          "max_abs": 1.1920928955078125e-07,
+          "mean_abs": 7.105427357601002e-15
+        },
+        "dq": {
+          "max_abs": 3.5762786865234375e-07,
+          "mean_abs": 2.1316282072803006e-14
+        }
+      },
+      "heads_per_group": 16,
+      "input_mib_pair": 1024.0,
+      "output_mib_pair": 64.0,
+      "shape": {
+        "B": 2,
+        "G": 8,
+        "H": 128,
+        "N": 64,
+        "R": 4,
+        "S": 4096,
+        "name": "fullish_seq4096_hpg16",
+        "seed": 3
+      }
+    }
+  ],
+  "torch_version": "2.13.0.dev20260426+cu132",
+  "utc": "20260430T154644Z",
+  "warmup": 20
+}

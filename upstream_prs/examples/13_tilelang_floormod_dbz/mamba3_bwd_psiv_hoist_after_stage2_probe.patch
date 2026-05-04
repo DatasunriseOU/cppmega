@@ -1,0 +1,79 @@
+--- a/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
++++ b/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
+@@ -96,6 +96,7 @@
+             # TMA-fix: QK_DOT flattened from [B, H, S, R, R] to [B, H, S, R*R] so the
+             # chunk-slice T.copy reads a 2D [chunk_size, R*R] tile (TMA-legal rank-2).
+             QK_DOT: T.Tensor([B, H, S, R * R], dtype), # type: ignore
++            PSIV_CACHE: T.Tensor([B, H, S * R, P], dtype), # type: ignore
+ 
+             SEGSUM: T.Tensor([B, H, nchunks, chunk_size, chunk_size], T.float32), # type: ignore
+             ):
+@@ -233,6 +234,11 @@
+                 PsiV_reshaped_frag = T.view(PsiV_frag, shape=[fused_chunk_size, P])
+                 T.copy(PsiV_reshaped_frag, PsiV_shared)
+ 
++                # Probe: bwd_fwd already materializes PsiV for the same V/Psi inputs.
++                # Persist the row-flattened [S*R, P] tile so bwd_bwd can skip the
++                # v * Psi rematerialization live range.
++                T.copy(PsiV_shared, PSIV_CACHE[i_b, i_h, fused_chunk_start:fused_chunk_start+fused_chunk_size, :])
++
+                 # TMA-fix: 2D load directly into q_shared [fused_chunk_size, N] since
+                 # Q is now [B, S*R, G, N]. No rank-3 view needed.
+                 T.copy(Q[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, i_h_qk, :], q_shared)
+@@ -567,6 +573,7 @@
+             # TMA-fix: QK_DOT flattened from [B, H, S, R, R] to [B, H, S, R*R].
+             QK_DOT: T.Tensor([B, H, S, R * R], dtype), # type: ignore
+             # DQK_DOT: T.Tensor([B, H, S, R, R], dtype), # type: ignore
++            PSIV_CACHE: T.Tensor([B, H, S * R, P], dtype), # type: ignore
+             DDA: T.Tensor([B, H, S], T.float32), # type: ignore
+             DSSDA: T.Tensor([B, H, nchunks, chunk_size, chunk_size], T.float32), # type: ignore
+             DDA_CS_REV: T.Tensor([B, H, S], T.float32), # type: ignore
+@@ -891,17 +898,14 @@
+                         dPsi_frag[r, p] += dPsiV_combined_shared[cs*R + r, p] * v_frag[cs, p]
+                 T.copy(dPsi_frag, dPsi_acc)
+ 
+-                # Compute Psi_V
+-                PsiV_frag = T.alloc_fragment([chunk_size, R, P], dtype)
+-                T.clear(PsiV_frag)
+-                for cs, p in T.Parallel(chunk_size, P):
+-                    for r in T.serial(R):
+-                        PsiV_frag[cs, r, p] += v_frag[cs, p] * Psi_frag[r, p]
+-                # NOTE: Tilelang unable to perform gemm with reshaped PsiV_frag
+-                # so have to copy to smem
++                # Probe: consume PsiV produced by bwd_fwd instead of recomputing
++                # PsiV_frag = v_frag * Psi_frag here. This drops the [chunk, R, P]
++                # fragment and its multiply loop from the bwd_bwd live range.
+                 PsiV_shared  = T.alloc_shared([fused_chunk_size, P], dtype)
+-                for cs, r, p in T.Parallel(chunk_size, R, P):
+-                    PsiV_shared[cs*R + r, p] = PsiV_frag[cs, r, p]
++                T.copy(
++                    PSIV_CACHE[i_b, i_h, fused_chunk_start:fused_chunk_start+fused_chunk_size, :],
++                    PsiV_shared,
++                )
+ 
+                 # Compute dqk_from_diag, which is the contribution to dQ/dK from qk_dot:
+                 dqk_from_diag_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], accum_dtype)
+@@ -1198,6 +1202,7 @@
+         dz_tilelang = None
+         dmimo_z = None
+     qk_dot = torch.zeros([B, H, S, R * R], dtype=q.dtype, device=q.device)
++    psiv_cache = torch.empty([B, H, S * R, P], dtype=v.dtype, device=v.device)
+ 
+     q_flat = q.contiguous().view(B, S * R, G, N)
+     k_flat = k.contiguous().view(B, S * R, G, N)
+@@ -1243,6 +1248,7 @@
+                     trap,
+                     D,
+                     qk_dot,
++                    psiv_cache,
+                     segsum,
+                     )
+     if reduceO:
+@@ -1300,6 +1306,7 @@
+             D,
+             dD,
+             qk_dot,
++            psiv_cache,
+             ddA,
+             dSSdA,
+             ddA_cs_rev,

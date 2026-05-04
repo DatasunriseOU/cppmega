@@ -1,0 +1,91 @@
+--- a/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
++++ b/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
+@@ -622,7 +622,10 @@ def mamba_mimo_bwd_bwd(
+ 
+             dPsiV_combined_shared = T.alloc_shared([fused_chunk_size, P], dtype)
+ 
+-            dqk_from_diag_shared = T.alloc_shared([fused_chunk_size, fused_chunk_size], accum_dtype)
++            # Wave31: only same-step R x R qk-dot diagonal blocks are consumed
++            # by dgamma/DK/DQ. Keep a compact [chunk, R, R] shared cache instead
++            # of the full [chunk*R, chunk*R] tile.
++            dqk_diag_shared = T.alloc_shared([chunk_size, R, R], accum_dtype)
+ 
+             q_pre_rot_shared = T.alloc_shared([fused_chunk_size, N], dtype)
+             k_pre_rot_shared = T.alloc_shared([fused_chunk_size, N], dtype)
+@@ -652,7 +655,6 @@ def mamba_mimo_bwd_bwd(
+                     lkq_masked__or__dkq_masked_shared: tilelang.layout.make_swizzled_layout(lkq_masked__or__dkq_masked_shared),
+ 
+                     dPsiV_combined_shared: tilelang.layout.make_swizzled_layout(dPsiV_combined_shared),
+-                    dqk_from_diag_shared: tilelang.layout.make_swizzled_layout(dqk_from_diag_shared),
+ 
+                     k_pre_rot_shared: tilelang.layout.make_swizzled_layout(k_pre_rot_shared),
+                     q_pre_rot_shared: tilelang.layout.make_swizzled_layout(q_pre_rot_shared),
+@@ -906,21 +908,28 @@ def mamba_mimo_bwd_bwd(
+                 for cs, r, p in T.Parallel(chunk_size, R, P):
+                     PsiV_shared[cs*R + r, p] = PsiV_frag[cs, r, p]
+ 
+-                # Compute dqk_from_diag, which is the contribution to dQ/dK from qk_dot:
+-                dqk_from_diag_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], accum_dtype)
+-                T.gemm(dPhiO_shared, PsiV_shared, dqk_from_diag_frag, transpose_B=True, clear_accum=True) # (cs*r_out, cs*r_in)
++                # Compute only the per-step R x R qk-dot diagonal consumer.
++                # The original full fused_chunk_size x fused_chunk_size GEMM
++                # materializes cross-step blocks that this path never consumes.
++                for cs, r_out, r_in in T.Parallel(chunk_size, R, R):
++                    dqk_diag_acc = T.alloc_var(accum_dtype)
++                    dqk_diag_acc = 0.0
++                    for p in T.serial(P):
++                        dqk_diag_acc += (
++                            dPhiO_shared[cs * R + r_out, p]
++                            * PsiV_shared[cs * R + r_in, p]
++                        )
++                    dqk_diag_shared[cs, r_out, r_in] = dqk_diag_acc
+                 # Compute dgamma_diag.
+-                # TMA-fix: dgamma_diag_prereduce_frag flattened to [chunk_size, R*R] to
+-                # match the 2D qk_dot_shared. The reduce_sum below no longer needs a view.
+-                dgamma_diag_prereduce_frag = T.alloc_fragment([chunk_size, R * R], accum_dtype)
+-                T.copy(qk_dot_shared, dgamma_diag_prereduce_frag)
+-                T.copy(dqk_from_diag_frag, dqk_from_diag_shared)
++                dgamma_diag_prereduce_frag = T.alloc_fragment([chunk_size, R, R], accum_dtype)
++                for cs, r_out, r_in in T.Parallel(chunk_size, R, R):
++                    dgamma_diag_prereduce_frag[cs, r_out, r_in] = qk_dot_shared[cs, r_out * R + r_in]
+                 for cs, r_out, r_in in T.Parallel(chunk_size, R, R):
+-                    dgamma_diag_prereduce_frag[cs, r_out * R + r_in] *= dqk_from_diag_shared[cs*R + r_out, cs*R + r_in]
++                    dgamma_diag_prereduce_frag[cs, r_out, r_in] *= dqk_diag_shared[cs, r_out, r_in]
+ 
+                 dgamma_diag_reduced_frag = T.alloc_fragment([chunk_size], accum_dtype)
+                 T.reduce_sum(
+-                    dgamma_diag_prereduce_frag,
++                    T.view(dgamma_diag_prereduce_frag, shape=[chunk_size, R*R]),
+                     dgamma_diag_reduced_frag,
+                     dim=-1,
+                     clear=True
+@@ -929,9 +938,8 @@ def mamba_mimo_bwd_bwd(
+                 # Apply shifted gamma to dqk:
+                 gamma_qk_frag = T.alloc_fragment([chunk_size], accum_dtype)
+                 T.copy(gamma_cached_frag, gamma_qk_frag) # Apply shifted gamma
+-                for csr_i, csr_j in T.Parallel(fused_chunk_size, fused_chunk_size):
+-                    dqk_from_diag_frag[csr_i, csr_j] *= gamma_qk_frag[csr_i//R]
+-                T.copy(dqk_from_diag_frag, dqk_from_diag_shared)
++                for cs, r_out, r_in in T.Parallel(chunk_size, R, R):
++                    dqk_diag_shared[cs, r_out, r_in] *= gamma_qk_frag[cs]
+ 
+                 # --- dK Path + ddA Terms ---
+                 dk_frag = T.alloc_fragment([fused_chunk_size, N], accum_dtype)
+@@ -1093,7 +1101,7 @@ def mamba_mimo_bwd_bwd(
+                     cs = csr_in // R
+                     for r_out in T.serial(R):
+                         csr_out = cs*R + r_out
+-                        dk_combined_frag[csr_in, n] += dqk_from_diag_shared[csr_out, csr_in] * q_dk_frag_reshaped[cs, r_out, n]  
++                        dk_combined_frag[csr_in, n] += dqk_diag_shared[cs, r_out, csr_in % R] * q_dk_frag_reshaped[cs, r_out, n]  
+                 # Copy to gmem:
+                 T.copy(dk_combined_frag, DK[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, i_h, :])
+ 
+@@ -1134,7 +1142,7 @@ def mamba_mimo_bwd_bwd(
+                     cs = csr_out // R
+                     for r_in in T.serial(R):
+                         csr_in = cs*R + r_in
+-                        dq_frag[csr_out, n] += dqk_from_diag_shared[csr_out, csr_in] * k_pre_rot_shared[csr_in, n]
++                        dq_frag[csr_out, n] += dqk_diag_shared[cs, csr_out % R, r_in] * k_pre_rot_shared[csr_in, n]
+                 # Copy to gmem:
+                 T.copy(dq_frag, DQ[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, i_h, :])
+ 

@@ -1,0 +1,628 @@
+--- a/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
++++ b/mamba_ssm/ops/tilelang/mamba3/mamba3_mimo_bwd.py
+@@ -35,8 +35,8 @@
+ @tilelang.jit(
+     out_idx=[],
+     pass_configs={
+-        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: False,
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: False,
+         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+     })
+ def mamba_mimo_bwd_fwd(
+@@ -71,30 +71,38 @@
+     @T.prim_func
+     def mamba_mimo_bwd_fwd_kernel(
+             DOUT: T.Tensor(DOUT_shape, dtype),  # type: ignore
+-            Q: T.Tensor([B, S, R, G, N], dtype),  # type: ignore
+-            K: T.Tensor([B, S, R, G, N], dtype),  # type: ignore
++            # TMA-fix: Q/K flattened from [B, S, R, G, N] to [B, S*R, G, N] so TileLang
++            # can emit a 2D TMA descriptor for the chunked load of fused_chunk_size rows.
++            Q: T.Tensor([B, S * R, G, N], dtype),  # type: ignore
++            K: T.Tensor([B, S * R, G, N], dtype),  # type: ignore
+             V: T.Tensor([B, S, H, P], dtype),  # type: ignore
+             Q_BIAS: T.Tensor([H, R, N], T.float32),  # type: ignore
+             K_BIAS: T.Tensor([H, R, N], T.float32),  # type: ignore
+             MIMO_V: T.Tensor([H, R, P], T.float32), # type: ignore
+             MIMO_O: T.Tensor([H, R, P], T.float32), # type: ignore
+-            
++
+             DMIMO_O: T.Tensor([B, H, R, P], T.float32), # type: ignore
+-            STATES: T.Tensor([B, H, nchunks, N, P], dtype), # type: ignore 
++            STATES: T.Tensor([B * H * nchunks * N, P], dtype), # type: ignore
+ 
+             Z: T.Tensor([B, S, H, P], dtype),  # type: ignore
+             MIMO_Z: T.Tensor([H, R, P], T.float32), # type: ignore
+             DZ: T.Tensor([B, S, H, P], dtype),  # type: ignore
+             DMIMO_Z: T.Tensor([B, H, R, P], T.float32), # type: ignore
+             ANGLES: T.Tensor([B, S, H, N//rotary_dim_divisor], T.float32), # type: ignore
+-            DA_CS: T.Tensor([B, H, S], T.float32), # type: ignore
+-            DA_CS_REV: T.Tensor([B, H, S], T.float32), # type: ignore
+-            DT: T.Tensor([B, H, S], T.float32), # type: ignore
++            # TMA-fix stage2: flatten small float32 [B,H,S] vectors to [B*H,S].
++            # A chunk copy is now a contiguous row slice with a rank-2 tensor map
++            # (globalDim [S, B*H], boxDim [chunk_size, 1]) instead of the
++            # failing rank-3 [S,H,B] map. The public wrapper passes zero-copy views.
++            DA_CS: T.Tensor([B * H, S], T.float32), # type: ignore
++            DA_CS_REV: T.Tensor([B * H, S], T.float32), # type: ignore
++            DT: T.Tensor([B * H, S], T.float32), # type: ignore
+             TRAP: T.Tensor([B, H, S], dtype), # type: ignore
+             D: T.Tensor([H], T.float32),  # type: ignore
+ 
+-            QK_DOT: T.Tensor([B, H, S, R, R], dtype), # type: ignore
+-            
++            # TMA-fix: QK_DOT flattened from [B, H, S, R, R] to [B, H, S, R*R] so the
++            # chunk-slice T.copy reads a 2D [chunk_size, R*R] tile (TMA-legal rank-2).
++            QK_DOT: T.Tensor([B, H, S, R * R], dtype), # type: ignore
++
+             SEGSUM: T.Tensor([B, H, nchunks, chunk_size, chunk_size], T.float32), # type: ignore
+             ):
+         """
+@@ -125,6 +133,7 @@
+             # --- Kernel Setup ---
+             # GQA support: map V head to Q/K head
+             i_h_qk = i_h // (H // G)
++            i_bh = i_b * H + i_h
+ 
+             # --- Buffer Allocation ---
+             q_shared = T.alloc_shared([fused_chunk_size, N], dtype)
+@@ -185,6 +194,7 @@
+             for i in T.Pipelined(0, nchunks, num_stages=num_stages):
+                 chunk_start = i * chunk_size
+                 fused_chunk_start = chunk_start * R
++                i_state = i_bh * nchunks + i
+ 
+                 # --- Discretization Factors (Shifted Gamma + Trap Scale) ---
+                 trap_shifted_frag = T.alloc_fragment([chunk_size], T.float32)
+@@ -197,7 +207,7 @@
+                     )
+                     dt_shifted_frag[cs] = T.if_then_else(
+                         chunk_start + cs + 1 < S,
+-                        DT[i_b, i_h, chunk_start + cs + 1],
++                        DT[i_bh, chunk_start + cs + 1],
+                         0.0,
+                     )
+                 shifted_gamma_frag = T.alloc_fragment([chunk_size], dtype)
+@@ -212,7 +222,7 @@
+                 trap_frag = T.alloc_fragment([chunk_size], T.float32)
+                 T.copy(TRAP[i_b, i_h, chunk_start: chunk_start+chunk_size], trap_frag)
+                 dt_frag = T.alloc_fragment([chunk_size], dtype)
+-                T.copy(DT[i_b, i_h, chunk_start: chunk_start+chunk_size], dt_frag)
++                T.copy(DT[i_bh, chunk_start: chunk_start+chunk_size], dt_frag)
+                 gamma_frag = T.alloc_fragment([chunk_size], T.float32)
+                 for cs in T.Parallel(chunk_size):
+                     gamma_frag[cs] = dt_frag[cs] * T.sigmoid(trap_frag[cs])
+@@ -231,30 +241,32 @@
+                 PsiV_reshaped_frag = T.view(PsiV_frag, shape=[fused_chunk_size, P])
+                 T.copy(PsiV_reshaped_frag, PsiV_shared)
+ 
+-                q_reshaped_shared = T.view(q_shared, shape=[chunk_size, R, N])
+-                T.copy(Q[i_b, chunk_start:chunk_start+chunk_size, :, i_h_qk, :], q_reshaped_shared)
+-                q_frag = T.alloc_fragment([chunk_size, R, N], dtype)
+-                T.copy(q_reshaped_shared, q_frag)
++                # TMA-fix: 2D load directly into q_shared [fused_chunk_size, N] since
++                # Q is now [B, S*R, G, N]. No rank-3 view needed.
++                T.copy(Q[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, i_h_qk, :], q_shared)
++                q_frag = T.alloc_fragment([fused_chunk_size, N], dtype)
++                T.copy(q_shared, q_frag)
+                 for cs, r, n in T.Parallel(chunk_size, R, N):
+-                    q_frag[cs, r, n] += q_bias_frag[r, n]
+-                T.copy(q_frag, q_reshaped_shared)
++                    q_frag[cs * R + r, n] += q_bias_frag[r, n]
++                T.copy(q_frag, q_shared)
+ 
+-                k_reshaped_shared = T.view(k_shared, shape=[chunk_size, R, N])
+-                T.copy(K[i_b, chunk_start:chunk_start+chunk_size, :, i_h_qk, :], k_reshaped_shared)
+-                k_frag = T.alloc_fragment([chunk_size, R, N], dtype)
+-                T.copy(k_reshaped_shared, k_frag)
++                # TMA-fix: 2D load directly into k_shared [fused_chunk_size, N].
++                T.copy(K[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, i_h_qk, :], k_shared)
++                k_frag = T.alloc_fragment([fused_chunk_size, N], dtype)
++                T.copy(k_shared, k_frag)
+                 for cs, r, n in T.Parallel(chunk_size, R, N):
+-                    k_frag[cs, r, n] += k_bias_frag[r, n]
+-                T.copy(k_frag, k_reshaped_shared)
++                    k_frag[cs * R + r, n] += k_bias_frag[r, n]
++                T.copy(k_frag, k_shared)
+ 
+                 # --- Cache Diagonal qk_dot Path ---
+                 # Keep full qk_dot in shared memory to reuse per-step R x R blocks.
+                 qk_dot_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], dtype=accum_dtype)
+                 T.gemm(q_shared, k_shared, qk_dot_frag, transpose_B=True, clear_accum=True)
+                 T.copy(qk_dot_frag, qk_dot_full_shared)
+-                # Output QK_DOT for the bwd_bwd kernel (per-time-step blocks only)
++                # Output QK_DOT for the bwd_bwd kernel (per-time-step blocks only).
++                # TMA-fix: QK_DOT is now [B, H, S, R*R]; pack (r_out, r_in) into the last dim.
+                 for cs, r_out, r_in in T.Parallel(chunk_size, R, R):
+-                    QK_DOT[i_b, i_h, chunk_start + cs, r_out, r_in] = \
++                    QK_DOT[i_b, i_h, chunk_start + cs, r_out * R + r_in] = \
+                         qk_dot_full_shared[cs * R + r_out, cs * R + r_in]
+ 
+                 # --- Rotary Q/K + Trap Scaling ---
+@@ -302,7 +314,7 @@
+ 
+                 # Strictly causal masking over chunk steps (exclude same-step diagonal).
+                 da_cs__or__exp_da_cs_shared = T.alloc_shared([chunk_size], T.float32)
+-                T.copy(DA_CS[i_b, i_h, chunk_start:chunk_start+chunk_size], da_cs__or__exp_da_cs_shared)       
++                T.copy(DA_CS[i_bh, chunk_start:chunk_start+chunk_size], da_cs__or__exp_da_cs_shared)       
+                 for csr_i, csr_j in T.Parallel(fused_chunk_size, fused_chunk_size):
+                     qk_intrachunk_frag[csr_i, csr_j] = T.if_then_else(
+                                                 csr_i//R > csr_j//R,
+@@ -457,11 +469,11 @@
+                         T.copy(dZeta_frag, dZeta_shared)
+ 
+                 # --- Save and Update Recurrent State ---
+-                T.copy(states_frag, STATES[i_b, i_h, i, :, :])
++                T.copy(states_frag, STATES[i_state * N:i_state * N + N, :])
+ 
+                 # DA_CS_REV scales stepwise K contribution into the new state.
+                 dA_cs_rev_frag = T.alloc_fragment([chunk_size], T.float32)
+-                T.copy(DA_CS_REV[i_b, i_h, chunk_start:chunk_start+chunk_size], dA_cs_rev_frag)
++                T.copy(DA_CS_REV[i_bh, chunk_start:chunk_start+chunk_size], dA_cs_rev_frag)
+                 # NOTE: we can recycle k_trap_scaled_frag from earlier, however,
+                 # that is slower, so choose to recopy from smem:
+                 k_state_frag = T.alloc_fragment([fused_chunk_size, N], dtype)
+@@ -472,9 +484,9 @@
+                 # DA_CS(last) applies chunk-level decay to the carried state.
+                 da_cs_sum = T.alloc_var(T.float32)
+                 if tail_len > 0 and i == nchunks - 1:
+-                    T.copy(DA_CS[i_b, i_h, S - 1], da_cs_sum)
++                    T.copy(DA_CS[i_bh, S - 1], da_cs_sum)
+                 else:
+-                    T.copy(DA_CS[i_b, i_h, chunk_start+chunk_size-1], da_cs_sum)
++                    T.copy(DA_CS[i_bh, chunk_start+chunk_size-1], da_cs_sum)
+                 for n, p in T.Parallel(N, P):
+                     states_frag[n, p] *= T.exp(da_cs_sum)
+                 T.gemm(k_state_frag, PsiV_shared, states_frag, transpose_A=True, clear_accum=False)
+@@ -498,8 +510,8 @@
+ @tilelang.jit(
+     out_idx=[],
+     pass_configs={
+-        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: False,
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: False,
+         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+     })
+ def mamba_mimo_bwd_bwd(
+@@ -534,8 +546,9 @@
+     @T.prim_func
+     def mamba_mimo_bwd_bwd_kernel(
+             DOUT: T.Tensor(DOUT_shape, dtype),  # type: ignore
+-            Q: T.Tensor([B, S, R, G, N], dtype),  # type: ignore
+-            K: T.Tensor([B, S, R, G, N], dtype),  # type: ignore
++            # TMA-fix: Q/K flattened from [B, S, R, G, N] to [B, S*R, G, N].
++            Q: T.Tensor([B, S * R, G, N], dtype),  # type: ignore
++            K: T.Tensor([B, S * R, G, N], dtype),  # type: ignore
+             V: T.Tensor([B, S, H, P], dtype),  # type: ignore
+             Q_BIAS: T.Tensor([H, R, N], T.float32),  # type: ignore
+             K_BIAS: T.Tensor([H, R, N], T.float32),  # type: ignore
+@@ -544,28 +557,32 @@
+             DK: T.Tensor([B, S*R, H, N], dtype),  # type: ignore
+             DV: T.Tensor([B, S, H, P], dtype),  # type: ignore
+             DMIMO_V: T.Tensor([B, H, R, P], T.float32), # type: ignore
+-            STATES: T.Tensor([B, H, nchunks, N, P], dtype), # type: ignore 
++            STATES: T.Tensor([B * H * nchunks * N, P], dtype), # type: ignore 
+             DQ: T.Tensor([B, S*R, H, N], dtype),  # type: ignore
+ 
+             Z: T.Tensor([B, S, H, P], dtype),  # type: ignore
+             MIMO_Z: T.Tensor([H, R, P], T.float32), # type: ignore
+             ANGLES: T.Tensor([B, S, H, N//rotary_dim_divisor], T.float32), # type: ignore
+-            DA_CS: T.Tensor([B, H, S], T.float32), # type: ignore
+-            DA_CS_REV: T.Tensor([B, H, S], T.float32), # type: ignore
+-            DT: T.Tensor([B, H, S], T.float32), # type: ignore
++            # TMA-fix stage2: flatten small float32 [B,H,S] vectors to [B*H,S].
++            # This keeps chunk vector copies TMA-compatible while preserving the
++            # public wrapper's original [B,H,S] tensors via zero-copy views.
++            DA_CS: T.Tensor([B * H, S], T.float32), # type: ignore
++            DA_CS_REV: T.Tensor([B * H, S], T.float32), # type: ignore
++            DT: T.Tensor([B * H, S], T.float32), # type: ignore
+             TRAP: T.Tensor([B, H, S], dtype), # type: ignore
+-            DFACTOR: T.Tensor([B, H, S], T.float32), # type: ignore
+-            DGAMMA_DIAG: T.Tensor([B, H, S], T.float32), # type: ignore
++            DFACTOR: T.Tensor([B * H, S], T.float32), # type: ignore
++            DGAMMA_DIAG: T.Tensor([B * H, S], T.float32), # type: ignore
+             DANGLES: T.Tensor([B, S, H, N//rotary_dim_divisor], T.float32), # type: ignore
+             D: T.Tensor([H], T.float32), # type: ignore
+             DD: T.Tensor([B, H], T.float32), # type: ignore
+ 
+-            QK_DOT: T.Tensor([B, H, S, R, R], dtype), # type: ignore
++            # TMA-fix: QK_DOT flattened from [B, H, S, R, R] to [B, H, S, R*R].
++            QK_DOT: T.Tensor([B, H, S, R * R], dtype), # type: ignore
+             # DQK_DOT: T.Tensor([B, H, S, R, R], dtype), # type: ignore
+-            DDA: T.Tensor([B, H, S], T.float32), # type: ignore
++            DDA: T.Tensor([B * H, S], T.float32), # type: ignore
+             DSSDA: T.Tensor([B, H, nchunks, chunk_size, chunk_size], T.float32), # type: ignore
+-            DDA_CS_REV: T.Tensor([B, H, S], T.float32), # type: ignore
+-            DDA_CS: T.Tensor([B, H, S], T.float32), # type: ignore
++            DDA_CS_REV: T.Tensor([B * H, S], T.float32), # type: ignore
++            DDA_CS: T.Tensor([B * H, S], T.float32), # type: ignore
+ 
+             SEGSUM: T.Tensor([B, H, nchunks, chunk_size, chunk_size], T.float32), # type: ignore
+             ):
+@@ -598,6 +615,7 @@
+             # --- Kernel Setup ---
+             # GQA support: map V head to Q/K head
+             i_h_qk = i_h // (H // G)
++            i_bh = i_b * H + i_h
+ 
+             # --- Buffer Allocation ---
+             dstates_shared = T.alloc_shared([N, P], dtype)
+@@ -624,7 +642,9 @@
+             dk_shared = T.alloc_shared([fused_chunk_size, N], dtype)
+             dq_shared = T.alloc_shared([fused_chunk_size, N], dtype)
+ 
+-            qk_dot_shared = T.alloc_shared([chunk_size, R, R], dtype)
++            # TMA-fix: qk_dot_shared flattened from [chunk_size, R, R] to [chunk_size, R*R]
++            # so TileLang can emit a rank-2 TMA descriptor for the gmem->smem load.
++            qk_dot_shared = T.alloc_shared([chunk_size, R * R], dtype)
+ 
+             k_pre_trap_shared = T.alloc_shared([fused_chunk_size, N], dtype)
+ 
+@@ -685,6 +705,7 @@
+                 chunk_idx = nchunks - 1 - chunk_idx_rev
+                 chunk_start = chunk_idx * chunk_size
+                 fused_chunk_start = chunk_start * R
++                i_state = i_bh * nchunks + chunk_idx
+ 
+                 # --- Discretization Factors (Shifted Gamma + Trap Scale) ---
+                 trap_shifted_frag = T.alloc_fragment([chunk_size], T.float32)
+@@ -697,7 +718,7 @@
+                     )
+                     dt_shifted_frag[cs] = T.if_then_else(
+                         chunk_start + cs + 1 < S,
+-                        DT[i_b, i_h, chunk_start + cs + 1],
++                        DT[i_bh, chunk_start + cs + 1],
+                         0.0,
+                     )
+                 shifted_gamma_frag = T.alloc_fragment([chunk_size], dtype)
+@@ -709,7 +730,7 @@
+                 trap_frag = T.alloc_fragment([chunk_size], T.float32)
+                 T.copy(TRAP[i_b, i_h, chunk_start: chunk_start+chunk_size], trap_frag)
+                 dt_frag = T.alloc_fragment([chunk_size], dtype)
+-                T.copy(DT[i_b, i_h, chunk_start: chunk_start+chunk_size], dt_frag)
++                T.copy(DT[i_bh, chunk_start: chunk_start+chunk_size], dt_frag)
+                 gamma_frag = T.alloc_fragment([chunk_size], T.float32)
+                 for cs in T.Parallel(chunk_size):
+                     gamma_frag[cs] = dt_frag[cs] * T.sigmoid(trap_frag[cs])
+@@ -755,17 +776,15 @@
+                     T.reduce_sum(T.view(dPhiO_frag, shape=[fused_chunk_size*P]), dD_frag, clear=False)
+ 
+                 # --- Prepare Rotated/Scaled QK and Compute dPsiV ---
+-                # Load q and apply q_bias to it:
+-                for cs, r, n in T.Parallel(chunk_size, R, N):
+-                    q_shared[cs*R + r, n] = Q[i_b, chunk_start+cs, r, i_h_qk, n]
+-                
+-                q_frag = T.alloc_fragment([chunk_size, R, N], dtype)
+-                for cs, r, n in T.Parallel(chunk_size, R, N):
+-                    q_frag[cs, r, n] = q_shared[cs*R + r, n]
+-                for cs, r, n in T.Parallel(chunk_size, R, N):
+-                    q_frag[cs, r, n] += q_bias_frag[r, n]
++                # Load q and apply q_bias to it.
++                # TMA-fix: Q is now [B, S*R, G, N]; read row-major without rank-5 indexing.
++                T.copy(Q[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, i_h_qk, :], q_shared)
++
++                q_frag = T.alloc_fragment([fused_chunk_size, N], dtype)
++                T.copy(q_shared, q_frag)
+                 for cs, r, n in T.Parallel(chunk_size, R, N):
+-                    q_shared[cs*R + r, n] = q_frag[cs, r, n]
++                    q_frag[cs * R + r, n] += q_bias_frag[r, n]
++                T.copy(q_frag, q_shared)
+                 T.copy(q_shared, q_pre_rot_shared) # Save pre-rotated q for later:
+                 # Apply rotary to q:
+                 q_first_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
+@@ -779,26 +798,27 @@
+                     q_shared[cs*R + r, n] = T.cos(angles_frag[cs, n]) * q_first_half_frag[cs, r, n] - T.sin(angles_frag[cs, n]) * q_second_half_frag[cs, r, n]
+                     q_shared[cs*R + r, N//2 + n] = T.sin(angles_frag[cs, n]) * q_first_half_frag[cs, r, n] + T.cos(angles_frag[cs, n]) * q_second_half_frag[cs, r, n]
+ 
+-                # Load k and apply k_bias to it:
+-                k_reshaped_shared = T.view(k_pre_trap_shared, shape=[chunk_size, R, N])
+-                T.copy(K[i_b, chunk_start:chunk_start+chunk_size, :, i_h_qk, :], k_reshaped_shared)
+-                k_frag = T.alloc_fragment([chunk_size, R, N], dtype)
+-                T.copy(k_reshaped_shared, k_frag)
++                # Load k and apply k_bias to it.
++                # TMA-fix: 2D load directly into k_pre_trap_shared [fused_chunk_size, N] -
++                # K is now [B, S*R, G, N] so the rank-3 view is gone.
++                T.copy(K[i_b, fused_chunk_start:fused_chunk_start+fused_chunk_size, i_h_qk, :], k_pre_trap_shared)
++                k_frag = T.alloc_fragment([fused_chunk_size, N], dtype)
++                T.copy(k_pre_trap_shared, k_frag)
+                 for cs, r, n in T.Parallel(chunk_size, R, N):
+-                    k_frag[cs, r, n] += k_bias_frag[r, n]
+-                T.copy(k_frag, k_reshaped_shared)
++                    k_frag[cs * R + r, n] += k_bias_frag[r, n]
++                T.copy(k_frag, k_pre_trap_shared)
+                 # Save pre-rotated k for later:
+                 for csr, n in T.Parallel(fused_chunk_size, N):
+                     k_pre_rot_shared[csr, n] = k_pre_trap_shared[csr, n]
+-                # Apply rotary to k:
++                # Apply rotary to k (access via 2D index [cs*R + r, n]):
+                 k_first_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
+                 k_second_half_frag = T.alloc_fragment([chunk_size, R, N//rotary_dim_divisor], dtype)
+                 for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
+-                    k_first_half_frag[cs, r, n] = k_reshaped_shared[cs, r, n]
+-                    k_second_half_frag[cs, r, n] = k_reshaped_shared[cs, r, N//2 + n]
++                    k_first_half_frag[cs, r, n] = k_pre_trap_shared[cs*R + r, n]
++                    k_second_half_frag[cs, r, n] = k_pre_trap_shared[cs*R + r, N//2 + n]
+                 for cs, r, n in T.Parallel(chunk_size, R, N//rotary_dim_divisor):
+-                    k_reshaped_shared[cs, r, n] = T.cos(angles_frag[cs, n]) * k_first_half_frag[cs, r, n] - T.sin(angles_frag[cs, n]) * k_second_half_frag[cs, r, n]
+-                    k_reshaped_shared[cs, r, N//2 + n] = T.sin(angles_frag[cs, n]) * k_first_half_frag[cs, r, n] + T.cos(angles_frag[cs, n]) * k_second_half_frag[cs, r, n]
++                    k_pre_trap_shared[cs*R + r, n] = T.cos(angles_frag[cs, n]) * k_first_half_frag[cs, r, n] - T.sin(angles_frag[cs, n]) * k_second_half_frag[cs, r, n]
++                    k_pre_trap_shared[cs*R + r, N//2 + n] = T.sin(angles_frag[cs, n]) * k_first_half_frag[cs, r, n] + T.cos(angles_frag[cs, n]) * k_second_half_frag[cs, r, n]
+                 # Apply Trap-specific scaling:
+                 k_trap_scaled_frag = T.alloc_fragment([fused_chunk_size, N], dtype)
+                 T.copy(k_pre_trap_shared, k_trap_scaled_frag)
+@@ -811,7 +831,7 @@
+                 T.gemm(k_shared, dstates_shared, dPsiV_frag, clear_accum=True)
+                 dA_cs_rev_frag = T.alloc_fragment([chunk_size], T.float32)
+                 dA_cs_rev_shared = T.alloc_shared([chunk_size], T.float32)
+-                T.copy(DA_CS_REV[i_b, i_h, chunk_start:chunk_start+chunk_size], dA_cs_rev_shared)
++                T.copy(DA_CS_REV[i_bh, chunk_start:chunk_start+chunk_size], dA_cs_rev_shared)
+                 T.copy(dA_cs_rev_shared, dA_cs_rev_frag)
+                 for csr, p in T.Parallel(fused_chunk_size, P):
+                     # DA_CS_REV scales per-step state contribution into dPsiV.
+@@ -857,17 +877,16 @@
+                 # Compute the contribution from the qk_dot term:
+                 # NOTE: recomputing qk_dot here is much slower than just loading from
+                 # the result of the bwd_fwd kernel
+-                qk_dot_frag = T.alloc_fragment([chunk_size, R, R], dtype)
+-                T.copy(QK_DOT[i_b, i_h, chunk_start:chunk_start+chunk_size, :, :], qk_dot_shared)
+-                T.copy(qk_dot_shared, qk_dot_frag)
++                # TMA-fix: qk_dot_frag flattened to [chunk_size, R*R]; load from
++                # [B, H, S, R*R] gmem into [chunk_size, R*R] smem (rank-2 TMA legal).
++                T.copy(QK_DOT[i_b, i_h, chunk_start:chunk_start+chunk_size, :], qk_dot_shared)
+                 gamma_dPsiV_frag = T.alloc_fragment([chunk_size], dtype)
+                 T.copy(gamma_frag, gamma_dPsiV_frag)
+-                for csr, p in T.Parallel(fused_chunk_size, P):
+-                    cs = csr // R
+-                    r_in = csr % R
++                for cs, r_in, p in T.Parallel(chunk_size, R, P):
++                    csr = cs * R + r_in
+                     for r_out in T.serial(R):
+                         csr_out = cs * R + r_out
+-                        dPsiV_D_fused_frag[csr, p] += dPhiO_shared[csr_out, p] * qk_dot_frag[cs, r_out, r_in] * gamma_dPsiV_frag[cs]
++                        dPsiV_D_fused_frag[csr, p] += dPhiO_shared[csr_out, p] * qk_dot_shared[cs, r_out * R + r_in] * gamma_dPsiV_frag[cs]
+                 T.copy(dPsiV_D_fused_frag, dPsiV_combined_shared)
+ 
+                 # --- Compute dV and dPsi from dPsiV ---
+@@ -903,21 +922,23 @@
+                 # Compute dqk_from_diag, which is the contribution to dQ/dK from qk_dot:
+                 dqk_from_diag_frag = T.alloc_fragment([fused_chunk_size, fused_chunk_size], accum_dtype)
+                 T.gemm(dPhiO_shared, PsiV_shared, dqk_from_diag_frag, transpose_B=True, clear_accum=True) # (cs*r_out, cs*r_in)
+-                # Compute dgamma_diag
+-                dgamma_diag_prereduce_frag = T.alloc_fragment([chunk_size, R, R], accum_dtype)
++                # Compute dgamma_diag.
++                # TMA-fix: dgamma_diag_prereduce_frag flattened to [chunk_size, R*R] to
++                # match the 2D qk_dot_shared. The reduce_sum below no longer needs a view.
++                dgamma_diag_prereduce_frag = T.alloc_fragment([chunk_size, R * R], accum_dtype)
+                 T.copy(qk_dot_shared, dgamma_diag_prereduce_frag)
+                 T.copy(dqk_from_diag_frag, dqk_from_diag_shared)
+                 for cs, r_out, r_in in T.Parallel(chunk_size, R, R):
+-                    dgamma_diag_prereduce_frag[cs, r_out, r_in] *= dqk_from_diag_shared[cs*R + r_out, cs*R + r_in]
++                    dgamma_diag_prereduce_frag[cs, r_out * R + r_in] *= dqk_from_diag_shared[cs*R + r_out, cs*R + r_in]
+ 
+                 dgamma_diag_reduced_frag = T.alloc_fragment([chunk_size], accum_dtype)
+                 T.reduce_sum(
+-                    T.view(dgamma_diag_prereduce_frag, shape=[chunk_size, R*R]),
++                    dgamma_diag_prereduce_frag,
+                     dgamma_diag_reduced_frag,
+                     dim=-1,
+                     clear=True
+                     )
+-                T.copy(dgamma_diag_reduced_frag, DGAMMA_DIAG[i_b, i_h, chunk_start:chunk_start+chunk_size])
++                T.copy(dgamma_diag_reduced_frag, DGAMMA_DIAG[i_bh, chunk_start:chunk_start+chunk_size])
+                 # Apply shifted gamma to dqk:
+                 gamma_qk_frag = T.alloc_fragment([chunk_size], accum_dtype)
+                 T.copy(gamma_cached_frag, gamma_qk_frag) # Apply shifted gamma
+@@ -937,7 +958,7 @@
+                 ddA_state_kv_prereduce_frag_reshaped = T.view(ddA_state_kv_prereduce_frag, shape=[chunk_size, R*N])
+                 ddA_state_kv_frag = T.alloc_fragment([chunk_size], accum_dtype)
+                 T.reduce_sum(ddA_state_kv_prereduce_frag_reshaped, ddA_state_kv_frag, dim=-1, clear=True)
+-                T.copy(ddA_state_kv_frag, DDA_CS_REV[i_b, i_h, chunk_start:chunk_start+chunk_size])
++                T.copy(ddA_state_kv_frag, DDA_CS_REV[i_bh, chunk_start:chunk_start+chunk_size])
+ 
+                 # Interchunk path uses k_scaled * exp(dA_cs_rev) in forward,
+                 # so apply exp(dA_cs_rev) to the interchunk dk term only.
+@@ -986,7 +1007,7 @@
+                     dfactor_prereduce_frag[cs, r, n] = k_factor_frag[cs, r, n] * dk_nodiag_frag[cs*R + r, n]
+                 dfactor_frag = T.alloc_fragment([chunk_size], accum_dtype)
+                 T.reduce_sum(T.view(dfactor_prereduce_frag, shape=[chunk_size, R*N]), dfactor_frag, dim=-1, clear=True)
+-                T.copy(dfactor_frag, DFACTOR[i_b, i_h, chunk_start:chunk_start+chunk_size])
++                T.copy(dfactor_frag, DFACTOR[i_bh, chunk_start:chunk_start+chunk_size])
+                 # Account for the effect of trap_scale = gamma + shifted_gamma:
+                 trap_scale_dk_frag = T.alloc_fragment([chunk_size], dtype)
+                 T.copy(trap_scale_shared, trap_scale_dk_frag)
+@@ -995,7 +1016,7 @@
+                 T.copy(dk_nodiag_frag, dk_shared)
+ 
+                 # --- State-Passing ddA Terms + Interchunk dQ ---
+-                T.copy(STATES[i_b, i_h, chunk_idx, :, :], states_shared) # Load cached states from bwd_fwd
++                T.copy(STATES[i_state * N:i_state * N + N, :], states_shared) # Load cached states from bwd_fwd
+                 # NOTE: Compute the contribution of state passing (part 3 of 4)
+                 states_frag = T.alloc_fragment([N, P], T.float32)
+                 T.copy(states_shared, states_frag)
+@@ -1003,9 +1024,9 @@
+                 ddA_state_passing_prereduce_frag = T.alloc_fragment([N, P], T.float32)
+                 da_cs_sum = T.alloc_var(T.float32)
+                 if tail_len > 0 and chunk_idx == nchunks - 1:
+-                    T.copy(DA_CS[i_b, i_h, S - 1], da_cs_sum)
++                    T.copy(DA_CS[i_bh, S - 1], da_cs_sum)
+                 else:
+-                    T.copy(DA_CS[i_b, i_h, chunk_start+chunk_size-1], da_cs_sum)
++                    T.copy(DA_CS[i_bh, chunk_start+chunk_size-1], da_cs_sum)
+                 for n, p in T.Parallel(N, P):
+                     ddA_state_passing_prereduce_frag[n, p] = (
+                         states_frag[n, p] 
+@@ -1020,7 +1041,7 @@
+                 dda_frag = T.alloc_fragment([chunk_size,], T.float32)
+                 for cs in T.Parallel(chunk_size):
+                     dda_frag[cs] = ddA_state_passing[0]
+-                T.copy(dda_frag, DDA[i_b, i_h, chunk_start:chunk_start+chunk_size])
++                T.copy(dda_frag, DDA[i_bh, chunk_start:chunk_start+chunk_size])
+ 
+                 dq_frag = T.alloc_fragment([fused_chunk_size, N], accum_dtype)
+                 T.gemm(dPhiO_shared, states_shared, dq_frag, transpose_B=True, clear_accum=True)
+@@ -1032,12 +1053,12 @@
+                 dda_cs_frag = T.alloc_fragment([chunk_size], accum_dtype)
+                 T.reduce_sum(T.view(dda_cs_prereduce_frag, shape=[chunk_size, R*N]), 
+                              dda_cs_frag, dim=-1, clear=True)
+-                T.copy(dda_cs_frag, DDA_CS[i_b, i_h, chunk_start:chunk_start+chunk_size])
++                T.copy(dda_cs_frag, DDA_CS[i_bh, chunk_start:chunk_start+chunk_size])
+ 
+                 dA_cs_dq_frag = T.alloc_fragment([chunk_size], T.float32)
+                 dA_cs_shared = T.alloc_shared([chunk_size], T.float32)
+ 
+-                T.copy(DA_CS[i_b, i_h, chunk_start:chunk_start+chunk_size], dA_cs_shared)
++                T.copy(DA_CS[i_bh, chunk_start:chunk_start+chunk_size], dA_cs_shared)
+                 T.copy(dA_cs_shared, dA_cs_dq_frag)
+                 for csr, n in T.Parallel(fused_chunk_size, N):
+                     # DA_CS scales interchunk q-state contribution in backward.
+@@ -1133,9 +1154,9 @@
+                 # --- Update Reverse-Passed State Gradient ---
+                 da_cs_sum_dstates = T.alloc_var(T.float32)
+                 if tail_len > 0 and chunk_idx == nchunks - 1:
+-                    T.copy(DA_CS[i_b, i_h, S - 1], da_cs_sum_dstates)
++                    T.copy(DA_CS[i_bh, S - 1], da_cs_sum_dstates)
+                 else:
+-                    T.copy(DA_CS[i_b, i_h, chunk_start+chunk_size-1], da_cs_sum_dstates)
++                    T.copy(DA_CS[i_bh, chunk_start+chunk_size-1], da_cs_sum_dstates)
+                 for n, p in T.Parallel(N, P):
+                     dstates_frag[n, p] *= T.exp(da_cs_sum_dstates)
+                 dPhiO_scaled_frag = T.alloc_fragment([fused_chunk_size, P], dtype)
+@@ -1177,9 +1198,9 @@
+         rotary_dim_divisor,
+         dtype,
+         bf_threads=128,
+-        bf_num_stages=0,
++        bf_num_stages=2,
+         bb_threads=256,
+-        bb_num_stages=0,
++        bb_num_stages=2,
+         ):
+     # TileLang kernel expects contiguous last-dim strides for DOUT.
+     B, S, R, G, N = q.shape
+@@ -1195,41 +1216,56 @@
+     else:
+         dz_tilelang = None
+         dmimo_z = None
+-    qk_dot = torch.zeros([B, H, S, R, R], dtype=q.dtype, device=q.device)
++    # TMA-fix: qk_dot flattened from [B, H, S, R, R] to [B, H, S, R*R] so the
++    # kernel can load a rank-2 [chunk_size, R*R] smem tile via TMA. Storage is
++    # identical (row-major contiguous) - writers/readers reshape to match.
++    qk_dot = torch.zeros([B, H, S, R * R], dtype=q.dtype, device=q.device)
+ 
+ 
+     if isinstance(dtype, torch.dtype):
+         dtype_str = str(dtype).replace("torch.", "")
+     else:
+         dtype_str = dtype
+-    bwd_fwd_kernel = mamba_mimo_bwd_fwd(B, S, H, G, N, P, R, 
++    bwd_fwd_kernel = mamba_mimo_bwd_fwd(B, S, H, G, N, P, R,
+                                              z is not None,
+                                              D is not None,
+                                              reduceO,
+-                                             chunk_size, 
++                                             chunk_size,
+                                              rotary_dim_divisor,
+                                              dtype_str,
+                                              bf_threads,
+                                              bf_num_stages)
++    # TMA-fix: Q/K flattened from [B, S, R, G, N] to [B, S*R, G, N] before hand-off.
++    # torch.Tensor.view is contiguous because (R, G, N) are the last three dims
++    # and (S, R) are adjacent - no data motion, just a new stride descriptor.
++    q_flat = q.view(B, S * R, G, N)
++    k_flat = k.view(B, S * R, G, N)
++    bh = B * H
++    # TMA-fix stage2: keep the public [B,H,S] layout, but pass [B*H,S]
++    # views into TileLang so vector chunk copies use rank-2 aligned TMA maps.
++    dA_cs_flat = dA_cs.view(bh, S)
++    dA_cs_rev_flat = dA_cs_rev.view(bh, S)
++    dt_flat = dt.view(bh, S)
++    states_flat = states.view(bh * math.ceil(S/chunk_size) * N, P)
+     bwd_fwd_kernel(
+                     dout,
+-                    q, 
+-                    k, 
+-                    v, 
++                    q_flat,
++                    k_flat,
++                    v,
+                     q_bias,
+                     k_bias,
+                     mimo_v, 
+                     mimo_o,
+                     dmimo_o,
+-                    states,
++                    states_flat,
+                     z,
+                     mimo_z,
+                     dz_tilelang,
+                     dmimo_z,
+                     angles,
+-                    dA_cs,
+-                    dA_cs_rev,
+-                    dt,
++                    dA_cs_flat,
++                    dA_cs_rev_flat,
++                    dt_flat,
+                     trap,
+                     D,
+                     qk_dot,
+@@ -1251,6 +1287,11 @@
+     dSSdA = torch.zeros([B, H, math.ceil(S/chunk_size), chunk_size, chunk_size], dtype=torch.float32, device=dt.device)
+     ddA_cs_rev = torch.zeros([B, H, S], dtype=torch.float32, device=dt.device)
+     ddA_cs = torch.zeros([B, H, S], dtype=torch.float32, device=dt.device)
++    dfactor_flat = dfactor.view(bh, S)
++    dgamma_diag_flat = dgamma_diag.view(bh, S)
++    ddA_flat = ddA.view(bh, S)
++    ddA_cs_rev_flat = ddA_cs_rev.view(bh, S)
++    ddA_cs_flat = ddA_cs.view(bh, S)
+     
+     
+     bwd_bwd_kernel = mamba_mimo_bwd_bwd(B, S, H, G, N, P, R, 
+@@ -1264,8 +1305,8 @@
+                                              bb_num_stages)
+     bwd_bwd_kernel(
+             dout,
+-            q, 
+-            k,
++            q_flat,
++            k_flat,
+             v,
+             q_bias,
+             k_bias,
+@@ -1274,25 +1315,25 @@
+             dk_tilelang.view(B, S*R, H, N), 
+             dv_tilelang, 
+             dmimo_v,
+-            states,
++            states_flat,
+             dq_tilelang.view(B, S*R, H, N),
+             z,
+             mimo_z,
+             angles,
+-            dA_cs,
+-            dA_cs_rev,
+-            dt,
++            dA_cs_flat,
++            dA_cs_rev_flat,
++            dt_flat,
+             trap,
+-            dfactor,
+-            dgamma_diag,
++            dfactor_flat,
++            dgamma_diag_flat,
+             dangles,
+             D,
+             dD,
+             qk_dot,
+-            ddA,
++            ddA_flat,
+             dSSdA,
+-            ddA_cs_rev,
+-            ddA_cs,
++            ddA_cs_rev_flat,
++            ddA_cs_flat,
+             segsum,
+             )
+     
