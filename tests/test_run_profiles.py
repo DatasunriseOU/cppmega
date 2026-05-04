@@ -304,6 +304,8 @@ def test_compact_direct_contract_selects_required_direct_defaults(capsys, monkey
     assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_BACKEND=off" in out
     assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_SWIZZLED=0" in out
     assert "export CPPMEGA_TE_MXFP8_TRANSPOSE_EMIT_STRICT=0" in out
+    assert "export CPPMEGA_TE_MXFP8_GROUPED_QUANTIZE_PRODUCER=single_output" in out
+    assert "export CPPMEGA_TE_MXFP8_BWD_ALLOW_BF16_FALLBACK=0" in out
 
 
 def test_swizzled_cutlass_scale_cli_selects_cutlass_native(capsys, monkeypatch):
