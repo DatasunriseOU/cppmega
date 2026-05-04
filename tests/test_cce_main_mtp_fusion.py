@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +17,81 @@ from cppmega.megatron.mtp_native_hopper_ce import (
     attach_fused_main_mtp_cce_loss,
     fused_main_mtp_cce_loss,
 )
+
+
+class _FakeMTPLossAutoScaler(torch.autograd.Function):
+    main_loss_backward_scale = torch.tensor(1.0)
+
+    @staticmethod
+    def forward(ctx, output, mtp_loss):
+        ctx.save_for_backward(mtp_loss)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (mtp_loss,) = ctx.saved_tensors
+        scaled_mtp_loss_grad = torch.ones_like(
+            mtp_loss
+        ) * _FakeMTPLossAutoScaler.main_loss_backward_scale
+        return grad_output, scaled_mtp_loss_grad
+
+    @classmethod
+    def set_loss_scale(cls, loss_scale):
+        cls.main_loss_backward_scale = loss_scale
+
+
+class _FakeMTPLossLoggingHelper:
+    @staticmethod
+    def save_loss_to_tracker(*_args, **_kwargs):
+        return None
+
+
+def _fake_roll_tensor(tensor, shifts, dims, cp_group=None, packed_seq_params=None):
+    del cp_group, packed_seq_params
+    rolled = torch.roll(tensor, shifts=shifts, dims=dims).clone()
+    if shifts == -1 and dims == -1:
+        rolled[..., -1] = 0
+    num_tokens = rolled.sum() if rolled.dtype != torch.long else torch.ones_like(rolled).sum()
+    return rolled, num_tokens
+
+
+@pytest.fixture(autouse=True)
+def _fake_megatron_mtp_modules(monkeypatch):
+    """Keep these unit tests independent from a built TransformerEngine .so."""
+    mtp_mod = types.ModuleType("megatron.core.transformer.multi_token_prediction")
+
+    def _original_process_mtp_loss(**_kwargs):
+        raise AssertionError("original process_mtp_loss should not run")
+
+    mtp_mod.MTPLossAutoScaler = _FakeMTPLossAutoScaler
+    mtp_mod.MTPLossLoggingHelper = _FakeMTPLossLoggingHelper
+    mtp_mod.roll_tensor = _fake_roll_tensor
+    mtp_mod.process_mtp_loss = _original_process_mtp_loss
+
+    parallel_state_mod = types.ModuleType("megatron.core.parallel_state")
+    parallel_state_mod.get_data_parallel_group = lambda with_context_parallel=True: None
+
+    core_mod = types.ModuleType("megatron.core")
+    core_mod.parallel_state = parallel_state_mod
+
+    transformer_mod = types.ModuleType("megatron.core.transformer")
+    transformer_mod.multi_token_prediction = mtp_mod
+
+    megatron_mod = types.ModuleType("megatron")
+    megatron_mod.core = core_mod
+
+    for name, module in {
+        "megatron": megatron_mod,
+        "megatron.core": core_mod,
+        "megatron.core.parallel_state": parallel_state_mod,
+        "megatron.core.transformer": transformer_mod,
+        "megatron.core.transformer.multi_token_prediction": mtp_mod,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    mtp_ce_mod.reset_fused_main_mtp_cce_counters()
+    mtp_ce_mod._FUSED_MAIN_MTP_CCE_DECLINE_REASONS_LOGGED.clear()
+    yield mtp_mod
 
 
 class _FakeCceOutputLayer(torch.nn.Module):
@@ -94,8 +171,6 @@ def _separate_upstream_per_token_autoscaler_total(
     output_layer,
     cfg,
 ):
-    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
-
     seq = labels.shape[-1]
     hidden_main = hidden_states[:seq]
     mtp_labels = labels.clone()
@@ -120,7 +195,7 @@ def _separate_upstream_per_token_autoscaler_total(
             )
         else:
             mtp_loss_normalized = mtp_scale * mtp_loss / mtp_mask.sum().clamp(min=1)
-        hidden_main = MTPLossAutoScaler.apply(hidden_main, mtp_loss_normalized)
+        hidden_main = _FakeMTPLossAutoScaler.apply(hidden_main, mtp_loss_normalized)
 
     main_loss = output_layer(
         hidden_main,
@@ -146,9 +221,7 @@ def test_fused_main_mtp_cce_loss_matches_separate_calls(monkeypatch):
     output_layer = _FakeCceOutputLayer(weight)
     cfg = _config(mtp_depth)
 
-    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
-
-    MTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
+    _FakeMTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
     fused_loss_tokens = fused_main_mtp_cce_loss(
         hidden_states=hidden_states,
         labels=labels,
@@ -212,10 +285,8 @@ def test_fused_main_mtp_cce_loss_matches_upstream_per_token_autoscaler(
     loss_mask = torch.ones(batch, seq)
     loss_mask[:, -2:] = 0
 
-    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
-
     cfg = _config(mtp_depth, calculate_per_token_loss=calculate_per_token_loss)
-    MTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
+    _FakeMTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
     fused_layer = _FakeCceOutputLayer(weight.detach().clone())
     fused_loss_tokens = fused_main_mtp_cce_loss(
         hidden_states=hidden_states,
@@ -237,7 +308,7 @@ def test_fused_main_mtp_cce_loss_matches_upstream_per_token_autoscaler(
 
     hidden_ref = hidden_states.detach().clone().requires_grad_(True)
     ref_layer = _FakeCceOutputLayer(weight.detach().clone())
-    MTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
+    _FakeMTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
     ref_total = _separate_upstream_per_token_autoscaler_total(
         hidden_states=hidden_ref,
         labels=labels,
@@ -302,10 +373,7 @@ def test_process_mtp_loss_fused_cce_path_feeds_main_cache(monkeypatch):
     monkeypatch.setenv("CPPMEGA_CCE_FUSE_MAIN_MTP_CE", "1")
     torch.manual_seed(6789)
 
-    import sys
-
     from megatron.core.transformer import multi_token_prediction as mtp_mod
-    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
     rebind_targets = (
         "megatron.core.transformer.multi_token_prediction",
@@ -354,7 +422,7 @@ def test_process_mtp_loss_fused_cce_path_feeds_main_cache(monkeypatch):
         loss_mask = torch.ones(batch, seq)
         output_layer = CountingCceOutputLayer(torch.randn(vocab, hidden))
 
-        MTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
+        _FakeMTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
         hidden_main = mtp_mod.process_mtp_loss(
             hidden_states=hidden_states,
             labels=labels,
@@ -400,3 +468,32 @@ def test_fused_main_mtp_cce_loss_declines_non_cce_backend(monkeypatch, capsys):
     )
     assert loss is None
     assert "LinearCE backend is 'liger'" in capsys.readouterr().out
+
+
+def test_fused_main_mtp_cce_counters_report_one_call_for_mtp2(monkeypatch):
+    monkeypatch.setenv("CPPMEGA_CCE_FUSE_MAIN_MTP_CE", "1")
+    torch.manual_seed(7890)
+
+    batch, seq, hidden, vocab, mtp_depth = 2, 5, 4, 17, 2
+    hidden_states = torch.randn((1 + mtp_depth) * seq, batch, hidden)
+    labels = torch.randint(0, vocab, (batch, seq))
+    output_layer = _FakeCceOutputLayer(torch.randn(vocab, hidden))
+
+    loss = fused_main_mtp_cce_loss(
+        hidden_states=hidden_states,
+        labels=labels,
+        loss_mask=torch.ones(batch, seq),
+        output_layer=output_layer,
+        output_weight=output_layer.weight,
+        runtime_gather_output=False,
+        is_training=False,
+        config=_config(mtp_depth),
+    )
+
+    assert loss is not None
+    counters = mtp_ce_mod.fused_main_mtp_cce_counters_snapshot()
+    assert counters["fused_main_mtp_cce_attempted"] == 1
+    assert counters["fused_main_mtp_cce_used"] == 1
+    assert counters["fused_main_mtp_cce_output_layer_calls"] == 1
+    assert counters["fused_main_mtp_cce_eliminated_output_layer_calls"] == 2
+    assert counters.get("fused_main_mtp_cce_fallback_mtp_output_layer_calls", 0) == 0

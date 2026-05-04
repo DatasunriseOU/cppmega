@@ -40,9 +40,11 @@ def _ensure_module_spec(name: str) -> None:
     """
     try:
         mod = importlib.import_module(name)
-    except ImportError:
-        # Module genuinely not installed — individual tests that need it
-        # will fail with a clear error. Don't mask that at collection time.
+    except (ImportError, FileNotFoundError):
+        # Module genuinely not installed, or TransformerEngine core .so is not
+        # built yet (megatron.core eagerly loads it). Individual tests that
+        # need the real module will fail with a clear error; tests that
+        # monkeypatch fake replacements stay collectable.
         return
 
     if getattr(mod, "__spec__", None) is None:

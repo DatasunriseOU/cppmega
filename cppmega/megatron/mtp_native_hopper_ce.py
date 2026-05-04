@@ -59,6 +59,8 @@ Memory cost at NAM56R MBS=10:
 """
 from __future__ import annotations
 
+import atexit
+from collections import Counter
 import os
 import sys
 
@@ -66,6 +68,30 @@ import sys
 _FUSED_MAIN_MTP_CCE_LOSS_ATTR = "_cppmega_fused_main_mtp_cce_loss"
 _FUSED_MAIN_MTP_CCE_LOGGED = False
 _FUSED_MAIN_MTP_CCE_DECLINE_REASONS_LOGGED: set[str] = set()
+_FUSED_MAIN_MTP_CCE_ATEXIT_REGISTERED = False
+_FUSED_MAIN_MTP_CCE_COUNTERS: Counter[str] = Counter()
+
+
+def reset_fused_main_mtp_cce_counters() -> None:
+    """Reset CCE main+MTP accounting counters for focused tests/probes."""
+    _FUSED_MAIN_MTP_CCE_COUNTERS.clear()
+
+
+def fused_main_mtp_cce_counters_snapshot() -> dict[str, int]:
+    """Return stable counters for profiler log parsing."""
+    return {key: int(value) for key, value in sorted(_FUSED_MAIN_MTP_CCE_COUNTERS.items())}
+
+
+def format_fused_main_mtp_cce_counters() -> str:
+    counters = fused_main_mtp_cce_counters_snapshot()
+    if not counters:
+        return "[cppmega_mtp_ce] CCE main+MTP fusion stats: {}"
+    items = ", ".join(f"{key}={value}" for key, value in counters.items())
+    return f"[cppmega_mtp_ce] CCE main+MTP fusion stats: {items}"
+
+
+def print_fused_main_mtp_cce_counters() -> None:
+    print(format_fused_main_mtp_cce_counters())
 
 
 def _env_flag_enabled(name: str, default: str = "1") -> bool:
@@ -85,6 +111,8 @@ def _linear_ce_backend(output_layer) -> str | None:
 
 
 def _log_fused_main_mtp_cce_decline(reason: str) -> None:
+    _FUSED_MAIN_MTP_CCE_COUNTERS["fused_main_mtp_cce_declined"] += 1
+    _FUSED_MAIN_MTP_CCE_COUNTERS[f"fused_main_mtp_cce_decline_{reason.replace(' ', '_')}"] += 1
     if reason in _FUSED_MAIN_MTP_CCE_DECLINE_REASONS_LOGGED:
         return
     _FUSED_MAIN_MTP_CCE_DECLINE_REASONS_LOGGED.add(reason)
@@ -149,6 +177,9 @@ def fused_main_mtp_cce_loss(
     the existing ``reduction="sum"`` MTP shim used, then attached through
     ``MTPLossAutoScaler`` so MTP gradients still flow during the main backward.
     """
+    if _env_flag_enabled("CPPMEGA_CCE_FUSE_MAIN_MTP_CE", "0"):
+        _FUSED_MAIN_MTP_CCE_COUNTERS["fused_main_mtp_cce_attempted"] += 1
+
     if labels is None:
         if _env_flag_enabled("CPPMEGA_CCE_FUSE_MAIN_MTP_CE", "0"):
             _log_fused_main_mtp_cce_decline("labels is None")
@@ -220,6 +251,9 @@ def fused_main_mtp_cce_loss(
         reduction="none",
         ignore_index=ignore_index,
     )
+    _FUSED_MAIN_MTP_CCE_COUNTERS["fused_main_mtp_cce_output_layer_calls"] += 1
+    _FUSED_MAIN_MTP_CCE_COUNTERS["fused_main_mtp_cce_used"] += 1
+    _FUSED_MAIN_MTP_CCE_COUNTERS["fused_main_mtp_cce_eliminated_output_layer_calls"] += mtp_num_layers
 
     if fused_loss.shape != fused_labels.shape:
         raise RuntimeError(
@@ -332,6 +366,7 @@ def _install_linear_ce_forward_cache_patch(LinearCrossEntropyModule) -> None:
         if output_cross_entropy_loss:
             cached_loss = getattr(input_, _FUSED_MAIN_MTP_CCE_LOSS_ATTR, None)
             if cached_loss is not None:
+                _FUSED_MAIN_MTP_CCE_COUNTERS["fused_main_mtp_cce_cached_main_consumed"] += 1
                 try:
                     delattr(input_, _FUSED_MAIN_MTP_CCE_LOSS_ATTR)
                 except Exception:
@@ -564,6 +599,8 @@ def _install_process_mtp_loss_patch() -> None:
         if fused_hidden_states is not None:
             return fused_hidden_states
 
+        _FUSED_MAIN_MTP_CCE_COUNTERS["fused_main_mtp_cce_fallback_separate_mtp_path"] += 1
+
         # Fused branch — rewritten with reduction="sum" to sidestep the
         # transpose round-trip NaN bug on shared-weight multi-call.
         hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
@@ -614,6 +651,7 @@ def _install_process_mtp_loss_patch() -> None:
                 reduction="sum",
                 ignore_index=-100,
             )
+            _FUSED_MAIN_MTP_CCE_COUNTERS["fused_main_mtp_cce_fallback_mtp_output_layer_calls"] += 1
 
             if is_training:
                 mtp_loss_for_log = (
@@ -671,3 +709,8 @@ def _install_process_mtp_loss_patch() -> None:
         "branch now uses reduction=\"sum\" + ignore_index=-100 "
         "(sidesteps PR #3345 transpose round-trip NaN on shared-weight multi-call)."
     )
+
+    global _FUSED_MAIN_MTP_CCE_ATEXIT_REGISTERED
+    if not _FUSED_MAIN_MTP_CCE_ATEXIT_REGISTERED:
+        atexit.register(print_fused_main_mtp_cce_counters)
+        _FUSED_MAIN_MTP_CCE_ATEXIT_REGISTERED = True
