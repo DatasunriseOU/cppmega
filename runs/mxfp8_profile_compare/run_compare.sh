@@ -15,12 +15,13 @@ mkdir -p "${OUT_DIR}"
 # sidecars.  All run on the same NAM56R-quarter (13-layer) shape, MTP=2,
 # micro_batch=4, seq=4096 → 16384 tokens/step.
 declare -a CONFIGS=(
-  "compact_direct|--fp8-recipe mxfp8 --mxfp8-linear-kernel-contract compact_direct_v1"
-  "gemm_ready_v1|--fp8-recipe mxfp8 --mxfp8-linear-kernel-contract gemm_ready_v1"
-  "legacy|--fp8-recipe mxfp8 --mxfp8-linear-kernel-contract legacy"
+  "bf16|--train-iters 20 --fp8-recipe off"
+  "mxfp8_gemm_ready|--train-iters 20 --fp8-recipe mxfp8 --mxfp8-linear-kernel-contract gemm_ready_v1"
+  "mxfp8_legacy|--train-iters 20 --fp8-recipe mxfp8 --mxfp8-linear-kernel-contract legacy"
 )
-
-export CPPMEGA_TRAIN_ITERS=20
+# compact_direct_v1 is intentionally excluded: the production grouped GEMM
+# path doesn't yet have a direct-backward branch for missing gemm-ready
+# operands, so the contract correctly rejects the run before step 1.
 
 for cfg in "${CONFIGS[@]}"; do
   name="${cfg%%|*}"
