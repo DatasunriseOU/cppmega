@@ -491,3 +491,25 @@ def test_wave11_amax_lock_is_global() -> None:
         "_FP8_AMAX_LOCK must be a threading.Lock instance — see "
         "wave-11 #3 rationale comment in fp8_amax.py"
     )
+
+
+def test_wave12_resolve_in_dtype_rejects_non_float() -> None:
+    """Wave-12 #4 (meta wave-11 MED): _resolve_in_dtype must reject any
+    tensor whose dtype is not floating-point BEFORE the dict lookup, so
+    a custom torch fork that registers a non-float dtype with a forged
+    ``__torch_dtype__='float16'`` cannot pass through and corrupt the
+    amax kernel's bit pattern.
+    """
+    from cppmega_mlx.nn._tilelang.fp8_amax import _resolve_in_dtype
+
+    # Each integer dtype must raise TypeError, with the message naming the
+    # offending dtype so downstream callers can diagnose without reflection.
+    for int_dtype in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8):
+        x = torch.zeros(4, dtype=int_dtype)
+        with pytest.raises(TypeError, match=r"floating-point"):
+            _resolve_in_dtype(x)
+
+    # Sanity: real floats still pass.
+    for fp_dtype in (torch.float16, torch.bfloat16, torch.float32):
+        x = torch.zeros(4, dtype=fp_dtype)
+        assert _resolve_in_dtype(x) in {"float16", "bfloat16", "float32"}
