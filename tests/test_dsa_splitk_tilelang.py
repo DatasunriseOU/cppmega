@@ -452,3 +452,108 @@ def test_dsa_splitk_indexer_loss_split_stage1_kernels_match_unified():
         loss_ah1.float(), loss_ah4.float(),
         rtol=1e-2, atol=1e-4,
     )
+
+
+@pytest.mark.skipif(not _TILELANG_OK, reason=f"TileLang unavailable: {_STATUS.reason}")
+def test_stage2_q_hoist_numerical_parity_wave5():
+    """Wave-5: full Q hoist (use_q_cache_v5=True) must match wave-4 partial-hoist
+    kernel numerically on a small case where both paths are buildable.
+
+    Validates that the budget-gated Q-cache (AH, BLOCK_SQ, AD) shared
+    fragment produces fp32-equivalent (within tolerance) loss vs. the
+    wave-4 per-(sk_tile, h) HBM reload pattern. Skips when the cache
+    doesn't fit the per-target budget.
+    """
+
+    from cppmega_mlx.nn._tilelang.dsa_splitk_indexer_loss import (
+        _block_constants_for_target,
+        _can_use_q_cache_v5,
+        _resolve_target,
+        _scale_to_bits,
+        _stage1_kernel_for,
+        _stage2_kernel_for,
+    )
+
+    device = _pick_device()
+    if device.type == "cpu":
+        pytest.skip("Wave-5 Q-hoist parity needs CUDA or Metal")
+
+    AB, AH, AD = 1, 4, 64
+    ASq, Sk = 128, 512
+    in_dtype = "float16"
+    target = _resolve_target(device)
+    stage1_kw, stage2_kw = _block_constants_for_target(target, AH=AH)
+    if not _can_use_q_cache_v5(
+        BLOCK_SQ=stage2_kw["BLOCK_SQ"], AH=AH, AD=AD, in_dtype=in_dtype, target=target
+    ):
+        pytest.skip(
+            f"Q-cache (AH={AH}, BLOCK_SQ={stage2_kw['BLOCK_SQ']}, AD={AD}) "
+            f"does not fit target {target!r} budget"
+        )
+
+    softmax_scale = 1.0 / math.sqrt(AD)
+    scale_bits = _scale_to_bits(softmax_scale)
+
+    torch.manual_seed(7)
+    query = torch.randn(ASq, AB, AH, AD, dtype=torch.float16, device=device)
+    key = torch.randn(Sk, AB, AH, AD, dtype=torch.float16, device=device)
+    index_scores = torch.randn(AB, ASq, Sk, dtype=torch.float32, device=device)
+    index_mask = torch.zeros(AB, ASq, Sk, dtype=torch.float32, device=device)
+    softmax_m = torch.zeros(AB, AH, ASq, dtype=torch.float32, device=device)
+    softmax_d = torch.ones(AB, AH, ASq, dtype=torch.float32, device=device)
+    softmax_m1 = torch.zeros(AB, ASq, dtype=torch.float32, device=device)
+    softmax_d1 = torch.ones(AB, ASq, dtype=torch.float32, device=device)
+
+    stage1 = _stage1_kernel_for(
+        AB, AH, AD, Sk, ASq, False, scale_bits, in_dtype, target,
+        stage1_kw["BLOCK_SQ"], stage1_kw["BLOCK_SK"], stage1_kw["BLOCK_D"],
+        stage1_kw["threads"], stage1_kw["num_stages"],
+    )
+    stage1(query, key, index_scores, index_mask, softmax_m, softmax_d, softmax_m1, softmax_d1)
+
+    out_v4 = torch.empty(AB, ASq, dtype=torch.float32, device=device)
+    out_v5 = torch.empty(AB, ASq, dtype=torch.float32, device=device)
+
+    stage2_v4 = _stage2_kernel_for(
+        AB, AH, AD, Sk, ASq, False, scale_bits, in_dtype, target,
+        stage2_kw["BLOCK_SQ"], stage2_kw["BLOCK_SK"], stage2_kw["BLOCK_D"],
+        stage2_kw["threads"], stage2_kw["num_stages"],
+        use_q_cache_v5=False,
+    )
+    stage2_v4(
+        query, key, index_scores, index_mask,
+        softmax_m, softmax_d, softmax_m1, softmax_d1, out_v4,
+    )
+
+    stage2_v5 = _stage2_kernel_for(
+        AB, AH, AD, Sk, ASq, False, scale_bits, in_dtype, target,
+        stage2_kw["BLOCK_SQ"], stage2_kw["BLOCK_SK"], stage2_kw["BLOCK_D"],
+        stage2_kw["threads"], stage2_kw["num_stages"],
+        use_q_cache_v5=True,
+    )
+    stage2_v5(
+        query, key, index_scores, index_mask,
+        softmax_m, softmax_d, softmax_m1, softmax_d1, out_v5,
+    )
+
+    # Same algorithm, different memory hierarchy -- expect fp32 round-off only.
+    torch.testing.assert_close(out_v4, out_v5, rtol=1e-4, atol=1e-5)
+
+
+def test_can_use_q_cache_v5_budget_logic():
+    """_can_use_q_cache_v5 returns sane bool over budget edges (no device required)."""
+
+    from cppmega_mlx.nn._tilelang.dsa_splitk_indexer_loss import _can_use_q_cache_v5
+
+    # Tiny shape -- fits everywhere.
+    assert _can_use_q_cache_v5(BLOCK_SQ=16, AH=2, AD=32, in_dtype="float16", target="metal")
+    assert _can_use_q_cache_v5(BLOCK_SQ=16, AH=2, AD=32, in_dtype="float16", target="cuda")
+    assert _can_use_q_cache_v5(BLOCK_SQ=16, AH=2, AD=32, in_dtype="float16", target="hip")
+
+    # Pathological -- 128*128*64*2 = 2 MB doesn't fit anywhere.
+    assert not _can_use_q_cache_v5(BLOCK_SQ=128, AH=128, AD=64, in_dtype="float16", target="metal")
+    assert not _can_use_q_cache_v5(BLOCK_SQ=128, AH=128, AD=64, in_dtype="float16", target="cuda")
+
+    # 32*16*64*2 = 64 KB: fits CUDA budget (64 KB), not Metal (16 KB).
+    assert not _can_use_q_cache_v5(BLOCK_SQ=32, AH=16, AD=64, in_dtype="float16", target="metal")
+    assert _can_use_q_cache_v5(BLOCK_SQ=32, AH=16, AD=64, in_dtype="float16", target="cuda")
