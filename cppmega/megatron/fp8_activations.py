@@ -90,6 +90,36 @@ try:
 except ImportError:
     pass
 
+# Tier-1 PoC of the unified TileLang fused-kernel pipeline. The Path C port
+# of ``_amax_kernel`` and ``_quantize_kernel`` lives in cppmega.mlx and runs
+# on both CUDA and Apple Metal SIMDgroup. ``has_tilelang`` is the import-time
+# probe; ``tilelang_supports(device)`` is the per-call dispatch gate that
+# replaces ``tensor.is_cuda`` on the pack hot-paths below.
+has_tilelang = False
+fp8_pack_tilelang: Any | None = None  # type: ignore[no-redef]
+
+
+def tilelang_supports(_device: torch.device) -> bool:  # noqa: D401 - thin shim
+    """Default no-op gate, replaced below when the Path C module imports."""
+
+    return False
+
+
+try:
+    from cppmega_mlx.nn._tilelang.fp8_amax import (  # type: ignore[import-not-found]
+        fp8_pack_tilelang as _fp8_pack_tilelang,
+        tilelang_supports as _tilelang_supports,
+    )
+
+    has_tilelang = True
+    fp8_pack_tilelang = _fp8_pack_tilelang
+    tilelang_supports = _tilelang_supports  # type: ignore[assignment]
+except (ImportError, ModuleNotFoundError, AttributeError):  # pragma: no cover - hosts without cppmega.mlx / TileLang
+    # Narrow exception set so genuine errors from the Path C module
+    # (TileLang version mismatch, malformed PrimFunc, missing intrinsics)
+    # surface instead of being silently swallowed.
+    has_tilelang = False
+
 
 PackedActivation: TypeAlias = (
     torch.Tensor
@@ -629,6 +659,8 @@ class FP8ActivationPacker:
 
         if _use_te_packer() and tensor.is_cuda:
             return _te_fp8_pack(tensor)
+        if has_tilelang and tilelang_supports(tensor.device) and fp8_pack_tilelang is not None:
+            return fp8_pack_tilelang(tensor)
         if _use_triton_fused() and tensor.is_cuda:
             return _triton_fp8_pack(tensor)
         return _unfused_fp8_pack(tensor)
@@ -680,6 +712,8 @@ class ClampingFP8Packer:
 
         if _use_te_packer() and tensor.is_cuda:
             return _te_fp8_pack(tensor, clamp=True)
+        if has_tilelang and tilelang_supports(tensor.device) and fp8_pack_tilelang is not None:
+            return fp8_pack_tilelang(tensor, clamp=True)
         if _use_triton_fused() and tensor.is_cuda:
             return _triton_fp8_pack(tensor, clamp=True)
         return _unfused_fp8_pack(tensor, clamp=True)
