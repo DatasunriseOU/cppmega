@@ -668,3 +668,59 @@ def test_wave9_tiled_block_sq_choice_for_production_shapes():
     assert _can_use_q_cache_v5_tiled(AH=128, AD=64, in_dtype="float16", target="metal") is None
     # CUDA budget 64 KB -> AH=16 lands on BLOCK_SQ=32 (16*32*64*2 = 65536 B exact).
     assert _can_use_q_cache_v5_tiled(AH=16, AD=64, in_dtype="float16", target="cuda") == 32
+
+
+def test_wave9_sparse_loss_scratch_cache():
+    """Wave-9 #5 perf: sparse_loss path reuses the scatter scratch buffer.
+
+    Pre-fix the wrapper allocated a fresh ``torch.full((AB, ASq, Sk), -inf)``
+    every forward, costing O(AB*ASq*Sk*4) bytes per step. This test asserts:
+
+    1. Two forwards with identical (AB, ASq, Sk, device, dtype) reuse the
+       SAME backing tensor (``id()`` parity, since ``_get_scatter_scratch``
+       returns the cached tensor itself before the scatter writes into it).
+    2. The cache size stays at 1 entry for repeated identical-shape calls.
+    3. The cap (``_SCATTER_SCRATCH_LRU_MAX``) prevents unbounded growth.
+    """
+
+    pytest = __import__("pytest")
+    torch_mod = __import__("torch")
+
+    try:
+        from cppmega_mlx.nn._tilelang.dsa_splitk_indexer_loss import (
+            _SCATTER_SCRATCH_CACHE,
+            _SCATTER_SCRATCH_LRU_MAX,
+            _get_scatter_scratch,
+        )
+    except Exception as exc:
+        pytest.skip(f"cppmega.mlx tilelang dsa not importable: {exc}")
+
+    _SCATTER_SCRATCH_CACHE.clear()
+
+    device = torch_mod.device("cpu")  # CPU avoids no-Metal/no-CUDA skip; logic is device-agnostic.
+    shape = (1, 4, 8)
+
+    a = _get_scatter_scratch(shape, device, torch_mod.float32)
+    b = _get_scatter_scratch(shape, device, torch_mod.float32)
+
+    # Same backing buffer on cache hit.
+    assert id(a) == id(b), "sparse_loss scatter scratch was re-allocated"
+    # Single-shape callers keep the cache at 1 entry.
+    assert len(_SCATTER_SCRATCH_CACHE) == 1
+    # Refilled to -inf for the next scatter_ to produce an identical mask.
+    assert torch_mod.isinf(b).all() and (b < 0).all(), "scratch not refilled with -inf"
+
+    # 5 forwards same shape -> still 1 entry, same id.
+    ids_seen = {id(a)}
+    for _ in range(5):
+        c = _get_scatter_scratch(shape, device, torch_mod.float32)
+        ids_seen.add(id(c))
+    assert ids_seen == {id(a)}
+    assert len(_SCATTER_SCRATCH_CACHE) == 1
+
+    # FIFO eviction stays within cap when shapes vary.
+    for n in range(_SCATTER_SCRATCH_LRU_MAX + 4):
+        _get_scatter_scratch((1, 4, 8 + n), device, torch_mod.float32)
+    assert len(_SCATTER_SCRATCH_CACHE) <= _SCATTER_SCRATCH_LRU_MAX, (
+        f"scratch cache grew past cap: {len(_SCATTER_SCRATCH_CACHE)} > {_SCATTER_SCRATCH_LRU_MAX}"
+    )
