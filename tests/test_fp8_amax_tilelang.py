@@ -336,3 +336,85 @@ def test_wave9_amax_non_pow2_no_pad(n):
 
     assert out.shape == (1,)
     torch.testing.assert_close(out.squeeze(), ref, rtol=1e-3, atol=1e-3)
+
+
+def test_wave9_concurrent_amax_compile():
+    """Wave-9 #6: ``_expose_to_globals`` mutates module ``__globals__`` in
+    place, and ``functools.lru_cache`` is not thread-safe under concurrent
+    miss + insert. Two threads compiling kernels for different
+    ``(n, dtype)`` combos used to race the ``N`` / ``BLOCK`` / ``DTYPE``
+    slots and could ship a corrupt PrimFunc to one of them. The
+    ``_FP8_AMAX_LOCK`` guard added in this commit serialises both
+    ``_amax_kernel_for`` and ``_quantize_kernel_for`` so the build path
+    is single-threaded even when callers compile concurrently.
+
+    The test does not require Metal / CUDA to be available because it
+    exercises the *build* (PrimFunc construction + lower) path, not the
+    runtime launch. Skips only when ``tilelang_supports`` reports the
+    build path is unreachable for the host.
+    """
+
+    import threading
+
+    if not tilelang_supports():
+        pytest.skip("tilelang build path unreachable on this host")
+
+    from cppmega_mlx.nn._tilelang.fp8_amax import (  # noqa: E402
+        _amax_kernel_for,
+        _quantize_kernel_for,
+    )
+
+    target = "metal"
+    combos = [
+        (256, "float16"),
+        (1024, "float16"),
+        (256, "bfloat16"),
+        (4096, "float16"),
+    ]
+    results: dict[tuple[int, str], object] = {}
+    errors: list[BaseException] = []
+
+    def _build(combo: tuple[int, str]) -> None:
+        try:
+            results[combo] = _amax_kernel_for(combo[0], combo[1], target)
+        except BaseException as exc:  # pragma: no cover - failure mode under test
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_build, args=(c,)) for c in combos]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent _amax_kernel_for crashed: {errors}"
+    assert len(results) == len(combos)
+    # Distinct kernel objects per (n, dtype). Ensures the cache did not
+    # alias a corrupt PrimFunc across concurrent misses.
+    ids = {id(v) for v in results.values()}
+    assert len(ids) == len(combos), (
+        f"concurrent compiles aliased PrimFuncs (cache race): "
+        f"{[(c, id(v)) for c, v in results.items()]}"
+    )
+
+    # Same exercise on the quantize side -- same lock so a regression in
+    # _quantize_kernel_for would surface here.
+    quant_results: dict[tuple[int, str], object] = {}
+
+    def _build_q(combo: tuple[int, str]) -> None:
+        try:
+            quant_results[combo] = _quantize_kernel_for(combo[0], combo[1], target)
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_build_q, args=(c,)) for c in combos]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, f"concurrent _quantize_kernel_for crashed: {errors}"
+    assert len(quant_results) == len(combos)
+    quant_ids = {id(v) for v in quant_results.values()}
+    assert len(quant_ids) == len(combos), (
+        f"concurrent quantize compiles aliased PrimFuncs: "
+        f"{[(c, id(v)) for c, v in quant_results.items()]}"
+    )
