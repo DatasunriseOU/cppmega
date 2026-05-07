@@ -606,6 +606,53 @@ def test_wave9_tiled_block_sq_non_multiple_asq():
     torch.testing.assert_close(out.to(torch.float32), ref.to(torch.float32), rtol=1e-2, atol=1e-4)
 
 
+@pytest.mark.skipif(not _TILELANG_OK, reason=f"TileLang unavailable: {_STATUS.reason}")
+def test_wave9_topk_oob_rejected():
+    """Wave-9 #4 regression for grok rev_38ff59759f HIGH finding.
+
+    Production callers used to skip the wave-3 ``CPPMEGA_MLX_DSA_DEBUG``-
+    gated bounds check, leaving torch ``scatter_(-1, topk_idx, 0.0)`` free
+    to silently corrupt adjacent memory on CUDA release builds when an
+    upstream bug fed a ``topk_index >= Sk``. Wave-9 #4 (cppmega.mlx
+    ``fcd7068``) makes the bounds check always-on with a single fused
+    ``((idx < 0) | (idx >= Sk)).any().item()`` reduction. This test
+    feeds an OOB index and asserts ``ValueError`` is raised before
+    scatter_ touches memory.
+    """
+
+    device = _pick_device()
+    if device.type == "cpu":
+        pytest.skip("TileLang DSA split-K requires a CUDA or Metal device")
+
+    torch.manual_seed(0xB0BD)
+    AB, AH, AD = 1, 4, 32
+    ASq, Sk = 16, 64
+    softmax_scale = 1.0 / math.sqrt(AD)
+
+    query = torch.randn(ASq, AB, AH, AD, dtype=torch.float16, device=device)
+    key = torch.randn(Sk, AB, AH, AD, dtype=torch.float16, device=device)
+    index_scores = torch.randn(AB, ASq, Sk, dtype=torch.float32, device=device)
+    # Inject an OOB index: Sk=64 so anything >= 64 must be rejected.
+    topk_indices = torch.zeros(AB, ASq, 4, dtype=torch.long, device=device)
+    topk_indices[0, 0, 0] = Sk + 7  # 71, well past the upper bound
+
+    with pytest.raises(ValueError, match="topk_indices out of range"):
+        dsa_splitk_indexer_loss_tilelang(
+            index_scores, topk_indices, query, key,
+            softmax_scale=softmax_scale, loss_coeff=1.0,
+            sparse_loss=True, pg_collection=None,
+        )
+
+    # Negative indices should also be rejected.
+    topk_indices[0, 0, 0] = -1
+    with pytest.raises(ValueError, match="topk_indices out of range"):
+        dsa_splitk_indexer_loss_tilelang(
+            index_scores, topk_indices, query, key,
+            softmax_scale=softmax_scale, loss_coeff=1.0,
+            sparse_loss=True, pg_collection=None,
+        )
+
+
 def test_wave9_tiled_block_sq_choice_for_production_shapes():
     """Wave-9 #2 budget probe: AH=8/16 + AD=64 shapes must land on the wave-5 path."""
 
