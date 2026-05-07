@@ -230,3 +230,79 @@ def test_tilelang_supports_with_reason_returns_2tuple():
     # The boolean wrapper must agree with the tuple's first element.
     for case in cases:
         assert tilelang_supports(case) == tilelang_supports_with_reason(case)[0]
+
+
+@pytest.mark.skipif(not _TILELANG_OK, reason=f"TileLang unavailable: {_STATUS.reason}")
+def test_fp8_pack_rejects_nonfinite_input():
+    """fp8_pack_tilelang must raise FloatingPointError on NaN/Inf, not
+    silently produce a degenerate (0 or NaN) scale that poisons downstream
+    weights. Wave-3 self-audit: closes the silent-NaN-propagation hole
+    in the host-side scale derivation.
+    """
+
+    device = _pick_device()
+    if device.type == "cpu":
+        pytest.skip("TileLang pack requires a CUDA or Metal device")
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("torch.float8_e4m3fn not available in this build")
+
+    for poison in [float("nan"), float("inf"), float("-inf")]:
+        x = torch.randn(32, 256, dtype=torch.float16, device=device)
+        x[0, 0] = poison
+        with pytest.raises(FloatingPointError, match=r"non-finite values"):
+            fp8_pack_tilelang(x)
+
+
+@pytest.mark.skipif(not _TILELANG_OK, reason=f"TileLang unavailable: {_STATUS.reason}")
+def test_fp8_amax_padding_does_not_change_result():
+    """The pow2 bucket pad-with-zeros must be a no-op for amax.
+
+    Regression guard for the JIT bucket cache: if a future refactor of
+    ``_bucket_n`` accidentally pads with non-zero (e.g. uninitialized
+    ``empty``), this test catches it because the padded amax would diverge
+    from the unpadded reference whenever the random tail contains values
+    larger than the data.
+    """
+
+    torch.manual_seed(0xCAFE)
+    device = _pick_device()
+    if device.type == "cpu":
+        pytest.skip("TileLang amax requires a CUDA or Metal device")
+
+    # Choose N that is *not* a power of two so the bucket cache pads.
+    for n in [4097, 5000, 8193]:
+        x = torch.randn(n, dtype=torch.float16, device=device) * 5.0
+        out = fp8_amax_tilelang(x)
+        ref = x.abs().amax().to(torch.float32)
+        torch.testing.assert_close(
+            out.squeeze(),
+            ref,
+            rtol=1e-3,
+            atol=1e-3,
+            msg=f"bucket-pad amax diverges from reference at n={n}",
+        )
+
+
+@pytest.mark.skipif(not _TILELANG_OK, reason=f"TileLang unavailable: {_STATUS.reason}")
+def test_fp8_amax_handles_signed_zero_only():
+    """amax over only ±0.0 must be exactly 0.0 (not -0.0, not denormal).
+
+    Wave-3 self-audit: closes a Metal-vs-CUDA divergence concern where
+    atomic_max on fp32 0.0 vs -0.0 may differ between the CUDA atomicMax
+    and the Metal CAS-loop emulation.
+    """
+
+    device = _pick_device()
+    if device.type == "cpu":
+        pytest.skip("TileLang amax requires a CUDA or Metal device")
+
+    # All-zero input.
+    x = torch.zeros(1024, dtype=torch.float16, device=device)
+    out = fp8_amax_tilelang(x)
+    assert float(out.item()) == 0.0, f"amax(zeros) should be 0.0, got {out.item()!r}"
+
+    # Mix of +0/-0 (negative-zero in fp16 still has |.| == 0).
+    x = torch.zeros(1024, dtype=torch.float16, device=device)
+    x[::2] = -0.0
+    out = fp8_amax_tilelang(x)
+    assert float(out.item()) == 0.0, f"amax(±0) should be 0.0, got {out.item()!r}"
