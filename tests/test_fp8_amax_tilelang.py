@@ -306,3 +306,33 @@ def test_fp8_amax_handles_signed_zero_only():
     x[::2] = -0.0
     out = fp8_amax_tilelang(x)
     assert float(out.item()) == 0.0, f"amax(±0) should be 0.0, got {out.item()!r}"
+
+
+@pytest.mark.skipif(not _TILELANG_OK, reason=f"TileLang unavailable: {_STATUS.reason}")
+@pytest.mark.parametrize("n", [100, 4097, 8001, 33333])
+def test_wave9_amax_non_pow2_no_pad(n):
+    """Wave-9 #3 — fp8_amax skips pad+copy on non-pow2 shapes that would
+    inflate kernel work by >=50%.
+
+    The wrapper now branches on ``bucket_n * 2 >= 3 * n`` and dispatches
+    to a per-shape kernel keyed on ``n`` directly. The per-block
+    ``if gi < N`` predicate (wave-3 partial-block guard) handles the tail
+    so the result still matches the bucket+pad path numerically.
+
+    See grok rev_38ff59759f HIGH-severity perf finding: "For any activation
+    shape not exactly a power-of-2 multiple of target BLOCK ... you pay full
+    device ``mx.zeros + copy_`` *every forward/backward pass*. For N=4097
+    → 8192 this is ~50% extra HBM traffic + allocation latency."
+    """
+
+    device = _pick_device()
+    if device.type == "cpu":
+        pytest.skip("TileLang amax requires a CUDA or Metal device")
+
+    torch.manual_seed(0xFACE)
+    x = torch.randn(n, dtype=torch.float16, device=device)
+    out = fp8_amax_tilelang(x)
+    ref = x.abs().amax().to(torch.float32)
+
+    assert out.shape == (1,)
+    torch.testing.assert_close(out.squeeze(), ref, rtol=1e-3, atol=1e-3)
