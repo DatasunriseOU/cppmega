@@ -774,3 +774,30 @@ def test_wave10_zero_size_handled():
     )
     assert out.shape == ()
     assert float(out) == 0.0
+
+
+def test_wave11_dsa_topk_zero_handled():
+    """Wave-11 #3 (grok wave-10 review HIGH): TOPK == 0 with sparse_loss=True
+    must be rejected at the boundary, not silently return NaN loss.
+
+    With TOPK == 0 the ``index_scores.scatter_(-1, topk_indices, 0.0)`` is a
+    no-op so the mask stays ``-inf`` everywhere. The downstream index-softmax
+    then produces NaN, and the KL loss propagates NaN into training. The
+    wrapper must raise ``ValueError`` instead.
+    """
+    device = torch.device("cpu")
+    in_dtype = torch.float32
+    q = torch.zeros((2, 1, 4, 16), device=device, dtype=in_dtype)
+    k = torch.zeros((4, 1, 4, 16), device=device, dtype=in_dtype)
+    idx_scores = torch.zeros((1, 2, 4), device=device, dtype=torch.float32)
+    topk_zero = torch.zeros((1, 2, 0), device=device, dtype=torch.int64)
+    with pytest.raises(ValueError, match="TOPK"):
+        dsa_splitk_indexer_loss_tilelang(
+            idx_scores, topk_zero, q, k, 1.0, 1.0, sparse_loss=True
+        )
+
+    # sparse_loss=False with TOPK == 0 should NOT raise (topk is unused there).
+    out = dsa_splitk_indexer_loss_tilelang(
+        idx_scores, topk_zero, q, k, 1.0, 1.0, sparse_loss=False
+    )
+    assert out.shape == ()

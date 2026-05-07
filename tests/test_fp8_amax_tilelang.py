@@ -466,3 +466,28 @@ def test_wave11_amax_nan_input_does_not_hang() -> None:
         raise res  # propagate unexpected error
     # Either a non-NaN amax (NaN was filtered to 0 → max over real data)
     # or a wave-3 FloatingPointError if all-NaN. Both are acceptable.
+
+
+
+def test_wave11_amax_lock_is_global() -> None:
+    """Wave-11 #3 (meta wave-10 review MED, NOT FIXED — design constraint).
+
+    Meta flagged the global ``_FP8_AMAX_LOCK`` as a DoS amplifier and
+    suggested per-signature locks. The fix was rejected because
+    ``_expose_to_globals`` mutates *module-level* globals shared across
+    every signature; per-signature locks would race on those globals.
+
+    This test locks in the design choice: the lock IS still a single
+    ``threading.Lock`` instance shared by both kernel factories. Future
+    wave-12 work (per-thread globals via ``types.FunctionType`` rebuild
+    or ``T.Var`` parameterisation) would flip this expectation; if
+    you're updating it, please update the inline rationale comment in
+    ``fp8_amax.py`` at the same time.
+    """
+    import threading
+    from cppmega_mlx.nn._tilelang import fp8_amax as _fp8_amax
+
+    assert isinstance(_fp8_amax._FP8_AMAX_LOCK, type(threading.Lock())), (
+        "_FP8_AMAX_LOCK must be a threading.Lock instance — see "
+        "wave-11 #3 rationale comment in fp8_amax.py"
+    )
