@@ -724,3 +724,53 @@ def test_wave9_sparse_loss_scratch_cache():
     assert len(_SCATTER_SCRATCH_CACHE) <= _SCATTER_SCRATCH_LRU_MAX, (
         f"scratch cache grew past cap: {len(_SCATTER_SCRATCH_CACHE)} > {_SCATTER_SCRATCH_LRU_MAX}"
     )
+
+
+def test_wave10_zero_size_handled():
+    """Wave-10 #1 (grok+meta HIGH): zero-size shapes must not div-by-zero.
+
+    Without the early-out at the top of ``dsa_splitk_indexer_loss_tilelang``,
+    ``ASq=0`` (or ``AB=0`` / ``AH=0`` / ``AD=0`` / ``Sk=0``) reaches
+    ``T.ceildiv(N, BLOCK_*)`` inside stage-1 / stage-2 kernel build →
+    div-by-zero → CUDA illegal memory access / Metal host crash. Attacker
+    scenario: malicious ONNX with attention mask length 0.
+
+    The wrapper must return a 0-d fp32 scalar (matching the documented
+    return contract) without invoking any kernel.
+    """
+    device = torch.device("cpu")
+    in_dtype = torch.float32
+
+    # ASq=0 (most common attacker shape: empty sequence).
+    q = torch.zeros((0, 1, 4, 16), device=device, dtype=in_dtype)
+    k = torch.zeros((4, 1, 4, 16), device=device, dtype=in_dtype)
+    idx_scores = torch.zeros((1, 0, 4), device=device, dtype=torch.float32)
+    topk = torch.zeros((1, 0, 2), device=device, dtype=torch.int64)
+    out = dsa_splitk_indexer_loss_tilelang(
+        idx_scores, topk, q, k, 1.0, 1.0, sparse_loss=True
+    )
+    assert out.shape == (), f"expected 0-d scalar, got shape {tuple(out.shape)}"
+    assert out.dtype == torch.float32
+    assert float(out) == 0.0
+
+    # Sk=0.
+    q = torch.zeros((2, 1, 4, 16), device=device, dtype=in_dtype)
+    k = torch.zeros((0, 1, 4, 16), device=device, dtype=in_dtype)
+    idx_scores = torch.zeros((1, 2, 0), device=device, dtype=torch.float32)
+    topk = torch.zeros((1, 2, 2), device=device, dtype=torch.int64)
+    out = dsa_splitk_indexer_loss_tilelang(
+        idx_scores, topk, q, k, 1.0, 1.0, sparse_loss=True
+    )
+    assert out.shape == ()
+    assert float(out) == 0.0
+
+    # AB=0.
+    q = torch.zeros((2, 0, 4, 16), device=device, dtype=in_dtype)
+    k = torch.zeros((4, 0, 4, 16), device=device, dtype=in_dtype)
+    idx_scores = torch.zeros((0, 2, 4), device=device, dtype=torch.float32)
+    topk = torch.zeros((0, 2, 2), device=device, dtype=torch.int64)
+    out = dsa_splitk_indexer_loss_tilelang(
+        idx_scores, topk, q, k, 1.0, 1.0, sparse_loss=False
+    )
+    assert out.shape == ()
+    assert float(out) == 0.0
