@@ -279,3 +279,90 @@ def test_dsa_splitk_indexer_loss_sparse_full_topk_matches_dense():
     torch.testing.assert_close(
         out_sparse.to(torch.float32), out_dense.to(torch.float32), rtol=1e-3, atol=1e-5,
     )
+
+
+# ---------------------------------------------------------------------------
+# Wave-3 self-audit: explicit sparse-mask sign-convention test.
+#
+# Catches the failure mode where the wrapper's scatter direction inverts
+# (``scatter(0, indices, -inf)`` instead of ``scatter(-inf, indices, 0)``) or
+# the kernel's ``s = s + IndexMask[..]`` becomes ``s - IndexMask[..]``. A
+# hand-crafted topk + dense ref makes the bug obvious; the random tests above
+# can mask it because random scores already produce a wide value range.
+# Also covers the new int32-topk_indices acceptance path landed in this wave.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _TILELANG_OK, reason=f"TileLang unavailable: {_STATUS.reason}")
+def test_dsa_splitk_indexer_loss_sparse_mask_sign_convention():
+    """Hand-crafted sparse mask: positions in topk → 0, others → -inf."""
+
+    device = _pick_device()
+    if device.type == "cpu":
+        pytest.skip("TileLang DSA split-K requires a CUDA or Metal device")
+
+    torch.manual_seed(0x517A)
+    AB, AH, AD = 1, 1, 32
+    ASq, Sk = 8, 16
+
+    query = torch.randn(ASq, AB, AH, AD, dtype=torch.float16, device=device)
+    key = torch.randn(Sk, AB, AH, AD, dtype=torch.float16, device=device)
+    index_scores = torch.randn(AB, ASq, Sk, dtype=torch.float32, device=device)
+
+    # Per-row top-2 picks, hand-chosen so each row has a distinct sparsity
+    # pattern. int32 dtype intentional -- exercises the int32→int64 promotion
+    # branch added in the wave-3 wrapper validation.
+    topk_indices = torch.tensor(
+        [[[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7], [7, 8]]],
+        dtype=torch.int32, device=device,
+    )
+
+    softmax_scale = 1.0 / math.sqrt(AD)
+    loss_coeff = 1.0
+
+    out_kernel = dsa_splitk_indexer_loss_tilelang(
+        index_scores, topk_indices, query, key,
+        softmax_scale=softmax_scale, loss_coeff=loss_coeff,
+        sparse_loss=True, pg_collection=None,
+    )
+    ref = _torch_indexer_loss_reference(
+        index_scores, topk_indices.to(torch.long), query, key,
+        softmax_scale=softmax_scale, loss_coeff=loss_coeff, sparse_loss=True,
+    )
+
+    torch.testing.assert_close(
+        out_kernel.to(torch.float32), ref.to(torch.float32),
+        rtol=1e-2, atol=1e-4,
+    )
+
+
+@pytest.mark.skipif(not _TILELANG_OK, reason=f"TileLang unavailable: {_STATUS.reason}")
+def test_dsa_splitk_indexer_loss_topk_validation():
+    """Wave-3 self-audit: wrapper raises clearly on bad topk_indices inputs."""
+
+    device = _pick_device()
+    if device.type == "cpu":
+        pytest.skip("TileLang DSA split-K requires a CUDA or Metal device")
+
+    AB, AH, AD = 1, 1, 32
+    ASq, Sk, TOPK = 8, 16, 4
+
+    query = torch.randn(ASq, AB, AH, AD, dtype=torch.float16, device=device)
+    key = torch.randn(Sk, AB, AH, AD, dtype=torch.float16, device=device)
+    index_scores = torch.randn(AB, ASq, Sk, dtype=torch.float32, device=device)
+
+    # Wrong shape.
+    bad_shape = torch.zeros((AB, ASq + 1, TOPK), dtype=torch.long, device=device)
+    with pytest.raises(ValueError, match="topk_indices must have shape"):
+        dsa_splitk_indexer_loss_tilelang(
+            index_scores, bad_shape, query, key,
+            softmax_scale=1.0, loss_coeff=1.0, sparse_loss=True,
+        )
+
+    # Wrong dtype.
+    bad_dtype = torch.zeros((AB, ASq, TOPK), dtype=torch.float32, device=device)
+    with pytest.raises(TypeError, match="topk_indices.dtype"):
+        dsa_splitk_indexer_loss_tilelang(
+            index_scores, bad_dtype, query, key,
+            softmax_scale=1.0, loss_coeff=1.0, sparse_loss=True,
+        )
