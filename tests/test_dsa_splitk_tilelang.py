@@ -557,3 +557,67 @@ def test_can_use_q_cache_v5_budget_logic():
     # 32*16*64*2 = 64 KB: fits CUDA budget (64 KB), not Metal (16 KB).
     assert not _can_use_q_cache_v5(BLOCK_SQ=32, AH=16, AD=64, in_dtype="float16", target="metal")
     assert _can_use_q_cache_v5(BLOCK_SQ=32, AH=16, AD=64, in_dtype="float16", target="cuda")
+
+
+@pytest.mark.skipif(not _TILELANG_OK, reason=f"TileLang unavailable: {_STATUS.reason}")
+def test_wave9_tiled_block_sq_non_multiple_asq():
+    """Wave-9 #2 regression for grok rev_38ff59759f HIGH finding.
+
+    The wave-8 366b5be tiled Q-cache picks ``BLOCK_SQ`` from
+    ``{64, 32, 16, 8}`` to fit the per-target shared-memory budget. AH=8 +
+    AD=64 lands on ``BLOCK_SQ=16`` on Metal. ``ASq=100`` is not a multiple
+    of 16 (last sq_block covers indices [96, 112), only 4 rows valid) ->
+    exercises the ``sq_idx < ASq`` clip on every loop nest in stage 2.
+    Off-by-one in any of {Q_full hoist, m1/d1 load, M_pre/D_pre prefetch,
+    Q_all_heads cache, valid predicate, output store} would diverge from
+    the torch reference by a noticeable margin.
+    """
+
+    device = _pick_device()
+    if device.type == "cpu":
+        pytest.skip("TileLang DSA split-K requires a CUDA or Metal device")
+
+    torch.manual_seed(0xA59E)
+    AB, AH, AD = 1, 8, 64
+    ASq, Sk = 100, 2048  # ASq deliberately non-multiple of any BLOCK_SQ choice
+    softmax_scale = 1.0 / math.sqrt(AD)
+    loss_coeff = 1.0
+
+    query = torch.randn(ASq, AB, AH, AD, dtype=torch.float16, device=device)
+    key = torch.randn(Sk, AB, AH, AD, dtype=torch.float16, device=device)
+    index_scores = torch.randn(AB, ASq, Sk, dtype=torch.float32, device=device)
+    topk_indices = torch.zeros(AB, ASq, 4, dtype=torch.long, device=device)
+
+    out = dsa_splitk_indexer_loss_tilelang(
+        index_scores, topk_indices, query, key,
+        softmax_scale=softmax_scale, loss_coeff=loss_coeff,
+        sparse_loss=False, pg_collection=None,
+    )
+    ref = _torch_indexer_loss_reference(
+        index_scores, topk_indices, query, key,
+        softmax_scale=softmax_scale, loss_coeff=loss_coeff,
+        sparse_loss=False,
+    )
+
+    assert out.dtype == torch.float32
+    # AH=8 + AD=64 routes through BLOCK_SQ=16 on Metal (16 KB budget exact).
+    # ASq=100 -> 7 sq_blocks; last block has 4 valid rows; off-by-one in any
+    # clip predicate would spike well above this tolerance.
+    torch.testing.assert_close(out.to(torch.float32), ref.to(torch.float32), rtol=1e-2, atol=1e-4)
+
+
+def test_wave9_tiled_block_sq_choice_for_production_shapes():
+    """Wave-9 #2 budget probe: AH=8/16 + AD=64 shapes must land on the wave-5 path."""
+
+    from cppmega_mlx.nn._tilelang.dsa_splitk_indexer_loss import _can_use_q_cache_v5_tiled
+
+    # AH=8 + AD=64 + Metal (16 KB): 8*16*64*2 = 16384 B -> exactly fits at BLOCK_SQ=16.
+    assert _can_use_q_cache_v5_tiled(AH=8, AD=64, in_dtype="float16", target="metal") == 16
+    # AH=16 + AD=64 + Metal: 16*8*64*2 = 16384 B -> fits at BLOCK_SQ=8.
+    assert _can_use_q_cache_v5_tiled(AH=16, AD=64, in_dtype="float16", target="metal") == 8
+    # AH=4 + AD=64 + Metal: 4*32*64*2 = 16384 B -> fits at BLOCK_SQ=32.
+    assert _can_use_q_cache_v5_tiled(AH=4, AD=64, in_dtype="float16", target="metal") == 32
+    # AH=128 + AD=64 + Metal: 128*8*64*2 = 131072 B -> over budget at all tiles.
+    assert _can_use_q_cache_v5_tiled(AH=128, AD=64, in_dtype="float16", target="metal") is None
+    # CUDA budget 64 KB -> AH=16 lands on BLOCK_SQ=32 (16*32*64*2 = 65536 B exact).
+    assert _can_use_q_cache_v5_tiled(AH=16, AD=64, in_dtype="float16", target="cuda") == 32
