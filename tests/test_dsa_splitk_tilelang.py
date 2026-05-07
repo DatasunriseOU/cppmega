@@ -366,3 +366,89 @@ def test_dsa_splitk_indexer_loss_topk_validation():
             index_scores, bad_dtype, query, key,
             softmax_scale=1.0, loss_coeff=1.0, sparse_loss=True,
         )
+
+
+def test_dsa_debug_env_gate_skips_sync_in_production():
+    """Wave-4 perf #1: production path must NOT sync the GPU.
+
+    The validation block (.item()/.all()) is gated behind
+    CPPMEGA_MLX_DSA_DEBUG. With the env var unset (default), even an
+    out-of-range topk index should reach the kernel layer without the
+    pre-launch ValueError firing. With the env var set, the same input
+    must raise ValueError as before.
+    """
+
+    import os
+    from cppmega_mlx.nn._tilelang.dsa_splitk_indexer_loss import (
+        _dsa_debug_enabled,
+    )
+
+    # The debug helper is the contract; verify both branches respond to
+    # env. Don't actually launch a GPU kernel here -- this is a fast
+    # CPU-side regression for the gating logic.
+    saved = os.environ.pop("CPPMEGA_MLX_DSA_DEBUG", None)
+    try:
+        assert _dsa_debug_enabled() is False
+        for falsey in ("", "0", "false", "no", "off", "FALSE"):
+            os.environ["CPPMEGA_MLX_DSA_DEBUG"] = falsey
+            assert _dsa_debug_enabled() is False, falsey
+        for truthy in ("1", "true", "yes", "on", "TRUE", "Yes"):
+            os.environ["CPPMEGA_MLX_DSA_DEBUG"] = truthy
+            assert _dsa_debug_enabled() is True, truthy
+    finally:
+        os.environ.pop("CPPMEGA_MLX_DSA_DEBUG", None)
+        if saved is not None:
+            os.environ["CPPMEGA_MLX_DSA_DEBUG"] = saved
+
+
+@pytest.mark.skipif(not _TILELANG_OK, reason=f"TileLang unavailable: {_STATUS.reason}")
+def test_dsa_splitk_indexer_loss_split_stage1_kernels_match_unified():
+    """Wave-4 perf #3: split stage-1 kernels (AH > 1 path) match the unified
+    kernel's M1/D1 outputs.
+
+    The wrapper auto-selects the split path when AH > 1 and the unified
+    path when AH == 1. To verify equivalence we run the same input shape
+    twice (with AH > 1 it goes through the split, then we slice and
+    reduce to the same statistics in the AH==1 unified launch). This
+    catches drift between ``make_dsa_splitk_stage1_idx_kernel`` and the
+    legacy unified ``if h == 0`` block.
+    """
+
+    device = _pick_device()
+    if device.type == "cpu":
+        pytest.skip("TileLang DSA split-K requires a CUDA or Metal device")
+
+    AB, AD = 1, 32
+    ASq, Sk, TOPK = 16, 32, 4
+    softmax_scale = 1.0 / math.sqrt(AD)
+
+    torch.manual_seed(13)
+    query_template = torch.randn(ASq, AB, 1, AD, dtype=torch.float16, device=device)
+    key_template = torch.randn(Sk, AB, 1, AD, dtype=torch.float16, device=device)
+    index_scores = torch.randn(AB, ASq, Sk, dtype=torch.float32, device=device)
+    topk = torch.randint(0, Sk, (AB, ASq, TOPK), dtype=torch.long, device=device)
+
+    # AH==1: exercises the unified kernel.
+    loss_ah1 = dsa_splitk_indexer_loss_tilelang(
+        index_scores, topk, query_template, key_template,
+        softmax_scale=softmax_scale, loss_coeff=1.0, sparse_loss=True,
+    )
+
+    # AH==4: exercises the split path; M1/D1 must match (they're
+    # AH-independent by construction). Build query/key with 4 heads but
+    # use the same head-0 slice so attn statistics also match.
+    AH = 4
+    query_ah4 = query_template.expand(ASq, AB, AH, AD).contiguous()
+    key_ah4 = key_template.expand(Sk, AB, AH, AD).contiguous()
+    loss_ah4 = dsa_splitk_indexer_loss_tilelang(
+        index_scores, topk, query_ah4, key_ah4,
+        softmax_scale=softmax_scale, loss_coeff=1.0, sparse_loss=True,
+    )
+
+    # Both paths produce a per-(b, sq) loss; they should be numerically
+    # close because the index-softmax statistics are head-independent
+    # and the attention path averages over the (here-identical) heads.
+    torch.testing.assert_close(
+        loss_ah1.float(), loss_ah4.float(),
+        rtol=1e-2, atol=1e-4,
+    )
