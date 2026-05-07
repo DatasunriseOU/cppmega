@@ -37,7 +37,7 @@ which has the same signature as Megatron's ``compute_dsa_indexer_loss``.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import triton
@@ -46,6 +46,38 @@ import triton.language as tl
 __all__ = [
     "compute_dsa_indexer_loss_splitk",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Tier-2 of the unified TileLang fused-kernel pipeline (sibling of
+# ``fp8_activations.py``'s amax/quantize hand-off): the Path C port of
+# ``_fwd_fused_indexer_loss_stage1_kernel`` and ``_stage2`` lives in
+# cppmega.mlx and runs on both CUDA and Apple Metal SIMDgroup. The probes
+# below are import-time; ``_dsa_tilelang_supports(device)`` is the per-call
+# dispatch gate that replaces the implicit ``tensor.is_cuda`` requirement
+# of the Triton-only path on hosts that have a TileLang install.
+# ---------------------------------------------------------------------------
+_has_dsa_tilelang = False
+_dsa_tilelang_fn: Any | None = None
+
+
+def _dsa_tilelang_supports(_device: torch.device) -> bool:  # noqa: D401 - thin shim
+    """Default no-op gate, replaced below when the Path C module imports."""
+
+    return False
+
+
+try:
+    from cppmega_mlx.nn._tilelang.dsa_splitk_indexer_loss import (  # type: ignore[import-not-found]
+        dsa_splitk_indexer_loss_tilelang as _dsa_splitk_indexer_loss_tilelang,
+        tilelang_supports as _dsa_tilelang_supports_impl,
+    )
+
+    _has_dsa_tilelang = True
+    _dsa_tilelang_fn = _dsa_splitk_indexer_loss_tilelang
+    _dsa_tilelang_supports = _dsa_tilelang_supports_impl  # type: ignore[assignment]
+except Exception:  # pragma: no cover - hosts without cppmega.mlx / TileLang
+    _has_dsa_tilelang = False
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +383,27 @@ def compute_dsa_indexer_loss_splitk(
     sk=4096) this saves ~7.5 GiB -> ~0.06 GiB for softmax stats, i.e.
     ~60% of the forward peak for the indexer loss computation.
     """
+    # Path C TileLang dispatch -- replaces the implicit ``tensor.is_cuda``
+    # gate on hosts where a TileLang JIT (CUDA or Apple Metal) is available.
+    # When tp.size() > 1 the upstream caller has already routed around the
+    # split-K path; here we only need to pick between TileLang and the legacy
+    # Triton emission, leaving the Triton fallback intact.
+    if (
+        _has_dsa_tilelang
+        and _dsa_tilelang_fn is not None
+        and _dsa_tilelang_supports(query.device)
+    ):
+        return _dsa_tilelang_fn(
+            index_scores,
+            topk_indices,
+            query,
+            key,
+            softmax_scale,
+            loss_coeff,
+            sparse_loss,
+            pg_collection,
+        )
+
     # query: [sq, b, np, hn]  key: [sk, b, np, hn]
     ASq, AB, AH, AD = query.shape
     ASk = key.shape[0]
