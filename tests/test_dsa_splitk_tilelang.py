@@ -167,3 +167,115 @@ def test_dsa_splitk_indexer_loss_matches_triton_reference():
         rtol=1e-2,
         atol=1e-4,
     )
+
+
+# ---------------------------------------------------------------------------
+# Wave-2 #06: sparse-only regression coverage
+#
+# These exercise the ``sparse_loss=True`` branch -- previously only the dense
+# (``sparse_loss=False``) path had numerical-parity tests. The two cases below
+# bracket the sparsity range:
+#   * High sparsity:  TOPK=8 of Sk=4096   (~99.8% masked)
+#   * Low sparsity:   TOPK=1024 of Sk=4096 (~75% masked)
+# Together with the dense tests above they cover the four sparse_loss x
+# kernel-stage combinations the hot path can hit.
+# ---------------------------------------------------------------------------
+
+
+def _run_sparse_parity(
+    *,
+    AB: int,
+    AH: int,
+    AD: int,
+    ASq: int,
+    Sk: int,
+    TOPK: int,
+    seed: int,
+) -> None:
+    device = _pick_device()
+    if device.type == "cpu":
+        pytest.skip("TileLang DSA split-K requires a CUDA or Metal device")
+
+    torch.manual_seed(seed)
+    softmax_scale = 1.0 / math.sqrt(AD)
+    loss_coeff = 1.0
+
+    query = torch.randn(ASq, AB, AH, AD, dtype=torch.float16, device=device)
+    key = torch.randn(Sk, AB, AH, AD, dtype=torch.float16, device=device)
+    index_scores = torch.randn(AB, ASq, Sk, dtype=torch.float32, device=device)
+
+    # Random TOPK indices per (b, sq) row, in [0, Sk). Deduplicate via sort to
+    # match the wrapper's ``scatter_(-1, topk_indices, 0.0)`` semantics, which
+    # collapses duplicates onto a single masked-in slot.
+    topk_indices = torch.randint(0, Sk, (AB, ASq, TOPK), dtype=torch.long, device=device)
+
+    out = dsa_splitk_indexer_loss_tilelang(
+        index_scores, topk_indices, query, key,
+        softmax_scale=softmax_scale, loss_coeff=loss_coeff,
+        sparse_loss=True, pg_collection=None,
+    )
+    ref = _torch_indexer_loss_reference(
+        index_scores, topk_indices, query, key,
+        softmax_scale=softmax_scale, loss_coeff=loss_coeff,
+        sparse_loss=True,
+    )
+
+    assert out.dtype == torch.float32
+    torch.testing.assert_close(out.to(torch.float32), ref.to(torch.float32), rtol=1e-2, atol=1e-4)
+
+
+@pytest.mark.skipif(not _TILELANG_OK, reason=f"TileLang unavailable: {_STATUS.reason}")
+def test_dsa_splitk_indexer_loss_sparse_high_sparsity():
+    """High-sparsity sparse_loss path (TOPK=8 of Sk=4096) parity vs torch ref."""
+
+    _run_sparse_parity(AB=1, AH=2, AD=64, ASq=128, Sk=4096, TOPK=8, seed=0xA11CE)
+
+
+@pytest.mark.skipif(not _TILELANG_OK, reason=f"TileLang unavailable: {_STATUS.reason}")
+def test_dsa_splitk_indexer_loss_sparse_low_sparsity():
+    """Low-sparsity sparse_loss path (TOPK=1024 of Sk=4096) parity vs torch ref."""
+
+    _run_sparse_parity(AB=1, AH=2, AD=64, ASq=128, Sk=4096, TOPK=1024, seed=0xB0B)
+
+
+@pytest.mark.skipif(not _TILELANG_OK, reason=f"TileLang unavailable: {_STATUS.reason}")
+def test_dsa_splitk_indexer_loss_sparse_full_topk_matches_dense():
+    """sparse_loss=True with TOPK=Sk degenerates to the dense path numerically.
+
+    Each row's mask is all-zeros (every position selected), so the kernel must
+    return the same value as ``sparse_loss=False`` on identical inputs. This
+    catches mask-application bugs (e.g. wrong sign, off-by-one on the scatter)
+    without needing a Triton ground truth.
+    """
+
+    device = _pick_device()
+    if device.type == "cpu":
+        pytest.skip("TileLang DSA split-K requires a CUDA or Metal device")
+
+    torch.manual_seed(0xDEAD)
+    AB, AH, AD = 1, 2, 32
+    ASq, Sk = 64, 128
+
+    query = torch.randn(ASq, AB, AH, AD, dtype=torch.float16, device=device)
+    key = torch.randn(Sk, AB, AH, AD, dtype=torch.float16, device=device)
+    index_scores = torch.randn(AB, ASq, Sk, dtype=torch.float32, device=device)
+
+    # TOPK == Sk and indices = arange => mask is all-zero.
+    topk_indices = torch.arange(Sk, dtype=torch.long, device=device).expand(AB, ASq, Sk).contiguous()
+
+    softmax_scale = 1.0 / math.sqrt(AD)
+    loss_coeff = 1.0
+
+    out_sparse = dsa_splitk_indexer_loss_tilelang(
+        index_scores, topk_indices, query, key,
+        softmax_scale=softmax_scale, loss_coeff=loss_coeff,
+        sparse_loss=True, pg_collection=None,
+    )
+    out_dense = dsa_splitk_indexer_loss_tilelang(
+        index_scores, topk_indices, query, key,
+        softmax_scale=softmax_scale, loss_coeff=loss_coeff,
+        sparse_loss=False, pg_collection=None,
+    )
+    torch.testing.assert_close(
+        out_sparse.to(torch.float32), out_dense.to(torch.float32), rtol=1e-3, atol=1e-5,
+    )
