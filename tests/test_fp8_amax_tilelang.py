@@ -15,10 +15,14 @@ import torch
 pytest.importorskip("cppmega_mlx.nn._tilelang.fp8_amax")
 from cppmega_mlx.nn._tilelang.fp8_amax import (  # noqa: E402
     _FP8_E4M3_MAX,
+    _bucket_n,
+    _pick_block_size,
     fp8_amax_path_c_status,
     fp8_amax_tilelang,
     fp8_pack_tilelang,
+    make_fp8_amax_kernel,
     tilelang_supports,
+    tilelang_supports_with_reason,
 )
 
 
@@ -120,3 +124,109 @@ def test_fp8_pack_tilelang_bf16_clamp_roundtrip():
         -_FP8_E4M3_MAX, _FP8_E4M3_MAX
     ).to(torch.float8_e4m3fn).to(torch.float32) * ref_scale
     torch.testing.assert_close(deq, ref_q, rtol=0.15, atol=ref_scale.item() * 1.0)
+
+
+@pytest.mark.skipif(not _TILELANG_OK, reason=f"TileLang unavailable: {_STATUS.reason}")
+def test_fp8_amax_partial_last_block_matches_torch_reference():
+    """Partial-last-block correctness: a non-divisible N must NOT silently
+    produce wrong output (either succeeds within the same tolerance as the
+    aligned shape, or raises a precise diagnostic).
+
+    Targets the BLOCK_SIZE-vs-threads concern from the wave-1 grok review:
+    on a partial last block, the masked ``T.Parallel(BLOCK)`` strided loop
+    must cover every in-range element exactly once.
+    """
+
+    torch.manual_seed(0xBAD)
+    device = _pick_device()
+    if device.type == "cpu":
+        pytest.skip("TileLang amax requires a CUDA or Metal device")
+
+    # 100 is < BLOCK_SIZE (1024 cuda / 256 metal), exercising the
+    # ``n_elements < block`` shrink path *and* a partial last block.
+    # 4097 forces bucket_n = 8192 with a 4095-zero-padded tail.
+    for shape in [(100,), (4097,), (1, 4097), (3, 1234)]:
+        x = torch.randn(*shape, dtype=torch.float16, device=device) * 5.0
+        out = fp8_amax_tilelang(x)
+        ref = x.abs().amax().to(torch.float32)
+        torch.testing.assert_close(
+            out.squeeze(),
+            ref,
+            rtol=1e-3,
+            atol=1e-3,
+            msg=f"partial-block amax mismatch at shape={shape}",
+        )
+
+
+def test_block_size_threads_invariant_raises_on_violation():
+    """Hand-rolled ``make_fp8_amax_kernel`` with a non-divisible (BLOCK, threads)
+    must raise a precise ``RuntimeError`` rather than silently producing
+    a kernel that under-covers the last block."""
+
+    with pytest.raises(RuntimeError, match=r"BLOCK_SIZE=1000 not divisible by THREADS=128"):
+        make_fp8_amax_kernel(n_elements=4096, block_size=1000, threads=128)
+
+
+def test_pick_block_size_per_target_table():
+    """The dynamic block-size picker honors the per-target table and the
+    BLOCK % THREADS == 0 invariant."""
+
+    cuda_block, cuda_threads = _pick_block_size("cuda", 1 << 20)
+    assert cuda_block == 1024 and cuda_threads == 128
+    assert cuda_block % cuda_threads == 0
+
+    hip_block, hip_threads = _pick_block_size("hip", 1 << 20)
+    assert hip_block == 1024 and hip_threads == 256
+    assert hip_block % hip_threads == 0
+
+    metal_block, metal_threads = _pick_block_size("metal -thread_warp_size=32", 1 << 20)
+    assert metal_block == 256 and metal_threads == 64
+    assert metal_block % metal_threads == 0
+
+    # Tiny input: block shrinks to next pow2 >= threads
+    tiny_block, tiny_threads = _pick_block_size("cuda", 50)
+    assert tiny_block >= tiny_threads
+    assert tiny_block % tiny_threads == 0
+
+
+def test_bucket_n_collapses_close_shapes():
+    """Bucket key collapses 5 close shapes (4097..8192) to a single key."""
+
+    keys = {_bucket_n(n, block_size=1024) for n in [4097, 5000, 6000, 7777, 8192]}
+    assert keys == {8192}, f"expected single 8192 bucket, got {keys}"
+
+    # Exact pow2 stays at pow2; tiny values clamp to block_size.
+    assert _bucket_n(8192, block_size=1024) == 8192
+    assert _bucket_n(100, block_size=1024) == 1024
+
+
+def test_tilelang_supports_with_reason_returns_2tuple():
+    """Every return path of the diagnostic helper is a (bool, str) 2-tuple."""
+
+    cases = [
+        torch.device("cpu"),
+        "cpu",
+        torch.device("cuda"),
+        "cuda",
+        torch.device("mps") if hasattr(torch.backends, "mps") else None,
+        None,
+        "definitely-not-a-device",
+    ]
+    for case in cases:
+        if case is None and not (
+            hasattr(torch.backends, "mps") and case is None
+        ):
+            # the explicit None is a separate test-case; skip the conditional
+            pass
+        result = tilelang_supports_with_reason(case)
+        assert isinstance(result, tuple) and len(result) == 2, (
+            f"non-tuple return for case={case!r}: {result!r}"
+        )
+        assert isinstance(result[0], bool), f"non-bool first: {result!r}"
+        assert isinstance(result[1], str) and result[1], (
+            f"empty/non-str reason for case={case!r}: {result!r}"
+        )
+
+    # The boolean wrapper must agree with the tuple's first element.
+    for case in cases:
+        assert tilelang_supports(case) == tilelang_supports_with_reason(case)[0]
