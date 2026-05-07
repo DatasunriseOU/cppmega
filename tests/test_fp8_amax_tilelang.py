@@ -418,3 +418,51 @@ def test_wave9_concurrent_amax_compile():
         f"concurrent quantize compiles aliased PrimFuncs: "
         f"{[(c, id(v)) for c, v in quant_results.items()]}"
     )
+
+
+@pytest.mark.skipif(
+    not _TILELANG_OK,
+    reason=f"TileLang FP8 unavailable: {_STATUS.reason or 'unknown'}",
+)
+def test_wave11_amax_nan_input_does_not_hang() -> None:
+    """Wave-11 #2: NaN-poisoned input must not hang the kernel.
+
+    CUDA ``atomicMax`` on fp32 is undefined for NaN, and Metal has no
+    native fp32 atomic_max — the lowering is a CAS loop. Without the
+    wave-11 pre-filter (`amax_safe = if v == v else 0`), a single NaN
+    in the input makes the CAS loop spin forever (NaN != NaN, so
+    compare_exchange never succeeds). This test launches the kernel
+    on a tensor that contains NaN and asserts it returns within a
+    reasonable wall-clock budget.
+    """
+    import threading
+
+    device = _pick_device()
+    n = 4096
+    x = torch.randn(n, device=device, dtype=torch.float32)
+    # Poison a few elements with NaN.
+    x[1] = float("nan")
+    x[1234] = float("nan")
+    x[-1] = float("nan")
+
+    result_holder: list[object] = []
+
+    def _run() -> None:
+        try:
+            result_holder.append(fp8_amax_tilelang(x))
+        except BaseException as exc:  # pragma: no cover - propagated below
+            result_holder.append(exc)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=30.0)  # generous: kernel build + launch + sync
+    assert not t.is_alive(), (
+        "fp8_amax_tilelang hung on NaN input -- wave-11 atomic_max NaN "
+        "pre-filter regressed (Metal CAS loop spin)."
+    )
+    assert result_holder, "kernel thread produced no result"
+    res = result_holder[0]
+    if isinstance(res, BaseException) and not isinstance(res, FloatingPointError):
+        raise res  # propagate unexpected error
+    # Either a non-NaN amax (NaN was filtered to 0 → max over real data)
+    # or a wave-3 FloatingPointError if all-NaN. Both are acceptable.
