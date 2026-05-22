@@ -29,6 +29,55 @@ from pathlib import Path
 import numpy as np
 
 
+_OUTPUT_DTYPE_MAP = {
+    "uint8": np.uint8,
+    "uint16": np.uint16,
+    "int32": np.int32,
+    "int64": np.int64,
+    # Historical CLI compatibility. Megatron's MMIDIDX dtype enum has no
+    # uint32 token dtype, so positive token IDs that need more than uint16 must
+    # be stored as int32.
+    "uint32": np.int32,
+}
+
+_MEGATRON_DTYPE_CODE_MAP = {
+    np.uint8: 1,
+    np.int32: 4,
+    np.int64: 5,
+    np.uint16: 8,
+}
+
+
+def _resolve_output_dtype(dtype_str: str) -> type[np.generic]:
+    try:
+        dtype = _OUTPUT_DTYPE_MAP[dtype_str]
+    except KeyError as exc:
+        raise ValueError(f"unsupported dtype: {dtype_str}") from exc
+    if dtype_str == "uint32":
+        print(
+            "WARNING: Megatron MMIDIDX has no uint32 dtype code; "
+            "writing token IDs as int32 instead",
+            file=sys.stderr,
+        )
+    return dtype
+
+
+def _megatron_dtype_code(dtype: type[np.generic] | np.dtype) -> int:
+    dtype_type = np.dtype(dtype).type
+    if dtype_type not in _MEGATRON_DTYPE_CODE_MAP:
+        supported = ", ".join(
+            sorted(
+                np.dtype(supported_dtype).name
+                for supported_dtype in _MEGATRON_DTYPE_CODE_MAP
+            )
+        )
+        raise ValueError(
+            f"unsupported Megatron MMIDIDX dtype {np.dtype(dtype).name}; "
+            f"supported dtypes: {supported}"
+        )
+    return _MEGATRON_DTYPE_CODE_MAP[dtype_type]
+
+
 def find_parquet_shards(input_dir: str, split: str) -> list[str]:
     """Find all parquet shard files for a given split.
 
@@ -74,9 +123,8 @@ def _convert_parquet_to_numpy(
     import pyarrow.parquet as pq
     import struct
 
-    dtype_map = {"uint16": np.uint16, "uint32": np.uint32, "int32": np.int32}
-    dtype_code_map = {np.uint16: 1, np.uint32: 4, np.int32: 5}  # Megatron codes
-    dtype = dtype_map[dtype_str]
+    dtype = _resolve_output_dtype(dtype_str)
+    dtype_code = _megatron_dtype_code(dtype)
 
     shards = find_parquet_shards(input_dir, split)
     print(f"found {len(shards)} {split} shards")
@@ -127,7 +175,7 @@ def _convert_parquet_to_numpy(
     with open(idx_path, "wb") as f:
         f.write(MAGIC)
         f.write(struct.pack("<Q", VERSION))
-        f.write(struct.pack("<B", dtype_code_map.get(dtype, 1)))
+        f.write(struct.pack("<B", dtype_code))
         f.write(struct.pack("<Q", len(all_docs)))  # num sequences
         f.write(struct.pack("<Q", len(all_docs) + 1))  # num documents (includes sentinel)
         sizes.tofile(f)
@@ -154,7 +202,9 @@ def convert_parquet_to_megatron(
 
     # Import Megatron's dataset builder
     try:
-        from megatron.core.datasets.indexed_dataset import IndexedDatasetBuilder as MMapIndexedDatasetBuilder
+        from megatron.core.datasets.indexed_dataset import (  # pyright: ignore[reportMissingImports]
+            IndexedDatasetBuilder as MMapIndexedDatasetBuilder,
+        )
     except (ImportError, Exception) as e:
         print(f"WARNING: megatron import failed ({e}), using fallback writer", file=sys.stderr)
         MMapIndexedDatasetBuilder = None
@@ -168,14 +218,7 @@ def convert_parquet_to_megatron(
     print(f"found {len(shards)} {split} shards in {input_dir}")
 
     # Determine dtype
-    dtype_map = {
-        "uint16": np.uint16,
-        "uint32": np.uint32,
-        "int32": np.int32,
-    }
-    dtype = dtype_map.get(dtype_str)
-    if dtype is None:
-        raise ValueError(f"unsupported dtype: {dtype_str}")
+    dtype = _resolve_output_dtype(dtype_str)
 
     # Create output directory
     output_dir = os.path.dirname(output_prefix)
@@ -247,9 +290,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--dtype",
-        choices=["uint16", "uint32", "int32"],
+        choices=["uint8", "uint16", "int32", "int64", "uint32"],
         default="uint16",
-        help="Output dtype for token IDs (default: uint16, sufficient for vocab < 65536)",
+        help=(
+            "Output dtype for token IDs. uint32 is accepted as a deprecated "
+            "alias that writes int32, because Megatron MMIDIDX has no uint32 "
+            "dtype code."
+        ),
     )
     args = parser.parse_args()
 

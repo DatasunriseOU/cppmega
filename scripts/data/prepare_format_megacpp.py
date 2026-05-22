@@ -47,11 +47,12 @@ def main() -> int:
     parser.add_argument("--dataset-name", default=DEFAULT_DATASET_NAME)
     parser.add_argument(
         "--dtype",
-        choices=["uint16", "uint32", "int32"],
-        default="uint32",
+        choices=["uint8", "uint16", "int32", "int64", "uint32"],
+        default="int32",
         help=(
-            "Token-ID dtype. Use uint32 for the megacpp tokenizer (vocab=131072 > "
-            "65535). uint16 only valid for vocab < 65536."
+            "Token-ID dtype. Use int32 for the megacpp tokenizer "
+            "(vocab=131072 > 65535). uint32 is accepted as a deprecated alias "
+            "that writes int32 because Megatron MMIDIDX has no uint32 dtype code."
         ),
     )
     parser.add_argument(

@@ -3,13 +3,23 @@
 # Goal: see whether TE Float8Quantizer (E5M2) output can be fed into the
 # existing TileLang sparse_mla_bwd_fp8 kernel (which currently hard-codes
 # dO in BF16).
+# ruff: noqa: E402
 
-import os, sys, traceback, torch
+import pkgutil
+import sys
+
+import torch
+
+import pytest
+
+if not torch.cuda.is_available():
+    pytest.skip("CUDA required", allow_module_level=True)
 
 sys.path.insert(0, "/home/dave/cppmega/cppmega")  # package root
 
-from transformer_engine.pytorch.tensor.float8_tensor import Float8Quantizer
-import transformer_engine_torch as tex
+float8_tensor = pytest.importorskip("transformer_engine.pytorch.tensor.float8_tensor")
+tex = pytest.importorskip("transformer_engine_torch")
+Float8Quantizer = float8_tensor.Float8Quantizer
 
 from cppmega.megatron.sparse_mla_ops.tilelang_sparse_mla_fwd_fp8 import (
     per_token_cast_to_fp8,
@@ -96,10 +106,11 @@ print("\n=== TileLang cuDNN probe ===")
 from tilelang.utils.target import SUPPORTED_TARGETS
 print("SUPPORTED_TARGETS =", list(SUPPORTED_TARGETS.keys()))
 # Is there any cuDNN-related symbol in tilelang?
-import tilelang, pkgutil
+import tilelang
 matched = []
 for m in pkgutil.walk_packages(tilelang.__path__, prefix="tilelang."):
-    if "cudnn" in m.name.lower(): matched.append(m.name)
+    if "cudnn" in m.name.lower():
+        matched.append(m.name)
 print("tilelang modules with 'cudnn':", matched or "NONE")
 
 print("\nDONE")

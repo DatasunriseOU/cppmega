@@ -108,7 +108,8 @@ Writes both splits:
 - `${MEGACPP_DATA_ROOT}/megatron/clang_semantic_4k_v10_train.{bin,idx}`
 - `${MEGACPP_DATA_ROOT}/megatron/clang_semantic_4k_v10_valid.{bin,idx}`
 
-Uses `uint32` tokens (vocab=131072 > 65535 so `uint16` is invalid).
+Uses `int32` output tokens (vocab=131072 > 65535 so `uint16` is invalid;
+Megatron MMIDIDX has no `uint32` dtype code).
 Implementation lives in `scripts/data_prep_parquet_to_megatron.py` which
 prefers `megatron.core.datasets.indexed_dataset.IndexedDatasetBuilder`
 and falls back to a raw `MMIDIDX` writer when megatron-core isn't
@@ -140,7 +141,7 @@ of document 0. Non-zero exit on any failure — **no silent fallbacks**.
 
 ## Megatron data format
 
-- `.bin` — flat packed token IDs (default dtype `uint32` for vocab=131072).
+- `.bin` — flat packed token IDs (default dtype `int32` for vocab=131072).
 - `.idx` — `MMIDIDX\x00\x00` magic + version + dtype-code + document count +
   `sizes[int32]` + `pointers[int64]` + `doc_idx[int64]`. Matches the
   `megatron-core` `MMapIndexedDataset` reader.

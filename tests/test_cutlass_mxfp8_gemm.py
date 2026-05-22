@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import pytest
 import torch
-import transformer_engine  # noqa: F401
-import transformer_engine_torch as tex
-from transformer_engine.pytorch.tensor import MXFP8Quantizer
+
+pytest.importorskip("transformer_engine")
+tex = pytest.importorskip("transformer_engine_torch")
+te_tensor = pytest.importorskip("transformer_engine.pytorch.tensor")
+MXFP8Quantizer = te_tensor.MXFP8Quantizer
 
 
 pytestmark = [
