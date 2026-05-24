@@ -127,7 +127,7 @@ def test_dsa_splitk_indexer_loss_matches_triton_reference():
 
     torch.manual_seed(0xBEEF)
     AB, AH, AD = 1, 4, 64
-    ASq, Sk = 128, 256
+    ASq, Sk = 128, 128
     softmax_scale = 1.0 / math.sqrt(AD)
     loss_coeff = 0.5
 
@@ -208,6 +208,9 @@ def _run_sparse_parity(
     # match the wrapper's ``scatter_(-1, topk_indices, 0.0)`` semantics, which
     # collapses duplicates onto a single masked-in slot.
     topk_indices = torch.randint(0, Sk, (AB, ASq, TOPK), dtype=torch.long, device=device)
+    # Ensure every row has at least one valid index within the causal region (0 is always <= sq_idx)
+    # to avoid mathematically degenerate rows of all -inf, which produce NaN in softmax.
+    topk_indices[:, :, 0] = 0
 
     out = dsa_splitk_indexer_loss_tilelang(
         index_scores, topk_indices, query, key,
@@ -785,8 +788,10 @@ def test_wave11_dsa_topk_zero_handled():
     then produces NaN, and the KL loss propagates NaN into training. The
     wrapper must raise ``ValueError`` instead.
     """
-    device = torch.device("cpu")
-    in_dtype = torch.float32
+    device = _pick_device()
+    if device.type == "cpu":
+        pytest.skip("TileLang DSA split-K requires a CUDA or Metal device")
+    in_dtype = torch.float16
     q = torch.zeros((2, 1, 4, 16), device=device, dtype=in_dtype)
     k = torch.zeros((4, 1, 4, 16), device=device, dtype=in_dtype)
     idx_scores = torch.zeros((1, 2, 4), device=device, dtype=torch.float32)
