@@ -112,6 +112,9 @@ def _convert_parquet_to_numpy(
     split: str,
     token_column: str,
     dtype_str: str,
+    side_channels: list[str] | None = None,
+    side_channel_dtypes: list[str] | None = None,
+    vocab_size: int = 65536,
 ) -> None:
     """Fallback: write Megatron-compatible .bin + .idx using raw numpy.
 
@@ -135,17 +138,37 @@ def _convert_parquet_to_numpy(
 
     # Collect all documents
     all_docs: list[np.ndarray] = []
+    all_side_docs: dict[str, list[np.ndarray]] = {col: [] for col in (side_channels or [])}
+    side_dtypes = {col: np.dtype(dt) for col, dt in zip(side_channels or [], side_channel_dtypes or [], strict=True)}
     t0 = time.time()
+
+    columns_to_read = [token_column] + (side_channels or [])
 
     for shard_idx, shard_path in enumerate(shards):
         pf = pq.ParquetFile(shard_path)
         for rg_idx in range(pf.metadata.num_row_groups):
-            table = pf.read_row_group(rg_idx, columns=[token_column])
-            column = table.column(token_column)
-            for row_idx in range(len(column)):
-                token_ids = column[row_idx].as_py()
+            table = pf.read_row_group(rg_idx, columns=columns_to_read)
+            token_col = table.column(token_column)
+            side_cols = {col: table.column(col) for col in (side_channels or [])}
+            for row_idx in range(len(token_col)):
+                token_ids = token_col[row_idx].as_py()
                 if token_ids:
                     all_docs.append(np.array(token_ids, dtype=dtype))
+                    for col in (side_channels or []):
+                        side_val = side_cols[col][row_idx].as_py()
+                        if side_val is None:
+                            side_val = []
+                        if len(side_val) != len(token_ids):
+                            print(
+                                f"WARNING: Column {col} length ({len(side_val)}) mismatch with tokens ({len(token_ids)}) "
+                                f"at row {row_idx}; automatically aligning...",
+                                file=sys.stderr,
+                            )
+                            if len(side_val) > len(token_ids):
+                                side_val = side_val[:len(token_ids)]
+                            else:
+                                side_val = side_val + [0] * (len(token_ids) - len(side_val))
+                        all_side_docs[col].append(np.array(side_val, dtype=side_dtypes[col]))
         if (shard_idx + 1) % 10 == 0:
             print(f"  read {shard_idx + 1}/{len(shards)} shards, {len(all_docs)} docs")
 
@@ -184,6 +207,33 @@ def _convert_parquet_to_numpy(
         doc_idx = np.arange(len(all_docs) + 1, dtype=np.int64)
         doc_idx.tofile(f)
 
+    # Write side channels
+    for col in (side_channels or []):
+        side_bin_path = f"{output_prefix}_{col}.bin"
+        with open(side_bin_path, "wb") as sf:
+            for doc_side in all_side_docs[col]:
+                doc_side.tofile(sf)
+
+    # Write JSON sidecar
+    json_path = output_prefix + ".json"
+    sidecar_data = {
+        "vocab_size": vocab_size,
+        "tokenizer_contract": "megacpp",
+        "dtype": dtype_str,
+        "token_count": total_tokens,
+    }
+    if side_channels:
+        side_channel_paths = {}
+        for col, dt_str in zip(side_channels, side_channel_dtypes or [], strict=True):
+            side_channel_paths[col] = {
+                "path": f"{os.path.basename(output_prefix)}_{col}.bin",
+                "dtype": dt_str,
+            }
+        sidecar_data["side_channel_paths"] = side_channel_paths
+
+    with open(json_path, "w", encoding="utf-8") as jf:
+        json.dump(sidecar_data, jf, indent=4)
+
     elapsed = time.time() - t0
     bin_size = os.path.getsize(bin_path) / (1024**3)
     print(f"\n{split}: {len(all_docs)} docs, {total_tokens:,} tokens, {bin_size:.2f} GiB in {elapsed:.1f}s")
@@ -196,9 +246,13 @@ def convert_parquet_to_megatron(
     split: str = "train",
     token_column: str = "token_ids",
     dtype_str: str = "uint16",
+    side_channels: list[str] | None = None,
+    side_channel_dtypes: list[str] | None = None,
+    vocab_size: int = 65536,
 ) -> None:
     """Convert parquet token_ids to Megatron MMapIndexedDataset format."""
     import pyarrow.parquet as pq
+    import json
 
     # Import Megatron's dataset builder
     try:
@@ -211,7 +265,16 @@ def convert_parquet_to_megatron(
 
     if MMapIndexedDatasetBuilder is None:
         # Fallback: write raw numpy binary + simple index
-        _convert_parquet_to_numpy(input_dir, output_prefix, split, token_column, dtype_str)
+        _convert_parquet_to_numpy(
+            input_dir,
+            output_prefix,
+            split,
+            token_column,
+            dtype_str,
+            side_channels=side_channels,
+            side_channel_dtypes=side_channel_dtypes,
+            vocab_size=vocab_size,
+        )
         return
 
     shards = find_parquet_shards(input_dir, split)
@@ -227,21 +290,52 @@ def convert_parquet_to_megatron(
 
     builder = MMapIndexedDatasetBuilder(output_prefix + ".bin", dtype=dtype)
 
+    # Open side channel writers
+    side_writers = {}
+    side_dtypes = {}
+    if side_channels:
+        for col, dt_str in zip(side_channels, side_channel_dtypes or [], strict=True):
+            side_bin_path = f"{output_prefix}_{col}.bin"
+            side_writers[col] = open(side_bin_path, "wb")
+            side_dtypes[col] = np.dtype(dt_str)
+
     total_docs = 0
     total_tokens = 0
     t0 = time.time()
 
+    columns_to_read = [token_column] + (side_channels or [])
+
     for shard_idx, shard_path in enumerate(shards):
         pf = pq.ParquetFile(shard_path)
         for rg_idx in range(pf.metadata.num_row_groups):
-            table = pf.read_row_group(rg_idx, columns=[token_column])
-            column = table.column(token_column)
-            for row_idx in range(len(column)):
-                token_ids = column[row_idx].as_py()
+            table = pf.read_row_group(rg_idx, columns=columns_to_read)
+            token_col = table.column(token_column)
+            side_cols = {col: table.column(col) for col in (side_channels or [])}
+            for row_idx in range(len(token_col)):
+                token_ids = token_col[row_idx].as_py()
                 if not token_ids:
                     continue
                 arr = np.array(token_ids, dtype=dtype)
-                builder.add_document(arr)
+                builder.add_document(arr, [len(arr)])
+
+                # Write aligned side channel values
+                for col in (side_channels or []):
+                    side_val = side_cols[col][row_idx].as_py()
+                    if side_val is None:
+                        side_val = []
+                    if len(side_val) != len(token_ids):
+                        print(
+                            f"WARNING: Column {col} length ({len(side_val)}) mismatch with tokens ({len(token_ids)}) "
+                            f"at row {row_idx}; automatically aligning...",
+                            file=sys.stderr,
+                        )
+                        if len(side_val) > len(token_ids):
+                            side_val = side_val[:len(token_ids)]
+                        else:
+                            side_val = side_val + [0] * (len(token_ids) - len(side_val))
+                    arr_side = np.array(side_val, dtype=side_dtypes[col])
+                    arr_side.tofile(side_writers[col])
+
                 total_docs += 1
                 total_tokens += len(arr)
 
@@ -253,6 +347,30 @@ def convert_parquet_to_megatron(
         )
 
     builder.finalize(output_prefix + ".idx")
+
+    # Close side channel writers
+    for writer in side_writers.values():
+        writer.close()
+
+    # Write JSON sidecar
+    json_path = output_prefix + ".json"
+    sidecar_data = {
+        "vocab_size": vocab_size,
+        "tokenizer_contract": "megacpp",
+        "dtype": dtype_str,
+        "token_count": total_tokens,
+    }
+    if side_channels:
+        side_channel_paths = {}
+        for col, dt_str in zip(side_channels, side_channel_dtypes or [], strict=True):
+            side_channel_paths[col] = {
+                "path": f"{os.path.basename(output_prefix)}_{col}.bin",
+                "dtype": dt_str,
+            }
+        sidecar_data["side_channel_paths"] = side_channel_paths
+
+    with open(json_path, "w", encoding="utf-8") as jf:
+        json.dump(sidecar_data, jf, indent=4)
 
     elapsed = time.time() - t0
     print(
@@ -298,7 +416,31 @@ def main() -> int:
             "dtype code."
         ),
     )
+    parser.add_argument(
+        "--side-channels",
+        default=None,
+        help="Comma-separated list of side-channel columns to convert (e.g. structure_ids,dep_levels)",
+    )
+    parser.add_argument(
+        "--side-channel-dtypes",
+        default=None,
+        help="Comma-separated list of dtypes for side-channels (e.g. uint16,uint8)",
+    )
+    parser.add_argument(
+        "--vocab-size",
+        type=int,
+        default=65536,
+        help="Tokenizer vocab size to write to the JSON sidecar (default: 65536)",
+    )
     args = parser.parse_args()
+
+    side_channels_list = [x.strip() for x in args.side_channels.split(",") if x.strip()] if args.side_channels else None
+    side_channel_dtypes_list = [x.strip() for x in args.side_channel_dtypes.split(",") if x.strip()] if args.side_channel_dtypes else None
+
+    if side_channels_list and not side_channel_dtypes_list:
+        raise ValueError("--side-channel-dtypes must be specified when --side-channels is provided")
+    if side_channels_list and side_channel_dtypes_list and len(side_channels_list) != len(side_channel_dtypes_list):
+        raise ValueError("Number of --side-channels must match number of --side-channel-dtypes")
 
     convert_parquet_to_megatron(
         input_dir=args.input_dir,
@@ -306,6 +448,9 @@ def main() -> int:
         split=args.split,
         token_column=args.token_column,
         dtype_str=args.dtype,
+        side_channels=side_channels_list,
+        side_channel_dtypes=side_channel_dtypes_list,
+        vocab_size=args.vocab_size,
     )
     return 0
 
