@@ -25,6 +25,8 @@ import os
 import sys
 from pathlib import Path
 
+import pyarrow.parquet as pq
+
 
 # Reuse the existing parquet→Megatron converter shipped in scripts/.
 _HERE = Path(__file__).resolve().parent
@@ -39,6 +41,81 @@ DEFAULT_DATA_ROOT = os.environ.get(
 DEFAULT_DATASET_NAME = os.environ.get(
     "MEGACPP_DATASET_NAME", "clang_semantic_4k_v10"
 )
+
+# Default token-aligned side channels (column -> Megatron .bin dtype) carried
+# alongside the token stream. These match the modern v12 parquet schema. Any
+# requested channel that is absent from the parquet schema is a hard error
+# unless --allow-missing-side-channels is passed (RULE #1: fail loud).
+DEFAULT_SIDE_CHANNELS: tuple[tuple[str, str], ...] = (
+    ("token_structure_ids", "uint8"),
+    ("token_dep_levels", "uint16"),
+    ("token_ast_depth", "uint16"),
+    ("token_sibling_index", "uint16"),
+    ("token_ast_node_type", "uint16"),
+    ("token_def_use", "uint8"),
+)
+
+
+def _parse_side_channels(spec: str) -> list[tuple[str, str]]:
+    """Parse a 'col:dtype,col:dtype' spec into ordered (column, dtype) pairs."""
+
+    pairs: list[tuple[str, str]] = []
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(
+                f"--side-channels entry {item!r} must be 'column:dtype'"
+            )
+        column, dtype = item.split(":", 1)
+        column, dtype = column.strip(), dtype.strip()
+        if not column or not dtype:
+            raise ValueError(
+                f"--side-channels entry {item!r} must be 'column:dtype'"
+            )
+        pairs.append((column, dtype))
+    return pairs
+
+
+def _resolve_side_channels(
+    input_dir: Path,
+    requested: list[tuple[str, str]],
+    *,
+    allow_missing: bool,
+) -> list[tuple[str, str]]:
+    """Filter requested side channels against the actual parquet schema.
+
+    Raises when a requested channel is absent unless allow_missing is set, in
+    which case the absent channel is dropped (and reported on stderr).
+    """
+
+    shards = sorted(input_dir.glob("*.parquet"))
+    if not shards:
+        raise FileNotFoundError(f"no parquet shards in {input_dir}")
+    present = set(pq.ParquetFile(shards[0]).schema_arrow.names)
+
+    resolved: list[tuple[str, str]] = []
+    missing: list[str] = []
+    for column, dtype in requested:
+        if column in present:
+            resolved.append((column, dtype))
+        else:
+            missing.append(column)
+
+    if missing and not allow_missing:
+        raise ValueError(
+            "requested side-channel(s) absent from parquet schema "
+            f"{input_dir.name}: {', '.join(missing)} "
+            "(pass --allow-missing-side-channels to drop them)"
+        )
+    if missing:
+        print(
+            f"[megacpp_format] WARNING dropping absent side-channels: "
+            f"{', '.join(missing)}",
+            file=sys.stderr,
+        )
+    return resolved
 
 
 def main() -> int:
@@ -65,6 +142,34 @@ def main() -> int:
         default="train,val",
         help="Comma-separated splits to emit (default: train,val)",
     )
+    default_side_channels = ",".join(
+        f"{col}:{dtype}" for col, dtype in DEFAULT_SIDE_CHANNELS
+    )
+    parser.add_argument(
+        "--side-channels",
+        default=default_side_channels,
+        help=(
+            "Comma-separated token-aligned side channels as 'column:dtype'. "
+            f"Default: {default_side_channels}. Empty string disables side channels."
+        ),
+    )
+    parser.add_argument(
+        "--allow-missing-side-channels",
+        action="store_true",
+        help=(
+            "Drop requested side channels that are absent from the parquet "
+            "schema instead of raising (default: raise / fail loud)."
+        ),
+    )
+    parser.add_argument(
+        "--vocab-size",
+        type=int,
+        default=131072,
+        help=(
+            "Tokenizer vocab size written to the JSON sidecar. Default 131072 "
+            "matches the megacpp tokenizer."
+        ),
+    )
     args = parser.parse_args()
 
     data_root = Path(args.data_root).resolve()
@@ -76,6 +181,24 @@ def main() -> int:
         )
     output_root = data_root / "megatron"
     output_root.mkdir(parents=True, exist_ok=True)
+
+    requested_side_channels = _parse_side_channels(args.side_channels)
+    resolved_side_channels = (
+        _resolve_side_channels(
+            input_dir,
+            requested_side_channels,
+            allow_missing=args.allow_missing_side_channels,
+        )
+        if requested_side_channels
+        else []
+    )
+    side_channels = [col for col, _ in resolved_side_channels] or None
+    side_channel_dtypes = [dtype for _, dtype in resolved_side_channels] or None
+    if side_channels:
+        print(
+            "[megacpp_format] side_channels="
+            + ", ".join(f"{c}:{d}" for c, d in resolved_side_channels)
+        )
 
     splits = [s.strip() for s in args.splits.split(",") if s.strip()]
     for split in splits:
@@ -94,6 +217,9 @@ def main() -> int:
             split=split,
             token_column=args.token_column,
             dtype_str=args.dtype,
+            side_channels=side_channels,
+            side_channel_dtypes=side_channel_dtypes,
+            vocab_size=args.vocab_size,
         )
 
     print(f"[megacpp_format] done. Megatron dataset at {output_root}")
