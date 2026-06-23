@@ -25,7 +25,7 @@ Usage:
     .venv/bin/python audit_megacpp_4k.py \
         --dataset-dir /Users/dave/sources/parquet/clang_semantic_4k_v10 \
         --kind static_code \
-        --vocab-size 131072 \
+        --vocab-size 65536 \
         --seq-len 4096 \
         --out-dir /tmp/audit_clang_semantic_4k_v10
 
@@ -401,8 +401,8 @@ def main() -> int:
     parser.add_argument(
         "--vocab-size",
         type=int,
-        default=131072,
-        help="Tokenizer vocab; any token_id >= this fails (default megacpp 131072).",
+        default=65536,
+        help="Tokenizer vocab; any token_id >= this fails (default canonical 65536).",
     )
     parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument(

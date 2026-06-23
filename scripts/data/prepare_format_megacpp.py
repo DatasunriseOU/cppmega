@@ -127,9 +127,9 @@ def main() -> int:
         choices=["uint8", "uint16", "int32", "int64", "uint32"],
         default="int32",
         help=(
-            "Token-ID dtype. Use int32 for the megacpp tokenizer "
-            "(vocab=131072 > 65535). uint32 is accepted as a deprecated alias "
-            "that writes int32 because Megatron MMIDIDX has no uint32 dtype code."
+            "Token-ID dtype. int32 is the safe default for any vocab. The canonical "
+            "tokenizer is 65536 (ids fit uint16); uint32 is accepted as a deprecated "
+            "alias that writes int32 because Megatron MMIDIDX has no uint32 dtype code."
         ),
     )
     parser.add_argument(
@@ -164,10 +164,11 @@ def main() -> int:
     parser.add_argument(
         "--vocab-size",
         type=int,
-        default=131072,
+        default=65536,
         help=(
-            "Tokenizer vocab size written to the JSON sidecar. Default 131072 "
-            "matches the megacpp tokenizer."
+            "Tokenizer vocab size written to the JSON sidecar. Default 65536 = the "
+            "canonical fixed mlx tokenizer (tokenizer_contract_v1.json). Existing "
+            "parquet token_ids fit this (max observed 65529)."
         ),
     )
     args = parser.parse_args()
