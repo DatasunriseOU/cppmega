@@ -281,6 +281,17 @@ from cppmega.megatron.moe_dispatcher_patch import apply_moe_dispatcher_identity_
 apply_dsa_indexer_fused_patch()
 apply_moe_dispatcher_identity_sort_patch()
 patch_mamba_output_layer_with_linear_ce()
+# cppmega structure side-channel DATA patch (gated on CPPMEGA_STRUCTURE_ENABLED).
+# Installs the GPTDataset.__getitem__ + get_batch_on_this_tp_rank monkeypatches
+# that inject the 5 token-aligned structure columns into each batch and stash
+# them in a thread-local for the model forward to consume. Runs here at the top
+# of the entry, before the dataset/dataloader is built. RULE #1: a bare import
+# (no try/except) -- if structure is requested and the patch cannot load, crash
+# loud rather than train silently without structure. When structure is off (the
+# quarter hybrid lane) this block is skipped and the shim is unchanged.
+if os.environ.get("CPPMEGA_STRUCTURE_ENABLED", "0") == "1":
+    import cppmega.megatron.structure_dataset_patch  # noqa: F401  (import side effects install the patches)
+    print("[local_quarter_shim] structure_dataset_patch installed", file=sys.stderr, flush=True)
 if os.environ.get("CPPMEGA_MUON_DTYPE_AUDIT", "0") == "1":
     from cppmega.megatron.muon_dtype_audit import (
         MuonDtypeAuditConfig,
