@@ -570,7 +570,11 @@ def set_gb10_dense500m_cpp_profile(profile: RunProfile | None = None) -> RunProf
         fp8_recipe="off",
         attention_backend="flash",
     )
-    profile.optimizer = OptimizerProfile(optimizer="adam")
+    # Muon is the optimizer the GB10 bf16-no-master-emerging plumbing is built
+    # around (adam conflicts with --use-bf16-no-master-emerging-optimizer). For a
+    # per-step throughput measurement the optimizer step is &lt;5% of the 4096 fwd/bwd
+    # so this does not perturb the comparison vs the MLX bf16 number.
+    profile.optimizer = OptimizerProfile()
     profile.runtime = RuntimePatchProfile(
         mamba3_mimo=False,
         ngram_hash_enabled=True,
