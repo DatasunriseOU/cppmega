@@ -564,6 +564,7 @@ def set_gb10_dense500m_cpp_profile(profile: RunProfile | None = None) -> RunProf
         micro_batch_size=4,
         global_batch_size=4,
         train_iters=30,
+        data_path="1.0 /home/dave/cppmega-root/data/megatron/reindexed_4k_train",
     )
     profile.precision = PrecisionProfile(
         fp8_recipe="off",
@@ -575,7 +576,7 @@ def set_gb10_dense500m_cpp_profile(profile: RunProfile | None = None) -> RunProf
         ngram_hash_enabled=True,
         structure_enabled=True,
         structure_components="core",
-        mtp_ce_kernel="off",
+        mtp_ce_kernel="native",
     )
     profile.profiling = ProfilingProfile()
     return profile
