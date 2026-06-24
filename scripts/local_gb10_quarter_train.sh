@@ -661,15 +661,23 @@ sed -i '1i import cppmega_local_quarter_shim  # local GB10 quarter train patches
   "${WORKDIR}/pretrain_mamba.py"
 
 : "${HYBRID_LAYER_PATTERN:?run profile did not set HYBRID_LAYER_PATTERN}"
-: "${NATIVE_ARGS:?run profile did not set NATIVE_ARGS}"
-case " ${NATIVE_ARGS} " in
-  *" --moe-token-dispatcher-type ${CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE} "*) ;;
-  *)
-    echo "FATAL: NATIVE_ARGS dispatcher does not match CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE=${CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE}" >&2
-    echo "NATIVE_ARGS=${NATIVE_ARGS}" >&2
-    exit 2
-    ;;
-esac
+if [[ "${CPPMEGA_DENSE_GQA:-0}" == "1" ]]; then
+  # Pure-dense GQA lane: no MLA/MoE/DSA literals, so NATIVE_ARGS is legitimately
+  # empty and there is no MoE token dispatcher to cross-check.  The hybrid
+  # NAM56R quarter lane (CPPMEGA_DENSE_GQA unset/0) keeps the original guards
+  # below byte-for-byte.
+  :
+else
+  : "${NATIVE_ARGS:?run profile did not set NATIVE_ARGS}"
+  case " ${NATIVE_ARGS} " in
+    *" --moe-token-dispatcher-type ${CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE} "*) ;;
+    *)
+      echo "FATAL: NATIVE_ARGS dispatcher does not match CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE=${CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE}" >&2
+      echo "NATIVE_ARGS=${NATIVE_ARGS}" >&2
+      exit 2
+      ;;
+  esac
+fi
 
 (
   while true; do
@@ -797,6 +805,30 @@ if [[ "${CPPMEGA_CUDA_PROFILE}" == "1" ]]; then
   )
 fi
 
+# --- Pure-dense GQA lane (gated on CPPMEGA_DENSE_GQA=1) -----------------------
+# Every assignment below is ADDITIVE and GATED so the hybrid NAM56R quarter lane
+# (CPPMEGA_DENSE_GQA unset/0) keeps emitting its original argv byte-for-byte.
+GQA_ARGS=()
+HEAD_TIE_ARGS=(--untie-embeddings-and-output-weights)
+RECOMPUTE_MODULES_ARGS=(--recompute-modules moe_act mlp mla_up_proj)
+MLA_DOWNPROJ_ARGS=(--mla-down-proj-fusion)
+if [[ "${CPPMEGA_DENSE_GQA:-0}" == "1" ]]; then
+  # B1 + B5: group-query attention + dense SwiGLU transformer knobs.
+  GQA_ARGS=(
+    --group-query-attention
+    --num-query-groups "${CPPMEGA_NUM_QUERY_GROUPS:-4}"
+    --kv-channels "${CPPMEGA_KV_CHANNELS:-64}"
+    --swiglu
+    --rotary-base 10000
+  )
+  # B2: dense lane uses a tied output head (no untie flag).
+  HEAD_TIE_ARGS=()
+  # B3: dense lane has no MoE/MLA modules to recompute, only mlp.
+  RECOMPUTE_MODULES_ARGS=(--recompute-modules mlp)
+  # B4: --mla-down-proj-fusion asserts multi_latent_attention; drop it for dense.
+  MLA_DOWNPROJ_ARGS=()
+fi
+
 TORCHRUN_EXTRA_ARGS=()
 TRAINING_ENTRY=("${WORKDIR}/pretrain_mamba.py")
 if [[ "${CPPMEGA_NSYS_PROFILE}" == "1" ]]; then
@@ -869,6 +901,7 @@ python -m torch.distributed.run --nproc_per_node=1 "${TORCHRUN_EXTRA_ARGS[@]}" "
   --hidden-size "${CPPMEGA_HIDDEN_SIZE:-3584}" \
   --ffn-hidden-size "${CPPMEGA_FFN_HIDDEN_SIZE:-18944}" \
   --num-attention-heads "${CPPMEGA_NUM_ATTN_HEADS:-28}" \
+  "${GQA_ARGS[@]}" \
   --seq-length "${CPPMEGA_SEQ_LENGTH}" \
   --max-position-embeddings "${CPPMEGA_MAX_POSITION_EMBEDDINGS}" \
   --micro-batch-size "${CPPMEGA_MICRO_BATCH_SIZE:-4}" \
@@ -883,7 +916,7 @@ python -m torch.distributed.run --nproc_per_node=1 "${TORCHRUN_EXTRA_ARGS[@]}" "
   --no-rope-fusion \
   --normalization RMSNorm \
   --disable-bias-linear \
-  --untie-embeddings-and-output-weights \
+  "${HEAD_TIE_ARGS[@]}" \
   --bf16 \
   "${FP8_ARGS[@]}" \
   --use-mcore-models \
@@ -896,8 +929,8 @@ python -m torch.distributed.run --nproc_per_node=1 "${TORCHRUN_EXTRA_ARGS[@]}" "
   --cross-entropy-loss-fusion \
   --cross-entropy-fusion-impl linear \
   --recompute-granularity selective \
-  --recompute-modules moe_act mlp mla_up_proj \
-  --mla-down-proj-fusion \
+  "${RECOMPUTE_MODULES_ARGS[@]}" \
+  "${MLA_DOWNPROJ_ARGS[@]}" \
   --clip-grad 1.0 \
   "${OPTIMIZER_ARGS[@]}" \
   ${NATIVE_ARGS} \

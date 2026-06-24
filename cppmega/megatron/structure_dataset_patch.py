@@ -145,8 +145,19 @@ try:
         if os.environ.get("CPPMEGA_STRUCTURE_ENABLED", "0") != "1":
             return sample
 
-        # Enabled structure columns
+        # Enabled structure columns (canonical names the model embedding expects).
         structure_cols = ["structure_ids", "dep_levels", "ast_depth_ids", "sibling_index_ids", "node_type_ids"]
+        # RULE #1: the converter writes side-channel keys under the parquet column
+        # spelling (``token_*``); older datasets used the bare canonical name. Try
+        # both so OUR reindexed dataset AND the legacy clang_semantic_4k_v10 lane
+        # resolve. A genuine miss RAISES below -- never a silent zero substitution.
+        _STRUCTURE_COL_ALIASES = {
+            "structure_ids": ("token_structure_ids", "structure_ids"),
+            "dep_levels": ("token_dep_levels", "dep_levels"),
+            "ast_depth_ids": ("token_ast_depth", "ast_depth_ids", "token_ast_depth_ids"),
+            "sibling_index_ids": ("token_sibling_index", "sibling_index_ids", "token_sibling_index_ids"),
+            "node_type_ids": ("token_ast_node_type", "node_type_ids", "token_ast_node_type_ids"),
+        }
 
         if idx is None:
             # Padded sequence: return zero tensors matching the tokens shape
@@ -160,28 +171,32 @@ try:
         if not side_channels:
             return sample
 
-        try:
-            indices = _get_absolute_token_indices(self, idx)
-            for col in structure_cols:
-                if col in side_channels:
-                    entry = side_channels[col]
-                    vals = entry["mmap"][indices]
-                    tensor = torch.from_numpy(vals).long()
-                    if self.config.add_extra_token_to_sequence:
-                        sample[col] = tensor[:-1].contiguous()
-                    else:
-                        sample[col] = tensor.contiguous()
-                else:
-                    # Provide zeros if a specific column is missing from the dataset
-                    tokens_shape = sample["tokens"].shape
-                    sample[col] = torch.zeros(tokens_shape, dtype=torch.long, device=sample["tokens"].device)
-        except Exception as exc:
-            print(f"[cppmega-patch] WARNING: failed to slice structure metadata: {exc}", flush=True)
-            # Fallback to zeros
-            tokens_shape = sample["tokens"].shape
-            for col in structure_cols:
-                if col not in sample:
-                    sample[col] = torch.zeros(tokens_shape, dtype=torch.long, device=sample["tokens"].device)
+        # RULE #1: no try/except->zeros. Resolve each canonical column from the
+        # sidecar under any known alias; an unresolved column while structure is
+        # enabled is a real misconfiguration and RAISES with WHERE+WHAT.
+        indices = _get_absolute_token_indices(self, idx)
+        for col in structure_cols:
+            source = next(
+                (a for a in _STRUCTURE_COL_ALIASES[col] if a in side_channels), None
+            )
+            if source is None:
+                raise KeyError(
+                    f"[cppmega-patch] structure column {col!r} missing from dataset "
+                    f"side-channels (tried {_STRUCTURE_COL_ALIASES[col]}; have "
+                    f"{sorted(side_channels)}) while CPPMEGA_STRUCTURE_ENABLED=1"
+                )
+            entry = side_channels[source]
+            vals = entry["mmap"][indices]
+            tensor = torch.from_numpy(vals).long()
+            if self.config.add_extra_token_to_sequence:
+                sample[col] = tensor[:-1].contiguous()
+            else:
+                sample[col] = tensor.contiguous()
+            if idx == 0:
+                print(
+                    f"[cppmega-patch] Mapped side-channel {source} -> {col}",
+                    flush=True,
+                )
 
         return sample
 
