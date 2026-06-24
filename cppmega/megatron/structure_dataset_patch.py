@@ -108,10 +108,21 @@ def _get_absolute_token_indices(dataset: Any, idx: int) -> np.ndarray:
     doc_index_end, doc_index_end_offset = dataset.sample_index[shuffled_idx + 1]
 
     token_itemsize = np.dtype(dataset.dataset.index.dtype).itemsize
+    seq_ptrs = dataset.dataset.index.sequence_pointers
+    seq_lens = dataset.dataset.index.sequence_lengths
+    # CRITICAL: ``doc_index_beg/end`` are indices INTO ``document_index`` (the
+    # shuffled per-epoch document permutation), NOT raw document ids. Megatron's
+    # GPTDataset._query_document_sample_shuffle_indices fetches the real document
+    # via ``self.document_index[i]`` -- mirror that exactly. Using ``i`` directly
+    # reads the WRONG document's pointer/length whenever document_index is a
+    # permutation (the default), yielding truncated index runs (the 1170 vs 4096
+    # collate crash). No silent fallback (RULE #1): wrong docs -> wrong data.
+    docmap = dataset.document_index
 
     if doc_index_beg == doc_index_end:
         # Sequence spans a single document
-        doc_start_token = dataset.dataset.index.sequence_pointers[doc_index_beg] // token_itemsize
+        real_doc = int(docmap[doc_index_beg])
+        doc_start_token = seq_ptrs[real_doc] // token_itemsize
         start = doc_start_token + doc_index_beg_offset
         length = doc_index_end_offset - doc_index_beg_offset + dataset.config.add_extra_token_to_sequence
         return np.arange(start, start + length, dtype=np.int64)
@@ -119,16 +130,17 @@ def _get_absolute_token_indices(dataset: Any, idx: int) -> np.ndarray:
         # Sequence spans multiple documents
         parts = []
         for i in range(doc_index_beg, doc_index_end + 1):
-            doc_start_token = dataset.dataset.index.sequence_pointers[i] // token_itemsize
+            real_doc = int(docmap[i])
+            doc_start_token = seq_ptrs[real_doc] // token_itemsize
             if i == doc_index_beg:
                 start = doc_start_token + doc_index_beg_offset
-                length = dataset.dataset.index.sequence_lengths[i] - doc_index_beg_offset
+                length = seq_lens[real_doc] - doc_index_beg_offset
             elif i == doc_index_end:
                 start = doc_start_token
                 length = doc_index_end_offset + dataset.config.add_extra_token_to_sequence
             else:
                 start = doc_start_token
-                length = dataset.dataset.index.sequence_lengths[i]
+                length = seq_lens[real_doc]
             parts.append(np.arange(start, start + length, dtype=np.int64))
         return np.concatenate(parts)
 
@@ -189,9 +201,24 @@ try:
             vals = entry["mmap"][indices]
             tensor = torch.from_numpy(vals).long()
             if self.config.add_extra_token_to_sequence:
-                sample[col] = tensor[:-1].contiguous()
-            else:
-                sample[col] = tensor.contiguous()
+                tensor = tensor[:-1]
+            tensor = tensor.contiguous()
+            # Align to the (possibly pad-extended) token length. Megatron pads a
+            # short trailing sample's tokens up to sequence_length; mirror that by
+            # zero-padding the structure tail -- those are genuine pad positions
+            # (loss-masked), so zeros are correct, NOT a silent data fallback.
+            # RULE #1: a structure run LONGER than the token window means the index
+            # reconstruction is wrong -> RAISE rather than silently truncate.
+            target_len = int(sample["tokens"].shape[-1])
+            if tensor.shape[0] > target_len:
+                raise ValueError(
+                    f"[cppmega-patch] structure col {col!r} len {tensor.shape[0]} > "
+                    f"token len {target_len} (idx {idx}); index reconstruction bug"
+                )
+            if tensor.shape[0] < target_len:
+                pad = torch.zeros(target_len - tensor.shape[0], dtype=tensor.dtype)
+                tensor = torch.cat([tensor, pad], dim=0)
+            sample[col] = tensor.contiguous()
             if idx == 0:
                 print(
                     f"[cppmega-patch] Mapped side-channel {source} -> {col}",
