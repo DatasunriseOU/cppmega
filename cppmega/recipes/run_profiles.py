@@ -547,9 +547,15 @@ def set_gb10_dense500m_cpp_profile(profile: RunProfile | None = None) -> RunProf
             name="gb10_dense500m_cpp",
             description="Single-GB10 pure-dense ~500M GQA C++ baseline lane",
         )
+    # 1:1 with the MLX DenseCppLM: 24 standard transformer blocks, each =
+    # attention sublayer + dense SwiGLU MLP sublayer. In the Megatron MambaStack
+    # chassis every pattern position is ONE layer, so a block is "AF" (A->'*'
+    # attention, F->'-' dense MLP). 24 blocks => 48 layer positions, NO Mamba
+    # (zero 'M'), NO MoE (zero 'E'), NO MLA/DSA/MTP. The MambaModel class is only
+    # the host for cppmega's custom embedding (ngram+structure) wiring.
     profile.model = ModelProfile(
-        pattern="A" * 24,
-        depth=24,
+        pattern="AF",
+        depth=48,
         mtp_depths=0,
         hidden_size=1280,
         ffn_hidden_size=3456,

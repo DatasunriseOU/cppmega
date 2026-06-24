@@ -81,6 +81,8 @@ def build_nam56r_lite_main_pattern(
     for symbol in parse_nem_pattern(pattern, depth):
         if symbol == "A":
             mapped.append(attn_symbol)
+        elif symbol == "F":
+            mapped.append("-")  # dense SwiGLU MLP layer (not MoE)
         elif symbol == "E":
             mapped.append("E")
         elif symbol in {"M", "R"}:

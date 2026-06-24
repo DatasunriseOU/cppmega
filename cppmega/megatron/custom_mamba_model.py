@@ -60,6 +60,22 @@ class CppMegaMambaModel(MambaModel):
             if hasattr(self, "embedding") and self.embedding is not None:
                 self._fastmtp.tie_word_embeddings(self.embedding)
 
+        # Diagnostic: confirm the cppmega feature params are REGISTERED in the
+        # model param tree (and thus visible to Megatron's optimizer/count). If
+        # they are absent here, the features are dead weight regardless of being
+        # built on self.embedding.
+        _names = [n for n, _ in self.named_parameters()]
+        _ng = sum(p.numel() for n, p in self.named_parameters() if "ngram" in n)
+        _st = sum(p.numel() for n, p in self.named_parameters() if "structure" in n)
+        _tot = sum(p.numel() for _, p in self.named_parameters())
+        print(
+            f"[cppmega-model] named_parameters total={_tot} "
+            f"ngram_params={_ng} structure_params={_st} "
+            f"has_ngram={'ngram' in ' '.join(_names)} "
+            f"has_structure={any('structure' in n for n in _names)}",
+            flush=True,
+        )
+
     def set_cppmega_structure_inputs(self, structure_inputs):
         self._cppmega_structure_inputs = structure_inputs
 
