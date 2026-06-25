@@ -589,6 +589,22 @@ def set_gb10_dense500m_cpp_profile(profile: RunProfile | None = None) -> RunProf
         mtp_ce_kernel="native",
     )
     profile.profiling = ProfilingProfile()
+    # Throughput-sweep overrides (baked into the emitted profile so they survive
+    # the launcher's eval, which the run-env cannot override). Used by the gb10
+    # batch/seq sweep to measure s/step + peak memory at different shapes.
+    _seq = os.environ.get("CPPMEGA_SWEEP_SEQ")
+    _mbs = os.environ.get("CPPMEGA_SWEEP_MBS")
+    _gbs = os.environ.get("CPPMEGA_SWEEP_GBS")
+    _iters = os.environ.get("CPPMEGA_SWEEP_ITERS")
+    if _seq:
+        profile.training.seq_length = int(_seq)
+        # seq <= max_position_embeddings (4096); shorter is fine, no max-pos change.
+    if _mbs:
+        profile.training.micro_batch_size = int(_mbs)
+    if _gbs:
+        profile.training.global_batch_size = int(_gbs)
+    if _iters:
+        profile.training.train_iters = int(_iters)
     return profile
 
 
