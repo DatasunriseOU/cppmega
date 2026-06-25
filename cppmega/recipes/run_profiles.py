@@ -11,6 +11,7 @@ across shell snippets.
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 from dataclasses import dataclass, field
 from typing import Literal
