@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 try:
     from megatron.core.models.mamba.mamba_model import MambaModel
 except ModuleNotFoundError:  # local macOS/dev environments without Megatron checkout
@@ -58,6 +60,22 @@ class CppMegaMambaModel(MambaModel):
             if hasattr(self, "embedding") and self.embedding is not None:
                 self._fastmtp.tie_word_embeddings(self.embedding)
 
+        # Diagnostic: confirm the cppmega feature params are REGISTERED in the
+        # model param tree (and thus visible to Megatron's optimizer/count). If
+        # they are absent here, the features are dead weight regardless of being
+        # built on self.embedding.
+        _names = [n for n, _ in self.named_parameters()]
+        _ng = sum(p.numel() for n, p in self.named_parameters() if "ngram" in n)
+        _st = sum(p.numel() for n, p in self.named_parameters() if "structure" in n)
+        _tot = sum(p.numel() for _, p in self.named_parameters())
+        print(
+            f"[cppmega-model] named_parameters total={_tot} "
+            f"ngram_params={_ng} structure_params={_st} "
+            f"has_ngram={'ngram' in ' '.join(_names)} "
+            f"has_structure={any('structure' in n for n in _names)}",
+            flush=True,
+        )
+
     def set_cppmega_structure_inputs(self, structure_inputs):
         self._cppmega_structure_inputs = structure_inputs
 
@@ -82,6 +100,28 @@ class CppMegaMambaModel(MambaModel):
         padding_mask=None,
         is_spec_decode=None,
     ):
+        # Bridge the structure side-channel into this forward. The stock
+        # MambaModel.forward monkeypatch (structure_dataset_patch Hop 3) is
+        # BYPASSED because this subclass overrides forward, so we pull the
+        # thread-local batch (stashed by the get_batch patch) ourselves and hand
+        # it to set_cppmega_structure_inputs before the embedding consumes it.
+        # Gated on CPPMEGA_STRUCTURE_ENABLED so the quarter lane (flag unset)
+        # never imports the data patch and is byte-for-byte unchanged. RULE #1:
+        # no try/except -- if structure is enabled and the wiring is missing the
+        # import RAISES rather than silently training on zero structure.
+        if (
+            os.environ.get("CPPMEGA_STRUCTURE_ENABLED", "0") == "1"
+            and self._cppmega_structure_inputs is None
+        ):
+            from cppmega.megatron.structure_batch import maybe_set_structure_inputs
+            from cppmega.megatron.structure_dataset_patch import (
+                _get_current_structure_batch,
+            )
+
+            structure_batch = _get_current_structure_batch()
+            if structure_batch is not None:
+                maybe_set_structure_inputs(self, structure_batch)
+
         if decoder_input is None and self.pre_process:
             decoder_input = self.embedding(
                 input_ids=input_ids,

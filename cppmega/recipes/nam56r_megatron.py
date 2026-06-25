@@ -15,9 +15,10 @@ from cppmega.features.mod.config import MoDConfig, MoDAConfig
 from cppmega.features.structure.config import StructureConfig
 
 
-_SUPPORTED_NEMOTRON_SYMBOLS = frozenset({"A", "M", "D", "E", "G", "R", "|"})
+_SUPPORTED_NEMOTRON_SYMBOLS = frozenset({"A", "F", "M", "D", "E", "G", "R", "|"})
 _NEMOTRON_TO_MEGATRON = {
     "A": "*",
+    "F": "-",  # dense SwiGLU MLP layer (Megatron MambaStack MLP slot); NOT MoE.
     "M": "M",
     "D": "G",
     "E": "E",
@@ -63,7 +64,7 @@ def parse_nem_pattern(pattern: str, depth: int) -> list[str]:
     invalid = sorted({ch for ch in upper if ch not in _SUPPORTED_NEMOTRON_SYMBOLS})
     if invalid:
         raise ValueError(
-            f"invalid pattern chars {invalid!r}; supported symbols are A, M, D, E, G, R and |"
+            f"invalid pattern chars {invalid!r}; supported symbols are A, F, M, D, E, G, R and |"
         )
 
     if "|" in upper:

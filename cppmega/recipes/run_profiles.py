@@ -11,6 +11,7 @@ across shell snippets.
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 from dataclasses import dataclass, field
 from typing import Literal
@@ -84,6 +85,15 @@ class ModelProfile:
     # without hidden shell edits while H200 profiles may opt back in.
     moe_router_fusion: bool = True
     dsa_indexer_loss_coeff: float = 0.001
+    # GQA settings for the pure-dense GB10 lane.  ``num_query_groups`` and
+    # ``kv_channels`` are only consumed when ``dense=True``; the hybrid NAM56R
+    # lanes leave them at 0 and the launcher does not emit GQA flags for them.
+    num_query_groups: int = 0
+    kv_channels: int = 0
+    # When True this is a plain dense GQA transformer: no MLA, no MoE, no DSA,
+    # tied embeddings.  ``native_args_fragment`` gates the MLA/MoE/DSA literals
+    # on this flag and the launcher emits GQA flags + a tied head.
+    dense: bool = False
 
 
 @dataclass
@@ -388,19 +398,22 @@ class RunProfile:
             depth=self.model.depth,
             mtp_depths=self.model.mtp_depths,
         )
+        # Pure-dense GQA lanes disable the MLA/MoE/DSA native literals entirely.
+        # Hybrid NAM56R lanes (dense=False) keep them on exactly as before.
+        enable_feature_args = not self.model.dense
         bundle = build_nam56r_megatron_native_args(
             plan=plan,
-            enable_mla=True,
+            enable_mla=enable_feature_args,
             enable_mtp=self.model.mtp_depths > 0,
             mtp_mode="hybrid",
             mtp_num_predictors=self.model.mtp_depths,
-            enable_moe=True,
+            enable_moe=enable_feature_args,
             moe_expert_model_parallel_size=self.model.moe_expert_model_parallel_size,
             moe_token_dispatcher_type=self.model.moe_token_dispatcher_type,
             moe_flex_dispatcher_backend=self.model.moe_flex_dispatcher_backend,
             moe_router_dtype=self.model.moe_router_dtype,
             moe_router_fusion=self.model.moe_router_fusion,
-            enable_dsa=True,
+            enable_dsa=enable_feature_args,
             dsa_indexer_loss_coeff=self.model.dsa_indexer_loss_coeff,
         )
         return bundle.to_shell_fragment()
@@ -518,9 +531,88 @@ def set_h200_dsa_9_4_m_profile(profile: RunProfile | None = None) -> RunProfile:
     return profile
 
 
+def set_gb10_dense500m_cpp_profile(profile: RunProfile | None = None) -> RunProfile:
+    """Fill the GB10 pure-dense ~500M GQA C++ profile.
+
+    This is a plain dense GQA transformer used as a clean baseline lane on the
+    single-GB10 box: 24 attention-only layers, GQA with 4 query groups and 64
+    kv channels, tied embeddings, SwiGLU/RMSNorm, no MLA/MoE/DSA/MTP, BF16 (FP8
+    off), flash attention, Adam optimizer, and the new token-aligned structure
+    side channels.  Selecting it exports CPPMEGA_DENSE_GQA=1 so the launcher
+    emits the GQA flags, a tied head, dense recompute, and skips the MLA-only
+    down-proj fusion.  It must not perturb the hybrid quarter lane.
+    """
+
+    if profile is None:
+        profile = RunProfile(
+            name="gb10_dense500m_cpp",
+            description="Single-GB10 pure-dense ~500M GQA C++ baseline lane",
+        )
+    # 1:1 with the MLX DenseCppLM: 24 standard transformer blocks, each =
+    # attention sublayer + dense SwiGLU MLP sublayer. In the Megatron MambaStack
+    # chassis every pattern position is ONE layer, so a block is "AF" (A->'*'
+    # attention, F->'-' dense MLP). 24 blocks => 48 layer positions, NO Mamba
+    # (zero 'M'), NO MoE (zero 'E'), NO MLA/DSA/MTP. The MambaModel class is only
+    # the host for cppmega's custom embedding (ngram+structure) wiring.
+    profile.model = ModelProfile(
+        pattern="AF",
+        depth=48,
+        mtp_depths=0,
+        hidden_size=1280,
+        ffn_hidden_size=3456,
+        num_attention_heads=20,
+        num_query_groups=4,
+        kv_channels=64,
+        dense=True,
+    )
+    profile.training = TrainingProfile(
+        vocab_size=65_536,
+        seq_length=4096,
+        micro_batch_size=4,
+        global_batch_size=4,
+        train_iters=30,
+        data_path="1.0 /home/dave/cppmega-root/data/megatron/reindexed_4k_train",
+    )
+    profile.precision = PrecisionProfile(
+        fp8_recipe="off",
+        attention_backend="flash",
+    )
+    # Muon is the optimizer the GB10 bf16-no-master-emerging plumbing is built
+    # around (adam conflicts with --use-bf16-no-master-emerging-optimizer). For a
+    # per-step throughput measurement the optimizer step is &lt;5% of the 4096 fwd/bwd
+    # so this does not perturb the comparison vs the MLX bf16 number.
+    profile.optimizer = OptimizerProfile()
+    profile.runtime = RuntimePatchProfile(
+        mamba3_mimo=False,
+        ngram_hash_enabled=True,
+        structure_enabled=True,
+        structure_components="core",
+        mtp_ce_kernel="native",
+    )
+    profile.profiling = ProfilingProfile()
+    # Throughput-sweep overrides (baked into the emitted profile so they survive
+    # the launcher's eval, which the run-env cannot override). Used by the gb10
+    # batch/seq sweep to measure s/step + peak memory at different shapes.
+    _seq = os.environ.get("CPPMEGA_SWEEP_SEQ")
+    _mbs = os.environ.get("CPPMEGA_SWEEP_MBS")
+    _gbs = os.environ.get("CPPMEGA_SWEEP_GBS")
+    _iters = os.environ.get("CPPMEGA_SWEEP_ITERS")
+    if _seq:
+        profile.training.seq_length = int(_seq)
+        # seq <= max_position_embeddings (4096); shorter is fine, no max-pos change.
+    if _mbs:
+        profile.training.micro_batch_size = int(_mbs)
+    if _gbs:
+        profile.training.global_batch_size = int(_gbs)
+    if _iters:
+        profile.training.train_iters = int(_iters)
+    return profile
+
+
 PROFILE_SETTERS = {
     "local_gb10_quarter": set_local_gb10_quarter_profile,
     "h200_dsa_9_4_m": set_h200_dsa_9_4_m_profile,
+    "gb10_dense500m_cpp": set_gb10_dense500m_cpp_profile,
 }
 
 
@@ -789,6 +881,15 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
                 "NVTE_BACKWARD_OVERRIDE": "none",
             }
         )
+    # Pure-dense GQA lanes export the group-query-attention knobs plus the
+    # CPPMEGA_DENSE_GQA gate the launcher uses to switch on GQA flags, the tied
+    # head, dense recompute, and to skip the MLA-only down-proj fusion.  These
+    # keys are emitted ONLY when the profile is dense so the hybrid NAM56R
+    # quarter lane's environment stays byte-for-byte unchanged.
+    if profile.model.dense:
+        env["CPPMEGA_NUM_QUERY_GROUPS"] = str(profile.model.num_query_groups)
+        env["CPPMEGA_KV_CHANNELS"] = str(profile.model.kv_channels)
+        env["CPPMEGA_DENSE_GQA"] = "1"
     return env
 
 

@@ -72,6 +72,26 @@ class CppMegaLanguageModelEmbedding(LanguageModelEmbedding):
                 bottleneck_dim=int(os.environ.get("CPPMEGA_STRUCTURE_BOTTLENECK_DIM", "64")),
             )
 
+        # Diagnostic (RULE #1 visibility): report whether the cppmega feature
+        # embeddings were actually constructed and how many params they add, so a
+        # silently-absent feature cannot masquerade as "wired".
+        _ng = (
+            sum(p.numel() for p in self.cppmega_ngram_hash.parameters())
+            if self.cppmega_ngram_hash is not None else 0
+        )
+        _st = (
+            sum(p.numel() for p in self.cppmega_structure.parameters())
+            if self.cppmega_structure is not None else 0
+        )
+        print(
+            f"[cppmega-embed] CppMegaLanguageModelEmbedding built: "
+            f"ngram={'ON' if self.cppmega_ngram_hash is not None else 'OFF'}({_ng} params) "
+            f"structure={'ON' if self.cppmega_structure is not None else 'OFF'}({_st} params) "
+            f"env NGRAM={os.environ.get('CPPMEGA_NGRAM_HASH_ENABLED')} "
+            f"STRUCT={os.environ.get('CPPMEGA_STRUCTURE_ENABLED')}",
+            flush=True,
+        )
+
     @staticmethod
     def _normalize_structure_inputs(
         input_ids: Tensor,
