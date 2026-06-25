@@ -1,0 +1,17 @@
+{
+  "project": "natural-bison-491019-t9",
+  "dry_run_month": "202512",
+  "repos_in_filter": 453,
+  "subtree_entries_total": 550,
+  "one_month_bytes": 108720153324,
+  "one_month_gib": 101.2535,
+  "one_month_cost_usd": 0.618003,
+  "history_first_month": "201501",
+  "history_last_month": "202606",
+  "history_months": 138,
+  "full_history_bytes_est": 15003381158712,
+  "full_history_tib_est": 13.6455,
+  "price_per_tib_usd": 6.25,
+  "full_history_cost_usd_est": 85.2843,
+  "query_table_glob_for_full_run": "githubarchive.month.20*"
+}

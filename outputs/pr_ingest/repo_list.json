@@ -1,0 +1,2983 @@
+{
+  "tarball": "/Users/dave/sources/parquet/data-cpp_all/data-cpp_all.tar.zst",
+  "generated_utc": "2026-06-25T14:53:52.015396+00:00",
+  "counts": {
+    "repos": 550,
+    "unresolved": 44,
+    "subtrees_seen": 594
+  },
+  "repos": [
+    {
+      "name": "4.4bsd-lite2",
+      "owner_repo": "sergev/4.4BSD-Lite2",
+      "url": "https://github.com/sergev/4.4BSD-Lite2.git"
+    },
+    {
+      "name": "abseil-cpp",
+      "owner_repo": "abseil/abseil-cpp",
+      "url": "https://github.com/abseil/abseil-cpp.git"
+    },
+    {
+      "name": "amrex",
+      "owner_repo": "AMReX-Codes/amrex",
+      "url": "https://github.com/AMReX-Codes/amrex"
+    },
+    {
+      "name": "apache-tvm",
+      "owner_repo": "apache/tvm",
+      "url": "https://github.com/apache/tvm.git"
+    },
+    {
+      "name": "apache-tvm.bare",
+      "owner_repo": "apache/tvm",
+      "url": "https://github.com/apache/tvm"
+    },
+    {
+      "name": "apex",
+      "owner_repo": "NVIDIA/apex",
+      "url": "https://github.com/NVIDIA/apex.git"
+    },
+    {
+      "name": "apex.bare",
+      "owner_repo": "NVIDIA/apex",
+      "url": "https://github.com/NVIDIA/apex"
+    },
+    {
+      "name": "apollo",
+      "owner_repo": "ApolloAuto/apollo",
+      "url": "https://github.com/ApolloAuto/apollo"
+    },
+    {
+      "name": "apple-cf",
+      "owner_repo": "apple-oss-distributions/CF",
+      "url": "https://github.com/apple-oss-distributions/CF.git"
+    },
+    {
+      "name": "apple-commoncrypto",
+      "owner_repo": "apple-oss-distributions/CommonCrypto",
+      "url": "https://github.com/apple-oss-distributions/CommonCrypto.git"
+    },
+    {
+      "name": "apple-dyld",
+      "owner_repo": "apple-oss-distributions/dyld",
+      "url": "https://github.com/apple-oss-distributions/dyld.git"
+    },
+    {
+      "name": "apple-libc",
+      "owner_repo": "apple-oss-distributions/Libc",
+      "url": "https://github.com/apple-oss-distributions/Libc.git"
+    },
+    {
+      "name": "apple-libdispatch",
+      "owner_repo": "apple-oss-distributions/libdispatch",
+      "url": "https://github.com/apple-oss-distributions/libdispatch.git"
+    },
+    {
+      "name": "apple-mlx",
+      "owner_repo": "ml-explore/mlx",
+      "url": "https://github.com/ml-explore/mlx.git"
+    },
+    {
+      "name": "apple-mlx.bare",
+      "owner_repo": "ml-explore/mlx",
+      "url": "https://github.com/ml-explore/mlx"
+    },
+    {
+      "name": "apple-objc4",
+      "owner_repo": "apple-oss-distributions/objc4",
+      "url": "https://github.com/apple-oss-distributions/objc4.git"
+    },
+    {
+      "name": "apple-security",
+      "owner_repo": "apple-oss-distributions/Security",
+      "url": "https://github.com/apple-oss-distributions/Security.git"
+    },
+    {
+      "name": "arangodb",
+      "owner_repo": "ArangoDB/arangodb",
+      "url": "https://github.com/ArangoDB/arangodb.git"
+    },
+    {
+      "name": "ardupilot",
+      "owner_repo": "ArduPilot/ardupilot",
+      "url": "https://github.com/ArduPilot/ardupilot.git"
+    },
+    {
+      "name": "argon2",
+      "owner_repo": "P-H-C/phc-winner-argon2",
+      "url": "https://github.com/P-H-C/phc-winner-argon2.git"
+    },
+    {
+      "name": "aria2",
+      "owner_repo": "aria2/aria2",
+      "url": "https://github.com/aria2/aria2.git"
+    },
+    {
+      "name": "arm-compute-library",
+      "owner_repo": "ARM-software/ComputeLibrary",
+      "url": "https://github.com/ARM-software/ComputeLibrary.git"
+    },
+    {
+      "name": "arm-compute-library.bare",
+      "owner_repo": "ARM-software/ComputeLibrary",
+      "url": "https://github.com/ARM-software/ComputeLibrary"
+    },
+    {
+      "name": "arm-nn",
+      "owner_repo": "ARM-software/armnn",
+      "url": "https://github.com/ARM-software/armnn.git"
+    },
+    {
+      "name": "arm-nn.bare",
+      "owner_repo": "ARM-software/armnn",
+      "url": "https://github.com/ARM-software/armnn"
+    },
+    {
+      "name": "arm-trusted-firmware",
+      "owner_repo": "ARM-software/arm-trusted-firmware",
+      "url": "https://github.com/ARM-software/arm-trusted-firmware.git"
+    },
+    {
+      "name": "arrow",
+      "owner_repo": "apache/arrow",
+      "url": "https://github.com/apache/arrow.git"
+    },
+    {
+      "name": "aseprite",
+      "owner_repo": "aseprite/aseprite",
+      "url": "https://github.com/aseprite/aseprite"
+    },
+    {
+      "name": "asio",
+      "owner_repo": "chriskohlhoff/asio",
+      "url": "https://github.com/chriskohlhoff/asio.git"
+    },
+    {
+      "name": "assimp",
+      "owner_repo": "assimp/assimp",
+      "url": "https://github.com/assimp/assimp"
+    },
+    {
+      "name": "atlmfc",
+      "owner_repo": "adzm/atlmfc",
+      "url": "https://github.com/adzm/atlmfc.git"
+    },
+    {
+      "name": "audacity",
+      "owner_repo": "audacity/audacity",
+      "url": "https://github.com/audacity/audacity.git"
+    },
+    {
+      "name": "bazel",
+      "owner_repo": "bazelbuild/bazel",
+      "url": "https://github.com/bazelbuild/bazel.git"
+    },
+    {
+      "name": "benchmark",
+      "owner_repo": "google/benchmark",
+      "url": "https://github.com/google/benchmark.git"
+    },
+    {
+      "name": "betaflight",
+      "owner_repo": "betaflight/betaflight",
+      "url": "https://github.com/betaflight/betaflight.git"
+    },
+    {
+      "name": "bgfx",
+      "owner_repo": "bkaradzic/bgfx",
+      "url": "https://github.com/bkaradzic/bgfx"
+    },
+    {
+      "name": "bionic",
+      "owner_repo": "nickg/nvc",
+      "url": "https://github.com/nickg/nvc.git"
+    },
+    {
+      "name": "bitcoin",
+      "owner_repo": "bitcoin/bitcoin",
+      "url": "https://github.com/bitcoin/bitcoin.git"
+    },
+    {
+      "name": "boost",
+      "owner_repo": "boostorg/boost",
+      "url": "https://github.com/boostorg/boost.git"
+    },
+    {
+      "name": "boringssl",
+      "owner_repo": "google/boringssl",
+      "url": "https://github.com/google/boringssl"
+    },
+    {
+      "name": "botan",
+      "owner_repo": "randombit/botan",
+      "url": "https://github.com/randombit/botan.git"
+    },
+    {
+      "name": "box2d",
+      "owner_repo": "erincatto/box2d",
+      "url": "https://github.com/erincatto/box2d"
+    },
+    {
+      "name": "bullet3",
+      "owner_repo": "bulletphysics/bullet3",
+      "url": "https://github.com/bulletphysics/bullet3"
+    },
+    {
+      "name": "c-ares",
+      "owner_repo": "c-ares/c-ares",
+      "url": "https://github.com/c-ares/c-ares.git"
+    },
+    {
+      "name": "cachelib",
+      "owner_repo": "facebook/CacheLib",
+      "url": "https://github.com/facebook/CacheLib.git"
+    },
+    {
+      "name": "caffe",
+      "owner_repo": "BVLC/caffe",
+      "url": "https://github.com/BVLC/caffe"
+    },
+    {
+      "name": "calculator",
+      "owner_repo": "microsoft/calculator",
+      "url": "https://github.com/microsoft/calculator.git"
+    },
+    {
+      "name": "capnproto",
+      "owner_repo": "capnproto/capnproto",
+      "url": "https://github.com/capnproto/capnproto.git"
+    },
+    {
+      "name": "carbon-lang",
+      "owner_repo": "carbon-language/carbon-lang",
+      "url": "https://github.com/carbon-language/carbon-lang.git"
+    },
+    {
+      "name": "carla",
+      "owner_repo": "carla-simulator/carla",
+      "url": "https://github.com/carla-simulator/carla"
+    },
+    {
+      "name": "Catch2",
+      "owner_repo": "catchorg/Catch2",
+      "url": "https://github.com/catchorg/Catch2.git"
+    },
+    {
+      "name": "cccl",
+      "owner_repo": "NVIDIA/cccl",
+      "url": "https://github.com/NVIDIA/cccl.git"
+    },
+    {
+      "name": "cccl.bare",
+      "owner_repo": "NVIDIA/cccl",
+      "url": "https://github.com/NVIDIA/cccl"
+    },
+    {
+      "name": "ceph",
+      "owner_repo": "ceph/ceph",
+      "url": "https://github.com/ceph/ceph.git"
+    },
+    {
+      "name": "cereal",
+      "owner_repo": "USCiLab/cereal",
+      "url": "https://github.com/USCiLab/cereal"
+    },
+    {
+      "name": "ceres-solver",
+      "owner_repo": "ceres-solver/ceres-solver",
+      "url": "https://github.com/ceres-solver/ceres-solver"
+    },
+    {
+      "name": "cgal",
+      "owner_repo": "CGAL/cgal",
+      "url": "https://github.com/CGAL/cgal"
+    },
+    {
+      "name": "chibios",
+      "owner_repo": "ChibiOS/ChibiOS",
+      "url": "https://github.com/ChibiOS/ChibiOS"
+    },
+    {
+      "name": "chrono",
+      "owner_repo": "projectchrono/chrono",
+      "url": "https://github.com/projectchrono/chrono.git"
+    },
+    {
+      "name": "cjson",
+      "owner_repo": "DaveGamble/cJSON",
+      "url": "https://github.com/DaveGamble/cJSON.git"
+    },
+    {
+      "name": "clamav",
+      "owner_repo": "Cisco-Talos/clamav",
+      "url": "https://github.com/Cisco-Talos/clamav.git"
+    },
+    {
+      "name": "clickhouse",
+      "owner_repo": "ClickHouse/ClickHouse",
+      "url": "https://github.com/ClickHouse/ClickHouse.git"
+    },
+    {
+      "name": "clr",
+      "owner_repo": "ROCm/clr",
+      "url": "https://github.com/ROCm/clr.git"
+    },
+    {
+      "name": "clr.bare",
+      "owner_repo": "ROCm/clr",
+      "url": "https://github.com/ROCm/clr"
+    },
+    {
+      "name": "cmake",
+      "owner_repo": "Kitware/CMake",
+      "url": "https://github.com/Kitware/CMake.git"
+    },
+    {
+      "name": "CMake",
+      "owner_repo": "Kitware/CMake",
+      "url": "https://github.com/Kitware/CMake.git"
+    },
+    {
+      "name": "cmsis-dsp",
+      "owner_repo": "ARM-software/CMSIS-DSP",
+      "url": "https://github.com/ARM-software/CMSIS-DSP.git"
+    },
+    {
+      "name": "cmsis-dsp.bare",
+      "owner_repo": "ARM-software/CMSIS-DSP",
+      "url": "https://github.com/ARM-software/CMSIS-DSP"
+    },
+    {
+      "name": "cmsis-nn",
+      "owner_repo": "ARM-software/CMSIS-NN",
+      "url": "https://github.com/ARM-software/CMSIS-NN.git"
+    },
+    {
+      "name": "cmsis-nn.bare",
+      "owner_repo": "ARM-software/CMSIS-NN",
+      "url": "https://github.com/ARM-software/CMSIS-NN"
+    },
+    {
+      "name": "cmsis5",
+      "owner_repo": "ARM-software/CMSIS_5",
+      "url": "https://github.com/ARM-software/CMSIS_5.git"
+    },
+    {
+      "name": "cmsis5.bare",
+      "owner_repo": "ARM-software/CMSIS_5",
+      "url": "https://github.com/ARM-software/CMSIS_5"
+    },
+    {
+      "name": "cntk",
+      "owner_repo": "microsoft/CNTK",
+      "url": "https://github.com/microsoft/CNTK"
+    },
+    {
+      "name": "composable-kernel",
+      "owner_repo": "ROCm/composable_kernel",
+      "url": "https://github.com/ROCm/composable_kernel.git"
+    },
+    {
+      "name": "composable-kernel.bare",
+      "owner_repo": "ROCm/composable_kernel",
+      "url": "https://github.com/ROCm/composable_kernel"
+    },
+    {
+      "name": "contiki-ng",
+      "owner_repo": "contiki-ng/contiki-ng",
+      "url": "https://github.com/contiki-ng/contiki-ng.git"
+    },
+    {
+      "name": "coreboot",
+      "owner_repo": "coreboot/coreboot",
+      "url": "https://github.com/coreboot/coreboot.git"
+    },
+    {
+      "name": "cpp-httplib",
+      "owner_repo": "yhirose/cpp-httplib",
+      "url": "https://github.com/yhirose/cpp-httplib.git"
+    },
+    {
+      "name": "cppcheck",
+      "owner_repo": "danmar/cppcheck",
+      "url": "https://github.com/danmar/cppcheck.git"
+    },
+    {
+      "name": "cpprestsdk",
+      "owner_repo": "microsoft/cpprestsdk",
+      "url": "https://github.com/microsoft/cpprestsdk.git"
+    },
+    {
+      "name": "cppwinrt",
+      "owner_repo": "microsoft/cppwinrt",
+      "url": "https://github.com/microsoft/cppwinrt.git"
+    },
+    {
+      "name": "cpuinfo",
+      "owner_repo": "pytorch/cpuinfo",
+      "url": "https://github.com/pytorch/cpuinfo.git"
+    },
+    {
+      "name": "cpuinfo.bare",
+      "owner_repo": "pytorch/cpuinfo",
+      "url": "https://github.com/pytorch/cpuinfo"
+    },
+    {
+      "name": "cpython",
+      "owner_repo": "python/cpython",
+      "url": "https://github.com/python/cpython.git"
+    },
+    {
+      "name": "crow",
+      "owner_repo": "CrowCpp/Crow",
+      "url": "https://github.com/CrowCpp/Crow.git"
+    },
+    {
+      "name": "cryptopp",
+      "owner_repo": "weidai11/cryptopp",
+      "url": "https://github.com/weidai11/cryptopp"
+    },
+    {
+      "name": "cub",
+      "owner_repo": "NVIDIA/cub",
+      "url": "https://github.com/NVIDIA/cub.git"
+    },
+    {
+      "name": "cub.bare",
+      "owner_repo": "NVIDIA/cub",
+      "url": "https://github.com/NVIDIA/cub"
+    },
+    {
+      "name": "cuda-library-samples",
+      "owner_repo": "NVIDIA/CUDALibrarySamples",
+      "url": "https://github.com/NVIDIA/CUDALibrarySamples.git"
+    },
+    {
+      "name": "cuda-library-samples.bare",
+      "owner_repo": "NVIDIA/CUDALibrarySamples",
+      "url": "https://github.com/NVIDIA/CUDALibrarySamples"
+    },
+    {
+      "name": "cuda-quantum",
+      "owner_repo": "NVIDIA/cuda-quantum",
+      "url": "https://github.com/NVIDIA/cuda-quantum.git"
+    },
+    {
+      "name": "cuda-quantum.bare",
+      "owner_repo": "NVIDIA/cuda-quantum",
+      "url": "https://github.com/NVIDIA/cuda-quantum"
+    },
+    {
+      "name": "cuda-samples",
+      "owner_repo": "NVIDIA/cuda-samples",
+      "url": "https://github.com/NVIDIA/cuda-samples.git"
+    },
+    {
+      "name": "cudnn-frontend",
+      "owner_repo": "NVIDIA/cudnn-frontend",
+      "url": "https://github.com/NVIDIA/cudnn-frontend.git"
+    },
+    {
+      "name": "cudnn-frontend.bare",
+      "owner_repo": "NVIDIA/cudnn-frontend",
+      "url": "https://github.com/NVIDIA/cudnn-frontend"
+    },
+    {
+      "name": "curl",
+      "owner_repo": "curl/curl",
+      "url": "https://github.com/curl/curl.git"
+    },
+    {
+      "name": "cutlass",
+      "owner_repo": "NVIDIA/cutlass",
+      "url": "https://github.com/NVIDIA/cutlass.git"
+    },
+    {
+      "name": "cutlass.bare",
+      "owner_repo": "NVIDIA/cutlass",
+      "url": "https://github.com/NVIDIA/cutlass"
+    },
+    {
+      "name": "dali",
+      "owner_repo": "NVIDIA/DALI",
+      "url": "https://github.com/NVIDIA/DALI.git"
+    },
+    {
+      "name": "dart-sdk",
+      "owner_repo": "dart-lang/sdk",
+      "url": "https://github.com/dart-lang/sdk.git"
+    },
+    {
+      "name": "dawn",
+      "owner_repo": "google/dawn",
+      "url": "https://github.com/google/dawn.git"
+    },
+    {
+      "name": "dealii",
+      "owner_repo": "dealii/dealii",
+      "url": "https://github.com/dealii/dealii.git"
+    },
+    {
+      "name": "deep-learning-examples",
+      "owner_repo": "NVIDIA/DeepLearningExamples",
+      "url": "https://github.com/NVIDIA/DeepLearningExamples.git"
+    },
+    {
+      "name": "deep-learning-examples.bare",
+      "owner_repo": "NVIDIA/DeepLearningExamples",
+      "url": "https://github.com/NVIDIA/DeepLearningExamples"
+    },
+    {
+      "name": "Detours",
+      "owner_repo": "microsoft/Detours",
+      "url": "https://github.com/microsoft/Detours.git"
+    },
+    {
+      "name": "diligent-engine",
+      "owner_repo": "DiligentGraphics/DiligentEngine",
+      "url": "https://github.com/DiligentGraphics/DiligentEngine.git"
+    },
+    {
+      "name": "directx-graphics-samples",
+      "owner_repo": "microsoft/DirectX-Graphics-Samples",
+      "url": "https://github.com/microsoft/DirectX-Graphics-Samples.git"
+    },
+    {
+      "name": "DirectX-Graphics-Samples",
+      "owner_repo": "microsoft/DirectX-Graphics-Samples",
+      "url": "https://github.com/microsoft/DirectX-Graphics-Samples.git"
+    },
+    {
+      "name": "DirectX-Headers",
+      "owner_repo": "microsoft/DirectX-Headers",
+      "url": "https://github.com/microsoft/DirectX-Headers.git"
+    },
+    {
+      "name": "directx-sdk-samples",
+      "owner_repo": "microsoft/DirectX-SDK-Samples",
+      "url": "https://github.com/microsoft/DirectX-SDK-Samples.git"
+    },
+    {
+      "name": "DirectXMath",
+      "owner_repo": "microsoft/DirectXMath",
+      "url": "https://github.com/microsoft/DirectXMath.git"
+    },
+    {
+      "name": "DirectXShaderCompiler",
+      "owner_repo": "microsoft/DirectXShaderCompiler",
+      "url": "https://github.com/microsoft/DirectXShaderCompiler.git"
+    },
+    {
+      "name": "DirectXTex",
+      "owner_repo": "microsoft/DirectXTex",
+      "url": "https://github.com/microsoft/DirectXTex.git"
+    },
+    {
+      "name": "DirectXTK",
+      "owner_repo": "microsoft/DirectXTK",
+      "url": "https://github.com/microsoft/DirectXTK.git"
+    },
+    {
+      "name": "directxtk",
+      "owner_repo": "microsoft/DirectXTK",
+      "url": "https://github.com/microsoft/DirectXTK.git"
+    },
+    {
+      "name": "DirectXTK12",
+      "owner_repo": "microsoft/DirectXTK12",
+      "url": "https://github.com/microsoft/DirectXTK12.git"
+    },
+    {
+      "name": "diskspd",
+      "owner_repo": "microsoft/diskspd",
+      "url": "https://github.com/microsoft/diskspd.git"
+    },
+    {
+      "name": "dlib",
+      "owner_repo": "davisking/dlib",
+      "url": "https://github.com/davisking/dlib.git"
+    },
+    {
+      "name": "doctest",
+      "owner_repo": "doctest/doctest",
+      "url": "https://github.com/doctest/doctest"
+    },
+    {
+      "name": "dolphin-emu",
+      "owner_repo": "dolphin-emu/dolphin",
+      "url": "https://github.com/dolphin-emu/dolphin"
+    },
+    {
+      "name": "dotnet-runtime",
+      "owner_repo": "dotnet/runtime",
+      "url": "https://github.com/dotnet/runtime.git"
+    },
+    {
+      "name": "dpdk",
+      "owner_repo": "DPDK/dpdk",
+      "url": "https://github.com/DPDK/dpdk.git"
+    },
+    {
+      "name": "dragonfly",
+      "owner_repo": "dragonflydb/dragonfly",
+      "url": "https://github.com/dragonflydb/dragonfly"
+    },
+    {
+      "name": "dragonflybsd",
+      "owner_repo": "DragonFlyBSD/DragonFlyBSD",
+      "url": "https://github.com/DragonFlyBSD/DragonFlyBSD.git"
+    },
+    {
+      "name": "dragonflydb",
+      "owner_repo": "dragonflydb/dragonfly",
+      "url": "https://github.com/dragonflydb/dragonfly.git"
+    },
+    {
+      "name": "duckdb",
+      "owner_repo": "duckdb/duckdb",
+      "url": "https://github.com/duckdb/duckdb.git"
+    },
+    {
+      "name": "duckstation",
+      "owner_repo": "stenzek/duckstation",
+      "url": "https://github.com/stenzek/duckstation.git"
+    },
+    {
+      "name": "ebpf-for-windows",
+      "owner_repo": "microsoft/ebpf-for-windows",
+      "url": "https://github.com/microsoft/ebpf-for-windows.git"
+    },
+    {
+      "name": "edk2",
+      "owner_repo": "tianocore/edk2",
+      "url": "https://github.com/tianocore/edk2.git"
+    },
+    {
+      "name": "entt",
+      "owner_repo": "skypjack/entt",
+      "url": "https://github.com/skypjack/entt.git"
+    },
+    {
+      "name": "envoy",
+      "owner_repo": "envoyproxy/envoy",
+      "url": "https://github.com/envoyproxy/envoy.git"
+    },
+    {
+      "name": "erlang-otp",
+      "owner_repo": "erlang/otp",
+      "url": "https://github.com/erlang/otp.git"
+    },
+    {
+      "name": "esp-idf",
+      "owner_repo": "espressif/esp-idf",
+      "url": "https://github.com/espressif/esp-idf"
+    },
+    {
+      "name": "executorch",
+      "owner_repo": "pytorch/executorch",
+      "url": "https://github.com/pytorch/executorch.git"
+    },
+    {
+      "name": "executorch.bare",
+      "owner_repo": "pytorch/executorch",
+      "url": "https://github.com/pytorch/executorch"
+    },
+    {
+      "name": "faiss",
+      "owner_repo": "facebookresearch/faiss",
+      "url": "https://github.com/facebookresearch/faiss"
+    },
+    {
+      "name": "faster-transformer",
+      "owner_repo": "NVIDIA/FasterTransformer",
+      "url": "https://github.com/NVIDIA/FasterTransformer.git"
+    },
+    {
+      "name": "faster-transformer.bare",
+      "owner_repo": "NVIDIA/FasterTransformer",
+      "url": "https://github.com/NVIDIA/FasterTransformer"
+    },
+    {
+      "name": "fbgemm",
+      "owner_repo": "pytorch/FBGEMM",
+      "url": "https://github.com/pytorch/FBGEMM.git"
+    },
+    {
+      "name": "fbgemm.bare",
+      "owner_repo": "pytorch/FBGEMM",
+      "url": "https://github.com/pytorch/FBGEMM"
+    },
+    {
+      "name": "ffmpeg",
+      "owner_repo": "FFmpeg/FFmpeg",
+      "url": "https://github.com/FFmpeg/FFmpeg.git"
+    },
+    {
+      "name": "fftw3",
+      "owner_repo": "FFTW/fftw3",
+      "url": "https://github.com/FFTW/fftw3.git"
+    },
+    {
+      "name": "filament",
+      "owner_repo": "google/filament",
+      "url": "https://github.com/google/filament.git"
+    },
+    {
+      "name": "fio",
+      "owner_repo": "axboe/fio",
+      "url": "https://github.com/axboe/fio.git"
+    },
+    {
+      "name": "flac",
+      "owner_repo": "xiph/flac",
+      "url": "https://github.com/xiph/flac"
+    },
+    {
+      "name": "flash-attention",
+      "owner_repo": "Dao-AILab/flash-attention",
+      "url": "https://github.com/Dao-AILab/flash-attention.git"
+    },
+    {
+      "name": "flash-attention.bare",
+      "owner_repo": "Dao-AILab/flash-attention",
+      "url": "https://github.com/Dao-AILab/flash-attention"
+    },
+    {
+      "name": "flashinfer",
+      "owner_repo": "flashinfer-ai/flashinfer",
+      "url": "https://github.com/flashinfer-ai/flashinfer.git"
+    },
+    {
+      "name": "flashinfer.bare",
+      "owner_repo": "flashinfer-ai/flashinfer",
+      "url": "https://github.com/flashinfer-ai/flashinfer"
+    },
+    {
+      "name": "flashlight",
+      "owner_repo": "flashlight/flashlight",
+      "url": "https://github.com/flashlight/flashlight"
+    },
+    {
+      "name": "flatbuffers",
+      "owner_repo": "google/flatbuffers",
+      "url": "https://github.com/google/flatbuffers.git"
+    },
+    {
+      "name": "fmt",
+      "owner_repo": "fmtlib/fmt",
+      "url": "https://github.com/fmtlib/fmt.git"
+    },
+    {
+      "name": "folly",
+      "owner_repo": "facebook/folly",
+      "url": "https://github.com/facebook/folly.git"
+    },
+    {
+      "name": "foundationdb",
+      "owner_repo": "apple/foundationdb",
+      "url": "https://github.com/apple/foundationdb.git"
+    },
+    {
+      "name": "freebsd-src",
+      "owner_repo": "freebsd/freebsd-src",
+      "url": "https://github.com/freebsd/freebsd-src.git"
+    },
+    {
+      "name": "freecad",
+      "owner_repo": "FreeCAD/FreeCAD",
+      "url": "https://github.com/FreeCAD/FreeCAD"
+    },
+    {
+      "name": "FreeRTOS",
+      "owner_repo": "FreeRTOS/FreeRTOS",
+      "url": "https://github.com/FreeRTOS/FreeRTOS.git"
+    },
+    {
+      "name": "freetype",
+      "owner_repo": "freetype/freetype",
+      "url": "https://github.com/freetype/freetype"
+    },
+    {
+      "name": "gcc-mirror",
+      "owner_repo": "gcc-mirror/gcc",
+      "url": "https://github.com/gcc-mirror/gcc.git"
+    },
+    {
+      "name": "geant4",
+      "owner_repo": "Geant4/geant4",
+      "url": "https://github.com/Geant4/geant4.git"
+    },
+    {
+      "name": "gemma-cpp",
+      "owner_repo": "google/gemma.cpp",
+      "url": "https://github.com/google/gemma.cpp.git"
+    },
+    {
+      "name": "gemma-cpp.bare",
+      "owner_repo": "google/gemma.cpp",
+      "url": "https://github.com/google/gemma.cpp"
+    },
+    {
+      "name": "ggml",
+      "owner_repo": "ggerganov/ggml",
+      "url": "https://github.com/ggerganov/ggml"
+    },
+    {
+      "name": "git-src",
+      "owner_repo": "git/git",
+      "url": "https://github.com/git/git"
+    },
+    {
+      "name": "glfw",
+      "owner_repo": "glfw/glfw",
+      "url": "https://github.com/glfw/glfw.git"
+    },
+    {
+      "name": "glib",
+      "owner_repo": "GNOME/glib",
+      "url": "https://github.com/GNOME/glib"
+    },
+    {
+      "name": "glm",
+      "owner_repo": "g-truc/glm",
+      "url": "https://github.com/g-truc/glm"
+    },
+    {
+      "name": "glow",
+      "owner_repo": "pytorch/glow",
+      "url": "https://github.com/pytorch/glow.git"
+    },
+    {
+      "name": "glow.bare",
+      "owner_repo": "pytorch/glow",
+      "url": "https://github.com/pytorch/glow"
+    },
+    {
+      "name": "glslang",
+      "owner_repo": "KhronosGroup/glslang",
+      "url": "https://github.com/KhronosGroup/glslang"
+    },
+    {
+      "name": "glslang-khronos",
+      "owner_repo": "KhronosGroup/glslang",
+      "url": "https://github.com/KhronosGroup/glslang.git"
+    },
+    {
+      "name": "glslang-khronos.bare",
+      "owner_repo": "KhronosGroup/glslang",
+      "url": "https://github.com/KhronosGroup/glslang"
+    },
+    {
+      "name": "gnupg",
+      "owner_repo": "gpg/gnupg",
+      "url": "https://github.com/gpg/gnupg"
+    },
+    {
+      "name": "godot",
+      "owner_repo": "godotengine/godot",
+      "url": "https://github.com/godotengine/godot.git"
+    },
+    {
+      "name": "googletest",
+      "owner_repo": "google/googletest",
+      "url": "https://github.com/google/googletest.git"
+    },
+    {
+      "name": "gperftools",
+      "owner_repo": "gperftools/gperftools",
+      "url": "https://github.com/gperftools/gperftools.git"
+    },
+    {
+      "name": "gpt4all",
+      "owner_repo": "nomic-ai/gpt4all",
+      "url": "https://github.com/nomic-ai/gpt4all"
+    },
+    {
+      "name": "gpu-operator.bare",
+      "owner_repo": "NVIDIA/gpu-operator",
+      "url": "https://github.com/NVIDIA/gpu-operator"
+    },
+    {
+      "name": "gromacs",
+      "owner_repo": "gromacs/gromacs",
+      "url": "https://github.com/gromacs/gromacs.git"
+    },
+    {
+      "name": "grpc",
+      "owner_repo": "grpc/grpc",
+      "url": "https://github.com/grpc/grpc.git"
+    },
+    {
+      "name": "gsl",
+      "owner_repo": "microsoft/GSL",
+      "url": "https://github.com/microsoft/GSL"
+    },
+    {
+      "name": "GSL",
+      "owner_repo": "microsoft/GSL",
+      "url": "https://github.com/microsoft/GSL.git"
+    },
+    {
+      "name": "gstreamer",
+      "owner_repo": "gstreamer/gstreamer",
+      "url": "https://github.com/gstreamer/gstreamer"
+    },
+    {
+      "name": "gtk",
+      "owner_repo": "GNOME/gtk",
+      "url": "https://github.com/GNOME/gtk"
+    },
+    {
+      "name": "h2o",
+      "owner_repo": "h2o/h2o",
+      "url": "https://github.com/h2o/h2o.git"
+    },
+    {
+      "name": "haiku",
+      "owner_repo": "haiku/haiku",
+      "url": "https://github.com/haiku/haiku"
+    },
+    {
+      "name": "handbrake",
+      "owner_repo": "HandBrake/HandBrake",
+      "url": "https://github.com/HandBrake/HandBrake"
+    },
+    {
+      "name": "haproxy",
+      "owner_repo": "haproxy/haproxy",
+      "url": "https://github.com/haproxy/haproxy"
+    },
+    {
+      "name": "harfbuzz",
+      "owner_repo": "harfbuzz/harfbuzz",
+      "url": "https://github.com/harfbuzz/harfbuzz"
+    },
+    {
+      "name": "hashcat",
+      "owner_repo": "hashcat/hashcat",
+      "url": "https://github.com/hashcat/hashcat"
+    },
+    {
+      "name": "hdf5",
+      "owner_repo": "HDFGroup/hdf5",
+      "url": "https://github.com/HDFGroup/hdf5"
+    },
+    {
+      "name": "hip",
+      "owner_repo": "ROCm/HIP",
+      "url": "https://github.com/ROCm/HIP.git"
+    },
+    {
+      "name": "hip.bare",
+      "owner_repo": "ROCm/HIP",
+      "url": "https://github.com/ROCm/HIP"
+    },
+    {
+      "name": "hipblas",
+      "owner_repo": "ROCm/hipBLAS",
+      "url": "https://github.com/ROCm/hipBLAS.git"
+    },
+    {
+      "name": "hipblas.bare",
+      "owner_repo": "ROCm/hipBLAS",
+      "url": "https://github.com/ROCm/hipBLAS"
+    },
+    {
+      "name": "hiredis",
+      "owner_repo": "redis/hiredis",
+      "url": "https://github.com/redis/hiredis.git"
+    },
+    {
+      "name": "hpx",
+      "owner_repo": "STEllAR-GROUP/hpx",
+      "url": "https://github.com/STEllAR-GROUP/hpx"
+    },
+    {
+      "name": "httpd",
+      "owner_repo": "apache/httpd",
+      "url": "https://github.com/apache/httpd.git"
+    },
+    {
+      "name": "illumos-gate",
+      "owner_repo": "illumos/illumos-gate",
+      "url": "https://github.com/illumos/illumos-gate.git"
+    },
+    {
+      "name": "imagemagick",
+      "owner_repo": "ImageMagick/ImageMagick",
+      "url": "https://github.com/ImageMagick/ImageMagick"
+    },
+    {
+      "name": "imgui",
+      "owner_repo": "ocornut/imgui",
+      "url": "https://github.com/ocornut/imgui.git"
+    },
+    {
+      "name": "imhex",
+      "owner_repo": "WerWolv/ImHex",
+      "url": "https://github.com/WerWolv/ImHex"
+    },
+    {
+      "name": "inkscape",
+      "owner_repo": "inkscape/inkscape",
+      "url": "https://github.com/inkscape/inkscape"
+    },
+    {
+      "name": "intel-compute-runtime",
+      "owner_repo": "intel/compute-runtime",
+      "url": "https://github.com/intel/compute-runtime.git"
+    },
+    {
+      "name": "intel-compute-runtime.bare",
+      "owner_repo": "intel/compute-runtime",
+      "url": "https://github.com/intel/compute-runtime"
+    },
+    {
+      "name": "intel-graphics-compiler",
+      "owner_repo": "intel/intel-graphics-compiler",
+      "url": "https://github.com/intel/intel-graphics-compiler.git"
+    },
+    {
+      "name": "intel-graphics-compiler.bare",
+      "owner_repo": "intel/intel-graphics-compiler",
+      "url": "https://github.com/intel/intel-graphics-compiler"
+    },
+    {
+      "name": "intel-llvm-dpcpp",
+      "owner_repo": "intel/llvm",
+      "url": "https://github.com/intel/llvm.git"
+    },
+    {
+      "name": "intel-llvm-dpcpp.bare",
+      "owner_repo": "intel/llvm",
+      "url": "https://github.com/intel/llvm"
+    },
+    {
+      "name": "intel-neural-compressor",
+      "owner_repo": "intel/neural-compressor",
+      "url": "https://github.com/intel/neural-compressor.git"
+    },
+    {
+      "name": "intel-neural-compressor.bare",
+      "owner_repo": "intel/neural-compressor",
+      "url": "https://github.com/intel/neural-compressor"
+    },
+    {
+      "name": "iperf3",
+      "owner_repo": "esnet/iperf",
+      "url": "https://github.com/esnet/iperf.git"
+    },
+    {
+      "name": "ipex",
+      "owner_repo": "intel/intel-extension-for-pytorch",
+      "url": "https://github.com/intel/intel-extension-for-pytorch.git"
+    },
+    {
+      "name": "ipex.bare",
+      "owner_repo": "intel/intel-extension-for-pytorch",
+      "url": "https://github.com/intel/intel-extension-for-pytorch"
+    },
+    {
+      "name": "iree",
+      "owner_repo": "iree-org/iree",
+      "url": "https://github.com/iree-org/iree.git"
+    },
+    {
+      "name": "iree.bare",
+      "owner_repo": "openxla/iree",
+      "url": "https://github.com/openxla/iree"
+    },
+    {
+      "name": "ITK",
+      "owner_repo": "InsightSoftwareConsortium/ITK",
+      "url": "https://github.com/InsightSoftwareConsortium/ITK.git"
+    },
+    {
+      "name": "iwyu",
+      "owner_repo": "include-what-you-use/include-what-you-use",
+      "url": "https://github.com/include-what-you-use/include-what-you-use"
+    },
+    {
+      "name": "jax",
+      "owner_repo": "jax-ml/jax",
+      "url": "https://github.com/jax-ml/jax.git"
+    },
+    {
+      "name": "jax.bare",
+      "owner_repo": "jax-ml/jax",
+      "url": "https://github.com/jax-ml/jax"
+    },
+    {
+      "name": "john",
+      "owner_repo": "openwall/john",
+      "url": "https://github.com/openwall/john.git"
+    },
+    {
+      "name": "jolt-physics",
+      "owner_repo": "jrouwe/JoltPhysics",
+      "url": "https://github.com/jrouwe/JoltPhysics"
+    },
+    {
+      "name": "jq",
+      "owner_repo": "jqlang/jq",
+      "url": "https://github.com/jqlang/jq"
+    },
+    {
+      "name": "json",
+      "owner_repo": "nlohmann/json",
+      "url": "https://github.com/nlohmann/json.git"
+    },
+    {
+      "name": "julia",
+      "owner_repo": "JuliaLang/julia",
+      "url": "https://github.com/JuliaLang/julia.git"
+    },
+    {
+      "name": "keepassxc",
+      "owner_repo": "keepassxreboot/keepassxc",
+      "url": "https://github.com/keepassxreboot/keepassxc"
+    },
+    {
+      "name": "keydb",
+      "owner_repo": "Snapchat/KeyDB",
+      "url": "https://github.com/Snapchat/KeyDB.git"
+    },
+    {
+      "name": "kineto",
+      "owner_repo": "pytorch/kineto",
+      "url": "https://github.com/pytorch/kineto.git"
+    },
+    {
+      "name": "kineto.bare",
+      "owner_repo": "pytorch/kineto",
+      "url": "https://github.com/pytorch/kineto"
+    },
+    {
+      "name": "kodi",
+      "owner_repo": "xbmc/xbmc",
+      "url": "https://github.com/xbmc/xbmc"
+    },
+    {
+      "name": "kokkos",
+      "owner_repo": "kokkos/kokkos",
+      "url": "https://github.com/kokkos/kokkos"
+    },
+    {
+      "name": "ladybird",
+      "owner_repo": "LadybirdBrowser/ladybird",
+      "url": "https://github.com/LadybirdBrowser/ladybird.git"
+    },
+    {
+      "name": "lammps",
+      "owner_repo": "lammps/lammps",
+      "url": "https://github.com/lammps/lammps"
+    },
+    {
+      "name": "leveldb",
+      "owner_repo": "google/leveldb",
+      "url": "https://github.com/google/leveldb.git"
+    },
+    {
+      "name": "libcudacxx",
+      "owner_repo": "NVIDIA/libcudacxx",
+      "url": "https://github.com/NVIDIA/libcudacxx.git"
+    },
+    {
+      "name": "libcudacxx.bare",
+      "owner_repo": "NVIDIA/libcudacxx",
+      "url": "https://github.com/NVIDIA/libcudacxx"
+    },
+    {
+      "name": "libevent",
+      "owner_repo": "libevent/libevent",
+      "url": "https://github.com/libevent/libevent"
+    },
+    {
+      "name": "libjpeg-turbo",
+      "owner_repo": "libjpeg-turbo/libjpeg-turbo",
+      "url": "https://github.com/libjpeg-turbo/libjpeg-turbo"
+    },
+    {
+      "name": "libpcap",
+      "owner_repo": "the-tcpdump-group/libpcap",
+      "url": "https://github.com/the-tcpdump-group/libpcap.git"
+    },
+    {
+      "name": "libpng",
+      "owner_repo": "glennrp/libpng",
+      "url": "https://github.com/glennrp/libpng"
+    },
+    {
+      "name": "librdkafka",
+      "owner_repo": "confluentinc/librdkafka",
+      "url": "https://github.com/confluentinc/librdkafka.git"
+    },
+    {
+      "name": "libsodium",
+      "owner_repo": "jedisct1/libsodium",
+      "url": "https://github.com/jedisct1/libsodium"
+    },
+    {
+      "name": "libusb",
+      "owner_repo": "libusb/libusb",
+      "url": "https://github.com/libusb/libusb.git"
+    },
+    {
+      "name": "libuv",
+      "owner_repo": "libuv/libuv",
+      "url": "https://github.com/libuv/libuv.git"
+    },
+    {
+      "name": "libzmq",
+      "owner_repo": "zeromq/libzmq",
+      "url": "https://github.com/zeromq/libzmq"
+    },
+    {
+      "name": "LightGBM",
+      "owner_repo": "microsoft/LightGBM",
+      "url": "https://github.com/microsoft/LightGBM.git"
+    },
+    {
+      "name": "linux",
+      "owner_repo": "torvalds/linux",
+      "url": "https://github.com/torvalds/linux.git"
+    },
+    {
+      "name": "littlefs",
+      "owner_repo": "littlefs-project/littlefs",
+      "url": "https://github.com/littlefs-project/littlefs.git"
+    },
+    {
+      "name": "llama.cpp",
+      "owner_repo": "ggerganov/llama.cpp",
+      "url": "https://github.com/ggerganov/llama.cpp"
+    },
+    {
+      "name": "llamafile",
+      "owner_repo": "mozilla-ai/llamafile",
+      "url": "https://github.com/mozilla-ai/llamafile"
+    },
+    {
+      "name": "llamafile-latest",
+      "owner_repo": "Mozilla-Ocho/llamafile",
+      "url": "https://github.com/Mozilla-Ocho/llamafile.git"
+    },
+    {
+      "name": "llamafile-latest.bare",
+      "owner_repo": "Mozilla-Ocho/llamafile",
+      "url": "https://github.com/Mozilla-Ocho/llamafile"
+    },
+    {
+      "name": "llvm-project",
+      "owner_repo": "llvm/llvm-project",
+      "url": "https://github.com/llvm/llvm-project.git"
+    },
+    {
+      "name": "lmdb",
+      "owner_repo": "LMDB/lmdb",
+      "url": "https://github.com/LMDB/lmdb.git"
+    },
+    {
+      "name": "lua",
+      "owner_repo": "lua/lua",
+      "url": "https://github.com/lua/lua"
+    },
+    {
+      "name": "luajit",
+      "owner_repo": "LuaJIT/LuaJIT",
+      "url": "https://github.com/LuaJIT/LuaJIT.git"
+    },
+    {
+      "name": "lvgl",
+      "owner_repo": "lvgl/lvgl",
+      "url": "https://github.com/lvgl/lvgl"
+    },
+    {
+      "name": "lwip",
+      "owner_repo": "lwip-tcpip/lwip",
+      "url": "https://github.com/lwip-tcpip/lwip.git"
+    },
+    {
+      "name": "lz4",
+      "owner_repo": "lz4/lz4",
+      "url": "https://github.com/lz4/lz4"
+    },
+    {
+      "name": "magnum",
+      "owner_repo": "mosra/magnum",
+      "url": "https://github.com/mosra/magnum"
+    },
+    {
+      "name": "mame",
+      "owner_repo": "mamedev/mame",
+      "url": "https://github.com/mamedev/mame.git"
+    },
+    {
+      "name": "mariadb",
+      "owner_repo": "MariaDB/server",
+      "url": "https://github.com/MariaDB/server.git"
+    },
+    {
+      "name": "marlin",
+      "owner_repo": "MarlinFirmware/Marlin",
+      "url": "https://github.com/MarlinFirmware/Marlin.git"
+    },
+    {
+      "name": "materialx",
+      "owner_repo": "AcademySoftwareFoundation/MaterialX",
+      "url": "https://github.com/AcademySoftwareFoundation/MaterialX"
+    },
+    {
+      "name": "matx",
+      "owner_repo": "NVIDIA/MatX",
+      "url": "https://github.com/NVIDIA/MatX.git"
+    },
+    {
+      "name": "matx.bare",
+      "owner_repo": "NVIDIA/MatX",
+      "url": "https://github.com/NVIDIA/MatX"
+    },
+    {
+      "name": "mbed-os",
+      "owner_repo": "ARMmbed/mbed-os",
+      "url": "https://github.com/ARMmbed/mbed-os"
+    },
+    {
+      "name": "mbedtls",
+      "owner_repo": "Mbed-TLS/mbedtls",
+      "url": "https://github.com/Mbed-TLS/mbedtls"
+    },
+    {
+      "name": "mediapipe",
+      "owner_repo": "google/mediapipe",
+      "url": "https://github.com/google/mediapipe"
+    },
+    {
+      "name": "memcached",
+      "owner_repo": "memcached/memcached",
+      "url": "https://github.com/memcached/memcached"
+    },
+    {
+      "name": "meshlab",
+      "owner_repo": "cnr-isti-vclab/meshlab",
+      "url": "https://github.com/cnr-isti-vclab/meshlab.git"
+    },
+    {
+      "name": "mfem",
+      "owner_repo": "mfem/mfem",
+      "url": "https://github.com/mfem/mfem"
+    },
+    {
+      "name": "micropython",
+      "owner_repo": "micropython/micropython",
+      "url": "https://github.com/micropython/micropython"
+    },
+    {
+      "name": "microsoft-ui-xaml",
+      "owner_repo": "microsoft/microsoft-ui-xaml",
+      "url": "https://github.com/microsoft/microsoft-ui-xaml.git"
+    },
+    {
+      "name": "mimalloc",
+      "owner_repo": "microsoft/mimalloc",
+      "url": "https://github.com/microsoft/mimalloc.git"
+    },
+    {
+      "name": "mindspore",
+      "owner_repo": "mindspore-ai/mindspore",
+      "url": "https://github.com/mindspore-ai/mindspore.git"
+    },
+    {
+      "name": "mindspore.bare",
+      "owner_repo": "mindspore-ai/mindspore",
+      "url": "https://github.com/mindspore-ai/mindspore"
+    },
+    {
+      "name": "mingw-w64",
+      "owner_repo": "mingw-w64/mingw-w64",
+      "url": "https://github.com/mingw-w64/mingw-w64.git"
+    },
+    {
+      "name": "miniaudio",
+      "owner_repo": "mackron/miniaudio",
+      "url": "https://github.com/mackron/miniaudio.git"
+    },
+    {
+      "name": "minix",
+      "owner_repo": "Stichting-MINIX-Research-Foundation/minix",
+      "url": "https://github.com/Stichting-MINIX-Research-Foundation/minix.git"
+    },
+    {
+      "name": "miopen",
+      "owner_repo": "ROCm/MIOpen",
+      "url": "https://github.com/ROCm/MIOpen.git"
+    },
+    {
+      "name": "miopen.bare",
+      "owner_repo": "ROCm/MIOpen",
+      "url": "https://github.com/ROCm/MIOpen"
+    },
+    {
+      "name": "mlpack",
+      "owner_repo": "mlpack/mlpack",
+      "url": "https://github.com/mlpack/mlpack"
+    },
+    {
+      "name": "mnn",
+      "owner_repo": "alibaba/MNN",
+      "url": "https://github.com/alibaba/MNN.git"
+    },
+    {
+      "name": "mold",
+      "owner_repo": "rui314/mold",
+      "url": "https://github.com/rui314/mold.git"
+    },
+    {
+      "name": "mongodb-cxx",
+      "owner_repo": "mongodb/mongo-cxx-driver",
+      "url": "https://github.com/mongodb/mongo-cxx-driver.git"
+    },
+    {
+      "name": "mono",
+      "owner_repo": "mono/mono",
+      "url": "https://github.com/mono/mono.git"
+    },
+    {
+      "name": "mosquitto",
+      "owner_repo": "eclipse-mosquitto/mosquitto",
+      "url": "https://github.com/eclipse-mosquitto/mosquitto.git"
+    },
+    {
+      "name": "mpv",
+      "owner_repo": "mpv-player/mpv",
+      "url": "https://github.com/mpv-player/mpv"
+    },
+    {
+      "name": "mruby",
+      "owner_repo": "mruby/mruby",
+      "url": "https://github.com/mruby/mruby.git"
+    },
+    {
+      "name": "msgpack-c",
+      "owner_repo": "msgpack/msgpack-c",
+      "url": "https://github.com/msgpack/msgpack-c"
+    },
+    {
+      "name": "msquic",
+      "owner_repo": "microsoft/msquic",
+      "url": "https://github.com/microsoft/msquic.git"
+    },
+    {
+      "name": "mujoco",
+      "owner_repo": "deepmind/mujoco",
+      "url": "https://github.com/deepmind/mujoco.git"
+    },
+    {
+      "name": "mxnet",
+      "owner_repo": "apache/mxnet",
+      "url": "https://github.com/apache/mxnet"
+    },
+    {
+      "name": "mysql",
+      "owner_repo": "mysql/mysql-server",
+      "url": "https://github.com/mysql/mysql-server.git"
+    },
+    {
+      "name": "nanomsg",
+      "owner_repo": "nanomsg/nanomsg",
+      "url": "https://github.com/nanomsg/nanomsg.git"
+    },
+    {
+      "name": "nccl",
+      "owner_repo": "NVIDIA/nccl",
+      "url": "https://github.com/NVIDIA/nccl.git"
+    },
+    {
+      "name": "nccl.bare",
+      "owner_repo": "NVIDIA/nccl",
+      "url": "https://github.com/NVIDIA/nccl"
+    },
+    {
+      "name": "ncnn",
+      "owner_repo": "Tencent/ncnn",
+      "url": "https://github.com/Tencent/ncnn"
+    },
+    {
+      "name": "ndpi",
+      "owner_repo": "ntop/nDPI",
+      "url": "https://github.com/ntop/nDPI.git"
+    },
+    {
+      "name": "nemo-guardrails.bare",
+      "owner_repo": "NVIDIA/NeMo-Guardrails",
+      "url": "https://github.com/NVIDIA/NeMo-Guardrails"
+    },
+    {
+      "name": "neovim",
+      "owner_repo": "neovim/neovim",
+      "url": "https://github.com/neovim/neovim"
+    },
+    {
+      "name": "netbsd",
+      "owner_repo": "NetBSD/src",
+      "url": "https://github.com/NetBSD/src"
+    },
+    {
+      "name": "nghttp2",
+      "owner_repo": "nghttp2/nghttp2",
+      "url": "https://github.com/nghttp2/nghttp2.git"
+    },
+    {
+      "name": "nginx",
+      "owner_repo": "nginx/nginx",
+      "url": "https://github.com/nginx/nginx.git"
+    },
+    {
+      "name": "nmap",
+      "owner_repo": "nmap/nmap",
+      "url": "https://github.com/nmap/nmap"
+    },
+    {
+      "name": "nng",
+      "owner_repo": "nanomsg/nng",
+      "url": "https://github.com/nanomsg/nng.git"
+    },
+    {
+      "name": "node",
+      "owner_repo": "nodejs/node",
+      "url": "https://github.com/nodejs/node.git"
+    },
+    {
+      "name": "notepad-plus-plus",
+      "owner_repo": "notepad-plus-plus/notepad-plus-plus",
+      "url": "https://github.com/notepad-plus-plus/notepad-plus-plus"
+    },
+    {
+      "name": "ntfs-3g",
+      "owner_repo": "tuxera/ntfs-3g",
+      "url": "https://github.com/tuxera/ntfs-3g.git"
+    },
+    {
+      "name": "nuttx",
+      "owner_repo": "apache/nuttx",
+      "url": "https://github.com/apache/nuttx"
+    },
+    {
+      "name": "nvidia-open-gpu-kernel",
+      "owner_repo": "NVIDIA/open-gpu-kernel-modules",
+      "url": "https://github.com/NVIDIA/open-gpu-kernel-modules.git"
+    },
+    {
+      "name": "nvidia-open-gpu-kernel.bare",
+      "owner_repo": "NVIDIA/open-gpu-kernel-modules",
+      "url": "https://github.com/NVIDIA/open-gpu-kernel-modules"
+    },
+    {
+      "name": "o3de",
+      "owner_repo": "o3de/o3de",
+      "url": "https://github.com/o3de/o3de.git"
+    },
+    {
+      "name": "obs-studio",
+      "owner_repo": "obsproject/obs-studio",
+      "url": "https://github.com/obsproject/obs-studio"
+    },
+    {
+      "name": "oceanbase",
+      "owner_repo": "oceanbase/oceanbase",
+      "url": "https://github.com/oceanbase/oceanbase.git"
+    },
+    {
+      "name": "ogre",
+      "owner_repo": "OGRECave/ogre",
+      "url": "https://github.com/OGRECave/ogre"
+    },
+    {
+      "name": "onednn",
+      "owner_repo": "oneapi-src/oneDNN",
+      "url": "https://github.com/oneapi-src/oneDNN.git"
+    },
+    {
+      "name": "onednn.bare",
+      "owner_repo": "oneapi-src/oneDNN",
+      "url": "https://github.com/oneapi-src/oneDNN"
+    },
+    {
+      "name": "onetbb",
+      "owner_repo": "oneapi-src/oneTBB",
+      "url": "https://github.com/oneapi-src/oneTBB.git"
+    },
+    {
+      "name": "onetbb.bare",
+      "owner_repo": "oneapi-src/oneTBB",
+      "url": "https://github.com/oneapi-src/oneTBB"
+    },
+    {
+      "name": "onnx",
+      "owner_repo": "onnx/onnx",
+      "url": "https://github.com/onnx/onnx.git"
+    },
+    {
+      "name": "onnx.bare",
+      "owner_repo": "onnx/onnx",
+      "url": "https://github.com/onnx/onnx"
+    },
+    {
+      "name": "onnxruntime",
+      "owner_repo": "microsoft/onnxruntime",
+      "url": "https://github.com/microsoft/onnxruntime.git"
+    },
+    {
+      "name": "onnxruntime-genai",
+      "owner_repo": "microsoft/onnxruntime-genai",
+      "url": "https://github.com/microsoft/onnxruntime-genai.git"
+    },
+    {
+      "name": "onnxruntime-genai.bare",
+      "owner_repo": "microsoft/onnxruntime-genai",
+      "url": "https://github.com/microsoft/onnxruntime-genai"
+    },
+    {
+      "name": "open-watcom",
+      "owner_repo": "open-watcom/open-watcom-v2",
+      "url": "https://github.com/open-watcom/open-watcom-v2.git"
+    },
+    {
+      "name": "open-watcom-v2",
+      "owner_repo": "open-watcom/open-watcom-v2",
+      "url": "https://github.com/open-watcom/open-watcom-v2.git"
+    },
+    {
+      "name": "openblas",
+      "owner_repo": "OpenMathLib/OpenBLAS",
+      "url": "https://github.com/OpenMathLib/OpenBLAS.git"
+    },
+    {
+      "name": "openbsd",
+      "owner_repo": "openbsd/src",
+      "url": "https://github.com/openbsd/src"
+    },
+    {
+      "name": "opencv",
+      "owner_repo": "opencv/opencv",
+      "url": "https://github.com/opencv/opencv.git"
+    },
+    {
+      "name": "openexr",
+      "owner_repo": "AcademySoftwareFoundation/openexr",
+      "url": "https://github.com/AcademySoftwareFoundation/openexr.git"
+    },
+    {
+      "name": "openfoam",
+      "owner_repo": "OpenFOAM/OpenFOAM-dev",
+      "url": "https://github.com/OpenFOAM/OpenFOAM-dev"
+    },
+    {
+      "name": "openh264",
+      "owner_repo": "cisco/openh264",
+      "url": "https://github.com/cisco/openh264.git"
+    },
+    {
+      "name": "openjdk",
+      "owner_repo": "openjdk/jdk",
+      "url": "https://github.com/openjdk/jdk.git"
+    },
+    {
+      "name": "opensbi",
+      "owner_repo": "riscv-software-src/opensbi",
+      "url": "https://github.com/riscv-software-src/opensbi.git"
+    },
+    {
+      "name": "openscad",
+      "owner_repo": "openscad/openscad",
+      "url": "https://github.com/openscad/openscad"
+    },
+    {
+      "name": "openssh",
+      "owner_repo": "openssh/openssh-portable",
+      "url": "https://github.com/openssh/openssh-portable.git"
+    },
+    {
+      "name": "openssl",
+      "owner_repo": "openssl/openssl",
+      "url": "https://github.com/openssl/openssl.git"
+    },
+    {
+      "name": "openvdb",
+      "owner_repo": "AcademySoftwareFoundation/openvdb",
+      "url": "https://github.com/AcademySoftwareFoundation/openvdb"
+    },
+    {
+      "name": "openvino",
+      "owner_repo": "openvinotoolkit/openvino",
+      "url": "https://github.com/openvinotoolkit/openvino.git"
+    },
+    {
+      "name": "openvino.bare",
+      "owner_repo": "openvinotoolkit/openvino",
+      "url": "https://github.com/openvinotoolkit/openvino"
+    },
+    {
+      "name": "openvpn",
+      "owner_repo": "OpenVPN/openvpn",
+      "url": "https://github.com/OpenVPN/openvpn"
+    },
+    {
+      "name": "openxla-xla",
+      "owner_repo": "openxla/xla",
+      "url": "https://github.com/openxla/xla.git"
+    },
+    {
+      "name": "openxla-xla.bare",
+      "owner_repo": "openxla/xla",
+      "url": "https://github.com/openxla/xla"
+    },
+    {
+      "name": "openzfs",
+      "owner_repo": "openzfs/zfs",
+      "url": "https://github.com/openzfs/zfs.git"
+    },
+    {
+      "name": "optee",
+      "owner_repo": "OP-TEE/optee_os",
+      "url": "https://github.com/OP-TEE/optee_os.git"
+    },
+    {
+      "name": "opus",
+      "owner_repo": "xiph/opus",
+      "url": "https://github.com/xiph/opus.git"
+    },
+    {
+      "name": "osl",
+      "owner_repo": "AcademySoftwareFoundation/OpenShadingLanguage",
+      "url": "https://github.com/AcademySoftwareFoundation/OpenShadingLanguage"
+    },
+    {
+      "name": "paddle",
+      "owner_repo": "PaddlePaddle/Paddle",
+      "url": "https://github.com/PaddlePaddle/Paddle"
+    },
+    {
+      "name": "paraview",
+      "owner_repo": "Kitware/ParaView",
+      "url": "https://github.com/Kitware/ParaView"
+    },
+    {
+      "name": "pbrt-v4",
+      "owner_repo": "mmp/pbrt-v4",
+      "url": "https://github.com/mmp/pbrt-v4.git"
+    },
+    {
+      "name": "pcl",
+      "owner_repo": "PointCloudLibrary/pcl",
+      "url": "https://github.com/PointCloudLibrary/pcl"
+    },
+    {
+      "name": "pcsx2",
+      "owner_repo": "PCSX2/pcsx2",
+      "url": "https://github.com/PCSX2/pcsx2"
+    },
+    {
+      "name": "pdns",
+      "owner_repo": "PowerDNS/pdns",
+      "url": "https://github.com/PowerDNS/pdns.git"
+    },
+    {
+      "name": "petsc",
+      "owner_repo": "petsc/petsc",
+      "url": "https://github.com/petsc/petsc.git"
+    },
+    {
+      "name": "php-src",
+      "owner_repo": "php/php-src",
+      "url": "https://github.com/php/php-src.git"
+    },
+    {
+      "name": "physx",
+      "owner_repo": "NVIDIA-Omniverse/PhysX",
+      "url": "https://github.com/NVIDIA-Omniverse/PhysX"
+    },
+    {
+      "name": "pico-sdk",
+      "owner_repo": "raspberrypi/pico-sdk",
+      "url": "https://github.com/raspberrypi/pico-sdk.git"
+    },
+    {
+      "name": "plan9",
+      "owner_repo": "plan9foundation/plan9",
+      "url": "https://github.com/plan9foundation/plan9.git"
+    },
+    {
+      "name": "poco",
+      "owner_repo": "pocoproject/poco",
+      "url": "https://github.com/pocoproject/poco.git"
+    },
+    {
+      "name": "portable",
+      "owner_repo": "libressl/portable",
+      "url": "https://github.com/libressl/portable.git"
+    },
+    {
+      "name": "postgres",
+      "owner_repo": "postgres/postgres",
+      "url": "https://github.com/postgres/postgres.git"
+    },
+    {
+      "name": "ppsspp",
+      "owner_repo": "hrydgard/ppsspp",
+      "url": "https://github.com/hrydgard/ppsspp.git"
+    },
+    {
+      "name": "ProcMon-for-Linux",
+      "owner_repo": "microsoft/ProcMon-for-Linux",
+      "url": "https://github.com/microsoft/ProcMon-for-Linux.git"
+    },
+    {
+      "name": "protobuf",
+      "owner_repo": "protocolbuffers/protobuf",
+      "url": "https://github.com/protocolbuffers/protobuf.git"
+    },
+    {
+      "name": "proxy",
+      "owner_repo": "microsoft/proxy",
+      "url": "https://github.com/microsoft/proxy.git"
+    },
+    {
+      "name": "proxygen",
+      "owner_repo": "facebook/proxygen",
+      "url": "https://github.com/facebook/proxygen"
+    },
+    {
+      "name": "px4-autopilot",
+      "owner_repo": "PX4/PX4-Autopilot",
+      "url": "https://github.com/PX4/PX4-Autopilot.git"
+    },
+    {
+      "name": "pybind11",
+      "owner_repo": "pybind/pybind11",
+      "url": "https://github.com/pybind/pybind11"
+    },
+    {
+      "name": "pytorch",
+      "owner_repo": "pytorch/pytorch",
+      "url": "https://github.com/pytorch/pytorch.git"
+    },
+    {
+      "name": "pytorch-xla",
+      "owner_repo": "pytorch/xla",
+      "url": "https://github.com/pytorch/xla.git"
+    },
+    {
+      "name": "pytorch-xla.bare",
+      "owner_repo": "pytorch/xla",
+      "url": "https://github.com/pytorch/xla"
+    },
+    {
+      "name": "qbittorrent",
+      "owner_repo": "qbittorrent/qBittorrent",
+      "url": "https://github.com/qbittorrent/qBittorrent"
+    },
+    {
+      "name": "qemu",
+      "owner_repo": "qemu/qemu",
+      "url": "https://github.com/qemu/qemu.git"
+    },
+    {
+      "name": "qmk-firmware",
+      "owner_repo": "qmk/qmk_firmware",
+      "url": "https://github.com/qmk/qmk_firmware"
+    },
+    {
+      "name": "qnnpack",
+      "owner_repo": "pytorch/QNNPACK",
+      "url": "https://github.com/pytorch/QNNPACK.git"
+    },
+    {
+      "name": "qnnpack.bare",
+      "owner_repo": "pytorch/QNNPACK",
+      "url": "https://github.com/pytorch/QNNPACK"
+    },
+    {
+      "name": "qtbase",
+      "owner_repo": "qt/qtbase",
+      "url": "https://github.com/qt/qtbase.git"
+    },
+    {
+      "name": "qualcomm-aimet",
+      "owner_repo": "quic/aimet",
+      "url": "https://github.com/quic/aimet.git"
+    },
+    {
+      "name": "qualcomm-aimet.bare",
+      "owner_repo": "quic/aimet",
+      "url": "https://github.com/quic/aimet"
+    },
+    {
+      "name": "questdb",
+      "owner_repo": "questdb/questdb",
+      "url": "https://github.com/questdb/questdb.git"
+    },
+    {
+      "name": "radare2",
+      "owner_repo": "radareorg/radare2",
+      "url": "https://github.com/radareorg/radare2"
+    },
+    {
+      "name": "range-v3",
+      "owner_repo": "ericniebler/range-v3",
+      "url": "https://github.com/ericniebler/range-v3.git"
+    },
+    {
+      "name": "rapidjson",
+      "owner_repo": "Tencent/rapidjson",
+      "url": "https://github.com/Tencent/rapidjson"
+    },
+    {
+      "name": "raylib",
+      "owner_repo": "raysan5/raylib",
+      "url": "https://github.com/raysan5/raylib.git"
+    },
+    {
+      "name": "rccl",
+      "owner_repo": "ROCm/rccl",
+      "url": "https://github.com/ROCm/rccl.git"
+    },
+    {
+      "name": "rccl.bare",
+      "owner_repo": "ROCm/rccl",
+      "url": "https://github.com/ROCm/rccl"
+    },
+    {
+      "name": "re2",
+      "owner_repo": "google/re2",
+      "url": "https://github.com/google/re2.git"
+    },
+    {
+      "name": "react-native-windows",
+      "owner_repo": "microsoft/react-native-windows",
+      "url": "https://github.com/microsoft/react-native-windows.git"
+    },
+    {
+      "name": "reactos",
+      "owner_repo": "reactos/reactos",
+      "url": "https://github.com/reactos/reactos"
+    },
+    {
+      "name": "redis",
+      "owner_repo": "redis/redis",
+      "url": "https://github.com/redis/redis.git"
+    },
+    {
+      "name": "rethinkdb",
+      "owner_repo": "rethinkdb/rethinkdb",
+      "url": "https://github.com/rethinkdb/rethinkdb.git"
+    },
+    {
+      "name": "retroarch",
+      "owner_repo": "libretro/RetroArch",
+      "url": "https://github.com/libretro/RetroArch.git"
+    },
+    {
+      "name": "riot",
+      "owner_repo": "RIOT-OS/RIOT",
+      "url": "https://github.com/RIOT-OS/RIOT.git"
+    },
+    {
+      "name": "riot-os",
+      "owner_repo": "RIOT-OS/RIOT",
+      "url": "https://github.com/RIOT-OS/RIOT"
+    },
+    {
+      "name": "rocblas",
+      "owner_repo": "ROCm/rocBLAS",
+      "url": "https://github.com/ROCm/rocBLAS.git"
+    },
+    {
+      "name": "rocblas.bare",
+      "owner_repo": "ROCm/rocBLAS",
+      "url": "https://github.com/ROCm/rocBLAS"
+    },
+    {
+      "name": "rocdbgapi",
+      "owner_repo": "ROCm/ROCdbgapi",
+      "url": "https://github.com/ROCm/ROCdbgapi.git"
+    },
+    {
+      "name": "rocdbgapi.bare",
+      "owner_repo": "ROCm/ROCdbgapi",
+      "url": "https://github.com/ROCm/ROCdbgapi"
+    },
+    {
+      "name": "rocfft",
+      "owner_repo": "ROCm/rocFFT",
+      "url": "https://github.com/ROCm/rocFFT.git"
+    },
+    {
+      "name": "rocfft.bare",
+      "owner_repo": "ROCm/rocFFT",
+      "url": "https://github.com/ROCm/rocFFT"
+    },
+    {
+      "name": "rocksdb",
+      "owner_repo": "facebook/rocksdb",
+      "url": "https://github.com/facebook/rocksdb.git"
+    },
+    {
+      "name": "rocm-cmake.bare",
+      "owner_repo": "ROCm/rocm-cmake",
+      "url": "https://github.com/ROCm/rocm-cmake"
+    },
+    {
+      "name": "rocm-llvm",
+      "owner_repo": "ROCm/llvm-project",
+      "url": "https://github.com/ROCm/llvm-project.git"
+    },
+    {
+      "name": "rocm-llvm.bare",
+      "owner_repo": "ROCm/llvm-project",
+      "url": "https://github.com/ROCm/llvm-project"
+    },
+    {
+      "name": "rocprim",
+      "owner_repo": "ROCm/rocPRIM",
+      "url": "https://github.com/ROCm/rocPRIM.git"
+    },
+    {
+      "name": "rocprim.bare",
+      "owner_repo": "ROCm/rocPRIM",
+      "url": "https://github.com/ROCm/rocPRIM"
+    },
+    {
+      "name": "rocr-runtime",
+      "owner_repo": "ROCm/ROCR-Runtime",
+      "url": "https://github.com/ROCm/ROCR-Runtime.git"
+    },
+    {
+      "name": "rocr-runtime.bare",
+      "owner_repo": "ROCm/ROCR-Runtime",
+      "url": "https://github.com/ROCm/ROCR-Runtime"
+    },
+    {
+      "name": "rocrand",
+      "owner_repo": "ROCm/rocRAND",
+      "url": "https://github.com/ROCm/rocRAND.git"
+    },
+    {
+      "name": "rocrand.bare",
+      "owner_repo": "ROCm/rocRAND",
+      "url": "https://github.com/ROCm/rocRAND"
+    },
+    {
+      "name": "rocsolver",
+      "owner_repo": "ROCm/rocSOLVER",
+      "url": "https://github.com/ROCm/rocSOLVER.git"
+    },
+    {
+      "name": "rocsolver.bare",
+      "owner_repo": "ROCm/rocSOLVER",
+      "url": "https://github.com/ROCm/rocSOLVER"
+    },
+    {
+      "name": "rocsparse",
+      "owner_repo": "ROCm/rocSPARSE",
+      "url": "https://github.com/ROCm/rocSPARSE.git"
+    },
+    {
+      "name": "rocsparse.bare",
+      "owner_repo": "ROCm/rocSPARSE",
+      "url": "https://github.com/ROCm/rocSPARSE"
+    },
+    {
+      "name": "root",
+      "owner_repo": "root-project/root",
+      "url": "https://github.com/root-project/root.git"
+    },
+    {
+      "name": "root-cern",
+      "owner_repo": "root-project/root",
+      "url": "https://github.com/root-project/root.git"
+    },
+    {
+      "name": "rpcs3",
+      "owner_repo": "RPCS3/rpcs3",
+      "url": "https://github.com/RPCS3/rpcs3"
+    },
+    {
+      "name": "rt-thread",
+      "owner_repo": "RT-Thread/rt-thread",
+      "url": "https://github.com/RT-Thread/rt-thread"
+    },
+    {
+      "name": "ruby",
+      "owner_repo": "ruby/ruby",
+      "url": "https://github.com/ruby/ruby.git"
+    },
+    {
+      "name": "runtime",
+      "owner_repo": "dotnet/runtime",
+      "url": "https://github.com/dotnet/runtime.git"
+    },
+    {
+      "name": "s2n-tls",
+      "owner_repo": "aws/s2n-tls",
+      "url": "https://github.com/aws/s2n-tls.git"
+    },
+    {
+      "name": "samsung-one",
+      "owner_repo": "Samsung/ONE",
+      "url": "https://github.com/Samsung/ONE.git"
+    },
+    {
+      "name": "samsung-one.bare",
+      "owner_repo": "Samsung/ONE",
+      "url": "https://github.com/Samsung/ONE"
+    },
+    {
+      "name": "scummvm",
+      "owner_repo": "scummvm/scummvm",
+      "url": "https://github.com/scummvm/scummvm.git"
+    },
+    {
+      "name": "scylladb",
+      "owner_repo": "scylladb/scylladb",
+      "url": "https://github.com/scylladb/scylladb.git"
+    },
+    {
+      "name": "SDL",
+      "owner_repo": "libsdl-org/SDL",
+      "url": "https://github.com/libsdl-org/SDL.git"
+    },
+    {
+      "name": "SEAL",
+      "owner_repo": "microsoft/SEAL",
+      "url": "https://github.com/microsoft/SEAL.git"
+    },
+    {
+      "name": "seastar",
+      "owner_repo": "scylladb/seastar",
+      "url": "https://github.com/scylladb/seastar.git"
+    },
+    {
+      "name": "sel4",
+      "owner_repo": "seL4/seL4",
+      "url": "https://github.com/seL4/seL4.git"
+    },
+    {
+      "name": "serenity",
+      "owner_repo": "SerenityOS/serenity",
+      "url": "https://github.com/SerenityOS/serenity"
+    },
+    {
+      "name": "SFML",
+      "owner_repo": "SFML/SFML",
+      "url": "https://github.com/SFML/SFML.git"
+    },
+    {
+      "name": "sgi-stl",
+      "owner_repo": "karottc/sgi-stl",
+      "url": "https://github.com/karottc/sgi-stl.git"
+    },
+    {
+      "name": "shadps4",
+      "owner_repo": "shadps4-emu/shadPS4",
+      "url": "https://github.com/shadps4-emu/shadPS4"
+    },
+    {
+      "name": "simdjson",
+      "owner_repo": "simdjson/simdjson",
+      "url": "https://github.com/simdjson/simdjson"
+    },
+    {
+      "name": "skia",
+      "owner_repo": "google/skia",
+      "url": "https://github.com/google/skia"
+    },
+    {
+      "name": "snmalloc",
+      "owner_repo": "microsoft/snmalloc",
+      "url": "https://github.com/microsoft/snmalloc.git"
+    },
+    {
+      "name": "snort3",
+      "owner_repo": "snort3/snort3",
+      "url": "https://github.com/snort3/snort3.git"
+    },
+    {
+      "name": "spdlog",
+      "owner_repo": "gabime/spdlog",
+      "url": "https://github.com/gabime/spdlog.git"
+    },
+    {
+      "name": "spirv-cross",
+      "owner_repo": "KhronosGroup/SPIRV-Cross",
+      "url": "https://github.com/KhronosGroup/SPIRV-Cross"
+    },
+    {
+      "name": "spirv-cross-khronos",
+      "owner_repo": "KhronosGroup/SPIRV-Cross",
+      "url": "https://github.com/KhronosGroup/SPIRV-Cross.git"
+    },
+    {
+      "name": "spirv-cross-khronos.bare",
+      "owner_repo": "KhronosGroup/SPIRV-Cross",
+      "url": "https://github.com/KhronosGroup/SPIRV-Cross"
+    },
+    {
+      "name": "spirv-tools",
+      "owner_repo": "KhronosGroup/SPIRV-Tools",
+      "url": "https://github.com/KhronosGroup/SPIRV-Tools.git"
+    },
+    {
+      "name": "spirv-tools.bare",
+      "owner_repo": "KhronosGroup/SPIRV-Tools",
+      "url": "https://github.com/KhronosGroup/SPIRV-Tools"
+    },
+    {
+      "name": "SPTAG",
+      "owner_repo": "microsoft/SPTAG",
+      "url": "https://github.com/microsoft/SPTAG.git"
+    },
+    {
+      "name": "sqlite",
+      "owner_repo": "sqlite/sqlite",
+      "url": "https://github.com/sqlite/sqlite"
+    },
+    {
+      "name": "squid",
+      "owner_repo": "squid-cache/squid",
+      "url": "https://github.com/squid-cache/squid"
+    },
+    {
+      "name": "src",
+      "owner_repo": "NetBSD/src",
+      "url": "https://github.com/NetBSD/src.git"
+    },
+    {
+      "name": "stablehlo",
+      "owner_repo": "openxla/stablehlo",
+      "url": "https://github.com/openxla/stablehlo.git"
+    },
+    {
+      "name": "stablehlo.bare",
+      "owner_repo": "openxla/stablehlo",
+      "url": "https://github.com/openxla/stablehlo"
+    },
+    {
+      "name": "stb",
+      "owner_repo": "nothings/stb",
+      "url": "https://github.com/nothings/stb"
+    },
+    {
+      "name": "stl",
+      "owner_repo": "microsoft/STL",
+      "url": "https://github.com/microsoft/STL.git"
+    },
+    {
+      "name": "STL",
+      "owner_repo": "microsoft/STL",
+      "url": "https://github.com/microsoft/STL.git"
+    },
+    {
+      "name": "stlport",
+      "owner_repo": "LiveMirror/stlport",
+      "url": "https://github.com/LiveMirror/stlport.git"
+    },
+    {
+      "name": "strace",
+      "owner_repo": "strace/strace",
+      "url": "https://github.com/strace/strace"
+    },
+    {
+      "name": "strongswan",
+      "owner_repo": "strongswan/strongswan",
+      "url": "https://github.com/strongswan/strongswan.git"
+    },
+    {
+      "name": "suricata",
+      "owner_repo": "OISF/suricata",
+      "url": "https://github.com/OISF/suricata.git"
+    },
+    {
+      "name": "swift",
+      "owner_repo": "swiftlang/swift",
+      "url": "https://github.com/swiftlang/swift.git"
+    },
+    {
+      "name": "SymCrypt",
+      "owner_repo": "microsoft/SymCrypt",
+      "url": "https://github.com/microsoft/SymCrypt.git"
+    },
+    {
+      "name": "systemd",
+      "owner_repo": "systemd/systemd",
+      "url": "https://github.com/systemd/systemd"
+    },
+    {
+      "name": "taichi",
+      "owner_repo": "taichi-dev/taichi",
+      "url": "https://github.com/taichi-dev/taichi"
+    },
+    {
+      "name": "taskflow",
+      "owner_repo": "taskflow/taskflow",
+      "url": "https://github.com/taskflow/taskflow.git"
+    },
+    {
+      "name": "tbb",
+      "owner_repo": "oneapi-src/oneTBB",
+      "url": "https://github.com/oneapi-src/oneTBB.git"
+    },
+    {
+      "name": "tcpdump",
+      "owner_repo": "the-tcpdump-group/tcpdump",
+      "url": "https://github.com/the-tcpdump-group/tcpdump.git"
+    },
+    {
+      "name": "telegram-desktop",
+      "owner_repo": "telegramdesktop/tdesktop",
+      "url": "https://github.com/telegramdesktop/tdesktop"
+    },
+    {
+      "name": "tensorflow",
+      "owner_repo": "tensorflow/tensorflow",
+      "url": "https://github.com/tensorflow/tensorflow.git"
+    },
+    {
+      "name": "tensorpipe",
+      "owner_repo": "pytorch/tensorpipe",
+      "url": "https://github.com/pytorch/tensorpipe.git"
+    },
+    {
+      "name": "tensorpipe.bare",
+      "owner_repo": "pytorch/tensorpipe",
+      "url": "https://github.com/pytorch/tensorpipe"
+    },
+    {
+      "name": "tensorrt-llm",
+      "owner_repo": "NVIDIA/TensorRT-LLM",
+      "url": "https://github.com/NVIDIA/TensorRT-LLM.git"
+    },
+    {
+      "name": "tensorrt-llm.bare",
+      "owner_repo": "NVIDIA/TensorRT-LLM",
+      "url": "https://github.com/NVIDIA/TensorRT-LLM"
+    },
+    {
+      "name": "tensorrt-oss",
+      "owner_repo": "NVIDIA/TensorRT",
+      "url": "https://github.com/NVIDIA/TensorRT.git"
+    },
+    {
+      "name": "tensorrt-oss.bare",
+      "owner_repo": "NVIDIA/TensorRT",
+      "url": "https://github.com/NVIDIA/TensorRT"
+    },
+    {
+      "name": "terminal",
+      "owner_repo": "microsoft/terminal",
+      "url": "https://github.com/microsoft/terminal.git"
+    },
+    {
+      "name": "tesseract",
+      "owner_repo": "tesseract-ocr/tesseract",
+      "url": "https://github.com/tesseract-ocr/tesseract"
+    },
+    {
+      "name": "threadx",
+      "owner_repo": "eclipse-threadx/threadx",
+      "url": "https://github.com/eclipse-threadx/threadx.git"
+    },
+    {
+      "name": "thrift",
+      "owner_repo": "apache/thrift",
+      "url": "https://github.com/apache/thrift"
+    },
+    {
+      "name": "thrust",
+      "owner_repo": "NVIDIA/thrust",
+      "url": "https://github.com/NVIDIA/thrust.git"
+    },
+    {
+      "name": "thrust.bare",
+      "owner_repo": "NVIDIA/thrust",
+      "url": "https://github.com/NVIDIA/thrust"
+    },
+    {
+      "name": "tinycc",
+      "owner_repo": "TinyCC/tinycc",
+      "url": "https://github.com/TinyCC/tinycc.git"
+    },
+    {
+      "name": "tinyusb",
+      "owner_repo": "hathach/tinyusb",
+      "url": "https://github.com/hathach/tinyusb.git"
+    },
+    {
+      "name": "tmux",
+      "owner_repo": "tmux/tmux",
+      "url": "https://github.com/tmux/tmux"
+    },
+    {
+      "name": "tnn",
+      "owner_repo": "Tencent/TNN",
+      "url": "https://github.com/Tencent/TNN.git"
+    },
+    {
+      "name": "transformer-engine",
+      "owner_repo": "NVIDIA/TransformerEngine",
+      "url": "https://github.com/NVIDIA/TransformerEngine.git"
+    },
+    {
+      "name": "transformer-engine.bare",
+      "owner_repo": "NVIDIA/TransformerEngine",
+      "url": "https://github.com/NVIDIA/TransformerEngine"
+    },
+    {
+      "name": "trilinos",
+      "owner_repo": "trilinos/Trilinos",
+      "url": "https://github.com/trilinos/Trilinos"
+    },
+    {
+      "name": "triton",
+      "owner_repo": "triton-lang/triton",
+      "url": "https://github.com/triton-lang/triton.git"
+    },
+    {
+      "name": "triton.bare",
+      "owner_repo": "triton-lang/triton",
+      "url": "https://github.com/triton-lang/triton"
+    },
+    {
+      "name": "tvm",
+      "owner_repo": "apache/tvm",
+      "url": "https://github.com/apache/tvm.git"
+    },
+    {
+      "name": "u-boot",
+      "owner_repo": "u-boot/u-boot",
+      "url": "https://github.com/u-boot/u-boot.git"
+    },
+    {
+      "name": "unbound",
+      "owner_repo": "NLnetLabs/unbound",
+      "url": "https://github.com/NLnetLabs/unbound.git"
+    },
+    {
+      "name": "unix-history",
+      "owner_repo": "dspinellis/unix-history-repo",
+      "url": "https://github.com/dspinellis/unix-history-repo.git"
+    },
+    {
+      "name": "usd",
+      "owner_repo": "PixarAnimationStudios/USD",
+      "url": "https://github.com/PixarAnimationStudios/USD.git"
+    },
+    {
+      "name": "util-linux",
+      "owner_repo": "util-linux/util-linux",
+      "url": "https://github.com/util-linux/util-linux"
+    },
+    {
+      "name": "uwebsockets",
+      "owner_repo": "uNetworking/uWebSockets",
+      "url": "https://github.com/uNetworking/uWebSockets"
+    },
+    {
+      "name": "v8",
+      "owner_repo": "nickg/nvc",
+      "url": "https://github.com/nickg/nvc.git"
+    },
+    {
+      "name": "valkey",
+      "owner_repo": "valkey-io/valkey",
+      "url": "https://github.com/valkey-io/valkey"
+    },
+    {
+      "name": "veracrypt",
+      "owner_repo": "veracrypt/VeraCrypt",
+      "url": "https://github.com/veracrypt/VeraCrypt"
+    },
+    {
+      "name": "verona",
+      "owner_repo": "microsoft/verona",
+      "url": "https://github.com/microsoft/verona.git"
+    },
+    {
+      "name": "vim",
+      "owner_repo": "vim/vim",
+      "url": "https://github.com/vim/vim"
+    },
+    {
+      "name": "vlc",
+      "owner_repo": "videolan/vlc",
+      "url": "https://github.com/videolan/vlc"
+    },
+    {
+      "name": "vllm",
+      "owner_repo": "vllm-project/vllm",
+      "url": "https://github.com/vllm-project/vllm.git"
+    },
+    {
+      "name": "vllm.bare",
+      "owner_repo": "vllm-project/vllm",
+      "url": "https://github.com/vllm-project/vllm"
+    },
+    {
+      "name": "VTK",
+      "owner_repo": "Kitware/VTK",
+      "url": "https://github.com/Kitware/VTK.git"
+    },
+    {
+      "name": "vulkan-examples",
+      "owner_repo": "SaschaWillems/Vulkan",
+      "url": "https://github.com/SaschaWillems/Vulkan.git"
+    },
+    {
+      "name": "vulkan-headers",
+      "owner_repo": "KhronosGroup/Vulkan-Headers",
+      "url": "https://github.com/KhronosGroup/Vulkan-Headers.git"
+    },
+    {
+      "name": "vulkan-headers.bare",
+      "owner_repo": "KhronosGroup/Vulkan-Headers",
+      "url": "https://github.com/KhronosGroup/Vulkan-Headers"
+    },
+    {
+      "name": "vulkan-hpp",
+      "owner_repo": "KhronosGroup/Vulkan-Hpp",
+      "url": "https://github.com/KhronosGroup/Vulkan-Hpp.git"
+    },
+    {
+      "name": "vulkan-loader",
+      "owner_repo": "KhronosGroup/Vulkan-Loader",
+      "url": "https://github.com/KhronosGroup/Vulkan-Loader.git"
+    },
+    {
+      "name": "vulkan-loader.bare",
+      "owner_repo": "KhronosGroup/Vulkan-Loader",
+      "url": "https://github.com/KhronosGroup/Vulkan-Loader"
+    },
+    {
+      "name": "vulkan-samples",
+      "owner_repo": "KhronosGroup/Vulkan-Samples",
+      "url": "https://github.com/KhronosGroup/Vulkan-Samples"
+    },
+    {
+      "name": "vulkan-validation-layers",
+      "owner_repo": "KhronosGroup/Vulkan-ValidationLayers",
+      "url": "https://github.com/KhronosGroup/Vulkan-ValidationLayers.git"
+    },
+    {
+      "name": "vulkan-validation-layers.bare",
+      "owner_repo": "KhronosGroup/Vulkan-ValidationLayers",
+      "url": "https://github.com/KhronosGroup/Vulkan-ValidationLayers"
+    },
+    {
+      "name": "webkit",
+      "owner_repo": "WebKit/WebKit",
+      "url": "https://github.com/WebKit/WebKit.git"
+    },
+    {
+      "name": "whisper-cpp-latest",
+      "owner_repo": "ggerganov/whisper.cpp",
+      "url": "https://github.com/ggerganov/whisper.cpp.git"
+    },
+    {
+      "name": "whisper-cpp-latest.bare",
+      "owner_repo": "ggerganov/whisper.cpp",
+      "url": "https://github.com/ggerganov/whisper.cpp"
+    },
+    {
+      "name": "whisper.cpp",
+      "owner_repo": "ggerganov/whisper.cpp",
+      "url": "https://github.com/ggerganov/whisper.cpp"
+    },
+    {
+      "name": "wicked-engine",
+      "owner_repo": "turanszkij/WickedEngine",
+      "url": "https://github.com/turanszkij/WickedEngine"
+    },
+    {
+      "name": "wil",
+      "owner_repo": "microsoft/wil",
+      "url": "https://github.com/microsoft/wil.git"
+    },
+    {
+      "name": "windows-classic-samples",
+      "owner_repo": "microsoft/Windows-classic-samples",
+      "url": "https://github.com/microsoft/Windows-classic-samples.git"
+    },
+    {
+      "name": "Windows-classic-samples",
+      "owner_repo": "microsoft/Windows-classic-samples",
+      "url": "https://github.com/microsoft/Windows-classic-samples.git"
+    },
+    {
+      "name": "Windows-Driver-Frameworks",
+      "owner_repo": "microsoft/Windows-Driver-Frameworks",
+      "url": "https://github.com/microsoft/Windows-Driver-Frameworks.git"
+    },
+    {
+      "name": "windows-driver-samples",
+      "owner_repo": "microsoft/Windows-driver-samples",
+      "url": "https://github.com/microsoft/Windows-driver-samples.git"
+    },
+    {
+      "name": "windows-research-kernel",
+      "owner_repo": "ayyucedemirbas/Windows-Research-Kernel-WRK-",
+      "url": "https://github.com/ayyucedemirbas/Windows-Research-Kernel-WRK-.git"
+    },
+    {
+      "name": "windows-terminal",
+      "owner_repo": "microsoft/terminal",
+      "url": "https://github.com/microsoft/terminal"
+    },
+    {
+      "name": "WindowsAppSDK",
+      "owner_repo": "microsoft/WindowsAppSDK",
+      "url": "https://github.com/microsoft/WindowsAppSDK.git"
+    },
+    {
+      "name": "wine",
+      "owner_repo": "wine-mirror/wine",
+      "url": "https://github.com/wine-mirror/wine.git"
+    },
+    {
+      "name": "winget-cli",
+      "owner_repo": "microsoft/winget-cli",
+      "url": "https://github.com/microsoft/winget-cli.git"
+    },
+    {
+      "name": "wiredtiger",
+      "owner_repo": "wiredtiger/wiredtiger",
+      "url": "https://github.com/wiredtiger/wiredtiger"
+    },
+    {
+      "name": "wireshark",
+      "owner_repo": "wireshark/wireshark",
+      "url": "https://github.com/wireshark/wireshark"
+    },
+    {
+      "name": "wolfssl",
+      "owner_repo": "wolfSSL/wolfssl",
+      "url": "https://github.com/wolfSSL/wolfssl.git"
+    },
+    {
+      "name": "wrk",
+      "owner_repo": "wg/wrk",
+      "url": "https://github.com/wg/wrk.git"
+    },
+    {
+      "name": "wslg",
+      "owner_repo": "microsoft/wslg",
+      "url": "https://github.com/microsoft/wslg.git"
+    },
+    {
+      "name": "wxWidgets",
+      "owner_repo": "wxWidgets/wxWidgets",
+      "url": "https://github.com/wxWidgets/wxWidgets.git"
+    },
+    {
+      "name": "x64dbg",
+      "owner_repo": "x64dbg/x64dbg",
+      "url": "https://github.com/x64dbg/x64dbg"
+    },
+    {
+      "name": "xemu",
+      "owner_repo": "xemu-project/xemu",
+      "url": "https://github.com/xemu-project/xemu"
+    },
+    {
+      "name": "xen",
+      "owner_repo": "xen-project/xen",
+      "url": "https://github.com/xen-project/xen.git"
+    },
+    {
+      "name": "xgboost",
+      "owner_repo": "dmlc/xgboost",
+      "url": "https://github.com/dmlc/xgboost.git"
+    },
+    {
+      "name": "xiaomi-mace",
+      "owner_repo": "XiaoMi/mace",
+      "url": "https://github.com/XiaoMi/mace.git"
+    },
+    {
+      "name": "xiaomi-mace.bare",
+      "owner_repo": "XiaoMi/mace",
+      "url": "https://github.com/XiaoMi/mace"
+    },
+    {
+      "name": "xnnpack",
+      "owner_repo": "google/XNNPACK",
+      "url": "https://github.com/google/XNNPACK.git"
+    },
+    {
+      "name": "xnnpack.bare",
+      "owner_repo": "google/XNNPACK",
+      "url": "https://github.com/google/XNNPACK"
+    },
+    {
+      "name": "xnu",
+      "owner_repo": "apple-oss-distributions/xnu",
+      "url": "https://github.com/apple-oss-distributions/xnu.git"
+    },
+    {
+      "name": "xz",
+      "owner_repo": "tukaani-project/xz",
+      "url": "https://github.com/tukaani-project/xz"
+    },
+    {
+      "name": "yara",
+      "owner_repo": "VirusTotal/yara",
+      "url": "https://github.com/VirusTotal/yara.git"
+    },
+    {
+      "name": "z3",
+      "owner_repo": "Z3Prover/z3",
+      "url": "https://github.com/Z3Prover/z3.git"
+    },
+    {
+      "name": "zeek",
+      "owner_repo": "zeek/zeek",
+      "url": "https://github.com/zeek/zeek.git"
+    },
+    {
+      "name": "zephyr",
+      "owner_repo": "zephyrproject-rtos/zephyr",
+      "url": "https://github.com/zephyrproject-rtos/zephyr.git"
+    },
+    {
+      "name": "zlib",
+      "owner_repo": "madler/zlib",
+      "url": "https://github.com/madler/zlib"
+    },
+    {
+      "name": "zstd",
+      "owner_repo": "facebook/zstd",
+      "url": "https://github.com/facebook/zstd"
+    }
+  ],
+  "unresolved": [
+    {
+      "name": "aosp-frameworks-av",
+      "reason": "remote-url-not-github",
+      "url": "https://android.googlesource.com/platform/frameworks/av"
+    },
+    {
+      "name": "aosp-frameworks-av.bare",
+      "reason": "remote-url-not-github",
+      "url": "https://android.googlesource.com/platform/frameworks/av"
+    },
+    {
+      "name": "aosp-frameworks-ml",
+      "reason": "remote-url-not-github",
+      "url": "https://android.googlesource.com/platform/frameworks/ml"
+    },
+    {
+      "name": "aosp-frameworks-ml.bare",
+      "reason": "remote-url-not-github",
+      "url": "https://android.googlesource.com/platform/frameworks/ml"
+    },
+    {
+      "name": "aosp-frameworks-native",
+      "reason": "remote-url-not-github",
+      "url": "https://android.googlesource.com/platform/frameworks/native"
+    },
+    {
+      "name": "aosp-frameworks-native.bare",
+      "reason": "remote-url-not-github",
+      "url": "https://android.googlesource.com/platform/frameworks/native"
+    },
+    {
+      "name": "aosp-hardware-interfaces",
+      "reason": "remote-url-not-github",
+      "url": "https://android.googlesource.com/platform/hardware/interfaces"
+    },
+    {
+      "name": "aosp-hardware-interfaces.bare",
+      "reason": "remote-url-not-github",
+      "url": "https://android.googlesource.com/platform/hardware/interfaces"
+    },
+    {
+      "name": "aosp-system-core",
+      "reason": "remote-url-not-github",
+      "url": "https://android.googlesource.com/platform/system/core"
+    },
+    {
+      "name": "aosp-system-core.bare",
+      "reason": "remote-url-not-github",
+      "url": "https://android.googlesource.com/platform/system/core"
+    },
+    {
+      "name": "binutils-gdb",
+      "reason": "remote-url-not-github",
+      "url": "https://sourceware.org/git/binutils-gdb.git"
+    },
+    {
+      "name": "blender",
+      "reason": "remote-url-not-github",
+      "url": "https://projects.blender.org/blender/blender.git"
+    },
+    {
+      "name": "ddk_wdk",
+      "reason": "no-git-config",
+      "url": null
+    },
+    {
+      "name": "eigen",
+      "reason": "remote-url-not-github",
+      "url": "https://gitlab.com/libeigen/eigen.git"
+    },
+    {
+      "name": "glibc",
+      "reason": "remote-url-not-github",
+      "url": "https://sourceware.org/git/glibc.git"
+    },
+    {
+      "name": "kate",
+      "reason": "remote-url-not-github",
+      "url": "https://invent.kde.org/utilities/kate.git"
+    },
+    {
+      "name": "kde-kconfig",
+      "reason": "remote-url-not-github",
+      "url": "https://invent.kde.org/frameworks/kconfig.git"
+    },
+    {
+      "name": "kde-kcoreaddons",
+      "reason": "remote-url-not-github",
+      "url": "https://invent.kde.org/frameworks/kcoreaddons.git"
+    },
+    {
+      "name": "kde-ki18n",
+      "reason": "remote-url-not-github",
+      "url": "https://invent.kde.org/frameworks/ki18n.git"
+    },
+    {
+      "name": "kde-kio",
+      "reason": "remote-url-not-github",
+      "url": "https://invent.kde.org/frameworks/kio.git"
+    },
+    {
+      "name": "kde-knotifications",
+      "reason": "remote-url-not-github",
+      "url": "https://invent.kde.org/frameworks/knotifications.git"
+    },
+    {
+      "name": "kde-kwidgetsaddons",
+      "reason": "remote-url-not-github",
+      "url": "https://invent.kde.org/frameworks/kwidgetsaddons.git"
+    },
+    {
+      "name": "kde-kxmlgui",
+      "reason": "remote-url-not-github",
+      "url": "https://invent.kde.org/frameworks/kxmlgui.git"
+    },
+    {
+      "name": "krita",
+      "reason": "remote-url-not-github",
+      "url": "https://invent.kde.org/graphics/krita.git"
+    },
+    {
+      "name": "mesa",
+      "reason": "remote-url-not-github",
+      "url": "https://gitlab.freedesktop.org/mesa/mesa.git"
+    },
+    {
+      "name": "microsoft-gaming-zone-d6f8312",
+      "reason": "no-git-config",
+      "url": null
+    },
+    {
+      "name": "misc_microsoft_gamedev_source_code",
+      "reason": "no-git-config",
+      "url": null
+    },
+    {
+      "name": "ms_dos_3_30_oem_adaptation_kit_source_code",
+      "reason": "no-git-config",
+      "url": null
+    },
+    {
+      "name": "musl",
+      "reason": "remote-url-not-github",
+      "url": "git://git.musl-libc.org/musl"
+    },
+    {
+      "name": "nt5src",
+      "reason": "no-git-config",
+      "url": null
+    },
+    {
+      "name": "tor",
+      "reason": "remote-url-not-github",
+      "url": "https://gitlab.torproject.org/tpo/core/tor.git"
+    },
+    {
+      "name": "valgrind",
+      "reason": "remote-url-not-github",
+      "url": "https://sourceware.org/git/valgrind.git"
+    },
+    {
+      "name": "windows_10_shared_source_kit",
+      "reason": "no-git-config",
+      "url": null
+    },
+    {
+      "name": "windows_2000_source_code",
+      "reason": "no-git-config",
+      "url": null
+    },
+    {
+      "name": "windows_ce_3_platform_builder_source_code",
+      "reason": "no-git-config",
+      "url": null
+    },
+    {
+      "name": "windows_ce_4_2_081231",
+      "reason": "no-git-config",
+      "url": null
+    },
+    {
+      "name": "windows_ce_5_121231",
+      "reason": "no-git-config",
+      "url": null
+    },
+    {
+      "name": "windows_embedded_7_2014M12",
+      "reason": "no-git-config",
+      "url": null
+    },
+    {
+      "name": "windows_embedded_ce_6_r3_170331",
+      "reason": "no-git-config",
+      "url": null
+    },
+    {
+      "name": "windows_embedded_compact_2013_2015M09",
+      "reason": "no-git-config",
+      "url": null
+    },
+    {
+      "name": "windows_nt_4_source_code",
+      "reason": "no-git-config",
+      "url": null
+    },
+    {
+      "name": "Xbox Live Source",
+      "reason": "no-git-config",
+      "url": null
+    },
+    {
+      "name": "xbox_leak_may_2020",
+      "reason": "no-git-config",
+      "url": null
+    },
+    {
+      "name": "xboz",
+      "reason": "no-git-config",
+      "url": null
+    }
+  ]
+}
