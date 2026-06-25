@@ -921,12 +921,10 @@ def test_tp2_sp_on_parity_vs_tp1():
     constraints.
 
     ------------------------------------------------------------------
-    KNOWN BUG (task #86, 2026-04-12): this test is EXPECTED TO FAIL on
-    ``grad.angle_proj.weight`` at the current revision because Stream B
-    wired the SP gather with ``tensor_parallel_output_grad=False`` at
-    ``cppmega/megatron/cppmega_mamba3_tp_mixer.py:443``.  The forward is
-    correct (angle_proj is identical across ranks; the gather just
-    reassembles the full L), but the backward flag is wrong for the way
+    Regression context (task #86, 2026-04-12): Stream B previously wired the
+    SP gather with an explicit disabled-output-grad flag in the mixer.  The
+    forward was correct (angle_proj is identical across ranks; the gather just
+    reassembled the full L), but the backward flag was wrong for the way
     ``angles_raw`` is consumed downstream:
 
     * After gather, ``angles`` is expanded to ``self.nheads_local_tp``
@@ -939,16 +937,13 @@ def test_tp2_sp_on_parity_vs_tp1():
       in that mode is ``reduce_scatter`` (sum-then-scatter), which is
       what ``tensor_parallel_output_grad=True`` selects (see
       ``megatron/core/tensor_parallel/mappings.py:336``).
-    * ``tensor_parallel_output_grad=False`` selects plain ``split`` --
+    * The explicit disabled-output-grad path selected plain ``split`` --
       it just slices each rank's local grad by its seq chunk and drops
       the contribution from other ranks' heads.
 
-    Fix (owned by Stream B, NOT this test): pass
-    ``tensor_parallel_output_grad=True`` (or omit the kwarg so the
-    default kicks in) on line 443 of the mixer.  The TP=2 launcher at
-    ``scripts/remote_train_h200_nam56r_tp2.sh`` is CURRENTLY emitting
-    incorrect ``angle_proj.weight`` gradients -- any numbers from that
-    run are not numerically trustworthy until this is fixed.
+    The production mixer now omits the kwarg so Megatron's reduce-scatter
+    backward default is used.  This parity test must keep mirroring that
+    production path, not the stale explicit-False regression.
     ------------------------------------------------------------------
     """
     import torch
@@ -1046,12 +1041,9 @@ def _angle_proj_worker(rank: int, world_size: int, master_port: int, sp_on: bool
     capturing ``angles_raw`` (shape (L, B, num_rope_angles)) and stashing
     it on rank 0.
 
-    We achieve this with a forward pre-hook-style approach: we monkey-patch
-    the mixer instance's ``angle_proj`` to record its post-gather output.
-    Rather than reach into mixer.forward (which also requires a full SSD
-    scan), we re-implement just the first 10 lines of the forward here
-    on a freshly constructed mixer, since that exactly isolates the
-    Stream B SP path.
+    Rather than reach into mixer.forward (which also requires a full SSD scan),
+    this worker re-implements just the first 10 lines of the forward on a
+    freshly constructed mixer, since that exactly isolates the Stream B SP path.
     """
     import torch
     import torch.distributed as dist
@@ -1130,7 +1122,7 @@ def _angle_proj_worker(rank: int, world_size: int, master_port: int, sp_on: bool
                 gather_from_sequence_parallel_region,
             )
             angles_raw = gather_from_sequence_parallel_region(
-                angles_raw, tensor_parallel_output_grad=False, group=mixer.tp_group,
+                angles_raw, group=mixer.tp_group,
             )
 
         # Every rank should now hold the FULL (L, B, num_rope_angles) tensor.

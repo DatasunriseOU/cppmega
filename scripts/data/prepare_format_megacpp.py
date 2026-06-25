@@ -25,8 +25,6 @@ import os
 import sys
 from pathlib import Path
 
-import pyarrow.parquet as pq
-
 
 # Reuse the existing parquet→Megatron converter shipped in scripts/.
 _HERE = Path(__file__).resolve().parent
@@ -52,7 +50,13 @@ DEFAULT_SIDE_CHANNELS: tuple[tuple[str, str], ...] = (
     ("token_ast_depth", "uint16"),
     ("token_sibling_index", "uint16"),
     ("token_ast_node_type", "uint16"),
+    ("token_symbol_ids", "uint32"),
+    ("token_call_targets", "uint32"),
+    ("token_type_refs", "uint32"),
     ("token_def_use", "uint8"),
+    ("token_change_mask_pre", "uint8"),
+    ("token_change_mask_post", "uint8"),
+    ("token_platform_ids", "uint16"),
 )
 
 
@@ -93,6 +97,8 @@ def _resolve_side_channels(
     shards = sorted(input_dir.glob("*.parquet"))
     if not shards:
         raise FileNotFoundError(f"no parquet shards in {input_dir}")
+    import pyarrow.parquet as pq
+
     present = set(pq.ParquetFile(shards[0]).schema_arrow.names)
 
     resolved: list[tuple[str, str]] = []

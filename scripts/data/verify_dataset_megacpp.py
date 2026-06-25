@@ -4,7 +4,7 @@
 Checks:
   1. ``<prefix>_train.bin`` and ``<prefix>_train.idx`` exist and are non-empty.
   2. ``.idx`` parses (via megatron-core if available, else raw struct check).
-  3. Token-ID range lies within expected vocab (default 131072).
+  3. Token-ID range lies within expected vocab (default 65536).
   4. Document count and total-token count are printed.
   5. First 64 tokens of document 0 are printed for sanity.
 
@@ -12,7 +12,7 @@ Exits non-zero on failure (no silent fallbacks).
 
 Usage:
     python verify_dataset_megacpp.py
-    python verify_dataset_megacpp.py --vocab-size 131072
+    python verify_dataset_megacpp.py --vocab-size 65536
 """
 
 from __future__ import annotations
@@ -31,6 +31,14 @@ DEFAULT_DATA_ROOT = os.environ.get(
 DEFAULT_DATASET_NAME = os.environ.get(
     "MEGACPP_DATASET_NAME", "clang_semantic_4k_v10"
 )
+DEFAULT_VOCAB_SIZE = 65536
+
+_RAW_DTYPE_BY_CODE = {
+    1: np.uint8,
+    4: np.int32,
+    5: np.int64,
+    8: np.uint16,
+}
 
 
 def _raw_idx_inspect(idx_path: Path) -> tuple[int, int]:
@@ -46,12 +54,31 @@ def _raw_idx_inspect(idx_path: Path) -> tuple[int, int]:
     return num_sequences, dtype_code
 
 
-def main() -> int:
+def _raw_token_range(bin_path: Path, dtype_code: int) -> tuple[int, int]:
+    try:
+        dtype = _RAW_DTYPE_BY_CODE[dtype_code]
+    except KeyError as exc:
+        supported = ", ".join(str(code) for code in sorted(_RAW_DTYPE_BY_CODE))
+        raise RuntimeError(
+            f"unsupported raw MMIDIDX dtype_code {dtype_code}; supported: {supported}"
+        ) from exc
+    arr = np.memmap(bin_path, dtype=dtype, mode="r")
+    if arr.size == 0:
+        raise RuntimeError(f"{bin_path} is empty")
+    return int(arr.min()), int(arr.max())
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", default=DEFAULT_DATA_ROOT)
     parser.add_argument("--dataset-name", default=DEFAULT_DATASET_NAME)
-    parser.add_argument("--vocab-size", type=int, default=131072)
+    parser.add_argument("--vocab-size", type=int, default=DEFAULT_VOCAB_SIZE)
     parser.add_argument("--splits", default="train,val")
+    return parser
+
+
+def main() -> int:
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     data_root = Path(args.data_root).resolve()
@@ -100,6 +127,12 @@ def main() -> int:
             print(f"  megatron-core unavailable ({e}); falling back to raw idx check")
             n_docs, dtype_code = _raw_idx_inspect(idx_path)
             print(f"  raw: num_sequences={n_docs:,} dtype_code={dtype_code}")
+            mn, mx = _raw_token_range(bin_path, dtype_code)
+            print(f"  token id range: [{mn}, {mx}]")
+            if mx >= args.vocab_size:
+                sys.exit(
+                    f"ERROR: max token id {mx} >= vocab_size {args.vocab_size}"
+                )
 
     print("\n[megacpp_verify] OK")
     return 0

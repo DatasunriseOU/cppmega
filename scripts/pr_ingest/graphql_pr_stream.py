@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GraphQL-primary, resumable PR fetch stream -> pr_store (GH Archive fallback hook).
+"""GraphQL-primary, resumable PR fetch stream -> pr_store (GH Archive fallback path).
 
 HYBRID strategy (David): GitHub GraphQL is PRIMARY (free, 5000 pts/hr/token).
 Multiple tokens (secrets/gh_tokens.txt PATs + the gh CLI token) are ROTATED so
@@ -27,7 +27,7 @@ import json
 import subprocess
 import sys
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 
@@ -41,7 +41,7 @@ def _now_utc() -> str:
 
 
 class TokenExhausted(RuntimeError):
-    """All tokens are rate-limited. Carries soonest reset epoch (fallback hook)."""
+    """All tokens are rate-limited. Carries soonest reset epoch for fallback."""
 
     def __init__(self, soonest_reset_epoch: Optional[int]):
         self.soonest_reset_epoch = soonest_reset_epoch
@@ -52,7 +52,7 @@ class TokenExhausted(RuntimeError):
         )
         super().__init__(
             f"ALL GraphQL tokens rate-limited; soonest reset at {when}. "
-            f"Fall back to GH Archive (gharchive_run.sh) or wait."
+            f"Run GH Archive fallback (gharchive_run.sh with PR_STORE_DB) or wait."
         )
 
 
@@ -140,6 +140,7 @@ def fetch_repo(
     max_prs: Optional[int],
     comment_cap: int,
     verbose: bool = True,
+    graphql_post: Callable[[str, str, dict], requests.Response] = _graphql_post,
 ) -> dict:
     """Fetch PRs for owner/name into store, resuming from the saved cursor."""
     repo = f"{owner}/{name}"
@@ -157,10 +158,12 @@ def fetch_repo(
     refetch_guard = after  # for resume proof: first request reuses saved cursor
 
     while True:
+        if max_prs is not None and fetched_this_run >= max_prs:
+            break
         if max_pages is not None and pages_this_run >= max_pages:
             break
         i, token = rotator.current()
-        resp = _graphql_post(token, _PR_QUERY, {"owner": owner, "name": name, "after": after})
+        resp = graphql_post(token, _PR_QUERY, {"owner": owner, "name": name, "after": after})
         if resp.status_code == 401:
             raise RuntimeError(f"[{repo}] token #{i} unauthorized (401): {resp.text[:300]}")
         if resp.status_code in (403, 429):
@@ -193,6 +196,8 @@ def fetch_repo(
         nodes = prs["nodes"]
         page_info = prs["pageInfo"]
 
+        processed_nodes = 0
+        hit_pr_cap = False
         for nd in nodes:
             number = nd["number"]
             comments = [
@@ -224,23 +229,35 @@ def fetch_repo(
             )
             pr_count += 1
             fetched_this_run += 1
+            processed_nodes += 1
             if max_prs is not None and fetched_this_run >= max_prs:
+                hit_pr_cap = True
                 break
+
+        if hit_pr_cap and processed_nodes < len(nodes):
+            store.commit()
+            if verbose:
+                sys.stderr.write(
+                    f"[{repo}] max_prs reached mid-page after {processed_nodes}/"
+                    f"{len(nodes)} PRs; cursor not advanced.\n"
+                )
+                sys.stderr.flush()
+            break
 
         page_count += 1
         pages_this_run += 1
         has_next = page_info["hasNextPage"]
         after = page_info["endCursor"]
-        done = (not has_next) or (max_prs is not None and fetched_this_run >= max_prs)
+        done = not has_next
         store.set_cursor(repo, "pr", after, page_count, pr_count, done, _now_utc())
         store.commit()
         if verbose:
             sys.stderr.write(
-                f"[{repo}] page {page_count} (+{len(nodes)} PRs, total {pr_count}) "
+                f"[{repo}] page {page_count} (+{processed_nodes} PRs, total {pr_count}) "
                 f"rl_remaining={rl.get('remaining')} tok#{i} cursor={after}\n"
             )
             sys.stderr.flush()
-        if done:
+        if done or hit_pr_cap:
             break
 
     return {

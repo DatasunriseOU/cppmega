@@ -31,8 +31,6 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-import pyarrow.parquet as pq
-
 
 TOKEN_COLUMN = "token_ids"
 ACTUAL_TOKEN_COUNT_COLUMN = "actual_token_count"
@@ -74,6 +72,13 @@ def build(
     repo_sample: int,
     batch_size: int,
 ) -> dict[str, object]:
+    if contract is None:
+        _fail("manifest fingerprints", "contract fingerprint required")
+    if tokenizer is None:
+        _fail("manifest fingerprints", "tokenizer fingerprint required")
+
+    import pyarrow.parquet as pq
+
     shards = find_shards(dataset_dir)
     base_schema = pq.ParquetFile(shards[0]).schema_arrow
     base_columns = _schema_columns(base_schema)
@@ -132,20 +137,18 @@ def build(
         total_size += size
 
     fingerprints: dict[str, object] = {}
-    if contract is not None:
-        if not contract.is_file():
-            _fail(str(contract), "contract file not found")
-        fingerprints["contract"] = {
-            "path": str(contract),
-            "sha256": _sha256(contract),
-        }
-    if tokenizer is not None:
-        if not tokenizer.is_file():
-            _fail(str(tokenizer), "tokenizer artifact not found")
-        fingerprints["tokenizer"] = {
-            "path": str(tokenizer),
-            "sha256": _sha256(tokenizer),
-        }
+    if not contract.is_file():
+        _fail(str(contract), "contract file not found")
+    fingerprints["contract"] = {
+        "path": str(contract),
+        "sha256": _sha256(contract),
+    }
+    if not tokenizer.is_file():
+        _fail(str(tokenizer), "tokenizer artifact not found")
+    fingerprints["tokenizer"] = {
+        "path": str(tokenizer),
+        "sha256": _sha256(tokenizer),
+    }
 
     distinct_repos = [r for r in repo_counter if r != "<empty>"]
     manifest = {
@@ -170,8 +173,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-dir", required=True)
     parser.add_argument("--seq-len", type=int, default=4096)
-    parser.add_argument("--contract", default=None, help="tokenizer_contract_v1.json")
-    parser.add_argument("--tokenizer", default=None, help="tokenizer.json artifact")
+    parser.add_argument("--contract", required=True, help="tokenizer_contract_v1.json")
+    parser.add_argument("--tokenizer", required=True, help="tokenizer.json artifact")
     parser.add_argument("--repo-sample", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument(
@@ -188,8 +191,8 @@ def main() -> int:
         manifest = build(
             dataset_dir=dataset_dir,
             seq_len=args.seq_len,
-            contract=Path(args.contract).resolve() if args.contract else None,
-            tokenizer=Path(args.tokenizer).resolve() if args.tokenizer else None,
+            contract=Path(args.contract).resolve(),
+            tokenizer=Path(args.tokenizer).resolve(),
             repo_sample=args.repo_sample,
             batch_size=args.batch_size,
         )

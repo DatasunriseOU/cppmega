@@ -1,0 +1,1227 @@
+{
+  "phase": "rank_usage",
+  "method": "single streaming read-only pass over the corpus tarball (zstd -dc | tarfile r|). Per source file we scan the top 49152 bytes with ONE #include regex (paths classified to base-lib families by a dispatch fn) and ONE combined symbol-prefix regex (std::/boost::/absl::/Eigen::/folly::/fmt::/google::protobuf::/gsl::/thrust::). Self-references excluded via per-family provider sets. Breadth = distinct referencing repos; volume = total includes / symbol refs.",
+  "sampled_or_full": "FULL (entire tarball streamed within budget)",
+  "elapsed_seconds": 884.9,
+  "time_budget_seconds": 14400.0,
+  "members_streamed": 7703235,
+  "repos_seen": 594,
+  "source_files_scanned": 2749108,
+  "source_files_skipped_too_big": 15,
+  "bytes_scanned": 25069556276,
+  "per_file_bytes_cap": 49152,
+  "files_per_sec": 3106.7,
+  "ranked": [
+    {
+      "family": "libc_posix",
+      "providers": [
+        "4.4bsd-lite2",
+        "apple-libc",
+        "freebsd-src",
+        "gcc-mirror",
+        "glibc",
+        "illumos-gate",
+        "linux",
+        "llvm-project",
+        "musl",
+        "netbsd",
+        "openbsd",
+        "src",
+        "xnu"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 481,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 481,
+      "total_includes": 864640,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "CMake",
+        "Catch2",
+        "Detours",
+        "DirectX-Graphics-Samples",
+        "DirectX-Headers",
+        "DirectXMath",
+        "DirectXShaderCompiler",
+        "DirectXTK",
+        "DirectXTK12",
+        "DirectXTex",
+        "FreeRTOS",
+        "ITK"
+      ]
+    },
+    {
+      "family": "libstdcxx_STL",
+      "providers": [
+        "STL",
+        "cccl",
+        "cccl.bare",
+        "gcc-mirror",
+        "intel-llvm-dpcpp",
+        "libcudacxx",
+        "llvm-project",
+        "rocm-llvm",
+        "sgi-stl",
+        "stl",
+        "stlport"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 414,
+      "distinct_repos_symbol": 418,
+      "distinct_repos_union": 423,
+      "total_includes": 978244,
+      "total_symbol_refs": 8310086,
+      "example_repos_include": [
+        "CMake",
+        "Catch2",
+        "Detours",
+        "DirectX-Graphics-Samples",
+        "DirectX-Headers",
+        "DirectXMath",
+        "DirectXShaderCompiler",
+        "DirectXTK",
+        "DirectXTK12",
+        "DirectXTex",
+        "FreeRTOS",
+        "GSL"
+      ]
+    },
+    {
+      "family": "windows_base",
+      "providers": [
+        "STL",
+        "ddk_wdk",
+        "nt5src",
+        "stl",
+        "windows-research-kernel",
+        "windows_10_shared_source_kit",
+        "windows_2000_source_code",
+        "windows_nt_4_source_code"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 416,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 416,
+      "total_includes": 63111,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "CMake",
+        "Catch2",
+        "Detours",
+        "DirectX-Graphics-Samples",
+        "DirectX-Headers",
+        "DirectXMath",
+        "DirectXShaderCompiler",
+        "DirectXTK",
+        "DirectXTK12",
+        "DirectXTex",
+        "FreeRTOS",
+        "ITK"
+      ]
+    },
+    {
+      "family": "zlib",
+      "providers": [
+        "zlib"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 200,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 200,
+      "total_includes": 3031,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "CMake",
+        "DirectXShaderCompiler",
+        "ITK",
+        "SEAL",
+        "VTK",
+        "aosp-frameworks-native",
+        "aosp-system-core",
+        "apollo",
+        "apple-security",
+        "arangodb",
+        "aria2",
+        "arm-compute-library"
+      ]
+    },
+    {
+      "family": "googletest",
+      "providers": [
+        "googletest"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 191,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 191,
+      "total_includes": 62365,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "CMake",
+        "DirectX-Headers",
+        "DirectXShaderCompiler",
+        "GSL",
+        "ITK",
+        "LightGBM",
+        "SEAL",
+        "abseil-cpp",
+        "aosp-frameworks-av",
+        "aosp-frameworks-ml",
+        "aosp-frameworks-native",
+        "aosp-hardware-interfaces"
+      ]
+    },
+    {
+      "family": "boost",
+      "providers": [
+        "boost"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 107,
+      "distinct_repos_symbol": 165,
+      "distinct_repos_union": 166,
+      "total_includes": 238917,
+      "total_symbol_refs": 338402,
+      "example_repos_include": [
+        "CMake",
+        "LightGBM",
+        "ProcMon-for-Linux",
+        "SPTAG",
+        "STL",
+        "VTK",
+        "apollo",
+        "arangodb",
+        "arrow",
+        "asio",
+        "bitcoin",
+        "blender"
+      ]
+    },
+    {
+      "family": "openssl_crypto",
+      "providers": [
+        "boringssl",
+        "openssl",
+        "portable"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 152,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 152,
+      "total_includes": 78494,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "CMake",
+        "ITK",
+        "SymCrypt",
+        "VTK",
+        "aosp-frameworks-av",
+        "aosp-frameworks-ml",
+        "aosp-frameworks-native",
+        "aosp-hardware-interfaces",
+        "aosp-system-core",
+        "apple-security",
+        "arangodb",
+        "aria2"
+      ]
+    },
+    {
+      "family": "abseil",
+      "providers": [
+        "abseil-cpp"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 78,
+      "distinct_repos_symbol": 105,
+      "distinct_repos_union": 105,
+      "total_includes": 81923,
+      "total_symbol_refs": 377062,
+      "example_repos_include": [
+        "ITK",
+        "apollo",
+        "arangodb",
+        "arrow",
+        "aseprite",
+        "assimp",
+        "bazel",
+        "betaflight",
+        "blender",
+        "boost",
+        "boringssl",
+        "carbon-lang"
+      ]
+    },
+    {
+      "family": "cpython",
+      "providers": [
+        "cpython"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 99,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 99,
+      "total_includes": 1021,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "CMake",
+        "ITK",
+        "VTK",
+        "apollo",
+        "arangodb",
+        "arrow",
+        "aseprite",
+        "binutils-gdb",
+        "blender",
+        "boost",
+        "bullet3",
+        "caffe"
+      ]
+    },
+    {
+      "family": "zstd",
+      "providers": [
+        "zstd"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 95,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 95,
+      "total_includes": 766,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "CMake",
+        "ITK",
+        "SEAL",
+        "SPTAG",
+        "VTK",
+        "aosp-system-core",
+        "arangodb",
+        "arrow",
+        "aseprite",
+        "binutils-gdb",
+        "bionic",
+        "blender"
+      ]
+    },
+    {
+      "family": "fmt",
+      "providers": [
+        "fmt",
+        "spdlog"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 58,
+      "distinct_repos_symbol": 73,
+      "distinct_repos_union": 75,
+      "total_includes": 3637,
+      "total_symbol_refs": 59163,
+      "example_repos_include": [
+        "LightGBM",
+        "VTK",
+        "aosp-frameworks-av",
+        "aosp-frameworks-native",
+        "apple-mlx",
+        "arm-nn",
+        "aseprite",
+        "blender",
+        "boost",
+        "ceph",
+        "clickhouse",
+        "cuda-quantum"
+      ]
+    },
+    {
+      "family": "cuda_cccl",
+      "providers": [
+        "cccl",
+        "cccl.bare",
+        "libcudacxx"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 72,
+      "distinct_repos_symbol": 49,
+      "distinct_repos_union": 72,
+      "total_includes": 18774,
+      "total_symbol_refs": 46217,
+      "example_repos_include": [
+        "CMake",
+        "SPTAG",
+        "VTK",
+        "amrex",
+        "apache-tvm",
+        "apex",
+        "apollo",
+        "apple-mlx",
+        "arangodb",
+        "boost",
+        "caffe",
+        "ceres-solver"
+      ]
+    },
+    {
+      "family": "libevent",
+      "providers": [
+        "libevent"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 71,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 71,
+      "total_includes": 4427,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "ITK",
+        "Windows-classic-samples",
+        "Xbox Live Source",
+        "aosp-system-core",
+        "aseprite",
+        "bitcoin",
+        "curl",
+        "dolphin-emu",
+        "dotnet-runtime",
+        "envoy",
+        "folly",
+        "freebsd-src"
+      ]
+    },
+    {
+      "family": "curl",
+      "providers": [
+        "curl"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 71,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 71,
+      "total_includes": 1119,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "CMake",
+        "ITK",
+        "VTK",
+        "arangodb",
+        "arrow",
+        "aseprite",
+        "audacity",
+        "ceph",
+        "clamav",
+        "cmake",
+        "cntk",
+        "cpp-httplib"
+      ]
+    },
+    {
+      "family": "eigen",
+      "providers": [
+        "eigen"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 58,
+      "distinct_repos_symbol": 68,
+      "distinct_repos_union": 68,
+      "total_includes": 3773,
+      "total_symbol_refs": 55944,
+      "example_repos_include": [
+        "ITK",
+        "LightGBM",
+        "VTK",
+        "aosp-frameworks-av",
+        "aosp-frameworks-ml",
+        "aosp-frameworks-native",
+        "apollo",
+        "arangodb",
+        "assimp",
+        "blender",
+        "boost",
+        "bullet3"
+      ]
+    },
+    {
+      "family": "libpng",
+      "providers": [
+        "libpng"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 66,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 66,
+      "total_includes": 525,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "CMake",
+        "DirectXTex",
+        "ITK",
+        "VTK",
+        "arangodb",
+        "aseprite",
+        "blender",
+        "boost",
+        "clamav",
+        "cmake",
+        "cntk",
+        "dealii"
+      ]
+    },
+    {
+      "family": "libjpeg",
+      "providers": [
+        "libjpeg-turbo"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 65,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 65,
+      "total_includes": 2211,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "CMake",
+        "DirectXTex",
+        "ITK",
+        "VTK",
+        "aosp-frameworks-av",
+        "aosp-hardware-interfaces",
+        "arangodb",
+        "aseprite",
+        "blender",
+        "boost",
+        "clamav",
+        "cmake"
+      ]
+    },
+    {
+      "family": "protobuf",
+      "providers": [
+        "protobuf"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 51,
+      "distinct_repos_symbol": 56,
+      "distinct_repos_union": 61,
+      "total_includes": 27449,
+      "total_symbol_refs": 23217,
+      "example_repos_include": [
+        "CMake",
+        "aosp-frameworks-av",
+        "aosp-frameworks-ml",
+        "aosp-hardware-interfaces",
+        "apollo",
+        "arm-nn",
+        "arrow",
+        "caffe",
+        "capnproto",
+        "clickhouse",
+        "cmake",
+        "cntk"
+      ]
+    },
+    {
+      "family": "glib",
+      "providers": [
+        "glib"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 60,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 60,
+      "total_includes": 4242,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "CMake",
+        "FreeRTOS",
+        "arrow",
+        "aseprite",
+        "audacity",
+        "cmake",
+        "coreboot",
+        "cppcheck",
+        "curl",
+        "dolphin-emu",
+        "dotnet-runtime",
+        "erlang-otp"
+      ]
+    },
+    {
+      "family": "nlohmann_json",
+      "providers": [
+        "json"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 60,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 60,
+      "total_includes": 3369,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "CMake",
+        "DirectX-Graphics-Samples",
+        "VTK",
+        "apollo",
+        "apple-mlx",
+        "bazel",
+        "blender",
+        "boost",
+        "cccl",
+        "cgal",
+        "cmake",
+        "cuda-quantum"
+      ]
+    },
+    {
+      "family": "xz",
+      "providers": [
+        "xz"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 60,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 60,
+      "total_includes": 220,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "CMake",
+        "ITK",
+        "ProcMon-for-Linux",
+        "VTK",
+        "arangodb",
+        "aseprite",
+        "binutils-gdb",
+        "boost",
+        "botan",
+        "clickhouse",
+        "cmake",
+        "coreboot"
+      ]
+    },
+    {
+      "family": "mbedtls",
+      "providers": [
+        "mbedtls"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 54,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 54,
+      "total_includes": 16881,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "CMake",
+        "FreeRTOS",
+        "SFML",
+        "VTK",
+        "arm-trusted-firmware",
+        "aseprite",
+        "cmake",
+        "contiki-ng",
+        "cpp-httplib",
+        "curl",
+        "dolphin-emu",
+        "dragonflybsd"
+      ]
+    },
+    {
+      "family": "lz4",
+      "providers": [
+        "lz4"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 54,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 54,
+      "total_includes": 394,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "CMake",
+        "VTK",
+        "aosp-system-core",
+        "arangodb",
+        "arrow",
+        "aseprite",
+        "bionic",
+        "ceph",
+        "clickhouse",
+        "cmake",
+        "coreboot",
+        "cuda-library-samples"
+      ]
+    },
+    {
+      "family": "sqlite",
+      "providers": [
+        "sqlite"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 53,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 53,
+      "total_includes": 285,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "CMake",
+        "ProcMon-for-Linux",
+        "VTK",
+        "apollo",
+        "apple-dyld",
+        "apple-security",
+        "aria2",
+        "arrow",
+        "audacity",
+        "bitcoin",
+        "botan",
+        "ceph"
+      ]
+    },
+    {
+      "family": "freetype",
+      "providers": [
+        "freetype"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 52,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 52,
+      "total_includes": 6641,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "CMake",
+        "DirectX-Graphics-Samples",
+        "SFML",
+        "VTK",
+        "arangodb",
+        "aseprite",
+        "bgfx",
+        "blender",
+        "cmake",
+        "directx-graphics-samples",
+        "dolphin-emu",
+        "duckstation"
+      ]
+    },
+    {
+      "family": "catch2",
+      "providers": [
+        "Catch2"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 49,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 49,
+      "total_includes": 1396,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "Detours",
+        "ProcMon-for-Linux",
+        "SFML",
+        "arm-nn",
+        "aseprite",
+        "audacity",
+        "cccl",
+        "ceph",
+        "cntk",
+        "cppwinrt",
+        "crow",
+        "cub"
+      ]
+    },
+    {
+      "family": "gsl_microsoft",
+      "providers": [
+        "GSL",
+        "gsl"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 27,
+      "distinct_repos_symbol": 32,
+      "distinct_repos_union": 45,
+      "total_includes": 902,
+      "total_symbol_refs": 13388,
+      "example_repos_include": [
+        "CMake",
+        "SEAL",
+        "arangodb",
+        "boost",
+        "cgal",
+        "cmake",
+        "cntk",
+        "dealii",
+        "eigen",
+        "freecad",
+        "gstreamer",
+        "krita"
+      ]
+    },
+    {
+      "family": "rapidjson",
+      "providers": [
+        "rapidjson"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 42,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 42,
+      "total_includes": 1464,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "CMake",
+        "VTK",
+        "arangodb",
+        "arrow",
+        "assimp",
+        "audacity",
+        "ceph",
+        "cereal",
+        "chrono",
+        "clickhouse",
+        "cmake",
+        "composable-kernel"
+      ]
+    },
+    {
+      "family": "wolfssl",
+      "providers": [
+        "wolfssl"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 35,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 35,
+      "total_includes": 6548,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "CMake",
+        "FreeRTOS",
+        "VTK",
+        "arangodb",
+        "aseprite",
+        "asio",
+        "boost",
+        "chibios",
+        "cmake",
+        "cpp-httplib",
+        "curl",
+        "dealii"
+      ]
+    },
+    {
+      "family": "folly",
+      "providers": [
+        "folly"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 17,
+      "distinct_repos_symbol": 28,
+      "distinct_repos_union": 28,
+      "total_includes": 2124,
+      "total_symbol_refs": 12038,
+      "example_repos_include": [
+        "cachelib",
+        "executorch",
+        "fbgemm",
+        "flashlight",
+        "glow",
+        "intel-llvm-dpcpp",
+        "ipex",
+        "kineto",
+        "llvm-project",
+        "mariadb",
+        "paddle",
+        "proxygen"
+      ]
+    },
+    {
+      "family": "libuv",
+      "providers": [
+        "libuv"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 28,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 28,
+      "total_includes": 1766,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "CMake",
+        "aria2",
+        "aseprite",
+        "boost",
+        "clickhouse",
+        "cmake",
+        "curl",
+        "dolphin-emu",
+        "freebsd-src",
+        "h2o",
+        "hiredis",
+        "julia"
+      ]
+    },
+    {
+      "family": "asio",
+      "providers": [
+        "asio",
+        "boost"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 26,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 26,
+      "total_includes": 20339,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "SPTAG",
+        "apollo",
+        "arangodb",
+        "arrow",
+        "botan",
+        "carla",
+        "ceph",
+        "cpp-httplib",
+        "cpprestsdk",
+        "crow",
+        "dealii",
+        "dragonfly"
+      ]
+    },
+    {
+      "family": "flatbuffers",
+      "providers": [
+        "flatbuffers"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 23,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 23,
+      "total_includes": 1495,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "aosp-hardware-interfaces",
+        "arm-nn",
+        "arrow",
+        "chrono",
+        "dragonfly",
+        "dragonflydb",
+        "envoy",
+        "executorch",
+        "glow",
+        "kodi",
+        "mediapipe",
+        "mindspore"
+      ]
+    },
+    {
+      "family": "benchmark",
+      "providers": [
+        "benchmark"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 21,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 21,
+      "total_includes": 77,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "apple-libdispatch",
+        "cgal",
+        "cntk",
+        "eigen",
+        "hashcat",
+        "linux",
+        "llamafile",
+        "llamafile-latest",
+        "mariadb",
+        "mindspore",
+        "ncnn",
+        "paddle"
+      ]
+    },
+    {
+      "family": "spdlog",
+      "providers": [
+        "spdlog"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 19,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 19,
+      "total_includes": 1614,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "VTK",
+        "aseprite",
+        "boost",
+        "carla",
+        "cuda-quantum",
+        "dolphin-emu",
+        "envoy",
+        "flashinfer",
+        "gpt4all",
+        "kodi",
+        "llamafile",
+        "matx"
+      ]
+    },
+    {
+      "family": "c_ares",
+      "providers": [
+        "c-ares"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 19,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 19,
+      "total_includes": 90,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "CMake",
+        "aria2",
+        "aseprite",
+        "clickhouse",
+        "cmake",
+        "curl",
+        "dolphin-emu",
+        "dragonfly",
+        "envoy",
+        "grpc",
+        "mosquitto",
+        "mysql"
+      ]
+    },
+    {
+      "family": "harfbuzz",
+      "providers": [
+        "harfbuzz"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 18,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 18,
+      "total_includes": 193,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "4.4bsd-lite2",
+        "VTK",
+        "aseprite",
+        "dolphin-emu",
+        "ffmpeg",
+        "godot",
+        "gtk",
+        "kodi",
+        "krita",
+        "ladybird",
+        "openjdk",
+        "openscad"
+      ]
+    },
+    {
+      "family": "wil_microsoft",
+      "providers": [
+        "wil"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 14,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 14,
+      "total_includes": 775,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "DirectX-Graphics-Samples",
+        "Windows-Driver-Frameworks",
+        "Windows-classic-samples",
+        "WindowsAppSDK",
+        "directx-graphics-samples",
+        "dolphin-emu",
+        "microsoft-ui-xaml",
+        "onnxruntime",
+        "onnxruntime-genai",
+        "pcsx2",
+        "terminal",
+        "windows-classic-samples"
+      ]
+    },
+    {
+      "family": "mimalloc",
+      "providers": [
+        "mimalloc"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 11,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 11,
+      "total_includes": 192,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "arrow",
+        "cpython",
+        "dragonfly",
+        "dragonflydb",
+        "iree",
+        "mold",
+        "onnxruntime",
+        "openscad",
+        "pytorch",
+        "vulkan-validation-layers",
+        "webkit"
+      ]
+    },
+    {
+      "family": "lmdb",
+      "providers": [
+        "lmdb"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 9,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 9,
+      "total_includes": 51,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "caffe",
+        "ceph",
+        "dali",
+        "freebsd-src",
+        "netbsd",
+        "pdns",
+        "php-src",
+        "src",
+        "xemu"
+      ]
+    },
+    {
+      "family": "simdjson",
+      "providers": [
+        "simdjson"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 4,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 4,
+      "total_includes": 13,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "clickhouse",
+        "ladybird",
+        "node",
+        "questdb"
+      ]
+    },
+    {
+      "family": "range_v3",
+      "providers": [
+        "range-v3"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 3,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 3,
+      "total_includes": 4078,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "folly",
+        "matx",
+        "telegram-desktop"
+      ]
+    },
+    {
+      "family": "libsodium",
+      "providers": [
+        "libsodium"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 3,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 3,
+      "total_includes": 181,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "freebsd-src",
+        "netbsd",
+        "src"
+      ]
+    },
+    {
+      "family": "capnproto",
+      "providers": [
+        "capnproto"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 3,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 3,
+      "total_includes": 25,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "bitcoin",
+        "clickhouse",
+        "physx"
+      ]
+    },
+    {
+      "family": "leveldb",
+      "providers": [
+        "leveldb"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 2,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 2,
+      "total_includes": 214,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "bitcoin",
+        "caffe"
+      ]
+    },
+    {
+      "family": "msgpack",
+      "providers": [
+        "msgpack-c"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 1,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 1,
+      "total_includes": 1,
+      "total_symbol_refs": 0,
+      "example_repos_include": [
+        "foundationdb"
+      ]
+    },
+    {
+      "family": "thrift",
+      "providers": [
+        "thrift"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 0,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 0,
+      "total_includes": 0,
+      "total_symbol_refs": 0,
+      "example_repos_include": []
+    },
+    {
+      "family": "openexr",
+      "providers": [
+        "openexr"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 0,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 0,
+      "total_includes": 0,
+      "total_symbol_refs": 0,
+      "example_repos_include": []
+    },
+    {
+      "family": "nghttp2",
+      "providers": [
+        "nghttp2"
+      ],
+      "present_in_corpus": true,
+      "distinct_repos_include": 0,
+      "distinct_repos_symbol": 0,
+      "distinct_repos_union": 0,
+      "total_includes": 0,
+      "total_symbol_refs": 0,
+      "example_repos_include": []
+    }
+  ]
+}

@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -106,6 +107,29 @@ def find_parquet_shards(input_dir: str, split: str) -> list[str]:
         raise ValueError(f"unknown split: {split}")
 
 
+def _require_token_aligned_side_channel(
+    column: str,
+    side_val: list[int] | None,
+    token_ids: list[int],
+    *,
+    shard_path: str,
+    row_idx: int,
+) -> list[int]:
+    """Return a side-channel row only if it is exactly token-aligned."""
+
+    if side_val is None:
+        raise ValueError(
+            f"side-channel {column} is null at {shard_path}#row{row_idx}; "
+            f"token_ids length {len(token_ids)}"
+        )
+    if len(side_val) != len(token_ids):
+        raise ValueError(
+            f"side-channel {column} length {len(side_val)} != "
+            f"token_ids length {len(token_ids)} at {shard_path}#row{row_idx}"
+        )
+    return side_val
+
+
 def _convert_parquet_to_numpy(
     input_dir: str,
     output_prefix: str,
@@ -155,19 +179,13 @@ def _convert_parquet_to_numpy(
                 if token_ids:
                     all_docs.append(np.array(token_ids, dtype=dtype))
                     for col in (side_channels or []):
-                        side_val = side_cols[col][row_idx].as_py()
-                        if side_val is None:
-                            side_val = []
-                        if len(side_val) != len(token_ids):
-                            print(
-                                f"WARNING: Column {col} length ({len(side_val)}) mismatch with tokens ({len(token_ids)}) "
-                                f"at row {row_idx}; automatically aligning...",
-                                file=sys.stderr,
-                            )
-                            if len(side_val) > len(token_ids):
-                                side_val = side_val[:len(token_ids)]
-                            else:
-                                side_val = side_val + [0] * (len(token_ids) - len(side_val))
+                        side_val = _require_token_aligned_side_channel(
+                            col,
+                            side_cols[col][row_idx].as_py(),
+                            token_ids,
+                            shard_path=shard_path,
+                            row_idx=row_idx,
+                        )
                         all_side_docs[col].append(np.array(side_val, dtype=side_dtypes[col]))
         if (shard_idx + 1) % 10 == 0:
             print(f"  read {shard_idx + 1}/{len(shards)} shards, {len(all_docs)} docs")
@@ -320,19 +338,13 @@ def convert_parquet_to_megatron(
 
                 # Write aligned side channel values
                 for col in (side_channels or []):
-                    side_val = side_cols[col][row_idx].as_py()
-                    if side_val is None:
-                        side_val = []
-                    if len(side_val) != len(token_ids):
-                        print(
-                            f"WARNING: Column {col} length ({len(side_val)}) mismatch with tokens ({len(token_ids)}) "
-                            f"at row {row_idx}; automatically aligning...",
-                            file=sys.stderr,
-                        )
-                        if len(side_val) > len(token_ids):
-                            side_val = side_val[:len(token_ids)]
-                        else:
-                            side_val = side_val + [0] * (len(token_ids) - len(side_val))
+                    side_val = _require_token_aligned_side_channel(
+                        col,
+                        side_cols[col][row_idx].as_py(),
+                        token_ids,
+                        shard_path=shard_path,
+                        row_idx=row_idx,
+                    )
                     arr_side = np.array(side_val, dtype=side_dtypes[col])
                     arr_side.tofile(side_writers[col])
 

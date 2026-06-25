@@ -2,9 +2,10 @@
 # GH Archive FALLBACK runner (only used when GraphQL hits a wall).
 #
 # HYBRID strategy: GraphQL is PRIMARY. This script is the documented fallback
-# hook that graphql_pr_stream.TokenExhausted points at. It runs the BigQuery
-# extraction in gharchive_query.sql for the resolved repo list, then the caller
-# loads the resulting PR/Review/Comment events into pr_store.
+# path that graphql_pr_stream.TokenExhausted points at. It runs the BigQuery
+# extraction in gharchive_query.sql for the resolved repo list, then optionally
+# loads the resulting PR/Review/Comment events into pr_store when PR_STORE_DB is
+# set.
 #
 # RULE #1: no silent success. If bq is missing or the query fails, we exit
 # non-zero and print why -- we do NOT pretend data was fetched.
@@ -14,6 +15,7 @@ PROJECT="${BQ_PROJECT:-natural-bison-491019-t9}"
 TABLE_GLOB="${TABLE_GLOB:-githubarchive.month.20*}"
 REPO_LIST="${REPO_LIST:-outputs/pr_ingest/repo_list.json}"
 OUT="${OUT:-outputs/pr_ingest/gharchive_events.json}"
+PR_STORE_DB="${PR_STORE_DB:-}"
 
 if ! command -v bq >/dev/null 2>&1; then
   echo "FATAL: bq (BigQuery CLI) not found; cannot run GH Archive fallback." >&2
@@ -37,3 +39,8 @@ SQL=$(sed -e "s|{table_glob}|$TABLE_GLOB|g" -e "s|{repo_in_list}|$IN_LIST|g" \
 echo "[gharchive] project=$PROJECT table=$TABLE_GLOB repos=$(python3 -c "import json;print(len(json.load(open('$REPO_LIST'))['repos']))")" >&2
 bq --project_id="$PROJECT" query --use_legacy_sql=false --format=prettyjson "$SQL" > "$OUT"
 echo "[gharchive] wrote $OUT" >&2
+if [[ -n "$PR_STORE_DB" ]]; then
+  python3 "$(dirname "$0")/gharchive_load_pr_store.py" --events "$OUT" --db "$PR_STORE_DB"
+else
+  echo "[gharchive] PR_STORE_DB not set; raw events only, pr_store load skipped." >&2
+fi
