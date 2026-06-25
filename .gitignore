@@ -25,3 +25,9 @@ ckpt/
 checkpoints/
 
 .codex/*
+
+# Secrets — real GitHub PATs / tokens. NEVER commit.
+secrets/
+outputs/pr_ingest/*.sqlite
+outputs/pr_ingest/*.sqlite-wal
+outputs/pr_ingest/*.sqlite-shm
