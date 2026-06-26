@@ -60,7 +60,7 @@ def test_selective_attention_filters_pp_layer_offset_from_mla_path(monkeypatch):
         layer_number=5,
         pg_collection="pg",
         pp_layer_offset=7,
-        is_mtp_layer=True,
+        is_mtp_layer=False,
         dsa_a_layer_ranks=(1,),
         attention_layer_numbers=attention_layers,
     )
@@ -84,7 +84,7 @@ def test_selective_attention_filters_pp_layer_offset_from_mla_path(monkeypatch):
         "pg_collection": "pg",
         "add_layer_offset": False,
         "pp_layer_offset": 7,
-        "is_mtp_layer": True,
+        "is_mtp_layer": False,
     }
 
 

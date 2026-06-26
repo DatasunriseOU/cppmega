@@ -119,13 +119,13 @@ runtime_pypi:
 sources:
   megatron_lm:
     repo: NVIDIA/Megatron-LM
-    ref: core_v0.16.0
+    ref: core_v0.18.0
     install_path: /opt/megatron-lm
     install_mode: editable    # `pip install -e .`
     recovered_patches:
       # Archived under cppmega after the old external fork became unavailable.
-      # These are not applied automatically: PR3674 does not apply cleanly to
-      # core_v0.16.0 and must be refreshed or paired with a compatible ref.
+      # These are not applied automatically; keep them here as provenance for
+      # cppmega-specific Megatron work that is not covered by tagged Core.
       - upstream_prs/megatron/0001-merge-PR-3674-DSA-absorbed-MLA-TileLang-fused-sparse.patch
       - upstream_prs/megatron/0002-cherry-pick-PR-4268-delayed-wgrad-overlap-with-P2P-b.patch
 

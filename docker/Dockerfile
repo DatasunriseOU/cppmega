@@ -72,7 +72,7 @@ RUN python -m pip install --no-deps /tmp/wheels/*.whl && rm -rf /tmp/wheels
 
 # --- megatron-lm with cppmega patches (editable so runtime patches resolve) -
 ARG MEGATRON_REPO=https://github.com/NVIDIA/Megatron-LM.git
-ARG MEGATRON_REF=core_v0.16.0
+ARG MEGATRON_REF=core_v0.18.0
 RUN set -eu; \
     git clone --depth=1 --branch "${MEGATRON_REF}" "${MEGATRON_REPO}" /opt/megatron-lm; \
     cd /opt/megatron-lm; \
