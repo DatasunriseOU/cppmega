@@ -80,6 +80,28 @@ jobs:
           gh release download "${{ steps.rel.outputs.tag }}" --dir wheels --pattern '*.whl'
           ls -lh wheels/
 
+      - name: Verify required wheels
+        run: |
+          set -euo pipefail
+          required=(
+            'transformer_engine-*.whl'
+            'flash_attn-*.whl'
+            'flash_attn_3-*.whl'
+            'mamba_ssm-*.whl'
+            'causal_conv1d-*.whl'
+            'fast_hadamard_transform-*.whl'
+            'tilelang-*.whl'
+            'qoptim_cuda-*.whl'
+          )
+          for pattern in "${required[@]}"; do
+            matches=(wheels/$pattern)
+            if [[ ! -e "${matches[0]}" ]]; then
+              echo "::error::wheel release ${{ steps.rel.outputs.tag }} is missing required asset: $pattern"
+              ls -lh wheels/ || true
+              exit 1
+            fi
+          done
+
       - name: Set up buildx
         uses: docker/setup-buildx-action@v3
 

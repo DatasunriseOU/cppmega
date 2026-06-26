@@ -55,9 +55,25 @@ jobs:
             echo "tag=$(echo ${{ github.sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
           fi
 
-  build:
+  source-access:
     if: github.repository == 'DatasunriseOU/cppmega'
     needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require private source token for cppmega forks
+        env:
+          SOURCE_GH_TOKEN: ${{ secrets.SOURCE_GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SOURCE_GH_TOKEN:-}" ]]; then
+            echo "::error::SOURCE_GH_TOKEN secret is required to clone jewelmusicee/TransformerEngine and jewelmusicee/flash-attention from DatasunriseOU/cppmega."
+            echo "::error::Set SOURCE_GH_TOKEN to a GitHub token with read access to the jewelmusicee source forks, or mirror those forks and update STACK.lock/.github/workflows/build-wheels.yml."
+            exit 1
+          fi
+
+  build:
+    if: github.repository == 'DatasunriseOU/cppmega'
+    needs: [resolve, source-access]
     runs-on: ubuntu-latest
     timeout-minutes: 350     # 6h hard limit; flash_attn at MAX_JOBS=1 ~= 4h
     strategy:
