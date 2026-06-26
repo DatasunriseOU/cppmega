@@ -264,12 +264,12 @@ class RuntimePatchProfile:
     # performance lanes can A/B exact vs approximate CE without ad hoc env.
     cce_filter_eps: CceFilterEps | str = "none"
     acknowledge_liger_mtp_ce_deprecated: bool = False
-    # Local source overrides that must be part of the typed launch contract.
-    # The GB10 FA4/TE fixes are source-tree patches, not installed PyPI wheels;
-    # without these roots first on PYTHONPATH the process can import a mixed
-    # flash-attn package and silently miss the SM120 guard/fallback fixes.
-    transformer_engine_source: str | None = "/home/dave/TransformerEngine"
-    flash_attention_source: str | None = "/home/dave/flash-attention-fa4"
+    # Optional local source overrides. Historical GB10/Modal lanes used patched
+    # source trees under /home/dave, but the reproducible GHCR path must not
+    # assume those machine-local checkouts exist. Pass explicit CLI overrides
+    # when reproducing that old stack.
+    transformer_engine_source: str | None = None
+    flash_attention_source: str | None = None
 
 
 @dataclass

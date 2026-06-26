@@ -1,0 +1,403 @@
+From ec6a9e900f9cdefccc088ab5630ddf4aeb53406e Mon Sep 17 00:00:00 2001
+From: David Gornshtein <davidgornshtein@gmail.com>
+Date: Mon, 13 Apr 2026 12:35:40 +0000
+Subject: [PATCH 2/2] =?UTF-8?q?cherry-pick:=20PR=20#4268=20=E2=80=94=20del?=
+ =?UTF-8?q?ayed=20wgrad=20overlap=20with=20P2P=20backward=20(PP>1=20A2A=20?=
+ =?UTF-8?q?overlap)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Only core files: model_parallel_config.py + model_chunk_schedule_plan.py
+Enables overlapping wgrad compute with PP P2P backward communication.
+---
+ megatron/core/model_parallel_config.py        |  15 ++
+ .../common/model_chunk_schedule_plan.py       |  73 +++++--
+ .../transformer/test_softmax_scale.py         | 201 ++++++++++++++++++
+ 3 files changed, 267 insertions(+), 22 deletions(-)
+ create mode 100644 tests/unit_tests/transformer/test_softmax_scale.py
+
+diff --git a/megatron/core/model_parallel_config.py b/megatron/core/model_parallel_config.py
+index d56c6282e..11cdcce69 100644
+--- a/megatron/core/model_parallel_config.py
++++ b/megatron/core/model_parallel_config.py
+@@ -293,6 +293,21 @@ class ModelParallelConfig:
+     This requires transformer_engine with GroupedLinear support (TE >= 2.3.0).
+     """
+ 
++    overlap_p2p_backward_on_comm_stream: bool = False
++    """Place backward P2P communication on the communication stream instead of the
++    computation stream, enabling overlap with the next VPP stage's forward compute."""
++
++    overlap_p2p_with_transformer_layer_wgrad: bool = False
++    """When enabled, deferred layers delay both attention and MLP weight gradient
++    computation to overlap with P2P communication. When disabled, only attention
++    weight gradients are deferred."""
++
++    overlap_p2p_wgrad_delayed_layer_number: int = 1
++    """Number of backward layers whose weight gradient computation is delayed to
++    overlap with P2P communication. Controls how many of the last backward layers
++    defer their wgrad. The type of wgrad deferred (attn only vs attn+mlp) is
++    controlled by overlap_p2p_with_transformer_layer_wgrad."""
++
+     ep_overlap_early_attn_memory_release: bool = False
+     """Enable early memory release of attention activations during EP overlap.
+     EP overlap can increase peak memory usage when the overlapped forward module allocates 
+diff --git a/megatron/core/models/common/model_chunk_schedule_plan.py b/megatron/core/models/common/model_chunk_schedule_plan.py
+index 2a7476228..47105bb8c 100644
+--- a/megatron/core/models/common/model_chunk_schedule_plan.py
++++ b/megatron/core/models/common/model_chunk_schedule_plan.py
+@@ -192,7 +192,9 @@ class TransformerLayerSchedulePlan:
+         )
+ 
+     @staticmethod
+-    def run(f_layer, b_layer, f_input=None, b_grad=None, is_last_layer_in_bwd=False):
++    def run(
++        f_layer, b_layer, f_input=None, b_grad=None, delay_attn_wgrad=False, delay_mlp_wgrad=False
++    ):
+         """Schedule one-forward-one-backward operations for a single transformer layer.
+ 
+         This function interleaves forward and backward operations, overlapping the communications
+@@ -210,8 +212,10 @@ class TransformerLayerSchedulePlan:
+             b_layer (TransformerLayerSchedulePlan): Backward layer (for previous microbatch)
+             f_input (Tensor): Input for forward computation
+             b_grad (Tensor): Gradient for backward computation
+-            is_last_layer_in_bwd (bool):
+-                Whether the current layer is the last layer in the backward pass.
++            delay_attn_wgrad (bool):
++                Whether to delay attention weight gradient computation for this layer.
++            delay_mlp_wgrad (bool):
++                Whether to delay MLP weight gradient computation for this layer.
+ 
+         Returns:
+             Functions or values for next iteration's computation
+@@ -233,7 +237,8 @@ class TransformerLayerSchedulePlan:
+                 f_input = f_layer.moe_dispatch.forward(f_input)
+ 
+         if b_layer is not None:
+-            b_layer.mlp.backward_dw()
++            if not delay_mlp_wgrad:
++                b_layer.mlp.backward_dw()
+             b_grad = b_layer.moe_dispatch.backward(b_grad)
+ 
+         if b_layer is not None and b_layer.config.ep_overlap_early_attn_memory_release:
+@@ -251,9 +256,7 @@ class TransformerLayerSchedulePlan:
+         if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
+             b_grad = b_layer.attn.backward(b_grad)
+ 
+-        # Delay the last attn_dw in backward pass (attn_dw of the first layer)
+-        # for overlapping with the p2p comm
+-        if b_layer is not None and not is_last_layer_in_bwd:
++        if b_layer is not None and not delay_attn_wgrad:
+             b_layer.attn.backward_dw()
+ 
+         return f_input, b_grad
+@@ -316,6 +319,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
+         self.pre_process = None
+         self.post_process = None
+         self.vp_stage = model.vp_stage
++        self.config = model.config
+ 
+         # save the inputs of model.forward() to ModelChunkState
+         self._model_chunk_state.input_ids = input_ids
+@@ -474,31 +478,53 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
+         b_num_layers = b_schedule_plan.num_layers() if b_schedule_plan is not None else 0
+         overlapped_layers = min(f_num_layers, b_num_layers)
+ 
++        # Determine how many backward layers should defer wgrad for P2P overlap.
++        num_wgrad_delayed = 0
++        delay_mlp_wgrad = False
++        if b_schedule_plan is not None:
++            num_wgrad_delayed = min(
++                b_schedule_plan.config.overlap_p2p_wgrad_delayed_layer_number, b_num_layers
++            )
++            delay_mlp_wgrad = b_schedule_plan.config.overlap_p2p_with_transformer_layer_wgrad
++        wgrad_delay_start = b_num_layers - num_wgrad_delayed
++
+         f_layer = b_layer = None
++        deferred_wgrad_layers = []
+         # combined forward and backward pass for overlapped layers
+         for i in range(overlapped_layers):
+             f_layer = f_schedule_plan.get_layer(i)
+             b_layer = b_schedule_plan.pop_layer()
++            should_delay = i >= wgrad_delay_start
+             torch.cuda.nvtx.range_push(f"layer_{i}f-layer_{b_schedule_plan.num_layers()}b")
+             f_input, b_grad = TransformerLayerSchedulePlan.run(
+                 f_layer,
+                 b_layer,
+                 f_input=f_input,
+                 b_grad=b_grad,
+-                is_last_layer_in_bwd=(i == b_num_layers - 1),
++                delay_attn_wgrad=should_delay,
++                delay_mlp_wgrad=(should_delay and delay_mlp_wgrad),
+             )
+-            if i < b_num_layers - 1:
++            if should_delay:
++                deferred_wgrad_layers.append(b_layer)
++            else:
+                 b_layer.release_state()
+             torch.cuda.nvtx.range_pop()
+ 
+         # backward pass for the remaining layers
+         for i in range(overlapped_layers, b_num_layers):
+             b_layer = b_schedule_plan.pop_layer()
++            should_delay = i >= wgrad_delay_start
+             torch.cuda.nvtx.range_push(f"layer_{b_schedule_plan.num_layers()}b")
+             _, b_grad = TransformerLayerSchedulePlan.run(
+-                None, b_layer, b_grad=b_grad, is_last_layer_in_bwd=(i == b_num_layers - 1)
++                None,
++                b_layer,
++                b_grad=b_grad,
++                delay_attn_wgrad=should_delay,
++                delay_mlp_wgrad=(should_delay and delay_mlp_wgrad),
+             )
+-            if i < b_num_layers - 1:
++            if should_delay:
++                deferred_wgrad_layers.append(b_layer)
++            else:
+                 b_layer.release_state()
+             torch.cuda.nvtx.range_pop()
+ 
+@@ -516,18 +542,21 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
+                 f_schedule_plan.wait_current_stream()
+                 post_forward(f_input, f_schedule_plan.vp_stage)
+ 
+-        # post_backward()/send_backward_recv_backward() is running in the computation stream,
+-        # so the p2p comm could be overlapped with the wgrad of attn backward
+         if b_schedule_plan is not None and post_backward is not None:
+-            b_schedule_plan.wait_current_stream()
+-            post_backward(b_grad, b_schedule_plan.vp_stage)
+-
+-        # Delay the last attn_dw in backward pass (attn_dw of the first layer)
+-        # for overlapping with the p2p comm
+-        if b_num_layers > 0:
+-            assert b_layer is not None
+-            b_layer.attn.backward_dw()
+-            b_layer.release_state()
++            if b_schedule_plan.config.overlap_p2p_backward_on_comm_stream:
++                with torch.cuda.stream(get_comm_stream()):
++                    b_schedule_plan.wait_current_stream()
++                    post_backward(b_grad, b_schedule_plan.vp_stage)
++            else:
++                b_schedule_plan.wait_current_stream()
++                post_backward(b_grad, b_schedule_plan.vp_stage)
++
++        # Run deferred wgrad computations after post_backward for P2P overlap.
++        for deferred_layer in deferred_wgrad_layers:
++            if delay_mlp_wgrad:
++                deferred_layer.mlp.backward_dw()
++            deferred_layer.attn.backward_dw()
++            deferred_layer.release_state()
+ 
+         # post process forward
+         if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
+diff --git a/tests/unit_tests/transformer/test_softmax_scale.py b/tests/unit_tests/transformer/test_softmax_scale.py
+new file mode 100644
+index 000000000..b2ad599c2
+--- /dev/null
++++ b/tests/unit_tests/transformer/test_softmax_scale.py
+@@ -0,0 +1,201 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++
++"""Tests for softmax_scale config propagation.
++
++Verifies that TransformerConfig.softmax_scale is properly considered
++in both Attention.flash_decode_and_prefill and MLASelfAttention.__init__.
++"""
++
++import math
++from unittest.mock import patch
++
++import pytest
++import torch
++
++from megatron.core.extensions.transformer_engine import TEDotProductAttention
++from megatron.core.models.common.embeddings import _yarn_get_mscale
++from megatron.core.models.gpt.gpt_layer_specs import (
++    get_gpt_layer_with_transformer_engine_submodules,
++)
++from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
++from megatron.core.transformer.attention import SelfAttention
++from megatron.core.transformer.enums import AttnMaskType
++from megatron.core.transformer.multi_latent_attention import (
++    MLASelfAttention,
++    MLASelfAttentionSubmodules,
++)
++from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
++from tests.unit_tests.test_utilities import Utils
++
++
++def _get_mla_submodules():
++    submodules = get_gpt_layer_with_transformer_engine_submodules(
++        multi_latent_attention=True
++    ).self_attention.submodules
++    assert isinstance(submodules, MLASelfAttentionSubmodules)
++    return submodules
++
++
++class TestAttentionSoftmaxScale:
++    """Tests that flash_decode_and_prefill respects config.softmax_scale."""
++
++    @pytest.fixture(scope='function', autouse=True)
++    def setup_and_teardown(self):
++        if not torch.cuda.is_available():
++            pytest.skip("GPU required")
++        Utils.initialize_model_parallel(1, 1)
++        model_parallel_cuda_manual_seed(123)
++        yield
++        Utils.destroy_model_parallel()
++
++    def _make_attention(self, softmax_scale=None):
++        config = TransformerConfig(
++            num_layers=2,
++            hidden_size=128,
++            num_attention_heads=4,
++            use_cpu_initialization=True,
++            softmax_scale=softmax_scale,
++        )
++        submodules = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
++        attn = SelfAttention(config, submodules, layer_number=1)
++        attn.eval()
++        attn.cuda()
++        return attn
++
++    def _call_and_capture_softmax_scale(self, attn):
++        """Call flash_decode_and_prefill with HAVE_FA3=False, capture softmax_scale from FA2."""
++        head_dim = attn.config.kv_channels
++        num_heads = attn.config.num_attention_heads
++        # q shape: [total_tokens, num_heads, 1, head_dim] — squeezed to [total, heads, head_dim]
++        q = torch.randn(2, num_heads, 1, head_dim, device='cuda', dtype=torch.float16)
++        k = torch.randn(2, num_heads, head_dim, device='cuda', dtype=torch.float16)
++        v = torch.randn(2, num_heads, head_dim, device='cuda', dtype=torch.float16)
++        cu_seqlens_q = torch.tensor([0, 1, 2], device='cuda', dtype=torch.int32)
++        cu_seqlens_k = torch.tensor([0, 1, 2], device='cuda', dtype=torch.int32)
++        seqlens_k = torch.tensor([1, 1], device='cuda', dtype=torch.int32)
++        block_table = torch.zeros(2, 1, device='cuda', dtype=torch.int32)
++
++        captured = {}
++
++        def fake_fa_varlen(*args, **kwargs):
++            captured['softmax_scale'] = kwargs.get('softmax_scale')
++            return torch.randn(2, num_heads, head_dim, device='cuda', dtype=torch.float16)
++
++        with (
++            patch('megatron.core.transformer.attention.HAVE_FA3', False),
++            patch('megatron.core.transformer.attention.flash_attn_varlen_func', fake_fa_varlen),
++        ):
++            attn.batch_invariant_mode = False
++            attn.flash_decode_and_prefill(
++                q,
++                k,
++                v,
++                max_seqlen_q=1,
++                max_seqlen_k=1,
++                cu_seqlens_q=cu_seqlens_q,
++                cu_seqlens_k=cu_seqlens_k,
++                seqlens_k=seqlens_k,
++                block_table=block_table,
++                is_decode_only=False,
++            )
++
++        return captured['softmax_scale']
++
++    def test_config_softmax_scale_used(self):
++        """When config.softmax_scale is set, flash_decode_and_prefill should use it."""
++        attn = self._make_attention(softmax_scale=0.042)
++        assert not hasattr(attn, 'softmax_scale')
++        scale = self._call_and_capture_softmax_scale(attn)
++        assert scale == 0.042
++
++    def test_default_softmax_scale(self):
++        """When config.softmax_scale is None and no instance attr, use 1/sqrt(head_dim)."""
++        attn = self._make_attention(softmax_scale=None)
++        assert not hasattr(attn, 'softmax_scale')
++        scale = self._call_and_capture_softmax_scale(attn)
++        head_dim = attn.config.kv_channels
++        assert scale == pytest.approx(head_dim**-0.5)
++
++    def test_instance_attr_takes_precedence(self):
++        """When self.softmax_scale is set, it takes precedence over config.softmax_scale."""
++        attn = self._make_attention(softmax_scale=0.042)
++        attn.softmax_scale = 0.123
++        scale = self._call_and_capture_softmax_scale(attn)
++        assert scale == 0.123
++
++
++class TestMLASoftmaxScale:
++    """Tests that MLASelfAttention.__init__ respects config.softmax_scale."""
++
++    @pytest.fixture(scope='function', autouse=True)
++    def setup_and_teardown(self):
++        if not torch.cuda.is_available():
++            pytest.skip("GPU required")
++        Utils.initialize_model_parallel(1, 1)
++        model_parallel_cuda_manual_seed(123)
++        yield
++        Utils.destroy_model_parallel()
++
++    def _make_mla(self, softmax_scale=None, rotary_scaling_factor=40.0, mscale_all_dim=0.0):
++        config = MLATransformerConfig(
++            num_layers=2,
++            hidden_size=12,
++            num_attention_heads=4,
++            use_cpu_initialization=True,
++            q_lora_rank=32,
++            kv_lora_rank=32,
++            qk_head_dim=128,
++            v_head_dim=128,
++            qk_pos_emb_head_dim=64,
++            rope_type='yarn',
++            rotary_base=10000,
++            original_max_position_embeddings=32,
++            softmax_scale=softmax_scale,
++            rotary_scaling_factor=rotary_scaling_factor,
++            mscale_all_dim=mscale_all_dim,
++        )
++        attention = MLASelfAttention(
++            config, _get_mla_submodules(), layer_number=1, attn_mask_type=AttnMaskType.causal
++        )
++        return config, attention
++
++    def test_config_softmax_scale_applied(self):
++        """When config.softmax_scale is set, MLA uses mscale^2 * config.softmax_scale."""
++        config, attention = self._make_mla(softmax_scale=0.042)
++        mscale = _yarn_get_mscale(config.rotary_scaling_factor, config.mscale_all_dim)
++        expected = mscale * mscale * 0.042
++        assert attention.softmax_scale == pytest.approx(expected)
++
++    def test_default_softmax_scale(self):
++        """When config.softmax_scale is None, MLA uses mscale^2 / sqrt(q_head_dim)."""
++        config, attention = self._make_mla(softmax_scale=None)
++        q_head_dim = config.qk_head_dim + config.qk_pos_emb_head_dim
++        mscale = _yarn_get_mscale(config.rotary_scaling_factor, config.mscale_all_dim)
++        expected = mscale * mscale * (1 / math.sqrt(q_head_dim))
++        assert attention.softmax_scale == pytest.approx(expected)
++
++    def test_config_softmax_scale_with_yarn_scaling(self):
++        """With rotary_scaling_factor > 1, mscale != 1, and config.softmax_scale is applied (not None)."""
++        config, attention = self._make_mla(softmax_scale=0.042, rotary_scaling_factor=4.0, mscale_all_dim=1.0)
++        mscale = _yarn_get_mscale(config.rotary_scaling_factor, config.mscale_all_dim)
++        assert mscale != 1.0, "mscale should be nontrivial with scaling_factor > 1 and mscale_all_dim != 0"
++        expected = mscale * mscale * 0.042
++        assert attention.softmax_scale == pytest.approx(expected)
++
++    def test_config_softmax_scale_with_trivial_scaling(self):
++        """With rotary_scaling_factor and mscale = 0."""
++        config, attention = self._make_mla(softmax_scale=0.042, rotary_scaling_factor=4.0)
++        mscale = _yarn_get_mscale(config.rotary_scaling_factor, config.mscale_all_dim)
++        assert mscale == 1.0, "mscale should be trivial with mscale_all_dim == 0"
++        expected = mscale * mscale * 0.042
++        assert attention.softmax_scale == pytest.approx(expected)
++
++    def test_softmax_scale_propagated_to_core_attention(self):
++        """The computed softmax_scale should be passed to core_attention."""
++        _, attention = self._make_mla(softmax_scale=0.042)
++        if isinstance(attention.core_attention, TEDotProductAttention):
++            assert attention.core_attention.flash_attention.softmax_scale == attention.softmax_scale
++            assert attention.core_attention.fused_attention.softmax_scale == attention.softmax_scale
++            assert attention.core_attention.unfused_attention.softmax_scale == attention.softmax_scale
++        else:
++            assert attention.core_attention.softmax_scale == attention.softmax_scale
+-- 
+2.34.1
+

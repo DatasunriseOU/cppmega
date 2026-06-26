@@ -28,6 +28,7 @@ wheels:
     # module. cppmega-specific CI trimming is kept in this repo's workflow.
     repo: Dao-AILab/flash-attention
     ref: main
+    patch: upstream_prs/flash_attn_setup_sm120f.patch
     version: 2.x.x
     build: |
       MAX_JOBS=1 NVCC_THREADS=2 \
@@ -108,6 +109,12 @@ sources:
     ref: core_v0.16.0
     install_path: /opt/megatron-lm
     install_mode: editable    # `pip install -e .`
+    recovered_patches:
+      # Archived under cppmega after the old external fork became unavailable.
+      # These are not applied automatically: PR3674 does not apply cleanly to
+      # core_v0.16.0 and must be refreshed or paired with a compatible ref.
+      - upstream_prs/megatron/0001-merge-PR-3674-DSA-absorbed-MLA-TileLang-fused-sparse.patch
+      - upstream_prs/megatron/0002-cherry-pick-PR-4268-delayed-wgrad-overlap-with-P2P-b.patch
 
 # Final runtime image
 image:

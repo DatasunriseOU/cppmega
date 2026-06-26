@@ -81,12 +81,9 @@ def test_local_gb10_profile_owns_cce_mtp_and_optimizer_defaults():
     assert env["CPPMEGA_MOE_TOKEN_DISPATCHER_TYPE"] == "alltoall"
     assert env["CPPMEGA_USE_FLASH_ATTN"] == "1"
     assert env["CPPMEGA_ATTN_BACKEND"] == "flash"
-    assert env["CPPMEGA_EXTRA_PYTHONPATH"].split(":")[:2] == [
-        "/home/dave/flash-attention-fa4",
-        "/home/dave/TransformerEngine",
-    ]
-    assert env["CPPMEGA_FLASH_ATTN_SOURCE_ROOT"] == "/home/dave/flash-attention-fa4"
-    assert env["CPPMEGA_TRANSFORMER_ENGINE_SOURCE_ROOT"] == "/home/dave/TransformerEngine"
+    assert "CPPMEGA_EXTRA_PYTHONPATH" not in env
+    assert "CPPMEGA_FLASH_ATTN_SOURCE_ROOT" not in env
+    assert "CPPMEGA_TRANSFORMER_ENGINE_SOURCE_ROOT" not in env
     assert env["CPPMEGA_NOCONV_MAMBA_CHUNK_SIZE"] == "256"
     assert env["CPPMEGA_CCE_FUSE_MAIN_MTP_CE"] == "1"
     assert env["CPPMEGA_CCE_FILTER_EPS"] == "high"
