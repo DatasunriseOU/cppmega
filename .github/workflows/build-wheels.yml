@@ -42,7 +42,7 @@ env:
 
 jobs:
   resolve:
-    if: github.repository == 'jewelmusicee/cppmega'
+    if: github.repository == 'DatasunriseOU/cppmega'
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.t.outputs.tag }}
@@ -56,7 +56,7 @@ jobs:
           fi
 
   build:
-    if: github.repository == 'jewelmusicee/cppmega'
+    if: github.repository == 'DatasunriseOU/cppmega'
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 350     # 6h hard limit; flash_attn at MAX_JOBS=1 ~= 4h
@@ -182,8 +182,15 @@ jobs:
 
       - name: Resolve source SHA
         id: src
+        env:
+          SOURCE_GH_TOKEN: ${{ secrets.SOURCE_GH_TOKEN }}
         run: |
-          SHA=$(git ls-remote https://github.com/${{ matrix.repo }}.git ${{ matrix.ref }} | awk '{print $1}' | head -1)
+          set -euo pipefail
+          REPO_URL="https://github.com/${{ matrix.repo }}.git"
+          if [[ -n "${SOURCE_GH_TOKEN:-}" ]]; then
+            REPO_URL="https://x-access-token:${SOURCE_GH_TOKEN}@github.com/${{ matrix.repo }}.git"
+          fi
+          SHA=$(git ls-remote "$REPO_URL" ${{ matrix.ref }} | awk '{print $1}' | head -1)
           if [ -z "$SHA" ]; then SHA="${{ matrix.ref }}"; fi
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "Resolved ${{ matrix.repo }}@${{ matrix.ref }} → $SHA"
@@ -200,7 +207,7 @@ jobs:
         # content.net both regularly time out / return 503 from GH runners,
         # blocking every wheel build for hours).
         # Source: archive.ubuntu.com/ubuntu/pool/main/g/gcc-15/ (15.2.0-4ubuntu4)
-        # Release: github.com/jewelmusicee/cppmega/releases/tag/${TOOLCHAIN_TAG}
+        # Release: github.com/${{ github.repository }}/releases/tag/${TOOLCHAIN_TAG}
         env:
           TOOLCHAIN_TAG: toolchain-gcc-15-15.2.0-4ubuntu4
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -210,9 +217,21 @@ jobs:
           cd /tmp/gcc15
           # Download from our own release (GitHub's CDN, very stable). One blob,
           # no PPA, no add-apt-repository, no Launchpad anywhere in the path.
-          gh release download "$TOOLCHAIN_TAG" \
-              --repo jewelmusicee/cppmega \
-              --pattern 'gcc-15-noble-amd64.tar.gz'
+          if ! gh release download "$TOOLCHAIN_TAG" \
+              --repo "${{ github.repository }}" \
+              --pattern 'gcc-15-noble-amd64.tar.gz'; then
+            echo "::warning::vendored gcc-15 release missing in ${{ github.repository }}; falling back to ubuntu-toolchain PPA"
+            sudo apt-get -o Acquire::Retries=5 update
+            sudo apt-get install -y software-properties-common
+            sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+            sudo apt-get -o Acquire::Retries=5 update
+            sudo apt-get install -y gcc-15 g++-15 ccache ninja-build
+            sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-15 90
+            sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-15 90
+            gcc --version
+            g++ --version
+            exit 0
+          fi
           tar xzf gcc-15-noble-amd64.tar.gz
           sha256sum -c SHA256SUMS
           # Install ccache + ninja from noble main (no PPA needed for these).
@@ -315,11 +334,17 @@ jobs:
         run: pip install --retries 10 --timeout 60 ninja packaging pybind11 cmake numpy einops scikit-build-core setuptools-scm "z3-solver>=4.13.0" cython
 
       - name: Clone source (any ref — branch / tag / SHA)
+        env:
+          SOURCE_GH_TOKEN: ${{ secrets.SOURCE_GH_TOKEN }}
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
           rm -rf src
-          git clone https://github.com/${{ matrix.repo }}.git src
+          REPO_URL="https://github.com/${{ matrix.repo }}.git"
+          if [[ -n "${SOURCE_GH_TOKEN:-}" ]]; then
+            REPO_URL="https://x-access-token:${SOURCE_GH_TOKEN}@github.com/${{ matrix.repo }}.git"
+          fi
+          git clone "$REPO_URL" src
           cd src
           git checkout ${{ matrix.ref }}
           if [[ "${{ matrix.submodules }}" == "true" ]]; then
@@ -448,7 +473,7 @@ jobs:
           retention-days: 7
 
   release:
-    if: github.repository == 'jewelmusicee/cppmega'
+    if: github.repository == 'DatasunriseOU/cppmega'
     needs: [resolve, build]
     runs-on: ubuntu-latest
     steps:
@@ -463,6 +488,28 @@ jobs:
 
       - name: List collected wheels
         run: ls -lh wheels/
+
+      - name: Verify required wheels
+        run: |
+          set -euo pipefail
+          required=(
+            'transformer_engine-*.whl'
+            'flash_attn-*.whl'
+            'flash_attn_3-*.whl'
+            'mamba_ssm-*.whl'
+            'causal_conv1d-*.whl'
+            'fast_hadamard_transform-*.whl'
+            'tilelang-*.whl'
+            'qoptim_cuda-*.whl'
+          )
+          for pattern in "${required[@]}"; do
+            matches=(wheels/$pattern)
+            if [[ ! -e "${matches[0]}" ]]; then
+              echo "::error::missing required wheel asset: $pattern"
+              ls -lh wheels/ || true
+              exit 1
+            fi
+          done
 
       - name: Create / update Release
         env:

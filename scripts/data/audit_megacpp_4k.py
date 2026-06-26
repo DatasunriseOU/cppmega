@@ -57,6 +57,12 @@ TOKEN_SIDE_CHANNEL_COLUMNS = (
     "token_sibling_index",
     "token_ast_node_type",
     "token_def_use",
+    "token_symbol_ids",
+    "token_call_targets",
+    "token_type_refs",
+    "token_change_mask_pre",
+    "token_change_mask_post",
+    "token_platform_ids",
 )
 # Semantic / graph columns from clang_enriched_to_parquet v12 _SCHEMA.
 SEMANTIC_COLUMNS = (

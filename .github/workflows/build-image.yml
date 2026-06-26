@@ -1,7 +1,7 @@
 name: build-image
 
 # Assemble the cppmega runtime image from the prebuilt wheel release and push
-# to ghcr.io/jewelmusicee/cppmega:<sha>. Buildx registry cache lives in the same
+# to ghcr.io/datasunriseou/cppmega:<sha>. Buildx registry cache lives in the same
 # repo so re-runs after a fix start from the last good layer, never from scratch.
 
 on:
@@ -32,12 +32,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/jewelmusicee/cppmega
+  IMAGE: ghcr.io/datasunriseou/cppmega
 
 jobs:
   image:
     if: |
-      github.repository == 'jewelmusicee/cppmega' &&
+      github.repository == 'DatasunriseOU/cppmega' &&
       (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     steps:
@@ -99,7 +99,7 @@ jobs:
             type=sha,format=long
             type=sha,prefix=,format=short
             type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=wheels-${{ steps.rel.outputs.tag }}
+            type=raw,value=${{ steps.rel.outputs.tag }}
 
       - name: Build & push (cache to/from registry)
         uses: docker/build-push-action@v6
@@ -113,4 +113,6 @@ jobs:
             type=registry,ref=${{ env.IMAGE }}:buildcache
           cache-to: |
             type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+          secrets: |
+            source_gh_token=${{ secrets.SOURCE_GH_TOKEN }}
           provenance: false   # cleaner package listing in ghcr UI

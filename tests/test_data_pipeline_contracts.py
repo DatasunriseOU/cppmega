@@ -136,8 +136,17 @@ def test_prepare_data_dispatcher_runs_fail_closed_gates_before_trainable_verify(
     assert "verify_tokenizer_contract.py" in script
     assert "verify_provenance.py" in script
     assert "verify_side_channel_shapes.py" in script
+    assert "--require-full-sidecars" in script
     assert "audit_megacpp_4k.py" in script
     assert "build_dataset_manifest.py" in script
+
+
+def test_side_channel_checker_has_full_sidecar_gate() -> None:
+    script = (_REPO_ROOT / "scripts/data/verify_side_channel_shapes.py").read_text()
+
+    assert "--require-full-sidecars" in script
+    assert "--allow-partial-sidecars" in script
+    assert "full sidecar dataset missing required token-aligned" in script
 
 
 def test_tp_sp_angle_gather_test_mirrors_production_default_backward_path() -> None:

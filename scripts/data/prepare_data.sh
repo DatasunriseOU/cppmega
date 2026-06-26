@@ -54,7 +54,8 @@ run_audit() {
         --dataset-dir "$DATASET_DIR" \
         --kind "$DATASET_KIND"
     "$PY" "$HERE/verify_side_channel_shapes.py" \
-        --dataset-dir "$DATASET_DIR"
+        --dataset-dir "$DATASET_DIR" \
+        --require-full-sidecars
     "$PY" "$HERE/audit_megacpp_4k.py" \
         --dataset-dir "$DATASET_DIR" \
         --kind "$DATASET_KIND" \

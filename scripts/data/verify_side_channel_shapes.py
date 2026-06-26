@@ -13,8 +13,10 @@ Usage:
         --dataset-dir /Users/dave/sources/parquet/clang_semantic_4k_v10 \
         --sample 256
 
+    # Legacy / partial-sidecar audit only, explicitly requested:
     .venv/bin/python verify_side_channel_shapes.py \
         --dataset-dir /Users/dave/sources/parquet/clang_commits_4k_v1 \
+        --allow-partial-sidecars \
         --channels token_structure_ids,token_dep_levels --sample 100
 """
 
@@ -69,13 +71,23 @@ def verify(
     dataset_dir: Path,
     channels: tuple[str, ...] | None,
     sample: int,
+    require_full_sidecars: bool,
 ) -> dict[str, object]:
     shards = find_shards(dataset_dir)
     present = set(pq.ParquetFile(shards[0]).schema_arrow.names)
     if TOKEN_COLUMN not in present:
         _fail(str(dataset_dir), f"required token column {TOKEN_COLUMN!r} absent")
 
-    if channels is None:
+    if require_full_sidecars:
+        check_channels = DEFAULT_TOKEN_ALIGNED_CHANNELS
+        missing = [c for c in check_channels if c not in present]
+        if missing:
+            _fail(
+                str(dataset_dir),
+                "full sidecar dataset missing required token-aligned "
+                f"side-channel column(s): {', '.join(missing)}",
+            )
+    elif channels is None:
         check_channels = tuple(c for c in DEFAULT_TOKEN_ALIGNED_CHANNELS if c in present)
     else:
         check_channels = channels
@@ -150,6 +162,23 @@ def main() -> int:
         default=256,
         help="Rows to sample per shard (default 256).",
     )
+    parser.add_argument(
+        "--require-full-sidecars",
+        action="store_true",
+        help=(
+            "Require every modern token-aligned side-channel column to be present "
+            "before checking lengths. This is the default; the flag is kept for "
+            "old callers that already pass it."
+        ),
+    )
+    parser.add_argument(
+        "--allow-partial-sidecars",
+        action="store_true",
+        help=(
+            "Legacy-only mode: check only requested/present side-channel columns. "
+            "Use this only when intentionally auditing old partial datasets."
+        ),
+    )
     args = parser.parse_args()
 
     dataset_dir = Path(args.dataset_dir).resolve()
@@ -163,7 +192,14 @@ def main() -> int:
         else None
     )
     try:
-        result = verify(dataset_dir=dataset_dir, channels=channels, sample=args.sample)
+        result = verify(
+            dataset_dir=dataset_dir,
+            channels=channels,
+            sample=args.sample,
+            require_full_sidecars=(
+                args.require_full_sidecars or not args.allow_partial_sidecars
+            ),
+        )
     except ShapeError as exc:
         print(f"SIDE-CHANNEL SHAPE CHECK FAILED: {exc}", file=sys.stderr)
         return 1

@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # cppmega runtime image.
 #
 # Wheels are built upstream by .github/workflows/build-wheels.yml and uploaded
@@ -7,8 +8,8 @@
 #
 # Layers are ordered cheapest → most-volatile so buildx registry cache reuses
 # everything below the changed wheel. Push/pull cache via:
-#   --cache-from=type=registry,ref=ghcr.io/jewelmusicee/cppmega:buildcache
-#   --cache-to=type=registry,ref=ghcr.io/jewelmusicee/cppmega:buildcache,mode=max
+#   --cache-from=type=registry,ref=ghcr.io/datasunriseou/cppmega:buildcache
+#   --cache-to=type=registry,ref=ghcr.io/datasunriseou/cppmega:buildcache,mode=max
 
 ARG CUDA_IMAGE=nvidia/cuda:13.2.1-cudnn-devel-ubuntu24.04
 FROM ${CUDA_IMAGE} AS runtime
@@ -71,8 +72,17 @@ RUN python -m pip install --no-deps /tmp/wheels/*.whl && rm -rf /tmp/wheels
 # --- megatron-lm with cppmega patches (editable so runtime patches resolve) -
 ARG MEGATRON_REPO=https://github.com/jewelmusicee/Megatron-LM.git
 ARG MEGATRON_REF=cppmega/bench3-fork
-RUN git clone --depth=1 --branch ${MEGATRON_REF} ${MEGATRON_REPO} /opt/megatron-lm \
-    && cd /opt/megatron-lm && python -m pip install -e . --no-build-isolation --no-deps
+RUN --mount=type=secret,id=source_gh_token,required=false \
+    set -eu; \
+    token_file=/run/secrets/source_gh_token; \
+    auth_repo="${MEGATRON_REPO}"; \
+    if [ -s "${token_file}" ] && printf '%s' "${MEGATRON_REPO}" | grep -q '^https://github.com/'; then \
+        token="$(cat "${token_file}")"; \
+        auth_repo="$(printf '%s' "${MEGATRON_REPO}" | sed "s#^https://github.com/#https://x-access-token:${token}@github.com/#")"; \
+    fi; \
+    git clone --depth=1 --branch "${MEGATRON_REF}" "${auth_repo}" /opt/megatron-lm; \
+    cd /opt/megatron-lm; \
+    python -m pip install -e . --no-build-isolation --no-deps
 
 # --- cppmega itself (source of cppmega.megatron.* runtime patches) ----------
 COPY . /opt/cppmega
