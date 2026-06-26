@@ -11,14 +11,6 @@ on:
         description: "Wheel release tag (without 'wheels-' prefix). Empty = latest."
         required: false
         type: string
-  push:
-    branches: [main]
-    paths:
-      - docker/Dockerfile
-      - .github/workflows/build-image.yml
-      - cppmega/**
-      - scripts/cppmega_fp8_shim.py
-      - pyproject.toml
   workflow_run:
     workflows: [build-wheels]
     types: [completed]
