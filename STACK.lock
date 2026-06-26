@@ -5,7 +5,10 @@ base:
   cuda_image: nvidia/cuda:13.2.1-cudnn-devel-ubuntu24.04
   python: "3.13"
   gcc: "15"           # via ppa:ubuntu-toolchain-r/test; needs nvcc --allow-unsupported-compiler
-  torch: "2.13.*"
+  # CUDA extension wheels must be built and consumed with the same exact
+  # nightly torch build. A floating 2.13.* pin lets the wheel builder and the
+  # Docker buildcache resolve different nightlies, which breaks TE's C++ ABI.
+  torch: "2.13.0.dev20260611+cu132"
   torch_index: https://download.pytorch.org/whl/nightly/cu132
   torch_arch_list: "9.0;10.0;12.1"   # H100 / B200 / GB10
 

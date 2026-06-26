@@ -36,7 +36,9 @@ concurrency:
 env:
   CUDA_VERSION: "13.2.1"
   PYTHON_VERSION: "3.13"
-  TORCH_VERSION: "2.13.*"
+  # Keep exact: C++ extension wheels, especially TransformerEngine, are ABI
+  # tied to the precise torch nightly they were compiled against.
+  TORCH_VERSION: "2.13.0.dev20260611+cu132"
   TORCH_INDEX: "https://download.pytorch.org/whl/nightly/cu132"
   TORCH_CUDA_ARCH_LIST: "9.0;10.0;12.1"
 
@@ -453,6 +455,20 @@ jobs:
       - name: List wheels
         if: success()
         run: ls -lh wheels/
+
+      - name: Smoke TransformerEngine wheel ABI
+        if: success() && matrix.name == 'transformer_engine'
+        run: |
+          set -euo pipefail
+          python -m pip install --no-deps wheels/transformer_engine-*.whl
+          python - <<'PY'
+          import torch
+          import transformer_engine
+          import transformer_engine.pytorch
+
+          print("torch", torch.__version__, torch.version.cuda)
+          print("transformer_engine", transformer_engine.__version__)
+          PY
 
       - name: Upload build log (always, even on failure/cancel)
         if: always()
