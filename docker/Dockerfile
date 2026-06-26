@@ -70,17 +70,10 @@ COPY wheels/ /tmp/wheels/
 RUN python -m pip install --no-deps /tmp/wheels/*.whl && rm -rf /tmp/wheels
 
 # --- megatron-lm with cppmega patches (editable so runtime patches resolve) -
-ARG MEGATRON_REPO=https://github.com/jewelmusicee/Megatron-LM.git
-ARG MEGATRON_REF=cppmega/bench3-fork
-RUN --mount=type=secret,id=source_gh_token,required=false \
-    set -eu; \
-    token_file=/run/secrets/source_gh_token; \
-    auth_repo="${MEGATRON_REPO}"; \
-    if [ -s "${token_file}" ] && printf '%s' "${MEGATRON_REPO}" | grep -q '^https://github.com/'; then \
-        token="$(cat "${token_file}")"; \
-        auth_repo="$(printf '%s' "${MEGATRON_REPO}" | sed "s#^https://github.com/#https://x-access-token:${token}@github.com/#")"; \
-    fi; \
-    git clone --depth=1 --branch "${MEGATRON_REF}" "${auth_repo}" /opt/megatron-lm; \
+ARG MEGATRON_REPO=https://github.com/NVIDIA/Megatron-LM.git
+ARG MEGATRON_REF=core_v0.16.0
+RUN set -eu; \
+    git clone --depth=1 --branch "${MEGATRON_REF}" "${MEGATRON_REPO}" /opt/megatron-lm; \
     cd /opt/megatron-lm; \
     python -m pip install -e . --no-build-isolation --no-deps
 

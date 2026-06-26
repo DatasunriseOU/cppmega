@@ -26,7 +26,7 @@ _REPO_ROOT = pathlib.Path(__file__).parent.parent
 APP_NAME = "cppmega-wave28-lane-c-h100"
 RESULTS_VOL = "cppmega-mamba3-benchmarks"
 BENCH_DIR = "/benchmarks/mamba3_wave28_lane_c_h100"
-GHCR_REPO = os.environ.get("GHCR_REPO", "ghcr.io/jewelmusicee/cppmega")
+GHCR_REPO = os.environ.get("GHCR_REPO", "ghcr.io/datasunriseou/cppmega")
 GHCR_TAG = os.environ.get("GHCR_TAG", "785c3fd")
 GHCR_REF = f"{GHCR_REPO}:{GHCR_TAG}"
 

@@ -55,25 +55,9 @@ jobs:
             echo "tag=$(echo ${{ github.sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
           fi
 
-  source-access:
-    if: github.repository == 'DatasunriseOU/cppmega'
-    needs: resolve
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require private source token for cppmega forks
-        env:
-          SOURCE_GH_TOKEN: ${{ secrets.SOURCE_GH_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${SOURCE_GH_TOKEN:-}" ]]; then
-            echo "::error::SOURCE_GH_TOKEN secret is required to clone jewelmusicee/TransformerEngine and jewelmusicee/flash-attention from DatasunriseOU/cppmega."
-            echo "::error::Set SOURCE_GH_TOKEN to a GitHub token with read access to the jewelmusicee source forks, or mirror those forks and update STACK.lock/.github/workflows/build-wheels.yml."
-            exit 1
-          fi
-
   build:
     if: github.repository == 'DatasunriseOU/cppmega'
-    needs: [resolve, source-access]
+    needs: [resolve]
     runs-on: ubuntu-latest
     timeout-minutes: 350     # 6h hard limit; flash_attn at MAX_JOBS=1 ~= 4h
     strategy:
@@ -81,18 +65,17 @@ jobs:
       matrix:
         include:
           - name: transformer_engine
-            repo: jewelmusicee/TransformerEngine
-            ref: cppmega-mxfp8-transpose-emit
+            repo: NVIDIA/TransformerEngine
+            ref: v2.16
             submodules: "true"
             # MAX_JOBS=1 NVCC_THREADS=2 — without these, ninja saturates the
             # 4-core / 7 GB runner and the job gets cancelled at ~1h30m with
             # nothing useful in the logs. TE has 100s of .cu files * 3 archs.
             extra_env: "NVTE_FRAMEWORK=pytorch MAX_JOBS=1 NVCC_THREADS=2"
           - name: flash_attn
-            # Our fork carries the cppmega/fa4-gb10-fixes branch on top of
-            # upstream b86e0cc — sm_120 score_mod, sm_121a Arch fix in
-            # FlashAttentionForwardSm120.__init__, dQ_single_wg gating.
-            # Builds the FA2 cuda kernels + FA4 cute python module in one wheel.
+            # Public upstream builds the FA2 cuda kernels + FA4 cute python
+            # module in one wheel. cppmega-specific build trimming stays below
+            # in this workflow so the build recipe is owned by DatasunriseOU/cppmega.
             #
             # MAX_JOBS=1 NVCC_THREADS=1 is the only RAM-stable combo on the
             # 7-GB runner. NVCC_THREADS=2 OOM-killed at 58 min (single nvcc
@@ -106,15 +89,16 @@ jobs:
             #   - H100/H200: covered by flash_attn_3 (FA3 hopper)
             #   - B200:      primary path is FA4 cute python (same wheel,
             #                JIT-compiled at runtime — no arch list needed)
-            #   - GB10:      FA2 sm_120 with cppmega's sm_121a Arch patch
-            # FA2 is therefore only the legacy fallback; sm_120 suffices.
-            repo: jewelmusicee/flash-attention
-            ref: cppmega/fa4-gb10-fixes
+            # FA2 is therefore only the legacy fallback; sm_120 is enough for
+            # this wheel build. GB10-specific sm_120f/121 fixes must live as
+            # local patches in this repo if we re-enable that path.
+            repo: Dao-AILab/flash-attention
+            ref: main
             submodules: "false"
             arch_override: "12.1"
             extra_env: "MAX_JOBS=1 NVCC_THREADS=1"
           - name: flash_attn_3
-            # Hopper FA3 path from the same fork (subdir hopper/). Trimmed to
+            # Hopper FA3 path from upstream flash-attention (subdir hopper/). Trimmed to
             # training essentials only: bf16+fp8, hdim 64/128, varlen+backward.
             # Drop fp16, hdim 96/192/256, paged/append KV (inference), local,
             # softcap, packgqa, cluster, hdimdiff64/192. Even at sm_90 + MAX_JOBS=1
@@ -132,8 +116,8 @@ jobs:
             # ARCH_SWITCH to 90 (via DISABLE_SM8x → defined when SM80=TRUE)
             # prevents the sm80 instantiation entirely, and PackGQA collapses to
             # false everywhere for arch=90.
-            repo: jewelmusicee/flash-attention
-            ref: cppmega/fa4-gb10-fixes
+            repo: Dao-AILab/flash-attention
+            ref: main
             submodules: "false"
             subdir: hopper
             arch_override: "9.0"
@@ -198,14 +182,9 @@ jobs:
 
       - name: Resolve source SHA
         id: src
-        env:
-          SOURCE_GH_TOKEN: ${{ secrets.SOURCE_GH_TOKEN }}
         run: |
           set -euo pipefail
           REPO_URL="https://github.com/${{ matrix.repo }}.git"
-          if [[ -n "${SOURCE_GH_TOKEN:-}" ]]; then
-            REPO_URL="https://x-access-token:${SOURCE_GH_TOKEN}@github.com/${{ matrix.repo }}.git"
-          fi
           SHA=$(git ls-remote "$REPO_URL" ${{ matrix.ref }} | awk '{print $1}' | head -1)
           if [ -z "$SHA" ]; then SHA="${{ matrix.ref }}"; fi
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
@@ -350,16 +329,11 @@ jobs:
         run: pip install --retries 10 --timeout 60 ninja packaging pybind11 cmake numpy einops scikit-build-core setuptools-scm "z3-solver>=4.13.0" cython
 
       - name: Clone source (any ref — branch / tag / SHA)
-        env:
-          SOURCE_GH_TOKEN: ${{ secrets.SOURCE_GH_TOKEN }}
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
           rm -rf src
           REPO_URL="https://github.com/${{ matrix.repo }}.git"
-          if [[ -n "${SOURCE_GH_TOKEN:-}" ]]; then
-            REPO_URL="https://x-access-token:${SOURCE_GH_TOKEN}@github.com/${{ matrix.repo }}.git"
-          fi
           git clone "$REPO_URL" src
           cd src
           git checkout ${{ matrix.ref }}

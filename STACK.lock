@@ -12,9 +12,9 @@ base:
 # Wheels built in matrix on ubuntu-latest (x86_64), uploaded to GH Release as assets.
 wheels:
   transformer_engine:
-    repo: jewelmusicee/TransformerEngine
-    ref: cppmega-mxfp8-transpose-emit
-    version: 2.16.0.dev0
+    repo: NVIDIA/TransformerEngine
+    ref: v2.16
+    version: 2.16
     build: |
       NVTE_FRAMEWORK=pytorch \
         pip wheel . --no-build-isolation -w /wheels
@@ -24,12 +24,11 @@ wheels:
       - transformer_engine-*.whl
 
   flash_attn:
-    # Our fork @ cppmega/fa4-gb10-fixes = upstream b86e0cc + 3 cute python
-    # patches (sm_120 score_mod, sm_121a Arch fix, dQ_single_wg gating).
-    # Ships FA2 cuda kernels + FA4 (flash_attn.cute) python module in one wheel.
-    repo: jewelmusicee/flash-attention
-    ref: cppmega/fa4-gb10-fixes
-    version: 2.x.x+cppmega-fa4-gb10
+    # Public upstream ships FA2 cuda kernels + FA4 (flash_attn.cute) python
+    # module. cppmega-specific CI trimming is kept in this repo's workflow.
+    repo: Dao-AILab/flash-attention
+    ref: main
+    version: 2.x.x
     build: |
       MAX_JOBS=1 NVCC_THREADS=2 \
         pip wheel . --no-build-isolation -w /wheels
@@ -37,11 +36,12 @@ wheels:
       - flash_attn-*.whl
 
   flash_attn_3:
-    # FA3 (Hopper) from hopper/ subdir of the same fork. PACKAGE_NAME=flash_attn_3
+    # FA3 (Hopper) from hopper/ subdir of upstream flash-attention.
+    # PACKAGE_NAME=flash_attn_3
     # so it co-installs with flash_attn (FA2/FA4) without conflict. For H100/H200
     # on Modal — useless for B200/GB10 but ships for code parity.
-    repo: jewelmusicee/flash-attention
-    ref: cppmega/fa4-gb10-fixes
+    repo: Dao-AILab/flash-attention
+    ref: main
     version: 3.x
     subdir: hopper
     build: |
@@ -104,8 +104,8 @@ wheels:
 # Repos cloned at runtime in the final image (not built as wheels).
 sources:
   megatron_lm:
-    repo: jewelmusicee/Megatron-LM
-    ref: cppmega/bench3-fork
+    repo: NVIDIA/Megatron-LM
+    ref: core_v0.16.0
     install_path: /opt/megatron-lm
     install_mode: editable    # `pip install -e .`
 

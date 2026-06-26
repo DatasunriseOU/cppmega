@@ -1070,9 +1070,9 @@ if (
                         "quantize_rowwise_transpose; the TN adapter will fall "
                         "through to the slow copy-based transpose path "
                         "(see metric mxfp8_tn_adapter_copy_transpose). "
-                        "This requires the cppmega TE fork "
-                        "(jewelmusicee/TransformerEngine ref "
-                        "cppmega-mxfp8-transpose-emit). Tested against TE "
+                        "The fast transpose-emit path requires a cppmega TE "
+                        "patch pack or future upstream TransformerEngine API. "
+                        "Tested against TE "
                         f"{_SUPPORTED_TE_VERSIONS}.",
                         file=_sys.stderr,
                     )

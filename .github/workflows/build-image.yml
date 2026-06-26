@@ -135,6 +135,4 @@ jobs:
             type=registry,ref=${{ env.IMAGE }}:buildcache
           cache-to: |
             type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
-          secrets: |
-            source_gh_token=${{ secrets.SOURCE_GH_TOKEN }}
           provenance: false   # cleaner package listing in ghcr UI
