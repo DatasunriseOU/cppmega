@@ -37,6 +37,7 @@ GHCR_REF = f"{GHCR_REPO}:{GHCR_TAG}"
 GPU_SPEC = os.environ.get("CPPMEGA_MODAL_GPU", "H100:1")
 OVERLAY_REPO = os.environ.get("CPPMEGA_MODAL_OVERLAY_REPO", "1") != "0"
 INSTALL_CUTLASS = os.environ.get("CPPMEGA_MODAL_INSTALL_CUTLASS", "0") == "1"
+INSTALL_FLASH_ATTN_4 = os.environ.get("CPPMEGA_MODAL_INSTALL_FLASH_ATTN_4", "0") == "1"
 RUN_TINY_CUDA_SMOKE = os.environ.get("CPPMEGA_MODAL_TINY_CUDA_SMOKE", "0") == "1"
 RUN_SIDECAR_SMOKE = os.environ.get("CPPMEGA_MODAL_SIDECAR_SMOKE", "1") != "0"
 FORMAT_SIDECAR_IF_MISSING = os.environ.get("CPPMEGA_MODAL_FORMAT_SIDECAR", "0") == "1"
@@ -81,6 +82,7 @@ def _image() -> modal.Image:
             "CPPMEGA_LOCAL_GIT_SHA": LOCAL_GIT_SHA,
             "CPPMEGA_OVERLAY_REPO": "1" if OVERLAY_REPO else "0",
             "CPPMEGA_INSTALL_CUTLASS_OVERLAY": "1" if INSTALL_CUTLASS else "0",
+            "CPPMEGA_INSTALL_FLASH_ATTN_4_OVERLAY": "1" if INSTALL_FLASH_ATTN_4 else "0",
             "CPPMEGA_MODAL_TINY_CUDA_SMOKE": "1" if RUN_TINY_CUDA_SMOKE else "0",
             "CPPMEGA_MODAL_SIDECAR_SMOKE": "1" if RUN_SIDECAR_SMOKE else "0",
             "CPPMEGA_MODAL_FORMAT_SIDECAR": "1" if FORMAT_SIDECAR_IF_MISSING else "0",
@@ -98,6 +100,11 @@ def _image() -> modal.Image:
         img = img.pip_install(
             "nvidia-cutlass-dsl==4.4.2",
             "quack-kernels==0.3.10",
+            extra_index_url="https://pypi.nvidia.com",
+        )
+    if INSTALL_FLASH_ATTN_4:
+        img = img.pip_install(
+            "flash-attn-4[cu13]==4.0.0b19",
             extra_index_url="https://pypi.nvidia.com",
         )
     if OVERLAY_REPO:
@@ -497,6 +504,8 @@ def _runtime_report(*, run_tiny_train: bool) -> dict[str, Any]:
             "transformer_engine.pytorch",
             "flash_attn",
             "flash_attn.cute",
+            "flash_attn.cute.interface",
+            "flash_attn.cute.block_sparsity",
             "flash_attn_3",
             "mamba_ssm",
             "tilelang",
@@ -515,6 +524,10 @@ def _runtime_report(*, run_tiny_train: bool) -> dict[str, Any]:
         "install_cutlass_overlay": os.environ.get(
             "CPPMEGA_INSTALL_CUTLASS_OVERLAY",
             "1" if INSTALL_CUTLASS else "0",
+        ) == "1",
+        "install_flash_attn_4_overlay": os.environ.get(
+            "CPPMEGA_INSTALL_FLASH_ATTN_4_OVERLAY",
+            "1" if INSTALL_FLASH_ATTN_4 else "0",
         ) == "1",
         "data_volume": DATA_VOLUME_NAME,
         "parquet_dataset": PARQUET_DATASET,

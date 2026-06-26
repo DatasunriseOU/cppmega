@@ -24,8 +24,9 @@ wheels:
       - transformer_engine-*.whl
 
   flash_attn:
-    # Public upstream ships FA2 cuda kernels + FA4 (flash_attn.cute) python
-    # module. cppmega-specific CI trimming is kept in this repo's workflow.
+    # Public upstream flash-attn wheel is FA2 CUDA kernels only for cppmega.
+    # Keep flash_attn.cute excluded: FA4 is installed separately from PyPI as
+    # flash-attn-4 with its own CUTLASS/quack dependency contract.
     repo: Dao-AILab/flash-attention
     ref: main
     patch: upstream_prs/flash_attn_setup_sm120f.patch
@@ -101,6 +102,15 @@ wheels:
         pip wheel . --no-build-isolation -w /wheels
     produces:
       - qoptim_cuda-*.whl
+
+runtime_pypi:
+  flash_attn_4:
+    # FA4 CuTe DSL package. This installs the flash_attn.cute namespace and
+    # matching nvidia-cutlass-dsl[cu13] / quack-kernels runtime dependencies.
+    # H100/H200 training uses FA3; FA4 is kept for the B200/GB10 CuTe path and
+    # for cppmega's cute_dsl_mimo modules.
+    package: "flash-attn-4[cu13]==4.0.0b19"
+    extra_index_url: https://pypi.nvidia.com
 
 # Repos cloned at runtime in the final image (not built as wheels).
 sources:

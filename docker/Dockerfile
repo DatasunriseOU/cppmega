@@ -57,13 +57,13 @@ RUN python -m pip install --pre --extra-index-url ${TORCH_INDEX} \
         apache-tvm-ffi==0.1.9 \
         nvidia-nccl-cu13
 
-# --- CuTe DSL + quack (Python-only, JIT-compiled kernels) -------------------
-# nvidia-cutlass-dsl 4.4.2 includes the SM120/121 StageCountAutoCarveout fix
-# (CUTLASS issue #3144) needed for GB10. quack is the Dao-AILab CuTe-DSL
-# kernel library; only on GitHub, not PyPI.
-RUN python -m pip install --no-cache-dir \
-        "nvidia-cutlass-dsl==4.4.2" \
-        "git+https://github.com/Dao-AILab/quack.git"
+# --- FA4 CuTe DSL runtime (Python-only, JIT-compiled kernels) ---------------
+# FA4 is intentionally separate from the flash_attn wheel. The flash-attn-4
+# package owns the flash_attn.cute namespace and pins the compatible
+# nvidia-cutlass-dsl[cu13] / quack-kernels dependency stack.
+RUN python -m pip install --no-cache-dir --pre \
+        --extra-index-url https://pypi.nvidia.com \
+        "flash-attn-4[cu13]==4.0.0b19"
 
 # --- prebuilt wheels (this layer changes whenever any wheel is rebuilt) -----
 COPY wheels/ /tmp/wheels/
@@ -89,13 +89,15 @@ ENV CUDA_HOME=/usr/local/cuda \
     PYTHONPATH=/opt/megatron-lm:/opt/cppmega
 
 # Smoke-import to fail fast on ABI mismatches at build time.
-# Note: flash_attn ships FA2 (kernels) + FA4 (flash_attn.cute python module);
-# flash_attn_3 is the separate FA3 hopper package. Both co-install fine.
+# Note: flash_attn ships FA2 kernels, flash_attn_3 is the separate FA3 Hopper
+# package, and flash-attn-4 owns flash_attn.cute for CuTe DSL kernels.
 RUN python -c "\
 import torch; print('torch', torch.__version__); \
 import transformer_engine; print('te', transformer_engine.__version__); \
 import transformer_engine.pytorch; \
-import flash_attn; import flash_attn.cute; \
+import flash_attn; \
+from flash_attn.cute.interface import flash_attn_func as fa4_flash_attn_func; \
+import flash_attn.cute.block_sparsity as _fa4_block_sparsity; \
 import flash_attn_3; \
 import mamba_ssm, causal_conv1d, fast_hadamard_transform, tilelang, qoptim_cuda; \
 import cutlass; import cutlass.cute as cute; \

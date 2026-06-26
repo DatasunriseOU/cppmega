@@ -425,14 +425,12 @@ jobs:
           # kvcache path (inference-only), so a runtime check is fine.
           sed -i 's|run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, Is_causal>(params, stream);|TORCH_CHECK(false, "flash_attn splitkv path disabled in cppmega CI build");|' \
               csrc/flash_attn/flash_api.cpp
-          # 4) Include flash_attn.cute (FA4 cute python module) in our wheel.
-          # Vanilla setup.py explicitly EXCLUDES flash_attn.cute and .cute.*
-          # from find_packages() so it can ship as a separate \`fa4\` package.
-          # cppmega wants FA4 + FA2 in one wheel for single-pip-install
-          # convenience (the smoke test on the runtime image does both
-          # \`import flash_attn\` and \`import flash_attn.cute\`).
-          sed -i '/^\s*"flash_attn\.cute",\s*$/d; /^\s*"flash_attn\.cute\.\*",\s*$/d' setup.py
-          echo "HEADDIM_SWITCH restricted to {64,128}; splitkv stubbed; cute included; survivors:"
+          # 4) Keep FA4 out of this wheel. Upstream excludes flash_attn.cute
+          # because FA4 ships as the separate flash-attn-4 package with its
+          # own nvidia-cutlass-dsl/quack dependency contract. Forcing cute into
+          # flash-attn produced an import surface that looked present but
+          # failed at runtime against modern CUTLASS Python.
+          echo "HEADDIM_SWITCH restricted to {64,128}; splitkv stubbed; survivors:"
           grep '_sm80\.cu' setup.py | sed 's/^/  /'
 
       - name: Build wheel
