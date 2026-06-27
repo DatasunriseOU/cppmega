@@ -63,3 +63,18 @@ def test_side_channel_length_mismatch_fails_closed() -> None:
             shard_path="shard_00000.parquet",
             row_idx=7,
         )
+
+
+def test_find_parquet_shards_all_keeps_every_file(tmp_path: Path) -> None:
+    converter = _load_converter_module()
+
+    for name in ("a.parquet", "b.parquet", "val_shard.parquet"):
+        (tmp_path / name).write_bytes(b"not a real parquet")
+
+    shards = converter.find_parquet_shards(str(tmp_path), "all")
+
+    assert [Path(shard).name for shard in shards] == [
+        "a.parquet",
+        "b.parquet",
+        "val_shard.parquet",
+    ]

@@ -103,6 +103,8 @@ def find_parquet_shards(input_dir: str, split: str) -> list[str]:
         if has_explicit_val:
             return [str(val_shard)]
         return [str(all_parquets[-1])] if len(all_parquets) > 1 else [str(all_parquets[0])]
+    elif split == "all":
+        return [str(p) for p in all_parquets]
     else:
         raise ValueError(f"unknown split: {split}")
 
@@ -160,54 +162,61 @@ def _convert_parquet_to_numpy(
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    # Collect all documents
-    all_docs: list[np.ndarray] = []
-    all_side_docs: dict[str, list[np.ndarray]] = {col: [] for col in (side_channels or [])}
     side_dtypes = {col: np.dtype(dt) for col, dt in zip(side_channels or [], side_channel_dtypes or [], strict=True)}
     t0 = time.time()
 
     columns_to_read = [token_column] + (side_channels or [])
 
-    for shard_idx, shard_path in enumerate(shards):
-        pf = pq.ParquetFile(shard_path)
-        for rg_idx in range(pf.metadata.num_row_groups):
-            table = pf.read_row_group(rg_idx, columns=columns_to_read)
-            token_col = table.column(token_column)
-            side_cols = {col: table.column(col) for col in (side_channels or [])}
-            for row_idx in range(len(token_col)):
-                token_ids = token_col[row_idx].as_py()
-                if token_ids:
-                    all_docs.append(np.array(token_ids, dtype=dtype))
-                    for col in (side_channels or []):
-                        side_val = _require_token_aligned_side_channel(
-                            col,
-                            side_cols[col][row_idx].as_py(),
-                            token_ids,
-                            shard_path=shard_path,
-                            row_idx=row_idx,
-                        )
-                        all_side_docs[col].append(np.array(side_val, dtype=side_dtypes[col]))
-        if (shard_idx + 1) % 10 == 0:
-            print(f"  read {shard_idx + 1}/{len(shards)} shards, {len(all_docs)} docs")
-
-    print(f"total: {len(all_docs)} documents")
-
-    # Write .bin
     bin_path = output_prefix + ".bin"
-    total_tokens = sum(len(d) for d in all_docs)
-    flat = np.empty(total_tokens, dtype=dtype)
-    offset = 0
-    sizes = np.empty(len(all_docs), dtype=np.int32)
-    pointers = np.empty(len(all_docs), dtype=np.int64)
+    side_writers = {
+        col: open(f"{output_prefix}_{col}.bin", "wb")
+        for col in (side_channels or [])
+    }
+    sizes: list[int] = []
+    pointers: list[int] = []
+    total_tokens = 0
 
-    for i, doc in enumerate(all_docs):
-        n = len(doc)
-        flat[offset:offset + n] = doc
-        sizes[i] = n
-        pointers[i] = offset * dtype().itemsize
-        offset += n
+    try:
+        with open(bin_path, "wb") as bin_fh:
+            for shard_idx, shard_path in enumerate(shards):
+                pf = pq.ParquetFile(shard_path)
+                for rg_idx in range(pf.metadata.num_row_groups):
+                    table = pf.read_row_group(rg_idx, columns=columns_to_read)
+                    token_col = table.column(token_column)
+                    side_cols = {col: table.column(col) for col in (side_channels or [])}
+                    for row_idx in range(len(token_col)):
+                        token_ids = token_col[row_idx].as_py()
+                        if not token_ids:
+                            continue
+                        arr = np.array(token_ids, dtype=dtype)
+                        pointers.append(total_tokens * dtype().itemsize)
+                        sizes.append(len(arr))
+                        arr.tofile(bin_fh)
 
-    flat.tofile(bin_path)
+                        for col in (side_channels or []):
+                            side_val = _require_token_aligned_side_channel(
+                                col,
+                                side_cols[col][row_idx].as_py(),
+                                token_ids,
+                                shard_path=shard_path,
+                                row_idx=row_idx,
+                            )
+                            np.array(side_val, dtype=side_dtypes[col]).tofile(side_writers[col])
+
+                        total_tokens += len(arr)
+                if (shard_idx + 1) % 10 == 0 or shard_idx + 1 == len(shards):
+                    print(
+                        f"  read {shard_idx + 1}/{len(shards)} shards, "
+                        f"{len(sizes):,} docs, {total_tokens:,} tokens"
+                    )
+    finally:
+        for writer in side_writers.values():
+            writer.close()
+
+    print(f"total: {len(sizes)} documents")
+
+    sizes_arr = np.array(sizes, dtype=np.int32)
+    pointers_arr = np.array(pointers, dtype=np.int64)
 
     # Write .idx (Megatron MMapIndexedDataset format)
     idx_path = output_prefix + ".idx"
@@ -217,20 +226,13 @@ def _convert_parquet_to_numpy(
         f.write(MAGIC)
         f.write(struct.pack("<Q", VERSION))
         f.write(struct.pack("<B", dtype_code))
-        f.write(struct.pack("<Q", len(all_docs)))  # num sequences
-        f.write(struct.pack("<Q", len(all_docs) + 1))  # num documents (includes sentinel)
-        sizes.tofile(f)
-        pointers.tofile(f)
+        f.write(struct.pack("<Q", len(sizes_arr)))  # num sequences
+        f.write(struct.pack("<Q", len(sizes_arr) + 1))  # num documents (includes sentinel)
+        sizes_arr.tofile(f)
+        pointers_arr.tofile(f)
         # Document indices (each doc is one sequence)
-        doc_idx = np.arange(len(all_docs) + 1, dtype=np.int64)
+        doc_idx = np.arange(len(sizes_arr) + 1, dtype=np.int64)
         doc_idx.tofile(f)
-
-    # Write side channels
-    for col in (side_channels or []):
-        side_bin_path = f"{output_prefix}_{col}.bin"
-        with open(side_bin_path, "wb") as sf:
-            for doc_side in all_side_docs[col]:
-                doc_side.tofile(sf)
 
     # Write JSON sidecar
     json_path = output_prefix + ".json"
@@ -254,8 +256,9 @@ def _convert_parquet_to_numpy(
 
     elapsed = time.time() - t0
     bin_size = os.path.getsize(bin_path) / (1024**3)
-    print(f"\n{split}: {len(all_docs)} docs, {total_tokens:,} tokens, {bin_size:.2f} GiB in {elapsed:.1f}s")
+    print(f"\n{split}: {len(sizes_arr)} docs, {total_tokens:,} tokens, {bin_size:.2f} GiB in {elapsed:.1f}s")
     print(f"output: {bin_path} + {idx_path}")
+    return
 
 
 def convert_parquet_to_megatron(
@@ -409,7 +412,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--split",
-        choices=["train", "val"],
+        choices=["train", "val", "all"],
         default="train",
         help="Which split to convert (default: train)",
     )

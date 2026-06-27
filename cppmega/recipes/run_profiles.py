@@ -609,10 +609,54 @@ def set_gb10_dense500m_cpp_profile(profile: RunProfile | None = None) -> RunProf
     return profile
 
 
+def set_h200_cpp_world_mini_profile(profile: RunProfile | None = None) -> RunProfile:
+    """Fill the single-H200 C++ world-model mini smoke profile.
+
+    This is the real Megatron-backed mini lane for current sidecar smoke runs:
+    the same pure-dense C++ model chassis as ``gb10_dense500m_cpp``, but pointed
+    at the 1024-token sidecar dataset produced by the cppmega.mlx pipeline and
+    sized for one H200 memory-fit sweeps.  It intentionally stays on
+    ``CppMegaMambaModel`` so structure/ngram ingress, tokenizer contract, and
+    future Megatron precision features are exercised instead of a standalone
+    PyTorch toy model.
+    """
+
+    if profile is None:
+        profile = RunProfile(
+            name="h200_cpp_world_mini",
+            description="Single-H200 Megatron-backed C++ world-model mini lane",
+        )
+    profile = set_gb10_dense500m_cpp_profile(profile)
+    profile.name = "h200_cpp_world_mini"
+    profile.description = "Single-H200 Megatron-backed C++ world-model mini lane"
+    profile.training = TrainingProfile(
+        vocab_size=65_536,
+        seq_length=1024,
+        micro_batch_size=128,
+        global_batch_size=128,
+        train_iters=100,
+        data_path="1.0 /data/cppmega_sidecar/cppmega_1024_smoke_mix_train",
+        tokenizer_model="/data/cpp_tokenizer_hf",
+    )
+    profile.precision = PrecisionProfile(
+        fp8_recipe="off",
+        attention_backend="flash",
+    )
+    profile.runtime = RuntimePatchProfile(
+        mamba3_mimo=False,
+        ngram_hash_enabled=True,
+        structure_enabled=True,
+        structure_components="core",
+        mtp_ce_kernel="native",
+    )
+    return profile
+
+
 PROFILE_SETTERS = {
     "local_gb10_quarter": set_local_gb10_quarter_profile,
     "h200_dsa_9_4_m": set_h200_dsa_9_4_m_profile,
     "gb10_dense500m_cpp": set_gb10_dense500m_cpp_profile,
+    "h200_cpp_world_mini": set_h200_cpp_world_mini_profile,
 }
 
 

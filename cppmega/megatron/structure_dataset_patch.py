@@ -1,6 +1,6 @@
 """Dynamic monkey-patching for Megatron-LM dataset structure ingress.
 
-Dynamically overrides GPTDataset.__getitem__, get_batch_on_this_tp_rank, and
+Dynamically overrides GPTDataset.__getitem__, Megatron's TP batch bridge, and
 MambaModel/GPTModel forward passes to stream token-aligned binary MMap metadata
 columns with zero memory or serialization overhead.
 """
@@ -23,6 +23,32 @@ def _set_current_structure_batch(batch: Dict[str, torch.Tensor] | None) -> None:
 
 def _get_current_structure_batch() -> Dict[str, torch.Tensor] | None:
     return getattr(_local_storage, "current_structure_batch", None)
+
+
+_STRUCTURE_BATCH_COLS = (
+    "structure_ids",
+    "dep_levels",
+    "ast_depth_ids",
+    "sibling_index_ids",
+    "node_type_ids",
+)
+
+
+def _pop_structure_batch(batch: Dict[str, torch.Tensor] | None) -> Dict[str, torch.Tensor] | None:
+    """Remove cppmega structure tensors from a Megatron batch and stash them."""
+    if batch is None:
+        _set_current_structure_batch(None)
+        return None
+    structure_batch = {
+        col: batch.pop(col)
+        for col in _STRUCTURE_BATCH_COLS
+        if col in batch
+    }
+    if structure_batch:
+        _set_current_structure_batch(structure_batch)
+        return structure_batch
+    _set_current_structure_batch(None)
+    return None
 
 
 def _lazy_init_side_channels(dataset: Any) -> Dict[str, Dict[str, Any]]:
@@ -235,25 +261,27 @@ except Exception as e:
 
 # --- 2. Monkey-patch get_batch_on_this_tp_rank ---
 try:
-    import megatron.training.utils as training_utils
+    try:
+        # Megatron core_v0.18.0 moved this helper here; pretrain_gpt.py imports
+        # from this module directly, so this patch must land before runpy enters
+        # upstream pretrain_mamba/pretrain_hybrid.
+        import megatron.core.utils as batch_utils  # type: ignore[import-not-found]
+    except ImportError:
+        # Older cppmega H200 trees used the training.utils location.
+        import megatron.training.utils as batch_utils  # type: ignore[import-not-found]
 
-    orig_get_batch_on_this_tp_rank = training_utils.get_batch_on_this_tp_rank
+    orig_get_batch_on_this_tp_rank = batch_utils.get_batch_on_this_tp_rank
 
     def patched_get_batch_on_this_tp_rank(*args, **kwargs) -> Dict[str, torch.Tensor] | None:
         batch = orig_get_batch_on_this_tp_rank(*args, **kwargs)
-        if batch is not None:
-            structure_batch = {}
-            structure_cols = ["structure_ids", "dep_levels", "ast_depth_ids", "sibling_index_ids", "node_type_ids"]
-            for col in structure_cols:
-                if col in batch:
-                    # Pop so upstream Megatron doesn't complain about unexpected keys
-                    structure_batch[col] = batch.pop(col)
-            if structure_batch:
-                _set_current_structure_batch(structure_batch)
+        _pop_structure_batch(batch)
         return batch
 
-    training_utils.get_batch_on_this_tp_rank = patched_get_batch_on_this_tp_rank
-    print("[cppmega-patch] Successfully patched get_batch_on_this_tp_rank", flush=True)
+    batch_utils.get_batch_on_this_tp_rank = patched_get_batch_on_this_tp_rank
+    print(
+        f"[cppmega-patch] Successfully patched {batch_utils.__name__}.get_batch_on_this_tp_rank",
+        flush=True,
+    )
 except Exception as e:
     print(f"[cppmega-patch] WARNING: failed to patch get_batch_on_this_tp_rank: {e}", flush=True)
 

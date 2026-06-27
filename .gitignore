@@ -27,7 +27,9 @@ checkpoints/
 .codex/*
 
 # Secrets — real GitHub PATs / tokens. NEVER commit.
+.env
 secrets/
 outputs/pr_ingest/*.sqlite
 outputs/pr_ingest/*.sqlite-wal
 outputs/pr_ingest/*.sqlite-shm
+outputs/crossrepo/global_symbols.sqlite

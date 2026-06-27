@@ -20,6 +20,27 @@ def test_local_gb10_profile_drives_mtp_pattern_and_num_layers():
     assert "--mtp-num-layers 2" in profile.native_args_fragment()
 
 
+def test_h200_cpp_world_mini_is_megatron_dense_sidecar_lane():
+    profile = get_run_profile("h200_cpp_world_mini")
+    env = profile_shell_assignments(profile)
+
+    assert profile.model.dense
+    assert profile.spec_module == "cppmega.megatron.nam56r_noconv_spec"
+    assert profile.spec_function == "build_cppmega_nam56r_noconv_stack_spec"
+    assert env["CPPMEGA_DENSE_GQA"] == "1"
+    assert env["CPPMEGA_STRUCTURE_ENABLED"] == "1"
+    assert env["CPPMEGA_NGRAM_HASH_ENABLED"] == "1"
+    assert env["CPPMEGA_SEQ_LENGTH"] == "1024"
+    assert env["CPPMEGA_MICRO_BATCH_SIZE"] == "128"
+    assert env["CPPMEGA_GLOBAL_BATCH_SIZE"] == "128"
+    assert env["CPPMEGA_VOCAB_SIZE"] == "65536"
+    assert env["CPPMEGA_DATA_PATH"] == "1.0 /data/cppmega_sidecar/cppmega_1024_smoke_mix_train"
+    assert env["CPPMEGA_TOKENIZER_MODEL"] == "/data/cpp_tokenizer_hf"
+    assert env["CPPMEGA_FP8_RECIPE"] == "off"
+    assert env["NATIVE_ARGS"] == ""
+    assert env["HYBRID_LAYER_PATTERN"] == "*-" * 24
+
+
 def test_h200_profile_renders_pipe_chunks_and_remote_native_overrides():
     profile = get_run_profile("h200_dsa_9_4_m")
     profile.model.moe_expert_model_parallel_size = 4
