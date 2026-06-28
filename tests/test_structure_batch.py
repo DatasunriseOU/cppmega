@@ -14,12 +14,25 @@ def test_extract_structure_inputs_filters_only_known_keys():
         "tokens": 1,
         "structure_ids": 2,
         "dep_levels": 3,
+        "symbol_ids": 4,
+        "call_targets": 5,
+        "change_mask_pre": 6,
+        "graph_call_edges": 7,
+        "graph_call_edge_counts": 8,
         "junk": 4,
     }
 
     extracted = extract_structure_inputs(batch)
 
-    assert extracted == {"structure_ids": 2, "dep_levels": 3}
+    assert extracted == {
+        "structure_ids": 2,
+        "dep_levels": 3,
+        "symbol_ids": 4,
+        "call_targets": 5,
+        "change_mask_pre": 6,
+        "graph_call_edges": 7,
+        "graph_call_edge_counts": 8,
+    }
 
 
 def test_maybe_set_structure_inputs_pushes_non_zero_metadata_into_model():

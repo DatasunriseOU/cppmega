@@ -10,10 +10,12 @@ Checks
 1. Contract <-> shipped ``tokenizer.json``: model vocab == contract vocab_size; every
    special-token id resolves to a token, and every reserved-role id resolves to its
    ``<RESERVED_N>`` slot (id == N).
-2. Contract <-> mlx ``data/tokenizer_contract.py`` (REQUIRED/TOOL_USE special ids).
-3. Contract <-> mlx ``tokenizer/cpp_tokenizer.py`` EXPECTED_VOCAB_SIZE.
-4. Contract <-> nanochat ``scripts/tok_train_cpp.py`` --vocab_size default (if present).
-5. NAM56R vocab dual-track: report model_factory NAM56R_FULL vs config default; assert
+2. Domain-delimiter reserved roles are complete START/END pairs and resolve to
+   existing ``<RESERVED_N>`` slots.
+3. Contract <-> mlx ``data/tokenizer_contract.py`` (REQUIRED/TOOL_USE special ids).
+4. Contract <-> mlx ``tokenizer/cpp_tokenizer.py`` EXPECTED_VOCAB_SIZE.
+5. Contract <-> nanochat ``scripts/tok_train_cpp.py`` --vocab_size default (if present).
+6. NAM56R vocab dual-track: report model_factory NAM56R_FULL vs config default; assert
    the first-run pairing (model vocab paired with the 65536 artifact) is internally
    consistent. The 65536/131072 split itself is intentional and NOT a failure.
 
@@ -33,6 +35,26 @@ from pathlib import Path
 
 class ContractError(Exception):
     """Fail-closed contract violation (WHERE + WHAT)."""
+
+
+DOMAIN_DELIMITER_ROLE_PAIRS: tuple[str, ...] = (
+    "CPP_CODE",
+    "MAKE",
+    "CMAKE",
+    "NINJA",
+    "BAZEL",
+    "BASH",
+    "ZSH",
+    "SH",
+    "TCSH",
+    "COMPILER_DIAGNOSTIC",
+    "BUILD_DIAGNOSTIC",
+    "COMPILER_ERROR",
+    "BUILD_ERROR",
+    "LINKER_ERROR",
+    "TEST_OUTPUT",
+    "TOOL_OUTPUT",
+)
 
 
 def _read_json(p: Path) -> dict:
@@ -90,7 +112,48 @@ def check_contract_vs_tokenizer(contract: dict, tok_json: Path) -> list[str]:
                 f"expected '<RESERVED_{tid}>'"
             )
     notes.append(f"reserved roles bound to <RESERVED_N> slots: {roles} OK")
+    notes += check_domain_delimiter_roles(contract, id_to_tok)
     return notes
+
+
+def check_domain_delimiter_roles(contract: dict, id_to_tok: dict[int, str]) -> list[str]:
+    assignments = contract.get("reserved_role_assignments")
+    if not isinstance(assignments, dict):
+        raise ContractError(
+            "WHERE=contract WHAT=reserved_role_assignments must be an object"
+        )
+
+    domain_ids: dict[int, str] = {}
+    for base in DOMAIN_DELIMITER_ROLE_PAIRS:
+        for edge in ("START", "END"):
+            role = f"{base}_{edge}"
+            if role not in assignments:
+                raise ContractError(
+                    f"WHERE=contract WHAT=missing domain delimiter role {role}"
+                )
+            token_id = assignments[role]
+            if not isinstance(token_id, int) or isinstance(token_id, bool):
+                raise ContractError(
+                    f"WHERE=contract WHAT=domain delimiter role {role} id must be int, "
+                    f"got {token_id!r}"
+                )
+            token = id_to_tok.get(token_id)
+            if token != f"<RESERVED_{token_id}>":
+                raise ContractError(
+                    f"WHERE=contract WHAT=domain delimiter role {role} id {token_id} "
+                    f"maps to {token!r}, expected '<RESERVED_{token_id}>'"
+                )
+            previous = domain_ids.setdefault(token_id, role)
+            if previous != role:
+                raise ContractError(
+                    f"WHERE=contract WHAT=domain delimiter id collision: id {token_id} "
+                    f"maps to both {previous} and {role}"
+                )
+
+    return [
+        "domain delimiter roles: "
+        f"{len(DOMAIN_DELIMITER_ROLE_PAIRS)} START/END pairs in <RESERVED_N> slots OK"
+    ]
 
 
 def check_contract_vs_mlx_constants(contract: dict, mlx_root: Path) -> list[str]:
@@ -106,7 +169,13 @@ def check_contract_vs_mlx_constants(contract: dict, mlx_root: Path) -> list[str]
                 raise ContractError(
                     f"WHERE={tc} WHAT={name}={tid} disagrees with contract {special[name]}"
                 )
-        notes.append(f"{tc.name}: special ids agree with contract OK")
+            if name in contract["reserved_role_assignments"]:
+                want = contract["reserved_role_assignments"][name]
+                if want != tid:
+                    raise ContractError(
+                        f"WHERE={tc} WHAT={name}={tid} disagrees with reserved role {want}"
+                    )
+        notes.append(f"{tc.name}: special/reserved ids agree with contract OK")
 
     # cpp_tokenizer.py EXPECTED_VOCAB_SIZE
     cpt = mlx_root / "cppmega_mlx" / "tokenizer" / "cpp_tokenizer.py"

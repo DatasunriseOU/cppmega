@@ -1,22 +1,42 @@
-"""Helpers for threading structure metadata through cppmega Megatron models."""
+"""Helpers for threading cppmega sidecar metadata through Megatron models."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 
-_STRUCTURE_KEYS = (
+TOKEN_SIDECAR_KEYS = (
     "structure_ids",
     "dep_levels",
     "ast_depth_ids",
     "sibling_index_ids",
     "node_type_ids",
+    "platform_ids",
+    "symbol_ids",
+    "call_targets",
+    "type_refs",
+    "def_use",
+    "change_mask_pre",
+    "change_mask_post",
+)
+
+GRAPH_ROUTE_KEYS = (
+    "graph_call_edges",
+    "graph_call_edge_counts",
+    "graph_type_edges",
+    "graph_type_edge_counts",
+    "graph_chunk_starts",
+    "graph_chunk_ends",
+    "graph_chunk_kinds",
+    "graph_chunk_dep_levels",
+    "graph_chunk_counts",
 )
 
 
 def extract_structure_inputs(batch: Mapping[str, object] | None) -> dict[str, object] | None:
     if batch is None:
         return None
-    extracted = {key: batch[key] for key in _STRUCTURE_KEYS if key in batch and batch[key] is not None}
+    keys = TOKEN_SIDECAR_KEYS + GRAPH_ROUTE_KEYS
+    extracted = {key: batch[key] for key in keys if key in batch and batch[key] is not None}
     return extracted or None
 
 

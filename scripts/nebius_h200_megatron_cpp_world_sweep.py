@@ -35,13 +35,13 @@ DEFAULT_SIDECAR_PREFIX = (
     ROOT.parent
     / "cppmega.mlx"
     / "outputs"
-    / "nebius_smoke"
-    / "megatron"
-    / "cppmega_1024_smoke_mix_train"
+    / "megatron_ready"
+    / "cppmega_1024_current_mix_graph_train"
 )
 DEFAULT_TOKENIZER_DIR = ROOT / "data" / "tokenizer_v2"
 OVERLAY_PATHS = (
     "cppmega/recipes/run_profiles.py",
+    "cppmega/megatron/structure_batch.py",
     "cppmega/megatron/structure_dataset_patch.py",
 )
 
@@ -91,6 +91,9 @@ def make_sidecar_tar(prefix: Path, tokenizer_dir: Path, path: Path) -> None:
     manifest = json.loads(prefix.with_suffix(".json").read_text())
     for entry in manifest.get("side_channel_paths", {}).values():
         required.append(prefix.parent / entry["path"])
+    for entry in manifest.get("graph_sidecar_paths", {}).values():
+        required.append(prefix.parent / entry["offsets_path"])
+        required.append(prefix.parent / entry["data_path"])
     required.extend(sorted(tokenizer_dir.iterdir()))
 
     for item in required:
@@ -384,8 +387,15 @@ def stream_tar_to_remote(args: argparse.Namespace, ip: str, tar_path: Path, targ
         subprocess.run(ssh_cmd, stdin=f, check=True)
 
 
-def remote_run_script(batch_sizes: list[int], train_iters: int, docker_image: str) -> str:
+def remote_run_script(
+    batch_sizes: list[int],
+    train_iters: int,
+    docker_image: str,
+    *,
+    data_prefix_name: str = "cppmega_1024_smoke_mix_train",
+) -> str:
     batches = " ".join(str(v) for v in batch_sizes)
+    data_prefix = shlex.quote(f"/data/cppmega_sidecar/{data_prefix_name}")
     return textwrap.dedent(
         f"""\
         #!/usr/bin/env bash
@@ -426,6 +436,10 @@ def remote_run_script(batch_sizes: list[int], train_iters: int, docker_image: st
         export NCCL_GRAPH_REGISTER=0
         export PYTORCH_CUDA_ALLOC_CONF="${{PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}}"
         export TRITON_CACHE_DIR="/data/.triton-cache"
+        export CPPMEGA_STRUCTURE_ENABLED="${{CPPMEGA_STRUCTURE_ENABLED:-1}}"
+        export CPPMEGA_GRAPH_ROUTES_ENABLED="${{CPPMEGA_GRAPH_ROUTES_ENABLED:-1}}"
+        export CPPMEGA_GRAPH_MAX_EDGES="${{CPPMEGA_GRAPH_MAX_EDGES:-256}}"
+        export CPPMEGA_GRAPH_MAX_CHUNKS="${{CPPMEGA_GRAPH_MAX_CHUNKS:-256}}"
         mkdir -p "$TRITON_CACHE_DIR" /data/cppmega_h200_results
 
         python - <<'PY'
@@ -533,7 +547,7 @@ def remote_run_script(batch_sizes: list[int], train_iters: int, docker_image: st
               --train-iters {train_iters} \\
               --fp8-recipe off)\\\"
 
-            DATA_ARGS=(--data-path 1.0 /data/cppmega_sidecar/cppmega_1024_smoke_mix_train)
+            DATA_ARGS=(--data-path 1.0 {data_prefix})
             OPTIMIZER_ARGS=(--optimizer \\\"\\$CPPMEGA_OPTIMIZER\\\")
             if [[ \\\"\\$CPPMEGA_OPTIMIZER\\\" == muon || \\\"\\$CPPMEGA_OPTIMIZER\\\" == dist_muon || \\\"\\$CPPMEGA_OPTIMIZER\\\" == adaptive_muon ]]; then
               OPTIMIZER_ARGS+=(--muon-momentum \\\"\\$CPPMEGA_MUON_MOMENTUM\\\" --muon-scale-mode \\\"\\$CPPMEGA_MUON_SCALE_MODE\\\" --muon-num-ns-steps \\\"\\$CPPMEGA_MUON_NUM_NS_STEPS\\\" --muon-tp-mode \\\"\\$CPPMEGA_MUON_TP_MODE\\\" --muon-scalar-optimizer \\\"\\$CPPMEGA_MUON_SCALAR_OPTIMIZER\\\")
@@ -672,7 +686,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         print(f"sidecar_prefix={args.sidecar_prefix}")
         print(f"tokenizer_dir={args.tokenizer_dir}")
         print(f"batches={batches}")
-        print(remote_run_script(batches, args.train_iters, args.docker_image)[:4000])
+        print(
+            remote_run_script(
+                batches,
+                args.train_iters,
+                args.docker_image,
+                data_prefix_name=args.sidecar_prefix.name,
+            )[:4000]
+        )
         return 0
 
     instance_id: str | None = None
@@ -697,7 +718,12 @@ def main(argv: Iterable[str] | None = None) -> int:
             stream_tar_to_remote(args, ip, sidecar_tar, "/data")
             if has_ghcr_auth:
                 stream_tar_to_remote(args, ip, ghcr_auth_tar, "/data")
-            script = remote_run_script(batches, args.train_iters, args.docker_image)
+            script = remote_run_script(
+                batches,
+                args.train_iters,
+                args.docker_image,
+                data_prefix_name=args.sidecar_prefix.name,
+            )
             ssh(args, ip, f"cat > /data/run_cppmega_h200_sweep.sh <<'EOF'\n{script}\nEOF\nchmod +x /data/run_cppmega_h200_sweep.sh")
             try:
                 ssh(args, ip, "bash /data/run_cppmega_h200_sweep.sh", timeout=7200)

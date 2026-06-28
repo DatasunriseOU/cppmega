@@ -1,4 +1,5 @@
 from scripts.nebius_h200_megatron_cpp_world_sweep import (
+    OVERLAY_PATHS,
     first_public_ip,
     make_ghcr_auth_tar,
     remote_run_script,
@@ -57,6 +58,24 @@ def test_remote_script_does_not_shadow_upstream_model_provider():
     assert "model_provider.py" not in script
 
 
+def test_overlay_includes_batch_and_dataset_sidecar_contract():
+    assert "cppmega/megatron/structure_dataset_patch.py" in OVERLAY_PATHS
+    assert "cppmega/megatron/structure_batch.py" in OVERLAY_PATHS
+
+
+def test_remote_script_enables_graph_routes_and_uses_selected_data_prefix():
+    script = remote_run_script(
+        [256],
+        1,
+        "ghcr.io/datasunriseou/cppmega:latest",
+        data_prefix_name="cppmega_1024_current_mix_graph_train",
+    )
+
+    assert 'export CPPMEGA_STRUCTURE_ENABLED="${CPPMEGA_STRUCTURE_ENABLED:-1}"' in script
+    assert 'export CPPMEGA_GRAPH_ROUTES_ENABLED="${CPPMEGA_GRAPH_ROUTES_ENABLED:-1}"' in script
+    assert "--data-path 1.0 /data/cppmega_sidecar/cppmega_1024_current_mix_graph_train" in script
+
+
 def test_make_ghcr_auth_tar_uses_token_file(tmp_path):
     token = tmp_path / "token.txt"
     token.write_text("SECRET_TOKEN")
@@ -76,3 +95,48 @@ def test_make_ghcr_auth_tar_uses_token_file(tmp_path):
         assert names == ["cppmega_auth/ghcr_token", "cppmega_auth/ghcr_user"]
         assert tf.extractfile("cppmega_auth/ghcr_user").read().decode() == "datasunrise"
         assert tf.extractfile("cppmega_auth/ghcr_token").read().decode() == "SECRET_TOKEN"
+
+
+def test_make_sidecar_tar_includes_graph_sidecars(tmp_path):
+    prefix = tmp_path / "sample_train"
+    tokenizer = tmp_path / "tok"
+    tokenizer.mkdir()
+    (tokenizer / "tokenizer.json").write_text("{}")
+
+    (prefix.with_suffix(".bin")).write_bytes(b"tokens")
+    (prefix.with_suffix(".idx")).write_bytes(b"index")
+    (tmp_path / "sample_train_token_structure_ids.bin").write_bytes(b"s")
+    (tmp_path / "sample_train_token_call_edges_offsets.bin").write_bytes(b"o")
+    (tmp_path / "sample_train_token_call_edges_data.bin").write_bytes(b"d")
+    prefix.with_suffix(".json").write_text(
+        __import__("json").dumps(
+            {
+                "side_channel_paths": {
+                    "token_structure_ids": {
+                        "path": "sample_train_token_structure_ids.bin",
+                        "dtype": "uint8",
+                    }
+                },
+                "graph_sidecar_paths": {
+                    "token_call_edges": {
+                        "offsets_path": "sample_train_token_call_edges_offsets.bin",
+                        "data_path": "sample_train_token_call_edges_data.bin",
+                    }
+                },
+            }
+        )
+    )
+    out = tmp_path / "sidecar.tgz"
+
+    from scripts.nebius_h200_megatron_cpp_world_sweep import make_sidecar_tar
+
+    make_sidecar_tar(prefix, tokenizer, out)
+
+    import tarfile
+
+    with tarfile.open(out, "r:gz") as tf:
+        names = set(tf.getnames())
+    assert "cppmega_sidecar/sample_train_token_structure_ids.bin" in names
+    assert "cppmega_sidecar/sample_train_token_call_edges_offsets.bin" in names
+    assert "cppmega_sidecar/sample_train_token_call_edges_data.bin" in names
+    assert "cpp_tokenizer_hf/tokenizer.json" in names

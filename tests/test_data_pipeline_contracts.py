@@ -141,6 +141,22 @@ def test_prepare_data_dispatcher_runs_fail_closed_gates_before_trainable_verify(
     assert "build_dataset_manifest.py" in script
 
 
+def test_tokenizer_contract_verifier_rejects_unpaired_domain_delimiter() -> None:
+    verify = _load_module(
+        "verify_tokenizer_contract",
+        "scripts/data/verify_tokenizer_contract.py",
+    )
+    contract = {
+        "reserved_role_assignments": {
+            "CPP_CODE_START": 53,
+        },
+    }
+    id_to_token = {53: "<RESERVED_53>"}
+
+    with pytest.raises(verify.ContractError, match="CPP_CODE_END"):
+        verify.check_domain_delimiter_roles(contract, id_to_token)
+
+
 def test_side_channel_checker_has_full_sidecar_gate() -> None:
     script = (_REPO_ROOT / "scripts/data/verify_side_channel_shapes.py").read_text()
 

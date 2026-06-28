@@ -10,9 +10,13 @@ required — this test inlines the upstream reference.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
-from cppmega.megatron.dsa_indexer_fused_patch import compute_index_scores_fused_bf16
+from cppmega.megatron.dsa_indexer_fused_patch import (
+    build_graph_route_bias_from_structure_batch,
+    compute_index_scores_fused_bf16,
+)
 
 
 def _upstream_reference(
@@ -69,6 +73,71 @@ def test_fused_matches_reference_bf16_no_relu():
     rel_err = abs_err / max(ref.abs().max().item(), 1e-6)
     print(f"relu=False abs_err={abs_err:.3e} rel_err={rel_err:.3e}")
     assert rel_err < 1e-3, f"rel_err {rel_err} too high"
+
+
+def test_graph_route_bias_from_structure_batch_scatter_edges():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    structure_batch = {
+        "graph_call_edges": torch.tensor(
+            [[[0, 2], [1, 3], [-1, -1]]], dtype=torch.long
+        ),
+        "graph_call_edge_counts": torch.tensor([2], dtype=torch.long),
+        "graph_type_edges": torch.tensor([[[2, 1], [-1, -1]]], dtype=torch.long),
+        "graph_type_edge_counts": torch.tensor([1], dtype=torch.long),
+    }
+
+    bias = build_graph_route_bias_from_structure_batch(
+        structure_batch,
+        batch_size=1,
+        seqlen_q=4,
+        seqlen_k=4,
+        device=device,
+        call_weight=2.0,
+        type_weight=3.0,
+    )
+
+    assert tuple(bias.shape) == (1, 4, 4)
+    assert bias[0, 0, 2].item() == 2.0
+    assert bias[0, 1, 3].item() == 2.0
+    assert bias[0, 2, 1].item() == 3.0
+    assert bias.sum().item() == 7.0
+
+
+def test_fused_scores_add_graph_route_bias_before_topk():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    sq = sk = 4
+    b, h, d = 1, 2, 8
+    q = torch.zeros(sq, b, h, d, dtype=torch.bfloat16, device=device)
+    k = torch.zeros(sk, b, d, dtype=torch.bfloat16, device=device)
+    w = torch.ones(sq, b, h, dtype=torch.bfloat16, device=device)
+    graph_bias = torch.zeros((b, sq, sk), dtype=torch.float32, device=device)
+    graph_bias[0, 1, 3] = 1.0
+    graph_bias[0, 2, 0] = 0.5
+
+    scores = compute_index_scores_fused_bf16(
+        q,
+        w,
+        k,
+        use_relu=True,
+        graph_bias=graph_bias,
+        graph_beta=10.0,
+    )
+
+    assert scores[0, 1, 3].item() == 10.0
+    assert scores[0, 2, 0].item() == 5.0
+    assert scores[0, 0, 0].item() == 0.0
+
+
+def test_graph_route_bias_requires_structure_batch():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    with pytest.raises(RuntimeError, match="no current cppmega structure batch"):
+        build_graph_route_bias_from_structure_batch(
+            None,
+            batch_size=1,
+            seqlen_q=4,
+            seqlen_k=4,
+            device=device,
+        )
 
 
 def test_fused_nam56r_shape():

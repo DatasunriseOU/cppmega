@@ -55,6 +55,7 @@ inside a custom-autograd recompute in the bwd).
 from __future__ import annotations
 
 import logging
+import os
 
 import torch
 
@@ -62,10 +63,187 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "apply_dsa_indexer_fused_patch",
+    "build_graph_route_bias_from_structure_batch",
     "compute_index_scores_fused_bf16",
 ]
 
 _PATCH_MARKER = "__cppmega_dsa_indexer_fused_patched__"
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a float, got {raw!r}") from exc
+
+
+def _as_batched_edges(
+    structure_batch: dict[str, torch.Tensor],
+    *,
+    edge_key: str,
+    count_key: str,
+    batch_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    edges = structure_batch.get(edge_key)
+    counts = structure_batch.get(count_key)
+    if edges is None and counts is None:
+        return None
+    if edges is None or counts is None:
+        raise KeyError(
+            f"graph route sidecar must provide both {edge_key!r} and "
+            f"{count_key!r}; got edges={edges is not None} counts={counts is not None}"
+        )
+    if not isinstance(edges, torch.Tensor) or not isinstance(counts, torch.Tensor):
+        raise TypeError(
+            f"graph route sidecars {edge_key!r}/{count_key!r} must be torch.Tensor, "
+            f"got {type(edges).__name__}/{type(counts).__name__}"
+        )
+    if edges.dim() == 2:
+        edges = edges.unsqueeze(0)
+    if edges.dim() != 3 or int(edges.shape[-1]) != 2:
+        raise ValueError(
+            f"{edge_key} must have shape [B,max_edges,2] or [max_edges,2], "
+            f"got {tuple(edges.shape)}"
+        )
+    counts = counts.reshape(-1)
+    if int(edges.shape[0]) not in (1, batch_size):
+        raise ValueError(
+            f"{edge_key} batch {int(edges.shape[0])} must be 1 or {batch_size}"
+        )
+    if int(counts.shape[0]) not in (1, batch_size):
+        raise ValueError(
+            f"{count_key} batch {int(counts.shape[0])} must be 1 or {batch_size}"
+        )
+    return edges.to(device=device, dtype=torch.long), counts.to(device=device, dtype=torch.long)
+
+
+def _scatter_relation_edges_(
+    bias: torch.Tensor,
+    edges: torch.Tensor,
+    counts: torch.Tensor,
+    *,
+    weight: float,
+    sq: int,
+    sk: int,
+) -> None:
+    if weight == 0.0:
+        return
+    batch_size = int(bias.shape[0])
+    max_edges = int(edges.shape[1])
+    for bi in range(batch_size):
+        edge_b = 0 if int(edges.shape[0]) == 1 else bi
+        count_b = 0 if int(counts.shape[0]) == 1 else bi
+        n = max(0, min(int(counts[count_b].item()), max_edges))
+        if n == 0:
+            continue
+        pairs = edges[edge_b, :n]
+        src = pairs[:, 0]
+        dst = pairs[:, 1]
+        valid = (src >= 0) & (src < sq) & (dst >= 0) & (dst < sk)
+        if not bool(valid.any().item()):
+            continue
+        bias[bi, src[valid], dst[valid]] += float(weight)
+
+
+def build_graph_route_bias_from_structure_batch(
+    structure_batch: dict[str, torch.Tensor] | None,
+    *,
+    batch_size: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+    call_weight: float = 1.0,
+    type_weight: float = 1.0,
+) -> torch.Tensor:
+    """Build ``S_graph[b,t,s]`` from cppmega graph route sidecars.
+
+    The current Megatron sidecar bridge carries token-position edge pairs:
+    ``graph_call_edges`` / ``graph_type_edges`` plus per-row counts.  This helper
+    turns them into the dense additive indexer prior used before DSA top-k.
+    It intentionally raises on missing/malformed route sidecars: graph-routed
+    cppmega models must not silently become token-only.
+    """
+
+    if structure_batch is None:
+        raise RuntimeError(
+            "CPPMEGA_GRAPH_ROUTES_ENABLED=1 but no current cppmega structure "
+            "batch is available; refusing token-only DSA indexer"
+        )
+    if batch_size <= 0 or seqlen_q <= 0 or seqlen_k <= 0:
+        raise ValueError(
+            "build_graph_route_bias_from_structure_batch: batch/seqlen must be "
+            f"positive, got B={batch_size} Sq={seqlen_q} Sk={seqlen_k}"
+        )
+
+    bias = torch.zeros(
+        (batch_size, seqlen_q, seqlen_k), device=device, dtype=dtype
+    )
+    seen_relation = False
+    for edge_key, count_key, weight in (
+        ("graph_call_edges", "graph_call_edge_counts", call_weight),
+        ("graph_type_edges", "graph_type_edge_counts", type_weight),
+    ):
+        relation = _as_batched_edges(
+            structure_batch,
+            edge_key=edge_key,
+            count_key=count_key,
+            batch_size=batch_size,
+            device=device,
+        )
+        if relation is None:
+            continue
+        seen_relation = True
+        edges, counts = relation
+        _scatter_relation_edges_(
+            bias,
+            edges,
+            counts,
+            weight=weight,
+            sq=seqlen_q,
+            sk=seqlen_k,
+        )
+    if not seen_relation:
+        raise KeyError(
+            "CPPMEGA_GRAPH_ROUTES_ENABLED=1 but structure batch has no graph "
+            "route edge tensors (expected graph_call_edges/type_edges)"
+        )
+    return bias
+
+
+def _current_graph_route_bias(
+    *,
+    batch_size: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    device: torch.device,
+) -> torch.Tensor:
+    try:
+        from cppmega.megatron.structure_dataset_patch import _get_current_structure_batch
+    except Exception as exc:  # pragma: no cover - exercised in remote Megatron env
+        raise RuntimeError(
+            "CPPMEGA_GRAPH_ROUTES_ENABLED=1 but structure_dataset_patch is not "
+            "importable; import it before applying the DSA indexer patch"
+        ) from exc
+
+    return build_graph_route_bias_from_structure_batch(
+        _get_current_structure_batch(),
+        batch_size=batch_size,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        device=device,
+        dtype=torch.float32,
+        call_weight=_env_float("CPPMEGA_DSA_GRAPH_CALL_WEIGHT", 1.0),
+        type_weight=_env_float("CPPMEGA_DSA_GRAPH_TYPE_WEIGHT", 1.0),
+    )
 
 
 def compute_index_scores_fused_bf16(
@@ -73,6 +251,9 @@ def compute_index_scores_fused_bf16(
     weights: torch.Tensor,
     k: torch.Tensor,
     use_relu: bool = True,
+    *,
+    graph_bias: torch.Tensor | None = None,
+    graph_beta: float | torch.Tensor = 1.0,
 ) -> torch.Tensor:
     """Drop-in replacement for Megatron DSA ``_compute_index_scores`` (BF16).
 
@@ -85,6 +266,8 @@ def compute_index_scores_fused_bf16(
         weights: ``[seqlen_q, batch, index_n_heads]``.
         k: ``[seqlen_k, batch, index_head_dim]``.
         use_relu: match upstream's ``use_relu`` flag.
+        graph_bias: optional dense ``S_graph`` prior ``[batch, seqlen_q, seqlen_k]``.
+        graph_beta: scalar multiplier for ``graph_bias``.
 
     Returns:
         ``[batch, seqlen_q, seqlen_k]`` FP32 index scores.
@@ -130,6 +313,19 @@ def compute_index_scores_fused_bf16(
         del logits_h, w_h
 
     del k_bds
+    if graph_bias is not None:
+        if tuple(graph_bias.shape) != (b, sq, sk):
+            raise ValueError(
+                f"graph_bias must be ({b},{sq},{sk}), got {tuple(graph_bias.shape)}"
+            )
+        beta = (
+            graph_beta.to(device=q.device, dtype=torch.float32)
+            if isinstance(graph_beta, torch.Tensor)
+            else torch.tensor(float(graph_beta), device=q.device, dtype=torch.float32)
+        )
+        if beta.numel() != 1:
+            raise ValueError(f"graph_beta must be scalar, got {tuple(beta.shape)}")
+        index_scores.add_(graph_bias.to(device=q.device, dtype=torch.float32) * beta)
     return index_scores
 
 
@@ -157,7 +353,26 @@ def apply_dsa_indexer_fused_patch(*, force: bool = False) -> bool:
         # Accept **kwargs to be forward-compatible with new upstream args
         # (e.g. PR #3674 added ``mask=``).  Unused kwargs are ignored by the
         # fused math — they only affect downstream masking in the caller.
-        return compute_index_scores_fused_bf16(q, weights, k, use_relu=use_relu)
+        graph_bias = None
+        graph_beta = 1.0
+        if _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
+            sq, b, _h, _d = q.shape
+            sk = k.shape[0]
+            graph_bias = _current_graph_route_bias(
+                batch_size=int(b),
+                seqlen_q=int(sq),
+                seqlen_k=int(sk),
+                device=q.device,
+            )
+            graph_beta = _env_float("CPPMEGA_DSA_GRAPH_BIAS_BETA", 1.0)
+        return compute_index_scores_fused_bf16(
+            q,
+            weights,
+            k,
+            use_relu=use_relu,
+            graph_bias=graph_bias,
+            graph_beta=graph_beta,
+        )
 
     setattr(_compute_index_scores_fused, _PATCH_MARKER, True)
     dsa_mod._compute_index_scores = _compute_index_scores_fused
