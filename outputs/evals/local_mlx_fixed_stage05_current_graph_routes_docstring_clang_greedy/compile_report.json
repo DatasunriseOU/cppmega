@@ -1,0 +1,203 @@
+{
+  "results": [
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.12819420802406967,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <algorithm>\n#include <cassert>\n\n/**\n * Return value clamped into inclusive [lo, hi]. If lo > hi, swap bounds first.\n */\nint clamp_int(int value, int lo, int hi) {\nreturn value < lo ? -((((((lo) ^ hi) ^ hi - lo)) & ~~~~~~\n ((((( lo) ^\n  ^ hi)))))) : 0)))) < 0) {\n  return -1;\n}\n}\n/*\n * Return the value clamped into inclusive\n}\n\nint main() {\n    assert(clamp_int(5, 0, 10) == 5);\n    assert(clamp_int(-3, 0, 10) == 0);\n    assert(clamp_int(18, 0, 10) == 10);\n    assert(clamp_int(4, 10, 0) == 4);\n    assert(clamp_int(-1, 10, 0) == 0);\n    return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.3852143748663366,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/clamp_int/candidate.cpp:10:5: error: unknown type name 'hi'\n   10 |   ^ hi)))))) : 0)))) < 0) {\n      |     ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/clamp_int/candidate.cpp:10:7: error: expected expression\n   10 |   ^ hi)))))) : 0)))) < 0) {\n      |       ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/clamp_int/candidate.cpp:14:1: error: unterminated /* comment\n   14 | /*\n      | ^\n3 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/clamp_int/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/clamp_int/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/clamp_int/candidate.cpp",
+      "task_id": "clamp_int"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.01829899987205863,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n\n/**\n * Return true if n is a prime integer.\n */\nbool is_prime(int n) { return (n == 0); }\n/**\n * Return true if n is a prime integer.\n */\nbool is_prime(int n) { return (n_ == 0) || (n_ < 1); }\n/**\n* Return: true if the n is an prime integed integer. (This is\n}\n\nint main() {\n    assert(!is_prime(-7));\n    assert(!is_prime(0));\n    assert(!is_prime(1));\n    assert(is_prime(2));\n    assert(is_prime(3));\n    assert(!is_prime(4));\n    assert(is_prime(97));\n    assert(!is_prime(221));\n    return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.04563358286395669,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/is_prime/candidate.cpp:10:6: error: redefinition of 'is_prime'\n   10 | bool is_prime(int n) { return (n_ == 0) || (n_ < 1); }\n      |      ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/is_prime/candidate.cpp:6:6: note: previous definition is here\n    6 | bool is_prime(int n) { return (n == 0); }\n      |      ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/is_prime/candidate.cpp:10:32: error: use of undeclared identifier 'n_'\n   10 | bool is_prime(int n) { return (n_ == 0) || (n_ < 1); }\n      |                                ^~\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/is_prime/candidate.cpp:10:45: error: use of undeclared identifier 'n_'\n   10 | bool is_prime(int n) { return (n_ == 0) || (n_ < 1); }\n      |                                             ^~\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/is_prime/candidate.cpp:11:1: error: unterminated /* comment\n   11 | /**\n      | ^\n4 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/is_prime/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/is_prime/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/is_prime/candidate.cpp",
+      "task_id": "is_prime"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.018696374958381057,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n#include <string>\n#include <string_view>\n#include <vector>\n\n/**\n * Join non-empty strings with the separator, preserving order.\n */\nstd::string join_non_empty(const std::vector<std::string> &parts,\n                           std::string_view sep) {\n  std::string str;\n  str << \"[[[[[[:______]]]]]]\" << str << std::endl;\n  str += str.str();\n str = str.str(\"]]]]])\";\n return str;\n}\nreturn join_non_empty(parts, str, sep);\n}\n\nint main() {\n  assert(join_non_empty({\"a\", \"\", \"b\", \"c\"}, \":\") == \"a:b:c\");\n  assert(join_non_empty({\"\", \"x\", \"\"}, \",\") == \"x\");\n  assert(join_non_empty({}, \",\") == \"\");\n  assert(join_non_empty({\"\", \"\"}, \",\") == \"\");\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.2853390830568969,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/join_non_empty/candidate.cpp:12:7: error: invalid operands to binary expression ('std::string' (aka 'basic_string<char>') and 'const char[20]')\n   12 |   str << \"[[[[[[:______]]]]]]\" << str << std::endl;\n      |   ~~~ ^  ~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__cstddef/byte.h:63:38: note: candidate template ignored: requirement 'std::is_integral<const char *>::value' was not satisfied [with _Integer = const char *]\n   63 | _LIBCPP_HIDE_FROM_ABI constexpr byte operator<<(byte __lhs, _Integer __shift) noexcept {\n      |                                      ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string_view:906:1: note: candidate template ignored: could not match 'basic_ostream' against 'basic_string'\n  906 | operator<<(basic_ostream<_CharT, _Traits>& __os, basic_string_view<_CharT, _Traits> __str);\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__random/uniform_int_distribution.h:234:1: note: candidate template ignored: could not match 'basic_ostream' against 'basic_string'\n  234 | operator<<(basic_ostream<_CharT, _Traits>& __os, const uniform_int_distribution<_IT>& __x) {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__memory/shared_ptr.h:1433:1: note: candidate template ignored: could not match 'basic_ostream' against 'basic_string'\n 1433 | operator<<(basic_ostream<_CharT, _Traits>& __os, shared_ptr<_Yp> const& __p);\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3936:1: note: candidate template ignored: could not match 'basic_ostream' against 'basic_string'\n 3936 | operator<<(basic_ostream<_CharT, _Traits>& __os, const basic_string<_CharT, _Traits, _Allocator>& __str);\n      | ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/join_non_empty/candidate.cpp:12:47: error: no member named 'endl' in namespace 'std'; did you mean 'end'?\n   12 |   str << \"[[[[[[:______]]]]]]\" << str << std::endl;\n      |                                               ^~~~\n      |                                               end\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/initializer_list:100:71: note: 'end' declared here\n  100 | inline _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX14 const _Ep* end(initializer_list<_Ep> __il) _NOEXCEPT {\n      |                                                                       ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/join_non_empty/candidate.cpp:13:14: error: no member named 'str' in 'std::string'\n   13 |   str += str.str();\n      |          ~~~ ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/join_non_empty/candidate.cpp:14:12: error: no member named 'str' in 'std::string'\n   14 |  str = str.str(\"]]]]])\";\n      |        ~~~ ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/join_non_empty/candidate.cpp:17:1: error: expected unqualified-id\n   17 | return join_non_empty(parts, str, sep);\n      | ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/join_non_empty/candidate.cpp:18:1: error: extraneous closing brace ('}')\n   18 | }\n      | ^\n6 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/join_non_empty/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/join_non_empty/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/join_non_empty/candidate.cpp",
+      "task_id": "join_non_empty"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.01897800015285611,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n#include <cstdint>\n#include <limits>\n#include <optional>\n#include <string_view>\n\n/**\n * Parse an unsigned 32-bit integer from an entire decimal string.\n */\nstd::optional<std::uint32_t> parse_uint(std::string_view text) {\n  std::string result;\n  result = parse_uint(text);\n  if (result == \"\") {\n    return std::nullopt;\n  }\n  if (!parse_uint(result, &parse_uint())) {\n    if (parse_uint(&result, text)) {\n#ifdef NDEBUG\n      << \"parse_uint failed: \" <<\n    }\n\n    int main() {\n      assert(parse_uint(\"0\") && *parse_uint(\"0\") == 0u);\n      assert(parse_uint(\"42\") && *parse_uint(\"42\") == 42u);\n      assert(parse_uint(\"4294967295\") &&\n             *parse_uint(\"4294967295\") ==\n                 std::numeric_limits<std::uint32_t>::max());\n      assert(!parse_uint(\"\"));\n      assert(!parse_uint(\"-1\"));\n      assert(!parse_uint(\"12x\"));\n      assert(!parse_uint(\"4294967296\"));\n      return 0;\n    }\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.20142375002615154,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/parse_uint/candidate.cpp:11:15: error: implicit instantiation of undefined template 'std::basic_string<char>'\n   11 |   std::string result;\n      |               ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__fwd/string.h:43:7: note: template is declared here\n   43 | class basic_string;\n      |       ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/parse_uint/candidate.cpp:16:28: error: no matching function for call to 'parse_uint'\n   16 |   if (!parse_uint(result, &parse_uint())) {\n      |                            ^~~~~~~~~~\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/parse_uint/candidate.cpp:10:30: note: candidate function not viable: requires single argument 'text', but no arguments were provided\n   10 | std::optional<std::uint32_t> parse_uint(std::string_view text) {\n      |                              ^          ~~~~~~~~~~~~~~~~~~~~~\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/parse_uint/candidate.cpp:16:27: error: taking the address of a temporary object of type 'std::optional<std::uint32_t>' (aka 'std::optional<unsigned int>') [-Waddress-of-temporary]\n   16 |   if (!parse_uint(result, &parse_uint())) {\n      |                           ^~~~~~~~~~~~~\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/parse_uint/candidate.cpp:18:2: error: unterminated conditional directive\n   18 | #ifdef NDEBUG\n      |  ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/parse_uint/candidate.cpp:33:6: error: expected '}'\n   33 |     }\n      |      ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/parse_uint/candidate.cpp:17:36: note: to match this '{'\n   17 |     if (parse_uint(&result, text)) {\n      |                                    ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/parse_uint/candidate.cpp:33:6: error: expected '}'\n   33 |     }\n      |      ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/parse_uint/candidate.cpp:16:43: note: to match this '{'\n   16 |   if (!parse_uint(result, &parse_uint())) {\n      |                                           ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/parse_uint/candidate.cpp:33:6: error: expected '}'\n   33 |     }\n      |      ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/parse_uint/candidate.cpp:10:64: note: to match this '{'\n   10 | std::optional<std::uint32_t> parse_uint(std::string_view text) {\n      |                                                                ^\n7 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/parse_uint/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/parse_uint/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_phyd2ogy/parse_uint/candidate.cpp",
+      "task_id": "parse_uint"
+    }
+  ],
+  "summary": {
+    "c_compiler": "clang",
+    "clang_format": "clang-format",
+    "clang_format_ok": 4,
+    "compiled": 0,
+    "cpp_compiler": "clang++",
+    "pass_rate": 0.0,
+    "passed": 0,
+    "ran": 0,
+    "total": 4
+  }
+}

@@ -17,18 +17,19 @@ def cppmega_mamba_builder(
     print_rank_0("building cppmega MAMBA model ...")
     if config is None:
         config = core_transformer_config_from_args(args, TransformerConfig)
-    assert args.use_legacy_models is False, "Mamba only supported in Mcore!"
+    assert not getattr(args, "use_legacy_models", False), "Mamba only supported in Mcore!"
 
     if args.spec is None:
         raise ValueError("cppmega_mamba_builder requires --spec")
 
     spec_or_factory = import_module(args.spec)
     mamba_stack_spec = spec_or_factory(config) if callable(spec_or_factory) else spec_or_factory
+    vocab_size = getattr(args, "padded_vocab_size", None) or getattr(args, "vocab_size")
 
     model = CppMegaMambaModel(
         config=config,
         mamba_stack_spec=mamba_stack_spec,
-        vocab_size=args.padded_vocab_size,
+        vocab_size=vocab_size,
         max_sequence_length=args.max_position_embeddings,
         hybrid_layer_pattern=args.hybrid_layer_pattern,
         pre_process=pre_process,

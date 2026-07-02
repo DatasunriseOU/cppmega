@@ -125,6 +125,47 @@ def _as_batched_edges(
     return edges.to(device=device, dtype=torch.long), counts.to(device=device, dtype=torch.long)
 
 
+def _as_batched_edge_triples(
+    structure_batch: dict[str, torch.Tensor],
+    *,
+    edge_key: str,
+    count_key: str,
+    batch_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    edges = structure_batch.get(edge_key)
+    counts = structure_batch.get(count_key)
+    if edges is None and counts is None:
+        return None
+    if edges is None or counts is None:
+        raise KeyError(
+            f"domain graph route sidecar must provide both {edge_key!r} and "
+            f"{count_key!r}; got edges={edges is not None} counts={counts is not None}"
+        )
+    if not isinstance(edges, torch.Tensor) or not isinstance(counts, torch.Tensor):
+        raise TypeError(
+            f"domain graph route sidecars {edge_key!r}/{count_key!r} must be "
+            f"torch.Tensor, got {type(edges).__name__}/{type(counts).__name__}"
+        )
+    if edges.dim() == 2:
+        edges = edges.unsqueeze(0)
+    if edges.dim() != 3 or int(edges.shape[-1]) != 3:
+        raise ValueError(
+            f"{edge_key} must have shape [B,max_edges,3] or [max_edges,3], "
+            f"got {tuple(edges.shape)}"
+        )
+    counts = counts.reshape(-1)
+    if int(edges.shape[0]) not in (1, batch_size):
+        raise ValueError(
+            f"{edge_key} batch {int(edges.shape[0])} must be 1 or {batch_size}"
+        )
+    if int(counts.shape[0]) not in (1, batch_size):
+        raise ValueError(
+            f"{count_key} batch {int(counts.shape[0])} must be 1 or {batch_size}"
+        )
+    return edges.to(device=device, dtype=torch.long), counts.to(device=device, dtype=torch.long)
+
+
 def _scatter_relation_edges_(
     bias: torch.Tensor,
     edges: torch.Tensor,
@@ -153,6 +194,35 @@ def _scatter_relation_edges_(
         bias[bi, src[valid], dst[valid]] += float(weight)
 
 
+def _scatter_relation_edge_triples_(
+    bias: torch.Tensor,
+    edges: torch.Tensor,
+    counts: torch.Tensor,
+    *,
+    weight: float,
+    sq: int,
+    sk: int,
+) -> None:
+    if weight == 0.0:
+        return
+    batch_size = int(bias.shape[0])
+    max_edges = int(edges.shape[1])
+    for bi in range(batch_size):
+        edge_b = 0 if int(edges.shape[0]) == 1 else bi
+        count_b = 0 if int(counts.shape[0]) == 1 else bi
+        n = max(0, min(int(counts[count_b].item()), max_edges))
+        if n == 0:
+            continue
+        triples = edges[edge_b, :n]
+        src = triples[:, 0]
+        dst = triples[:, 1]
+        kind = triples[:, 2]
+        valid = (src >= 0) & (src < sq) & (dst >= 0) & (dst < sk) & (kind >= 0)
+        if not bool(valid.any().item()):
+            continue
+        bias[bi, src[valid], dst[valid]] += float(weight)
+
+
 def build_graph_route_bias_from_structure_batch(
     structure_batch: dict[str, torch.Tensor] | None,
     *,
@@ -163,6 +233,11 @@ def build_graph_route_bias_from_structure_batch(
     dtype: torch.dtype = torch.float32,
     call_weight: float = 1.0,
     type_weight: float = 1.0,
+    domain_weight: float = 1.0,
+    build_weight: float = 1.0,
+    shell_weight: float = 1.0,
+    diagnostic_weight: float = 1.0,
+    cross_domain_weight: float = 1.0,
 ) -> torch.Tensor:
     """Build ``S_graph[b,t,s]`` from cppmega graph route sidecars.
 
@@ -211,10 +286,37 @@ def build_graph_route_bias_from_structure_batch(
             sq=seqlen_q,
             sk=seqlen_k,
         )
+    for edge_key, count_key, weight in (
+        ("graph_domain_edges", "graph_domain_edge_counts", domain_weight),
+        ("graph_build_edges", "graph_build_edge_counts", build_weight),
+        ("graph_shell_edges", "graph_shell_edge_counts", shell_weight),
+        ("graph_diagnostic_edges", "graph_diagnostic_edge_counts", diagnostic_weight),
+        ("graph_cross_domain_edges", "graph_cross_domain_edge_counts", cross_domain_weight),
+    ):
+        relation = _as_batched_edge_triples(
+            structure_batch,
+            edge_key=edge_key,
+            count_key=count_key,
+            batch_size=batch_size,
+            device=device,
+        )
+        if relation is None:
+            continue
+        seen_relation = True
+        edges, counts = relation
+        _scatter_relation_edge_triples_(
+            bias,
+            edges,
+            counts,
+            weight=weight,
+            sq=seqlen_q,
+            sk=seqlen_k,
+        )
     if not seen_relation:
         raise KeyError(
             "CPPMEGA_GRAPH_ROUTES_ENABLED=1 but structure batch has no graph "
-            "route edge tensors (expected graph_call_edges/type_edges)"
+            "route edge tensors (expected graph_call_edges/type_edges or "
+            "domain/build/shell/diagnostic/cross-domain edges)"
         )
     return bias
 
@@ -243,6 +345,11 @@ def _current_graph_route_bias(
         dtype=torch.float32,
         call_weight=_env_float("CPPMEGA_DSA_GRAPH_CALL_WEIGHT", 1.0),
         type_weight=_env_float("CPPMEGA_DSA_GRAPH_TYPE_WEIGHT", 1.0),
+        domain_weight=_env_float("CPPMEGA_DSA_GRAPH_DOMAIN_WEIGHT", 1.0),
+        build_weight=_env_float("CPPMEGA_DSA_GRAPH_BUILD_WEIGHT", 1.0),
+        shell_weight=_env_float("CPPMEGA_DSA_GRAPH_SHELL_WEIGHT", 1.0),
+        diagnostic_weight=_env_float("CPPMEGA_DSA_GRAPH_DIAGNOSTIC_WEIGHT", 1.0),
+        cross_domain_weight=_env_float("CPPMEGA_DSA_GRAPH_CROSS_DOMAIN_WEIGHT", 1.0),
     )
 
 

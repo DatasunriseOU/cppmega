@@ -1,0 +1,203 @@
+{
+  "results": [
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.026539500104263425,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <algorithm>\n#include <cassert>\n\n/**\n * Return value clamped into inclusive [lo, hi]. If lo > hi, swap bounds first.\n */\nint clamp_int(int value, int lo, int hi) { return clamp_int(value, lo, hi); }\n/* Return value clamped into inclusive [lo, hi]. If lo > hi, swap bounds first.\n */\nstatic const int clamp_int = -1;\n/* Ret value clamped_int into indiv [lo,hi]. If\n * lo >-lo\n}\n\nint main() {\n    assert(clamp_int(5, 0, 10) == 5);\n    assert(clamp_int(-3, 0, 10) == 0);\n    assert(clamp_int(18, 0, 10) == 10);\n    assert(clamp_int(4, 10, 0) == 4);\n    assert(clamp_int(-1, 10, 0) == 0);\n    return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.2171541249845177,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/clamp_int/candidate.cpp:10:18: error: redefinition of 'clamp_int' as different kind of symbol\n   10 | static const int clamp_int = -1;\n      |                  ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/clamp_int/candidate.cpp:7:5: note: previous definition is here\n    7 | int clamp_int(int value, int lo, int hi) { return clamp_int(value, lo, hi); }\n      |     ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/clamp_int/candidate.cpp:11:1: error: unterminated /* comment\n   11 | /* Ret value clamped_int into indiv [lo,hi]. If\n      | ^\n2 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/clamp_int/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/clamp_int/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/clamp_int/candidate.cpp",
+      "task_id": "clamp_int"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.028455084189772606,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n\n/**\n * Return true if n is a prime integer.\n */\nbool is_prime(int n) {\nif (n >= ((((((       +     \\     \"     64     l     t     idx     n     (((((     )     int     , )   ) n n n)))))) {\n return false;\n}\nreturn true;\n}\n\nint main() {\n  assert(!is_prime(-7));\n  assert(!is_prime(0));\n  assert(!is_prime(1));\n  assert(is_prime(2));\n  assert(is_prime(3));\n  assert(!is_prime(4));\n  assert(is_prime(97));\n  assert(!is_prime(221));\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.050428415881469846,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/is_prime/candidate.cpp:7:29: error: expected expression\n    7 | if (n >= ((((((       +     \\     \"     64     l     t     idx     n     (((((     )     int     , )   ) n n n)))))) {\n      |                             ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/is_prime/candidate.cpp:7:35: warning: missing terminating '\"' character [-Winvalid-pp-token]\n    7 | if (n >= ((((((       +     \\     \"     64     l     t     idx     n     (((((     )     int     , )   ) n n n)))))) {\n      |                                   ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/is_prime/candidate.cpp:10:1: error: expected unqualified-id\n   10 | return true;\n      | ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/is_prime/candidate.cpp:11:1: error: extraneous closing brace ('}')\n   11 | }\n      | ^\n1 warning and 3 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/is_prime/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/is_prime/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/is_prime/candidate.cpp",
+      "task_id": "is_prime"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.021005749935284257,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n#include <string>\n#include <string_view>\n#include <vector>\n\n/**\n * Join non-empty strings with the separator, preserving order.\n */\nstd::string join_non_empty(const std::vector<std::string> &parts,\n                           std::string_view sep) {\n  std::string sep_sep = sep.substr(sep.length());\n  std::string separator = sep.find(sep_sep);\n  if (separator == std::string::npos) {\n    separator += sep_sep;\n  }\n  separator.insert(separator.end(), sep_sep); // separator + separator\n}\nreturn sep_sep;\n;\n}\n\nint main() {\n  assert(join_non_empty({\"a\", \"\", \"b\", \"c\"}, \":\") == \"a:b:c\");\n  assert(join_non_empty({\"\", \"x\", \"\"}, \",\") == \"x\");\n  assert(join_non_empty({}, \",\") == \"\");\n  assert(join_non_empty({\"\", \"\"}, \",\") == \"\");\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.3052198749501258,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/join_non_empty/candidate.cpp:11:15: error: no viable conversion from 'std::string_view' to 'std::string' (aka 'basic_string<char>')\n   11 |   std::string sep_sep = sep.substr(sep.length());\n      |               ^         ~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1002:71: note: candidate constructor not viable: no known conversion from 'std::string_view' to 'const std::string &' for 1st argument\n 1002 |   _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_STRING_INTERNAL_MEMORY_ACCESS basic_string(const basic_string& __str)\n      |                                                                       ^            ~~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1022:55: note: candidate constructor not viable: no known conversion from 'std::string_view' to 'std::string &&' for 1st argument\n 1022 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 basic_string(basic_string&& __str)\n      |                                                       ^            ~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1062:55: note: candidate constructor template not viable: no known conversion from 'std::string_view' to 'const char * _Nonnull' for 1st argument\n 1062 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 basic_string(const _CharT* _LIBCPP_DIAGNOSE_NULLPTR __s) {\n      |                                                       ^            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1197:55: note: candidate constructor not viable: no known conversion from 'std::string_view' to 'initializer_list<char>' for 1st argument\n 1197 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 basic_string(initializer_list<_CharT> __il) {\n      |                                                       ^            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:987:64: note: explicit constructor is not a candidate\n  987 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 explicit basic_string(const allocator_type& __a)\n      |                                                                ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1156:64: note: explicit constructor is not a candidate\n 1156 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 explicit basic_string(const _Tp& __t) {\n      |                                                                ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/join_non_empty/candidate.cpp:12:15: error: no viable conversion from 'size_type' (aka 'unsigned long') to 'std::string' (aka 'basic_string<char>')\n   12 |   std::string separator = sep.find(sep_sep);\n      |               ^           ~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1002:71: note: candidate constructor not viable: no known conversion from 'size_type' (aka 'unsigned long') to 'const std::string &' for 1st argument\n 1002 |   _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_STRING_INTERNAL_MEMORY_ACCESS basic_string(const basic_string& __str)\n      |                                                                       ^            ~~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1022:55: note: candidate constructor not viable: no known conversion from 'size_type' (aka 'unsigned long') to 'std::string &&' for 1st argument\n 1022 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 basic_string(basic_string&& __str)\n      |                                                       ^            ~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1062:55: note: candidate constructor template not viable: no known conversion from 'size_type' (aka 'unsigned long') to 'const char * _Nonnull' for 1st argument\n 1062 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 basic_string(const _CharT* _LIBCPP_DIAGNOSE_NULLPTR __s) {\n      |                                                       ^            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1197:55: note: candidate constructor not viable: no known conversion from 'size_type' (aka 'unsigned long') to 'initializer_list<char>' for 1st argument\n 1197 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 basic_string(initializer_list<_CharT> __il) {\n      |                                                       ^            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:987:64: note: explicit constructor is not a candidate\n  987 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 explicit basic_string(const allocator_type& __a)\n      |                                                                ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1156:64: note: explicit constructor is not a candidate\n 1156 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 explicit basic_string(const _Tp& __t) {\n      |                                                                ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/join_non_empty/candidate.cpp:13:17: error: invalid operands to binary expression ('std::string' (aka 'basic_string<char>') and 'const size_type' (aka 'const unsigned long'))\n   13 |   if (separator == std::string::npos) {\n      |       ~~~~~~~~~ ^  ~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__variant/monostate.h:28:45: note: candidate function not viable: no known conversion from 'std::string' (aka 'basic_string<char>') to 'monostate' for 1st argument\n   28 | _LIBCPP_HIDE_FROM_ABI inline constexpr bool operator==(monostate, monostate) noexcept { return true; }\n      |                                             ^          ~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__system_error/error_condition.h:95:35: note: candidate function not viable: no known conversion from 'std::string' (aka 'basic_string<char>') to 'const error_condition' for 1st argument\n   95 | inline _LIBCPP_HIDE_FROM_ABI bool operator==(const error_condition& __x, const error_condition& __y) _NOEXCEPT {\n      |                                   ^          ~~~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__system_error/error_code.h:91:35: note: candidate function not viable: no known conversion from 'std::string' (aka 'basic_string<char>') to 'const error_code' for 1st argument\n   91 | inline _LIBCPP_HIDE_FROM_ABI bool operator==(const error_code& __x, const error_code& __y) _NOEXCEPT {\n      |                                   ^          ~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__system_error/error_code.h:95:35: note: candidate function not viable: no known conversion from 'std::string' (aka 'basic_string<char>') to 'const error_code' for 1st argument\n   95 | inline _LIBCPP_HIDE_FROM_ABI bool operator==(const error_code& __x, const error_condition& __y) _NOEXCEPT {\n      |                                   ^          ~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__system_error/error_code.h:95:35: note: candidate function (with reversed parameter order) not viable: no known conversion from 'std::string' (aka 'basic_string<char>') to 'const error_condition' for 1st argument\n   95 | inline _LIBCPP_HIDE_FROM_ABI bool operator==(const error_code& __x, const error_condition& __y) _NOEXCEPT {\n      |                                   ^          ~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__thread/id.h:78:35: note: candidate function not viable: no known conversion from 'std::string' (aka 'basic_string<char>') to '__thread_id' for 1st argument\n   78 | inline _LIBCPP_HIDE_FROM_ABI bool operator==(__thread_id __x, __thread_id __y) _NOEXCEPT {\n      |                 \n...<truncated>...\ny/candidate.cpp:20:1: error: extraneous closing brace ('}')\n   20 | }\n      | ^\n6 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/join_non_empty/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/join_non_empty/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/join_non_empty/candidate.cpp",
+      "task_id": "join_non_empty"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.019832667196169496,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n#include <cstdint>\n#include <limits>\n#include <optional>\n#include <string_view>\n\n/**\n * Parse an unsigned 32-bit integer from an entire decimal string.\n */\nstd::optional<std::uint32_t> parse_uint(std::string_view text) {\n  std::optional<std::uint32_t> ret = parse_uint(std::string_view(text));\n  if (ret.empty()) {\n    return std::nullopt;\n  }\n  return ret;\n}\nstd::optional<std_uint32_t> parse_uint8(std::string_view text) {\n  std::optional<uint32_t>\n      ret{std::to_string(text.size())}\n};\nstd::optional <\n}\n\nint main() {\n  assert(parse_uint(\"0\") && *parse_uint(\"0\") == 0u);\n  assert(parse_uint(\"42\") && *parse_uint(\"42\") == 42u);\n  assert(parse_uint(\"4294967295\") &&\n         *parse_uint(\"4294967295\") ==\n             std::numeric_limits<std::uint32_t>::max());\n  assert(!parse_uint(\"\"));\n  assert(!parse_uint(\"-1\"));\n  assert(!parse_uint(\"12x\"));\n  assert(!parse_uint(\"4294967296\"));\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.19612183282151818,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/parse_uint/candidate.cpp:12:11: error: no member named 'empty' in 'std::optional<unsigned int>'\n   12 |   if (ret.empty()) {\n      |       ~~~ ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/parse_uint/candidate.cpp:17:15: error: unknown type name 'std_uint32_t'; did you mean '__uint32_t'?\n   17 | std::optional<std_uint32_t> parse_uint8(std::string_view text) {\n      |               ^~~~~~~~~~~~\n      |               __uint32_t\n/Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk/usr/include/arm/_types.h:36:33: note: '__uint32_t' declared here\n   36 | typedef unsigned int            __uint32_t;\n      |                                 ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/parse_uint/candidate.cpp:19:16: error: no member named 'to_string' in namespace 'std'\n   19 |       ret{std::to_string(text.size())}\n      |                ^~~~~~~~~\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/parse_uint/candidate.cpp:19:39: error: expected ';' at end of declaration\n   19 |       ret{std::to_string(text.size())}\n      |                                       ^\n      |                                       ;\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/parse_uint/candidate.cpp:22:1: error: expected expression\n   22 | }\n      | ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/parse_uint/candidate.cpp:35:2: error: expected '>'\n   35 | }\n      |  ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/parse_uint/candidate.cpp:21:15: note: to match this '<'\n   21 | std::optional <\n      |               ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/parse_uint/candidate.cpp:35:2: error: expected unqualified-id\n   35 | }\n      |  ^\n7 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/parse_uint/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/parse_uint/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_w9dhvhr5/parse_uint/candidate.cpp",
+      "task_id": "parse_uint"
+    }
+  ],
+  "summary": {
+    "c_compiler": "clang",
+    "clang_format": "clang-format",
+    "clang_format_ok": 4,
+    "compiled": 0,
+    "cpp_compiler": "clang++",
+    "pass_rate": 0.0,
+    "passed": 0,
+    "ran": 0,
+    "total": 4
+  }
+}

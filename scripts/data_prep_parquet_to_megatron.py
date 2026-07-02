@@ -57,6 +57,14 @@ _MEGATRON_DTYPE_CODE_MAP = {
 }
 
 DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS: tuple[tuple[str, str], ...] = (
+    ("loss_mask", "uint8"),
+    ("doc_ids", "uint32"),
+    ("token_domain_ids", "uint16"),
+    ("token_role_ids", "uint16"),
+    ("token_entity_ids", "uint32"),
+    ("token_scope_ids", "uint32"),
+    ("token_source_doc_ids", "uint32"),
+    ("token_confidence_ids", "uint8"),
     ("token_structure_ids", "uint8"),
     ("token_dep_levels", "uint16"),
     ("token_ast_depth", "uint16"),
@@ -74,6 +82,11 @@ DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS: tuple[tuple[str, str], ...] = (
 DEFAULT_CPPMEGA_GRAPH_SIDECARS: tuple[tuple[str, str, str], ...] = (
     ("token_call_edges", "edge_pairs", "int32"),
     ("token_type_edges", "edge_pairs", "int32"),
+    ("token_domain_edges", "edge_triples", "int32"),
+    ("token_build_edges", "edge_triples", "int32"),
+    ("token_shell_edges", "edge_triples", "int32"),
+    ("token_diagnostic_edges", "edge_triples", "int32"),
+    ("token_cross_domain_edges", "edge_triples", "int32"),
     ("token_chunk_starts", "ragged_1d", "uint32"),
     ("token_chunk_ends", "ragged_1d", "uint32"),
     ("token_chunk_kinds", "ragged_1d", "uint16"),
@@ -244,6 +257,64 @@ def _normalize_edge_pairs(
     return pairs.astype(np.int32, copy=False)
 
 
+def _normalize_edge_triples(
+    value: object,
+    *,
+    column: str,
+    shard_path: str,
+    row_idx: int,
+) -> np.ndarray:
+    """Normalize a parquet edge-list cell to an ``(E, 3)`` int32 array.
+
+    Accepted element formats:
+    - ``{"from": i, "to": j, "kind": k}``
+    - ``{"src": i, "dst": j, "kind": k}``
+    - ``[i, j, k]`` / ``(i, j, k)``
+    """
+
+    if value is None:
+        return np.zeros((0, 3), dtype=np.int32)
+    triples_list: list[tuple[int, int, int]] = []
+    for edge in value:  # type: ignore[union-attr]
+        if hasattr(edge, "as_py"):
+            edge = edge.as_py()
+        if isinstance(edge, dict):
+            src = edge.get("from", edge.get("src"))
+            dst = edge.get("to", edge.get("dst"))
+            kind = edge.get("kind")
+        elif isinstance(edge, (list, tuple, np.ndarray)) and len(edge) >= 3:
+            src, dst, kind = edge[0], edge[1], edge[2]
+        else:
+            raise ValueError(
+                f"{column} edge must be {{from,to,kind}}/{{src,dst,kind}} or "
+                f"triple at {shard_path}#row{row_idx}; got {type(edge).__name__}"
+            )
+        if src is None or dst is None or kind is None:
+            raise ValueError(
+                f"{column} edge has missing src/dst/kind at {shard_path}#row{row_idx}"
+            )
+        src_i = int(src)
+        dst_i = int(dst)
+        kind_i = int(kind)
+        if src_i < 0 or dst_i < 0 or kind_i < 0:
+            raise ValueError(
+                f"{column} edge triples must be non-negative at "
+                f"{shard_path}#row{row_idx}: ({src_i}, {dst_i}, {kind_i})"
+            )
+        triples_list.append((src_i, dst_i, kind_i))
+    triples = np.asarray(triples_list, dtype=np.int64)
+    if triples.size == 0:
+        return np.zeros((0, 3), dtype=np.int32)
+    if triples.ndim != 2 or triples.shape[1] != 3:
+        raise ValueError(
+            f"{column} must normalize to (E, 3), got shape {tuple(triples.shape)} "
+            f"at {shard_path}#row{row_idx}"
+        )
+    if np.any(triples > np.iinfo(np.int32).max):
+        raise ValueError(f"{column} edge value exceeds int32 at {shard_path}#row{row_idx}")
+    return triples.astype(np.int32, copy=False)
+
+
 def _normalize_ragged_int_vector(
     value: object,
     *,
@@ -316,6 +387,15 @@ class _GraphSidecarWriters:
                 )
                 arr.astype(dtype, copy=False).tofile(self._data_files[column])
                 item_count = int(arr.shape[0])
+            elif kind == "edge_triples":
+                arr = _normalize_edge_triples(
+                    values.get(column),
+                    column=column,
+                    shard_path=shard_path,
+                    row_idx=row_idx,
+                )
+                arr.astype(dtype, copy=False).tofile(self._data_files[column])
+                item_count = int(arr.shape[0])
             elif kind == "ragged_1d":
                 arr = _normalize_ragged_int_vector(
                     values.get(column),
@@ -351,6 +431,8 @@ class _GraphSidecarWriters:
             }
             if kind == "edge_pairs":
                 entry["shape_tail"] = [2]
+            elif kind == "edge_triples":
+                entry["shape_tail"] = [3]
             manifest[column] = entry
         self._closed = True
         return manifest

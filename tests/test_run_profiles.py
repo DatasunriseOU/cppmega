@@ -37,6 +37,15 @@ def test_h200_cpp_world_mini_is_megatron_dense_sidecar_lane():
     assert env["CPPMEGA_DATA_PATH"] == "1.0 /data/cppmega_sidecar/cppmega_1024_smoke_mix_train"
     assert env["CPPMEGA_TOKENIZER_MODEL"] == "/data/cpp_tokenizer_hf"
     assert env["CPPMEGA_FP8_RECIPE"] == "off"
+    assert env["CPPMEGA_ATTN_BACKEND"] == "auto"
+    assert env["CPPMEGA_USE_FLASH_ATTN"] == "1"
+    assert env["CPPMEGA_OPTIMIZER"] == "adam"
+    assert env["CPPMEGA_MUON_SCALAR_OPTIMIZER"] == "adam"
+    assert env["CPPMEGA_MUON_QUANTIZED_MOMENTUM"] == "0"
+    assert env["CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER"] == "0"
+    assert env["CPPMEGA_USE_BF16_NO_MASTER_EMERGING_FALLBACK_OPTIMIZER"] == "0"
+    assert env["CPPMEGA_GRAD_REDUCE_IN_BF16"] == "0"
+    assert env["CPPMEGA_LOCAL_DDP_DISABLE_CONTIGUOUS_GRAD_BUFFER"] == "0"
     assert env["NATIVE_ARGS"] == ""
     assert env["HYBRID_LAYER_PATTERN"] == "*-" * 24
 

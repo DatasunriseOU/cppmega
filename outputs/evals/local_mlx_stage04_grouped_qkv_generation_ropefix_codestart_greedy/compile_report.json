@@ -1,0 +1,203 @@
+{
+  "results": [
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.36308729101438075,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <algorithm>\n#include <cassert>\n\n/**\n * Return value clamped into inclusive [lo, hi]. If lo > hi, swap bounds first.\n */\nint clamp_int(int value, int lo, int hi) {\n  int hi = -hi;\n  int hi = hi;\n  int hi = hi;\n  int hi = hi;\n  int hi = hi;\n  int hi = hi;\n  int hi = hi;\n  int hi = hi;\n  int hi = hi;\n  int hi = hi;\n  int hi = hi;\n  int hi = hi;\n  int hi =\n}\n\nint main() {\n  assert(clamp_int(5, 0, 10) == 5);\n  assert(clamp_int(-3, 0, 10) == 0);\n  assert(clamp_int(18, 0, 10) == 10);\n  assert(clamp_int(4, 10, 0) == 4);\n  assert(clamp_int(-1, 10, 0) == 0);\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 1.5842817079974338,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:8:7: error: redefinition of 'hi'\n    8 |   int hi = -hi;\n      |       ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:7:38: note: previous definition is here\n    7 | int clamp_int(int value, int lo, int hi) {\n      |                                      ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:9:7: error: redefinition of 'hi'\n    9 |   int hi = hi;\n      |       ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:7:38: note: previous definition is here\n    7 | int clamp_int(int value, int lo, int hi) {\n      |                                      ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:10:7: error: redefinition of 'hi'\n   10 |   int hi = hi;\n      |       ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:7:38: note: previous definition is here\n    7 | int clamp_int(int value, int lo, int hi) {\n      |                                      ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:11:7: error: redefinition of 'hi'\n   11 |   int hi = hi;\n      |       ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:7:38: note: previous definition is here\n    7 | int clamp_int(int value, int lo, int hi) {\n      |                                      ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:12:7: error: redefinition of 'hi'\n   12 |   int hi = hi;\n      |       ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:7:38: note: previous definition is here\n    7 | int clamp_int(int value, int lo, int hi) {\n      |                                      ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:13:7: error: redefinition of 'hi'\n   13 |   int hi = hi;\n      |       ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:7:38: note: previous definition is here\n    7 | int clamp_int(int value, int lo, int hi) {\n      |                                      ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:14:7: error: redefinition of 'hi'\n   14 |   int hi = hi;\n      |       ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:7:38: note: previous definition is here\n    7 | int clamp_int(int value, int lo, int hi) {\n      |                                      ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:15:7: error: redefinition of 'hi'\n   15 |   int hi = hi;\n      |       ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:7:38: note: previous definition is here\n    7 | int clamp_int(int value, int lo, int hi) {\n      |                                      ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:16:7: error: redefinition of 'hi'\n   16 |   int hi = hi;\n      |       ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:7:38: note: previous definition is here\n    7 | int clamp_int(int value, int lo, int hi) {\n      |                                      ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:17:7: error: redefinition of 'hi'\n   17 |   int hi = hi;\n      |       ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:7:38: note: previous definition is here\n    7 | int clamp_int(int value, int lo, int hi) {\n      |                                      ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:18:7: error: redefinition of 'hi'\n   18 |   int hi = hi;\n      |       ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:7:38: note: previous definition is here\n    7 | int clamp_int(int value, int lo, int hi) {\n      |                                      ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:19:7: error: redefinition of 'hi'\n   19 |   int hi = hi;\n      |       ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:7:38: note: previous definition is here\n    7 | int clamp_int(int value, int lo, int hi) {\n      |                                      ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:20:7: error: redefinition of 'hi'\n   20 |   int hi =\n      |       ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:7:38: note: previous definition is here\n    7 | int clamp_int(int value, int lo, int hi) {\n      |                                      ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:21:1: error: expected expression\n   21 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:30:2: error: expected ';' at end of declaration\n   30 | }\n      |  ^\n      |  ;\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:30:2: error: expected '}'\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:7:42: note: to match this '{'\n    7 | int clamp_int(int value, int lo, int hi) {\n      |                                          ^\n16 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp",
+        "-o",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp",
+      "task_id": "clamp_int"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.030855874996632338,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n\n/**\n * Return true if n is a prime integer.\n */\nbool is_prime(int n) { return n <= n && n < n; }\nbool is_prime(int n) { return n <= n && n < n; }\nbool is_prime(int n) { return n <= n && n < n; }\nbool is_prime(int n) { return n <= n && n < n; }\n\nint main() {\n  assert(!is_prime(-7));\n  assert(!is_prime(0));\n  assert(!is_prime(1));\n  assert(is_prime(2));\n  assert(is_prime(3));\n  assert(!is_prime(4));\n  assert(is_prime(97));\n  assert(!is_prime(221));\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.096582124941051,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:6:33: warning: self-comparison always evaluates to true [-Wtautological-compare]\n    6 | bool is_prime(int n) { return n <= n && n < n; }\n      |                                 ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:6:43: warning: self-comparison always evaluates to false [-Wtautological-compare]\n    6 | bool is_prime(int n) { return n <= n && n < n; }\n      |                                           ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:7:6: error: redefinition of 'is_prime'\n    7 | bool is_prime(int n) { return n <= n && n < n; }\n      |      ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:6:6: note: previous definition is here\n    6 | bool is_prime(int n) { return n <= n && n < n; }\n      |      ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:7:33: warning: self-comparison always evaluates to true [-Wtautological-compare]\n    7 | bool is_prime(int n) { return n <= n && n < n; }\n      |                                 ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:7:43: warning: self-comparison always evaluates to false [-Wtautological-compare]\n    7 | bool is_prime(int n) { return n <= n && n < n; }\n      |                                           ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:8:33: warning: self-comparison always evaluates to true [-Wtautological-compare]\n    8 | bool is_prime(int n) { return n <= n && n < n; }\n      |                                 ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:8:43: warning: self-comparison always evaluates to false [-Wtautological-compare]\n    8 | bool is_prime(int n) { return n <= n && n < n; }\n      |                                           ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:9:33: warning: self-comparison always evaluates to true [-Wtautological-compare]\n    9 | bool is_prime(int n) { return n <= n && n < n; }\n      |                                 ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:9:43: warning: self-comparison always evaluates to false [-Wtautological-compare]\n    9 | bool is_prime(int n) { return n <= n && n < n; }\n      |                                           ^\n8 warnings and 1 error generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp",
+        "-o",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp",
+      "task_id": "is_prime"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.04983633302617818,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n#include <string>\n#include <string_view>\n#include <vector>\n\n/**\n * Join non-empty strings with the separator, preserving order.\n */\nstd::string join_non_empty(const std::vector<std::string> &parts,\n                           std::string_view sep) {\n  std::string result;\n  for (const auto &[_, _] : parts) {\n    result.push_back(std::to_string(*_));\n  }\n  if (!result.empty()) {\n    result.push_back(std::to_string(*_));\n  }\n}\nreturn result;\n}\n// === POST-COMMIT: 85858888 STRING::VALID IN FILE C\n}\n\nint main() {\n  assert(join_non_empty({\"a\", \"\", \"b\", \"c\"}, \":\") == \"a:b:c\");\n  assert(join_non_empty({\"\", \"x\", \"\"}, \",\") == \"x\");\n  assert(join_non_empty({}, \",\") == \"\");\n  assert(join_non_empty({\"\", \"\"}, \",\") == \"\");\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 1.073758166981861,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:12:24: warning: placeholder variables are a C++2c extension [-Wc++26-extensions]\n   12 |   for (const auto &[_, _] : parts) {\n      |                        ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:12:20: error: type 'const std::string' binds to 1 element, but 2 names were provided\n   12 |   for (const auto &[_, _] : parts) {\n      |                    ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__vector/vector.h:352:88: note: selected 'begin' function with iterator type 'const_iterator' (aka '__wrap_iter<const std::string *>')\n  352 |   [[__nodiscard__]] _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_HIDE_FROM_ABI const_iterator begin() const _NOEXCEPT {\n      |                                                                                        ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:16:38: error: use of undeclared identifier '_'\n   16 |     result.push_back(std::to_string(*_));\n      |                                      ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:19:1: error: expected unqualified-id\n   19 | return result;\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:20:1: error: extraneous closing brace ('}')\n   20 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:22:1: error: extraneous closing brace ('}')\n   22 | }\n      | ^\n1 warning and 5 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp",
+        "-o",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp",
+      "task_id": "join_non_empty"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.049745541997253895,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n#include <cstdint>\n#include <limits>\n#include <optional>\n#include <string_view>\n\n/**\n * Parse an unsigned 32-bit integer from an entire decimal string.\n */\nstd::optional<std::uint32_t> parse_uint(std::string_view text) {\n  auto result = parse_uint(text);\n  if (result.size() == 0) {\n    return {};\n  }\n  result.size() = result.size();\n  return {};\n}\nreturn std::nullopt;\n}\ntemplate <typename T>\ninline T *(*(*(*(*((((((((((((((((((\n}\n\nint main() {\n  assert(parse_uint(\"0\") && *parse_uint(\"0\") == 0u);\n  assert(parse_uint(\"42\") && *parse_uint(\"42\") == 42u);\n  assert(parse_uint(\"4294967295\") &&\n         *parse_uint(\"4294967295\") ==\n             std::numeric_limits<std::uint32_t>::max());\n  assert(!parse_uint(\"\"));\n  assert(!parse_uint(\"-1\"));\n  assert(!parse_uint(\"12x\"));\n  assert(!parse_uint(\"4294967296\"));\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.7566287500085309,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:12:14: error: no member named 'size' in 'std::optional<unsigned int>'\n   12 |   if (result.size() == 0) {\n      |       ~~~~~~ ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:15:10: error: no member named 'size' in 'std::optional<unsigned int>'\n   15 |   result.size() = result.size();\n      |   ~~~~~~ ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:15:26: error: no member named 'size' in 'std::optional<unsigned int>'\n   15 |   result.size() = result.size();\n      |                   ~~~~~~ ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:18:1: error: expected unqualified-id\n   18 | return std::nullopt;\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:19:1: error: extraneous closing brace ('}')\n   19 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:22:1: error: expected unqualified-id\n   22 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:22:1: error: expected ')'\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:21:36: note: to match this '('\n   21 | inline T *(*(*(*(*((((((((((((((((((\n      |                                    ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:22:1: error: expected ')'\n   22 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:21:35: note: to match this '('\n   21 | inline T *(*(*(*(*((((((((((((((((((\n      |                                   ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:22:1: error: expected ')'\n   22 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:21:34: note: to match this '('\n   21 | inline T *(*(*(*(*((((((((((((((((((\n      |                                  ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:22:1: error: expected ')'\n   22 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:21:33: note: to match this '('\n   21 | inline T *(*(*(*(*((((((((((((((((((\n      |                                 ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:22:1: error: expected ')'\n   22 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:21:32: note: to match this '('\n   21 | inline T *(*(*(*(*((((((((((((((((((\n      |                                ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:22:1: error: expected ')'\n   22 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:21:31: note: to match this '('\n   21 | inline T *(*(*(*(*((((((((((((((((((\n      |                               ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:22:1: error: expected ')'\n   22 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:21:30: note: to match this '('\n   21 | inline T *(*(*(*(*((((((((((((((((((\n      |                              ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:22:1: error: expected ')'\n   22 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:21:29: note: to match this '('\n   21 | inline T *(*(*(*(*((((((((((((((((((\n      |                             ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:22:1: error: expected ')'\n   22 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:21:28: note: to match this '('\n   21 | inline T *(*(*(*(*((((((((((((((((((\n      |                            ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:22:1: error: expected ')'\n   22 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:21:27: note: to match this '('\n   21 | inline T *(*(*(*(*((((((((((((((((((\n      |                           ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:22:1: error: expected ')'\n   22 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:21:26: note: to match this '('\n   21 | inline T *(*(*(*(*((((((((((((((((((\n      |                          ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:22:1: error: expected ')'\n   22 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:21:25: note: to match this '('\n   21 | inline T *(*(*(*(*((((((((((((((((((\n      |                         ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:22:1: error: expected ')'\n   22 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:21:24: note: to match this '('\n   21 | inline T *(*(*(*(*((((((((((((((((((\n      |                        ^\nfatal error: too many errors emitted, stopping now [-ferror-limit=]\n20 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp",
+        "-o",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp",
+      "task_id": "parse_uint"
+    }
+  ],
+  "summary": {
+    "c_compiler": "clang",
+    "clang_format": "clang-format",
+    "clang_format_ok": 4,
+    "compiled": 0,
+    "cpp_compiler": "clang++",
+    "pass_rate": 0.0,
+    "passed": 0,
+    "ran": 0,
+    "total": 4
+  }
+}

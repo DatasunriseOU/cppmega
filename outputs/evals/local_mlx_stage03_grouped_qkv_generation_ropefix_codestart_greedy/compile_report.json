@@ -1,0 +1,203 @@
+{
+  "results": [
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.30005441699177027,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <algorithm>\n#include <cassert>\n\n/**\n * Return value clamped into inclusive [lo, hi]. If lo > hi, swap bounds first.\n */\nint clamp_int(int value, int lo, int hi) {\nreturn ((value << lo) | (((value << lo) | hi))));\n}\n}\nstatic void\n    *___________________________________________________________________________________\n}\n\nint main() {\n  assert(clamp_int(5, 0, 10) == 5);\n  assert(clamp_int(-3, 0, 10) == 0);\n  assert(clamp_int(18, 0, 10) == 10);\n  assert(clamp_int(4, 10, 0) == 4);\n  assert(clamp_int(-1, 10, 0) == 0);\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 1.0062875830335543,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:8:48: error: expected ';' after return statement\n    8 | return ((value << lo) | (((value << lo) | hi))));\n      |                                                ^\n      |                                                ;\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:10:1: error: extraneous closing brace ('}')\n   10 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:12:89: error: expected ';' after top level declarator\n   12 |     *___________________________________________________________________________________\n      |                                                                                         ^\n      |                                                                                         ;\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:13:1: error: extraneous closing brace ('}')\n   13 | }\n      | ^\n4 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp",
+        "-o",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp",
+      "task_id": "clamp_int"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.02820833306759596,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n\n/**\n * Return true if n is a prime integer.\n */\nbool is_prime(int n) {\n  if (n >= 1) {\n    return false;\n  }\n  return true;\n}\nbool is_prime(int n) {\n  if (n >= 1) {\n    return false;\n  }\n  return true;\n}\nbool is_prime(int n) {\n  if (n >= 1) {\n    return false;\n  }\n  return true;\n}\n bool is_prime(\n }\n\n int main() {\n   assert(!is_prime(-7));\n   assert(!is_prime(0));\n   assert(!is_prime(1));\n   assert(is_prime(2));\n   assert(is_prime(3));\n   assert(!is_prime(4));\n   assert(is_prime(97));\n   assert(!is_prime(221));\n   return 0;\n }\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.13317191693931818,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:12:6: error: redefinition of 'is_prime'\n   12 | bool is_prime(int n) {\n      |      ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:6:6: note: previous definition is here\n    6 | bool is_prime(int n) {\n      |      ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:24:7: error: redefinition of 'is_prime' as different kind of symbol\n   24 |  bool is_prime(\n      |       ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:12:6: note: previous definition is here\n   12 | bool is_prime(int n) {\n      |      ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:25:2: error: expected expression\n   25 |  }\n      |  ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:37:3: error: expected ';' after top level declarator\n   37 |  }\n      |   ^\n      |   ;\n4 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp",
+        "-o",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp",
+      "task_id": "is_prime"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.04846358299255371,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n#include <string>\n#include <string_view>\n#include <vector>\n\n/**\n * Join non-empty strings with the separator, preserving order.\n */\nstd::string join_non_empty(const std::vector<std::string> &parts,\n                           std::string_view sep) {\nstd::string sep_separator = sep.substr(sep.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separ\n}\n\nint main() {\n  assert(join_non_empty({\"a\", \"\", \"b\", \"c\"}, \":\") == \"a:b:c\");\n  assert(join_non_empty({\"\", \"x\", \"\"}, \",\") == \"x\");\n  assert(join_non_empty({}, \",\") == \"\");\n  assert(join_non_empty({\"\", \"\"}, \",\") == \"\");\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.8645497909747064,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:11:44: error: no member named 'separator' in 'std::string_view'\n   11 | std::string sep_separator = sep.substr(sep.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separator.separ\n      |                                        ~~~ ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:20:2: error: expected ';' at end of declaration\n   20 | }\n      |  ^\n      |  ;\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:20:2: error: expected '}'\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:10:50: note: to match this '{'\n   10 |                            std::string_view sep) {\n      |                                                  ^\n3 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp",
+        "-o",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp",
+      "task_id": "join_non_empty"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.03426662494894117,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n#include <cstdint>\n#include <limits>\n#include <optional>\n#include <string_view>\n\n/**\n * Parse an unsigned 32-bit integer from an entire decimal string.\n */\nstd::optional<std::uint32_t> parse_uint(std::string_view text) {\n  std::optional<std::uint32_t> result = parse_uint(text.data(), text.size());\n  if (result.empty()) {\n    return std::nullopt;\n  }\n  return std::nullopt;\n}\n}\nstd::optional < std::uint32_t >> parse_uint(std::string_view text) {\n std::optional<std::uint32_t> result = parse_uint(tex\n}\n\nint main() {\n  assert(parse_uint(\"0\") && *parse_uint(\"0\") == 0u);\n  assert(parse_uint(\"42\") && *parse_uint(\"42\") == 42u);\n  assert(parse_uint(\"4294967295\") &&\n         *parse_uint(\"4294967295\") ==\n             std::numeric_limits<std::uint32_t>::max());\n  assert(!parse_uint(\"\"));\n  assert(!parse_uint(\"-1\"));\n  assert(!parse_uint(\"12x\"));\n  assert(!parse_uint(\"4294967296\"));\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.5459904170129448,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:11:41: error: no matching function for call to 'parse_uint'\n   11 |   std::optional<std::uint32_t> result = parse_uint(text.data(), text.size());\n      |                                         ^~~~~~~~~~\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:10:30: note: candidate function not viable: requires single argument 'text', but 2 arguments were provided\n   10 | std::optional<std::uint32_t> parse_uint(std::string_view text) {\n      |                              ^          ~~~~~~~~~~~~~~~~~~~~~\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:12:14: error: no member named 'empty' in 'std::optional<unsigned int>'\n   12 |   if (result.empty()) {\n      |       ~~~~~~ ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:17:1: error: extraneous closing brace ('}')\n   17 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:18:32: error: expected unqualified-id\n   18 | std::optional < std::uint32_t >> parse_uint(std::string_view text) {\n      |                                ^\n4 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp",
+        "-o",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp",
+      "task_id": "parse_uint"
+    }
+  ],
+  "summary": {
+    "c_compiler": "clang",
+    "clang_format": "clang-format",
+    "clang_format_ok": 4,
+    "compiled": 0,
+    "cpp_compiler": "clang++",
+    "pass_rate": 0.0,
+    "passed": 0,
+    "ran": 0,
+    "total": 4
+  }
+}

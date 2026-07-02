@@ -1,0 +1,203 @@
+{
+  "results": [
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.13293033407535404,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <algorithm>\n#include <cassert>\n\n/**\n * Return value clamped into inclusive [lo, hi]. If lo > hi, swap bounds first.\n */\nint clamp_int(int value, int lo, int hi) {\nreturn (((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((\n}\n\nint main() {\n  assert(clamp_int(5, 0, 10) == 5);\n  assert(clamp_int(-3, 0, 10) == 0);\n  assert(clamp_int(18, 0, 10) == 10);\n  assert(clamp_int(4, 10, 0) == 4);\n  assert(clamp_int(-1, 10, 0) == 0);\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.389444625005126,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:9:1: error: expected expression\n    9 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:18:2: error: expected '}'\n   18 | }\n      |  ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:7:42: note: to match this '{'\n    7 | int clamp_int(int value, int lo, int hi) {\n      |                                          ^\n2 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp",
+        "-o",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp",
+      "task_id": "clamp_int"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.01902562496252358,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n\n/**\n * Return true if n is a prime integer.\n */\nbool is_prime(int n) {\nreturn (((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((\n}\n\nint main() {\n  assert(!is_prime(-7));\n  assert(!is_prime(0));\n  assert(!is_prime(1));\n  assert(is_prime(2));\n  assert(is_prime(3));\n  assert(!is_prime(4));\n  assert(is_prime(97));\n  assert(!is_prime(221));\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.04253033304121345,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:8:1: error: expected expression\n    8 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:20:2: error: expected '}'\n   20 | }\n      |  ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:6:22: note: to match this '{'\n    6 | bool is_prime(int n) {\n      |                      ^\n2 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp",
+        "-o",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp",
+      "task_id": "is_prime"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.02566166699398309,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n#include <string>\n#include <string_view>\n#include <vector>\n\n/**\n * Join non-empty strings with the separator, preserving order.\n */\nstd::string join_non_empty(const std::vector<std::string> &parts,\n                           std::string_view sep) {\n  for (auto it = parts.begin(); it != parts.end(); ++it) {\n    if ((*it == sep) || (*it == sep)) {\n      return it;\n    }\n  }\n  return join_non_empty;\n}\n/**\n * Join non-empty strings with the separator, preserving order.\n */\nvoid\n}\n\nint main() {\n  assert(join_non_empty({\"a\", \"\", \"b\", \"c\"}, \":\") == \"a:b:c\");\n  assert(join_non_empty({\"\", \"x\", \"\"}, \",\") == \"x\");\n  assert(join_non_empty({}, \",\") == \"\");\n  assert(join_non_empty({\"\", \"\"}, \",\") == \"\");\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.3654154579853639,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:13:14: error: no viable conversion from returned value of type 'const_iterator' (aka '__wrap_iter<const std::string *>') to function return type 'std::string' (aka 'basic_string<char>')\n   13 |       return it;\n      |              ^~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1002:71: note: candidate constructor not viable: no known conversion from 'const_iterator' (aka '__wrap_iter<const std::string *>') to 'const std::string &' for 1st argument\n 1002 |   _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_STRING_INTERNAL_MEMORY_ACCESS basic_string(const basic_string& __str)\n      |                                                                       ^            ~~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1022:55: note: candidate constructor not viable: no known conversion from 'const_iterator' (aka '__wrap_iter<const std::string *>') to 'std::string &&' for 1st argument\n 1022 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 basic_string(basic_string&& __str)\n      |                                                       ^            ~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1062:55: note: candidate constructor template not viable: no known conversion from 'const_iterator' (aka '__wrap_iter<const std::string *>') to 'const char * _Nonnull' for 1st argument\n 1062 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 basic_string(const _CharT* _LIBCPP_DIAGNOSE_NULLPTR __s) {\n      |                                                       ^            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1197:55: note: candidate constructor not viable: no known conversion from 'const_iterator' (aka '__wrap_iter<const std::string *>') to 'initializer_list<char>' for 1st argument\n 1197 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 basic_string(initializer_list<_CharT> __il) {\n      |                                                       ^            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:987:64: note: explicit constructor is not a candidate\n  987 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 explicit basic_string(const allocator_type& __a)\n      |                                                                ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1156:64: note: explicit constructor is not a candidate\n 1156 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 explicit basic_string(const _Tp& __t) {\n      |                                                                ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:16:10: error: no viable conversion from returned value of type 'std::string (const std::vector<std::string> &, std::string_view)' (aka 'basic_string<char> (const std::vector<basic_string<char>> &, basic_string_view<char>)') to function return type 'std::string' (aka 'basic_string<char>')\n   16 |   return join_non_empty;\n      |          ^~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1002:71: note: candidate constructor not viable: no known conversion from 'std::string (const std::vector<std::string> &, std::string_view)' (aka 'basic_string<char> (const std::vector<basic_string<char>> &, basic_string_view<char>)') to 'const std::string &' for 1st argument\n 1002 |   _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_STRING_INTERNAL_MEMORY_ACCESS basic_string(const basic_string& __str)\n      |                                                                       ^            ~~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1022:55: note: candidate constructor not viable: no known conversion from 'std::string (const std::vector<std::string> &, std::string_view)' (aka 'basic_string<char> (const std::vector<basic_string<char>> &, basic_string_view<char>)') to 'std::string &&' for 1st argument\n 1022 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 basic_string(basic_string&& __str)\n      |                                                       ^            ~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1062:55: note: candidate constructor template not viable: no known conversion from 'std::string (const std::vector<std::string> &, std::string_view)' (aka 'basic_string<char> (const std::vector<basic_string<char>> &, basic_string_view<char>)') to 'const char * _Nonnull' for 1st argument\n 1062 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 basic_string(const _CharT* _LIBCPP_DIAGNOSE_NULLPTR __s) {\n      |                                                       ^            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1197:55: note: candidate constructor not viable: no known conversion from 'std::string (const std::vector<std::string> &, std::string_view)' (aka 'basic_string<char> (const std::vector<basic_string<char>> &, basic_string_view<char>)') to 'initializer_list<char>' for 1st argument\n 1197 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 basic_string(initializer_list<_CharT> __il) {\n      |                                                       ^            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:987:64: note: explicit constructor is not a candidate\n  987 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 explicit basic_string(const allocator_type& __a)\n      |                                                                ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1156:64: note: explicit constructor is not a candidate\n 1156 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 explicit basic_string(const _Tp& __t) {\n      |                                                                ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:22:1: error: expected unqualified-id\n   22 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:22:1: error: extraneous closing brace ('}')\n4 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp",
+        "-o",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp",
+      "task_id": "join_non_empty"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.020429000025615096,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n#include <cstdint>\n#include <limits>\n#include <optional>\n#include <string_view>\n\n/**\n * Parse an unsigned 32-bit integer from an entire decimal string.\n */\nstd::optional<std::uint32_t> parse_uint(std::string_view text) {\n  std::uint32_t value = text.find('0', text.find('0', 0));\n  if (value != std::numeric_limits<std::uint32_t>::max()) {\n    parse_uint32(value);\n  } else {\n    parse_uint32(value);\n  }\n  return parse_uint32(text);\n}\n// === POST-COMMIT: - fix from signed part\n}\n\nint main() {\n  assert(parse_uint(\"0\") && *parse_uint(\"0\") == 0u);\n  assert(parse_uint(\"42\") && *parse_uint(\"42\") == 42u);\n  assert(parse_uint(\"4294967295\") &&\n         *parse_uint(\"4294967295\") ==\n             std::numeric_limits<std::uint32_t>::max());\n  assert(!parse_uint(\"\"));\n  assert(!parse_uint(\"-1\"));\n  assert(!parse_uint(\"12x\"));\n  assert(!parse_uint(\"4294967296\"));\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.20141387498006225,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:13:5: error: use of undeclared identifier 'parse_uint32'; did you mean 'parse_uint'?\n   13 |     parse_uint32(value);\n      |     ^~~~~~~~~~~~\n      |     parse_uint\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:10:30: note: 'parse_uint' declared here\n   10 | std::optional<std::uint32_t> parse_uint(std::string_view text) {\n      |                              ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:13:18: error: no viable conversion from 'std::uint32_t' (aka 'unsigned int') to 'std::string_view' (aka 'basic_string_view<char>')\n   13 |     parse_uint32(value);\n      |                  ^~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string_view:318:25: note: candidate constructor not viable: no known conversion from 'std::uint32_t' (aka 'unsigned int') to 'const std::string_view &' for 1st argument\n  318 |   _LIBCPP_HIDE_FROM_ABI basic_string_view(const basic_string_view&) _NOEXCEPT = default;\n      |                         ^                 ~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string_view:357:43: note: candidate constructor not viable: no known conversion from 'std::uint32_t' (aka 'unsigned int') to 'const char * _Nonnull' for 1st argument\n  357 |   _LIBCPP_CONSTEXPR _LIBCPP_HIDE_FROM_ABI basic_string_view(const _CharT* _LIBCPP_DIAGNOSE_NULLPTR __s)\n      |                                           ^                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:10:58: note: passing argument to parameter 'text' here\n   10 | std::optional<std::uint32_t> parse_uint(std::string_view text) {\n      |                                                          ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:15:5: error: use of undeclared identifier 'parse_uint32'; did you mean 'parse_uint'?\n   15 |     parse_uint32(value);\n      |     ^~~~~~~~~~~~\n      |     parse_uint\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:10:30: note: 'parse_uint' declared here\n   10 | std::optional<std::uint32_t> parse_uint(std::string_view text) {\n      |                              ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:15:18: error: no viable conversion from 'std::uint32_t' (aka 'unsigned int') to 'std::string_view' (aka 'basic_string_view<char>')\n   15 |     parse_uint32(value);\n      |                  ^~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string_view:318:25: note: candidate constructor not viable: no known conversion from 'std::uint32_t' (aka 'unsigned int') to 'const std::string_view &' for 1st argument\n  318 |   _LIBCPP_HIDE_FROM_ABI basic_string_view(const basic_string_view&) _NOEXCEPT = default;\n      |                         ^                 ~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string_view:357:43: note: candidate constructor not viable: no known conversion from 'std::uint32_t' (aka 'unsigned int') to 'const char * _Nonnull' for 1st argument\n  357 |   _LIBCPP_CONSTEXPR _LIBCPP_HIDE_FROM_ABI basic_string_view(const _CharT* _LIBCPP_DIAGNOSE_NULLPTR __s)\n      |                                           ^                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:10:58: note: passing argument to parameter 'text' here\n   10 | std::optional<std::uint32_t> parse_uint(std::string_view text) {\n      |                                                          ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:17:10: error: use of undeclared identifier 'parse_uint32'; did you mean 'parse_uint'?\n   17 |   return parse_uint32(text);\n      |          ^~~~~~~~~~~~\n      |          parse_uint\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:10:30: note: 'parse_uint' declared here\n   10 | std::optional<std::uint32_t> parse_uint(std::string_view text) {\n      |                              ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:20:1: error: extraneous closing brace ('}')\n   20 | }\n      | ^\n6 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp",
+        "-o",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp",
+      "task_id": "parse_uint"
+    }
+  ],
+  "summary": {
+    "c_compiler": "clang",
+    "clang_format": "clang-format",
+    "clang_format_ok": 4,
+    "compiled": 0,
+    "cpp_compiler": "clang++",
+    "pass_rate": 0.0,
+    "passed": 0,
+    "ran": 0,
+    "total": 4
+  }
+}

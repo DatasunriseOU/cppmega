@@ -26,6 +26,12 @@ def _get_current_structure_batch() -> Dict[str, torch.Tensor] | None:
 
 
 _TOKEN_BATCH_COLS = (
+    "domain_ids",
+    "role_ids",
+    "entity_ids",
+    "scope_ids",
+    "source_doc_ids",
+    "confidence_ids",
     "structure_ids",
     "dep_levels",
     "ast_depth_ids",
@@ -45,6 +51,16 @@ _GRAPH_BATCH_COLS = (
     "graph_call_edge_counts",
     "graph_type_edges",
     "graph_type_edge_counts",
+    "graph_domain_edges",
+    "graph_domain_edge_counts",
+    "graph_build_edges",
+    "graph_build_edge_counts",
+    "graph_shell_edges",
+    "graph_shell_edge_counts",
+    "graph_diagnostic_edges",
+    "graph_diagnostic_edge_counts",
+    "graph_cross_domain_edges",
+    "graph_cross_domain_edge_counts",
     "graph_chunk_starts",
     "graph_chunk_ends",
     "graph_chunk_kinds",
@@ -53,6 +69,12 @@ _GRAPH_BATCH_COLS = (
 )
 
 _TOKEN_COL_ALIASES = {
+    "domain_ids": ("token_domain_ids", "domain_ids"),
+    "role_ids": ("token_role_ids", "role_ids"),
+    "entity_ids": ("token_entity_ids", "entity_ids"),
+    "scope_ids": ("token_scope_ids", "scope_ids"),
+    "source_doc_ids": ("token_source_doc_ids", "source_doc_ids"),
+    "confidence_ids": ("token_confidence_ids", "confidence_ids"),
     "structure_ids": ("token_structure_ids", "structure_ids"),
     "dep_levels": ("token_dep_levels", "dep_levels"),
     "ast_depth_ids": ("token_ast_depth", "ast_depth_ids", "token_ast_depth_ids"),
@@ -67,9 +89,16 @@ _TOKEN_COL_ALIASES = {
     "change_mask_post": ("token_change_mask_post", "change_mask_post"),
 }
 
+_LOSS_MASK_ALIASES = ("loss_mask", "token_loss_mask")
+
 _GRAPH_ROUTE_COLS = (
     "token_call_edges",
     "token_type_edges",
+    "token_domain_edges",
+    "token_build_edges",
+    "token_shell_edges",
+    "token_diagnostic_edges",
+    "token_cross_domain_edges",
     "token_chunk_starts",
     "token_chunk_ends",
     "token_chunk_kinds",
@@ -310,6 +339,31 @@ def _get_absolute_token_indices(dataset: Any, idx: int) -> np.ndarray:
     return np.concatenate(parts) if parts else np.empty((0,), dtype=np.int64)
 
 
+def _align_token_sidecar_tensor(
+    tensor: torch.Tensor,
+    *,
+    target_len: int,
+    col: str,
+    idx: int,
+    pad_value: int | float = 0,
+) -> torch.Tensor:
+    """Align a token sidecar to Megatron's possibly padded sample length."""
+
+    if tensor.shape[0] > target_len:
+        raise ValueError(
+            f"[cppmega-patch] sidecar col {col!r} len {tensor.shape[0]} > "
+            f"token len {target_len} (idx {idx}); index reconstruction bug"
+        )
+    if tensor.shape[0] < target_len:
+        pad = torch.full(
+            (target_len - tensor.shape[0],),
+            pad_value,
+            dtype=tensor.dtype,
+        )
+        tensor = torch.cat([tensor, pad], dim=0)
+    return tensor.contiguous()
+
+
 def _slice_graph_doc(cache_entry: dict[str, Any], real_doc: int) -> np.ndarray:
     offsets = cache_entry["offsets"]
     start = int(offsets[real_doc])
@@ -319,6 +373,14 @@ def _slice_graph_doc(cache_entry: dict[str, Any], real_doc: int) -> np.ndarray:
 
 def _cap_2d(values: list[tuple[int, int]], *, max_rows: int) -> tuple[torch.Tensor, torch.Tensor]:
     out = torch.full((max_rows, 2), -1, dtype=torch.long)
+    count = min(len(values), max_rows)
+    if count:
+        out[:count] = torch.tensor(values[:count], dtype=torch.long)
+    return out, torch.tensor(count, dtype=torch.long)
+
+
+def _cap_3d(values: list[tuple[int, int, int]], *, max_rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.full((max_rows, 3), -1, dtype=torch.long)
     count = min(len(values), max_rows)
     if count:
         out[:count] = torch.tensor(values[:count], dtype=torch.long)
@@ -343,6 +405,11 @@ def _build_graph_route_tensors(
 ) -> Dict[str, torch.Tensor]:
     call_edges: list[tuple[int, int]] = []
     type_edges: list[tuple[int, int]] = []
+    domain_edges: list[tuple[int, int, int]] = []
+    build_edges: list[tuple[int, int, int]] = []
+    shell_edges: list[tuple[int, int, int]] = []
+    diagnostic_edges: list[tuple[int, int, int]] = []
+    cross_domain_edges: list[tuple[int, int, int]] = []
     chunk_starts: list[int] = []
     chunk_ends: list[int] = []
     chunk_kinds: list[int] = []
@@ -367,6 +434,23 @@ def _build_graph_route_tensors(
                     adj_dst = target_start + dst_i - source_start
                     if 0 <= adj_src < target_len and 0 <= adj_dst < target_len:
                         sink.append((adj_src, adj_dst))
+
+        for source_name, sink in (
+            ("token_domain_edges", domain_edges),
+            ("token_build_edges", build_edges),
+            ("token_shell_edges", shell_edges),
+            ("token_diagnostic_edges", diagnostic_edges),
+            ("token_cross_domain_edges", cross_domain_edges),
+        ):
+            rows = _slice_graph_doc(graph_sidecars[source_name], real_doc)
+            for src, dst, kind in rows:
+                src_i = int(src)
+                dst_i = int(dst)
+                if source_start <= src_i < source_end and source_start <= dst_i < source_end:
+                    adj_src = target_start + src_i - source_start
+                    adj_dst = target_start + dst_i - source_start
+                    if 0 <= adj_src < target_len and 0 <= adj_dst < target_len:
+                        sink.append((adj_src, adj_dst, int(kind)))
 
         starts = _slice_graph_doc(graph_sidecars["token_chunk_starts"], real_doc)
         ends = _slice_graph_doc(graph_sidecars["token_chunk_ends"], real_doc)
@@ -397,6 +481,11 @@ def _build_graph_route_tensors(
 
     graph_call_edges, graph_call_edge_counts = _cap_2d(call_edges, max_rows=max_edges)
     graph_type_edges, graph_type_edge_counts = _cap_2d(type_edges, max_rows=max_edges)
+    graph_domain_edges, graph_domain_edge_counts = _cap_3d(domain_edges, max_rows=max_edges)
+    graph_build_edges, graph_build_edge_counts = _cap_3d(build_edges, max_rows=max_edges)
+    graph_shell_edges, graph_shell_edge_counts = _cap_3d(shell_edges, max_rows=max_edges)
+    graph_diagnostic_edges, graph_diagnostic_edge_counts = _cap_3d(diagnostic_edges, max_rows=max_edges)
+    graph_cross_domain_edges, graph_cross_domain_edge_counts = _cap_3d(cross_domain_edges, max_rows=max_edges)
     graph_chunk_starts, graph_chunk_counts = _cap_1d(chunk_starts, max_rows=max_chunks)
     graph_chunk_ends, _ = _cap_1d(chunk_ends, max_rows=max_chunks)
     graph_chunk_kinds, _ = _cap_1d(chunk_kinds, max_rows=max_chunks)
@@ -407,6 +496,16 @@ def _build_graph_route_tensors(
         "graph_call_edge_counts": graph_call_edge_counts,
         "graph_type_edges": graph_type_edges,
         "graph_type_edge_counts": graph_type_edge_counts,
+        "graph_domain_edges": graph_domain_edges,
+        "graph_domain_edge_counts": graph_domain_edge_counts,
+        "graph_build_edges": graph_build_edges,
+        "graph_build_edge_counts": graph_build_edge_counts,
+        "graph_shell_edges": graph_shell_edges,
+        "graph_shell_edge_counts": graph_shell_edge_counts,
+        "graph_diagnostic_edges": graph_diagnostic_edges,
+        "graph_diagnostic_edge_counts": graph_diagnostic_edge_counts,
+        "graph_cross_domain_edges": graph_cross_domain_edges,
+        "graph_cross_domain_edge_counts": graph_cross_domain_edge_counts,
         "graph_chunk_starts": graph_chunk_starts,
         "graph_chunk_ends": graph_chunk_ends,
         "graph_chunk_kinds": graph_chunk_kinds,
@@ -439,6 +538,11 @@ try:
                     {
                         "token_call_edges": {"offsets": np.array([0, 0]), "data": np.empty((0, 2), dtype=np.int32)},
                         "token_type_edges": {"offsets": np.array([0, 0]), "data": np.empty((0, 2), dtype=np.int32)},
+                        "token_domain_edges": {"offsets": np.array([0, 0]), "data": np.empty((0, 3), dtype=np.int32)},
+                        "token_build_edges": {"offsets": np.array([0, 0]), "data": np.empty((0, 3), dtype=np.int32)},
+                        "token_shell_edges": {"offsets": np.array([0, 0]), "data": np.empty((0, 3), dtype=np.int32)},
+                        "token_diagnostic_edges": {"offsets": np.array([0, 0]), "data": np.empty((0, 3), dtype=np.int32)},
+                        "token_cross_domain_edges": {"offsets": np.array([0, 0]), "data": np.empty((0, 3), dtype=np.int32)},
                         "token_chunk_starts": {"offsets": np.array([0, 0]), "data": np.empty((0,), dtype=np.uint32)},
                         "token_chunk_ends": {"offsets": np.array([0, 0]), "data": np.empty((0,), dtype=np.uint32)},
                         "token_chunk_kinds": {"offsets": np.array([0, 0]), "data": np.empty((0,), dtype=np.uint16)},
@@ -463,6 +567,39 @@ try:
         # sidecar under any known alias; an unresolved column while structure is
         # enabled is a real misconfiguration and RAISES with WHERE+WHAT.
         indices = _get_absolute_token_indices(self, idx)
+        target_len = int(sample["tokens"].shape[-1])
+
+        # Packed cppmega parquet carries loss_mask that suppresses pad and
+        # inter-document boundary labels. Megatron's default GPTDataset mask is
+        # not enough for our packed multi-document rows, so require and apply it
+        # here before the batch bridge sees the sample.
+        loss_mask_source = next(
+            (a for a in _LOSS_MASK_ALIASES if a in side_channels), None
+        )
+        if loss_mask_source is None:
+            raise KeyError(
+                "[cppmega-patch] parquet loss_mask sidecar missing from dataset "
+                f"side-channels (tried {_LOSS_MASK_ALIASES}; have "
+                f"{sorted(side_channels)}) while CPPMEGA_STRUCTURE_ENABLED=1"
+            )
+        loss_mask_entry = side_channels[loss_mask_source]
+        loss_vals = loss_mask_entry["mmap"][indices]
+        loss_tensor = torch.from_numpy(loss_vals).float()
+        if self.config.add_extra_token_to_sequence:
+            loss_tensor = loss_tensor[:-1]
+        sample["loss_mask"] = _align_token_sidecar_tensor(
+            loss_tensor,
+            target_len=target_len,
+            col=loss_mask_source,
+            idx=idx,
+            pad_value=0.0,
+        )
+        if idx == 0:
+            print(
+                f"[cppmega-patch] Mapped side-channel {loss_mask_source} -> loss_mask",
+                flush=True,
+            )
+
         for col in _TOKEN_BATCH_COLS:
             source = next(
                 (a for a in _TOKEN_COL_ALIASES[col] if a in side_channels), None
@@ -485,16 +622,13 @@ try:
             # (loss-masked), so zeros are correct, NOT a silent data fallback.
             # RULE #1: a structure run LONGER than the token window means the index
             # reconstruction is wrong -> RAISE rather than silently truncate.
-            target_len = int(sample["tokens"].shape[-1])
-            if tensor.shape[0] > target_len:
-                raise ValueError(
-                    f"[cppmega-patch] structure col {col!r} len {tensor.shape[0]} > "
-                    f"token len {target_len} (idx {idx}); index reconstruction bug"
-                )
-            if tensor.shape[0] < target_len:
-                pad = torch.zeros(target_len - tensor.shape[0], dtype=tensor.dtype)
-                tensor = torch.cat([tensor, pad], dim=0)
-            sample[col] = tensor.contiguous()
+            sample[col] = _align_token_sidecar_tensor(
+                tensor,
+                target_len=target_len,
+                col=col,
+                idx=idx,
+                pad_value=0,
+            )
             if idx == 0:
                 print(
                     f"[cppmega-patch] Mapped side-channel {source} -> {col}",

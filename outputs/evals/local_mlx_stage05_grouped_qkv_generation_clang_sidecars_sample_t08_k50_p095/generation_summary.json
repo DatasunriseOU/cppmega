@@ -1,0 +1,12 @@
+{
+  "cases": 4,
+  "checkpoint": "outputs/checkpoints/mlx_converted/stage_05_seq1024_grouped_qkv/model.safetensors",
+  "completions": 4,
+  "max_new_tokens": 128,
+  "prompt_mode": "source-prefix",
+  "prompt_sidecars": "clang",
+  "seq_len": 1024,
+  "temperature": 0.8,
+  "top_k": 50,
+  "top_p": 0.95
+}

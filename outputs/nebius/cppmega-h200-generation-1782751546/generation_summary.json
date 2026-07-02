@@ -1,0 +1,40 @@
+{
+  "checkpoint_iteration": "(5000, 3.1155692765184005e+18)",
+  "cuda_peak_allocated_gib": 1.360896110534668,
+  "cuda_peak_reserved_gib": 1.609375,
+  "items": [
+    {
+      "completion": "hi o t hi e o ok o the o ok t et o the o ok t et o ok t et ang age prim c s d ard c n fi nce high p m x x gn\n",
+      "generated_tokens": 128,
+      "prompt_tokens": 90,
+      "raw_completion": "hi o t hi e o ok o the o ok t et o the o ok t et o ok t et ang age prim c s d ard c n fi nce high p m x x gn",
+      "task_id": "clamp_int"
+    },
+    {
+      "completion": "n m n m n m n m n m n m n m n m n m n m n m n m n m n m\n",
+      "generated_tokens": 128,
+      "prompt_tokens": 45,
+      "raw_completion": "n m n m n m n m n m n m n m n m n m n m n m n m n m n m",
+      "task_id": "is_prime"
+    },
+    {
+      "completion": "fix fix fix fix fix fix fix fix fix it fix fix fix fix fix fix fix fix fix fix fix fix fix fix fix fix fix fix fix fix fix fix\n",
+      "generated_tokens": 128,
+      "prompt_tokens": 90,
+      "raw_completion": "fix fix fix fix fix fix fix fix fix it fix fix fix fix fix fix fix fix fix fix fix fix fix fix fix fix fix fix fix fix fix fix",
+      "task_id": "join_non_empty"
+    },
+    {
+      "completion": "t t t t t t t t\n",
+      "generated_tokens": 128,
+      "prompt_tokens": 89,
+      "raw_completion": "t t t t t t t t",
+      "task_id": "parse_uint"
+    }
+  ],
+  "max_new_tokens": 128,
+  "prompt_mode": "source-prefix",
+  "temperature": 0.0,
+  "top_p": 1.0,
+  "total": 4
+}

@@ -1,0 +1,203 @@
+{
+  "results": [
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.019292833050712943,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <algorithm>\n#include <cassert>\n\n/**\n * Return value clamped into inclusive [lo, hi]. If lo > hi, swap bounds first.\n */\nint clamp_int(int value, int lo, int hi) {\nreturn (((((( ( ( (( ( value      \n     ( lo > hi) ) ) )))))) << lo;\n}\n/**\n * Return the value of the (((value    ) . If lo >0 . If hi >0 .))\n * * If lo, swap bo\n}\n\nint main() {\n    assert(clamp_int(5, 0, 10) == 5);\n    assert(clamp_int(-3, 0, 10) == 0);\n    assert(clamp_int(18, 0, 10) == 10);\n    assert(clamp_int(4, 10, 0) == 4);\n    assert(clamp_int(-1, 10, 0) == 0);\n    return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.18553712498396635,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/clamp_int/candidate.cpp:9:6: error: called object type 'int' is not a function or function pointer\n    8 | return (((((( ( ( (( ( value      \n      |                        ~~~~~\n    9 |      ( lo > hi) ) ) )))))) << lo;\n      |      ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/clamp_int/candidate.cpp:9:33: error: expected ')'\n    9 |      ( lo > hi) ) ) )))))) << lo;\n      |                                 ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/clamp_int/candidate.cpp:8:10: note: to match this '('\n    8 | return (((((( ( ( (( ( value      \n      |          ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/clamp_int/candidate.cpp:9:33: error: expected ')'\n    9 |      ( lo > hi) ) ) )))))) << lo;\n      |                                 ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/clamp_int/candidate.cpp:8:9: note: to match this '('\n    8 | return (((((( ( ( (( ( value      \n      |         ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/clamp_int/candidate.cpp:9:33: error: expected ')'\n    9 |      ( lo > hi) ) ) )))))) << lo;\n      |                                 ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/clamp_int/candidate.cpp:8:8: note: to match this '('\n    8 | return (((((( ( ( (( ( value      \n      |        ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/clamp_int/candidate.cpp:11:1: error: unterminated /* comment\n   11 | /**\n      | ^\n5 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/clamp_int/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/clamp_int/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/clamp_int/candidate.cpp",
+      "task_id": "clamp_int"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.020923584001138806,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n\n/**\n * Return true if n is a prime integer.\n */\nbool is_prime(int n) {\nreturn ((((((int(((((unsigned ((((unsigned(((((char *) 0)))))) * n) * n * n + n)) * (n - 1)) * 0) * n;\n}\nbool is_num(int n) {\n return ((n << (((( ( ( (( ( int n) 0)\n}\n\nint main() {\n  assert(!is_prime(-7));\n  assert(!is_prime(0));\n  assert(!is_prime(1));\n  assert(is_prime(2));\n  assert(is_prime(3));\n  assert(!is_prime(4));\n  assert(is_prime(97));\n  assert(!is_prime(221));\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.044400749960914254,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:7:35: error: cast from pointer to smaller type 'unsigned int' loses information\n    7 | return ((((((int(((((unsigned ((((unsigned(((((char *) 0)))))) * n) * n * n + n)) * (n - 1)) * 0) * n;\n      |                                   ^~~~~~~~~~~~~~~~~~~~~~~~~~\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:7:102: error: expected ')'\n    7 | return ((((((int(((((unsigned ((((unsigned(((((char *) 0)))))) * n) * n * n + n)) * (n - 1)) * 0) * n;\n      |                                                                                                      ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:7:18: note: to match this '('\n    7 | return ((((((int(((((unsigned ((((unsigned(((((char *) 0)))))) * n) * n * n + n)) * (n - 1)) * 0) * n;\n      |                  ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:7:102: error: expected ')'\n    7 | return ((((((int(((((unsigned ((((unsigned(((((char *) 0)))))) * n) * n * n + n)) * (n - 1)) * 0) * n;\n      |                                                                                                      ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:7:17: note: to match this '('\n    7 | return ((((((int(((((unsigned ((((unsigned(((((char *) 0)))))) * n) * n * n + n)) * (n - 1)) * 0) * n;\n      |                 ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:7:102: error: expected ')'\n    7 | return ((((((int(((((unsigned ((((unsigned(((((char *) 0)))))) * n) * n * n + n)) * (n - 1)) * 0) * n;\n      |                                                                                                      ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:7:13: note: to match this '('\n    7 | return ((((((int(((((unsigned ((((unsigned(((((char *) 0)))))) * n) * n * n + n)) * (n - 1)) * 0) * n;\n      |             ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:7:102: error: expected ')'\n    7 | return ((((((int(((((unsigned ((((unsigned(((((char *) 0)))))) * n) * n * n + n)) * (n - 1)) * 0) * n;\n      |                                                                                                      ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:7:12: note: to match this '('\n    7 | return ((((((int(((((unsigned ((((unsigned(((((char *) 0)))))) * n) * n * n + n)) * (n - 1)) * 0) * n;\n      |            ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:7:102: error: expected ')'\n    7 | return ((((((int(((((unsigned ((((unsigned(((((char *) 0)))))) * n) * n * n + n)) * (n - 1)) * 0) * n;\n      |                                                                                                      ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:7:11: note: to match this '('\n    7 | return ((((((int(((((unsigned ((((unsigned(((((char *) 0)))))) * n) * n * n + n)) * (n - 1)) * 0) * n;\n      |           ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:7:102: error: expected ')'\n    7 | return ((((((int(((((unsigned ((((unsigned(((((char *) 0)))))) * n) * n * n + n)) * (n - 1)) * 0) * n;\n      |                                                                                                      ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:7:10: note: to match this '('\n    7 | return ((((((int(((((unsigned ((((unsigned(((((char *) 0)))))) * n) * n * n + n)) * (n - 1)) * 0) * n;\n      |          ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:7:102: error: expected ')'\n    7 | return ((((((int(((((unsigned ((((unsigned(((((char *) 0)))))) * n) * n * n + n)) * (n - 1)) * 0) * n;\n      |                                                                                                      ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:7:9: note: to match this '('\n    7 | return ((((((int(((((unsigned ((((unsigned(((((char *) 0)))))) * n) * n * n + n)) * (n - 1)) * 0) * n;\n      |         ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:7:102: error: expected ')'\n    7 | return ((((((int(((((unsigned ((((unsigned(((((char *) 0)))))) * n) * n * n + n)) * (n - 1)) * 0) * n;\n      |                                                                                                      ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:7:8: note: to match this '('\n    7 | return ((((((int(((((unsigned ((((unsigned(((((char *) 0)))))) * n) * n * n + n)) * (n - 1)) * 0) * n;\n      |        ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:10:34: error: expected ')'\n   10 |  return ((n << (((( ( ( (( ( int n) 0)\n      |                                  ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:10:28: note: to match this '('\n   10 |  return ((n << (((( ( ( (( ( int n) 0)\n      |                            ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:11:1: error: expected ')'\n   11 | }\n      | ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:10:25: note: to match this '('\n   10 |  return ((n << (((( ( ( (( ( int n) 0)\n      |                         ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:11:1: error: expected ')'\n   11 | }\n      | ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:10:23: note: to match this '('\n   10 |  return ((n << (((( ( ( (( ( int n) 0)\n      |                       ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:11:1: error: expected ')'\n   11 | }\n      | ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:10:21: note: to match this '('\n   10 |  return ((n << (((( ( ( (( ( int n) 0)\n      |                     ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:11:1: error: expected ')'\n   11 | }\n      | ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:10:19: note: to match this '('\n   10 |  return ((n << (((( ( ( (( ( int n) 0)\n      |                   ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:11:1: error: expected ')'\n   11 | }\n      | ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:10:18: note: to match this '('\n   10 |  return ((n << (((( ( ( (( ( int n) 0)\n      |                  ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:11:1: error: expected ')'\n   11 | }\n      | ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:10:17: note: to match this '('\n   10 |  return ((n << (((( ( ( (( ( int n) 0)\n      |                 ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:11:1: error: expected ')'\n   11 | }\n      | ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp:10:16: note: to match this '('\n   10 |  return ((n << (((( ( ( (( ( int n) 0)\n      |      \n...<truncated>...\n         ^\nfatal error: too many errors emitted, stopping now [-ferror-limit=]\n20 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/is_prime/candidate.cpp",
+      "task_id": "is_prime"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.019194917054846883,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n#include <string>\n#include <string_view>\n#include <vector>\n\n/**\n * Join non-empty strings with the separator, preserving order.\n */\nstd::string join_non_empty(const std::vector<std::string> &parts,\n                           std::string_view sep) {\n  std::string join_sep;\n  join_sep = join_sep; // The last element joined with the sep is the join sep\n                       // is already the join elements\n  join_sep.push_back(\n      join_sep); // Theort element's join eles are already joined with.\n  join_sep[sep] = join_txt; //\n}\n\nint main() {\n  assert(join_non_empty({\"a\", \"\", \"b\", \"c\"}, \":\") == \"a:b:c\");\n  assert(join_non_empty({\"\", \"x\", \"\"}, \",\") == \"x\");\n  assert(join_non_empty({}, \",\") == \"\");\n  assert(join_non_empty({\"\", \"\"}, \",\") == \"\");\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.2735350411385298,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/join_non_empty/candidate.cpp:15:7: error: no viable conversion from 'std::string' (aka 'basic_string<char>') to 'value_type' (aka 'char')\n   15 |       join_sep); // Theort element's join eles are already joined with.\n      |       ^~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1212:55: note: candidate function\n 1212 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 operator __self_view() const _NOEXCEPT {\n      |                                                       ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1477:59: note: passing argument to parameter '__c' here\n 1477 |   _LIBCPP_CONSTEXPR_SINCE_CXX20 void push_back(value_type __c);\n      |                                                           ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/join_non_empty/candidate.cpp:16:11: error: no viable overloaded operator[] for type 'std::string' (aka 'basic_string<char>')\n   16 |   join_sep[sep] = join_txt; //\n      |   ~~~~~~~~^~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1350:3: note: candidate function not viable: no known conversion from 'std::string_view' (aka 'basic_string_view<char>') to 'size_type' (aka 'unsigned long') for 1st argument\n 1350 |   operator[](size_type __pos) const _NOEXCEPT {\n      |   ^          ~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1359:3: note: candidate function not viable: no known conversion from 'std::string_view' (aka 'basic_string_view<char>') to 'size_type' (aka 'unsigned long') for 1st argument\n 1359 |   operator[](size_type __pos) _NOEXCEPT {\n      |   ^          ~~~~~~~~~~~~~~~\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/join_non_empty/candidate.cpp:16:19: error: use of undeclared identifier 'join_txt'\n   16 |   join_sep[sep] = join_txt; //\n      |                   ^~~~~~~~\n3 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/join_non_empty/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/join_non_empty/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/join_non_empty/candidate.cpp",
+      "task_id": "join_non_empty"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.019314124947413802,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n#include <cstdint>\n#include <limits>\n#include <optional>\n#include <string_view>\n\n/**\n * Parse an unsigned 32-bit integer from an entire decimal string.\n */\nstd::optional<std::uint32_t> parse_uint(std::string_view text) {\n  std::optional<std::uint32_t> parse_uint_args {\n    {\n      {{{{}}}};\n      parse_uint.parse_uint_from_string(text){\n          std::optional<parse_uint_t> parse_uchar_args{{}}};\n    }\n\n    int main() {\n      assert(parse_uint(\"0\") && *parse_uint(\"0\") == 0u);\n      assert(parse_uint(\"42\") && *parse_uint(\"42\") == 42u);\n      assert(parse_uint(\"4294967295\") &&\n             *parse_uint(\"4294967295\") ==\n                 std::numeric_limits<std::uint32_t>::max());\n      assert(!parse_uint(\"\"));\n      assert(!parse_uint(\"-1\"));\n      assert(!parse_uint(\"12x\"));\n      assert(!parse_uint(\"4294967296\"));\n      return 0;\n    }\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.18603404215537012,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/parse_uint/candidate.cpp:13:15: error: expected '}'\n   13 |       {{{{}}}};\n      |               ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/parse_uint/candidate.cpp:12:5: note: to match this '{'\n   12 |     {\n      |     ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/parse_uint/candidate.cpp:16:6: error: expected ';' at end of declaration\n   16 |     }\n      |      ^\n      |      ;\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/parse_uint/candidate.cpp:18:16: error: function definition is not allowed here\n   18 |     int main() {\n      |                ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/parse_uint/candidate.cpp:29:6: error: expected '}'\n   29 |     }\n      |      ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/parse_uint/candidate.cpp:10:64: note: to match this '{'\n   10 | std::optional<std::uint32_t> parse_uint(std::string_view text) {\n      |                                                                ^\n4 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/parse_uint/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/parse_uint/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_c1_h1_iw/parse_uint/candidate.cpp",
+      "task_id": "parse_uint"
+    }
+  ],
+  "summary": {
+    "c_compiler": "clang",
+    "clang_format": "clang-format",
+    "clang_format_ok": 4,
+    "compiled": 0,
+    "cpp_compiler": "clang++",
+    "pass_rate": 0.0,
+    "passed": 0,
+    "ran": 0,
+    "total": 4
+  }
+}

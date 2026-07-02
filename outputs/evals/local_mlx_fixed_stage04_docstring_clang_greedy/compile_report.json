@@ -1,0 +1,210 @@
+{
+  "results": [
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.02255524997599423,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <algorithm>\n#include <cassert>\n\n/**\n * Return value clamped into inclusive [lo, hi]. If lo > hi, swap bounds first.\n */\nint clamp_int(int value, int lo, int hi) {\n  int hi = -value;\n  int hihi = hi;\n  int lohi = hihi;\n  inthihi = lohi;\n  hihi = hihi;\n  lohi <<= hihi;\n#ifdef __WIN32\n  if (value > hihi) {\n    hihi -= hihi;\n#endif\n    lohihi = (hihihi * hihi) + hihi;\n#if defined\n  }\n\n  int main() {\n    assert(clamp_int(5, 0, 10) == 5);\n    assert(clamp_int(-3, 0, 10) == 0);\n    assert(clamp_int(18, 0, 10) == 10);\n    assert(clamp_int(4, 10, 0) == 4);\n    assert(clamp_int(-1, 10, 0) == 0);\n    return 0;\n  }\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.23079045792110264,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/clamp_int/candidate.cpp:8:7: error: redefinition of 'hi'\n    8 |   int hi = -value;\n      |       ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/clamp_int/candidate.cpp:7:38: note: previous definition is here\n    7 | int clamp_int(int value, int lo, int hi) {\n      |                                      ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/clamp_int/candidate.cpp:11:3: error: use of undeclared identifier 'inthihi'\n   11 |   inthihi = lohi;\n      |   ^~~~~~~\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/clamp_int/candidate.cpp:18:5: error: use of undeclared identifier 'lohihi'\n   18 |     lohihi = (hihihi * hihi) + hihi;\n      |     ^~~~~~\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/clamp_int/candidate.cpp:18:15: error: use of undeclared identifier 'hihihi'; did you mean 'hihi'?\n   18 |     lohihi = (hihihi * hihi) + hihi;\n      |               ^~~~~~\n      |               hihi\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/clamp_int/candidate.cpp:9:7: note: 'hihi' declared here\n    9 |   int hihi = hi;\n      |       ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/clamp_int/candidate.cpp:19:12: error: macro name missing\n   19 | #if defined\n      |            ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/clamp_int/candidate.cpp:19:2: error: unterminated conditional directive\n   19 | #if defined\n      |  ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/clamp_int/candidate.cpp:29:4: error: expected '}'\n   29 |   }\n      |    ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/clamp_int/candidate.cpp:7:42: note: to match this '{'\n    7 | int clamp_int(int value, int lo, int hi) {\n      |                                          ^\n7 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/clamp_int/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/clamp_int/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/clamp_int/candidate.cpp",
+      "task_id": "clamp_int"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.019803334027528763,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n\n/**\n * Return true if n is a prime integer.\n */\nbool is_prime(int n) { return n < 2 || n > 3 || n << SPACESPACE__LITTLE__; }\nbool is_seed() const { return is_seed__little__(); }\nbool &is_seed2() const { return !is_seed2__littleg__(); }\nbool &is_seed3() const;\nbool\n}\n\nint main() {\n  assert(!is_prime(-7));\n  assert(!is_prime(0));\n  assert(!is_prime(1));\n  assert(is_prime(2));\n  assert(is_prime(3));\n  assert(!is_prime(4));\n  assert(is_prime(97));\n  assert(!is_prime(221));\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.04621058306656778,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/is_prime/candidate.cpp:6:54: error: use of undeclared identifier 'SPACESPACE__LITTLE__'\n    6 | bool is_prime(int n) { return n < 2 || n > 3 || n << SPACESPACE__LITTLE__; }\n      |                                                      ^~~~~~~~~~~~~~~~~~~~\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/is_prime/candidate.cpp:7:16: error: non-member function cannot have 'const' qualifier\n    7 | bool is_seed() const { return is_seed__little__(); }\n      |                ^~~~~\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/is_prime/candidate.cpp:7:31: error: use of undeclared identifier 'is_seed__little__'\n    7 | bool is_seed() const { return is_seed__little__(); }\n      |                               ^~~~~~~~~~~~~~~~~\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/is_prime/candidate.cpp:8:18: error: non-member function cannot have 'const' qualifier\n    8 | bool &is_seed2() const { return !is_seed2__littleg__(); }\n      |                  ^~~~~\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/is_prime/candidate.cpp:8:34: error: use of undeclared identifier 'is_seed2__littleg__'\n    8 | bool &is_seed2() const { return !is_seed2__littleg__(); }\n      |                                  ^~~~~~~~~~~~~~~~~~~\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/is_prime/candidate.cpp:9:18: error: non-member function cannot have 'const' qualifier\n    9 | bool &is_seed3() const;\n      |                  ^~~~~\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/is_prime/candidate.cpp:11:1: error: expected unqualified-id\n   11 | }\n      | ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/is_prime/candidate.cpp:11:1: error: extraneous closing brace ('}')\n8 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/is_prime/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/is_prime/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/is_prime/candidate.cpp",
+      "task_id": "is_prime"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.019546082941815257,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n#include <string>\n#include <string_view>\n#include <vector>\n\n/**\n * Join non-empty strings with the separator, preserving order.\n */\nstd::string join_non_empty(const std::vector<std::string> &parts,\n                           std::string_view sep) {\n  std::string s;\n  for (s = parts.begin(), sep = parts.end()) {\n    if (!std::isdigit(*s)) {\n      // if it is a non-empty string, or it is not a non-whitespace string,\n      // we don't need to check for it.\n      s = s + sep;\n      continue;\n    }\n    if\n  }\n\n  int main() {\n    assert(join_non_empty({\"a\", \"\", \"b\", \"c\"}, \":\") == \"a:b:c\");\n    assert(join_non_empty({\"\", \"x\", \"\"}, \",\") == \"x\");\n    assert(join_non_empty({}, \",\") == \"\");\n    assert(join_non_empty({\"\", \"\"}, \",\") == \"\");\n    return 0;\n  }\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.2860390411224216,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/join_non_empty/candidate.cpp:12:10: error: no viable overloaded '='\n   12 |   for (s = parts.begin(), sep = parts.end()) {\n      |        ~ ^ ~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1217:3: note: candidate function not viable: no known conversion from 'const_iterator' (aka '__wrap_iter<const std::string *>') to 'const std::string' for 1st argument\n 1217 |   operator=(const basic_string& __str);\n      |   ^         ~~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1230:3: note: candidate function not viable: no known conversion from 'const_iterator' (aka '__wrap_iter<const std::string *>') to 'std::string' for 1st argument\n 1230 |   operator=(basic_string&& __str) noexcept(__noexcept_move_assign_container<_Allocator, __alloc_traits>::value) {\n      |   ^         ~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1235:69: note: candidate function not viable: no known conversion from 'const_iterator' (aka '__wrap_iter<const std::string *>') to 'initializer_list<value_type>' (aka 'initializer_list<char>') for 1st argument\n 1235 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 basic_string& operator=(initializer_list<value_type> __il) {\n      |                                                                     ^         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1240:3: note: candidate function not viable: no known conversion from 'const_iterator' (aka '__wrap_iter<const std::string *>') to 'const value_type * _Nonnull' (aka 'const char *') for 1st argument\n 1240 |   operator=(const value_type* _LIBCPP_DIAGNOSE_NULLPTR __s) {\n      |   ^         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1246:47: note: candidate function not viable: no known conversion from 'const_iterator' (aka '__wrap_iter<const std::string *>') to 'value_type' (aka 'char') for 1st argument\n 1246 |   _LIBCPP_CONSTEXPR_SINCE_CXX20 basic_string& operator=(value_type __c);\n      |                                               ^         ~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1223:47: note: candidate template ignored: requirement '__can_be_converted_to_string_view_v<char, std::char_traits<char>, std::__wrap_iter<const std::string *>>' was not satisfied [with _Tp = const_iterator]\n 1223 |   _LIBCPP_CONSTEXPR_SINCE_CXX20 basic_string& operator=(const _Tp& __t) {\n      |                                               ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/join_non_empty/candidate.cpp:12:31: error: no viable overloaded '='\n   12 |   for (s = parts.begin(), sep = parts.end()) {\n      |                           ~~~ ^ ~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string_view:320:44: note: candidate function not viable: no known conversion from 'const_iterator' (aka '__wrap_iter<const std::string *>') to 'const std::string_view' for 1st argument\n  320 |   _LIBCPP_HIDE_FROM_ABI basic_string_view& operator=(const basic_string_view&) _NOEXCEPT = default;\n      |                                            ^         ~~~~~~~~~~~~~~~~~~~~~~~~\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/join_non_empty/candidate.cpp:12:44: error: expected ';' in 'for' statement specifier\n   12 |   for (s = parts.begin(), sep = parts.end()) {\n      |                                            ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/join_non_empty/candidate.cpp:12:44: error: expected ';' in 'for' statement specifier\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/join_non_empty/candidate.cpp:13:23: error: indirection requires pointer operand ('std::string' (aka 'basic_string<char>') invalid)\n   13 |     if (!std::isdigit(*s)) {\n      |                       ^~\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/join_non_empty/candidate.cpp:16:13: error: invalid operands to binary expression ('std::string' (aka 'basic_string<char>') and 'std::string_view' (aka 'basic_string_view<char>'))\n   16 |       s = s + sep;\n      |           ~ ^ ~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3758:1: note: candidate template ignored: deduced conflicting types for parameter '_CharT' ('char' vs. 'std::string_view' (aka 'basic_string_view<char>'))\n 3758 | operator+(const basic_string<_CharT, _Traits, _Allocator>& __lhs, _CharT __rhs) {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3821:1: note: candidate template ignored: deduced conflicting types for parameter '_CharT' ('char' vs. 'std::string_view' (aka 'basic_string_view<char>'))\n 3821 | operator+(basic_string<_CharT, _Traits, _Allocator>&& __lhs, _CharT __rhs) {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__iterator/reverse_iterator.h:298:1: note: candidate template ignored: could not match 'reverse_iterator' against 'basic_string_view'\n  298 | operator+(typename reverse_iterator<_Iter>::difference_type __n, const reverse_iterator<_Iter>& __x) {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__iterator/wrap_iter.h:230:1: note: candidate template ignored: could not match '__wrap_iter' against 'basic_string_view'\n  230 | operator+(typename __wrap_iter<_Iter1>::difference_type __n, __wrap_iter<_Iter1> __x) _NOEXCEPT {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__iterator/move_iterator.h:317:1: note: candidate template ignored: could not match 'move_iterator' against 'basic_string_view'\n  317 | operator+(iter_difference_t<_Iter> __n, const move_iterator<_Iter>& __x)\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3729:1: note: candidate template ignored: could not match 'basic_string' against 'basic_string_view'\n 3729 | operator+(const basic_string<_CharT, _Traits, _Allocator>& __lhs,\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3736:1: note: candidate template ignored: could not match 'const _CharT *' against 'std::string' (aka 'basic_string<char>')\n 3736 | operator+(const _CharT* __lhs, const basic_string<_CharT, _Traits, _Allocator>& __rhs) {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3745:1: note: candidate template ignored: could not match 'basic_string' against 'basic_string_view'\n 3745 | operator+(_CharT __lhs, const basic_string<_CharT, _Traits, _Allocator>& __rhs) {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3752:1: note: candidate template ignored: could not match 'const _CharT *' against 'std::string_view' (aka 'basic_string_view<char>')\n 3752 | operator+(const basic_string<_CharT, _Traits, _Allocator>& __lhs, const _CharT* __rhs) {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3784:1: note: candidate template ignored: could not match 'basic_string' against 'basic_string_view'\n 3784 | operator+(basic_string<_CharT, _Traits, _Allocator>&& __lhs, const basic_string<_CharT, _Traits, _Allocator>& __rhs) {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3790:1: note: candidate template ignored: could not match 'basic_string' against 'basic_string_view'\n 3790 | operator+(const basic_string<_CharT, _Traits, _Allocator>& __lhs, basic_string<_CharT, _Traits, _Allocator>&& __rhs) {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3796:1: note: candidate template ignored: could not match 'basic_string' against 'basic_string_view'\n 3796 | operator+(basic_string<_CharT, _Traits, _Allocator>&& __lhs, basic_string<_CharT, _Traits, _Allocator>&& __rhs) {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3802:1: note: candidate template ignored: could not match 'const _CharT *' against 'std::string' (aka 'basic_string<char>')\n 3802 | operator+(const\n...<truncated>...\n::string_view sep) {\n      |                                                  ^\n9 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/join_non_empty/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/join_non_empty/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/join_non_empty/candidate.cpp",
+      "task_id": "join_non_empty"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.019684792030602694,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n#include <cstdint>\n#include <limits>\n#include <optional>\n#include <string_view>\n\n/**\n * Parse an unsigned 32-bit integer from an entire decimal string.\n */\nstd::optional<std::uint32_t> parse_uint(std::string_view text) {}\n\nint main() {\n  assert(parse_uint(\"0\") && *parse_uint(\"0\") == 0u);\n  assert(parse_uint(\"42\") && *parse_uint(\"42\") == 42u);\n  assert(parse_uint(\"4294967295\") &&\n         *parse_uint(\"4294967295\") ==\n             std::numeric_limits<std::uint32_t>::max());\n  assert(!parse_uint(\"\"));\n  assert(!parse_uint(\"-1\"));\n  assert(!parse_uint(\"12x\"));\n  assert(!parse_uint(\"4294967296\"));\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.3717180418316275,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/parse_uint/candidate.cpp:10:65: warning: non-void function does not return a value [-Wreturn-type]\n   10 | std::optional<std::uint32_t> parse_uint(std::string_view text) {}\n      |                                                                 ^\n1 warning generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/parse_uint/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/parse_uint/candidate"
+      ],
+      "compile_ok": true,
+      "missing_completion": false,
+      "passed": false,
+      "run": {
+        "elapsed_s": 0.002638499950990081,
+        "ok": false,
+        "returncode": -5,
+        "stderr": "",
+        "stdout": "",
+        "timeout": false
+      },
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_eq9r6zq5/parse_uint/candidate.cpp",
+      "task_id": "parse_uint"
+    }
+  ],
+  "summary": {
+    "c_compiler": "clang",
+    "clang_format": "clang-format",
+    "clang_format_ok": 4,
+    "compiled": 1,
+    "cpp_compiler": "clang++",
+    "pass_rate": 0.0,
+    "passed": 0,
+    "ran": 0,
+    "total": 4
+  }
+}

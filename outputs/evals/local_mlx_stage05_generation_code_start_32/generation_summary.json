@@ -1,0 +1,8 @@
+{
+  "cases": 4,
+  "checkpoint": "outputs/checkpoints/mlx_converted/stage_05_seq1024/model.safetensors",
+  "completions": 4,
+  "max_new_tokens": 32,
+  "prompt_mode": "source-prefix",
+  "seq_len": 1024
+}

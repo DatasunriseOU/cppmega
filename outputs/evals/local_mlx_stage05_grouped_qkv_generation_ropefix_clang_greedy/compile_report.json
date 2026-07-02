@@ -1,0 +1,203 @@
+{
+  "results": [
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.1388390000211075,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <algorithm>\n#include <cassert>\n\n/**\n * Return value clamped into inclusive [lo, hi]. If lo > hi, swap bounds first.\n */\nint clamp_int(int value, int lo, int hi) {\nreturn (((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((\n}\n\nint main() {\n  assert(clamp_int(5, 0, 10) == 5);\n  assert(clamp_int(-3, 0, 10) == 0);\n  assert(clamp_int(18, 0, 10) == 10);\n  assert(clamp_int(4, 10, 0) == 4);\n  assert(clamp_int(-1, 10, 0) == 0);\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.4826300829881802,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:9:1: error: expected expression\n    9 | }\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:18:2: error: expected '}'\n   18 | }\n      |  ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:7:42: note: to match this '{'\n    7 | int clamp_int(int value, int lo, int hi) {\n      |                                          ^\n2 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp",
+        "-o",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp",
+      "task_id": "clamp_int"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.02505475003272295,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n\n/**\n * Return true if n is a prime integer.\n */\nbool is_prime(int n) {\nreturn ((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((                            forforforforforforforforfor\n}\n\nint main() {\n  assert(!is_prime(-7));\n  assert(!is_prime(0));\n  assert(!is_prime(1));\n  assert(is_prime(2));\n  assert(is_prime(3));\n  assert(!is_prime(4));\n  assert(is_prime(97));\n  assert(!is_prime(221));\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.04984579200390726,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:7:124: error: use of undeclared identifier 'forforforforforforforforfor'\n    7 | return ((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((                            forforforforforforforforfor\n      |                                                                                                                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:20:2: error: expected '}'\n   20 | }\n      |  ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:6:22: note: to match this '{'\n    6 | bool is_prime(int n) {\n      |                      ^\n2 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp",
+        "-o",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp",
+      "task_id": "is_prime"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.021514832973480225,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n#include <string>\n#include <string_view>\n#include <vector>\n\n/**\n * Join non-empty strings with the separator, preserving order.\n */\nstd::string join_non_empty(const std::vector<std::string> &parts,\n                           std::string_view sep) {\n  std::string join_sep;\n  join_sep = join_sep;\n  join_sep = join_sep;\n  join_sep = join_sep;\n  join_sep = join_sep;\n  join_sep = join_sep;\n  join_sep = join_sep;\n  join_sep = join_sep;\n  join_sep = join_sep;\n  join_sep = join_sep;\n  join_sep = join_sep\n}\n\nint main() {\n  assert(join_non_empty({\"a\", \"\", \"b\", \"c\"}, \":\") == \"a:b:c\");\n  assert(join_non_empty({\"\", \"x\", \"\"}, \",\") == \"x\");\n  assert(join_non_empty({}, \",\") == \"\");\n  assert(join_non_empty({\"\", \"\"}, \",\") == \"\");\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.3528317080345005,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:21:22: error: expected ';' after expression\n   21 |   join_sep = join_sep\n      |                      ^\n      |                      ;\n1 error generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp",
+        "-o",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp",
+      "task_id": "join_non_empty"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.021041458006948233,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n#include <cstdint>\n#include <limits>\n#include <optional>\n#include <string_view>\n\n/**\n * Parse an unsigned 32-bit integer from an entire decimal string.\n */\nstd::optional<std::uint32_t> parse_uint(std::string_view text) {\n  std::optional<std::uint32_t> parse_uint_args {\n    {\n      {\n        {\n          {\n            {\n              {\n                {\n                  {\n                    {\n                      {\n                        {\n                          {\n                            {\n                              {\n                                {\n                                  {\n                                    {\n                                      {\n                                        {\n                                          {\n                                            {\n                                              {\n                                                {\n                                                  {\n                                                    {\n                                                      {\n                                                        {\n                                                          {\n<UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK>\n                                                          }\n\n                                                          int main() {\n                                                            assert(parse_uint(\n                                                                       \"0\") &&\n                                                                   *parse_uint(\n                                                                       \"0\") ==\n                                                                       0u);\n                                                            assert(parse_uint(\n                                                                       \"42\") &&\n                                                                   *parse_uint(\n                                                                       \"42\") ==\n                                                                       42u);\n                                                            assert(\n                                                                parse_uint(\n                                                                    \"429496729\"\n                                                                    \"5\") &&\n                                                                *parse_uint(\n                                                                    \"429496729\"\n                                                                    \"5\") ==\n                                                                    std::numeric_limits<\n                                                                        std::\n                                                                            uint32_t>::\n                                                                        max());\n                                                            assert(!parse_uint(\n                                                                \"\"));\n                                                            assert(!parse_uint(\n                                                                \"-1\"));\n                                                            assert(!parse_uint(\n                                                                \"12x\"));\n                                                            assert(!parse_uint(\n                                                                \"4294967296\"));\n                                                            return 0;\n                                                          }\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.20287783409003168,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:40:1: error: expected expression\n   40 | <UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK>\n      | ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:40:2: error: use of undeclared identifier 'UNK'\n   40 | <UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK>\n      |  ^~~\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:40:6: error: expected expression\n   40 | <UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK>\n      |      ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:40:7: error: use of undeclared identifier 'UNK'\n   40 | <UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK>\n      |       ^~~\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:40:11: error: expected expression\n   40 | <UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK>\n      |           ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:40:12: error: use of undeclared identifier 'UNK'\n   40 | <UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK>\n      |            ^~~\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:40:16: error: expected expression\n   40 | <UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK>\n      |                ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:40:17: error: use of undeclared identifier 'UNK'\n   40 | <UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK>\n      |                 ^~~\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:40:21: error: expected expression\n   40 | <UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK>\n      |                     ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:40:22: error: use of undeclared identifier 'UNK'\n   40 | <UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK>\n      |                      ^~~\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:40:26: error: expected expression\n   40 | <UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK>\n      |                          ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:40:27: error: use of undeclared identifier 'UNK'\n   40 | <UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK>\n      |                           ^~~\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:40:31: error: expected expression\n   40 | <UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK>\n      |                               ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:40:32: error: use of undeclared identifier 'UNK'\n   40 | <UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UNK><UN\n...<truncated>...\n         ^\nfatal error: too many errors emitted, stopping now [-ferror-limit=]\n20 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp",
+        "-o",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp",
+      "task_id": "parse_uint"
+    }
+  ],
+  "summary": {
+    "c_compiler": "clang",
+    "clang_format": "clang-format",
+    "clang_format_ok": 4,
+    "compiled": 0,
+    "cpp_compiler": "clang++",
+    "pass_rate": 0.0,
+    "passed": 0,
+    "ran": 0,
+    "total": 4
+  }
+}

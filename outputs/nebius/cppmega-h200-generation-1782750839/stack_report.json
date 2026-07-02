@@ -1,0 +1,40 @@
+{
+  "cppmega": {
+    "file": "/opt/cppmega/cppmega/__init__.py",
+    "version": "0.1.0"
+  },
+  "cuda": {
+    "capability": [
+      9,
+      0
+    ],
+    "cuda": "13.2",
+    "device": "NVIDIA H200",
+    "torch": "2.13.0.dev20260611+cu132",
+    "total_memory_gib": 139.80072021484375
+  },
+  "flash_attn": {
+    "file": "/usr/local/lib/python3.13/dist-packages/flash_attn/__init__.py",
+    "version": "2.8.4"
+  },
+  "mamba_ssm": {
+    "file": "/usr/local/lib/python3.13/dist-packages/mamba_ssm/__init__.py",
+    "version": "2.3.1"
+  },
+  "megatron.core": {
+    "file": "/opt/megatron-lm/megatron/core/__init__.py",
+    "version": "0.18.0+ba7b5eb"
+  },
+  "torch": {
+    "file": "/usr/local/lib/python3.13/dist-packages/torch/__init__.py",
+    "version": "2.13.0.dev20260611+cu132"
+  },
+  "transformer_engine": {
+    "file": "/usr/local/lib/python3.13/dist-packages/transformer_engine/__init__.py",
+    "version": "2.16.0+4220403e"
+  },
+  "transformer_engine.pytorch": {
+    "file": "/usr/local/lib/python3.13/dist-packages/transformer_engine/pytorch/__init__.py",
+    "version": null
+  }
+}

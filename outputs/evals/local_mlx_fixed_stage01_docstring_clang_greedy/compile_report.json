@@ -1,0 +1,203 @@
+{
+  "results": [
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.1425640000961721,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <algorithm>\n#include <cassert>\n\n/**\n * Return value clamped into inclusive [lo, hi]. If lo > hi, swap bounds first.\n */\nint clamp_int(int value, int lo, int hi) {\n  int lo = (value < lo)\n      ? ((((((value << lo) - hi) - hi - hi)) : hi) : hi; return lo < hi;\n}\n\nint main() {\n  assert(clamp_int(5, 0, 10) == 5);\n  assert(clamp_int(-3, 0, 10) == 0);\n  assert(clamp_int(18, 0, 10) == 10);\n  assert(clamp_int(4, 10, 0) == 4);\n  assert(clamp_int(-1, 10, 0) == 0);\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.48827037517912686,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/clamp_int/candidate.cpp:8:7: error: redefinition of 'lo'\n    8 |   int lo = (value < lo)\n      |       ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/clamp_int/candidate.cpp:7:30: note: previous definition is here\n    7 | int clamp_int(int value, int lo, int hi) {\n      |                              ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/clamp_int/candidate.cpp:9:46: error: expected ')'\n    9 |       ? ((((((value << lo) - hi) - hi - hi)) : hi) : hi; return lo < hi;\n      |                                              ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/clamp_int/candidate.cpp:9:10: note: to match this '('\n    9 |       ? ((((((value << lo) - hi) - hi - hi)) : hi) : hi; return lo < hi;\n      |          ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/clamp_int/candidate.cpp:9:52: error: expected ')'\n    9 |       ? ((((((value << lo) - hi) - hi - hi)) : hi) : hi; return lo < hi;\n      |                                                    ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/clamp_int/candidate.cpp:9:9: note: to match this '('\n    9 |       ? ((((((value << lo) - hi) - hi - hi)) : hi) : hi; return lo < hi;\n      |         ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/clamp_int/candidate.cpp:9:56: error: expected ':'\n    9 |       ? ((((((value << lo) - hi) - hi - hi)) : hi) : hi; return lo < hi;\n      |                                                        ^\n      |                                                        : \n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/clamp_int/candidate.cpp:9:7: note: to match this '?'\n    9 |       ? ((((((value << lo) - hi) - hi - hi)) : hi) : hi; return lo < hi;\n      |       ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/clamp_int/candidate.cpp:9:56: error: expected expression\n    9 |       ? ((((((value << lo) - hi) - hi - hi)) : hi) : hi; return lo < hi;\n      |                                                        ^\n5 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/clamp_int/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/clamp_int/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/clamp_int/candidate.cpp",
+      "task_id": "clamp_int"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.023564124945551157,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n\n/**\n * Return true if n is a prime integer.\n */\nbool is_prime(int n) {\n  if (n <= 2) {\n    return false;\n  }\n}\nreturn true;\n}\n\nint main() {\n  assert(!is_prime(-7));\n  assert(!is_prime(0));\n  assert(!is_prime(1));\n  assert(is_prime(2));\n  assert(is_prime(3));\n  assert(!is_prime(4));\n  assert(is_prime(97));\n  assert(!is_prime(221));\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.05226775002665818,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/is_prime/candidate.cpp:10:1: warning: non-void function does not return a value in all control paths [-Wreturn-type]\n   10 | }\n      | ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/is_prime/candidate.cpp:11:1: error: expected unqualified-id\n   11 | return true;\n      | ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/is_prime/candidate.cpp:12:1: error: extraneous closing brace ('}')\n   12 | }\n      | ^\n1 warning and 2 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/is_prime/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/is_prime/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/is_prime/candidate.cpp",
+      "task_id": "is_prime"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.022664958843961358,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n#include <string>\n#include <string_view>\n#include <vector>\n\n/**\n * Join non-empty strings with the separator, preserving order.\n */\nstd::string join_non_empty(const std::vector<std::string> &parts,\n                           std::string_view sep) {\n  auto sep = parts.begin();\n  if (sep == sep.end()) {\n    return sep;\n  }\n  if (!sep.empty()) { // \"\" is not valid in the same string.\n    return sep + sep + 1;\n  }\n}\n\nint main() {\n  assert(join_non_empty({\"a\", \"\", \"b\", \"c\"}, \":\") == \"a:b:c\");\n  assert(join_non_empty({\"\", \"x\", \"\"}, \",\") == \"x\");\n  assert(join_non_empty({}, \",\") == \"\");\n  assert(join_non_empty({\"\", \"\"}, \",\") == \"\");\n  return 0;\n}\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.40401891712099314,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/join_non_empty/candidate.cpp:11:8: error: redefinition of 'sep'\n   11 |   auto sep = parts.begin();\n      |        ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/join_non_empty/candidate.cpp:10:45: note: previous definition is here\n   10 |                            std::string_view sep) {\n      |                                             ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/join_non_empty/candidate.cpp:13:12: error: no viable conversion from returned value of type 'std::string_view' (aka 'basic_string_view<char>') to function return type 'std::string' (aka 'basic_string<char>')\n   13 |     return sep;\n      |            ^~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1002:71: note: candidate constructor not viable: no known conversion from 'std::string_view' (aka 'basic_string_view<char>') to 'const std::string &' for 1st argument\n 1002 |   _LIBCPP_CONSTEXPR_SINCE_CXX20 _LIBCPP_STRING_INTERNAL_MEMORY_ACCESS basic_string(const basic_string& __str)\n      |                                                                       ^            ~~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1022:55: note: candidate constructor not viable: no known conversion from 'std::string_view' (aka 'basic_string_view<char>') to 'std::string &&' for 1st argument\n 1022 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 basic_string(basic_string&& __str)\n      |                                                       ^            ~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1062:55: note: candidate constructor template not viable: no known conversion from 'std::string_view' (aka 'basic_string_view<char>') to 'const char * _Nonnull' for 1st argument\n 1062 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 basic_string(const _CharT* _LIBCPP_DIAGNOSE_NULLPTR __s) {\n      |                                                       ^            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1197:55: note: candidate constructor not viable: no known conversion from 'std::string_view' (aka 'basic_string_view<char>') to 'initializer_list<char>' for 1st argument\n 1197 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 basic_string(initializer_list<_CharT> __il) {\n      |                                                       ^            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:987:64: note: explicit constructor is not a candidate\n  987 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 explicit basic_string(const allocator_type& __a)\n      |                                                                ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:1156:64: note: explicit constructor is not a candidate\n 1156 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 explicit basic_string(const _Tp& __t) {\n      |                                                                ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/join_non_empty/candidate.cpp:16:16: error: invalid operands to binary expression ('std::string_view' (aka 'basic_string_view<char>') and 'std::string_view')\n   16 |     return sep + sep + 1;\n      |            ~~~ ^ ~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__iterator/reverse_iterator.h:298:1: note: candidate template ignored: could not match 'reverse_iterator' against 'basic_string_view'\n  298 | operator+(typename reverse_iterator<_Iter>::difference_type __n, const reverse_iterator<_Iter>& __x) {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__iterator/wrap_iter.h:230:1: note: candidate template ignored: could not match '__wrap_iter' against 'basic_string_view'\n  230 | operator+(typename __wrap_iter<_Iter1>::difference_type __n, __wrap_iter<_Iter1> __x) _NOEXCEPT {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__iterator/move_iterator.h:317:1: note: candidate template ignored: could not match 'move_iterator' against 'basic_string_view'\n  317 | operator+(iter_difference_t<_Iter> __n, const move_iterator<_Iter>& __x)\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3729:1: note: candidate template ignored: could not match 'basic_string' against 'basic_string_view'\n 3729 | operator+(const basic_string<_CharT, _Traits, _Allocator>& __lhs,\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3736:1: note: candidate template ignored: could not match 'const _CharT *' against 'std::string_view' (aka 'basic_string_view<char>')\n 3736 | operator+(const _CharT* __lhs, const basic_string<_CharT, _Traits, _Allocator>& __rhs) {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3745:1: note: candidate template ignored: could not match 'basic_string' against 'basic_string_view'\n 3745 | operator+(_CharT __lhs, const basic_string<_CharT, _Traits, _Allocator>& __rhs) {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3752:1: note: candidate template ignored: could not match 'basic_string' against 'basic_string_view'\n 3752 | operator+(const basic_string<_CharT, _Traits, _Allocator>& __lhs, const _CharT* __rhs) {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3758:1: note: candidate template ignored: could not match 'basic_string' against 'basic_string_view'\n 3758 | operator+(const basic_string<_CharT, _Traits, _Allocator>& __lhs, _CharT __rhs) {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3784:1: note: candidate template ignored: could not match 'basic_string' against 'basic_string_view'\n 3784 | operator+(basic_string<_CharT, _Traits, _Allocator>&& __lhs, const basic_string<_CharT, _Traits, _Allocator>& __rhs) {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3790:1: note: candidate template ignored: could not match 'basic_string' against 'basic_string_view'\n 3790 | operator+(const basic_string<_CharT, _Traits, _Allocator>& __lhs, basic_string<_CharT, _Traits, _Allocator>&& __rhs) {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3796:1: note: candidate template ignored: could not match 'basic_string' against 'basic_string_view'\n 3796 | operator+(basic_string<_CharT, _Traits, _Allocator>&& __lhs, basic_string<_CharT, _Traits, _Allocator>&& __rhs) {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3802:1: note: candidate template ignored: could not match 'const _CharT *' against 'std::string_view' (aka 'basic_string_view<char>')\n 3802 | operator+(const _CharT* __lhs, basic_string<_CharT, _Traits, _Allocator>&& __rhs) {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3808:1: note: candidate template ignored: could not match 'basic_string' against 'basic_string_view'\n 3808 | operator+(_CharT __lhs, basic_string<_CharT, _Traits, _Allocator>&& __rhs) {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3815:1: note: candidate template ignored: could not match 'basic_string' against 'basic_string_view'\n 3815 | operator+(basic_string<_CharT, _Traits, _Allocator>&& __lhs, const _CharT* __rhs) {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/string:3821:1: note: candidate template ignored: could not match 'basic_string' against 'basic_string_view'\n 3821 | operator+(basic_string<_CharT, _Traits, _Allocator>&& __lhs, _CharT __rhs) {\n      | ^\n3 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/join_non_empty/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/join_non_empty/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/join_non_empty/candidate.cpp",
+      "task_id": "join_non_empty"
+    },
+    {
+      "clang_format": {
+        "cmd": [
+          "clang-format",
+          "--assume-filename=candidate.cpp"
+        ],
+        "elapsed_s": 0.026308124884963036,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "#include <cassert>\n#include <cstdint>\n#include <limits>\n#include <optional>\n#include <string_view>\n\n/**\n * Parse an unsigned 32-bit integer from an entire decimal string.\n */\nstd::optional<std::uint32_t> parse_uint(std::string_view text) {\n  if (text.size() == 2) {\n    return text;\n  }\n  if (t == '0' || t == '9') {\n    if (!parse_uint(text, text.data(), text)) {\n      throw std::runtime_error(\"Unable to parse '\" + text +\n                               \"' from an integer\");\n    }\n\n    int main() {\n      assert(parse_uint(\"0\") && *parse_uint(\"0\") == 0u);\n      assert(parse_uint(\"42\") && *parse_uint(\"42\") == 42u);\n      assert(parse_uint(\"4294967295\") &&\n             *parse_uint(\"4294967295\") ==\n                 std::numeric_limits<std::uint32_t>::max());\n      assert(!parse_uint(\"\"));\n      assert(!parse_uint(\"-1\"));\n      assert(!parse_uint(\"12x\"));\n      assert(!parse_uint(\"4294967296\"));\n      return 0;\n    }\n",
+        "timeout": false
+      },
+      "compile": {
+        "elapsed_s": 0.23337320797145367,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/parse_uint/candidate.cpp:12:12: error: no viable conversion from returned value of type 'std::string_view' (aka 'basic_string_view<char>') to function return type 'std::optional<std::uint32_t>' (aka 'std::optional<unsigned int>')\n   12 |     return text;\n      |            ^~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/optional:900:35: note: candidate constructor not viable: no known conversion from 'std::string_view' (aka 'basic_string_view<char>') to 'const optional<unsigned int> &' for 1st argument\n  900 |   _LIBCPP_HIDE_FROM_ABI constexpr optional(const optional&) = default;\n      |                                   ^        ~~~~~~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/optional:901:35: note: candidate constructor not viable: no known conversion from 'std::string_view' (aka 'basic_string_view<char>') to 'optional<unsigned int> &&' for 1st argument\n  901 |   _LIBCPP_HIDE_FROM_ABI constexpr optional(optional&&)      = default;\n      |                                   ^        ~~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/optional:902:35: note: candidate constructor not viable: no known conversion from 'std::string_view' (aka 'basic_string_view<char>') to 'nullopt_t' for 1st argument\n  902 |   _LIBCPP_HIDE_FROM_ABI constexpr optional(nullopt_t) noexcept {}\n      |                                   ^        ~~~~~~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/optional:918:35: note: candidate template ignored: requirement 'std::optional<unsigned int>::_CheckOptionalArgsConstructor::__enable_implicit()' was not satisfied [with _Up = std::string_view &]\n  918 |   _LIBCPP_HIDE_FROM_ABI constexpr optional(_Up&& __v)\n      |                                   ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/optional:936:55: note: candidate template ignored: could not match 'optional' against 'basic_string_view'\n  936 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 optional(const optional<_Up>& __v)\n      |                                                       ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/optional:954:55: note: candidate template ignored: could not match 'optional' against 'basic_string_view'\n  954 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 optional(optional<_Up>&& __v)\n      |                                                       ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/optional:908:44: note: explicit constructor is not a candidate\n  908 |   _LIBCPP_HIDE_FROM_ABI constexpr explicit optional(_InPlaceT, _Args&&... __args)\n      |                                            ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/optional:927:44: note: explicit constructor is not a candidate\n  927 |   _LIBCPP_HIDE_FROM_ABI constexpr explicit optional(_Up&& __v)\n      |                                            ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/optional:944:64: note: explicit constructor is not a candidate\n  944 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 explicit optional(const optional<_Up>& __v)\n      |                                                                ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/optional:962:64: note: explicit constructor is not a candidate\n  962 |   _LIBCPP_HIDE_FROM_ABI _LIBCPP_CONSTEXPR_SINCE_CXX20 explicit optional(optional<_Up>&& __v)\n      |                                                                ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/parse_uint/candidate.cpp:14:7: error: use of undeclared identifier 't'\n   14 |   if (t == '0' || t == '9') {\n      |       ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/parse_uint/candidate.cpp:14:19: error: use of undeclared identifier 't'\n   14 |   if (t == '0' || t == '9') {\n      |                   ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/parse_uint/candidate.cpp:15:10: error: no matching function for call to 'parse_uint'\n   15 |     if (!parse_uint(text, text.data(), text)) {\n      |          ^~~~~~~~~~\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/parse_uint/candidate.cpp:10:30: note: candidate function not viable: requires single argument 'text', but 3 arguments were provided\n   10 | std::optional<std::uint32_t> parse_uint(std::string_view text) {\n      |                              ^          ~~~~~~~~~~~~~~~~~~~~~\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/parse_uint/candidate.cpp:16:52: error: invalid operands to binary expression ('const char[18]' and 'std::string_view' (aka 'basic_string_view<char>'))\n   16 |       throw std::runtime_error(\"Unable to parse '\" + text +\n      |                                ~~~~~~~~~~~~~~~~~~~ ^ ~~~~\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__iterator/wrap_iter.h:230:1: note: candidate template ignored: could not match '__wrap_iter' against 'basic_string_view'\n  230 | operator+(typename __wrap_iter<_Iter1>::difference_type __n, __wrap_iter<_Iter1> __x) _NOEXCEPT {\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__iterator/move_iterator.h:317:1: note: candidate template ignored: could not match 'move_iterator' against 'basic_string_view'\n  317 | operator+(iter_difference_t<_Iter> __n, const move_iterator<_Iter>& __x)\n      | ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__iterator/reverse_iterator.h:298:1: note: candidate template ignored: could not match 'reverse_iterator' against 'basic_string_view'\n  298 | operator+(typename reverse_iterator<_Iter>::difference_type __n, const reverse_iterator<_Iter>& __x) {\n      | ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/parse_uint/candidate.cpp:20:16: error: function definition is not allowed here\n   20 |     int main() {\n      |                ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/parse_uint/candidate.cpp:31:6: error: expected '}'\n   31 |     }\n      |      ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/parse_uint/candidate.cpp:14:29: note: to match this '{'\n   14 |   if (t == '0' || t == '9') {\n      |                             ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/parse_uint/candidate.cpp:31:6: error: expected '}'\n   31 |     }\n      |      ^\n/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/parse_uint/candidate.cpp:10:64: note: to match this '{'\n   10 | std::optional<std::uint32_t> parse_uint(std::string_view text) {\n      |                                                                ^\n8 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/parse_uint/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/parse_uint/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_57n7b5l1/parse_uint/candidate.cpp",
+      "task_id": "parse_uint"
+    }
+  ],
+  "summary": {
+    "c_compiler": "clang",
+    "clang_format": "clang-format",
+    "clang_format_ok": 4,
+    "compiled": 0,
+    "cpp_compiler": "clang++",
+    "pass_rate": 0.0,
+    "passed": 0,
+    "ran": 0,
+    "total": 4
+  }
+}

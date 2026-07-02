@@ -1,0 +1,4 @@
+{"task_id": "clamp_int", "completion": "11111111111111111111111111111111", "prompt_tokens": 97, "generated_tokens": 32}
+{"task_id": "is_prime", "completion": "1hshshshshshshshshshshshshshshshshshshshshshshshshshshshshshshs", "prompt_tokens": 51, "generated_tokens": 32}
+{"task_id": "join_non_empty", "completion": "1[1RT1[1RT1[1RT1(RT1RTRTRTRTRTRTRTRTRTRTRTRTRTRTRTRT", "prompt_tokens": 99, "generated_tokens": 32}
+{"task_id": "parse_uint", "completion": "1[1RT1[1RT1(RT1(RT1(RTRTRTRTRTRTRTRTRTRTRTRTRTRTRTRT", "prompt_tokens": 99, "generated_tokens": 32}

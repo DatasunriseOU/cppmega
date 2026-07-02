@@ -1,0 +1,12 @@
+{
+  "cases": 4,
+  "checkpoint": "/Volumes/external/sources/cppmega/outputs/checkpoints/mlx_converted/stage_05_seq1024_grouped_qkv/model.safetensors",
+  "completions": 4,
+  "max_new_tokens": 128,
+  "prompt_mode": "docstring",
+  "prompt_sidecars": "clang",
+  "seq_len": 1024,
+  "temperature": 0.0,
+  "top_k": null,
+  "top_p": 1.0
+}

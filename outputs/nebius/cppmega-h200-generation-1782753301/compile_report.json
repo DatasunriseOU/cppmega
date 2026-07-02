@@ -1,0 +1,153 @@
+{
+  "results": [
+    {
+      "compile": {
+        "elapsed_s": 0.5770400420296937,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:8:14: error: expected ';' at end of declaration\n    8 | int hide_lo_t hile looking into the lookup target value into the lookup_target_value value (lookup_target_value);}<BOS>//<RESERVED_46>language:<RESERVED_46>primary=c++<RESERVED_46>standard=c++17<RESERVED_46>confidence=high<RESERVED_47>//<RESERVED_46><BOS><RESERVED_47>//<RESERVED_46>platform:<RESERVED_46>x86_64-linux-gnu<RESERVED_47>//<RESERVED_46>co\n      |              ^\n      |              ;\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:8:115: error: expected unqualified-id\n    8 | int hide_lo_t hile looking into the lookup target value into the lookup_target_value value (lookup_target_value);}<BOS>//<RESERVED_46>language:<RESERVED_46>primary=c++<RESERVED_46>standard=c++17<RESERVED_46>confidence=high<RESERVED_47>//<RESERVED_46><BOS><RESERVED_47>//<RESERVED_46>platform:<RESERVED_46>x86_64-linux-gnu<RESERVED_47>//<RESERVED_46>co\n      |                                                                                                                   ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp:9:1: error: extraneous closing brace ('}')\n    9 | }\n      | ^\n3 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp",
+        "-o",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/clamp_int/candidate.cpp",
+      "task_id": "clamp_int"
+    },
+    {
+      "compile": {
+        "elapsed_s": 0.04198666708543897,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp:7:60: error: expected ';' at end of declaration\n    7 | int num_digits(int);int num_digits(int);int num_digits(int)int_digits(int)int_num_digits(int_num_digits(int_num_digits(int)num_digits(int_num_digits(int_num_digits(int_num_digits(int)num_digits(int_num_digits(int_num_digits(int_num_digits(int_\n      |                                                            ^\n      |                                                            ;\n1 error generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp",
+        "-o",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/is_prime/candidate.cpp",
+      "task_id": "is_prime"
+    },
+    {
+      "compile": {
+        "elapsed_s": 0.3071251669898629,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:10:22: error: use of undeclared identifier 'prefix_prefix_'\n   10 | std::string prefix = prefix_prefix_;std::string prefix = prefix_;std::string prefix = prefix_prefix_prefix_;};<RESERVED_47><RESERVED_46>for<RESERVED_46>(auto<RESERVED_46>it<RESERVED_46>=<RESERVED_46>prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_pre\n      |                      ^~~~~~~~~~~~~~\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:10:49: error: redefinition of 'prefix'\n   10 | std::string prefix = prefix_prefix_;std::string prefix = prefix_;std::string prefix = prefix_prefix_prefix_;};<RESERVED_47><RESERVED_46>for<RESERVED_46>(auto<RESERVED_46>it<RESERVED_46>=<RESERVED_46>prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_pre\n      |                                                 ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:10:13: note: previous definition is here\n   10 | std::string prefix = prefix_prefix_;std::string prefix = prefix_;std::string prefix = prefix_prefix_prefix_;};<RESERVED_47><RESERVED_46>for<RESERVED_46>(auto<RESERVED_46>it<RESERVED_46>=<RESERVED_46>prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_pre\n      |             ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:10:58: error: use of undeclared identifier 'prefix_'; did you mean 'prefix'?\n   10 | std::string prefix = prefix_prefix_;std::string prefix = prefix_;std::string prefix = prefix_prefix_prefix_;};<RESERVED_47><RESERVED_46>for<RESERVED_46>(auto<RESERVED_46>it<RESERVED_46>=<RESERVED_46>prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_pre\n      |                                                          ^~~~~~~\n      |                                                          prefix\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:10:13: note: 'prefix' declared here\n   10 | std::string prefix = prefix_prefix_;std::string prefix = prefix_;std::string prefix = prefix_prefix_prefix_;};<RESERVED_47><RESERVED_46>for<RESERVED_46>(auto<RESERVED_46>it<RESERVED_46>=<RESERVED_46>prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_pre\n      |             ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:10:78: error: redefinition of 'prefix'\n   10 | std::string prefix = prefix_prefix_;std::string prefix = prefix_;std::string prefix = prefix_prefix_prefix_;};<RESERVED_47><RESERVED_46>for<RESERVED_46>(auto<RESERVED_46>it<RESERVED_46>=<RESERVED_46>prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_pre\n      |                                                                              ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:10:13: note: previous definition is here\n   10 | std::string prefix = prefix_prefix_;std::string prefix = prefix_;std::string prefix = prefix_prefix_prefix_;};<RESERVED_47><RESERVED_46>for<RESERVED_46>(auto<RESERVED_46>it<RESERVED_46>=<RESERVED_46>prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_pre\n      |             ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:10:87: error: use of undeclared identifier 'prefix_prefix_prefix_'\n   10 | std::string prefix = prefix_prefix_;std::string prefix = prefix_;std::string prefix = prefix_prefix_prefix_;};<RESERVED_47><RESERVED_46>for<RESERVED_46>(auto<RESERVED_46>it<RESERVED_46>=<RESERVED_46>prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_pre\n      |                                                                                       ^~~~~~~~~~~~~~~~~~~~~\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp:10:111: error: expected unqualified-id\n   10 | std::string prefix = prefix_prefix_;std::string prefix = prefix_;std::string prefix = prefix_prefix_prefix_;};<RESERVED_47><RESERVED_46>for<RESERVED_46>(auto<RESERVED_46>it<RESERVED_46>=<RESERVED_46>prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_prefix_pre\n      |                                                                                                               ^\n6 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp",
+        "-o",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/join_non_empty/candidate.cpp",
+      "task_id": "join_non_empty"
+    },
+    {
+      "compile": {
+        "elapsed_s": 0.19093945808708668,
+        "ok": false,
+        "returncode": 1,
+        "stderr": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:11:22: error: implicit instantiation of undefined template 'std::basic_string<char>'\n   11 | std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text<RESERVED_46>+<RESERVED_46>\" (\"<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>\") + uint64 + uint64 + uint64 + uint64 + uint64\n      |                      ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__fwd/string.h:43:7: note: template is declared here\n   43 | class basic_string;\n      |       ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:11:13: error: implicit instantiation of undefined template 'std::basic_string<char>'\n   11 | std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text<RESERVED_46>+<RESERVED_46>\" (\"<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>\") + uint64 + uint64 + uint64 + uint64 + uint64\n      |             ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__fwd/string.h:43:7: note: template is declared here\n   43 | class basic_string;\n      |       ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:11:52: error: redefinition of 'uint64'\n   11 | std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text<RESERVED_46>+<RESERVED_46>\" (\"<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>\") + uint64 + uint64 + uint64 + uint64 + uint64\n      |                                                    ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:11:13: note: previous definition is here\n   11 | std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text<RESERVED_46>+<RESERVED_46>\" (\"<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>\") + uint64 + uint64 + uint64 + uint64 + uint64\n      |             ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:11:61: error: implicit instantiation of undefined template 'std::basic_string<char>'\n   11 | std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text<RESERVED_46>+<RESERVED_46>\" (\"<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>\") + uint64 + uint64 + uint64 + uint64 + uint64\n      |                                                             ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__fwd/string.h:43:7: note: template is declared here\n   43 | class basic_string;\n      |       ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:11:91: error: redefinition of 'uint64'\n   11 | std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text<RESERVED_46>+<RESERVED_46>\" (\"<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>\") + uint64 + uint64 + uint64 + uint64 + uint64\n      |                                                                                           ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:11:13: note: previous definition is here\n   11 | std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text<RESERVED_46>+<RESERVED_46>\" (\"<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>\") + uint64 + uint64 + uint64 + uint64 + uint64\n      |             ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:11:100: error: implicit instantiation of undefined template 'std::basic_string<char>'\n   11 | std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text<RESERVED_46>+<RESERVED_46>\" (\"<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>\") + uint64 + uint64 + uint64 + uint64 + uint64\n      |                                                                                                    ^\n/opt/homebrew/Cellar/llvm/22.1.2/bin/../include/c++/v1/__fwd/string.h:43:7: note: template is declared here\n   43 | class basic_string;\n      |       ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:11:130: error: redefinition of 'uint64'\n   11 | std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text<RESERVED_46>+<RESERVED_46>\" (\"<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>\") + uint64 + uint64 + uint64 + uint64 + uint64\n      |                                                                                                                                  ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:11:13: note: previous definition is here\n   11 | std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text<RESERVED_46>+<RESERVED_46>\" (\"<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>\") + uint64 + uint64 + uint64 + uint64 + uint64\n      |             ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:11:156: error: use of undeclared identifier 'RESERVED_46'\n   11 | std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text<RESERVED_46>+<RESERVED_46>\" (\"<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>\") + uint64 + uint64 + uint64 + uint64 + uint64\n      |                                                                                                                                                            ^~~~~~~~~~~\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:11:169: error: expected expression\n   11 | std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text<RESERVED_46>+<RESERVED_46>\" (\"<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>\") + uint64 + uint64 + uint64 + uint64 + uint64\n      |                                                                                                                                                                         ^\n/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp:11:170: error: use of undeclared identifier 'RESERVED_46'\n   11 | std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text);std::string uint64 = std::string(text<RESERVED_46>+<RESERVED_46>\" (\"<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>uint64<RESERVED_46>+<RESERVED_46>\") + uint64 + uint64 + uint64 + uint64 + uint64\n      |                                                                                                                      \n...<truncated>...\nal error: too many errors emitted, stopping now [-ferror-limit=]\n1 warning and 20 errors generated.\n",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp",
+        "-o",
+        "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate"
+      ],
+      "compile_ok": false,
+      "missing_completion": false,
+      "passed": false,
+      "run": null,
+      "run_ok": false,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/Volumes/external/sources/cppmega/outputs/evals/cpp_generation_compile_work/parse_uint/candidate.cpp",
+      "task_id": "parse_uint"
+    }
+  ],
+  "summary": {
+    "c_compiler": "clang",
+    "compiled": 0,
+    "cpp_compiler": "clang++",
+    "pass_rate": 0.0,
+    "passed": 0,
+    "ran": 0,
+    "total": 4
+  }
+}

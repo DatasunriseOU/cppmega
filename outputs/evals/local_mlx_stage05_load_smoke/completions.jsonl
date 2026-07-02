@@ -1,0 +1,4 @@
+{"task_id": "clamp_int", "completion": "", "prompt_tokens": 96, "generated_tokens": 0}
+{"task_id": "is_prime", "completion": "", "prompt_tokens": 50, "generated_tokens": 0}
+{"task_id": "join_non_empty", "completion": "", "prompt_tokens": 98, "generated_tokens": 0}
+{"task_id": "parse_uint", "completion": "", "prompt_tokens": 98, "generated_tokens": 0}

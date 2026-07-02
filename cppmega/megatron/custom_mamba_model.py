@@ -153,7 +153,6 @@ class CppMegaMambaModel(MambaModel):
                     loss_mask=loss_mask,
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
-                    is_spec_decode=is_spec_decode,
                 )
             finally:
                 hook.remove()
@@ -183,5 +182,4 @@ class CppMegaMambaModel(MambaModel):
             loss_mask=loss_mask,
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
-            is_spec_decode=is_spec_decode,
         )

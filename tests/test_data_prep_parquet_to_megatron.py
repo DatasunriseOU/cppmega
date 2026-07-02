@@ -73,6 +73,14 @@ def test_default_cppmega_side_channels_are_full_token_aligned_profile() -> None:
     dtypes = dict(converter.DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS)
 
     assert names == [
+        "loss_mask",
+        "doc_ids",
+        "token_domain_ids",
+        "token_role_ids",
+        "token_entity_ids",
+        "token_scope_ids",
+        "token_source_doc_ids",
+        "token_confidence_ids",
         "token_structure_ids",
         "token_dep_levels",
         "token_ast_depth",
@@ -86,6 +94,12 @@ def test_default_cppmega_side_channels_are_full_token_aligned_profile() -> None:
         "token_change_mask_post",
         "token_platform_ids",
     ]
+    assert dtypes["loss_mask"] == "uint8"
+    assert dtypes["doc_ids"] == "uint32"
+    assert dtypes["token_domain_ids"] == "uint16"
+    assert dtypes["token_role_ids"] == "uint16"
+    assert dtypes["token_entity_ids"] == "uint32"
+    assert dtypes["token_confidence_ids"] == "uint8"
     assert dtypes["token_symbol_ids"] == "uint32"
     assert dtypes["token_def_use"] == "uint8"
 
@@ -96,6 +110,11 @@ def test_default_cppmega_graph_sidecars_are_document_aligned_route_profile() -> 
     assert converter.DEFAULT_CPPMEGA_GRAPH_SIDECARS == (
         ("token_call_edges", "edge_pairs", "int32"),
         ("token_type_edges", "edge_pairs", "int32"),
+        ("token_domain_edges", "edge_triples", "int32"),
+        ("token_build_edges", "edge_triples", "int32"),
+        ("token_shell_edges", "edge_triples", "int32"),
+        ("token_diagnostic_edges", "edge_triples", "int32"),
+        ("token_cross_domain_edges", "edge_triples", "int32"),
         ("token_chunk_starts", "ragged_1d", "uint32"),
         ("token_chunk_ends", "ragged_1d", "uint32"),
         ("token_chunk_kinds", "ragged_1d", "uint16"),
@@ -117,6 +136,23 @@ def test_normalize_edge_pairs_accepts_parquet_struct_dicts() -> None:
     np.testing.assert_array_equal(pairs, np.array([[3, 1], [2, 0]], dtype=np.int32))
 
 
+def test_normalize_edge_triples_accepts_domain_route_dicts() -> None:
+    converter = _load_converter_module()
+
+    triples = converter._normalize_edge_triples(
+        [{"from": 3, "to": 1, "kind": 20}, {"src": 2, "dst": 0, "kind": 60}],
+        column="token_domain_edges",
+        shard_path="shard.parquet",
+        row_idx=9,
+    )
+
+    assert triples.dtype == np.dtype(np.int32)
+    np.testing.assert_array_equal(
+        triples,
+        np.array([[3, 1, 20], [2, 0, 60]], dtype=np.int32),
+    )
+
+
 def test_graph_sidecar_writer_writes_offsets_data_and_manifest(tmp_path: Path) -> None:
     converter = _load_converter_module()
     prefix = tmp_path / "cppmega_train"
@@ -124,6 +160,7 @@ def test_graph_sidecar_writer_writes_offsets_data_and_manifest(tmp_path: Path) -
         str(prefix),
         (
             ("token_call_edges", "edge_pairs", "int32"),
+            ("token_domain_edges", "edge_triples", "int32"),
             ("token_chunk_starts", "ragged_1d", "uint32"),
         ),
     )
@@ -131,13 +168,14 @@ def test_graph_sidecar_writer_writes_offsets_data_and_manifest(tmp_path: Path) -
     writer.append(
         {
             "token_call_edges": [{"from": 1, "to": 0}, {"from": 2, "to": 1}],
+            "token_domain_edges": [{"from": 0, "to": 3, "kind": 20}],
             "token_chunk_starts": [0, 8, 16],
         },
         shard_path="shard.parquet",
         row_idx=0,
     )
     writer.append(
-        {"token_call_edges": [], "token_chunk_starts": [0]},
+        {"token_call_edges": [], "token_domain_edges": [], "token_chunk_starts": [0]},
         shard_path="shard.parquet",
         row_idx=1,
     )
@@ -159,6 +197,15 @@ def test_graph_sidecar_writer_writes_offsets_data_and_manifest(tmp_path: Path) -
     np.testing.assert_array_equal(
         np.fromfile(tmp_path / "cppmega_train_token_call_edges_data.bin", dtype=np.int32).reshape(-1, 2),
         np.array([[1, 0], [2, 1]], dtype=np.int32),
+    )
+    assert manifest["token_domain_edges"]["shape_tail"] == [3]
+    np.testing.assert_array_equal(
+        np.fromfile(tmp_path / "cppmega_train_token_domain_edges_offsets.bin", dtype=np.int64),
+        np.array([0, 1, 1], dtype=np.int64),
+    )
+    np.testing.assert_array_equal(
+        np.fromfile(tmp_path / "cppmega_train_token_domain_edges_data.bin", dtype=np.int32).reshape(-1, 3),
+        np.array([[0, 3, 20]], dtype=np.int32),
     )
     np.testing.assert_array_equal(
         np.fromfile(tmp_path / "cppmega_train_token_chunk_starts_offsets.bin", dtype=np.int64),

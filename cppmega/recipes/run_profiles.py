@@ -640,7 +640,20 @@ def set_h200_cpp_world_mini_profile(profile: RunProfile | None = None) -> RunPro
     )
     profile.precision = PrecisionProfile(
         fp8_recipe="off",
-        attention_backend="flash",
+        attention_backend="auto",
+    )
+    # The single-H200 smoke/capacity lane must run on the current GHCR Megatron
+    # image without relying on cppmega's extended Muon CLI flags.  Keep Muon in
+    # the GB10/NAM lanes; use parser-native Adam here so the sweep measures the
+    # model/data/sidecar path instead of failing at argparse.
+    profile.optimizer = OptimizerProfile(
+        optimizer="adam",
+        muon_scalar_optimizer="adam",
+        muon_quantized_momentum=False,
+        use_bf16_no_master_emerging_optimizer=False,
+        use_bf16_no_master_emerging_fallback_optimizer=False,
+        grad_reduce_in_bf16=False,
+        local_ddp_disable_contiguous_grad_buffer=False,
     )
     profile.runtime = RuntimePatchProfile(
         mamba3_mimo=False,

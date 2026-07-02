@@ -103,6 +103,34 @@ def test_graph_route_bias_from_structure_batch_scatter_edges():
     assert bias.sum().item() == 7.0
 
 
+def test_graph_route_bias_from_structure_batch_scatter_domain_edge_triples():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    structure_batch = {
+        "graph_domain_edges": torch.tensor(
+            [[[0, 2, 20], [-1, -1, -1]]], dtype=torch.long
+        ),
+        "graph_domain_edge_counts": torch.tensor([1], dtype=torch.long),
+        "graph_diagnostic_edges": torch.tensor(
+            [[[1, 3, 60], [-1, -1, -1]]], dtype=torch.long
+        ),
+        "graph_diagnostic_edge_counts": torch.tensor([1], dtype=torch.long),
+    }
+
+    bias = build_graph_route_bias_from_structure_batch(
+        structure_batch,
+        batch_size=1,
+        seqlen_q=4,
+        seqlen_k=4,
+        device=device,
+        domain_weight=2.0,
+        diagnostic_weight=5.0,
+    )
+
+    assert bias[0, 0, 2].item() == 2.0
+    assert bias[0, 1, 3].item() == 5.0
+    assert bias.sum().item() == 7.0
+
+
 def test_fused_scores_add_graph_route_bias_before_topk():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     sq = sk = 4

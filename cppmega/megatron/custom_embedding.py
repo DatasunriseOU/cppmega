@@ -23,6 +23,7 @@ except ModuleNotFoundError:  # local macOS/dev environments without Megatron che
     _mcore_parallel_state = None  # type: ignore[assignment]
 
 from cppmega.features.engram.ngram_hash import CppMegaNgramHashEmbedding
+from cppmega.features.domain.embedding import CppMegaDomainEmbedding
 from cppmega.features.structure.embedding import CppMegaStructureEmbedding
 
 try:
@@ -38,6 +39,7 @@ except ModuleNotFoundError:  # local macOS/dev environments without Megatron che
 # :meth:`CppMegaLanguageModelEmbedding.sharded_state_dict`.
 _CPPMEGA_CUSTOM_PREFIXES: tuple[str, ...] = (
     "cppmega_ngram_hash.",
+    "cppmega_domain.",
     "cppmega_structure.",
 )
 
@@ -72,6 +74,20 @@ class CppMegaLanguageModelEmbedding(LanguageModelEmbedding):
                 bottleneck_dim=int(os.environ.get("CPPMEGA_STRUCTURE_BOTTLENECK_DIM", "64")),
             )
 
+        self.cppmega_domain = None
+        domain_enabled = os.environ.get(
+            "CPPMEGA_DOMAIN_EMBEDDING_ENABLED",
+            "1" if os.environ.get("CPPMEGA_STRUCTURE_ENABLED", "0") == "1" else "0",
+        ) == "1"
+        if domain_enabled:
+            self.cppmega_domain = CppMegaDomainEmbedding(
+                hidden_size=self.config.hidden_size,
+                num_domains=int(os.environ.get("CPPMEGA_NUM_DOMAINS", "64")),
+                num_roles=int(os.environ.get("CPPMEGA_NUM_DOMAIN_ROLES", "128")),
+                num_confidences=int(os.environ.get("CPPMEGA_NUM_PARSE_CONFIDENCES", "8")),
+                bottleneck_dim=int(os.environ.get("CPPMEGA_DOMAIN_BOTTLENECK_DIM", "32")),
+            )
+
         # Diagnostic (RULE #1 visibility): report whether the cppmega feature
         # embeddings were actually constructed and how many params they add, so a
         # silently-absent feature cannot masquerade as "wired".
@@ -83,12 +99,18 @@ class CppMegaLanguageModelEmbedding(LanguageModelEmbedding):
             sum(p.numel() for p in self.cppmega_structure.parameters())
             if self.cppmega_structure is not None else 0
         )
+        _dm = (
+            sum(p.numel() for p in self.cppmega_domain.parameters())
+            if self.cppmega_domain is not None else 0
+        )
         print(
             f"[cppmega-embed] CppMegaLanguageModelEmbedding built: "
             f"ngram={'ON' if self.cppmega_ngram_hash is not None else 'OFF'}({_ng} params) "
+            f"domain={'ON' if self.cppmega_domain is not None else 'OFF'}({_dm} params) "
             f"structure={'ON' if self.cppmega_structure is not None else 'OFF'}({_st} params) "
             f"env NGRAM={os.environ.get('CPPMEGA_NGRAM_HASH_ENABLED')} "
-            f"STRUCT={os.environ.get('CPPMEGA_STRUCTURE_ENABLED')}",
+            f"STRUCT={os.environ.get('CPPMEGA_STRUCTURE_ENABLED')} "
+            f"DOMAIN={os.environ.get('CPPMEGA_DOMAIN_EMBEDDING_ENABLED')}",
             flush=True,
         )
 
@@ -118,6 +140,30 @@ class CppMegaLanguageModelEmbedding(LanguageModelEmbedding):
             normalized[name] = tensor.to(device=input_ids.device, dtype=torch.long)
         return normalized
 
+    @staticmethod
+    def _normalize_domain_inputs(
+        input_ids: Tensor,
+        structure_inputs: dict[str, Tensor] | None,
+    ) -> dict[str, Tensor | None]:
+        names = (
+            "domain_ids",
+            "role_ids",
+            "confidence_ids",
+        )
+        normalized: dict[str, Tensor | None] = {name: None for name in names}
+        if structure_inputs is None:
+            return normalized
+        for name in names:
+            tensor = structure_inputs.get(name)
+            if tensor is None:
+                continue
+            if tensor.shape != input_ids.shape:
+                raise ValueError(
+                    f"domain input {name} shape {tuple(tensor.shape)} does not match input_ids {tuple(input_ids.shape)}"
+                )
+            normalized[name] = tensor.to(device=input_ids.device, dtype=torch.long)
+        return normalized
+
     def forward(
         self,
         input_ids: Tensor,
@@ -135,6 +181,17 @@ class CppMegaLanguageModelEmbedding(LanguageModelEmbedding):
         if self.cppmega_ngram_hash is not None:
             ngram_embeddings = self.cppmega_ngram_hash(input_ids)
             embeddings = embeddings + ngram_embeddings
+
+        if self.cppmega_domain is not None:
+            normalized_domain = self._normalize_domain_inputs(input_ids, structure_inputs)
+            domain_embeddings = self.cppmega_domain(
+                domain_ids=normalized_domain["domain_ids"],
+                role_ids=normalized_domain["role_ids"],
+                confidence_ids=normalized_domain["confidence_ids"],
+                target_dtype=embeddings.dtype,
+            )
+            if isinstance(domain_embeddings, torch.Tensor) and domain_embeddings.ndim == embeddings.ndim:
+                embeddings = embeddings + domain_embeddings
 
         if self.cppmega_structure is not None:
             normalized_structure = self._normalize_structure_inputs(input_ids, structure_inputs)

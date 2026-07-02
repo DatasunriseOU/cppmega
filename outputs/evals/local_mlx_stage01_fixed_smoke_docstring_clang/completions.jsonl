@@ -1,0 +1,4 @@
+{"task_id": "clamp_int", "completion": "int lo =\n", "prompt_tokens": 96, "generated_tokens": 8, "prompt_sidecars": {"structure": "clang_ast", "syntax": "clang_ast", "adapter": "cpp:clang-ast-v1"}}
+{"task_id": "is_prime", "completion": "if (n <=\n", "prompt_tokens": 50, "generated_tokens": 8, "prompt_sidecars": {"structure": "clang_ast", "syntax": "clang_ast", "adapter": "cpp:clang-ast-v1"}}
+{"task_id": "join_non_empty", "completion": "auto sep = parts\n", "prompt_tokens": 98, "generated_tokens": 8, "prompt_sidecars": {"structure": "clang_ast", "syntax": "clang_ast", "adapter": "cpp:clang-ast-v1"}}
+{"task_id": "parse_uint", "completion": "if (text.\n", "prompt_tokens": 98, "generated_tokens": 8, "prompt_sidecars": {"structure": "clang_ast", "syntax": "clang_ast", "adapter": "cpp:clang-ast-v1"}}

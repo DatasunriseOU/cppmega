@@ -19,6 +19,10 @@ def test_extract_structure_inputs_filters_only_known_keys():
         "change_mask_pre": 6,
         "graph_call_edges": 7,
         "graph_call_edge_counts": 8,
+        "domain_ids": 9,
+        "role_ids": 10,
+        "graph_build_edges": 11,
+        "graph_build_edge_counts": 12,
         "junk": 4,
     }
 
@@ -32,6 +36,10 @@ def test_extract_structure_inputs_filters_only_known_keys():
         "change_mask_pre": 6,
         "graph_call_edges": 7,
         "graph_call_edge_counts": 8,
+        "domain_ids": 9,
+        "role_ids": 10,
+        "graph_build_edges": 11,
+        "graph_build_edge_counts": 12,
     }
 
 

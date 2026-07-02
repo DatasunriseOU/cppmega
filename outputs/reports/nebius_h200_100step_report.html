@@ -1,0 +1,674 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>cppmega H200 100-step report</title>
+  <style>
+    :root {
+      --bg: #f4f6f6;
+      --ink: #121514;
+      --muted: #68706d;
+      --line: #d8ddda;
+      --panel: #ffffff;
+      --ok: #2c7a47;
+      --warn: #b45f06;
+      --oom: #b42318;
+      --skip: #6d7370;
+      --accent: #176b87;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .page { max-width: 1480px; margin: 0 auto; padding: 36px 28px 56px; }
+    header {
+      display: grid;
+      grid-template-columns: 1.6fr 1fr;
+      gap: 24px;
+      align-items: end;
+      padding-bottom: 24px;
+      border-bottom: 1px solid var(--line);
+    }
+    h1 { margin: 0; font-size: 44px; line-height: 1.02; letter-spacing: 0; }
+    h2 { margin: 0 0 16px; font-size: 18px; letter-spacing: 0; }
+    h3 { margin: 18px 0 8px; font-size: 14px; color: var(--muted); }
+    .lede { margin: 12px 0 0; max-width: 82ch; color: var(--muted); font-size: 16px; }
+    .stamp { text-align: right; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 22px 0; }
+    .metric { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+    .metric span { display: block; color: var(--muted); font-size: 12px; }
+    .metric strong { display: block; margin-top: 5px; font-size: 22px; line-height: 1.1; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 18px; overflow: hidden; }
+    .wide { grid-column: 1 / -1; }
+    .panel-title-row { display: flex; justify-content: space-between; gap: 18px; align-items: center; }
+    .legend { display: flex; gap: 16px; color: var(--muted); font-size: 12px; }
+    .legend i { display: inline-block; width: 12px; height: 12px; margin-right: 6px; border-radius: 3px; vertical-align: -2px; }
+    .legend .bf16 { background: #176b87; }
+    .legend .fp8 { background: #b45f06; }
+    .legend .fixed { background: #2c7a47; }
+    .bar-chart { display: grid; gap: 9px; }
+    .bar-row { display: grid; grid-template-columns: 168px 1fr 110px; gap: 12px; align-items: center; }
+    .bar-label { color: var(--muted); white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .bar-track { height: 18px; background: #eef1ef; border: 1px solid var(--line); border-radius: 5px; overflow: hidden; }
+    .bar-fill { height: 100%; background: var(--accent); }
+    .bar-fill.ok { background: var(--ok); }
+    .bar-fill.warn { background: var(--warn); }
+    .bar-fill.oom { background: var(--oom); }
+    .bar-fill.fail { background: var(--oom); }
+    .bar-value { text-align: right; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    svg { width: 100%; height: auto; display: block; }
+    .axis { stroke: var(--line); stroke-width: 1; }
+    .svg-label { fill: var(--muted); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border-bottom: 1px solid var(--line); padding: 9px 10px; text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: 12px; font-weight: 650; }
+    td { font-variant-numeric: tabular-nums; }
+    .runs td:nth-child(2), .runs td:nth-child(3), .runs td:nth-child(8), .runs td:nth-child(10), .runs td:nth-child(11) {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .pill { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 12px; border: 1px solid currentColor; white-space: nowrap; }
+    .pill.ok, td.ok { color: var(--ok); }
+    .pill.warn, td.warn { color: var(--warn); }
+    .pill.oom, .pill.fail, td.oom, td.fail { color: var(--oom); }
+    .pill.skip, td.skip, td.na { color: var(--skip); }
+    .matrix-wrap { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    .matrix td, .matrix th { text-align: center; }
+    .matrix td { border: 1px solid var(--line); border-radius: 4px; font-size: 12px; }
+    .matrix small { display: block; margin-top: 3px; color: var(--muted); }
+    .note {
+      margin-top: 16px;
+      padding: 14px 16px;
+      border-left: 4px solid var(--warn);
+      background: #fff8ee;
+      color: #5e3708;
+      border-radius: 6px;
+    }
+    footer { margin-top: 18px; color: var(--muted); font-size: 12px; }
+    @media (max-width: 960px) {
+      header, .grid, .metrics, .matrix-wrap { grid-template-columns: 1fr; }
+      .stamp { text-align: left; }
+      .bar-row { grid-template-columns: 1fr; gap: 4px; }
+      .bar-value { text-align: left; }
+      .runs { display: block; overflow-x: auto; white-space: nowrap; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header>
+      <div>
+        <h1>cppmega H200 100-step report</h1>
+        <p class="lede">Real Nebius H200 smoke/capacity sweep for the cppmega Megatron world model using verified code+commit graph sidecar data. No synthetic dataset and no token-only path.</p>
+      </div>
+      <div class="stamp">
+        generated 2026-06-29 02:50:09<br>
+        source: outputs/nebius/*
+      </div>
+    </header>
+
+    <section class="metrics"><div class="metric"><span>BF16 max passing</span><strong>2048 / BS 64</strong></div><div class="metric"><span>Fixed FP8+recompute max passing</span><strong>1024 / BS 192</strong></div><div class="metric"><span>Graph sidecar evidence</span><strong>16/22 log rows</strong></div><div class="metric"><span>FP8 evidence</span><strong>10 logs with TE FP8</strong></div></section>
+
+    <div class="grid">
+
+    <section class="panel">
+      <h2>Peak H200 memory</h2>
+      <div class="bar-chart">
+            <div class="bar-row">
+              <div class="bar-label">BF16 1024/64</div>
+              <div class="bar-track"><div class="bar-fill ok" style="width:32.84%"></div></div>
+              <div class="bar-value">46.1 GiB</div>
+            </div>
+
+            <div class="bar-row">
+              <div class="bar-label">BF16 1024/128</div>
+              <div class="bar-track"><div class="bar-fill ok" style="width:56.26%"></div></div>
+              <div class="bar-value">79.0 GiB</div>
+            </div>
+
+            <div class="bar-row">
+              <div class="bar-label">BF16 1024/256</div>
+              <div class="bar-track"><div class="bar-fill oom" style="width:99.57%"></div></div>
+              <div class="bar-value">139.8 GiB</div>
+            </div>
+
+            <div class="bar-row">
+              <div class="bar-label">BF16 2048/64</div>
+              <div class="bar-track"><div class="bar-fill ok" style="width:56.34%"></div></div>
+              <div class="bar-value">79.1 GiB</div>
+            </div>
+
+            <div class="bar-row">
+              <div class="bar-label">BF16 2048/128</div>
+              <div class="bar-track"><div class="bar-fill oom" style="width:99.57%"></div></div>
+              <div class="bar-value">139.8 GiB</div>
+            </div>
+
+            <div class="bar-row">
+              <div class="bar-label">BF16 4096/64</div>
+              <div class="bar-track"><div class="bar-fill oom" style="width:99.57%"></div></div>
+              <div class="bar-value">139.8 GiB</div>
+            </div>
+
+            <div class="bar-row">
+              <div class="bar-label">FP8 tensorwise 1024/64</div>
+              <div class="bar-track"><div class="bar-fill warn" style="width:51.78%"></div></div>
+              <div class="bar-value">72.7 GiB</div>
+            </div>
+
+            <div class="bar-row">
+              <div class="bar-label">FP8 tensorwise 1024/128</div>
+              <div class="bar-track"><div class="bar-fill warn" style="width:93.61%"></div></div>
+              <div class="bar-value">131.4 GiB</div>
+            </div>
+
+            <div class="bar-row">
+              <div class="bar-label">FP8 tensorwise 1024/256</div>
+              <div class="bar-track"><div class="bar-fill oom" style="width:97.37%"></div></div>
+              <div class="bar-value">136.7 GiB</div>
+            </div>
+
+            <div class="bar-row">
+              <div class="bar-label">FP8 tensorwise 2048/64</div>
+              <div class="bar-track"><div class="bar-fill ok" style="width:93.71%"></div></div>
+              <div class="bar-value">131.6 GiB</div>
+            </div>
+
+            <div class="bar-row">
+              <div class="bar-label">FP8 tensorwise 2048/128</div>
+              <div class="bar-track"><div class="bar-fill oom" style="width:97.57%"></div></div>
+              <div class="bar-value">137.0 GiB</div>
+            </div>
+
+            <div class="bar-row">
+              <div class="bar-label">FP8 tensorwise 4096/64</div>
+              <div class="bar-track"><div class="bar-fill oom" style="width:97.88%"></div></div>
+              <div class="bar-value">137.4 GiB</div>
+            </div>
+
+            <div class="bar-row">
+              <div class="bar-label">FP8 tensorwise + MLP recompute 1024/64</div>
+              <div class="bar-track"><div class="bar-fill fail" style="width:6.53%"></div></div>
+              <div class="bar-value">9.2 GiB</div>
+            </div>
+
+            <div class="bar-row">
+              <div class="bar-label">FP8 tensorwise + MLP recompute + NVRTC-off 1024/64</div>
+              <div class="bar-track"><div class="bar-fill ok" style="width:32.48%"></div></div>
+              <div class="bar-value">45.6 GiB</div>
+            </div>
+
+            <div class="bar-row">
+              <div class="bar-label">FP8 tensorwise + MLP recompute + NVRTC-off 1024/128</div>
+              <div class="bar-track"><div class="bar-fill ok" style="width:54.41%"></div></div>
+              <div class="bar-value">76.4 GiB</div>
+            </div>
+
+            <div class="bar-row">
+              <div class="bar-label">FP8 tensorwise + MLP recompute + NVRTC-off 1024/192</div>
+              <div class="bar-track"><div class="bar-fill ok" style="width:77.14%"></div></div>
+              <div class="bar-value">108.3 GiB</div>
+            </div>
+            </div>
+    </section>
+
+
+    <section class="panel">
+      <h2>Throughput at step 100</h2>
+      <div class="bar-chart">
+            <div class="bar-row">
+              <div class="bar-label">BF16 1024/64</div>
+              <div class="bar-track"><div class="bar-fill ok" style="width:83.81%"></div></div>
+              <div class="bar-value">107383.3 tok/s</div>
+            </div>
+
+            <div class="bar-row">
+              <div class="bar-label">BF16 1024/128</div>
+              <div class="bar-track"><div class="bar-fill ok" style="width:84.43%"></div></div>
+              <div class="bar-value">108180.9 tok/s</div>
+            </div>
+
+            <div class="bar-row">
+              <div class="bar-label">BF16 2048/64</div>
+              <div class="bar-track"><div class="bar-fill ok" style="width:78.33%"></div></div>
+              <div class="bar-value">100361.4 tok/s</div>
+            </div>
+
+            <div class="bar-row">
+              <div class="bar-label">FP8 tensorwise 2048/64</div>
+              <div class="bar-track"><div class="bar-fill ok" style="width:100.00%"></div></div>
+              <div class="bar-value">128125.1 tok/s</div>
+            </div>
+
+            <div class="bar-row">
+              <div class="bar-label">FP8 tensorwise + MLP recompute + NVRTC-off 1024/64</div>
+              <div class="bar-track"><div class="bar-fill ok" style="width:92.63%"></div></div>
+              <div class="bar-value">118681.6 tok/s</div>
+            </div>
+
+            <div class="bar-row">
+              <div class="bar-label">FP8 tensorwise + MLP recompute + NVRTC-off 1024/128</div>
+              <div class="bar-track"><div class="bar-fill ok" style="width:95.31%"></div></div>
+              <div class="bar-value">122120.6 tok/s</div>
+            </div>
+
+            <div class="bar-row">
+              <div class="bar-label">FP8 tensorwise + MLP recompute + NVRTC-off 1024/192</div>
+              <div class="bar-track"><div class="bar-fill ok" style="width:95.88%"></div></div>
+              <div class="bar-value">122841.6 tok/s</div>
+            </div>
+            </div>
+    </section>
+
+
+    <section class="panel wide">
+      <div class="panel-title-row">
+        <h2>Training loss after 100 steps</h2>
+        <div class="legend"><span><i class="bf16"></i>BF16</span><span><i class="fp8"></i>FP8 tensorwise</span><span><i class="fixed"></i>FP8 + recompute fixed</span></div>
+      </div>
+      <svg viewBox="0 0 920 260" role="img" aria-label="Training loss line chart">
+        <line x1="58" y1="212" x2="896" y2="212" class="axis" />
+        <line x1="58" y1="26" x2="58" y2="212" class="axis" />
+        <text x="10" y="30" class="svg-label">3.17</text>
+        <text x="10" y="212" class="svg-label">1.93</text>
+        <polyline points="58.0,131.1 477.0,162.3 896.0,33.2" fill="none" stroke="#176b87" stroke-width="3" stroke-linecap="round" /><polyline points="58.0,177.4 477.0,210.6 896.0,212.0" fill="none" stroke="#2c7a47" stroke-width="3" stroke-linecap="round" />
+        <circle cx="58.0" cy="131.1" r="5.5" fill="#176b87"><title>BF16 seq=1024 bs=64: loss=2.4718</title></circle><circle cx="477.0" cy="162.3" r="5.5" fill="#176b87"><title>BF16 seq=1024 bs=128: loss=2.2638</title></circle><circle cx="896.0" cy="33.2" r="5.5" fill="#176b87"><title>BF16 seq=2048 bs=64: loss=3.1254</title></circle><circle cx="58.0" cy="26.0" r="5.5" fill="#b45f06"><title>FP8 tensorwise seq=2048 bs=64: loss=3.1736</title></circle><circle cx="58.0" cy="177.4" r="5.5" fill="#2c7a47"><title>FP8 tensorwise + MLP recompute + NVRTC-off seq=1024 bs=64: loss=2.1632</title></circle><circle cx="477.0" cy="210.6" r="5.5" fill="#2c7a47"><title>FP8 tensorwise + MLP recompute + NVRTC-off seq=1024 bs=128: loss=1.9412</title></circle><circle cx="896.0" cy="212.0" r="5.5" fill="#2c7a47"><title>FP8 tensorwise + MLP recompute + NVRTC-off seq=1024 bs=192: loss=1.9320</title></circle>
+        <text x="58.0" y="247" text-anchor="middle" class="svg-label">1024/64</text><text x="197.7" y="247" text-anchor="middle" class="svg-label">1024/128</text><text x="337.3" y="247" text-anchor="middle" class="svg-label">2048/64</text><text x="477.0" y="247" text-anchor="middle" class="svg-label">2048/64</text><text x="616.7" y="247" text-anchor="middle" class="svg-label">1024/64</text><text x="756.3" y="247" text-anchor="middle" class="svg-label">1024/128</text><text x="896.0" y="247" text-anchor="middle" class="svg-label">1024/192</text>
+      </svg>
+    </section>
+
+
+    <section class="panel wide">
+      <h2>Capacity matrix</h2>
+      <div class="matrix-wrap"><h3>BF16</h3><table class="matrix"><thead><tr><th>seq \ BS</th><th>64</th><th>128</th><th>192</th><th>256</th></tr></thead><tbody><tr><th>1024</th><td class="ok">OK<small>46.1 GiB</small></td><td class="ok">OK<small>79.0 GiB</small></td><td class="na">-</td><td class="oom">OOM<small>139.8 GiB</small></td></tr><tr><th>2048</th><td class="ok">OK<small>79.1 GiB</small></td><td class="oom">OOM<small>139.8 GiB</small></td><td class="na">-</td><td class="skip">Skipped</td></tr><tr><th>4096</th><td class="oom">OOM<small>139.8 GiB</small></td><td class="skip">Skipped</td><td class="na">-</td><td class="skip">Skipped</td></tr></tbody></table><h3>FP8 tensorwise</h3><table class="matrix"><thead><tr><th>seq \ BS</th><th>64</th><th>128</th><th>192</th><th>256</th></tr></thead><tbody><tr><th>1024</th><td class="warn">100 steps + TE cleanup crash<small>72.7 GiB</small></td><td class="warn">100 steps + TE cleanup crash<small>131.4 GiB</small></td><td class="na">-</td><td class="oom">OOM<small>136.7 GiB</small></td></tr><tr><th>2048</th><td class="ok">OK<small>131.6 GiB</small></td><td class="oom">OOM<small>137.0 GiB</small></td><td class="na">-</td><td class="skip">Skipped</td></tr><tr><th>4096</th><td class="oom">OOM<small>137.4 GiB</small></td><td class="skip">Skipped</td><td class="na">-</td><td class="skip">Skipped</td></tr></tbody></table><h3>FP8 tensorwise + MLP recompute</h3><table class="matrix"><thead><tr><th>seq \ BS</th><th>64</th><th>128</th><th>192</th><th>256</th></tr></thead><tbody><tr><th>1024</th><td class="fail">Fail<small>9.2 GiB</small></td><td class="na">-</td><td class="na">-</td><td class="na">-</td></tr><tr><th>2048</th><td class="na">-</td><td class="na">-</td><td class="na">-</td><td class="na">-</td></tr><tr><th>4096</th><td class="na">-</td><td class="na">-</td><td class="na">-</td><td class="na">-</td></tr></tbody></table><h3>FP8 tensorwise + MLP recompute + NVRTC-off</h3><table class="matrix"><thead><tr><th>seq \ BS</th><th>64</th><th>128</th><th>192</th><th>256</th></tr></thead><tbody><tr><th>1024</th><td class="ok">OK<small>45.6 GiB</small></td><td class="ok">OK<small>76.4 GiB</small></td><td class="ok">OK<small>108.3 GiB</small></td><td class="na">-</td></tr><tr><th>2048</th><td class="na">-</td><td class="na">-</td><td class="na">-</td><td class="na">-</td></tr><tr><th>4096</th><td class="na">-</td><td class="na">-</td><td class="na">-</td><td class="na">-</td></tr></tbody></table></div>
+    </section>
+
+
+    <section class="panel wide">
+      <h2>Run table</h2>
+      <table class="runs">
+        <thead>
+          <tr>
+            <th>Mode</th><th>Seq</th><th>BS</th><th>Status</th>
+            <th>Train loss / PPL</th><th>Val loss / PPL</th><th>Test loss / PPL</th>
+            <th>Peak</th><th>CUDA alloc/res</th><th>Iter ms</th><th>Tok/s</th><th>Sidecar</th><th>Source</th>
+          </tr>
+        </thead>
+        <tbody>
+            <tr>
+              <td>BF16</td>
+              <td>1024</td>
+              <td>64</td>
+              <td><span class="pill ok">OK</span></td>
+              <td>2.4718 / 11.84</td>
+              <td>2.3874 / 10.89</td>
+              <td>3.0698 / 21.54</td>
+              <td>46.1 GiB</td>
+              <td>43.5 / 43.7 GiB</td>
+              <td>610.3</td>
+              <td>107383</td>
+              <td>yes</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782680290/seq_1024_bs_64.log">log</a></td>
+            </tr>
+
+            <tr>
+              <td>BF16</td>
+              <td>1024</td>
+              <td>128</td>
+              <td><span class="pill ok">OK</span></td>
+              <td>2.2638 / 9.62</td>
+              <td>2.2268 / 9.27</td>
+              <td>2.9819 / 19.73</td>
+              <td>79.0 GiB</td>
+              <td>76.2 / 76.6 GiB</td>
+              <td>1211.6</td>
+              <td>108181</td>
+              <td>yes</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782680290/seq_1024_bs_128.log">log</a></td>
+            </tr>
+
+            <tr>
+              <td>BF16</td>
+              <td>1024</td>
+              <td>256</td>
+              <td><span class="pill oom">OOM</span></td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>139.8 GiB</td>
+              <td>137.0 / 137.4 GiB</td>
+              <td>-</td>
+              <td>-</td>
+              <td>yes</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782680290/seq_1024_bs_256.log">log</a></td>
+            </tr>
+
+            <tr>
+              <td>BF16</td>
+              <td>2048</td>
+              <td>64</td>
+              <td><span class="pill ok">OK</span></td>
+              <td>3.1254 / 22.77</td>
+              <td>2.8022 / 16.48</td>
+              <td>2.8758 / 17.74</td>
+              <td>79.1 GiB</td>
+              <td>76.2 / 76.7 GiB</td>
+              <td>1306.0</td>
+              <td>100361</td>
+              <td>yes</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782681292/seq_2048_bs_64.log">log</a></td>
+            </tr>
+
+            <tr>
+              <td>BF16</td>
+              <td>2048</td>
+              <td>128</td>
+              <td><span class="pill oom">OOM</span></td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>139.8 GiB</td>
+              <td>137.0 / 137.7 GiB</td>
+              <td>-</td>
+              <td>-</td>
+              <td>yes</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782681292/seq_2048_bs_128.log">log</a></td>
+            </tr>
+
+            <tr>
+              <td>BF16</td>
+              <td>2048</td>
+              <td>256</td>
+              <td><span class="pill skip">Skipped</span></td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>- GiB</td>
+              <td>- / - GiB</td>
+              <td>-</td>
+              <td>-</td>
+              <td>no</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782681292/seq_2048_bs_256.log">log</a></td>
+            </tr>
+
+            <tr>
+              <td>BF16</td>
+              <td>4096</td>
+              <td>64</td>
+              <td><span class="pill oom">OOM</span></td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>139.8 GiB</td>
+              <td>137.3 / 137.6 GiB</td>
+              <td>-</td>
+              <td>-</td>
+              <td>yes</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782681292/seq_4096_bs_64.log">log</a></td>
+            </tr>
+
+            <tr>
+              <td>BF16</td>
+              <td>4096</td>
+              <td>128</td>
+              <td><span class="pill skip">Skipped</span></td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>- GiB</td>
+              <td>- / - GiB</td>
+              <td>-</td>
+              <td>-</td>
+              <td>no</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782681292/seq_4096_bs_128.log">log</a></td>
+            </tr>
+
+            <tr>
+              <td>BF16</td>
+              <td>4096</td>
+              <td>256</td>
+              <td><span class="pill skip">Skipped</span></td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>- GiB</td>
+              <td>- / - GiB</td>
+              <td>-</td>
+              <td>-</td>
+              <td>no</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782681292/seq_4096_bs_256.log">log</a></td>
+            </tr>
+
+            <tr>
+              <td>FP8 tensorwise</td>
+              <td>1024</td>
+              <td>64</td>
+              <td><span class="pill warn">100 steps + TE cleanup crash</span></td>
+              <td>2.4220 / 11.27</td>
+              <td>2.3282 / 10.26</td>
+              <td>3.0050 / 20.19</td>
+              <td>72.7 GiB</td>
+              <td>69.6 / 70.3 GiB</td>
+              <td>472.1</td>
+              <td>138818</td>
+              <td>yes</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782683923/seq_1024_bs_64.log">log</a></td>
+            </tr>
+
+            <tr>
+              <td>FP8 tensorwise</td>
+              <td>1024</td>
+              <td>128</td>
+              <td><span class="pill warn">100 steps + TE cleanup crash</span></td>
+              <td>2.2406 / 9.40</td>
+              <td>2.2155 / 9.17</td>
+              <td>2.9642 / 19.38</td>
+              <td>131.4 GiB</td>
+              <td>127.6 / 129.0 GiB</td>
+              <td>920.2</td>
+              <td>142439</td>
+              <td>yes</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782683923/seq_1024_bs_128.log">log</a></td>
+            </tr>
+
+            <tr>
+              <td>FP8 tensorwise</td>
+              <td>1024</td>
+              <td>256</td>
+              <td><span class="pill oom">OOM</span></td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>136.7 GiB</td>
+              <td>135.7 / 136.6 GiB</td>
+              <td>-</td>
+              <td>-</td>
+              <td>yes</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782683923/seq_1024_bs_256.log">log</a></td>
+            </tr>
+
+            <tr>
+              <td>FP8 tensorwise</td>
+              <td>2048</td>
+              <td>64</td>
+              <td><span class="pill ok">OK</span></td>
+              <td>3.1736 / 23.89</td>
+              <td>2.8466 / 17.23</td>
+              <td>2.9252 / 18.64</td>
+              <td>131.6 GiB</td>
+              <td>127.6 / 129.1 GiB</td>
+              <td>1023.0</td>
+              <td>128125</td>
+              <td>yes</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782683923/seq_2048_bs_64.log">log</a></td>
+            </tr>
+
+            <tr>
+              <td>FP8 tensorwise</td>
+              <td>2048</td>
+              <td>128</td>
+              <td><span class="pill oom">OOM</span></td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>137.0 GiB</td>
+              <td>136.0 / 136.8 GiB</td>
+              <td>-</td>
+              <td>-</td>
+              <td>yes</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782683923/seq_2048_bs_128.log">log</a></td>
+            </tr>
+
+            <tr>
+              <td>FP8 tensorwise</td>
+              <td>2048</td>
+              <td>256</td>
+              <td><span class="pill skip">Skipped</span></td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>- GiB</td>
+              <td>- / - GiB</td>
+              <td>-</td>
+              <td>-</td>
+              <td>no</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782683923/seq_2048_bs_256.log">log</a></td>
+            </tr>
+
+            <tr>
+              <td>FP8 tensorwise</td>
+              <td>4096</td>
+              <td>64</td>
+              <td><span class="pill oom">OOM</span></td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>137.4 GiB</td>
+              <td>136.5 / 137.3 GiB</td>
+              <td>-</td>
+              <td>-</td>
+              <td>yes</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782683923/seq_4096_bs_64.log">log</a></td>
+            </tr>
+
+            <tr>
+              <td>FP8 tensorwise</td>
+              <td>4096</td>
+              <td>128</td>
+              <td><span class="pill skip">Skipped</span></td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>- GiB</td>
+              <td>- / - GiB</td>
+              <td>-</td>
+              <td>-</td>
+              <td>no</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782683923/seq_4096_bs_128.log">log</a></td>
+            </tr>
+
+            <tr>
+              <td>FP8 tensorwise</td>
+              <td>4096</td>
+              <td>256</td>
+              <td><span class="pill skip">Skipped</span></td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>- GiB</td>
+              <td>- / - GiB</td>
+              <td>-</td>
+              <td>-</td>
+              <td>no</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782683923/seq_4096_bs_256.log">log</a></td>
+            </tr>
+
+            <tr>
+              <td>FP8 tensorwise + MLP recompute</td>
+              <td>1024</td>
+              <td>64</td>
+              <td><span class="pill fail">Fail</span></td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>- / -</td>
+              <td>9.2 GiB</td>
+              <td>7.3 / 7.6 GiB</td>
+              <td>-</td>
+              <td>-</td>
+              <td>yes</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782682254/seq_1024_bs_64.log">log</a></td>
+            </tr>
+
+            <tr>
+              <td>FP8 tensorwise + MLP recompute + NVRTC-off</td>
+              <td>1024</td>
+              <td>64</td>
+              <td><span class="pill ok">OK</span></td>
+              <td>2.1632 / 8.70</td>
+              <td>2.2870 / 9.85</td>
+              <td>2.2237 / 9.24</td>
+              <td>45.6 GiB</td>
+              <td>42.4 / 43.2 GiB</td>
+              <td>552.2</td>
+              <td>118682</td>
+              <td>yes</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782692003/seq_1024_bs_64.log">log</a></td>
+            </tr>
+
+            <tr>
+              <td>FP8 tensorwise + MLP recompute + NVRTC-off</td>
+              <td>1024</td>
+              <td>128</td>
+              <td><span class="pill ok">OK</span></td>
+              <td>1.9412 / 6.97</td>
+              <td>2.2649 / 9.63</td>
+              <td>2.0752 / 7.97</td>
+              <td>76.4 GiB</td>
+              <td>73.2 / 74.0 GiB</td>
+              <td>1073.3</td>
+              <td>122121</td>
+              <td>yes</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782692760/seq_1024_bs_128.log">log</a></td>
+            </tr>
+
+            <tr>
+              <td>FP8 tensorwise + MLP recompute + NVRTC-off</td>
+              <td>1024</td>
+              <td>192</td>
+              <td><span class="pill ok">OK</span></td>
+              <td>1.9320 / 6.90</td>
+              <td>2.2519 / 9.51</td>
+              <td>2.0508 / 7.77</td>
+              <td>108.3 GiB</td>
+              <td>104.1 / 105.9 GiB</td>
+              <td>1600.5</td>
+              <td>122842</td>
+              <td>yes</td>
+              <td><a href="../nebius/cppmega-h200-megatron-1782693401/seq_1024_bs_192.log">log</a></td>
+            </tr>
+            </tbody>
+      </table>
+    </section>
+
+    </div>
+
+    <section class="panel wide">
+      <h2>Interpretation</h2>
+      <p>The fixed FP8 tensorwise + MLP recompute profile now passes cleanly on a single Nebius H200 for 1024-token context at BS64, BS128 and BS192. The fix has two parts: Megatron TE checkpoint kwargs are bound into the forwarded callable, and FP8 tensorwise sweeps default to <code>NVTE_DISABLE_NVRTC=1</code> to avoid the Transformer Engine RTC teardown crash seen with TE 2.16.0.</p>
+      <p>BS192 is the best current 1024-token smoke profile: 100 steps pass with no OOM, no skipped/nan iterations, no <code>Kernel::~Kernel</code> cleanup crash, about 122.9k tok/s over the last 20 iterations, and about 110.9GB nvidia-smi peak. Prior BS256 runs OOM near the H200 memory limit, so BS192 is the stable recommendation for the 10000-step trial.</p>
+      <p>For maximum MFU, the remaining performance branch is to rebuild the image with a newer Transformer Engine and retest <code>--enable-nvrtc</code>. On the current image, keeping NVRTC enabled is around 4% faster at BS64 but crashes during TE RTC cleanup after metrics are emitted.</p>
+      <div class="note">Do not treat <code>OK_TE_CLEANUP_SIGSEGV</code> as a clean production status. It means 100 training steps and eval completed, then TE crashed during process teardown.</div>
+    </section>
+
+    <footer>
+      Logs are linked relative to this report. Rebuild with <code>python3 scripts/render_nebius_h200_report.py</code>.
+    </footer>
+  </main>
+</body>
+</html>

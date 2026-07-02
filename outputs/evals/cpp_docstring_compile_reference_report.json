@@ -1,0 +1,181 @@
+{
+  "results": [
+    {
+      "compile": {
+        "elapsed_s": 0.2358301249332726,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_8nanemzg/clamp_int/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_8nanemzg/clamp_int/candidate"
+      ],
+      "compile_ok": true,
+      "missing_completion": false,
+      "passed": true,
+      "run": {
+        "elapsed_s": 0.0027384170098230243,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "",
+        "timeout": false
+      },
+      "run_ok": true,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_8nanemzg/clamp_int/candidate.cpp",
+      "task_id": "clamp_int"
+    },
+    {
+      "compile": {
+        "elapsed_s": 0.07999691599979997,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_8nanemzg/is_prime/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_8nanemzg/is_prime/candidate"
+      ],
+      "compile_ok": true,
+      "missing_completion": false,
+      "passed": true,
+      "run": {
+        "elapsed_s": 0.0026454159524291754,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "",
+        "timeout": false
+      },
+      "run_ok": true,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_8nanemzg/is_prime/candidate.cpp",
+      "task_id": "is_prime"
+    },
+    {
+      "compile": {
+        "elapsed_s": 0.3039442499866709,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_8nanemzg/join_non_empty/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_8nanemzg/join_non_empty/candidate"
+      ],
+      "compile_ok": true,
+      "missing_completion": false,
+      "passed": true,
+      "run": {
+        "elapsed_s": 0.0026829999405890703,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "",
+        "timeout": false
+      },
+      "run_ok": true,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_8nanemzg/join_non_empty/candidate.cpp",
+      "task_id": "join_non_empty"
+    },
+    {
+      "compile": {
+        "elapsed_s": 0.22599629207979888,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "",
+        "timeout": false
+      },
+      "compile_cmd": [
+        "clang++",
+        "-std=c++20",
+        "-O0",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_8nanemzg/parse_uint/candidate.cpp",
+        "-o",
+        "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_8nanemzg/parse_uint/candidate"
+      ],
+      "compile_ok": true,
+      "missing_completion": false,
+      "passed": true,
+      "run": {
+        "elapsed_s": 0.002815459039993584,
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "",
+        "timeout": false
+      },
+      "run_ok": true,
+      "sidecar_contract": {
+        "generated_suffix_policy": "zero/default token sidecars during decode, then reparse full candidate before compile/run gate",
+        "graph_routes": "optional for standalone single-function tasks; required for repo repair/code-with-dependencies tasks",
+        "prompt_sidecars_required": [
+          "platform_ids",
+          "token_structure_ids",
+          "token_ast_depth",
+          "token_ast_node_type"
+        ]
+      },
+      "source_path": "/var/folders/gz/9lg38q650kxg8c3wrj48kml00000gn/T/cppmega_cpp_eval_8nanemzg/parse_uint/candidate.cpp",
+      "task_id": "parse_uint"
+    }
+  ],
+  "summary": {
+    "c_compiler": "clang",
+    "compiled": 4,
+    "cpp_compiler": "clang++",
+    "pass_rate": 1.0,
+    "passed": 4,
+    "ran": 4,
+    "total": 4
+  }
+}
