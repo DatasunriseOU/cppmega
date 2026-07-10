@@ -190,7 +190,15 @@ class CppMegaLanguageModelEmbedding(LanguageModelEmbedding):
                 confidence_ids=normalized_domain["confidence_ids"],
                 target_dtype=embeddings.dtype,
             )
-            if isinstance(domain_embeddings, torch.Tensor) and domain_embeddings.ndim == embeddings.ndim:
+            if domain_embeddings is not None:
+                # RULE #1: a wrong-shape domain embedding must not be silently
+                # dropped -- that would train with the domain signal disabled.
+                if domain_embeddings.shape != embeddings.shape:
+                    raise RuntimeError(
+                        f"[cppmega] domain embedding shape {tuple(domain_embeddings.shape)} "
+                        f"!= token embedding shape {tuple(embeddings.shape)}; "
+                        f"refusing to silently drop the domain signal."
+                    )
                 embeddings = embeddings + domain_embeddings
 
         if self.cppmega_structure is not None:

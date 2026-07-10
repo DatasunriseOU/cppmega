@@ -35,3 +35,14 @@ def test_domain_embedding_accepts_missing_optional_sidecars():
     )
 
     assert tuple(out.shape) == (1, 2, 8)
+
+
+def test_domain_embedding_returns_none_when_all_sidecars_absent():
+    emb = CppMegaDomainEmbedding(hidden_size=8, bottleneck_dim=4)
+    assert emb(domain_ids=None, role_ids=None, confidence_ids=None) is None
+
+
+def test_domain_embedding_raises_on_out_of_range_ids():
+    emb = CppMegaDomainEmbedding(hidden_size=8, num_domains=64, bottleneck_dim=4)
+    with pytest.raises(ValueError, match="out of range"):
+        emb(domain_ids=torch.tensor([[999]], dtype=torch.long), role_ids=None, confidence_ids=None)

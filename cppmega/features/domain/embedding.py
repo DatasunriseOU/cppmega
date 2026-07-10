@@ -63,7 +63,7 @@ class CppMegaDomainEmbedding(nn.Module):
         role_ids: torch.Tensor | None,
         confidence_ids: torch.Tensor | None,
         target_dtype: torch.dtype | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
         inputs = {
             "domain": domain_ids,
             "role": role_ids,
@@ -71,7 +71,9 @@ class CppMegaDomainEmbedding(nn.Module):
         }
         ref = next((value for value in inputs.values() if value is not None), None)
         if ref is None:
-            return torch.tensor(0.0, dtype=target_dtype or torch.float32)
+            # No domain sidecars for this step -> no additive signal. Return None
+            # (not a CPU scalar) so the caller skips the add cleanly on any device.
+            return None
 
         batch, seq = ref.shape[:2]
         ids_list: list[torch.Tensor] = []
@@ -82,8 +84,18 @@ class CppMegaDomainEmbedding(nn.Module):
                 ids_list.append(torch.zeros(batch, seq, dtype=torch.long, device=ref.device))
                 present.append(False)
                 continue
-            clamped = tensor.to(dtype=torch.long).clamp(0, int(self._comp_clamp_max[index].item()))
-            ids_list.append(clamped + int(self._comp_offsets[index].item()))
+            tensor = tensor.to(dtype=torch.long)
+            comp_max = int(self._comp_clamp_max[index].item())
+            # RULE #1: out-of-range ids mean a corrupt/misconfigured sidecar.
+            # Raise instead of clamping into the boundary bucket (silent wrong data).
+            if bool((tensor < 0).any().item()) or bool((tensor > comp_max).any().item()):
+                bad = tensor[(tensor < 0) | (tensor > comp_max)].flatten()[:8].tolist()
+                raise ValueError(
+                    f"[cppmega-domain] {name}_ids out of range [0,{comp_max}]: "
+                    f"offending values {bad} -- corrupt/misconfigured sidecar; "
+                    f"refusing to clamp."
+                )
+            ids_list.append(tensor + int(self._comp_offsets[index].item()))
             present.append(True)
 
         stacked_ids = torch.stack(ids_list, dim=-1).reshape(batch * seq, len(self.COMPONENTS))
