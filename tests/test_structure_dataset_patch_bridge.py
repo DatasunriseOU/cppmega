@@ -36,6 +36,18 @@ def test_pop_structure_batch_removes_sidecars_and_sets_thread_local():
     assert patch._get_current_structure_batch() is structure
 
 
+def test_safe_sidecar_path_allows_plain_relative_and_blocks_escape():
+    base = "/data/cppmega_sidecar"
+    ok = patch._safe_sidecar_path(
+        base, "train_token_ast_depth.bin", col="c", field="path", json_path="m.json"
+    )
+    assert ok == "/data/cppmega_sidecar/train_token_ast_depth.bin"
+
+    for evil in ("../../etc/passwd", "/etc/passwd", "sub/../../escape.bin"):
+        with pytest.raises(ValueError):
+            patch._safe_sidecar_path(base, evil, col="c", field="path", json_path="m.json")
+
+
 def test_build_graph_route_tensors_offsets_caps_and_clips():
     graph_sidecars = {
         "token_call_edges": {

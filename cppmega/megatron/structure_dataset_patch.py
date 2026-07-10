@@ -159,6 +159,29 @@ def _load_sidecar_manifest(dataset: Any) -> tuple[str, dict[str, Any]]:
     return json_path, sidecar
 
 
+def _safe_sidecar_path(
+    base_dir: str, rel_path: str, *, col: str, field: str, json_path: str
+) -> str:
+    """Join a manifest-supplied relative sidecar path, refusing to escape base_dir.
+
+    RULE #1 / security: a manifest is data, not code. An absolute path or a ``..``
+    traversal in it must fail loud, not silently read outside the dataset dir.
+    """
+    if os.path.isabs(rel_path):
+        raise ValueError(
+            f"[cppmega-patch] {field} for {col!r} must be a relative filename, got "
+            f"absolute {rel_path!r} in {json_path!r}"
+        )
+    joined = os.path.normpath(os.path.join(base_dir, rel_path))
+    base_norm = os.path.normpath(base_dir)
+    if joined != base_norm and not joined.startswith(base_norm + os.sep):
+        raise ValueError(
+            f"[cppmega-patch] {field} for {col!r} escapes the sidecar dir: "
+            f"{rel_path!r} -> {joined!r} (base {base_norm!r}) in {json_path!r}"
+        )
+    return joined
+
+
 def _lazy_init_side_channels(dataset: Any) -> Dict[str, Dict[str, Any]]:
     """Load JSON sidecar and initialize numpy.memmap for all defined side-channel columns."""
     if hasattr(dataset, "_side_channels_cache") and dataset._side_channels_cache is not None:
@@ -184,7 +207,7 @@ def _lazy_init_side_channels(dataset: Any) -> Dict[str, Dict[str, Any]]:
         dtype_str = entry.get("dtype", "uint16")
         if not rel_path:
             raise ValueError(f"[cppmega-patch] side-channel {col!r} has no path in {json_path!r}")
-        path = os.path.join(base_dir, rel_path)
+        path = _safe_sidecar_path(base_dir, rel_path, col=col, field="path", json_path=json_path)
         if not os.path.exists(path):
             raise FileNotFoundError(
                 f"[cppmega-patch] side-channel file for {col!r} not found: {path}"
@@ -227,8 +250,12 @@ def _lazy_init_graph_sidecars(dataset: Any) -> Dict[str, Dict[str, Any]]:
     document_count = int(sidecar.get("document_count", len(dataset.dataset.index.sequence_lengths)))
     base_dir = os.path.dirname(json_path)
     for col, entry in graph_paths.items():
-        offsets_path = os.path.join(base_dir, entry["offsets_path"])
-        data_path = os.path.join(base_dir, entry["data_path"])
+        offsets_path = _safe_sidecar_path(
+            base_dir, entry["offsets_path"], col=col, field="offsets_path", json_path=json_path
+        )
+        data_path = _safe_sidecar_path(
+            base_dir, entry["data_path"], col=col, field="data_path", json_path=json_path
+        )
         if not os.path.exists(offsets_path):
             raise FileNotFoundError(f"[cppmega-patch] graph offsets file for {col!r} not found: {offsets_path}")
         if not os.path.exists(data_path):
@@ -656,8 +683,15 @@ try:
 
     GPTDataset.__getitem__ = patched_getitem
     print("[cppmega-patch] Successfully patched GPTDataset.__getitem__", flush=True)
+except ImportError:
+    # Megatron not installed (local unit-test path) -- nothing to patch.
+    pass
 except Exception as e:
-    print(f"[cppmega-patch] WARNING: failed to patch GPTDataset.__getitem__: {e}", flush=True)
+    # RULE #1: Megatron present but patching failed -> a training run would
+    # silently proceed without structure ingress. Fail loud.
+    raise RuntimeError(
+        f"[cppmega-patch] failed to patch GPTDataset.__getitem__: {e}"
+    ) from e
 
 
 # --- 2. Monkey-patch get_batch_on_this_tp_rank ---
@@ -683,8 +717,13 @@ try:
         f"[cppmega-patch] Successfully patched {batch_utils.__name__}.get_batch_on_this_tp_rank",
         flush=True,
     )
+except ImportError:
+    # Megatron not installed (local unit-test path) -- nothing to patch.
+    pass
 except Exception as e:
-    print(f"[cppmega-patch] WARNING: failed to patch get_batch_on_this_tp_rank: {e}", flush=True)
+    raise RuntimeError(
+        f"[cppmega-patch] failed to patch get_batch_on_this_tp_rank: {e}"
+    ) from e
 
 
 # --- 3. Monkey-patch MambaModel / GPTModel forward passes ---
@@ -705,7 +744,9 @@ try:
 except ImportError:
     pass
 except Exception as e:
-    print(f"[cppmega-patch] WARNING: failed to patch MambaModel.forward: {e}", flush=True)
+    raise RuntimeError(
+        f"[cppmega-patch] failed to patch MambaModel.forward: {e}"
+    ) from e
 
 
 try:
@@ -725,4 +766,6 @@ try:
 except ImportError:
     pass
 except Exception as e:
-    print(f"[cppmega-patch] WARNING: failed to patch GPTModel.forward: {e}", flush=True)
+    raise RuntimeError(
+        f"[cppmega-patch] failed to patch GPTModel.forward: {e}"
+    ) from e
