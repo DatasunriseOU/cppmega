@@ -89,11 +89,32 @@ def _copy_graph_sidecar(
             f"need {document_count + 1}"
         )
     new_offsets = np.asarray(src_offsets[: document_count + 1], dtype=offset_dtype).copy()
+    if np.any(np.diff(new_offsets.astype(np.int64)) < 0):
+        raise ValueError(
+            f"{src_manifest_entry['offsets_path']} offsets are not monotonic non-decreasing: "
+            f"{new_offsets.tolist()}"
+        )
     item_count = int(new_offsets[-1])
 
+    declared_item_count = int(src_manifest_entry["item_count"])
+    row_elems = int(np.prod(shape_tail)) if shape_tail else 1
     src_data_path = src_base.parent / str(src_manifest_entry["data_path"])
+    expected_bytes = declared_item_count * row_elems * dtype.itemsize
+    actual_bytes = src_data_path.stat().st_size
+    if actual_bytes != expected_bytes:
+        raise ValueError(
+            f"{src_manifest_entry['data_path']} size mismatch: file has {actual_bytes} bytes, "
+            f"manifest declares item_count={declared_item_count} * {row_elems} elems * "
+            f"{dtype.itemsize} bytes/elem = {expected_bytes} bytes"
+        )
+    if item_count > declared_item_count:
+        raise ValueError(
+            f"{src_manifest_entry['offsets_path']} final offset {item_count} exceeds declared "
+            f"item_count {declared_item_count} for {src_manifest_entry['data_path']}"
+        )
+
     if shape_tail:
-        data = np.memmap(src_data_path, mode="r", dtype=dtype, shape=(int(src_manifest_entry["item_count"]),) + shape_tail)
+        data = np.memmap(src_data_path, mode="r", dtype=dtype, shape=(declared_item_count,) + shape_tail)
         sliced = np.asarray(data[:item_count])
     else:
         data = np.memmap(src_data_path, mode="r", dtype=dtype)

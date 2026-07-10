@@ -11,6 +11,7 @@ and by remote H200 generation jobs.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 import json
 import os
 import re
@@ -302,6 +303,20 @@ def evaluate_case(
     }
 
 
+def _evaluate_case_worker(
+    args: tuple[CppGenerationCase, str | None, str, str | None, Path],
+) -> dict[str, Any]:
+    """Top-level (pickle-safe) worker so cases can run under ProcessPoolExecutor."""
+    case, completion, compiler, clang_format, work_root = args
+    return evaluate_case(
+        case,
+        completion,
+        compiler=compiler,
+        clang_format=clang_format,
+        work_root=work_root,
+    )
+
+
 def evaluate_suite(
     cases: dict[str, CppGenerationCase],
     completions: dict[str, str],
@@ -310,6 +325,7 @@ def evaluate_suite(
     c_compiler: str,
     clang_format: str | None,
     keep_workdir: bool,
+    jobs: int | None = None,
 ) -> dict[str, Any]:
     for compiler in {cpp_compiler, c_compiler}:
         if shutil.which(compiler) is None:
@@ -319,6 +335,10 @@ def evaluate_suite(
     extra = sorted(set(completions) - set(cases))
     if extra:
         raise ValueError(f"completion task_id not present in cases: {extra[:10]}")
+    if jobs is None:
+        jobs = min(8, os.cpu_count() or 1)
+    if jobs < 1:
+        raise ValueError(f"jobs must be >= 1, got {jobs}")
 
     with tempfile.TemporaryDirectory(prefix="cppmega_cpp_eval_") as tmp:
         work_root = Path(tmp)
@@ -329,16 +349,25 @@ def evaluate_suite(
             persistent.mkdir(parents=True)
             work_root = persistent
 
-        results = [
-            evaluate_case(
+        # evaluate_case isolates each case under work_root/task_id, so cases run in
+        # parallel safely. executor.map preserves the sorted(cases) input order; a
+        # worker Python exception propagates here (a normal compile/run failure is a
+        # returned result, not an exception).
+        worker_args = [
+            (
                 case,
                 completions.get(task_id),
-                compiler=c_compiler if case.language == "c" else cpp_compiler,
-                clang_format=clang_format,
-                work_root=work_root,
+                c_compiler if case.language == "c" else cpp_compiler,
+                clang_format,
+                work_root,
             )
             for task_id, case in sorted(cases.items())
         ]
+        if jobs == 1:
+            results = [_evaluate_case_worker(item) for item in worker_args]
+        else:
+            with ProcessPoolExecutor(max_workers=jobs) as executor:
+                results = list(executor.map(_evaluate_case_worker, worker_args))
     passed = sum(1 for item in results if item["passed"])
     compiled = sum(1 for item in results if item["compile_ok"])
     ran = sum(1 for item in results if item["run_ok"])
@@ -358,6 +387,7 @@ def evaluate_suite(
             "cpp_compiler": cpp_compiler,
             "c_compiler": c_compiler,
             "clang_format": clang_format,
+            "jobs": jobs,
         },
         "results": results,
     }
@@ -400,6 +430,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Explicit ablation: compile generated source without clang-format.",
     )
     parser.add_argument("--keep-workdir", action="store_true")
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=min(8, os.cpu_count() or 1),
+        help="parallel compile/run workers (default: %(default)s)",
+    )
     parser.add_argument("--fail-on-fail", action="store_true")
     parser.add_argument("--json", action="store_true", help="also print report JSON")
     return parser.parse_args(argv)
@@ -418,6 +454,7 @@ def main(argv: list[str] | None = None) -> int:
         c_compiler=args.c_compiler,
         clang_format=None if args.no_clang_format else args.clang_format,
         keep_workdir=args.keep_workdir,
+        jobs=args.jobs,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")

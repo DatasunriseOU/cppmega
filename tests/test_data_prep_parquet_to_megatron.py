@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -214,6 +216,39 @@ def test_graph_sidecar_writer_writes_offsets_data_and_manifest(tmp_path: Path) -
     starts = np.fromfile(tmp_path / "cppmega_train_token_chunk_starts_data.bin", dtype=np.uint32)
     np.testing.assert_array_equal(starts, np.array([0, 8, 16, 0], dtype=np.uint32))
     json.dumps(manifest)
+
+
+def test_missing_megatron_import_fails_loud(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    converter = _load_converter_module()
+
+    def _forbidden_numpy_fallback(*args: object, **kwargs: object) -> None:
+        raise AssertionError(
+            "silent numpy fallback writer must not be used when the Megatron "
+            "import fails"
+        )
+
+    monkeypatch.setattr(
+        converter, "_convert_parquet_to_numpy", _forbidden_numpy_fallback
+    )
+    # Stub pyarrow so the function reaches the megatron import (pyarrow is
+    # imported first and is not needed before the megatron import raises).
+    pyarrow_stub = types.ModuleType("pyarrow")
+    parquet_stub = types.ModuleType("pyarrow.parquet")
+    pyarrow_stub.parquet = parquet_stub  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "pyarrow", pyarrow_stub)
+    monkeypatch.setitem(sys.modules, "pyarrow.parquet", parquet_stub)
+    # Simulate a missing/broken Megatron-Core install: None in sys.modules makes
+    # `from megatron.core... import ...` raise ImportError at call time.
+    monkeypatch.setitem(sys.modules, "megatron", None)
+
+    with pytest.raises(RuntimeError, match="IndexedDatasetBuilder"):
+        converter.convert_parquet_to_megatron(
+            input_dir=str(tmp_path),
+            output_prefix=str(tmp_path / "cppmega_train"),
+            split="train",
+        )
 
 
 def test_find_parquet_shards_all_keeps_every_file(tmp_path: Path) -> None:

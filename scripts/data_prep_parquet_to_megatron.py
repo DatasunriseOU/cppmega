@@ -629,29 +629,23 @@ def convert_parquet_to_megatron(
         side_channels = [name for name, _ in DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS]
         side_channel_dtypes = [dtype for _, dtype in DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS]
 
-    # Import Megatron's dataset builder
+    # Import Megatron's dataset builder. A missing/broken Megatron install must
+    # FAIL LOUD: silently falling back to the raw-numpy writer would emit a
+    # different on-disk layout that the training pipeline may not consume, so a
+    # broken env would masquerade as a successful conversion.
     try:
         from megatron.core.datasets.indexed_dataset import (  # pyright: ignore[reportMissingImports]
             IndexedDatasetBuilder as MMapIndexedDatasetBuilder,
         )
-    except (ImportError, Exception) as e:
-        print(f"WARNING: megatron import failed ({e}), using fallback writer", file=sys.stderr)
-        MMapIndexedDatasetBuilder = None
-
-    if MMapIndexedDatasetBuilder is None:
-        # Fallback: write raw numpy binary + simple index
-        _convert_parquet_to_numpy(
-            input_dir,
-            output_prefix,
-            split,
-            token_column,
-            dtype_str,
-            side_channels=side_channels,
-            side_channel_dtypes=side_channel_dtypes,
-            graph_sidecars=graph_sidecars,
-            vocab_size=vocab_size,
-        )
-        return
+    except Exception as e:
+        raise RuntimeError(
+            "convert_parquet_to_megatron: failed to import "
+            "megatron.core.datasets.indexed_dataset.IndexedDatasetBuilder "
+            f"({type(e).__name__}: {e}). Install/repair Megatron-Core "
+            "(pip install megatron-core) so the Megatron IndexedDataset writer "
+            "is available; refusing to silently fall back to the raw-numpy writer "
+            "which emits an incompatible on-disk format."
+        ) from e
 
     shards = find_parquet_shards(input_dir, split)
     print(f"found {len(shards)} {split} shards in {input_dir}")

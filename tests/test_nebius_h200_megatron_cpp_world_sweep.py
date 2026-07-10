@@ -1,7 +1,10 @@
 import subprocess
 
+import pytest
+
 from scripts.nebius_h200_megatron_cpp_world_sweep import (
     OVERLAY_PATHS,
+    _docker_auth_from_config,
     first_public_ip,
     main,
     make_checkpoint_tar,
@@ -410,3 +413,29 @@ def test_make_multi_sidecar_tar_includes_each_prefix_once(tmp_path):
     assert "cppmega_sidecar/seq1024_train_token_structure_ids.bin" in names
     assert "cppmega_sidecar/seq2048_train_token_structure_ids.bin" in names
     assert "cpp_tokenizer_hf/tokenizer.json" in names
+
+
+def test_docker_auth_returns_none_when_config_absent(tmp_path, monkeypatch):
+    # Genuine absence: no ~/.docker/config.json at all -> None (a normal "no creds").
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert _docker_auth_from_config("ghcr.io") is None
+
+
+def test_docker_auth_returns_none_when_config_has_no_creds(tmp_path, monkeypatch):
+    # Config exists and parses but configures nothing for the host -> None.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    docker_dir = tmp_path / ".docker"
+    docker_dir.mkdir()
+    (docker_dir / "config.json").write_text('{"auths": {}}')
+    assert _docker_auth_from_config("ghcr.io") is None
+
+
+def test_docker_auth_raises_when_config_present_but_corrupt(tmp_path, monkeypatch):
+    # Configured-but-broken: config.json exists but is unparseable -> raise, do not
+    # silently return None (which the caller would treat as "no creds configured").
+    monkeypatch.setenv("HOME", str(tmp_path))
+    docker_dir = tmp_path / ".docker"
+    docker_dir.mkdir()
+    (docker_dir / "config.json").write_text("{ this is not valid json ")
+    with pytest.raises(RuntimeError, match="configured but broken"):
+        _docker_auth_from_config("ghcr.io")

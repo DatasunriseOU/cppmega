@@ -138,6 +138,50 @@ def test_c_language_case_uses_c_compiler(tmp_path: Path) -> None:
     assert report["summary"]["c_compiler"] == "clang"
 
 
+def test_evaluate_suite_rejects_nonpositive_jobs() -> None:
+    module = _load_module()
+    with pytest.raises(ValueError, match="jobs must be"):
+        module.evaluate_suite(
+            {},
+            {},
+            cpp_compiler="true",
+            c_compiler="true",
+            clang_format=None,
+            keep_workdir=False,
+            jobs=0,
+        )
+
+
+@pytest.mark.skipif(shutil.which("clang++") is None, reason="clang++ not installed")
+def test_parallel_jobs_preserve_order_and_pass(tmp_path: Path) -> None:
+    out = tmp_path / "report.json"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--cases",
+            str(ROOT / "evals" / "cpp_docstring_compile_cases.jsonl"),
+            "--completions",
+            str(ROOT / "evals" / "cpp_docstring_compile_reference.jsonl"),
+            "--out",
+            str(out),
+            "--jobs",
+            "3",
+            "--fail-on-fail",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    report = json.loads(out.read_text())
+    assert report["summary"]["total"] == 4
+    assert report["summary"]["passed"] == 4
+    assert report["summary"]["jobs"] == 3
+    ids = [item["task_id"] for item in report["results"]]
+    assert ids == sorted(ids)  # deterministic sorted order under parallelism
+
+
 def test_extract_code_accepts_fenced_cpp_completion() -> None:
     module = _load_module()
     raw = "Here is the body:\n```cpp\nreturn 1;\n```\n"

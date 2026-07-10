@@ -178,8 +178,11 @@ def _docker_auth_from_config(host: str = "ghcr.io") -> tuple[str, str] | None:
         return None
     try:
         config = json.loads(config_path.read_text())
-    except Exception:
-        return None
+    except Exception as exc:
+        raise RuntimeError(
+            f"Docker config is configured but broken: {config_path} exists but is "
+            f"unparseable ({exc})"
+        ) from exc
 
     auths = config.get("auths") or {}
     for key in (host, f"https://{host}"):
@@ -218,8 +221,11 @@ def _docker_auth_from_config(host: str = "ghcr.io") -> tuple[str, str] | None:
             continue
         try:
             payload = json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            continue
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Docker credential helper {helper!r} is configured but broken: it "
+                f"returned malformed (non-JSON) output for {server!r} ({exc})"
+            ) from exc
         username = payload.get("Username") or payload.get("username")
         secret = payload.get("Secret") or payload.get("secret")
         if username and secret:
@@ -1008,6 +1014,9 @@ def main(argv: Iterable[str] | None = None) -> int:
             try:
                 ssh(args, ip, "bash /data/run_cppmega_h200_sweep.sh", timeout=args.remote_timeout_s)
             finally:
+                # A training exception may be propagating through this finally; detect it
+                # so the transfers below stay loud without masking the primary error.
+                training_failed = sys.exc_info()[0] is not None
                 out_dir = ROOT / "outputs" / "nebius" / args.instance_name
                 out_dir.mkdir(parents=True, exist_ok=True)
                 scp_cmd = [
@@ -1024,10 +1033,19 @@ def main(argv: Iterable[str] | None = None) -> int:
                     f"{args.ssh_user}@{ip}:/data/cppmega_h200_results/.",
                     str(out_dir),
                 ]
+                # Best-effort log fetch: stay loud on failure, but never raise here so a
+                # propagating training exception is not masked.
                 try:
-                    run(scp_cmd, check=False)
+                    log_proc = run(scp_cmd, check=False)
                 except FileNotFoundError:
-                    print("[nebius-sweep] scp unavailable; skipping log fetch", file=sys.stderr)
+                    print("[nebius-sweep] ERROR: scp unavailable; training log fetch FAILED", file=sys.stderr)
+                else:
+                    if log_proc.returncode != 0:
+                        print(
+                            f"[nebius-sweep] ERROR: log fetch scp exited {log_proc.returncode}; "
+                            f"training logs may be missing from {out_dir}",
+                            file=sys.stderr,
+                        )
                 if args.save_checkpoint:
                     ckpt_dir = ROOT / "outputs" / "checkpoints" / args.instance_name
                     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -1045,10 +1063,29 @@ def main(argv: Iterable[str] | None = None) -> int:
                         f"{args.ssh_user}@{ip}:/data/cppmega_h200_checkpoints/.",
                         str(ckpt_dir),
                     ]
+                    # The user explicitly asked to save+copy checkpoints, so a failed or
+                    # absent transfer is silent data loss -> raise. But if a training
+                    # exception is already propagating, do not mask it: be very loud instead.
+                    ckpt_failure: str | None = None
                     try:
-                        run(ckpt_scp_cmd, check=False)
+                        ckpt_proc = run(ckpt_scp_cmd, check=False)
                     except FileNotFoundError:
-                        print("[nebius-sweep] scp unavailable; skipping checkpoint fetch", file=sys.stderr)
+                        ckpt_failure = "scp is unavailable; checkpoints were NOT copied back"
+                    else:
+                        if ckpt_proc.returncode != 0:
+                            ckpt_failure = (
+                                f"scp exited {ckpt_proc.returncode}; checkpoints were NOT "
+                                f"copied to {ckpt_dir}"
+                            )
+                    if ckpt_failure is not None:
+                        if training_failed:
+                            print(
+                                f"[nebius-sweep] ERROR: checkpoint fetch failed ({ckpt_failure}); "
+                                "not raising because a training exception is already propagating",
+                                file=sys.stderr,
+                            )
+                        else:
+                            raise RuntimeError(f"Checkpoint fetch failed: {ckpt_failure}")
     finally:
         if instance_id and not args.keep_instance:
             run(
