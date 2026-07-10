@@ -4,6 +4,8 @@ import pytest
 import torch
 
 from cppmega.megatron.graph_route_attention_bias_patch import (
+    _forward_inference_context,
+    _graph_attention_bias_for_layer,
     attention_layer_route_kind,
     build_dense_graph_attention_bias_from_structure_batch,
 )
@@ -76,6 +78,63 @@ def test_dense_graph_attention_bias_requires_route_edges():
             seqlen_q=4,
             seqlen_k=4,
             device=torch.device("cpu"),
+        )
+
+
+def test_dense_graph_attention_bias_raises_above_max_seq(monkeypatch):
+    monkeypatch.setenv("CPPMEGA_GRAPH_DENSE_MAX_SEQ", "4")
+    structure_batch = {
+        "graph_call_edges": torch.tensor([[[0, 2], [-1, -1]]], dtype=torch.long),
+        "graph_call_edge_counts": torch.tensor([1], dtype=torch.long),
+    }
+    with pytest.raises(RuntimeError, match="CPPMEGA_GRAPH_DENSE_MAX_SEQ"):
+        build_dense_graph_attention_bias_from_structure_batch(
+            structure_batch,
+            batch_size=1,
+            seqlen_q=5,
+            seqlen_k=5,
+            device=torch.device("cpu"),
+        )
+
+
+def test_dense_graph_attention_bias_builds_at_max_seq(monkeypatch):
+    monkeypatch.setenv("CPPMEGA_GRAPH_DENSE_MAX_SEQ", "4")
+    structure_batch = {
+        "graph_call_edges": torch.tensor([[[0, 2], [-1, -1]]], dtype=torch.long),
+        "graph_call_edge_counts": torch.tensor([1], dtype=torch.long),
+    }
+    bias = build_dense_graph_attention_bias_from_structure_batch(
+        structure_batch,
+        batch_size=1,
+        seqlen_q=4,
+        seqlen_k=4,
+        device=torch.device("cpu"),
+        call_weight=2.0,
+    )
+    assert tuple(bias.shape) == (1, 1, 4, 4)
+    assert bias[0, 0, 0, 2].item() == 2.0
+
+
+def test_forward_inference_context_detects_context_and_params():
+    ctx = object()
+    assert _forward_inference_context({}) is None
+    assert _forward_inference_context({"inference_context": None}) is None
+    assert _forward_inference_context({"inference_context": ctx}) is ctx
+    assert _forward_inference_context({"inference_params": ctx}) is ctx
+
+
+def test_dense_graph_attention_bias_raises_in_incremental_decode(monkeypatch):
+    monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
+    monkeypatch.setenv("CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS", "1")
+    layer = _Layer(_DenseSelfAttention())
+    hidden_states = torch.zeros(4, 2, 8)
+
+    class _FakeInferenceContext:
+        pass
+
+    with pytest.raises(RuntimeError, match="incremental decode"):
+        _graph_attention_bias_for_layer(
+            layer, hidden_states, _FakeInferenceContext()
         )
 
 

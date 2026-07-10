@@ -156,6 +156,56 @@ def test_fused_scores_add_graph_route_bias_before_topk():
     assert scores[0, 0, 0].item() == 0.0
 
 
+def test_scatter_edges_vectorized_matches_reference_loop():
+    from cppmega.megatron.dsa_indexer_fused_patch import _scatter_edges_
+
+    torch.manual_seed(0)
+    B, sq, sk, maxE = 8, 32, 24, 6
+    edges = torch.full((B, maxE, 2), -1, dtype=torch.int32)
+    counts = torch.zeros(B, dtype=torch.long)
+    for b in range(B):
+        n = int(torch.randint(0, maxE + 1, (1,)))
+        counts[b] = n
+        if n:
+            flat = torch.randperm(sq * sk)[:n]  # unique (src,dst) per sample
+            edges[b, :n, 0] = (flat // sk).to(torch.int32)
+            edges[b, :n, 1] = (flat % sk).to(torch.int32)
+
+    bias_vec = torch.zeros(B, sq, sk)
+    _scatter_edges_(bias_vec, edges, counts, weight=2.0, sq=sq, sk=sk, require_kind=False)
+
+    bias_ref = torch.zeros(B, sq, sk)  # naive per-sample reference (old semantics)
+    for b in range(B):
+        for e in range(int(counts[b])):
+            bias_ref[b, int(edges[b, e, 0]), int(edges[b, e, 1])] += 2.0
+
+    assert torch.equal(bias_vec, bias_ref)
+
+    # shared single-row edges must broadcast across the batch identically
+    shared = torch.tensor([[[0, 1], [2, 3], [-1, -1]]], dtype=torch.int32)
+    bias_b = torch.zeros(4, sq, sk)
+    _scatter_edges_(bias_b, shared, torch.tensor([2]), weight=1.0, sq=sq, sk=sk, require_kind=False)
+    assert bias_b[:, 0, 1].tolist() == [1.0] * 4 and bias_b[:, 2, 3].tolist() == [1.0] * 4
+
+
+def test_graph_route_bias_raises_on_out_of_range_edge():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    structure_batch = {
+        # count says 1 real edge, but dst=9 is out of range for seqlen 4.
+        "graph_call_edges": torch.tensor([[[0, 9], [-1, -1]]], dtype=torch.long),
+        "graph_call_edge_counts": torch.tensor([1], dtype=torch.long),
+    }
+    with pytest.raises(ValueError, match="out of range"):
+        build_graph_route_bias_from_structure_batch(
+            structure_batch,
+            batch_size=1,
+            seqlen_q=4,
+            seqlen_k=4,
+            device=device,
+            call_weight=2.0,
+        )
+
+
 def test_graph_route_bias_requires_structure_batch():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     with pytest.raises(RuntimeError, match="no current cppmega structure batch"):

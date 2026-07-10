@@ -46,6 +46,16 @@ def _env_float(name: str, default: float) -> float:
         raise ValueError(f"{name} must be a float, got {raw!r}") from exc
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an int, got {raw!r}") from exc
+
+
 def graph_dense_bias_enabled() -> bool:
     """Default dense graph bias on whenever graph routes are enabled."""
 
@@ -78,6 +88,25 @@ def build_dense_graph_attention_bias_from_structure_batch(
     attention bias broadcastable to ``[B,H,Sq,Sk]``, so we insert the singleton
     head dimension here.
     """
+
+    # ponytail: the real fix for long context is a block-sparse bias carrying
+    # only the handful of edges; this cap is the fail-loud guard against a
+    # silent multi-GiB dense [B,1,Sq,Sk] blowup (bf16 is 4 GiB at B=8,S=16384).
+    # Default cap = the repo's documented max validated seq (16384). The DSA model
+    # never hits this dense path (route_kind=="dsa" returns None), so this only
+    # guards a dense TE/GQA variant against an unbounded blowup beyond 16k.
+    max_seq = _env_int("CPPMEGA_GRAPH_DENSE_MAX_SEQ", 16384)
+    if seqlen_q > max_seq or seqlen_k > max_seq:
+        elem = torch.empty((), dtype=dtype).element_size()
+        gib = batch_size * seqlen_q * seqlen_k * elem / (1024 ** 3)
+        raise RuntimeError(
+            "dense graph-route attention bias would materialize a "
+            f"[B={batch_size},1,Sq={seqlen_q},Sk={seqlen_k}] {dtype} tensor "
+            f"(~{gib:.2f} GiB); Sq/Sk exceed CPPMEGA_GRAPH_DENSE_MAX_SEQ={max_seq}. "
+            "Dense O(B*Sq*Sk) bias does not scale to long context — use DSA graph "
+            "top-k / block-sparse bias for longer sequences, or raise the cap if "
+            "you have the memory."
+        )
 
     graph = build_graph_route_bias_from_structure_batch(
         structure_batch,
@@ -136,7 +165,26 @@ def _hidden_shape_tensor(hidden_states: Any) -> torch.Tensor:
     return tensor
 
 
-def _graph_attention_bias_for_layer(layer: Any, hidden_states: Any) -> torch.Tensor | None:
+def _forward_inference_context(kwargs: dict[str, Any]) -> Any:
+    """Return the Megatron inference context/params from a TransformerLayer.forward
+    call, or ``None`` during training.
+
+    Megatron passes ``inference_context`` (or the deprecated ``inference_params``
+    alias) as a keyword during incremental decode / cached generation.  When it is
+    present, the seam only sees the query tokens as hidden_states, so the true KV
+    length is not Sq and a square dense bias would be wrong.
+    """
+
+    for key in ("inference_context", "inference_params"):
+        value = kwargs.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _graph_attention_bias_for_layer(
+    layer: Any, hidden_states: Any, inference_context: Any = None
+) -> torch.Tensor | None:
     if not graph_dense_bias_enabled():
         return None
 
@@ -164,6 +212,14 @@ def _graph_attention_bias_for_layer(layer: Any, hidden_states: Any) -> torch.Ten
     if int(getattr(getattr(layer, "config", None), "context_parallel_size", 1)) != 1:
         raise RuntimeError(
             "dense graph-route attention bias does not support context_parallel_size > 1 yet"
+        )
+    if inference_context is not None:
+        raise RuntimeError(
+            "dense graph-route attention bias only supports square self-attention "
+            "(Sq==Sk); TransformerLayer.forward received an inference/decode context "
+            f"({type(inference_context).__name__}) so the KV length cannot be derived "
+            f"from the query hidden_states [S={int(tensor.shape[0])},B={int(tensor.shape[1])}]"
+            " — not supported in incremental decode; use DSA graph top-k bias"
         )
 
     from cppmega.megatron.structure_dataset_patch import _get_current_structure_batch
@@ -216,7 +272,9 @@ def apply_graph_route_attention_bias_patch(*, force: bool = False) -> bool:
                     "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS=1 but TransformerLayer.forward "
                     "received no hidden_states"
                 )
-            bias = _graph_attention_bias_for_layer(self, hidden_states)
+            bias = _graph_attention_bias_for_layer(
+                self, hidden_states, _forward_inference_context(kwargs)
+            )
             if bias is not None:
                 kwargs["attention_bias"] = bias
         return existing(self, *args, **kwargs)

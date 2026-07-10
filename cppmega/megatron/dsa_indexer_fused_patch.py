@@ -166,6 +166,60 @@ def _as_batched_edge_triples(
     return edges.to(device=device, dtype=torch.long), counts.to(device=device, dtype=torch.long)
 
 
+def _scatter_edges_(
+    bias: torch.Tensor,
+    edges: torch.Tensor,
+    counts: torch.Tensor,
+    *,
+    weight: float,
+    sq: int,
+    sk: int,
+    require_kind: bool,
+) -> None:
+    """Add ``weight`` at each declared edge's ``(src,dst)`` in ``bias`` [B,Sq,Sk].
+
+    Fully vectorized: no per-sample Python loop and a SINGLE device sync (the
+    validity check), instead of ~2*B host syncs per relation-kind per layer — real
+    runs use micro-batch up to 192, so the old loop stalled the GPU thousands of
+    times per step. ``counts[b]`` is the number of declared edges for sample ``b``
+    (rest is padding); ``require_kind`` also requires ``edges[...,2] >= 0`` (triples).
+    Duplicate ``(b,src,dst)`` accumulate via index_add_, identical to the old
+    per-sample ``+=`` for the normal unique-edge case.
+    """
+    if weight == 0.0:
+        return
+    batch = int(bias.shape[0])
+    max_edges = int(edges.shape[1])
+    if max_edges == 0:
+        return
+    if int(edges.shape[0]) == 1 and batch > 1:
+        edges = edges.expand(batch, -1, -1)
+    if int(counts.shape[0]) == 1 and batch > 1:
+        counts = counts.expand(batch)
+    counts = counts.to(torch.long).clamp(min=0, max=max_edges)  # [B]; non-inplace, do not mutate caller
+    active = torch.arange(max_edges, device=edges.device)[None, :] < counts[:, None]  # [B,max_edges]
+    src = edges[..., 0]
+    dst = edges[..., 1]
+    in_range = (src >= 0) & (src < sq) & (dst >= 0) & (dst < sk)
+    if require_kind:
+        in_range = in_range & (edges[..., 2] >= 0)
+    bad = active & ~in_range
+    # RULE #1: a declared (active) edge out of range is corrupt graph metadata,
+    # not padding -> raise, don't drop. One sync for the whole batch.
+    if bool(bad.any().item()):
+        bi, ei = torch.nonzero(bad, as_tuple=True)
+        sample = edges[bi[:8], ei[:8]].tolist()
+        raise ValueError(
+            f"[cppmega-graph] {int(bad.sum().item())} declared graph edges out of "
+            f"range for (sq={sq}, sk={sk}): {sample}"
+        )
+    bidx = torch.nonzero(active, as_tuple=True)[0]
+    s = src[active]
+    d = dst[active]
+    lin = (bidx * sq + s) * sk + d  # int64 (bidx is long) -> safe for large B*Sq*Sk
+    bias.view(-1).index_add_(0, lin, bias.new_full((int(lin.numel()),), float(weight)))
+
+
 def _scatter_relation_edges_(
     bias: torch.Tensor,
     edges: torch.Tensor,
@@ -175,23 +229,7 @@ def _scatter_relation_edges_(
     sq: int,
     sk: int,
 ) -> None:
-    if weight == 0.0:
-        return
-    batch_size = int(bias.shape[0])
-    max_edges = int(edges.shape[1])
-    for bi in range(batch_size):
-        edge_b = 0 if int(edges.shape[0]) == 1 else bi
-        count_b = 0 if int(counts.shape[0]) == 1 else bi
-        n = max(0, min(int(counts[count_b].item()), max_edges))
-        if n == 0:
-            continue
-        pairs = edges[edge_b, :n]
-        src = pairs[:, 0]
-        dst = pairs[:, 1]
-        valid = (src >= 0) & (src < sq) & (dst >= 0) & (dst < sk)
-        if not bool(valid.any().item()):
-            continue
-        bias[bi, src[valid], dst[valid]] += float(weight)
+    _scatter_edges_(bias, edges, counts, weight=weight, sq=sq, sk=sk, require_kind=False)
 
 
 def _scatter_relation_edge_triples_(
@@ -203,24 +241,7 @@ def _scatter_relation_edge_triples_(
     sq: int,
     sk: int,
 ) -> None:
-    if weight == 0.0:
-        return
-    batch_size = int(bias.shape[0])
-    max_edges = int(edges.shape[1])
-    for bi in range(batch_size):
-        edge_b = 0 if int(edges.shape[0]) == 1 else bi
-        count_b = 0 if int(counts.shape[0]) == 1 else bi
-        n = max(0, min(int(counts[count_b].item()), max_edges))
-        if n == 0:
-            continue
-        triples = edges[edge_b, :n]
-        src = triples[:, 0]
-        dst = triples[:, 1]
-        kind = triples[:, 2]
-        valid = (src >= 0) & (src < sq) & (dst >= 0) & (dst < sk) & (kind >= 0)
-        if not bool(valid.any().item()):
-            continue
-        bias[bi, src[valid], dst[valid]] += float(weight)
+    _scatter_edges_(bias, edges, counts, weight=weight, sq=sq, sk=sk, require_kind=True)
 
 
 def build_graph_route_bias_from_structure_batch(
