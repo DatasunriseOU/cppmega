@@ -198,6 +198,18 @@ def test_scatter_edges_raises_on_count_out_of_range():
         _scatter_edges_(torch.zeros(1, 4, 4), edges, torch.tensor([-1]), weight=1.0, sq=4, sk=4, require_kind=False)
 
 
+def test_scatter_edges_raises_on_declared_edges_with_zero_slots():
+    from cppmega.megatron.dsa_indexer_fused_patch import _scatter_edges_
+
+    edges = torch.zeros(1, 0, 2, dtype=torch.long)  # zero edge slots
+    with pytest.raises(ValueError, match="out of range"):
+        _scatter_edges_(torch.zeros(1, 4, 4), edges, torch.tensor([1]), weight=1.0, sq=4, sk=4, require_kind=False)
+    # all-zero counts with zero slots is a legit no-op (must not raise)
+    bias = torch.zeros(1, 4, 4)
+    _scatter_edges_(bias, edges, torch.tensor([0]), weight=1.0, sq=4, sk=4, require_kind=False)
+    assert float(bias.sum()) == 0.0
+
+
 def test_graph_route_bias_raises_on_out_of_range_edge():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     structure_batch = {

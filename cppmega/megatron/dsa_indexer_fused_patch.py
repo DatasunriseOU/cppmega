@@ -190,8 +190,6 @@ def _scatter_edges_(
         return
     batch = int(bias.shape[0])
     max_edges = int(edges.shape[1])
-    if max_edges == 0:
-        return
     if int(edges.shape[0]) == 1 and batch > 1:
         edges = edges.expand(batch, -1, -1)
     if int(counts.shape[0]) == 1 and batch > 1:
@@ -205,6 +203,8 @@ def _scatter_edges_(
         raise ValueError(
             f"[cppmega-graph] edge counts out of range [0,{max_edges}]: {bad}"
         )
+    if max_edges == 0:
+        return  # validated above: with 0 edge slots every declared count must be 0
     active = torch.arange(max_edges, device=edges.device)[None, :] < counts[:, None]  # [B,max_edges]
     src = edges[..., 0]
     dst = edges[..., 1]
