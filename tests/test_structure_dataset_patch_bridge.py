@@ -48,6 +48,21 @@ def test_safe_sidecar_path_allows_plain_relative_and_blocks_escape():
             patch._safe_sidecar_path(base, evil, col="c", field="path", json_path="m.json")
 
 
+def test_safe_sidecar_path_blocks_symlink_escape(tmp_path):
+    base = tmp_path / "dataset"
+    base.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.bin").write_bytes(b"x")
+    (base / "link").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        patch._safe_sidecar_path(str(base), "link/secret.bin", col="c", field="path", json_path="m.json")
+    (base / "ok.bin").write_bytes(b"y")
+    assert patch._safe_sidecar_path(
+        str(base), "ok.bin", col="c", field="path", json_path="m.json"
+    ).endswith("ok.bin")
+
+
 def test_build_graph_route_tensors_offsets_caps_and_clips():
     graph_sidecars = {
         "token_call_edges": {

@@ -179,6 +179,15 @@ def _safe_sidecar_path(
             f"[cppmega-patch] {field} for {col!r} escapes the sidecar dir: "
             f"{rel_path!r} -> {joined!r} (base {base_norm!r}) in {json_path!r}"
         )
+    # Symlink-safe containment: a symlink INSIDE base_dir could still point outside
+    # it, bypassing the lexical check above. Resolve real paths and re-verify.
+    real = os.path.realpath(joined)
+    real_base = os.path.realpath(base_dir)
+    if real != real_base and not real.startswith(real_base + os.sep):
+        raise ValueError(
+            f"[cppmega-patch] {field} for {col!r} resolves outside the sidecar dir via a "
+            f"symlink: {rel_path!r} -> {real!r} (base {real_base!r}) in {json_path!r}"
+        )
     return joined
 
 
