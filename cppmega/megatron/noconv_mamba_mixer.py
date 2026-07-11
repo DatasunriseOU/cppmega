@@ -311,18 +311,35 @@ class Mamba3ScanMixin:
             B = B + self.B_bias
             C = C + self.C_bias
 
-        # --- Trapezoidal discretisation: scale B ---
+        # --- Trapezoidal discretisation: scale B (per head) ---
         if trap is not None:
             dt_for_trap = F.softplus(dd_dt + dt_bias)  # (b, l, h)
-            scale = _compute_trapezoidal_scale(dt_for_trap, trap)  # (b, l, h)
-            # Expand from nheads to ngroups
+            scale = _compute_trapezoidal_scale(dt_for_trap, trap)  # (b, l, h) per head
             ngroups = B.shape[2]
             nheads = scale.shape[2]
-            heads_per_group = nheads // ngroups
-            scale_g = scale.reshape(
-                scale.shape[0], scale.shape[1], ngroups, heads_per_group,
-            ).mean(dim=-1)  # (b, l, ngroups)
-            B = B * scale_g.unsqueeze(-1)
+            if nheads % ngroups != 0:
+                raise RuntimeError(
+                    f"noconv trapezoidal: nheads={nheads} not divisible by ngroups={ngroups}"
+                )
+            if ngroups == nheads:
+                B = B * scale.unsqueeze(-1)
+            else:
+                # The trapezoidal factor is PER HEAD; averaging it across the heads
+                # that share a B/C group (the old `.mean(dim=-1)`) changed the
+                # discretisation. Expand grouped B/C to per-head so each head keeps
+                # its own factor (downstream SSD then runs with ngroups == nheads).
+                heads_per_group = nheads // ngroups
+                B = (
+                    B.unsqueeze(3)
+                    .expand(B.shape[0], B.shape[1], ngroups, heads_per_group, B.shape[-1])
+                    .reshape(B.shape[0], B.shape[1], nheads, B.shape[-1])
+                )
+                C = (
+                    C.unsqueeze(3)
+                    .expand(C.shape[0], C.shape[1], ngroups, heads_per_group, C.shape[-1])
+                    .reshape(C.shape[0], C.shape[1], nheads, C.shape[-1])
+                )
+                B = B * scale.unsqueeze(-1)
 
         # --- RoPE on B and C along state dimension ---
         if angles is not None:
