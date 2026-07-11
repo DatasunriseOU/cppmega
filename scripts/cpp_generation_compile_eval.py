@@ -49,6 +49,10 @@ class CppGenerationCase:
         for key in ("task_id", "prompt", "source_prefix", "source_suffix"):
             if not isinstance(row.get(key), str) or not row[key]:
                 raise ValueError(f"case row needs non-empty string field {key!r}")
+        # task_id is used as a filesystem path component (work_root / task_id), so it
+        # must be a single safe name — reject separators / traversal / absolute paths.
+        if Path(row["task_id"]).name != row["task_id"] or row["task_id"] in {".", ".."}:
+            raise ValueError(f"task_id must be a plain filename (no path separators): {row['task_id']!r}")
         language = str(row.get("language", "cpp"))
         if language not in {"c", "cpp", "c++", "cc"}:
             raise ValueError(f"{row['task_id']}: unsupported language {language!r}")

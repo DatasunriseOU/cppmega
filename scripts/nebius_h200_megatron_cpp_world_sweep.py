@@ -591,7 +591,10 @@ def remote_run_script(
             "total_memory_gib": torch.cuda.get_device_properties(0).total_memory / 1024**3,
         }}
         print("CPPMEGA_STACK_REPORT=" + json.dumps(report, sort_keys=True), flush=True)
-        assert report["megatron.core.utils.get_batch_on_this_tp_rank"], report
+        if not report["megatron.core.utils.get_batch_on_this_tp_rank"]:
+            raise RuntimeError(
+                "cppmega stack: get_batch_on_this_tp_rank patch missing: " + json.dumps(report)
+            )
         PY
 
         TEST_SPECS=(

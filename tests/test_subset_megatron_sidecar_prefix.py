@@ -46,6 +46,37 @@ def _write_graph_sidecar(
     }
 
 
+def test_safe_src_blocks_traversal_and_symlink(tmp_path: Path):
+    module = _load_module()
+    base = tmp_path / "ds"
+    base.mkdir()
+    (base / "ok.bin").write_bytes(b"x")
+    assert module._safe_src(base, "ok.bin").name == "ok.bin"
+    with pytest.raises(ValueError, match="escapes"):
+        module._safe_src(base, "../../etc/passwd")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "s.bin").write_bytes(b"y")
+    (base / "link").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="escapes"):
+        module._safe_src(base, "link/s.bin")
+
+
+def test_create_subset_respects_max_tokens_no_overshoot(tmp_path: Path):
+    import json
+
+    module = _load_module()
+    src = tmp_path / "src"
+    module._write_mmididx(src.with_suffix(".idx"), 8, np.array([100, 100, 100], dtype=np.int64))
+    np.arange(300, dtype=np.uint16).tofile(src.with_suffix(".bin"))
+    src.with_suffix(".json").write_text('{"token_count": 300, "document_count": 3}')
+    dst = tmp_path / "dst"
+    module.create_subset(src, dst, max_tokens=200, max_docs=None)
+    m = json.loads(dst.with_suffix(".json").read_text())
+    assert m["document_count"] == 2  # old `+1` overshot to 3 docs / 300 tokens
+    assert m["token_count"] == 200
+
+
 def test_correct_manifest_passes(tmp_path: Path):
     module = _load_module()
     src_base = tmp_path / "src"

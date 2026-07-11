@@ -70,6 +70,19 @@ def _copy_token_aligned_file(src: Path, dst: Path, dtype: np.dtype, items: int) 
             remaining -= len(chunk)
 
 
+def _safe_src(base_dir: Path, rel: str) -> Path:
+    """Resolve a manifest-supplied relative sidecar path under base_dir, refusing
+    absolute paths and ``..``/symlink escapes. The manifest is data, not code, so a
+    traversal must fail loud rather than read/copy an arbitrary file."""
+    resolved = (base_dir / rel).resolve()
+    base = base_dir.resolve()
+    if resolved != base and not resolved.is_relative_to(base):
+        raise ValueError(
+            f"[subset] manifest sidecar path {rel!r} escapes {base}: -> {resolved}"
+        )
+    return resolved
+
+
 def _copy_graph_sidecar(
     *,
     src_base: Path,
@@ -82,7 +95,9 @@ def _copy_graph_sidecar(
     dtype = np.dtype(str(src_manifest_entry["dtype"]))
     shape_tail = tuple(int(x) for x in src_manifest_entry.get("shape_tail", []))
 
-    src_offsets = np.memmap(src_base.parent / str(src_manifest_entry["offsets_path"]), mode="r", dtype=offset_dtype)
+    src_offsets = np.memmap(
+        _safe_src(src_base.parent, str(src_manifest_entry["offsets_path"])), mode="r", dtype=offset_dtype
+    )
     if len(src_offsets) < document_count + 1:
         raise ValueError(
             f"{src_manifest_entry['offsets_path']} has {len(src_offsets)} offsets, "
@@ -98,7 +113,7 @@ def _copy_graph_sidecar(
 
     declared_item_count = int(src_manifest_entry["item_count"])
     row_elems = int(np.prod(shape_tail)) if shape_tail else 1
-    src_data_path = src_base.parent / str(src_manifest_entry["data_path"])
+    src_data_path = _safe_src(src_base.parent, str(src_manifest_entry["data_path"]))
     expected_bytes = declared_item_count * row_elems * dtype.itemsize
     actual_bytes = src_data_path.stat().st_size
     if actual_bytes != expected_bytes:
@@ -133,7 +148,10 @@ def create_subset(src_prefix: Path, dst_prefix: Path, *, max_tokens: int, max_do
     token_dtype = _DTYPE_BY_CODE[dtype_code]
 
     cumulative = np.cumsum(sizes, dtype=np.int64)
-    doc_count = int(np.searchsorted(cumulative, max_tokens, side="right") + 1)
+    # Largest doc prefix whose cumulative token total is <= max_tokens. searchsorted
+    # with side="right" already returns that count; a trailing +1 overshot the cap by
+    # a whole document (e.g. sizes=[100,100,100], max_tokens=200 -> 3 docs / 300 tokens).
+    doc_count = int(np.searchsorted(cumulative, max_tokens, side="right"))
     if max_docs is not None:
         doc_count = min(doc_count, max_docs)
     doc_count = min(doc_count, len(sizes))
@@ -162,7 +180,9 @@ def create_subset(src_prefix: Path, dst_prefix: Path, *, max_tokens: int, max_do
         dtype = np.dtype(str(entry["dtype"]))
         src_name = str(entry["path"])
         dst_name = f"{dst_prefix.name}_{column}.bin"
-        _copy_token_aligned_file(src_prefix.parent / src_name, dst_prefix.parent / dst_name, dtype, token_count)
+        _copy_token_aligned_file(
+            _safe_src(src_prefix.parent, src_name), dst_prefix.parent / dst_name, dtype, token_count
+        )
         side_paths[column] = {"path": dst_name, "dtype": str(entry["dtype"])}
     dst_manifest["side_channel_paths"] = side_paths
 

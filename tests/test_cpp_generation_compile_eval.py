@@ -138,6 +138,14 @@ def test_c_language_case_uses_c_compiler(tmp_path: Path) -> None:
     assert report["summary"]["c_compiler"] == "clang"
 
 
+def test_from_json_rejects_task_id_path_traversal() -> None:
+    module = _load_module()
+    with pytest.raises(ValueError, match="plain filename"):
+        module.CppGenerationCase.from_json(
+            {"task_id": "../../pwn", "prompt": "p", "source_prefix": "a", "source_suffix": "b"}
+        )
+
+
 def test_evaluate_suite_rejects_nonpositive_jobs() -> None:
     module = _load_module()
     with pytest.raises(ValueError, match="jobs must be"):
