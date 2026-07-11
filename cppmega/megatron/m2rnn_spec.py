@@ -151,6 +151,20 @@ class CppMegaM2RNNMixer(nn.Module):
             self.num_g_heads,
             self.num_weight_heads,
         )
+        for _name, _count in (
+            ("m2rnn_num_q_heads", self.num_q_heads),
+            ("m2rnn_num_k_heads", self.num_k_heads),
+            ("m2rnn_num_v_heads", self.num_v_heads),
+            ("m2rnn_num_f_heads", self.num_f_heads),
+            ("m2rnn_num_g_heads", self.num_g_heads),
+            ("m2rnn_num_weight_heads", self.num_weight_heads),
+        ):
+            if self.num_heads % _count != 0:
+                raise ValueError(
+                    f"CppMegaM2RNNMixer.__init__: {_name}={_count} does not divide "
+                    f"num_heads={self.num_heads}; repeat_interleave head broadcast "
+                    "would floor-divide and silently corrupt head alignment."
+                )
 
         self.q_dim = self.num_q_heads * self.k_head_dim
         self.k_dim = self.num_k_heads * self.k_head_dim
@@ -243,11 +257,17 @@ class CppMegaM2RNNMixer(nn.Module):
         v_start = k_start + self.k_dim
         v = conv_input[..., v_start : v_start + self.v_dim].view(batch, seq, self.num_v_heads, self.v_head_dim)
 
-        if (
-            self.kernel_choice == "triton"
-            and _M2RNN_TRITON_AVAILABLE
-            and q.is_cuda
-        ):
+        if self.kernel_choice == "triton":
+            if not (_M2RNN_TRITON_AVAILABLE and q.is_cuda):
+                raise RuntimeError(
+                    "CppMegaM2RNNMixer.forward: m2rnn_kernel='triton' but the "
+                    "fused Triton M²RNN kernel is unavailable "
+                    f"(_M2RNN_TRITON_AVAILABLE={_M2RNN_TRITON_AVAILABLE}, "
+                    f"q.is_cuda={q.is_cuda}). Refusing to silently fall back to "
+                    "the ~460× slower Python scan; install Triton on a CUDA host "
+                    "or set m2rnn_kernel='torch' (CPPMEGA_M2RNN_KERNEL=torch) to "
+                    "select the reference path explicitly."
+                )
             out, _ = _m2rnn_scan_triton(
                 q=q,
                 k=k,

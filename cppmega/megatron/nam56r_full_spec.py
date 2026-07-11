@@ -69,8 +69,13 @@ def _clone_attention_variant_config(config, *, experimental_attention_variant):
     cloned = copy.copy(config)
     try:
         cloned.experimental_attention_variant = experimental_attention_variant
-    except AttributeError:
-        return config
+    except AttributeError as exc:
+        raise AttributeError(
+            f"_clone_attention_variant_config: cannot set "
+            f"experimental_attention_variant={experimental_attention_variant!r} on config "
+            f"of type {type(config).__name__!r}; required to build the correct MLA/DSA "
+            f"attention variant"
+        ) from exc
     return cloned
 
 

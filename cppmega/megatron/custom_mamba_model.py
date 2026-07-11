@@ -6,8 +6,16 @@ import os
 
 try:
     from megatron.core.models.mamba.mamba_model import MambaModel
-except ModuleNotFoundError:  # local macOS/dev environments without Megatron checkout
-    MambaModel = object  # type: ignore[assignment]
+except ModuleNotFoundError as exc:  # local macOS/dev environments without Megatron checkout
+    _MEGATRON_IMPORT_ERROR = exc
+
+    class MambaModel:  # type: ignore[no-redef]
+        """Placeholder so this module stays importable without a Megatron
+        checkout; constructing CppMegaMambaModel fails loud with the original
+        ImportError instead of silently subclassing ``object``."""
+
+        def __init__(self, *args, **kwargs):
+            raise _MEGATRON_IMPORT_ERROR
 
 from cppmega.megatron.custom_embedding import CppMegaLanguageModelEmbedding
 from cppmega.megatron.fastmtp_layer import (

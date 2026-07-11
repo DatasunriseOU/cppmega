@@ -23,6 +23,7 @@ from cppmega.megatron.nam56r_layout import (
     FULL_NAM56R_DEPTH,
     FULL_NAM56R_PATTERN,
     has_megatron_dsa_symbol,
+    load_dsa_a_layer_ranks,
     load_r_layer_indices,
 )
 
@@ -110,9 +111,29 @@ def build_cppmega_nam56r_te_stack_spec(config):
     # PR #3553 adds 'dsa_layer' field to MambaStackSubmodules.
     # Provide the upstream DSA layer spec (or attention_layer as fallback)
     # when available, so 'D' layers are correctly routed.
+    dsa_a_layer_ranks = load_dsa_a_layer_ranks()
     if has_megatron_dsa_symbol():
+        # FAIL LOUD: if DSA is actually requested but upstream has no dsa_layer
+        # spec, refuse to silently route 'D' layers through dense attention.
+        if dsa_a_layer_ranks and getattr(upstream, "dsa_layer", None) is None:
+            raise RuntimeError(
+                "build_cppmega_nam56r_te_stack_spec: DSA requested via "
+                f"CPPMEGA_DSA_A_LAYER_RANKS={dsa_a_layer_ranks} but upstream "
+                "mamba_stack_spec provides no dsa_layer spec; refusing to "
+                "silently map DSA 'D' layers to dense attention. Use "
+                "nam56r_full_spec for DSA support."
+            )
         submodules_kwargs["dsa_layer"] = getattr(
             upstream, "dsa_layer", upstream.attention_layer
+        )
+    elif dsa_a_layer_ranks:
+        # FAIL LOUD: DSA ranks requested but Megatron lacks PR #3553's
+        # DS_ATTENTION symbol, so 'D' layers cannot be routed at all.
+        raise RuntimeError(
+            "build_cppmega_nam56r_te_stack_spec: DSA ranks requested via "
+            f"CPPMEGA_DSA_A_LAYER_RANKS={dsa_a_layer_ranks} but Megatron lacks "
+            "the PR #3553 DS_ATTENTION symbol (has_megatron_dsa_symbol() is "
+            "False); cannot route 'D' layers."
         )
 
     return ModuleSpec(

@@ -88,6 +88,11 @@ class AuthorMamba3Mixer(nn.Module):
             dtype=config.params_dtype,
         )
 
+        if layer_number is not None and layer_number < 1:
+            raise ValueError(
+                f"AuthorMamba3Mixer requires a 1-based layer_number >= 1, got {layer_number}"
+            )
+
         self.mixer = Mamba3(
             d_model=author_config.d_model,
             d_state=author_config.d_state,
@@ -103,7 +108,7 @@ class AuthorMamba3Mixer(nn.Module):
             is_mimo=author_config.is_mimo,
             mimo_rank=author_config.mimo_rank,
             chunk_size=author_config.chunk_size,
-            layer_idx=None if layer_number is None else max(layer_number - 1, 0),
+            layer_idx=None if layer_number is None else layer_number - 1,
             n_layer=getattr(config, "num_layers", None),
             device=device,
             dtype=config.params_dtype,
