@@ -57,8 +57,12 @@ def sparse_absorbed_dsa_fn(
     # topk_indices: [b, sq, topk]
     # k_flat: [b, sk, hn]
     # We want k_sparse: [b, sq, topk, hn]
-    # Clamp indices to valid range (indexer may produce out-of-range values
-    # for padded/masked positions).
+    # The indexer emits out-of-range indices (e.g. -1 or >= sk) for padded/masked
+    # selections. Clamp ONLY so the gather stays in-bounds, but remember which
+    # entries were invalid so we can mask them to -inf before softmax (below).
+    # Otherwise a padded selection silently attends to token 0 (RULE #1: a padded
+    # selection must contribute zero, not real-token attention).
+    invalid_select_mask = (topk_indices < 0) | (topk_indices >= sk)  # [b, sq, topk]
     topk_indices = topk_indices.clamp(0, sk - 1)
     batch_idx = torch.arange(b, device=key.device).view(b, 1, 1).expand_as(topk_indices)
     k_sparse = k_flat[batch_idx, topk_indices]  # [b, sq, topk, hn]
@@ -89,6 +93,10 @@ def sparse_absorbed_dsa_fn(
     sq_positions = torch.arange(sq, device=q.device, dtype=topk_indices.dtype)
     future_mask = topk_indices > sq_positions.view(1, -1, 1)  # [b, sq, topk]
     scores.masked_fill_(future_mask.unsqueeze(1), float("-inf"))
+    # Padded/invalid indexer selections were clamped to token 0 for the gather;
+    # mask them out here so they receive zero softmax weight instead of attending
+    # to a real token. (The query's own position is always valid, so no all-inf row.)
+    scores.masked_fill_(invalid_select_mask.unsqueeze(1), float("-inf"))
 
     # Softmax over topk dim
     attn_w = F.softmax(scores, dim=-1, dtype=torch.float32)

@@ -67,6 +67,22 @@ class CppMegaMambaModel(MambaModel):
             # synchronized at startup.
             if hasattr(self, "embedding") and self.embedding is not None:
                 self._fastmtp.tie_word_embeddings(self.embedding)
+            elif (
+                getattr(getattr(self, "output_layer", None), "weight", None) is not None
+                and getattr(self.config, "share_embeddings_and_output_weights", False)
+            ):
+                # PP>1 last stage has no embedding but owns the shared output weight,
+                # which IS the tied input embedding under
+                # share_embeddings_and_output_weights. Tie FastMTP to it instead of
+                # silently training an independent untied copy (RULE #1).
+                self._fastmtp.word_embeddings.weight = self.output_layer.weight
+            else:
+                raise RuntimeError(
+                    "FastMTP is enabled but its word embeddings cannot be tied on this "
+                    "stage: no self.embedding and no shared self.output_layer.weight "
+                    "(share_embeddings_and_output_weights). Refusing to silently train "
+                    "an untied FastMTP embedding."
+                )
 
         # Diagnostic: confirm the cppmega feature params are REGISTERED in the
         # model param tree (and thus visible to Megatron's optimizer/count). If

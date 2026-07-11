@@ -118,7 +118,18 @@ class AuthorMamba3Mixer(nn.Module):
         # instead of upstream _Mamba3Function.  Same TileLang kernels, but
         # controlled saved-tensor lifecycle and fp32 param enforcement.
         import mamba_ssm.modules.mamba3 as _m3_mod
-        _m3_mod.mamba3_mimo_combined = cppmega_tilelang_mimo_combined
+        # This patches a PROCESS-GLOBAL module attribute. Guard it so a second,
+        # DIFFERENT patch (another model wanting a different MIMO fn in the same
+        # process) fails loud instead of silently clobbering ours.
+        _current = getattr(_m3_mod, "mamba3_mimo_combined", None)
+        if _current is not cppmega_tilelang_mimo_combined:
+            if getattr(_current, "__cppmega_mimo_patched__", False):
+                raise RuntimeError(
+                    "mamba_ssm.modules.mamba3.mamba3_mimo_combined was already patched "
+                    "by a different cppmega MIMO function; refusing to clobber it"
+                )
+            cppmega_tilelang_mimo_combined.__cppmega_mimo_patched__ = True
+            _m3_mod.mamba3_mimo_combined = cppmega_tilelang_mimo_combined
 
     def forward(
         self,
