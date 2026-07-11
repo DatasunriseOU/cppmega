@@ -117,10 +117,15 @@ def test_dense_graph_attention_bias_builds_at_max_seq(monkeypatch):
 
 def test_forward_inference_context_detects_context_and_params():
     ctx = object()
-    assert _forward_inference_context({}) is None
-    assert _forward_inference_context({"inference_context": None}) is None
-    assert _forward_inference_context({"inference_context": ctx}) is ctx
-    assert _forward_inference_context({"inference_params": ctx}) is ctx
+    names = ["self", "hidden_states", "attention_mask", "inference_context", "inference_params"]
+    # keyword forms
+    assert _forward_inference_context(names, (), {}) is None
+    assert _forward_inference_context(names, (), {"inference_context": None}) is None
+    assert _forward_inference_context(names, (), {"inference_context": ctx}) is ctx
+    assert _forward_inference_context(names, (), {"inference_params": ctx}) is ctx
+    # POSITIONAL form: inference_context is signature index 3 -> args index 2 (self dropped)
+    assert _forward_inference_context(names, ("hs", "mask", ctx), {}) is ctx
+    assert _forward_inference_context(names, ("hs", "mask"), {}) is None
 
 
 def test_dense_graph_attention_bias_raises_in_incremental_decode(monkeypatch):

@@ -196,7 +196,15 @@ def _scatter_edges_(
         edges = edges.expand(batch, -1, -1)
     if int(counts.shape[0]) == 1 and batch > 1:
         counts = counts.expand(batch)
-    counts = counts.to(torch.long).clamp(min=0, max=max_edges)  # [B]; non-inplace, do not mutate caller
+    counts = counts.to(torch.long)  # non-inplace; not mutated below, so caller's tensor is safe
+    # RULE #1: a declared count outside [0, max_edges] is corrupt sidecar metadata
+    # (the padded edge tensor has exactly max_edges slots) -> raise, don't clamp it
+    # into a valid-looking-but-wrong graph.
+    if bool(((counts < 0) | (counts > max_edges)).any().item()):
+        bad = counts[(counts < 0) | (counts > max_edges)][:8].tolist()
+        raise ValueError(
+            f"[cppmega-graph] edge counts out of range [0,{max_edges}]: {bad}"
+        )
     active = torch.arange(max_edges, device=edges.device)[None, :] < counts[:, None]  # [B,max_edges]
     src = edges[..., 0]
     dst = edges[..., 1]

@@ -10,6 +10,7 @@ Engine as a post-scale bias.  This module installs that path fail-closed.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from typing import Any
@@ -165,20 +166,27 @@ def _hidden_shape_tensor(hidden_states: Any) -> torch.Tensor:
     return tensor
 
 
-def _forward_inference_context(kwargs: dict[str, Any]) -> Any:
-    """Return the Megatron inference context/params from a TransformerLayer.forward
-    call, or ``None`` during training.
+def _forward_inference_context(param_names: list[str], args: tuple, kwargs: dict) -> Any:
+    """Return Megatron's inference/decode context from a TransformerLayer.forward
+    call (passed by keyword OR positionally), or ``None`` during training.
 
     Megatron passes ``inference_context`` (or the deprecated ``inference_params``
-    alias) as a keyword during incremental decode / cached generation.  When it is
-    present, the seam only sees the query tokens as hidden_states, so the true KV
-    length is not Sq and a square dense bias would be wrong.
+    alias) during incremental decode / cached generation. When present, the seam
+    only sees the query tokens as hidden_states, so the true KV length is not Sq and
+    a square dense bias would be wrong. ``param_names`` is
+    ``signature(TransformerLayer.forward).parameters`` including ``self`` at index 0;
+    the wrapper receives ``self`` separately, so a parameter at signature index ``i``
+    sits at ``args[i-1]`` when passed positionally.
     """
 
     for key in ("inference_context", "inference_params"):
         value = kwargs.get(key)
         if value is not None:
             return value
+        if key in param_names:
+            ai = param_names.index(key) - 1  # drop leading 'self'
+            if 0 <= ai < len(args) and args[ai] is not None:
+                return args[ai]
     return None
 
 
@@ -259,6 +267,8 @@ def apply_graph_route_attention_bias_patch(*, force: bool = False) -> bool:
         log.info("cppmega graph-route attention bias patch already applied")
         return True
 
+    _forward_param_names = list(inspect.signature(existing).parameters)
+
     def _forward_with_graph_route_bias(self, *args, **kwargs):
         if kwargs.get("attention_bias") is None and graph_dense_bias_enabled():
             if "hidden_states" in kwargs:
@@ -273,7 +283,7 @@ def apply_graph_route_attention_bias_patch(*, force: bool = False) -> bool:
                     "received no hidden_states"
                 )
             bias = _graph_attention_bias_for_layer(
-                self, hidden_states, _forward_inference_context(kwargs)
+                self, hidden_states, _forward_inference_context(_forward_param_names, args, kwargs)
             )
             if bias is not None:
                 kwargs["attention_bias"] = bias

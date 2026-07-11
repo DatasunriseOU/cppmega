@@ -188,6 +188,16 @@ def test_scatter_edges_vectorized_matches_reference_loop():
     assert bias_b[:, 0, 1].tolist() == [1.0] * 4 and bias_b[:, 2, 3].tolist() == [1.0] * 4
 
 
+def test_scatter_edges_raises_on_count_out_of_range():
+    from cppmega.megatron.dsa_indexer_fused_patch import _scatter_edges_
+
+    edges = torch.tensor([[[0, 1]]], dtype=torch.long)  # max_edges = 1
+    with pytest.raises(ValueError, match="out of range"):
+        _scatter_edges_(torch.zeros(1, 4, 4), edges, torch.tensor([5]), weight=1.0, sq=4, sk=4, require_kind=False)
+    with pytest.raises(ValueError, match="out of range"):
+        _scatter_edges_(torch.zeros(1, 4, 4), edges, torch.tensor([-1]), weight=1.0, sq=4, sk=4, require_kind=False)
+
+
 def test_graph_route_bias_raises_on_out_of_range_edge():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     structure_batch = {
