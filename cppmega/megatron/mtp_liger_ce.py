@@ -168,29 +168,37 @@ def patch_mtp_loss_with_liger():
             # unchanged byte-for-byte.  sum(broadcast * mask) = mean * mask.sum
             # which == sum(per_token_CE) when mask is binary {0,1} and
             # ignore_index pre-zeroed the masked positions.
-            target_1d_masked = torch.where(
-                loss_mask.transpose(0, 1).reshape(-1).bool(),
-                target_1d,
-                target_1d.new_full(target_1d.shape, -100),
-            )
-            liger_loss_scalar, _, _ = LigerFusedLinearCrossEntropyFunction.apply(
-                h_2d,       # [s*b, h] bf16
-                w,          # [V, h] bf16
-                target_1d_masked,  # [s*b] int64 with -100 for masked
-                None,       # bias
-                None,       # ce_weight
-                -100,       # ignore_index
-                0.0,        # lse_square_scale
-                0.0,        # label_smoothing
-                "mean",     # reduction — NEVER "none" (Liger #968)
-                None,       # softcap
-                False,      # return_z_loss
-            )
+            if num_tokens == 0:
+                # All positions masked (e.g. a context-parallel rank / packed
+                # micro-batch with no valid tokens): Liger reduction="mean" over
+                # zero valid tokens is NaN, and `loss_mask(=0) * NaN == NaN` would
+                # poison the gradient. Contribute exactly zero instead (RULE #1: do
+                # not let a degenerate batch silently inject NaN).
+                mtp_loss = h_2d.new_zeros(b, s)
+            else:
+                target_1d_masked = torch.where(
+                    loss_mask.transpose(0, 1).reshape(-1).bool(),
+                    target_1d,
+                    target_1d.new_full(target_1d.shape, -100),
+                )
+                liger_loss_scalar, _, _ = LigerFusedLinearCrossEntropyFunction.apply(
+                    h_2d,       # [s*b, h] bf16
+                    w,          # [V, h] bf16
+                    target_1d_masked,  # [s*b] int64 with -100 for masked
+                    None,       # bias
+                    None,       # ce_weight
+                    -100,       # ignore_index
+                    0.0,        # lse_square_scale
+                    0.0,        # label_smoothing
+                    "mean",     # reduction — NEVER "none" (Liger #968)
+                    None,       # softcap
+                    False,      # return_z_loss
+                )
 
-            # Broadcast scalar to [b, s] so downstream loss_mask * mtp_loss
-            # and sum(.)/num_tokens compute the same value as a true
-            # per-token reduction.
-            mtp_loss = liger_loss_scalar.expand(b, s).contiguous()
+                # Broadcast scalar to [b, s] so downstream loss_mask * mtp_loss
+                # and sum(.)/num_tokens compute the same value as a true
+                # per-token reduction.
+                mtp_loss = liger_loss_scalar.expand(b, s).contiguous()
 
             # Apply loss mask (same as original)
             mtp_loss = loss_mask * mtp_loss
