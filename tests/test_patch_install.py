@@ -70,6 +70,12 @@ def test_bad_boolean_value_raises(monkeypatch):
         CppMegaFeatureConfig.from_env()
 
 
+def test_zero_graph_max_edges_raises(monkeypatch):
+    monkeypatch.setenv("CPPMEGA_GRAPH_MAX_EDGES", "0")
+    with pytest.raises(ValueError, match="GRAPH_MAX_EDGES must be positive"):
+        CppMegaFeatureConfig.from_env()
+
+
 def test_install_applies_in_canonical_order(monkeypatch):
     import cppmega.megatron.te_checkpoint_kwarg_patch as te
     import cppmega.megatron.dsa_indexer_fused_patch as dsa

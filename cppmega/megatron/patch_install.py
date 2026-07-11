@@ -138,10 +138,15 @@ class CppMegaFeatureConfig:
                 "CPPMEGA_DOMAIN_EMBEDDING_ENABLED=1 requires CPPMEGA_STRUCTURE_ENABLED=1 "
                 "(domain ids arrive as structure sidecars)"
             )
-        if self.graph_dense_max_seq <= 0:
-            raise ValueError(
-                f"CPPMEGA_GRAPH_DENSE_MAX_SEQ must be positive, got {self.graph_dense_max_seq}"
-            )
+        for name, value in (
+            ("CPPMEGA_GRAPH_DENSE_MAX_SEQ", self.graph_dense_max_seq),
+            ("CPPMEGA_GRAPH_MAX_EDGES", self.graph_max_edges),
+            ("CPPMEGA_GRAPH_MAX_CHUNKS", self.graph_max_chunks),
+            ("CPPMEGA_DOMAIN_BOTTLENECK_DIM", self.domain_bottleneck_dim),
+            ("CPPMEGA_STRUCTURE_BOTTLENECK_DIM", self.structure_bottleneck_dim),
+        ):
+            if value <= 0:
+                raise ValueError(f"{name} must be positive, got {value}")
 
 
 def install_cppmega_stack(config: CppMegaFeatureConfig | None = None) -> CppMegaFeatureConfig:
