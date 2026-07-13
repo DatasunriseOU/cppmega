@@ -148,6 +148,15 @@ def _pop_structure_batch(batch: Dict[str, torch.Tensor] | None) -> Dict[str, tor
         if col in batch
     }
     if structure_batch:
+        receipt_path = os.environ.get("CPPMEGA_H200_BATCH_RECEIPT")
+        if receipt_path:
+            from cppmega.megatron.h200_preflight import observe_production_batch
+
+            observe_production_batch(
+                batch=batch,
+                structure_batch=structure_batch,
+                receipt_path=receipt_path,
+            )
         _set_current_structure_batch(structure_batch)
         return structure_batch
     _set_current_structure_batch(None)

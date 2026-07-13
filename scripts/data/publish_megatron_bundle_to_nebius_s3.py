@@ -19,6 +19,8 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
+import struct
 import subprocess
 import tarfile
 import tempfile
@@ -28,6 +30,115 @@ from typing import Iterable
 DEFAULT_ENDPOINT = "https://storage.eu-north1.nebius.cloud"
 DEFAULT_BUCKET = "cppmega-sidecar-20260627"
 DEFAULT_PREFIX = "cppmega-megatron/macro-routes"
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+EXPECTED_BUNDLE_TOKENIZER_CONTRACT = "megacpp-vocab-65536"
+EXPECTED_PREFIX_TOKENIZER_CONTRACT = "megacpp"
+EXPECTED_VOCAB_SIZE = 65536
+EXPECTED_GRAPH_SIDECAR_SCHEMA = "cppmega_graph_routes_v2"
+EXPECTED_TOKENIZER_CORE_TOKENS = (
+    "<PAD>",
+    "<UNK>",
+    "<BOS>",
+    "<EOS>",
+    "<FIM_PREFIX>",
+    "<FIM_MIDDLE>",
+    "<FIM_SUFFIX>",
+    "<CODE_START>",
+    "<CODE_END>",
+    "<THINK_START>",
+    "<THINK_END>",
+    "<QUERY_TOOL>",
+    "<INDEX>",
+    "<DEBUG_CONTEXT>",
+    "<FILE_SEP>",
+    "<DIFF_START>",
+    "<DIFF_END>",
+    "<COMMENT_START>",
+    "<COMMENT_END>",
+    "<TOOL_RESULT>",
+    "<THINK_CODE>",
+    "<THINK_ERROR>",
+    "<THINK_FIX>",
+    "<THINK_VERIFY>",
+    "<THINK_PLAN>",
+    "<THINK_TRACE>",
+    "<SCRIPT_START>",
+    "<SCRIPT_END>",
+    "<SCRIPT_RESULT>",
+    "<COMPILE_START>",
+    "<COMPILE_END>",
+    "<COMPILE_OK>",
+    "<COMPILE_ERROR>",
+    "<TEST_START>",
+    "<TEST_END>",
+    "<TEST_PASS>",
+    "<TEST_FAIL>",
+    "<AST_NODE>",
+    "<SYMBOL_REF>",
+    "<TYPE_INFO>",
+    "<SCOPE_ENTER>",
+    "<SCOPE_EXIT>",
+    "<INCLUDE_CONTEXT>",
+    "<TEMPLATE_INST>",
+    "<OVERLOAD_SET>",
+    "<FIM_INSTRUCTION>",
+    "<SPACE>",
+    "<NL>",
+)
+TOKEN_INDEX_DTYPE_CODES = {
+    "uint8": 1,
+    "int32": 4,
+    "int64": 5,
+    "uint16": 8,
+}
+DTYPE_SIZES = {
+    "uint8": 1,
+    "uint16": 2,
+    "uint32": 4,
+    "int32": 4,
+    "int64": 8,
+}
+TOKEN_SIDECAR_DTYPES = {
+    "loss_mask": "uint8",
+    "doc_ids": "uint16",
+    "token_domain_ids": "uint16",
+    "token_role_ids": "uint16",
+    "token_entity_ids": "uint32",
+    "token_scope_ids": "uint32",
+    "token_confidence_ids": "uint8",
+    "token_structure_ids": "uint8",
+    "token_dep_levels": "uint16",
+    "token_ast_depth": "uint16",
+    "token_sibling_index": "uint16",
+    "token_ast_node_type": "uint16",
+    "token_symbol_ids": "uint32",
+    "token_call_targets": "uint32",
+    "token_type_refs": "uint32",
+    "token_def_use": "uint8",
+    "token_change_mask_pre": "uint8",
+    "token_change_mask_post": "uint8",
+}
+GRAPH_SIDECAR_SPECS = {
+    "token_call_edges": ("edge_pairs", "int32", [2]),
+    "token_type_edges": ("edge_pairs", "int32", [2]),
+    "token_domain_edges": ("edge_triples", "int32", [3]),
+    "token_build_edges": ("edge_triples", "int32", [3]),
+    "token_shell_edges": ("edge_triples", "int32", [3]),
+    "token_diagnostic_edges": ("edge_triples", "int32", [3]),
+    "token_cross_domain_edges": ("edge_triples", "int32", [3]),
+    "token_chunk_starts": ("ragged_1d", "uint32", [1]),
+    "token_chunk_ends": ("ragged_1d", "uint32", [1]),
+    "token_chunk_kinds": ("ragged_1d", "uint16", [1]),
+    "token_chunk_dep_levels": ("ragged_1d", "uint16", [1]),
+}
+REQUIRED_TOKEN_SIDECARS = set(TOKEN_SIDECAR_DTYPES)
+REQUIRED_GRAPH_SIDECARS = set(GRAPH_SIDECAR_SPECS)
+NONZERO_GRAPH_SIDECARS = {
+    "token_chunk_starts",
+    "token_chunk_ends",
+    "token_chunk_kinds",
+    "token_chunk_dep_levels",
+}
 
 
 def _sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
@@ -36,6 +147,33 @@ def _sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
         while chunk := fh.read(chunk_size):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _write_json_atomic(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    os.replace(temporary, path)
+
+
+def _canonical_artifact_records(records: Iterable[dict]) -> list[dict[str, object]]:
+    return [
+        {
+            "path": str(record["path"]),
+            "size": int(record["size"]),
+            "sha256": str(record["sha256"]),
+        }
+        for record in sorted(records, key=lambda item: str(item["path"]))
+    ]
+
+
+def _artifact_set_sha256(records: Iterable[dict]) -> str:
+    payload = json.dumps(
+        _canonical_artifact_records(records), separators=(",", ":"), sort_keys=True
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _load_env_file(path: Path) -> None:
@@ -63,7 +201,13 @@ def _s3_env() -> dict[str, str]:
 
 def _safe_artifact_path(bundle: Path, relative: str) -> Path:
     posix = PurePosixPath(relative)
-    if posix.is_absolute() or ".." in posix.parts:
+    if (
+        not relative
+        or "\\" in relative
+        or posix.is_absolute()
+        or any(part in ("", ".", "..") for part in posix.parts)
+        or posix.as_posix() != relative
+    ):
         raise ValueError(f"unsafe artifact path in bundle manifest: {relative!r}")
     path = (bundle / Path(*posix.parts)).resolve()
     root = bundle.resolve()
@@ -72,11 +216,420 @@ def _safe_artifact_path(bundle: Path, relative: str) -> Path:
     return path
 
 
+def _require_manifest_tokenizer_contract(manifest: dict) -> None:
+    if manifest.get("tokenizer_contract") != EXPECTED_BUNDLE_TOKENIZER_CONTRACT:
+        raise ValueError(
+            "bundle tokenizer_contract must be "
+            f"{EXPECTED_BUNDLE_TOKENIZER_CONTRACT!r}, got "
+            f"{manifest.get('tokenizer_contract')!r}"
+        )
+    if int(manifest.get("vocab_size", -1)) != EXPECTED_VOCAB_SIZE:
+        raise ValueError(
+            f"bundle vocab_size must be {EXPECTED_VOCAB_SIZE}, "
+            f"got {manifest.get('vocab_size')!r}"
+        )
+
+
+def _read_int64_offsets(path: Path, expected_count: int) -> list[int]:
+    raw = path.read_bytes()
+    if len(raw) != expected_count * 8:
+        raise ValueError(
+            f"{path}: offsets byte size {len(raw)} != {expected_count * 8}"
+        )
+    return list(struct.unpack(f"<{expected_count}q", raw))
+
+
+def _read_mmididx(path: Path, *, expected_dtype: str) -> dict[str, int]:
+    with path.open("rb") as stream:
+        if stream.read(9) != b"MMIDIDX\x00\x00":
+            raise ValueError(f"{path}: invalid MMIDIDX header")
+        version_raw = stream.read(8)
+        dtype_raw = stream.read(1)
+        sequences_raw = stream.read(8)
+        documents_raw = stream.read(8)
+        if tuple(map(len, (version_raw, dtype_raw, sequences_raw, documents_raw))) != (
+            8,
+            1,
+            8,
+            8,
+        ):
+            raise ValueError(f"{path}: truncated MMIDIDX header")
+        version = struct.unpack("<Q", version_raw)[0]
+        dtype_code = struct.unpack("<B", dtype_raw)[0]
+        sequences = struct.unpack("<Q", sequences_raw)[0]
+        documents = struct.unpack("<Q", documents_raw)[0]
+        expected_size = 34 + sequences * 4 + sequences * 8 + documents * 8
+        if path.stat().st_size != expected_size:
+            raise ValueError(
+                f"{path}: MMIDIDX size {path.stat().st_size} != {expected_size}"
+            )
+        sizes_raw = stream.read(sequences * 4)
+        pointers_raw = stream.read(sequences * 8)
+        document_indices_raw = stream.read(documents * 8)
+    if version != 1:
+        raise ValueError(f"{path}: unsupported MMIDIDX version {version}, expected 1")
+    expected_dtype_code = TOKEN_INDEX_DTYPE_CODES.get(expected_dtype)
+    if expected_dtype_code is None:
+        raise ValueError(f"{path}: unsupported MMIDIDX token dtype {expected_dtype!r}")
+    if dtype_code != expected_dtype_code:
+        raise ValueError(
+            f"{path}: MMIDIDX dtype code {dtype_code} != {expected_dtype_code} "
+            f"for {expected_dtype}"
+        )
+    lengths = [value[0] for value in struct.iter_unpack("<i", sizes_raw)]
+    if any(length <= 0 for length in lengths):
+        raise ValueError(f"{path}: MMIDIDX sequence lengths must be positive")
+    pointers = [value[0] for value in struct.iter_unpack("<q", pointers_raw)]
+    expected_pointers: list[int] = []
+    token_offset = 0
+    for length in lengths:
+        expected_pointers.append(token_offset * DTYPE_SIZES[expected_dtype])
+        token_offset += length
+    if pointers != expected_pointers:
+        raise ValueError(f"{path}: MMIDIDX sequence pointers do not match token dtype")
+    document_indices = [
+        value[0] for value in struct.iter_unpack("<q", document_indices_raw)
+    ]
+    if document_indices != list(range(sequences + 1)):
+        raise ValueError(
+            f"{path}: MMIDIDX document indices must bind one packed sequence per document"
+        )
+    return {
+        "version": version,
+        "dtype_code": dtype_code,
+        "sequences": sequences,
+        "documents": documents,
+        "tokens": token_offset,
+    }
+
+
+def _contains_nonzero_byte(path: Path, chunk_size: int = 8 * 1024 * 1024) -> bool:
+    with path.open("rb") as stream:
+        while chunk := stream.read(chunk_size):
+            if any(chunk):
+                return True
+    return False
+
+
+def _safe_prefix_file(prefix_dir: Path, relative: str) -> Path:
+    posix = PurePosixPath(relative)
+    if (
+        not relative
+        or "\\" in relative
+        or posix.is_absolute()
+        or any(part in ("", ".", "..") for part in posix.parts)
+        or posix.as_posix() != relative
+    ):
+        raise ValueError(f"unsafe sidecar path in prefix manifest: {relative!r}")
+    root = prefix_dir.resolve()
+    candidate = root
+    for part in posix.parts:
+        candidate /= part
+        if candidate.is_symlink():
+            raise ValueError(
+                f"sidecar path must be a regular file, not a symlink: {relative!r}"
+            )
+    path = candidate.resolve()
+    if path != root and root not in path.parents:
+        raise ValueError(f"sidecar path escapes prefix directory: {relative!r}")
+    return path
+
+
+def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
+    prefix = prefix.resolve()
+    manifest_path = prefix.with_suffix(".json")
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise FileNotFoundError(manifest_path)
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if data.get("tokenizer_contract") != EXPECTED_PREFIX_TOKENIZER_CONTRACT:
+        raise ValueError(
+            f"{manifest_path}: tokenizer_contract={data.get('tokenizer_contract')!r}, "
+            f"expected {EXPECTED_PREFIX_TOKENIZER_CONTRACT!r}"
+        )
+    if int(data.get("vocab_size", -1)) != EXPECTED_VOCAB_SIZE:
+        raise ValueError(
+            f"{manifest_path}: vocab_size={data.get('vocab_size')!r}, "
+            f"expected {EXPECTED_VOCAB_SIZE}"
+        )
+    token_count = int(data.get("token_count", -1))
+    document_count = int(data.get("document_count", -1))
+    if token_count <= 0 or document_count <= 0:
+        raise ValueError(f"{manifest_path}: token_count/document_count must be positive")
+    token_path = prefix.with_suffix(".bin")
+    index_path = prefix.with_suffix(".idx")
+    if (
+        token_path.is_symlink()
+        or index_path.is_symlink()
+        or not token_path.is_file()
+        or not index_path.is_file()
+    ):
+        raise FileNotFoundError(f"{prefix}: missing .bin/.idx pair")
+    token_dtype = str(data.get("dtype", ""))
+    if token_dtype not in DTYPE_SIZES:
+        raise ValueError(f"{manifest_path}: unsupported token dtype {token_dtype!r}")
+    if token_path.stat().st_size != token_count * DTYPE_SIZES[token_dtype]:
+        raise ValueError(f"{manifest_path}: token binary size does not match token_count")
+    index = _read_mmididx(index_path, expected_dtype=token_dtype)
+    if index["tokens"] != token_count or index["sequences"] != document_count:
+        raise ValueError(f"{manifest_path}: MMIDIDX token/document counts disagree")
+    if index["documents"] != document_count + 1:
+        raise ValueError(f"{manifest_path}: MMIDIDX document sentinel is missing")
+
+    referenced = {manifest_path, token_path, index_path}
+
+    side_paths = data.get("side_channel_paths")
+    if not isinstance(side_paths, dict):
+        raise ValueError(f"{manifest_path}: side_channel_paths must be an object")
+    missing_sidecars = sorted(REQUIRED_TOKEN_SIDECARS - set(side_paths))
+    if missing_sidecars:
+        raise ValueError(f"{manifest_path}: missing token sidecars {missing_sidecars}")
+    for name in REQUIRED_TOKEN_SIDECARS:
+        spec = side_paths[name]
+        if not isinstance(spec, dict):
+            raise ValueError(f"{manifest_path}: token sidecar {name} must be an object")
+        dtype = str(spec.get("dtype", ""))
+        expected_dtype = TOKEN_SIDECAR_DTYPES[name]
+        if dtype != expected_dtype:
+            raise ValueError(
+                f"{manifest_path}: token sidecar {name} dtype {dtype!r} "
+                f"!= {expected_dtype!r}"
+            )
+        side_path = _safe_prefix_file(prefix.parent, str(spec.get("path", "")))
+        if not side_path.is_file():
+            raise FileNotFoundError(side_path)
+        expected_bytes = token_count * DTYPE_SIZES[dtype]
+        if side_path.stat().st_size != expected_bytes:
+            raise ValueError(
+                f"{manifest_path}: token sidecar {name} size "
+                f"{side_path.stat().st_size} != {expected_bytes}"
+            )
+        if name == "token_structure_ids" and not _contains_nonzero_byte(side_path):
+            raise ValueError(
+                f"{manifest_path}: token_structure_ids must contain nonzero values"
+            )
+        referenced.add(side_path)
+
+    graph_paths = data.get("graph_sidecar_paths")
+    if data.get("graph_sidecar_schema") != EXPECTED_GRAPH_SIDECAR_SCHEMA:
+        raise ValueError(
+            f"{manifest_path}: graph_sidecar_schema={data.get('graph_sidecar_schema')!r}, "
+            f"expected {EXPECTED_GRAPH_SIDECAR_SCHEMA!r}"
+        )
+    if not isinstance(graph_paths, dict):
+        raise ValueError(f"{manifest_path}: graph_sidecar_paths must be an object")
+    missing_graph = sorted(REQUIRED_GRAPH_SIDECARS - set(graph_paths))
+    if missing_graph:
+        raise ValueError(f"{manifest_path}: missing graph sidecars {missing_graph}")
+    graph_item_counts: dict[str, int] = {}
+    for name in REQUIRED_GRAPH_SIDECARS:
+        spec = graph_paths[name]
+        if not isinstance(spec, dict):
+            raise ValueError(f"{manifest_path}: graph sidecar {name} must be an object")
+        expected_kind, expected_dtype, expected_shape_tail = GRAPH_SIDECAR_SPECS[name]
+        if spec.get("kind") != expected_kind:
+            raise ValueError(f"{manifest_path}: graph sidecar {name} has bad kind")
+        dtype = str(spec.get("dtype", ""))
+        if dtype != expected_dtype:
+            raise ValueError(f"{manifest_path}: graph sidecar {name} has bad dtype {dtype!r}")
+        if spec.get("offset_dtype") != "int64":
+            raise ValueError(f"{manifest_path}: graph sidecar {name} offsets must be int64")
+        if spec.get("shape_tail") != expected_shape_tail:
+            raise ValueError(f"{manifest_path}: graph sidecar {name} bad shape_tail")
+        tail = expected_shape_tail[0]
+        item_count = int(spec.get("item_count", -1))
+        if item_count < 0:
+            raise ValueError(f"{manifest_path}: graph sidecar {name} has bad item_count")
+        graph_item_counts[name] = item_count
+        if name in NONZERO_GRAPH_SIDECARS and item_count <= 0:
+            raise ValueError(
+                f"{manifest_path}: graph sidecar {name} must be nonzero for H200 ingress"
+            )
+        offsets_path = _safe_prefix_file(prefix.parent, str(spec.get("offsets_path", "")))
+        data_path = _safe_prefix_file(prefix.parent, str(spec.get("data_path", "")))
+        if not offsets_path.is_file() or not data_path.is_file():
+            raise FileNotFoundError(f"{manifest_path}: graph sidecar {name} files missing")
+        offsets = _read_int64_offsets(offsets_path, document_count + 1)
+        if offsets[0] != 0 or offsets[-1] != item_count:
+            raise ValueError(
+                f"{manifest_path}: graph sidecar {name} CSR offsets do not "
+                f"span item_count={item_count}"
+            )
+        if any(left > right for left, right in zip(offsets, offsets[1:])):
+            raise ValueError(f"{manifest_path}: graph sidecar {name} CSR offsets decrease")
+        expected_data_bytes = item_count * tail * DTYPE_SIZES[dtype]
+        if data_path.stat().st_size != expected_data_bytes:
+            raise ValueError(
+                f"{manifest_path}: graph sidecar {name} data size "
+                f"{data_path.stat().st_size} != {expected_data_bytes}"
+            )
+        referenced.update((offsets_path, data_path))
+    chunk_item_counts = {
+        graph_item_counts[name]
+        for name in (
+            "token_chunk_starts",
+            "token_chunk_ends",
+            "token_chunk_kinds",
+            "token_chunk_dep_levels",
+        )
+    }
+    if len(chunk_item_counts) != 1:
+        raise ValueError(f"{manifest_path}: graph chunk CSR item counts disagree")
+
+    source_platform = data.get("source_platform_sidecar")
+    if not isinstance(source_platform, dict) or source_platform.get("schema") != "cppmega_source_platform_v1":
+        raise ValueError(f"{manifest_path}: compact source platform sidecar missing or invalid")
+    source_document_count = int(source_platform.get("source_document_count", -1))
+    platform_id_count = int(source_platform.get("platform_id_count", -1))
+    if source_document_count <= 0 or platform_id_count <= 0:
+        raise ValueError(f"{manifest_path}: invalid source platform counts")
+    sequence_offsets_path = _safe_prefix_file(
+        prefix.parent, str(source_platform.get("sequence_doc_offsets_path", ""))
+    )
+    document_offsets_path = _safe_prefix_file(
+        prefix.parent, str(source_platform.get("doc_platform_offsets_path", ""))
+    )
+    platform_ids_path = _safe_prefix_file(
+        prefix.parent, str(source_platform.get("platform_ids_path", ""))
+    )
+    if not all(
+        path.is_file()
+        for path in (sequence_offsets_path, document_offsets_path, platform_ids_path)
+    ):
+        raise FileNotFoundError(f"{manifest_path}: source platform files missing")
+    sequence_offsets = _read_int64_offsets(sequence_offsets_path, document_count + 1)
+    document_offsets = _read_int64_offsets(
+        document_offsets_path, source_document_count + 1
+    )
+    for label, offsets, final in (
+        ("sequence", sequence_offsets, source_document_count),
+        ("document", document_offsets, platform_id_count),
+    ):
+        if offsets[0] != 0 or offsets[-1] != final:
+            raise ValueError(f"{manifest_path}: source platform {label} CSR bounds mismatch")
+        if any(left > right for left, right in zip(offsets, offsets[1:])):
+            raise ValueError(f"{manifest_path}: source platform {label} CSR offsets decrease")
+    if platform_ids_path.stat().st_size != platform_id_count * 2:
+        raise ValueError(f"{manifest_path}: source platform IDs size mismatch")
+    referenced.update(
+        (sequence_offsets_path, document_offsets_path, platform_ids_path)
+    )
+    return data, referenced
+
+
+def _validate_tokenizer_directory(tokenizer_root: Path) -> set[Path]:
+    if tokenizer_root.is_symlink():
+        raise ValueError("tokenizer directory must not be a symlink")
+    tokenizer_root = tokenizer_root.resolve()
+    required = {
+        tokenizer_root / "tokenizer.json",
+        tokenizer_root / "tokenizer_config.json",
+        tokenizer_root / "special_tokens_map.json",
+    }
+    entries = set(tokenizer_root.iterdir()) if tokenizer_root.is_dir() else set()
+    if any(path.is_symlink() or not path.is_file() for path in entries):
+        raise ValueError("tokenizer directory may contain only regular files")
+    if not required.issubset(entries):
+        raise ValueError("tokenizer directory is missing required regular artifacts")
+    tokenizer = json.loads((tokenizer_root / "tokenizer.json").read_text(encoding="utf-8"))
+    vocab = (tokenizer.get("model") or {}).get("vocab")
+    if not isinstance(vocab, dict) or len(vocab) != EXPECTED_VOCAB_SIZE:
+        raise ValueError(
+            "tokenizer vocab size mismatch: "
+            f"expected {EXPECTED_VOCAB_SIZE}, got "
+            f"{len(vocab) if isinstance(vocab, dict) else None}"
+        )
+    if tokenizer.get("version") != "1.0" or (tokenizer.get("model") or {}).get(
+        "type"
+    ) != "BPE":
+        raise ValueError("tokenizer JSON schema must be version 1.0 BPE")
+    vocab_ids = list(vocab.values())
+    if any(not isinstance(value, int) or isinstance(value, bool) for value in vocab_ids):
+        raise ValueError("tokenizer vocab IDs must be integers")
+    if set(vocab_ids) != set(range(EXPECTED_VOCAB_SIZE)):
+        raise ValueError("tokenizer vocab IDs must be a complete unique 0..65535 range")
+
+    added_tokens = tokenizer.get("added_tokens")
+    if not isinstance(added_tokens, list):
+        raise ValueError("tokenizer added_tokens must be a list")
+    added_by_id: dict[int, str] = {}
+    for entry in added_tokens:
+        if not isinstance(entry, dict):
+            raise ValueError("tokenizer added token entries must be objects")
+        token_id = entry.get("id")
+        content = entry.get("content")
+        if (
+            not isinstance(token_id, int)
+            or isinstance(token_id, bool)
+            or not isinstance(content, str)
+            or token_id in added_by_id
+        ):
+            raise ValueError("tokenizer added token IDs/content must be unique and typed")
+        added_by_id[token_id] = content
+        if vocab.get(content) != token_id:
+            raise ValueError(
+                f"tokenizer added token {content!r}={token_id} disagrees with vocab"
+            )
+    expected_tokens = {
+        **{index: token for index, token in enumerate(EXPECTED_TOKENIZER_CORE_TOKENS)},
+        **{index: f"<RESERVED_{index}>" for index in range(191, 237)},
+    }
+    for token_id, token in expected_tokens.items():
+        if vocab.get(token) != token_id or added_by_id.get(token_id) != token:
+            raise ValueError(
+                f"tokenizer canonical token {token!r} must remain at ID {token_id}"
+            )
+
+    expected_specials = {
+        "pad_token": "<PAD>",
+        "unk_token": "<UNK>",
+        "bos_token": "<BOS>",
+        "eos_token": "<EOS>",
+    }
+    for filename in ("tokenizer_config.json", "special_tokens_map.json"):
+        config = json.loads((tokenizer_root / filename).read_text(encoding="utf-8"))
+        if any(config.get(key) != value for key, value in expected_specials.items()):
+            raise ValueError(f"{filename}: canonical special-token mapping drifted")
+    return entries
+
+
+def _validate_tokenizer_descriptor(
+    bundle: Path, manifest: dict, artifact_by_path: dict[str, dict]
+) -> set[Path]:
+    descriptor = manifest.get("tokenizer")
+    if not isinstance(descriptor, dict):
+        raise ValueError("bundle tokenizer descriptor is missing")
+    if descriptor.get("contract") != EXPECTED_BUNDLE_TOKENIZER_CONTRACT:
+        raise ValueError("bundle tokenizer descriptor contract mismatch")
+    if int(descriptor.get("vocab_size", -1)) != EXPECTED_VOCAB_SIZE:
+        raise ValueError("bundle tokenizer descriptor vocab size mismatch")
+    tokenizer_root = _safe_artifact_path(bundle, str(descriptor.get("path", "")))
+    records = descriptor.get("files")
+    if not isinstance(records, list) or not records:
+        raise ValueError("bundle tokenizer descriptor has no files")
+    canonical = _canonical_artifact_records(records)
+    if descriptor.get("artifact_set_sha256") != _artifact_set_sha256(canonical):
+        raise ValueError("bundle tokenizer artifact-set SHA-256 mismatch")
+    referenced: set[Path] = set()
+    for record in canonical:
+        relative = str(record["path"])
+        if artifact_by_path.get(relative) != record:
+            raise ValueError(f"tokenizer artifact is not bound by bundle manifest: {relative}")
+        path = _safe_artifact_path(bundle, relative)
+        if tokenizer_root not in path.parents:
+            raise ValueError(f"tokenizer artifact escapes tokenizer root: {relative}")
+        referenced.add(path)
+    required = _validate_tokenizer_directory(tokenizer_root)
+    if not required.issubset(referenced):
+        raise ValueError("bundle tokenizer descriptor is missing required artifacts")
+    return referenced
+
+
 def _load_bundle_manifest(bundle: Path) -> tuple[dict, list[dict]]:
     manifest_path = bundle / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("schema") != "cppmega_megatron_bundle_v1":
         raise ValueError(f"unsupported bundle schema: {manifest.get('schema')!r}")
+    _require_manifest_tokenizer_contract(manifest)
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, list) or not artifacts:
         raise ValueError("bundle manifest has no artifacts")
@@ -84,24 +637,28 @@ def _load_bundle_manifest(bundle: Path) -> tuple[dict, list[dict]]:
         raise ValueError("bundle artifact_count does not match artifact list")
     seen: set[str] = set()
     for record in artifacts:
-        relative = str(record.get("path"))
+        if not isinstance(record, dict):
+            raise ValueError("bundle artifact records must be objects")
+        relative_raw = record.get("path")
+        if not isinstance(relative_raw, str):
+            raise ValueError("bundle artifact path must be a string")
+        relative = relative_raw
+        if relative == "manifest.json":
+            raise ValueError("bundle artifacts must not include manifest.json")
         if relative in seen:
             raise ValueError(f"duplicate artifact path: {relative}")
         seen.add(relative)
+        size = record.get("size")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise ValueError(f"artifact {relative} has invalid size")
+        digest = record.get("sha256")
+        if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+            raise ValueError(f"artifact {relative} is missing a valid sha256")
         _safe_artifact_path(bundle, relative)
     if sum(int(record["size"]) for record in artifacts) != int(manifest["artifact_bytes"]):
         raise ValueError("bundle artifact_bytes does not match artifact list")
-    canonical = [
-        {
-            "path": str(record["path"]),
-            "size": int(record["size"]),
-            "sha256": str(record["sha256"]),
-        }
-        for record in sorted(artifacts, key=lambda item: str(item["path"]))
-    ]
-    artifact_set_sha256 = hashlib.sha256(
-        json.dumps(canonical, separators=(",", ":"), sort_keys=True).encode()
-    ).hexdigest()
+    canonical = _canonical_artifact_records(artifacts)
+    artifact_set_sha256 = _artifact_set_sha256(canonical)
     if manifest.get("artifact_set_sha256") != artifact_set_sha256:
         raise ValueError("bundle artifact_set_sha256 does not match artifact list")
     if not str(manifest.get("bundle_id", "")).endswith(artifact_set_sha256[:16]):
@@ -111,11 +668,54 @@ def _load_bundle_manifest(bundle: Path) -> tuple[dict, list[dict]]:
 
 def _validate_bundle(bundle: Path, hash_jobs: int) -> tuple[dict, list[dict]]:
     manifest, artifacts = _load_bundle_manifest(bundle)
+    artifact_by_path = {
+        str(record["path"]): {
+            "path": str(record["path"]),
+            "size": int(record["size"]),
+            "sha256": str(record["sha256"]),
+        }
+        for record in artifacts
+    }
+    _validate_tokenizer_descriptor(bundle, manifest, artifact_by_path)
+
+    buckets = manifest.get("buckets")
+    if (
+        not isinstance(buckets, list)
+        or not buckets
+        or any(not isinstance(bucket, int) or isinstance(bucket, bool) for bucket in buckets)
+        or len(buckets) != len(set(buckets))
+    ):
+        raise ValueError("bundle buckets must be a non-empty unique integer list")
+    bucket_results = manifest.get("bucket_results")
+    if not isinstance(bucket_results, list) or not bucket_results:
+        raise ValueError("bundle bucket_results must be a non-empty list")
+    result_buckets: list[int] = []
+    referenced_paths: set[Path] = set()
+    for result in bucket_results:
+        if not isinstance(result, dict):
+            raise ValueError("bundle bucket_results entries must be objects")
+        bucket = result.get("bucket")
+        if not isinstance(bucket, int) or isinstance(bucket, bool):
+            raise ValueError("bundle bucket result has invalid bucket")
+        result_buckets.append(bucket)
+        prefix = _safe_artifact_path(bundle, str(result.get("prefix", "")))
+        prefix_manifest, referenced = _validate_prefix_manifest_contract(prefix)
+        if result.get("manifest") != prefix_manifest:
+            raise ValueError(f"{prefix}: embedded prefix manifest does not match artifact")
+        referenced_paths.update(referenced)
+    if result_buckets != buckets:
+        raise ValueError(
+            f"bundle bucket_results do not match buckets: {result_buckets} != {buckets}"
+        )
+    for path in referenced_paths:
+        relative = path.relative_to(bundle.resolve()).as_posix()
+        if relative not in artifact_by_path:
+            raise ValueError(f"referenced bundle artifact has no hash record: {relative}")
 
     def validate(record: dict) -> dict:
         relative = str(record["path"])
         path = _safe_artifact_path(bundle, relative)
-        if not path.is_file():
+        if path.is_symlink() or not path.is_file():
             raise FileNotFoundError(path)
         size = path.stat().st_size
         if size != int(record["size"]):
@@ -329,6 +929,33 @@ def _publish_json(
         )
 
 
+def _open_resumable_receipt(
+    path: Path, *, schema: str, binding: dict[str, object]
+) -> dict:
+    if path.exists():
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        if receipt.get("schema") != schema or any(
+            receipt.get(key) != value for key, value in binding.items()
+        ):
+            raise ValueError(f"publish receipt binding mismatch: {path}")
+        return receipt
+    receipt = {
+        "schema": schema,
+        **binding,
+        "status": "in_progress",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_json_atomic(path, receipt)
+    return receipt
+
+
+def _update_receipt(path: Path, receipt: dict, **updates: object) -> None:
+    receipt.update(updates)
+    receipt["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _write_json_atomic(path, receipt)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, required=True)
@@ -352,16 +979,38 @@ def main(argv: Iterable[str] | None = None) -> int:
     bundle = args.bundle.resolve()
     _load_env_file(args.env_file)
     env = os.environ.copy() if args.dry_run else _s3_env()
-    if args.archive is None:
-        manifest, artifacts = _validate_bundle(bundle, args.hash_jobs)
-    else:
-        manifest, artifacts = _load_bundle_manifest(bundle)
+    manifest, artifacts = _validate_bundle(bundle, args.hash_jobs)
     bundle_id = str(manifest["bundle_id"])
 
     if args.archive is not None:
         archive = args.archive.resolve()
         archive_size, archive_sha256 = _validate_archive(
             bundle=bundle, archive=archive, manifest=manifest
+        )
+        receipt_path = bundle / "archive_publish_receipt.json"
+        receipt_payload = _open_resumable_receipt(
+            receipt_path,
+            schema="cppmega_megatron_archive_publish_receipt_v1",
+            binding={
+                "endpoint_url": args.endpoint_url,
+                "bucket": args.bucket,
+                "prefix": args.prefix.strip("/"),
+                "bundle_id": bundle_id,
+                "artifact_set_sha256": manifest["artifact_set_sha256"],
+                "dry_run": args.dry_run,
+            },
+        )
+        archive_validation = {
+            "status": "verified",
+            "member_count": len(artifacts) + 1,
+            "artifact_set_sha256": manifest["artifact_set_sha256"],
+            "logical_manifest_sha256": _sha256(bundle / "manifest.json"),
+        }
+        _update_receipt(
+            receipt_path,
+            receipt_payload,
+            status="in_progress",
+            archive_validation=archive_validation,
         )
         transport_base = f"{args.prefix.strip('/')}/transports/{bundle_id}"
         archive_key = f"{transport_base}/bundle.tar.zst"
@@ -375,6 +1024,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             env=env,
             dry_run=args.dry_run,
         )
+        _update_receipt(receipt_path, receipt_payload, archive=archive_record)
         logical_manifest_path = bundle / "manifest.json"
         logical_manifest_sha256 = _sha256(logical_manifest_path)
         logical_manifest_key = f"{transport_base}/logical_manifest.json"
@@ -387,6 +1037,11 @@ def main(argv: Iterable[str] | None = None) -> int:
             sha256=logical_manifest_sha256,
             env=env,
             dry_run=args.dry_run,
+        )
+        _update_receipt(
+            receipt_path,
+            receipt_payload,
+            logical_manifest=logical_manifest_record,
         )
         transport = {
             "schema": "cppmega_megatron_bundle_transport_v1",
@@ -415,6 +1070,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             env=env,
             dry_run=args.dry_run,
         )
+        _update_receipt(receipt_path, receipt_payload, transport=transport_record)
         latest_transport = {
             "schema": "cppmega_megatron_latest_transport_v1",
             "bundle_id": bundle_id,
@@ -432,26 +1088,14 @@ def main(argv: Iterable[str] | None = None) -> int:
             dry_run=args.dry_run,
             allow_overwrite=True,
         )
-        receipt_payload = {
-            "schema": "cppmega_megatron_archive_publish_receipt_v1",
-            "endpoint_url": args.endpoint_url,
-            "bucket": args.bucket,
-            "archive_validation": {
-                "status": "verified",
-                "member_count": len(artifacts) + 1,
-                "artifact_set_sha256": manifest["artifact_set_sha256"],
-                "logical_manifest_sha256": logical_manifest_sha256,
-            },
-            "archive": archive_record,
-            "logical_manifest": logical_manifest_record,
-            "transport": transport_record,
-            "latest_transport": latest_record,
-            "dry_run": args.dry_run,
-        }
-        receipt_path = bundle / "archive_publish_receipt.json"
-        receipt_path.write_text(
-            json.dumps(receipt_payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+        _update_receipt(
+            receipt_path,
+            receipt_payload,
+            status="complete",
+            archive=archive_record,
+            logical_manifest=logical_manifest_record,
+            transport=transport_record,
+            latest_transport=latest_record,
         )
         print(
             json.dumps(
@@ -463,7 +1107,50 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     base_key = f"{args.prefix.strip('/')}/bundles/{bundle_id}"
 
-    receipts: list[dict[str, object]] = []
+    receipt_path = bundle / "publish_receipt.json"
+    receipt_payload = _open_resumable_receipt(
+        receipt_path,
+        schema="cppmega_megatron_publish_receipt_v1",
+        binding={
+            "endpoint_url": args.endpoint_url,
+            "bucket": args.bucket,
+            "base_key": base_key,
+            "bundle_id": bundle_id,
+            "artifact_set_sha256": manifest["artifact_set_sha256"],
+            "dry_run": args.dry_run,
+        },
+    )
+    expected_receipts = {
+        f"{base_key}/{record['path']}": {
+            "size": int(record["size"]),
+            "sha256": str(record["sha256"]),
+        }
+        for record in artifacts
+    }
+    prior_artifacts = receipt_payload.get("artifacts", [])
+    if not isinstance(prior_artifacts, list):
+        raise ValueError("publish receipt artifacts must be a list")
+    receipts_by_key: dict[str, dict] = {}
+    for item in prior_artifacts:
+        if not isinstance(item, dict):
+            raise ValueError("publish receipt artifact entries must be objects")
+        key = str(item.get("key", ""))
+        expected = expected_receipts.get(key)
+        if (
+            expected is None
+            or item.get("size") != expected["size"]
+            or item.get("sha256") != expected["sha256"]
+            or item.get("status")
+            not in {"dry_run", "already_verified", "uploaded_verified"}
+        ):
+            raise ValueError(f"publish receipt artifact mismatch: {key!r}")
+        receipts_by_key[key] = item
+    _update_receipt(
+        receipt_path,
+        receipt_payload,
+        status="in_progress",
+        artifacts=sorted(receipts_by_key.values(), key=lambda item: str(item["key"])),
+    )
     with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
         futures = [
             pool.submit(
@@ -481,7 +1168,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         ]
         for future in as_completed(futures):
             receipt = future.result()
-            receipts.append(receipt)
+            receipts_by_key[str(receipt["key"])] = receipt
+            _update_receipt(
+                receipt_path,
+                receipt_payload,
+                artifacts=sorted(
+                    receipts_by_key.values(), key=lambda item: str(item["key"])
+                ),
+            )
             print(json.dumps(receipt, sort_keys=True), flush=True)
 
     manifest_record = _publish_json(
@@ -510,19 +1204,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         dry_run=args.dry_run,
         allow_overwrite=True,
     )
-    receipt_payload = {
-        "schema": "cppmega_megatron_publish_receipt_v1",
-        "endpoint_url": args.endpoint_url,
-        "bucket": args.bucket,
-        "base_key": base_key,
-        "artifacts": sorted(receipts, key=lambda item: str(item["key"])),
-        "manifest": manifest_record,
-        "latest": latest_record,
-        "dry_run": args.dry_run,
-    }
-    receipt_path = bundle / "publish_receipt.json"
-    receipt_path.write_text(
-        json.dumps(receipt_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    _update_receipt(
+        receipt_path,
+        receipt_payload,
+        status="complete",
+        artifacts=sorted(receipts_by_key.values(), key=lambda item: str(item["key"])),
+        manifest=manifest_record,
+        latest=latest_record,
     )
     print(json.dumps({"receipt": str(receipt_path), "latest": latest}, indent=2))
     return 0

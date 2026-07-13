@@ -1,3 +1,5 @@
+import json
+
 import pytest
 import numpy as np
 
@@ -46,6 +48,32 @@ def test_symbol_sidecar_tensor_preserves_unsigned_values_above_int64() -> None:
 
     assert tensor.dtype == torch.uint64
     assert tensor.tolist() == [int(high_id), int(high_id) - 1]
+
+
+def test_pop_structure_batch_emits_h200_production_receipt(tmp_path, monkeypatch):
+    receipt_path = tmp_path / "production-batch.json"
+    monkeypatch.setenv("CPPMEGA_H200_BATCH_RECEIPT", str(receipt_path))
+    batch = {
+        "tokens": torch.tensor([[11, 12, 13, 14]]),
+        "labels": torch.tensor([[12, 13, 14, 0]]),
+        "loss_mask": torch.tensor([[1.0, 1.0, 1.0, 0.0]]),
+        "structure_ids": torch.tensor([[1, 2, 2, 1]]),
+        "graph_chunk_starts": torch.tensor([[0, 2]]),
+        "graph_chunk_ends": torch.tensor([[2, 4]]),
+        "graph_chunk_kinds": torch.tensor([[1, 2]]),
+        "graph_chunk_dep_levels": torch.tensor([[0, 1]]),
+        "graph_chunk_counts": torch.tensor([2]),
+    }
+
+    structure = patch._pop_structure_batch(batch)
+
+    assert structure is not None
+    assert set(batch) == {"tokens", "labels", "loss_mask"}
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] == "verified"
+    assert receipt["batch"]["tokens"]["shape"] == [1, 4]
+    assert receipt["structure"]["structure_ids"]["nonzero"] == 4
+    assert receipt["structure"]["graph_chunk_counts"]["sum"] == 2
 
 
 def test_safe_sidecar_path_allows_plain_relative_and_blocks_escape():

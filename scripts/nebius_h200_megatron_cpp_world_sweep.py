@@ -26,6 +26,18 @@ from typing import Iterable
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.data.publish_megatron_bundle_to_nebius_s3 import (
+    NONZERO_GRAPH_SIDECARS,
+    REQUIRED_GRAPH_SIDECARS,
+    REQUIRED_TOKEN_SIDECARS,
+    _validate_prefix_manifest_contract,
+    _validate_tokenizer_directory,
+)
+
+
 DEFAULT_PARENT_ID = "project-e00w4wx5pr008qm6txmcgr"
 DEFAULT_SUBNET_ID = "vpcsubnet-e00wm5th5ywn69bb0e"
 DEFAULT_SECURITY_GROUP_ID = "vpcsecuritygroup-e00qtzsrtgdv7wh8e7"
@@ -46,11 +58,11 @@ OVERLAY_PATHS = (
     "cppmega/megatron/te_checkpoint_kwarg_patch.py",
     "cppmega/megatron/dsa_indexer_fused_patch.py",
     "cppmega/megatron/graph_route_attention_bias_patch.py",
+    "cppmega/megatron/h200_preflight.py",
     "cppmega/megatron/structure_batch.py",
     "cppmega/megatron/structure_dataset_patch.py",
+    "scripts/h200_megatron_preflight.py",
 )
-
-
 def default_ssh_key() -> Path:
     for name in ("id_ed25519", "id_rsa", "google_compute_engine"):
         path = Path.home() / ".ssh" / name
@@ -91,9 +103,14 @@ def make_overlay_tar(path: Path) -> None:
             tf.add(ROOT / rel, arcname=rel)
 
 
+def _assert_prefix_contract(prefix: Path) -> dict:
+    manifest, _referenced = _validate_prefix_manifest_contract(prefix)
+    return manifest
+
+
 def _sidecar_required_files(prefix: Path, tokenizer_dir: Path) -> list[Path]:
     required = [prefix.with_suffix(".bin"), prefix.with_suffix(".idx"), prefix.with_suffix(".json")]
-    manifest = json.loads(prefix.with_suffix(".json").read_text())
+    manifest = _assert_prefix_contract(prefix)
     for entry in manifest.get("side_channel_paths", {}).values():
         required.append(prefix.parent / entry["path"])
     for entry in manifest.get("graph_sidecar_paths", {}).values():
@@ -111,6 +128,7 @@ def _sidecar_required_files(prefix: Path, tokenizer_dir: Path) -> list[Path]:
             if key not in source_platform:
                 raise KeyError(f"source_platform_sidecar missing {key}")
             required.append(prefix.parent / source_platform[key])
+    _validate_tokenizer_directory(tokenizer_dir)
     required.extend(sorted(tokenizer_dir.iterdir()))
 
     for item in required:
@@ -612,6 +630,21 @@ def remote_run_script(
         TEST_SPECS=(
 {test_lines}
         )
+        IFS=: read -r PREFLIGHT_SEQ PREFLIGHT_PREFIX_NAME <<< "${{TEST_SPECS[0]}}"
+        DATA_PREFIX="/data/cppmega_sidecar/${{PREFLIGHT_PREFIX_NAME}}"
+        if [[ ! -s "${{DATA_PREFIX}}.bin" || ! -s "${{DATA_PREFIX}}.idx" || ! -s "${{DATA_PREFIX}}.json" ]]; then
+          echo "CPPMEGA_H200_PREFLIGHT_STATUS=FAIL reason=missing_data_prefix prefix=${{DATA_PREFIX}}" | tee -a /data/cppmega_h200_results/summary.log
+          exit 2
+        fi
+        python /opt/cppmega/scripts/h200_megatron_preflight.py \
+          --data-prefix "$DATA_PREFIX" \
+          --tokenizer-model /data/cpp_tokenizer_hf \
+          --sequence-length "$PREFLIGHT_SEQ" \
+          --micro-batch-size 1 \
+          --fp8-recipe {shlex.quote(fp8_recipe)} \
+          --output /data/cppmega_h200_results/h200_preflight.json
+        echo "CPPMEGA_H200_PREFLIGHT_STATUS=PASS" | tee -a /data/cppmega_h200_results/summary.log
+
         for SPEC in "${{TEST_SPECS[@]}}"; do
           IFS=: read -r SEQ DATA_PREFIX_NAME <<< "$SPEC"
           DATA_PREFIX="/data/cppmega_sidecar/${{DATA_PREFIX_NAME}}"

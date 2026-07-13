@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import io
+import json
+import hashlib
 import shutil
 import subprocess
 import sys
@@ -8,9 +11,12 @@ from pathlib import Path
 
 import pytest
 
+import scripts.data.restore_megatron_bundle_from_nebius_s3 as restore
 from scripts.data.restore_megatron_bundle_from_nebius_s3 import (
+    _acquire_archive,
     _extract_tar_zst,
     _require_free_space,
+    _validate_tar_zst_members,
     _validate_transport,
 )
 
@@ -102,6 +108,161 @@ def test_extract_tar_zst_streams_into_destination(tmp_path):
     assert (destination / "data/source.txt").read_text(encoding="utf-8") == "cppmega\n"
 
 
+def _write_tar_zst(
+    tmp_path: Path, members: list[tuple[tarfile.TarInfo, bytes]]
+) -> Path:
+    raw_tar = tmp_path / "bundle.tar"
+    archive = tmp_path / "bundle.tar.zst"
+    with tarfile.open(raw_tar, "w") as tar:
+        for member, payload in members:
+            if member.isfile():
+                member.size = len(payload)
+                tar.addfile(member, io.BytesIO(payload))
+            else:
+                tar.addfile(member)
+    subprocess.run(
+        ["zstd", "-q", "-1", str(raw_tar), "-o", str(archive)], check=True
+    )
+    return archive
+
+
+def _regular_member(name: str, payload: bytes = b"x") -> tuple[tarfile.TarInfo, bytes]:
+    member = tarfile.TarInfo(name)
+    member.type = tarfile.REGTYPE
+    return member, payload
+
+
+@pytest.mark.skipif(shutil.which("zstd") is None, reason="zstd is required")
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../escape.txt",
+        "/abs.txt",
+        "safe/../../escape.txt",
+        r"safe\..\escape.txt",
+        "safe//noncanonical.txt",
+    ],
+)
+def test_extract_tar_zst_rejects_path_traversal_before_extracting(tmp_path, name):
+    archive = _write_tar_zst(tmp_path, [_regular_member(name)])
+    destination = tmp_path / "restored"
+
+    with pytest.raises(ValueError, match="unsafe archive member path"):
+        _extract_tar_zst(archive, destination)
+
+    assert not destination.exists()
+
+
+@pytest.mark.skipif(shutil.which("zstd") is None, reason="zstd is required")
+@pytest.mark.parametrize(
+    ("member_type", "message"),
+    [
+        (tarfile.SYMTYPE, "unsupported member type"),
+        (tarfile.LNKTYPE, "unsupported member type"),
+        (tarfile.CHRTYPE, "unsupported member type"),
+        (tarfile.BLKTYPE, "unsupported member type"),
+        (tarfile.FIFOTYPE, "unsupported member type"),
+    ],
+)
+def test_extract_tar_zst_rejects_links_and_device_entries_before_extracting(
+    tmp_path, member_type, message
+):
+    member = tarfile.TarInfo("unsafe")
+    member.type = member_type
+    member.linkname = "target"
+    member.devmajor = 1
+    member.devminor = 3
+    archive = _write_tar_zst(tmp_path, [(member, b"")])
+    destination = tmp_path / "restored"
+
+    with pytest.raises(ValueError, match=message):
+        _extract_tar_zst(archive, destination)
+
+    assert not destination.exists()
+
+
+@pytest.mark.skipif(shutil.which("zstd") is None, reason="zstd is required")
+def test_restore_archive_member_set_must_be_complete_before_extraction(tmp_path):
+    archive = _write_tar_zst(tmp_path, [_regular_member("manifest.json", b"{}")])
+    destination = tmp_path / "restored"
+
+    with pytest.raises(ValueError, match="member set mismatch"):
+        _extract_tar_zst(
+            archive,
+            destination,
+            expected_member_names={"manifest.json", "data/sample.bin"},
+        )
+
+    assert not destination.exists()
+
+
+@pytest.mark.skipif(shutil.which("zstd") is None, reason="zstd is required")
+def test_restore_archive_rejects_duplicate_members_before_extraction(tmp_path):
+    archive = _write_tar_zst(
+        tmp_path,
+        [
+            _regular_member("manifest.json", b"{}"),
+            _regular_member("manifest.json", b"{}"),
+        ],
+    )
+    destination = tmp_path / "restored"
+
+    with pytest.raises(ValueError, match="duplicate member"):
+        _extract_tar_zst(
+            archive,
+            destination,
+            expected_member_names={"manifest.json"},
+        )
+
+    assert not destination.exists()
+
+
+@pytest.mark.skipif(shutil.which("zstd") is None, reason="zstd is required")
+def test_validate_tar_zst_members_accepts_only_expected_regular_files(tmp_path):
+    archive = _write_tar_zst(
+        tmp_path,
+        [
+            _regular_member("manifest.json", b"{}"),
+            _regular_member("data/sample.bin", b"cppmega"),
+        ],
+    )
+
+    seen = _validate_tar_zst_members(
+        archive, {"manifest.json", "data/sample.bin"}
+    )
+
+    assert seen == ["manifest.json", "data/sample.bin"]
+
+
+@pytest.mark.skipif(shutil.which("zstd") is None, reason="zstd is required")
+@pytest.mark.parametrize(
+    ("expected_size", "expected_sha256", "message"),
+    [
+        (8, hashlib.sha256(b"cppmega").hexdigest(), "size mismatch"),
+        (7, hashlib.sha256(b"changed").hexdigest(), "SHA-256 mismatch"),
+    ],
+)
+def test_restore_validates_member_size_and_hash_before_extraction(
+    tmp_path, expected_size, expected_sha256, message
+):
+    archive = _write_tar_zst(
+        tmp_path, [_regular_member("data/sample.bin", b"cppmega")]
+    )
+    destination = tmp_path / "restored"
+
+    with pytest.raises(ValueError, match=message):
+        _extract_tar_zst(
+            archive,
+            destination,
+            expected_member_names={"data/sample.bin"},
+            expected_member_records={
+                "data/sample.bin": (expected_size, expected_sha256)
+            },
+        )
+
+    assert not destination.exists()
+
+
 def test_restore_script_supports_direct_cli_execution():
     root = Path(__file__).resolve().parents[1]
     result = subprocess.run(
@@ -130,3 +291,70 @@ def test_restore_requires_space_for_archive_expansion(tmp_path, monkeypatch):
         _require_free_space(
             tmp_path, artifact_bytes=8, archive_bytes=3, headroom_gb=0
         )
+
+
+def test_archive_download_uses_atomic_staging_and_resumable_receipt(
+    tmp_path, monkeypatch
+):
+    payload = b"verified archive"
+    digest = hashlib.sha256(payload).hexdigest()
+    archive = tmp_path / ".bundle.tar.zst"
+    calls = []
+
+    def fake_download(uri, destination, *, endpoint, env):
+        calls.append((uri, destination, endpoint, env))
+        assert destination.name.endswith(".download")
+        destination.write_bytes(payload)
+
+    monkeypatch.setattr(restore, "_aws_download", fake_download)
+    first = _acquire_archive(
+        uri="s3://bucket/bundle.tar.zst",
+        archive=archive,
+        endpoint="https://storage.example",
+        env={"AWS_ACCESS_KEY_ID": "test"},
+        expected_size=len(payload),
+        expected_sha256=digest,
+    )
+    second = _acquire_archive(
+        uri="s3://bucket/bundle.tar.zst",
+        archive=archive,
+        endpoint="https://storage.example",
+        env={"AWS_ACCESS_KEY_ID": "test"},
+        expected_size=len(payload),
+        expected_sha256=digest,
+    )
+
+    assert len(calls) == 1
+    assert first["status"] == "downloaded_verified"
+    assert second["status"] == "reused_verified"
+    assert archive.read_bytes() == payload
+    assert not archive.with_name(archive.name + ".download").exists()
+    receipt = json.loads(
+        archive.with_name(archive.name + ".receipt.json").read_text(encoding="utf-8")
+    )
+    assert receipt["sha256"] == digest
+    assert receipt["uri"] == "s3://bucket/bundle.tar.zst"
+
+
+def test_archive_download_never_promotes_partial_payload(tmp_path, monkeypatch):
+    payload = b"complete"
+    digest = hashlib.sha256(payload).hexdigest()
+    archive = tmp_path / ".bundle.tar.zst"
+
+    def fake_download(_uri, destination, *, endpoint, env):
+        destination.write_bytes(b"partial")
+
+    monkeypatch.setattr(restore, "_aws_download", fake_download)
+
+    with pytest.raises(ValueError, match="downloaded archive size"):
+        _acquire_archive(
+            uri="s3://bucket/bundle.tar.zst",
+            archive=archive,
+            endpoint="https://storage.example",
+            env={},
+            expected_size=len(payload),
+            expected_sha256=digest,
+        )
+
+    assert not archive.exists()
+    assert not archive.with_name(archive.name + ".receipt.json").exists()

@@ -9,9 +9,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import re
 import shutil
 import subprocess
+import tarfile
 from typing import Iterable
 
 if __package__:
@@ -22,7 +24,9 @@ if __package__:
         _load_env_file,
         _s3_env,
         _sha256,
+        _validate_archive_member_names,
         _validate_bundle,
+        _write_json_atomic,
     )
 else:
     from publish_megatron_bundle_to_nebius_s3 import (  # type: ignore[no-redef]
@@ -32,7 +36,9 @@ else:
         _load_env_file,
         _s3_env,
         _sha256,
+        _validate_archive_member_names,
         _validate_bundle,
+        _write_json_atomic,
     )
 
 
@@ -70,6 +76,85 @@ def _aws_download(
     )
 
 
+def _archive_receipt_path(archive: Path) -> Path:
+    return archive.with_name(archive.name + ".receipt.json")
+
+
+def _archive_matches(archive: Path, *, size: int, sha256: str) -> bool:
+    return (
+        archive.is_file()
+        and archive.stat().st_size == size
+        and _sha256(archive) == sha256
+    )
+
+
+def _acquire_archive(
+    *,
+    uri: str,
+    archive: Path,
+    endpoint: str,
+    env: dict[str, str],
+    expected_size: int,
+    expected_sha256: str,
+) -> dict[str, object]:
+    download = archive.with_name(archive.name + ".download")
+    receipt_path = _archive_receipt_path(archive)
+    binding = {
+        "schema": "cppmega_megatron_archive_download_receipt_v1",
+        "uri": uri,
+        "size": expected_size,
+        "sha256": expected_sha256,
+    }
+
+    if archive.exists():
+        if not _archive_matches(
+            archive, size=expected_size, sha256=expected_sha256
+        ):
+            raise ValueError("existing archive does not match transport descriptor")
+        if receipt_path.exists():
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if any(receipt.get(key) != value for key, value in binding.items()):
+                raise ValueError("archive download receipt binding mismatch")
+        else:
+            _write_json_atomic(
+                receipt_path,
+                {
+                    **binding,
+                    "status": "recovered_verified",
+                    "verified_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        return {**binding, "status": "reused_verified", "receipt": str(receipt_path)}
+
+    if receipt_path.exists():
+        receipt_path.unlink()
+    recovered_download = False
+    if download.exists():
+        if _archive_matches(
+            download, size=expected_size, sha256=expected_sha256
+        ):
+            recovered_download = True
+        else:
+            download.unlink()
+    if not download.exists():
+        _aws_download(uri, download, endpoint=endpoint, env=env)
+    if download.stat().st_size != expected_size:
+        download.unlink(missing_ok=True)
+        raise ValueError("downloaded archive size does not match transport descriptor")
+    if _sha256(download) != expected_sha256:
+        download.unlink(missing_ok=True)
+        raise ValueError("downloaded archive SHA-256 does not match transport descriptor")
+    os.replace(download, archive)
+    status = "recovered_download_verified" if recovered_download else "downloaded_verified"
+    receipt = {
+        **binding,
+        "status": status,
+        "verified_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_json_atomic(receipt_path, receipt)
+    return {**receipt, "receipt": str(receipt_path)}
+
+
 def _validate_transport(
     transport: dict, *, expected_bundle_id: str | None = None
 ) -> None:
@@ -90,7 +175,7 @@ def _validate_transport(
     if int(archive.get("size", 0)) <= 0:
         raise ValueError("transport archive size must be positive")
     digest = str(archive.get("sha256", ""))
-    if len(digest) != 64:
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise ValueError("transport archive SHA-256 is invalid")
     logical_manifest = transport.get("logical_manifest")
     if not isinstance(logical_manifest, dict):
@@ -99,36 +184,209 @@ def _validate_transport(
         raise ValueError("transport logical manifest URI must use s3://")
     if int(logical_manifest.get("size", 0)) <= 0:
         raise ValueError("transport logical manifest size must be positive")
-    if len(str(logical_manifest.get("sha256", ""))) != 64:
+    if not re.fullmatch(r"[0-9a-f]{64}", str(logical_manifest.get("sha256", ""))):
         raise ValueError("transport logical manifest SHA-256 is invalid")
     if transport.get("logical_manifest_sha256") != logical_manifest.get("sha256"):
         raise ValueError("transport logical manifest hashes disagree")
-    if len(str(transport.get("artifact_set_sha256", ""))) != 64:
+    if not re.fullmatch(r"[0-9a-f]{64}", str(transport.get("artifact_set_sha256", ""))):
         raise ValueError("transport artifact-set SHA-256 is invalid")
+    if int(transport.get("artifact_count", 0)) <= 0:
+        raise ValueError("transport artifact_count must be positive")
+    if int(transport.get("artifact_bytes", 0)) <= 0:
+        raise ValueError("transport artifact_bytes must be positive")
 
 
-def _extract_tar_zst(archive: Path, destination: Path) -> None:
-    destination.mkdir(parents=True, exist_ok=False)
+def _safe_archive_member_name(name: str) -> str:
+    posix = PurePosixPath(name)
+    if (
+        not name
+        or "\\" in name
+        or posix.is_absolute()
+        or any(part in ("", ".", "..") for part in posix.parts)
+        or posix.as_posix() != name
+    ):
+        raise ValueError(f"unsafe archive member path: {name!r}")
+    return name
+
+
+def _validate_tar_member(member: tarfile.TarInfo) -> None:
+    _safe_archive_member_name(member.name)
+    if not member.isfile():
+        raise ValueError(
+            f"archive contains unsupported member type for {member.name!r}: "
+            f"type={member.type!r}"
+        )
+
+
+def _stream_tar_zst(archive: Path) -> tuple[subprocess.Popen[bytes], tarfile.TarFile]:
     decoder = subprocess.Popen(
         ["zstd", "-dc", str(archive)], stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
     assert decoder.stdout is not None
-    extraction = subprocess.run(
-        ["tar", "-xf", "-", "-C", str(destination)],
-        stdin=decoder.stdout,
-        capture_output=True,
-        check=False,
-    )
-    decoder.stdout.close()
+    return decoder, tarfile.open(fileobj=decoder.stdout, mode="r|")
+
+
+def _finish_decoder(decoder: subprocess.Popen[bytes]) -> None:
     decoder_stderr = decoder.communicate()[1]
-    if decoder.returncode != 0 or extraction.returncode != 0:
-        shutil.rmtree(destination, ignore_errors=True)
+    if decoder.returncode != 0:
         raise RuntimeError(
-            "archive extraction failed: "
-            f"zstd={decoder.returncode} {decoder_stderr.decode(errors='replace').strip()} "
-            f"tar={extraction.returncode} "
-            f"{extraction.stderr.decode(errors='replace').strip()}"
+            "zstd archive stream failed: "
+            f"{decoder_stderr.decode(errors='replace').strip()}"
         )
+
+
+def _validate_tar_zst_members(
+    archive: Path,
+    expected_member_names: set[str] | None = None,
+    expected_member_records: dict[str, tuple[int, str]] | None = None,
+) -> list[str]:
+    if expected_member_records is not None:
+        record_names = set(expected_member_records)
+        if expected_member_names is not None and expected_member_names != record_names:
+            raise ValueError("expected archive member names/records disagree")
+        expected_member_names = record_names
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    decoder, tar = _stream_tar_zst(archive)
+    try:
+        with tar:
+            for member in tar:
+                _validate_tar_member(member)
+                if member.name in seen_set:
+                    raise ValueError(f"archive contains duplicate member: {member.name!r}")
+                seen_set.add(member.name)
+                seen.append(member.name)
+                if expected_member_names is not None and member.name not in expected_member_names:
+                    raise ValueError(f"archive contains unexpected member: {member.name!r}")
+                if expected_member_records is not None:
+                    expected_size, expected_sha256 = expected_member_records[member.name]
+                    if member.size != expected_size:
+                        raise ValueError(
+                            f"archive member size mismatch for {member.name}: "
+                            f"{member.size} != {expected_size}"
+                        )
+                    source = tar.extractfile(member)
+                    if source is None:
+                        raise ValueError(f"cannot read archive member: {member.name!r}")
+                    digest = hashlib.sha256()
+                    with source:
+                        while chunk := source.read(8 * 1024 * 1024):
+                            digest.update(chunk)
+                    if digest.hexdigest() != expected_sha256:
+                        raise ValueError(
+                            f"archive member SHA-256 mismatch for {member.name}"
+                        )
+    except BaseException:
+        decoder.kill()
+        decoder.wait()
+        raise
+    finally:
+        if decoder.stdout is not None:
+            decoder.stdout.close()
+    _finish_decoder(decoder)
+    if expected_member_names is not None:
+        _validate_archive_member_names(seen, expected_member_names)
+    return seen
+
+
+def _extract_tar_zst(
+    archive: Path,
+    destination: Path,
+    expected_member_names: set[str] | None = None,
+    expected_member_records: dict[str, tuple[int, str]] | None = None,
+) -> None:
+    # Validate all headers and the expected member set before creating files.
+    _validate_tar_zst_members(
+        archive,
+        expected_member_names,
+        expected_member_records,
+    )
+
+    destination.mkdir(parents=True, exist_ok=False)
+    decoder, tar = _stream_tar_zst(archive)
+    try:
+        with tar:
+            for member in tar:
+                _validate_tar_member(member)
+                target = destination / Path(*PurePosixPath(member.name).parts)
+                root = destination.resolve()
+                resolved_target = target.resolve()
+                if root not in resolved_target.parents:
+                    raise ValueError(f"archive member escapes restore root: {member.name!r}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source = tar.extractfile(member)
+                if source is None:
+                    raise ValueError(f"cannot read archive member: {member.name!r}")
+                expected = (
+                    expected_member_records.get(member.name)
+                    if expected_member_records is not None
+                    else None
+                )
+                if expected is not None and member.size != expected[0]:
+                    raise ValueError(
+                        f"archive member size mismatch for {member.name}: "
+                        f"{member.size} != {expected[0]}"
+                    )
+                with source, target.open("xb") as out:
+                    digest = hashlib.sha256()
+                    while chunk := source.read(8 * 1024 * 1024):
+                        out.write(chunk)
+                        digest.update(chunk)
+                if expected is not None and digest.hexdigest() != expected[1]:
+                    raise ValueError(
+                        f"archive member SHA-256 mismatch for {member.name}"
+                    )
+                os.chmod(target, member.mode & 0o777)
+    except BaseException:
+        decoder.kill()
+        decoder.wait()
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
+    finally:
+        if decoder.stdout is not None:
+            decoder.stdout.close()
+    try:
+        _finish_decoder(decoder)
+    except Exception:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
+
+
+def _expected_archive_members(
+    logical_manifest: dict, logical_manifest_bytes: bytes
+) -> dict[str, tuple[int, str]]:
+    artifacts = logical_manifest.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise ValueError("remote logical manifest has no artifacts")
+    records = {
+        "manifest.json": (
+            len(logical_manifest_bytes),
+            hashlib.sha256(logical_manifest_bytes).hexdigest(),
+        )
+    }
+    for record in artifacts:
+        if not isinstance(record, dict):
+            raise ValueError("remote logical manifest artifact records must be objects")
+        name = _safe_archive_member_name(str(record.get("path", "")))
+        size = record.get("size")
+        digest = record.get("sha256")
+        if (
+            name in records
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or not isinstance(digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
+            raise ValueError(f"invalid remote logical manifest artifact: {name!r}")
+        records[name] = (size, digest)
+    if len(artifacts) != int(logical_manifest.get("artifact_count", -1)):
+        raise ValueError("remote logical manifest artifact_count mismatch")
+    if sum(size for name, (size, _digest) in records.items() if name != "manifest.json") != int(
+        logical_manifest.get("artifact_bytes", -1)
+    ):
+        raise ValueError("remote logical manifest artifact_bytes mismatch")
+    return records
 
 
 def _require_free_space(
@@ -217,15 +475,32 @@ def main(argv: Iterable[str] | None = None) -> int:
         manifest, _artifacts = _validate_bundle(destination, args.hash_jobs)
         if manifest["bundle_id"] != bundle_id:
             raise ValueError("existing destination contains a different bundle")
+        if manifest["artifact_set_sha256"] != transport["artifact_set_sha256"]:
+            raise ValueError("existing destination artifact set does not match transport")
+        if _sha256(destination / "manifest.json") != transport["logical_manifest_sha256"]:
+            raise ValueError("existing destination logical manifest does not match transport")
+        _write_json_atomic(
+            destination / "restore_receipt.json",
+            {
+                "schema": "cppmega_megatron_restore_receipt_v1",
+                "status": "already_verified",
+                "bundle_id": bundle_id,
+                "transport": transport_uri,
+                "transport_sha256": hashlib.sha256(transport_bytes).hexdigest(),
+                "logical_manifest_sha256": transport["logical_manifest_sha256"],
+                "artifact_set_sha256": manifest["artifact_set_sha256"],
+                "artifact_count": manifest["artifact_count"],
+                "artifact_bytes": manifest["artifact_bytes"],
+                "restored_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
         print(json.dumps({"bundle": str(destination), "status": "already_verified"}))
         return 0
 
     partial = output_root / f".{bundle_id}.partial"
     archive = output_root / f".{bundle_id}.tar.zst"
-    if partial.exists() or archive.exists():
-        raise RuntimeError(
-            f"stale restore state exists; inspect and remove {partial} / {archive}"
-        )
+    if partial.exists():
+        shutil.rmtree(partial)
 
     archive_info = transport["archive"]
     _require_free_space(
@@ -234,37 +509,54 @@ def main(argv: Iterable[str] | None = None) -> int:
         archive_bytes=int(archive_info["size"]),
         headroom_gb=max(0, args.free_space_headroom_gb),
     )
-    _aws_download(
-        str(archive_info["uri"]), archive, endpoint=args.endpoint_url, env=env
+    archive_download = _acquire_archive(
+        uri=str(archive_info["uri"]),
+        archive=archive,
+        endpoint=args.endpoint_url,
+        env=env,
+        expected_size=int(archive_info["size"]),
+        expected_sha256=str(archive_info["sha256"]),
     )
-    if archive.stat().st_size != int(archive_info["size"]):
-        raise ValueError("downloaded archive size does not match transport descriptor")
-    if _sha256(archive) != archive_info["sha256"]:
-        raise ValueError("downloaded archive SHA-256 does not match transport descriptor")
 
-    _extract_tar_zst(archive, partial)
-    manifest, _artifacts = _validate_bundle(partial, args.hash_jobs)
-    if manifest["bundle_id"] != bundle_id:
-        raise ValueError("restored logical bundle ID does not match transport")
-    if manifest["artifact_set_sha256"] != transport["artifact_set_sha256"]:
-        raise ValueError("restored artifact set does not match transport")
-    if _sha256(partial / "manifest.json") != transport["logical_manifest_sha256"]:
-        raise ValueError("restored logical manifest does not match transport")
+    try:
+        expected_members = _expected_archive_members(
+            logical_manifest, logical_manifest_bytes
+        )
+        _extract_tar_zst(
+            archive,
+            partial,
+            expected_member_names=set(expected_members),
+            expected_member_records=expected_members,
+        )
+        manifest, _artifacts = _validate_bundle(partial, args.hash_jobs)
+        if manifest["bundle_id"] != bundle_id:
+            raise ValueError("restored logical bundle ID does not match transport")
+        if manifest["artifact_set_sha256"] != transport["artifact_set_sha256"]:
+            raise ValueError("restored artifact set does not match transport")
+        if _sha256(partial / "manifest.json") != transport["logical_manifest_sha256"]:
+            raise ValueError("restored logical manifest does not match transport")
+    except Exception:
+        shutil.rmtree(partial, ignore_errors=True)
+        raise
 
     os.replace(partial, destination)
     if not args.keep_archive:
         archive.unlink()
+        _archive_receipt_path(archive).unlink(missing_ok=True)
     receipt = {
         "schema": "cppmega_megatron_restore_receipt_v1",
+        "status": "restored_verified",
         "bundle_id": bundle_id,
         "transport": transport_uri,
+        "transport_sha256": hashlib.sha256(transport_bytes).hexdigest(),
+        "logical_manifest_sha256": transport["logical_manifest_sha256"],
+        "artifact_set_sha256": manifest["artifact_set_sha256"],
         "artifact_count": manifest["artifact_count"],
         "artifact_bytes": manifest["artifact_bytes"],
+        "archive_download": archive_download,
         "restored_at": datetime.now(timezone.utc).isoformat(),
     }
-    (destination / "restore_receipt.json").write_text(
-        json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    _write_json_atomic(destination / "restore_receipt.json", receipt)
     print(json.dumps({"bundle": str(destination), "status": "restored_verified"}))
     return 0
 

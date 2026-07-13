@@ -1,9 +1,17 @@
+import json
+from pathlib import Path
+import shutil
+import struct
 import subprocess
 
 import pytest
 
 from scripts.nebius_h200_megatron_cpp_world_sweep import (
+    NONZERO_GRAPH_SIDECARS,
     OVERLAY_PATHS,
+    REQUIRED_GRAPH_SIDECARS,
+    REQUIRED_TOKEN_SIDECARS,
+    _assert_prefix_contract,
     _docker_auth_from_config,
     first_public_ip,
     main,
@@ -12,6 +20,114 @@ from scripts.nebius_h200_megatron_cpp_world_sweep import (
     make_multi_sidecar_tar,
     remote_run_script,
 )
+from scripts.h200_megatron_preflight import main as h200_preflight_main
+
+
+_DTYPE_SIZES = {"uint8": 1, "uint16": 2, "uint32": 4, "int32": 4}
+
+
+def _write_valid_sidecar_prefix(prefix):
+    token_count = 3
+    document_count = 1
+    prefix.with_suffix(".bin").write_bytes(b"\x01\x00\x02\x00\x03\x00")
+    prefix.with_suffix(".idx").write_bytes(
+        b"MMIDIDX\x00\x00"
+        + struct.pack("<QBQQ", 1, 8, document_count, document_count + 1)
+        + struct.pack("<i", token_count)
+        + struct.pack("<q", 0)
+        + struct.pack("<2q", 0, document_count)
+    )
+
+    side_channel_paths = {}
+    for name in sorted(REQUIRED_TOKEN_SIDECARS):
+        dtype = "uint8" if name in {
+            "loss_mask",
+            "token_confidence_ids",
+            "token_structure_ids",
+            "token_def_use",
+            "token_change_mask_pre",
+            "token_change_mask_post",
+        } else "uint16"
+        if name in {
+            "token_entity_ids",
+            "token_scope_ids",
+            "token_symbol_ids",
+            "token_call_targets",
+            "token_type_refs",
+        }:
+            dtype = "uint32"
+        relative = f"{prefix.name}_{name}.bin"
+        payload = bytearray(token_count * _DTYPE_SIZES[dtype])
+        if name == "token_structure_ids":
+            payload[0] = 1
+        (prefix.parent / relative).write_bytes(payload)
+        side_channel_paths[name] = {"path": relative, "dtype": dtype}
+
+    graph_sidecar_paths = {}
+    for name in sorted(REQUIRED_GRAPH_SIDECARS):
+        if name in {"token_call_edges", "token_type_edges"}:
+            kind, dtype, shape_tail = "edge_pairs", "int32", [2]
+        elif name.endswith("_edges"):
+            kind, dtype, shape_tail = "edge_triples", "int32", [3]
+        else:
+            kind = "ragged_1d"
+            dtype = "uint32" if name in {"token_chunk_starts", "token_chunk_ends"} else "uint16"
+            shape_tail = [1]
+        item_count = 1 if name in NONZERO_GRAPH_SIDECARS else 0
+        offsets_relative = f"{prefix.name}_{name}_offsets.bin"
+        data_relative = f"{prefix.name}_{name}_data.bin"
+        (prefix.parent / offsets_relative).write_bytes(
+            struct.pack("<2q", 0, item_count)
+        )
+        payload = bytearray(item_count * shape_tail[0] * _DTYPE_SIZES[dtype])
+        if payload and name in {"token_chunk_ends", "token_chunk_kinds"}:
+            payload[0] = 1
+        (prefix.parent / data_relative).write_bytes(payload)
+        graph_sidecar_paths[name] = {
+            "kind": kind,
+            "offsets_path": offsets_relative,
+            "data_path": data_relative,
+            "offset_dtype": "int64",
+            "dtype": dtype,
+            "item_count": item_count,
+            "shape_tail": shape_tail,
+        }
+
+    source_platform = {
+        "schema": "cppmega_source_platform_v1",
+        "sequence_doc_offsets_path": f"{prefix.name}_source_platform_sequence_doc_offsets.bin",
+        "doc_platform_offsets_path": f"{prefix.name}_source_platform_doc_id_offsets.bin",
+        "platform_ids_path": f"{prefix.name}_source_platform_ids.bin",
+        "source_document_count": 1,
+        "platform_id_count": 1,
+    }
+    (prefix.parent / source_platform["sequence_doc_offsets_path"]).write_bytes(
+        struct.pack("<2q", 0, 1)
+    )
+    (prefix.parent / source_platform["doc_platform_offsets_path"]).write_bytes(
+        struct.pack("<2q", 0, 1)
+    )
+    (prefix.parent / source_platform["platform_ids_path"]).write_bytes(b"\x01\x00")
+    prefix.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "vocab_size": 65536,
+                "tokenizer_contract": "megacpp",
+                "dtype": "uint16",
+                "token_count": token_count,
+                "document_count": document_count,
+                "graph_sidecar_schema": "cppmega_graph_routes_v2",
+                "side_channel_paths": side_channel_paths,
+                "graph_sidecar_paths": graph_sidecar_paths,
+                "source_platform_sidecar": source_platform,
+            }
+        )
+    )
+    return json.loads(prefix.with_suffix(".json").read_text())
+
+
+def _write_tokenizer_dir(path):
+    shutil.copytree(Path(__file__).resolve().parents[1] / "data/tokenizer_v2", path)
 
 
 def test_first_public_ip_accepts_nebius_cidr_status_address():
@@ -76,6 +192,8 @@ def test_overlay_includes_batch_and_dataset_sidecar_contract():
     assert "cppmega/megatron/graph_route_attention_bias_patch.py" in OVERLAY_PATHS
     assert "cppmega/megatron/structure_dataset_patch.py" in OVERLAY_PATHS
     assert "cppmega/megatron/structure_batch.py" in OVERLAY_PATHS
+    assert "cppmega/megatron/h200_preflight.py" in OVERLAY_PATHS
+    assert "scripts/h200_megatron_preflight.py" in OVERLAY_PATHS
 
 
 def test_remote_script_enables_graph_routes_and_uses_selected_data_prefix():
@@ -105,6 +223,23 @@ def test_remote_script_enables_graph_routes_and_uses_selected_data_prefix():
     assert "--eval-iters 0" not in script
     assert "--cross-entropy-fusion-impl te" in script
     assert "--cross-entropy-fusion-impl linear" not in script
+
+
+def test_remote_script_runs_fail_closed_h200_preflight_before_sweep():
+    script = remote_run_script(
+        [64],
+        3,
+        "ghcr.io/datasunriseou/cppmega:latest",
+        data_prefix_name="cppmega_1024_current_mix_graph_train",
+    )
+
+    preflight = "python /opt/cppmega/scripts/h200_megatron_preflight.py"
+    assert preflight in script
+    assert "--data-prefix \"$DATA_PREFIX\"" in script
+    assert "--tokenizer-model /data/cpp_tokenizer_hf" in script
+    assert "--output /data/cppmega_h200_results/h200_preflight.json" in script
+    assert "CPPMEGA_H200_PREFLIGHT_STATUS=PASS" in script
+    assert script.index(preflight) < script.index('for SPEC in "${TEST_SPECS[@]}"')
 
 
 def test_remote_script_can_sweep_multiple_seq_lengths_with_separate_prefixes():
@@ -335,43 +470,8 @@ def test_make_ghcr_auth_tar_uses_token_file(tmp_path):
 def test_make_sidecar_tar_includes_graph_sidecars(tmp_path):
     prefix = tmp_path / "sample_train"
     tokenizer = tmp_path / "tok"
-    tokenizer.mkdir()
-    (tokenizer / "tokenizer.json").write_text("{}")
-
-    (prefix.with_suffix(".bin")).write_bytes(b"tokens")
-    (prefix.with_suffix(".idx")).write_bytes(b"index")
-    (tmp_path / "sample_train_token_structure_ids.bin").write_bytes(b"s")
-    (tmp_path / "sample_train_token_call_edges_offsets.bin").write_bytes(b"o")
-    (tmp_path / "sample_train_token_call_edges_data.bin").write_bytes(b"d")
-    for suffix in (
-        "source_platform_sequence_doc_offsets.bin",
-        "source_platform_doc_id_offsets.bin",
-        "source_platform_ids.bin",
-    ):
-        (tmp_path / f"sample_train_{suffix}").write_bytes(b"p")
-    prefix.with_suffix(".json").write_text(
-        __import__("json").dumps(
-            {
-                "side_channel_paths": {
-                    "token_structure_ids": {
-                        "path": "sample_train_token_structure_ids.bin",
-                        "dtype": "uint8",
-                    }
-                },
-                "graph_sidecar_paths": {
-                    "token_call_edges": {
-                        "offsets_path": "sample_train_token_call_edges_offsets.bin",
-                        "data_path": "sample_train_token_call_edges_data.bin",
-                    }
-                },
-                "source_platform_sidecar": {
-                    "sequence_doc_offsets_path": "sample_train_source_platform_sequence_doc_offsets.bin",
-                    "doc_platform_offsets_path": "sample_train_source_platform_doc_id_offsets.bin",
-                    "platform_ids_path": "sample_train_source_platform_ids.bin",
-                },
-            }
-        )
-    )
+    _write_tokenizer_dir(tokenizer)
+    _write_valid_sidecar_prefix(prefix)
     out = tmp_path / "sidecar.tgz"
 
     from scripts.nebius_h200_megatron_cpp_world_sweep import make_sidecar_tar
@@ -395,27 +495,11 @@ def test_make_sidecar_tar_includes_graph_sidecars(tmp_path):
 
 def test_make_multi_sidecar_tar_includes_each_prefix_once(tmp_path):
     tokenizer = tmp_path / "tok"
-    tokenizer.mkdir()
-    (tokenizer / "tokenizer.json").write_text("{}")
+    _write_tokenizer_dir(tokenizer)
 
     prefixes = [tmp_path / "seq1024_train", tmp_path / "seq2048_train"]
     for prefix in prefixes:
-        prefix.with_suffix(".bin").write_bytes(b"tokens")
-        prefix.with_suffix(".idx").write_bytes(b"index")
-        (tmp_path / f"{prefix.name}_token_structure_ids.bin").write_bytes(b"s")
-        prefix.with_suffix(".json").write_text(
-            __import__("json").dumps(
-                {
-                    "side_channel_paths": {
-                        "token_structure_ids": {
-                            "path": f"{prefix.name}_token_structure_ids.bin",
-                            "dtype": "uint8",
-                        }
-                    },
-                    "graph_sidecar_paths": {},
-                }
-            )
-        )
+        _write_valid_sidecar_prefix(prefix)
 
     out = tmp_path / "sidecars.tgz"
     make_multi_sidecar_tar(prefixes, tokenizer, out)
@@ -429,6 +513,78 @@ def test_make_multi_sidecar_tar_includes_each_prefix_once(tmp_path):
     assert "cppmega_sidecar/seq1024_train_token_structure_ids.bin" in names
     assert "cppmega_sidecar/seq2048_train_token_structure_ids.bin" in names
     assert "cpp_tokenizer_hf/tokenizer.json" in names
+
+
+def test_sidecar_preflight_rejects_missing_graph_sidecars(tmp_path):
+    prefix = tmp_path / "sample_train"
+    manifest = _write_valid_sidecar_prefix(prefix)
+    manifest["graph_sidecar_paths"].pop("token_chunk_ends")
+    prefix.with_suffix(".json").write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="missing graph sidecars"):
+        _assert_prefix_contract(prefix)
+
+
+def test_sidecar_preflight_rejects_zero_structure_values(tmp_path):
+    prefix = tmp_path / "sample_train"
+    manifest = _write_valid_sidecar_prefix(prefix)
+    structure = prefix.parent / manifest["side_channel_paths"]["token_structure_ids"]["path"]
+    structure.write_bytes(b"\x00" * structure.stat().st_size)
+
+    with pytest.raises(ValueError, match="token_structure_ids.*nonzero"):
+        _assert_prefix_contract(prefix)
+
+
+def test_sidecar_packaging_rejects_tokenizer_vocab_drift(tmp_path):
+    prefix = tmp_path / "sample_train"
+    _write_valid_sidecar_prefix(prefix)
+    tokenizer = tmp_path / "tok"
+    _write_tokenizer_dir(tokenizer)
+    tokenizer_path = tokenizer / "tokenizer.json"
+    payload = json.loads(tokenizer_path.read_text(encoding="utf-8"))
+    payload["model"]["vocab"].pop(next(iter(payload["model"]["vocab"])))
+    tokenizer_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="tokenizer vocab size"):
+        make_multi_sidecar_tar([prefix], tokenizer, tmp_path / "sidecars.tgz")
+
+
+def test_h200_preflight_real_local_dry_run_writes_bound_commands(tmp_path):
+    prefix = tmp_path / "sample_train"
+    tokenizer = tmp_path / "tok"
+    _write_valid_sidecar_prefix(prefix)
+    _write_tokenizer_dir(tokenizer)
+    output = tmp_path / "h200-preflight.json"
+    checkpoint = tmp_path / "checkpoint"
+
+    assert (
+        h200_preflight_main(
+            [
+                "--data-prefix",
+                str(prefix),
+                "--tokenizer-model",
+                str(tokenizer),
+                "--sequence-length",
+                "1024",
+                "--checkpoint-root",
+                str(checkpoint),
+                "--output",
+                str(output),
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+
+    receipt = json.loads(output.read_text(encoding="utf-8"))
+    assert receipt["schema"] == "cppmega_h200_megatron_preflight_v1"
+    assert receipt["status"] == "dry_run"
+    assert receipt["data"]["manifest"]["graph_sidecar_schema"] == "cppmega_graph_routes_v2"
+    assert receipt["checkpoint"]["full_optimizer_and_rng_state"] is True
+    assert receipt["commands"]["save"][receipt["commands"]["save"].index("--train-iters") + 1] == "1"
+    assert receipt["commands"]["restore"][receipt["commands"]["restore"].index("--train-iters") + 1] == "2"
+    assert "--load" in receipt["commands"]["restore"]
+    assert not checkpoint.exists()
 
 
 def test_docker_auth_returns_none_when_config_absent(tmp_path, monkeypatch):

@@ -34,6 +34,11 @@ from data_prep_parquet_to_megatron import (  # noqa: E402
     DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS,
     convert_parquet_to_megatron,
 )
+from data.publish_megatron_bundle_to_nebius_s3 import (  # noqa: E402
+    EXPECTED_BUNDLE_TOKENIZER_CONTRACT,
+    EXPECTED_VOCAB_SIZE,
+    _validate_tokenizer_directory,
+)
 
 
 DEFAULT_BUCKETS = (1024, 2048, 4096, 8192, 16384)
@@ -355,6 +360,8 @@ def _run_snapshot_audit(
             raise RuntimeError("existing audit receipt snapshot binding mismatch")
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     else:
+        empty_pr_root = audit_root / "empty_standalone_pr_root"
+        empty_pr_root.mkdir(parents=True, exist_ok=True)
         subprocess.run(
             [
                 sys.executable,
@@ -363,6 +370,8 @@ def _run_snapshot_audit(
                 str(snapshot_root / "code"),
                 "--commit-root",
                 str(snapshot_root / "commits"),
+                "--pr-root",
+                str(empty_pr_root),
                 "--buckets",
                 ",".join(str(bucket) for bucket in buckets),
                 "--workers",
@@ -588,6 +597,34 @@ def _artifact_set_sha256(records: list[dict[str, object]]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _stage_tokenizer(tokenizer_dir: Path, bundle_root: Path) -> dict[str, object]:
+    source_files = sorted(_validate_tokenizer_directory(tokenizer_dir))
+    source = tokenizer_dir.resolve()
+
+    target = bundle_root / "tokenizer"
+    if target.exists():
+        raise RuntimeError(f"tokenizer staging target already exists: {target}")
+    target.mkdir()
+    records: list[dict[str, object]] = []
+    for path in source_files:
+        staged = target / path.name
+        shutil.copy2(path, staged)
+        records.append(
+            {
+                "path": staged.relative_to(bundle_root).as_posix(),
+                "size": staged.stat().st_size,
+                "sha256": _sha256(staged),
+            }
+        )
+    return {
+        "path": "tokenizer",
+        "contract": EXPECTED_BUNDLE_TOKENIZER_CONTRACT,
+        "vocab_size": EXPECTED_VOCAB_SIZE,
+        "files": records,
+        "artifact_set_sha256": _artifact_set_sha256(records),
+    }
+
+
 def _portable_bucket_results(
     bundle_root: Path, results: list[dict[str, object]]
 ) -> list[dict[str, object]]:
@@ -638,6 +675,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--conveyor-manifest",
         type=Path,
         default=sibling / "outputs/conveyor/macro_routes_v1_20260710_135335/_done.json",
+    )
+    parser.add_argument(
+        "--tokenizer-dir",
+        type=Path,
+        default=REPO_ROOT / "data/tokenizer_v2",
     )
     parser.add_argument("--buckets", default=",".join(map(str, DEFAULT_BUCKETS)))
     parser.add_argument("--min-age-seconds", type=float, default=120.0)
@@ -722,6 +764,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         provenance_root / "repaired_snapshot_manifest.json",
         repaired_snapshot_manifest,
     )
+    tokenizer = _stage_tokenizer(args.tokenizer_dir, partial_dir)
     if not args.keep_snapshot:
         shutil.rmtree(snapshot_root)
     artifacts = _artifact_records(partial_dir, args.hash_jobs)
@@ -731,8 +774,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         "schema": "cppmega_megatron_bundle_v1",
         "bundle_id": f"{output_dir.name}-{artifact_set_sha256[:16]}",
         "created_at": _utc_now(),
-        "tokenizer_contract": "megacpp-vocab-65536",
-        "vocab_size": 65536,
+        "tokenizer_contract": EXPECTED_BUNDLE_TOKENIZER_CONTRACT,
+        "vocab_size": EXPECTED_VOCAB_SIZE,
+        "tokenizer": tokenizer,
         "token_column": "input_ids",
         "length_column": "valid_token_count",
         "writer_backend": "mmididx",

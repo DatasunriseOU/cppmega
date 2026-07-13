@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import scripts.data.build_macro_routes_megatron_bundle as builder
 from scripts.data.build_macro_routes_megatron_bundle import (
     _artifact_set_sha256,
     build_arg_parser,
@@ -14,6 +15,7 @@ from scripts.data.build_macro_routes_megatron_bundle import (
     _portable_bucket_results,
     _run_snapshot_audit,
     _snapshot_sources,
+    _stage_tokenizer,
     _write_repaired_snapshot_manifest,
 )
 
@@ -35,6 +37,26 @@ def test_builder_discards_intermediate_snapshot_by_default() -> None:
 
     assert parser.parse_args([]).keep_snapshot is False
     assert parser.parse_args(["--keep-snapshot"]).keep_snapshot is True
+
+
+def test_builder_stages_and_hashes_the_production_tokenizer(tmp_path: Path) -> None:
+    source = Path(__file__).resolve().parents[1] / "data/tokenizer_v2"
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+
+    descriptor = _stage_tokenizer(source, bundle)
+
+    assert descriptor["path"] == "tokenizer"
+    assert descriptor["vocab_size"] == 65536
+    assert {record["path"] for record in descriptor["files"]} == {
+        "tokenizer/special_tokens_map.json",
+        "tokenizer/tokenizer.json",
+        "tokenizer/tokenizer_config.json",
+    }
+    for record in descriptor["files"]:
+        staged = bundle / record["path"]
+        assert staged.stat().st_size == record["size"]
+        assert hashlib.sha256(staged.read_bytes()).hexdigest() == record["sha256"]
 
 
 def test_bucket_prefixes_are_bundle_relative_and_cannot_escape(tmp_path: Path) -> None:
@@ -71,6 +93,42 @@ def test_builder_rejects_unbound_existing_audit_receipt(tmp_path: Path) -> None:
             workers=1,
             snapshot_manifest_sha256="abc",
         )
+
+
+def test_snapshot_audit_passes_explicit_empty_pr_root(tmp_path: Path, monkeypatch) -> None:
+    captured: dict[str, list[str]] = {}
+    audit_root = tmp_path / "audit"
+
+    def fake_run(cmd: list[str], *, check: bool) -> None:
+        assert check is True
+        captured["cmd"] = cmd
+        audit_root.mkdir(parents=True, exist_ok=True)
+        (audit_root / "sidecar_parquet_audit.json").write_text(
+            json.dumps(
+                {
+                    "total": {"bad_files": 0, "bad_rows": 0},
+                    "bad_files": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(builder.subprocess, "run", fake_run)
+
+    _run_snapshot_audit(
+        snapshot_root=tmp_path / "snapshot",
+        audit_script=tmp_path / "audit.py",
+        audit_root=audit_root,
+        buckets=(1024,),
+        workers=1,
+        snapshot_manifest_sha256="abc",
+    )
+
+    cmd = captured["cmd"]
+    pr_root = Path(cmd[cmd.index("--pr-root") + 1])
+    assert pr_root == audit_root / "empty_standalone_pr_root"
+    assert pr_root.is_dir()
+    assert "outputs/reindexed_pr" not in " ".join(cmd)
 
 
 def _write(path: Path, value: bytes) -> None:
