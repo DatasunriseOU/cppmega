@@ -419,7 +419,7 @@
     },
     {
       "id": 46,
-      "content": "<RESERVED_46>",
+      "content": "<SPACE>",
       "single_word": false,
       "lstrip": false,
       "rstrip": false,
@@ -428,7 +428,7 @@
     },
     {
       "id": 47,
-      "content": "<RESERVED_47>",
+      "content": "<NL>",
       "single_word": false,
       "lstrip": false,
       "rstrip": false,
@@ -64878,8 +64878,8 @@
       "<INCLUDE_CONTEXT>": 42,
       "<TEMPLATE_INST>": 43,
       "<OVERLOAD_SET>": 44,
-      "<RESERVED_46>": 46,
-      "<RESERVED_47>": 47,
+      "<SPACE>": 46,
+      "<NL>": 47,
       "<RESERVED_48>": 48,
       "<RESERVED_49>": 49,
       "<RESERVED_50>": 50,

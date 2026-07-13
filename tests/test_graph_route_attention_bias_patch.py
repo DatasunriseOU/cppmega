@@ -40,6 +40,9 @@ def test_dense_graph_attention_bias_is_broadcastable_post_scale_bias():
         "graph_type_edge_counts": torch.tensor([1], dtype=torch.long),
         "graph_build_edges": torch.tensor([[[3, 0, 20], [-1, -1, -1]]], dtype=torch.long),
         "graph_build_edge_counts": torch.tensor([1], dtype=torch.long),
+        "graph_chunk_starts": torch.tensor([[0, 1, 2, 3]], dtype=torch.long),
+        "graph_chunk_ends": torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+        "graph_chunk_counts": torch.tensor([4], dtype=torch.long),
     }
 
     bias = build_dense_graph_attention_bias_from_structure_batch(
@@ -81,11 +84,35 @@ def test_dense_graph_attention_bias_requires_route_edges():
         )
 
 
+def test_dense_graph_attention_bias_accepts_explicit_empty_prompt_graph():
+    structure_batch = {
+        "graph_call_edges": torch.zeros((1, 0, 2), dtype=torch.long),
+        "graph_call_edge_counts": torch.zeros((1,), dtype=torch.long),
+        "graph_chunk_starts": torch.zeros((1, 0), dtype=torch.long),
+        "graph_chunk_ends": torch.zeros((1, 0), dtype=torch.long),
+        "graph_chunk_counts": torch.zeros((1,), dtype=torch.long),
+    }
+
+    bias = build_dense_graph_attention_bias_from_structure_batch(
+        structure_batch,
+        batch_size=1,
+        seqlen_q=4,
+        seqlen_k=4,
+        device=torch.device("cpu"),
+    )
+
+    assert tuple(bias.shape) == (1, 1, 4, 4)
+    assert torch.count_nonzero(bias).item() == 0
+
+
 def test_dense_graph_attention_bias_raises_above_max_seq(monkeypatch):
     monkeypatch.setenv("CPPMEGA_GRAPH_DENSE_MAX_SEQ", "4")
     structure_batch = {
         "graph_call_edges": torch.tensor([[[0, 2], [-1, -1]]], dtype=torch.long),
         "graph_call_edge_counts": torch.tensor([1], dtype=torch.long),
+        "graph_chunk_starts": torch.tensor([[0, 1, 2, 3]], dtype=torch.long),
+        "graph_chunk_ends": torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+        "graph_chunk_counts": torch.tensor([4], dtype=torch.long),
     }
     with pytest.raises(RuntimeError, match="CPPMEGA_GRAPH_DENSE_MAX_SEQ"):
         build_dense_graph_attention_bias_from_structure_batch(
@@ -102,6 +129,9 @@ def test_dense_graph_attention_bias_builds_at_max_seq(monkeypatch):
     structure_batch = {
         "graph_call_edges": torch.tensor([[[0, 2], [-1, -1]]], dtype=torch.long),
         "graph_call_edge_counts": torch.tensor([1], dtype=torch.long),
+        "graph_chunk_starts": torch.tensor([[0, 1, 2, 3]], dtype=torch.long),
+        "graph_chunk_ends": torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+        "graph_chunk_counts": torch.tensor([4], dtype=torch.long),
     }
     bias = build_dense_graph_attention_bias_from_structure_batch(
         structure_batch,

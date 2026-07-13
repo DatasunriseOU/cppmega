@@ -53,8 +53,10 @@ class CppMegaDomainEmbedding(nn.Module):
 
         self.stacked_emb.weight.is_embedding_or_output_parameter = True
         self.up_proj.weight.is_embedding_or_output_parameter = True
+        # Keep the additive residual exactly zero at initialization while
+        # preserving a first-step gradient into the sidecar table. Zeroing both
+        # factors makes this entire path gradient-dead forever.
         nn.init.zeros_(self.stacked_emb.weight)
-        nn.init.zeros_(self.up_proj.weight)
 
     def forward(
         self,
@@ -71,9 +73,10 @@ class CppMegaDomainEmbedding(nn.Module):
         }
         ref = next((value for value in inputs.values() if value is not None), None)
         if ref is None:
-            # No domain sidecars for this step -> no additive signal. Return None
-            # (not a CPU scalar) so the caller skips the add cleanly on any device.
-            return None
+            raise ValueError(
+                "[cppmega-domain] domain embedding is enabled but all domain "
+                "sidecars are absent"
+            )
 
         batch, seq = ref.shape[:2]
         ids_list: list[torch.Tensor] = []

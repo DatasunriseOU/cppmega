@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CppMega: полный review данных, моделей и обучения</title>
+  <style>
+    :root {
+      --ink: #171a1f;
+      --muted: #5d6672;
+      --line: #d8dde4;
+      --soft: #f4f6f8;
+      --paper: #ffffff;
+      --blue: #1769aa;
+      --green: #16724b;
+      --amber: #9a5b00;
+      --red: #b4232c;
+      --violet: #6650a4;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; max-width: 100%; overflow-x: hidden; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--paper);
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 15px;
+      line-height: 1.55;
+      letter-spacing: 0;
+      max-width: 100%;
+      overflow-x: hidden;
+    }
+    a { color: var(--blue); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+    code { font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.9em; }
+    .topline { height: 5px; background: linear-gradient(90deg, var(--red) 0 18%, var(--amber) 18% 36%, var(--green) 36% 61%, var(--blue) 61% 82%, var(--violet) 82%); }
+    header { border-bottom: 1px solid var(--line); background: #fafbfc; }
+    .wrap { width: min(1220px, calc(100% - 40px)); margin: 0 auto; }
+    .heading { padding: 34px 0 25px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 28px; align-items: end; }
+    .heading > *, main, section { min-width: 0; }
+    .eyebrow { margin: 0 0 7px; color: var(--red); font-size: 12px; font-weight: 750; text-transform: uppercase; }
+    h1 { margin: 0; font-size: clamp(28px, 4vw, 46px); line-height: 1.08; font-weight: 760; overflow-wrap: anywhere; }
+    .subtitle { margin: 11px 0 0; color: var(--muted); font-size: 17px; max-width: 780px; }
+    .stamp { text-align: right; color: var(--muted); white-space: nowrap; }
+    .stamp strong { display: block; color: var(--ink); font-size: 16px; }
+    nav { border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 10; background: rgba(255,255,255,.96); backdrop-filter: blur(10px); }
+    nav .wrap { min-height: 48px; display: flex; align-items: center; gap: 23px; overflow-x: auto; }
+    nav a { color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 700; white-space: nowrap; }
+    nav a:hover { color: var(--ink); }
+    main { padding: 32px 0 70px; }
+    section { padding: 28px 0; border-bottom: 1px solid var(--line); }
+    section:last-child { border-bottom: 0; }
+    h2 { margin: 0 0 16px; font-size: 24px; line-height: 1.2; }
+    h3 { margin: 24px 0 10px; font-size: 17px; }
+    p { margin: 0 0 13px; }
+    .verdict { border-left: 5px solid var(--red); padding: 18px 20px; background: #fff6f6; width: 100%; max-width: 1080px; overflow-wrap: anywhere; }
+    .verdict strong { color: var(--red); }
+    .metrics { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin-top: 22px; }
+    .metric { border: 1px solid var(--line); border-radius: 6px; padding: 14px 13px; min-width: 0; }
+    .metric b { display: block; font-size: 20px; line-height: 1.15; overflow-wrap: anywhere; }
+    .metric span { color: var(--muted); font-size: 12px; }
+    .status-row { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 12px; margin: 18px 0; }
+    .status { border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; }
+    .status .label { color: var(--muted); font-size: 12px; text-transform: uppercase; font-weight: 750; }
+    .status .value { display: block; margin-top: 4px; font-size: 16px; font-weight: 730; overflow-wrap: anywhere; }
+    .ok { color: var(--green); }
+    .running { color: var(--amber); }
+    .blocked { color: var(--red); }
+    .table-scroll { width: 100%; max-width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; }
+    table { width: 100%; border-collapse: collapse; min-width: 760px; }
+    th, td { padding: 11px 12px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+    th { background: var(--soft); color: #3f4751; font-size: 12px; text-transform: uppercase; font-weight: 760; }
+    tr:last-child td { border-bottom: 0; }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .sev { display: inline-block; min-width: 66px; font-size: 11px; font-weight: 800; text-transform: uppercase; }
+    .sev.critical { color: var(--red); }
+    .sev.high { color: var(--amber); }
+    .sev.medium { color: var(--blue); }
+    .chart { margin: 20px 0 4px; display: grid; gap: 11px; }
+    .bar-row { display: grid; grid-template-columns: 72px minmax(240px, 1fr) 118px; gap: 12px; align-items: center; }
+    .bar-label { font-variant-numeric: tabular-nums; font-weight: 720; }
+    .bar-track { height: 24px; background: var(--soft); border: 1px solid var(--line); display: flex; overflow: hidden; border-radius: 4px; }
+    .bar-code { background: var(--blue); height: 100%; }
+    .bar-commit { background: var(--green); height: 100%; }
+    .bar-value { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+    .legend { display: flex; gap: 18px; margin: 12px 0 0 84px; color: var(--muted); font-size: 12px; }
+    .dot { width: 9px; height: 9px; display: inline-block; margin-right: 6px; }
+    .dot.code { background: var(--blue); } .dot.commit { background: var(--green); }
+    .steps { counter-reset: plan; display: grid; gap: 0; border-top: 1px solid var(--line); }
+    .step { counter-increment: plan; display: grid; grid-template-columns: 42px 150px minmax(0,1fr) 220px; gap: 12px; padding: 15px 0; border-bottom: 1px solid var(--line); }
+    .step::before { content: counter(plan); width: 28px; height: 28px; display: grid; place-items: center; border: 1px solid var(--ink); border-radius: 50%; font-weight: 750; }
+    .step b { font-size: 14px; }
+    .step .gate { color: var(--muted); font-size: 13px; }
+    .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 30px; }
+    ul, ol { margin: 9px 0 0; padding-left: 21px; }
+    li { margin: 7px 0; }
+    .note { padding: 13px 15px; background: var(--soft); border-left: 3px solid var(--blue); color: #3d4650; }
+    p code, .note code { overflow-wrap: anywhere; word-break: break-word; white-space: normal; }
+    .links { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px 24px; }
+    footer { background: #171a1f; color: #c8ced6; padding: 28px 0 40px; font-size: 13px; }
+    footer strong { color: white; }
+    @media (max-width: 900px) {
+      .heading { grid-template-columns: 1fr; }
+      .stamp { text-align: left; }
+      .metrics { grid-template-columns: repeat(3, minmax(0,1fr)); }
+      .status-row, .columns { grid-template-columns: 1fr; }
+      .step { grid-template-columns: 36px 1fr; }
+      .step > :nth-child(n+2) { grid-column: 2; }
+      .links { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 560px) {
+      .wrap { width: calc(100% - 24px); }
+      .heading { gap: 20px; }
+      .stamp { white-space: normal; }
+      nav .wrap { width: 100%; padding: 0 12px; }
+      .metrics { grid-template-columns: repeat(2, minmax(0,1fr)); }
+      .bar-row { grid-template-columns: 54px minmax(160px,1fr); }
+      .bar-value { grid-column: 2; text-align: left; }
+      h1 { font-size: 30px; }
+      .verdict { padding: 16px 14px; }
+      .table-scroll { max-width: calc(100vw - 24px); }
+    }
+  </style>
+</head>
+<body>
+  <div class="topline"></div>
+  <header>
+    <div class="wrap heading">
+      <div>
+        <p class="eyebrow">Engineering review / evidence first</p>
+        <h1>CppMega: данные, модели, обучение и генерация кода</h1>
+        <p class="subtitle">Полный разбор двух репозиториев, реально добежавшего parquet-корпуса, graph-routes механизмов, eval-контрактов и следующего training curriculum.</p>
+      </div>
+      <div class="stamp"><strong>13 июля 2026</strong>8 независимых review lanes<br>cppmega + cppmega.mlx</div>
+    </div>
+  </header>
+  <nav><div class="wrap">
+    <a href="#verdict">Вердикт</a><a href="#findings">Findings</a><a href="#data">Данные</a><a href="#bundle">Megatron</a><a href="#fix-plan">Fix plan</a><a href="#target">Цель</a><a href="#models">Модели</a><a href="#codegen">Codegen</a><a href="#training">Обучение</a><a href="#evidence">Проверки</a>
+  </div></nav>
+
+  <main class="wrap">
+    <section id="verdict">
+      <h2>Вердикт</h2>
+      <div class="verdict"><strong>Старые Megatron prefixes и старые graph-route checkpoints не являются доказательством корректности.</strong> В landed parquet была реальная утечка между документами, а в прежнем training path были неполные sidecars, неверная система координат graph edges и неработающие градиенты side embeddings. Исправленный frozen snapshot содержит достаточно данных для следующего meaningful run, но production objective mixer и graph-conditioned inference ещё не собраны в один надёжный путь.</div>
+      <div class="metrics">
+        <div class="metric"><b>4.133B</b><span>valid tokens</span></div>
+        <div class="metric"><b>4.124B</b><span>trained tokens</span></div>
+        <div class="metric"><b>2.631M</b><span>packed sequences</span></div>
+        <div class="metric"><b>11,771</b><span>manifest shards</span></div>
+        <div class="metric"><b>5</b><span>context buckets</span></div>
+        <div class="metric"><b>~714.7M</b><span>model parameters</span></div>
+      </div>
+    </section>
+
+    <section id="findings">
+      <h2>Главные findings</h2>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Severity</th><th>Проблема</th><th>Статус</th><th>Что сделано / что осталось</th></tr></thead>
+        <tbody>
+          <tr><td><span class="sev critical">Critical</span></td><td>810,921 строк <code>code/1024</code> обучались через реальные границы документов.</td><td class="ok">Исправлено</td><td>Frozen snapshot переписан по независимому oracle; восстановлено 3,719,382 boundary targets.</td></tr>
+          <tr><td><span class="sev critical">Critical</span></td><td>Конвертация могла захватить interrupted/unmanifested parquet.</td><td class="ok">Исправлено</td><td>Immutable allowlist из <code>_done.json</code>; 39 residual files исключены.</td></tr>
+          <tr><td><span class="sev critical">Critical</span></td><td>H200 tokenizer держал reserved tokens вместо <code>&lt;SPACE&gt;/&lt;NL&gt;</code> на ID 46/47.</td><td class="ok">Исправлено</td><td>Оба tokenizer artifacts проверяются по точным строкам и ID.</td></tr>
+          <tr><td><span class="sev critical">Critical</span></td><td>Domain/structure residual embeddings были gradient-dead при инициализации.</td><td class="ok">Исправлено</td><td>Нулевой residual сохранён, но gradient path жив; есть regression.</td></tr>
+          <tr><td><span class="sev high">High</span></td><td>Call/type edges были chunk indices, а Megatron трактовал их как token offsets.</td><td class="ok">Исправлено</td><td>Graph schema v2 фиксирует coordinate space и делает chunk-to-sample remap.</td></tr>
+          <tr><td><span class="sev high">High</span></td><td>Аудитор читал крупный parquet целиком и доходил до 6–9 GB RSS на worker.</td><td class="ok">Исправлено</td><td>Row-group aggregation: 400 MB peak на реальном 6.2M-token shard.</td></tr>
+          <tr><td><span class="sev high">High</span></td><td>Local MLX reader выбрасывал compact MMIDIDX строки короче bucket; на 2k читалось только 220 из 441,140.</td><td class="ok">Исправлено</td><td>Padding восстанавливается в памяти; все пять bucket дают ровно один sample на source row и сохраняют graph routes.</td></tr>
+          <tr><td><span class="sev high">High</span></td><td>S3 publisher мог перезаписать immutable bundle object при другом SHA.</td><td class="ok">Исправлено</td><td>Artifacts/manifest падают на remote mismatch; overwrite разрешён только для <code>latest.json</code>.</td></tr>
+          <tr><td><span class="sev high">High</span></td><td>Nebius возвращал metadata key как <code>Sha256</code>, а publisher сравнивал только lowercase и ложно отклонял правильный upload.</td><td class="ok">Исправлено live</td><td>Case-insensitive metadata contract закреплён тестом и повторным remote HEAD.</td></tr>
+          <tr><td><span class="sev high">High</span></td><td><code>qname</code> не уникален; lookup и 31-bit semantic IDs всё ещё схлопывают overloads.</td><td class="blocked">Нужна регенерация</td><td>Storage UID уже composite; routing надо перевести на clang USR/signature + <code>qname → candidates</code>.</td></tr>
+          <tr><td><span class="sev high">High</span></td><td>Long runner остаётся преимущественно causal CE; FIM/IFIM/real commit/graph losses разрознены.</td><td class="blocked">Блокер train</td><td>Нужен production objective mixer с realised-token receipts.</td></tr>
+          <tr><td><span class="sev high">High</span></td><td>MLX умеет читать graph v2, но normal batch/model/loss автоматически его не использует.</td><td class="blocked">Не готово</td><td>Нужна graph packet → block bias/indexer loss проводка и Megatron↔MLX logits parity.</td></tr>
+          <tr><td><span class="sev high">High</span></td><td>Prompt generation не строит реальный repo graph; generated suffix получает нулевые sidecars.</td><td class="blocked">Не готово</td><td>Нужен clang prompt builder и incremental/reparse suffix strategy.</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <section id="data">
+      <h2>Что реально вошло в frozen corpus</h2>
+      <p>Только manifest-complete parquet. Это сертифицированный срез, а не конец живого conveyor: 16 failed units исключены, текущие code/commit workers продолжают писать следующую генерацию.</p>
+      <div class="chart" aria-label="Распределение valid tokens по bucket">
+        <div class="bar-row"><span class="bar-label">1,024</span><div class="bar-track"><span class="bar-code" style="width:87.34%"></span><span class="bar-commit" style="width:12.66%"></span></div><span class="bar-value">1.712B</span></div>
+        <div class="bar-row"><span class="bar-label">2,048</span><div class="bar-track"><span class="bar-code" style="width:18.40%"></span><span class="bar-commit" style="width:18.33%"></span></div><span class="bar-value">629.5M</span></div>
+        <div class="bar-row"><span class="bar-label">4,096</span><div class="bar-track"><span class="bar-code" style="width:16.48%"></span><span class="bar-commit" style="width:21.69%"></span></div><span class="bar-value">653.3M</span></div>
+        <div class="bar-row"><span class="bar-label">8,192</span><div class="bar-track"><span class="bar-code" style="width:13.03%"></span><span class="bar-commit" style="width:23.29%"></span></div><span class="bar-value">621.7M</span></div>
+        <div class="bar-row"><span class="bar-label">16,384</span><div class="bar-track"><span class="bar-code" style="width:9.67%"></span><span class="bar-commit" style="width:20.46%"></span></div><span class="bar-value">515.9M</span></div>
+      </div>
+      <div class="legend"><span><i class="dot code"></i>code</span><span><i class="dot commit"></i>commits + integrated PR</span></div>
+      <p class="note"><b>Trained-token equivalent steps</b> при 196,608 capacity tokens/step: 1,024 → 8,668; 2,048 → 3,199; 4,096 → 3,321; 8,192 → 3,161; 16,384 → 2,623. Это расчёт по <code>loss_mask</code>, а не предположение о 100% заполнении каждого batch.</p>
+      <h3>Точный inventory</h3>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Bucket</th><th class="num">Code files</th><th class="num">Code tokens</th><th class="num">Commit files</th><th class="num">Commit tokens</th><th class="num">Всего</th></tr></thead>
+        <tbody>
+          <tr><td>1,024</td><td class="num">293</td><td class="num">1,495,779,442</td><td class="num">2,073</td><td class="num">216,519,785</td><td class="num"><b>1,712,299,227</b></td></tr>
+          <tr><td>2,048</td><td class="num">293</td><td class="num">315,334,535</td><td class="num">2,074</td><td class="num">314,170,230</td><td class="num"><b>629,504,765</b></td></tr>
+          <tr><td>4,096</td><td class="num">289</td><td class="num">282,151,520</td><td class="num">2,074</td><td class="num">371,189,937</td><td class="num"><b>653,341,457</b></td></tr>
+          <tr><td>8,192</td><td class="num">289</td><td class="num">223,059,383</td><td class="num">2,069</td><td class="num">398,656,066</td><td class="num"><b>621,715,449</b></td></tr>
+          <tr><td>16,384</td><td class="num">277</td><td class="num">165,555,100</td><td class="num">2,040</td><td class="num">350,331,237</td><td class="num"><b>515,886,337</b></td></tr>
+        </tbody>
+      </table></div>
+      <p class="note">PR sidecar отдельно не публикуется: PR title/body/comments интегрированы в commit documents. У 14,041 уже замороженных PR-bearing документов structured PR number ещё null, но discussion text сохранён.</p>
+      <h3>Graph coverage</h3>
+      <div class="metrics">
+        <div class="metric"><b>13.59M</b><span>chunks</span></div>
+        <div class="metric"><b>644,450</b><span>call edges</span></div>
+        <div class="metric"><b>452,370</b><span>type edges</span></div>
+        <div class="metric"><b>17.95M</b><span>token-route edges</span></div>
+        <div class="metric"><b>572,229</b><span>build edges</span></div>
+        <div class="metric"><b class="blocked">0</b><span>shell / diag / cross</span></div>
+      </div>
+      <p class="note"><b>A2/global symbols:</b> rebuilt DB содержит 14,199 <code>std</code> rows (10,570 functions + 3,629 types), 14,276 <code>std::</code>-prefixed rows и 0 libiberty rows. Старое загрязнение исправлено. Но distinct qnames только 4,869, что подтверждает необходимость USR/signature candidate resolution.</p>
+    </section>
+
+    <section id="bundle">
+      <h2>Новый Megatron bundle</h2>
+      <div class="status-row">
+        <div class="status"><span class="label">Boundary repair</span><span class="value ok">Завершён и подтверждён</span></div>
+        <div class="status"><span class="label">Local bundle</span><span class="value ok" id="local-build-status">COMPLETE · five-bucket MLX smoke</span></div>
+        <div class="status"><span class="label">Nebius S3</span><span class="value ok" id="s3-publish-status">COMPLETE · HEAD + SHA verified</span></div>
+      </div>
+      <p><code>/Volumes/external/sources/cppmega.mlx/outputs/megatron_ready/macro_routes_v1_20260713</code></p>
+      <p><code>macro_routes_v1_20260713-8c550514dd52ddc9</code> · 236 artifacts · 174,421,216,970 bytes</p>
+      <p><code>macro_routes_v1_20260713.tar.zst</code> · 2,823,467,371 bytes · 61.8x compression</p>
+      <p><code>s3://cppmega-sidecar-20260627/cppmega-megatron/macro-routes/transports/macro_routes_v1_20260713-8c550514dd52ddc9/</code></p>
+      <div class="columns">
+        <div><h3>В каждом bucket</h3><ul><li>MMIDIDX v1 token <code>.bin/.idx</code>;</li><li>18 token-aligned sidecars, включая <code>loss_mask</code> и row-local <code>doc_ids</code>;</li><li>graph routes v2: call/type/domain/build/shell/diagnostic/cross-domain;</li><li>chunk spans и compact nested-CSR source platforms;</li><li>coordinate spaces, dtypes, counts и SHA-256.</li></ul></div>
+        <div><h3>Publication semantics</h3><ul><li>237 archive members потоково сверены по size + SHA;</li><li>remote archive и logical manifest immutable;</li><li><code>transport.json</code> пишется после payload;</li><li><code>latest_transport.json</code> обновляется последним;</li><li>restore проверяет место, SHA и делает atomic rename.</li></ul></div>
+      </div>
+      <p class="note">Local MLX compact-row restoration проверена на всём bundle: 1,804,082 / 441,140 / 230,004 / 110,040 / 46,197 samples, ровно по MMIDIDX document count. Token sidecars и graph v2 packets читаются во всех bucket без физического расширения padding.</p>
+      <p class="note">Remote proof: archive 2,823,467,371 bytes, SHA <code>5ac3e095…a1c93a7</code>; logical manifest byte-identical local copy; transport/latest SHA совпали; active multipart и старый uncommitted raw-prefix отсутствуют.</p>
+    </section>
+
+    <section id="fix-plan">
+      <h2>План исправлений</h2>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Приоритет</th><th>Workstream</th><th>Что менять</th><th>Acceptance gate</th></tr></thead>
+        <tbody>
+          <tr><td><b>P0</b></td><td>Symbol identity</td><td>Clang USR/signature, local USR index, qname candidates, referenced-cursor resolution.</td><td>Overload/template tests; regenerate semantic/call/type routes.</td></tr>
+          <tr><td><b>P0</b></td><td>Objective mixer</td><td>Production FIM/AST-FIM/IFIM, real diff/pre-post, recovery и graph losses с realised-token accounting.</td><td>50M S0 receipt; configured ratios; никакого synthetic post-as-diff.</td></tr>
+          <tr><td><b>P0</b></td><td>Graph parity</td><td>Graph v2 packet → MLX model/loss; реальные prompt graphs на MLX и H200.</td><td>Megatron↔MLX logits parity; graph-on меняет logits и gradients.</td></tr>
+          <tr><td><b>P0</b></td><td>Codegen eval</td><td>Разные prompt contracts, pass@k, leakage hashes, format/parse/compile/link/run/sanitizer.</td><td>Reference cases green локально; старые 0/4 остаются baseline.</td></tr>
+          <tr><td><b>P1</b></td><td>Domain data</td><td>Полные build/shell/diagnostic/SQL parsers и routes.</td><td>Golden parser corpus; nonzero shell/diag/cross edges; parquet regeneration.</td></tr>
+          <tr><td><b>P1</b></td><td>Transactions</td><td>Atomic five-bucket publish + dedup, temp→replace, reservation heartbeat.</td><td>Kill/restart и duplicate-race regressions.</td></tr>
+          <tr><td><b>P1</b></td><td>Sparse DSA</td><td>Caller mask, candidate union, recall/dense parity; пока dense GQA.</td><td>Recall@256 ≥95%, NLL Δ≤2%, затем 32k–128k MFU sweep.</td></tr>
+          <tr><td><b>P2</b></td><td>Loop/world/tool</td><td>Typed trajectories/actions, stable loop schedule, verified outcomes.</td><td>Bounded residuals и traceable edit→build→test rewards.</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <section id="target">
+      <h2>Что именно мы строим</h2>
+      <div class="columns">
+        <div><p><b>CppMega — C/C++ software world model, а не general-purpose chat model.</b> Основной stream — source, templates/macros, comments/docstrings и clang semantics. Commit + integrated PR задают реальные pre/diff/post переходы.</p><p>Build systems, shells, diagnostics и позднее embedded SQL остаются отдельными delimiter-bounded domains со своими parsers, roles и routes; они не маскируются под comments.</p></div>
+        <div><p>Dense GQA видит полный контекст и получает deterministic AST/def-use/type/call/include/build/diagnostic priors. <code>I_neural + βS_graph</code> включается как DSA selector после dense graph training, главным образом для 32k–128k.</p><p>Stable loop моделирует edit→build→diagnostic→test trajectories. Decode заканчивается не текстом, а reparse, format, compile, link, executable oracle и verified feedback.</p></div>
+      </div>
+    </section>
+
+    <section id="models">
+      <h2>Модели и механизмы</h2>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Механизм</th><th>Есть в коде</th><th>Production proof</th><th>Следующий gate</th></tr></thead>
+        <tbody>
+          <tr><td>Dense GQA + graph bias</td><td class="ok">Да</td><td>Старый H200 run невалиден как data-contract proof</td><td>Graph-on/off logits и edge-gradient receipt на новом bundle</td></tr>
+          <tr><td>DSA: <code>I_neural + βS_graph</code></td><td class="ok">Да, Megatron</td><td>Unit/reference</td><td>Caller mask, recall@256 ≥95%, sparse/dense NLL Δ≤2%</td></tr>
+          <tr><td>MLX graph-route parity</td><td>Reader v2</td><td class="blocked">Нет model-path proof</td><td>Graph packet → model/loss, identical-prompt logits parity</td></tr>
+          <tr><td>Mamba3 / NAM routes</td><td class="ok">Да</td><td>Smoke/старые runs</td><td><code>trap/angles</code>, TP/cache/decode, route activations</td></tr>
+          <tr><td>MTP / FastMTP</td><td class="ok">Да</td><td>Smoke</td><td>Backbone/head gradient ownership и parity receipt</td></tr>
+          <tr><td>Stable loop / world model</td><td>Reference</td><td class="blocked">Smoke only</td><td>Loop-depth curriculum, fixed-point diagnostics, trajectory runner</td></tr>
+          <tr><td>Build/shell/diagnostic routes</td><td>Contracts + parsers</td><td>Частично</td><td>Реальная ingest coverage; frozen shell/diag/cross-domain edges пока нулевые</td></tr>
+        </tbody>
+      </table></div>
+      <p class="note">Dense GQA видит все токены: graph routes там добавляют детерминированный structural prior, а не вырезают контекст. DSA нужен позже, когда 32k–128k делают dense attention экономически дорогим.</p>
+    </section>
+
+    <section id="codegen">
+      <h2>План генерации C/C++</h2>
+      <ol>
+        <li><b>Развести prompt contracts:</b> source-prefix-with-docstring, настоящий docstring/signature-only, FIM и IFIM должны иметь разные labels и receipts.</li>
+        <li><b>Строить sidecars до decode:</b> parser + clang adapter для prompt; repo repair получает dependency blocks и call/type/def-use/build/diagnostic routes.</li>
+        <li><b>Не притворяться с suffix sidecars:</b> baseline может быть zero, production обязан incremental parse или периодический full reparse.</li>
+        <li><b>Форматировать и проверять:</b> decode whitespace, reject metadata tokens, <code>clang-format</code>, clang parse, compile, link, executable oracle, sanitizer/timeout classification.</li>
+        <li><b>Считать pass@k и leakage:</b> pass@1/5/10, repo/commit/file/function/content hashes против frozen training manifest.</li>
+        <li><b>Эвалы локально:</b> checkpoint conversion может идти на H200, generation/compile gate по умолчанию выполняется на local macOS.</li>
+      </ol>
+      <p>Текущие старые receipts дают <b>0/4 compile</b> и на CUDA, и после MLX conversion. Низкий teacher-forced PPL у causal checkpoint не доказывает способность генерировать компилируемый код.</p>
+    </section>
+
+    <section id="training">
+      <h2>Этапы обучения</h2>
+      <div class="steps">
+        <div class="step"><b>S0 · 0.05B</b><span>Contract smoke: causal CE, sidecar и graph-gradient probes.</span><span class="gate">Gate: exact hashes; graph-on меняет logits; reference compile harness green.</span></div>
+        <div class="step"><b>S1 · 5.0B</b><span>C/C++ foundation: causal 65%, FIM 10%, AST-FIM 10%, IFIM 5%, symbol/type/callee 10%.</span><span class="gate">Gate: realised objective ratios, no token-only fallback, syntax/compile trend.</span></div>
+        <div class="step"><b>S2 · 8.5B</b><span>Commit/repair: real diff, pre→post, PR conditioning; 2k/4k/8k.</span><span class="gate">Gate: typed commit/PR packets и улучшение compile/run repair.</span></div>
+        <div class="step"><b>S3 · 10.5B</b><span>Graph/diagnostics: dense graph bias, indexer KL/ranking, diagnostic IFIM.</span><span class="gate">Gate: edge coverage, recall@256 ≥95%, sparse/dense NLL parity.</span></div>
+        <div class="step"><b>S4 · 13.2B</b><span>Tool/world trajectories: typed actions, next diagnostics, graph delta, stable loops.</span><span class="gate">Gate: только реальные tool outcomes; bounded fixed-point residuals.</span></div>
+      </div>
+      <p>Milestone checkpoints: 50M, 5B, 8.5B, 10.5B, 13.2B trained tokens; rolling каждые 250M с optimizer, RNG, scheduler и exact data cursor. Пять context buckets — один curriculum, не пять независимых моделей.</p>
+      <p class="note">Frozen bundle даёт 4.124B causal loss targets. Граница S1=5B — это примерно 1.21 effective passes с FIM/AST-FIM/IFIM transforms, а не 5B уникальных source tokens. Финальные 13.2B близки к порядку 20 tokens/parameter для текущей ~714.7M модели; новые conveyor данные должны добавлять разнообразие.</p>
+    </section>
+
+    <section id="evidence">
+      <h2>Проверки и исходные отчёты</h2>
+      <div class="status-row">
+        <div class="status"><span class="label">cppmega focused</span><span class="value ok">151 passed · 1 skipped</span></div>
+        <div class="status"><span class="label">cppmega.mlx focused</span><span class="value ok">239 passed</span></div>
+        <div class="status"><span class="label">Broad root suite</span><span class="value blocked">836 pass / 34 fail; fresh run blocked by optional Modal import</span></div>
+      </div>
+      <div class="links">
+        <a href="FULL_REVIEW.md">Полный machine-readable review (Markdown)</a>
+        <a href="local_mlx_bundle_smoke.json">Local MLX five-bucket receipt</a>
+        <a href="../../../cppmega.mlx/outputs/megatron_ready/macro_routes_v1_20260713/manifest.json">Immutable local bundle manifest</a>
+        <a href="../../../cppmega.mlx/outputs/megatron_ready/macro_routes_v1_20260713/archive_publish_receipt.json">Nebius archive publish receipt</a>
+        <a href="screenshots/mobile-layout-receipt.json">390px mobile layout receipt</a>
+        <a href="../lane2-landed-parquet-truth-REVIEW.md">Exhaustive landed parquet truth review</a>
+        <a href="lanes/01-data-pipeline.md">Lane 1 · data pipeline</a>
+        <a href="lanes/02-parquet-truth.md">Lane 2 · parquet truth</a>
+        <a href="lanes/03-megatron-model.md">Lane 3 · Megatron mechanisms</a>
+        <a href="lanes/04-mlx-parity.md">Lane 4 · MLX parity</a>
+        <a href="lanes/05-tokenizer-domains.md">Lane 5 · tokenizer and domains</a>
+        <a href="lanes/06-training-plan.md">Lane 6 · training curriculum</a>
+        <a href="lanes/07-codegen-evals.md">Lane 7 · codegen and evals</a>
+        <a href="lanes/08-megatron-s3.md">Lane 8 · Megatron and S3 publication</a>
+      </div>
+    </section>
+  </main>
+  <footer><div class="wrap"><strong>CppMega full review</strong><br>Claims разделены на implemented, unit-tested, runner-wired, production-exercised и live-proven. Bundle/S3 статус обновляется только по локальному manifest и remote HEAD receipt.</div></footer>
+</body>
+</html>

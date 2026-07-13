@@ -16,8 +16,6 @@ def test_structure_embedding_core_returns_hidden_sized_tensor():
 
 def test_structure_embedding_backward_reaches_tables():
     module = CppMegaStructureEmbedding(hidden_size=16, active_components="core", bottleneck_dim=4)
-    with torch.no_grad():
-        module.up_proj.weight.fill_(1.0)
     structure_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
     dep_levels = torch.tensor([[0, 1, 2]], dtype=torch.long)
 
@@ -26,3 +24,25 @@ def test_structure_embedding_backward_reaches_tables():
 
     assert module.stacked_emb.weight.grad is not None
     assert torch.isfinite(module.stacked_emb.weight.grad).all().item()
+    assert torch.count_nonzero(module.stacked_emb.weight.grad).item() > 0
+
+
+def test_structure_embedding_rejects_missing_or_invalid_sidecars():
+    module = CppMegaStructureEmbedding(hidden_size=16, active_components="core", bottleneck_dim=4)
+
+    try:
+        module(structure_ids=None, dep_levels=None)
+    except ValueError as exc:
+        assert "all active sidecars are absent" in str(exc)
+    else:
+        raise AssertionError("missing enabled structure sidecars must fail closed")
+
+    try:
+        module(
+            structure_ids=torch.tensor([[999]], dtype=torch.long),
+            dep_levels=torch.tensor([[0]], dtype=torch.long),
+        )
+    except ValueError as exc:
+        assert "out of range" in str(exc)
+    else:
+        raise AssertionError("invalid structure ids must fail closed")

@@ -227,13 +227,80 @@ def trim_body_completion(text: str) -> str:
         pos = stripped.find(marker)
         if pos >= 0:
             stripped = stripped[:pos]
-    kept: list[str] = []
-    for line in stripped.splitlines():
-        if line.startswith("}"):
-            break
-        kept.append(line)
-    body = "\n".join(kept).strip()
+    stripped = _trim_at_function_closing_brace(stripped)
+    body = stripped.strip()
     return body + ("\n" if body else "")
+
+
+def _trim_at_function_closing_brace(text: str) -> str:
+    """Drop only the brace that closes the prompt's already-open function."""
+    depth = 1
+    index = 0
+    state = "code"
+    while index < len(text):
+        char = text[index]
+        following = text[index + 1] if index + 1 < len(text) else ""
+
+        if state == "line-comment":
+            if char == "\n":
+                state = "code"
+            index += 1
+            continue
+        if state == "block-comment":
+            if char == "*" and following == "/":
+                state = "code"
+                index += 2
+            else:
+                index += 1
+            continue
+        if state in {"string", "character"}:
+            quote = '"' if state == "string" else "'"
+            if char == "\\":
+                index += 2
+            elif char == quote:
+                state = "code"
+                index += 1
+            else:
+                index += 1
+            continue
+
+        if char == "/" and following == "/":
+            state = "line-comment"
+            index += 2
+            continue
+        if char == "/" and following == "*":
+            state = "block-comment"
+            index += 2
+            continue
+        if char == "R" and following == '"':
+            delimiter_end = text.find("(", index + 2, min(len(text), index + 20))
+            if delimiter_end >= 0:
+                delimiter = text[index + 2 : delimiter_end]
+                if len(delimiter) <= 16 and not any(
+                    item.isspace() or item in "()\\" for item in delimiter
+                ):
+                    terminator = ")" + delimiter + '"'
+                    raw_end = text.find(terminator, delimiter_end + 1)
+                    if raw_end < 0:
+                        return text
+                    index = raw_end + len(terminator)
+                    continue
+        if char == '"':
+            state = "string"
+            index += 1
+            continue
+        if char == "'":
+            state = "character"
+            index += 1
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[:index]
+        index += 1
+    return text
 
 
 def build_prompt_rows(cases_path: Path, prompts_path: Path, prompt_mode: str) -> list[dict[str, str]]:
@@ -394,6 +461,7 @@ def set_default_structure_inputs(model, batch: int, seq: int, device: torch.devi
     if setter is None:
         raise AttributeError("CppMega model does not expose set_cppmega_structure_inputs")
     zeros = torch.zeros((batch, seq), dtype=torch.long, device=device)
+    empty_counts = torch.zeros((batch,), dtype=torch.long, device=device)
     setter(
         {
             "structure_ids": zeros,
@@ -401,6 +469,14 @@ def set_default_structure_inputs(model, batch: int, seq: int, device: torch.devi
             "ast_depth_ids": zeros,
             "sibling_index_ids": zeros,
             "node_type_ids": zeros,
+            # Standalone function prompts have no repository graph. Preserve the
+            # graph-routed checkpoint contract with an explicit empty graph; an
+            # absent graph must fail closed instead of looking token-only by accident.
+            "graph_call_edges": torch.zeros((batch, 0, 2), dtype=torch.long, device=device),
+            "graph_call_edge_counts": empty_counts,
+            "graph_chunk_starts": torch.zeros((batch, 0), dtype=torch.long, device=device),
+            "graph_chunk_ends": torch.zeros((batch, 0), dtype=torch.long, device=device),
+            "graph_chunk_counts": empty_counts,
         }
     )
 

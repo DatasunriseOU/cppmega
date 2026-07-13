@@ -315,6 +315,16 @@ def apply_all() -> None:
          desync race that bit us earlier (see `_ensure_aggressive_merge`
          for the line-count-preserving fix).
     """
+    if os.environ.get("CPPMEGA_MAMBA3_P1", "0") != "1":
+        raise RuntimeError(
+            "Refusing to mutate mamba_ssm: set CPPMEGA_MAMBA3_P1=1 explicitly"
+        )
+    if os.environ.get("MAMBA3_P1_ALLOW_FILE_MUTATION", "0") != "1":
+        raise RuntimeError(
+            "Refusing to mutate mamba_ssm site-packages without "
+            "MAMBA3_P1_ALLOW_FILE_MUTATION=1"
+        )
+
     try:
         import torch.distributed as dist
         dist_available = True

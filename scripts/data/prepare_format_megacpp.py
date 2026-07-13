@@ -8,9 +8,9 @@ megacpp naming/path conventions:
   output = ${MEGACPP_DATA_ROOT}/megatron/${MEGACPP_DATASET_NAME}_train.{bin,idx}
            ${MEGACPP_DATA_ROOT}/megatron/${MEGACPP_DATASET_NAME}_valid.{bin,idx}
 
-Writes both train and val splits. Defaults match the production
-``clang_semantic_4k_v10`` dataset consumed by
-``scripts/remote_smoke_h200_dsa_9_4_m.sh``.
+For modern bucketed parquet the default is one ``all``/training prefix.  An
+explicit validation split must be requested only for datasets that actually
+carry the nanochat validation-shard convention.
 
 Usage:
     python prepare_format_megacpp.py             # all defaults
@@ -30,7 +30,10 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 _SCRIPTS_DIR = _HERE.parent
 sys.path.insert(0, str(_SCRIPTS_DIR))
-from data_prep_parquet_to_megatron import convert_parquet_to_megatron  # noqa: E402
+from data_prep_parquet_to_megatron import (  # noqa: E402
+    DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS,
+    convert_parquet_to_megatron,
+)
 
 
 DEFAULT_DATA_ROOT = os.environ.get(
@@ -45,18 +48,7 @@ DEFAULT_DATASET_NAME = os.environ.get(
 # requested channel that is absent from the parquet schema is a hard error
 # unless --allow-missing-side-channels is passed (RULE #1: fail loud).
 DEFAULT_SIDE_CHANNELS: tuple[tuple[str, str], ...] = (
-    ("token_structure_ids", "uint8"),
-    ("token_dep_levels", "uint16"),
-    ("token_ast_depth", "uint16"),
-    ("token_sibling_index", "uint16"),
-    ("token_ast_node_type", "uint16"),
-    ("token_symbol_ids", "uint32"),
-    ("token_call_targets", "uint32"),
-    ("token_type_refs", "uint32"),
-    ("token_def_use", "uint8"),
-    ("token_change_mask_pre", "uint8"),
-    ("token_change_mask_post", "uint8"),
-    ("token_platform_ids", "uint16"),
+    DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS
 )
 
 
@@ -140,13 +132,24 @@ def main() -> int:
     )
     parser.add_argument(
         "--token-column",
-        default="token_ids",
-        help="Parquet column containing token IDs",
+        default="auto",
+        help="Parquet token column, or auto for exactly one of input_ids/token_ids",
     )
     parser.add_argument(
         "--splits",
-        default="train,val",
-        help="Comma-separated splits to emit (default: train,val)",
+        default="all",
+        help="Comma-separated splits to emit (default: all)",
+    )
+    parser.add_argument(
+        "--length-column",
+        default="auto",
+        help="Packed valid-length column (default: auto -> valid_token_count)",
+    )
+    parser.add_argument(
+        "--writer-backend",
+        choices=["megatron", "mmididx"],
+        default="megatron",
+        help="Indexed writer implementation (default: Megatron builder)",
     )
     default_side_channels = ",".join(
         f"{col}:{dtype}" for col, dtype in DEFAULT_SIDE_CHANNELS
@@ -209,10 +212,10 @@ def main() -> int:
 
     splits = [s.strip() for s in args.splits.split(",") if s.strip()]
     for split in splits:
-        if split not in ("train", "val"):
+        if split not in ("train", "val", "all"):
             sys.exit(f"ERROR: unknown split '{split}'")
         # Megatron --data-path convention: <dataset_name>_train / _valid
-        suffix = "train" if split == "train" else "valid"
+        suffix = "valid" if split == "val" else "train"
         output_prefix = output_root / f"{args.dataset_name}_{suffix}"
         print(
             f"[megacpp_format] split={split} "
@@ -224,9 +227,11 @@ def main() -> int:
             split=split,
             token_column=args.token_column,
             dtype_str=args.dtype,
+            length_column=args.length_column,
             side_channels=side_channels,
             side_channel_dtypes=side_channel_dtypes,
             vocab_size=args.vocab_size,
+            writer_backend=args.writer_backend,
         )
 
     print(f"[megacpp_format] done. Megatron dataset at {output_root}")

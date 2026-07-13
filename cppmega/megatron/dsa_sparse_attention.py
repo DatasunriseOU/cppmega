@@ -51,6 +51,10 @@ def sparse_dsa_fn(
     sk = key.size(0)
     hnv = value.size(3)
     topk = topk_indices.size(-1)
+    if sk <= 0:
+        raise ValueError("sparse_dsa_fn requires at least one key/value token")
+    if topk <= 0:
+        raise ValueError("sparse_dsa_fn requires at least one selected index")
 
     # ===================================================================
     # 1) Permute Q/K/V to batch-first for efficient gathering
@@ -68,9 +72,16 @@ def sparse_dsa_fn(
     # With topk=256, the naive gather k_sparse[b,np,sq,topk,hn] is 42 GiB.
     # We chunk over heads to keep peak at O(b*chunk*sq*topk*hn).
     # ===================================================================
+    # Clamp sentinels only for gather safety. They stay masked in attention, so
+    # padded selections can never become an accidental edge to token 0.
+    invalid_select_mask = (topk_indices < 0) | (topk_indices >= sk)
+    topk_indices = topk_indices.clamp(0, sk - 1)
+
     # Precompute causal mask: topk_indices[b, sq, topk] > position → future
     sq_positions = torch.arange(sq, device=q.device, dtype=topk_indices.dtype)
     future_mask = topk_indices > sq_positions.view(1, -1, 1)  # [b, sq, topk]
+    masked_select = future_mask | invalid_select_mask
+    all_masked = masked_select.all(dim=-1)  # [b, sq]
 
     # Per-head index templates (same for all heads — GQA shared indices)
     # [b, sq, topk, 1]
@@ -79,9 +90,12 @@ def sparse_dsa_fn(
 
     # Budget: K_gather(bf16) + V_gather(bf16) + scores(fp32) + attn_w(fp32) per chunk
     bytes_per_head = b * sq * topk * (hn * 2 + hnv * 2 + 4 + 4)
-    free_bytes = torch.cuda.mem_get_info(q.device)[0]
-    # Use at most 80% of free memory for the chunk to leave room for autograd
-    head_chunk = min(np_, max(1, int(free_bytes * 0.8) // bytes_per_head))
+    if q.device.type == "cuda":
+        free_bytes = torch.cuda.mem_get_info(q.device)[0]
+        # Use at most 80% of free memory for the chunk to leave room for autograd.
+        head_chunk = min(np_, max(1, int(free_bytes * 0.8) // bytes_per_head))
+    else:
+        head_chunk = np_
     output = torch.zeros(b, np_, sq, hnv, device=q.device, dtype=q.dtype)
 
     for h0 in range(0, np_, head_chunk):
@@ -95,7 +109,14 @@ def sparse_dsa_fn(
         # Scores in bf16 then upcast only for softmax
         scores = torch.einsum("bnqd,bnqkd->bnqk", q[:, h0:h1], k_chunk) * softmax_scale
         del k_chunk
-        scores.masked_fill_(future_mask.unsqueeze(1), float("-inf"))
+        scores.masked_fill_(masked_select.unsqueeze(1), float("-inf"))
+        # A fully padded query row has no attention edge. Give softmax a finite
+        # placeholder and zero its output below, avoiding NaNs without creating
+        # a synthetic token-0 edge.
+        first_slot = torch.zeros(topk, device=q.device, dtype=torch.bool)
+        first_slot[0] = True
+        finite_placeholder = all_masked[:, None, :, None] & first_slot.view(1, 1, 1, -1)
+        scores.masked_fill_(finite_placeholder, 0.0)
         attn_w = F.softmax(scores.float(), dim=-1, dtype=torch.float32)
         del scores
 
@@ -103,10 +124,12 @@ def sparse_dsa_fn(
         idx_v = idx_v_base.unsqueeze(1).expand(b, nc, sq, topk, hnv)
         v_chunk = v[:, h0:h1].unsqueeze(2).expand(-1, -1, sq, -1, -1).gather(3, idx_v)
 
-        output[:, h0:h1] = torch.einsum("bnqk,bnqkd->bnqd", attn_w.to(v_chunk.dtype), v_chunk)
+        chunk_output = torch.einsum("bnqk,bnqkd->bnqd", attn_w.to(v_chunk.dtype), v_chunk)
+        chunk_output.masked_fill_(all_masked[:, None, :, None], 0.0)
+        output[:, h0:h1] = chunk_output
         del attn_w, v_chunk
 
-    del future_mask
+    del future_mask, invalid_select_mask, masked_select, all_masked
 
     # ===================================================================
     # 7) Reshape back to Megatron expected format: [sq, b, np * hnv]

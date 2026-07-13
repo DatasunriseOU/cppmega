@@ -46,6 +46,20 @@ _TOKEN_BATCH_COLS = (
     "change_mask_post",
 )
 
+_REQUIRED_STRUCTURE_TOKEN_COLS = (
+    "structure_ids",
+    "dep_levels",
+    "ast_depth_ids",
+    "sibling_index_ids",
+    "node_type_ids",
+)
+
+_REQUIRED_DOMAIN_TOKEN_COLS = (
+    "domain_ids",
+    "role_ids",
+    "confidence_ids",
+)
+
 _GRAPH_BATCH_COLS = (
     "graph_call_edges",
     "graph_call_edge_counts",
@@ -104,6 +118,15 @@ _GRAPH_ROUTE_COLS = (
     "token_chunk_kinds",
     "token_chunk_dep_levels",
 )
+
+
+def _required_token_batch_cols() -> set[str]:
+    """Return only sidecars consumed by enabled input embeddings."""
+
+    required = set(_REQUIRED_STRUCTURE_TOKEN_COLS)
+    if os.environ.get("CPPMEGA_DOMAIN_EMBEDDING_ENABLED", "0") == "1":
+        required.update(_REQUIRED_DOMAIN_TOKEN_COLS)
+    return required
 
 
 def _pop_structure_batch(batch: Dict[str, torch.Tensor] | None) -> Dict[str, torch.Tensor] | None:
@@ -240,9 +263,9 @@ def _lazy_init_graph_sidecars(dataset: Any) -> Dict[str, Dict[str, Any]]:
         return dataset._graph_sidecars_cache
 
     json_path, sidecar = _load_sidecar_manifest(dataset)
-    if sidecar.get("graph_sidecar_schema") != "cppmega_graph_routes_v1":
+    if sidecar.get("graph_sidecar_schema") != "cppmega_graph_routes_v2":
         raise ValueError(
-            f"[cppmega-patch] graph_sidecar_schema must be cppmega_graph_routes_v1 in {json_path!r}; "
+            f"[cppmega-patch] graph_sidecar_schema must be cppmega_graph_routes_v2 in {json_path!r}; "
             f"got {sidecar.get('graph_sidecar_schema')!r}"
         )
     graph_paths = sidecar.get("graph_sidecar_paths")
@@ -258,7 +281,26 @@ def _lazy_init_graph_sidecars(dataset: Any) -> Dict[str, Dict[str, Any]]:
 
     document_count = int(sidecar.get("document_count", len(dataset.dataset.index.sequence_lengths)))
     base_dir = os.path.dirname(json_path)
+    expected_coordinates = {
+        "token_call_edges": "chunk_index",
+        "token_type_edges": "chunk_index",
+        "token_domain_edges": "token_index",
+        "token_build_edges": "token_index",
+        "token_shell_edges": "token_index",
+        "token_diagnostic_edges": "token_index",
+        "token_cross_domain_edges": "token_index",
+        "token_chunk_starts": "token_index",
+        "token_chunk_ends": "token_index",
+        "token_chunk_kinds": "chunk_index",
+        "token_chunk_dep_levels": "chunk_index",
+    }
     for col, entry in graph_paths.items():
+        coordinate_space = entry.get("coordinate_space")
+        if coordinate_space != expected_coordinates[col]:
+            raise ValueError(
+                f"[cppmega-patch] graph sidecar {col!r} coordinate_space "
+                f"{coordinate_space!r} != {expected_coordinates[col]!r} in {json_path!r}"
+            )
         offsets_path = _safe_sidecar_path(
             base_dir, entry["offsets_path"], col=col, field="offsets_path", json_path=json_path
         )
@@ -292,6 +334,7 @@ def _lazy_init_graph_sidecars(dataset: Any) -> Dict[str, Dict[str, Any]]:
             "dtype": dtype,
             "shape_tail": shape_tail,
             "kind": entry.get("kind"),
+            "coordinate_space": coordinate_space,
         }
         print(
             f"[cppmega-patch] Mapped graph sidecar {col} from {data_path} "
@@ -458,20 +501,6 @@ def _build_graph_route_tensors(
         target_start = span["target_start"]
 
         for source_name, sink in (
-            ("token_call_edges", call_edges),
-            ("token_type_edges", type_edges),
-        ):
-            rows = _slice_graph_doc(graph_sidecars[source_name], real_doc)
-            for src, dst in rows:
-                src_i = int(src)
-                dst_i = int(dst)
-                if source_start <= src_i < source_end and source_start <= dst_i < source_end:
-                    adj_src = target_start + src_i - source_start
-                    adj_dst = target_start + dst_i - source_start
-                    if 0 <= adj_src < target_len and 0 <= adj_dst < target_len:
-                        sink.append((adj_src, adj_dst))
-
-        for source_name, sink in (
             ("token_domain_edges", domain_edges),
             ("token_build_edges", build_edges),
             ("token_shell_edges", shell_edges),
@@ -497,7 +526,10 @@ def _build_graph_route_tensors(
                 f"[cppmega-patch] chunk graph sidecar lengths disagree for document {real_doc}: "
                 f"starts={len(starts)} ends={len(ends)} kinds={len(kinds)} dep_levels={len(dep_levels)}"
             )
-        for start, end, kind, dep_level in zip(starts, ends, kinds, dep_levels, strict=True):
+        doc_chunk_to_sample: dict[int, int] = {}
+        for doc_chunk_index, (start, end, kind, dep_level) in enumerate(
+            zip(starts, ends, kinds, dep_levels, strict=True)
+        ):
             start_i = int(start)
             end_i = int(end)
             overlap_start = max(start_i, source_start)
@@ -510,10 +542,60 @@ def _build_graph_route_tensors(
                 continue
             adj_end = min(adj_end, target_len)
             if adj_start < adj_end:
+                doc_chunk_to_sample[doc_chunk_index] = len(chunk_starts)
                 chunk_starts.append(adj_start)
                 chunk_ends.append(adj_end)
                 chunk_kinds.append(int(kind))
                 chunk_dep_levels.append(int(dep_level))
+
+        # call/type pairs are chunk-index routes, not token offsets. Remap the
+        # document-local chunk ids through the chunks that overlap this sample;
+        # the attention/indexer layer expands them to token-span blocks.
+        for source_name, sink in (
+            ("token_call_edges", call_edges),
+            ("token_type_edges", type_edges),
+        ):
+            rows = _slice_graph_doc(graph_sidecars[source_name], real_doc)
+            for src, dst in rows:
+                src_i = int(src)
+                dst_i = int(dst)
+                if src_i < 0 or dst_i < 0 or src_i >= len(starts) or dst_i >= len(starts):
+                    raise ValueError(
+                        f"[cppmega-patch] {source_name} chunk endpoint out of range "
+                        f"for document {real_doc} with {len(starts)} chunks: "
+                        f"({src_i}, {dst_i})"
+                    )
+                if src_i in doc_chunk_to_sample and dst_i in doc_chunk_to_sample:
+                    sink.append(
+                        (doc_chunk_to_sample[src_i], doc_chunk_to_sample[dst_i])
+                    )
+
+    if len(chunk_starts) > max_chunks:
+        raise ValueError(
+            "[cppmega-patch] graph route chunk capacity exceeded: "
+            f"required={len(chunk_starts)} configured={max_chunks}; increase "
+            "CPPMEGA_GRAPH_MAX_CHUNKS rather than truncating routes"
+        )
+    edge_families = {
+        "call": call_edges,
+        "type": type_edges,
+        "domain": domain_edges,
+        "build": build_edges,
+        "shell": shell_edges,
+        "diagnostic": diagnostic_edges,
+        "cross_domain": cross_domain_edges,
+    }
+    overflow = {
+        name: len(edges)
+        for name, edges in edge_families.items()
+        if len(edges) > max_edges
+    }
+    if overflow:
+        raise ValueError(
+            "[cppmega-patch] graph route edge capacity exceeded: "
+            f"configured={max_edges} required={overflow}; increase "
+            "CPPMEGA_GRAPH_MAX_EDGES rather than truncating routes"
+        )
 
     graph_call_edges, graph_call_edge_counts = _cap_2d(call_edges, max_rows=max_edges)
     graph_type_edges, graph_type_edge_counts = _cap_2d(type_edges, max_rows=max_edges)
@@ -636,16 +718,19 @@ try:
                 flush=True,
             )
 
+        required_token_cols = _required_token_batch_cols()
         for col in _TOKEN_BATCH_COLS:
             source = next(
                 (a for a in _TOKEN_COL_ALIASES[col] if a in side_channels), None
             )
             if source is None:
-                raise KeyError(
-                    f"[cppmega-patch] token sidecar column {col!r} missing from dataset "
-                    f"side-channels (tried {_TOKEN_COL_ALIASES[col]}; have "
-                    f"{sorted(side_channels)}) while CPPMEGA_STRUCTURE_ENABLED=1"
-                )
+                if col in required_token_cols:
+                    raise KeyError(
+                        f"[cppmega-patch] required token sidecar column {col!r} "
+                        f"missing from dataset side-channels (tried "
+                        f"{_TOKEN_COL_ALIASES[col]}; have {sorted(side_channels)})"
+                    )
+                continue
             entry = side_channels[source]
             vals = entry["mmap"][indices]
             tensor = torch.from_numpy(vals).long()

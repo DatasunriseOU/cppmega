@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import struct
 import subprocess
 import sys
@@ -32,20 +33,14 @@ def test_prepare_format_default_side_channels_preserve_graph_training_labels() -
 
     names = {name for name, _dtype in prepare_format.DEFAULT_SIDE_CHANNELS}
 
-    assert {
-        "token_structure_ids",
-        "token_dep_levels",
-        "token_ast_depth",
-        "token_sibling_index",
-        "token_ast_node_type",
-        "token_symbol_ids",
-        "token_call_targets",
-        "token_type_refs",
-        "token_def_use",
-        "token_change_mask_pre",
-        "token_change_mask_post",
-        "token_platform_ids",
-    }.issubset(names)
+    converter = _load_module(
+        "data_prep_parquet_to_megatron_contract",
+        "scripts/data_prep_parquet_to_megatron.py",
+    )
+    assert names == {
+        name for name, _dtype in converter.DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS
+    }
+    assert {"loss_mask", "doc_ids", "token_domain_ids", "token_role_ids"} <= names
 
 
 def test_verify_dataset_default_vocab_is_canonical_contract() -> None:
@@ -155,6 +150,35 @@ def test_tokenizer_contract_verifier_rejects_unpaired_domain_delimiter() -> None
 
     with pytest.raises(verify.ContractError, match="CPP_CODE_END"):
         verify.check_domain_delimiter_roles(contract, id_to_token)
+
+
+def test_tokenizer_contract_verifier_rejects_reserved_whitespace_slot(
+    tmp_path: Path,
+) -> None:
+    verify = _load_module(
+        "verify_tokenizer_contract_special_strings",
+        "scripts/data/verify_tokenizer_contract.py",
+    )
+    tokenizer = tmp_path / "tokenizer.json"
+    vocab = {f"token-{idx}": idx for idx in range(46)}
+    vocab["<RESERVED_46>"] = 46
+    tokenizer.write_text(
+        json.dumps(
+            {
+                "model": {"vocab": vocab},
+                "added_tokens": [{"id": 46, "content": "<RESERVED_46>"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    contract = {
+        "vocab_size": 47,
+        "special_tokens": {"SPACE": 46},
+        "reserved_role_assignments": {},
+    }
+
+    with pytest.raises(verify.ContractError, match="expected '<SPACE>'"):
+        verify.check_contract_vs_tokenizer(contract, tokenizer)
 
 
 def test_side_channel_checker_has_full_sidecar_gate() -> None:

@@ -106,6 +106,50 @@ def test_correct_manifest_passes(tmp_path: Path):
     assert out_offsets.tolist() == [0, 2]
 
 
+def test_source_platform_subset_preserves_nested_csr_prefix(tmp_path: Path):
+    module = _load_module()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    np.array([0, 2, 3], dtype=np.int64).tofile(
+        tmp_path / "src_source_platform_sequence_doc_offsets.bin"
+    )
+    np.array([0, 2, 3, 6], dtype=np.int64).tofile(
+        tmp_path / "src_source_platform_doc_id_offsets.bin"
+    )
+    np.array([2, 62, 93, 3, 64, 94], dtype=np.uint16).tofile(
+        tmp_path / "src_source_platform_ids.bin"
+    )
+    entry = {
+        "schema": "cppmega_source_platform_v1",
+        "sequence_doc_offsets_path": "src_source_platform_sequence_doc_offsets.bin",
+        "doc_platform_offsets_path": "src_source_platform_doc_id_offsets.bin",
+        "platform_ids_path": "src_source_platform_ids.bin",
+        "offset_dtype": "int64",
+        "dtype": "uint16",
+        "source_document_count": 3,
+        "platform_id_count": 6,
+    }
+
+    copied = module._copy_source_platform_sidecar(
+        src_prefix=src,
+        dst_prefix=dst,
+        entry=entry,
+        document_count=1,
+    )
+
+    assert copied["source_document_count"] == 2
+    assert copied["platform_id_count"] == 3
+    assert np.fromfile(
+        tmp_path / copied["sequence_doc_offsets_path"], dtype=np.int64
+    ).tolist() == [0, 2]
+    assert np.fromfile(
+        tmp_path / copied["doc_platform_offsets_path"], dtype=np.int64
+    ).tolist() == [0, 2, 3]
+    assert np.fromfile(
+        tmp_path / copied["platform_ids_path"], dtype=np.uint16
+    ).tolist() == [2, 62, 93]
+
+
 def test_wrong_item_count_raises(tmp_path: Path):
     module = _load_module()
     src_base = tmp_path / "src"

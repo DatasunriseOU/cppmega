@@ -142,6 +142,73 @@ def _copy_graph_sidecar(
     dst_manifest_entry["item_count"] = item_count
 
 
+def _copy_source_platform_sidecar(
+    *,
+    src_prefix: Path,
+    dst_prefix: Path,
+    entry: dict[str, object],
+    document_count: int,
+) -> dict[str, object]:
+    if entry.get("schema") != "cppmega_source_platform_v1":
+        raise ValueError(
+            f"unsupported source platform sidecar schema {entry.get('schema')!r}"
+        )
+    src_dir = src_prefix.parent
+    sequence_offsets = np.memmap(
+        _safe_src(src_dir, str(entry["sequence_doc_offsets_path"])),
+        mode="r",
+        dtype=np.int64,
+    )
+    if len(sequence_offsets) < document_count + 1:
+        raise ValueError("source platform sequence offsets are truncated")
+    sequence_subset = np.asarray(
+        sequence_offsets[: document_count + 1], dtype=np.int64
+    ).copy()
+    if int(sequence_subset[0]) != 0 or np.any(np.diff(sequence_subset) < 0):
+        raise ValueError("source platform sequence offsets must start at 0 and be monotonic")
+    source_document_count = int(sequence_subset[-1])
+
+    doc_offsets = np.memmap(
+        _safe_src(src_dir, str(entry["doc_platform_offsets_path"])),
+        mode="r",
+        dtype=np.int64,
+    )
+    if len(doc_offsets) < source_document_count + 1:
+        raise ValueError("source platform document offsets are truncated")
+    doc_subset = np.asarray(
+        doc_offsets[: source_document_count + 1], dtype=np.int64
+    ).copy()
+    if int(doc_subset[0]) != 0 or np.any(np.diff(doc_subset) < 0):
+        raise ValueError("source platform document offsets must start at 0 and be monotonic")
+    platform_id_count = int(doc_subset[-1])
+
+    platform_dtype = np.dtype(str(entry.get("dtype", "uint16")))
+    platform_ids_path = _safe_src(src_dir, str(entry["platform_ids_path"]))
+    available_ids, remainder = divmod(
+        platform_ids_path.stat().st_size, platform_dtype.itemsize
+    )
+    if remainder or platform_id_count > available_ids:
+        raise ValueError("source platform ID data is truncated or misaligned")
+    platform_ids = np.memmap(platform_ids_path, mode="r", dtype=platform_dtype)
+
+    copied = dict(entry)
+    copied["sequence_doc_offsets_path"] = (
+        f"{dst_prefix.name}_source_platform_sequence_doc_offsets.bin"
+    )
+    copied["doc_platform_offsets_path"] = (
+        f"{dst_prefix.name}_source_platform_doc_id_offsets.bin"
+    )
+    copied["platform_ids_path"] = f"{dst_prefix.name}_source_platform_ids.bin"
+    copied["source_document_count"] = source_document_count
+    copied["platform_id_count"] = platform_id_count
+    sequence_subset.tofile(dst_prefix.parent / str(copied["sequence_doc_offsets_path"]))
+    doc_subset.tofile(dst_prefix.parent / str(copied["doc_platform_offsets_path"]))
+    np.asarray(platform_ids[:platform_id_count], dtype=platform_dtype).tofile(
+        dst_prefix.parent / str(copied["platform_ids_path"])
+    )
+    return copied
+
+
 def create_subset(src_prefix: Path, dst_prefix: Path, *, max_tokens: int, max_docs: int | None) -> None:
     src_manifest = json.loads(src_prefix.with_suffix(".json").read_text())
     dtype_code, sizes, _, _ = _read_mmididx(src_prefix.with_suffix(".idx"))
@@ -200,8 +267,25 @@ def create_subset(src_prefix: Path, dst_prefix: Path, *, max_tokens: int, max_do
         )
         graph_paths[column] = copied
     if graph_paths:
-        dst_manifest["graph_sidecar_schema"] = "cppmega_graph_routes_v1"
+        graph_schema = src_manifest.get("graph_sidecar_schema")
+        if graph_schema != "cppmega_graph_routes_v2":
+            raise ValueError(
+                f"source graph_sidecar_schema must be cppmega_graph_routes_v2, "
+                f"got {graph_schema!r}"
+            )
+        dst_manifest["graph_sidecar_schema"] = graph_schema
         dst_manifest["graph_sidecar_paths"] = graph_paths
+
+    source_platform = src_manifest.get("source_platform_sidecar")
+    if source_platform is not None:
+        if not isinstance(source_platform, dict):
+            raise ValueError("source_platform_sidecar must be a JSON object")
+        dst_manifest["source_platform_sidecar"] = _copy_source_platform_sidecar(
+            src_prefix=src_prefix,
+            dst_prefix=dst_prefix,
+            entry=source_platform,
+            document_count=doc_count,
+        )
 
     dst_prefix.with_suffix(".json").write_text(json.dumps(dst_manifest, indent=2), encoding="utf-8")
     print(

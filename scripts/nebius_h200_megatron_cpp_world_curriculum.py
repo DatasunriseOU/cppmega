@@ -143,8 +143,27 @@ def _default_stages() -> list[Stage]:
 
 
 def _assert_prefix_contract(stages: list[Stage]) -> None:
-    required_sidecars = {"loss_mask", "doc_ids"}
-    required_graph_schema = "cppmega_graph_routes_v1"
+    required_sidecars = {
+        "loss_mask",
+        "doc_ids",
+        "token_domain_ids",
+        "token_role_ids",
+        "token_entity_ids",
+        "token_scope_ids",
+        "token_confidence_ids",
+        "token_structure_ids",
+        "token_dep_levels",
+        "token_ast_depth",
+        "token_sibling_index",
+        "token_ast_node_type",
+        "token_symbol_ids",
+        "token_call_targets",
+        "token_type_refs",
+        "token_def_use",
+        "token_change_mask_pre",
+        "token_change_mask_post",
+    }
+    required_graph_schema = "cppmega_graph_routes_v2"
     for stage in stages:
         manifest = json.loads(stage.prefix.with_suffix(".json").read_text())
         side = set(manifest.get("side_channel_paths", {}))
@@ -156,6 +175,13 @@ def _assert_prefix_contract(stages: list[Stage]) -> None:
             raise ValueError(
                 f"{stage.prefix}: graph_sidecar_schema={graph_schema!r}, "
                 f"expected {required_graph_schema!r}"
+            )
+        source_platform = manifest.get("source_platform_sidecar")
+        if not isinstance(source_platform, dict) or source_platform.get(
+            "schema"
+        ) != "cppmega_source_platform_v1":
+            raise ValueError(
+                f"{stage.prefix}: compact source platform sidecar missing or invalid"
             )
 
 
@@ -270,6 +296,7 @@ def _remote_script(
         export TRITON_CACHE_DIR="/data/.triton-cache"
         export NVTE_DISABLE_NVRTC=1
         export CPPMEGA_STRUCTURE_ENABLED=1
+        export CPPMEGA_DOMAIN_EMBEDDING_ENABLED=1
         export CPPMEGA_GRAPH_ROUTES_ENABLED=1
         export CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS="${{CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS:-1}}"
         export CPPMEGA_GRAPH_MAX_EDGES="${{CPPMEGA_GRAPH_MAX_EDGES:-256}}"

@@ -65,8 +65,9 @@ class CppMegaStructureEmbedding(nn.Module):
         self.stacked_emb.weight.is_embedding_or_output_parameter = True
         self.up_proj.weight.is_embedding_or_output_parameter = True
         self.component_scales = nn.Parameter(torch.full((num_active,), 1.0 / max(num_active, 1)))
+        # Zero residual, live gradient: the table starts at zero and the
+        # projection keeps its normal non-zero initialization.
         nn.init.zeros_(self.stacked_emb.weight)
-        nn.init.zeros_(self.up_proj.weight)
 
     @classmethod
     def _parse_components(cls, spec: str) -> tuple[str, ...]:
@@ -99,7 +100,10 @@ class CppMegaStructureEmbedding(nn.Module):
         }
         ref = next((inputs[name] for name in self.active_component_names if inputs[name] is not None), None)
         if ref is None:
-            return torch.tensor(0.0, dtype=target_dtype or torch.float32)
+            raise ValueError(
+                "[cppmega-structure] structure embedding is enabled but all "
+                "active sidecars are absent"
+            )
 
         batch, seq = ref.shape[:2]
         ids_list: list[torch.Tensor] = []
@@ -110,8 +114,15 @@ class CppMegaStructureEmbedding(nn.Module):
                 ids_list.append(torch.zeros(batch, seq, dtype=torch.long, device=ref.device))
                 present.append(False)
                 continue
-            clamped = tensor.clamp(0, int(self._comp_clamp_max[index].item()))
-            ids_list.append(clamped + int(self._comp_offsets[index].item()))
+            tensor = tensor.to(dtype=torch.long)
+            comp_max = int(self._comp_clamp_max[index].item())
+            if bool((tensor < 0).any().item()) or bool((tensor > comp_max).any().item()):
+                bad = tensor[(tensor < 0) | (tensor > comp_max)].flatten()[:8].tolist()
+                raise ValueError(
+                    f"[cppmega-structure] {name} ids out of range [0,{comp_max}]: "
+                    f"offending values {bad}"
+                )
+            ids_list.append(tensor + int(self._comp_offsets[index].item()))
             present.append(True)
 
         stacked_ids = torch.stack(ids_list, dim=-1).reshape(batch * seq, len(self.active_component_names))

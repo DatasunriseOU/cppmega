@@ -10,6 +10,8 @@ required — this test inlines the upstream reference.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -84,6 +86,9 @@ def test_graph_route_bias_from_structure_batch_scatter_edges():
         "graph_call_edge_counts": torch.tensor([2], dtype=torch.long),
         "graph_type_edges": torch.tensor([[[2, 1], [-1, -1]]], dtype=torch.long),
         "graph_type_edge_counts": torch.tensor([1], dtype=torch.long),
+        "graph_chunk_starts": torch.tensor([[0, 1, 2, 3]], dtype=torch.long),
+        "graph_chunk_ends": torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+        "graph_chunk_counts": torch.tensor([4], dtype=torch.long),
     }
 
     bias = build_graph_route_bias_from_structure_batch(
@@ -101,6 +106,29 @@ def test_graph_route_bias_from_structure_batch_scatter_edges():
     assert bias[0, 1, 3].item() == 2.0
     assert bias[0, 2, 1].item() == 3.0
     assert bias.sum().item() == 7.0
+
+
+def test_graph_route_chunk_edge_expands_to_token_span_block():
+    structure_batch = {
+        "graph_call_edges": torch.tensor([[[0, 1]]], dtype=torch.long),
+        "graph_call_edge_counts": torch.tensor([1], dtype=torch.long),
+        "graph_chunk_starts": torch.tensor([[0, 2]], dtype=torch.long),
+        "graph_chunk_ends": torch.tensor([[2, 4]], dtype=torch.long),
+        "graph_chunk_counts": torch.tensor([2], dtype=torch.long),
+    }
+
+    bias = build_graph_route_bias_from_structure_batch(
+        structure_batch,
+        batch_size=1,
+        seqlen_q=4,
+        seqlen_k=4,
+        device=torch.device("cpu"),
+        call_weight=2.0,
+    )
+
+    expected = torch.zeros((1, 4, 4))
+    expected[0, 0:2, 2:4] = 2.0
+    assert torch.equal(bias, expected)
 
 
 def test_graph_route_bias_from_structure_batch_scatter_domain_edge_triples():
@@ -216,8 +244,11 @@ def test_graph_route_bias_raises_on_out_of_range_edge():
         # count says 1 real edge, but dst=9 is out of range for seqlen 4.
         "graph_call_edges": torch.tensor([[[0, 9], [-1, -1]]], dtype=torch.long),
         "graph_call_edge_counts": torch.tensor([1], dtype=torch.long),
+        "graph_chunk_starts": torch.tensor([[0, 1, 2, 3]], dtype=torch.long),
+        "graph_chunk_ends": torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+        "graph_chunk_counts": torch.tensor([4], dtype=torch.long),
     }
-    with pytest.raises(ValueError, match="out of range"):
+    with pytest.raises(ValueError, match="unavailable chunk"):
         build_graph_route_bias_from_structure_batch(
             structure_batch,
             batch_size=1,
@@ -238,6 +269,47 @@ def test_graph_route_bias_requires_structure_batch():
             seqlen_k=4,
             device=device,
         )
+
+
+def test_dsa_backward_reuses_its_own_microbatch_graph(monkeypatch):
+    from cppmega.megatron import dsa_indexer_fused_patch as fused_patch
+    from cppmega.megatron.structure_dataset_patch import _set_current_structure_batch
+
+    class FakeFusedLoss:
+        @staticmethod
+        def forward(ctx):
+            active = fused_patch._GRAPH_BATCH_OVERRIDE.get()
+            ctx.forward_seen = active["graph_call_edges"].clone()
+            return "forward"
+
+        @staticmethod
+        def backward(ctx):
+            active = fused_patch._GRAPH_BATCH_OVERRIDE.get()
+            ctx.backward_seen = active["graph_call_edges"].clone()
+            return "backward"
+
+    first = {
+        "graph_call_edges": torch.tensor([[[0, 1]]]),
+        "graph_call_edge_counts": torch.tensor([1]),
+    }
+    second = {
+        "graph_call_edges": torch.tensor([[[2, 3]]]),
+        "graph_call_edge_counts": torch.tensor([1]),
+    }
+    fake_module = SimpleNamespace(FusedDSAIndexerLoss=FakeFusedLoss)
+    monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
+    _set_current_structure_batch(first)
+    fused_patch._patch_fused_dsa_autograd(fake_module)
+    ctx = SimpleNamespace()
+
+    assert FakeFusedLoss.forward(ctx) == "forward"
+    _set_current_structure_batch(second)
+    assert FakeFusedLoss.backward(ctx) == "backward"
+
+    assert torch.equal(ctx.forward_seen, first["graph_call_edges"])
+    assert torch.equal(ctx.backward_seen, first["graph_call_edges"])
+    assert not torch.equal(ctx.backward_seen, second["graph_call_edges"])
+    _set_current_structure_batch(None)
 
 
 def test_fused_nam56r_shape():

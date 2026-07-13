@@ -60,7 +60,14 @@ def test_custom_embedding_structure_path_runs(monkeypatch):
     input_ids = torch.randint(0, 16, (2, 4))
     position_ids = torch.arange(4).unsqueeze(0).expand(2, -1)
 
-    out = embedding(input_ids, position_ids)
+    out = embedding(
+        input_ids,
+        position_ids,
+        structure_inputs={
+            "structure_ids": torch.zeros_like(input_ids),
+            "dep_levels": torch.zeros_like(input_ids),
+        },
+    )
 
     assert out.shape == (4, 2, 16)
     monkeypatch.delenv("CPPMEGA_STRUCTURE_ENABLED")

@@ -67,11 +67,11 @@ def test_build_graph_route_tensors_offsets_caps_and_clips():
     graph_sidecars = {
         "token_call_edges": {
             "offsets": [0, 3],
-            "data": torch.tensor([[1, 2], [2, 4], [7, 8]], dtype=torch.int32).numpy(),
+            "data": torch.tensor([[0, 1], [1, 2], [2, 2]], dtype=torch.int32).numpy(),
         },
         "token_type_edges": {
             "offsets": [0, 2],
-            "data": torch.tensor([[3, 4], [8, 9]], dtype=torch.int32).numpy(),
+            "data": torch.tensor([[1, 0], [2, 1]], dtype=torch.int32).numpy(),
         },
         "token_domain_edges": {
             "offsets": [0, 2],
@@ -128,9 +128,9 @@ def test_build_graph_route_tensors_offsets_caps_and_clips():
         max_chunks=2,
     )
 
-    assert torch.equal(routed["graph_call_edges"], torch.tensor([[0, 1], [1, 3]]))
-    assert routed["graph_call_edge_counts"].item() == 2
-    assert torch.equal(routed["graph_type_edges"], torch.tensor([[2, 3], [-1, -1]]))
+    assert torch.equal(routed["graph_call_edges"], torch.tensor([[0, 1], [-1, -1]]))
+    assert routed["graph_call_edge_counts"].item() == 1
+    assert torch.equal(routed["graph_type_edges"], torch.tensor([[1, 0], [-1, -1]]))
     assert routed["graph_type_edge_counts"].item() == 1
     assert torch.equal(routed["graph_domain_edges"], torch.tensor([[0, 3, 20], [-1, -1, -1]]))
     assert routed["graph_domain_edge_counts"].item() == 1
@@ -147,3 +147,97 @@ def test_build_graph_route_tensors_offsets_caps_and_clips():
     assert torch.equal(routed["graph_chunk_kinds"], torch.tensor([1, 2]))
     assert torch.equal(routed["graph_chunk_dep_levels"], torch.tensor([0, 4]))
     assert routed["graph_chunk_counts"].item() == 2
+
+
+def test_build_graph_route_tensors_rejects_invalid_chunk_endpoint():
+    graph_sidecars = {
+        name: {"offsets": [0, 0], "data": torch.empty((0, width), dtype=torch.int32).numpy()}
+        for name, width in (
+            ("token_type_edges", 2),
+            ("token_domain_edges", 3),
+            ("token_build_edges", 3),
+            ("token_shell_edges", 3),
+            ("token_diagnostic_edges", 3),
+            ("token_cross_domain_edges", 3),
+        )
+    }
+    graph_sidecars.update(
+        {
+            "token_call_edges": {
+                "offsets": [0, 1],
+                "data": torch.tensor([[7, 8]], dtype=torch.int32).numpy(),
+            },
+            "token_chunk_starts": {"offsets": [0, 1], "data": torch.tensor([0]).numpy()},
+            "token_chunk_ends": {"offsets": [0, 1], "data": torch.tensor([4]).numpy()},
+            "token_chunk_kinds": {"offsets": [0, 1], "data": torch.tensor([1]).numpy()},
+            "token_chunk_dep_levels": {"offsets": [0, 1], "data": torch.tensor([0]).numpy()},
+        }
+    )
+
+    with pytest.raises(ValueError, match="chunk endpoint out of range"):
+        patch._build_graph_route_tensors(
+            graph_sidecars,
+            [{"real_doc": 0, "doc_start_token": 0, "source_start": 0, "source_end": 4, "target_start": 0}],
+            target_len=4,
+            max_edges=2,
+            max_chunks=2,
+        )
+
+
+def test_build_graph_route_tensors_rejects_capacity_truncation():
+    empty_pairs = torch.empty((0, 2), dtype=torch.int32).numpy()
+    empty_triples = torch.empty((0, 3), dtype=torch.int32).numpy()
+    graph_sidecars = {
+        "token_call_edges": {
+            "offsets": [0, 1],
+            "data": torch.tensor([[0, 1]], dtype=torch.int32).numpy(),
+        },
+        "token_type_edges": {"offsets": [0, 0], "data": empty_pairs},
+        "token_domain_edges": {"offsets": [0, 0], "data": empty_triples},
+        "token_build_edges": {"offsets": [0, 0], "data": empty_triples},
+        "token_shell_edges": {"offsets": [0, 0], "data": empty_triples},
+        "token_diagnostic_edges": {"offsets": [0, 0], "data": empty_triples},
+        "token_cross_domain_edges": {"offsets": [0, 0], "data": empty_triples},
+        "token_chunk_starts": {
+            "offsets": [0, 2],
+            "data": torch.tensor([0, 2], dtype=torch.int32).numpy(),
+        },
+        "token_chunk_ends": {
+            "offsets": [0, 2],
+            "data": torch.tensor([2, 4], dtype=torch.int32).numpy(),
+        },
+        "token_chunk_kinds": {
+            "offsets": [0, 2],
+            "data": torch.tensor([1, 1], dtype=torch.int32).numpy(),
+        },
+        "token_chunk_dep_levels": {
+            "offsets": [0, 2],
+            "data": torch.tensor([0, 0], dtype=torch.int32).numpy(),
+        },
+    }
+    spans = [
+        {
+            "real_doc": 0,
+            "doc_start_token": 0,
+            "source_start": 0,
+            "source_end": 4,
+            "target_start": 0,
+        }
+    ]
+
+    with pytest.raises(ValueError, match="chunk capacity exceeded"):
+        patch._build_graph_route_tensors(
+            graph_sidecars,
+            spans,
+            target_len=4,
+            max_edges=2,
+            max_chunks=1,
+        )
+    with pytest.raises(ValueError, match="edge capacity exceeded"):
+        patch._build_graph_route_tensors(
+            graph_sidecars,
+            spans,
+            target_len=4,
+            max_edges=0,
+            max_chunks=2,
+        )

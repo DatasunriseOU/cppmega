@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextvars import ContextVar, Token
 
 import torch
 
@@ -68,6 +69,32 @@ __all__ = [
 ]
 
 _PATCH_MARKER = "__cppmega_dsa_indexer_fused_patched__"
+_AUTOGRAD_PATCH_MARKER = "__cppmega_graph_microbatch_patched__"
+_NO_GRAPH_BATCH = object()
+_GRAPH_BATCH_OVERRIDE: ContextVar[object] = ContextVar(
+    "cppmega_dsa_graph_batch_override", default=_NO_GRAPH_BATCH
+)
+_GRAPH_ROUTE_BATCH_KEYS = (
+    "graph_call_edges",
+    "graph_call_edge_counts",
+    "graph_type_edges",
+    "graph_type_edge_counts",
+    "graph_domain_edges",
+    "graph_domain_edge_counts",
+    "graph_build_edges",
+    "graph_build_edge_counts",
+    "graph_shell_edges",
+    "graph_shell_edge_counts",
+    "graph_diagnostic_edges",
+    "graph_diagnostic_edge_counts",
+    "graph_cross_domain_edges",
+    "graph_cross_domain_edge_counts",
+    "graph_chunk_starts",
+    "graph_chunk_ends",
+    "graph_chunk_kinds",
+    "graph_chunk_dep_levels",
+    "graph_chunk_counts",
+)
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -240,6 +267,143 @@ def _scatter_relation_edges_(
     _scatter_edges_(bias, edges, counts, weight=weight, sq=sq, sk=sk, require_kind=False)
 
 
+def _as_batched_chunks(
+    structure_batch: dict[str, torch.Tensor],
+    *,
+    batch_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    starts = structure_batch.get("graph_chunk_starts")
+    ends = structure_batch.get("graph_chunk_ends")
+    counts = structure_batch.get("graph_chunk_counts")
+    if starts is None or ends is None or counts is None:
+        raise KeyError(
+            "chunk-index call/type routes require graph_chunk_starts, "
+            "graph_chunk_ends, and graph_chunk_counts"
+        )
+    if not all(isinstance(value, torch.Tensor) for value in (starts, ends, counts)):
+        raise TypeError("graph chunk sidecars must be torch.Tensor")
+    if starts.dim() == 1:
+        starts = starts.unsqueeze(0)
+    if ends.dim() == 1:
+        ends = ends.unsqueeze(0)
+    if starts.dim() != 2 or ends.shape != starts.shape:
+        raise ValueError(
+            f"graph chunk starts/ends must have matching [B,C] shape, got "
+            f"{tuple(starts.shape)}/{tuple(ends.shape)}"
+        )
+    counts = counts.reshape(-1)
+    if int(starts.shape[0]) not in (1, batch_size):
+        raise ValueError(f"graph chunk batch {int(starts.shape[0])} must be 1 or {batch_size}")
+    if int(counts.shape[0]) not in (1, batch_size):
+        raise ValueError(f"graph chunk counts batch must be 1 or {batch_size}")
+    if int(starts.shape[0]) == 1 and batch_size > 1:
+        starts = starts.expand(batch_size, -1)
+        ends = ends.expand(batch_size, -1)
+    if int(counts.shape[0]) == 1 and batch_size > 1:
+        counts = counts.expand(batch_size)
+    starts = starts.to(device=device, dtype=torch.long)
+    ends = ends.to(device=device, dtype=torch.long)
+    counts = counts.to(device=device, dtype=torch.long)
+    max_chunks = int(starts.shape[1])
+    if bool(((counts < 0) | (counts > max_chunks)).any().item()):
+        raise ValueError(f"graph chunk counts out of range [0,{max_chunks}]")
+    return starts, ends, counts
+
+
+def _token_chunk_map(
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+    counts: torch.Tensor,
+    *,
+    length: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch, max_chunks = starts.shape
+    if max_chunks == 0:
+        return (
+            torch.zeros((batch, length), dtype=torch.long, device=starts.device),
+            torch.zeros((batch, length), dtype=torch.bool, device=starts.device),
+        )
+    slots = torch.arange(max_chunks, device=starts.device).unsqueeze(0)
+    active = slots < counts.unsqueeze(1)
+    invalid = active & ((starts < 0) | (ends <= starts) | (ends > length))
+    if bool(invalid.any().item()):
+        raise ValueError("active graph chunk span is outside the sample token range")
+    if max_chunks > 1:
+        ordered = active[:, 1:] & active[:, :-1] & (starts[:, 1:] < ends[:, :-1])
+        if bool(ordered.any().item()):
+            raise ValueError("active graph chunk spans overlap or are out of order")
+
+    searchable = torch.where(active, starts, torch.full_like(starts, length + 1))
+    positions = torch.arange(length, device=starts.device).unsqueeze(0).expand(batch, -1)
+    chunk_ids = torch.searchsorted(searchable.contiguous(), positions.contiguous(), right=True) - 1
+    safe_ids = chunk_ids.clamp(0, max_chunks - 1)
+    selected_starts = starts.gather(1, safe_ids)
+    selected_ends = ends.gather(1, safe_ids)
+    valid = (
+        (chunk_ids >= 0)
+        & (chunk_ids < counts.unsqueeze(1))
+        & (positions >= selected_starts)
+        & (positions < selected_ends)
+    )
+    return safe_ids, valid
+
+
+def _scatter_chunk_relation_edges_(
+    bias: torch.Tensor,
+    edges: torch.Tensor,
+    counts: torch.Tensor,
+    *,
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+    chunk_counts: torch.Tensor,
+    weight: float,
+    sq: int,
+    sk: int,
+) -> None:
+    """Expand chunk-index relations into token-span blocks in ``bias``."""
+
+    if weight == 0.0:
+        return
+    batch = int(bias.shape[0])
+    max_edges = int(edges.shape[1])
+    max_chunks = int(starts.shape[1])
+    if int(edges.shape[0]) == 1 and batch > 1:
+        edges = edges.expand(batch, -1, -1)
+    if int(counts.shape[0]) == 1 and batch > 1:
+        counts = counts.expand(batch)
+    if bool(((counts < 0) | (counts > max_edges)).any().item()):
+        raise ValueError(f"graph edge counts out of range [0,{max_edges}]")
+    active = torch.arange(max_edges, device=edges.device).unsqueeze(0) < counts.unsqueeze(1)
+    src = edges[..., 0]
+    dst = edges[..., 1]
+    valid_endpoint = (
+        (src >= 0)
+        & (dst >= 0)
+        & (src < chunk_counts.unsqueeze(1))
+        & (dst < chunk_counts.unsqueeze(1))
+    )
+    if bool((active & ~valid_endpoint).any().item()):
+        raise ValueError("declared call/type edge references an unavailable chunk")
+    if not bool(active.any().item()):
+        return
+
+    adjacency = bias.new_zeros((batch, max_chunks, max_chunks))
+    bidx = torch.nonzero(active, as_tuple=True)[0]
+    lin = (bidx * max_chunks + src[active]) * max_chunks + dst[active]
+    adjacency.view(-1).index_add_(
+        0, lin, adjacency.new_full((int(lin.numel()),), float(weight))
+    )
+    q_chunks, q_valid = _token_chunk_map(starts, ends, chunk_counts, length=sq)
+    k_chunks, k_valid = _token_chunk_map(starts, ends, chunk_counts, length=sk)
+    rows = adjacency.gather(
+        1, q_chunks.unsqueeze(-1).expand(-1, -1, max_chunks)
+    )
+    block_bias = rows.gather(2, k_chunks.unsqueeze(1).expand(-1, sq, -1))
+    block_bias.masked_fill_(~(q_valid.unsqueeze(2) & k_valid.unsqueeze(1)), 0)
+    bias.add_(block_bias)
+
+
 def _scatter_relation_edge_triples_(
     bias: torch.Tensor,
     edges: torch.Tensor,
@@ -270,9 +434,9 @@ def build_graph_route_bias_from_structure_batch(
 ) -> torch.Tensor:
     """Build ``S_graph[b,t,s]`` from cppmega graph route sidecars.
 
-    The current Megatron sidecar bridge carries token-position edge pairs:
-    ``graph_call_edges`` / ``graph_type_edges`` plus per-row counts.  This helper
-    turns them into the dense additive indexer prior used before DSA top-k.
+    ``graph_call_edges`` / ``graph_type_edges`` are chunk-index pairs.  They are
+    expanded through ``graph_chunk_starts/ends`` into token-span blocks. Domain,
+    build, shell, diagnostic, and cross-domain triples are token-position edges.
     It intentionally raises on missing/malformed route sidecars: graph-routed
     cppmega models must not silently become token-only.
     """
@@ -292,6 +456,7 @@ def build_graph_route_bias_from_structure_batch(
         (batch_size, seqlen_q, seqlen_k), device=device, dtype=dtype
     )
     seen_relation = False
+    chunk_layout: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
     for edge_key, count_key, weight in (
         ("graph_call_edges", "graph_call_edge_counts", call_weight),
         ("graph_type_edges", "graph_type_edge_counts", type_weight),
@@ -307,10 +472,18 @@ def build_graph_route_bias_from_structure_batch(
             continue
         seen_relation = True
         edges, counts = relation
-        _scatter_relation_edges_(
+        if chunk_layout is None:
+            chunk_layout = _as_batched_chunks(
+                structure_batch, batch_size=batch_size, device=device
+            )
+        starts, ends, chunk_counts = chunk_layout
+        _scatter_chunk_relation_edges_(
             bias,
             edges,
             counts,
+            starts=starts,
+            ends=ends,
+            chunk_counts=chunk_counts,
             weight=weight,
             sq=seqlen_q,
             sk=seqlen_k,
@@ -365,8 +538,14 @@ def _current_graph_route_bias(
             "importable; import it before applying the DSA indexer patch"
         ) from exc
 
+    override = _GRAPH_BATCH_OVERRIDE.get()
+    structure_batch = (
+        _get_current_structure_batch()
+        if override is _NO_GRAPH_BATCH
+        else override
+    )
     return build_graph_route_bias_from_structure_batch(
-        _get_current_structure_batch(),
+        structure_batch,
         batch_size=batch_size,
         seqlen_q=seqlen_q,
         seqlen_k=seqlen_k,
@@ -380,6 +559,75 @@ def _current_graph_route_bias(
         diagnostic_weight=_env_float("CPPMEGA_DSA_GRAPH_DIAGNOSTIC_WEIGHT", 1.0),
         cross_domain_weight=_env_float("CPPMEGA_DSA_GRAPH_CROSS_DOMAIN_WEIGHT", 1.0),
     )
+
+
+def _capture_current_graph_batch() -> dict[str, torch.Tensor]:
+    try:
+        from cppmega.megatron.structure_dataset_patch import _get_current_structure_batch
+    except Exception as exc:  # pragma: no cover - remote Megatron environment
+        raise RuntimeError(
+            "graph-routed DSA autograd requires structure_dataset_patch"
+        ) from exc
+    current = _get_current_structure_batch()
+    if current is None:
+        raise RuntimeError(
+            "CPPMEGA_GRAPH_ROUTES_ENABLED=1 but no structure batch is active "
+            "while entering FusedDSAIndexerLoss"
+        )
+    captured = {
+        key: value.detach().clone()
+        for key in _GRAPH_ROUTE_BATCH_KEYS
+        if (value := current.get(key)) is not None
+    }
+    if not captured:
+        raise KeyError("active structure batch contains no graph route tensors")
+    return captured
+
+
+def _set_graph_batch_override(batch: dict[str, torch.Tensor]) -> Token:
+    return _GRAPH_BATCH_OVERRIDE.set(batch)
+
+
+def _reset_graph_batch_override(token: Token) -> None:
+    _GRAPH_BATCH_OVERRIDE.reset(token)
+
+
+def _patch_fused_dsa_autograd(dsa_mod) -> None:
+    fused_loss = getattr(dsa_mod, "FusedDSAIndexerLoss", None)
+    if fused_loss is None:
+        raise RuntimeError("Megatron DSA FusedDSAIndexerLoss is unavailable")
+    if getattr(fused_loss, _AUTOGRAD_PATCH_MARKER, False):
+        return
+    original_forward = fused_loss.forward
+    original_backward = fused_loss.backward
+
+    def forward(ctx, *args, **kwargs):
+        captured = None
+        token = None
+        if _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
+            captured = _capture_current_graph_batch()
+            token = _set_graph_batch_override(captured)
+        ctx.cppmega_graph_route_batch = captured
+        try:
+            return original_forward(ctx, *args, **kwargs)
+        finally:
+            if token is not None:
+                _reset_graph_batch_override(token)
+
+    def backward(ctx, *args, **kwargs):
+        captured = getattr(ctx, "cppmega_graph_route_batch", None)
+        token = None
+        if captured is not None:
+            token = _set_graph_batch_override(captured)
+        try:
+            return original_backward(ctx, *args, **kwargs)
+        finally:
+            if token is not None:
+                _reset_graph_batch_override(token)
+
+    fused_loss.forward = staticmethod(forward)
+    fused_loss.backward = staticmethod(backward)
+    setattr(fused_loss, _AUTOGRAD_PATCH_MARKER, True)
 
 
 def compute_index_scores_fused_bf16(
@@ -512,6 +760,7 @@ def apply_dsa_indexer_fused_patch(*, force: bool = False) -> bool:
 
     setattr(_compute_index_scores_fused, _PATCH_MARKER, True)
     dsa_mod._compute_index_scores = _compute_index_scores_fused
+    _patch_fused_dsa_autograd(dsa_mod)
 
     log.info(
         "cppmega DSA indexer fused patch applied: per-head accumulation, "

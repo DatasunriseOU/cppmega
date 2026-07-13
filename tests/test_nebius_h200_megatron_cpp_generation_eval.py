@@ -1,3 +1,4 @@
+import ast
 import subprocess
 import tarfile
 
@@ -63,6 +64,9 @@ def test_generation_worker_builds_model_loads_checkpoint_and_threads_sidecars():
     assert "load_checkpoint(model_list, None, None, strict=True)" in worker
     assert "set_cppmega_structure_inputs" in worker
     assert '"structure_ids": zeros' in worker
+    assert '"graph_call_edges": torch.zeros((batch, 0, 2)' in worker
+    assert '"graph_call_edge_counts": empty_counts' in worker
+    assert '"graph_chunk_counts": empty_counts' in worker
     assert "--load" in worker
     assert "--no-load-optim" in worker
     assert "--no-load-rng" in worker
@@ -77,6 +81,33 @@ def test_generation_worker_can_emit_tensorwise_fp8_args():
     assert 'if fp8_recipe == "tensorwise":' in worker
     assert '"--fp8-recipe", "tensorwise"' in worker
     assert '"--fp8-amax-history-len", "16"' in worker
+
+
+def test_trim_body_completion_preserves_nested_blocks_and_trailing_return():
+    tree = ast.parse(generation_worker_source())
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"trim_body_completion", "_trim_at_function_closing_brace"}
+    ]
+    namespace = {}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "<worker>", "exec"), namespace)
+    completion = """if (value < lo) {
+    value = lo;
+}
+// Ignore this brace: }
+return value;
+}
+int main() { return 0; }
+"""
+
+    assert namespace["trim_body_completion"](completion) == """if (value < lo) {
+    value = lo;
+}
+// Ignore this brace: }
+return value;
+"""
 
 
 def test_make_eval_tar_contains_cases_and_prompts(tmp_path):
