@@ -31,20 +31,21 @@ jobs:
     if: |
       github.repository == 'DatasunriseOU/cppmega' &&
       (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, cppmega]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: false
+      - name: Verify persistent runner capacity
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h "$GITHUB_WORKSPACE"
+          available_kib=$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 {print $4}')
+          minimum_kib=$((80 * 1024 * 1024))
+          if (( available_kib < minimum_kib )); then
+            echo "::error::build-image requires at least 80 GiB free on the persistent runner"
+            exit 1
+          fi
 
       - name: Resolve wheel release tag
         id: rel
