@@ -29,7 +29,6 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
-SOURCE_ROOT="$(cd "$REPO_ROOT/.." && pwd)"
 PY="${PYTHON:-python3}"
 DATA_ROOT="${MEGACPP_DATA_ROOT:-/home/dave/cppmega-root/data}"
 DATASET_NAME="${MEGACPP_DATASET_NAME:-clang_semantic_4k_v10}"

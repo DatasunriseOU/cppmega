@@ -14,12 +14,8 @@ Checks
    ``<RESERVED_N>`` slot (id == N).
 2. Domain-delimiter reserved roles are complete START/END pairs and resolve to
    existing ``<RESERVED_N>`` slots.
-3. Contract <-> mlx ``data/tokenizer_contract.py`` (REQUIRED/TOOL_USE special ids).
-4. Contract <-> mlx ``tokenizer/cpp_tokenizer.py`` EXPECTED_VOCAB_SIZE.
-5. Contract <-> nanochat ``scripts/tok_train_cpp.py`` --vocab_size default (if present).
-6. NAM56R vocab dual-track: report model_factory NAM56R_FULL vs config default; assert
-   the first-run pairing (model vocab paired with the 65536 artifact) is internally
-   consistent. The 65536/131072 split itself is intentional and NOT a failure.
+3. Optional explicitly supplied MLX/nanochat checkouts can be cross-checked; the
+   default and CI path never read mutable sibling worktrees.
 
 Usage:
     python verify_tokenizer_contract.py \
@@ -33,7 +29,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import sys
 from pathlib import Path
 
 

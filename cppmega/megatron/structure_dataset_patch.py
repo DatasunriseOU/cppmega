@@ -18,6 +18,11 @@ from typing import Dict, Any, Optional
 import torch
 import numpy as np
 
+from cppmega.megatron.domain_route_contract import (
+    GRAPH_ROUTE_COLUMNS,
+    GRAPH_ROUTE_COORDINATE_SPACES,
+)
+
 # Thread-local storage to safely pass the current batch's structure inputs to model forward
 _local_storage = threading.local()
 
@@ -127,19 +132,7 @@ _SYMBOL_IDENTITY_SCHEMA_VERSION = 3
 
 _LOSS_MASK_ALIASES = ("loss_mask", "token_loss_mask")
 
-_GRAPH_ROUTE_COLS = (
-    "token_call_edges",
-    "token_type_edges",
-    "token_domain_edges",
-    "token_build_edges",
-    "token_shell_edges",
-    "token_diagnostic_edges",
-    "token_cross_domain_edges",
-    "token_chunk_starts",
-    "token_chunk_ends",
-    "token_chunk_kinds",
-    "token_chunk_dep_levels",
-)
+_GRAPH_ROUTE_COLS = GRAPH_ROUTE_COLUMNS
 
 _CPPMEGA_BATCH_COLS = _TOKEN_BATCH_COLS + _GRAPH_BATCH_COLS
 _TP_SIDECAR_MAX_DIMS = 4
@@ -746,25 +739,12 @@ def _lazy_init_graph_sidecars(dataset: Any) -> Dict[str, Dict[str, Any]]:
 
     document_count = int(sidecar.get("document_count", len(dataset.dataset.index.sequence_lengths)))
     base_dir = os.path.dirname(json_path)
-    expected_coordinates = {
-        "token_call_edges": "chunk_index",
-        "token_type_edges": "chunk_index",
-        "token_domain_edges": "token_index",
-        "token_build_edges": "token_index",
-        "token_shell_edges": "token_index",
-        "token_diagnostic_edges": "token_index",
-        "token_cross_domain_edges": "token_index",
-        "token_chunk_starts": "token_index",
-        "token_chunk_ends": "token_index",
-        "token_chunk_kinds": "chunk_index",
-        "token_chunk_dep_levels": "chunk_index",
-    }
     for col, entry in graph_paths.items():
         coordinate_space = entry.get("coordinate_space")
-        if coordinate_space != expected_coordinates[col]:
+        if coordinate_space != GRAPH_ROUTE_COORDINATE_SPACES[col]:
             raise ValueError(
                 f"[cppmega-patch] graph sidecar {col!r} coordinate_space "
-                f"{coordinate_space!r} != {expected_coordinates[col]!r} in {json_path!r}"
+                f"{coordinate_space!r} != {GRAPH_ROUTE_COORDINATE_SPACES[col]!r} in {json_path!r}"
             )
         offsets_path = _safe_sidecar_path(
             base_dir, entry["offsets_path"], col=col, field="offsets_path", json_path=json_path

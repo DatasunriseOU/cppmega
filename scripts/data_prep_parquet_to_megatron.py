@@ -56,6 +56,16 @@ from cppmega.megatron.objective_contract import (
     materialized_objective_artifact_manifest,
     validate_objective_contract,
 )
+from cppmega.megatron.domain_route_contract import (  # noqa: E402
+    DOMAIN_DELIMITER_ID_TO_DOMAIN,
+    DOMAIN_EDGE_KINDS_BY_COLUMN,
+    DOMAIN_ROUTE_COLUMNS,
+    DOMAIN_START_DELIMITER_IDS,
+    VALID_DOMAIN_CONFIDENCE_IDS,
+    VALID_DOMAIN_EDGE_KINDS,
+    VALID_DOMAIN_IDS,
+    VALID_DOMAIN_ROLE_IDS,
+)
 
 
 _OUTPUT_DTYPE_MAP = {
@@ -251,62 +261,6 @@ _GRAPH_RELATION_TO_COLUMN = {
     "cross_domain": "token_cross_domain_edges",
 }
 
-DOMAIN_ROUTE_COLUMNS = (
-    "token_domain_ids",
-    "token_role_ids",
-    "token_entity_ids",
-    "token_scope_ids",
-    "token_source_doc_ids",
-    "token_confidence_ids",
-)
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-DOMAIN_SCHEMA_PATH = _REPO_ROOT / "data/domain_schema_v1.json"
-TOKENIZER_CONTRACT_PATH = (
-    _REPO_ROOT / "data/tokenizer_v2/tokenizer_contract_v1.json"
-)
-DOMAIN_SCHEMA = json.loads(DOMAIN_SCHEMA_PATH.read_text(encoding="utf-8"))
-TOKENIZER_CONTRACT = json.loads(
-    TOKENIZER_CONTRACT_PATH.read_text(encoding="utf-8")
-)
-if DOMAIN_SCHEMA.get("schema") != "cppmega_domain_sidecars_v1":
-    raise RuntimeError(f"unsupported frozen domain schema: {DOMAIN_SCHEMA_PATH}")
-VALID_DOMAIN_IDS = frozenset(
-    int(value) for value in DOMAIN_SCHEMA["domain_kinds"].values()
-)
-VALID_DOMAIN_ROLE_IDS = frozenset(
-    int(value) for value in DOMAIN_SCHEMA["role_kinds"].values()
-)
-VALID_DOMAIN_CONFIDENCE_IDS = frozenset(
-    int(value) for value in DOMAIN_SCHEMA["confidence_kinds"].values()
-)
-_EDGE_FAMILY_TO_COLUMN = {
-    "domain": "token_domain_edges",
-    "build": "token_build_edges",
-    "shell": "token_shell_edges",
-    "diagnostic": "token_diagnostic_edges",
-    "cross_domain": "token_cross_domain_edges",
-}
-DOMAIN_EDGE_KINDS_BY_COLUMN = {
-    _EDGE_FAMILY_TO_COLUMN[family]: frozenset(int(kind) for kind in kinds)
-    for family, kinds in DOMAIN_SCHEMA["edge_families"].items()
-}
-VALID_DOMAIN_EDGE_KINDS = frozenset().union(*DOMAIN_EDGE_KINDS_BY_COLUMN.values())
-
-_RESERVED_ROLES = TOKENIZER_CONTRACT["reserved_role_assignments"]
-DOMAIN_DELIMITER_ID_TO_DOMAIN: dict[int, int] = {}
-DOMAIN_START_DELIMITER_IDS: frozenset[int] = frozenset(
-    int(_RESERVED_ROLES[spec["start"]])
-    for spec in DOMAIN_SCHEMA["delimiter_roles"].values()
-)
-for _delimiter in DOMAIN_SCHEMA["delimiter_roles"].values():
-    _domain_id = int(_delimiter["domain_id"])
-    for _direction in ("start", "end"):
-        _token_id = int(_RESERVED_ROLES[_delimiter[_direction]])
-        if _token_id in DOMAIN_DELIMITER_ID_TO_DOMAIN:
-            raise RuntimeError(
-                f"duplicate domain delimiter token ID {_token_id} in frozen contracts"
-            )
-        DOMAIN_DELIMITER_ID_TO_DOMAIN[_token_id] = _domain_id
 UINT32_MAX = int(np.iinfo(np.uint32).max)
 
 
