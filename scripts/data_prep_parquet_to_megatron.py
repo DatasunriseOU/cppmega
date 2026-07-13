@@ -107,6 +107,82 @@ DEFAULT_CPPMEGA_GRAPH_SIDECARS: tuple[tuple[str, str, str], ...] = (
     ("token_chunk_dep_levels", "ragged_1d", "uint16"),
 )
 
+SYMBOL_IDENTITY_SCHEMA_METADATA_KEY = "cppmega.symbol_identity_schema_version"
+REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION = 2
+
+
+def _require_symbol_identity_schema_metadata(
+    metadata: dict[bytes, bytes] | None,
+    source: str,
+) -> int:
+    key = SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")
+    raw_version = (metadata or {}).get(key)
+    try:
+        version = int(raw_version) if raw_version is not None else None
+    except (TypeError, ValueError):
+        version = None
+    if version != REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"{source}: missing or incompatible {SYMBOL_IDENTITY_SCHEMA_METADATA_KEY} "
+            f"metadata ({raw_version!r}); regenerate parquet with clang USR/signature "
+            f"schema v{REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION} before conversion"
+        )
+    return version
+
+
+def _require_symbol_identity_schema(shards: list[str]) -> int | None:
+    import pyarrow.parquet as pq
+
+    accepted_version: int | None = None
+    semantic_presence: bool | None = None
+    identity_columns = {
+        "token_symbol_ids",
+        "token_call_targets",
+        "token_type_refs",
+        "token_def_use",
+    }
+    for shard in shards:
+        schema = pq.ParquetFile(shard).schema_arrow
+        present_identity_columns = identity_columns & set(schema.names)
+        if present_identity_columns and present_identity_columns != identity_columns:
+            missing = sorted(identity_columns - present_identity_columns)
+            raise RuntimeError(
+                f"{shard}: partial semantic-symbol columns; missing={missing}. "
+                "Regenerate one complete clang USR/signature dataset"
+            )
+        has_identity_columns = bool(present_identity_columns)
+        if semantic_presence is None:
+            semantic_presence = has_identity_columns
+        elif has_identity_columns != semantic_presence:
+            raise RuntimeError(
+                f"{shard}: mixed semantic-symbol column presence across parquet shards; "
+                "regenerate one consistent clang USR/signature dataset"
+            )
+        if not has_identity_columns:
+            continue
+        metadata = schema.metadata
+        version = _require_symbol_identity_schema_metadata(metadata, shard)
+        if accepted_version is None:
+            accepted_version = version
+        elif version != accepted_version:
+            raise RuntimeError(
+                f"{shard}: mixed symbol identity schema versions in one conversion; "
+                "regenerate all parquet shards with clang USR/signature identities"
+            )
+    return accepted_version
+
+
+def _add_symbol_identity_manifest(
+    sidecar_data: dict[str, object],
+    version: int,
+) -> None:
+    if version != REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION:
+        raise ValueError(
+            f"cannot write manifest for symbol identity schema v{version}; "
+            f"expected v{REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION}"
+        )
+    sidecar_data["symbol_identity_schema_version"] = version
+
 
 def _resolve_output_dtype(dtype_str: str) -> type[np.generic]:
     try:
@@ -914,6 +990,7 @@ def _convert_parquet_to_numpy(
     shards = find_parquet_shards(input_dir, split)
     token_column = _resolve_token_column(shards, token_column)
     length_column = _resolve_length_column(shards, length_column)
+    symbol_identity_schema_version = _require_symbol_identity_schema(shards)
     write_source_platform = _resolve_source_platform_sidecar(
         shards, source_platform_sidecar
     )
@@ -1125,6 +1202,8 @@ def _convert_parquet_to_numpy(
         sidecar_data["side_channel_paths"] = side_channel_paths
     _add_graph_manifest(sidecar_data, graph_sidecar_paths)
     _add_source_platform_manifest(sidecar_data, source_platform_paths)
+    if symbol_identity_schema_version is not None:
+        _add_symbol_identity_manifest(sidecar_data, symbol_identity_schema_version)
 
     with open(json_path, "w", encoding="utf-8") as jf:
         json.dump(sidecar_data, jf, indent=4)
@@ -1201,6 +1280,7 @@ def convert_parquet_to_megatron(
     shards = find_parquet_shards(input_dir, split)
     token_column = _resolve_token_column(shards, token_column)
     length_column = _resolve_length_column(shards, length_column)
+    symbol_identity_schema_version = _require_symbol_identity_schema(shards)
     write_source_platform = _resolve_source_platform_sidecar(
         shards, source_platform_sidecar
     )
@@ -1371,6 +1451,8 @@ def convert_parquet_to_megatron(
         sidecar_data["side_channel_paths"] = side_channel_paths
     _add_graph_manifest(sidecar_data, graph_sidecar_paths)
     _add_source_platform_manifest(sidecar_data, source_platform_paths)
+    if symbol_identity_schema_version is not None:
+        _add_symbol_identity_manifest(sidecar_data, symbol_identity_schema_version)
 
     with open(json_path, "w", encoding="utf-8") as jf:
         json.dump(sidecar_data, jf, indent=4)

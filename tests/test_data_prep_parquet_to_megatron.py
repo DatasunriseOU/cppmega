@@ -374,7 +374,10 @@ def test_explicit_mmididx_writer_trims_padding_and_all_sidecars(tmp_path: Path) 
             row[name] = [[3]]
         else:
             row[name] = [[1]]
-    pq.write_table(pa.table(row), input_dir / "repo.parquet")
+    table = pa.table(row).replace_schema_metadata({
+        converter.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode(): b"2"
+    })
+    pq.write_table(table, input_dir / "repo.parquet")
 
     output_prefix = tmp_path / "cppmega_1024_train"
     converter.convert_parquet_to_megatron(
@@ -402,6 +405,7 @@ def test_explicit_mmididx_writer_trims_padding_and_all_sidecars(tmp_path: Path) 
     assert manifest["token_column"] == "input_ids"
     assert manifest["length_column"] == "valid_token_count"
     assert manifest["writer_backend"] == "mmididx"
+    assert manifest["symbol_identity_schema_version"] == 2
     assert set(manifest["side_channel_paths"]) == {
         name for name, _dtype in converter.DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS
     }
@@ -445,9 +449,10 @@ def test_mmididx_row_group_batching_preserves_document_order_and_offsets(
             rows[name] = [[2], [2, 4], [1]]
         else:
             rows[name] = [[1], [1, 1], [1]]
-    pq.write_table(
-        pa.table(rows), input_dir / "repo.parquet", row_group_size=2
-    )
+    table = pa.table(rows).replace_schema_metadata({
+        converter.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode(): b"2"
+    })
+    pq.write_table(table, input_dir / "repo.parquet", row_group_size=2)
 
     output_prefix = tmp_path / "cppmega_train"
     converter.convert_parquet_to_megatron(
@@ -514,6 +519,36 @@ def test_auto_token_column_fails_on_ambiguous_schema(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="exactly one of input_ids/token_ids"):
+        converter._convert_parquet_to_numpy(
+            input_dir=str(tmp_path),
+            output_prefix=str(tmp_path / "out"),
+            split="all",
+            token_column="auto",
+            dtype_str="uint16",
+            side_channels=[],
+            side_channel_dtypes=[],
+            graph_sidecars=None,
+        )
+
+
+def test_semantic_parquet_requires_usr_identity_schema_metadata(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    converter = _load_converter_module()
+    pq.write_table(
+        pa.table(
+            {
+                "input_ids": [[1]],
+                "token_symbol_ids": [[7]],
+                "token_call_targets": [[0]],
+                "token_type_refs": [[0]],
+                "token_def_use": [[1]],
+            }
+        ),
+        tmp_path / "stale.parquet",
+    )
+
+    with pytest.raises(RuntimeError, match="regenerate.*clang USR"):
         converter._convert_parquet_to_numpy(
             input_dir=str(tmp_path),
             output_prefix=str(tmp_path / "out"),
