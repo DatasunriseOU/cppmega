@@ -560,69 +560,83 @@ def _validate_domain_route_sidecars(
             )
         vectors[column] = vector
 
-    for column, valid_values in (
+    enum_contracts = (
         ("token_domain_ids", VALID_DOMAIN_IDS),
         ("token_role_ids", VALID_DOMAIN_ROLE_IDS),
         ("token_confidence_ids", VALID_DOMAIN_CONFIDENCE_IDS),
-    ):
+    )
+    for column, valid_values in enum_contracts:
         for value in vectors[column]:
             if value not in valid_values:
                 raise ValueError(
                     f"unknown {column} value {value} at {shard_path}#row{row_idx}"
                 )
-    for column in ("token_entity_ids", "token_scope_ids", "token_source_doc_ids"):
+    for column in (
+        "token_entity_ids",
+        "token_scope_ids",
+        "token_source_doc_ids",
+    ):
         if any(value < 0 or value > UINT32_MAX for value in vectors[column]):
-            raise ValueError(f"{column} must fit uint32 at {shard_path}#row{row_idx}")
+            raise ValueError(
+                f"{column} must fit uint32 at {shard_path}#row{row_idx}"
+            )
     if any(value <= 0 for value in vectors["token_source_doc_ids"]):
         raise ValueError(
             "token_source_doc_ids must preserve a positive source document ID "
             f"for every valid token at {shard_path}#row{row_idx}"
         )
 
+    domains = vectors["token_domain_ids"]
+    roles = vectors["token_role_ids"]
+    confidence = vectors["token_confidence_ids"]
     stack: list[int] = []
     for token_idx, (token_id, domain_id, role_id, confidence_id) in enumerate(
-        zip(
-            tokens,
-            vectors["token_domain_ids"],
-            vectors["token_role_ids"],
-            vectors["token_confidence_ids"],
-            strict=True,
-        )
+        zip(tokens, domains, roles, confidence, strict=True)
     ):
         expected_domain = DOMAIN_DELIMITER_ID_TO_DOMAIN.get(token_id)
-        if expected_domain is None:
+        if expected_domain is not None:
+            if domain_id != expected_domain:
+                raise ValueError(
+                    f"delimiter token id {token_id} requires domain id "
+                    f"{expected_domain}, got {domain_id} at "
+                    f"{shard_path}#row{row_idx}:token{token_idx}"
+                )
+            if role_id != 1:
+                raise ValueError(
+                    f"delimiter token id {token_id} requires role id 1 at "
+                    f"{shard_path}#row{row_idx}:token{token_idx}"
+                )
+            if confidence_id != 4:
+                raise ValueError(
+                    f"delimiter token id {token_id} requires confidence id 4 at "
+                    f"{shard_path}#row{row_idx}:token{token_idx}"
+                )
+            if token_id in DOMAIN_START_DELIMITER_IDS:
+                stack.append(expected_domain)
+            else:
+                if not stack or stack[-1] != expected_domain:
+                    raise ValueError(
+                        f"unmatched domain end delimiter token id {token_id} at "
+                        f"{shard_path}#row{row_idx}:token{token_idx}"
+                    )
+                stack.pop()
+        else:
             if role_id == 1:
                 raise ValueError(
                     f"DELIMITER role on non-delimiter token id {token_id} at "
                     f"{shard_path}#row{row_idx}:token{token_idx}"
                 )
-            continue
-        if domain_id != expected_domain:
-            raise ValueError(
-                f"delimiter token id {token_id} requires domain id {expected_domain}, "
-                f"got {domain_id} at {shard_path}#row{row_idx}:token{token_idx}"
-            )
-        if role_id != 1:
-            raise ValueError(
-                f"delimiter token id {token_id} requires role id 1 at "
-                f"{shard_path}#row{row_idx}:token{token_idx}"
-            )
-        if confidence_id != 4:
-            raise ValueError(
-                f"delimiter token id {token_id} requires confidence id 4 at "
-                f"{shard_path}#row{row_idx}:token{token_idx}"
-            )
-        if token_id in DOMAIN_START_DELIMITER_IDS:
-            stack.append(expected_domain)
-        elif not stack or stack[-1] != expected_domain:
-            raise ValueError(
-                f"unmatched domain end delimiter token id {token_id} at "
-                f"{shard_path}#row{row_idx}:token{token_idx}"
-            )
-        else:
-            stack.pop()
+            expected_active_domain = stack[-1] if stack else 0
+            if domain_id != expected_active_domain:
+                raise ValueError(
+                    f"domain id {domain_id} does not match active reserved "
+                    f"delimiter domain {expected_active_domain} at "
+                    f"{shard_path}#row{row_idx}:token{token_idx}"
+                )
     if stack:
-        raise ValueError(f"unclosed domain delimiters {stack} at {shard_path}#row{row_idx}")
+        raise ValueError(
+            f"unclosed domain delimiters {stack} at {shard_path}#row{row_idx}"
+        )
 
 
 def _fixed_width_list_matrix(

@@ -594,6 +594,126 @@ def test_normalize_edge_triples_rejects_wrong_family_kind_26() -> None:
         )
 
 
+def test_normalize_edge_triples_rejects_unknown_domain_route_kind() -> None:
+    converter = _load_converter_module()
+
+    with pytest.raises(ValueError, match="unknown domain route edge kind 9999"):
+        converter._normalize_edge_triples(
+            [{"from": 0, "to": 1, "kind": 9999}],
+            column="token_domain_edges",
+            shard_path="shard.parquet",
+            row_idx=4,
+        )
+
+
+def test_normalize_edge_triples_rejects_missing_fields_and_wrong_edge_family() -> None:
+    converter = _load_converter_module()
+
+    with pytest.raises(ValueError, match="missing src/dst/kind"):
+        converter._normalize_edge_triples(
+            [{"from": 0, "kind": 20}],
+            column="token_build_edges",
+            shard_path="shard.parquet",
+            row_idx=4,
+        )
+
+    with pytest.raises(ValueError, match="edge kind 60 is not valid for token_build_edges"):
+        converter._normalize_edge_triples(
+            [{"from": 0, "to": 1, "kind": 60}],
+            column="token_build_edges",
+            shard_path="shard.parquet",
+            row_idx=4,
+        )
+
+
+def test_domain_route_sidecars_validate_enums_delimiters_and_source_ids() -> None:
+    converter = _load_converter_module()
+    values = {
+        "token_domain_ids": [1, 1, 1],
+        "token_role_ids": [1, 2, 1],
+        "token_entity_ids": [0, 7, 0],
+        "token_scope_ids": [0, 0, 0],
+        "token_source_doc_ids": [9, 9, 9],
+        "token_confidence_ids": [4, 2, 4],
+    }
+
+    converter._validate_domain_route_sidecars(
+        [191, 1000, 192],
+        values,
+        shard_path="shard.parquet",
+        row_idx=3,
+    )
+
+    bad_domain = dict(values)
+    bad_domain["token_domain_ids"] = [1, 999, 1]
+    with pytest.raises(ValueError, match="unknown token_domain_ids value 999"):
+        converter._validate_domain_route_sidecars(
+            [191, 1000, 192],
+            bad_domain,
+            shard_path="shard.parquet",
+            row_idx=3,
+        )
+
+    wrong_delimiter_domain = dict(values)
+    wrong_delimiter_domain["token_domain_ids"] = [2, 1, 1]
+    with pytest.raises(ValueError, match="delimiter token id 191 requires domain id 1"):
+        converter._validate_domain_route_sidecars(
+            [191, 1000, 192],
+            wrong_delimiter_domain,
+            shard_path="shard.parquet",
+            row_idx=3,
+        )
+
+    missing_source = dict(values)
+    missing_source.pop("token_source_doc_ids")
+    with pytest.raises(ValueError, match="complete token-aligned domain route profile"):
+        converter._validate_domain_route_sidecars(
+            [191, 1000, 192],
+            missing_source,
+            shard_path="shard.parquet",
+            row_idx=3,
+        )
+
+
+def test_domain_route_sidecars_validate_nested_sql_and_uint32_bounds() -> None:
+    converter = _load_converter_module()
+    nested = {
+        "token_domain_ids": [1, 30, 30, 30, 1],
+        "token_role_ids": [1, 1, 2, 1, 1],
+        "token_entity_ids": [0, 0, 7, 0, 0],
+        "token_scope_ids": [0, 0, 0, 0, 0],
+        "token_source_doc_ids": [9, 9, 9, 9, 9],
+        "token_confidence_ids": [4, 4, 2, 4, 4],
+    }
+
+    converter._validate_domain_route_sidecars(
+        [191, 239, 1000, 240, 192],
+        nested,
+        shard_path="shard.parquet",
+        row_idx=5,
+    )
+
+    oversized_entity = dict(nested)
+    oversized_entity["token_entity_ids"] = [0, 0, 2**32, 0, 0]
+    with pytest.raises(ValueError, match="token_entity_ids must fit uint32"):
+        converter._validate_domain_route_sidecars(
+            [191, 239, 1000, 240, 192],
+            oversized_entity,
+            shard_path="shard.parquet",
+            row_idx=5,
+        )
+
+    oversized_source = dict(nested)
+    oversized_source["token_source_doc_ids"] = [9, 9, 2**32, 9, 9]
+    with pytest.raises(ValueError, match="token_source_doc_ids must fit uint32"):
+        converter._validate_domain_route_sidecars(
+            [191, 239, 1000, 240, 192],
+            oversized_source,
+            shard_path="shard.parquet",
+            row_idx=5,
+        )
+
+
 def test_graph_sidecar_writer_writes_offsets_data_and_manifest(tmp_path: Path) -> None:
     converter = _load_converter_module()
     prefix = tmp_path / "cppmega_train"
@@ -780,6 +900,13 @@ def test_explicit_mmididx_writer_trims_padding_and_all_sidecars(tmp_path: Path) 
         np.fromfile(tmp_path / "cppmega_1024_train_loss_mask.bin", dtype=np.uint8),
         np.array([1, 1, 0], dtype=np.uint8),
     )
+    np.testing.assert_array_equal(
+        np.fromfile(
+            tmp_path / "cppmega_1024_train_token_source_doc_ids.bin",
+            dtype=np.uint32,
+        ),
+        np.array([1, 1, 1], dtype=np.uint32),
+    )
     manifest = json.loads(output_prefix.with_suffix(".json").read_text())
     assert manifest["token_count"] == 3
     assert manifest["source_capacity_token_count"] == 5
@@ -872,6 +999,46 @@ def test_mmididx_writer_binds_pre_materialized_objective_contract(
         ),
         np.array([OBJECTIVE_IDS[task] for task in tasks], dtype=np.uint8),
     )
+
+
+def test_mmididx_conversion_rejects_invalid_domain_profile_before_success(
+    tmp_path: Path,
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    converter = _load_converter_module()
+    input_dir = tmp_path / "parquet"
+    input_dir.mkdir()
+    row: dict[str, object] = {
+        "valid_token_count": [2],
+        "input_ids": [[10, 11]],
+    }
+    for name, _dtype in converter.DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS:
+        row[name] = [[0, 0]]
+    row["doc_ids"] = [[1, 1]]
+    row["token_domain_ids"] = [[999, 0]]
+    row["token_source_doc_ids"] = [[1, 1]]
+    for name, kind, _dtype in converter.DEFAULT_CPPMEGA_GRAPH_SIDECARS:
+        if kind in {"edge_pairs", "edge_triples"}:
+            row[name] = [[]]
+        elif name == "token_chunk_starts":
+            row[name] = [[0]]
+        elif name == "token_chunk_ends":
+            row[name] = [[2]]
+        else:
+            row[name] = [[1]]
+    table = _stamp_v3_identity_table(pa, pa.table(row), converter)
+    pq.write_table(table, input_dir / "bad.parquet")
+
+    with pytest.raises(ValueError, match="unknown token_domain_ids value 999"):
+        converter.convert_parquet_to_megatron(
+            input_dir=str(input_dir),
+            output_prefix=str(tmp_path / "bad_train"),
+            split="all",
+            token_column="auto",
+            length_column="auto",
+            writer_backend="mmididx",
+        )
 
 
 def test_mmididx_row_group_batching_preserves_document_order_and_offsets(
