@@ -75,10 +75,7 @@ class CppMegaLanguageModelEmbedding(LanguageModelEmbedding):
             )
 
         self.cppmega_domain = None
-        domain_enabled = os.environ.get(
-            "CPPMEGA_DOMAIN_EMBEDDING_ENABLED",
-            "1" if os.environ.get("CPPMEGA_STRUCTURE_ENABLED", "0") == "1" else "0",
-        ) == "1"
+        domain_enabled = os.environ.get("CPPMEGA_DOMAIN_EMBEDDING_ENABLED", "0") == "1"
         if domain_enabled:
             self.cppmega_domain = CppMegaDomainEmbedding(
                 hidden_size=self.config.hidden_size,

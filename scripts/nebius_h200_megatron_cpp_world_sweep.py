@@ -99,6 +99,18 @@ def _sidecar_required_files(prefix: Path, tokenizer_dir: Path) -> list[Path]:
     for entry in manifest.get("graph_sidecar_paths", {}).values():
         required.append(prefix.parent / entry["offsets_path"])
         required.append(prefix.parent / entry["data_path"])
+    source_platform = manifest.get("source_platform_sidecar")
+    if source_platform is not None:
+        if not isinstance(source_platform, dict):
+            raise ValueError("source_platform_sidecar must be a JSON object")
+        for key in (
+            "sequence_doc_offsets_path",
+            "doc_platform_offsets_path",
+            "platform_ids_path",
+        ):
+            if key not in source_platform:
+                raise KeyError(f"source_platform_sidecar missing {key}")
+            required.append(prefix.parent / source_platform[key])
     required.extend(sorted(tokenizer_dir.iterdir()))
 
     for item in required:

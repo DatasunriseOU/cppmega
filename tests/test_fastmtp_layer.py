@@ -89,10 +89,36 @@ class TestFusedLinearCE:
         targets[-1] = -1  # one ignored position
 
         loss = _fused_linear_cross_entropy(hidden, weight, targets, ignore_index=-1)
-        assert loss.shape == (B * T,)
-        assert not torch.isnan(loss).any()
-        # Ignored position should have 0 loss
-        assert loss[-1].item() == 0.0
+        reference = torch.nn.functional.cross_entropy(
+            torch.nn.functional.linear(hidden, weight).float(),
+            targets,
+            ignore_index=-1,
+            reduction="mean",
+        )
+        assert loss.shape == ()
+        assert torch.allclose(loss, reference)
+
+    def test_liger_path_never_uses_unsafe_none_reduction(self, monkeypatch):
+        from cppmega.megatron import fastmtp_layer
+
+        seen = {}
+
+        class FakeLiger:
+            @staticmethod
+            def apply(*args):
+                seen["reduction"] = args[8]
+                return args[0].sum() * 0.0
+
+        monkeypatch.setenv("CPPMEGA_FASTMTP_USE_LIGER", "1")
+        monkeypatch.setattr(fastmtp_layer, "_get_liger_fused_ce", lambda: FakeLiger)
+        loss = fastmtp_layer._fused_linear_cross_entropy(
+            torch.randn(4, 3),
+            torch.randn(8, 3),
+            torch.tensor([1, 2, -1, 3]),
+        )
+
+        assert loss.shape == ()
+        assert seen["reduction"] == "mean"
 
 
 class TestEnvConfig:

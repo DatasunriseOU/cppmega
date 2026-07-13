@@ -343,6 +343,12 @@ def test_make_sidecar_tar_includes_graph_sidecars(tmp_path):
     (tmp_path / "sample_train_token_structure_ids.bin").write_bytes(b"s")
     (tmp_path / "sample_train_token_call_edges_offsets.bin").write_bytes(b"o")
     (tmp_path / "sample_train_token_call_edges_data.bin").write_bytes(b"d")
+    for suffix in (
+        "source_platform_sequence_doc_offsets.bin",
+        "source_platform_doc_id_offsets.bin",
+        "source_platform_ids.bin",
+    ):
+        (tmp_path / f"sample_train_{suffix}").write_bytes(b"p")
     prefix.with_suffix(".json").write_text(
         __import__("json").dumps(
             {
@@ -357,6 +363,11 @@ def test_make_sidecar_tar_includes_graph_sidecars(tmp_path):
                         "offsets_path": "sample_train_token_call_edges_offsets.bin",
                         "data_path": "sample_train_token_call_edges_data.bin",
                     }
+                },
+                "source_platform_sidecar": {
+                    "sequence_doc_offsets_path": "sample_train_source_platform_sequence_doc_offsets.bin",
+                    "doc_platform_offsets_path": "sample_train_source_platform_doc_id_offsets.bin",
+                    "platform_ids_path": "sample_train_source_platform_ids.bin",
                 },
             }
         )
@@ -374,6 +385,11 @@ def test_make_sidecar_tar_includes_graph_sidecars(tmp_path):
     assert "cppmega_sidecar/sample_train_token_structure_ids.bin" in names
     assert "cppmega_sidecar/sample_train_token_call_edges_offsets.bin" in names
     assert "cppmega_sidecar/sample_train_token_call_edges_data.bin" in names
+    assert "cppmega_sidecar/sample_train_source_platform_ids.bin" in names
+    assert (
+        "cppmega_sidecar/sample_train_source_platform_sequence_doc_offsets.bin"
+        in names
+    )
     assert "cpp_tokenizer_hf/tokenizer.json" in names
 
 

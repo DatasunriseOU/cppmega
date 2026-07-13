@@ -57,6 +57,20 @@ def test_megatron_structure_patch_requires_domain_route_columns():
         assert column in patch._GRAPH_ROUTE_COLS
 
 
+def test_structure_patch_requires_only_consumed_token_sidecars(monkeypatch):
+    monkeypatch.delenv("CPPMEGA_DOMAIN_EMBEDDING_ENABLED", raising=False)
+    assert patch._required_token_batch_cols() == set(
+        patch._REQUIRED_STRUCTURE_TOKEN_COLS
+    )
+    assert "source_doc_ids" not in patch._required_token_batch_cols()
+    assert "platform_ids" not in patch._required_token_batch_cols()
+
+    monkeypatch.setenv("CPPMEGA_DOMAIN_EMBEDDING_ENABLED", "1")
+    assert set(patch._REQUIRED_DOMAIN_TOKEN_COLS) <= (
+        patch._required_token_batch_cols()
+    )
+
+
 def test_structure_dataset_patch_remaps_domain_edge_triples_to_batch_tensors():
     graph_sidecars = {
         "token_call_edges": {"offsets": np.array([0, 0]), "data": np.empty((0, 2), dtype=np.int32)},

@@ -77,7 +77,7 @@ def _fused_linear_cross_entropy(
     targets: torch.Tensor,
     ignore_index: int = -1,
 ) -> torch.Tensor:
-    """Compute cross-entropy loss, using Liger fused path if available.
+    """Compute mean cross-entropy loss, using Liger fused path if available.
 
     Falls back to standard F.linear + F.cross_entropy if Liger is not installed.
 
@@ -88,8 +88,11 @@ def _fused_linear_cross_entropy(
         ignore_index: index to ignore in loss computation
 
     Returns:
-        per-token losses (B*T,) with reduction='none'
+        scalar mean over non-ignored targets
     """
+    valid_targets = targets != ignore_index
+    if not bool(valid_targets.any()):
+        return hidden.sum() * 0.0
     use_liger = os.environ.get("CPPMEGA_FASTMTP_USE_LIGER", "1") == "1"
     liger_fn = _get_liger_fused_ce() if use_liger else None
     if liger_fn is not None:
@@ -106,7 +109,7 @@ def _fused_linear_cross_entropy(
             ignore_index, # ignore_index
             0.0,          # lse_square_scale
             0.0,          # label_smoothing
-            "none",       # reduction
+            "mean",       # reduction; Liger reduction="none" corrupts backward
             None,         # softcap
             False,        # return_z_loss
         )
@@ -116,13 +119,12 @@ def _fused_linear_cross_entropy(
         # Fallback: standard path (materializes logits)
         logits = F.linear(hidden, weight)
         logits = logits.float()
-        loss = F.cross_entropy(
+        return F.cross_entropy(
             logits,
             targets,
             ignore_index=ignore_index,
-            reduction="none",
+            reduction="mean",
         )
-        return loss
 
 
 class _SimpleMTPBlock(nn.Module):
@@ -310,6 +312,11 @@ class FastMTPLayer(MegatronModule):
 
         rolled_ids = labels.clone()  # (B, T)
         rolled_targets = labels.clone()  # (B, T)
+        rolled_loss_mask = (
+            loss_mask.to(dtype=torch.bool)
+            if loss_mask is not None
+            else torch.ones_like(labels, dtype=torch.bool)
+        )
 
         accumulated_losses: list[torch.Tensor] = []
         step_weights = cast(torch.Tensor, self.step_weights)
@@ -327,6 +334,7 @@ class FastMTPLayer(MegatronModule):
             # Roll left by 1, mask tail
             rolled_ids = _roll_and_mask_ids(rolled_ids)
             rolled_targets = _roll_and_mask_targets(rolled_targets)
+            rolled_loss_mask = _roll_and_mask_ids(rolled_loss_mask)
 
             # Embed rolled teacher-forcing tokens using our own word_embeddings
             # (weight-tied with main model's embedding)
@@ -358,14 +366,14 @@ class FastMTPLayer(MegatronModule):
             h_flat = h_ce.reshape(B_T, -1)
             targets_flat = rolled_targets.reshape(-1)
 
-            step_loss_tokens = _fused_linear_cross_entropy(
-                h_flat, lm_head_weight, targets_flat, ignore_index=-1
+            effective_targets = torch.where(
+                rolled_loss_mask.reshape(-1),
+                targets_flat,
+                targets_flat.new_full(targets_flat.shape, -1),
             )
-
-            # Mask and reduce
-            valid_mask = (targets_flat != -1).to(step_loss_tokens.dtype)
-            valid_count = valid_mask.sum()
-            step_loss = (step_loss_tokens * valid_mask).sum() / valid_count.clamp(min=1)
+            step_loss = _fused_linear_cross_entropy(
+                h_flat, lm_head_weight, effective_targets, ignore_index=-1
+            )
             accumulated_losses.append(step_weights[k] * step_loss)
 
         if not accumulated_losses:

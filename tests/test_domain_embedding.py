@@ -37,12 +37,27 @@ def test_domain_embedding_accepts_missing_optional_sidecars():
     assert tuple(out.shape) == (1, 2, 8)
 
 
-def test_domain_embedding_returns_none_when_all_sidecars_absent():
+def test_domain_embedding_fails_when_all_sidecars_absent():
     emb = CppMegaDomainEmbedding(hidden_size=8, bottleneck_dim=4)
-    assert emb(domain_ids=None, role_ids=None, confidence_ids=None) is None
+    with pytest.raises(ValueError, match="all domain sidecars are absent"):
+        emb(domain_ids=None, role_ids=None, confidence_ids=None)
 
 
 def test_domain_embedding_raises_on_out_of_range_ids():
     emb = CppMegaDomainEmbedding(hidden_size=8, num_domains=64, bottleneck_dim=4)
     with pytest.raises(ValueError, match="out of range"):
         emb(domain_ids=torch.tensor([[999]], dtype=torch.long), role_ids=None, confidence_ids=None)
+
+
+def test_domain_embedding_default_init_has_live_gradient():
+    emb = CppMegaDomainEmbedding(hidden_size=8, bottleneck_dim=4)
+    out = emb(
+        domain_ids=torch.tensor([[1, 2]], dtype=torch.long),
+        role_ids=torch.tensor([[1, 2]], dtype=torch.long),
+        confidence_ids=torch.tensor([[1, 1]], dtype=torch.long),
+    )
+
+    assert torch.count_nonzero(out).item() == 0
+    out.sum().backward()
+    assert emb.stacked_emb.weight.grad is not None
+    assert torch.count_nonzero(emb.stacked_emb.weight.grad).item() > 0

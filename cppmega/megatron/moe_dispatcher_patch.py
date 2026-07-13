@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import functools
 import os
-from typing import Optional
+import weakref
 
 import torch
 
@@ -21,17 +21,9 @@ __all__ = ["apply_moe_dispatcher_identity_sort_patch", "is_identity_permutation"
 
 _ENV_FLAG = "CPPMEGA_MOE_SKIP_IDENTITY_CHUNK_SORT"
 _PATCH_MARKER = "__cppmega_identity_chunk_sort_skip__"
-_IDENTITY_CACHE: dict[tuple[str, int, int, Optional[int]], bool] = {}
-
-
-def _tensor_cache_key(tensor: torch.Tensor) -> tuple[str, int, int, Optional[int]]:
-    ptr: Optional[int]
-    try:
-        ptr = int(tensor.data_ptr())
-    except RuntimeError:
-        ptr = None
-    return (str(tensor.device), int(tensor.numel()), int(tensor.dtype == torch.long), ptr)
-
+_IDENTITY_CACHE: dict[
+    int, tuple[weakref.ReferenceType[torch.Tensor], int, bool]
+] = {}
 
 def is_identity_permutation(sorted_idxs: torch.Tensor) -> bool:
     """Return True when ``sorted_idxs`` is ``[0, 1, ..., n - 1]``.
@@ -43,17 +35,31 @@ def is_identity_permutation(sorted_idxs: torch.Tensor) -> bool:
 
     if sorted_idxs.dim() != 1:
         return False
-    key = _tensor_cache_key(sorted_idxs)
-    cached = _IDENTITY_CACHE.get(key)
-    if cached is not None:
-        return cached
+    # CPU checks are cheap. Caching by storage pointer is unsafe because the
+    # allocator may reuse that pointer for a different tensor, which can turn a
+    # non-identity permutation into a false cache hit.
+    cache_key = id(sorted_idxs)
+    version = int(sorted_idxs._version)
+    if sorted_idxs.is_cuda:
+        cached = _IDENTITY_CACHE.get(cache_key)
+        if cached is not None and cached[0]() is sorted_idxs and cached[1] == version:
+            return cached[2]
 
     if sorted_idxs.is_cuda and torch.cuda.is_current_stream_capturing():
         return False
 
     values = sorted_idxs.detach().cpu().tolist()
     result = values == list(range(len(values)))
-    _IDENTITY_CACHE[key] = result
+    if sorted_idxs.is_cuda:
+        reference = weakref.ref(
+            sorted_idxs,
+            lambda current, key=cache_key: (
+                _IDENTITY_CACHE.pop(key, None)
+                if _IDENTITY_CACHE.get(key, (None,))[0] is current
+                else None
+            ),
+        )
+        _IDENTITY_CACHE[cache_key] = (reference, version, result)
     return result
 
 

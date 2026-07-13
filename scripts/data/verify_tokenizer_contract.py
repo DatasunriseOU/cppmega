@@ -43,6 +43,13 @@ DOMAIN_DELIMITER_ROLE_PAIRS: tuple[str, ...] = (
     "CMAKE",
     "NINJA",
     "BAZEL",
+    "AUTOCONF",
+    "AUTOMAKE",
+    "MESON",
+    "GN",
+    "SCONS",
+    "XMAKE",
+    "COMPILE_COMMANDS",
     "BASH",
     "ZSH",
     "SH",
@@ -95,11 +102,22 @@ def check_contract_vs_tokenizer(contract: dict, tok_json: Path) -> list[str]:
         )
     notes.append(f"tokenizer.json: vocab={len(vocab)} max_added_id={max_id} OK")
 
-    # every special-token id must resolve to *some* added token
+    # Every special-token id must resolve to its exact canonical token string.
+    # Merely checking that an added token occupies the slot allowed the shipped
+    # H200 tokenizer to keep <RESERVED_46>/<RESERVED_47> while the contract and
+    # data encoded <SPACE>/<NL>.
     for name, tid in contract["special_tokens"].items():
-        if tid not in id_to_tok:
+        expected = f"<{name}>"
+        actual = id_to_tok.get(tid)
+        if actual != expected:
             raise ContractError(
-                f"WHERE={tok_json} WHAT=special token {name}={tid} has no added_token entry"
+                f"WHERE={tok_json} WHAT=special token {name}={tid} maps to "
+                f"{actual!r}, expected {expected!r}"
+            )
+        if vocab.get(expected) != tid:
+            raise ContractError(
+                f"WHERE={tok_json} WHAT=model vocab token {expected!r} maps to "
+                f"{vocab.get(expected)!r}, expected {tid}"
             )
 
     # reserved-role ids must resolve to the matching <RESERVED_N> slot
@@ -255,12 +273,16 @@ def main() -> int:
     contract_path = Path(args.contract) if args.contract else (
         mlx_root / "cppmega_mlx" / "tokenizer" / "tokenizer_contract_v1.json"
     )
-    tok_json = mlx_root / "cppmega_mlx" / "tokenizer" / "tokenizer.json"
+    tokenizer_paths = (
+        mlx_root / "cppmega_mlx" / "tokenizer" / "tokenizer.json",
+        root / "cppmega" / "data" / "tokenizer_v2" / "tokenizer.json",
+    )
 
     contract = _read_json(contract_path)
     notes: list[str] = [f"contract: {contract_path} (v{contract['contract_version']})"]
     try:
-        notes += check_contract_vs_tokenizer(contract, tok_json)
+        for tok_json in tokenizer_paths:
+            notes += check_contract_vs_tokenizer(contract, tok_json)
         notes += check_contract_vs_mlx_constants(contract, mlx_root)
         notes += check_nanochat(contract, nano_root)
         notes += check_nam56r_dual_track(contract, mlx_root)
