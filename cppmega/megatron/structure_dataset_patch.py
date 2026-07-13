@@ -103,6 +103,14 @@ _TOKEN_COL_ALIASES = {
     "change_mask_post": ("token_change_mask_post", "change_mask_post"),
 }
 
+_OPAQUE_SYMBOL_ID_COLS = frozenset(("symbol_ids", "call_targets", "type_refs"))
+_OPAQUE_SYMBOL_ID_ALIASES = frozenset(
+    alias
+    for column in _OPAQUE_SYMBOL_ID_COLS
+    for alias in _TOKEN_COL_ALIASES[column]
+)
+_SYMBOL_IDENTITY_SCHEMA_VERSION = 3
+
 _LOSS_MASK_ALIASES = ("loss_mask", "token_loss_mask")
 
 _GRAPH_ROUTE_COLS = (
@@ -233,10 +241,39 @@ def _lazy_init_side_channels(dataset: Any) -> Dict[str, Dict[str, Any]]:
             "CPPMEGA_STRUCTURE_ENABLED=1"
         )
 
+    present_symbol_columns = _OPAQUE_SYMBOL_ID_ALIASES & set(side_paths)
+    if present_symbol_columns:
+        if sidecar.get("symbol_identity_schema_version") != _SYMBOL_IDENTITY_SCHEMA_VERSION:
+            raise ValueError(
+                "[cppmega-patch] semantic symbol sidecars require "
+                f"symbol_identity_schema_version={_SYMBOL_IDENTITY_SCHEMA_VERSION} "
+                f"in {json_path!r}; got "
+                f"{sidecar.get('symbol_identity_schema_version')!r}"
+            )
+        alias_groups = {
+            column: set(_TOKEN_COL_ALIASES[column]) & set(side_paths)
+            for column in _OPAQUE_SYMBOL_ID_COLS
+        }
+        invalid_groups = {
+            column: sorted(matches)
+            for column, matches in alias_groups.items()
+            if len(matches) != 1
+        }
+        if invalid_groups:
+            raise ValueError(
+                "[cppmega-patch] semantic symbol sidecars require exactly one alias "
+                f"for each identity channel in {json_path!r}; got {invalid_groups}"
+            )
+
     base_dir = os.path.dirname(json_path)
     for col, entry in side_paths.items():
         rel_path = entry.get("path")
         dtype_str = entry.get("dtype", "uint16")
+        if col in _OPAQUE_SYMBOL_ID_ALIASES and dtype_str != "uint64":
+            raise ValueError(
+                f"[cppmega-patch] semantic symbol sidecar {col!r} must use "
+                f"uint64, got {dtype_str!r} in {json_path!r}"
+            )
         if not rel_path:
             raise ValueError(f"[cppmega-patch] side-channel {col!r} has no path in {json_path!r}")
         path = _safe_sidecar_path(base_dir, rel_path, col=col, field="path", json_path=json_path)
@@ -441,6 +478,20 @@ def _align_token_sidecar_tensor(
         )
         tensor = torch.cat([tensor, pad], dim=0)
     return tensor.contiguous()
+
+
+def _token_sidecar_tensor(values: np.ndarray, *, col: str) -> torch.Tensor:
+    """Convert one token sidecar without narrowing opaque symbol identities."""
+
+    array_values = np.asarray(values)
+    if col in _OPAQUE_SYMBOL_ID_COLS:
+        if array_values.dtype != np.dtype(np.uint64):
+            raise ValueError(
+                f"[cppmega-patch] {col} must arrive as uint64, got "
+                f"{array_values.dtype.name}"
+            )
+        return torch.from_numpy(np.array(array_values, dtype=np.uint64, copy=True))
+    return torch.from_numpy(array_values).long()
 
 
 def _slice_graph_doc(cache_entry: dict[str, Any], real_doc: int) -> np.ndarray:
@@ -733,7 +784,7 @@ try:
                 continue
             entry = side_channels[source]
             vals = entry["mmap"][indices]
-            tensor = torch.from_numpy(vals).long()
+            tensor = _token_sidecar_tensor(vals, col=col)
             if self.config.add_extra_token_to_sequence:
                 tensor = tensor[:-1]
             tensor = tensor.contiguous()

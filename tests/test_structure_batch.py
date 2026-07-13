@@ -9,7 +9,7 @@ class _Model:
         self.seen = structure_inputs
 
 
-def test_extract_structure_inputs_filters_only_known_keys():
+def test_extract_structure_inputs_excludes_opaque_symbol_ids_from_model_inputs():
     batch = {
         "tokens": 1,
         "structure_ids": 2,
@@ -31,8 +31,6 @@ def test_extract_structure_inputs_filters_only_known_keys():
     assert extracted == {
         "structure_ids": 2,
         "dep_levels": 3,
-        "symbol_ids": 4,
-        "call_targets": 5,
         "change_mask_pre": 6,
         "graph_call_edges": 7,
         "graph_call_edge_counts": 8,

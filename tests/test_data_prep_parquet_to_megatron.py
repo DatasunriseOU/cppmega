@@ -27,6 +27,33 @@ def _load_converter_module():
     return module
 
 
+def _stamp_v3_identity_table(pa, table, converter):
+    for column in ("token_symbol_ids", "token_call_targets", "token_type_refs"):
+        index = table.schema.get_field_index(column)
+        table = table.set_column(
+            index,
+            column,
+            pa.array(table.column(column).to_pylist(), type=pa.list_(pa.uint64())),
+        )
+    table = table.append_column(
+        "symbol_identities",
+        pa.array(
+            [[] for _ in range(table.num_rows)],
+            type=pa.list_(
+                pa.struct(
+                    [
+                        pa.field("symbol_id", pa.uint64()),
+                        pa.field("symbol_key", pa.string()),
+                    ]
+                )
+            ),
+        ),
+    )
+    return table.replace_schema_metadata(
+        {converter.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode(): b"3"}
+    )
+
+
 def test_megatron_dtype_codes_match_mmididx_enum() -> None:
     converter = _load_converter_module()
 
@@ -100,8 +127,93 @@ def test_default_cppmega_side_channels_are_full_token_aligned_profile() -> None:
     assert dtypes["token_role_ids"] == "uint16"
     assert dtypes["token_entity_ids"] == "uint32"
     assert dtypes["token_confidence_ids"] == "uint8"
-    assert dtypes["token_symbol_ids"] == "uint32"
+    assert dtypes["token_symbol_ids"] == "uint64"
+    assert dtypes["token_call_targets"] == "uint64"
+    assert dtypes["token_type_refs"] == "uint64"
     assert dtypes["token_def_use"] == "uint8"
+
+
+def test_mmididx_preserves_symbol_id_above_signed_int64(tmp_path: Path) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    converter = _load_converter_module()
+    key_index = 0
+    while True:
+        symbol_key = f"usr:owner/repo:c:@F@wide_id_{key_index}#"
+        symbol_id = converter._compute_symbol_id(symbol_key)
+        if symbol_id > np.iinfo(np.int64).max:
+            break
+        key_index += 1
+
+    input_dir = tmp_path / "parquet"
+    input_dir.mkdir()
+    schema = pa.schema(
+        [
+            pa.field("input_ids", pa.list_(pa.uint32())),
+            pa.field("token_symbol_ids", pa.list_(pa.uint64())),
+            pa.field("token_call_targets", pa.list_(pa.uint64())),
+            pa.field("token_type_refs", pa.list_(pa.uint64())),
+            pa.field("token_def_use", pa.list_(pa.uint8())),
+            pa.field(
+                "symbol_identities",
+                pa.list_(
+                    pa.struct(
+                        [
+                            pa.field("symbol_id", pa.uint64()),
+                            pa.field("symbol_key", pa.string()),
+                        ]
+                    )
+                ),
+            ),
+        ],
+        metadata={
+            converter.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii"): b"3"
+        },
+    )
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "input_ids": [7, 8],
+                    "token_symbol_ids": [symbol_id, symbol_id],
+                    "token_call_targets": [0, symbol_id],
+                    "token_type_refs": [symbol_id, 0],
+                    "token_def_use": [0, 1],
+                    "symbol_identities": [
+                        {"symbol_id": symbol_id, "symbol_key": symbol_key}
+                    ],
+                }
+            ],
+            schema=schema,
+        ),
+        input_dir / "wide.parquet",
+    )
+
+    output_prefix = tmp_path / "wide_train"
+    converter.convert_parquet_to_megatron(
+        input_dir=str(input_dir),
+        output_prefix=str(output_prefix),
+        split="all",
+        token_column="input_ids",
+        side_channels=[
+            "token_symbol_ids",
+            "token_call_targets",
+            "token_type_refs",
+            "token_def_use",
+        ],
+        side_channel_dtypes=["uint64", "uint64", "uint64", "uint8"],
+        graph_sidecars=None,
+        source_platform_sidecar=False,
+        writer_backend="mmididx",
+    )
+
+    np.testing.assert_array_equal(
+        np.fromfile(tmp_path / "wide_train_token_symbol_ids.bin", dtype=np.uint64),
+        np.array([symbol_id, symbol_id], dtype=np.uint64),
+    )
+    manifest = json.loads(output_prefix.with_suffix(".json").read_text())
+    assert manifest["side_channel_paths"]["token_symbol_ids"]["dtype"] == "uint64"
+    assert manifest["symbol_identity_schema_version"] == 3
 
 
 def test_source_platform_writer_preserves_multi_label_document_context(
@@ -360,6 +472,8 @@ def test_explicit_mmididx_writer_trims_padding_and_all_sidecars(tmp_path: Path) 
     }
     for name, _dtype in converter.DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS:
         row[name] = [[1, 1, 0, 0, 0]]
+    for name in ("token_symbol_ids", "token_call_targets", "token_type_refs"):
+        row[name] = [[0, 0, 0, 0, 0]]
     row["doc_ids"] = [[1, 1, 1, 1, 1]]
     for name, kind, _dtype in converter.DEFAULT_CPPMEGA_GRAPH_SIDECARS:
         if name == "token_domain_edges":
@@ -374,9 +488,7 @@ def test_explicit_mmididx_writer_trims_padding_and_all_sidecars(tmp_path: Path) 
             row[name] = [[3]]
         else:
             row[name] = [[1]]
-    table = pa.table(row).replace_schema_metadata({
-        converter.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode(): b"2"
-    })
+    table = _stamp_v3_identity_table(pa, pa.table(row), converter)
     pq.write_table(table, input_dir / "repo.parquet")
 
     output_prefix = tmp_path / "cppmega_1024_train"
@@ -405,7 +517,7 @@ def test_explicit_mmididx_writer_trims_padding_and_all_sidecars(tmp_path: Path) 
     assert manifest["token_column"] == "input_ids"
     assert manifest["length_column"] == "valid_token_count"
     assert manifest["writer_backend"] == "mmididx"
-    assert manifest["symbol_identity_schema_version"] == 2
+    assert manifest["symbol_identity_schema_version"] == 3
     assert set(manifest["side_channel_paths"]) == {
         name for name, _dtype in converter.DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS
     }
@@ -436,6 +548,8 @@ def test_mmididx_row_group_batching_preserves_document_order_and_offsets(
             [3, 4, 5, 6],
             [7, 90, 90, 90],
         ]
+    for name in ("token_symbol_ids", "token_call_targets", "token_type_refs"):
+        rows[name] = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
     rows["loss_mask"] = [[1, 0, 0, 0], [1, 1, 0, 1], [0, 0, 0, 0]]
     rows["doc_ids"] = [[1, 1, 0, 0], [1, 1, 2, 2], [1, 0, 0, 0]]
     for name, kind, _dtype in converter.DEFAULT_CPPMEGA_GRAPH_SIDECARS:
@@ -449,9 +563,7 @@ def test_mmididx_row_group_batching_preserves_document_order_and_offsets(
             rows[name] = [[2], [2, 4], [1]]
         else:
             rows[name] = [[1], [1, 1], [1]]
-    table = pa.table(rows).replace_schema_metadata({
-        converter.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode(): b"2"
-    })
+    table = _stamp_v3_identity_table(pa, pa.table(rows), converter)
     pq.write_table(table, input_dir / "repo.parquet", row_group_size=2)
 
     output_prefix = tmp_path / "cppmega_train"

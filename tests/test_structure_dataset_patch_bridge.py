@@ -1,4 +1,5 @@
 import pytest
+import numpy as np
 
 torch = pytest.importorskip("torch")
 
@@ -34,6 +35,17 @@ def test_pop_structure_batch_removes_sidecars_and_sets_thread_local():
     assert torch.equal(structure["graph_call_edge_counts"], torch.tensor([1]))
     assert torch.equal(structure["graph_build_edge_counts"], torch.tensor([1]))
     assert patch._get_current_structure_batch() is structure
+
+
+def test_symbol_sidecar_tensor_preserves_unsigned_values_above_int64() -> None:
+    high_id = np.uint64(0xF123456789ABCDEF)
+    tensor = patch._token_sidecar_tensor(
+        np.array([high_id, high_id - np.uint64(1)], dtype=np.uint64),
+        col="symbol_ids",
+    )
+
+    assert tensor.dtype == torch.uint64
+    assert tensor.tolist() == [int(high_id), int(high_id) - 1]
 
 
 def test_safe_sidecar_path_allows_plain_relative_and_blocks_escape():

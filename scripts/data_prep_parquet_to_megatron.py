@@ -34,12 +34,25 @@ from pathlib import Path
 
 import numpy as np
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from cppmega.symbol_identity import (
+    SYMBOL_IDENTITIES_COLUMN,
+    SYMBOL_IDENTITY_SCHEMA_METADATA_KEY,
+    SYMBOL_IDENTITY_SCHEMA_VERSION,
+    SymbolIdentityRegistry,
+    compute_symbol_id,
+)
+
 
 _OUTPUT_DTYPE_MAP = {
     "uint8": np.uint8,
     "uint16": np.uint16,
     "int32": np.int32,
     "int64": np.int64,
+    "uint64": np.uint64,
     # Historical CLI compatibility. Megatron's MMIDIDX dtype enum has no
     # uint32 token dtype, so positive token IDs that need more than uint16 must
     # be stored as int32.
@@ -74,9 +87,9 @@ DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS: tuple[tuple[str, str], ...] = (
     ("token_ast_depth", "uint16"),
     ("token_sibling_index", "uint16"),
     ("token_ast_node_type", "uint16"),
-    ("token_symbol_ids", "uint32"),
-    ("token_call_targets", "uint32"),
-    ("token_type_refs", "uint32"),
+    ("token_symbol_ids", "uint64"),
+    ("token_call_targets", "uint64"),
+    ("token_type_refs", "uint64"),
     ("token_def_use", "uint8"),
     ("token_change_mask_pre", "uint8"),
     ("token_change_mask_post", "uint8"),
@@ -107,8 +120,13 @@ DEFAULT_CPPMEGA_GRAPH_SIDECARS: tuple[tuple[str, str, str], ...] = (
     ("token_chunk_dep_levels", "ragged_1d", "uint16"),
 )
 
-SYMBOL_IDENTITY_SCHEMA_METADATA_KEY = "cppmega.symbol_identity_schema_version"
-REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION = 2
+REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION = SYMBOL_IDENTITY_SCHEMA_VERSION
+_SYMBOL_ID_COLUMNS = (
+    "token_symbol_ids",
+    "token_call_targets",
+    "token_type_refs",
+)
+_compute_symbol_id = compute_symbol_id
 
 
 def _require_symbol_identity_schema_metadata(
@@ -131,18 +149,19 @@ def _require_symbol_identity_schema_metadata(
 
 
 def _require_symbol_identity_schema(shards: list[str]) -> int | None:
+    import pyarrow as pa
     import pyarrow.parquet as pq
 
     accepted_version: int | None = None
     semantic_presence: bool | None = None
     identity_columns = {
-        "token_symbol_ids",
-        "token_call_targets",
-        "token_type_refs",
+        *_SYMBOL_ID_COLUMNS,
         "token_def_use",
     }
+    corpus_registry = SymbolIdentityRegistry()
     for shard in shards:
-        schema = pq.ParquetFile(shard).schema_arrow
+        parquet_file = pq.ParquetFile(shard)
+        schema = parquet_file.schema_arrow
         present_identity_columns = identity_columns & set(schema.names)
         if present_identity_columns and present_identity_columns != identity_columns:
             missing = sorted(identity_columns - present_identity_columns)
@@ -160,6 +179,41 @@ def _require_symbol_identity_schema(shards: list[str]) -> int | None:
             )
         if not has_identity_columns:
             continue
+        if SYMBOL_IDENTITIES_COLUMN not in schema.names:
+            raise RuntimeError(
+                f"{shard}: semantic symbol columns require "
+                f"{SYMBOL_IDENTITIES_COLUMN!r} collision claims; regenerate parquet "
+                "with clang USR/signature identities"
+            )
+        identity_type = schema.field(SYMBOL_IDENTITIES_COLUMN).type
+        if not (pa.types.is_list(identity_type) or pa.types.is_large_list(identity_type)):
+            raise RuntimeError(
+                f"{shard}: {SYMBOL_IDENTITIES_COLUMN} must be a list, got {identity_type}"
+            )
+        identity_value_type = identity_type.value_type
+        if not pa.types.is_struct(identity_value_type):
+            raise RuntimeError(
+                f"{shard}: {SYMBOL_IDENTITIES_COLUMN} values must be structs"
+            )
+        try:
+            symbol_id_type = identity_value_type.field("symbol_id").type
+            symbol_key_type = identity_value_type.field("symbol_key").type
+        except KeyError as error:
+            raise RuntimeError(
+                f"{shard}: {SYMBOL_IDENTITIES_COLUMN} requires symbol_id/symbol_key"
+            ) from error
+        if symbol_id_type != pa.uint64() or symbol_key_type != pa.string():
+            raise RuntimeError(
+                f"{shard}: invalid {SYMBOL_IDENTITIES_COLUMN} types: {identity_value_type}"
+            )
+        for column in _SYMBOL_ID_COLUMNS:
+            column_type = schema.field(column).type
+            if not (
+                pa.types.is_list(column_type) or pa.types.is_large_list(column_type)
+            ) or column_type.value_type != pa.uint64():
+                raise RuntimeError(
+                    f"{shard}: {column} must use list<uint64>, got {column_type}"
+                )
         metadata = schema.metadata
         version = _require_symbol_identity_schema_metadata(metadata, shard)
         if accepted_version is None:
@@ -169,6 +223,27 @@ def _require_symbol_identity_schema(shards: list[str]) -> int | None:
                 f"{shard}: mixed symbol identity schema versions in one conversion; "
                 "regenerate all parquet shards with clang USR/signature identities"
             )
+        row_offset = 0
+        columns = [*_SYMBOL_ID_COLUMNS, SYMBOL_IDENTITIES_COLUMN]
+        for batch in parquet_file.iter_batches(columns=columns):
+            rows = batch.to_pylist()
+            for local_index, row in enumerate(rows):
+                source = f"{shard}:row={row_offset + local_index}"
+                row_registry = SymbolIdentityRegistry()
+                corpus_registry.register_records(
+                    row[SYMBOL_IDENTITIES_COLUMN], source=source
+                )
+                row_registry.register_records(
+                    row[SYMBOL_IDENTITIES_COLUMN], source=source
+                )
+                used_ids = {
+                    int(value)
+                    for column in _SYMBOL_ID_COLUMNS
+                    for value in row[column]
+                    if int(value) != 0
+                }
+                row_registry.require_ids(used_ids, source=source)
+            row_offset += batch.num_rows
     return accepted_version
 
 
@@ -203,6 +278,31 @@ def _resolve_sidecar_dtype(dtype_str: str) -> np.dtype:
         return np.dtype(_SIDECAR_DTYPE_MAP[dtype_str])
     except KeyError as exc:
         raise ValueError(f"unsupported sidecar dtype: {dtype_str}") from exc
+
+
+def _require_symbol_sidecar_dtypes(
+    side_channels: list[str] | None,
+    side_channel_dtypes: list[str] | None,
+) -> None:
+    requested = dict(
+        zip(side_channels or [], side_channel_dtypes or [], strict=True)
+    )
+    present = set(_SYMBOL_ID_COLUMNS) & set(requested)
+    if present and present != set(_SYMBOL_ID_COLUMNS):
+        missing = sorted(set(_SYMBOL_ID_COLUMNS) - present)
+        raise ValueError(
+            f"partial symbol identity sidecars are not allowed; missing={missing}"
+        )
+    invalid = {
+        column: requested[column]
+        for column in present
+        if requested[column] != "uint64"
+    }
+    if invalid:
+        raise ValueError(
+            f"v{SYMBOL_IDENTITY_SCHEMA_VERSION} symbol sidecars must use uint64: "
+            f"{invalid}"
+        )
 
 
 def _megatron_dtype_code(dtype: type[np.generic] | np.dtype) -> int:
@@ -991,6 +1091,7 @@ def _convert_parquet_to_numpy(
     token_column = _resolve_token_column(shards, token_column)
     length_column = _resolve_length_column(shards, length_column)
     symbol_identity_schema_version = _require_symbol_identity_schema(shards)
+    _require_symbol_sidecar_dtypes(side_channels, side_channel_dtypes)
     write_source_platform = _resolve_source_platform_sidecar(
         shards, source_platform_sidecar
     )
@@ -1281,6 +1382,7 @@ def convert_parquet_to_megatron(
     token_column = _resolve_token_column(shards, token_column)
     length_column = _resolve_length_column(shards, length_column)
     symbol_identity_schema_version = _require_symbol_identity_schema(shards)
+    _require_symbol_sidecar_dtypes(side_channels, side_channel_dtypes)
     write_source_platform = _resolve_source_platform_sidecar(
         shards, source_platform_sidecar
     )
