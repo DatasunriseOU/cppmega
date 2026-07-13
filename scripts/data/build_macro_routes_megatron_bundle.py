@@ -27,6 +27,7 @@ from typing import Iterable
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_ROOT = REPO_ROOT / "scripts"
+sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(SCRIPTS_ROOT))
 
 from data_prep_parquet_to_megatron import (  # noqa: E402
@@ -38,6 +39,10 @@ from data.publish_megatron_bundle_to_nebius_s3 import (  # noqa: E402
     EXPECTED_BUNDLE_TOKENIZER_CONTRACT,
     EXPECTED_VOCAB_SIZE,
     _validate_tokenizer_directory,
+)
+from cppmega.megatron.objective_contract import (  # noqa: E402
+    validate_materialized_objective_contract,
+    validate_objective_contract,
 )
 
 
@@ -525,6 +530,18 @@ def _verify_prefix(prefix: Path, expected: dict[str, int]) -> dict[str, object]:
         raise RuntimeError(f"{prefix}: source platform document offsets size mismatch")
     if platform_ids.stat().st_size != int(source_platform["platform_id_count"]) * 2:
         raise RuntimeError(f"{prefix}: source platform IDs size mismatch")
+    objective = data.get("objective_contract")
+    if objective is None:
+        raise RuntimeError(f"{prefix}: objective_contract is required")
+    validated_objective = validate_materialized_objective_contract(
+        objective,
+        base_dir=str(prefix.parent),
+        document_count=document_count,
+    )
+    if validated_objective.payload["totals"]["samples"] != document_count:
+        raise RuntimeError(
+            f"{prefix}: objective sample count does not match document_count"
+        )
     return data
 
 
@@ -534,6 +551,7 @@ def _build_bucket(
     snapshot_root: Path,
     data_root: Path,
     audit_receipt: dict[str, object],
+    objective_contract_path: Path,
 ) -> dict[str, object]:
     expected = _bucket_audit_totals(audit_receipt, bucket)
     final_dir = data_root / f"seq_{bucket}"
@@ -552,12 +570,13 @@ def _build_bucket(
         input_dir=str(snapshot_root / "combined" / str(bucket)),
         output_prefix=str(building_prefix),
         split="all",
-        token_column="auto",
+        token_column="input_ids",
         length_column="valid_token_count",
         dtype_str="uint16",
         vocab_size=65536,
         writer_backend="mmididx",
         source_platform_sidecar=True,
+        objective_contract_path=str(objective_contract_path.resolve()),
     )
     manifest = _verify_prefix(building_prefix, expected)
     os.replace(building_dir, final_dir)
@@ -681,6 +700,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=REPO_ROOT / "data/tokenizer_v2",
     )
+    parser.add_argument(
+        "--objective-contract",
+        type=Path,
+        help=(
+            "CASE1 cppmega_pre_materialized_objectives_v1 receipt. Production "
+            "graph bundles require this explicit materialization contract."
+        ),
+    )
     parser.add_argument("--buckets", default=",".join(map(str, DEFAULT_BUCKETS)))
     parser.add_argument("--min-age-seconds", type=float, default=120.0)
     parser.add_argument("--audit-workers", type=int, default=8)
@@ -699,6 +726,15 @@ def main(argv: Iterable[str] | None = None) -> int:
     buckets = tuple(int(value) for value in args.buckets.split(",") if value)
     if not buckets:
         raise SystemExit("at least one bucket is required")
+    if args.objective_contract is None:
+        raise SystemExit("--objective-contract is required for graph-route bundles")
+    objective_contract_path = args.objective_contract.resolve()
+    if not objective_contract_path.is_file():
+        raise FileNotFoundError(objective_contract_path)
+    objective_payload = json.loads(
+        objective_contract_path.read_text(encoding="utf-8")
+    )
+    objective_contract = validate_objective_contract(objective_payload)
     output_dir = args.output_dir.resolve()
     partial_dir = output_dir.with_name(f".{output_dir.name}.partial")
     if output_dir.exists():
@@ -753,6 +789,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 snapshot_root=snapshot_root,
                 data_root=data_root,
                 audit_receipt=audit_receipt,
+                objective_contract_path=objective_contract_path,
             )
             for bucket in buckets
         ],
@@ -764,6 +801,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         provenance_root / "repaired_snapshot_manifest.json",
         repaired_snapshot_manifest,
     )
+    staged_objective_contract = provenance_root / "objective_contract.json"
+    shutil.copy2(objective_contract_path, staged_objective_contract)
     tokenizer = _stage_tokenizer(args.tokenizer_dir, partial_dir)
     if not args.keep_snapshot:
         shutil.rmtree(snapshot_root)
@@ -780,6 +819,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         "token_column": "input_ids",
         "length_column": "valid_token_count",
         "writer_backend": "mmididx",
+        "training_contract": "objective_materialized",
+        "objective_materialization": {
+            "path": "provenance/objective_contract.json",
+            "schema": objective_contract.payload["schema"],
+            "sha256": objective_contract.sha256,
+            "file_sha256": _sha256(staged_objective_contract),
+        },
         "buckets": list(buckets),
         "known_limitations": [
             "semantic symbol IDs and some local/global lookups are qname-based; "

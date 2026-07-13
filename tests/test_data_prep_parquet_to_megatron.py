@@ -9,6 +9,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from cppmega.megatron.objective_contract import (
+    OBJECTIVE_CONTRACT_SCHEMA,
+    OBJECTIVE_IDS,
+)
+
 
 def _load_converter_module():
     module_path = (
@@ -52,6 +57,75 @@ def _stamp_v3_identity_table(pa, table, converter):
     return table.replace_schema_metadata(
         {converter.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode(): b"3"}
     )
+
+
+def _objective_contract() -> dict[str, object]:
+    tasks = ("causal_lm", "fim", "ast_fim", "ifim", "commit_diff", "pre_to_post")
+    return {
+        "schema": OBJECTIVE_CONTRACT_SCHEMA,
+        "algorithm": "hamilton_eligibility_bipartite_v1",
+        "seed": 17,
+        "quota_window_samples": 6,
+        "task_order": list(tasks),
+        "configured_rates": {task: "1/6" for task in tasks},
+        "planned_samples": {task: 1 for task in tasks},
+        "realized": {
+            task: {
+                "samples": 1,
+                "input_tokens": 3,
+                "loss_tokens": 3 if task == "causal_lm" else 2,
+            }
+            for task in tasks
+        },
+        "totals": {"samples": 6, "input_tokens": 18, "loss_tokens": 13},
+        "typed_sources": {
+            "ifim_instruction": "ifim_instruction_token_ids",
+            "commit_message": "commit_msg_token_ids",
+            "diff": "diff_token_ids",
+            "pre": "pre_token_ids",
+            "post": "post_token_ids",
+            "missing_fields": "ineligible",
+            "rendered_text_parsing": False,
+        },
+        "graph_auxiliary": {
+            "relations": ["call", "type"],
+            "eligible_samples": 1,
+            "positive_edges": 5,
+            "global_weight": "1",
+            "bce_weight": "1/10",
+            "coverage_weight": "1/20",
+            "topk": 8,
+            "pos_weight": "1",
+            "margin": "1",
+            "included_in_total_loss": True,
+            "runtime": "megatron_dsa_indexer_v1",
+            "pair_mask": "causal_same_document_upstream_v1",
+            "chunk_edge_expansion": "cartesian_token_spans_v1",
+        },
+        "materialization": {
+            "format": "shifted_lm_document_v1",
+            "token_column": "input_ids",
+            "loss_mask_column": "loss_mask",
+            "length_column": "valid_token_count",
+            "objective_column": "objective_kind",
+            "document_id_column": "doc_ids",
+            "source_document_id_column": "token_source_doc_ids",
+        },
+    }
+
+
+def test_objective_conversion_requires_source_document_provenance() -> None:
+    converter = _load_converter_module()
+    contract = converter.validate_objective_contract(_objective_contract())
+
+    with pytest.raises(ValueError, match="token_source_doc_ids"):
+        converter._validate_objective_conversion_config(
+            contract,
+            token_column="input_ids",
+            length_column="valid_token_count",
+            side_channels=["loss_mask", "doc_ids"],
+            graph_columns=["token_call_edges", "token_type_edges"],
+        )
 
 
 def test_megatron_dtype_codes_match_mmididx_enum() -> None:
@@ -108,6 +182,7 @@ def test_default_cppmega_side_channels_are_full_token_aligned_profile() -> None:
         "token_role_ids",
         "token_entity_ids",
         "token_scope_ids",
+        "token_source_doc_ids",
         "token_confidence_ids",
         "token_structure_ids",
         "token_dep_levels",
@@ -126,6 +201,7 @@ def test_default_cppmega_side_channels_are_full_token_aligned_profile() -> None:
     assert dtypes["token_domain_ids"] == "uint16"
     assert dtypes["token_role_ids"] == "uint16"
     assert dtypes["token_entity_ids"] == "uint32"
+    assert dtypes["token_source_doc_ids"] == "uint32"
     assert dtypes["token_confidence_ids"] == "uint8"
     assert dtypes["token_symbol_ids"] == "uint64"
     assert dtypes["token_call_targets"] == "uint64"
@@ -316,7 +392,7 @@ def test_normalize_edge_triples_accepts_domain_route_dicts() -> None:
     converter = _load_converter_module()
 
     triples = converter._normalize_edge_triples(
-        [{"from": 3, "to": 1, "kind": 20}, {"src": 2, "dst": 0, "kind": 60}],
+        [{"from": 3, "to": 1, "kind": 5}, {"src": 2, "dst": 0, "kind": 8}],
         column="token_domain_edges",
         shard_path="shard.parquet",
         row_idx=9,
@@ -325,8 +401,20 @@ def test_normalize_edge_triples_accepts_domain_route_dicts() -> None:
     assert triples.dtype == np.dtype(np.int32)
     np.testing.assert_array_equal(
         triples,
-        np.array([[3, 1, 20], [2, 0, 60]], dtype=np.int32),
+        np.array([[3, 1, 5], [2, 0, 8]], dtype=np.int32),
     )
+
+
+def test_normalize_edge_triples_rejects_wrong_family_kind_26() -> None:
+    converter = _load_converter_module()
+
+    with pytest.raises(ValueError, match="not valid for token_domain_edges"):
+        converter._normalize_edge_triples(
+            [{"from": 0, "to": 1, "kind": 26}],
+            column="token_domain_edges",
+            shard_path="shard.parquet",
+            row_idx=4,
+        )
 
 
 def test_graph_sidecar_writer_writes_offsets_data_and_manifest(tmp_path: Path) -> None:
@@ -344,7 +432,7 @@ def test_graph_sidecar_writer_writes_offsets_data_and_manifest(tmp_path: Path) -
     writer.append(
         {
             "token_call_edges": [{"from": 1, "to": 0}, {"from": 2, "to": 1}],
-            "token_domain_edges": [{"from": 0, "to": 3, "kind": 20}],
+            "token_domain_edges": [{"from": 0, "to": 3, "kind": 5}],
             "token_chunk_starts": [0, 8, 16],
         },
         shard_path="shard.parquet",
@@ -383,7 +471,7 @@ def test_graph_sidecar_writer_writes_offsets_data_and_manifest(tmp_path: Path) -
     )
     np.testing.assert_array_equal(
         np.fromfile(tmp_path / "cppmega_train_token_domain_edges_data.bin", dtype=np.int32).reshape(-1, 3),
-        np.array([[0, 3, 20]], dtype=np.int32),
+        np.array([[0, 3, 5]], dtype=np.int32),
     )
     np.testing.assert_array_equal(
         np.fromfile(tmp_path / "cppmega_train_token_chunk_starts_offsets.bin", dtype=np.int64),
@@ -403,7 +491,7 @@ def test_graph_sidecar_writer_rejects_route_past_trimmed_row(tmp_path: Path) -> 
 
     with pytest.raises(ValueError, match="endpoint exceeds valid token count 3"):
         writer.append(
-            {"token_domain_edges": [{"from": 0, "to": 3, "kind": 20}]},
+            {"token_domain_edges": [{"from": 0, "to": 3, "kind": 5}]},
             shard_path="shard.parquet",
             row_idx=0,
             token_count=3,
@@ -474,10 +562,16 @@ def test_explicit_mmididx_writer_trims_padding_and_all_sidecars(tmp_path: Path) 
         row[name] = [[1, 1, 0, 0, 0]]
     for name in ("token_symbol_ids", "token_call_targets", "token_type_refs"):
         row[name] = [[0, 0, 0, 0, 0]]
+    row["token_domain_ids"] = [[0, 0, 0, 0, 0]]
+    row["token_role_ids"] = [[0, 0, 0, 0, 0]]
+    row["token_entity_ids"] = [[0, 0, 0, 0, 0]]
+    row["token_scope_ids"] = [[0, 0, 0, 0, 0]]
+    row["token_source_doc_ids"] = [[1, 1, 1, 0, 0]]
+    row["token_confidence_ids"] = [[0, 0, 0, 0, 0]]
     row["doc_ids"] = [[1, 1, 1, 1, 1]]
     for name, kind, _dtype in converter.DEFAULT_CPPMEGA_GRAPH_SIDECARS:
         if name == "token_domain_edges":
-            row[name] = [[{"from": 0, "to": 2, "kind": 20}]]
+            row[name] = [[{"from": 0, "to": 2, "kind": 5}]]
         elif kind == "edge_pairs":
             row[name] = [[]]
         elif kind == "edge_triples":
@@ -529,6 +623,100 @@ def test_explicit_mmididx_writer_trims_padding_and_all_sidecars(tmp_path: Path) 
     )
 
 
+def test_mmididx_writer_binds_pre_materialized_objective_contract(
+    tmp_path: Path,
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    converter = _load_converter_module()
+    tasks = tuple(_objective_contract()["task_order"])
+    input_dir = tmp_path / "parquet"
+    input_dir.mkdir()
+    rows: dict[str, object] = {
+        "valid_token_count": [4] * len(tasks),
+        "input_ids": [
+            [10 + index, 20 + index, 30 + index, 40 + index]
+            for index in range(len(tasks))
+        ],
+        "loss_mask": [
+            [1, 1, 1, 0] if task == "causal_lm" else [0, 1, 1, 0]
+            for task in tasks
+        ],
+        "objective_kind": list(tasks),
+        "doc_ids": [[1, 1, 1, 1] for _task in tasks],
+        "token_domain_ids": [[0, 0, 0, 0] for _task in tasks],
+        "token_role_ids": [[0, 0, 0, 0] for _task in tasks],
+        "token_entity_ids": [[0, 0, 0, 0] for _task in tasks],
+        "token_scope_ids": [[0, 0, 0, 0] for _task in tasks],
+        "token_source_doc_ids": [[7, 7, 7, 7] for _task in tasks],
+        "token_confidence_ids": [[0, 0, 0, 0] for _task in tasks],
+        "token_call_edges": [
+            [{"from": 0, "to": 0}, {"from": 1, "to": 0}]
+            if task == "causal_lm"
+            else []
+            for task in tasks
+        ],
+        "token_type_edges": [[] for _task in tasks],
+        "token_chunk_starts": [
+            [0, 2] if task == "causal_lm" else [] for task in tasks
+        ],
+        "token_chunk_ends": [
+            [2, 4] if task == "causal_lm" else [] for task in tasks
+        ],
+        "token_chunk_kinds": [
+            [1, 1] if task == "causal_lm" else [] for task in tasks
+        ],
+        "token_chunk_dep_levels": [
+            [0, 0] if task == "causal_lm" else [] for task in tasks
+        ],
+    }
+    pq.write_table(pa.table(rows), input_dir / "objectives.parquet")
+    contract_path = tmp_path / "objective_contract.json"
+    contract_path.write_text(json.dumps(_objective_contract()), encoding="utf-8")
+    side_channels = [
+        "loss_mask",
+        "doc_ids",
+        "token_domain_ids",
+        "token_role_ids",
+        "token_entity_ids",
+        "token_scope_ids",
+        "token_source_doc_ids",
+        "token_confidence_ids",
+    ]
+    side_dtypes = ["uint8", "uint16", "uint16", "uint16", "uint32", "uint32", "uint32", "uint8"]
+    output_prefix = tmp_path / "objective_train"
+
+    converter.convert_parquet_to_megatron(
+        input_dir=str(input_dir),
+        output_prefix=str(output_prefix),
+        split="all",
+        token_column="auto",
+        length_column="auto",
+        side_channels=side_channels,
+        side_channel_dtypes=side_dtypes,
+        graph_sidecars=(
+            ("token_call_edges", "edge_pairs", "int32"),
+            ("token_type_edges", "edge_pairs", "int32"),
+            ("token_chunk_starts", "ragged_1d", "uint32"),
+            ("token_chunk_ends", "ragged_1d", "uint32"),
+            ("token_chunk_kinds", "ragged_1d", "uint16"),
+            ("token_chunk_dep_levels", "ragged_1d", "uint16"),
+        ),
+        source_platform_sidecar=False,
+        objective_contract_path=str(contract_path),
+        writer_backend="mmididx",
+    )
+
+    manifest = json.loads(output_prefix.with_suffix(".json").read_text())
+    assert manifest["objective_contract"]["payload"] == _objective_contract()
+    np.testing.assert_array_equal(
+        np.fromfile(
+            tmp_path / "objective_train_objective_ids.bin", dtype=np.uint8
+        ),
+        np.array([OBJECTIVE_IDS[task] for task in tasks], dtype=np.uint8),
+    )
+
+
 def test_mmididx_row_group_batching_preserves_document_order_and_offsets(
     tmp_path: Path,
 ) -> None:
@@ -550,11 +738,24 @@ def test_mmididx_row_group_batching_preserves_document_order_and_offsets(
         ]
     for name in ("token_symbol_ids", "token_call_targets", "token_type_refs"):
         rows[name] = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+    for name in (
+        "token_domain_ids",
+        "token_role_ids",
+        "token_entity_ids",
+        "token_scope_ids",
+        "token_confidence_ids",
+    ):
+        rows[name] = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+    rows["token_source_doc_ids"] = [
+        [11, 11, 0, 0],
+        [21, 21, 22, 22],
+        [31, 0, 0, 0],
+    ]
     rows["loss_mask"] = [[1, 0, 0, 0], [1, 1, 0, 1], [0, 0, 0, 0]]
     rows["doc_ids"] = [[1, 1, 0, 0], [1, 1, 2, 2], [1, 0, 0, 0]]
     for name, kind, _dtype in converter.DEFAULT_CPPMEGA_GRAPH_SIDECARS:
         if name == "token_call_edges":
-            rows[name] = [[], [{"from": 0, "to": 1}], []]
+            rows[name] = [[], [{"from": 0, "to": 0}], []]
         elif kind in {"edge_pairs", "edge_triples"}:
             rows[name] = [[], [], []]
         elif name == "token_chunk_starts":
@@ -604,7 +805,7 @@ def test_mmididx_row_group_batching_preserves_document_order_and_offsets(
             tmp_path / "cppmega_train_token_call_edges_data.bin",
             dtype=np.int32,
         ),
-        np.array([0, 1], dtype=np.int32),
+        np.array([0, 0], dtype=np.int32),
     )
     np.testing.assert_array_equal(
         np.fromfile(

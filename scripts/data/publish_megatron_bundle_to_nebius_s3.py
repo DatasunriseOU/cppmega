@@ -22,9 +22,21 @@ from pathlib import Path, PurePosixPath
 import re
 import struct
 import subprocess
+import sys
 import tarfile
 import tempfile
 from typing import Iterable
+
+import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from cppmega.megatron.objective_contract import (  # noqa: E402
+    validate_materialized_objective_contract,
+    validate_objective_contract,
+)
 
 
 DEFAULT_ENDPOINT = "https://storage.eu-north1.nebius.cloud"
@@ -35,6 +47,20 @@ EXPECTED_BUNDLE_TOKENIZER_CONTRACT = "megacpp-vocab-65536"
 EXPECTED_PREFIX_TOKENIZER_CONTRACT = "megacpp"
 EXPECTED_VOCAB_SIZE = 65536
 EXPECTED_GRAPH_SIDECAR_SCHEMA = "cppmega_graph_routes_v2"
+CANONICAL_TOKENIZER_CONTRACT_PATH = (
+    REPO_ROOT / "data/tokenizer_v2/tokenizer_contract_v1.json"
+)
+CANONICAL_DOMAIN_SCHEMA_PATH = REPO_ROOT / "data/domain_schema_v1.json"
+CANONICAL_TOKENIZER_CONTRACT_BYTES = (
+    CANONICAL_TOKENIZER_CONTRACT_PATH.read_bytes()
+)
+CANONICAL_TOKENIZER_CONTRACT_SHA256 = hashlib.sha256(
+    CANONICAL_TOKENIZER_CONTRACT_BYTES
+).hexdigest()
+CANONICAL_TOKENIZER_CONTRACT = json.loads(CANONICAL_TOKENIZER_CONTRACT_BYTES)
+CANONICAL_DOMAIN_SCHEMA = json.loads(
+    CANONICAL_DOMAIN_SCHEMA_PATH.read_text(encoding="utf-8")
+)
 EXPECTED_TOKENIZER_CORE_TOKENS = (
     "<PAD>",
     "<UNK>",
@@ -105,6 +131,7 @@ TOKEN_SIDECAR_DTYPES = {
     "token_role_ids": "uint16",
     "token_entity_ids": "uint32",
     "token_scope_ids": "uint32",
+    "token_source_doc_ids": "uint32",
     "token_confidence_ids": "uint8",
     "token_structure_ids": "uint8",
     "token_dep_levels": "uint16",
@@ -139,6 +166,28 @@ NONZERO_GRAPH_SIDECARS = {
     "token_chunk_kinds",
     "token_chunk_dep_levels",
 }
+ROUTE_GRAPH_SIDECARS = tuple(
+    name for name in GRAPH_SIDECAR_SPECS if name.endswith("_edges")
+)
+_GRAPH_FAMILY_BY_COLUMN = {
+    "token_domain_edges": "domain",
+    "token_build_edges": "build",
+    "token_shell_edges": "shell",
+    "token_diagnostic_edges": "diagnostic",
+    "token_cross_domain_edges": "cross_domain",
+}
+_ALLOWED_EDGE_KINDS = {
+    f"token_{family}_edges": frozenset(int(value) for value in values)
+    for family, values in CANONICAL_DOMAIN_SCHEMA["edge_families"].items()
+}
+_RESERVED_ROLE_IDS = CANONICAL_TOKENIZER_CONTRACT["reserved_role_assignments"]
+_DELIMITER_BY_TOKEN_ID: dict[int, tuple[int, bool, int]] = {}
+for _delimiter in CANONICAL_DOMAIN_SCHEMA["delimiter_roles"].values():
+    _start_id = int(_RESERVED_ROLE_IDS[_delimiter["start"]])
+    _end_id = int(_RESERVED_ROLE_IDS[_delimiter["end"]])
+    _domain_id = int(_delimiter["domain_id"])
+    _DELIMITER_BY_TOKEN_ID[_start_id] = (_domain_id, True, _end_id)
+    _DELIMITER_BY_TOKEN_ID[_end_id] = (_domain_id, False, _start_id)
 
 
 def _sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
@@ -239,7 +288,7 @@ def _read_int64_offsets(path: Path, expected_count: int) -> list[int]:
     return list(struct.unpack(f"<{expected_count}q", raw))
 
 
-def _read_mmididx(path: Path, *, expected_dtype: str) -> dict[str, int]:
+def _read_mmididx(path: Path, *, expected_dtype: str) -> dict[str, object]:
     with path.open("rb") as stream:
         if stream.read(9) != b"MMIDIDX\x00\x00":
             raise ValueError(f"{path}: invalid MMIDIDX header")
@@ -300,6 +349,7 @@ def _read_mmididx(path: Path, *, expected_dtype: str) -> dict[str, int]:
         "sequences": sequences,
         "documents": documents,
         "tokens": token_offset,
+        "lengths": lengths,
     }
 
 
@@ -333,6 +383,285 @@ def _safe_prefix_file(prefix_dir: Path, relative: str) -> Path:
     if path != root and root not in path.parents:
         raise ValueError(f"sidecar path escapes prefix directory: {relative!r}")
     return path
+
+
+def _numpy_dtype(name: str) -> np.dtype:
+    return np.dtype(
+        {
+            "uint8": "<u1",
+            "uint16": "<u2",
+            "uint32": "<u4",
+            "int32": "<i4",
+            "int64": "<i8",
+        }[name]
+    )
+
+
+def _read_graph_array(
+    path: Path, *, dtype: str, item_count: int, width: int
+) -> np.ndarray:
+    if item_count == 0:
+        return np.empty((0, width), dtype=_numpy_dtype(dtype))
+    return np.memmap(
+        path,
+        mode="r",
+        dtype=_numpy_dtype(dtype),
+        shape=(item_count, width),
+    )
+
+
+def _validate_token_semantics(
+    *,
+    token_path: Path,
+    token_dtype: str,
+    lengths: list[int],
+    sidecar_files: dict[str, Path],
+) -> dict[str, int]:
+    token_count = sum(lengths)
+    tokens = np.memmap(
+        token_path,
+        mode="r",
+        dtype=_numpy_dtype(token_dtype),
+        shape=(token_count,),
+    )
+    domain_ids = np.memmap(
+        sidecar_files["token_domain_ids"],
+        mode="r",
+        dtype="<u2",
+        shape=(token_count,),
+    )
+    role_ids = np.memmap(
+        sidecar_files["token_role_ids"],
+        mode="r",
+        dtype="<u2",
+        shape=(token_count,),
+    )
+    confidence_ids = np.memmap(
+        sidecar_files["token_confidence_ids"],
+        mode="r",
+        dtype="<u1",
+        shape=(token_count,),
+    )
+    source_ids = np.memmap(
+        sidecar_files["token_source_doc_ids"],
+        mode="r",
+        dtype="<u4",
+        shape=(token_count,),
+    )
+    valid_domains = frozenset(
+        int(value) for value in CANONICAL_DOMAIN_SCHEMA["domain_kinds"].values()
+    )
+    valid_roles = frozenset(
+        int(value) for value in CANONICAL_DOMAIN_SCHEMA["role_kinds"].values()
+    )
+    valid_confidences = frozenset(
+        int(value)
+        for value in CANONICAL_DOMAIN_SCHEMA["confidence_kinds"].values()
+    )
+    delimiter_ids = np.asarray(sorted(_DELIMITER_BY_TOKEN_ID), dtype=tokens.dtype)
+    delimiter_count = 0
+    balanced_pairs = 0
+    start = 0
+    for sequence_index, length in enumerate(lengths):
+        end = start + length
+        sequence_sources = source_ids[start:end]
+        if np.any(sequence_sources == 0):
+            raise ValueError(
+                "token_source_doc_ids must be positive for every valid token: "
+                f"sequence={sequence_index}"
+            )
+        sequence_domains = domain_ids[start:end]
+        sequence_roles = role_ids[start:end]
+        sequence_confidences = confidence_ids[start:end]
+        if any(int(value) not in valid_domains for value in np.unique(sequence_domains)):
+            raise ValueError(f"unknown token_domain_ids in sequence {sequence_index}")
+        if any(int(value) not in valid_roles for value in np.unique(sequence_roles)):
+            raise ValueError(f"unknown token_role_ids in sequence {sequence_index}")
+        if any(
+            int(value) not in valid_confidences
+            for value in np.unique(sequence_confidences)
+        ):
+            raise ValueError(
+                f"unknown token_confidence_ids in sequence {sequence_index}"
+            )
+        sequence_tokens = tokens[start:end]
+        marker_mask = np.isin(sequence_tokens, delimiter_ids)
+        if np.any((sequence_roles == 1) & ~marker_mask):
+            raise ValueError(
+                f"DELIMITER role on non-delimiter token in sequence {sequence_index}"
+            )
+        stack: list[int] = []
+        for local_position in np.flatnonzero(marker_mask):
+            token_id = int(sequence_tokens[local_position])
+            expected_domain, is_start, counterpart = _DELIMITER_BY_TOKEN_ID[token_id]
+            if int(sequence_domains[local_position]) != expected_domain:
+                raise ValueError(
+                    f"delimiter token ID {token_id} has wrong domain in "
+                    f"sequence {sequence_index}"
+                )
+            if int(sequence_roles[local_position]) != 1:
+                raise ValueError(
+                    f"delimiter token ID {token_id} must have DELIMITER role"
+                )
+            if int(sequence_confidences[local_position]) != 4:
+                raise ValueError(
+                    f"delimiter token ID {token_id} must have EXACT confidence"
+                )
+            delimiter_count += 1
+            if is_start:
+                stack.append(counterpart)
+            elif not stack or stack[-1] != token_id:
+                raise ValueError(
+                    f"crossing or unmatched delimiter token ID {token_id} in "
+                    f"sequence {sequence_index}"
+                )
+            else:
+                stack.pop()
+                balanced_pairs += 1
+        if stack:
+            raise ValueError(
+                f"unclosed domain delimiter pairs in sequence {sequence_index}"
+            )
+        start = end
+    return {
+        "token_count": token_count,
+        "minimum_source_doc_id": int(source_ids.min()),
+        "delimiter_count": delimiter_count,
+        "balanced_delimiter_pairs": balanced_pairs,
+    }
+
+
+def _validate_graph_provenance(
+    *,
+    lengths: list[int],
+    source_doc_path: Path,
+    graph_files: dict[str, tuple[list[int], Path, dict]],
+) -> dict[str, object]:
+    sequence_starts = np.cumsum([0, *lengths[:-1]], dtype=np.int64)
+    source_ids = np.memmap(
+        source_doc_path,
+        mode="r",
+        dtype="<u4",
+        shape=(sum(lengths),),
+    )
+    chunk_names = (
+        "token_chunk_starts",
+        "token_chunk_ends",
+        "token_chunk_kinds",
+        "token_chunk_dep_levels",
+    )
+    chunk_offsets = graph_files["token_chunk_starts"][0]
+    for name in chunk_names[1:]:
+        if graph_files[name][0] != chunk_offsets:
+            raise ValueError("graph chunk CSR offsets disagree by sequence")
+    chunk_arrays = {
+        name: _read_graph_array(
+            graph_files[name][1],
+            dtype=str(graph_files[name][2]["dtype"]),
+            item_count=int(graph_files[name][2]["item_count"]),
+            width=1,
+        ).reshape(-1)
+        for name in chunk_names
+    }
+    graph_arrays = {
+        name: _read_graph_array(
+            graph_files[name][1],
+            dtype=str(graph_files[name][2]["dtype"]),
+            item_count=int(graph_files[name][2]["item_count"]),
+            width=int(graph_files[name][2]["shape_tail"][0]),
+        )
+        for name in ROUTE_GRAPH_SIDECARS
+    }
+    route_counts = {name: 0 for name in ROUTE_GRAPH_SIDECARS}
+    for sequence_index, length in enumerate(lengths):
+        sequence_start = int(sequence_starts[sequence_index])
+        chunk_begin, chunk_end = (
+            int(chunk_offsets[sequence_index]),
+            int(chunk_offsets[sequence_index + 1]),
+        )
+        starts = chunk_arrays["token_chunk_starts"][chunk_begin:chunk_end]
+        ends = chunk_arrays["token_chunk_ends"][chunk_begin:chunk_end]
+        kinds = chunk_arrays["token_chunk_kinds"][chunk_begin:chunk_end]
+        levels = chunk_arrays["token_chunk_dep_levels"][chunk_begin:chunk_end]
+        if (
+            np.any(starts < 0)
+            or np.any(ends <= starts)
+            or np.any(ends > length)
+            or np.any(kinds <= 0)
+            or np.any(levels < 0)
+        ):
+            raise ValueError(
+                f"invalid graph chunk spans/kinds in sequence {sequence_index}"
+            )
+        chunk_docs: list[int] = []
+        for local_start, local_end in zip(starts, ends, strict=True):
+            docs = source_ids[
+                sequence_start + int(local_start) : sequence_start + int(local_end)
+            ]
+            if docs.size == 0 or np.any(docs != docs[0]):
+                raise ValueError(
+                    "graph chunk crosses source-document provenance in "
+                    f"sequence {sequence_index}"
+                )
+            chunk_docs.append(int(docs[0]))
+
+        for name in ROUTE_GRAPH_SIDECARS:
+            offsets, _path, _spec = graph_files[name]
+            begin, end = int(offsets[sequence_index]), int(offsets[sequence_index + 1])
+            edges = graph_arrays[name][begin:end]
+            route_counts[name] += len(edges)
+            if name in {"token_call_edges", "token_type_edges"}:
+                for source, target in edges:
+                    source_i, target_i = int(source), int(target)
+                    if (
+                        source_i < 0
+                        or target_i < 0
+                        or source_i >= len(chunk_docs)
+                        or target_i >= len(chunk_docs)
+                    ):
+                        raise ValueError(
+                            f"{name} endpoint exceeds chunk count in "
+                            f"sequence {sequence_index}"
+                        )
+                    if chunk_docs[source_i] != chunk_docs[target_i]:
+                        raise ValueError(
+                            f"{name} endpoint document provenance mismatch in "
+                            f"sequence {sequence_index}"
+                        )
+            else:
+                allowed_kinds = _ALLOWED_EDGE_KINDS[name]
+                for source, target, kind in edges:
+                    source_i, target_i, kind_i = (
+                        int(source),
+                        int(target),
+                        int(kind),
+                    )
+                    if (
+                        source_i < 0
+                        or target_i < 0
+                        or source_i >= length
+                        or target_i >= length
+                    ):
+                        raise ValueError(
+                            f"{name} endpoint exceeds token count in "
+                            f"sequence {sequence_index}"
+                        )
+                    if kind_i not in allowed_kinds:
+                        raise ValueError(
+                            f"edge kind {kind_i} is not valid for {name}"
+                        )
+                    if (
+                        source_ids[sequence_start + source_i]
+                        != source_ids[sequence_start + target_i]
+                    ):
+                        raise ValueError(
+                            f"{name} endpoint document provenance mismatch in "
+                            f"sequence {sequence_index}"
+                        )
+    active = {name: count for name, count in route_counts.items() if count > 0}
+    if not active:
+        raise ValueError("graph bundle has no supported nonempty route edge")
+    return {"route_edge_count": sum(active.values()), "route_edge_counts": active}
 
 
 def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
@@ -374,6 +703,7 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
         raise ValueError(f"{manifest_path}: MMIDIDX token/document counts disagree")
     if index["documents"] != document_count + 1:
         raise ValueError(f"{manifest_path}: MMIDIDX document sentinel is missing")
+    lengths = [int(value) for value in index["lengths"]]
 
     referenced = {manifest_path, token_path, index_path}
 
@@ -383,6 +713,7 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
     missing_sidecars = sorted(REQUIRED_TOKEN_SIDECARS - set(side_paths))
     if missing_sidecars:
         raise ValueError(f"{manifest_path}: missing token sidecars {missing_sidecars}")
+    sidecar_files: dict[str, Path] = {}
     for name in REQUIRED_TOKEN_SIDECARS:
         spec = side_paths[name]
         if not isinstance(spec, dict):
@@ -408,6 +739,7 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
                 f"{manifest_path}: token_structure_ids must contain nonzero values"
             )
         referenced.add(side_path)
+        sidecar_files[name] = side_path
 
     graph_paths = data.get("graph_sidecar_paths")
     if data.get("graph_sidecar_schema") != EXPECTED_GRAPH_SIDECAR_SCHEMA:
@@ -421,6 +753,7 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
     if missing_graph:
         raise ValueError(f"{manifest_path}: missing graph sidecars {missing_graph}")
     graph_item_counts: dict[str, int] = {}
+    graph_files: dict[str, tuple[list[int], Path, dict]] = {}
     for name in REQUIRED_GRAPH_SIDECARS:
         spec = graph_paths[name]
         if not isinstance(spec, dict):
@@ -463,6 +796,7 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
                 f"{data_path.stat().st_size} != {expected_data_bytes}"
             )
         referenced.update((offsets_path, data_path))
+        graph_files[name] = (offsets, data_path, spec)
     chunk_item_counts = {
         graph_item_counts[name]
         for name in (
@@ -474,6 +808,17 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
     }
     if len(chunk_item_counts) != 1:
         raise ValueError(f"{manifest_path}: graph chunk CSR item counts disagree")
+    _validate_token_semantics(
+        token_path=token_path,
+        token_dtype=token_dtype,
+        lengths=lengths,
+        sidecar_files=sidecar_files,
+    )
+    _validate_graph_provenance(
+        lengths=lengths,
+        source_doc_path=sidecar_files["token_source_doc_ids"],
+        graph_files=graph_files,
+    )
 
     source_platform = data.get("source_platform_sidecar")
     if not isinstance(source_platform, dict) or source_platform.get("schema") != "cppmega_source_platform_v1":
@@ -513,6 +858,23 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
     referenced.update(
         (sequence_offsets_path, document_offsets_path, platform_ids_path)
     )
+    objective = data.get("objective_contract")
+    if objective is None:
+        raise ValueError(f"{manifest_path}: objective_contract is required")
+    validated_objective = validate_materialized_objective_contract(
+        objective,
+        base_dir=str(prefix.parent),
+        document_count=document_count,
+    )
+    if int(validated_objective.payload["totals"]["samples"]) != document_count:
+        raise ValueError(
+            f"{manifest_path}: objective samples do not match document_count"
+        )
+    objective_sidecar = objective["objective_id_sidecar"]
+    objective_path = _safe_prefix_file(
+        prefix.parent, str(objective_sidecar["path"])
+    )
+    referenced.add(objective_path)
     return data, referenced
 
 
@@ -524,12 +886,21 @@ def _validate_tokenizer_directory(tokenizer_root: Path) -> set[Path]:
         tokenizer_root / "tokenizer.json",
         tokenizer_root / "tokenizer_config.json",
         tokenizer_root / "special_tokens_map.json",
+        tokenizer_root / "tokenizer_contract_v1.json",
     }
     entries = set(tokenizer_root.iterdir()) if tokenizer_root.is_dir() else set()
     if any(path.is_symlink() or not path.is_file() for path in entries):
         raise ValueError("tokenizer directory may contain only regular files")
     if not required.issubset(entries):
         raise ValueError("tokenizer directory is missing required regular artifacts")
+    contract_path = tokenizer_root / "tokenizer_contract_v1.json"
+    if _sha256(contract_path) != CANONICAL_TOKENIZER_CONTRACT_SHA256:
+        raise ValueError(
+            "tokenizer_contract_v1.json does not match the frozen checked-out contract"
+        )
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    if contract != CANONICAL_TOKENIZER_CONTRACT:
+        raise ValueError("tokenizer contract JSON payload drifted")
     tokenizer = json.loads((tokenizer_root / "tokenizer.json").read_text(encoding="utf-8"))
     vocab = (tokenizer.get("model") or {}).get("vocab")
     if not isinstance(vocab, dict) or len(vocab) != EXPECTED_VOCAB_SIZE:
@@ -571,7 +942,11 @@ def _validate_tokenizer_directory(tokenizer_root: Path) -> set[Path]:
             )
     expected_tokens = {
         **{index: token for index, token in enumerate(EXPECTED_TOKENIZER_CORE_TOKENS)},
-        **{index: f"<RESERVED_{index}>" for index in range(191, 237)},
+        **{
+            int(token_id): f"<RESERVED_{int(token_id)}>"
+            for role, token_id in contract["reserved_role_assignments"].items()
+            if not role.startswith("_")
+        },
     }
     for token_id, token in expected_tokens.items():
         if vocab.get(token) != token_id or added_by_id.get(token_id) != token:
@@ -630,6 +1005,23 @@ def _load_bundle_manifest(bundle: Path) -> tuple[dict, list[dict]]:
     if manifest.get("schema") != "cppmega_megatron_bundle_v1":
         raise ValueError(f"unsupported bundle schema: {manifest.get('schema')!r}")
     _require_manifest_tokenizer_contract(manifest)
+    if manifest.get("training_contract") != "objective_materialized":
+        raise ValueError(
+            "bundle training_contract must be 'objective_materialized'"
+        )
+    objective_materialization = manifest.get("objective_materialization")
+    if (
+        not isinstance(objective_materialization, dict)
+        or objective_materialization.get("schema")
+        != "cppmega_pre_materialized_objectives_v1"
+        or not SHA256_RE.fullmatch(
+            str(objective_materialization.get("sha256", ""))
+        )
+        or not SHA256_RE.fullmatch(
+            str(objective_materialization.get("file_sha256", ""))
+        )
+    ):
+        raise ValueError("bundle objective_materialization descriptor is invalid")
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, list) or not artifacts:
         raise ValueError("bundle manifest has no artifacts")
@@ -677,6 +1069,22 @@ def _validate_bundle(bundle: Path, hash_jobs: int) -> tuple[dict, list[dict]]:
         for record in artifacts
     }
     _validate_tokenizer_descriptor(bundle, manifest, artifact_by_path)
+    objective_descriptor = manifest["objective_materialization"]
+    objective_relative = str(objective_descriptor.get("path", ""))
+    objective_path = _safe_artifact_path(bundle, objective_relative)
+    objective_record = artifact_by_path.get(objective_relative)
+    if (
+        objective_record is None
+        or objective_record["sha256"] != objective_descriptor["file_sha256"]
+        or not objective_path.is_file()
+    ):
+        raise ValueError("bundle objective materialization artifact is not hash-bound")
+    raw_objective = json.loads(objective_path.read_text(encoding="utf-8"))
+    if (
+        validate_objective_contract(raw_objective).sha256
+        != objective_descriptor["sha256"]
+    ):
+        raise ValueError("bundle objective materialization payload digest mismatch")
 
     buckets = manifest.get("buckets")
     if (
@@ -691,6 +1099,7 @@ def _validate_bundle(bundle: Path, hash_jobs: int) -> tuple[dict, list[dict]]:
         raise ValueError("bundle bucket_results must be a non-empty list")
     result_buckets: list[int] = []
     referenced_paths: set[Path] = set()
+    objective_sha256 = str(manifest["objective_materialization"]["sha256"])
     for result in bucket_results:
         if not isinstance(result, dict):
             raise ValueError("bundle bucket_results entries must be objects")
@@ -700,6 +1109,10 @@ def _validate_bundle(bundle: Path, hash_jobs: int) -> tuple[dict, list[dict]]:
         result_buckets.append(bucket)
         prefix = _safe_artifact_path(bundle, str(result.get("prefix", "")))
         prefix_manifest, referenced = _validate_prefix_manifest_contract(prefix)
+        if prefix_manifest["objective_contract"]["sha256"] != objective_sha256:
+            raise ValueError(
+                f"{prefix}: objective contract does not match bundle descriptor"
+            )
         if result.get("manifest") != prefix_manifest:
             raise ValueError(f"{prefix}: embedded prefix manifest does not match artifact")
         referenced_paths.update(referenced)

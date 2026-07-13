@@ -18,6 +18,16 @@ import numpy as np
 # Thread-local storage to safely pass the current batch's structure inputs to model forward
 _local_storage = threading.local()
 
+
+def _env_flag(name: str) -> bool:
+    raw = os.environ.get(name, "0").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} has invalid boolean value {raw!r}")
+
+
 def _set_current_structure_batch(batch: Dict[str, torch.Tensor] | None) -> None:
     _local_storage.current_structure_batch = batch
 
@@ -134,6 +144,8 @@ def _required_token_batch_cols() -> set[str]:
     required = set(_REQUIRED_STRUCTURE_TOKEN_COLS)
     if os.environ.get("CPPMEGA_DOMAIN_EMBEDDING_ENABLED", "0") == "1":
         required.update(_REQUIRED_DOMAIN_TOKEN_COLS)
+    if _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
+        required.add("source_doc_ids")
     return required
 
 
@@ -195,6 +207,27 @@ def _load_sidecar_manifest(dataset: Any) -> tuple[str, dict[str, Any]]:
     json_path = _sidecar_json_path(dataset)
     with open(json_path, "r", encoding="utf-8") as f:
         sidecar = json.load(f)
+    if _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
+        objective_contract = sidecar.get("objective_contract")
+        if objective_contract is None:
+            raise KeyError(
+                f"[cppmega-patch] objective_contract missing in {json_path!r} "
+                "while CPPMEGA_GRAPH_ROUTES_ENABLED=1"
+            )
+        from cppmega.megatron.objective_contract import (
+            validate_materialized_objective_contract,
+        )
+
+        document_count = sidecar.get("document_count")
+        if not isinstance(document_count, int) or document_count < 1:
+            raise ValueError(
+                f"[cppmega-patch] document_count must be positive in {json_path!r}"
+            )
+        validate_materialized_objective_contract(
+            objective_contract,
+            base_dir=os.path.dirname(json_path),
+            document_count=document_count,
+        )
     dataset._cppmega_sidecar_manifest = (json_path, sidecar)
     return json_path, sidecar
 

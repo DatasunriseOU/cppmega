@@ -431,6 +431,7 @@ def build_graph_route_bias_from_structure_batch(
     shell_weight: float = 1.0,
     diagnostic_weight: float = 1.0,
     cross_domain_weight: float = 1.0,
+    consumer: str | None = None,
 ) -> torch.Tensor:
     """Build ``S_graph[b,t,s]`` from cppmega graph route sidecars.
 
@@ -520,6 +521,15 @@ def build_graph_route_bias_from_structure_batch(
             "route edge tensors (expected graph_call_edges/type_edges or "
             "domain/build/shell/diagnostic/cross-domain edges)"
         )
+    receipt_path = os.environ.get("CPPMEGA_H200_GRAPH_PRIOR_RECEIPT")
+    if receipt_path and consumer is not None:
+        from cppmega.megatron.h200_preflight import observe_graph_prior
+
+        observe_graph_prior(
+            prior=bias,
+            consumer=consumer,
+            receipt_path=receipt_path,
+        )
     return bias
 
 
@@ -558,6 +568,7 @@ def _current_graph_route_bias(
         shell_weight=_env_float("CPPMEGA_DSA_GRAPH_SHELL_WEIGHT", 1.0),
         diagnostic_weight=_env_float("CPPMEGA_DSA_GRAPH_DIAGNOSTIC_WEIGHT", 1.0),
         cross_domain_weight=_env_float("CPPMEGA_DSA_GRAPH_CROSS_DOMAIN_WEIGHT", 1.0),
+        consumer="dsa_indexer",
     )
 
 

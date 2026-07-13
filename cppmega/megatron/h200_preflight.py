@@ -8,13 +8,42 @@ import os
 from pathlib import Path
 from typing import Mapping
 
+from cppmega.receipt_binding import (
+    validate_binding_shape,
+    validate_receipt_binding,
+)
+
 REQUIRED_BATCH_FIELDS = ("tokens", "labels", "loss_mask")
 REQUIRED_GRAPH_BATCH_FIELDS = (
+    "source_doc_ids",
+    "graph_call_edges",
+    "graph_call_edge_counts",
+    "graph_type_edges",
+    "graph_type_edge_counts",
+    "graph_domain_edges",
+    "graph_domain_edge_counts",
+    "graph_build_edges",
+    "graph_build_edge_counts",
+    "graph_shell_edges",
+    "graph_shell_edge_counts",
+    "graph_diagnostic_edges",
+    "graph_diagnostic_edge_counts",
+    "graph_cross_domain_edges",
+    "graph_cross_domain_edge_counts",
     "graph_chunk_starts",
     "graph_chunk_ends",
     "graph_chunk_kinds",
     "graph_chunk_dep_levels",
     "graph_chunk_counts",
+)
+_ROUTE_FAMILIES = (
+    ("call", 2, "chunk"),
+    ("type", 2, "chunk"),
+    ("domain", 3, "token"),
+    ("build", 3, "token"),
+    ("shell", 3, "token"),
+    ("diagnostic", 3, "token"),
+    ("cross_domain", 3, "token"),
 )
 
 
@@ -86,8 +115,29 @@ def _validate_active_graph(
             "production graph_chunk_counts must contain one count per batch row"
         )
 
+    source_doc_ids = (
+        structure_batch["source_doc_ids"]
+        .detach()
+        .to(device="cpu", dtype=torch.int64)
+    )
+    if tuple(source_doc_ids.shape) != token_shape:
+        raise RuntimeError(
+            "production source_doc_ids shape must match tokens"
+        )
+    valid_tokens = (
+        batch["tokens"].detach().to(device="cpu").ne(0)
+        | batch["labels"].detach().to(device="cpu").ne(0)
+        | batch["loss_mask"].detach().to(device="cpu").ne(0)
+        | structure_batch["structure_ids"].detach().to(device="cpu").ne(0)
+    )
+    if torch.any(source_doc_ids[valid_tokens] <= 0):
+        raise RuntimeError(
+            "production source_doc_ids must be positive for every valid token"
+        )
+
     total_chunks = 0
     max_end = 0
+    chunk_docs_by_row: list[list[int]] = []
     for row, raw_count in enumerate(counts.tolist()):
         count = int(raw_count)
         if count < 0 or count > chunk_shape[1]:
@@ -95,6 +145,7 @@ def _validate_active_graph(
                 f"production graph chunk count {count} exceeds capacity {chunk_shape[1]}"
             )
         if count == 0:
+            chunk_docs_by_row.append([])
             continue
         starts = chunks["graph_chunk_starts"][row, :count].to(dtype=torch.int64)
         ends = chunks["graph_chunk_ends"][row, :count].to(dtype=torch.int64)
@@ -110,9 +161,91 @@ def _validate_active_graph(
             raise RuntimeError("production active graph chunk spans/kinds are invalid")
         total_chunks += count
         max_end = max(max_end, int(ends.max().item()))
+        chunk_docs: list[int] = []
+        for start, end in zip(starts.tolist(), ends.tolist(), strict=True):
+            docs = source_doc_ids[row, int(start) : int(end)]
+            if docs.numel() == 0 or torch.any(docs != docs[0]):
+                raise RuntimeError(
+                    "production graph chunk crosses source-document provenance"
+                )
+            chunk_docs.append(int(docs[0].item()))
+        chunk_docs_by_row.append(chunk_docs)
     if total_chunks <= 0:
         raise RuntimeError("production graph batch has no active chunks")
-    return {"chunk_count": total_chunks, "max_chunk_end": max_end}
+
+    route_edge_counts: dict[str, int] = {}
+    for family, width, coordinate_space in _ROUTE_FAMILIES:
+        edge_key = f"graph_{family}_edges"
+        count_key = f"graph_{family}_edge_counts"
+        edges = structure_batch[edge_key].detach().to(
+            device="cpu", dtype=torch.int64
+        )
+        edge_counts = structure_batch[count_key].detach().to(
+            device="cpu", dtype=torch.int64
+        ).reshape(-1)
+        if (
+            edges.ndim != 3
+            or edges.shape[0] != token_shape[0]
+            or edges.shape[2] != width
+            or edge_counts.numel() != token_shape[0]
+        ):
+            raise RuntimeError(
+                f"production {family} route tensors have invalid shape"
+            )
+        family_total = 0
+        for row, raw_count in enumerate(edge_counts.tolist()):
+            count = int(raw_count)
+            if count < 0 or count > edges.shape[1]:
+                raise RuntimeError(
+                    f"production {family} edge count exceeds capacity"
+                )
+            active_edges = edges[row, :count]
+            family_total += count
+            for edge in active_edges.tolist():
+                source, target = int(edge[0]), int(edge[1])
+                if coordinate_space == "chunk":
+                    chunk_docs = chunk_docs_by_row[row]
+                    if (
+                        source < 0
+                        or target < 0
+                        or source >= len(chunk_docs)
+                        or target >= len(chunk_docs)
+                    ):
+                        raise RuntimeError(
+                            f"production {family} route endpoint exceeds chunks"
+                        )
+                    source_doc, target_doc = (
+                        chunk_docs[source],
+                        chunk_docs[target],
+                    )
+                else:
+                    if (
+                        source < 0
+                        or target < 0
+                        or source >= token_shape[1]
+                        or target >= token_shape[1]
+                        or int(edge[2]) <= 0
+                    ):
+                        raise RuntimeError(
+                            f"production {family} route endpoint/kind is invalid"
+                        )
+                    source_doc = int(source_doc_ids[row, source].item())
+                    target_doc = int(source_doc_ids[row, target].item())
+                if source_doc <= 0 or source_doc != target_doc:
+                    raise RuntimeError(
+                        f"production {family} route endpoint provenance mismatch"
+                    )
+        if family_total:
+            route_edge_counts[family] = family_total
+    route_edge_count = sum(route_edge_counts.values())
+    if route_edge_count <= 0:
+        raise RuntimeError("production graph batch has no active route edges")
+    return {
+        "chunk_count": total_chunks,
+        "max_chunk_end": max_end,
+        "route_edge_count": route_edge_count,
+        "route_edge_counts": route_edge_counts,
+    }
 
 
 def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
@@ -124,14 +257,30 @@ def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
     os.replace(temporary, path)
 
 
+def _binding_from_environment() -> dict[str, object] | None:
+    raw = os.environ.get("CPPMEGA_H200_RECEIPT_BINDING")
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            "CPPMEGA_H200_RECEIPT_BINDING must be JSON"
+        ) from error
+    return validate_binding_shape(value, where="H200 environment")
+
+
 def observe_production_batch(
     *,
     batch: Mapping[str, object],
     structure_batch: Mapping[str, object],
     receipt_path: str | Path,
+    receipt_binding: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Record the first real Megatron batch after sidecar materialization."""
 
+    if receipt_binding is None:
+        receipt_binding = _binding_from_environment()
     output = Path(receipt_path)
     if output.exists():
         existing = json.loads(output.read_text(encoding="utf-8"))
@@ -140,6 +289,12 @@ def observe_production_batch(
             or existing.get("status") != "verified"
         ):
             raise RuntimeError(f"invalid existing H200 batch receipt: {output}")
+        if receipt_binding is not None:
+            validate_receipt_binding(
+                existing.get("binding"),
+                expected=receipt_binding,
+                where="H200 batch receipt",
+            )
         return existing
 
     missing_batch = sorted(set(REQUIRED_BATCH_FIELDS) - set(batch))
@@ -171,6 +326,8 @@ def observe_production_batch(
     if structure_summary["graph_chunk_kinds"]["nonzero"] <= 0:
         raise RuntimeError("production graph_chunk_kinds must contain nonzero values")
     active_graph = _validate_active_graph(batch, structure_batch)
+    source_doc_ids = structure_batch["source_doc_ids"].detach().to(device="cpu")
+    positive_source_ids = source_doc_ids[source_doc_ids > 0]
 
     receipt: dict[str, object] = {
         "schema": "cppmega_h200_production_batch_v1",
@@ -181,6 +338,77 @@ def observe_production_batch(
         "batch": batch_summary,
         "structure": structure_summary,
         "active_graph": active_graph,
+        "source_provenance": {
+            "positive_token_count": int(positive_source_ids.numel()),
+            "minimum_source_doc_id": int(positive_source_ids.min().item()),
+        },
     }
+    if receipt_binding is not None:
+        receipt["binding"] = validate_binding_shape(
+            receipt_binding, where="H200 batch receipt"
+        )
     _write_json_atomic(output, receipt)
     return receipt
+
+
+def observe_graph_prior(
+    *,
+    prior: object,
+    consumer: str,
+    receipt_path: str | Path,
+    receipt_binding: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Prove that the selected graph consumer received a nonzero prior."""
+
+    import torch
+
+    if receipt_binding is None:
+        receipt_binding = _binding_from_environment()
+    if consumer not in {"dense_attention", "dsa_indexer"}:
+        raise RuntimeError(f"unsupported graph-prior consumer {consumer!r}")
+    output = Path(receipt_path)
+    if output.exists():
+        existing = json.loads(output.read_text(encoding="utf-8"))
+        if (
+            existing.get("schema") != "cppmega_h200_graph_prior_v1"
+            or existing.get("status") != "verified"
+            or existing.get("consumer") != consumer
+        ):
+            raise RuntimeError(f"invalid existing H200 graph-prior receipt: {output}")
+        if receipt_binding is not None:
+            validate_receipt_binding(
+                existing.get("binding"),
+                expected=receipt_binding,
+                where="H200 graph-prior receipt",
+            )
+        return existing
+    if not isinstance(prior, torch.Tensor):
+        raise RuntimeError("graph prior must be a tensor")
+    detached = prior.detach()
+    if detached.numel() <= 0 or not torch.isfinite(detached).all():
+        raise RuntimeError("graph prior must be nonempty and finite")
+    nonzero = int(torch.count_nonzero(detached).item())
+    if nonzero <= 0:
+        raise RuntimeError("graph prior consumer input must be nonzero")
+    payload: dict[str, object] = {
+        "schema": "cppmega_h200_graph_prior_v1",
+        "status": "verified",
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "rank": int(os.environ.get("RANK", "0")),
+        "consumer": consumer,
+        "prior": {
+            "shape": [int(value) for value in detached.shape],
+            "dtype": str(detached.dtype),
+            "device": str(detached.device),
+            "nonzero": nonzero,
+            "sum": float(detached.to(dtype=torch.float64).sum().item()),
+            "minimum": float(detached.min().item()),
+            "maximum": float(detached.max().item()),
+        },
+    }
+    if receipt_binding is not None:
+        payload["binding"] = validate_binding_shape(
+            receipt_binding, where="H200 graph-prior receipt"
+        )
+    _write_json_atomic(output, payload)
+    return payload

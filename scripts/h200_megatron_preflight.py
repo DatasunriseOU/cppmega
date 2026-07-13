@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import hashlib
 import importlib
 import json
 import math
@@ -12,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,9 +25,19 @@ if str(ROOT) not in sys.path:
 
 from cppmega.recipes.run_profiles import get_run_profile, profile_shell_assignments
 from scripts.data.publish_megatron_bundle_to_nebius_s3 import (
+    _sha256,
+    _validate_bundle,
     _validate_prefix_manifest_contract,
     _validate_tokenizer_directory,
 )
+from cppmega.receipt_binding import (
+    build_receipt_binding,
+    canonical_sha256,
+    validate_binding_shape,
+    validate_receipt_binding,
+)
+
+PENDING_CHECKPOINT_SHA256 = "0" * 64
 
 
 def _write_json_atomic(path: Path, payload: object) -> None:
@@ -48,11 +60,13 @@ import sys
 
 from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_patch
 from cppmega.megatron.graph_route_attention_bias_patch import apply_graph_route_attention_bias_patch
+from cppmega.megatron.checkpoint_restore_preflight import install_checkpoint_restore_preflight
 from cppmega.megatron.te_checkpoint_kwarg_patch import apply_te_checkpoint_kwarg_patch
 
 apply_te_checkpoint_kwarg_patch()
 apply_dsa_indexer_fused_patch()
 apply_graph_route_attention_bias_patch()
+install_checkpoint_restore_preflight()
 import cppmega.megatron.structure_dataset_patch  # noqa: F401
 
 @atexit.register
@@ -255,7 +269,50 @@ def build_megatron_command(
     return command
 
 
-def _stack_report() -> dict[str, object]:
+def _claimed_backend_modules(environment: dict[str, str]) -> tuple[str, ...]:
+    if environment.get("CPPMEGA_DENSE_GQA", "0") == "1":
+        return ()
+    mode = environment.get("CPPMEGA_DSA_SPARSE_MODE", "").strip().lower()
+    if mode == "tilelang":
+        return ("tilelang", "triton", "tvm")
+    if mode == "triton":
+        return ("triton",)
+    if mode == "tvm":
+        return ("tvm",)
+    return ()
+
+
+def _validate_backend_dispatch_receipt(
+    receipt: object, *, claims: tuple[str, ...]
+) -> dict[str, object]:
+    if not isinstance(receipt, dict):
+        raise RuntimeError("backend dispatch receipt must be an object")
+    if receipt.get("schema") != "cppmega_backend_dispatch_v1":
+        raise RuntimeError("backend dispatch receipt schema mismatch")
+    selected = receipt.get("selected_backend")
+    if not isinstance(selected, str) or selected not in claims:
+        raise RuntimeError(
+            f"actual selected backend {selected!r} is not claimed by profile"
+        )
+    for phase in ("forward", "backward"):
+        evidence = receipt.get(phase)
+        if (
+            not isinstance(evidence, dict)
+            or evidence.get("status") != "passed"
+            or evidence.get("finite") is not True
+        ):
+            raise RuntimeError(f"backend dispatch receipt lacks {phase} evidence")
+    numerical = receipt.get("numerical")
+    if (
+        not isinstance(numerical, dict)
+        or numerical.get("status") != "passed"
+        or not math.isfinite(float(numerical.get("max_abs_error", math.nan)))
+    ):
+        raise RuntimeError("backend dispatch receipt lacks numerical evidence")
+    return receipt
+
+
+def _stack_report(environment: dict[str, str]) -> dict[str, object]:
     import torch
 
     if not torch.cuda.is_available():
@@ -267,14 +324,16 @@ def _stack_report() -> dict[str, object]:
             f"capability={torch.cuda.get_device_capability(0)!r}"
         )
     modules = {}
-    for name in (
+    base_modules = (
         "torch",
         "transformer_engine",
         "transformer_engine.pytorch",
         "flash_attn",
         "megatron.core",
         "cppmega",
-    ):
+    )
+    backend_claims = _claimed_backend_modules(environment)
+    for name in (*base_modules, *backend_claims):
         module = importlib.import_module(name)
         modules[name] = {
             "file": getattr(module, "__file__", None),
@@ -301,6 +360,7 @@ def _stack_report() -> dict[str, object]:
             "total_memory_bytes": int(device.total_memory),
         },
         "nvidia_smi": nvidia_smi,
+        "backend_claims": list(backend_claims),
     }
 
 
@@ -350,6 +410,180 @@ def _iteration_evidence(text: str, *, expected_iteration: int) -> dict[str, obje
     }
 
 
+def _checkpoint_load_evidence(
+    text: str, *, expected_iteration: int
+) -> dict[str, object]:
+    pattern = re.compile(
+        r"successfully loaded checkpoint from\s+.+?"
+        r"(?:\[\s*t\s+\d+\s+p\s+\d+\s*\]\s*)?"
+        rf"at iteration\s+{expected_iteration}\b",
+        flags=re.IGNORECASE,
+    )
+    match = pattern.search(text)
+    if match is None:
+        raise RuntimeError(
+            "H200 restore lacks explicit Megatron successful checkpoint load "
+            f"at iteration {expected_iteration}"
+        )
+    return {
+        "status": "verified",
+        "iteration": expected_iteration,
+        "log_evidence": match.group(0),
+    }
+
+
+def _validate_checkpoint_state_restore(
+    saved: object, loaded: object
+) -> dict[str, object]:
+    if not isinstance(saved, dict) or not isinstance(loaded, dict):
+        raise RuntimeError("checkpoint state receipts must be objects")
+    for receipt, mode in ((saved, "save"), (loaded, "load")):
+        if (
+            receipt.get("schema") != "cppmega_h200_checkpoint_state_v1"
+            or receipt.get("status") != "verified"
+            or receipt.get("mode") != mode
+            or receipt.get("iteration") != 1
+        ):
+            raise RuntimeError(f"invalid checkpoint {mode} state receipt")
+    saved_fingerprints = saved.get("fingerprints")
+    loaded_fingerprints = loaded.get("fingerprints")
+    if not isinstance(saved_fingerprints, dict) or not isinstance(
+        loaded_fingerprints, dict
+    ):
+        raise RuntimeError("checkpoint state fingerprints are missing")
+    matched: list[str] = []
+    for component in ("model", "optimizer", "rng"):
+        expected = saved_fingerprints.get(component)
+        actual = loaded_fingerprints.get(component)
+        if (
+            not isinstance(expected, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected)
+            or actual != expected
+        ):
+            raise RuntimeError(
+                f"checkpoint restored {component} fingerprint mismatch"
+            )
+        matched.append(component)
+    return {"status": "verified", "matched": matched, "iteration": 1}
+
+
+def _checkpoint_tree_sha256(checkpoint_root: Path, iteration: int = 1) -> str:
+    iteration_root = checkpoint_root / f"iter_{iteration:07d}"
+    if not iteration_root.is_dir():
+        raise RuntimeError(
+            f"checkpoint iteration directory is missing: {iteration_root}"
+        )
+    records = []
+    for path in sorted(item for item in iteration_root.rglob("*") if item.is_file()):
+        records.append(
+            {
+                "path": path.relative_to(iteration_root).as_posix(),
+                "size": path.stat().st_size,
+                "sha256": _sha256(path),
+            }
+        )
+    if not records:
+        raise RuntimeError(f"checkpoint iteration directory is empty: {iteration_root}")
+    return canonical_sha256(records)
+
+
+def _stage_cold_checkpoint(
+    *,
+    source: Path,
+    destination: Path,
+    receipt_path: Path,
+    receipt_binding: dict[str, object],
+) -> dict[str, object]:
+    binding = validate_binding_shape(
+        receipt_binding, where="cold checkpoint receipt"
+    )
+    source = source.resolve()
+    destination = destination.resolve()
+    if source == destination:
+        raise RuntimeError("cold checkpoint destination must differ from save root")
+    if destination.exists():
+        raise RuntimeError(f"refusing stale cold checkpoint: {destination}")
+    if receipt_path.exists():
+        raise RuntimeError(f"refusing stale cold checkpoint receipt: {receipt_path}")
+    if source.is_symlink() or not source.is_dir():
+        raise RuntimeError(f"checkpoint save root is not a regular directory: {source}")
+    symlinks = [path for path in source.rglob("*") if path.is_symlink()]
+    if symlinks:
+        raise RuntimeError(f"checkpoint save root contains symlinks: {symlinks[0]}")
+    checkpoint_sha256 = _checkpoint_tree_sha256(source, iteration=1)
+    if checkpoint_sha256 != binding["checkpoint_sha256"]:
+        raise RuntimeError("cold checkpoint source hash does not match receipt binding")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = destination.parent / f".{destination.name}.partial-{os.getpid()}"
+    if staging.exists():
+        raise RuntimeError(f"refusing stale cold checkpoint staging tree: {staging}")
+    try:
+        shutil.copytree(source, staging, copy_function=shutil.copy2)
+        latest = staging / "latest_checkpointed_iteration.txt"
+        if not latest.is_file() or latest.read_text(encoding="utf-8").strip() != "1":
+            raise RuntimeError("cold checkpoint staging tree does not select iteration 1")
+        staged_sha256 = _checkpoint_tree_sha256(staging, iteration=1)
+        if staged_sha256 != checkpoint_sha256:
+            raise RuntimeError("cold checkpoint staging hash mismatch")
+        os.replace(staging, destination)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    payload: dict[str, object] = {
+        "schema": "cppmega_h200_cold_checkpoint_v1",
+        "status": "verified",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "source": str(source),
+        "destination": str(destination),
+        "checkpoint_sha256": checkpoint_sha256,
+        "binding": binding,
+    }
+    _write_json_atomic(receipt_path, payload)
+    return payload
+
+
+def _bundle_identity(
+    bundle_root: Path, data_prefix: Path, *, hash_jobs: int
+) -> tuple[dict[str, object], dict[str, str]]:
+    root = bundle_root.resolve()
+    manifest, _records = _validate_bundle(root, hash_jobs)
+    selected = data_prefix.resolve()
+    try:
+        selected.relative_to(root)
+    except ValueError as error:
+        raise RuntimeError("H200 data prefix escapes explicit bundle root") from error
+    prefix_hashes: dict[str, str] = {}
+    found = False
+    for result in manifest["bucket_results"]:
+        prefix = (root / str(result["prefix"])).resolve()
+        manifest_path = prefix.with_suffix(".json")
+        relative = manifest_path.relative_to(root).as_posix()
+        prefix_hashes[relative] = _sha256(manifest_path)
+        if prefix == selected:
+            found = True
+    if not found:
+        raise RuntimeError("H200 data prefix is not declared by bundle bucket_results")
+    return manifest, dict(sorted(prefix_hashes.items()))
+
+
+def _finalize_bound_receipt(
+    path: Path, *, expected_pending: dict[str, object], final: dict[str, object]
+) -> dict[str, object]:
+    if not path.is_file():
+        raise RuntimeError(f"required receipt was not written: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    validate_receipt_binding(
+        payload.get("binding"),
+        expected=expected_pending,
+        where=path.name,
+    )
+    payload["binding"] = final
+    _write_json_atomic(path, payload)
+    return payload
+
+
 def _run_phase(
     *,
     name: str,
@@ -357,12 +591,30 @@ def _run_phase(
     environment: dict[str, str],
     log_path: Path,
     batch_receipt: Path,
+    graph_prior_receipt: Path,
+    checkpoint_state_receipt: Path,
     expected_iteration: int,
+    expected_loaded_iteration: int | None,
     checkpoint_root: Path,
+    receipt_binding: dict[str, object],
 ) -> dict[str, object]:
-    batch_receipt.unlink(missing_ok=True)
+    for path in (batch_receipt, graph_prior_receipt, checkpoint_state_receipt):
+        path.unlink(missing_ok=True)
     phase_environment = dict(environment)
     phase_environment["CPPMEGA_H200_BATCH_RECEIPT"] = str(batch_receipt)
+    phase_environment["CPPMEGA_H200_GRAPH_PRIOR_RECEIPT"] = str(
+        graph_prior_receipt
+    )
+    phase_environment["CPPMEGA_H200_CHECKPOINT_STATE_RECEIPT"] = str(
+        checkpoint_state_receipt
+    )
+    phase_environment["CPPMEGA_H200_EXPECTED_LOAD_ITERATION"] = "1"
+    phase_environment["CPPMEGA_H200_CHECKPOINT_PROOF_MODE"] = (
+        "restore" if expected_loaded_iteration is not None else "save"
+    )
+    phase_environment["CPPMEGA_H200_RECEIPT_BINDING"] = json.dumps(
+        receipt_binding, sort_keys=True
+    )
     with log_path.open("w", encoding="utf-8") as log:
         result = subprocess.run(
             command,
@@ -380,6 +632,13 @@ def _run_phase(
     iteration_evidence = _iteration_evidence(
         text, expected_iteration=expected_iteration
     )
+    load_evidence = (
+        _checkpoint_load_evidence(
+            text, expected_iteration=expected_loaded_iteration
+        )
+        if expected_loaded_iteration is not None
+        else None
+    )
     latest = checkpoint_root / "latest_checkpointed_iteration.txt"
     if not latest.is_file() or latest.read_text(encoding="utf-8").strip() != str(
         expected_iteration
@@ -390,8 +649,75 @@ def _run_phase(
     if not batch_receipt.is_file():
         raise RuntimeError(f"H200 preflight {name} did not record a production batch")
     batch = json.loads(batch_receipt.read_text(encoding="utf-8"))
-    if batch.get("status") != "verified":
+    active_graph = batch.get("active_graph")
+    source_provenance = batch.get("source_provenance")
+    if (
+        batch.get("status") != "verified"
+        or not isinstance(active_graph, dict)
+        or int(active_graph.get("route_edge_count", 0)) <= 0
+        or not isinstance(source_provenance, dict)
+        or int(source_provenance.get("minimum_source_doc_id", 0)) <= 0
+    ):
         raise RuntimeError(f"H200 preflight {name} production batch is not verified")
+    if not graph_prior_receipt.is_file():
+        raise RuntimeError(
+            f"H200 preflight {name} did not record graph-prior consumption"
+        )
+    graph_prior = json.loads(graph_prior_receipt.read_text(encoding="utf-8"))
+    prior_summary = graph_prior.get("prior")
+    if (
+        graph_prior.get("status") != "verified"
+        or graph_prior.get("consumer") not in {"dense_attention", "dsa_indexer"}
+        or not isinstance(prior_summary, dict)
+        or int(prior_summary.get("nonzero", 0)) <= 0
+    ):
+        raise RuntimeError(f"H200 preflight {name} graph prior is not verified")
+    if not checkpoint_state_receipt.is_file():
+        raise RuntimeError(
+            f"H200 preflight {name} did not record checkpoint runtime state"
+        )
+    checkpoint_state = json.loads(
+        checkpoint_state_receipt.read_text(encoding="utf-8")
+    )
+    expected_mode = "load" if expected_loaded_iteration is not None else "save"
+    if (
+        checkpoint_state.get("status") != "verified"
+        or checkpoint_state.get("mode") != expected_mode
+        or checkpoint_state.get("iteration") != 1
+    ):
+        raise RuntimeError(
+            f"H200 preflight {name} checkpoint state receipt is invalid"
+        )
+    checkpoint_sha256 = _checkpoint_tree_sha256(checkpoint_root, iteration=1)
+    final_binding = dict(receipt_binding)
+    final_binding["checkpoint_sha256"] = checkpoint_sha256
+    if receipt_binding["checkpoint_sha256"] == PENDING_CHECKPOINT_SHA256:
+        batch = _finalize_bound_receipt(
+            batch_receipt,
+            expected_pending=receipt_binding,
+            final=final_binding,
+        )
+        graph_prior = _finalize_bound_receipt(
+            graph_prior_receipt,
+            expected_pending=receipt_binding,
+            final=final_binding,
+        )
+        checkpoint_state = _finalize_bound_receipt(
+            checkpoint_state_receipt,
+            expected_pending=receipt_binding,
+            final=final_binding,
+        )
+    else:
+        for path, payload in (
+            (batch_receipt, batch),
+            (graph_prior_receipt, graph_prior),
+            (checkpoint_state_receipt, checkpoint_state),
+        ):
+            validate_receipt_binding(
+                payload.get("binding"),
+                expected=final_binding,
+                where=path.name,
+            )
     peak = re.findall(
         r"CPPMEGA_CUDA_PEAK allocated_gib=([0-9.]+) reserved_gib=([0-9.]+)", text
     )
@@ -403,8 +729,18 @@ def _run_phase(
         "command_shell": shlex.join(command),
         "log": str(log_path),
         "batch_receipt": str(batch_receipt),
+        "graph_prior_receipt": str(graph_prior_receipt),
+        "checkpoint_state_receipt": str(checkpoint_state_receipt),
+        "binding": final_binding,
+        "checkpoint_sha256": checkpoint_sha256,
         "completed_iteration": expected_iteration,
         "iteration_evidence": iteration_evidence,
+        "checkpoint_load_evidence": load_evidence,
+        "forward_backward_numerical": {
+            "status": "passed",
+            "finite_lm_loss": iteration_evidence["lm_loss"],
+            "finite_grad_norm": iteration_evidence["grad_norm"],
+        },
         "cuda_peak_allocated_gib": float(peak[-1][0]),
         "cuda_peak_reserved_gib": float(peak[-1][1]),
     }
@@ -412,8 +748,10 @@ def _run_phase(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bundle-root", type=Path, required=True)
     parser.add_argument("--data-prefix", type=Path, required=True)
     parser.add_argument("--tokenizer-model", type=Path, required=True)
+    parser.add_argument("--run-id", required=True)
     parser.add_argument("--sequence-length", type=int, required=True)
     parser.add_argument("--micro-batch-size", type=int, default=1)
     parser.add_argument("--fp8-recipe", choices=("off", "tensorwise"), default="off")
@@ -422,39 +760,84 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("/data/cppmega_h200_preflight_checkpoint"),
     )
+    parser.add_argument("--cold-checkpoint-root", type=Path)
+    parser.add_argument("--hash-jobs", type=int, default=4)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
 
 def main(argv: Iterable[str] | None = None) -> int:
-    args = build_arg_parser().parse_args(list(argv) if argv is not None else None)
-    if args.sequence_length <= 0 or args.micro_batch_size <= 0:
-        raise ValueError("sequence length and micro batch size must be positive")
-    prefix_manifest, _referenced = _validate_prefix_manifest_contract(args.data_prefix)
-    _validate_tokenizer_directory(args.tokenizer_model)
+    raw_argv = list(argv) if argv is not None else list(sys.argv[1:])
+    args = build_arg_parser().parse_args(raw_argv)
+    if args.sequence_length <= 0 or args.micro_batch_size <= 0 or args.hash_jobs <= 0:
+        raise ValueError("sequence length, micro batch size, and hash jobs must be positive")
+
+    bundle_root = args.bundle_root.resolve()
+    data_prefix = args.data_prefix.resolve()
+    tokenizer_model = args.tokenizer_model.resolve()
+    manifest, prefix_manifest_hashes = _bundle_identity(
+        bundle_root, data_prefix, hash_jobs=args.hash_jobs
+    )
+    tokenizer_descriptor = manifest["tokenizer"]
+    expected_tokenizer = (bundle_root / str(tokenizer_descriptor["path"])).resolve()
+    if tokenizer_model != expected_tokenizer:
+        raise RuntimeError(
+            "H200 tokenizer must be the descriptor-bound tokenizer inside bundle root"
+        )
+    _validate_tokenizer_directory(tokenizer_model)
+    prefix_manifest, _referenced = _validate_prefix_manifest_contract(data_prefix)
     environment = _profile_environment(
         sequence_length=args.sequence_length,
         micro_batch_size=args.micro_batch_size,
         fp8_recipe=args.fp8_recipe,
     )
+    backend_claims = _claimed_backend_modules(environment)
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
         raise RuntimeError(f"refusing stale H200 preflight receipt: {output}")
-    if args.checkpoint_root.exists():
+    checkpoint_root = args.checkpoint_root.resolve()
+    cold_checkpoint_root = (
+        args.cold_checkpoint_root.resolve()
+        if args.cold_checkpoint_root is not None
+        else checkpoint_root.with_name(f"{checkpoint_root.name}-cold")
+    )
+    if checkpoint_root.exists():
         raise RuntimeError(
-            f"refusing stale H200 preflight checkpoint root: {args.checkpoint_root}"
+            f"refusing stale H200 preflight checkpoint root: {checkpoint_root}"
         )
+    if cold_checkpoint_root.exists():
+        raise RuntimeError(
+            f"refusing stale H200 cold checkpoint root: {cold_checkpoint_root}"
+        )
+
+    config = {
+        "schema": "cppmega_h200_megatron_preflight_config_v1",
+        "profile": "h200_cpp_world_mini",
+        "bundle_root": str(bundle_root),
+        "data_prefix": data_prefix.relative_to(bundle_root).as_posix(),
+        "tokenizer": tokenizer_model.relative_to(bundle_root).as_posix(),
+        "sequence_length": args.sequence_length,
+        "micro_batch_size": args.micro_batch_size,
+        "fp8_recipe": args.fp8_recipe,
+        "checkpoint_root": str(checkpoint_root),
+        "cold_checkpoint_root": str(cold_checkpoint_root),
+    }
+    identity = {
+        "bundle_id": str(manifest["bundle_id"]),
+        "artifact_set_sha256": str(manifest["artifact_set_sha256"]),
+        "prefix_manifest_sha256s": prefix_manifest_hashes,
+    }
 
     with tempfile.TemporaryDirectory(prefix="cppmega-h200-preflight-") as raw_workdir:
         workdir = Path(raw_workdir)
         wrapper = _write_wrappers(workdir)
         save_command = build_megatron_command(
             wrapper=wrapper,
-            data_prefix=args.data_prefix,
-            tokenizer_model=args.tokenizer_model,
-            checkpoint_root=args.checkpoint_root,
+            data_prefix=data_prefix,
+            tokenizer_model=tokenizer_model,
+            checkpoint_root=checkpoint_root,
             sequence_length=args.sequence_length,
             micro_batch_size=args.micro_batch_size,
             train_iters=1,
@@ -463,35 +846,71 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
         restore_command = build_megatron_command(
             wrapper=wrapper,
-            data_prefix=args.data_prefix,
-            tokenizer_model=args.tokenizer_model,
-            checkpoint_root=args.checkpoint_root,
+            data_prefix=data_prefix,
+            tokenizer_model=tokenizer_model,
+            checkpoint_root=cold_checkpoint_root,
             sequence_length=args.sequence_length,
             micro_batch_size=args.micro_batch_size,
             train_iters=2,
             environment=environment,
             load_checkpoint=True,
         )
+        invocation_command = [str(Path(__file__).resolve()), *raw_argv]
+        save_binding = build_receipt_binding(
+            **identity,
+            checkpoint_sha256=PENDING_CHECKPOINT_SHA256,
+            config=config,
+            command=save_command,
+            run_id=args.run_id,
+        )
+        restore_pending_binding = build_receipt_binding(
+            **identity,
+            checkpoint_sha256=PENDING_CHECKPOINT_SHA256,
+            config=config,
+            command=restore_command,
+            run_id=args.run_id,
+        )
+        top_pending_binding = build_receipt_binding(
+            **identity,
+            checkpoint_sha256=PENDING_CHECKPOINT_SHA256,
+            config=config,
+            command=invocation_command,
+            run_id=args.run_id,
+        )
         base_receipt: dict[str, object] = {
             "schema": "cppmega_h200_megatron_preflight_v1",
             "status": "dry_run" if args.dry_run else "running",
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "run_id": args.run_id,
+            "bundle": {"root": str(bundle_root), **identity},
+            "binding": top_pending_binding,
+            "phase_binding_templates": {
+                "save": save_binding,
+                "restore": restore_pending_binding,
+            },
+            "config": config,
             "data": {
-                "prefix": str(args.data_prefix.resolve()),
+                "prefix": str(data_prefix),
                 "manifest": prefix_manifest,
                 "sequence_length": args.sequence_length,
                 "micro_batch_size": args.micro_batch_size,
             },
             "checkpoint": {
-                "root": str(args.checkpoint_root),
+                "root": str(checkpoint_root),
+                "cold_root": str(cold_checkpoint_root),
                 "save_iteration": 1,
                 "restored_from_iteration": 1,
                 "post_restore_iteration": 2,
                 "full_optimizer_and_rng_state": True,
             },
             "commands": {
+                "invocation": invocation_command,
                 "save": save_command,
                 "restore": restore_command,
+            },
+            "backend_dispatch": {
+                "status": "required" if backend_claims else "not_claimed",
+                "claimed_backends": list(backend_claims),
             },
         }
         if args.dry_run:
@@ -499,25 +918,76 @@ def main(argv: Iterable[str] | None = None) -> int:
             print(json.dumps(base_receipt, indent=2, sort_keys=True))
             return 0
 
-        stack = _stack_report()
+        stack = _stack_report(environment)
         try:
+            save_state_receipt = output.parent / "h200_preflight_save_state.json"
             save = _run_phase(
                 name="save",
                 command=save_command,
                 environment=environment,
                 log_path=output.parent / "h200_preflight_save.log",
                 batch_receipt=output.parent / "h200_preflight_save_batch.json",
+                graph_prior_receipt=output.parent
+                / "h200_preflight_save_graph_prior.json",
+                checkpoint_state_receipt=save_state_receipt,
                 expected_iteration=1,
-                checkpoint_root=args.checkpoint_root,
+                expected_loaded_iteration=None,
+                checkpoint_root=checkpoint_root,
+                receipt_binding=save_binding,
             )
+            checkpoint_sha256 = str(save["checkpoint_sha256"])
+            cold_command = [
+                "cppmega-stage-cold-checkpoint",
+                str(checkpoint_root),
+                str(cold_checkpoint_root),
+            ]
+            cold_binding = build_receipt_binding(
+                **identity,
+                checkpoint_sha256=checkpoint_sha256,
+                config=config,
+                command=cold_command,
+                run_id=args.run_id,
+            )
+            cold = _stage_cold_checkpoint(
+                source=checkpoint_root,
+                destination=cold_checkpoint_root,
+                receipt_path=output.parent / "h200_preflight_cold_checkpoint.json",
+                receipt_binding=cold_binding,
+            )
+            restore_binding = build_receipt_binding(
+                **identity,
+                checkpoint_sha256=checkpoint_sha256,
+                config=config,
+                command=restore_command,
+                run_id=args.run_id,
+            )
+            restore_state_receipt = output.parent / "h200_preflight_restore_state.json"
             restore = _run_phase(
                 name="restore",
                 command=restore_command,
                 environment=environment,
                 log_path=output.parent / "h200_preflight_restore.log",
                 batch_receipt=output.parent / "h200_preflight_restore_batch.json",
+                graph_prior_receipt=output.parent
+                / "h200_preflight_restore_graph_prior.json",
+                checkpoint_state_receipt=restore_state_receipt,
                 expected_iteration=2,
-                checkpoint_root=args.checkpoint_root,
+                expected_loaded_iteration=1,
+                checkpoint_root=cold_checkpoint_root,
+                receipt_binding=restore_binding,
+            )
+            if restore["checkpoint_sha256"] != checkpoint_sha256:
+                raise RuntimeError("cold-restored iteration-1 checkpoint hash drifted")
+            restore_proof = _validate_checkpoint_state_restore(
+                json.loads(save_state_receipt.read_text(encoding="utf-8")),
+                json.loads(restore_state_receipt.read_text(encoding="utf-8")),
+            )
+            top_binding = build_receipt_binding(
+                **identity,
+                checkpoint_sha256=checkpoint_sha256,
+                config=config,
+                command=invocation_command,
+                run_id=args.run_id,
             )
         except Exception as error:
             _write_json_atomic(
@@ -535,7 +1005,17 @@ def main(argv: Iterable[str] | None = None) -> int:
             "status": "passed",
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "stack": stack,
-            "phases": {"save": save, "restore": restore},
+            "binding": top_binding,
+            "checkpoint": {
+                **base_receipt["checkpoint"],
+                "sha256": checkpoint_sha256,
+                "restore_proof": restore_proof,
+            },
+            "commands": {
+                **base_receipt["commands"],
+                "cold_checkpoint": cold_command,
+            },
+            "phases": {"save": save, "cold_restore": cold, "restore": restore},
         }
         _write_json_atomic(output, receipt)
         print(json.dumps(receipt, indent=2, sort_keys=True))

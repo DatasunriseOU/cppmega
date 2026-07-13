@@ -1,3 +1,4 @@
+import json
 import os
 
 import pytest
@@ -64,6 +65,28 @@ def test_dense_graph_attention_bias_is_broadcastable_post_scale_bias():
     assert bias[0, 0, 2, 1].item() == 1.5
     assert bias[0, 0, 3, 0].item() == 2.0
     assert bias.sum().item() == 5.5
+
+
+def test_dense_attention_consumer_records_nonzero_graph_prior(tmp_path, monkeypatch):
+    receipt_path = tmp_path / "dense-prior.json"
+    monkeypatch.setenv("CPPMEGA_H200_GRAPH_PRIOR_RECEIPT", str(receipt_path))
+    structure_batch = {
+        "graph_domain_edges": torch.tensor([[[1, 3, 5]]], dtype=torch.long),
+        "graph_domain_edge_counts": torch.tensor([1], dtype=torch.long),
+    }
+
+    bias = build_dense_graph_attention_bias_from_structure_batch(
+        structure_batch,
+        batch_size=1,
+        seqlen_q=4,
+        seqlen_k=4,
+        device=torch.device("cpu"),
+    )
+
+    assert bias[0, 0, 1, 3].item() == 1.0
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["consumer"] == "dense_attention"
+    assert receipt["prior"]["nonzero"] == 1
 
 
 def test_attention_layer_route_kind_only_biases_dense_attention():

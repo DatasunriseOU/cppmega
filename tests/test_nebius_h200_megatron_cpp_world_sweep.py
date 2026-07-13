@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -27,19 +28,28 @@ _DTYPE_SIZES = {"uint8": 1, "uint16": 2, "uint32": 4, "int32": 4}
 
 
 def _write_valid_sidecar_prefix(prefix):
-    token_count = 3
-    document_count = 1
-    prefix.with_suffix(".bin").write_bytes(b"\x01\x00\x02\x00\x03\x00")
+    tokens_per_document = 3
+    document_count = 6
+    token_count = tokens_per_document * document_count
+    prefix.with_suffix(".bin").write_bytes(
+        struct.pack(f"<{token_count}H", *range(1, token_count + 1))
+    )
     prefix.with_suffix(".idx").write_bytes(
         b"MMIDIDX\x00\x00"
         + struct.pack("<QBQQ", 1, 8, document_count, document_count + 1)
-        + struct.pack("<i", token_count)
-        + struct.pack("<q", 0)
-        + struct.pack("<2q", 0, document_count)
+        + struct.pack(f"<{document_count}i", *([tokens_per_document] * document_count))
+        + struct.pack(
+            f"<{document_count}q",
+            *(index * tokens_per_document * 2 for index in range(document_count)),
+        )
+        + struct.pack(f"<{document_count + 1}q", *range(document_count + 1))
     )
 
     side_channel_paths = {}
-    for name in sorted(REQUIRED_TOKEN_SIDECARS):
+    required_token_sidecars = set(REQUIRED_TOKEN_SIDECARS) | {
+        "token_source_doc_ids"
+    }
+    for name in sorted(required_token_sidecars):
         dtype = "uint8" if name in {
             "loss_mask",
             "token_confidence_ids",
@@ -54,12 +64,24 @@ def _write_valid_sidecar_prefix(prefix):
             "token_symbol_ids",
             "token_call_targets",
             "token_type_refs",
+            "token_source_doc_ids",
         }:
             dtype = "uint32"
         relative = f"{prefix.name}_{name}.bin"
         payload = bytearray(token_count * _DTYPE_SIZES[dtype])
         if name == "token_structure_ids":
             payload[0] = 1
+        if name == "loss_mask":
+            payload[:] = b"\x01" * token_count
+        if name == "token_source_doc_ids":
+            payload[:] = struct.pack(
+                f"<{token_count}I",
+                *(
+                    document + 1
+                    for document in range(document_count)
+                    for _token in range(tokens_per_document)
+                ),
+            )
         (prefix.parent / relative).write_bytes(payload)
         side_channel_paths[name] = {"path": relative, "dtype": dtype}
 
@@ -73,15 +95,27 @@ def _write_valid_sidecar_prefix(prefix):
             kind = "ragged_1d"
             dtype = "uint32" if name in {"token_chunk_starts", "token_chunk_ends"} else "uint16"
             shape_tail = [1]
-        item_count = 1 if name in NONZERO_GRAPH_SIDECARS else 0
+        item_count = (
+            1
+            if name in NONZERO_GRAPH_SIDECARS or name == "token_domain_edges"
+            else 0
+        )
         offsets_relative = f"{prefix.name}_{name}_offsets.bin"
         data_relative = f"{prefix.name}_{name}_data.bin"
         (prefix.parent / offsets_relative).write_bytes(
-            struct.pack("<2q", 0, item_count)
+            struct.pack(
+                f"<{document_count + 1}q",
+                0,
+                *([item_count] * document_count),
+            )
         )
         payload = bytearray(item_count * shape_tail[0] * _DTYPE_SIZES[dtype])
-        if payload and name in {"token_chunk_ends", "token_chunk_kinds"}:
-            payload[0] = 1
+        if name == "token_domain_edges":
+            payload[:] = struct.pack("<3i", 0, 1, 5)
+        elif name == "token_chunk_ends":
+            payload[:] = struct.pack("<I", tokens_per_document)
+        elif name == "token_chunk_kinds":
+            payload[:] = struct.pack("<H", 1)
         (prefix.parent / data_relative).write_bytes(payload)
         graph_sidecar_paths[name] = {
             "kind": kind,
@@ -98,16 +132,77 @@ def _write_valid_sidecar_prefix(prefix):
         "sequence_doc_offsets_path": f"{prefix.name}_source_platform_sequence_doc_offsets.bin",
         "doc_platform_offsets_path": f"{prefix.name}_source_platform_doc_id_offsets.bin",
         "platform_ids_path": f"{prefix.name}_source_platform_ids.bin",
-        "source_document_count": 1,
-        "platform_id_count": 1,
+        "source_document_count": document_count,
+        "platform_id_count": document_count,
     }
     (prefix.parent / source_platform["sequence_doc_offsets_path"]).write_bytes(
-        struct.pack("<2q", 0, 1)
+        struct.pack(f"<{document_count + 1}q", *range(document_count + 1))
     )
     (prefix.parent / source_platform["doc_platform_offsets_path"]).write_bytes(
-        struct.pack("<2q", 0, 1)
+        struct.pack(f"<{document_count + 1}q", *range(document_count + 1))
     )
-    (prefix.parent / source_platform["platform_ids_path"]).write_bytes(b"\x01\x00")
+    (prefix.parent / source_platform["platform_ids_path"]).write_bytes(
+        struct.pack(f"<{document_count}H", *range(1, document_count + 1))
+    )
+    tasks = ("causal_lm", "fim", "ast_fim", "ifim", "commit_diff", "pre_to_post")
+    objective_payload = {
+        "schema": "cppmega_pre_materialized_objectives_v1",
+        "algorithm": "hamilton_eligibility_bipartite_v1",
+        "seed": 17,
+        "quota_window_samples": 6,
+        "task_order": list(tasks),
+        "configured_rates": {task: "1/6" for task in tasks},
+        "planned_samples": {task: 1 for task in tasks},
+        "realized": {
+            task: {
+                "samples": 1,
+                "input_tokens": 3,
+                "loss_tokens": 3 if task == "causal_lm" else 2,
+            }
+            for task in tasks
+        },
+        "totals": {"samples": 6, "input_tokens": 18, "loss_tokens": 13},
+        "typed_sources": {
+            "ifim_instruction": "ifim_instruction_token_ids",
+            "commit_message": "commit_msg_token_ids",
+            "diff": "diff_token_ids",
+            "pre": "pre_token_ids",
+            "post": "post_token_ids",
+            "missing_fields": "ineligible",
+            "rendered_text_parsing": False,
+        },
+        "graph_auxiliary": {
+            "relations": ["domain"],
+            "eligible_samples": 1,
+            "positive_edges": 1,
+            "global_weight": "1",
+            "bce_weight": "1/10",
+            "coverage_weight": "1/20",
+            "topk": 8,
+            "pos_weight": "1",
+            "margin": "1",
+            "included_in_total_loss": True,
+            "runtime": "megatron_dsa_indexer_v1",
+            "pair_mask": "causal_same_document_upstream_v1",
+            "chunk_edge_expansion": "cartesian_token_spans_v1",
+        },
+        "materialization": {
+            "format": "shifted_lm_document_v1",
+            "token_column": "input_ids",
+            "loss_mask_column": "loss_mask",
+            "length_column": "valid_token_count",
+            "objective_column": "objective_kind",
+            "document_id_column": "doc_ids",
+            "source_document_id_column": "token_source_doc_ids",
+        },
+    }
+    objective_sha256 = hashlib.sha256(
+        json.dumps(
+            objective_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("ascii")
+    ).hexdigest()
+    objective_ids = f"{prefix.name}_objective_ids.bin"
+    (prefix.parent / objective_ids).write_bytes(bytes(range(1, document_count + 1)))
     prefix.with_suffix(".json").write_text(
         json.dumps(
             {
@@ -120,6 +215,16 @@ def _write_valid_sidecar_prefix(prefix):
                 "side_channel_paths": side_channel_paths,
                 "graph_sidecar_paths": graph_sidecar_paths,
                 "source_platform_sidecar": source_platform,
+                "objective_contract": {
+                    "schema": "cppmega_pre_materialized_objectives_v1",
+                    "sha256": objective_sha256,
+                    "payload": objective_payload,
+                    "objective_id_sidecar": {
+                        "path": objective_ids,
+                        "dtype": "uint8",
+                        "document_aligned": True,
+                    },
+                },
             }
         )
     )
@@ -128,6 +233,68 @@ def _write_valid_sidecar_prefix(prefix):
 
 def _write_tokenizer_dir(path):
     shutil.copytree(Path(__file__).resolve().parents[1] / "data/tokenizer_v2", path)
+
+
+def _write_test_bundle(root, prefix, tokenizer):
+    prefix_manifest = json.loads(prefix.with_suffix(".json").read_text())
+    objective = prefix_manifest["objective_contract"]
+    provenance = root / "provenance"
+    provenance.mkdir()
+    objective_path = provenance / "objective_contract.json"
+    objective_path.write_text(json.dumps(objective["payload"]), encoding="utf-8")
+    paths = sorted(path for path in root.rglob("*") if path.is_file())
+    records = [
+        {
+            "path": path.relative_to(root).as_posix(),
+            "size": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for path in paths
+    ]
+    artifact_set_sha256 = hashlib.sha256(
+        json.dumps(records, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    tokenizer_prefix = tokenizer.relative_to(root).as_posix() + "/"
+    tokenizer_records = [
+        record for record in records if record["path"].startswith(tokenizer_prefix)
+    ]
+    tokenizer_sha256 = hashlib.sha256(
+        json.dumps(tokenizer_records, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    manifest = {
+        "schema": "cppmega_megatron_bundle_v1",
+        "bundle_id": f"test-bundle-{artifact_set_sha256[:16]}",
+        "tokenizer_contract": "megacpp-vocab-65536",
+        "vocab_size": 65536,
+        "training_contract": "objective_materialized",
+        "objective_materialization": {
+            "path": objective_path.relative_to(root).as_posix(),
+            "schema": "cppmega_pre_materialized_objectives_v1",
+            "sha256": objective["sha256"],
+            "file_sha256": hashlib.sha256(objective_path.read_bytes()).hexdigest(),
+        },
+        "buckets": [1024],
+        "tokenizer": {
+            "path": tokenizer.relative_to(root).as_posix(),
+            "contract": "megacpp-vocab-65536",
+            "vocab_size": 65536,
+            "files": tokenizer_records,
+            "artifact_set_sha256": tokenizer_sha256,
+        },
+        "bucket_results": [
+            {
+                "bucket": 1024,
+                "prefix": prefix.relative_to(root).as_posix(),
+                "manifest": prefix_manifest,
+            }
+        ],
+        "artifact_count": len(records),
+        "artifact_bytes": sum(record["size"] for record in records),
+        "artifact_set_sha256": artifact_set_sha256,
+        "artifacts": records,
+    }
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return manifest
 
 
 def test_first_public_ip_accepts_nebius_cidr_status_address():
@@ -554,16 +721,21 @@ def test_h200_preflight_real_local_dry_run_writes_bound_commands(tmp_path):
     tokenizer = tmp_path / "tok"
     _write_valid_sidecar_prefix(prefix)
     _write_tokenizer_dir(tokenizer)
+    bundle = _write_test_bundle(tmp_path, prefix, tokenizer)
     output = tmp_path / "h200-preflight.json"
     checkpoint = tmp_path / "checkpoint"
 
     assert (
         h200_preflight_main(
             [
+                "--bundle-root",
+                str(tmp_path),
                 "--data-prefix",
                 str(prefix),
                 "--tokenizer-model",
                 str(tokenizer),
+                "--run-id",
+                "local-dry-run",
                 "--sequence-length",
                 "1024",
                 "--checkpoint-root",
@@ -579,6 +751,8 @@ def test_h200_preflight_real_local_dry_run_writes_bound_commands(tmp_path):
     receipt = json.loads(output.read_text(encoding="utf-8"))
     assert receipt["schema"] == "cppmega_h200_megatron_preflight_v1"
     assert receipt["status"] == "dry_run"
+    assert receipt["bundle"]["bundle_id"] == bundle["bundle_id"]
+    assert receipt["binding"]["run_id"] == "local-dry-run"
     assert receipt["data"]["manifest"]["graph_sidecar_schema"] == "cppmega_graph_routes_v2"
     assert receipt["checkpoint"]["full_optimizer_and_rng_state"] is True
     assert receipt["commands"]["save"][receipt["commands"]["save"].index("--train-iters") + 1] == "1"

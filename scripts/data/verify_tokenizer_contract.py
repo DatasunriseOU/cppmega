@@ -3,7 +3,9 @@
 repo that hard-codes vocab/special-token constants. Fail-closed (RULE #1): any real
 mismatch raises with WHERE + WHAT and exits non-zero.
 
-Single source of truth: ``cppmega_mlx/tokenizer/tokenizer_contract_v1.json``.
+The contract, tokenizer, and frozen domain schema are explicit inputs. CI must
+pass paths from the checked-out workspace so a sibling checkout cannot make a
+stale contract look current.
 
 Checks
 ------
@@ -20,8 +22,10 @@ Checks
    consistent. The 65536/131072 split itself is intentional and NOT a failure.
 
 Usage:
-    python verify_tokenizer_contract.py            # autodetect sibling repos
-    python verify_tokenizer_contract.py --root /Volumes/external/sources
+    python verify_tokenizer_contract.py \
+      --contract data/tokenizer_v2/tokenizer_contract_v1.json \
+      --tokenizer data/tokenizer_v2/tokenizer.json \
+      --domain-schema data/domain_schema_v1.json
 """
 
 from __future__ import annotations
@@ -35,33 +39,6 @@ from pathlib import Path
 
 class ContractError(Exception):
     """Fail-closed contract violation (WHERE + WHAT)."""
-
-
-DOMAIN_DELIMITER_ROLE_PAIRS: tuple[str, ...] = (
-    "CPP_CODE",
-    "MAKE",
-    "CMAKE",
-    "NINJA",
-    "BAZEL",
-    "AUTOCONF",
-    "AUTOMAKE",
-    "MESON",
-    "GN",
-    "SCONS",
-    "XMAKE",
-    "COMPILE_COMMANDS",
-    "BASH",
-    "ZSH",
-    "SH",
-    "TCSH",
-    "COMPILER_DIAGNOSTIC",
-    "BUILD_DIAGNOSTIC",
-    "COMPILER_ERROR",
-    "BUILD_ERROR",
-    "LINKER_ERROR",
-    "TEST_OUTPUT",
-    "TOOL_OUTPUT",
-)
 
 
 def _read_json(p: Path) -> dict:
@@ -83,7 +60,61 @@ def _grep_int(path: Path, pattern: str) -> list[int]:
     return out
 
 
-def check_contract_vs_tokenizer(contract: dict, tok_json: Path) -> list[str]:
+def load_domain_delimiter_role_pairs(
+    domain_schema_path: Path,
+) -> tuple[tuple[str, str], ...]:
+    schema = _read_json(domain_schema_path)
+    if schema.get("schema") != "cppmega_domain_sidecars_v1":
+        raise ContractError(
+            f"WHERE={domain_schema_path} WHAT=unsupported domain schema "
+            f"{schema.get('schema')!r}"
+        )
+    roles = schema.get("delimiter_roles")
+    if not isinstance(roles, dict) or not roles:
+        raise ContractError(
+            f"WHERE={domain_schema_path} WHAT=delimiter_roles must be a nonempty object"
+        )
+    pairs: list[tuple[str, str]] = []
+    seen_ids: set[int] = set()
+    for domain, spec in roles.items():
+        if not isinstance(spec, dict):
+            raise ContractError(
+                f"WHERE={domain_schema_path} WHAT=delimiter role {domain} must be an object"
+            )
+        domain_id = spec.get("domain_id")
+        start = spec.get("start")
+        end = spec.get("end")
+        if (
+            not isinstance(domain_id, int)
+            or isinstance(domain_id, bool)
+            or domain_id <= 0
+            or domain_id in seen_ids
+        ):
+            raise ContractError(
+                f"WHERE={domain_schema_path} WHAT=invalid/duplicate domain_id "
+                f"{domain_id!r} for {domain}"
+            )
+        if (
+            not isinstance(start, str)
+            or not start.endswith("_START")
+            or not isinstance(end, str)
+            or not end.endswith("_END")
+            or start[: -len("_START")] != end[: -len("_END")]
+        ):
+            raise ContractError(
+                f"WHERE={domain_schema_path} WHAT=invalid delimiter pair for "
+                f"{domain}: {start!r}/{end!r}"
+            )
+        seen_ids.add(domain_id)
+        pairs.append((start, end))
+    return tuple(pairs)
+
+
+def check_contract_vs_tokenizer(
+    contract: dict,
+    tok_json: Path,
+    delimiter_pairs: tuple[tuple[str, str], ...] | None = None,
+) -> list[str]:
     notes: list[str] = []
     tk = _read_json(tok_json)
     vocab = tk.get("model", {}).get("vocab", {})
@@ -130,21 +161,47 @@ def check_contract_vs_tokenizer(contract: dict, tok_json: Path) -> list[str]:
                 f"expected '<RESERVED_{tid}>'"
             )
     notes.append(f"reserved roles bound to <RESERVED_N> slots: {roles} OK")
-    notes += check_domain_delimiter_roles(contract, id_to_tok)
+    notes += check_domain_delimiter_roles(
+        contract, id_to_tok, delimiter_pairs=delimiter_pairs
+    )
     return notes
 
 
-def check_domain_delimiter_roles(contract: dict, id_to_tok: dict[int, str]) -> list[str]:
+def check_domain_delimiter_roles(
+    contract: dict,
+    id_to_tok: dict[int, str],
+    *,
+    delimiter_pairs: tuple[tuple[str, str], ...] | None = None,
+) -> list[str]:
     assignments = contract.get("reserved_role_assignments")
     if not isinstance(assignments, dict):
         raise ContractError(
             "WHERE=contract WHAT=reserved_role_assignments must be an object"
         )
 
+    if delimiter_pairs is None:
+        starts = sorted(
+            role for role in assignments if role.endswith("_START")
+        )
+        delimiter_pairs = tuple(
+            (role, role[: -len("_START")] + "_END") for role in starts
+        )
+    expected_roles = {role for pair in delimiter_pairs for role in pair}
+    actual_roles = {
+        role
+        for role in assignments
+        if role.endswith("_START") or role.endswith("_END")
+    }
+    if actual_roles != expected_roles:
+        raise ContractError(
+            "WHERE=contract WHAT=domain delimiter roles disagree with canonical "
+            f"schema: missing={sorted(expected_roles - actual_roles)} "
+            f"extra={sorted(actual_roles - expected_roles)}"
+        )
+
     domain_ids: dict[int, str] = {}
-    for base in DOMAIN_DELIMITER_ROLE_PAIRS:
-        for edge in ("START", "END"):
-            role = f"{base}_{edge}"
+    for pair in delimiter_pairs:
+        for role in pair:
             if role not in assignments:
                 raise ContractError(
                     f"WHERE=contract WHAT=missing domain delimiter role {role}"
@@ -170,7 +227,7 @@ def check_domain_delimiter_roles(contract: dict, id_to_tok: dict[int, str]) -> l
 
     return [
         "domain delimiter roles: "
-        f"{len(DOMAIN_DELIMITER_ROLE_PAIRS)} START/END pairs in <RESERVED_N> slots OK"
+        f"{len(delimiter_pairs)} START/END pairs in <RESERVED_N> slots OK"
     ]
 
 
@@ -259,33 +316,32 @@ def check_nam56r_dual_track(contract: dict, mlx_root: Path) -> list[str]:
     return notes
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    here = Path(__file__).resolve()
-    default_root = here.parents[3]  # .../sources  (cppmega/scripts/data/<file>)
-    ap.add_argument("--root", default=str(default_root), help="dir holding sibling repos")
-    ap.add_argument("--contract", default="", help="path to tokenizer_contract_v1.json")
-    args = ap.parse_args()
+    ap.add_argument("--contract", type=Path, required=True)
+    ap.add_argument("--tokenizer", type=Path, required=True)
+    ap.add_argument("--domain-schema", type=Path, required=True)
+    ap.add_argument("--mlx-root", type=Path)
+    ap.add_argument("--nano-root", type=Path)
+    args = ap.parse_args(argv)
 
-    root = Path(args.root)
-    mlx_root = root / "cppmega.mlx"
-    nano_root = root / "nanochat"
-    contract_path = Path(args.contract) if args.contract else (
-        mlx_root / "cppmega_mlx" / "tokenizer" / "tokenizer_contract_v1.json"
-    )
-    tokenizer_paths = (
-        mlx_root / "cppmega_mlx" / "tokenizer" / "tokenizer.json",
-        root / "cppmega" / "data" / "tokenizer_v2" / "tokenizer.json",
-    )
+    contract_path = args.contract.resolve()
+    tokenizer_path = args.tokenizer.resolve()
+    domain_schema_path = args.domain_schema.resolve()
 
     contract = _read_json(contract_path)
+    delimiter_pairs = load_domain_delimiter_role_pairs(domain_schema_path)
     notes: list[str] = [f"contract: {contract_path} (v{contract['contract_version']})"]
     try:
-        for tok_json in tokenizer_paths:
-            notes += check_contract_vs_tokenizer(contract, tok_json)
-        notes += check_contract_vs_mlx_constants(contract, mlx_root)
-        notes += check_nanochat(contract, nano_root)
-        notes += check_nam56r_dual_track(contract, mlx_root)
+        notes += check_contract_vs_tokenizer(
+            contract, tokenizer_path, delimiter_pairs
+        )
+        if args.mlx_root is not None:
+            mlx_root = args.mlx_root.resolve()
+            notes += check_contract_vs_mlx_constants(contract, mlx_root)
+            notes += check_nam56r_dual_track(contract, mlx_root)
+        if args.nano_root is not None:
+            notes += check_nanochat(contract, args.nano_root.resolve())
     except ContractError as exc:
         print("TOKENIZER CONTRACT: FAIL")
         print(f"  {exc}")

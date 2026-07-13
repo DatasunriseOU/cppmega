@@ -21,8 +21,9 @@
 #   MEGACPP_DATASET_NAME default: clang_semantic_4k_v10
 #   MEGACPP_NANOCHAT_ROOT  (required for 'tokenize' stage)
 #   MEGACPP_DATASET_KIND default: static_code (use commits for commit shards)
-#   MEGACPP_TOKENIZER_CONTRACT default: ../cppmega.mlx/cppmega_mlx/tokenizer/tokenizer_contract_v1.json
-#   MEGACPP_TOKENIZER_JSON default: ../cppmega.mlx/cppmega_mlx/tokenizer/tokenizer.json
+#   MEGACPP_TOKENIZER_CONTRACT default: data/tokenizer_v2/tokenizer_contract_v1.json
+#   MEGACPP_TOKENIZER_JSON default: data/tokenizer_v2/tokenizer.json
+#   MEGACPP_DOMAIN_SCHEMA default: data/domain_schema_v1.json
 
 set -euo pipefail
 
@@ -34,8 +35,9 @@ DATA_ROOT="${MEGACPP_DATA_ROOT:-/home/dave/cppmega-root/data}"
 DATASET_NAME="${MEGACPP_DATASET_NAME:-clang_semantic_4k_v10}"
 DATASET_KIND="${MEGACPP_DATASET_KIND:-static_code}"
 DATASET_DIR="${DATA_ROOT}/parquet/${DATASET_NAME}"
-CONTRACT="${MEGACPP_TOKENIZER_CONTRACT:-${SOURCE_ROOT}/cppmega.mlx/cppmega_mlx/tokenizer/tokenizer_contract_v1.json}"
-TOKENIZER_JSON="${MEGACPP_TOKENIZER_JSON:-${SOURCE_ROOT}/cppmega.mlx/cppmega_mlx/tokenizer/tokenizer.json}"
+CONTRACT="${MEGACPP_TOKENIZER_CONTRACT:-${REPO_ROOT}/data/tokenizer_v2/tokenizer_contract_v1.json}"
+TOKENIZER_JSON="${MEGACPP_TOKENIZER_JSON:-${REPO_ROOT}/data/tokenizer_v2/tokenizer.json}"
+DOMAIN_SCHEMA="${MEGACPP_DOMAIN_SCHEMA:-${REPO_ROOT}/data/domain_schema_v1.json}"
 MANIFEST_OUT="${MEGACPP_MANIFEST_OUT:-${DATA_ROOT}/manifests/${DATASET_NAME}.json}"
 
 STAGE="${1:-all}"
@@ -48,8 +50,9 @@ run_tokenize() {
 }
 run_audit() {
     "$PY" "$HERE/verify_tokenizer_contract.py" \
-        --root "$SOURCE_ROOT" \
-        --contract "$CONTRACT"
+        --contract "$CONTRACT" \
+        --tokenizer "$TOKENIZER_JSON" \
+        --domain-schema "$DOMAIN_SCHEMA"
     "$PY" "$HERE/verify_provenance.py" \
         --dataset-dir "$DATASET_DIR" \
         --kind "$DATASET_KIND"

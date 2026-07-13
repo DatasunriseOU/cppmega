@@ -39,6 +39,75 @@ def test_builder_discards_intermediate_snapshot_by_default() -> None:
     assert parser.parse_args(["--keep-snapshot"]).keep_snapshot is True
 
 
+def test_builder_accepts_explicit_objective_materialization_contract() -> None:
+    args = build_arg_parser().parse_args(
+        ["--objective-contract", "/checked-out/objective_contract.json"]
+    )
+
+    assert args.objective_contract == Path(
+        "/checked-out/objective_contract.json"
+    )
+
+
+def test_every_bucket_conversion_receives_objective_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    objective_contract = tmp_path / "objective_contract.json"
+    objective_contract.write_text("{}", encoding="utf-8")
+
+    def fake_convert(**kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(builder, "convert_parquet_to_megatron", fake_convert)
+    monkeypatch.setattr(
+        builder,
+        "_verify_prefix",
+        lambda _prefix, _expected: {
+            "objective_contract": {
+                "sha256": "a" * 64,
+                "objective_id_sidecar": {
+                    "path": "objective_ids.bin",
+                    "dtype": "uint8",
+                    "document_aligned": True,
+                },
+            }
+        },
+    )
+
+    builder._build_bucket(
+        bucket=1024,
+        snapshot_root=tmp_path / "snapshot",
+        data_root=tmp_path / "data",
+        audit_receipt={
+            "by_kind_bucket": {
+                "code/1024": {
+                    "files": 1,
+                    "rows": 1,
+                    "capacity_tokens": 4,
+                    "valid_tokens": 3,
+                    "trained_tokens": 2,
+                    "bad_files": 0,
+                    "bad_rows": 0,
+                },
+                "commits/1024": {
+                    "files": 0,
+                    "rows": 0,
+                    "capacity_tokens": 0,
+                    "valid_tokens": 0,
+                    "trained_tokens": 0,
+                    "bad_files": 0,
+                    "bad_rows": 0,
+                },
+            }
+        },
+        objective_contract_path=objective_contract,
+    )
+
+    assert captured["objective_contract_path"] == str(objective_contract.resolve())
+    assert captured["token_column"] == "input_ids"
+
+
 def test_builder_stages_and_hashes_the_production_tokenizer(tmp_path: Path) -> None:
     source = Path(__file__).resolve().parents[1] / "data/tokenizer_v2"
     bundle = tmp_path / "bundle"
@@ -51,6 +120,7 @@ def test_builder_stages_and_hashes_the_production_tokenizer(tmp_path: Path) -> N
     assert {record["path"] for record in descriptor["files"]} == {
         "tokenizer/special_tokens_map.json",
         "tokenizer/tokenizer.json",
+        "tokenizer/tokenizer_contract_v1.json",
         "tokenizer/tokenizer_config.json",
     }
     for record in descriptor["files"]:

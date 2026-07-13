@@ -13,8 +13,19 @@ from pathlib import PurePosixPath
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 from typing import Iterable
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from cppmega.receipt_binding import (  # noqa: E402
+    build_receipt_binding,
+    validate_binding_shape,
+    validate_receipt_binding,
+)
 
 if __package__:
     from scripts.data.publish_megatron_bundle_to_nebius_s3 import (
@@ -96,6 +107,7 @@ def _acquire_archive(
     env: dict[str, str],
     expected_size: int,
     expected_sha256: str,
+    receipt_binding: dict[str, object] | None = None,
 ) -> dict[str, object]:
     download = archive.with_name(archive.name + ".download")
     receipt_path = _archive_receipt_path(archive)
@@ -105,6 +117,10 @@ def _acquire_archive(
         "size": expected_size,
         "sha256": expected_sha256,
     }
+    if receipt_binding is not None:
+        binding["binding"] = validate_binding_shape(
+            receipt_binding, where="archive download receipt"
+        )
 
     if archive.exists():
         if not _archive_matches(
@@ -113,8 +129,23 @@ def _acquire_archive(
             raise ValueError("existing archive does not match transport descriptor")
         if receipt_path.exists():
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-            if any(receipt.get(key) != value for key, value in binding.items()):
+            if any(
+                receipt.get(key) != value
+                for key, value in binding.items()
+                if key != "binding"
+            ):
                 raise ValueError("archive download receipt binding mismatch")
+            if receipt_binding is not None:
+                try:
+                    validate_receipt_binding(
+                        receipt.get("binding"),
+                        expected=receipt_binding,
+                        where="archive download receipt binding",
+                    )
+                except (RuntimeError, ValueError) as error:
+                    raise ValueError(
+                        f"archive download receipt binding mismatch: {error}"
+                    ) from error
         else:
             _write_json_atomic(
                 receipt_path,

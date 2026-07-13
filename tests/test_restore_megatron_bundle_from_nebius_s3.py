@@ -358,3 +358,46 @@ def test_archive_download_never_promotes_partial_payload(tmp_path, monkeypatch):
 
     assert not archive.exists()
     assert not archive.with_name(archive.name + ".receipt.json").exists()
+
+
+def test_archive_download_receipt_rejects_stale_case6_binding(tmp_path, monkeypatch):
+    payload = b"verified archive"
+    digest = hashlib.sha256(payload).hexdigest()
+    archive = tmp_path / ".bundle.tar.zst"
+    binding = {
+        "schema": "cppmega_case6_receipt_binding_v1",
+        "bundle_id": "bundle-1",
+        "artifact_set_sha256": "a" * 64,
+        "prefix_manifest_sha256s": {"data/train.json": "b" * 64},
+        "checkpoint_sha256": "c" * 64,
+        "config_sha256": "d" * 64,
+        "command_sha256": "e" * 64,
+        "run_id": "cold-restore-1",
+    }
+
+    def fake_download(_uri, destination, *, endpoint, env):
+        destination.write_bytes(payload)
+
+    monkeypatch.setattr(restore, "_aws_download", fake_download)
+    _acquire_archive(
+        uri="s3://bucket/bundle.tar.zst",
+        archive=archive,
+        endpoint="https://storage.example",
+        env={},
+        expected_size=len(payload),
+        expected_sha256=digest,
+        receipt_binding=binding,
+    )
+    stale = dict(binding)
+    stale["run_id"] = "cold-restore-2"
+
+    with pytest.raises(ValueError, match="receipt binding.*run_id"):
+        _acquire_archive(
+            uri="s3://bucket/bundle.tar.zst",
+            archive=archive,
+            endpoint="https://storage.example",
+            env={},
+            expected_size=len(payload),
+            expected_sha256=digest,
+            receipt_binding=stale,
+        )

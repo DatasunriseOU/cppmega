@@ -126,7 +126,17 @@ def build_dense_graph_attention_bias_from_structure_batch(
     )
     if beta != 1.0:
         graph = graph * float(beta)
-    return graph.unsqueeze(1).contiguous()
+    bias = graph.unsqueeze(1).contiguous()
+    receipt_path = os.environ.get("CPPMEGA_H200_GRAPH_PRIOR_RECEIPT")
+    if receipt_path:
+        from cppmega.megatron.h200_preflight import observe_graph_prior
+
+        observe_graph_prior(
+            prior=bias,
+            consumer="dense_attention",
+            receipt_path=receipt_path,
+        )
+    return bias
 
 
 def attention_layer_route_kind(layer: Any) -> str:
