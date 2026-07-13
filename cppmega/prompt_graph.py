@@ -18,10 +18,11 @@ import tempfile
 from typing import Any
 
 
-INDEX_SCHEMA = "cppmega_prompt_graph_index_v1"
-ARTIFACT_SCHEMA = "cppmega_prompt_graph_artifact_v1"
-WINDOW_SCHEMA = "cppmega_prompt_graph_window_v1"
-BUILDER_VERSION = "1"
+INDEX_SCHEMA = "cppmega_prompt_graph_index_v2"
+LEGACY_INDEX_SCHEMA = "cppmega_prompt_graph_index_v1"
+ARTIFACT_SCHEMA = "cppmega_prompt_graph_artifact_v2"
+WINDOW_SCHEMA = "cppmega_prompt_graph_window_v2"
+BUILDER_VERSION = "2"
 
 TOKEN_SIDECAR_NAMES = (
     "structure_ids",
@@ -45,6 +46,14 @@ TOKEN_SIDECAR_DEFAULTS = {
     "domain_ids": 1,
     "confidence_ids": 4,
 }
+GENERATED_TOKEN_SIDECAR_DEFAULTS = {
+    **TOKEN_SIDECAR_DEFAULTS,
+    "confidence_ids": 1,
+    "source_doc_ids": 0,
+}
+GENERATED_TOKEN_POLICY = (
+    "generated_continuation_chunk_with_repository_summary_v1"
+)
 CPP_SPACE_SENTINEL = "<SPACE>"
 CPP_NEWLINE_SENTINEL = "<NL>"
 
@@ -62,15 +71,36 @@ TRIPLE_ROUTE_KEYS = {
         "graph_cross_domain_edge_counts",
     ),
 }
-DEFAULT_TRIPLE_KIND = {
-    "domain": 0,
-    "build": 20,
-    "shell": 40,
-    "diagnostic": 60,
-    "cross_domain": 90,
+ROUTE_KIND_FAMILIES = {
+    "domain": frozenset(range(1, 14)),
+    "build": frozenset(range(20, 27)),
+    "shell": frozenset(range(40, 45)),
+    "diagnostic": frozenset({60, 61, 62, 63, 64, 70, 71, 80, 90}),
+    "cross_domain": frozenset({100}),
 }
+GENERATED_QUERY_ROUTE_KEY = "graph_generated_query_edges"
+GENERATED_QUERY_COUNT_KEY = "graph_generated_query_edge_counts"
 RELATION_NAMES = tuple(
     sorted((*PAIR_ROUTE_KEYS, "def_use", *TRIPLE_ROUTE_KEYS))
+)
+
+_REPOSITORY_SOURCE_SUFFIXES = frozenset(
+    {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
+)
+_REPOSITORY_INPUT_NAMES = frozenset(
+    {
+        "compile_commands.json",
+        "CMakeLists.txt",
+        "Makefile",
+        "meson.build",
+        "BUILD",
+        "BUILD.bazel",
+        "WORKSPACE",
+        "WORKSPACE.bazel",
+    }
+)
+_REPOSITORY_SKIP_DIRS = frozenset(
+    {".git", ".hg", ".svn", ".venv", "node_modules", "__pycache__"}
 )
 
 
@@ -97,12 +127,65 @@ def _sha_file(path: Path) -> str:
     return sha256(path.read_bytes()).hexdigest()
 
 
+def repository_snapshot(project_root: str | Path) -> tuple[str, dict[str, str]]:
+    """Hash deterministic source/build inputs used by the prompt index producer."""
+    root = Path(project_root).resolve()
+    if not root.is_dir():
+        raise NotADirectoryError(f"prompt graph repository not found: {root}")
+    manifest: dict[str, str] = {}
+    for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root)
+        if any(part in _REPOSITORY_SKIP_DIRS for part in relative.parts):
+            continue
+        if (
+            path.suffix.lower() not in _REPOSITORY_SOURCE_SUFFIXES
+            and path.name not in _REPOSITORY_INPUT_NAMES
+        ):
+            continue
+        manifest[relative.as_posix()] = sha256(path.read_bytes()).hexdigest()
+    if not any(
+        Path(path).suffix.lower() in _REPOSITORY_SOURCE_SUFFIXES
+        for path in manifest
+    ):
+        raise ValueError(f"prompt graph repository has no C/C++ sources: {root}")
+    return _sha_json(manifest), manifest
+
+
 def _is_sha256(value: Any) -> bool:
     return (
         isinstance(value, str)
         and len(value) == 64
         and all(char in "0123456789abcdef" for char in value)
     )
+
+
+def _validate_relative_source_path(value: str, *, where: str) -> str:
+    relative = Path(value)
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        raise ValueError(f"{where} must be a contained relative path, got {value!r}")
+    return relative.as_posix()
+
+
+def _route_kind_family(kind: int) -> str | None:
+    for family, kinds in ROUTE_KIND_FAMILIES.items():
+        if kind in kinds:
+            return family
+    return None
+
+
+def _validate_route_kind(relation: str, kind: int | None, *, where: str) -> int:
+    if kind is None:
+        raise ValueError(f"{where}: {relation} requires an explicit kind")
+    actual = _route_kind_family(kind)
+    if actual is None:
+        raise ValueError(f"{where}: unknown domain edge kind {kind}")
+    if actual != relation:
+        raise ValueError(
+            f"{where}: edge kind {kind} belongs to {actual}, not {relation}"
+        )
+    return kind
 
 
 def normalize_cpp_whitespace_with_offsets(
@@ -322,33 +405,90 @@ def _validate_span(start: int, end: int, upper: int, *, where: str) -> None:
 
 
 @dataclass(frozen=True)
+class PromptGraphDocument:
+    id: int
+    source_path: str
+    source: str
+
+    @classmethod
+    def from_dict(cls, row: Mapping[str, Any]) -> "PromptGraphDocument":
+        source = row.get("source")
+        if not isinstance(source, str):
+            raise TypeError("document.source must be a string")
+        return cls(
+            id=_require_int(row.get("id"), where="document.id"),
+            source_path=_validate_relative_source_path(
+                _require_str(row.get("source_path"), where="document.source_path"),
+                where="document.source_path",
+            ),
+            source=source,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "source_path": self.source_path,
+            "source": self.source,
+        }
+
+
+@dataclass(frozen=True)
 class PromptGraphSymbol:
     id: int
     identity: str
     kind: str
+    document_id: int
+    source_path: str
     start: int
     end: int
+    semantic_identity: str
+    symbol_key: str = ""
+    usr: str = ""
+    canonical_signature: str = ""
+    qname: str = ""
+    chunk_identity: str = ""
 
     @classmethod
     def from_dict(cls, row: Mapping[str, Any]) -> "PromptGraphSymbol":
+        identity = _require_str(row.get("identity"), where="symbol.identity")
         return cls(
             id=_require_int(row.get("id"), where="symbol.id"),
-            identity=_require_str(
-                row.get("identity"),
-                where="symbol.identity",
-            ),
+            identity=identity,
             kind=str(row.get("kind") or "symbol"),
+            document_id=_require_int(
+                row.get("document_id"), where="symbol.document_id"
+            ),
+            source_path=_validate_relative_source_path(
+                _require_str(row.get("source_path"), where="symbol.source_path"),
+                where="symbol.source_path",
+            ),
             start=_require_int(row.get("start"), where="symbol.start"),
             end=_require_int(row.get("end"), where="symbol.end"),
+            semantic_identity=_require_str(
+                row.get("semantic_identity"), where="symbol.semantic_identity"
+            ),
+            symbol_key=str(row.get("symbol_key") or ""),
+            usr=str(row.get("usr") or ""),
+            canonical_signature=str(row.get("canonical_signature") or ""),
+            qname=str(row.get("qname") or ""),
+            chunk_identity=str(row.get("chunk_identity") or ""),
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "identity": self.identity,
+            "semantic_identity": self.semantic_identity,
+            "symbol_key": self.symbol_key,
+            "usr": self.usr,
+            "canonical_signature": self.canonical_signature,
+            "qname": self.qname,
             "kind": self.kind,
+            "document_id": self.document_id,
+            "source_path": self.source_path,
             "start": self.start,
             "end": self.end,
+            "chunk_identity": self.chunk_identity,
         }
 
 
@@ -356,6 +496,8 @@ class PromptGraphSymbol:
 class PromptGraphChunk:
     id: int
     identity: str
+    document_id: int
+    source_path: str
     start: int
     end: int
     kind: int = 1
@@ -367,19 +509,25 @@ class PromptGraphChunk:
         return cls(
             id=chunk_id,
             identity=str(row.get("identity") or f"chunk:{chunk_id}"),
+            document_id=_require_int(
+                row.get("document_id"), where="chunk.document_id"
+            ),
+            source_path=_validate_relative_source_path(
+                _require_str(row.get("source_path"), where="chunk.source_path"),
+                where="chunk.source_path",
+            ),
             start=_require_int(row.get("start"), where="chunk.start"),
             end=_require_int(row.get("end"), where="chunk.end"),
             kind=_require_int(row.get("kind", 1), where="chunk.kind"),
-            dep_level=_require_int(
-                row.get("dep_level", 0),
-                where="chunk.dep_level",
-            ),
+            dep_level=_require_int(row.get("dep_level", 0), where="chunk.dep_level"),
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "identity": self.identity,
+            "document_id": self.document_id,
+            "source_path": self.source_path,
             "start": self.start,
             "end": self.end,
             "kind": self.kind,
@@ -423,16 +571,29 @@ class PromptGraphEdge:
 @dataclass(frozen=True)
 class PromptProjectIndex:
     project_id: str
-    source_path: str
-    source: str
+    documents: tuple[PromptGraphDocument, ...]
     symbols: tuple[PromptGraphSymbol, ...]
     chunks: tuple[PromptGraphChunk, ...]
     edges: tuple[PromptGraphEdge, ...]
+    provenance: Mapping[str, Any]
     schema: str = INDEX_SCHEMA
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "PromptProjectIndex":
+    def from_dict(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        allow_legacy_single_document: bool = False,
+    ) -> "PromptProjectIndex":
         schema = payload.get("schema")
+        if schema == LEGACY_INDEX_SCHEMA:
+            if not allow_legacy_single_document:
+                raise ValueError(
+                    "legacy prompt graph index requires explicit "
+                    "allow_legacy_single_document=True"
+                )
+            payload = _upgrade_legacy_single_document_index(payload)
+            schema = payload.get("schema")
         if schema != INDEX_SCHEMA:
             raise ValueError(
                 f"unsupported prompt graph index schema {schema!r}"
@@ -442,11 +603,10 @@ class PromptProjectIndex:
                 payload.get("project_id"),
                 where="project_id",
             ),
-            source_path=_require_str(
-                payload.get("source_path"),
-                where="source_path",
+            documents=tuple(
+                PromptGraphDocument.from_dict(row)
+                for row in _require_rows(payload.get("documents"), where="documents")
             ),
-            source=_require_str(payload.get("source"), where="source"),
             symbols=tuple(
                 PromptGraphSymbol.from_dict(row)
                 for row in _require_rows(
@@ -468,6 +628,7 @@ class PromptProjectIndex:
                     where="edges",
                 )
             ),
+            provenance=dict(payload.get("provenance") or {}),
             schema=schema,
         )
         index.validate()
@@ -477,6 +638,8 @@ class PromptProjectIndex:
     def from_json_path(
         cls,
         path: str | Path,
+        *,
+        allow_legacy_single_document: bool = False,
     ) -> "PromptProjectIndex":
         path = Path(path)
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -484,18 +647,49 @@ class PromptProjectIndex:
             raise ValueError(
                 f"{path}: prompt graph index must be a JSON object"
             )
-        return cls.from_dict(payload)
+        return cls.from_dict(
+            payload,
+            allow_legacy_single_document=allow_legacy_single_document,
+        )
 
     def validate(self) -> None:
-        source_len = len(self.source)
+        if not self.documents:
+            raise ValueError("prompt graph index has no documents")
+        documents_by_id: dict[int, PromptGraphDocument] = {}
+        documents_by_path: dict[str, PromptGraphDocument] = {}
+        for document in self.documents:
+            if document.id <= 0:
+                raise ValueError("prompt graph document ids must be positive")
+            if document.id in documents_by_id:
+                raise ValueError(f"duplicate document id {document.id}")
+            if document.source_path in documents_by_path:
+                raise ValueError(f"duplicate document source_path {document.source_path!r}")
+            documents_by_id[document.id] = document
+            documents_by_path[document.source_path] = document
+
         seen_ids: set[int] = set()
         seen_identities: set[str] = set()
+        legacy_adapter = (
+            self.provenance.get("producer")
+            == "explicit_legacy_single_document_adapter"
+        )
         for symbol in self.symbols:
+            document = documents_by_id.get(symbol.document_id)
+            if document is None:
+                raise ValueError(
+                    f"symbol {symbol.identity}: unknown document_id {symbol.document_id}"
+                )
+            if document.source_path != symbol.source_path:
+                raise ValueError(
+                    f"symbol {symbol.identity}: document_id {symbol.document_id} "
+                    f"source_path mismatch {symbol.source_path!r} != "
+                    f"{document.source_path!r}"
+                )
             _validate_span(
                 symbol.start,
                 symbol.end,
-                source_len,
-                where=f"symbol {symbol.identity}",
+                len(document.source),
+                where=f"symbol {symbol.identity} in {document.source_path}",
             )
             if symbol.id <= 0:
                 raise ValueError(
@@ -507,21 +701,41 @@ class PromptProjectIndex:
                 raise ValueError(
                     f"duplicate symbol identity {symbol.identity!r}"
                 )
+            if (
+                not legacy_adapter
+                and symbol.kind in {"function", "type", "variable"}
+                and (not symbol.usr or not symbol.canonical_signature)
+            ):
+                raise ValueError(
+                    f"symbol {symbol.identity}: v2 definitions require clang USR "
+                    "and canonical_signature; qname-only indexes are unsupported"
+                )
             seen_ids.add(symbol.id)
             seen_identities.add(symbol.identity)
 
         seen_chunk_ids: set[int] = set()
         seen_chunk_identities: set[str] = set()
-        last_end = -1
+        last_end_by_document: dict[int, int] = {}
         for chunk in sorted(
             self.chunks,
-            key=lambda item: (item.start, item.end, item.id),
+            key=lambda item: (item.document_id, item.start, item.end, item.id),
         ):
+            document = documents_by_id.get(chunk.document_id)
+            if document is None:
+                raise ValueError(
+                    f"chunk {chunk.identity}: unknown document_id {chunk.document_id}"
+                )
+            if document.source_path != chunk.source_path:
+                raise ValueError(
+                    f"chunk {chunk.identity}: document_id {chunk.document_id} "
+                    f"source_path mismatch {chunk.source_path!r} != "
+                    f"{document.source_path!r}"
+                )
             _validate_span(
                 chunk.start,
                 chunk.end,
-                source_len,
-                where=f"chunk {chunk.identity}",
+                len(document.source),
+                where=f"chunk {chunk.identity} in {document.source_path}",
             )
             if chunk.id < 0:
                 raise ValueError(
@@ -538,11 +752,14 @@ class PromptProjectIndex:
                 raise ValueError(
                     f"duplicate chunk identity {chunk.identity!r}"
                 )
+            last_end = last_end_by_document.get(chunk.document_id, -1)
             if chunk.start < last_end:
-                raise ValueError("prompt graph chunks must not overlap")
+                raise ValueError(
+                    f"prompt graph chunks must not overlap in {chunk.source_path}"
+                )
             seen_chunk_ids.add(chunk.id)
             seen_chunk_identities.add(chunk.identity)
-            last_end = chunk.end
+            last_end_by_document[chunk.document_id] = chunk.end
 
         valid_relations = set(RELATION_NAMES)
         seen_edges: set[tuple[str, str, str, int | None]] = set()
@@ -559,8 +776,16 @@ class PromptProjectIndex:
                 raise ValueError(
                     f"edge target identity not found: {edge.target!r}"
                 )
-            if edge.kind is not None and edge.kind < 0:
-                raise ValueError("edge.kind must be non-negative")
+            if edge.relation in TRIPLE_ROUTE_KEYS:
+                _validate_route_kind(
+                    edge.relation,
+                    edge.kind,
+                    where=f"edge {edge.source!r}->{edge.target!r}",
+                )
+            elif edge.kind is not None:
+                raise ValueError(
+                    f"{edge.relation} edge must not carry a domain route kind"
+                )
             edge_key = (
                 edge.relation,
                 edge.source,
@@ -571,41 +796,63 @@ class PromptProjectIndex:
                 raise ValueError(f"duplicate prompt graph edge {edge_key!r}")
             seen_edges.add(edge_key)
 
-    def verify_source_file(self, project_root: str | Path) -> Path:
+    def verify_repository(self, project_root: str | Path) -> Path:
         root = Path(project_root).resolve()
-        relative = Path(self.source_path)
-        if relative.is_absolute() or ".." in relative.parts:
-            raise ValueError(
-                "prompt graph source_path must be a contained relative path, "
-                f"got {self.source_path!r}"
-            )
-        source_path = (root / relative).resolve()
-        try:
-            source_path.relative_to(root)
-        except ValueError as exc:
-            raise ValueError(
-                f"prompt graph source_path escapes project root {root}: "
-                f"{self.source_path!r}"
-            ) from exc
-        if not source_path.is_file():
-            raise FileNotFoundError(
-                f"prompt graph source file not found: {source_path}"
-            )
-        actual = source_path.read_text(encoding="utf-8")
-        if actual != self.source:
-            raise ValueError(
-                f"prompt graph source mismatch for {source_path}: "
-                f"index_sha256={self.source_sha256} "
-                f"file_sha256={_sha_text(actual)}"
-            )
-        return source_path
+        for document in self.documents:
+            source_path = (root / document.source_path).resolve()
+            try:
+                source_path.relative_to(root)
+            except ValueError as exc:
+                raise ValueError(
+                    f"prompt graph source path escapes repository: "
+                    f"{document.source_path!r}"
+                ) from exc
+            if not source_path.is_file():
+                raise FileNotFoundError(f"prompt graph source file not found: {source_path}")
+            actual = source_path.read_text(encoding="utf-8")
+            if actual != document.source:
+                raise ValueError(
+                    f"prompt graph repository freshness mismatch for {source_path}"
+                )
+        expected = dict(self.provenance.get("hashes") or {}).get(
+            "repository_sha256"
+        )
+        if expected is not None:
+            actual, _manifest = repository_snapshot(root)
+            if actual != expected:
+                raise ValueError(
+                    "prompt graph repository freshness mismatch: "
+                    f"expected={expected} actual={actual}"
+                )
+        return root
+
+    def document_for_path(self, source_path: str) -> PromptGraphDocument:
+        normalized = _validate_relative_source_path(source_path, where="source_path")
+        matches = [doc for doc in self.documents if doc.source_path == normalized]
+        if len(matches) != 1:
+            raise KeyError(f"prompt graph document not found: {normalized!r}")
+        return matches[0]
+
+    def document_for_id(self, document_id: int) -> PromptGraphDocument:
+        matches = [doc for doc in self.documents if doc.id == document_id]
+        if len(matches) != 1:
+            raise KeyError(f"prompt graph document id not found: {document_id}")
+        return matches[0]
+
+    def symbol_for_identity(self, identity: str) -> PromptGraphSymbol:
+        matches = [symbol for symbol in self.symbols if symbol.identity == identity]
+        if len(matches) != 1:
+            raise KeyError(f"prompt graph symbol identity not found: {identity!r}")
+        return matches[0]
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema": self.schema,
             "project_id": self.project_id,
-            "source_path": self.source_path,
-            "source": self.source,
+            "documents": [
+                document.to_dict()
+                for document in sorted(self.documents, key=lambda item: item.id)
+            ],
             "symbols": [
                 symbol.to_dict()
                 for symbol in sorted(
@@ -617,7 +864,12 @@ class PromptProjectIndex:
                 chunk.to_dict()
                 for chunk in sorted(
                     self.chunks,
-                    key=lambda item: (item.start, item.end, item.id),
+                    key=lambda item: (
+                        item.document_id,
+                        item.start,
+                        item.end,
+                        item.id,
+                    ),
                 )
             ],
             "edges": [
@@ -632,20 +884,69 @@ class PromptProjectIndex:
                     ),
                 )
             ],
+            "provenance": json.loads(_stable_json(self.provenance)),
         }
 
     @property
     def source_sha256(self) -> str:
-        return _sha_text(self.source)
+        return _sha_json(
+            {
+                document.source_path: _sha_text(document.source)
+                for document in sorted(self.documents, key=lambda item: item.source_path)
+            }
+        )
 
     @property
     def index_sha256(self) -> str:
         return _sha_json(self.to_dict())
 
 
+def _upgrade_legacy_single_document_index(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    source_path = _validate_relative_source_path(
+        _require_str(payload.get("source_path"), where="source_path"),
+        where="source_path",
+    )
+    source = payload.get("source")
+    if not isinstance(source, str):
+        raise TypeError("source must be a string")
+    upgraded = dict(payload)
+    upgraded.pop("source_path", None)
+    upgraded.pop("source", None)
+    upgraded["schema"] = INDEX_SCHEMA
+    upgraded["documents"] = [
+        {"id": 1, "source_path": source_path, "source": source}
+    ]
+    upgraded["symbols"] = [
+        {
+            **dict(row),
+            "document_id": 1,
+            "source_path": source_path,
+            "semantic_identity": str(row.get("identity") or ""),
+        }
+        for row in _require_rows(payload.get("symbols"), where="symbols")
+    ]
+    upgraded["chunks"] = [
+        {
+            **dict(row),
+            "document_id": 1,
+            "source_path": source_path,
+        }
+        for row in _require_rows(payload.get("chunks"), where="chunks")
+    ]
+    upgraded["provenance"] = {
+        "producer": "explicit_legacy_single_document_adapter",
+        "legacy_schema": LEGACY_INDEX_SCHEMA,
+    }
+    return upgraded
+
+
 @dataclass(frozen=True)
 class PromptGraphSegment:
     text: str
+    document_id: int | None = None
+    source_path: str | None = None
     source_start: int | None = None
     role: str = "code"
 
@@ -663,12 +964,34 @@ class PromptGraphSegment:
             raise ValueError(
                 "prompt graph segment source_start must be a non-negative integer"
             )
+        if self.source_start is not None:
+            if (
+                isinstance(self.document_id, bool)
+                or not isinstance(self.document_id, int)
+                or self.document_id <= 0
+            ):
+                raise ValueError(
+                    "source-mapped prompt graph segment requires positive document_id"
+                )
+            if not isinstance(self.source_path, str) or not self.source_path:
+                raise ValueError(
+                    "source-mapped prompt graph segment requires source_path"
+                )
+            _validate_relative_source_path(
+                self.source_path, where="prompt graph segment source_path"
+            )
+        elif self.document_id is not None or self.source_path is not None:
+            raise ValueError(
+                "unmapped prompt graph segment must not declare document metadata"
+            )
         if not isinstance(self.role, str) or not self.role:
             raise ValueError("prompt graph segment role must be non-empty")
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "text": self.text,
+            "document_id": self.document_id,
+            "source_path": self.source_path,
             "source_start": self.source_start,
             "role": self.role,
         }
@@ -690,6 +1013,8 @@ class PromptGraphContext:
         cls,
         prompt: str,
         *,
+        document_id: int | None = None,
+        source_path: str | None = None,
         source_start: int | None = 0,
         language: str = "cpp",
         role: str = "code",
@@ -698,6 +1023,8 @@ class PromptGraphContext:
             segments=(
                 PromptGraphSegment(
                     prompt,
+                    document_id=document_id,
+                    source_path=source_path,
                     source_start=source_start,
                     role=role,
                 ),
@@ -713,14 +1040,18 @@ class PromptGraphContext:
     def context_sha256(self) -> str:
         return _sha_json(self.to_dict())
 
-    def source_positions(self) -> list[int | None]:
-        positions: list[int | None] = []
+    def source_positions(self) -> list[tuple[int, int] | None]:
+        positions: list[tuple[int, int] | None] = []
         for segment in self.segments:
             if segment.source_start is None:
                 positions.extend([None] * len(segment.text))
             else:
+                assert segment.document_id is not None
                 positions.extend(
-                    int(segment.source_start) + offset
+                    (
+                        int(segment.document_id),
+                        int(segment.source_start) + offset,
+                    )
                     for offset in range(len(segment.text))
                 )
         return positions
@@ -893,6 +1224,10 @@ class PromptGraphModelInputs:
                 route_key
             ]:
                 bias[int(source_token)][int(target_token)] += weight
+        for source_token, target_token in self.graph_routes[
+            GENERATED_QUERY_ROUTE_KEY
+        ]:
+            bias[int(source_token)][int(target_token)] += 1.0
         return bias
 
 
@@ -1131,10 +1466,33 @@ class PromptGraphArtifact:
             )
 
         generated_count = total_token_count - self.token_count
+        anchor_candidates = [
+            index
+            for index, value in enumerate(self.side_channels["structure_ids"])
+            if int(value) > 0
+        ]
+        if not anchor_candidates:
+            raise ValueError(
+                "prompt graph artifact has no live structure token for generated decode"
+            )
+        anchor = anchor_candidates[-1]
+        generated_values = dict(GENERATED_TOKEN_SIDECAR_DEFAULTS)
+        for name in (
+            "structure_ids",
+            "dep_levels",
+            "ast_depth_ids",
+            "sibling_index_ids",
+            "node_type_ids",
+            "domain_ids",
+        ):
+            generated_values[name] = int(self.side_channels[name][anchor])
+        generated_values["domain_ids"] = 1
+        generated_values["confidence_ids"] = 1
+        generated_values["source_doc_ids"] = 0
         side_channels = {
             name: (
                 list(self.side_channels[name])
-                + [TOKEN_SIDECAR_DEFAULTS[name]] * generated_count
+                + [generated_values[name]] * generated_count
             )[window_start:window_end]
             for name in TOKEN_SIDECAR_NAMES
         }
@@ -1220,6 +1578,39 @@ class PromptGraphArtifact:
             graph_routes[count_key] = [len(rows)]
             visible_route_counts[relation] = len(rows)
 
+        summary_tokens: set[int] = set()
+        for _relation, (route_key, _count_key) in PAIR_ROUTE_KEYS.items():
+            for source_chunk, target_chunk in graph_routes[route_key]:
+                summary_tokens.add(starts[int(source_chunk)])
+                summary_tokens.add(starts[int(target_chunk)])
+        for _relation, (route_key, _count_key) in TRIPLE_ROUTE_KEYS.items():
+            for source_token, target_token, _kind in graph_routes[route_key]:
+                summary_tokens.add(int(source_token))
+                summary_tokens.add(int(target_token))
+
+        generated_visible_start = max(self.token_count, window_start)
+        generated_visible_end = window_end
+        generated_rows: list[list[int]] = []
+        if generated_visible_start < generated_visible_end:
+            if not summary_tokens:
+                raise ValueError(
+                    "generated prompt graph queries have no visible repository summary"
+                )
+            starts.append(generated_visible_start - window_start)
+            ends.append(generated_visible_end - window_start)
+            kinds.append(int(generated_values["structure_ids"]))
+            dep_levels.append(int(generated_values["dep_levels"]))
+            for query_token in range(
+                generated_visible_start - window_start,
+                generated_visible_end - window_start,
+            ):
+                generated_rows.extend(
+                    [query_token, target_token]
+                    for target_token in sorted(summary_tokens)
+                )
+        graph_routes[GENERATED_QUERY_ROUTE_KEY] = generated_rows
+        graph_routes[GENERATED_QUERY_COUNT_KEY] = [len(generated_rows)]
+
         graph_routes.update(
             {
                 "graph_chunk_starts": starts,
@@ -1240,6 +1631,12 @@ class PromptGraphArtifact:
             "window_end": window_end,
             "total_token_count": total_token_count,
             "token_count": window_end - window_start,
+            "generated_token_policy": GENERATED_TOKEN_POLICY,
+            "generated_token_count": max(
+                0, generated_visible_end - generated_visible_start
+            ),
+            "repository_summary_token_count": len(summary_tokens),
+            "generated_query_edge_count": len(generated_rows),
         }
         return PromptGraphModelInputs(
             side_channels=side_channels,
@@ -1367,6 +1764,7 @@ class PromptGraphBuilder:
             prompt_to_source,
         )
         side_channels = _empty_side_channels(len(token_ids))
+        _map_source_documents_to_tokens(token_source_sets, side_channels)
         identity_token_spans = _map_symbols_to_tokens(
             project_index,
             token_source_sets,
@@ -1420,7 +1818,13 @@ class PromptGraphBuilder:
             "schema": ARTIFACT_SCHEMA,
             "cache_key": cache_key,
             "project_id": project_index.project_id,
-            "source_path": project_index.source_path,
+            "document_count": len(project_index.documents),
+            "source_paths": [
+                document.source_path
+                for document in sorted(
+                    project_index.documents, key=lambda item: item.id
+                )
+            ],
             "prompt_length": len(prompt),
             "token_count": len(token_ids),
             "symbol_count": len(identity_token_spans),
@@ -1446,6 +1850,8 @@ class PromptGraphBuilder:
                     {
                         "length": len(segment.text),
                         "role": segment.role,
+                        "document_id": segment.document_id,
+                        "source_path": segment.source_path,
                         "source_start": segment.source_start,
                         "text_sha256": _sha_text(segment.text),
                     }
@@ -1696,16 +2102,22 @@ def _validate_token_spans(
 
 def _validate_prompt_source_bounds(
     index: PromptProjectIndex,
-    positions: Sequence[int | None],
+    positions: Sequence[tuple[int, int] | None],
 ) -> None:
-    source_len = len(index.source)
-    for position in positions:
-        if position is not None and not (
-            0 <= position < source_len
-        ):
+    for reference in positions:
+        if reference is None:
+            continue
+        document_id, position = reference
+        try:
+            document = index.document_for_id(document_id)
+        except KeyError as exc:
             raise ValueError(
-                f"prompt source offset {position} outside "
-                f"prompt/source bounds length {source_len}"
+                f"prompt source references unknown document_id {document_id}"
+            ) from exc
+        if not 0 <= position < len(document.source):
+            raise ValueError(
+                f"prompt source offset {position} outside {document.source_path} "
+                f"bounds length {len(document.source)}"
             )
 
 
@@ -1716,15 +2128,22 @@ def _validate_context_source_text(
     for segment_number, segment in enumerate(context.segments):
         if segment.source_start is None:
             continue
+        assert segment.document_id is not None
+        assert segment.source_path is not None
+        document = index.document_for_id(segment.document_id)
+        if document.source_path != segment.source_path:
+            raise ValueError(
+                f"prompt segment {segment_number} document_id/source_path mismatch"
+            )
         start = int(segment.source_start)
         end = start + len(segment.text)
-        if start < 0 or end > len(index.source):
+        if start < 0 or end > len(document.source):
             raise ValueError(
                 f"prompt segment {segment_number} source span "
                 f"[{start},{end}) is outside indexed source length "
-                f"{len(index.source)}"
+                f"{len(document.source)}"
             )
-        if index.source[start:end] != segment.text:
+        if document.source[start:end] != segment.text:
             raise ValueError(
                 f"prompt segment {segment_number} text does not match "
                 f"indexed source span [{start},{end})"
@@ -1733,13 +2152,13 @@ def _validate_context_source_text(
 
 def _token_source_sets(
     token_spans: Sequence[tuple[int, int]],
-    prompt_to_source: Sequence[int | None],
-) -> list[set[int]]:
+    prompt_to_source: Sequence[tuple[int, int] | None],
+) -> list[set[tuple[int, int]]]:
     return [
         {
-            int(position)
-            for position in prompt_to_source[start:end]
-            if position is not None
+            (int(reference[0]), int(reference[1]))
+            for reference in prompt_to_source[start:end]
+            if reference is not None
         }
         for start, end in token_spans
     ]
@@ -1754,27 +2173,49 @@ def _empty_side_channels(
     }
 
 
+def _map_source_documents_to_tokens(
+    token_source_sets: Sequence[set[tuple[int, int]]],
+    side_channels: dict[str, list[int]],
+) -> None:
+    for token_index, references in enumerate(token_source_sets):
+        document_ids = {document_id for document_id, _position in references}
+        if len(document_ids) > 1:
+            raise ValueError(
+                f"token {token_index} crosses prompt graph documents: "
+                f"{sorted(document_ids)}"
+            )
+        if document_ids:
+            side_channels["source_doc_ids"][token_index] = next(
+                iter(document_ids)
+            )
+
+
 def _tokens_overlapping_span(
-    token_source_sets: Sequence[set[int]],
+    token_source_sets: Sequence[set[tuple[int, int]]],
+    document_id: int,
     start: int,
     end: int,
 ) -> list[int]:
     return [
         index
         for index, positions in enumerate(token_source_sets)
-        if any(start <= position < end for position in positions)
+        if any(
+            source_document_id == document_id and start <= position < end
+            for source_document_id, position in positions
+        )
     ]
 
 
 def _map_symbols_to_tokens(
     index: PromptProjectIndex,
-    token_source_sets: Sequence[set[int]],
+    token_source_sets: Sequence[set[tuple[int, int]]],
     side_channels: dict[str, list[int]],
 ) -> dict[str, tuple[int, int]]:
     identity_token_spans: dict[str, tuple[int, int]] = {}
     for symbol in sorted(
         index.symbols,
         key=lambda item: (
+            item.document_id,
             -(item.end - item.start),
             item.start,
             item.id,
@@ -1782,6 +2223,7 @@ def _map_symbols_to_tokens(
     ):
         token_indexes = _tokens_overlapping_span(
             token_source_sets,
+            symbol.document_id,
             symbol.start,
             symbol.end,
         )
@@ -1807,7 +2249,7 @@ def _map_symbols_to_tokens(
 
 def _map_chunks_to_token_rows(
     index: PromptProjectIndex,
-    token_source_sets: Sequence[set[int]],
+    token_source_sets: Sequence[set[tuple[int, int]]],
     side_channels: dict[str, list[int]],
 ) -> list[tuple[int, int, int, int, int, PromptGraphChunk]]:
     rows: list[
@@ -1815,10 +2257,16 @@ def _map_chunks_to_token_rows(
     ] = []
     for chunk in sorted(
         index.chunks,
-        key=lambda item: (item.start, item.end, item.id),
+        key=lambda item: (
+            item.document_id,
+            item.start,
+            item.end,
+            item.id,
+        ),
     ):
         token_indexes = _tokens_overlapping_span(
             token_source_sets,
+            chunk.document_id,
             chunk.start,
             chunk.end,
         )
@@ -1935,10 +2383,10 @@ def _map_edges(
             route_key, _count_key = TRIPLE_ROUTE_KEYS[
                 edge.relation
             ]
-            kind = (
-                edge.kind
-                if edge.kind is not None
-                else DEFAULT_TRIPLE_KIND[edge.relation]
+            kind = _validate_route_kind(
+                edge.relation,
+                edge.kind,
+                where=f"edge {edge.source!r}->{edge.target!r}",
             )
             triple = [source_first, target_first, kind]
             if triple not in graph_routes.setdefault(route_key, []):
@@ -1952,6 +2400,8 @@ def _map_edges(
         rows = graph_routes.setdefault(route_key, [])
         graph_routes[count_key] = [len(rows)]
         route_edge_counts[relation] = len(rows)
+    graph_routes[GENERATED_QUERY_ROUTE_KEY] = []
+    graph_routes[GENERATED_QUERY_COUNT_KEY] = [0]
     return graph_routes, edge_counts, route_edge_counts
 
 
@@ -1977,10 +2427,21 @@ def _symbol_to_chunk_rows(
     }
     result: dict[str, int] = {}
     for symbol in index.symbols:
+        if symbol.chunk_identity:
+            matches = [
+                chunk
+                for *_prefix, chunk in chunk_rows
+                if chunk.identity == symbol.chunk_identity
+            ]
+            if len(matches) == 1:
+                result[symbol.identity] = row_for_chunk_id[matches[0].id]
+                continue
         containing = [
             chunk
             for *_prefix, chunk in chunk_rows
             if (
+                chunk.document_id == symbol.document_id
+                and
                 chunk.start <= symbol.start
                 and symbol.end <= chunk.end
             )
@@ -1989,7 +2450,8 @@ def _symbol_to_chunk_rows(
             containing = [
                 chunk
                 for *_prefix, chunk in chunk_rows
-                if max(chunk.start, symbol.start)
+                if chunk.document_id == symbol.document_id
+                and max(chunk.start, symbol.start)
                 < min(chunk.end, symbol.end)
             ]
         if containing:
@@ -2046,6 +2508,8 @@ def _validate_graph_routes(
         "graph_chunk_kinds",
         "graph_chunk_dep_levels",
         "graph_chunk_counts",
+        GENERATED_QUERY_ROUTE_KEY,
+        GENERATED_QUERY_COUNT_KEY,
     }
     for route_key, count_key in (
         *PAIR_ROUTE_KEYS.values(),
@@ -2137,7 +2601,7 @@ def _validate_graph_routes(
                     f"graph chunk bounds {chunk_count}"
                 )
 
-    for route_key, count_key in TRIPLE_ROUTE_KEYS.values():
+    for relation, (route_key, count_key) in TRIPLE_ROUTE_KEYS.items():
         rows = graph_routes[route_key]
         counts = graph_routes[count_key]
         if len(counts) != 1 or int(counts[0]) != len(rows):
@@ -2162,10 +2626,33 @@ def _validate_graph_routes(
                     f"{route_key} triple ({source},{target},{kind}) "
                     f"out of token bounds {token_count}"
                 )
-            if kind < 0:
-                raise ValueError(
-                    f"{route_key} triple kind must be non-negative"
-                )
+            _validate_route_kind(
+                relation,
+                kind,
+                where=f"{route_key} triple ({source},{target},{kind})",
+            )
+
+    generated_rows = graph_routes[GENERATED_QUERY_ROUTE_KEY]
+    generated_counts = graph_routes[GENERATED_QUERY_COUNT_KEY]
+    if len(generated_counts) != 1 or int(generated_counts[0]) != len(
+        generated_rows
+    ):
+        raise ValueError(
+            f"{GENERATED_QUERY_ROUTE_KEY} count does not match route rows"
+        )
+    for row in generated_rows:
+        if len(row) != 2:
+            raise ValueError(
+                f"{GENERATED_QUERY_ROUTE_KEY} rows must be token pairs"
+            )
+        source, target = int(row[0]), int(row[1])
+        if not (
+            0 <= source < token_count and 0 <= target < token_count
+        ):
+            raise ValueError(
+                f"{GENERATED_QUERY_ROUTE_KEY} pair ({source},{target}) out of "
+                f"token bounds {token_count}"
+            )
 
 
 __all__ = [
@@ -2174,12 +2661,18 @@ __all__ = [
     "CPP_NEWLINE_SENTINEL",
     "CPP_SPACE_SENTINEL",
     "CppPromptTokenizerAdapter",
+    "GENERATED_QUERY_COUNT_KEY",
+    "GENERATED_QUERY_ROUTE_KEY",
+    "GENERATED_TOKEN_POLICY",
+    "GENERATED_TOKEN_SIDECAR_DEFAULTS",
     "INDEX_SCHEMA",
+    "LEGACY_INDEX_SCHEMA",
     "PAIR_ROUTE_KEYS",
     "PromptGraphArtifact",
     "PromptGraphBuilder",
     "PromptGraphChunk",
     "PromptGraphContext",
+    "PromptGraphDocument",
     "PromptGraphEdge",
     "PromptGraphModelInputs",
     "PromptGraphSegment",
@@ -2190,4 +2683,5 @@ __all__ = [
     "TRIPLE_ROUTE_KEYS",
     "WINDOW_SCHEMA",
     "normalize_cpp_whitespace_with_offsets",
+    "repository_snapshot",
 ]

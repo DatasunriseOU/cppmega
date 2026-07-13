@@ -20,6 +20,7 @@ import tarfile
 import tempfile
 import textwrap
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
@@ -46,6 +47,7 @@ from scripts.nebius_h200_megatron_cpp_world_sweep import (
     wait_for_ssh,
 )
 from cppmega.prompt_graph import PromptProjectIndex
+from cppmega.prompt_graph_index import ClangPromptProjectIndexProducer
 
 
 ROOT = _SCRIPT_ROOT
@@ -90,29 +92,95 @@ def _contained_path(root: Path, raw: object, *, where: str) -> tuple[Path, Path]
     return path, relative
 
 
-def eval_graph_assets(cases: Path, *, prompt_graph_mode: str) -> dict[Path, Path]:
+def effective_case_prompt_graph_mode(
+    row: dict[str, object],
+    global_mode: str,
+) -> str:
+    if global_mode not in {"repo", "off"}:
+        raise ValueError(f"unsupported prompt graph mode {global_mode!r}")
+    task_id = str(row.get("task_id", "<missing-task-id>"))
+    case_mode = row.get("prompt_graph_mode")
+    if case_mode not in {"repo", "off"}:
+        raise ValueError(
+            f"{task_id}.prompt_graph_mode must be explicitly 'repo' or 'off'"
+        )
+    return "off" if global_mode == "off" else str(case_mode)
+
+
+@dataclass(frozen=True)
+class PreparedEvalGraphCases:
+    rows: tuple[dict[str, object], ...]
+    assets: dict[Path, Path]
+
+
+def _prepare_eval_graph_cases(
+    cases: Path,
+    *,
+    prompt_graph_mode: str,
+    prompt_index_cache_dir: Path,
+    indexer_root: Path | None = None,
+) -> PreparedEvalGraphCases:
     if prompt_graph_mode not in {"repo", "off"}:
         raise ValueError(f"unsupported prompt graph mode {prompt_graph_mode!r}")
     if not cases.is_file():
         raise FileNotFoundError(cases)
-    if prompt_graph_mode == "off":
-        return {}
 
     root = cases.resolve().parent
     assets: dict[Path, Path] = {}
-    for row in iter_jsonl(cases):
+    staged_rows: list[dict[str, object]] = []
+    for original_row in iter_jsonl(cases):
+        row = dict(original_row)
         task_id = str(row.get("task_id", "<missing-task-id>"))
-        index_path, index_relative = _contained_path(
+        case_mode = effective_case_prompt_graph_mode(row, prompt_graph_mode)
+        row["prompt_graph_mode"] = case_mode
+        if case_mode == "off":
+            staged_rows.append(row)
+            continue
+
+        repo_path, _repo_relative = _contained_path(
             root,
-            row.get("prompt_graph_index"),
-            where=f"{task_id}.prompt_graph_index",
+            row.get("prompt_graph_repo"),
+            where=f"{task_id}.prompt_graph_repo",
         )
-        if not index_path.is_file():
+        if not repo_path.is_dir():
             raise FileNotFoundError(
-                f"{task_id}: prompt graph index not found: {index_path}"
+                f"{task_id}: prompt graph repository not found: {repo_path}"
             )
-        project_index = PromptProjectIndex.from_json_path(index_path)
-        source_path = project_index.verify_source_file(index_path.parent)
+        raw_index = row.get("prompt_graph_index")
+        if isinstance(raw_index, str) and raw_index:
+            index_path, _index_relative = _contained_path(
+                root,
+                raw_index,
+                where=f"{task_id}.prompt_graph_index",
+            )
+            if not index_path.is_file():
+                raise FileNotFoundError(
+                    f"{task_id}: prompt graph index not found: {index_path}"
+                )
+            project_index = PromptProjectIndex.from_json_path(index_path)
+            project_index.verify_repository(repo_path)
+            index_receipt = dict(project_index.provenance)
+        else:
+            raw_project_id = row.get("prompt_graph_project_id")
+            project_id = (
+                str(raw_project_id)
+                if isinstance(raw_project_id, str) and raw_project_id
+                else repo_path.name
+            )
+            built = ClangPromptProjectIndexProducer(
+                cache_dir=prompt_index_cache_dir,
+                indexer_root=indexer_root,
+            ).build(repo_path, project_id=project_id)
+            project_index = built.index
+            index_path = built.path
+            index_receipt = dict(built.receipt)
+
+        raw_source_path = row.get("prompt_source_path")
+        if not isinstance(raw_source_path, str) or not raw_source_path:
+            raise ValueError(
+                f"{task_id}.prompt_source_path must be a non-empty relative path"
+            )
+        source_document = project_index.document_for_path(raw_source_path)
         source_start = row.get("prompt_source_start")
         if isinstance(source_start, bool) or not isinstance(source_start, int):
             raise ValueError(f"{task_id}.prompt_source_start must be an integer")
@@ -120,24 +188,54 @@ def eval_graph_assets(cases: Path, *, prompt_graph_mode: str) -> dict[Path, Path
         if not isinstance(prompt, str) or not prompt:
             raise ValueError(f"{task_id}.source_prefix must be a non-empty string")
         prompt_end = source_start + len(prompt)
-        if source_start < 0 or project_index.source[source_start:prompt_end] != prompt:
+        if (
+            source_start < 0
+            or source_document.source[source_start:prompt_end] != prompt
+        ):
             raise ValueError(
-                f"{task_id}: source_prefix does not match indexed source at "
-                f"prompt_source_start={source_start}"
+                f"{task_id}: source_prefix does not match indexed document "
+                f"{source_document.source_path!r} at prompt_source_start={source_start}"
             )
 
-        source_relative = index_relative.parent / project_index.source_path
-        for relative, asset in (
-            (index_relative, index_path),
-            (source_relative, source_path),
-        ):
+        cache_key = str(index_receipt.get("cache_key") or project_index.index_sha256)
+        stage_root = Path("prompt_graph") / cache_key
+        index_relative = stage_root / "project_index.json"
+        row["prompt_graph_repo"] = stage_root.as_posix()
+        row["prompt_graph_index"] = index_relative.as_posix()
+        row["prompt_graph_index_receipt"] = index_receipt
+        candidates: list[tuple[Path, Path]] = [(index_relative, index_path)]
+        manifest = index_receipt.get("repository_manifest")
+        if not isinstance(manifest, dict) or not manifest:
+            raise ValueError(
+                f"{task_id}: prompt graph index lacks repository_manifest provenance"
+            )
+        for source_relative in sorted(manifest):
+            source_path, normalized = _contained_path(
+                repo_path,
+                source_relative,
+                where=f"{task_id}.repository_manifest[{source_relative!r}]",
+            )
+            if not source_path.is_file():
+                raise FileNotFoundError(source_path)
+            candidates.append((stage_root / normalized, source_path))
+        for relative, asset in candidates:
             previous = assets.get(relative)
             if previous is not None and previous != asset:
                 raise ValueError(
                     f"conflicting eval graph assets for {relative}: {previous} != {asset}"
                 )
             assets[relative] = asset
-    return assets
+        staged_rows.append(row)
+    return PreparedEvalGraphCases(rows=tuple(staged_rows), assets=assets)
+
+
+def eval_graph_assets(cases: Path, *, prompt_graph_mode: str) -> dict[Path, Path]:
+    cache_dir = Path(tempfile.gettempdir()) / "cppmega-prompt-index-cache"
+    return _prepare_eval_graph_cases(
+        cases,
+        prompt_graph_mode=prompt_graph_mode,
+        prompt_index_cache_dir=cache_dir,
+    ).assets
 
 
 def make_eval_tar(
@@ -150,14 +248,26 @@ def make_eval_tar(
     for item in (cases, prompts):
         if not item.exists():
             raise FileNotFoundError(item)
-    graph_assets = eval_graph_assets(cases, prompt_graph_mode=prompt_graph_mode)
     with tempfile.TemporaryDirectory(prefix="cppmega-eval-stage-") as stage_raw:
         stage = Path(stage_raw)
         eval_stage = stage / "cppmega_eval"
         eval_stage.mkdir()
-        os.symlink(cases.resolve(), eval_stage / "cases.jsonl")
+        prepared = _prepare_eval_graph_cases(
+            cases,
+            prompt_graph_mode=prompt_graph_mode,
+            prompt_index_cache_dir=stage / "prompt_index_cache",
+        )
+        (eval_stage / "cases.jsonl").write_text(
+            "".join(
+                json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+                for row in prepared.rows
+            ),
+            encoding="utf-8",
+        )
         os.symlink(prompts.resolve(), eval_stage / "prompts.jsonl")
-        for relative, source in sorted(graph_assets.items(), key=lambda item: str(item[0])):
+        for relative, source in sorted(
+            prepared.assets.items(), key=lambda item: str(item[0])
+        ):
             target = eval_stage / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             os.symlink(source, target)
@@ -242,11 +352,17 @@ from pathlib import Path
 import torch
 
 from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_patch
-from cppmega.megatron.graph_route_attention_bias_patch import apply_graph_route_attention_bias_patch
+from cppmega.megatron.graph_route_attention_bias_patch import (
+    PromptGraphInferenceState,
+    apply_graph_route_attention_bias_patch,
+    set_prompt_graph_inference_state,
+)
 from cppmega.megatron.structure_dataset_patch import _set_current_structure_batch
 from cppmega.megatron.te_checkpoint_kwarg_patch import apply_te_checkpoint_kwarg_patch
 from cppmega.prompt_graph import (
     CppPromptTokenizerAdapter,
+    GENERATED_QUERY_COUNT_KEY,
+    GENERATED_QUERY_ROUTE_KEY,
     PAIR_ROUTE_KEYS,
     TOKEN_SIDECAR_NAMES,
     TRIPLE_ROUTE_KEYS,
@@ -284,6 +400,16 @@ def contained_eval_path(root: Path, raw: object, *, where: str) -> Path:
     except ValueError as exc:
         raise ValueError(f"{where} escapes {root}: {raw!r}") from exc
     return path
+
+
+def effective_case_graph_mode(case: dict[str, object], global_mode: str) -> str:
+    case_mode = case.get("prompt_graph_mode")
+    if case_mode not in {"repo", "off"}:
+        raise ValueError(
+            f"{case.get('task_id', '<missing>')}.prompt_graph_mode must be "
+            "explicitly 'repo' or 'off'"
+        )
+    return "off" if global_mode == "off" else str(case_mode)
 
 
 def load_tokenizer(tokenizer_dir: str):
@@ -423,8 +549,6 @@ def build_prompt_rows(
 ) -> list[dict[str, object]]:
     if prompt_graph_mode not in {"repo", "off"}:
         raise ValueError(f"unknown prompt graph mode {prompt_graph_mode!r}")
-    if prompt_graph_mode == "repo" and prompt_mode != "source-prefix":
-        raise ValueError("repository prompt graphs require prompt_mode=source-prefix")
     cases = {str(row["task_id"]): row for row in iter_jsonl(cases_path)}
     prompts = {str(row["task_id"]): row for row in iter_jsonl(prompts_path)}
     if set(cases) != set(prompts):
@@ -436,6 +560,11 @@ def build_prompt_rows(
     rows: list[dict[str, object]] = []
     for task_id in sorted(cases):
         case = cases[task_id]
+        case_graph_mode = effective_case_graph_mode(case, prompt_graph_mode)
+        if case_graph_mode == "repo" and prompt_mode != "source-prefix":
+            raise ValueError(
+                f"{task_id}: repository prompt graph requires prompt_mode=source-prefix"
+            )
         prompt_row = prompts[task_id]
         if prompt_mode == "source-prefix":
             prompt_text = str(case["source_prefix"])
@@ -447,9 +576,15 @@ def build_prompt_rows(
             "task_id": task_id,
             "language": str(case.get("language", "cpp")),
             "prompt": prompt_text,
+            "prompt_graph_mode": case_graph_mode,
         }
-        if prompt_graph_mode == "repo":
+        if case_graph_mode == "repo":
             eval_root = cases_path.resolve().parent
+            repo_path = contained_eval_path(
+                eval_root,
+                case.get("prompt_graph_repo"),
+                where=f"{task_id}.prompt_graph_repo",
+            )
             index_path = contained_eval_path(
                 eval_root,
                 case.get("prompt_graph_index"),
@@ -460,14 +595,31 @@ def build_prompt_rows(
                     f"{task_id}: prompt graph index not found: {index_path}"
                 )
             project_index = PromptProjectIndex.from_json_path(index_path)
-            project_index.verify_source_file(index_path.parent)
+            project_index.verify_repository(repo_path)
+            source_path = case.get("prompt_source_path")
+            if not isinstance(source_path, str) or not source_path:
+                raise ValueError(
+                    f"{task_id}.prompt_source_path must be a non-empty relative path"
+                )
+            source_document = project_index.document_for_path(source_path)
             source_start = case.get("prompt_source_start")
             if isinstance(source_start, bool) or not isinstance(source_start, int):
                 raise ValueError(f"{task_id}.prompt_source_start must be an integer")
             if source_start < 0:
                 raise ValueError(f"{task_id}.prompt_source_start must be non-negative")
+            source_end = source_start + len(prompt_text)
+            if source_document.source[source_start:source_end] != prompt_text:
+                raise ValueError(
+                    f"{task_id}: prompt does not match indexed source document"
+                )
             row["prompt_graph_index_path"] = str(index_path)
+            row["prompt_graph_repository_path"] = str(repo_path)
+            row["prompt_document_id"] = source_document.id
+            row["prompt_source_path"] = source_document.source_path
             row["prompt_source_start"] = source_start
+            row["prompt_graph_index_receipt"] = case.get(
+                "prompt_graph_index_receipt"
+            )
         rows.append(row)
     return rows
 
@@ -601,6 +753,7 @@ def build_prompt_graph_structure_inputs(
     total_token_count: int,
     window_start: int,
     window_end: int,
+    query_start: int,
     device: torch.device,
 ):
     graph_inputs = graph_artifact.model_inputs(
@@ -609,9 +762,20 @@ def build_prompt_graph_structure_inputs(
         window_end=window_end,
     )
     routes = graph_inputs.graph_routes
+    query_offset = query_start - window_start
+    query_length = window_end - query_start
+    if query_offset < 0 or query_length <= 0:
+        raise ValueError(
+            f"invalid graph query [{query_start},{window_end}) for "
+            f"window [{window_start},{window_end})"
+        )
     structure_inputs = {
         name: torch.tensor(
-            [graph_inputs.side_channels[name]],
+            [
+                graph_inputs.side_channels[name][
+                    query_offset : query_offset + query_length
+                ]
+            ],
             dtype=torch.long,
             device=device,
         )
@@ -624,6 +788,12 @@ def build_prompt_graph_structure_inputs(
         structure_inputs[count_key] = torch.tensor(
             routes[count_key], dtype=torch.long, device=device
         )
+    structure_inputs[GENERATED_QUERY_ROUTE_KEY] = torch.tensor(
+        routes[GENERATED_QUERY_ROUTE_KEY], dtype=torch.long, device=device
+    ).reshape(1, -1, 2)
+    structure_inputs[GENERATED_QUERY_COUNT_KEY] = torch.tensor(
+        routes[GENERATED_QUERY_COUNT_KEY], dtype=torch.long, device=device
+    )
     for _relation, (route_key, count_key) in TRIPLE_ROUTE_KEYS.items():
         structure_inputs[route_key] = torch.tensor(
             routes[route_key], dtype=torch.long, device=device
@@ -652,6 +822,127 @@ def set_prompt_graph_structure_inputs(model, structure_inputs) -> None:
     if setter is None:
         raise AttributeError("CppMega model does not expose set_cppmega_structure_inputs")
     setter(structure_inputs)
+
+
+def restore_checkpoint_strict(load_checkpoint, model_list):
+    return load_checkpoint(model_list, None, None, strict=True)
+
+
+def _prompt_graph_counters(structure_inputs) -> dict[str, int]:
+    def count_value(value) -> int:
+        if hasattr(value, "reshape"):
+            value = value.reshape(-1)
+        if isinstance(value, (list, tuple)):
+            return sum(
+                int(item.item() if hasattr(item, "item") else item)
+                for item in value
+            )
+        if hasattr(value, "numel") and int(value.numel()) > 1:
+            return int(value.sum().item())
+        return int(value.item() if hasattr(value, "item") else value)
+
+    if structure_inputs is None:
+        return {
+            "chunks": 0,
+            "graph_edges": 0,
+            "generated_query_edges": 0,
+        }
+    edge_count_names = (
+        "graph_call_edge_counts",
+        "graph_type_edge_counts",
+        "graph_domain_edge_counts",
+        "graph_build_edge_counts",
+        "graph_shell_edge_counts",
+        "graph_diagnostic_edge_counts",
+        "graph_cross_domain_edge_counts",
+    )
+    return {
+        "chunks": count_value(structure_inputs.get("graph_chunk_counts", [0])),
+        "graph_edges": sum(
+            count_value(structure_inputs.get(name, [0]))
+            for name in edge_count_names
+        ),
+        "generated_query_edges": count_value(
+            structure_inputs.get("graph_generated_query_edge_counts", [0])
+        ),
+    }
+
+
+def _require_nonempty_prompt_graph(
+    prompt_graph_mode: str,
+    counters: dict[str, int],
+) -> None:
+    if prompt_graph_mode == "repo" and (
+        counters["chunks"] <= 0 or counters["graph_edges"] <= 0
+    ):
+        raise RuntimeError(
+            "repository prompt graph mode requires nonempty graph tensors: "
+            + str(sorted(counters.items()))
+        )
+
+
+def graph_conditioned_forward(
+    model,
+    input_ids,
+    position_ids,
+    *,
+    prompt_graph_mode: str,
+    structure_inputs,
+    inference_context,
+):
+    counters = _prompt_graph_counters(structure_inputs)
+    _require_nonempty_prompt_graph(prompt_graph_mode, counters)
+    if prompt_graph_mode == "repo":
+        set_prompt_graph_structure_inputs(model, structure_inputs)
+        _set_current_structure_batch(structure_inputs)
+    try:
+        logits = model(
+            input_ids,
+            position_ids,
+            None,
+            runtime_gather_output=True,
+            inference_context=inference_context,
+        )
+    finally:
+        _set_current_structure_batch(None)
+    return logits, counters
+
+
+def prompt_graph_receipt_fields(
+    prompt_graph_mode: str,
+    artifact_receipt,
+    window_receipt,
+    counters: dict[str, int],
+) -> dict[str, object]:
+    _require_nonempty_prompt_graph(prompt_graph_mode, counters)
+    return {
+        "prompt_graph_mode": prompt_graph_mode,
+        "prompt_graph_counters": dict(counters),
+        "prompt_graph_receipt": artifact_receipt,
+        "prompt_graph_window_receipt": window_receipt,
+    }
+
+
+def make_static_inference_context(seq_length: int):
+    try:
+        from megatron.core.inference.contexts import StaticInferenceContext
+    except ImportError:
+        from megatron.core.inference_params import InferenceParams as StaticInferenceContext
+    try:
+        return StaticInferenceContext(
+            max_batch_size=1,
+            max_sequence_length=seq_length,
+        )
+    except TypeError:
+        return StaticInferenceContext(1, seq_length)
+
+
+def advance_inference_context(inference_context, amount: int) -> None:
+    increment = getattr(inference_context, "increment_sequence_len_offset", None)
+    if callable(increment):
+        increment(amount)
+    else:
+        inference_context.sequence_len_offset += amount
 
 
 def cppmega_generation_model_provider(pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
@@ -773,7 +1064,7 @@ def main() -> int:
     }, sort_keys=True), flush=True)
 
     model_list = get_model(cppmega_generation_model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=False)
-    iteration = load_checkpoint(model_list, None, None, strict=True)
+    iteration = restore_checkpoint_strict(load_checkpoint, model_list)
     model = model_list[0]
     model.eval()
     _set_current_structure_batch(None)
@@ -797,8 +1088,15 @@ def main() -> int:
         for row in prompt_rows:
             task_id = str(row["task_id"])
             prompt = str(row["prompt"])
+            case_graph_mode = str(row["prompt_graph_mode"])
+            os.environ["CPPMEGA_GRAPH_ROUTES_ENABLED"] = (
+                "1" if case_graph_mode == "repo" else "0"
+            )
+            os.environ["CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS"] = (
+                "1" if case_graph_mode == "repo" else "0"
+            )
             graph_artifact = None
-            if prompt_graph_mode == "repo":
+            if case_graph_mode == "repo":
                 if graph_builder is None:
                     raise RuntimeError("repository prompt graph builder was not initialized")
                 project_index = PromptProjectIndex.from_json_path(
@@ -808,6 +1106,8 @@ def main() -> int:
                     project_index,
                     PromptGraphContext.from_prompt(
                         prompt,
+                        document_id=int(row["prompt_document_id"]),
+                        source_path=str(row["prompt_source_path"]),
                         source_start=int(row["prompt_source_start"]),
                         language=str(row["language"]),
                     ),
@@ -832,35 +1132,55 @@ def main() -> int:
             ids = list(prompt_ids)
             generated: list[int] = []
             graph_window_receipt = None
+            graph_counters = _prompt_graph_counters(None)
+            inference_context = make_static_inference_context(seq_length)
             with torch.inference_mode():
-                for _ in range(max_new_tokens):
-                    window_start = max(0, len(ids) - seq_length)
-                    ctx = ids[window_start:]
-                    input_ids = torch.tensor([ctx], dtype=torch.long, device=device)
-                    position_ids = torch.arange(len(ctx), dtype=torch.long, device=device).unsqueeze(0)
+                for decode_step in range(max_new_tokens):
+                    query_start = 0 if decode_step == 0 else len(ids) - 1
+                    query_ids = ids if decode_step == 0 else ids[-1:]
+                    key_length = query_start + len(query_ids)
+                    input_ids = torch.tensor(
+                        [query_ids], dtype=torch.long, device=device
+                    )
+                    position_ids = torch.arange(
+                        query_start,
+                        key_length,
+                        dtype=torch.long,
+                        device=device,
+                    ).unsqueeze(0)
                     structure_inputs = None
                     if graph_artifact is not None:
                         structure_inputs, graph_window_receipt = build_prompt_graph_structure_inputs(
                             graph_artifact,
                             total_token_count=len(ids),
-                            window_start=window_start,
+                            window_start=0,
                             window_end=len(ids),
+                            query_start=query_start,
                             device=device,
                         )
-                        set_prompt_graph_structure_inputs(model, structure_inputs)
-                        _set_current_structure_batch(structure_inputs)
-                    try:
-                        logits = model(
-                            input_ids,
-                            position_ids,
-                            None,
-                            runtime_gather_output=True,
+                        set_prompt_graph_inference_state(
+                            inference_context,
+                            PromptGraphInferenceState(
+                                structure_batch=structure_inputs,
+                                query_start=query_start,
+                                key_length=key_length,
+                            ),
                         )
-                    finally:
-                        if structure_inputs is not None:
-                            _set_current_structure_batch(None)
+                    logits, graph_counters = graph_conditioned_forward(
+                        model,
+                        input_ids,
+                        position_ids,
+                        prompt_graph_mode=case_graph_mode,
+                        structure_inputs=structure_inputs,
+                        inference_context=inference_context,
+                    )
+                    advance_inference_context(inference_context, len(query_ids))
                     next_id = sample_next(
-                        last_step_logits(logits, batch=1, seq=len(ctx))[0],
+                        last_step_logits(
+                            logits,
+                            batch=1,
+                            seq=len(query_ids),
+                        )[0],
                         temperature,
                         top_p,
                     )
@@ -873,10 +1193,11 @@ def main() -> int:
                         break
             raw_completion = decode(tokenizer, generated)
             completion = trim_body_completion(raw_completion)
-            graph_receipt_fields = (
-                {"prompt_graph_receipt": graph_artifact.receipt}
-                if graph_artifact is not None
-                else {}
+            graph_receipt_fields = prompt_graph_receipt_fields(
+                case_graph_mode,
+                None if graph_artifact is None else graph_artifact.receipt,
+                graph_window_receipt,
+                graph_counters,
             )
             out_row = {
                 "task_id": task_id,
@@ -885,7 +1206,6 @@ def main() -> int:
                 "generated_ids": generated,
                 "prompt_tokens": len(prompt_ids),
                 "generated_tokens": len(generated),
-                "prompt_graph_window_receipt": graph_window_receipt,
                 **graph_receipt_fields,
             }
             completion_row = {
@@ -900,6 +1220,8 @@ def main() -> int:
                 "task_id": task_id,
                 "prompt_tokens": len(prompt_ids),
                 "generated_tokens": len(generated),
+                "prompt_graph_mode": case_graph_mode,
+                "prompt_graph_counters": graph_counters,
                 "prompt_graph_cache_key": (
                     graph_artifact.receipt["cache_key"]
                     if graph_artifact is not None
@@ -1038,6 +1360,7 @@ def run_compile_gate(cases: Path, completions: Path, report: Path, *, keep_workd
         "--out",
         str(report),
         "--json",
+        "--fail-on-fail",
     ]
     if keep_workdir:
         cmd.append("--keep-workdir")
