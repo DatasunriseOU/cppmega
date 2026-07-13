@@ -45,6 +45,7 @@ from scripts.nebius_h200_megatron_cpp_world_sweep import (
     wait_for_ip,
     wait_for_ssh,
 )
+from cppmega.prompt_graph import PromptProjectIndex
 
 
 ROOT = _SCRIPT_ROOT
@@ -59,16 +60,107 @@ DEFAULT_CASES = ROOT / "evals" / "cpp_docstring_compile_cases.jsonl"
 DEFAULT_PROMPTS = ROOT / "outputs" / "evals" / "cpp_docstring_compile_prompts.jsonl"
 
 
-def make_eval_tar(cases: Path, prompts: Path, path: Path) -> None:
+def iter_jsonl(path: Path) -> Iterable[dict[str, object]]:
+    with path.open("r", encoding="utf-8") as fh:
+        for line_no, raw in enumerate(fh, start=1):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{line_no}: invalid JSONL: {exc}") from exc
+            if not isinstance(row, dict):
+                raise ValueError(f"{path}:{line_no}: expected object")
+            yield row
+
+
+def _contained_path(root: Path, raw: object, *, where: str) -> tuple[Path, Path]:
+    if not isinstance(raw, str) or not raw:
+        raise ValueError(f"{where} must be a non-empty relative path")
+    relative = Path(raw)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"{where} must be a contained relative path, got {raw!r}")
+    root = root.resolve()
+    path = (root / relative).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{where} escapes {root}: {raw!r}") from exc
+    return path, relative
+
+
+def eval_graph_assets(cases: Path, *, prompt_graph_mode: str) -> dict[Path, Path]:
+    if prompt_graph_mode not in {"repo", "off"}:
+        raise ValueError(f"unsupported prompt graph mode {prompt_graph_mode!r}")
+    if not cases.is_file():
+        raise FileNotFoundError(cases)
+    if prompt_graph_mode == "off":
+        return {}
+
+    root = cases.resolve().parent
+    assets: dict[Path, Path] = {}
+    for row in iter_jsonl(cases):
+        task_id = str(row.get("task_id", "<missing-task-id>"))
+        index_path, index_relative = _contained_path(
+            root,
+            row.get("prompt_graph_index"),
+            where=f"{task_id}.prompt_graph_index",
+        )
+        if not index_path.is_file():
+            raise FileNotFoundError(
+                f"{task_id}: prompt graph index not found: {index_path}"
+            )
+        project_index = PromptProjectIndex.from_json_path(index_path)
+        source_path = project_index.verify_source_file(index_path.parent)
+        source_start = row.get("prompt_source_start")
+        if isinstance(source_start, bool) or not isinstance(source_start, int):
+            raise ValueError(f"{task_id}.prompt_source_start must be an integer")
+        prompt = row.get("source_prefix")
+        if not isinstance(prompt, str) or not prompt:
+            raise ValueError(f"{task_id}.source_prefix must be a non-empty string")
+        prompt_end = source_start + len(prompt)
+        if source_start < 0 or project_index.source[source_start:prompt_end] != prompt:
+            raise ValueError(
+                f"{task_id}: source_prefix does not match indexed source at "
+                f"prompt_source_start={source_start}"
+            )
+
+        source_relative = index_relative.parent / project_index.source_path
+        for relative, asset in (
+            (index_relative, index_path),
+            (source_relative, source_path),
+        ):
+            previous = assets.get(relative)
+            if previous is not None and previous != asset:
+                raise ValueError(
+                    f"conflicting eval graph assets for {relative}: {previous} != {asset}"
+                )
+            assets[relative] = asset
+    return assets
+
+
+def make_eval_tar(
+    cases: Path,
+    prompts: Path,
+    path: Path,
+    *,
+    prompt_graph_mode: str,
+) -> None:
     for item in (cases, prompts):
         if not item.exists():
             raise FileNotFoundError(item)
+    graph_assets = eval_graph_assets(cases, prompt_graph_mode=prompt_graph_mode)
     with tempfile.TemporaryDirectory(prefix="cppmega-eval-stage-") as stage_raw:
         stage = Path(stage_raw)
         eval_stage = stage / "cppmega_eval"
         eval_stage.mkdir()
         os.symlink(cases.resolve(), eval_stage / "cases.jsonl")
         os.symlink(prompts.resolve(), eval_stage / "prompts.jsonl")
+        for relative, source in sorted(graph_assets.items(), key=lambda item: str(item[0])):
+            target = eval_stage / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(source, target)
         cmd = ["tar", "-czhf", str(path), "-C", str(stage), "cppmega_eval"]
         env = {**os.environ, "GZIP": "-1", "COPYFILE_DISABLE": "1"}
         printable = " ".join(shlex.quote(part) for part in cmd)
@@ -151,7 +243,17 @@ import torch
 
 from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_patch
 from cppmega.megatron.graph_route_attention_bias_patch import apply_graph_route_attention_bias_patch
+from cppmega.megatron.structure_dataset_patch import _set_current_structure_batch
 from cppmega.megatron.te_checkpoint_kwarg_patch import apply_te_checkpoint_kwarg_patch
+from cppmega.prompt_graph import (
+    CppPromptTokenizerAdapter,
+    PAIR_ROUTE_KEYS,
+    TOKEN_SIDECAR_NAMES,
+    TRIPLE_ROUTE_KEYS,
+    PromptGraphBuilder,
+    PromptGraphContext,
+    PromptProjectIndex,
+)
 
 
 def iter_jsonl(path: Path):
@@ -169,6 +271,21 @@ def iter_jsonl(path: Path):
             yield row
 
 
+def contained_eval_path(root: Path, raw: object, *, where: str) -> Path:
+    if not isinstance(raw, str) or not raw:
+        raise ValueError(f"{where} must be a non-empty relative path")
+    relative = Path(raw)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"{where} must be a contained relative path, got {raw!r}")
+    root = root.resolve()
+    path = (root / relative).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{where} escapes {root}: {raw!r}") from exc
+    return path
+
+
 def load_tokenizer(tokenizer_dir: str):
     from transformers import AutoTokenizer
 
@@ -182,11 +299,6 @@ def load_tokenizer(tokenizer_dir: str):
         raise ValueError(f"{tokenizer_json}: missing model.vocab for cppmega decode")
     tok._cppmega_id_to_token = {int(token_id): token for token, token_id in vocab.items()}
     return tok
-
-
-def encode(tokenizer, text: str) -> list[int]:
-    ids = tokenizer.encode(text, add_special_tokens=False)
-    return [int(x) for x in ids]
 
 
 def decode(tokenizer, ids: list[int]) -> str:
@@ -303,7 +415,16 @@ def _trim_at_function_closing_brace(text: str) -> str:
     return text
 
 
-def build_prompt_rows(cases_path: Path, prompts_path: Path, prompt_mode: str) -> list[dict[str, str]]:
+def build_prompt_rows(
+    cases_path: Path,
+    prompts_path: Path,
+    prompt_mode: str,
+    prompt_graph_mode: str,
+) -> list[dict[str, object]]:
+    if prompt_graph_mode not in {"repo", "off"}:
+        raise ValueError(f"unknown prompt graph mode {prompt_graph_mode!r}")
+    if prompt_graph_mode == "repo" and prompt_mode != "source-prefix":
+        raise ValueError("repository prompt graphs require prompt_mode=source-prefix")
     cases = {str(row["task_id"]): row for row in iter_jsonl(cases_path)}
     prompts = {str(row["task_id"]): row for row in iter_jsonl(prompts_path)}
     if set(cases) != set(prompts):
@@ -312,7 +433,7 @@ def build_prompt_rows(cases_path: Path, prompts_path: Path, prompt_mode: str) ->
             f"cases_only={sorted(set(cases) - set(prompts))[:5]} "
             f"prompts_only={sorted(set(prompts) - set(cases))[:5]}"
         )
-    rows: list[dict[str, str]] = []
+    rows: list[dict[str, object]] = []
     for task_id in sorted(cases):
         case = cases[task_id]
         prompt_row = prompts[task_id]
@@ -322,13 +443,32 @@ def build_prompt_rows(cases_path: Path, prompts_path: Path, prompt_mode: str) ->
             prompt_text = str(prompt_row["prompt"])
         else:
             raise ValueError(f"unknown prompt mode {prompt_mode!r}")
-        rows.append(
-            {
-                "task_id": task_id,
-                "language": str(case.get("language", "cpp")),
-                "prompt": prompt_text,
-            }
-        )
+        row: dict[str, object] = {
+            "task_id": task_id,
+            "language": str(case.get("language", "cpp")),
+            "prompt": prompt_text,
+        }
+        if prompt_graph_mode == "repo":
+            eval_root = cases_path.resolve().parent
+            index_path = contained_eval_path(
+                eval_root,
+                case.get("prompt_graph_index"),
+                where=f"{task_id}.prompt_graph_index",
+            )
+            if not index_path.is_file():
+                raise FileNotFoundError(
+                    f"{task_id}: prompt graph index not found: {index_path}"
+                )
+            project_index = PromptProjectIndex.from_json_path(index_path)
+            project_index.verify_source_file(index_path.parent)
+            source_start = case.get("prompt_source_start")
+            if isinstance(source_start, bool) or not isinstance(source_start, int):
+                raise ValueError(f"{task_id}.prompt_source_start must be an integer")
+            if source_start < 0:
+                raise ValueError(f"{task_id}.prompt_source_start must be non-negative")
+            row["prompt_graph_index_path"] = str(index_path)
+            row["prompt_source_start"] = source_start
+        rows.append(row)
     return rows
 
 
@@ -455,30 +595,63 @@ def target_module(model):
     return inner
 
 
-def set_default_structure_inputs(model, batch: int, seq: int, device: torch.device) -> None:
+def build_prompt_graph_structure_inputs(
+    graph_artifact,
+    *,
+    total_token_count: int,
+    window_start: int,
+    window_end: int,
+    device: torch.device,
+):
+    graph_inputs = graph_artifact.model_inputs(
+        total_token_count=total_token_count,
+        window_start=window_start,
+        window_end=window_end,
+    )
+    routes = graph_inputs.graph_routes
+    structure_inputs = {
+        name: torch.tensor(
+            [graph_inputs.side_channels[name]],
+            dtype=torch.long,
+            device=device,
+        )
+        for name in TOKEN_SIDECAR_NAMES
+    }
+    for _relation, (route_key, count_key) in PAIR_ROUTE_KEYS.items():
+        structure_inputs[route_key] = torch.tensor(
+            routes[route_key], dtype=torch.long, device=device
+        ).reshape(1, -1, 2)
+        structure_inputs[count_key] = torch.tensor(
+            routes[count_key], dtype=torch.long, device=device
+        )
+    for _relation, (route_key, count_key) in TRIPLE_ROUTE_KEYS.items():
+        structure_inputs[route_key] = torch.tensor(
+            routes[route_key], dtype=torch.long, device=device
+        ).reshape(1, -1, 3)
+        structure_inputs[count_key] = torch.tensor(
+            routes[count_key], dtype=torch.long, device=device
+        )
+    for name in (
+        "graph_chunk_starts",
+        "graph_chunk_ends",
+        "graph_chunk_kinds",
+        "graph_chunk_dep_levels",
+    ):
+        structure_inputs[name] = torch.tensor(
+            [routes[name]], dtype=torch.long, device=device
+        )
+    structure_inputs["graph_chunk_counts"] = torch.tensor(
+        routes["graph_chunk_counts"], dtype=torch.long, device=device
+    )
+    return structure_inputs, graph_inputs.receipt
+
+
+def set_prompt_graph_structure_inputs(model, structure_inputs) -> None:
     module = target_module(model)
     setter = getattr(module, "set_cppmega_structure_inputs", None)
     if setter is None:
         raise AttributeError("CppMega model does not expose set_cppmega_structure_inputs")
-    zeros = torch.zeros((batch, seq), dtype=torch.long, device=device)
-    empty_counts = torch.zeros((batch,), dtype=torch.long, device=device)
-    setter(
-        {
-            "structure_ids": zeros,
-            "dep_levels": zeros,
-            "ast_depth_ids": zeros,
-            "sibling_index_ids": zeros,
-            "node_type_ids": zeros,
-            # Standalone function prompts have no repository graph. Preserve the
-            # graph-routed checkpoint contract with an explicit empty graph; an
-            # absent graph must fail closed instead of looking token-only by accident.
-            "graph_call_edges": torch.zeros((batch, 0, 2), dtype=torch.long, device=device),
-            "graph_call_edge_counts": empty_counts,
-            "graph_chunk_starts": torch.zeros((batch, 0), dtype=torch.long, device=device),
-            "graph_chunk_ends": torch.zeros((batch, 0), dtype=torch.long, device=device),
-            "graph_chunk_counts": empty_counts,
-        }
-    )
+    setter(structure_inputs)
 
 
 def cppmega_generation_model_provider(pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
@@ -542,15 +715,43 @@ def main() -> int:
     temperature = float(os.environ["CPPMEGA_TEMPERATURE"])
     top_p = float(os.environ["CPPMEGA_TOP_P"])
     prompt_mode = os.environ["CPPMEGA_PROMPT_MODE"]
+    prompt_graph_mode = os.environ["CPPMEGA_PROMPT_GRAPH_MODE"]
     checkpoint_dir = os.environ["CPPMEGA_CHECKPOINT_DIR"]
     tokenizer_dir = os.environ["CPPMEGA_TOKENIZER_DIR"]
     fp8_recipe = os.environ["CPPMEGA_FP8_RECIPE"]
+    if prompt_graph_mode not in {"repo", "off"}:
+        raise ValueError(f"unknown prompt graph mode {prompt_graph_mode!r}")
+    if prompt_graph_mode == "repo":
+        required_flags = (
+            "CPPMEGA_STRUCTURE_ENABLED",
+            "CPPMEGA_GRAPH_ROUTES_ENABLED",
+            "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS",
+        )
+        disabled = [name for name in required_flags if os.environ.get(name) != "1"]
+        if disabled:
+            raise RuntimeError(
+                "repository prompt graphs require enabled structure/route flags: "
+                + ", ".join(disabled)
+            )
 
     tokenizer = load_tokenizer(tokenizer_dir)
+    prompt_tokenizer = CppPromptTokenizerAdapter(
+        tokenizer,
+        tokenizer_path=Path(tokenizer_dir) / "tokenizer.json",
+    )
+    graph_builder = (
+        PromptGraphBuilder(
+            prompt_tokenizer,
+            cache_dir=Path(os.environ["CPPMEGA_PROMPT_GRAPH_CACHE_DIR"]),
+        )
+        if prompt_graph_mode == "repo"
+        else None
+    )
     prompt_rows = build_prompt_rows(
         Path("/data/cppmega_eval/cases.jsonl"),
         Path("/data/cppmega_eval/prompts.jsonl"),
         prompt_mode,
+        prompt_graph_mode,
     )
 
     sys.argv = build_megatron_argv(seq_length, checkpoint_dir, tokenizer_dir, fp8_recipe)
@@ -566,6 +767,7 @@ def main() -> int:
         "hidden_size": args.hidden_size,
         "hybrid_layer_pattern": args.hybrid_layer_pattern,
         "structure_enabled": os.environ.get("CPPMEGA_STRUCTURE_ENABLED"),
+        "prompt_graph_mode": prompt_graph_mode,
         "fp8_recipe": fp8_recipe,
         "load": args.load,
     }, sort_keys=True), flush=True)
@@ -574,6 +776,7 @@ def main() -> int:
     iteration = load_checkpoint(model_list, None, None, strict=True)
     model = model_list[0]
     model.eval()
+    _set_current_structure_batch(None)
     torch.cuda.reset_peak_memory_stats()
     device = torch.device("cuda")
 
@@ -582,6 +785,7 @@ def main() -> int:
     summary = {
         "checkpoint_iteration": int(iteration) if isinstance(iteration, int) else str(iteration),
         "prompt_mode": prompt_mode,
+        "prompt_graph_mode": prompt_graph_mode,
         "max_new_tokens": max_new_tokens,
         "temperature": temperature,
         "top_p": top_p,
@@ -591,26 +795,70 @@ def main() -> int:
     eos_id = int(getattr(tokenizer, "eos_token_id", 3) or 3)
     with completions_path.open("w", encoding="utf-8") as comp_fh, detail_path.open("w", encoding="utf-8") as detail_fh:
         for row in prompt_rows:
-            prompt_ids = encode(tokenizer, row["prompt"])
+            task_id = str(row["task_id"])
+            prompt = str(row["prompt"])
+            graph_artifact = None
+            if prompt_graph_mode == "repo":
+                if graph_builder is None:
+                    raise RuntimeError("repository prompt graph builder was not initialized")
+                project_index = PromptProjectIndex.from_json_path(
+                    str(row["prompt_graph_index_path"])
+                )
+                graph_artifact = graph_builder.build(
+                    project_index,
+                    PromptGraphContext.from_prompt(
+                        prompt,
+                        source_start=int(row["prompt_source_start"]),
+                        language=str(row["language"]),
+                    ),
+                )
+                prompt_ids = list(graph_artifact.token_ids)
+            else:
+                prompt_ids, _prompt_offsets = prompt_tokenizer.encode_with_offsets(
+                    prompt
+                )
             if not prompt_ids:
-                raise ValueError(f"{row['task_id']}: prompt tokenized to empty ids")
+                raise ValueError(f"{task_id}: prompt tokenized to empty ids")
             if len(prompt_ids) >= seq_length:
-                prompt_ids = prompt_ids[-(seq_length - 1) :]
+                raise ValueError(
+                    f"{task_id}: prompt has {len(prompt_ids)} tokens, which does not "
+                    f"fit seq_length={seq_length} without breaking graph alignment"
+                )
+            if graph_artifact is not None and len(prompt_ids) + max_new_tokens > seq_length:
+                raise ValueError(
+                    f"{task_id}: prompt plus max_new_tokens exceeds seq_length; "
+                    "repository graph decode does not discard indexed prompt tokens"
+                )
             ids = list(prompt_ids)
             generated: list[int] = []
+            graph_window_receipt = None
             with torch.inference_mode():
                 for _ in range(max_new_tokens):
-                    ctx = ids[-seq_length:]
+                    window_start = max(0, len(ids) - seq_length)
+                    ctx = ids[window_start:]
                     input_ids = torch.tensor([ctx], dtype=torch.long, device=device)
                     position_ids = torch.arange(len(ctx), dtype=torch.long, device=device).unsqueeze(0)
-                    if os.environ.get("CPPMEGA_STRUCTURE_ENABLED", "0") == "1":
-                        set_default_structure_inputs(model, 1, len(ctx), device)
-                    logits = model(
-                        input_ids,
-                        position_ids,
-                        None,
-                        runtime_gather_output=True,
-                    )
+                    structure_inputs = None
+                    if graph_artifact is not None:
+                        structure_inputs, graph_window_receipt = build_prompt_graph_structure_inputs(
+                            graph_artifact,
+                            total_token_count=len(ids),
+                            window_start=window_start,
+                            window_end=len(ids),
+                            device=device,
+                        )
+                        set_prompt_graph_structure_inputs(model, structure_inputs)
+                        _set_current_structure_batch(structure_inputs)
+                    try:
+                        logits = model(
+                            input_ids,
+                            position_ids,
+                            None,
+                            runtime_gather_output=True,
+                        )
+                    finally:
+                        if structure_inputs is not None:
+                            _set_current_structure_batch(None)
                     next_id = sample_next(
                         last_step_logits(logits, batch=1, seq=len(ctx))[0],
                         temperature,
@@ -625,21 +873,43 @@ def main() -> int:
                         break
             raw_completion = decode(tokenizer, generated)
             completion = trim_body_completion(raw_completion)
+            graph_receipt_fields = (
+                {"prompt_graph_receipt": graph_artifact.receipt}
+                if graph_artifact is not None
+                else {}
+            )
             out_row = {
-                "task_id": row["task_id"],
+                "task_id": task_id,
                 "completion": completion,
                 "raw_completion": raw_completion,
                 "generated_ids": generated,
                 "prompt_tokens": len(prompt_ids),
                 "generated_tokens": len(generated),
+                "prompt_graph_window_receipt": graph_window_receipt,
+                **graph_receipt_fields,
             }
-            comp_fh.write(json.dumps({"task_id": row["task_id"], "completion": completion}, ensure_ascii=False) + "\n")
+            completion_row = {
+                "task_id": task_id,
+                "completion": completion,
+                **graph_receipt_fields,
+            }
+            comp_fh.write(json.dumps(completion_row, ensure_ascii=False) + "\n")
             detail_fh.write(json.dumps(out_row, ensure_ascii=False) + "\n")
             summary["items"].append(out_row)
             print("CPPMEGA_GENERATION_ITEM=" + json.dumps({
-                "task_id": row["task_id"],
+                "task_id": task_id,
                 "prompt_tokens": len(prompt_ids),
                 "generated_tokens": len(generated),
+                "prompt_graph_cache_key": (
+                    graph_artifact.receipt["cache_key"]
+                    if graph_artifact is not None
+                    else None
+                ),
+                "prompt_graph_edge_counts": (
+                    graph_artifact.receipt["edge_counts"]
+                    if graph_artifact is not None
+                    else None
+                ),
                 "completion_preview": completion[:120],
             }, sort_keys=True), flush=True)
 
@@ -667,9 +937,13 @@ def remote_generation_script(
     temperature: float,
     top_p: float,
     prompt_mode: str,
+    prompt_graph_mode: str,
     fp8_recipe: str,
     disable_nvrtc: bool,
 ) -> str:
+    if prompt_graph_mode not in {"repo", "off"}:
+        raise ValueError(f"unsupported prompt graph mode {prompt_graph_mode!r}")
+    graph_flag_default = 1 if prompt_graph_mode == "repo" else 0
     # Keep the generated Python here-doc aligned with the surrounding shell
     # template so textwrap.dedent can put HEREDOC delimiters at column 0.
     worker = textwrap.indent(generation_worker_source(), "        ")
@@ -714,18 +988,20 @@ def remote_generation_script(
         export PYTORCH_CUDA_ALLOC_CONF="${{PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}}"
         export TRITON_CACHE_DIR="/data/.triton-cache"
         export NVTE_DISABLE_NVRTC="{1 if disable_nvrtc else 0}"
-        export CPPMEGA_STRUCTURE_ENABLED="${{CPPMEGA_STRUCTURE_ENABLED:-1}}"
-        export CPPMEGA_GRAPH_ROUTES_ENABLED="${{CPPMEGA_GRAPH_ROUTES_ENABLED:-1}}"
-        export CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS="${{CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS:-1}}"
+        export CPPMEGA_STRUCTURE_ENABLED="${{CPPMEGA_STRUCTURE_ENABLED:-{graph_flag_default}}}"
+        export CPPMEGA_GRAPH_ROUTES_ENABLED="${{CPPMEGA_GRAPH_ROUTES_ENABLED:-{graph_flag_default}}}"
+        export CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS="${{CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS:-{graph_flag_default}}}"
         export CPPMEGA_SEQ_LENGTH="{seq_length}"
         export CPPMEGA_MAX_NEW_TOKENS="{max_new_tokens}"
         export CPPMEGA_TEMPERATURE="{temperature}"
         export CPPMEGA_TOP_P="{top_p}"
         export CPPMEGA_PROMPT_MODE="{prompt_mode}"
+        export CPPMEGA_PROMPT_GRAPH_MODE="{prompt_graph_mode}"
+        export CPPMEGA_PROMPT_GRAPH_CACHE_DIR="/data/cppmega_h200_generation_results/prompt_graph_cache"
         export CPPMEGA_FP8_RECIPE="{fp8_recipe}"
         export CPPMEGA_CHECKPOINT_DIR="/data/cppmega_load_checkpoint"
         export CPPMEGA_TOKENIZER_DIR="/data/cpp_tokenizer_hf"
-        mkdir -p "$TRITON_CACHE_DIR" /data/cppmega_h200_generation_results
+        mkdir -p "$TRITON_CACHE_DIR" "$CPPMEGA_PROMPT_GRAPH_CACHE_DIR"
 
         eval "$(python -m cppmega.recipes.run_profiles shell h200_cpp_world_mini \
           --seq-length {seq_length} \
@@ -799,6 +1075,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--prompt-mode", choices=("source-prefix", "instruction"), default="source-prefix")
+    parser.add_argument("--prompt-graph-mode", choices=("repo", "off"), default="repo")
     parser.add_argument("--fp8-recipe", choices=("off", "tensorwise"), default="off")
     parser.add_argument("--disable-nvrtc", action="store_true")
     parser.add_argument("--remote-timeout-s", type=int, default=3600)
@@ -819,6 +1096,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         raise ValueError("--top-p must be in [0, 1]")
     if args.temperature < 0:
         raise ValueError("--temperature must be non-negative")
+    if args.prompt_graph_mode == "repo" and args.prompt_mode != "source-prefix":
+        raise ValueError("--prompt-graph-mode=repo requires --prompt-mode=source-prefix")
+    if not args.prompts.is_file():
+        raise FileNotFoundError(args.prompts)
+    eval_graph_assets(args.cases, prompt_graph_mode=args.prompt_graph_mode)
 
     pubkey_path = args.ssh_pubkey or Path(str(args.ssh_key) + ".pub")
     if not pubkey_path.exists():
@@ -832,6 +1114,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         temperature=args.temperature,
         top_p=args.top_p,
         prompt_mode=args.prompt_mode,
+        prompt_graph_mode=args.prompt_graph_mode,
         fp8_recipe=args.fp8_recipe,
         disable_nvrtc=args.disable_nvrtc,
     )
@@ -840,6 +1123,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         print(f"tokenizer_dir={args.tokenizer_dir}")
         print(f"cases={args.cases}")
         print(f"prompts={args.prompts}")
+        print(f"prompt_graph_mode={args.prompt_graph_mode}")
         print(script[:5000])
         return 0
 
@@ -856,7 +1140,12 @@ def main(argv: Iterable[str] | None = None) -> int:
 
             make_overlay_tar(overlay_tar)
             make_tokenizer_tar(args.tokenizer_dir, tokenizer_tar)
-            make_eval_tar(args.cases, args.prompts, eval_tar)
+            make_eval_tar(
+                args.cases,
+                args.prompts,
+                eval_tar,
+                prompt_graph_mode=args.prompt_graph_mode,
+            )
             make_checkpoint_plain_tar(args.checkpoint_local, checkpoint_tar)
             has_ghcr_auth = make_ghcr_auth_tar(args, ghcr_auth_tar)
             if args.docker_image.startswith("ghcr.io/") and not has_ghcr_auth and not args.no_ghcr_auth:

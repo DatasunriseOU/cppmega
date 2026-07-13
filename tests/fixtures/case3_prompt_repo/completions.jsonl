@@ -1,0 +1,1 @@
+{"task_id":"case3_add_one_checked","completion":"  return clamp_to_zero(acc.value) + 1;\n"}

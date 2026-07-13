@@ -54,6 +54,7 @@ DEFAULT_SIDECAR_PREFIX = (
 DEFAULT_TOKENIZER_DIR = ROOT / "data" / "tokenizer_v2"
 OVERLAY_PATHS = (
     "cppmega/receipt_binding.py",
+    "cppmega/prompt_graph.py",
     "cppmega/recipes/run_profiles.py",
     "cppmega/megatron/custom_mamba_model.py",
     "cppmega/megatron/mamba_builder.py",

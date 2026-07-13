@@ -1,6 +1,10 @@
 import ast
+import json
 import subprocess
 import tarfile
+from pathlib import Path
+
+import pytest
 
 from scripts.nebius_h200_megatron_cpp_generation_eval import (
     generation_worker_source,
@@ -9,7 +13,26 @@ from scripts.nebius_h200_megatron_cpp_generation_eval import (
     make_eval_tar,
     make_tokenizer_tar,
     remote_generation_script,
+    run_compile_gate,
 )
+
+
+ROOT = Path(__file__).resolve().parents[1]
+CASE3_FIXTURE = ROOT / "tests" / "fixtures" / "case3_prompt_repo"
+
+
+class _OffsetTokenizer:
+    name_or_path = "case3-offset-tokenizer"
+
+    def encode_with_offsets(self, text: str):
+        return [ord(ch) % 251 + 1 for ch in text], [
+            (index, index + 1) for index in range(len(text))
+        ]
+
+
+def _case3_prompt() -> str:
+    row = json.loads((CASE3_FIXTURE / "cases.jsonl").read_text().splitlines()[0])
+    return row["source_prefix"]
 
 
 def test_remote_generation_script_is_bash_parseable(tmp_path):
@@ -20,6 +43,7 @@ def test_remote_generation_script_is_bash_parseable(tmp_path):
         temperature=0.0,
         top_p=1.0,
         prompt_mode="source-prefix",
+        prompt_graph_mode="repo",
         fp8_recipe="off",
         disable_nvrtc=True,
     )
@@ -35,6 +59,8 @@ def test_remote_generation_script_is_bash_parseable(tmp_path):
     assert "apply_dsa_indexer_fused_patch()" in script
     assert "apply_graph_route_attention_bias_patch()" in script
     assert 'export CPPMEGA_PROMPT_MODE="source-prefix"' in script
+    assert 'export CPPMEGA_PROMPT_GRAPH_MODE="repo"' in script
+    assert 'export CPPMEGA_PROMPT_GRAPH_CACHE_DIR="/data/cppmega_h200_generation_results/prompt_graph_cache"' in script
     assert 'export CPPMEGA_CHECKPOINT_DIR="/data/cppmega_load_checkpoint"' in script
     assert 'export NVTE_DISABLE_NVRTC="1"' in script
     assert "pretrain_mamba.py" not in script
@@ -63,16 +89,66 @@ def test_generation_worker_builds_model_loads_checkpoint_and_threads_sidecars():
     assert "get_model(cppmega_generation_model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=False)" in worker
     assert "load_checkpoint(model_list, None, None, strict=True)" in worker
     assert "set_cppmega_structure_inputs" in worker
-    assert '"structure_ids": zeros' in worker
-    assert '"graph_call_edges": torch.zeros((batch, 0, 2)' in worker
-    assert '"graph_call_edge_counts": empty_counts' in worker
-    assert '"graph_chunk_counts": empty_counts' in worker
+    assert "TOKEN_SIDECAR_NAMES" in worker
+    assert "build_prompt_graph_structure_inputs" in worker
+    assert "PromptGraphBuilder" in worker
+    assert "CppPromptTokenizerAdapter" in worker
+    assert "PromptProjectIndex.from_json_path" in worker
+    assert "_set_current_structure_batch(structure_inputs)" in worker
+    assert "_set_current_structure_batch(None)" in worker
+    assert "finally:" in worker
+    assert '"prompt_graph_receipt": graph_artifact.receipt' in worker
+    assert '"graph_call_edges": torch.zeros((batch, 0, 2)' not in worker
+    assert '"graph_call_edge_counts": empty_counts' not in worker
+    assert '"graph_chunk_counts": empty_counts' not in worker
     assert "--load" in worker
     assert "--no-load-optim" in worker
     assert "--no-load-rng" in worker
     assert "pretrain_mamba" not in worker
     assert "apply_graph_route_attention_bias_patch()" in worker
     assert "apply_dsa_indexer_fused_patch()" in worker
+
+
+def test_prompt_graph_builder_serializes_h200_structure_inputs(tmp_path):
+    from cppmega.prompt_graph import (
+        PromptGraphBuilder,
+        PromptGraphContext,
+        PromptProjectIndex,
+        TOKEN_SIDECAR_DEFAULTS,
+    )
+
+    prompt = _case3_prompt()
+    builder = PromptGraphBuilder(_OffsetTokenizer(), cache_dir=tmp_path)
+    artifact = builder.build(
+        PromptProjectIndex.from_json_path(CASE3_FIXTURE / "project_index.json"),
+        PromptGraphContext.from_prompt(prompt, source_start=0),
+    )
+
+    assert artifact.edge_counts["call"] == 1
+    assert artifact.edge_counts["type"] == 1
+    assert artifact.edge_counts["def_use"] == 1
+    assert artifact.graph_routes["graph_call_edges"] == [[2, 1]]
+    assert artifact.graph_routes["graph_type_edges"] == [[3, 0]]
+    assert artifact.graph_routes["graph_domain_edges"] == [
+        [
+            artifact.first_token_for_identity("call:warmup->clamp_to_zero"),
+            artifact.first_token_for_identity("tiny::clamp_to_zero"),
+            2,
+        ]
+    ]
+    restored = artifact.__class__.from_dict(json.loads(artifact.to_json()))
+    assert restored.receipt == artifact.receipt
+    assert (tmp_path / f"{artifact.receipt['cache_key']}.json").is_file()
+    model_inputs = artifact.model_inputs(
+        total_token_count=artifact.token_count + 2,
+        window_start=1,
+        window_end=artifact.token_count + 2,
+    )
+    assert model_inputs.graph_routes["graph_call_edges"] == [[2, 1]]
+    assert all(
+        values[-2:] == [TOKEN_SIDECAR_DEFAULTS[name]] * 2
+        for name, values in model_inputs.side_channels.items()
+    )
 
 
 def test_generation_worker_can_emit_tensorwise_fp8_args():
@@ -110,19 +186,53 @@ return value;
 """
 
 
-def test_make_eval_tar_contains_cases_and_prompts(tmp_path):
-    cases = tmp_path / "cases.jsonl"
-    prompts = tmp_path / "prompts.jsonl"
-    cases.write_text('{"task_id":"x","prompt":"p","source_prefix":"int f(){\\n","source_suffix":"}\\n"}\n')
-    prompts.write_text('{"task_id":"x","prompt":"p"}\n')
+def test_make_eval_tar_contains_cases_prompts_and_project_index(tmp_path):
     out = tmp_path / "eval.tgz"
 
-    make_eval_tar(cases, prompts, out)
+    make_eval_tar(
+        CASE3_FIXTURE / "cases.jsonl",
+        CASE3_FIXTURE / "prompts.jsonl",
+        out,
+        prompt_graph_mode="repo",
+    )
 
     with tarfile.open(out, "r:gz") as tf:
         names = set(tf.getnames())
     assert "cppmega_eval/cases.jsonl" in names
     assert "cppmega_eval/prompts.jsonl" in names
+    assert "cppmega_eval/project_index.json" in names
+    assert "cppmega_eval/src/math_prompt.cpp" in names
+
+
+def test_make_eval_tar_fails_closed_when_repo_graph_index_is_missing(tmp_path):
+    cases = tmp_path / "cases.jsonl"
+    prompts = tmp_path / "prompts.jsonl"
+    cases.write_text(
+        '{"task_id":"x","source_prefix":"int f(){\\n","source_suffix":"}\\n"}\n'
+    )
+    prompts.write_text('{"task_id":"x","prompt":"p"}\n')
+
+    with pytest.raises(ValueError, match="x.*prompt_graph_index"):
+        make_eval_tar(
+            cases,
+            prompts,
+            tmp_path / "eval.tgz",
+            prompt_graph_mode="repo",
+        )
+
+
+def test_case3_fixture_passes_local_compile_gate(tmp_path):
+    report = tmp_path / "compile_report.json"
+
+    rc = run_compile_gate(
+        CASE3_FIXTURE / "cases.jsonl",
+        CASE3_FIXTURE / "completions.jsonl",
+        report,
+        keep_workdir=False,
+    )
+
+    assert rc == 0
+    assert json.loads(report.read_text())["summary"]["passed"] == 1
 
 
 def test_make_tokenizer_tar_requires_and_includes_tokenizer_json(tmp_path):
@@ -170,10 +280,6 @@ def test_dry_run_prints_remote_generation_script(tmp_path, capsys):
     tokenizer = tmp_path / "tok"
     tokenizer.mkdir()
     (tokenizer / "tokenizer.json").write_text("{}")
-    cases = tmp_path / "cases.jsonl"
-    prompts = tmp_path / "prompts.jsonl"
-    cases.write_text('{"task_id":"x","prompt":"p","source_prefix":"int f(){\\n","source_suffix":"}\\n"}\n')
-    prompts.write_text('{"task_id":"x","prompt":"p"}\n')
 
     rc = main(
         [
@@ -185,9 +291,9 @@ def test_dry_run_prints_remote_generation_script(tmp_path, capsys):
             "--tokenizer-dir",
             str(tokenizer),
             "--cases",
-            str(cases),
+            str(CASE3_FIXTURE / "cases.jsonl"),
             "--prompts",
-            str(prompts),
+            str(CASE3_FIXTURE / "prompts.jsonl"),
             "--max-new-tokens",
             "8",
         ]
@@ -198,3 +304,4 @@ def test_dry_run_prints_remote_generation_script(tmp_path, capsys):
     assert "checkpoint_local=" in out
     assert "generate_worker.py" in out
     assert "cppmega_h200_generation_results" in out
+    assert 'CPPMEGA_PROMPT_GRAPH_MODE="repo"' in out

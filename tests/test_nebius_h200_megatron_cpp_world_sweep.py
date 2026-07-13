@@ -354,6 +354,7 @@ def test_remote_script_does_not_shadow_upstream_model_provider():
 
 
 def test_overlay_includes_batch_and_dataset_sidecar_contract():
+    assert "cppmega/prompt_graph.py" in OVERLAY_PATHS
     assert "cppmega/megatron/custom_mamba_model.py" in OVERLAY_PATHS
     assert "cppmega/megatron/mamba_builder.py" in OVERLAY_PATHS
     assert "cppmega/megatron/te_checkpoint_kwarg_patch.py" in OVERLAY_PATHS
