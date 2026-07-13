@@ -41,7 +41,8 @@ jobs:
             tests/test_build_macro_routes_megatron_bundle.py \
             tests/test_dsa_sparse_attention.py \
             tests/test_publish_megatron_bundle_to_nebius_s3.py \
-            tests/test_restore_megatron_bundle_from_nebius_s3.py
+            tests/test_restore_megatron_bundle_from_nebius_s3.py \
+            tests/test_workflow_runner_policy.py
           "${python_bin}" scripts/data/verify_tokenizer_contract.py \
             --root /Volumes/external/sources
           git diff --check
@@ -69,5 +70,6 @@ jobs:
             tests/test_subset_megatron_sidecar_prefix.py \
             tests/test_build_macro_routes_megatron_bundle.py \
             tests/test_publish_megatron_bundle_to_nebius_s3.py \
-            tests/test_restore_megatron_bundle_from_nebius_s3.py
+            tests/test_restore_megatron_bundle_from_nebius_s3.py \
+            tests/test_workflow_runner_policy.py
           git diff --check

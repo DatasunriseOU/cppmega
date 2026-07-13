@@ -1,8 +1,8 @@
 name: build-wheels
 
 # Build all custom CUDA wheels (TE 2.16.0.dev0, flash-attn, mamba_ssm,
-# causal_conv1d, fast_hadamard, tilelang, qoptim_cuda) on free ubuntu-latest
-# x86_64 runners (50000 free min/month).
+# causal_conv1d, fast_hadamard, tilelang, qoptim_cuda) on the repository's
+# persistent self-hosted Linux x86_64 runner.
 #
 # Each matrix entry caches its own ~/.ccache between runs, keyed on source
 # git commit. Wheels are uploaded as a single GH Release `wheels-${{ inputs.tag }}`.
@@ -18,6 +18,7 @@ on:
         required: false
         type: string
   push:
+    branches: [main]
     paths:
       - STACK.lock
       - upstream_prs/*.patch
@@ -45,7 +46,7 @@ env:
 jobs:
   resolve:
     if: github.repository == 'DatasunriseOU/cppmega'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, cppmega]
     outputs:
       tag: ${{ steps.t.outputs.tag }}
     steps:
@@ -60,7 +61,7 @@ jobs:
   build:
     if: github.repository == 'DatasunriseOU/cppmega'
     needs: [resolve]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, cppmega]
     timeout-minutes: 350     # 6h hard limit; flash_attn at MAX_JOBS=1 ~= 4h
     strategy:
       fail-fast: false
@@ -171,17 +172,17 @@ jobs:
       - name: Checkout cppmega (for patches)
         uses: actions/checkout@v4
 
-      - name: Free disk space
-        # Reclaims ~30 GB by removing Android SDK / dotnet / Haskell / etc.
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: false
+      - name: Verify persistent runner capacity
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h "$GITHUB_WORKSPACE"
+          available_kib=$(df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 {print $4}')
+          minimum_kib=$((120 * 1024 * 1024))
+          if (( available_kib < minimum_kib )); then
+            echo "::error::CUDA wheel build requires at least 120 GiB free on the persistent runner"
+            exit 1
+          fi
 
       - name: Resolve source SHA
         id: src
@@ -202,7 +203,7 @@ jobs:
         # We pulled gcc-15 .debs from Ubuntu questing (25.10) main archive
         # once and uploaded them as a release asset on this repo. This avoids
         # the chronically flaky Launchpad PPA (api.launchpad.net + ppa.launchpad
-        # content.net both regularly time out / return 503 from GH runners,
+        # content.net both regularly time out / return 503 from CI runners,
         # blocking every wheel build for hours).
         # Source: archive.ubuntu.com/ubuntu/pool/main/g/gcc-15/ (15.2.0-4ubuntu4)
         # Release: github.com/${{ github.repository }}/releases/tag/${TOOLCHAIN_TAG}
@@ -262,13 +263,16 @@ jobs:
           echo "CUDA_HOME=/usr/local/cuda-13.2" >> "$GITHUB_ENV"
           echo "/usr/local/cuda-13.2/bin" >> "$GITHUB_PATH"
           /usr/local/cuda-13.2/bin/nvcc --version
-          # Stub libs for libcuda/libnvidia-ml — runners have no NVIDIA driver,
-          # so the real .so isn't present. CMake (CUDA::cuda_driver, CUDA::nvml)
-          # and link-time refs need symlinks from stubs/ into lib64/.
-          sudo ln -sf /usr/local/cuda-13.2/lib64/stubs/libcuda.so /usr/local/cuda-13.2/lib64/libcuda.so
-          sudo ln -sf /usr/local/cuda-13.2/lib64/stubs/libcuda.so /usr/local/cuda-13.2/lib64/libcuda.so.1
-          sudo ln -sf /usr/local/cuda-13.2/lib64/stubs/libnvidia-ml.so /usr/local/cuda-13.2/lib64/libnvidia-ml.so
-          sudo ln -sf /usr/local/cuda-13.2/lib64/stubs/libnvidia-ml.so /usr/local/cuda-13.2/lib64/libnvidia-ml.so.1
+          # Keep real driver libraries intact on persistent GPU runners. Add
+          # toolkit stubs only when the host has no driver library at all.
+          if ! ldconfig -p | grep -q 'libcuda\.so\.1'; then
+            sudo ln -sf /usr/local/cuda-13.2/lib64/stubs/libcuda.so /usr/local/cuda-13.2/lib64/libcuda.so
+            sudo ln -sf /usr/local/cuda-13.2/lib64/stubs/libcuda.so /usr/local/cuda-13.2/lib64/libcuda.so.1
+          fi
+          if ! ldconfig -p | grep -q 'libnvidia-ml\.so\.1'; then
+            sudo ln -sf /usr/local/cuda-13.2/lib64/stubs/libnvidia-ml.so /usr/local/cuda-13.2/lib64/libnvidia-ml.so
+            sudo ln -sf /usr/local/cuda-13.2/lib64/stubs/libnvidia-ml.so /usr/local/cuda-13.2/lib64/libnvidia-ml.so.1
+          fi
 
       - name: Wire ccache as gcc/g++/nvcc via PATH
         # CC="ccache gcc-15" breaks setuptools/ninja (it splits the value and
@@ -490,7 +494,7 @@ jobs:
   release:
     if: github.repository == 'DatasunriseOU/cppmega'
     needs: [resolve, build]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, cppmega]
     steps:
       - uses: actions/checkout@v4
 
