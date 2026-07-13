@@ -131,6 +131,45 @@ def test_graph_route_chunk_edge_expands_to_token_span_block():
     assert torch.equal(bias, expected)
 
 
+def test_graph_objective_golden_span_expansion_uses_doc_and_upstream_masks():
+    from cppmega.megatron import dsa_indexer_fused_patch as fused_patch
+
+    structure_batch = {
+        "graph_call_edges": torch.tensor(
+            [[[2, 1], [0, 2]]], dtype=torch.long
+        ),
+        "graph_call_edge_counts": torch.tensor([1], dtype=torch.long),
+        "graph_chunk_starts": torch.tensor([[0, 2, 4]], dtype=torch.long),
+        "graph_chunk_ends": torch.tensor([[2, 4, 6]], dtype=torch.long),
+        "graph_chunk_counts": torch.tensor([3], dtype=torch.long),
+        "graph_document_ids": torch.tensor(
+            [[101, 101, 202, 202, 202, 202]], dtype=torch.long
+        ),
+    }
+    upstream_mask = torch.zeros((6, 6), dtype=torch.float32)
+    upstream_mask[5, 3] = float("-inf")
+
+    targets, pair_mask = fused_patch.build_graph_objective_tensors(
+        structure_batch,
+        relations=("call",),
+        batch_size=1,
+        seqlen_q=6,
+        seqlen_k=6,
+        device=torch.device("cpu"),
+        upstream_mask=upstream_mask,
+    )
+
+    expected_targets = torch.zeros((1, 6, 6), dtype=torch.bool)
+    expected_targets[0, 4, 2] = True
+    expected_targets[0, 4, 3] = True
+    expected_targets[0, 5, 2] = True
+    assert torch.equal(targets, expected_targets)
+    assert pair_mask[0, 1, 0]
+    assert not pair_mask[0, 2, 1]
+    assert not pair_mask[0, 5, 3]
+    assert torch.all(~targets | pair_mask)
+
+
 def test_graph_route_bias_from_structure_batch_scatter_domain_edge_triples():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     structure_batch = {
@@ -310,6 +349,71 @@ def test_dsa_backward_reuses_its_own_microbatch_graph(monkeypatch):
     assert torch.equal(ctx.backward_seen, first["graph_call_edges"])
     assert not torch.equal(ctx.backward_seen, second["graph_call_edges"])
     _set_current_structure_batch(None)
+
+
+def test_dsa_indexer_loss_wrapper_adds_weighted_graph_objective(monkeypatch):
+    from cppmega.megatron import dsa_indexer_fused_patch as fused_patch
+    from cppmega.megatron.structure_dataset_patch import _set_current_structure_batch
+
+    def base_indexer_loss(index_scores, *_args, **_kwargs):
+        return index_scores.sum() * 0.0 + 2.0
+
+    fake_module = SimpleNamespace(compute_dsa_indexer_loss=base_indexer_loss)
+    structure_batch = {
+        "graph_call_edges": torch.tensor([[[1, 0]]], dtype=torch.long),
+        "graph_call_edge_counts": torch.tensor([1], dtype=torch.long),
+        "graph_chunk_starts": torch.tensor([[0, 1]], dtype=torch.long),
+        "graph_chunk_ends": torch.tensor([[1, 2]], dtype=torch.long),
+        "graph_chunk_counts": torch.tensor([2], dtype=torch.long),
+        "graph_document_ids": torch.tensor([[7, 7]], dtype=torch.long),
+    }
+    monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_RELATIONS", "call")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_WEIGHT", "0.5")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_BCE_WEIGHT", "1.0")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_COVERAGE_WEIGHT", "0.25")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_TOPK", "1")
+    _set_current_structure_batch(structure_batch)
+    fused_patch._patch_dsa_graph_objective(fake_module)
+    scores = torch.zeros((1, 2, 2), requires_grad=True)
+
+    total = fake_module.compute_dsa_indexer_loss(scores)
+    total.backward()
+
+    assert total.item() > 2.0
+    assert scores.grad is not None
+    assert torch.count_nonzero(scores.grad).item() > 0
+    _set_current_structure_batch(None)
+
+
+def test_dsa_graph_objective_receives_upstream_additive_mask(monkeypatch):
+    from cppmega.megatron import dsa_indexer_fused_patch as fused_patch
+
+    seen: dict[str, torch.Tensor] = {}
+
+    def base_indexer_loss(index_scores, *, mask=None):
+        del mask
+        return index_scores.sum() * 0.0
+
+    def graph_objective(index_scores, *, upstream_mask=None):
+        seen["mask"] = upstream_mask
+        return index_scores.sum() * 0.0
+
+    fake_module = SimpleNamespace(compute_dsa_indexer_loss=base_indexer_loss)
+    upstream_mask = torch.tensor(
+        [[0.0, float("-inf")], [0.0, 0.0]], dtype=torch.float32
+    )
+    monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
+    monkeypatch.setattr(
+        fused_patch, "_graph_objective_from_index_scores", graph_objective
+    )
+    fused_patch._patch_dsa_graph_objective(fake_module)
+
+    fake_module.compute_dsa_indexer_loss(
+        torch.zeros((1, 2, 2)), mask=upstream_mask
+    )
+
+    assert seen["mask"] is upstream_mask
 
 
 def test_fused_nam56r_shape():

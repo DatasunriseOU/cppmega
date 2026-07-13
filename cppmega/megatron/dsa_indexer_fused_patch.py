@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import logging
 import os
+import inspect
 from contextvars import ContextVar, Token
 
 import torch
@@ -64,12 +65,14 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "apply_dsa_indexer_fused_patch",
+    "build_graph_objective_tensors",
     "build_graph_route_bias_from_structure_batch",
     "compute_index_scores_fused_bf16",
 ]
 
 _PATCH_MARKER = "__cppmega_dsa_indexer_fused_patched__"
 _AUTOGRAD_PATCH_MARKER = "__cppmega_graph_microbatch_patched__"
+_GRAPH_OBJECTIVE_PATCH_MARKER = "__cppmega_graph_objective_patched__"
 _NO_GRAPH_BATCH = object()
 _GRAPH_BATCH_OVERRIDE: ContextVar[object] = ContextVar(
     "cppmega_dsa_graph_batch_override", default=_NO_GRAPH_BATCH
@@ -94,6 +97,7 @@ _GRAPH_ROUTE_BATCH_KEYS = (
     "graph_chunk_kinds",
     "graph_chunk_dep_levels",
     "graph_chunk_counts",
+    "graph_document_ids",
 )
 
 
@@ -561,6 +565,267 @@ def _current_graph_route_bias(
     )
 
 
+def _active_graph_structure_batch() -> dict[str, torch.Tensor]:
+    try:
+        from cppmega.megatron.structure_dataset_patch import _get_current_structure_batch
+    except Exception as exc:  # pragma: no cover - remote Megatron environment
+        raise RuntimeError(
+            "CPPMEGA_GRAPH_ROUTES_ENABLED=1 but structure_dataset_patch is not "
+            "available"
+        ) from exc
+    override = _GRAPH_BATCH_OVERRIDE.get()
+    current = (
+        _get_current_structure_batch()
+        if override is _NO_GRAPH_BATCH
+        else override
+    )
+    if current is None or not isinstance(current, dict):
+        raise RuntimeError(
+            "CPPMEGA_GRAPH_ROUTES_ENABLED=1 but no active structure batch is "
+            "available for graph auxiliary loss"
+        )
+    return current
+
+
+def _graph_target_bias(
+    structure_batch: dict[str, torch.Tensor],
+    *,
+    relations: tuple[str, ...],
+    batch_size: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    device: torch.device,
+) -> torch.Tensor:
+    relation_keys = {
+        "call": ("graph_call_edges", "graph_call_edge_counts"),
+        "type": ("graph_type_edges", "graph_type_edge_counts"),
+        "domain": ("graph_domain_edges", "graph_domain_edge_counts"),
+        "build": ("graph_build_edges", "graph_build_edge_counts"),
+        "shell": ("graph_shell_edges", "graph_shell_edge_counts"),
+        "diagnostic": (
+            "graph_diagnostic_edges",
+            "graph_diagnostic_edge_counts",
+        ),
+        "cross_domain": (
+            "graph_cross_domain_edges",
+            "graph_cross_domain_edge_counts",
+        ),
+    }
+    unknown = sorted(set(relations) - set(relation_keys))
+    if unknown:
+        raise ValueError(f"unsupported graph auxiliary relations: {unknown}")
+    selected: dict[str, torch.Tensor] = {}
+    for relation in relations:
+        for key in relation_keys[relation]:
+            if key in structure_batch:
+                selected[key] = structure_batch[key]
+    for key in (
+        "graph_chunk_starts",
+        "graph_chunk_ends",
+        "graph_chunk_counts",
+    ):
+        if key in structure_batch:
+            selected[key] = structure_batch[key]
+    return build_graph_route_bias_from_structure_batch(
+        selected,
+        batch_size=batch_size,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        device=device,
+        dtype=torch.float32,
+    )
+
+
+def build_graph_objective_tensors(
+    structure_batch: dict[str, torch.Tensor],
+    *,
+    relations: tuple[str, ...],
+    batch_size: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    device: torch.device,
+    upstream_mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build token-expanded targets and the exact trainable graph pair mask."""
+
+    targets = _graph_target_bias(
+        structure_batch,
+        relations=relations,
+        batch_size=batch_size,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        device=device,
+    ).gt(0)
+    document_ids = structure_batch.get("graph_document_ids")
+    if not isinstance(document_ids, torch.Tensor):
+        raise KeyError(
+            "graph auxiliary loss requires graph_document_ids derived from "
+            "packed document boundaries"
+        )
+    if document_ids.dim() == 1:
+        document_ids = document_ids.unsqueeze(0)
+    if document_ids.dim() != 2:
+        raise ValueError(
+            "graph_document_ids must have shape [B,S] or [S], got "
+            f"{tuple(document_ids.shape)}"
+        )
+    if int(document_ids.shape[0]) == 1 and batch_size > 1:
+        document_ids = document_ids.expand(batch_size, -1)
+    if int(document_ids.shape[0]) != batch_size:
+        raise ValueError(
+            f"graph_document_ids batch {int(document_ids.shape[0])} != {batch_size}"
+        )
+    if int(document_ids.shape[1]) < max(seqlen_q, seqlen_k):
+        raise ValueError(
+            f"graph_document_ids length {int(document_ids.shape[1])} is shorter "
+            f"than graph score shape ({seqlen_q}, {seqlen_k})"
+        )
+    document_ids = document_ids.to(device=device, dtype=torch.long)
+    query_docs = document_ids[:, :seqlen_q]
+    key_docs = document_ids[:, :seqlen_k]
+    positive_docs = (query_docs > 0).unsqueeze(2) & (key_docs > 0).unsqueeze(1)
+    same_document = query_docs.unsqueeze(2) == key_docs.unsqueeze(1)
+
+    query_positions = torch.arange(seqlen_q, device=device)[:, None]
+    key_positions = torch.arange(seqlen_k, device=device)[None, :]
+    pair_mask = (key_positions <= query_positions).unsqueeze(0)
+    pair_mask = pair_mask.expand(batch_size, -1, -1)
+    pair_mask = pair_mask & positive_docs & same_document
+
+    if upstream_mask is not None:
+        if not isinstance(upstream_mask, torch.Tensor):
+            raise TypeError(
+                f"DSA upstream mask must be torch.Tensor, got "
+                f"{type(upstream_mask).__name__}"
+            )
+        mask = upstream_mask.to(device=device)
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+        if mask.dim() != 3 or tuple(mask.shape[-2:]) != (seqlen_q, seqlen_k):
+            raise ValueError(
+                "DSA upstream mask must have shape [Q,K] or [B,Q,K], got "
+                f"{tuple(mask.shape)}"
+            )
+        if int(mask.shape[0]) == 1 and batch_size > 1:
+            mask = mask.expand(batch_size, -1, -1)
+        if int(mask.shape[0]) != batch_size:
+            raise ValueError(
+                f"DSA upstream mask batch {int(mask.shape[0])} != {batch_size}"
+            )
+        if mask.dtype == torch.bool:
+            upstream_valid = mask
+        else:
+            upstream_valid = torch.isfinite(mask) & (mask >= 0)
+        pair_mask = pair_mask & upstream_valid
+
+    targets = targets & pair_mask
+    return targets, pair_mask
+
+
+def _graph_objective_from_index_scores(
+    index_scores: torch.Tensor,
+    *,
+    upstream_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute graph BCE/coverage on neural DSA scores, excluding fixed bias."""
+
+    from cppmega.megatron.graph_objective_loss import (
+        GraphAuxiliaryLossConfig,
+        graph_auxiliary_loss,
+    )
+
+    if index_scores.ndim != 3:
+        raise ValueError(
+            f"DSA graph objective requires (B,Q,K) index scores, got "
+            f"{tuple(index_scores.shape)}"
+        )
+    config = GraphAuxiliaryLossConfig.from_env()
+    batch, seqlen_q, seqlen_k = (int(value) for value in index_scores.shape)
+    structure_batch = _active_graph_structure_batch()
+    targets, pair_mask = build_graph_objective_tensors(
+        structure_batch,
+        relations=config.relations,
+        batch_size=batch,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        device=index_scores.device,
+        upstream_mask=upstream_mask,
+    )
+    route_bias = _current_graph_route_bias(
+        batch_size=batch,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        device=index_scores.device,
+    )
+    graph_beta = _env_float("CPPMEGA_DSA_GRAPH_BIAS_BETA", 1.0)
+    neural_scores = index_scores.float() - graph_beta * route_bias
+    pair_mask = pair_mask & torch.isfinite(neural_scores)
+    graph_loss, _components = graph_auxiliary_loss(
+        neural_scores,
+        targets.to(dtype=neural_scores.dtype),
+        pair_mask=pair_mask,
+        config=config,
+    )
+    return graph_loss
+
+
+def _patch_dsa_graph_objective(dsa_mod) -> None:
+    """Compose graph supervision into Megatron's autograd-carried DSA loss."""
+
+    existing = getattr(dsa_mod, "compute_dsa_indexer_loss", None)
+    if existing is None:
+        raise RuntimeError("Megatron DSA compute_dsa_indexer_loss is unavailable")
+    if getattr(existing, _GRAPH_OBJECTIVE_PATCH_MARKER, False):
+        return
+
+    def compute_dsa_indexer_loss_with_graph(index_scores, *args, **kwargs):
+        indexer_loss = existing(index_scores, *args, **kwargs)
+        if not _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
+            return indexer_loss
+        upstream_mask = kwargs.get("mask")
+        if upstream_mask is None:
+            try:
+                bound = inspect.signature(existing).bind_partial(
+                    index_scores, *args, **kwargs
+                )
+            except (TypeError, ValueError):
+                bound = None
+            if bound is not None:
+                upstream_mask = bound.arguments.get("mask")
+        return indexer_loss + _graph_objective_from_index_scores(
+            index_scores, upstream_mask=upstream_mask
+        )
+
+    setattr(
+        compute_dsa_indexer_loss_with_graph,
+        _GRAPH_OBJECTIVE_PATCH_MARKER,
+        True,
+    )
+    dsa_mod.compute_dsa_indexer_loss = compute_dsa_indexer_loss_with_graph
+
+    sparse_existing = getattr(dsa_mod, "compute_dsa_indexer_loss_topk_sparse", None)
+    if sparse_existing is not None and not getattr(
+        sparse_existing, _GRAPH_OBJECTIVE_PATCH_MARKER, False
+    ):
+        def sparse_loss_requires_dense_graph_scores(*args, **kwargs):
+            if _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
+                raise RuntimeError(
+                    "graph auxiliary loss requires full DSA indexer scores; "
+                    "top-k-only sparse indexer loss cannot satisfy the objective "
+                    "contract"
+                )
+            return sparse_existing(*args, **kwargs)
+
+        setattr(
+            sparse_loss_requires_dense_graph_scores,
+            _GRAPH_OBJECTIVE_PATCH_MARKER,
+            True,
+        )
+        dsa_mod.compute_dsa_indexer_loss_topk_sparse = (
+            sparse_loss_requires_dense_graph_scores
+        )
+
+
 def _capture_current_graph_batch() -> dict[str, torch.Tensor]:
     try:
         from cppmega.megatron.structure_dataset_patch import _get_current_structure_batch
@@ -729,9 +994,7 @@ def apply_dsa_indexer_fused_patch(*, force: bool = False) -> bool:
             "megatron.core.transformer.experimental_attention_variant.dsa."
             "_compute_index_scores not found — Megatron version mismatch?"
         )
-    if getattr(existing, _PATCH_MARKER, False) and not force:
-        log.info("cppmega DSA indexer fused patch already applied")
-        return True
+    already_patched = getattr(existing, _PATCH_MARKER, False) and not force
 
     def _compute_index_scores_fused(q, weights, k, use_relu: bool = True, **kwargs):
         # Accept **kwargs to be forward-compatible with new upstream args
@@ -758,9 +1021,15 @@ def apply_dsa_indexer_fused_patch(*, force: bool = False) -> bool:
             graph_beta=graph_beta,
         )
 
-    setattr(_compute_index_scores_fused, _PATCH_MARKER, True)
-    dsa_mod._compute_index_scores = _compute_index_scores_fused
+    if not already_patched:
+        setattr(_compute_index_scores_fused, _PATCH_MARKER, True)
+        dsa_mod._compute_index_scores = _compute_index_scores_fused
+    _patch_dsa_graph_objective(dsa_mod)
     _patch_fused_dsa_autograd(dsa_mod)
+
+    if already_patched:
+        log.info("cppmega DSA indexer fused patch already applied")
+        return True
 
     log.info(
         "cppmega DSA indexer fused patch applied: per-head accumulation, "

@@ -18,6 +18,15 @@ import numpy as np
 # Thread-local storage to safely pass the current batch's structure inputs to model forward
 _local_storage = threading.local()
 
+
+def _env_flag(name: str) -> bool:
+    raw = os.environ.get(name, "0").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} has invalid boolean value {raw!r}")
+
 def _set_current_structure_batch(batch: Dict[str, torch.Tensor] | None) -> None:
     _local_storage.current_structure_batch = batch
 
@@ -80,6 +89,7 @@ _GRAPH_BATCH_COLS = (
     "graph_chunk_kinds",
     "graph_chunk_dep_levels",
     "graph_chunk_counts",
+    "graph_document_ids",
 )
 
 _TOKEN_COL_ALIASES = {
@@ -178,6 +188,36 @@ def _load_sidecar_manifest(dataset: Any) -> tuple[str, dict[str, Any]]:
     json_path = _sidecar_json_path(dataset)
     with open(json_path, "r", encoding="utf-8") as f:
         sidecar = json.load(f)
+    if _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
+        objective_contract = sidecar.get("objective_contract")
+        if objective_contract is None:
+            raise KeyError(
+                f"[cppmega-patch] objective_contract missing in {json_path!r} "
+                "while CPPMEGA_GRAPH_ROUTES_ENABLED=1; graph production data "
+                "must be pre-materialized from the typed objective mixer"
+            )
+        from cppmega.megatron.objective_contract import (
+            validate_materialized_objective_contract,
+        )
+
+        document_count = sidecar.get("document_count")
+        if not isinstance(document_count, int) or document_count < 1:
+            raise ValueError(
+                f"[cppmega-patch] document_count must be a positive integer in "
+                f"{json_path!r}"
+            )
+        validated_objectives = validate_materialized_objective_contract(
+            objective_contract,
+            base_dir=os.path.dirname(json_path),
+            document_count=document_count,
+        )
+        from cppmega.megatron.graph_objective_loss import (
+            validate_runtime_graph_contract,
+        )
+
+        validate_runtime_graph_contract(
+            validated_objectives.payload["graph_auxiliary"]
+        )
     dataset._cppmega_sidecar_manifest = (json_path, sidecar)
     return json_path, sidecar
 
@@ -259,7 +299,7 @@ def _lazy_init_graph_sidecars(dataset: Any) -> Dict[str, Dict[str, Any]]:
         return dataset._graph_sidecars_cache
 
     dataset._graph_sidecars_cache = {}
-    if os.environ.get("CPPMEGA_GRAPH_ROUTES_ENABLED", "0") != "1":
+    if not _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
         return dataset._graph_sidecars_cache
 
     json_path, sidecar = _load_sidecar_manifest(dataset)
@@ -441,6 +481,67 @@ def _align_token_sidecar_tensor(
         )
         tensor = torch.cat([tensor, pad], dim=0)
     return tensor.contiguous()
+
+
+def _sample_document_ids(
+    raw_document_ids: torch.Tensor,
+    spans: list[dict[str, int]],
+    *,
+    target_len: int,
+) -> torch.Tensor:
+    """Remap packed row-local IDs to unique sample-local graph segments."""
+
+    values = raw_document_ids.reshape(-1).to(dtype=torch.long)
+    if target_len < 1:
+        raise ValueError(f"graph document target_len must be positive, got {target_len}")
+    result = torch.zeros((target_len,), dtype=torch.long, device=values.device)
+    cursor = 0
+    next_document_id = 1
+    expected_target_start = 0
+    for span_index, span in enumerate(spans):
+        target_start = int(span["target_start"])
+        source_length = int(span["source_end"]) - int(span["source_start"])
+        if source_length <= 0 or target_start != expected_target_start:
+            raise ValueError(
+                f"sample span {span_index} has invalid length/start: "
+                f"length={source_length} target_start={target_start} "
+                f"expected={expected_target_start}"
+            )
+        available = min(source_length, int(values.numel()) - cursor)
+        if available < 0:
+            raise ValueError("sample document-id cursor exceeded source sidecar")
+        if target_start + available > target_len:
+            raise ValueError(
+                f"sample span {span_index} exceeds graph document target length"
+            )
+        segment = values[cursor : cursor + available]
+        if bool((segment <= 0).any().item()):
+            raise ValueError(
+                "packed doc_ids must be positive throughout every sampled token"
+            )
+        previous_raw_id: int | None = None
+        current_document_id = 0
+        for offset, raw_id in enumerate(segment.tolist()):
+            raw_id = int(raw_id)
+            if previous_raw_id is None or raw_id != previous_raw_id:
+                current_document_id = next_document_id
+                next_document_id += 1
+            result[target_start + offset] = current_document_id
+            previous_raw_id = raw_id
+        cursor += available
+        expected_target_start = target_start + available
+        if available < source_length:
+            if cursor != int(values.numel()) or span_index != len(spans) - 1:
+                raise ValueError(
+                    "sample document-id sidecar ended before a non-final source span"
+                )
+            break
+    if cursor != int(values.numel()):
+        raise ValueError(
+            f"sample document-id spans consumed {cursor} values, have "
+            f"{int(values.numel())}"
+        )
+    return result
 
 
 def _slice_graph_doc(cache_entry: dict[str, Any], real_doc: int) -> np.ndarray:
@@ -649,7 +750,7 @@ try:
             tokens_shape = sample["tokens"].shape
             for col in _TOKEN_BATCH_COLS:
                 sample[col] = torch.zeros(tokens_shape, dtype=torch.long, device=sample["tokens"].device)
-            if os.environ.get("CPPMEGA_GRAPH_ROUTES_ENABLED", "0") == "1":
+            if _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
                 max_edges = int(os.environ.get("CPPMEGA_GRAPH_MAX_EDGES", "256"))
                 max_chunks = int(os.environ.get("CPPMEGA_GRAPH_MAX_CHUNKS", "256"))
                 graph = _build_graph_route_tensors(
@@ -670,6 +771,9 @@ try:
                     target_len=int(tokens_shape[-1]),
                     max_edges=max_edges,
                     max_chunks=max_chunks,
+                )
+                graph["graph_document_ids"] = torch.zeros(
+                    tokens_shape, dtype=torch.long, device=sample["tokens"].device
                 )
                 sample.update(graph)
             return sample
@@ -756,7 +860,7 @@ try:
                     flush=True,
                 )
 
-        if os.environ.get("CPPMEGA_GRAPH_ROUTES_ENABLED", "0") == "1":
+        if _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
             graph_sidecars = _lazy_init_graph_sidecars(self)
             if not graph_sidecars:
                 raise RuntimeError(
@@ -764,12 +868,30 @@ try:
                 )
             max_edges = int(os.environ.get("CPPMEGA_GRAPH_MAX_EDGES", "256"))
             max_chunks = int(os.environ.get("CPPMEGA_GRAPH_MAX_CHUNKS", "256"))
+            spans = _get_sample_token_spans(self, idx)
             graph = _build_graph_route_tensors(
                 graph_sidecars,
-                _get_sample_token_spans(self, idx),
+                spans,
                 target_len=int(sample["tokens"].shape[-1]),
                 max_edges=max_edges,
                 max_chunks=max_chunks,
+            )
+            document_entry = side_channels.get("doc_ids")
+            if document_entry is None:
+                raise KeyError(
+                    "[cppmega-patch] graph auxiliary loss requires the packed "
+                    "doc_ids sidecar; token_source_doc_ids is provenance and "
+                    "cannot substitute for segment boundaries"
+                )
+            raw_document_ids = torch.from_numpy(
+                document_entry["mmap"][indices]
+            ).long()
+            if self.config.add_extra_token_to_sequence:
+                raw_document_ids = raw_document_ids[:-1]
+            graph["graph_document_ids"] = _sample_document_ids(
+                raw_document_ids,
+                spans,
+                target_len=int(sample["tokens"].shape[-1]),
             )
             sample.update(graph)
 

@@ -9,6 +9,9 @@ from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 
 from cppmega.megatron.custom_mamba_model import CppMegaMambaModel
+from cppmega.megatron.graph_objective_loss import (
+    require_active_dsa_graph_objective,
+)
 
 
 def cppmega_mamba_builder(
@@ -17,6 +20,7 @@ def cppmega_mamba_builder(
     print_rank_0("building cppmega MAMBA model ...")
     if config is None:
         config = core_transformer_config_from_args(args, TransformerConfig)
+    require_active_dsa_graph_objective(config)
     assert not getattr(args, "use_legacy_models", False), "Mamba only supported in Mcore!"
 
     if args.spec is None:

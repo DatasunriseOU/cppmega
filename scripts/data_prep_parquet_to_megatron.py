@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 from array import array
+from collections.abc import Mapping
 import json
 import os
 import sys
@@ -33,6 +34,16 @@ import time
 from pathlib import Path
 
 import numpy as np
+
+from cppmega.megatron.objective_contract import (
+    OBJECTIVE_GRAPH_SIDECARS,
+    OBJECTIVE_TOKEN_SIDE_CHANNELS,
+    ObjectiveMaterializationArtifact,
+    ObjectiveMaterializationTracker,
+    ValidatedObjectiveContract,
+    load_objective_materialization_artifact,
+    validate_objective_contract,
+)
 
 
 _OUTPUT_DTYPE_MAP = {
@@ -61,26 +72,7 @@ _MEGATRON_DTYPE_CODE_MAP = {
     np.uint16: 8,
 }
 
-DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS: tuple[tuple[str, str], ...] = (
-    ("loss_mask", "uint8"),
-    ("doc_ids", "uint16"),
-    ("token_domain_ids", "uint16"),
-    ("token_role_ids", "uint16"),
-    ("token_entity_ids", "uint32"),
-    ("token_scope_ids", "uint32"),
-    ("token_confidence_ids", "uint8"),
-    ("token_structure_ids", "uint8"),
-    ("token_dep_levels", "uint16"),
-    ("token_ast_depth", "uint16"),
-    ("token_sibling_index", "uint16"),
-    ("token_ast_node_type", "uint16"),
-    ("token_symbol_ids", "uint32"),
-    ("token_call_targets", "uint32"),
-    ("token_type_refs", "uint32"),
-    ("token_def_use", "uint8"),
-    ("token_change_mask_pre", "uint8"),
-    ("token_change_mask_post", "uint8"),
-)
+DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS = OBJECTIVE_TOKEN_SIDE_CHANNELS
 
 # ``token_platform_ids`` is a legacy scalar mirror and cannot represent the
 # multi-label platform context carried by each packed source document.  The
@@ -93,19 +85,18 @@ SOURCE_PLATFORM_SIDECAR_SCHEMA = "cppmega_source_platform_v1"
 MAX_SOURCE_PLATFORM_IDS = 32
 PLATFORM_VOCAB_SIZE = 113
 
-DEFAULT_CPPMEGA_GRAPH_SIDECARS: tuple[tuple[str, str, str], ...] = (
-    ("token_call_edges", "edge_pairs", "int32"),
-    ("token_type_edges", "edge_pairs", "int32"),
-    ("token_domain_edges", "edge_triples", "int32"),
-    ("token_build_edges", "edge_triples", "int32"),
-    ("token_shell_edges", "edge_triples", "int32"),
-    ("token_diagnostic_edges", "edge_triples", "int32"),
-    ("token_cross_domain_edges", "edge_triples", "int32"),
-    ("token_chunk_starts", "ragged_1d", "uint32"),
-    ("token_chunk_ends", "ragged_1d", "uint32"),
-    ("token_chunk_kinds", "ragged_1d", "uint16"),
-    ("token_chunk_dep_levels", "ragged_1d", "uint16"),
-)
+DEFAULT_CPPMEGA_GRAPH_SIDECARS = OBJECTIVE_GRAPH_SIDECARS
+
+OBJECTIVE_KIND_COLUMN = "objective_kind"
+_GRAPH_RELATION_TO_COLUMN = {
+    "call": "token_call_edges",
+    "type": "token_type_edges",
+    "domain": "token_domain_edges",
+    "build": "token_build_edges",
+    "shell": "token_shell_edges",
+    "diagnostic": "token_diagnostic_edges",
+    "cross_domain": "token_cross_domain_edges",
+}
 
 
 def _resolve_output_dtype(dtype_str: str) -> type[np.generic]:
@@ -867,6 +858,209 @@ def _graph_sidecar_values(
     return {column: graph_cols[column][row_idx].as_py() for column in graph_cols}  # type: ignore[index]
 
 
+def _load_objective_contract(
+    path: str | None,
+) -> ValidatedObjectiveContract | None:
+    if path is None:
+        return None
+    with open(path, encoding="utf-8") as handle:
+        raw = json.load(handle)
+    if not isinstance(raw, dict):
+        raise ValueError("objective contract root must be a JSON object")
+    return validate_objective_contract(raw)
+
+
+def _required_objective_graph_columns(
+    contract: ValidatedObjectiveContract,
+) -> tuple[str, ...]:
+    relations = contract.payload["graph_auxiliary"]["relations"]
+    unknown = sorted(set(relations) - set(_GRAPH_RELATION_TO_COLUMN))
+    if unknown:
+        raise ValueError(
+            f"objective contract has unsupported graph relations: {unknown}"
+        )
+    return tuple(_GRAPH_RELATION_TO_COLUMN[relation] for relation in relations)
+
+
+def _validate_objective_conversion_config(
+    contract: ValidatedObjectiveContract | None,
+    *,
+    token_column: str,
+    length_column: str | None,
+    side_channels: list[str] | None,
+    graph_columns: list[str],
+) -> None:
+    if contract is None:
+        return
+    materialization = contract.payload["materialization"]
+    expected_token_column = materialization["token_column"]
+    if token_column != expected_token_column:
+        raise ValueError(
+            f"pre-materialized objective token column must be "
+            f"{expected_token_column!r}, got {token_column!r}"
+        )
+    expected_length_column = materialization["length_column"]
+    if length_column != expected_length_column:
+        raise ValueError(
+            f"pre-materialized objective length column must be "
+            f"{expected_length_column!r}, got {length_column!r}"
+        )
+    if "loss_mask" not in (side_channels or []):
+        raise ValueError(
+            "pre-materialized objective conversion requires the loss_mask side channel"
+        )
+    for semantic_field in ("document_id_column", "source_document_id_column"):
+        required_column = materialization[semantic_field]
+        if required_column not in (side_channels or []):
+            raise ValueError(
+                "pre-materialized objective conversion requires the "
+                f"{required_column} side channel bound by "
+                f"materialization.{semantic_field}"
+            )
+    missing_graph = sorted(
+        set(_required_objective_graph_columns(contract)) - set(graph_columns)
+    )
+    if missing_graph:
+        raise ValueError(
+            "pre-materialized objective conversion is missing configured graph "
+            f"sidecars: {missing_graph}"
+        )
+
+
+def _require_positive_token_source_doc_ids(
+    values: object,
+    *,
+    token_count: int,
+    where: str,
+) -> None:
+    source_ids = np.asarray(values).reshape(-1)
+    if len(source_ids) < token_count or np.any(source_ids[:token_count] <= 0):
+        raise ValueError(
+            f"token_source_doc_ids must be positive within valid_token_count "
+            f"at {where}"
+        )
+
+
+def _count_objective_graph_edges(
+    values: Mapping[str, object],
+    contract: ValidatedObjectiveContract,
+    *,
+    document_ids: object,
+    input_length: int,
+    shard_path: str,
+    row_idx: int,
+) -> int:
+    docs = np.asarray(document_ids).reshape(-1)
+    if len(docs) < input_length or np.any(docs[:input_length] <= 0):
+        raise ValueError(
+            f"doc_ids must be positive and aligned for graph accounting at "
+            f"{shard_path}#row{row_idx}"
+        )
+    starts = values.get("token_chunk_starts")
+    ends = values.get("token_chunk_ends")
+    pairs: set[tuple[int, int]] = set()
+    for column in _required_objective_graph_columns(contract):
+        raw = values.get(column)
+        if raw is None:
+            raise ValueError(
+                f"configured graph relation column {column} is null at "
+                f"{shard_path}#row{row_idx}"
+            )
+        if not isinstance(raw, list):
+            raise ValueError(
+                f"configured graph relation column {column} is not a list at "
+                f"{shard_path}#row{row_idx}"
+            )
+        if column in {"token_call_edges", "token_type_edges"}:
+            if not isinstance(starts, list) or not isinstance(ends, list):
+                raise ValueError(
+                    f"chunk graph accounting requires starts/ends at "
+                    f"{shard_path}#row{row_idx}"
+                )
+            if len(starts) != len(ends):
+                raise ValueError(
+                    f"chunk starts/ends length mismatch at {shard_path}#row{row_idx}"
+                )
+            for edge in raw:
+                source = int(edge["from"])
+                destination = int(edge["to"])
+                if not (
+                    0 <= source < len(starts) and 0 <= destination < len(starts)
+                ):
+                    raise ValueError(
+                        f"chunk edge endpoint out of range at {shard_path}#row{row_idx}"
+                    )
+                for query in range(
+                    int(starts[source]), min(int(ends[source]), input_length)
+                ):
+                    for key in range(
+                        int(starts[destination]),
+                        min(int(ends[destination]), input_length),
+                    ):
+                        pairs.add((query, key))
+        else:
+            for edge in raw:
+                pairs.add((int(edge["from"]), int(edge["to"])))
+    return sum(
+        1
+        for query, key in pairs
+        if 0 <= key <= query < input_length and docs[query] == docs[key]
+    )
+
+
+def _track_objective_row(
+    tracker: ObjectiveMaterializationTracker,
+    contract: ValidatedObjectiveContract,
+    *,
+    objective_kind: object,
+    token_count: int,
+    loss_mask: object,
+    document_ids: object,
+    graph_values: Mapping[str, object],
+    shard_path: str,
+    row_idx: int,
+) -> None:
+    if not isinstance(objective_kind, str) or not objective_kind:
+        raise ValueError(
+            f"{OBJECTIVE_KIND_COLUMN} must be a non-empty string at "
+            f"{shard_path}#row{row_idx}"
+        )
+    if token_count < 2:
+        raise ValueError(
+            "shifted_lm_document_v1 requires at least two materialized tokens at "
+            f"{shard_path}#row{row_idx}"
+        )
+    mask = np.asarray(loss_mask)
+    if mask.ndim != 1 or len(mask) < token_count:
+        raise ValueError(
+            f"loss_mask is not aligned to {token_count} materialized tokens at "
+            f"{shard_path}#row{row_idx}"
+        )
+    if int(mask[token_count - 1]) != 0:
+        raise ValueError(
+            "shifted_lm_document_v1 requires a zero sentinel loss mask at the "
+            f"last token at {shard_path}#row{row_idx}"
+        )
+    trained = mask[: token_count - 1]
+    if np.any((trained != 0) & (trained != 1)):
+        raise ValueError(
+            f"objective loss_mask must be binary at {shard_path}#row{row_idx}"
+        )
+    tracker.append(
+        objective_kind,
+        input_tokens=token_count - 1,
+        loss_tokens=int(trained.sum(dtype=np.int64)),
+        graph_edges=_count_objective_graph_edges(
+            graph_values,
+            contract,
+            document_ids=document_ids,
+            input_length=token_count - 1,
+            shard_path=shard_path,
+            row_idx=row_idx,
+        ),
+    )
+
+
 def _add_graph_manifest(
     sidecar_data: dict[str, object],
     graph_sidecar_paths: dict[str, dict[str, object]] | None,
@@ -896,6 +1090,7 @@ def _convert_parquet_to_numpy(
     side_channel_dtypes: list[str] | None = None,
     graph_sidecars: tuple[tuple[str, str, str], ...] | None = DEFAULT_CPPMEGA_GRAPH_SIDECARS,
     source_platform_sidecar: bool | None = None,
+    objective_contract: ValidatedObjectiveContract | None = None,
     vocab_size: int = 65536,
 ) -> None:
     """Fallback: write Megatron-compatible .bin + .idx using raw numpy.
@@ -937,12 +1132,20 @@ def _convert_parquet_to_numpy(
         else None
     )
     graph_columns = graph_writers.columns if graph_writers is not None else []
+    _validate_objective_conversion_config(
+        objective_contract,
+        token_column=token_column,
+        length_column=length_column,
+        side_channels=side_channels,
+        graph_columns=graph_columns,
+    )
     columns_to_read = _unique_columns(
         [token_column],
         [length_column] if length_column else None,
         side_channels,
         graph_columns,
         [SOURCE_PLATFORM_IDS_COLUMN] if write_source_platform else None,
+        [OBJECTIVE_KIND_COLUMN] if objective_contract is not None else None,
     )
 
     bin_path = output_prefix + ".bin"
@@ -956,6 +1159,12 @@ def _convert_parquet_to_numpy(
     source_capacity_tokens = 0
     trained_tokens = 0
     graph_sidecar_paths: dict[str, dict[str, object]] | None = None
+    objective_tracker = (
+        ObjectiveMaterializationTracker(objective_contract, output_prefix)
+        if objective_contract is not None
+        else None
+    )
+    objective_manifest: dict[str, object] | None = None
 
     try:
         with open(bin_path, "wb") as bin_fh:
@@ -967,6 +1176,11 @@ def _convert_parquet_to_numpy(
                     length_col = table.column(length_column) if length_column else None
                     side_cols = {col: table.column(col) for col in (side_channels or [])}
                     graph_cols = {col: table.column(col) for col in graph_columns}
+                    objective_col = (
+                        table.column(OBJECTIVE_KIND_COLUMN)
+                        if objective_contract is not None
+                        else None
+                    )
                     source_platform_col = (
                         table.column(SOURCE_PLATFORM_IDS_COLUMN)
                         if write_source_platform
@@ -1027,6 +1241,13 @@ def _convert_parquet_to_numpy(
                             row_group_idx=rg_idx,
                         )
                         side_matrices[col] = side_matrix
+                        if col == "token_source_doc_ids":
+                            for row_idx, token_count in enumerate(lengths.tolist()):
+                                _require_positive_token_source_doc_ids(
+                                    side_matrix[row_idx],
+                                    token_count=token_count,
+                                    where=f"{shard_path}#row_group{rg_idx}#row{row_idx}",
+                                )
                         flat_side = side_matrix[valid_mask].astype(
                             side_dtypes[col], copy=False
                         )
@@ -1035,9 +1256,10 @@ def _convert_parquet_to_numpy(
                             trained_tokens += int(flat_side.sum(dtype=np.int64))
 
                     for row_idx, token_count in enumerate(lengths.tolist()):
+                        graph_values = _graph_sidecar_values(graph_cols, row_idx)
                         if graph_writers is not None:
                             graph_writers.append(
-                                _graph_sidecar_values(graph_cols, row_idx),
+                                graph_values,
                                 shard_path=shard_path,
                                 row_idx=row_idx,
                                 token_count=token_count,
@@ -1047,6 +1269,20 @@ def _convert_parquet_to_numpy(
                                 source_platform_col[row_idx],
                                 doc_ids=side_matrices["doc_ids"][row_idx].tolist(),
                                 token_count=token_count,
+                                shard_path=shard_path,
+                                row_idx=row_idx,
+                            )
+                        if objective_tracker is not None:
+                            assert objective_contract is not None
+                            assert objective_col is not None
+                            _track_objective_row(
+                                objective_tracker,
+                                objective_contract,
+                                objective_kind=objective_col[row_idx].as_py(),
+                                token_count=token_count,
+                                loss_mask=side_matrices["loss_mask"][row_idx],
+                                document_ids=side_matrices["doc_ids"][row_idx],
+                                graph_values=graph_values,
                                 shard_path=shard_path,
                                 row_idx=row_idx,
                             )
@@ -1070,11 +1306,15 @@ def _convert_parquet_to_numpy(
             if source_platform_writer is not None
             else None
         )
+        if objective_tracker is not None:
+            objective_manifest = objective_tracker.close()
     except Exception:
         if graph_writers is not None:
             graph_writers.abort_close()
         if source_platform_writer is not None:
             source_platform_writer.abort_close()
+        if objective_tracker is not None:
+            objective_tracker.abort_close()
         raise
     finally:
         for writer in side_writers.values():
@@ -1125,6 +1365,8 @@ def _convert_parquet_to_numpy(
         sidecar_data["side_channel_paths"] = side_channel_paths
     _add_graph_manifest(sidecar_data, graph_sidecar_paths)
     _add_source_platform_manifest(sidecar_data, source_platform_paths)
+    if objective_manifest is not None:
+        sidecar_data["objective_contract"] = objective_manifest
 
     with open(json_path, "w", encoding="utf-8") as jf:
         json.dump(sidecar_data, jf, indent=4)
@@ -1137,7 +1379,7 @@ def _convert_parquet_to_numpy(
 
 
 def convert_parquet_to_megatron(
-    input_dir: str,
+    input_dir: str | None,
     output_prefix: str,
     split: str = "train",
     token_column: str = "auto",
@@ -1147,6 +1389,8 @@ def convert_parquet_to_megatron(
     side_channel_dtypes: list[str] | None = None,
     graph_sidecars: tuple[tuple[str, str, str], ...] | None = DEFAULT_CPPMEGA_GRAPH_SIDECARS,
     source_platform_sidecar: bool | None = None,
+    objective_contract_path: str | None = None,
+    objective_artifact_path: str | None = None,
     vocab_size: int = 65536,
     writer_backend: str = "megatron",
 ) -> None:
@@ -1159,9 +1403,49 @@ def convert_parquet_to_megatron(
     import pyarrow.parquet as pq
     import json
 
-    if side_channels is None and side_channel_dtypes is None:
-        side_channels = [name for name, _ in DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS]
-        side_channel_dtypes = [dtype for _, dtype in DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS]
+    objective_artifact: ObjectiveMaterializationArtifact | None = None
+    if objective_artifact_path is not None:
+        if objective_contract_path is not None:
+            raise ValueError(
+                "objective artifact and objective contract cannot both be supplied"
+            )
+        objective_artifact = load_objective_materialization_artifact(
+            objective_artifact_path
+        )
+        if input_dir is not None and Path(input_dir).resolve() != objective_artifact.input_dir:
+            raise ValueError("input_dir does not match objective artifact directory")
+        input_dir = str(objective_artifact.input_dir)
+        if split != "all":
+            raise ValueError("objective artifact conversion requires split='all'")
+        if token_column not in {"auto", "input_ids"}:
+            raise ValueError("token_column conflicts with objective artifact")
+        token_column = "input_ids"
+        if length_column not in {None, "auto", "valid_token_count"}:
+            raise ValueError("length_column conflicts with objective artifact")
+        length_column = "valid_token_count"
+        expected_channels = list(OBJECTIVE_TOKEN_SIDE_CHANNELS)
+        if side_channels is None and side_channel_dtypes is None:
+            side_channels = [column for column, _dtype in expected_channels]
+            side_channel_dtypes = [dtype for _column, dtype in expected_channels]
+        elif list(zip(side_channels or [], side_channel_dtypes or [], strict=True)) != expected_channels:
+            raise ValueError("side channels conflict with objective artifact")
+        if graph_sidecars != OBJECTIVE_GRAPH_SIDECARS:
+            raise ValueError("graph sidecars conflict with objective artifact")
+        if source_platform_sidecar is False:
+            raise ValueError("source platform sidecar conflicts with objective artifact")
+        source_platform_sidecar = True
+        objective_contract = objective_artifact.contract
+    else:
+        if input_dir is None:
+            raise ValueError("input_dir is required without an objective artifact")
+        if side_channels is None and side_channel_dtypes is None:
+            side_channels = [name for name, _ in DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS]
+            side_channel_dtypes = [
+                dtype for _, dtype in DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS
+            ]
+        objective_contract = _load_objective_contract(objective_contract_path)
+
+    assert input_dir is not None
 
     if writer_backend == "mmididx":
         return _convert_parquet_to_numpy(
@@ -1175,6 +1459,7 @@ def convert_parquet_to_megatron(
             side_channel_dtypes=side_channel_dtypes,
             graph_sidecars=graph_sidecars,
             source_platform_sidecar=source_platform_sidecar,
+            objective_contract=objective_contract,
             vocab_size=vocab_size,
         )
     if writer_backend != "megatron":
@@ -1236,7 +1521,20 @@ def convert_parquet_to_megatron(
         else None
     )
     graph_columns = graph_writers.columns if graph_writers is not None else []
+    _validate_objective_conversion_config(
+        objective_contract,
+        token_column=token_column,
+        length_column=length_column,
+        side_channels=side_channels,
+        graph_columns=graph_columns,
+    )
     graph_sidecar_paths: dict[str, dict[str, object]] | None = None
+    objective_tracker = (
+        ObjectiveMaterializationTracker(objective_contract, output_prefix)
+        if objective_contract is not None
+        else None
+    )
+    objective_manifest: dict[str, object] | None = None
 
     total_docs = 0
     total_tokens = 0
@@ -1250,6 +1548,7 @@ def convert_parquet_to_megatron(
         side_channels,
         graph_columns,
         [SOURCE_PLATFORM_IDS_COLUMN] if write_source_platform else None,
+        [OBJECTIVE_KIND_COLUMN] if objective_contract is not None else None,
     )
 
     try:
@@ -1261,6 +1560,11 @@ def convert_parquet_to_megatron(
                 length_col = table.column(length_column) if length_column else None
                 side_cols = {col: table.column(col) for col in (side_channels or [])}
                 graph_cols = {col: table.column(col) for col in graph_columns}
+                objective_col = (
+                    table.column(OBJECTIVE_KIND_COLUMN)
+                    if objective_contract is not None
+                    else None
+                )
                 source_platform_col = (
                     table.column(SOURCE_PLATFORM_IDS_COLUMN)
                     if write_source_platform
@@ -1298,22 +1602,45 @@ def convert_parquet_to_megatron(
                             row_idx=row_idx,
                         )
                         trimmed_side = side_val[:token_count]
+                        if col == "token_source_doc_ids":
+                            _require_positive_token_source_doc_ids(
+                                trimmed_side,
+                                token_count=token_count,
+                                where=f"{shard_path}#row{row_idx}",
+                            )
                         arr_side = np.array(trimmed_side, dtype=side_dtypes[col])
                         arr_side.tofile(side_writers[col])
                         if col == "loss_mask":
                             trained_tokens += sum(int(value) for value in trimmed_side)
                     if graph_writers is not None:
+                        graph_values = _graph_sidecar_values(graph_cols, row_idx)
                         graph_writers.append(
-                            _graph_sidecar_values(graph_cols, row_idx),
+                            graph_values,
                             shard_path=shard_path,
                             row_idx=row_idx,
                             token_count=token_count,
                         )
+                    else:
+                        graph_values = {}
                     if source_platform_writer is not None:
                         source_platform_writer.append(
                             source_platform_col[row_idx],
                             doc_ids=side_cols["doc_ids"][row_idx].as_py(),
                             token_count=token_count,
+                            shard_path=shard_path,
+                            row_idx=row_idx,
+                        )
+                    if objective_tracker is not None:
+                        assert objective_contract is not None
+                        assert objective_col is not None
+                        _track_objective_row(
+                            objective_tracker,
+                            objective_contract,
+                            objective_kind=objective_col[row_idx].as_py(),
+                            token_count=token_count,
+                            loss_mask=side_cols["loss_mask"][row_idx].as_py(),
+                            document_ids=side_cols["doc_ids"][row_idx].as_py(),
+                            graph_values=graph_values,
                             shard_path=shard_path,
                             row_idx=row_idx,
                         )
@@ -1337,11 +1664,15 @@ def convert_parquet_to_megatron(
             if source_platform_writer is not None
             else None
         )
+        if objective_tracker is not None:
+            objective_manifest = objective_tracker.close()
     except Exception:
         if graph_writers is not None:
             graph_writers.abort_close()
         if source_platform_writer is not None:
             source_platform_writer.abort_close()
+        if objective_tracker is not None:
+            objective_tracker.abort_close()
         raise
     finally:
         for writer in side_writers.values():
@@ -1371,6 +1702,8 @@ def convert_parquet_to_megatron(
         sidecar_data["side_channel_paths"] = side_channel_paths
     _add_graph_manifest(sidecar_data, graph_sidecar_paths)
     _add_source_platform_manifest(sidecar_data, source_platform_paths)
+    if objective_manifest is not None:
+        sidecar_data["objective_contract"] = objective_manifest
 
     with open(json_path, "w", encoding="utf-8") as jf:
         json.dump(sidecar_data, jf, indent=4)
@@ -1390,8 +1723,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--input-dir",
-        required=True,
-        help="Directory containing parquet shards",
+        default=None,
+        help=(
+            "Directory containing parquet shards. May be omitted when "
+            "--objective-artifact supplies the canonical directory."
+        ),
     )
     parser.add_argument(
         "--output-prefix",
@@ -1480,12 +1816,33 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--objective-contract",
+        default=None,
+        help=(
+            "Path to a cppmega_pre_materialized_objectives_v1 receipt. When "
+            "set, objective_kind, loss-mask, graph-edge, and quota accounting "
+            "are verified exactly and embedded into the output manifest."
+        ),
+    )
+    parser.add_argument(
+        "--objective-artifact",
+        default=None,
+        help=(
+            "Path to cppmega_objective_materialization_artifact_v1. This is the "
+            "canonical CASE1/CASE6/H200 handoff and binds the input directory, "
+            "contract, shard hashes, sidecars, and graph semantics."
+        ),
+    )
+    parser.add_argument(
         "--vocab-size",
         type=int,
         default=65536,
         help="Tokenizer vocab size to write to the JSON sidecar (default: 65536)",
     )
     args = parser.parse_args()
+
+    if args.input_dir is None and args.objective_artifact is None:
+        raise ValueError("--input-dir is required without --objective-artifact")
 
     if args.no_side_channels and args.side_channels:
         raise ValueError("--no-side-channels cannot be combined with --side-channels")
@@ -1534,6 +1891,8 @@ def main() -> int:
         side_channel_dtypes=side_channel_dtypes_list,
         graph_sidecars=graph_sidecars,
         source_platform_sidecar=source_platform_sidecar,
+        objective_contract_path=args.objective_contract,
+        objective_artifact_path=args.objective_artifact,
         vocab_size=args.vocab_size,
         writer_backend=args.writer_backend,
     )

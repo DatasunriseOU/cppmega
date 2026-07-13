@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sys
@@ -8,6 +9,14 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+
+from cppmega.megatron.objective_contract import (
+    OBJECTIVE_CONTRACT_SCHEMA,
+    OBJECTIVE_GRAPH_SIDECARS,
+    OBJECTIVE_IDS,
+    OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA,
+    OBJECTIVE_TOKEN_SIDE_CHANNELS,
+)
 
 
 def _load_converter_module():
@@ -25,6 +34,145 @@ def _load_converter_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _objective_contract() -> dict[str, object]:
+    tasks = (
+        "causal_lm",
+        "fim",
+        "ast_fim",
+        "ifim",
+        "commit_diff",
+        "pre_to_post",
+    )
+    return {
+        "schema": OBJECTIVE_CONTRACT_SCHEMA,
+        "algorithm": "hamilton_eligibility_bipartite_v1",
+        "seed": 17,
+        "quota_window_samples": 6,
+        "task_order": list(tasks),
+        "configured_rates": {task: "1/6" for task in tasks},
+        "planned_samples": {task: 1 for task in tasks},
+        "realized": {
+            task: {
+                "samples": 1,
+                "input_tokens": 3,
+                "loss_tokens": 3 if task == "causal_lm" else 2,
+            }
+            for task in tasks
+        },
+        "totals": {"samples": 6, "input_tokens": 18, "loss_tokens": 13},
+        "typed_sources": {
+            "ifim_instruction": "ifim_instruction_token_ids",
+            "commit_message": "commit_msg_token_ids",
+            "diff": "diff_token_ids",
+            "pre": "pre_token_ids",
+            "post": "post_token_ids",
+            "missing_fields": "ineligible",
+            "rendered_text_parsing": False,
+        },
+        "graph_auxiliary": {
+            "relations": ["call", "type"],
+            "eligible_samples": 1,
+            "positive_edges": 5,
+            "global_weight": "1",
+            "bce_weight": "1/10",
+            "coverage_weight": "1/20",
+            "topk": 8,
+            "pos_weight": "1",
+            "margin": "1",
+            "included_in_total_loss": True,
+            "runtime": "megatron_dsa_indexer_v1",
+            "pair_mask": "causal_same_document_upstream_v1",
+            "chunk_edge_expansion": "cartesian_token_spans_v1",
+        },
+        "materialization": {
+            "format": "shifted_lm_document_v1",
+            "token_column": "input_ids",
+            "loss_mask_column": "loss_mask",
+            "length_column": "valid_token_count",
+            "objective_column": "objective_kind",
+            "document_id_column": "doc_ids",
+            "source_document_id_column": "token_source_doc_ids",
+        },
+    }
+
+
+def _write_objective_artifact(input_dir: Path) -> Path:
+    contract = _objective_contract()
+    contract_path = input_dir / "objective_contract.json"
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+    shards = sorted(input_dir.glob("*.parquet"))
+    canonical = json.dumps(
+        contract,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    artifact = {
+        "schema": OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA,
+        "documents": contract["totals"]["samples"],  # type: ignore[index]
+        "objective_contract": {
+            "path": contract_path.name,
+            "sha256": hashlib.sha256(canonical).hexdigest(),
+        },
+        "parquet_shards": [
+            {
+                "path": shard.name,
+                "size_bytes": shard.stat().st_size,
+                "sha256": hashlib.sha256(shard.read_bytes()).hexdigest(),
+            }
+            for shard in shards
+        ],
+        "converter": {
+            "split": "all",
+            "token_column": "input_ids",
+            "length_column": "valid_token_count",
+            "side_channels": [
+                {"column": column, "dtype": dtype}
+                for column, dtype in OBJECTIVE_TOKEN_SIDE_CHANNELS
+            ],
+            "graph_sidecars": [
+                {"column": column, "kind": kind, "dtype": dtype}
+                for column, kind, dtype in OBJECTIVE_GRAPH_SIDECARS
+            ],
+            "source_platform_sidecar": "require",
+            "graph_relations": ["call", "type"],
+            "graph_pair_mask": "causal_same_document_upstream_v1",
+            "chunk_edge_expansion": "cartesian_token_spans_v1",
+        },
+    }
+    artifact_path = input_dir / "objective_materialization.json"
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+    return artifact_path
+
+
+def test_objective_conversion_rejects_materialized_column_drift() -> None:
+    converter = _load_converter_module()
+    contract = converter.validate_objective_contract(_objective_contract())
+
+    with pytest.raises(ValueError, match="token column"):
+        converter._validate_objective_conversion_config(
+            contract,
+            token_column="token_ids",
+            length_column="valid_token_count",
+            side_channels=["loss_mask"],
+            graph_columns=["token_call_edges", "token_type_edges"],
+        )
+
+
+def test_objective_conversion_requires_document_id_sidecar() -> None:
+    converter = _load_converter_module()
+    contract = converter.validate_objective_contract(_objective_contract())
+
+    with pytest.raises(ValueError, match="doc_ids"):
+        converter._validate_objective_conversion_config(
+            contract,
+            token_column="input_ids",
+            length_column="valid_token_count",
+            side_channels=["loss_mask"],
+            graph_columns=["token_call_edges", "token_type_edges"],
+        )
 
 
 def test_megatron_dtype_codes_match_mmididx_enum() -> None:
@@ -81,6 +229,7 @@ def test_default_cppmega_side_channels_are_full_token_aligned_profile() -> None:
         "token_role_ids",
         "token_entity_ids",
         "token_scope_ids",
+        "token_source_doc_ids",
         "token_confidence_ids",
         "token_structure_ids",
         "token_dep_levels",
@@ -99,6 +248,7 @@ def test_default_cppmega_side_channels_are_full_token_aligned_profile() -> None:
     assert dtypes["token_domain_ids"] == "uint16"
     assert dtypes["token_role_ids"] == "uint16"
     assert dtypes["token_entity_ids"] == "uint32"
+    assert dtypes["token_source_doc_ids"] == "uint32"
     assert dtypes["token_confidence_ids"] == "uint8"
     assert dtypes["token_symbol_ids"] == "uint32"
     assert dtypes["token_def_use"] == "uint8"
@@ -361,6 +511,7 @@ def test_explicit_mmididx_writer_trims_padding_and_all_sidecars(tmp_path: Path) 
     for name, _dtype in converter.DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS:
         row[name] = [[1, 1, 0, 0, 0]]
     row["doc_ids"] = [[1, 1, 1, 1, 1]]
+    row["token_source_doc_ids"] = [[7, 7, 7, 0, 0]]
     for name, kind, _dtype in converter.DEFAULT_CPPMEGA_GRAPH_SIDECARS:
         if name == "token_domain_edges":
             row[name] = [[{"from": 0, "to": 2, "kind": 20}]]
@@ -411,6 +562,163 @@ def test_explicit_mmididx_writer_trims_padding_and_all_sidecars(tmp_path: Path) 
     assert manifest["source_platform_sidecar"]["schema"] == (
         "cppmega_source_platform_v1"
     )
+
+
+def test_mmididx_writer_binds_pre_materialized_objective_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    converter = _load_converter_module()
+    tasks = tuple(_objective_contract()["task_order"])
+    input_dir = tmp_path / "parquet"
+    input_dir.mkdir()
+    rows: dict[str, object] = {
+        "valid_token_count": [4] * len(tasks),
+        # shifted_lm_document_v1 stores [input[0], *targets].
+        "input_ids": [
+            [10 + index, 20 + index, 30 + index, 40 + index]
+            for index in range(len(tasks))
+        ],
+        "loss_mask": [
+            [1, 1, 1, 0] if task == "causal_lm" else [0, 1, 1, 0]
+            for task in tasks
+        ],
+        "objective_kind": list(tasks),
+        "doc_ids": [[1, 1, 1, 1] for _task in tasks],
+        "token_source_doc_ids": [[7, 7, 7, 7] for _task in tasks],
+        "source_platform_ids": [[[2]] for _task in tasks],
+        "token_call_edges": [
+            [{"from": 0, "to": 0}, {"from": 1, "to": 0}]
+            if task == "causal_lm"
+            else []
+            for task in tasks
+        ],
+        "token_type_edges": [[] for _task in tasks],
+        "token_chunk_starts": [
+            [0, 2] if task == "causal_lm" else [] for task in tasks
+        ],
+        "token_chunk_ends": [
+            [2, 4] if task == "causal_lm" else [] for task in tasks
+        ],
+        "token_chunk_kinds": [
+            [1, 1] if task == "causal_lm" else [] for task in tasks
+        ],
+        "token_chunk_dep_levels": [
+            [0, 0] if task == "causal_lm" else [] for task in tasks
+        ],
+    }
+    for column, _dtype in OBJECTIVE_TOKEN_SIDE_CHANNELS:
+        rows.setdefault(column, [[0, 0, 0, 0] for _task in tasks])
+    for column, kind, _dtype in OBJECTIVE_GRAPH_SIDECARS:
+        if column not in rows:
+            rows[column] = [[] for _task in tasks]
+    pq.write_table(pa.table(rows), input_dir / "objectives.parquet")
+    artifact_path = _write_objective_artifact(input_dir)
+
+    output_prefix = tmp_path / "objective_train"
+    converter.convert_parquet_to_megatron(
+        input_dir=str(input_dir),
+        output_prefix=str(output_prefix),
+        split="all",
+        token_column="auto",
+        length_column="auto",
+        objective_artifact_path=str(artifact_path),
+        writer_backend="mmididx",
+    )
+
+    manifest = json.loads(output_prefix.with_suffix(".json").read_text())
+    embedded = manifest["objective_contract"]
+    assert embedded["schema"] == OBJECTIVE_CONTRACT_SCHEMA
+    assert embedded["payload"] == _objective_contract()
+    np.testing.assert_array_equal(
+        np.fromfile(
+            tmp_path / "objective_train_objective_ids.bin", dtype=np.uint8
+        ),
+        np.array([OBJECTIVE_IDS[task] for task in tasks], dtype=np.uint8),
+    )
+    from cppmega.megatron import structure_dataset_patch as dataset_patch
+
+    dataset = types.SimpleNamespace(
+        dataset=types.SimpleNamespace(bin_path=str(output_prefix) + ".bin")
+    )
+    monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
+    _manifest_path, opened = dataset_patch._load_sidecar_manifest(dataset)
+    assert opened["objective_contract"]["sha256"] == embedded["sha256"]
+
+
+def test_objective_contract_fails_on_materialized_loss_token_drift(
+    tmp_path: Path,
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    converter = _load_converter_module()
+    tasks = tuple(_objective_contract()["task_order"])
+    input_dir = tmp_path / "parquet"
+    input_dir.mkdir()
+    pq.write_table(
+        pa.table(
+            {
+                "valid_token_count": [4] * len(tasks),
+                "input_ids": [[1, 2, 3, 4] for _task in tasks],
+                # FIM has three loss tokens here, while the receipt says two.
+                "loss_mask": [
+                    [1, 1, 1, 0]
+                    if task in {"causal_lm", "fim"}
+                    else [0, 1, 1, 0]
+                    for task in tasks
+                ],
+                "objective_kind": list(tasks),
+                "doc_ids": [[1, 1, 1, 1] for _task in tasks],
+                "token_source_doc_ids": [[7, 7, 7, 7] for _task in tasks],
+                "token_call_edges": [
+                    [{"from": 0, "to": 0}, {"from": 1, "to": 0}]
+                    if task == "causal_lm"
+                    else []
+                    for task in tasks
+                ],
+                "token_type_edges": [[] for _task in tasks],
+                "token_chunk_starts": [
+                    [0, 2] if task == "causal_lm" else [] for task in tasks
+                ],
+                "token_chunk_ends": [
+                    [2, 4] if task == "causal_lm" else [] for task in tasks
+                ],
+                "token_chunk_kinds": [
+                    [1, 1] if task == "causal_lm" else [] for task in tasks
+                ],
+                "token_chunk_dep_levels": [
+                    [0, 0] if task == "causal_lm" else [] for task in tasks
+                ],
+            }
+        ),
+        input_dir / "objectives.parquet",
+    )
+    contract_path = tmp_path / "objective_contract.json"
+    contract_path.write_text(json.dumps(_objective_contract()), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="loss_tokens.*fim"):
+        converter.convert_parquet_to_megatron(
+            input_dir=str(input_dir),
+            output_prefix=str(tmp_path / "objective_train"),
+            split="all",
+            token_column="auto",
+            length_column="auto",
+            side_channels=["loss_mask", "doc_ids", "token_source_doc_ids"],
+            side_channel_dtypes=["uint8", "uint16", "uint32"],
+            graph_sidecars=(
+                ("token_call_edges", "edge_pairs", "int32"),
+                ("token_type_edges", "edge_pairs", "int32"),
+                ("token_chunk_starts", "ragged_1d", "uint32"),
+                ("token_chunk_ends", "ragged_1d", "uint32"),
+                ("token_chunk_kinds", "ragged_1d", "uint16"),
+                ("token_chunk_dep_levels", "ragged_1d", "uint16"),
+            ),
+            source_platform_sidecar=False,
+            objective_contract_path=str(contract_path),
+            writer_backend="mmididx",
+        )
 
 
 def test_mmididx_row_group_batching_preserves_document_order_and_offsets(
