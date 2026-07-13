@@ -1,0 +1,30 @@
+{
+  "schema": "cppmega_local_mlx_bundle_smoke_v1",
+  "checked_at": "2026-07-13T16:27:02Z",
+  "bundle_id": "macro_routes_v1_20260713-8c550514dd52ddc9",
+  "bundle": "/Volumes/external/sources/cppmega.mlx/outputs/megatron_ready/macro_routes_v1_20260713",
+  "status": "ok",
+  "sidecar_families": [
+    "domain_routes",
+    "semantic_graph",
+    "structure",
+    "syntax",
+    "temporal_diff"
+  ],
+  "graph_relations": [
+    "build",
+    "call",
+    "cross_domain",
+    "diagnostic",
+    "domain",
+    "shell",
+    "type"
+  ],
+  "buckets": [
+    {"seq_len": 1024, "documents": 1804082, "local_samples": 1804082, "sample_shape": [1, 1024]},
+    {"seq_len": 2048, "documents": 441140, "local_samples": 441140, "sample_shape": [1, 2048]},
+    {"seq_len": 4096, "documents": 230004, "local_samples": 230004, "sample_shape": [1, 4096]},
+    {"seq_len": 8192, "documents": 110040, "local_samples": 110040, "sample_shape": [1, 8192]},
+    {"seq_len": 16384, "documents": 46197, "local_samples": 46197, "sample_shape": [1, 16384]}
+  ]
+}
