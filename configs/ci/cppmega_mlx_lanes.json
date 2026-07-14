@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "lanes": [
+    {
+      "id": "macos-cppmega-mlx-contracts",
+      "system": "darwin",
+      "machines": [
+        "arm64"
+      ],
+      "requires_cuda": false,
+      "required_modules": [
+        "pytest",
+        "mlx",
+        "numpy",
+        "pyarrow",
+        "tokenizers"
+      ],
+      "timeout_seconds": 900,
+      "commands": [
+        {
+          "name": "focused-cppmega-mlx-contracts",
+          "timeout_seconds": 840,
+          "argv": [
+            "{python}",
+            "-m",
+            "pytest",
+            "-q",
+            "tests/test_ast_fim.py",
+            "tests/test_data_package_imports.py",
+            "tests/test_domain_graph_routes.py",
+            "tests/test_inference_generation.py",
+            "tests/test_self_hosted_ci.py",
+            "tests/test_workflow_runner_policy.py"
+          ]
+        },
+        {
+          "name": "source-whitespace",
+          "timeout_seconds": 30,
+          "argv": [
+            "git",
+            "diff",
+            "--check"
+          ]
+        }
+      ]
+    }
+  ]
+}

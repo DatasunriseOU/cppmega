@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "repository": "DatasunriseOU/cppmega",
+  "hosts": [
+    {
+      "id": "local-macos",
+      "address": "local",
+      "transport": "local",
+      "system": "darwin",
+      "machines": [
+        "arm64"
+      ],
+      "python": "/Volumes/external/sources/cppmega.mlx/.venv/bin/python",
+      "lanes": [
+        "macos-contracts"
+      ],
+      "dispatch_enabled": true,
+      "required": true,
+      "capabilities": [
+        "macos",
+        "arm64"
+      ]
+    },
+    {
+      "id": "windows-10-0-0-11",
+      "address": "10.0.0.11",
+      "transport": "ssh",
+      "user": "dave",
+      "port": 22,
+      "remote_shell": "windows",
+      "system": "windows",
+      "machines": [
+        "amd64",
+        "x86_64"
+      ],
+      "python": "python",
+      "lanes": [],
+      "dispatch_enabled": false,
+      "required": false,
+      "capabilities": [
+        "windows",
+        "inventory-only"
+      ],
+      "trust": "trusted",
+      "host_key": {
+        "algorithm": "ssh-ed25519",
+        "public_key": "AAAAC3NzaC1lZDI1NTE5AAAAIJRwravCVfVsFZfdgfvC/OlW0K7vrJ7pBjl5p86YKSSs",
+        "fingerprint_sha256": "SHA256:xGOQHYDUpAKZPiHLlYNYp01FiayrndE1tGC9wBoA+xw"
+      },
+      "reason": "Windows is inventoried and identity-pinned, but this repository currently has no Windows lane."
+    },
+    {
+      "id": "quarantined-10-0-0-12",
+      "address": "10.0.0.12",
+      "transport": "ssh",
+      "user": "dave",
+      "port": 22,
+      "remote_shell": "posix",
+      "system": "linux",
+      "machines": [
+        "x86_64",
+        "aarch64"
+      ],
+      "python": "python3",
+      "lanes": [
+        "linux-contracts",
+        "linux-cuda"
+      ],
+      "dispatch_enabled": false,
+      "required": false,
+      "capabilities": [
+        "linux-candidate",
+        "cuda-unverified",
+        "quarantined"
+      ],
+      "trust": "quarantined",
+      "reason": "No out-of-band verified host key is available; the runner may scan and report the observed fingerprint but never authenticates or dispatches."
+    },
+    {
+      "id": "legion-10-0-0-16",
+      "address": "10.0.0.16",
+      "transport": "ssh",
+      "user": "davidgor",
+      "port": 22,
+      "remote_shell": "posix",
+      "system": "linux",
+      "machines": [
+        "x86_64",
+        "amd64"
+      ],
+      "python": "python3",
+      "lanes": [
+        "linux-contracts",
+        "linux-cuda"
+      ],
+      "dispatch_enabled": true,
+      "required": true,
+      "capabilities": [
+        "linux",
+        "x86_64",
+        "cuda"
+      ],
+      "trust": "trusted",
+      "host_key": {
+        "algorithm": "ssh-ed25519",
+        "public_key": "AAAAC3NzaC1lZDI1NTE5AAAAIASmjUl/IUCFfvXkXpCWWGJJ04Tx5FWEevIdFRYJCBic",
+        "fingerprint_sha256": "SHA256:stt997SDguq5Gkvu9jm+EAt80arl+BS8rsf8dqIljLc"
+      }
+    }
+  ]
+}

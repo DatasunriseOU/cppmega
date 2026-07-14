@@ -1,0 +1,178 @@
+{
+  "schema_version": 1,
+  "lanes": [
+    {
+      "id": "macos-contracts",
+      "system": "darwin",
+      "machines": [
+        "arm64"
+      ],
+      "requires_cuda": false,
+      "required_modules": [
+        "pytest",
+        "numpy",
+        "pyarrow",
+        "tokenizers"
+      ],
+      "timeout_seconds": 1200,
+      "commands": [
+        {
+          "name": "focused-contracts",
+          "timeout_seconds": 1080,
+          "argv": [
+            "{python}",
+            "-m",
+            "pytest",
+            "-q",
+            "tests/test_custom_embedding.py",
+            "tests/test_data_pipeline_contracts.py",
+            "tests/test_data_prep_parquet_to_megatron.py",
+            "tests/test_domain_embedding.py",
+            "tests/test_domain_megatron_sidecars.py",
+            "tests/test_dsa_indexer_fused_patch.py",
+            "tests/test_fastmtp_layer.py",
+            "tests/test_graph_route_attention_bias_patch.py",
+            "tests/test_nebius_h200_megatron_cpp_generation_eval.py",
+            "tests/test_nebius_h200_megatron_cpp_world_sweep.py",
+            "tests/test_structure_dataset_patch_bridge.py",
+            "tests/test_structure_embedding.py",
+            "tests/test_subset_megatron_sidecar_prefix.py",
+            "tests/test_build_macro_routes_megatron_bundle.py",
+            "tests/test_dsa_sparse_attention.py",
+            "tests/test_publish_megatron_bundle_to_nebius_s3.py",
+            "tests/test_restore_megatron_bundle_from_nebius_s3.py",
+            "tests/test_workflow_runner_policy.py",
+            "tests/ci/test_repository_ci_runner.py"
+          ]
+        },
+        {
+          "name": "tokenizer-contract",
+          "timeout_seconds": 60,
+          "argv": [
+            "{python}",
+            "scripts/data/verify_tokenizer_contract.py",
+            "--contract",
+            "data/tokenizer_v2/tokenizer_contract_v1.json",
+            "--tokenizer",
+            "data/tokenizer_v2/tokenizer.json",
+            "--domain-schema",
+            "data/domain_schema_v1.json"
+          ]
+        },
+        {
+          "name": "source-whitespace",
+          "timeout_seconds": 30,
+          "argv": [
+            "git",
+            "diff",
+            "--check"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "linux-contracts",
+      "system": "linux",
+      "machines": [
+        "x86_64",
+        "amd64"
+      ],
+      "requires_cuda": false,
+      "required_modules": [
+        "pytest",
+        "numpy",
+        "pyarrow",
+        "tokenizers",
+        "boto3",
+        "zstandard"
+      ],
+      "timeout_seconds": 1200,
+      "commands": [
+        {
+          "name": "portable-contracts",
+          "timeout_seconds": 1080,
+          "argv": [
+            "{python}",
+            "-m",
+            "pytest",
+            "-q",
+            "tests/test_data_pipeline_contracts.py",
+            "tests/test_data_prep_parquet_to_megatron.py",
+            "tests/test_domain_megatron_sidecars.py",
+            "tests/test_nebius_h200_megatron_cpp_generation_eval.py",
+            "tests/test_nebius_h200_megatron_cpp_world_sweep.py",
+            "tests/test_subset_megatron_sidecar_prefix.py",
+            "tests/test_build_macro_routes_megatron_bundle.py",
+            "tests/test_publish_megatron_bundle_to_nebius_s3.py",
+            "tests/test_restore_megatron_bundle_from_nebius_s3.py",
+            "tests/test_workflow_runner_policy.py",
+            "tests/ci/test_repository_ci_runner.py"
+          ]
+        },
+        {
+          "name": "tokenizer-contract",
+          "timeout_seconds": 60,
+          "argv": [
+            "{python}",
+            "scripts/data/verify_tokenizer_contract.py",
+            "--contract",
+            "data/tokenizer_v2/tokenizer_contract_v1.json",
+            "--tokenizer",
+            "data/tokenizer_v2/tokenizer.json",
+            "--domain-schema",
+            "data/domain_schema_v1.json"
+          ]
+        },
+        {
+          "name": "source-whitespace",
+          "timeout_seconds": 30,
+          "argv": [
+            "git",
+            "diff",
+            "--check"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "linux-cuda",
+      "system": "linux",
+      "machines": [
+        "x86_64",
+        "amd64"
+      ],
+      "requires_cuda": true,
+      "required_modules": [
+        "pytest",
+        "torch",
+        "triton",
+        "megatron.core",
+        "mamba_ssm"
+      ],
+      "timeout_seconds": 1200,
+      "commands": [
+        {
+          "name": "cuda-contracts",
+          "timeout_seconds": 1140,
+          "argv": [
+            "{python}",
+            "-m",
+            "pytest",
+            "-q",
+            "tests/test_m2rnn_pararnn_tiled_cuda.py",
+            "tests/test_noconv_f2_gpu.py"
+          ]
+        },
+        {
+          "name": "source-whitespace",
+          "timeout_seconds": 30,
+          "argv": [
+            "git",
+            "diff",
+            "--check"
+          ]
+        }
+      ]
+    }
+  ]
+}
