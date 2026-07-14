@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sys
@@ -11,7 +12,10 @@ import pytest
 
 from cppmega.megatron.objective_contract import (
     OBJECTIVE_CONTRACT_SCHEMA,
+    OBJECTIVE_GRAPH_SIDECARS,
     OBJECTIVE_IDS,
+    OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA,
+    OBJECTIVE_TOKEN_SIDE_CHANNELS,
     validate_materialized_objective_contract,
     validate_objective_contract,
 )
@@ -69,6 +73,7 @@ def _objective_contract() -> dict[str, object]:
         "seed": 17,
         "quota_window_samples": 6,
         "task_order": list(tasks),
+        "objective_ids": {task: OBJECTIVE_IDS[task] for task in tasks},
         "configured_rates": {task: "1/6" for task in tasks},
         "planned_samples": {task: 1 for task in tasks},
         "realized": {
@@ -94,6 +99,9 @@ def _objective_contract() -> dict[str, object]:
             "eligible_samples": 1,
             "positive_edges": 5,
             "global_weight": "1",
+            "indexer_weight": "1/1000",
+            "layer_weight": "1",
+            "layer_reduction": "sum",
             "bce_weight": "1/10",
             "coverage_weight": "1/20",
             "topk": 8,
@@ -114,6 +122,107 @@ def _objective_contract() -> dict[str, object]:
             "source_document_id_column": "token_source_doc_ids",
         },
     }
+
+
+def _write_objective_artifact(input_dir: Path) -> Path:
+    contract = _objective_contract()
+    contract_path = input_dir / "objective_contract.json"
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+    canonical = json.dumps(
+        contract,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    shards = sorted(input_dir.glob("*.parquet"))
+    artifact = {
+        "schema": OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA,
+        "documents": contract["totals"]["samples"],  # type: ignore[index]
+        "objective_contract": {
+            "path": contract_path.name,
+            "sha256": hashlib.sha256(canonical).hexdigest(),
+            "size_bytes": contract_path.stat().st_size,
+            "file_sha256": hashlib.sha256(contract_path.read_bytes()).hexdigest(),
+        },
+        "parquet_shards": [
+            {
+                "path": shard.name,
+                "size_bytes": shard.stat().st_size,
+                "sha256": hashlib.sha256(shard.read_bytes()).hexdigest(),
+            }
+            for shard in shards
+        ],
+        "converter": {
+            "split": "all",
+            "token_column": "input_ids",
+            "length_column": "valid_token_count",
+            "side_channels": [
+                {"column": column, "dtype": dtype}
+                for column, dtype in OBJECTIVE_TOKEN_SIDE_CHANNELS
+            ],
+            "graph_sidecars": [
+                {"column": column, "kind": kind, "dtype": dtype}
+                for column, kind, dtype in OBJECTIVE_GRAPH_SIDECARS
+            ],
+            "source_platform_sidecar": "require",
+            "graph_relations": ["call", "type"],
+            "graph_pair_mask": "causal_same_document_upstream_v1",
+            "chunk_edge_expansion": "cartesian_token_spans_v1",
+        },
+    }
+    artifact["artifact_set_sha256"] = hashlib.sha256(
+        json.dumps(
+            artifact,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+    ).hexdigest()
+    artifact_path = input_dir / "objective_materialization.json"
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+    return artifact_path
+
+
+def test_objective_conversion_rejects_materialized_column_drift() -> None:
+    converter = _load_converter_module()
+    contract = converter.validate_objective_contract(_objective_contract())
+
+    with pytest.raises(ValueError, match="token column"):
+        converter._validate_objective_conversion_config(
+            contract,
+            token_column="token_ids",
+            length_column="valid_token_count",
+            side_channels=["loss_mask"],
+            graph_columns=["token_call_edges", "token_type_edges"],
+        )
+
+
+def test_objective_conversion_requires_document_id_sidecar() -> None:
+    converter = _load_converter_module()
+    contract = converter.validate_objective_contract(_objective_contract())
+
+    with pytest.raises(ValueError, match="doc_ids"):
+        converter._validate_objective_conversion_config(
+            contract,
+            token_column="input_ids",
+            length_column="valid_token_count",
+            side_channels=["loss_mask"],
+            graph_columns=["token_call_edges", "token_type_edges"],
+        )
+
+
+def test_objective_conversion_rejects_bare_contract(tmp_path: Path) -> None:
+    converter = _load_converter_module()
+    contract_path = tmp_path / "objective_contract.json"
+    contract_path.write_text(json.dumps(_objective_contract()), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="bare --objective-contract"):
+        converter.convert_parquet_to_megatron(
+            input_dir=str(tmp_path),
+            output_prefix=str(tmp_path / "train"),
+            objective_contract_path=str(contract_path),
+            writer_backend="mmididx",
+        )
 
 
 def test_objective_contract_accepts_deterministic_zero_hamilton_quota() -> None:
@@ -712,12 +821,8 @@ def test_mmididx_writer_binds_pre_materialized_objective_contract(
         ],
         "objective_kind": list(tasks),
         "doc_ids": [[1, 1, 1, 1] for _task in tasks],
-        "token_domain_ids": [[0, 0, 0, 0] for _task in tasks],
-        "token_role_ids": [[0, 0, 0, 0] for _task in tasks],
-        "token_entity_ids": [[0, 0, 0, 0] for _task in tasks],
-        "token_scope_ids": [[0, 0, 0, 0] for _task in tasks],
         "token_source_doc_ids": [[7, 7, 7, 7] for _task in tasks],
-        "token_confidence_ids": [[0, 0, 0, 0] for _task in tasks],
+        "source_platform_ids": [[[2]] for _task in tasks],
         "token_call_edges": [
             [{"from": 0, "to": 0}, {"from": 1, "to": 0}]
             if task == "causal_lm"
@@ -738,20 +843,13 @@ def test_mmididx_writer_binds_pre_materialized_objective_contract(
             [0, 0] if task == "causal_lm" else [] for task in tasks
         ],
     }
-    pq.write_table(pa.table(rows), input_dir / "objectives.parquet")
-    contract_path = tmp_path / "objective_contract.json"
-    contract_path.write_text(json.dumps(_objective_contract()), encoding="utf-8")
-    side_channels = [
-        "loss_mask",
-        "doc_ids",
-        "token_domain_ids",
-        "token_role_ids",
-        "token_entity_ids",
-        "token_scope_ids",
-        "token_source_doc_ids",
-        "token_confidence_ids",
-    ]
-    side_dtypes = ["uint8", "uint16", "uint16", "uint16", "uint32", "uint32", "uint32", "uint8"]
+    for column, _dtype in OBJECTIVE_TOKEN_SIDE_CHANNELS:
+        rows.setdefault(column, [[0, 0, 0, 0] for _task in tasks])
+    for column, _kind, _dtype in OBJECTIVE_GRAPH_SIDECARS:
+        rows.setdefault(column, [[] for _task in tasks])
+    table = _stamp_v3_identity_table(pa, pa.table(rows), converter)
+    pq.write_table(table, input_dir / "objectives.parquet")
+    artifact_path = _write_objective_artifact(input_dir)
     output_prefix = tmp_path / "objective_train"
 
     converter.convert_parquet_to_megatron(
@@ -760,23 +858,14 @@ def test_mmididx_writer_binds_pre_materialized_objective_contract(
         split="all",
         token_column="auto",
         length_column="auto",
-        side_channels=side_channels,
-        side_channel_dtypes=side_dtypes,
-        graph_sidecars=(
-            ("token_call_edges", "edge_pairs", "int32"),
-            ("token_type_edges", "edge_pairs", "int32"),
-            ("token_chunk_starts", "ragged_1d", "uint32"),
-            ("token_chunk_ends", "ragged_1d", "uint32"),
-            ("token_chunk_kinds", "ragged_1d", "uint16"),
-            ("token_chunk_dep_levels", "ragged_1d", "uint16"),
-        ),
-        source_platform_sidecar=False,
-        objective_contract_path=str(contract_path),
+        objective_artifact_path=str(artifact_path),
         writer_backend="mmididx",
     )
 
     manifest = json.loads(output_prefix.with_suffix(".json").read_text())
     assert manifest["objective_contract"]["payload"] == _objective_contract()
+    assert manifest["objective_materialization"]["artifact_set_sha256"]
+    assert manifest["symbol_identity_schema_version"] == 3
     np.testing.assert_array_equal(
         np.fromfile(
             tmp_path / "objective_train_objective_ids.bin", dtype=np.uint8

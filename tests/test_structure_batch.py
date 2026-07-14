@@ -39,6 +39,8 @@ def test_extract_structure_inputs_excludes_opaque_symbol_ids_from_model_inputs()
         "graph_build_edges": 11,
         "graph_build_edge_counts": 12,
     }
+    assert "symbol_ids" not in extracted
+    assert "call_targets" not in extracted
 
 
 def test_maybe_set_structure_inputs_pushes_non_zero_metadata_into_model():

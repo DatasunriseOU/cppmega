@@ -47,8 +47,13 @@ from cppmega.symbol_identity import (
     compute_symbol_id,
 )
 from cppmega.megatron.objective_contract import (
+    OBJECTIVE_GRAPH_SIDECARS,
+    OBJECTIVE_TOKEN_SIDE_CHANNELS,
+    ObjectiveMaterializationArtifact,
     ObjectiveMaterializationTracker,
     ValidatedObjectiveContract,
+    load_objective_materialization_artifact,
+    materialized_objective_artifact_manifest,
     validate_objective_contract,
 )
 
@@ -69,6 +74,7 @@ _SIDECAR_DTYPE_MAP = {
     "uint8": np.uint8,
     "uint16": np.uint16,
     "uint32": np.uint32,
+    "uint64": np.uint64,
     "int32": np.int32,
     "int64": np.int64,
 }
@@ -80,27 +86,7 @@ _MEGATRON_DTYPE_CODE_MAP = {
     np.uint16: 8,
 }
 
-DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS: tuple[tuple[str, str], ...] = (
-    ("loss_mask", "uint8"),
-    ("doc_ids", "uint16"),
-    ("token_domain_ids", "uint16"),
-    ("token_role_ids", "uint16"),
-    ("token_entity_ids", "uint32"),
-    ("token_scope_ids", "uint32"),
-    ("token_source_doc_ids", "uint32"),
-    ("token_confidence_ids", "uint8"),
-    ("token_structure_ids", "uint8"),
-    ("token_dep_levels", "uint16"),
-    ("token_ast_depth", "uint16"),
-    ("token_sibling_index", "uint16"),
-    ("token_ast_node_type", "uint16"),
-    ("token_symbol_ids", "uint64"),
-    ("token_call_targets", "uint64"),
-    ("token_type_refs", "uint64"),
-    ("token_def_use", "uint8"),
-    ("token_change_mask_pre", "uint8"),
-    ("token_change_mask_post", "uint8"),
-)
+DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS = OBJECTIVE_TOKEN_SIDE_CHANNELS
 
 # ``token_platform_ids`` is a legacy scalar mirror and cannot represent the
 # multi-label platform context carried by each packed source document.  The
@@ -113,19 +99,7 @@ SOURCE_PLATFORM_SIDECAR_SCHEMA = "cppmega_source_platform_v1"
 MAX_SOURCE_PLATFORM_IDS = 32
 PLATFORM_VOCAB_SIZE = 113
 
-DEFAULT_CPPMEGA_GRAPH_SIDECARS: tuple[tuple[str, str, str], ...] = (
-    ("token_call_edges", "edge_pairs", "int32"),
-    ("token_type_edges", "edge_pairs", "int32"),
-    ("token_domain_edges", "edge_triples", "int32"),
-    ("token_build_edges", "edge_triples", "int32"),
-    ("token_shell_edges", "edge_triples", "int32"),
-    ("token_diagnostic_edges", "edge_triples", "int32"),
-    ("token_cross_domain_edges", "edge_triples", "int32"),
-    ("token_chunk_starts", "ragged_1d", "uint32"),
-    ("token_chunk_ends", "ragged_1d", "uint32"),
-    ("token_chunk_kinds", "ragged_1d", "uint16"),
-    ("token_chunk_dep_levels", "ragged_1d", "uint16"),
-)
+DEFAULT_CPPMEGA_GRAPH_SIDECARS = OBJECTIVE_GRAPH_SIDECARS
 
 REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION = SYMBOL_IDENTITY_SCHEMA_VERSION
 _SYMBOL_ID_COLUMNS = (
@@ -1468,6 +1442,7 @@ def _convert_parquet_to_numpy(
     graph_sidecars: tuple[tuple[str, str, str], ...] | None = DEFAULT_CPPMEGA_GRAPH_SIDECARS,
     source_platform_sidecar: bool | None = None,
     objective_contract: ValidatedObjectiveContract | None = None,
+    objective_artifact_manifest: Mapping[str, object] | None = None,
     vocab_size: int = 65536,
 ) -> None:
     """Fallback: write Megatron-compatible .bin + .idx using raw numpy.
@@ -1756,6 +1731,10 @@ def _convert_parquet_to_numpy(
         _add_symbol_identity_manifest(sidecar_data, symbol_identity_schema_version)
     if objective_manifest is not None:
         sidecar_data["objective_contract"] = objective_manifest
+    if objective_artifact_manifest is not None:
+        sidecar_data["objective_materialization"] = dict(
+            objective_artifact_manifest
+        )
 
     with open(json_path, "w", encoding="utf-8") as jf:
         json.dump(sidecar_data, jf, indent=4)
@@ -1768,7 +1747,7 @@ def _convert_parquet_to_numpy(
 
 
 def convert_parquet_to_megatron(
-    input_dir: str,
+    input_dir: str | None,
     output_prefix: str,
     split: str = "train",
     token_column: str = "auto",
@@ -1779,6 +1758,7 @@ def convert_parquet_to_megatron(
     graph_sidecars: tuple[tuple[str, str, str], ...] | None = DEFAULT_CPPMEGA_GRAPH_SIDECARS,
     source_platform_sidecar: bool | None = None,
     objective_contract_path: str | None = None,
+    objective_artifact_path: str | None = None,
     vocab_size: int = 65536,
     writer_backend: str = "megatron",
 ) -> None:
@@ -1791,10 +1771,63 @@ def convert_parquet_to_megatron(
     import pyarrow.parquet as pq
     import json
 
-    if side_channels is None and side_channel_dtypes is None:
-        side_channels = [name for name, _ in DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS]
-        side_channel_dtypes = [dtype for _, dtype in DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS]
-    objective_contract = _load_objective_contract(objective_contract_path)
+    objective_artifact: ObjectiveMaterializationArtifact | None = None
+    objective_artifact_manifest: dict[str, object] | None = None
+    if objective_artifact_path is not None:
+        if objective_contract_path is not None:
+            raise ValueError(
+                "objective artifact and objective contract cannot both be supplied"
+            )
+        objective_artifact = load_objective_materialization_artifact(
+            objective_artifact_path
+        )
+        if (
+            input_dir is not None
+            and Path(input_dir).resolve() != objective_artifact.input_dir
+        ):
+            raise ValueError("input_dir does not match objective artifact directory")
+        input_dir = str(objective_artifact.input_dir)
+        if split != "all":
+            raise ValueError("objective artifact conversion requires split='all'")
+        if token_column not in {"auto", "input_ids"}:
+            raise ValueError("token_column conflicts with objective artifact")
+        token_column = "input_ids"
+        if length_column not in {None, "auto", "valid_token_count"}:
+            raise ValueError("length_column conflicts with objective artifact")
+        length_column = "valid_token_count"
+        expected_channels = list(OBJECTIVE_TOKEN_SIDE_CHANNELS)
+        if side_channels is None and side_channel_dtypes is None:
+            side_channels = [column for column, _dtype in expected_channels]
+            side_channel_dtypes = [dtype for _column, dtype in expected_channels]
+        elif list(
+            zip(side_channels or [], side_channel_dtypes or [], strict=True)
+        ) != expected_channels:
+            raise ValueError("side channels conflict with objective artifact")
+        if graph_sidecars != OBJECTIVE_GRAPH_SIDECARS:
+            raise ValueError("graph sidecars conflict with objective artifact")
+        if source_platform_sidecar is False:
+            raise ValueError("source platform sidecar conflicts with objective artifact")
+        source_platform_sidecar = True
+        objective_contract = objective_artifact.contract
+        objective_artifact_manifest = materialized_objective_artifact_manifest(
+            objective_artifact
+        )
+    else:
+        if objective_contract_path is not None:
+            raise ValueError(
+                "bare --objective-contract is not accepted; use the canonical "
+                "shard-hashed --objective-artifact"
+            )
+        if input_dir is None:
+            raise ValueError("input_dir is required without an objective artifact")
+        if side_channels is None and side_channel_dtypes is None:
+            side_channels = [name for name, _ in DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS]
+            side_channel_dtypes = [
+                dtype for _, dtype in DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS
+            ]
+        objective_contract = None
+
+    assert input_dir is not None
 
     if writer_backend == "mmididx":
         return _convert_parquet_to_numpy(
@@ -1809,6 +1842,7 @@ def convert_parquet_to_megatron(
             graph_sidecars=graph_sidecars,
             source_platform_sidecar=source_platform_sidecar,
             objective_contract=objective_contract,
+            objective_artifact_manifest=objective_artifact_manifest,
             vocab_size=vocab_size,
         )
     if writer_backend != "megatron":
@@ -2062,6 +2096,10 @@ def convert_parquet_to_megatron(
         _add_symbol_identity_manifest(sidecar_data, symbol_identity_schema_version)
     if objective_manifest is not None:
         sidecar_data["objective_contract"] = objective_manifest
+    if objective_artifact_manifest is not None:
+        sidecar_data["objective_materialization"] = dict(
+            objective_artifact_manifest
+        )
 
     with open(json_path, "w", encoding="utf-8") as jf:
         json.dump(sidecar_data, jf, indent=4)
@@ -2081,8 +2119,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--input-dir",
-        required=True,
-        help="Directory containing parquet shards",
+        default=None,
+        help=(
+            "Directory containing parquet shards. May be omitted when "
+            "--objective-artifact supplies the canonical directory."
+        ),
     )
     parser.add_argument(
         "--output-prefix",
@@ -2174,9 +2215,17 @@ def main() -> int:
         "--objective-contract",
         default=None,
         help=(
-            "Path to a cppmega_pre_materialized_objectives_v1 receipt. "
-            "Objective IDs, loss masks, graph edges, and exact accounting are "
-            "validated and embedded in the indexed-prefix manifest."
+            "Legacy option retained only for an explicit fail-closed error. "
+            "Use --objective-artifact; bare contracts are not accepted."
+        ),
+    )
+    parser.add_argument(
+        "--objective-artifact",
+        default=None,
+        help=(
+            "Path to cppmega_objective_materialization_artifact_v1. This is the "
+            "canonical CASE1/CASE6/H200 handoff and binds the input directory, "
+            "contract, shard hashes, sidecars, and graph semantics."
         ),
     )
     parser.add_argument(
@@ -2186,6 +2235,9 @@ def main() -> int:
         help="Tokenizer vocab size to write to the JSON sidecar (default: 65536)",
     )
     args = parser.parse_args()
+
+    if args.input_dir is None and args.objective_artifact is None:
+        raise ValueError("--input-dir is required without --objective-artifact")
 
     if args.no_side_channels and args.side_channels:
         raise ValueError("--no-side-channels cannot be combined with --side-channels")
@@ -2235,6 +2287,7 @@ def main() -> int:
         graph_sidecars=graph_sidecars,
         source_platform_sidecar=source_platform_sidecar,
         objective_contract_path=args.objective_contract,
+        objective_artifact_path=args.objective_artifact,
         vocab_size=args.vocab_size,
         writer_backend=args.writer_backend,
     )

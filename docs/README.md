@@ -12,6 +12,8 @@ Use this file as the front door for repo documentation.
   commands for validated configs.
 - [porting_policy.md](porting_policy.md) captures what belongs in `cppmega`
   versus upstream Megatron, Transformer Engine, TileLang, or other projects.
+- [objective_mixture_contract.md](objective_mixture_contract.md) defines the
+  typed pre-materialized objective handoff and fail-closed Megatron/H200 gates.
 
 ## Session And Probe Notes
 
