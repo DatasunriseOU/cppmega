@@ -2,18 +2,18 @@
 """Build an audited, immutable cppmega macro-routes Megatron bundle.
 
 The live parquet conveyor keeps adding/replacing shards.  This builder first
-hardlinks only stable shards into a run-local snapshot, audits that snapshot,
-then converts every requested sequence bucket with the full token and graph
-sidecar contract.  Bucket directories and the final bundle are published by
-rename only after validation succeeds.
+reflinks or copies stable shards into a private run-local snapshot, audits that
+snapshot, then converts every requested sequence bucket with the full token and
+graph sidecar contract.  Bucket directories and the final bundle are published
+by rename only after validation succeeds.
 """
 
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import os
@@ -22,8 +22,9 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
 import time
-from typing import Iterable
+from typing import Iterable, TextIO
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -40,6 +41,7 @@ from data.publish_megatron_bundle_to_nebius_s3 import (  # noqa: E402
     EXPECTED_BUNDLE_TOKENIZER_CONTRACT,
     EXPECTED_VOCAB_SIZE,
     _objective_source_snapshot_summary,
+    _validate_bundle,
     _validate_prefix_manifest_contract,
     _validate_tokenizer_directory,
 )
@@ -50,6 +52,7 @@ from cppmega.megatron.objective_contract import (  # noqa: E402
 
 
 DEFAULT_BUCKETS = (1024, 2048, 4096, 8192, 16384)
+BUILD_PLAN_SCHEMA = "cppmega_macro_routes_build_plan_v1"
 DTYPE_SIZES = {
     "uint8": 1,
     "uint16": 2,
@@ -70,6 +73,109 @@ def _sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
         while chunk := fh.read(chunk_size):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _canonical_sha256(payload: object) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _stat_signature(stat: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
+
+
+def _copy_private(source: Path, target: Path) -> None:
+    """Create a copy-on-write clone when available, otherwise a private copy."""
+
+    clone_command = (
+        ["cp", "-c", str(source), str(target)]
+        if sys.platform == "darwin"
+        else ["cp", "--reflink=auto", "--", str(source), str(target)]
+    )
+    try:
+        cloned = subprocess.run(clone_command, capture_output=True, check=False)
+    except OSError:
+        cloned = None
+    if cloned is None or cloned.returncode != 0:
+        target.unlink(missing_ok=True)
+        shutil.copy2(source, target)
+
+
+def _copy_stable_snapshot_file(source: Path, target: Path) -> dict[str, object]:
+    if source.is_symlink() or not source.is_file():
+        raise RuntimeError(f"snapshot source is not a regular file: {source}")
+    if target.exists():
+        raise RuntimeError(f"snapshot target already exists: {target}")
+
+    staged = target.with_name(
+        f".{target.name}.staging-{os.getpid()}-{threading.get_ident()}"
+    )
+    staged.unlink(missing_ok=True)
+    try:
+        before = source.stat()
+        before_sha256 = _sha256(source)
+        after_initial_hash = source.stat()
+        if _stat_signature(before) != _stat_signature(after_initial_hash):
+            raise RuntimeError(f"source changed during pre-copy hashing: {source}")
+
+        _copy_private(source, staged)
+        after_copy = source.stat()
+        after_sha256 = _sha256(source)
+        after_final_hash = source.stat()
+        staged_before_hash = staged.stat()
+        staged_sha256 = _sha256(staged)
+        staged_after_hash = staged.stat()
+
+        source_signatures = {
+            _stat_signature(before),
+            _stat_signature(after_initial_hash),
+            _stat_signature(after_copy),
+            _stat_signature(after_final_hash),
+        }
+        if len(source_signatures) != 1 or before_sha256 != after_sha256:
+            raise RuntimeError(f"source changed while snapshotting: {source}")
+        if (
+            _stat_signature(staged_before_hash) != _stat_signature(staged_after_hash)
+            or staged_before_hash.st_size != before.st_size
+            or staged_sha256 != before_sha256
+        ):
+            raise RuntimeError(f"private snapshot copy is unstable: {source}")
+        if (
+            staged_after_hash.st_dev == after_final_hash.st_dev
+            and staged_after_hash.st_ino == after_final_hash.st_ino
+        ):
+            raise RuntimeError(f"snapshot copy unexpectedly shares an inode: {source}")
+        os.replace(staged, target)
+        return {
+            "size": before.st_size,
+            "mtime_ns": before.st_mtime_ns,
+            "sha256": before_sha256,
+        }
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def _acquire_build_lock(output_dir: Path) -> TextIO:
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = output_dir.with_name(f".{output_dir.name}.build.lock")
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        handle.close()
+        raise RuntimeError(f"bundle build already active: {output_dir}") from error
+    return handle
 
 
 def _write_json_atomic(path: Path, payload: object) -> None:
@@ -112,8 +218,9 @@ def _stable_parquets(
 def _load_manifest_allowlist(
     manifest_path: Path,
     buckets: tuple[int, ...],
-) -> tuple[dict[tuple[str, int], set[str]], dict[str, object]]:
-    blob = json.loads(manifest_path.read_text(encoding="utf-8"))
+) -> tuple[dict[tuple[str, int], dict[str, int]], dict[str, object]]:
+    manifest_bytes = manifest_path.read_bytes()
+    blob = json.loads(manifest_bytes)
     done = blob.get("done")
     if not isinstance(done, dict):
         raise ValueError(f"{manifest_path}: missing done map")
@@ -126,8 +233,8 @@ def _load_manifest_allowlist(
             f"{manifest_path}: refusing to freeze a conveyor with "
             f"{len(failed)} failed units; sample={sample}"
         )
-    allowed = {
-        (kind, bucket): set() for kind in ("code", "commits") for bucket in buckets
+    allowed: dict[tuple[str, int], dict[str, int]] = {
+        (kind, bucket): {} for kind in ("code", "commits") for bucket in buckets
     }
     for key, info in done.items():
         if not isinstance(info, dict):
@@ -150,8 +257,24 @@ def _load_manifest_allowlist(
         else:
             continue
         for bucket in buckets:
-            if str(bucket) in lengths:
-                allowed[(kind, bucket)].add(filename)
+            length_info = lengths.get(str(bucket))
+            if length_info is None:
+                continue
+            if not isinstance(length_info, dict):
+                raise RuntimeError(
+                    f"manifest has malformed length metadata for {key}/{bucket}"
+                )
+            rows = length_info.get("rows")
+            if not isinstance(rows, int) or isinstance(rows, bool) or rows < 1:
+                raise RuntimeError(
+                    f"manifest has invalid row count for {key}/{bucket}: {rows!r}"
+                )
+            bucket_rows = allowed[(kind, bucket)]
+            if filename in bucket_rows:
+                raise RuntimeError(
+                    f"manifest maps duplicate shard {kind}/{bucket}/{filename}"
+                )
+            bucket_rows[filename] = rows
     if any(not names for names in allowed.values()):
         empty = [
             f"{kind}/{bucket}" for (kind, bucket), names in allowed.items() if not names
@@ -159,7 +282,7 @@ def _load_manifest_allowlist(
         raise RuntimeError(f"manifest has no completed files for: {', '.join(empty)}")
     metadata = {
         "path": str(manifest_path.resolve()),
-        "sha256": _sha256(manifest_path),
+        "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "done_units": len(done),
         "failed_units": 0,
         "allowlist_counts": {
@@ -178,29 +301,37 @@ def _snapshot_sources(
     buckets: tuple[int, ...],
     min_age_seconds: float,
     hash_jobs: int,
-    allowed: dict[tuple[str, int], set[str]],
+    allowed: dict[tuple[str, int], dict[str, int]],
     conveyor_manifest: dict[str, object],
 ) -> dict[str, object]:
     manifest_path = snapshot_root / "source_manifest.json"
     if manifest_path.exists():
-        return json.loads(manifest_path.read_text(encoding="utf-8"))
+        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (
+            existing.get("schema") != "cppmega_parquet_snapshot_v1"
+            or existing.get("conveyor_manifest") != conveyor_manifest
+        ):
+            raise RuntimeError("existing source snapshot does not match build inputs")
+        return existing
     if snapshot_root.exists():
         raise RuntimeError(
             f"incomplete source snapshot exists without manifest: {snapshot_root}"
         )
 
-    records: list[dict[str, object]] = []
+    candidates: list[tuple[str, int, Path, Path, int]] = []
     for kind, source_root in (("code", code_root), ("commits", commit_root)):
         for bucket in buckets:
             source_paths = _stable_parquets(
                 source_root,
                 bucket,
                 min_age_seconds,
-                allowed[(kind, bucket)],
+                set(allowed[(kind, bucket)]),
             )
             if not source_paths:
                 raise RuntimeError(f"no stable {kind}/{bucket} parquet shards")
-            missing = allowed[(kind, bucket)] - {path.name for path in source_paths}
+            missing = set(allowed[(kind, bucket)]) - {
+                path.name for path in source_paths
+            }
             if missing:
                 raise RuntimeError(
                     f"{kind}/{bucket}: {len(missing)} manifest-backed shards are "
@@ -209,35 +340,35 @@ def _snapshot_sources(
             kind_dir = snapshot_root / kind / str(bucket)
             kind_dir.mkdir(parents=True, exist_ok=True)
             for source in source_paths:
-                before = source.stat()
                 target = kind_dir / source.name
-                os.link(source, target)
-                after = source.stat()
-                if (
-                    before.st_ino != after.st_ino
-                    or before.st_size != after.st_size
-                    or before.st_mtime_ns != after.st_mtime_ns
-                ):
-                    target.unlink(missing_ok=True)
-                    continue
-                records.append(
-                    {
-                        "kind": kind,
-                        "bucket": bucket,
-                        "source": str(source.resolve()),
-                        "snapshot": str(target.relative_to(snapshot_root)),
-                        "size": before.st_size,
-                        "mtime_ns": before.st_mtime_ns,
-                    }
+                candidates.append(
+                    (
+                        kind,
+                        bucket,
+                        source,
+                        target,
+                        allowed[(kind, bucket)][source.name],
+                    )
                 )
 
-    def add_hash(record: dict[str, object]) -> dict[str, object]:
-        out = dict(record)
-        out["sha256"] = _sha256(snapshot_root / str(record["snapshot"]))
-        return out
+    def copy_candidate(
+        candidate: tuple[str, int, Path, Path, int],
+    ) -> dict[str, object]:
+        kind, bucket, source, target, rows = candidate
+        copied = _copy_stable_snapshot_file(source, target)
+        return {
+            "kind": kind,
+            "bucket": bucket,
+            "source": str(source.resolve()),
+            "snapshot": str(target.relative_to(snapshot_root)),
+            "size": copied["size"],
+            "mtime_ns": copied["mtime_ns"],
+            "rows": rows,
+            "sha256": copied["sha256"],
+        }
 
     with ThreadPoolExecutor(max_workers=max(1, hash_jobs)) as pool:
-        records = list(pool.map(add_hash, records))
+        records = list(pool.map(copy_candidate, candidates))
 
     by_kind_bucket: dict[str, int] = {}
     for record in records:
@@ -250,7 +381,7 @@ def _snapshot_sources(
     }
     if by_kind_bucket != expected_counts:
         raise RuntimeError(
-            "source snapshot lost files during hardlink publication: "
+            "source snapshot lost files during private-copy publication: "
             f"actual={by_kind_bucket} expected={expected_counts}"
         )
     payload: dict[str, object] = {
@@ -275,12 +406,32 @@ def _write_repaired_snapshot_manifest(
 ) -> dict[str, object]:
     output_path = snapshot_root / "repaired_manifest.json"
     if output_path.exists():
-        return json.loads(output_path.read_text(encoding="utf-8"))
-    changed_paths = {
-        str(Path(str(record["path"])).resolve())
+        existing = json.loads(output_path.read_text(encoding="utf-8"))
+        if existing.get("source_manifest_sha256") != _canonical_sha256(
+            source_manifest
+        ):
+            raise RuntimeError("existing repaired snapshot source binding mismatch")
+        existing_records = existing.get("files")
+        if not isinstance(existing_records, list):
+            raise RuntimeError("existing repaired snapshot has no files list")
+        for record in existing_records:
+            if not isinstance(record, dict):
+                raise RuntimeError("existing repaired snapshot file record is invalid")
+            path = snapshot_root / str(record["snapshot"])
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or path.stat().st_size != int(record["size"])
+                or _sha256(path) != str(record["snapshot_sha256"])
+            ):
+                raise RuntimeError(f"existing repaired snapshot file drifted: {path}")
+        return existing
+    scan_by_path = {
+        str(Path(str(record["path"])).resolve()): record
         for record in repair_receipt.get("file_scans", [])
         if isinstance(record, dict) and record.get("path")
     }
+    changed_paths = set(scan_by_path)
     source_records = source_manifest.get("files")
     if not isinstance(source_records, list):
         raise RuntimeError("source snapshot manifest has no files list")
@@ -288,21 +439,49 @@ def _write_repaired_snapshot_manifest(
     def add_repaired_hash(record: dict[str, object]) -> dict[str, object]:
         snapshot_path = (snapshot_root / str(record["snapshot"])).resolve()
         changed = str(snapshot_path) in changed_paths
+        snapshot_size = snapshot_path.stat().st_size
+        snapshot_sha256 = _sha256(snapshot_path)
+        actually_changed = (
+            snapshot_size != int(record["size"])
+            or snapshot_sha256 != str(record["sha256"])
+        )
+        if changed != actually_changed:
+            raise RuntimeError(
+                "boundary repair receipt does not match snapshot bytes: "
+                f"{snapshot_path}"
+            )
+        if changed and int(scan_by_path[str(snapshot_path)].get("rows", -1)) != int(
+            record["rows"]
+        ):
+            raise RuntimeError(
+                f"boundary repair row count drifted for snapshot: {snapshot_path}"
+            )
         return {
             "kind": record["kind"],
             "bucket": record["bucket"],
             "snapshot": record["snapshot"],
-            "size": snapshot_path.stat().st_size,
+            "size": snapshot_size,
+            "rows": record["rows"],
             "source_sha256": record["sha256"],
-            "snapshot_sha256": _sha256(snapshot_path) if changed else record["sha256"],
+            "snapshot_sha256": snapshot_sha256,
             "boundary_repaired": changed,
         }
 
     with ThreadPoolExecutor(max_workers=max(1, hash_jobs)) as pool:
         records = list(pool.map(add_repaired_hash, source_records))
+    known_paths = {
+        str((snapshot_root / str(record["snapshot"])).resolve())
+        for record in source_records
+        if isinstance(record, dict)
+    }
+    if changed_paths - known_paths:
+        raise RuntimeError(
+            "boundary repair receipt references files outside the source snapshot"
+        )
     payload: dict[str, object] = {
         "schema": "cppmega_repaired_parquet_snapshot_v1",
         "created_at": _utc_now(),
+        "source_manifest_sha256": _canonical_sha256(source_manifest),
         "file_count": len(records),
         "changed_files": len(changed_paths),
         "files": records,
@@ -476,27 +655,61 @@ def _validate_objective_source_binding(
         raise RuntimeError(str(exc)) from exc
 
     files = binding["files"]
-    source_counter: Counter[tuple[int, str]] = Counter()
+    objective_records: list[dict[str, object]] = []
     for record in files:
-        source_counter[(int(record["size_bytes"]), str(record["sha256"]))] += 1
+        relative = Path(str(record["path"]))
+        if (
+            relative.is_absolute()
+            or len(relative.parts) != 3
+            or relative.parts[0] not in {"code", "commits"}
+            or relative.parts[1] != str(bucket)
+            or relative.name in {"", ".", ".."}
+        ):
+            raise RuntimeError(
+                f"bucket {bucket}: objective source path is not canonical: {relative}"
+            )
+        objective_records.append(
+            {
+                "kind": relative.parts[0],
+                "bucket": bucket,
+                "path": relative.as_posix(),
+                "size": int(record["size_bytes"]),
+                "sha256": str(record["sha256"]),
+                "rows": int(record["rows"]),
+            }
+        )
 
     repaired_files = repaired_snapshot_manifest.get("files")
     if not isinstance(repaired_files, list):
         raise RuntimeError("repaired snapshot manifest has no files list")
     snapshot_records = [
-        record
+        {
+            "kind": str(record["kind"]),
+            "bucket": int(record["bucket"]),
+            "path": str(record["snapshot"]),
+            "size": int(record["size"]),
+            "sha256": str(record["snapshot_sha256"]),
+            "rows": int(record["rows"]),
+        }
         for record in repaired_files
         if isinstance(record, dict) and int(record.get("bucket", -1)) == bucket
     ]
-    snapshot_counter = Counter(
-        (int(record["size"]), str(record["snapshot_sha256"]))
-        for record in snapshot_records
-    )
-    if source_counter != snapshot_counter:
+    if objective_records != snapshot_records:
+        mismatch_index = next(
+            (
+                index
+                for index, pair in enumerate(
+                    zip(objective_records, snapshot_records, strict=False)
+                )
+                if pair[0] != pair[1]
+            ),
+            min(len(objective_records), len(snapshot_records)),
+        )
         raise RuntimeError(
-            f"bucket {bucket}: objective sources do not match repaired snapshot; "
-            f"objective_only={list((source_counter - snapshot_counter).elements())[:5]} "
-            f"snapshot_only={list((snapshot_counter - source_counter).elements())[:5]}"
+            f"bucket {bucket}: objective sources do not match repaired snapshot "
+            f"at ordered record {mismatch_index}; "
+            f"objective_count={len(objective_records)} "
+            f"snapshot_count={len(snapshot_records)}"
         )
     return source_summary
 
@@ -631,6 +844,7 @@ def _build_bucket(
     final_prefix = final_dir / prefix_name
     if final_dir.exists():
         manifest = _verify_prefix(final_prefix, expected)
+        _require_bucket_objective_binding(final_prefix, manifest, artifact)
         return {"bucket": bucket, "prefix": str(final_prefix), "manifest": manifest}
 
     building_dir = data_root / f".seq_{bucket}.building"
@@ -651,17 +865,23 @@ def _build_bucket(
         objective_artifact_path=str(objective_artifact_path.resolve()),
     )
     manifest = _verify_prefix(building_prefix, expected)
+    _require_bucket_objective_binding(building_prefix, manifest, artifact)
+    os.replace(building_dir, final_dir)
+    return {"bucket": bucket, "prefix": str(final_prefix), "manifest": manifest}
+
+
+def _require_bucket_objective_binding(
+    prefix: Path, manifest: dict[str, object], artifact: object
+) -> None:
     materialization = manifest.get("objective_materialization")
     if (
         not isinstance(materialization, dict)
-        or materialization.get("artifact_set_sha256") != artifact.artifact_set_sha256
-        or materialization.get("artifact_file_sha256") != artifact.file_sha256
+        or materialization.get("artifact_set_sha256")
+        != getattr(artifact, "artifact_set_sha256")
+        or materialization.get("artifact_file_sha256")
+        != getattr(artifact, "file_sha256")
     ):
-        raise RuntimeError(
-            f"{building_prefix}: converted objective artifact binding drifted"
-        )
-    os.replace(building_dir, final_dir)
-    return {"bucket": bucket, "prefix": str(final_prefix), "manifest": manifest}
+        raise RuntimeError(f"{prefix}: converted objective artifact binding drifted")
 
 
 def _artifact_records(root: Path, hash_jobs: int) -> list[dict[str, object]]:
@@ -699,22 +919,37 @@ def _artifact_set_sha256(records: list[dict[str, object]]) -> str:
 
 def _stage_tokenizer(tokenizer_dir: Path, bundle_root: Path) -> dict[str, object]:
     source_files = sorted(_validate_tokenizer_directory(tokenizer_dir))
+    source_bindings = {
+        path.name: (path.stat().st_size, _sha256(path)) for path in source_files
+    }
 
     target = bundle_root / "tokenizer"
-    if target.exists():
-        raise RuntimeError(f"tokenizer staging target already exists: {target}")
-    target.mkdir()
+    if target.exists() and (target.is_symlink() or not target.is_dir()):
+        raise RuntimeError(f"tokenizer staging target is invalid: {target}")
+    target.mkdir(exist_ok=True)
     records: list[dict[str, object]] = []
     for path in source_files:
         staged = target / path.name
-        shutil.copy2(path, staged)
+        if staged.exists():
+            if staged.is_symlink() or not staged.is_file():
+                raise RuntimeError(f"staged tokenizer file is invalid: {staged}")
+        else:
+            shutil.copy2(path, staged)
+        expected_size, expected_sha256 = source_bindings[path.name]
+        if (
+            staged.stat().st_size != expected_size
+            or _sha256(staged) != expected_sha256
+        ):
+            raise RuntimeError(f"staged tokenizer file does not match source: {staged}")
         records.append(
             {
                 "path": staged.relative_to(bundle_root).as_posix(),
-                "size": staged.stat().st_size,
-                "sha256": _sha256(staged),
+                "size": expected_size,
+                "sha256": expected_sha256,
             }
         )
+    if {path.name for path in target.iterdir()} != set(source_bindings):
+        raise RuntimeError(f"staged tokenizer contains unexpected files: {target}")
     return {
         "path": "tokenizer",
         "contract": EXPECTED_BUNDLE_TOKENIZER_CONTRACT,
@@ -726,7 +961,9 @@ def _stage_tokenizer(tokenizer_dir: Path, bundle_root: Path) -> dict[str, object
 
 def _stage_data_contracts(bundle_root: Path) -> dict[str, dict[str, object]]:
     target = bundle_root / "contracts"
-    target.mkdir()
+    if target.exists() and (target.is_symlink() or not target.is_dir()):
+        raise RuntimeError(f"data-contract staging target is invalid: {target}")
+    target.mkdir(exist_ok=True)
     sources = {
         "domain_schema": REPO_ROOT / "data/domain_schema_v1.json",
         "tokenizer_contract": (
@@ -736,12 +973,27 @@ def _stage_data_contracts(bundle_root: Path) -> dict[str, dict[str, object]]:
     descriptors: dict[str, dict[str, object]] = {}
     for name, source in sources.items():
         staged = target / source.name
-        shutil.copy2(source, staged)
+        expected_size = source.stat().st_size
+        expected_sha256 = _sha256(source)
+        if staged.exists():
+            if staged.is_symlink() or not staged.is_file():
+                raise RuntimeError(f"staged data contract is invalid: {staged}")
+        else:
+            shutil.copy2(source, staged)
+        if (
+            staged.stat().st_size != expected_size
+            or _sha256(staged) != expected_sha256
+        ):
+            raise RuntimeError(f"staged data contract does not match source: {staged}")
         descriptors[name] = {
             "path": staged.relative_to(bundle_root).as_posix(),
-            "size": staged.stat().st_size,
-            "sha256": _sha256(staged),
+            "size": expected_size,
+            "sha256": expected_sha256,
         }
+    if {path.name for path in target.iterdir()} != {
+        source.name for source in sources.values()
+    }:
+        raise RuntimeError(f"staged data contracts contain unexpected files: {target}")
     return descriptors
 
 
@@ -761,6 +1013,171 @@ def _portable_bucket_results(
         normalized["prefix"] = relative_prefix.as_posix()
         portable.append(normalized)
     return portable
+
+
+def _objective_build_records(
+    objective_artifacts: dict[int, Path], buckets: tuple[int, ...]
+) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for bucket in buckets:
+        artifact = load_objective_materialization_artifact(
+            objective_artifacts[bucket]
+        )
+        records.append(
+            {
+                "bucket": bucket,
+                "artifact_path": str(artifact.path),
+                "artifact_set_sha256": artifact.artifact_set_sha256,
+                "artifact_file_sha256": artifact.file_sha256,
+                "contract_path": str(artifact.contract_path),
+                "contract_sha256": artifact.contract.sha256,
+                "contract_file_sha256": _sha256(artifact.contract_path),
+            }
+        )
+    return records
+
+
+def _source_file_records(paths: Iterable[Path], root: Path) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for path in sorted(paths):
+        records.append(
+            {
+                "path": path.resolve().relative_to(root.resolve()).as_posix(),
+                "size": path.stat().st_size,
+                "sha256": _sha256(path),
+            }
+        )
+    return records
+
+
+def _create_build_plan(
+    *,
+    args: argparse.Namespace,
+    buckets: tuple[int, ...],
+    output_dir: Path,
+    objective_artifacts: dict[int, Path],
+    conveyor_manifest: dict[str, object],
+) -> dict[str, object]:
+    objective_records = _objective_build_records(objective_artifacts, buckets)
+    tokenizer_dir = args.tokenizer_dir.resolve()
+    tokenizer_records = _source_file_records(
+        _validate_tokenizer_directory(tokenizer_dir), tokenizer_dir
+    )
+    contract_paths = (
+        REPO_ROOT / "data/domain_schema_v1.json",
+        REPO_ROOT / "data/tokenizer_v2/tokenizer_contract_v1.json",
+    )
+    converter_path = REPO_ROOT / "scripts/data_prep_parquet_to_megatron.py"
+    plan = {
+        "output_dir": str(output_dir),
+        "source_roots": {
+            "code": str(args.code_root.resolve()),
+            "commits": str(args.commit_root.resolve()),
+        },
+        "conveyor_manifest": conveyor_manifest,
+        "buckets": list(buckets),
+        "min_age_seconds": args.min_age_seconds,
+        "keep_snapshot": bool(args.keep_snapshot),
+        "objective_artifacts": objective_records,
+        "tokenizer": {
+            "path": str(tokenizer_dir),
+            "files": tokenizer_records,
+            "artifact_set_sha256": _artifact_set_sha256(tokenizer_records),
+        },
+        "data_contracts": _source_file_records(contract_paths, REPO_ROOT),
+        "implementation": {
+            "builder": {
+                "path": str(Path(__file__).resolve()),
+                "sha256": _sha256(Path(__file__).resolve()),
+            },
+            "converter": {
+                "path": str(converter_path.resolve()),
+                "sha256": _sha256(converter_path),
+            },
+            "audit": {
+                "path": str(args.audit_script.resolve()),
+                "sha256": _sha256(args.audit_script.resolve()),
+            },
+            "boundary_repair": {
+                "path": str(args.repair_script.resolve()),
+                "sha256": _sha256(args.repair_script.resolve()),
+            },
+        },
+    }
+    return {
+        "schema": BUILD_PLAN_SCHEMA,
+        "objective_artifacts_sha256": _canonical_sha256(objective_records),
+        "build_plan_sha256": _canonical_sha256(plan),
+        "plan": plan,
+    }
+
+
+def _ensure_partial_build_plan(
+    partial_dir: Path, expected: dict[str, object]
+) -> None:
+    plan_path = partial_dir / "build_plan.json"
+    if partial_dir.exists():
+        if partial_dir.is_symlink() or not partial_dir.is_dir():
+            raise RuntimeError(f"partial build path is not a directory: {partial_dir}")
+        if plan_path.is_symlink() or not plan_path.is_file():
+            raise RuntimeError(
+                f"stale partial build has no canonical build plan: {partial_dir}"
+            )
+        try:
+            existing = json.loads(plan_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                f"stale partial build has an unreadable build plan: {partial_dir}"
+            ) from error
+        if not isinstance(existing, dict):
+            raise RuntimeError(
+                f"stale partial build has an invalid build plan: {partial_dir}"
+            )
+        if existing != expected:
+            raise RuntimeError(
+                "stale partial build plan mismatch: "
+                f"existing={existing.get('build_plan_sha256')} "
+                f"expected={expected.get('build_plan_sha256')} "
+                f"existing_objectives={existing.get('objective_artifacts_sha256')} "
+                f"expected_objectives={expected.get('objective_artifacts_sha256')}"
+            )
+        return
+    partial_dir.mkdir(parents=True)
+    _write_json_atomic(plan_path, expected)
+
+
+def _assert_build_plan_inputs(
+    *,
+    args: argparse.Namespace,
+    objective_artifacts: dict[int, Path],
+    buckets: tuple[int, ...],
+    output_dir: Path,
+    build_plan: dict[str, object],
+) -> None:
+    _allowed, conveyor_manifest = _load_manifest_allowlist(
+        args.conveyor_manifest.resolve(), buckets
+    )
+    actual = _create_build_plan(
+        args=args,
+        buckets=buckets,
+        output_dir=output_dir,
+        objective_artifacts=objective_artifacts,
+        conveyor_manifest=conveyor_manifest,
+    )
+    if actual == build_plan:
+        return
+    if actual.get("objective_artifacts_sha256") != build_plan.get(
+        "objective_artifacts_sha256"
+    ):
+        raise RuntimeError("objective artifacts changed after build plan creation")
+    raise RuntimeError("build inputs changed after build plan creation")
+
+
+def _publish_validated_bundle(
+    partial_dir: Path, output_dir: Path, *, hash_jobs: int
+) -> None:
+    _validate_bundle(partial_dir, hash_jobs)
+    os.replace(partial_dir, output_dir)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -819,26 +1236,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--keep-snapshot",
         action="store_true",
-        help="retain repaired parquet hardlink/copy snapshot after a successful build",
+        help="retain repaired private parquet snapshot after a successful build",
     )
     return parser
 
 
-def main(argv: Iterable[str] | None = None) -> int:
-    args = build_arg_parser().parse_args(argv)
-    buckets = tuple(int(value) for value in args.buckets.split(",") if value)
-    if not buckets:
-        raise SystemExit("at least one bucket is required")
-    objective_artifacts = _parse_objective_artifacts(args.objective_artifact, buckets)
-    output_dir = args.output_dir.resolve()
+def _run_build(
+    *,
+    args: argparse.Namespace,
+    buckets: tuple[int, ...],
+    objective_artifacts: dict[int, Path],
+    output_dir: Path,
+) -> int:
     partial_dir = output_dir.with_name(f".{output_dir.name}.partial")
     if output_dir.exists():
         raise SystemExit(f"final bundle already exists: {output_dir}")
-    partial_dir.mkdir(parents=True, exist_ok=True)
 
     allowlist, conveyor_manifest = _load_manifest_allowlist(
         args.conveyor_manifest.resolve(), buckets
     )
+    build_plan = _create_build_plan(
+        args=args,
+        buckets=buckets,
+        output_dir=output_dir,
+        objective_artifacts=objective_artifacts,
+        conveyor_manifest=conveyor_manifest,
+    )
+    _ensure_partial_build_plan(partial_dir, build_plan)
 
     snapshot_root = partial_dir / "snapshot"
     source_manifest = _snapshot_sources(
@@ -880,6 +1304,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         workers=args.audit_workers,
         snapshot_manifest_sha256=_sha256(snapshot_root / "repaired_manifest.json"),
     )
+    _assert_build_plan_inputs(
+        args=args,
+        objective_artifacts=objective_artifacts,
+        buckets=buckets,
+        output_dir=output_dir,
+        build_plan=build_plan,
+    )
     data_root = partial_dir / "data"
     data_root.mkdir(exist_ok=True)
     bucket_results = _portable_bucket_results(
@@ -920,6 +1351,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         }
     tokenizer = _stage_tokenizer(args.tokenizer_dir, partial_dir)
     data_contracts = _stage_data_contracts(partial_dir)
+    _assert_build_plan_inputs(
+        args=args,
+        objective_artifacts=objective_artifacts,
+        buckets=buckets,
+        output_dir=output_dir,
+        build_plan=build_plan,
+    )
+    _ensure_partial_build_plan(partial_dir, build_plan)
     if not args.keep_snapshot:
         shutil.rmtree(snapshot_root)
     artifacts = _artifact_records(partial_dir, args.hash_jobs)
@@ -937,6 +1376,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         "length_column": "valid_token_count",
         "writer_backend": "mmididx",
         "training_contract": "objective_materialized",
+        "build_plan": {
+            "path": "build_plan.json",
+            "build_plan_sha256": build_plan["build_plan_sha256"],
+            "objective_artifacts_sha256": build_plan[
+                "objective_artifacts_sha256"
+            ],
+        },
         "objective_materialization": {
             "schema": "cppmega_bucketed_objective_materializations_v1",
             "buckets": objective_descriptors,
@@ -991,9 +1437,32 @@ def main(argv: Iterable[str] | None = None) -> int:
         "artifact_bytes": sum(int(record["size"]) for record in artifacts),
     }
     _write_json_atomic(partial_dir / "manifest.json", manifest)
-    os.replace(partial_dir, output_dir)
+    _publish_validated_bundle(partial_dir, output_dir, hash_jobs=args.hash_jobs)
     print(json.dumps({"bundle": str(output_dir), "audit": manifest["audit"]}, indent=2))
     return 0
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    buckets = tuple(int(value) for value in args.buckets.split(",") if value)
+    if not buckets:
+        raise SystemExit("at least one bucket is required")
+    if len(buckets) != len(set(buckets)):
+        raise SystemExit("--buckets must not contain duplicates")
+    output_dir = args.output_dir.resolve()
+    lock = _acquire_build_lock(output_dir)
+    try:
+        objective_artifacts = _parse_objective_artifacts(
+            args.objective_artifact, buckets
+        )
+        return _run_build(
+            args=args,
+            buckets=buckets,
+            objective_artifacts=objective_artifacts,
+            output_dir=output_dir,
+        )
+    finally:
+        lock.close()
 
 
 if __name__ == "__main__":

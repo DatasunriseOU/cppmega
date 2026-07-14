@@ -10,11 +10,15 @@ import pytest
 
 import scripts.data.build_macro_routes_megatron_bundle as builder
 from scripts.data.build_macro_routes_megatron_bundle import (
+    _acquire_build_lock,
     _artifact_set_sha256,
     build_arg_parser,
+    _canonical_sha256,
+    _ensure_partial_build_plan,
     _load_manifest_allowlist,
     _parse_objective_artifacts,
     _portable_bucket_results,
+    _publish_validated_bundle,
     _run_snapshot_audit,
     _snapshot_sources,
     _stage_data_contracts,
@@ -175,9 +179,12 @@ def test_objective_sources_must_match_repaired_snapshot(
     repaired = {
         "files": [
             {
+                "kind": Path(row["path"]).parts[0],
                 "bucket": 1024,
+                "snapshot": row["path"],
                 "size": row["size_bytes"],
                 "snapshot_sha256": row["sha256"],
+                "rows": row["rows"],
             }
             for row in files
         ]
@@ -190,11 +197,28 @@ def test_objective_sources_must_match_repaired_snapshot(
     )
     assert result["artifact_set_sha256"] == digest
 
-    repaired["files"][0]["snapshot_sha256"] = "0" * 64
+    for field, value in (
+        ("kind", "commits"),
+        ("bucket", 2048),
+        ("snapshot", "code/1024/other.parquet"),
+        ("size", 999),
+        ("snapshot_sha256", "0" * 64),
+        ("rows", 999),
+    ):
+        drifted = json.loads(json.dumps(repaired))
+        drifted["files"][0][field] = value
+        with pytest.raises(RuntimeError, match="do not match repaired snapshot"):
+            _validate_objective_source_binding(
+                objective_artifact_path=tmp_path / "objective.json",
+                repaired_snapshot_manifest=drifted,
+                bucket=1024,
+            )
+
+    reversed_snapshot = {"files": list(reversed(repaired["files"]))}
     with pytest.raises(RuntimeError, match="do not match repaired snapshot"):
         _validate_objective_source_binding(
             objective_artifact_path=tmp_path / "objective.json",
-            repaired_snapshot_manifest=repaired,
+            repaired_snapshot_manifest=reversed_snapshot,
             bucket=1024,
         )
 
@@ -263,9 +287,12 @@ def _bounded_v2_source_binding() -> tuple[dict[str, object], dict[str, object]]:
     repaired_snapshot = {
         "files": [
             {
+                "kind": "code",
                 "bucket": 1024,
+                "snapshot": files[0]["path"],
                 "size": files[0]["size_bytes"],
                 "snapshot_sha256": files[0]["sha256"],
+                "rows": files[0]["rows"],
             }
         ]
     }
@@ -343,7 +370,9 @@ def test_builder_stages_and_hashes_the_production_tokenizer(tmp_path: Path) -> N
     bundle.mkdir()
 
     descriptor = _stage_tokenizer(source, bundle)
+    resumed = _stage_tokenizer(source, bundle)
 
+    assert resumed == descriptor
     assert descriptor["path"] == "tokenizer"
     assert descriptor["vocab_size"] == 65536
     assert {record["path"] for record in descriptor["files"]} == {
@@ -363,7 +392,9 @@ def test_builder_stages_frozen_domain_and_tokenizer_contracts(tmp_path: Path) ->
     bundle.mkdir()
 
     descriptors = _stage_data_contracts(bundle)
+    resumed = _stage_data_contracts(bundle)
 
+    assert resumed == descriptors
     assert set(descriptors) == {"domain_schema", "tokenizer_contract"}
     for descriptor in descriptors.values():
         staged = bundle / str(descriptor["path"])
@@ -493,6 +524,11 @@ def test_manifest_allowlist_excludes_uncommitted_parquet_orphans(
     assert sorted(
         path.name for path in (snapshot / "commits/1024").glob("*.parquet")
     ) == ["repo_r0.parquet"]
+    assert receipt["files"][0]["rows"] == 1
+    assert (
+        (snapshot / "code/1024/repo.parquet").stat().st_ino
+        != (code_root / "1024/repo.parquet").stat().st_ino
+    )
 
 
 def test_manifest_allowlist_rejects_failed_conveyor_units(tmp_path: Path) -> None:
@@ -519,7 +555,9 @@ def test_manifest_allowlist_rejects_failed_conveyor_units(tmp_path: Path) -> Non
         _load_manifest_allowlist(manifest_path, (1024,))
 
 
-def test_repaired_snapshot_manifest_hashes_only_replaced_files(tmp_path: Path) -> None:
+def test_repaired_snapshot_manifest_hashes_and_binds_replaced_files(
+    tmp_path: Path,
+) -> None:
     snapshot = tmp_path / "snapshot"
     unchanged = snapshot / "code/1024/a.parquet"
     changed = snapshot / "commits/1024/b.parquet"
@@ -531,12 +569,16 @@ def test_repaired_snapshot_manifest_hashes_only_replaced_files(tmp_path: Path) -
                 "kind": "code",
                 "bucket": 1024,
                 "snapshot": "code/1024/a.parquet",
+                "size": len(b"same"),
+                "rows": 2,
                 "sha256": hashlib.sha256(b"same").hexdigest(),
             },
             {
                 "kind": "commits",
                 "bucket": 1024,
                 "snapshot": "commits/1024/b.parquet",
+                "size": len(b"before"),
+                "rows": 3,
                 "sha256": hashlib.sha256(b"before").hexdigest(),
             },
         ]
@@ -547,7 +589,7 @@ def test_repaired_snapshot_manifest_hashes_only_replaced_files(tmp_path: Path) -
     repaired = _write_repaired_snapshot_manifest(
         snapshot_root=snapshot,
         source_manifest=source_manifest,
-        repair_receipt={"file_scans": [{"path": str(changed)}]},
+        repair_receipt={"file_scans": [{"path": str(changed), "rows": 3}]},
         hash_jobs=1,
     )
 
@@ -562,3 +604,130 @@ def test_repaired_snapshot_manifest_hashes_only_replaced_files(tmp_path: Path) -
         by_path["commits/1024/b.parquet"]["snapshot_sha256"]
         != by_path["commits/1024/b.parquet"]["source_sha256"]
     )
+    assert by_path["code/1024/a.parquet"]["rows"] == 2
+    assert by_path["commits/1024/b.parquet"]["rows"] == 3
+
+
+def test_snapshot_rejects_source_mutation_during_private_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code_root = tmp_path / "code"
+    commit_root = tmp_path / "commits"
+    code_source = code_root / "1024/repo.parquet"
+    _write(code_source, b"code-before")
+    _write(commit_root / "1024/repo_r0.parquet", b"commit")
+    real_copy = builder._copy_private
+
+    def copy_then_mutate(source: Path, target: Path) -> None:
+        real_copy(source, target)
+        if source == code_source:
+            source.write_bytes(b"code-after")
+
+    monkeypatch.setattr(builder, "_copy_private", copy_then_mutate)
+    snapshot = tmp_path / "snapshot"
+    with pytest.raises(RuntimeError, match="source changed while snapshotting"):
+        _snapshot_sources(
+            code_root=code_root,
+            commit_root=commit_root,
+            snapshot_root=snapshot,
+            buckets=(1024,),
+            min_age_seconds=0,
+            hash_jobs=1,
+            allowed={
+                ("code", 1024): {"repo.parquet": 2},
+                ("commits", 1024): {"repo_r0.parquet": 3},
+            },
+            conveyor_manifest={"sha256": "a" * 64},
+        )
+
+    assert not (snapshot / "source_manifest.json").exists()
+    assert not (snapshot / "code/1024/repo.parquet").exists()
+
+
+def _test_build_plan(objective_digest: str) -> dict[str, object]:
+    objectives = [
+        {
+            "bucket": 1024,
+            "artifact_path": "/objective.json",
+            "artifact_set_sha256": objective_digest,
+            "artifact_file_sha256": "b" * 64,
+            "contract_path": "/contract.json",
+            "contract_sha256": "c" * 64,
+            "contract_file_sha256": "d" * 64,
+        }
+    ]
+    plan = {"buckets": [1024], "objective_artifacts": objectives}
+    return {
+        "schema": builder.BUILD_PLAN_SCHEMA,
+        "objective_artifacts_sha256": _canonical_sha256(objectives),
+        "build_plan_sha256": _canonical_sha256(plan),
+        "plan": plan,
+    }
+
+
+def test_stale_partial_cannot_reuse_different_objective_build_plan(
+    tmp_path: Path,
+) -> None:
+    partial = tmp_path / ".bundle.partial"
+    original = _test_build_plan("a" * 64)
+    _ensure_partial_build_plan(partial, original)
+    _ensure_partial_build_plan(partial, original)
+
+    with pytest.raises(RuntimeError, match="stale partial build plan mismatch"):
+        _ensure_partial_build_plan(partial, _test_build_plan("e" * 64))
+
+    changed_plan = json.loads(json.dumps(original))
+    changed_plan["plan"]["keep_snapshot"] = True
+    changed_plan["build_plan_sha256"] = _canonical_sha256(changed_plan["plan"])
+    assert (
+        changed_plan["objective_artifacts_sha256"]
+        == original["objective_artifacts_sha256"]
+    )
+    with pytest.raises(RuntimeError, match="stale partial build plan mismatch"):
+        _ensure_partial_build_plan(partial, changed_plan)
+
+
+def test_unbound_partial_is_rejected_as_stale(tmp_path: Path) -> None:
+    partial = tmp_path / ".bundle.partial"
+    partial.mkdir()
+
+    with pytest.raises(RuntimeError, match="no canonical build plan"):
+        _ensure_partial_build_plan(partial, _test_build_plan("a" * 64))
+
+
+def test_concurrent_build_lock_is_rejected(tmp_path: Path) -> None:
+    output = tmp_path / "bundle"
+    first = _acquire_build_lock(output)
+    try:
+        with pytest.raises(RuntimeError, match="bundle build already active"):
+            _acquire_build_lock(output)
+    finally:
+        first.close()
+
+    second = _acquire_build_lock(output)
+    second.close()
+
+
+def test_strict_validation_runs_before_atomic_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    partial = tmp_path / ".bundle.partial"
+    output = tmp_path / "bundle"
+
+    def validate(bundle: Path, hash_jobs: int) -> None:
+        assert bundle == partial
+        assert hash_jobs == 3
+        events.append("validate")
+
+    def publish(source: Path, target: Path) -> None:
+        assert source == partial
+        assert target == output
+        events.append("publish")
+
+    monkeypatch.setattr(builder, "_validate_bundle", validate)
+    monkeypatch.setattr(builder.os, "replace", publish)
+
+    _publish_validated_bundle(partial, output, hash_jobs=3)
+
+    assert events == ["validate", "publish"]
