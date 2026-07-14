@@ -84,6 +84,24 @@ def _source_identity(source: str) -> tuple[int, str]:
 
 def _objective_payload():
     tasks = ("causal_lm", "fim", "ast_fim", "ifim", "commit_diff", "pre_to_post")
+    source_files = [
+        {
+            "path": "/frozen/code/1024/code.parquet",
+            "size_bytes": 17,
+            "sha256": "2" * 64,
+            "rows": 6,
+        }
+    ]
+    source_digest = publisher._artifact_set_sha256(
+        [
+            {
+                "path": record["path"],
+                "size": record["size_bytes"],
+                "sha256": record["sha256"],
+            }
+            for record in source_files
+        ]
+    )
     return {
         "schema": "cppmega_pre_materialized_objectives_v1",
         "algorithm": "hamilton_eligibility_bipartite_v1",
@@ -137,6 +155,23 @@ def _objective_payload():
             "objective_column": "objective_kind",
             "document_id_column": "doc_ids",
             "source_document_id_column": "token_source_doc_ids",
+        },
+        "source_snapshot": {
+            "schema": "cppmega_objective_source_snapshot_v1",
+            "sequence_length": 1024,
+            "file_count": 1,
+            "row_count": 6,
+            "files": source_files,
+            "sampling": {
+                "mode": "deterministic_epoch_shuffle_v1",
+                "seed": 17,
+                "requested_samples": 6,
+                "full_passes": 1,
+                "tail_rows": 0,
+                "min_row_reuse": 1,
+                "max_row_reuse": 1,
+            },
+            "artifact_set_sha256": source_digest,
         },
     }
 
@@ -490,6 +525,16 @@ def _prefix_bundle(tmp_path):
                     "contract_file_sha256": hashlib.sha256(
                         objective_source.read_bytes()
                     ).hexdigest(),
+                    "source_snapshot": {
+                        key: objective_payload["source_snapshot"][key]
+                        for key in (
+                            "schema",
+                            "artifact_set_sha256",
+                            "file_count",
+                            "row_count",
+                            "sampling",
+                        )
+                    },
                 }
             },
         },
@@ -577,6 +622,30 @@ def test_validate_bundle_rehashes_every_manifest_artifact(tmp_path):
         record for record in records if record["local_path"] == str(artifact)
     )
     assert artifact_record["sha256"] == digest
+
+
+def test_validate_bundle_requires_objective_source_snapshot_summary(tmp_path):
+    _bundle(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    descriptor = manifest["objective_materialization"]["buckets"]["1024"]
+    descriptor.pop("source_snapshot")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="descriptor is invalid"):
+        _validate_bundle(tmp_path, hash_jobs=1)
+
+
+def test_validate_bundle_matches_source_summary_to_staged_contract(tmp_path):
+    _bundle(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    descriptor = manifest["objective_materialization"]["buckets"]["1024"]
+    descriptor["source_snapshot"]["artifact_set_sha256"] = "3" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="source_snapshot summary mismatch"):
+        _validate_bundle(tmp_path, hash_jobs=1)
 
 
 def test_validate_bundle_rejects_manifest_path_escape(tmp_path):

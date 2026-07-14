@@ -1287,6 +1287,124 @@ def _validate_data_contract_descriptors(
     return referenced
 
 
+def _objective_source_snapshot_summary(
+    source_snapshot: object, *, bucket: int
+) -> dict[str, object]:
+    if not isinstance(source_snapshot, dict):
+        raise ValueError(f"bucket {bucket} objective source_snapshot is missing")
+    expected_keys = {
+        "schema",
+        "sequence_length",
+        "file_count",
+        "row_count",
+        "files",
+        "sampling",
+        "artifact_set_sha256",
+    }
+    if set(source_snapshot) != expected_keys:
+        raise ValueError(f"bucket {bucket} objective source_snapshot is invalid")
+    if (
+        source_snapshot["schema"] != "cppmega_objective_source_snapshot_v1"
+        or int(source_snapshot["sequence_length"]) != bucket
+    ):
+        raise ValueError(f"bucket {bucket} objective source_snapshot schema drifted")
+    files = source_snapshot["files"]
+    if not isinstance(files, list) or not files:
+        raise ValueError(f"bucket {bucket} objective source files are missing")
+    records: list[dict[str, object]] = []
+    total_rows = 0
+    for record in files:
+        if not isinstance(record, dict) or set(record) != {
+            "path",
+            "size_bytes",
+            "sha256",
+            "rows",
+        }:
+            raise ValueError(f"bucket {bucket} objective source file is invalid")
+        size = record["size_bytes"]
+        rows = record["rows"]
+        digest = str(record["sha256"])
+        if (
+            not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 1
+            or not isinstance(rows, int)
+            or isinstance(rows, bool)
+            or rows < 1
+            or not SHA256_RE.fullmatch(digest)
+        ):
+            raise ValueError(f"bucket {bucket} objective source file values are invalid")
+        records.append(
+            {"path": str(record["path"]), "size": size, "sha256": digest}
+        )
+        total_rows += rows
+    if (
+        int(source_snapshot["file_count"]) != len(files)
+        or int(source_snapshot["row_count"]) != total_rows
+    ):
+        raise ValueError(f"bucket {bucket} objective source counts drifted")
+    digest = _artifact_set_sha256(records)
+    if source_snapshot["artifact_set_sha256"] != digest:
+        raise ValueError(f"bucket {bucket} objective source digest drifted")
+    sampling = source_snapshot["sampling"]
+    expected_sampling_keys = {
+        "mode",
+        "seed",
+        "requested_samples",
+        "full_passes",
+        "tail_rows",
+        "min_row_reuse",
+        "max_row_reuse",
+    }
+    if not isinstance(sampling, dict) or set(sampling) != expected_sampling_keys:
+        raise ValueError(f"bucket {bucket} objective source sampling is invalid")
+    requested = int(sampling["requested_samples"])
+    full_passes, tail_rows = divmod(requested, total_rows)
+    if (
+        sampling["mode"] != "deterministic_epoch_shuffle_v1"
+        or requested < 1
+        or int(sampling["full_passes"]) != full_passes
+        or int(sampling["tail_rows"]) != tail_rows
+        or int(sampling["min_row_reuse"]) != full_passes
+        or int(sampling["max_row_reuse"]) != full_passes + int(tail_rows > 0)
+    ):
+        raise ValueError(f"bucket {bucket} objective source sampling drifted")
+    return {
+        "schema": source_snapshot["schema"],
+        "artifact_set_sha256": digest,
+        "file_count": len(files),
+        "row_count": total_rows,
+        "sampling": sampling,
+    }
+
+
+def _validate_objective_source_summary(
+    summary: object, *, bucket: int
+) -> None:
+    if not isinstance(summary, dict) or set(summary) != {
+        "schema",
+        "artifact_set_sha256",
+        "file_count",
+        "row_count",
+        "sampling",
+    }:
+        raise ValueError(
+            f"bundle objective source_snapshot descriptor is invalid for {bucket}"
+        )
+    if (
+        summary["schema"] != "cppmega_objective_source_snapshot_v1"
+        or not SHA256_RE.fullmatch(str(summary["artifact_set_sha256"]))
+        or not isinstance(summary["file_count"], int)
+        or int(summary["file_count"]) < 1
+        or not isinstance(summary["row_count"], int)
+        or int(summary["row_count"]) < 1
+        or not isinstance(summary["sampling"], dict)
+    ):
+        raise ValueError(
+            f"bundle objective source_snapshot descriptor drifted for {bucket}"
+        )
+
+
 def _load_bundle_manifest(bundle: Path) -> tuple[dict, list[dict]]:
     manifest_path = bundle / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1313,6 +1431,7 @@ def _load_bundle_manifest(bundle: Path) -> tuple[dict, list[dict]]:
         "contract_schema",
         "contract_sha256",
         "contract_file_sha256",
+        "source_snapshot",
     }
     for bucket, descriptor in objective_materialization["buckets"].items():
         if not isinstance(bucket, str) or not bucket.isdecimal():
@@ -1341,6 +1460,9 @@ def _load_bundle_manifest(bundle: Path) -> tuple[dict, list[dict]]:
                 raise ValueError(
                     f"objective materialization {bucket}.{field} is invalid"
                 )
+        _validate_objective_source_summary(
+            descriptor["source_snapshot"], bucket=int(bucket)
+        )
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, list) or not artifacts:
         raise ValueError("bundle manifest has no artifacts")
@@ -1419,12 +1541,18 @@ def _validate_bundle(bundle: Path, hash_jobs: int) -> tuple[dict, list[dict]]:
         ):
             raise ValueError(f"bucket {bucket} objective contract is not hash-bound")
         raw_contract = json.loads(contract_path.read_text(encoding="utf-8"))
-        if (
-            validate_objective_contract(raw_contract).sha256
-            != descriptor["contract_sha256"]
-        ):
+        validated_contract = validate_objective_contract(raw_contract)
+        if validated_contract.sha256 != descriptor["contract_sha256"]:
             raise ValueError(
                 f"bucket {bucket} objective contract payload digest mismatch"
+            )
+        source_summary = _objective_source_snapshot_summary(
+            validated_contract.payload.get("source_snapshot"),
+            bucket=bucket,
+        )
+        if source_summary != descriptor["source_snapshot"]:
+            raise ValueError(
+                f"bucket {bucket} objective source_snapshot summary mismatch"
             )
 
         artifact_relative = str(descriptor["artifact_path"])
