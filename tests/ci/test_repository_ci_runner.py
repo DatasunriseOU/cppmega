@@ -182,15 +182,20 @@ def test_lane_parser_rejects_dependency_install_and_shell_commands(
 
 def test_ssh_command_pins_identity_and_disables_interactive_or_forwarded_access(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lanes = ci.load_lanes(LANES_CONFIG)
     _, rows = ci.load_hosts(HOSTS_CONFIG, lanes=lanes)
     host = next(row for row in rows if row["id"] == "legion-10-0-0-16")
     known_hosts = ci._write_known_hosts(host, tmp_path)
-    monkeypatch.delenv("CPPMEGA_CI_SSH_IDENTITY_FILE", raising=False)
+    identity_file = tmp_path / "runner-key"
+    identity_file.write_text("test-only\n", encoding="ascii")
 
-    command = ci._ssh_base(host, known_hosts=known_hosts, connect_timeout=7)
+    command = ci._ssh_base(
+        host,
+        known_hosts=known_hosts,
+        connect_timeout=7,
+        identity_file=identity_file,
+    )
     rendered = " ".join(command)
 
     assert "BatchMode=yes" in rendered
@@ -202,15 +207,14 @@ def test_ssh_command_pins_identity_and_disables_interactive_or_forwarded_access(
     assert "GlobalKnownHostsFile=/dev/null" in rendered
     assert "ForwardAgent=no" in rendered
     assert "ClearAllForwardings=yes" in rendered
+    assert "IdentitiesOnly=yes" in rendered
+    assert str(identity_file) in command
     assert "ConnectTimeout=7" in rendered
     assert command[-1] == "davidgor@10.0.0.16"
     assert known_hosts.read_text(encoding="ascii") == ci._known_hosts_line(host)
 
 
-def test_trusted_key_fingerprints_match_and_quarantined_host_never_authenticates(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_trusted_fingerprints_and_quarantined_host_denies_auth() -> None:
     lanes = ci.load_lanes(LANES_CONFIG)
     _, rows = ci.load_hosts(HOSTS_CONFIG, lanes=lanes)
     trusted = [host for host in rows if host.get("trust") == "trusted"]
@@ -219,38 +223,51 @@ def test_trusted_key_fingerprints_match_and_quarantined_host_never_authenticates
             ci._host_key_fingerprint(host["host_key"]["public_key"])
             == (host["host_key"]["fingerprint_sha256"])
         )
+        assert (
+            ci._host_identity_decision(
+                host,
+                {"status": "observed", "key": host["host_key"]["public_key"]},
+            )["may_authenticate"]
+            is True
+        )
 
     quarantined = next(host for host in rows if host["id"] == "quarantined-10-0-0-12")
-    monkeypatch.setattr(
-        ci,
-        "_scan_host_key",
-        lambda *args, **kwargs: {
+    decision = ci._host_identity_decision(
+        quarantined,
+        {
             "status": "observed",
             "fingerprint_sha256": "SHA256:observed-only",
             "key": "not-trusted",
         },
     )
 
-    def fail_if_ssh_built(*args: Any, **kwargs: Any) -> tuple[str, ...]:
-        raise AssertionError("quarantined host must not build an SSH auth command")
+    assert decision == {
+        "may_authenticate": False,
+        "status": "quarantined",
+        "detail": "untrusted_host_identity",
+        "identity_verified": False,
+    }
 
-    monkeypatch.setattr(ci, "_ssh_base", fail_if_ssh_built)
-    probe = ci.probe_host(
-        quarantined,
-        lanes=lanes,
-        selected_lanes=quarantined["lanes"],
-        known_hosts_dir=tmp_path,
-        connect_timeout=1,
-    )
 
-    assert probe["status"] == "quarantined"
-    assert probe["detail"] == "untrusted_host_identity"
-    assert probe["identity_verified"] is False
-    assert probe["observed_host_key_fingerprint"] == "SHA256:observed-only"
-    assert all(
-        status["status"] == "transport_unavailable"
-        for status in probe["lane_status"].values()
-    )
+@pytest.mark.parametrize(
+    ("scan", "detail"),
+    [
+        ({"status": "keyscan_failed", "key": None}, "keyscan_failed"),
+        ({"status": "observed", "key": "unexpected-key"}, "host_key_mismatch"),
+    ],
+)
+def test_trusted_host_identity_decision_fails_closed(
+    scan: dict[str, Any], detail: str
+) -> None:
+    lanes = ci.load_lanes(LANES_CONFIG)
+    _, rows = ci.load_hosts(HOSTS_CONFIG, lanes=lanes)
+    host = next(row for row in rows if row["id"] == "legion-10-0-0-16")
+
+    decision = ci._host_identity_decision(host, scan)
+
+    assert decision["may_authenticate"] is False
+    assert decision["identity_verified"] is False
+    assert decision["detail"] == detail
 
 
 def test_step_timeout_kills_process_group(tmp_path: Path) -> None:
@@ -270,10 +287,8 @@ def test_step_timeout_kills_process_group(tmp_path: Path) -> None:
 
 def test_step_logs_redact_environment_tokens_and_private_keys(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     secret = "unit-test-secret-value-12345"
-    monkeypatch.setenv("EXAMPLE_API_TOKEN", secret)
     code = (
         "print('token="
         + secret

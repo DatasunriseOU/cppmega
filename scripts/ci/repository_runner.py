@@ -842,11 +842,24 @@ def _write_known_hosts(host: dict[str, Any], directory: Path) -> Path:
     return path
 
 
+def _identity_file_from_environment() -> Path | None:
+    value = os.environ.get("CPPMEGA_CI_SSH_IDENTITY_FILE")
+    if not value:
+        return None
+    identity = Path(value).expanduser()
+    if not identity.is_file() or not os.access(identity, os.R_OK):
+        raise RepositoryCIError(
+            "CPPMEGA_CI_SSH_IDENTITY_FILE does not name a readable file"
+        )
+    return identity
+
+
 def _ssh_base(
     host: dict[str, Any],
     *,
     known_hosts: Path,
     connect_timeout: int,
+    identity_file: Path | None,
 ) -> tuple[str, ...]:
     command = [
         "ssh",
@@ -891,16 +904,42 @@ def _ssh_base(
         "-p",
         str(host["port"]),
     ]
-    identity_file = os.environ.get("CPPMEGA_CI_SSH_IDENTITY_FILE")
     if identity_file:
-        identity = Path(identity_file).expanduser()
-        if not identity.is_file():
-            raise RepositoryCIError(
-                "CPPMEGA_CI_SSH_IDENTITY_FILE does not name a readable file"
-            )
-        command.extend(("-o", "IdentitiesOnly=yes", "-i", str(identity)))
+        command.extend(("-o", "IdentitiesOnly=yes", "-i", str(identity_file)))
     command.append(f"{host['user']}@{host['address']}")
     return tuple(command)
+
+
+def _host_identity_decision(
+    host: dict[str, Any], scan: dict[str, Any]
+) -> dict[str, Any]:
+    if host.get("trust") != "trusted":
+        return {
+            "may_authenticate": False,
+            "status": "quarantined",
+            "detail": "untrusted_host_identity",
+            "identity_verified": False,
+        }
+    if scan.get("status") != "observed":
+        return {
+            "may_authenticate": False,
+            "status": "unavailable",
+            "detail": str(scan.get("status")),
+            "identity_verified": False,
+        }
+    if scan.get("key") != host["host_key"]["public_key"]:
+        return {
+            "may_authenticate": False,
+            "status": "unavailable",
+            "detail": "host_key_mismatch",
+            "identity_verified": False,
+        }
+    return {
+        "may_authenticate": True,
+        "status": "unavailable",
+        "detail": None,
+        "identity_verified": True,
+    }
 
 
 def classify_ssh_failure(stderr: str) -> str:
@@ -1005,23 +1044,18 @@ def probe_host(
         else:
             scan = _scan_host_key(host, timeout_seconds=connect_timeout)
             probe["observed_host_key_fingerprint"] = scan.get("fingerprint_sha256")
-            if host.get("trust") != "trusted":
-                probe["status"] = "quarantined"
-                probe["detail"] = "untrusted_host_identity"
+            identity = _host_identity_decision(host, scan)
+            probe["status"] = identity["status"]
+            probe["detail"] = identity["detail"]
+            probe["identity_verified"] = identity["identity_verified"]
+            if not identity["may_authenticate"]:
                 return probe
-            expected_key = host["host_key"]["public_key"]
-            if scan.get("status") != "observed":
-                probe["detail"] = str(scan.get("status"))
-                return probe
-            if scan.get("key") != expected_key:
-                probe["detail"] = "host_key_mismatch"
-                return probe
-            probe["identity_verified"] = True
             known_hosts = _write_known_hosts(host, known_hosts_dir)
             ssh = _ssh_base(
                 host,
                 known_hosts=known_hosts,
                 connect_timeout=connect_timeout,
+                identity_file=_identity_file_from_environment(),
             )
             probe_argv = (
                 _windows_inventory_probe_argv()
@@ -1820,6 +1854,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                             host,
                             known_hosts=known_hosts,
                             connect_timeout=args.connect_timeout,
+                            identity_file=_identity_file_from_environment(),
                         )
                     for lane_id in lane_ids:
                         if probe["lane_status"][lane_id]["available"] is not True:
