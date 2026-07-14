@@ -19,6 +19,7 @@ from scripts.data.build_macro_routes_megatron_bundle import (
     _snapshot_sources,
     _stage_data_contracts,
     _stage_tokenizer,
+    _validate_objective_source_binding,
     _write_repaired_snapshot_manifest,
 )
 
@@ -120,6 +121,81 @@ def test_every_bucket_conversion_receives_hash_bound_objective_artifact(
     assert captured["objective_artifact_path"] == str(objective_artifact.resolve())
     assert captured["input_dir"] is None
     assert captured["token_column"] == "input_ids"
+
+
+def test_objective_sources_must_match_repaired_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = b"code"
+    second = b"commit"
+    files = [
+        {
+            "path": "code/1024/repo.parquet",
+            "size_bytes": len(first),
+            "sha256": hashlib.sha256(first).hexdigest(),
+            "rows": 2,
+        },
+        {
+            "path": "commits/1024/repo_r0.parquet",
+            "size_bytes": len(second),
+            "sha256": hashlib.sha256(second).hexdigest(),
+            "rows": 3,
+        },
+    ]
+    digest = _artifact_set_sha256(
+        [
+            {"path": row["path"], "size": row["size_bytes"], "sha256": row["sha256"]}
+            for row in files
+        ]
+    )
+    source_snapshot = {
+        "schema": "cppmega_objective_source_snapshot_v1",
+        "sequence_length": 1024,
+        "file_count": 2,
+        "row_count": 5,
+        "files": files,
+        "sampling": {
+            "mode": "deterministic_epoch_shuffle_v1",
+            "requested_samples": 60,
+            "full_passes": 12,
+            "tail_rows": 0,
+            "min_row_reuse": 12,
+            "max_row_reuse": 12,
+        },
+        "artifact_set_sha256": digest,
+    }
+    monkeypatch.setattr(
+        builder,
+        "load_objective_materialization_artifact",
+        lambda _path: SimpleNamespace(
+            contract=SimpleNamespace(payload={"source_snapshot": source_snapshot})
+        ),
+    )
+    repaired = {
+        "files": [
+            {
+                "bucket": 1024,
+                "size": row["size_bytes"],
+                "snapshot_sha256": row["sha256"],
+            }
+            for row in files
+        ]
+    }
+
+    result = _validate_objective_source_binding(
+        objective_artifact_path=tmp_path / "objective.json",
+        repaired_snapshot_manifest=repaired,
+        bucket=1024,
+    )
+    assert result["artifact_set_sha256"] == digest
+
+    repaired["files"][0]["snapshot_sha256"] = "0" * 64
+    with pytest.raises(RuntimeError, match="do not match repaired snapshot"):
+        _validate_objective_source_binding(
+            objective_artifact_path=tmp_path / "objective.json",
+            repaired_snapshot_manifest=repaired,
+            bucket=1024,
+        )
 
 
 def test_builder_stages_and_hashes_the_production_tokenizer(tmp_path: Path) -> None:

@@ -11,6 +11,7 @@ rename only after validation succeeds.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
@@ -447,6 +448,102 @@ def _objective_expected_counts(path: Path) -> dict[str, int]:
     }
 
 
+def _validate_objective_source_binding(
+    *,
+    objective_artifact_path: Path,
+    repaired_snapshot_manifest: dict[str, object],
+    bucket: int,
+) -> dict[str, object]:
+    artifact = load_objective_materialization_artifact(objective_artifact_path)
+    binding = artifact.contract.payload.get("source_snapshot")
+    if not isinstance(binding, dict):
+        raise RuntimeError(
+            f"bucket {bucket}: objective contract has no source_snapshot binding"
+        )
+    expected_keys = {
+        "schema",
+        "sequence_length",
+        "file_count",
+        "row_count",
+        "files",
+        "sampling",
+        "artifact_set_sha256",
+    }
+    if set(binding) != expected_keys:
+        raise RuntimeError(
+            f"bucket {bucket}: objective source_snapshot keys drifted: "
+            f"{sorted(set(binding) ^ expected_keys)}"
+        )
+    if binding["schema"] != "cppmega_objective_source_snapshot_v1":
+        raise RuntimeError(f"bucket {bucket}: unsupported objective source schema")
+    if int(binding["sequence_length"]) != bucket:
+        raise RuntimeError(
+            f"bucket {bucket}: objective source sequence_length mismatch"
+        )
+    files = binding["files"]
+    if not isinstance(files, list) or int(binding["file_count"]) != len(files):
+        raise RuntimeError(f"bucket {bucket}: objective source file_count mismatch")
+    source_counter: Counter[tuple[int, str]] = Counter()
+    for record in files:
+        if not isinstance(record, dict) or set(record) != {
+            "path", "size_bytes", "sha256", "rows"
+        }:
+            raise RuntimeError(
+                f"bucket {bucket}: malformed objective source file record"
+            )
+        source_counter[(int(record["size_bytes"]), str(record["sha256"]))] += 1
+
+    repaired_files = repaired_snapshot_manifest.get("files")
+    if not isinstance(repaired_files, list):
+        raise RuntimeError("repaired snapshot manifest has no files list")
+    snapshot_records = [
+        record
+        for record in repaired_files
+        if isinstance(record, dict) and int(record.get("bucket", -1)) == bucket
+    ]
+    snapshot_counter = Counter(
+        (int(record["size"]), str(record["snapshot_sha256"]))
+        for record in snapshot_records
+    )
+    if source_counter != snapshot_counter:
+        raise RuntimeError(
+            f"bucket {bucket}: objective sources do not match repaired snapshot; "
+            f"objective_only={list((source_counter - snapshot_counter).elements())[:5]} "
+            f"snapshot_only={list((snapshot_counter - source_counter).elements())[:5]}"
+        )
+
+    digest_payload = dict(binding)
+    recorded_digest = str(digest_payload.pop("artifact_set_sha256"))
+    actual_digest = _artifact_set_sha256(
+        [
+            {
+                "path": str(record["path"]),
+                "size": int(record["size_bytes"]),
+                "sha256": str(record["sha256"]),
+            }
+            for record in files
+        ]
+    )
+    if recorded_digest != actual_digest:
+        raise RuntimeError(
+            f"bucket {bucket}: objective source artifact_set_sha256 mismatch"
+        )
+    if int(binding["row_count"]) < 1:
+        raise RuntimeError(f"bucket {bucket}: objective source row_count must be positive")
+    sampling = binding["sampling"]
+    if not isinstance(sampling, dict) or sampling.get("mode") != (
+        "deterministic_epoch_shuffle_v1"
+    ):
+        raise RuntimeError(f"bucket {bucket}: unsupported objective source sampling")
+    return {
+        "schema": binding["schema"],
+        "artifact_set_sha256": recorded_digest,
+        "file_count": len(files),
+        "row_count": int(binding["row_count"]),
+        "sampling": sampling,
+    }
+
+
 def _read_mmididx(idx_path: Path) -> dict[str, int]:
     with idx_path.open("rb") as fh:
         if fh.read(9) != b"MMIDIDX\x00\x00":
@@ -810,6 +907,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         repair_receipt=repair_receipt,
         hash_jobs=args.hash_jobs,
     )
+    objective_source_bindings = {
+        bucket: _validate_objective_source_binding(
+            objective_artifact_path=objective_artifacts[bucket],
+            repaired_snapshot_manifest=repaired_snapshot_manifest,
+            bucket=bucket,
+        )
+        for bucket in buckets
+    }
     audit_receipt = _run_snapshot_audit(
         snapshot_root=snapshot_root,
         audit_script=args.audit_script.resolve(),
@@ -854,6 +959,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             "contract_schema": artifact.contract.payload["schema"],
             "contract_sha256": artifact.contract.sha256,
             "contract_file_sha256": _sha256(staged_contract),
+            "source_snapshot": objective_source_bindings[bucket],
         }
     tokenizer = _stage_tokenizer(args.tokenizer_dir, partial_dir)
     data_contracts = _stage_data_contracts(partial_dir)
