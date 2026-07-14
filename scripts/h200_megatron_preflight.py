@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import argparse
+from array import array
 from datetime import datetime, timezone
-import hashlib
 import importlib
 import json
 import math
@@ -23,14 +23,17 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from cppmega.recipes.run_profiles import get_run_profile, profile_shell_assignments
-from scripts.data.publish_megatron_bundle_to_nebius_s3 import (
+from cppmega.recipes.run_profiles import (  # noqa: E402
+    get_run_profile,
+    profile_shell_assignments,
+)
+from scripts.data.publish_megatron_bundle_to_nebius_s3 import (  # noqa: E402
     _sha256,
     _validate_bundle,
     _validate_prefix_manifest_contract,
     _validate_tokenizer_directory,
 )
-from cppmega.receipt_binding import (
+from cppmega.receipt_binding import (  # noqa: E402
     build_receipt_binding,
     canonical_sha256,
     validate_binding_shape,
@@ -38,6 +41,13 @@ from cppmega.receipt_binding import (
 )
 
 PENDING_CHECKPOINT_SHA256 = "0" * 64
+_GRAPH_CHUNK_SIDECARS = (
+    "token_chunk_starts",
+    "token_chunk_ends",
+    "token_chunk_kinds",
+    "token_chunk_dep_levels",
+)
+_GRAPH_EDGE_KINDS = frozenset({"edge_pairs", "edge_triples"})
 
 
 def _write_json_atomic(path: Path, payload: object) -> None:
@@ -49,6 +59,148 @@ def _write_json_atomic(path: Path, payload: object) -> None:
     os.replace(temporary, path)
 
 
+def _csr_offsets_receipt(
+    path: Path,
+    *,
+    document_count: int,
+    item_count: int,
+    offset_dtype: object,
+) -> tuple[dict[str, object], array]:
+    if offset_dtype != "int64":
+        raise RuntimeError(f"graph CSR offsets must be int64: {path}")
+    expected_entries = document_count + 1
+    expected_bytes = expected_entries * 8
+    if path.stat().st_size != expected_bytes:
+        raise RuntimeError(
+            f"graph CSR offset size mismatch for {path}: "
+            f"{path.stat().st_size} != {expected_bytes}"
+        )
+    offsets = array("q")
+    with path.open("rb") as stream:
+        offsets.fromfile(stream, expected_entries)
+    if sys.byteorder != "little":
+        offsets.byteswap()
+    if len(offsets) != expected_entries or offsets[0] != 0:
+        raise RuntimeError(f"invalid graph CSR offsets header: {path}")
+
+    maximum = 0
+    previous = 0
+    for offset in offsets[1:]:
+        if offset < previous:
+            raise RuntimeError(f"graph CSR offsets are not monotonic: {path}")
+        maximum = max(maximum, offset - previous)
+        previous = offset
+    if previous != item_count:
+        raise RuntimeError(
+            f"graph CSR item count mismatch for {path}: {previous} != {item_count}"
+        )
+    return (
+        {
+            "offsets_path": path.name,
+            "offsets_sha256": _sha256(path),
+            "item_count": item_count,
+            "max_items_per_document": maximum,
+        },
+        offsets,
+    )
+
+
+def derive_graph_capacity_receipt(
+    data_prefix: Path,
+    *,
+    sequence_length: int,
+) -> dict[str, object]:
+    """Derive exact graph tensor capacities from a manifest-bound CSR prefix."""
+    if sequence_length <= 0:
+        raise ValueError("sequence_length must be positive")
+    data_prefix = data_prefix.resolve()
+    manifest, _referenced = _validate_prefix_manifest_contract(data_prefix)
+    document_count = int(manifest.get("document_count", 0))
+    if document_count <= 0:
+        raise RuntimeError("graph capacity derivation requires document_count > 0")
+    expected_capacity_tokens = document_count * sequence_length
+    if int(manifest.get("source_capacity_token_count", -1)) != expected_capacity_tokens:
+        raise RuntimeError(
+            "graph capacity derivation requires the fixed-row source capacity "
+            f"contract: source_capacity_token_count={manifest.get('source_capacity_token_count')!r} "
+            f"expected={expected_capacity_tokens}"
+        )
+
+    graph_paths = manifest.get("graph_sidecar_paths")
+    if not isinstance(graph_paths, dict) or not graph_paths:
+        raise RuntimeError("graph capacity derivation requires graph_sidecar_paths")
+
+    sidecar_receipts: dict[str, dict[str, object]] = {}
+    max_edges = 0
+    chunk_offsets: array | None = None
+    max_chunks = 0
+    for name, raw_entry in sorted(graph_paths.items()):
+        if not isinstance(raw_entry, dict):
+            raise RuntimeError(f"graph sidecar entry must be an object: {name}")
+        offsets_name = raw_entry.get("offsets_path")
+        if not isinstance(offsets_name, str) or not offsets_name:
+            raise RuntimeError(f"graph sidecar lacks offsets_path: {name}")
+        item_count = int(raw_entry.get("item_count", -1))
+        if item_count < 0:
+            raise RuntimeError(f"graph sidecar lacks nonnegative item_count: {name}")
+        offsets_path = data_prefix.parent / offsets_name
+        receipt, offsets = _csr_offsets_receipt(
+            offsets_path,
+            document_count=document_count,
+            item_count=item_count,
+            offset_dtype=raw_entry.get("offset_dtype"),
+        )
+        sidecar_receipts[name] = receipt
+        maximum = int(receipt["max_items_per_document"])
+        if raw_entry.get("kind") in _GRAPH_EDGE_KINDS:
+            max_edges = max(max_edges, maximum)
+        if name in _GRAPH_CHUNK_SIDECARS:
+            if chunk_offsets is None:
+                chunk_offsets = offsets
+                max_chunks = maximum
+            elif offsets != chunk_offsets:
+                raise RuntimeError(
+                    "chunk graph CSR offsets disagree across starts/ends/kinds/dep-levels"
+                )
+
+    missing_chunks = sorted(set(_GRAPH_CHUNK_SIDECARS) - set(sidecar_receipts))
+    if missing_chunks:
+        raise RuntimeError(f"graph capacity derivation lacks chunk sidecars: {missing_chunks}")
+    if not any(
+        isinstance(entry, dict) and entry.get("kind") in _GRAPH_EDGE_KINDS
+        for entry in graph_paths.values()
+    ):
+        raise RuntimeError("graph capacity derivation lacks edge sidecars")
+
+    return {
+        "schema": "cppmega_graph_capacity_v1",
+        "status": "verified",
+        "data_prefix": str(data_prefix),
+        "prefix_manifest_sha256": _sha256(data_prefix.with_suffix(".json")),
+        "sequence_length": sequence_length,
+        "document_count": document_count,
+        "source_capacity_token_count": expected_capacity_tokens,
+        "graph_max_edges": max(1, max_edges),
+        "graph_max_chunks": max(1, max_chunks),
+        "derivation": "max_per_fixed_capacity_document_from_csr_offsets_v1",
+        "sidecars": sidecar_receipts,
+    }
+
+
+def write_graph_capacity_receipt(
+    data_prefix: Path,
+    *,
+    sequence_length: int,
+    output: Path,
+) -> dict[str, object]:
+    receipt = derive_graph_capacity_receipt(
+        data_prefix,
+        sequence_length=sequence_length,
+    )
+    _write_json_atomic(output, receipt)
+    return receipt
+
+
 def _write_wrappers(workdir: Path) -> Path:
     wrapper = workdir / "pretrain_mamba.py"
     wrapper.write_text(
@@ -58,13 +210,14 @@ import os
 import runpy
 import sys
 
-from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_patch
 from cppmega.megatron.graph_route_attention_bias_patch import apply_graph_route_attention_bias_patch
 from cppmega.megatron.checkpoint_restore_preflight import install_checkpoint_restore_preflight
 from cppmega.megatron.te_checkpoint_kwarg_patch import apply_te_checkpoint_kwarg_patch
 
 apply_te_checkpoint_kwarg_patch()
-apply_dsa_indexer_fused_patch()
+if os.environ.get('CPPMEGA_DSA_PATCH_ENABLED', '0') == '1':
+    from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_patch
+    apply_dsa_indexer_fused_patch()
 apply_graph_route_attention_bias_patch()
 install_checkpoint_restore_preflight()
 import cppmega.megatron.structure_dataset_patch  # noqa: F401
@@ -112,7 +265,13 @@ runpy.run_path(_inner, run_name='__main__')
 
 
 def _profile_environment(
-    *, sequence_length: int, micro_batch_size: int, fp8_recipe: str
+    *,
+    sequence_length: int,
+    micro_batch_size: int,
+    fp8_recipe: str,
+    graph_max_edges: int,
+    graph_max_chunks: int,
+    enable_dsa_patch: bool,
 ) -> dict[str, str]:
     profile = get_run_profile("h200_cpp_world_mini")
     profile.training.seq_length = sequence_length
@@ -126,12 +285,13 @@ def _profile_environment(
             "CPPMEGA_STRUCTURE_ENABLED": "1",
             "CPPMEGA_GRAPH_ROUTES_ENABLED": "1",
             "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS": "1",
-            "CPPMEGA_GRAPH_MAX_EDGES": environment.get(
-                "CPPMEGA_GRAPH_MAX_EDGES", "256"
-            ),
-            "CPPMEGA_GRAPH_MAX_CHUNKS": environment.get(
-                "CPPMEGA_GRAPH_MAX_CHUNKS", "256"
-            ),
+            "CPPMEGA_GRAPH_MAX_EDGES": str(graph_max_edges),
+            "CPPMEGA_GRAPH_MAX_CHUNKS": str(graph_max_chunks),
+            "CPPMEGA_DSA_PATCH_ENABLED": "1" if enable_dsa_patch else "0",
+            "CPPMEGA_DSA_GRAPH_AUX_ENABLED": "0",
+            "CPPMEGA_DSA_GRAPH_AUX_WEIGHT": "0",
+            "CPPMEGA_DSA_INDEXER_LOSS_COEFF": "0",
+            "CPPMEGA_DSA_SKIP_INDEXER_LOSS": "1",
             "CUDA_DEVICE_MAX_CONNECTIONS": "1",
             "NCCL_GRAPH_REGISTER": "0",
         }
@@ -204,7 +364,7 @@ def build_megatron_command(
         "--train-iters",
         str(train_iters),
         "--eval-interval",
-        "50000000",
+        "1",
         "--eval-iters",
         "1",
         "--lr",
@@ -239,7 +399,6 @@ def build_megatron_command(
         "1.0",
         "--optimizer",
         environment["CPPMEGA_OPTIMIZER"],
-        "--no-check-for-nan-in-loss-and-grad",
         "--rerun-mode",
         "disabled",
         "--save",
@@ -427,6 +586,31 @@ def _iteration_evidence(text: str, *, expected_iteration: int) -> dict[str, obje
         "skipped_iterations": 0,
         "nan_iterations": 0,
     }
+
+
+def write_training_loss_receipt(
+    log_path: Path,
+    *,
+    expected_iteration: int,
+    output: Path,
+) -> dict[str, object]:
+    if expected_iteration <= 0:
+        raise ValueError("expected_iteration must be positive")
+    if not log_path.is_file():
+        raise FileNotFoundError(log_path)
+    evidence = _iteration_evidence(
+        log_path.read_text(encoding="utf-8", errors="replace"),
+        expected_iteration=expected_iteration,
+    )
+    receipt = {
+        "schema": "cppmega_h200_training_loss_gate_v1",
+        "status": "verified",
+        "log_path": str(log_path),
+        "log_sha256": _sha256(log_path),
+        "evidence": evidence,
+    }
+    _write_json_atomic(output, receipt)
+    return receipt
 
 
 def _checkpoint_load_evidence(
@@ -804,6 +988,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--micro-batch-size", type=int, default=1)
     parser.add_argument("--fp8-recipe", choices=("off", "tensorwise"), default="off")
     parser.add_argument(
+        "--enable-dsa-patch",
+        action="store_true",
+        help="Explicitly install the DSA patch; dense-GQA DSA auxiliary loss stays disabled.",
+    )
+    parser.add_argument(
         "--checkpoint-root",
         type=Path,
         default=Path("/data/cppmega_h200_preflight_checkpoint"),
@@ -835,16 +1024,31 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
     _validate_tokenizer_directory(tokenizer_model)
     prefix_manifest, _referenced = _validate_prefix_manifest_contract(data_prefix)
+    graph_capacity = derive_graph_capacity_receipt(
+        data_prefix,
+        sequence_length=args.sequence_length,
+    )
     environment = _profile_environment(
         sequence_length=args.sequence_length,
         micro_batch_size=args.micro_batch_size,
         fp8_recipe=args.fp8_recipe,
+        graph_max_edges=int(graph_capacity["graph_max_edges"]),
+        graph_max_chunks=int(graph_capacity["graph_max_chunks"]),
+        enable_dsa_patch=args.enable_dsa_patch,
     )
     backend_claims = _claimed_backend_modules(environment)
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
         raise RuntimeError(f"refusing stale H200 preflight receipt: {output}")
+    graph_capacity_output = output.with_name(
+        f"{output.stem}_graph_capacity{output.suffix or '.json'}"
+    )
+    if graph_capacity_output.exists():
+        raise RuntimeError(
+            f"refusing stale H200 graph capacity receipt: {graph_capacity_output}"
+        )
+    _write_json_atomic(graph_capacity_output, graph_capacity)
     checkpoint_root = args.checkpoint_root.resolve()
     cold_checkpoint_root = (
         args.cold_checkpoint_root.resolve()
@@ -869,6 +1073,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         "sequence_length": args.sequence_length,
         "micro_batch_size": args.micro_batch_size,
         "fp8_recipe": args.fp8_recipe,
+        "enable_dsa_patch": args.enable_dsa_patch,
+        "graph_max_edges": graph_capacity["graph_max_edges"],
+        "graph_max_chunks": graph_capacity["graph_max_chunks"],
         "checkpoint_root": str(checkpoint_root),
         "cold_checkpoint_root": str(cold_checkpoint_root),
     }
@@ -942,6 +1149,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                 "manifest": prefix_manifest,
                 "sequence_length": args.sequence_length,
                 "micro_batch_size": args.micro_batch_size,
+                "graph_capacity": graph_capacity,
+                "graph_capacity_receipt": str(graph_capacity_output),
             },
             "checkpoint": {
                 "root": str(checkpoint_root),

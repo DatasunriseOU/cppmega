@@ -6,10 +6,11 @@ and runs staged training sequentially:
 
     1024 -> 2048 -> 4096 -> 8192 -> 16384
 
-Each stage saves a full Megatron checkpoint under its own stage directory and
-the next stage loads the previous checkpoint as pretrained weights.  The data
-iterator is reset at each context bucket, so stage train-iters and save-intervals
-are local to that bucket rather than cumulative across different datasets.
+Each stage saves a full Megatron checkpoint under its own stage directory.  The
+next stage uses only the previous model weights as a warm start; optimizer, RNG,
+scheduler, and data iterator state are intentionally reset.  Stage train-iters
+and save/eval intervals are local to each context bucket, not a continuous exact
+resume across different datasets.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -93,48 +95,37 @@ def _parse_stage(raw: str, index: int) -> Stage:
     )
 
 
-def _default_stages() -> list[Stage]:
-    base = ROOT.parent / "cppmega.mlx" / "outputs" / "megatron_ready"
+def _default_stages(
+    bundle_root: Path | None = None,
+    bundle_manifest: dict[str, object] | None = None,
+) -> list[Stage]:
+    if bundle_root is None:
+        base = ROOT.parent / "cppmega.mlx" / "outputs" / "megatron_ready"
+        prefix_by_seq = {
+            seq: base / f"cppmega_reindexed_seq{seq}_lossmask_graph_train"
+            for seq in (1024, 2048, 4096, 8192, 16384)
+        }
+    else:
+        if not isinstance(bundle_manifest, dict):
+            raise ValueError("bundle_manifest is required with bundle_root")
+        prefix_by_seq = {
+            int(result["bucket"]): bundle_root / str(result["prefix"])
+            for result in bundle_manifest["bucket_results"]
+        }
+        missing = sorted({1024, 2048, 4096, 8192, 16384} - set(prefix_by_seq))
+        if missing:
+            raise ValueError(f"bundle lacks default curriculum buckets: {missing}")
+
     specs = [
-        (
-            1024,
-            192,
-            192,
-            1421,
-            base / "cppmega_reindexed_seq1024_lossmask_graph_train",
-        ),
-        (
-            2048,
-            96,
-            96,
-            1686,
-            base / "cppmega_reindexed_seq2048_lossmask_graph_train",
-        ),
-        (
-            4096,
-            40,
-            40,
-            2311,
-            base / "cppmega_reindexed_seq4096_lossmask_graph_train",
-        ),
+        (1024, 192, 192, 1421, prefix_by_seq[1024]),
+        (2048, 96, 96, 1686, prefix_by_seq[2048]),
+        (4096, 40, 40, 2311, prefix_by_seq[4096]),
         # H200-observed defaults. Long-context stages keep a larger global batch
         # but split it into smaller microbatches; the previous micro==global
         # runs OOMed on TE cross-entropy/logits materialization before graph
         # routes became the limiting factor.
-        (
-            8192,
-            16,
-            4,
-            2756,
-            base / "cppmega_reindexed_seq8192_lossmask_graph_train",
-        ),
-        (
-            16384,
-            8,
-            2,
-            2391,
-            base / "cppmega_reindexed_seq16384_lossmask_graph_train",
-        ),
+        (8192, 16, 4, 2756, prefix_by_seq[8192]),
+        (16384, 8, 2, 2391, prefix_by_seq[16384]),
     ]
     return [
         Stage(index=i, seq=seq, batch=batch, micro_batch=micro_batch, iters=iters, prefix=prefix)
@@ -185,9 +176,38 @@ def _assert_prefix_contract(stages: list[Stage]) -> None:
             )
 
 
-def _make_curriculum_manifest(stages: list[Stage], path: Path) -> None:
+def _derive_stage_graph_capacities(stages: list[Stage]) -> dict[int, dict[str, object]]:
+    return {
+        stage.index: sweep.derive_graph_capacity_receipt(
+            stage.prefix,
+            sequence_length=stage.seq,
+        )
+        for stage in stages
+    }
+
+
+def _make_curriculum_manifest(
+    stages: list[Stage],
+    path: Path,
+    *,
+    graph_capacities: dict[int, dict[str, object]],
+    remote_prefixes: dict[int, str] | None = None,
+    bundle_identity: dict[str, object] | None = None,
+) -> None:
+    remote_prefixes = remote_prefixes or {
+        stage.index: stage.prefix_name for stage in stages
+    }
     payload = {
-        "schema": "cppmega_h200_curriculum_v1",
+        "schema": "cppmega_h200_curriculum_v2",
+        "bundle": bundle_identity,
+        "checkpoint_transition": {
+            "mode": "model_weights_warm_start",
+            "optimizer_state": "reset",
+            "rng_state": "reset",
+            "scheduler_state": "reset",
+            "data_iterator_state": "reset_per_stage",
+            "exact_resume": False,
+        },
         "stages": [
             {
                 "index": stage.index,
@@ -197,7 +217,8 @@ def _make_curriculum_manifest(stages: list[Stage], path: Path) -> None:
                 "micro_batch": stage.micro_batch,
                 "stage_iters": stage.iters,
                 "prefix": str(stage.prefix),
-                "prefix_name": stage.prefix_name,
+                "remote_prefix": remote_prefixes[stage.index],
+                "graph_capacity": graph_capacities[stage.index],
                 "remote_checkpoint_root": stage.remote_checkpoint_root,
             }
             for stage in stages
@@ -206,11 +227,24 @@ def _make_curriculum_manifest(stages: list[Stage], path: Path) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
-def _make_curriculum_tar(stages: list[Stage], path: Path) -> None:
+def _make_curriculum_tar(
+    stages: list[Stage],
+    path: Path,
+    *,
+    graph_capacities: dict[int, dict[str, object]],
+    remote_prefixes: dict[int, str],
+    bundle_identity: dict[str, object],
+) -> None:
     with tempfile.TemporaryDirectory(prefix="cppmega-curriculum-manifest-") as raw:
         tmp = Path(raw)
         manifest = tmp / "curriculum_manifest.json"
-        _make_curriculum_manifest(stages, manifest)
+        _make_curriculum_manifest(
+            stages,
+            manifest,
+            graph_capacities=graph_capacities,
+            remote_prefixes=remote_prefixes,
+            bundle_identity=bundle_identity,
+        )
         with tarfile.open(path, "w:gz") as tf:
             tf.add(manifest, arcname="cppmega_curriculum/curriculum_manifest.json")
 
@@ -234,9 +268,16 @@ def _remote_script(
     *,
     docker_image: str,
     fp8_recipe: str,
+    remote_prefixes: dict[int, str],
+    graph_capacities: dict[int, dict[str, object]],
+    bundle_root: str = "/data/cppmega_bundle",
+    tokenizer_model: str = "/data/cppmega_bundle/tokenizer",
+    enable_dsa_patch: bool = False,
+    run_id: str = "nebius-h200-curriculum",
     initial_checkpoint_root: str = "",
     initial_cum_iters: int = 0,
 ) -> str:
+    sweep.validate_docker_image_digest(docker_image)
     stage_lines = "\n".join(
         "          "
         + shlex.quote(
@@ -247,12 +288,17 @@ def _remote_script(
                     str(stage.batch),
                     str(stage.micro_batch),
                     str(stage.iters),
-                    stage.prefix_name,
+                    remote_prefixes[stage.index],
                     stage.remote_checkpoint_root,
+                    str(graph_capacities[stage.index]["graph_max_edges"]),
+                    str(graph_capacities[stage.index]["graph_max_chunks"]),
                 )
             )
         )
         for stage in stages
+    )
+    preflight_dsa_arg = (
+        "          --enable-dsa-patch \\\n" if enable_dsa_patch else ""
     )
     return textwrap.dedent(
         f"""\
@@ -299,20 +345,27 @@ def _remote_script(
         export CPPMEGA_DOMAIN_EMBEDDING_ENABLED=1
         export CPPMEGA_GRAPH_ROUTES_ENABLED=1
         export CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS="${{CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS:-1}}"
-        export CPPMEGA_GRAPH_MAX_EDGES="${{CPPMEGA_GRAPH_MAX_EDGES:-256}}"
-        export CPPMEGA_GRAPH_MAX_CHUNKS="${{CPPMEGA_GRAPH_MAX_CHUNKS:-256}}"
+        export CPPMEGA_DSA_PATCH_ENABLED="{1 if enable_dsa_patch else 0}"
+        export CPPMEGA_DSA_GRAPH_AUX_ENABLED=0
+        export CPPMEGA_DSA_GRAPH_AUX_WEIGHT=0
+        export CPPMEGA_DSA_INDEXER_LOSS_COEFF=0
+        export CPPMEGA_DSA_SKIP_INDEXER_LOSS=1
+        export CPPMEGA_BUNDLE_ROOT={shlex.quote(bundle_root)}
+        export CPPMEGA_TOKENIZER_MODEL={shlex.quote(tokenizer_model)}
         mkdir -p "$TRITON_CACHE_DIR" /data/cppmega_h200_results /data/cppmega_curriculum_checkpoints
 
         python - <<'PY'
         import importlib
         import json
+        import os
         import torch
-        from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_patch
         from cppmega.megatron.graph_route_attention_bias_patch import apply_graph_route_attention_bias_patch
         from cppmega.megatron.te_checkpoint_kwarg_patch import apply_te_checkpoint_kwarg_patch
 
         apply_te_checkpoint_kwarg_patch()
-        apply_dsa_indexer_fused_patch()
+        if os.environ.get("CPPMEGA_DSA_PATCH_ENABLED", "0") == "1":
+            from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_patch
+            apply_dsa_indexer_fused_patch()
         apply_graph_route_attention_bias_patch()
         modules = [
             "torch",
@@ -352,21 +405,66 @@ def _remote_script(
         {stage_lines}
         )
 
+        IFS=: read -r PREFLIGHT_STAGE PREFLIGHT_SEQ PREFLIGHT_BS PREFLIGHT_MBS PREFLIGHT_ITERS PREFLIGHT_PREFIX PREFLIGHT_CHECKPOINT PREFLIGHT_MAX_EDGES PREFLIGHT_MAX_CHUNKS <<< "${{STAGES[0]}}"
+        PREFLIGHT_DATA_PREFIX="$CPPMEGA_BUNDLE_ROOT/${{PREFLIGHT_PREFIX}}"
+        export CPPMEGA_GRAPH_MAX_EDGES="$PREFLIGHT_MAX_EDGES"
+        export CPPMEGA_GRAPH_MAX_CHUNKS="$PREFLIGHT_MAX_CHUNKS"
+        if [[ ! -s "${{PREFLIGHT_DATA_PREFIX}}.bin" || ! -s "${{PREFLIGHT_DATA_PREFIX}}.idx" || ! -s "${{PREFLIGHT_DATA_PREFIX}}.json" ]]; then
+          echo "CPPMEGA_H200_PREFLIGHT_STATUS=FAIL reason=missing_data_prefix prefix=${{PREFLIGHT_DATA_PREFIX}}" | tee -a /data/cppmega_h200_results/summary.log
+          exit 2
+        fi
+        python /opt/cppmega/scripts/h200_megatron_preflight.py \
+          --bundle-root "$CPPMEGA_BUNDLE_ROOT" \
+          --data-prefix "$PREFLIGHT_DATA_PREFIX" \
+          --tokenizer-model "$CPPMEGA_TOKENIZER_MODEL" \
+          --run-id {shlex.quote(run_id)} \
+          --sequence-length "$PREFLIGHT_SEQ" \
+          --micro-batch-size 1 \
+          --fp8-recipe {shlex.quote(fp8_recipe)} \
+{preflight_dsa_arg}\
+          --output /data/cppmega_h200_results/h200_preflight.json
+        echo "CPPMEGA_H200_PREFLIGHT_STATUS=PASS" | tee -a /data/cppmega_h200_results/summary.log
+
         PREV_CHECKPOINT_ROOT={shlex.quote(initial_checkpoint_root)}
         PREV_CUM_ITERS={int(initial_cum_iters)}
         for SPEC in "${{STAGES[@]}}"; do
-          IFS=: read -r STAGE_IDX SEQ BS MBS STAGE_ITERS DATA_PREFIX_NAME CHECKPOINT_ROOT <<< "$SPEC"
+          IFS=: read -r STAGE_IDX SEQ BS MBS STAGE_ITERS DATA_PREFIX_NAME CHECKPOINT_ROOT GRAPH_MAX_EDGES GRAPH_MAX_CHUNKS <<< "$SPEC"
           CUM_ITERS=$((PREV_CUM_ITERS + STAGE_ITERS))
           TARGET_ITERS=$STAGE_ITERS
-          DATA_PREFIX="/data/cppmega_sidecar/${{DATA_PREFIX_NAME}}"
+          EVAL_INTERVAL=$(( TARGET_ITERS < 100 ? TARGET_ITERS : 100 ))
+          DATA_PREFIX="$CPPMEGA_BUNDLE_ROOT/${{DATA_PREFIX_NAME}}"
           LOG="/data/cppmega_h200_results/stage_${{STAGE_IDX}}_seq_${{SEQ}}_gbs_${{BS}}_mbs_${{MBS}}.log"
           NVSMI="/data/cppmega_h200_results/stage_${{STAGE_IDX}}_seq_${{SEQ}}_gbs_${{BS}}_mbs_${{MBS}}.nvsmi.csv"
           export DATA_PREFIX
-          echo "CPPMEGA_CURRICULUM_STAGE_START stage=${{STAGE_IDX}} seq=${{SEQ}} global_batch=${{BS}} micro_batch=${{MBS}} stage_iters=${{STAGE_ITERS}} target_iter=${{TARGET_ITERS}} cumulative_after=${{CUM_ITERS}} prefix=${{DATA_PREFIX}}" | tee "$LOG" | tee -a /data/cppmega_h200_results/summary.log
+          export CPPMEGA_GRAPH_MAX_EDGES="$GRAPH_MAX_EDGES"
+          export CPPMEGA_GRAPH_MAX_CHUNKS="$GRAPH_MAX_CHUNKS"
+          if [[ -n "$PREV_CHECKPOINT_ROOT" ]]; then
+            TRANSITION="model_weights_warm_start optimizer=reset rng=reset scheduler=reset exact_resume=false"
+          else
+            TRANSITION="from_scratch"
+          fi
+          echo "CPPMEGA_CURRICULUM_STAGE_START stage=${{STAGE_IDX}} seq=${{SEQ}} global_batch=${{BS}} micro_batch=${{MBS}} stage_iters=${{STAGE_ITERS}} target_iter=${{TARGET_ITERS}} cumulative_accounting_after=${{CUM_ITERS}} transition=${{TRANSITION}} prefix=${{DATA_PREFIX}}" | tee "$LOG" | tee -a /data/cppmega_h200_results/summary.log
           if [[ ! -s "${{DATA_PREFIX}}.bin" || ! -s "${{DATA_PREFIX}}.idx" || ! -s "${{DATA_PREFIX}}.json" ]]; then
             echo "CPPMEGA_CURRICULUM_STAGE_RESULT stage=${{STAGE_IDX}} status=FAIL reason=missing_data_prefix" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
             exit 2
           fi
+          CAPACITY_RECEIPT="/data/cppmega_h200_results/stage_${{STAGE_IDX}}_graph_capacity.json"
+          python - "$DATA_PREFIX" "$SEQ" "$GRAPH_MAX_EDGES" "$GRAPH_MAX_CHUNKS" "$CAPACITY_RECEIPT" <<'PYCAP'
+        import sys
+        from pathlib import Path
+        from scripts.h200_megatron_preflight import write_graph_capacity_receipt
+
+        receipt = write_graph_capacity_receipt(
+            Path(sys.argv[1]),
+            sequence_length=int(sys.argv[2]),
+            output=Path(sys.argv[5]),
+        )
+        expected = (int(sys.argv[3]), int(sys.argv[4]))
+        actual = (int(receipt["graph_max_edges"]), int(receipt["graph_max_chunks"]))
+        if actual != expected:
+            raise RuntimeError(f"launcher/remote graph capacity mismatch: {{expected}} != {{actual}}")
+        PYCAP
+          echo "CPPMEGA_GRAPH_CAPACITY stage=${{STAGE_IDX}} seq=${{SEQ}} max_edges=${{GRAPH_MAX_EDGES}} max_chunks=${{GRAPH_MAX_CHUNKS}} receipt=${{CAPACITY_RECEIPT}}" | tee -a /data/cppmega_h200_results/summary.log
 
           (
             while true; do
@@ -392,12 +490,13 @@ def _remote_script(
         import runpy
         import sys
 
-        from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_patch
         from cppmega.megatron.graph_route_attention_bias_patch import apply_graph_route_attention_bias_patch
         from cppmega.megatron.te_checkpoint_kwarg_patch import apply_te_checkpoint_kwarg_patch
 
         apply_te_checkpoint_kwarg_patch()
-        apply_dsa_indexer_fused_patch()
+        if os.environ.get('CPPMEGA_DSA_PATCH_ENABLED', '0') == '1':
+            from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_patch
+            apply_dsa_indexer_fused_patch()
         apply_graph_route_attention_bias_patch()
 
         if os.environ.get('CPPMEGA_STRUCTURE_ENABLED', '0') == '1':
@@ -452,6 +551,10 @@ def _remote_script(
               --global-batch-size ${{BS}} \\
               --train-iters ${{TARGET_ITERS}} \\
               --fp8-recipe {fp8_recipe})\\\"
+            export CPPMEGA_DSA_GRAPH_AUX_ENABLED=0
+            export CPPMEGA_DSA_GRAPH_AUX_WEIGHT=0
+            export CPPMEGA_DSA_INDEXER_LOSS_COEFF=0
+            export CPPMEGA_DSA_SKIP_INDEXER_LOSS=1
 
             DATA_ARGS=(--data-path 1.0 \\\"\\$DATA_PREFIX\\")
             OPTIMIZER_ARGS=(--optimizer \\\"\\$CPPMEGA_OPTIMIZER\\\")
@@ -489,7 +592,7 @@ def _remote_script(
             python -m torch.distributed.run --nproc_per_node=1 \\\"\\$WORKDIR/pretrain_mamba.py\\\" \\
               \\\"\\${{DATA_ARGS[@]}}\\\" \\
               --tokenizer-type HuggingFaceTokenizer \\
-              --tokenizer-model /data/cpp_tokenizer_hf \\
+              --tokenizer-model \\\"\\$CPPMEGA_TOKENIZER_MODEL\\\" \\
               --vocab-size 65536 \\
               --make-vocab-size-divisible-by 128 \\
               --tensor-model-parallel-size 1 \\
@@ -508,7 +611,7 @@ def _remote_script(
               --micro-batch-size ${{MBS}} \\
               --global-batch-size ${{BS}} \\
               --train-iters ${{TARGET_ITERS}} \\
-              --eval-interval 50000000 \\
+              --eval-interval ${{EVAL_INTERVAL}} \\
               --eval-iters 1 \\
               --lr \\\"\\$CPPMEGA_LR\\\" \\
               --min-lr \\\"\\$CPPMEGA_MIN_LR\\\" \\
@@ -528,7 +631,6 @@ def _remote_script(
               \\\"\\${{RECOMPUTE_ARGS[@]}}\\\" \\
               --clip-grad 1.0 \\
               \\\"\\${{OPTIMIZER_ARGS[@]}}\\\" \\
-              --no-check-for-nan-in-loss-and-grad \\
               --rerun-mode disabled \\
               \\\"\\${{CHECKPOINT_ARGS[@]}}\\\" \\
               --log-interval 1
@@ -543,11 +645,32 @@ def _remote_script(
             echo "CPPMEGA_CURRICULUM_STAGE_RESULT stage=${{STAGE_IDX}} seq=${{SEQ}} global_batch=${{BS}} micro_batch=${{MBS}} status=FAIL exit=${{status}}" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
             exit "$status"
           fi
+          LOSS_RECEIPT="/data/cppmega_h200_results/stage_${{STAGE_IDX}}_loss_gate.json"
+          if ! python - "$LOG" "$TARGET_ITERS" "$LOSS_RECEIPT" <<'PYLOSS'
+        import sys
+        from pathlib import Path
+        from scripts.h200_megatron_preflight import write_training_loss_receipt
+
+        write_training_loss_receipt(
+            Path(sys.argv[1]),
+            expected_iteration=int(sys.argv[2]),
+            output=Path(sys.argv[3]),
+        )
+        PYLOSS
+          then
+            echo "CPPMEGA_CURRICULUM_STAGE_RESULT stage=${{STAGE_IDX}} status=FAIL reason=finite_loss_gate" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
+            exit 4
+          fi
           if [[ ! -s "$CHECKPOINT_ROOT/latest_checkpointed_iteration.txt" ]]; then
             echo "CPPMEGA_CURRICULUM_STAGE_RESULT stage=${{STAGE_IDX}} seq=${{SEQ}} batch=${{BS}} status=FAIL reason=missing_checkpoint" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
             exit 3
           fi
-          echo "CPPMEGA_CURRICULUM_STAGE_RESULT stage=${{STAGE_IDX}} seq=${{SEQ}} global_batch=${{BS}} micro_batch=${{MBS}} status=OK checkpoint_root=${{CHECKPOINT_ROOT}}" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
+          LATEST_ITER="$(tr -d '[:space:]' < "$CHECKPOINT_ROOT/latest_checkpointed_iteration.txt")"
+          if [[ "$LATEST_ITER" != "$TARGET_ITERS" ]]; then
+            echo "CPPMEGA_CURRICULUM_STAGE_RESULT stage=${{STAGE_IDX}} status=FAIL reason=checkpoint_iteration expected=${{TARGET_ITERS}} actual=${{LATEST_ITER}}" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
+            exit 3
+          fi
+          echo "CPPMEGA_CURRICULUM_STAGE_RESULT stage=${{STAGE_IDX}} seq=${{SEQ}} global_batch=${{BS}} micro_batch=${{MBS}} status=OK checkpoint_root=${{CHECKPOINT_ROOT}} loss_receipt=${{LOSS_RECEIPT}} transition=${{TRANSITION}}" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
           PREV_CHECKPOINT_ROOT="$CHECKPOINT_ROOT"
           PREV_CUM_ITERS="$CUM_ITERS"
         done
@@ -599,7 +722,7 @@ def _ssh_run_no_check(args: argparse.Namespace, ip: str, command: str, *, timeou
     return subprocess.run(cmd, timeout=timeout).returncode
 
 
-def main() -> int:
+def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--parent-id", default=sweep.DEFAULT_PARENT_ID)
     parser.add_argument("--subnet-id", default=sweep.DEFAULT_SUBNET_ID)
@@ -614,10 +737,12 @@ def main() -> int:
     parser.add_argument("--ssh-key", type=Path, default=sweep.default_ssh_key())
     parser.add_argument("--ssh-pubkey", type=Path, default=None)
     parser.add_argument("--docker-image", default=sweep.DEFAULT_DOCKER_IMAGE)
+    parser.add_argument("--bundle-root", type=Path, required=True)
+    parser.add_argument("--hash-jobs", type=int, default=4)
     parser.add_argument("--ghcr-user", default=None)
     parser.add_argument("--ghcr-token-file", type=Path, default=None)
     parser.add_argument("--no-ghcr-auth", action="store_true")
-    parser.add_argument("--tokenizer-dir", type=Path, default=sweep.DEFAULT_TOKENIZER_DIR)
+    parser.add_argument("--tokenizer-dir", type=Path, default=None)
     parser.add_argument(
         "--stage",
         action="append",
@@ -629,26 +754,52 @@ def main() -> int:
     )
     parser.add_argument("--fp8-recipe", choices=["tensorwise"], default="tensorwise")
     parser.add_argument(
+        "--enable-dsa-patch",
+        action="store_true",
+        help="Explicitly install the DSA patch; dense-GQA DSA auxiliary loss stays zero.",
+    )
+    parser.add_argument(
         "--start-stage",
         type=int,
         default=1,
-        help="First stage index to run. Use 2+ with --initial-checkpoint-root to resume a failed curriculum.",
+        help=(
+            "First stage index to run. Use 2+ with --initial-checkpoint-root for a "
+            "model-only warm start; this is not an exact optimizer/RNG resume."
+        ),
     )
     parser.add_argument(
         "--initial-checkpoint-root",
         type=Path,
         default=None,
-        help="Local checkpoint root to upload and use as PREV_CHECKPOINT_ROOT before --start-stage.",
+        help=(
+            "Local checkpoint root whose model weights warm-start --start-stage. "
+            "Optimizer, RNG, scheduler, and data iterator state are reset."
+        ),
     )
     parser.add_argument("--remote-timeout-s", type=int, default=86400)
     parser.add_argument("--keep-instance", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    sweep.validate_docker_image_digest(args.docker_image)
+    if args.hash_jobs <= 0:
+        raise ValueError("--hash-jobs must be positive")
+    bundle_root = args.bundle_root.expanduser().resolve()
+    bundle_manifest, _bundle_artifacts = sweep._validate_bundle(
+        bundle_root,
+        args.hash_jobs,
+    )
+    tokenizer_relative = str(bundle_manifest["tokenizer"]["path"])
+    bundle_tokenizer = (bundle_root / tokenizer_relative).resolve()
+    if args.tokenizer_dir is not None and args.tokenizer_dir.resolve() != bundle_tokenizer:
+        raise ValueError(
+            "--tokenizer-dir must be the descriptor-bound tokenizer inside --bundle-root"
+        )
 
     all_stages = (
         [_parse_stage(raw, i) for i, raw in enumerate(args.stage, 1)]
         if args.stage
-        else _default_stages()
+        else _default_stages(bundle_root, bundle_manifest)
     )
     if args.start_stage < 1:
         raise ValueError("--start-stage must be >= 1")
@@ -659,6 +810,29 @@ def main() -> int:
     if args.start_stage > 1 and args.initial_checkpoint_root is None:
         raise ValueError("--initial-checkpoint-root is required when --start-stage > 1")
     _assert_prefix_contract(stages)
+    declared_prefixes = {
+        (bundle_root / str(result["prefix"])).resolve(): (
+            int(result["bucket"]),
+            str(result["prefix"]),
+        )
+        for result in bundle_manifest["bucket_results"]
+    }
+    remote_prefixes: dict[int, str] = {}
+    for stage in stages:
+        declared = declared_prefixes.get(stage.prefix.resolve())
+        if declared is None:
+            raise ValueError(f"stage prefix is not declared by bundle: {stage.prefix}")
+        bucket, relative = declared
+        if bucket != stage.seq:
+            raise ValueError(
+                f"stage sequence length {stage.seq} does not match bundle bucket {bucket}"
+            )
+        remote_prefixes[stage.index] = relative
+    graph_capacities = _derive_stage_graph_capacities(stages)
+    bundle_identity = {
+        "bundle_id": str(bundle_manifest["bundle_id"]),
+        "artifact_set_sha256": str(bundle_manifest["artifact_set_sha256"]),
+    }
 
     args.ssh_key = args.ssh_key.expanduser().resolve()
     ssh_pubkey_path = args.ssh_pubkey or Path(str(args.ssh_key) + ".pub")
@@ -677,30 +851,65 @@ def main() -> int:
         print(
             f"  stage={stage.index} seq={stage.seq} bs={stage.batch} "
             f"stage_iters={stage.iters} target_iters={stage.iters} "
-            f"cumulative_after={cumulative} prefix={stage.prefix}",
+            f"cumulative_accounting_after={cumulative} "
+            f"graph_max_edges={graph_capacities[stage.index]['graph_max_edges']} "
+            f"graph_max_chunks={graph_capacities[stage.index]['graph_max_chunks']} "
+            f"prefix={stage.prefix}",
             flush=True,
         )
 
     if args.dry_run:
+        print(
+            _remote_script(
+                stages,
+                docker_image=args.docker_image,
+                fp8_recipe=args.fp8_recipe,
+                remote_prefixes=remote_prefixes,
+                graph_capacities=graph_capacities,
+                tokenizer_model=f"/data/cppmega_bundle/{tokenizer_relative}",
+                enable_dsa_patch=args.enable_dsa_patch,
+                run_id=args.instance_name,
+                initial_checkpoint_root="/data/cppmega_curriculum_checkpoints/initial"
+                if args.initial_checkpoint_root is not None
+                else "",
+                initial_cum_iters=previous_cum_iters,
+            )[:4000]
+        )
         return 0
 
     instance_id: str | None = None
     ip: str | None = None
     remote_status = 1
+    retrieval_succeeded = False
     out_results = ROOT / "outputs" / "nebius" / args.instance_name
     out_checkpoints = ROOT / "outputs" / "checkpoints" / args.instance_name
 
     with tempfile.TemporaryDirectory(prefix="cppmega-h200-curriculum-") as raw_tmp:
         tmp = Path(raw_tmp)
         overlay_tar = tmp / "cppmega_overlay.tgz"
-        sidecar_tar = tmp / "cppmega_sidecar.tgz"
+        bundle_tar = tmp / "cppmega_bundle.tgz"
         auth_tar = tmp / "cppmega_ghcr_auth.tgz"
         curriculum_tar = tmp / "cppmega_curriculum.tgz"
         checkpoint_tar = tmp / "cppmega_initial_checkpoint.tgz"
 
         sweep.make_overlay_tar(overlay_tar)
-        sweep.make_multi_sidecar_tar([stage.prefix for stage in stages], args.tokenizer_dir, sidecar_tar)
-        _make_curriculum_tar(stages, curriculum_tar)
+        archived_prefixes, archived_tokenizer = sweep.make_bundle_tar(
+            bundle_root,
+            [stage.prefix for stage in stages],
+            bundle_tar,
+            hash_jobs=args.hash_jobs,
+        )
+        if archived_prefixes != [remote_prefixes[stage.index] for stage in stages]:
+            raise RuntimeError("bundle archive prefix layout drifted after validation")
+        if archived_tokenizer != tokenizer_relative:
+            raise RuntimeError("bundle archive tokenizer layout drifted after validation")
+        _make_curriculum_tar(
+            stages,
+            curriculum_tar,
+            graph_capacities=graph_capacities,
+            remote_prefixes=remote_prefixes,
+            bundle_identity=bundle_identity,
+        )
         initial_remote_checkpoint_root = ""
         if args.initial_checkpoint_root is not None:
             initial_checkpoint_root = args.initial_checkpoint_root.expanduser().resolve()
@@ -709,13 +918,22 @@ def main() -> int:
                 f"/data/cppmega_curriculum_checkpoints/{initial_checkpoint_root.name}"
             )
         has_auth = sweep.make_ghcr_auth_tar(args, auth_tar)
+        if (
+            args.docker_image.startswith("ghcr.io/")
+            and not has_auth
+            and not args.no_ghcr_auth
+        ):
+            raise RuntimeError(
+                "GHCR image selected but no auth was found. Set GHCR_TOKEN/GITHUB_TOKEN, "
+                "pass --ghcr-token-file, or docker login ghcr.io locally."
+            )
 
         try:
             instance_id = sweep.create_instance(args, ssh_pubkey)
             ip = sweep.wait_for_ip(instance_id)
             sweep.wait_for_ssh(args, ip)
             sweep.stream_tar_to_remote(args, ip, overlay_tar, "/data/cppmega_overlay")
-            sweep.stream_tar_to_remote(args, ip, sidecar_tar, "/data")
+            sweep.stream_tar_to_remote(args, ip, bundle_tar, "/data")
             sweep.stream_tar_to_remote(args, ip, curriculum_tar, "/data")
             if args.initial_checkpoint_root is not None:
                 sweep.stream_tar_to_remote(args, ip, checkpoint_tar, "/data")
@@ -726,6 +944,11 @@ def main() -> int:
                 stages,
                 docker_image=args.docker_image,
                 fp8_recipe=args.fp8_recipe,
+                remote_prefixes=remote_prefixes,
+                graph_capacities=graph_capacities,
+                tokenizer_model=f"/data/cppmega_bundle/{tokenizer_relative}",
+                enable_dsa_patch=args.enable_dsa_patch,
+                run_id=args.instance_name,
                 initial_checkpoint_root=initial_remote_checkpoint_root,
                 initial_cum_iters=previous_cum_iters,
             )
@@ -752,25 +975,66 @@ def main() -> int:
                 remote_status = 70
         finally:
             if ip is not None:
-                _scp_from_remote(args, ip, "/data/cppmega_h200_results", out_results)
-                _scp_from_remote(args, ip, "/data/cppmega_curriculum_checkpoints", out_checkpoints)
-            if instance_id is not None and not args.keep_instance:
-                sweep.run(
-                    [
-                        "nebius",
-                        "compute",
-                        "instance",
-                        "delete",
-                        instance_id,
-                        "--format",
-                        "json",
-                        "--no-progress",
-                        "--timeout",
-                        "20m",
-                    ],
-                    check=False,
-                    timeout=1500,
+                retrieval_statuses: dict[str, int] = {}
+                for name, remote_path, local_path in (
+                    ("results", "/data/cppmega_h200_results", out_results),
+                    (
+                        "checkpoints",
+                        "/data/cppmega_curriculum_checkpoints",
+                        out_checkpoints,
+                    ),
+                ):
+                    try:
+                        retrieval_statuses[name] = _scp_from_remote(
+                            args,
+                            ip,
+                            remote_path,
+                            local_path,
+                        )
+                    except OSError as error:
+                        retrieval_statuses[name] = 127
+                        print(
+                            f"[nebius-curriculum] ERROR: {name} retrieval failed: {error}",
+                            file=sys.stderr,
+                        )
+                retrieval_succeeded = all(
+                    status == 0 for status in retrieval_statuses.values()
                 )
+                if not retrieval_succeeded:
+                    print(
+                        "[nebius-curriculum] ERROR: artifact retrieval failed: "
+                        f"{retrieval_statuses}",
+                        file=sys.stderr,
+                    )
+                    if remote_status == 0:
+                        remote_status = 74
+            if instance_id is not None:
+                if sweep.instance_delete_allowed(
+                    keep_instance=args.keep_instance,
+                    retrieval_succeeded=retrieval_succeeded,
+                ):
+                    sweep.run(
+                        [
+                            "nebius",
+                            "compute",
+                            "instance",
+                            "delete",
+                            instance_id,
+                            "--format",
+                            "json",
+                            "--no-progress",
+                            "--timeout",
+                            "20m",
+                        ],
+                        check=False,
+                        timeout=1500,
+                    )
+                elif not args.keep_instance:
+                    print(
+                        f"[nebius-curriculum] preserving instance {instance_id}: "
+                        "results/checkpoints were not fully retrieved",
+                        file=sys.stderr,
+                    )
 
     return remote_status
 
