@@ -614,16 +614,40 @@ def _graph_target_bias(
     unknown = sorted(set(relations) - set(relation_keys))
     if unknown:
         raise ValueError(f"unsupported graph auxiliary relations: {unknown}")
+    missing_relations = {
+        relation: [
+            key for key in relation_keys[relation] if key not in structure_batch
+        ]
+        for relation in relations
+    }
+    missing_relations = {
+        relation: keys for relation, keys in missing_relations.items() if keys
+    }
+    if missing_relations:
+        raise KeyError(
+            "graph auxiliary loss is missing required relation sidecars: "
+            f"{missing_relations}"
+        )
     selected: dict[str, torch.Tensor] = {}
     for relation in relations:
         for key in relation_keys[relation]:
             if key in structure_batch:
                 selected[key] = structure_batch[key]
-    for key in (
+    required_chunk_keys = (
         "graph_chunk_starts",
         "graph_chunk_ends",
         "graph_chunk_counts",
-    ):
+    )
+    if set(relations) & {"call", "type"}:
+        missing_chunks = [
+            key for key in required_chunk_keys if key not in structure_batch
+        ]
+        if missing_chunks:
+            raise KeyError(
+                "call/type graph auxiliary loss is missing required chunk "
+                f"sidecars: {missing_chunks}"
+            )
+    for key in required_chunk_keys:
         if key in structure_batch:
             selected[key] = structure_batch[key]
     return build_graph_route_bias_from_structure_batch(

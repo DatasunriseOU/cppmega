@@ -17,6 +17,7 @@ from cppmega.megatron.objective_contract import (
     OBJECTIVE_TOKEN_SIDE_CHANNELS,
     ObjectiveMaterializationTracker,
     load_objective_materialization_artifact,
+    materialized_objective_artifact_manifest,
     validate_objective_contract,
 )
 
@@ -37,6 +38,7 @@ def _valid_contract() -> dict[str, object]:
         "seed": 17,
         "quota_window_samples": 6,
         "task_order": list(TASKS),
+        "objective_ids": {task: OBJECTIVE_IDS[task] for task in TASKS},
         "configured_rates": {task: "1/6" for task in TASKS},
         "planned_samples": {task: 1 for task in TASKS},
         "realized": {
@@ -66,6 +68,9 @@ def _valid_contract() -> dict[str, object]:
             "eligible_samples": 1,
             "positive_edges": 5,
             "global_weight": "1",
+            "indexer_weight": "1/1000",
+            "layer_weight": "1",
+            "layer_reduction": "sum",
             "bce_weight": "1/10",
             "coverage_weight": "1/20",
             "topk": 8,
@@ -106,6 +111,8 @@ def _write_materialization_artifact(tmp_path: Path) -> Path:
         "objective_contract": {
             "path": contract_path.name,
             "sha256": hashlib.sha256(canonical).hexdigest(),
+            "size_bytes": contract_path.stat().st_size,
+            "file_sha256": hashlib.sha256(contract_path.read_bytes()).hexdigest(),
         },
         "parquet_shards": [
             {
@@ -132,6 +139,14 @@ def _write_materialization_artifact(tmp_path: Path) -> Path:
             "chunk_edge_expansion": "cartesian_token_spans_v1",
         },
     }
+    artifact["artifact_set_sha256"] = hashlib.sha256(
+        json.dumps(
+            artifact,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+    ).hexdigest()
     artifact_path = tmp_path / "objective_materialization.json"
     artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
     return artifact_path
@@ -368,6 +383,41 @@ def test_graph_enabled_boolean_alias_still_requires_objective_contract(
         dataset_patch._load_sidecar_manifest(dataset)
 
 
+@pytest.mark.parametrize(
+    ("graph_enabled", "structure_enabled", "message"),
+    (
+        ("0", "1", "GRAPH_ROUTES_ENABLED"),
+        ("1", "0", "STRUCTURE_ENABLED"),
+    ),
+)
+def test_production_objective_ingress_rejects_disabled_routes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    graph_enabled: str,
+    structure_enabled: str,
+    message: str,
+) -> None:
+    from cppmega.megatron import structure_dataset_patch as dataset_patch
+
+    prefix = tmp_path / "objective_train"
+    prefix.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "document_count": 1,
+                "objective_contract": {},
+                "objective_materialization": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    dataset = SimpleNamespace(dataset=SimpleNamespace(bin_path=str(prefix) + ".bin"))
+    monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", graph_enabled)
+    monkeypatch.setenv("CPPMEGA_STRUCTURE_ENABLED", structure_enabled)
+
+    with pytest.raises(RuntimeError, match=message):
+        dataset_patch._load_sidecar_manifest(dataset)
+
+
 def test_graph_enabled_dataset_ingress_validates_bound_objective_ids(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -384,20 +434,44 @@ def test_graph_enabled_dataset_ingress_validates_bound_objective_ids(
             graph_edges=5 if task == "causal_lm" else 0,
         )
     embedded = tracker.close()
+    objective_artifact = load_objective_materialization_artifact(
+        _write_materialization_artifact(tmp_path)
+    )
     prefix.with_suffix(".json").write_text(
-        json.dumps({"document_count": 6, "objective_contract": embedded}),
+        json.dumps(
+            {
+                "document_count": 6,
+                "objective_contract": embedded,
+                "objective_materialization": materialized_objective_artifact_manifest(
+                    objective_artifact
+                ),
+            }
+        ),
         encoding="utf-8",
     )
     dataset = SimpleNamespace(dataset=SimpleNamespace(bin_path=str(prefix) + ".bin"))
     monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
+    monkeypatch.setenv("CPPMEGA_STRUCTURE_ENABLED", "1")
 
     _path, manifest = dataset_patch._load_sidecar_manifest(dataset)
 
     assert manifest["objective_contract"]["sha256"] == contract.sha256
 
 
+@pytest.mark.parametrize(
+    ("env_name", "env_value", "field"),
+    (
+        ("CPPMEGA_DSA_GRAPH_AUX_WEIGHT", "2.0", "global_weight"),
+        ("CPPMEGA_DSA_INDEXER_LOSS_COEFF", "0.002", "indexer_weight"),
+        ("CPPMEGA_DSA_GRAPH_LAYER_WEIGHT", "0.5", "layer_weight"),
+    ),
+)
 def test_graph_enabled_dataset_ingress_rejects_runtime_weight_drift(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    env_name: str,
+    env_value: str,
+    field: str,
 ) -> None:
     from cppmega.megatron import structure_dataset_patch as dataset_patch
 
@@ -411,13 +485,25 @@ def test_graph_enabled_dataset_ingress_rejects_runtime_weight_drift(
             loss_tokens=3 if task == "causal_lm" else 2,
             graph_edges=5 if task == "causal_lm" else 0,
         )
+    objective_artifact = load_objective_materialization_artifact(
+        _write_materialization_artifact(tmp_path)
+    )
     prefix.with_suffix(".json").write_text(
-        json.dumps({"document_count": 6, "objective_contract": tracker.close()}),
+        json.dumps(
+            {
+                "document_count": 6,
+                "objective_contract": tracker.close(),
+                "objective_materialization": materialized_objective_artifact_manifest(
+                    objective_artifact
+                ),
+            }
+        ),
         encoding="utf-8",
     )
     dataset = SimpleNamespace(dataset=SimpleNamespace(bin_path=str(prefix) + ".bin"))
     monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
-    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_WEIGHT", "2.0")
+    monkeypatch.setenv("CPPMEGA_STRUCTURE_ENABLED", "1")
+    monkeypatch.setenv(env_name, env_value)
 
-    with pytest.raises(ValueError, match="global_weight.*contract"):
+    with pytest.raises(ValueError, match=field + ".*contract"):
         dataset_patch._load_sidecar_manifest(dataset)

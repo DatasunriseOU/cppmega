@@ -42,6 +42,7 @@ from cppmega.megatron.objective_contract import (
     ObjectiveMaterializationTracker,
     ValidatedObjectiveContract,
     load_objective_materialization_artifact,
+    materialized_objective_artifact_manifest,
     validate_objective_contract,
 )
 
@@ -61,6 +62,7 @@ _SIDECAR_DTYPE_MAP = {
     "uint8": np.uint8,
     "uint16": np.uint16,
     "uint32": np.uint32,
+    "uint64": np.uint64,
     "int32": np.int32,
     "int64": np.int64,
 }
@@ -1091,6 +1093,7 @@ def _convert_parquet_to_numpy(
     graph_sidecars: tuple[tuple[str, str, str], ...] | None = DEFAULT_CPPMEGA_GRAPH_SIDECARS,
     source_platform_sidecar: bool | None = None,
     objective_contract: ValidatedObjectiveContract | None = None,
+    objective_artifact_manifest: Mapping[str, object] | None = None,
     vocab_size: int = 65536,
 ) -> None:
     """Fallback: write Megatron-compatible .bin + .idx using raw numpy.
@@ -1367,6 +1370,10 @@ def _convert_parquet_to_numpy(
     _add_source_platform_manifest(sidecar_data, source_platform_paths)
     if objective_manifest is not None:
         sidecar_data["objective_contract"] = objective_manifest
+    if objective_artifact_manifest is not None:
+        sidecar_data["objective_materialization"] = dict(
+            objective_artifact_manifest
+        )
 
     with open(json_path, "w", encoding="utf-8") as jf:
         json.dump(sidecar_data, jf, indent=4)
@@ -1404,6 +1411,7 @@ def convert_parquet_to_megatron(
     import json
 
     objective_artifact: ObjectiveMaterializationArtifact | None = None
+    objective_artifact_manifest: dict[str, object] | None = None
     if objective_artifact_path is not None:
         if objective_contract_path is not None:
             raise ValueError(
@@ -1435,7 +1443,15 @@ def convert_parquet_to_megatron(
             raise ValueError("source platform sidecar conflicts with objective artifact")
         source_platform_sidecar = True
         objective_contract = objective_artifact.contract
+        objective_artifact_manifest = materialized_objective_artifact_manifest(
+            objective_artifact
+        )
     else:
+        if objective_contract_path is not None:
+            raise ValueError(
+                "bare --objective-contract is not accepted; use the canonical "
+                "shard-hashed --objective-artifact"
+            )
         if input_dir is None:
             raise ValueError("input_dir is required without an objective artifact")
         if side_channels is None and side_channel_dtypes is None:
@@ -1443,7 +1459,7 @@ def convert_parquet_to_megatron(
             side_channel_dtypes = [
                 dtype for _, dtype in DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS
             ]
-        objective_contract = _load_objective_contract(objective_contract_path)
+        objective_contract = None
 
     assert input_dir is not None
 
@@ -1460,6 +1476,7 @@ def convert_parquet_to_megatron(
             graph_sidecars=graph_sidecars,
             source_platform_sidecar=source_platform_sidecar,
             objective_contract=objective_contract,
+            objective_artifact_manifest=objective_artifact_manifest,
             vocab_size=vocab_size,
         )
     if writer_backend != "megatron":
@@ -1704,6 +1721,10 @@ def convert_parquet_to_megatron(
     _add_source_platform_manifest(sidecar_data, source_platform_paths)
     if objective_manifest is not None:
         sidecar_data["objective_contract"] = objective_manifest
+    if objective_artifact_manifest is not None:
+        sidecar_data["objective_materialization"] = dict(
+            objective_artifact_manifest
+        )
 
     with open(json_path, "w", encoding="utf-8") as jf:
         json.dump(sidecar_data, jf, indent=4)
@@ -1819,9 +1840,8 @@ def main() -> int:
         "--objective-contract",
         default=None,
         help=(
-            "Path to a cppmega_pre_materialized_objectives_v1 receipt. When "
-            "set, objective_kind, loss-mask, graph-edge, and quota accounting "
-            "are verified exactly and embedded into the output manifest."
+            "Legacy option retained only for an explicit fail-closed error. "
+            "Use --objective-artifact; bare contracts are not accepted."
         ),
     )
     parser.add_argument(

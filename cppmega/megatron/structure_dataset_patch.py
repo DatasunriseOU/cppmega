@@ -113,6 +113,13 @@ _TOKEN_COL_ALIASES = {
     "change_mask_post": ("token_change_mask_post", "change_mask_post"),
 }
 
+_OPAQUE_SYMBOL_ID_COLS = frozenset(("symbol_ids", "call_targets", "type_refs"))
+_OPAQUE_SYMBOL_ID_ALIASES = frozenset(
+    alias
+    for column in _OPAQUE_SYMBOL_ID_COLS
+    for alias in _TOKEN_COL_ALIASES[column]
+)
+
 _LOSS_MASK_ALIASES = ("loss_mask", "token_loss_mask")
 
 _GRAPH_ROUTE_COLS = (
@@ -188,8 +195,26 @@ def _load_sidecar_manifest(dataset: Any) -> tuple[str, dict[str, Any]]:
     json_path = _sidecar_json_path(dataset)
     with open(json_path, "r", encoding="utf-8") as f:
         sidecar = json.load(f)
+    objective_contract = sidecar.get("objective_contract")
+    objective_materialization = sidecar.get("objective_materialization")
+    production_objectives = (
+        objective_contract is not None or objective_materialization is not None
+    )
+    if production_objectives:
+        if objective_contract is None or objective_materialization is None:
+            raise KeyError(
+                f"[cppmega-patch] production objective data in {json_path!r} "
+                "requires both objective_contract and objective_materialization"
+            )
+        if not _env_flag("CPPMEGA_STRUCTURE_ENABLED"):
+            raise RuntimeError(
+                "production objective data requires CPPMEGA_STRUCTURE_ENABLED=1"
+            )
+        if not _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
+            raise RuntimeError(
+                "production objective data requires CPPMEGA_GRAPH_ROUTES_ENABLED=1"
+            )
     if _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
-        objective_contract = sidecar.get("objective_contract")
         if objective_contract is None:
             raise KeyError(
                 f"[cppmega-patch] objective_contract missing in {json_path!r} "
@@ -197,6 +222,7 @@ def _load_sidecar_manifest(dataset: Any) -> tuple[str, dict[str, Any]]:
                 "must be pre-materialized from the typed objective mixer"
             )
         from cppmega.megatron.objective_contract import (
+            validate_materialized_objective_artifact,
             validate_materialized_objective_contract,
         )
 
@@ -209,6 +235,11 @@ def _load_sidecar_manifest(dataset: Any) -> tuple[str, dict[str, Any]]:
         validated_objectives = validate_materialized_objective_contract(
             objective_contract,
             base_dir=os.path.dirname(json_path),
+            document_count=document_count,
+        )
+        validate_materialized_objective_artifact(
+            objective_materialization,
+            objective_contract=validated_objectives,
             document_count=document_count,
         )
         from cppmega.megatron.graph_objective_loss import (
@@ -271,6 +302,17 @@ def _lazy_init_side_channels(dataset: Any) -> Dict[str, Dict[str, Any]]:
         raise KeyError(
             f"[cppmega-patch] side_channel_paths missing in {json_path!r} while "
             "CPPMEGA_STRUCTURE_ENABLED=1"
+        )
+
+    invalid_identity_dtypes = {
+        column: entry.get("dtype")
+        for column, entry in side_paths.items()
+        if column in _OPAQUE_SYMBOL_ID_ALIASES and entry.get("dtype") != "uint64"
+    }
+    if invalid_identity_dtypes:
+        raise ValueError(
+            "[cppmega-patch] opaque symbol/call/type sidecars must use uint64; "
+            f"got {invalid_identity_dtypes} in {json_path!r}"
         )
 
     base_dir = os.path.dirname(json_path)
@@ -481,6 +523,20 @@ def _align_token_sidecar_tensor(
         )
         tensor = torch.cat([tensor, pad], dim=0)
     return tensor.contiguous()
+
+
+def _token_sidecar_tensor(values: np.ndarray, *, col: str) -> torch.Tensor:
+    """Convert sidecars without narrowing opaque CASE4 identities."""
+
+    array_values = np.asarray(values)
+    if col in _OPAQUE_SYMBOL_ID_COLS:
+        if array_values.dtype != np.dtype(np.uint64):
+            raise ValueError(
+                f"[cppmega-patch] {col} must arrive as uint64, got "
+                f"{array_values.dtype.name}"
+            )
+        return torch.from_numpy(np.array(array_values, dtype=np.uint64, copy=True))
+    return torch.from_numpy(array_values).long()
 
 
 def _sample_document_ids(
@@ -742,14 +798,28 @@ try:
     def patched_getitem(self: GPTDataset, idx: Optional[int]) -> Dict[str, torch.Tensor]:
         sample = orig_getitem(self, idx)
 
-        if os.environ.get("CPPMEGA_STRUCTURE_ENABLED", "0") != "1":
+        structure_enabled = _env_flag("CPPMEGA_STRUCTURE_ENABLED")
+        graph_enabled = _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED")
+        if graph_enabled and not structure_enabled:
+            raise RuntimeError(
+                "CPPMEGA_GRAPH_ROUTES_ENABLED=1 requires "
+                "CPPMEGA_STRUCTURE_ENABLED=1"
+            )
+        if not structure_enabled:
+            try:
+                _load_sidecar_manifest(self)
+            except FileNotFoundError:
+                pass
             return sample
 
         if idx is None:
             # Padded sequence: return zero tensors matching the tokens shape
             tokens_shape = sample["tokens"].shape
             for col in _TOKEN_BATCH_COLS:
-                sample[col] = torch.zeros(tokens_shape, dtype=torch.long, device=sample["tokens"].device)
+                dtype = torch.uint64 if col in _OPAQUE_SYMBOL_ID_COLS else torch.long
+                sample[col] = torch.zeros(
+                    tokens_shape, dtype=dtype, device=sample["tokens"].device
+                )
             if _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
                 max_edges = int(os.environ.get("CPPMEGA_GRAPH_MAX_EDGES", "256"))
                 max_chunks = int(os.environ.get("CPPMEGA_GRAPH_MAX_CHUNKS", "256"))
@@ -837,7 +907,7 @@ try:
                 continue
             entry = side_channels[source]
             vals = entry["mmap"][indices]
-            tensor = torch.from_numpy(vals).long()
+            tensor = _token_sidecar_tensor(vals, col=col)
             if self.config.add_extra_token_to_sequence:
                 tensor = tensor[:-1]
             tensor = tensor.contiguous()

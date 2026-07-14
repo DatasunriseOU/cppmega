@@ -51,6 +51,7 @@ def _objective_contract() -> dict[str, object]:
         "seed": 17,
         "quota_window_samples": 6,
         "task_order": list(tasks),
+        "objective_ids": {task: OBJECTIVE_IDS[task] for task in tasks},
         "configured_rates": {task: "1/6" for task in tasks},
         "planned_samples": {task: 1 for task in tasks},
         "realized": {
@@ -76,6 +77,9 @@ def _objective_contract() -> dict[str, object]:
             "eligible_samples": 1,
             "positive_edges": 5,
             "global_weight": "1",
+            "indexer_weight": "1/1000",
+            "layer_weight": "1",
+            "layer_reduction": "sum",
             "bce_weight": "1/10",
             "coverage_weight": "1/20",
             "topk": 8,
@@ -115,6 +119,8 @@ def _write_objective_artifact(input_dir: Path) -> Path:
         "objective_contract": {
             "path": contract_path.name,
             "sha256": hashlib.sha256(canonical).hexdigest(),
+            "size_bytes": contract_path.stat().st_size,
+            "file_sha256": hashlib.sha256(contract_path.read_bytes()).hexdigest(),
         },
         "parquet_shards": [
             {
@@ -142,6 +148,14 @@ def _write_objective_artifact(input_dir: Path) -> Path:
             "chunk_edge_expansion": "cartesian_token_spans_v1",
         },
     }
+    artifact["artifact_set_sha256"] = hashlib.sha256(
+        json.dumps(
+            artifact,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+    ).hexdigest()
     artifact_path = input_dir / "objective_materialization.json"
     artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
     return artifact_path
@@ -172,6 +186,20 @@ def test_objective_conversion_requires_document_id_sidecar() -> None:
             length_column="valid_token_count",
             side_channels=["loss_mask"],
             graph_columns=["token_call_edges", "token_type_edges"],
+        )
+
+
+def test_objective_conversion_rejects_bare_contract(tmp_path: Path) -> None:
+    converter = _load_converter_module()
+    contract_path = tmp_path / "objective_contract.json"
+    contract_path.write_text(json.dumps(_objective_contract()), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="bare --objective-contract"):
+        converter.convert_parquet_to_megatron(
+            input_dir=str(tmp_path),
+            output_prefix=str(tmp_path / "train"),
+            objective_contract_path=str(contract_path),
+            writer_backend="mmididx",
         )
 
 
@@ -250,7 +278,9 @@ def test_default_cppmega_side_channels_are_full_token_aligned_profile() -> None:
     assert dtypes["token_entity_ids"] == "uint32"
     assert dtypes["token_source_doc_ids"] == "uint32"
     assert dtypes["token_confidence_ids"] == "uint8"
-    assert dtypes["token_symbol_ids"] == "uint32"
+    assert dtypes["token_symbol_ids"] == "uint64"
+    assert dtypes["token_call_targets"] == "uint64"
+    assert dtypes["token_type_refs"] == "uint64"
     assert dtypes["token_def_use"] == "uint8"
 
 
@@ -611,6 +641,15 @@ def test_mmididx_writer_binds_pre_materialized_objective_contract(
     }
     for column, _dtype in OBJECTIVE_TOKEN_SIDE_CHANNELS:
         rows.setdefault(column, [[0, 0, 0, 0] for _task in tasks])
+    high_identity = (1 << 63) + 12345
+    for column in ("token_symbol_ids", "token_call_targets", "token_type_refs"):
+        rows[column] = pa.array(
+            [
+                [0, high_identity + index, high_identity + index, 0]
+                for index, _task in enumerate(tasks)
+            ],
+            type=pa.list_(pa.uint64()),
+        )
     for column, kind, _dtype in OBJECTIVE_GRAPH_SIDECARS:
         if column not in rows:
             rows[column] = [[] for _task in tasks]
@@ -632,6 +671,16 @@ def test_mmididx_writer_binds_pre_materialized_objective_contract(
     embedded = manifest["objective_contract"]
     assert embedded["schema"] == OBJECTIVE_CONTRACT_SCHEMA
     assert embedded["payload"] == _objective_contract()
+    assert manifest["objective_materialization"]["artifact_set_sha256"]
+    np.testing.assert_array_equal(
+        np.fromfile(
+            tmp_path / "objective_train_token_symbol_ids.bin", dtype=np.uint64
+        )[1::4],
+        np.array(
+            [high_identity + index for index in range(len(tasks))],
+            dtype=np.uint64,
+        ),
+    )
     np.testing.assert_array_equal(
         np.fromfile(
             tmp_path / "objective_train_objective_ids.bin", dtype=np.uint8
@@ -644,6 +693,7 @@ def test_mmididx_writer_binds_pre_materialized_objective_contract(
         dataset=types.SimpleNamespace(bin_path=str(output_prefix) + ".bin")
     )
     monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
+    monkeypatch.setenv("CPPMEGA_STRUCTURE_ENABLED", "1")
     _manifest_path, opened = dataset_patch._load_sidecar_manifest(dataset)
     assert opened["objective_contract"]["sha256"] == embedded["sha256"]
 
@@ -657,9 +707,7 @@ def test_objective_contract_fails_on_materialized_loss_token_drift(
     tasks = tuple(_objective_contract()["task_order"])
     input_dir = tmp_path / "parquet"
     input_dir.mkdir()
-    pq.write_table(
-        pa.table(
-            {
+    rows: dict[str, object] = {
                 "valid_token_count": [4] * len(tasks),
                 "input_ids": [[1, 2, 3, 4] for _task in tasks],
                 # FIM has three loss tokens here, while the receipt says two.
@@ -691,12 +739,14 @@ def test_objective_contract_fails_on_materialized_loss_token_drift(
                 "token_chunk_dep_levels": [
                     [0, 0] if task == "causal_lm" else [] for task in tasks
                 ],
+                "source_platform_ids": [[[2]] for _task in tasks],
             }
-        ),
-        input_dir / "objectives.parquet",
-    )
-    contract_path = tmp_path / "objective_contract.json"
-    contract_path.write_text(json.dumps(_objective_contract()), encoding="utf-8")
+    for column, _dtype in OBJECTIVE_TOKEN_SIDE_CHANNELS:
+        rows.setdefault(column, [[0, 0, 0, 0] for _task in tasks])
+    for column, _kind, _dtype in OBJECTIVE_GRAPH_SIDECARS:
+        rows.setdefault(column, [[] for _task in tasks])
+    pq.write_table(pa.table(rows), input_dir / "objectives.parquet")
+    artifact_path = _write_objective_artifact(input_dir)
 
     with pytest.raises(ValueError, match="loss_tokens.*fim"):
         converter.convert_parquet_to_megatron(
@@ -705,18 +755,7 @@ def test_objective_contract_fails_on_materialized_loss_token_drift(
             split="all",
             token_column="auto",
             length_column="auto",
-            side_channels=["loss_mask", "doc_ids", "token_source_doc_ids"],
-            side_channel_dtypes=["uint8", "uint16", "uint32"],
-            graph_sidecars=(
-                ("token_call_edges", "edge_pairs", "int32"),
-                ("token_type_edges", "edge_pairs", "int32"),
-                ("token_chunk_starts", "ragged_1d", "uint32"),
-                ("token_chunk_ends", "ragged_1d", "uint32"),
-                ("token_chunk_kinds", "ragged_1d", "uint16"),
-                ("token_chunk_dep_levels", "ragged_1d", "uint16"),
-            ),
-            source_platform_sidecar=False,
-            objective_contract_path=str(contract_path),
+            objective_artifact_path=str(artifact_path),
             writer_backend="mmididx",
         )
 

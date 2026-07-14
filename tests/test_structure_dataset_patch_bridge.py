@@ -1,8 +1,27 @@
+import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
 
 from cppmega.megatron import structure_dataset_patch as patch
+
+
+def test_opaque_identity_tensor_preserves_full_uint64_range():
+    identity = (1 << 63) + 12345
+
+    tensor = patch._token_sidecar_tensor(
+        np.array([identity], dtype=np.uint64),
+        col="symbol_ids",
+    )
+
+    assert tensor.dtype == torch.uint64
+    assert int(tensor.numpy()[0]) == identity
+
+    with pytest.raises(ValueError, match="must arrive as uint64"):
+        patch._token_sidecar_tensor(
+            np.array([123], dtype=np.uint32),
+            col="symbol_ids",
+        )
 
 
 def test_pop_structure_batch_removes_sidecars_and_sets_thread_local():

@@ -31,8 +31,6 @@ def test_extract_structure_inputs_filters_only_known_keys():
     assert extracted == {
         "structure_ids": 2,
         "dep_levels": 3,
-        "symbol_ids": 4,
-        "call_targets": 5,
         "change_mask_pre": 6,
         "graph_call_edges": 7,
         "graph_call_edge_counts": 8,
@@ -41,6 +39,8 @@ def test_extract_structure_inputs_filters_only_known_keys():
         "graph_build_edges": 11,
         "graph_build_edge_counts": 12,
     }
+    assert "symbol_ids" not in extracted
+    assert "call_targets" not in extracted
 
 
 def test_maybe_set_structure_inputs_pushes_non_zero_metadata_into_model():

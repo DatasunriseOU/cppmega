@@ -41,9 +41,9 @@ OBJECTIVE_TOKEN_SIDE_CHANNELS: tuple[tuple[str, str], ...] = (
     ("token_ast_depth", "uint16"),
     ("token_sibling_index", "uint16"),
     ("token_ast_node_type", "uint16"),
-    ("token_symbol_ids", "uint32"),
-    ("token_call_targets", "uint32"),
-    ("token_type_refs", "uint32"),
+    ("token_symbol_ids", "uint64"),
+    ("token_call_targets", "uint64"),
+    ("token_type_refs", "uint64"),
     ("token_def_use", "uint8"),
     ("token_change_mask_pre", "uint8"),
     ("token_change_mask_post", "uint8"),
@@ -159,6 +159,8 @@ class ObjectiveMaterializationArtifact:
     parquet_paths: tuple[Path, ...]
     contract: ValidatedObjectiveContract
     payload: dict[str, Any]
+    artifact_set_sha256: str
+    file_sha256: str
 
 
 def validate_objective_contract(
@@ -194,6 +196,13 @@ def validate_objective_contract(
     if missing_required:
         raise ValueError(
             f"task_order is missing production objectives: {missing_required}"
+        )
+    objective_ids = _mapping(contract.get("objective_ids"), where="objective_ids")
+    expected_objective_ids = {task: OBJECTIVE_IDS[task] for task in task_order}
+    if dict(objective_ids) != expected_objective_ids:
+        raise ValueError(
+            "objective_ids must use the canonical encounter-order-independent "
+            f"mapping: {expected_objective_ids}"
         )
 
     configured = _mapping(contract.get("configured_rates"), where="configured_rates")
@@ -299,8 +308,16 @@ def validate_objective_contract(
         graph.get("eligible_samples"), where="graph_auxiliary.eligible_samples"
     )
     _positive_int(graph.get("positive_edges"), where="graph_auxiliary.positive_edges")
-    for field in ("global_weight", "bce_weight", "coverage_weight"):
+    for field in (
+        "global_weight",
+        "indexer_weight",
+        "layer_weight",
+        "bce_weight",
+        "coverage_weight",
+    ):
         _fraction(graph.get(field), where=f"graph_auxiliary.{field}", positive=True)
+    if graph.get("layer_reduction") != "sum":
+        raise ValueError("graph_auxiliary.layer_reduction must be 'sum'")
     for field in ("pos_weight", "margin"):
         _fraction(
             graph.get(field),
@@ -380,6 +397,7 @@ def load_objective_materialization_artifact(
         "objective_contract",
         "parquet_shards",
         "converter",
+        "artifact_set_sha256",
     }
     if set(artifact) != expected_top:
         raise ValueError(
@@ -391,16 +409,38 @@ def load_objective_materialization_artifact(
             "objective materialization artifact schema must be "
             f"{OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA!r}"
         )
+    artifact_set_payload = dict(artifact)
+    artifact_set_sha256 = artifact_set_payload.pop("artifact_set_sha256", None)
+    if artifact_set_sha256 != _canonical_sha256(artifact_set_payload):
+        raise ValueError(
+            "objective materialization artifact_set_sha256 does not match payload"
+        )
     root = artifact_path.parent.resolve()
 
     contract_ref = _mapping(
         artifact.get("objective_contract"), where="objective_contract"
     )
-    if set(contract_ref) != {"path", "sha256"}:
-        raise ValueError("objective_contract must contain only path and sha256")
+    expected_contract_ref_keys = {
+        "path",
+        "sha256",
+        "size_bytes",
+        "file_sha256",
+    }
+    if set(contract_ref) != expected_contract_ref_keys:
+        raise ValueError(
+            "objective_contract must contain path, sha256, size_bytes, "
+            "and file_sha256"
+        )
     contract_path = _artifact_file(
         root, contract_ref.get("path"), where="objective_contract.path"
     )
+    expected_contract_size = _positive_int(
+        contract_ref.get("size_bytes"), where="objective_contract.size_bytes"
+    )
+    if contract_path.stat().st_size != expected_contract_size:
+        raise ValueError("objective_contract.size_bytes does not match")
+    if contract_ref.get("file_sha256") != _file_sha256(contract_path):
+        raise ValueError("objective_contract.file_sha256 does not match")
     with contract_path.open(encoding="utf-8") as handle:
         contract_raw = json.load(handle)
     contract = validate_objective_contract(
@@ -494,7 +534,19 @@ def load_objective_materialization_artifact(
         parquet_paths=tuple(parquet_paths),
         contract=contract,
         payload=copy.deepcopy(artifact),
+        artifact_set_sha256=str(artifact_set_sha256),
+        file_sha256=_file_sha256(artifact_path),
     )
+
+
+def materialized_objective_artifact_manifest(
+    artifact: ObjectiveMaterializationArtifact,
+) -> dict[str, Any]:
+    """Return the immutable artifact binding embedded in converted datasets."""
+
+    manifest = copy.deepcopy(artifact.payload)
+    manifest["artifact_file_sha256"] = artifact.file_sha256
+    return manifest
 
 
 @dataclass
@@ -645,6 +697,83 @@ def validate_materialized_objective_contract(
     return validated
 
 
+def validate_materialized_objective_artifact(
+    value: object,
+    *,
+    objective_contract: ValidatedObjectiveContract,
+    document_count: int,
+) -> None:
+    """Validate the artifact binding embedded by the canonical converter."""
+
+    binding = _mapping(value, where="objective_materialization")
+    expected_keys = {
+        "schema",
+        "artifact_file_sha256",
+        "documents",
+        "objective_contract",
+        "parquet_shards",
+        "converter",
+        "artifact_set_sha256",
+    }
+    if set(binding) != expected_keys:
+        raise ValueError(
+            f"objective_materialization keys must be exactly {sorted(expected_keys)}"
+        )
+    if binding.get("schema") != OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA:
+        raise ValueError("objective_materialization schema is invalid")
+    for field in ("artifact_set_sha256", "artifact_file_sha256"):
+        value = binding.get(field)
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError(f"objective_materialization.{field} must be sha256 hex")
+    artifact_payload = copy.deepcopy(dict(binding))
+    artifact_payload.pop("artifact_file_sha256")
+    expected_set_sha256 = artifact_payload.pop("artifact_set_sha256")
+    if expected_set_sha256 != _canonical_sha256(artifact_payload):
+        raise ValueError(
+            "objective_materialization artifact_set_sha256 does not match payload"
+        )
+    if binding.get("documents") != document_count:
+        raise ValueError(
+            "objective_materialization.documents does not match dataset document_count"
+        )
+    contract_ref = _mapping(
+        binding.get("objective_contract"),
+        where="objective_materialization.objective_contract",
+    )
+    if contract_ref.get("sha256") != objective_contract.sha256:
+        raise ValueError(
+            "objective_materialization objective contract hash does not match"
+        )
+    shards = binding.get("parquet_shards")
+    if not isinstance(shards, list) or not shards:
+        raise ValueError("objective_materialization.parquet_shards must be non-empty")
+    names: list[str] = []
+    for index, raw_shard in enumerate(shards):
+        shard = _mapping(raw_shard, where=f"objective_materialization.parquet_shards[{index}]")
+        if set(shard) != {"path", "size_bytes", "sha256"}:
+            raise ValueError(
+                "objective_materialization shard bindings require path/size_bytes/sha256"
+            )
+        name = shard.get("path")
+        if not isinstance(name, str) or not name or os.path.basename(name) != name:
+            raise ValueError("objective_materialization shard path must be a filename")
+        _positive_int(shard.get("size_bytes"), where=f"shard[{index}].size_bytes")
+        digest = shard.get("sha256")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError(f"objective_materialization shard[{index}] sha256 is invalid")
+        names.append(name)
+    if names != sorted(names) or len(names) != len(set(names)):
+        raise ValueError("objective_materialization shards must be sorted and unique")
+
+
 __all__ = [
     "OBJECTIVE_CONTRACT_SCHEMA",
     "OBJECTIVE_GRAPH_SIDECARS",
@@ -655,6 +784,8 @@ __all__ = [
     "ObjectiveMaterializationTracker",
     "ValidatedObjectiveContract",
     "load_objective_materialization_artifact",
+    "materialized_objective_artifact_manifest",
+    "validate_materialized_objective_artifact",
     "validate_materialized_objective_contract",
     "validate_objective_contract",
 ]

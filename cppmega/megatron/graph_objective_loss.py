@@ -18,12 +18,20 @@ class GraphAuxiliaryLossConfig:
     bce_weight: float
     coverage_weight: float
     topk: int
+    indexer_weight: float = 0.001
+    layer_weight: float = 1.0
     pos_weight: float = 1.0
     margin: float = 1.0
     relations: tuple[str, ...] = ("call", "type")
 
     def __post_init__(self) -> None:
-        for name in ("global_weight", "bce_weight", "coverage_weight"):
+        for name in (
+            "global_weight",
+            "indexer_weight",
+            "layer_weight",
+            "bce_weight",
+            "coverage_weight",
+        ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be > 0")
@@ -52,6 +60,12 @@ class GraphAuxiliaryLossConfig:
                 global_weight=float(
                     os.environ.get("CPPMEGA_DSA_GRAPH_AUX_WEIGHT", "1.0")
                 ),
+                indexer_weight=float(
+                    os.environ.get("CPPMEGA_DSA_INDEXER_LOSS_COEFF", "0.001")
+                ),
+                layer_weight=float(
+                    os.environ.get("CPPMEGA_DSA_GRAPH_LAYER_WEIGHT", "1.0")
+                ),
                 bce_weight=float(
                     os.environ.get("CPPMEGA_DSA_GRAPH_BCE_WEIGHT", "0.10")
                 ),
@@ -70,6 +84,14 @@ class GraphAuxiliaryLossConfig:
 def validate_runtime_graph_contract(graph_contract: Mapping[str, object]) -> None:
     """Require runtime graph-loss knobs to exactly match the data receipt."""
 
+    if not graph_objective_requested():
+        raise ValueError(
+            "production graph objective requires CPPMEGA_GRAPH_ROUTES_ENABLED=1"
+        )
+    if not _env_flag("CPPMEGA_STRUCTURE_ENABLED"):
+        raise ValueError(
+            "production graph objective requires CPPMEGA_STRUCTURE_ENABLED=1"
+        )
     config = GraphAuxiliaryLossConfig.from_env()
     expected_relations = tuple(graph_contract.get("relations", ()))
     if config.relations != expected_relations:
@@ -79,6 +101,8 @@ def validate_runtime_graph_contract(graph_contract: Mapping[str, object]) -> Non
         )
     comparisons = {
         "global_weight": config.global_weight,
+        "indexer_weight": config.indexer_weight,
+        "layer_weight": config.layer_weight,
         "bce_weight": config.bce_weight,
         "coverage_weight": config.coverage_weight,
         "pos_weight": config.pos_weight,
@@ -98,18 +122,41 @@ def validate_runtime_graph_contract(graph_contract: Mapping[str, object]) -> Non
             f"graph auxiliary runtime topk={config.topk} differs from "
             f"contract={graph_contract.get('topk')!r}"
         )
+    if graph_contract.get("layer_reduction") != "sum":
+        raise ValueError("graph auxiliary layer_reduction must be 'sum'")
 
 
-def require_active_dsa_graph_objective(transformer_config: object) -> None:
+def _env_flag(name: str) -> bool:
+    raw = os.environ.get(name, "0").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} has invalid boolean value {raw!r}")
+
+
+def graph_objective_requested() -> bool:
+    return _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED")
+
+
+def require_active_dsa_graph_objective(
+    transformer_config: object,
+    *,
+    required: bool = True,
+) -> None:
     """Fail before model construction if graph loss cannot reach total loss."""
 
-    if os.environ.get("CPPMEGA_GRAPH_ROUTES_ENABLED", "0").lower() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
+    if not required:
         return
+    if not graph_objective_requested():
+        raise ValueError(
+            "graph objective requested but CPPMEGA_GRAPH_ROUTES_ENABLED is disabled"
+        )
+    if not _env_flag("CPPMEGA_STRUCTURE_ENABLED"):
+        raise ValueError(
+            "graph objective requested but CPPMEGA_STRUCTURE_ENABLED is disabled"
+        )
+    graph_config = GraphAuxiliaryLossConfig.from_env()
     coefficient = getattr(transformer_config, "dsa_indexer_loss_coeff", None)
     coefficient_value = float(coefficient) if coefficient is not None else None
     if (
@@ -121,6 +168,12 @@ def require_active_dsa_graph_objective(transformer_config: object) -> None:
             "CPPMEGA_GRAPH_ROUTES_ENABLED=1 requires a finite positive "
             "TransformerConfig.dsa_indexer_loss_coeff so the weighted graph "
             "objective reaches DSAIndexerLossAutoScaler"
+        )
+    if Fraction(str(coefficient_value)) != Fraction(str(graph_config.indexer_weight)):
+        raise ValueError(
+            "TransformerConfig.dsa_indexer_loss_coeff differs from the graph "
+            f"indexer coefficient: {coefficient_value} != "
+            f"{graph_config.indexer_weight}"
         )
     if bool(getattr(transformer_config, "dsa_indexer_use_sparse_loss", False)):
         raise ValueError(
@@ -205,7 +258,7 @@ def graph_auxiliary_loss(
         penalties = deficits * targets * finite_boundary.to(scores.dtype)
         coverage = penalties.sum() / positive_edges.clamp_min(1.0)
 
-    total = config.global_weight * (
+    total = config.global_weight * config.layer_weight * (
         config.bce_weight * bce + config.coverage_weight * coverage
     )
     return total, {
@@ -217,6 +270,7 @@ def graph_auxiliary_loss(
 
 __all__ = [
     "GraphAuxiliaryLossConfig",
+    "graph_objective_requested",
     "graph_auxiliary_loss",
     "require_active_dsa_graph_objective",
     "validate_runtime_graph_contract",
