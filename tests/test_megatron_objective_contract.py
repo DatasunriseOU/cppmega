@@ -19,6 +19,7 @@ from cppmega.megatron.objective_contract import (
     load_objective_materialization_artifact,
     materialized_objective_artifact_manifest,
     validate_objective_contract,
+    verify_objective_materialization_shard,
 )
 
 TASKS = (
@@ -202,6 +203,26 @@ def test_objective_materialization_artifact_rejects_unlisted_parquet(
         load_objective_materialization_artifact(artifact_path)
 
 
+def test_objective_materialization_shard_reverification_detects_replacement(
+    tmp_path: Path,
+) -> None:
+    artifact = load_objective_materialization_artifact(
+        _write_materialization_artifact(tmp_path)
+    )
+    shard = artifact.parquet_paths[0]
+    before = verify_objective_materialization_shard(artifact, shard)
+    replacement = tmp_path / "replacement.parquet"
+    replacement.write_bytes(shard.read_bytes())
+    replacement.replace(shard)
+
+    with pytest.raises(ValueError, match="stat changed while the shard was consumed"):
+        verify_objective_materialization_shard(
+            artifact,
+            shard,
+            previous_stat=before,
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "bad_value", "match"),
     [
@@ -248,7 +269,7 @@ def test_contract_binds_materialized_parquet_columns(
         validate_objective_contract(contract)
 
 
-def test_contract_accepts_deterministic_zero_quota_in_small_window() -> None:
+def test_contract_rejects_zero_required_quota_in_small_window() -> None:
     contract = _valid_contract()
     contract["quota_window_samples"] = 5
     contract["planned_samples"]["pre_to_post"] = 0  # type: ignore[index]
@@ -263,9 +284,38 @@ def test_contract_accepts_deterministic_zero_quota_in_small_window() -> None:
         "loss_tokens": 11,
     }
 
-    validated = validate_objective_contract(contract)
+    with pytest.raises(ValueError, match="nonzero planned quota.*Hamilton window"):
+        validate_objective_contract(contract)
 
-    assert validated.planned_samples["pre_to_post"] == 0
+
+def test_contract_rejects_whole_dataset_hamilton_instead_of_window_schedule() -> None:
+    contract = _valid_contract()
+    contract["quota_window_samples"] = 7
+    whole_dataset_quotas = {
+        "causal_lm": 3,
+        "fim": 3,
+        "ast_fim": 2,
+        "ifim": 2,
+        "commit_diff": 2,
+        "pre_to_post": 2,
+    }
+    contract["planned_samples"] = whole_dataset_quotas
+    contract["realized"] = {
+        task: {
+            "samples": samples,
+            "input_tokens": samples * 3,
+            "loss_tokens": samples * (3 if task == "causal_lm" else 2),
+        }
+        for task, samples in whole_dataset_quotas.items()
+    }
+    contract["totals"] = {
+        "samples": 14,
+        "input_tokens": 42,
+        "loss_tokens": 31,
+    }
+
+    with pytest.raises(ValueError, match="identical Hamilton quota windows"):
+        validate_objective_contract(contract)
 
 
 @pytest.mark.parametrize(

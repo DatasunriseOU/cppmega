@@ -226,7 +226,7 @@ def test_objective_conversion_rejects_bare_contract(tmp_path: Path) -> None:
         )
 
 
-def test_objective_contract_accepts_deterministic_zero_hamilton_quota() -> None:
+def test_objective_contract_rejects_zero_required_hamilton_quota() -> None:
     contract = _objective_contract()
     contract["quota_window_samples"] = 3
     contract["totals"] = {"samples": 3, "input_tokens": 9, "loss_tokens": 8}
@@ -247,7 +247,8 @@ def test_objective_contract_accepts_deterministic_zero_hamilton_quota() -> None:
         for task, samples in contract["planned_samples"].items()
     }
 
-    assert validate_objective_contract(contract).planned_samples["ifim"] == 0
+    with pytest.raises(ValueError, match="nonzero planned quota.*Hamilton window"):
+        validate_objective_contract(contract)
 
 
 def test_materialized_objective_contract_rejects_id_histogram_drift(tmp_path: Path) -> None:
@@ -459,6 +460,83 @@ def test_side_channel_length_mismatch_fails_closed() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("values", "dtype", "match"),
+    [
+        ([1.5], "uint8", "finite integral values"),
+        ([-1], "uint8", "outside uint8 range"),
+        ([256], "uint8", "outside uint8 range"),
+        ([2**64], "uint64", "outside uint64 range"),
+    ],
+)
+def test_token_sidecar_cast_fails_closed_before_numpy_cast(
+    values: list[float | int], dtype: str, match: str
+) -> None:
+    converter = _load_converter_module()
+
+    with pytest.raises(ValueError, match=match):
+        converter._validated_token_sidecar_array(
+            values,
+            converter._resolve_sidecar_dtype(dtype),
+            column="test_sidecar",
+            where="shard.parquet#row0",
+        )
+
+
+def test_mmididx_rejects_fractional_token_sidecar_without_partial_outputs(
+    tmp_path: Path,
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    converter = _load_converter_module()
+    input_dir = tmp_path / "parquet"
+    input_dir.mkdir()
+    pq.write_table(
+        pa.table({"input_ids": [[10, 11]], "loss_mask": [[1.0, 0.5]]}),
+        input_dir / "fractional.parquet",
+    )
+    output_prefix = tmp_path / "fractional_train"
+
+    with pytest.raises(ValueError, match="loss_mask.*finite integral values"):
+        converter.convert_parquet_to_megatron(
+            input_dir=str(input_dir),
+            output_prefix=str(output_prefix),
+            split="all",
+            token_column="input_ids",
+            side_channels=["loss_mask"],
+            side_channel_dtypes=["uint8"],
+            graph_sidecars=None,
+            source_platform_sidecar=False,
+            writer_backend="mmididx",
+        )
+
+    assert not output_prefix.with_suffix(".bin").exists()
+    assert not output_prefix.with_suffix(".idx").exists()
+    assert not output_prefix.with_suffix(".json").exists()
+
+
+@pytest.mark.parametrize(
+    "doc_ids",
+    ([7, 7, 8, 8], [1, 2, 1, 2], [1, 1, 3, 3]),
+)
+def test_source_platform_writer_rejects_noncontiguous_or_reused_document_ids(
+    tmp_path: Path,
+    doc_ids: list[int],
+) -> None:
+    converter = _load_converter_module()
+    writer = converter._SourcePlatformSidecarWriter(str(tmp_path / "bad"))
+
+    with pytest.raises(ValueError, match="contiguous, non-reused row-local IDs"):
+        writer.append(
+            [[2], [3]],
+            doc_ids=doc_ids,
+            token_count=4,
+            shard_path="shard.parquet",
+            row_idx=0,
+        )
+    writer.abort_close()
+
+
 def test_default_cppmega_side_channels_are_full_token_aligned_profile() -> None:
     converter = _load_converter_module()
 
@@ -633,14 +711,14 @@ def test_source_platform_writer_preserves_multi_label_document_context(
     )
 
 
-def test_source_platform_writer_rejects_nonlocal_document_ids(tmp_path: Path) -> None:
+def test_source_platform_writer_requires_every_platform_bag(tmp_path: Path) -> None:
     converter = _load_converter_module()
     writer = converter._SourcePlatformSidecarWriter(str(tmp_path / "bad"))
 
-    with pytest.raises(ValueError, match="row-local IDs 1..2"):
+    with pytest.raises(ValueError, match="1 row-local documents.*2 source platform"):
         writer.append(
             [[2], [3]],
-            doc_ids=[7, 7, 8, 8],
+            doc_ids=[1, 1, 1, 1],
             token_count=4,
             shard_path="shard.parquet",
             row_idx=0,
@@ -1173,8 +1251,66 @@ def test_explicit_mmididx_writer_trims_padding_and_all_sidecars(tmp_path: Path) 
     )
 
 
+def test_mmididx_failed_publish_preserves_complete_previous_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    converter = _load_converter_module()
+    input_dir = tmp_path / "parquet"
+    input_dir.mkdir()
+    pq.write_table(
+        _case5_table(pa, converter, _minimal_case5_rows(converter)),
+        input_dir / "repo.parquet",
+    )
+    output_prefix = tmp_path / "stable_train"
+    conversion_args = {
+        "input_dir": str(input_dir),
+        "output_prefix": str(output_prefix),
+        "split": "all",
+        "token_column": "auto",
+        "length_column": "auto",
+        "writer_backend": "mmididx",
+    }
+    converter.convert_parquet_to_megatron(**conversion_args)
+    old_files = converter._generation_members(tmp_path, output_prefix.name)
+    old_generation = {path.name: path.read_bytes() for path in old_files}
+    assert {"stable_train.bin", "stable_train.idx", "stable_train.json"} <= set(
+        old_generation
+    )
+    assert "stable_train_source_identity_registry.sqlite" in old_generation
+
+    real_replace = converter.os.replace
+    failed = False
+
+    def _crash_during_publish(source: object, destination: object) -> None:
+        nonlocal failed
+        source_path = Path(source)  # type: ignore[arg-type]
+        if (
+            not failed
+            and source_path.parent.name.startswith(".stable_train.stage-")
+            and source_path.name == "stable_train.idx"
+        ):
+            failed = True
+            raise OSError("simulated publish crash")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(converter.os, "replace", _crash_during_publish)
+
+    with pytest.raises(OSError, match="simulated publish crash"):
+        converter.convert_parquet_to_megatron(**conversion_args)
+
+    assert failed
+    current_files = converter._generation_members(tmp_path, output_prefix.name)
+    assert {path.name: path.read_bytes() for path in current_files} == old_generation
+    assert not list(tmp_path.glob(".stable_train.stage-*"))
+    assert not list(tmp_path.glob(".stable_train.rollback-*"))
+
+
 def test_mmididx_writer_binds_pre_materialized_objective_contract(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
@@ -1233,6 +1369,32 @@ def test_mmididx_writer_binds_pre_materialized_objective_contract(
     pq.write_table(table, input_dir / "objectives.parquet")
     artifact_path = _write_objective_artifact(input_dir)
     output_prefix = tmp_path / "objective_train"
+    bound_shard = (input_dir / "objectives.parquet").resolve()
+    verifications: list[tuple[Path, bool]] = []
+    real_verify = converter.verify_objective_materialization_shard
+
+    def _forbid_reglob(*args: object, **kwargs: object) -> list[str]:
+        raise AssertionError("objective artifact conversion must not re-glob shards")
+
+    def _track_verification(
+        artifact: object,
+        shard_path: str,
+        *,
+        previous_stat: object = None,
+    ) -> object:
+        verifications.append((Path(shard_path).resolve(), previous_stat is not None))
+        return real_verify(
+            artifact,
+            shard_path,
+            previous_stat=previous_stat,
+        )
+
+    monkeypatch.setattr(converter, "find_parquet_shards", _forbid_reglob)
+    monkeypatch.setattr(
+        converter,
+        "verify_objective_materialization_shard",
+        _track_verification,
+    )
 
     converter.convert_parquet_to_megatron(
         input_dir=str(input_dir),
@@ -1243,6 +1405,8 @@ def test_mmididx_writer_binds_pre_materialized_objective_contract(
         objective_artifact_path=str(artifact_path),
         writer_backend="mmididx",
     )
+
+    assert verifications == [(bound_shard, False), (bound_shard, True)]
 
     manifest = json.loads(output_prefix.with_suffix(".json").read_text())
     assert manifest["objective_contract"]["payload"] == _objective_contract()

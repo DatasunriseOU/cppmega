@@ -29,9 +29,13 @@ from array import array
 from collections.abc import Mapping
 import hashlib
 import json
+import math
+from numbers import Integral, Real
 import os
+import shutil
 import sqlite3
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, cast
@@ -58,6 +62,7 @@ from cppmega.megatron.objective_contract import (
     load_objective_materialization_artifact,
     materialized_objective_artifact_manifest,
     validate_objective_contract,
+    verify_objective_materialization_shard,
 )
 from cppmega.megatron.domain_route_contract import (  # noqa: E402
     CASE5_SCHEMA_METADATA_KEY,
@@ -303,6 +308,99 @@ def _resolve_sidecar_dtype(dtype_str: str) -> np.dtype:
         return np.dtype(_SIDECAR_DTYPE_MAP[dtype_str])
     except KeyError as exc:
         raise ValueError(f"unsupported sidecar dtype: {dtype_str}") from exc
+
+
+def _validated_token_sidecar_array(
+    values: object,
+    dtype: np.dtype,
+    *,
+    column: str,
+    where: str,
+) -> np.ndarray:
+    """Cast a token sidecar only after proving integrality and dtype range."""
+
+    target = np.dtype(dtype)
+    if target.kind not in {"i", "u"}:
+        raise ValueError(f"token sidecar {column} has non-integer dtype {target.name}")
+    raw = np.asarray(values)
+    if raw.size == 0:
+        return raw.astype(target, copy=False)
+
+    if raw.dtype.kind in {"i", "u", "b"}:
+        minimum = int(raw.min())
+        maximum = int(raw.max())
+        normalized = raw
+    elif raw.dtype.kind == "f":
+        if not np.all(np.isfinite(raw)) or not np.all(raw == np.trunc(raw)):
+            raise ValueError(
+                f"token sidecar {column} must contain finite integral values "
+                f"before cast to {target.name} at {where}"
+            )
+        minimum = int(raw.min())
+        maximum = int(raw.max())
+        normalized = raw
+    else:
+        normalized_values: list[int] = []
+        for value in raw.reshape(-1):
+            if isinstance(value, (bool, np.bool_)):
+                normalized_values.append(int(value))
+                continue
+            if isinstance(value, Integral):
+                normalized_values.append(int(value))
+                continue
+            if isinstance(value, Real):
+                numeric = float(value)
+                if math.isfinite(numeric) and numeric.is_integer():
+                    normalized_values.append(int(value))
+                    continue
+            raise ValueError(
+                f"token sidecar {column} must contain finite integral values "
+                f"before cast to {target.name} at {where}; got {value!r}"
+            )
+        minimum = min(normalized_values)
+        maximum = max(normalized_values)
+        normalized = np.asarray(normalized_values, dtype=object).reshape(raw.shape)
+
+    info = np.iinfo(target)
+    if minimum < info.min or maximum > info.max:
+        raise ValueError(
+            f"token sidecar {column} values [{minimum}, {maximum}] are outside "
+            f"{target.name} range [{info.min}, {info.max}] at {where}"
+        )
+    return normalized.astype(target, copy=False)
+
+
+def _require_contiguous_doc_ids(
+    values: object,
+    *,
+    token_count: int,
+    where: str,
+    expected_document_count: int | None = None,
+) -> np.ndarray:
+    docs = _validated_token_sidecar_array(
+        values,
+        np.dtype(np.uint32),
+        column="doc_ids",
+        where=where,
+    ).reshape(-1)
+    if len(docs) < token_count or token_count <= 0:
+        raise ValueError(
+            f"doc_ids must cover {token_count} valid tokens at {where}; got {len(docs)}"
+        )
+    valid = docs[:token_count]
+    transitions = np.diff(valid.astype(np.int64, copy=False))
+    if valid[0] != 1 or np.any((transitions != 0) & (transitions != 1)):
+        raise ValueError(
+            "doc_ids must be contiguous, non-reused row-local IDs 1..N "
+            f"at {where}; got {valid.tolist()}"
+        )
+    document_count = int(valid[-1])
+    if expected_document_count is not None and document_count != expected_document_count:
+        raise ValueError(
+            f"doc_ids cover {document_count} row-local documents but "
+            f"{expected_document_count} source platform bags exist at {where}"
+        )
+    return valid
 
 
 def _require_symbol_sidecar_dtypes(
@@ -1408,17 +1506,12 @@ class _SourcePlatformSidecarWriter:
                 f"doc_ids length {len(doc_ids)} < valid token count {token_count} at "
                 f"{shard_path}#row{row_idx}"
             )
-        valid_doc_ids = [int(value) for value in doc_ids[:token_count]]
-        if not valid_doc_ids:
-            raise ValueError(f"empty valid doc_ids at {shard_path}#row{row_idx}")
-        expected_doc_ids = set(range(1, len(groups) + 1))
-        actual_doc_ids = set(valid_doc_ids)
-        if actual_doc_ids != expected_doc_ids:
-            raise ValueError(
-                f"doc_ids must reference every source platform bag exactly by row-local "
-                f"IDs 1..{len(groups)} at {shard_path}#row{row_idx}; "
-                f"got {sorted(actual_doc_ids)}"
-            )
+        _require_contiguous_doc_ids(
+            doc_ids,
+            token_count=token_count,
+            expected_document_count=len(groups),
+            where=f"{shard_path}#row{row_idx}",
+        )
 
         for source_doc_index, raw_ids in enumerate(groups):
             ids = raw_ids.as_py() if hasattr(raw_ids, "as_py") else raw_ids
@@ -1602,12 +1695,11 @@ def _count_objective_graph_edges(
     shard_path: str,
     row_idx: int,
 ) -> int:
-    docs = np.asarray(document_ids).reshape(-1)
-    if len(docs) < input_length or np.any(docs[:input_length] <= 0):
-        raise ValueError(
-            f"doc_ids must be positive and aligned for graph accounting at "
-            f"{shard_path}#row{row_idx}"
-        )
+    docs = _require_contiguous_doc_ids(
+        document_ids,
+        token_count=input_length,
+        where=f"{shard_path}#row{row_idx}",
+    )
     starts = values.get("token_chunk_starts")
     ends = values.get("token_chunk_ends")
     pairs: set[tuple[int, int]] = set()
@@ -1756,7 +1848,7 @@ def _add_case5_manifest(
     }
 
 
-def _convert_parquet_to_numpy(
+def _write_parquet_to_numpy_generation(
     input_dir: str,
     output_prefix: str,
     split: str,
@@ -1769,9 +1861,12 @@ def _convert_parquet_to_numpy(
     source_platform_sidecar: bool | None = None,
     objective_contract: ValidatedObjectiveContract | None = None,
     objective_artifact_manifest: Mapping[str, object] | None = None,
+    objective_artifact: ObjectiveMaterializationArtifact | None = None,
+    shards: list[str] | None = None,
+    reported_output_prefix: str | None = None,
     vocab_size: int = 65536,
 ) -> None:
-    """Fallback: write Megatron-compatible .bin + .idx using raw numpy.
+    """Write one staged Megatron-compatible .bin + .idx generation.
 
     Format:
     - .bin: contiguous flat array of all token IDs
@@ -1784,7 +1879,23 @@ def _convert_parquet_to_numpy(
     dtype = _resolve_output_dtype(dtype_str)
     dtype_code = _megatron_dtype_code(dtype)
 
-    shards = find_parquet_shards(input_dir, split)
+    if objective_artifact is not None:
+        artifact_shards = [str(path) for path in objective_artifact.parquet_paths]
+        if shards is not None and [
+            str(Path(path).resolve()) for path in shards
+        ] != artifact_shards:
+            raise ValueError(
+                "supplied shards differ from objective artifact parquet_paths"
+            )
+        shards = artifact_shards
+    else:
+        shards = (
+            list(shards)
+            if shards is not None
+            else find_parquet_shards(input_dir, split)
+        )
+    if not shards:
+        raise FileNotFoundError(f"no parquet shards supplied for {input_dir}")
     token_column = _resolve_token_column(shards, token_column)
     length_column = _resolve_length_column(shards, length_column)
     symbol_identity_schema_version = _require_symbol_identity_schema(shards)
@@ -1808,7 +1919,10 @@ def _convert_parquet_to_numpy(
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    side_dtypes = {col: np.dtype(dt) for col, dt in zip(side_channels or [], side_channel_dtypes or [], strict=True)}
+    side_dtypes = {
+        col: _resolve_sidecar_dtype(dt)
+        for col, dt in zip(side_channels or [], side_channel_dtypes or [], strict=True)
+    }
     t0 = time.time()
 
     graph_writers = _GraphSidecarWriters(output_prefix, graph_sidecars) if graph_sidecars else None
@@ -1862,6 +1976,13 @@ def _convert_parquet_to_numpy(
     try:
         with open(bin_path, "wb") as bin_fh:
             for shard_idx, shard_path in enumerate(shards):
+                verified_stat = (
+                    verify_objective_materialization_shard(
+                        objective_artifact, shard_path
+                    )
+                    if objective_artifact is not None
+                    else None
+                )
                 pf = pq.ParquetFile(shard_path)
                 for rg_idx in range(pf.metadata.num_row_groups):
                     table = pf.read_row_group(rg_idx, columns=columns_to_read)
@@ -1937,6 +2058,12 @@ def _convert_parquet_to_numpy(
                         side_matrices[col] = side_matrix
 
                     for row_idx, token_count in enumerate(lengths.tolist()):
+                        if "doc_ids" in side_matrices:
+                            _require_contiguous_doc_ids(
+                                side_matrices["doc_ids"][row_idx],
+                                token_count=token_count,
+                                where=f"{shard_path}#row{row_idx}",
+                            )
                         _validate_domain_route_sidecars(
                             token_matrix[row_idx, :token_count],
                             {
@@ -1957,8 +2084,11 @@ def _convert_parquet_to_numpy(
 
                     for col in (side_channels or []):
                         side_matrix = side_matrices[col]
-                        flat_side = side_matrix[valid_mask].astype(
-                            side_dtypes[col], copy=False
+                        flat_side = _validated_token_sidecar_array(
+                            side_matrix[valid_mask],
+                            side_dtypes[col],
+                            column=col,
+                            where=f"{shard_path}#row_group{rg_idx}",
                         )
                         flat_side.tofile(side_writers[col])
                         if col == "loss_mask":
@@ -2017,6 +2147,13 @@ def _convert_parquet_to_numpy(
                     group_tokens = int(lengths.sum(dtype=np.int64))
                     total_tokens += group_tokens
                     source_capacity_tokens += row_count * capacity
+                if objective_artifact is not None:
+                    assert verified_stat is not None
+                    verify_objective_materialization_shard(
+                        objective_artifact,
+                        shard_path,
+                        previous_stat=verified_stat,
+                    )
                 if (shard_idx + 1) % 10 == 0 or shard_idx + 1 == len(shards):
                     print(
                         f"  read {shard_idx + 1}/{len(shards)} shards, "
@@ -2116,8 +2253,126 @@ def _convert_parquet_to_numpy(
     elapsed = time.time() - t0
     bin_size = os.path.getsize(bin_path) / (1024**3)
     print(f"\n{split}: {len(sizes_arr)} docs, {total_tokens:,} tokens, {bin_size:.2f} GiB in {elapsed:.1f}s")
-    print(f"output: {bin_path} + {idx_path}")
+    reported_prefix = reported_output_prefix or output_prefix
+    print(f"output: {reported_prefix}.bin + {reported_prefix}.idx")
     return
+
+
+def _generation_members(directory: Path, prefix_name: str) -> list[Path]:
+    core_names = {f"{prefix_name}.bin", f"{prefix_name}.idx", f"{prefix_name}.json"}
+    sidecar_prefix = f"{prefix_name}_"
+    sidecar_suffixes = {".bin", ".sqlite", ".sqlite3"}
+    return sorted(
+        (
+            path
+            for path in directory.iterdir()
+            if path.is_file()
+            and (
+                path.name in core_names
+                or (
+                    path.name.startswith(sidecar_prefix)
+                    and path.suffix in sidecar_suffixes
+                )
+            )
+        ),
+        key=lambda path: path.name,
+    )
+
+
+def _publish_staged_generation(staged_prefix: str, output_prefix: str) -> None:
+    staged = Path(staged_prefix)
+    output = Path(output_prefix)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staged_files = _generation_members(staged.parent, staged.name)
+    staged_names = {path.name for path in staged_files}
+    required = {f"{output.name}.bin", f"{output.name}.idx", f"{output.name}.json"}
+    if staged.name != output.name:
+        raise ValueError("staged and published generation prefixes must share a basename")
+    missing = sorted(required - staged_names)
+    if missing:
+        raise RuntimeError(f"staged mmididx generation is incomplete; missing={missing}")
+
+    old_files = _generation_members(output.parent, output.name)
+    old_names = {path.name for path in old_files}
+    backup_dir = Path(
+        tempfile.mkdtemp(prefix=f".{output.name}.rollback-", dir=output.parent)
+    )
+    backups = {path.name: backup_dir / path.name for path in old_files}
+    try:
+        for old_path in old_files:
+            os.replace(old_path, backups[old_path.name])
+        for staged_path in staged_files:
+            os.replace(staged_path, output.parent / staged_path.name)
+    except BaseException as publish_error:
+        rollback_errors: list[Exception] = []
+        for name in staged_names - old_names:
+            try:
+                (output.parent / name).unlink(missing_ok=True)
+            except Exception as exc:  # pragma: no cover - catastrophic filesystem error
+                rollback_errors.append(exc)
+        for name in sorted(old_names):
+            backup_path = backups[name]
+            if not backup_path.exists():
+                continue
+            try:
+                os.replace(backup_path, output.parent / name)
+            except Exception as exc:  # pragma: no cover - catastrophic filesystem error
+                rollback_errors.append(exc)
+        if rollback_errors:
+            raise RuntimeError(
+                f"failed to roll back mmididx generation; preserved backup={backup_dir}"
+            ) from publish_error
+        shutil.rmtree(backup_dir)
+        raise
+    else:
+        shutil.rmtree(backup_dir)
+
+
+def _convert_parquet_to_numpy(
+    input_dir: str,
+    output_prefix: str,
+    split: str,
+    token_column: str,
+    dtype_str: str,
+    length_column: str | None = None,
+    side_channels: list[str] | None = None,
+    side_channel_dtypes: list[str] | None = None,
+    graph_sidecars: tuple[tuple[str, str, str], ...]
+    | None = DEFAULT_CPPMEGA_GRAPH_SIDECARS,
+    source_platform_sidecar: bool | None = None,
+    objective_contract: ValidatedObjectiveContract | None = None,
+    objective_artifact_manifest: Mapping[str, object] | None = None,
+    objective_artifact: ObjectiveMaterializationArtifact | None = None,
+    shards: list[str] | None = None,
+    vocab_size: int = 65536,
+) -> None:
+    """Build and transactionally publish one complete mmididx generation."""
+
+    output = Path(output_prefix)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{output.name}.stage-", dir=output.parent
+    ) as stage_dir:
+        staged_prefix = str(Path(stage_dir) / output.name)
+        _write_parquet_to_numpy_generation(
+            input_dir=input_dir,
+            output_prefix=staged_prefix,
+            split=split,
+            token_column=token_column,
+            dtype_str=dtype_str,
+            length_column=length_column,
+            side_channels=side_channels,
+            side_channel_dtypes=side_channel_dtypes,
+            graph_sidecars=graph_sidecars,
+            source_platform_sidecar=source_platform_sidecar,
+            objective_contract=objective_contract,
+            objective_artifact_manifest=objective_artifact_manifest,
+            objective_artifact=objective_artifact,
+            shards=shards,
+            reported_output_prefix=output_prefix,
+            vocab_size=vocab_size,
+        )
+        _publish_staged_generation(staged_prefix, output_prefix)
 
 
 def convert_parquet_to_megatron(
@@ -2202,6 +2457,11 @@ def convert_parquet_to_megatron(
         objective_contract = None
 
     assert input_dir is not None
+    bound_shards = (
+        [str(path) for path in objective_artifact.parquet_paths]
+        if objective_artifact is not None
+        else None
+    )
 
     if writer_backend == "mmididx":
         return _convert_parquet_to_numpy(
@@ -2217,6 +2477,8 @@ def convert_parquet_to_megatron(
             source_platform_sidecar=source_platform_sidecar,
             objective_contract=objective_contract,
             objective_artifact_manifest=objective_artifact_manifest,
+            objective_artifact=objective_artifact,
+            shards=bound_shards,
             vocab_size=vocab_size,
         )
     if writer_backend != "megatron":
@@ -2240,7 +2502,11 @@ def convert_parquet_to_megatron(
             "which emits an incompatible on-disk format."
         ) from e
 
-    shards = find_parquet_shards(input_dir, split)
+    shards = (
+        list(bound_shards)
+        if bound_shards is not None
+        else find_parquet_shards(input_dir, split)
+    )
     token_column = _resolve_token_column(shards, token_column)
     length_column = _resolve_length_column(shards, length_column)
     symbol_identity_schema_version = _require_symbol_identity_schema(shards)
@@ -2277,7 +2543,7 @@ def convert_parquet_to_megatron(
         for col, dt_str in zip(side_channels, side_channel_dtypes or [], strict=True):
             side_bin_path = f"{output_prefix}_{col}.bin"
             side_writers[col] = open(side_bin_path, "wb")
-            side_dtypes[col] = np.dtype(dt_str)
+            side_dtypes[col] = _resolve_sidecar_dtype(dt_str)
 
     graph_writers = _GraphSidecarWriters(output_prefix, graph_sidecars) if graph_sidecars else None
     source_platform_writer = (
@@ -2325,6 +2591,11 @@ def convert_parquet_to_megatron(
 
     try:
         for shard_idx, shard_path in enumerate(shards):
+            verified_stat = (
+                verify_objective_materialization_shard(objective_artifact, shard_path)
+                if objective_artifact is not None
+                else None
+            )
             pf = pq.ParquetFile(shard_path)
             for rg_idx in range(pf.metadata.num_row_groups):
                 table = pf.read_row_group(rg_idx, columns=columns_to_read)
@@ -2376,6 +2647,12 @@ def convert_parquet_to_megatron(
                             row_idx=row_idx,
                         )
                         trimmed_side_values[col] = side_val[:token_count]
+                    if "doc_ids" in trimmed_side_values:
+                        _require_contiguous_doc_ids(
+                            trimmed_side_values["doc_ids"],
+                            token_count=token_count,
+                            where=f"{shard_path}#row{row_idx}",
+                        )
                     _validate_domain_route_sidecars(
                         token_ids,
                         {
@@ -2392,7 +2669,12 @@ def convert_parquet_to_megatron(
                     # Write aligned side channel values
                     for col in (side_channels or []):
                         trimmed_side = trimmed_side_values[col]
-                        arr_side = np.array(trimmed_side, dtype=side_dtypes[col])
+                        arr_side = _validated_token_sidecar_array(
+                            trimmed_side,
+                            side_dtypes[col],
+                            column=col,
+                            where=f"{shard_path}#row{row_idx}",
+                        )
                         arr_side.tofile(side_writers[col])
                         if col == "loss_mask":
                             trained_tokens += sum(int(value) for value in trimmed_side)
@@ -2443,6 +2725,13 @@ def convert_parquet_to_megatron(
                     total_tokens += len(arr)
                     source_capacity_tokens += len(raw_token_ids)
 
+            if objective_artifact is not None:
+                assert verified_stat is not None
+                verify_objective_materialization_shard(
+                    objective_artifact,
+                    shard_path,
+                    previous_stat=verified_stat,
+                )
             elapsed = time.time() - t0
             print(
                 f"  shard {shard_idx + 1}/{len(shards)}: "

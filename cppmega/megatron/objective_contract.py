@@ -164,6 +164,9 @@ class ObjectiveMaterializationArtifact:
     file_sha256: str
 
 
+ObjectiveShardStat = tuple[int, int, int, int, int]
+
+
 def validate_objective_contract(
     raw_contract: Mapping[str, Any],
 ) -> ValidatedObjectiveContract:
@@ -232,10 +235,17 @@ def validate_objective_contract(
             f"samples={total_samples}, window={window}"
         )
     window_quotas = _hamilton_quotas(rates, task_order, window)
+    zero_required_quotas = sorted(
+        task
+        for task in REQUIRED_PRODUCTION_OBJECTIVES
+        if window_quotas[task] == 0
+    )
+    if zero_required_quotas:
+        raise ValueError(
+            "required objectives must have a nonzero planned quota in every "
+            f"Hamilton window: {zero_required_quotas}"
+        )
     window_count = total_samples // window
-    expected_planned = {
-        task: quota * window_count for task, quota in window_quotas.items()
-    }
 
     planned = _mapping(contract.get("planned_samples"), where="planned_samples")
     if set(planned) != set(task_order):
@@ -246,10 +256,34 @@ def validate_objective_contract(
         )
         for task in task_order
     }
-    if planned_samples != expected_planned:
+    zero_required_planned = sorted(
+        task
+        for task in REQUIRED_PRODUCTION_OBJECTIVES
+        if planned_samples[task] == 0
+    )
+    if zero_required_planned:
         raise ValueError(
-            "planned_samples do not match deterministic Hamilton quotas: "
-            f"expected={expected_planned}, got={planned_samples}"
+            "required objectives must have nonzero planned_samples: "
+            f"{zero_required_planned}"
+        )
+    non_window_aligned = {
+        task: samples
+        for task, samples in planned_samples.items()
+        if samples % window_count
+    }
+    if non_window_aligned:
+        raise ValueError(
+            "planned_samples cannot be represented by identical Hamilton quota "
+            f"windows: window_count={window_count}, values={non_window_aligned}"
+        )
+    planned_per_window = {
+        task: samples // window_count for task, samples in planned_samples.items()
+    }
+    if planned_per_window != window_quotas:
+        raise ValueError(
+            "planned_samples do not match the deterministic Hamilton schedule "
+            f"in every quota window: expected={window_quotas}, "
+            f"got={planned_per_window}"
         )
 
     realized = _mapping(contract.get("realized"), where="realized")
@@ -391,6 +425,54 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _stat_signature(value: os.stat_result) -> ObjectiveShardStat:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def verify_objective_materialization_shard(
+    artifact: ObjectiveMaterializationArtifact,
+    shard_path: str | os.PathLike[str],
+    *,
+    previous_stat: ObjectiveShardStat | None = None,
+) -> ObjectiveShardStat:
+    """Re-verify one bound parquet and detect replacement during consumption."""
+
+    path = Path(shard_path).resolve()
+    try:
+        index = artifact.parquet_paths.index(path)
+    except ValueError as exc:
+        raise ValueError(f"parquet shard is not bound by objective artifact: {path}") from exc
+    raw_binding = artifact.payload["parquet_shards"][index]
+    binding = _mapping(raw_binding, where=f"parquet_shards[{index}]")
+    if binding.get("path") != path.name:
+        raise ValueError(f"parquet_shards[{index}].path no longer matches artifact")
+
+    before = path.stat()
+    digest = _file_sha256(path)
+    after = path.stat()
+    before_signature = _stat_signature(before)
+    after_signature = _stat_signature(after)
+    if before_signature != after_signature:
+        raise ValueError(
+            f"parquet_shards[{index}] changed while its bytes were being verified"
+        )
+    if after.st_size != binding.get("size_bytes"):
+        raise ValueError(f"parquet_shards[{index}].size_bytes does not match")
+    if digest != binding.get("sha256"):
+        raise ValueError(f"parquet_shards[{index}].sha256 does not match")
+    if previous_stat is not None and after_signature != previous_stat:
+        raise ValueError(
+            f"parquet_shards[{index}] stat changed while the shard was consumed"
+        )
+    return after_signature
 
 
 def load_objective_materialization_artifact(
@@ -824,6 +906,7 @@ __all__ = [
     "ValidatedObjectiveContract",
     "load_objective_materialization_artifact",
     "materialized_objective_artifact_manifest",
+    "verify_objective_materialization_shard",
     "validate_materialized_objective_artifact",
     "validate_materialized_objective_contract",
     "validate_objective_contract",
