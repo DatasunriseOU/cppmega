@@ -291,12 +291,26 @@ def _load_env_file(path: Path) -> None:
 
 def _s3_env() -> dict[str, str]:
     env = os.environ.copy()
-    access = env.get("NEBIUS_S3_ACCESS_KEY_ID") or env.get("AWS_ACCESS_KEY_ID")
-    secret = env.get("NEBIUS_S3_SECRET_ACCESS_KEY") or env.get("AWS_SECRET_ACCESS_KEY")
+    nebius_access_name = "NEBIUS_S3_ACCESS_KEY_ID"
+    nebius_secret_name = "NEBIUS_S3_SECRET_ACCESS_KEY"
+    if nebius_access_name in env or nebius_secret_name in env:
+        access = env.get(nebius_access_name)
+        secret = env.get(nebius_secret_name)
+        if not access or not secret:
+            raise SystemExit(
+                "a complete Nebius S3 credential pair is required when either "
+                "NEBIUS_S3 credential is set"
+            )
+        env["AWS_ACCESS_KEY_ID"] = access
+        env["AWS_SECRET_ACCESS_KEY"] = secret
+        env.pop("AWS_SESSION_TOKEN", None)
+        env.pop("AWS_SECURITY_TOKEN", None)
+        return env
+
+    access = env.get("AWS_ACCESS_KEY_ID")
+    secret = env.get("AWS_SECRET_ACCESS_KEY")
     if not access or not secret:
-        raise SystemExit("missing Nebius S3 access/secret credentials")
-    env["AWS_ACCESS_KEY_ID"] = access
-    env["AWS_SECRET_ACCESS_KEY"] = secret
+        raise SystemExit("a complete AWS S3 credential pair is required")
     return env
 
 
@@ -2119,24 +2133,21 @@ def _head(
 
 
 def _head_matches(head: dict | None, *, size: int, sha256: str) -> bool:
-    if not head or int(head.get("ContentLength", -1)) != size:
+    if (
+        not head
+        or SHA256_RE.fullmatch(sha256) is None
+        or int(head.get("ContentLength", -1)) != size
+    ):
         return False
     metadata = {
         str(key).lower(): value for key, value in (head.get("Metadata") or {}).items()
     }
     if metadata.get("sha256") != sha256:
         return False
-    remote_checksum = head.get("ChecksumSHA256")
-    if remote_checksum is None:
-        return True
+    if head.get("ChecksumType") not in (None, "FULL_OBJECT"):
+        return False
     expected_checksum = base64.b64encode(bytes.fromhex(sha256)).decode("ascii")
-    if remote_checksum == expected_checksum:
-        return True
-    return bool(
-        head.get("ChecksumType") == "COMPOSITE"
-        and isinstance(remote_checksum, str)
-        and re.fullmatch(r"[A-Za-z0-9+/]+=*-[1-9][0-9]*", remote_checksum)
-    )
+    return head.get("ChecksumSHA256") == expected_checksum
 
 
 def _multipart_layout(size: int) -> tuple[int, int]:
@@ -2181,6 +2192,30 @@ def _multipart_metadata(
         "multipart-part-size": str(part_size),
         "multipart-part-count": str(part_count),
     }
+
+
+def _multipart_layout_metadata_matches(
+    head: dict | None,
+    *,
+    size: int,
+    sha256: str,
+    part_size: int,
+    part_count: int,
+) -> bool:
+    """Check whether a HEAD is a verification candidate, not whether bytes match."""
+    if (
+        not head
+        or SHA256_RE.fullmatch(sha256) is None
+        or int(head.get("ContentLength", -1)) != size
+    ):
+        return False
+    metadata = {
+        str(key).lower(): str(value)
+        for key, value in (head.get("Metadata") or {}).items()
+    }
+    return metadata == _multipart_metadata(
+        sha256=sha256, part_size=part_size, part_count=part_count
+    )
 
 
 def _read_exact_part(
@@ -2241,17 +2276,15 @@ def _multipart_head_matches(
     checksum_sha256: str,
     etag: str | None = None,
 ) -> bool:
-    if not _head_matches(head, size=size, sha256=sha256):
-        return False
-    assert head is not None
-    metadata = {
-        str(key).lower(): str(value)
-        for key, value in (head.get("Metadata") or {}).items()
-    }
-    if metadata != _multipart_metadata(
-        sha256=sha256, part_size=part_size, part_count=part_count
+    if not _multipart_layout_metadata_matches(
+        head,
+        size=size,
+        sha256=sha256,
+        part_size=part_size,
+        part_count=part_count,
     ):
         return False
+    assert head is not None
     if (
         head.get("ChecksumType") != "COMPOSITE"
         or head.get("ChecksumSHA256") != checksum_sha256
@@ -2404,8 +2437,18 @@ def _upload_multipart_file(
     """
     uri = f"s3://{bucket}/{key}"
     part_size, part_count = _multipart_layout(size)
-    basic_existing_match = _head_matches(initial_head, size=size, sha256=sha256)
-    if initial_head is not None and not basic_existing_match and not allow_overwrite:
+    existing_verification_candidate = _multipart_layout_metadata_matches(
+        initial_head,
+        size=size,
+        sha256=sha256,
+        part_size=part_size,
+        part_count=part_count,
+    )
+    if (
+        initial_head is not None
+        and not existing_verification_candidate
+        and not allow_overwrite
+    ):
         metadata = {
             str(name).lower(): value
             for name, value in (initial_head.get("Metadata") or {}).items()
@@ -2437,7 +2480,7 @@ def _upload_multipart_file(
     try:
         with _stable_upload_snapshot(local, size=size, sha256=sha256) as snapshot:
             expected_part_checksums: list[str] | None = None
-            if basic_existing_match:
+            if existing_verification_candidate:
                 expected_part_checksums = _multipart_part_checksums(
                     snapshot,
                     size=size,

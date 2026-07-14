@@ -54,6 +54,18 @@ def _command_option(command, name):
     return command[command.index(name) + 1]
 
 
+def _clear_s3_credential_env(monkeypatch):
+    for name in (
+        "NEBIUS_S3_ACCESS_KEY_ID",
+        "NEBIUS_S3_SECRET_ACCESS_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_SECURITY_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 def _archive(tmp_path, artifact):
     raw_archive = tmp_path / "bundle.tar"
     archive = tmp_path / "bundle.tar.zst"
@@ -1483,38 +1495,135 @@ def test_validate_prefix_rejects_misaligned_graph_chunk_csr_counts(tmp_path):
         publisher._validate_prefix_manifest_contract(prefix)
 
 
-def test_head_contract_requires_size_and_sha_metadata():
-    assert _head_matches(
-        {"ContentLength": 8, "Metadata": {"sha256": "abc"}},
-        size=8,
-        sha256="abc",
-    )
-    assert not _head_matches(
-        {"ContentLength": 7, "Metadata": {"sha256": "abc"}},
-        size=8,
-        sha256="abc",
-    )
-    assert not _head_matches({"ContentLength": 8, "Metadata": {}}, size=8, sha256="abc")
+def test_s3_env_selects_nebius_credentials_and_clears_aws_tokens(monkeypatch):
+    _clear_s3_credential_env(monkeypatch)
+    monkeypatch.setenv("NEBIUS_S3_ACCESS_KEY_ID", "nebius-access")
+    monkeypatch.setenv("NEBIUS_S3_SECRET_ACCESS_KEY", "nebius-secret")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "stale-aws-access")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "stale-aws-secret")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "stale-session-token")
+    monkeypatch.setenv("AWS_SECURITY_TOKEN", "stale-security-token")
+
+    env = publisher._s3_env()
+
+    assert env["AWS_ACCESS_KEY_ID"] == "nebius-access"
+    assert env["AWS_SECRET_ACCESS_KEY"] == "nebius-secret"
+    assert "AWS_SESSION_TOKEN" not in env
+    assert "AWS_SECURITY_TOKEN" not in env
 
 
-def test_head_contract_accepts_nebius_metadata_key_casing():
-    assert _head_matches(
-        {"ContentLength": 8, "Metadata": {"Sha256": "abc"}},
-        size=8,
-        sha256="abc",
-    )
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (
+        ("NEBIUS_S3_ACCESS_KEY_ID", "partial-nebius-access"),
+        ("NEBIUS_S3_SECRET_ACCESS_KEY", "partial-nebius-secret"),
+    ),
+)
+def test_s3_env_rejects_partial_nebius_family_even_with_complete_aws(
+    monkeypatch, name, value
+):
+    _clear_s3_credential_env(monkeypatch)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "aws-access")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-secret")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "aws-session-token")
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(SystemExit) as error:
+        publisher._s3_env()
+
+    message = str(error.value)
+    assert "complete Nebius S3 credential pair" in message
+    assert value not in message
+    assert "aws-secret" not in message
+    assert "aws-session-token" not in message
 
 
-def test_head_contract_accepts_server_verified_multipart_composite_checksum():
+def test_s3_env_preserves_session_token_only_for_complete_aws_family(monkeypatch):
+    _clear_s3_credential_env(monkeypatch)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "aws-access")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-secret")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "aws-session-token")
+
+    env = publisher._s3_env()
+
+    assert env["AWS_ACCESS_KEY_ID"] == "aws-access"
+    assert env["AWS_SECRET_ACCESS_KEY"] == "aws-secret"
+    assert env["AWS_SESSION_TOKEN"] == "aws-session-token"
+
+
+def test_head_contract_requires_size_metadata_and_exact_server_sha256():
+    digest = hashlib.sha256(b"remote-bytes").hexdigest()
+    expected_checksum = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
+
     assert _head_matches(
         {
             "ContentLength": 8,
-            "Metadata": {"sha256": "a" * 64},
-            "ChecksumSHA256": "YWJjZA==-2",
+            "Metadata": {"sha256": digest},
+            "ChecksumSHA256": expected_checksum,
+        },
+        size=8,
+        sha256=digest,
+    )
+    assert not _head_matches(
+        {
+            "ContentLength": 7,
+            "Metadata": {"sha256": digest},
+            "ChecksumSHA256": expected_checksum,
+        },
+        size=8,
+        sha256=digest,
+    )
+    assert not _head_matches(
+        {
+            "ContentLength": 8,
+            "Metadata": {"sha256": "0" * 64},
+            "ChecksumSHA256": expected_checksum,
+        },
+        size=8,
+        sha256=digest,
+    )
+    assert not _head_matches(
+        {"ContentLength": 8, "Metadata": {"sha256": digest}},
+        size=8,
+        sha256=digest,
+    )
+    assert not _head_matches(
+        {"ContentLength": 8, "Metadata": {}, "ChecksumSHA256": expected_checksum},
+        size=8,
+        sha256=digest,
+    )
+
+
+def test_head_contract_accepts_nebius_metadata_key_casing():
+    digest = hashlib.sha256(b"remote-bytes").hexdigest()
+    assert _head_matches(
+        {
+            "ContentLength": 8,
+            "Metadata": {"Sha256": digest},
+            "ChecksumSHA256": base64.b64encode(bytes.fromhex(digest)).decode(
+                "ascii"
+            ),
+        },
+        size=8,
+        sha256=digest,
+    )
+
+
+def test_head_contract_rejects_arbitrary_multipart_composite_checksum():
+    digest = hashlib.sha256(b"remote-bytes").hexdigest()
+    arbitrary_composite = (
+        base64.b64encode(hashlib.sha256(b"other-part").digest()).decode("ascii")
+        + "-2"
+    )
+    assert not _head_matches(
+        {
+            "ContentLength": 8,
+            "Metadata": {"sha256": digest},
+            "ChecksumSHA256": arbitrary_composite,
             "ChecksumType": "COMPOSITE",
         },
         size=8,
-        sha256="a" * 64,
+        sha256=digest,
     )
 
 
@@ -1589,6 +1698,72 @@ def test_immutable_bundle_object_rejects_existing_remote_mismatch(
             env={},
             dry_run=False,
         )
+
+
+def test_small_existing_object_with_forged_metadata_and_no_checksum_fails_closed(
+    tmp_path, monkeypatch
+):
+    artifact, digest = _bundle(tmp_path)
+    monkeypatch.setattr(
+        publisher,
+        "_head",
+        lambda **_kwargs: {
+            "ContentLength": artifact.stat().st_size,
+            "Metadata": {"sha256": digest},
+            "ETag": '"forged-metadata"',
+        },
+    )
+
+    def forbidden_upload(*_args, **_kwargs):
+        raise AssertionError("unverified immutable object must not be uploaded")
+
+    monkeypatch.setattr(publisher.subprocess, "run", forbidden_upload)
+    with pytest.raises(RuntimeError, match="immutable remote object mismatch"):
+        _upload_file(
+            local=artifact,
+            endpoint="https://example.invalid",
+            bucket="bucket",
+            key="bundles/test-bundle/data/sample.bin",
+            size=artifact.stat().st_size,
+            sha256=digest,
+            env={},
+            dry_run=False,
+        )
+
+
+def test_small_existing_object_requires_exact_server_sha256_for_already_verified(
+    tmp_path, monkeypatch
+):
+    artifact, digest = _bundle(tmp_path)
+    expected_checksum = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
+    monkeypatch.setattr(
+        publisher,
+        "_head",
+        lambda **_kwargs: {
+            "ContentLength": artifact.stat().st_size,
+            "Metadata": {"sha256": digest},
+            "ChecksumSHA256": expected_checksum,
+            "ChecksumType": "FULL_OBJECT",
+            "ETag": '"verified"',
+        },
+    )
+
+    def forbidden_upload(*_args, **_kwargs):
+        raise AssertionError("exactly verified object must not be uploaded")
+
+    monkeypatch.setattr(publisher.subprocess, "run", forbidden_upload)
+    receipt = _upload_file(
+        local=artifact,
+        endpoint="https://example.invalid",
+        bucket="bucket",
+        key="bundles/test-bundle/data/sample.bin",
+        size=artifact.stat().st_size,
+        sha256=digest,
+        env={},
+        dry_run=False,
+    )
+
+    assert receipt["status"] == "already_verified"
 
 
 def test_small_upload_is_checksum_bound_and_create_only(tmp_path, monkeypatch):
@@ -1721,7 +1896,7 @@ def test_multipart_part_failure_aborts_and_removes_temporary_part(
     assert not list(tmp_path.glob(".cppmega-multipart-part-*"))
 
 
-def test_multipart_existing_destination_with_unverified_checksum_is_rejected(
+def test_existing_multipart_requires_locally_derived_exact_composite_checksum(
     tmp_path, monkeypatch
 ):
     artifact = tmp_path / "multipart.bin"
@@ -1729,6 +1904,13 @@ def test_multipart_existing_destination_with_unverified_checksum_is_rejected(
     digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
     _force_tiny_multipart(monkeypatch)
     part_size, part_count = publisher._multipart_layout(artifact.stat().st_size)
+    part_checksums = publisher._multipart_part_checksums(
+        artifact,
+        size=artifact.stat().st_size,
+        part_size=part_size,
+        part_count=part_count,
+    )
+    composite = publisher._multipart_composite_sha256(part_checksums)
     metadata = publisher._multipart_metadata(
         sha256=digest, part_size=part_size, part_count=part_count
     )
@@ -1738,11 +1920,57 @@ def test_multipart_existing_destination_with_unverified_checksum_is_rejected(
         lambda **_kwargs: {
             "ContentLength": artifact.stat().st_size,
             "Metadata": metadata,
-            "ChecksumSHA256": f"{'A' * 44}-{part_count}",
+            "ChecksumSHA256": composite,
             "ChecksumType": "COMPOSITE",
             "ETag": '"existing"',
         },
     )
+
+    def forbidden_command(*_args, **_kwargs):
+        raise AssertionError("an exactly verified destination must not be uploaded")
+
+    monkeypatch.setattr(publisher.subprocess, "run", forbidden_command)
+
+    receipt = _upload_file(
+        local=artifact,
+        endpoint="https://example.invalid",
+        bucket="bucket",
+        key="bundles/test-bundle/large.bin",
+        size=artifact.stat().st_size,
+        sha256=digest,
+        env={},
+        dry_run=False,
+    )
+
+    assert receipt["status"] == "already_verified"
+    assert receipt["checksum_sha256"] == composite
+    assert receipt["verification"]["metadata"] == metadata
+
+
+@pytest.mark.parametrize("checksum_state", ("missing", "arbitrary"))
+def test_multipart_existing_destination_without_exact_checksum_is_rejected(
+    tmp_path, monkeypatch, checksum_state
+):
+    artifact = tmp_path / "multipart.bin"
+    artifact.write_bytes(b"existing-destination")
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    _force_tiny_multipart(monkeypatch)
+    part_size, part_count = publisher._multipart_layout(artifact.stat().st_size)
+    metadata = publisher._multipart_metadata(
+        sha256=digest, part_size=part_size, part_count=part_count
+    )
+    head = {
+        "ContentLength": artifact.stat().st_size,
+        "Metadata": metadata,
+        "ChecksumType": "COMPOSITE",
+        "ETag": '"existing"',
+    }
+    if checksum_state == "arbitrary":
+        arbitrary = base64.b64encode(hashlib.sha256(b"forged-parts").digest()).decode(
+            "ascii"
+        )
+        head["ChecksumSHA256"] = f"{arbitrary}-{part_count}"
+    monkeypatch.setattr(publisher, "_head", lambda **_kwargs: head)
 
     def forbidden_command(*_args, **_kwargs):
         raise AssertionError("an existing immutable destination must not be replaced")
