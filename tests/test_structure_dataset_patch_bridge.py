@@ -159,6 +159,29 @@ def test_opaque_identity_tensor_preserves_full_uint64_bits():
         )
 
 
+def test_loss_mask_sidecar_requires_explicit_source_transition_alignment(tmp_path):
+    prefix = tmp_path / "train"
+    prefix.with_suffix(".bin").write_bytes(b"\0")
+    loss_path = tmp_path / "train_loss_mask.bin"
+    np.array([0], dtype=np.uint8).tofile(loss_path)
+    manifest = {
+        "side_channel_paths": {
+            "loss_mask": {"path": loss_path.name, "dtype": "uint8"}
+        }
+    }
+    manifest_path = prefix.with_suffix(".json")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    dataset = SimpleNamespace(dataset=SimpleNamespace(bin_path=f"{prefix}.bin"))
+
+    with pytest.raises(ValueError, match="loss_mask_alignment"):
+        patch._load_sidecar_manifest(dataset)
+
+    manifest["loss_mask_alignment"] = "source_token_predicts_next_v1"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _path, loaded = patch._load_sidecar_manifest(dataset)
+    assert loaded["loss_mask_alignment"] == "source_token_predicts_next_v1"
+
+
 def test_case5_training_loader_requires_success_receipt_and_registry(
     tmp_path,
     monkeypatch,

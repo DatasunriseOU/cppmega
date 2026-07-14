@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from cppmega.megatron.objective_contract import (
+    LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
     OBJECTIVE_CONTRACT_SCHEMA,
     OBJECTIVE_GRAPH_SIDECARS,
     OBJECTIVE_IDS,
@@ -178,6 +179,9 @@ def _objective_contract() -> dict[str, object]:
             "format": "shifted_lm_document_v1",
             "token_column": "input_ids",
             "loss_mask_column": "loss_mask",
+            "loss_mask_alignment": (
+                LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1
+            ),
             "length_column": "valid_token_count",
             "objective_column": "objective_kind",
             "document_id_column": "doc_ids",
@@ -227,6 +231,9 @@ def _write_objective_artifact(input_dir: Path) -> Path:
                 for column, kind, dtype in OBJECTIVE_GRAPH_SIDECARS
             ],
             "source_platform_sidecar": "require",
+            "loss_mask_alignment": (
+                LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1
+            ),
             "graph_relations": ["call", "type"],
             "graph_pair_mask": "causal_same_document_upstream_v1",
             "chunk_edge_expansion": "cartesian_token_spans_v1",
@@ -271,6 +278,28 @@ def test_objective_conversion_requires_document_id_sidecar() -> None:
             side_channels=["loss_mask"],
             graph_columns=["token_call_edges", "token_type_edges"],
         )
+
+
+def test_loss_mask_rejects_cross_document_transition() -> None:
+    converter = _load_converter_module()
+
+    with pytest.raises(ValueError, match="cross-document transitions"):
+        converter._validate_source_transition_loss_mask(
+            [1, 1, 1, 0],
+            token_count=4,
+            where="fixture#row0",
+            document_ids=[1, 1, 2, 2],
+        )
+
+    np.testing.assert_array_equal(
+        converter._validate_source_transition_loss_mask(
+            [1, 0, 1, 0],
+            token_count=4,
+            where="fixture#row1",
+            document_ids=[1, 1, 2, 2],
+        ),
+        np.array([1, 0, 1, 0], dtype=np.uint8),
+    )
 
 
 def test_objective_conversion_rejects_bare_contract(tmp_path: Path) -> None:
@@ -1373,6 +1402,9 @@ def test_explicit_mmididx_writer_trims_padding_and_all_sidecars(tmp_path: Path) 
     assert manifest["token_column"] == "input_ids"
     assert manifest["length_column"] == "valid_token_count"
     assert manifest["writer_backend"] == "mmididx"
+    assert manifest["loss_mask_alignment"] == (
+        LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1
+    )
     assert manifest["symbol_identity_schema_version"] == 3
     assert set(manifest["side_channel_paths"]) == {
         name for name, _dtype in converter.DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS
@@ -1831,7 +1863,7 @@ def test_mmididx_row_group_batching_preserves_document_order_and_offsets(
         [21, 21, 22, 22],
         [31, 0, 0, 0],
     ]
-    rows["loss_mask"] = [[1, 0, 0, 0], [1, 1, 0, 1], [0, 0, 0, 0]]
+    rows["loss_mask"] = [[1, 0, 0, 0], [1, 0, 1, 0], [0, 0, 0, 0]]
     rows["doc_ids"] = [[1, 1, 0, 0], [1, 1, 2, 2], [1, 0, 0, 0]]
     rows["token_source_identity_ids"] = [
         [int(identities[0]["source_identity_id"])] * 2 + [0, 0],
@@ -1877,7 +1909,7 @@ def test_mmididx_row_group_batching_preserves_document_order_and_offsets(
     )
     np.testing.assert_array_equal(
         np.fromfile(tmp_path / "cppmega_train_loss_mask.bin", dtype=np.uint8),
-        np.array([1, 0, 1, 1, 0, 1, 0], dtype=np.uint8),
+        np.array([1, 0, 1, 0, 1, 0, 0], dtype=np.uint8),
     )
     with output_prefix.with_suffix(".idx").open("rb") as idx:
         idx.seek(34)

@@ -171,6 +171,7 @@ _CASE5_DOMAIN_ID_ALIASES = {
 }
 
 _LOSS_MASK_ALIASES = ("loss_mask", "token_loss_mask")
+_LOSS_MASK_ALIGNMENT = "source_token_predicts_next_v1"
 
 _GRAPH_ROUTE_COLS = GRAPH_ROUTE_COLUMNS
 
@@ -596,6 +597,16 @@ def _load_sidecar_manifest(dataset: Any) -> tuple[str, dict[str, Any]]:
     json_path = _sidecar_json_path(dataset)
     with open(json_path, "r", encoding="utf-8") as f:
         sidecar = json.load(f)
+    side_paths = sidecar.get("side_channel_paths")
+    if isinstance(side_paths, dict) and any(
+        alias in side_paths for alias in _LOSS_MASK_ALIASES
+    ):
+        alignment = sidecar.get("loss_mask_alignment")
+        if alignment != _LOSS_MASK_ALIGNMENT:
+            raise ValueError(
+                f"[cppmega-patch] loss_mask sidecar in {json_path!r} requires "
+                f"loss_mask_alignment={_LOSS_MASK_ALIGNMENT!r}; got {alignment!r}"
+            )
     objective_contract = sidecar.get("objective_contract")
     objective_materialization = sidecar.get("objective_materialization")
     production_objectives = (

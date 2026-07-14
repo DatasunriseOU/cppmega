@@ -75,6 +75,7 @@ MULTIPART_PUBLICATION_PROTOCOL = "conditional-complete-v1"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 EXPECTED_BUNDLE_TOKENIZER_CONTRACT = "megacpp-vocab-65536"
 EXPECTED_PREFIX_TOKENIZER_CONTRACT = "megacpp"
+EXPECTED_LOSS_MASK_ALIGNMENT = "source_token_predicts_next_v1"
 EXPECTED_VOCAB_SIZE = 65536
 EXPECTED_GRAPH_SIDECAR_SCHEMA = "cppmega_graph_routes_v2"
 OBJECTIVE_SAMPLING_MODE_V1 = "deterministic_epoch_shuffle_v1"
@@ -521,6 +522,18 @@ def _validate_token_semantics(
         dtype="<u8",
         shape=(token_count,),
     )
+    loss_mask = np.memmap(
+        sidecar_files["loss_mask"],
+        mode="r",
+        dtype="<u1",
+        shape=(token_count,),
+    )
+    document_ids = np.memmap(
+        sidecar_files["doc_ids"],
+        mode="r",
+        dtype="<u4",
+        shape=(token_count,),
+    )
     valid_domains = frozenset(
         int(value) for value in CANONICAL_DOMAIN_SCHEMA["domain_kinds"].values()
     )
@@ -533,9 +546,41 @@ def _validate_token_semantics(
     delimiter_ids = np.asarray(sorted(_DELIMITER_BY_TOKEN_ID), dtype=tokens.dtype)
     delimiter_count = 0
     balanced_pairs = 0
+    trained_token_count = 0
     start = 0
     for sequence_index, length in enumerate(lengths):
         end = start + length
+        sequence_loss_mask = loss_mask[start:end]
+        sequence_document_ids = document_ids[start:end]
+        document_transitions = np.diff(
+            sequence_document_ids.astype(np.int64, copy=False)
+        )
+        if (
+            sequence_document_ids.size == 0
+            or int(sequence_document_ids[0]) != 1
+            or np.any((document_transitions != 0) & (document_transitions != 1))
+        ):
+            raise ValueError(
+                "doc_ids must be positive contiguous, non-reused sequence-local "
+                f"IDs 1..N in sequence {sequence_index}"
+            )
+        if np.any((sequence_loss_mask != 0) & (sequence_loss_mask != 1)):
+            raise ValueError(f"loss_mask must be binary in sequence {sequence_index}")
+        if int(sequence_loss_mask[-1]) != 0:
+            raise ValueError(
+                "source_token_predicts_next_v1 requires the final loss mask "
+                f"to be zero in sequence {sequence_index}"
+            )
+        leaking = np.flatnonzero(
+            (sequence_document_ids[:-1] != sequence_document_ids[1:])
+            & (sequence_loss_mask[:-1] != 0)
+        )
+        if leaking.size:
+            raise ValueError(
+                "loss_mask trains cross-document transitions in sequence "
+                f"{sequence_index}: source_positions={leaking[:16].tolist()}"
+            )
+        trained_token_count += int(sequence_loss_mask.sum(dtype=np.int64))
         sequence_sources = source_ids[start:end]
         if np.any(sequence_sources == 0):
             raise ValueError(
@@ -618,6 +663,7 @@ def _validate_token_semantics(
         "minimum_source_identity_id": int(source_identity_ids.min()),
         "delimiter_count": delimiter_count,
         "balanced_delimiter_pairs": balanced_pairs,
+        "trained_token_count": trained_token_count,
     }
 
 
@@ -1017,6 +1063,12 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
     side_paths = data.get("side_channel_paths")
     if not isinstance(side_paths, dict):
         raise ValueError(f"{manifest_path}: side_channel_paths must be an object")
+    if data.get("loss_mask_alignment") != EXPECTED_LOSS_MASK_ALIGNMENT:
+        raise ValueError(
+            f"{manifest_path}: loss_mask_alignment="
+            f"{data.get('loss_mask_alignment')!r}, expected "
+            f"{EXPECTED_LOSS_MASK_ALIGNMENT!r}"
+        )
     missing_sidecars = sorted(REQUIRED_TOKEN_SIDECARS - set(side_paths))
     if missing_sidecars:
         raise ValueError(f"{manifest_path}: missing token sidecars {missing_sidecars}")
@@ -1141,12 +1193,18 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
     }
     if len(chunk_item_counts) != 1:
         raise ValueError(f"{manifest_path}: graph chunk CSR item counts disagree")
-    _validate_token_semantics(
+    token_semantics = _validate_token_semantics(
         token_path=token_path,
         token_dtype=token_dtype,
         lengths=lengths,
         sidecar_files=sidecar_files,
     )
+    if int(data.get("trained_token_count", -1)) != token_semantics[
+        "trained_token_count"
+    ]:
+        raise ValueError(
+            f"{manifest_path}: trained_token_count does not match loss_mask"
+        )
     source_identity_registry_path = _validate_case5_source_registry(
         prefix=prefix,
         manifest=data,

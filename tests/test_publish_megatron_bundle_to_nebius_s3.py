@@ -254,6 +254,7 @@ def _objective_payload():
             "format": "shifted_lm_document_v1",
             "token_column": "input_ids",
             "loss_mask_column": "loss_mask",
+            "loss_mask_alignment": "source_token_predicts_next_v1",
             "length_column": "valid_token_count",
             "objective_column": "objective_kind",
             "document_id_column": "doc_ids",
@@ -497,6 +498,7 @@ def _prefix_bundle(tmp_path):
             "side_channels": [],
             "graph_sidecars": [],
             "source_platform_sidecar": "require",
+            "loss_mask_alignment": "source_token_predicts_next_v1",
             "graph_relations": ["domain"],
             "graph_pair_mask": "causal_same_document_upstream_v1",
             "chunk_edge_expansion": "cartesian_token_spans_v1",
@@ -533,8 +535,10 @@ def _prefix_bundle(tmp_path):
         "tokenizer_contract": "megacpp",
         "dtype": "uint16",
         "token_count": token_count,
+        "trained_token_count": 13,
         "document_count": document_count,
         "graph_sidecar_schema": "cppmega_graph_routes_v2",
+        "loss_mask_alignment": "source_token_predicts_next_v1",
         "side_channel_paths": side_channel_paths,
         "graph_sidecar_paths": graph_sidecar_paths,
         "source_platform_sidecar": source_platform,
@@ -1070,6 +1074,29 @@ def test_validate_prefix_rejects_noncanonical_attention_doc_ids(
         publisher._validate_prefix_manifest_contract(prefix)
 
 
+def test_validate_prefix_rejects_missing_loss_mask_alignment(tmp_path):
+    prefix = _prefix_bundle(tmp_path)
+    manifest = json.loads(prefix.with_suffix(".json").read_text(encoding="utf-8"))
+    manifest.pop("loss_mask_alignment")
+    prefix.with_suffix(".json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="loss_mask_alignment"):
+        publisher._validate_prefix_manifest_contract(prefix)
+
+
+def test_validate_prefix_rejects_trained_cross_document_label(tmp_path):
+    prefix = _prefix_bundle(tmp_path)
+    manifest = json.loads(prefix.with_suffix(".json").read_text(encoding="utf-8"))
+    doc_spec = manifest["side_channel_paths"]["doc_ids"]
+    doc_path = prefix.parent / doc_spec["path"]
+    doc_values = list(struct.unpack("<24I", doc_path.read_bytes()))
+    doc_values[:4] = [1, 1, 2, 2]
+    doc_path.write_bytes(struct.pack("<24I", *doc_values))
+
+    with pytest.raises(ValueError, match="cross-document transitions"):
+        publisher._validate_prefix_manifest_contract(prefix)
+
+
 def test_validate_prefix_matches_attention_segments_to_source_platform_csr(tmp_path):
     prefix = _prefix_bundle(tmp_path)
     manifest = json.loads(prefix.with_suffix(".json").read_text(encoding="utf-8"))
@@ -1078,6 +1105,13 @@ def test_validate_prefix_matches_attention_segments_to_source_platform_csr(tmp_p
     values = list(struct.unpack("<24I", path.read_bytes()))
     values[:4] = [1, 1, 2, 2]
     path.write_bytes(struct.pack("<24I", *values))
+    loss_spec = manifest["side_channel_paths"]["loss_mask"]
+    loss_path = prefix.parent / loss_spec["path"]
+    loss_values = list(loss_path.read_bytes())
+    loss_values[:4] = [1, 0, 1, 0]
+    loss_path.write_bytes(bytes(loss_values))
+    manifest["trained_token_count"] = 12
+    prefix.with_suffix(".json").write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(ValueError, match="doc_ids cover 2.*source platform.*1"):
         publisher._validate_prefix_manifest_contract(prefix)
@@ -1154,6 +1188,12 @@ def test_validate_bundle_rejects_edge_across_attention_document_boundary(tmp_pat
     doc_ids = [1] * 24
     doc_ids[1:4] = [2, 2, 2]
     (prefix.parent / doc_spec["path"]).write_bytes(struct.pack("<24I", *doc_ids))
+    loss_spec = prefix_manifest["side_channel_paths"]["loss_mask"]
+    loss_path = prefix.parent / loss_spec["path"]
+    loss_values = list(loss_path.read_bytes())
+    loss_values[:4] = [0, 1, 1, 0]
+    loss_path.write_bytes(bytes(loss_values))
+    prefix_manifest["trained_token_count"] = 12
 
     platform = prefix_manifest["source_platform_sidecar"]
     (prefix.parent / platform["sequence_doc_offsets_path"]).write_bytes(

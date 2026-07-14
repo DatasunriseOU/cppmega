@@ -56,6 +56,7 @@ from cppmega.symbol_identity import (  # noqa: E402
     compute_symbol_id,
 )
 from cppmega.megatron.objective_contract import (  # noqa: E402
+    LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
     OBJECTIVE_GRAPH_SIDECARS,
     OBJECTIVE_TOKEN_SIDE_CHANNELS,
     ObjectiveMaterializationArtifact,
@@ -420,6 +421,54 @@ def _require_contiguous_doc_ids(
             f"doc_ids cover {document_count} row-local documents but "
             f"{expected_document_count} source platform bags exist at {where}"
         )
+    return valid
+
+
+def _validate_source_transition_loss_mask(
+    values: object,
+    *,
+    token_count: int,
+    where: str,
+    document_ids: object | None = None,
+) -> np.ndarray:
+    """Validate source-token mask semantics used by Megatron and MLX readers."""
+
+    mask_array = _validated_token_sidecar_array(
+        values,
+        np.dtype(np.uint8),
+        column="loss_mask",
+        where=where,
+    )
+    if mask_array.ndim != 1:
+        raise ValueError(f"loss_mask must be one-dimensional at {where}")
+    mask = mask_array.reshape(-1)
+    if token_count < 1 or len(mask) < token_count:
+        raise ValueError(
+            f"loss_mask must cover every materialized token at {where}; "
+            f"token_count={token_count} mask_length={len(mask)}"
+        )
+    valid = mask[:token_count]
+    if np.any((valid != 0) & (valid != 1)):
+        raise ValueError(f"loss_mask must be binary at {where}")
+    if int(valid[-1]) != 0:
+        raise ValueError(
+            "source_token_predicts_next_v1 requires a zero loss mask on the "
+            f"last materialized token at {where}"
+        )
+    if document_ids is not None:
+        docs = _require_contiguous_doc_ids(
+            document_ids,
+            token_count=token_count,
+            where=where,
+        )
+        cross_document = docs[:-1] != docs[1:]
+        leaking = np.flatnonzero(cross_document & (valid[:-1] != 0))
+        if leaking.size:
+            raise ValueError(
+                "loss_mask trains cross-document transitions under "
+                "source_token_predicts_next_v1 at "
+                f"{where}: source_positions={leaking[:16].tolist()}"
+            )
     return valid
 
 
@@ -1815,22 +1864,14 @@ def _track_objective_row(
             "shifted_lm_document_v1 requires at least two materialized tokens at "
             f"{shard_path}#row{row_idx}"
         )
-    mask = np.asarray(loss_mask)
-    if mask.ndim != 1 or len(mask) < token_count:
-        raise ValueError(
-            f"loss_mask is not aligned to {token_count} materialized tokens at "
-            f"{shard_path}#row{row_idx}"
-        )
-    if int(mask[token_count - 1]) != 0:
-        raise ValueError(
-            "shifted_lm_document_v1 requires a zero sentinel loss mask at the "
-            f"last token at {shard_path}#row{row_idx}"
-        )
-    trained = mask[: token_count - 1]
-    if np.any((trained != 0) & (trained != 1)):
-        raise ValueError(
-            f"objective loss_mask must be binary at {shard_path}#row{row_idx}"
-        )
+    where = f"{shard_path}#row{row_idx}"
+    valid_mask = _validate_source_transition_loss_mask(
+        loss_mask,
+        token_count=token_count,
+        where=where,
+        document_ids=document_ids,
+    )
+    trained = valid_mask[:-1]
     tracker.append(
         objective_kind,
         input_tokens=token_count - 1,
@@ -2107,6 +2148,17 @@ def _write_parquet_to_numpy_generation(
                                 token_count=token_count,
                                 where=f"{shard_path}#row{row_idx}",
                             )
+                        if "loss_mask" in side_matrices:
+                            _validate_source_transition_loss_mask(
+                                side_matrices["loss_mask"][row_idx],
+                                token_count=token_count,
+                                where=f"{shard_path}#row{row_idx}",
+                                document_ids=(
+                                    side_matrices["doc_ids"][row_idx]
+                                    if "doc_ids" in side_matrices
+                                    else None
+                                ),
+                            )
                         _validate_domain_route_sidecars(
                             token_matrix[row_idx, :token_count],
                             {
@@ -2269,6 +2321,10 @@ def _write_parquet_to_numpy_generation(
         "length_column": length_column,
         "writer_backend": "mmididx",
     }
+    if side_channels and "loss_mask" in side_channels:
+        sidecar_data["loss_mask_alignment"] = (
+            LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1
+        )
     if side_channels:
         side_channel_paths = {}
         for col, dt_str in zip(side_channels, side_channel_dtypes or [], strict=True):
@@ -2881,6 +2937,13 @@ def _convert_parquet_to_megatron_unpublished(
                             token_count=token_count,
                             where=f"{shard_path}#row{row_idx}",
                         )
+                    if "loss_mask" in trimmed_side_values:
+                        _validate_source_transition_loss_mask(
+                            trimmed_side_values["loss_mask"],
+                            token_count=token_count,
+                            where=f"{shard_path}#row{row_idx}",
+                            document_ids=trimmed_side_values.get("doc_ids"),
+                        )
                     _validate_domain_route_sidecars(
                         token_ids,
                         {
@@ -3012,6 +3075,10 @@ def _convert_parquet_to_megatron_unpublished(
         "length_column": length_column,
         "writer_backend": "megatron",
     }
+    if side_channels and "loss_mask" in side_channels:
+        sidecar_data["loss_mask_alignment"] = (
+            LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1
+        )
     if side_channels:
         side_channel_paths = {}
         for col, dt_str in zip(side_channels, side_channel_dtypes or [], strict=True):

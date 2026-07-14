@@ -27,6 +27,9 @@ OBJECTIVE_CONTRACT_SCHEMA = "cppmega_pre_materialized_objectives_v1"
 OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA = (
     "cppmega_objective_materialization_artifact_v1"
 )
+LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1 = (
+    "source_token_predicts_next_v1"
+)
 OBJECTIVE_TOKEN_SIDE_CHANNELS: tuple[tuple[str, str], ...] = (
     ("loss_mask", "uint8"),
     ("doc_ids", "uint32"),
@@ -385,6 +388,7 @@ def validate_objective_contract(
     expected_materialization_columns = {
         "token_column": "input_ids",
         "loss_mask_column": "loss_mask",
+        "loss_mask_alignment": LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
         "length_column": "valid_token_count",
         "objective_column": "objective_kind",
         "document_id_column": "doc_ids",
@@ -548,6 +552,7 @@ def load_objective_materialization_artifact(
         "side_channels",
         "graph_sidecars",
         "source_platform_sidecar",
+        "loss_mask_alignment",
         "graph_relations",
         "graph_pair_mask",
         "chunk_edge_expansion",
@@ -573,6 +578,7 @@ def load_objective_materialization_artifact(
         "side_channels": expected_side_channels,
         "graph_sidecars": expected_graph_sidecars,
         "source_platform_sidecar": "require",
+        "loss_mask_alignment": LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
         "graph_relations": graph["relations"],
         "graph_pair_mask": graph["pair_mask"],
         "chunk_edge_expansion": graph["chunk_edge_expansion"],
@@ -897,6 +903,7 @@ def validate_materialized_objective_artifact(
 
 
 __all__ = [
+    "LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1",
     "OBJECTIVE_CONTRACT_SCHEMA",
     "OBJECTIVE_GRAPH_SIDECARS",
     "OBJECTIVE_IDS",

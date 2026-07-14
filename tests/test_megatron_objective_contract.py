@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from cppmega.megatron.objective_contract import (
+    LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
     OBJECTIVE_CONTRACT_SCHEMA,
     OBJECTIVE_IDS,
     OBJECTIVE_GRAPH_SIDECARS,
@@ -86,6 +87,9 @@ def _valid_contract() -> dict[str, object]:
             "format": "shifted_lm_document_v1",
             "token_column": "input_ids",
             "loss_mask_column": "loss_mask",
+            "loss_mask_alignment": (
+                LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1
+            ),
             "length_column": "valid_token_count",
             "objective_column": "objective_kind",
             "document_id_column": "doc_ids",
@@ -135,6 +139,9 @@ def _write_materialization_artifact(tmp_path: Path) -> Path:
                 for column, kind, dtype in OBJECTIVE_GRAPH_SIDECARS
             ],
             "source_platform_sidecar": "require",
+            "loss_mask_alignment": (
+                LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1
+            ),
             "graph_relations": ["call", "type"],
             "graph_pair_mask": "causal_same_document_upstream_v1",
             "chunk_edge_expansion": "cartesian_token_spans_v1",
@@ -253,6 +260,7 @@ def test_contract_rejects_realized_mix_drift() -> None:
     [
         ("token_column", "token_ids"),
         ("loss_mask_column", "token_loss_mask"),
+        ("loss_mask_alignment", "target_token_v0"),
         ("length_column", None),
         ("document_id_column", "token_source_doc_ids"),
     ],
