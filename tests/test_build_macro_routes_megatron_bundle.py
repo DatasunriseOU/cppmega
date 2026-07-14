@@ -356,6 +356,30 @@ def test_manifest_allowlist_excludes_uncommitted_parquet_orphans(
     ) == ["repo_r0.parquet"]
 
 
+def test_manifest_allowlist_rejects_failed_conveyor_units(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "_done.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "done": {
+                    "repo::code": {"lengths": {"1024": {"rows": 1}}},
+                    "repo::r0": {"lengths": {"1024": {"rows": 1}}},
+                },
+                "failed": {
+                    "broken::code": {
+                        "stage": "index_project",
+                        "detail": "exit 137",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="refusing to freeze.*1 failed units"):
+        _load_manifest_allowlist(manifest_path, (1024,))
+
+
 def test_repaired_snapshot_manifest_hashes_only_replaced_files(tmp_path: Path) -> None:
     snapshot = tmp_path / "snapshot"
     unchanged = snapshot / "code/1024/a.parquet"

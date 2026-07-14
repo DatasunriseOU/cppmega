@@ -116,6 +116,15 @@ def _load_manifest_allowlist(
     done = blob.get("done")
     if not isinstance(done, dict):
         raise ValueError(f"{manifest_path}: missing done map")
+    failed = blob.get("failed")
+    if not isinstance(failed, dict):
+        raise ValueError(f"{manifest_path}: missing failed map")
+    if failed:
+        sample = sorted(str(key) for key in failed)[:10]
+        raise RuntimeError(
+            f"{manifest_path}: refusing to freeze a conveyor with "
+            f"{len(failed)} failed units; sample={sample}"
+        )
     allowed = {
         (kind, bucket): set() for kind in ("code", "commits") for bucket in buckets
     }
@@ -151,7 +160,7 @@ def _load_manifest_allowlist(
         "path": str(manifest_path.resolve()),
         "sha256": _sha256(manifest_path),
         "done_units": len(done),
-        "failed_units": len(blob.get("failed") or {}),
+        "failed_units": 0,
         "allowlist_counts": {
             f"{kind}/{bucket}": len(names)
             for (kind, bucket), names in sorted(allowed.items())
