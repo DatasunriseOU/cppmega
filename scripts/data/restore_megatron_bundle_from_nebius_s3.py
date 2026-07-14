@@ -39,6 +39,7 @@ if __package__:
         _sha256,
         _validate_archive_member_names,
         _validate_bundle,
+        _validate_logical_manifest_contract,
         _write_json_atomic,
     )
 else:
@@ -51,6 +52,7 @@ else:
         _sha256,
         _validate_archive_member_names,
         _validate_bundle,
+        _validate_logical_manifest_contract,
         _write_json_atomic,
     )
 
@@ -535,6 +537,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     if hashlib.sha256(logical_manifest_bytes).hexdigest() != logical_manifest_info["sha256"]:
         raise ValueError("remote logical manifest SHA-256 does not match transport")
     logical_manifest = json.loads(logical_manifest_bytes)
+    _validate_logical_manifest_contract(logical_manifest)
     if logical_manifest.get("bundle_id") != bundle_id:
         raise ValueError("remote logical manifest bundle ID does not match transport")
     if logical_manifest.get("artifact_set_sha256") != transport["artifact_set_sha256"]:

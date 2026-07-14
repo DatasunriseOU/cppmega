@@ -1405,9 +1405,9 @@ def _validate_objective_source_summary(
         )
 
 
-def _load_bundle_manifest(bundle: Path) -> tuple[dict, list[dict]]:
-    manifest_path = bundle / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+def _validate_logical_manifest_contract(manifest: dict) -> None:
+    """Reject unsupported bundle contracts without touching artifact payloads."""
+
     if manifest.get("schema") != "cppmega_megatron_bundle_v1":
         raise ValueError(f"unsupported bundle schema: {manifest.get('schema')!r}")
     _require_manifest_tokenizer_contract(manifest)
@@ -1463,6 +1463,12 @@ def _load_bundle_manifest(bundle: Path) -> tuple[dict, list[dict]]:
         _validate_objective_source_summary(
             descriptor["source_snapshot"], bucket=int(bucket)
         )
+
+
+def _load_bundle_manifest(bundle: Path) -> tuple[dict, list[dict]]:
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    _validate_logical_manifest_contract(manifest)
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, list) or not artifacts:
         raise ValueError("bundle manifest has no artifacts")

@@ -333,6 +333,57 @@ def test_restore_requires_space_for_archive_expansion(tmp_path, monkeypatch):
         )
 
 
+def test_restore_rejects_legacy_manifest_before_archive_download(
+    tmp_path, monkeypatch
+):
+    logical_manifest = {
+        "schema": "cppmega_megatron_bundle_v1",
+        "bundle_id": "bundle-1",
+        "tokenizer_contract": "megacpp-vocab-65536",
+        "vocab_size": 65536,
+        "training_contract": "legacy_causal",
+        "artifact_set_sha256": "b" * 64,
+        "artifact_count": 1,
+        "artifact_bytes": 8,
+    }
+    logical_bytes = json.dumps(logical_manifest).encode("utf-8")
+    transport = _transport()
+    transport["logical_manifest"]["size"] = len(logical_bytes)
+    transport["logical_manifest"]["sha256"] = hashlib.sha256(logical_bytes).hexdigest()
+    transport["logical_manifest_sha256"] = transport["logical_manifest"]["sha256"]
+    transport_bytes = json.dumps(transport).encode("utf-8")
+
+    def fake_read(uri, **_kwargs):
+        if uri.endswith("transport.json"):
+            return transport_bytes
+        if uri.endswith("logical_manifest.json"):
+            return logical_bytes
+        raise AssertionError(f"unexpected remote read: {uri}")
+
+    monkeypatch.setattr(restore, "_load_env_file", lambda _path: None)
+    monkeypatch.setattr(restore, "_s3_env", lambda: {})
+    monkeypatch.setattr(restore, "_aws_read", fake_read)
+    monkeypatch.setattr(
+        restore,
+        "_acquire_archive",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("archive download must not start")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="training_contract"):
+        restore.main(
+            [
+                "--output-root",
+                str(tmp_path),
+                "--bundle-id",
+                "bundle-1",
+                "--run-id",
+                "preflight",
+            ]
+        )
+
+
 def test_archive_download_uses_atomic_staging_and_resumable_receipt(
     tmp_path, monkeypatch
 ):
