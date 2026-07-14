@@ -251,7 +251,9 @@ def test_objective_contract_rejects_zero_required_hamilton_quota() -> None:
         validate_objective_contract(contract)
 
 
-def test_materialized_objective_contract_rejects_id_histogram_drift(tmp_path: Path) -> None:
+def test_materialized_objective_contract_rejects_id_histogram_drift(
+    tmp_path: Path,
+) -> None:
     contract = validate_objective_contract(_objective_contract())
     sidecar = tmp_path / "objective_ids.bin"
     np.asarray([1, 1, 3, 4, 5, 6], dtype=np.uint8).tofile(sidecar)
@@ -329,9 +331,7 @@ def _high_source_identity() -> dict[str, int | str]:
 
 
 def _case5_table(pa, converter, rows: dict[str, object]):
-    edge_pair = pa.struct(
-        [pa.field("from", pa.uint16()), pa.field("to", pa.uint16())]
-    )
+    edge_pair = pa.struct([pa.field("from", pa.uint16()), pa.field("to", pa.uint16())])
     edge_triple = pa.struct(
         [
             pa.field("from", pa.uint32()),
@@ -386,11 +386,15 @@ def _case5_table(pa, converter, rows: dict[str, object]):
             converter.DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode("utf-8"): (
                 converter.DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii")
             ),
+            converter.DOMAIN_SCHEMA_SHA256_METADATA_KEY.encode("utf-8"): (
+                converter.DOMAIN_SCHEMA_SHA256.encode("ascii")
+            ),
+            converter.TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode("utf-8"): (
+                converter.TOKENIZER_CONTRACT_SHA256.encode("ascii")
+            ),
         }
     )
-    return table.replace_schema_metadata(
-        metadata
-    )
+    return table.replace_schema_metadata(metadata)
 
 
 def _minimal_case5_rows(converter) -> dict[str, object]:
@@ -612,9 +616,7 @@ def test_mmididx_preserves_symbol_id_above_signed_int64(tmp_path: Path) -> None:
                 ),
             ),
         ],
-        metadata={
-            converter.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii"): b"3"
-        },
+        metadata={converter.SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii"): b"3"},
     )
     pq.write_table(
         pa.Table.from_pylist(
@@ -770,9 +772,7 @@ def test_case5_arrow_contract_fails_closed(
         wrong_edges = pa.array(
             [[{"from": 0, "to": 0}]],
             type=pa.list_(
-                pa.struct(
-                    [pa.field("from", pa.int64()), pa.field("to", pa.int64())]
-                )
+                pa.struct([pa.field("from", pa.int64()), pa.field("to", pa.int64())])
             ),
         )
         edge_index = table.schema.get_field_index("token_call_edges")
@@ -815,7 +815,7 @@ def test_default_cppmega_graph_sidecars_are_document_aligned_route_profile() -> 
         ("token_cross_domain_edges", "edge_triples", "int32"),
         ("token_chunk_starts", "ragged_1d", "uint32"),
         ("token_chunk_ends", "ragged_1d", "uint32"),
-        ("token_chunk_kinds", "ragged_1d", "uint16"),
+        ("token_chunk_kinds", "ragged_1d", "uint8"),
         ("token_chunk_dep_levels", "ragged_1d", "uint16"),
     )
 
@@ -886,7 +886,9 @@ def test_normalize_edge_triples_rejects_missing_fields_and_wrong_edge_family() -
             row_idx=4,
         )
 
-    with pytest.raises(ValueError, match="edge kind 60 is not valid for token_build_edges"):
+    with pytest.raises(
+        ValueError, match="edge kind 60 is not valid for token_build_edges"
+    ):
         converter._normalize_edge_triples(
             [{"from": 0, "to": 1, "kind": 60}],
             column="token_build_edges",
@@ -1034,28 +1036,40 @@ def test_graph_sidecar_writer_writes_offsets_data_and_manifest(tmp_path: Path) -
         "coordinate_space": "chunk_index",
     }
     np.testing.assert_array_equal(
-        np.fromfile(tmp_path / "cppmega_train_token_call_edges_offsets.bin", dtype=np.int64),
+        np.fromfile(
+            tmp_path / "cppmega_train_token_call_edges_offsets.bin", dtype=np.int64
+        ),
         np.array([0, 2, 2], dtype=np.int64),
     )
     np.testing.assert_array_equal(
-        np.fromfile(tmp_path / "cppmega_train_token_call_edges_data.bin", dtype=np.int32).reshape(-1, 2),
+        np.fromfile(
+            tmp_path / "cppmega_train_token_call_edges_data.bin", dtype=np.int32
+        ).reshape(-1, 2),
         np.array([[1, 0], [2, 1]], dtype=np.int32),
     )
     assert manifest["token_domain_edges"]["shape_tail"] == [3]
     assert manifest["token_domain_edges"]["coordinate_space"] == "token_index"
     np.testing.assert_array_equal(
-        np.fromfile(tmp_path / "cppmega_train_token_domain_edges_offsets.bin", dtype=np.int64),
+        np.fromfile(
+            tmp_path / "cppmega_train_token_domain_edges_offsets.bin", dtype=np.int64
+        ),
         np.array([0, 1, 1], dtype=np.int64),
     )
     np.testing.assert_array_equal(
-        np.fromfile(tmp_path / "cppmega_train_token_domain_edges_data.bin", dtype=np.int32).reshape(-1, 3),
+        np.fromfile(
+            tmp_path / "cppmega_train_token_domain_edges_data.bin", dtype=np.int32
+        ).reshape(-1, 3),
         np.array([[0, 3, 5]], dtype=np.int32),
     )
     np.testing.assert_array_equal(
-        np.fromfile(tmp_path / "cppmega_train_token_chunk_starts_offsets.bin", dtype=np.int64),
+        np.fromfile(
+            tmp_path / "cppmega_train_token_chunk_starts_offsets.bin", dtype=np.int64
+        ),
         np.array([0, 3, 4], dtype=np.int64),
     )
-    starts = np.fromfile(tmp_path / "cppmega_train_token_chunk_starts_data.bin", dtype=np.uint32)
+    starts = np.fromfile(
+        tmp_path / "cppmega_train_token_chunk_starts_data.bin", dtype=np.uint32
+    )
     np.testing.assert_array_equal(starts, np.array([0, 8, 16, 0], dtype=np.uint32))
     json.dumps(manifest)
 
@@ -1077,7 +1091,9 @@ def test_graph_sidecar_writer_rejects_route_past_trimmed_row(tmp_path: Path) -> 
     writer.abort_close()
 
 
-def test_graph_sidecar_writer_rejects_chunk_edge_past_chunk_count(tmp_path: Path) -> None:
+def test_graph_sidecar_writer_rejects_chunk_edge_past_chunk_count(
+    tmp_path: Path,
+) -> None:
     converter = _load_converter_module()
     writer = converter._GraphSidecarWriters(
         str(tmp_path / "bad_chunk_edge"),
@@ -1107,11 +1123,13 @@ def test_graph_sidecar_writer_rejects_misaligned_chunk_arrays(tmp_path: Path) ->
         (
             ("token_chunk_starts", "ragged_1d", "uint32"),
             ("token_chunk_ends", "ragged_1d", "uint32"),
-            ("token_chunk_kinds", "ragged_1d", "uint16"),
+            ("token_chunk_kinds", "ragged_1d", "uint8"),
         ),
     )
 
-    with pytest.raises(ValueError, match=r"token_chunk_\* sidecars must have equal lengths"):
+    with pytest.raises(
+        ValueError, match=r"token_chunk_\* sidecars must have equal lengths"
+    ):
         writer.append(
             {
                 "token_chunk_starts": [0, 2],
@@ -1237,12 +1255,13 @@ def test_explicit_mmididx_writer_trims_padding_and_all_sidecars(tmp_path: Path) 
     assert receipt["delimiter_contract_sha256"] == (
         converter.DOMAIN_DELIMITER_CONTRACT_SHA256
     )
+    assert receipt["domain_schema_sha256"] == converter.DOMAIN_SCHEMA_SHA256
+    assert receipt["tokenizer_contract_sha256"] == (converter.TOKENIZER_CONTRACT_SHA256)
     assert manifest["source_identity_registry"]["identity_count"] == 1
     registry_path = tmp_path / manifest["source_identity_registry"]["path"]
     with sqlite3.connect(registry_path) as registry:
         stored = registry.execute(
-            "SELECT source_identity_id, canonical_sha256, source "
-            "FROM source_identities"
+            "SELECT source_identity_id, canonical_sha256, source FROM source_identities"
         ).fetchone()
     assert stored == (
         identity_id.to_bytes(8, "big"),
@@ -1316,9 +1335,7 @@ def test_mmididx_writer_binds_pre_materialized_objective_contract(
     pq = pytest.importorskip("pyarrow.parquet")
     converter = _load_converter_module()
     tasks = tuple(_objective_contract()["task_order"])
-    identities = [
-        _source_identity(f'{{"objective":"{task}"}}') for task in tasks
-    ]
+    identities = [_source_identity(f'{{"objective":"{task}"}}') for task in tasks]
     input_dir = tmp_path / "parquet"
     input_dir.mkdir()
     rows: dict[str, object] = {
@@ -1328,29 +1345,20 @@ def test_mmididx_writer_binds_pre_materialized_objective_contract(
             for index in range(len(tasks))
         ],
         "loss_mask": [
-            [1, 1, 1, 0] if task == "causal_lm" else [0, 1, 1, 0]
-            for task in tasks
+            [1, 1, 1, 0] if task == "causal_lm" else [0, 1, 1, 0] for task in tasks
         ],
         "objective_kind": list(tasks),
         "doc_ids": [[1, 1, 1, 1] for _task in tasks],
         "token_source_doc_ids": [[7, 7, 7, 7] for _task in tasks],
         "source_platform_ids": [[[2]] for _task in tasks],
         "token_call_edges": [
-            [{"from": 0, "to": 0}, {"from": 1, "to": 0}]
-            if task == "causal_lm"
-            else []
+            [{"from": 0, "to": 0}, {"from": 1, "to": 0}] if task == "causal_lm" else []
             for task in tasks
         ],
         "token_type_edges": [[] for _task in tasks],
-        "token_chunk_starts": [
-            [0, 2] if task == "causal_lm" else [] for task in tasks
-        ],
-        "token_chunk_ends": [
-            [2, 4] if task == "causal_lm" else [] for task in tasks
-        ],
-        "token_chunk_kinds": [
-            [1, 1] if task == "causal_lm" else [] for task in tasks
-        ],
+        "token_chunk_starts": [[0, 2] if task == "causal_lm" else [] for task in tasks],
+        "token_chunk_ends": [[2, 4] if task == "causal_lm" else [] for task in tasks],
+        "token_chunk_kinds": [[1, 1] if task == "causal_lm" else [] for task in tasks],
         "token_chunk_dep_levels": [
             [0, 0] if task == "causal_lm" else [] for task in tasks
         ],
@@ -1413,9 +1421,7 @@ def test_mmididx_writer_binds_pre_materialized_objective_contract(
     assert manifest["objective_materialization"]["artifact_set_sha256"]
     assert manifest["symbol_identity_schema_version"] == 3
     np.testing.assert_array_equal(
-        np.fromfile(
-            tmp_path / "objective_train_objective_ids.bin", dtype=np.uint8
-        ),
+        np.fromfile(tmp_path / "objective_train_objective_ids.bin", dtype=np.uint8),
         np.array([OBJECTIVE_IDS[task] for task in tasks], dtype=np.uint8),
     )
 
@@ -1438,9 +1444,7 @@ def test_mmididx_conversion_rejects_invalid_domain_profile_before_success(
     row["doc_ids"] = [[1, 1]]
     row["token_domain_ids"] = [[999, 0]]
     row["token_source_doc_ids"] = [[1, 1]]
-    row["token_source_identity_ids"] = [
-        [int(identity["source_identity_id"])] * 2
-    ]
+    row["token_source_identity_ids"] = [[int(identity["source_identity_id"])] * 2]
     row[converter.SOURCE_IDENTITY_REGISTRY_COLUMN] = [[identity]]
     for name, kind, _dtype in converter.DEFAULT_CPPMEGA_GRAPH_SIDECARS:
         if kind in {"edge_pairs", "edge_triples"}:

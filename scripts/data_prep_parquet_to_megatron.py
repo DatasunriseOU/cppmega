@@ -46,14 +46,14 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from cppmega.symbol_identity import (
+from cppmega.symbol_identity import (  # noqa: E402
     SYMBOL_IDENTITIES_COLUMN,
     SYMBOL_IDENTITY_SCHEMA_METADATA_KEY,
     SYMBOL_IDENTITY_SCHEMA_VERSION,
     SymbolIdentityRegistry,
     compute_symbol_id,
 )
-from cppmega.megatron.objective_contract import (
+from cppmega.megatron.objective_contract import (  # noqa: E402
     OBJECTIVE_GRAPH_SIDECARS,
     OBJECTIVE_TOKEN_SIDE_CHANNELS,
     ObjectiveMaterializationArtifact,
@@ -73,9 +73,13 @@ from cppmega.megatron.domain_route_contract import (  # noqa: E402
     DOMAIN_DELIMITER_ID_TO_DOMAIN,
     DOMAIN_EDGE_KINDS_BY_COLUMN,
     DOMAIN_ROUTE_COLUMNS,
+    DOMAIN_SCHEMA_SHA256,
+    DOMAIN_SCHEMA_SHA256_METADATA_KEY,
     DOMAIN_START_DELIMITER_IDS,
     GRAPH_ROUTE_COLUMNS,
     SOURCE_IDENTITY_REGISTRY_SCHEMA,
+    TOKENIZER_CONTRACT_SHA256,
+    TOKENIZER_CONTRACT_SHA256_METADATA_KEY,
     VALID_DOMAIN_CONFIDENCE_IDS,
     VALID_DOMAIN_EDGE_KINDS,
     VALID_DOMAIN_IDS,
@@ -192,7 +196,9 @@ def _require_symbol_identity_schema(shards: list[str]) -> int | None:
                 "with clang USR/signature identities"
             )
         identity_type = schema.field(SYMBOL_IDENTITIES_COLUMN).type
-        if not (pa.types.is_list(identity_type) or pa.types.is_large_list(identity_type)):
+        if not (
+            pa.types.is_list(identity_type) or pa.types.is_large_list(identity_type)
+        ):
             raise RuntimeError(
                 f"{shard}: {SYMBOL_IDENTITIES_COLUMN} must be a list, got {identity_type}"
             )
@@ -214,9 +220,12 @@ def _require_symbol_identity_schema(shards: list[str]) -> int | None:
             )
         for column in _SYMBOL_ID_COLUMNS:
             column_type = schema.field(column).type
-            if not (
-                pa.types.is_list(column_type) or pa.types.is_large_list(column_type)
-            ) or column_type.value_type != pa.uint64():
+            if (
+                not (
+                    pa.types.is_list(column_type) or pa.types.is_large_list(column_type)
+                )
+                or column_type.value_type != pa.uint64()
+            ):
                 raise RuntimeError(
                     f"{shard}: {column} must use list<uint64>, got {column_type}"
                 )
@@ -395,7 +404,10 @@ def _require_contiguous_doc_ids(
             f"at {where}; got {valid.tolist()}"
         )
     document_count = int(valid[-1])
-    if expected_document_count is not None and document_count != expected_document_count:
+    if (
+        expected_document_count is not None
+        and document_count != expected_document_count
+    ):
         raise ValueError(
             f"doc_ids cover {document_count} row-local documents but "
             f"{expected_document_count} source platform bags exist at {where}"
@@ -407,9 +419,7 @@ def _require_symbol_sidecar_dtypes(
     side_channels: list[str] | None,
     side_channel_dtypes: list[str] | None,
 ) -> None:
-    requested = dict(
-        zip(side_channels or [], side_channel_dtypes or [], strict=True)
-    )
+    requested = dict(zip(side_channels or [], side_channel_dtypes or [], strict=True))
     present = set(_SYMBOL_ID_COLUMNS) & set(requested)
     if present and present != set(_SYMBOL_ID_COLUMNS):
         missing = sorted(set(_SYMBOL_ID_COLUMNS) - present)
@@ -417,9 +427,7 @@ def _require_symbol_sidecar_dtypes(
             f"partial symbol identity sidecars are not allowed; missing={missing}"
         )
     invalid = {
-        column: requested[column]
-        for column in present
-        if requested[column] != "uint64"
+        column: requested[column] for column in present if requested[column] != "uint64"
     }
     if invalid:
         raise ValueError(
@@ -463,11 +471,17 @@ def find_parquet_shards(input_dir: str, split: str) -> list[str]:
         if has_explicit_val:
             return [str(p) for p in all_parquets if p.name != "val_shard.parquet"]
         # Last shard is val by convention
-        return [str(p) for p in all_parquets[:-1]] if len(all_parquets) > 1 else [str(all_parquets[0])]
+        return (
+            [str(p) for p in all_parquets[:-1]]
+            if len(all_parquets) > 1
+            else [str(all_parquets[0])]
+        )
     elif split == "val":
         if has_explicit_val:
             return [str(val_shard)]
-        return [str(all_parquets[-1])] if len(all_parquets) > 1 else [str(all_parquets[0])]
+        return (
+            [str(all_parquets[-1])] if len(all_parquets) > 1 else [str(all_parquets[0])]
+        )
     elif split == "all":
         return [str(p) for p in all_parquets]
     else:
@@ -506,9 +520,7 @@ def _resolve_length_column(shards: list[str], requested: str | None) -> str | No
     return requested
 
 
-def _resolve_source_platform_sidecar(
-    shards: list[str], requested: bool | None
-) -> bool:
+def _resolve_source_platform_sidecar(shards: list[str], requested: bool | None) -> bool:
     """Resolve auto/required source-platform preservation against the schema."""
 
     import pyarrow.parquet as pq  # type: ignore[import-not-found]
@@ -535,9 +547,7 @@ def _require_case5_sidecar_dtypes(
     side_channels: list[str] | None,
     side_channel_dtypes: list[str] | None,
 ) -> None:
-    requested = dict(
-        zip(side_channels or (), side_channel_dtypes or (), strict=True)
-    )
+    requested = dict(zip(side_channels or (), side_channel_dtypes or (), strict=True))
     present_routes = set(DOMAIN_ROUTE_COLUMNS) & set(requested)
     if present_routes and present_routes != set(DOMAIN_ROUTE_COLUMNS):
         missing = sorted(set(DOMAIN_ROUTE_COLUMNS) - present_routes)
@@ -578,9 +588,7 @@ def _require_case5_schema(
     import pyarrow as pa  # type: ignore[import-not-found]
     import pyarrow.parquet as pq  # type: ignore[import-not-found]
 
-    edge_pair = pa.struct(
-        [pa.field("from", pa.uint16()), pa.field("to", pa.uint16())]
-    )
+    edge_pair = pa.struct([pa.field("from", pa.uint16()), pa.field("to", pa.uint16())])
     edge_triple = pa.struct(
         [
             pa.field("from", pa.uint32()),
@@ -609,10 +617,7 @@ def _require_case5_schema(
         "token_type_refs": pa.list_(pa.uint64()),
         "token_call_edges": pa.list_(edge_pair),
         "token_type_edges": pa.list_(edge_pair),
-        **{
-            column: pa.list_(edge_triple)
-            for column in DOMAIN_EDGE_KINDS_BY_COLUMN
-        },
+        **{column: pa.list_(edge_triple) for column in DOMAIN_EDGE_KINDS_BY_COLUMN},
         "token_chunk_starts": pa.list_(pa.uint32()),
         "token_chunk_ends": pa.list_(pa.uint32()),
         "token_chunk_kinds": pa.list_(pa.uint8()),
@@ -643,6 +648,12 @@ def _require_case5_schema(
             DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode(
                 "utf-8"
             ): DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii"),
+            DOMAIN_SCHEMA_SHA256_METADATA_KEY.encode(
+                "utf-8"
+            ): DOMAIN_SCHEMA_SHA256.encode("ascii"),
+            TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode(
+                "utf-8"
+            ): TOKENIZER_CONTRACT_SHA256.encode("ascii"),
         }
         bad_metadata = {
             key.decode("utf-8"): metadata.get(key)
@@ -783,9 +794,7 @@ def _validate_domain_route_sidecars(
         "token_source_doc_ids",
     ):
         if any(value < 0 or value > UINT32_MAX for value in vectors[column]):
-            raise ValueError(
-                f"{column} must fit uint32 at {shard_path}#row{row_idx}"
-            )
+            raise ValueError(f"{column} must fit uint32 at {shard_path}#row{row_idx}")
     if any(value <= 0 for value in vectors["token_source_doc_ids"]):
         raise ValueError(
             "token_source_doc_ids must preserve a positive source document ID "
@@ -878,8 +887,7 @@ def _fixed_width_list_matrix(
         )
     if combined.null_count:
         raise ValueError(
-            f"{column_name} contains null rows at "
-            f"{shard_path}#row_group{row_group_idx}"
+            f"{column_name} contains null rows at {shard_path}#row_group{row_group_idx}"
         )
     if not hasattr(combined, "offsets") or not hasattr(combined, "values"):
         raise ValueError(
@@ -887,7 +895,9 @@ def _fixed_width_list_matrix(
             f"{shard_path}#row_group{row_group_idx}"
         )
 
-    offsets = np.asarray(combined.offsets.to_numpy(zero_copy_only=False), dtype=np.int64)
+    offsets = np.asarray(
+        combined.offsets.to_numpy(zero_copy_only=False), dtype=np.int64
+    )
     lengths = np.diff(offsets)
     width = int(lengths[0]) if len(lengths) else 0
     if width <= 0 or np.any(lengths != width):
@@ -1010,9 +1020,13 @@ def _normalize_edge_pairs(
             f"at {shard_path}#row{row_idx}"
         )
     if np.any(pairs < 0):
-        raise ValueError(f"{column} contains negative edge endpoint at {shard_path}#row{row_idx}")
+        raise ValueError(
+            f"{column} contains negative edge endpoint at {shard_path}#row{row_idx}"
+        )
     if np.any(pairs > np.iinfo(np.int32).max):
-        raise ValueError(f"{column} edge endpoint exceeds int32 at {shard_path}#row{row_idx}")
+        raise ValueError(
+            f"{column} edge endpoint exceeds int32 at {shard_path}#row{row_idx}"
+        )
     return pairs.astype(np.int32, copy=False)
 
 
@@ -1062,8 +1076,7 @@ def _normalize_edge_triples(
             )
         if kind_i not in VALID_DOMAIN_EDGE_KINDS:
             raise ValueError(
-                f"unknown domain route edge kind {kind_i} at "
-                f"{shard_path}#row{row_idx}"
+                f"unknown domain route edge kind {kind_i} at {shard_path}#row{row_idx}"
             )
         allowed_kinds = DOMAIN_EDGE_KINDS_BY_COLUMN.get(column)
         if allowed_kinds is None:
@@ -1083,7 +1096,9 @@ def _normalize_edge_triples(
             f"at {shard_path}#row{row_idx}"
         )
     if np.any(triples > np.iinfo(np.int32).max):
-        raise ValueError(f"{column} edge value exceeds int32 at {shard_path}#row{row_idx}")
+        raise ValueError(
+            f"{column} edge value exceeds int32 at {shard_path}#row{row_idx}"
+        )
     return triples.astype(np.int32, copy=False)
 
 
@@ -1108,7 +1123,9 @@ def _normalize_ragged_int_vector(
             f"{tuple(arr.shape)} at {shard_path}#row{row_idx}"
         )
     if np.any(arr < 0):
-        raise ValueError(f"{column} contains negative value at {shard_path}#row{row_idx}")
+        raise ValueError(
+            f"{column} contains negative value at {shard_path}#row{row_idx}"
+        )
     info = np.iinfo(dtype)
     if np.any(arr > info.max):
         raise ValueError(
@@ -1179,9 +1196,7 @@ class _SourceIdentityRegistryWriter:
                 f"token_source_identity_ids length {len(source_identity_ids)} < "
                 f"valid token count {token_count} at {shard_path}#row{row_idx}"
             )
-        referenced = {
-            int(raw) for raw in source_identity_ids[:token_count]
-        }
+        referenced = {int(raw) for raw in source_identity_ids[:token_count]}
         if not referenced or any(
             value <= 0 or value > UINT64_MAX for value in referenced
         ):
@@ -1347,9 +1362,13 @@ class _GraphSidecarWriters:
             )
         starts = ragged_arrays.get("token_chunk_starts")
         ends = ragged_arrays.get("token_chunk_ends")
-        if starts is not None and ends is not None and (
-            np.any(starts >= ends)
-            or (token_count is not None and np.any(ends > token_count))
+        if (
+            starts is not None
+            and ends is not None
+            and (
+                np.any(starts >= ends)
+                or (token_count is not None and np.any(ends > token_count))
+            )
         ):
             raise ValueError(
                 "token chunk spans must satisfy 0 <= start < end <= "
@@ -1385,7 +1404,11 @@ class _GraphSidecarWriters:
                     shard_path=shard_path,
                     row_idx=row_idx,
                 )
-                if token_count is not None and arr.size and np.any(arr[:, :2] >= token_count):
+                if (
+                    token_count is not None
+                    and arr.size
+                    and np.any(arr[:, :2] >= token_count)
+                ):
                     raise ValueError(
                         f"{column} endpoint exceeds valid token count {token_count} at "
                         f"{shard_path}#row{row_idx}"
@@ -1409,7 +1432,9 @@ class _GraphSidecarWriters:
                     )
                 item_count = int(arr.shape[0])
             else:
-                raise ValueError(f"unsupported graph sidecar kind {kind!r} for {column}")
+                raise ValueError(
+                    f"unsupported graph sidecar kind {kind!r} for {column}"
+                )
             self._item_counts[column] += item_count
             self._offsets[column].append(self._item_counts[column])
             if item_count:
@@ -1576,9 +1601,7 @@ class _SourcePlatformSidecarWriter:
             "sequence_doc_offsets_path": (
                 f"{base}_source_platform_sequence_doc_offsets.bin"
             ),
-            "doc_platform_offsets_path": (
-                f"{base}_source_platform_doc_id_offsets.bin"
-            ),
+            "doc_platform_offsets_path": (f"{base}_source_platform_doc_id_offsets.bin"),
             "platform_ids_path": f"{base}_source_platform_ids.bin",
             "offset_dtype": "int64",
             "dtype": "uint16",
@@ -1681,8 +1704,7 @@ def _require_positive_token_source_doc_ids(
     source_ids = np.asarray(values).reshape(-1)
     if len(source_ids) < token_count or np.any(source_ids[:token_count] <= 0):
         raise ValueError(
-            f"token_source_doc_ids must be positive within valid_token_count "
-            f"at {where}"
+            f"token_source_doc_ids must be positive within valid_token_count at {where}"
         )
 
 
@@ -1728,9 +1750,7 @@ def _count_objective_graph_edges(
             for edge in raw:
                 source = int(edge["from"])
                 destination = int(edge["to"])
-                if not (
-                    0 <= source < len(starts) and 0 <= destination < len(starts)
-                ):
+                if not (0 <= source < len(starts) and 0 <= destination < len(starts)):
                     raise ValueError(
                         f"chunk edge endpoint out of range at {shard_path}#row{row_idx}"
                     )
@@ -1805,7 +1825,6 @@ def _track_objective_row(
     )
 
 
-
 def _add_graph_manifest(
     sidecar_data: dict[str, object],
     graph_sidecar_paths: dict[str, dict[str, object]] | None,
@@ -1841,6 +1860,8 @@ def _add_case5_manifest(
         "schema": CASE5_SCHEMA_VERSION,
         "validated_shard_count": validated_shard_count,
         "delimiter_contract_sha256": DOMAIN_DELIMITER_CONTRACT_SHA256,
+        "domain_schema_sha256": DOMAIN_SCHEMA_SHA256,
+        "tokenizer_contract_sha256": TOKENIZER_CONTRACT_SHA256,
         "domain_route_columns": list(DOMAIN_ROUTE_COLUMNS),
         "graph_route_columns": list(GRAPH_ROUTE_COLUMNS),
         "graph_sidecars_written": graph_sidecars_written,
@@ -1857,7 +1878,8 @@ def _write_parquet_to_numpy_generation(
     length_column: str | None = None,
     side_channels: list[str] | None = None,
     side_channel_dtypes: list[str] | None = None,
-    graph_sidecars: tuple[tuple[str, str, str], ...] | None = DEFAULT_CPPMEGA_GRAPH_SIDECARS,
+    graph_sidecars: tuple[tuple[str, str, str], ...]
+    | None = DEFAULT_CPPMEGA_GRAPH_SIDECARS,
     source_platform_sidecar: bool | None = None,
     objective_contract: ValidatedObjectiveContract | None = None,
     objective_artifact_manifest: Mapping[str, object] | None = None,
@@ -1881,9 +1903,10 @@ def _write_parquet_to_numpy_generation(
 
     if objective_artifact is not None:
         artifact_shards = [str(path) for path in objective_artifact.parquet_paths]
-        if shards is not None and [
-            str(Path(path).resolve()) for path in shards
-        ] != artifact_shards:
+        if (
+            shards is not None
+            and [str(Path(path).resolve()) for path in shards] != artifact_shards
+        ):
             raise ValueError(
                 "supplied shards differ from objective artifact parquet_paths"
             )
@@ -1925,16 +1948,14 @@ def _write_parquet_to_numpy_generation(
     }
     t0 = time.time()
 
-    graph_writers = _GraphSidecarWriters(output_prefix, graph_sidecars) if graph_sidecars else None
+    graph_writers = (
+        _GraphSidecarWriters(output_prefix, graph_sidecars) if graph_sidecars else None
+    )
     source_platform_writer = (
-        _SourcePlatformSidecarWriter(output_prefix)
-        if write_source_platform
-        else None
+        _SourcePlatformSidecarWriter(output_prefix) if write_source_platform else None
     )
     source_identity_writer = (
-        _SourceIdentityRegistryWriter(output_prefix)
-        if case5_shard_count
-        else None
+        _SourceIdentityRegistryWriter(output_prefix) if case5_shard_count else None
     )
     graph_columns = graph_writers.columns if graph_writers is not None else []
     _validate_objective_conversion_config(
@@ -1956,8 +1977,7 @@ def _write_parquet_to_numpy_generation(
 
     bin_path = output_prefix + ".bin"
     side_writers = {
-        col: open(f"{output_prefix}_{col}.bin", "wb")
-        for col in (side_channels or [])
+        col: open(f"{output_prefix}_{col}.bin", "wb") for col in (side_channels or [])
     }
     sizes = array("i")
     pointers = array("q")
@@ -1988,7 +2008,9 @@ def _write_parquet_to_numpy_generation(
                     table = pf.read_row_group(rg_idx, columns=columns_to_read)
                     token_col = table.column(token_column)
                     length_col = table.column(length_column) if length_column else None
-                    side_cols = {col: table.column(col) for col in (side_channels or [])}
+                    side_cols = {
+                        col: table.column(col) for col in (side_channels or [])
+                    }
                     graph_cols = {col: table.column(col) for col in graph_columns}
                     objective_col = (
                         table.column(OBJECTIVE_KIND_COLUMN)
@@ -2046,7 +2068,7 @@ def _write_parquet_to_numpy_generation(
                         )
 
                     side_matrices: dict[str, np.ndarray] = {}
-                    for col in (side_channels or []):
+                    for col in side_channels or []:
                         side_matrix, _ = _fixed_width_list_matrix(
                             side_cols[col],
                             column_name=col,
@@ -2082,7 +2104,7 @@ def _write_parquet_to_numpy_generation(
                     sizes.extend(lengths.astype(np.int32, copy=False).tolist())
                     flat_tokens.astype(dtype, copy=False).tofile(bin_fh)
 
-                    for col in (side_channels or []):
+                    for col in side_channels or []:
                         side_matrix = side_matrices[col]
                         flat_side = _validated_token_sidecar_array(
                             side_matrix[valid_mask],
@@ -2201,7 +2223,9 @@ def _write_parquet_to_numpy_generation(
         f.write(struct.pack("<Q", VERSION))
         f.write(struct.pack("<B", dtype_code))
         f.write(struct.pack("<Q", len(sizes_arr)))  # num sequences
-        f.write(struct.pack("<Q", len(sizes_arr) + 1))  # num documents (includes sentinel)
+        f.write(
+            struct.pack("<Q", len(sizes_arr) + 1)
+        )  # num documents (includes sentinel)
         sizes_arr.tofile(f)
         pointers_arr.tofile(f)
         # Document indices (each doc is one sequence)
@@ -2216,7 +2240,9 @@ def _write_parquet_to_numpy_generation(
         "dtype": dtype_str,
         "token_count": total_tokens,
         "source_capacity_token_count": source_capacity_tokens,
-        "trained_token_count": trained_tokens if side_channels and "loss_mask" in side_channels else None,
+        "trained_token_count": trained_tokens
+        if side_channels and "loss_mask" in side_channels
+        else None,
         "document_count": len(sizes_arr),
         "token_column": token_column,
         "length_column": length_column,
@@ -2237,9 +2263,7 @@ def _write_parquet_to_numpy_generation(
     if objective_manifest is not None:
         sidecar_data["objective_contract"] = objective_manifest
     if objective_artifact_manifest is not None:
-        sidecar_data["objective_materialization"] = dict(
-            objective_artifact_manifest
-        )
+        sidecar_data["objective_materialization"] = dict(objective_artifact_manifest)
     _add_case5_manifest(
         sidecar_data,
         validated_shard_count=case5_shard_count,
@@ -2252,7 +2276,9 @@ def _write_parquet_to_numpy_generation(
 
     elapsed = time.time() - t0
     bin_size = os.path.getsize(bin_path) / (1024**3)
-    print(f"\n{split}: {len(sizes_arr)} docs, {total_tokens:,} tokens, {bin_size:.2f} GiB in {elapsed:.1f}s")
+    print(
+        f"\n{split}: {len(sizes_arr)} docs, {total_tokens:,} tokens, {bin_size:.2f} GiB in {elapsed:.1f}s"
+    )
     reported_prefix = reported_output_prefix or output_prefix
     print(f"output: {reported_prefix}.bin + {reported_prefix}.idx")
     return
@@ -2287,10 +2313,14 @@ def _publish_staged_generation(staged_prefix: str, output_prefix: str) -> None:
     staged_names = {path.name for path in staged_files}
     required = {f"{output.name}.bin", f"{output.name}.idx", f"{output.name}.json"}
     if staged.name != output.name:
-        raise ValueError("staged and published generation prefixes must share a basename")
+        raise ValueError(
+            "staged and published generation prefixes must share a basename"
+        )
     missing = sorted(required - staged_names)
     if missing:
-        raise RuntimeError(f"staged mmididx generation is incomplete; missing={missing}")
+        raise RuntimeError(
+            f"staged mmididx generation is incomplete; missing={missing}"
+        )
 
     old_files = _generation_members(output.parent, output.name)
     old_names = {path.name for path in old_files}
@@ -2384,7 +2414,8 @@ def convert_parquet_to_megatron(
     length_column: str | None = None,
     side_channels: list[str] | None = None,
     side_channel_dtypes: list[str] | None = None,
-    graph_sidecars: tuple[tuple[str, str, str], ...] | None = DEFAULT_CPPMEGA_GRAPH_SIDECARS,
+    graph_sidecars: tuple[tuple[str, str, str], ...]
+    | None = DEFAULT_CPPMEGA_GRAPH_SIDECARS,
     source_platform_sidecar: bool | None = None,
     objective_contract_path: str | None = None,
     objective_artifact_path: str | None = None,
@@ -2428,14 +2459,17 @@ def convert_parquet_to_megatron(
         if side_channels is None and side_channel_dtypes is None:
             side_channels = [column for column, _dtype in expected_channels]
             side_channel_dtypes = [dtype for _column, dtype in expected_channels]
-        elif list(
-            zip(side_channels or [], side_channel_dtypes or [], strict=True)
-        ) != expected_channels:
+        elif (
+            list(zip(side_channels or [], side_channel_dtypes or [], strict=True))
+            != expected_channels
+        ):
             raise ValueError("side channels conflict with objective artifact")
         if graph_sidecars != OBJECTIVE_GRAPH_SIDECARS:
             raise ValueError("graph sidecars conflict with objective artifact")
         if source_platform_sidecar is False:
-            raise ValueError("source platform sidecar conflicts with objective artifact")
+            raise ValueError(
+                "source platform sidecar conflicts with objective artifact"
+            )
         source_platform_sidecar = True
         objective_contract = objective_artifact.contract
         objective_artifact_manifest = materialized_objective_artifact_manifest(
@@ -2545,16 +2579,14 @@ def convert_parquet_to_megatron(
             side_writers[col] = open(side_bin_path, "wb")
             side_dtypes[col] = _resolve_sidecar_dtype(dt_str)
 
-    graph_writers = _GraphSidecarWriters(output_prefix, graph_sidecars) if graph_sidecars else None
+    graph_writers = (
+        _GraphSidecarWriters(output_prefix, graph_sidecars) if graph_sidecars else None
+    )
     source_platform_writer = (
-        _SourcePlatformSidecarWriter(output_prefix)
-        if write_source_platform
-        else None
+        _SourcePlatformSidecarWriter(output_prefix) if write_source_platform else None
     )
     source_identity_writer = (
-        _SourceIdentityRegistryWriter(output_prefix)
-        if case5_shard_count
-        else None
+        _SourceIdentityRegistryWriter(output_prefix) if case5_shard_count else None
     )
     graph_columns = graph_writers.columns if graph_writers is not None else []
     _validate_objective_conversion_config(
@@ -2638,7 +2670,7 @@ def convert_parquet_to_megatron(
                         row_idx=row_idx,
                     )
                     trimmed_side_values: dict[str, list[int]] = {}
-                    for col in (side_channels or []):
+                    for col in side_channels or []:
                         side_val = _require_token_aligned_side_channel(
                             col,
                             side_cols[col][row_idx].as_py(),
@@ -2667,7 +2699,7 @@ def convert_parquet_to_megatron(
                     builder.add_document(arr, [len(arr)])
 
                     # Write aligned side channel values
-                    for col in (side_channels or []):
+                    for col in side_channels or []:
                         trimmed_side = trimmed_side_values[col]
                         arr_side = _validated_token_sidecar_array(
                             trimmed_side,
@@ -2776,7 +2808,9 @@ def convert_parquet_to_megatron(
         "dtype": dtype_str,
         "token_count": total_tokens,
         "source_capacity_token_count": source_capacity_tokens,
-        "trained_token_count": trained_tokens if side_channels and "loss_mask" in side_channels else None,
+        "trained_token_count": trained_tokens
+        if side_channels and "loss_mask" in side_channels
+        else None,
         "document_count": total_docs,
         "token_column": token_column,
         "length_column": length_column,
@@ -2797,9 +2831,7 @@ def convert_parquet_to_megatron(
     if objective_manifest is not None:
         sidecar_data["objective_contract"] = objective_manifest
     if objective_artifact_manifest is not None:
-        sidecar_data["objective_materialization"] = dict(
-            objective_artifact_manifest
-        )
+        sidecar_data["objective_materialization"] = dict(objective_artifact_manifest)
     _add_case5_manifest(
         sidecar_data,
         validated_shard_count=case5_shard_count,
@@ -2948,13 +2980,17 @@ def main() -> int:
     if args.no_side_channels and args.side_channels:
         raise ValueError("--no-side-channels cannot be combined with --side-channels")
     if args.no_side_channels and args.side_channel_dtypes:
-        raise ValueError("--no-side-channels cannot be combined with --side-channel-dtypes")
+        raise ValueError(
+            "--no-side-channels cannot be combined with --side-channel-dtypes"
+        )
 
     if args.no_side_channels:
         side_channels_list = []
         side_channel_dtypes_list = []
     elif args.side_channels:
-        side_channels_list = [x.strip() for x in args.side_channels.split(",") if x.strip()]
+        side_channels_list = [
+            x.strip() for x in args.side_channels.split(",") if x.strip()
+        ]
         side_channel_dtypes_list = (
             [x.strip() for x in args.side_channel_dtypes.split(",") if x.strip()]
             if args.side_channel_dtypes
@@ -2962,12 +2998,22 @@ def main() -> int:
         )
     else:
         side_channels_list = [name for name, _ in DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS]
-        side_channel_dtypes_list = [dtype for _, dtype in DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS]
+        side_channel_dtypes_list = [
+            dtype for _, dtype in DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS
+        ]
 
     if side_channels_list and not side_channel_dtypes_list:
-        raise ValueError("--side-channel-dtypes must be specified when --side-channels is provided")
-    if side_channels_list and side_channel_dtypes_list and len(side_channels_list) != len(side_channel_dtypes_list):
-        raise ValueError("Number of --side-channels must match number of --side-channel-dtypes")
+        raise ValueError(
+            "--side-channel-dtypes must be specified when --side-channels is provided"
+        )
+    if (
+        side_channels_list
+        and side_channel_dtypes_list
+        and len(side_channels_list) != len(side_channel_dtypes_list)
+    ):
+        raise ValueError(
+            "Number of --side-channels must match number of --side-channel-dtypes"
+        )
     graph_sidecars = (
         None
         if args.no_side_channels or args.no_graph_sidecars
