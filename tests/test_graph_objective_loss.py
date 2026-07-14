@@ -101,6 +101,7 @@ def test_graph_enabled_model_requires_active_dense_dsa_loss(
 ) -> None:
     monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
     monkeypatch.setenv("CPPMEGA_STRUCTURE_ENABLED", "1")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_ENABLED", "1")
 
     with pytest.raises(ValueError, match="dsa_indexer_loss_coeff"):
         require_active_dsa_graph_objective(
@@ -149,12 +150,25 @@ def test_graph_objective_fails_when_routes_or_structure_are_disabled(
         dsa_indexer_loss_coeff=0.001,
         dsa_indexer_use_sparse_loss=False,
     )
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_ENABLED", "1")
     with pytest.raises(ValueError, match="GRAPH_ROUTES_ENABLED.*disabled"):
         require_active_dsa_graph_objective(config)
 
     monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
     with pytest.raises(ValueError, match="STRUCTURE_ENABLED.*disabled"):
         require_active_dsa_graph_objective(config)
+
+
+def test_dense_graph_routes_do_not_require_a_dsa_indexer_coefficient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
+    monkeypatch.setenv("CPPMEGA_STRUCTURE_ENABLED", "1")
+    monkeypatch.delenv("CPPMEGA_DSA_GRAPH_AUX_ENABLED", raising=False)
+
+    require_active_dsa_graph_objective(
+        SimpleNamespace(dsa_indexer_loss_coeff=None), required=False
+    )
 
 
 def test_graph_runtime_config_rejects_non_finite_weight(

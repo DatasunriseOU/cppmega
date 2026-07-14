@@ -84,7 +84,7 @@ class GraphAuxiliaryLossConfig:
 def validate_runtime_graph_contract(graph_contract: Mapping[str, object]) -> None:
     """Require runtime graph-loss knobs to exactly match the data receipt."""
 
-    if not graph_objective_requested():
+    if not _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
         raise ValueError(
             "production graph objective requires CPPMEGA_GRAPH_ROUTES_ENABLED=1"
         )
@@ -92,6 +92,11 @@ def validate_runtime_graph_contract(graph_contract: Mapping[str, object]) -> Non
         raise ValueError(
             "production graph objective requires CPPMEGA_STRUCTURE_ENABLED=1"
         )
+    # Dense GQA consumes the same routes through attention bias and trains them
+    # through LM loss. DSA-specific coefficients apply only when the indexer
+    # auxiliary objective is explicitly enabled.
+    if not graph_objective_requested():
+        return
     config = GraphAuxiliaryLossConfig.from_env()
     expected_relations = tuple(graph_contract.get("relations", ()))
     if config.relations != expected_relations:
@@ -136,7 +141,7 @@ def _env_flag(name: str) -> bool:
 
 
 def graph_objective_requested() -> bool:
-    return _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED")
+    return _env_flag("CPPMEGA_DSA_GRAPH_AUX_ENABLED")
 
 
 def require_active_dsa_graph_objective(
@@ -150,7 +155,11 @@ def require_active_dsa_graph_objective(
         return
     if not graph_objective_requested():
         raise ValueError(
-            "graph objective requested but CPPMEGA_GRAPH_ROUTES_ENABLED is disabled"
+            "DSA graph objective requested but CPPMEGA_DSA_GRAPH_AUX_ENABLED is disabled"
+        )
+    if not _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
+        raise ValueError(
+            "DSA graph objective requested but CPPMEGA_GRAPH_ROUTES_ENABLED is disabled"
         )
     if not _env_flag("CPPMEGA_STRUCTURE_ENABLED"):
         raise ValueError(
