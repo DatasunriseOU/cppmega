@@ -242,6 +242,11 @@ def _bounded_v2_sampling() -> dict[str, object]:
             "rows": "seeded_permutation_within_record_batch",
         },
         "cursor_semantics": "last_yielded_row_v1",
+        "producer": {
+            "name": "pyarrow.parquet.ParquetFile.iter_batches",
+            "version": 1,
+            "row_group_rows": [[2]],
+        },
         "final_cursor": {
             "epoch": 2,
             "shard_position": 0,

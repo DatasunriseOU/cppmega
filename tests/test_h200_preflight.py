@@ -7,7 +7,12 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from cppmega.megatron.h200_preflight import observe_graph_prior, observe_production_batch
+from cppmega.megatron.h200_preflight import (
+    GRAPH_CHUNK_KIND_COUNT,
+    GraphChunkKind,
+    observe_graph_prior,
+    observe_production_batch,
+)
 from cppmega.megatron.checkpoint_restore_preflight import state_fingerprint
 from scripts.h200_megatron_preflight import (
     _claimed_backend_modules,
@@ -87,6 +92,55 @@ def test_observe_production_batch_records_nonzero_structure_and_graph(tmp_path):
         "route_edge_counts": {"domain": 1},
     }
     assert json.loads(receipt_path.read_text(encoding="utf-8")) == receipt
+
+
+def test_observe_production_batch_accepts_canonical_other_chunk_kind_zero(tmp_path):
+    structure = _structure_batch()
+    structure["graph_chunk_kinds"].fill_(int(GraphChunkKind.OTHER))
+
+    receipt = observe_production_batch(
+        batch=_production_batch(),
+        structure_batch=structure,
+        receipt_path=tmp_path / "batch.json",
+    )
+
+    assert int(GraphChunkKind.OTHER) == 0
+    assert receipt["structure"]["graph_chunk_kinds"]["nonzero"] == 0
+    assert receipt["active_graph"]["chunk_count"] == 2
+
+
+def test_observe_production_batch_rejects_out_of_range_chunk_kind(tmp_path):
+    structure = _structure_batch()
+    structure["graph_chunk_kinds"][0, 0] = GRAPH_CHUNK_KIND_COUNT
+
+    with pytest.raises(RuntimeError, match="chunk kind.*canonical range"):
+        observe_production_batch(
+            batch=_production_batch(),
+            structure_batch=structure,
+            receipt_path=tmp_path / "batch.json",
+        )
+
+
+@pytest.mark.parametrize(
+    ("starts", "ends"),
+    (
+        ([0, 1], [2, 4]),
+        ([2, 0], [4, 2]),
+    ),
+)
+def test_observe_production_batch_rejects_unordered_or_overlapping_chunks(
+    tmp_path, starts, ends
+):
+    structure = _structure_batch()
+    structure["graph_chunk_starts"][0] = torch.tensor(starts)
+    structure["graph_chunk_ends"][0] = torch.tensor(ends)
+
+    with pytest.raises(RuntimeError, match="ordered and nonoverlapping"):
+        observe_production_batch(
+            batch=_production_batch(),
+            structure_batch=structure,
+            receipt_path=tmp_path / "batch.json",
+        )
 
 
 def test_observe_production_batch_rejects_zero_structure_before_receipt(tmp_path):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from enum import IntEnum
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,29 @@ from cppmega.receipt_binding import (
     validate_binding_shape,
     validate_receipt_binding,
 )
+
+
+class GraphChunkKind(IntEnum):
+    OTHER = 0
+    PREAMBLE = 1
+    FUNCTION_SIGNATURE = 2
+    FUNCTION_BODY = 3
+    CLASS_DECLARATION = 4
+    CLASS_MEMBER = 5
+    COMMENT = 6
+    TYPEDEF = 7
+    NAMESPACE = 8
+    BUILD = 9
+    HEADER_FRAGMENT = 10
+    MACRO = 11
+
+
+GRAPH_CHUNK_KIND_COUNT = len(GraphChunkKind)
+if tuple(int(kind) for kind in GraphChunkKind) != tuple(
+    range(GRAPH_CHUNK_KIND_COUNT)
+):
+    raise RuntimeError("GraphChunkKind values must remain contiguous from zero")
+
 
 REQUIRED_BATCH_FIELDS = ("tokens", "labels", "loss_mask")
 REQUIRED_GRAPH_BATCH_FIELDS = (
@@ -155,10 +179,20 @@ def _validate_active_graph(
             torch.any(starts < 0)
             or torch.any(ends <= starts)
             or torch.any(ends > token_shape[1])
-            or torch.any(kinds <= 0)
             or torch.any(levels < 0)
         ):
-            raise RuntimeError("production active graph chunk spans/kinds are invalid")
+            raise RuntimeError("production active graph chunk spans are invalid")
+        if torch.any(kinds < int(GraphChunkKind.OTHER)) or torch.any(
+            kinds >= GRAPH_CHUNK_KIND_COUNT
+        ):
+            raise RuntimeError(
+                "production graph chunk kind is outside the canonical range "
+                f"[0,{GRAPH_CHUNK_KIND_COUNT})"
+            )
+        if count > 1 and torch.any(starts[1:] < ends[:-1]):
+            raise RuntimeError(
+                "production graph chunks must be ordered and nonoverlapping"
+            )
         total_chunks += count
         max_end = max(max_end, int(ends.max().item()))
         chunk_docs: list[int] = []
@@ -323,8 +357,6 @@ def observe_production_batch(
         raise RuntimeError("production graph_chunk_counts must be nonzero")
     if structure_summary["graph_chunk_ends"]["nonzero"] <= 0:
         raise RuntimeError("production graph_chunk_ends must contain nonzero values")
-    if structure_summary["graph_chunk_kinds"]["nonzero"] <= 0:
-        raise RuntimeError("production graph_chunk_kinds must contain nonzero values")
     active_graph = _validate_active_graph(batch, structure_batch)
     source_doc_ids = structure_batch["source_doc_ids"].detach().to(device="cpu")
     positive_source_ids = source_doc_ids[source_doc_ids > 0]

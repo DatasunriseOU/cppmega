@@ -101,6 +101,11 @@ def _bounded_v2_sampling() -> dict[str, object]:
             "rows": "seeded_permutation_within_record_batch",
         },
         "cursor_semantics": "last_yielded_row_v1",
+        "producer": {
+            "name": "pyarrow.parquet.ParquetFile.iter_batches",
+            "version": 1,
+            "row_group_rows": [[2]],
+        },
         "final_cursor": {
             "epoch": 2,
             "shard_position": 0,
@@ -140,6 +145,24 @@ def _malform_bounded_v2_sampling(
         cursor = sampling["final_cursor"]
         assert isinstance(cursor, dict)
         cursor.pop("row_index_in_record_batch")
+    elif malformation == "missing_producer":
+        sampling.pop("producer")
+    elif malformation == "invalid_producer_version":
+        producer = sampling["producer"]
+        assert isinstance(producer, dict)
+        producer["version"] = 2
+    elif malformation == "invalid_producer_name":
+        producer = sampling["producer"]
+        assert isinstance(producer, dict)
+        producer["name"] = "unknown"
+    elif malformation == "extra_producer_field":
+        producer = sampling["producer"]
+        assert isinstance(producer, dict)
+        producer["unbound"] = True
+    elif malformation == "producer_layout_mismatch":
+        producer = sampling["producer"]
+        assert isinstance(producer, dict)
+        producer["row_group_rows"] = [[1]]
     elif malformation == "wrong_source_index":
         cursor = sampling["final_cursor"]
         assert isinstance(cursor, dict)
@@ -365,6 +388,7 @@ def _prefix_bundle(tmp_path):
         _write_bytes(prefix.parent / data_rel, payload)
         graph_sidecar_paths[name] = {
             "kind": kind,
+            "coordinate_space": publisher.GRAPH_ROUTE_COORDINATE_SPACES[name],
             "offsets_path": offsets_rel,
             "data_path": data_rel,
             "offset_dtype": "int64",
@@ -642,6 +666,44 @@ def _prefix_bundle(tmp_path):
     return prefix
 
 
+def _set_graph_chunks(
+    prefix: Path,
+    *,
+    starts: list[int],
+    ends: list[int],
+    kinds: list[int] | None = None,
+    dep_levels: list[int] | None = None,
+) -> None:
+    if len(starts) != len(ends):
+        raise AssertionError("test graph chunk spans must be aligned")
+    count = len(starts)
+    kinds = [1] * count if kinds is None else kinds
+    dep_levels = [0] * count if dep_levels is None else dep_levels
+    if not len(kinds) == len(dep_levels) == count:
+        raise AssertionError("test graph chunk metadata must be aligned")
+    manifest_path = prefix.with_suffix(".json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    values = {
+        "token_chunk_starts": (starts, "I"),
+        "token_chunk_ends": (ends, "I"),
+        "token_chunk_kinds": (kinds, "B"),
+        "token_chunk_dep_levels": (dep_levels, "H"),
+    }
+    document_count = int(manifest["document_count"])
+    for name, (items, code) in values.items():
+        spec = manifest["graph_sidecar_paths"][name]
+        spec["item_count"] = count
+        _write_bytes(
+            prefix.parent / spec["offsets_path"],
+            struct.pack(f"<{document_count + 1}q", 0, *([count] * document_count)),
+        )
+        _write_bytes(
+            prefix.parent / spec["data_path"],
+            struct.pack(f"<{count}{code}", *items),
+        )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
 def _rehash_bundle_manifest(tmp_path):
     manifest_path = tmp_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -729,6 +791,9 @@ def test_publisher_validates_seeded_shard_cursor_permutation():
     cursor = sampling["final_cursor"]
     assert isinstance(cursor, dict)
     cursor.update({"epoch": 0, "shard_index": 1, "source_index": 0})
+    producer = sampling["producer"]
+    assert isinstance(producer, dict)
+    producer["row_group_rows"] = [[2], [1, 2], [4]]
 
     publisher._validate_objective_source_sampling(
         sampling,
@@ -739,13 +804,69 @@ def test_publisher_validates_seeded_shard_cursor_permutation():
     )
 
     cursor["shard_index"] = 0
-    with pytest.raises(ValueError, match="final_cursor shard drifted"):
+    with pytest.raises(ValueError, match="final_cursor.*replay"):
         publisher._validate_objective_source_sampling(
             sampling,
             bucket=1024,
             total_rows=9,
             file_count=3,
             source_rows=(2, 3, 4),
+        )
+
+
+@pytest.mark.parametrize(
+    "coordinate",
+    tuple(sorted(publisher.OBJECTIVE_SAMPLING_V2_CURSOR_KEYS)),
+)
+def test_publisher_rejects_each_inexact_v2_replay_cursor_coordinate(coordinate):
+    sampling = _bounded_v2_sampling()
+    sampling.update(
+        {
+            "seed": 1,
+            "requested_samples": 13,
+            "full_passes": 0,
+            "tail_rows": 13,
+            "min_row_reuse": 0,
+            "max_row_reuse": 1,
+        }
+    )
+    producer = sampling["producer"]
+    assert isinstance(producer, dict)
+    producer["row_group_rows"] = [[3, 4], [2, 5], [1, 3, 2]]
+    cursor = sampling["final_cursor"]
+    assert isinstance(cursor, dict)
+    cursor.update(
+        {
+            "epoch": 0,
+            "shard_position": 1,
+            "shard_index": 0,
+            "row_group_position": 1,
+            "row_group_index": 1,
+            "record_batch_index": 1,
+            "row_shuffle_position": 1,
+            "row_index_in_record_batch": 0,
+            "source_index": 12,
+        }
+    )
+
+    publisher._validate_objective_source_sampling(
+        sampling,
+        bucket=1024,
+        total_rows=20,
+        file_count=3,
+        source_rows=(7, 7, 6),
+    )
+
+    tampered = json.loads(json.dumps(sampling))
+    tampered_cursor = tampered["final_cursor"]
+    tampered_cursor[coordinate] = 0 if cursor[coordinate] != 0 else 1
+    with pytest.raises(ValueError, match="final_cursor.*replay"):
+        publisher._validate_objective_source_sampling(
+            tampered,
+            bucket=1024,
+            total_rows=20,
+            file_count=3,
+            source_rows=(7, 7, 6),
         )
 
 
@@ -757,6 +878,11 @@ def test_publisher_validates_seeded_shard_cursor_permutation():
         "invalid_record_batch_rows",
         "ordering_drift",
         "missing_cursor_coordinate",
+        "missing_producer",
+        "invalid_producer_version",
+        "invalid_producer_name",
+        "extra_producer_field",
+        "producer_layout_mismatch",
         "wrong_source_index",
         "wrong_epoch",
     ),
@@ -906,6 +1032,43 @@ def test_validate_bundle_requires_positive_uint32_source_doc_ids(tmp_path):
 
     with pytest.raises(ValueError, match="token_source_doc_ids.*positive"):
         _validate_bundle(tmp_path, hash_jobs=1)
+
+
+@pytest.mark.parametrize(
+    "first_sequence_doc_ids",
+    (
+        [0, 1, 1, 1],
+        [2, 2, 2, 2],
+        [1, 3, 3, 3],
+        [1, 2, 1, 1],
+    ),
+)
+def test_validate_prefix_rejects_noncanonical_attention_doc_ids(
+    tmp_path, first_sequence_doc_ids
+):
+    prefix = _prefix_bundle(tmp_path)
+    manifest = json.loads(prefix.with_suffix(".json").read_text(encoding="utf-8"))
+    spec = manifest["side_channel_paths"]["doc_ids"]
+    path = prefix.parent / spec["path"]
+    values = list(struct.unpack("<24I", path.read_bytes()))
+    values[:4] = first_sequence_doc_ids
+    path.write_bytes(struct.pack("<24I", *values))
+
+    with pytest.raises(ValueError, match="doc_ids.*contiguous.*1..N"):
+        publisher._validate_prefix_manifest_contract(prefix)
+
+
+def test_validate_prefix_matches_attention_segments_to_source_platform_csr(tmp_path):
+    prefix = _prefix_bundle(tmp_path)
+    manifest = json.loads(prefix.with_suffix(".json").read_text(encoding="utf-8"))
+    spec = manifest["side_channel_paths"]["doc_ids"]
+    path = prefix.parent / spec["path"]
+    values = list(struct.unpack("<24I", path.read_bytes()))
+    values[:4] = [1, 1, 2, 2]
+    path.write_bytes(struct.pack("<24I", *values))
+
+    with pytest.raises(ValueError, match="doc_ids cover 2.*source platform.*1"):
+        publisher._validate_prefix_manifest_contract(prefix)
 
 
 def test_validate_bundle_rejects_source_identity_sidecar_registry_mismatch(tmp_path):
@@ -1189,6 +1352,76 @@ def test_validate_prefix_accepts_canonical_other_chunk_kind_zero(tmp_path):
     (prefix.parent / spec["data_path"]).write_bytes(struct.pack("<B", 0))
 
     publisher._validate_prefix_manifest_contract(prefix)
+
+
+def test_validate_prefix_rejects_out_of_range_chunk_kind(tmp_path):
+    prefix = _prefix_bundle(tmp_path)
+    manifest = json.loads(prefix.with_suffix(".json").read_text(encoding="utf-8"))
+    spec = manifest["graph_sidecar_paths"]["token_chunk_kinds"]
+    (prefix.parent / spec["data_path"]).write_bytes(
+        struct.pack("<B", publisher.GRAPH_CHUNK_KIND_COUNT)
+    )
+
+    with pytest.raises(ValueError, match="chunk kind.*canonical range"):
+        publisher._validate_prefix_manifest_contract(prefix)
+
+
+def test_validate_prefix_accepts_ordered_touching_graph_chunks(tmp_path):
+    prefix = _prefix_bundle(tmp_path)
+    _set_graph_chunks(prefix, starts=[0, 2], ends=[2, 4], kinds=[0, 11])
+
+    publisher._validate_prefix_manifest_contract(prefix)
+
+
+@pytest.mark.parametrize(
+    ("starts", "ends"),
+    (
+        ([0, 1], [2, 4]),
+        ([2, 0], [4, 2]),
+    ),
+)
+def test_validate_prefix_rejects_overlapping_or_unordered_graph_chunks(
+    tmp_path, starts, ends
+):
+    prefix = _prefix_bundle(tmp_path)
+    _set_graph_chunks(prefix, starts=starts, ends=ends)
+
+    with pytest.raises(ValueError, match="ordered and nonoverlapping"):
+        publisher._validate_prefix_manifest_contract(prefix)
+
+
+@pytest.mark.parametrize("mutation", ("missing", "unexpected"))
+def test_validate_prefix_requires_exact_graph_sidecar_key_set(tmp_path, mutation):
+    prefix = _prefix_bundle(tmp_path)
+    manifest_path = prefix.with_suffix(".json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    graph_paths = manifest["graph_sidecar_paths"]
+    if mutation == "missing":
+        graph_paths.pop("token_call_edges")
+    else:
+        graph_paths["token_unknown_edges"] = dict(graph_paths["token_call_edges"])
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=f"graph sidecar key set.*{mutation}"):
+        publisher._validate_prefix_manifest_contract(prefix)
+
+
+@pytest.mark.parametrize("coordinate_space", (None, "token_index"))
+def test_validate_prefix_requires_exact_graph_coordinate_space(
+    tmp_path, coordinate_space
+):
+    prefix = _prefix_bundle(tmp_path)
+    manifest_path = prefix.with_suffix(".json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    spec = manifest["graph_sidecar_paths"]["token_call_edges"]
+    if coordinate_space is None:
+        spec.pop("coordinate_space")
+    else:
+        spec["coordinate_space"] = coordinate_space
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="coordinate_space"):
+        publisher._validate_prefix_manifest_contract(prefix)
 
 
 def test_validate_prefix_accepts_graph_route_across_source_constituents(tmp_path):

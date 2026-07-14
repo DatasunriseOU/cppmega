@@ -51,8 +51,13 @@ from cppmega.megatron.domain_route_contract import (  # noqa: E402
     DOMAIN_ROUTE_COLUMNS,
     DOMAIN_SCHEMA_SHA256,
     GRAPH_ROUTE_COLUMNS,
+    GRAPH_ROUTE_COORDINATE_SPACES,
     SOURCE_IDENTITY_REGISTRY_SCHEMA,
     TOKENIZER_CONTRACT_SHA256,
+)
+from cppmega.megatron.h200_preflight import (  # noqa: E402
+    GRAPH_CHUNK_KIND_COUNT,
+    GraphChunkKind,
 )
 
 
@@ -89,6 +94,7 @@ OBJECTIVE_SAMPLING_V2_KEYS = OBJECTIVE_SAMPLING_BASE_KEYS | {
     "record_batch_rows",
     "ordering",
     "cursor_semantics",
+    "producer",
     "final_cursor",
 }
 OBJECTIVE_SAMPLING_V2_ORDERING = {
@@ -111,6 +117,11 @@ OBJECTIVE_SAMPLING_V2_CURSOR_KEYS = frozenset(
         "row_index_in_record_batch",
         "source_index",
     }
+)
+OBJECTIVE_SAMPLING_V2_PRODUCER_NAME = "pyarrow.parquet.ParquetFile.iter_batches"
+OBJECTIVE_SAMPLING_V2_PRODUCER_VERSION = 1
+OBJECTIVE_SAMPLING_V2_PRODUCER_KEYS = frozenset(
+    {"name", "version", "row_group_rows"}
 )
 CANONICAL_TOKENIZER_CONTRACT_PATH = (
     REPO_ROOT / "data/tokenizer_v2/tokenizer_contract_v1.json"
@@ -199,6 +210,8 @@ GRAPH_SIDECAR_SPECS = {
 }
 REQUIRED_TOKEN_SIDECARS = set(TOKEN_SIDECAR_DTYPES)
 REQUIRED_GRAPH_SIDECARS = set(GRAPH_SIDECAR_SPECS)
+if REQUIRED_GRAPH_SIDECARS != set(GRAPH_ROUTE_COORDINATE_SPACES):
+    raise RuntimeError("graph sidecar coordinate contract is incomplete")
 NONZERO_GRAPH_SIDECARS = {
     "token_chunk_starts",
     "token_chunk_ends",
@@ -598,6 +611,7 @@ def _validate_graph_provenance(
     *,
     lengths: list[int],
     document_id_path: Path,
+    source_document_offsets: list[int],
     graph_files: dict[str, tuple[list[int], Path, dict]],
 ) -> dict[str, object]:
     sequence_starts = np.cumsum([0, *lengths[:-1]], dtype=np.int64)
@@ -638,6 +652,28 @@ def _validate_graph_provenance(
     route_counts = {name: 0 for name in ROUTE_GRAPH_SIDECARS}
     for sequence_index, length in enumerate(lengths):
         sequence_start = int(sequence_starts[sequence_index])
+        sequence_docs = document_ids[sequence_start : sequence_start + length]
+        transitions = np.diff(sequence_docs.astype(np.int64, copy=False))
+        if (
+            sequence_docs.size == 0
+            or int(sequence_docs[0]) != 1
+            or np.any((transitions != 0) & (transitions != 1))
+        ):
+            raise ValueError(
+                "doc_ids must be positive contiguous, non-reused sequence-local "
+                f"IDs 1..N in sequence {sequence_index}"
+            )
+        segment_count = int(sequence_docs[-1])
+        expected_segment_count = int(
+            source_document_offsets[sequence_index + 1]
+            - source_document_offsets[sequence_index]
+        )
+        if segment_count != expected_segment_count:
+            raise ValueError(
+                f"doc_ids cover {segment_count} attention segments but source "
+                f"platform sequence CSR declares {expected_segment_count} in "
+                f"sequence {sequence_index}"
+            )
         chunk_begin, chunk_end = (
             int(chunk_offsets[sequence_index]),
             int(chunk_offsets[sequence_index + 1]),
@@ -650,11 +686,22 @@ def _validate_graph_provenance(
             np.any(starts < 0)
             or np.any(ends <= starts)
             or np.any(ends > length)
-            or np.any(kinds < 0)
             or np.any(levels < 0)
         ):
             raise ValueError(
-                f"invalid graph chunk spans/kinds in sequence {sequence_index}"
+                f"invalid graph chunk spans in sequence {sequence_index}"
+            )
+        if np.any(kinds < int(GraphChunkKind.OTHER)) or np.any(
+            kinds >= GRAPH_CHUNK_KIND_COUNT
+        ):
+            raise ValueError(
+                "graph chunk kind is outside the canonical range "
+                f"[0,{GRAPH_CHUNK_KIND_COUNT}) in sequence {sequence_index}"
+            )
+        if len(starts) > 1 and np.any(starts[1:] < ends[:-1]):
+            raise ValueError(
+                "graph chunks must be ordered and nonoverlapping in "
+                f"sequence {sequence_index}"
             )
         chunk_docs: list[int] = []
         for local_start, local_end in zip(starts, ends, strict=True):
@@ -999,9 +1046,13 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
         )
     if not isinstance(graph_paths, dict):
         raise ValueError(f"{manifest_path}: graph_sidecar_paths must be an object")
-    missing_graph = sorted(REQUIRED_GRAPH_SIDECARS - set(graph_paths))
-    if missing_graph:
-        raise ValueError(f"{manifest_path}: missing graph sidecars {missing_graph}")
+    graph_keys = set(graph_paths)
+    if graph_keys != REQUIRED_GRAPH_SIDECARS:
+        raise ValueError(
+            f"{manifest_path}: graph sidecar key set must be exact; "
+            f"missing={sorted(REQUIRED_GRAPH_SIDECARS - graph_keys)} "
+            f"unexpected={sorted(graph_keys - REQUIRED_GRAPH_SIDECARS)}"
+        )
     graph_item_counts: dict[str, int] = {}
     graph_files: dict[str, tuple[list[int], Path, dict]] = {}
     for name in REQUIRED_GRAPH_SIDECARS:
@@ -1011,6 +1062,12 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
         expected_kind, expected_dtype, expected_shape_tail = GRAPH_SIDECAR_SPECS[name]
         if spec.get("kind") != expected_kind:
             raise ValueError(f"{manifest_path}: graph sidecar {name} has bad kind")
+        expected_coordinate_space = GRAPH_ROUTE_COORDINATE_SPACES[name]
+        if spec.get("coordinate_space") != expected_coordinate_space:
+            raise ValueError(
+                f"{manifest_path}: graph sidecar {name} coordinate_space "
+                f"{spec.get('coordinate_space')!r} != {expected_coordinate_space!r}"
+            )
         dtype = str(spec.get("dtype", ""))
         if dtype != expected_dtype:
             raise ValueError(
@@ -1076,11 +1133,6 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
         lengths=lengths,
         sidecar_files=sidecar_files,
     )
-    _validate_graph_provenance(
-        lengths=lengths,
-        document_id_path=sidecar_files["doc_ids"],
-        graph_files=graph_files,
-    )
     source_identity_registry_path = _validate_case5_source_registry(
         prefix=prefix,
         manifest=data,
@@ -1134,6 +1186,12 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
     if platform_ids_path.stat().st_size != platform_id_count * 2:
         raise ValueError(f"{manifest_path}: source platform IDs size mismatch")
     referenced.update((sequence_offsets_path, document_offsets_path, platform_ids_path))
+    _validate_graph_provenance(
+        lengths=lengths,
+        document_id_path=sidecar_files["doc_ids"],
+        source_document_offsets=sequence_offsets,
+        graph_files=graph_files,
+    )
     objective = data.get("objective_contract")
     if objective is None:
         raise ValueError(f"{manifest_path}: objective_contract is required")
@@ -1345,6 +1403,128 @@ def _objective_sampling_permutation(
     return sorted(range(size), key=sort_key)
 
 
+def _validate_objective_sampling_v2_producer(
+    producer: object,
+    *,
+    bucket: int,
+    total_rows: int,
+    file_count: int,
+    source_rows: tuple[int, ...] | None,
+) -> tuple[tuple[int, ...], ...]:
+    if (
+        not isinstance(producer, dict)
+        or set(producer) != OBJECTIVE_SAMPLING_V2_PRODUCER_KEYS
+    ):
+        raise ValueError(
+            f"bucket {bucket} objective source replay producer metadata is invalid"
+        )
+    if (
+        producer["name"] != OBJECTIVE_SAMPLING_V2_PRODUCER_NAME
+        or producer["version"] != OBJECTIVE_SAMPLING_V2_PRODUCER_VERSION
+        or not _is_plain_int(producer["version"])
+    ):
+        raise ValueError(
+            f"bucket {bucket} objective source replay producer is unsupported"
+        )
+    raw_layout = producer["row_group_rows"]
+    if not isinstance(raw_layout, list) or len(raw_layout) != file_count:
+        raise ValueError(
+            f"bucket {bucket} objective source producer row-group layout is invalid"
+        )
+    layout: list[tuple[int, ...]] = []
+    for shard_index, raw_groups in enumerate(raw_layout):
+        if (
+            not isinstance(raw_groups, list)
+            or not raw_groups
+            or any(not _is_plain_int(rows) or rows < 1 for rows in raw_groups)
+        ):
+            raise ValueError(
+                f"bucket {bucket} objective source producer row-group layout "
+                f"is invalid for shard {shard_index}"
+            )
+        groups = tuple(int(rows) for rows in raw_groups)
+        if source_rows is not None and sum(groups) != source_rows[shard_index]:
+            raise ValueError(
+                f"bucket {bucket} objective source producer row-group layout "
+                f"drifted for shard {shard_index}"
+            )
+        layout.append(groups)
+    if sum(sum(groups) for groups in layout) != total_rows:
+        raise ValueError(
+            f"bucket {bucket} objective source producer row-group totals drifted"
+        )
+    return tuple(layout)
+
+
+def _objective_sampling_v2_final_cursor(
+    *,
+    seed: int,
+    requested_samples: int,
+    record_batch_rows: int,
+    row_group_rows: tuple[tuple[int, ...], ...],
+) -> dict[str, int]:
+    total_rows = sum(sum(groups) for groups in row_group_rows)
+    source_index = requested_samples - 1
+    epoch, remaining = divmod(source_index, total_rows)
+    shard_order = _objective_sampling_permutation(
+        len(row_group_rows),
+        seed=seed,
+        components=("shards", epoch),
+    )
+    for shard_position, shard_index in enumerate(shard_order):
+        shard_rows = sum(row_group_rows[shard_index])
+        if remaining < shard_rows:
+            break
+        remaining -= shard_rows
+    else:  # pragma: no cover - validated positive layout makes this unreachable
+        raise AssertionError("objective source replay exceeded shard layout")
+
+    shard_row_groups = row_group_rows[shard_index]
+    row_group_order = _objective_sampling_permutation(
+        len(shard_row_groups),
+        seed=seed,
+        components=("row_groups", epoch, shard_index),
+    )
+    for row_group_position, row_group_index in enumerate(row_group_order):
+        row_group_size = shard_row_groups[row_group_index]
+        if remaining < row_group_size:
+            break
+        remaining -= row_group_size
+    else:  # pragma: no cover - validated positive layout makes this unreachable
+        raise AssertionError("objective source replay exceeded row-group layout")
+
+    record_batch_index, row_shuffle_position = divmod(
+        remaining, record_batch_rows
+    )
+    record_batch_start = record_batch_index * record_batch_rows
+    record_batch_size = min(
+        record_batch_rows,
+        row_group_size - record_batch_start,
+    )
+    row_order = _objective_sampling_permutation(
+        record_batch_size,
+        seed=seed,
+        components=(
+            "rows",
+            epoch,
+            shard_index,
+            row_group_index,
+            record_batch_index,
+        ),
+    )
+    return {
+        "epoch": epoch,
+        "shard_position": shard_position,
+        "shard_index": shard_index,
+        "row_group_position": row_group_position,
+        "row_group_index": row_group_index,
+        "record_batch_index": record_batch_index,
+        "row_shuffle_position": row_shuffle_position,
+        "row_index_in_record_batch": row_order[row_shuffle_position],
+        "source_index": source_index,
+    }
+
+
 def _validate_objective_source_sampling(
     sampling: object,
     *,
@@ -1404,6 +1584,17 @@ def _validate_objective_source_sampling(
         )
     if sampling["cursor_semantics"] != "last_yielded_row_v1":
         raise ValueError(f"bucket {bucket} objective source cursor semantics drifted")
+    if source_rows is not None and (
+        len(source_rows) != file_count or sum(source_rows) != total_rows
+    ):
+        raise ValueError(f"bucket {bucket} objective source row counts drifted")
+    row_group_rows = _validate_objective_sampling_v2_producer(
+        sampling["producer"],
+        bucket=bucket,
+        total_rows=total_rows,
+        file_count=file_count,
+        source_rows=source_rows,
+    )
 
     cursor = sampling["final_cursor"]
     if not isinstance(cursor, dict) or set(cursor) != OBJECTIVE_SAMPLING_V2_CURSOR_KEYS:
@@ -1416,50 +1607,20 @@ def _validate_objective_source_sampling(
             f"bucket {bucket} objective source final_cursor values are invalid"
         )
 
-    expected_source_index = requested - 1
-    expected_epoch, source_offset = divmod(expected_source_index, total_rows)
-    if (
-        cursor["source_index"] != expected_source_index
-        or cursor["epoch"] != expected_epoch
-        or cursor["shard_position"] >= file_count
-        or cursor["shard_index"] >= file_count
-    ):
-        raise ValueError(f"bucket {bucket} objective source final_cursor drifted")
-
-    target_rows = total_rows
-    if source_rows is not None:
-        if len(source_rows) != file_count or sum(source_rows) != total_rows:
-            raise ValueError(f"bucket {bucket} objective source row counts drifted")
-        shard_order = _objective_sampling_permutation(
-            file_count,
-            seed=sampling["seed"],
-            components=("shards", expected_epoch),
-        )
-        remaining = source_offset
-        for shard_position, shard_index in enumerate(shard_order):
-            target_rows = source_rows[shard_index]
-            if remaining < target_rows:
-                break
-            remaining -= target_rows
-        if (
-            cursor["shard_position"] != shard_position
-            or cursor["shard_index"] != shard_index
-        ):
-            raise ValueError(
-                f"bucket {bucket} objective source final_cursor shard drifted"
-            )
-
-    max_record_batches = (target_rows + record_batch_rows - 1) // record_batch_rows
-    max_batch_rows = min(record_batch_rows, target_rows)
-    if (
-        cursor["row_group_position"] >= target_rows
-        or cursor["row_group_index"] >= target_rows
-        or cursor["record_batch_index"] >= max_record_batches
-        or cursor["row_shuffle_position"] >= max_batch_rows
-        or cursor["row_index_in_record_batch"] >= max_batch_rows
-    ):
+    expected_cursor = _objective_sampling_v2_final_cursor(
+        seed=sampling["seed"],
+        requested_samples=requested,
+        record_batch_rows=record_batch_rows,
+        row_group_rows=row_group_rows,
+    )
+    if cursor != expected_cursor:
+        drift = {
+            field: {"actual": cursor[field], "expected": expected_cursor[field]}
+            for field in OBJECTIVE_SAMPLING_V2_CURSOR_KEYS
+            if cursor[field] != expected_cursor[field]
+        }
         raise ValueError(
-            f"bucket {bucket} objective source final_cursor bounds drifted"
+            f"bucket {bucket} objective source final_cursor replay drifted: {drift}"
         )
     return sampling
 
