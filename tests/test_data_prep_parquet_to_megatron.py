@@ -11,6 +11,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from cppmega.megatron.graph_recipe import (
+    STAGE1_GRAPH_RELATIONS,
+    STAGE1_GRAPH_TOPK,
+    stage1_graph_recipe_binding,
+)
 from cppmega.megatron.objective_contract import (
     LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
     OBJECTIVE_CONTRACT_SCHEMA,
@@ -158,7 +163,8 @@ def _objective_contract() -> dict[str, object]:
             "rendered_text_parsing": False,
         },
         "graph_auxiliary": {
-            "relations": ["call", "type"],
+            "recipe": stage1_graph_recipe_binding(),
+            "relations": list(STAGE1_GRAPH_RELATIONS),
             "eligible_samples": 1,
             "positive_edges": 5,
             "global_weight": "1",
@@ -167,7 +173,7 @@ def _objective_contract() -> dict[str, object]:
             "layer_reduction": "sum",
             "bce_weight": "1/10",
             "coverage_weight": "1/20",
-            "topk": 8,
+            "topk": STAGE1_GRAPH_TOPK,
             "pos_weight": "1",
             "margin": "1",
             "included_in_total_loss": True,
@@ -234,7 +240,7 @@ def _write_objective_artifact(input_dir: Path) -> Path:
             "loss_mask_alignment": (
                 LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1
             ),
-            "graph_relations": ["call", "type"],
+            "graph_relations": list(STAGE1_GRAPH_RELATIONS),
             "graph_pair_mask": "causal_same_document_upstream_v1",
             "chunk_edge_expansion": "cartesian_token_spans_v1",
         },

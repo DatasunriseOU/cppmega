@@ -11,6 +11,12 @@ from fractions import Fraction
 import torch
 import torch.nn.functional as F
 
+from cppmega.megatron.graph_recipe import (
+    STAGE1_GRAPH_RELATIONS,
+    stage1_graph_config_kwargs,
+    validate_stage1_graph_contract,
+)
+
 
 @dataclass(frozen=True)
 class GraphAuxiliaryLossConfig:
@@ -22,7 +28,7 @@ class GraphAuxiliaryLossConfig:
     layer_weight: float = 1.0
     pos_weight: float = 1.0
     margin: float = 1.0
-    relations: tuple[str, ...] = ("call", "type")
+    relations: tuple[str, ...] = STAGE1_GRAPH_RELATIONS
 
     def __post_init__(self) -> None:
         for name in (
@@ -48,33 +54,63 @@ class GraphAuxiliaryLossConfig:
 
     @classmethod
     def from_env(cls) -> "GraphAuxiliaryLossConfig":
+        defaults = stage1_graph_config_kwargs()
         relations = tuple(
             item.strip()
             for item in os.environ.get(
-                "CPPMEGA_DSA_GRAPH_AUX_RELATIONS", "call,type"
+                "CPPMEGA_DSA_GRAPH_AUX_RELATIONS",
+                ",".join(STAGE1_GRAPH_RELATIONS),
             ).split(",")
             if item.strip()
         )
         try:
             return cls(
                 global_weight=float(
-                    os.environ.get("CPPMEGA_DSA_GRAPH_AUX_WEIGHT", "1.0")
+                    os.environ.get(
+                        "CPPMEGA_DSA_GRAPH_AUX_WEIGHT",
+                        str(defaults["global_weight"]),
+                    )
                 ),
                 indexer_weight=float(
-                    os.environ.get("CPPMEGA_DSA_INDEXER_LOSS_COEFF", "0.001")
+                    os.environ.get(
+                        "CPPMEGA_DSA_INDEXER_LOSS_COEFF",
+                        str(defaults["indexer_weight"]),
+                    )
                 ),
                 layer_weight=float(
-                    os.environ.get("CPPMEGA_DSA_GRAPH_LAYER_WEIGHT", "1.0")
+                    os.environ.get(
+                        "CPPMEGA_DSA_GRAPH_LAYER_WEIGHT",
+                        str(defaults["layer_weight"]),
+                    )
                 ),
                 bce_weight=float(
-                    os.environ.get("CPPMEGA_DSA_GRAPH_BCE_WEIGHT", "0.10")
+                    os.environ.get(
+                        "CPPMEGA_DSA_GRAPH_BCE_WEIGHT",
+                        str(defaults["bce_weight"]),
+                    )
                 ),
                 coverage_weight=float(
-                    os.environ.get("CPPMEGA_DSA_GRAPH_COVERAGE_WEIGHT", "0.05")
+                    os.environ.get(
+                        "CPPMEGA_DSA_GRAPH_COVERAGE_WEIGHT",
+                        str(defaults["coverage_weight"]),
+                    )
                 ),
-                topk=int(os.environ.get("CPPMEGA_DSA_GRAPH_AUX_TOPK", "8")),
-                pos_weight=float(os.environ.get("CPPMEGA_DSA_GRAPH_POS_WEIGHT", "1.0")),
-                margin=float(os.environ.get("CPPMEGA_DSA_GRAPH_MARGIN", "1.0")),
+                topk=int(
+                    os.environ.get(
+                        "CPPMEGA_DSA_GRAPH_AUX_TOPK", str(defaults["topk"])
+                    )
+                ),
+                pos_weight=float(
+                    os.environ.get(
+                        "CPPMEGA_DSA_GRAPH_POS_WEIGHT",
+                        str(defaults["pos_weight"]),
+                    )
+                ),
+                margin=float(
+                    os.environ.get(
+                        "CPPMEGA_DSA_GRAPH_MARGIN", str(defaults["margin"])
+                    )
+                ),
                 relations=relations,
             )
         except ValueError as exc:
@@ -92,6 +128,7 @@ def validate_runtime_graph_contract(graph_contract: Mapping[str, object]) -> Non
         raise ValueError(
             "production graph objective requires CPPMEGA_STRUCTURE_ENABLED=1"
         )
+    validate_stage1_graph_contract(graph_contract)
     # Dense GQA consumes the same routes through attention bias and trains them
     # through LM loss. DSA-specific coefficients apply only when the indexer
     # auxiliary objective is explicitly enabled.

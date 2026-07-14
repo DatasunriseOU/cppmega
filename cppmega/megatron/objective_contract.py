@@ -23,6 +23,8 @@ from typing import Any
 
 import numpy as np
 
+from cppmega.megatron.graph_recipe import validate_stage1_graph_contract
+
 OBJECTIVE_CONTRACT_SCHEMA = "cppmega_pre_materialized_objectives_v1"
 OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA = (
     "cppmega_objective_materialization_artifact_v1"
@@ -341,6 +343,7 @@ def validate_objective_contract(
             )
 
     graph = _mapping(contract.get("graph_auxiliary"), where="graph_auxiliary")
+    validate_stage1_graph_contract(graph)
     relations = graph.get("relations")
     if (
         not isinstance(relations, list)

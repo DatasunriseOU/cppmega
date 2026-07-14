@@ -16,6 +16,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from cppmega.megatron.graph_recipe import (
+    STAGE1_GRAPH_RELATIONS,
+    STAGE1_GRAPH_TOPK,
+    stage1_graph_recipe_binding,
+)
 import scripts.data.publish_megatron_bundle_to_nebius_s3 as publisher
 from scripts.data.publish_megatron_bundle_to_nebius_s3 import (
     _head,
@@ -233,7 +238,8 @@ def _objective_payload():
             "rendered_text_parsing": False,
         },
         "graph_auxiliary": {
-            "relations": ["domain"],
+            "recipe": stage1_graph_recipe_binding(),
+            "relations": list(STAGE1_GRAPH_RELATIONS),
             "eligible_samples": 1,
             "positive_edges": 1,
             "global_weight": "1",
@@ -242,7 +248,7 @@ def _objective_payload():
             "layer_reduction": "sum",
             "bce_weight": "1/10",
             "coverage_weight": "1/20",
-            "topk": 8,
+            "topk": STAGE1_GRAPH_TOPK,
             "pos_weight": "1",
             "margin": "1",
             "included_in_total_loss": True,
@@ -499,7 +505,7 @@ def _prefix_bundle(tmp_path):
             "graph_sidecars": [],
             "source_platform_sidecar": "require",
             "loss_mask_alignment": "source_token_predicts_next_v1",
-            "graph_relations": ["domain"],
+            "graph_relations": list(STAGE1_GRAPH_RELATIONS),
             "graph_pair_mask": "causal_same_document_upstream_v1",
             "chunk_edge_expansion": "cartesian_token_spans_v1",
         },

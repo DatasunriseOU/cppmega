@@ -11,6 +11,11 @@ import tarfile
 
 import pytest
 
+from cppmega.megatron.graph_recipe import (
+    STAGE1_GRAPH_RELATIONS,
+    STAGE1_GRAPH_TOPK,
+    stage1_graph_recipe_binding,
+)
 import scripts.data.publish_megatron_bundle_to_nebius_s3 as publisher
 import scripts.nebius_h200_megatron_cpp_world_sweep as sweep_module
 
@@ -151,15 +156,16 @@ def _write_valid_sidecar_prefix(
         payload = bytearray(item_count * shape_tail[0] * _DTYPE_SIZES[dtype])
         if name == "token_domain_edges":
             payload[:] = struct.pack(f"<{item_count * 3}i", *((0, 1, 5) * item_count))
+        elif name == "token_chunk_starts":
+            payload[:] = struct.pack(f"<{item_count}I", *range(item_count))
         elif name == "token_chunk_ends":
-            payload[:] = struct.pack(
-                f"<{item_count}I", *([tokens_per_document] * item_count)
-            )
+            payload[:] = struct.pack(f"<{item_count}I", *range(1, item_count + 1))
         elif name == "token_chunk_kinds":
             payload[:] = struct.pack(f"<{item_count}B", *([1] * item_count))
         (prefix.parent / data_relative).write_bytes(payload)
         graph_sidecar_paths[name] = {
             "kind": kind,
+            "coordinate_space": publisher.GRAPH_ROUTE_COORDINATE_SPACES[name],
             "offsets_path": offsets_relative,
             "data_path": data_relative,
             "offset_dtype": "int64",
@@ -218,6 +224,24 @@ def _write_valid_sidecar_prefix(
     finally:
         registry.close()
     tasks = ("causal_lm", "fim", "ast_fim", "ifim", "commit_diff", "pre_to_post")
+    source_files = [
+        {
+            "path": "/frozen/code/1024/code.parquet",
+            "size_bytes": 17,
+            "sha256": "2" * 64,
+            "rows": document_count,
+        }
+    ]
+    source_digest = publisher._artifact_set_sha256(
+        [
+            {
+                "path": record["path"],
+                "size": record["size_bytes"],
+                "sha256": record["sha256"],
+            }
+            for record in source_files
+        ]
+    )
     objective_payload = {
         "schema": "cppmega_pre_materialized_objectives_v1",
         "algorithm": "hamilton_eligibility_bipartite_v1",
@@ -246,7 +270,8 @@ def _write_valid_sidecar_prefix(
             "rendered_text_parsing": False,
         },
         "graph_auxiliary": {
-            "relations": ["domain"],
+            "recipe": stage1_graph_recipe_binding(),
+            "relations": list(STAGE1_GRAPH_RELATIONS),
             "eligible_samples": 1,
             "positive_edges": 1,
             "global_weight": "1",
@@ -255,7 +280,7 @@ def _write_valid_sidecar_prefix(
             "layer_reduction": "sum",
             "bce_weight": "1/10",
             "coverage_weight": "1/20",
-            "topk": 8,
+            "topk": STAGE1_GRAPH_TOPK,
             "pos_weight": "1",
             "margin": "1",
             "included_in_total_loss": True,
@@ -272,6 +297,23 @@ def _write_valid_sidecar_prefix(
             "objective_column": "objective_kind",
             "document_id_column": "doc_ids",
             "source_document_id_column": "token_source_doc_ids",
+        },
+        "source_snapshot": {
+            "schema": "cppmega_objective_source_snapshot_v1",
+            "sequence_length": 1024,
+            "file_count": 1,
+            "row_count": document_count,
+            "files": source_files,
+            "sampling": {
+                "mode": "deterministic_epoch_shuffle_v1",
+                "seed": 17,
+                "requested_samples": document_count,
+                "full_passes": 1,
+                "tail_rows": 0,
+                "min_row_reuse": 1,
+                "max_row_reuse": 1,
+            },
+            "artifact_set_sha256": source_digest,
         },
     }
     objective_sha256 = hashlib.sha256(
@@ -371,7 +413,7 @@ def _write_test_bundle(root, prefix, tokenizer):
             "graph_sidecars": [],
             "source_platform_sidecar": "require",
             "loss_mask_alignment": "source_token_predicts_next_v1",
-            "graph_relations": ["domain"],
+            "graph_relations": list(STAGE1_GRAPH_RELATIONS),
             "graph_pair_mask": "causal_same_document_upstream_v1",
             "chunk_edge_expansion": "cartesian_token_spans_v1",
         },
@@ -440,6 +482,16 @@ def _write_test_bundle(root, prefix, tokenizer):
                     "contract_schema": "cppmega_pre_materialized_objectives_v1",
                     "contract_sha256": objective["sha256"],
                     "contract_file_sha256": objective_file_sha256,
+                    "source_snapshot": {
+                        key: objective["payload"]["source_snapshot"][key]
+                        for key in (
+                            "schema",
+                            "artifact_set_sha256",
+                            "file_count",
+                            "row_count",
+                            "sampling",
+                        )
+                    },
                 }
             },
         },
@@ -1080,7 +1132,7 @@ def test_sidecar_preflight_rejects_missing_graph_sidecars(tmp_path):
     manifest["graph_sidecar_paths"].pop("token_chunk_ends")
     prefix.with_suffix(".json").write_text(json.dumps(manifest))
 
-    with pytest.raises(ValueError, match="missing graph sidecars"):
+    with pytest.raises(ValueError, match="graph sidecar key set.*missing"):
         _assert_prefix_contract(prefix)
 
 
@@ -1099,19 +1151,19 @@ def test_graph_capacities_are_derived_from_actual_csr_offsets(tmp_path):
     _write_valid_sidecar_prefix(
         prefix,
         edge_capacity=300,
-        chunk_capacity=400,
+        chunk_capacity=4,
     )
 
     receipt = derive_graph_capacity_receipt(prefix, sequence_length=1024)
 
     assert receipt["graph_max_edges"] == 300
-    assert receipt["graph_max_chunks"] == 400
+    assert receipt["graph_max_chunks"] == 4
     assert receipt["sidecars"]["token_domain_edges"][
         "max_items_per_document"
     ] == 300
     assert receipt["sidecars"]["token_chunk_starts"][
         "max_items_per_document"
-    ] == 400
+    ] == 4
     assert len(receipt["sidecars"]["token_domain_edges"]["offsets_sha256"]) == 64
 
 
