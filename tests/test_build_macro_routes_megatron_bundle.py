@@ -77,6 +77,8 @@ def test_every_bucket_conversion_receives_hash_bound_objective_artifact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured: dict[str, object] = {}
+    generation_dir = tmp_path / "generation"
+    generation_dir.mkdir()
     objective_artifact = tmp_path / "objective_materialization.json"
     objective_artifact.write_text("{}", encoding="utf-8")
 
@@ -84,6 +86,11 @@ def test_every_bucket_conversion_receives_hash_bound_objective_artifact(
         captured.update(kwargs)
 
     monkeypatch.setattr(builder, "convert_parquet_to_megatron", fake_convert)
+    monkeypatch.setattr(
+        builder,
+        "_current_generation_directory",
+        lambda _prefix: generation_dir,
+    )
     monkeypatch.setattr(
         builder,
         "load_objective_materialization_artifact",
@@ -125,6 +132,73 @@ def test_every_bucket_conversion_receives_hash_bound_objective_artifact(
     assert captured["objective_artifact_path"] == str(objective_artifact.resolve())
     assert captured["input_dir"] is None
     assert captured["token_column"] == "input_ids"
+
+
+def test_build_bucket_seals_pointer_generation_as_regular_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    objective_artifact = tmp_path / "objective_materialization.json"
+    objective_artifact.write_text("{}", encoding="utf-8")
+    verified: list[Path] = []
+
+    monkeypatch.setattr(
+        builder,
+        "load_objective_materialization_artifact",
+        lambda _path: SimpleNamespace(
+            artifact_set_sha256="a" * 64,
+            file_sha256="b" * 64,
+        ),
+    )
+    monkeypatch.setattr(
+        builder,
+        "_objective_expected_counts",
+        lambda _path: {"rows": 1, "valid_tokens": 3, "trained_tokens": 2},
+    )
+
+    def fake_convert(**kwargs: object) -> None:
+        prefix = Path(str(kwargs["output_prefix"]))
+        generation = (
+            prefix.parent
+            / "snapshot"
+            / "megatron_generations"
+            / prefix.name
+            / "generation-test"
+        )
+        generation.mkdir(parents=True)
+        for suffix in (".bin", ".idx", ".json"):
+            (generation / f"{prefix.name}{suffix}").write_bytes(suffix.encode())
+        current = prefix.parent / f".{prefix.name}.current"
+        current.symlink_to(os.path.relpath(generation, prefix.parent))
+        for suffix in (".bin", ".idx", ".json"):
+            alias = prefix.with_suffix(suffix)
+            alias.symlink_to(f"{current.name}/{alias.name}")
+
+    manifest = {
+        "objective_materialization": {
+            "artifact_set_sha256": "a" * 64,
+            "artifact_file_sha256": "b" * 64,
+        }
+    }
+
+    def fake_verify(prefix: Path, _expected: dict[str, int]) -> dict[str, object]:
+        verified.append(prefix)
+        return manifest
+
+    monkeypatch.setattr(builder, "convert_parquet_to_megatron", fake_convert)
+    monkeypatch.setattr(builder, "_verify_prefix", fake_verify)
+
+    result = builder._build_bucket(
+        bucket=1024,
+        data_root=tmp_path / "data",
+        objective_artifact_path=objective_artifact,
+    )
+
+    final_dir = tmp_path / "data" / "seq_1024"
+    final_prefix = final_dir / "cppmega_macro_routes_seq1024_train"
+    assert result["prefix"] == str(final_prefix)
+    assert verified[-1] == final_prefix
+    assert not (tmp_path / "data" / ".seq_1024.building").exists()
+    assert all(path.is_file() and not path.is_symlink() for path in final_dir.iterdir())
 
 
 def test_objective_sources_must_match_repaired_snapshot(

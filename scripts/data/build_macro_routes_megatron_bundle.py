@@ -35,6 +35,7 @@ sys.path.insert(0, str(SCRIPTS_ROOT))
 from data_prep_parquet_to_megatron import (  # noqa: E402
     DEFAULT_CPPMEGA_GRAPH_SIDECARS,
     DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS,
+    _current_generation_directory,
     convert_parquet_to_megatron,
 )
 from data.publish_megatron_bundle_to_nebius_s3 import (  # noqa: E402
@@ -840,14 +841,16 @@ def _build_bucket(
     artifact = load_objective_materialization_artifact(objective_artifact_path)
     expected = _objective_expected_counts(objective_artifact_path)
     final_dir = data_root / f"seq_{bucket}"
+    building_dir = data_root / f".seq_{bucket}.building"
     prefix_name = f"cppmega_macro_routes_seq{bucket}_train"
     final_prefix = final_dir / prefix_name
     if final_dir.exists():
+        if building_dir.exists():
+            shutil.rmtree(building_dir)
         manifest = _verify_prefix(final_prefix, expected)
         _require_bucket_objective_binding(final_prefix, manifest, artifact)
         return {"bucket": bucket, "prefix": str(final_prefix), "manifest": manifest}
 
-    building_dir = data_root / f".seq_{bucket}.building"
     if building_dir.exists():
         shutil.rmtree(building_dir)
     building_dir.mkdir(parents=True)
@@ -864,9 +867,22 @@ def _build_bucket(
         source_platform_sidecar=True,
         objective_artifact_path=str(objective_artifact_path.resolve()),
     )
-    manifest = _verify_prefix(building_prefix, expected)
-    _require_bucket_objective_binding(building_prefix, manifest, artifact)
-    os.replace(building_dir, final_dir)
+
+    generation_dir = _current_generation_directory(building_prefix)
+    if generation_dir is None:
+        raise RuntimeError(f"{building_prefix}: converter published no generation")
+    generation_prefix = generation_dir / prefix_name
+    manifest = _verify_prefix(generation_prefix, expected)
+    _require_bucket_objective_binding(generation_prefix, manifest, artifact)
+
+    # The converter publishes through an immutable pointer so concurrent readers
+    # never observe a mixed generation. A transport bundle must instead contain
+    # only regular files. Moving the already-validated generation directory gives
+    # the bundle both properties without weakening the publisher's symlink gate.
+    os.replace(generation_dir, final_dir)
+    shutil.rmtree(building_dir)
+    manifest = _verify_prefix(final_prefix, expected)
+    _require_bucket_objective_binding(final_prefix, manifest, artifact)
     return {"bucket": bucket, "prefix": str(final_prefix), "manifest": manifest}
 
 
