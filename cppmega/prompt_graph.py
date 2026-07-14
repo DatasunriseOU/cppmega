@@ -15,15 +15,22 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 from typing import Any
 
+from .symbol_identity import (
+    SYMBOL_IDENTITY_SCHEMA_VERSION,
+    SYMBOL_ID_MAX,
+    compute_symbol_id,
+)
 
-INDEX_SCHEMA = "cppmega_prompt_graph_index_v2"
+
+INDEX_SCHEMA = "cppmega_prompt_graph_index_v3"
 LEGACY_INDEX_SCHEMA = "cppmega_prompt_graph_index_v1"
-ARTIFACT_SCHEMA = "cppmega_prompt_graph_artifact_v2"
-WINDOW_SCHEMA = "cppmega_prompt_graph_window_v2"
-BUILDER_VERSION = "2"
+ARTIFACT_SCHEMA = "cppmega_prompt_graph_artifact_v3"
+WINDOW_SCHEMA = "cppmega_prompt_graph_window_v3"
+BUILDER_VERSION = "3"
 
 TOKEN_SIDECAR_NAMES = (
     "structure_ids",
@@ -118,6 +125,11 @@ _REPOSITORY_INPUT_NAMES = frozenset(
 _REPOSITORY_SKIP_DIRS = frozenset(
     {".git", ".hg", ".svn", ".venv", "node_modules", "__pycache__"}
 )
+_PROJECT_IDENTITY_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
+_OPAQUE_SYMBOL_ID_SIDECARS = frozenset(
+    {"symbol_ids", "call_targets", "type_refs"}
+)
+_DEF_USE_VALUES = frozenset({0, 1, 2})
 
 
 def _stable_json(value: Any) -> str:
@@ -400,6 +412,25 @@ def _require_str(value: Any, *, where: str) -> str:
     return value
 
 
+def require_prompt_graph_project_id(value: object, *, where: str) -> str:
+    """Validate the stable ``owner/repo`` identity used by v3 symbol keys."""
+
+    if not isinstance(value, str) or value != value.strip():
+        raise ValueError(
+            f"{where} must be an exact owner/repo string, got {value!r}"
+        )
+    if not _PROJECT_IDENTITY_RE.fullmatch(value):
+        raise ValueError(
+            f"{where} must be stable owner/repo, got {value!r}"
+        )
+    owner, repo = value.split("/", 1)
+    if owner in {".", ".."} or repo in {".", ".."} or repo.endswith(".git"):
+        raise ValueError(
+            f"{where} must be canonical owner/repo without .git, got {value!r}"
+        )
+    return value
+
+
 def _require_rows(
     value: Any,
     *,
@@ -451,6 +482,7 @@ class PromptGraphDocument:
 @dataclass(frozen=True)
 class PromptGraphSymbol:
     id: int
+    symbol_id: int
     identity: str
     kind: str
     document_id: int
@@ -469,6 +501,9 @@ class PromptGraphSymbol:
         identity = _require_str(row.get("identity"), where="symbol.identity")
         return cls(
             id=_require_int(row.get("id"), where="symbol.id"),
+            symbol_id=_require_int(
+                row.get("symbol_id"), where="symbol.symbol_id"
+            ),
             identity=identity,
             kind=str(row.get("kind") or "symbol"),
             document_id=_require_int(
@@ -493,6 +528,7 @@ class PromptGraphSymbol:
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
+            "symbol_id": self.symbol_id,
             "identity": self.identity,
             "semantic_identity": self.semantic_identity,
             "symbol_key": self.symbol_key,
@@ -615,7 +651,7 @@ class PromptProjectIndex:
                 f"unsupported prompt graph index schema {schema!r}"
             )
         index = cls(
-            project_id=_require_str(
+            project_id=require_prompt_graph_project_id(
                 payload.get("project_id"),
                 where="project_id",
             ),
@@ -669,6 +705,7 @@ class PromptProjectIndex:
         )
 
     def validate(self) -> None:
+        require_prompt_graph_project_id(self.project_id, where="project_id")
         if not self.documents:
             raise ValueError("prompt graph index has no documents")
         documents_by_id: dict[int, PromptGraphDocument] = {}
@@ -689,6 +726,17 @@ class PromptProjectIndex:
             self.provenance.get("producer")
             == "explicit_legacy_single_document_adapter"
         )
+        if (
+            not legacy_adapter
+            and self.provenance.get("symbol_identity_schema_version")
+            != SYMBOL_IDENTITY_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                "prompt graph index requires symbol_identity_schema_version="
+                f"{SYMBOL_IDENTITY_SCHEMA_VERSION}"
+            )
+        canonical_key_by_id: dict[int, str] = {}
+        canonical_id_by_key: dict[str, int] = {}
         for symbol in self.symbols:
             document = documents_by_id.get(symbol.document_id)
             if document is None:
@@ -713,6 +761,38 @@ class PromptProjectIndex:
                 )
             if symbol.id in seen_ids:
                 raise ValueError(f"duplicate symbol id {symbol.id}")
+            if not 0 < symbol.symbol_id <= SYMBOL_ID_MAX:
+                raise ValueError(
+                    f"symbol {symbol.identity}: symbol_id must be canonical uint64"
+                )
+            if not symbol.symbol_key:
+                raise ValueError(
+                    f"symbol {symbol.identity}: symbol_key must be non-empty"
+                )
+            if symbol.semantic_identity != symbol.symbol_key:
+                raise ValueError(
+                    f"symbol {symbol.identity}: semantic_identity must equal symbol_key"
+                )
+            expected_symbol_id = compute_symbol_id(symbol.symbol_key)
+            if symbol.symbol_id != expected_symbol_id:
+                raise ValueError(
+                    f"symbol {symbol.identity}: symbol_id {symbol.symbol_id} does not "
+                    f"match v{SYMBOL_IDENTITY_SCHEMA_VERSION} canonical ID "
+                    f"{expected_symbol_id}"
+                )
+            existing_key = canonical_key_by_id.get(symbol.symbol_id)
+            if existing_key is not None and existing_key != symbol.symbol_key:
+                raise ValueError(
+                    "canonical symbol ID collision in prompt graph index: "
+                    f"id={symbol.symbol_id} first={existing_key!r} "
+                    f"second={symbol.symbol_key!r}"
+                )
+            existing_id = canonical_id_by_key.get(symbol.symbol_key)
+            if existing_id is not None and existing_id != symbol.symbol_id:
+                raise ValueError(
+                    f"canonical symbol key {symbol.symbol_key!r} maps to both "
+                    f"{existing_id} and {symbol.symbol_id}"
+                )
             if symbol.identity in seen_identities:
                 raise ValueError(
                     f"duplicate symbol identity {symbol.identity!r}"
@@ -720,14 +800,16 @@ class PromptProjectIndex:
             if (
                 not legacy_adapter
                 and symbol.kind in {"function", "type", "variable"}
-                and (not symbol.usr or not symbol.canonical_signature)
+                and not symbol.canonical_signature
             ):
                 raise ValueError(
-                    f"symbol {symbol.identity}: v2 definitions require clang USR "
-                    "and canonical_signature; qname-only indexes are unsupported"
+                    f"symbol {symbol.identity}: v3 definitions require a "
+                    "canonical_signature; qname-only indexes are unsupported"
                 )
             seen_ids.add(symbol.id)
             seen_identities.add(symbol.identity)
+            canonical_key_by_id[symbol.symbol_id] = symbol.symbol_key
+            canonical_id_by_key[symbol.symbol_key] = symbol.symbol_id
 
         seen_chunk_ids: set[int] = set()
         seen_chunk_identities: set[str] = set()
@@ -920,6 +1002,9 @@ class PromptProjectIndex:
 def _upgrade_legacy_single_document_index(
     payload: Mapping[str, Any],
 ) -> dict[str, Any]:
+    project_id = require_prompt_graph_project_id(
+        payload.get("project_id"), where="project_id"
+    )
     source_path = _validate_relative_source_path(
         _require_str(payload.get("source_path"), where="source_path"),
         where="source_path",
@@ -934,15 +1019,24 @@ def _upgrade_legacy_single_document_index(
     upgraded["documents"] = [
         {"id": 1, "source_path": source_path, "source": source}
     ]
-    upgraded["symbols"] = [
-        {
-            **dict(row),
-            "document_id": 1,
-            "source_path": source_path,
-            "semantic_identity": str(row.get("identity") or ""),
-        }
-        for row in _require_rows(payload.get("symbols"), where="symbols")
-    ]
+    upgraded_symbols: list[dict[str, Any]] = []
+    for row in _require_rows(payload.get("symbols"), where="symbols"):
+        identity = _require_str(row.get("identity"), where="symbol.identity")
+        symbol_key = (
+            f"legacy:schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}\x1f"
+            f"project={project_id}\x1fidentity={identity}"
+        )
+        upgraded_symbols.append(
+            {
+                **dict(row),
+                "symbol_id": compute_symbol_id(symbol_key),
+                "document_id": 1,
+                "source_path": source_path,
+                "semantic_identity": symbol_key,
+                "symbol_key": symbol_key,
+            }
+        )
+    upgraded["symbols"] = upgraded_symbols
     upgraded["chunks"] = [
         {
             **dict(row),
@@ -954,6 +1048,7 @@ def _upgrade_legacy_single_document_index(
     upgraded["provenance"] = {
         "producer": "explicit_legacy_single_document_adapter",
         "legacy_schema": LEGACY_INDEX_SCHEMA,
+        "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
     }
     return upgraded
 
@@ -1333,6 +1428,15 @@ class PromptGraphModelInputs:
             raise ValueError(
                 f"unsupported prompt graph window schema {self.schema!r}"
             )
+        if self.receipt.get("schema") != WINDOW_SCHEMA:
+            raise ValueError("prompt graph window receipt schema mismatch")
+        if (
+            self.receipt.get("symbol_identity_schema_version")
+            != SYMBOL_IDENTITY_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                "prompt graph window requires canonical symbol identity v3"
+            )
         if self.token_count <= 0:
             raise ValueError("prompt graph model input token_count must be positive")
         _validate_side_channels(self.side_channels, self.token_count)
@@ -1516,6 +1620,13 @@ class PromptGraphArtifact:
         if self.receipt.get("schema") != ARTIFACT_SCHEMA:
             raise ValueError(
                 "prompt graph receipt schema does not match artifact"
+            )
+        if (
+            self.receipt.get("symbol_identity_schema_version")
+            != SYMBOL_IDENTITY_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                "prompt graph artifact requires canonical symbol identity v3"
             )
         if int(self.receipt.get("token_count", -1)) != self.token_count:
             raise ValueError(
@@ -1792,6 +1903,7 @@ class PromptGraphArtifact:
         )
         receipt = {
             "schema": WINDOW_SCHEMA,
+            "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
             "artifact_cache_key": self.receipt["cache_key"],
             "hashes": dict(self.receipt["hashes"]),
             "edge_counts": dict(self.edge_counts),
@@ -1986,6 +2098,7 @@ class PromptGraphBuilder:
 
         receipt: dict[str, Any] = {
             "schema": ARTIFACT_SCHEMA,
+            "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
             "cache_key": cache_key,
             "project_id": project_index.project_id,
             "document_count": len(project_index.documents),
@@ -2405,7 +2518,7 @@ def _map_symbols_to_tokens(
         )
         identity_token_spans[symbol.identity] = token_span
         for token_index in token_indexes:
-            side_channels["symbol_ids"][token_index] = symbol.id
+            side_channels["symbol_ids"][token_index] = symbol.symbol_id
             if symbol.kind in {
                 "struct",
                 "class",
@@ -2413,7 +2526,11 @@ def _map_symbols_to_tokens(
                 "enum",
                 "type_use",
             }:
-                side_channels["type_refs"][token_index] = symbol.id
+                side_channels["type_refs"][token_index] = symbol.symbol_id
+            if symbol.kind in {"function", "type", "variable"}:
+                side_channels["def_use"][token_index] = 1
+            elif symbol.kind == "use":
+                side_channels["def_use"][token_index] = 2
     return identity_token_spans
 
 
@@ -2515,19 +2632,24 @@ def _map_edges(
             _fill_side_channel_range(
                 side_channels["call_targets"],
                 source_span,
-                target_symbol.id,
+                target_symbol.symbol_id,
             )
         elif edge.relation == "type":
             _fill_side_channel_range(
                 side_channels["type_refs"],
                 source_span,
-                target_symbol.id,
+                target_symbol.symbol_id,
             )
         elif edge.relation == "def_use":
             _fill_side_channel_range(
                 side_channels["def_use"],
                 source_span,
-                target_symbol.id,
+                2,
+            )
+            _fill_side_channel_range(
+                side_channels["def_use"],
+                identity_token_spans[edge.target],
+                1,
             )
 
         if edge.relation in PAIR_ROUTE_KEYS:
@@ -2664,6 +2786,18 @@ def _validate_side_channels(
             raise ValueError(
                 f"prompt graph side channel {name} must contain "
                 "non-negative integers"
+            )
+        if name in _OPAQUE_SYMBOL_ID_SIDECARS and any(
+            value > SYMBOL_ID_MAX for value in values
+        ):
+            raise ValueError(
+                f"prompt graph side channel {name} must contain uint64 IDs"
+            )
+        if name == "def_use" and any(
+            value not in _DEF_USE_VALUES for value in values
+        ):
+            raise ValueError(
+                "prompt graph token_def_use values must be only 0/1/2"
             )
 
 
@@ -2853,5 +2987,6 @@ __all__ = [
     "TRIPLE_ROUTE_KEYS",
     "WINDOW_SCHEMA",
     "normalize_cpp_whitespace_with_offsets",
+    "require_prompt_graph_project_id",
     "repository_snapshot",
 ]

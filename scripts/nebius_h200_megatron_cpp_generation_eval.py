@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402
 """Generate C/C++ eval completions from a Megatron checkpoint on one Nebius H200.
 
 This runner is deliberately separate from the training sweep.  It uploads the
@@ -16,7 +17,6 @@ import os
 import shlex
 import subprocess
 import sys
-import tarfile
 import tempfile
 import textwrap
 import time
@@ -46,7 +46,10 @@ from scripts.nebius_h200_megatron_cpp_world_sweep import (
     wait_for_ip,
     wait_for_ssh,
 )
-from cppmega.prompt_graph import PromptProjectIndex
+from cppmega.prompt_graph import (
+    PromptProjectIndex,
+    require_prompt_graph_project_id,
+)
 from cppmega.prompt_graph_index import ClangPromptProjectIndexProducer
 
 
@@ -146,6 +149,10 @@ def _prepare_eval_graph_cases(
             raise FileNotFoundError(
                 f"{task_id}: prompt graph repository not found: {repo_path}"
             )
+        project_id = require_prompt_graph_project_id(
+            row.get("prompt_graph_project_id"),
+            where=f"{task_id}.prompt_graph_project_id",
+        )
         raw_index = row.get("prompt_graph_index")
         if isinstance(raw_index, str) and raw_index:
             index_path, _index_relative = _contained_path(
@@ -158,15 +165,14 @@ def _prepare_eval_graph_cases(
                     f"{task_id}: prompt graph index not found: {index_path}"
                 )
             project_index = PromptProjectIndex.from_json_path(index_path)
+            if project_index.project_id != project_id:
+                raise ValueError(
+                    f"{task_id}: prompt graph project_id mismatch: "
+                    f"case={project_id!r} index={project_index.project_id!r}"
+                )
             project_index.verify_repository(repo_path)
             index_receipt = dict(project_index.provenance)
         else:
-            raw_project_id = row.get("prompt_graph_project_id")
-            project_id = (
-                str(raw_project_id)
-                if isinstance(raw_project_id, str) and raw_project_id
-                else repo_path.name
-            )
             built = ClangPromptProjectIndexProducer(
                 cache_dir=prompt_index_cache_dir,
                 indexer_root=indexer_root,
@@ -203,6 +209,7 @@ def _prepare_eval_graph_cases(
         index_relative = stage_root / "project_index.json"
         row["prompt_graph_repo"] = stage_root.as_posix()
         row["prompt_graph_index"] = index_relative.as_posix()
+        row["prompt_graph_project_id"] = project_id
         row["prompt_graph_index_receipt"] = index_receipt
         candidates: list[tuple[Path, Path]] = [(index_relative, index_path)]
         manifest = index_receipt.get("repository_manifest")
@@ -378,6 +385,12 @@ from cppmega.prompt_graph import (
     PromptGraphBuilder,
     PromptGraphContext,
     PromptProjectIndex,
+    require_prompt_graph_project_id,
+)
+
+
+OPAQUE_SYMBOL_ID_SIDECARS = frozenset(
+    {"symbol_ids", "call_targets", "type_refs"}
 )
 
 
@@ -604,6 +617,16 @@ def build_prompt_rows(
                     f"{task_id}: prompt graph index not found: {index_path}"
                 )
             project_index = PromptProjectIndex.from_json_path(index_path)
+            expected_project_id = require_prompt_graph_project_id(
+                case.get("prompt_graph_project_id"),
+                where=f"{task_id}.prompt_graph_project_id",
+            )
+            if project_index.project_id != expected_project_id:
+                raise ValueError(
+                    f"{task_id}: prompt graph project_id mismatch: "
+                    f"case={expected_project_id!r} "
+                    f"index={project_index.project_id!r}"
+                )
             project_index.verify_repository(repo_path)
             source_path = case.get("prompt_source_path")
             if not isinstance(source_path, str) or not source_path:
@@ -785,7 +808,11 @@ def build_prompt_graph_structure_inputs(
                     query_offset : query_offset + query_length
                 ]
             ],
-            dtype=torch.long,
+            dtype=(
+                torch.uint64
+                if name in OPAQUE_SYMBOL_ID_SIDECARS
+                else torch.long
+            ),
             device=device,
         )
         for name in TOKEN_SIDECAR_NAMES

@@ -5,10 +5,16 @@ from copy import deepcopy
 import pytest
 
 from cppmega.prompt_graph import (
+    INDEX_SCHEMA,
     PromptGraphBuilder,
     PromptGraphContext,
+    PromptGraphModelInputs,
     PromptGraphSegment,
     PromptProjectIndex,
+)
+from cppmega.symbol_identity import (
+    SYMBOL_IDENTITY_SCHEMA_VERSION,
+    compute_symbol_id,
 )
 
 
@@ -21,12 +27,24 @@ class _CharacterOffsetTokenizer:
         ]
 
 
-def _v2_payload() -> dict[str, object]:
+PROJECT_ID = "tests/prompt-graph"
+
+
+def _symbol_key(usr: str) -> str:
+    return (
+        f"usr:schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}\x1f"
+        f"project={PROJECT_ID}\x1fusr={usr}"
+    )
+
+
+def _v3_payload() -> dict[str, object]:
     first = "int first() { return 1; }\n"
     second = "int second() { return first(); }\n"
+    first_key = _symbol_key("c:@F@first#")
+    second_key = _symbol_key("c:@F@second#")
     return {
-        "schema": "cppmega_prompt_graph_index_v2",
-        "project_id": "multi",
+        "schema": INDEX_SCHEMA,
+        "project_id": PROJECT_ID,
         "documents": [
             {"id": 1, "source_path": "src/first.cpp", "source": first},
             {"id": 2, "source_path": "src/second.cpp", "source": second},
@@ -34,8 +52,10 @@ def _v2_payload() -> dict[str, object]:
         "symbols": [
             {
                 "id": 1,
+                "symbol_id": compute_symbol_id(first_key),
                 "identity": "definition:first",
-                "semantic_identity": "c:@F@first#",
+                "semantic_identity": first_key,
+                "symbol_key": first_key,
                 "usr": "c:@F@first#",
                 "canonical_signature": "display=first()|type=int ()",
                 "qname": "first",
@@ -48,8 +68,10 @@ def _v2_payload() -> dict[str, object]:
             },
             {
                 "id": 2,
+                "symbol_id": compute_symbol_id(second_key),
                 "identity": "definition:second",
-                "semantic_identity": "c:@F@second#",
+                "semantic_identity": second_key,
+                "symbol_key": second_key,
                 "usr": "c:@F@second#",
                 "canonical_signature": "display=second()|type=int ()",
                 "qname": "second",
@@ -62,12 +84,30 @@ def _v2_payload() -> dict[str, object]:
             },
             {
                 "id": 3,
+                "symbol_id": compute_symbol_id(first_key),
                 "identity": "occurrence:call:first",
-                "semantic_identity": "c:@F@first#",
+                "semantic_identity": first_key,
+                "symbol_key": first_key,
                 "usr": "c:@F@first#",
                 "canonical_signature": "display=first()|type=int ()",
                 "qname": "first",
                 "kind": "callsite",
+                "document_id": 2,
+                "source_path": "src/second.cpp",
+                "start": second.index("first"),
+                "end": second.index("first") + len("first"),
+                "chunk_identity": "chunk:second",
+            },
+            {
+                "id": 4,
+                "symbol_id": compute_symbol_id(first_key),
+                "identity": "occurrence:use:first",
+                "semantic_identity": first_key,
+                "symbol_key": first_key,
+                "usr": "c:@F@first#",
+                "canonical_signature": "display=first()|type=int ()",
+                "qname": "first",
+                "kind": "use",
                 "document_id": 2,
                 "source_path": "src/second.cpp",
                 "start": second.index("first"),
@@ -109,32 +149,38 @@ def _v2_payload() -> dict[str, object]:
                 "target": "definition:first",
                 "kind": 2,
             },
+            {
+                "relation": "def_use",
+                "source": "occurrence:use:first",
+                "target": "definition:first",
+            },
         ],
         "provenance": {
             "producer": "test",
+            "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
             "hashes": {"repository_sha256": "0" * 64},
         },
     }
 
 
-def test_v2_index_validates_spans_per_document_and_cross_document_edges() -> None:
-    index = PromptProjectIndex.from_dict(_v2_payload())
+def test_v3_index_validates_spans_per_document_and_cross_document_edges() -> None:
+    index = PromptProjectIndex.from_dict(_v3_payload())
     assert index.symbol_for_identity("occurrence:call:first").document_id == 2
     assert index.symbol_for_identity("definition:first").document_id == 1
 
-    bad = _v2_payload()
+    bad = _v3_payload()
     bad["symbols"][0]["end"] = len(bad["documents"][1]["source"]) + 10
     with pytest.raises(ValueError, match="src/first.cpp.*invalid span"):
         PromptProjectIndex.from_dict(bad)
 
-    bad = _v2_payload()
+    bad = _v3_payload()
     bad["chunks"][0]["source_path"] = "src/second.cpp"
     with pytest.raises(ValueError, match="document_id.*source_path"):
         PromptProjectIndex.from_dict(bad)
 
 
 def test_builder_projects_cross_document_route_and_document_ids() -> None:
-    index = PromptProjectIndex.from_dict(_v2_payload())
+    index = PromptProjectIndex.from_dict(_v3_payload())
     first, second = index.documents
     artifact = PromptGraphBuilder(_CharacterOffsetTokenizer()).build(
         index,
@@ -163,10 +209,97 @@ def test_builder_projects_cross_document_route_and_document_ids() -> None:
         1,
         2,
     }
+    first_symbol = index.symbol_for_identity("definition:first")
+    use_symbol = index.symbol_for_identity("occurrence:use:first")
+    assert first_symbol.id == 1
+    assert first_symbol.symbol_id == compute_symbol_id(first_symbol.symbol_key)
+    assert use_symbol.symbol_id == first_symbol.symbol_id
+    assert first_symbol.symbol_id != first_symbol.id
+    assert (
+        artifact.side_channels["symbol_ids"][
+            artifact.first_token_for_identity("occurrence:use:first")
+        ]
+        == first_symbol.symbol_id
+    )
+    assert (
+        artifact.side_channels["call_targets"][
+            artifact.first_token_for_identity("occurrence:call:first")
+        ]
+        == first_symbol.symbol_id
+    )
+    assert (
+        artifact.side_channels["def_use"][
+            artifact.first_token_for_identity("definition:first")
+        ]
+        == 1
+    )
+    assert (
+        artifact.side_channels["def_use"][
+            artifact.first_token_for_identity("occurrence:use:first")
+        ]
+        == 2
+    )
+    assert set(artifact.side_channels["def_use"]) <= {0, 1, 2}
+
+
+def test_v3_index_rejects_noncanonical_project_and_symbol_ids() -> None:
+    for project_id in ("repo", " owner/repo", "owner/repo.git", "a/b/c"):
+        payload = _v3_payload()
+        payload["project_id"] = project_id
+        with pytest.raises(ValueError, match="owner/repo"):
+            PromptProjectIndex.from_dict(payload)
+
+    payload = _v3_payload()
+    payload["symbols"][0]["symbol_id"] += 1
+    with pytest.raises(ValueError, match="does not match.*canonical ID"):
+        PromptProjectIndex.from_dict(payload)
+
+
+def test_prompt_graph_model_inputs_reject_non_enum_token_def_use() -> None:
+    index = PromptProjectIndex.from_dict(_v3_payload())
+    first, second = index.documents
+    artifact = PromptGraphBuilder(_CharacterOffsetTokenizer()).build(
+        index,
+        PromptGraphContext(
+            segments=(
+                PromptGraphSegment(
+                    first.source,
+                    document_id=first.id,
+                    source_path=first.source_path,
+                    source_start=0,
+                ),
+                PromptGraphSegment("\n", role="separator"),
+                PromptGraphSegment(
+                    second.source,
+                    document_id=second.id,
+                    source_path=second.source_path,
+                    source_start=0,
+                ),
+            )
+        ),
+    )
+    model_inputs = artifact.model_inputs(
+        total_token_count=artifact.token_count,
+        window_start=0,
+        window_end=artifact.token_count,
+    )
+    invalid_side_channels = {
+        name: list(values)
+        for name, values in model_inputs.side_channels.items()
+    }
+    invalid_side_channels["def_use"][0] = 3
+
+    with pytest.raises(ValueError, match="token_def_use.*0/1/2"):
+        PromptGraphModelInputs(
+            side_channels=invalid_side_channels,
+            graph_routes=model_inputs.graph_routes,
+            receipt=model_inputs.receipt,
+            token_count=model_inputs.token_count,
+        )
 
 
 def test_repository_context_includes_referenced_cross_file_definition() -> None:
-    index = PromptProjectIndex.from_dict(_v2_payload())
+    index = PromptProjectIndex.from_dict(_v3_payload())
     second = index.document_for_path("src/second.cpp")
 
     context = PromptGraphContext.from_repository_prompt(
@@ -212,7 +345,7 @@ def test_triple_route_kinds_are_explicit_and_family_checked(
     kind: int | None,
     message: str,
 ) -> None:
-    payload = _v2_payload()
+    payload = _v3_payload()
     edge = payload["edges"][1]
     edge["relation"] = relation
     if kind is None:
@@ -225,14 +358,14 @@ def test_triple_route_kinds_are_explicit_and_family_checked(
 
 
 def test_canonical_cross_domain_kind_100_is_accepted() -> None:
-    payload = _v2_payload()
+    payload = _v3_payload()
     payload["edges"][1].update(relation="cross_domain", kind=100)
     index = PromptProjectIndex.from_dict(payload)
     assert index.edges[1].kind == 100
 
 
 def test_generated_tokens_keep_live_structure_and_repository_summary_routes() -> None:
-    index = PromptProjectIndex.from_dict(_v2_payload())
+    index = PromptProjectIndex.from_dict(_v3_payload())
     first, second = index.documents
     artifact = PromptGraphBuilder(_CharacterOffsetTokenizer()).build(
         index,
@@ -281,11 +414,11 @@ def test_generated_tokens_keep_live_structure_and_repository_summary_routes() ->
 
 
 def test_legacy_single_document_schema_requires_explicit_opt_in() -> None:
-    payload = _v2_payload()
+    payload = _v3_payload()
     document = payload["documents"][0]
     legacy = {
         "schema": "cppmega_prompt_graph_index_v1",
-        "project_id": "legacy",
+        "project_id": "tests/legacy",
         "source_path": document["source_path"],
         "source": document["source"],
         "symbols": [
@@ -317,3 +450,6 @@ def test_legacy_single_document_schema_requires_explicit_opt_in() -> None:
     )
     assert len(index.documents) == 1
     assert index.documents[0].source_path == "src/first.cpp"
+    assert index.symbols[0].symbol_id == compute_symbol_id(
+        index.symbols[0].symbol_key
+    )

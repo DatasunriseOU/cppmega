@@ -1,11 +1,16 @@
 import ast
 import json
+import shutil
 import subprocess
 import tarfile
 from pathlib import Path
 
 import pytest
 
+from cppmega.symbol_identity import (
+    SYMBOL_IDENTITY_SCHEMA_VERSION,
+    compute_symbol_id,
+)
 from scripts.nebius_h200_megatron_cpp_generation_eval import (
     DEFAULT_CASES,
     eval_graph_assets,
@@ -23,6 +28,8 @@ from scripts.nebius_h200_megatron_cpp_generation_eval import (
 
 ROOT = Path(__file__).resolve().parents[1]
 CASE3_FIXTURE = ROOT / "tests" / "fixtures" / "case3_prompt_repo"
+V3_INDEXER_ROOT = ROOT.parent / "cppmega_mlx_case4_usr"
+PROMPT_GRAPH_PROJECT_ID = "tests/case3-prompt-repo"
 
 
 class _OffsetTokenizer:
@@ -39,10 +46,26 @@ def _case3_prompt() -> str:
     return row["source_prefix"]
 
 
-def test_actual_parser_defaults_accept_explicit_shipped_case_graph_modes():
-    indexer_root = ROOT.parent / "cppmega_mlx_case3_prompt"
+def _v3_eval_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
+    repo = tmp_path / "case3_prompt_repo"
+    shutil.copytree(CASE3_FIXTURE, repo)
+    rows = list(iter_jsonl(CASE3_FIXTURE / "cases.jsonl"))
+    for row in rows:
+        row["prompt_graph_repo"] = repo.name
+        row["prompt_graph_project_id"] = PROMPT_GRAPH_PROJECT_ID
+    cases = tmp_path / "cases.jsonl"
+    cases.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    prompts = tmp_path / "prompts.jsonl"
+    shutil.copyfile(CASE3_FIXTURE / "prompts.jsonl", prompts)
+    return cases, prompts, repo
+
+
+def test_actual_parser_defaults_require_stable_project_identity(tmp_path):
     args = parse_args(
-        ["--dry-run", "--clang-indexer-root", str(indexer_root)]
+        ["--dry-run", "--clang-indexer-root", str(V3_INDEXER_ROOT)]
     )
     rows = list(iter_jsonl(DEFAULT_CASES))
 
@@ -50,8 +73,16 @@ def test_actual_parser_defaults_accept_explicit_shipped_case_graph_modes():
     assert args.prompt_graph_mode == "repo"
     assert rows
     assert {row["prompt_graph_mode"] for row in rows} == {"off", "repo"}
+    with pytest.raises(ValueError, match="prompt_graph_project_id.*owner/repo"):
+        eval_graph_assets(
+            args.cases,
+            prompt_graph_mode=args.prompt_graph_mode,
+            indexer_root=args.clang_indexer_root,
+        )
+
+    cases, _prompts, _repo = _v3_eval_fixture(tmp_path)
     assets = eval_graph_assets(
-        args.cases,
+        cases,
         prompt_graph_mode=args.prompt_graph_mode,
         indexer_root=args.clang_indexer_root,
     )
@@ -118,6 +149,8 @@ def test_generation_worker_builds_model_loads_checkpoint_and_threads_sidecars():
     assert "inference_context=inference_context" in worker
     assert "set_cppmega_structure_inputs" in worker
     assert "TOKEN_SIDECAR_NAMES" in worker
+    assert "OPAQUE_SYMBOL_ID_SIDECARS" in worker
+    assert "torch.uint64" in worker
     assert "build_prompt_graph_structure_inputs" in worker
     assert "PromptGraphBuilder" in worker
     assert "CppPromptTokenizerAdapter" in worker
@@ -242,7 +275,6 @@ def test_prompt_graph_builder_serializes_h200_structure_inputs(tmp_path):
     from cppmega.prompt_graph import (
         PromptGraphBuilder,
         PromptGraphContext,
-        PromptProjectIndex,
     )
     from cppmega.prompt_graph_index import ClangPromptProjectIndexProducer
 
@@ -250,8 +282,8 @@ def test_prompt_graph_builder_serializes_h200_structure_inputs(tmp_path):
     builder = PromptGraphBuilder(_OffsetTokenizer(), cache_dir=tmp_path)
     project_index = ClangPromptProjectIndexProducer(
         cache_dir=tmp_path / "index-cache",
-        indexer_root=ROOT.parent / "cppmega_mlx_case3_prompt",
-    ).build(CASE3_FIXTURE, project_id="case3_prompt_repo").index
+        indexer_root=V3_INDEXER_ROOT,
+    ).build(CASE3_FIXTURE, project_id=PROMPT_GRAPH_PROJECT_ID).index
     source = project_index.document_for_path("src/math_prompt.cpp")
     artifact = builder.build(
         project_index,
@@ -267,6 +299,29 @@ def test_prompt_graph_builder_serializes_h200_structure_inputs(tmp_path):
     assert artifact.edge_counts["call"] > 0
     assert artifact.edge_counts["type"] > 0
     assert artifact.edge_counts["def_use"] > 0
+    assert project_index.project_id == PROMPT_GRAPH_PROJECT_ID
+    assert (
+        project_index.provenance["symbol_identity_schema_version"]
+        == SYMBOL_IDENTITY_SCHEMA_VERSION
+    )
+    assert [symbol.id for symbol in project_index.symbols] == list(
+        range(1, len(project_index.symbols) + 1)
+    )
+    canonical_ids = {symbol.symbol_id for symbol in project_index.symbols}
+    assert any(symbol_id > (1 << 63) - 1 for symbol_id in canonical_ids)
+    assert all(
+        symbol.symbol_id == compute_symbol_id(symbol.symbol_key)
+        for symbol in project_index.symbols
+    )
+    assert any(
+        symbol.symbol_id != symbol.id for symbol in project_index.symbols
+    )
+    for name in ("symbol_ids", "call_targets", "type_refs"):
+        assert {
+            value for value in artifact.side_channels[name] if value
+        } <= canonical_ids
+    assert set(artifact.side_channels["def_use"]) <= {0, 1, 2}
+    assert {1, 2} <= set(artifact.side_channels["def_use"])
     assert artifact.graph_routes["graph_call_edges"]
     assert artifact.graph_routes["graph_type_edges"]
     assert artifact.graph_routes["graph_domain_edges"]
@@ -332,26 +387,37 @@ return value;
 
 def test_make_eval_tar_builds_and_contains_real_project_index(tmp_path):
     out = tmp_path / "eval.tgz"
+    cases, prompts, _repo = _v3_eval_fixture(tmp_path / "fixture")
 
     make_eval_tar(
-        CASE3_FIXTURE / "cases.jsonl",
-        CASE3_FIXTURE / "prompts.jsonl",
+        cases,
+        prompts,
         out,
         prompt_graph_mode="repo",
-        indexer_root=ROOT.parent / "cppmega_mlx_case3_prompt",
+        indexer_root=V3_INDEXER_ROOT,
     )
 
     with tarfile.open(out, "r:gz") as tf:
         names = set(tf.getnames())
         staged_cases = json.loads(tf.extractfile("cppmega_eval/cases.jsonl").read())
+        index_name = "cppmega_eval/" + staged_cases["prompt_graph_index"]
+        index_payload = json.loads(tf.extractfile(index_name).read())
     assert "cppmega_eval/cases.jsonl" in names
     assert "cppmega_eval/prompts.jsonl" in names
-    index_name = "cppmega_eval/" + staged_cases["prompt_graph_index"]
     assert index_name in names
     assert any(name.endswith("/src/math_prompt.cpp") for name in names)
+    assert staged_cases["prompt_graph_project_id"] == PROMPT_GRAPH_PROJECT_ID
     assert staged_cases["prompt_graph_index_receipt"]["producer"] == (
         "ClangPromptProjectIndexProducer"
     )
+    assert (
+        staged_cases["prompt_graph_index_receipt"][
+            "symbol_identity_schema_version"
+        ]
+        == SYMBOL_IDENTITY_SCHEMA_VERSION
+    )
+    assert index_payload["schema"] == "cppmega_prompt_graph_index_v3"
+    assert all("symbol_id" in symbol for symbol in index_payload["symbols"])
 
 
 def test_make_eval_tar_fails_closed_when_repo_checkout_is_missing(tmp_path):
@@ -369,7 +435,7 @@ def test_make_eval_tar_fails_closed_when_repo_checkout_is_missing(tmp_path):
             prompts,
             tmp_path / "eval.tgz",
             prompt_graph_mode="repo",
-            indexer_root=ROOT.parent / "cppmega_mlx_case3_prompt",
+            indexer_root=V3_INDEXER_ROOT,
         )
 
 
@@ -466,6 +532,7 @@ def test_dry_run_prints_remote_generation_script(tmp_path, capsys):
     tokenizer = tmp_path / "tok"
     tokenizer.mkdir()
     (tokenizer / "tokenizer.json").write_text("{}")
+    cases, prompts, _repo = _v3_eval_fixture(tmp_path / "fixture")
 
     rc = main(
         [
@@ -477,13 +544,13 @@ def test_dry_run_prints_remote_generation_script(tmp_path, capsys):
             "--tokenizer-dir",
             str(tokenizer),
             "--cases",
-            str(CASE3_FIXTURE / "cases.jsonl"),
+            str(cases),
             "--prompts",
-            str(CASE3_FIXTURE / "prompts.jsonl"),
+            str(prompts),
             "--max-new-tokens",
             "8",
             "--clang-indexer-root",
-            str(ROOT.parent / "cppmega_mlx_case3_prompt"),
+            str(V3_INDEXER_ROOT),
         ]
     )
 

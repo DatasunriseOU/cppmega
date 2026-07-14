@@ -1,10 +1,10 @@
 """Production clang adapter for repository prompt-graph indexes.
 
 The adapter reuses the repository clang indexer's discovery, compile-command,
-libclang, and cursor-offset seams. Semantic identity delegates to CASE 4's
-``symbol_reference_for_cursor`` when present. Until that lands in the shared
-indexer, the compatibility seam transports clang USR plus canonical signature
-directly and never derives identity from a qualified name.
+libclang, and cursor-offset seams. Semantic identity delegates to CASE 4's v3
+``symbol_reference_for_cursor`` contract and preserves its canonical uint64 ID.
+The compatibility seam transports clang USR plus canonical signature directly
+and never derives identity from a qualified name.
 """
 
 from __future__ import annotations
@@ -21,11 +21,19 @@ import tempfile
 from types import ModuleType
 from typing import Any
 
-from .prompt_graph import INDEX_SCHEMA, PromptProjectIndex, repository_snapshot
+from .prompt_graph import (
+    INDEX_SCHEMA,
+    PromptProjectIndex,
+    repository_snapshot,
+    require_prompt_graph_project_id,
+)
+from .symbol_identity import (
+    SYMBOL_IDENTITY_SCHEMA_VERSION,
+    compute_symbol_id,
+)
 
 
-PRODUCER_VERSION = "2"
-SYMBOL_IDENTITY_SCHEMA_VERSION = 2
+PRODUCER_VERSION = "3"
 
 
 @dataclass(frozen=True)
@@ -40,6 +48,7 @@ class PromptProjectIndexBuildResult:
 class _CursorIdentity:
     semantic_identity: str
     symbol_key: str
+    symbol_id: int
     usr: str
     canonical_signature: str
     qname: str
@@ -133,12 +142,16 @@ def _identity_for_cursor(
             project_id=project_id,
             fallback_file=source_path,
         )
+        if not isinstance(reference, Mapping):
+            raise TypeError(
+                "CASE 4 v3 symbol_reference_for_cursor must return a mapping"
+            )
         usr = str(reference.get("usr") or "")
         signature = _normalize_signature(
             reference.get("canonical_signature")
         )
         symbol_key = str(reference.get("symbol_key") or "")
-        if not usr or not signature or not symbol_key:
+        if not signature or not symbol_key:
             return None
         version = int(
             reference.get("symbol_identity_schema_version") or 0
@@ -148,14 +161,28 @@ def _identity_for_cursor(
                 "CASE 4 symbol identity schema mismatch: "
                 f"expected={SYMBOL_IDENTITY_SCHEMA_VERSION} actual={version}"
             )
+        claimed_symbol_id = reference.get("symbol_id")
+        if isinstance(claimed_symbol_id, bool) or not isinstance(
+            claimed_symbol_id, int
+        ):
+            raise ValueError(
+                "CASE 4 v3 symbol reference requires an integer symbol_id"
+            )
+        expected_symbol_id = compute_symbol_id(symbol_key)
+        if claimed_symbol_id != expected_symbol_id:
+            raise ValueError(
+                "CASE 4 symbol ID does not match canonical key: "
+                f"claimed={claimed_symbol_id} expected={expected_symbol_id}"
+            )
         return _CursorIdentity(
             semantic_identity=symbol_key,
             symbol_key=symbol_key,
+            symbol_id=claimed_symbol_id,
             usr=usr,
             canonical_signature=signature,
             qname=str(reference.get("qname") or ""),
             symbol_kind=str(reference.get("symbol_kind") or "symbol"),
-            adapter="case4_symbol_reference_for_cursor_v2",
+            adapter="case4_symbol_reference_for_cursor_v3",
         )
 
     usr = _cursor_usr(cursor)
@@ -169,11 +196,12 @@ def _identity_for_cursor(
     return _CursorIdentity(
         semantic_identity=symbol_key,
         symbol_key=symbol_key,
+        symbol_id=compute_symbol_id(symbol_key),
         usr=usr,
         canonical_signature=signature,
         qname=str(indexer.get_qualified_name(cursor) or ""),
         symbol_kind=_cursor_kind_name(cursor),
-        adapter="raw_clang_usr_signature_v2_adapter",
+        adapter="raw_clang_usr_signature_v3_adapter",
     )
 
 
@@ -410,9 +438,9 @@ class ClangPromptProjectIndexProducer:
         root = Path(repo_root).resolve()
         if not root.is_dir():
             raise NotADirectoryError(f"prompt graph repository not found: {root}")
-        if not isinstance(project_id, str) or not project_id.strip():
-            raise ValueError("prompt graph project_id must be non-empty")
-        project_id = project_id.strip()
+        project_id = require_prompt_graph_project_id(
+            project_id, where="prompt graph project_id"
+        )
         indexer, indexer_path = _load_indexer(self.indexer_root)
         configured_libclang = indexer._configure_libclang(
             self.libclang_path or os.environ.get("NANOCHAT_LIBCLANG_PATH")
@@ -626,6 +654,7 @@ class ClangPromptProjectIndexProducer:
                                 "end": symbol_end,
                                 "semantic_identity": identity.semantic_identity,
                                 "symbol_key": identity.symbol_key,
+                                "symbol_id": identity.symbol_id,
                                 "usr": identity.usr,
                                 "canonical_signature": identity.canonical_signature,
                                 "qname": identity.qname,
@@ -688,6 +717,7 @@ class ClangPromptProjectIndexProducer:
                         "end": end,
                         "semantic_identity": target.semantic_identity,
                         "symbol_key": target.symbol_key,
+                        "symbol_id": target.symbol_id,
                         "usr": target.usr,
                         "canonical_signature": target.canonical_signature,
                         "qname": target.qname,
@@ -709,14 +739,15 @@ class ClangPromptProjectIndexProducer:
         )
         definitions_by_semantic: dict[str, list[dict[str, Any]]] = {}
         symbols: list[dict[str, Any]] = []
-        for symbol_id, row in enumerate(ordered_symbols, start=1):
+        for node_id, row in enumerate(ordered_symbols, start=1):
             owner = _owning_chunk(row, chunks)
             local_identity = (
                 f"symbol:{row['document_id']}:{row['start']}:{row['end']}:"
                 f"{row['kind']}:{sha256(row['semantic_identity'].encode()).hexdigest()[:16]}"
             )
             symbol = {
-                "id": symbol_id,
+                "id": node_id,
+                "symbol_id": row["symbol_id"],
                 "identity": local_identity,
                 "semantic_identity": row["semantic_identity"],
                 "symbol_key": row["symbol_key"],
@@ -818,18 +849,19 @@ class ClangPromptProjectIndexProducer:
             if symbol["kind"] in {"function", "type", "variable"}
         ]
         if any(
-            not symbol["usr"] or not symbol["canonical_signature"]
+            not symbol["symbol_key"] or not symbol["canonical_signature"]
             for symbol in definitions
         ):
             raise ValueError(
                 "clang prompt graph producer rejects qname-only definitions; "
-                "CASE 4 USR and canonical signature are required"
+                "CASE 4 v3 symbol key and canonical signature are required"
             )
 
         provenance = {
             "producer": "ClangPromptProjectIndexProducer",
             "producer_version": PRODUCER_VERSION,
             "schema": INDEX_SCHEMA,
+            "project_id": project_id,
             "cache_key": cache_key,
             "strict_diagnostics": self.strict_diagnostics,
             "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
@@ -905,7 +937,10 @@ class ClangPromptProjectIndexProducer:
                 raise ValueError("producer mismatch")
             if receipt.get("cache_key") != cache_key:
                 raise ValueError("cache key mismatch")
-            if int(receipt.get("symbol_identity_schema_version") or 0) != 2:
+            if (
+                int(receipt.get("symbol_identity_schema_version") or 0)
+                != SYMBOL_IDENTITY_SCHEMA_VERSION
+            ):
                 raise ValueError("CASE 4 symbol identity schema mismatch")
             hashes = dict(receipt.get("hashes") or {})
             for name, expected in expected_hashes.items():
