@@ -72,6 +72,46 @@ EXPECTED_BUNDLE_TOKENIZER_CONTRACT = "megacpp-vocab-65536"
 EXPECTED_PREFIX_TOKENIZER_CONTRACT = "megacpp"
 EXPECTED_VOCAB_SIZE = 65536
 EXPECTED_GRAPH_SIDECAR_SCHEMA = "cppmega_graph_routes_v2"
+OBJECTIVE_SAMPLING_MODE_V1 = "deterministic_epoch_shuffle_v1"
+OBJECTIVE_SAMPLING_MODE_V2 = "deterministic_shard_row_group_record_batch_shuffle_v2"
+OBJECTIVE_SAMPLING_BASE_KEYS = frozenset(
+    {
+        "mode",
+        "seed",
+        "requested_samples",
+        "full_passes",
+        "tail_rows",
+        "min_row_reuse",
+        "max_row_reuse",
+    }
+)
+OBJECTIVE_SAMPLING_V2_KEYS = OBJECTIVE_SAMPLING_BASE_KEYS | {
+    "record_batch_rows",
+    "ordering",
+    "cursor_semantics",
+    "final_cursor",
+}
+OBJECTIVE_SAMPLING_V2_ORDERING = {
+    "permutation": "sha256_sort_key_v1",
+    "epochs": "ascending",
+    "shards": "seeded_permutation_per_epoch",
+    "row_groups": "seeded_permutation_per_shard_epoch",
+    "record_batches": "physical_order_within_row_group",
+    "rows": "seeded_permutation_within_record_batch",
+}
+OBJECTIVE_SAMPLING_V2_CURSOR_KEYS = frozenset(
+    {
+        "epoch",
+        "shard_position",
+        "shard_index",
+        "row_group_position",
+        "row_group_index",
+        "record_batch_index",
+        "row_shuffle_position",
+        "row_index_in_record_batch",
+        "source_index",
+    }
+)
 CANONICAL_TOKENIZER_CONTRACT_PATH = (
     REPO_ROOT / "data/tokenizer_v2/tokenizer_contract_v1.json"
 )
@@ -1287,6 +1327,143 @@ def _validate_data_contract_descriptors(
     return referenced
 
 
+def _is_plain_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _objective_sampling_permutation(
+    size: int, *, seed: int, components: tuple[object, ...]
+) -> list[int]:
+    def sort_key(index: int) -> tuple[bytes, int]:
+        encoded = json.dumps(
+            [seed, *components, index],
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+        return hashlib.sha256(encoded).digest(), index
+
+    return sorted(range(size), key=sort_key)
+
+
+def _validate_objective_source_sampling(
+    sampling: object,
+    *,
+    bucket: int,
+    total_rows: int,
+    file_count: int,
+    source_rows: tuple[int, ...] | None = None,
+) -> dict[str, object]:
+    if not isinstance(sampling, dict):
+        raise ValueError(f"bucket {bucket} objective source sampling is invalid")
+
+    mode = sampling.get("mode")
+    if mode == OBJECTIVE_SAMPLING_MODE_V1:
+        expected_keys = OBJECTIVE_SAMPLING_BASE_KEYS
+    elif mode == OBJECTIVE_SAMPLING_MODE_V2:
+        expected_keys = OBJECTIVE_SAMPLING_V2_KEYS
+    else:
+        raise ValueError(f"bucket {bucket} objective source sampling is unsupported")
+    if set(sampling) != expected_keys:
+        raise ValueError(f"bucket {bucket} objective source sampling fields drifted")
+
+    integer_fields = (
+        "seed",
+        "requested_samples",
+        "full_passes",
+        "tail_rows",
+        "min_row_reuse",
+        "max_row_reuse",
+    )
+    if any(not _is_plain_int(sampling[field]) for field in integer_fields):
+        raise ValueError(
+            f"bucket {bucket} objective source sampling values are invalid"
+        )
+
+    requested = sampling["requested_samples"]
+    if requested < 1:
+        raise ValueError(f"bucket {bucket} objective source sampling drifted")
+    full_passes, tail_rows = divmod(requested, total_rows)
+    if (
+        sampling["full_passes"] != full_passes
+        or sampling["tail_rows"] != tail_rows
+        or sampling["min_row_reuse"] != full_passes
+        or sampling["max_row_reuse"] != full_passes + int(tail_rows > 0)
+    ):
+        raise ValueError(f"bucket {bucket} objective source sampling drifted")
+    if mode == OBJECTIVE_SAMPLING_MODE_V1:
+        return sampling
+
+    record_batch_rows = sampling["record_batch_rows"]
+    if not _is_plain_int(record_batch_rows) or record_batch_rows < 1:
+        raise ValueError(
+            f"bucket {bucket} objective source record_batch_rows is invalid"
+        )
+    if sampling["ordering"] != OBJECTIVE_SAMPLING_V2_ORDERING:
+        raise ValueError(
+            f"bucket {bucket} objective source deterministic ordering drifted"
+        )
+    if sampling["cursor_semantics"] != "last_yielded_row_v1":
+        raise ValueError(f"bucket {bucket} objective source cursor semantics drifted")
+
+    cursor = sampling["final_cursor"]
+    if not isinstance(cursor, dict) or set(cursor) != OBJECTIVE_SAMPLING_V2_CURSOR_KEYS:
+        raise ValueError(f"bucket {bucket} objective source final_cursor is invalid")
+    if any(
+        not _is_plain_int(cursor[field]) or cursor[field] < 0
+        for field in OBJECTIVE_SAMPLING_V2_CURSOR_KEYS
+    ):
+        raise ValueError(
+            f"bucket {bucket} objective source final_cursor values are invalid"
+        )
+
+    expected_source_index = requested - 1
+    expected_epoch, source_offset = divmod(expected_source_index, total_rows)
+    if (
+        cursor["source_index"] != expected_source_index
+        or cursor["epoch"] != expected_epoch
+        or cursor["shard_position"] >= file_count
+        or cursor["shard_index"] >= file_count
+    ):
+        raise ValueError(f"bucket {bucket} objective source final_cursor drifted")
+
+    target_rows = total_rows
+    if source_rows is not None:
+        if len(source_rows) != file_count or sum(source_rows) != total_rows:
+            raise ValueError(f"bucket {bucket} objective source row counts drifted")
+        shard_order = _objective_sampling_permutation(
+            file_count,
+            seed=sampling["seed"],
+            components=("shards", expected_epoch),
+        )
+        remaining = source_offset
+        for shard_position, shard_index in enumerate(shard_order):
+            target_rows = source_rows[shard_index]
+            if remaining < target_rows:
+                break
+            remaining -= target_rows
+        if (
+            cursor["shard_position"] != shard_position
+            or cursor["shard_index"] != shard_index
+        ):
+            raise ValueError(
+                f"bucket {bucket} objective source final_cursor shard drifted"
+            )
+
+    max_record_batches = (target_rows + record_batch_rows - 1) // record_batch_rows
+    max_batch_rows = min(record_batch_rows, target_rows)
+    if (
+        cursor["row_group_position"] >= target_rows
+        or cursor["row_group_index"] >= target_rows
+        or cursor["record_batch_index"] >= max_record_batches
+        or cursor["row_shuffle_position"] >= max_batch_rows
+        or cursor["row_index_in_record_batch"] >= max_batch_rows
+    ):
+        raise ValueError(
+            f"bucket {bucket} objective source final_cursor bounds drifted"
+        )
+    return sampling
+
+
 def _objective_source_snapshot_summary(
     source_snapshot: object, *, bucket: int
 ) -> dict[str, object]:
@@ -1303,15 +1480,19 @@ def _objective_source_snapshot_summary(
     }
     if set(source_snapshot) != expected_keys:
         raise ValueError(f"bucket {bucket} objective source_snapshot is invalid")
+    sequence_length = source_snapshot["sequence_length"]
     if (
         source_snapshot["schema"] != "cppmega_objective_source_snapshot_v1"
-        or int(source_snapshot["sequence_length"]) != bucket
+        or not _is_plain_int(sequence_length)
+        or sequence_length != bucket
     ):
         raise ValueError(f"bucket {bucket} objective source_snapshot schema drifted")
     files = source_snapshot["files"]
     if not isinstance(files, list) or not files:
         raise ValueError(f"bucket {bucket} objective source files are missing")
     records: list[dict[str, object]] = []
+    source_paths: list[str] = []
+    source_rows: list[int] = []
     total_rows = 0
     for record in files:
         if not isinstance(record, dict) or set(record) != {
@@ -1321,54 +1502,51 @@ def _objective_source_snapshot_summary(
             "rows",
         }:
             raise ValueError(f"bucket {bucket} objective source file is invalid")
+        path = record["path"]
         size = record["size_bytes"]
         rows = record["rows"]
-        digest = str(record["sha256"])
+        digest = record["sha256"]
         if (
-            not isinstance(size, int)
-            or isinstance(size, bool)
+            not isinstance(path, str)
+            or not path
+            or not _is_plain_int(size)
             or size < 1
-            or not isinstance(rows, int)
-            or isinstance(rows, bool)
+            or not _is_plain_int(rows)
             or rows < 1
+            or not isinstance(digest, str)
             or not SHA256_RE.fullmatch(digest)
         ):
-            raise ValueError(f"bucket {bucket} objective source file values are invalid")
-        records.append(
-            {"path": str(record["path"]), "size": size, "sha256": digest}
-        )
+            raise ValueError(
+                f"bucket {bucket} objective source file values are invalid"
+            )
+        records.append({"path": path, "size": size, "sha256": digest})
+        source_paths.append(path)
+        source_rows.append(rows)
         total_rows += rows
     if (
-        int(source_snapshot["file_count"]) != len(files)
-        or int(source_snapshot["row_count"]) != total_rows
+        source_paths != sorted(source_paths, key=PurePosixPath)
+        or len(source_paths) != len(set(source_paths))
+    ):
+        raise ValueError(f"bucket {bucket} objective source file ordering drifted")
+    file_count = source_snapshot["file_count"]
+    row_count = source_snapshot["row_count"]
+    if (
+        not _is_plain_int(file_count)
+        or not _is_plain_int(row_count)
+        or file_count != len(files)
+        or row_count != total_rows
     ):
         raise ValueError(f"bucket {bucket} objective source counts drifted")
     digest = _artifact_set_sha256(records)
     if source_snapshot["artifact_set_sha256"] != digest:
         raise ValueError(f"bucket {bucket} objective source digest drifted")
-    sampling = source_snapshot["sampling"]
-    expected_sampling_keys = {
-        "mode",
-        "seed",
-        "requested_samples",
-        "full_passes",
-        "tail_rows",
-        "min_row_reuse",
-        "max_row_reuse",
-    }
-    if not isinstance(sampling, dict) or set(sampling) != expected_sampling_keys:
-        raise ValueError(f"bucket {bucket} objective source sampling is invalid")
-    requested = int(sampling["requested_samples"])
-    full_passes, tail_rows = divmod(requested, total_rows)
-    if (
-        sampling["mode"] != "deterministic_epoch_shuffle_v1"
-        or requested < 1
-        or int(sampling["full_passes"]) != full_passes
-        or int(sampling["tail_rows"]) != tail_rows
-        or int(sampling["min_row_reuse"]) != full_passes
-        or int(sampling["max_row_reuse"]) != full_passes + int(tail_rows > 0)
-    ):
-        raise ValueError(f"bucket {bucket} objective source sampling drifted")
+    sampling = _validate_objective_source_sampling(
+        source_snapshot["sampling"],
+        bucket=bucket,
+        total_rows=total_rows,
+        file_count=len(files),
+        source_rows=tuple(source_rows),
+    )
     return {
         "schema": source_snapshot["schema"],
         "artifact_set_sha256": digest,
@@ -1378,9 +1556,7 @@ def _objective_source_snapshot_summary(
     }
 
 
-def _validate_objective_source_summary(
-    summary: object, *, bucket: int
-) -> None:
+def _validate_objective_source_summary(summary: object, *, bucket: int) -> None:
     if not isinstance(summary, dict) or set(summary) != {
         "schema",
         "artifact_set_sha256",
@@ -1391,18 +1567,27 @@ def _validate_objective_source_summary(
         raise ValueError(
             f"bundle objective source_snapshot descriptor is invalid for {bucket}"
         )
+    artifact_set_sha256 = summary["artifact_set_sha256"]
+    file_count = summary["file_count"]
+    row_count = summary["row_count"]
     if (
         summary["schema"] != "cppmega_objective_source_snapshot_v1"
-        or not SHA256_RE.fullmatch(str(summary["artifact_set_sha256"]))
-        or not isinstance(summary["file_count"], int)
-        or int(summary["file_count"]) < 1
-        or not isinstance(summary["row_count"], int)
-        or int(summary["row_count"]) < 1
-        or not isinstance(summary["sampling"], dict)
+        or not isinstance(artifact_set_sha256, str)
+        or not SHA256_RE.fullmatch(artifact_set_sha256)
+        or not _is_plain_int(file_count)
+        or file_count < 1
+        or not _is_plain_int(row_count)
+        or row_count < 1
     ):
         raise ValueError(
             f"bundle objective source_snapshot descriptor drifted for {bucket}"
         )
+    _validate_objective_source_sampling(
+        summary["sampling"],
+        bucket=bucket,
+        total_rows=row_count,
+        file_count=file_count,
+    )
 
 
 def _validate_logical_manifest_contract(manifest: dict) -> None:

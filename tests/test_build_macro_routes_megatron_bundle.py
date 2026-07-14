@@ -156,6 +156,7 @@ def test_objective_sources_must_match_repaired_snapshot(
         "files": files,
         "sampling": {
             "mode": "deterministic_epoch_shuffle_v1",
+            "seed": 17,
             "requested_samples": 60,
             "full_passes": 12,
             "tail_rows": 0,
@@ -194,6 +195,144 @@ def test_objective_sources_must_match_repaired_snapshot(
         _validate_objective_source_binding(
             objective_artifact_path=tmp_path / "objective.json",
             repaired_snapshot_manifest=repaired,
+            bucket=1024,
+        )
+
+
+def _bounded_v2_sampling() -> dict[str, object]:
+    return {
+        "mode": "deterministic_shard_row_group_record_batch_shuffle_v2",
+        "seed": 31,
+        "requested_samples": 5,
+        "full_passes": 2,
+        "tail_rows": 1,
+        "min_row_reuse": 2,
+        "max_row_reuse": 3,
+        "record_batch_rows": 2,
+        "ordering": {
+            "permutation": "sha256_sort_key_v1",
+            "epochs": "ascending",
+            "shards": "seeded_permutation_per_epoch",
+            "row_groups": "seeded_permutation_per_shard_epoch",
+            "record_batches": "physical_order_within_row_group",
+            "rows": "seeded_permutation_within_record_batch",
+        },
+        "cursor_semantics": "last_yielded_row_v1",
+        "final_cursor": {
+            "epoch": 2,
+            "shard_position": 0,
+            "shard_index": 0,
+            "row_group_position": 0,
+            "row_group_index": 0,
+            "record_batch_index": 0,
+            "row_shuffle_position": 0,
+            "row_index_in_record_batch": 0,
+            "source_index": 4,
+        },
+    }
+
+
+def _bounded_v2_source_binding() -> tuple[dict[str, object], dict[str, object]]:
+    payload = b"code"
+    files = [
+        {
+            "path": "code/1024/repo.parquet",
+            "size_bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "rows": 2,
+        }
+    ]
+    digest = _artifact_set_sha256(
+        [
+            {
+                "path": files[0]["path"],
+                "size": files[0]["size_bytes"],
+                "sha256": files[0]["sha256"],
+            }
+        ]
+    )
+    source_snapshot = {
+        "schema": "cppmega_objective_source_snapshot_v1",
+        "sequence_length": 1024,
+        "file_count": 1,
+        "row_count": 2,
+        "files": files,
+        "sampling": _bounded_v2_sampling(),
+        "artifact_set_sha256": digest,
+    }
+    repaired_snapshot = {
+        "files": [
+            {
+                "bucket": 1024,
+                "size": files[0]["size_bytes"],
+                "snapshot_sha256": files[0]["sha256"],
+            }
+        ]
+    }
+    return source_snapshot, repaired_snapshot
+
+
+def test_builder_accepts_exact_bounded_v2_sampling_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_snapshot, repaired_snapshot = _bounded_v2_source_binding()
+    monkeypatch.setattr(
+        builder,
+        "load_objective_materialization_artifact",
+        lambda _path: SimpleNamespace(
+            contract=SimpleNamespace(payload={"source_snapshot": source_snapshot})
+        ),
+    )
+
+    result = _validate_objective_source_binding(
+        objective_artifact_path=tmp_path / "objective.json",
+        repaired_snapshot_manifest=repaired_snapshot,
+        bucket=1024,
+    )
+
+    assert result["sampling"] == _bounded_v2_sampling()
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    (
+        "missing_record_batch_rows",
+        "record_batch_size_alias",
+        "ordering_drift",
+        "missing_cursor_coordinate",
+        "wrong_source_index",
+    ),
+)
+def test_builder_rejects_malformed_bounded_v2_sampling_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    malformation: str,
+) -> None:
+    source_snapshot, repaired_snapshot = _bounded_v2_source_binding()
+    sampling = source_snapshot["sampling"]
+    assert isinstance(sampling, dict)
+    if malformation == "missing_record_batch_rows":
+        sampling.pop("record_batch_rows")
+    elif malformation == "record_batch_size_alias":
+        sampling["record_batch_size"] = sampling.pop("record_batch_rows")
+    elif malformation == "ordering_drift":
+        sampling["ordering"]["rows"] = "physical_order_within_record_batch"
+    elif malformation == "missing_cursor_coordinate":
+        sampling["final_cursor"].pop("row_index_in_record_batch")
+    else:
+        sampling["final_cursor"]["source_index"] = 3
+    monkeypatch.setattr(
+        builder,
+        "load_objective_materialization_artifact",
+        lambda _path: SimpleNamespace(
+            contract=SimpleNamespace(payload={"source_snapshot": source_snapshot})
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="objective source"):
+        _validate_objective_source_binding(
+            objective_artifact_path=tmp_path / "objective.json",
+            repaired_snapshot_manifest=repaired_snapshot,
             bucket=1024,
         )
 

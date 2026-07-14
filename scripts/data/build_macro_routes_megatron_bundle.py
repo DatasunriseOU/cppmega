@@ -39,6 +39,7 @@ from data_prep_parquet_to_megatron import (  # noqa: E402
 from data.publish_megatron_bundle_to_nebius_s3 import (  # noqa: E402
     EXPECTED_BUNDLE_TOKENIZER_CONTRACT,
     EXPECTED_VOCAB_SIZE,
+    _objective_source_snapshot_summary,
     _validate_prefix_manifest_contract,
     _validate_tokenizer_directory,
 )
@@ -469,37 +470,14 @@ def _validate_objective_source_binding(
         raise RuntimeError(
             f"bucket {bucket}: objective contract has no source_snapshot binding"
         )
-    expected_keys = {
-        "schema",
-        "sequence_length",
-        "file_count",
-        "row_count",
-        "files",
-        "sampling",
-        "artifact_set_sha256",
-    }
-    if set(binding) != expected_keys:
-        raise RuntimeError(
-            f"bucket {bucket}: objective source_snapshot keys drifted: "
-            f"{sorted(set(binding) ^ expected_keys)}"
-        )
-    if binding["schema"] != "cppmega_objective_source_snapshot_v1":
-        raise RuntimeError(f"bucket {bucket}: unsupported objective source schema")
-    if int(binding["sequence_length"]) != bucket:
-        raise RuntimeError(
-            f"bucket {bucket}: objective source sequence_length mismatch"
-        )
+    try:
+        source_summary = _objective_source_snapshot_summary(binding, bucket=bucket)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
     files = binding["files"]
-    if not isinstance(files, list) or int(binding["file_count"]) != len(files):
-        raise RuntimeError(f"bucket {bucket}: objective source file_count mismatch")
     source_counter: Counter[tuple[int, str]] = Counter()
     for record in files:
-        if not isinstance(record, dict) or set(record) != {
-            "path", "size_bytes", "sha256", "rows"
-        }:
-            raise RuntimeError(
-                f"bucket {bucket}: malformed objective source file record"
-            )
         source_counter[(int(record["size_bytes"]), str(record["sha256"]))] += 1
 
     repaired_files = repaired_snapshot_manifest.get("files")
@@ -520,37 +498,7 @@ def _validate_objective_source_binding(
             f"objective_only={list((source_counter - snapshot_counter).elements())[:5]} "
             f"snapshot_only={list((snapshot_counter - source_counter).elements())[:5]}"
         )
-
-    digest_payload = dict(binding)
-    recorded_digest = str(digest_payload.pop("artifact_set_sha256"))
-    actual_digest = _artifact_set_sha256(
-        [
-            {
-                "path": str(record["path"]),
-                "size": int(record["size_bytes"]),
-                "sha256": str(record["sha256"]),
-            }
-            for record in files
-        ]
-    )
-    if recorded_digest != actual_digest:
-        raise RuntimeError(
-            f"bucket {bucket}: objective source artifact_set_sha256 mismatch"
-        )
-    if int(binding["row_count"]) < 1:
-        raise RuntimeError(f"bucket {bucket}: objective source row_count must be positive")
-    sampling = binding["sampling"]
-    if not isinstance(sampling, dict) or sampling.get("mode") != (
-        "deterministic_epoch_shuffle_v1"
-    ):
-        raise RuntimeError(f"bucket {bucket}: unsupported objective source sampling")
-    return {
-        "schema": binding["schema"],
-        "artifact_set_sha256": recorded_digest,
-        "file_count": len(files),
-        "row_count": int(binding["row_count"]),
-        "sampling": sampling,
-    }
+    return source_summary
 
 
 def _read_mmididx(idx_path: Path) -> dict[str, int]:

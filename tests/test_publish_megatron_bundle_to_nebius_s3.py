@@ -82,6 +82,74 @@ def _source_identity(source: str) -> tuple[int, str]:
     return identity_id, digest.hex()
 
 
+def _bounded_v2_sampling() -> dict[str, object]:
+    return {
+        "mode": "deterministic_shard_row_group_record_batch_shuffle_v2",
+        "seed": 31,
+        "requested_samples": 5,
+        "full_passes": 2,
+        "tail_rows": 1,
+        "min_row_reuse": 2,
+        "max_row_reuse": 3,
+        "record_batch_rows": 2,
+        "ordering": {
+            "permutation": "sha256_sort_key_v1",
+            "epochs": "ascending",
+            "shards": "seeded_permutation_per_epoch",
+            "row_groups": "seeded_permutation_per_shard_epoch",
+            "record_batches": "physical_order_within_row_group",
+            "rows": "seeded_permutation_within_record_batch",
+        },
+        "cursor_semantics": "last_yielded_row_v1",
+        "final_cursor": {
+            "epoch": 2,
+            "shard_position": 0,
+            "shard_index": 0,
+            "row_group_position": 0,
+            "row_group_index": 0,
+            "record_batch_index": 0,
+            "row_shuffle_position": 0,
+            "row_index_in_record_batch": 0,
+            "source_index": 4,
+        },
+    }
+
+
+def _bounded_v2_source_snapshot() -> dict[str, object]:
+    source_snapshot = _objective_payload()["source_snapshot"]
+    source_snapshot["row_count"] = 2
+    source_snapshot["files"][0]["rows"] = 2
+    source_snapshot["sampling"] = _bounded_v2_sampling()
+    return source_snapshot
+
+
+def _malform_bounded_v2_sampling(
+    sampling: dict[str, object], malformation: str
+) -> None:
+    if malformation == "missing_record_batch_rows":
+        sampling.pop("record_batch_rows")
+    elif malformation == "record_batch_size_alias":
+        sampling["record_batch_size"] = sampling.pop("record_batch_rows")
+    elif malformation == "invalid_record_batch_rows":
+        sampling["record_batch_rows"] = True
+    elif malformation == "ordering_drift":
+        ordering = sampling["ordering"]
+        assert isinstance(ordering, dict)
+        ordering["rows"] = "physical_order_within_record_batch"
+    elif malformation == "missing_cursor_coordinate":
+        cursor = sampling["final_cursor"]
+        assert isinstance(cursor, dict)
+        cursor.pop("row_index_in_record_batch")
+    elif malformation == "wrong_source_index":
+        cursor = sampling["final_cursor"]
+        assert isinstance(cursor, dict)
+        cursor["source_index"] = 3
+    else:
+        cursor = sampling["final_cursor"]
+        assert isinstance(cursor, dict)
+        cursor["epoch"] = 1
+
+
 def _objective_payload():
     tasks = ("causal_lm", "fim", "ast_fim", "ifim", "commit_diff", "pre_to_post")
     source_files = [
@@ -634,6 +702,94 @@ def test_validate_bundle_requires_objective_source_snapshot_summary(tmp_path):
 
     with pytest.raises(ValueError, match="descriptor is invalid"):
         _validate_bundle(tmp_path, hash_jobs=1)
+
+
+def test_publisher_accepts_exact_bounded_v2_sampling_contract():
+    summary = publisher._objective_source_snapshot_summary(
+        _bounded_v2_source_snapshot(), bucket=1024
+    )
+
+    publisher._validate_objective_source_summary(summary, bucket=1024)
+
+    assert summary["sampling"] == _bounded_v2_sampling()
+
+
+def test_publisher_validates_seeded_shard_cursor_permutation():
+    sampling = _bounded_v2_sampling()
+    sampling.update(
+        {
+            "seed": 17,
+            "requested_samples": 1,
+            "full_passes": 0,
+            "tail_rows": 1,
+            "min_row_reuse": 0,
+            "max_row_reuse": 1,
+        }
+    )
+    cursor = sampling["final_cursor"]
+    assert isinstance(cursor, dict)
+    cursor.update({"epoch": 0, "shard_index": 1, "source_index": 0})
+
+    publisher._validate_objective_source_sampling(
+        sampling,
+        bucket=1024,
+        total_rows=9,
+        file_count=3,
+        source_rows=(2, 3, 4),
+    )
+
+    cursor["shard_index"] = 0
+    with pytest.raises(ValueError, match="final_cursor shard drifted"):
+        publisher._validate_objective_source_sampling(
+            sampling,
+            bucket=1024,
+            total_rows=9,
+            file_count=3,
+            source_rows=(2, 3, 4),
+        )
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    (
+        "missing_record_batch_rows",
+        "record_batch_size_alias",
+        "invalid_record_batch_rows",
+        "ordering_drift",
+        "missing_cursor_coordinate",
+        "wrong_source_index",
+        "wrong_epoch",
+    ),
+)
+def test_publisher_rejects_malformed_bounded_v2_sampling_contract(malformation):
+    source_snapshot = _bounded_v2_source_snapshot()
+    sampling = source_snapshot["sampling"]
+    assert isinstance(sampling, dict)
+    _malform_bounded_v2_sampling(sampling, malformation)
+
+    with pytest.raises(ValueError, match="objective source"):
+        publisher._objective_source_snapshot_summary(source_snapshot, bucket=1024)
+
+    valid_summary = publisher._objective_source_snapshot_summary(
+        _bounded_v2_source_snapshot(), bucket=1024
+    )
+    summary_sampling = valid_summary["sampling"]
+    assert isinstance(summary_sampling, dict)
+    _malform_bounded_v2_sampling(summary_sampling, malformation)
+    with pytest.raises(ValueError, match="objective source"):
+        publisher._validate_objective_source_summary(valid_summary, bucket=1024)
+
+
+def test_publisher_preserves_fail_closed_v1_sampling_support():
+    source_snapshot = _objective_payload()["source_snapshot"]
+    summary = publisher._objective_source_snapshot_summary(source_snapshot, bucket=1024)
+    publisher._validate_objective_source_summary(summary, bucket=1024)
+
+    sampling = source_snapshot["sampling"]
+    assert isinstance(sampling, dict)
+    sampling.pop("seed")
+    with pytest.raises(ValueError, match="sampling fields drifted"):
+        publisher._objective_source_snapshot_summary(source_snapshot, bucket=1024)
 
 
 def test_validate_bundle_matches_source_summary_to_staged_contract(tmp_path):
