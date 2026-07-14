@@ -57,6 +57,9 @@ else:
     )
 
 
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
 def _aws_read(uri: str, *, endpoint: str, env: dict[str, str]) -> bytes:
     result = subprocess.run(
         ["aws", "s3", "cp", uri, "-", "--endpoint-url", endpoint, "--no-progress"],
@@ -133,8 +136,33 @@ def _prefix_manifest_sha256s(logical_manifest: dict) -> dict[str, str]:
     return dict(sorted(result.items()))
 
 
+def _validate_run_id(run_id: object) -> str:
+    if not isinstance(run_id, str) or not _RUN_ID_RE.fullmatch(run_id):
+        raise ValueError(
+            "restore run_id must be a 1-128 character identifier containing only "
+            "letters, digits, '.', '_' or '-'"
+        )
+    return run_id
+
+
+def _contained_output_path(output_root: Path, name: str) -> Path:
+    path = output_root / name
+    if path.parent != output_root or path.name != name:
+        raise ValueError(f"unsafe restore output path component: {name!r}")
+    return path
+
+
+def _remove_partial_tree(partial: Path) -> None:
+    if not partial.exists() and not partial.is_symlink():
+        return
+    if partial.is_symlink() or not partial.is_dir():
+        raise ValueError(f"restore partial path is not a regular directory: {partial}")
+    shutil.rmtree(partial)
+
+
 def _acquire_restore_lock(output_root: Path, *, bundle_id: str, run_id: str):
-    lock_path = output_root / f".{bundle_id}.{run_id}.restore.lock"
+    run_id = _validate_run_id(run_id)
+    lock_path = _contained_output_path(output_root, f".{bundle_id}.restore.lock")
     handle = lock_path.open("a+", encoding="utf-8")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -497,6 +525,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Iterable[str] | None = None) -> int:
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     args = build_arg_parser().parse_args(raw_argv)
+    args.run_id = _validate_run_id(args.run_id)
+    if args.bundle_id is not None and not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", args.bundle_id
+    ):
+        raise ValueError(f"unsafe requested bundle ID: {args.bundle_id!r}")
     _load_env_file(args.env_file)
     env = _s3_env()
     prefix = args.prefix.strip("/")
@@ -574,7 +607,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     _restore_lock = _acquire_restore_lock(
         output_root, bundle_id=bundle_id, run_id=args.run_id
     )
-    destination = output_root / bundle_id
+    destination = _contained_output_path(output_root, bundle_id)
     if destination.exists():
         manifest, _artifacts = _validate_bundle(destination, args.hash_jobs)
         if manifest["bundle_id"] != bundle_id:
@@ -602,10 +635,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         print(json.dumps({"bundle": str(destination), "status": "already_verified"}))
         return 0
 
-    partial = output_root / f".{bundle_id}.{args.run_id}.partial"
-    archive = output_root / f".{bundle_id}.{args.run_id}.tar.zst"
-    if partial.exists():
-        shutil.rmtree(partial)
+    partial = _contained_output_path(
+        output_root, f".{bundle_id}.{args.run_id}.partial"
+    )
+    archive = _contained_output_path(
+        output_root, f".{bundle_id}.{args.run_id}.tar.zst"
+    )
+    _remove_partial_tree(partial)
 
     archive_info = transport["archive"]
     _require_free_space(
@@ -642,7 +678,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         if _sha256(partial / "manifest.json") != transport["logical_manifest_sha256"]:
             raise ValueError("restored logical manifest does not match transport")
     except Exception:
-        shutil.rmtree(partial, ignore_errors=True)
+        _remove_partial_tree(partial)
         raise
 
     os.replace(partial, destination)

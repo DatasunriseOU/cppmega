@@ -18,6 +18,7 @@ from scripts.data.restore_megatron_bundle_from_nebius_s3 import (
     _extract_tar_zst,
     _prefix_manifest_sha256s,
     _require_free_space,
+    _validate_run_id,
     _validate_tar_zst_members,
     _validate_transport,
     build_arg_parser,
@@ -319,6 +320,48 @@ def test_restore_lock_rejects_same_bundle_and_run_concurrency(tmp_path: Path) ->
             _acquire_restore_lock(tmp_path, bundle_id="bundle-1", run_id="run-1")
     finally:
         first.close()
+
+
+def test_restore_lock_rejects_different_runs_for_same_bundle(tmp_path: Path) -> None:
+    first = _acquire_restore_lock(tmp_path, bundle_id="bundle-1", run_id="run-1")
+    try:
+        with pytest.raises(RuntimeError, match="restore already active"):
+            _acquire_restore_lock(tmp_path, bundle_id="bundle-1", run_id="run-2")
+    finally:
+        first.close()
+
+
+@pytest.mark.parametrize(
+    "run_id",
+    ["x/../victim", "../victim", "/absolute", ".", "x" * 129, "space id"],
+)
+def test_restore_rejects_unsafe_run_id_before_filesystem_mutation(
+    tmp_path: Path, run_id: str
+) -> None:
+    output_root = tmp_path / "restore-output"
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    sentinel = victim / "sentinel"
+    sentinel.write_text("keep", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="restore run_id"):
+        restore.main(
+            [
+                "--output-root",
+                str(output_root),
+                "--run-id",
+                run_id,
+            ]
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert not output_root.exists()
+
+
+def test_validate_restore_run_id_accepts_safe_identifier() -> None:
+    assert _validate_run_id("cold-restore_20260714.01") == (
+        "cold-restore_20260714.01"
+    )
 
 
 def test_restore_requires_space_for_archive_expansion(tmp_path, monkeypatch):
