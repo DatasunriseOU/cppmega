@@ -118,16 +118,25 @@ def _rng_state() -> dict[str, object]:
     }
     if torch.cuda.is_available():
         state["torch_cuda"] = torch.cuda.get_rng_state_all()
+        state["megatron_cuda_rng_tracker"] = _megatron_cuda_rng_tracker_state()
+    return state
+
+
+def _megatron_cuda_rng_tracker_state() -> object:
     try:
         from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
-
-        tracker = get_cuda_rng_tracker()
-        get_states = getattr(tracker, "get_states", None)
-        if callable(get_states):
-            state["megatron_cuda_rng_tracker"] = get_states()
-    except (ImportError, AttributeError):
-        pass
-    return state
+    except (ImportError, AttributeError) as error:
+        raise RuntimeError(
+            "CUDA checkpoint proof requires Megatron CUDA RNG tracker"
+        ) from error
+    tracker = get_cuda_rng_tracker()
+    get_states = getattr(tracker, "get_states", None)
+    if not callable(get_states):
+        raise RuntimeError("Megatron CUDA RNG tracker has no callable get_states")
+    states = get_states()
+    if not isinstance(states, Mapping) or not states:
+        raise RuntimeError("Megatron CUDA RNG tracker returned no named RNG states")
+    return states
 
 
 def runtime_state_fingerprints(model: object, optimizer: object) -> dict[str, str]:

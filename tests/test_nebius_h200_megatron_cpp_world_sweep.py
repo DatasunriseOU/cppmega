@@ -4,6 +4,7 @@ from pathlib import Path
 import shutil
 import struct
 import subprocess
+import tarfile
 
 import pytest
 
@@ -17,6 +18,7 @@ from scripts.nebius_h200_megatron_cpp_world_sweep import (
     first_public_ip,
     main,
     make_checkpoint_tar,
+    make_bundle_tar,
     make_ghcr_auth_tar,
     make_multi_sidecar_tar,
     remote_run_script,
@@ -360,7 +362,11 @@ def test_overlay_includes_batch_and_dataset_sidecar_contract():
     assert "cppmega/megatron/structure_dataset_patch.py" in OVERLAY_PATHS
     assert "cppmega/megatron/structure_batch.py" in OVERLAY_PATHS
     assert "cppmega/megatron/h200_preflight.py" in OVERLAY_PATHS
+    assert "cppmega/megatron/checkpoint_restore_preflight.py" in OVERLAY_PATHS
+    assert "cppmega/megatron/objective_contract.py" in OVERLAY_PATHS
+    assert "cppmega/receipt_binding.py" in OVERLAY_PATHS
     assert "scripts/h200_megatron_preflight.py" in OVERLAY_PATHS
+    assert "scripts/data/publish_megatron_bundle_to_nebius_s3.py" in OVERLAY_PATHS
 
 
 def test_remote_script_enables_graph_routes_and_uses_selected_data_prefix():
@@ -377,7 +383,7 @@ def test_remote_script_enables_graph_routes_and_uses_selected_data_prefix():
     assert "apply_dsa_indexer_fused_patch()" in script
     assert "apply_graph_route_attention_bias_patch()" in script
     assert "1024:cppmega_1024_current_mix_graph_train" in script
-    assert 'DATA_PREFIX="/data/cppmega_sidecar/${DATA_PREFIX_NAME}"' in script
+    assert 'DATA_PREFIX="$CPPMEGA_BUNDLE_ROOT/${DATA_PREFIX_NAME}"' in script
     assert 'DATA_ARGS=(--data-path 1.0 \\"\\$DATA_PREFIX\\")' in script
     assert 'ATTN_ARGS=(--attention-backend \\"\\$CPPMEGA_ATTN_BACKEND\\")' in script
     assert "CPPMEGA_USE_FLASH_ATTN" in script
@@ -402,8 +408,10 @@ def test_remote_script_runs_fail_closed_h200_preflight_before_sweep():
 
     preflight = "python /opt/cppmega/scripts/h200_megatron_preflight.py"
     assert preflight in script
+    assert '--bundle-root "$CPPMEGA_BUNDLE_ROOT"' in script
     assert "--data-prefix \"$DATA_PREFIX\"" in script
-    assert "--tokenizer-model /data/cpp_tokenizer_hf" in script
+    assert '--tokenizer-model "$CPPMEGA_TOKENIZER_MODEL"' in script
+    assert "--run-id nebius-h200-sweep" in script
     assert "--output /data/cppmega_h200_results/h200_preflight.json" in script
     assert "CPPMEGA_H200_PREFLIGHT_STATUS=PASS" in script
     assert script.index(preflight) < script.index('for SPEC in "${TEST_SPECS[@]}"')
@@ -571,11 +579,22 @@ def test_make_checkpoint_tar_archives_checkpoint_contents(tmp_path):
 
 
 def test_fp8_tensorwise_dry_run_disables_nvrtc_by_default(tmp_path, capsys):
+    bundle_root = tmp_path / "bundle"
+    bundle_root.mkdir()
+    prefix = bundle_root / "sample_train"
+    tokenizer = bundle_root / "tok"
+    _write_valid_sidecar_prefix(prefix)
+    _write_tokenizer_dir(tokenizer)
+    _write_test_bundle(bundle_root, prefix, tokenizer)
     pubkey = tmp_path / "id_ed25519.pub"
     pubkey.write_text("ssh-ed25519 TESTKEY codex\n")
     rc = main(
         [
             "--dry-run",
+            "--bundle-root",
+            str(bundle_root),
+            "--sidecar-prefix",
+            str(prefix),
             "--fp8-recipe",
             "tensorwise",
             "--batch-sizes",
@@ -592,11 +611,22 @@ def test_fp8_tensorwise_dry_run_disables_nvrtc_by_default(tmp_path, capsys):
 
 
 def test_fp8_tensorwise_can_keep_nvrtc_enabled_for_perf_probe(tmp_path, capsys):
+    bundle_root = tmp_path / "bundle"
+    bundle_root.mkdir()
+    prefix = bundle_root / "sample_train"
+    tokenizer = bundle_root / "tok"
+    _write_valid_sidecar_prefix(prefix)
+    _write_tokenizer_dir(tokenizer)
+    _write_test_bundle(bundle_root, prefix, tokenizer)
     pubkey = tmp_path / "id_ed25519.pub"
     pubkey.write_text("ssh-ed25519 TESTKEY codex\n")
     rc = main(
         [
             "--dry-run",
+            "--bundle-root",
+            str(bundle_root),
+            "--sidecar-prefix",
+            str(prefix),
             "--fp8-recipe",
             "tensorwise",
             "--enable-nvrtc",
@@ -680,6 +710,28 @@ def test_make_multi_sidecar_tar_includes_each_prefix_once(tmp_path):
     assert "cppmega_sidecar/seq1024_train_token_structure_ids.bin" in names
     assert "cppmega_sidecar/seq2048_train_token_structure_ids.bin" in names
     assert "cpp_tokenizer_hf/tokenizer.json" in names
+
+
+def test_make_bundle_tar_preserves_manifest_bound_objective_and_layout(tmp_path):
+    prefix = tmp_path / "sample_train"
+    tokenizer = tmp_path / "tok"
+    _write_valid_sidecar_prefix(prefix)
+    _write_tokenizer_dir(tokenizer)
+    manifest = _write_test_bundle(tmp_path, prefix, tokenizer)
+    output = tmp_path / "bundle.tgz"
+
+    prefixes, tokenizer_relative = make_bundle_tar(tmp_path, [prefix], output)
+
+    with tarfile.open(output, "r:gz") as archive:
+        names = set(archive.getnames())
+    objective_path = manifest["bucket_results"][0]["manifest"]["objective_contract"][
+        "objective_id_sidecar"
+    ]["path"]
+    assert prefixes == [manifest["bucket_results"][0]["prefix"]]
+    assert tokenizer_relative == manifest["tokenizer"]["path"]
+    assert "cppmega_bundle/manifest.json" in names
+    assert f"cppmega_bundle/{objective_path}" in names
+    assert f"cppmega_bundle/{prefix.name}.json" in names
 
 
 def test_sidecar_preflight_rejects_missing_graph_sidecars(tmp_path):

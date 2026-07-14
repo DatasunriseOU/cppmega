@@ -274,7 +274,7 @@ def _claimed_backend_modules(environment: dict[str, str]) -> tuple[str, ...]:
         return ()
     mode = environment.get("CPPMEGA_DSA_SPARSE_MODE", "").strip().lower()
     if mode == "tilelang":
-        return ("tilelang", "triton", "tvm")
+        return ("tilelang",)
     if mode == "triton":
         return ("triton",)
     if mode == "tvm":
@@ -309,6 +309,25 @@ def _validate_backend_dispatch_receipt(
         or not math.isfinite(float(numerical.get("max_abs_error", math.nan)))
     ):
         raise RuntimeError("backend dispatch receipt lacks numerical evidence")
+    return receipt
+
+
+def _load_backend_dispatch_receipt(
+    path: Path,
+    *,
+    claims: tuple[str, ...],
+    receipt_binding: dict[str, object],
+) -> dict[str, object]:
+    if not path.is_file():
+        raise RuntimeError(f"required backend dispatch receipt was not written: {path}")
+    receipt = _validate_backend_dispatch_receipt(
+        json.loads(path.read_text(encoding="utf-8")), claims=claims
+    )
+    validate_receipt_binding(
+        receipt.get("binding"),
+        expected=receipt_binding,
+        where=path.name,
+    )
     return receipt
 
 
@@ -593,12 +612,17 @@ def _run_phase(
     batch_receipt: Path,
     graph_prior_receipt: Path,
     checkpoint_state_receipt: Path,
+    backend_dispatch_receipt: Path,
+    backend_claims: tuple[str, ...],
     expected_iteration: int,
     expected_loaded_iteration: int | None,
     checkpoint_root: Path,
     receipt_binding: dict[str, object],
 ) -> dict[str, object]:
-    for path in (batch_receipt, graph_prior_receipt, checkpoint_state_receipt):
+    required_receipts = [batch_receipt, graph_prior_receipt, checkpoint_state_receipt]
+    if backend_claims:
+        required_receipts.append(backend_dispatch_receipt)
+    for path in required_receipts:
         path.unlink(missing_ok=True)
     phase_environment = dict(environment)
     phase_environment["CPPMEGA_H200_BATCH_RECEIPT"] = str(batch_receipt)
@@ -608,6 +632,10 @@ def _run_phase(
     phase_environment["CPPMEGA_H200_CHECKPOINT_STATE_RECEIPT"] = str(
         checkpoint_state_receipt
     )
+    if backend_claims:
+        phase_environment["CPPMEGA_H200_BACKEND_DISPATCH_RECEIPT"] = str(
+            backend_dispatch_receipt
+        )
     phase_environment["CPPMEGA_H200_EXPECTED_LOAD_ITERATION"] = "1"
     phase_environment["CPPMEGA_H200_CHECKPOINT_PROOF_MODE"] = (
         "restore" if expected_loaded_iteration is not None else "save"
@@ -679,6 +707,13 @@ def _run_phase(
     checkpoint_state = json.loads(
         checkpoint_state_receipt.read_text(encoding="utf-8")
     )
+    backend_dispatch = None
+    if backend_claims:
+        backend_dispatch = _load_backend_dispatch_receipt(
+            backend_dispatch_receipt,
+            claims=backend_claims,
+            receipt_binding=receipt_binding,
+        )
     expected_mode = "load" if expected_loaded_iteration is not None else "save"
     if (
         checkpoint_state.get("status") != "verified"
@@ -707,12 +742,21 @@ def _run_phase(
             expected_pending=receipt_binding,
             final=final_binding,
         )
+        if backend_dispatch is not None:
+            backend_dispatch = _finalize_bound_receipt(
+                backend_dispatch_receipt,
+                expected_pending=receipt_binding,
+                final=final_binding,
+            )
     else:
-        for path, payload in (
+        bound_receipts = [
             (batch_receipt, batch),
             (graph_prior_receipt, graph_prior),
             (checkpoint_state_receipt, checkpoint_state),
-        ):
+        ]
+        if backend_dispatch is not None:
+            bound_receipts.append((backend_dispatch_receipt, backend_dispatch))
+        for path, payload in bound_receipts:
             validate_receipt_binding(
                 payload.get("binding"),
                 expected=final_binding,
@@ -731,6 +775,10 @@ def _run_phase(
         "batch_receipt": str(batch_receipt),
         "graph_prior_receipt": str(graph_prior_receipt),
         "checkpoint_state_receipt": str(checkpoint_state_receipt),
+        "backend_dispatch_receipt": (
+            str(backend_dispatch_receipt) if backend_dispatch is not None else None
+        ),
+        "backend_dispatch": backend_dispatch,
         "binding": final_binding,
         "checkpoint_sha256": checkpoint_sha256,
         "completed_iteration": expected_iteration,
@@ -930,6 +978,9 @@ def main(argv: Iterable[str] | None = None) -> int:
                 graph_prior_receipt=output.parent
                 / "h200_preflight_save_graph_prior.json",
                 checkpoint_state_receipt=save_state_receipt,
+                backend_dispatch_receipt=output.parent
+                / "h200_preflight_save_backend_dispatch.json",
+                backend_claims=backend_claims,
                 expected_iteration=1,
                 expected_loaded_iteration=None,
                 checkpoint_root=checkpoint_root,
@@ -971,6 +1022,9 @@ def main(argv: Iterable[str] | None = None) -> int:
                 graph_prior_receipt=output.parent
                 / "h200_preflight_restore_graph_prior.json",
                 checkpoint_state_receipt=restore_state_receipt,
+                backend_dispatch_receipt=output.parent
+                / "h200_preflight_restore_backend_dispatch.json",
+                backend_claims=backend_claims,
                 expected_iteration=2,
                 expected_loaded_iteration=1,
                 checkpoint_root=cold_checkpoint_root,

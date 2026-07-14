@@ -183,7 +183,9 @@ def validate_objective_contract(
     if set(planned) != set(task_order):
         raise ValueError("planned_samples keys must exactly match task_order")
     planned_samples = {
-        task: _positive_int(planned[task], where=f"planned_samples.{task}")
+        task: _positive_int(
+            planned[task], where=f"planned_samples.{task}", allow_zero=True
+        )
         for task in task_order
     }
     if planned_samples != expected_planned:
@@ -207,11 +209,19 @@ def validate_objective_contract(
                 f"planned={planned_samples[task]}"
             )
         input_tokens = _positive_int(
-            row.get("input_tokens"), where=f"realized.{task}.input_tokens"
+            row.get("input_tokens"),
+            where=f"realized.{task}.input_tokens",
+            allow_zero=samples == 0,
         )
         loss_tokens = _positive_int(
-            row.get("loss_tokens"), where=f"realized.{task}.loss_tokens"
+            row.get("loss_tokens"),
+            where=f"realized.{task}.loss_tokens",
+            allow_zero=samples == 0,
         )
+        if samples == 0 and (input_tokens or loss_tokens):
+            raise ValueError(
+                f"realized.{task} has zero samples but nonzero token accounting"
+            )
         if loss_tokens > input_tokens:
             raise ValueError(
                 f"realized.{task}.loss_tokens={loss_tokens} exceeds "
@@ -438,10 +448,38 @@ def validate_materialized_objective_contract(
             raise ValueError("objective_contract objective ID path escapes dataset")
         if not os.path.isfile(path):
             raise FileNotFoundError(path)
-        if document_count is not None and os.path.getsize(path) != document_count:
+        expected_documents = int(validated.payload["totals"]["samples"])
+        if document_count is not None and document_count != expected_documents:
+            raise ValueError(
+                "objective contract sample count must equal document_count: "
+                f"samples={expected_documents}, documents={document_count}"
+            )
+        if os.path.getsize(path) != expected_documents:
             raise ValueError(
                 "objective ID sidecar byte count must equal document_count: "
-                f"bytes={os.path.getsize(path)}, documents={document_count}"
+                f"bytes={os.path.getsize(path)}, documents={expected_documents}"
+            )
+        objective_ids = np.memmap(path, mode="r", dtype=np.uint8)
+        allowed_ids = {OBJECTIVE_IDS[task] for task in validated.task_order}
+        present_ids = {int(value) for value in np.unique(objective_ids)}
+        unknown_ids = sorted(present_ids - allowed_ids)
+        if unknown_ids:
+            raise ValueError(
+                f"objective ID sidecar contains unknown objective IDs: {unknown_ids}"
+            )
+        histogram = np.bincount(objective_ids, minlength=256)
+        expected_histogram = {
+            OBJECTIVE_IDS[task]: int(validated.planned_samples[task])
+            for task in validated.task_order
+        }
+        actual_histogram = {
+            objective_id: int(histogram[objective_id])
+            for objective_id in sorted(allowed_ids)
+        }
+        if actual_histogram != expected_histogram:
+            raise ValueError(
+                "objective ID sidecar histogram differs from objective contract: "
+                f"expected={expected_histogram}, got={actual_histogram}"
             )
     return validated
 

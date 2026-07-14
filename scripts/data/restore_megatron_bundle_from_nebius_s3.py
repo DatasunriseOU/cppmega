@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import os
@@ -22,6 +23,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from cppmega.receipt_binding import (  # noqa: E402
+    NO_CHECKPOINT_SHA256,
     build_receipt_binding,
     validate_binding_shape,
     validate_receipt_binding,
@@ -97,6 +99,49 @@ def _archive_matches(archive: Path, *, size: int, sha256: str) -> bool:
         and archive.stat().st_size == size
         and _sha256(archive) == sha256
     )
+
+
+def _prefix_manifest_sha256s(logical_manifest: dict) -> dict[str, str]:
+    artifacts = logical_manifest.get("artifacts")
+    bucket_results = logical_manifest.get("bucket_results")
+    if not isinstance(artifacts, list) or not isinstance(bucket_results, list):
+        raise ValueError("logical manifest lacks artifacts or bucket_results")
+    artifact_hashes: dict[str, str] = {}
+    for record in artifacts:
+        if not isinstance(record, dict):
+            raise ValueError("logical manifest artifact record must be an object")
+        path = record.get("path")
+        digest = record.get("sha256")
+        if not isinstance(path, str) or not isinstance(digest, str):
+            raise ValueError("logical manifest artifact identity is invalid")
+        artifact_hashes[path] = digest
+    result: dict[str, str] = {}
+    for bucket in bucket_results:
+        if not isinstance(bucket, dict) or not isinstance(bucket.get("prefix"), str):
+            raise ValueError("logical manifest bucket prefix is invalid")
+        manifest_path = f"{bucket['prefix']}.json"
+        digest = artifact_hashes.get(manifest_path)
+        if digest is None:
+            raise ValueError(
+                f"logical manifest does not bind prefix manifest {manifest_path}"
+            )
+        result[manifest_path] = digest
+    if not result:
+        raise ValueError("logical manifest has no bound Megatron prefix manifests")
+    return dict(sorted(result.items()))
+
+
+def _acquire_restore_lock(output_root: Path, *, bundle_id: str, run_id: str):
+    lock_path = output_root / f".{bundle_id}.{run_id}.restore.lock"
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        handle.close()
+        raise RuntimeError(
+            f"restore already active for bundle={bundle_id} run_id={run_id}"
+        ) from error
+    return handle
 
 
 def _acquire_archive(
@@ -436,6 +481,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--bundle-id")
+    parser.add_argument("--run-id", required=True)
     parser.add_argument("--bucket", default=DEFAULT_BUCKET)
     parser.add_argument("--prefix", default=DEFAULT_PREFIX)
     parser.add_argument("--endpoint-url", default=DEFAULT_ENDPOINT)
@@ -447,7 +493,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Iterable[str] | None = None) -> int:
-    args = build_arg_parser().parse_args(argv)
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = build_arg_parser().parse_args(raw_argv)
     _load_env_file(args.env_file)
     env = _s3_env()
     prefix = args.prefix.strip("/")
@@ -501,6 +548,29 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     output_root = args.output_root.resolve()
     output_root.mkdir(parents=True, exist_ok=True)
+    restore_config = {
+        "schema": "cppmega_nebius_bundle_restore_config_v1",
+        "bucket": args.bucket,
+        "prefix": prefix,
+        "endpoint_url": args.endpoint_url,
+        "output_root": str(output_root),
+        "bundle_id": bundle_id,
+        "hash_jobs": args.hash_jobs,
+        "free_space_headroom_gb": args.free_space_headroom_gb,
+        "keep_archive": args.keep_archive,
+    }
+    receipt_binding = build_receipt_binding(
+        bundle_id=bundle_id,
+        artifact_set_sha256=str(transport["artifact_set_sha256"]),
+        prefix_manifest_sha256s=_prefix_manifest_sha256s(logical_manifest),
+        checkpoint_sha256=NO_CHECKPOINT_SHA256,
+        config=restore_config,
+        command=[str(Path(__file__).resolve()), *raw_argv],
+        run_id=args.run_id,
+    )
+    _restore_lock = _acquire_restore_lock(
+        output_root, bundle_id=bundle_id, run_id=args.run_id
+    )
     destination = output_root / bundle_id
     if destination.exists():
         manifest, _artifacts = _validate_bundle(destination, args.hash_jobs)
@@ -522,14 +592,15 @@ def main(argv: Iterable[str] | None = None) -> int:
                 "artifact_set_sha256": manifest["artifact_set_sha256"],
                 "artifact_count": manifest["artifact_count"],
                 "artifact_bytes": manifest["artifact_bytes"],
+                "binding": receipt_binding,
                 "restored_at": datetime.now(timezone.utc).isoformat(),
             },
         )
         print(json.dumps({"bundle": str(destination), "status": "already_verified"}))
         return 0
 
-    partial = output_root / f".{bundle_id}.partial"
-    archive = output_root / f".{bundle_id}.tar.zst"
+    partial = output_root / f".{bundle_id}.{args.run_id}.partial"
+    archive = output_root / f".{bundle_id}.{args.run_id}.tar.zst"
     if partial.exists():
         shutil.rmtree(partial)
 
@@ -547,6 +618,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         env=env,
         expected_size=int(archive_info["size"]),
         expected_sha256=str(archive_info["sha256"]),
+        receipt_binding=receipt_binding,
     )
 
     try:
@@ -584,6 +656,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "artifact_set_sha256": manifest["artifact_set_sha256"],
         "artifact_count": manifest["artifact_count"],
         "artifact_bytes": manifest["artifact_bytes"],
+        "binding": receipt_binding,
         "archive_download": archive_download,
         "restored_at": datetime.now(timezone.utc).isoformat(),
     }

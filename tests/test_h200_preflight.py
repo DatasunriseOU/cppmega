@@ -182,7 +182,7 @@ def test_tilelang_profile_requires_actual_dispatch_and_numerical_evidence():
     claims = _claimed_backend_modules(
         {"CPPMEGA_DENSE_GQA": "0", "CPPMEGA_DSA_SPARSE_MODE": "tilelang"}
     )
-    assert claims == ("tilelang", "triton", "tvm")
+    assert claims == ("tilelang",)
     receipt = {
         "schema": "cppmega_backend_dispatch_v1",
         "selected_backend": "tilelang",

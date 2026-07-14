@@ -13,18 +13,22 @@ lacking its manifest or transport descriptor.
 from __future__ import annotations
 
 import argparse
+import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 from typing import Iterable
 
 import numpy as np
@@ -1237,6 +1241,8 @@ def _head(
         endpoint,
         "--output",
         "json",
+        "--checksum-mode",
+        "ENABLED",
     ]
     result = subprocess.run(
         cmd, env=env, text=True, capture_output=True, check=False
@@ -1258,7 +1264,47 @@ def _head_matches(head: dict | None, *, size: int, sha256: str) -> bool:
     metadata = {
         str(key).lower(): value for key, value in (head.get("Metadata") or {}).items()
     }
-    return metadata.get("sha256") == sha256
+    if metadata.get("sha256") != sha256:
+        return False
+    remote_checksum = head.get("ChecksumSHA256")
+    if remote_checksum is None:
+        return True
+    expected_checksum = base64.b64encode(bytes.fromhex(sha256)).decode("ascii")
+    if remote_checksum == expected_checksum:
+        return True
+    return bool(
+        head.get("ChecksumType") == "COMPOSITE"
+        and isinstance(remote_checksum, str)
+        and re.fullmatch(r"[A-Za-z0-9+/]+=*-[1-9][0-9]*", remote_checksum)
+    )
+
+
+@contextmanager
+def _stable_upload_snapshot(local: Path, *, size: int, sha256: str):
+    if not local.is_file() or local.stat().st_size != size or _sha256(local) != sha256:
+        raise RuntimeError(f"local upload source drifted before snapshot: {local}")
+    snapshot = local.with_name(
+        f".{local.name}.upload-{os.getpid()}-{threading.get_ident()}"
+    )
+    snapshot.unlink(missing_ok=True)
+    clone_command = (
+        ["cp", "-c", str(local), str(snapshot)]
+        if sys.platform == "darwin"
+        else ["cp", "--reflink=auto", "--", str(local), str(snapshot)]
+    )
+    cloned = subprocess.run(clone_command, capture_output=True, check=False)
+    if cloned.returncode != 0:
+        shutil.copyfile(local, snapshot)
+    try:
+        snapshot.chmod(0o400)
+        if snapshot.stat().st_size != size or _sha256(snapshot) != sha256:
+            raise RuntimeError(f"stable upload snapshot does not match {local}")
+        yield snapshot
+        if snapshot.stat().st_size != size or _sha256(snapshot) != sha256:
+            raise RuntimeError(f"stable upload snapshot changed during upload: {local}")
+    finally:
+        snapshot.chmod(0o600)
+        snapshot.unlink(missing_ok=True)
 
 
 def _upload_file(
@@ -1289,23 +1335,75 @@ def _upload_file(
             )
     if dry_run:
         return {"key": key, "size": size, "sha256": sha256, "status": "dry_run"}
-    subprocess.run(
-        [
-            "aws",
-            "s3",
-            "cp",
-            str(local),
-            f"s3://{bucket}/{key}",
-            "--endpoint-url",
-            endpoint,
-            "--metadata",
-            f"sha256={sha256}",
-            "--only-show-errors",
-            "--no-progress",
-        ],
-        env=env,
-        check=True,
-    )
+    expected_checksum = base64.b64encode(bytes.fromhex(sha256)).decode("ascii")
+    with _stable_upload_snapshot(local, size=size, sha256=sha256) as snapshot:
+        if size <= 5 * 1024**3:
+            command = [
+                "aws",
+                "s3api",
+                "put-object",
+                "--bucket",
+                bucket,
+                "--key",
+                key,
+                "--body",
+                str(snapshot),
+                "--endpoint-url",
+                endpoint,
+                "--metadata",
+                f"sha256={sha256}",
+                "--checksum-algorithm",
+                "SHA256",
+                "--checksum-sha256",
+                expected_checksum,
+                "--output",
+                "json",
+            ]
+            if head is None:
+                command.extend(["--if-none-match", "*"])
+            else:
+                etag = head.get("ETag")
+                if not allow_overwrite or not isinstance(etag, str) or not etag:
+                    raise RuntimeError(
+                        f"remote object cannot be conditionally replaced: s3://{bucket}/{key}"
+                    )
+                command.extend(["--if-match", etag])
+            result = subprocess.run(
+                command,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"conditional S3 upload failed for s3://{bucket}/{key}: "
+                    f"{result.stderr.strip()}"
+                )
+        else:
+            if head is not None:
+                raise RuntimeError(
+                    f"large S3 object replacement is forbidden: s3://{bucket}/{key}"
+                )
+            subprocess.run(
+                [
+                    "aws",
+                    "s3",
+                    "cp",
+                    str(snapshot),
+                    f"s3://{bucket}/{key}",
+                    "--endpoint-url",
+                    endpoint,
+                    "--metadata",
+                    f"sha256={sha256}",
+                    "--checksum-algorithm",
+                    "SHA256",
+                    "--only-show-errors",
+                    "--no-progress",
+                ],
+                env=env,
+                check=True,
+            )
     head = _head(endpoint=endpoint, bucket=bucket, key=key, env=env)
     if not _head_matches(head, size=size, sha256=sha256):
         raise RuntimeError(f"remote verification failed for s3://{bucket}/{key}")
@@ -1426,7 +1524,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             archive_validation=archive_validation,
         )
         transport_base = f"{args.prefix.strip('/')}/transports/{bundle_id}"
-        archive_key = f"{transport_base}/bundle.tar.zst"
+        archive_key = f"{transport_base}/bundle-{archive_sha256}.tar.zst"
         archive_record = _upload_file(
             local=archive,
             endpoint=args.endpoint_url,

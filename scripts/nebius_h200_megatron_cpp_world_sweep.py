@@ -33,6 +33,7 @@ from scripts.data.publish_megatron_bundle_to_nebius_s3 import (
     NONZERO_GRAPH_SIDECARS,
     REQUIRED_GRAPH_SIDECARS,
     REQUIRED_TOKEN_SIDECARS,
+    _validate_bundle,
     _validate_prefix_manifest_contract,
     _validate_tokenizer_directory,
 )
@@ -52,6 +53,7 @@ DEFAULT_SIDECAR_PREFIX = (
 )
 DEFAULT_TOKENIZER_DIR = ROOT / "data" / "tokenizer_v2"
 OVERLAY_PATHS = (
+    "cppmega/receipt_binding.py",
     "cppmega/recipes/run_profiles.py",
     "cppmega/megatron/custom_mamba_model.py",
     "cppmega/megatron/mamba_builder.py",
@@ -59,9 +61,12 @@ OVERLAY_PATHS = (
     "cppmega/megatron/dsa_indexer_fused_patch.py",
     "cppmega/megatron/graph_route_attention_bias_patch.py",
     "cppmega/megatron/h200_preflight.py",
+    "cppmega/megatron/checkpoint_restore_preflight.py",
+    "cppmega/megatron/objective_contract.py",
     "cppmega/megatron/structure_batch.py",
     "cppmega/megatron/structure_dataset_patch.py",
     "scripts/h200_megatron_preflight.py",
+    "scripts/data/publish_megatron_bundle_to_nebius_s3.py",
 )
 def default_ssh_key() -> Path:
     for name in ("id_ed25519", "id_rsa", "google_compute_engine"):
@@ -182,6 +187,52 @@ def make_multi_sidecar_tar(prefixes: list[Path], tokenizer_dir: Path, path: Path
 
 def make_sidecar_tar(prefix: Path, tokenizer_dir: Path, path: Path) -> None:
     make_multi_sidecar_tar([prefix], tokenizer_dir, path)
+
+
+def make_bundle_tar(
+    bundle_root: Path,
+    prefixes: list[Path],
+    path: Path,
+    *,
+    hash_jobs: int = 4,
+) -> tuple[list[str], str]:
+    bundle_root = bundle_root.resolve()
+    manifest, artifacts = _validate_bundle(bundle_root, hash_jobs)
+    declared_prefixes = {
+        (bundle_root / str(result["prefix"])).resolve(): str(result["prefix"])
+        for result in manifest["bucket_results"]
+    }
+    remote_prefixes: list[str] = []
+    for prefix in prefixes:
+        relative = declared_prefixes.get(prefix.resolve())
+        if relative is None:
+            raise ValueError(f"selected prefix is not declared by bundle: {prefix}")
+        remote_prefixes.append(relative)
+    tokenizer_relative = str(manifest["tokenizer"]["path"])
+
+    with tempfile.TemporaryDirectory(prefix="cppmega-bundle-stage-") as stage_raw:
+        stage_root = Path(stage_raw) / "cppmega_bundle"
+        stage_root.mkdir()
+        sources = [bundle_root / "manifest.json"] + [
+            bundle_root / str(record["path"]) for record in artifacts
+        ]
+        for source in sources:
+            target = stage_root / source.relative_to(bundle_root)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(source, target)
+        cmd = [
+            "tar",
+            "-czhf",
+            str(path),
+            "-C",
+            stage_raw,
+            "cppmega_bundle",
+        ]
+        printable = " ".join(shlex.quote(part) for part in cmd)
+        print(f"[nebius-sweep] $ GZIP=-1 COPYFILE_DISABLE=1 {printable}", flush=True)
+        env = {**os.environ, "GZIP": "-1", "COPYFILE_DISABLE": "1"}
+        subprocess.run(cmd, check=True, env=env)
+    return remote_prefixes, tokenizer_relative
 
 
 def make_checkpoint_tar(checkpoint_dir: Path, path: Path) -> None:
@@ -501,6 +552,9 @@ def remote_run_script(
     save_model_only: bool = True,
     load_checkpoint_remote: str | None = None,
     load_model_only: bool = True,
+    bundle_root: str = "/data/cppmega_bundle",
+    tokenizer_model: str = "/data/cppmega_bundle/tokenizer",
+    run_id: str = "nebius-h200-sweep",
 ) -> str:
     batches = " ".join(str(v) for v in batch_sizes)
     tests = seq_data_prefixes or [(1024, data_prefix_name)]
@@ -574,6 +628,8 @@ def remote_run_script(
         export CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS="${{CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS:-1}}"
         export CPPMEGA_GRAPH_MAX_EDGES="${{CPPMEGA_GRAPH_MAX_EDGES:-256}}"
         export CPPMEGA_GRAPH_MAX_CHUNKS="${{CPPMEGA_GRAPH_MAX_CHUNKS:-256}}"
+        export CPPMEGA_BUNDLE_ROOT={shlex.quote(bundle_root)}
+        export CPPMEGA_TOKENIZER_MODEL={shlex.quote(tokenizer_model)}
         mkdir -p "$TRITON_CACHE_DIR" /data/cppmega_h200_results
 
         python - <<'PY'
@@ -631,14 +687,16 @@ def remote_run_script(
 {test_lines}
         )
         IFS=: read -r PREFLIGHT_SEQ PREFLIGHT_PREFIX_NAME <<< "${{TEST_SPECS[0]}}"
-        DATA_PREFIX="/data/cppmega_sidecar/${{PREFLIGHT_PREFIX_NAME}}"
+        DATA_PREFIX="$CPPMEGA_BUNDLE_ROOT/${{PREFLIGHT_PREFIX_NAME}}"
         if [[ ! -s "${{DATA_PREFIX}}.bin" || ! -s "${{DATA_PREFIX}}.idx" || ! -s "${{DATA_PREFIX}}.json" ]]; then
           echo "CPPMEGA_H200_PREFLIGHT_STATUS=FAIL reason=missing_data_prefix prefix=${{DATA_PREFIX}}" | tee -a /data/cppmega_h200_results/summary.log
           exit 2
         fi
         python /opt/cppmega/scripts/h200_megatron_preflight.py \
+          --bundle-root "$CPPMEGA_BUNDLE_ROOT" \
           --data-prefix "$DATA_PREFIX" \
-          --tokenizer-model /data/cpp_tokenizer_hf \
+          --tokenizer-model "$CPPMEGA_TOKENIZER_MODEL" \
+          --run-id {shlex.quote(run_id)} \
           --sequence-length "$PREFLIGHT_SEQ" \
           --micro-batch-size 1 \
           --fp8-recipe {shlex.quote(fp8_recipe)} \
@@ -647,7 +705,7 @@ def remote_run_script(
 
         for SPEC in "${{TEST_SPECS[@]}}"; do
           IFS=: read -r SEQ DATA_PREFIX_NAME <<< "$SPEC"
-          DATA_PREFIX="/data/cppmega_sidecar/${{DATA_PREFIX_NAME}}"
+          DATA_PREFIX="$CPPMEGA_BUNDLE_ROOT/${{DATA_PREFIX_NAME}}"
           export DATA_PREFIX
           if [[ ! -s "${{DATA_PREFIX}}.bin" || ! -s "${{DATA_PREFIX}}.idx" || ! -s "${{DATA_PREFIX}}.json" ]]; then
             echo "CPPMEGA_TEST_RESULT seq=${{SEQ}} status=FAIL reason=missing_data_prefix prefix=${{DATA_PREFIX}}" | tee -a /data/cppmega_h200_results/summary.log
@@ -782,7 +840,7 @@ def remote_run_script(
             python -m torch.distributed.run --nproc_per_node=1 \\\"\\$WORKDIR/pretrain_mamba.py\\\" \\
               \\\"\\${{DATA_ARGS[@]}}\\\" \\
               --tokenizer-type HuggingFaceTokenizer \\
-              --tokenizer-model /data/cpp_tokenizer_hf \\
+              --tokenizer-model \\\"\\$CPPMEGA_TOKENIZER_MODEL\\\" \\
               --vocab-size 65536 \\
               --make-vocab-size-divisible-by 128 \\
               --tensor-model-parallel-size 1 \\
@@ -890,6 +948,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--ssh-key", type=Path, default=default_ssh_key())
     parser.add_argument("--ssh-pubkey", type=Path, default=None)
     parser.add_argument("--docker-image", default=DEFAULT_DOCKER_IMAGE)
+    parser.add_argument("--bundle-root", type=Path, required=True)
+    parser.add_argument("--hash-jobs", type=int, default=4)
     parser.add_argument("--ghcr-user", default=None)
     parser.add_argument("--ghcr-token-file", type=Path, default=None)
     parser.add_argument("--no-ghcr-auth", action="store_true")
@@ -902,7 +962,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             "1024=/path/train1024,2048=/path/train2048. Overrides --sidecar-prefix."
         ),
     )
-    parser.add_argument("--tokenizer-dir", type=Path, default=DEFAULT_TOKENIZER_DIR)
+    parser.add_argument("--tokenizer-dir", type=Path, default=None)
     parser.add_argument("--batch-sizes", default="256,512,1024")
     parser.add_argument("--train-iters", type=int, default=3)
     parser.add_argument(
@@ -984,6 +1044,24 @@ def main(argv: Iterable[str] | None = None) -> int:
             raise ValueError("--sidecar-prefixes did not contain any entries")
     else:
         seq_prefixes = [(1024, args.sidecar_prefix)]
+    bundle_root = args.bundle_root.resolve()
+    manifest, _bundle_artifacts = _validate_bundle(bundle_root, args.hash_jobs)
+    declared_prefixes = {
+        (bundle_root / str(result["prefix"])).resolve(): str(result["prefix"])
+        for result in manifest["bucket_results"]
+    }
+    remote_prefixes = []
+    for sequence_length, prefix in seq_prefixes:
+        relative = declared_prefixes.get(prefix.resolve())
+        if relative is None:
+            raise ValueError(f"selected prefix is not declared by bundle: {prefix}")
+        remote_prefixes.append((sequence_length, relative))
+    tokenizer_relative = str(manifest["tokenizer"]["path"])
+    bundle_tokenizer = (bundle_root / tokenizer_relative).resolve()
+    if args.tokenizer_dir is not None and args.tokenizer_dir.resolve() != bundle_tokenizer:
+        raise ValueError(
+            "--tokenizer-dir must be the descriptor-bound tokenizer inside --bundle-root"
+        )
     if args.load_checkpoint_local and args.load_checkpoint_remote:
         raise ValueError("--load-checkpoint-local and --load-checkpoint-remote are mutually exclusive")
     load_checkpoint_remote = args.load_checkpoint_remote
@@ -997,15 +1075,16 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.dry_run:
         print(f"parent_id={args.parent_id}")
         print(f"sidecar_prefixes={seq_prefixes}")
-        print(f"tokenizer_dir={args.tokenizer_dir}")
+        print(f"bundle_root={bundle_root}")
+        print(f"tokenizer_dir={bundle_tokenizer}")
         print(f"batches={batches}")
         print(
             remote_run_script(
                 batches,
                 args.train_iters,
                 args.docker_image,
-                data_prefix_name=seq_prefixes[0][1].name,
-                seq_data_prefixes=[(seq, prefix.name) for seq, prefix in seq_prefixes],
+                data_prefix_name=remote_prefixes[0][1],
+                seq_data_prefixes=remote_prefixes,
                 fp8_recipe=args.fp8_recipe,
                 disable_nvrtc=effective_disable_nvrtc,
                 save_checkpoint=args.save_checkpoint,
@@ -1013,6 +1092,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                 save_model_only=not args.save_full_state,
                 load_checkpoint_remote=load_checkpoint_remote,
                 load_model_only=not args.load_full_state,
+                tokenizer_model=f"/data/cppmega_bundle/{tokenizer_relative}",
+                run_id=args.instance_name,
             )[:4000]
         )
         return 0
@@ -1025,7 +1106,16 @@ def main(argv: Iterable[str] | None = None) -> int:
             ghcr_auth_tar = Path(tmp) / "cppmega_ghcr_auth.tgz"
             load_checkpoint_tar = Path(tmp) / "cppmega_load_checkpoint.tgz"
             make_overlay_tar(overlay_tar)
-            make_multi_sidecar_tar([prefix for _, prefix in seq_prefixes], args.tokenizer_dir, sidecar_tar)
+            archived_prefixes, archived_tokenizer = make_bundle_tar(
+                bundle_root,
+                [prefix for _, prefix in seq_prefixes],
+                sidecar_tar,
+                hash_jobs=args.hash_jobs,
+            )
+            if archived_prefixes != [prefix for _, prefix in remote_prefixes]:
+                raise RuntimeError("bundle archive prefix layout drifted after validation")
+            if archived_tokenizer != tokenizer_relative:
+                raise RuntimeError("bundle archive tokenizer layout drifted after validation")
             if args.load_checkpoint_local:
                 make_checkpoint_tar(args.load_checkpoint_local, load_checkpoint_tar)
             has_ghcr_auth = make_ghcr_auth_tar(args, ghcr_auth_tar)
@@ -1048,8 +1138,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                 batches,
                 args.train_iters,
                 args.docker_image,
-                data_prefix_name=seq_prefixes[0][1].name,
-                seq_data_prefixes=[(seq, prefix.name) for seq, prefix in seq_prefixes],
+                data_prefix_name=remote_prefixes[0][1],
+                seq_data_prefixes=remote_prefixes,
                 fp8_recipe=args.fp8_recipe,
                 disable_nvrtc=effective_disable_nvrtc,
                 save_checkpoint=args.save_checkpoint,
@@ -1057,6 +1147,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                 save_model_only=not args.save_full_state,
                 load_checkpoint_remote=load_checkpoint_remote,
                 load_model_only=not args.load_full_state,
+                tokenizer_model=f"/data/cppmega_bundle/{tokenizer_relative}",
+                run_id=args.instance_name,
             )
             ssh(args, ip, f"cat > /data/run_cppmega_h200_sweep.sh <<'EOF'\n{script}\nEOF\nchmod +x /data/run_cppmega_h200_sweep.sh")
             try:

@@ -9,6 +9,7 @@ import re
 from typing import Any
 
 RECEIPT_BINDING_SCHEMA = "cppmega_case6_receipt_binding_v1"
+NO_CHECKPOINT_SHA256 = hashlib.sha256(b"cppmega:no-checkpoint:v1").hexdigest()
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _FIELDS = (
@@ -126,6 +127,7 @@ def validate_receipt_binding(
 
 
 __all__ = [
+    "NO_CHECKPOINT_SHA256",
     "RECEIPT_BINDING_SCHEMA",
     "build_receipt_binding",
     "canonical_sha256",

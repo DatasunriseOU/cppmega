@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import base64
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import shutil
@@ -15,6 +17,7 @@ import scripts.data.publish_megatron_bundle_to_nebius_s3 as publisher
 from scripts.data.publish_megatron_bundle_to_nebius_s3 import (
     _head,
     _head_matches,
+    _stable_upload_snapshot,
     _upload_file,
     _validate_archive,
     _validate_archive_member_names,
@@ -773,6 +776,19 @@ def test_head_contract_accepts_nebius_metadata_key_casing():
     )
 
 
+def test_head_contract_accepts_server_verified_multipart_composite_checksum():
+    assert _head_matches(
+        {
+            "ContentLength": 8,
+            "Metadata": {"sha256": "a" * 64},
+            "ChecksumSHA256": "YWJjZA==-2",
+            "ChecksumType": "COMPOSITE",
+        },
+        size=8,
+        sha256="a" * 64,
+    )
+
+
 def test_head_distinguishes_missing_object_from_transport_failure(monkeypatch):
     monkeypatch.setattr(
         publisher.subprocess,
@@ -840,6 +856,114 @@ def test_immutable_bundle_object_rejects_existing_remote_mismatch(
             env={},
             dry_run=False,
         )
+
+
+def test_small_upload_is_checksum_bound_and_create_only(tmp_path, monkeypatch):
+    artifact, digest = _bundle(tmp_path)
+    expected_checksum = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
+    heads = iter(
+        [
+            None,
+            {
+                "ContentLength": artifact.stat().st_size,
+                "Metadata": {"sha256": digest},
+                "ChecksumSHA256": expected_checksum,
+                "ETag": '"etag"',
+            },
+        ]
+    )
+    monkeypatch.setattr(publisher, "_head", lambda **_kwargs: next(heads))
+
+    @contextmanager
+    def stable_snapshot(local, **_kwargs):
+        yield local
+
+    monkeypatch.setattr(publisher, "_stable_upload_snapshot", stable_snapshot)
+    commands = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(publisher.subprocess, "run", fake_run)
+
+    receipt = _upload_file(
+        local=artifact,
+        endpoint="https://example.invalid",
+        bucket="bucket",
+        key="bundles/test-bundle/data/sample.bin",
+        size=artifact.stat().st_size,
+        sha256=digest,
+        env={},
+        dry_run=False,
+    )
+
+    command = commands[0]
+    assert command[:3] == ["aws", "s3api", "put-object"]
+    assert command[command.index("--checksum-sha256") + 1] == expected_checksum
+    assert command[command.index("--if-none-match") + 1] == "*"
+    assert receipt["status"] == "uploaded_verified"
+
+
+def test_latest_pointer_update_uses_remote_etag_compare_and_swap(
+    tmp_path, monkeypatch
+):
+    artifact, digest = _bundle(tmp_path)
+    expected_checksum = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
+    heads = iter(
+        [
+            {
+                "ContentLength": artifact.stat().st_size,
+                "Metadata": {"sha256": "0" * 64},
+                "ETag": '"old-etag"',
+            },
+            {
+                "ContentLength": artifact.stat().st_size,
+                "Metadata": {"sha256": digest},
+                "ChecksumSHA256": expected_checksum,
+                "ETag": '"new-etag"',
+            },
+        ]
+    )
+    monkeypatch.setattr(publisher, "_head", lambda **_kwargs: next(heads))
+
+    @contextmanager
+    def stable_snapshot(local, **_kwargs):
+        yield local
+
+    monkeypatch.setattr(publisher, "_stable_upload_snapshot", stable_snapshot)
+    commands = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(publisher.subprocess, "run", fake_run)
+
+    _upload_file(
+        local=artifact,
+        endpoint="https://example.invalid",
+        bucket="bucket",
+        key="latest.json",
+        size=artifact.stat().st_size,
+        sha256=digest,
+        env={},
+        dry_run=False,
+        allow_overwrite=True,
+    )
+
+    command = commands[0]
+    assert command[command.index("--if-match") + 1] == '"old-etag"'
+
+
+def test_upload_snapshot_isolated_from_source_mutation(tmp_path):
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"stable")
+    digest = hashlib.sha256(b"stable").hexdigest()
+
+    with _stable_upload_snapshot(source, size=6, sha256=digest) as snapshot:
+        source.write_bytes(b"changed")
+        assert snapshot.read_bytes() == b"stable"
 
 
 def test_archive_member_set_must_be_exact_and_unique():
@@ -914,7 +1038,10 @@ def test_archive_transport_dry_run_writes_commit_order_receipt(tmp_path):
     bundle_id = json.loads(
         (tmp_path / "manifest.json").read_text(encoding="utf-8")
     )["bundle_id"]
-    assert receipt["archive"]["key"].endswith(f"/{bundle_id}/bundle.tar.zst")
+    assert receipt["archive"]["key"].startswith(
+        f"cppmega-megatron/macro-routes/transports/{bundle_id}/bundle-"
+    )
+    assert receipt["archive"]["key"].endswith(".tar.zst")
     assert receipt["logical_manifest"]["key"].endswith(
         f"/{bundle_id}/logical_manifest.json"
     )

@@ -14,10 +14,13 @@ import pytest
 import scripts.data.restore_megatron_bundle_from_nebius_s3 as restore
 from scripts.data.restore_megatron_bundle_from_nebius_s3 import (
     _acquire_archive,
+    _acquire_restore_lock,
     _extract_tar_zst,
+    _prefix_manifest_sha256s,
     _require_free_space,
     _validate_tar_zst_members,
     _validate_transport,
+    build_arg_parser,
 )
 
 
@@ -279,6 +282,43 @@ def test_restore_script_supports_direct_cli_execution():
 
     assert result.returncode == 0, result.stderr
     assert "Restore and verify" in result.stdout
+
+
+def test_restore_cli_requires_explicit_run_identity() -> None:
+    required = {
+        action.dest
+        for action in build_arg_parser()._actions
+        if getattr(action, "required", False)
+    }
+
+    assert {"output_root", "run_id"} <= required
+
+
+def test_restore_binding_derives_all_prefix_manifest_hashes() -> None:
+    manifest = {
+        "artifacts": [
+            {"path": "data/seq_1024/train.json", "sha256": "a" * 64},
+            {"path": "data/seq_2048/train.json", "sha256": "b" * 64},
+        ],
+        "bucket_results": [
+            {"prefix": "data/seq_2048/train"},
+            {"prefix": "data/seq_1024/train"},
+        ],
+    }
+
+    assert _prefix_manifest_sha256s(manifest) == {
+        "data/seq_1024/train.json": "a" * 64,
+        "data/seq_2048/train.json": "b" * 64,
+    }
+
+
+def test_restore_lock_rejects_same_bundle_and_run_concurrency(tmp_path: Path) -> None:
+    first = _acquire_restore_lock(tmp_path, bundle_id="bundle-1", run_id="run-1")
+    try:
+        with pytest.raises(RuntimeError, match="restore already active"):
+            _acquire_restore_lock(tmp_path, bundle_id="bundle-1", run_id="run-1")
+    finally:
+        first.close()
 
 
 def test_restore_requires_space_for_archive_expansion(tmp_path, monkeypatch):

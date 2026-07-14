@@ -12,6 +12,8 @@ import pytest
 from cppmega.megatron.objective_contract import (
     OBJECTIVE_CONTRACT_SCHEMA,
     OBJECTIVE_IDS,
+    validate_materialized_objective_contract,
+    validate_objective_contract,
 )
 
 
@@ -112,6 +114,72 @@ def _objective_contract() -> dict[str, object]:
             "source_document_id_column": "token_source_doc_ids",
         },
     }
+
+
+def test_objective_contract_accepts_deterministic_zero_hamilton_quota() -> None:
+    contract = _objective_contract()
+    contract["quota_window_samples"] = 3
+    contract["totals"] = {"samples": 3, "input_tokens": 9, "loss_tokens": 8}
+    contract["planned_samples"] = {
+        "causal_lm": 1,
+        "fim": 1,
+        "ast_fim": 1,
+        "ifim": 0,
+        "commit_diff": 0,
+        "pre_to_post": 0,
+    }
+    contract["realized"] = {
+        task: {
+            "samples": samples,
+            "input_tokens": samples * 3,
+            "loss_tokens": samples * 3 - (1 if task == "fim" else 0),
+        }
+        for task, samples in contract["planned_samples"].items()
+    }
+
+    assert validate_objective_contract(contract).planned_samples["ifim"] == 0
+
+
+def test_materialized_objective_contract_rejects_id_histogram_drift(tmp_path: Path) -> None:
+    contract = validate_objective_contract(_objective_contract())
+    sidecar = tmp_path / "objective_ids.bin"
+    np.asarray([1, 1, 3, 4, 5, 6], dtype=np.uint8).tofile(sidecar)
+    wrapper = {
+        "schema": OBJECTIVE_CONTRACT_SCHEMA,
+        "sha256": contract.sha256,
+        "payload": contract.payload,
+        "objective_id_sidecar": {
+            "path": sidecar.name,
+            "dtype": "uint8",
+            "document_aligned": True,
+        },
+    }
+
+    with pytest.raises(ValueError, match="histogram differs"):
+        validate_materialized_objective_contract(
+            wrapper, base_dir=str(tmp_path), document_count=6
+        )
+
+
+def test_materialized_objective_contract_rejects_unknown_id(tmp_path: Path) -> None:
+    contract = validate_objective_contract(_objective_contract())
+    sidecar = tmp_path / "objective_ids.bin"
+    np.asarray([1, 2, 3, 4, 5, 255], dtype=np.uint8).tofile(sidecar)
+    wrapper = {
+        "schema": OBJECTIVE_CONTRACT_SCHEMA,
+        "sha256": contract.sha256,
+        "payload": contract.payload,
+        "objective_id_sidecar": {
+            "path": sidecar.name,
+            "dtype": "uint8",
+            "document_aligned": True,
+        },
+    }
+
+    with pytest.raises(ValueError, match="unknown objective IDs"):
+        validate_materialized_objective_contract(
+            wrapper, base_dir=str(tmp_path), document_count=6
+        )
 
 
 def test_objective_conversion_requires_source_document_provenance() -> None:
