@@ -39,6 +39,67 @@ def _load_converter_module():
     return module
 
 
+def _install_fake_megatron_builder(
+    monkeypatch: pytest.MonkeyPatch,
+    constructions: list[tuple[Path, np.dtype]],
+) -> None:
+    class FakeIndexedDatasetBuilder:
+        def __init__(self, bin_path: str, dtype: type[np.generic]) -> None:
+            self._bin_path = Path(bin_path)
+            self._dtype = np.dtype(dtype)
+            constructions.append((self._bin_path, self._dtype))
+            self._writer = self._bin_path.open("wb")
+
+        def add_document(self, values: np.ndarray, sizes: list[int]) -> None:
+            assert sizes == [len(values)]
+            np.asarray(values, dtype=self._dtype).tofile(self._writer)
+
+        def finalize(self, index_path: str) -> None:
+            self._writer.close()
+            dtype_codes = {
+                np.dtype(np.uint8): 1,
+                np.dtype(np.int32): 4,
+                np.dtype(np.int64): 5,
+                np.dtype(np.uint16): 8,
+            }
+            Path(index_path).write_bytes(
+                b"MMIDIDX\x00\x00"
+                + (1).to_bytes(8, "little")
+                + bytes([dtype_codes[self._dtype]])
+            )
+
+    megatron = types.ModuleType("megatron")
+    core = types.ModuleType("megatron.core")
+    datasets = types.ModuleType("megatron.core.datasets")
+    indexed_dataset = types.ModuleType("megatron.core.datasets.indexed_dataset")
+    indexed_dataset.IndexedDatasetBuilder = FakeIndexedDatasetBuilder  # type: ignore[attr-defined]
+    megatron.core = core  # type: ignore[attr-defined]
+    core.datasets = datasets  # type: ignore[attr-defined]
+    datasets.indexed_dataset = indexed_dataset  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "megatron", megatron)
+    monkeypatch.setitem(sys.modules, "megatron.core", core)
+    monkeypatch.setitem(sys.modules, "megatron.core.datasets", datasets)
+    monkeypatch.setitem(
+        sys.modules, "megatron.core.datasets.indexed_dataset", indexed_dataset
+    )
+
+
+def _minimal_conversion_args(
+    input_dir: Path, output_prefix: Path, writer_backend: str
+) -> dict[str, object]:
+    return {
+        "input_dir": str(input_dir),
+        "output_prefix": str(output_prefix),
+        "split": "all",
+        "token_column": "input_ids",
+        "side_channels": [],
+        "side_channel_dtypes": [],
+        "graph_sidecars": None,
+        "source_platform_sidecar": False,
+        "writer_backend": writer_backend,
+    }
+
+
 def _stamp_v3_identity_table(pa, table, converter):
     for column in ("token_symbol_ids", "token_call_targets", "token_type_refs"):
         index = table.schema.get_field_index(column)
@@ -449,6 +510,77 @@ def test_legacy_uint32_cli_dtype_is_explicit_int32_alias(
     assert dtype is np.int32
     assert converter._megatron_dtype_code(dtype) == 4
     assert "no uint32 dtype code" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("writer_backend", ["mmididx", "megatron"])
+def test_uint32_conversion_records_canonical_int32_physical_dtype(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    writer_backend: str,
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    converter = _load_converter_module()
+    constructions: list[tuple[Path, np.dtype]] = []
+    if writer_backend == "megatron":
+        _install_fake_megatron_builder(monkeypatch, constructions)
+    input_dir = tmp_path / "parquet"
+    input_dir.mkdir()
+    pq.write_table(
+        pa.table({"input_ids": [[70_000, 80_000]]}), input_dir / "tokens.parquet"
+    )
+    output_prefix = tmp_path / f"{writer_backend}_train"
+
+    converter.convert_parquet_to_megatron(
+        **_minimal_conversion_args(input_dir, output_prefix, writer_backend),
+        dtype_str="uint32",
+        vocab_size=100_000,
+    )
+
+    np.testing.assert_array_equal(
+        np.fromfile(output_prefix.with_suffix(".bin"), dtype=np.int32),
+        np.array([70_000, 80_000], dtype=np.int32),
+    )
+    manifest = json.loads(output_prefix.with_suffix(".json").read_text())
+    assert manifest["dtype"] == "int32"
+    assert output_prefix.with_suffix(".idx").read_bytes()[17] == 4
+    if writer_backend == "megatron":
+        assert len(constructions) == 1
+        assert constructions[0][1] == np.dtype(np.int32)
+        assert constructions[0][0].parent.name.startswith(
+            f".{output_prefix.name}.stage-"
+        )
+
+
+@pytest.mark.parametrize("writer_backend", ["mmididx", "megatron"])
+def test_uint64_rejects_before_backend_or_output_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    writer_backend: str,
+) -> None:
+    converter = _load_converter_module()
+    backend_called = False
+
+    def _forbid_backend(*args: object, **kwargs: object) -> None:
+        nonlocal backend_called
+        backend_called = True
+        raise AssertionError("backend must not run for an unencodable MMIDIDX dtype")
+
+    monkeypatch.setattr(
+        converter, "_convert_parquet_to_megatron_unpublished", _forbid_backend
+    )
+    output_prefix = tmp_path / f"{writer_backend}_train"
+
+    with pytest.raises(ValueError, match="unsupported Megatron MMIDIDX dtype uint64"):
+        converter.convert_parquet_to_megatron(
+            input_dir=str(tmp_path / "missing"),
+            output_prefix=str(output_prefix),
+            dtype_str="uint64",
+            writer_backend=writer_backend,
+        )
+
+    assert not backend_called
+    assert not list(tmp_path.iterdir())
 
 
 def test_side_channel_length_mismatch_fails_closed() -> None:
@@ -1271,61 +1403,253 @@ def test_explicit_mmididx_writer_trims_padding_and_all_sidecars(tmp_path: Path) 
     )
 
 
-def test_mmididx_failed_publish_preserves_complete_previous_generation(
+@pytest.mark.parametrize("writer_backend", ["mmididx", "megatron"])
+def test_failed_pointer_publication_preserves_complete_previous_generation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    writer_backend: str,
 ) -> None:
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     converter = _load_converter_module()
+    constructions: list[tuple[Path, np.dtype]] = []
+    if writer_backend == "megatron":
+        _install_fake_megatron_builder(monkeypatch, constructions)
     input_dir = tmp_path / "parquet"
     input_dir.mkdir()
     pq.write_table(
-        _case5_table(pa, converter, _minimal_case5_rows(converter)),
-        input_dir / "repo.parquet",
+        pa.table({"input_ids": [[10, 11]]}), input_dir / "repo.parquet"
     )
-    output_prefix = tmp_path / "stable_train"
-    conversion_args = {
-        "input_dir": str(input_dir),
-        "output_prefix": str(output_prefix),
-        "split": "all",
-        "token_column": "auto",
-        "length_column": "auto",
-        "writer_backend": "mmididx",
-    }
+    output_prefix = tmp_path / f"stable_{writer_backend}_train"
+    conversion_args = _minimal_conversion_args(
+        input_dir, output_prefix, writer_backend
+    )
     converter.convert_parquet_to_megatron(**conversion_args)
     old_files = converter._generation_members(tmp_path, output_prefix.name)
     old_generation = {path.name: path.read_bytes() for path in old_files}
-    assert {"stable_train.bin", "stable_train.idx", "stable_train.json"} <= set(
-        old_generation
-    )
-    assert "stable_train_source_identity_registry.sqlite" in old_generation
+    old_pointer = converter._current_generation_link(output_prefix)
+    old_target = old_pointer.readlink()
+    old_snapshot = old_pointer.resolve()
+    old_snapshot_bytes = {
+        path.name: path.read_bytes()
+        for path in converter._generation_members(old_snapshot, output_prefix.name)
+    }
+    assert old_snapshot_bytes == old_generation
 
-    real_replace = converter.os.replace
+    pq.write_table(
+        pa.table({"input_ids": [[20, 21]]}), input_dir / "repo.parquet"
+    )
+
+    real_replace_symlink = converter._replace_symlink
     failed = False
 
-    def _crash_during_publish(source: object, destination: object) -> None:
+    def _crash_during_publish(path: Path, target: str) -> None:
         nonlocal failed
-        source_path = Path(source)  # type: ignore[arg-type]
-        if (
-            not failed
-            and source_path.parent.name.startswith(".stable_train.stage-")
-            and source_path.name == "stable_train.idx"
-        ):
+        if Path(path) == old_pointer and target != str(old_target):
             failed = True
+            assert {
+                member.name: member.read_bytes()
+                for member in converter._generation_members(
+                    tmp_path, output_prefix.name
+                )
+            } == old_generation
             raise OSError("simulated publish crash")
-        real_replace(source, destination)
+        real_replace_symlink(path, target)
 
-    monkeypatch.setattr(converter.os, "replace", _crash_during_publish)
+    monkeypatch.setattr(converter, "_replace_symlink", _crash_during_publish)
 
     with pytest.raises(OSError, match="simulated publish crash"):
         converter.convert_parquet_to_megatron(**conversion_args)
 
     assert failed
+    assert old_pointer.readlink() == old_target
+    assert old_pointer.resolve() == old_snapshot
     current_files = converter._generation_members(tmp_path, output_prefix.name)
     assert {path.name: path.read_bytes() for path in current_files} == old_generation
-    assert not list(tmp_path.glob(".stable_train.stage-*"))
-    assert not list(tmp_path.glob(".stable_train.rollback-*"))
+    assert old_snapshot_bytes == {
+        path.name: path.read_bytes()
+        for path in converter._generation_members(old_snapshot, output_prefix.name)
+    }
+    generations = [
+        path
+        for path in converter._generation_snapshot_root(output_prefix).iterdir()
+        if path.is_dir()
+    ]
+    assert generations == [old_snapshot]
+    assert not list(tmp_path.glob(f".{output_prefix.name}.stage-*"))
+
+
+@pytest.mark.parametrize("writer_backend", ["mmididx", "megatron"])
+def test_pointer_switch_publishes_one_complete_immutable_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    writer_backend: str,
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    converter = _load_converter_module()
+    if writer_backend == "megatron":
+        _install_fake_megatron_builder(monkeypatch, [])
+    input_dir = tmp_path / "parquet"
+    input_dir.mkdir()
+    shard = input_dir / "repo.parquet"
+    pq.write_table(pa.table({"input_ids": [[10, 11]]}), shard)
+    output_prefix = tmp_path / f"atomic_{writer_backend}_train"
+    conversion_args = _minimal_conversion_args(
+        input_dir, output_prefix, writer_backend
+    )
+    converter.convert_parquet_to_megatron(**conversion_args)
+    current = converter._current_generation_link(output_prefix)
+    old_target = current.readlink()
+    old_snapshot = current.resolve()
+    old_generation = {
+        path.name: path.read_bytes()
+        for path in converter._generation_members(old_snapshot, output_prefix.name)
+    }
+    pq.write_table(pa.table({"input_ids": [[20, 21]]}), shard)
+
+    real_replace_symlink = converter._replace_symlink
+    observations: list[str] = []
+
+    def _observe_pointer_switch(path: Path, target: str) -> None:
+        if Path(path) != current or target == str(old_target):
+            real_replace_symlink(path, target)
+            return
+        assert current.readlink() == old_target
+        assert {
+            member.name: member.read_bytes()
+            for member in converter._generation_members(
+                tmp_path, output_prefix.name
+            )
+        } == old_generation
+        observations.append("old")
+        real_replace_symlink(path, target)
+        new_snapshot = current.resolve()
+        assert new_snapshot != old_snapshot
+        assert {
+            member.name: member.read_bytes()
+            for member in converter._generation_members(
+                tmp_path, output_prefix.name
+            )
+        } == {
+            member.name: member.read_bytes()
+            for member in converter._generation_members(
+                new_snapshot, output_prefix.name
+            )
+        }
+        observations.append("new")
+
+    monkeypatch.setattr(converter, "_replace_symlink", _observe_pointer_switch)
+    converter.convert_parquet_to_megatron(**conversion_args)
+
+    assert observations == ["old", "new"]
+    assert old_generation == {
+        path.name: path.read_bytes()
+        for path in converter._generation_members(old_snapshot, output_prefix.name)
+    }
+    expected_pointer = converter._current_generation_link(output_prefix).name
+    assert all(
+        path.is_symlink()
+        and path.readlink() == Path(f"{expected_pointer}/{path.name}")
+        for path in converter._generation_entries(tmp_path, output_prefix.name)
+    )
+
+
+@pytest.mark.parametrize("writer_backend", ["mmididx", "megatron"])
+def test_conversion_failure_does_not_touch_existing_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    writer_backend: str,
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    converter = _load_converter_module()
+    if writer_backend == "megatron":
+        _install_fake_megatron_builder(monkeypatch, [])
+    input_dir = tmp_path / "parquet"
+    input_dir.mkdir()
+    shard = input_dir / "repo.parquet"
+    pq.write_table(pa.table({"input_ids": [[10, 11]]}), shard)
+    output_prefix = tmp_path / f"stable_{writer_backend}_train"
+    conversion_args = _minimal_conversion_args(
+        input_dir, output_prefix, writer_backend
+    )
+    converter.convert_parquet_to_megatron(**conversion_args, vocab_size=100)
+    current = converter._current_generation_link(output_prefix)
+    old_target = current.readlink()
+    old_generation = {
+        path.name: path.read_bytes()
+        for path in converter._generation_members(tmp_path, output_prefix.name)
+    }
+
+    pq.write_table(pa.table({"input_ids": [[1_000, 1_001]]}), shard)
+    with pytest.raises(ValueError, match="outside vocab"):
+        converter.convert_parquet_to_megatron(**conversion_args, vocab_size=100)
+
+    assert current.readlink() == old_target
+    assert {
+        path.name: path.read_bytes()
+        for path in converter._generation_members(tmp_path, output_prefix.name)
+    } == old_generation
+    assert not list(tmp_path.glob(f".{output_prefix.name}.stage-*"))
+
+
+def test_legacy_generation_is_preserved_when_pointer_commit_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    converter = _load_converter_module()
+    output_prefix = tmp_path / "legacy_train"
+    legacy = {
+        "legacy_train.bin": b"old-bin",
+        "legacy_train.idx": b"old-index",
+        "legacy_train.json": b'{"generation":"old"}',
+        "legacy_train_loss_mask.bin": b"old-sidecar",
+    }
+    for name, content in legacy.items():
+        (tmp_path / name).write_bytes(content)
+    stage = tmp_path / ".legacy_train.stage-test"
+    stage.mkdir()
+    staged = {
+        "legacy_train.bin": b"new-bin",
+        "legacy_train.idx": b"new-index",
+        "legacy_train.json": b'{"generation":"new"}',
+    }
+    for name, content in staged.items():
+        (stage / name).write_bytes(content)
+
+    current = converter._current_generation_link(output_prefix)
+    real_replace_symlink = converter._replace_symlink
+    pointer_writes = 0
+
+    def _fail_new_pointer(path: Path, target: str) -> None:
+        nonlocal pointer_writes
+        if Path(path) == current:
+            pointer_writes += 1
+            if pointer_writes == 2:
+                raise OSError("simulated pointer commit failure")
+        real_replace_symlink(path, target)
+
+    monkeypatch.setattr(converter, "_replace_symlink", _fail_new_pointer)
+
+    with pytest.raises(OSError, match="simulated pointer commit failure"):
+        converter._publish_staged_generation(
+            str(stage / output_prefix.name), str(output_prefix)
+        )
+
+    assert pointer_writes == 2
+    assert current.is_symlink()
+    assert {
+        path.name: path.read_bytes()
+        for path in converter._generation_members(tmp_path, output_prefix.name)
+    } == legacy
+    assert all((tmp_path / name).is_symlink() for name in legacy)
+    generations = [
+        path
+        for path in converter._generation_snapshot_root(output_prefix).iterdir()
+        if path.is_dir()
+    ]
+    assert generations == [current.resolve()]
 
 
 def test_mmididx_writer_binds_pre_materialized_objective_contract(

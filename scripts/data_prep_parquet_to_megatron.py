@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import argparse
 from array import array
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import math
@@ -312,6 +314,12 @@ def _resolve_output_dtype(dtype_str: str) -> type[np.generic]:
     return dtype
 
 
+def _physical_output_dtype_name(dtype: type[np.generic] | np.dtype) -> str:
+    """Return the canonical dtype name encoded in MMIDIDX and token bytes."""
+
+    return np.dtype(dtype).name
+
+
 def _resolve_sidecar_dtype(dtype_str: str) -> np.dtype:
     try:
         return np.dtype(_SIDECAR_DTYPE_MAP[dtype_str])
@@ -450,6 +458,16 @@ def _megatron_dtype_code(dtype: type[np.generic] | np.dtype) -> int:
             f"supported dtypes: {supported}"
         )
     return _MEGATRON_DTYPE_CODE_MAP[dtype_type]
+
+
+def _validate_output_dtype_contract(dtype_str: str) -> None:
+    """Reject dtypes that cannot be represented by the MMIDIDX header."""
+
+    try:
+        dtype = _OUTPUT_DTYPE_MAP[dtype_str]
+    except KeyError as exc:
+        raise ValueError(f"unsupported dtype: {dtype_str}") from exc
+    _megatron_dtype_code(dtype)
 
 
 def find_parquet_shards(input_dir: str, split: str) -> list[str]:
@@ -2240,7 +2258,7 @@ def _write_parquet_to_numpy_generation(
     sidecar_data = {
         "vocab_size": vocab_size,
         "tokenizer_contract": "megacpp",
-        "dtype": dtype_str,
+        "dtype": _physical_output_dtype_name(dtype),
         "token_count": total_tokens,
         "source_capacity_token_count": source_capacity_tokens,
         "trained_token_count": trained_tokens
@@ -2287,78 +2305,250 @@ def _write_parquet_to_numpy_generation(
     return
 
 
-def _generation_members(directory: Path, prefix_name: str) -> list[Path]:
+def _is_generation_member_name(name: str, prefix_name: str) -> bool:
     core_names = {f"{prefix_name}.bin", f"{prefix_name}.idx", f"{prefix_name}.json"}
     sidecar_prefix = f"{prefix_name}_"
     sidecar_suffixes = {".bin", ".sqlite", ".sqlite3"}
+    path = Path(name)
+    return name in core_names or (
+        name.startswith(sidecar_prefix) and path.suffix in sidecar_suffixes
+    )
+
+
+def _generation_members(directory: Path, prefix_name: str) -> list[Path]:
     return sorted(
         (
             path
             for path in directory.iterdir()
-            if path.is_file()
-            and (
-                path.name in core_names
-                or (
-                    path.name.startswith(sidecar_prefix)
-                    and path.suffix in sidecar_suffixes
-                )
-            )
+            if path.is_file() and _is_generation_member_name(path.name, prefix_name)
         ),
         key=lambda path: path.name,
     )
 
 
+def _generation_entries(directory: Path, prefix_name: str) -> list[Path]:
+    """Return public generation entries, including temporarily dangling aliases."""
+
+    return sorted(
+        (
+            path
+            for path in directory.iterdir()
+            if (path.is_file() or path.is_symlink())
+            and _is_generation_member_name(path.name, prefix_name)
+        ),
+        key=lambda path: path.name,
+    )
+
+
+def _required_generation_names(prefix_name: str) -> set[str]:
+    return {f"{prefix_name}.bin", f"{prefix_name}.idx", f"{prefix_name}.json"}
+
+
+def _generation_snapshot_root(output: Path) -> Path:
+    return output.parent / "snapshot" / "megatron_generations" / output.name
+
+
+def _current_generation_link(output: Path) -> Path:
+    return output.parent / f".{output.name}.current"
+
+
+def _relative_link_target(path: Path, *, relative_to: Path) -> str:
+    return os.path.relpath(path, start=relative_to)
+
+
+def _replace_symlink(path: Path, target: str) -> None:
+    """Atomically replace one symlink without mutating its current target."""
+
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.link-", dir=path.parent
+    )
+    os.close(fd)
+    temporary = Path(temporary_name)
+    temporary.unlink()
+    try:
+        os.symlink(target, temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def _generation_publication_lock(output: Path) -> Iterator[None]:
+    root = _generation_snapshot_root(output)
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / ".publish.lock"
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _validate_complete_generation(
+    members: list[Path], prefix_name: str, *, source: str
+) -> set[str]:
+    names = {path.name for path in members}
+    missing = sorted(_required_generation_names(prefix_name) - names)
+    if missing:
+        raise RuntimeError(f"{source} generation is incomplete; missing={missing}")
+    return names
+
+
+def _current_generation_directory(output: Path) -> Path | None:
+    current = _current_generation_link(output)
+    if not os.path.lexists(current):
+        return None
+    if not current.is_symlink():
+        raise RuntimeError(f"generation pointer is not a symlink: {current}")
+    target = Path(os.readlink(current))
+    if not target.is_absolute():
+        target = current.parent / target
+    try:
+        resolved = target.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"generation pointer is dangling: {current}") from exc
+    root = _generation_snapshot_root(output).resolve()
+    if root != resolved.parent and root not in resolved.parents:
+        raise RuntimeError(
+            f"generation pointer escapes the immutable snapshot root: {current}"
+        )
+    if not resolved.is_dir():
+        raise RuntimeError(f"generation pointer target is not a directory: {resolved}")
+    return resolved
+
+
+def _snapshot_legacy_generation(output: Path) -> tuple[Path, set[str]] | None:
+    legacy_members = _generation_members(output.parent, output.name)
+    if not legacy_members:
+        return None
+    legacy_names = _validate_complete_generation(
+        legacy_members, output.name, source="existing"
+    )
+    root = _generation_snapshot_root(output)
+    staging = Path(tempfile.mkdtemp(prefix=".legacy-", dir=root))
+    generation = root / f"generation-legacy-{staging.name.removeprefix('.legacy-')}"
+    try:
+        for source in legacy_members:
+            destination = staging / source.name
+            resolved_source = source.resolve(strict=True)
+            try:
+                os.link(resolved_source, destination)
+            except OSError:
+                shutil.copy2(resolved_source, destination)
+        os.replace(staging, generation)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return generation, legacy_names
+
+
+def _ensure_generation_aliases(output: Path, names: set[str]) -> None:
+    current = _current_generation_link(output)
+    for name in sorted(names):
+        alias = output.parent / name
+        expected_target = f"{current.name}/{name}"
+        if alias.is_symlink() and os.readlink(alias) == expected_target:
+            continue
+        _replace_symlink(alias, expected_target)
+
+
+def _remove_generation_aliases(output: Path, names: set[str]) -> None:
+    current = _current_generation_link(output)
+    for name in sorted(names):
+        alias = output.parent / name
+        if not alias.is_symlink():
+            continue
+        if os.readlink(alias) == f"{current.name}/{name}":
+            try:
+                alias.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def _publish_staged_generation(staged_prefix: str, output_prefix: str) -> None:
+    """Publish a complete immutable generation with one atomic pointer switch."""
+
     staged = Path(staged_prefix)
     output = Path(output_prefix)
     output.parent.mkdir(parents=True, exist_ok=True)
     staged_files = _generation_members(staged.parent, staged.name)
-    staged_names = {path.name for path in staged_files}
-    required = {f"{output.name}.bin", f"{output.name}.idx", f"{output.name}.json"}
     if staged.name != output.name:
         raise ValueError(
             "staged and published generation prefixes must share a basename"
         )
-    missing = sorted(required - staged_names)
-    if missing:
-        raise RuntimeError(
-            f"staged mmididx generation is incomplete; missing={missing}"
-        )
-
-    old_files = _generation_members(output.parent, output.name)
-    old_names = {path.name for path in old_files}
-    backup_dir = Path(
-        tempfile.mkdtemp(prefix=f".{output.name}.rollback-", dir=output.parent)
+    if (
+        staged.parent.is_symlink()
+        or not staged.parent.is_dir()
+        or staged.parent.parent.resolve() != output.parent.resolve()
+    ):
+        raise ValueError("staged generation must be in a private sibling directory")
+    staged_names = _validate_complete_generation(
+        staged_files, output.name, source="staged"
     )
-    backups = {path.name: backup_dir / path.name for path in old_files}
-    try:
-        for old_path in old_files:
-            os.replace(old_path, backups[old_path.name])
-        for staged_path in staged_files:
-            os.replace(staged_path, output.parent / staged_path.name)
-    except BaseException as publish_error:
-        rollback_errors: list[Exception] = []
-        for name in staged_names - old_names:
+
+    with _generation_publication_lock(output):
+        root = _generation_snapshot_root(output)
+        generation = root / (
+            f"generation-{time.time_ns()}-{staged.parent.name.rsplit('-', 1)[-1]}"
+        )
+        if generation.exists():  # pragma: no cover - random tempfile collision
+            raise FileExistsError(generation)
+        os.replace(staged.parent, generation)
+
+        old_names: set[str] = set()
+        created_aliases: set[str] = set()
+        committed = False
+        try:
+            current_generation = _current_generation_directory(output)
+            if current_generation is None:
+                legacy = _snapshot_legacy_generation(output)
+                if legacy is not None:
+                    legacy_generation, old_names = legacy
+                    try:
+                        _replace_symlink(
+                            _current_generation_link(output),
+                            _relative_link_target(
+                                legacy_generation, relative_to=output.parent
+                            ),
+                        )
+                    except BaseException:
+                        shutil.rmtree(legacy_generation, ignore_errors=True)
+                        raise
+                    _ensure_generation_aliases(output, old_names)
+            else:
+                old_names = _validate_complete_generation(
+                    _generation_members(current_generation, output.name),
+                    output.name,
+                    source="current",
+                )
+                _ensure_generation_aliases(output, old_names)
+
+            public_names = {
+                path.name for path in _generation_entries(output.parent, output.name)
+            }
+            created_aliases = staged_names - public_names
+            _ensure_generation_aliases(output, old_names | staged_names)
+            _replace_symlink(
+                _current_generation_link(output),
+                _relative_link_target(generation, relative_to=output.parent),
+            )
+            committed = True
+        except BaseException:
             try:
-                (output.parent / name).unlink(missing_ok=True)
-            except Exception as exc:  # pragma: no cover - catastrophic filesystem error
-                rollback_errors.append(exc)
-        for name in sorted(old_names):
-            backup_path = backups[name]
-            if not backup_path.exists():
-                continue
-            try:
-                os.replace(backup_path, output.parent / name)
-            except Exception as exc:  # pragma: no cover - catastrophic filesystem error
-                rollback_errors.append(exc)
-        if rollback_errors:
-            raise RuntimeError(
-                f"failed to roll back mmididx generation; preserved backup={backup_dir}"
-            ) from publish_error
-        shutil.rmtree(backup_dir)
-        raise
-    else:
-        shutil.rmtree(backup_dir)
+                committed = _current_generation_directory(output) == generation.resolve()
+            except Exception:
+                # If pointer state cannot be proven, preserving the immutable
+                # generation is safer than deleting a possibly active target.
+                committed = True
+            if not committed:
+                _remove_generation_aliases(output, created_aliases - old_names)
+                shutil.rmtree(generation, ignore_errors=True)
+            raise
+
+        # Removed members now resolve to nowhere through the new pointer. Their
+        # aliases are cleanup-only and cannot expose bytes from another generation.
+        _remove_generation_aliases(output, old_names - staged_names)
 
 
 def _convert_parquet_to_numpy(
@@ -2408,7 +2598,7 @@ def _convert_parquet_to_numpy(
         _publish_staged_generation(staged_prefix, output_prefix)
 
 
-def convert_parquet_to_megatron(
+def _convert_parquet_to_megatron_unpublished(
     input_dir: str | None,
     output_prefix: str,
     split: str = "train",
@@ -2424,6 +2614,7 @@ def convert_parquet_to_megatron(
     objective_artifact_path: str | None = None,
     vocab_size: int = 65536,
     writer_backend: str = "megatron",
+    _reported_output_prefix: str | None = None,
 ) -> None:
     """Convert packed parquet to Megatron MMapIndexedDataset format.
 
@@ -2431,6 +2622,8 @@ def convert_parquet_to_megatron(
     MMIDIDX layout.  It is never selected as an automatic fallback when the
     Megatron import is broken.
     """
+    _validate_output_dtype_contract(dtype_str)
+
     import pyarrow.parquet as pq  # type: ignore[import-not-found]
     import json
 
@@ -2808,7 +3001,7 @@ def convert_parquet_to_megatron(
     sidecar_data = {
         "vocab_size": vocab_size,
         "tokenizer_contract": "megacpp",
-        "dtype": dtype_str,
+        "dtype": _physical_output_dtype_name(dtype),
         "token_count": total_tokens,
         "source_capacity_token_count": source_capacity_tokens,
         "trained_token_count": trained_tokens
@@ -2851,7 +3044,64 @@ def convert_parquet_to_megatron(
         f"{total_docs:,} documents, {total_tokens:,} tokens "
         f"in {elapsed:.1f}s"
     )
-    print(f"output: {output_prefix}.bin + {output_prefix}.idx")
+    reported_prefix = _reported_output_prefix or output_prefix
+    print(f"output: {reported_prefix}.bin + {reported_prefix}.idx")
+
+
+def convert_parquet_to_megatron(
+    input_dir: str | None,
+    output_prefix: str,
+    split: str = "train",
+    token_column: str = "auto",
+    dtype_str: str = "uint16",
+    length_column: str | None = None,
+    side_channels: list[str] | None = None,
+    side_channel_dtypes: list[str] | None = None,
+    graph_sidecars: tuple[tuple[str, str, str], ...]
+    | None = DEFAULT_CPPMEGA_GRAPH_SIDECARS,
+    source_platform_sidecar: bool | None = None,
+    objective_contract_path: str | None = None,
+    objective_artifact_path: str | None = None,
+    vocab_size: int = 65536,
+    writer_backend: str = "megatron",
+) -> None:
+    """Convert parquet and atomically publish one immutable output generation."""
+
+    _validate_output_dtype_contract(dtype_str)
+
+    def write_generation(
+        generation_prefix: str, reported_prefix: str | None = None
+    ) -> None:
+        _convert_parquet_to_megatron_unpublished(
+            input_dir=input_dir,
+            output_prefix=generation_prefix,
+            split=split,
+            token_column=token_column,
+            dtype_str=dtype_str,
+            length_column=length_column,
+            side_channels=side_channels,
+            side_channel_dtypes=side_channel_dtypes,
+            graph_sidecars=graph_sidecars,
+            source_platform_sidecar=source_platform_sidecar,
+            objective_contract_path=objective_contract_path,
+            objective_artifact_path=objective_artifact_path,
+            vocab_size=vocab_size,
+            writer_backend=writer_backend,
+            _reported_output_prefix=reported_prefix,
+        )
+
+    if writer_backend != "megatron":
+        write_generation(output_prefix)
+        return
+
+    output = Path(output_prefix)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{output.name}.stage-", dir=output.parent
+    ) as stage_dir:
+        staged_prefix = str(Path(stage_dir) / output.name)
+        write_generation(staged_prefix, output_prefix)
+        _publish_staged_generation(staged_prefix, output_prefix)
 
 
 def main() -> int:
