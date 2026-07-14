@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import json
 from pathlib import Path
@@ -10,6 +11,7 @@ import sqlite3
 import struct
 import subprocess
 import tarfile
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -33,6 +35,23 @@ def _bundle(tmp_path):
     artifact = prefix.with_suffix(".bin")
     digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
     return artifact, digest
+
+
+def _force_tiny_multipart(monkeypatch, *, single_put_max=5, part_size=4):
+    monkeypatch.setattr(publisher, "S3_SINGLE_PUT_MAX_BYTES", single_put_max)
+    monkeypatch.setattr(publisher, "S3_MIN_MULTIPART_PART_BYTES", part_size)
+    monkeypatch.setattr(publisher, "MULTIPART_DEFAULT_PART_BYTES", part_size)
+    monkeypatch.setattr(publisher, "MULTIPART_PART_ALIGNMENT_BYTES", 1)
+
+    @contextmanager
+    def stable_snapshot(local, **_kwargs):
+        yield local
+
+    monkeypatch.setattr(publisher, "_stable_upload_snapshot", stable_snapshot)
+
+
+def _command_option(command, name):
+    return command[command.index(name) + 1]
 
 
 def _archive(tmp_path, artifact):
@@ -1124,23 +1143,281 @@ def test_small_upload_is_checksum_bound_and_create_only(tmp_path, monkeypatch):
     assert receipt["status"] == "uploaded_verified"
 
 
-def test_large_upload_fails_closed_until_conditional_multipart_exists(
+def test_over_5gib_selects_multipart_without_allocating_5gib(tmp_path, monkeypatch):
+    artifact = tmp_path / "tiny-large-object"
+    artifact.write_bytes(b"selection-only")
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    requested_size = 5 * 1024**3 + 1
+    monkeypatch.setattr(publisher, "_head", lambda **_kwargs: None)
+    calls = []
+
+    def fake_multipart(**kwargs):
+        calls.append(kwargs)
+        return {
+            "key": kwargs["key"],
+            "size": kwargs["size"],
+            "sha256": kwargs["sha256"],
+            "status": "uploaded_verified",
+        }
+
+    monkeypatch.setattr(publisher, "_upload_multipart_file", fake_multipart)
+
+    receipt = _upload_file(
+        local=artifact,
+        endpoint="https://example.invalid",
+        bucket="bucket",
+        key="bundles/test-bundle/large.bin",
+        size=requested_size,
+        sha256=digest,
+        env={},
+        dry_run=False,
+    )
+
+    assert receipt["status"] == "uploaded_verified"
+    assert calls[0]["size"] == requested_size
+    assert calls[0]["initial_head"] is None
+
+
+def test_multipart_part_failure_aborts_and_removes_temporary_part(
     tmp_path, monkeypatch
 ):
-    artifact, digest = _bundle(tmp_path)
+    artifact = tmp_path / "multipart.bin"
+    artifact.write_bytes(b"part-failure")
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    _force_tiny_multipart(monkeypatch)
     monkeypatch.setattr(publisher, "_head", lambda **_kwargs: None)
+    commands = []
 
-    with pytest.raises(RuntimeError, match="conditional multipart create"):
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        operation = command[2]
+        if operation == "create-multipart-upload":
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"UploadId": "upload-1"}), stderr=""
+            )
+        if operation == "upload-part":
+            return SimpleNamespace(
+                returncode=1, stdout="", stderr="injected part failure"
+            )
+        if operation == "abort-multipart-upload":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(publisher.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="upload-part 1 failed"):
         _upload_file(
             local=artifact,
             endpoint="https://example.invalid",
             bucket="bucket",
             key="bundles/test-bundle/large.bin",
-            size=5 * 1024**3 + 1,
+            size=artifact.stat().st_size,
             sha256=digest,
             env={},
             dry_run=False,
         )
+
+    assert [command[2] for command in commands] == [
+        "create-multipart-upload",
+        "upload-part",
+        "abort-multipart-upload",
+    ]
+    assert _command_option(commands[-1], "--upload-id") == "upload-1"
+    assert not list(tmp_path.glob(".cppmega-multipart-part-*"))
+
+
+def test_multipart_existing_destination_with_unverified_checksum_is_rejected(
+    tmp_path, monkeypatch
+):
+    artifact = tmp_path / "multipart.bin"
+    artifact.write_bytes(b"existing-destination")
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    _force_tiny_multipart(monkeypatch)
+    part_size, part_count = publisher._multipart_layout(artifact.stat().st_size)
+    metadata = publisher._multipart_metadata(
+        sha256=digest, part_size=part_size, part_count=part_count
+    )
+    monkeypatch.setattr(
+        publisher,
+        "_head",
+        lambda **_kwargs: {
+            "ContentLength": artifact.stat().st_size,
+            "Metadata": metadata,
+            "ChecksumSHA256": f"{'A' * 44}-{part_count}",
+            "ChecksumType": "COMPOSITE",
+            "ETag": '"existing"',
+        },
+    )
+
+    def forbidden_command(*_args, **_kwargs):
+        raise AssertionError("an existing immutable destination must not be replaced")
+
+    monkeypatch.setattr(publisher.subprocess, "run", forbidden_command)
+
+    with pytest.raises(RuntimeError, match="cannot be verified exactly"):
+        _upload_file(
+            local=artifact,
+            endpoint="https://example.invalid",
+            bucket="bucket",
+            key="bundles/test-bundle/large.bin",
+            size=artifact.stat().st_size,
+            sha256=digest,
+            env={},
+            dry_run=False,
+        )
+
+
+def test_concurrent_multipart_publishers_preserve_immutable_destination(
+    tmp_path, monkeypatch
+):
+    artifact = tmp_path / "multipart.bin"
+    artifact.write_bytes(b"concurrent-publication")
+    size = artifact.stat().st_size
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    _force_tiny_multipart(monkeypatch)
+    lock = threading.Lock()
+    initial_head_barrier = threading.Barrier(2)
+    complete_barrier = threading.Barrier(2)
+    state = {
+        "initial_heads": 0,
+        "next_upload": 0,
+        "uploads": {},
+        "object_head": None,
+        "commands": [],
+        "aborts": [],
+    }
+
+    def response(payload=None, *, returncode=0, stderr=""):
+        return SimpleNamespace(
+            returncode=returncode,
+            stdout=json.dumps(payload or {}) if returncode == 0 else "",
+            stderr=stderr,
+        )
+
+    def fake_run(command, **_kwargs):
+        operation = command[2]
+        with lock:
+            state["commands"].append(list(command))
+
+        if operation == "head-object":
+            with lock:
+                current = state["object_head"]
+                is_initial = current is None and state["initial_heads"] < 2
+                if is_initial:
+                    state["initial_heads"] += 1
+            if is_initial:
+                initial_head_barrier.wait(timeout=10)
+                return response(returncode=254, stderr="404 Not Found")
+            if current is None:
+                return response(returncode=254, stderr="404 Not Found")
+            return response(current)
+
+        if operation == "create-multipart-upload":
+            with lock:
+                state["next_upload"] += 1
+                upload_id = f"upload-{state['next_upload']}"
+                state["uploads"][upload_id] = {
+                    "metadata": json.loads(_command_option(command, "--metadata")),
+                    "parts": {},
+                }
+            return response({"UploadId": upload_id})
+
+        if operation == "upload-part":
+            upload_id = _command_option(command, "--upload-id")
+            part_number = int(_command_option(command, "--part-number"))
+            body = Path(_command_option(command, "--body")).read_bytes()
+            checksum = base64.b64encode(hashlib.sha256(body).digest()).decode("ascii")
+            assert checksum == _command_option(command, "--checksum-sha256")
+            etag = f'"{upload_id}-part-{part_number}"'
+            with lock:
+                state["uploads"][upload_id]["parts"][part_number] = {
+                    "length": len(body),
+                    "checksum": checksum,
+                    "etag": etag,
+                }
+            return response({"ETag": etag, "ChecksumSHA256": checksum})
+
+        if operation == "complete-multipart-upload":
+            upload_id = _command_option(command, "--upload-id")
+            manifest_path = Path(
+                _command_option(command, "--multipart-upload").removeprefix("file://")
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            part_checksums = [part["ChecksumSHA256"] for part in manifest["Parts"]]
+            composite = publisher._multipart_composite_sha256(part_checksums)
+            assert _command_option(command, "--checksum-sha256") == composite.rsplit(
+                "-", 1
+            )[0]
+            assert _command_option(command, "--if-none-match") == "*"
+            assert int(_command_option(command, "--mpu-object-size")) == size
+            complete_barrier.wait(timeout=10)
+            with lock:
+                if state["object_head"] is not None:
+                    return response(
+                        returncode=255,
+                        stderr="PreconditionFailed: 412 If-None-Match",
+                    )
+                upload = state["uploads"][upload_id]
+                etag = f'"{upload_id}-complete"'
+                state["object_head"] = {
+                    "ContentLength": sum(
+                        part["length"] for part in upload["parts"].values()
+                    ),
+                    "Metadata": upload["metadata"],
+                    "ChecksumSHA256": composite,
+                    "ChecksumType": "COMPOSITE",
+                    "ETag": etag,
+                }
+            return response(
+                {
+                    "ETag": etag,
+                    "ChecksumSHA256": composite,
+                    "ChecksumType": "COMPOSITE",
+                }
+            )
+
+        if operation == "abort-multipart-upload":
+            with lock:
+                state["aborts"].append(_command_option(command, "--upload-id"))
+            return response()
+
+        raise AssertionError(command)
+
+    monkeypatch.setattr(publisher.subprocess, "run", fake_run)
+
+    def publish():
+        return _upload_file(
+            local=artifact,
+            endpoint="https://example.invalid",
+            bucket="bucket",
+            key="bundles/test-bundle/large.bin",
+            size=size,
+            sha256=digest,
+            env={},
+            dry_run=False,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(publish) for _ in range(2)]
+        receipts = [future.result(timeout=20) for future in futures]
+
+    assert sorted(receipt["status"] for receipt in receipts) == [
+        "already_verified",
+        "uploaded_verified",
+    ]
+    concurrent_receipt = next(
+        receipt for receipt in receipts if receipt["status"] == "already_verified"
+    )
+    assert concurrent_receipt["race_resolution"] == "matching_concurrent_publisher"
+    assert concurrent_receipt["verification"]["metadata"]["sha256"] == digest
+    assert len(state["aborts"]) == 1
+    completes = [
+        command
+        for command in state["commands"]
+        if command[2] == "complete-multipart-upload"
+    ]
+    assert len(completes) == 2
+    assert all(_command_option(command, "--if-none-match") == "*" for command in completes)
 
 
 def test_latest_pointer_update_uses_remote_etag_compare_and_swap(tmp_path, monkeypatch):

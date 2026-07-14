@@ -30,7 +30,7 @@ import sys
 import tarfile
 import tempfile
 import threading
-from typing import Iterable
+from typing import BinaryIO, Iterable
 
 import numpy as np
 
@@ -59,6 +59,14 @@ from cppmega.megatron.domain_route_contract import (  # noqa: E402
 DEFAULT_ENDPOINT = "https://storage.eu-north1.nebius.cloud"
 DEFAULT_BUCKET = "cppmega-sidecar-20260627"
 DEFAULT_PREFIX = "cppmega-megatron/macro-routes"
+S3_SINGLE_PUT_MAX_BYTES = 5 * 1024**3
+S3_MIN_MULTIPART_PART_BYTES = 5 * 1024**2
+S3_MAX_MULTIPART_PART_BYTES = 5 * 1024**3
+S3_MAX_MULTIPART_PARTS = 10_000
+S3_MAX_OBJECT_BYTES = 5 * 1024**4
+MULTIPART_DEFAULT_PART_BYTES = 512 * 1024**2
+MULTIPART_PART_ALIGNMENT_BYTES = 1024**2
+MULTIPART_PUBLICATION_PROTOCOL = "conditional-complete-v1"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 EXPECTED_BUNDLE_TOKENIZER_CONTRACT = "megacpp-vocab-65536"
 EXPECTED_PREFIX_TOKENIZER_CONTRACT = "megacpp"
@@ -1651,6 +1659,222 @@ def _head_matches(head: dict | None, *, size: int, sha256: str) -> bool:
     )
 
 
+def _multipart_layout(size: int) -> tuple[int, int]:
+    if size <= 0:
+        raise ValueError(f"multipart object size must be positive, got {size}")
+    if size > S3_MAX_OBJECT_BYTES:
+        raise RuntimeError(
+            f"object size {size} exceeds the supported S3 limit {S3_MAX_OBJECT_BYTES}"
+        )
+    minimum_for_part_limit = (size + S3_MAX_MULTIPART_PARTS - 1) // (
+        S3_MAX_MULTIPART_PARTS
+    )
+    aligned_minimum = (
+        (
+            minimum_for_part_limit
+            + MULTIPART_PART_ALIGNMENT_BYTES
+            - 1
+        )
+        // MULTIPART_PART_ALIGNMENT_BYTES
+        * MULTIPART_PART_ALIGNMENT_BYTES
+    )
+    part_size = max(
+        S3_MIN_MULTIPART_PART_BYTES,
+        MULTIPART_DEFAULT_PART_BYTES,
+        aligned_minimum,
+    )
+    part_count = (size + part_size - 1) // part_size
+    if part_size > S3_MAX_MULTIPART_PART_BYTES or part_count > S3_MAX_MULTIPART_PARTS:
+        raise RuntimeError(
+            f"no safe S3 multipart layout for size={size}: "
+            f"part_size={part_size} part_count={part_count}"
+        )
+    return part_size, part_count
+
+
+def _multipart_metadata(
+    *, sha256: str, part_size: int, part_count: int
+) -> dict[str, str]:
+    return {
+        "sha256": sha256,
+        "publication-protocol": MULTIPART_PUBLICATION_PROTOCOL,
+        "multipart-part-size": str(part_size),
+        "multipart-part-count": str(part_count),
+    }
+
+
+def _read_exact_part(
+    source: BinaryIO, length: int, destination: BinaryIO | None = None
+) -> str:
+    digest = hashlib.sha256()
+    remaining = length
+    while remaining:
+        chunk = source.read(min(8 * 1024 * 1024, remaining))
+        if not chunk:
+            raise RuntimeError(
+                f"multipart source ended with {remaining} bytes still expected"
+            )
+        digest.update(chunk)
+        if destination is not None:
+            destination.write(chunk)
+        remaining -= len(chunk)
+    return base64.b64encode(digest.digest()).decode("ascii")
+
+
+def _multipart_part_checksums(
+    path: Path, *, size: int, part_size: int, part_count: int
+) -> list[str]:
+    checksums: list[str] = []
+    with path.open("rb") as source:
+        for part_number in range(1, part_count + 1):
+            part_offset = (part_number - 1) * part_size
+            part_length = min(part_size, size - part_offset)
+            checksums.append(_read_exact_part(source, part_length))
+        if source.read(1):
+            raise RuntimeError(f"multipart source contains bytes beyond size={size}: {path}")
+    return checksums
+
+
+def _multipart_composite_sha256(part_checksums: list[str]) -> str:
+    if not part_checksums:
+        raise ValueError("multipart checksum requires at least one part")
+    digest = hashlib.sha256()
+    for checksum in part_checksums:
+        try:
+            raw = base64.b64decode(checksum, validate=True)
+        except ValueError as error:
+            raise ValueError(f"invalid multipart part SHA-256: {checksum!r}") from error
+        if len(raw) != hashlib.sha256().digest_size:
+            raise ValueError(f"invalid multipart part SHA-256 length: {checksum!r}")
+        digest.update(raw)
+    encoded = base64.b64encode(digest.digest()).decode("ascii")
+    return f"{encoded}-{len(part_checksums)}"
+
+
+def _multipart_head_matches(
+    head: dict | None,
+    *,
+    size: int,
+    sha256: str,
+    part_size: int,
+    part_count: int,
+    checksum_sha256: str,
+    etag: str | None = None,
+) -> bool:
+    if not _head_matches(head, size=size, sha256=sha256):
+        return False
+    assert head is not None
+    metadata = {
+        str(key).lower(): str(value)
+        for key, value in (head.get("Metadata") or {}).items()
+    }
+    if metadata != _multipart_metadata(
+        sha256=sha256, part_size=part_size, part_count=part_count
+    ):
+        return False
+    if (
+        head.get("ChecksumType") != "COMPOSITE"
+        or head.get("ChecksumSHA256") != checksum_sha256
+    ):
+        return False
+    remote_etag = head.get("ETag")
+    if not isinstance(remote_etag, str) or not remote_etag:
+        return False
+    return etag is None or remote_etag == etag
+
+
+def _multipart_receipt(
+    *,
+    head: dict | None,
+    key: str,
+    size: int,
+    sha256: str,
+    part_size: int,
+    part_count: int,
+    checksum_sha256: str,
+    status: str,
+    etag: str | None = None,
+) -> dict[str, object]:
+    if not _multipart_head_matches(
+        head,
+        size=size,
+        sha256=sha256,
+        part_size=part_size,
+        part_count=part_count,
+        checksum_sha256=checksum_sha256,
+        etag=etag,
+    ):
+        raise RuntimeError(f"remote multipart verification failed for key {key!r}")
+    assert head is not None
+    verified_metadata = _multipart_metadata(
+        sha256=sha256, part_size=part_size, part_count=part_count
+    )
+    return {
+        "key": key,
+        "size": size,
+        "sha256": sha256,
+        "status": status,
+        "upload_mode": "multipart",
+        "part_size": part_size,
+        "part_count": part_count,
+        "checksum_type": "COMPOSITE",
+        "checksum_sha256": checksum_sha256,
+        "etag": head["ETag"],
+        "verification": {
+            "content_length": int(head["ContentLength"]),
+            "metadata": verified_metadata,
+            "checksum_type": head["ChecksumType"],
+            "checksum_sha256": head["ChecksumSHA256"],
+        },
+    }
+
+
+def _parse_s3_json(result: object, *, operation: str, uri: str) -> dict:
+    returncode = int(getattr(result, "returncode", -1))
+    stderr = str(getattr(result, "stderr", "")).strip()
+    if returncode != 0:
+        raise RuntimeError(f"{operation} failed for {uri}: {stderr}")
+    stdout = str(getattr(result, "stdout", ""))
+    try:
+        payload = json.loads(stdout) if stdout.strip() else {}
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"{operation} returned invalid JSON for {uri}") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{operation} returned non-object JSON for {uri}")
+    return payload
+
+
+def _abort_multipart_upload(
+    *, endpoint: str, bucket: str, key: str, upload_id: str, env: dict[str, str]
+) -> str | None:
+    command = [
+        "aws",
+        "s3api",
+        "abort-multipart-upload",
+        "--bucket",
+        bucket,
+        "--key",
+        key,
+        "--upload-id",
+        upload_id,
+        "--endpoint-url",
+        endpoint,
+    ]
+    try:
+        result = subprocess.run(
+            command, env=env, text=True, capture_output=True, check=False
+        )
+    except Exception as error:  # pragma: no cover - subprocess launch failures are rare
+        return str(error)
+    if result.returncode == 0:
+        return None
+    error = result.stderr.strip()
+    lowered = error.lower()
+    if "nosuchupload" in lowered:
+        return None
+    return error or f"abort-multipart-upload exited {result.returncode}"
+
+
 @contextmanager
 def _stable_upload_snapshot(local: Path, *, size: int, sha256: str):
     if not local.is_file() or local.stat().st_size != size or _sha256(local) != sha256:
@@ -1679,6 +1903,365 @@ def _stable_upload_snapshot(local: Path, *, size: int, sha256: str):
         snapshot.unlink(missing_ok=True)
 
 
+def _upload_multipart_file(
+    *,
+    local: Path,
+    endpoint: str,
+    bucket: str,
+    key: str,
+    size: int,
+    sha256: str,
+    env: dict[str, str],
+    initial_head: dict | None,
+    allow_overwrite: bool,
+) -> dict[str, object]:
+    """Publish through a checksum-bound conditional completion.
+
+    Multipart creation is intentionally not the linearization point: incomplete
+    uploads are invisible.  The destination changes only through a conditional
+    CompleteMultipartUpload.  Endpoints that reject that condition or the
+    checksum contract fail closed; there is no unconditional fallback.
+    """
+    uri = f"s3://{bucket}/{key}"
+    part_size, part_count = _multipart_layout(size)
+    basic_existing_match = _head_matches(initial_head, size=size, sha256=sha256)
+    if initial_head is not None and not basic_existing_match and not allow_overwrite:
+        metadata = {
+            str(name).lower(): value
+            for name, value in (initial_head.get("Metadata") or {}).items()
+        }
+        raise RuntimeError(
+            f"immutable remote object mismatch for {uri}: "
+            f"size={initial_head.get('ContentLength')} sha256={metadata.get('sha256')}; "
+            f"local size={size} sha256={sha256}"
+        )
+
+    upload_id: str | None = None
+    abort_attempted = False
+    abort_failure: str | None = None
+
+    def abort_once() -> str | None:
+        nonlocal abort_attempted, abort_failure
+        if upload_id is None or abort_attempted:
+            return abort_failure
+        abort_attempted = True
+        abort_failure = _abort_multipart_upload(
+            endpoint=endpoint,
+            bucket=bucket,
+            key=key,
+            upload_id=upload_id,
+            env=env,
+        )
+        return abort_failure
+
+    try:
+        with _stable_upload_snapshot(local, size=size, sha256=sha256) as snapshot:
+            expected_part_checksums: list[str] | None = None
+            if basic_existing_match:
+                expected_part_checksums = _multipart_part_checksums(
+                    snapshot,
+                    size=size,
+                    part_size=part_size,
+                    part_count=part_count,
+                )
+                existing_checksum = _multipart_composite_sha256(
+                    expected_part_checksums
+                )
+                current_head = _head(
+                    endpoint=endpoint, bucket=bucket, key=key, env=env
+                )
+                if _multipart_head_matches(
+                    current_head,
+                    size=size,
+                    sha256=sha256,
+                    part_size=part_size,
+                    part_count=part_count,
+                    checksum_sha256=existing_checksum,
+                ):
+                    return _multipart_receipt(
+                        head=current_head,
+                        key=key,
+                        size=size,
+                        sha256=sha256,
+                        part_size=part_size,
+                        part_count=part_count,
+                        checksum_sha256=existing_checksum,
+                        status="already_verified",
+                    )
+                if not allow_overwrite:
+                    raise RuntimeError(
+                        "immutable remote multipart object cannot be verified exactly "
+                        f"for {uri}; refusing replacement"
+                    )
+                initial_head = current_head
+
+            if initial_head is None:
+                complete_condition = ["--if-none-match", "*"]
+            else:
+                etag = initial_head.get("ETag")
+                if not allow_overwrite or not isinstance(etag, str) or not etag:
+                    raise RuntimeError(
+                        f"remote object cannot be conditionally replaced: {uri}"
+                    )
+                complete_condition = ["--if-match", etag]
+
+            metadata = _multipart_metadata(
+                sha256=sha256, part_size=part_size, part_count=part_count
+            )
+            create_command = [
+                "aws",
+                "s3api",
+                "create-multipart-upload",
+                "--bucket",
+                bucket,
+                "--key",
+                key,
+                "--endpoint-url",
+                endpoint,
+                "--metadata",
+                json.dumps(metadata, separators=(",", ":"), sort_keys=True),
+                "--checksum-algorithm",
+                "SHA256",
+                "--checksum-type",
+                "COMPOSITE",
+                "--output",
+                "json",
+            ]
+            create_result = subprocess.run(
+                create_command,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            create_payload = _parse_s3_json(
+                create_result, operation="create-multipart-upload", uri=uri
+            )
+            candidate_upload_id = create_payload.get("UploadId")
+            if not isinstance(candidate_upload_id, str) or not candidate_upload_id:
+                raise RuntimeError(
+                    f"create-multipart-upload returned no UploadId for {uri}"
+                )
+            upload_id = candidate_upload_id
+
+            uploaded_parts: list[dict[str, object]] = []
+            uploaded_checksums: list[str] = []
+            with snapshot.open("rb") as source:
+                for part_number in range(1, part_count + 1):
+                    part_offset = (part_number - 1) * part_size
+                    part_length = min(part_size, size - part_offset)
+                    part_path: Path | None = None
+                    try:
+                        with tempfile.NamedTemporaryFile(
+                            prefix=".cppmega-multipart-part-",
+                            suffix=f"-{part_number:05d}",
+                            dir=snapshot.parent,
+                            delete=False,
+                        ) as part_file:
+                            part_path = Path(part_file.name)
+                            part_checksum = _read_exact_part(
+                                source, part_length, part_file
+                            )
+                        if (
+                            expected_part_checksums is not None
+                            and part_checksum
+                            != expected_part_checksums[part_number - 1]
+                        ):
+                            raise RuntimeError(
+                                f"stable multipart snapshot changed at part {part_number}"
+                            )
+                        upload_command = [
+                            "aws",
+                            "s3api",
+                            "upload-part",
+                            "--bucket",
+                            bucket,
+                            "--key",
+                            key,
+                            "--upload-id",
+                            upload_id,
+                            "--part-number",
+                            str(part_number),
+                            "--body",
+                            str(part_path),
+                            "--content-length",
+                            str(part_length),
+                            "--checksum-algorithm",
+                            "SHA256",
+                            "--checksum-sha256",
+                            part_checksum,
+                            "--endpoint-url",
+                            endpoint,
+                            "--output",
+                            "json",
+                        ]
+                        upload_result = subprocess.run(
+                            upload_command,
+                            env=env,
+                            text=True,
+                            capture_output=True,
+                            check=False,
+                        )
+                        upload_payload = _parse_s3_json(
+                            upload_result,
+                            operation=f"upload-part {part_number}",
+                            uri=uri,
+                        )
+                        etag = upload_payload.get("ETag")
+                        remote_checksum = upload_payload.get("ChecksumSHA256")
+                        if not isinstance(etag, str) or not etag:
+                            raise RuntimeError(
+                                f"upload-part {part_number} returned no ETag for {uri}"
+                            )
+                        if remote_checksum != part_checksum:
+                            raise RuntimeError(
+                                f"upload-part {part_number} checksum mismatch for {uri}: "
+                                f"{remote_checksum!r} != {part_checksum!r}"
+                            )
+                        uploaded_parts.append(
+                            {
+                                "PartNumber": part_number,
+                                "ETag": etag,
+                                "ChecksumSHA256": part_checksum,
+                            }
+                        )
+                        uploaded_checksums.append(part_checksum)
+                    finally:
+                        if part_path is not None:
+                            part_path.unlink(missing_ok=True)
+                if source.read(1):
+                    raise RuntimeError(
+                        f"multipart source contains bytes beyond size={size}: {snapshot}"
+                    )
+
+            composite_checksum = _multipart_composite_sha256(uploaded_checksums)
+            checksum_header = composite_checksum.rsplit("-", 1)[0]
+            manifest_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    prefix=".cppmega-multipart-complete-",
+                    suffix=".json",
+                    dir=snapshot.parent,
+                    encoding="utf-8",
+                    delete=False,
+                ) as manifest_file:
+                    manifest_path = Path(manifest_file.name)
+                    json.dump(
+                        {"Parts": uploaded_parts},
+                        manifest_file,
+                        separators=(",", ":"),
+                    )
+                complete_command = [
+                    "aws",
+                    "s3api",
+                    "complete-multipart-upload",
+                    "--bucket",
+                    bucket,
+                    "--key",
+                    key,
+                    "--upload-id",
+                    upload_id,
+                    "--multipart-upload",
+                    f"file://{manifest_path}",
+                    "--checksum-sha256",
+                    checksum_header,
+                    "--checksum-type",
+                    "COMPOSITE",
+                    "--mpu-object-size",
+                    str(size),
+                    "--endpoint-url",
+                    endpoint,
+                    "--output",
+                    "json",
+                    *complete_condition,
+                ]
+                complete_result = subprocess.run(
+                    complete_command,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+            finally:
+                if manifest_path is not None:
+                    manifest_path.unlink(missing_ok=True)
+
+            if complete_result.returncode != 0:
+                completion_error = complete_result.stderr.strip()
+                cleanup_error = abort_once()
+                if cleanup_error is not None:
+                    raise RuntimeError(
+                        f"conditional multipart completion failed for {uri}: "
+                        f"{completion_error}; abort also failed: {cleanup_error}"
+                    )
+                concurrent_head = _head(
+                    endpoint=endpoint, bucket=bucket, key=key, env=env
+                )
+                if _multipart_head_matches(
+                    concurrent_head,
+                    size=size,
+                    sha256=sha256,
+                    part_size=part_size,
+                    part_count=part_count,
+                    checksum_sha256=composite_checksum,
+                ):
+                    receipt = _multipart_receipt(
+                        head=concurrent_head,
+                        key=key,
+                        size=size,
+                        sha256=sha256,
+                        part_size=part_size,
+                        part_count=part_count,
+                        checksum_sha256=composite_checksum,
+                        status="already_verified",
+                    )
+                    receipt["race_resolution"] = "matching_concurrent_publisher"
+                    return receipt
+                raise RuntimeError(
+                    f"conditional multipart completion failed for {uri}: "
+                    f"{completion_error}; destination is absent or does not match"
+                )
+
+            complete_payload = _parse_s3_json(
+                complete_result, operation="complete-multipart-upload", uri=uri
+            )
+            response_checksum = complete_payload.get("ChecksumSHA256")
+            if response_checksum not in (None, composite_checksum):
+                raise RuntimeError(
+                    f"complete-multipart-upload checksum mismatch for {uri}: "
+                    f"{response_checksum!r} != {composite_checksum!r}"
+                )
+            response_checksum_type = complete_payload.get("ChecksumType")
+            if response_checksum_type not in (None, "COMPOSITE"):
+                raise RuntimeError(
+                    f"complete-multipart-upload checksum type mismatch for {uri}: "
+                    f"{response_checksum_type!r}"
+                )
+            response_etag = complete_payload.get("ETag")
+            expected_etag = response_etag if isinstance(response_etag, str) else None
+            final_head = _head(endpoint=endpoint, bucket=bucket, key=key, env=env)
+            receipt = _multipart_receipt(
+                head=final_head,
+                key=key,
+                size=size,
+                sha256=sha256,
+                part_size=part_size,
+                part_count=part_count,
+                checksum_sha256=composite_checksum,
+                status="uploaded_verified",
+                etag=expected_etag,
+            )
+        return receipt
+    except BaseException as error:
+        cleanup_error = abort_once()
+        if cleanup_error is not None:
+            raise RuntimeError(
+                f"{error}; multipart abort failed for {uri}: {cleanup_error}"
+            ) from error
+        raise
+
+
 def _upload_file(
     *,
     local: Path,
@@ -1691,32 +2274,39 @@ def _upload_file(
     dry_run: bool,
     allow_overwrite: bool = False,
 ) -> dict[str, object]:
+    head: dict | None = None
     if not dry_run:
         head = _head(endpoint=endpoint, bucket=bucket, key=key, env=env)
-        if _head_matches(head, size=size, sha256=sha256):
-            return {
-                "key": key,
-                "size": size,
-                "sha256": sha256,
-                "status": "already_verified",
-            }
-        if head is not None and not allow_overwrite:
-            remote_metadata = {
-                str(key).lower(): value
-                for key, value in (head.get("Metadata") or {}).items()
-            }
-            raise RuntimeError(
-                f"immutable remote object mismatch for s3://{bucket}/{key}: "
-                f"size={head.get('ContentLength')} sha256={remote_metadata.get('sha256')}; "
-                f"local size={size} sha256={sha256}"
-            )
     if dry_run:
         return {"key": key, "size": size, "sha256": sha256, "status": "dry_run"}
-    if size > 5 * 1024**3:
+    if size > S3_SINGLE_PUT_MAX_BYTES:
+        return _upload_multipart_file(
+            local=local,
+            endpoint=endpoint,
+            bucket=bucket,
+            key=key,
+            size=size,
+            sha256=sha256,
+            env=env,
+            initial_head=head,
+            allow_overwrite=allow_overwrite,
+        )
+    if _head_matches(head, size=size, sha256=sha256):
+        return {
+            "key": key,
+            "size": size,
+            "sha256": sha256,
+            "status": "already_verified",
+        }
+    if head is not None and not allow_overwrite:
+        remote_metadata = {
+            str(key).lower(): value
+            for key, value in (head.get("Metadata") or {}).items()
+        }
         raise RuntimeError(
-            "objects larger than 5 GiB require a conditional multipart create "
-            "protocol; unsafe unconditioned aws s3 cp is forbidden: "
-            f"s3://{bucket}/{key}"
+            f"immutable remote object mismatch for s3://{bucket}/{key}: "
+            f"size={head.get('ContentLength')} sha256={remote_metadata.get('sha256')}; "
+            f"local size={size} sha256={sha256}"
         )
     expected_checksum = base64.b64encode(bytes.fromhex(sha256)).decode("ascii")
     with _stable_upload_snapshot(local, size=size, sha256=sha256) as snapshot:
