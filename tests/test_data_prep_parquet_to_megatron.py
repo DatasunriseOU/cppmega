@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import sqlite3
 import sys
 import types
 from pathlib import Path
@@ -305,6 +306,118 @@ def test_objective_conversion_requires_source_document_provenance() -> None:
         )
 
 
+def _source_identity(source: str) -> dict[str, int | str]:
+    digest = hashlib.sha256(source.encode("utf-8")).digest()
+    identity_id = int.from_bytes(digest[:8], "big", signed=False)
+    if identity_id == 0:
+        identity_id = int.from_bytes(digest[8:16], "big", signed=False)
+    assert identity_id > 0
+    return {
+        "source_identity_id": identity_id,
+        "canonical_sha256": digest.hex(),
+        "source": source,
+    }
+
+
+def _high_source_identity() -> dict[str, int | str]:
+    for suffix in range(100):
+        identity = _source_identity(f'{{"source_path":"src/high-{suffix}.cc"}}')
+        if int(identity["source_identity_id"]) > 2**63:
+            return identity
+    raise AssertionError("failed to produce a deterministic high uint64 identity")
+
+
+def _case5_table(pa, converter, rows: dict[str, object]):
+    edge_pair = pa.struct(
+        [pa.field("from", pa.uint16()), pa.field("to", pa.uint16())]
+    )
+    edge_triple = pa.struct(
+        [
+            pa.field("from", pa.uint32()),
+            pa.field("to", pa.uint32()),
+            pa.field("kind", pa.int32()),
+        ]
+    )
+    identity_struct = pa.struct(
+        [
+            pa.field("source_identity_id", pa.uint64(), nullable=False),
+            pa.field("canonical_sha256", pa.string(), nullable=False),
+            pa.field("source", pa.string(), nullable=False),
+        ]
+    )
+    types = {
+        "doc_ids": pa.list_(pa.uint32()),
+        "token_domain_ids": pa.list_(pa.uint16()),
+        "token_role_ids": pa.list_(pa.uint16()),
+        "token_entity_ids": pa.list_(pa.uint32()),
+        "token_scope_ids": pa.list_(pa.uint32()),
+        "token_source_doc_ids": pa.list_(pa.uint32()),
+        "token_source_identity_ids": pa.list_(pa.uint64()),
+        "token_confidence_ids": pa.list_(pa.uint8()),
+        "token_symbol_ids": pa.list_(pa.uint64()),
+        "token_call_targets": pa.list_(pa.uint64()),
+        "token_type_refs": pa.list_(pa.uint64()),
+        "token_call_edges": pa.list_(edge_pair),
+        "token_type_edges": pa.list_(edge_pair),
+        **{
+            column: pa.list_(edge_triple)
+            for column in converter.DOMAIN_EDGE_KINDS_BY_COLUMN
+        },
+        "token_chunk_starts": pa.list_(pa.uint32()),
+        "token_chunk_ends": pa.list_(pa.uint32()),
+        "token_chunk_kinds": pa.list_(pa.uint8()),
+        "token_chunk_dep_levels": pa.list_(pa.uint16()),
+        converter.SOURCE_IDENTITY_REGISTRY_COLUMN: pa.list_(identity_struct),
+    }
+    table = pa.table(
+        {
+            name: pa.array(values, type=types[name]) if name in types else values
+            for name, values in rows.items()
+        }
+    )
+    table = _stamp_v3_identity_table(pa, table, converter)
+    metadata = dict(table.schema.metadata or {})
+    metadata.update(
+        {
+            converter.CASE5_SCHEMA_METADATA_KEY.encode("utf-8"): (
+                converter.CASE5_SCHEMA_VERSION.encode("utf-8")
+            ),
+            converter.DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode("utf-8"): (
+                converter.DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii")
+            ),
+        }
+    )
+    return table.replace_schema_metadata(
+        metadata
+    )
+
+
+def _minimal_case5_rows(converter) -> dict[str, object]:
+    identity = _source_identity('{"source_path":"src/minimal.cc"}')
+    identity_id = int(identity["source_identity_id"])
+    rows: dict[str, object] = {
+        "valid_token_count": [2],
+        "input_ids": [[10, 11]],
+        "source_platform_ids": [[[2]]],
+    }
+    for name, _dtype in converter.DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS:
+        rows[name] = [[0, 0]]
+    rows["doc_ids"] = [[1, 1]]
+    rows["token_source_doc_ids"] = [[1, 1]]
+    rows["token_source_identity_ids"] = [[identity_id, identity_id]]
+    rows[converter.SOURCE_IDENTITY_REGISTRY_COLUMN] = [[identity]]
+    for name, kind, _dtype in converter.DEFAULT_CPPMEGA_GRAPH_SIDECARS:
+        if kind in {"edge_pairs", "edge_triples"}:
+            rows[name] = [[]]
+        elif name == "token_chunk_starts":
+            rows[name] = [[0]]
+        elif name == "token_chunk_ends":
+            rows[name] = [[2]]
+        else:
+            rows[name] = [[1]]
+    return rows
+
+
 def test_megatron_dtype_codes_match_mmididx_enum() -> None:
     converter = _load_converter_module()
 
@@ -360,6 +473,7 @@ def test_default_cppmega_side_channels_are_full_token_aligned_profile() -> None:
         "token_entity_ids",
         "token_scope_ids",
         "token_source_doc_ids",
+        "token_source_identity_ids",
         "token_confidence_ids",
         "token_structure_ids",
         "token_dep_levels",
@@ -374,11 +488,12 @@ def test_default_cppmega_side_channels_are_full_token_aligned_profile() -> None:
         "token_change_mask_post",
     ]
     assert dtypes["loss_mask"] == "uint8"
-    assert dtypes["doc_ids"] == "uint16"
+    assert dtypes["doc_ids"] == "uint32"
     assert dtypes["token_domain_ids"] == "uint16"
     assert dtypes["token_role_ids"] == "uint16"
     assert dtypes["token_entity_ids"] == "uint32"
     assert dtypes["token_source_doc_ids"] == "uint32"
+    assert dtypes["token_source_identity_ids"] == "uint64"
     assert dtypes["token_confidence_ids"] == "uint8"
     assert dtypes["token_symbol_ids"] == "uint64"
     assert dtypes["token_call_targets"] == "uint64"
@@ -533,6 +648,82 @@ def test_source_platform_writer_rejects_nonlocal_document_ids(tmp_path: Path) ->
     writer.abort_close()
 
 
+def test_source_identity_registry_rejects_corrupt_digest_and_missing_fk(
+    tmp_path: Path,
+) -> None:
+    converter = _load_converter_module()
+    identity = _source_identity('{"source_path":"src/identity.cc"}')
+    writer = converter._SourceIdentityRegistryWriter(str(tmp_path / "registry"))
+
+    corrupt = dict(identity)
+    corrupt["canonical_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="full canonical source SHA256"):
+        writer.append(
+            [corrupt],
+            source_identity_ids=[int(identity["source_identity_id"])],
+            token_count=1,
+            shard_path="shard.parquet",
+            row_idx=0,
+        )
+    with pytest.raises(ValueError, match="missing token foreign keys"):
+        writer.append(
+            [identity],
+            source_identity_ids=[int(identity["source_identity_id"]) + 1],
+            token_count=1,
+            shard_path="shard.parquet",
+            row_idx=1,
+        )
+    writer.abort_close()
+
+
+@pytest.mark.parametrize("failure", ["missing_column", "edge_schema", "receipt"])
+def test_case5_arrow_contract_fails_closed(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    converter = _load_converter_module()
+    table = _case5_table(pa, converter, _minimal_case5_rows(converter))
+    if failure == "missing_column":
+        table = table.drop(["token_source_identity_ids"])
+        expected = "incomplete CASE5 packed schema"
+    elif failure == "edge_schema":
+        wrong_edges = pa.array(
+            [[{"from": 0, "to": 0}]],
+            type=pa.list_(
+                pa.struct(
+                    [pa.field("from", pa.int64()), pa.field("to", pa.int64())]
+                )
+            ),
+        )
+        edge_index = table.schema.get_field_index("token_call_edges")
+        table = table.set_column(edge_index, "token_call_edges", wrong_edges)
+        expected = "Arrow types differ"
+    else:
+        table = table.replace_schema_metadata(
+            {
+                converter.CASE5_SCHEMA_METADATA_KEY: converter.CASE5_SCHEMA_VERSION,
+                converter.DOMAIN_DELIMITER_CONTRACT_METADATA_KEY: "stale",
+            }
+        )
+        expected = "stale CASE5 receipt metadata"
+    shard = tmp_path / f"{failure}.parquet"
+    pq.write_table(table, shard)
+
+    with pytest.raises(ValueError, match=expected):
+        converter._require_case5_schema(
+            [str(shard)],
+            side_channels=[
+                name for name, _dtype in converter.DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS
+            ],
+            side_channel_dtypes=[
+                dtype for _name, dtype in converter.DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS
+            ],
+            graph_sidecars=converter.DEFAULT_CPPMEGA_GRAPH_SIDECARS,
+        )
+
+
 def test_default_cppmega_graph_sidecars_are_document_aligned_route_profile() -> None:
     converter = _load_converter_module()
 
@@ -634,6 +825,7 @@ def test_domain_route_sidecars_validate_enums_delimiters_and_source_ids() -> Non
         "token_entity_ids": [0, 7, 0],
         "token_scope_ids": [0, 0, 0],
         "token_source_doc_ids": [9, 9, 9],
+        "token_source_identity_ids": [2**63 + 11] * 3,
         "token_confidence_ids": [4, 2, 4],
     }
 
@@ -683,6 +875,7 @@ def test_domain_route_sidecars_validate_nested_sql_and_uint32_bounds() -> None:
         "token_entity_ids": [0, 0, 7, 0, 0],
         "token_scope_ids": [0, 0, 0, 0, 0],
         "token_source_doc_ids": [9, 9, 9, 9, 9],
+        "token_source_identity_ids": [2**63 + 11] * 5,
         "token_confidence_ids": [4, 4, 2, 4, 4],
     }
 
@@ -709,6 +902,16 @@ def test_domain_route_sidecars_validate_nested_sql_and_uint32_bounds() -> None:
         converter._validate_domain_route_sidecars(
             [191, 239, 1000, 240, 192],
             oversized_source,
+            shard_path="shard.parquet",
+            row_idx=5,
+        )
+
+    missing_identity = dict(nested)
+    missing_identity["token_source_identity_ids"] = [2**63 + 11, 0, 1, 1, 1]
+    with pytest.raises(ValueError, match="positive uint64 registry foreign key"):
+        converter._validate_domain_route_sidecars(
+            [191, 239, 1000, 240, 192],
+            missing_identity,
             shard_path="shard.parquet",
             row_idx=5,
         )
@@ -850,6 +1053,8 @@ def test_explicit_mmididx_writer_trims_padding_and_all_sidecars(tmp_path: Path) 
     converter = _load_converter_module()
     input_dir = tmp_path / "parquet"
     input_dir.mkdir()
+    identity = _high_source_identity()
+    identity_id = int(identity["source_identity_id"])
     row = {
         "valid_token_count": [3],
         "input_ids": [[7, 8, 9, 0, 0]],
@@ -864,8 +1069,10 @@ def test_explicit_mmididx_writer_trims_padding_and_all_sidecars(tmp_path: Path) 
     row["token_entity_ids"] = [[0, 0, 0, 0, 0]]
     row["token_scope_ids"] = [[0, 0, 0, 0, 0]]
     row["token_source_doc_ids"] = [[1, 1, 1, 0, 0]]
+    row["token_source_identity_ids"] = [[identity_id] * 3 + [0, 0]]
     row["token_confidence_ids"] = [[0, 0, 0, 0, 0]]
     row["doc_ids"] = [[1, 1, 1, 1, 1]]
+    row[converter.SOURCE_IDENTITY_REGISTRY_COLUMN] = [[identity]]
     for name, kind, _dtype in converter.DEFAULT_CPPMEGA_GRAPH_SIDECARS:
         if name == "token_domain_edges":
             row[name] = [[{"from": 0, "to": 2, "kind": 5}]]
@@ -879,8 +1086,7 @@ def test_explicit_mmididx_writer_trims_padding_and_all_sidecars(tmp_path: Path) 
             row[name] = [[3]]
         else:
             row[name] = [[1]]
-    table = _stamp_v3_identity_table(pa, pa.table(row), converter)
-    pq.write_table(table, input_dir / "repo.parquet")
+    pq.write_table(_case5_table(pa, converter, row), input_dir / "repo.parquet")
 
     output_prefix = tmp_path / "cppmega_1024_train"
     converter.convert_parquet_to_megatron(
@@ -907,6 +1113,29 @@ def test_explicit_mmididx_writer_trims_padding_and_all_sidecars(tmp_path: Path) 
         ),
         np.array([1, 1, 1], dtype=np.uint32),
     )
+    identity_sidecar = np.fromfile(
+        tmp_path / "cppmega_1024_train_token_source_identity_ids.bin",
+        dtype=np.uint64,
+    )
+    np.testing.assert_array_equal(
+        identity_sidecar,
+        np.array([identity_id] * 3, dtype=np.uint64),
+    )
+    from cppmega.megatron import structure_dataset_patch
+
+    training_tensor = structure_dataset_patch._token_sidecar_tensor(
+        identity_sidecar,
+        col="source_identity_ids",
+    )
+    assert str(training_tensor.dtype) == "torch.uint64"
+    assert training_tensor.tolist() == [identity_id] * 3
+    np.testing.assert_array_equal(
+        np.fromfile(
+            tmp_path / "cppmega_1024_train_token_symbol_ids.bin",
+            dtype=np.uint64,
+        ),
+        np.array([0, 0, 0], dtype=np.uint64),
+    )
     manifest = json.loads(output_prefix.with_suffix(".json").read_text())
     assert manifest["token_count"] == 3
     assert manifest["source_capacity_token_count"] == 5
@@ -925,6 +1154,23 @@ def test_explicit_mmididx_writer_trims_padding_and_all_sidecars(tmp_path: Path) 
     assert manifest["source_platform_sidecar"]["schema"] == (
         "cppmega_source_platform_v1"
     )
+    receipt = manifest[converter.CASE5_RECEIPT_KEY]
+    assert receipt["status"] == "success"
+    assert receipt["delimiter_contract_sha256"] == (
+        converter.DOMAIN_DELIMITER_CONTRACT_SHA256
+    )
+    assert manifest["source_identity_registry"]["identity_count"] == 1
+    registry_path = tmp_path / manifest["source_identity_registry"]["path"]
+    with sqlite3.connect(registry_path) as registry:
+        stored = registry.execute(
+            "SELECT source_identity_id, canonical_sha256, source "
+            "FROM source_identities"
+        ).fetchone()
+    assert stored == (
+        identity_id.to_bytes(8, "big"),
+        identity["canonical_sha256"],
+        identity["source"],
+    )
 
 
 def test_mmididx_writer_binds_pre_materialized_objective_contract(
@@ -934,6 +1180,9 @@ def test_mmididx_writer_binds_pre_materialized_objective_contract(
     pq = pytest.importorskip("pyarrow.parquet")
     converter = _load_converter_module()
     tasks = tuple(_objective_contract()["task_order"])
+    identities = [
+        _source_identity(f'{{"objective":"{task}"}}') for task in tasks
+    ]
     input_dir = tmp_path / "parquet"
     input_dir.mkdir()
     rows: dict[str, object] = {
@@ -972,9 +1221,15 @@ def test_mmididx_writer_binds_pre_materialized_objective_contract(
     }
     for column, _dtype in OBJECTIVE_TOKEN_SIDE_CHANNELS:
         rows.setdefault(column, [[0, 0, 0, 0] for _task in tasks])
+    rows["token_source_identity_ids"] = [
+        [int(identity["source_identity_id"])] * 4 for identity in identities
+    ]
+    rows[converter.SOURCE_IDENTITY_REGISTRY_COLUMN] = [
+        [identity] for identity in identities
+    ]
     for column, _kind, _dtype in OBJECTIVE_GRAPH_SIDECARS:
         rows.setdefault(column, [[] for _task in tasks])
-    table = _stamp_v3_identity_table(pa, pa.table(rows), converter)
+    table = _case5_table(pa, converter, rows)
     pq.write_table(table, input_dir / "objectives.parquet")
     artifact_path = _write_objective_artifact(input_dir)
     output_prefix = tmp_path / "objective_train"
@@ -1013,11 +1268,16 @@ def test_mmididx_conversion_rejects_invalid_domain_profile_before_success(
         "valid_token_count": [2],
         "input_ids": [[10, 11]],
     }
+    identity = _source_identity('{"source_path":"src/bad.cc"}')
     for name, _dtype in converter.DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS:
         row[name] = [[0, 0]]
     row["doc_ids"] = [[1, 1]]
     row["token_domain_ids"] = [[999, 0]]
     row["token_source_doc_ids"] = [[1, 1]]
+    row["token_source_identity_ids"] = [
+        [int(identity["source_identity_id"])] * 2
+    ]
+    row[converter.SOURCE_IDENTITY_REGISTRY_COLUMN] = [[identity]]
     for name, kind, _dtype in converter.DEFAULT_CPPMEGA_GRAPH_SIDECARS:
         if kind in {"edge_pairs", "edge_triples"}:
             row[name] = [[]]
@@ -1027,8 +1287,7 @@ def test_mmididx_conversion_rejects_invalid_domain_profile_before_success(
             row[name] = [[2]]
         else:
             row[name] = [[1]]
-    table = _stamp_v3_identity_table(pa, pa.table(row), converter)
-    pq.write_table(table, input_dir / "bad.parquet")
+    pq.write_table(_case5_table(pa, converter, row), input_dir / "bad.parquet")
 
     with pytest.raises(ValueError, match="unknown token_domain_ids value 999"):
         converter.convert_parquet_to_megatron(
@@ -1054,6 +1313,10 @@ def test_mmididx_row_group_batching_preserves_document_order_and_offsets(
         "input_ids": [[10, 11, 0, 0], [20, 21, 22, 23], [30, 0, 0, 0]],
         "source_platform_ids": [[[2]], [[3], [4]], [[5]]],
     }
+    identities = [
+        _source_identity(f'{{"source_path":"src/row-{index}.cc"}}')
+        for index in range(4)
+    ]
     for name, _dtype in converter.DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS:
         rows[name] = [
             [1, 2, 90, 90],
@@ -1077,6 +1340,17 @@ def test_mmididx_row_group_batching_preserves_document_order_and_offsets(
     ]
     rows["loss_mask"] = [[1, 0, 0, 0], [1, 1, 0, 1], [0, 0, 0, 0]]
     rows["doc_ids"] = [[1, 1, 0, 0], [1, 1, 2, 2], [1, 0, 0, 0]]
+    rows["token_source_identity_ids"] = [
+        [int(identities[0]["source_identity_id"])] * 2 + [0, 0],
+        [int(identities[1]["source_identity_id"])] * 2
+        + [int(identities[2]["source_identity_id"])] * 2,
+        [int(identities[3]["source_identity_id"]), 0, 0, 0],
+    ]
+    rows[converter.SOURCE_IDENTITY_REGISTRY_COLUMN] = [
+        [identities[0]],
+        [identities[1], identities[2]],
+        [identities[3]],
+    ]
     for name, kind, _dtype in converter.DEFAULT_CPPMEGA_GRAPH_SIDECARS:
         if name == "token_call_edges":
             rows[name] = [[], [{"from": 0, "to": 0}], []]
@@ -1088,8 +1362,11 @@ def test_mmididx_row_group_batching_preserves_document_order_and_offsets(
             rows[name] = [[2], [2, 4], [1]]
         else:
             rows[name] = [[1], [1, 1], [1]]
-    table = _stamp_v3_identity_table(pa, pa.table(rows), converter)
-    pq.write_table(table, input_dir / "repo.parquet", row_group_size=2)
+    pq.write_table(
+        _case5_table(pa, converter, rows),
+        input_dir / "repo.parquet",
+        row_group_size=2,
+    )
 
     output_prefix = tmp_path / "cppmega_train"
     converter.convert_parquet_to_megatron(

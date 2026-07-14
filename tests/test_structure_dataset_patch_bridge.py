@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 import numpy as np
 import pytest
 
@@ -140,6 +141,82 @@ def _assert_distributed_uint64_results(tmp_path: Path) -> None:
         assert all("refusing to narrow" in result["error"] for result in results)
 
 
+def test_opaque_identity_tensor_preserves_full_uint64_bits():
+    identity_id = 2**63 + 0x1234
+
+    tensor = patch._token_sidecar_tensor(
+        np.array([identity_id, 0], dtype=np.uint64),
+        col="source_identity_ids",
+    )
+
+    assert tensor.dtype == torch.uint64
+    assert tensor.tolist() == [identity_id, 0]
+
+    with pytest.raises(ValueError, match="must arrive as uint64"):
+        patch._token_sidecar_tensor(
+            np.array([17], dtype=np.uint32),
+            col="symbol_ids",
+        )
+
+
+def test_case5_training_loader_requires_success_receipt_and_registry(
+    tmp_path,
+    monkeypatch,
+):
+    from cppmega.megatron.domain_route_contract import (
+        CASE5_RECEIPT_KEY,
+        CASE5_SCHEMA_VERSION,
+        DOMAIN_DELIMITER_CONTRACT_SHA256,
+        SOURCE_IDENTITY_REGISTRY_SCHEMA,
+    )
+
+    monkeypatch.setenv("CPPMEGA_STRUCTURE_ENABLED", "1")
+    prefix = tmp_path / "train"
+    prefix.with_suffix(".bin").write_bytes(b"\0")
+    route_dtypes = {
+        "token_domain_ids": "uint16",
+        "token_role_ids": "uint16",
+        "token_entity_ids": "uint32",
+        "token_scope_ids": "uint32",
+        "token_source_doc_ids": "uint32",
+        "token_source_identity_ids": "uint64",
+        "token_confidence_ids": "uint8",
+    }
+    paths = {}
+    for column, dtype in route_dtypes.items():
+        path = tmp_path / f"train_{column}.bin"
+        np.array([1], dtype=dtype).tofile(path)
+        paths[column] = {"path": path.name, "dtype": dtype}
+    registry_path = tmp_path / "train_source_identity_registry.sqlite"
+    registry_path.write_bytes(b"receipt")
+    manifest = {
+        "side_channel_paths": paths,
+        CASE5_RECEIPT_KEY: {
+            "status": "success",
+            "schema": CASE5_SCHEMA_VERSION,
+            "delimiter_contract_sha256": DOMAIN_DELIMITER_CONTRACT_SHA256,
+        },
+        "source_identity_registry": {
+            "schema": SOURCE_IDENTITY_REGISTRY_SCHEMA,
+            "path": registry_path.name,
+        },
+    }
+    prefix.with_suffix(".json").write_text(json.dumps(manifest))
+    dataset = SimpleNamespace(dataset=SimpleNamespace(bin_path=f"{prefix}.bin"))
+
+    loaded = patch._lazy_init_side_channels(dataset)
+
+    assert loaded["token_source_identity_ids"]["dtype"] == np.dtype(np.uint64)
+
+    del manifest[CASE5_RECEIPT_KEY]
+    prefix.with_suffix(".json").write_text(json.dumps(manifest))
+    unreceipted = SimpleNamespace(
+        dataset=SimpleNamespace(bin_path=f"{prefix}.bin")
+    )
+    with pytest.raises(ValueError, match="successful case5_domain_ingestion_receipt"):
+        patch._lazy_init_side_channels(unreceipted)
+
+
 def test_pop_structure_batch_removes_sidecars_and_sets_thread_local():
     batch = {
         "tokens": torch.tensor([[1, 2, 3]]),
@@ -186,7 +263,9 @@ def test_padded_samples_keep_opaque_channels_uint64() -> None:
 
     for col in patch._TOKEN_BATCH_COLS:
         sidecar = patch._padded_token_sidecar_tensor(tokens, col=col)
-        expected_dtype = torch.uint64 if col in patch._OPAQUE_SYMBOL_ID_COLS else torch.long
+        expected_dtype = (
+            torch.uint64 if col in patch._OPAQUE_UINT64_ID_COLS else torch.long
+        )
         assert sidecar.dtype == expected_dtype
         assert sidecar.shape == tokens.shape
         assert sidecar.tolist() == [0, 0, 0, 0]

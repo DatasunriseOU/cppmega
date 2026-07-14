@@ -38,6 +38,7 @@ from data_prep_parquet_to_megatron import (  # noqa: E402
 from data.publish_megatron_bundle_to_nebius_s3 import (  # noqa: E402
     EXPECTED_BUNDLE_TOKENIZER_CONTRACT,
     EXPECTED_VOCAB_SIZE,
+    _validate_prefix_manifest_contract,
     _validate_tokenizer_directory,
 )
 from cppmega.megatron.objective_contract import (  # noqa: E402
@@ -51,6 +52,7 @@ DTYPE_SIZES = {
     "uint8": 1,
     "uint16": 2,
     "uint32": 4,
+    "uint64": 8,
     "int32": 4,
     "int64": 8,
 }
@@ -542,6 +544,7 @@ def _verify_prefix(prefix: Path, expected: dict[str, int]) -> dict[str, object]:
         raise RuntimeError(
             f"{prefix}: objective sample count does not match document_count"
         )
+    _validate_prefix_manifest_contract(prefix)
     return data
 
 

@@ -27,11 +27,14 @@ from __future__ import annotations
 import argparse
 from array import array
 from collections.abc import Mapping
+import hashlib
 import json
 import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 
@@ -57,10 +60,17 @@ from cppmega.megatron.objective_contract import (
     validate_objective_contract,
 )
 from cppmega.megatron.domain_route_contract import (  # noqa: E402
+    CASE5_SCHEMA_METADATA_KEY,
+    CASE5_RECEIPT_KEY,
+    CASE5_SCHEMA_VERSION,
+    DOMAIN_DELIMITER_CONTRACT_METADATA_KEY,
+    DOMAIN_DELIMITER_CONTRACT_SHA256,
     DOMAIN_DELIMITER_ID_TO_DOMAIN,
     DOMAIN_EDGE_KINDS_BY_COLUMN,
     DOMAIN_ROUTE_COLUMNS,
     DOMAIN_START_DELIMITER_IDS,
+    GRAPH_ROUTE_COLUMNS,
+    SOURCE_IDENTITY_REGISTRY_SCHEMA,
     VALID_DOMAIN_CONFIDENCE_IDS,
     VALID_DOMAIN_EDGE_KINDS,
     VALID_DOMAIN_IDS,
@@ -262,6 +272,16 @@ _GRAPH_RELATION_TO_COLUMN = {
 }
 
 UINT32_MAX = int(np.iinfo(np.uint32).max)
+UINT64_MAX = int(np.iinfo(np.uint64).max)
+SOURCE_IDENTITY_REGISTRY_COLUMN = "source_identity_registry"
+_OPAQUE_UINT64_COLUMNS = frozenset(
+    {
+        "token_source_identity_ids",
+        "token_symbol_ids",
+        "token_call_targets",
+        "token_type_refs",
+    }
+)
 
 
 def _resolve_output_dtype(dtype_str: str) -> type[np.generic]:
@@ -361,7 +381,7 @@ def _resolve_token_column(shards: list[str], requested: str) -> str:
 
     if requested != "auto":
         return requested
-    import pyarrow.parquet as pq
+    import pyarrow.parquet as pq  # type: ignore[import-not-found]
 
     names = set(pq.ParquetFile(shards[0]).schema_arrow.names)
     present = [name for name in ("input_ids", "token_ids") if name in names]
@@ -378,7 +398,7 @@ def _resolve_length_column(shards: list[str], requested: str | None) -> str | No
 
     if requested in (None, "", "none"):
         return None
-    import pyarrow.parquet as pq
+    import pyarrow.parquet as pq  # type: ignore[import-not-found]
 
     names = set(pq.ParquetFile(shards[0]).schema_arrow.names)
     if requested == "auto":
@@ -393,7 +413,7 @@ def _resolve_source_platform_sidecar(
 ) -> bool:
     """Resolve auto/required source-platform preservation against the schema."""
 
-    import pyarrow.parquet as pq
+    import pyarrow.parquet as pq  # type: ignore[import-not-found]
 
     present = SOURCE_PLATFORM_IDS_COLUMN in set(
         pq.ParquetFile(shards[0]).schema_arrow.names
@@ -403,6 +423,139 @@ def _resolve_source_platform_sidecar(
             f"required {SOURCE_PLATFORM_IDS_COLUMN} is absent from {shards[0]}"
         )
     return present if requested is None else bool(requested)
+
+
+def _case5_conversion_requested(
+    side_channels: list[str] | None,
+    graph_sidecars: tuple[tuple[str, str, str], ...] | None,
+) -> bool:
+    requested = set(side_channels or ())
+    return bool(requested & set(DOMAIN_ROUTE_COLUMNS)) or bool(graph_sidecars)
+
+
+def _require_case5_sidecar_dtypes(
+    side_channels: list[str] | None,
+    side_channel_dtypes: list[str] | None,
+) -> None:
+    requested = dict(
+        zip(side_channels or (), side_channel_dtypes or (), strict=True)
+    )
+    present_routes = set(DOMAIN_ROUTE_COLUMNS) & set(requested)
+    if present_routes and present_routes != set(DOMAIN_ROUTE_COLUMNS):
+        missing = sorted(set(DOMAIN_ROUTE_COLUMNS) - present_routes)
+        raise ValueError(
+            f"partial CASE5 domain route sidecars are not allowed; missing={missing}"
+        )
+    if "doc_ids" in requested and requested["doc_ids"] != "uint32":
+        raise ValueError("CASE5 row-local doc_ids sidecar must use uint32")
+    invalid = {
+        column: requested[column]
+        for column in _OPAQUE_UINT64_COLUMNS & set(requested)
+        if requested[column] != "uint64"
+    }
+    if invalid:
+        raise ValueError(f"opaque identity sidecars must use uint64: {invalid}")
+
+
+def _require_case5_schema(
+    shards: list[str],
+    *,
+    side_channels: list[str] | None,
+    side_channel_dtypes: list[str] | None,
+    graph_sidecars: tuple[tuple[str, str, str], ...] | None,
+) -> int:
+    """Fail closed on the packed CASE5 Arrow schema and contract receipts."""
+
+    _require_case5_sidecar_dtypes(side_channels, side_channel_dtypes)
+    if not _case5_conversion_requested(side_channels, graph_sidecars):
+        return 0
+    route_columns: set[str] = set(DOMAIN_ROUTE_COLUMNS)
+    missing_output_routes = sorted(route_columns - set(side_channels or ()))
+    if missing_output_routes:
+        raise ValueError(
+            "CASE5 conversion must preserve the complete domain route profile; "
+            f"missing output sidecars={missing_output_routes}"
+        )
+
+    import pyarrow as pa  # type: ignore[import-not-found]
+    import pyarrow.parquet as pq  # type: ignore[import-not-found]
+
+    edge_pair = pa.struct(
+        [pa.field("from", pa.uint16()), pa.field("to", pa.uint16())]
+    )
+    edge_triple = pa.struct(
+        [
+            pa.field("from", pa.uint32()),
+            pa.field("to", pa.uint32()),
+            pa.field("kind", pa.int32()),
+        ]
+    )
+    source_identity = pa.struct(
+        [
+            pa.field("source_identity_id", pa.uint64(), nullable=False),
+            pa.field("canonical_sha256", pa.string(), nullable=False),
+            pa.field("source", pa.string(), nullable=False),
+        ]
+    )
+    expected_types = {
+        "doc_ids": pa.list_(pa.uint32()),
+        "token_domain_ids": pa.list_(pa.uint16()),
+        "token_role_ids": pa.list_(pa.uint16()),
+        "token_entity_ids": pa.list_(pa.uint32()),
+        "token_scope_ids": pa.list_(pa.uint32()),
+        "token_source_doc_ids": pa.list_(pa.uint32()),
+        "token_source_identity_ids": pa.list_(pa.uint64()),
+        "token_confidence_ids": pa.list_(pa.uint8()),
+        "token_symbol_ids": pa.list_(pa.uint64()),
+        "token_call_targets": pa.list_(pa.uint64()),
+        "token_type_refs": pa.list_(pa.uint64()),
+        "token_call_edges": pa.list_(edge_pair),
+        "token_type_edges": pa.list_(edge_pair),
+        **{
+            column: pa.list_(edge_triple)
+            for column in DOMAIN_EDGE_KINDS_BY_COLUMN
+        },
+        "token_chunk_starts": pa.list_(pa.uint32()),
+        "token_chunk_ends": pa.list_(pa.uint32()),
+        "token_chunk_kinds": pa.list_(pa.uint8()),
+        "token_chunk_dep_levels": pa.list_(pa.uint16()),
+        SOURCE_IDENTITY_REGISTRY_COLUMN: pa.list_(source_identity),
+    }
+    for shard in shards:
+        schema = pq.ParquetFile(shard).schema_arrow
+        missing = sorted(set(expected_types) - set(schema.names))
+        if missing:
+            raise ValueError(
+                f"{shard}: incomplete CASE5 packed schema; missing={missing}"
+            )
+        wrong_types = {
+            column: str(schema.field(column).type)
+            for column, expected in expected_types.items()
+            if schema.field(column).type != expected
+        }
+        if wrong_types:
+            raise ValueError(
+                f"{shard}: CASE5 Arrow types differ from the contract: {wrong_types}"
+            )
+        metadata = schema.metadata or {}
+        expected_metadata = {
+            CASE5_SCHEMA_METADATA_KEY.encode("utf-8"): CASE5_SCHEMA_VERSION.encode(
+                "utf-8"
+            ),
+            DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode(
+                "utf-8"
+            ): DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii"),
+        }
+        bad_metadata = {
+            key.decode("utf-8"): metadata.get(key)
+            for key, expected in expected_metadata.items()
+            if metadata.get(key) != expected
+        }
+        if bad_metadata:
+            raise ValueError(
+                f"{shard}: missing or stale CASE5 receipt metadata: {bad_metadata}"
+            )
+    return len(shards)
 
 
 def _row_token_length(
@@ -416,12 +569,12 @@ def _row_token_length(
     if length_column is None:
         return capacity
     if hasattr(raw_length, "as_py"):
-        raw_length = raw_length.as_py()
+        raw_length = cast(Any, raw_length).as_py()
     if raw_length is None:
         raise ValueError(
             f"length column {length_column} is null at {shard_path}#row{row_idx}"
         )
-    length = int(raw_length)
+    length = int(cast(Any, raw_length))
     if length <= 0 or length > capacity:
         raise ValueError(
             f"length column {length_column}={length} is outside [1, {capacity}] "
@@ -447,7 +600,7 @@ def _validate_token_ids(
             f"token ids [{min_id}, {max_id}] are outside vocab [0, {vocab_size}) "
             f"at {shard_path}#row{row_idx}"
         )
-    info = np.iinfo(dtype)
+    info = np.iinfo(dtype)  # pyright: ignore[reportCallIssue, reportArgumentType]
     if max_id > info.max:
         raise ValueError(
             f"token id {max_id} exceeds output dtype {np.dtype(dtype).name} max "
@@ -491,7 +644,8 @@ def _validate_domain_route_sidecars(
     if not present:
         return
     if len(present) != len(DOMAIN_ROUTE_COLUMNS):
-        missing = sorted(set(DOMAIN_ROUTE_COLUMNS) - set(present))
+        route_columns: set[str] = set(DOMAIN_ROUTE_COLUMNS)
+        missing = sorted(route_columns - set(present))
         raise ValueError(
             "domain routing requires the complete token-aligned domain route "
             f"profile at {shard_path}#row{row_idx}; missing={missing}"
@@ -538,6 +692,14 @@ def _validate_domain_route_sidecars(
         raise ValueError(
             "token_source_doc_ids must preserve a positive source document ID "
             f"for every valid token at {shard_path}#row{row_idx}"
+        )
+    if any(
+        value <= 0 or value > UINT64_MAX
+        for value in vectors["token_source_identity_ids"]
+    ):
+        raise ValueError(
+            "token_source_identity_ids must preserve a positive uint64 registry "
+            f"foreign key for every valid token at {shard_path}#row{row_idx}"
         )
 
     domains = vectors["token_domain_ids"]
@@ -857,6 +1019,178 @@ def _normalize_ragged_int_vector(
     return arr.astype(dtype, copy=False)
 
 
+def _source_identity_id_from_digest(digest: bytes) -> int:
+    value = int.from_bytes(digest[:8], "big", signed=False)
+    if value == 0:
+        value = int.from_bytes(digest[8:16], "big", signed=False)
+    if value == 0:
+        raise ValueError("SHA256 digest produced reserved source identity 0")
+    return value
+
+
+class _SourceIdentityRegistryWriter:
+    """Persist full source witnesses and sequence-to-identity relations."""
+
+    def __init__(self, output_prefix: str) -> None:
+        self._output_prefix = output_prefix
+        self._path = f"{output_prefix}_{SOURCE_IDENTITY_REGISTRY_COLUMN}.sqlite"
+        if os.path.exists(self._path):
+            os.remove(self._path)
+        self._db = sqlite3.connect(self._path)
+        self._db.execute("PRAGMA foreign_keys = ON")
+        self._db.executescript(
+            """
+            CREATE TABLE source_identities (
+                source_identity_id BLOB PRIMARY KEY CHECK(length(source_identity_id) = 8),
+                canonical_sha256 TEXT NOT NULL CHECK(length(canonical_sha256) = 64),
+                source TEXT NOT NULL CHECK(length(source) > 0)
+            );
+            CREATE TABLE sequence_source_identities (
+                sequence_index INTEGER NOT NULL,
+                source_identity_id BLOB NOT NULL,
+                PRIMARY KEY(sequence_index, source_identity_id),
+                FOREIGN KEY(source_identity_id)
+                    REFERENCES source_identities(source_identity_id)
+            );
+            """
+        )
+        self._sequence_count = 0
+        self._identity_count = 0
+        self._reference_count = 0
+        self._closed = False
+
+    def append(
+        self,
+        value: object,
+        *,
+        source_identity_ids: list[int] | np.ndarray,
+        token_count: int,
+        shard_path: str,
+        row_idx: int,
+    ) -> None:
+        if self._closed:
+            raise RuntimeError("source identity registry writer is already closed")
+        entries = cast(Any, value).as_py() if hasattr(value, "as_py") else value
+        if not isinstance(entries, list) or not entries:
+            raise ValueError(
+                f"{SOURCE_IDENTITY_REGISTRY_COLUMN} must be a non-empty list at "
+                f"{shard_path}#row{row_idx}"
+            )
+        if len(source_identity_ids) < token_count:
+            raise ValueError(
+                f"token_source_identity_ids length {len(source_identity_ids)} < "
+                f"valid token count {token_count} at {shard_path}#row{row_idx}"
+            )
+        referenced = {
+            int(raw) for raw in source_identity_ids[:token_count]
+        }
+        if not referenced or any(
+            value <= 0 or value > UINT64_MAX for value in referenced
+        ):
+            raise ValueError(
+                "token_source_identity_ids must contain positive uint64 registry "
+                f"foreign keys at {shard_path}#row{row_idx}"
+            )
+
+        row_registry: dict[int, tuple[str, str]] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"{SOURCE_IDENTITY_REGISTRY_COLUMN} entries must be structs at "
+                    f"{shard_path}#row{row_idx}"
+                )
+            source = entry.get("source")
+            digest_text = entry.get("canonical_sha256")
+            if not isinstance(source, str) or not source:
+                raise ValueError(
+                    f"source identity registry has empty source at "
+                    f"{shard_path}#row{row_idx}"
+                )
+            digest = hashlib.sha256(source.encode("utf-8")).digest()
+            expected_digest = digest.hex()
+            identity_id = int(entry.get("source_identity_id", 0))
+            if (
+                digest_text != expected_digest
+                or identity_id != _source_identity_id_from_digest(digest)
+            ):
+                raise ValueError(
+                    "source identity registry entry does not match its full "
+                    f"canonical source SHA256 at {shard_path}#row{row_idx}: "
+                    f"id={identity_id} digest={digest_text!r}"
+                )
+            previous = row_registry.get(identity_id)
+            witness = (expected_digest, source)
+            if previous is not None and previous != witness:
+                raise ValueError(
+                    f"source identity uint64 collision for id {identity_id} at "
+                    f"{shard_path}#row{row_idx}"
+                )
+            row_registry[identity_id] = witness
+
+        missing = sorted(referenced - set(row_registry))
+        if missing:
+            raise ValueError(
+                "source identity registry missing token foreign keys at "
+                f"{shard_path}#row{row_idx}: {missing[:8]}"
+            )
+
+        for identity_id, (digest_text, source) in row_registry.items():
+            identity_key = identity_id.to_bytes(8, "big", signed=False)
+            existing = self._db.execute(
+                "SELECT canonical_sha256, source FROM source_identities "
+                "WHERE source_identity_id = ?",
+                (identity_key,),
+            ).fetchone()
+            if existing is not None and existing != (digest_text, source):
+                raise ValueError(
+                    f"source identity uint64 collision for id {identity_id} across "
+                    f"packed rows at {shard_path}#row{row_idx}"
+                )
+            if existing is None:
+                self._db.execute(
+                    "INSERT INTO source_identities "
+                    "(source_identity_id, canonical_sha256, source) VALUES (?, ?, ?)",
+                    (identity_key, digest_text, source),
+                )
+                self._identity_count += 1
+            self._db.execute(
+                "INSERT INTO sequence_source_identities "
+                "(sequence_index, source_identity_id) VALUES (?, ?)",
+                (self._sequence_count, identity_key),
+            )
+            self._reference_count += 1
+        self._sequence_count += 1
+
+    def flush(self) -> None:
+        if self._closed:
+            raise RuntimeError("source identity registry writer is already closed")
+        self._db.commit()
+
+    def close(self) -> dict[str, object]:
+        if self._closed:
+            raise RuntimeError("source identity registry writer is already closed")
+        self._db.commit()
+        self._db.close()
+        self._closed = True
+        return {
+            "schema": SOURCE_IDENTITY_REGISTRY_SCHEMA,
+            "path": os.path.basename(self._path),
+            "id_encoding": "uint64_be",
+            "canonical_digest": "sha256",
+            "sequence_count": self._sequence_count,
+            "identity_count": self._identity_count,
+            "sequence_identity_reference_count": self._reference_count,
+            "token_foreign_key_sidecar": "token_source_identity_ids",
+        }
+
+    def abort_close(self) -> None:
+        if self._closed:
+            return
+        self._db.rollback()
+        self._db.close()
+        self._closed = True
+
+
 class _GraphSidecarWriters:
     """Write document-aligned CSR-style graph sidecars next to .bin/.idx."""
 
@@ -1063,7 +1397,7 @@ class _SourcePlatformSidecarWriter:
             raise ValueError(
                 f"{SOURCE_PLATFORM_IDS_COLUMN} is null at {shard_path}#row{row_idx}"
             )
-        groups = value.as_py() if hasattr(value, "as_py") else value
+        groups = cast(Any, value).as_py() if hasattr(value, "as_py") else value
         if not isinstance(groups, list) or not groups:
             raise ValueError(
                 f"{SOURCE_PLATFORM_IDS_COLUMN} must contain one platform bag per "
@@ -1398,6 +1732,30 @@ def _add_source_platform_manifest(
         sidecar_data["source_platform_sidecar"] = source_platform_sidecar
 
 
+def _add_case5_manifest(
+    sidecar_data: dict[str, object],
+    *,
+    validated_shard_count: int,
+    source_identity_registry: dict[str, object] | None,
+    graph_sidecars_written: bool,
+) -> None:
+    if validated_shard_count == 0:
+        return
+    if source_identity_registry is None:
+        raise RuntimeError("CASE5 conversion completed without an identity registry")
+    sidecar_data["source_identity_registry"] = source_identity_registry
+    sidecar_data[CASE5_RECEIPT_KEY] = {
+        "status": "success",
+        "schema": CASE5_SCHEMA_VERSION,
+        "validated_shard_count": validated_shard_count,
+        "delimiter_contract_sha256": DOMAIN_DELIMITER_CONTRACT_SHA256,
+        "domain_route_columns": list(DOMAIN_ROUTE_COLUMNS),
+        "graph_route_columns": list(GRAPH_ROUTE_COLUMNS),
+        "graph_sidecars_written": graph_sidecars_written,
+        "source_identity_registry_schema": SOURCE_IDENTITY_REGISTRY_SCHEMA,
+    }
+
+
 def _convert_parquet_to_numpy(
     input_dir: str,
     output_prefix: str,
@@ -1420,7 +1778,7 @@ def _convert_parquet_to_numpy(
     - .idx: magic(9), version(1), dtype_code(1), num_sequences(8), num_documents(8),
             then sizes[num_docs] as int32, then pointers[num_docs] as int64
     """
-    import pyarrow.parquet as pq
+    import pyarrow.parquet as pq  # type: ignore[import-not-found]
     import struct
 
     dtype = _resolve_output_dtype(dtype_str)
@@ -1431,6 +1789,12 @@ def _convert_parquet_to_numpy(
     length_column = _resolve_length_column(shards, length_column)
     symbol_identity_schema_version = _require_symbol_identity_schema(shards)
     _require_symbol_sidecar_dtypes(side_channels, side_channel_dtypes)
+    case5_shard_count = _require_case5_schema(
+        shards,
+        side_channels=side_channels,
+        side_channel_dtypes=side_channel_dtypes,
+        graph_sidecars=graph_sidecars,
+    )
     write_source_platform = _resolve_source_platform_sidecar(
         shards, source_platform_sidecar
     )
@@ -1453,6 +1817,11 @@ def _convert_parquet_to_numpy(
         if write_source_platform
         else None
     )
+    source_identity_writer = (
+        _SourceIdentityRegistryWriter(output_prefix)
+        if case5_shard_count
+        else None
+    )
     graph_columns = graph_writers.columns if graph_writers is not None else []
     _validate_objective_conversion_config(
         objective_contract,
@@ -1468,6 +1837,7 @@ def _convert_parquet_to_numpy(
         graph_columns,
         [SOURCE_PLATFORM_IDS_COLUMN] if write_source_platform else None,
         [OBJECTIVE_KIND_COLUMN] if objective_contract is not None else None,
+        [SOURCE_IDENTITY_REGISTRY_COLUMN] if case5_shard_count else None,
     )
 
     bin_path = output_prefix + ".bin"
@@ -1487,6 +1857,7 @@ def _convert_parquet_to_numpy(
         else None
     )
     objective_manifest: dict[str, object] | None = None
+    source_identity_paths: dict[str, object] | None = None
 
     try:
         with open(bin_path, "wb") as bin_fh:
@@ -1506,6 +1877,11 @@ def _convert_parquet_to_numpy(
                     source_platform_col = (
                         table.column(SOURCE_PLATFORM_IDS_COLUMN)
                         if write_source_platform
+                        else None
+                    )
+                    source_identity_col = (
+                        table.column(SOURCE_IDENTITY_REGISTRY_COLUMN)
+                        if source_identity_writer is not None
                         else None
                     )
                     row_count = len(token_col)
@@ -1538,10 +1914,13 @@ def _convert_parquet_to_numpy(
                             f"token ids [{min_id}, {max_id}] are outside vocab "
                             f"[0, {vocab_size}) at {shard_path}#row_group{rg_idx}"
                         )
-                    if max_id > np.iinfo(dtype).max:
+                    dtype_info = np.iinfo(  # pyright: ignore[reportCallIssue, reportArgumentType]
+                        dtype  # pyright: ignore[reportArgumentType]
+                    )
+                    if max_id > dtype_info.max:
                         raise ValueError(
                             f"token id {max_id} exceeds output dtype "
-                            f"{np.dtype(dtype).name} max {np.iinfo(dtype).max} at "
+                            f"{np.dtype(dtype).name} max {dtype_info.max} at "
                             f"{shard_path}#row_group{rg_idx}"
                         )
 
@@ -1595,6 +1974,7 @@ def _convert_parquet_to_numpy(
                                 token_count=token_count,
                             )
                         if source_platform_writer is not None:
+                            assert source_platform_col is not None
                             source_platform_writer.append(
                                 source_platform_col[row_idx],
                                 doc_ids=side_matrices["doc_ids"][row_idx].tolist(),
@@ -1616,10 +1996,23 @@ def _convert_parquet_to_numpy(
                                 shard_path=shard_path,
                                 row_idx=row_idx,
                             )
+                        if source_identity_writer is not None:
+                            assert source_identity_col is not None
+                            source_identity_writer.append(
+                                source_identity_col[row_idx],
+                                source_identity_ids=side_matrices[
+                                    "token_source_identity_ids"
+                                ][row_idx],
+                                token_count=token_count,
+                                shard_path=shard_path,
+                                row_idx=row_idx,
+                            )
                     if graph_writers is not None:
                         graph_writers.flush()
                     if source_platform_writer is not None:
                         source_platform_writer.flush()
+                    if source_identity_writer is not None:
+                        source_identity_writer.flush()
 
                     group_tokens = int(lengths.sum(dtype=np.int64))
                     total_tokens += group_tokens
@@ -1638,6 +2031,11 @@ def _convert_parquet_to_numpy(
         )
         if objective_tracker is not None:
             objective_manifest = objective_tracker.close()
+        source_identity_paths = (
+            source_identity_writer.close()
+            if source_identity_writer is not None
+            else None
+        )
     except Exception:
         if graph_writers is not None:
             graph_writers.abort_close()
@@ -1645,6 +2043,8 @@ def _convert_parquet_to_numpy(
             source_platform_writer.abort_close()
         if objective_tracker is not None:
             objective_tracker.abort_close()
+        if source_identity_writer is not None:
+            source_identity_writer.abort_close()
         raise
     finally:
         for writer in side_writers.values():
@@ -1703,6 +2103,12 @@ def _convert_parquet_to_numpy(
         sidecar_data["objective_materialization"] = dict(
             objective_artifact_manifest
         )
+    _add_case5_manifest(
+        sidecar_data,
+        validated_shard_count=case5_shard_count,
+        source_identity_registry=source_identity_paths,
+        graph_sidecars_written=graph_writers is not None,
+    )
 
     with open(json_path, "w", encoding="utf-8") as jf:
         json.dump(sidecar_data, jf, indent=4)
@@ -1736,7 +2142,7 @@ def convert_parquet_to_megatron(
     MMIDIDX layout.  It is never selected as an automatic fallback when the
     Megatron import is broken.
     """
-    import pyarrow.parquet as pq
+    import pyarrow.parquet as pq  # type: ignore[import-not-found]
     import json
 
     objective_artifact: ObjectiveMaterializationArtifact | None = None
@@ -1839,6 +2245,12 @@ def convert_parquet_to_megatron(
     length_column = _resolve_length_column(shards, length_column)
     symbol_identity_schema_version = _require_symbol_identity_schema(shards)
     _require_symbol_sidecar_dtypes(side_channels, side_channel_dtypes)
+    case5_shard_count = _require_case5_schema(
+        shards,
+        side_channels=side_channels,
+        side_channel_dtypes=side_channel_dtypes,
+        graph_sidecars=graph_sidecars,
+    )
     write_source_platform = _resolve_source_platform_sidecar(
         shards, source_platform_sidecar
     )
@@ -1873,6 +2285,11 @@ def convert_parquet_to_megatron(
         if write_source_platform
         else None
     )
+    source_identity_writer = (
+        _SourceIdentityRegistryWriter(output_prefix)
+        if case5_shard_count
+        else None
+    )
     graph_columns = graph_writers.columns if graph_writers is not None else []
     _validate_objective_conversion_config(
         objective_contract,
@@ -1888,6 +2305,7 @@ def convert_parquet_to_megatron(
         else None
     )
     objective_manifest: dict[str, object] | None = None
+    source_identity_paths: dict[str, object] | None = None
 
     total_docs = 0
     total_tokens = 0
@@ -1902,6 +2320,7 @@ def convert_parquet_to_megatron(
         graph_columns,
         [SOURCE_PLATFORM_IDS_COLUMN] if write_source_platform else None,
         [OBJECTIVE_KIND_COLUMN] if objective_contract is not None else None,
+        [SOURCE_IDENTITY_REGISTRY_COLUMN] if case5_shard_count else None,
     )
 
     try:
@@ -1921,6 +2340,11 @@ def convert_parquet_to_megatron(
                 source_platform_col = (
                     table.column(SOURCE_PLATFORM_IDS_COLUMN)
                     if write_source_platform
+                    else None
+                )
+                source_identity_col = (
+                    table.column(SOURCE_IDENTITY_REGISTRY_COLUMN)
+                    if source_identity_writer is not None
                     else None
                 )
                 for row_idx in range(len(token_col)):
@@ -1981,6 +2405,7 @@ def convert_parquet_to_megatron(
                             token_count=token_count,
                         )
                     if source_platform_writer is not None:
+                        assert source_platform_col is not None
                         source_platform_writer.append(
                             source_platform_col[row_idx],
                             doc_ids=side_cols["doc_ids"][row_idx].as_py(),
@@ -1999,6 +2424,17 @@ def convert_parquet_to_megatron(
                             loss_mask=trimmed_side_values["loss_mask"],
                             document_ids=trimmed_side_values["doc_ids"],
                             graph_values=graph_values,
+                            shard_path=shard_path,
+                            row_idx=row_idx,
+                        )
+                    if source_identity_writer is not None:
+                        assert source_identity_col is not None
+                        source_identity_writer.append(
+                            source_identity_col[row_idx],
+                            source_identity_ids=trimmed_side_values[
+                                "token_source_identity_ids"
+                            ],
+                            token_count=token_count,
                             shard_path=shard_path,
                             row_idx=row_idx,
                         )
@@ -2024,6 +2460,11 @@ def convert_parquet_to_megatron(
         )
         if objective_tracker is not None:
             objective_manifest = objective_tracker.close()
+        source_identity_paths = (
+            source_identity_writer.close()
+            if source_identity_writer is not None
+            else None
+        )
     except Exception:
         if graph_writers is not None:
             graph_writers.abort_close()
@@ -2031,6 +2472,8 @@ def convert_parquet_to_megatron(
             source_platform_writer.abort_close()
         if objective_tracker is not None:
             objective_tracker.abort_close()
+        if source_identity_writer is not None:
+            source_identity_writer.abort_close()
         raise
     finally:
         for writer in side_writers.values():
@@ -2068,6 +2511,12 @@ def convert_parquet_to_megatron(
         sidecar_data["objective_materialization"] = dict(
             objective_artifact_manifest
         )
+    _add_case5_manifest(
+        sidecar_data,
+        validated_shard_count=case5_shard_count,
+        source_identity_registry=source_identity_paths,
+        graph_sidecars_written=graph_writers is not None,
+    )
 
     with open(json_path, "w", encoding="utf-8") as jf:
         json.dump(sidecar_data, jf, indent=4)

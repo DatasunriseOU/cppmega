@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -35,6 +36,7 @@ DOMAIN_ROUTE_COLUMNS = (
     "token_entity_ids",
     "token_scope_ids",
     "token_source_doc_ids",
+    "token_source_identity_ids",
     "token_confidence_ids",
 )
 
@@ -94,6 +96,7 @@ if not isinstance(_ASSIGNMENTS, dict) or not isinstance(_DELIMITER_ROLES, dict):
 DOMAIN_DELIMITER_ID_TO_DOMAIN: dict[int, int] = {}
 _start_ids: set[int] = set()
 _end_ids: set[int] = set()
+_delimiter_token_ids: dict[str, int] = {}
 for domain_name, raw_spec in _DELIMITER_ROLES.items():
     if not isinstance(raw_spec, dict):
         raise RuntimeError(f"invalid delimiter spec for {domain_name!r}")
@@ -108,14 +111,33 @@ for domain_name, raw_spec in _DELIMITER_ROLES.items():
         if token_id in DOMAIN_DELIMITER_ID_TO_DOMAIN:
             raise RuntimeError(f"duplicate domain delimiter token id {token_id}")
         DOMAIN_DELIMITER_ID_TO_DOMAIN[token_id] = domain_id
+        _delimiter_token_ids[str(role)] = token_id
         target.add(token_id)
 
 DOMAIN_START_DELIMITER_IDS = frozenset(_start_ids)
 DOMAIN_END_DELIMITER_IDS = frozenset(_end_ids)
+DOMAIN_DELIMITER_TOKEN_IDS = dict(sorted(_delimiter_token_ids.items()))
+DOMAIN_DELIMITER_CONTRACT_METADATA_KEY = (
+    "cppmega.domain_delimiter_contract_sha256"
+)
+DOMAIN_DELIMITER_CONTRACT_SHA256 = hashlib.sha256(
+    json.dumps(
+        DOMAIN_DELIMITER_TOKEN_IDS,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
+CASE5_SCHEMA_METADATA_KEY = "cppmega.case5_schema"
+CASE5_SCHEMA_VERSION = "case5_domain_routes_v1"
+CASE5_RECEIPT_KEY = "case5_domain_ingestion_receipt"
+SOURCE_IDENTITY_REGISTRY_SCHEMA = "cppmega_source_identity_registry_v1"
 
 
 __all__ = [
     "DOMAIN_DELIMITER_ID_TO_DOMAIN",
+    "DOMAIN_DELIMITER_CONTRACT_METADATA_KEY",
+    "DOMAIN_DELIMITER_CONTRACT_SHA256",
+    "DOMAIN_DELIMITER_TOKEN_IDS",
     "DOMAIN_EDGE_KINDS_BY_COLUMN",
     "DOMAIN_END_DELIMITER_IDS",
     "DOMAIN_ROUTE_COLUMNS",
@@ -126,4 +148,8 @@ __all__ = [
     "VALID_DOMAIN_EDGE_KINDS",
     "VALID_DOMAIN_IDS",
     "VALID_DOMAIN_ROLE_IDS",
+    "CASE5_SCHEMA_METADATA_KEY",
+    "CASE5_RECEIPT_KEY",
+    "CASE5_SCHEMA_VERSION",
+    "SOURCE_IDENTITY_REGISTRY_SCHEMA",
 ]

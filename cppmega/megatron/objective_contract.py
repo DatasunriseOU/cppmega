@@ -29,12 +29,13 @@ OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA = (
 )
 OBJECTIVE_TOKEN_SIDE_CHANNELS: tuple[tuple[str, str], ...] = (
     ("loss_mask", "uint8"),
-    ("doc_ids", "uint16"),
+    ("doc_ids", "uint32"),
     ("token_domain_ids", "uint16"),
     ("token_role_ids", "uint16"),
     ("token_entity_ids", "uint32"),
     ("token_scope_ids", "uint32"),
     ("token_source_doc_ids", "uint32"),
+    ("token_source_identity_ids", "uint64"),
     ("token_confidence_ids", "uint8"),
     ("token_structure_ids", "uint8"),
     ("token_dep_levels", "uint16"),

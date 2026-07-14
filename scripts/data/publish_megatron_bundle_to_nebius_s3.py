@@ -23,6 +23,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -38,8 +39,18 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from cppmega.megatron.objective_contract import (  # noqa: E402
+    OBJECTIVE_GRAPH_SIDECARS,
+    OBJECTIVE_TOKEN_SIDE_CHANNELS,
     validate_materialized_objective_contract,
     validate_objective_contract,
+)
+from cppmega.megatron.domain_route_contract import (  # noqa: E402
+    CASE5_RECEIPT_KEY,
+    CASE5_SCHEMA_VERSION,
+    DOMAIN_DELIMITER_CONTRACT_SHA256,
+    DOMAIN_ROUTE_COLUMNS,
+    GRAPH_ROUTE_COLUMNS,
+    SOURCE_IDENTITY_REGISTRY_SCHEMA,
 )
 
 
@@ -125,42 +136,18 @@ DTYPE_SIZES = {
     "uint8": 1,
     "uint16": 2,
     "uint32": 4,
+    "uint64": 8,
     "int32": 4,
     "int64": 8,
 }
-TOKEN_SIDECAR_DTYPES = {
-    "loss_mask": "uint8",
-    "doc_ids": "uint16",
-    "token_domain_ids": "uint16",
-    "token_role_ids": "uint16",
-    "token_entity_ids": "uint32",
-    "token_scope_ids": "uint32",
-    "token_source_doc_ids": "uint32",
-    "token_confidence_ids": "uint8",
-    "token_structure_ids": "uint8",
-    "token_dep_levels": "uint16",
-    "token_ast_depth": "uint16",
-    "token_sibling_index": "uint16",
-    "token_ast_node_type": "uint16",
-    "token_symbol_ids": "uint32",
-    "token_call_targets": "uint32",
-    "token_type_refs": "uint32",
-    "token_def_use": "uint8",
-    "token_change_mask_pre": "uint8",
-    "token_change_mask_post": "uint8",
-}
+TOKEN_SIDECAR_DTYPES = dict(OBJECTIVE_TOKEN_SIDE_CHANNELS)
 GRAPH_SIDECAR_SPECS = {
-    "token_call_edges": ("edge_pairs", "int32", [2]),
-    "token_type_edges": ("edge_pairs", "int32", [2]),
-    "token_domain_edges": ("edge_triples", "int32", [3]),
-    "token_build_edges": ("edge_triples", "int32", [3]),
-    "token_shell_edges": ("edge_triples", "int32", [3]),
-    "token_diagnostic_edges": ("edge_triples", "int32", [3]),
-    "token_cross_domain_edges": ("edge_triples", "int32", [3]),
-    "token_chunk_starts": ("ragged_1d", "uint32", [1]),
-    "token_chunk_ends": ("ragged_1d", "uint32", [1]),
-    "token_chunk_kinds": ("ragged_1d", "uint16", [1]),
-    "token_chunk_dep_levels": ("ragged_1d", "uint16", [1]),
+    name: (
+        kind,
+        dtype,
+        [2] if kind == "edge_pairs" else [3] if kind == "edge_triples" else [1],
+    )
+    for name, kind, dtype in OBJECTIVE_GRAPH_SIDECARS
 }
 REQUIRED_TOKEN_SIDECARS = set(TOKEN_SIDECAR_DTYPES)
 REQUIRED_GRAPH_SIDECARS = set(GRAPH_SIDECAR_SPECS)
@@ -395,6 +382,7 @@ def _numpy_dtype(name: str) -> np.dtype:
             "uint8": "<u1",
             "uint16": "<u2",
             "uint32": "<u4",
+            "uint64": "<u8",
             "int32": "<i4",
             "int64": "<i8",
         }[name]
@@ -452,6 +440,12 @@ def _validate_token_semantics(
         dtype="<u4",
         shape=(token_count,),
     )
+    source_identity_ids = np.memmap(
+        sidecar_files["token_source_identity_ids"],
+        mode="r",
+        dtype="<u8",
+        shape=(token_count,),
+    )
     valid_domains = frozenset(
         int(value) for value in CANONICAL_DOMAIN_SCHEMA["domain_kinds"].values()
     )
@@ -472,6 +466,11 @@ def _validate_token_semantics(
         if np.any(sequence_sources == 0):
             raise ValueError(
                 "token_source_doc_ids must be positive for every valid token: "
+                f"sequence={sequence_index}"
+            )
+        if np.any(source_identity_ids[start:end] == 0):
+            raise ValueError(
+                "token_source_identity_ids must be positive for every valid token: "
                 f"sequence={sequence_index}"
             )
         sequence_domains = domain_ids[start:end]
@@ -530,6 +529,7 @@ def _validate_token_semantics(
     return {
         "token_count": token_count,
         "minimum_source_doc_id": int(source_ids.min()),
+        "minimum_source_identity_id": int(source_identity_ids.min()),
         "delimiter_count": delimiter_count,
         "balanced_delimiter_pairs": balanced_pairs,
     }
@@ -668,6 +668,162 @@ def _validate_graph_provenance(
     return {"route_edge_count": sum(active.values()), "route_edge_counts": active}
 
 
+def _source_identity_id(source: str) -> int:
+    digest = hashlib.sha256(source.encode("utf-8")).digest()
+    value = int.from_bytes(digest[:8], "big", signed=False)
+    if value == 0:
+        value = int.from_bytes(digest[8:16], "big", signed=False)
+    if value == 0:
+        raise ValueError("source identity SHA256 maps to reserved ID 0")
+    return value
+
+
+def _decode_source_identity_key(raw: object) -> int:
+    if not isinstance(raw, (bytes, bytearray, memoryview)):
+        raise ValueError("source identity registry key must be an 8-byte BLOB")
+    value = bytes(raw)
+    if len(value) != 8:
+        raise ValueError("source identity registry key must be an 8-byte BLOB")
+    return int.from_bytes(value, "big", signed=False)
+
+
+def _validate_case5_source_registry(
+    *,
+    prefix: Path,
+    manifest: dict,
+    lengths: list[int],
+    source_identity_sidecar: Path,
+) -> Path:
+    receipt = manifest.get(CASE5_RECEIPT_KEY)
+    if not isinstance(receipt, dict) or receipt.get("status") != "success":
+        raise ValueError(f"{prefix}: successful {CASE5_RECEIPT_KEY} is required")
+    expected_receipt = {
+        "schema": CASE5_SCHEMA_VERSION,
+        "delimiter_contract_sha256": DOMAIN_DELIMITER_CONTRACT_SHA256,
+        "domain_route_columns": list(DOMAIN_ROUTE_COLUMNS),
+        "graph_route_columns": list(GRAPH_ROUTE_COLUMNS),
+        "graph_sidecars_written": True,
+        "source_identity_registry_schema": SOURCE_IDENTITY_REGISTRY_SCHEMA,
+    }
+    drift = {
+        key: receipt.get(key)
+        for key, expected in expected_receipt.items()
+        if receipt.get(key) != expected
+    }
+    if drift:
+        raise ValueError(f"{prefix}: stale CASE5 ingestion receipt fields: {drift}")
+
+    registry = manifest.get("source_identity_registry")
+    if not isinstance(registry, dict):
+        raise ValueError(f"{prefix}: source_identity_registry receipt is required")
+    expected_registry = {
+        "schema": SOURCE_IDENTITY_REGISTRY_SCHEMA,
+        "id_encoding": "uint64_be",
+        "canonical_digest": "sha256",
+        "sequence_count": len(lengths),
+        "token_foreign_key_sidecar": "token_source_identity_ids",
+    }
+    registry_drift = {
+        key: registry.get(key)
+        for key, expected in expected_registry.items()
+        if registry.get(key) != expected
+    }
+    if registry_drift:
+        raise ValueError(f"{prefix}: invalid source identity registry receipt: {registry_drift}")
+    registry_path = _safe_prefix_file(prefix.parent, str(registry.get("path", "")))
+    if registry_path.is_symlink() or not registry_path.is_file():
+        raise FileNotFoundError(registry_path)
+
+    token_count = sum(lengths)
+    token_ids = np.memmap(
+        source_identity_sidecar,
+        mode="r",
+        dtype="<u8",
+        shape=(token_count,),
+    )
+    connection = sqlite3.connect(
+        f"{registry_path.as_uri()}?mode=ro&immutable=1",
+        uri=True,
+    )
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+        if integrity != ("ok",):
+            raise ValueError(f"{prefix}: source identity registry integrity failed")
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        required_tables = {"source_identities", "sequence_source_identities"}
+        if not required_tables.issubset(tables):
+            raise ValueError(
+                f"{prefix}: source identity registry tables missing: "
+                f"{sorted(required_tables - tables)}"
+            )
+
+        identity_count = int(
+            connection.execute("SELECT COUNT(*) FROM source_identities").fetchone()[0]
+        )
+        reference_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM sequence_source_identities"
+            ).fetchone()[0]
+        )
+        if identity_count != int(registry.get("identity_count", -1)):
+            raise ValueError(f"{prefix}: source identity registry count mismatch")
+        if reference_count != int(
+            registry.get("sequence_identity_reference_count", -1)
+        ):
+            raise ValueError(f"{prefix}: source identity reference count mismatch")
+
+        witness_count = 0
+        for raw_id, digest_text, source in connection.execute(
+            "SELECT source_identity_id, canonical_sha256, source "
+            "FROM source_identities"
+        ):
+            identity_id = _decode_source_identity_key(raw_id)
+            if not isinstance(source, str) or not source:
+                raise ValueError(f"{prefix}: empty canonical source identity witness")
+            actual_digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+            if digest_text != actual_digest or identity_id != _source_identity_id(source):
+                raise ValueError(f"{prefix}: invalid source identity witness {identity_id}")
+            witness_count += 1
+        if witness_count != identity_count:
+            raise ValueError(f"{prefix}: source identity witness count mismatch")
+
+        reference_rows = iter(
+            connection.execute(
+                "SELECT sequence_index, source_identity_id "
+                "FROM sequence_source_identities "
+                "ORDER BY sequence_index, source_identity_id"
+            )
+        )
+        pending = next(reference_rows, None)
+        start = 0
+        for sequence_index, length in enumerate(lengths):
+            end = start + length
+            expected_ids = {int(value) for value in np.unique(token_ids[start:end])}
+            actual_ids: set[int] = set()
+            while pending is not None and int(pending[0]) == sequence_index:
+                actual_ids.add(_decode_source_identity_key(pending[1]))
+                pending = next(reference_rows, None)
+            if pending is not None and int(pending[0]) < sequence_index:
+                raise ValueError(f"{prefix}: unordered source identity references")
+            if actual_ids != expected_ids:
+                raise ValueError(
+                    f"{prefix}: source identity registry/token mismatch in "
+                    f"sequence {sequence_index}"
+                )
+            start = end
+        if pending is not None:
+            raise ValueError(f"{prefix}: source identity reference exceeds sequences")
+    finally:
+        connection.close()
+    return registry_path
+
+
 def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
     prefix = prefix.resolve()
     manifest_path = prefix.with_suffix(".json")
@@ -744,6 +900,10 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
             )
         referenced.add(side_path)
         sidecar_files[name] = side_path
+    if data.get("symbol_identity_schema_version") != 3:
+        raise ValueError(
+            f"{manifest_path}: symbol_identity_schema_version=3 is required"
+        )
 
     graph_paths = data.get("graph_sidecar_paths")
     if data.get("graph_sidecar_schema") != EXPECTED_GRAPH_SIDECAR_SCHEMA:
@@ -823,6 +983,13 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
         source_doc_path=sidecar_files["token_source_doc_ids"],
         graph_files=graph_files,
     )
+    source_identity_registry_path = _validate_case5_source_registry(
+        prefix=prefix,
+        manifest=data,
+        lengths=lengths,
+        source_identity_sidecar=sidecar_files["token_source_identity_ids"],
+    )
+    referenced.add(source_identity_registry_path)
 
     source_platform = data.get("source_platform_sidecar")
     if not isinstance(source_platform, dict) or source_platform.get("schema") != "cppmega_source_platform_v1":

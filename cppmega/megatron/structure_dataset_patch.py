@@ -15,12 +15,16 @@ from functools import wraps
 from math import prod
 from typing import Dict, Any, Optional
 
-import torch
+import torch  # type: ignore[import-not-found]
 import numpy as np
 
 from cppmega.megatron.domain_route_contract import (
+    CASE5_RECEIPT_KEY,
+    CASE5_SCHEMA_VERSION,
+    DOMAIN_DELIMITER_CONTRACT_SHA256,
     GRAPH_ROUTE_COLUMNS,
     GRAPH_ROUTE_COORDINATE_SPACES,
+    SOURCE_IDENTITY_REGISTRY_SCHEMA,
 )
 
 # Thread-local storage to safely pass the current batch's structure inputs to model forward
@@ -49,6 +53,7 @@ _TOKEN_BATCH_COLS = (
     "entity_ids",
     "scope_ids",
     "source_doc_ids",
+    "source_identity_ids",
     "confidence_ids",
     "structure_ids",
     "dep_levels",
@@ -75,6 +80,10 @@ _REQUIRED_STRUCTURE_TOKEN_COLS = (
 _REQUIRED_DOMAIN_TOKEN_COLS = (
     "domain_ids",
     "role_ids",
+    "entity_ids",
+    "scope_ids",
+    "source_doc_ids",
+    "source_identity_ids",
     "confidence_ids",
 )
 
@@ -107,6 +116,10 @@ _TOKEN_COL_ALIASES = {
     "entity_ids": ("token_entity_ids", "entity_ids"),
     "scope_ids": ("token_scope_ids", "scope_ids"),
     "source_doc_ids": ("token_source_doc_ids", "source_doc_ids"),
+    "source_identity_ids": (
+        "token_source_identity_ids",
+        "source_identity_ids",
+    ),
     "confidence_ids": ("token_confidence_ids", "confidence_ids"),
     "structure_ids": ("token_structure_ids", "structure_ids"),
     "dep_levels": ("token_dep_levels", "dep_levels"),
@@ -129,6 +142,26 @@ _OPAQUE_SYMBOL_ID_ALIASES = frozenset(
     for alias in _TOKEN_COL_ALIASES[column]
 )
 _SYMBOL_IDENTITY_SCHEMA_VERSION = 3
+_OPAQUE_UINT64_ID_COLS = frozenset(
+    ("source_identity_ids", "symbol_ids", "call_targets", "type_refs")
+)
+_OPAQUE_UINT64_ID_ALIASES = frozenset(
+    alias
+    for column in _OPAQUE_UINT64_ID_COLS
+    for alias in _TOKEN_COL_ALIASES[column]
+)
+_CASE5_DOMAIN_ID_ALIASES = {
+    column: frozenset(_TOKEN_COL_ALIASES[column])
+    for column in (
+        "domain_ids",
+        "role_ids",
+        "entity_ids",
+        "scope_ids",
+        "source_doc_ids",
+        "source_identity_ids",
+        "confidence_ids",
+    )
+}
 
 _LOSS_MASK_ALIASES = ("loss_mask", "token_loss_mask")
 
@@ -148,7 +181,7 @@ _TPBridgeIssue = tuple[int, int, BaseException | None]
 def _required_token_batch_cols() -> set[str]:
     """Return only sidecars consumed by enabled input embeddings."""
 
-    required = set(_REQUIRED_STRUCTURE_TOKEN_COLS)
+    required: set[str] = set(_REQUIRED_STRUCTURE_TOKEN_COLS)
     if os.environ.get("CPPMEGA_DOMAIN_EMBEDDING_ENABLED", "0") == "1":
         required.update(_REQUIRED_DOMAIN_TOKEN_COLS)
     if _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
@@ -157,7 +190,7 @@ def _required_token_batch_cols() -> set[str]:
 
 
 def _expected_sidecar_dtype(col: str) -> torch.dtype:
-    if col in _OPAQUE_SYMBOL_ID_COLS:
+    if col in _OPAQUE_UINT64_ID_COLS:
         uint64 = getattr(torch, "uint64", None)
         if uint64 is None:
             raise RuntimeError(
@@ -277,7 +310,7 @@ def _payload_columns(present: set[str], *, opaque: bool) -> list[str]:
     return [
         col
         for col in _CPPMEGA_BATCH_COLS
-        if col in present and (col in _OPAQUE_SYMBOL_ID_COLS) == opaque
+        if col in present and (col in _OPAQUE_UINT64_ID_COLS) == opaque
     ]
 
 
@@ -350,7 +383,7 @@ def _bridge_protocol_error(
             f"sidecar {col!r} exceeds the supported {_TP_SIDECAR_MAX_DIMS}-D "
             "TP bridge shape"
         )
-    elif code == _TP_BRIDGE_DEVICE and col in _OPAQUE_SYMBOL_ID_COLS:
+    elif code == _TP_BRIDGE_DEVICE and col in _OPAQUE_UINT64_ID_COLS:
         return _uint64_transport_error(
             col,
             broadcast_group,
@@ -687,12 +720,64 @@ def _lazy_init_side_channels(dataset: Any) -> Dict[str, Dict[str, Any]]:
             )
 
     base_dir = os.path.dirname(json_path)
+    present_case5_aliases = set(side_paths) & set().union(
+        *_CASE5_DOMAIN_ID_ALIASES.values()
+    )
+    if present_case5_aliases:
+        invalid_alias_groups = {
+            column: sorted(aliases & set(side_paths))
+            for column, aliases in _CASE5_DOMAIN_ID_ALIASES.items()
+            if len(aliases & set(side_paths)) != 1
+        }
+        if invalid_alias_groups:
+            raise ValueError(
+                "[cppmega-patch] CASE5 requires exactly one sidecar alias for "
+                f"every domain route column in {json_path!r}; got "
+                f"{invalid_alias_groups}"
+            )
+        receipt = sidecar.get(CASE5_RECEIPT_KEY)
+        if not isinstance(receipt, dict) or receipt.get("status") != "success":
+            raise ValueError(
+                f"[cppmega-patch] successful {CASE5_RECEIPT_KEY} missing from "
+                f"{json_path!r}"
+            )
+        if (
+            receipt.get("schema") != CASE5_SCHEMA_VERSION
+            or receipt.get("delimiter_contract_sha256")
+            != DOMAIN_DELIMITER_CONTRACT_SHA256
+        ):
+            raise ValueError(
+                f"[cppmega-patch] stale CASE5 schema or delimiter receipt in "
+                f"{json_path!r}: {receipt}"
+            )
+        registry = sidecar.get("source_identity_registry")
+        if (
+            not isinstance(registry, dict)
+            or registry.get("schema") != SOURCE_IDENTITY_REGISTRY_SCHEMA
+            or not registry.get("path")
+        ):
+            raise ValueError(
+                f"[cppmega-patch] CASE5 source identity registry receipt is "
+                f"missing or invalid in {json_path!r}"
+            )
+        registry_path = _safe_sidecar_path(
+            base_dir,
+            registry["path"],
+            col="source_identity_registry",
+            field="path",
+            json_path=json_path,
+        )
+        if not os.path.exists(registry_path):
+            raise FileNotFoundError(
+                f"[cppmega-patch] CASE5 source identity registry not found: "
+                f"{registry_path}"
+            )
     for col, entry in side_paths.items():
         rel_path = entry.get("path")
         dtype_str = entry.get("dtype", "uint16")
-        if col in _OPAQUE_SYMBOL_ID_ALIASES and dtype_str != "uint64":
+        if col in _OPAQUE_UINT64_ID_ALIASES and dtype_str != "uint64":
             raise ValueError(
-                f"[cppmega-patch] semantic symbol sidecar {col!r} must use "
+                f"[cppmega-patch] opaque identity sidecar {col!r} must use "
                 f"uint64, got {dtype_str!r} in {json_path!r}"
             )
         if not rel_path:
@@ -889,10 +974,10 @@ def _align_token_sidecar_tensor(
 
 
 def _token_sidecar_tensor(values: np.ndarray, *, col: str) -> torch.Tensor:
-    """Convert one token sidecar without narrowing opaque symbol identities."""
+    """Preserve opaque identity bits instead of narrowing them to int64."""
 
     array_values = np.asarray(values)
-    if col in _OPAQUE_SYMBOL_ID_COLS:
+    if col in _OPAQUE_UINT64_ID_COLS:
         if array_values.dtype != np.dtype(np.uint64):
             raise ValueError(
                 f"[cppmega-patch] {col} must arrive as uint64, got "
@@ -1154,7 +1239,9 @@ def _build_graph_route_tensors(
 
 # --- 1. Monkey-patch GPTDataset.__getitem__ ---
 try:
-    from megatron.core.datasets.gpt_dataset import GPTDataset
+    from megatron.core.datasets.gpt_dataset import (  # pyright: ignore[reportMissingImports]
+        GPTDataset,
+    )
 
     orig_getitem = GPTDataset.__getitem__
 
@@ -1370,7 +1457,9 @@ except Exception as e:
 
 # --- 3. Monkey-patch MambaModel / GPTModel forward passes ---
 try:
-    from megatron.core.models.mamba import MambaModel
+    from megatron.core.models.mamba import (  # pyright: ignore[reportMissingImports]
+        MambaModel,
+    )
 
     orig_mamba_forward = MambaModel.forward
 
@@ -1392,7 +1481,9 @@ except Exception as e:
 
 
 try:
-    from megatron.core.models.gpt import GPTModel
+    from megatron.core.models.gpt import (  # pyright: ignore[reportMissingImports]
+        GPTModel,
+    )
 
     orig_gpt_forward = GPTModel.forward
 

@@ -6,6 +6,7 @@ from contextlib import contextmanager
 import json
 from pathlib import Path
 import shutil
+import sqlite3
 import struct
 import subprocess
 import tarfile
@@ -53,6 +54,15 @@ def _write_bytes(path, payload):
     path.write_bytes(payload)
 
 
+def _source_identity(source: str) -> tuple[int, str]:
+    digest = hashlib.sha256(source.encode("utf-8")).digest()
+    identity_id = int.from_bytes(digest[:8], "big", signed=False)
+    if identity_id == 0:
+        identity_id = int.from_bytes(digest[8:16], "big", signed=False)
+    assert identity_id > 0
+    return identity_id, digest.hex()
+
+
 def _objective_payload():
     tasks = ("causal_lm", "fim", "ast_fim", "ifim", "commit_diff", "pre_to_post")
     return {
@@ -61,6 +71,7 @@ def _objective_payload():
         "seed": 17,
         "quota_window_samples": 6,
         "task_order": list(tasks),
+        "objective_ids": {task: index + 1 for index, task in enumerate(tasks)},
         "configured_rates": {task: "1/6" for task in tasks},
         "planned_samples": {task: 1 for task in tasks},
         "realized": {
@@ -86,6 +97,9 @@ def _objective_payload():
             "eligible_samples": 1,
             "positive_edges": 1,
             "global_weight": "1",
+            "indexer_weight": "1/1000",
+            "layer_weight": "1",
+            "layer_reduction": "sum",
             "bce_weight": "1/10",
             "coverage_weight": "1/20",
             "topk": 8,
@@ -118,6 +132,13 @@ def _prefix_bundle(tmp_path):
         for document in range(document_count)
         for value in (10 + document, 20 + document, 30 + document, 40 + document)
     ]
+    source_identities = [
+        (
+            *_source_identity(f'{{"source_path":"src/doc-{document}.cc"}}'),
+            f'{{"source_path":"src/doc-{document}.cc"}}',
+        )
+        for document in range(document_count)
+    ]
     _write_bytes(
         prefix.with_suffix(".bin"),
         struct.pack(f"<{token_count}H", *token_values),
@@ -141,23 +162,7 @@ def _prefix_bundle(tmp_path):
         "token_source_doc_ids"
     }
     for name in sorted(required_token_sidecars):
-        dtype = "uint8" if name in {
-            "loss_mask",
-            "token_confidence_ids",
-            "token_structure_ids",
-            "token_def_use",
-            "token_change_mask_pre",
-            "token_change_mask_post",
-        } else "uint16"
-        if name in {
-            "token_entity_ids",
-            "token_scope_ids",
-            "token_symbol_ids",
-            "token_call_targets",
-            "token_type_refs",
-            "token_source_doc_ids",
-        }:
-            dtype = "uint32"
+        dtype = publisher.TOKEN_SIDECAR_DTYPES[name]
         rel = f"{prefix.name}_{name}.bin"
         payload = bytearray(token_count * publisher.DTYPE_SIZES[dtype])
         if name == "token_structure_ids":
@@ -174,11 +179,20 @@ def _prefix_bundle(tmp_path):
             )
         if name == "doc_ids":
             payload[:] = struct.pack(
-                f"<{token_count}H",
+                f"<{token_count}I",
                 *(
                     value
                     for _document in range(document_count)
                     for value in (1, 1, 1, 1)
+                ),
+            )
+        if name == "token_source_identity_ids":
+            payload[:] = struct.pack(
+                f"<{token_count}Q",
+                *(
+                    source_identities[document][0]
+                    for document in range(document_count)
+                    for _token in range(tokens_per_document)
                 ),
             )
         if name == "token_source_doc_ids":
@@ -260,6 +274,38 @@ def _prefix_bundle(tmp_path):
         prefix.parent / source_platform["platform_ids_path"],
         struct.pack(f"<{document_count}H", *range(1, document_count + 1)),
     )
+    registry_path = prefix.parent / f"{prefix.name}_source_identity_registry.sqlite"
+    registry = sqlite3.connect(registry_path)
+    try:
+        registry.executescript(
+            """
+            CREATE TABLE source_identities (
+                source_identity_id BLOB PRIMARY KEY,
+                canonical_sha256 TEXT NOT NULL,
+                source TEXT NOT NULL
+            );
+            CREATE TABLE sequence_source_identities (
+                sequence_index INTEGER NOT NULL,
+                source_identity_id BLOB NOT NULL,
+                PRIMARY KEY(sequence_index, source_identity_id)
+            );
+            """
+        )
+        for sequence_index, (identity_id, digest, source) in enumerate(
+            source_identities
+        ):
+            key = identity_id.to_bytes(8, "big", signed=False)
+            registry.execute(
+                "INSERT INTO source_identities VALUES (?, ?, ?)",
+                (key, digest, source),
+            )
+            registry.execute(
+                "INSERT INTO sequence_source_identities VALUES (?, ?)",
+                (sequence_index, key),
+            )
+        registry.commit()
+    finally:
+        registry.close()
     objective_payload = _objective_payload()
     objective_sha256 = hashlib.sha256(
         json.dumps(
@@ -294,6 +340,31 @@ def _prefix_bundle(tmp_path):
         "side_channel_paths": side_channel_paths,
         "graph_sidecar_paths": graph_sidecar_paths,
         "source_platform_sidecar": source_platform,
+        "symbol_identity_schema_version": 3,
+        "source_identity_registry": {
+            "schema": publisher.SOURCE_IDENTITY_REGISTRY_SCHEMA,
+            "path": registry_path.name,
+            "id_encoding": "uint64_be",
+            "canonical_digest": "sha256",
+            "sequence_count": document_count,
+            "identity_count": document_count,
+            "sequence_identity_reference_count": document_count,
+            "token_foreign_key_sidecar": "token_source_identity_ids",
+        },
+        publisher.CASE5_RECEIPT_KEY: {
+            "status": "success",
+            "schema": publisher.CASE5_SCHEMA_VERSION,
+            "validated_shard_count": 1,
+            "delimiter_contract_sha256": (
+                publisher.DOMAIN_DELIMITER_CONTRACT_SHA256
+            ),
+            "domain_route_columns": list(publisher.DOMAIN_ROUTE_COLUMNS),
+            "graph_route_columns": list(publisher.GRAPH_ROUTE_COLUMNS),
+            "graph_sidecars_written": True,
+            "source_identity_registry_schema": (
+                publisher.SOURCE_IDENTITY_REGISTRY_SCHEMA
+            ),
+        },
         "objective_contract": objective_contract,
     }
     prefix.with_suffix(".json").write_text(json.dumps(prefix_manifest), encoding="utf-8")
@@ -505,6 +576,39 @@ def test_validate_bundle_requires_positive_uint32_source_doc_ids(tmp_path):
     _rehash_bundle_manifest(tmp_path)
 
     with pytest.raises(ValueError, match="token_source_doc_ids.*positive"):
+        _validate_bundle(tmp_path, hash_jobs=1)
+
+
+def test_validate_bundle_rejects_source_identity_sidecar_registry_mismatch(tmp_path):
+    prefix = _prefix_bundle(tmp_path)
+    prefix_manifest = json.loads(prefix.with_suffix(".json").read_text(encoding="utf-8"))
+    spec = prefix_manifest["side_channel_paths"]["token_source_identity_ids"]
+    path = prefix.parent / spec["path"]
+    values = list(struct.unpack("<24Q", path.read_bytes()))
+    values[0] ^= 1
+    path.write_bytes(struct.pack("<24Q", *values))
+    _rehash_bundle_manifest(tmp_path)
+
+    with pytest.raises(ValueError, match="registry/token mismatch"):
+        _validate_bundle(tmp_path, hash_jobs=1)
+
+
+def test_validate_bundle_rejects_tampered_source_identity_witness(tmp_path):
+    prefix = _prefix_bundle(tmp_path)
+    prefix_manifest = json.loads(prefix.with_suffix(".json").read_text(encoding="utf-8"))
+    registry_path = prefix.parent / prefix_manifest["source_identity_registry"]["path"]
+    registry = sqlite3.connect(registry_path)
+    try:
+        registry.execute(
+            "UPDATE source_identities SET source = ? WHERE rowid = 1",
+            ('{"source_path":"src/tampered.cc"}',),
+        )
+        registry.commit()
+    finally:
+        registry.close()
+    _rehash_bundle_manifest(tmp_path)
+
+    with pytest.raises(ValueError, match="invalid source identity witness"):
         _validate_bundle(tmp_path, hash_jobs=1)
 
 
