@@ -2,15 +2,18 @@
 
 Dynamically overrides GPTDataset.__getitem__, Megatron's TP batch bridge, and
 MambaModel/GPTModel forward passes to stream token-aligned binary MMap metadata
-columns with zero memory or serialization overhead.
+columns through coalesced tensor-parallel transport.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import threading
-from typing import Dict, Any, Optional, Tuple
+from functools import wraps
+from math import prod
+from typing import Dict, Any, Optional
 
 import torch
 import numpy as np
@@ -137,6 +140,16 @@ _GRAPH_ROUTE_COLS = (
     "token_chunk_dep_levels",
 )
 
+_CPPMEGA_BATCH_COLS = _TOKEN_BATCH_COLS + _GRAPH_BATCH_COLS
+_TP_SIDECAR_MAX_DIMS = 4
+_TP_BRIDGE_OK = 0
+_TP_BRIDGE_MISSING = 1
+_TP_BRIDGE_NOT_TENSOR = 2
+_TP_BRIDGE_DTYPE = 3
+_TP_BRIDGE_SHAPE = 4
+_TP_BRIDGE_DEVICE = 5
+_TPBridgeIssue = tuple[int, int, BaseException | None]
+
 
 def _required_token_batch_cols() -> set[str]:
     """Return only sidecars consumed by enabled input embeddings."""
@@ -149,6 +162,27 @@ def _required_token_batch_cols() -> set[str]:
     return required
 
 
+def _expected_sidecar_dtype(col: str) -> torch.dtype:
+    if col in _OPAQUE_SYMBOL_ID_COLS:
+        uint64 = getattr(torch, "uint64", None)
+        if uint64 is None:
+            raise RuntimeError(
+                "[cppmega-patch] this PyTorch build has no torch.uint64; "
+                f"cannot represent opaque sidecar {col!r} without narrowing"
+            )
+        return uint64
+    return torch.long
+
+
+def _padded_token_sidecar_tensor(tokens: torch.Tensor, *, col: str) -> torch.Tensor:
+    """Build one zero sidecar for a Megatron batch-padding sample."""
+    return torch.zeros(
+        tokens.shape,
+        dtype=_expected_sidecar_dtype(col),
+        device=tokens.device,
+    )
+
+
 def _pop_structure_batch(batch: Dict[str, torch.Tensor] | None) -> Dict[str, torch.Tensor] | None:
     """Remove cppmega sidecar tensors from a Megatron batch and stash them."""
     if batch is None:
@@ -156,7 +190,7 @@ def _pop_structure_batch(batch: Dict[str, torch.Tensor] | None) -> Dict[str, tor
         return None
     structure_batch = {
         col: batch.pop(col)
-        for col in _TOKEN_BATCH_COLS + _GRAPH_BATCH_COLS
+        for col in _CPPMEGA_BATCH_COLS
         if col in batch
     }
     if structure_batch:
@@ -173,6 +207,324 @@ def _pop_structure_batch(batch: Dict[str, torch.Tensor] | None) -> Dict[str, tor
         return structure_batch
     _set_current_structure_batch(None)
     return None
+
+
+def _take_cppmega_sidecars(batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Remove cppmega-owned tensors before Megatron filters the core batch."""
+    return {
+        col: batch.pop(col)
+        for col in _CPPMEGA_BATCH_COLS
+        if col in batch
+    }
+
+
+def _batch_transport_device(batch: Dict[str, torch.Tensor] | None) -> torch.device:
+    if batch is not None:
+        for value in batch.values():
+            if isinstance(value, torch.Tensor):
+                return value.device
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
+def _tp_backend_name(group: Any) -> str:
+    try:
+        return str(torch.distributed.get_backend(group))
+    except Exception:
+        return "unknown"
+
+
+def _uint64_transport_error(
+    col: str,
+    group: Any,
+    *,
+    device: torch.device,
+    exc: BaseException | None = None,
+) -> RuntimeError:
+    detail = f"; transport error: {exc}" if exc is not None else ""
+    return RuntimeError(
+        "[cppmega-patch] tensor-parallel backend "
+        f"{_tp_backend_name(group)!r} cannot transport opaque uint64 sidecar "
+        f"{col!r} on {device} with torch {torch.__version__}; refusing "
+        f"to narrow opaque IDs{detail}"
+    )
+
+
+def _broadcast_tp_tensor(
+    tensor: torch.Tensor,
+    *,
+    col: str,
+    broadcast_src_rank: int,
+    broadcast_group: Any,
+) -> None:
+    try:
+        torch.distributed.broadcast(
+            tensor,
+            broadcast_src_rank,
+            group=broadcast_group,
+        )
+    except (RuntimeError, TypeError, NotImplementedError) as exc:
+        if tensor.dtype == getattr(torch, "uint64", None):
+            raise _uint64_transport_error(
+                col,
+                broadcast_group,
+                device=tensor.device,
+                exc=exc,
+            ) from exc
+        raise RuntimeError(
+            "[cppmega-patch] tensor-parallel broadcast failed for cppmega "
+            f"sidecar protocol tensor {col!r} with dtype={tensor.dtype}, "
+            f"device={tensor.device}, backend={_tp_backend_name(broadcast_group)!r}: {exc}"
+        ) from exc
+
+
+def _payload_columns(present: set[str], *, opaque: bool) -> list[str]:
+    return [
+        col
+        for col in _CPPMEGA_BATCH_COLS
+        if col in present and (col in _OPAQUE_SYMBOL_ID_COLS) == opaque
+    ]
+
+
+def _prepare_source_payloads(
+    sidecars: Dict[str, torch.Tensor],
+    *,
+    device: torch.device,
+) -> tuple[Dict[str, torch.Tensor], Dict[bool, torch.Tensor], _TPBridgeIssue | None]:
+    if not sidecars:
+        return {}, {}, (_TP_BRIDGE_MISSING, -1, None)
+
+    prepared: Dict[str, torch.Tensor] = {}
+    for col_index, col in enumerate(_CPPMEGA_BATCH_COLS):
+        if col not in sidecars:
+            continue
+        tensor = sidecars[col]
+        if not isinstance(tensor, torch.Tensor):
+            return {}, {}, (_TP_BRIDGE_NOT_TENSOR, col_index, None)
+        try:
+            expected_dtype = _expected_sidecar_dtype(col)
+        except RuntimeError as exc:
+            return {}, {}, (_TP_BRIDGE_DEVICE, col_index, exc)
+        if tensor.dtype != expected_dtype:
+            return {}, {}, (_TP_BRIDGE_DTYPE, col_index, None)
+        if tensor.ndim > _TP_SIDECAR_MAX_DIMS:
+            return {}, {}, (_TP_BRIDGE_SHAPE, col_index, None)
+        prepared[col] = tensor
+
+    payloads: Dict[bool, torch.Tensor] = {}
+    for opaque in (False, True):
+        cols = _payload_columns(set(prepared), opaque=opaque)
+        if not cols:
+            continue
+        try:
+            payloads[opaque] = torch.cat(
+                [prepared[col].reshape(-1) for col in cols]
+            ).to(device=device, non_blocking=True).contiguous()
+        except (RuntimeError, TypeError, NotImplementedError) as exc:
+            col_index = _CPPMEGA_BATCH_COLS.index(cols[0])
+            return {}, {}, (_TP_BRIDGE_DEVICE, col_index, exc)
+    return prepared, payloads, None
+
+
+def _bridge_protocol_error(
+    code: int,
+    col_index: int,
+    *,
+    device: torch.device,
+    broadcast_group: Any,
+    cause: BaseException | None = None,
+) -> RuntimeError:
+    if 0 <= col_index < len(_CPPMEGA_BATCH_COLS):
+        col = _CPPMEGA_BATCH_COLS[col_index]
+    else:
+        col = "<batch>"
+    if code == _TP_BRIDGE_MISSING:
+        message = (
+            "TP source batch contains no cppmega sidecars; the GPTDataset/DataLoader "
+            "bridge is not installed"
+        )
+    elif code == _TP_BRIDGE_NOT_TENSOR:
+        message = f"sidecar {col!r} is not a torch.Tensor after DataLoader collation"
+    elif code == _TP_BRIDGE_DTYPE:
+        message = (
+            f"sidecar {col!r} must use {_expected_sidecar_dtype(col)} after "
+            "DataLoader collation"
+        )
+    elif code == _TP_BRIDGE_SHAPE:
+        message = (
+            f"sidecar {col!r} exceeds the supported {_TP_SIDECAR_MAX_DIMS}-D "
+            "TP bridge shape"
+        )
+    elif code == _TP_BRIDGE_DEVICE and col in _OPAQUE_SYMBOL_ID_COLS:
+        return _uint64_transport_error(
+            col,
+            broadcast_group,
+            device=device,
+            exc=cause,
+        )
+    elif code == _TP_BRIDGE_DEVICE:
+        message = f"sidecar {col!r} cannot be moved to TP device {device}"
+    else:
+        message = f"unknown TP sidecar bridge control code {code} for {col!r}"
+    if cause is not None:
+        message += f"; transport error: {cause}"
+    return RuntimeError(f"[cppmega-patch] {message}")
+
+
+def _broadcast_cppmega_sidecars(
+    source_sidecars: Dict[str, torch.Tensor],
+    *,
+    batch: Dict[str, torch.Tensor] | None,
+    tp_rank: int,
+    broadcast_src_rank: int,
+    broadcast_group: Any,
+    transport_device: torch.device | None = None,
+) -> Dict[str, torch.Tensor]:
+    """Broadcast sidecars without depending on Megatron retaining custom keys."""
+    device = transport_device or _batch_transport_device(batch)
+    prepared: Dict[str, torch.Tensor] = {}
+    payloads: Dict[bool, torch.Tensor] = {}
+    issue: _TPBridgeIssue | None = None
+    if tp_rank == 0:
+        prepared, payloads, issue = _prepare_source_payloads(
+            source_sidecars,
+            device=device,
+        )
+
+    # Row zero is the source preflight result. Remaining rows carry exact shapes.
+    header = torch.full(
+        (len(_CPPMEGA_BATCH_COLS) + 1, _TP_SIDECAR_MAX_DIMS + 1),
+        -1,
+        dtype=torch.int64,
+        device="cpu" if tp_rank == 0 else device,
+    )
+    if tp_rank == 0:
+        header[0, 0] = _TP_BRIDGE_OK if issue is None else issue[0]
+        header[0, 1] = -1 if issue is None else issue[1]
+        if issue is None:
+            for col_index, col in enumerate(_CPPMEGA_BATCH_COLS, start=1):
+                tensor = prepared.get(col)
+                if tensor is None:
+                    continue
+                header[col_index, 0] = tensor.ndim
+                if tensor.ndim:
+                    header[col_index, 1 : tensor.ndim + 1] = torch.tensor(
+                        tensor.shape,
+                        dtype=torch.int64,
+                    )
+        header = header.to(device=device, non_blocking=True)
+    _broadcast_tp_tensor(
+        header,
+        col="<cppmega-sidecar-header>",
+        broadcast_src_rank=broadcast_src_rank,
+        broadcast_group=broadcast_group,
+    )
+
+    header_rows = header.tolist()
+    error_code = int(header_rows[0][0])
+    error_col_index = int(header_rows[0][1])
+    if error_code != _TP_BRIDGE_OK:
+        cause = issue[2] if issue is not None else None
+        raise _bridge_protocol_error(
+            error_code,
+            error_col_index,
+            device=device,
+            broadcast_group=broadcast_group,
+            cause=cause,
+        )
+
+    shapes: Dict[str, tuple[int, ...]] = {}
+    for col, row in zip(_CPPMEGA_BATCH_COLS, header_rows[1:], strict=True):
+        ndim = int(row[0])
+        if ndim >= 0:
+            shapes[col] = tuple(int(value) for value in row[1 : ndim + 1])
+
+    received: Dict[str, torch.Tensor] = {}
+    for opaque in (False, True):
+        cols = _payload_columns(set(shapes), opaque=opaque)
+        if not cols:
+            continue
+        dtype = _expected_sidecar_dtype(cols[0])
+        if tp_rank == 0:
+            payload = payloads[opaque]
+        else:
+            payload_numel = sum(prod(shapes[col]) for col in cols)
+            try:
+                payload = torch.empty(payload_numel, dtype=dtype, device=device)
+            except (RuntimeError, TypeError, NotImplementedError) as exc:
+                if opaque:
+                    raise _uint64_transport_error(
+                        cols[0],
+                        broadcast_group,
+                        device=device,
+                        exc=exc,
+                    ) from exc
+                raise
+        _broadcast_tp_tensor(
+            payload,
+            col=cols[0],
+            broadcast_src_rank=broadcast_src_rank,
+            broadcast_group=broadcast_group,
+        )
+        offset = 0
+        for col in cols:
+            numel = prod(shapes[col])
+            received[col] = payload[offset : offset + numel].view(shapes[col])
+            offset += numel
+    return received
+
+
+def _make_get_batch_on_this_tp_rank_bridge(original_get_batch):
+    """Wrap the pinned helper while owning cppmega sidecar extraction."""
+    signature = inspect.signature(original_get_batch)
+    required = {"batch", "tp_rank", "broadcast_src_rank", "broadcast_group"}
+    missing = required - set(signature.parameters)
+
+    @wraps(original_get_batch)
+    def bridged_get_batch(*args, **kwargs):
+        _set_current_structure_batch(None)
+        if missing:
+            if os.environ.get("CPPMEGA_STRUCTURE_ENABLED", "0") == "1":
+                raise RuntimeError(
+                    "[cppmega-patch] Megatron get_batch_on_this_tp_rank has an "
+                    f"unsupported signature missing {sorted(missing)}; cppmega requires "
+                    "the STACK.lock core_v0.18.0 batch bridge"
+                )
+            return original_get_batch(*args, **kwargs)
+
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        input_batch = bound.arguments["batch"]
+        if not isinstance(input_batch, dict):
+            raise TypeError(
+                "[cppmega-patch] Megatron get_batch_on_this_tp_rank batch must be a dict, "
+                f"got {type(input_batch).__name__}"
+            )
+        if os.environ.get("CPPMEGA_STRUCTURE_ENABLED", "0") != "1":
+            return original_get_batch(*args, **kwargs)
+
+        tp_rank = int(bound.arguments["tp_rank"])
+        source_sidecars = _take_cppmega_sidecars(input_batch)
+        source_device = _batch_transport_device(input_batch) if tp_rank == 0 else None
+        batch = original_get_batch(*args, **kwargs)
+        if batch is not None and not isinstance(batch, dict):
+            raise TypeError(
+                "[cppmega-patch] Megatron get_batch_on_this_tp_rank must return a dict "
+                f"or None, got {type(batch).__name__}"
+            )
+        sidecars = _broadcast_cppmega_sidecars(
+            source_sidecars,
+            batch=batch,
+            tp_rank=tp_rank,
+            broadcast_src_rank=int(bound.arguments["broadcast_src_rank"]),
+            broadcast_group=bound.arguments["broadcast_group"],
+            transport_device=source_device,
+        )
+        _set_current_structure_batch(sidecars)
+        return batch
+
+    return bridged_get_batch
 
 
 def _sidecar_json_path(dataset: Any) -> str:
@@ -739,9 +1091,8 @@ try:
 
         if idx is None:
             # Padded sequence: return zero tensors matching the tokens shape
-            tokens_shape = sample["tokens"].shape
             for col in _TOKEN_BATCH_COLS:
-                sample[col] = torch.zeros(tokens_shape, dtype=torch.long, device=sample["tokens"].device)
+                sample[col] = _padded_token_sidecar_tensor(sample["tokens"], col=col)
             if os.environ.get("CPPMEGA_GRAPH_ROUTES_ENABLED", "0") == "1":
                 max_edges = int(os.environ.get("CPPMEGA_GRAPH_MAX_EDGES", "256"))
                 max_chunks = int(os.environ.get("CPPMEGA_GRAPH_MAX_CHUNKS", "256"))
@@ -760,7 +1111,7 @@ try:
                         "token_chunk_dep_levels": {"offsets": np.array([0, 0]), "data": np.empty((0,), dtype=np.uint16)},
                     },
                     [],
-                    target_len=int(tokens_shape[-1]),
+                    target_len=int(sample["tokens"].shape[-1]),
                     max_edges=max_edges,
                     max_chunks=max_chunks,
                 )
@@ -892,14 +1243,9 @@ try:
         # Older cppmega H200 trees used the training.utils location.
         import megatron.training.utils as batch_utils  # type: ignore[import-not-found]
 
-    orig_get_batch_on_this_tp_rank = batch_utils.get_batch_on_this_tp_rank
-
-    def patched_get_batch_on_this_tp_rank(*args, **kwargs) -> Dict[str, torch.Tensor] | None:
-        batch = orig_get_batch_on_this_tp_rank(*args, **kwargs)
-        _pop_structure_batch(batch)
-        return batch
-
-    batch_utils.get_batch_on_this_tp_rank = patched_get_batch_on_this_tp_rank
+    batch_utils.get_batch_on_this_tp_rank = _make_get_batch_on_this_tp_rank_bridge(
+        batch_utils.get_batch_on_this_tp_rank
+    )
     print(
         f"[cppmega-patch] Successfully patched {batch_utils.__name__}.get_batch_on_this_tp_rank",
         flush=True,
