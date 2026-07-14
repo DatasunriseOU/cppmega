@@ -1071,6 +1071,7 @@ def test_graph_sidecar_writer_writes_offsets_data_and_manifest(tmp_path: Path) -
         tmp_path / "cppmega_train_token_chunk_starts_data.bin", dtype=np.uint32
     )
     np.testing.assert_array_equal(starts, np.array([0, 8, 16, 0], dtype=np.uint32))
+    assert manifest["token_chunk_starts"]["shape_tail"] == [1]
     json.dumps(manifest)
 
 

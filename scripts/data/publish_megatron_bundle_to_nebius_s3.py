@@ -597,12 +597,12 @@ def _validate_token_semantics(
 def _validate_graph_provenance(
     *,
     lengths: list[int],
-    source_doc_path: Path,
+    document_id_path: Path,
     graph_files: dict[str, tuple[list[int], Path, dict]],
 ) -> dict[str, object]:
     sequence_starts = np.cumsum([0, *lengths[:-1]], dtype=np.int64)
-    source_ids = np.memmap(
-        source_doc_path,
+    document_ids = np.memmap(
+        document_id_path,
         mode="r",
         dtype="<u4",
         shape=(sum(lengths),),
@@ -650,7 +650,7 @@ def _validate_graph_provenance(
             np.any(starts < 0)
             or np.any(ends <= starts)
             or np.any(ends > length)
-            or np.any(kinds <= 0)
+            or np.any(kinds < 0)
             or np.any(levels < 0)
         ):
             raise ValueError(
@@ -658,12 +658,12 @@ def _validate_graph_provenance(
             )
         chunk_docs: list[int] = []
         for local_start, local_end in zip(starts, ends, strict=True):
-            docs = source_ids[
+            docs = document_ids[
                 sequence_start + int(local_start) : sequence_start + int(local_end)
             ]
             if docs.size == 0 or np.any(docs != docs[0]):
                 raise ValueError(
-                    "graph chunk crosses source-document provenance in "
+                    "graph chunk crosses an attention-document boundary in "
                     f"sequence {sequence_index}"
                 )
             chunk_docs.append(int(docs[0]))
@@ -712,11 +712,11 @@ def _validate_graph_provenance(
                     if kind_i not in allowed_kinds:
                         raise ValueError(f"edge kind {kind_i} is not valid for {name}")
                     if (
-                        source_ids[sequence_start + source_i]
-                        != source_ids[sequence_start + target_i]
+                        document_ids[sequence_start + source_i]
+                        != document_ids[sequence_start + target_i]
                     ):
                         raise ValueError(
-                            f"{name} endpoint document provenance mismatch in "
+                            f"{name} crosses an attention-document boundary in "
                             f"sequence {sequence_index}"
                         )
     active = {name: count for name, count in route_counts.items() if count > 0}
@@ -1078,7 +1078,7 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
     )
     _validate_graph_provenance(
         lengths=lengths,
-        source_doc_path=sidecar_files["token_source_doc_ids"],
+        document_id_path=sidecar_files["doc_ids"],
         graph_files=graph_files,
     )
     source_identity_registry_path = _validate_case5_source_registry(

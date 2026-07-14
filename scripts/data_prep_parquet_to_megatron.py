@@ -1475,10 +1475,13 @@ class _GraphSidecarWriters:
             elif kind == "edge_triples":
                 entry["shape_tail"] = [3]
                 entry["coordinate_space"] = "token_index"
-            elif column in {"token_chunk_starts", "token_chunk_ends"}:
-                entry["coordinate_space"] = "token_index"
-            else:
-                entry["coordinate_space"] = "chunk_index"
+            elif kind == "ragged_1d":
+                entry["shape_tail"] = [1]
+                entry["coordinate_space"] = (
+                    "token_index"
+                    if column in {"token_chunk_starts", "token_chunk_ends"}
+                    else "chunk_index"
+                )
             manifest[column] = entry
         self._closed = True
         return manifest

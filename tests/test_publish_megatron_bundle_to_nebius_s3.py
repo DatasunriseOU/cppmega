@@ -970,18 +970,34 @@ def test_validate_bundle_rejects_source_identity_reference_without_witness(
         _validate_bundle(tmp_path, hash_jobs=1)
 
 
-def test_validate_bundle_rejects_edge_endpoint_document_provenance_mismatch(tmp_path):
+def test_validate_bundle_rejects_edge_across_attention_document_boundary(tmp_path):
     prefix = _prefix_bundle(tmp_path)
     prefix_manifest = json.loads(
         prefix.with_suffix(".json").read_text(encoding="utf-8")
     )
-    spec = prefix_manifest["side_channel_paths"]["token_source_doc_ids"]
-    source_ids = [document + 1 for document in range(6) for _token in range(4)]
-    source_ids[1] = 2
-    (prefix.parent / spec["path"]).write_bytes(struct.pack("<24I", *source_ids))
+    doc_spec = prefix_manifest["side_channel_paths"]["doc_ids"]
+    doc_ids = [1] * 24
+    doc_ids[1:4] = [2, 2, 2]
+    (prefix.parent / doc_spec["path"]).write_bytes(struct.pack("<24I", *doc_ids))
+
+    platform = prefix_manifest["source_platform_sidecar"]
+    (prefix.parent / platform["sequence_doc_offsets_path"]).write_bytes(
+        struct.pack("<7q", 0, 2, 3, 4, 5, 6, 7)
+    )
+    (prefix.parent / platform["doc_platform_offsets_path"]).write_bytes(
+        struct.pack("<8q", *range(8))
+    )
+    (prefix.parent / platform["platform_ids_path"]).write_bytes(
+        struct.pack("<7H", *([1] * 7))
+    )
+    platform["source_document_count"] = 7
+    platform["platform_id_count"] = 7
+    prefix.with_suffix(".json").write_text(
+        json.dumps(prefix_manifest), encoding="utf-8"
+    )
     _rehash_bundle_manifest(tmp_path)
 
-    with pytest.raises(ValueError, match="provenance|source document"):
+    with pytest.raises(ValueError, match="attention-document boundary"):
         _validate_bundle(tmp_path, hash_jobs=1)
 
 
@@ -1164,6 +1180,27 @@ def test_validate_prefix_rejects_in_tree_sidecar_symlink(tmp_path):
 
     with pytest.raises(ValueError, match="regular file.*symlink"):
         publisher._validate_prefix_manifest_contract(prefix)
+
+
+def test_validate_prefix_accepts_canonical_other_chunk_kind_zero(tmp_path):
+    prefix = _prefix_bundle(tmp_path)
+    manifest = json.loads(prefix.with_suffix(".json").read_text(encoding="utf-8"))
+    spec = manifest["graph_sidecar_paths"]["token_chunk_kinds"]
+    (prefix.parent / spec["data_path"]).write_bytes(struct.pack("<B", 0))
+
+    publisher._validate_prefix_manifest_contract(prefix)
+
+
+def test_validate_prefix_accepts_graph_route_across_source_constituents(tmp_path):
+    prefix = _prefix_bundle(tmp_path)
+    manifest = json.loads(prefix.with_suffix(".json").read_text(encoding="utf-8"))
+    spec = manifest["side_channel_paths"]["token_source_doc_ids"]
+    source_doc_path = prefix.parent / spec["path"]
+    source_docs = bytearray(source_doc_path.read_bytes())
+    source_docs[4:8] = struct.pack("<I", 2)
+    source_doc_path.write_bytes(source_docs)
+
+    publisher._validate_prefix_manifest_contract(prefix)
 
 
 def test_validate_bundle_rejects_embedded_prefix_manifest_drift(tmp_path):
