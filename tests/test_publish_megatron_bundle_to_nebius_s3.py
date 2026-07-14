@@ -152,9 +152,7 @@ def _prefix_bundle(tmp_path):
             f"<{document_count}q",
             *(index * tokens_per_document * 2 for index in range(document_count)),
         )
-        + struct.pack(
-            f"<{document_count + 1}q", *range(document_count + 1)
-        ),
+        + struct.pack(f"<{document_count + 1}q", *range(document_count + 1)),
     )
 
     side_channel_paths = {}
@@ -171,11 +169,7 @@ def _prefix_bundle(tmp_path):
             payload[:] = bytes(
                 value
                 for document in range(document_count)
-                for value in (
-                    (1, 1, 1, 0)
-                    if document == 0
-                    else (0, 1, 1, 0)
-                )
+                for value in ((1, 1, 1, 0) if document == 0 else (0, 1, 1, 0))
             )
         if name == "doc_ids":
             payload[:] = struct.pack(
@@ -221,7 +215,12 @@ def _prefix_bundle(tmp_path):
             item_count = 1 if name == "token_domain_edges" else 0
         else:
             kind = "ragged_1d"
-            dtype = "uint32" if name in {"token_chunk_starts", "token_chunk_ends"} else "uint16"
+            if name in {"token_chunk_starts", "token_chunk_ends"}:
+                dtype = "uint32"
+            elif name == "token_chunk_kinds":
+                dtype = "uint8"
+            else:
+                dtype = "uint16"
             shape_tail = [1]
             item_count = 1
         offsets_rel = f"{prefix.name}_{name}_offsets.bin"
@@ -234,15 +233,13 @@ def _prefix_bundle(tmp_path):
                 *([item_count] * document_count),
             ),
         )
-        payload = b"\x00" * (
-            item_count * shape_tail[0] * publisher.DTYPE_SIZES[dtype]
-        )
+        payload = b"\x00" * (item_count * shape_tail[0] * publisher.DTYPE_SIZES[dtype])
         if name == "token_domain_edges":
             payload = struct.pack("<3i", 1, 0, 5)
         elif name == "token_chunk_ends":
             payload = struct.pack("<I", tokens_per_document)
         elif name == "token_chunk_kinds":
-            payload = struct.pack("<H", 1)
+            payload = struct.pack("<B", 1)
         _write_bytes(prefix.parent / data_rel, payload)
         graph_sidecar_paths[name] = {
             "kind": kind,
@@ -315,6 +312,49 @@ def _prefix_bundle(tmp_path):
             ensure_ascii=True,
         ).encode("ascii")
     ).hexdigest()
+    provenance_dir = tmp_path / "provenance"
+    provenance_dir.mkdir()
+    objective_source = provenance_dir / "objective_contract_seq1024.json"
+    objective_source.write_text(json.dumps(objective_payload), encoding="utf-8")
+    artifact_payload = {
+        "schema": "cppmega_objective_materialization_artifact_v1",
+        "documents": document_count,
+        "objective_contract": {
+            "path": objective_source.name,
+            "sha256": objective_sha256,
+            "size_bytes": objective_source.stat().st_size,
+            "file_sha256": hashlib.sha256(objective_source.read_bytes()).hexdigest(),
+        },
+        "parquet_shards": [
+            {
+                "path": "objectives_00000.parquet",
+                "size_bytes": 1,
+                "sha256": "1" * 64,
+            }
+        ],
+        "converter": {
+            "split": "all",
+            "token_column": "input_ids",
+            "length_column": "valid_token_count",
+            "side_channels": [],
+            "graph_sidecars": [],
+            "source_platform_sidecar": "require",
+            "graph_relations": ["domain"],
+            "graph_pair_mask": "causal_same_document_upstream_v1",
+            "chunk_edge_expansion": "cartesian_token_spans_v1",
+        },
+    }
+    artifact_payload["artifact_set_sha256"] = hashlib.sha256(
+        json.dumps(
+            artifact_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+    ).hexdigest()
+    objective_artifact = provenance_dir / "objective_artifact_seq1024.json"
+    objective_artifact.write_text(json.dumps(artifact_payload), encoding="utf-8")
+    artifact_file_sha256 = hashlib.sha256(objective_artifact.read_bytes()).hexdigest()
     objective_ids_rel = f"{prefix.name}_objective_ids.bin"
     _write_bytes(
         prefix.parent / objective_ids_rel,
@@ -355,9 +395,9 @@ def _prefix_bundle(tmp_path):
             "status": "success",
             "schema": publisher.CASE5_SCHEMA_VERSION,
             "validated_shard_count": 1,
-            "delimiter_contract_sha256": (
-                publisher.DOMAIN_DELIMITER_CONTRACT_SHA256
-            ),
+            "delimiter_contract_sha256": (publisher.DOMAIN_DELIMITER_CONTRACT_SHA256),
+            "domain_schema_sha256": publisher.DOMAIN_SCHEMA_SHA256,
+            "tokenizer_contract_sha256": publisher.TOKENIZER_CONTRACT_SHA256,
             "domain_route_columns": list(publisher.DOMAIN_ROUTE_COLUMNS),
             "graph_route_columns": list(publisher.GRAPH_ROUTE_COLUMNS),
             "graph_sidecars_written": True,
@@ -366,19 +406,33 @@ def _prefix_bundle(tmp_path):
             ),
         },
         "objective_contract": objective_contract,
+        "objective_materialization": {
+            **artifact_payload,
+            "artifact_file_sha256": artifact_file_sha256,
+        },
     }
-    prefix.with_suffix(".json").write_text(json.dumps(prefix_manifest), encoding="utf-8")
+    prefix.with_suffix(".json").write_text(
+        json.dumps(prefix_manifest), encoding="utf-8"
+    )
 
     tokenizer_dir = tmp_path / "tokenizer"
     shutil.copytree(
         Path(__file__).resolve().parents[1] / "data/tokenizer_v2",
         tokenizer_dir,
     )
-    provenance_dir = tmp_path / "provenance"
-    provenance_dir.mkdir()
-    objective_source = provenance_dir / "objective_contract.json"
-    objective_source.write_text(json.dumps(objective_payload), encoding="utf-8")
-
+    contracts_dir = tmp_path / "contracts"
+    contracts_dir.mkdir()
+    domain_contract = contracts_dir / "domain_schema_v1.json"
+    tokenizer_contract = contracts_dir / "tokenizer_contract_v1.json"
+    shutil.copy2(
+        Path(__file__).resolve().parents[1] / "data/domain_schema_v1.json",
+        domain_contract,
+    )
+    shutil.copy2(
+        Path(__file__).resolve().parents[1]
+        / "data/tokenizer_v2/tokenizer_contract_v1.json",
+        tokenizer_contract,
+    )
     paths = sorted(path for path in tmp_path.rglob("*") if path.is_file())
     records = [
         {
@@ -404,10 +458,21 @@ def _prefix_bundle(tmp_path):
         "vocab_size": 65536,
         "training_contract": "objective_materialized",
         "objective_materialization": {
-            "path": "provenance/objective_contract.json",
-            "schema": "cppmega_pre_materialized_objectives_v1",
-            "sha256": objective_sha256,
-            "file_sha256": hashlib.sha256(objective_source.read_bytes()).hexdigest(),
+            "schema": "cppmega_bucketed_objective_materializations_v1",
+            "buckets": {
+                "1024": {
+                    "artifact_path": "provenance/objective_artifact_seq1024.json",
+                    "artifact_schema": "cppmega_objective_materialization_artifact_v1",
+                    "artifact_set_sha256": artifact_payload["artifact_set_sha256"],
+                    "artifact_file_sha256": artifact_file_sha256,
+                    "contract_path": "provenance/objective_contract_seq1024.json",
+                    "contract_schema": "cppmega_pre_materialized_objectives_v1",
+                    "contract_sha256": objective_sha256,
+                    "contract_file_sha256": hashlib.sha256(
+                        objective_source.read_bytes()
+                    ).hexdigest(),
+                }
+            },
         },
         "buckets": [1024],
         "tokenizer": {
@@ -417,7 +482,25 @@ def _prefix_bundle(tmp_path):
             "files": tokenizer_records,
             "artifact_set_sha256": tokenizer_set_sha256,
         },
-        "bucket_results": [{"bucket": 1024, "prefix": str(prefix.relative_to(tmp_path)), "manifest": prefix_manifest}],
+        "data_contracts": {
+            "domain_schema": {
+                "path": "contracts/domain_schema_v1.json",
+                "size": domain_contract.stat().st_size,
+                "sha256": hashlib.sha256(domain_contract.read_bytes()).hexdigest(),
+            },
+            "tokenizer_contract": {
+                "path": "contracts/tokenizer_contract_v1.json",
+                "size": tokenizer_contract.stat().st_size,
+                "sha256": hashlib.sha256(tokenizer_contract.read_bytes()).hexdigest(),
+            },
+        },
+        "bucket_results": [
+            {
+                "bucket": 1024,
+                "prefix": str(prefix.relative_to(tmp_path)),
+                "manifest": prefix_manifest,
+            }
+        ],
         "artifact_count": len(records),
         "artifact_bytes": sum(int(record["size"]) for record in records),
         "artifact_set_sha256": artifact_set_sha256,
@@ -471,7 +554,9 @@ def test_validate_bundle_rehashes_every_manifest_artifact(tmp_path):
     manifest, records = _validate_bundle(tmp_path, hash_jobs=2)
 
     assert manifest["artifact_bytes"] == sum(record["size"] for record in records)
-    artifact_record = next(record for record in records if record["local_path"] == str(artifact))
+    artifact_record = next(
+        record for record in records if record["local_path"] == str(artifact)
+    )
     assert artifact_record["sha256"] == digest
 
 
@@ -544,9 +629,7 @@ def test_validate_bundle_rejects_zero_route_edges(tmp_path):
     prefix_manifest = json.loads(prefix_manifest_path.read_text(encoding="utf-8"))
     spec = prefix_manifest["graph_sidecar_paths"]["token_domain_edges"]
     spec["item_count"] = 0
-    (prefix.parent / spec["offsets_path"]).write_bytes(
-        struct.pack("<7q", *([0] * 7))
-    )
+    (prefix.parent / spec["offsets_path"]).write_bytes(struct.pack("<7q", *([0] * 7)))
     (prefix.parent / spec["data_path"]).write_bytes(b"")
     prefix_manifest_path.write_text(json.dumps(prefix_manifest), encoding="utf-8")
     _rehash_bundle_manifest(tmp_path)
@@ -570,7 +653,9 @@ def test_validate_prefix_rejects_graph_routes_without_case1_objective_contract(
 
 def test_validate_bundle_requires_positive_uint32_source_doc_ids(tmp_path):
     prefix = _prefix_bundle(tmp_path)
-    prefix_manifest = json.loads(prefix.with_suffix(".json").read_text(encoding="utf-8"))
+    prefix_manifest = json.loads(
+        prefix.with_suffix(".json").read_text(encoding="utf-8")
+    )
     spec = prefix_manifest["side_channel_paths"]["token_source_doc_ids"]
     (prefix.parent / spec["path"]).write_bytes(struct.pack("<24I", *([0] * 24)))
     _rehash_bundle_manifest(tmp_path)
@@ -581,7 +666,9 @@ def test_validate_bundle_requires_positive_uint32_source_doc_ids(tmp_path):
 
 def test_validate_bundle_rejects_source_identity_sidecar_registry_mismatch(tmp_path):
     prefix = _prefix_bundle(tmp_path)
-    prefix_manifest = json.loads(prefix.with_suffix(".json").read_text(encoding="utf-8"))
+    prefix_manifest = json.loads(
+        prefix.with_suffix(".json").read_text(encoding="utf-8")
+    )
     spec = prefix_manifest["side_channel_paths"]["token_source_identity_ids"]
     path = prefix.parent / spec["path"]
     values = list(struct.unpack("<24Q", path.read_bytes()))
@@ -595,7 +682,9 @@ def test_validate_bundle_rejects_source_identity_sidecar_registry_mismatch(tmp_p
 
 def test_validate_bundle_rejects_tampered_source_identity_witness(tmp_path):
     prefix = _prefix_bundle(tmp_path)
-    prefix_manifest = json.loads(prefix.with_suffix(".json").read_text(encoding="utf-8"))
+    prefix_manifest = json.loads(
+        prefix.with_suffix(".json").read_text(encoding="utf-8")
+    )
     registry_path = prefix.parent / prefix_manifest["source_identity_registry"]["path"]
     registry = sqlite3.connect(registry_path)
     try:
@@ -612,19 +701,40 @@ def test_validate_bundle_rejects_tampered_source_identity_witness(tmp_path):
         _validate_bundle(tmp_path, hash_jobs=1)
 
 
+def test_validate_bundle_rejects_source_identity_reference_without_witness(
+    tmp_path,
+):
+    prefix = _prefix_bundle(tmp_path)
+    prefix_manifest = json.loads(
+        prefix.with_suffix(".json").read_text(encoding="utf-8")
+    )
+    registry_path = prefix.parent / prefix_manifest["source_identity_registry"]["path"]
+    registry = sqlite3.connect(registry_path)
+    try:
+        key = registry.execute(
+            "SELECT source_identity_id FROM sequence_source_identities LIMIT 1"
+        ).fetchone()[0]
+        registry.execute(
+            "DELETE FROM source_identities WHERE source_identity_id = ?", (key,)
+        )
+        registry.commit()
+    finally:
+        registry.close()
+    _rehash_bundle_manifest(tmp_path)
+
+    with pytest.raises(ValueError, match="without canonical witnesses"):
+        _validate_bundle(tmp_path, hash_jobs=1)
+
+
 def test_validate_bundle_rejects_edge_endpoint_document_provenance_mismatch(tmp_path):
     prefix = _prefix_bundle(tmp_path)
-    prefix_manifest = json.loads(prefix.with_suffix(".json").read_text(encoding="utf-8"))
-    spec = prefix_manifest["side_channel_paths"]["token_source_doc_ids"]
-    source_ids = [
-        document + 1
-        for document in range(6)
-        for _token in range(4)
-    ]
-    source_ids[1] = 2
-    (prefix.parent / spec["path"]).write_bytes(
-        struct.pack("<24I", *source_ids)
+    prefix_manifest = json.loads(
+        prefix.with_suffix(".json").read_text(encoding="utf-8")
     )
+    spec = prefix_manifest["side_channel_paths"]["token_source_doc_ids"]
+    source_ids = [document + 1 for document in range(6) for _token in range(4)]
+    source_ids[1] = 2
+    (prefix.parent / spec["path"]).write_bytes(struct.pack("<24I", *source_ids))
     _rehash_bundle_manifest(tmp_path)
 
     with pytest.raises(ValueError, match="provenance|source document"):
@@ -633,7 +743,9 @@ def test_validate_bundle_rejects_edge_endpoint_document_provenance_mismatch(tmp_
 
 def test_validate_bundle_rejects_wrong_domain_edge_family_kind_26(tmp_path):
     prefix = _prefix_bundle(tmp_path)
-    prefix_manifest = json.loads(prefix.with_suffix(".json").read_text(encoding="utf-8"))
+    prefix_manifest = json.loads(
+        prefix.with_suffix(".json").read_text(encoding="utf-8")
+    )
     spec = prefix_manifest["graph_sidecar_paths"]["token_domain_edges"]
     (prefix.parent / spec["data_path"]).write_bytes(struct.pack("<3i", 1, 0, 26))
     _rehash_bundle_manifest(tmp_path)
@@ -668,10 +780,17 @@ def test_validate_bundle_rejects_wrong_domain_edge_family_kind_26(tmp_path):
         ),
         (
             [191, 195, 196, 10],
-            [1, 2, 2, 0],
+            [1, 2, 2, 1],
             [1, 1, 1, 0],
             [4, 4, 4, 0],
             "unclosed",
+        ),
+        (
+            [191, 10, 192, 11],
+            [1, 0, 1, 0],
+            [1, 0, 1, 0],
+            [4, 4, 4, 0],
+            "active delimiter scope",
         ),
     ],
 )
@@ -679,9 +798,7 @@ def test_validate_bundle_rejects_invalid_domain_delimiter_mapping_and_balance(
     tmp_path, tokens, domains, roles, confidences, message
 ):
     prefix = _prefix_bundle(tmp_path)
-    token_values = list(
-        struct.unpack("<24H", prefix.with_suffix(".bin").read_bytes())
-    )
+    token_values = list(struct.unpack("<24H", prefix.with_suffix(".bin").read_bytes()))
     token_values[:4] = tokens
     prefix.with_suffix(".bin").write_bytes(struct.pack("<24H", *token_values))
     manifest = json.loads(prefix.with_suffix(".json").read_text(encoding="utf-8"))
@@ -722,15 +839,11 @@ def test_validate_bundle_rejects_missing_staged_tokenizer_contract(tmp_path):
         manifest["tokenizer"]["files"]
     )
     manifest["artifact_count"] = len(manifest["artifacts"])
-    manifest["artifact_bytes"] = sum(
-        record["size"] for record in manifest["artifacts"]
-    )
+    manifest["artifact_bytes"] = sum(record["size"] for record in manifest["artifacts"])
     manifest["artifact_set_sha256"] = publisher._artifact_set_sha256(
         manifest["artifacts"]
     )
-    manifest["bundle_id"] = (
-        f"test-bundle-{manifest['artifact_set_sha256'][:16]}"
-    )
+    manifest["bundle_id"] = f"test-bundle-{manifest['artifact_set_sha256'][:16]}"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(ValueError, match="missing required regular artifacts"):
@@ -867,9 +980,7 @@ def test_head_contract_requires_size_and_sha_metadata():
         size=8,
         sha256="abc",
     )
-    assert not _head_matches(
-        {"ContentLength": 8, "Metadata": {}}, size=8, sha256="abc"
-    )
+    assert not _head_matches({"ContentLength": 8, "Metadata": {}}, size=8, sha256="abc")
 
 
 def test_head_contract_accepts_nebius_metadata_key_casing():
@@ -898,10 +1009,14 @@ def test_head_distinguishes_missing_object_from_transport_failure(monkeypatch):
         publisher.subprocess,
         "run",
         lambda *_args, **_kwargs: SimpleNamespace(
-            returncode=254, stdout="", stderr="An error occurred (404) when calling HeadObject"
+            returncode=254,
+            stdout="",
+            stderr="An error occurred (404) when calling HeadObject",
         ),
     )
-    assert _head(endpoint="https://s3.invalid", bucket="b", key="missing", env={}) is None
+    assert (
+        _head(endpoint="https://s3.invalid", bucket="b", key="missing", env={}) is None
+    )
 
     monkeypatch.setattr(
         publisher.subprocess,
@@ -1009,9 +1124,26 @@ def test_small_upload_is_checksum_bound_and_create_only(tmp_path, monkeypatch):
     assert receipt["status"] == "uploaded_verified"
 
 
-def test_latest_pointer_update_uses_remote_etag_compare_and_swap(
+def test_large_upload_fails_closed_until_conditional_multipart_exists(
     tmp_path, monkeypatch
 ):
+    artifact, digest = _bundle(tmp_path)
+    monkeypatch.setattr(publisher, "_head", lambda **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="conditional multipart create"):
+        _upload_file(
+            local=artifact,
+            endpoint="https://example.invalid",
+            bucket="bucket",
+            key="bundles/test-bundle/large.bin",
+            size=5 * 1024**3 + 1,
+            sha256=digest,
+            env={},
+            dry_run=False,
+        )
+
+
+def test_latest_pointer_update_uses_remote_etag_compare_and_swap(tmp_path, monkeypatch):
     artifact, digest = _bundle(tmp_path)
     expected_checksum = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
     heads = iter(
@@ -1134,14 +1266,16 @@ def test_archive_transport_dry_run_writes_commit_order_receipt(tmp_path):
     artifact, _digest = _bundle(tmp_path)
     archive = _archive(tmp_path, artifact)
 
-    assert main(["--bundle", str(tmp_path), "--archive", str(archive), "--dry-run"]) == 0
+    assert (
+        main(["--bundle", str(tmp_path), "--archive", str(archive), "--dry-run"]) == 0
+    )
 
     receipt = json.loads(
-        (tmp_path / "archive_publish_receipt.json").read_text(encoding="utf-8")
+        (tmp_path / "archive_publish_dry_run_receipt.json").read_text(encoding="utf-8")
     )
-    bundle_id = json.loads(
-        (tmp_path / "manifest.json").read_text(encoding="utf-8")
-    )["bundle_id"]
+    bundle_id = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))[
+        "bundle_id"
+    ]
     assert receipt["archive"]["key"].startswith(
         f"cppmega-megatron/macro-routes/transports/{bundle_id}/bundle-"
     )
@@ -1175,7 +1309,7 @@ def test_loose_publish_receipt_is_incremental_and_bundle_bound(tmp_path):
 
     assert main(["--bundle", str(tmp_path), "--dry-run", "--jobs", "2"]) == 0
 
-    receipt_path = tmp_path / "publish_receipt.json"
+    receipt_path = tmp_path / "publish_dry_run_receipt.json"
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
     assert receipt["status"] == "complete"
@@ -1192,7 +1326,7 @@ def test_loose_publish_receipt_is_incremental_and_bundle_bound(tmp_path):
 def test_loose_publish_rejects_stale_artifact_receipt_entry(tmp_path):
     _prefix_bundle(tmp_path)
     assert main(["--bundle", str(tmp_path), "--dry-run"]) == 0
-    receipt_path = tmp_path / "publish_receipt.json"
+    receipt_path = tmp_path / "publish_dry_run_receipt.json"
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     receipt["artifacts"][0]["sha256"] = "0" * 64
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")

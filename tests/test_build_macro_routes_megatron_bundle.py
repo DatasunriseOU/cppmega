@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,9 +13,11 @@ from scripts.data.build_macro_routes_megatron_bundle import (
     _artifact_set_sha256,
     build_arg_parser,
     _load_manifest_allowlist,
+    _parse_objective_artifacts,
     _portable_bucket_results,
     _run_snapshot_audit,
     _snapshot_sources,
+    _stage_data_contracts,
     _stage_tokenizer,
     _write_repaired_snapshot_manifest,
 )
@@ -39,27 +42,56 @@ def test_builder_discards_intermediate_snapshot_by_default() -> None:
     assert parser.parse_args(["--keep-snapshot"]).keep_snapshot is True
 
 
-def test_builder_accepts_explicit_objective_materialization_contract() -> None:
+def test_builder_accepts_explicit_bucketed_objective_artifacts() -> None:
     args = build_arg_parser().parse_args(
-        ["--objective-contract", "/checked-out/objective_contract.json"]
+        ["--objective-artifact", "1024=/checked-out/objective_materialization.json"]
     )
 
-    assert args.objective_contract == Path(
-        "/checked-out/objective_contract.json"
+    assert args.objective_artifact == [
+        "1024=/checked-out/objective_materialization.json"
+    ]
+
+
+def test_builder_requires_exactly_one_objective_artifact_per_bucket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / "objective_materialization.json"
+    artifact.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        builder, "load_objective_materialization_artifact", lambda _path: object()
     )
 
+    assert _parse_objective_artifacts(
+        [f"1024={artifact}", f"2048={artifact}"], (1024, 2048)
+    ) == {1024: artifact.resolve(), 2048: artifact.resolve()}
+    with pytest.raises(ValueError, match="exactly match"):
+        _parse_objective_artifacts([f"1024={artifact}"], (1024, 2048))
 
-def test_every_bucket_conversion_receives_objective_contract(
+
+def test_every_bucket_conversion_receives_hash_bound_objective_artifact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured: dict[str, object] = {}
-    objective_contract = tmp_path / "objective_contract.json"
-    objective_contract.write_text("{}", encoding="utf-8")
+    objective_artifact = tmp_path / "objective_materialization.json"
+    objective_artifact.write_text("{}", encoding="utf-8")
 
     def fake_convert(**kwargs: object) -> None:
         captured.update(kwargs)
 
     monkeypatch.setattr(builder, "convert_parquet_to_megatron", fake_convert)
+    monkeypatch.setattr(
+        builder,
+        "load_objective_materialization_artifact",
+        lambda _path: SimpleNamespace(
+            artifact_set_sha256="a" * 64,
+            file_sha256="b" * 64,
+        ),
+    )
+    monkeypatch.setattr(
+        builder,
+        "_objective_expected_counts",
+        lambda _path: {"rows": 1, "valid_tokens": 3, "trained_tokens": 2},
+    )
     monkeypatch.setattr(
         builder,
         "_verify_prefix",
@@ -71,40 +103,22 @@ def test_every_bucket_conversion_receives_objective_contract(
                     "dtype": "uint8",
                     "document_aligned": True,
                 },
-            }
+            },
+            "objective_materialization": {
+                "artifact_set_sha256": "a" * 64,
+                "artifact_file_sha256": "b" * 64,
+            },
         },
     )
 
     builder._build_bucket(
         bucket=1024,
-        snapshot_root=tmp_path / "snapshot",
         data_root=tmp_path / "data",
-        audit_receipt={
-            "by_kind_bucket": {
-                "code/1024": {
-                    "files": 1,
-                    "rows": 1,
-                    "capacity_tokens": 4,
-                    "valid_tokens": 3,
-                    "trained_tokens": 2,
-                    "bad_files": 0,
-                    "bad_rows": 0,
-                },
-                "commits/1024": {
-                    "files": 0,
-                    "rows": 0,
-                    "capacity_tokens": 0,
-                    "valid_tokens": 0,
-                    "trained_tokens": 0,
-                    "bad_files": 0,
-                    "bad_rows": 0,
-                },
-            }
-        },
-        objective_contract_path=objective_contract,
+        objective_artifact_path=objective_artifact,
     )
 
-    assert captured["objective_contract_path"] == str(objective_contract.resolve())
+    assert captured["objective_artifact_path"] == str(objective_artifact.resolve())
+    assert captured["input_dir"] is None
     assert captured["token_column"] == "input_ids"
 
 
@@ -127,6 +141,19 @@ def test_builder_stages_and_hashes_the_production_tokenizer(tmp_path: Path) -> N
         staged = bundle / record["path"]
         assert staged.stat().st_size == record["size"]
         assert hashlib.sha256(staged.read_bytes()).hexdigest() == record["sha256"]
+
+
+def test_builder_stages_frozen_domain_and_tokenizer_contracts(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+
+    descriptors = _stage_data_contracts(bundle)
+
+    assert set(descriptors) == {"domain_schema", "tokenizer_contract"}
+    for descriptor in descriptors.values():
+        staged = bundle / str(descriptor["path"])
+        assert staged.stat().st_size == descriptor["size"]
+        assert hashlib.sha256(staged.read_bytes()).hexdigest() == descriptor["sha256"]
 
 
 def test_bucket_prefixes_are_bundle_relative_and_cannot_escape(tmp_path: Path) -> None:
@@ -165,7 +192,9 @@ def test_builder_rejects_unbound_existing_audit_receipt(tmp_path: Path) -> None:
         )
 
 
-def test_snapshot_audit_passes_explicit_empty_pr_root(tmp_path: Path, monkeypatch) -> None:
+def test_snapshot_audit_passes_explicit_empty_pr_root(
+    tmp_path: Path, monkeypatch
+) -> None:
     captured: dict[str, list[str]] = {}
     audit_root = tmp_path / "audit"
 
@@ -206,7 +235,9 @@ def _write(path: Path, value: bytes) -> None:
     path.write_bytes(value)
 
 
-def test_manifest_allowlist_excludes_uncommitted_parquet_orphans(tmp_path: Path) -> None:
+def test_manifest_allowlist_excludes_uncommitted_parquet_orphans(
+    tmp_path: Path,
+) -> None:
     code_root = tmp_path / "code"
     commit_root = tmp_path / "commits"
     _write(code_root / "1024" / "repo.parquet", b"code")

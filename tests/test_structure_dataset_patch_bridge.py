@@ -195,6 +195,8 @@ def test_case5_training_loader_requires_success_receipt_and_registry(
             "status": "success",
             "schema": CASE5_SCHEMA_VERSION,
             "delimiter_contract_sha256": DOMAIN_DELIMITER_CONTRACT_SHA256,
+            "domain_schema_sha256": patch.DOMAIN_SCHEMA_SHA256,
+            "tokenizer_contract_sha256": patch.TOKENIZER_CONTRACT_SHA256,
         },
         "source_identity_registry": {
             "schema": SOURCE_IDENTITY_REGISTRY_SCHEMA,
@@ -210,9 +212,7 @@ def test_case5_training_loader_requires_success_receipt_and_registry(
 
     del manifest[CASE5_RECEIPT_KEY]
     prefix.with_suffix(".json").write_text(json.dumps(manifest))
-    unreceipted = SimpleNamespace(
-        dataset=SimpleNamespace(bin_path=f"{prefix}.bin")
-    )
+    unreceipted = SimpleNamespace(dataset=SimpleNamespace(bin_path=f"{prefix}.bin"))
     with pytest.raises(ValueError, match="successful case5_domain_ingestion_receipt"):
         patch._lazy_init_side_channels(unreceipted)
 
@@ -367,7 +367,9 @@ def test_uint64_transport_failure_refuses_to_narrow(monkeypatch) -> None:
 
 def test_uint64_torch_coalescing_failure_refuses_to_narrow(monkeypatch) -> None:
     monkeypatch.setenv("CPPMEGA_STRUCTURE_ENABLED", "1")
-    monkeypatch.setattr(torch.distributed, "broadcast", lambda tensor, src, group=None: None)
+    monkeypatch.setattr(
+        torch.distributed, "broadcast", lambda tensor, src, group=None: None
+    )
     original_cat = torch.cat
 
     def unsupported_uint64_cat(tensors, *args, **kwargs):
@@ -396,8 +398,7 @@ def test_uint64_torch_coalescing_failure_refuses_to_narrow(monkeypatch) -> None:
 
 
 @pytest.mark.skipif(
-    not torch.distributed.is_available()
-    or not torch.distributed.is_gloo_available(),
+    not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
     reason="Gloo is unavailable",
 )
 def test_two_rank_gloo_uint64_transport_is_exact_or_fails_loudly(tmp_path) -> None:
@@ -476,7 +477,9 @@ def test_safe_sidecar_path_allows_plain_relative_and_blocks_escape():
 
     for evil in ("../../etc/passwd", "/etc/passwd", "sub/../../escape.bin"):
         with pytest.raises(ValueError):
-            patch._safe_sidecar_path(base, evil, col="c", field="path", json_path="m.json")
+            patch._safe_sidecar_path(
+                base, evil, col="c", field="path", json_path="m.json"
+            )
 
 
 def test_safe_sidecar_path_blocks_symlink_escape(tmp_path):
@@ -487,7 +490,9 @@ def test_safe_sidecar_path_blocks_symlink_escape(tmp_path):
     (outside / "secret.bin").write_bytes(b"x")
     (base / "link").symlink_to(outside, target_is_directory=True)
     with pytest.raises(ValueError, match="symlink"):
-        patch._safe_sidecar_path(str(base), "link/secret.bin", col="c", field="path", json_path="m.json")
+        patch._safe_sidecar_path(
+            str(base), "link/secret.bin", col="c", field="path", json_path="m.json"
+        )
     (base / "ok.bin").write_bytes(b"y")
     assert patch._safe_sidecar_path(
         str(base), "ok.bin", col="c", field="path", json_path="m.json"
@@ -563,15 +568,25 @@ def test_build_graph_route_tensors_offsets_caps_and_clips():
     assert routed["graph_call_edge_counts"].item() == 1
     assert torch.equal(routed["graph_type_edges"], torch.tensor([[1, 0], [-1, -1]]))
     assert routed["graph_type_edge_counts"].item() == 1
-    assert torch.equal(routed["graph_domain_edges"], torch.tensor([[0, 3, 20], [-1, -1, -1]]))
+    assert torch.equal(
+        routed["graph_domain_edges"], torch.tensor([[0, 3, 20], [-1, -1, -1]])
+    )
     assert routed["graph_domain_edge_counts"].item() == 1
-    assert torch.equal(routed["graph_build_edges"], torch.tensor([[1, 4, 21], [-1, -1, -1]]))
+    assert torch.equal(
+        routed["graph_build_edges"], torch.tensor([[1, 4, 21], [-1, -1, -1]])
+    )
     assert routed["graph_build_edge_counts"].item() == 1
-    assert torch.equal(routed["graph_shell_edges"], torch.tensor([[-1, -1, -1], [-1, -1, -1]]))
+    assert torch.equal(
+        routed["graph_shell_edges"], torch.tensor([[-1, -1, -1], [-1, -1, -1]])
+    )
     assert routed["graph_shell_edge_counts"].item() == 0
-    assert torch.equal(routed["graph_diagnostic_edges"], torch.tensor([[3, 0, 60], [-1, -1, -1]]))
+    assert torch.equal(
+        routed["graph_diagnostic_edges"], torch.tensor([[3, 0, 60], [-1, -1, -1]])
+    )
     assert routed["graph_diagnostic_edge_counts"].item() == 1
-    assert torch.equal(routed["graph_cross_domain_edges"], torch.tensor([[4, 1, 62], [-1, -1, -1]]))
+    assert torch.equal(
+        routed["graph_cross_domain_edges"], torch.tensor([[4, 1, 62], [-1, -1, -1]])
+    )
     assert routed["graph_cross_domain_edge_counts"].item() == 1
     assert torch.equal(routed["graph_chunk_starts"], torch.tensor([0, 1]))
     assert torch.equal(routed["graph_chunk_ends"], torch.tensor([1, 5]))
@@ -582,7 +597,10 @@ def test_build_graph_route_tensors_offsets_caps_and_clips():
 
 def test_build_graph_route_tensors_rejects_invalid_chunk_endpoint():
     graph_sidecars = {
-        name: {"offsets": [0, 0], "data": torch.empty((0, width), dtype=torch.int32).numpy()}
+        name: {
+            "offsets": [0, 0],
+            "data": torch.empty((0, width), dtype=torch.int32).numpy(),
+        }
         for name, width in (
             ("token_type_edges", 2),
             ("token_domain_edges", 3),
@@ -598,17 +616,31 @@ def test_build_graph_route_tensors_rejects_invalid_chunk_endpoint():
                 "offsets": [0, 1],
                 "data": torch.tensor([[7, 8]], dtype=torch.int32).numpy(),
             },
-            "token_chunk_starts": {"offsets": [0, 1], "data": torch.tensor([0]).numpy()},
+            "token_chunk_starts": {
+                "offsets": [0, 1],
+                "data": torch.tensor([0]).numpy(),
+            },
             "token_chunk_ends": {"offsets": [0, 1], "data": torch.tensor([4]).numpy()},
             "token_chunk_kinds": {"offsets": [0, 1], "data": torch.tensor([1]).numpy()},
-            "token_chunk_dep_levels": {"offsets": [0, 1], "data": torch.tensor([0]).numpy()},
+            "token_chunk_dep_levels": {
+                "offsets": [0, 1],
+                "data": torch.tensor([0]).numpy(),
+            },
         }
     )
 
     with pytest.raises(ValueError, match="chunk endpoint out of range"):
         patch._build_graph_route_tensors(
             graph_sidecars,
-            [{"real_doc": 0, "doc_start_token": 0, "source_start": 0, "source_end": 4, "target_start": 0}],
+            [
+                {
+                    "real_doc": 0,
+                    "doc_start_token": 0,
+                    "source_start": 0,
+                    "source_end": 4,
+                    "target_start": 0,
+                }
+            ],
             target_len=4,
             max_edges=2,
             max_chunks=2,

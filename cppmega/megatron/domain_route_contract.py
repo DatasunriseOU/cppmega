@@ -9,9 +9,7 @@ from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 DOMAIN_SCHEMA_PATH = _REPO_ROOT / "data/domain_schema_v1.json"
-TOKENIZER_CONTRACT_PATH = (
-    _REPO_ROOT / "data/tokenizer_v2/tokenizer_contract_v1.json"
-)
+TOKENIZER_CONTRACT_PATH = _REPO_ROOT / "data/tokenizer_v2/tokenizer_contract_v1.json"
 
 
 def _load_json(path: Path) -> dict[str, object]:
@@ -26,6 +24,10 @@ def _load_json(path: Path) -> dict[str, object]:
 
 DOMAIN_SCHEMA = _load_json(DOMAIN_SCHEMA_PATH)
 TOKENIZER_CONTRACT = _load_json(TOKENIZER_CONTRACT_PATH)
+DOMAIN_SCHEMA_SHA256 = hashlib.sha256(DOMAIN_SCHEMA_PATH.read_bytes()).hexdigest()
+TOKENIZER_CONTRACT_SHA256 = hashlib.sha256(
+    TOKENIZER_CONTRACT_PATH.read_bytes()
+).hexdigest()
 if DOMAIN_SCHEMA.get("schema") != "cppmega_domain_sidecars_v1":
     raise RuntimeError(f"unsupported frozen domain schema: {DOMAIN_SCHEMA_PATH}")
 
@@ -62,9 +64,7 @@ DOMAIN_EDGE_KINDS_BY_COLUMN = {
 }
 if set(DOMAIN_EDGE_KINDS_BY_COLUMN) != set(_EDGE_FAMILY_TO_COLUMN.values()):
     raise RuntimeError("frozen domain schema does not define every graph edge family")
-VALID_DOMAIN_EDGE_KINDS = frozenset().union(
-    *DOMAIN_EDGE_KINDS_BY_COLUMN.values()
-)
+VALID_DOMAIN_EDGE_KINDS = frozenset().union(*DOMAIN_EDGE_KINDS_BY_COLUMN.values())
 
 GRAPH_ROUTE_COLUMNS = (
     "token_call_edges",
@@ -102,7 +102,9 @@ for domain_name, raw_spec in _DELIMITER_ROLES.items():
         raise RuntimeError(f"invalid delimiter spec for {domain_name!r}")
     domain_id = int(raw_spec["domain_id"])
     if domain_id not in VALID_DOMAIN_IDS:
-        raise RuntimeError(f"delimiter {domain_name!r} has unknown domain id {domain_id}")
+        raise RuntimeError(
+            f"delimiter {domain_name!r} has unknown domain id {domain_id}"
+        )
     for direction, target in (("start", _start_ids), ("end", _end_ids)):
         role = raw_spec[direction]
         if role not in _ASSIGNMENTS:
@@ -117,9 +119,9 @@ for domain_name, raw_spec in _DELIMITER_ROLES.items():
 DOMAIN_START_DELIMITER_IDS = frozenset(_start_ids)
 DOMAIN_END_DELIMITER_IDS = frozenset(_end_ids)
 DOMAIN_DELIMITER_TOKEN_IDS = dict(sorted(_delimiter_token_ids.items()))
-DOMAIN_DELIMITER_CONTRACT_METADATA_KEY = (
-    "cppmega.domain_delimiter_contract_sha256"
-)
+DOMAIN_DELIMITER_CONTRACT_METADATA_KEY = "cppmega.domain_delimiter_contract_sha256"
+DOMAIN_SCHEMA_SHA256_METADATA_KEY = "cppmega.domain_schema_sha256"
+TOKENIZER_CONTRACT_SHA256_METADATA_KEY = "cppmega.tokenizer_contract_sha256"
 DOMAIN_DELIMITER_CONTRACT_SHA256 = hashlib.sha256(
     json.dumps(
         DOMAIN_DELIMITER_TOKEN_IDS,
@@ -141,6 +143,8 @@ __all__ = [
     "DOMAIN_EDGE_KINDS_BY_COLUMN",
     "DOMAIN_END_DELIMITER_IDS",
     "DOMAIN_ROUTE_COLUMNS",
+    "DOMAIN_SCHEMA_SHA256",
+    "DOMAIN_SCHEMA_SHA256_METADATA_KEY",
     "DOMAIN_START_DELIMITER_IDS",
     "GRAPH_ROUTE_COLUMNS",
     "GRAPH_ROUTE_COORDINATE_SPACES",
@@ -152,4 +156,6 @@ __all__ = [
     "CASE5_RECEIPT_KEY",
     "CASE5_SCHEMA_VERSION",
     "SOURCE_IDENTITY_REGISTRY_SCHEMA",
+    "TOKENIZER_CONTRACT_SHA256",
+    "TOKENIZER_CONTRACT_SHA256_METADATA_KEY",
 ]

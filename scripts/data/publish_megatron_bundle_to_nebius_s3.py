@@ -49,8 +49,10 @@ from cppmega.megatron.domain_route_contract import (  # noqa: E402
     CASE5_SCHEMA_VERSION,
     DOMAIN_DELIMITER_CONTRACT_SHA256,
     DOMAIN_ROUTE_COLUMNS,
+    DOMAIN_SCHEMA_SHA256,
     GRAPH_ROUTE_COLUMNS,
     SOURCE_IDENTITY_REGISTRY_SCHEMA,
+    TOKENIZER_CONTRACT_SHA256,
 )
 
 
@@ -66,9 +68,7 @@ CANONICAL_TOKENIZER_CONTRACT_PATH = (
     REPO_ROOT / "data/tokenizer_v2/tokenizer_contract_v1.json"
 )
 CANONICAL_DOMAIN_SCHEMA_PATH = REPO_ROOT / "data/domain_schema_v1.json"
-CANONICAL_TOKENIZER_CONTRACT_BYTES = (
-    CANONICAL_TOKENIZER_CONTRACT_PATH.read_bytes()
-)
+CANONICAL_TOKENIZER_CONTRACT_BYTES = CANONICAL_TOKENIZER_CONTRACT_PATH.read_bytes()
 CANONICAL_TOKENIZER_CONTRACT_SHA256 = hashlib.sha256(
     CANONICAL_TOKENIZER_CONTRACT_BYTES
 ).hexdigest()
@@ -453,8 +453,7 @@ def _validate_token_semantics(
         int(value) for value in CANONICAL_DOMAIN_SCHEMA["role_kinds"].values()
     )
     valid_confidences = frozenset(
-        int(value)
-        for value in CANONICAL_DOMAIN_SCHEMA["confidence_kinds"].values()
+        int(value) for value in CANONICAL_DOMAIN_SCHEMA["confidence_kinds"].values()
     )
     delimiter_ids = np.asarray(sorted(_DELIMITER_BY_TOKEN_ID), dtype=tokens.dtype)
     delimiter_count = 0
@@ -476,7 +475,9 @@ def _validate_token_semantics(
         sequence_domains = domain_ids[start:end]
         sequence_roles = role_ids[start:end]
         sequence_confidences = confidence_ids[start:end]
-        if any(int(value) not in valid_domains for value in np.unique(sequence_domains)):
+        if any(
+            int(value) not in valid_domains for value in np.unique(sequence_domains)
+        ):
             raise ValueError(f"unknown token_domain_ids in sequence {sequence_index}")
         if any(int(value) not in valid_roles for value in np.unique(sequence_roles)):
             raise ValueError(f"unknown token_role_ids in sequence {sequence_index}")
@@ -493,9 +494,19 @@ def _validate_token_semantics(
             raise ValueError(
                 f"DELIMITER role on non-delimiter token in sequence {sequence_index}"
             )
-        stack: list[int] = []
-        for local_position in np.flatnonzero(marker_mask):
+        stack: list[tuple[int, int]] = []
+        for local_position in range(length):
             token_id = int(sequence_tokens[local_position])
+            if token_id not in _DELIMITER_BY_TOKEN_ID:
+                active_domain = stack[-1][1] if stack else 0
+                if int(sequence_domains[local_position]) != active_domain:
+                    raise ValueError(
+                        "token domain does not match active delimiter scope in "
+                        f"sequence {sequence_index} at token {local_position}: "
+                        f"domain={int(sequence_domains[local_position])} "
+                        f"active={active_domain}"
+                    )
+                continue
             expected_domain, is_start, counterpart = _DELIMITER_BY_TOKEN_ID[token_id]
             if int(sequence_domains[local_position]) != expected_domain:
                 raise ValueError(
@@ -512,8 +523,8 @@ def _validate_token_semantics(
                 )
             delimiter_count += 1
             if is_start:
-                stack.append(counterpart)
-            elif not stack or stack[-1] != token_id:
+                stack.append((counterpart, expected_domain))
+            elif not stack or stack[-1][0] != token_id:
                 raise ValueError(
                     f"crossing or unmatched delimiter token ID {token_id} in "
                     f"sequence {sequence_index}"
@@ -651,9 +662,7 @@ def _validate_graph_provenance(
                             f"sequence {sequence_index}"
                         )
                     if kind_i not in allowed_kinds:
-                        raise ValueError(
-                            f"edge kind {kind_i} is not valid for {name}"
-                        )
+                        raise ValueError(f"edge kind {kind_i} is not valid for {name}")
                     if (
                         source_ids[sequence_start + source_i]
                         != source_ids[sequence_start + target_i]
@@ -700,6 +709,8 @@ def _validate_case5_source_registry(
     expected_receipt = {
         "schema": CASE5_SCHEMA_VERSION,
         "delimiter_contract_sha256": DOMAIN_DELIMITER_CONTRACT_SHA256,
+        "domain_schema_sha256": DOMAIN_SCHEMA_SHA256,
+        "tokenizer_contract_sha256": TOKENIZER_CONTRACT_SHA256,
         "domain_route_columns": list(DOMAIN_ROUTE_COLUMNS),
         "graph_route_columns": list(GRAPH_ROUTE_COLUMNS),
         "graph_sidecars_written": True,
@@ -729,7 +740,9 @@ def _validate_case5_source_registry(
         if registry.get(key) != expected
     }
     if registry_drift:
-        raise ValueError(f"{prefix}: invalid source identity registry receipt: {registry_drift}")
+        raise ValueError(
+            f"{prefix}: invalid source identity registry receipt: {registry_drift}"
+        )
     registry_path = _safe_prefix_file(prefix.parent, str(registry.get("path", "")))
     if registry_path.is_symlink() or not registry_path.is_file():
         raise FileNotFoundError(registry_path)
@@ -762,6 +775,24 @@ def _validate_case5_source_registry(
                 f"{prefix}: source identity registry tables missing: "
                 f"{sorted(required_tables - tables)}"
             )
+        foreign_key_errors = list(connection.execute("PRAGMA foreign_key_check"))
+        if foreign_key_errors:
+            raise ValueError(
+                f"{prefix}: source identity registry foreign-key check failed"
+            )
+        missing_witnesses = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM sequence_source_identities AS refs "
+                "LEFT JOIN source_identities AS witnesses "
+                "ON witnesses.source_identity_id = refs.source_identity_id "
+                "WHERE witnesses.source_identity_id IS NULL"
+            ).fetchone()[0]
+        )
+        if missing_witnesses:
+            raise ValueError(
+                f"{prefix}: source identity registry has {missing_witnesses} "
+                "references without canonical witnesses"
+            )
 
         identity_count = int(
             connection.execute("SELECT COUNT(*) FROM source_identities").fetchone()[0]
@@ -780,15 +811,18 @@ def _validate_case5_source_registry(
 
         witness_count = 0
         for raw_id, digest_text, source in connection.execute(
-            "SELECT source_identity_id, canonical_sha256, source "
-            "FROM source_identities"
+            "SELECT source_identity_id, canonical_sha256, source FROM source_identities"
         ):
             identity_id = _decode_source_identity_key(raw_id)
             if not isinstance(source, str) or not source:
                 raise ValueError(f"{prefix}: empty canonical source identity witness")
             actual_digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
-            if digest_text != actual_digest or identity_id != _source_identity_id(source):
-                raise ValueError(f"{prefix}: invalid source identity witness {identity_id}")
+            if digest_text != actual_digest or identity_id != _source_identity_id(
+                source
+            ):
+                raise ValueError(
+                    f"{prefix}: invalid source identity witness {identity_id}"
+                )
             witness_count += 1
         if witness_count != identity_count:
             raise ValueError(f"{prefix}: source identity witness count mismatch")
@@ -843,7 +877,9 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
     token_count = int(data.get("token_count", -1))
     document_count = int(data.get("document_count", -1))
     if token_count <= 0 or document_count <= 0:
-        raise ValueError(f"{manifest_path}: token_count/document_count must be positive")
+        raise ValueError(
+            f"{manifest_path}: token_count/document_count must be positive"
+        )
     token_path = prefix.with_suffix(".bin")
     index_path = prefix.with_suffix(".idx")
     if (
@@ -857,7 +893,9 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
     if token_dtype not in DTYPE_SIZES:
         raise ValueError(f"{manifest_path}: unsupported token dtype {token_dtype!r}")
     if token_path.stat().st_size != token_count * DTYPE_SIZES[token_dtype]:
-        raise ValueError(f"{manifest_path}: token binary size does not match token_count")
+        raise ValueError(
+            f"{manifest_path}: token binary size does not match token_count"
+        )
     index = _read_mmididx(index_path, expected_dtype=token_dtype)
     if index["tokens"] != token_count or index["sequences"] != document_count:
         raise ValueError(f"{manifest_path}: MMIDIDX token/document counts disagree")
@@ -927,24 +965,34 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
             raise ValueError(f"{manifest_path}: graph sidecar {name} has bad kind")
         dtype = str(spec.get("dtype", ""))
         if dtype != expected_dtype:
-            raise ValueError(f"{manifest_path}: graph sidecar {name} has bad dtype {dtype!r}")
+            raise ValueError(
+                f"{manifest_path}: graph sidecar {name} has bad dtype {dtype!r}"
+            )
         if spec.get("offset_dtype") != "int64":
-            raise ValueError(f"{manifest_path}: graph sidecar {name} offsets must be int64")
+            raise ValueError(
+                f"{manifest_path}: graph sidecar {name} offsets must be int64"
+            )
         if spec.get("shape_tail") != expected_shape_tail:
             raise ValueError(f"{manifest_path}: graph sidecar {name} bad shape_tail")
         tail = expected_shape_tail[0]
         item_count = int(spec.get("item_count", -1))
         if item_count < 0:
-            raise ValueError(f"{manifest_path}: graph sidecar {name} has bad item_count")
+            raise ValueError(
+                f"{manifest_path}: graph sidecar {name} has bad item_count"
+            )
         graph_item_counts[name] = item_count
         if name in NONZERO_GRAPH_SIDECARS and item_count <= 0:
             raise ValueError(
                 f"{manifest_path}: graph sidecar {name} must be nonzero for H200 ingress"
             )
-        offsets_path = _safe_prefix_file(prefix.parent, str(spec.get("offsets_path", "")))
+        offsets_path = _safe_prefix_file(
+            prefix.parent, str(spec.get("offsets_path", ""))
+        )
         data_path = _safe_prefix_file(prefix.parent, str(spec.get("data_path", "")))
         if not offsets_path.is_file() or not data_path.is_file():
-            raise FileNotFoundError(f"{manifest_path}: graph sidecar {name} files missing")
+            raise FileNotFoundError(
+                f"{manifest_path}: graph sidecar {name} files missing"
+            )
         offsets = _read_int64_offsets(offsets_path, document_count + 1)
         if offsets[0] != 0 or offsets[-1] != item_count:
             raise ValueError(
@@ -952,7 +1000,9 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
                 f"span item_count={item_count}"
             )
         if any(left > right for left, right in zip(offsets, offsets[1:])):
-            raise ValueError(f"{manifest_path}: graph sidecar {name} CSR offsets decrease")
+            raise ValueError(
+                f"{manifest_path}: graph sidecar {name} CSR offsets decrease"
+            )
         expected_data_bytes = item_count * tail * DTYPE_SIZES[dtype]
         if data_path.stat().st_size != expected_data_bytes:
             raise ValueError(
@@ -992,8 +1042,13 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
     referenced.add(source_identity_registry_path)
 
     source_platform = data.get("source_platform_sidecar")
-    if not isinstance(source_platform, dict) or source_platform.get("schema") != "cppmega_source_platform_v1":
-        raise ValueError(f"{manifest_path}: compact source platform sidecar missing or invalid")
+    if (
+        not isinstance(source_platform, dict)
+        or source_platform.get("schema") != "cppmega_source_platform_v1"
+    ):
+        raise ValueError(
+            f"{manifest_path}: compact source platform sidecar missing or invalid"
+        )
     source_document_count = int(source_platform.get("source_document_count", -1))
     platform_id_count = int(source_platform.get("platform_id_count", -1))
     if source_document_count <= 0 or platform_id_count <= 0:
@@ -1021,14 +1076,16 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
         ("document", document_offsets, platform_id_count),
     ):
         if offsets[0] != 0 or offsets[-1] != final:
-            raise ValueError(f"{manifest_path}: source platform {label} CSR bounds mismatch")
+            raise ValueError(
+                f"{manifest_path}: source platform {label} CSR bounds mismatch"
+            )
         if any(left > right for left, right in zip(offsets, offsets[1:])):
-            raise ValueError(f"{manifest_path}: source platform {label} CSR offsets decrease")
+            raise ValueError(
+                f"{manifest_path}: source platform {label} CSR offsets decrease"
+            )
     if platform_ids_path.stat().st_size != platform_id_count * 2:
         raise ValueError(f"{manifest_path}: source platform IDs size mismatch")
-    referenced.update(
-        (sequence_offsets_path, document_offsets_path, platform_ids_path)
-    )
+    referenced.update((sequence_offsets_path, document_offsets_path, platform_ids_path))
     objective = data.get("objective_contract")
     if objective is None:
         raise ValueError(f"{manifest_path}: objective_contract is required")
@@ -1042,9 +1099,7 @@ def _validate_prefix_manifest_contract(prefix: Path) -> tuple[dict, set[Path]]:
             f"{manifest_path}: objective samples do not match document_count"
         )
     objective_sidecar = objective["objective_id_sidecar"]
-    objective_path = _safe_prefix_file(
-        prefix.parent, str(objective_sidecar["path"])
-    )
+    objective_path = _safe_prefix_file(prefix.parent, str(objective_sidecar["path"]))
     referenced.add(objective_path)
     return data, referenced
 
@@ -1072,7 +1127,9 @@ def _validate_tokenizer_directory(tokenizer_root: Path) -> set[Path]:
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
     if contract != CANONICAL_TOKENIZER_CONTRACT:
         raise ValueError("tokenizer contract JSON payload drifted")
-    tokenizer = json.loads((tokenizer_root / "tokenizer.json").read_text(encoding="utf-8"))
+    tokenizer = json.loads(
+        (tokenizer_root / "tokenizer.json").read_text(encoding="utf-8")
+    )
     vocab = (tokenizer.get("model") or {}).get("vocab")
     if not isinstance(vocab, dict) or len(vocab) != EXPECTED_VOCAB_SIZE:
         raise ValueError(
@@ -1080,12 +1137,15 @@ def _validate_tokenizer_directory(tokenizer_root: Path) -> set[Path]:
             f"expected {EXPECTED_VOCAB_SIZE}, got "
             f"{len(vocab) if isinstance(vocab, dict) else None}"
         )
-    if tokenizer.get("version") != "1.0" or (tokenizer.get("model") or {}).get(
-        "type"
-    ) != "BPE":
+    if (
+        tokenizer.get("version") != "1.0"
+        or (tokenizer.get("model") or {}).get("type") != "BPE"
+    ):
         raise ValueError("tokenizer JSON schema must be version 1.0 BPE")
     vocab_ids = list(vocab.values())
-    if any(not isinstance(value, int) or isinstance(value, bool) for value in vocab_ids):
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) for value in vocab_ids
+    ):
         raise ValueError("tokenizer vocab IDs must be integers")
     if set(vocab_ids) != set(range(EXPECTED_VOCAB_SIZE)):
         raise ValueError("tokenizer vocab IDs must be a complete unique 0..65535 range")
@@ -1105,7 +1165,9 @@ def _validate_tokenizer_directory(tokenizer_root: Path) -> set[Path]:
             or not isinstance(content, str)
             or token_id in added_by_id
         ):
-            raise ValueError("tokenizer added token IDs/content must be unique and typed")
+            raise ValueError(
+                "tokenizer added token IDs/content must be unique and typed"
+            )
         added_by_id[token_id] = content
         if vocab.get(content) != token_id:
             raise ValueError(
@@ -1159,7 +1221,9 @@ def _validate_tokenizer_descriptor(
     for record in canonical:
         relative = str(record["path"])
         if artifact_by_path.get(relative) != record:
-            raise ValueError(f"tokenizer artifact is not bound by bundle manifest: {relative}")
+            raise ValueError(
+                f"tokenizer artifact is not bound by bundle manifest: {relative}"
+            )
         path = _safe_artifact_path(bundle, relative)
         if tokenizer_root not in path.parents:
             raise ValueError(f"tokenizer artifact escapes tokenizer root: {relative}")
@@ -1170,6 +1234,51 @@ def _validate_tokenizer_descriptor(
     return referenced
 
 
+def _validate_data_contract_descriptors(
+    bundle: Path, manifest: dict, artifact_by_path: dict[str, dict]
+) -> set[Path]:
+    descriptors = manifest.get("data_contracts")
+    if not isinstance(descriptors, dict) or set(descriptors) != {
+        "domain_schema",
+        "tokenizer_contract",
+    }:
+        raise ValueError("bundle data_contracts descriptor is missing or incomplete")
+    expected = {
+        "domain_schema": (
+            CANONICAL_DOMAIN_SCHEMA_PATH,
+            hashlib.sha256(CANONICAL_DOMAIN_SCHEMA_PATH.read_bytes()).hexdigest(),
+        ),
+        "tokenizer_contract": (
+            CANONICAL_TOKENIZER_CONTRACT_PATH,
+            CANONICAL_TOKENIZER_CONTRACT_SHA256,
+        ),
+    }
+    referenced: set[Path] = set()
+    for name, (_canonical_path, canonical_sha256) in expected.items():
+        descriptor = descriptors[name]
+        if not isinstance(descriptor, dict) or set(descriptor) != {
+            "path",
+            "size",
+            "sha256",
+        }:
+            raise ValueError(f"bundle data contract {name} descriptor is invalid")
+        relative = str(descriptor["path"])
+        record = artifact_by_path.get(relative)
+        path = _safe_artifact_path(bundle, relative)
+        if (
+            record is None
+            or record["size"] != descriptor["size"]
+            or record["sha256"] != descriptor["sha256"]
+            or descriptor["sha256"] != canonical_sha256
+            or not path.is_file()
+        ):
+            raise ValueError(
+                f"bundle data contract {name} is not canonically hash-bound"
+            )
+        referenced.add(path)
+    return referenced
+
+
 def _load_bundle_manifest(bundle: Path) -> tuple[dict, list[dict]]:
     manifest_path = bundle / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1177,22 +1286,53 @@ def _load_bundle_manifest(bundle: Path) -> tuple[dict, list[dict]]:
         raise ValueError(f"unsupported bundle schema: {manifest.get('schema')!r}")
     _require_manifest_tokenizer_contract(manifest)
     if manifest.get("training_contract") != "objective_materialized":
-        raise ValueError(
-            "bundle training_contract must be 'objective_materialized'"
-        )
+        raise ValueError("bundle training_contract must be 'objective_materialized'")
     objective_materialization = manifest.get("objective_materialization")
     if (
         not isinstance(objective_materialization, dict)
         or objective_materialization.get("schema")
-        != "cppmega_pre_materialized_objectives_v1"
-        or not SHA256_RE.fullmatch(
-            str(objective_materialization.get("sha256", ""))
-        )
-        or not SHA256_RE.fullmatch(
-            str(objective_materialization.get("file_sha256", ""))
-        )
+        != "cppmega_bucketed_objective_materializations_v1"
+        or not isinstance(objective_materialization.get("buckets"), dict)
+        or not objective_materialization["buckets"]
     ):
         raise ValueError("bundle objective_materialization descriptor is invalid")
+    required_objective_fields = {
+        "artifact_path",
+        "artifact_schema",
+        "artifact_set_sha256",
+        "artifact_file_sha256",
+        "contract_path",
+        "contract_schema",
+        "contract_sha256",
+        "contract_file_sha256",
+    }
+    for bucket, descriptor in objective_materialization["buckets"].items():
+        if not isinstance(bucket, str) or not bucket.isdecimal():
+            raise ValueError("objective materialization bucket keys must be integers")
+        if (
+            not isinstance(descriptor, dict)
+            or set(descriptor) != required_objective_fields
+        ):
+            raise ValueError(
+                f"bundle objective materialization descriptor is invalid for {bucket}"
+            )
+        if (
+            descriptor["artifact_schema"]
+            != "cppmega_objective_materialization_artifact_v1"
+        ):
+            raise ValueError(f"unsupported objective artifact schema for {bucket}")
+        if descriptor["contract_schema"] != "cppmega_pre_materialized_objectives_v1":
+            raise ValueError(f"unsupported objective contract schema for {bucket}")
+        for field in (
+            "artifact_set_sha256",
+            "artifact_file_sha256",
+            "contract_sha256",
+            "contract_file_sha256",
+        ):
+            if not SHA256_RE.fullmatch(str(descriptor.get(field, ""))):
+                raise ValueError(
+                    f"objective materialization {bucket}.{field} is invalid"
+                )
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, list) or not artifacts:
         raise ValueError("bundle manifest has no artifacts")
@@ -1218,7 +1358,9 @@ def _load_bundle_manifest(bundle: Path) -> tuple[dict, list[dict]]:
         if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
             raise ValueError(f"artifact {relative} is missing a valid sha256")
         _safe_artifact_path(bundle, relative)
-    if sum(int(record["size"]) for record in artifacts) != int(manifest["artifact_bytes"]):
+    if sum(int(record["size"]) for record in artifacts) != int(
+        manifest["artifact_bytes"]
+    ):
         raise ValueError("bundle artifact_bytes does not match artifact list")
     canonical = _canonical_artifact_records(artifacts)
     artifact_set_sha256 = _artifact_set_sha256(canonical)
@@ -1240,37 +1382,77 @@ def _validate_bundle(bundle: Path, hash_jobs: int) -> tuple[dict, list[dict]]:
         for record in artifacts
     }
     _validate_tokenizer_descriptor(bundle, manifest, artifact_by_path)
-    objective_descriptor = manifest["objective_materialization"]
-    objective_relative = str(objective_descriptor.get("path", ""))
-    objective_path = _safe_artifact_path(bundle, objective_relative)
-    objective_record = artifact_by_path.get(objective_relative)
-    if (
-        objective_record is None
-        or objective_record["sha256"] != objective_descriptor["file_sha256"]
-        or not objective_path.is_file()
-    ):
-        raise ValueError("bundle objective materialization artifact is not hash-bound")
-    raw_objective = json.loads(objective_path.read_text(encoding="utf-8"))
-    if (
-        validate_objective_contract(raw_objective).sha256
-        != objective_descriptor["sha256"]
-    ):
-        raise ValueError("bundle objective materialization payload digest mismatch")
-
+    _validate_data_contract_descriptors(bundle, manifest, artifact_by_path)
     buckets = manifest.get("buckets")
     if (
         not isinstance(buckets, list)
         or not buckets
-        or any(not isinstance(bucket, int) or isinstance(bucket, bool) for bucket in buckets)
+        or any(
+            not isinstance(bucket, int) or isinstance(bucket, bool)
+            for bucket in buckets
+        )
         or len(buckets) != len(set(buckets))
     ):
         raise ValueError("bundle buckets must be a non-empty unique integer list")
+    objective_descriptors = manifest["objective_materialization"]["buckets"]
+    if set(objective_descriptors) != {str(bucket) for bucket in buckets}:
+        raise ValueError(
+            "bundle objective materialization buckets do not match bundle buckets"
+        )
+    for bucket in buckets:
+        descriptor = objective_descriptors[str(bucket)]
+        contract_relative = str(descriptor["contract_path"])
+        contract_path = _safe_artifact_path(bundle, contract_relative)
+        contract_record = artifact_by_path.get(contract_relative)
+        if (
+            contract_record is None
+            or contract_record["sha256"] != descriptor["contract_file_sha256"]
+            or not contract_path.is_file()
+        ):
+            raise ValueError(f"bucket {bucket} objective contract is not hash-bound")
+        raw_contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        if (
+            validate_objective_contract(raw_contract).sha256
+            != descriptor["contract_sha256"]
+        ):
+            raise ValueError(
+                f"bucket {bucket} objective contract payload digest mismatch"
+            )
+
+        artifact_relative = str(descriptor["artifact_path"])
+        artifact_path = _safe_artifact_path(bundle, artifact_relative)
+        artifact_record = artifact_by_path.get(artifact_relative)
+        if (
+            artifact_record is None
+            or artifact_record["sha256"] != descriptor["artifact_file_sha256"]
+            or not artifact_path.is_file()
+        ):
+            raise ValueError(f"bucket {bucket} objective artifact is not hash-bound")
+        raw_artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        artifact_digest = raw_artifact.get("artifact_set_sha256")
+        artifact_payload = dict(raw_artifact)
+        artifact_payload.pop("artifact_set_sha256", None)
+        actual_artifact_digest = hashlib.sha256(
+            json.dumps(
+                artifact_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("ascii")
+        ).hexdigest()
+        if (
+            raw_artifact.get("schema") != descriptor["artifact_schema"]
+            or artifact_digest != descriptor["artifact_set_sha256"]
+            or artifact_digest != actual_artifact_digest
+        ):
+            raise ValueError(
+                f"bucket {bucket} objective artifact payload digest mismatch"
+            )
     bucket_results = manifest.get("bucket_results")
     if not isinstance(bucket_results, list) or not bucket_results:
         raise ValueError("bundle bucket_results must be a non-empty list")
     result_buckets: list[int] = []
     referenced_paths: set[Path] = set()
-    objective_sha256 = str(manifest["objective_materialization"]["sha256"])
     for result in bucket_results:
         if not isinstance(result, dict):
             raise ValueError("bundle bucket_results entries must be objects")
@@ -1280,12 +1462,29 @@ def _validate_bundle(bundle: Path, hash_jobs: int) -> tuple[dict, list[dict]]:
         result_buckets.append(bucket)
         prefix = _safe_artifact_path(bundle, str(result.get("prefix", "")))
         prefix_manifest, referenced = _validate_prefix_manifest_contract(prefix)
-        if prefix_manifest["objective_contract"]["sha256"] != objective_sha256:
+        descriptor = objective_descriptors[str(bucket)]
+        if (
+            prefix_manifest["objective_contract"]["sha256"]
+            != descriptor["contract_sha256"]
+        ):
             raise ValueError(
                 f"{prefix}: objective contract does not match bundle descriptor"
             )
+        materialization = prefix_manifest.get("objective_materialization")
+        if (
+            not isinstance(materialization, dict)
+            or materialization.get("artifact_set_sha256")
+            != descriptor["artifact_set_sha256"]
+            or materialization.get("artifact_file_sha256")
+            != descriptor["artifact_file_sha256"]
+        ):
+            raise ValueError(
+                f"{prefix}: objective artifact does not match bundle descriptor"
+            )
         if result.get("manifest") != prefix_manifest:
-            raise ValueError(f"{prefix}: embedded prefix manifest does not match artifact")
+            raise ValueError(
+                f"{prefix}: embedded prefix manifest does not match artifact"
+            )
         referenced_paths.update(referenced)
     if result_buckets != buckets:
         raise ValueError(
@@ -1294,7 +1493,9 @@ def _validate_bundle(bundle: Path, hash_jobs: int) -> tuple[dict, list[dict]]:
     for path in referenced_paths:
         relative = path.relative_to(bundle.resolve()).as_posix()
         if relative not in artifact_by_path:
-            raise ValueError(f"referenced bundle artifact has no hash record: {relative}")
+            raise ValueError(
+                f"referenced bundle artifact has no hash record: {relative}"
+            )
 
     def validate(record: dict) -> dict:
         relative = str(record["path"])
@@ -1303,7 +1504,9 @@ def _validate_bundle(bundle: Path, hash_jobs: int) -> tuple[dict, list[dict]]:
             raise FileNotFoundError(path)
         size = path.stat().st_size
         if size != int(record["size"]):
-            raise ValueError(f"artifact size mismatch for {relative}: {size} != {record['size']}")
+            raise ValueError(
+                f"artifact size mismatch for {relative}: {size} != {record['size']}"
+            )
         digest = _sha256(path)
         if digest != record["sha256"]:
             raise ValueError(f"artifact sha256 mismatch for {relative}")
@@ -1351,11 +1554,15 @@ def _validate_archive(
         with tarfile.open(fileobj=decoder.stdout, mode="r|") as tar:
             for member in tar:
                 if not member.isfile():
-                    raise ValueError(f"archive contains non-file member: {member.name!r}")
+                    raise ValueError(
+                        f"archive contains non-file member: {member.name!r}"
+                    )
                 seen.append(member.name)
                 expected_record = expected.get(member.name)
                 if expected_record is None:
-                    raise ValueError(f"archive contains unexpected member: {member.name!r}")
+                    raise ValueError(
+                        f"archive contains unexpected member: {member.name!r}"
+                    )
                 expected_size, expected_sha256 = expected_record
                 if member.size != expected_size:
                     raise ValueError(
@@ -1411,9 +1618,7 @@ def _head(
         "--checksum-mode",
         "ENABLED",
     ]
-    result = subprocess.run(
-        cmd, env=env, text=True, capture_output=True, check=False
-    )
+    result = subprocess.run(cmd, env=env, text=True, capture_output=True, check=False)
     if result.returncode != 0:
         error = result.stderr.lower()
         if any(marker in error for marker in ("404", "not found", "nosuchkey")):
@@ -1489,7 +1694,12 @@ def _upload_file(
     if not dry_run:
         head = _head(endpoint=endpoint, bucket=bucket, key=key, env=env)
         if _head_matches(head, size=size, sha256=sha256):
-            return {"key": key, "size": size, "sha256": sha256, "status": "already_verified"}
+            return {
+                "key": key,
+                "size": size,
+                "sha256": sha256,
+                "status": "already_verified",
+            }
         if head is not None and not allow_overwrite:
             remote_metadata = {
                 str(key).lower(): value
@@ -1502,74 +1712,55 @@ def _upload_file(
             )
     if dry_run:
         return {"key": key, "size": size, "sha256": sha256, "status": "dry_run"}
+    if size > 5 * 1024**3:
+        raise RuntimeError(
+            "objects larger than 5 GiB require a conditional multipart create "
+            "protocol; unsafe unconditioned aws s3 cp is forbidden: "
+            f"s3://{bucket}/{key}"
+        )
     expected_checksum = base64.b64encode(bytes.fromhex(sha256)).decode("ascii")
     with _stable_upload_snapshot(local, size=size, sha256=sha256) as snapshot:
-        if size <= 5 * 1024**3:
-            command = [
-                "aws",
-                "s3api",
-                "put-object",
-                "--bucket",
-                bucket,
-                "--key",
-                key,
-                "--body",
-                str(snapshot),
-                "--endpoint-url",
-                endpoint,
-                "--metadata",
-                f"sha256={sha256}",
-                "--checksum-algorithm",
-                "SHA256",
-                "--checksum-sha256",
-                expected_checksum,
-                "--output",
-                "json",
-            ]
-            if head is None:
-                command.extend(["--if-none-match", "*"])
-            else:
-                etag = head.get("ETag")
-                if not allow_overwrite or not isinstance(etag, str) or not etag:
-                    raise RuntimeError(
-                        f"remote object cannot be conditionally replaced: s3://{bucket}/{key}"
-                    )
-                command.extend(["--if-match", etag])
-            result = subprocess.run(
-                command,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"conditional S3 upload failed for s3://{bucket}/{key}: "
-                    f"{result.stderr.strip()}"
-                )
+        command = [
+            "aws",
+            "s3api",
+            "put-object",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--body",
+            str(snapshot),
+            "--endpoint-url",
+            endpoint,
+            "--metadata",
+            f"sha256={sha256}",
+            "--checksum-algorithm",
+            "SHA256",
+            "--checksum-sha256",
+            expected_checksum,
+            "--output",
+            "json",
+        ]
+        if head is None:
+            command.extend(["--if-none-match", "*"])
         else:
-            if head is not None:
+            etag = head.get("ETag")
+            if not allow_overwrite or not isinstance(etag, str) or not etag:
                 raise RuntimeError(
-                    f"large S3 object replacement is forbidden: s3://{bucket}/{key}"
+                    f"remote object cannot be conditionally replaced: s3://{bucket}/{key}"
                 )
-            subprocess.run(
-                [
-                    "aws",
-                    "s3",
-                    "cp",
-                    str(snapshot),
-                    f"s3://{bucket}/{key}",
-                    "--endpoint-url",
-                    endpoint,
-                    "--metadata",
-                    f"sha256={sha256}",
-                    "--checksum-algorithm",
-                    "SHA256",
-                    "--only-show-errors",
-                    "--no-progress",
-                ],
-                env=env,
-                check=True,
+            command.extend(["--if-match", etag])
+        result = subprocess.run(
+            command,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"conditional S3 upload failed for s3://{bucket}/{key}: "
+                f"{result.stderr.strip()}"
             )
     head = _head(endpoint=endpoint, bucket=bucket, key=key, env=env)
     if not _head_matches(head, size=size, sha256=sha256):
@@ -1665,7 +1856,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         archive_size, archive_sha256 = _validate_archive(
             bundle=bundle, archive=archive, manifest=manifest
         )
-        receipt_path = bundle / "archive_publish_receipt.json"
+        receipt_path = bundle / (
+            "archive_publish_dry_run_receipt.json"
+            if args.dry_run
+            else "archive_publish_receipt.json"
+        )
         receipt_payload = _open_resumable_receipt(
             receipt_path,
             schema="cppmega_megatron_archive_publish_receipt_v1",
@@ -1785,7 +1980,9 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     base_key = f"{args.prefix.strip('/')}/bundles/{bundle_id}"
 
-    receipt_path = bundle / "publish_receipt.json"
+    receipt_path = bundle / (
+        "publish_dry_run_receipt.json" if args.dry_run else "publish_receipt.json"
+    )
     receipt_payload = _open_resumable_receipt(
         receipt_path,
         schema="cppmega_megatron_publish_receipt_v1",

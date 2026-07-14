@@ -59,7 +59,7 @@ OBJECTIVE_GRAPH_SIDECARS: tuple[tuple[str, str, str], ...] = (
     ("token_cross_domain_edges", "edge_triples", "int32"),
     ("token_chunk_starts", "ragged_1d", "uint32"),
     ("token_chunk_ends", "ragged_1d", "uint32"),
-    ("token_chunk_kinds", "ragged_1d", "uint16"),
+    ("token_chunk_kinds", "ragged_1d", "uint8"),
     ("token_chunk_dep_levels", "ragged_1d", "uint16"),
 )
 OBJECTIVE_IDS: dict[str, int] = {
@@ -236,9 +236,7 @@ def validate_objective_contract(
         )
     window_quotas = _hamilton_quotas(rates, task_order, window)
     zero_required_quotas = sorted(
-        task
-        for task in REQUIRED_PRODUCTION_OBJECTIVES
-        if window_quotas[task] == 0
+        task for task in REQUIRED_PRODUCTION_OBJECTIVES if window_quotas[task] == 0
     )
     if zero_required_quotas:
         raise ValueError(
@@ -257,9 +255,7 @@ def validate_objective_contract(
         for task in task_order
     }
     zero_required_planned = sorted(
-        task
-        for task in REQUIRED_PRODUCTION_OBJECTIVES
-        if planned_samples[task] == 0
+        task for task in REQUIRED_PRODUCTION_OBJECTIVES if planned_samples[task] == 0
     )
     if zero_required_planned:
         raise ValueError(
@@ -376,13 +372,11 @@ def validate_objective_contract(
         raise ValueError("graph_auxiliary.runtime must be 'megatron_dsa_indexer_v1'")
     if graph.get("pair_mask") != "causal_same_document_upstream_v1":
         raise ValueError(
-            "graph_auxiliary.pair_mask must be "
-            "'causal_same_document_upstream_v1'"
+            "graph_auxiliary.pair_mask must be 'causal_same_document_upstream_v1'"
         )
     if graph.get("chunk_edge_expansion") != "cartesian_token_spans_v1":
         raise ValueError(
-            "graph_auxiliary.chunk_edge_expansion must be "
-            "'cartesian_token_spans_v1'"
+            "graph_auxiliary.chunk_edge_expansion must be 'cartesian_token_spans_v1'"
         )
 
     materialization = _mapping(contract.get("materialization"), where="materialization")
@@ -449,7 +443,9 @@ def verify_objective_materialization_shard(
     try:
         index = artifact.parquet_paths.index(path)
     except ValueError as exc:
-        raise ValueError(f"parquet shard is not bound by objective artifact: {path}") from exc
+        raise ValueError(
+            f"parquet shard is not bound by objective artifact: {path}"
+        ) from exc
     raw_binding = artifact.payload["parquet_shards"][index]
     binding = _mapping(raw_binding, where=f"parquet_shards[{index}]")
     if binding.get("path") != path.name:
@@ -521,8 +517,7 @@ def load_objective_materialization_artifact(
     }
     if set(contract_ref) != expected_contract_ref_keys:
         raise ValueError(
-            "objective_contract must contain path, sha256, size_bytes, "
-            "and file_sha256"
+            "objective_contract must contain path, sha256, size_bytes, and file_sha256"
         )
     contract_path = _artifact_file(
         root, contract_ref.get("path"), where="objective_contract.path"
@@ -618,7 +613,9 @@ def load_objective_materialization_artifact(
         if candidate.resolve() not in set(parquet_paths)
     )
     if unlisted:
-        raise ValueError(f"objective artifact directory contains unlisted parquet: {unlisted}")
+        raise ValueError(
+            f"objective artifact directory contains unlisted parquet: {unlisted}"
+        )
 
     return ObjectiveMaterializationArtifact(
         path=artifact_path,
@@ -874,7 +871,9 @@ def validate_materialized_objective_artifact(
         raise ValueError("objective_materialization.parquet_shards must be non-empty")
     names: list[str] = []
     for index, raw_shard in enumerate(shards):
-        shard = _mapping(raw_shard, where=f"objective_materialization.parquet_shards[{index}]")
+        shard = _mapping(
+            raw_shard, where=f"objective_materialization.parquet_shards[{index}]"
+        )
         if set(shard) != {"path", "size_bytes", "sha256"}:
             raise ValueError(
                 "objective_materialization shard bindings require path/size_bytes/sha256"
@@ -889,7 +888,9 @@ def validate_materialized_objective_artifact(
             or len(digest) != 64
             or any(character not in "0123456789abcdef" for character in digest)
         ):
-            raise ValueError(f"objective_materialization shard[{index}] sha256 is invalid")
+            raise ValueError(
+                f"objective_materialization shard[{index}] sha256 is invalid"
+            )
         names.append(name)
     if names != sorted(names) or len(names) != len(set(names)):
         raise ValueError("objective_materialization shards must be sorted and unique")

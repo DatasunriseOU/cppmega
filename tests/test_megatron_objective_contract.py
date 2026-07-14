@@ -177,9 +177,7 @@ def test_objective_materialization_artifact_opens_exact_bound_inputs(
     assert artifact.parquet_paths == (
         (tmp_path / "objectives_00000.parquet").resolve(),
     )
-    assert artifact.contract.sha256 == artifact.payload["objective_contract"][
-        "sha256"
-    ]
+    assert artifact.contract.sha256 == artifact.payload["objective_contract"]["sha256"]
 
 
 def test_objective_materialization_artifact_rejects_shard_byte_drift(
@@ -554,6 +552,7 @@ def test_graph_enabled_dataset_ingress_rejects_runtime_weight_drift(
     dataset = SimpleNamespace(dataset=SimpleNamespace(bin_path=str(prefix) + ".bin"))
     monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
     monkeypatch.setenv("CPPMEGA_STRUCTURE_ENABLED", "1")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_ENABLED", "1")
     monkeypatch.setenv(env_name, env_value)
 
     with pytest.raises(ValueError, match=field + ".*contract"):

@@ -42,8 +42,8 @@ from data.publish_megatron_bundle_to_nebius_s3 import (  # noqa: E402
     _validate_tokenizer_directory,
 )
 from cppmega.megatron.objective_contract import (  # noqa: E402
+    load_objective_materialization_artifact,
     validate_materialized_objective_contract,
-    validate_objective_contract,
 )
 
 
@@ -73,7 +73,9 @@ def _sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
 def _write_json_atomic(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     os.replace(tmp, path)
 
 
@@ -113,7 +115,9 @@ def _load_manifest_allowlist(
     done = blob.get("done")
     if not isinstance(done, dict):
         raise ValueError(f"{manifest_path}: missing done map")
-    allowed = {(kind, bucket): set() for kind in ("code", "commits") for bucket in buckets}
+    allowed = {
+        (kind, bucket): set() for kind in ("code", "commits") for bucket in buckets
+    }
     for key, info in done.items():
         if not isinstance(info, dict):
             continue
@@ -138,7 +142,9 @@ def _load_manifest_allowlist(
             if str(bucket) in lengths:
                 allowed[(kind, bucket)].add(filename)
     if any(not names for names in allowed.values()):
-        empty = [f"{kind}/{bucket}" for (kind, bucket), names in allowed.items() if not names]
+        empty = [
+            f"{kind}/{bucket}" for (kind, bucket), names in allowed.items() if not names
+        ]
         raise RuntimeError(f"manifest has no completed files for: {', '.join(empty)}")
     metadata = {
         "path": str(manifest_path.resolve()),
@@ -327,21 +333,6 @@ def _run_boundary_repair(
     return receipt
 
 
-def _build_combined_snapshot(snapshot_root: Path, buckets: tuple[int, ...]) -> None:
-    for bucket in buckets:
-        combined_dir = snapshot_root / "combined" / str(bucket)
-        if combined_dir.exists():
-            continue
-        building = combined_dir.with_name(f".{combined_dir.name}.building")
-        if building.exists():
-            shutil.rmtree(building)
-        building.mkdir(parents=True)
-        for kind in ("code", "commits"):
-            for source in sorted((snapshot_root / kind / str(bucket)).glob("*.parquet")):
-                os.link(source, building / f"{kind}__{source.name}")
-        os.replace(building, combined_dir)
-
-
 def _run_snapshot_audit(
     *,
     snapshot_root: Path,
@@ -412,22 +403,47 @@ def _run_snapshot_audit(
     return receipt
 
 
-def _bucket_audit_totals(receipt: dict[str, object], bucket: int) -> dict[str, int]:
-    by_kind_bucket = receipt.get("by_kind_bucket")
-    if not isinstance(by_kind_bucket, dict):
-        raise RuntimeError("audit receipt has no by_kind_bucket map")
-    entries = []
-    for kind in ("code", "commits"):
-        key = f"{kind}/{bucket}"
-        entry = by_kind_bucket.get(key)
-        if not isinstance(entry, dict):
-            raise RuntimeError(f"audit receipt is missing {key}")
-        if int(entry.get("bad_files", -1)) or int(entry.get("bad_rows", -1)):
-            raise RuntimeError(f"audit receipt bucket {key} is not green")
-        entries.append(entry)
+def _parse_objective_artifacts(
+    values: list[str], buckets: tuple[int, ...]
+) -> dict[int, Path]:
+    artifacts: dict[int, Path] = {}
+    for value in values:
+        bucket_text, separator, path_text = value.partition("=")
+        if not separator or not bucket_text or not path_text:
+            raise ValueError(
+                "--objective-artifact must use BUCKET=/path/to/"
+                "objective_materialization.json"
+            )
+        try:
+            bucket = int(bucket_text)
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid objective artifact bucket {bucket_text!r}"
+            ) from exc
+        if bucket in artifacts:
+            raise ValueError(f"duplicate objective artifact for bucket {bucket}")
+        artifacts[bucket] = Path(path_text).resolve()
+    expected = set(buckets)
+    actual = set(artifacts)
+    if actual != expected:
+        raise ValueError(
+            "objective artifact buckets must exactly match --buckets: "
+            f"missing={sorted(expected - actual)} extra={sorted(actual - expected)}"
+        )
+    for path in artifacts.values():
+        load_objective_materialization_artifact(path)
+    return artifacts
+
+
+def _objective_expected_counts(path: Path) -> dict[str, int]:
+    artifact = load_objective_materialization_artifact(path)
+    totals = artifact.contract.payload["totals"]
+    samples = int(totals["samples"])
     return {
-        field: sum(int(entry[field]) for entry in entries)
-        for field in ("files", "rows", "capacity_tokens", "valid_tokens", "trained_tokens")
+        "rows": samples,
+        # shifted_lm_document_v1 appends one zero-loss sentinel per sample.
+        "valid_tokens": int(totals["input_tokens"]) + samples,
+        "trained_tokens": int(totals["loss_tokens"]),
     }
 
 
@@ -467,7 +483,9 @@ def _verify_prefix(prefix: Path, expected: dict[str, int]) -> dict[str, object]:
     document_count = int(data["document_count"])
     trained_tokens = int(data["trained_token_count"])
     if token_count != expected["valid_tokens"]:
-        raise RuntimeError(f"{prefix}: token_count {token_count} != {expected['valid_tokens']}")
+        raise RuntimeError(
+            f"{prefix}: token_count {token_count} != {expected['valid_tokens']}"
+        )
     if document_count != expected["rows"]:
         raise RuntimeError(
             f"{prefix}: document_count {document_count} != {expected['rows']}"
@@ -520,9 +538,7 @@ def _verify_prefix(prefix: Path, expected: dict[str, int]) -> dict[str, object]:
         raise RuntimeError(f"{prefix}: compact source platform sidecar missing")
     if source_platform.get("schema") != "cppmega_source_platform_v1":
         raise RuntimeError(f"{prefix}: unsupported source platform sidecar schema")
-    sequence_offsets = prefix_dir / str(
-        source_platform["sequence_doc_offsets_path"]
-    )
+    sequence_offsets = prefix_dir / str(source_platform["sequence_doc_offsets_path"])
     doc_offsets = prefix_dir / str(source_platform["doc_platform_offsets_path"])
     platform_ids = prefix_dir / str(source_platform["platform_ids_path"])
     if sequence_offsets.stat().st_size != (document_count + 1) * 8:
@@ -551,12 +567,11 @@ def _verify_prefix(prefix: Path, expected: dict[str, int]) -> dict[str, object]:
 def _build_bucket(
     *,
     bucket: int,
-    snapshot_root: Path,
     data_root: Path,
-    audit_receipt: dict[str, object],
-    objective_contract_path: Path,
+    objective_artifact_path: Path,
 ) -> dict[str, object]:
-    expected = _bucket_audit_totals(audit_receipt, bucket)
+    artifact = load_objective_materialization_artifact(objective_artifact_path)
+    expected = _objective_expected_counts(objective_artifact_path)
     final_dir = data_root / f"seq_{bucket}"
     prefix_name = f"cppmega_macro_routes_seq{bucket}_train"
     final_prefix = final_dir / prefix_name
@@ -570,7 +585,7 @@ def _build_bucket(
     building_dir.mkdir(parents=True)
     building_prefix = building_dir / prefix_name
     convert_parquet_to_megatron(
-        input_dir=str(snapshot_root / "combined" / str(bucket)),
+        input_dir=None,
         output_prefix=str(building_prefix),
         split="all",
         token_column="input_ids",
@@ -579,9 +594,18 @@ def _build_bucket(
         vocab_size=65536,
         writer_backend="mmididx",
         source_platform_sidecar=True,
-        objective_contract_path=str(objective_contract_path.resolve()),
+        objective_artifact_path=str(objective_artifact_path.resolve()),
     )
     manifest = _verify_prefix(building_prefix, expected)
+    materialization = manifest.get("objective_materialization")
+    if (
+        not isinstance(materialization, dict)
+        or materialization.get("artifact_set_sha256") != artifact.artifact_set_sha256
+        or materialization.get("artifact_file_sha256") != artifact.file_sha256
+    ):
+        raise RuntimeError(
+            f"{building_prefix}: converted objective artifact binding drifted"
+        )
     os.replace(building_dir, final_dir)
     return {"bucket": bucket, "prefix": str(final_prefix), "manifest": manifest}
 
@@ -621,7 +645,6 @@ def _artifact_set_sha256(records: list[dict[str, object]]) -> str:
 
 def _stage_tokenizer(tokenizer_dir: Path, bundle_root: Path) -> dict[str, object]:
     source_files = sorted(_validate_tokenizer_directory(tokenizer_dir))
-    source = tokenizer_dir.resolve()
 
     target = bundle_root / "tokenizer"
     if target.exists():
@@ -645,6 +668,27 @@ def _stage_tokenizer(tokenizer_dir: Path, bundle_root: Path) -> dict[str, object
         "files": records,
         "artifact_set_sha256": _artifact_set_sha256(records),
     }
+
+
+def _stage_data_contracts(bundle_root: Path) -> dict[str, dict[str, object]]:
+    target = bundle_root / "contracts"
+    target.mkdir()
+    sources = {
+        "domain_schema": REPO_ROOT / "data/domain_schema_v1.json",
+        "tokenizer_contract": (
+            REPO_ROOT / "data/tokenizer_v2/tokenizer_contract_v1.json"
+        ),
+    }
+    descriptors: dict[str, dict[str, object]] = {}
+    for name, source in sources.items():
+        staged = target / source.name
+        shutil.copy2(source, staged)
+        descriptors[name] = {
+            "path": staged.relative_to(bundle_root).as_posix(),
+            "size": staged.stat().st_size,
+            "sha256": _sha256(staged),
+        }
+    return descriptors
 
 
 def _portable_bucket_results(
@@ -704,11 +748,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=REPO_ROOT / "data/tokenizer_v2",
     )
     parser.add_argument(
-        "--objective-contract",
-        type=Path,
+        "--objective-artifact",
+        action="append",
+        default=[],
+        metavar="BUCKET=PATH",
         help=(
-            "CASE1 cppmega_pre_materialized_objectives_v1 receipt. Production "
-            "graph bundles require this explicit materialization contract."
+            "Canonical shard-hashed CASE1 objective artifact for one sequence "
+            "bucket. Repeat once for every --buckets entry."
         ),
     )
     parser.add_argument("--buckets", default=",".join(map(str, DEFAULT_BUCKETS)))
@@ -729,15 +775,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     buckets = tuple(int(value) for value in args.buckets.split(",") if value)
     if not buckets:
         raise SystemExit("at least one bucket is required")
-    if args.objective_contract is None:
-        raise SystemExit("--objective-contract is required for graph-route bundles")
-    objective_contract_path = args.objective_contract.resolve()
-    if not objective_contract_path.is_file():
-        raise FileNotFoundError(objective_contract_path)
-    objective_payload = json.loads(
-        objective_contract_path.read_text(encoding="utf-8")
-    )
-    objective_contract = validate_objective_contract(objective_payload)
+    objective_artifacts = _parse_objective_artifacts(args.objective_artifact, buckets)
     output_dir = args.output_dir.resolve()
     partial_dir = output_dir.with_name(f".{output_dir.name}.partial")
     if output_dir.exists():
@@ -780,8 +818,6 @@ def main(argv: Iterable[str] | None = None) -> int:
         workers=args.audit_workers,
         snapshot_manifest_sha256=_sha256(snapshot_root / "repaired_manifest.json"),
     )
-    _build_combined_snapshot(snapshot_root, buckets)
-
     data_root = partial_dir / "data"
     data_root.mkdir(exist_ok=True)
     bucket_results = _portable_bucket_results(
@@ -789,10 +825,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         [
             _build_bucket(
                 bucket=bucket,
-                snapshot_root=snapshot_root,
                 data_root=data_root,
-                audit_receipt=audit_receipt,
-                objective_contract_path=objective_contract_path,
+                objective_artifact_path=objective_artifacts[bucket],
             )
             for bucket in buckets
         ],
@@ -804,9 +838,25 @@ def main(argv: Iterable[str] | None = None) -> int:
         provenance_root / "repaired_snapshot_manifest.json",
         repaired_snapshot_manifest,
     )
-    staged_objective_contract = provenance_root / "objective_contract.json"
-    shutil.copy2(objective_contract_path, staged_objective_contract)
+    objective_descriptors: dict[str, dict[str, object]] = {}
+    for bucket in buckets:
+        artifact = load_objective_materialization_artifact(objective_artifacts[bucket])
+        staged_artifact = provenance_root / f"objective_artifact_seq{bucket}.json"
+        staged_contract = provenance_root / f"objective_contract_seq{bucket}.json"
+        shutil.copy2(artifact.path, staged_artifact)
+        shutil.copy2(artifact.contract_path, staged_contract)
+        objective_descriptors[str(bucket)] = {
+            "artifact_path": staged_artifact.relative_to(partial_dir).as_posix(),
+            "artifact_schema": artifact.payload["schema"],
+            "artifact_set_sha256": artifact.artifact_set_sha256,
+            "artifact_file_sha256": artifact.file_sha256,
+            "contract_path": staged_contract.relative_to(partial_dir).as_posix(),
+            "contract_schema": artifact.contract.payload["schema"],
+            "contract_sha256": artifact.contract.sha256,
+            "contract_file_sha256": _sha256(staged_contract),
+        }
     tokenizer = _stage_tokenizer(args.tokenizer_dir, partial_dir)
+    data_contracts = _stage_data_contracts(partial_dir)
     if not args.keep_snapshot:
         shutil.rmtree(snapshot_root)
     artifacts = _artifact_records(partial_dir, args.hash_jobs)
@@ -819,15 +869,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         "tokenizer_contract": EXPECTED_BUNDLE_TOKENIZER_CONTRACT,
         "vocab_size": EXPECTED_VOCAB_SIZE,
         "tokenizer": tokenizer,
+        "data_contracts": data_contracts,
         "token_column": "input_ids",
         "length_column": "valid_token_count",
         "writer_backend": "mmididx",
         "training_contract": "objective_materialized",
         "objective_materialization": {
-            "path": "provenance/objective_contract.json",
-            "schema": objective_contract.payload["schema"],
-            "sha256": objective_contract.sha256,
-            "file_sha256": _sha256(staged_objective_contract),
+            "schema": "cppmega_bucketed_objective_materializations_v1",
+            "buckets": objective_descriptors,
         },
         "buckets": list(buckets),
         "known_limitations": [
@@ -866,7 +915,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         },
         "implementation_sha256": {
             "builder": _sha256(Path(__file__).resolve()),
-            "converter": _sha256(REPO_ROOT / "scripts/data_prep_parquet_to_megatron.py"),
+            "converter": _sha256(
+                REPO_ROOT / "scripts/data_prep_parquet_to_megatron.py"
+            ),
             "audit": _sha256(args.audit_script.resolve()),
             "boundary_repair": _sha256(args.repair_script.resolve()),
         },

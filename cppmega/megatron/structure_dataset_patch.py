@@ -22,9 +22,11 @@ from cppmega.megatron.domain_route_contract import (
     CASE5_RECEIPT_KEY,
     CASE5_SCHEMA_VERSION,
     DOMAIN_DELIMITER_CONTRACT_SHA256,
+    DOMAIN_SCHEMA_SHA256,
     GRAPH_ROUTE_COLUMNS,
     GRAPH_ROUTE_COORDINATE_SPACES,
     SOURCE_IDENTITY_REGISTRY_SCHEMA,
+    TOKENIZER_CONTRACT_SHA256,
 )
 
 # Thread-local storage to safely pass the current batch's structure inputs to model forward
@@ -42,6 +44,7 @@ def _env_flag(name: str) -> bool:
 
 def _set_current_structure_batch(batch: Dict[str, torch.Tensor] | None) -> None:
     _local_storage.current_structure_batch = batch
+
 
 def _get_current_structure_batch() -> Dict[str, torch.Tensor] | None:
     return getattr(_local_storage, "current_structure_batch", None)
@@ -124,8 +127,16 @@ _TOKEN_COL_ALIASES = {
     "structure_ids": ("token_structure_ids", "structure_ids"),
     "dep_levels": ("token_dep_levels", "dep_levels"),
     "ast_depth_ids": ("token_ast_depth", "ast_depth_ids", "token_ast_depth_ids"),
-    "sibling_index_ids": ("token_sibling_index", "sibling_index_ids", "token_sibling_index_ids"),
-    "node_type_ids": ("token_ast_node_type", "node_type_ids", "token_ast_node_type_ids"),
+    "sibling_index_ids": (
+        "token_sibling_index",
+        "sibling_index_ids",
+        "token_sibling_index_ids",
+    ),
+    "node_type_ids": (
+        "token_ast_node_type",
+        "node_type_ids",
+        "token_ast_node_type_ids",
+    ),
     "platform_ids": ("token_platform_ids", "platform_ids"),
     "symbol_ids": ("token_symbol_ids", "symbol_ids"),
     "call_targets": ("token_call_targets", "call_targets"),
@@ -137,18 +148,14 @@ _TOKEN_COL_ALIASES = {
 
 _OPAQUE_SYMBOL_ID_COLS = frozenset(("symbol_ids", "call_targets", "type_refs"))
 _OPAQUE_SYMBOL_ID_ALIASES = frozenset(
-    alias
-    for column in _OPAQUE_SYMBOL_ID_COLS
-    for alias in _TOKEN_COL_ALIASES[column]
+    alias for column in _OPAQUE_SYMBOL_ID_COLS for alias in _TOKEN_COL_ALIASES[column]
 )
 _SYMBOL_IDENTITY_SCHEMA_VERSION = 3
 _OPAQUE_UINT64_ID_COLS = frozenset(
     ("source_identity_ids", "symbol_ids", "call_targets", "type_refs")
 )
 _OPAQUE_UINT64_ID_ALIASES = frozenset(
-    alias
-    for column in _OPAQUE_UINT64_ID_COLS
-    for alias in _TOKEN_COL_ALIASES[column]
+    alias for column in _OPAQUE_UINT64_ID_COLS for alias in _TOKEN_COL_ALIASES[column]
 )
 _CASE5_DOMAIN_ID_ALIASES = {
     column: frozenset(_TOKEN_COL_ALIASES[column])
@@ -210,15 +217,15 @@ def _padded_token_sidecar_tensor(tokens: torch.Tensor, *, col: str) -> torch.Ten
     )
 
 
-def _pop_structure_batch(batch: Dict[str, torch.Tensor] | None) -> Dict[str, torch.Tensor] | None:
+def _pop_structure_batch(
+    batch: Dict[str, torch.Tensor] | None,
+) -> Dict[str, torch.Tensor] | None:
     """Remove cppmega sidecar tensors from a Megatron batch and stash them."""
     if batch is None:
         _set_current_structure_batch(None)
         return None
     structure_batch = {
-        col: batch.pop(col)
-        for col in _CPPMEGA_BATCH_COLS
-        if col in batch
+        col: batch.pop(col) for col in _CPPMEGA_BATCH_COLS if col in batch
     }
     if structure_batch:
         receipt_path = os.environ.get("CPPMEGA_H200_BATCH_RECEIPT")
@@ -238,11 +245,7 @@ def _pop_structure_batch(batch: Dict[str, torch.Tensor] | None) -> Dict[str, tor
 
 def _take_cppmega_sidecars(batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """Remove cppmega-owned tensors before Megatron filters the core batch."""
-    return {
-        col: batch.pop(col)
-        for col in _CPPMEGA_BATCH_COLS
-        if col in batch
-    }
+    return {col: batch.pop(col) for col in _CPPMEGA_BATCH_COLS if col in batch}
 
 
 def _batch_transport_device(batch: Dict[str, torch.Tensor] | None) -> torch.device:
@@ -345,9 +348,11 @@ def _prepare_source_payloads(
         if not cols:
             continue
         try:
-            payloads[opaque] = torch.cat(
-                [prepared[col].reshape(-1) for col in cols]
-            ).to(device=device, non_blocking=True).contiguous()
+            payloads[opaque] = (
+                torch.cat([prepared[col].reshape(-1) for col in cols])
+                .to(device=device, non_blocking=True)
+                .contiguous()
+            )
         except (RuntimeError, TypeError, NotImplementedError) as exc:
             col_index = _CPPMEGA_BATCH_COLS.index(cols[0])
             return {}, {}, (_TP_BRIDGE_DEVICE, col_index, exc)
@@ -566,7 +571,9 @@ def _sidecar_json_path(dataset: Any) -> str:
                 bin_path = getattr(bin_reader, "_bin_path", None)
 
     if bin_path is None:
-        raise RuntimeError("[cppmega-patch] bin_path is None, cannot initialize side channels")
+        raise RuntimeError(
+            "[cppmega-patch] bin_path is None, cannot initialize side channels"
+        )
 
     prefix = os.path.splitext(str(bin_path))[0]
     json_path = prefix + ".json"
@@ -581,7 +588,10 @@ def _sidecar_json_path(dataset: Any) -> str:
 
 
 def _load_sidecar_manifest(dataset: Any) -> tuple[str, dict[str, Any]]:
-    if hasattr(dataset, "_cppmega_sidecar_manifest") and dataset._cppmega_sidecar_manifest is not None:
+    if (
+        hasattr(dataset, "_cppmega_sidecar_manifest")
+        and dataset._cppmega_sidecar_manifest is not None
+    ):
         return dataset._cppmega_sidecar_manifest
     json_path = _sidecar_json_path(dataset)
     with open(json_path, "r", encoding="utf-8") as f:
@@ -637,9 +647,7 @@ def _load_sidecar_manifest(dataset: Any) -> tuple[str, dict[str, Any]]:
             validate_runtime_graph_contract,
         )
 
-        validate_runtime_graph_contract(
-            validated_objectives.payload["graph_auxiliary"]
-        )
+        validate_runtime_graph_contract(validated_objectives.payload["graph_auxiliary"])
     dataset._cppmega_sidecar_manifest = (json_path, sidecar)
     return json_path, sidecar
 
@@ -678,7 +686,10 @@ def _safe_sidecar_path(
 
 def _lazy_init_side_channels(dataset: Any) -> Dict[str, Dict[str, Any]]:
     """Load JSON sidecar and initialize numpy.memmap for all defined side-channel columns."""
-    if hasattr(dataset, "_side_channels_cache") and dataset._side_channels_cache is not None:
+    if (
+        hasattr(dataset, "_side_channels_cache")
+        and dataset._side_channels_cache is not None
+    ):
         return dataset._side_channels_cache
 
     dataset._side_channels_cache = {}
@@ -697,7 +708,10 @@ def _lazy_init_side_channels(dataset: Any) -> Dict[str, Dict[str, Any]]:
 
     present_symbol_columns = _OPAQUE_SYMBOL_ID_ALIASES & set(side_paths)
     if present_symbol_columns:
-        if sidecar.get("symbol_identity_schema_version") != _SYMBOL_IDENTITY_SCHEMA_VERSION:
+        if (
+            sidecar.get("symbol_identity_schema_version")
+            != _SYMBOL_IDENTITY_SCHEMA_VERSION
+        ):
             raise ValueError(
                 "[cppmega-patch] semantic symbol sidecars require "
                 f"symbol_identity_schema_version={_SYMBOL_IDENTITY_SCHEMA_VERSION} "
@@ -745,6 +759,8 @@ def _lazy_init_side_channels(dataset: Any) -> Dict[str, Dict[str, Any]]:
             receipt.get("schema") != CASE5_SCHEMA_VERSION
             or receipt.get("delimiter_contract_sha256")
             != DOMAIN_DELIMITER_CONTRACT_SHA256
+            or receipt.get("domain_schema_sha256") != DOMAIN_SCHEMA_SHA256
+            or receipt.get("tokenizer_contract_sha256") != TOKENIZER_CONTRACT_SHA256
         ):
             raise ValueError(
                 f"[cppmega-patch] stale CASE5 schema or delimiter receipt in "
@@ -781,8 +797,12 @@ def _lazy_init_side_channels(dataset: Any) -> Dict[str, Dict[str, Any]]:
                 f"uint64, got {dtype_str!r} in {json_path!r}"
             )
         if not rel_path:
-            raise ValueError(f"[cppmega-patch] side-channel {col!r} has no path in {json_path!r}")
-        path = _safe_sidecar_path(base_dir, rel_path, col=col, field="path", json_path=json_path)
+            raise ValueError(
+                f"[cppmega-patch] side-channel {col!r} has no path in {json_path!r}"
+            )
+        path = _safe_sidecar_path(
+            base_dir, rel_path, col=col, field="path", json_path=json_path
+        )
         if not os.path.exists(path):
             raise FileNotFoundError(
                 f"[cppmega-patch] side-channel file for {col!r} not found: {path}"
@@ -792,13 +812,19 @@ def _lazy_init_side_channels(dataset: Any) -> Dict[str, Dict[str, Any]]:
             "mmap": mmap,
             "dtype": np.dtype(dtype_str),
         }
-        print(f"[cppmega-patch] Mapped side-channel {col} from {path} with dtype {dtype_str}", flush=True)
+        print(
+            f"[cppmega-patch] Mapped side-channel {col} from {path} with dtype {dtype_str}",
+            flush=True,
+        )
 
     return dataset._side_channels_cache
 
 
 def _lazy_init_graph_sidecars(dataset: Any) -> Dict[str, Dict[str, Any]]:
-    if hasattr(dataset, "_graph_sidecars_cache") and dataset._graph_sidecars_cache is not None:
+    if (
+        hasattr(dataset, "_graph_sidecars_cache")
+        and dataset._graph_sidecars_cache is not None
+    ):
         return dataset._graph_sidecars_cache
 
     dataset._graph_sidecars_cache = {}
@@ -820,9 +846,13 @@ def _lazy_init_graph_sidecars(dataset: Any) -> Dict[str, Dict[str, Any]]:
 
     missing = sorted(set(_GRAPH_ROUTE_COLS) - set(graph_paths))
     if missing:
-        raise KeyError(f"[cppmega-patch] graph sidecars missing required columns: {missing}")
+        raise KeyError(
+            f"[cppmega-patch] graph sidecars missing required columns: {missing}"
+        )
 
-    document_count = int(sidecar.get("document_count", len(dataset.dataset.index.sequence_lengths)))
+    document_count = int(
+        sidecar.get("document_count", len(dataset.dataset.index.sequence_lengths))
+    )
     base_dir = os.path.dirname(json_path)
     for col, entry in graph_paths.items():
         coordinate_space = entry.get("coordinate_space")
@@ -832,23 +862,41 @@ def _lazy_init_graph_sidecars(dataset: Any) -> Dict[str, Dict[str, Any]]:
                 f"{coordinate_space!r} != {GRAPH_ROUTE_COORDINATE_SPACES[col]!r} in {json_path!r}"
             )
         offsets_path = _safe_sidecar_path(
-            base_dir, entry["offsets_path"], col=col, field="offsets_path", json_path=json_path
+            base_dir,
+            entry["offsets_path"],
+            col=col,
+            field="offsets_path",
+            json_path=json_path,
         )
         data_path = _safe_sidecar_path(
-            base_dir, entry["data_path"], col=col, field="data_path", json_path=json_path
+            base_dir,
+            entry["data_path"],
+            col=col,
+            field="data_path",
+            json_path=json_path,
         )
         if not os.path.exists(offsets_path):
-            raise FileNotFoundError(f"[cppmega-patch] graph offsets file for {col!r} not found: {offsets_path}")
+            raise FileNotFoundError(
+                f"[cppmega-patch] graph offsets file for {col!r} not found: {offsets_path}"
+            )
         if not os.path.exists(data_path):
-            raise FileNotFoundError(f"[cppmega-patch] graph data file for {col!r} not found: {data_path}")
+            raise FileNotFoundError(
+                f"[cppmega-patch] graph data file for {col!r} not found: {data_path}"
+            )
 
         offset_dtype = np.dtype(entry.get("offset_dtype", "int64"))
         dtype = np.dtype(entry.get("dtype", "int32"))
-        offsets = np.memmap(offsets_path, mode="r", dtype=offset_dtype, shape=(document_count + 1,))
+        offsets = np.memmap(
+            offsets_path, mode="r", dtype=offset_dtype, shape=(document_count + 1,)
+        )
         if int(offsets[0]) != 0:
-            raise ValueError(f"[cppmega-patch] graph offsets for {col!r} must start at 0")
+            raise ValueError(
+                f"[cppmega-patch] graph offsets for {col!r} must start at 0"
+            )
         if np.any(np.diff(offsets) < 0):
-            raise ValueError(f"[cppmega-patch] graph offsets for {col!r} are not monotonic")
+            raise ValueError(
+                f"[cppmega-patch] graph offsets for {col!r} are not monotonic"
+            )
         item_count = int(entry.get("item_count", int(offsets[-1])))
         if int(offsets[-1]) != item_count:
             raise ValueError(
@@ -997,7 +1045,9 @@ def _sample_document_ids(
 
     values = raw_document_ids.reshape(-1).to(dtype=torch.long)
     if target_len < 1:
-        raise ValueError(f"graph document target_len must be positive, got {target_len}")
+        raise ValueError(
+            f"graph document target_len must be positive, got {target_len}"
+        )
     result = torch.zeros((target_len,), dtype=torch.long, device=values.device)
     cursor = 0
     next_document_id = 1
@@ -1055,7 +1105,9 @@ def _slice_graph_doc(cache_entry: dict[str, Any], real_doc: int) -> np.ndarray:
     return np.asarray(cache_entry["data"][start:end])
 
 
-def _cap_2d(values: list[tuple[int, int]], *, max_rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _cap_2d(
+    values: list[tuple[int, int]], *, max_rows: int
+) -> tuple[torch.Tensor, torch.Tensor]:
     out = torch.full((max_rows, 2), -1, dtype=torch.long)
     count = min(len(values), max_rows)
     if count:
@@ -1063,7 +1115,9 @@ def _cap_2d(values: list[tuple[int, int]], *, max_rows: int) -> tuple[torch.Tens
     return out, torch.tensor(count, dtype=torch.long)
 
 
-def _cap_3d(values: list[tuple[int, int, int]], *, max_rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _cap_3d(
+    values: list[tuple[int, int, int]], *, max_rows: int
+) -> tuple[torch.Tensor, torch.Tensor]:
     out = torch.full((max_rows, 3), -1, dtype=torch.long)
     count = min(len(values), max_rows)
     if count:
@@ -1071,7 +1125,9 @@ def _cap_3d(values: list[tuple[int, int, int]], *, max_rows: int) -> tuple[torch
     return out, torch.tensor(count, dtype=torch.long)
 
 
-def _cap_1d(values: list[int], *, max_rows: int, pad: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+def _cap_1d(
+    values: list[int], *, max_rows: int, pad: int = 0
+) -> tuple[torch.Tensor, torch.Tensor]:
     out = torch.full((max_rows,), pad, dtype=torch.long)
     count = min(len(values), max_rows)
     if count:
@@ -1116,7 +1172,10 @@ def _build_graph_route_tensors(
             for src, dst, kind in rows:
                 src_i = int(src)
                 dst_i = int(dst)
-                if source_start <= src_i < source_end and source_start <= dst_i < source_end:
+                if (
+                    source_start <= src_i < source_end
+                    and source_start <= dst_i < source_end
+                ):
                     adj_src = target_start + src_i - source_start
                     adj_dst = target_start + dst_i - source_start
                     if 0 <= adj_src < target_len and 0 <= adj_dst < target_len:
@@ -1125,7 +1184,9 @@ def _build_graph_route_tensors(
         starts = _slice_graph_doc(graph_sidecars["token_chunk_starts"], real_doc)
         ends = _slice_graph_doc(graph_sidecars["token_chunk_ends"], real_doc)
         kinds = _slice_graph_doc(graph_sidecars["token_chunk_kinds"], real_doc)
-        dep_levels = _slice_graph_doc(graph_sidecars["token_chunk_dep_levels"], real_doc)
+        dep_levels = _slice_graph_doc(
+            graph_sidecars["token_chunk_dep_levels"], real_doc
+        )
         if not (len(starts) == len(ends) == len(kinds) == len(dep_levels)):
             raise ValueError(
                 f"[cppmega-patch] chunk graph sidecar lengths disagree for document {real_doc}: "
@@ -1164,7 +1225,12 @@ def _build_graph_route_tensors(
             for src, dst in rows:
                 src_i = int(src)
                 dst_i = int(dst)
-                if src_i < 0 or dst_i < 0 or src_i >= len(starts) or dst_i >= len(starts):
+                if (
+                    src_i < 0
+                    or dst_i < 0
+                    or src_i >= len(starts)
+                    or dst_i >= len(starts)
+                ):
                     raise ValueError(
                         f"[cppmega-patch] {source_name} chunk endpoint out of range "
                         f"for document {real_doc} with {len(starts)} chunks: "
@@ -1204,11 +1270,21 @@ def _build_graph_route_tensors(
 
     graph_call_edges, graph_call_edge_counts = _cap_2d(call_edges, max_rows=max_edges)
     graph_type_edges, graph_type_edge_counts = _cap_2d(type_edges, max_rows=max_edges)
-    graph_domain_edges, graph_domain_edge_counts = _cap_3d(domain_edges, max_rows=max_edges)
-    graph_build_edges, graph_build_edge_counts = _cap_3d(build_edges, max_rows=max_edges)
-    graph_shell_edges, graph_shell_edge_counts = _cap_3d(shell_edges, max_rows=max_edges)
-    graph_diagnostic_edges, graph_diagnostic_edge_counts = _cap_3d(diagnostic_edges, max_rows=max_edges)
-    graph_cross_domain_edges, graph_cross_domain_edge_counts = _cap_3d(cross_domain_edges, max_rows=max_edges)
+    graph_domain_edges, graph_domain_edge_counts = _cap_3d(
+        domain_edges, max_rows=max_edges
+    )
+    graph_build_edges, graph_build_edge_counts = _cap_3d(
+        build_edges, max_rows=max_edges
+    )
+    graph_shell_edges, graph_shell_edge_counts = _cap_3d(
+        shell_edges, max_rows=max_edges
+    )
+    graph_diagnostic_edges, graph_diagnostic_edge_counts = _cap_3d(
+        diagnostic_edges, max_rows=max_edges
+    )
+    graph_cross_domain_edges, graph_cross_domain_edge_counts = _cap_3d(
+        cross_domain_edges, max_rows=max_edges
+    )
     graph_chunk_starts, graph_chunk_counts = _cap_1d(chunk_starts, max_rows=max_chunks)
     graph_chunk_ends, _ = _cap_1d(chunk_ends, max_rows=max_chunks)
     graph_chunk_kinds, _ = _cap_1d(chunk_kinds, max_rows=max_chunks)
@@ -1245,15 +1321,16 @@ try:
 
     orig_getitem = GPTDataset.__getitem__
 
-    def patched_getitem(self: GPTDataset, idx: Optional[int]) -> Dict[str, torch.Tensor]:
+    def patched_getitem(
+        self: GPTDataset, idx: Optional[int]
+    ) -> Dict[str, torch.Tensor]:
         sample = orig_getitem(self, idx)
 
         structure_enabled = _env_flag("CPPMEGA_STRUCTURE_ENABLED")
         graph_enabled = _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED")
         if graph_enabled and not structure_enabled:
             raise RuntimeError(
-                "CPPMEGA_GRAPH_ROUTES_ENABLED=1 requires "
-                "CPPMEGA_STRUCTURE_ENABLED=1"
+                "CPPMEGA_GRAPH_ROUTES_ENABLED=1 requires CPPMEGA_STRUCTURE_ENABLED=1"
             )
         if not structure_enabled:
             try:
@@ -1271,17 +1348,50 @@ try:
                 max_chunks = int(os.environ.get("CPPMEGA_GRAPH_MAX_CHUNKS", "256"))
                 graph = _build_graph_route_tensors(
                     {
-                        "token_call_edges": {"offsets": np.array([0, 0]), "data": np.empty((0, 2), dtype=np.int32)},
-                        "token_type_edges": {"offsets": np.array([0, 0]), "data": np.empty((0, 2), dtype=np.int32)},
-                        "token_domain_edges": {"offsets": np.array([0, 0]), "data": np.empty((0, 3), dtype=np.int32)},
-                        "token_build_edges": {"offsets": np.array([0, 0]), "data": np.empty((0, 3), dtype=np.int32)},
-                        "token_shell_edges": {"offsets": np.array([0, 0]), "data": np.empty((0, 3), dtype=np.int32)},
-                        "token_diagnostic_edges": {"offsets": np.array([0, 0]), "data": np.empty((0, 3), dtype=np.int32)},
-                        "token_cross_domain_edges": {"offsets": np.array([0, 0]), "data": np.empty((0, 3), dtype=np.int32)},
-                        "token_chunk_starts": {"offsets": np.array([0, 0]), "data": np.empty((0,), dtype=np.uint32)},
-                        "token_chunk_ends": {"offsets": np.array([0, 0]), "data": np.empty((0,), dtype=np.uint32)},
-                        "token_chunk_kinds": {"offsets": np.array([0, 0]), "data": np.empty((0,), dtype=np.uint16)},
-                        "token_chunk_dep_levels": {"offsets": np.array([0, 0]), "data": np.empty((0,), dtype=np.uint16)},
+                        "token_call_edges": {
+                            "offsets": np.array([0, 0]),
+                            "data": np.empty((0, 2), dtype=np.int32),
+                        },
+                        "token_type_edges": {
+                            "offsets": np.array([0, 0]),
+                            "data": np.empty((0, 2), dtype=np.int32),
+                        },
+                        "token_domain_edges": {
+                            "offsets": np.array([0, 0]),
+                            "data": np.empty((0, 3), dtype=np.int32),
+                        },
+                        "token_build_edges": {
+                            "offsets": np.array([0, 0]),
+                            "data": np.empty((0, 3), dtype=np.int32),
+                        },
+                        "token_shell_edges": {
+                            "offsets": np.array([0, 0]),
+                            "data": np.empty((0, 3), dtype=np.int32),
+                        },
+                        "token_diagnostic_edges": {
+                            "offsets": np.array([0, 0]),
+                            "data": np.empty((0, 3), dtype=np.int32),
+                        },
+                        "token_cross_domain_edges": {
+                            "offsets": np.array([0, 0]),
+                            "data": np.empty((0, 3), dtype=np.int32),
+                        },
+                        "token_chunk_starts": {
+                            "offsets": np.array([0, 0]),
+                            "data": np.empty((0,), dtype=np.uint32),
+                        },
+                        "token_chunk_ends": {
+                            "offsets": np.array([0, 0]),
+                            "data": np.empty((0,), dtype=np.uint32),
+                        },
+                        "token_chunk_kinds": {
+                            "offsets": np.array([0, 0]),
+                            "data": np.empty((0,), dtype=np.uint8),
+                        },
+                        "token_chunk_dep_levels": {
+                            "offsets": np.array([0, 0]),
+                            "data": np.empty((0,), dtype=np.uint16),
+                        },
                     },
                     [],
                     target_len=int(sample["tokens"].shape[-1]),
@@ -1401,9 +1511,7 @@ try:
                     "doc_ids sidecar; token_source_doc_ids is provenance and "
                     "cannot substitute for segment boundaries"
                 )
-            raw_document_ids = torch.from_numpy(
-                document_entry["mmap"][indices]
-            ).long()
+            raw_document_ids = torch.from_numpy(document_entry["mmap"][indices]).long()
             if self.config.add_extra_token_to_sequence:
                 raw_document_ids = raw_document_ids[:-1]
             graph["graph_document_ids"] = _sample_document_ids(
@@ -1467,6 +1575,7 @@ try:
         structure_batch = _get_current_structure_batch()
         if structure_batch:
             from cppmega.megatron.structure_batch import maybe_set_structure_inputs
+
             maybe_set_structure_inputs(self, structure_batch)
         return orig_mamba_forward(self, *args, **kwargs)
 
@@ -1491,6 +1600,7 @@ try:
         structure_batch = _get_current_structure_batch()
         if structure_batch:
             from cppmega.megatron.structure_batch import maybe_set_structure_inputs
+
             maybe_set_structure_inputs(self, structure_batch)
         return orig_gpt_forward(self, *args, **kwargs)
 
@@ -1499,6 +1609,4 @@ try:
 except ImportError:
     pass
 except Exception as e:
-    raise RuntimeError(
-        f"[cppmega-patch] failed to patch GPTModel.forward: {e}"
-    ) from e
+    raise RuntimeError(f"[cppmega-patch] failed to patch GPTModel.forward: {e}") from e
