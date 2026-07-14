@@ -8,6 +8,7 @@ invalid.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
@@ -85,7 +86,22 @@ RELATION_NAMES = tuple(
 )
 
 _REPOSITORY_SOURCE_SUFFIXES = frozenset(
-    {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
+    {
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cxx",
+        ".h",
+        ".h++",
+        ".hh",
+        ".hpp",
+        ".hxx",
+        ".inc",
+        ".inl",
+        ".ipp",
+        ".tpp",
+        ".txx",
+    }
 )
 _REPOSITORY_INPUT_NAMES = frozenset(
     {
@@ -1015,7 +1031,7 @@ class PromptGraphContext:
         *,
         document_id: int | None = None,
         source_path: str | None = None,
-        source_start: int | None = 0,
+        source_start: int | None = None,
         language: str = "cpp",
         role: str = "code",
     ) -> "PromptGraphContext":
@@ -1031,6 +1047,61 @@ class PromptGraphContext:
             ),
             language=language,
         )
+
+    @classmethod
+    def from_repository_prompt(
+        cls,
+        project_index: PromptProjectIndex,
+        prompt: str,
+        *,
+        document_id: int,
+        source_path: str,
+        source_start: int,
+        language: str = "cpp",
+    ) -> "PromptGraphContext":
+        """Prepend the transitive definitions referenced by a source prompt."""
+        prompt_segment = PromptGraphSegment(
+            prompt,
+            document_id=document_id,
+            source_path=source_path,
+            source_start=source_start,
+            role="target",
+        )
+        dependencies = _repository_dependency_chunks(
+            project_index,
+            document_id=document_id,
+            source_start=source_start,
+            source_end=source_start + len(prompt),
+        )
+        if not dependencies:
+            return cls(segments=(prompt_segment,), language=language)
+
+        segments: list[PromptGraphSegment] = []
+        for chunk in dependencies:
+            document = project_index.document_for_id(chunk.document_id)
+            segments.extend(
+                (
+                    PromptGraphSegment(
+                        f"\n// cppmega dependency: {chunk.source_path}\n",
+                        role="dependency_boundary",
+                    ),
+                    PromptGraphSegment(
+                        document.source[chunk.start : chunk.end],
+                        document_id=chunk.document_id,
+                        source_path=chunk.source_path,
+                        source_start=chunk.start,
+                        role="dependency",
+                    ),
+                )
+            )
+        segments.append(
+            PromptGraphSegment(
+                f"\n// cppmega target: {source_path}\n",
+                role="target_boundary",
+            )
+        )
+        segments.append(prompt_segment)
+        return cls(segments=tuple(segments), language=language)
 
     @property
     def text(self) -> str:
@@ -1063,6 +1134,105 @@ class PromptGraphContext:
                 segment.to_dict() for segment in self.segments
             ],
         }
+
+
+def _repository_dependency_chunks(
+    project_index: PromptProjectIndex,
+    *,
+    document_id: int,
+    source_start: int,
+    source_end: int,
+) -> tuple[PromptGraphChunk, ...]:
+    """Return every indexed definition chunk reachable from visible uses."""
+    project_index.validate()
+    source_document = project_index.document_for_id(document_id)
+    if source_start < 0 or source_end <= source_start:
+        raise ValueError("repository prompt source span must be non-empty")
+    if source_end > len(source_document.source):
+        raise ValueError(
+            f"repository prompt source span [{source_start},{source_end}) "
+            f"exceeds {source_document.source_path} length "
+            f"{len(source_document.source)}"
+        )
+
+    symbols_by_identity = {
+        symbol.identity: symbol for symbol in project_index.symbols
+    }
+    chunks_by_identity = {
+        chunk.identity: chunk for chunk in project_index.chunks
+    }
+    symbols_by_chunk: dict[str, list[PromptGraphSymbol]] = {}
+    for symbol in sorted(
+        project_index.symbols,
+        key=lambda item: (
+            item.chunk_identity,
+            item.document_id,
+            item.start,
+            item.end,
+            item.identity,
+        ),
+    ):
+        symbols_by_chunk.setdefault(symbol.chunk_identity, []).append(symbol)
+    outgoing: dict[str, list[PromptGraphEdge]] = {}
+    for edge in sorted(
+        project_index.edges,
+        key=lambda item: (
+            item.source,
+            item.relation,
+            item.target,
+            -1 if item.kind is None else item.kind,
+        ),
+    ):
+        outgoing.setdefault(edge.source, []).append(edge)
+
+    visible = {
+        symbol.identity
+        for symbol in project_index.symbols
+        if symbol.document_id == document_id
+        and symbol.start < source_end
+        and source_start < symbol.end
+    }
+    queue = deque(sorted(visible))
+    seen_or_queued = set(visible)
+    visited: set[str] = set()
+    dependencies: dict[str, PromptGraphChunk] = {}
+    while queue:
+        source_identity = queue.popleft()
+        if source_identity in visited:
+            continue
+        visited.add(source_identity)
+        for edge in outgoing.get(source_identity, ()):
+            target = symbols_by_identity[edge.target]
+            chunk = chunks_by_identity.get(target.chunk_identity)
+            if chunk is None:
+                raise ValueError(
+                    f"repository dependency edge {edge.source!r}->"
+                    f"{edge.target!r} has no target definition chunk"
+                )
+            overlaps_prompt = (
+                chunk.document_id == document_id
+                and chunk.start < source_end
+                and source_start < chunk.end
+            )
+            if overlaps_prompt:
+                continue
+            dependencies[chunk.identity] = chunk
+            for candidate in symbols_by_chunk.get(chunk.identity, ()):
+                if candidate.identity not in seen_or_queued:
+                    queue.append(candidate.identity)
+                    seen_or_queued.add(candidate.identity)
+
+    return tuple(
+        sorted(
+            dependencies.values(),
+            key=lambda item: (
+                item.source_path,
+                item.start,
+                item.end,
+                item.identity,
+            ),
+        )
+    )
 
 
 class CppPromptTokenizerAdapter:

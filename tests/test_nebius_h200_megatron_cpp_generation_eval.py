@@ -40,17 +40,23 @@ def _case3_prompt() -> str:
 
 
 def test_actual_parser_defaults_accept_explicit_shipped_case_graph_modes():
-    args = parse_args(["--dry-run"])
+    indexer_root = ROOT.parent / "cppmega_mlx_case3_prompt"
+    args = parse_args(
+        ["--dry-run", "--clang-indexer-root", str(indexer_root)]
+    )
     rows = list(iter_jsonl(DEFAULT_CASES))
 
     assert args.cases == DEFAULT_CASES
     assert args.prompt_graph_mode == "repo"
     assert rows
-    assert {row["prompt_graph_mode"] for row in rows} == {"off"}
-    assert eval_graph_assets(
+    assert {row["prompt_graph_mode"] for row in rows} == {"off", "repo"}
+    assets = eval_graph_assets(
         args.cases,
         prompt_graph_mode=args.prompt_graph_mode,
-    ) == {}
+        indexer_root=args.clang_indexer_root,
+    )
+    assert assets
+    assert args.allow_compile_fail is False
 
 
 def test_remote_generation_script_is_bash_parseable(tmp_path):
@@ -116,6 +122,7 @@ def test_generation_worker_builds_model_loads_checkpoint_and_threads_sidecars():
     assert "PromptGraphBuilder" in worker
     assert "CppPromptTokenizerAdapter" in worker
     assert "PromptProjectIndex.from_json_path" in worker
+    assert "PromptGraphContext.from_repository_prompt" in worker
     assert "_set_current_structure_batch(structure_inputs)" in worker
     assert "_set_current_structure_batch(None)" in worker
     assert "finally:" in worker
@@ -248,7 +255,8 @@ def test_prompt_graph_builder_serializes_h200_structure_inputs(tmp_path):
     source = project_index.document_for_path("src/math_prompt.cpp")
     artifact = builder.build(
         project_index,
-        PromptGraphContext.from_prompt(
+        PromptGraphContext.from_repository_prompt(
+            project_index,
             prompt,
             document_id=source.id,
             source_path=source.source_path,
@@ -262,6 +270,17 @@ def test_prompt_graph_builder_serializes_h200_structure_inputs(tmp_path):
     assert artifact.graph_routes["graph_call_edges"]
     assert artifact.graph_routes["graph_type_edges"]
     assert artifact.graph_routes["graph_domain_edges"]
+    assert any(
+        segment.role == "dependency"
+        and segment.source_path == "src/repo_helper.cpp"
+        for segment in PromptGraphContext.from_repository_prompt(
+            project_index,
+            prompt,
+            document_id=source.id,
+            source_path=source.source_path,
+            source_start=0,
+        ).segments
+    )
     restored = artifact.__class__.from_dict(json.loads(artifact.to_json()))
     assert restored.receipt == artifact.receipt
     assert (tmp_path / f"{artifact.receipt['cache_key']}.json").is_file()
@@ -319,6 +338,7 @@ def test_make_eval_tar_builds_and_contains_real_project_index(tmp_path):
         CASE3_FIXTURE / "prompts.jsonl",
         out,
         prompt_graph_mode="repo",
+        indexer_root=ROOT.parent / "cppmega_mlx_case3_prompt",
     )
 
     with tarfile.open(out, "r:gz") as tf:
@@ -349,21 +369,31 @@ def test_make_eval_tar_fails_closed_when_repo_checkout_is_missing(tmp_path):
             prompts,
             tmp_path / "eval.tgz",
             prompt_graph_mode="repo",
+            indexer_root=ROOT.parent / "cppmega_mlx_case3_prompt",
         )
 
 
-def test_case3_fixture_passes_local_compile_gate(tmp_path):
+def test_case3_gold_fixture_passes_repository_compile_and_link_gate(tmp_path):
     report = tmp_path / "compile_report.json"
 
     rc = run_compile_gate(
         CASE3_FIXTURE / "cases.jsonl",
-        CASE3_FIXTURE / "completions.jsonl",
+        CASE3_FIXTURE / "gold_completions.jsonl",
         report,
         keep_workdir=False,
     )
 
     assert rc == 0
-    assert json.loads(report.read_text())["summary"]["passed"] == 1
+    payload = json.loads(report.read_text())
+    assert payload["summary"]["passed"] == 1
+    assert payload["summary"]["repository_cases"] == 1
+    result = payload["results"][0]
+    assert result["compile_context"] == "repository"
+    assert result["linked_sources"] == [
+        "src/math_prompt.cpp",
+        "src/repo_helper.cpp",
+        "src/repo_caller.cpp",
+    ]
 
 
 def test_local_compile_gate_returns_nonzero_for_failed_candidate(tmp_path):
@@ -452,6 +482,8 @@ def test_dry_run_prints_remote_generation_script(tmp_path, capsys):
             str(CASE3_FIXTURE / "prompts.jsonl"),
             "--max-new-tokens",
             "8",
+            "--clang-indexer-root",
+            str(ROOT.parent / "cppmega_mlx_case3_prompt"),
         ]
     )
 

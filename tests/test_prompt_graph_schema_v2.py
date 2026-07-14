@@ -165,6 +165,37 @@ def test_builder_projects_cross_document_route_and_document_ids() -> None:
     }
 
 
+def test_repository_context_includes_referenced_cross_file_definition() -> None:
+    index = PromptProjectIndex.from_dict(_v2_payload())
+    second = index.document_for_path("src/second.cpp")
+
+    context = PromptGraphContext.from_repository_prompt(
+        index,
+        second.source,
+        document_id=second.id,
+        source_path=second.source_path,
+        source_start=0,
+    )
+    artifact = PromptGraphBuilder(_CharacterOffsetTokenizer()).build(index, context)
+
+    dependencies = [
+        segment for segment in context.segments if segment.role == "dependency"
+    ]
+    assert len(dependencies) == 1
+    assert dependencies[0].source_path == "src/first.cpp"
+    assert context.segments[-1].role == "target"
+    assert artifact.edge_counts["call"] == 1
+    assert artifact.graph_routes["graph_call_edges"]
+
+
+def test_from_prompt_default_remains_unmapped_and_usable() -> None:
+    context = PromptGraphContext.from_prompt("int value = 1;")
+
+    assert context.text == "int value = 1;"
+    assert context.segments[0].source_start is None
+    assert set(context.source_positions()) == {None}
+
+
 @pytest.mark.parametrize(
     ("relation", "kind", "message"),
     [

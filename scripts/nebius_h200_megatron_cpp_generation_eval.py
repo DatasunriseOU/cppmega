@@ -170,6 +170,7 @@ def _prepare_eval_graph_cases(
             built = ClangPromptProjectIndexProducer(
                 cache_dir=prompt_index_cache_dir,
                 indexer_root=indexer_root,
+                strict_diagnostics=True,
             ).build(repo_path, project_id=project_id)
             project_index = built.index
             index_path = built.path
@@ -229,12 +230,18 @@ def _prepare_eval_graph_cases(
     return PreparedEvalGraphCases(rows=tuple(staged_rows), assets=assets)
 
 
-def eval_graph_assets(cases: Path, *, prompt_graph_mode: str) -> dict[Path, Path]:
+def eval_graph_assets(
+    cases: Path,
+    *,
+    prompt_graph_mode: str,
+    indexer_root: Path | None,
+) -> dict[Path, Path]:
     cache_dir = Path(tempfile.gettempdir()) / "cppmega-prompt-index-cache"
     return _prepare_eval_graph_cases(
         cases,
         prompt_graph_mode=prompt_graph_mode,
         prompt_index_cache_dir=cache_dir,
+        indexer_root=indexer_root,
     ).assets
 
 
@@ -244,6 +251,7 @@ def make_eval_tar(
     path: Path,
     *,
     prompt_graph_mode: str,
+    indexer_root: Path | None,
 ) -> None:
     for item in (cases, prompts):
         if not item.exists():
@@ -256,6 +264,7 @@ def make_eval_tar(
             cases,
             prompt_graph_mode=prompt_graph_mode,
             prompt_index_cache_dir=stage / "prompt_index_cache",
+            indexer_root=indexer_root,
         )
         (eval_stage / "cases.jsonl").write_text(
             "".join(
@@ -1104,7 +1113,8 @@ def main() -> int:
                 )
                 graph_artifact = graph_builder.build(
                     project_index,
-                    PromptGraphContext.from_prompt(
+                    PromptGraphContext.from_repository_prompt(
+                        project_index,
                         prompt,
                         document_id=int(row["prompt_document_id"]),
                         source_path=str(row["prompt_source_path"]),
@@ -1211,6 +1221,7 @@ def main() -> int:
             completion_row = {
                 "task_id": task_id,
                 "completion": completion,
+                "completion_source": "model_generation",
                 **graph_receipt_fields,
             }
             comp_fh.write(json.dumps(completion_row, ensure_ascii=False) + "\n")
@@ -1393,6 +1404,16 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tokenizer-dir", type=Path, default=DEFAULT_TOKENIZER_DIR)
     parser.add_argument("--cases", type=Path, default=DEFAULT_CASES)
     parser.add_argument("--prompts", type=Path, default=DEFAULT_PROMPTS)
+    parser.add_argument(
+        "--clang-indexer-root",
+        type=Path,
+        default=(
+            Path(os.environ["CPPMEGA_CLANG_INDEXER_ROOT"])
+            if os.environ.get("CPPMEGA_CLANG_INDEXER_ROOT")
+            else None
+        ),
+        help="Required for repo cases without a prebuilt prompt graph index.",
+    )
     parser.add_argument("--seq-length", type=int, default=1024)
     parser.add_argument("--max-new-tokens", type=int, default=192)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -1404,7 +1425,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--remote-timeout-s", type=int, default=3600)
     parser.add_argument("--keep-instance", action="store_true")
     parser.add_argument("--keep-workdir", action="store_true")
-    parser.add_argument("--fail-on-compile-fail", action="store_true")
+    parser.add_argument(
+        "--allow-compile-fail",
+        action="store_true",
+        help="Diagnostic-only override; generation compile failures fail by default.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(list(argv) if argv is not None else None)
 
@@ -1423,7 +1448,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         raise ValueError("--prompt-graph-mode=repo requires --prompt-mode=source-prefix")
     if not args.prompts.is_file():
         raise FileNotFoundError(args.prompts)
-    eval_graph_assets(args.cases, prompt_graph_mode=args.prompt_graph_mode)
+    eval_graph_assets(
+        args.cases,
+        prompt_graph_mode=args.prompt_graph_mode,
+        indexer_root=args.clang_indexer_root,
+    )
 
     pubkey_path = args.ssh_pubkey or Path(str(args.ssh_key) + ".pub")
     if not pubkey_path.exists():
@@ -1468,6 +1497,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 args.prompts,
                 eval_tar,
                 prompt_graph_mode=args.prompt_graph_mode,
+                indexer_root=args.clang_indexer_root,
             )
             make_checkpoint_plain_tar(args.checkpoint_local, checkpoint_tar)
             has_ghcr_auth = make_ghcr_auth_tar(args, ghcr_auth_tar)
@@ -1535,11 +1565,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     if not completions.exists():
         raise FileNotFoundError(f"remote generation did not produce {completions}")
     compile_rc = run_compile_gate(args.cases, completions, report, keep_workdir=args.keep_workdir)
-    if args.fail_on_compile_fail and compile_rc != 0:
+    if compile_rc != 0 and not args.allow_compile_fail:
         return compile_rc
     summary = json.loads(report.read_text())["summary"]
     print("CPPMEGA_LOCAL_COMPILE_EVAL=" + json.dumps(summary, sort_keys=True), flush=True)
-    return 0 if compile_rc == 0 or not args.fail_on_compile_fail else compile_rc
+    return 0
 
 
 if __name__ == "__main__":

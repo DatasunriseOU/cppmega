@@ -24,7 +24,7 @@ from typing import Any
 from .prompt_graph import INDEX_SCHEMA, PromptProjectIndex, repository_snapshot
 
 
-PRODUCER_VERSION = "1"
+PRODUCER_VERSION = "2"
 SYMBOL_IDENTITY_SCHEMA_VERSION = 2
 
 
@@ -177,30 +177,6 @@ def _identity_for_cursor(
     )
 
 
-def _default_indexer_root() -> Path:
-    configured = os.environ.get("CPPMEGA_CLANG_INDEXER_ROOT")
-    candidates: list[Path] = []
-    if configured:
-        candidates.append(Path(configured).expanduser())
-    module_path = Path(__file__).resolve()
-    for ancestor in module_path.parents:
-        candidates.append(ancestor)
-        candidates.extend(
-            (
-                ancestor / "cppmega.mlx",
-                ancestor / "cppmega_mlx_case3_prompt",
-            )
-        )
-    for candidate in candidates:
-        path = candidate.resolve() / "tools" / "clang_indexer" / "index_project.py"
-        if path.is_file():
-            return candidate.resolve()
-    raise FileNotFoundError(
-        "clang indexer not found; set CPPMEGA_CLANG_INDEXER_ROOT to a checkout "
-        "containing tools/clang_indexer/index_project.py"
-    )
-
-
 def _load_indexer(indexer_root: Path) -> tuple[ModuleType, Path]:
     path = indexer_root / "tools" / "clang_indexer" / "index_project.py"
     if not path.is_file():
@@ -222,6 +198,35 @@ def _load_indexer(indexer_root: Path) -> tuple[ModuleType, Path]:
     return module, path
 
 
+def _libclang_identity(
+    indexer: ModuleType,
+    configured_path: str | None,
+) -> tuple[str, str | None]:
+    runtime = getattr(indexer, "clang_cindex_runtime", None)
+    conf = getattr(runtime, "conf", None)
+    cx_string = getattr(runtime, "_CXString", None)
+    if conf is None or cx_string is None:
+        raise RuntimeError(
+            "clang prompt graph producer cannot inspect the configured "
+            "libclang runtime version"
+        )
+    function = conf.lib.clang_getClangVersion
+    function.restype = cx_string
+    raw_version = function()
+    version = cx_string.from_result(raw_version)
+    if isinstance(version, bytes):
+        version = version.decode("utf-8", errors="replace")
+    version = str(version).strip()
+    if not version:
+        raise RuntimeError("configured libclang returned an empty version")
+
+    config = getattr(runtime, "Config", None)
+    library_file = getattr(config, "library_file", None)
+    library_path = getattr(config, "library_path", None)
+    resolved = configured_path or library_file or library_path
+    return version, None if resolved is None else str(resolved)
+
+
 def _cursor_offsets(
     indexer: ModuleType,
     cursor: Any,
@@ -237,15 +242,90 @@ def _name_span(
     source: str,
     extent: tuple[int, int],
     *,
+    filename: str,
+    byte_to_char: Any,
     fallback_name: str = "",
 ) -> tuple[int, int]:
     start, end = extent
-    spelling = str(getattr(cursor, "spelling", "") or fallback_name)
-    if spelling:
-        relative = source.find(spelling, start, end)
-        if relative >= 0:
-            return relative, relative + len(spelling)
-    return start, end
+    spellings: list[str] = []
+    for raw in (getattr(cursor, "spelling", ""), fallback_name):
+        spelling = str(raw or "")
+        if spelling and spelling not in spellings:
+            spellings.append(spelling)
+        unqualified = spelling.rsplit("::", 1)[-1]
+        if unqualified and unqualified not in spellings:
+            spellings.append(unqualified)
+
+    location = getattr(cursor, "location", None)
+    location_file = getattr(getattr(location, "file", None), "name", None)
+    location_offset: int | None = None
+    if location_file is not None and os.path.normcase(
+        os.path.normpath(str(location_file))
+    ) == os.path.normcase(os.path.normpath(filename)):
+        location_offset = byte_to_char(int(location.offset))
+
+    if location_offset is not None:
+        for spelling in spellings:
+            candidate_end = location_offset + len(spelling)
+            if (
+                start <= location_offset < candidate_end <= end
+                and source[location_offset:candidate_end] == spelling
+            ):
+                return location_offset, candidate_end
+
+    token_candidates: list[tuple[int, int]] = []
+    location_token_candidates: list[tuple[int, int]] = []
+    getter = getattr(cursor, "get_tokens", None)
+    if callable(getter):
+        for token in getter():
+            token_spelling = str(getattr(token, "spelling", "") or "")
+            token_extent = getattr(token, "extent", None)
+            token_start = getattr(token_extent, "start", None)
+            token_end = getattr(token_extent, "end", None)
+            start_file = getattr(getattr(token_start, "file", None), "name", None)
+            end_file = getattr(getattr(token_end, "file", None), "name", None)
+            if start_file is None or end_file is None:
+                continue
+            normalized = os.path.normcase(os.path.normpath(filename))
+            if (
+                os.path.normcase(os.path.normpath(str(start_file))) != normalized
+                or os.path.normcase(os.path.normpath(str(end_file))) != normalized
+            ):
+                continue
+            token_span = (
+                byte_to_char(int(token_start.offset)),
+                byte_to_char(int(token_end.offset)),
+            )
+            if (
+                start <= token_span[0] < token_span[1] <= end
+                and source[token_span[0] : token_span[1]] == token_spelling
+            ):
+                if (
+                    location_offset is not None
+                    and token_span[0] <= location_offset < token_span[1]
+                ):
+                    location_token_candidates.append(token_span)
+                if token_spelling in spellings:
+                    token_candidates.append(token_span)
+    if location_token_candidates:
+        return min(location_token_candidates)
+    if token_candidates:
+        if location_offset is not None:
+            return min(
+                token_candidates,
+                key=lambda span: (
+                    0 if span[0] <= location_offset < span[1] else 1,
+                    abs(span[0] - location_offset),
+                    span,
+                ),
+            )
+        if len(token_candidates) == 1:
+            return token_candidates[0]
+    raise ValueError(
+        "clang prompt graph could not select an exact identifier span: "
+        f"kind={_cursor_kind_name(cursor)!r} spellings={spellings!r} "
+        f"extent=[{start},{end}) location={location_offset}"
+    )
 
 
 def _is_definition(cursor: Any) -> bool:
@@ -307,16 +387,19 @@ class ClangPromptProjectIndexProducer:
         cache_dir: str | Path,
         indexer_root: str | Path | None = None,
         libclang_path: str | Path | None = None,
+        strict_diagnostics: bool = False,
     ) -> None:
         self.cache_dir = Path(cache_dir)
-        self.indexer_root = (
-            _default_indexer_root()
-            if indexer_root is None
-            else Path(indexer_root).resolve()
-        )
+        if indexer_root is None:
+            raise ValueError(
+                "ClangPromptProjectIndexProducer requires explicit indexer_root "
+                "pointing to tools/clang_indexer/index_project.py"
+            )
+        self.indexer_root = Path(indexer_root).resolve()
         self.libclang_path = (
             None if libclang_path is None else str(Path(libclang_path).resolve())
         )
+        self.strict_diagnostics = bool(strict_diagnostics)
 
     def build(
         self,
@@ -331,8 +414,43 @@ class ClangPromptProjectIndexProducer:
             raise ValueError("prompt graph project_id must be non-empty")
         project_id = project_id.strip()
         indexer, indexer_path = _load_indexer(self.indexer_root)
+        configured_libclang = indexer._configure_libclang(
+            self.libclang_path or os.environ.get("NANOCHAT_LIBCLANG_PATH")
+        )
+        libclang_version, resolved_libclang = _libclang_identity(
+            indexer,
+            configured_libclang,
+        )
+        clang_index = indexer.Index.create()
+        files = sorted(
+            (Path(path).resolve() for path in indexer.find_cpp_files(str(root))),
+            key=lambda path: path.relative_to(root).as_posix(),
+        )
+        if not files:
+            raise ValueError(f"clang prompt graph producer found no sources in {root}")
+        compile_db = indexer.load_compile_commands(str(root))
+        default_args = indexer.get_default_compile_args(str(root))
+        compile_args_by_file = {
+            path.relative_to(root).as_posix(): list(
+                indexer._resolve_file_args(str(path), compile_db, default_args)
+            )
+            for path in files
+        }
         repository_sha256, repository_manifest = repository_snapshot(root)
+        dependency_manifest = {
+            path.relative_to(root).as_posix(): sha256(path.read_bytes()).hexdigest()
+            for path in files
+        }
         indexer_sha256 = _sha_file(indexer_path)
+        fingerprint_hashes = {
+            "repository_sha256": repository_sha256,
+            "dependency_closure_sha256": _sha_json(dependency_manifest),
+            "compile_args_sha256": _sha_json(compile_args_by_file),
+            "indexer_sha256": indexer_sha256,
+            "libclang_version_sha256": sha256(
+                libclang_version.encode("utf-8")
+            ).hexdigest(),
+        }
         cache_key = _sha_json(
             {
                 "schema": INDEX_SCHEMA,
@@ -340,8 +458,10 @@ class ClangPromptProjectIndexProducer:
                 "producer_version": PRODUCER_VERSION,
                 "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
                 "project_id": project_id,
-                "repository_sha256": repository_sha256,
-                "indexer_sha256": indexer_sha256,
+                "strict_diagnostics": self.strict_diagnostics,
+                "hashes": fingerprint_hashes,
+                "libclang_version": libclang_version,
+                "libclang_path": resolved_libclang,
             }
         )
         path = self.cache_dir / f"{cache_key}.json"
@@ -350,19 +470,25 @@ class ClangPromptProjectIndexProducer:
                 path,
                 root=root,
                 cache_key=cache_key,
-                repository_sha256=repository_sha256,
-                indexer_sha256=indexer_sha256,
+                expected_hashes=fingerprint_hashes,
+                libclang_version=libclang_version,
+                resolved_libclang=resolved_libclang,
             )
 
         index = self._build_uncached(
             indexer,
+            clang_index=clang_index,
+            files=files,
+            compile_args_by_file=compile_args_by_file,
             root=root,
             project_id=project_id,
             cache_key=cache_key,
-            repository_sha256=repository_sha256,
+            fingerprint_hashes=fingerprint_hashes,
             repository_manifest=repository_manifest,
-            indexer_sha256=indexer_sha256,
+            dependency_manifest=dependency_manifest,
             indexer_path=indexer_path,
+            libclang_version=libclang_version,
+            resolved_libclang=resolved_libclang,
         )
         self._write_cached(path, index)
         return PromptProjectIndexBuildResult(
@@ -376,27 +502,19 @@ class ClangPromptProjectIndexProducer:
         self,
         indexer: ModuleType,
         *,
+        clang_index: Any,
+        files: list[Path],
+        compile_args_by_file: Mapping[str, list[str]],
         root: Path,
         project_id: str,
         cache_key: str,
-        repository_sha256: str,
+        fingerprint_hashes: Mapping[str, str],
         repository_manifest: Mapping[str, str],
-        indexer_sha256: str,
+        dependency_manifest: Mapping[str, str],
         indexer_path: Path,
+        libclang_version: str,
+        resolved_libclang: str | None,
     ) -> PromptProjectIndex:
-        indexer._configure_libclang(
-            self.libclang_path or os.environ.get("NANOCHAT_LIBCLANG_PATH")
-        )
-        clang_index = indexer.Index.create()
-        files = sorted(
-            (Path(path).resolve() for path in indexer.find_cpp_files(str(root))),
-            key=lambda path: path.relative_to(root).as_posix(),
-        )
-        if not files:
-            raise ValueError(f"clang prompt graph producer found no sources in {root}")
-        compile_db = indexer.load_compile_commands(str(root))
-        default_args = indexer.get_default_compile_args(str(root))
-
         documents: list[dict[str, Any]] = []
         document_by_path: dict[str, dict[str, Any]] = {}
         for document_id, path in enumerate(files, start=1):
@@ -429,9 +547,7 @@ class ClangPromptProjectIndexProducer:
             relative = path.relative_to(root).as_posix()
             document = document_by_path[relative]
             source = str(document["source"])
-            compile_args = indexer._resolve_file_args(
-                str(path), compile_db, default_args
-            )
+            compile_args = list(compile_args_by_file[relative])
             try:
                 translation_unit = clang_index.parse(
                     str(path),
@@ -442,9 +558,22 @@ class ClangPromptProjectIndexProducer:
                 raise RuntimeError(
                     f"clang prompt graph parse failed for {path}: {exc}"
                 ) from exc
-            diagnostics[relative] = [
-                str(diagnostic) for diagnostic in translation_unit.diagnostics
+            diagnostic_rows = [
+                {
+                    "severity": int(getattr(diagnostic, "severity", 3)),
+                    "text": str(diagnostic),
+                }
+                for diagnostic in translation_unit.diagnostics
             ]
+            diagnostics[relative] = [row["text"] for row in diagnostic_rows]
+            parse_errors = [
+                row for row in diagnostic_rows if int(row["severity"]) >= 3
+            ]
+            if self.strict_diagnostics and parse_errors:
+                rendered = "; ".join(row["text"] for row in parse_errors[:5])
+                raise RuntimeError(
+                    f"strict clang prompt graph parse rejected {path}: {rendered}"
+                )
             byte_to_char = indexer._byte_to_char_mapper(source)
             stack: list[tuple[Any, int]] = [(translation_unit.cursor, 0)]
             while stack:
@@ -482,7 +611,11 @@ class ClangPromptProjectIndexProducer:
                     if identity is not None:
                         identity_adapters.add(identity.adapter)
                         symbol_start, symbol_end = _name_span(
-                            cursor, source, extent
+                            cursor,
+                            source,
+                            extent,
+                            filename=str(path),
+                            byte_to_char=byte_to_char,
                         )
                         raw_symbols.append(
                             {
@@ -542,6 +675,8 @@ class ClangPromptProjectIndexProducer:
                     cursor,
                     source,
                     extent,
+                    filename=str(path),
+                    byte_to_char=byte_to_char,
                     fallback_name=str(getattr(referenced, "spelling", "") or ""),
                 )
                 raw_symbols.append(
@@ -696,13 +831,21 @@ class ClangPromptProjectIndexProducer:
             "producer_version": PRODUCER_VERSION,
             "schema": INDEX_SCHEMA,
             "cache_key": cache_key,
+            "strict_diagnostics": self.strict_diagnostics,
             "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
             "identity_adapters": sorted(identity_adapters),
-            "hashes": {
-                "repository_sha256": repository_sha256,
-                "indexer_sha256": indexer_sha256,
+            "hashes": dict(fingerprint_hashes),
+            "toolchain": {
+                "libclang_version": libclang_version,
+                "libclang_path": resolved_libclang,
+                "compile_args_by_file": {
+                    path: list(args)
+                    for path, args in sorted(compile_args_by_file.items())
+                },
             },
             "repository_manifest": dict(sorted(repository_manifest.items())),
+            "dependency_closure_policy": "all_indexed_repository_sources_v1",
+            "dependency_manifest": dict(sorted(dependency_manifest.items())),
             "indexer_path": str(indexer_path),
             "document_count": len(documents),
             "symbol_count": len(symbols),
@@ -751,8 +894,9 @@ class ClangPromptProjectIndexProducer:
         *,
         root: Path,
         cache_key: str,
-        repository_sha256: str,
-        indexer_sha256: str,
+        expected_hashes: Mapping[str, str],
+        libclang_version: str,
+        resolved_libclang: str | None,
     ) -> PromptProjectIndexBuildResult:
         try:
             index = PromptProjectIndex.from_json_path(path)
@@ -764,10 +908,14 @@ class ClangPromptProjectIndexProducer:
             if int(receipt.get("symbol_identity_schema_version") or 0) != 2:
                 raise ValueError("CASE 4 symbol identity schema mismatch")
             hashes = dict(receipt.get("hashes") or {})
-            if hashes.get("repository_sha256") != repository_sha256:
-                raise ValueError("repository hash mismatch")
-            if hashes.get("indexer_sha256") != indexer_sha256:
-                raise ValueError("indexer hash mismatch")
+            for name, expected in expected_hashes.items():
+                if hashes.get(name) != expected:
+                    raise ValueError(f"{name} mismatch")
+            toolchain = dict(receipt.get("toolchain") or {})
+            if toolchain.get("libclang_version") != libclang_version:
+                raise ValueError("libclang version mismatch")
+            if toolchain.get("libclang_path") != resolved_libclang:
+                raise ValueError("libclang path mismatch")
             index.verify_repository(root)
         except Exception as exc:
             raise ValueError(

@@ -18,8 +18,12 @@ must not mark a case passed.
 The first checked-in suite is intentionally small and deterministic:
 
 - cases: `evals/cpp_docstring_compile_cases.jsonl`
-- reference completions: `evals/cpp_docstring_compile_reference.jsonl`
+- gold completions: `evals/cpp_docstring_compile_reference.jsonl`
 - runner: `scripts/cpp_generation_compile_eval.py`
+
+The gold rows only validate the compile/run oracle. They are not generation
+E2E evidence. Generated rows identify themselves with
+`completion_source: "model_generation"`.
 
 Run:
 
@@ -64,6 +68,11 @@ context, graph routes are required, not optional:
 - `token_chunk_kinds`
 - `token_chunk_dep_levels`
 
+Repository prompts prepend the transitive indexed definition chunks referenced
+by the visible target prefix. Repository cases are compiled from an isolated
+copy of the real checkout with all declared translation units, then linked and
+run; they are not rebuilt as standalone temporary source files.
+
 During token-by-token generation, the generated suffix can use zero/default
 token sidecars until parser refresh. After a statement/function candidate is
 complete, reparse the assembled source and run the compiler/test gate. The
@@ -98,6 +107,7 @@ python3 scripts/nebius_h200_megatron_cpp_generation_eval.py \
   --checkpoint-local outputs/checkpoints/cppmega-h200-megatron-1782697038/seq_1024_bs_192 \
   --cases evals/cpp_docstring_compile_cases.jsonl \
   --prompts outputs/evals/cpp_docstring_compile_prompts.jsonl \
+  --clang-indexer-root ../cppmega.mlx \
   --max-new-tokens 128 \
   --disable-nvrtc \
   --keep-workdir
@@ -107,6 +117,10 @@ It uploads the current cppmega overlay, tokenizer, eval JSONL, and latest
 Megatron `torch_dist` checkpoint iteration, runs one inference-only process in
 `ghcr.io/datasunriseou/cppmega:latest`, copies completions back, deletes the
 instance, then runs the local compile/run gate.
+
+The clang producer checkout is an explicit dependency. Strict eval indexing
+rejects clang error/fatal diagnostics, and a failed local compile gate makes the
+wrapper fail by default. `--allow-compile-fail` is a diagnostic-only override.
 
 The wrapper uses the cppmega tokenizer decode contract, not generic Hugging Face
 `decode()`: token strings are concatenated and `<SPACE>`/`<RESERVED_46>` and

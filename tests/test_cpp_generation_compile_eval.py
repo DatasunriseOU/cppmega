@@ -33,6 +33,10 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
 
 @pytest.mark.skipif(shutil.which("clang++") is None, reason="clang++ not installed")
 def test_reference_docstring_suite_compiles_and_runs(tmp_path: Path) -> None:
+    gold_path = ROOT / "evals" / "cpp_docstring_compile_reference.jsonl"
+    gold_rows = [json.loads(line) for line in gold_path.read_text().splitlines()]
+    assert all(row["completion_source"] == "gold_fixture" for row in gold_rows)
+
     out = tmp_path / "report.json"
     proc = subprocess.run(
         [
@@ -41,7 +45,7 @@ def test_reference_docstring_suite_compiles_and_runs(tmp_path: Path) -> None:
             "--cases",
             str(ROOT / "evals" / "cpp_docstring_compile_cases.jsonl"),
             "--completions",
-            str(ROOT / "evals" / "cpp_docstring_compile_reference.jsonl"),
+            str(gold_path),
             "--out",
             str(out),
             "--fail-on-fail",
@@ -52,9 +56,17 @@ def test_reference_docstring_suite_compiles_and_runs(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0, proc.stderr
     report = json.loads(out.read_text())
-    assert report["summary"]["total"] == 4
-    assert report["summary"]["passed"] == 4
+    assert report["summary"]["total"] == 5
+    assert report["summary"]["passed"] == 5
+    assert report["summary"]["repository_cases"] == 1
     assert all(item["compile_ok"] and item["run_ok"] for item in report["results"])
+    repo_result = next(
+        item
+        for item in report["results"]
+        if item["task_id"] == "case3_add_one_checked"
+    )
+    assert repo_result["compile_context"] == "repository"
+    assert len(repo_result["linked_sources"]) == 3
 
 
 @pytest.mark.skipif(shutil.which("clang++") is None, reason="clang++ not installed")
@@ -183,8 +195,8 @@ def test_parallel_jobs_preserve_order_and_pass(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0, proc.stderr
     report = json.loads(out.read_text())
-    assert report["summary"]["total"] == 4
-    assert report["summary"]["passed"] == 4
+    assert report["summary"]["total"] == 5
+    assert report["summary"]["passed"] == 5
     assert report["summary"]["jobs"] == 3
     ids = [item["task_id"] for item in report["results"]]
     assert ids == sorted(ids)  # deterministic sorted order under parallelism
@@ -228,10 +240,14 @@ def test_prompts_jsonl_preserves_sidecar_contract(tmp_path: Path) -> None:
     prompts = tmp_path / "prompts.jsonl"
     module.write_prompts(cases, prompts)
 
-    first = json.loads(prompts.read_text(encoding="utf-8").splitlines()[0])
-    assert first["language"] == "cpp"
-    assert "prompt" in first
-    assert first["sidecar_contract"]["prompt_sidecars_required"] == [
+    rows = [
+        json.loads(line)
+        for line in prompts.read_text(encoding="utf-8").splitlines()
+    ]
+    clamp = next(row for row in rows if row["task_id"] == "clamp_int")
+    assert clamp["language"] == "cpp"
+    assert "prompt" in clamp
+    assert clamp["sidecar_contract"]["prompt_sidecars_required"] == [
         "platform_ids",
         "token_structure_ids",
         "token_ast_depth",
