@@ -72,20 +72,6 @@ import atexit
 import os
 import sys
 
-try:
-    from megatron.core.inference.contexts import static_context as _sc
-    if not hasattr(_sc, "deprecate_inference_params"):
-        try:
-            from megatron.core.utils import deprecate_inference_params as _dip
-        except ImportError:
-            def _dip(inference_context, inference_params):
-                if inference_context is None and inference_params is not None:
-                    return inference_params
-                return inference_context
-        _sc.deprecate_inference_params = _dip
-except Exception as _exc:
-    print(f"[wave29_shim] static_context alias skipped: {_exc}", file=sys.stderr)
-
 if os.environ.get("CPPMEGA_MAMBA3_MIMO", "0") == "1":
     try:
         from megatron.core.transformer.transformer_config import TransformerConfig

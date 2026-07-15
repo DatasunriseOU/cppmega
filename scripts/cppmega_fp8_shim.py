@@ -15,13 +15,7 @@ Usage from a launch script::
 
 Installed patches (each is best-effort and logs a clear message on failure):
 
-  (1) `megatron.core.inference.contexts.static_context.deprecate_inference_params`
-      compatibility alias — needed by `cppmega.megatron.mamba3_te_mixer` which
-      imports this symbol from `static_context`, but in megatron-core 0.18rc0 the
-      function lives in `megatron.core.utils`. Without this alias, any import of
-      the mamba3_te_mixer module fails.
-
-  (2) Optional MIMO config patch driven by environment variables
+  (1) Optional MIMO config patch driven by environment variables
       `CPPMEGA_MAMBA3_MIMO=1` and `CPPMEGA_MAMBA_NUM_GROUPS`. Patches
       `TransformerConfig.__post_init__` to set
       `cppmega_mamba3_is_mimo=True`, `cppmega_mamba3_mimo_rank=4`, and
@@ -29,13 +23,13 @@ Installed patches (each is best-effort and logs a clear message on failure):
       7/7 MIMO feature configuration. Also optionally overrides
       `mamba_num_groups`.
 
-  (3) `TransformerConfig.__getattr__` fallback that raises `AttributeError` on
+  (2) `TransformerConfig.__getattr__` fallback that raises `AttributeError` on
       unknown `cppmega_mamba3_*` attribute names. This allows `getattr(config,
       "cppmega_mamba3_rope_fraction", 0.5)` to correctly fall back to the
       default 0.5 (returning None would trip downstream asserts like
       `rope_fraction in (0.5, 1.0)`).
 
-  (4) `Float16Module.__init__` **one-shot** post-init patch that restores
+  (3) `Float16Module.__init__` **one-shot** post-init patch that restores
       Mamba3 fp32 parameters (`dt_bias`, `D`, `B_bias`, `C_bias`, `mimo_x`,
       `mimo_z`, `mimo_o`) AFTER Megatron's blanket bf16 cast. The
       upstream `mamba_ssm.modules.mamba3.Mamba3` module initializes these
@@ -3085,26 +3079,7 @@ if (
 
 
 # -----------------------------------------------------------------------------
-# (1) deprecate_inference_params compatibility shim
-# -----------------------------------------------------------------------------
-try:
-    from megatron.core.inference.contexts import static_context as _sc
-    if not hasattr(_sc, "deprecate_inference_params"):
-        try:
-            from megatron.core.utils import deprecate_inference_params as _dip
-        except ImportError:
-            def _dip(inference_context, inference_params):
-                if inference_context is None and inference_params is not None:
-                    return inference_params
-                return inference_context
-        _sc.deprecate_inference_params = _dip
-except Exception as _exc:  # pragma: no cover
-    import sys
-    print(f"[cppmega_fp8_shim] static_context alias skipped: {_exc}", file=sys.stderr)
-
-
-# -----------------------------------------------------------------------------
-# (2) Optional Mamba config patch (profile/env bridge)
+# (1) Optional Mamba config patch (profile/env bridge)
 # -----------------------------------------------------------------------------
 _mimo_on = os.environ.get("CPPMEGA_MAMBA3_MIMO", "0") == "1"
 _num_groups_override = os.environ.get("CPPMEGA_MAMBA_NUM_GROUPS", "")
@@ -3160,7 +3135,7 @@ if _mimo_on or _num_groups_override or _noconv_chunk_override:
 
 
 # -----------------------------------------------------------------------------
-# (3) TransformerConfig dynamic attribute fallback
+# (2) TransformerConfig dynamic attribute fallback
 # -----------------------------------------------------------------------------
 try:
     from megatron.core.transformer.transformer_config import TransformerConfig
@@ -3181,7 +3156,7 @@ except Exception:
 
 
 # -----------------------------------------------------------------------------
-# (4) Float16Module one-shot Mamba3 fp32 param patch
+# (3) Float16Module one-shot Mamba3 fp32 param patch
 # -----------------------------------------------------------------------------
 # Replaces the deprecated per-forward `register_forward_pre_hook` workaround.
 # Per nsys profile 2026-04-11 the per-forward hook was responsible for 305 ms/iter
@@ -3231,7 +3206,7 @@ except Exception as _exc:  # pragma: no cover
 
 
 # -----------------------------------------------------------------------------
-# (5) CUDA graph compatibility: bypass _broadcast_cu_seqlens at TP=1
+# (4) CUDA graph compatibility: bypass _broadcast_cu_seqlens at TP=1
 # -----------------------------------------------------------------------------
 # When CUDA graphs capture forward_step, get_batch is called inside the
 # captured region.  _broadcast_cu_seqlens does torch.tensor(n, dtype=int64,
@@ -3265,7 +3240,7 @@ except Exception as _exc:  # pragma: no cover
 
 
 # -----------------------------------------------------------------------------
-# (6) MTP fused linear cross-entropy route
+# (5) MTP fused linear cross-entropy route
 # -----------------------------------------------------------------------------
 # Default to Megatron's LinearCrossEntropyModule route.  On GB10 this can be
 # forced to Apple CCE with CPPMEGA_MTP_CE_KERNEL=cce; on supported Hopper /
@@ -3308,7 +3283,7 @@ except Exception as _exc:  # pragma: no cover
 
 
 # -----------------------------------------------------------------------------
-# (7) TileLang SparseMLA monkey-patch for DSA sparse attention (env-driven)
+# (6) TileLang SparseMLA monkey-patch for DSA sparse attention (env-driven)
 # -----------------------------------------------------------------------------
 # Replaces Megatron's ``unfused_dsa_fn`` (which materializes the FULL
 # [b*np, sq, sk] FP32 attention scores = 7 GiB at production shape) with

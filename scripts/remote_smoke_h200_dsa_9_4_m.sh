@@ -82,7 +82,7 @@ export CPPMEGA_DSA_A_LAYER_RANKS="${CPPMEGA_DSA_A_LAYER_RANKS:-1,2,3,5,6,7,9,10,
 # TileLang SparseMLA (default): fused online-softmax sparse attention kernel
 # from Megatron-LM PR #3674. The kernel is parameterized for arbitrary d_v
 # (verified working with d_v=512 on H200). ~40% throughput improvement over
-# gather_scatter. Monkey-patched via cppmega_fp8_shim.py patch (7).
+# gather_scatter. Monkey-patched via cppmega_fp8_shim.py patch (6).
 export CPPMEGA_DSA_SPARSE_MODE="${CPPMEGA_DSA_SPARSE_MODE:-tilelang}"
 
 # Mamba/M2RNN activation checkpointing — saves ~28+ GiB per microbatch
@@ -203,21 +203,6 @@ from __future__ import annotations
 import os
 import sys
 import atexit
-
-# (1) deprecate_inference_params compatibility shim
-try:
-    from megatron.core.inference.contexts import static_context as _sc
-    if not hasattr(_sc, "deprecate_inference_params"):
-        try:
-            from megatron.core.utils import deprecate_inference_params as _dip
-        except ImportError:
-            def _dip(inference_context, inference_params):
-                if inference_context is None and inference_params is not None:
-                    return inference_params
-                return inference_context
-        _sc.deprecate_inference_params = _dip
-except Exception as _exc:
-    print(f"[cppmega_mimo_shim] static_context alias skipped: {_exc}", file=sys.stderr)
 
 # (2) MIMO __post_init__
 _mimo_on = os.environ.get("CPPMEGA_MAMBA3_MIMO", "0") == "1"
