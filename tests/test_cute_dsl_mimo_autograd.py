@@ -11,13 +11,16 @@ Target shapes: NAM56R training config
 
 import os
 import sys
-import time
-import math
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 import torch
-import torch.nn.functional as F
+import pytest
+
+
+if not torch.cuda.is_available():
+    pytest.skip("CuTe/TileLang MIMO parity requires CUDA", allow_module_level=True)
+pytest.importorskip("mamba_ssm.ops.tilelang.mamba3.mamba3_mimo")
 
 
 def generate_test_inputs(
@@ -242,7 +245,7 @@ def test_timing():
     tl_fwd_ms = time_fn(tl_fwd, n_warmup=5, n_iter=20)
     cd_fwd_ms = time_fn(cd_fwd, n_warmup=3, n_iter=5)
 
-    print(f"  Forward only:")
+    print("  Forward only:")
     print(f"    TileLang:  {tl_fwd_ms:.3f} ms")
     print(f"    CuTe DSL:  {cd_fwd_ms:.3f} ms")
     if tl_fwd_ms > 0:
@@ -265,7 +268,7 @@ def test_timing():
     tl_total_ms = time_fn(tl_fwd_bwd, n_warmup=2, n_iter=5)
     cd_total_ms = time_fn(cd_fwd_bwd, n_warmup=2, n_iter=5)
 
-    print(f"  Forward + backward:")
+    print("  Forward + backward:")
     print(f"    TileLang:  {tl_total_ms:.3f} ms")
     print(f"    CuTe DSL:  {cd_total_ms:.3f} ms")
     if tl_total_ms > 0:

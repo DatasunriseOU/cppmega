@@ -356,7 +356,8 @@ def test_wave9_concurrent_amax_compile():
 
     import threading
 
-    if not tilelang_supports():
+    device = _pick_device()
+    if device.type == "cpu" or not tilelang_supports(device):
         pytest.skip("tilelang build path unreachable on this host")
 
     from cppmega_mlx.nn._tilelang.fp8_amax import (  # noqa: E402

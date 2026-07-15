@@ -9,6 +9,7 @@ _compute_data_dependent_A) only need torch and can be tested locally.
 """
 
 import importlib
+import importlib.util
 import pathlib
 from typing import Optional, Tuple
 
@@ -23,6 +24,7 @@ import torch.nn.functional as F
 from tests._megatron_stub import install_megatron_stub, is_real_megatron_available
 
 _has_megatron = is_real_megatron_available()
+_has_mamba_ssm = importlib.util.find_spec("mamba_ssm") is not None
 if not _has_megatron:
     install_megatron_stub()
 _module_path = pathlib.Path(__file__).parent.parent / "cppmega" / "megatron" / "noconv_mamba_mixer.py"
@@ -55,13 +57,19 @@ def _executable_lines(text: str) -> list[str]:
 # Importability (megatron required)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not _has_megatron, reason="megatron not installed locally")
+@pytest.mark.skipif(
+    not (_has_megatron and _has_mamba_ssm),
+    reason="megatron and mamba_ssm are required for runtime import",
+)
 def test_noconv_mamba_mixer_importable():
     from cppmega.megatron.noconv_mamba_mixer import NoConvMambaMixer
     assert NoConvMambaMixer is not None
 
 
-@pytest.mark.skipif(not _has_megatron, reason="megatron not installed locally")
+@pytest.mark.skipif(
+    not (_has_megatron and _has_mamba_ssm),
+    reason="megatron and mamba_ssm are required for runtime import",
+)
 def test_submodules_importable():
     from cppmega.megatron.noconv_mamba_mixer import NoConvMambaMixerSubmodules
     assert NoConvMambaMixerSubmodules is not None
@@ -207,7 +215,10 @@ def test_split_matches_mamba_mixer():
 # Forward signature (megatron required for import)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not _has_megatron, reason="megatron not installed locally")
+@pytest.mark.skipif(
+    not (_has_megatron and _has_mamba_ssm),
+    reason="megatron and mamba_ssm are required for runtime import",
+)
 def test_forward_signature():
     import inspect
     from cppmega.megatron.noconv_mamba_mixer import NoConvMambaMixer
@@ -222,7 +233,10 @@ def test_forward_signature():
 # Can be wrapped in a ModuleSpec (megatron required)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not _has_megatron, reason="megatron not installed locally")
+@pytest.mark.skipif(
+    not (_has_megatron and _has_mamba_ssm),
+    reason="megatron and mamba_ssm are required for runtime import",
+)
 def test_module_spec_construction():
     from megatron.core.transformer.spec_utils import ModuleSpec
     from cppmega.megatron.noconv_mamba_mixer import (
@@ -253,7 +267,6 @@ def test_module_spec_construction():
 def _extract_helper_functions():
     """Extract the three helper functions from source without importing the module."""
     import ast
-    import textwrap
 
     src = _read_source()
     tree = ast.parse(src)
@@ -377,7 +390,7 @@ class TestApplyRopeOnStateDim:
 
     def test_pi_rotation_negates_pairs(self):
         """Rotating by pi should negate both elements of each pair."""
-        batch, seqlen, ngroups, d_state = 1, 1, 1, 4
+        batch, seqlen, ngroups = 1, 1, 1
         n_rope_angles = 2
         tensor = torch.tensor([[[[1.0, 0.0, 0.0, 1.0]]]])
         angles_cumsum = torch.full((batch, seqlen, ngroups, n_rope_angles), torch.pi)

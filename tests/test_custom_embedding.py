@@ -1,5 +1,3 @@
-import os
-
 import torch
 import pytest
 
@@ -8,6 +6,8 @@ from cppmega.megatron.custom_embedding import CppMegaLanguageModelEmbedding
 
 if CppMegaLanguageModelEmbedding.__mro__[1] is object:
     pytest.skip("Megatron is not importable in local test environment", allow_module_level=True)
+if not torch.cuda.is_available():
+    pytest.skip("Megatron embedding runtime requires CUDA", allow_module_level=True)
 
 
 class _Config:
@@ -20,6 +20,7 @@ class _Config:
     mup_embedding_mult = 1.0
     perform_initialization = True
     use_cpu_initialization = False
+    deterministic_mode = False
 
     @staticmethod
     def embedding_init_method(weight):

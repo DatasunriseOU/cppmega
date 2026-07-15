@@ -2,6 +2,11 @@ import importlib.util
 import inspect
 from pathlib import Path
 
+import pytest
+
+
+pytest.importorskip("modal")
+
 
 def _load_wave31_module():
     script = Path(__file__).resolve().parents[1] / "scripts" / "modal_mamba3_wave31_g8_reachability.py"
@@ -12,13 +17,13 @@ def _load_wave31_module():
     return module
 
 
-def test_full_gate_defaults_to_mla_auto_not_forced_flash():
+def test_full_gate_defaults_to_current_production_flash_case():
     mod = _load_wave31_module()
 
-    assert inspect.signature(mod.gate.get_raw_f()).parameters["case_label"].default == "mla_auto_full"
-    assert mod._CASES["mla_auto_full"]["attention_backend"] == "auto"
-    assert mod._CASES["mla_auto_full"]["production_throughput"] is True
-    assert mod._CASES["te_flash_full"]["production_throughput"] is False
+    assert inspect.signature(mod.gate.get_raw_f()).parameters["case_label"].default == "te_flash_full"
+    assert mod._CASES["te_flash_full"]["attention_backend"] == "flash"
+    assert mod._CASES["te_flash_full"]["production_throughput"] is True
+    assert mod._CASES["fallback_auto_full"]["production_throughput"] is False
 
 
 def test_parse_log_extracts_te_backend_selection(tmp_path):
