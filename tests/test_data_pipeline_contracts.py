@@ -162,8 +162,10 @@ def test_tokenizer_contract_verifier_derives_all_case5_delimiters_from_schema() 
         _REPO_ROOT / "data/domain_schema_v1.json"
     )
 
-    assert len(pairs) == 27
+    assert len(pairs) == 29
     assert ("CONFIGURE_START", "CONFIGURE_END") in pairs
+    assert ("KSH_START", "KSH_END") in pairs
+    assert ("PYTHON_START", "PYTHON_END") in pairs
     assert ("SQL_START", "SQL_END") in pairs
     assert ("LINKER_DIAGNOSTIC_START", "LINKER_DIAGNOSTIC_END") in pairs
     assert ("SANITIZER_OUTPUT_START", "SANITIZER_OUTPUT_END") in pairs

@@ -1,0 +1,855 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Каноническая интеграция cppmega / cppmega.mlx - 2026-07-15</title>
+  <style>
+    :root {
+      --bg: #f6f8fa;
+      --surface: #ffffff;
+      --surface-2: #f0f3f6;
+      --text: #1f2328;
+      --muted: #59636e;
+      --line: #d0d7de;
+      --line-strong: #afb8c1;
+      --accent: #0969da;
+      --accent-soft: #ddf4ff;
+      --good: #1a7f37;
+      --good-soft: #dafbe1;
+      --warn: #9a6700;
+      --warn-soft: #fff8c5;
+      --bad: #cf222e;
+      --bad-soft: #ffebe9;
+      --code-bg: #24292f;
+      --code-text: #f6f8fa;
+      --radius: 6px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0d1117;
+        --surface: #161b22;
+        --surface-2: #21262d;
+        --text: #e6edf3;
+        --muted: #9da7b3;
+        --line: #30363d;
+        --line-strong: #484f58;
+        --accent: #58a6ff;
+        --accent-soft: #12243a;
+        --good: #56d364;
+        --good-soft: #173323;
+        --warn: #e3b341;
+        --warn-soft: #352b12;
+        --bad: #ff7b72;
+        --bad-soft: #3c1e23;
+        --code-bg: #010409;
+        --code-text: #e6edf3;
+      }
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+      font-size: 15px;
+      line-height: 1.58;
+      letter-spacing: 0;
+    }
+    a { color: var(--accent); text-underline-offset: 3px; }
+    a:hover { text-decoration-thickness: 2px; }
+    code, pre, .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+    code {
+      padding: 0.08em 0.3em;
+      background: var(--surface-2);
+      border-radius: 4px;
+      overflow-wrap: anywhere;
+    }
+    pre {
+      margin: 14px 0;
+      padding: 15px 17px;
+      overflow-x: auto;
+      color: var(--code-text);
+      background: var(--code-bg);
+      border-radius: var(--radius);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    pre code { padding: 0; color: inherit; background: transparent; }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 260px minmax(0, 1fr);
+      width: min(1460px, 100%);
+      min-height: 100dvh;
+      margin: 0 auto;
+      background: var(--surface);
+      border-inline: 1px solid var(--line);
+    }
+    .sidebar {
+      position: sticky;
+      top: 0;
+      align-self: start;
+      height: 100dvh;
+      overflow-y: auto;
+      padding: 24px 20px;
+      background: var(--bg);
+      border-right: 1px solid var(--line);
+    }
+    .sidebar-title {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--text);
+      font-size: 16px;
+      font-weight: 750;
+      text-decoration: none;
+    }
+    .sidebar-meta {
+      margin: 0 0 20px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .sidebar nav { display: grid; gap: 2px; }
+    .sidebar nav a {
+      display: block;
+      padding: 7px 9px;
+      color: var(--muted);
+      border-left: 2px solid transparent;
+      text-decoration: none;
+      font-size: 13px;
+      line-height: 1.3;
+    }
+    .sidebar nav a:hover {
+      color: var(--text);
+      background: var(--surface-2);
+      border-left-color: var(--accent);
+    }
+    .content { min-width: 0; padding: 42px clamp(24px, 5vw, 72px) 72px; }
+    header {
+      padding-bottom: 28px;
+      border-bottom: 1px solid var(--line);
+    }
+    h1, h2, h3 { letter-spacing: 0; }
+    h1 {
+      max-width: 900px;
+      margin: 0 0 14px;
+      font-size: clamp(30px, 4vw, 44px);
+      line-height: 1.12;
+    }
+    h2 {
+      margin: 0 0 14px;
+      font-size: 25px;
+      line-height: 1.25;
+    }
+    h3 {
+      margin: 25px 0 8px;
+      font-size: 18px;
+      line-height: 1.3;
+    }
+    p { max-width: 88ch; margin: 8px 0 14px; }
+    ul, ol { max-width: 92ch; padding-left: 22px; }
+    li { margin: 5px 0; }
+    section {
+      padding: 36px 0 8px;
+      scroll-margin-top: 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    section:last-of-type { border-bottom: 0; }
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 18px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .repo-links { margin-top: 13px; }
+    .repo-links a { margin-right: 16px; font-weight: 650; }
+
+      .status-strip {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+      margin-top: 24px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .status-item {
+      min-width: 0;
+      padding: 15px;
+      background: var(--surface);
+      border-right: 1px solid var(--line);
+    }
+    .status-item:last-child { border-right: 0; }
+    .status-item strong { display: block; font-size: 21px; line-height: 1.15; }
+    .status-item span { display: block; margin-top: 5px; color: var(--muted); font-size: 12px; }
+
+    .callout {
+      max-width: 92ch;
+      margin: 16px 0;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-left-width: 4px;
+      border-radius: var(--radius);
+      background: var(--surface-2);
+    }
+    .callout.good { border-left-color: var(--good); background: var(--good-soft); }
+    .callout.warn { border-left-color: var(--warn); background: var(--warn-soft); }
+    .callout.bad { border-left-color: var(--bad); background: var(--bad-soft); }
+    .callout.info { border-left-color: var(--accent); background: var(--accent-soft); }
+
+    .table-wrap {
+      margin: 14px 0 20px;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+    }
+    table { width: 100%; border-collapse: collapse; min-width: 720px; background: var(--surface); }
+    th, td {
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+      border-bottom: 1px solid var(--line);
+    }
+    th {
+      color: var(--muted);
+      background: var(--surface-2);
+      font-size: 12px;
+      font-weight: 750;
+      text-transform: uppercase;
+    }
+    tr:last-child td { border-bottom: 0; }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .total-row td { font-weight: 750; background: var(--surface-2); }
+    .status {
+      display: inline-block;
+      padding: 1px 7px;
+      border: 1px solid currentColor;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 750;
+      white-space: nowrap;
+    }
+    .status.good { color: var(--good); }
+    .status.warn { color: var(--warn); }
+    .status.bad { color: var(--bad); }
+    .path-list { display: grid; gap: 7px; max-width: 1000px; }
+    .path-list a { overflow-wrap: anywhere; }
+    .back-top { margin-top: 24px; font-size: 13px; }
+    footer {
+      margin-top: 42px;
+      padding-top: 22px;
+      color: var(--muted);
+      border-top: 1px solid var(--line);
+      font-size: 13px;
+    }
+
+    @media (max-width: 980px) {
+      .layout { display: block; border-inline: 0; }
+      .sidebar {
+        position: static;
+        width: 100%;
+        height: auto;
+        padding: 16px 18px;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+      .sidebar nav {
+        display: flex;
+        gap: 4px;
+        overflow-x: auto;
+        padding-bottom: 4px;
+      }
+      .sidebar nav a {
+        flex: 0 0 auto;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        white-space: nowrap;
+      }
+      .content { padding: 30px 20px 56px; }
+      .status-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .status-item:nth-child(2n) { border-right: 0; }
+      .status-item:nth-child(-n+4) { border-bottom: 1px solid var(--line); }
+    }
+
+    @media (max-width: 560px) {
+      body { font-size: 14px; }
+      h1 { font-size: 29px; }
+      h2 { font-size: 22px; }
+      .content { padding-inline: 14px; }
+      .status-strip { grid-template-columns: 1fr; }
+      .status-item { border-right: 0; border-bottom: 1px solid var(--line); }
+      .status-item:last-child { border-bottom: 0; }
+    }
+
+    @media print {
+      :root { color-scheme: light; }
+      body { background: #fff; color: #111; }
+      .layout { display: block; border: 0; }
+      .sidebar { display: none; }
+      .content { padding: 0; }
+      section { break-inside: avoid-page; }
+      a { color: #111; text-decoration: none; }
+      .back-top { display: none; }
+    }
+  </style>
+</head>
+<body id="top">
+  <div class="layout">
+    <aside class="sidebar" aria-label="Навигация по отчёту">
+      <a class="sidebar-title" href="#top">Canonical integration</a>
+      <p class="sidebar-meta">2026-07-15 · git/receipts recheck 20:52 CEST</p>
+      <nav>
+        <a href="#summary">Короткий итог</a>
+        <a href="#roles">Роли репозиториев</a>
+        <a href="#ported">Переносы</a>
+        <a href="#contracts">KSH / Python</a>
+        <a href="#pipeline">Data path</a>
+        <a href="#mlx-role">MLX runtime</a>
+        <a href="#commits">Коммиты</a>
+        <a href="#tests">Тесты</a>
+        <a href="#detours">Detours receipt</a>
+        <a href="#case5-v4">CASE5 v4</a>
+        <a href="#case5-v7">CASE5 v7</a>
+        <a href="#a2">A2 symbols</a>
+        <a href="#fim-ast-fim">FIM / AST-FIM</a>
+        <a href="#risks">Риски</a>
+        <a href="#evidence">Доказательства</a>
+      </nav>
+    </aside>
+
+    <main class="content">
+      <header>
+        <h1>Каноническая интеграция <code>cppmega</code> и <code>cppmega.mlx</code></h1>
+        <div class="meta">
+          <span>Снимок проверки: 2026-07-15 20:52 CEST</span>
+          <span>Ветка: <code>codex/canonical-complete-20260715</code></span>
+          <span>Формат: code, data, runtime и live receipts</span>
+        </div>
+        <div class="repo-links">
+          <a href="https://github.com/DatasunriseOU/cppmega">GitHub: cppmega</a>
+          <a href="https://github.com/DatasunriseOU/cppmega_mlx">GitHub: cppmega_mlx</a>
+        </div>
+        <div class="callout warn">
+          CASE5 span-fixes не считаются принятыми без v7 rerun/receipt. Числа v7 ниже относятся к историческому snapshot <code>14:40-14:54 CEST</code> (<code>77 done / 11 failed</code>), а H200 gate описан только в точном component scope.
+        </div>
+        <div class="status-strip" aria-label="Ключевые показатели">
+          <div class="status-item"><strong>2</strong><span>самостоятельных canonical repos</span></div>
+          <div class="status-item"><strong>45 257</strong><span>valid tokens в Detours root smoke</span></div>
+          <div class="status-item"><strong>7 178</strong><span>CASE5 v4 полных шагов по бакетам</span></div>
+          <div class="status-item"><strong>15 485 / 0</strong><span>std rows / libiberty rows в A2 DB</span></div>
+          <div class="status-item"><strong>11 / 7</strong><span>H200 final gate / DSA suite passed</span></div>
+        </div>
+      </header>
+
+      <section id="summary">
+        <h2>1. Короткий итог</h2>
+        <ol>
+          <li><code>cppmega</code> теперь владеет Megatron/CUDA runtime и полным root-local data path: source, clang index, parquet, audit, graph sidecars и Megatron conversion.</li>
+          <li><code>cppmega.mlx</code> остаётся Apple Silicon runtime, Path C/Metal исследовательским контуром и визуальным конструктором/инспектором.</li>
+          <li>KSH и Python расширяют существующий <code>v1</code> на reserved IDs <code>245-248</code>, без изменения tokenizer vocabulary и без перенумерации.</li>
+          <li>Detours прошёл реальный root-only end-to-end путь с fail-closed audit и 31 дополнительным sidecar channel.</li>
+          <li>CASE5 v4 содержит <strong>1 411 702 081 trained tokens</strong> и <strong>7 178</strong> schedule-valid полных шагов.</li>
+          <li>CASE5 v7 snapshot partial: <strong>153 090 795 trained tokens</strong>, <strong>776</strong> schedule-valid steps и <strong>77 done / 11 failed</strong>. Run использует старый pinned runtime <code>1ba36f7</code>, не текущий MLX HEAD <code>d5fdec0</code>.</li>
+          <li>A2 DB очищена от libiberty, но множественные overloads подтверждают, что <code>qname</code> не уникален.</li>
+          <li>На exact root commit <code>2b5dd3d</code> H200 DSA suite дал <strong>7 passed</strong>, final gate - <strong>11 passed</strong>; writer/reader receipt: <strong>46</strong> docs, <strong>45 257</strong> valid, <strong>45 063</strong> trained, <strong>20</strong> aligned sidecars, <strong>11</strong> graph CSR.</li>
+          <li>Unresolved остаются: FIM/AST-FIM physical-identity eligibility, Xbox provenance и root environment packaging gap.</li>
+        </ol>
+      </section>
+
+      <section id="roles">
+        <h2>2. Зачем нужны два репозитория</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Репозиторий</th><th>Основная задача</th><th>Самостоятельная ответственность</th><th>Не его задача</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><strong>cppmega</strong></td>
+                <td>Production training и data plane для NAM56R</td>
+                <td>Megatron/PyTorch/CUDA, corpus, graph sidecars, bundles, H200 component runtime</td>
+                <td>MLX UI, Apple Metal runtime, скрытый импорт соседнего checkout</td>
+              </tr>
+              <tr>
+                <td><strong>cppmega.mlx</strong></td>
+                <td>Локальный Apple Silicon runtime и визуально-исследовательский контур</td>
+                <td>MLX eager/compiled smokes, Metal/TileLang, checkpoints, benchmarks, inspector</td>
+                <td>Подменять root CUDA backend или заявлять distributed H200 readiness</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout info">Общий интерфейс между репозиториями: schemas, hashes и sidecar semantics. Python-import через соседний checkout не является контрактом.</div>
+        <p>Локальные источники: <a href="/Volumes/external/sources/cppmega/README.md">root README</a> · <a href="/Volumes/external/sources/cppmega.mlx/README.md">MLX README</a> · <a href="/Volumes/external/sources/cppmega/tests/test_megatron_root_runtime_independence.py">runtime-isolation tests</a>.</p>
+      </section>
+
+      <section id="ported">
+        <h2>3. Что и откуда перенесено</h2>
+
+        <h3>nanochat -> оба canonical repos</h3>
+        <p>Перенесена data-preparation механика: git-history extraction, clang-enriched JSONL, tokenized parquet, fixed-length packing, document identity, platform vocabulary, token budgets, memory guards и atomic publication. Модельный Torch runtime не стал зависимостью canonical repos.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Target</th><th>Root-owned поверхности</th><th>Граница</th></tr></thead>
+            <tbody>
+              <tr><td><code>cppmega</code></td><td><code>cppmega/data/nanochat_pipeline</code>, <code>scripts/nanochat_data</code>, <code>scripts/streaming_*</code></td><td>Импорты и пути указывают на root; внешний venv использовался только как локальное окружение зависимостей</td></tr>
+              <tr><td><code>cppmega.mlx</code></td><td><code>cppmega_mlx/data/nanochat_pipeline</code>, собственные <code>scripts/nanochat_data</code></td><td>Эквивалентный data contract остаётся независимым внутри MLX repo</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>cppmega.mlx -> cppmega</h3>
+        <p>В root перенесены domain/build/shell/diagnostic parsers, KSH/Python, tokenizer contract, source/project/symbol identity, prompt graph, clang indexer, commit processor, PR ingestion, cross-repo DB, audit/repair/report tooling. Namespace и defaults перепривязаны к <code>cppmega</code>.</p>
+        <p>Не перенесены как dependencies: MLX tensors, Metal kernels, <code>vbgui</code>, MLX checkpoint runtime и автоматические <code>../cppmega.mlx</code> paths.</p>
+
+        <h3>full_integration -> canonical branches</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Target</th><th>Integration head</th><th>Перенесённые категории</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><code>cppmega</code></td>
+                <td><a href="https://github.com/DatasunriseOU/cppmega/commit/0d3098c6bc3975db034bc7a425d5527ae04d399d"><code>0d3098c</code></a></td>
+                <td>Objectives, clang/uint64 identity, CASE5 sidecars, prompt graphs, graph gradients, immutable bundles, H200/CI fail-closed hardening, retired legacy fallbacks</td>
+              </tr>
+              <tr>
+                <td><code>cppmega.mlx</code></td>
+                <td><a href="https://github.com/DatasunriseOU/cppmega_mlx/commit/70b1f5d5199135647994cac246326f5a8f2b2678"><code>70b1f5d</code></a></td>
+                <td>Graph/objective training, conveyor/indexer hardening, Path C planner/receipt, Mamba3 F2, row carries, RoPE parity, native/Metal and CI contracts</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Оба integration heads являются реальными предками canonical HEAD. Integration worktrees не содержат уникальных tracked production patches.</p>
+      </section>
+
+      <section id="contracts">
+        <h2>4. KSH, Python и reserved IDs 245-248</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Сущность</th><th class="num">Значение</th><th>Tokenizer literal</th></tr></thead>
+            <tbody>
+              <tr><td><code>DomainKind.KSH</code></td><td class="num">24</td><td>-</td></tr>
+              <tr><td><code>DomainKind.PYTHON</code></td><td class="num">31</td><td>-</td></tr>
+              <tr><td><code>KSH_START</code></td><td class="num">245</td><td><code>&lt;RESERVED_245&gt;</code></td></tr>
+              <tr><td><code>KSH_END</code></td><td class="num">246</td><td><code>&lt;RESERVED_246&gt;</code></td></tr>
+              <tr><td><code>PYTHON_START</code></td><td class="num">247</td><td><code>&lt;RESERVED_247&gt;</code></td></tr>
+              <tr><td><code>PYTHON_END</code></td><td class="num">248</td><td><code>&lt;RESERVED_248&gt;</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Это in-place <code>v1</code>: vocabulary не меняется, ID не сдвигаются, schema остаётся <code>cppmega_domain_sidecars_v1</code>. Новая семантика назначается заранее зарезервированным IDs.</p>
+        <div class="callout good">Complete legacy v1 hash triples принимаются атомарно. Смешанный old/new triple отвергается, чтобы loader не принял частично обновлённый shard.</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Контракт</th><th>SHA-256</th></tr></thead>
+            <tbody>
+              <tr><td>Delimiter</td><td class="mono">09fe81e915ee713004a1148abe54fbca2cf9ccfa9445901299a395d2b9fe253b</td></tr>
+              <tr><td>Domain schema</td><td class="mono">522bf7d664bfc01da647a275baa022ed9f9894b3962bd160e096dbc6642a7a2a</td></tr>
+              <tr><td>Tokenizer contract</td><td class="mono">77e7c934622cfea4e43999c400eb2e210def289a47cccfbb37c4a45222bc38b8</td></tr>
+              <tr><td>Tokenizer artifact</td><td class="mono">d3c4711161a452ee36d64222b6977845ddd58b1e723a7de54158c64c50d2a888</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Python parser использует stdlib <code>ast</code>/<code>tokenize</code>, строит roles, scopes, AST/call/def-use edges и умеет сохранять partial result. KSH использует общий shell contract с отдельным domain kind.</p>
+      </section>
+
+      <section id="pipeline">
+        <h2>5. Root-independent source -> parquet -> Megatron</h2>
+        <pre><code>explicit source roots
+  -&gt; scripts/data/source_conveyor.py
+  -&gt; scripts/streaming_conveyor.py
+  -&gt; tools/clang_indexer/index_project.py
+  -&gt; enriched JSONL
+  -&gt; scripts/nanochat_data/clang_enriched_to_parquet.py
+  -&gt; route_by_fit + pack_enriched_rows.py
+  -&gt; fixed-length parquet + domain/source/graph sidecars
+  -&gt; audit_sidecar_parquet.py
+  -&gt; data_prep_parquet_to_megatron.py
+  -&gt; immutable .bin/.idx + token sidecars + graph CSR sidecars</code></pre>
+        <ul>
+          <li>Source, output, repo-list и tokenizer paths передаются явно.</li>
+          <li>Revision guard фиксирует exact commit и relevant dirty scope.</li>
+          <li>Root entrypoints не используют sibling checkout defaults.</li>
+          <li>FP8/DSA backend errors fail-loud, без автоматической MLX-подмены.</li>
+          <li>Megatron output публикуется generation directory + atomic current pointer.</li>
+        </ul>
+        <p>Ключевые файлы: <a href="/Volumes/external/sources/cppmega/scripts/data/source_conveyor.py">source conveyor</a> · <a href="/Volumes/external/sources/cppmega/scripts/data_prep_parquet_to_megatron.py">Megatron converter</a> · <a href="/Volumes/external/sources/cppmega/tests/test_root_data_entrypoints.py">entrypoint tests</a>.</p>
+      </section>
+
+      <section id="mlx-role">
+        <h2>6. Роль MLX runtime и визуального слоя</h2>
+        <ol>
+          <li><strong>Apple Silicon runtime:</strong> MLX eager/compiled smokes, checkpoints и локальные model-contract checks.</li>
+          <li><strong>Metal/TileLang research:</strong> Path C planner, generated kernels, Mamba3/MLA/DSA fusion и честные unsupported boundaries.</li>
+          <li><strong>Visual Builder:</strong> model graph, tokenizer spans, parquet/domain/graph inspection и debugging state.</li>
+        </ol>
+        <p>Локальные поверхности: <a href="/Volumes/external/sources/cppmega.mlx/vbgui/src/components/DataInspector.tsx">DataInspector</a> · <a href="/Volumes/external/sources/cppmega.mlx/cppmega_v4/jsonrpc/tokenizer_methods.py">tokenizer RPC</a> · <a href="/Volumes/external/sources/cppmega.mlx/cppmega_mlx/runtime/path_c_fusion_schedules.py">Path C schedules</a>.</p>
+        <div class="callout info">MLX pass не доказывает CUDA/TE или distributed Megatron. H200 component smoke, в свою очередь, не заменяет локальные macOS generation/eval/compile gates.</div>
+      </section>
+
+      <section id="commits">
+        <h2>7. Точные коммиты</h2>
+        <h3>cppmega</h3>
+        <p>Branch <code>codex/canonical-complete-20260715</code>, HEAD <code>2b5dd3df263883a1c88a5051e5edabafa54845ed</code>.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Commit</th><th>Время CEST</th><th>Назначение</th></tr></thead>
+            <tbody>
+              <tr><td><code>2b5dd3df263883a1c88a5051e5edabafa54845ed</code></td><td>14:36</td><td>Generate causal top-k fixtures</td></tr>
+              <tr><td><code>dd82a55aa023453e37c642605b6d2f6ad7f5373e</code></td><td>14:16</td><td>Align parser spans with token materialization</td></tr>
+              <tr><td><code>7d3a590871ec0d15fd88be4908c6591b3a61df81</code></td><td>13:51</td><td>Expose CASE5 contract hashes to loader</td></tr>
+              <tr><td><code>e925acaf9d76d159ce0e7987d470be266e5ad7f6</code></td><td>13:29</td><td>Independent corpus and Megatron pipeline</td></tr>
+              <tr><td><code>0a6061ea267e32de9658d30e0e7318ced6d81098</code></td><td>12:42</td><td>Canonical source processing core</td></tr>
+              <tr><td><code>166f6cb85fe0ac19e0c495628b852e94df177d38</code></td><td>12:03</td><td>Validate objective contracts before parquet import</td></tr>
+              <tr><td><a href="https://github.com/DatasunriseOU/cppmega/commit/0d3098c6bc3975db034bc7a425d5527ae04d399d"><code>0d3098c6...</code></a></td><td>03:07</td><td>Published full integration head</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Локальный root commit object проверен через <code>git -C /Volumes/external/sources/cppmega show --no-patch 2b5dd3df263883a1c88a5051e5edabafa54845ed</code>. Ветка <code>codex/canonical-complete-20260715</code> отсутствует в <code>origin</code>. На финальной проверке status также показывал чужие <code>M .gitignore</code>, <code>M scripts/data/build_dataset_manifest.py</code>, <code>M tools/clang_indexer/index_project.py</code>, незатрекованный <code>tests/test_clang_exception_specification.py</code> и plan-файл; эти изменения не откатывались.</p>
+
+        <h3>cppmega.mlx</h3>
+        <p>Branch <code>codex/canonical-complete-20260715</code>, HEAD <code>d5fdec0eded97a2dd0c17828d75d979d4029c8f9</code>.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Commit</th><th>Время CEST</th><th>Назначение</th></tr></thead>
+            <tbody>
+              <tr><td><code>d5fdec0eded97a2dd0c17828d75d979d4029c8f9</code></td><td>20:13</td><td>Preserve packed document sidecars</td></tr>
+              <tr><td><code>050be1155ac5bb9f7e2332acdd161e82a7e64a01</code></td><td>20:04</td><td>Keep golden pipeline repository local</td></tr>
+              <tr><td><code>189b38bd030b00cadf46b7d980eed7d1a4aaa49d</code></td><td>19:54</td><td>Make MLX compile gate repository local</td></tr>
+              <tr><td><code>e25622982d4044a2ccaac3bc0539571b411b51b9</code></td><td>14:06</td><td>Align parser spans with token materialization</td></tr>
+              <tr><td><code>1ba36f7ddecdab91f3acc8ced5698c9ffadbe52b</code></td><td>13:06</td><td>Audit invalid domain files in corpus mode</td></tr>
+              <tr><td><code>8ea8f1ece4b3b81e590fc86e974aeed64726d787</code></td><td>12:52</td><td>Skip malformed generic text candidates</td></tr>
+              <tr><td><code>43804fafe22561f9d2c10e6f0718729c3a2bb58e</code></td><td>12:35</td><td>Add KSH and Python domain parsers</td></tr>
+              <tr><td><code>9ff05c5f0acc40e4cbe4f661beb16618fc41164a</code></td><td>12:01</td><td>Recover stored non-GitHub project identities</td></tr>
+              <tr><td><a href="https://github.com/DatasunriseOU/cppmega_mlx/commit/70b1f5d5199135647994cac246326f5a8f2b2678"><code>70b1f5d5...</code></a></td><td>04:50</td><td>Published full integration head</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn">MLX HEAD <code>d5fdec0</code> проверен локально через <code>git show</code>. Во время pass другие исполнители продолжили менять dirty FIM/objective (<code>objective_data</code>, <code>objective_mixer</code>, <code>objectives</code>, <code>megatron_objectives</code>), tests и clang identity files. Эти изменения не входят в HEAD, не редактировались этим pass и не считаются принятым fix без отдельного commit/receipt. Remote branch <code>codex/canonical-complete-20260715</code> отсутствует.</div>
+      </section>
+
+      <section id="tests">
+        <h2>8. Тесты и статические проверки</h2>
+        <p>Receipts ниже частично перекрываются, поэтому не суммируются.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Слой</th><th>Receipt</th><th>Что доказывает</th></tr></thead>
+            <tbody>
+              <tr><td>Published full integration baseline</td><td><span class="status good">1659 passed, 6 skipped</span></td><td>MLX Path C/native/data и root Megatron/data/CI</td></tr>
+              <tr><td>Root canonical focused integration</td><td><span class="status good">166 passed, 2 skipped</span></td><td>Source core, contracts, converter, PR/crossrepo/audit/runtime independence</td></tr>
+              <tr><td>Root KSH/Python + entrypoints</td><td><span class="status good">22 passed</span></td><td>Parser discovery/materialization и root-local CLI</td></tr>
+              <tr><td>Root graph/loader after 7d3a590</td><td><span class="status good">27 passed</span></td><td>CASE5 receipt/hash exports и graph loader bridge</td></tr>
+              <tr><td>Root parser TDD on dd82a55</td><td><span class="status bad">RED 5 failed / 1 passed</span> -> <span class="status good">GREEN 6 passed</span></td><td>Настоящее red/green доказательство parser-span fix</td></tr>
+              <tr><td>Root expanded parser suite</td><td><span class="status good">49 passed, 1 skipped</span></td><td>Расширенный parser/materializer/contract regression set</td></tr>
+              <tr><td>MLX focused rerun on e256229</td><td><span class="status good">112 passed</span></td><td>Receipt на <code>e256229</code>; текущий MLX HEAD уже <code>d5fdec0</code></td></tr>
+              <tr><td>MLX invalid-input corpus policy</td><td><span class="status good">83 passed</span></td><td>Generic skip, explicit fail-loud API, audited conveyor mode</td></tr>
+              <tr><td>Nebius H200 initial gate on b4e5261</td><td><span class="status good">11 passed, 27 warnings</span></td><td>Первый hardware receipt до larger-seq fixture repair</td></tr>
+              <tr><td>H200 full DSA file on exact 2b5dd3d</td><td><span class="status good">7 passed, 35 warnings</span></td><td>Full <code>tests/test_dsa_splitk_indexer_loss.py</code> на exact root HEAD</td></tr>
+              <tr><td>H200 final required gate on exact 2b5dd3d</td><td><span class="status good">11 passed, 27 warnings in 8.00s</span></td><td>CUDA/TE/Megatron component gate; writer/reader <code>46 / 45 257 / 45 063 / 20 / 11</code></td></tr>
+              <tr><td>Ruff, compileall, shell syntax, diff check</td><td><span class="status good">PASS</span></td><td>Static integrity of canonical delta</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout info">На локальном Mac real Megatron import недоступен из-за отсутствующего <code>megatron-core</code>; hardware-specific component gate завершён отдельно на H200 exact <code>2b5dd3d</code>.</div>
+        <h3>H200 exact receipt и граница доказательства</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Поле</th><th>Live receipt</th></tr></thead>
+            <tbody>
+              <tr><td>VM</td><td><code>computeinstance-e00dezxd2mdw060cem</code> / <code>cppmega-h200-canonical-20260715-140105</code></td></tr>
+              <tr><td>Container image</td><td>pinned digest prefix <code>sha256:08c5...</code></td></tr>
+              <tr><td>Первый GHCR pull</td><td><code>403</code>: token не имел <code>read:packages</code></td></tr>
+              <tr><td>Auth correction</td><td>Login package-capable account; secrets в отчёт не переносятся</td></tr>
+              <tr><td>Preliminary source</td><td><code>b4e526160fc5eeada5ad041a5f7109d558899c19</code> (ранний gate до fixture repair)</td></tr>
+              <tr><td>Exact final root source</td><td><code>2b5dd3df263883a1c88a5051e5edabafa54845ed</code></td></tr>
+              <tr><td>Full DSA suite</td><td><span class="status good">7 passed, 35 warnings</span></td></tr>
+              <tr><td>Final required gate</td><td><span class="status good">11 passed, 27 warnings in 8.00s</span></td></tr>
+              <tr><td>Writer / reader receipt</td><td><code>46</code> docs · <code>45 257</code> valid · <code>45 063</code> trained · <code>20</code> aligned sidecars · <code>11</code> graph CSR</td></tr>
+              <tr><td>Cleanup</td><td>VM deleted; direct get -> <code>NotFound</code>, project instance list empty</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Full split-K сначала выявил larger-seq fixture mismatch. Commit <code>2b5dd3d</code> causal-masks <code>index_scores</code> до top-k и передаёт те же masked scores в loss, как production path. После repair full DSA file и final required gate прошли на exact canonical HEAD. Source anchors: <a href="/Volumes/external/sources/cppmega/tests/test_dsa_splitk_indexer_loss.py">DSA fixture</a> · <a href="/Volumes/external/sources/cppmega/tests/test_nebius_h200_megatron_cpp_world_sweep.py">H200 tests</a> · <a href="/Volumes/external/sources/cppmega/scripts/nebius_h200_megatron_cpp_world_sweep.py">H200 launcher</a>. Это component acceptance, не доказательство длительного distributed training run.</p>
+      </section>
+
+      <section id="detours">
+        <h2>9. Detours: реальный root end-to-end receipt</h2>
+        <p>Artifact root: <code>/tmp/cppmega-root-smoke.1CGnuc</code>. Запуск был привязан к clean root revision <code>e925aca</code>.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Метрика</th><th class="num">Значение</th></tr></thead>
+            <tbody>
+              <tr><td>Repo / bucket</td><td class="num"><code>microsoft/Detours</code> / 1024</td></tr>
+              <tr><td>Rows / sequences</td><td class="num">46</td></tr>
+              <tr><td>Capacity tokens</td><td class="num">47 104</td></tr>
+              <tr><td>Valid tokens</td><td class="num">45 257</td></tr>
+              <tr><td>Trained tokens</td><td class="num">45 063</td></tr>
+              <tr><td>Padding</td><td class="num">1 847 · 3.921111%</td></tr>
+              <tr><td>Total conveyor time</td><td class="num">84.734 s</td></tr>
+              <tr><td>Bad files / bad rows</td><td class="num">0 / 0</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Stage timings</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Stage</th><th class="num">Seconds</th></tr></thead>
+            <tbody>
+              <tr><td>Clang index</td><td class="num">9.167591</td></tr>
+              <tr><td>Materialize</td><td class="num">58.590907</td></tr>
+              <tr><td>Route by fit</td><td class="num">11.273985</td></tr>
+              <tr><td>Pack</td><td class="num">5.160196</td></tr>
+              <tr><td>Recompress</td><td class="num">0.115098</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Converter output</h3>
+        <ul>
+          <li><code>detours.bin</code> + <code>detours.idx</code> (MMIDIDX).</li>
+          <li>20 token-aligned sidecars и 11 graph CSR/ragged sidecars.</li>
+          <li>13 source identities, 84 sequence references, 46 sequences.</li>
+          <li>Immutable generation <code>generation-1784115486756288000-6g2sjm59</code> и atomic <code>.detours.current</code>.</li>
+        </ul>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Graph channel</th><th class="num">Items</th></tr></thead>
+            <tbody>
+              <tr><td>Call / type edges</td><td class="num">1 / 1</td></tr>
+              <tr><td>Domain / build edges</td><td class="num">542 / 154</td></tr>
+              <tr><td>Shell / diagnostic / cross-domain</td><td class="num">0 / 0 / 0</td></tr>
+              <tr><td>Chunk starts / ends / kinds / dep levels</td><td class="num">207 each</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Receipts: <a href="/tmp/cppmega-root-smoke.1CGnuc/packed/.conveyor/progress.jsonl">conveyor progress</a> · <a href="/tmp/cppmega-root-smoke.1CGnuc/audit/sidecar_parquet_audit.md">audit</a> · <a href="/tmp/cppmega-root-smoke.1CGnuc/audit/sidecar_parquet_audit.json">audit JSON</a> · <a href="/tmp/cppmega-root-smoke.1CGnuc/megatron/detours.json">Megatron manifest</a> · <a href="/Volumes/external/sources/cppmega/scripts/data_prep_parquet_to_megatron.py">converter source</a>.</p>
+        <h3>H200 real Megatron writer+reader</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Проверка</th><th class="num">Receipt</th></tr></thead>
+            <tbody>
+              <tr><td>Documents</td><td class="num">46</td></tr>
+              <tr><td>Valid / trained tokens</td><td class="num">45 257 / 45 063</td></tr>
+              <tr><td>First IndexedDataset document</td><td class="num">length 1014, dtype int32</td></tr>
+              <tr><td>Token-aligned / graph CSR sidecars</td><td class="num">20 / 11</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>H200 receipt доказывает writer+reader interoperability для Detours в точном component scope. Локальный JSON использует <code>writer_backend=mmididx</code> как обозначение формата; это не следует смешивать с H200 reader receipt. Ни один из них не заменяет full distributed training/performance result.</p>
+        <div class="callout warn">Root не имеет собственного <code>.venv</code>, а <code>pyproject.toml</code> задаёт <code>dependencies = []</code>. Smoke использовал <code>cppmega.mlx/.venv/bin/python</code>, который фактически разрешается в <code>nanochat/.venv</code>. Код root-local, но environment packaging ещё нужно сделать standalone.</div>
+      </section>
+
+      <section id="case5-v4">
+        <h2>10. CASE5 v4: стабильный inventory</h2>
+        <p>Runtime: <code>63b0f587ce9504672bd58c964c6c4176fc10956d</code>. Каждый schedule step содержит 196 608 tokens. Повторный запуск <a href="/Volumes/external/sources/cppmega.mlx/scripts/report_training_steps.py">report_training_steps.py</a> на <a href="/Volumes/external/sources/cppmega.mlx/outputs/reindexed_case5_v4_20260714_093120_code">code root</a> и <a href="/Volumes/external/sources/cppmega.mlx/outputs/reindexed_case5_v4_20260714_093120_commits">commit root</a> воспроизвёл итог без skipped files.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th class="num">Bucket</th><th class="num">Batch</th><th class="num">Code</th><th class="num">Commit+PR</th><th class="num">Combined</th><th class="num">Full steps</th></tr></thead>
+            <tbody>
+              <tr><td class="num">1024</td><td class="num">192</td><td class="num">716 866 504</td><td class="num">36 658 247</td><td class="num">753 524 751</td><td class="num">3 832</td></tr>
+              <tr><td class="num">2048</td><td class="num">96</td><td class="num">134 702 573</td><td class="num">43 259 845</td><td class="num">177 962 418</td><td class="num">905</td></tr>
+              <tr><td class="num">4096</td><td class="num">48</td><td class="num">126 565 916</td><td class="num">51 451 443</td><td class="num">178 017 359</td><td class="num">905</td></tr>
+              <tr><td class="num">8192</td><td class="num">24</td><td class="num">109 386 520</td><td class="num">56 598 061</td><td class="num">165 984 581</td><td class="num">844</td></tr>
+              <tr><td class="num">16384</td><td class="num">12</td><td class="num">87 504 305</td><td class="num">48 708 667</td><td class="num">136 212 972</td><td class="num">692</td></tr>
+              <tr class="total-row"><td colspan="2">Итого</td><td class="num">1 175 025 818</td><td class="num">236 676 263</td><td class="num">1 411 702 081</td><td class="num">7 178</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre><code>schedule-valid: 3832 + 905 + 905 + 844 + 692 = 7178
+fungible aggregate: floor(1 411 702 081 / 196 608) = 7180</code></pre>
+        <div class="callout good">Правильный отчётный итог: <strong>7 178</strong>. Остатки разных sequence-length buckets не взаимозаменяемы.</div>
+        <p>Inventory отражает существующие shards, но не заявляет corpus gap-free: v4 commit lane ранее останавливалась на provenance mapping для <code>blender</code>, а наличие shards не доказывает полный corpus coverage.</p>
+      </section>
+
+      <section id="case5-v7">
+        <h2>11. CASE5 v7: живой статус</h2>
+        <p>Run <code>case5_v7_20260715_130725</code>, pinned runtime <code>1ba36f7</code>. Snapshot launch записывал tmux sessions <code>cppmega_case5_v7_code</code> и <code>cppmega_case5_v7_commits</code>.</p>
+        <h3>Trained-token snapshot на 14:40 CEST</h3>
+        <p>Tokens/step: <code>196 608</code>; полные шаги считаются отдельно по бакетам.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Bucket</th><th class="num">Combined trained tokens</th><th class="num">Полных шагов</th></tr></thead>
+            <tbody>
+              <tr><td>1024</td><td class="num">98 863 686</td><td class="num">502</td></tr>
+              <tr><td>2048</td><td class="num">15 449 130</td><td class="num">78</td></tr>
+              <tr><td>4096</td><td class="num">15 938 281</td><td class="num">81</td></tr>
+              <tr><td>8192</td><td class="num">13 519 250</td><td class="num">68</td></tr>
+              <tr><td>16384</td><td class="num">9 320 448</td><td class="num">47</td></tr>
+              <tr class="total-row"><td>Итого</td><td class="num">153 090 795</td><td class="num">776</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn">Это partial trained-token snapshot. Его нельзя прибавлять к v4: v7 повторно обрабатывает пересекающиеся источники.</div>
+        <h3>Recent throughput</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Lane</th><th class="num">Valid tokens</th><th class="num">Elapsed</th><th class="num">Throughput</th></tr></thead>
+            <tbody>
+              <tr><td>Code</td><td class="num">140 957 215</td><td class="num">4 324.754 s</td><td class="num">~117.3M tok/h</td></tr>
+              <tr><td>Commits</td><td class="num">12 714 472</td><td class="num">4 236.171 s</td><td class="num">~10.8M tok/h</td></tr>
+              <tr class="total-row"><td>Concurrent lane-rate sum</td><td class="num">-</td><td class="num">-</td><td class="num">~128.1M tok/h</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Combined throughput - сумма одновременно работающих lane rates, не деление объединённых токенов на один wall-clock denominator.</p>
+        <h3>Snapshot manifest: движущийся, не финальный</h3>
+        <p>Требуемая receipt-точка v7 зафиксирована как <code>77 done / 11 failed</code>. Это исторический snapshot, не финальный corpus verdict:</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Поле</th><th class="num">Snapshot</th></tr></thead>
+            <tbody>
+              <tr><td>Done units</td><td class="num">77</td></tr>
+              <tr><td>Failed units</td><td class="num">11</td></tr>
+              <tr><td>Runtime revision</td><td class="num"><code>1ba36f7</code></td></tr>
+              <tr><td>Window</td><td class="num">14:40-14:54 CEST</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>После snapshot <code>_done.json</code> продолжал изменяться. Ссылка на него ниже является live provenance anchor, но не immutable источником числа <code>77/11</code>; позднее состояние намеренно не подставляется в этот отчёт.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Unit</th><th>Failure</th><th>Статус</th></tr></thead>
+            <tbody>
+              <tr><td><code>LightGBM::repo</code></td><td>Domain-edge endpoint вне nonempty token span</td><td><span class="status warn">targeted rerun on e256229</span></td></tr>
+              <tr><td><code>SDL::repo</code></td><td>Тот же parser/materializer span class</td><td><span class="status warn">targeted rerun on e256229</span></td></tr>
+              <tr><td><code>SPTAG::repo</code></td><td>Embedded span <code>1966:2315</code> не сопоставился tokens</td><td><span class="status warn">targeted rerun on e256229</span></td></tr>
+              <tr><td>Другие parser/materialize units</td><td>ITK, VTK, apache-tvm, apple-mlx, ardupilot, arm-compute-library, arm-trusted-firmware, arrow</td><td><span class="status warn">repair agents active; rerun pending</span></td></tr>
+              <tr><td><code>apple-libdispatch::repo</code></td><td>Unknown clang enum <code>9</code></td><td><span class="status warn">separate compatibility repair</span></td></tr>
+              <tr><td><code>php-src::commits</code></td><td>Отдельный live commit-lane failed unit</td><td><span class="status warn">receipt audit required</span></td></tr>
+              <tr><td><code>Xbox Live Source::code</code></td><td>Нет canonical project identity</td><td><span class="status bad">provenance unresolved</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><code>e256229</code>/<code>dd82a55</code> landed; MLX focused rerun даёт 112 passed, root TDD - RED 5/1 -> GREEN 6 passed, expanded root - 49 passed/1 skipped. Но snapshot закреплён на <code>1ba36f7</code>, а текущий MLX checkout уже на <code>d5fdec0</code>. <a href="/Volumes/external/sources/cppmega.mlx/outputs/conveyor_case5_v7_20260715_130725/code_revision_guard/1ba36f7ddecdab91f3acc8ced5698c9ffadbe52b-be678ff3aeec94fd/launch_receipt.json">Launch receipt</a> содержит <code>CPPMEGA_CODE_REVISION_DRIFT</code>. Нужны targeted reruns и полный audit остальных failed units старого pre-fix manifest.</p>
+        <p>Xbox Source Cache указывает на archive <code>data-cpp_all.tar.zst</code>, не на normal forge remote. Допустимы только explicit archive identity после проверки происхождения/лицензии или документированное exclusion.</p>
+        <p>Live files: <a href="/Volumes/external/sources/cppmega.mlx/outputs/conveyor_case5_v7_20260715_130725/_done.json">manifest</a> · <a href="/Volumes/external/sources/cppmega.mlx/outputs/conveyor_case5_v7_20260715_130725/launch_code.sh">code launcher</a> · <a href="/Volumes/external/sources/cppmega.mlx/outputs/conveyor_case5_v7_20260715_130725/launch_commits.sh">commit launcher</a> · <a href="/Volumes/external/sources/cppmega.mlx/outputs/conveyor_case5_v7_20260715_130725/progress_code.jsonl">code progress</a> · <a href="/Volumes/external/sources/cppmega.mlx/outputs/conveyor_case5_v7_20260715_130725/progress_commits.jsonl">commit progress</a>.</p>
+      </section>
+
+      <section id="a2">
+        <h2>12. A2 std DB и canonical symbol identity</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Метрика</th><th class="num">Значение</th></tr></thead>
+            <tbody>
+              <tr><td>std rows</td><td class="num">15 485</td></tr>
+              <tr><td>Functions / types</td><td class="num">10 439 / 5 046</td></tr>
+              <tr><td>Distinct std qnames</td><td class="num">5 113</td></tr>
+              <tr><td>libiberty rows</td><td class="num">0</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Очистка A2 успешна, но количество candidates доказывает, что <code>qname</code> не уникален.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>qname</th><th class="num">Candidates</th><th class="num">Signatures</th><th class="num">Files</th></tr></thead>
+            <tbody>
+              <tr><td><code>std::operator==</code></td><td class="num">122</td><td class="num">75</td><td class="num">75</td></tr>
+              <tr><td><code>std::swap</code></td><td class="num">112</td><td class="num">92</td><td class="num">62</td></tr>
+              <tr><td><code>std::operator&lt;&lt;</code></td><td class="num">103</td><td class="num">53</td><td class="num">65</td></tr>
+              <tr><td><code>std::formatter</code></td><td class="num">86</td><td class="num">64</td><td class="num">14</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <ol>
+          <li>Stable clang USR + owning project имеет высший приоритет.</li>
+          <li>Без USR используются canonical signature, symbol kind, normalized qname и scoped project/file/line.</li>
+          <li>Без пригодной signature разрешён typed repo-file-location fallback с project, repository-relative file и declaration location.</li>
+          <li>Canonical key получает domain-separated SHA-256 -> uint64 ID; registry fail-loud на collision.</li>
+        </ol>
+        <p>Primary key в DB: <code>symbol_uid</code>. <code>qname</code> используется только для candidate lookup; ambiguous lookup падает, а не выбирает произвольную строку.</p>
+        <p>Локальные источники: <a href="/Volumes/external/sources/cppmega/scripts/crossrepo/build_global_symbol_index.py">global symbol builder</a> · <a href="/Volumes/external/sources/cppmega/tools/clang_indexer/index_project.py">identity construction</a> · <a href="/Volumes/external/sources/cppmega.mlx/outputs/crossrepo/global_symbols_case5_v3_20260714_063541.sqlite">A2 DB</a>.</p>
+      </section>
+
+      <section id="fim-ast-fim">
+        <h2>13. FIM/AST-FIM: eligibility и physical identities</h2>
+        <div class="callout bad">Этот contract gap остаётся unresolved. Общие parser tests и H200 component gate его не закрывают.</div>
+        <p>MLX worktree содержит параллельные незакоммиченные edits для physical-source-safe middle. Они не входят в HEAD <code>d5fdec0</code> и пока не имеют отдельного accepted receipt, поэтому ниже описывается открытая acceptance boundary, а не заявленный fix.</p>
+        <p><a href="/Volumes/external/sources/cppmega.mlx/cppmega_mlx/training/objective_mixer.py">EligibilityAwareTaskMixer</a> различает FIM, AST-FIM и IFIM, проверяет domain interior, длину, clang chunks и IFIM instruction tokens. Для transformed document также существует guard, требующий одну положительную token-aligned physical source identity.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Слой</th><th>Что уже есть</th><th>Почему receipt ещё не закрыт</th></tr></thead>
+            <tbody>
+              <tr><td>Eligibility</td><td>Domain-preserving span, minimum length, AST chunk metadata, IFIM instruction tokens</td><td>Missing <code>source_identity_ids</code> возвращает <code>None</code> из physical guard и не делает candidate ineligible на стадии quota</td></tr>
+              <tr><td>Materialization</td><td><a href="/Volumes/external/sources/cppmega.mlx/cppmega_mlx/training/megatron_objectives.py">Production materializer</a> remap-ит provenance и может fail-close</td><td>Ошибка после выбора objective не доказывает корректное eligibility/realized-token accounting</td></tr>
+              <tr><td>Tests</td><td><a href="/Volumes/external/sources/cppmega.mlx/tests/test_production_objective_mixer.py">Positive one-physical и multi-document cases</a></td><td>Нужны negative receipts для absent, zero, malformed и mixed identity arrays на pinned production rerun</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Для закрытия каждый FIM/AST-FIM candidate должен fail-close без одной positive uint64 physical identity на выбранный logical document, registry/FK audit должен пройти на transformed rows, а realized objective receipt не должен учитывать rejected candidates. До такого pinned rerun physical-identity eligibility <strong>не считается исправленной</strong>.</p>
+        <p>Дополнительные источники: <a href="/Volumes/external/sources/cppmega.mlx/docs/reviews/2026-07-14-data-parquet-megatron-review.md">data/parquet/Megatron review</a> · <a href="/Volumes/external/sources/cppmega/docs/objective_mixture_contract.md">objective mixture contract</a>.</p>
+      </section>
+
+      <section id="risks">
+        <h2>14. Незавершённые проблемы и риски</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Риск</th><th>Что доказано</th><th>Что требуется</th></tr></thead>
+            <tbody>
+              <tr><td>Span contracts</td><td>MLX 112 passed; root RED 5/1 -> GREEN 6; expanded root 49 passed/1 skipped</td><td>Новый pinned runtime, targeted LightGBM/SDL/SPTAG reruns и полный old-manifest audit</td></tr>
+              <tr><td>FIM/AST-FIM physical identities</td><td>Guard и positive tests существуют</td><td>Fail-closed eligibility, registry/FK audit и realized-token receipt</td></tr>
+              <tr><td>Xbox provenance</td><td>Известен archive source; fake GitHub mapping отвергнут</td><td>Проверка origin/license, explicit identity или exclusion</td></tr>
+              <tr><td>H200 exact acceptance</td><td><code>2b5dd3d</code>: full DSA 7 passed/35 warnings; final gate 11 passed/27 warnings in 8.00s; real writer+reader</td><td>Не экстраполировать component gate на long distributed training/performance</td></tr>
+              <tr><td>Nebius cleanup</td><td>Image <code>sha256:08c5...</code>; GHCR auth исправлен; VM deleted и API подтверждает отсутствие</td><td>Новый VM только для следующего отдельного GPU workflow</td></tr>
+              <tr><td>Root environment</td><td>Detours E2E прошёл root code path</td><td>Собственный venv/lock/declared dependencies</td></tr>
+              <tr><td>Publication</td><td>Exact local commits и ancestry проверены</td><td>Canonical branches ещё не pushed</td></tr>
+              <tr><td>CASE5 v7</td><td>Зафиксирован snapshot 77/11 на старом <code>1ba36f7</code></td><td>Repairs, pinned reruns, audit и final trained-token report</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout bad">H200 required component gate завершён. CASE5 span acceptance и сам v7 run остаются незавершёнными до targeted reruns и финального audit.</div>
+      </section>
+
+      <section id="evidence">
+        <h2>15. Индекс доказательств</h2>
+        <h3>GitHub</h3>
+        <div class="path-list">
+          <a href="https://github.com/DatasunriseOU/cppmega">DatasunriseOU/cppmega</a>
+          <a href="https://github.com/DatasunriseOU/cppmega_mlx">DatasunriseOU/cppmega_mlx</a>
+          <a href="https://github.com/DatasunriseOU/cppmega/tree/codex/full-review-integration">Root full integration branch</a>
+          <a href="https://github.com/DatasunriseOU/cppmega_mlx/tree/codex/full-review-integration">MLX full integration branch</a>
+        </div>
+        <h3>Local source</h3>
+        <div class="path-list">
+          <a href="/Volumes/external/sources/cppmega/cppmega/data/domain_ingestion.py">cppmega domain ingestion</a>
+          <a href="/Volumes/external/sources/cppmega/tools/clang_indexer/index_project.py">cppmega clang indexer</a>
+          <a href="/Volumes/external/sources/cppmega/scripts/data_prep_parquet_to_megatron.py">cppmega Megatron converter</a>
+          <a href="/Volumes/external/sources/cppmega/tests/test_case5_v7_parser_token_span_regressions.py">cppmega CASE5 span regressions</a>
+          <a href="/Volumes/external/sources/cppmega/tests/test_dsa_splitk_indexer_loss.py">cppmega DSA causal fixture</a>
+          <a href="/Volumes/external/sources/cppmega/tests/test_nebius_h200_megatron_cpp_world_sweep.py">cppmega H200 sweep tests</a>
+          <a href="/Volumes/external/sources/cppmega.mlx/cppmega_mlx/data/domain_ingestion.py">cppmega.mlx domain ingestion</a>
+          <a href="/Volumes/external/sources/cppmega.mlx/tests/test_case5_v7_parser_token_span_regressions.py">cppmega.mlx CASE5 span regressions</a>
+          <a href="/Volumes/external/sources/cppmega.mlx/cppmega_mlx/training/objective_mixer.py">FIM/AST-FIM eligibility</a>
+          <a href="/Volumes/external/sources/cppmega.mlx/cppmega_mlx/training/megatron_objectives.py">Megatron provenance materializer</a>
+          <a href="/Volumes/external/sources/cppmega.mlx/tests/test_production_objective_mixer.py">Physical identity tests</a>
+          <a href="/Volumes/external/sources/cppmega.mlx/vbgui/src/components/DataInspector.tsx">MLX DataInspector</a>
+        </div>
+        <h3>Runtime receipts</h3>
+        <div class="path-list">
+          <a href="/tmp/cppmega-root-smoke.1CGnuc/audit/sidecar_parquet_audit.md">Detours audit</a>
+          <a href="/tmp/cppmega-root-smoke.1CGnuc/audit/sidecar_parquet_audit.json">Detours audit JSON</a>
+          <a href="/tmp/cppmega-root-smoke.1CGnuc/megatron/detours.json">Detours Megatron receipt</a>
+          <a href="/tmp/cppmega-root-smoke.1CGnuc/megatron/snapshot/megatron_generations/detours/generation-1784115486756288000-6g2sjm59/detours.json">Detours immutable generation</a>
+          <a href="/Volumes/external/sources/cppmega.mlx/outputs/conveyor_case5_v7_20260715_130725/_done.json">CASE5 v7 manifest</a>
+          <a href="/Volumes/external/sources/cppmega.mlx/outputs/conveyor_case5_v7_20260715_130725/code_revision_guard/1ba36f7ddecdab91f3acc8ced5698c9ffadbe52b-be678ff3aeec94fd/launch_receipt.json">CASE5 v7 launch revision receipt</a>
+          <a href="/Volumes/external/sources/cppmega.mlx/outputs/source_cache/code/Xbox%20Live%20Source/.cppmega_source_cache_complete.json">Xbox source-cache receipt</a>
+          <a href="/Volumes/external/sources/cppmega.mlx/outputs/crossrepo/global_symbols_case5_v3_20260714_063541.sqlite">A2 global symbols DB</a>
+        </div>
+      </section>
+
+      <footer>
+        <strong>Изменённые файлы:</strong><br>
+        <code>/Volumes/external/sources/cppmega/reports/canonical_integration_20260715.md</code><br>
+        <code>/Volumes/external/sources/cppmega/reports/canonical_integration_20260715.html</code><br><br>
+        Код, tests, configs, manifests и commits этим documentation pass не изменялись.
+        <p class="back-top"><a href="#top">К началу отчёта</a></p>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

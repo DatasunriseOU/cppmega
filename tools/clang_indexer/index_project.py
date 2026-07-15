@@ -897,6 +897,28 @@ def _cursor_canonical_signature(cursor: Cursor) -> str:
         ) from exc
 
 
+def _cursor_exception_specification_name(cursor: Cursor) -> str:
+    """Return a stable exception-spec name across libclang/binding skew."""
+    try:
+        exception_kind = getattr(cursor, "exception_specification_kind", None)
+    except ValueError as exc:
+        raw_id: int | None = None
+        if clang_cindex_module is not None and isinstance(cursor, Cursor):
+            conf = getattr(clang_cindex_module, "conf", None)
+            lib = getattr(conf, "lib", None)
+            getter = getattr(lib, "clang_getCursorExceptionSpecificationType", None)
+            if callable(getter):
+                raw_id = int(getter(cursor))
+        if raw_id is None:
+            match = re.search(r"(-?\d+)\D*$", str(exc))
+            if match is not None:
+                raw_id = int(match.group(1))
+        return f"UNKNOWN_{raw_id}" if raw_id is not None else "UNKNOWN"
+
+    name = getattr(exception_kind, "name", "") or str(exception_kind or "")
+    return name.rsplit(".", 1)[-1]
+
+
 def _cursor_canonical_signature_unchecked(cursor: Cursor) -> str:
     pieces: list[str] = []
     display = _normalize_signature_text(getattr(cursor, "displayname", "") or "")
@@ -944,8 +966,7 @@ def _cursor_canonical_signature_unchecked(cursor: Cursor) -> str:
             )
     if arg_types:
         pieces.append("args=(" + ",".join(arg_types) + ")")
-    exception_kind = getattr(cursor, "exception_specification_kind", None)
-    exception_name = getattr(exception_kind, "name", "") or str(exception_kind or "")
+    exception_name = _cursor_exception_specification_name(cursor)
     if pieces and exception_name:
         pieces.append(f"exception={exception_name.rsplit('.', 1)[-1]}")
     return "|".join(pieces)
