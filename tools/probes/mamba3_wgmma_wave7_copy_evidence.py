@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import pathlib
 import re
@@ -21,10 +22,10 @@ import tempfile
 from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+sys.path = [entry for entry in sys.path if entry != str(ROOT)]
+sys.path.insert(0, str(ROOT))
 
-from tools.probes import mamba3_wgmma_wave6_copy_path as wave6
+wave6 = importlib.import_module("tools.probes.mamba3_wgmma_wave6_copy_path")
 
 
 DATE = "2026-04-30"

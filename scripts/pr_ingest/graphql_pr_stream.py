@@ -27,9 +27,7 @@ import json
 import subprocess
 import sys
 import time
-from typing import Callable, Optional
-
-import requests
+from typing import Any, Callable, Optional
 
 from pr_store import PRStore
 
@@ -111,7 +109,13 @@ query($owner:String!, $name:String!, $after:String) {
 """
 
 
-def _graphql_post(token: str, query: str, variables: dict) -> requests.Response:
+def _graphql_post(token: str, query: str, variables: dict) -> Any:
+    try:
+        import requests
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "GraphQL PR ingestion requires the requests package for live HTTP calls"
+        ) from exc
     return requests.post(
         GITHUB_GRAPHQL,
         headers={
@@ -124,7 +128,7 @@ def _graphql_post(token: str, query: str, variables: dict) -> requests.Response:
     )
 
 
-def _reset_epoch_from_headers(resp: requests.Response) -> Optional[int]:
+def _reset_epoch_from_headers(resp: Any) -> Optional[int]:
     v = resp.headers.get("X-RateLimit-Reset")
     if v and v.isdigit():
         return int(v)
@@ -140,7 +144,7 @@ def fetch_repo(
     max_prs: Optional[int],
     comment_cap: int,
     verbose: bool = True,
-    graphql_post: Callable[[str, str, dict], requests.Response] = _graphql_post,
+    graphql_post: Callable[[str, str, dict], Any] = _graphql_post,
 ) -> dict:
     """Fetch PRs for owner/name into store, resuming from the saved cursor."""
     repo = f"{owner}/{name}"

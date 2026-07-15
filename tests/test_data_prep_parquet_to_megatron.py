@@ -2027,9 +2027,13 @@ def test_missing_megatron_import_fails_loud(
     pyarrow_stub.parquet = parquet_stub  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "pyarrow", pyarrow_stub)
     monkeypatch.setitem(sys.modules, "pyarrow.parquet", parquet_stub)
-    # Simulate a missing/broken Megatron-Core install: None in sys.modules makes
-    # `from megatron.core... import ...` raise ImportError at call time.
+    # Simulate a missing/broken Megatron-Core install even when another test
+    # imported Megatron earlier in this interpreter.
+    for module_name in tuple(sys.modules):
+        if module_name == "megatron" or module_name.startswith("megatron."):
+            monkeypatch.delitem(sys.modules, module_name, raising=False)
     monkeypatch.setitem(sys.modules, "megatron", None)
+    (tmp_path / "train.parquet").write_bytes(b"unread test shard")
 
     with pytest.raises(RuntimeError, match="IndexedDatasetBuilder"):
         converter.convert_parquet_to_megatron(

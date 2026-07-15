@@ -218,11 +218,17 @@ def _load_indexer(indexer_root: Path) -> tuple[ModuleType, Path]:
         raise ImportError(f"cannot load clang indexer module from {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
+    indexer_root_text = str(indexer_root)
+    original_sys_path = list(sys.path)
+    sys.path = [entry for entry in sys.path if entry != indexer_root_text]
+    sys.path.insert(0, indexer_root_text)
     try:
         spec.loader.exec_module(module)
     except Exception:
         sys.modules.pop(module_name, None)
         raise
+    finally:
+        sys.path[:] = original_sys_path
     return module, path
 
 

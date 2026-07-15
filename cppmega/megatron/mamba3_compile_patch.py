@@ -93,10 +93,10 @@ def _compiled_postprocess_siso(y: torch.Tensor,
     RMSNormGated itself is already Triton-fused, so we only compile the
     surrounding rearranges + float casts that feed into it.
     """
-    # y: (b, l, h, p) -> (b, l, d)
-    b, l, h, p = y.shape
-    y_flat = y.reshape(b, l, h * p)
-    z_flat = z.reshape(b, l, h * p)
+    # y: (b, seq_len, h, p) -> (b, seq_len, d)
+    b, seq_len, h, p = y.shape
+    y_flat = y.reshape(b, seq_len, h * p)
+    z_flat = z.reshape(b, seq_len, h * p)
     return y_flat, z_flat
 
 
@@ -112,10 +112,10 @@ def _compiled_postprocess_mimo(y: torch.Tensor,
     """
     # z: (b, l, h, p), mimo_z: (h, r, p)
     z_f = torch.einsum("blhp,hrp->blrhp", z.float(), mimo_z)
-    # (b, l, r, h, p) -> (b, l, r, h*p)
-    b, l, r, h, p = z_f.shape
-    z_f = z_f.reshape(b, l, r, h * p)
-    # y: (b, l, r, h, p) -> (b, l, r, h*p)
+    # (b, seq_len, r, h, p) -> (b, seq_len, r, h*p)
+    b, seq_len, r, h, p = z_f.shape
+    z_f = z_f.reshape(b, seq_len, r, h * p)
+    # y: (b, seq_len, r, h, p) -> (b, seq_len, r, h*p)
     y_f = y.reshape(y.shape[0], y.shape[1], y.shape[2], -1).float()
     return y_f, z_f
 
@@ -128,10 +128,10 @@ def _compiled_postprocess_mimo_out(y: torch.Tensor,
 
     After RMSNormGated, we reshape back and apply the output einsum.
     """
-    # y: (b, l, r, h*p) -> (b, l, r, h, p)
-    b, l, r, d = y.shape
+    # y: (b, seq_len, r, h*p) -> (b, seq_len, r, h, p)
+    b, seq_len, r, d = y.shape
     h = d // headdim
-    y = y.reshape(b, l, r, h, headdim)
+    y = y.reshape(b, seq_len, r, h, headdim)
     y = torch.einsum("blrhp,hrp->blhp", y, mimo_o)
     return y
 
@@ -167,7 +167,7 @@ def _patch_cppmega_mamba3_te():
         packed_seq_params=None,
         **kwargs,
     ):
-        from megatron.core.inference.contexts.static_context import deprecate_inference_params
+        from megatron.core.utils import deprecate_inference_params
         from mamba_ssm.ops.triton.mamba3.mamba3_siso_combined import mamba3_siso_combined
         from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo as mamba3_mimo_combined
         from mamba_ssm.ops.triton.angle_cumsum import angle_dt
@@ -303,7 +303,6 @@ def _patch_noconv_mamba3():
     from cppmega.megatron.noconv_mamba_mixer import (
         Mamba3ScanMixin,
         NoConvMambaMixer,
-        _compute_data_dependent_A,
     )
     from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
@@ -420,8 +419,6 @@ def apply_mamba3_compile_patch() -> None:
 
     Always on.  Crashes on failure — no fallbacks.
     """
-    import torch
-
     # CppMegaMamba3TE: compile is now INLINE (import _compiled_data_dep_A
     # directly in mamba3_te_mixer.py). No monkey-patch needed.
     # _patch_cppmega_mamba3_te()  # REMOVED — inline in mamba3_te_mixer.py

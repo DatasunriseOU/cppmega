@@ -1,5 +1,6 @@
 import ast
 import json
+import os
 import shutil
 import subprocess
 import tarfile
@@ -28,7 +29,12 @@ from scripts.nebius_h200_megatron_cpp_generation_eval import (
 
 ROOT = Path(__file__).resolve().parents[1]
 CASE3_FIXTURE = ROOT / "tests" / "fixtures" / "case3_prompt_repo"
-V3_INDEXER_ROOT = ROOT.parent / "cppmega_mlx_case4_usr"
+V3_INDEXER_ROOT = Path(
+    os.environ.get(
+        "CPPMEGA_TEST_CLANG_INDEXER_ROOT",
+        ROOT.parent / "cppmega.mlx",
+    )
+)
 PROMPT_GRAPH_PROJECT_ID = "tests/case3-prompt-repo"
 
 
