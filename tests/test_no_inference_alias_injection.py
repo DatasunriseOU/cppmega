@@ -6,6 +6,7 @@ from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT_ROOT = _REPO_ROOT / "scripts"
+_SOURCE_ROOTS = (_REPO_ROOT / "cppmega", _SCRIPT_ROOT)
 _EXCLUDED_SCRIPT = _SCRIPT_ROOT / "nebius_h200_megatron_cpp_generation_eval.py"
 _FORBIDDEN_PATTERNS = {
     "legacy static_context import": re.compile(
@@ -36,19 +37,20 @@ _FORBIDDEN_PATTERNS = {
 }
 
 
-def _production_script_sources() -> list[Path]:
+def _production_sources() -> list[Path]:
     return sorted(
         path
-        for path in _SCRIPT_ROOT.rglob("*")
+        for source_root in _SOURCE_ROOTS
+        for path in source_root.rglob("*")
         if path.suffix in {".py", ".sh"}
         and path != _EXCLUDED_SCRIPT
     )
 
 
-def test_production_scripts_do_not_inject_deprecated_inference_alias() -> None:
+def test_production_sources_do_not_inject_deprecated_inference_alias() -> None:
     violations: list[str] = []
 
-    for path in _production_script_sources():
+    for path in _production_sources():
         source = path.read_text(encoding="utf-8")
         for label, pattern in _FORBIDDEN_PATTERNS.items():
             for match in pattern.finditer(source):
