@@ -7,14 +7,14 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from cppmega.megatron.h200_preflight import (
+from cppmega.megatron.h200_preflight import (  # noqa: E402
     GRAPH_CHUNK_KIND_COUNT,
     GraphChunkKind,
     observe_graph_prior,
     observe_production_batch,
 )
-from cppmega.megatron.checkpoint_restore_preflight import state_fingerprint
-from scripts.h200_megatron_preflight import (
+from cppmega.megatron.checkpoint_restore_preflight import state_fingerprint  # noqa: E402
+from scripts.h200_megatron_preflight import (  # noqa: E402
     _claimed_backend_modules,
     _checkpoint_load_evidence,
     _checkpoint_tree_sha256,
@@ -290,6 +290,13 @@ def test_h200_commands_save_and_restore_full_optimizer_state(tmp_path):
         "CPPMEGA_OPTIMIZER": "adam",
         "CPPMEGA_USE_FLASH_ATTN": "1",
         "CPPMEGA_FP8_RECIPE": "off",
+        "NATIVE_ARGS": (
+            "--experimental-attention-variant dsa "
+            "--dsa-indexer-loss-coeff 0.001"
+        ),
+        "CPPMEGA_DSA_INDEXER_LOSS_COEFF": "0.001",
+        "CPPMEGA_SPEC_MODULE": "cppmega.megatron.nam56r_full_spec",
+        "CPPMEGA_SPEC_FUNCTION": "build_cppmega_nam56r_full_stack_spec",
     }
     common = {
         "wrapper": tmp_path / "pretrain_mamba.py",

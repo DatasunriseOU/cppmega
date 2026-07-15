@@ -1554,7 +1554,11 @@ try:
         # from this module directly, so this patch must land before runpy enters
         # upstream pretrain_mamba/pretrain_hybrid.
         import megatron.core.utils as batch_utils  # type: ignore[import-not-found]
-    except ImportError:
+        if not hasattr(batch_utils, "get_batch_on_this_tp_rank"):
+            raise ImportError(
+                "megatron.core.utils has no get_batch_on_this_tp_rank"
+            )
+    except (ImportError, AttributeError):
         # Older cppmega H200 trees used the training.utils location.
         import megatron.training.utils as batch_utils  # type: ignore[import-not-found]
 

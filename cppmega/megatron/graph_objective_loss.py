@@ -53,11 +53,15 @@ class GraphAuxiliaryLossConfig:
             raise ValueError("relations must not contain duplicates")
 
     @classmethod
-    def from_env(cls) -> "GraphAuxiliaryLossConfig":
+    def from_env(
+        cls,
+        environment: Mapping[str, str] | None = None,
+    ) -> "GraphAuxiliaryLossConfig":
+        source = os.environ if environment is None else environment
         defaults = stage1_graph_config_kwargs()
         relations = tuple(
             item.strip()
-            for item in os.environ.get(
+            for item in source.get(
                 "CPPMEGA_DSA_GRAPH_AUX_RELATIONS",
                 ",".join(STAGE1_GRAPH_RELATIONS),
             ).split(",")
@@ -66,48 +70,48 @@ class GraphAuxiliaryLossConfig:
         try:
             return cls(
                 global_weight=float(
-                    os.environ.get(
+                    source.get(
                         "CPPMEGA_DSA_GRAPH_AUX_WEIGHT",
                         str(defaults["global_weight"]),
                     )
                 ),
                 indexer_weight=float(
-                    os.environ.get(
+                    source.get(
                         "CPPMEGA_DSA_INDEXER_LOSS_COEFF",
                         str(defaults["indexer_weight"]),
                     )
                 ),
                 layer_weight=float(
-                    os.environ.get(
+                    source.get(
                         "CPPMEGA_DSA_GRAPH_LAYER_WEIGHT",
                         str(defaults["layer_weight"]),
                     )
                 ),
                 bce_weight=float(
-                    os.environ.get(
+                    source.get(
                         "CPPMEGA_DSA_GRAPH_BCE_WEIGHT",
                         str(defaults["bce_weight"]),
                     )
                 ),
                 coverage_weight=float(
-                    os.environ.get(
+                    source.get(
                         "CPPMEGA_DSA_GRAPH_COVERAGE_WEIGHT",
                         str(defaults["coverage_weight"]),
                     )
                 ),
                 topk=int(
-                    os.environ.get(
+                    source.get(
                         "CPPMEGA_DSA_GRAPH_AUX_TOPK", str(defaults["topk"])
                     )
                 ),
                 pos_weight=float(
-                    os.environ.get(
+                    source.get(
                         "CPPMEGA_DSA_GRAPH_POS_WEIGHT",
                         str(defaults["pos_weight"]),
                     )
                 ),
                 margin=float(
-                    os.environ.get(
+                    source.get(
                         "CPPMEGA_DSA_GRAPH_MARGIN", str(defaults["margin"])
                     )
                 ),
@@ -117,24 +121,39 @@ class GraphAuxiliaryLossConfig:
             raise ValueError(f"invalid DSA graph auxiliary environment: {exc}") from exc
 
 
-def validate_runtime_graph_contract(graph_contract: Mapping[str, object]) -> None:
+def validate_runtime_graph_contract(
+    graph_contract: Mapping[str, object],
+    *,
+    environment: Mapping[str, str] | None = None,
+    require_included_auxiliary: bool = False,
+) -> None:
     """Require runtime graph-loss knobs to exactly match the data receipt."""
 
-    if not _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
+    if not _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED", environment=environment):
         raise ValueError(
             "production graph objective requires CPPMEGA_GRAPH_ROUTES_ENABLED=1"
         )
-    if not _env_flag("CPPMEGA_STRUCTURE_ENABLED"):
+    if not _env_flag("CPPMEGA_STRUCTURE_ENABLED", environment=environment):
         raise ValueError(
             "production graph objective requires CPPMEGA_STRUCTURE_ENABLED=1"
         )
     validate_stage1_graph_contract(graph_contract)
-    # Dense GQA consumes the same routes through attention bias and trains them
-    # through LM loss. DSA-specific coefficients apply only when the indexer
-    # auxiliary objective is explicitly enabled.
-    if not graph_objective_requested():
+    requested = graph_objective_requested(environment=environment)
+    if (
+        require_included_auxiliary
+        and graph_contract.get("included_in_total_loss") is True
+        and not requested
+    ):
+        raise ValueError(
+            "graph_auxiliary.included_in_total_loss=true requires the DSA graph "
+            "auxiliary objective to be enabled"
+        )
+    # Route-only runtime validation may train dense attention through LM loss.
+    # Production preflight passes require_included_auxiliary=True and rejects
+    # that mode for contracts which promise inclusion in total loss.
+    if not requested:
         return
-    config = GraphAuxiliaryLossConfig.from_env()
+    config = GraphAuxiliaryLossConfig.from_env(environment)
     expected_relations = tuple(graph_contract.get("relations", ()))
     if config.relations != expected_relations:
         raise ValueError(
@@ -168,8 +187,13 @@ def validate_runtime_graph_contract(graph_contract: Mapping[str, object]) -> Non
         raise ValueError("graph auxiliary layer_reduction must be 'sum'")
 
 
-def _env_flag(name: str) -> bool:
-    raw = os.environ.get(name, "0").strip().lower()
+def _env_flag(
+    name: str,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> bool:
+    source = os.environ if environment is None else environment
+    raw = source.get(name, "0").strip().lower()
     if raw in {"1", "true", "yes", "on"}:
         return True
     if raw in {"0", "false", "no", "off"}:
@@ -177,8 +201,14 @@ def _env_flag(name: str) -> bool:
     raise ValueError(f"{name} has invalid boolean value {raw!r}")
 
 
-def graph_objective_requested() -> bool:
-    return _env_flag("CPPMEGA_DSA_GRAPH_AUX_ENABLED")
+def graph_objective_requested(
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> bool:
+    return _env_flag(
+        "CPPMEGA_DSA_GRAPH_AUX_ENABLED",
+        environment=environment,
+    )
 
 
 def require_active_dsa_graph_objective(
@@ -255,6 +285,15 @@ def _validate_inputs(
     return tuple(int(value) for value in indexer_scores.shape)
 
 
+def _finite_connected_zero(scores: torch.Tensor) -> torch.Tensor:
+    finite_scores = torch.where(
+        torch.isfinite(scores),
+        scores,
+        torch.zeros_like(scores),
+    )
+    return finite_scores.sum().mul(0.0)
+
+
 def graph_auxiliary_loss(
     indexer_scores: torch.Tensor,
     edge_targets: torch.Tensor,
@@ -272,20 +311,22 @@ def graph_auxiliary_loss(
     _batch, _queries, keys = _validate_inputs(indexer_scores, edge_targets, pair_mask)
     scores = indexer_scores.float()
     targets = edge_targets.to(device=scores.device, dtype=torch.float32)
-    valid_pairs = pair_mask.to(device=scores.device, dtype=torch.bool)
-    positive_edges = targets.sum()
+    finite_scores = torch.isfinite(scores)
+    safe_scores = torch.where(finite_scores, scores, torch.zeros_like(scores))
+    valid_pairs = pair_mask.to(device=scores.device, dtype=torch.bool) & finite_scores
+    positive_edges = targets[valid_pairs].sum()
     if int(positive_edges.detach().item()) == 0:
-        zero = scores.sum() * 0.0
+        zero = _finite_connected_zero(scores)
         return zero, {
             "bce": zero,
             "coverage": zero,
             "positive_edges": positive_edges,
         }
 
-    eligible_samples = targets.sum(dim=(1, 2)) > 0
+    eligible_samples = ((targets > 0) & valid_pairs).any(dim=(1, 2))
     valid_pairs = valid_pairs & eligible_samples[:, None, None]
     element_bce = F.binary_cross_entropy_with_logits(
-        scores,
+        safe_scores,
         targets,
         reduction="none",
         pos_weight=torch.tensor(
@@ -295,18 +336,19 @@ def graph_auxiliary_loss(
     bce = element_bce[valid_pairs].mean()
 
     if config.topk >= keys:
-        coverage = scores.sum() * 0.0
+        coverage = _finite_connected_zero(scores)
     else:
-        masked_scores = scores.masked_fill(~valid_pairs, float("-inf"))
+        masked_scores = safe_scores.masked_fill(~valid_pairs, float("-inf"))
         boundary = torch.topk(masked_scores, k=config.topk + 1, dim=-1).values[..., -1:]
         finite_boundary = torch.isfinite(boundary)
-        deficits = torch.relu(boundary + config.margin - scores)
+        deficits = torch.relu(boundary + config.margin - safe_scores)
         penalties = deficits * targets * finite_boundary.to(scores.dtype)
         coverage = penalties.sum() / positive_edges.clamp_min(1.0)
 
-    total = config.global_weight * config.layer_weight * (
+    unscaled = config.global_weight * config.layer_weight * (
         config.bce_weight * bce + config.coverage_weight * coverage
     )
+    total = config.indexer_weight * unscaled
     return total, {
         "bce": bce,
         "coverage": coverage,

@@ -1,16 +1,18 @@
-"""Correctness test for the DSA indexer fused per-head accumulation patch.
+"""Integration tests for the DSA indexer fused graph-gradient patch.
 
 Verifies :func:`compute_index_scores_fused_bf16` matches the upstream
 Megatron BF16 ``_compute_index_scores`` einsum implementation to within
 FP32 associative-reorder tolerance.
 
-Run on GB10 (or any CUDA GPU) with a small shape; no Megatron checkout
-required — this test inlines the upstream reference.
+The gradient integration cases import the real sibling Megatron DSA contract;
+the larger BF16 parity cases remain runnable on CPU and CUDA.
 """
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import subprocess
+import sys
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -310,9 +312,19 @@ def test_graph_route_bias_requires_structure_batch():
         )
 
 
+def test_structure_dataset_patch_imports_against_real_sibling_megatron():
+    result = subprocess.run(
+        [sys.executable, "-c", "import cppmega.megatron.structure_dataset_patch"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_dsa_backward_reuses_its_own_microbatch_graph(monkeypatch):
     from cppmega.megatron import dsa_indexer_fused_patch as fused_patch
-    from cppmega.megatron.structure_dataset_patch import _set_current_structure_batch
 
     class FakeFusedLoss:
         @staticmethod
@@ -337,26 +349,32 @@ def test_dsa_backward_reuses_its_own_microbatch_graph(monkeypatch):
     }
     fake_module = SimpleNamespace(FusedDSAIndexerLoss=FakeFusedLoss)
     monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
-    _set_current_structure_batch(first)
+    current = {"batch": first}
+    monkeypatch.setattr(
+        fused_patch,
+        "_capture_current_graph_batch",
+        lambda: {
+            key: value.detach().clone()
+            for key, value in current["batch"].items()
+        },
+    )
     fused_patch._patch_fused_dsa_autograd(fake_module)
     ctx = SimpleNamespace()
 
     assert FakeFusedLoss.forward(ctx) == "forward"
-    _set_current_structure_batch(second)
+    current["batch"] = second
     assert FakeFusedLoss.backward(ctx) == "backward"
 
     assert torch.equal(ctx.forward_seen, first["graph_call_edges"])
     assert torch.equal(ctx.backward_seen, first["graph_call_edges"])
     assert not torch.equal(ctx.backward_seen, second["graph_call_edges"])
-    _set_current_structure_batch(None)
 
 
 def test_dsa_indexer_loss_wrapper_adds_weighted_graph_objective(monkeypatch):
     from cppmega.megatron import dsa_indexer_fused_patch as fused_patch
-    from cppmega.megatron.structure_dataset_patch import _set_current_structure_batch
 
     def base_indexer_loss(index_scores, *_args, **_kwargs):
-        return index_scores.sum() * 0.0 + 2.0
+        return index_scores.new_tensor(2.0)
 
     fake_module = SimpleNamespace(compute_dsa_indexer_loss=base_indexer_loss)
     structure_batch = {
@@ -368,22 +386,551 @@ def test_dsa_indexer_loss_wrapper_adds_weighted_graph_objective(monkeypatch):
         "graph_document_ids": torch.tensor([[7, 7]], dtype=torch.long),
     }
     monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_ENABLED", "1")
     monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_RELATIONS", "call")
     monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_WEIGHT", "0.5")
     monkeypatch.setenv("CPPMEGA_DSA_GRAPH_BCE_WEIGHT", "1.0")
     monkeypatch.setenv("CPPMEGA_DSA_GRAPH_COVERAGE_WEIGHT", "0.25")
     monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_TOPK", "1")
-    _set_current_structure_batch(structure_batch)
+    token = fused_patch._set_graph_batch_override(structure_batch)
     fused_patch._patch_dsa_graph_objective(fake_module)
     scores = torch.zeros((1, 2, 2), requires_grad=True)
 
-    total = fake_module.compute_dsa_indexer_loss(scores)
-    total.backward()
+    try:
+        total = fake_module.compute_dsa_indexer_loss(scores)
+        total.backward()
+    finally:
+        fused_patch._reset_graph_batch_override(token)
 
     assert total.item() > 2.0
     assert scores.grad is not None
     assert torch.count_nonzero(scores.grad).item() > 0
-    _set_current_structure_batch(None)
+
+
+def test_patched_fused_dsa_backward_propagates_graph_only_gradients(monkeypatch):
+    from cppmega.megatron import dsa_indexer_fused_patch as fused_patch
+
+    class TensorParallelGroup:
+        @staticmethod
+        def size():
+            return 1
+
+    pg_collection = SimpleNamespace(tp=TensorParallelGroup())
+    dsa_module = SimpleNamespace()
+
+    def patched_index_scores(q, weights, k, use_relu=True):
+        sq, batch, _heads, _dim = q.shape
+        graph_bias = fused_patch._current_graph_route_bias(
+            batch_size=batch,
+            seqlen_q=sq,
+            seqlen_k=k.shape[0],
+            device=q.device,
+        )
+        return fused_patch.compute_index_scores_fused_bf16(
+            q,
+            weights,
+            k,
+            use_relu=use_relu,
+            graph_bias=graph_bias,
+        )
+
+    def base_indexer_loss(
+        index_scores,
+        _topk_indices,
+        _query,
+        _key,
+        _softmax_scale,
+        loss_coeff,
+        _sparse_loss,
+        _pg_collection,
+        *,
+        mask=None,
+    ):
+        del mask
+        return index_scores.square().mean() * loss_coeff
+
+    def forward_loss(
+        q,
+        weights,
+        k,
+        query,
+        key,
+        topk,
+        softmax_scale,
+        loss_coeff,
+        mask,
+        sparse_loss,
+        pg_collection,
+    ):
+        index_scores = dsa_module._compute_index_scores(q, weights, k)
+        masked_scores = index_scores if mask is None else index_scores + mask
+        topk_indices = masked_scores.topk(topk, dim=-1).indices
+        loss = dsa_module.compute_dsa_indexer_loss(
+            index_scores,
+            topk_indices,
+            query,
+            key,
+            softmax_scale,
+            loss_coeff,
+            sparse_loss,
+            pg_collection,
+            mask=mask,
+        )
+        return topk_indices, loss
+
+    def backward_loss(
+        q,
+        weights,
+        k,
+        _query,
+        _key,
+        _topk_indices,
+        _softmax_scale,
+        loss_coeff,
+        _sparse_loss,
+        _mask,
+        grad_loss,
+        _pg_collection,
+    ):
+        with torch.enable_grad():
+            q_recompute = q.detach().requires_grad_(True)
+            weights_recompute = weights.detach().requires_grad_(True)
+            k_recompute = k.detach().requires_grad_(True)
+            index_scores = dsa_module._compute_index_scores(
+                q_recompute,
+                weights_recompute,
+                k_recompute,
+            )
+            kl_only_loss = index_scores.square().mean() * loss_coeff
+            return torch.autograd.grad(
+                kl_only_loss,
+                (q_recompute, weights_recompute, k_recompute),
+                grad_outputs=grad_loss,
+            )
+
+    class PinnedFusedDSAIndexerLoss(torch.autograd.Function):
+        @staticmethod
+        def forward(
+            ctx,
+            q,
+            weights,
+            k,
+            query,
+            key,
+            softmax_scale,
+            topk,
+            loss_coeff,
+            mask,
+            sparse_loss,
+            pg_collection,
+        ):
+            topk_indices, loss = dsa_module.fwd_fused_indexer_loss_naive(
+                q,
+                weights,
+                k,
+                query,
+                key,
+                topk,
+                softmax_scale,
+                loss_coeff,
+                mask,
+                sparse_loss,
+                pg_collection,
+            )
+            ctx.save_for_backward(q, weights, k, query, key, topk_indices)
+            ctx.softmax_scale = softmax_scale
+            ctx.loss_coeff = loss_coeff
+            ctx.sparse_loss = sparse_loss
+            ctx.mask = mask
+            ctx.pg_collection = pg_collection
+            ctx.use_relu = True
+            return topk_indices, loss
+
+        @staticmethod
+        def backward(ctx, _grad_topk_indices, grad_loss):
+            q, weights, k, query, key, topk_indices = ctx.saved_tensors
+            grad_q, grad_weights, grad_k = dsa_module.bwd_fused_indexer_loss_naive(
+                q,
+                weights,
+                k,
+                query,
+                key,
+                topk_indices,
+                ctx.softmax_scale,
+                ctx.loss_coeff,
+                ctx.sparse_loss,
+                ctx.mask,
+                grad_loss,
+                ctx.pg_collection,
+            )
+            return (
+                grad_q,
+                grad_weights,
+                grad_k,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
+    dsa_module._compute_index_scores = patched_index_scores
+    dsa_module.compute_dsa_indexer_loss = base_indexer_loss
+    dsa_module.fwd_fused_indexer_loss_naive = forward_loss
+    dsa_module.bwd_fused_indexer_loss_naive = backward_loss
+    dsa_module.FusedDSAIndexerLoss = PinnedFusedDSAIndexerLoss
+
+    structure_batch = {
+        "graph_call_edges": torch.tensor([[[1, 0]]], dtype=torch.long),
+        "graph_call_edge_counts": torch.tensor([1], dtype=torch.long),
+        "graph_chunk_starts": torch.tensor([[0, 1]], dtype=torch.long),
+        "graph_chunk_ends": torch.tensor([[1, 2]], dtype=torch.long),
+        "graph_chunk_counts": torch.tensor([2], dtype=torch.long),
+        "graph_document_ids": torch.tensor([[7, 7]], dtype=torch.long),
+    }
+    monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_ENABLED", "1")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_RELATIONS", "call")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_WEIGHT", "1")
+    monkeypatch.setenv("CPPMEGA_DSA_INDEXER_LOSS_COEFF", "1")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_LAYER_WEIGHT", "1")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_BCE_WEIGHT", "1")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_COVERAGE_WEIGHT", "1")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_TOPK", "1")
+    monkeypatch.setattr(
+        fused_patch,
+        "_capture_current_graph_batch",
+        lambda: {
+            key: value.detach().clone()
+            for key, value in structure_batch.items()
+        },
+    )
+    fused_patch._patch_dsa_graph_objective(dsa_module)
+    fused_patch._patch_fused_dsa_autograd(dsa_module)
+
+    q = torch.full((2, 1, 2, 3), 0.5, requires_grad=True)
+    weights = torch.full((2, 1, 2), 0.25, requires_grad=True)
+    k = torch.full((2, 1, 3), 0.75, requires_grad=True)
+    query = torch.zeros((2, 1, 1, 3))
+    key = torch.zeros((2, 1, 1, 3))
+
+    _topk_indices, graph_only_loss = PinnedFusedDSAIndexerLoss.apply(
+        q,
+        weights,
+        k,
+        query,
+        key,
+        1.0,
+        1,
+        0.0,
+        None,
+        False,
+        pg_collection,
+    )
+    graph_only_loss.backward()
+
+    assert graph_only_loss.item() > 0.0
+    for tensor in (q, weights, k):
+        assert tensor.grad is not None
+        assert torch.count_nonzero(tensor.grad).item() > 0
+
+
+def test_real_megatron_fused_dsa_preserves_mask_and_scales_parameter_gradients(
+    monkeypatch,
+    capsys,
+):
+    from cppmega.megatron import dsa_indexer_fused_patch as fused_patch
+    from megatron.core.transformer import MLATransformerConfig
+    from megatron.core.transformer.experimental_attention_variant import dsa as dsa_module
+
+    class TensorParallelGroup:
+        @staticmethod
+        def size():
+            return 1
+
+    class ContractFusedDSAIndexerLoss(dsa_module.FusedDSAIndexerLoss):
+        pass
+
+    class TinyLinear(torch.nn.Module):
+        def __init__(self, input_size, output_size, **_kwargs):
+            super().__init__()
+            values = torch.arange(output_size * input_size, dtype=torch.float32)
+            self.weight = torch.nn.Parameter(
+                values.reshape(output_size, input_size) / 20.0 + 0.05
+            )
+
+        def forward(self, inputs):
+            return torch.nn.functional.linear(inputs, self.weight), None
+
+    class TinyNorm(torch.nn.Module):
+        def __init__(self, config, hidden_size, eps, **_kwargs):
+            super().__init__()
+            del config
+            self.weight = torch.nn.Parameter(torch.ones(hidden_size))
+            self.bias = torch.nn.Parameter(torch.zeros(hidden_size))
+            self.eps = eps
+
+        def forward(self, inputs):
+            return torch.nn.functional.layer_norm(
+                inputs,
+                (inputs.shape[-1],),
+                self.weight,
+                self.bias,
+                self.eps,
+            )
+
+    class FakeRotaryEmbedding:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get_rotary_seq_len(self, _inference, _decoder, inputs, *_args):
+            return inputs.shape[0]
+
+        def __call__(self, *_args, **_kwargs):
+            return torch.empty(0)
+
+    pg_collection = SimpleNamespace(tp=TensorParallelGroup(), cp=None)
+    monkeypatch.setattr(
+        dsa_module,
+        "FusedDSAIndexerLoss",
+        ContractFusedDSAIndexerLoss,
+    )
+    monkeypatch.setattr(dsa_module, "RotaryEmbedding", FakeRotaryEmbedding)
+    monkeypatch.setattr(dsa_module, "rotate_activation", lambda tensor: tensor)
+    monkeypatch.setattr(
+        dsa_module.DSAIndexer,
+        "__init__",
+        dsa_module.DSAIndexer.__init__,
+    )
+    monkeypatch.setattr(
+        dsa_module.DSAttention,
+        "__init__",
+        dsa_module.DSAttention.__init__,
+    )
+    monkeypatch.setattr(
+        dsa_module.DSAttention,
+        "forward",
+        dsa_module.DSAttention.forward,
+    )
+    monkeypatch.setattr(
+        dsa_module.DSAttention,
+        fused_patch._RUNTIME_RECEIPT_PATCH_MARKER,
+        False,
+        raising=False,
+    )
+
+    def patched_index_scores(q, weights, k, use_relu=True):
+        sq, batch, _heads, _dim = q.shape
+        graph_bias = fused_patch._current_graph_route_bias(
+            batch_size=batch,
+            seqlen_q=sq,
+            seqlen_k=k.shape[0],
+            device=q.device,
+        )
+        return fused_patch.compute_index_scores_fused_bf16(
+            q,
+            weights,
+            k,
+            use_relu=use_relu,
+            graph_bias=graph_bias,
+        )
+
+    monkeypatch.setattr(dsa_module, "_compute_index_scores", patched_index_scores)
+    monkeypatch.setattr(
+        dsa_module,
+        "compute_dsa_indexer_loss",
+        dsa_module.compute_dsa_indexer_loss,
+    )
+
+    seen_masks: list[torch.Tensor | None] = []
+    original_graph_objective = fused_patch._graph_objective_from_index_scores
+
+    def recording_graph_objective(index_scores, *, upstream_mask=None):
+        seen_masks.append(upstream_mask)
+        return original_graph_objective(
+            index_scores,
+            upstream_mask=upstream_mask,
+        )
+
+    monkeypatch.setattr(
+        fused_patch,
+        "_graph_objective_from_index_scores",
+        recording_graph_objective,
+    )
+    structure_batch = {
+        "graph_call_edges": torch.tensor([[[2, 0]]], dtype=torch.long),
+        "graph_call_edge_counts": torch.tensor([1], dtype=torch.long),
+        "graph_chunk_starts": torch.tensor([[0, 1, 2]], dtype=torch.long),
+        "graph_chunk_ends": torch.tensor([[1, 2, 3]], dtype=torch.long),
+        "graph_chunk_counts": torch.tensor([3], dtype=torch.long),
+        "graph_document_ids": torch.tensor([[7, 7, 7]], dtype=torch.long),
+    }
+    monkeypatch.setattr(
+        fused_patch,
+        "_capture_current_graph_batch",
+        lambda: {
+            key: value.detach().clone()
+            for key, value in structure_batch.items()
+        },
+    )
+    monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_ENABLED", "1")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_RELATIONS", "call")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_WEIGHT", "1")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_LAYER_WEIGHT", "1")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_BCE_WEIGHT", "1")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_COVERAGE_WEIGHT", "1")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_TOPK", "1")
+    fused_patch._patch_dsa_graph_objective(dsa_module)
+    fused_patch._patch_fused_dsa_autograd(dsa_module)
+    fused_patch._patch_dsa_runtime_receipts(dsa_module)
+
+    upstream_mask = torch.tensor(
+        [
+            [0.0, float("-inf"), float("-inf")],
+            [0.0, 0.0, float("-inf")],
+            [0.0, float("-inf"), 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    indexer_config = MLATransformerConfig(
+        num_layers=1,
+        hidden_size=4,
+        num_attention_heads=1,
+        ffn_hidden_size=8,
+        kv_channels=4,
+        q_lora_rank=4,
+        kv_lora_rank=4,
+        qk_head_dim=2,
+        qk_pos_emb_head_dim=2,
+        v_head_dim=4,
+        rope_type="rope",
+        dsa_indexer_n_heads=2,
+        dsa_indexer_head_dim=2,
+        dsa_indexer_topk=2,
+        dsa_indexer_loss_coeff=0.001,
+        use_cpu_initialization=True,
+        transformer_impl="local",
+    )
+    indexer_submodules = dsa_module.DSAIndexerSubmodules(
+        linear_wq_b=TinyLinear,
+        linear_wk=TinyLinear,
+        k_norm=TinyNorm,
+        linear_weights_proj=TinyLinear,
+    )
+    x = torch.tensor(
+        [
+            [[0.2, 0.3, 0.4, 0.5]],
+            [[0.5, 0.1, 0.2, 0.7]],
+            [[0.9, 0.2, 0.8, 0.1]],
+        ]
+    )
+    qr = torch.tensor(
+        [
+            [[0.1, 0.8, 0.2, 0.6]],
+            [[0.4, 0.2, 0.7, 0.3]],
+            [[0.9, 0.1, 0.5, 0.4]],
+        ]
+    )
+
+    def run(indexer_weight: str, *, emit_receipts: bool):
+        monkeypatch.setenv("CPPMEGA_DSA_INDEXER_LOSS_COEFF", indexer_weight)
+        if emit_receipts:
+            monkeypatch.setenv("CPPMEGA_H200_DSA_GRAPH_RECEIPTS", "1")
+        else:
+            monkeypatch.delenv("CPPMEGA_H200_DSA_GRAPH_RECEIPTS", raising=False)
+        indexer = dsa_module.DSAIndexer(
+            indexer_config,
+            indexer_submodules,
+            pg_collection,
+        )
+        indexer.cppmega_dsa_layer_number = 3
+        indexer._apply_rope = MethodType(
+            lambda _self, tensor, *_args: tensor,
+            indexer,
+        )
+        q, k, weights = indexer.forward_before_topk(x, qr)
+        query = torch.zeros((3, 1, 1, 2))
+        key = torch.zeros((3, 1, 1, 2))
+
+        layer_token = fused_patch._DSA_LAYER_CONTEXT.set(3)
+        try:
+            _topk_indices, graph_only_loss = ContractFusedDSAIndexerLoss.apply(
+                q,
+                weights,
+                k,
+                query,
+                key,
+                1.0,
+                2,
+                0.0,
+                upstream_mask,
+                False,
+                pg_collection,
+            )
+        finally:
+            fused_patch._DSA_LAYER_CONTEXT.reset(layer_token)
+        graph_only_loss.backward()
+        parameter_grads = {
+            name: parameter.grad.detach().clone()
+            for name, parameter in indexer.named_parameters()
+            if parameter.grad is not None
+        }
+        return graph_only_loss, parameter_grads
+
+    unit_loss, unit_grads = run("1", emit_receipts=False)
+    milli_loss, milli_grads = run("0.001", emit_receipts=True)
+
+    assert unit_loss.item() > 0.0
+    assert torch.isfinite(unit_loss)
+    assert torch.isfinite(milli_loss)
+    assert len(seen_masks) == 4
+    assert seen_masks[0] is seen_masks[1]
+    assert seen_masks[2] is seen_masks[3]
+    for seen in seen_masks:
+        assert seen is not None
+        assert torch.equal(seen, upstream_mask)
+        assert seen.untyped_storage().data_ptr() == (
+            upstream_mask.untyped_storage().data_ptr()
+        )
+    assert unit_grads.keys() == milli_grads.keys()
+    assert unit_grads.keys() == {
+        "linear_wq_b.weight",
+        "linear_wk.weight",
+        "k_norm.weight",
+        "k_norm.bias",
+        "linear_weights_proj.weight",
+    }
+    for name in unit_grads:
+        unit_grad = unit_grads[name]
+        milli_grad = milli_grads[name]
+        assert torch.isfinite(unit_grad).all()
+        assert torch.isfinite(milli_grad).all()
+        assert torch.count_nonzero(unit_grad).item() > 0
+        assert torch.count_nonzero(milli_grad).item() > 0
+        assert torch.linalg.vector_norm(milli_grad).item() == pytest.approx(
+            torch.linalg.vector_norm(unit_grad).item() * 0.001,
+            rel=1e-4,
+            abs=1e-8,
+        )
+
+    from scripts.h200_megatron_preflight import _dsa_graph_gradient_evidence
+
+    receipt_evidence = _dsa_graph_gradient_evidence(
+        capsys.readouterr().out,
+        expected_coefficient=0.001,
+    )
+    assert len(receipt_evidence["graph_losses"]) == 1
+    assert len(receipt_evidence["per_indexer"]) == 1
+    assert receipt_evidence["effective_coefficient"] == pytest.approx(0.001)
+    assert receipt_evidence["graph_losses"][0] == pytest.approx(milli_loss.item())
+    assert receipt_evidence["per_indexer"][0]["grad_norm"] > 0.0
+    assert set(receipt_evidence["per_indexer"][0]["parameter_grad_norms"]) == set(
+        milli_grads
+    )
 
 
 def test_dsa_graph_objective_receives_upstream_additive_mask(monkeypatch):
@@ -393,17 +940,18 @@ def test_dsa_graph_objective_receives_upstream_additive_mask(monkeypatch):
 
     def base_indexer_loss(index_scores, *, mask=None):
         del mask
-        return index_scores.sum() * 0.0
+        return index_scores.new_zeros(())
 
     def graph_objective(index_scores, *, upstream_mask=None):
         seen["mask"] = upstream_mask
-        return index_scores.sum() * 0.0
+        return index_scores.new_zeros(())
 
     fake_module = SimpleNamespace(compute_dsa_indexer_loss=base_indexer_loss)
     upstream_mask = torch.tensor(
         [[0.0, float("-inf")], [0.0, 0.0]], dtype=torch.float32
     )
     monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_ENABLED", "1")
     monkeypatch.setattr(
         fused_patch, "_graph_objective_from_index_scores", graph_objective
     )

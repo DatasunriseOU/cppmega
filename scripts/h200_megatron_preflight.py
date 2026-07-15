@@ -39,6 +39,9 @@ from cppmega.receipt_binding import (  # noqa: E402
     validate_binding_shape,
     validate_receipt_binding,
 )
+from cppmega.megatron.graph_objective_loss import (  # noqa: E402
+    validate_runtime_graph_contract,
+)
 
 PENDING_CHECKPOINT_SHA256 = "0" * 64
 _GRAPH_CHUNK_SIDECARS = (
@@ -278,20 +281,24 @@ def _profile_environment(
     profile.training.micro_batch_size = micro_batch_size
     profile.training.global_batch_size = micro_batch_size
     profile.precision.fp8_recipe = fp8_recipe
+    profile.model.dense = False
+    profile.spec_module = "cppmega.megatron.nam56r_full_spec"
+    profile.spec_function = "build_cppmega_nam56r_full_stack_spec"
     environment = os.environ.copy()
     environment.update(profile_shell_assignments(profile))
+    environment.pop("CPPMEGA_DENSE_GQA", None)
     environment.update(
         {
             "CPPMEGA_STRUCTURE_ENABLED": "1",
             "CPPMEGA_GRAPH_ROUTES_ENABLED": "1",
-            "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS": "1",
+            "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS": "0",
             "CPPMEGA_GRAPH_MAX_EDGES": str(graph_max_edges),
             "CPPMEGA_GRAPH_MAX_CHUNKS": str(graph_max_chunks),
             "CPPMEGA_DSA_PATCH_ENABLED": "1" if enable_dsa_patch else "0",
-            "CPPMEGA_DSA_GRAPH_AUX_ENABLED": "0",
-            "CPPMEGA_DSA_GRAPH_AUX_WEIGHT": "0",
-            "CPPMEGA_DSA_INDEXER_LOSS_COEFF": "0",
-            "CPPMEGA_DSA_SKIP_INDEXER_LOSS": "1",
+            "CPPMEGA_DSA_GRAPH_AUX_ENABLED": "1",
+            "CPPMEGA_DSA_GRAPH_AUX_WEIGHT": "1",
+            "CPPMEGA_DSA_INDEXER_LOSS_COEFF": "0.001",
+            "CPPMEGA_DSA_SKIP_INDEXER_LOSS": "0",
             "CUDA_DEVICE_MAX_CONNECTIONS": "1",
             "NCCL_GRAPH_REGISTER": "0",
         }
@@ -311,6 +318,25 @@ def build_megatron_command(
     environment: dict[str, str],
     load_checkpoint: bool,
 ) -> list[str]:
+    native_args = shlex.split(environment["NATIVE_ARGS"])
+    try:
+        variant_index = native_args.index("--experimental-attention-variant")
+    except ValueError as exc:
+        raise ValueError(
+            "production graph auxiliary preflight requires native DSA model args"
+        ) from exc
+    if native_args[variant_index + 1 : variant_index + 2] != ["dsa"]:
+        raise ValueError(
+            "production graph auxiliary preflight requires "
+            "--experimental-attention-variant dsa"
+        )
+    coefficient_index = native_args.index("--dsa-indexer-loss-coeff")
+    if native_args[coefficient_index + 1 : coefficient_index + 2] != [
+        environment["CPPMEGA_DSA_INDEXER_LOSS_COEFF"]
+    ]:
+        raise ValueError(
+            "native DSA indexer coefficient differs from graph auxiliary contract"
+        )
     command = [
         sys.executable,
         "-m",
@@ -345,11 +371,7 @@ def build_megatron_command(
         environment["CPPMEGA_FFN_HIDDEN_SIZE"],
         "--num-attention-heads",
         environment["CPPMEGA_NUM_ATTN_HEADS"],
-        "--group-query-attention",
-        "--num-query-groups",
-        environment["CPPMEGA_NUM_QUERY_GROUPS"],
-        "--kv-channels",
-        environment["CPPMEGA_KV_CHANNELS"],
+        *native_args,
         "--swiglu",
         "--rotary-base",
         "10000",
@@ -386,8 +408,8 @@ def build_megatron_command(
         "--attention-backend",
         environment["CPPMEGA_ATTN_BACKEND"],
         "--spec",
-        "cppmega.megatron.nam56r_noconv_spec",
-        "build_cppmega_nam56r_noconv_stack_spec",
+        environment["CPPMEGA_SPEC_MODULE"],
+        environment["CPPMEGA_SPEC_FUNCTION"],
         "--cross-entropy-loss-fusion",
         "--cross-entropy-fusion-impl",
         "te",
@@ -488,6 +510,103 @@ def _load_backend_dispatch_receipt(
         where=path.name,
     )
     return receipt
+
+
+def _validate_graph_prior_receipt(receipt: object) -> dict[str, object]:
+    if not isinstance(receipt, dict):
+        raise RuntimeError("DSA graph prior receipt must be an object")
+    if receipt.get("status") != "verified":
+        raise RuntimeError("DSA graph prior receipt is not verified")
+    if receipt.get("consumer") != "dsa_indexer":
+        raise RuntimeError(
+            "DSA graph prior receipt consumer must be exactly dsa_indexer"
+        )
+    prior = receipt.get("prior")
+    if not isinstance(prior, dict) or int(prior.get("nonzero", 0)) <= 0:
+        raise RuntimeError("DSA graph prior receipt lacks a nonzero prior")
+    return receipt
+
+
+def _dsa_graph_gradient_evidence(
+    text: str,
+    *,
+    expected_coefficient: float,
+) -> dict[str, object]:
+    objective_records: list[dict[str, object]] = []
+    gradient_records: list[dict[str, object]] = []
+    for line in text.splitlines():
+        if line.startswith("CPPMEGA_DSA_GRAPH_OBJECTIVE "):
+            payload = json.loads(line.split(" ", 1)[1])
+            objective_records.append(payload)
+        elif line.startswith("CPPMEGA_DSA_INDEXER_GRAD "):
+            payload = json.loads(line.split(" ", 1)[1])
+            gradient_records.append(payload)
+
+    if not objective_records or not gradient_records:
+        raise RuntimeError(
+            "H200 preflight log lacks actual DSA graph objective and indexer gradient evidence"
+        )
+    expected_module = (
+        "megatron.core.transformer.experimental_attention_variant.dsa.DSAttention"
+    )
+    expected_indexer = (
+        "megatron.core.transformer.experimental_attention_variant.dsa.DSAIndexer"
+    )
+    coefficients = []
+    for record in objective_records:
+        if record.get("actual_dsa_module") != expected_module:
+            raise RuntimeError("DSA graph receipt does not identify actual DSAttention")
+        layer_number = record.get("layer_number")
+        if not isinstance(layer_number, int) or layer_number <= 0:
+            raise RuntimeError("DSA graph receipt lacks a positive layer number")
+        graph_loss = float(record.get("graph_loss", math.nan))
+        coefficient = float(record.get("effective_coefficient", math.nan))
+        if not math.isfinite(graph_loss) or graph_loss <= 0.0:
+            raise RuntimeError("DSA graph receipt lacks a finite positive graph loss")
+        if not math.isfinite(coefficient):
+            raise RuntimeError("DSA graph receipt has a non-finite coefficient")
+        if not math.isclose(coefficient, expected_coefficient, rel_tol=0.0, abs_tol=1e-12):
+            raise RuntimeError(
+                "DSA graph receipt coefficient differs from the configured indexer coefficient"
+            )
+        coefficients.append(coefficient)
+
+    for record in gradient_records:
+        if record.get("actual_indexer_module") != expected_indexer:
+            raise RuntimeError("DSA gradient receipt does not identify actual DSAIndexer")
+        layer_number = record.get("layer_number")
+        if not isinstance(layer_number, int) or layer_number <= 0:
+            raise RuntimeError("DSA gradient receipt lacks a positive layer number")
+        grad_norm = float(record.get("grad_norm", math.nan))
+        parameter_norms = record.get("parameter_grad_norms")
+        if not math.isfinite(grad_norm) or grad_norm <= 0.0:
+            raise RuntimeError("DSA indexer receipt lacks a finite positive grad norm")
+        if not isinstance(parameter_norms, dict) or not parameter_norms:
+            raise RuntimeError("DSA indexer receipt lacks per-parameter grad norms")
+        positive_parameter_gradient = False
+        for value in parameter_norms.values():
+            parsed = float(value)
+            if not math.isfinite(parsed) or parsed < 0.0:
+                raise RuntimeError("DSA indexer receipt has an invalid parameter grad norm")
+            positive_parameter_gradient |= parsed > 0.0
+        if not positive_parameter_gradient:
+            raise RuntimeError("DSA indexer receipt has no nonzero parameter gradient")
+
+    objective_layers = [record.get("layer_number") for record in objective_records]
+    gradient_layers = [record.get("layer_number") for record in gradient_records]
+    if sorted(objective_layers) != sorted(gradient_layers):
+        raise RuntimeError("DSA graph and indexer receipts do not cover the same layers")
+    return {
+        "actual_dsa_modules": sorted(
+            {str(record["actual_dsa_module"]) for record in objective_records}
+        ),
+        "actual_indexer_modules": sorted(
+            {str(record["actual_indexer_module"]) for record in gradient_records}
+        ),
+        "effective_coefficient": coefficients[-1],
+        "graph_losses": [float(record["graph_loss"]) for record in objective_records],
+        "per_indexer": gradient_records,
+    }
 
 
 def _stack_report(environment: dict[str, str]) -> dict[str, object]:
@@ -593,13 +712,15 @@ def write_training_loss_receipt(
     *,
     expected_iteration: int,
     output: Path,
+    expected_dsa_coefficient: float | None = None,
 ) -> dict[str, object]:
     if expected_iteration <= 0:
         raise ValueError("expected_iteration must be positive")
     if not log_path.is_file():
         raise FileNotFoundError(log_path)
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
     evidence = _iteration_evidence(
-        log_path.read_text(encoding="utf-8", errors="replace"),
+        log_text,
         expected_iteration=expected_iteration,
     )
     receipt = {
@@ -609,6 +730,11 @@ def write_training_loss_receipt(
         "log_sha256": _sha256(log_path),
         "evidence": evidence,
     }
+    if expected_dsa_coefficient is not None:
+        receipt["dsa_graph_gradient"] = _dsa_graph_gradient_evidence(
+            log_text,
+            expected_coefficient=expected_dsa_coefficient,
+        )
     _write_json_atomic(output, receipt)
     return receipt
 
@@ -816,6 +942,7 @@ def _run_phase(
     phase_environment["CPPMEGA_H200_CHECKPOINT_STATE_RECEIPT"] = str(
         checkpoint_state_receipt
     )
+    phase_environment["CPPMEGA_H200_DSA_GRAPH_RECEIPTS"] = "1"
     if backend_claims:
         phase_environment["CPPMEGA_H200_BACKEND_DISPATCH_RECEIPT"] = str(
             backend_dispatch_receipt
@@ -843,6 +970,10 @@ def _run_phase(
     text = log_path.read_text(encoding="utf-8", errors="replace")
     iteration_evidence = _iteration_evidence(
         text, expected_iteration=expected_iteration
+    )
+    dsa_graph_gradient = _dsa_graph_gradient_evidence(
+        text,
+        expected_coefficient=float(environment["CPPMEGA_DSA_INDEXER_LOSS_COEFF"]),
     )
     load_evidence = (
         _checkpoint_load_evidence(
@@ -876,14 +1007,7 @@ def _run_phase(
             f"H200 preflight {name} did not record graph-prior consumption"
         )
     graph_prior = json.loads(graph_prior_receipt.read_text(encoding="utf-8"))
-    prior_summary = graph_prior.get("prior")
-    if (
-        graph_prior.get("status") != "verified"
-        or graph_prior.get("consumer") not in {"dense_attention", "dsa_indexer"}
-        or not isinstance(prior_summary, dict)
-        or int(prior_summary.get("nonzero", 0)) <= 0
-    ):
-        raise RuntimeError(f"H200 preflight {name} graph prior is not verified")
+    _validate_graph_prior_receipt(graph_prior)
     if not checkpoint_state_receipt.is_file():
         raise RuntimeError(
             f"H200 preflight {name} did not record checkpoint runtime state"
@@ -967,6 +1091,7 @@ def _run_phase(
         "checkpoint_sha256": checkpoint_sha256,
         "completed_iteration": expected_iteration,
         "iteration_evidence": iteration_evidence,
+        "dsa_graph_gradient": dsa_graph_gradient,
         "checkpoint_load_evidence": load_evidence,
         "forward_backward_numerical": {
             "status": "passed",
@@ -989,8 +1114,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fp8-recipe", choices=("off", "tensorwise"), default="off")
     parser.add_argument(
         "--enable-dsa-patch",
-        action="store_true",
-        help="Explicitly install the DSA patch; dense-GQA DSA auxiliary loss stays disabled.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Install the required fused DSA graph-objective patch.",
     )
     parser.add_argument(
         "--checkpoint-root",
@@ -1035,6 +1161,29 @@ def main(argv: Iterable[str] | None = None) -> int:
         graph_max_edges=int(graph_capacity["graph_max_edges"]),
         graph_max_chunks=int(graph_capacity["graph_max_chunks"]),
         enable_dsa_patch=args.enable_dsa_patch,
+    )
+    objective_descriptor = prefix_manifest.get("objective_contract")
+    objective_payload = (
+        objective_descriptor.get("payload")
+        if isinstance(objective_descriptor, dict)
+        else None
+    )
+    graph_contract = (
+        objective_payload.get("graph_auxiliary")
+        if isinstance(objective_payload, dict)
+        else None
+    )
+    if not isinstance(graph_contract, dict):
+        raise ValueError("H200 preflight requires graph_auxiliary objective contract")
+    if environment["CPPMEGA_DSA_PATCH_ENABLED"] != "1":
+        raise ValueError(
+            "graph_auxiliary.included_in_total_loss requires the fused DSA patch "
+            "before model construction"
+        )
+    validate_runtime_graph_contract(
+        graph_contract,
+        environment=environment,
+        require_included_auxiliary=True,
     )
     backend_claims = _claimed_backend_modules(environment)
     output = args.output.resolve()

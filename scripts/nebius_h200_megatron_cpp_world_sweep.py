@@ -30,6 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from cppmega.recipes.run_profiles import get_run_profile  # noqa: E402
 from scripts.data.publish_megatron_bundle_to_nebius_s3 import (  # noqa: E402
     _validate_bundle,
     _validate_prefix_manifest_contract,
@@ -561,7 +562,7 @@ def remote_run_script(
     graph_capacity: tuple[int, int] | None = None,
     fp8_recipe: str = "off",
     disable_nvrtc: bool = False,
-    enable_dsa_patch: bool = False,
+    enable_dsa_patch: bool = True,
     save_checkpoint: bool = False,
     save_interval: int | None = None,
     save_model_only: bool = True,
@@ -574,6 +575,22 @@ def remote_run_script(
     validate_docker_image_digest(docker_image)
     if train_iters <= 0:
         raise ValueError("train_iters must be positive")
+    if not enable_dsa_patch:
+        raise ValueError(
+            "production graph auxiliary contract requires the fused DSA patch"
+        )
+    dsa_profile = get_run_profile("h200_cpp_world_mini")
+    dsa_profile.model.dense = False
+    dsa_profile.spec_module = "cppmega.megatron.nam56r_full_spec"
+    dsa_profile.spec_function = "build_cppmega_nam56r_full_stack_spec"
+    dsa_native_args = shlex.split(dsa_profile.native_args_fragment())
+    if "--experimental-attention-variant" not in dsa_native_args:
+        raise ValueError("H200 graph auxiliary launcher requires native DSA args")
+    dsa_args = " ".join(shlex.quote(value) for value in dsa_native_args)
+    dsa_spec_args = " ".join(
+        shlex.quote(value)
+        for value in (dsa_profile.spec_module, dsa_profile.spec_function)
+    )
     batches = " ".join(str(v) for v in batch_sizes)
     if seq_data_prefixes is None:
         if graph_capacity is None:
@@ -660,12 +677,13 @@ def remote_run_script(
         export NVTE_DISABLE_NVRTC="{1 if disable_nvrtc else 0}"
         export CPPMEGA_STRUCTURE_ENABLED="${{CPPMEGA_STRUCTURE_ENABLED:-1}}"
         export CPPMEGA_GRAPH_ROUTES_ENABLED="${{CPPMEGA_GRAPH_ROUTES_ENABLED:-1}}"
-        export CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS="${{CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS:-1}}"
+        export CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS=0
         export CPPMEGA_DSA_PATCH_ENABLED="{1 if enable_dsa_patch else 0}"
-        export CPPMEGA_DSA_GRAPH_AUX_ENABLED=0
-        export CPPMEGA_DSA_GRAPH_AUX_WEIGHT=0
-        export CPPMEGA_DSA_INDEXER_LOSS_COEFF=0
-        export CPPMEGA_DSA_SKIP_INDEXER_LOSS=1
+        export CPPMEGA_DSA_GRAPH_AUX_ENABLED=1
+        export CPPMEGA_DSA_GRAPH_AUX_WEIGHT=1
+        export CPPMEGA_DSA_INDEXER_LOSS_COEFF=0.001
+        export CPPMEGA_DSA_SKIP_INDEXER_LOSS=0
+        export CPPMEGA_H200_DSA_GRAPH_RECEIPTS=1
         export CPPMEGA_BUNDLE_ROOT={shlex.quote(bundle_root)}
         export CPPMEGA_TOKENIZER_MODEL={shlex.quote(tokenizer_model)}
         mkdir -p "$TRITON_CACHE_DIR" /data/cppmega_h200_results
@@ -869,10 +887,11 @@ def remote_run_script(
               --global-batch-size ${{BS}} \\
               --train-iters {train_iters} \\
               --fp8-recipe {fp8_recipe})\\\"
-            export CPPMEGA_DSA_GRAPH_AUX_ENABLED=0
-            export CPPMEGA_DSA_GRAPH_AUX_WEIGHT=0
-            export CPPMEGA_DSA_INDEXER_LOSS_COEFF=0
-            export CPPMEGA_DSA_SKIP_INDEXER_LOSS=1
+            export CPPMEGA_DSA_GRAPH_AUX_ENABLED=1
+            export CPPMEGA_DSA_GRAPH_AUX_WEIGHT=1
+            export CPPMEGA_DSA_INDEXER_LOSS_COEFF=0.001
+            export CPPMEGA_DSA_SKIP_INDEXER_LOSS=0
+            unset CPPMEGA_DENSE_GQA
 
             DATA_ARGS=(--data-path 1.0 \\\"\\$DATA_PREFIX\\")
             OPTIMIZER_ARGS=(--optimizer \\\"\\$CPPMEGA_OPTIMIZER\\\")
@@ -887,7 +906,7 @@ def remote_run_script(
             if [[ \\\"\\$CPPMEGA_GRAD_REDUCE_IN_BF16\\\" == 1 || \\\"\\$CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER\\\" == 1 ]]; then OPTIMIZER_ARGS+=(--grad-reduce-in-bf16); fi
             if [[ \\\"\\$CPPMEGA_LOCAL_DDP_DISABLE_CONTIGUOUS_GRAD_BUFFER\\\" == 1 ]]; then OPTIMIZER_ARGS+=(--local-ddp-disable-contiguous-grad-buffer); fi
 
-            GQA_ARGS=(--group-query-attention --num-query-groups \\\"\\$CPPMEGA_NUM_QUERY_GROUPS\\\" --kv-channels \\\"\\$CPPMEGA_KV_CHANNELS\\\" --swiglu --rotary-base 10000)
+            DSA_ARGS=({dsa_args})
             ATTN_ARGS=(--attention-backend \\\"\\$CPPMEGA_ATTN_BACKEND\\\")
             if [[ \\\"\\$CPPMEGA_USE_FLASH_ATTN\\\" == 1 ]]; then
               ATTN_ARGS=(--use-flash-attn \\\"\\${{ATTN_ARGS[@]}}\\\")
@@ -920,7 +939,7 @@ def remote_run_script(
               --hidden-size \\\"\\$CPPMEGA_HIDDEN_SIZE\\\" \\
               --ffn-hidden-size \\\"\\$CPPMEGA_FFN_HIDDEN_SIZE\\\" \\
               --num-attention-heads \\\"\\$CPPMEGA_NUM_ATTN_HEADS\\\" \\
-              \\\"\\${{GQA_ARGS[@]}}\\\" \\
+              \\\"\\${{DSA_ARGS[@]}}\\\" \\
               --seq-length ${{SEQ}} \\
               --max-position-embeddings ${{SEQ}} \\
               --micro-batch-size ${{BS}} \\
@@ -940,7 +959,7 @@ def remote_run_script(
               --use-mcore-models \\
               --transformer-impl transformer_engine \\
               \\\"\\${{ATTN_ARGS[@]}}\\\" \\
-              --spec cppmega.megatron.nam56r_noconv_spec build_cppmega_nam56r_noconv_stack_spec \\
+              --spec {dsa_spec_args} \\
               --cross-entropy-loss-fusion \\
               --cross-entropy-fusion-impl te \\
               \\\"\\${{RECOMPUTE_ARGS[@]}}\\\" \\
@@ -983,6 +1002,7 @@ def remote_run_script(
             Path(sys.argv[1]),
             expected_iteration=int(sys.argv[2]),
             output=Path(sys.argv[3]),
+            expected_dsa_coefficient=0.001,
         )
         PYLOSS
           then
@@ -1111,8 +1131,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     parser.add_argument(
         "--enable-dsa-patch",
-        action="store_true",
-        help="Explicitly install the DSA patch; dense-GQA DSA auxiliary loss stays zero.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Install the required fused DSA graph-objective patch.",
     )
     parser.add_argument("--keep-instance", action="store_true")
     parser.add_argument("--dry-run", action="store_true")

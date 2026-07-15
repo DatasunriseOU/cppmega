@@ -739,13 +739,23 @@ def test_remote_script_enables_graph_routes_and_uses_selected_data_prefix():
 
     assert 'export CPPMEGA_STRUCTURE_ENABLED="${CPPMEGA_STRUCTURE_ENABLED:-1}"' in script
     assert 'export CPPMEGA_GRAPH_ROUTES_ENABLED="${CPPMEGA_GRAPH_ROUTES_ENABLED:-1}"' in script
-    assert 'export CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS="${CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS:-1}"' in script
-    assert 'export CPPMEGA_DSA_PATCH_ENABLED="0"' in script
-    assert "--enable-dsa-patch" not in script
+    assert "export CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS=0" in script
+    assert 'export CPPMEGA_DSA_PATCH_ENABLED="1"' in script
+    assert "--enable-dsa-patch" in script
     assert "if os.environ.get('CPPMEGA_DSA_PATCH_ENABLED', '0') == '1'" in script
     assert "apply_dsa_indexer_fused_patch()" in script
-    assert "export CPPMEGA_DSA_GRAPH_AUX_ENABLED=0" in script
-    assert "export CPPMEGA_DSA_INDEXER_LOSS_COEFF=0" in script
+    assert "export CPPMEGA_DSA_GRAPH_AUX_ENABLED=1" in script
+    assert "export CPPMEGA_DSA_GRAPH_AUX_WEIGHT=1" in script
+    assert "export CPPMEGA_DSA_INDEXER_LOSS_COEFF=0.001" in script
+    assert "export CPPMEGA_DSA_SKIP_INDEXER_LOSS=0" in script
+    assert "--experimental-attention-variant dsa" in script
+    assert "--multi-latent-attention" in script
+    assert "--dsa-indexer-loss-coeff 0.001" in script
+    assert "cppmega.megatron.nam56r_full_spec" in script
+    assert "build_cppmega_nam56r_full_stack_spec" in script
+    assert "CPPMEGA_H200_DSA_GRAPH_RECEIPTS=1" in script
+    assert "expected_dsa_coefficient=0.001" in script
+    assert "GQA_ARGS" not in script
     assert "apply_graph_route_attention_bias_patch()" in script
     assert "1024:cppmega_1024_current_mix_graph_train" in script
     assert 'DATA_PREFIX="$CPPMEGA_BUNDLE_ROOT/${DATA_PREFIX_NAME}"' in script
@@ -766,15 +776,14 @@ def test_remote_script_enables_graph_routes_and_uses_selected_data_prefix():
     assert "--cross-entropy-fusion-impl te" in script
     assert "--cross-entropy-fusion-impl linear" not in script
 
-    dsa_script = remote_run_script(
-        [256],
-        1,
-        DEFAULT_DOCKER_IMAGE,
-        graph_capacity=_TEST_GRAPH_CAPACITY,
-        enable_dsa_patch=True,
-    )
-    assert 'export CPPMEGA_DSA_PATCH_ENABLED="1"' in dsa_script
-    assert "--enable-dsa-patch" in dsa_script
+    with pytest.raises(ValueError, match="requires the fused DSA patch"):
+        remote_run_script(
+            [256],
+            1,
+            DEFAULT_DOCKER_IMAGE,
+            graph_capacity=_TEST_GRAPH_CAPACITY,
+            enable_dsa_patch=False,
+        )
 
 
 def test_remote_script_runs_fail_closed_h200_preflight_before_sweep():
@@ -1239,7 +1248,13 @@ def test_h200_preflight_real_local_dry_run_writes_bound_commands(tmp_path):
     assert receipt["commands"]["save"][
         receipt["commands"]["save"].index("--eval-interval") + 1
     ] == "1"
-    assert receipt["config"]["enable_dsa_patch"] is False
+    assert receipt["config"]["enable_dsa_patch"] is True
+    save_command = receipt["commands"]["save"]
+    assert save_command[save_command.index("--experimental-attention-variant") + 1] == "dsa"
+    assert "--multi-latent-attention" in save_command
+    assert save_command.count("--dsa-indexer-loss-coeff") == 1
+    assert save_command[save_command.index("--dsa-indexer-loss-coeff") + 1] == "0.001"
+    assert "--group-query-attention" not in save_command
     assert not checkpoint.exists()
 
 
