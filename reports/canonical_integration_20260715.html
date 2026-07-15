@@ -303,7 +303,7 @@
   <div class="layout">
     <aside class="sidebar" aria-label="Навигация по отчёту">
       <a class="sidebar-title" href="#top">Canonical integration</a>
-      <p class="sidebar-meta">2026-07-15 · git/receipts recheck 20:52 CEST</p>
+      <p class="sidebar-meta">2026-07-15 · git/tests/receipts recheck 21:03 CEST</p>
       <nav>
         <a href="#summary">Короткий итог</a>
         <a href="#roles">Роли репозиториев</a>
@@ -327,7 +327,7 @@
       <header>
         <h1>Каноническая интеграция <code>cppmega</code> и <code>cppmega.mlx</code></h1>
         <div class="meta">
-          <span>Снимок проверки: 2026-07-15 20:52 CEST</span>
+          <span>Снимок проверки: 2026-07-15 21:03 CEST</span>
           <span>Ветка: <code>codex/canonical-complete-20260715</code></span>
           <span>Формат: code, data, runtime и live receipts</span>
         </div>
@@ -336,7 +336,7 @@
           <a href="https://github.com/DatasunriseOU/cppmega_mlx">GitHub: cppmega_mlx</a>
         </div>
         <div class="callout warn">
-          CASE5 span-fixes не считаются принятыми без v7 rerun/receipt. Числа v7 ниже относятся к историческому snapshot <code>14:40-14:54 CEST</code> (<code>77 done / 11 failed</code>), а H200 gate описан только в точном component scope.
+          Source-local FIM/AST-FIM fixes приняты на canonical heads и проверены локальными receipts; старый CASE5 v7 runtime всё ещё требует pinned rerun. Числа v7 ниже относятся к историческому snapshot <code>14:40-14:54 CEST</code> (<code>77 done / 11 failed</code>), а H200 gate описан только в точном component scope.
         </div>
         <div class="status-strip" aria-label="Ключевые показатели">
           <div class="status-item"><strong>2</strong><span>самостоятельных canonical repos</span></div>
@@ -355,10 +355,10 @@
           <li>KSH и Python расширяют существующий <code>v1</code> на reserved IDs <code>245-248</code>, без изменения tokenizer vocabulary и без перенумерации.</li>
           <li>Detours прошёл реальный root-only end-to-end путь с fail-closed audit и 31 дополнительным sidecar channel.</li>
           <li>CASE5 v4 содержит <strong>1 411 702 081 trained tokens</strong> и <strong>7 178</strong> schedule-valid полных шагов.</li>
-          <li>CASE5 v7 snapshot partial: <strong>153 090 795 trained tokens</strong>, <strong>776</strong> schedule-valid steps и <strong>77 done / 11 failed</strong>. Run использует старый pinned runtime <code>1ba36f7</code>, не текущий MLX HEAD <code>d5fdec0</code>.</li>
+          <li>CASE5 v7 snapshot partial: <strong>153 090 795 trained tokens</strong>, <strong>776</strong> schedule-valid steps и <strong>77 done / 11 failed</strong>. Run использует старый pinned runtime <code>1ba36f7</code>, не текущий MLX HEAD <code>12610eb</code>.</li>
           <li>A2 DB очищена от libiberty, но множественные overloads подтверждают, что <code>qname</code> не уникален.</li>
           <li>На exact root commit <code>2b5dd3d</code> H200 DSA suite дал <strong>7 passed</strong>, final gate - <strong>11 passed</strong>; writer/reader receipt: <strong>46</strong> docs, <strong>45 257</strong> valid, <strong>45 063</strong> trained, <strong>20</strong> aligned sidecars, <strong>11</strong> graph CSR.</li>
-          <li>Unresolved остаются: FIM/AST-FIM physical-identity eligibility, Xbox provenance и root environment packaging gap.</li>
+          <li>Source-local FIM/AST-FIM, per-document IFIM binding и partial commit rows закрыты на canonical MLX head; открыты pinned v7 rerun, Xbox provenance и root environment packaging gap.</li>
         </ol>
       </section>
 
@@ -495,11 +495,12 @@
       <section id="commits">
         <h2>7. Точные коммиты</h2>
         <h3>cppmega</h3>
-        <p>Branch <code>codex/canonical-complete-20260715</code>, HEAD <code>2b5dd3df263883a1c88a5051e5edabafa54845ed</code>.</p>
+        <p>Branch <code>codex/canonical-complete-20260715</code>, accepted root code commit <code>6667d41f8dceb05221228097e336f239e7ba61c4</code>. Branch HEAD после него содержит только refresh этого отчёта.</p>
         <div class="table-wrap">
           <table>
             <thead><tr><th>Commit</th><th>Время CEST</th><th>Назначение</th></tr></thead>
             <tbody>
+              <tr><td><code>6667d41f8dceb05221228097e336f239e7ba61c4</code></td><td>21:01</td><td>Harden canonical root contracts</td></tr>
               <tr><td><code>2b5dd3df263883a1c88a5051e5edabafa54845ed</code></td><td>14:36</td><td>Generate causal top-k fixtures</td></tr>
               <tr><td><code>dd82a55aa023453e37c642605b6d2f6ad7f5373e</code></td><td>14:16</td><td>Align parser spans with token materialization</td></tr>
               <tr><td><code>7d3a590871ec0d15fd88be4908c6591b3a61df81</code></td><td>13:51</td><td>Expose CASE5 contract hashes to loader</td></tr>
@@ -510,14 +511,15 @@
             </tbody>
           </table>
         </div>
-        <p>Локальный root commit object проверен через <code>git -C /Volumes/external/sources/cppmega show --no-patch 2b5dd3df263883a1c88a5051e5edabafa54845ed</code>. Ветка <code>codex/canonical-complete-20260715</code> отсутствует в <code>origin</code>. На финальной проверке status также показывал чужие <code>M .gitignore</code>, <code>M scripts/data/build_dataset_manifest.py</code>, <code>M tools/clang_indexer/index_project.py</code>, незатрекованный <code>tests/test_clang_exception_specification.py</code> и plan-файл; эти изменения не откатывались.</p>
+        <p>Локальный root commit object проверен через <code>git -C /Volumes/external/sources/cppmega show --no-patch 6667d41f8dceb05221228097e336f239e7ba61c4</code>. Ветка <code>codex/canonical-complete-20260715</code> отсутствует в <code>origin</code>. Пользовательский <code>.gitignore</code> и untracked plan-файл сохранены вне commit.</p>
 
         <h3>cppmega.mlx</h3>
-        <p>Branch <code>codex/canonical-complete-20260715</code>, HEAD <code>d5fdec0eded97a2dd0c17828d75d979d4029c8f9</code>.</p>
+        <p>Branch <code>codex/canonical-complete-20260715</code>, HEAD <code>12610eb69d1b9499c0242c4a27b95b58d7313346</code>.</p>
         <div class="table-wrap">
           <table>
             <thead><tr><th>Commit</th><th>Время CEST</th><th>Назначение</th></tr></thead>
             <tbody>
+              <tr><td><code>12610eb69d1b9499c0242c4a27b95b58d7313346</code></td><td>21:02</td><td>Preserve source-local objective provenance</td></tr>
               <tr><td><code>d5fdec0eded97a2dd0c17828d75d979d4029c8f9</code></td><td>20:13</td><td>Preserve packed document sidecars</td></tr>
               <tr><td><code>050be1155ac5bb9f7e2332acdd161e82a7e64a01</code></td><td>20:04</td><td>Keep golden pipeline repository local</td></tr>
               <tr><td><code>189b38bd030b00cadf46b7d980eed7d1a4aaa49d</code></td><td>19:54</td><td>Make MLX compile gate repository local</td></tr>
@@ -530,7 +532,7 @@
             </tbody>
           </table>
         </div>
-        <div class="callout warn">MLX HEAD <code>d5fdec0</code> проверен локально через <code>git show</code>. Во время pass другие исполнители продолжили менять dirty FIM/objective (<code>objective_data</code>, <code>objective_mixer</code>, <code>objectives</code>, <code>megatron_objectives</code>), tests и clang identity files. Эти изменения не входят в HEAD, не редактировались этим pass и не считаются принятым fix без отдельного commit/receipt. Remote branch <code>codex/canonical-complete-20260715</code> отсутствует.</div>
+        <div class="callout info">MLX HEAD <code>12610eb</code> проверен локально через <code>git show</code>; source-local FIM/AST-FIM/IFIM и partial commit loader входят в этот commit и имеют свежий <code>201 passed</code> receipt. Remote branch <code>codex/canonical-complete-20260715</code> отсутствует.</div>
       </section>
 
       <section id="tests">
@@ -546,7 +548,11 @@
               <tr><td>Root graph/loader after 7d3a590</td><td><span class="status good">27 passed</span></td><td>CASE5 receipt/hash exports и graph loader bridge</td></tr>
               <tr><td>Root parser TDD on dd82a55</td><td><span class="status bad">RED 5 failed / 1 passed</span> -> <span class="status good">GREEN 6 passed</span></td><td>Настоящее red/green доказательство parser-span fix</td></tr>
               <tr><td>Root expanded parser suite</td><td><span class="status good">49 passed, 1 skipped</span></td><td>Расширенный parser/materializer/contract regression set</td></tr>
-              <tr><td>MLX focused rerun on e256229</td><td><span class="status good">112 passed</span></td><td>Receipt на <code>e256229</code>; текущий MLX HEAD уже <code>d5fdec0</code></td></tr>
+              <tr><td>MLX focused rerun on e256229</td><td><span class="status good">112 passed</span></td><td>Исторический receipt на <code>e256229</code>; новый current-head receipt указан ниже</td></tr>
+              <tr><td>Current MLX objective/FIM suite on 12610eb</td><td><span class="status good">201 passed</span></td><td>Physical-source FIM/AST-FIM, document-local IFIM, partial commits, golden fixtures and materializer</td></tr>
+              <tr><td>Current root contract/parser suite on 6667d41</td><td><span class="status good">139 passed</span></td><td>Root-local tokenizer/domain/parser/converter/entrypoint checks in project Python 3.13</td></tr>
+              <tr><td>Golden production objective materializer</td><td><span class="status good">60 docs; 26 075 input; 21 374 loss</span></td><td>Exact quota window with objective/graph/source-identity receipts</td></tr>
+              <tr><td>Root MMIDIDX conversion</td><td><span class="status good">60 docs; 26 135 shifted</span></td><td><code>.bin/.idx</code> plus token, graph, loss-mask, objective-id and provenance sidecars</td></tr>
               <tr><td>MLX invalid-input corpus policy</td><td><span class="status good">83 passed</span></td><td>Generic skip, explicit fail-loud API, audited conveyor mode</td></tr>
               <tr><td>Nebius H200 initial gate on b4e5261</td><td><span class="status good">11 passed, 27 warnings</span></td><td>Первый hardware receipt до larger-seq fixture repair</td></tr>
               <tr><td>H200 full DSA file on exact 2b5dd3d</td><td><span class="status good">7 passed, 35 warnings</span></td><td>Full <code>tests/test_dsa_splitk_indexer_loss.py</code> на exact root HEAD</td></tr>
@@ -555,7 +561,7 @@
             </tbody>
           </table>
         </div>
-        <div class="callout info">На локальном Mac real Megatron import недоступен из-за отсутствующего <code>megatron-core</code>; hardware-specific component gate завершён отдельно на H200 exact <code>2b5dd3d</code>.</div>
+        <div class="callout info">На локальном Mac real Megatron import недоступен из-за отсутствующего <code>megatron-core</code>; root converter receipt выполнен в проектном Python 3.13 окружении с explicit <code>mmididx</code> backend. Hardware-specific component gate завершён отдельно на H200 exact <code>2b5dd3d</code>.</div>
         <h3>H200 exact receipt и граница доказательства</h3>
         <div class="table-wrap">
           <table>
@@ -726,7 +732,7 @@ fungible aggregate: floor(1 411 702 081 / 196 608) = 7180</code></pre>
             </tbody>
           </table>
         </div>
-        <p><code>e256229</code>/<code>dd82a55</code> landed; MLX focused rerun даёт 112 passed, root TDD - RED 5/1 -> GREEN 6 passed, expanded root - 49 passed/1 skipped. Но snapshot закреплён на <code>1ba36f7</code>, а текущий MLX checkout уже на <code>d5fdec0</code>. <a href="/Volumes/external/sources/cppmega.mlx/outputs/conveyor_case5_v7_20260715_130725/code_revision_guard/1ba36f7ddecdab91f3acc8ced5698c9ffadbe52b-be678ff3aeec94fd/launch_receipt.json">Launch receipt</a> содержит <code>CPPMEGA_CODE_REVISION_DRIFT</code>. Нужны targeted reruns и полный audit остальных failed units старого pre-fix manifest.</p>
+        <p><code>e256229</code>/<code>dd82a55</code> landed; current MLX objective suite даёт 201 passed, current root contract/parser suite - 139 passed. Но snapshot закреплён на <code>1ba36f7</code>, а canonical MLX checkout уже на <code>12610eb</code>. <a href="/Volumes/external/sources/cppmega.mlx/outputs/conveyor_case5_v7_20260715_130725/code_revision_guard/1ba36f7ddecdab91f3acc8ced5698c9ffadbe52b-be678ff3aeec94fd/launch_receipt.json">Launch receipt</a> содержит <code>CPPMEGA_CODE_REVISION_DRIFT</code>. Нужны targeted reruns и полный audit остальных failed units старого pre-fix manifest.</p>
         <p>Xbox Source Cache указывает на archive <code>data-cpp_all.tar.zst</code>, не на normal forge remote. Допустимы только explicit archive identity после проверки происхождения/лицензии или документированное exclusion.</p>
         <p>Live files: <a href="/Volumes/external/sources/cppmega.mlx/outputs/conveyor_case5_v7_20260715_130725/_done.json">manifest</a> · <a href="/Volumes/external/sources/cppmega.mlx/outputs/conveyor_case5_v7_20260715_130725/launch_code.sh">code launcher</a> · <a href="/Volumes/external/sources/cppmega.mlx/outputs/conveyor_case5_v7_20260715_130725/launch_commits.sh">commit launcher</a> · <a href="/Volumes/external/sources/cppmega.mlx/outputs/conveyor_case5_v7_20260715_130725/progress_code.jsonl">code progress</a> · <a href="/Volumes/external/sources/cppmega.mlx/outputs/conveyor_case5_v7_20260715_130725/progress_commits.jsonl">commit progress</a>.</p>
       </section>
@@ -768,20 +774,19 @@ fungible aggregate: floor(1 411 702 081 / 196 608) = 7180</code></pre>
 
       <section id="fim-ast-fim">
         <h2>13. FIM/AST-FIM: eligibility и physical identities</h2>
-        <div class="callout bad">Этот contract gap остаётся unresolved. Общие parser tests и H200 component gate его не закрывают.</div>
-        <p>MLX worktree содержит параллельные незакоммиченные edits для physical-source-safe middle. Они не входят в HEAD <code>d5fdec0</code> и пока не имеют отдельного accepted receipt, поэтому ниже описывается открытая acceptance boundary, а не заявленный fix.</p>
-        <p><a href="/Volumes/external/sources/cppmega.mlx/cppmega_mlx/training/objective_mixer.py">EligibilityAwareTaskMixer</a> различает FIM, AST-FIM и IFIM, проверяет domain interior, длину, clang chunks и IFIM instruction tokens. Для transformed document также существует guard, требующий одну положительную token-aligned physical source identity.</p>
+        <div class="callout good">Основной source-local contract gap закрыт в MLX commit <code>12610eb</code>. Старый CASE5 v7 conveyor всё ещё pinned на <code>1ba36f7</code> и не считается автоматически перепроцессированным.</div>
+        <p><a href="/Volumes/external/sources/cppmega.mlx/cppmega_mlx/training/objective_mixer.py">EligibilityAwareTaskMixer</a> теперь допускает mixed-source context, но выбирает FIM/AST-FIM/recovery middle только внутри contiguous <code>(source_doc_id, source_identity_id)</code> run. IFIM instruction привязывается к logical document через <code>source_ifim_instruction_token_ids</code>, а не broadcast-ится на весь packed row.</p>
         <div class="table-wrap">
           <table>
             <thead><tr><th>Слой</th><th>Что уже есть</th><th>Почему receipt ещё не закрыт</th></tr></thead>
             <tbody>
-              <tr><td>Eligibility</td><td>Domain-preserving span, minimum length, AST chunk metadata, IFIM instruction tokens</td><td>Missing <code>source_identity_ids</code> возвращает <code>None</code> из physical guard и не делает candidate ineligible на стадии quota</td></tr>
-              <tr><td>Materialization</td><td><a href="/Volumes/external/sources/cppmega.mlx/cppmega_mlx/training/megatron_objectives.py">Production materializer</a> remap-ит provenance и может fail-close</td><td>Ошибка после выбора objective не доказывает корректное eligibility/realized-token accounting</td></tr>
-              <tr><td>Tests</td><td><a href="/Volumes/external/sources/cppmega.mlx/tests/test_production_objective_mixer.py">Positive one-physical и multi-document cases</a></td><td>Нужны negative receipts для absent, zero, malformed и mixed identity arrays на pinned production rerun</td></tr>
+              <tr><td>Eligibility</td><td>Source-local middle, AST chunks, recovery spans and document-local IFIM binding</td><td>Legacy unit packets without sidecars remain backward-compatible API; production rows still require the typed sidecar boundary</td></tr>
+              <tr><td>Materialization</td><td><a href="/Volumes/external/sources/cppmega.mlx/cppmega_mlx/training/megatron_objectives.py">Production materializer</a> independently validates transformed middle and remaps provenance registry</td><td>Corpus-level acceptance still needs a new pinned v7/v8 rerun</td></tr>
+              <tr><td>Tests</td><td><a href="/Volumes/external/sources/cppmega.mlx/tests/test_production_objective_mixer.py">201 passed</a>; 60-document artifact and root converter receipts</td><td>Old v7 failed units must be rerun with the new runtime</td></tr>
             </tbody>
           </table>
         </div>
-        <p>Для закрытия каждый FIM/AST-FIM candidate должен fail-close без одной positive uint64 physical identity на выбранный logical document, registry/FK audit должен пройти на transformed rows, а realized objective receipt не должен учитывать rejected candidates. До такого pinned rerun physical-identity eligibility <strong>не считается исправленной</strong>.</p>
+        <p>Итого: source-local safety и document-local IFIM binding приняты локально. Для corpus-level acceptance нужен отдельный pinned rerun, потому что действующий v7 запуск использует старый runtime и его <code>77/11</code> snapshot.</p>
         <p>Дополнительные источники: <a href="/Volumes/external/sources/cppmega.mlx/docs/reviews/2026-07-14-data-parquet-megatron-review.md">data/parquet/Megatron review</a> · <a href="/Volumes/external/sources/cppmega/docs/objective_mixture_contract.md">objective mixture contract</a>.</p>
       </section>
 
@@ -791,8 +796,8 @@ fungible aggregate: floor(1 411 702 081 / 196 608) = 7180</code></pre>
           <table>
             <thead><tr><th>Риск</th><th>Что доказано</th><th>Что требуется</th></tr></thead>
             <tbody>
-              <tr><td>Span contracts</td><td>MLX 112 passed; root RED 5/1 -> GREEN 6; expanded root 49 passed/1 skipped</td><td>Новый pinned runtime, targeted LightGBM/SDL/SPTAG reruns и полный old-manifest audit</td></tr>
-              <tr><td>FIM/AST-FIM physical identities</td><td>Guard и positive tests существуют</td><td>Fail-closed eligibility, registry/FK audit и realized-token receipt</td></tr>
+              <tr><td>Span contracts</td><td>Current MLX objective suite 201 passed; current root suite 139 passed</td><td>Новый pinned runtime, targeted LightGBM/SDL/SPTAG reruns и полный old-manifest audit</td></tr>
+              <tr><td>FIM/AST-FIM physical identities</td><td>Source-local middle, document-local IFIM and independent materializer check in <code>12610eb</code></td><td>Pinned v7/v8 rerun with realized per-objective receipt; legacy no-sidecar API is not production data</td></tr>
               <tr><td>Xbox provenance</td><td>Известен archive source; fake GitHub mapping отвергнут</td><td>Проверка origin/license, explicit identity или exclusion</td></tr>
               <tr><td>H200 exact acceptance</td><td><code>2b5dd3d</code>: full DSA 7 passed/35 warnings; final gate 11 passed/27 warnings in 8.00s; real writer+reader</td><td>Не экстраполировать component gate на long distributed training/performance</td></tr>
               <tr><td>Nebius cleanup</td><td>Image <code>sha256:08c5...</code>; GHCR auth исправлен; VM deleted и API подтверждает отсутствие</td><td>Новый VM только для следующего отдельного GPU workflow</td></tr>
@@ -802,7 +807,7 @@ fungible aggregate: floor(1 411 702 081 / 196 608) = 7180</code></pre>
             </tbody>
           </table>
         </div>
-        <div class="callout bad">H200 required component gate завершён. CASE5 span acceptance и сам v7 run остаются незавершёнными до targeted reruns и финального audit.</div>
+        <div class="callout bad">H200 required component gate завершён. Source-local FIM fix принят локально, но CASE5 v7 corpus acceptance и сам v7 run остаются незавершёнными до pinned reruns и финального audit.</div>
       </section>
 
       <section id="evidence">
@@ -839,6 +844,8 @@ fungible aggregate: floor(1 411 702 081 / 196 608) = 7180</code></pre>
           <a href="/Volumes/external/sources/cppmega.mlx/outputs/conveyor_case5_v7_20260715_130725/code_revision_guard/1ba36f7ddecdab91f3acc8ced5698c9ffadbe52b-be678ff3aeec94fd/launch_receipt.json">CASE5 v7 launch revision receipt</a>
           <a href="/Volumes/external/sources/cppmega.mlx/outputs/source_cache/code/Xbox%20Live%20Source/.cppmega_source_cache_complete.json">Xbox source-cache receipt</a>
           <a href="/Volumes/external/sources/cppmega.mlx/outputs/crossrepo/global_symbols_case5_v3_20260714_063541.sqlite">A2 global symbols DB</a>
+          <a href="/tmp/cppmega_mlx_objective_golden_20260715/objective_materialization.json">Golden objective materialization receipt</a>
+          <a href="/tmp/cppmega_mlx_objective_golden_20260715/megatron/golden.json">Root converter generation receipt</a>
         </div>
       </section>
 
@@ -846,7 +853,7 @@ fungible aggregate: floor(1 411 702 081 / 196 608) = 7180</code></pre>
         <strong>Изменённые файлы:</strong><br>
         <code>/Volumes/external/sources/cppmega/reports/canonical_integration_20260715.md</code><br>
         <code>/Volumes/external/sources/cppmega/reports/canonical_integration_20260715.html</code><br><br>
-        Код, tests, configs, manifests и commits этим documentation pass не изменялись.
+        Root commit <code>6667d41f</code> и MLX commit <code>12610eb</code> содержат код, tests и golden fixtures. Пользовательский root <code>.gitignore</code> и untracked plan-файл намеренно не включены.
         <p class="back-top"><a href="#top">К началу отчёта</a></p>
       </footer>
     </main>
