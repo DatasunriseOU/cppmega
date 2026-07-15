@@ -151,6 +151,13 @@ def test_generation_worker_builds_model_loads_checkpoint_and_threads_sidecars():
     assert "restore_checkpoint_strict(load_checkpoint, model_list)" in worker
     assert "def graph_conditioned_forward" in worker
     assert "def make_static_inference_context" in worker
+    assert "from megatron.core.inference.contexts import StaticInferenceContext" in worker
+    assert "max_batch_size=1" in worker
+    assert "max_sequence_length=seq_length" in worker
+    assert "inference_context.increment_sequence_len_offset(amount)" in worker
+    assert "megatron.core.inference_params" not in worker
+    assert "StaticInferenceContext(1, seq_length)" not in worker
+    assert "inference_context.sequence_len_offset += amount" not in worker
     assert "set_prompt_graph_inference_state" in worker
     assert "inference_context=inference_context" in worker
     assert "set_cppmega_structure_inputs" in worker

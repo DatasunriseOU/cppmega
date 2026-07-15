@@ -328,9 +328,8 @@ def test_source_supports_all_mamba3_features():
     assert "num_rope_angles" in text
     assert "rotary_dim_divisor" in text
 
-    # Data-dependent A: dd_A is routed through the compiled helper with A_floor.
+    # Data-dependent A fields remain part of the mixer contract.
     assert "dd_A" in text
-    assert "_compiled_data_dep_A(dd_A, self.A_floor, dd_dt, self.dt_bias)" in text
     assert "A_floor" in text
 
     # MIMO: mimo_x, mimo_z, mimo_o
@@ -338,6 +337,36 @@ def test_source_supports_all_mamba3_features():
     assert "self.mimo_z" in text
     assert "self.mimo_o" in text
     assert "is_mimo" in text
+
+
+def test_compiled_data_dependent_a_matches_reference_math():
+    torch = pytest.importorskip("torch")
+    from cppmega.megatron.mamba3_compile_patch import _compiled_data_dep_A
+
+    dd_a = torch.tensor(
+        [[[0.0, 1.0], [-1.0, 2.0]]],
+        dtype=torch.float32,
+    )
+    dd_dt = torch.tensor(
+        [[[0.5, -0.5], [1.0, 0.0]]],
+        dtype=torch.float32,
+    )
+    dt_bias = torch.tensor([0.25, -0.25], dtype=torch.float32)
+    a_floor = 0.1
+
+    adt, dt, decay = _compiled_data_dep_A(dd_a, a_floor, dd_dt, dt_bias)
+
+    expected_decay = -torch.nn.functional.softplus(dd_a.float())
+    expected_decay = torch.clamp(expected_decay, max=-a_floor)
+    expected_dt_untransposed = torch.nn.functional.softplus(
+        (dd_dt + dt_bias).float()
+    )
+    expected_adt = (expected_decay * expected_dt_untransposed).transpose(1, 2)
+    expected_dt = expected_dt_untransposed.transpose(1, 2)
+
+    torch.testing.assert_close(decay, expected_decay)
+    torch.testing.assert_close(dt, expected_dt)
+    torch.testing.assert_close(adt, expected_adt)
 
 
 # ---------------------------------------------------------------------------

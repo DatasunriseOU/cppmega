@@ -960,25 +960,16 @@ def prompt_graph_receipt_fields(
 
 
 def make_static_inference_context(seq_length: int):
-    try:
-        from megatron.core.inference.contexts import StaticInferenceContext
-    except ImportError:
-        from megatron.core.inference_params import InferenceParams as StaticInferenceContext
-    try:
-        return StaticInferenceContext(
-            max_batch_size=1,
-            max_sequence_length=seq_length,
-        )
-    except TypeError:
-        return StaticInferenceContext(1, seq_length)
+    from megatron.core.inference.contexts import StaticInferenceContext
+
+    return StaticInferenceContext(
+        max_batch_size=1,
+        max_sequence_length=seq_length,
+    )
 
 
 def advance_inference_context(inference_context, amount: int) -> None:
-    increment = getattr(inference_context, "increment_sequence_len_offset", None)
-    if callable(increment):
-        increment(amount)
-    else:
-        inference_context.sequence_len_offset += amount
+    inference_context.increment_sequence_len_offset(amount)
 
 
 def cppmega_generation_model_provider(pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
