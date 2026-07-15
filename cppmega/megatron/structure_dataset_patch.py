@@ -21,9 +21,11 @@ import numpy as np
 from cppmega.megatron.domain_route_contract import (
     CASE5_RECEIPT_KEY,
     CASE5_SCHEMA_VERSION,
+    DOMAIN_SCHEMA_SHA256,  # noqa: F401 - compatibility export for loader callers
     GRAPH_ROUTE_COLUMNS,
     GRAPH_ROUTE_COORDINATE_SPACES,
     SOURCE_IDENTITY_REGISTRY_SCHEMA,
+    TOKENIZER_CONTRACT_SHA256,  # noqa: F401 - compatibility export for loader callers
     is_accepted_case5_contract_hash_triple,
 )
 
