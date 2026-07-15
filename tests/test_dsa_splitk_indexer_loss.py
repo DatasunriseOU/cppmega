@@ -122,13 +122,25 @@ def _make_inputs(
     g = torch.Generator(device="cpu").manual_seed(seed)
     query = torch.randn(sq, b, np_, hn, generator=g, dtype=torch.bfloat16).to(device)
     key = torch.randn(sk, b, np_, hn, generator=g, dtype=torch.bfloat16).to(device)
-    index_scores = torch.randn(b, sq, sk, generator=g, dtype=torch.float32).to(device)
+    index_scores = torch.randn(b, sq, sk, generator=g, dtype=torch.float32)
 
-    # Build valid topk indices (each row: topk distinct values in [0, sk))
-    topk_indices = torch.stack([
-        torch.randperm(sk, generator=g)[:topk]
-        for _ in range(b * sq)
-    ]).reshape(b, sq, topk).to(device)
+    # Match the production DSA order: causal-mask index scores before top-k
+    # and pass those same masked scores into the loss. Independent random
+    # indices can leave early queries with no admissible key, while returning
+    # unmasked scores makes split-K skip future blocks that the test reference
+    # still includes in its index-softmax denominator.
+    causal_mask = torch.triu(
+        torch.full((sq, sk), float("-inf"), dtype=torch.float32),
+        diagonal=1,
+    )
+    index_scores = (index_scores + causal_mask).to(device)
+    topk_indices = index_scores.topk(
+        min(topk, sk),
+        dim=-1,
+    ).indices.to(device)
+
+    query_positions = torch.arange(sq, device=device).view(1, sq, 1)
+    assert torch.all((topk_indices <= query_positions).any(dim=-1))
 
     return query, key, index_scores, topk_indices
 
