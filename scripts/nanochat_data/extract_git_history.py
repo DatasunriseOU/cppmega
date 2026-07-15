@@ -61,6 +61,10 @@ from scripts.nanochat_data.memory_guard import (  # noqa: E402
     check_memory_limit,
     start_memory_guard,
 )
+from cppmega.symbol_identity import (  # noqa: E402
+    SymbolIdentityError,
+    require_project_identity,
+)
 
 
 CHECKPOINT_SCHEMA_VERSION = 1
@@ -733,7 +737,20 @@ def _repo_source_context(
     requested_repo_name = repo_name or Path(repo_path).name
     repo_url = resolve_repo_url(repo_path)
     owner_repo = resolve_owner_repo(repo_path)
-    canonical_repo_name = owner_repo or requested_repo_name
+    explicit_project_id = "/" in requested_repo_name
+    if explicit_project_id:
+        canonical_requested = require_project_identity(
+            requested_repo_name,
+            source="extract_git_history --repo-name",
+        )
+        if owner_repo is not None and owner_repo != canonical_requested:
+            raise RuntimeError(
+                f"explicit project identity {canonical_requested!r} conflicts "
+                f"with clone remote identity {owner_repo!r}"
+            )
+        canonical_repo_name = canonical_requested
+    else:
+        canonical_repo_name = owner_repo or requested_repo_name
 
     if notes == "off":
         use_notes = False
@@ -1873,6 +1890,15 @@ def main():
         "--max_commits", type=int, default=0, help="Max commits per repo (0 = all)"
     )
     parser.add_argument(
+        "--repo-name",
+        default=None,
+        help=(
+            "Explicit canonical project identity (owner/repo) for --repo. "
+            "Use this when the staged checkout directory is a synthetic name "
+            "such as _src."
+        ),
+    )
+    parser.add_argument(
         "--memory-limit-gb",
         type=float,
         default=10.0,
@@ -1931,6 +1957,16 @@ def main():
         help="Explicitly discard the durable extraction checkpoint before starting.",
     )
     args = parser.parse_args()
+    if args.repo_name and not args.repo:
+        parser.error("--repo-name requires --repo")
+    if args.repo_name:
+        try:
+            require_project_identity(
+                args.repo_name,
+                source="extract_git_history --repo-name",
+            )
+        except SymbolIdentityError as exc:
+            parser.error(str(exc))
     if args.checkpoint_commits <= 0:
         parser.error("--checkpoint-commits must be positive")
     if args.bad_unit_policy not in {"fail", "quarantine"}:
@@ -1991,7 +2027,7 @@ def main():
         checkpoint_root.mkdir(parents=True, exist_ok=True)
 
         for repo_path in repos:
-            repo_name = Path(repo_path).name
+            repo_name = args.repo_name or Path(repo_path).name
             try:
                 source = _repo_source_context(
                     repo_path,

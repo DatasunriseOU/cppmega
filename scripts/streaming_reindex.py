@@ -975,7 +975,9 @@ def stage_index_commits(repo: str, commit_inputs: Sequence[Path], work: Path,
                         repo_list: Path | None = None,
                         memory_limit_gb: float = 10.0,
                         analysis_cache_entries: int = 128,
-                        allow_empty: bool = False) -> Path | None:
+                        allow_empty: bool = False,
+                        *,
+                        project_id: str) -> Path | None:
     """process_commits.py -> <repo>.enriched.jsonl (commit edit-signal docs).
 
     A commit is an ATOMIC change-unit: process_commits dedups whole commit DOCS
@@ -993,6 +995,10 @@ def stage_index_commits(repo: str, commit_inputs: Sequence[Path], work: Path,
         "--format", "both",
         "--memory-limit-gb", str(memory_limit_gb),
         "--analysis-cache-entries", str(max(0, int(analysis_cache_entries))),
+        "--project-id", require_project_identity(
+            project_id,
+            source=f"stage_index_commits({repo})",
+        ),
     ]
     if dedup_db is not None:
         cmd += ["--dedup-db", str(dedup_db)]
@@ -1384,6 +1390,7 @@ def process_one_commit_source(
             stage_db,
             memory_limit_gb=memory_limit_gb,
             analysis_cache_entries=analysis_cache_entries,
+            project_id=project_id,
         )
         timings["process_commits_s"] = round(time.monotonic() - started, 6)
         if enriched is None:

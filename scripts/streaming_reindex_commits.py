@@ -294,8 +294,20 @@ def get_commit_list(repo_dir: Path) -> list[str]:
     return out.split("\n") if out else []
 
 
-def stage_extract_commits(repo: str, repo_dir: Path, work: Path) -> Path:
-    """extract_git_history.py --repo <_src> -> <repo>_commits.jsonl (all commits)."""
+def stage_extract_commits(
+    repo: str,
+    repo_dir: Path,
+    work: Path,
+    *,
+    project_id: str | None = None,
+) -> Path:
+    """Extract all commits with an explicit canonical project identity."""
+    if project_id is None:
+        raise RepoFailure(
+            repo,
+            "project_identity",
+            "extract_git_history requires an explicit canonical project identity",
+        )
     commits_jsonl = work / f"{repo}_commits.jsonl"
     run_checked(
         repo,
@@ -303,6 +315,10 @@ def stage_extract_commits(repo: str, repo_dir: Path, work: Path) -> Path:
         [
             VENV_PYTHON, EXTRACT_GIT,
             "--repo", repo_dir,
+            "--repo-name", sr.require_project_identity(
+                project_id,
+                source=f"stage_extract_commits({repo})",
+            ),
             "--output", commits_jsonl,
             "--max_commits", "0",
         ],
@@ -584,7 +600,8 @@ def process_range(
                                        pr_store=pr_store, repo_list=repo_list,
                                        memory_limit_gb=memory_limit_gb,
                                        analysis_cache_entries=analysis_cache_entries,
-                                       allow_empty=True)
+                                       allow_empty=True,
+                                       project_id=project_id)
         timings["process_commits_s"] = round(time.monotonic() - started, 6)
         if enriched is None:
             sr.discard_dedup_stage(dedup_db, stage_id, stage_db)
@@ -717,10 +734,16 @@ def process_one_repo(
     repo_work.mkdir(parents=True, exist_ok=True)
     smallest = lengths_sorted[0]
     try:
+        project_id = sr.resolve_project_identity(repo, repo_list)
         commit_list = get_commit_list(repo_dir)
         if not commit_list:
             raise RepoFailure(repo, "git_log", "no --no-merges --diff-filter=M commits")
-        records_jsonl = stage_extract_commits(repo, repo_dir, repo_work)
+        records_jsonl = stage_extract_commits(
+            repo,
+            repo_dir,
+            repo_work,
+            project_id=project_id,
+        )
 
         # .git is no longer needed (records captured); delete to free disk now.
         git_dir = repo_dir / ".git"
