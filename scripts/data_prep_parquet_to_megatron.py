@@ -2680,16 +2680,22 @@ def _convert_parquet_to_megatron_unpublished(
     """
     _validate_output_dtype_contract(dtype_str)
 
+    if objective_contract_path is not None:
+        if objective_artifact_path is not None:
+            raise ValueError(
+                "objective artifact and objective contract cannot both be supplied"
+            )
+        raise ValueError(
+            "bare --objective-contract is not accepted; use the canonical "
+            "shard-hashed --objective-artifact"
+        )
+
     import pyarrow.parquet as pq  # type: ignore[import-not-found]
     import json
 
     objective_artifact: ObjectiveMaterializationArtifact | None = None
     objective_artifact_manifest: dict[str, object] | None = None
     if objective_artifact_path is not None:
-        if objective_contract_path is not None:
-            raise ValueError(
-                "objective artifact and objective contract cannot both be supplied"
-            )
         objective_artifact = load_objective_materialization_artifact(
             objective_artifact_path
         )
@@ -2728,11 +2734,6 @@ def _convert_parquet_to_megatron_unpublished(
             objective_artifact
         )
     else:
-        if objective_contract_path is not None:
-            raise ValueError(
-                "bare --objective-contract is not accepted; use the canonical "
-                "shard-hashed --objective-artifact"
-            )
         if input_dir is None:
             raise ValueError("input_dir is required without an objective artifact")
         if side_channels is None and side_channel_dtypes is None:
