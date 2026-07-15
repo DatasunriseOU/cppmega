@@ -87,6 +87,7 @@ from cppmega.megatron.domain_route_contract import (  # noqa: E402
     VALID_DOMAIN_EDGE_KINDS,
     VALID_DOMAIN_IDS,
     VALID_DOMAIN_ROLE_IDS,
+    validate_case5_contract_hash_triple,
 )
 
 
@@ -708,29 +709,21 @@ def _require_case5_schema(
                 f"{shard}: CASE5 Arrow types differ from the contract: {wrong_types}"
             )
         metadata = schema.metadata or {}
-        expected_metadata = {
-            CASE5_SCHEMA_METADATA_KEY.encode("utf-8"): CASE5_SCHEMA_VERSION.encode(
-                "utf-8"
-            ),
-            DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode(
-                "utf-8"
-            ): DOMAIN_DELIMITER_CONTRACT_SHA256.encode("ascii"),
-            DOMAIN_SCHEMA_SHA256_METADATA_KEY.encode(
-                "utf-8"
-            ): DOMAIN_SCHEMA_SHA256.encode("ascii"),
-            TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode(
-                "utf-8"
-            ): TOKENIZER_CONTRACT_SHA256.encode("ascii"),
-        }
-        bad_metadata = {
-            key.decode("utf-8"): metadata.get(key)
-            for key, expected in expected_metadata.items()
-            if metadata.get(key) != expected
-        }
-        if bad_metadata:
+        schema_key = CASE5_SCHEMA_METADATA_KEY.encode("utf-8")
+        if metadata.get(schema_key) != CASE5_SCHEMA_VERSION.encode("utf-8"):
             raise ValueError(
-                f"{shard}: missing or stale CASE5 receipt metadata: {bad_metadata}"
+                f"{shard}: missing or stale CASE5 schema metadata: "
+                f"{metadata.get(schema_key)!r}"
             )
+        try:
+            validate_case5_contract_hash_triple(
+                metadata.get(DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode("utf-8")),
+                metadata.get(DOMAIN_SCHEMA_SHA256_METADATA_KEY.encode("utf-8")),
+                metadata.get(TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode("utf-8")),
+                where=shard,
+            )
+        except ValueError as exc:
+            raise ValueError(f"{shard}: missing or stale CASE5 receipt metadata: {exc}") from exc
     return len(shards)
 
 

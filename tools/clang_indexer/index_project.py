@@ -2856,6 +2856,7 @@ def _classify_shell_file(filepath: str, fname: str) -> str | None:
 def find_shell_files(
     project_dir: str,
     extra_exclude_dirs: set[str] | None = None,
+    invalid_input_handler: Callable[[Path, ValueError], None] | None = None,
 ) -> list[tuple[str, str]]:
     """Find shell sources, including extensionless files with a shell shebang."""
 
@@ -2865,7 +2866,13 @@ def find_shell_files(
         dirs[:] = [directory for directory in dirs if directory not in skip_dirs]
         for fname in filenames:
             filepath = os.path.join(root, fname)
-            shell_kind = _classify_shell_file(filepath, fname)
+            try:
+                shell_kind = _classify_shell_file(filepath, fname)
+            except ValueError as exc:
+                if invalid_input_handler is not None:
+                    invalid_input_handler(Path(filepath), exc)
+                    continue
+                raise
             if shell_kind is None:
                 continue
             try:
@@ -7027,6 +7034,7 @@ def emit_build_documents(
     dedup_stage_db: str | None = None,
     dedup_near: bool = True,
     emit_doc: Callable[[dict[str, object]], None] | None = None,
+    skip_invalid_inputs: bool = False,
 ) -> list[dict]:
     """Emit bounded domain docs with tokenized-hash dedup.
 
@@ -7075,67 +7083,80 @@ def emit_build_documents(
     from cppmega.data.domain_ingestion import iter_domain_file_chunks
 
     for filepath, build_kind in sorted(build_files):
-        source_chunks = iter_domain_file_chunks(
-            filepath,
-            max_chunk_bytes=BUILD_FILE_SIZE_CAP,
-        )
-        for source_chunk in source_chunks:
-            text = source_chunk.text
-            if not text or not text.strip():
-                skipped_empty += 1
-                continue
-
-            per_file_build_info = dict(default_build_info) if default_build_info else {}
-            if build_kind not in {
-                "bash",
-                "sh",
-                "zsh",
-                "tcsh",
-                "ksh",
-                "python",
-                "sql",
-                "compiler_diagnostic",
-                "linker_diagnostic",
-                "build_diagnostic",
-                "sanitizer_output",
-                "test_output",
-                "tool_output",
-            }:
-                per_file_build_info["build_system"] = build_kind
-
-            if tok is not None:
-                token_ids = tok.encode(text)
-                if not token_ids:
-                    raise RuntimeError(
-                        f"build file {filepath} ({build_kind}) tokenized to ZERO ids; "
-                        f"tokenizer/build-doc bug (RULE #1: fail loud)"
-                    )
-                if store is not None:
-                    if store.seen_exact_tokens(token_ids):
-                        dropped += 1
-                        continue
-                    if dedup_near and store.seen_near_tokens(token_ids):
-                        dropped += 1
-                        continue
-                else:
-                    _DedupStore, _sha1_tokens = _import_dedup_store_symbols()
-                    h = _sha1_tokens(token_ids)
-                    if h in seen_local:
-                        dropped += 1
-                        continue
-                    seen_local.add(h)
-
-            record_doc(
-                build_build_doc(
-                    filepath,
-                    text,
-                    build_kind,
-                    source_root=source_root,
-                    project_id=project_id,
-                    build_info=per_file_build_info or None,
-                    source_span=source_chunk.source_span(),
-                )
+        try:
+            source_chunks = iter_domain_file_chunks(
+                filepath,
+                max_chunk_bytes=BUILD_FILE_SIZE_CAP,
             )
+            for source_chunk in source_chunks:
+                text = source_chunk.text
+                if not text or not text.strip():
+                    skipped_empty += 1
+                    continue
+
+                per_file_build_info = dict(default_build_info) if default_build_info else {}
+                if build_kind not in {
+                    "bash",
+                    "sh",
+                    "zsh",
+                    "tcsh",
+                    "ksh",
+                    "python",
+                    "sql",
+                    "compiler_diagnostic",
+                    "linker_diagnostic",
+                    "build_diagnostic",
+                    "sanitizer_output",
+                    "test_output",
+                    "tool_output",
+                }:
+                    per_file_build_info["build_system"] = build_kind
+
+                if tok is not None:
+                    token_ids = tok.encode(text)
+                    if not token_ids:
+                        raise RuntimeError(
+                            f"build file {filepath} ({build_kind}) tokenized to ZERO ids; "
+                            f"tokenizer/build-doc bug (RULE #1: fail loud)"
+                        )
+                    if store is not None:
+                        if store.seen_exact_tokens(token_ids):
+                            dropped += 1
+                            continue
+                        if dedup_near and store.seen_near_tokens(token_ids):
+                            dropped += 1
+                            continue
+                    else:
+                        _DedupStore, _sha1_tokens = _import_dedup_store_symbols()
+                        h = _sha1_tokens(token_ids)
+                        if h in seen_local:
+                            dropped += 1
+                            continue
+                        seen_local.add(h)
+
+                record_doc(
+                    build_build_doc(
+                        filepath,
+                        text,
+                        build_kind,
+                        source_root=source_root,
+                        project_id=project_id,
+                        build_info=per_file_build_info or None,
+                        source_span=source_chunk.source_span(),
+                    )
+                )
+        except ValueError as exc:
+            if skip_invalid_inputs and str(exc).startswith(
+                (
+                    "binary domain input contains NUL byte",
+                    "invalid UTF-8 domain input",
+                    "binary shell/domain input contains NUL byte",
+                    "invalid UTF-8 shell/domain input",
+                )
+            ):
+                print(f"  SKIP invalid typed domain input {filepath}: {exc}", file=sys.stderr)
+                continue
+            raise
 
     if store is not None:
         store.commit()
@@ -7670,6 +7691,7 @@ def process_project(
     emit_doc: Callable[[str | dict[str, object]], None] | None = None,
     *,
     project_id: str,
+    skip_invalid_domain_inputs: bool = False,
 ) -> list:
     """Process a single project: parse all files, build index, generate docs.
 
@@ -7693,6 +7715,14 @@ def process_project(
 
     print(f"\n--- Processing project: {stable_project_id} ---", file=sys.stderr)
 
+    invalid_domain_paths: set[str] = set()
+
+    def _handle_invalid_domain_input(path: Path, exc: ValueError) -> None:
+        invalid_domain_paths.add(os.path.abspath(path))
+        print(f"  SKIP invalid typed domain input {path}: {exc}", file=sys.stderr)
+
+    invalid_handler = _handle_invalid_domain_input if skip_invalid_domain_inputs else None
+
     # Find source files
     cpp_files = find_cpp_files(project_dir, extra_exclude_dirs=extra_exclude_dirs)
     print(f"  Found {len(cpp_files)} C/C++ source files", file=sys.stderr)
@@ -7702,7 +7732,11 @@ def process_project(
     # Discover build/compilation files (ADDITIVE; emitted as 'build' docs).
     build_files = find_build_files(project_dir, extra_exclude_dirs=extra_exclude_dirs)
     print(f"  Found {len(build_files)} build/compilation files", file=sys.stderr)
-    shell_files = find_shell_files(project_dir, extra_exclude_dirs=extra_exclude_dirs)
+    shell_files = find_shell_files(
+        project_dir,
+        extra_exclude_dirs=extra_exclude_dirs,
+        invalid_input_handler=invalid_handler,
+    )
     print(f"  Found {len(shell_files)} project shell files", file=sys.stderr)
     from cppmega.data.domain_ingestion import discover_project_domain_files
 
@@ -7710,6 +7744,7 @@ def process_project(
         project_dir,
         extra_exclude_dirs=extra_exclude_dirs,
         include_cpp=False,
+        invalid_input_handler=invalid_handler,
     )
     domain_files_by_path = {
         os.path.abspath(filepath): (os.path.abspath(filepath), build_kind)
@@ -7722,6 +7757,10 @@ def process_project(
             discovered.domain.name.lower(),
         )
     domain_files = sorted(domain_files_by_path.values())
+    if invalid_domain_paths:
+        domain_files = [
+            item for item in domain_files if item[0] not in invalid_domain_paths
+        ]
     print(
         f"  Found {len(domain_files)} total typed domain files after dedup",
         file=sys.stderr,
@@ -7913,6 +7952,7 @@ def process_project(
             dedup_stage_db=dedup_stage_db,
             dedup_near=dedup_near,
             emit_doc=_emit_counted if emit_doc is not None else None,
+            skip_invalid_inputs=skip_invalid_domain_inputs,
         )
         if emit_doc is None:
             documents.extend(build_docs)
@@ -7966,6 +8006,13 @@ def main() -> int:
                              'call_edges, type_edges alongside text')
     parser.add_argument('--exclude-dirs', type=str, default=None,
                         help='Comma-separated extra directory names to exclude from file discovery')
+    parser.add_argument(
+        '--skip-invalid-domain-inputs',
+        action='store_true',
+        help='Corpus mode: log and skip individual typed domain files containing '
+             'NUL or invalid UTF-8 instead of failing the entire project. The '
+             'default remains fail-loud.',
+    )
     parser.add_argument('--memory-limit-gb', type=float, default=10.0,
                         help='Abort if this Python wrapper exceeds this max RSS in GiB (default: 10)')
     parser.add_argument('--dedup-db', type=str, default=None,
@@ -8186,6 +8233,7 @@ def main() -> int:
                             args.dedup_stage_id, args.dedup_stage_db, dedup_near,
                             global_symbol_index,
                             project_id=project_id,
+                            skip_invalid_domain_inputs=args.skip_invalid_domain_inputs,
                         ): (pd, project_id)
                         for pd, project_id in project_specs
                     }
@@ -8212,6 +8260,7 @@ def main() -> int:
                             args.dedup_stage_db, dedup_near,
                             global_symbol_index, emit_doc=_write_doc,
                             project_id=project_id,
+                            skip_invalid_domain_inputs=args.skip_invalid_domain_inputs,
                         )
                         for doc in docs:
                             _write_doc(doc)

@@ -129,6 +129,70 @@ DOMAIN_DELIMITER_CONTRACT_SHA256 = hashlib.sha256(
         separators=(",", ":"),
     ).encode("utf-8")
 ).hexdigest()
+LEGACY_CASE5_CONTRACT_HASH_TRIPLES = frozenset(
+    {
+        (
+            "1f2e35d7917409fc03704d32c2d55d0fb3e29f1bd9e60acca775a392cf2f53e6",
+            "9c3517b5a3fda01c4f55d55bc0d12dff4af3edb3db6321bda6c22489061b4fdd",
+            "c3bb669015c48e2049e3b82ccb8c98c6eceae0644f7da0b5b8600c573d7087a5",
+        ),
+        (
+            "1f2e35d7917409fc03704d32c2d55d0fb3e29f1bd9e60acca775a392cf2f53e6",
+            "9c3517b5a3fda01c4f55d55bc0d12dff4af3edb3db6321bda6c22489061b4fdd",
+            "80e73699e26d2c19fe4477cf8194886e52c7a5e114023df27e55d6a69b62c198",
+        ),
+    }
+)
+
+
+def is_accepted_case5_contract_hash_triple(
+    delimiter_contract_sha256: object,
+    domain_schema_sha256: object,
+    tokenizer_contract_sha256: object,
+) -> bool:
+    """Accept the current v1 contract or one complete known v1 predecessor."""
+
+    def hash_text(value: object) -> str:
+        if isinstance(value, bytes):
+            try:
+                return value.decode("ascii")
+            except UnicodeDecodeError:
+                return ""
+        return str(value)
+
+    triple = (
+        hash_text(delimiter_contract_sha256),
+        hash_text(domain_schema_sha256),
+        hash_text(tokenizer_contract_sha256),
+    )
+    current = (
+        DOMAIN_DELIMITER_CONTRACT_SHA256,
+        DOMAIN_SCHEMA_SHA256,
+        TOKENIZER_CONTRACT_SHA256,
+    )
+    return triple == current or triple in LEGACY_CASE5_CONTRACT_HASH_TRIPLES
+
+
+def validate_case5_contract_hash_triple(
+    delimiter_contract_sha256: object,
+    domain_schema_sha256: object,
+    tokenizer_contract_sha256: object,
+    *,
+    where: str,
+) -> None:
+    if not is_accepted_case5_contract_hash_triple(
+        delimiter_contract_sha256,
+        domain_schema_sha256,
+        tokenizer_contract_sha256,
+    ):
+        raise ValueError(
+            f"{where}: unknown or mixed CASE5 v1 contract hashes: "
+            f"delimiter={delimiter_contract_sha256!r}, "
+            f"domain={domain_schema_sha256!r}, "
+            f"tokenizer={tokenizer_contract_sha256!r}"
+        )
+
+
 CASE5_SCHEMA_METADATA_KEY = "cppmega.case5_schema"
 CASE5_SCHEMA_VERSION = "case5_domain_routes_v1"
 CASE5_RECEIPT_KEY = "case5_domain_ingestion_receipt"
@@ -148,6 +212,7 @@ __all__ = [
     "DOMAIN_START_DELIMITER_IDS",
     "GRAPH_ROUTE_COLUMNS",
     "GRAPH_ROUTE_COORDINATE_SPACES",
+    "LEGACY_CASE5_CONTRACT_HASH_TRIPLES",
     "VALID_DOMAIN_CONFIDENCE_IDS",
     "VALID_DOMAIN_EDGE_KINDS",
     "VALID_DOMAIN_IDS",
@@ -158,4 +223,6 @@ __all__ = [
     "SOURCE_IDENTITY_REGISTRY_SCHEMA",
     "TOKENIZER_CONTRACT_SHA256",
     "TOKENIZER_CONTRACT_SHA256_METADATA_KEY",
+    "is_accepted_case5_contract_hash_triple",
+    "validate_case5_contract_hash_triple",
 ]

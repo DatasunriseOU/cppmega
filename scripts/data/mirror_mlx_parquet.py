@@ -2,7 +2,7 @@
 """Mirror the cppmega.mlx token-enriched parquet rewrite onto OUR parquet, plus
 backfill of GENUINELY DERIVABLE missing metadata.
 
-RUN WITH: /Volumes/external/sources/cppmega.mlx/.venv/bin/python (pyarrow 21.x).
+Run with a cppmega-local Python environment that provides pyarrow 21.x.
 
 WHAT THIS DOES (and what it deliberately does NOT do)
 =====================================================
@@ -86,7 +86,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from cppmega.symbol_identity import (
+from cppmega.symbol_identity import (  # noqa: E402
     SYMBOL_IDENTITIES_COLUMN,
     SYMBOL_IDENTITY_SCHEMA_METADATA_KEY,
     SYMBOL_IDENTITY_SCHEMA_VERSION,

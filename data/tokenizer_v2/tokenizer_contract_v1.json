@@ -2,7 +2,7 @@
   "contract_version": 1,
   "description": "Canonical cross-repo cppmega tokenizer contract. The shipped tokenizer.json is frozen at 65536 tokens. Logical domain roles may reference existing <RESERVED_N> slots without changing vocab size, but a newly assigned role is not learned by an existing checkpoint until data is regenerated and the checkpoint is trained on that encoding.",
   "vocab_size": 65536,
-  "token_role_contract_sha256": "bf6f62921f02caddd9fd9f544e7a3233a5b9c8919967831cd8b9e8387db4a4a5",
+  "token_role_contract_sha256": "4775bc5dc3b90b4bd9d0949fdb54ac418c97c954e23b4b1724bb3b7fd596ac50",
   "artifact_contract": {
     "canonical_json_sha256": "7e055987ff80b48869e98b3df62b910f105924f8f9dfc2ba52485379aba4c000",
     "canonicalization": "UTF-8 JSON with sorted keys and separators (comma, colon)",
@@ -138,7 +138,11 @@
     "LINKER_DIAGNOSTIC_START": 241,
     "LINKER_DIAGNOSTIC_END": 242,
     "SANITIZER_OUTPUT_START": 243,
-    "SANITIZER_OUTPUT_END": 244
+    "SANITIZER_OUTPUT_END": 244,
+    "KSH_START": 245,
+    "KSH_END": 246,
+    "PYTHON_START": 247,
+    "PYTHON_END": 248
   },
   "sequence_contracts": {
     "line_comment_eol": {

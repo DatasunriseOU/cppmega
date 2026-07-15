@@ -283,6 +283,13 @@ def _read_validated_domain_text(path: Path, *, expected_size: int) -> str:
     return _decode_domain_bytes(raw, path=path)
 
 
+def _is_domain_text_integrity_error(exc: ValueError) -> bool:
+    message = str(exc)
+    return message.startswith("binary domain input contains NUL byte") or message.startswith(
+        "invalid UTF-8 domain input"
+    )
+
+
 def _utf8_boundary_at_or_before(data: bytearray, limit: int) -> int:
     cut = min(int(limit), len(data))
     while cut > 0 and cut < len(data) and data[cut] & 0xC0 == 0x80:
@@ -1061,6 +1068,7 @@ def discover_project_domain_files(
     *,
     extra_exclude_dirs: set[str] | None = None,
     include_cpp: bool = True,
+    invalid_input_handler: Callable[[Path, ValueError], None] | None = None,
 ) -> list[DiscoveredDomainFile]:
     """Discover typed text inputs without opening unrelated binary assets."""
 
@@ -1119,6 +1127,23 @@ def discover_project_domain_files(
                         continue
                     raise
                 adapter = resolve_domain_parser(path, text)
+        except ValueError as exc:
+            # Signature-based candidates are opportunistic. Repository trees
+            # commonly contain generated/binary ``.txt`` and log artifacts;
+            # malformed bytes in those files must not abort discovery of the
+            # rest of the project. Explicit domain paths and extensionless
+            # files that resolved to a typed adapter remain fail-closed.
+            if (
+                signature_candidate
+                and not explicit_candidate
+                and not ambiguous_extensionless
+                and _is_domain_text_integrity_error(exc)
+            ):
+                continue
+            if invalid_input_handler is not None and _is_domain_text_integrity_error(exc):
+                invalid_input_handler(path, exc)
+                continue
+            raise
         except OSError as exc:
             if explicit_candidate or not ambiguous_extensionless:
                 raise OSError(f"failed to read domain input {path}: {exc}") from exc

@@ -1,187 +1,156 @@
 #!/usr/bin/env python3
-"""megacpp data prep — Stage 2: Tokenize raw C/C++ source into parquet shards.
+"""Run the repository-local source-to-packed-parquet conveyor.
 
-This stage runs the Clang semantic indexer over the raw corpus, emits JSONL
-with per-chunk token IDs, and streams it into parquet shards of the form
-``shard_NNNNN.parquet`` plus an optional ``val_shard.parquet``.
-
-DEPENDENCY — nanochat source tree required
--------------------------------------------
-The semantic indexer and the hybrid C++ BPE tokenizer live in the upstream
-nanochat repo and are too heavyweight to vendor verbatim here:
-
-  * ``nanochat/tools/clang_indexer/index_project.py`` — libclang-based
-    cross-file semantic indexer (emits enriched JSONL).
-  * ``nanochat/nanochat/cpp_tokenizer.py`` — hybrid fixed-vocab + BPE
-    tokenizer (131072 tokens) backed by ``nanochat/tokenizer.json``.
-  * ``nanochat/scripts/data/clang_enriched_to_4k_parquet.py`` — 4K-budgeted
-    parquet converter; imports several ``nanochat.*`` modules.
-  * ``nanochat/scripts/data/stream_jsonl_to_parquet.py`` — simple streaming
-    variant (no nanochat.* deps) — a standalone copy is shipped alongside as
-    ``prepare_stream_jsonl_to_parquet_megacpp.py``.
-
-To run the full tokenize stage, clone nanochat next to cppmega:
-
-    git clone <nanochat-url> /path/to/nanochat
-    export MEGACPP_NANOCHAT_ROOT=/path/to/nanochat
-
-Then this script dispatches to nanochat's ``run_clang_pipeline.sh`` with the
-megacpp output layout. If ``MEGACPP_NANOCHAT_ROOT`` is not set, the script
-exits with a clear error pointing here.
-
-Output layout (under ``${MEGACPP_DATA_ROOT}``):
-
-    data/
-      cpp_raw/                        # stage 1 clones
-      parquet/
-        clang_semantic_4k_v10/
-          shard_00000.parquet
-          shard_00001.parquet
-          ...
-          val_shard.parquet
-          _COMPLETE
-      tokenizer/
-        tokenizer.json                # copied/linked from nanochat
+The heavy source processing lives in ``scripts/data/source_conveyor.py``. This
+entrypoint keeps the public contract small and portable: callers choose the
+source tree, packed output root, tokenizer artifact, and target sequence
+lengths explicitly.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
-import shutil
+from pathlib import Path
+import shlex
 import subprocess
 import sys
-from pathlib import Path
 
 
-DEFAULT_DATA_ROOT = os.environ.get(
-    "MEGACPP_DATA_ROOT", "/home/dave/cppmega-root/data"
-)
-DEFAULT_DATASET_NAME = "clang_semantic_4k_v10"
+HERE = Path(__file__).resolve().parent
+REPO_ROOT = HERE.parents[1]
+SOURCE_CONVEYOR = HERE / "source_conveyor.py"
+DEFAULT_TOKENIZER = REPO_ROOT / "data" / "tokenizer_v2" / "tokenizer.json"
+DEFAULT_TARGET_LENGTHS = (1024, 2048, 4096)
 
 
-def _require_nanochat_root() -> Path:
-    root = os.environ.get("MEGACPP_NANOCHAT_ROOT")
-    if not root:
-        sys.exit(
-            "ERROR: MEGACPP_NANOCHAT_ROOT is not set.\n"
-            "  The tokenize stage depends on the nanochat repo (clang indexer +\n"
-            "  cpp_tokenizer). Clone nanochat and point this env var at it:\n"
-            "    export MEGACPP_NANOCHAT_ROOT=/path/to/nanochat\n"
-            "  See docs/data_preparation.md for details."
-        )
-    p = Path(root)
-    if not p.is_dir():
-        sys.exit(f"ERROR: MEGACPP_NANOCHAT_ROOT={p} does not exist")
-    pipeline = p / "scripts" / "data" / "run_clang_pipeline.sh"
-    if not pipeline.is_file():
-        sys.exit(f"ERROR: {pipeline} not found — is MEGACPP_NANOCHAT_ROOT correct?")
-    return p
+def _parse_target_lengths(value: str) -> tuple[int, ...]:
+    lengths: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            length = int(item)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"target length must be an integer, got {item!r}"
+            ) from exc
+        if length <= 0:
+            raise argparse.ArgumentTypeError("target lengths must be positive")
+        lengths.add(length)
+    if not lengths:
+        raise argparse.ArgumentTypeError("at least one target length is required")
+    return tuple(sorted(lengths))
 
 
-def _copy_tokenizer(nanochat_root: Path, data_root: Path) -> None:
-    src = nanochat_root / "tokenizer.json"
-    if not src.is_file():
-        sys.exit(f"ERROR: tokenizer artifact not found at {src}")
-    dst_dir = data_root / "tokenizer"
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    dst = dst_dir / "tokenizer.json"
-    if not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime:
-        shutil.copy2(src, dst)
-        print(f"[megacpp] copied tokenizer: {src} -> {dst}")
-    else:
-        print(f"[megacpp] tokenizer already up to date at {dst}")
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--data-root",
-        default=DEFAULT_DATA_ROOT,
-        help=f"megacpp data root (default: {DEFAULT_DATA_ROOT})",
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--dataset-name",
-        default=DEFAULT_DATASET_NAME,
-        help=f"output parquet dataset subdir (default: {DEFAULT_DATASET_NAME})",
+        "--source-root",
+        type=Path,
+        required=True,
+        help="Directory containing already-extracted source repositories.",
     )
     parser.add_argument(
-        "--raw-subdir",
-        default="cpp_raw",
-        help="subdir of --data-root holding stage-1 raw clones",
+        "--output-root",
+        type=Path,
+        required=True,
+        help="Destination root; packed parquet is published under <root>/<length>/.",
     )
     parser.add_argument(
-        "--workers",
+        "--tokenizer",
+        type=Path,
+        default=DEFAULT_TOKENIZER,
+        help=f"Tokenizer JSON artifact (default: {DEFAULT_TOKENIZER}).",
+    )
+    parser.add_argument(
+        "--target-lengths",
+        type=_parse_target_lengths,
+        default=DEFAULT_TARGET_LENGTHS,
+        metavar="CSV",
+        help="Comma-separated packed lengths (default: 1024,2048,4096).",
+    )
+    parser.add_argument(
+        "--repo-list",
+        type=Path,
+        default=None,
+        help="Optional bare-repository to owner/repo identity map.",
+    )
+    parser.add_argument(
+        "--max-repos",
         type=int,
-        default=48,
-        help="parse-workers passed to clang indexer",
+        default=None,
+        help="Optional cap for a focused run; omit for the full source root.",
     )
     parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=4096,
-        help="hard token budget per sample (matches the 4k dataset family)",
+        "--min-free-disk-gb",
+        type=float,
+        default=None,
+        help="Override the local conveyor free-disk preflight for a controlled run.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--expected-code-revision",
+        default=None,
+        help="Exact 40-character Git revision; defaults to the current HEAD.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the local conveyor command without processing source data.",
+    )
+    return parser
 
-    data_root = Path(args.data_root).resolve()
-    raw_dir = data_root / args.raw_subdir
-    if not raw_dir.is_dir():
-        sys.exit(
-            f"ERROR: raw corpus not found at {raw_dir}.\n"
-            f"  Run prepare_download_megacpp.sh first."
-        )
 
-    nanochat_root = _require_nanochat_root()
-    _copy_tokenizer(nanochat_root, data_root)
-
-    parquet_root = data_root / "parquet" / args.dataset_name
-    parquet_root.mkdir(parents=True, exist_ok=True)
-
-    pipeline = nanochat_root / "scripts" / "data" / "run_clang_pipeline.sh"
-    env = os.environ.copy()
-    env["TOKENIZER_PATH"] = str(data_root / "tokenizer" / "tokenizer.json")
-    env["MAX_TOKENS"] = str(args.max_tokens)
-    # Output layout — run_clang_pipeline.sh writes:
-    #   $OUTPUT_DIR/cpp_clang_crossfile_16k.jsonl  (default 16k label)
-    #   $OUTPUT_DIR/parquet/cpp_clang_crossfile_16k/
-    # We honor that layout; the caller renames / symlinks to
-    # ${dataset_name} afterwards.
-    staging = data_root / "staging" / args.dataset_name
-    staging.mkdir(parents=True, exist_ok=True)
-
-    cmd = [
-        "bash",
-        str(pipeline),
-        str(raw_dir),
-        str(staging),
-        str(args.workers),
+def build_conveyor_command(args: argparse.Namespace) -> list[str]:
+    source_root = args.source_root.resolve()
+    output_root = args.output_root.resolve()
+    tokenizer = args.tokenizer.resolve()
+    target_lengths = ",".join(str(length) for length in args.target_lengths)
+    command = [
+        sys.executable,
+        str(SOURCE_CONVEYOR),
+        "--source-root",
+        str(source_root),
+        "--output-root",
+        str(output_root),
+        "--tokenizer",
+        str(tokenizer),
+        "--target-lengths",
+        target_lengths,
     ]
-    print("[megacpp] running nanochat clang pipeline:")
-    print("   ", " ".join(cmd))
-    ret = subprocess.call(cmd, env=env)
-    if ret != 0:
-        sys.exit(f"ERROR: nanochat clang pipeline exited with {ret}")
+    if args.repo_list is not None:
+        command.extend(("--repo-list", str(args.repo_list.resolve())))
+    if args.max_repos is not None:
+        command.extend(("--max-repos", str(args.max_repos)))
+    if args.min_free_disk_gb is not None:
+        command.extend(("--min-free-disk-gb", str(args.min_free_disk_gb)))
+    if args.expected_code_revision is not None:
+        command.extend(("--expected-code-revision", args.expected_code_revision))
+    return command
 
-    # Publish: move/symlink staging/parquet/* into data/parquet/<dataset_name>/
-    produced = staging / "parquet"
-    if produced.is_dir():
-        # Find the single sub-dataset dir
-        subs = [p for p in produced.iterdir() if p.is_dir()]
-        if len(subs) != 1:
-            sys.exit(f"ERROR: expected 1 sub-dataset dir in {produced}, got {subs}")
-        src = subs[0]
-        for shard in src.iterdir():
-            dst = parquet_root / shard.name
-            if dst.exists():
-                dst.unlink()
-            shutil.move(str(shard), str(dst))
-        print(f"[megacpp] published parquet shards to {parquet_root}")
-    else:
-        sys.exit(f"ERROR: pipeline did not produce {produced}")
 
-    print(f"[megacpp] stage 2 done: {parquet_root}")
-    return 0
+def main(argv: list[str] | None = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    source_root = args.source_root.resolve()
+    tokenizer = args.tokenizer.resolve()
+    if not source_root.is_dir():
+        parser.error(f"--source-root is not a directory: {source_root}")
+    if not tokenizer.is_file():
+        parser.error(f"--tokenizer is not a file: {tokenizer}")
+
+    command = build_conveyor_command(args)
+    if args.dry_run:
+        print(f"DRY-RUN {shlex.join(command)}")
+        return 0
+
+    if not SOURCE_CONVEYOR.is_file():
+        parser.error(f"local source conveyor not found: {SOURCE_CONVEYOR}")
+    return subprocess.run(command, check=False).returncode
 
 
 if __name__ == "__main__":

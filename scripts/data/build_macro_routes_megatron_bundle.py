@@ -1197,37 +1197,39 @@ def _publish_validated_bundle(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    sibling = REPO_ROOT.parent / "cppmega.mlx"
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--code-root",
         type=Path,
-        default=sibling / "outputs/reindexed_macro_routes_v1_20260710_135335_code",
+        default=None,
+        help="explicit root containing bucketed code parquet shards",
     )
     parser.add_argument(
         "--commit-root",
         type=Path,
-        default=sibling / "outputs/reindexed_macro_routes_v1_20260710_135335_commits",
+        default=None,
+        help="explicit root containing bucketed commit parquet shards",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=sibling / "outputs/megatron_ready/macro_routes_v1_20260713",
+        default=REPO_ROOT / "outputs/megatron_ready/macro_routes_v1_20260713",
     )
     parser.add_argument(
         "--audit-script",
         type=Path,
-        default=sibling / "scripts/audit_sidecar_parquet.py",
+        default=REPO_ROOT / "scripts/audit_sidecar_parquet.py",
     )
     parser.add_argument(
         "--repair-script",
         type=Path,
-        default=sibling / "scripts/repair_packed_document_boundaries.py",
+        default=REPO_ROOT / "scripts/repair_packed_document_boundaries.py",
     )
     parser.add_argument(
         "--conveyor-manifest",
         type=Path,
-        default=sibling / "outputs/conveyor/macro_routes_v1_20260710_135335/_done.json",
+        default=None,
+        help="explicit completed conveyor manifest binding the source shards",
     )
     parser.add_argument(
         "--tokenizer-dir",
@@ -1255,6 +1257,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="retain repaired private parquet snapshot after a successful build",
     )
     return parser
+
+
+def _require_explicit_source_inputs(args: argparse.Namespace) -> None:
+    missing = [
+        option
+        for attribute, option in (
+            ("code_root", "--code-root"),
+            ("commit_root", "--commit-root"),
+            ("conveyor_manifest", "--conveyor-manifest"),
+        )
+        if getattr(args, attribute) is None
+    ]
+    if missing:
+        raise SystemExit(
+            "bundle source inputs must be explicit: " + ", ".join(missing)
+        )
 
 
 def _run_build(
@@ -1436,7 +1454,6 @@ def _run_build(
         },
         "git": {
             "cppmega": _git_sha(REPO_ROOT),
-            "cppmega_mlx": _git_sha(REPO_ROOT.parent / "cppmega.mlx"),
         },
         "implementation_sha256": {
             "builder": _sha256(Path(__file__).resolve()),
@@ -1460,6 +1477,7 @@ def _run_build(
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    _require_explicit_source_inputs(args)
     buckets = tuple(int(value) for value in args.buckets.split(",") if value)
     if not buckets:
         raise SystemExit("at least one bucket is required")

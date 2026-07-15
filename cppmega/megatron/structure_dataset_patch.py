@@ -21,12 +21,10 @@ import numpy as np
 from cppmega.megatron.domain_route_contract import (
     CASE5_RECEIPT_KEY,
     CASE5_SCHEMA_VERSION,
-    DOMAIN_DELIMITER_CONTRACT_SHA256,
-    DOMAIN_SCHEMA_SHA256,
     GRAPH_ROUTE_COLUMNS,
     GRAPH_ROUTE_COORDINATE_SPACES,
     SOURCE_IDENTITY_REGISTRY_SCHEMA,
-    TOKENIZER_CONTRACT_SHA256,
+    is_accepted_case5_contract_hash_triple,
 )
 
 # Thread-local storage to safely pass the current batch's structure inputs to model forward
@@ -766,12 +764,12 @@ def _lazy_init_side_channels(dataset: Any) -> Dict[str, Dict[str, Any]]:
                 f"[cppmega-patch] successful {CASE5_RECEIPT_KEY} missing from "
                 f"{json_path!r}"
             )
-        if (
-            receipt.get("schema") != CASE5_SCHEMA_VERSION
-            or receipt.get("delimiter_contract_sha256")
-            != DOMAIN_DELIMITER_CONTRACT_SHA256
-            or receipt.get("domain_schema_sha256") != DOMAIN_SCHEMA_SHA256
-            or receipt.get("tokenizer_contract_sha256") != TOKENIZER_CONTRACT_SHA256
+        if receipt.get("schema") != CASE5_SCHEMA_VERSION or not (
+            is_accepted_case5_contract_hash_triple(
+                receipt.get("delimiter_contract_sha256"),
+                receipt.get("domain_schema_sha256"),
+                receipt.get("tokenizer_contract_sha256"),
+            )
         ):
             raise ValueError(
                 f"[cppmega-patch] stale CASE5 schema or delimiter receipt in "

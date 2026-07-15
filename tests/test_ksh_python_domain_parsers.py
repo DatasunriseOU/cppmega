@@ -184,6 +184,53 @@ def test_domain_dispatch_and_discovery_cover_ksh_and_python(tmp_path: Path) -> N
     }
 
 
+@pytest.mark.parametrize("name", ["module.py", "script.ksh", "Makefile"])
+def test_domain_discovery_can_audit_and_skip_invalid_explicit_inputs(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    from cppmega.data.domain_ingestion import discover_project_domain_files
+
+    explicit = tmp_path / name
+    explicit.write_bytes(b"explicit domain\xff")
+    rejected: list[tuple[Path, str]] = []
+
+    discovered = discover_project_domain_files(
+        tmp_path,
+        invalid_input_handler=lambda path, exc: rejected.append((path, str(exc))),
+    )
+
+    assert discovered == []
+    assert len(rejected) == 1
+    assert rejected[0][0] == explicit
+    assert rejected[0][1].startswith("invalid UTF-8 domain input")
+
+
+@pytest.mark.parametrize(
+    ("name", "payload", "raises"),
+    [
+        ("compiler-output.txt", b"error: candidate\0binary", False),
+        ("compiler-output.txt", b"error: candidate\xff", False),
+        ("module.py", b"print('typed')\xff", True),
+        ("script.ksh", b"print typed\xff", True),
+    ],
+)
+def test_domain_discovery_only_rejects_invalid_explicit_inputs(
+    tmp_path: Path,
+    name: str,
+    payload: bytes,
+    raises: bool,
+) -> None:
+    from cppmega.data.domain_ingestion import discover_project_domain_files
+
+    (tmp_path / name).write_bytes(payload)
+    if raises:
+        with pytest.raises(ValueError, match="invalid UTF-8 domain input"):
+            discover_project_domain_files(tmp_path)
+    else:
+        assert discover_project_domain_files(tmp_path) == []
+
+
 def test_indexer_classifies_ksh_and_python_documents(tmp_path: Path) -> None:
     from tools.clang_indexer import index_project
 

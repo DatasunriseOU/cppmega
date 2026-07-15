@@ -969,6 +969,42 @@ def test_case5_arrow_contract_fails_closed(
         )
 
 
+def test_case5_arrow_contract_accepts_complete_legacy_v1_hash_triple(
+    tmp_path: Path,
+) -> None:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    converter = _load_converter_module()
+    table = _case5_table(pa, converter, _minimal_case5_rows(converter))
+    metadata = dict(table.schema.metadata or {})
+    metadata.update(
+        {
+            converter.DOMAIN_DELIMITER_CONTRACT_METADATA_KEY.encode("utf-8"): (
+                b"1f2e35d7917409fc03704d32c2d55d0fb3e29f1bd9e60acca775a392cf2f53e6"
+            ),
+            converter.DOMAIN_SCHEMA_SHA256_METADATA_KEY.encode("utf-8"): (
+                b"9c3517b5a3fda01c4f55d55bc0d12dff4af3edb3db6321bda6c22489061b4fdd"
+            ),
+            converter.TOKENIZER_CONTRACT_SHA256_METADATA_KEY.encode("utf-8"): (
+                b"c3bb669015c48e2049e3b82ccb8c98c6eceae0644f7da0b5b8600c573d7087a5"
+            ),
+        }
+    )
+    shard = tmp_path / "legacy-case5-v1.parquet"
+    pq.write_table(table.replace_schema_metadata(metadata), shard)
+
+    assert converter._require_case5_schema(
+        [str(shard)],
+        side_channels=[
+            name for name, _dtype in converter.DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS
+        ],
+        side_channel_dtypes=[
+            dtype for _name, dtype in converter.DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS
+        ],
+        graph_sidecars=converter.DEFAULT_CPPMEGA_GRAPH_SIDECARS,
+    ) == 1
+
+
 def test_default_cppmega_graph_sidecars_are_document_aligned_route_profile() -> None:
     converter = _load_converter_module()
 
