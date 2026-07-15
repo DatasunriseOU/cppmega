@@ -465,6 +465,37 @@ def _char_point_to_token_index(
     return None
 
 
+def _char_span_to_token_bounds(
+    token_spans: list[tuple[int, int]],
+    start_char: int,
+    end_char: int,
+    *,
+    source_length: int,
+) -> tuple[int, int] | None:
+    start_char = int(start_char)
+    end_char = int(end_char)
+    source_length = int(source_length)
+    if start_char < 0 or end_char <= start_char or end_char > source_length:
+        raise ValueError(
+            f"character span {start_char}:{end_char} is outside source span bounds "
+            f"[0, {source_length}]"
+        )
+
+    first: int | None = None
+    last: int | None = None
+    for idx, (start, end) in enumerate(token_spans):
+        start_i = int(start)
+        end_i = int(end)
+        if end_i <= start_i or end_i <= start_char or start_i >= end_char:
+            continue
+        if first is None:
+            first = idx
+        last = idx
+    if first is None or last is None:
+        return None
+    return first, last + 1
+
+
 def _remap_char_edge_triples_to_tokens(
     raw_edges: Any,
     token_spans: list[tuple[int, int]],
@@ -769,21 +800,18 @@ def _insert_embedded_domain_delimiters(
         start_char = int(span["start"])
         end_char = int(span["end"])
         domain = DomainKind(int(span["domain_kind"]))
-        start_token = _char_position_to_token_index(
+        token_bounds = _char_span_to_token_bounds(
             token_spans,
             start_char,
+            end_char,
             source_length=text_length,
         )
-        end_token_inclusive = _char_position_to_token_index(
-            token_spans,
-            end_char - 1,
-            source_length=text_length,
-        )
-        if start_token is None or end_token_inclusive is None:
+        if token_bounds is None:
             raise ValueError(
                 f"embedded domain span {start_char}:{end_char} could not be mapped to token spans"
             )
-        resolved.append((start_token, end_token_inclusive + 1, domain))
+        start_token, end_token = token_bounds
+        resolved.append((start_token, end_token, domain))
 
     for start_token, end_token, domain in resolved:
         _insert_domain_delimiter_pair(

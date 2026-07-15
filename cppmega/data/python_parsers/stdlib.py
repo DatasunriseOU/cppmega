@@ -63,15 +63,21 @@ def _tokenize_source(
                 continue
             start = _token_offset(starts, info.start, text_length=len(text))
             end = _token_offset(starts, info.end, text_length=len(text))
+            token_text = info.string
+            if tokenize.tok_name.get(info.type) == "FSTRING_MIDDLE":
+                leading_whitespace = len(token_text) - len(token_text.lstrip())
+                start += leading_whitespace
+                token_text = token_text[leading_whitespace:]
             if end <= start:
                 continue
+            line = max(0, bisect_right(starts, start) - 1)
             tokens.append(
                 LexedToken(
-                    text=info.string,
+                    text=token_text,
                     start=start,
                     end=end,
-                    line=max(0, info.start[0] - 1),
-                    column=max(0, info.start[1]),
+                    line=line,
+                    column=start - starts[line],
                 )
             )
             token_infos.append(info)

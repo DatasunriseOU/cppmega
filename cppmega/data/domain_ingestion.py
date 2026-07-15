@@ -18,7 +18,11 @@ from cppmega.data.build_parsers import (
     parse_make,
     parse_ninja,
 )
-from cppmega.data.build_parsers.base import ParsedDomainDocument, strip_quotes
+from cppmega.data.build_parsers.base import (
+    ParsedDomainDocument,
+    lex_text,
+    strip_quotes,
+)
 from cppmega.data.diagnostic_parsers import (
     parse_build_error,
     parse_clang_diagnostic,
@@ -832,10 +836,6 @@ _CPP_LITERAL_SEPARATOR_RE = re.compile(
     r"(?:\s|//[^\n]*(?:\n|$)|/\*.*?\*/)*\Z",
     re.DOTALL,
 )
-_SQL_PREFIX_RE = re.compile(
-    r"^\s*(?:CREATE|ALTER|INSERT|UPDATE|DELETE|SELECT|DROP|WITH|PRAGMA|BEGIN)\b",
-    re.IGNORECASE,
-)
 _SQL_CALL_RE = re.compile(
     r"\b(?P<call>sqlite3_exec|sqlite3_prepare(?:_v2)?|PQexec|PQprepare|mysql_query)\s*\(",
 )
@@ -848,6 +848,61 @@ _SQL_CALL_QUERY_ARGUMENT = {
     "mysql_query": 1,
 }
 _EXEC_SQL_RE = re.compile(r"(?im)\bEXEC[ \t]+SQL\b[^;]*;")
+
+
+def _looks_like_sql_statement(text: str) -> bool:
+    values = [strip_quotes(token.text).upper() for token in lex_text(text)]
+    if not values:
+        return False
+    head = values[0]
+    if head == "CREATE":
+        return any(
+            value in {"DATABASE", "INDEX", "SCHEMA", "TABLE", "TRIGGER", "VIEW"}
+            for value in values[1:6]
+        )
+    if head == "ALTER":
+        return len(values) > 1 and values[1] in {
+            "DATABASE",
+            "INDEX",
+            "SCHEMA",
+            "TABLE",
+            "VIEW",
+        }
+    if head == "INSERT":
+        return "INTO" in values[1:4]
+    if head == "UPDATE":
+        return (
+            len(values) > 3
+            and values[1] not in {":", "="}
+            and "SET" in values[2:]
+        )
+    if head == "DELETE":
+        return len(values) > 1 and values[1] == "FROM"
+    if head == "SELECT":
+        return len(values) > 1
+    if head == "DROP":
+        return len(values) > 1 and values[1] in {
+            "DATABASE",
+            "INDEX",
+            "SCHEMA",
+            "TABLE",
+            "TRIGGER",
+            "VIEW",
+        }
+    if head == "WITH":
+        return "AS" in values[1:] and "(" in values[1:]
+    if head == "PRAGMA":
+        return len(values) > 1 and values[1] not in {":", "="}
+    if head == "BEGIN":
+        return len(values) == 1 or values[1] in {
+            ";",
+            "DEFERRED",
+            "EXCLUSIVE",
+            "IMMEDIATE",
+            "TRANSACTION",
+            "WORK",
+        }
+    return False
 
 
 def _call_argument_spans(text: str, open_paren: int) -> list[tuple[int, int]]:
@@ -956,7 +1011,9 @@ def extract_embedded_domain_blocks(
     for match in _CPP_RAW_SQL_RE.finditer(text):
         body = match.group("body")
         tag = match.group("tag").upper()
-        if "SQL" not in tag and not _SQL_PREFIX_RE.match(body):
+        if not body.strip():
+            continue
+        if "SQL" not in tag and not _looks_like_sql_statement(body):
             continue
         start, end = match.span("body")
         owner = next(
@@ -975,7 +1032,9 @@ def extract_embedded_domain_blocks(
             argument_start,
             argument_end,
         ):
-            if not _SQL_PREFIX_RE.match("".join(body for _, _, body in group)):
+            if not _looks_like_sql_statement(
+                "".join(body for _, _, body in group)
+            ):
                 continue
             candidates.extend((start, end, call_anchor) for start, end, _ in group)
 
