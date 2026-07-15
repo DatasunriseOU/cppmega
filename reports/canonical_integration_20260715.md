@@ -251,7 +251,7 @@ Accepted root code commit: `6667d41f8dceb05221228097e336f239e7ba61c4`. Branch HE
 | `166f6cb85fe0ac19e0c495628b852e94df177d38` | 12:03 | `fix(data): validate objective contracts before parquet import` |
 | `0d3098c6bc3975db034bc7a425d5527ae04d399d` | 03:07 | published `full-review-integration` head |
 
-Локальный commit object проверен через `git -C /Volumes/external/sources/cppmega show --no-patch 6667d41f8dceb05221228097e336f239e7ba61c4`. В `origin` ветка `codex/canonical-complete-20260715` отсутствует: `git ls-remote --heads origin codex/canonical-complete-20260715` вернул пустой результат.
+Локальный commit object проверен через `git -C /Volumes/external/sources/cppmega show --no-patch 6667d41f8dceb05221228097e336f239e7ba61c4`. Ветка `codex/canonical-complete-20260715` опубликована в `origin`; remote SHA повторно проверен после push.
 
 Worktree caveat на финальной проверке: root сохраняет пользовательский dirty `.gitignore` и незатрекованный plan-файл; они намеренно не включены в commit. Остальные root changes этого pass вошли в `6667d41`. MLX worktree чист после `12610eb`.
 
@@ -273,7 +273,7 @@ HEAD: `12610eb69d1b9499c0242c4a27b95b58d7313346`
 | `9ff05c5f0acc40e4cbe4f661beb16618fc41164a` | 12:01 | `fix(data): recover stored non-github project identities` |
 | `70b1f5d5199135647994cac246326f5a8f2b2678` | 04:50 | published `full-review-integration` head |
 
-Локальный commit object проверен через `git -C /Volumes/external/sources/cppmega.mlx show --no-patch 12610eb69d1b9499c0242c4a27b95b58d7313346`. Ветка `codex/canonical-complete-20260715` отсутствует в MLX remote; hash выше является точным локальным commit и не подменяется ссылкой на несуществующую remote branch.
+Локальный commit object проверен через `git -C /Volumes/external/sources/cppmega.mlx show --no-patch 12610eb69d1b9499c0242c4a27b95b58d7313346`. Ветка `codex/canonical-complete-20260715` опубликована в MLX `origin`; remote SHA равен локальному HEAD.
 
 <a id="tests"></a>
 ## 8. Тесты и статические проверки
@@ -596,7 +596,7 @@ Canonical identity работает по приоритету:
 | H200 exact acceptance | `2b5dd3d`: full DSA file `7 passed, 35 warnings`; final required gate `11 passed, 27 warnings in 8.00s`; Detours writer+reader real | Не экстраполировать component gate на длительный distributed training/performance result |
 | Nebius cleanup | Image pin `sha256:08c5...`; GHCR 403 диагностирован и auth исправлен; VM удалена и API подтверждает отсутствие | Ничего для этого gate; новый VM нужен только для следующего отдельного GPU workflow |
 | Root Python environment | Root code path независим; реальный Detours E2E прошёл | Собственный `.venv`/lock/declared runtime dependencies вместо внешнего nanochat-linked environment |
-| Canonical publication | Exact local commits и ancestry проверены | Ветки `codex/canonical-complete-20260715` ещё не pushed на снимке |
+| Canonical publication | Обе ветки `codex/canonical-complete-20260715` pushed; remote SHA проверены | Осталось только принять решение о PR/merge в default branches |
 | CASE5 v7 completeness | Зафиксированный snapshot: `77/11`; run pinned на старом `1ba36f7`, не на текущем `12610eb` | Завершить run/repairs/reruns, провести audit и только затем считать replacement corpus готовым |
 
 Требуемый H200 CUDA/TE/Megatron component gate получен и VM удалена. Локальные model generation/eval/compile gates по-прежнему должны выполняться на macOS; этот GPU receipt не подменяет локальную оценку модели и не доказывает длительный training run.

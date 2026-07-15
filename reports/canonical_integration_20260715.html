@@ -511,7 +511,7 @@
             </tbody>
           </table>
         </div>
-        <p>Локальный root commit object проверен через <code>git -C /Volumes/external/sources/cppmega show --no-patch 6667d41f8dceb05221228097e336f239e7ba61c4</code>. Ветка <code>codex/canonical-complete-20260715</code> отсутствует в <code>origin</code>. Пользовательский <code>.gitignore</code> и untracked plan-файл сохранены вне commit.</p>
+        <p>Локальный root commit object проверен через <code>git -C /Volumes/external/sources/cppmega show --no-patch 6667d41f8dceb05221228097e336f239e7ba61c4</code>. Ветка <code>codex/canonical-complete-20260715</code> опубликована в <code>origin</code>; remote SHA повторно проверен после push. Пользовательский <code>.gitignore</code> и untracked plan-файл сохранены вне commit.</p>
 
         <h3>cppmega.mlx</h3>
         <p>Branch <code>codex/canonical-complete-20260715</code>, HEAD <code>12610eb69d1b9499c0242c4a27b95b58d7313346</code>.</p>
@@ -532,7 +532,7 @@
             </tbody>
           </table>
         </div>
-        <div class="callout info">MLX HEAD <code>12610eb</code> проверен локально через <code>git show</code>; source-local FIM/AST-FIM/IFIM и partial commit loader входят в этот commit и имеют свежий <code>201 passed</code> receipt. Remote branch <code>codex/canonical-complete-20260715</code> отсутствует.</div>
+        <div class="callout info">MLX HEAD <code>12610eb</code> проверен локально через <code>git show</code>; source-local FIM/AST-FIM/IFIM и partial commit loader входят в этот commit и имеют свежий <code>201 passed</code> receipt. Remote branch <code>codex/canonical-complete-20260715</code> опубликована, remote SHA равен локальному HEAD.</div>
       </section>
 
       <section id="tests">
@@ -802,7 +802,7 @@ fungible aggregate: floor(1 411 702 081 / 196 608) = 7180</code></pre>
               <tr><td>H200 exact acceptance</td><td><code>2b5dd3d</code>: full DSA 7 passed/35 warnings; final gate 11 passed/27 warnings in 8.00s; real writer+reader</td><td>Не экстраполировать component gate на long distributed training/performance</td></tr>
               <tr><td>Nebius cleanup</td><td>Image <code>sha256:08c5...</code>; GHCR auth исправлен; VM deleted и API подтверждает отсутствие</td><td>Новый VM только для следующего отдельного GPU workflow</td></tr>
               <tr><td>Root environment</td><td>Detours E2E прошёл root code path</td><td>Собственный venv/lock/declared dependencies</td></tr>
-              <tr><td>Publication</td><td>Exact local commits и ancestry проверены</td><td>Canonical branches ещё не pushed</td></tr>
+              <tr><td>Publication</td><td>Обе canonical branches pushed; remote SHA проверены</td><td>Осталось решение о PR/merge в default branches</td></tr>
               <tr><td>CASE5 v7</td><td>Зафиксирован snapshot 77/11 на старом <code>1ba36f7</code></td><td>Repairs, pinned reruns, audit и final trained-token report</td></tr>
             </tbody>
           </table>
