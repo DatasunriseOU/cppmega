@@ -101,7 +101,7 @@
 
 | Gate | Результат |
 |---|---|
-| Полный pytest в dedicated Megatron env | `1385 passed, 159 skipped, 24 warnings` за `49.13s` |
+| Полный pytest в dedicated Megatron env | `1385 passed, 159 skipped, 24 warnings` за `50.87s` |
 | Selected environment/CI/regression suite | `104 passed` |
 | Environment verification | Exact clean Megatron commit `ba7b5ebce12af60627a80985792a1449ce45f46c` |
 | cppmega wheel smoke | PASS; runtime JSON contracts есть, namespace только `cppmega` |
