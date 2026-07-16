@@ -20,10 +20,11 @@
     .metric { background:#fff; border:1px solid var(--line); border-left:5px solid var(--green); padding:15px 16px; }
     .metric strong { display:block; font-size:24px; line-height:1.15; }
     .metric span { color:var(--muted); font-size:13px; }
-    table { border-collapse:collapse; width:100%; background:#fff; margin:12px 0 20px; }
+    .table-wrap { max-width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; margin:12px 0 20px; }
+    table { border-collapse:collapse; width:100%; background:#fff; margin:0; }
     th,td { border:1px solid var(--line); padding:10px 12px; text-align:left; vertical-align:top; }
     th { background:#edf2f6; font-weight:700; }
-    code { background:#eaf0f5; padding:2px 5px; border-radius:3px; font-size:.92em; }
+    code { background:#eaf0f5; padding:2px 5px; border-radius:3px; font-size:.92em; overflow-wrap:anywhere; word-break:break-word; }
     .ok { color:var(--green); font-weight:700; }
     .warn { color:var(--amber); font-weight:700; }
     .bar { height:12px; background:#e5ebf0; margin-top:7px; }
@@ -31,7 +32,7 @@
     .source-list { columns:2 360px; column-gap:36px; }
     .source-list li { break-inside:avoid; margin:5px 0; }
     footer { border-top:1px solid var(--line); margin-top:40px; padding-top:16px; color:var(--muted); font-size:13px; }
-    @media (max-width:650px) { main { padding:25px 15px 48px; } table { font-size:14px; } th,td { padding:8px; } }
+    @media (max-width:650px) { main { padding:25px 15px 48px; } table { min-width:560px; font-size:14px; } th,td { padding:8px; } }
   </style>
 </head>
 <body>
@@ -87,7 +88,7 @@
   <p>Tracked egg-info пересобран из текущего <code>pyproject.toml</code>: Python <code>&gt;=3.11</code>, optional data dependency <code>datasketch==1.10.0</code>. Setuptools discovery ограничен <code>cppmega</code> и <code>cppmega.*</code>; wheel содержит runtime contracts <code>domain_schema_v1.json</code>, <code>tokenizer.json</code> и <code>tokenizer_contract_v1.json</code>, но не публикует namespace <code>cppmega_mlx</code>.</p>
 
   <h2>Проверки</h2>
-  <table>
+  <div class="table-wrap"><table>
     <thead><tr><th>Проверка</th><th>Receipt</th><th>Комментарий</th></tr></thead>
     <tbody>
       <tr><td>Full pytest</td><td class="ok">PASS</td><td>1385 passed, 159 skipped, 24 warnings, 49.13s</td></tr>
@@ -97,11 +98,12 @@
       <tr><td>compileall</td><td class="ok">PASS</td><td><code>cppmega scripts tests tools</code></td></tr>
       <tr><td>Tracked bash syntax</td><td class="ok">PASS</td><td>all tracked <code>*.sh</code></td></tr>
       <tr><td>git diff --check</td><td class="ok">PASS</td><td>no whitespace errors</td></tr>
+      <tr><td>HTML changelog desktop/mobile</td><td class="ok">PASS</td><td>1440px и 390px; без page-level horizontal overflow</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Что не включено</h2>
-  <table>
+  <div class="table-wrap"><table>
     <thead><tr><th>Группа</th><th>Решение</th></tr></thead>
     <tbody>
       <tr><td><code>.gitignore</code> report patterns</td><td>Оставлено dirty: широкое подавление review artifacts не относится к hardening.</td></tr>
@@ -109,7 +111,7 @@
       <tr><td>Stale superpowers plan</td><td>Не production documentation.</td></tr>
       <tr><td><code>tests/test_pr_export_batches.py</code></td><td>Cross-repo MLX namespace smoke, не CUDA/Megatron gate.</td></tr>
     </tbody>
-  </table>
+  </table></div>
 
   <h2>Остаточные риски</h2>
   <p class="warn">Локальный Mac не даёт доказательства H200/CUDA kernel runtime. Self-hosted workflow и contracts проверены, но GPU receipt должен быть получен на выделенном CUDA runner.</p>

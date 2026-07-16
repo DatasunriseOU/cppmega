@@ -109,6 +109,7 @@
 | Python compileall | PASS для `cppmega scripts tests tools` |
 | Tracked shell `bash -n` | PASS |
 | `git diff --check` | PASS |
+| HTML changelog desktop/mobile | PASS: 1440px и 390px без page-level horizontal overflow |
 
 Команда полного теста:
 
