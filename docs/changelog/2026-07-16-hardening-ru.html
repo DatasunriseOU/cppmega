@@ -113,10 +113,14 @@
     </tbody>
   </table></div>
 
+  <h2>Dependabot: review 17 июля 2026</h2>
+  <p>Единственный alert <code>GHSA-rrmf-rvhw-rf47</code> относится только к <code>upstream_prs/examples/03_sparse_mla_fp8_dispatch/requirements.txt</code> и pinned <code>torch==2.12.0.dev20260410+cu132</code>. Это reproducer для конкретного H200 + Transformer Engine стека, не dependency wheel или runtime package cppmega. В reproducer нет вызова <code>torch.jit.script</code>, а advisory не указывает patched release. Pin сохранён ради воспроизводимости GPU case; это ограниченный operational risk, не production fix.</p>
+
   <h2>Остаточные риски</h2>
   <p class="warn">Локальный Mac не даёт доказательства H200/CUDA kernel runtime. Self-hosted workflow и contracts проверены, но GPU receipt должен быть получен на выделенном CUDA runner.</p>
   <p>Warnings Transformer Engine/Apex в dedicated Mac environment ожидаемы и не считаются GPU результатом.</p>
   <p>Repo-wide Ruff ещё содержит 202 legacy violations в нетронутых файлах; все Python-файлы production diff проходят pinned changed-file Ruff.</p>
+  <p>Dependabot alert по reproducer Torch остаётся отдельным operational risk и не считается закрытым production fix.</p>
 
   <footer>Отчёт сгенерирован из текущего source tree; ссылки указывают на ветку hardening, а не на старые review notes.</footer>
 </main>

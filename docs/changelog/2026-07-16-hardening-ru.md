@@ -111,6 +111,17 @@
 | `git diff --check` | PASS |
 | HTML changelog desktop/mobile | PASS: 1440px и 390px без page-level horizontal overflow |
 
+## Dependabot review: 17 июля 2026
+
+Открытый alert `GHSA-rrmf-rvhw-rf47` относится только к
+`upstream_prs/examples/03_sparse_mla_fp8_dispatch/requirements.txt` и pinned
+`torch==2.12.0.dev20260410+cu132`. Это reproducer для конкретного H200 +
+Transformer Engine стека, не dependency wheel или runtime package cppmega.
+В самом reproducer нет вызова `torch.jit.script`; patched release advisory не
+указывает. Pin не менялся, чтобы не разрушить воспроизводимость GPU case. Alert
+классифицирован как ограниченный tolerable risk, а не как исправленная
+production dependency.
+
 Команда полного теста:
 
 ```bash
@@ -131,3 +142,5 @@ env -u PYTHONPATH -u PYTHONHOME -u VIRTUAL_ENV \
   файлах); все Python-файлы production diff проходят pinned changed-file Ruff.
 - Cross-repo MLX tests оставлены вне commit, чтобы `cppmega` не выдавал отсутствие
   локального MLX runtime за успешную CUDA проверку.
+- Dependabot alert по reproducer Torch остаётся отдельным operational risk и не
+  должен считаться закрытым production fix.
