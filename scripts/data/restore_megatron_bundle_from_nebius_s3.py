@@ -29,32 +29,18 @@ from cppmega.receipt_binding import (  # noqa: E402
     validate_receipt_binding,
 )
 
-if __package__:
-    from scripts.data.publish_megatron_bundle_to_nebius_s3 import (
-        DEFAULT_BUCKET,
-        DEFAULT_ENDPOINT,
-        DEFAULT_PREFIX,
-        _load_env_file,
-        _s3_env,
-        _sha256,
-        _validate_archive_member_names,
-        _validate_bundle,
-        _validate_logical_manifest_contract,
-        _write_json_atomic,
-    )
-else:
-    from publish_megatron_bundle_to_nebius_s3 import (  # type: ignore[no-redef]
-        DEFAULT_BUCKET,
-        DEFAULT_ENDPOINT,
-        DEFAULT_PREFIX,
-        _load_env_file,
-        _s3_env,
-        _sha256,
-        _validate_archive_member_names,
-        _validate_bundle,
-        _validate_logical_manifest_contract,
-        _write_json_atomic,
-    )
+from scripts.data.publish_megatron_bundle_to_nebius_s3 import (  # noqa: E402
+    DEFAULT_BUCKET,
+    DEFAULT_ENDPOINT,
+    DEFAULT_PREFIX,
+    _load_env_file,
+    _s3_env,
+    _sha256,
+    _validate_archive_member_names,
+    _validate_bundle,
+    _validate_logical_manifest_contract,
+    _write_json_atomic,
+)
 
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")

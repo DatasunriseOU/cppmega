@@ -107,7 +107,7 @@ python3 scripts/nebius_h200_megatron_cpp_generation_eval.py \
   --checkpoint-local outputs/checkpoints/cppmega-h200-megatron-1782697038/seq_1024_bs_192 \
   --cases evals/cpp_docstring_compile_cases.jsonl \
   --prompts outputs/evals/cpp_docstring_compile_prompts.jsonl \
-  --clang-indexer-root ../cppmega.mlx \
+  --clang-indexer-root . \
   --max-new-tokens 128 \
   --disable-nvrtc \
   --keep-workdir
@@ -118,7 +118,7 @@ Megatron `torch_dist` checkpoint iteration, runs one inference-only process in
 `ghcr.io/datasunriseou/cppmega:latest`, copies completions back, deletes the
 instance, then runs the local compile/run gate.
 
-The clang producer checkout is an explicit dependency. Strict eval indexing
+The clang producer is owned by this cppmega checkout. Strict eval indexing
 rejects clang error/fatal diagnostics, and a failed local compile gate makes the
 wrapper fail by default. `--allow-compile-fail` is a diagnostic-only override.
 

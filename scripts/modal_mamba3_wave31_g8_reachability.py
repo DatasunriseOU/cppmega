@@ -745,7 +745,8 @@ def _parse_log(log_path: pathlib.Path, tokens_per_iter: int) -> dict[str, Any]:
     for line in text.splitlines():
         lower = line.lower()
         if (
-            "dot product attention" in lower
+            "dotproductattention" in lower
+            or "dot product attention" in lower
             or "attention backend" in lower
             or "nvte" in lower
             or "fusedattention" in lower
@@ -758,8 +759,17 @@ def _parse_log(log_path: pathlib.Path, tokens_per_iter: int) -> dict[str, Any]:
     te_rejection_lines = [
         line
         for line in te_debug_lines
-        if re.search(r"(disable|reject|unavailable|not available|not supported|reason|no .*backend)", line, re.I)
+        if re.search(r"(disabl\w*|reject\w*|unavailable|not available|not supported|reason|no .*backend)", line, re.I)
     ]
+    te_available_backends = []
+    te_selected_backends = []
+    for line in te_debug_lines:
+        available = re.search(r"\bAvailable backends\s*=\s*(.+?)\s*$", line, re.I)
+        if available:
+            te_available_backends.append(available.group(1).strip().removesuffix("."))
+        selected = re.search(r"\bSelected backend\s*=\s*(.+?)\s*$", line, re.I)
+        if selected:
+            te_selected_backends.append(selected.group(1).strip().removesuffix("."))
     mamba_backward_markers = [
         line
         for line in text.splitlines()
@@ -776,6 +786,8 @@ def _parse_log(log_path: pathlib.Path, tokens_per_iter: int) -> dict[str, Any]:
         "peak_reserved_gib": max(peak_reserved) if peak_reserved else None,
         "te_debug_lines": te_debug_lines[-120:],
         "te_rejection_lines": te_rejection_lines[-80:],
+        "te_available_backends_last": te_available_backends[-1] if te_available_backends else None,
+        "te_selected_backend_last": te_selected_backends[-1] if te_selected_backends else None,
         "mamba_backward_marker_lines": mamba_backward_markers[-80:],
         "reached_mamba_backward": bool(mamba_backward_markers) or bool(elapsed_ms) or bool(iterations),
         "last_120_lines": "\n".join(text.splitlines()[-120:]),

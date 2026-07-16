@@ -10,7 +10,7 @@
       "machines": [
         "arm64"
       ],
-      "python": "/Volumes/external/sources/cppmega.mlx/.venv/bin/python",
+      "python": "/Volumes/external/sources/.venvs/cppmega.source/bin/python",
       "lanes": [
         "macos-contracts"
       ],

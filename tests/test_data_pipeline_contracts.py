@@ -123,6 +123,17 @@ def test_package_data_includes_cuda_headers_needed_by_extension_build() -> None:
     package_data = pyproject["tool"]["setuptools"]["package-data"]["cppmega"]
 
     assert "megatron/cuda_ext/*.hpp" in package_data
+    assert "data/domain_schema_v1.json" in package_data
+    assert "tokenizer/tokenizer.json" in package_data
+    assert "tokenizer/tokenizer_contract_v1.json" in package_data
+
+
+def test_package_discovery_does_not_publish_sibling_mlx_namespace() -> None:
+    pyproject = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text())
+    include = pyproject["tool"]["setuptools"]["packages"]["find"]["include"]
+
+    assert include == ["cppmega", "cppmega.*"]
+    assert "cppmega*" not in include
 
 
 def test_prepare_data_dispatcher_runs_fail_closed_gates_before_trainable_verify() -> None:

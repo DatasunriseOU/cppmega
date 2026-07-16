@@ -33,6 +33,43 @@ COMPLETION_KEYS = ("completion", "generated_text", "text", "candidate")
 FENCE_RE = re.compile(r"```(?:[A-Za-z0-9_+.#-]+)?\s*\n(.*?)```", re.DOTALL)
 
 
+def resolve_clang_format(command: str) -> str:
+    """Resolve the default formatter without weakening the format gate."""
+
+    if os.path.sep in command or (os.path.altsep and os.path.altsep in command):
+        return command
+
+    resolved = shutil.which(command)
+    if resolved is not None:
+        return resolved
+
+    if command == DEFAULT_CLANG_FORMAT and shutil.which("xcrun") is not None:
+        try:
+            probe = subprocess.run(
+                ["xcrun", "--find", command],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            probe = None
+        if probe is not None:
+            candidate = probe.stdout.strip()
+            if probe.returncode == 0 and candidate:
+                return candidate
+
+    if command == DEFAULT_CLANG_FORMAT:
+        for candidate in (
+            Path("/opt/homebrew/opt/llvm/bin/clang-format"),
+            Path("/usr/local/opt/llvm/bin/clang-format"),
+        ):
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+
+    return command
+
+
 def _relative_path(raw: Any, *, where: str) -> Path:
     if not isinstance(raw, str) or not raw:
         raise ValueError(f"{where} must be a non-empty relative path")
@@ -578,7 +615,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--c-compiler", default=os.environ.get("CC", "clang"))
     parser.add_argument(
         "--clang-format",
-        default=os.environ.get("CLANG_FORMAT", DEFAULT_CLANG_FORMAT),
+        default=resolve_clang_format(
+            os.environ.get("CLANG_FORMAT", DEFAULT_CLANG_FORMAT)
+        ),
         help="clang-format binary used before compile; default: %(default)s",
     )
     parser.add_argument(

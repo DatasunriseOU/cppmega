@@ -3,8 +3,13 @@ name = "cppmega"
 version = "0.1.0"
 description = "Megatron-first CUDA-only rebuild of nanochat feature contracts"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = []
+
+[project.optional-dependencies]
+data = [
+    "datasketch==1.10.0",
+]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
@@ -14,10 +19,17 @@ build-backend = "setuptools.build_meta"
 include-package-data = false
 
 [tool.setuptools.package-data]
-cppmega = ["megatron/cuda_ext/*.cpp", "megatron/cuda_ext/*.cu", "megatron/cuda_ext/*.hpp"]
+cppmega = [
+    "data/domain_schema_v1.json",
+    "megatron/cuda_ext/*.cpp",
+    "megatron/cuda_ext/*.cu",
+    "megatron/cuda_ext/*.hpp",
+    "tokenizer/tokenizer.json",
+    "tokenizer/tokenizer_contract_v1.json",
+]
 
 [tool.setuptools.packages.find]
-include = ["cppmega*"]
+include = ["cppmega", "cppmega.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

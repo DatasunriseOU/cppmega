@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -65,12 +66,15 @@ def _minimal_lane_config(
     path: Path,
     *,
     command: list[str] | None = None,
+    lane_id: str = "local-test",
+    test_profile: str | None = None,
 ) -> Path:
     payload = {
         "schema_version": 1,
         "lanes": [
             {
-                "id": "local-test",
+                "id": lane_id,
+                "test_profile": test_profile,
                 "system": platform.system().lower(),
                 "machines": [platform.machine().lower()],
                 "requires_cuda": False,
@@ -132,6 +136,41 @@ def test_inventory_maps_actual_hosts_and_supported_lanes() -> None:
     assert hosts["windows-10-0-0-11"]["lanes"] == []
     assert hosts["quarantined-10-0-0-12"]["trust"] == "quarantined"
     assert hosts["quarantined-10-0-0-12"]["dispatch_enabled"] is False
+
+
+def test_local_macos_uses_owned_source_environment() -> None:
+    lanes = ci.load_lanes(LANES_CONFIG)
+    _, rows = ci.load_hosts(HOSTS_CONFIG, lanes=lanes)
+    host = next(row for row in rows if row["id"] == "local-macos")
+
+    assert host["python"] == "/Volumes/external/sources/.venvs/cppmega.source/bin/python"
+    assert "/cppmega.mlx/.venv/" not in host["python"]
+    assert "/nanochat/.venv/" not in host["python"]
+
+
+def test_repository_runner_module_entrypoint_executes_cli() -> None:
+    runner = REPO_ROOT / "scripts" / "ci" / "repository_runner.py"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "list",
+            "--host",
+            "local-macos",
+            "--lane",
+            "macos-contracts",
+            "--json",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["hosts"][0]["id"] == "local-macos"
+    assert set(payload["lanes"]) == {"macos-contracts"}
 
 
 def test_configs_contain_no_credentials_or_mutable_install_steps() -> None:
@@ -283,6 +322,112 @@ def test_step_timeout_kills_process_group(tmp_path: Path) -> None:
     assert result["status"] == "timed_out"
     assert result["exit_code"] == 124
     assert time.monotonic() - started < 5
+
+
+def test_sanitized_environment_disables_user_site_and_unsafe_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("PYTHONNOUSERSITE", "0")
+    monkeypatch.setenv("PYTHONSAFEPATH", "0")
+    monkeypatch.setenv("PYTHONPATH", "/tmp/untrusted")
+
+    environment = ci._sanitized_environment(tmp_path)
+
+    assert environment["PYTHONNOUSERSITE"] == "1"
+    assert environment["PYTHONSAFEPATH"] == "1"
+    assert environment["PYTHONPATH"] == str(tmp_path)
+
+
+def test_run_step_preserves_explicit_test_profile(tmp_path: Path) -> None:
+    driver = """
+import sys
+from pathlib import Path
+
+from scripts.ci.repository_runner import run_step
+
+result = run_step(
+    name="profile",
+    command=(
+        sys.executable,
+        "-c",
+        "import os; print(os.environ.get('CPPMEGA_TEST_PROFILE'))",
+    ),
+    cwd=Path.cwd(),
+    log_path=Path("profile.log"),
+    timeout_seconds=5,
+)
+raise SystemExit(result["exit_code"])
+"""
+    environment = os.environ.copy()
+    environment["CPPMEGA_TEST_PROFILE"] = "portable-data"
+    environment["PYTHONPATH"] = str(REPO_ROOT)
+    result = subprocess.run(
+        [sys.executable, "-c", driver],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "profile.log").read_text(encoding="utf-8").strip() == (
+        "portable-data"
+    )
+
+
+def test_linux_contract_lane_sets_portable_test_profile(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    lanes_path = _minimal_lane_config(
+        tmp_path / "lanes.json",
+        lane_id="linux-contracts",
+        test_profile="portable-data",
+        command=[
+            "{python}",
+            "-c",
+            "import os; print(os.environ.get('CPPMEGA_TEST_PROFILE'))",
+        ],
+    )
+    receipt_dir = tmp_path / "receipt"
+    environment = os.environ.copy()
+    environment.pop("CPPMEGA_TEST_PROFILE", None)
+    environment["PYTHONPATH"] = str(REPO_ROOT)
+    runner = REPO_ROOT / "scripts" / "ci" / "repository_runner.py"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "lane",
+            "--lanes-config",
+            str(lanes_path),
+            "--lane",
+            "linux-contracts",
+            "--repo-root",
+            str(repo),
+            "--receipt-dir",
+            str(receipt_dir),
+            "--python",
+            sys.executable,
+        ],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (receipt_dir / "test-command.log").read_text(
+        encoding="utf-8"
+    ).strip() == "portable-data"
+
+
+def test_portable_profile_allows_repository_runner_regressions() -> None:
+    import conftest
+
+    assert "tests/ci/test_repository_ci_runner.py" in conftest._PORTABLE_TEST_ALLOWLIST
 
 
 def test_step_logs_redact_environment_tokens_and_private_keys(

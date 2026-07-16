@@ -30,10 +30,12 @@ from .prompt_graph import (
 from .symbol_identity import (
     SYMBOL_IDENTITY_SCHEMA_VERSION,
     compute_symbol_id,
+    is_repo_file_location_identity,
 )
 
 
 PRODUCER_VERSION = "3"
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 @dataclass(frozen=True)
@@ -151,7 +153,9 @@ def _identity_for_cursor(
             reference.get("canonical_signature")
         )
         symbol_key = str(reference.get("symbol_key") or "")
-        if not signature or not symbol_key:
+        if not symbol_key:
+            return None
+        if not signature and not is_repo_file_location_identity(symbol_key):
             return None
         version = int(
             reference.get("symbol_identity_schema_version") or 0
@@ -206,12 +210,34 @@ def _identity_for_cursor(
 
 
 def _load_indexer(indexer_root: Path) -> tuple[ModuleType, Path]:
+    indexer_root = indexer_root.expanduser().resolve()
+    if indexer_root != _REPOSITORY_ROOT:
+        raise ValueError(
+            "cppmega prompt-graph indexer must come from the same checkout as "
+            "the imported cppmega package; "
+            f"package_root={_REPOSITORY_ROOT}, indexer_root={indexer_root}. "
+            "Cross-checkout cppmega/cppmega.mlx indexer mixing is unsupported."
+        )
     path = indexer_root / "tools" / "clang_indexer" / "index_project.py"
     if not path.is_file():
         raise FileNotFoundError(f"clang indexer module not found: {path}")
     module_name = "_cppmega_prompt_graph_clang_indexer_" + _sha_file(path)[:12]
     existing = sys.modules.get(module_name)
     if existing is not None:
+        existing_file = getattr(existing, "__file__", None)
+        existing_spec = getattr(existing, "__spec__", None)
+        existing_origin = getattr(existing_spec, "origin", None)
+        origins = (existing_file, existing_origin)
+        if any(
+            not isinstance(origin, (str, os.PathLike))
+            or Path(origin).expanduser().resolve(strict=False) != path
+            for origin in origins
+        ):
+            raise ValueError(
+                "cached clang indexer provenance does not match the requested "
+                f"module: requested={path}, file={existing_file!r}, "
+                f"spec_origin={existing_origin!r}"
+            )
         return existing, path
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
@@ -219,7 +245,8 @@ def _load_indexer(indexer_root: Path) -> tuple[ModuleType, Path]:
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     indexer_root_text = str(indexer_root)
-    original_sys_path = list(sys.path)
+    original_sys_path = sys.path
+    original_entries = list(original_sys_path)
     sys.path = [entry for entry in sys.path if entry != indexer_root_text]
     sys.path.insert(0, indexer_root_text)
     try:
@@ -228,7 +255,8 @@ def _load_indexer(indexer_root: Path) -> tuple[ModuleType, Path]:
         sys.modules.pop(module_name, None)
         raise
     finally:
-        sys.path[:] = original_sys_path
+        original_sys_path[:] = original_entries
+        sys.path = original_sys_path
     return module, path
 
 
@@ -855,12 +883,17 @@ class ClangPromptProjectIndexProducer:
             if symbol["kind"] in {"function", "type", "variable"}
         ]
         if any(
-            not symbol["symbol_key"] or not symbol["canonical_signature"]
+            not symbol["symbol_key"]
+            or (
+                not symbol["canonical_signature"]
+                and not is_repo_file_location_identity(symbol["symbol_key"])
+            )
             for symbol in definitions
         ):
             raise ValueError(
                 "clang prompt graph producer rejects qname-only definitions; "
-                "CASE 4 v3 symbol key and canonical signature are required"
+                "CASE 4 v3 symbol key plus a canonical signature or explicit "
+                "repo_file_location identity are required"
             )
 
         provenance = {

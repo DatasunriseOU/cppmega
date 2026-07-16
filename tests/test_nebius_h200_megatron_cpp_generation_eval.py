@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
 
@@ -32,7 +33,7 @@ CASE3_FIXTURE = ROOT / "tests" / "fixtures" / "case3_prompt_repo"
 V3_INDEXER_ROOT = Path(
     os.environ.get(
         "CPPMEGA_TEST_CLANG_INDEXER_ROOT",
-        ROOT.parent / "cppmega.mlx",
+        ROOT,
     )
 )
 PROMPT_GRAPH_PROJECT_ID = "tests/case3-prompt-repo"
@@ -71,11 +72,12 @@ def _v3_eval_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
 
 def test_actual_parser_defaults_require_stable_project_identity(tmp_path):
     args = parse_args(
-        ["--dry-run", "--clang-indexer-root", str(V3_INDEXER_ROOT)]
+        ["--dry-run"]
     )
     rows = list(iter_jsonl(DEFAULT_CASES))
 
     assert args.cases == DEFAULT_CASES
+    assert args.clang_indexer_root == ROOT
     assert args.prompt_graph_mode == "repo"
     assert rows
     assert {row["prompt_graph_mode"] for row in rows} == {"off", "repo"}
@@ -94,6 +96,39 @@ def test_actual_parser_defaults_require_stable_project_identity(tmp_path):
     )
     assert assets
     assert args.allow_compile_fail is False
+
+
+def test_root_prompt_graph_loader_is_independent_of_partial_mlx_namespace():
+    script = f"""
+from pathlib import Path
+import cppmega_mlx
+from cppmega.prompt_graph_index import _load_indexer
+from cppmega.data.prompt_graph_index import _load_indexer as _load_data_indexer
+
+module, path = _load_indexer(Path({str(ROOT)!r}))
+assert path == Path({str(ROOT / 'tools' / 'clang_indexer' / 'index_project.py')!r})
+assert module.__name__.startswith('_cppmega_prompt_graph_clang_indexer_')
+
+for loader in (_load_indexer, _load_data_indexer):
+    try:
+        loader(Path({str(ROOT.parent / 'cppmega.mlx')!r}))
+    except ValueError as exc:
+        assert 'same checkout' in str(exc)
+        assert 'Cross-checkout cppmega/cppmega.mlx indexer mixing is unsupported' in str(exc)
+    else:
+        raise AssertionError('cross-checkout clang indexer was accepted')
+"""
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_remote_generation_script_is_bash_parseable(tmp_path):

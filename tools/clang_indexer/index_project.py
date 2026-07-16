@@ -7090,7 +7090,7 @@ def emit_build_documents(
     if tokenizer_path:
         tok = _load_cppmega_tokenizer(tokenizer_path)
         if dedup_db:
-            from dedup_store import DedupStore
+            DedupStore, _sha1_tokens = _import_dedup_store_symbols()
             store = DedupStore(
                 dedup_db,
                 near=dedup_near,
@@ -8174,7 +8174,7 @@ def main() -> int:
         # FAIL LOUD up front: open once here so a bad db / missing datasketch
         # crashes before any heavy parsing (RULE #1). Closed immediately; each
         # process_project reopens against the same WAL db.
-        from dedup_store import DedupStore
+        DedupStore, _sha1_tokens = _import_dedup_store_symbols()
         if args.dedup_stage_id:
             if args.dedup_stage_db:
                 # Local-stage subprocess path: global db is read-only even during

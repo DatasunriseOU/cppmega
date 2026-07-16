@@ -84,6 +84,7 @@ _PASSTHROUGH_ENV = {
     "CUDA_HOME",
     "CUDA_PATH",
     "CUDA_VISIBLE_DEVICES",
+    "CPPMEGA_TEST_PROFILE",
     "DYLD_LIBRARY_PATH",
     "HOME",
     "LANG",
@@ -260,6 +261,13 @@ def load_lanes(path: Path = DEFAULT_LANES_CONFIG) -> dict[str, dict[str, Any]]:
         timeout = lane.get("timeout_seconds")
         if not isinstance(timeout, int) or timeout <= 0:
             raise RepositoryCIError(f"lane {lane_id} needs a positive timeout")
+        test_profile = lane.get("test_profile")
+        if test_profile is not None and (
+            not isinstance(test_profile, str)
+            or not test_profile
+            or _SAFE_ID.fullmatch(test_profile) is None
+        ):
+            raise RepositoryCIError(f"lane {lane_id} has invalid test_profile")
         commands = lane.get("commands")
         if not isinstance(commands, list) or not commands:
             raise RepositoryCIError(f"lane {lane_id} needs commands")
@@ -507,7 +515,11 @@ class _Redactor:
         return "".join(self.line(line) for line in value.splitlines(keepends=True))
 
 
-def _sanitized_environment(repo_root: Path) -> dict[str, str]:
+def _sanitized_environment(
+    repo_root: Path,
+    *,
+    environment_overrides: dict[str, str | None] | None = None,
+) -> dict[str, str]:
     environment = {
         key: value for key, value in os.environ.items() if key in _PASSTHROUGH_ENV
     }
@@ -518,12 +530,25 @@ def _sanitized_environment(repo_root: Path) -> dict[str, str]:
             "PIP_NO_INDEX": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONHASHSEED": "0",
+            "PYTHONNOUSERSITE": "1",
             "PYTHONPATH": str(repo_root),
+            "PYTHONSAFEPATH": "1",
             "PYTHONUNBUFFERED": "1",
             "TOKENIZERS_PARALLELISM": "false",
         }
     )
+    for key, value in (environment_overrides or {}).items():
+        if value is None:
+            environment.pop(key, None)
+        else:
+            environment[key] = value
     return environment
+
+
+def _lane_environment_overrides(
+    lane: dict[str, Any],
+) -> dict[str, str | None] | None:
+    return {"CPPMEGA_TEST_PROFILE": lane.get("test_profile")}
 
 
 def _terminate_process_group(process: subprocess.Popen[str]) -> None:
@@ -561,6 +586,7 @@ def run_step(
     log_path: Path,
     timeout_seconds: float,
     display_command: Sequence[str] | None = None,
+    environment_overrides: dict[str, str | None] | None = None,
 ) -> dict[str, Any]:
     """Run one command with a hard timeout and a redacted combined log."""
 
@@ -581,7 +607,9 @@ def run_step(
         process = subprocess.Popen(
             tuple(str(part) for part in command),
             cwd=cwd,
-            env=_sanitized_environment(cwd),
+            env=_sanitized_environment(
+                cwd, environment_overrides=environment_overrides
+            ),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -1126,6 +1154,7 @@ def run_lane(args: argparse.Namespace) -> int:
     error: str | None = None
     exit_code = 1
     python = args.python
+    environment_overrides = _lane_environment_overrides(lane)
 
     def remaining(limit: int) -> float:
         return max(0.0, min(float(limit), deadline - time.monotonic()))
@@ -1165,6 +1194,7 @@ def run_lane(args: argparse.Namespace) -> int:
             cwd=repo_root,
             log_path=receipt_dir / "preprovisioned-environment.log",
             timeout_seconds=remaining(60),
+            environment_overrides=environment_overrides,
         )
         steps.append(preflight)
         if preflight["exit_code"] != 0:
@@ -1193,6 +1223,7 @@ def run_lane(args: argparse.Namespace) -> int:
                     cwd=repo_root,
                     log_path=receipt_dir / f"{command['name']}.log",
                     timeout_seconds=remaining(int(command["timeout_seconds"])),
+                    environment_overrides=environment_overrides,
                 )
                 steps.append(step)
                 if step["exit_code"] != 0:
@@ -1985,3 +2016,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, RepositoryCIError, subprocess.SubprocessError) as exc:
         print(f"[repository-ci] fatal: {_Redactor().text(str(exc))}", file=sys.stderr)
         return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

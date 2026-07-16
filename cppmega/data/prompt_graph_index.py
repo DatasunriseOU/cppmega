@@ -35,6 +35,7 @@ from cppmega.symbol_identity import (
 
 
 PRODUCER_VERSION = "3"
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True)
@@ -209,23 +210,53 @@ def _identity_for_cursor(
 
 
 def _load_indexer(indexer_root: Path) -> tuple[ModuleType, Path]:
+    indexer_root = indexer_root.expanduser().resolve()
+    if indexer_root != _REPOSITORY_ROOT:
+        raise ValueError(
+            "cppmega prompt-graph indexer must come from the same checkout as "
+            "the imported cppmega package; "
+            f"package_root={_REPOSITORY_ROOT}, indexer_root={indexer_root}. "
+            "Cross-checkout cppmega/cppmega.mlx indexer mixing is unsupported."
+        )
     path = indexer_root / "tools" / "clang_indexer" / "index_project.py"
     if not path.is_file():
         raise FileNotFoundError(f"clang indexer module not found: {path}")
     module_name = "_cppmega_prompt_graph_clang_indexer_" + _sha_file(path)[:12]
     existing = sys.modules.get(module_name)
     if existing is not None:
+        existing_file = getattr(existing, "__file__", None)
+        existing_spec = getattr(existing, "__spec__", None)
+        existing_origin = getattr(existing_spec, "origin", None)
+        origins = (existing_file, existing_origin)
+        if any(
+            not isinstance(origin, (str, os.PathLike))
+            or Path(origin).expanduser().resolve(strict=False) != path
+            for origin in origins
+        ):
+            raise ValueError(
+                "cached clang indexer provenance does not match the requested "
+                f"module: requested={path}, file={existing_file!r}, "
+                f"spec_origin={existing_origin!r}"
+            )
         return existing, path
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load clang indexer module from {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
+    indexer_root_text = str(indexer_root)
+    original_sys_path = sys.path
+    original_entries = list(original_sys_path)
+    sys.path = [entry for entry in sys.path if entry != indexer_root_text]
+    sys.path.insert(0, indexer_root_text)
     try:
         spec.loader.exec_module(module)
     except Exception:
         sys.modules.pop(module_name, None)
         raise
+    finally:
+        original_sys_path[:] = original_entries
+        sys.path = original_sys_path
     return module, path
 
 
@@ -861,7 +892,8 @@ class ClangPromptProjectIndexProducer:
         ):
             raise ValueError(
                 "clang prompt graph producer rejects qname-only definitions; "
-                "CASE 4 v3 symbol key and canonical signature are required"
+                "CASE 4 v3 symbol key plus a canonical signature or explicit "
+                "repo_file_location identity are required"
             )
 
         provenance = {

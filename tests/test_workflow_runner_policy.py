@@ -70,3 +70,14 @@ def test_persistent_pr_ci_actions_are_pinned_to_commits() -> None:
     ]
 
     assert not violations, f"mutable action references are forbidden: {violations}"
+
+
+def test_linux_portable_lane_uses_explicit_megatron_free_profile() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci-self-hosted.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "CPPMEGA_TEST_PROFILE=portable-data python -m pytest -q" in workflow
+    assert workflow.count("unset PYTHONPATH PYTHONHOME VIRTUAL_ENV || true") == 2
+    assert workflow.count("export PYTHONNOUSERSITE=1") == 2
+    assert workflow.count("export PYTHONSAFEPATH=1") == 2

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -29,6 +32,161 @@ def _included_graph_contract() -> dict[str, object]:
         "positive_edges": 1,
         "included_in_total_loss": True,
     }
+
+
+def test_pytest_bootstrap_finds_selected_real_megatron_without_pythonpath():
+    repo_root = Path(__file__).resolve().parents[1]
+
+    script = """
+import conftest
+import megatron
+import megatron.core
+from megatron.core.transformer.experimental_attention_variant import dsa
+from megatron.core.transformer.moe import moe_utils
+from pathlib import Path
+
+expected = Path(conftest.MEGATRON_SOURCE_ROOT).resolve() / "megatron"
+for module in (megatron.core, dsa, moe_utils):
+    assert Path(module.__file__).resolve().is_relative_to(expected), module.__file__
+assert megatron.__spec__ is not None
+assert not getattr(megatron, "__cppmega_stub__", False)
+"""
+    environment = os.environ.copy()
+    for name in ("PYTHONPATH", "MEGATRON_LM_REPO", "MEGATRON_ROOT"):
+        environment.pop(name, None)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo_root,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_pytest_bootstrap_fails_loudly_for_invalid_explicit_megatron_root(tmp_path):
+    missing_root = tmp_path / "missing-megatron"
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    environment.pop("MEGATRON_ROOT", None)
+    environment["MEGATRON_LM_REPO"] = str(missing_root)
+    result = subprocess.run(
+        [sys.executable, "-c", "import conftest"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "MEGATRON_LM_REPO" in result.stderr
+    assert "real Megatron-LM" in result.stderr
+
+
+def test_portable_profile_requires_only_allowlisted_test_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import conftest
+
+    monkeypatch.setenv("CPPMEGA_TEST_PROFILE", "portable-data")
+    assert conftest._portable_profile_requested()
+
+
+def test_portable_profile_accepts_node_id_and_pytest_option_value(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    environment["CPPMEGA_TEST_PROFILE"] = "portable-data"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "tests/test_data_pipeline_contracts.py::test_verify_dataset_default_vocab_is_canonical_contract",
+            "--basetemp",
+            str(tmp_path / "pytest-base"),
+        ],
+        cwd=repo_root,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_explicit_megatron_root_without_receipt_requires_exact_commit(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    source = tmp_path / "megatron"
+    (source / "megatron" / "core").mkdir(parents=True)
+    (source / "megatron" / "core" / "__init__.py").write_text("", encoding="utf-8")
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    environment.pop("CPPMEGA_MEGATRON_COMMIT", None)
+    environment["MEGATRON_LM_REPO"] = str(source)
+    result = subprocess.run(
+        [sys.executable, "-c", "import conftest"],
+        cwd=repo_root,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "CPPMEGA_MEGATRON_COMMIT" in result.stderr
+
+
+def test_manifest_source_validation_rejects_dirty_or_drifted_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import conftest
+
+    source = tmp_path / "megatron"
+    (source / "megatron" / "core").mkdir(parents=True)
+    subprocess.run(["git", "-C", str(source), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(source), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(source), "config", "user.name", "cppmega-test"],
+        check=True,
+    )
+    (source / "megatron" / "core" / "__init__.py").write_text("\n")
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(source), "commit", "-qm", "fixture"],
+        check=True,
+    )
+    commit = subprocess.check_output(
+        ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+    ).strip()
+    manifest = {
+        "megatron_commit": commit,
+        "source_dirty": False,
+        "megatron_root": str(source),
+    }
+    manifest_path = tmp_path / "cppmega-environment.json"
+
+    (source / "dirty.txt").write_text("dirty\n")
+    with pytest.raises(RuntimeError, match="changed after receipt"):
+        conftest._validate_manifest_source(manifest_path, manifest, source)
+
+    (source / "dirty.txt").unlink()
+    manifest["megatron_commit"] = "0" * 40
+    with pytest.raises(RuntimeError, match="differs from receipt"):
+        conftest._validate_manifest_source(manifest_path, manifest, source)
 
 
 def test_production_preflight_uses_derived_capacity_and_active_dsa_auxiliary():

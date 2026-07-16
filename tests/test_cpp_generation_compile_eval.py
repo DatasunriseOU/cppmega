@@ -24,6 +24,63 @@ def _load_module():
     return module
 
 
+def test_resolve_clang_format_prefers_path_and_returns_executable() -> None:
+    module = _load_module()
+
+    assert module.resolve_clang_format("/opt/llvm/bin/clang-format") == (
+        "/opt/llvm/bin/clang-format"
+    )
+
+
+def test_resolve_clang_format_uses_xcrun_when_path_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module()
+    calls: list[list[str]] = []
+
+    def fake_which(name: str) -> str | None:
+        return "/usr/bin/xcrun" if name == "xcrun" else None
+
+    def fake_run(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout="/Applications/Xcode.app/clang-format\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(module.shutil, "which", fake_which)
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    assert module.resolve_clang_format("clang-format") == (
+        "/Applications/Xcode.app/clang-format"
+    )
+    assert calls == [["xcrun", "--find", "clang-format"]]
+
+
+def test_resolve_clang_format_tolerates_broken_xcrun_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module()
+
+    monkeypatch.setattr(
+        module.shutil,
+        "which",
+        lambda name: "/usr/bin/xcrun" if name == "xcrun" else None,
+    )
+    monkeypatch.setattr(module.Path, "is_file", lambda _path: False)
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(["xcrun"], timeout=5)
+        ),
+    )
+
+    assert module.resolve_clang_format("clang-format") == "clang-format"
+
+
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
     path.write_text(
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),

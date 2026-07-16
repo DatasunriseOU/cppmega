@@ -1428,9 +1428,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=(
             Path(os.environ["CPPMEGA_CLANG_INDEXER_ROOT"])
             if os.environ.get("CPPMEGA_CLANG_INDEXER_ROOT")
-            else None
+            else ROOT
         ),
-        help="Required for repo cases without a prebuilt prompt graph index.",
+        help=(
+            "Checkout containing tools/clang_indexer/index_project.py; "
+            "defaults to this cppmega checkout."
+        ),
     )
     parser.add_argument("--seq-length", type=int, default=1024)
     parser.add_argument("--max-new-tokens", type=int, default=192)

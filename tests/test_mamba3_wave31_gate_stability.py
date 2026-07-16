@@ -26,14 +26,18 @@ def test_full_gate_defaults_to_current_production_flash_case():
     assert mod._CASES["fallback_auto_full"]["production_throughput"] is False
 
 
-def test_parse_log_extracts_te_backend_selection(tmp_path):
+def test_parse_log_extracts_te_backend_selection_and_rejections(tmp_path):
     mod = _load_wave31_module()
     log = tmp_path / "train.log"
+    rejection_lines = [
+        "DEBUG:DotProductAttention:Disabling FlashAttention 2 as it does not support MLA.",
+        "DEBUG:DotProductAttention:Rejecting ExperimentalAttention due to runtime policy.",
+    ]
     log.write_text(
         "\n".join(
             [
-                "DEBUG:DotProductAttention:Disabling FlashAttention 2 as it does not support MLA.",
-                "DEBUG:DotProductAttention:Available backends = {FlashAttention=False, FusedAttention=True (sub-backend 1), UnfusedDotProductAttention=True}",
+                *rejection_lines,
+                "DEBUG:DotProductAttention:Available backends = {FlashAttention=False, ExperimentalAttention=False, FusedAttention=True (sub-backend 1), UnfusedDotProductAttention=True}",
                 "DEBUG:DotProductAttention:Selected backend = FusedAttention (sub-backend 1).",
                 "[2026-04-30] iteration        1/      20 | elapsed time per iteration (ms): 100.0 |",
                 "[production_peak_mem] rank=0 device=0 peak_alloc_gib=12.500 peak_reserved_gib=13.000",
@@ -43,8 +47,20 @@ def test_parse_log_extracts_te_backend_selection(tmp_path):
 
     metrics = mod._parse_log(log, tokens_per_iter=4096)
 
-    assert metrics["te_flash_mla_rejected"] is True
+    assert metrics["te_rejection_lines"] == rejection_lines
     assert metrics["te_selected_backend_last"] == "FusedAttention (sub-backend 1)"
     assert metrics["te_available_backends_last"].startswith("{FlashAttention=False")
     assert metrics["iterations_seen"] == 1
     assert metrics["tok_sec_from_last_step"] == 40960.0
+
+
+def test_parse_log_backend_metrics_have_stable_empty_defaults(tmp_path):
+    mod = _load_wave31_module()
+    log = tmp_path / "train.log"
+    log.write_text("training setup complete")
+
+    metrics = mod._parse_log(log, tokens_per_iter=4096)
+
+    assert metrics["te_rejection_lines"] == []
+    assert metrics["te_selected_backend_last"] is None
+    assert metrics["te_available_backends_last"] is None

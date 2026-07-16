@@ -8,6 +8,7 @@
         "arm64"
       ],
       "requires_cuda": false,
+      "test_profile": null,
       "required_modules": [
         "pytest",
         "numpy",
@@ -78,6 +79,7 @@
         "amd64"
       ],
       "requires_cuda": false,
+      "test_profile": "portable-data",
       "required_modules": [
         "pytest",
         "numpy",
@@ -142,6 +144,7 @@
         "amd64"
       ],
       "requires_cuda": true,
+      "test_profile": null,
       "required_modules": [
         "pytest",
         "torch",
