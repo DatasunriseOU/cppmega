@@ -1,9 +1,6 @@
-# Pinned deps used to validate the reproducer on h200_1
-# (/mnt/data/venv) on 2026-04-14 against NVIDIA H200 sm_90.
-#
-# These are the "works today" versions for the bench3 stack. See
-# MEMORY.md > reference_bench3_h200_stack.md for the full picture.
-torch==2.12.0.dev20260410+cu132
+# Stable CUDA 13.2 release used by the current H200/B200 stack.
+# Install with --extra-index-url https://download.pytorch.org/whl/cu132.
+torch==2.13.0+cu132
 transformer-engine==2.13.0
 # cppmega is the in-tree editable install:
 #   pip install -e /path/to/cppmega
