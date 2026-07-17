@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Setup cppmega environment on h200_1.
 #
-# This machine has system-wide PyTorch 2.12 + CUDA 12.8 and no pre-existing
-# cppmega or Megatron installation.  The script creates a venv from system
-# Python, installs Megatron-LM + TE + Author Mamba3, and downloads training
-# data from GCS.
+# The base venv must provide the cppmega CUDA contract: stable PyTorch
+# 2.13.0+cu132. The script creates a venv from that base, installs
+# Megatron-LM + TE + Author Mamba3, and downloads training data from GCS.
 set -euo pipefail
 
 REMOTE_HOST="${REMOTE_HOST:-h200_1}"
@@ -13,6 +12,7 @@ REMOTE_ROOT="${REMOTE_ROOT:-/home/dave/cppmega-root}"
 REMOTE_CPPMEGA_DIR="${REMOTE_CPPMEGA_DIR:-${REMOTE_ROOT}/cppmega}"
 REMOTE_VENV="${REMOTE_VENV:-${REMOTE_ROOT}/cppmega-venv}"
 REMOTE_BASE_VENV="${REMOTE_BASE_VENV:-/home/dave/nanochat-exact/venv313}"
+EXPECTED_TORCH_VERSION="${EXPECTED_TORCH_VERSION:-2.13.0+cu132}"
 REMOTE_TMP_SCRIPT="${REMOTE_TMP_SCRIPT:-/tmp/cppmega-bench-setup.sh}"
 MEGATRON_COMMIT="${MEGATRON_COMMIT:-e40feed4a}"
 MAMBA_COMMIT="${MAMBA_COMMIT:-31f3d7baba69d0ccad1635ace1e477367899e408}"
@@ -39,6 +39,11 @@ BASE_PYTHON="${REMOTE_BASE_VENV}/bin/python"
 BASE_TORCH_VERSION="$("${BASE_PYTHON}" -c 'import torch; print(torch.__version__)')"
 echo "base Python: ${BASE_PYTHON}"
 echo "base PyTorch: ${BASE_TORCH_VERSION}"
+if [ "${BASE_TORCH_VERSION}" != "${EXPECTED_TORCH_VERSION}" ]; then
+  echo "ERROR: base venv has torch ${BASE_TORCH_VERSION}; expected ${EXPECTED_TORCH_VERSION}" >&2
+  echo "Install the stable CUDA release in ${REMOTE_BASE_VENV} before rerunning this setup." >&2
+  exit 1
+fi
 
 # ---- Create cppmega venv from base ----
 rm -rf "${REMOTE_VENV}"
@@ -185,8 +190,9 @@ mkdir -p "${REMOTE_ROOT}/.triton-cache"
 
 # ---- Verification ----
 CLONED_TORCH_VERSION="$(python -c 'import torch; print(torch.__version__)')"
-if [ "${CLONED_TORCH_VERSION}" != "${BASE_TORCH_VERSION}" ]; then
-  echo "WARNING: venv torch drifted: ${CLONED_TORCH_VERSION} != ${BASE_TORCH_VERSION}" >&2
+if [ "${CLONED_TORCH_VERSION}" != "${EXPECTED_TORCH_VERSION}" ]; then
+  echo "ERROR: venv torch drifted: ${CLONED_TORCH_VERSION} != ${EXPECTED_TORCH_VERSION}" >&2
+  exit 1
 fi
 
 python -c "

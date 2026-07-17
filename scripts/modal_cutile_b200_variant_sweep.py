@@ -56,7 +56,8 @@ import modal
 # ---------------------------------------------------------------------------
 
 _PYTHON = "3.13"
-_TORCH_NIGHTLY_INDEX = "https://download.pytorch.org/whl/nightly/cu132"
+_TORCH_VERSION = "2.13.0+cu132"
+_TORCH_INDEX = "https://download.pytorch.org/whl/cu132"
 
 _PATCH_FILE = "/Volumes/external/sources/cppmega/scripts/_modal_patch_mamba_setup.py"
 
@@ -66,15 +67,14 @@ def _base_cutile_image() -> modal.Image:
     img = (
         base.apt_install("git", "build-essential", "ninja-build", "curl", "ca-certificates")
         .pip_install(
-            "torch==2.12.*",
+            f"torch=={_TORCH_VERSION}",
             "numpy>=1.26",
             "packaging",
             "wheel",
             "setuptools",
             "einops",
             "ninja",
-            extra_index_url=_TORCH_NIGHTLY_INDEX,
-            pre=True,
+            extra_index_url=_TORCH_INDEX,
         )
         .pip_install(
             "nvidia-cuda-nvcc",

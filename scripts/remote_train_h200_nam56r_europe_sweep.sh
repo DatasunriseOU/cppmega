@@ -9,7 +9,7 @@
 # --dsa-indexer-topk 256, --dsa-indexer-loss-coeff 0.001.
 #
 # Machine: europe h200_1 (LOCATION_2)
-# Stack: torch 2.12 nightly, megatron-core 0.18, TE 2.13, cuDNN 92000
+# Stack: torch 2.13 stable cu132, megatron-core 0.18, TE 2.13, cuDNN 92000
 set -euo pipefail
 
 REMOTE_ROOT="${REMOTE_ROOT:-/home/dave/cppmega-root}"

@@ -114,13 +114,13 @@
   </table></div>
 
   <h2>Dependabot: review 17 июля 2026</h2>
-  <p>Единственный alert <code>GHSA-rrmf-rvhw-rf47</code> относится только к <code>upstream_prs/examples/03_sparse_mla_fp8_dispatch/requirements.txt</code> и pinned <code>torch==2.12.0.dev20260410+cu132</code>. Это reproducer для конкретного H200 + Transformer Engine стека, не dependency wheel или runtime package cppmega. В reproducer нет вызова <code>torch.jit.script</code>, а advisory не указывает patched release. Pin сохранён ради воспроизводимости GPU case; это ограниченный operational risk, не production fix.</p>
+  <p>Alert <code>GHSA-rrmf-rvhw-rf47</code> закрыт заменой vulnerable reproducer pin <code>torch==2.12.0.dev20260410+cu132</code> на стабильный CUDA-релиз <code>torch==2.13.0+cu132</code>. Тот же стабильный pin теперь используется в <code>STACK.lock</code>, CUDA Docker и self-hosted wheel workflow; активные H200/B200 Modal-образы больше не разрешают nightly. <code>cppmega.mlx</code> уже имел стабильный <code>torch 2.13.0</code> в <code>uv.lock</code>, а optional Path C теперь явно требует именно этот релиз. Исторические отчёты о старых nightly-прогонах сохранены как история, но текущий production/reproducer contract больше не зависит от dev-сборки.</p>
 
   <h2>Остаточные риски</h2>
   <p class="warn">Локальный Mac не даёт доказательства H200/CUDA kernel runtime. Self-hosted workflow и contracts проверены, но GPU receipt должен быть получен на выделенном CUDA runner.</p>
   <p>Warnings Transformer Engine/Apex в dedicated Mac environment ожидаемы и не считаются GPU результатом.</p>
   <p>Repo-wide Ruff ещё содержит 202 legacy violations в нетронутых файлах; все Python-файлы production diff проходят pinned changed-file Ruff.</p>
-  <p>Dependabot alert по reproducer Torch остаётся отдельным operational risk и не считается закрытым production fix.</p>
+  <p>Для CUDA wheel ABI требуется пересобрать custom Transformer Engine и остальные C++/CUDA wheels после смены torch pin; локальный Mac не заменяет этот self-hosted GPU receipt.</p>
 
   <footer>Отчёт сгенерирован из текущего source tree; ссылки указывают на ветку hardening, а не на старые review notes.</footer>
 </main>

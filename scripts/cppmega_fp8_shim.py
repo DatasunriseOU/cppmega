@@ -3,8 +3,8 @@
 This module is the single source of truth for the runtime monkey-patches that
 cppmega training launches need to interoperate with upstream megatron-core +
 mamba-ssm + transformer-engine at the version pins currently deployed on our
-bench machines (torch 2.12 cu132, megatron-core 0.18rc0, TE 2.13, mamba_ssm
-2.3.1).
+bench machines (torch 2.13.0+cu132, megatron-core 0.18rc0, TE 2.13,
+mamba_ssm 2.3.1).
 
 Usage from a launch script::
 

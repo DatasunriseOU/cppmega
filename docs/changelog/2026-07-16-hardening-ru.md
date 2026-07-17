@@ -113,14 +113,14 @@
 
 ## Dependabot review: 17 июля 2026
 
-Открытый alert `GHSA-rrmf-rvhw-rf47` относится только к
-`upstream_prs/examples/03_sparse_mla_fp8_dispatch/requirements.txt` и pinned
-`torch==2.12.0.dev20260410+cu132`. Это reproducer для конкретного H200 +
-Transformer Engine стека, не dependency wheel или runtime package cppmega.
-В самом reproducer нет вызова `torch.jit.script`; patched release advisory не
-указывает. Pin не менялся, чтобы не разрушить воспроизводимость GPU case. Alert
-классифицирован как ограниченный tolerable risk, а не как исправленная
-production dependency.
+Alert `GHSA-rrmf-rvhw-rf47` был закрыт заменой vulnerable reproducer pin
+`torch==2.12.0.dev20260410+cu132` на стабильный CUDA-релиз
+`torch==2.13.0+cu132`. Тот же стабильный pin теперь используется в
+`STACK.lock`, CUDA Docker и self-hosted wheel workflow; активные H200/B200
+Modal-образы больше не разрешают nightly. `cppmega.mlx` уже имел стабильный
+`torch 2.13.0` в `uv.lock`, а optional Path C теперь явно требует именно этот
+релиз. Исторические отчёты о старых nightly-прогонах сохранены как история,
+но текущий production/reproducer contract больше не зависит от dev-сборки.
 
 Команда полного теста:
 

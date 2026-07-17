@@ -14,7 +14,7 @@
 #
 # Prerequisites:
 #   - europe stack: ${REMOTE_ROOT:-/home/dave/cppmega-root}/cppmega-venv,
-#     torch 2.12+cu132, mamba_ssm 2.3.1, TE 2.13, Megatron 0.18
+#     torch 2.13.0+cu132, mamba_ssm 2.3.1, TE 2.13, Megatron 0.18
 #   - commit a9ebb78+ (post-dd4da34 unconditional patches)
 #   - Dataset prepared via scripts/data_prep_parquet_to_megatron.py
 #

@@ -58,14 +58,15 @@ from dataclasses import dataclass, field
 
 import modal
 
-# Base image: heavy stack (torch 2.12 cu132 / TE 2.13 / mamba_ssm / TileLang
+# Base image: heavy stack (torch 2.13 stable cu132 / TE 2.13 / mamba_ssm / TileLang
 # dev / flash-attn / Megatron dev). Inlined for Modal packaging; identical
 # definition to scripts/modal_cppmega_base.py — same content hash → layers
 # share Modal's cache across both apps.
 _REPO_ROOT = pathlib.Path(__file__).parent.parent
 CUDA_BASE = "nvidia/cuda:13.2.0-cudnn-devel-ubuntu24.04"
 PYTHON_VERSION = "3.13"
-TORCH_NIGHTLY_INDEX = "https://download.pytorch.org/whl/nightly/cu132"
+TORCH_VERSION = "2.13.0+cu132"
+TORCH_INDEX = "https://download.pytorch.org/whl/cu132"
 MEGATRON_COMMIT = "980211ae"
 _WHEELS_DIR = "/tmp/cppmega_wheels"
 _WHEEL_FILES = [
@@ -98,12 +99,11 @@ def cppmega_base_image() -> modal.Image:
             "PYTHONPATH": "/opt/megatron-lm",
         })
         .pip_install(
-            "torch==2.12.*",
+            f"torch=={TORCH_VERSION}",
             "numpy>=1.26", "packaging", "wheel", "setuptools", "ninja",
             "einops", "pybind11", "pyyaml", "regex",
             "sentencepiece", "tiktoken", "six", "scipy",
-            extra_index_url=TORCH_NIGHTLY_INDEX,
-            pre=True,
+            extra_index_url=TORCH_INDEX,
         )
         .pip_install(
             "apache-tvm-ffi==0.1.9",

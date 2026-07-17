@@ -249,7 +249,7 @@ class CppmegaEnvironmentTests(unittest.TestCase):
             (checkout / "cppmega").mkdir()
             (checkout / "cppmega" / "__init__.py").write_text("\n", encoding="utf-8")
             (checkout / "STACK.lock").write_text(
-                """base:\n  python: '3.13'\n  torch: '2.13.0.dev20260611+cu132'\nsources:\n  megatron_lm:\n    ref: fixture\n""",
+                """base:\n  python: '3.13'\n  torch: '2.13.0+cu132'\nsources:\n  megatron_lm:\n    ref: fixture\n""",
                 encoding="utf-8",
             )
             commit = _make_source(source)
@@ -367,7 +367,7 @@ class CppmegaEnvironmentTests(unittest.TestCase):
             (checkout / "cppmega").mkdir()
             (checkout / "cppmega" / "__init__.py").write_text("\n", encoding="utf-8")
             (checkout / "STACK.lock").write_text(
-                """base:\n  python: '3.13'\n  torch: '2.13.0.dev20260611+cu132'\nsources:\n  megatron_lm:\n    ref: fixture\n""",
+                """base:\n  python: '3.13'\n  torch: '2.13.0+cu132'\nsources:\n  megatron_lm:\n    ref: fixture\n""",
                 encoding="utf-8",
             )
             commit = _make_source(source)

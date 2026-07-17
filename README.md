@@ -439,7 +439,7 @@ local `dev_latest` branch until noted otherwise.
 
 ### Software Stack
 
-- PyTorch 2.12 nightly + cu132
+- PyTorch 2.13.0 stable + cu132
 - Transformer Engine 2.13
 - TileLang 0.1.8+cuda.gitf309d814 (main-branch build; install via `scripts/install_tilelang_wheel.sh` or source)
 - mamba-ssm 2.3.1

@@ -20,8 +20,10 @@ The template proposes two fixes, both validated here:
 
 - Requires a GPU with FP8 support: H100 / H200 / B200 (sm_90+), Ada
   sm_89, or GB10 sm_121a.
-- Verified on h200_1 (H200, sm_90, torch 2.12 cu132,
-  transformer-engine 2.13.0, cppmega editable install).
+- The stable revalidation target is h200_1 (H200, sm_90, torch 2.13.0+cu132,
+  transformer-engine 2.13.0, cppmega editable install). The earlier receipt
+  used the superseded nightly; rerun the GPU smoke after rebuilding the CUDA
+  extension wheels against this release.
 - See `requirements.txt` for the exact pinned stack.
 
 ## Running
