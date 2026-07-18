@@ -15,9 +15,15 @@ from cppmega.megatron.graph_recipe import (
     stage1_graph_recipe_binding,
 )
 from cppmega.megatron.objective_contract import (
+    GRAPH_ELIGIBILITY_RECEIPT_SCHEMA,
     LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
     OBJECTIVE_CONTRACT_SCHEMA,
     OBJECTIVE_IDS,
+    OBJECTIVE_SCHEDULE_ALGORITHM,
+    OBJECTIVE_SCHEDULE_RECEIPT_SCHEMA,
+    OBJECTIVE_SCHEDULE_WINDOW_SCHEMA,
+    OBJECTIVE_SOURCE_RESUME_SCHEMA,
+    OBJECTIVE_SOURCE_SELECTION_SCHEMA,
     OBJECTIVE_GRAPH_SIDECARS,
     OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA,
     OBJECTIVE_TOKEN_SIDE_CHANNELS,
@@ -36,6 +42,93 @@ TASKS = (
     "commit_diff",
     "pre_to_post",
 )
+
+
+def _source_selection_receipt() -> dict[str, object]:
+    relations = list(STAGE1_GRAPH_RELATIONS)
+    assignments = []
+    for index, task in enumerate(TASKS):
+        eligible = index == 0
+        route_mode = "identity" if task == "causal_lm" else (
+            "excluded" if task in {"commit_diff", "pre_to_post"} else "source_token_remap"
+        )
+        reason = None if eligible else (
+            "exact_source_route_map_unavailable"
+            if route_mode == "excluded"
+            else "no_configured_graph_positive_causal_same_document_pair"
+        )
+        assignments.append(
+            {
+                "source_index": index,
+                "source_pool_index": index,
+                "task": task,
+                "graph_eligibility": {
+                    "schema": GRAPH_ELIGIBILITY_RECEIPT_SCHEMA,
+                    "objective": task,
+                    "eligible": eligible,
+                    "reason": reason,
+                    "positive_edges": 5 if eligible else 0,
+                    "relations": relations,
+                    "route_mode": route_mode,
+                    "route_receipt": {"mode": route_mode},
+                },
+            }
+        )
+    window = {
+        "schema": OBJECTIVE_SCHEDULE_WINDOW_SCHEMA,
+        "algorithm": OBJECTIVE_SCHEDULE_ALGORITHM,
+        "start_step": 0,
+        "output_samples": len(TASKS),
+        "source_pool_samples": len(TASKS),
+        "source_rows_consumed": len(TASKS),
+        "selected_source_indices": list(range(len(TASKS))),
+        "task_counts": {task: 1 for task in TASKS},
+        "assignments": assignments,
+        "graph_positive_assignments": 1,
+        "graph_positive_edges": 5,
+    }
+    digest = hashlib.sha256(
+        json.dumps([window], sort_keys=True, separators=(",", ":")).encode("ascii")
+    ).hexdigest()
+    return {
+        "schema": OBJECTIVE_SOURCE_SELECTION_SCHEMA,
+        "algorithm": OBJECTIVE_SCHEDULE_ALGORITHM,
+        "output_samples": len(TASKS),
+        "source_rows_consumed": len(TASKS),
+        "unused_buffered_sources": 0,
+        "quota_window_samples": len(TASKS),
+        "quota_lookahead_samples": 0,
+        "max_source_pool_samples": len(TASKS),
+        "max_source_pool_observed": len(TASKS),
+        "required_graph_relations": relations,
+        "windows": [window],
+        "windows_sha256": digest,
+        "resume": {
+            "schema": OBJECTIVE_SOURCE_RESUME_SCHEMA,
+            "cursor_semantics": (
+                "replay_buffered_rows_then_continue_after_last_yielded_v1"
+            ),
+            "last_yielded_cursor": {"source_index": len(TASKS) - 1},
+            "buffered_source_cursors": [],
+        },
+        "schedule": {
+            "schema": OBJECTIVE_SCHEDULE_RECEIPT_SCHEMA,
+            "algorithm": OBJECTIVE_SCHEDULE_ALGORITHM,
+            "windows_sha256": digest,
+        },
+    }
+
+
+def _refresh_source_selection_digest(receipt: dict[str, object]) -> None:
+    digest = hashlib.sha256(
+        json.dumps(
+            receipt["windows"],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    ).hexdigest()
+    receipt["windows_sha256"] = digest
+    receipt["schedule"]["windows_sha256"] = digest  # type: ignore[index]
 
 
 def _valid_contract() -> dict[str, object]:
@@ -180,6 +273,49 @@ def test_valid_contract_has_stable_digest_and_distinct_objective_ids() -> None:
     assert len(first.sha256) == 64
     assert set(first.planned_samples) == set(TASKS)
     assert OBJECTIVE_IDS["ifim"] != OBJECTIVE_IDS["ast_fim"]
+
+
+def test_contract_validates_canonical_bounded_schedule_receipt() -> None:
+    contract = _valid_contract()
+    contract["source_selection"] = _source_selection_receipt()
+
+    validated = validate_objective_contract(contract)
+
+    assert validated.payload["source_selection"] == contract["source_selection"]
+
+
+def test_contract_rejects_materializer_runner_assignment_divergence() -> None:
+    contract = _valid_contract()
+    source_selection = _source_selection_receipt()
+    source_selection["windows"][0]["selected_source_indices"] = [  # type: ignore[index]
+        1,
+        0,
+        2,
+        3,
+        4,
+        5,
+    ]
+    _refresh_source_selection_digest(source_selection)
+    contract["source_selection"] = source_selection
+
+    with pytest.raises(ValueError, match="selected_source_indices drifted"):
+        validate_objective_contract(contract)
+
+
+def test_contract_requires_explicit_commit_graph_ineligibility_receipt() -> None:
+    contract = _valid_contract()
+    source_selection = _source_selection_receipt()
+    assignments = source_selection["windows"][0]["assignments"]  # type: ignore[index]
+    commit = next(row for row in assignments if row["task"] == "commit_diff")
+    commit["graph_eligibility"]["route_mode"] = "source_token_remap"
+    commit["graph_eligibility"]["route_receipt"]["mode"] = (
+        "source_token_remap"
+    )
+    _refresh_source_selection_digest(source_selection)
+    contract["source_selection"] = source_selection
+
+    with pytest.raises(ValueError, match="commit objectives without exact route maps"):
+        validate_objective_contract(contract)
 
 
 def test_objective_materialization_artifact_opens_exact_bound_inputs(
