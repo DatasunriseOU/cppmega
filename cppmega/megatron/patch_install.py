@@ -25,6 +25,8 @@ import importlib
 import os
 from dataclasses import dataclass
 
+from cppmega.megatron.graph_objective_loss import resolve_graph_bias_beta
+
 
 def _env_bool(
     name: str,
@@ -156,9 +158,7 @@ class CppMegaFeatureConfig:
             graph_attention_cross_domain_weight=_env_float(
                 "CPPMEGA_GRAPH_ATTENTION_CROSS_DOMAIN_WEIGHT", 1.0, source=source
             ),
-            dsa_graph_bias_beta=_env_float(
-                "CPPMEGA_DSA_GRAPH_BIAS_BETA", 1.0, source=source
-            ),
+            dsa_graph_bias_beta=resolve_graph_bias_beta(source),
         )
         # The DENSE flag DEFAULTS on but is gated by routes at runtime
         # (graph_dense_bias_enabled() returns False when routes are off), so a

@@ -65,6 +65,12 @@ from contextvars import ContextVar, Token
 
 import torch
 
+from cppmega.megatron.graph_objective_loss import (
+    graph_bias_beta_binding,
+    resolve_graph_bias_beta,
+    validate_graph_bias_beta,
+)
+
 log = logging.getLogger(__name__)
 
 __all__ = [
@@ -462,6 +468,7 @@ def build_graph_route_bias_from_structure_batch(
     diagnostic_weight: float = 1.0,
     cross_domain_weight: float = 1.0,
     consumer: str | None = None,
+    bias_beta: float | None = None,
 ) -> torch.Tensor:
     """Build ``S_graph[b,t,s]`` from cppmega graph route sidecars.
 
@@ -559,6 +566,7 @@ def build_graph_route_bias_from_structure_batch(
             prior=bias,
             consumer=consumer,
             receipt_path=receipt_path,
+            bias_beta=bias_beta,
         )
     return bias
 
@@ -569,6 +577,7 @@ def _current_graph_route_bias(
     seqlen_q: int,
     seqlen_k: int,
     device: torch.device,
+    bias_beta: float | None = None,
 ) -> torch.Tensor:
     override = _GRAPH_BATCH_OVERRIDE.get()
     if override is _NO_GRAPH_BATCH:
@@ -584,6 +593,11 @@ def _current_graph_route_bias(
         structure_batch = _get_current_structure_batch()
     else:
         structure_batch = override
+    effective_beta = (
+        resolve_graph_bias_beta()
+        if bias_beta is None
+        else validate_graph_bias_beta(bias_beta)
+    )
     return build_graph_route_bias_from_structure_batch(
         structure_batch,
         batch_size=batch_size,
@@ -599,6 +613,7 @@ def _current_graph_route_bias(
         diagnostic_weight=_env_float("CPPMEGA_DSA_GRAPH_DIAGNOSTIC_WEIGHT", 1.0),
         cross_domain_weight=_env_float("CPPMEGA_DSA_GRAPH_CROSS_DOMAIN_WEIGHT", 1.0),
         consumer="dsa_indexer",
+        bias_beta=effective_beta,
     )
 
 
@@ -818,9 +833,9 @@ def _graph_objective_from_index_scores(
         seqlen_q=seqlen_q,
         seqlen_k=seqlen_k,
         device=index_scores.device,
+        bias_beta=config.bias_beta,
     )
     neural_scores = index_scores.float() - config.bias_beta * route_bias
-    pair_mask = pair_mask & torch.isfinite(neural_scores)
     graph_loss, _components = graph_auxiliary_loss(
         neural_scores,
         targets.to(dtype=neural_scores.dtype),
@@ -1115,13 +1130,16 @@ def _patch_fused_dsa_autograd(dsa_mod) -> None:
                     GraphAuxiliaryLossConfig,
                 )
 
+                receipt_config = GraphAuxiliaryLossConfig.from_env()
+
                 _emit_runtime_receipt(
                     "CPPMEGA_DSA_GRAPH_OBJECTIVE",
                     {
                         "layer_number": layer_number,
                         "actual_dsa_module": _qualified_name(dsa_mod.DSAttention),
-                        "effective_coefficient": (
-                            GraphAuxiliaryLossConfig.from_env().indexer_weight
+                        "effective_coefficient": receipt_config.indexer_weight,
+                        "bias_beta": graph_bias_beta_binding(
+                            receipt_config.bias_beta
                         ),
                         "graph_loss": float(graph_loss.detach().float().item()),
                     },
@@ -1158,7 +1176,7 @@ def compute_index_scores_fused_bf16(
     use_relu: bool = True,
     *,
     graph_bias: torch.Tensor | None = None,
-    graph_beta: float | torch.Tensor = 1.0,
+    graph_beta: float | torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Drop-in replacement for Megatron DSA ``_compute_index_scores`` (BF16).
 
@@ -1172,7 +1190,8 @@ def compute_index_scores_fused_bf16(
         k: ``[seqlen_k, batch, index_head_dim]``.
         use_relu: match upstream's ``use_relu`` flag.
         graph_bias: optional dense ``S_graph`` prior ``[batch, seqlen_q, seqlen_k]``.
-        graph_beta: scalar multiplier for ``graph_bias``.
+        graph_beta: scalar multiplier for ``graph_bias``. If omitted, the
+            canonical runtime beta is resolved from the graph contract.
 
     Returns:
         ``[batch, seqlen_q, seqlen_k]`` FP32 index scores.
@@ -1223,6 +1242,8 @@ def compute_index_scores_fused_bf16(
             raise ValueError(
                 f"graph_bias must be ({b},{sq},{sk}), got {tuple(graph_bias.shape)}"
             )
+        if graph_beta is None:
+            graph_beta = resolve_graph_bias_beta()
         beta = (
             graph_beta.to(device=q.device, dtype=torch.float32)
             if isinstance(graph_beta, torch.Tensor)
@@ -1265,13 +1286,14 @@ def apply_dsa_indexer_fused_patch(*, force: bool = False) -> bool:
         if _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
             sq, b, _h, _d = q.shape
             sk = k.shape[0]
+            graph_beta = resolve_graph_bias_beta()
             graph_bias = _current_graph_route_bias(
                 batch_size=int(b),
                 seqlen_q=int(sq),
                 seqlen_k=int(sk),
                 device=q.device,
+                bias_beta=graph_beta,
             )
-            graph_beta = _env_float("CPPMEGA_DSA_GRAPH_BIAS_BETA", 1.0)
         return compute_index_scores_fused_bf16(
             q,
             weights,

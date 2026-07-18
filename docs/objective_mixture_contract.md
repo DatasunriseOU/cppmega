@@ -100,7 +100,10 @@ export CPPMEGA_DSA_GRAPH_AUX_WEIGHT=1.0
 export CPPMEGA_DSA_GRAPH_BCE_WEIGHT=0.10
 export CPPMEGA_DSA_GRAPH_COVERAGE_WEIGHT=0.05
 export CPPMEGA_DSA_GRAPH_AUX_TOPK=256
-export CPPMEGA_DSA_GRAPH_BIAS_BETA=1
+export CPPMEGA_GRAPH_BIAS_BETA=1
+# Legacy aliases are accepted only when they exactly match the canonical beta.
+# export CPPMEGA_DSA_GRAPH_BIAS_BETA=1
+# export CPPMEGA_GRAPH_ATTENTION_BIAS_BETA=1
 export CPPMEGA_DSA_GRAPH_POS_WEIGHT=1.0
 export CPPMEGA_DSA_GRAPH_MARGIN=1.0
 export CPPMEGA_OBJECTIVE_CONTRACT_REQUIRED=1
@@ -111,15 +114,21 @@ construction also requires a positive `dsa_indexer_loss_coeff` and
 `dsa_indexer_use_sparse_loss=False`; otherwise the graph objective cannot reach
 the autograd-carried DSA loss and construction fails. The weighted graph BCE
 and top-k coverage terms are added directly to Megatron's dense DSA indexer
-loss. Pairs with non-finite indexer scores are excluded from BCE, positive-edge
-normalization, and coverage.
+loss. Non-finite scores on negative or otherwise masked pairs are excluded from
+BCE, positive-edge normalization, and coverage. A positive graph target paired
+with a non-finite score is an invalid batch and fails closed; it must never be
+converted into zero positives or zero loss.
 
 When graph routes are enabled, the fused DSA score passed to selector top-k is
-exactly `I_neural + beta*S_graph`, with `beta` bound by the recipe and applied
-before top-k. The graph auxiliary loss removes that fixed prior before
-supervising the neural score, so the selector prior cannot silently become a
-token-only or post-top-k side path. A contract that declares graph loss included
-in total loss is rejected unless the DSA graph auxiliary flag is enabled.
+exactly `I_neural + beta*S_graph`, with one resolved beta shared by DSA, dense
+attention, and graph-loss subtraction. The canonical runtime name is
+`CPPMEGA_GRAPH_BIAS_BETA`; the historical DSA and dense names are compatibility
+aliases and a mismatch between any present names is rejected. Runtime graph
+prior receipts carry the exact rational beta binding. The graph auxiliary loss
+removes that fixed prior before supervising the neural score, so the selector
+prior cannot silently become a token-only or post-top-k side path. A contract
+that declares graph loss included in total loss is rejected unless the DSA graph
+auxiliary flag is enabled.
 
 Dataset ingress validates the embedded digest and requires the objective-ID
 sidecar byte count to equal the indexed document count. Legacy indexed prefixes

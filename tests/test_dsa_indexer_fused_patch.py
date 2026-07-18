@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import json
+import os
 from types import MethodType, SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -239,6 +242,61 @@ def test_fused_scores_reject_nonpositive_graph_beta():
             graph_bias=graph_bias,
             graph_beta=0.0,
         )
+
+
+def test_fused_scores_use_canonical_graph_beta_by_default():
+    q = torch.zeros((2, 1, 1, 4), dtype=torch.bfloat16)
+    k = torch.zeros((2, 1, 4), dtype=torch.bfloat16)
+    weights = torch.ones((2, 1, 1), dtype=torch.bfloat16)
+    graph_bias = torch.zeros((1, 2, 2), dtype=torch.float32)
+    graph_bias[0, 1, 0] = 1.0
+
+    with patch.dict(
+        os.environ,
+        {"CPPMEGA_GRAPH_BIAS_BETA": "3"},
+        clear=True,
+    ):
+        scores = compute_index_scores_fused_bf16(
+            q,
+            weights,
+            k,
+            graph_bias=graph_bias,
+        )
+
+    assert scores[0, 1, 0].item() == 3.0
+
+
+def test_dsa_graph_prior_receipt_binds_canonical_beta(tmp_path):
+    from cppmega.megatron import dsa_indexer_fused_patch as fused_patch
+
+    structure_batch = {
+        "graph_domain_edges": torch.tensor([[[1, 3, 5]]], dtype=torch.long),
+        "graph_domain_edge_counts": torch.tensor([1], dtype=torch.long),
+    }
+    receipt_path = tmp_path / "dsa-prior.json"
+    token = fused_patch._set_graph_batch_override(structure_batch)
+    try:
+        with patch.dict(
+            os.environ,
+            {
+                "CPPMEGA_GRAPH_BIAS_BETA": "2",
+                "CPPMEGA_H200_GRAPH_PRIOR_RECEIPT": str(receipt_path),
+            },
+            clear=True,
+        ):
+            bias = fused_patch._current_graph_route_bias(
+                batch_size=1,
+                seqlen_q=4,
+                seqlen_k=4,
+                device=torch.device("cpu"),
+            )
+    finally:
+        fused_patch._reset_graph_batch_override(token)
+
+    assert bias[0, 1, 3].item() == 1.0
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["consumer"] == "dsa_indexer"
+    assert receipt["bias_beta"]["value"] == "2"
 
 
 def test_scatter_edges_vectorized_matches_reference_loop():

@@ -25,6 +25,10 @@ from cppmega.megatron.dsa_indexer_fused_patch import (
     _scatter_edges_,
     build_graph_route_bias_from_structure_batch,
 )
+from cppmega.megatron.graph_objective_loss import (
+    resolve_graph_bias_beta,
+    validate_graph_bias_beta,
+)
 
 log = logging.getLogger(__name__)
 
@@ -124,7 +128,7 @@ def build_dense_graph_attention_bias_from_structure_batch(
     shell_weight: float = 1.0,
     diagnostic_weight: float = 1.0,
     cross_domain_weight: float = 1.0,
-    beta: float = 1.0,
+    beta: float | None = None,
 ) -> torch.Tensor:
     """Build TE-compatible dense attention bias ``[B,1,Sq,Sk]``.
 
@@ -134,6 +138,11 @@ def build_dense_graph_attention_bias_from_structure_batch(
     head dimension here.
     """
 
+    effective_beta = (
+        resolve_graph_bias_beta()
+        if beta is None
+        else validate_graph_bias_beta(beta)
+    )
     # ponytail: the real fix for long context is a block-sparse bias carrying
     # only the handful of edges; this cap is the fail-loud guard against a
     # silent multi-GiB dense [B,1,Sq,Sk] blowup (bf16 is 4 GiB at B=8,S=16384).
@@ -186,8 +195,8 @@ def build_dense_graph_attention_bias_from_structure_batch(
             sk=seqlen_k,
             require_kind=False,
         )
-    if beta != 1.0:
-        graph = graph * float(beta)
+    if effective_beta != 1.0:
+        graph = graph * effective_beta
     bias = graph.unsqueeze(1).contiguous()
     receipt_path = os.environ.get("CPPMEGA_H200_GRAPH_PRIOR_RECEIPT")
     if receipt_path:
@@ -197,6 +206,7 @@ def build_dense_graph_attention_bias_from_structure_batch(
             prior=bias,
             consumer="dense_attention",
             receipt_path=receipt_path,
+            bias_beta=effective_beta,
         )
     return bias
 
@@ -217,10 +227,15 @@ def build_rectangular_graph_attention_bias_from_structure_batch(
     shell_weight: float = 1.0,
     diagnostic_weight: float = 1.0,
     cross_domain_weight: float = 1.0,
-    beta: float = 1.0,
+    beta: float | None = None,
 ) -> torch.Tensor:
     """Build ``[B,1,new-query,cached-key]`` graph bias in global token space."""
 
+    effective_beta = (
+        resolve_graph_bias_beta()
+        if beta is None
+        else validate_graph_bias_beta(beta)
+    )
     if structure_batch is None:
         raise RuntimeError(
             "incremental graph decode has no prompt graph structure batch"
@@ -354,8 +369,8 @@ def build_rectangular_graph_attention_bias_from_structure_batch(
         )
     if not seen_relation:
         raise KeyError("prompt graph inference state contains no route tensors")
-    if beta != 1.0:
-        bias.mul_(float(beta))
+    if effective_beta != 1.0:
+        bias.mul_(effective_beta)
     return bias.unsqueeze(1).contiguous()
 
 
@@ -480,6 +495,7 @@ def _graph_attention_bias_for_layer(
         raise RuntimeError(
             "dense graph-route attention bias does not support context_parallel_size > 1 yet"
         )
+    beta = resolve_graph_bias_beta()
     if inference_context is not None:
         state = _prompt_graph_inference_state(inference_context)
         offset = getattr(inference_context, "sequence_len_offset", None)
@@ -510,7 +526,7 @@ def _graph_attention_bias_for_layer(
             shell_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_SHELL_WEIGHT", 1.0),
             diagnostic_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_DIAGNOSTIC_WEIGHT", 1.0),
             cross_domain_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_CROSS_DOMAIN_WEIGHT", 1.0),
-            beta=_env_float("CPPMEGA_GRAPH_ATTENTION_BIAS_BETA", 1.0),
+            beta=beta,
         )
 
     from cppmega.megatron.structure_dataset_patch import _get_current_structure_batch
@@ -529,7 +545,7 @@ def _graph_attention_bias_for_layer(
         shell_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_SHELL_WEIGHT", 1.0),
         diagnostic_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_DIAGNOSTIC_WEIGHT", 1.0),
         cross_domain_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_CROSS_DOMAIN_WEIGHT", 1.0),
-        beta=_env_float("CPPMEGA_GRAPH_ATTENTION_BIAS_BETA", 1.0),
+        beta=beta,
     )
 
 

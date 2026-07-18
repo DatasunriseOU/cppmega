@@ -1,5 +1,6 @@
 import json
 import os
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -89,7 +90,76 @@ def test_dense_attention_consumer_records_nonzero_graph_prior(tmp_path, monkeypa
     assert bias[0, 0, 1, 3].item() == 1.0
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["consumer"] == "dense_attention"
+    assert receipt["bias_beta"] == {
+        "canonical_env": "CPPMEGA_GRAPH_BIAS_BETA",
+        "legacy_envs": [
+            "CPPMEGA_DSA_GRAPH_BIAS_BETA",
+            "CPPMEGA_GRAPH_ATTENTION_BIAS_BETA",
+        ],
+        "value": "1",
+    }
     assert receipt["prior"]["nonzero"] == 1
+
+
+def test_dense_graph_attention_bias_rejects_dsa_dense_beta_drift():
+    structure_batch = {
+        "graph_domain_edges": torch.tensor([[[1, 3, 5]]], dtype=torch.long),
+        "graph_domain_edge_counts": torch.tensor([1], dtype=torch.long),
+    }
+    _set_current_structure_batch(structure_batch)
+    try:
+        with patch.dict(
+            os.environ,
+            {
+                "CPPMEGA_GRAPH_ROUTES_ENABLED": "1",
+                "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS": "1",
+                "CPPMEGA_DSA_GRAPH_BIAS_BETA": "2",
+                "CPPMEGA_GRAPH_ATTENTION_BIAS_BETA": "3",
+            },
+            clear=False,
+        ):
+            with pytest.raises(ValueError, match="beta.*differ"):
+                _graph_attention_bias_for_layer(
+                    _Layer(_DenseSelfAttention()),
+                    torch.zeros(4, 1, 8),
+                )
+    finally:
+        _set_current_structure_batch(None)
+
+
+def test_dense_graph_attention_bias_uses_canonical_beta():
+    structure_batch = {
+        "graph_domain_edges": torch.tensor([[[1, 3, 5]]], dtype=torch.long),
+        "graph_domain_edge_counts": torch.tensor([1], dtype=torch.long),
+    }
+    _set_current_structure_batch(structure_batch)
+    try:
+        with patch.dict(
+            os.environ,
+            {
+                "CPPMEGA_GRAPH_ROUTES_ENABLED": "1",
+                "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS": "1",
+                "CPPMEGA_GRAPH_BIAS_BETA": "2",
+            },
+            clear=True,
+        ):
+            bias = _graph_attention_bias_for_layer(
+                _Layer(_DenseSelfAttention()),
+                torch.zeros(4, 1, 8),
+            )
+            direct_bias = build_dense_graph_attention_bias_from_structure_batch(
+                structure_batch,
+                batch_size=1,
+                seqlen_q=4,
+                seqlen_k=4,
+                device=torch.device("cpu"),
+            )
+    finally:
+        _set_current_structure_batch(None)
+
+    assert bias is not None
+    assert bias[0, 0, 1, 3].item() == 2.0
+    assert direct_bias[0, 0, 1, 3].item() == 2.0
 
 
 def test_attention_layer_route_kind_only_biases_dense_attention():

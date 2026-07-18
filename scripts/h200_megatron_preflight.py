@@ -41,6 +41,8 @@ from cppmega.receipt_binding import (  # noqa: E402
     validate_receipt_binding,
 )
 from cppmega.megatron.graph_objective_loss import (  # noqa: E402
+    graph_bias_beta_binding,
+    resolve_graph_bias_beta,
     validate_runtime_graph_contract,
 )
 
@@ -554,7 +556,11 @@ def _load_backend_dispatch_receipt(
     return receipt
 
 
-def _validate_graph_prior_receipt(receipt: object) -> dict[str, object]:
+def _validate_graph_prior_receipt(
+    receipt: object,
+    *,
+    expected_beta: float | None = None,
+) -> dict[str, object]:
     if not isinstance(receipt, dict):
         raise RuntimeError("DSA graph prior receipt must be an object")
     if receipt.get("status") != "verified":
@@ -563,6 +569,8 @@ def _validate_graph_prior_receipt(receipt: object) -> dict[str, object]:
         raise RuntimeError(
             "DSA graph prior receipt consumer must be exactly dsa_indexer"
         )
+    if receipt.get("bias_beta") != graph_bias_beta_binding(expected_beta):
+        raise RuntimeError("DSA graph prior receipt beta binding is missing or stale")
     prior = receipt.get("prior")
     if not isinstance(prior, dict) or int(prior.get("nonzero", 0)) <= 0:
         raise RuntimeError("DSA graph prior receipt lacks a nonzero prior")
@@ -573,6 +581,7 @@ def _dsa_graph_gradient_evidence(
     text: str,
     *,
     expected_coefficient: float,
+    expected_beta: float | None = None,
 ) -> dict[str, object]:
     objective_records: list[dict[str, object]] = []
     gradient_records: list[dict[str, object]] = []
@@ -611,6 +620,11 @@ def _dsa_graph_gradient_evidence(
             raise RuntimeError(
                 "DSA graph receipt coefficient differs from the configured indexer coefficient"
             )
+        if (
+            expected_beta is not None
+            and record.get("bias_beta") != graph_bias_beta_binding(expected_beta)
+        ):
+            raise RuntimeError("DSA graph receipt beta binding is missing or stale")
         coefficients.append(coefficient)
 
     for record in gradient_records:
@@ -1102,6 +1116,7 @@ def _run_phase(
     dsa_graph_gradient = _dsa_graph_gradient_evidence(
         text,
         expected_coefficient=float(environment["CPPMEGA_DSA_INDEXER_LOSS_COEFF"]),
+        expected_beta=resolve_graph_bias_beta(environment),
     )
     load_evidence = (
         _checkpoint_load_evidence(
@@ -1141,7 +1156,10 @@ def _run_phase(
             f"H200 preflight {name} did not record graph-prior consumption"
         )
     graph_prior = json.loads(graph_prior_receipt.read_text(encoding="utf-8"))
-    _validate_graph_prior_receipt(graph_prior)
+    _validate_graph_prior_receipt(
+        graph_prior,
+        expected_beta=resolve_graph_bias_beta(environment),
+    )
     if not checkpoint_state_receipt.is_file():
         raise RuntimeError(
             f"H200 preflight {name} did not record checkpoint runtime state"

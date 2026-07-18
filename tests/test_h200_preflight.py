@@ -220,6 +220,7 @@ def test_observe_graph_prior_requires_nonzero_consumer_input(tmp_path):
 
     assert receipt["status"] == "verified"
     assert receipt["consumer"] == "dense_attention"
+    assert receipt["bias_beta"]["value"] == "1"
     assert receipt["prior"]["nonzero"] == 1
 
     with pytest.raises(RuntimeError, match="graph prior.*nonzero"):
@@ -227,6 +228,24 @@ def test_observe_graph_prior_requires_nonzero_consumer_input(tmp_path):
             prior=torch.zeros((1, 1, 2, 2)),
             consumer="dsa_indexer",
             receipt_path=tmp_path / "zero.json",
+        )
+
+
+def test_observe_graph_prior_rejects_stale_beta_receipt(tmp_path):
+    receipt_path = tmp_path / "prior.json"
+    observe_graph_prior(
+        prior=torch.tensor([[[[0.0, 2.0], [0.0, 0.0]]]]),
+        consumer="dsa_indexer",
+        receipt_path=receipt_path,
+        bias_beta=1.0,
+    )
+
+    with pytest.raises(RuntimeError, match="receipt beta"):
+        observe_graph_prior(
+            prior=torch.tensor([[[[0.0, 2.0], [0.0, 0.0]]]]),
+            consumer="dsa_indexer",
+            receipt_path=receipt_path,
+            bias_beta=2.0,
         )
 
 

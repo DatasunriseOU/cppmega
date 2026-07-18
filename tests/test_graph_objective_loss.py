@@ -5,9 +5,13 @@ import torch
 from types import SimpleNamespace
 
 from cppmega.megatron.graph_objective_loss import (
+    GRAPH_BIAS_BETA_ENV,
+    GRAPH_BIAS_BETA_LEGACY_ENVS,
     GraphAuxiliaryLossConfig,
+    graph_bias_beta_binding,
     graph_auxiliary_loss,
     require_active_dsa_graph_objective,
+    resolve_graph_bias_beta,
     validate_runtime_graph_contract,
 )
 from cppmega.megatron.graph_recipe import (
@@ -155,7 +159,7 @@ def test_graph_loss_sanitizes_non_finite_masked_scores_and_gradients() -> None:
     assert torch.count_nonzero(scores.grad).item() > 0
 
 
-def test_graph_loss_excludes_positive_targets_at_non_finite_scores() -> None:
+def test_graph_loss_rejects_positive_targets_at_non_finite_scores() -> None:
     scores = torch.tensor(
         [[[0.0, float("inf"), -1.0], [0.0, 0.0, 0.0]]],
         dtype=torch.float32,
@@ -164,8 +168,6 @@ def test_graph_loss_excludes_positive_targets_at_non_finite_scores() -> None:
         [[[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]],
         dtype=torch.float32,
     )
-    reference_targets = targets.clone()
-    reference_targets[0, 0, 1] = 0.0
     pair_mask = torch.ones_like(scores, dtype=torch.bool)
     config = GraphAuxiliaryLossConfig(
         global_weight=1.0,
@@ -178,23 +180,13 @@ def test_graph_loss_excludes_positive_targets_at_non_finite_scores() -> None:
         margin=3.0,
     )
 
-    loss, components = graph_auxiliary_loss(
-        scores,
-        targets,
-        pair_mask=pair_mask,
-        config=config,
-    )
-    reference_loss, reference_components = graph_auxiliary_loss(
-        scores,
-        reference_targets,
-        pair_mask=pair_mask,
-        config=config,
-    )
-
-    torch.testing.assert_close(
-        components["coverage"], reference_components["coverage"]
-    )
-    torch.testing.assert_close(loss, reference_loss)
+    with pytest.raises(ValueError, match="positive graph target.*non-finite"):
+        graph_auxiliary_loss(
+            scores,
+            targets,
+            pair_mask=pair_mask,
+            config=config,
+        )
 
 
 def test_graph_loss_empty_batch_returns_finite_connected_zero() -> None:
@@ -366,3 +358,30 @@ def test_runtime_graph_contract_rejects_selector_beta_drift() -> None:
 
     with pytest.raises(ValueError, match="bias beta"):
         validate_runtime_graph_contract(contract, environment=environment)
+
+
+def test_graph_config_rejects_dsa_dense_beta_drift() -> None:
+    environment = {
+        "CPPMEGA_DSA_GRAPH_BIAS_BETA": "2",
+        "CPPMEGA_GRAPH_ATTENTION_BIAS_BETA": "3",
+    }
+
+    with pytest.raises(ValueError, match="beta.*differ"):
+        GraphAuxiliaryLossConfig.from_env(environment)
+
+
+def test_graph_config_binds_canonical_beta_and_equal_legacy_aliases() -> None:
+    environment = {
+        GRAPH_BIAS_BETA_ENV: "2",
+        GRAPH_BIAS_BETA_LEGACY_ENVS[0]: "2.0",
+        GRAPH_BIAS_BETA_LEGACY_ENVS[1]: "2e0",
+    }
+
+    assert resolve_graph_bias_beta(environment) == 2.0
+    config = GraphAuxiliaryLossConfig.from_env(environment)
+    assert config.bias_beta == 2.0
+    assert graph_bias_beta_binding(config.bias_beta) == {
+        "canonical_env": GRAPH_BIAS_BETA_ENV,
+        "legacy_envs": list(GRAPH_BIAS_BETA_LEGACY_ENVS),
+        "value": "2",
+    }
