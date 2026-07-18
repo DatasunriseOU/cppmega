@@ -66,6 +66,7 @@ _QK_KW: dict[str, int] = {
     "outputs_per_block": 4,
     "reduce_threads": 32,
     "vec": 4,
+    "B_SCALE_ROWS": 1,
 }
 
 
@@ -93,6 +94,7 @@ def test_engine_mode_yields_compiled_artifact_with_target_tag() -> None:
 
 
 def test_shim_mode_yields_msl_lowering_with_buffer_param_names() -> None:
+    pytest.importorskip("tilelang")
     msl_transform = pytest.importorskip("cppmega_mlx.nn._tilelang._msl_transform")
     if not msl_transform.can_run_metal():
         pytest.skip("Metal runtime not available; shim path requires it")
@@ -146,9 +148,10 @@ def test_lower_msl_helper_routes_through_dispatcher() -> None:
     assert isinstance(shim_src, str) and shim_src.strip()
 
 
-def test_legacy_metal_kernel_cache_still_works() -> None:
-    """Regression: the 6 mlx call sites that go through _qk_reduce_kernel_for must keep working."""
+def test_diagnostic_lowering_cache_does_not_construct_direct_msl_kernel() -> None:
+    """The retained inspection helper must not recreate a direct-MSL runtime."""
 
+    pytest.importorskip("tilelang")
     msl_transform = pytest.importorskip("cppmega_mlx.nn._tilelang._msl_transform")
     if not msl_transform.can_run_metal():
         pytest.skip("Metal runtime not available")
@@ -161,7 +164,8 @@ def test_legacy_metal_kernel_cache_still_works() -> None:
         _QK_KW["outputs_per_block"],
         _QK_KW["reduce_threads"],
         _QK_KW["vec"],
+        _QK_KW["B_SCALE_ROWS"],
     )
     assert hasattr(lowering, "msl_text")
     assert set(input_names) == {"A_fp8", "A_scale", "B_fp8", "B_scale"}
-    assert kernel is not None
+    assert kernel is None

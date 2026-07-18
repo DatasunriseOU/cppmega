@@ -23,7 +23,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python_bin=/Volumes/external/sources/cppmega.mlx/.venv/bin/python
+          unset PYTHONPATH PYTHONHOME VIRTUAL_ENV || true
+          export PYTHONNOUSERSITE=1
+          export PYTHONSAFEPATH=1
+          python_bin=/Volumes/external/sources/.venvs/cppmega.source/bin/python
+          export MEGATRON_LM_REPO=/Volumes/external/sources/Megatron-LM-core_v0.18.0
           test -x "${python_bin}"
           "${python_bin}" -m pytest -q \
             tests/test_custom_embedding.py \
@@ -45,7 +49,9 @@ jobs:
             tests/test_restore_megatron_bundle_from_nebius_s3.py \
             tests/test_workflow_runner_policy.py
           "${python_bin}" scripts/data/verify_tokenizer_contract.py \
-            --root /Volumes/external/sources
+            --contract "${GITHUB_WORKSPACE}/data/tokenizer_v2/tokenizer_contract_v1.json" \
+            --tokenizer "${GITHUB_WORKSPACE}/data/tokenizer_v2/tokenizer.json" \
+            --domain-schema "${GITHUB_WORKSPACE}/data/domain_schema_v1.json"
           git diff --check
 
   linux-portable:
@@ -63,7 +69,10 @@ jobs:
       - name: Run portable data and bundle suite
         run: |
           set -euo pipefail
-          python -m pytest -q \
+          unset PYTHONPATH PYTHONHOME VIRTUAL_ENV || true
+          export PYTHONNOUSERSITE=1
+          export PYTHONSAFEPATH=1
+          CPPMEGA_TEST_PROFILE=portable-data python -m pytest -q \
             tests/test_data_pipeline_contracts.py \
             tests/test_data_prep_parquet_to_megatron.py \
             tests/test_domain_megatron_sidecars.py \
@@ -74,4 +83,8 @@ jobs:
             tests/test_publish_megatron_bundle_to_nebius_s3.py \
             tests/test_restore_megatron_bundle_from_nebius_s3.py \
             tests/test_workflow_runner_policy.py
+          python scripts/data/verify_tokenizer_contract.py \
+            --contract "${GITHUB_WORKSPACE}/data/tokenizer_v2/tokenizer_contract_v1.json" \
+            --tokenizer "${GITHUB_WORKSPACE}/data/tokenizer_v2/tokenizer.json" \
+            --domain-schema "${GITHUB_WORKSPACE}/data/domain_schema_v1.json"
           git diff --check

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import pathlib
 import sys
@@ -17,12 +18,12 @@ from typing import Any
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+sys.path = [entry for entry in sys.path if entry != str(ROOT)]
+sys.path.insert(0, str(ROOT))
 
-from tools.probes import mamba3_wgmma_wave6_copy_path as wave6
-from tools.probes import mamba3_wgmma_wave8_copy_evidence as wave8
-from tools.probes import mamba3_wgmma_wave9_copy_probe as wave9
+wave6 = importlib.import_module("tools.probes.mamba3_wgmma_wave6_copy_path")
+wave8 = importlib.import_module("tools.probes.mamba3_wgmma_wave8_copy_evidence")
+wave9 = importlib.import_module("tools.probes.mamba3_wgmma_wave9_copy_probe")
 
 
 DATE = "2026-04-30"
@@ -613,11 +614,9 @@ def render_markdown_guide(receipt: dict[str, Any]) -> str:
     evidence = receipt["source_evidence"]
     runtime = evidence["runtime"]
     timing = runtime.get("timing") or {}
-    correctness = runtime.get("correctness") or {}
     device = runtime.get("device") or {}
     ptxas = evidence["ptxas"].get("metadata") or {}
     decision = receipt["decision"]
-    contract = receipt["guard_contract"]
 
     return f"""# Mamba3 Mono WGMMA Copy Path Wave10 CuTe Integration - {DATE}
 

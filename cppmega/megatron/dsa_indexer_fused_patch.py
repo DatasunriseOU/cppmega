@@ -22,9 +22,9 @@ except for FP32 reduction order (head-wise instead of vectorised) which
 is exact up to associative FP32 reorder (< 1e-6 relative error on
 bounded inputs).
 
-This is a pure correctness/memory fix — it is numerically equivalent to
-upstream and has no runtime penalty on H200 (the per-head bmm lowers to
-a single cuBLAS GEMM per head, same FLOP count). It replaces the dead
+The fused score path is numerically equivalent to upstream and has no
+runtime penalty on H200 (the per-head bmm lowers to a single cuBLAS GEMM
+per head, same FLOP count). It replaces the dead
 ``dsa_fp8_patch.py`` (deleted 2026-04-13 in commit ``b6fb886``) for
 memory-bound configurations like DSA 9+4 with MBS >= 8.
 
@@ -47,14 +47,19 @@ MBS=10 NAM56R — upstream ``_compute_index_scores`` materialises
 9 DSA layers => ~45 GiB resident.  Fused per-head ``[b, sq, sk]`` =
 640 MiB/layer => ~5.7 GiB resident.  Net save ~40 GiB; without the fused
 path MBS=10 is impossible, period.  No env gate — install or raise.
-No backward changes — upstream ``_compute_index_scores`` is not
-autograd-aware (called under ``torch.no_grad()`` in the fwd path and
-inside a custom-autograd recompute in the bwd).
+
+When the graph auxiliary objective is enabled, the patch also composes
+graph loss into Megatron's fused indexer loss and recomputes its gradients
+inside the custom backward. The exact forward attention mask and graph
+sidecars are captured per microbatch and reused during backward.
 """
 
 from __future__ import annotations
 
+import inspect
+import json
 import logging
+import math
 import os
 from contextvars import ContextVar, Token
 
@@ -64,16 +69,28 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "apply_dsa_indexer_fused_patch",
+    "build_graph_objective_tensors",
     "build_graph_route_bias_from_structure_batch",
     "compute_index_scores_fused_bf16",
 ]
 
 _PATCH_MARKER = "__cppmega_dsa_indexer_fused_patched__"
 _AUTOGRAD_PATCH_MARKER = "__cppmega_graph_microbatch_patched__"
+_GRAPH_OBJECTIVE_PATCH_MARKER = "__cppmega_graph_objective_patched__"
+_RUNTIME_RECEIPT_PATCH_MARKER = "__cppmega_dsa_runtime_receipts_patched__"
 _NO_GRAPH_BATCH = object()
+_NO_UPSTREAM_MASK = object()
+_NO_DSA_LAYER = object()
 _GRAPH_BATCH_OVERRIDE: ContextVar[object] = ContextVar(
     "cppmega_dsa_graph_batch_override", default=_NO_GRAPH_BATCH
 )
+_UPSTREAM_MASK_OVERRIDE: ContextVar[object] = ContextVar(
+    "cppmega_dsa_upstream_mask_override", default=_NO_UPSTREAM_MASK
+)
+_DSA_LAYER_CONTEXT: ContextVar[object] = ContextVar(
+    "cppmega_dsa_layer_context", default=_NO_DSA_LAYER
+)
+_GRAPH_OBJECTIVE_RECEIPT_LAYERS: set[int] = set()
 _GRAPH_ROUTE_BATCH_KEYS = (
     "graph_call_edges",
     "graph_call_edge_counts",
@@ -94,6 +111,7 @@ _GRAPH_ROUTE_BATCH_KEYS = (
     "graph_chunk_kinds",
     "graph_chunk_dep_levels",
     "graph_chunk_counts",
+    "graph_document_ids",
 )
 
 
@@ -109,6 +127,18 @@ def _env_float(name: str, default: float) -> float:
         return float(raw)
     except ValueError as exc:
         raise ValueError(f"{name} must be a float, got {raw!r}") from exc
+
+
+def _qualified_name(value: object) -> str:
+    cls = value if isinstance(value, type) else type(value)
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def _emit_runtime_receipt(prefix: str, payload: dict[str, object]) -> None:
+    print(
+        f"{prefix} {json.dumps(payload, sort_keys=True, separators=(',', ':'))}",
+        flush=True,
+    )
 
 
 def _as_batched_edges(
@@ -431,6 +461,7 @@ def build_graph_route_bias_from_structure_batch(
     shell_weight: float = 1.0,
     diagnostic_weight: float = 1.0,
     cross_domain_weight: float = 1.0,
+    consumer: str | None = None,
 ) -> torch.Tensor:
     """Build ``S_graph[b,t,s]`` from cppmega graph route sidecars.
 
@@ -520,6 +551,15 @@ def build_graph_route_bias_from_structure_batch(
             "route edge tensors (expected graph_call_edges/type_edges or "
             "domain/build/shell/diagnostic/cross-domain edges)"
         )
+    receipt_path = os.environ.get("CPPMEGA_H200_GRAPH_PRIOR_RECEIPT")
+    if receipt_path and consumer is not None:
+        from cppmega.megatron.h200_preflight import observe_graph_prior
+
+        observe_graph_prior(
+            prior=bias,
+            consumer=consumer,
+            receipt_path=receipt_path,
+        )
     return bias
 
 
@@ -530,20 +570,20 @@ def _current_graph_route_bias(
     seqlen_k: int,
     device: torch.device,
 ) -> torch.Tensor:
-    try:
-        from cppmega.megatron.structure_dataset_patch import _get_current_structure_batch
-    except Exception as exc:  # pragma: no cover - exercised in remote Megatron env
-        raise RuntimeError(
-            "CPPMEGA_GRAPH_ROUTES_ENABLED=1 but structure_dataset_patch is not "
-            "importable; import it before applying the DSA indexer patch"
-        ) from exc
-
     override = _GRAPH_BATCH_OVERRIDE.get()
-    structure_batch = (
-        _get_current_structure_batch()
-        if override is _NO_GRAPH_BATCH
-        else override
-    )
+    if override is _NO_GRAPH_BATCH:
+        try:
+            from cppmega.megatron.structure_dataset_patch import (
+                _get_current_structure_batch,
+            )
+        except Exception as exc:  # pragma: no cover - remote Megatron environment
+            raise RuntimeError(
+                "CPPMEGA_GRAPH_ROUTES_ENABLED=1 but structure_dataset_patch is not "
+                "importable; import it before applying the DSA indexer patch"
+            ) from exc
+        structure_batch = _get_current_structure_batch()
+    else:
+        structure_batch = override
     return build_graph_route_bias_from_structure_batch(
         structure_batch,
         batch_size=batch_size,
@@ -558,7 +598,318 @@ def _current_graph_route_bias(
         shell_weight=_env_float("CPPMEGA_DSA_GRAPH_SHELL_WEIGHT", 1.0),
         diagnostic_weight=_env_float("CPPMEGA_DSA_GRAPH_DIAGNOSTIC_WEIGHT", 1.0),
         cross_domain_weight=_env_float("CPPMEGA_DSA_GRAPH_CROSS_DOMAIN_WEIGHT", 1.0),
+        consumer="dsa_indexer",
     )
+
+
+def _active_graph_structure_batch() -> dict[str, torch.Tensor]:
+    override = _GRAPH_BATCH_OVERRIDE.get()
+    if override is _NO_GRAPH_BATCH:
+        try:
+            from cppmega.megatron.structure_dataset_patch import (
+                _get_current_structure_batch,
+            )
+        except Exception as exc:  # pragma: no cover - remote Megatron environment
+            raise RuntimeError(
+                "CPPMEGA_GRAPH_ROUTES_ENABLED=1 but structure_dataset_patch is not "
+                "available"
+            ) from exc
+        current = _get_current_structure_batch()
+    else:
+        current = override
+    if current is None or not isinstance(current, dict):
+        raise RuntimeError(
+            "CPPMEGA_GRAPH_ROUTES_ENABLED=1 but no active structure batch is "
+            "available for graph auxiliary loss"
+        )
+    return current
+
+
+def _graph_target_bias(
+    structure_batch: dict[str, torch.Tensor],
+    *,
+    relations: tuple[str, ...],
+    batch_size: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    device: torch.device,
+) -> torch.Tensor:
+    relation_keys = {
+        "call": ("graph_call_edges", "graph_call_edge_counts"),
+        "type": ("graph_type_edges", "graph_type_edge_counts"),
+        "domain": ("graph_domain_edges", "graph_domain_edge_counts"),
+        "build": ("graph_build_edges", "graph_build_edge_counts"),
+        "shell": ("graph_shell_edges", "graph_shell_edge_counts"),
+        "diagnostic": (
+            "graph_diagnostic_edges",
+            "graph_diagnostic_edge_counts",
+        ),
+        "cross_domain": (
+            "graph_cross_domain_edges",
+            "graph_cross_domain_edge_counts",
+        ),
+    }
+    unknown = sorted(set(relations) - set(relation_keys))
+    if unknown:
+        raise ValueError(f"unsupported graph auxiliary relations: {unknown}")
+    missing_relations = {
+        relation: [
+            key for key in relation_keys[relation] if key not in structure_batch
+        ]
+        for relation in relations
+    }
+    missing_relations = {
+        relation: keys for relation, keys in missing_relations.items() if keys
+    }
+    if missing_relations:
+        raise KeyError(
+            "graph auxiliary loss is missing required relation sidecars: "
+            f"{missing_relations}"
+        )
+    selected: dict[str, torch.Tensor] = {}
+    for relation in relations:
+        for key in relation_keys[relation]:
+            if key in structure_batch:
+                selected[key] = structure_batch[key]
+    required_chunk_keys = (
+        "graph_chunk_starts",
+        "graph_chunk_ends",
+        "graph_chunk_counts",
+    )
+    if set(relations) & {"call", "type"}:
+        missing_chunks = [
+            key for key in required_chunk_keys if key not in structure_batch
+        ]
+        if missing_chunks:
+            raise KeyError(
+                "call/type graph auxiliary loss is missing required chunk "
+                f"sidecars: {missing_chunks}"
+            )
+    for key in required_chunk_keys:
+        if key in structure_batch:
+            selected[key] = structure_batch[key]
+    return build_graph_route_bias_from_structure_batch(
+        selected,
+        batch_size=batch_size,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        device=device,
+        dtype=torch.float32,
+    )
+
+
+def build_graph_objective_tensors(
+    structure_batch: dict[str, torch.Tensor],
+    *,
+    relations: tuple[str, ...],
+    batch_size: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    device: torch.device,
+    upstream_mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build token-expanded targets and the exact trainable graph pair mask."""
+
+    targets = _graph_target_bias(
+        structure_batch,
+        relations=relations,
+        batch_size=batch_size,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        device=device,
+    ).gt(0)
+    document_ids = structure_batch.get("graph_document_ids")
+    if not isinstance(document_ids, torch.Tensor):
+        raise KeyError(
+            "graph auxiliary loss requires graph_document_ids derived from "
+            "packed document boundaries"
+        )
+    if document_ids.dim() == 1:
+        document_ids = document_ids.unsqueeze(0)
+    if document_ids.dim() != 2:
+        raise ValueError(
+            "graph_document_ids must have shape [B,S] or [S], got "
+            f"{tuple(document_ids.shape)}"
+        )
+    if int(document_ids.shape[0]) == 1 and batch_size > 1:
+        document_ids = document_ids.expand(batch_size, -1)
+    if int(document_ids.shape[0]) != batch_size:
+        raise ValueError(
+            f"graph_document_ids batch {int(document_ids.shape[0])} != {batch_size}"
+        )
+    if int(document_ids.shape[1]) < max(seqlen_q, seqlen_k):
+        raise ValueError(
+            f"graph_document_ids length {int(document_ids.shape[1])} is shorter "
+            f"than graph score shape ({seqlen_q}, {seqlen_k})"
+        )
+    document_ids = document_ids.to(device=device, dtype=torch.long)
+    query_docs = document_ids[:, :seqlen_q]
+    key_docs = document_ids[:, :seqlen_k]
+    positive_docs = (query_docs > 0).unsqueeze(2) & (key_docs > 0).unsqueeze(1)
+    same_document = query_docs.unsqueeze(2) == key_docs.unsqueeze(1)
+
+    query_positions = torch.arange(seqlen_q, device=device)[:, None]
+    key_positions = torch.arange(seqlen_k, device=device)[None, :]
+    pair_mask = (key_positions <= query_positions).unsqueeze(0)
+    pair_mask = pair_mask.expand(batch_size, -1, -1)
+    pair_mask = pair_mask & positive_docs & same_document
+
+    if upstream_mask is not None:
+        if not isinstance(upstream_mask, torch.Tensor):
+            raise TypeError(
+                f"DSA upstream mask must be torch.Tensor, got "
+                f"{type(upstream_mask).__name__}"
+            )
+        mask = upstream_mask.to(device=device)
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0)
+        if mask.dim() != 3 or tuple(mask.shape[-2:]) != (seqlen_q, seqlen_k):
+            raise ValueError(
+                "DSA upstream mask must have shape [Q,K] or [B,Q,K], got "
+                f"{tuple(mask.shape)}"
+            )
+        if int(mask.shape[0]) == 1 and batch_size > 1:
+            mask = mask.expand(batch_size, -1, -1)
+        if int(mask.shape[0]) != batch_size:
+            raise ValueError(
+                f"DSA upstream mask batch {int(mask.shape[0])} != {batch_size}"
+            )
+        if mask.dtype == torch.bool:
+            upstream_valid = mask
+        else:
+            upstream_valid = torch.isfinite(mask) & (mask >= 0)
+        pair_mask = pair_mask & upstream_valid
+
+    targets = targets & pair_mask
+    return targets, pair_mask
+
+
+def _graph_objective_from_index_scores(
+    index_scores: torch.Tensor,
+    *,
+    upstream_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute graph BCE/coverage on neural DSA scores, excluding fixed bias."""
+
+    from cppmega.megatron.graph_objective_loss import (
+        GraphAuxiliaryLossConfig,
+        graph_auxiliary_loss,
+    )
+
+    if index_scores.ndim != 3:
+        raise ValueError(
+            f"DSA graph objective requires (B,Q,K) index scores, got "
+            f"{tuple(index_scores.shape)}"
+        )
+    config = GraphAuxiliaryLossConfig.from_env()
+    batch, seqlen_q, seqlen_k = (int(value) for value in index_scores.shape)
+    structure_batch = _active_graph_structure_batch()
+    targets, pair_mask = build_graph_objective_tensors(
+        structure_batch,
+        relations=config.relations,
+        batch_size=batch,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        device=index_scores.device,
+        upstream_mask=upstream_mask,
+    )
+    route_bias = _current_graph_route_bias(
+        batch_size=batch,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        device=index_scores.device,
+    )
+    graph_beta = _env_float("CPPMEGA_DSA_GRAPH_BIAS_BETA", 1.0)
+    neural_scores = index_scores.float() - graph_beta * route_bias
+    pair_mask = pair_mask & torch.isfinite(neural_scores)
+    graph_loss, _components = graph_auxiliary_loss(
+        neural_scores,
+        targets.to(dtype=neural_scores.dtype),
+        pair_mask=pair_mask,
+        config=config,
+    )
+    return graph_loss
+
+
+def _bind_upstream_mask(callable_obj, *args, **kwargs) -> torch.Tensor | None:
+    try:
+        bound = inspect.signature(callable_obj).bind_partial(*args, **kwargs)
+    except (TypeError, ValueError):
+        return None
+    mask = bound.arguments.get("mask")
+    if mask is None:
+        return None
+    if not isinstance(mask, torch.Tensor):
+        raise TypeError(
+            f"Megatron FusedDSAIndexerLoss mask must be torch.Tensor, got "
+            f"{type(mask).__name__}"
+        )
+    return mask.detach()
+
+
+def _patch_dsa_graph_objective(dsa_mod) -> None:
+    """Compose graph supervision into Megatron's autograd-carried DSA loss."""
+
+    existing = getattr(dsa_mod, "compute_dsa_indexer_loss", None)
+    if existing is None:
+        raise RuntimeError("Megatron DSA compute_dsa_indexer_loss is unavailable")
+    if getattr(existing, _GRAPH_OBJECTIVE_PATCH_MARKER, False):
+        return
+
+    def compute_dsa_indexer_loss_with_graph(index_scores, *args, **kwargs):
+        indexer_loss = existing(index_scores, *args, **kwargs)
+        if not _env_flag("CPPMEGA_DSA_GRAPH_AUX_ENABLED"):
+            return indexer_loss
+        if not _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
+            raise RuntimeError(
+                "DSA graph auxiliary objective requires graph routes to be enabled"
+            )
+        upstream_mask = kwargs.get("mask")
+        if upstream_mask is None:
+            try:
+                bound = inspect.signature(existing).bind_partial(
+                    index_scores, *args, **kwargs
+                )
+            except (TypeError, ValueError):
+                bound = None
+            if bound is not None:
+                upstream_mask = bound.arguments.get("mask")
+        if upstream_mask is None:
+            captured_mask = _UPSTREAM_MASK_OVERRIDE.get()
+            if captured_mask is not _NO_UPSTREAM_MASK:
+                upstream_mask = captured_mask
+        return indexer_loss + _graph_objective_from_index_scores(
+            index_scores, upstream_mask=upstream_mask
+        )
+
+    setattr(
+        compute_dsa_indexer_loss_with_graph,
+        _GRAPH_OBJECTIVE_PATCH_MARKER,
+        True,
+    )
+    dsa_mod.compute_dsa_indexer_loss = compute_dsa_indexer_loss_with_graph
+
+    sparse_existing = getattr(dsa_mod, "compute_dsa_indexer_loss_topk_sparse", None)
+    if sparse_existing is not None and not getattr(
+        sparse_existing, _GRAPH_OBJECTIVE_PATCH_MARKER, False
+    ):
+        def sparse_loss_requires_dense_graph_scores(*args, **kwargs):
+            if _env_flag("CPPMEGA_DSA_GRAPH_AUX_ENABLED"):
+                raise RuntimeError(
+                    "graph auxiliary loss requires full DSA indexer scores; "
+                    "top-k-only sparse indexer loss cannot satisfy the objective "
+                    "contract"
+                )
+            return sparse_existing(*args, **kwargs)
+
+        setattr(
+            sparse_loss_requires_dense_graph_scores,
+            _GRAPH_OBJECTIVE_PATCH_MARKER,
+            True,
+        )
+        dsa_mod.compute_dsa_indexer_loss_topk_sparse = (
+            sparse_loss_requires_dense_graph_scores
+        )
 
 
 def _capture_current_graph_batch() -> dict[str, torch.Tensor]:
@@ -592,6 +943,90 @@ def _reset_graph_batch_override(token: Token) -> None:
     _GRAPH_BATCH_OVERRIDE.reset(token)
 
 
+def _install_indexer_gradient_receipts(indexer) -> None:
+    if not _env_flag("CPPMEGA_H200_DSA_GRAPH_RECEIPTS"):
+        return
+    if getattr(indexer, _RUNTIME_RECEIPT_PATCH_MARKER, False):
+        return
+    parameters = tuple(
+        (name, parameter)
+        for name, parameter in indexer.named_parameters()
+        if parameter.requires_grad
+    )
+    if not parameters:
+        raise RuntimeError("DSAIndexer exposes no trainable parameters for receipts")
+
+    seen_norms: dict[str, float] = {}
+    handles = []
+
+    def hook_for(name: str):
+        def record_gradient(gradient: torch.Tensor) -> torch.Tensor:
+            if getattr(indexer, "cppmega_dsa_gradient_receipt_emitted", False):
+                return gradient
+            norm = float(
+                torch.linalg.vector_norm(gradient.detach().float()).cpu().item()
+            )
+            seen_norms[name] = norm
+            if len(seen_norms) == len(parameters):
+                total_norm = math.sqrt(
+                    sum(value * value for value in seen_norms.values())
+                )
+                _emit_runtime_receipt(
+                    "CPPMEGA_DSA_INDEXER_GRAD",
+                    {
+                        "layer_number": getattr(
+                            indexer, "cppmega_dsa_layer_number", None
+                        ),
+                        "actual_indexer_module": _qualified_name(indexer),
+                        "grad_norm": total_norm,
+                        "parameter_grad_norms": dict(sorted(seen_norms.items())),
+                    },
+                )
+                indexer.cppmega_dsa_gradient_receipt_emitted = True
+                seen_norms.clear()
+            return gradient
+
+        return record_gradient
+
+    for name, parameter in parameters:
+        handles.append(parameter.register_hook(hook_for(name)))
+    indexer.cppmega_dsa_gradient_receipt_handles = tuple(handles)
+    setattr(indexer, _RUNTIME_RECEIPT_PATCH_MARKER, True)
+
+
+def _patch_dsa_runtime_receipts(dsa_mod) -> None:
+    dsa_attention = getattr(dsa_mod, "DSAttention", None)
+    dsa_indexer = getattr(dsa_mod, "DSAIndexer", None)
+    if dsa_attention is None or dsa_indexer is None:
+        raise RuntimeError("Megatron DSA runtime modules are unavailable")
+    if getattr(dsa_attention, _RUNTIME_RECEIPT_PATCH_MARKER, False):
+        return
+
+    original_attention_init = dsa_attention.__init__
+    original_attention_forward = dsa_attention.forward
+    original_indexer_init = dsa_indexer.__init__
+
+    def indexer_init(self, *args, **kwargs):
+        original_indexer_init(self, *args, **kwargs)
+        _install_indexer_gradient_receipts(self)
+
+    def attention_init(self, *args, **kwargs):
+        original_attention_init(self, *args, **kwargs)
+        self.indexer.cppmega_dsa_layer_number = int(self.layer_number)
+
+    def attention_forward(self, *args, **kwargs):
+        token = _DSA_LAYER_CONTEXT.set(int(self.layer_number))
+        try:
+            return original_attention_forward(self, *args, **kwargs)
+        finally:
+            _DSA_LAYER_CONTEXT.reset(token)
+
+    dsa_indexer.__init__ = indexer_init
+    dsa_attention.__init__ = attention_init
+    dsa_attention.forward = attention_forward
+    setattr(dsa_attention, _RUNTIME_RECEIPT_PATCH_MARKER, True)
+
+
 def _patch_fused_dsa_autograd(dsa_mod) -> None:
     fused_loss = getattr(dsa_mod, "FusedDSAIndexerLoss", None)
     if fused_loss is None:
@@ -604,13 +1039,30 @@ def _patch_fused_dsa_autograd(dsa_mod) -> None:
     def forward(ctx, *args, **kwargs):
         captured = None
         token = None
+        upstream_mask = None
+        mask_token = None
         if _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
             captured = _capture_current_graph_batch()
             token = _set_graph_batch_override(captured)
+        if _env_flag("CPPMEGA_DSA_GRAPH_AUX_ENABLED"):
+            upstream_mask = _bind_upstream_mask(
+                original_forward,
+                ctx,
+                *args,
+                **kwargs,
+            )
+            mask_token = _UPSTREAM_MASK_OVERRIDE.set(upstream_mask)
         ctx.cppmega_graph_route_batch = captured
+        ctx.cppmega_dsa_upstream_mask = upstream_mask
+        layer_number = _DSA_LAYER_CONTEXT.get()
+        ctx.cppmega_dsa_layer_number = (
+            None if layer_number is _NO_DSA_LAYER else int(layer_number)
+        )
         try:
             return original_forward(ctx, *args, **kwargs)
         finally:
+            if mask_token is not None:
+                _UPSTREAM_MASK_OVERRIDE.reset(mask_token)
             if token is not None:
                 _reset_graph_batch_override(token)
 
@@ -620,7 +1072,77 @@ def _patch_fused_dsa_autograd(dsa_mod) -> None:
         if captured is not None:
             token = _set_graph_batch_override(captured)
         try:
-            return original_backward(ctx, *args, **kwargs)
+            original_grads = original_backward(ctx, *args, **kwargs)
+            if not _env_flag("CPPMEGA_DSA_GRAPH_AUX_ENABLED"):
+                return original_grads
+            grad_loss = args[1] if len(args) > 1 else kwargs.get("grad_loss")
+            if grad_loss is None:
+                return original_grads
+            if not isinstance(original_grads, tuple) or len(original_grads) < 3:
+                raise RuntimeError(
+                    "Megatron FusedDSAIndexerLoss backward returned an incompatible "
+                    "gradient tuple"
+                )
+
+            q, weights, k = ctx.saved_tensors[:3]
+            with torch.enable_grad():
+                q_recompute = q.detach().requires_grad_(True)
+                weights_recompute = weights.detach().requires_grad_(True)
+                k_recompute = k.detach().requires_grad_(True)
+                neural_and_route_scores = dsa_mod._compute_index_scores(
+                    q_recompute,
+                    weights_recompute,
+                    k_recompute,
+                    use_relu=bool(getattr(ctx, "use_relu", True)),
+                )
+                graph_loss = _graph_objective_from_index_scores(
+                    neural_and_route_scores,
+                    upstream_mask=getattr(ctx, "cppmega_dsa_upstream_mask", None),
+                )
+                graph_grads = torch.autograd.grad(
+                    graph_loss,
+                    (q_recompute, weights_recompute, k_recompute),
+                    grad_outputs=grad_loss,
+                    allow_unused=True,
+                )
+
+            layer_number = getattr(ctx, "cppmega_dsa_layer_number", None)
+            if (
+                _env_flag("CPPMEGA_H200_DSA_GRAPH_RECEIPTS")
+                and isinstance(layer_number, int)
+                and layer_number not in _GRAPH_OBJECTIVE_RECEIPT_LAYERS
+            ):
+                from cppmega.megatron.graph_objective_loss import (
+                    GraphAuxiliaryLossConfig,
+                )
+
+                _emit_runtime_receipt(
+                    "CPPMEGA_DSA_GRAPH_OBJECTIVE",
+                    {
+                        "layer_number": layer_number,
+                        "actual_dsa_module": _qualified_name(dsa_mod.DSAttention),
+                        "effective_coefficient": (
+                            GraphAuxiliaryLossConfig.from_env().indexer_weight
+                        ),
+                        "graph_loss": float(graph_loss.detach().float().item()),
+                    },
+                )
+                _GRAPH_OBJECTIVE_RECEIPT_LAYERS.add(layer_number)
+
+            combined_grads = list(original_grads)
+            for index, graph_grad in enumerate(graph_grads):
+                if graph_grad is None or not ctx.needs_input_grad[index]:
+                    continue
+                original_grad = combined_grads[index]
+                if original_grad is None:
+                    combined_grads[index] = graph_grad.to(
+                        dtype=(q, weights, k)[index].dtype
+                    )
+                else:
+                    combined_grads[index] = original_grad + graph_grad.to(
+                        dtype=original_grad.dtype
+                    )
+            return tuple(combined_grads)
         finally:
             if token is not None:
                 _reset_graph_batch_override(token)
@@ -729,9 +1251,7 @@ def apply_dsa_indexer_fused_patch(*, force: bool = False) -> bool:
             "megatron.core.transformer.experimental_attention_variant.dsa."
             "_compute_index_scores not found — Megatron version mismatch?"
         )
-    if getattr(existing, _PATCH_MARKER, False) and not force:
-        log.info("cppmega DSA indexer fused patch already applied")
-        return True
+    already_patched = getattr(existing, _PATCH_MARKER, False) and not force
 
     def _compute_index_scores_fused(q, weights, k, use_relu: bool = True, **kwargs):
         # Accept **kwargs to be forward-compatible with new upstream args
@@ -758,9 +1278,16 @@ def apply_dsa_indexer_fused_patch(*, force: bool = False) -> bool:
             graph_beta=graph_beta,
         )
 
-    setattr(_compute_index_scores_fused, _PATCH_MARKER, True)
-    dsa_mod._compute_index_scores = _compute_index_scores_fused
+    if not already_patched:
+        setattr(_compute_index_scores_fused, _PATCH_MARKER, True)
+        dsa_mod._compute_index_scores = _compute_index_scores_fused
+    _patch_dsa_graph_objective(dsa_mod)
     _patch_fused_dsa_autograd(dsa_mod)
+    _patch_dsa_runtime_receipts(dsa_mod)
+
+    if already_patched:
+        log.info("cppmega DSA indexer fused patch already applied")
+        return True
 
     log.info(
         "cppmega DSA indexer fused patch applied: per-head accumulation, "

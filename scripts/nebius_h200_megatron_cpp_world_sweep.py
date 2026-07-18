@@ -14,6 +14,7 @@ import base64
 import ipaddress
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -26,11 +27,28 @@ from typing import Iterable
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from cppmega.recipes.run_profiles import get_run_profile  # noqa: E402
+from scripts.data.publish_megatron_bundle_to_nebius_s3 import (  # noqa: E402
+    _validate_bundle,
+    _validate_prefix_manifest_contract,
+    _validate_tokenizer_directory,
+)
+from scripts.h200_megatron_preflight import (  # noqa: E402
+    derive_graph_capacity_receipt,
+)
+
+
 DEFAULT_PARENT_ID = "project-e00w4wx5pr008qm6txmcgr"
 DEFAULT_SUBNET_ID = "vpcsubnet-e00wm5th5ywn69bb0e"
 DEFAULT_SECURITY_GROUP_ID = "vpcsecuritygroup-e00qtzsrtgdv7wh8e7"
 DEFAULT_IMAGE_ID = "computeimage-e00hbfk8kmf3w3prch"
-DEFAULT_DOCKER_IMAGE = "ghcr.io/datasunriseou/cppmega:latest"
+DEFAULT_DOCKER_IMAGE = (
+    "ghcr.io/datasunriseou/cppmega@"
+    "sha256:08c5db7368d1037d930e0825281468927de9c85b12ba10373fe07e082150d983"
+)
 DEFAULT_SIDECAR_PREFIX = (
     ROOT.parent
     / "cppmega.mlx"
@@ -40,15 +58,22 @@ DEFAULT_SIDECAR_PREFIX = (
 )
 DEFAULT_TOKENIZER_DIR = ROOT / "data" / "tokenizer_v2"
 OVERLAY_PATHS = (
-    "cppmega/recipes/run_profiles.py",
-    "cppmega/megatron/custom_mamba_model.py",
-    "cppmega/megatron/mamba_builder.py",
-    "cppmega/megatron/te_checkpoint_kwarg_patch.py",
-    "cppmega/megatron/dsa_indexer_fused_patch.py",
-    "cppmega/megatron/graph_route_attention_bias_patch.py",
-    "cppmega/megatron/structure_batch.py",
-    "cppmega/megatron/structure_dataset_patch.py",
+    "cppmega",
+    "scripts/h200_megatron_preflight.py",
+    "scripts/data/publish_megatron_bundle_to_nebius_s3.py",
+    "data/domain_schema_v1.json",
+    "data/tokenizer_v2/tokenizer_contract_v1.json",
 )
+_IMMUTABLE_IMAGE_RE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
+
+
+def validate_docker_image_digest(image: str) -> str:
+    if not _IMMUTABLE_IMAGE_RE.fullmatch(image):
+        raise ValueError(
+            "--docker-image must be an immutable image digest "
+            "(registry/repository@sha256:<64 lowercase hex chars>); mutable tags are rejected"
+        )
+    return image
 
 
 def default_ssh_key() -> Path:
@@ -86,14 +111,25 @@ def run_json(cmd: list[str], *, timeout: int | None = None) -> object:
 
 
 def make_overlay_tar(path: Path) -> None:
+    def keep_source(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        parts = Path(info.name).parts
+        if "__pycache__" in parts or info.name.endswith((".pyc", ".pyo")):
+            return None
+        return info
+
     with tarfile.open(path, "w:gz") as tf:
         for rel in OVERLAY_PATHS:
-            tf.add(ROOT / rel, arcname=rel)
+            tf.add(ROOT / rel, arcname=rel, filter=keep_source)
+
+
+def _assert_prefix_contract(prefix: Path) -> dict:
+    manifest, _referenced = _validate_prefix_manifest_contract(prefix)
+    return manifest
 
 
 def _sidecar_required_files(prefix: Path, tokenizer_dir: Path) -> list[Path]:
     required = [prefix.with_suffix(".bin"), prefix.with_suffix(".idx"), prefix.with_suffix(".json")]
-    manifest = json.loads(prefix.with_suffix(".json").read_text())
+    manifest = _assert_prefix_contract(prefix)
     for entry in manifest.get("side_channel_paths", {}).values():
         required.append(prefix.parent / entry["path"])
     for entry in manifest.get("graph_sidecar_paths", {}).values():
@@ -111,6 +147,7 @@ def _sidecar_required_files(prefix: Path, tokenizer_dir: Path) -> list[Path]:
             if key not in source_platform:
                 raise KeyError(f"source_platform_sidecar missing {key}")
             required.append(prefix.parent / source_platform[key])
+    _validate_tokenizer_directory(tokenizer_dir)
     required.extend(sorted(tokenizer_dir.iterdir()))
 
     for item in required:
@@ -164,6 +201,52 @@ def make_multi_sidecar_tar(prefixes: list[Path], tokenizer_dir: Path, path: Path
 
 def make_sidecar_tar(prefix: Path, tokenizer_dir: Path, path: Path) -> None:
     make_multi_sidecar_tar([prefix], tokenizer_dir, path)
+
+
+def make_bundle_tar(
+    bundle_root: Path,
+    prefixes: list[Path],
+    path: Path,
+    *,
+    hash_jobs: int = 4,
+) -> tuple[list[str], str]:
+    bundle_root = bundle_root.resolve()
+    manifest, artifacts = _validate_bundle(bundle_root, hash_jobs)
+    declared_prefixes = {
+        (bundle_root / str(result["prefix"])).resolve(): str(result["prefix"])
+        for result in manifest["bucket_results"]
+    }
+    remote_prefixes: list[str] = []
+    for prefix in prefixes:
+        relative = declared_prefixes.get(prefix.resolve())
+        if relative is None:
+            raise ValueError(f"selected prefix is not declared by bundle: {prefix}")
+        remote_prefixes.append(relative)
+    tokenizer_relative = str(manifest["tokenizer"]["path"])
+
+    with tempfile.TemporaryDirectory(prefix="cppmega-bundle-stage-") as stage_raw:
+        stage_root = Path(stage_raw) / "cppmega_bundle"
+        stage_root.mkdir()
+        sources = [bundle_root / "manifest.json"] + [
+            bundle_root / str(record["path"]) for record in artifacts
+        ]
+        for source in sources:
+            target = stage_root / source.relative_to(bundle_root)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(source, target)
+        cmd = [
+            "tar",
+            "-czhf",
+            str(path),
+            "-C",
+            stage_raw,
+            "cppmega_bundle",
+        ]
+        printable = " ".join(shlex.quote(part) for part in cmd)
+        print(f"[nebius-sweep] $ GZIP=-1 COPYFILE_DISABLE=1 {printable}", flush=True)
+        env = {**os.environ, "GZIP": "-1", "COPYFILE_DISABLE": "1"}
+        subprocess.run(cmd, check=True, env=env)
+    return remote_prefixes, tokenizer_relative
 
 
 def make_checkpoint_tar(checkpoint_dir: Path, path: Path) -> None:
@@ -475,21 +558,59 @@ def remote_run_script(
     docker_image: str,
     *,
     data_prefix_name: str = "cppmega_1024_smoke_mix_train",
-    seq_data_prefixes: list[tuple[int, str]] | None = None,
+    seq_data_prefixes: list[tuple[int, str, int, int]] | None = None,
+    graph_capacity: tuple[int, int] | None = None,
     fp8_recipe: str = "off",
     disable_nvrtc: bool = False,
+    enable_dsa_patch: bool = True,
     save_checkpoint: bool = False,
     save_interval: int | None = None,
     save_model_only: bool = True,
     load_checkpoint_remote: str | None = None,
     load_model_only: bool = True,
+    bundle_root: str = "/data/cppmega_bundle",
+    tokenizer_model: str = "/data/cppmega_bundle/tokenizer",
+    run_id: str = "nebius-h200-sweep",
 ) -> str:
-    batches = " ".join(str(v) for v in batch_sizes)
-    tests = seq_data_prefixes or [(1024, data_prefix_name)]
-    test_lines = "\n".join(
-        f"          {shlex.quote(str(seq) + ':' + name)}" for seq, name in tests
+    validate_docker_image_digest(docker_image)
+    if train_iters <= 0:
+        raise ValueError("train_iters must be positive")
+    if not enable_dsa_patch:
+        raise ValueError(
+            "production graph auxiliary contract requires the fused DSA patch"
+        )
+    dsa_profile = get_run_profile("h200_cpp_world_mini")
+    dsa_profile.model.dense = False
+    dsa_profile.spec_module = "cppmega.megatron.nam56r_full_spec"
+    dsa_profile.spec_function = "build_cppmega_nam56r_full_stack_spec"
+    dsa_native_args = shlex.split(dsa_profile.native_args_fragment())
+    if "--experimental-attention-variant" not in dsa_native_args:
+        raise ValueError("H200 graph auxiliary launcher requires native DSA args")
+    dsa_args = " ".join(shlex.quote(value) for value in dsa_native_args)
+    dsa_spec_args = " ".join(
+        shlex.quote(value)
+        for value in (dsa_profile.spec_module, dsa_profile.spec_function)
     )
+    batches = " ".join(str(v) for v in batch_sizes)
+    if seq_data_prefixes is None:
+        if graph_capacity is None:
+            raise ValueError("graph_capacity is required for a single-prefix sweep")
+        tests = [(1024, data_prefix_name, *graph_capacity)]
+    else:
+        tests = seq_data_prefixes
+    for seq, name, max_edges, max_chunks in tests:
+        if seq <= 0 or not name or max_edges <= 0 or max_chunks <= 0:
+            raise ValueError(f"invalid sequence graph capacity spec: {(seq, name, max_edges, max_chunks)}")
+    test_lines = "\n".join(
+        f"          {shlex.quote(':'.join(map(str, (seq, name, max_edges, max_chunks))))}"
+        for seq, name, max_edges, max_chunks in tests
+    )
+    eval_interval = min(train_iters, 100)
     effective_save_interval = save_interval or train_iters
+    if save_interval is not None and not save_checkpoint:
+        raise ValueError("save_interval requires save_checkpoint")
+    if save_checkpoint and not 0 < effective_save_interval <= train_iters:
+        raise ValueError("save_interval must be between 1 and train_iters")
     checkpoint_lines = ["            CHECKPOINT_ARGS=()"]
     if load_checkpoint_remote:
         checkpoint_lines.append(
@@ -508,8 +629,11 @@ def remote_run_script(
         if save_model_only:
             checkpoint_lines.append("            CHECKPOINT_ARGS+=(--no-save-optim --no-save-rng)")
     else:
-        checkpoint_lines.append("            CHECKPOINT_ARGS+=(--save-interval 50000000)")
+        checkpoint_lines.append("            # Checkpointing intentionally disabled for this sweep.")
     checkpoint_block = "\n".join(checkpoint_lines) + "\n"
+    preflight_dsa_arg = (
+        "          --enable-dsa-patch \\\n" if enable_dsa_patch else ""
+    )
     return textwrap.dedent(
         f"""\
         #!/usr/bin/env bash
@@ -553,21 +677,29 @@ def remote_run_script(
         export NVTE_DISABLE_NVRTC="{1 if disable_nvrtc else 0}"
         export CPPMEGA_STRUCTURE_ENABLED="${{CPPMEGA_STRUCTURE_ENABLED:-1}}"
         export CPPMEGA_GRAPH_ROUTES_ENABLED="${{CPPMEGA_GRAPH_ROUTES_ENABLED:-1}}"
-        export CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS="${{CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS:-1}}"
-        export CPPMEGA_GRAPH_MAX_EDGES="${{CPPMEGA_GRAPH_MAX_EDGES:-256}}"
-        export CPPMEGA_GRAPH_MAX_CHUNKS="${{CPPMEGA_GRAPH_MAX_CHUNKS:-256}}"
+        export CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS=0
+        export CPPMEGA_DSA_PATCH_ENABLED="{1 if enable_dsa_patch else 0}"
+        export CPPMEGA_DSA_GRAPH_AUX_ENABLED=1
+        export CPPMEGA_DSA_GRAPH_AUX_WEIGHT=1
+        export CPPMEGA_DSA_INDEXER_LOSS_COEFF=0.001
+        export CPPMEGA_DSA_SKIP_INDEXER_LOSS=0
+        export CPPMEGA_H200_DSA_GRAPH_RECEIPTS=1
+        export CPPMEGA_BUNDLE_ROOT={shlex.quote(bundle_root)}
+        export CPPMEGA_TOKENIZER_MODEL={shlex.quote(tokenizer_model)}
         mkdir -p "$TRITON_CACHE_DIR" /data/cppmega_h200_results
 
         python - <<'PY'
         import importlib
         import json
+        import os
         import torch
-        from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_patch
         from cppmega.megatron.graph_route_attention_bias_patch import apply_graph_route_attention_bias_patch
         from cppmega.megatron.te_checkpoint_kwarg_patch import apply_te_checkpoint_kwarg_patch
 
         apply_te_checkpoint_kwarg_patch()
-        apply_dsa_indexer_fused_patch()
+        if os.environ.get("CPPMEGA_DSA_PATCH_ENABLED", "0") == "1":
+            from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_patch
+            apply_dsa_indexer_fused_patch()
         apply_graph_route_attention_bias_patch()
 
         modules = [
@@ -612,14 +744,53 @@ def remote_run_script(
         TEST_SPECS=(
 {test_lines}
         )
+        IFS=: read -r PREFLIGHT_SEQ PREFLIGHT_PREFIX_NAME PREFLIGHT_MAX_EDGES PREFLIGHT_MAX_CHUNKS <<< "${{TEST_SPECS[0]}}"
+        DATA_PREFIX="$CPPMEGA_BUNDLE_ROOT/${{PREFLIGHT_PREFIX_NAME}}"
+        export CPPMEGA_GRAPH_MAX_EDGES="$PREFLIGHT_MAX_EDGES"
+        export CPPMEGA_GRAPH_MAX_CHUNKS="$PREFLIGHT_MAX_CHUNKS"
+        if [[ ! -s "${{DATA_PREFIX}}.bin" || ! -s "${{DATA_PREFIX}}.idx" || ! -s "${{DATA_PREFIX}}.json" ]]; then
+          echo "CPPMEGA_H200_PREFLIGHT_STATUS=FAIL reason=missing_data_prefix prefix=${{DATA_PREFIX}}" | tee -a /data/cppmega_h200_results/summary.log
+          exit 2
+        fi
+        python /opt/cppmega/scripts/h200_megatron_preflight.py \
+          --bundle-root "$CPPMEGA_BUNDLE_ROOT" \
+          --data-prefix "$DATA_PREFIX" \
+          --tokenizer-model "$CPPMEGA_TOKENIZER_MODEL" \
+          --run-id {shlex.quote(run_id)} \
+          --sequence-length "$PREFLIGHT_SEQ" \
+          --micro-batch-size 1 \
+          --fp8-recipe {shlex.quote(fp8_recipe)} \
+{preflight_dsa_arg}\
+          --output /data/cppmega_h200_results/h200_preflight.json
+        echo "CPPMEGA_H200_PREFLIGHT_STATUS=PASS" | tee -a /data/cppmega_h200_results/summary.log
+
         for SPEC in "${{TEST_SPECS[@]}}"; do
-          IFS=: read -r SEQ DATA_PREFIX_NAME <<< "$SPEC"
-          DATA_PREFIX="/data/cppmega_sidecar/${{DATA_PREFIX_NAME}}"
+          IFS=: read -r SEQ DATA_PREFIX_NAME GRAPH_MAX_EDGES GRAPH_MAX_CHUNKS <<< "$SPEC"
+          DATA_PREFIX="$CPPMEGA_BUNDLE_ROOT/${{DATA_PREFIX_NAME}}"
           export DATA_PREFIX
+          export CPPMEGA_GRAPH_MAX_EDGES="$GRAPH_MAX_EDGES"
+          export CPPMEGA_GRAPH_MAX_CHUNKS="$GRAPH_MAX_CHUNKS"
           if [[ ! -s "${{DATA_PREFIX}}.bin" || ! -s "${{DATA_PREFIX}}.idx" || ! -s "${{DATA_PREFIX}}.json" ]]; then
             echo "CPPMEGA_TEST_RESULT seq=${{SEQ}} status=FAIL reason=missing_data_prefix prefix=${{DATA_PREFIX}}" | tee -a /data/cppmega_h200_results/summary.log
             exit 2
           fi
+          CAPACITY_RECEIPT="/data/cppmega_h200_results/graph_capacity_seq_${{SEQ}}.json"
+          python - "$DATA_PREFIX" "$SEQ" "$GRAPH_MAX_EDGES" "$GRAPH_MAX_CHUNKS" "$CAPACITY_RECEIPT" <<'PYCAP'
+        import sys
+        from pathlib import Path
+        from scripts.h200_megatron_preflight import write_graph_capacity_receipt
+
+        receipt = write_graph_capacity_receipt(
+            Path(sys.argv[1]),
+            sequence_length=int(sys.argv[2]),
+            output=Path(sys.argv[5]),
+        )
+        expected = (int(sys.argv[3]), int(sys.argv[4]))
+        actual = (int(receipt["graph_max_edges"]), int(receipt["graph_max_chunks"]))
+        if actual != expected:
+            raise RuntimeError(f"launcher/remote graph capacity mismatch: {{expected}} != {{actual}}")
+        PYCAP
+          echo "CPPMEGA_GRAPH_CAPACITY seq=${{SEQ}} max_edges=${{GRAPH_MAX_EDGES}} max_chunks=${{GRAPH_MAX_CHUNKS}} receipt=${{CAPACITY_RECEIPT}}" | tee -a /data/cppmega_h200_results/summary.log
           SEQ_OOM=0
           for BS in {batches}; do
           LOG="/data/cppmega_h200_results/seq_${{SEQ}}_bs_${{BS}}.log"
@@ -654,12 +825,13 @@ def remote_run_script(
         import runpy
         import sys
 
-        from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_patch
         from cppmega.megatron.graph_route_attention_bias_patch import apply_graph_route_attention_bias_patch
         from cppmega.megatron.te_checkpoint_kwarg_patch import apply_te_checkpoint_kwarg_patch
 
         apply_te_checkpoint_kwarg_patch()
-        apply_dsa_indexer_fused_patch()
+        if os.environ.get('CPPMEGA_DSA_PATCH_ENABLED', '0') == '1':
+            from cppmega.megatron.dsa_indexer_fused_patch import apply_dsa_indexer_fused_patch
+            apply_dsa_indexer_fused_patch()
         apply_graph_route_attention_bias_patch()
 
         if os.environ.get('CPPMEGA_STRUCTURE_ENABLED', '0') == '1':
@@ -715,6 +887,11 @@ def remote_run_script(
               --global-batch-size ${{BS}} \\
               --train-iters {train_iters} \\
               --fp8-recipe {fp8_recipe})\\\"
+            export CPPMEGA_DSA_GRAPH_AUX_ENABLED=1
+            export CPPMEGA_DSA_GRAPH_AUX_WEIGHT=1
+            export CPPMEGA_DSA_INDEXER_LOSS_COEFF=0.001
+            export CPPMEGA_DSA_SKIP_INDEXER_LOSS=0
+            unset CPPMEGA_DENSE_GQA
 
             DATA_ARGS=(--data-path 1.0 \\\"\\$DATA_PREFIX\\")
             OPTIMIZER_ARGS=(--optimizer \\\"\\$CPPMEGA_OPTIMIZER\\\")
@@ -729,7 +906,7 @@ def remote_run_script(
             if [[ \\\"\\$CPPMEGA_GRAD_REDUCE_IN_BF16\\\" == 1 || \\\"\\$CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER\\\" == 1 ]]; then OPTIMIZER_ARGS+=(--grad-reduce-in-bf16); fi
             if [[ \\\"\\$CPPMEGA_LOCAL_DDP_DISABLE_CONTIGUOUS_GRAD_BUFFER\\\" == 1 ]]; then OPTIMIZER_ARGS+=(--local-ddp-disable-contiguous-grad-buffer); fi
 
-            GQA_ARGS=(--group-query-attention --num-query-groups \\\"\\$CPPMEGA_NUM_QUERY_GROUPS\\\" --kv-channels \\\"\\$CPPMEGA_KV_CHANNELS\\\" --swiglu --rotary-base 10000)
+            DSA_ARGS=({dsa_args})
             ATTN_ARGS=(--attention-backend \\\"\\$CPPMEGA_ATTN_BACKEND\\\")
             if [[ \\\"\\$CPPMEGA_USE_FLASH_ATTN\\\" == 1 ]]; then
               ATTN_ARGS=(--use-flash-attn \\\"\\${{ATTN_ARGS[@]}}\\\")
@@ -749,7 +926,7 @@ def remote_run_script(
             python -m torch.distributed.run --nproc_per_node=1 \\\"\\$WORKDIR/pretrain_mamba.py\\\" \\
               \\\"\\${{DATA_ARGS[@]}}\\\" \\
               --tokenizer-type HuggingFaceTokenizer \\
-              --tokenizer-model /data/cpp_tokenizer_hf \\
+              --tokenizer-model \\\"\\$CPPMEGA_TOKENIZER_MODEL\\\" \\
               --vocab-size 65536 \\
               --make-vocab-size-divisible-by 128 \\
               --tensor-model-parallel-size 1 \\
@@ -762,13 +939,13 @@ def remote_run_script(
               --hidden-size \\\"\\$CPPMEGA_HIDDEN_SIZE\\\" \\
               --ffn-hidden-size \\\"\\$CPPMEGA_FFN_HIDDEN_SIZE\\\" \\
               --num-attention-heads \\\"\\$CPPMEGA_NUM_ATTN_HEADS\\\" \\
-              \\\"\\${{GQA_ARGS[@]}}\\\" \\
+              \\\"\\${{DSA_ARGS[@]}}\\\" \\
               --seq-length ${{SEQ}} \\
               --max-position-embeddings ${{SEQ}} \\
               --micro-batch-size ${{BS}} \\
               --global-batch-size ${{BS}} \\
               --train-iters {train_iters} \\
-              --eval-interval 50000000 \\
+              --eval-interval {eval_interval} \\
               --eval-iters 1 \\
               --lr \\\"\\$CPPMEGA_LR\\\" \\
               --min-lr \\\"\\$CPPMEGA_MIN_LR\\\" \\
@@ -782,13 +959,12 @@ def remote_run_script(
               --use-mcore-models \\
               --transformer-impl transformer_engine \\
               \\\"\\${{ATTN_ARGS[@]}}\\\" \\
-              --spec cppmega.megatron.nam56r_noconv_spec build_cppmega_nam56r_noconv_stack_spec \\
+              --spec {dsa_spec_args} \\
               --cross-entropy-loss-fusion \\
               --cross-entropy-fusion-impl te \\
               \\\"\\${{RECOMPUTE_ARGS[@]}}\\\" \\
               --clip-grad 1.0 \\
               \\\"\\${{OPTIMIZER_ARGS[@]}}\\\" \\
-              --no-check-for-nan-in-loss-and-grad \\
               --rerun-mode disabled \\
               \\\"\\${{CHECKPOINT_ARGS[@]}}\\\" \\
               --log-interval 1
@@ -816,7 +992,24 @@ def remote_run_script(
             echo "CPPMEGA_BATCH_RESULT seq=${{SEQ}} batch=${{BS}} status=FAIL exit=${{status}}" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
             exit "$status"
           fi
-          echo "CPPMEGA_BATCH_RESULT seq=${{SEQ}} batch=${{BS}} status=OK" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
+          LOSS_RECEIPT="/data/cppmega_h200_results/seq_${{SEQ}}_bs_${{BS}}_loss_gate.json"
+          if ! python - "$LOG" "{train_iters}" "$LOSS_RECEIPT" <<'PYLOSS'
+        import sys
+        from pathlib import Path
+        from scripts.h200_megatron_preflight import write_training_loss_receipt
+
+        write_training_loss_receipt(
+            Path(sys.argv[1]),
+            expected_iteration=int(sys.argv[2]),
+            output=Path(sys.argv[3]),
+            expected_dsa_coefficient=0.001,
+        )
+        PYLOSS
+          then
+            echo "CPPMEGA_BATCH_RESULT seq=${{SEQ}} batch=${{BS}} status=FAIL reason=finite_loss_gate" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
+            exit 4
+          fi
+          echo "CPPMEGA_BATCH_RESULT seq=${{SEQ}} batch=${{BS}} status=OK loss_receipt=${{LOSS_RECEIPT}}" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
           done
         done
         INNER
@@ -839,6 +1032,10 @@ def parse_batches(raw: str) -> list[int]:
     return values
 
 
+def instance_delete_allowed(*, keep_instance: bool, retrieval_succeeded: bool) -> bool:
+    return not keep_instance and retrieval_succeeded
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--parent-id", default=os.environ.get("NEBIUS_PARENT_ID", DEFAULT_PARENT_ID))
@@ -857,6 +1054,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--ssh-key", type=Path, default=default_ssh_key())
     parser.add_argument("--ssh-pubkey", type=Path, default=None)
     parser.add_argument("--docker-image", default=DEFAULT_DOCKER_IMAGE)
+    parser.add_argument("--bundle-root", type=Path, required=True)
+    parser.add_argument("--hash-jobs", type=int, default=4)
     parser.add_argument("--ghcr-user", default=None)
     parser.add_argument("--ghcr-token-file", type=Path, default=None)
     parser.add_argument("--no-ghcr-auth", action="store_true")
@@ -869,7 +1068,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             "1024=/path/train1024,2048=/path/train2048. Overrides --sidecar-prefix."
         ),
     )
-    parser.add_argument("--tokenizer-dir", type=Path, default=DEFAULT_TOKENIZER_DIR)
+    parser.add_argument("--tokenizer-dir", type=Path, default=None)
     parser.add_argument("--batch-sizes", default="256,512,1024")
     parser.add_argument("--train-iters", type=int, default=3)
     parser.add_argument(
@@ -930,10 +1129,19 @@ def main(argv: Iterable[str] | None = None) -> int:
             "H200 image but reproduces the TE KernelManager cleanup segfault with TE 2.16.0."
         ),
     )
+    parser.add_argument(
+        "--enable-dsa-patch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Install the required fused DSA graph-objective patch.",
+    )
     parser.add_argument("--keep-instance", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
+    validate_docker_image_digest(args.docker_image)
+    if args.train_iters <= 0 or args.hash_jobs <= 0:
+        raise ValueError("train iters and hash jobs must be positive")
     batches = parse_batches(args.batch_sizes)
     effective_disable_nvrtc = args.disable_nvrtc or (
         args.fp8_recipe == "tensorwise" and not args.enable_nvrtc
@@ -951,6 +1159,35 @@ def main(argv: Iterable[str] | None = None) -> int:
             raise ValueError("--sidecar-prefixes did not contain any entries")
     else:
         seq_prefixes = [(1024, args.sidecar_prefix)]
+    bundle_root = args.bundle_root.resolve()
+    manifest, _bundle_artifacts = _validate_bundle(bundle_root, args.hash_jobs)
+    declared_prefixes = {
+        (bundle_root / str(result["prefix"])).resolve(): str(result["prefix"])
+        for result in manifest["bucket_results"]
+    }
+    remote_prefixes: list[tuple[int, str, int, int]] = []
+    for sequence_length, prefix in seq_prefixes:
+        relative = declared_prefixes.get(prefix.resolve())
+        if relative is None:
+            raise ValueError(f"selected prefix is not declared by bundle: {prefix}")
+        capacity = derive_graph_capacity_receipt(
+            prefix,
+            sequence_length=sequence_length,
+        )
+        remote_prefixes.append(
+            (
+                sequence_length,
+                relative,
+                int(capacity["graph_max_edges"]),
+                int(capacity["graph_max_chunks"]),
+            )
+        )
+    tokenizer_relative = str(manifest["tokenizer"]["path"])
+    bundle_tokenizer = (bundle_root / tokenizer_relative).resolve()
+    if args.tokenizer_dir is not None and args.tokenizer_dir.resolve() != bundle_tokenizer:
+        raise ValueError(
+            "--tokenizer-dir must be the descriptor-bound tokenizer inside --bundle-root"
+        )
     if args.load_checkpoint_local and args.load_checkpoint_remote:
         raise ValueError("--load-checkpoint-local and --load-checkpoint-remote are mutually exclusive")
     load_checkpoint_remote = args.load_checkpoint_remote
@@ -964,27 +1201,31 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.dry_run:
         print(f"parent_id={args.parent_id}")
         print(f"sidecar_prefixes={seq_prefixes}")
-        print(f"tokenizer_dir={args.tokenizer_dir}")
+        print(f"bundle_root={bundle_root}")
+        print(f"tokenizer_dir={bundle_tokenizer}")
         print(f"batches={batches}")
         print(
             remote_run_script(
                 batches,
                 args.train_iters,
                 args.docker_image,
-                data_prefix_name=seq_prefixes[0][1].name,
-                seq_data_prefixes=[(seq, prefix.name) for seq, prefix in seq_prefixes],
+                seq_data_prefixes=remote_prefixes,
                 fp8_recipe=args.fp8_recipe,
                 disable_nvrtc=effective_disable_nvrtc,
+                enable_dsa_patch=args.enable_dsa_patch,
                 save_checkpoint=args.save_checkpoint,
                 save_interval=args.save_interval,
                 save_model_only=not args.save_full_state,
                 load_checkpoint_remote=load_checkpoint_remote,
                 load_model_only=not args.load_full_state,
+                tokenizer_model=f"/data/cppmega_bundle/{tokenizer_relative}",
+                run_id=args.instance_name,
             )[:4000]
         )
         return 0
 
     instance_id: str | None = None
+    retrieval_succeeded = False
     try:
         with tempfile.TemporaryDirectory(prefix="cppmega-h200-sweep-") as tmp:
             overlay_tar = Path(tmp) / "cppmega_overlay.tgz"
@@ -992,7 +1233,16 @@ def main(argv: Iterable[str] | None = None) -> int:
             ghcr_auth_tar = Path(tmp) / "cppmega_ghcr_auth.tgz"
             load_checkpoint_tar = Path(tmp) / "cppmega_load_checkpoint.tgz"
             make_overlay_tar(overlay_tar)
-            make_multi_sidecar_tar([prefix for _, prefix in seq_prefixes], args.tokenizer_dir, sidecar_tar)
+            archived_prefixes, archived_tokenizer = make_bundle_tar(
+                bundle_root,
+                [prefix for _, prefix in seq_prefixes],
+                sidecar_tar,
+                hash_jobs=args.hash_jobs,
+            )
+            if archived_prefixes != [prefix for _, prefix, _, _ in remote_prefixes]:
+                raise RuntimeError("bundle archive prefix layout drifted after validation")
+            if archived_tokenizer != tokenizer_relative:
+                raise RuntimeError("bundle archive tokenizer layout drifted after validation")
             if args.load_checkpoint_local:
                 make_checkpoint_tar(args.load_checkpoint_local, load_checkpoint_tar)
             has_ghcr_auth = make_ghcr_auth_tar(args, ghcr_auth_tar)
@@ -1015,15 +1265,17 @@ def main(argv: Iterable[str] | None = None) -> int:
                 batches,
                 args.train_iters,
                 args.docker_image,
-                data_prefix_name=seq_prefixes[0][1].name,
-                seq_data_prefixes=[(seq, prefix.name) for seq, prefix in seq_prefixes],
+                seq_data_prefixes=remote_prefixes,
                 fp8_recipe=args.fp8_recipe,
                 disable_nvrtc=effective_disable_nvrtc,
+                enable_dsa_patch=args.enable_dsa_patch,
                 save_checkpoint=args.save_checkpoint,
                 save_interval=args.save_interval,
                 save_model_only=not args.save_full_state,
                 load_checkpoint_remote=load_checkpoint_remote,
                 load_model_only=not args.load_full_state,
+                tokenizer_model=f"/data/cppmega_bundle/{tokenizer_relative}",
+                run_id=args.instance_name,
             )
             ssh(args, ip, f"cat > /data/run_cppmega_h200_sweep.sh <<'EOF'\n{script}\nEOF\nchmod +x /data/run_cppmega_h200_sweep.sh")
             try:
@@ -1048,19 +1300,18 @@ def main(argv: Iterable[str] | None = None) -> int:
                     f"{args.ssh_user}@{ip}:/data/cppmega_h200_results/.",
                     str(out_dir),
                 ]
-                # Best-effort log fetch: stay loud on failure, but never raise here so a
-                # propagating training exception is not masked.
+                results_failure: str | None = None
                 try:
                     log_proc = run(scp_cmd, check=False)
                 except FileNotFoundError:
-                    print("[nebius-sweep] ERROR: scp unavailable; training log fetch FAILED", file=sys.stderr)
+                    results_failure = "scp is unavailable; results were NOT copied back"
                 else:
                     if log_proc.returncode != 0:
-                        print(
-                            f"[nebius-sweep] ERROR: log fetch scp exited {log_proc.returncode}; "
-                            f"training logs may be missing from {out_dir}",
-                            file=sys.stderr,
+                        results_failure = (
+                            f"results scp exited {log_proc.returncode}; results were NOT "
+                            f"copied to {out_dir}"
                         )
+                ckpt_failure: str | None = None
                 if args.save_checkpoint:
                     ckpt_dir = ROOT / "outputs" / "checkpoints" / args.instance_name
                     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -1081,7 +1332,6 @@ def main(argv: Iterable[str] | None = None) -> int:
                     # The user explicitly asked to save+copy checkpoints, so a failed or
                     # absent transfer is silent data loss -> raise. But if a training
                     # exception is already propagating, do not mask it: be very loud instead.
-                    ckpt_failure: str | None = None
                     try:
                         ckpt_proc = run(ckpt_scp_cmd, check=False)
                     except FileNotFoundError:
@@ -1092,33 +1342,45 @@ def main(argv: Iterable[str] | None = None) -> int:
                                 f"scp exited {ckpt_proc.returncode}; checkpoints were NOT "
                                 f"copied to {ckpt_dir}"
                             )
-                    if ckpt_failure is not None:
-                        if training_failed:
-                            print(
-                                f"[nebius-sweep] ERROR: checkpoint fetch failed ({ckpt_failure}); "
-                                "not raising because a training exception is already propagating",
-                                file=sys.stderr,
-                            )
-                        else:
-                            raise RuntimeError(f"Checkpoint fetch failed: {ckpt_failure}")
+                retrieval_succeeded = results_failure is None and ckpt_failure is None
+                if not retrieval_succeeded:
+                    failures = "; ".join(
+                        failure
+                        for failure in (results_failure, ckpt_failure)
+                        if failure is not None
+                    )
+                    message = f"artifact retrieval failed: {failures}"
+                    print(f"[nebius-sweep] ERROR: {message}", file=sys.stderr)
+                    if not training_failed:
+                        raise RuntimeError(message)
     finally:
-        if instance_id and not args.keep_instance:
-            run(
-                [
-                    "nebius",
-                    "compute",
-                    "instance",
-                    "delete",
-                    instance_id,
-                    "--format",
-                    "json",
-                    "--no-progress",
-                    "--timeout",
-                    "20m",
-                ],
-                check=False,
-                timeout=1500,
-            )
+        if instance_id:
+            if instance_delete_allowed(
+                keep_instance=args.keep_instance,
+                retrieval_succeeded=retrieval_succeeded,
+            ):
+                run(
+                    [
+                        "nebius",
+                        "compute",
+                        "instance",
+                        "delete",
+                        instance_id,
+                        "--format",
+                        "json",
+                        "--no-progress",
+                        "--timeout",
+                        "20m",
+                    ],
+                    check=False,
+                    timeout=1500,
+                )
+            elif not args.keep_instance:
+                print(
+                    f"[nebius-sweep] preserving instance {instance_id}: "
+                    "results/checkpoints were not fully retrieved",
+                    file=sys.stderr,
+                )
     return 0
 
 

@@ -78,13 +78,11 @@ trap 'rm -rf "${REMOTE_WORKDIR}"' EXIT
 # --- Monkey patch / MIMO shim -------------------------------------------------
 #
 # Use the canonical shim module at scripts/cppmega_fp8_shim.py.  It installs:
-#   (1) megatron.core.inference.contexts.static_context.deprecate_inference_params
-#       compatibility alias (needed by mamba3_te_mixer on megatron-core 0.18rc0)
-#   (2) MIMO config patch driven by CPPMEGA_MAMBA3_MIMO / CPPMEGA_MAMBA_NUM_GROUPS
+#   (1) MIMO config patch driven by CPPMEGA_MAMBA3_MIMO / CPPMEGA_MAMBA_NUM_GROUPS
 #       (enables is_mimo=True, rank=4, chunk=16 on TransformerConfig __post_init__)
-#   (3) TransformerConfig.__getattr__ AttributeError fallback for cppmega_mamba3_*
+#   (2) TransformerConfig.__getattr__ AttributeError fallback for cppmega_mamba3_*
 #       (so getattr(..., default) works for optional attributes)
-#   (4) Float16Module.__init__ ONE-SHOT patch that restores Mamba3 fp32 params
+#   (3) Float16Module.__init__ ONE-SHOT patch that restores Mamba3 fp32 params
 #       (dt_bias, D, B_bias, C_bias, mimo_x_bias, mimo_z_bias, mimo_o_bias) after
 #       Megatron's blanket bf16 cast, so the TileLang mamba_mimo_fwd_kernel dtype
 #       contract is preserved.  Replaces the previous per-forward pre-hook which
@@ -94,7 +92,7 @@ cp "${REMOTE_CPPMEGA_ROOT}/scripts/cppmega_fp8_shim.py" "${REMOTE_WORKDIR}/cppme
 
 # --- Quick import smoke -------------------------------------------------------
 PYTHONPATH="${REMOTE_WORKDIR}:${PYTHONPATH:-}" python - <<PY
-import cppmega_fp8_shim  # noqa: F401 -- installs compat aliases
+import cppmega_fp8_shim  # noqa: F401 -- installs runtime patches
 import cppmega
 import megatron
 import transformer_engine
@@ -114,7 +112,7 @@ import os, sys, runpy
 _here = os.path.dirname(os.path.abspath(__file__))
 if _here not in sys.path:
     sys.path.insert(0, _here)
-import cppmega_fp8_shim  # noqa: F401  -- install compat aliases
+import cppmega_fp8_shim  # noqa: F401  -- install runtime patches
 
 # Delegate to the original Megatron pretrain_mamba (which calls pretrain()).
 runpy.run_path(

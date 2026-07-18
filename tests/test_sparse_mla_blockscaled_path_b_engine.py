@@ -93,10 +93,11 @@ def test_path_c_qk_sister_reexported_from_path_b() -> None:
         assert hasattr(pb, name), f"path-b should re-export {name}"
 
 
-def test_wave6_deferral_marker_present_in_docstring() -> None:
-    """Module docstring tells callers Path-B awaits a Path-C MXFP8 rewrite."""
+def test_docstring_records_direct_msl_retirement_and_path_c_replacement() -> None:
+    """The compatibility module must direct prepared buffers to Path C."""
 
     pb = importlib.import_module(_pb_mod_name)
     doc = pb.__doc__ or ""
-    assert "Wave-6" in doc, "missing wave-6 deferral note"
-    assert "Path-C" in doc or "path_c" in doc, "must point at Path-C QK sister"
+    assert "retire" in doc.lower()
+    assert "Path C" in doc or "path_c" in doc
+    assert "force_metal=True" in doc

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from cppmega.recipes.nam56r_nemo_recipe import (
     NAM56RNeMoRecipe,
     build_nemo_hybrid_pattern,
@@ -83,7 +81,7 @@ class TestRecipeArgs:
         assert "--first-last-layers-bf16" in args
         assert "--attention-backend" in args
         idx = args.index("--attention-backend")
-        assert args[idx + 1] == "auto"
+        assert args[idx + 1] == "flash"
 
     def test_selective_recompute_without_cuda_graphs(self):
         """Selective recompute is enabled when CUDA graphs are off."""
@@ -135,10 +133,11 @@ class TestRecipeArgs:
         spec_idx = args.index("--spec")
         assert args[spec_idx + 1] == "megatron.core.models.mamba.mamba_layer_specs"
 
-    def test_mock_data_flag(self):
+    def test_smoke_uses_real_data_contract(self):
         recipe = nam56r_smoke_test()
         args = recipe.to_args()
-        assert "--mock-data" in args
+        assert "--mock-data" not in args
+        assert recipe.mock_data is False
 
     def test_eval_iters_set(self):
         recipe = nam56r_nemo_native_pretrain()
@@ -172,7 +171,11 @@ class TestCudaGraphs:
         assert args[idx + 1] == "transformer_engine"
         assert "--cuda-graph-scope" in args
 
-    def test_mamba3_te_has_cuda_graphs(self):
+    def test_mamba3_te_has_cuda_graphs(self, monkeypatch):
+        monkeypatch.setenv(
+            "CPPMEGA_I_UNDERSTAND_NAM56R_MAMBA3_TE_PRETRAIN_USES_DEPRECATED_NHEADS112",
+            "1",
+        )
         recipe = nam56r_mamba3_te_pretrain()
         args = recipe.to_args()
         assert "--cuda-graph-impl" in args

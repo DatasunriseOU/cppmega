@@ -17,8 +17,8 @@ shards, or a missing required token column all raise with WHERE + WHAT.
 Usage:
     .venv/bin/python build_dataset_manifest.py \
         --dataset-dir /Users/dave/sources/parquet/clang_semantic_4k_v10 \
-        --contract /Volumes/external/sources/cppmega.mlx/cppmega_mlx/tokenizer/tokenizer_contract_v1.json \
-        --tokenizer /Volumes/external/sources/cppmega.mlx/cppmega_mlx/tokenizer/tokenizer.json \
+        --contract data/tokenizer_v2/tokenizer_contract_v1.json \
+        --tokenizer data/tokenizer_v2/tokenizer.json \
         --out /tmp/manifest_clang_semantic_4k_v10.json
 """
 

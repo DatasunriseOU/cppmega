@@ -4,7 +4,7 @@
 #
 # PyPI ships only cp310/cp311 (and nothing for cp313). The prebuilt wheel in
 # sftp://BUCKET_ARTIFACTS/wheels/ was produced locally on bench3 against
-# cu13.2 / torch 2.12 nightly / Python 3.13.
+# cu13.2 / torch 2.13 stable / Python 3.13.
 #
 # Primary path: download prebuilt wheel from GS (or HTTPS mirror), pip install.
 # Fallback:     clone Dao-AILab/fast-hadamard-transform, pip install -e .

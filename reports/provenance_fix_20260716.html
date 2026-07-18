@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Provenance fix - cppmega - 2026-07-16</title>
+  <style>
+    :root { --bg:#f5f7fa; --surface:#fff; --ink:#20252b; --muted:#5c6670; --line:#d7dde5; --blue:#1769aa; --good:#147a43; --good-bg:#e7f6ed; --warn:#8a5b00; --warn-bg:#fff4d6; --code:#20252b; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; }
+    .page { width:min(1180px,100%); margin:0 auto; background:var(--surface); min-height:100vh; padding:34px 44px 70px; }
+    h1 { margin:0 0 6px; font-size:32px; line-height:1.2; }
+    h2 { margin:34px 0 12px; padding-bottom:6px; border-bottom:1px solid var(--line); font-size:22px; }
+    h3 { margin:24px 0 8px; font-size:17px; }
+    .meta { color:var(--muted); margin-bottom:22px; }
+    a { color:var(--blue); }
+    .status { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin:24px 0; }
+    .metric { border:1px solid var(--line); border-radius:6px; padding:13px 15px; background:#fbfcfe; }
+    .metric strong { display:block; font-size:23px; line-height:1.2; color:var(--good); }
+    .metric span { color:var(--muted); font-size:12px; }
+    .ok { background:var(--good-bg); border-left:4px solid var(--good); padding:13px 16px; }
+    .note { background:var(--warn-bg); border-left:4px solid var(--warn); padding:13px 16px; }
+    table { width:100%; border-collapse:collapse; margin:12px 0 18px; }
+    th,td { text-align:left; vertical-align:top; border-bottom:1px solid var(--line); padding:9px 10px; }
+    th { background:#f0f3f7; font-weight:650; }
+    code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+    code { background:#eef1f4; padding:1px 4px; border-radius:3px; overflow-wrap:anywhere; }
+    pre { background:var(--code); color:#f2f5f8; padding:15px 17px; border-radius:6px; overflow:auto; font-size:12.5px; }
+    li { margin:4px 0; }
+    @media (max-width:760px) { .page { padding:24px 18px 50px; } .status { grid-template-columns:repeat(2,minmax(0,1fr)); } h1 { font-size:27px; } }
+  </style>
+</head>
+<body>
+<main class="page">
+  <h1>Исправление provenance для staged commit pipeline</h1>
+  <div class="meta">16 июля 2026 · ветка <code>codex/canonical-complete-20260715</code> · root <a href="https://github.com/DatasunriseOU/cppmega/commit/71786b4">71786b4</a> · MLX <a href="https://github.com/DatasunriseOU/cppmega_mlx/commit/7ca3f71">7ca3f71</a></div>
+
+  <div class="ok"><strong>Результат:</strong> staged checkout больше не выдаёт <code>repo="_src"</code> в commit records. Canonical project identity передаётся в extractor, consumer, PR lookup и parquet; старый cache принимается только с явным legacy receipt.</div>
+
+  <div class="status">
+    <div class="metric"><strong>122</strong><span>MLX focused tests passed</span></div>
+    <div class="metric"><strong>4</strong><span>CUDA identity tests passed</span></div>
+    <div class="metric"><strong>140/140</strong><span>Blender probe docs canonical</span></div>
+    <div class="metric"><strong>0</strong><span>probe parse errors</span></div>
+  </div>
+
+  <h2>Что сломалось</h2>
+  <p>Conveyor складывает staged source в <code>&lt;repo&gt;/_src</code>. Старый extractor принимал имя директории за project identity и писал его в JSONL. После включения строгого symbol identity validator все Blender ranges падали с ошибкой о bare <code>_src</code>.</p>
+  <pre>repo_list.json
+  -> --repo-name canonical-project
+  -> extract_git_history
+  -> --project-id canonical-project
+  -> process_commits
+  -> PR lookup / parquet</pre>
+
+  <h2>Что исправлено</h2>
+  <table>
+    <thead><tr><th>Слой</th><th>Изменение</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td>Extractor</td><td>Добавлен <code>--repo-name</code>; explicit identity проверяется против remote.</td><td><a href="/Volumes/external/sources/cppmega.mlx/scripts/nanochat_data/extract_git_history.py#L730">extract_git_history.py:730</a></td></tr>
+      <tr><td>Consumer</td><td><code>--project-id</code> нормализует legacy rows до PR lookup, пересчитывает оба stable ID и отклоняет конфликтующий canonical project.</td><td><a href="/Volumes/external/sources/cppmega.mlx/tools/clang_indexer/process_commits.py#L2407">process_commits.py:2407</a></td></tr>
+      <tr><td>Stage wiring</td><td>Reindex и conveyor передают identity в обе стороны.</td><td><a href="/Volumes/external/sources/cppmega.mlx/scripts/streaming_reindex_commits.py#L297">streaming_reindex_commits.py:297</a></td></tr>
+      <tr><td>Legacy cache</td><td>Старый completed fingerprint валидируется отдельно; reuse получает <code>hit_legacy_identity_override</code>.</td><td><a href="/Volumes/external/sources/cppmega.mlx/scripts/streaming_conveyor.py#L1199">streaming_conveyor.py:1199</a></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Доказательства</h2>
+  <h3>Тесты</h3>
+  <table>
+    <tr><th>Проверка</th><th>Результат</th></tr>
+    <tr><td>MLX data/conveyor/identity focused suite</td><td><strong>122 passed</strong></td></tr>
+    <tr><td>CUDA root identity suite</td><td><strong>4 passed</strong></td></tr>
+    <tr><td>Production scripts py_compile в обоих checkout</td><td><strong>pass</strong></td></tr>
+    <tr><td>Full local suites</td><td>Большинство passed; оставшиеся failures относятся к pre-existing TileLang/Metal, Megatron environment и stale test-surface contracts.</td></tr>
+  </table>
+
+  <h3>Exact Blender probe</h3>
+  <p>Вход: <code>/tmp/cppmega_v8_blender_r0_probe/blender_r0.jsonl</code>. Выход: <code>140</code> enriched docs из <code>100</code> records.</p>
+  <pre>records_read=100
+documents_written=140
+parse_errors=0
+legacy_identity_overrides=100
+repos={blender/blender}
+bad_repo_stable_ids=0
+bad_filepath_stable_ids=0
+elapsed=67.2s</pre>
+
+  <h3>Production v8</h3>
+  <p>Detached runtime: <code>/Volumes/external/sources/cppmega_mlx_case5_v8_runtime</code>.</p>
+  <p>Run root: <code>/Volumes/external/sources/cppmega.mlx/outputs/conveyor_case5_v8_retry_blender_20260716_0045</code>.</p>
+  <table>
+    <tr><th>Receipt</th><th>Значение</th></tr>
+    <tr><td>External cache</td><td><strong>validated and reused</strong></td></tr>
+    <tr><td>Cached records</td><td>175,111</td></tr>
+    <tr><td>Cache status</td><td><code>hit_legacy_identity_override</code></td></tr>
+    <tr><td>Re-extraction</td><td>0</td></tr>
+    <tr><td>Latest snapshot</td><td>16 completed ranges, 0 failed, 5,676,156 valid tokens</td></tr>
+  </table>
+  <p><a href="/Volumes/external/sources/cppmega.mlx/outputs/launch_case5_v8_retry_blender.sh">Launcher</a> · <a href="/Volumes/external/sources/cppmega.mlx/outputs/conveyor_case5_v8_retry_blender_20260716_0045.log">Log</a> · <a href="/Volumes/external/sources/cppmega.mlx/outputs/conveyor_case5_v8_retry_blender_20260716_0045/progress_commits.jsonl">Progress JSONL</a></p>
+
+  <h2>Live status</h2>
+  <table>
+    <tr><th>Session</th><th>State</th></tr>
+    <tr><td><code>cppmega_case5_v7_code</code></td><td>Жив; последняя receipt около 1.152B valid code tokens.</td></tr>
+    <tr><td><code>cppmega_case5_v7_commits</code></td><td>Остановлен после доказательства исправления; Blender failure storm больше не расходует workers.</td></tr>
+    <tr><td><code>cppmega_case5_v8_blender</code></td><td>Жив; обрабатывает полный Blender legacy cache с canonical normalization.</td></tr>
+  </table>
+
+  <h2>Остаточные риски</h2>
+  <div class="note"><ol>
+    <li>v8 Blender retry ещё не завершён: receipt показывает промежуточные 16 из 1752 ranges.</li>
+    <li>Blender identity из repo-list намеренно записывается как <code>projects.blender.org/blender%2Fblender</code>; это lossless forge identity, не bare name.</li>
+    <li>PR discussion hit rate в 100-record probe равен 0; это отдельная проблема покрытия/key в PR store.</li>
+    <li>На RTX 4070 GPU доступен, но удалённый checkout не содержит torch, Megatron или Transformer Engine; CUDA training smoke без установки нового dependency stack не запускался.</li>
+  </ol></div>
+</main>
+</body>
+</html>

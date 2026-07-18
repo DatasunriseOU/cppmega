@@ -1,41 +1,637 @@
 #!/usr/bin/env python3
-"""GraphQL-primary, resumable PR fetch stream -> pr_store (GH Archive fallback path).
+"""Tier-2 PR ingest, component (5): GraphQL-PRIMARY whole-repo PR streamer.
 
-HYBRID strategy (David): GitHub GraphQL is PRIMARY (free, 5000 pts/hr/token).
-Multiple tokens (secrets/gh_tokens.txt PATs + the gh CLI token) are ROTATED so
-the effective budget is N*5000/hr. GH Archive is only a *fallback* hook invoked
-when GraphQL truly cannot proceed (all tokens rate-limited with a far reset, or
-a repo GraphQL cannot serve).
+The HYBRID strategy the user chose: GraphQL is the PRIMARY (free) path; GH
+Archive is only the FALLBACK when we hit a wall on a particular repo (too many
+PRs / chronic rate limiting). Where ``github_graphql_fallback.py`` fetches ONE
+(repo, pr_number) at a time (gap-filling), THIS module streams EVERY PR of EVERY
+repo in ``repo_list.json`` by paginating the ``pullRequests`` connection, and
+folds each PR into the same ``pr_store`` (by (repo,pr_number) AND by
+(repo, mergeCommit.oid)).
 
-RULE #1 (fail loud, no silent fallback):
-  * If a token hits its rate limit we ROTATE to the next token. If ALL tokens are
-    exhausted we do NOT silently skip / drop PRs -- we RAISE TokenExhausted with
-    the soonest reset time so the caller decides (wait or hand off to GH Archive).
-  * Any unexpected GraphQL error body is raised with the repo + cursor context.
-  * Resume is exact: the per-(repo,'pr') cursor checkpoint in pr_store means a
-    re-run continues from the last saved endCursor and never refetches a page.
+For each repo we page::
 
-Each PR is stored with its REAL number, title, body, state, author, timestamps,
-merge_commit_sha, plus the first N comments and reviews (author + body each).
+  repository(owner,name){
+    pullRequests(first:100, after:$cursor, states:[MERGED,CLOSED,OPEN],
+                 orderBy:{field:CREATED_AT, direction:ASC}){
+      nodes{ number mergeCommit{oid} title body
+             comments(first:100){nodes{author{login} body createdAt}}
+             reviews(first:50){nodes{author{login} state body submittedAt}}
+             closingIssuesReferences(first:20){nodes{number title body}} }
+      pageInfo{ hasNextPage endCursor } } }
+
+Token rotation (REUSED from github_graphql_fallback.TokenPool): round-robin over
+the 6 tokens (the 5 PATs in ``secrets/gh_tokens.txt`` PLUS the ``gh auth token``
+of the logged-in CLI account). On a token's primary limit
+(X-RateLimit-Remaining==0), secondary/abuse limit, or 429 we cool that token and
+rotate to the next; when EVERY token is cooling we FAIL LOUD (RULE #1) after
+recording the (repo, cursor) so a later run resumes mid-repo — we never silently
+skip a repo on token exhaustion.
+
+Checkpointing / resume (RULE #1: a crash must not lose progress, and must not
+silently drop a repo):
+  * A MANIFEST (JSON) records, per repo: status (pending|in_progress|done|
+    fallback), the last successfully-committed ``endCursor``, and PR counts.
+  * On (re)start we skip ``done`` repos and resume ``in_progress`` repos FROM
+    their saved cursor. The manifest is rewritten atomically after each
+    committed page, so resume is per-repo AND per-cursor.
+
+GH Archive FALLBACK HOOK (does NOT block the stream): if a repo trips the
+fallback heuristic — its total PR count exceeds ``--fallback-pr-threshold`` or it
+rate-limits us more than ``--fallback-ratelimit-trips`` times — we mark it
+``fallback`` in the manifest AND append it to ``--fallback-list`` (JSONL) for the
+gharchive_run.sh path to pick up, then MOVE ON to the next repo. We do not abort
+the whole stream for one pathological repo.
+
+Usage:
+  python3 scripts/pr_ingest/graphql_pr_stream.py \
+      --repo-list outputs/pr_ingest/repo_list.json \
+      --store out/pr_store.sqlite \
+      --tokens secrets/gh_tokens.txt \
+      --manifest out/graphql_stream_manifest.json \
+      --fallback-list out/graphql_fallback_repos.jsonl
+
+  # Validate on ONE explicit repo before repo_list.json exists:
+  python3 scripts/pr_ingest/graphql_pr_stream.py \
+      --repo tilelang/tilelang --store out/pr_store.sqlite \
+      --tokens secrets/gh_tokens.txt --manifest out/m.json \
+      --fallback-list out/fb.jsonl --max-prs 5
 """
 
-from __future__ import annotations
-
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime as _dt
 import json
+import os
 import subprocess
 import sys
+import threading
 import time
-from typing import Callable, Optional
+import urllib.error
+import urllib.request
+from typing import Any, Callable, Optional
 
-import requests
+# Package-safe for tests/imports; direct-script execution adds only the repo root.
+if __package__ in (None, ""):
+    repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
 
-from pr_store import PRStore
+from scripts.pr_ingest import pr_store  # noqa: E402
+from scripts.pr_ingest.github_graphql_fallback import load_tokens  # noqa: E402
 
-GITHUB_GRAPHQL = "https://api.github.com/graphql"
+GQL_URL = "https://api.github.com/graphql"
+
+# One page of a repo's pullRequests connection. Each PR's comments/reviews are
+# fetched first-page only (100 comments / 50 reviews) inline; the rare PR with
+# MORE than that is finished by the per-PR gap-filler in
+# github_graphql_fallback.py (we record it for that path). This keeps the stream
+# query cheap and bounded so we page repos fast and rate-limit-lightly.
+REPO_PR_QUERY = """
+query($owner:String!, $name:String!, $cursor:String) {
+  repository(owner:$owner, name:$name) {
+    pullRequests(first:100, after:$cursor,
+                 states:[MERGED,CLOSED,OPEN],
+                 orderBy:{field:CREATED_AT, direction:ASC}) {
+      totalCount
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        title
+        body
+        mergeCommit { oid }
+        comments(first:100) {
+          totalCount
+          nodes { author { login } body createdAt }
+        }
+        reviews(first:50) {
+          totalCount
+          nodes { author { login } state body submittedAt }
+        }
+        closingIssuesReferences(first:20) {
+          nodes { number title body }
+        }
+      }
+    }
+  }
+}
+"""
 
 
+# --------------------------------------------------------------------------- #
+# Token loading: 5 PATs from the file + the gh CLI account token = 6 tokens.   #
+# --------------------------------------------------------------------------- #
+def load_all_tokens(tokens_file: str, include_gh_cli: bool = True) -> list[str]:
+    """Reuse github_graphql_fallback.load_tokens, then append `gh auth token`.
+
+    RULE #1: if --include-gh-cli is on and `gh auth token` cannot be obtained we
+    RAISE (we do not silently run with fewer tokens than the user asked for).
+    """
+    toks = load_tokens(tokens_file)
+    if include_gh_cli:
+        try:
+            out = subprocess.run(
+                ["gh", "auth", "token"],
+                check=True, capture_output=True, text=True, timeout=30,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+            raise SystemExit(
+                f"[graphql-stream] --include-gh-cli set but `gh auth token` "
+                f"failed: {e}. Run `gh auth login`, or pass --no-gh-cli."
+            )
+        gh_tok = (out.stdout or "").strip()
+        if not gh_tok:
+            raise SystemExit(
+                "[graphql-stream] `gh auth token` returned empty; "
+                "run `gh auth login` or pass --no-gh-cli."
+            )
+        if gh_tok not in toks:
+            toks.append(gh_tok)
+    if not toks:
+        raise SystemExit("[graphql-stream] no tokens available (file + gh cli both empty)")
+    return toks
+
+
+# --------------------------------------------------------------------------- #
+# Manifest: per-repo resumable checkpoint.                                     #
+# --------------------------------------------------------------------------- #
+class Manifest:
+    """Per-(repo, endCursor) resumable checkpoint, persisted atomically."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.RLock()
+        self.data: dict = {"repos": {}}
+        if os.path.exists(path):
+            with open(path) as f:
+                try:
+                    self.data = json.load(f)
+                except json.JSONDecodeError as e:
+                    raise SystemExit(
+                        f"[graphql-stream] manifest {path} is corrupt JSON: {e}. "
+                        f"Move it aside to start fresh (RULE #1: not silently overwriting)."
+                    )
+            if "repos" not in self.data:
+                raise SystemExit(
+                    f"[graphql-stream] manifest {path} missing 'repos' key (wrong file?)"
+                )
+
+    def get(self, repo: str) -> dict:
+        with self._lock:
+            return dict(self.data["repos"].get(repo, {}))
+
+    def status(self, repo: str) -> str:
+        return self.get(repo).get("status", "pending")
+
+    def cursor(self, repo: str):
+        return self.get(repo).get("cursor")
+
+    def update(self, repo: str, **fields) -> None:
+        with self._lock:
+            rec = self.data["repos"].setdefault(repo, {})
+            rec.update(fields)
+            self._flush()
+
+    def _flush(self) -> None:
+        d = os.path.dirname(os.path.abspath(self.path))
+        os.makedirs(d, exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.data, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, self.path)  # atomic on POSIX
+
+
+class StreamAborted(Exception):
+    """Raised inside a worker when a sibling worker hit a fatal condition.
+
+    The shared ``stop_event`` is set by the failing worker; every other worker
+    checks it between pages / HTTP attempts and raises this so the pool tears
+    down promptly instead of hanging on ``shutdown(wait=True)``."""
+
+
+class SharedTokenPool:
+    """ONE thread-safe token pool shared by ALL workers (fixes the H4 double-spend).
+
+    The previous per-worker ``TokenPool`` gave every worker a PRIVATE
+    ``cooldown_until``, so a 401/rate-limit cooldown on a PAT was invisible to
+    the other workers -- two workers would keep hammering the SAME PAT past its
+    GLOBAL (per-token) GitHub limit, and one worker's cooldown could not stop the
+    others. This single pool serializes ALL token state (rotation + cooldowns)
+    under one lock so a cooldown set by any worker is honored by every worker,
+    and ``AllTokensExhausted`` is raised only when every token is genuinely
+    cooling (RULE #1: fail loud, no silent double-spend).
+    """
+
+    def __init__(self, tokens: list[str]):
+        toks = list(tokens)
+        if not toks:
+            raise SystemExit("[graphql-stream] SharedTokenPool got no tokens")
+        self.tokens = toks
+        self.cooldown_until = [0.0] * len(toks)
+        self._idx = 0
+        self._lock = threading.Lock()
+
+    def acquire(self) -> tuple[int, str]:
+        """Reserve the next non-cooling token (round-robin across workers).
+
+        Returns ``(idx, token)``. RAISES :class:`AllTokensExhausted` when every
+        token is cooling, carrying the soonest reset so the caller can report it.
+        """
+        with self._lock:
+            now = time.time()
+            n = len(self.tokens)
+            for _ in range(n):
+                i = self._idx
+                self._idx = (self._idx + 1) % n
+                if self.cooldown_until[i] <= now:
+                    return i, self.tokens[i]
+            soonest = min(self.cooldown_until) - now
+            raise AllTokensExhausted(soonest)
+
+    def cool(self, idx: int, seconds: float) -> None:
+        """Cool token ``idx`` for ``seconds`` -- visible to ALL workers at once."""
+        with self._lock:
+            self.cooldown_until[idx] = time.time() + max(1.0, seconds)
+
+
+# --------------------------------------------------------------------------- #
+# HTTP POST with the same rate-limit semantics as the fallback gap-filler.     #
+# --------------------------------------------------------------------------- #
+def _post(token: str, variables: dict) -> tuple[int, dict, dict]:
+    payload = json.dumps({"query": REPO_PR_QUERY, "variables": variables}).encode()
+    req = urllib.request.Request(GQL_URL, data=payload, method="POST")
+    req.add_header("Authorization", f"bearer {token}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", "cppmega-pr-ingest")
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            return resp.status, dict(resp.headers), json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        headers = dict(e.headers or {})
+        try:
+            body = json.loads(e.read().decode())
+        except Exception:
+            body = {"message": str(e)}
+        return e.code, headers, body
+
+
+class AllTokensExhausted(Exception):
+    """Raised when every token is cooling. Carries the soonest reset (s)."""
+
+    def __init__(self, soonest_s: float):
+        super().__init__(f"all tokens rate-limited; soonest reset ~{soonest_s:.0f}s")
+        self.soonest_s = soonest_s
+
+
+class RepoRateLimited(Exception):
+    """Soft signal: this page kept rate-limiting; caller may route to fallback."""
+
+
+def _post_with_rotation(pool: "SharedTokenPool", variables: dict, owner: str, name: str,
+                        max_retries: int,
+                        stop_event: threading.Event | None = None) -> dict:
+    """POST one page via the SHARED pool, rotating tokens on rate limits.
+
+    Returns the JSON body on success. RAISES:
+      * StreamAborted when ``stop_event`` was set by a sibling worker's fatal
+        failure (so we abort promptly instead of hanging the pool).
+      * SystemExit on auth/other-403/GraphQL-errors (fail loud — real bug).
+      * AllTokensExhausted when every (shared) token is cooling (caller records
+        cursor and re-raises as a loud failure).
+      * RepoRateLimited when we burn the per-page retry budget on THIS repo
+        (caller decides: route to GH Archive fallback, do NOT abort the stream).
+    """
+    attempts = 0
+    unauthorized = 0
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            raise StreamAborted(f"{owner}/{name}: aborted by sibling worker failure")
+        # Reserve a usable token from the SHARED pool (raises AllTokensExhausted
+        # when every token is cooling) -- cooldowns set below are seen by all.
+        idx, token = pool.acquire()
+        status, headers, jb = _post(token, variables)
+
+        if status == 401:
+            unauthorized += 1
+            sys.stderr.write(
+                f"[graphql-stream] token #{idx} unauthorized for "
+                f"{owner}/{name}; cooling it for ALL workers\n"
+            )
+            sys.stderr.flush()
+            pool.cool(idx, 24 * 3600)
+            if unauthorized >= len(pool.tokens):
+                raise SystemExit(
+                    f"[graphql-stream] all tokens unauthorized while streaming "
+                    f"{owner}/{name}; fix the PAT(s)/gh token"
+                )
+            continue
+
+        remaining = headers.get("X-RateLimit-Remaining")
+        retry_after = headers.get("Retry-After")
+        jb_lower = json.dumps(jb).lower()
+        is_secondary = status == 403 and (
+            retry_after is not None
+            or "secondary rate limit" in jb_lower
+            or "abuse" in jb_lower
+        )
+        if status == 403 and not is_secondary and "rate limit" not in jb_lower:
+            raise SystemExit(
+                f"[graphql-stream] 403 Forbidden (not a rate limit) for "
+                f"{owner}/{name}: {jb.get('message', jb)}"
+            )
+        if is_secondary or (remaining is not None and remaining == "0") or status == 429:
+            attempts += 1
+            if attempts > max_retries:
+                # Burned the per-page budget on THIS repo -> soft signal up.
+                raise RepoRateLimited()
+            if retry_after is not None:
+                wait = float(retry_after)
+            else:
+                reset = headers.get("X-RateLimit-Reset")
+                wait = max(1.0, float(reset) - time.time()) if reset else 30.0
+            # Cool THIS token for all workers; the next loop's acquire() rotates
+            # to the next usable token or raises AllTokensExhausted when none.
+            pool.cool(idx, wait)
+            continue
+
+        if status != 200:
+            raise SystemExit(
+                f"[graphql-stream] HTTP {status} for {owner}/{name}: {jb}"
+            )
+        if jb.get("errors"):
+            # A NOT_FOUND on the repository is a real, recordable outcome, not a
+            # transient. Surface it loudly with the repo so the caller logs it.
+            raise SystemExit(
+                f"[graphql-stream] GraphQL errors for {owner}/{name}: {jb['errors']}"
+            )
+        return jb
+
+
+# --------------------------------------------------------------------------- #
+# Map a GraphQL PR node -> the pr_store.upsert_record() record shape.          #
+# --------------------------------------------------------------------------- #
+def _pr_node_to_record(repo: str, node: dict) -> tuple[dict, bool]:
+    """Return (record, truncated). ``truncated`` is True when this PR had MORE
+    comments/reviews than one page (the per-PR gap-filler should finish it)."""
+    number = node["number"]
+    mc = node.get("mergeCommit")
+    merge_sha = mc.get("oid") if mc else None
+
+    comments: list[dict] = []
+    reviews: list[dict] = []
+    linked: list[dict] = []
+    truncated = False
+
+    cn = node.get("comments") or {}
+    for n in cn.get("nodes", []):
+        comments.append({
+            "user": (n.get("author") or {}).get("login", "") if n.get("author") else "",
+            "body": n.get("body", "") or "",
+            "created_at": n.get("createdAt", "") or "",
+            "kind": "comment",
+        })
+    if (cn.get("totalCount") or 0) > len(cn.get("nodes", [])):
+        truncated = True
+
+    rv = node.get("reviews") or {}
+    for n in rv.get("nodes", []):
+        reviews.append({
+            "user": (n.get("author") or {}).get("login", "") if n.get("author") else "",
+            "state": n.get("state", "") or "",
+            "body": n.get("body", "") or "",
+            "created_at": n.get("submittedAt", "") or "",
+        })
+    if (rv.get("totalCount") or 0) > len(rv.get("nodes", [])):
+        truncated = True
+
+    for li in (node.get("closingIssuesReferences") or {}).get("nodes", []):
+        linked.append({
+            "number": li["number"],
+            "title": li.get("title", "") or "",
+            "body": li.get("body", "") or "",
+        })
+
+    comments.sort(key=lambda c: c.get("created_at") or "")
+    reviews.sort(key=lambda r: r.get("created_at") or "")
+    rec = {
+        "repo": repo,
+        "pr_number": number,
+        "merge_commit_sha": merge_sha,
+        "pr_title": node.get("title", "") or "",
+        "pr_body": node.get("body", "") or "",
+        "comments": comments,
+        "reviews": reviews,
+        "linked_issues": linked,
+    }
+    return rec, truncated
+
+
+# --------------------------------------------------------------------------- #
+# Stream ONE repo, paginating + checkpointing per page.                        #
+# --------------------------------------------------------------------------- #
+def stream_repo(
+    pool: "SharedTokenPool",
+    conn,
+    manifest: Manifest,
+    repo: str,
+    *,
+    fallback_pr_threshold: int,
+    fallback_ratelimit_trips: int,
+    fallback_list_path: str,
+    max_prs: int | None = None,
+    max_retries: int = 8,
+    truncated_targets_path: str | None = None,
+    append_lock: threading.Lock | None = None,
+    stop_event: threading.Event | None = None,
+) -> dict:
+    """Stream all PRs of ``repo``. Resumes from manifest cursor if present.
+
+    Returns a per-repo stats dict. RAISES AllTokensExhausted up to the caller
+    (after the manifest already holds the resumable cursor). RAISES StreamAborted
+    if ``stop_event`` is set (a sibling worker failed fatally) so the pool tears
+    down promptly. Routes the repo to the GH Archive fallback (and returns) when
+    the fallback heuristic trips.
+    """
+    if "/" not in repo:
+        raise SystemExit(f"[graphql-stream] repo must be 'owner/name', got {repo!r}")
+    owner, name = repo.split("/", 1)
+
+    cursor = manifest.cursor(repo)  # None on a fresh repo, else resume point
+    manifest.update(repo, status="in_progress")
+    stats = {"repo": repo, "prs": 0, "truncated": 0, "pages": 0, "ratelimit_trips": 0}
+    total_count = None
+
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            raise StreamAborted(f"{repo}: aborted by sibling worker failure")
+        variables = {"owner": owner, "name": name, "cursor": cursor}
+        try:
+            jb = _post_with_rotation(pool, variables, owner, name, max_retries,
+                                     stop_event=stop_event)
+        except RepoRateLimited:
+            stats["ratelimit_trips"] += 1
+            if stats["ratelimit_trips"] >= fallback_ratelimit_trips:
+                _route_to_fallback(
+                    manifest, repo, fallback_list_path, cursor,
+                    reason="ratelimit", stats=stats, total_count=total_count,
+                    append_lock=append_lock,
+                )
+                return stats
+            # Another wall on the same page but under the trip cap: brief pause,
+            # then retry the SAME cursor (no progress lost).
+            time.sleep(2.0)
+            continue
+
+        prconn = ((jb.get("data") or {}).get("repository") or {}).get("pullRequests")
+        if prconn is None:
+            # repository present but pullRequests null is anomalous -> fail loud.
+            raise SystemExit(
+                f"[graphql-stream] {repo}: data.repository.pullRequests is null "
+                f"(repo missing or no PR access): {jb}"
+            )
+
+        if total_count is None:
+            total_count = prconn.get("totalCount")
+            # Fallback heuristic on size: a huge repo is routed to GH Archive at
+            # the very first page, BEFORE we burn quota paging it here.
+            if (total_count or 0) > fallback_pr_threshold:
+                _route_to_fallback(
+                    manifest, repo, fallback_list_path, cursor,
+                    reason="too_many_prs", stats=stats, total_count=total_count,
+                    append_lock=append_lock,
+                )
+                return stats
+
+        for node in prconn.get("nodes", []):
+            rec, truncated = _pr_node_to_record(repo, node)
+            pr_store.upsert_record(conn, rec, commit=False)
+            stats["prs"] += 1
+            if truncated:
+                stats["truncated"] += 1
+                if truncated_targets_path:
+                    _append_jsonl(
+                        truncated_targets_path,
+                        {"repo": repo, "pr_number": rec["pr_number"]},
+                        lock=append_lock,
+                    )
+            if max_prs is not None and stats["prs"] >= max_prs:
+                conn.commit()
+                manifest.update(
+                    repo, status="in_progress", cursor=cursor,
+                    prs=stats["prs"], total_count=total_count,
+                    note=f"stopped at --max-prs={max_prs}",
+                )
+                stats["pages"] += 1
+                return stats
+
+        stats["pages"] += 1
+        conn.commit()
+        pi = prconn.get("pageInfo") or {}
+        end_cursor = pi.get("endCursor")
+        has_next = pi.get("hasNextPage")
+
+        # Checkpoint AFTER the page's PRs are committed: resume continues from
+        # this exact endCursor (per-repo + per-cursor resumability).
+        cursor = end_cursor
+        manifest.update(
+            repo,
+            status="in_progress" if has_next else "done",
+            cursor=cursor if has_next else None,
+            prs=stats["prs"], truncated=stats["truncated"],
+            total_count=total_count,
+        )
+        if not has_next:
+            break
+
+    return stats
+
+
+def _route_to_fallback(manifest: Manifest, repo: str, fallback_list_path: str,
+                       cursor, *, reason: str, stats: dict, total_count,
+                       append_lock: threading.Lock | None = None) -> None:
+    """Mark repo for the GH Archive path WITHOUT aborting the stream."""
+    manifest.update(
+        repo, status="fallback", cursor=cursor,
+        fallback_reason=reason, prs=stats["prs"], total_count=total_count,
+    )
+    _append_jsonl(fallback_list_path, {
+        "repo": repo, "reason": reason, "cursor": cursor,
+        "total_count": total_count, "prs_streamed": stats["prs"],
+    }, lock=append_lock)
+    stats["fallback"] = reason
+    sys.stderr.write(
+        f"[graphql-stream] {repo}: routed to GH Archive fallback ({reason}; "
+        f"total_count={total_count}); continuing stream.\n"
+    )
+    sys.stderr.flush()
+
+
+def _append_jsonl(path: str, obj: dict, *, lock: threading.Lock | None = None) -> None:
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    if lock is not None:
+        with lock:
+            with open(path, "a") as f:
+                f.write(json.dumps(obj) + "\n")
+        return
+    with open(path, "a") as f:
+        f.write(json.dumps(obj) + "\n")
+
+
+# --------------------------------------------------------------------------- #
+# Repo list loading.                                                          #
+# --------------------------------------------------------------------------- #
+def load_repo_list(path: str) -> list[str]:
+    """Load only GitHub ``owner_repo`` keys from a mixed-forge repo list."""
+    if not os.path.exists(path):
+        raise SystemExit(
+            f"[graphql-stream] --repo-list not found: {path}. "
+            f"Pass --repo owner/name to validate on a single repo instead."
+        )
+    with open(path) as f:
+        data = json.load(f)
+    repos = data.get("repos")
+    if not isinstance(repos, list):
+        raise SystemExit(
+            f"[graphql-stream] {path} has no 'repos' list (wrong file?)"
+        )
+    out = []
+    seen: set[str] = set()
+    for index, r in enumerate(repos):
+        if not isinstance(r, dict):
+            raise SystemExit(
+                f"[graphql-stream] {path}: repos[{index}] must be an object"
+            )
+        owner_repo = r.get("owner_repo")
+        if owner_repo is None:
+            continue
+        if not isinstance(owner_repo, str) or not owner_repo:
+            raise SystemExit(
+                f"[graphql-stream] invalid owner_repo in repos[{index}]: {r}"
+            )
+        project_identity = r.get("project_identity")
+        if (
+            project_identity is not None
+            and project_identity != owner_repo
+        ):
+            raise SystemExit(
+                f"[graphql-stream] repos[{index}] has conflicting project_identity "
+                f"{project_identity!r} and owner_repo {owner_repo!r}"
+            )
+        if owner_repo in seen:
+            continue
+        seen.add(owner_repo)
+        out.append(owner_repo)
+    if not out:
+        raise SystemExit(f"[graphql-stream] {path} resolved zero repos")
+    return out
+
+
+
+# Root compatibility: exact cursor semantics used by existing callers/tests.
 def _now_utc() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
 
@@ -111,9 +707,15 @@ query($owner:String!, $name:String!, $after:String) {
 """
 
 
-def _graphql_post(token: str, query: str, variables: dict) -> requests.Response:
+def _graphql_post(token: str, query: str, variables: dict) -> Any:
+    try:
+        import requests
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "GraphQL PR ingestion requires the requests package for live HTTP calls"
+        ) from exc
     return requests.post(
-        GITHUB_GRAPHQL,
+        GQL_URL,
         headers={
             "Authorization": f"bearer {token}",
             "Content-Type": "application/json",
@@ -124,7 +726,7 @@ def _graphql_post(token: str, query: str, variables: dict) -> requests.Response:
     )
 
 
-def _reset_epoch_from_headers(resp: requests.Response) -> Optional[int]:
+def _reset_epoch_from_headers(resp: Any) -> Optional[int]:
     v = resp.headers.get("X-RateLimit-Reset")
     if v and v.isdigit():
         return int(v)
@@ -132,7 +734,7 @@ def _reset_epoch_from_headers(resp: requests.Response) -> Optional[int]:
 
 
 def fetch_repo(
-    store: PRStore,
+    store: pr_store.PRStore,
     rotator: TokenRotator,
     owner: str,
     name: str,
@@ -140,7 +742,7 @@ def fetch_repo(
     max_prs: Optional[int],
     comment_cap: int,
     verbose: bool = True,
-    graphql_post: Callable[[str, str, dict], requests.Response] = _graphql_post,
+    graphql_post: Callable[[str, str, dict], Any] = _graphql_post,
 ) -> dict:
     """Fetch PRs for owner/name into store, resuming from the saved cursor."""
     repo = f"{owner}/{name}"
@@ -269,62 +871,171 @@ def fetch_repo(
     }
 
 
-def load_tokens(tokens_file: Optional[str], use_gh_cli: bool) -> list[str]:
-    toks: list[str] = []
-    if tokens_file:
-        with open(tokens_file) as fh:
-            for line in fh:
-                t = line.strip()
-                if t and not t.startswith("#"):
-                    toks.append(t)
-    if use_gh_cli:
-        try:
-            out = subprocess.run(
-                ["gh", "auth", "token"], capture_output=True, text=True, check=True
-            ).stdout.strip()
-            if out and out not in toks:
-                toks.append(out)
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"gh auth token failed: {e.stderr}")
-    # de-dup, preserve order
-    seen: set[str] = set()
-    uniq = []
-    for t in toks:
-        if t not in seen:
-            seen.add(t)
-            uniq.append(t)
-    if not uniq:
-        raise RuntimeError("no tokens loaded (need --tokens file and/or gh CLI login)")
-    return uniq
 
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--repo-list", help="repo_list.json from build_repo_list.py")
+    src.add_argument("--repo", help="single owner/name (validate before repo_list exists)")
 
-def main(argv: Optional[list[str]] = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--repo", required=True, help="owner/repo")
-    ap.add_argument("--db", default="outputs/pr_ingest/prs.sqlite")
-    ap.add_argument("--tokens", default=None, help="file of GitHub tokens, one per line")
-    ap.add_argument("--no-gh-cli", action="store_true", help="do not append the gh CLI token")
-    ap.add_argument("--max-pages", type=int, default=None)
-    ap.add_argument("--max-prs", type=int, default=None)
-    ap.add_argument("--comment-cap", type=int, default=20)
+    ap.add_argument("--store", required=True, help="pr_store SQLite path")
+    ap.add_argument("--tokens", required=True, help="File of GitHub PATs, one/line")
+    ap.add_argument("--manifest", required=True, help="Per-repo resume manifest JSON")
+    ap.add_argument("--fallback-list", required=True,
+                    help="JSONL of repos routed to the GH Archive fallback")
+    ap.add_argument("--truncated-targets",
+                    help="JSONL of (repo,pr_number) whose comments/reviews "
+                         "overflowed one page (finish via github_graphql_fallback.py)")
+    ap.add_argument("--no-gh-cli", dest="include_gh_cli", action="store_false",
+                    help="Do NOT append `gh auth token` as the 6th token")
+    ap.add_argument("--fallback-pr-threshold", type=int, default=20000,
+                    help="Route a repo to GH Archive if totalCount exceeds this")
+    ap.add_argument("--fallback-ratelimit-trips", type=int, default=3,
+                    help="Route a repo to GH Archive after this many page-level "
+                         "rate-limit walls")
+    ap.add_argument("--max-retries", type=int, default=8,
+                    help="Per-page rate-limit retry budget before a fallback trip")
+    ap.add_argument("--max-prs", type=int,
+                    help="Stop each repo after N PRs (validation/smoke)")
+    ap.add_argument("--max-repos", type=int,
+                    help="Process at most N repos this run (validation/smoke)")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="Number of repos to stream concurrently. Each worker "
+                         "gets its own SQLite connection; ALL workers share ONE "
+                         "token pool so per-PAT rate limits are accounted once.")
     args = ap.parse_args(argv)
 
-    if "/" not in args.repo:
-        raise SystemExit(f"--repo must be owner/repo, got {args.repo!r}")
-    owner, name = args.repo.split("/", 1)
-    tokens = load_tokens(args.tokens, use_gh_cli=not args.no_gh_cli)
-    sys.stderr.write(f"[tokens] loaded {len(tokens)} token(s)\n")
-    rotator = TokenRotator(tokens)
+    tokens = load_all_tokens(args.tokens, include_gh_cli=args.include_gh_cli)
+    sys.stderr.write(f"[graphql-stream] token pool size = {len(tokens)}\n")
+    # ONE shared, thread-safe token pool for ALL workers: a cooldown set by any
+    # worker is honored by every worker, so concurrent workers cannot double-spend
+    # the SAME PAT's global rate limit (H4 fix).
+    pool = SharedTokenPool(tokens)
+    # Cross-worker abort flag: a worker that hits a fatal condition sets this so
+    # the others stop between pages instead of the pool hanging on shutdown.
+    stop_event = threading.Event()
+    # Open once in the parent to create schema and switch the DB into WAL before
+    # workers open their own connections.
+    parent_conn = pr_store.connect(args.store, create=True)
+    parent_conn.close()
+    manifest = Manifest(args.manifest)
+    append_lock = threading.Lock()
 
-    with PRStore(args.db) as store:
-        result = fetch_repo(
-            store, rotator, owner, name,
-            max_pages=args.max_pages, max_prs=args.max_prs,
-            comment_cap=args.comment_cap,
+    repos = [args.repo] if args.repo else load_repo_list(args.repo_list)
+    if args.max_repos is not None:
+        repos = repos[: args.max_repos]
+
+    totals = {"repos_done": 0, "repos_fallback": 0, "prs": 0, "truncated": 0}
+    runnable: list[str] = []
+    seen_runnable: set[str] = set()
+    for repo in repos:
+        if repo in seen_runnable:
+            continue
+        seen_runnable.add(repo)
+        st = manifest.status(repo)
+        if st == "done":
+            sys.stderr.write(f"[graphql-stream] {repo}: already done, skipping\n")
+            continue
+        if st == "fallback":
+            sys.stderr.write(f"[graphql-stream] {repo}: already routed to fallback, skipping\n")
+            totals["repos_fallback"] += 1
+            continue
+        runnable.append(repo)
+
+    def run_one(repo: str, worker_index: int) -> dict:
+        conn = pr_store.connect(args.store, create=True)
+        try:
+            st = manifest.status(repo)
+            sys.stderr.write(
+                f"[graphql-stream] streaming {repo}"
+                + (f" (resume cursor={manifest.cursor(repo)})" if st == "in_progress" else "")
+                + f" worker={worker_index}\n"
+            )
+            sys.stderr.flush()
+            return stream_repo(
+                pool, conn, manifest, repo,
+                fallback_pr_threshold=args.fallback_pr_threshold,
+                fallback_ratelimit_trips=args.fallback_ratelimit_trips,
+                fallback_list_path=args.fallback_list,
+                max_prs=args.max_prs, max_retries=args.max_retries,
+                truncated_targets_path=args.truncated_targets,
+                append_lock=append_lock,
+                stop_event=stop_event,
+            )
+        finally:
+            conn.close()
+
+    def record_stats(repo: str, stats: dict) -> None:
+        totals["prs"] += stats["prs"]
+        totals["truncated"] += stats["truncated"]
+        if stats.get("fallback"):
+            totals["repos_fallback"] += 1
+        elif manifest.status(repo) == "done":
+            totals["repos_done"] += 1
+        sys.stderr.write(
+            f"[graphql-stream] {repo}: prs={stats['prs']} pages={stats['pages']} "
+            f"truncated={stats['truncated']} "
+            f"{'FALLBACK=' + stats['fallback'] if stats.get('fallback') else 'done'}\n"
         )
-        result["tokens_used"] = rotator.used_count()
-        result["tokens_available"] = len(tokens)
-    print(json.dumps(result, indent=2))
+        sys.stderr.flush()
+
+    workers = max(1, int(args.workers or 1))
+    if args.repo:
+        workers = 1
+    if workers == 1:
+        for i, repo in enumerate(runnable):
+            try:
+                record_stats(repo, run_one(repo, i))
+            except AllTokensExhausted as e:
+                cur = manifest.cursor(repo)
+                raise SystemExit(
+                    f"[graphql-stream] ALL {len(tokens)} tokens rate-limited while "
+                    f"streaming {repo} (soonest reset ~{e.soonest_s:.0f}s). "
+                    f"Progress saved: manifest={args.manifest} repo={repo} "
+                    f"cursor={cur!r}. Re-run the SAME command after the reset "
+                    f"(or add more PATs) to RESUME mid-repo. FAILING LOUD per RULE #1."
+                )
+    else:
+        # NOTE: do NOT use `with ThreadPoolExecutor(...)` here. Its __exit__ runs
+        # shutdown(wait=True), which on a fatal error would BLOCK until every
+        # already-submitted repo finishes streaming (a hang, not a fast abort).
+        # Instead, on a fatal error we set stop_event (workers bail between pages)
+        # and shutdown(wait=False, cancel_futures=True) so the process exits
+        # promptly. FAILING LOUD per RULE #1, without hanging.
+        executor = ThreadPoolExecutor(max_workers=workers)
+        future_repo = {
+            executor.submit(run_one, repo, i): repo
+            for i, repo in enumerate(runnable)
+        }
+        try:
+            for fut in as_completed(future_repo):
+                repo = future_repo[fut]
+                try:
+                    record_stats(repo, fut.result())
+                except StreamAborted:
+                    # A sibling worker already hit the fatal condition and raises
+                    # the loud SystemExit below; this worker just bailed cleanly.
+                    continue
+                except AllTokensExhausted as e:
+                    stop_event.set()
+                    cur = manifest.cursor(repo)
+                    raise SystemExit(
+                        f"[graphql-stream] ALL {len(tokens)} tokens rate-limited while "
+                        f"streaming {repo} (soonest reset ~{e.soonest_s:.0f}s). "
+                        f"Progress saved: manifest={args.manifest} repo={repo} "
+                        f"cursor={cur!r}. Re-run the SAME command after the reset "
+                        f"(or add more PATs) to RESUME mid-repo. FAILING LOUD per RULE #1."
+                    )
+        finally:
+            stop_event.set()
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    sys.stderr.write(
+        f"[graphql-stream] DONE repos_done={totals['repos_done']} "
+        f"repos_fallback={totals['repos_fallback']} prs={totals['prs']} "
+        f"truncated={totals['truncated']} store={args.store}\n"
+    )
     return 0
 
 

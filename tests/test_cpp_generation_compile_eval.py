@@ -24,6 +24,63 @@ def _load_module():
     return module
 
 
+def test_resolve_clang_format_prefers_path_and_returns_executable() -> None:
+    module = _load_module()
+
+    assert module.resolve_clang_format("/opt/llvm/bin/clang-format") == (
+        "/opt/llvm/bin/clang-format"
+    )
+
+
+def test_resolve_clang_format_uses_xcrun_when_path_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module()
+    calls: list[list[str]] = []
+
+    def fake_which(name: str) -> str | None:
+        return "/usr/bin/xcrun" if name == "xcrun" else None
+
+    def fake_run(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout="/Applications/Xcode.app/clang-format\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(module.shutil, "which", fake_which)
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    assert module.resolve_clang_format("clang-format") == (
+        "/Applications/Xcode.app/clang-format"
+    )
+    assert calls == [["xcrun", "--find", "clang-format"]]
+
+
+def test_resolve_clang_format_tolerates_broken_xcrun_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module()
+
+    monkeypatch.setattr(
+        module.shutil,
+        "which",
+        lambda name: "/usr/bin/xcrun" if name == "xcrun" else None,
+    )
+    monkeypatch.setattr(module.Path, "is_file", lambda _path: False)
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(["xcrun"], timeout=5)
+        ),
+    )
+
+    assert module.resolve_clang_format("clang-format") == "clang-format"
+
+
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
     path.write_text(
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
@@ -33,6 +90,10 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
 
 @pytest.mark.skipif(shutil.which("clang++") is None, reason="clang++ not installed")
 def test_reference_docstring_suite_compiles_and_runs(tmp_path: Path) -> None:
+    gold_path = ROOT / "evals" / "cpp_docstring_compile_reference.jsonl"
+    gold_rows = [json.loads(line) for line in gold_path.read_text().splitlines()]
+    assert all(row["completion_source"] == "gold_fixture" for row in gold_rows)
+
     out = tmp_path / "report.json"
     proc = subprocess.run(
         [
@@ -41,7 +102,7 @@ def test_reference_docstring_suite_compiles_and_runs(tmp_path: Path) -> None:
             "--cases",
             str(ROOT / "evals" / "cpp_docstring_compile_cases.jsonl"),
             "--completions",
-            str(ROOT / "evals" / "cpp_docstring_compile_reference.jsonl"),
+            str(gold_path),
             "--out",
             str(out),
             "--fail-on-fail",
@@ -52,9 +113,17 @@ def test_reference_docstring_suite_compiles_and_runs(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0, proc.stderr
     report = json.loads(out.read_text())
-    assert report["summary"]["total"] == 4
-    assert report["summary"]["passed"] == 4
+    assert report["summary"]["total"] == 5
+    assert report["summary"]["passed"] == 5
+    assert report["summary"]["repository_cases"] == 1
     assert all(item["compile_ok"] and item["run_ok"] for item in report["results"])
+    repo_result = next(
+        item
+        for item in report["results"]
+        if item["task_id"] == "case3_add_one_checked"
+    )
+    assert repo_result["compile_context"] == "repository"
+    assert len(repo_result["linked_sources"]) == 3
 
 
 @pytest.mark.skipif(shutil.which("clang++") is None, reason="clang++ not installed")
@@ -183,8 +252,8 @@ def test_parallel_jobs_preserve_order_and_pass(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0, proc.stderr
     report = json.loads(out.read_text())
-    assert report["summary"]["total"] == 4
-    assert report["summary"]["passed"] == 4
+    assert report["summary"]["total"] == 5
+    assert report["summary"]["passed"] == 5
     assert report["summary"]["jobs"] == 3
     ids = [item["task_id"] for item in report["results"]]
     assert ids == sorted(ids)  # deterministic sorted order under parallelism
@@ -228,10 +297,14 @@ def test_prompts_jsonl_preserves_sidecar_contract(tmp_path: Path) -> None:
     prompts = tmp_path / "prompts.jsonl"
     module.write_prompts(cases, prompts)
 
-    first = json.loads(prompts.read_text(encoding="utf-8").splitlines()[0])
-    assert first["language"] == "cpp"
-    assert "prompt" in first
-    assert first["sidecar_contract"]["prompt_sidecars_required"] == [
+    rows = [
+        json.loads(line)
+        for line in prompts.read_text(encoding="utf-8").splitlines()
+    ]
+    clamp = next(row for row in rows if row["task_id"] == "clamp_int")
+    assert clamp["language"] == "cpp"
+    assert "prompt" in clamp
+    assert clamp["sidecar_contract"]["prompt_sidecars_required"] == [
         "platform_ids",
         "token_structure_ids",
         "token_ast_depth",

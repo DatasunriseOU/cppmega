@@ -10,9 +10,8 @@ option for cuTile Python kernel testing. B200 is the next best target: it is
 the datacenter Blackwell in cuTile's supported --gpu-name list and is also
 the consumer-deployment target for future cppmega releases.
 
-Stack targeted (matches memory/reference_stack_bench.md where possible):
-- torch 2.12 nightly on cu13x (prefers cu132 to match bench3 exactly; pip
-  will resolve whichever nightly exists today)
+Stack targeted:
+- torch 2.13.0 stable on cu132
 - cuda-tile             (NVIDIA cuTile Python, the `import cuda.tile as ct` pkg)
 - apache-tvm-ffi==0.1.9 (CRITICAL: MUST be <0.1.10 for TileLang)
 - tilelang==0.1.8
@@ -61,9 +60,9 @@ import modal
 
 _PYTHON = "3.13"
 
-# Torch nightly: the cu132 nightly index, resolved at image build time.
-# We pin the major.minor to 2.12.* to stay on the same branch as bench3.
-_TORCH_NIGHTLY_INDEX = "https://download.pytorch.org/whl/nightly/cu132"
+# Stable CUDA wheel. Keep exact so Modal image layers and extension ABI agree.
+_TORCH_VERSION = "2.13.0+cu132"
+_TORCH_INDEX = "https://download.pytorch.org/whl/cu132"
 
 # GPU spec: B200:2 by default. Override via env for dev.
 _GPU_SPEC = os.environ.get("CPPMEGA_MODAL_GPU", "B200:2")
@@ -82,18 +81,16 @@ def _image() -> modal.Image:
     base: Any = modal.Image.debian_slim(python_version=_PYTHON)
     img = (
         base.apt_install("git", "build-essential", "ninja-build", "curl", "ca-certificates")
-        # Torch 2.12 nightly cu132 (match bench3). pre=True enables nightlies;
-        # extra_index_url keeps PyPI available for the rest of the deps.
+        # Stable torch 2.13 cu132; extra_index_url keeps PyPI available for deps.
         .pip_install(
-            "torch==2.12.*",
+            f"torch=={_TORCH_VERSION}",
             "numpy>=1.26",
             "packaging",
             "wheel",
             "setuptools",
             "einops",
             "ninja",
-            extra_index_url=_TORCH_NIGHTLY_INDEX,
-            pre=True,
+            extra_index_url=_TORCH_INDEX,
         )
         # nvcc for tileiras JIT. Torch's cu132 wheel already brings
         # nvidia-cuda-nvrtc / nvidia-cuda-runtime / cuda-toolkit meta as
@@ -116,7 +113,7 @@ def _image() -> modal.Image:
         )
         # mamba-ssm reference kernel is installed in a SEPARATE layered
         # image (`image_with_mamba` below) because its source build is
-        # fragile against torch 2.12 nightly (no prebuilt wheels on PyPI
+        # fragile against the stable torch 2.13 CUDA stack (no prebuilt wheels
         # for this torch version as of 2026-04-10). The sanity path does
         # not need mamba-ssm, so we keep the base image lean and fast.
         # Put nvcc on PATH globally so tileiras can find it. env dict is
@@ -188,10 +185,10 @@ except ImportError:
 def _image_with_mamba() -> modal.Image:
     """Overlay mamba-ssm 2.3.1 + causal-conv1d on top of the base image.
 
-    Kept separate because mamba-ssm has no prebuilt wheel for torch 2.12
-    nightly as of 2026-04-10, so we build from source. The build needs
+    Kept separate because mamba-ssm has no prebuilt wheel for our torch 2.13
+    CUDA stack, so we build from source. The build needs
     nvcc (already on PATH in the base), --no-build-isolation (so the
-    build env sees torch 2.12+cu132 from the outer layer instead of a
+    build env sees torch 2.13.0+cu132 from the outer layer instead of a
     stale torch 2.11+cu130 from PyPI), and TORCH_CUDA_ARCH_LIST='10.0'
     to target B200 sm_100.
 
@@ -214,7 +211,7 @@ def _image_with_mamba() -> modal.Image:
               "C_INCLUDE_PATH": "/usr/local/lib/python3.13/site-packages/nvidia/cu13/include",
               "CUDA_INCLUDE_DIRS": "/usr/local/lib/python3.13/site-packages/nvidia/cu13/include",
               # Link-time and run-time search paths for libcudart / cuBLAS /
-              # other nvidia-cu13 runtime libraries. The torch 2.12+cu132
+              # other nvidia-cu13 runtime libraries. The torch 2.13.0+cu132
               # meta-wheel lays them out under nvidia/cu13/lib — but also
               # under nvidia/cu13/lib/x86_64-linux-gnu in some layouts,
               # hence the double path here. (Confirmed the exact layout
@@ -410,7 +407,8 @@ def sanity() -> dict[str, Any]:
 
     # ---- mamba_ssm reference availability ----
     # NOTE: mamba_ssm is NOT installed in the base sanity image (its source
-    # build is fragile against torch 2.12 nightly). It lives in the layered
+    # build is fragile against the stable torch 2.13 CUDA stack). It lives in
+    # the layered
     # image built by _image_with_mamba() and is only loaded by the Mamba3
     # MIMO parity test in modal_cutile_mamba_mimo.py.
     try:

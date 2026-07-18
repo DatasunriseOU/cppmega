@@ -9,7 +9,7 @@
 # --dsa-indexer-topk 256, --dsa-indexer-loss-coeff 0.001.
 #
 # Machine: europe h200_1 (LOCATION_2)
-# Stack: torch 2.12 nightly, megatron-core 0.18, TE 2.13, cuDNN 92000
+# Stack: torch 2.13 stable cu132, megatron-core 0.18, TE 2.13, cuDNN 92000
 set -euo pipefail
 
 REMOTE_ROOT="${REMOTE_ROOT:-/home/dave/cppmega-root}"
@@ -86,21 +86,6 @@ cat > "${WORKDIR}/cppmega_mimo_shim.py" <<'PY'
 from __future__ import annotations
 import os
 import sys
-
-# (1) deprecate_inference_params compatibility shim
-try:
-    from megatron.core.inference.contexts import static_context as _sc
-    if not hasattr(_sc, "deprecate_inference_params"):
-        try:
-            from megatron.core.utils import deprecate_inference_params as _dip
-        except ImportError:
-            def _dip(inference_context, inference_params):
-                if inference_context is None and inference_params is not None:
-                    return inference_params
-                return inference_context
-        _sc.deprecate_inference_params = _dip
-except Exception as _exc:
-    print(f"[cppmega_mimo_shim] static_context alias skipped: {_exc}", file=sys.stderr)
 
 # (2) MIMO __post_init__
 _mimo_on = os.environ.get("CPPMEGA_MAMBA3_MIMO", "0") == "1"

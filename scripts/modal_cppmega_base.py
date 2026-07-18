@@ -1,7 +1,7 @@
 """Modal base image for cppmega stack — bench3/GB10 parity via prebuilt wheels.
 
 Stack (all cp313 prebuilt, no source builds):
-  - torch 2.12.* nightly cu132 (from pytorch nightly index)
+  - torch 2.13.0 stable cu132
   - transformer_engine_torch 2.13.0   (local wheel)
   - transformer_engine_cu13 + meta     (pypi, pulled by TE torch bindings)
   - mamba_ssm 2.3.1 (local wheel — @31f3d7b + bench patches baked in)
@@ -28,7 +28,8 @@ import modal
 
 PYTHON_VERSION = "3.13"
 CUDA_BASE = "nvidia/cuda:13.2.0-cudnn-devel-ubuntu24.04"
-TORCH_NIGHTLY_INDEX = "https://download.pytorch.org/whl/nightly/cu132"
+TORCH_VERSION = "2.13.0+cu132"
+TORCH_INDEX = "https://download.pytorch.org/whl/cu132"
 MEGATRON_COMMIT = "980211ae"  # bench3's pin (2026-04-09), before output_cross_entropy_loss kwarg
 
 _REPO_ROOT = pathlib.Path(__file__).parent.parent
@@ -62,14 +63,13 @@ def cppmega_base_image() -> modal.Image:
             "TORCH_CUDA_ARCH_LIST": "9.0",
             "PYTHONPATH": "/opt/megatron-lm",
         })
-        # torch 2.12 nightly cu132 + pure-Python deps (no source builds needed).
+        # Stable torch 2.13 cu132 + pure-Python deps (no source builds needed).
         .pip_install(
-            "torch==2.12.*",
+            f"torch=={TORCH_VERSION}",
             "numpy>=1.26", "packaging", "wheel", "setuptools", "ninja",
             "einops", "pybind11", "pyyaml", "regex",
             "sentencepiece", "tiktoken", "six", "scipy",
-            extra_index_url=TORCH_NIGHTLY_INDEX,
-            pre=True,
+            extra_index_url=TORCH_INDEX,
         )
         # TE + wheel-pkg declared deps (must be present BEFORE installing
         # our --no-deps wheels, because mamba_ssm/TE import time needs them).

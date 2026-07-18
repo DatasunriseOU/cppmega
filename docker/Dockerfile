@@ -44,9 +44,9 @@ ENV NVCC_PREPEND_FLAGS="--compiler-bindir=/usr/bin/g++-15 --allow-unsupported-co
 # --- python deps from PyPI (stable, slow-changing layer) --------------------
 RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel
 
-ARG TORCH_INDEX=https://download.pytorch.org/whl/nightly/cu132
-ARG TORCH_VERSION=2.13.0.dev20260611+cu132
-RUN python -m pip install --pre --extra-index-url ${TORCH_INDEX} \
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu132
+ARG TORCH_VERSION=2.13.0+cu132
+RUN python -m pip install --extra-index-url ${TORCH_INDEX} \
         "torch==${TORCH_VERSION}" \
         numpy packaging ninja einops pybind11 pyyaml regex \
         sentencepiece tiktoken six scipy filelock typing-extensions \

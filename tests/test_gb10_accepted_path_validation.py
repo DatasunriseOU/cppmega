@@ -151,9 +151,9 @@ def test_probe_json_parser_rejects_cutlass_native_sidecar_peak():
 
     errors = validate_probe_report(report)
 
-    assert "mxfp8_tn_sidecar_registry_peak=1; expected 0 for compact_direct_v1" in errors
-    assert "mxfp8_tn_sidecar_registry_peak_bytes=65536; expected 0 for compact_direct_v1" in errors
-    assert "mxfp8_tn_sidecar_attr_attached=1; expected 0 for compact_direct_v1" in errors
+    assert errors == [
+        "mxfp8_tn_sidecar_registry_peak=1; expected 0 for cutlass_native"
+    ]
 
 
 def test_probe_json_parser_accepts_flashinfer_cutlass_backend():

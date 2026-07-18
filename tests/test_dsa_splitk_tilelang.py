@@ -1,19 +1,39 @@
-"""Numerical-parity tests for the TileLang Path C DSA split-K indexer loss.
+"""Optional parity tests for a separately supplied TileLang DSA reference.
 
-The kernels under test live at
-``cppmega_mlx/nn/_tilelang/dsa_splitk_indexer_loss.py`` and replace the
-CUDA-only Triton ``_fwd_fused_indexer_loss_stage1_kernel`` /
-``_stage2_kernel`` in ``cppmega/megatron/dsa_splitk_indexer_loss.py`` on
-hosts where TileLang is available (both CUDA and Apple Metal SIMDgroup).
+Set ``CPPMEGA_MLX_REFERENCE_ROOT`` to a cppmega.mlx checkout to enable these
+tests. Production dispatch remains in ``cppmega.megatron`` and never imports
+the reference package.
 """
 
 from __future__ import annotations
 
 import math
+import os
+from pathlib import Path
+import sys
+
 import pytest
 
+
+_REFERENCE_ROOT_RAW = os.environ.get("CPPMEGA_MLX_REFERENCE_ROOT")
+if not _REFERENCE_ROOT_RAW:
+    pytest.skip(
+        "set CPPMEGA_MLX_REFERENCE_ROOT to enable optional DSA parity tests",
+        allow_module_level=True,
+    )
+_REFERENCE_ROOT = Path(_REFERENCE_ROOT_RAW).expanduser().resolve()
+if not (_REFERENCE_ROOT / "cppmega_mlx" / "__init__.py").is_file():
+    pytest.skip(
+        f"invalid CPPMEGA_MLX_REFERENCE_ROOT: {_REFERENCE_ROOT}",
+        allow_module_level=True,
+    )
+sys.path.insert(0, str(_REFERENCE_ROOT))
+
 torch = pytest.importorskip("torch")
-pytest.importorskip("cppmega_mlx.nn._tilelang.dsa_splitk_indexer_loss")
+_reference_module = pytest.importorskip(
+    "cppmega_mlx.nn._tilelang.dsa_splitk_indexer_loss"
+)
+assert Path(_reference_module.__file__).resolve().is_relative_to(_REFERENCE_ROOT)
 from cppmega_mlx.nn._tilelang.dsa_splitk_indexer_loss import (  # noqa: E402
     dsa_splitk_indexer_loss_tilelang,
     dsa_splitk_path_c_status,
@@ -136,27 +156,21 @@ def test_dsa_splitk_indexer_loss_matches_triton_reference():
     index_scores = torch.randn(AB, ASq, Sk, dtype=torch.float32, device="cuda")
     topk_indices = torch.zeros(AB, ASq, 4, dtype=torch.long, device="cuda")
 
-    # Force TileLang via the public API (the wrapper in
-    # ``compute_dsa_indexer_loss_splitk`` already prefers TileLang when both
-    # paths are available).
+    # Invoke the external reference directly; it is intentionally outside the
+    # root production dispatch path.
     out_tilelang = dsa_splitk_indexer_loss_tilelang(
         index_scores, topk_indices, query, key,
         softmax_scale=softmax_scale, loss_coeff=loss_coeff,
         sparse_loss=False, pg_collection=None,
     )
 
-    # Run the legacy Triton path by temporarily disabling the TileLang gate.
-    import cppmega.megatron.dsa_splitk_indexer_loss as mod
-    saved = mod._has_dsa_tilelang
-    try:
-        mod._has_dsa_tilelang = False
-        out_triton = compute_dsa_indexer_loss_splitk(
-            index_scores, topk_indices, query, key,
-            softmax_scale=softmax_scale, loss_coeff=loss_coeff,
-            sparse_loss=False, pg_collection=None,
-        )
-    finally:
-        mod._has_dsa_tilelang = saved
+    # The production wrapper is root-owned Triton; TileLang remains an
+    # explicit test-only parity reference.
+    out_triton = compute_dsa_indexer_loss_splitk(
+        index_scores, topk_indices, query, key,
+        softmax_scale=softmax_scale, loss_coeff=loss_coeff,
+        sparse_loss=False, pg_collection=None,
+    )
 
     # CUDA Triton vs TileLang parity on the same shape/seed should be tight;
     # both run fp16 inputs with fp32 online-softmax accumulation. Tighten

@@ -14,7 +14,7 @@ Pack/unpack uses Transformer Engine by default. The older Triton/PyTorch path
 is fail-closed and requires an explicit deprecated-path acknowledgement.
 
 Usage:
-    from nanochat.fp8_activations import enable_fp8_activation_checkpointing
+    from cppmega.megatron.fp8_activations import enable_fp8_activation_checkpointing
 
     # Native mode (no extra deps)
     enable_fp8_activation_checkpointing(model)
@@ -34,7 +34,6 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, TypeAlias, cast
 
 import torch
@@ -60,8 +59,8 @@ _FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
 # Minimum tensor size (in elements) to bother with FP8 quantization.
 # Tensors smaller than this get more overhead from quantize/dequantize than
 # they save in memory. Default 16384 elements = 32KB in BF16.
-# Configurable via NANOCHAT_FP8_MIN_ELEMENTS env var.
-_FP8_MIN_ELEMENTS = int(os.environ.get("NANOCHAT_FP8_MIN_ELEMENTS", "16384"))
+# Configurable via CPPMEGA_FP8_MIN_ELEMENTS env var.
+_FP8_MIN_ELEMENTS = int(os.environ.get("CPPMEGA_FP8_MIN_ELEMENTS", "16384"))
 
 # Check hardware support
 _FP8_AVAILABLE = False
@@ -89,37 +88,6 @@ try:
     _TRITON_AVAILABLE = True
 except ImportError:
     pass
-
-# Tier-1 PoC of the unified TileLang fused-kernel pipeline. The Path C port
-# of ``_amax_kernel`` and ``_quantize_kernel`` lives in cppmega.mlx and runs
-# on both CUDA and Apple Metal SIMDgroup. ``has_tilelang`` is the import-time
-# probe; ``tilelang_supports(device)`` is the per-call dispatch gate that
-# replaces ``tensor.is_cuda`` on the pack hot-paths below.
-has_tilelang = False
-fp8_pack_tilelang: Any | None = None  # type: ignore[no-redef]
-
-
-def tilelang_supports(_device: torch.device) -> bool:  # noqa: D401 - thin shim
-    """Default no-op gate, replaced below when the Path C module imports."""
-
-    return False
-
-
-try:
-    from cppmega_mlx.nn._tilelang.fp8_amax import (  # type: ignore[import-not-found]
-        fp8_pack_tilelang as _fp8_pack_tilelang,
-        tilelang_supports as _tilelang_supports,
-    )
-
-    has_tilelang = True
-    fp8_pack_tilelang = _fp8_pack_tilelang
-    tilelang_supports = _tilelang_supports  # type: ignore[assignment]
-except (ImportError, ModuleNotFoundError, AttributeError):  # pragma: no cover - hosts without cppmega.mlx / TileLang
-    # Narrow exception set so genuine errors from the Path C module
-    # (TileLang version mismatch, malformed PrimFunc, missing intrinsics)
-    # surface instead of being silently swallowed.
-    has_tilelang = False
-
 
 PackedActivation: TypeAlias = (
     torch.Tensor
@@ -199,7 +167,7 @@ class fp8_quantize_disabled:
 
     Example::
 
-        from nanochat.fp8_activations import fp8_quantize_disabled
+        from cppmega.megatron.fp8_activations import fp8_quantize_disabled
 
         class MyModule(nn.Module):
             def forward(self, x):
@@ -596,9 +564,10 @@ def _use_te_packer() -> bool:
         )
         return False
     if backend not in {"te", "transformer_engine", "auto"}:
-        logger.warning(
-            "Unknown CPPMEGA_FP8_ACTIVATION_BACKEND=%s; using Transformer Engine if available.",
-            backend,
+        raise ValueError(
+            "unsupported CPPMEGA_FP8_ACTIVATION_BACKEND="
+            f"{backend!r}; expected te, transformer_engine, auto, or an "
+            "explicitly acknowledged legacy backend"
         )
     if not _TE_AVAILABLE and torch.cuda.is_available():
         _allow_legacy_activation_backend(
@@ -612,14 +581,12 @@ def _use_te_packer() -> bool:
 def _use_triton_fused() -> bool:
     """Return True if legacy fused Triton FP8 kernels should be used.
 
-    Can be disabled via NANOCHAT_FP8_NO_TRITON=1. Needed on torch 2.12
+    Can be disabled via CPPMEGA_FP8_NO_TRITON=1. Needed on torch 2.12
     nightly + triton 3.7 + sm90 where inductor async precompile of the
     quantize kernel hits a Triton LLIR PassManager::run failure during
     `.to(tl.float8e4nv)` lowering.  The unfused PyTorch path (abs().max()
     then div().clamp().to(fp8)) gets fused by inductor transparently.
     """
-    if os.environ.get("NANOCHAT_FP8_NO_TRITON", "0") == "1":
-        return False
     if os.environ.get("CPPMEGA_FP8_NO_TRITON", "0") == "1":
         return False
     return _TRITON_AVAILABLE and torch.cuda.is_available()
@@ -659,8 +626,6 @@ class FP8ActivationPacker:
 
         if _use_te_packer() and tensor.is_cuda:
             return _te_fp8_pack(tensor)
-        if has_tilelang and tilelang_supports(tensor.device) and fp8_pack_tilelang is not None:
-            return fp8_pack_tilelang(tensor)
         if _use_triton_fused() and tensor.is_cuda:
             return _triton_fp8_pack(tensor)
         return _unfused_fp8_pack(tensor)
@@ -712,8 +677,6 @@ class ClampingFP8Packer:
 
         if _use_te_packer() and tensor.is_cuda:
             return _te_fp8_pack(tensor, clamp=True)
-        if has_tilelang and tilelang_supports(tensor.device) and fp8_pack_tilelang is not None:
-            return fp8_pack_tilelang(tensor, clamp=True)
         if _use_triton_fused() and tensor.is_cuda:
             return _triton_fp8_pack(tensor, clamp=True)
         return _unfused_fp8_pack(tensor, clamp=True)
@@ -737,6 +700,12 @@ def enable_fp8_activation_checkpointing(
     Returns:
         dict with status info
     """
+    backend = backend.strip().lower()
+    if backend not in {"native", "coat"}:
+        raise ValueError(
+            f"unsupported FP8 activation backend {backend!r}; expected 'native' or 'coat'"
+        )
+
     if not _FP8_AVAILABLE:
         logger.warning(
             "FP8 activations not available (need SM90+ GPU with torch.float8_e4m3fn). "
@@ -746,10 +715,10 @@ def enable_fp8_activation_checkpointing(
 
     if backend == "coat":
         if not _COAT_AVAILABLE:
-            logger.warning("COAT not installed (pip install fp8-coat). Using native FP8.")
-            backend = "native"
-        else:
-            return _enable_coat_fp8(model)
+            raise RuntimeError(
+                "COAT FP8 backend was requested but fp8-coat is not installed"
+            )
+        return _enable_coat_fp8(model)
 
     # Native: register pack/unpack hooks on checkpoint context
     # This works with torch.utils.checkpoint.checkpoint() calls
@@ -801,8 +770,7 @@ def _enable_coat_fp8(model: torch.nn.Module) -> dict:
         elif hasattr(coat, "fp8_model_init"):
             coat.fp8_model_init(model)
         else:
-            logger.warning("COAT installed but API not recognized. Using native FP8.")
-            return enable_fp8_activation_checkpointing(model, backend="native")
+            raise RuntimeError("COAT is installed but exposes no supported FP8 API")
 
         logger.info("COAT FP8 training enabled (activations + optimizer states)")
         return {
@@ -811,8 +779,7 @@ def _enable_coat_fp8(model: torch.nn.Module) -> dict:
             "features": ["fp8_activations", "fp8_optimizer_states"],
         }
     except Exception as e:
-        logger.warning(f"COAT initialization failed: {e}. Using native FP8.")
-        return enable_fp8_activation_checkpointing(model, backend="native")
+        raise RuntimeError("COAT FP8 initialization failed") from e
 
 
 class LayerAwareFP8Packer:
@@ -862,7 +829,7 @@ def get_fp8_activation_checkpoint_context(
 
     Use this in place of torch.utils.checkpoint.checkpoint():
 
-        from nanochat.fp8_activations import get_fp8_activation_checkpoint_context
+        from cppmega.megatron.fp8_activations import get_fp8_activation_checkpoint_context
 
         ctx = get_fp8_activation_checkpoint_context()
         with ctx:
