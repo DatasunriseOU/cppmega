@@ -137,9 +137,13 @@ for loader in (_load_indexer, _load_data_indexer):
         assert 'Cross-checkout cppmega/cppmega.mlx indexer mixing is unsupported' in str(exc)
     else:
         raise AssertionError('cross-checkout clang indexer was accepted')
-"""
+    """
     environment = os.environ.copy()
-    environment.pop("PYTHONPATH", None)
+    # The repository runner enables PYTHONSAFEPATH, so removing PYTHONPATH
+    # would intentionally hide the checkout under test and let an editable
+    # package from another checkout win. Bind the subprocess to this exact
+    # source tree instead of relying on cwd or ambient editable finders.
+    environment["PYTHONPATH"] = str(ROOT)
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=ROOT,
