@@ -25,21 +25,21 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from cppmega.data.build_parsers import (
+from cppmega.data.build_parsers import (  # noqa: E402
     parse_bazel,
     parse_cmake,
     parse_configure,
     parse_make,
     parse_ninja,
 )
-from cppmega.data.diagnostic_parsers import (
+from cppmega.data.diagnostic_parsers import (  # noqa: E402
     parse_build_error,
     parse_clang_diagnostic,
     parse_linker_error,
     parse_sanitizer_output,
     parse_test_output,
 )
-from cppmega.data.domain_schema import (
+from cppmega.data.domain_schema import (  # noqa: E402
     DOMAIN_EDGE_FIELD_FAMILIES,
     DomainKind,
     DomainRoleKind,
@@ -47,7 +47,7 @@ from cppmega.data.domain_schema import (
     delimiter_token_ids,
     domain_edge_family,
 )
-from cppmega.data.shell_parsers import (
+from cppmega.data.shell_parsers import (  # noqa: E402
     parse_bash,
     parse_ksh,
     parse_sh,
