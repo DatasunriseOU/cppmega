@@ -78,6 +78,9 @@ def _valid_objective_contract() -> dict[str, object]:
         "graph_auxiliary": {
             "recipe": stage1_graph_recipe_binding(),
             "relations": list(STAGE1_GRAPH_RELATIONS),
+            "bias_beta": "1",
+            "score_formula": "i_neural_plus_beta_s_graph_v1",
+            "score_stage": "before_topk",
             "eligible_samples": 1,
             "positive_edges": 5,
             "global_weight": "1",
