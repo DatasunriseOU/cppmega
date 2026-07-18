@@ -197,6 +197,7 @@ def _valid_contract() -> dict[str, object]:
             "document_id_column": "doc_ids",
             "source_document_id_column": "token_source_doc_ids",
         },
+        "source_selection": _source_selection_receipt(),
     }
 
 

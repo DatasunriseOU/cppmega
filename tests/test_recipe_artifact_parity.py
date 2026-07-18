@@ -16,10 +16,10 @@ from tests.test_megatron_objective_contract import _valid_contract
 
 
 _EXPECTED_OBJECTIVE_ARTIFACT_FILE_SHA256 = (
-    "8edfac1806082c7c17fdad73b3b26d9364ac9806a793efe6252b89fa4298d406"
+    "432e42342023e003fec8439861abc2369c4ea51504b25cfef9b441afdbb8dd73"
 )
 _EXPECTED_OBJECTIVE_ARTIFACT_SET_SHA256 = (
-    "ceb08c6a5a8f6dda3e703dd3535b092f0f66c9bcd065bdad6917facd1880a91b"
+    "a62b2687ab4790c97fa1bb5f5b62f1236bb72ad8c63d3a94bf8c3a0fb80f7685"
 )
 
 
