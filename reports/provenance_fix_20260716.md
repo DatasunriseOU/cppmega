@@ -1,7 +1,8 @@
 # Исправление provenance для staged commit pipeline
 
-**Дата:** 2026-07-16 (CEST)  
-**Ветка:** `codex/canonical-complete-20260715`  
+**Дата:** 2026-07-16 (CEST)
+
+**Ветка:** `codex/canonical-complete-20260715`
 **Коммиты:** `cppmega.mlx` [`7ca3f71`](https://github.com/DatasunriseOU/cppmega_mlx/commit/7ca3f71), `cppmega` [`71786b4`](https://github.com/DatasunriseOU/cppmega/commit/71786b4)
 
 ## Итог
