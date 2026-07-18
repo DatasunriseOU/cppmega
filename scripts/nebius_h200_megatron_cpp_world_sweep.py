@@ -1034,6 +1034,9 @@ def remote_run_script(
           for BS in {batches}; do
           LOG="/data/cppmega_h200_results/seq_${{SEQ}}_bs_${{BS}}.log"
           NVSMI="/data/cppmega_h200_results/seq_${{SEQ}}_bs_${{BS}}.nvsmi.csv"
+          GRAPH_PRIOR_RECEIPT="/data/cppmega_h200_results/seq_${{SEQ}}_bs_${{BS}}_graph_prior.json"
+          rm -f "$GRAPH_PRIOR_RECEIPT"
+          export CPPMEGA_H200_GRAPH_PRIOR_RECEIPT="$GRAPH_PRIOR_RECEIPT"
           if [[ "$SEQ_OOM" == 1 ]]; then
             echo "CPPMEGA_BATCH_RESULT seq=${{SEQ}} batch=${{BS}} status=SKIP reason=previous_oom" | tee "$LOG" | tee -a /data/cppmega_h200_results/summary.log
             continue
@@ -1242,13 +1245,33 @@ def remote_run_script(
             expected_iteration=int(sys.argv[2]),
             output=Path(sys.argv[3]),
             expected_dsa_coefficient=0.001,
+            expected_dsa_beta=1.0,
         )
         PYLOSS
           then
             echo "CPPMEGA_BATCH_RESULT seq=${{SEQ}} batch=${{BS}} status=FAIL reason=finite_loss_gate" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
             exit 4
           fi
-          echo "CPPMEGA_BATCH_RESULT seq=${{SEQ}} batch=${{BS}} status=OK loss_receipt=${{LOSS_RECEIPT}}" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
+          if ! python - "$GRAPH_PRIOR_RECEIPT" <<'PYSELECTOR'
+        import json
+        import sys
+        from pathlib import Path
+        from scripts.h200_megatron_preflight import _validate_graph_prior_receipt
+
+        path = Path(sys.argv[1])
+        if not path.is_file():
+            raise RuntimeError(f"training did not write DSA selector receipt: {{path}}")
+        _validate_graph_prior_receipt(
+            json.loads(path.read_text(encoding="utf-8")),
+            expected_beta=1.0,
+            require_selector=True,
+        )
+        PYSELECTOR
+          then
+            echo "CPPMEGA_BATCH_RESULT seq=${{SEQ}} batch=${{BS}} status=FAIL reason=dsa_selector_gate" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
+            exit 5
+          fi
+          echo "CPPMEGA_BATCH_RESULT seq=${{SEQ}} batch=${{BS}} status=OK loss_receipt=${{LOSS_RECEIPT}} graph_prior_receipt=${{GRAPH_PRIOR_RECEIPT}}" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
           done
         done
         INNER

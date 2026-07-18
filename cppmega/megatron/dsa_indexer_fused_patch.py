@@ -78,6 +78,7 @@ __all__ = [
     "build_graph_objective_tensors",
     "build_graph_route_bias_from_structure_batch",
     "compute_index_scores_fused_bf16",
+    "require_graph_routes_for_production",
 ]
 
 _PATCH_MARKER = "__cppmega_dsa_indexer_fused_patched__"
@@ -97,6 +98,8 @@ _DSA_LAYER_CONTEXT: ContextVar[object] = ContextVar(
     "cppmega_dsa_layer_context", default=_NO_DSA_LAYER
 )
 _GRAPH_OBJECTIVE_RECEIPT_LAYERS: set[int] = set()
+_SELECTOR_RECEIPT_PATCH_MARKER = "__cppmega_dsa_selector_receipts_patched__"
+_SELECTOR_RECEIPT_KEYS: set[tuple[str, int, int | None]] = set()
 _GRAPH_ROUTE_BATCH_KEYS = (
     "graph_call_edges",
     "graph_call_edge_counts",
@@ -122,7 +125,42 @@ _GRAPH_ROUTE_BATCH_KEYS = (
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default).lower() in {"1", "true", "yes", "on"}
+    raw = os.environ.get(name, default)
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{name} must be one of 1,true,yes,on,0,false,no,off; got {raw!r}"
+    )
+
+
+def require_graph_routes_for_production() -> None:
+    """Reject an accidental tensor-only DSA/dense run in production context.
+
+    Ordinary low-level unit/reference calls remain available.  Once a launch
+    carries a production graph marker, disabling routes is allowed only through
+    the deliberately named ``CPPMEGA_GRAPH_ROUTES_ABLATION=1`` opt-in.
+    """
+
+    if _env_flag("CPPMEGA_GRAPH_ROUTES_ABLATION"):
+        return
+    receipt_marker = bool(os.environ.get("CPPMEGA_H200_GRAPH_PRIOR_RECEIPT"))
+    production_marker = receipt_marker or any(
+        _env_flag(name)
+        for name in (
+            "CPPMEGA_H200_DSA_GRAPH_RECEIPTS",
+            "CPPMEGA_DSA_GRAPH_AUX_ENABLED",
+            "CPPMEGA_OBJECTIVE_CONTRACT_REQUIRED",
+        )
+    )
+    if production_marker and not _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
+        raise RuntimeError(
+            "production Megatron graph routes are mandatory; refusing tensor-only "
+            "DSA/attention path. Set CPPMEGA_GRAPH_ROUTES_ENABLED=1 or explicitly "
+            "set CPPMEGA_GRAPH_ROUTES_ABLATION=1 for an intentional ablation"
+        )
 
 
 def _env_float(name: str, default: float) -> float:
@@ -578,6 +616,7 @@ def _current_graph_route_bias(
     seqlen_k: int,
     device: torch.device,
     bias_beta: float | None = None,
+    record_receipt: bool = True,
 ) -> torch.Tensor:
     override = _GRAPH_BATCH_OVERRIDE.get()
     if override is _NO_GRAPH_BATCH:
@@ -598,6 +637,14 @@ def _current_graph_route_bias(
         if bias_beta is None
         else validate_graph_bias_beta(bias_beta)
     )
+    if not record_receipt:
+        return _build_graph_route_bias_without_receipt(
+            structure_batch,
+            batch_size=batch_size,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            device=device,
+        )
     return build_graph_route_bias_from_structure_batch(
         structure_batch,
         batch_size=batch_size,
@@ -614,6 +661,35 @@ def _current_graph_route_bias(
         cross_domain_weight=_env_float("CPPMEGA_DSA_GRAPH_CROSS_DOMAIN_WEIGHT", 1.0),
         consumer="dsa_indexer",
         bias_beta=effective_beta,
+    )
+
+
+def _build_graph_route_bias_without_receipt(
+    structure_batch: dict[str, torch.Tensor],
+    *,
+    batch_size: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build the same graph prior without mutating the H200 receipt."""
+
+    return build_graph_route_bias_from_structure_batch(
+        structure_batch,
+        batch_size=batch_size,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        device=device,
+        dtype=torch.float32,
+        call_weight=_env_float("CPPMEGA_DSA_GRAPH_CALL_WEIGHT", 1.0),
+        type_weight=_env_float("CPPMEGA_DSA_GRAPH_TYPE_WEIGHT", 1.0),
+        domain_weight=_env_float("CPPMEGA_DSA_GRAPH_DOMAIN_WEIGHT", 1.0),
+        build_weight=_env_float("CPPMEGA_DSA_GRAPH_BUILD_WEIGHT", 1.0),
+        shell_weight=_env_float("CPPMEGA_DSA_GRAPH_SHELL_WEIGHT", 1.0),
+        diagnostic_weight=_env_float("CPPMEGA_DSA_GRAPH_DIAGNOSTIC_WEIGHT", 1.0),
+        cross_domain_weight=_env_float("CPPMEGA_DSA_GRAPH_CROSS_DOMAIN_WEIGHT", 1.0),
+        consumer=None,
+        bias_beta=resolve_graph_bias_beta(),
     )
 
 
@@ -1019,6 +1095,7 @@ def _patch_dsa_runtime_receipts(dsa_mod) -> None:
     original_attention_init = dsa_attention.__init__
     original_attention_forward = dsa_attention.forward
     original_indexer_init = dsa_indexer.__init__
+    original_fused_qk_topk = getattr(dsa_mod, "fused_qk_topk_naive", None)
 
     def indexer_init(self, *args, **kwargs):
         original_indexer_init(self, *args, **kwargs)
@@ -1038,6 +1115,92 @@ def _patch_dsa_runtime_receipts(dsa_mod) -> None:
     dsa_indexer.__init__ = indexer_init
     dsa_attention.__init__ = attention_init
     dsa_attention.forward = attention_forward
+    if original_fused_qk_topk is not None and not getattr(
+        original_fused_qk_topk, _SELECTOR_RECEIPT_PATCH_MARKER, False
+    ):
+
+        def fused_qk_topk_with_selector_receipt(
+            q,
+            k,
+            weights,
+            index_topk,
+            mask=None,
+            *args,
+            **kwargs,
+        ):
+            result = original_fused_qk_topk(
+                q, k, weights, index_topk, mask, *args, **kwargs
+            )
+            receipt_path = os.environ.get("CPPMEGA_H200_GRAPH_PRIOR_RECEIPT")
+            if not receipt_path or not _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
+                return result
+
+            layer_context = _DSA_LAYER_CONTEXT.get()
+            layer_number = (
+                None if layer_context is _NO_DSA_LAYER else int(layer_context)
+            )
+            receipt_key = (
+                receipt_path,
+                int(os.environ.get("RANK", "0")),
+                layer_number,
+            )
+            if receipt_key in _SELECTOR_RECEIPT_KEYS:
+                return result
+
+            sq, batch_size, _heads, _head_dim = q.shape
+            graph_prior = _current_graph_route_bias(
+                batch_size=int(batch_size),
+                seqlen_q=int(sq),
+                seqlen_k=int(k.shape[0]),
+                device=q.device,
+                bias_beta=resolve_graph_bias_beta(),
+                record_receipt=False,
+            )
+            neural_scores = compute_index_scores_fused_bf16(
+                q,
+                weights,
+                k,
+                use_relu=True,
+            )
+            beta = resolve_graph_bias_beta()
+            expected_post_add = neural_scores + graph_prior * beta
+            if mask is None:
+                expanded_mask = None
+                actual_post_add = result[0]
+            else:
+                expanded_mask = mask
+                if tuple(mask.shape) != tuple(expected_post_add.shape):
+                    expanded_mask = torch.broadcast_to(mask, expected_post_add.shape)
+                finite_mask = torch.isfinite(expanded_mask)
+                actual_post_add = torch.where(
+                    finite_mask,
+                    result[0] - expanded_mask.to(dtype=result[0].dtype),
+                    expected_post_add.to(dtype=result[0].dtype),
+                )
+
+            from cppmega.megatron.h200_preflight import observe_dsa_selector
+
+            observe_dsa_selector(
+                neural_scores=neural_scores,
+                graph_prior=graph_prior,
+                beta=float(beta),
+                mask=expanded_mask,
+                actual_post_add_scores=actual_post_add,
+                actual_post_mask_scores=result[0],
+                actual_topk_indices=result[1],
+                index_topk=int(index_topk),
+                receipt_path=receipt_path,
+                layer_number=layer_number,
+            )
+            _SELECTOR_RECEIPT_KEYS.add(receipt_key)
+            return result
+
+        setattr(
+            fused_qk_topk_with_selector_receipt,
+            _SELECTOR_RECEIPT_PATCH_MARKER,
+            True,
+        )
+        dsa_mod.fused_qk_topk_naive = fused_qk_topk_with_selector_receipt
     setattr(dsa_attention, _RUNTIME_RECEIPT_PATCH_MARKER, True)
 
 
@@ -1267,6 +1430,8 @@ def apply_dsa_indexer_fused_patch(*, force: bool = False) -> bool:
     docstring for the ~40 GiB memory accounting).
     """
 
+    require_graph_routes_for_production()
+
     from megatron.core.transformer.experimental_attention_variant import dsa as dsa_mod
 
     existing = getattr(dsa_mod, "_compute_index_scores", None)
@@ -1281,6 +1446,7 @@ def apply_dsa_indexer_fused_patch(*, force: bool = False) -> bool:
         # Accept **kwargs to be forward-compatible with new upstream args
         # (e.g. PR #3674 added ``mask=``).  Unused kwargs are ignored by the
         # fused math — they only affect downstream masking in the caller.
+        require_graph_routes_for_production()
         graph_bias = None
         graph_beta = 1.0
         if _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):

@@ -11,6 +11,8 @@ from cppmega.megatron.graph_route_attention_bias_patch import (
     _graph_attention_bias_for_layer,
     attention_layer_route_kind,
     build_dense_graph_attention_bias_from_structure_batch,
+    _env_flag,
+    graph_dense_bias_enabled,
     set_prompt_graph_inference_state,
 )
 from cppmega.megatron.structure_dataset_patch import _set_current_structure_batch
@@ -69,6 +71,31 @@ def test_dense_graph_attention_bias_is_broadcastable_post_scale_bias():
     assert bias[0, 0, 2, 1].item() == 1.5
     assert bias[0, 0, 3, 0].item() == 2.0
     assert bias.sum().item() == 5.5
+
+
+def test_dense_graph_edge_changes_attention_logits_and_value_output():
+    structure_batch = {
+        "graph_domain_edges": torch.tensor([[[0, 3, 5]]], dtype=torch.long),
+        "graph_domain_edge_counts": torch.tensor([1], dtype=torch.long),
+    }
+    graph_bias = build_dense_graph_attention_bias_from_structure_batch(
+        structure_batch,
+        batch_size=1,
+        seqlen_q=4,
+        seqlen_k=4,
+        device=torch.device("cpu"),
+        beta=4.0,
+    )
+    logits = torch.zeros((1, 1, 1, 4), dtype=torch.float32)
+    values = torch.tensor([[[[1.0], [2.0], [4.0], [8.0]]]])
+
+    plain_output = torch.matmul(torch.softmax(logits, dim=-1), values)
+    routed_logits = logits + graph_bias[:, :, :1, :]
+    routed_output = torch.matmul(torch.softmax(routed_logits, dim=-1), values)
+
+    assert routed_logits[0, 0, 0, 3].item() == pytest.approx(4.0)
+    assert not torch.equal(routed_output, plain_output)
+    assert routed_output.item() > plain_output.item()
 
 
 def test_dense_attention_consumer_records_nonzero_graph_prior(tmp_path, monkeypatch):
@@ -327,8 +354,6 @@ def test_dense_graph_attention_bias_env_defaults_are_enabled_with_graph_routes()
     try:
         os.environ["CPPMEGA_GRAPH_ROUTES_ENABLED"] = "1"
         os.environ.pop("CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS", None)
-        from cppmega.megatron.graph_route_attention_bias_patch import graph_dense_bias_enabled
-
         assert graph_dense_bias_enabled()
     finally:
         if old_graph is None:
@@ -339,3 +364,48 @@ def test_dense_graph_attention_bias_env_defaults_are_enabled_with_graph_routes()
             os.environ.pop("CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS", None)
         else:
             os.environ["CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS"] = old_dense
+
+
+def test_dense_tensor_only_production_path_requires_explicit_ablation():
+    production = {
+        "CPPMEGA_GRAPH_ROUTES_ENABLED": "0",
+        "CPPMEGA_H200_GRAPH_PRIOR_RECEIPT": "/tmp/graph-prior.json",
+    }
+    with patch.dict(os.environ, production, clear=True):
+        with pytest.raises(RuntimeError, match="tensor-only"):
+            graph_dense_bias_enabled()
+
+    with patch.dict(
+        os.environ,
+        {**production, "CPPMEGA_GRAPH_ROUTES_ABLATION": "1"},
+        clear=True,
+    ):
+        assert graph_dense_bias_enabled() is False
+
+
+def test_env_flag_accepts_only_documented_values_and_fails_closed():
+    name = "CPPMEGA_TEST_STRICT_GRAPH_FLAG"
+    previous = os.environ.get(name)
+    try:
+        for value in ("1", "true", "TRUE", " yes ", "on"):
+            os.environ[name] = value
+            assert _env_flag(name) is True
+        for value in ("0", "false", "FALSE", " no ", "off"):
+            os.environ[name] = value
+            assert _env_flag(name) is False
+
+        for value in ("", "   ", "tru", "0x1", "maybe"):
+            os.environ[name] = value
+            with pytest.raises(ValueError, match=name):
+                _env_flag(name)
+
+        os.environ.pop(name)
+        assert _env_flag(name, "yes") is True
+        assert _env_flag(name, "off") is False
+        with pytest.raises(ValueError, match=name):
+            _env_flag(name, "")
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous

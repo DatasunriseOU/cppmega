@@ -37,6 +37,7 @@ from scripts.data.publish_megatron_bundle_to_nebius_s3 import (  # noqa: E402
 from cppmega.receipt_binding import (  # noqa: E402
     build_receipt_binding,
     canonical_sha256,
+    complete_training_implementation_binding,
     validate_binding_shape,
     validate_receipt_binding,
 )
@@ -563,6 +564,7 @@ def _validate_graph_prior_receipt(
     receipt: object,
     *,
     expected_beta: float | None = None,
+    require_selector: bool = False,
 ) -> dict[str, object]:
     if not isinstance(receipt, dict):
         raise RuntimeError("DSA graph prior receipt must be an object")
@@ -579,6 +581,45 @@ def _validate_graph_prior_receipt(
     prior = receipt.get("prior")
     if not isinstance(prior, dict) or int(prior.get("nonzero", 0)) <= 0:
         raise RuntimeError("DSA graph prior receipt lacks a nonzero prior")
+    selector = receipt.get("selector")
+    if selector is not None:
+        if (
+            not isinstance(selector, dict)
+            or selector.get("schema") != "cppmega_h200_dsa_selector_v1"
+            or selector.get("status") != "verified"
+            or selector.get("formula") != "I_neural + beta*S_graph -> mask -> topk"
+        ):
+            raise RuntimeError("DSA selector receipt is malformed")
+        observations = selector.get("observations")
+        if not isinstance(observations, list) or not observations:
+            raise RuntimeError("DSA selector receipt lacks observations")
+        for observation in observations:
+            if not isinstance(observation, dict):
+                raise RuntimeError("DSA selector observation must be an object")
+            if observation.get("beta") != receipt.get("bias_beta"):
+                raise RuntimeError("DSA selector observation beta binding is stale")
+            if observation.get("indices_match") is not True:
+                raise RuntimeError("DSA selector observation did not verify top-k")
+            for field in ("neural", "graph", "post_add", "post_mask"):
+                tensor = observation.get(field)
+                if (
+                    not isinstance(tensor, dict)
+                    or not re.fullmatch(r"[0-9a-f]{64}", str(tensor.get("sha256", "")))
+                ):
+                    raise RuntimeError(f"DSA selector observation lacks {field} digest")
+            topk = observation.get("topk_indices")
+            if (
+                not isinstance(topk, dict)
+                or not re.fullmatch(r"[0-9a-f]{64}", str(topk.get("sha256", "")))
+                or not isinstance(topk.get("sample"), list)
+            ):
+                raise RuntimeError("DSA selector observation lacks top-k evidence")
+            if float(observation.get("equation_max_abs_error", math.inf)) > 1e-5:
+                raise RuntimeError("DSA selector neural+graph equation is not verified")
+            if float(observation.get("mask_max_abs_error", math.inf)) > 1e-5:
+                raise RuntimeError("DSA selector mask equation is not verified")
+    elif require_selector:
+        raise RuntimeError("DSA graph prior receipt lacks selector-level top-k evidence")
     return receipt
 
 
@@ -870,6 +911,7 @@ def write_training_loss_receipt(
     expected_iteration: int,
     output: Path,
     expected_dsa_coefficient: float | None = None,
+    expected_dsa_beta: float | None = None,
 ) -> dict[str, object]:
     if expected_iteration <= 0:
         raise ValueError("expected_iteration must be positive")
@@ -891,6 +933,7 @@ def write_training_loss_receipt(
         receipt["dsa_graph_gradient"] = _dsa_graph_gradient_evidence(
             log_text,
             expected_coefficient=expected_dsa_coefficient,
+            expected_beta=expected_dsa_beta,
         )
     _write_json_atomic(output, receipt)
     return receipt
@@ -1194,6 +1237,7 @@ def _run_phase(
     _validate_graph_prior_receipt(
         graph_prior,
         expected_beta=resolve_graph_bias_beta(environment),
+        require_selector=True,
     )
     if not checkpoint_state_receipt.is_file():
         raise RuntimeError(
@@ -1296,6 +1340,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-prefix", type=Path, required=True)
     parser.add_argument("--tokenizer-model", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument(
+        "--megatron-commit",
+        default=os.environ.get("CPPMEGA_MEGATRON_COMMIT"),
+        help="exact Megatron-LM commit; defaults to CPPMEGA_MEGATRON_COMMIT",
+    )
     parser.add_argument("--sequence-length", type=int, required=True)
     parser.add_argument("--micro-batch-size", type=int, default=1)
     parser.add_argument("--fp8-recipe", choices=("off", "tensorwise"), default="off")
@@ -1322,6 +1371,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = build_arg_parser().parse_args(raw_argv)
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", args.run_id):
         raise ValueError("H200 preflight run_id is not a safe identifier")
+    if not isinstance(args.megatron_commit, str) or re.fullmatch(
+        r"[0-9a-f]{40}(?:[0-9a-f]{24})?", args.megatron_commit
+    ) is None:
+        raise ValueError(
+            "H200 preflight requires --megatron-commit or "
+            "CPPMEGA_MEGATRON_COMMIT with an exact lowercase Git SHA"
+        )
     if args.sequence_length <= 0 or args.micro_batch_size <= 0 or args.hash_jobs <= 0:
         raise ValueError("sequence length, micro batch size, and hash jobs must be positive")
 
@@ -1330,6 +1386,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     tokenizer_model = args.tokenizer_model.resolve()
     manifest, prefix_manifest_hashes = _bundle_identity(
         bundle_root, data_prefix, hash_jobs=args.hash_jobs
+    )
+    implementation = complete_training_implementation_binding(
+        manifest.get("implementation"),
+        megatron_commit=args.megatron_commit,
     )
     tokenizer_descriptor = manifest["tokenizer"]
     expected_tokenizer = (bundle_root / str(tokenizer_descriptor["path"])).resolve()
@@ -1427,6 +1487,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "bundle_id": str(manifest["bundle_id"]),
         "artifact_set_sha256": str(manifest["artifact_set_sha256"]),
         "prefix_manifest_sha256s": prefix_manifest_hashes,
+        "implementation": implementation,
     }
 
     with tempfile.TemporaryDirectory(prefix="cppmega-h200-preflight-") as raw_workdir:

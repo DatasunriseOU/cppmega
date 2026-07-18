@@ -78,27 +78,33 @@ def test_persistent_pr_ci_actions_are_pinned_to_commits() -> None:
     assert not violations, f"mutable action references are forbidden: {violations}"
 
 
-def test_linux_portable_lane_uses_explicit_megatron_free_profile() -> None:
+def test_workflow_delegates_to_authoritative_lanes_with_source_binding() -> None:
     workflow = (REPO_ROOT / ".github" / "workflows" / "ci-self-hosted.yml").read_text(
         encoding="utf-8"
     )
 
-    assert "CPPMEGA_TEST_PROFILE=portable-data python -m pytest -q" in workflow
-    assert workflow.count("unset PYTHONPATH PYTHONHOME VIRTUAL_ENV || true") == 2
-    assert workflow.count("export PYTHONNOUSERSITE=1") == 2
-    assert workflow.count("export PYTHONSAFEPATH=1") == 2
+    assert workflow.count("scripts/ci/run_repository_ci.py lane") == 2
+    assert workflow.count("--lanes-config") == 2
+    assert "--lane macos-contracts" in workflow
+    assert "--lane linux-contracts" in workflow
+    assert workflow.count("--expected-source-commit \"${GITHUB_SHA}\"") == 2
+    assert workflow.count("--expected-source-tree \"${expected_tree}\"") == 2
+    assert workflow.count("test \"$(git rev-parse HEAD)\" = \"${GITHUB_SHA}\"") == 2
+    assert " -m pytest " not in workflow
+
+    payload = json.loads(
+        (REPO_ROOT / "configs" / "ci" / "lanes.json").read_text(encoding="utf-8")
+    )
+    lanes = {lane["id"]: lane for lane in payload["lanes"]}
+    assert lanes["linux-contracts"]["test_profile"] == "portable-data"
 
 
 def test_frozen_domain_eval_is_wired_into_repository_owned_ci() -> None:
     workflow = (REPO_ROOT / ".github" / "workflows" / "ci-self-hosted.yml").read_text(
         encoding="utf-8"
     )
-    for test_path in DOMAIN_CONTRACT_TESTS:
-        assert workflow.count(test_path) == 2
-    assert workflow.count("scripts/eval_domain_routed_codegen.py") == 2
-    assert workflow.count("evals/domain_routed_prompts.jsonl") == 2
-    assert workflow.count("evals/domain_routed_gold_completions.jsonl") == 2
-    assert workflow.count("${RUNNER_TEMP}/cppmega-domain-routed-codegen.json") == 2
+    assert workflow.count("scripts/ci/run_repository_ci.py lane") == 2
+    assert "tests/test_eval_domain_routed_codegen.py" not in workflow
 
     payload = json.loads(
         (REPO_ROOT / "configs" / "ci" / "lanes.json").read_text(encoding="utf-8")

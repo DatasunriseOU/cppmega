@@ -227,6 +227,7 @@ def test_generation_worker_builds_model_loads_checkpoint_and_threads_sidecars():
     assert "PromptGraphBuilder" in worker
     assert "CppPromptTokenizerAdapter" in worker
     assert "PromptProjectIndex.from_json_path" in worker
+    assert 'Path("/data/cppmega_eval/indexer_root")' in worker
     assert "PromptGraphContext.from_repository_prompt" in worker
     assert "validate_production_repository_index" in worker
     assert "_set_current_structure_batch(structure_inputs)" in worker
@@ -628,6 +629,16 @@ def test_make_eval_tar_builds_and_contains_real_project_index(tmp_path):
     )
     assert index_payload["schema"] == "cppmega_prompt_graph_index_v3"
     assert all("symbol_id" in symbol for symbol in index_payload["symbols"])
+    assert "cppmega_eval/indexer_root/tools/clang_indexer/index_project.py" in names
+    assert (
+        index_payload["provenance"]["indexer_path"]
+        == "/data/cppmega_eval/indexer_root/tools/clang_indexer/index_project.py"
+    )
+    assert (
+        staged_cases["prompt_graph_index_receipt"]
+        == index_payload["provenance"]
+    )
+    PromptProjectIndex.from_dict(index_payload).verify_integrity()
 
 
 def test_make_eval_tar_fails_closed_when_repo_checkout_is_missing(tmp_path):

@@ -272,12 +272,16 @@ def _remote_script(
     graph_capacities: dict[int, dict[str, object]],
     bundle_root: str = "/data/cppmega_bundle",
     tokenizer_model: str = "/data/cppmega_bundle/tokenizer",
-    enable_dsa_patch: bool = False,
+    enable_dsa_patch: bool = True,
     run_id: str = "nebius-h200-curriculum",
     initial_checkpoint_root: str = "",
     initial_cum_iters: int = 0,
 ) -> str:
     sweep.validate_docker_image_digest(docker_image)
+    if not enable_dsa_patch:
+        raise ValueError(
+            "production curriculum requires the fused DSA patch and graph auxiliary loss"
+        )
     stage_lines = "\n".join(
         "          "
         + shlex.quote(
@@ -345,11 +349,12 @@ def _remote_script(
         export CPPMEGA_DOMAIN_EMBEDDING_ENABLED=1
         export CPPMEGA_GRAPH_ROUTES_ENABLED=1
         export CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS="${{CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS:-1}}"
-        export CPPMEGA_DSA_PATCH_ENABLED="{1 if enable_dsa_patch else 0}"
-        export CPPMEGA_DSA_GRAPH_AUX_ENABLED=0
-        export CPPMEGA_DSA_GRAPH_AUX_WEIGHT=0
-        export CPPMEGA_DSA_INDEXER_LOSS_COEFF=0
-        export CPPMEGA_DSA_SKIP_INDEXER_LOSS=1
+        export CPPMEGA_DSA_PATCH_ENABLED="1"
+        export CPPMEGA_DSA_GRAPH_AUX_ENABLED=1
+        export CPPMEGA_DSA_GRAPH_AUX_WEIGHT=1
+        export CPPMEGA_DSA_INDEXER_LOSS_COEFF=0.001
+        export CPPMEGA_DSA_SKIP_INDEXER_LOSS=0
+        export CPPMEGA_H200_DSA_GRAPH_RECEIPTS=1
         export CPPMEGA_BUNDLE_ROOT={shlex.quote(bundle_root)}
         export CPPMEGA_TOKENIZER_MODEL={shlex.quote(tokenizer_model)}
         mkdir -p "$TRITON_CACHE_DIR" /data/cppmega_h200_results /data/cppmega_curriculum_checkpoints
@@ -435,6 +440,9 @@ def _remote_script(
           DATA_PREFIX="$CPPMEGA_BUNDLE_ROOT/${{DATA_PREFIX_NAME}}"
           LOG="/data/cppmega_h200_results/stage_${{STAGE_IDX}}_seq_${{SEQ}}_gbs_${{BS}}_mbs_${{MBS}}.log"
           NVSMI="/data/cppmega_h200_results/stage_${{STAGE_IDX}}_seq_${{SEQ}}_gbs_${{BS}}_mbs_${{MBS}}.nvsmi.csv"
+          GRAPH_PRIOR_RECEIPT="/data/cppmega_h200_results/stage_${{STAGE_IDX}}_graph_prior.json"
+          rm -f "$GRAPH_PRIOR_RECEIPT"
+          export CPPMEGA_H200_GRAPH_PRIOR_RECEIPT="$GRAPH_PRIOR_RECEIPT"
           export DATA_PREFIX
           export CPPMEGA_GRAPH_MAX_EDGES="$GRAPH_MAX_EDGES"
           export CPPMEGA_GRAPH_MAX_CHUNKS="$GRAPH_MAX_CHUNKS"
@@ -551,10 +559,10 @@ def _remote_script(
               --global-batch-size ${{BS}} \\
               --train-iters ${{TARGET_ITERS}} \\
               --fp8-recipe {fp8_recipe})\\\"
-            export CPPMEGA_DSA_GRAPH_AUX_ENABLED=0
-            export CPPMEGA_DSA_GRAPH_AUX_WEIGHT=0
-            export CPPMEGA_DSA_INDEXER_LOSS_COEFF=0
-            export CPPMEGA_DSA_SKIP_INDEXER_LOSS=1
+            export CPPMEGA_DSA_GRAPH_AUX_ENABLED=1
+            export CPPMEGA_DSA_GRAPH_AUX_WEIGHT=1
+            export CPPMEGA_DSA_INDEXER_LOSS_COEFF=0.001
+            export CPPMEGA_DSA_SKIP_INDEXER_LOSS=0
 
             DATA_ARGS=(--data-path 1.0 \\\"\\$DATA_PREFIX\\")
             OPTIMIZER_ARGS=(--optimizer \\\"\\$CPPMEGA_OPTIMIZER\\\")
@@ -655,11 +663,32 @@ def _remote_script(
             Path(sys.argv[1]),
             expected_iteration=int(sys.argv[2]),
             output=Path(sys.argv[3]),
+            expected_dsa_coefficient=0.001,
+            expected_dsa_beta=1.0,
         )
         PYLOSS
           then
             echo "CPPMEGA_CURRICULUM_STAGE_RESULT stage=${{STAGE_IDX}} status=FAIL reason=finite_loss_gate" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
             exit 4
+          fi
+          if ! python - "$GRAPH_PRIOR_RECEIPT" <<'PYSELECTOR'
+        import json
+        import sys
+        from pathlib import Path
+        from scripts.h200_megatron_preflight import _validate_graph_prior_receipt
+
+        path = Path(sys.argv[1])
+        if not path.is_file():
+            raise RuntimeError(f"training did not write DSA selector receipt: {{path}}")
+        _validate_graph_prior_receipt(
+            json.loads(path.read_text(encoding="utf-8")),
+            expected_beta=1.0,
+            require_selector=True,
+        )
+        PYSELECTOR
+          then
+            echo "CPPMEGA_CURRICULUM_STAGE_RESULT stage=${{STAGE_IDX}} status=FAIL reason=dsa_selector_gate" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
+            exit 5
           fi
           if [[ ! -s "$CHECKPOINT_ROOT/latest_checkpointed_iteration.txt" ]]; then
             echo "CPPMEGA_CURRICULUM_STAGE_RESULT stage=${{STAGE_IDX}} seq=${{SEQ}} batch=${{BS}} status=FAIL reason=missing_checkpoint" | tee -a "$LOG" | tee -a /data/cppmega_h200_results/summary.log
@@ -755,8 +784,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--fp8-recipe", choices=["tensorwise"], default="tensorwise")
     parser.add_argument(
         "--enable-dsa-patch",
-        action="store_true",
-        help="Explicitly install the DSA patch; dense-GQA DSA auxiliary loss stays zero.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require the fused DSA patch and graph auxiliary loss (production default).",
     )
     parser.add_argument(
         "--start-stage",
@@ -780,6 +810,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--keep-instance", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(list(argv) if argv is not None else None)
+
+    if not args.enable_dsa_patch:
+        raise ValueError(
+            "production curriculum cannot run with --no-enable-dsa-patch"
+        )
 
     sweep.validate_docker_image_digest(args.docker_image)
     if args.hash_jobs <= 0:

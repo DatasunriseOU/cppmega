@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -61,17 +62,26 @@ _EXPECTED_STAGE1_GRAPH_RECIPE_SHA256 = (
 
 def _peer_graph_recipe_module():
     configured = os.environ.get("CPPMEGA_RECIPE_PARITY_PEER_ROOT")
-    candidates = []
-    if configured:
-        candidates.append(Path(configured))
-    candidates.append(
-        Path(__file__).resolve().parents[2]
-        / "cppmega_mlx_fix_recipe_parity_20260718"
-    )
-    candidates.append(Path(__file__).resolve().parents[2] / "cppmega.mlx")
-    peer_root = next((path for path in candidates if path.is_dir()), None)
-    if peer_root is None:
-        pytest.skip("cross-repository recipe parity worktree is unavailable")
+    expected_commit = os.environ.get("CPPMEGA_RECIPE_PARITY_PEER_COMMIT")
+    if not configured or not expected_commit:
+        pytest.fail(
+            "recipe parity requires explicit CPPMEGA_RECIPE_PARITY_PEER_ROOT "
+            "and CPPMEGA_RECIPE_PARITY_PEER_COMMIT"
+        )
+    peer_root = Path(configured).expanduser().resolve()
+    if not peer_root.is_dir():
+        pytest.fail(f"cross-repository recipe parity worktree is unavailable: {peer_root}")
+    actual_commit = subprocess.run(
+        ("git", "-C", str(peer_root), "rev-parse", "HEAD"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if actual_commit != expected_commit:
+        pytest.fail(
+            "recipe parity checkout commit mismatch: "
+            f"expected={expected_commit} actual={actual_commit}"
+        )
     module_path = peer_root / "cppmega_mlx/data/graph_recipe.py"
     spec = importlib.util.spec_from_file_location("_peer_mlx_graph_recipe", module_path)
     if spec is None or spec.loader is None:

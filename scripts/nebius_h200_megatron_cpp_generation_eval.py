@@ -51,6 +51,7 @@ from cppmega.prompt_graph import (
     require_prompt_graph_project_id,
 )
 from cppmega.prompt_graph_index import ClangPromptProjectIndexProducer
+from cppmega.prompt_graph_provenance import indexer_dependency_manifest
 
 
 ROOT = _SCRIPT_ROOT
@@ -273,26 +274,82 @@ def make_eval_tar(
         stage = Path(stage_raw)
         eval_stage = stage / "cppmega_eval"
         eval_stage.mkdir()
+        if prompt_graph_mode == "repo":
+            if indexer_root is None:
+                raise ValueError(
+                    "repository prompt-graph eval requires an explicit indexer_root"
+                )
+            indexer_root = indexer_root.resolve()
+            indexer_path = indexer_root / "tools" / "clang_indexer" / "index_project.py"
+            dependency_manifest = indexer_dependency_manifest(
+                indexer_path,
+                indexer_root,
+            )
+            remote_indexer_root = Path("/data/cppmega_eval/indexer_root")
+            for relative in dependency_manifest:
+                source = indexer_root / relative
+                if not source.is_file():
+                    raise FileNotFoundError(
+                        f"indexer dependency disappeared while staging: {source}"
+                    )
+                target = eval_stage / "indexer_root" / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.symlink(source, target)
         prepared = _prepare_eval_graph_cases(
             cases,
             prompt_graph_mode=prompt_graph_mode,
             prompt_index_cache_dir=stage / "prompt_index_cache",
             indexer_root=indexer_root,
         )
-        (eval_stage / "cases.jsonl").write_text(
-            "".join(
-                json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
-                for row in prepared.rows
-            ),
-            encoding="utf-8",
-        )
+        staged_rows = [dict(row) for row in prepared.rows]
         os.symlink(prompts.resolve(), eval_stage / "prompts.jsonl")
         for relative, source in sorted(
             prepared.assets.items(), key=lambda item: str(item[0])
         ):
             target = eval_stage / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            os.symlink(source, target)
+            if relative.name == "project_index.json" and prompt_graph_mode == "repo":
+                payload = json.loads(source.read_text(encoding="utf-8"))
+                provenance = dict(payload.get("provenance") or {})
+                provenance["indexer_path"] = str(
+                    remote_indexer_root / "tools" / "clang_indexer" / "index_project.py"
+                )
+                provenance["indexer_checkout_root"] = str(remote_indexer_root)
+                payload["provenance"] = provenance
+                from cppmega.prompt_graph import PromptProjectIndex
+
+                rebased_index = PromptProjectIndex.from_dict(payload).with_integrity()
+                for row in staged_rows:
+                    raw_index_path = row.get("prompt_graph_index_path")
+                    if (
+                        (
+                            isinstance(raw_index_path, str)
+                            and Path(raw_index_path).resolve() == source.resolve()
+                        )
+                        or row.get("prompt_graph_index") == relative.as_posix()
+                    ):
+                        row["prompt_graph_index_receipt"] = dict(
+                            rebased_index.provenance
+                        )
+                target.write_text(
+                    json.dumps(
+                        rebased_index.to_dict(),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            else:
+                os.symlink(source, target)
+        (eval_stage / "cases.jsonl").write_text(
+            "".join(
+                json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+                for row in staged_rows
+            ),
+            encoding="utf-8",
+        )
         cmd = ["tar", "-czhf", str(path), "-C", str(stage), "cppmega_eval"]
         env = {**os.environ, "GZIP": "-1", "COPYFILE_DISABLE": "1"}
         printable = " ".join(shlex.quote(part) for part in cmd)
@@ -636,6 +693,7 @@ def build_prompt_rows(
             project_index.validate_production_repository_index(
                 expected_project_id=expected_project_id,
                 repository_root=repo_path,
+                expected_indexer_root=Path("/data/cppmega_eval/indexer_root"),
             )
             declared_receipt = case.get("prompt_graph_index_receipt")
             if not isinstance(declared_receipt, dict) or declared_receipt != dict(
@@ -1149,6 +1207,7 @@ def main() -> int:
                 project_index.validate_production_repository_index(
                     expected_project_id=str(row["prompt_graph_project_id"]),
                     repository_root=str(row["prompt_graph_repository_path"]),
+                    expected_indexer_root=Path("/data/cppmega_eval/indexer_root"),
                 )
                 graph_artifact = graph_builder.build(
                     project_index,

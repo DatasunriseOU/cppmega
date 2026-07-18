@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import IntEnum
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 from typing import Mapping
@@ -89,6 +91,64 @@ def _tensor_summary(value: object) -> dict[str, object]:
         "numel": int(value.numel()),
         "nonzero": int(detached.count_nonzero().item()),
         "sum": float(detached.to(dtype=torch.float64).sum().item()),
+    }
+
+
+def _tensor_sha256(value: object) -> str:
+    """Hash tensor bytes after a deterministic CPU/contiguous conversion."""
+
+    import torch
+
+    if not isinstance(value, torch.Tensor):
+        raise RuntimeError(f"selector evidence value is not a tensor: {type(value)!r}")
+    detached = value.detach().to(device="cpu").contiguous()
+    return hashlib.sha256(detached.view(torch.uint8).numpy().tobytes()).hexdigest()
+
+
+def _finite_tensor_max_abs_diff(left: object, right: object) -> float:
+    """Compare finite entries while requiring identical infinity locations."""
+
+    import torch
+
+    if not isinstance(left, torch.Tensor) or not isinstance(right, torch.Tensor):
+        raise RuntimeError("selector score evidence must be tensors")
+    if tuple(left.shape) != tuple(right.shape):
+        raise RuntimeError(
+            f"selector score shape mismatch: {tuple(left.shape)} != {tuple(right.shape)}"
+        )
+    left_finite = torch.isfinite(left)
+    right_finite = torch.isfinite(right)
+    if not torch.equal(left_finite, right_finite):
+        return float("inf")
+    if not bool(left_finite.any().item()):
+        return 0.0
+    return float((left[left_finite] - right[right_finite]).abs().max().item())
+
+
+def _selector_tensor_summary(value: object) -> dict[str, object]:
+    """Return strict-JSON-safe score evidence, including mask infinities."""
+
+    import torch
+
+    if not isinstance(value, torch.Tensor):
+        raise RuntimeError(f"selector evidence value is not a tensor: {type(value)!r}")
+    detached = value.detach()
+    finite = torch.isfinite(detached)
+    finite_values = detached[finite].to(dtype=torch.float64)
+    return {
+        "shape": [int(size) for size in detached.shape],
+        "dtype": str(detached.dtype),
+        "device": str(detached.device),
+        "numel": int(detached.numel()),
+        "nonzero": int(torch.count_nonzero(detached).item()),
+        "finite_count": int(finite.sum().item()),
+        "positive_infinity_count": int(torch.isposinf(detached).sum().item()),
+        "negative_infinity_count": int(torch.isneginf(detached).sum().item()),
+        "nan_count": int(torch.isnan(detached).sum().item()),
+        "finite_sum": float(finite_values.sum().item()) if finite_values.numel() else 0.0,
+        "finite_minimum": float(finite_values.min().item()) if finite_values.numel() else None,
+        "finite_maximum": float(finite_values.max().item()) if finite_values.numel() else None,
+        "sha256": _tensor_sha256(detached),
     }
 
 
@@ -341,7 +401,8 @@ def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
     temporary.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
     )
     os.replace(temporary, path)
 
@@ -538,5 +599,155 @@ def observe_graph_prior(
         payload["binding"] = validate_binding_shape(
             receipt_binding, where="H200 graph-prior receipt"
         )
+    _write_json_atomic(output, payload)
+    return payload
+
+
+def observe_dsa_selector(
+    *,
+    neural_scores: object,
+    graph_prior: object,
+    beta: float,
+    mask: object | None,
+    actual_post_add_scores: object,
+    actual_post_mask_scores: object,
+    actual_topk_indices: object,
+    index_topk: int,
+    receipt_path: str | Path,
+    layer_number: int | None = None,
+    receipt_binding: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Record and verify the real DSA pre-top-k graph-route composition.
+
+    The receipt deliberately stores compact tensor summaries and hashes rather
+    than dense score matrices.  The arithmetic and selected-index checks happen
+    on the live tensors before the receipt is written.
+    """
+
+    import torch
+
+    if receipt_binding is None:
+        receipt_binding = _binding_from_environment()
+
+    tensors = {
+        "neural_scores": neural_scores,
+        "graph_prior": graph_prior,
+        "actual_post_add_scores": actual_post_add_scores,
+        "actual_post_mask_scores": actual_post_mask_scores,
+        "actual_topk_indices": actual_topk_indices,
+    }
+    if any(not isinstance(value, torch.Tensor) for value in tensors.values()):
+        raise RuntimeError("DSA selector evidence requires tensor inputs")
+    if not math.isfinite(float(beta)) or float(beta) <= 0.0:
+        raise RuntimeError(f"DSA selector beta must be finite and positive, got {beta}")
+    if int(index_topk) <= 0:
+        raise RuntimeError(f"DSA selector index_topk must be positive, got {index_topk}")
+
+    neural = neural_scores.detach().to(dtype=torch.float32)
+    graph = graph_prior.detach().to(device=neural.device, dtype=torch.float32)
+    if tuple(neural.shape) != tuple(graph.shape) or neural.dim() != 3:
+        raise RuntimeError(
+            "DSA selector neural and graph scores must both be [batch, query, key] "
+            f"with equal shape, got {tuple(neural.shape)} and {tuple(graph.shape)}"
+        )
+    if not bool(torch.isfinite(neural).all().item()) or not bool(
+        torch.isfinite(graph).all().item()
+    ):
+        raise RuntimeError("DSA selector neural scores and graph prior must be finite")
+
+    expected_post_add = neural + graph * float(beta)
+    if mask is None:
+        expected_post_mask = expected_post_add
+        actual_mask = None
+    else:
+        if not isinstance(mask, torch.Tensor):
+            raise RuntimeError("DSA selector mask must be a tensor or None")
+        actual_mask = mask.detach().to(device=neural.device, dtype=expected_post_add.dtype)
+        if tuple(actual_mask.shape) != tuple(expected_post_add.shape):
+            raise RuntimeError(
+                "DSA selector mask shape differs from score shape: "
+                f"{tuple(actual_mask.shape)} != {tuple(expected_post_add.shape)}"
+            )
+        expected_post_mask = expected_post_add + actual_mask
+
+    actual_add = actual_post_add_scores.detach().to(
+        device=neural.device, dtype=expected_post_add.dtype
+    )
+    actual_masked = actual_post_mask_scores.detach().to(
+        device=neural.device, dtype=expected_post_mask.dtype
+    )
+    add_error = _finite_tensor_max_abs_diff(actual_add, expected_post_add)
+    mask_error = _finite_tensor_max_abs_diff(actual_masked, expected_post_mask)
+    if not math.isfinite(add_error) or add_error > 1e-5:
+        raise RuntimeError(f"DSA selector neural+graph equation mismatch: {add_error}")
+    if not math.isfinite(mask_error) or mask_error > 1e-5:
+        raise RuntimeError(f"DSA selector mask application mismatch: {mask_error}")
+
+    topk_count = min(int(index_topk), int(expected_post_mask.shape[-1]))
+    expected_indices = expected_post_mask.topk(topk_count, dim=-1).indices
+    actual_indices = actual_topk_indices.detach().to(device=neural.device)
+    if not torch.equal(actual_indices, expected_indices):
+        raise RuntimeError("DSA selector top-k indices do not match post-mask scores")
+
+    output = Path(receipt_path)
+    if not output.is_file():
+        raise RuntimeError(f"DSA selector requires an existing graph-prior receipt: {output}")
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    if payload.get("schema") != "cppmega_h200_graph_prior_v1":
+        raise RuntimeError("DSA selector graph-prior receipt schema mismatch")
+    if payload.get("status") != "verified" or payload.get("consumer") != "dsa_indexer":
+        raise RuntimeError("DSA selector graph-prior receipt is not a verified DSA receipt")
+    expected_beta_binding = graph_bias_beta_binding(beta)
+    if payload.get("bias_beta") != expected_beta_binding:
+        raise RuntimeError("DSA selector graph-prior receipt beta differs from selector")
+    if receipt_binding is not None:
+        validate_receipt_binding(
+            payload.get("binding"), expected=receipt_binding, where="DSA selector receipt"
+        )
+
+    observation = {
+        "rank": int(os.environ.get("RANK", "0")),
+        "layer_number": layer_number,
+        "beta": expected_beta_binding,
+        "index_topk": int(index_topk),
+        "neural": _selector_tensor_summary(neural),
+        "graph": _selector_tensor_summary(graph),
+        "post_add": _selector_tensor_summary(expected_post_add),
+        "post_mask": _selector_tensor_summary(expected_post_mask),
+        "mask_present": actual_mask is not None,
+        "equation_max_abs_error": add_error,
+        "mask_max_abs_error": mask_error,
+        "topk_indices": {
+            "shape": [int(value) for value in actual_indices.shape],
+            "sha256": _tensor_sha256(actual_indices),
+            "sample": [int(value) for value in actual_indices.detach().cpu().reshape(-1)[:32]],
+        },
+        "indices_match": True,
+    }
+    selector = payload.get("selector")
+    if not isinstance(selector, dict):
+        selector = {
+            "schema": "cppmega_h200_dsa_selector_v1",
+            "status": "verified",
+            "observations": [],
+        }
+    observations = selector.get("observations")
+    if not isinstance(observations, list):
+        raise RuntimeError("DSA selector receipt observations must be a list")
+    key = (observation["rank"], observation["layer_number"])
+    replaced = False
+    for index, existing in enumerate(observations):
+        if isinstance(existing, dict) and (
+            existing.get("rank"), existing.get("layer_number")
+        ) == key:
+            observations[index] = observation
+            replaced = True
+            break
+    if not replaced:
+        observations.append(observation)
+    selector["observations"] = observations
+    selector["observation_count"] = len(observations)
+    selector["formula"] = "I_neural + beta*S_graph -> mask -> topk"
+    payload["selector"] = selector
     _write_json_atomic(output, payload)
     return payload

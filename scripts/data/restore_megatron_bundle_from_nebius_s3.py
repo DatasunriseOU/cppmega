@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
 from cppmega.receipt_binding import (  # noqa: E402
     NO_CHECKPOINT_SHA256,
     build_receipt_binding,
+    complete_training_implementation_binding,
     validate_binding_shape,
     validate_receipt_binding,
 )
@@ -44,6 +45,13 @@ from scripts.data.publish_megatron_bundle_to_nebius_s3 import (  # noqa: E402
 
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_REUSABLE_ARCHIVE_RECEIPT_STATUSES = frozenset(
+    {
+        "recovered_verified",
+        "recovered_download_verified",
+        "downloaded_verified",
+    }
+)
 
 
 def _aws_read(uri: str, *, endpoint: str, env: dict[str, str]) -> bytes:
@@ -210,23 +218,32 @@ def _acquire_archive(
             raise ValueError("existing archive does not match transport descriptor")
         if receipt_path.exists():
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-            if any(
-                receipt.get(key) != value
-                for key, value in binding.items()
-                if key != "binding"
-            ):
-                raise ValueError("archive download receipt binding mismatch")
-            if receipt_binding is not None:
-                try:
-                    validate_receipt_binding(
-                        receipt.get("binding"),
-                        expected=receipt_binding,
-                        where="archive download receipt binding",
-                    )
-                except (RuntimeError, ValueError) as error:
-                    raise ValueError(
-                        f"archive download receipt binding mismatch: {error}"
-                    ) from error
+            if receipt.get("status") not in _REUSABLE_ARCHIVE_RECEIPT_STATUSES:
+                archive.unlink()
+                receipt_path.unlink()
+            else:
+                if any(
+                    receipt.get(key) != value
+                    for key, value in binding.items()
+                    if key != "binding"
+                ):
+                    raise ValueError("archive download receipt binding mismatch")
+                if receipt_binding is not None:
+                    try:
+                        validate_receipt_binding(
+                            receipt.get("binding"),
+                            expected=receipt_binding,
+                            where="archive download receipt binding",
+                        )
+                    except (RuntimeError, ValueError) as error:
+                        raise ValueError(
+                            f"archive download receipt binding mismatch: {error}"
+                        ) from error
+                return {
+                    **binding,
+                    "status": "reused_verified",
+                    "receipt": str(receipt_path),
+                }
         else:
             _write_json_atomic(
                 receipt_path,
@@ -236,7 +253,11 @@ def _acquire_archive(
                     "verified_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
-        return {**binding, "status": "reused_verified", "receipt": str(receipt_path)}
+            return {
+                **binding,
+                "status": "reused_verified",
+                "receipt": str(receipt_path),
+            }
 
     if receipt_path.exists():
         receipt_path.unlink()
@@ -518,6 +539,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--bundle-id")
     parser.add_argument("--run-id", required=True)
+    parser.add_argument(
+        "--megatron-commit",
+        default=os.environ.get("CPPMEGA_MEGATRON_COMMIT"),
+        help="exact Megatron-LM commit; defaults to CPPMEGA_MEGATRON_COMMIT",
+    )
     parser.add_argument("--bucket", default=DEFAULT_BUCKET)
     parser.add_argument("--prefix", default=DEFAULT_PREFIX)
     parser.add_argument("--endpoint-url", default=DEFAULT_ENDPOINT)
@@ -537,6 +563,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     args = build_arg_parser().parse_args(raw_argv)
     args.run_id = _validate_run_id(args.run_id)
+    if not isinstance(args.megatron_commit, str) or re.fullmatch(
+        r"[0-9a-f]{40}(?:[0-9a-f]{24})?", args.megatron_commit
+    ) is None:
+        raise ValueError(
+            "bundle restore requires --megatron-commit or "
+            "CPPMEGA_MEGATRON_COMMIT with an exact lowercase Git SHA"
+        )
     if args.bundle_id is not None and not re.fullmatch(
         r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", args.bundle_id
     ):
@@ -599,6 +632,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         transport["artifact_bytes"]
     ):
         raise ValueError("remote logical manifest counts do not match transport")
+    implementation = complete_training_implementation_binding(
+        logical_manifest.get("implementation"),
+        megatron_commit=args.megatron_commit,
+    )
 
     if args.require_empty_output_root:
         _require_empty_output_root(output_root)
@@ -624,6 +661,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         config=restore_config,
         command=[str(Path(__file__).resolve()), *raw_argv],
         run_id=args.run_id,
+        implementation=implementation,
     )
     _restore_lock = _acquire_restore_lock(
         output_root, bundle_id=bundle_id, run_id=args.run_id

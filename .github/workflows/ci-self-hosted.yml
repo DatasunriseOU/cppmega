@@ -19,47 +19,37 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - name: Run focused contract suite
+      - name: Run repository-owned macOS lane
         shell: bash
+        env:
+          CPPMEGA_MLX_REFERENCE_ROOT: ${{ vars.CPPMEGA_MLX_REFERENCE_ROOT }}
+          CPPMEGA_MLX_REFERENCE_COMMIT: ${{ vars.CPPMEGA_MLX_REFERENCE_COMMIT }}
+          CPPMEGA_RECIPE_PARITY_PEER_ROOT: ${{ vars.CPPMEGA_MLX_REFERENCE_ROOT }}
+          CPPMEGA_RECIPE_PARITY_PEER_COMMIT: ${{ vars.CPPMEGA_MLX_REFERENCE_COMMIT }}
+          CPPMEGA_RECIPE_PARITY_PYTHON: ${{ vars.CPPMEGA_RECIPE_PARITY_PYTHON }}
         run: |
           set -euo pipefail
-          unset PYTHONPATH PYTHONHOME VIRTUAL_ENV || true
-          export PYTHONNOUSERSITE=1
-          export PYTHONSAFEPATH=1
-          python_bin=/Volumes/external/sources/.venvs/cppmega.source/bin/python
+          python_bin="${CPPMEGA_CI_PYTHON:-/Volumes/external/sources/.venvs/cppmega.source/bin/python}"
           export MEGATRON_LM_REPO=/Volumes/external/sources/Megatron-LM-core_v0.18.0
           test -x "${python_bin}"
-          "${python_bin}" -m pytest -q \
-            tests/test_custom_embedding.py \
-            tests/test_data_pipeline_contracts.py \
-            tests/test_data_prep_parquet_to_megatron.py \
-            tests/test_case5_ksh_domain_contract.py \
-            tests/test_domain_embedding.py \
-            tests/test_domain_megatron_sidecars.py \
-            tests/test_dsa_indexer_fused_patch.py \
-            tests/test_eval_domain_routed_codegen.py \
-            tests/test_fastmtp_layer.py \
-            tests/test_graph_route_attention_bias_patch.py \
-            tests/test_ksh_python_domain_parsers.py \
-            tests/test_nebius_h200_megatron_cpp_generation_eval.py \
-            tests/test_nebius_h200_megatron_cpp_world_sweep.py \
-            tests/test_structure_dataset_patch_bridge.py \
-            tests/test_structure_embedding.py \
-            tests/test_subset_megatron_sidecar_prefix.py \
-            tests/test_build_macro_routes_megatron_bundle.py \
-            tests/test_dsa_sparse_attention.py \
-            tests/test_publish_megatron_bundle_to_nebius_s3.py \
-            tests/test_restore_megatron_bundle_from_nebius_s3.py \
-            tests/test_workflow_runner_policy.py
-          "${python_bin}" scripts/eval_domain_routed_codegen.py \
-            --prompts evals/domain_routed_prompts.jsonl \
-            --completions evals/domain_routed_gold_completions.jsonl \
-            --out "${RUNNER_TEMP}/cppmega-domain-routed-codegen.json"
-          "${python_bin}" scripts/data/verify_tokenizer_contract.py \
-            --contract "${GITHUB_WORKSPACE}/data/tokenizer_v2/tokenizer_contract_v1.json" \
-            --tokenizer "${GITHUB_WORKSPACE}/data/tokenizer_v2/tokenizer.json" \
-            --domain-schema "${GITHUB_WORKSPACE}/data/domain_schema_v1.json"
-          git diff --check
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          expected_tree="$(git rev-parse HEAD^{tree})"
+          "${python_bin}" scripts/ci/run_repository_ci.py lane \
+            --lanes-config "${GITHUB_WORKSPACE}/configs/ci/lanes.json" \
+            --lane macos-contracts \
+            --repo-root "${GITHUB_WORKSPACE}" \
+            --receipt-dir "${RUNNER_TEMP}/cppmega-repository-ci-macos-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --python "${python_bin}" \
+            --expected-source-commit "${GITHUB_SHA}" \
+            --expected-source-tree "${expected_tree}"
+      - name: Upload macOS lane receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cppmega-repository-ci-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cppmega-repository-ci-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 14
 
   linux-portable:
     name: Linux portable data contracts
@@ -71,34 +61,26 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.13"
-      - name: Install portable test dependencies
+      - name: Install portable lane dependencies
         run: python -m pip install --disable-pip-version-check pytest numpy pyarrow tokenizers boto3 zstandard
-      - name: Run portable data and bundle suite
+      - name: Run repository-owned Linux lane
         run: |
           set -euo pipefail
-          unset PYTHONPATH PYTHONHOME VIRTUAL_ENV || true
-          export PYTHONNOUSERSITE=1
-          export PYTHONSAFEPATH=1
-          CPPMEGA_TEST_PROFILE=portable-data python -m pytest -q \
-            tests/test_data_pipeline_contracts.py \
-            tests/test_data_prep_parquet_to_megatron.py \
-            tests/test_case5_ksh_domain_contract.py \
-            tests/test_domain_megatron_sidecars.py \
-            tests/test_eval_domain_routed_codegen.py \
-            tests/test_ksh_python_domain_parsers.py \
-            tests/test_nebius_h200_megatron_cpp_generation_eval.py \
-            tests/test_nebius_h200_megatron_cpp_world_sweep.py \
-            tests/test_subset_megatron_sidecar_prefix.py \
-            tests/test_build_macro_routes_megatron_bundle.py \
-            tests/test_publish_megatron_bundle_to_nebius_s3.py \
-            tests/test_restore_megatron_bundle_from_nebius_s3.py \
-            tests/test_workflow_runner_policy.py
-          python scripts/eval_domain_routed_codegen.py \
-            --prompts evals/domain_routed_prompts.jsonl \
-            --completions evals/domain_routed_gold_completions.jsonl \
-            --out "${RUNNER_TEMP}/cppmega-domain-routed-codegen.json"
-          python scripts/data/verify_tokenizer_contract.py \
-            --contract "${GITHUB_WORKSPACE}/data/tokenizer_v2/tokenizer_contract_v1.json" \
-            --tokenizer "${GITHUB_WORKSPACE}/data/tokenizer_v2/tokenizer.json" \
-            --domain-schema "${GITHUB_WORKSPACE}/data/domain_schema_v1.json"
-          git diff --check
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          expected_tree="$(git rev-parse HEAD^{tree})"
+          python scripts/ci/run_repository_ci.py lane \
+            --lanes-config "${GITHUB_WORKSPACE}/configs/ci/lanes.json" \
+            --lane linux-contracts \
+            --repo-root "${GITHUB_WORKSPACE}" \
+            --receipt-dir "${RUNNER_TEMP}/cppmega-repository-ci-linux-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --python python \
+            --expected-source-commit "${GITHUB_SHA}" \
+            --expected-source-tree "${expected_tree}"
+      - name: Upload Linux lane receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cppmega-repository-ci-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cppmega-repository-ci-linux-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 14

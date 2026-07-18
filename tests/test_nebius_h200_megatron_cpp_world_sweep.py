@@ -16,6 +16,7 @@ from cppmega.megatron.graph_recipe import (
     STAGE1_GRAPH_TOPK,
     stage1_graph_recipe_binding,
 )
+from cppmega.receipt_binding import build_data_producer_binding
 import scripts.data.publish_megatron_bundle_to_nebius_s3 as publisher
 import scripts.nebius_h200_megatron_cpp_world_sweep as sweep_module
 
@@ -477,11 +478,19 @@ def _write_test_bundle(root, prefix, tokenizer):
     ]
     tokenizer_sha256 = publisher._artifact_set_sha256(tokenizer_records)
     manifest = {
-        "schema": "cppmega_megatron_bundle_v1",
+        "schema": "cppmega_megatron_bundle_v2",
         "bundle_id": f"test-bundle-{artifact_set_sha256[:16]}",
         "tokenizer_contract": "megacpp-vocab-65536",
         "vocab_size": 65536,
         "training_contract": "objective_materialized",
+        "implementation": build_data_producer_binding(
+            cppmega_commit="a" * 40,
+            cppmega_tree_sha256="b" * 64,
+            cppmega_mlx_commit="c" * 40,
+            cppmega_mlx_tree_sha256="d" * 64,
+            clang_indexer_sha256="e" * 64,
+            clang_indexer_dependency_closure_sha256="f" * 64,
+        ),
         "objective_materialization": {
             "schema": "cppmega_bucketed_objective_materializations_v1",
             "buckets": {
@@ -856,6 +865,10 @@ def test_remote_script_can_sweep_multiple_seq_lengths_with_separate_prefixes():
     assert "--max-position-embeddings ${SEQ}" in script
     assert "seq_${SEQ}_bs_${BS}.log" in script
     assert "CPPMEGA_BATCH_RESULT seq=${SEQ} batch=${BS}" in script
+    assert "GRAPH_PRIOR_RECEIPT=\"/data/cppmega_h200_results/seq_${SEQ}_bs_${BS}_graph_prior.json\"" in script
+    assert "require_selector=True" in script
+    assert "expected_dsa_beta=1.0" in script
+    assert "reason=dsa_selector_gate" in script
 
 
 def test_remote_script_can_enable_tensorwise_fp8_flags():
@@ -1263,6 +1276,8 @@ def test_h200_preflight_real_local_dry_run_writes_bound_commands(tmp_path):
                 str(prefix),
                 "--tokenizer-model",
                 str(tokenizer),
+                "--megatron-commit",
+                "9" * 40,
                 "--run-id",
                 "local-dry-run",
                 "--sequence-length",

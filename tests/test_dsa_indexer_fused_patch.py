@@ -14,6 +14,7 @@ import subprocess
 import sys
 import json
 import os
+from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
@@ -264,6 +265,200 @@ def test_fused_scores_use_canonical_graph_beta_by_default():
         )
 
     assert scores[0, 1, 0].item() == 3.0
+
+
+def test_real_pinned_dsa_topk_emits_selector_receipt(tmp_path):
+    """Exercise the installed pinned Megatron selector in a clean subprocess."""
+
+    receipt_path = tmp_path / "dsa-selector.json"
+    script = r'''
+import json
+import os
+from pathlib import Path
+
+import torch
+
+from megatron.core.transformer.experimental_attention_variant import dsa
+from cppmega.megatron import dsa_indexer_fused_patch as fused_patch
+
+structure = {
+    "graph_domain_edges": torch.tensor([[[0, 3, 7]]], dtype=torch.long),
+    "graph_domain_edge_counts": torch.tensor([1], dtype=torch.long),
+}
+token = fused_patch._set_graph_batch_override(structure)
+try:
+    fused_patch.apply_dsa_indexer_fused_patch(force=True)
+    q = torch.zeros((2, 1, 1, 4), dtype=torch.bfloat16)
+    k = torch.zeros((4, 1, 4), dtype=torch.bfloat16)
+    weights = torch.ones((2, 1, 1), dtype=torch.bfloat16)
+    mask = torch.zeros((1, 2, 4), dtype=torch.float32)
+    scores, indices = dsa.fused_qk_topk_naive(q, k, weights, 2, mask)
+    dsa.fused_qk_topk_naive(q, k, weights, 2, mask)
+    print(json.dumps({"indices": indices.tolist(), "scores": scores.tolist()}))
+finally:
+    fused_patch._reset_graph_batch_override(token)
+'''
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "CPPMEGA_GRAPH_ROUTES_ENABLED": "1",
+            "CPPMEGA_GRAPH_BIAS_BETA": "1",
+            "CPPMEGA_H200_GRAPH_PRIOR_RECEIPT": str(receipt_path),
+        }
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr + "\n" + result.stdout
+    output = json.loads(result.stdout.strip().splitlines()[-1])
+    assert output["indices"][0][0][0] == 3
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    selector = receipt["selector"]
+    assert selector["formula"] == "I_neural + beta*S_graph -> mask -> topk"
+    assert selector["observation_count"] == 1
+    observation = selector["observations"][0]
+    assert observation["indices_match"] is True
+    assert observation["equation_max_abs_error"] <= 1e-5
+    assert len(observation["topk_indices"]["sha256"]) == 64
+
+
+def test_real_pinned_dsa_topk_applies_graph_before_mask_and_selection(tmp_path):
+    """The actual pinned Megatron selector must consume graph-biased scores."""
+
+    script = r'''
+import json
+import torch
+
+from megatron.core.transformer.experimental_attention_variant import dsa
+from cppmega.megatron import dsa_indexer_fused_patch as fused_patch
+
+structure = {
+    "graph_domain_edges": torch.tensor([[[0, 3, 7]]], dtype=torch.long),
+    "graph_domain_edge_counts": torch.tensor([1], dtype=torch.long),
+}
+token = fused_patch._set_graph_batch_override(structure)
+try:
+    fused_patch.apply_dsa_indexer_fused_patch(force=True)
+    q = torch.zeros((1, 1, 1, 2), dtype=torch.bfloat16)
+    k = torch.zeros((4, 1, 2), dtype=torch.bfloat16)
+    weights = torch.ones((1, 1, 1), dtype=torch.bfloat16)
+    plain_scores, plain_indices = dsa.fused_qk_topk_naive(
+        q, k, weights, 1, None
+    )
+    mask = torch.zeros((1, 1, 4), dtype=torch.float32)
+    mask[..., 3] = float("-inf")
+    masked_scores, masked_indices = dsa.fused_qk_topk_naive(
+        q, k, weights, 1, mask
+    )
+    print(json.dumps({
+        "plain_scores": plain_scores.tolist(),
+        "plain_indices": plain_indices.tolist(),
+        "masked_scores": masked_scores.tolist(),
+        "masked_indices": masked_indices.tolist(),
+    }))
+finally:
+    fused_patch._reset_graph_batch_override(token)
+'''
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "CPPMEGA_GRAPH_ROUTES_ENABLED": "1",
+            "CPPMEGA_GRAPH_BIAS_BETA": "4",
+        }
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr + "\n" + result.stdout
+    output = json.loads(result.stdout.strip().splitlines()[-1])
+    assert output["plain_indices"][0][0][0] == 3
+    assert output["plain_scores"][0][0][3] == pytest.approx(4.0)
+    assert output["masked_indices"][0][0][0] != 3
+    assert output["masked_scores"][0][0][3] == float("-inf")
+
+
+def test_graph_edges_change_production_indexer_loss_and_gradient():
+    from cppmega.megatron import dsa_indexer_fused_patch as fused_patch
+
+    base_scores = torch.zeros((1, 4, 4), dtype=torch.float32)
+    base_scores[0, 3, 0] = 5.0
+    base_scores[0, 3, 1] = -5.0
+    environment = {
+        "CPPMEGA_GRAPH_ROUTES_ENABLED": "1",
+        "CPPMEGA_DSA_GRAPH_AUX_ENABLED": "1",
+        "CPPMEGA_DSA_GRAPH_AUX_RELATIONS": "domain",
+        "CPPMEGA_DSA_GRAPH_AUX_WEIGHT": "1",
+        "CPPMEGA_DSA_INDEXER_LOSS_COEFF": "1",
+        "CPPMEGA_DSA_GRAPH_LAYER_WEIGHT": "1",
+        "CPPMEGA_DSA_GRAPH_BCE_WEIGHT": "1",
+        "CPPMEGA_DSA_GRAPH_COVERAGE_WEIGHT": "1",
+        "CPPMEGA_DSA_GRAPH_AUX_TOPK": "4",
+        "CPPMEGA_GRAPH_BIAS_BETA": "1",
+    }
+
+    def run(edge_destination: int) -> tuple[torch.Tensor, torch.Tensor]:
+        scores = base_scores.clone().requires_grad_(True)
+        structure = {
+            "graph_domain_edges": torch.tensor(
+                [[[3, edge_destination, 5]]], dtype=torch.long
+            ),
+            "graph_domain_edge_counts": torch.tensor([1], dtype=torch.long),
+            "graph_document_ids": torch.full((1, 4), 7, dtype=torch.long),
+        }
+        token = fused_patch._set_graph_batch_override(structure)
+        try:
+            with patch.dict(os.environ, environment, clear=True):
+                loss = fused_patch._graph_objective_from_index_scores(scores)
+            loss.backward()
+            return loss.detach(), scores.grad.detach().clone()
+        finally:
+            fused_patch._reset_graph_batch_override(token)
+
+    low_loss, low_grad = run(0)
+    high_loss, high_grad = run(1)
+
+    assert torch.isfinite(low_loss)
+    assert torch.isfinite(high_loss)
+    assert high_loss.item() > low_loss.item()
+    assert low_grad[0, 3, 0].abs().item() > 0
+    assert high_grad[0, 3, 1].abs().item() > 0
+    assert not torch.equal(low_grad, high_grad)
+
+
+def test_production_tensor_only_dsa_fails_closed_unless_explicit_ablation():
+    from cppmega.megatron.dsa_indexer_fused_patch import (
+        apply_dsa_indexer_fused_patch,
+        require_graph_routes_for_production,
+    )
+
+    production_environment = {
+        "CPPMEGA_GRAPH_ROUTES_ENABLED": "0",
+        "CPPMEGA_H200_GRAPH_PRIOR_RECEIPT": "/tmp/graph-prior.json",
+    }
+    with patch.dict(os.environ, production_environment, clear=True):
+        with pytest.raises(RuntimeError, match="tensor-only"):
+            apply_dsa_indexer_fused_patch(force=True)
+
+    with patch.dict(
+        os.environ,
+        {
+            **production_environment,
+            "CPPMEGA_GRAPH_ROUTES_ABLATION": "1",
+        },
+        clear=True,
+    ):
+        require_graph_routes_for_production()
 
 
 def test_dsa_graph_prior_receipt_binds_canonical_beta(tmp_path):

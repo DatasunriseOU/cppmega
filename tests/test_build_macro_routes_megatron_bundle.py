@@ -19,6 +19,7 @@ from scripts.data.build_macro_routes_megatron_bundle import (
     _load_manifest_allowlist,
     _parse_objective_artifacts,
     _portable_bucket_results,
+    _producer_binding_from_conveyor,
     _publish_validated_bundle,
     _run_snapshot_audit,
     _snapshot_sources,
@@ -37,6 +38,53 @@ def test_bundle_known_limitations_do_not_claim_retired_qname_or_domain_gaps() ->
     text = " ".join(BUNDLE_KNOWN_LIMITATIONS).lower()
     assert "qname" not in text
     assert "no observed shell" not in text
+
+
+def _conveyor_revision_binding() -> dict[str, object]:
+    return {
+        "code_revision": {
+            "schema_version": 2,
+            "git_commit": "a" * 40,
+            "dirty": False,
+            "source_tree_sha256": "b" * 64,
+            "indexer_dependency_closure_sha256": "d" * 64,
+            "indexer_provenance": {
+                "schema": "cppmega_indexer_dependency_binding_v1",
+                "path": "tools/clang_indexer/index_project.py",
+                "source_sha256": "c" * 64,
+                "dependency_closure_sha256": "d" * 64,
+                "dependency_manifest": {
+                    "tools/clang_indexer/index_project.py": "c" * 64,
+                },
+            },
+        }
+    }
+
+
+def test_bundle_producer_binding_covers_cppmega_mlx_and_indexer_closure() -> None:
+    binding = _producer_binding_from_conveyor(
+        _conveyor_revision_binding(),
+        cppmega_commit="e" * 40,
+        cppmega_tree_sha256="f" * 64,
+    )
+
+    assert set(binding["components"]) == {
+        "cppmega",
+        "cppmega_mlx",
+        "clang_indexer",
+    }
+    assert binding["components"]["clang_indexer"][
+        "dependency_closure_sha256"
+    ] == "d" * 64
+
+
+def test_bundle_producer_binding_rejects_legacy_revision_receipt() -> None:
+    with pytest.raises(RuntimeError, match="schema v2"):
+        _producer_binding_from_conveyor(
+            {"code_revision": {"schema_version": 1, "dirty": False}},
+            cppmega_commit="e" * 40,
+            cppmega_tree_sha256="f" * 64,
+        )
 
 
 def test_artifact_set_fingerprint_is_order_independent_and_content_bound() -> None:

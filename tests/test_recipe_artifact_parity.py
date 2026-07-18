@@ -25,18 +25,27 @@ _EXPECTED_OBJECTIVE_ARTIFACT_SET_SHA256 = (
 
 def _mlx_root() -> Path:
     configured = os.environ.get("CPPMEGA_RECIPE_PARITY_PEER_ROOT")
-    candidates = []
-    if configured:
-        candidates.append(Path(configured))
-    candidates.append(
-        Path(__file__).resolve().parents[2]
-        / "cppmega_mlx_fix_recipe_parity_20260718"
-    )
-    candidates.append(Path(__file__).resolve().parents[2] / "cppmega.mlx")
-    for candidate in candidates:
-        if candidate.is_dir():
-            return candidate
-    pytest.skip("cross-repository artifact parity worktree is unavailable")
+    expected_commit = os.environ.get("CPPMEGA_RECIPE_PARITY_PEER_COMMIT")
+    if not configured or not expected_commit:
+        pytest.fail(
+            "artifact parity requires explicit CPPMEGA_RECIPE_PARITY_PEER_ROOT "
+            "and CPPMEGA_RECIPE_PARITY_PEER_COMMIT"
+        )
+    candidate = Path(configured).expanduser().resolve()
+    if not candidate.is_dir():
+        pytest.fail(f"cross-repository artifact parity worktree is unavailable: {candidate}")
+    actual_commit = subprocess.run(
+        ("git", "-C", str(candidate), "rev-parse", "HEAD"),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if actual_commit != expected_commit:
+        pytest.fail(
+            "artifact parity checkout commit mismatch: "
+            f"expected={expected_commit} actual={actual_commit}"
+        )
+    return candidate
 
 
 def _mlx_python(peer_root: Path) -> Path:

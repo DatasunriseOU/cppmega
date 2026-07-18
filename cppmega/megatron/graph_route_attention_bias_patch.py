@@ -24,6 +24,7 @@ from cppmega.megatron.dsa_indexer_fused_patch import (
     _as_batched_edge_triples,
     _scatter_edges_,
     build_graph_route_bias_from_structure_batch,
+    require_graph_routes_for_production,
 )
 from cppmega.megatron.graph_objective_loss import (
     resolve_graph_bias_beta,
@@ -82,7 +83,21 @@ def _prompt_graph_inference_state(inference_context: Any) -> PromptGraphInferenc
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default).lower() in {"1", "true", "yes", "on"}
+    raw = os.environ[name] if name in os.environ else default
+    if not isinstance(raw, str):
+        raise TypeError(f"{name} must be a string boolean value, got {type(raw).__name__}")
+    normalized = raw.strip().lower()
+    if not normalized:
+        raise ValueError(
+            f"{name} must be one of 1,true,yes,on,0,false,no,off; empty values are invalid"
+        )
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{name} must be one of 1,true,yes,on,0,false,no,off; got {raw!r}"
+    )
 
 
 def _env_float(name: str, default: float) -> float:
@@ -108,6 +123,7 @@ def _env_int(name: str, default: int) -> int:
 def graph_dense_bias_enabled() -> bool:
     """Default dense graph bias on whenever graph routes are enabled."""
 
+    require_graph_routes_for_production()
     if not _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
         return False
     return _env_flag("CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS", "1")
@@ -556,6 +572,8 @@ def apply_graph_route_attention_bias_patch(*, force: bool = False) -> bool:
     ``attention_bias``; DSA is handled by the DSA indexer patch; MLA raises so
     we do not silently run a graph-routed cppmega model as token-only.
     """
+
+    require_graph_routes_for_production()
 
     from megatron.core.transformer.transformer_layer import TransformerLayer
 

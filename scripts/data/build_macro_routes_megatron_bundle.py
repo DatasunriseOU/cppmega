@@ -50,6 +50,7 @@ from cppmega.megatron.objective_contract import (  # noqa: E402
     load_objective_materialization_artifact,
     validate_materialized_objective_contract,
 )
+from cppmega.receipt_binding import build_data_producer_binding  # noqa: E402
 
 
 DEFAULT_BUCKETS = (1024, 2048, 4096, 8192, 16384)
@@ -201,6 +202,39 @@ def _git_sha(root: Path) -> str | None:
         check=False,
     )
     return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _producer_binding_from_conveyor(
+    conveyor_manifest: dict[str, object],
+    *,
+    cppmega_commit: str,
+    cppmega_tree_sha256: str,
+) -> dict[str, object]:
+    revision = conveyor_manifest.get("code_revision")
+    if not isinstance(revision, dict):
+        raise RuntimeError("conveyor manifest lacks a code_revision receipt")
+    if int(revision.get("schema_version", 0)) < 2 or revision.get("dirty") is not False:
+        raise RuntimeError(
+            "conveyor manifest requires a clean code revision schema v2 receipt"
+        )
+    indexer = revision.get("indexer_provenance")
+    if not isinstance(indexer, dict):
+        raise RuntimeError("conveyor manifest lacks clang indexer provenance")
+    if indexer.get("schema") != "cppmega_indexer_dependency_binding_v1":
+        raise RuntimeError("conveyor manifest clang indexer provenance is unsupported")
+    closure = indexer.get("dependency_closure_sha256")
+    if closure != revision.get("indexer_dependency_closure_sha256"):
+        raise RuntimeError(
+            "conveyor manifest clang indexer dependency closure is inconsistent"
+        )
+    return build_data_producer_binding(
+        cppmega_commit=cppmega_commit,
+        cppmega_tree_sha256=cppmega_tree_sha256,
+        cppmega_mlx_commit=str(revision.get("git_commit", "")),
+        cppmega_mlx_tree_sha256=str(revision.get("source_tree_sha256", "")),
+        clang_indexer_sha256=str(indexer.get("source_sha256", "")),
+        clang_indexer_dependency_closure_sha256=str(closure or ""),
+    )
 
 
 def _stable_parquets(
@@ -1095,6 +1129,11 @@ def _create_build_plan(
             "commits": str(args.commit_root.resolve()),
         },
         "conveyor_manifest": conveyor_manifest,
+        "implementation": _producer_binding_from_conveyor(
+            conveyor_manifest,
+            cppmega_commit=args.cppmega_commit,
+            cppmega_tree_sha256=args.cppmega_tree_sha256,
+        ),
         "buckets": list(buckets),
         "min_age_seconds": args.min_age_seconds,
         "keep_snapshot": bool(args.keep_snapshot),
@@ -1105,7 +1144,7 @@ def _create_build_plan(
             "artifact_set_sha256": _artifact_set_sha256(tokenizer_records),
         },
         "data_contracts": _source_file_records(contract_paths, REPO_ROOT),
-        "implementation": {
+        "implementation_sha256": {
             "builder": {
                 "path": str(Path(__file__).resolve()),
                 "sha256": _sha256(Path(__file__).resolve()),
@@ -1241,6 +1280,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=REPO_ROOT / "data/tokenizer_v2",
     )
     parser.add_argument(
+        "--cppmega-commit",
+        default=None,
+        help="exact clean cppmega Git commit used by the bundle builder",
+    )
+    parser.add_argument(
+        "--cppmega-tree-sha256",
+        default=None,
+        help="SHA-256 of the reviewed cppmega tracked source tree",
+    )
+    parser.add_argument(
         "--objective-artifact",
         action="append",
         default=[],
@@ -1270,6 +1319,8 @@ def _require_explicit_source_inputs(args: argparse.Namespace) -> None:
             ("code_root", "--code-root"),
             ("commit_root", "--commit-root"),
             ("conveyor_manifest", "--conveyor-manifest"),
+            ("cppmega_commit", "--cppmega-commit"),
+            ("cppmega_tree_sha256", "--cppmega-tree-sha256"),
         )
         if getattr(args, attribute) is None
     ]
@@ -1403,7 +1454,7 @@ def _run_build(
     artifact_set_sha256 = _artifact_set_sha256(artifacts)
     audit_total = audit_receipt["total"]
     manifest = {
-        "schema": "cppmega_megatron_bundle_v1",
+        "schema": "cppmega_megatron_bundle_v2",
         "bundle_id": f"{output_dir.name}-{artifact_set_sha256[:16]}",
         "created_at": _utc_now(),
         "tokenizer_contract": EXPECTED_BUNDLE_TOKENIZER_CONTRACT,
@@ -1454,6 +1505,11 @@ def _run_build(
         "git": {
             "cppmega": _git_sha(REPO_ROOT),
         },
+        "implementation": _producer_binding_from_conveyor(
+            conveyor_manifest,
+            cppmega_commit=args.cppmega_commit,
+            cppmega_tree_sha256=args.cppmega_tree_sha256,
+        ),
         "implementation_sha256": {
             "builder": _sha256(Path(__file__).resolve()),
             "converter": _sha256(

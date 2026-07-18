@@ -21,6 +21,7 @@ from cppmega.megatron.graph_recipe import (
     STAGE1_GRAPH_TOPK,
     stage1_graph_recipe_binding,
 )
+from cppmega.receipt_binding import build_data_producer_binding
 import scripts.data.publish_megatron_bundle_to_nebius_s3 as publisher
 from scripts.data.publish_megatron_bundle_to_nebius_s3 import (
     _head,
@@ -624,11 +625,19 @@ def _prefix_bundle(tmp_path):
         json.dumps(tokenizer_records, separators=(",", ":"), sort_keys=True).encode()
     ).hexdigest()
     manifest = {
-        "schema": "cppmega_megatron_bundle_v1",
+        "schema": "cppmega_megatron_bundle_v2",
         "bundle_id": f"test-bundle-{artifact_set_sha256[:16]}",
         "tokenizer_contract": "megacpp-vocab-65536",
         "vocab_size": 65536,
         "training_contract": "objective_materialized",
+        "implementation": build_data_producer_binding(
+            cppmega_commit="a" * 40,
+            cppmega_tree_sha256="b" * 64,
+            cppmega_mlx_commit="c" * 40,
+            cppmega_mlx_tree_sha256="d" * 64,
+            clang_indexer_sha256="e" * 64,
+            clang_indexer_dependency_closure_sha256="f" * 64,
+        ),
         "objective_materialization": {
             "schema": "cppmega_bucketed_objective_materializations_v1",
             "buckets": {

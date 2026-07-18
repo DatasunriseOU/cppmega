@@ -47,6 +47,7 @@ from cppmega.megatron.objective_contract import (  # noqa: E402
     validate_materialized_objective_contract,
     validate_objective_contract,
 )
+from cppmega.receipt_binding import validate_implementation_binding  # noqa: E402
 from cppmega.megatron.graph_recipe import (  # noqa: E402
     stage1_graph_recipe_binding,
 )
@@ -1983,11 +1984,16 @@ def _validate_logical_manifest_contract(manifest: object) -> None:
 
     if not isinstance(manifest, dict):
         raise ValueError("bundle logical manifest must be an object")
-    if manifest.get("schema") != "cppmega_megatron_bundle_v1":
+    if manifest.get("schema") != "cppmega_megatron_bundle_v2":
         raise ValueError(f"unsupported bundle schema: {manifest.get('schema')!r}")
     _require_manifest_tokenizer_contract(manifest)
     if manifest.get("training_contract") != "objective_materialized":
         raise ValueError("bundle training_contract must be 'objective_materialized'")
+    validate_implementation_binding(
+        manifest.get("implementation"),
+        where="bundle implementation",
+        required_components=("cppmega", "cppmega_mlx", "clang_indexer"),
+    )
     raw_artifacts = manifest.get("artifacts")
     if not isinstance(raw_artifacts, list) or not raw_artifacts:
         raise ValueError("bundle logical manifest artifacts must be a non-empty list")
