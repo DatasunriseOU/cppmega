@@ -1,6 +1,8 @@
 """Compatibility re-export of the canonical symbol identity contract."""
 
 from cppmega.symbol_identity import (
+    EXTERNAL_PROVIDER_FILE_PREFIX,
+    EXTERNAL_PROVIDER_PROJECTS,
     REPO_FILE_LOCATION_IDENTITY_PREFIX,
     SYMBOL_IDENTITIES_COLUMN,
     SYMBOL_IDENTITY_SCHEMA_METADATA_KEY,
@@ -10,14 +12,20 @@ from cppmega.symbol_identity import (
     ResolvedProjectIdentity,
     SymbolIdentityError,
     SymbolIdentityRegistry,
+    canonical_external_provider_file,
+    canonical_external_usr_identity,
     compute_symbol_id,
+    external_provider_project,
     is_repo_file_location_identity,
+    parse_external_provider_file,
     parse_repo_file_location_identity,
     require_project_identity,
     resolve_remote_project_identity,
 )
 
 __all__ = [
+    "EXTERNAL_PROVIDER_FILE_PREFIX",
+    "EXTERNAL_PROVIDER_PROJECTS",
     "REPO_FILE_LOCATION_IDENTITY_PREFIX",
     "SYMBOL_IDENTITIES_COLUMN",
     "SYMBOL_IDENTITY_SCHEMA_METADATA_KEY",
@@ -27,8 +35,12 @@ __all__ = [
     "RepoFileLocationIdentity",
     "SymbolIdentityError",
     "SymbolIdentityRegistry",
+    "canonical_external_provider_file",
+    "canonical_external_usr_identity",
     "compute_symbol_id",
+    "external_provider_project",
     "is_repo_file_location_identity",
+    "parse_external_provider_file",
     "parse_repo_file_location_identity",
     "require_project_identity",
     "resolve_remote_project_identity",

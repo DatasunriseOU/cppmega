@@ -59,13 +59,18 @@ from cppmega.data.build_context import (
     load_compile_commands_file,
 )
 from cppmega.symbol_identity import (
+    EXTERNAL_PROVIDER_PROJECTS,
     SYMBOL_IDENTITIES_COLUMN,
     SYMBOL_IDENTITY_SCHEMA_VERSION,
     SYMBOL_ID_MAX,  # noqa: F401 - re-exported for global index consumers
     SymbolIdentityError,
     SymbolIdentityRegistry,
+    canonical_external_provider_file,
+    canonical_external_usr_identity,
     compute_symbol_id,
+    external_provider_project,
     is_repo_file_location_identity,
+    parse_external_provider_file,
     parse_repo_file_location_identity,
     require_project_identity,
 )
@@ -780,7 +785,10 @@ def _normalize_signature_text(value: str | None) -> str:
 
 
 _PROVIDER_PATH_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("libc++", ("/libcxx/include/", "/include/c++/v1/")),
+    (
+        "libc++",
+        ("/libc++/include/", "/libcxx/include/", "/include/c++/v1/"),
+    ),
     (
         "libstdc++",
         ("/libstdc++-v3/include/", "/libstdc++-v3/libsupc++/", "/include/c++/"),
@@ -789,10 +797,7 @@ _PROVIDER_PATH_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("boost", ("/boost/",)),
 )
 _PROVIDER_PROJECT_IDENTITIES = {
-    "libc++": "llvm/llvm-project",
-    "libstdc++": "gcc-mirror/gcc",
-    "msvc-stl": "microsoft/STL",
-    "boost": "boostorg/boost",
+    **EXTERNAL_PROVIDER_PROJECTS,
 }
 
 
@@ -803,14 +808,13 @@ def symbol_provider_provenance(file_path: str | None) -> tuple[str, str]:
         return "", ""
     raw_path = str(file_path).replace("\\", "/").strip("/")
     if raw_path.startswith("@provider/"):
-        parts = raw_path.split("/", 2)
-        if (
-            len(parts) == 3
-            and parts[1] in _PROVIDER_PROJECT_IDENTITIES
-            and parts[2]
-        ):
-            return parts[1], parts[2]
-        return "", ""
+        try:
+            return parse_external_provider_file(
+                raw_path,
+                source="symbol provider provenance",
+            )
+        except SymbolIdentityError:
+            return "", ""
     normalized = "/" + raw_path
     lowered = normalized.lower()
     for provider, markers in _PROVIDER_PATH_MARKERS:
@@ -831,7 +835,18 @@ def symbol_provider_provenance(file_path: str | None) -> tuple[str, str]:
                 include_path = include_path[include_offset + len(include_marker) :]
             elif provider == "boost":
                 include_path = "boost/" + include_path
-            return provider, include_path.strip("/")
+            try:
+                canonical = canonical_external_provider_file(
+                    provider,
+                    include_path.strip("/"),
+                    source="symbol provider provenance",
+                )
+                return parse_external_provider_file(
+                    canonical,
+                    source="symbol provider provenance",
+                )
+            except SymbolIdentityError:
+                return provider, ""
     return "", ""
 
 
@@ -1000,6 +1015,8 @@ def canonical_symbol_identity(
     file: str | None = None,
     line: int | None = None,
     column: int | None = None,
+    provider: str | None = None,
+    include_provenance: str | None = None,
     force_file_scope: bool = False,
     repo_file_location_fallback: bool = False,
 ) -> str:
@@ -1021,6 +1038,15 @@ def canonical_symbol_identity(
         if raw_project
         else ""
     )
+    if provider or include_provenance:
+        return canonical_external_usr_identity(
+            usr=normalized_usr,
+            canonical_signature=normalized_signature,
+            provider=provider,
+            include_provenance=include_provenance,
+            project=owning_project or None,
+            source="canonical_symbol_identity external provider",
+        )
     if normalized_usr:
         project_scope = f"project={owning_project}\x1f" if owning_project else ""
         return (
@@ -1165,6 +1191,19 @@ def _cursor_repo_file_location_identity(
     candidate = _normalize_identity_path(
         str(location_name) if location_name else fallback_file
     )
+    if candidate.startswith("@provider/"):
+        provider, include_provenance = parse_external_provider_file(
+            candidate,
+            source="cursor provider identity",
+        )
+        return (
+            canonical_external_provider_file(
+                provider,
+                include_provenance,
+                source="cursor provider identity",
+            ),
+            external_provider_project(provider, source="cursor provider identity"),
+        )
     project_path = _normalize_identity_path(project_dir)
     if not _is_absolute_identity_path(candidate):
         return _normalize_repo_relative_identity_file(candidate), str(project or "")
@@ -1189,9 +1228,15 @@ def _cursor_repo_file_location_identity(
         return _normalize_repo_relative_identity_file(relative_file), str(project or "")
 
     provider, include_provenance = symbol_provider_provenance(candidate)
-    provider_project = _PROVIDER_PROJECT_IDENTITIES.get(provider, "")
-    if provider_project and include_provenance:
-        return f"@provider/{provider}/{include_provenance}", provider_project
+    if provider and include_provenance:
+        return (
+            canonical_external_provider_file(
+                provider,
+                include_provenance,
+                source="cursor provider identity",
+            ),
+            external_provider_project(provider, source="cursor provider identity"),
+        )
     raise SymbolIdentityError(
         "external declaration without USR or canonical signature requires a "
         f"stable provider identity, got path={candidate!r}"
@@ -1240,20 +1285,17 @@ def symbol_identity_for_cursor(
     signature = _cursor_canonical_signature(cursor)
     file_scope = force_file_scope
     uses_repo_file_location = not usr and not signature
-    if uses_repo_file_location:
-        rel_file, identity_project = _cursor_repo_file_location_identity(
-            cursor,
-            project_dir=project_dir,
-            project=project or repo,
-            fallback_file=fallback_file,
-        )
-    else:
-        rel_file, is_project_local = _cursor_identity_location(
-            cursor,
-            project_dir=project_dir,
-            fallback_file=fallback_file,
-        )
-        identity_project = (project or repo) if is_project_local else None
+    rel_file, identity_project = _cursor_repo_file_location_identity(
+        cursor,
+        project_dir=project_dir,
+        project=project or repo,
+        fallback_file=fallback_file,
+    )
+    requested_project = project or repo
+    is_external = rel_file.startswith("@provider/") or (
+        bool(requested_project) and identity_project != requested_project
+    )
+    provider, include_provenance = symbol_provider_provenance(rel_file)
     loc = getattr(cursor, "location", None)
     linkage = getattr(cursor, "linkage", None)
     linkage_name = getattr(linkage, "name", "") or str(linkage or "")
@@ -1272,18 +1314,28 @@ def symbol_identity_for_cursor(
     }
     if "INTERNAL" in linkage_name or storage_name == "STATIC" or is_local:
         file_scope = True
-    identity_key = canonical_symbol_identity(
-        qname=qname,
-        kind=_cursor_kind_name(cursor),
-        usr=usr,
-        canonical_signature=signature,
-        project=identity_project,
-        file=rel_file,
-        line=getattr(loc, "line", None),
-        column=getattr(loc, "column", None),
-        force_file_scope=file_scope,
-        repo_file_location_fallback=uses_repo_file_location,
-    )
+    if is_external and usr:
+        identity_key = canonical_external_usr_identity(
+            usr=usr,
+            canonical_signature=signature,
+            provider=provider,
+            include_provenance=include_provenance,
+            project=identity_project,
+            source="symbol_identity_for_cursor",
+        )
+    else:
+        identity_key = canonical_symbol_identity(
+            qname=qname,
+            kind=_cursor_kind_name(cursor),
+            usr=usr,
+            canonical_signature=signature,
+            project=identity_project,
+            file=rel_file,
+            line=getattr(loc, "line", None),
+            column=getattr(loc, "column", None),
+            force_file_scope=file_scope or is_external,
+            repo_file_location_fallback=uses_repo_file_location,
+        )
     return identity_key, usr, signature
 
 
@@ -1312,15 +1364,29 @@ def symbol_reference_for_cursor(
         reference_line = location_identity.line
         reference_column = location_identity.column
     else:
-        relative_file, is_project_local = _cursor_identity_location(
+        relative_file, reference_project = _cursor_repo_file_location_identity(
             cursor,
             project_dir=project_dir,
+            project=project_id,
             fallback_file=fallback_file,
         )
-        reference_project = project_id if is_project_local else ""
         reference_line = int(getattr(location, "line", 0) or 0)
         reference_column = int(getattr(location, "column", 0) or 0)
     provider, include_provenance = symbol_provider_provenance(relative_file)
+    if reference_project != project_id:
+        if not provider or not include_provenance:
+            raise SymbolIdentityError(
+                "symbol_reference_for_cursor cannot authorize an unknown external provider"
+            )
+        expected_file = canonical_external_provider_file(
+            provider,
+            include_provenance,
+            source="symbol_reference_for_cursor",
+        )
+        if relative_file != expected_file:
+            raise SymbolIdentityError(
+                "symbol_reference_for_cursor provider file is not canonical"
+            )
     return {
         "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
         "symbol_key": key,
@@ -1362,7 +1428,7 @@ def _normalize_symbol_reference(value: object) -> SymbolReference | None:
             "symbol reference ID does not match canonical key: "
             f"claimed={claimed_symbol_id} expected={expected_symbol_id} key={key!r}"
         )
-    return {
+    normalized = {
         "symbol_identity_schema_version": identity_version,
         "symbol_key": key,
         "symbol_id": expected_symbol_id,
@@ -1378,6 +1444,41 @@ def _normalize_symbol_reference(value: object) -> SymbolReference | None:
         "provider": str(value.get("provider") or ""),
         "include_provenance": str(value.get("include_provenance") or ""),
     }
+    provider = str(normalized["provider"])
+    include_provenance = str(normalized["include_provenance"])
+    reference_project = str(normalized["project"])
+    reference_file = str(normalized["file"])
+    has_external_claim = bool(
+        provider or include_provenance or reference_file.startswith("@provider/")
+    )
+    if has_external_claim:
+        expected_project = external_provider_project(
+            provider,
+            source="normalized external symbol reference",
+        )
+        expected_file = canonical_external_provider_file(
+            provider,
+            include_provenance,
+            source="normalized external symbol reference",
+        )
+        if reference_project != expected_project or reference_file != expected_file:
+            raise SymbolIdentityError(
+                "normalized external symbol reference provider provenance is inconsistent"
+            )
+        if normalized["usr"]:
+            expected_key = canonical_external_usr_identity(
+                usr=normalized["usr"],
+                canonical_signature=normalized["canonical_signature"],
+                provider=provider,
+                include_provenance=include_provenance,
+                project=reference_project,
+                source="normalized external symbol reference",
+            )
+            if key != expected_key:
+                raise SymbolIdentityError(
+                    "normalized external symbol reference key is inconsistent"
+                )
+    return normalized
 
 
 def _compute_symbol_id(symbol_key: str) -> int:
@@ -1761,6 +1862,12 @@ class ProjectIndex:
             symbol_key = str(normalized["symbol_key"])
             if symbol_key in self.functions:
                 return symbol_key
+            if (
+                normalized.get("provider")
+                or normalized.get("include_provenance")
+                or str(normalized.get("file") or "").startswith("@provider/")
+            ):
+                return None
             candidates = list(
                 self.function_qnames.get(
                     normalize_inline_namespace_qname(str(normalized["qname"])), []
@@ -1799,6 +1906,12 @@ class ProjectIndex:
             symbol_key = str(normalized["symbol_key"])
             if symbol_key in self.typedefs:
                 return symbol_key
+            if (
+                normalized.get("provider")
+                or normalized.get("include_provenance")
+                or str(normalized.get("file") or "").startswith("@provider/")
+            ):
+                return None
             candidates = list(
                 self.typedef_qnames.get(
                     normalize_inline_namespace_qname(str(normalized["qname"])), []
@@ -3316,23 +3429,26 @@ class GlobalSymbolReader:
         """Resolve one exact candidate and fail closed on ambiguity."""
         all_candidates = self.lookup_candidates(qname)
         candidates = list(all_candidates)
+        identity_filter_used = False
+        if symbol_key:
+            identity_filter_used = True
+            candidates = [row for row in candidates if row["symbol_key"] == symbol_key]
         if usr:
+            identity_filter_used = True
             candidates = [row for row in candidates if row["usr"] == usr]
-        else:
-            fallback_used = False
-            if canonical_signature:
-                fallback_used = True
-                signature = _normalize_signature_text(canonical_signature)
-                candidates = [
-                    row
-                    for row in candidates
-                    if _normalize_signature_text(str(row["canonical_signature"])) == signature
-                ]
-            if symbol_kind:
-                fallback_used = True
-                candidates = [row for row in candidates if row["symbol_kind"] == symbol_kind]
-            if not fallback_used and symbol_key:
-                candidates = [row for row in candidates if row["symbol_key"] == symbol_key]
+        if canonical_signature:
+            identity_filter_used = True
+            signature = _normalize_signature_text(canonical_signature)
+            candidates = [
+                row
+                for row in candidates
+                if _normalize_signature_text(str(row["canonical_signature"])) == signature
+            ]
+        if symbol_kind:
+            identity_filter_used = True
+            candidates = [row for row in candidates if row["symbol_kind"] == symbol_kind]
+        if not identity_filter_used:
+            candidates = list(all_candidates)
         if project:
             candidates = [row for row in candidates if row["base_repo"] == project]
         if file:
@@ -4960,38 +5076,37 @@ def build_enriched_doc(
                 return None
             identity_filter_used = False
             usr = str(reference.get("usr") or "")
+            reference_key = str(reference.get("symbol_key") or "")
             if usr:
                 identity_filter_used = True
                 candidates = [target for target in candidates if target.get("usr") == usr]
-            else:
-                reference_key = str(reference.get("symbol_key") or "")
-                signature = _normalize_signature_text(
-                    str(reference.get("canonical_signature") or "")
-                )
-                if signature:
-                    identity_filter_used = True
-                    candidates = [
-                        target
-                        for target in candidates
-                        if _normalize_signature_text(
-                            str(target.get("canonical_signature") or "")
-                        ) == signature
-                    ]
-                symbol_kind = str(reference.get("symbol_kind") or "")
-                if symbol_kind:
-                    identity_filter_used = True
-                    candidates = [
-                        target
-                        for target in candidates
-                        if str(target.get("kind") or "") == symbol_kind
-                    ]
-                if not identity_filter_used and reference_key:
-                    identity_filter_used = True
-                    candidates = [
-                        target
-                        for target in candidates
-                        if target.get("symbol_key") == reference_key
-                    ]
+            signature = _normalize_signature_text(
+                str(reference.get("canonical_signature") or "")
+            )
+            if signature:
+                identity_filter_used = True
+                candidates = [
+                    target
+                    for target in candidates
+                    if _normalize_signature_text(
+                        str(target.get("canonical_signature") or "")
+                    ) == signature
+                ]
+            symbol_kind = str(reference.get("symbol_kind") or "")
+            if symbol_kind:
+                identity_filter_used = True
+                candidates = [
+                    target
+                    for target in candidates
+                    if str(target.get("kind") or "") == symbol_kind
+                ]
+            if reference_key:
+                identity_filter_used = True
+                candidates = [
+                    target
+                    for target in candidates
+                    if target.get("symbol_key") == reference_key
+                ]
             provider = str(reference.get("provider") or "")
             if provider:
                 identity_filter_used = True

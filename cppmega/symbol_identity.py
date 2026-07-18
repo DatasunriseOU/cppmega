@@ -24,6 +24,13 @@ SYMBOL_IDENTITIES_COLUMN = "symbol_identities"
 SYMBOL_ID_MAX = (1 << 64) - 1
 _SYMBOL_ID_HASH_DOMAIN = b"cppmega.symbol-id.v3\0"
 REPO_FILE_LOCATION_IDENTITY_PREFIX = "repo_file_location:"
+EXTERNAL_PROVIDER_FILE_PREFIX = "@provider/"
+EXTERNAL_PROVIDER_PROJECTS = {
+    "libc++": "llvm/llvm-project",
+    "libstdc++": "gcc-mirror/gcc",
+    "msvc-stl": "microsoft/STL",
+    "boost": "boostorg/boost",
+}
 
 
 class SymbolIdentityError(RuntimeError):
@@ -270,6 +277,139 @@ def is_repo_file_location_identity(value: object) -> bool:
         return False
     parse_repo_file_location_identity(value)
     return True
+
+
+def external_provider_project(
+    provider: object,
+    *,
+    source: str = "external symbol provider",
+) -> str:
+    """Return the authoritative project namespace for a trusted provider."""
+
+    if (
+        not isinstance(provider, str)
+        or provider != provider.strip()
+        or provider not in EXTERNAL_PROVIDER_PROJECTS
+    ):
+        raise SymbolIdentityError(
+            f"{source}: unsupported external symbol provider {provider!r}"
+        )
+    return EXTERNAL_PROVIDER_PROJECTS[provider]
+
+
+def canonical_external_provider_file(
+    provider: object,
+    include_provenance: object,
+    *,
+    source: str = "external symbol provider file",
+) -> str:
+    """Return a canonical provider-owned include identity."""
+
+    external_provider_project(provider, source=source)
+    normalized_provider = str(provider)
+    if (
+        not isinstance(include_provenance, str)
+        or not include_provenance
+        or include_provenance != include_provenance.strip()
+    ):
+        raise SymbolIdentityError(
+            f"{source}: include provenance must be a non-empty canonical path"
+        )
+    include = include_provenance
+    if (
+        posixpath.normpath(include) != include
+        or include.startswith("/")
+        or _WINDOWS_LOCAL_PATH_RE.match(include)
+        or "\\" in include
+        or any(part in {"", ".", ".."} for part in include.split("/"))
+        or any(
+            char.isspace() or ord(char) < 32 or ord(char) == 127
+            for char in include
+        )
+    ):
+        raise SymbolIdentityError(
+            f"{source}: include provenance is not canonical: {include!r}"
+        )
+    return f"{EXTERNAL_PROVIDER_FILE_PREFIX}{normalized_provider}/{include}"
+
+
+def parse_external_provider_file(
+    value: object,
+    *,
+    source: str = "external symbol provider file",
+) -> tuple[str, str]:
+    """Parse and validate a canonical ``@provider/...`` identity."""
+
+    if not isinstance(value, str) or not value.startswith(
+        EXTERNAL_PROVIDER_FILE_PREFIX
+    ):
+        raise SymbolIdentityError(
+            f"{source}: expected an {EXTERNAL_PROVIDER_FILE_PREFIX!r} path"
+        )
+    payload = value.removeprefix(EXTERNAL_PROVIDER_FILE_PREFIX)
+    provider, separator, include = payload.partition("/")
+    if not separator:
+        raise SymbolIdentityError(f"{source}: provider include path is missing")
+    expected = canonical_external_provider_file(
+        provider,
+        include,
+        source=source,
+    )
+    if value != expected:
+        raise SymbolIdentityError(
+            f"{source}: provider include path is not canonical: {value!r}"
+        )
+    return provider, include
+
+
+def canonical_external_usr_identity(
+    *,
+    usr: object,
+    canonical_signature: object,
+    provider: object,
+    include_provenance: object,
+    project: object | None = None,
+    source: str = "external USR identity",
+) -> str:
+    """Bind an external clang USR to provider, include, and overload signature."""
+
+    provider_project = external_provider_project(provider, source=source)
+    provider_name = str(provider)
+    provider_file = canonical_external_provider_file(
+        provider,
+        include_provenance,
+        source=source,
+    )
+    if project is not None:
+        claimed_project = require_project_identity(project, source=f"{source}:project")
+        if claimed_project != provider_project:
+            raise SymbolIdentityError(
+                f"{source}: provider {provider!r} belongs to {provider_project!r}, "
+                f"not {claimed_project!r}"
+            )
+    if (
+        not isinstance(usr, str)
+        or not usr
+        or usr != usr.strip()
+        or "\x1f" in usr
+        or any(
+            char.isspace() or ord(char) < 32 or ord(char) == 127
+            for char in usr
+        )
+    ):
+        raise SymbolIdentityError(f"{source}: clang USR is missing or unsafe")
+    signature = " ".join(str(canonical_signature or "").split())
+    if not signature or "\x1f" in signature:
+        raise SymbolIdentityError(
+            f"{source}: canonical signature is required for external USR identity"
+        )
+    _provider, include = parse_external_provider_file(provider_file, source=source)
+    encoded_signature = quote(signature, safe=_IDENTITY_COMPONENT_SAFE)
+    return (
+        f"usr:schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}\x1f"
+        f"project={provider_project}\x1fprovider={provider_name}\x1f"
+        f"include={include}\x1fsig={encoded_signature}\x1fusr={usr}"
+    )
 
 
 def _normalize_remote_host(host: str, *, source: str) -> str:
@@ -563,6 +703,8 @@ class SymbolIdentityRegistry:
 
 
 __all__ = [
+    "EXTERNAL_PROVIDER_FILE_PREFIX",
+    "EXTERNAL_PROVIDER_PROJECTS",
     "REPO_FILE_LOCATION_IDENTITY_PREFIX",
     "SYMBOL_IDENTITIES_COLUMN",
     "SYMBOL_IDENTITY_SCHEMA_METADATA_KEY",
@@ -572,8 +714,12 @@ __all__ = [
     "RepoFileLocationIdentity",
     "SymbolIdentityError",
     "SymbolIdentityRegistry",
+    "canonical_external_provider_file",
+    "canonical_external_usr_identity",
     "compute_symbol_id",
+    "external_provider_project",
     "is_repo_file_location_identity",
+    "parse_external_provider_file",
     "parse_repo_file_location_identity",
     "require_project_identity",
     "resolve_remote_project_identity",
