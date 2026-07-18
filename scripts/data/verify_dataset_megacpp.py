@@ -74,6 +74,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-name", default=DEFAULT_DATASET_NAME)
     parser.add_argument("--vocab-size", type=int, default=DEFAULT_VOCAB_SIZE)
     parser.add_argument("--splits", default="train,val")
+    parser.add_argument(
+        "--raw-only",
+        action="store_true",
+        help=(
+            "skip the optional Megatron IndexedDataset reader and validate the "
+            "MMIDIDX files directly; this is required on hosts where importing "
+            "the CUDA-oriented Megatron stack is not supported"
+        ),
+    )
     return parser
 
 
@@ -102,29 +111,7 @@ def main() -> int:
         if bin_bytes == 0:
             sys.exit(f"ERROR: {bin_path} is empty")
 
-        # Prefer megatron-core if available.
-        try:
-            from megatron.core.datasets.indexed_dataset import IndexedDataset
-
-            ds = IndexedDataset(str(prefix))
-            n_docs = len(ds.document_indices) - 1
-            total_tokens = int(ds.sequence_lengths.sum())
-            sample = ds.get(0)[:64]
-            print(f"  megatron: docs={n_docs:,} tokens={total_tokens:,} "
-                  f"dtype={sample.dtype}")
-            mn, mx = int(sample.min()), int(sample.max())
-            # Full-array min/max is cheap because .bin is memmapped.
-            arr_mm = np.memmap(bin_path, dtype=sample.dtype, mode="r")
-            mn = min(mn, int(arr_mm.min()))
-            mx = max(mx, int(arr_mm.max()))
-            print(f"  token id range: [{mn}, {mx}]")
-            if mx >= args.vocab_size:
-                sys.exit(
-                    f"ERROR: max token id {mx} >= vocab_size {args.vocab_size}"
-                )
-            print(f"  doc0[:64]: {sample.tolist()}")
-        except Exception as e:
-            print(f"  megatron-core unavailable ({e}); falling back to raw idx check")
+        if args.raw_only:
             n_docs, dtype_code = _raw_idx_inspect(idx_path)
             print(f"  raw: num_sequences={n_docs:,} dtype_code={dtype_code}")
             mn, mx = _raw_token_range(bin_path, dtype_code)
@@ -133,6 +120,42 @@ def main() -> int:
                 sys.exit(
                     f"ERROR: max token id {mx} >= vocab_size {args.vocab_size}"
                 )
+            continue
+
+        # Prefer megatron-core if available. Only an import failure permits the
+        # documented raw inspection path; malformed datasets and runtime errors
+        # in IndexedDataset must remain visible to the caller.
+        try:
+            from megatron.core.datasets.indexed_dataset import IndexedDataset
+        except (ImportError, ModuleNotFoundError) as exc:
+            print(f"  megatron-core unavailable ({exc}); using raw idx check")
+            n_docs, dtype_code = _raw_idx_inspect(idx_path)
+            print(f"  raw: num_sequences={n_docs:,} dtype_code={dtype_code}")
+            mn, mx = _raw_token_range(bin_path, dtype_code)
+            print(f"  token id range: [{mn}, {mx}]")
+            if mx >= args.vocab_size:
+                sys.exit(
+                    f"ERROR: max token id {mx} >= vocab_size {args.vocab_size}"
+                )
+            continue
+
+        ds = IndexedDataset(str(prefix))
+        n_docs = len(ds.document_indices) - 1
+        total_tokens = int(ds.sequence_lengths.sum())
+        sample = ds.get(0)[:64]
+        print(f"  megatron: docs={n_docs:,} tokens={total_tokens:,} "
+              f"dtype={sample.dtype}")
+        mn, mx = int(sample.min()), int(sample.max())
+        # Full-array min/max is cheap because .bin is memmapped.
+        arr_mm = np.memmap(bin_path, dtype=sample.dtype, mode="r")
+        mn = min(mn, int(arr_mm.min()))
+        mx = max(mx, int(arr_mm.max()))
+        print(f"  token id range: [{mn}, {mx}]")
+        if mx >= args.vocab_size:
+            sys.exit(
+                f"ERROR: max token id {mx} >= vocab_size {args.vocab_size}"
+            )
+        print(f"  doc0[:64]: {sample.tolist()}")
 
     print("\n[megacpp_verify] OK")
     return 0

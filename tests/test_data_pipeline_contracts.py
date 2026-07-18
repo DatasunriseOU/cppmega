@@ -52,6 +52,7 @@ def test_verify_dataset_default_vocab_is_canonical_contract() -> None:
     parser = verify.build_arg_parser()
 
     assert parser.parse_args([]).vocab_size == 65536
+    assert parser.parse_args(["--raw-only"]).raw_only is True
 
 
 def _write_minimal_mmididx(idx_path: Path, dtype_code: int, num_sequences: int = 1) -> None:
@@ -86,6 +87,7 @@ def test_verify_dataset_raw_fallback_checks_full_token_range(tmp_path: Path) -> 
             "train",
             "--vocab-size",
             "65535",
+            "--raw-only",
         ],
         cwd=str(_REPO_ROOT),
         text=True,
