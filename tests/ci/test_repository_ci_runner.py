@@ -158,11 +158,15 @@ def test_macos_lane_covers_cross_repo_case_contracts_and_preserves_peer_paths() 
     }
 
     assert {
+        "tests/test_audit_sidecar_parquet.py",
         "tests/test_case4_identity_parity.py",
+        "tests/test_case5_v7_parser_token_span_regressions.py",
         "tests/test_case6_nebius_contracts.py",
         "tests/test_graph_objective_loss.py",
         "tests/test_graph_recipe.py",
         "tests/test_megatron_objective_contract.py",
+        "tests/test_prompt_graph_index_loader_contract.py",
+        "tests/test_prompt_graph_schema_v2.py",
         "tests/test_recipe_artifact_parity.py",
     }.issubset(argv)
     assert {
