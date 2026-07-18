@@ -27,6 +27,18 @@ from cppmega.symbol_identity import (
     compute_symbol_id,
     is_repo_file_location_identity,
 )
+from cppmega.prompt_graph_provenance import (
+    INDEX_INTEGRITY_VERSION,
+    INDEX_PAYLOAD_HASH_KEY,
+    PRODUCTION_INDEX_PRODUCER,
+    PRODUCTION_INDEX_VERSION,
+    TRUSTED_IDENTITY_ADAPTERS,
+    integrity_payload as _integrity_payload_for_index,
+    payload_sha256 as _payload_sha256_for_index,
+    validate_production_repository_index as _validate_production_index,
+    verify_integrity as _verify_index_integrity,
+    with_integrity as _with_index_integrity,
+)
 
 
 INDEX_SCHEMA = "cppmega_prompt_graph_index_v3"
@@ -1005,6 +1017,39 @@ class PromptProjectIndex:
     @property
     def index_sha256(self) -> str:
         return _sha_json(self.to_dict())
+
+    def _integrity_payload(self) -> dict[str, Any]:
+        return _integrity_payload_for_index(self)
+
+    @property
+    def payload_sha256(self) -> str:
+        return _payload_sha256_for_index(self)
+
+    def with_integrity(self) -> "PromptProjectIndex":
+        return _with_index_integrity(self)
+
+    def verify_integrity(self) -> None:
+        _verify_index_integrity(self)
+
+    def validate_production_repository_index(
+        self,
+        *,
+        expected_project_id: str | None = None,
+        repository_root: str | Path | None = None,
+        expected_indexer_root: str | Path | None = None,
+    ) -> None:
+        _validate_production_index(
+            self,
+            expected_project_id=expected_project_id,
+            repository_root=repository_root,
+            expected_indexer_root=expected_indexer_root,
+            index_schema=INDEX_SCHEMA,
+            relation_names=RELATION_NAMES,
+            repository_snapshot=repository_snapshot,
+            validate_relative_source_path=_validate_relative_source_path,
+            sha_file=_sha_file,
+            require_project_id=require_prompt_graph_project_id,
+        )
 
 
 def _upgrade_legacy_single_document_index(
@@ -2194,6 +2239,7 @@ class PromptGraphBuilder:
             project_index,
             prompt_to_source,
         )
+        _validate_token_source_alignment(token_spans, prompt_to_source)
         token_source_sets = _token_source_sets(
             token_spans,
             prompt_to_source,
@@ -2598,6 +2644,22 @@ def _token_source_sets(
         }
         for start, end in token_spans
     ]
+
+
+def _validate_token_source_alignment(
+    token_spans: Sequence[tuple[int, int]],
+    prompt_to_source: Sequence[tuple[int, int] | None],
+) -> None:
+    """Reject tokenizer pieces that mix synthetic and source-mapped text."""
+
+    for token_index, (start, end) in enumerate(token_spans):
+        references = prompt_to_source[start:end]
+        mapped_count = sum(reference is not None for reference in references)
+        if mapped_count and mapped_count != len(references):
+            raise ValueError(
+                "prompt graph token sidecar alignment crosses mapped and "
+                f"unmapped text at token {token_index}: [{start},{end})"
+            )
 
 
 def _empty_side_channels(
@@ -3122,7 +3184,9 @@ __all__ = [
     "GENERATED_QUERY_ROUTE_KEY",
     "GENERATED_TOKEN_POLICY",
     "GENERATED_TOKEN_SIDECAR_DEFAULTS",
+    "INDEX_INTEGRITY_VERSION",
     "INDEX_SCHEMA",
+    "INDEX_PAYLOAD_HASH_KEY",
     "LEGACY_INDEX_SCHEMA",
     "PAIR_ROUTE_KEYS",
     "PAIR_ROUTE_EDGE_KINDS",
@@ -3136,9 +3200,12 @@ __all__ = [
     "PromptGraphSegment",
     "PromptGraphSymbol",
     "PromptProjectIndex",
+    "PRODUCTION_INDEX_PRODUCER",
+    "PRODUCTION_INDEX_VERSION",
     "TOKEN_SIDECAR_DEFAULTS",
     "TOKEN_SIDECAR_NAMES",
     "TRIPLE_ROUTE_KEYS",
+    "TRUSTED_IDENTITY_ADAPTERS",
     "WINDOW_SCHEMA",
     "normalize_cpp_whitespace_with_offsets",
     "require_prompt_graph_project_id",

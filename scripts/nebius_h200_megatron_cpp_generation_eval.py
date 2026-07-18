@@ -182,6 +182,12 @@ def _prepare_eval_graph_cases(
             index_path = built.path
             index_receipt = dict(built.receipt)
 
+        project_index.validate_production_repository_index(
+            expected_project_id=project_id,
+            repository_root=repo_path,
+            expected_indexer_root=indexer_root,
+        )
+
         raw_source_path = row.get("prompt_source_path")
         if not isinstance(raw_source_path, str) or not raw_source_path:
             raise ValueError(
@@ -627,7 +633,17 @@ def build_prompt_rows(
                     f"case={expected_project_id!r} "
                     f"index={project_index.project_id!r}"
                 )
-            project_index.verify_repository(repo_path)
+            project_index.validate_production_repository_index(
+                expected_project_id=expected_project_id,
+                repository_root=repo_path,
+            )
+            declared_receipt = case.get("prompt_graph_index_receipt")
+            if not isinstance(declared_receipt, dict) or declared_receipt != dict(
+                project_index.provenance
+            ):
+                raise ValueError(
+                    f"{task_id}: prompt graph index receipt does not match payload"
+                )
             source_path = case.get("prompt_source_path")
             if not isinstance(source_path, str) or not source_path:
                 raise ValueError(
@@ -646,6 +662,7 @@ def build_prompt_rows(
                 )
             row["prompt_graph_index_path"] = str(index_path)
             row["prompt_graph_repository_path"] = str(repo_path)
+            row["prompt_graph_project_id"] = expected_project_id
             row["prompt_document_id"] = source_document.id
             row["prompt_source_path"] = source_document.source_path
             row["prompt_source_start"] = source_start
@@ -1128,6 +1145,10 @@ def main() -> int:
                     raise RuntimeError("repository prompt graph builder was not initialized")
                 project_index = PromptProjectIndex.from_json_path(
                     str(row["prompt_graph_index_path"])
+                )
+                project_index.validate_production_repository_index(
+                    expected_project_id=str(row["prompt_graph_project_id"]),
+                    repository_root=str(row["prompt_graph_repository_path"]),
                 )
                 graph_artifact = graph_builder.build(
                     project_index,

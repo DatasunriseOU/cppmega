@@ -22,6 +22,7 @@ from types import ModuleType
 from typing import Any
 
 from .prompt_graph import (
+    INDEX_INTEGRITY_VERSION,
     INDEX_SCHEMA,
     PromptProjectIndex,
     repository_snapshot,
@@ -449,7 +450,7 @@ class ClangPromptProjectIndexProducer:
         cache_dir: str | Path,
         indexer_root: str | Path | None = None,
         libclang_path: str | Path | None = None,
-        strict_diagnostics: bool = False,
+        strict_diagnostics: bool = True,
     ) -> None:
         self.cache_dir = Path(cache_dir)
         if indexer_root is None:
@@ -518,6 +519,7 @@ class ClangPromptProjectIndexProducer:
                 "schema": INDEX_SCHEMA,
                 "producer": "ClangPromptProjectIndexProducer",
                 "producer_version": PRODUCER_VERSION,
+                "index_integrity_version": INDEX_INTEGRITY_VERSION,
                 "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
                 "project_id": project_id,
                 "strict_diagnostics": self.strict_diagnostics,
@@ -533,6 +535,8 @@ class ClangPromptProjectIndexProducer:
                 root=root,
                 cache_key=cache_key,
                 expected_hashes=fingerprint_hashes,
+                project_id=project_id,
+                expected_indexer_root=self.indexer_root,
                 libclang_version=libclang_version,
                 resolved_libclang=resolved_libclang,
             )
@@ -551,6 +555,12 @@ class ClangPromptProjectIndexProducer:
             indexer_path=indexer_path,
             libclang_version=libclang_version,
             resolved_libclang=resolved_libclang,
+        )
+        index = index.with_integrity()
+        index.validate_production_repository_index(
+            expected_project_id=project_id,
+            repository_root=root,
+            expected_indexer_root=self.indexer_root,
         )
         self._write_cached(path, index)
         return PromptProjectIndexBuildResult(
@@ -899,6 +909,7 @@ class ClangPromptProjectIndexProducer:
         provenance = {
             "producer": "ClangPromptProjectIndexProducer",
             "producer_version": PRODUCER_VERSION,
+            "index_integrity_version": INDEX_INTEGRITY_VERSION,
             "schema": INDEX_SCHEMA,
             "project_id": project_id,
             "cache_key": cache_key,
@@ -918,6 +929,7 @@ class ClangPromptProjectIndexProducer:
             "dependency_closure_policy": "all_indexed_repository_sources_v1",
             "dependency_manifest": dict(sorted(dependency_manifest.items())),
             "indexer_path": str(indexer_path),
+            "indexer_checkout_root": str(self.indexer_root),
             "document_count": len(documents),
             "symbol_count": len(symbols),
             "chunk_count": len(chunks),
@@ -966,16 +978,25 @@ class ClangPromptProjectIndexProducer:
         root: Path,
         cache_key: str,
         expected_hashes: Mapping[str, str],
+        project_id: str,
+        expected_indexer_root: Path,
         libclang_version: str,
         resolved_libclang: str | None,
     ) -> PromptProjectIndexBuildResult:
         try:
             index = PromptProjectIndex.from_json_path(path)
+            index.validate_production_repository_index(
+                expected_project_id=project_id,
+                repository_root=root,
+                expected_indexer_root=expected_indexer_root,
+            )
             receipt = index.provenance
             if receipt.get("producer") != "ClangPromptProjectIndexProducer":
                 raise ValueError("producer mismatch")
             if receipt.get("cache_key") != cache_key:
                 raise ValueError("cache key mismatch")
+            if receipt.get("index_integrity_version") != INDEX_INTEGRITY_VERSION:
+                raise ValueError("index integrity version mismatch")
             if (
                 int(receipt.get("symbol_identity_schema_version") or 0)
                 != SYMBOL_IDENTITY_SCHEMA_VERSION

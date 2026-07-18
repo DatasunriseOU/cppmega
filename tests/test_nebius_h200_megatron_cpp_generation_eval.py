@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import json
 import os
 import shutil
@@ -12,6 +13,10 @@ import pytest
 from cppmega.symbol_identity import (
     SYMBOL_IDENTITY_SCHEMA_VERSION,
     compute_symbol_id,
+)
+from cppmega.prompt_graph import (
+    INDEX_PAYLOAD_HASH_KEY,
+    PromptProjectIndex,
 )
 from scripts.nebius_h200_megatron_cpp_generation_eval import (
     DEFAULT_CASES,
@@ -68,6 +73,21 @@ def _v3_eval_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     prompts = tmp_path / "prompts.jsonl"
     shutil.copyfile(CASE3_FIXTURE / "prompts.jsonl", prompts)
     return cases, prompts, repo
+
+
+def _reseal_index_payload(payload: dict[str, object]) -> dict[str, object]:
+    provenance = dict(payload.get("provenance") or {})
+    provenance.pop(INDEX_PAYLOAD_HASH_KEY, None)
+    payload["provenance"] = provenance
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    provenance[INDEX_PAYLOAD_HASH_KEY] = hashlib.sha256(encoded).hexdigest()
+    payload["provenance"] = provenance
+    return payload
 
 
 def test_actual_parser_defaults_require_stable_project_identity(tmp_path):
@@ -204,6 +224,7 @@ def test_generation_worker_builds_model_loads_checkpoint_and_threads_sidecars():
     assert "CppPromptTokenizerAdapter" in worker
     assert "PromptProjectIndex.from_json_path" in worker
     assert "PromptGraphContext.from_repository_prompt" in worker
+    assert "validate_production_repository_index" in worker
     assert "_set_current_structure_batch(structure_inputs)" in worker
     assert "_set_current_structure_batch(None)" in worker
     assert "finally:" in worker
@@ -348,6 +369,13 @@ def test_prompt_graph_builder_serializes_h200_structure_inputs(tmp_path):
     assert artifact.edge_counts["type"] > 0
     assert artifact.edge_counts["def_use"] > 0
     assert project_index.project_id == PROMPT_GRAPH_PROJECT_ID
+    assert project_index.provenance["strict_diagnostics"] is True
+    assert project_index.provenance[INDEX_PAYLOAD_HASH_KEY]
+    project_index.validate_production_repository_index(
+        expected_project_id=PROMPT_GRAPH_PROJECT_ID,
+        repository_root=CASE3_FIXTURE,
+        expected_indexer_root=V3_INDEXER_ROOT,
+    )
     assert (
         project_index.provenance["symbol_identity_schema_version"]
         == SYMBOL_IDENTITY_SCHEMA_VERSION
@@ -396,6 +424,136 @@ def test_prompt_graph_builder_serializes_h200_structure_inputs(tmp_path):
     assert model_inputs.graph_routes["graph_generated_query_edge_counts"] == [2 * model_inputs.receipt["repository_summary_token_count"]]
     assert all(value > 0 for value in model_inputs.side_channels["structure_ids"][-2:])
     assert model_inputs.side_channels["confidence_ids"][-2:] == [1, 1]
+
+
+def test_real_producer_preserves_overloads_and_caller_target_identity(tmp_path):
+    from cppmega.prompt_graph_index import ClangPromptProjectIndexProducer
+
+    index = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=V3_INDEXER_ROOT,
+    ).build(CASE3_FIXTURE, project_id=PROMPT_GRAPH_PROJECT_ID).index
+    overloads = [
+        symbol
+        for symbol in index.symbols
+        if symbol.kind == "function"
+        and symbol.qname == "case3_repo::repository_helper"
+    ]
+    assert len(overloads) == 2
+    assert {symbol.canonical_signature for symbol in overloads} == {
+        "display=repository_helper(int)|type=int (int)|result=int|args=(int)|exception=NONE",
+        "display=repository_helper(double)|type=double (double)|result=double|args=(double)|exception=NONE",
+    }
+    assert len({symbol.usr for symbol in overloads}) == 2
+    assert all(
+        symbol.symbol_id == compute_symbol_id(symbol.symbol_key)
+        for symbol in overloads
+    )
+
+    caller = index.document_for_path("src/repo_caller.cpp")
+    call_edges = [
+        edge
+        for edge in index.edges
+        if edge.relation == "call"
+        and index.symbol_for_identity(edge.source).document_id == caller.id
+    ]
+    assert len(call_edges) == 1
+    target = index.symbol_for_identity(call_edges[0].target)
+    assert target.kind == "function"
+    assert target.canonical_signature.startswith("display=repository_helper(int)")
+
+
+def test_production_validator_rejects_resealed_semantic_edge_tamper(tmp_path):
+    from cppmega.prompt_graph_index import ClangPromptProjectIndexProducer
+
+    index = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=V3_INDEXER_ROOT,
+    ).build(CASE3_FIXTURE, project_id=PROMPT_GRAPH_PROJECT_ID).index
+    payload = index.to_dict()
+    double_definition = next(
+        symbol
+        for symbol in index.symbols
+        if symbol.kind == "function"
+        and symbol.qname == "case3_repo::repository_helper"
+        and "double" in symbol.canonical_signature
+    )
+    caller = index.document_for_path("src/repo_caller.cpp")
+    edge = next(
+        edge
+        for edge in payload["edges"]
+        if edge["relation"] == "call"
+        and index.symbol_for_identity(edge["source"]).document_id == caller.id
+    )
+    edge["target"] = double_definition.identity
+    tampered = PromptProjectIndex.from_dict(_reseal_index_payload(payload))
+
+    with pytest.raises(ValueError, match="edge changes semantic identity"):
+        tampered.validate_production_repository_index(
+            expected_project_id=PROMPT_GRAPH_PROJECT_ID,
+            repository_root=CASE3_FIXTURE,
+            expected_indexer_root=V3_INDEXER_ROOT,
+        )
+
+
+def test_production_validator_rejects_resealed_non_definition_edge_target(tmp_path):
+    from cppmega.prompt_graph_index import ClangPromptProjectIndexProducer
+
+    index = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=V3_INDEXER_ROOT,
+    ).build(CASE3_FIXTURE, project_id=PROMPT_GRAPH_PROJECT_ID).index
+    payload = index.to_dict()
+    caller = index.document_for_path("src/repo_caller.cpp")
+    edge = next(
+        edge
+        for edge in payload["edges"]
+        if edge["relation"] == "call"
+        and index.symbol_for_identity(edge["source"]).document_id == caller.id
+    )
+    edge["target"] = edge["source"]
+    tampered = PromptProjectIndex.from_dict(_reseal_index_payload(payload))
+
+    with pytest.raises(ValueError, match="edge target is not a definition"):
+        tampered.validate_production_repository_index(
+            expected_project_id=PROMPT_GRAPH_PROJECT_ID,
+            repository_root=CASE3_FIXTURE,
+            expected_indexer_root=V3_INDEXER_ROOT,
+        )
+
+
+def test_eval_staging_rejects_resealed_synthetic_index_provenance(tmp_path):
+    from cppmega.prompt_graph_index import ClangPromptProjectIndexProducer
+
+    cases, prompts, repo = _v3_eval_fixture(tmp_path / "fixture")
+    index = ClangPromptProjectIndexProducer(
+        cache_dir=tmp_path / "index-cache",
+        indexer_root=V3_INDEXER_ROOT,
+    ).build(repo, project_id=PROMPT_GRAPH_PROJECT_ID).index
+    payload = index.to_dict()
+    payload["provenance"]["producer"] = "synthetic_fixture"
+    index_path = repo / "project_index.json"
+    index_path.write_text(
+        json.dumps(_reseal_index_payload(payload), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    rows = list(iter_jsonl(cases))
+    rows[0]["prompt_graph_index"] = f"{repo.name}/project_index.json"
+    cases.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError, match="production repository index requires producer"
+    ):
+        make_eval_tar(
+            cases,
+            prompts,
+            tmp_path / "eval.tgz",
+            prompt_graph_mode="repo",
+            indexer_root=V3_INDEXER_ROOT,
+        )
 
 
 def test_generation_worker_can_emit_tensorwise_fp8_args():
