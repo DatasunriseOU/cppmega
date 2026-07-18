@@ -212,6 +212,7 @@ def _write_objective_artifact(input_dir: Path) -> Path:
     shards = sorted(input_dir.glob("*.parquet"))
     artifact = {
         "schema": OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA,
+        "graph_recipe": stage1_graph_recipe_binding(),
         "documents": contract["totals"]["samples"],  # type: ignore[index]
         "objective_contract": {
             "path": contract_path.name,

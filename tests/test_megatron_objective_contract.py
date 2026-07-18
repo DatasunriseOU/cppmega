@@ -121,6 +121,7 @@ def _write_materialization_artifact(tmp_path: Path) -> Path:
     ).encode("ascii")
     artifact = {
         "schema": OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA,
+        "graph_recipe": stage1_graph_recipe_binding(),
         "documents": 6,
         "objective_contract": {
             "path": contract_path.name,
@@ -359,6 +360,38 @@ def test_contract_requires_the_bound_pre_topk_graph_selector_beta() -> None:
 
     with pytest.raises(ValueError, match="graph_auxiliary.bias_beta"):
         validate_objective_contract(contract)
+
+
+def test_objective_artifact_is_v2_and_binds_the_canonical_graph_recipe(
+    tmp_path: Path,
+) -> None:
+    artifact = json.loads(
+        _write_materialization_artifact(tmp_path).read_text(encoding="utf-8")
+    )
+
+    assert artifact["schema"] == "cppmega_objective_materialization_artifact_v2"
+    assert artifact["graph_recipe"] == stage1_graph_recipe_binding()
+
+
+def test_legacy_objective_artifact_requires_regeneration(tmp_path: Path) -> None:
+    artifact_path = _write_materialization_artifact(tmp_path)
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact["schema"] = "cppmega_objective_materialization_artifact_v1"
+    artifact.pop("graph_recipe")
+    artifact_payload = dict(artifact)
+    artifact_payload.pop("artifact_set_sha256")
+    artifact["artifact_set_sha256"] = hashlib.sha256(
+        json.dumps(
+            artifact_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+    ).hexdigest()
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="legacy.*migration required.*regenerate"):
+        load_objective_materialization_artifact(artifact_path)
 
 
 @pytest.mark.parametrize(

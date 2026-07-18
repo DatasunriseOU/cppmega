@@ -58,6 +58,7 @@ from cppmega.symbol_identity import (  # noqa: E402
 from cppmega.megatron.objective_contract import (  # noqa: E402
     LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
     OBJECTIVE_GRAPH_SIDECARS,
+    OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA,
     OBJECTIVE_TOKEN_SIDE_CHANNELS,
     ObjectiveMaterializationArtifact,
     ObjectiveMaterializationTracker,
@@ -3275,7 +3276,7 @@ def main() -> int:
         "--objective-artifact",
         default=None,
         help=(
-            "Path to cppmega_objective_materialization_artifact_v1. This is the "
+            f"Path to {OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA}. This is the "
             "canonical CASE1/CASE6/H200 handoff and binds the input directory, "
             "contract, shard hashes, sidecars, and graph semantics."
         ),

@@ -485,7 +485,8 @@ def _prefix_bundle(tmp_path):
     objective_source = provenance_dir / "objective_contract_seq1024.json"
     objective_source.write_text(json.dumps(objective_payload), encoding="utf-8")
     artifact_payload = {
-        "schema": "cppmega_objective_materialization_artifact_v1",
+        "schema": "cppmega_objective_materialization_artifact_v2",
+        "graph_recipe": stage1_graph_recipe_binding(),
         "documents": document_count,
         "objective_contract": {
             "path": objective_source.name,
@@ -633,7 +634,7 @@ def _prefix_bundle(tmp_path):
             "buckets": {
                 "1024": {
                     "artifact_path": "provenance/objective_artifact_seq1024.json",
-                    "artifact_schema": "cppmega_objective_materialization_artifact_v1",
+                    "artifact_schema": "cppmega_objective_materialization_artifact_v2",
                     "artifact_set_sha256": artifact_payload["artifact_set_sha256"],
                     "artifact_file_sha256": artifact_file_sha256,
                     "contract_path": "provenance/objective_contract_seq1024.json",

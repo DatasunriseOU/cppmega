@@ -398,7 +398,8 @@ def _write_test_bundle(root, prefix, tokenizer):
     objective_path.write_text(json.dumps(objective["payload"]), encoding="utf-8")
     objective_file_sha256 = hashlib.sha256(objective_path.read_bytes()).hexdigest()
     artifact_payload = {
-        "schema": "cppmega_objective_materialization_artifact_v1",
+        "schema": "cppmega_objective_materialization_artifact_v2",
+        "graph_recipe": stage1_graph_recipe_binding(),
         "documents": prefix_manifest["document_count"],
         "objective_contract": {
             "path": objective_path.name,
@@ -479,7 +480,7 @@ def _write_test_bundle(root, prefix, tokenizer):
             "buckets": {
                 "1024": {
                     "artifact_path": artifact_path.relative_to(root).as_posix(),
-                    "artifact_schema": "cppmega_objective_materialization_artifact_v1",
+                    "artifact_schema": "cppmega_objective_materialization_artifact_v2",
                     "artifact_set_sha256": objective_artifact_sha256,
                     "artifact_file_sha256": artifact_file_sha256,
                     "contract_path": objective_path.relative_to(root).as_posix(),

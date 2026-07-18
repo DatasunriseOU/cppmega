@@ -25,11 +25,15 @@ import numpy as np
 
 from cppmega.megatron.graph_recipe import (
     STAGE1_GRAPH_RELATIONS,
+    stage1_graph_recipe_binding,
     validate_stage1_graph_contract,
 )
 
 OBJECTIVE_CONTRACT_SCHEMA = "cppmega_pre_materialized_objectives_v1"
 OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA = (
+    "cppmega_objective_materialization_artifact_v2"
+)
+LEGACY_OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA = (
     "cppmega_objective_materialization_artifact_v1"
 )
 LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1 = (
@@ -503,8 +507,14 @@ def load_objective_materialization_artifact(
     with artifact_path.open(encoding="utf-8") as handle:
         raw = json.load(handle)
     artifact = dict(_mapping(raw, where="objective materialization artifact"))
+    if artifact.get("schema") == LEGACY_OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA:
+        raise ValueError(
+            "legacy objective materialization artifact schema detected; migration "
+            "required: regenerate the objective contract and artifact"
+        )
     expected_top = {
         "schema",
+        "graph_recipe",
         "documents",
         "objective_contract",
         "parquet_shards",
@@ -526,6 +536,11 @@ def load_objective_materialization_artifact(
     if artifact_set_sha256 != _canonical_sha256(artifact_set_payload):
         raise ValueError(
             "objective materialization artifact_set_sha256 does not match payload"
+        )
+    if artifact.get("graph_recipe") != stage1_graph_recipe_binding():
+        raise ValueError(
+            "objective materialization graph recipe binding is missing or stale; "
+            "regenerate the objective artifact"
         )
     root = artifact_path.parent.resolve()
 
@@ -849,8 +864,14 @@ def validate_materialized_objective_artifact(
     """Validate the artifact binding embedded by the canonical converter."""
 
     binding = _mapping(value, where="objective_materialization")
+    if binding.get("schema") == LEGACY_OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA:
+        raise ValueError(
+            "legacy objective materialization artifact schema detected; migration "
+            "required: regenerate the objective contract and artifact"
+        )
     expected_keys = {
         "schema",
+        "graph_recipe",
         "artifact_file_sha256",
         "documents",
         "objective_contract",
@@ -864,6 +885,11 @@ def validate_materialized_objective_artifact(
         )
     if binding.get("schema") != OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA:
         raise ValueError("objective_materialization schema is invalid")
+    if binding.get("graph_recipe") != stage1_graph_recipe_binding():
+        raise ValueError(
+            "objective_materialization graph recipe binding is missing or stale; "
+            "regenerate the objective artifact"
+        )
     for field in ("artifact_set_sha256", "artifact_file_sha256"):
         value = binding.get(field)
         if (
@@ -927,6 +953,7 @@ __all__ = [
     "OBJECTIVE_GRAPH_SIDECARS",
     "OBJECTIVE_IDS",
     "OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA",
+    "LEGACY_OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA",
     "OBJECTIVE_TOKEN_SIDE_CHANNELS",
     "ObjectiveMaterializationArtifact",
     "ObjectiveMaterializationTracker",

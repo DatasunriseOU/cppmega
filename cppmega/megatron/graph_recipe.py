@@ -9,6 +9,9 @@ from typing import Any, Mapping
 
 
 STAGE1_GRAPH_RECIPE_SCHEMA = "cppmega_stage1_graph_recipe_v1"
+STAGE1_GRAPH_LEGACY_RECIPE_SHA256 = (
+    "0cfbc70d139215546b59acbaf07ea91dea272edfc1148ba2cd54f86add737a33"
+)
 STAGE1_GRAPH_RELATIONS = (
     "call",
     "type",
@@ -92,7 +95,17 @@ def stage1_graph_config_kwargs() -> dict[str, Any]:
 
 
 def validate_stage1_graph_contract(graph: Mapping[str, object]) -> None:
-    if graph.get("recipe") != stage1_graph_recipe_binding():
+    binding = graph.get("recipe")
+    if (
+        isinstance(binding, Mapping)
+        and binding.get("schema") == STAGE1_GRAPH_RECIPE_SCHEMA
+        and binding.get("sha256") == STAGE1_GRAPH_LEGACY_RECIPE_SHA256
+    ):
+        raise ValueError(
+            "legacy Stage-1 graph recipe binding detected; migration required: "
+            "regenerate the objective contract and objective materialization artifact"
+        )
+    if binding != stage1_graph_recipe_binding():
         raise ValueError("graph_auxiliary.recipe binding is missing or stale")
     recipe = stage1_graph_recipe_payload()
     for field, expected in recipe.items():
@@ -110,6 +123,7 @@ __all__ = [
     "STAGE1_GRAPH_CHUNK_EDGE_EXPANSION",
     "STAGE1_GRAPH_BIAS_BETA",
     "STAGE1_GRAPH_EXACT_WEIGHTS",
+    "STAGE1_GRAPH_LEGACY_RECIPE_SHA256",
     "STAGE1_GRAPH_LAYER_REDUCTION",
     "STAGE1_GRAPH_PAIR_MASK",
     "STAGE1_GRAPH_RECIPE_SCHEMA",

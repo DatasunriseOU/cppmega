@@ -40,10 +40,15 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from cppmega.megatron.objective_contract import (  # noqa: E402
+    LEGACY_OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA,
     OBJECTIVE_GRAPH_SIDECARS,
+    OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA,
     OBJECTIVE_TOKEN_SIDE_CHANNELS,
     validate_materialized_objective_contract,
     validate_objective_contract,
+)
+from cppmega.megatron.graph_recipe import (  # noqa: E402
+    stage1_graph_recipe_binding,
 )
 from cppmega.megatron.domain_route_contract import (  # noqa: E402
     CASE5_RECEIPT_KEY,
@@ -2048,10 +2053,14 @@ def _validate_logical_manifest_contract(manifest: object) -> None:
             raise ValueError(
                 f"bundle objective materialization descriptor is invalid for {bucket}"
             )
-        if (
-            descriptor["artifact_schema"]
-            != "cppmega_objective_materialization_artifact_v1"
+        if descriptor["artifact_schema"] == (
+            LEGACY_OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA
         ):
+            raise ValueError(
+                f"legacy objective artifact schema for {bucket}; migration required: "
+                "regenerate the objective artifact and bundle"
+            )
+        if descriptor["artifact_schema"] != OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA:
             raise ValueError(f"unsupported objective artifact schema for {bucket}")
         if descriptor["contract_schema"] != "cppmega_pre_materialized_objectives_v1":
             raise ValueError(f"unsupported objective contract schema for {bucket}")
@@ -2292,12 +2301,39 @@ def _validate_bundle(bundle: Path, hash_jobs: int) -> tuple[dict, list[dict]]:
             ).encode("ascii")
         ).hexdigest()
         if (
+            raw_artifact.get("schema")
+            == LEGACY_OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA
+        ):
+            raise ValueError(
+                f"bucket {bucket} objective artifact is legacy; migration required: "
+                "regenerate the objective artifact and bundle"
+            )
+        expected_artifact_fields = {
+            "schema",
+            "graph_recipe",
+            "documents",
+            "objective_contract",
+            "parquet_shards",
+            "converter",
+            "artifact_set_sha256",
+        }
+        if set(raw_artifact) != expected_artifact_fields:
+            raise ValueError(
+                f"bucket {bucket} objective artifact fields drifted; "
+                "regenerate the objective artifact and bundle"
+            )
+        if (
             raw_artifact.get("schema") != descriptor["artifact_schema"]
             or artifact_digest != descriptor["artifact_set_sha256"]
             or artifact_digest != actual_artifact_digest
         ):
             raise ValueError(
                 f"bucket {bucket} objective artifact payload digest mismatch"
+            )
+        if raw_artifact.get("graph_recipe") != stage1_graph_recipe_binding():
+            raise ValueError(
+                f"bucket {bucket} objective artifact graph recipe mismatch; "
+                "regenerate the objective artifact and bundle"
             )
     bucket_results = manifest.get("bucket_results")
     if not isinstance(bucket_results, list) or not bucket_results:
