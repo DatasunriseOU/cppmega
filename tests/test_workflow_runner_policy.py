@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -23,6 +24,11 @@ NON_PR_ONLY_GUARD = (
 ACTION_USE = re.compile(
     r"uses:\s*['\"]?(?P<action>actions/[A-Za-z0-9_.-]+)"
     r"@(?P<ref>[^\s'\"#]+)"
+)
+DOMAIN_CONTRACT_TESTS = (
+    "tests/test_case5_ksh_domain_contract.py",
+    "tests/test_eval_domain_routed_codegen.py",
+    "tests/test_ksh_python_domain_parsers.py",
 )
 
 
@@ -81,3 +87,38 @@ def test_linux_portable_lane_uses_explicit_megatron_free_profile() -> None:
     assert workflow.count("unset PYTHONPATH PYTHONHOME VIRTUAL_ENV || true") == 2
     assert workflow.count("export PYTHONNOUSERSITE=1") == 2
     assert workflow.count("export PYTHONSAFEPATH=1") == 2
+
+
+def test_frozen_domain_eval_is_wired_into_repository_owned_ci() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci-self-hosted.yml").read_text(
+        encoding="utf-8"
+    )
+    for test_path in DOMAIN_CONTRACT_TESTS:
+        assert workflow.count(test_path) == 2
+    assert workflow.count("scripts/eval_domain_routed_codegen.py") == 2
+    assert workflow.count("evals/domain_routed_prompts.jsonl") == 2
+    assert workflow.count("evals/domain_routed_gold_completions.jsonl") == 2
+    assert workflow.count("${RUNNER_TEMP}/cppmega-domain-routed-codegen.json") == 2
+
+    payload = json.loads(
+        (REPO_ROOT / "configs" / "ci" / "lanes.json").read_text(encoding="utf-8")
+    )
+    lanes = {lane["id"]: lane for lane in payload["lanes"]}
+    for lane_id in ("macos-contracts", "linux-contracts"):
+        commands = {command["name"]: command for command in lanes[lane_id]["commands"]}
+        pytest_argv = next(
+            command["argv"]
+            for command in commands.values()
+            if command["argv"][:4] == ["{python}", "-m", "pytest", "-q"]
+        )
+        assert set(DOMAIN_CONTRACT_TESTS) <= set(pytest_argv)
+        assert commands["frozen-domain-eval"]["argv"] == [
+            "{python}",
+            "scripts/eval_domain_routed_codegen.py",
+            "--prompts",
+            "evals/domain_routed_prompts.jsonl",
+            "--completions",
+            "evals/domain_routed_gold_completions.jsonl",
+            "--out",
+            "/tmp/cppmega-domain-routed-codegen.json",
+        ]
