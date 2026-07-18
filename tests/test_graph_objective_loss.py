@@ -140,6 +140,48 @@ def test_graph_loss_sanitizes_non_finite_masked_scores_and_gradients() -> None:
     assert torch.count_nonzero(scores.grad).item() > 0
 
 
+def test_graph_loss_excludes_positive_targets_at_non_finite_scores() -> None:
+    scores = torch.tensor(
+        [[[0.0, float("inf"), -1.0], [0.0, 0.0, 0.0]]],
+        dtype=torch.float32,
+    )
+    targets = torch.tensor(
+        [[[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]],
+        dtype=torch.float32,
+    )
+    reference_targets = targets.clone()
+    reference_targets[0, 0, 1] = 0.0
+    pair_mask = torch.ones_like(scores, dtype=torch.bool)
+    config = GraphAuxiliaryLossConfig(
+        global_weight=1.0,
+        indexer_weight=1.0,
+        layer_weight=1.0,
+        bce_weight=1.0,
+        coverage_weight=1.0,
+        topk=1,
+        pos_weight=1.0,
+        margin=3.0,
+    )
+
+    loss, components = graph_auxiliary_loss(
+        scores,
+        targets,
+        pair_mask=pair_mask,
+        config=config,
+    )
+    reference_loss, reference_components = graph_auxiliary_loss(
+        scores,
+        reference_targets,
+        pair_mask=pair_mask,
+        config=config,
+    )
+
+    torch.testing.assert_close(
+        components["coverage"], reference_components["coverage"]
+    )
+    torch.testing.assert_close(loss, reference_loss)
+
+
 def test_graph_loss_empty_batch_returns_finite_connected_zero() -> None:
     scores = torch.tensor(
         [[[float("inf"), float("-inf")], [float("nan"), 0.0]]],

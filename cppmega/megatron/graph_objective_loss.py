@@ -342,7 +342,12 @@ def graph_auxiliary_loss(
         boundary = torch.topk(masked_scores, k=config.topk + 1, dim=-1).values[..., -1:]
         finite_boundary = torch.isfinite(boundary)
         deficits = torch.relu(boundary + config.margin - safe_scores)
-        penalties = deficits * targets * finite_boundary.to(scores.dtype)
+        penalties = (
+            deficits
+            * targets
+            * valid_pairs.to(scores.dtype)
+            * finite_boundary.to(scores.dtype)
+        )
         coverage = penalties.sum() / positive_edges.clamp_min(1.0)
 
     unscaled = config.global_weight * config.layer_weight * (

@@ -107,7 +107,8 @@ construction also requires a positive `dsa_indexer_loss_coeff` and
 `dsa_indexer_use_sparse_loss=False`; otherwise the graph objective cannot reach
 the autograd-carried DSA loss and construction fails. The weighted graph BCE
 and top-k coverage terms are added directly to Megatron's dense DSA indexer
-loss.
+loss. Pairs with non-finite indexer scores are excluded from BCE, positive-edge
+normalization, and coverage.
 
 Dataset ingress validates the embedded digest and requires the objective-ID
 sidecar byte count to equal the indexed document count. Legacy indexed prefixes
