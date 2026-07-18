@@ -149,6 +149,8 @@ def _remove_partial_tree(partial: Path) -> None:
 def _acquire_restore_lock(output_root: Path, *, bundle_id: str, run_id: str):
     run_id = _validate_run_id(run_id)
     lock_path = _contained_output_path(output_root, f".{bundle_id}.restore.lock")
+    if lock_path.is_symlink() or (lock_path.exists() and not lock_path.is_file()):
+        raise ValueError(f"restore lock path is not a regular file: {lock_path}")
     handle = lock_path.open("a+", encoding="utf-8")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -172,6 +174,9 @@ def _acquire_archive(
 ) -> dict[str, object]:
     download = archive.with_name(archive.name + ".download")
     receipt_path = _archive_receipt_path(archive)
+    for path in (archive, download, receipt_path):
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise ValueError(f"restore archive path is not a regular file: {path}")
     binding = {
         "schema": "cppmega_megatron_archive_download_receipt_v1",
         "uri": uri,
@@ -516,6 +521,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", args.bundle_id
     ):
         raise ValueError(f"unsafe requested bundle ID: {args.bundle_id!r}")
+    if args.hash_jobs <= 0 or args.free_space_headroom_gb < 0:
+        raise ValueError(
+            "hash jobs must be positive and free-space headroom nonnegative"
+        )
     _load_env_file(args.env_file)
     env = _s3_env()
     prefix = args.prefix.strip("/")
@@ -595,6 +604,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     destination = _contained_output_path(output_root, bundle_id)
     if destination.exists():
+        if destination.is_symlink() or not destination.is_dir():
+            raise ValueError(
+                "existing restore destination is not a regular directory: "
+                f"{destination}"
+            )
         manifest, _artifacts = _validate_bundle(destination, args.hash_jobs)
         if manifest["bundle_id"] != bundle_id:
             raise ValueError("existing destination contains a different bundle")
@@ -667,6 +681,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         _remove_partial_tree(partial)
         raise
 
+    if destination.exists():
+        raise RuntimeError(f"restore destination appeared during extraction: {destination}")
     os.replace(partial, destination)
     if not args.keep_archive:
         archive.unlink()

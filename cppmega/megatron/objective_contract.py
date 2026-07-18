@@ -23,7 +23,10 @@ from typing import Any
 
 import numpy as np
 
-from cppmega.megatron.graph_recipe import validate_stage1_graph_contract
+from cppmega.megatron.graph_recipe import (
+    STAGE1_GRAPH_RELATIONS,
+    validate_stage1_graph_contract,
+)
 
 OBJECTIVE_CONTRACT_SCHEMA = "cppmega_pre_materialized_objectives_v1"
 OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA = (
@@ -81,6 +84,7 @@ OBJECTIVE_IDS: dict[str, int] = {
 REQUIRED_PRODUCTION_OBJECTIVES = frozenset(
     {"causal_lm", "fim", "ast_fim", "ifim", "commit_diff", "pre_to_post"}
 )
+GRAPH_RELATIONS = frozenset(STAGE1_GRAPH_RELATIONS)
 
 _EXPECTED_TYPED_SOURCES = {
     "ifim_instruction": "ifim_instruction_token_ids",
@@ -343,7 +347,6 @@ def validate_objective_contract(
             )
 
     graph = _mapping(contract.get("graph_auxiliary"), where="graph_auxiliary")
-    validate_stage1_graph_contract(graph)
     relations = graph.get("relations")
     if (
         not isinstance(relations, list)
@@ -351,9 +354,22 @@ def validate_objective_contract(
         or any(not isinstance(item, str) or not item for item in relations)
     ):
         raise ValueError("graph_auxiliary.relations must be a non-empty string list")
-    _positive_int(
+    if len(set(relations)) != len(relations):
+        raise ValueError("graph_auxiliary.relations contains duplicates")
+    unknown_relations = sorted(set(relations) - GRAPH_RELATIONS)
+    if unknown_relations:
+        raise ValueError(
+            "graph_auxiliary.relations contains unknown relations: "
+            f"{unknown_relations}"
+        )
+    validate_stage1_graph_contract(graph)
+    eligible_samples = _positive_int(
         graph.get("eligible_samples"), where="graph_auxiliary.eligible_samples"
     )
+    if eligible_samples > total_samples:
+        raise ValueError(
+            "graph_auxiliary.eligible_samples cannot exceed totals.samples"
+        )
     _positive_int(graph.get("positive_edges"), where="graph_auxiliary.positive_edges")
     for field in (
         "global_weight",

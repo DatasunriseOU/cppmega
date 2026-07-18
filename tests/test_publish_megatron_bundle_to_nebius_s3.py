@@ -1505,6 +1505,25 @@ def test_validate_bundle_rejects_embedded_prefix_manifest_drift(tmp_path):
         _validate_bundle(tmp_path, hash_jobs=1)
 
 
+def test_logical_manifest_preflight_rejects_nested_graph_contract_before_archive(
+    tmp_path,
+):
+    _prefix_bundle(tmp_path)
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    manifest["bucket_results"][0]["manifest"]["graph_sidecar_schema"] = (
+        "stale_graph_schema"
+    )
+
+    with pytest.raises(ValueError, match="graph_sidecar_schema"):
+        publisher._validate_logical_manifest_contract(manifest)
+
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    objective = manifest["bucket_results"][0]["manifest"]["objective_contract"]
+    objective["payload"]["graph_auxiliary"]["relations"] = ["unknown"]
+    with pytest.raises(ValueError, match="unknown relations"):
+        publisher._validate_logical_manifest_contract(manifest)
+
+
 def test_validate_bundle_rejects_wrong_prefix_graph_schema(tmp_path):
     prefix = _prefix_bundle(tmp_path)
     manifest_path = prefix.with_suffix(".json")
@@ -1606,6 +1625,7 @@ def test_head_contract_requires_size_metadata_and_exact_server_sha256():
             "ContentLength": 8,
             "Metadata": {"sha256": digest},
             "ChecksumSHA256": expected_checksum,
+            "ChecksumType": "FULL_OBJECT",
         },
         size=8,
         sha256=digest,
@@ -1649,6 +1669,7 @@ def test_head_contract_accepts_nebius_metadata_key_casing():
             "ChecksumSHA256": base64.b64encode(bytes.fromhex(digest)).decode(
                 "ascii"
             ),
+            "ChecksumType": "FULL_OBJECT",
         },
         size=8,
         sha256=digest,
@@ -1822,6 +1843,7 @@ def test_small_upload_is_checksum_bound_and_create_only(tmp_path, monkeypatch):
                 "ContentLength": artifact.stat().st_size,
                 "Metadata": {"sha256": digest},
                 "ChecksumSHA256": expected_checksum,
+                "ChecksumType": "FULL_OBJECT",
                 "ETag": '"etag"',
             },
         ]
@@ -2203,6 +2225,7 @@ def test_latest_pointer_update_uses_remote_etag_compare_and_swap(tmp_path, monke
                 "ContentLength": artifact.stat().st_size,
                 "Metadata": {"sha256": digest},
                 "ChecksumSHA256": expected_checksum,
+                "ChecksumType": "FULL_OBJECT",
                 "ETag": '"new-etag"',
             },
         ]

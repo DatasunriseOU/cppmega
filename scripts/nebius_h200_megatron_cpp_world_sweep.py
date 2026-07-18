@@ -65,6 +65,7 @@ OVERLAY_PATHS = (
     "data/tokenizer_v2/tokenizer_contract_v1.json",
 )
 _IMMUTABLE_IMAGE_RE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
+_NEBIUS_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,255}$")
 
 
 def validate_docker_image_digest(image: str) -> str:
@@ -74,6 +75,12 @@ def validate_docker_image_digest(image: str) -> str:
             "(registry/repository@sha256:<64 lowercase hex chars>); mutable tags are rejected"
         )
     return image
+
+
+def validate_nebius_resource_id(value: str, *, name: str) -> str:
+    if not _NEBIUS_ID_RE.fullmatch(value):
+        raise ValueError(f"{name} must be a nonempty Nebius resource identifier")
+    return value
 
 
 def default_ssh_key() -> Path:
@@ -1137,9 +1144,23 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     parser.add_argument("--keep-instance", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--plan-script",
+        type=Path,
+        help="With --dry-run, write the exact remote leader script to this path.",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     validate_docker_image_digest(args.docker_image)
+    for name, value in (
+        ("--parent-id", args.parent_id),
+        ("--subnet-id", args.subnet_id),
+        ("--security-group-id", args.security_group_id),
+        ("--image-id", args.image_id),
+    ):
+        validate_nebius_resource_id(value, name=name)
+    if args.plan_script is not None and not args.dry_run:
+        raise ValueError("--plan-script requires --dry-run")
     if args.train_iters <= 0 or args.hash_jobs <= 0:
         raise ValueError("train iters and hash jobs must be positive")
     batches = parse_batches(args.batch_sizes)
@@ -1199,29 +1220,42 @@ def main(argv: Iterable[str] | None = None) -> int:
     ssh_pubkey = pubkey_path.read_text().strip()
 
     if args.dry_run:
+        script = remote_run_script(
+            batches,
+            args.train_iters,
+            args.docker_image,
+            seq_data_prefixes=remote_prefixes,
+            fp8_recipe=args.fp8_recipe,
+            disable_nvrtc=effective_disable_nvrtc,
+            enable_dsa_patch=args.enable_dsa_patch,
+            save_checkpoint=args.save_checkpoint,
+            save_interval=args.save_interval,
+            save_model_only=not args.save_full_state,
+            load_checkpoint_remote=load_checkpoint_remote,
+            load_model_only=not args.load_full_state,
+            tokenizer_model=f"/data/cppmega_bundle/{tokenizer_relative}",
+            run_id=args.instance_name,
+        )
+        if args.plan_script is not None:
+            plan_script = args.plan_script.resolve()
+            if plan_script.exists() or plan_script.is_symlink():
+                raise RuntimeError(f"refusing stale H200 plan script: {plan_script}")
+            plan_script.parent.mkdir(parents=True, exist_ok=True)
+            temporary = plan_script.with_name(f".{plan_script.name}.tmp-{os.getpid()}")
+            temporary.write_text(script, encoding="utf-8")
+            temporary.chmod(0o700)
+            os.replace(temporary, plan_script)
+            print(f"plan_script={plan_script}")
         print(f"parent_id={args.parent_id}")
+        print(f"subnet_id={args.subnet_id}")
+        print(f"security_group_id={args.security_group_id}")
+        print(f"image_id={args.image_id}")
+        print(f"docker_image={args.docker_image}")
         print(f"sidecar_prefixes={seq_prefixes}")
         print(f"bundle_root={bundle_root}")
         print(f"tokenizer_dir={bundle_tokenizer}")
         print(f"batches={batches}")
-        print(
-            remote_run_script(
-                batches,
-                args.train_iters,
-                args.docker_image,
-                seq_data_prefixes=remote_prefixes,
-                fp8_recipe=args.fp8_recipe,
-                disable_nvrtc=effective_disable_nvrtc,
-                enable_dsa_patch=args.enable_dsa_patch,
-                save_checkpoint=args.save_checkpoint,
-                save_interval=args.save_interval,
-                save_model_only=not args.save_full_state,
-                load_checkpoint_remote=load_checkpoint_remote,
-                load_model_only=not args.load_full_state,
-                tokenizer_model=f"/data/cppmega_bundle/{tokenizer_relative}",
-                run_id=args.instance_name,
-            )[:4000]
-        )
+        print(script)
         return 0
 
     instance_id: str | None = None

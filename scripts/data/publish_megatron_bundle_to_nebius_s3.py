@@ -16,6 +16,7 @@ import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+from collections.abc import Mapping
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -291,7 +292,13 @@ def _load_env_file(path: Path) -> None:
 
 
 def _s3_env() -> dict[str, str]:
-    env = os.environ.copy()
+    return _resolve_s3_env(os.environ)
+
+
+def _resolve_s3_env(source: Mapping[str, str]) -> dict[str, str]:
+    """Resolve one complete credential family without mixing providers."""
+
+    env = dict(source)
     nebius_access_name = "NEBIUS_S3_ACCESS_KEY_ID"
     nebius_secret_name = "NEBIUS_S3_SECRET_ACCESS_KEY"
     if nebius_access_name in env or nebius_secret_name in env:
@@ -315,7 +322,9 @@ def _s3_env() -> dict[str, str]:
     return env
 
 
-def _safe_artifact_path(bundle: Path, relative: str) -> Path:
+def _validate_artifact_relative_path(relative: object) -> str:
+    if not isinstance(relative, str):
+        raise ValueError("bundle artifact path must be a string")
     posix = PurePosixPath(relative)
     if (
         not relative
@@ -325,6 +334,12 @@ def _safe_artifact_path(bundle: Path, relative: str) -> Path:
         or posix.as_posix() != relative
     ):
         raise ValueError(f"unsafe artifact path in bundle manifest: {relative!r}")
+    return relative
+
+
+def _safe_artifact_path(bundle: Path, relative: str) -> Path:
+    _validate_artifact_relative_path(relative)
+    posix = PurePosixPath(relative)
     path = (bundle / Path(*posix.parts)).resolve()
     root = bundle.resolve()
     if path != root and root not in path.parents:
@@ -1823,14 +1838,186 @@ def _validate_objective_source_summary(summary: object, *, bucket: int) -> None:
     )
 
 
-def _validate_logical_manifest_contract(manifest: dict) -> None:
+def _validate_embedded_prefix_manifest_contract(
+    prefix_manifest: object,
+    *,
+    prefix_name: str,
+    objective_descriptor: dict[str, object],
+    artifact_by_path: dict[str, dict],
+) -> None:
+    if not isinstance(prefix_manifest, dict):
+        raise ValueError(f"embedded prefix manifest {prefix_name} must be an object")
+    if prefix_manifest.get("tokenizer_contract") != EXPECTED_PREFIX_TOKENIZER_CONTRACT:
+        raise ValueError(
+            f"embedded prefix manifest {prefix_name}: tokenizer contract is invalid"
+        )
+    if int(prefix_manifest.get("vocab_size", -1)) != EXPECTED_VOCAB_SIZE:
+        raise ValueError(
+            f"embedded prefix manifest {prefix_name}: vocab_size is invalid"
+        )
+    document_count = int(prefix_manifest.get("document_count", -1))
+    token_count = int(prefix_manifest.get("token_count", -1))
+    if document_count <= 0 or token_count <= 0:
+        raise ValueError(
+            f"embedded prefix manifest {prefix_name}: token/document counts must be positive"
+        )
+
+    side_channels = prefix_manifest.get("side_channel_paths")
+    if not isinstance(side_channels, dict):
+        raise ValueError(
+            f"embedded prefix manifest {prefix_name}: side_channel_paths must be an object"
+        )
+    missing_token = sorted(REQUIRED_TOKEN_SIDECARS - set(side_channels))
+    if missing_token:
+        raise ValueError(
+            f"embedded prefix manifest {prefix_name}: missing token sidecars {missing_token}"
+        )
+    for name in REQUIRED_TOKEN_SIDECARS:
+        spec = side_channels[name]
+        if not isinstance(spec, dict):
+            raise ValueError(
+                f"embedded prefix manifest {prefix_name}: token sidecar {name} is invalid"
+            )
+        _validate_artifact_relative_path(spec.get("path"))
+        if spec.get("dtype") != TOKEN_SIDECAR_DTYPES[name]:
+            raise ValueError(
+                f"embedded prefix manifest {prefix_name}: token sidecar {name} dtype is invalid"
+            )
+
+    if prefix_manifest.get("graph_sidecar_schema") != EXPECTED_GRAPH_SIDECAR_SCHEMA:
+        raise ValueError(
+            f"embedded prefix manifest {prefix_name}: graph_sidecar_schema is invalid"
+        )
+    graph_paths = prefix_manifest.get("graph_sidecar_paths")
+    if not isinstance(graph_paths, dict):
+        raise ValueError(
+            f"embedded prefix manifest {prefix_name}: graph_sidecar_paths must be an object"
+        )
+    missing_graph = sorted(REQUIRED_GRAPH_SIDECARS - set(graph_paths))
+    if missing_graph:
+        raise ValueError(
+            f"embedded prefix manifest {prefix_name}: missing graph sidecars {missing_graph}"
+        )
+    chunk_counts: set[int] = set()
+    for name, (expected_kind, expected_dtype, expected_shape) in GRAPH_SIDECAR_SPECS.items():
+        spec = graph_paths[name]
+        if not isinstance(spec, dict):
+            raise ValueError(
+                f"embedded prefix manifest {prefix_name}: graph sidecar {name} is invalid"
+            )
+        if (
+            spec.get("kind") != expected_kind
+            or spec.get("dtype") != expected_dtype
+            or spec.get("offset_dtype") != "int64"
+            or spec.get("shape_tail") != expected_shape
+            or spec.get("coordinate_space") != GRAPH_ROUTE_COORDINATE_SPACES[name]
+        ):
+            raise ValueError(
+                f"embedded prefix manifest {prefix_name}: graph sidecar {name} shape contract is invalid"
+            )
+        item_count = spec.get("item_count")
+        if not isinstance(item_count, int) or isinstance(item_count, bool) or item_count < 0:
+            raise ValueError(
+                f"embedded prefix manifest {prefix_name}: graph sidecar {name} item_count is invalid"
+            )
+        if name in NONZERO_GRAPH_SIDECARS and item_count == 0:
+            raise ValueError(
+                f"embedded prefix manifest {prefix_name}: graph sidecar {name} must be nonzero"
+            )
+        if name.startswith("token_chunk_"):
+            chunk_counts.add(item_count)
+        _validate_artifact_relative_path(spec.get("offsets_path"))
+        _validate_artifact_relative_path(spec.get("data_path"))
+    if len(chunk_counts) != 1:
+        raise ValueError(
+            f"embedded prefix manifest {prefix_name}: graph chunk counts disagree"
+        )
+
+    source_platform = prefix_manifest.get("source_platform_sidecar")
+    if (
+        not isinstance(source_platform, dict)
+        or source_platform.get("schema") != "cppmega_source_platform_v1"
+        or int(source_platform.get("source_document_count", -1)) <= 0
+        or int(source_platform.get("platform_id_count", -1)) <= 0
+    ):
+        raise ValueError(
+            f"embedded prefix manifest {prefix_name}: source platform contract is invalid"
+        )
+    for field in (
+        "sequence_doc_offsets_path",
+        "doc_platform_offsets_path",
+        "platform_ids_path",
+    ):
+        _validate_artifact_relative_path(source_platform.get(field))
+
+    objective = prefix_manifest.get("objective_contract")
+    validated_objective = validate_materialized_objective_contract(objective)
+    if int(validated_objective.payload["totals"]["samples"]) != document_count:
+        raise ValueError(
+            f"embedded prefix manifest {prefix_name}: objective samples do not match document_count"
+        )
+    if objective.get("sha256") != objective_descriptor["contract_sha256"]:
+        raise ValueError(
+            f"embedded prefix manifest {prefix_name}: objective contract is not bundle-bound"
+        )
+    objective_sidecar = objective["objective_id_sidecar"]
+    _validate_artifact_relative_path(objective_sidecar["path"])
+
+    artifact_path = objective_descriptor["artifact_path"]
+    artifact_record = artifact_by_path.get(str(artifact_path))
+    if artifact_record is None or artifact_record.get("sha256") != objective_descriptor[
+        "artifact_file_sha256"
+    ]:
+        raise ValueError(
+            f"embedded prefix manifest {prefix_name}: objective artifact is not artifact-bound"
+        )
+
+
+def _validate_logical_manifest_contract(manifest: object) -> None:
     """Reject unsupported bundle contracts without touching artifact payloads."""
 
+    if not isinstance(manifest, dict):
+        raise ValueError("bundle logical manifest must be an object")
     if manifest.get("schema") != "cppmega_megatron_bundle_v1":
         raise ValueError(f"unsupported bundle schema: {manifest.get('schema')!r}")
     _require_manifest_tokenizer_contract(manifest)
     if manifest.get("training_contract") != "objective_materialized":
         raise ValueError("bundle training_contract must be 'objective_materialized'")
+    raw_artifacts = manifest.get("artifacts")
+    if not isinstance(raw_artifacts, list) or not raw_artifacts:
+        raise ValueError("bundle logical manifest artifacts must be a non-empty list")
+    artifact_by_path: dict[str, dict] = {}
+    for record in raw_artifacts:
+        if not isinstance(record, dict):
+            raise ValueError("bundle logical manifest artifact records must be objects")
+        relative = _validate_artifact_relative_path(record.get("path"))
+        if relative == "manifest.json":
+            raise ValueError("bundle artifacts must not include manifest.json")
+        if relative in artifact_by_path:
+            raise ValueError(f"duplicate artifact path: {relative}")
+        size = record.get("size")
+        digest = record.get("sha256")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise ValueError(f"artifact {relative} has invalid size")
+        if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+            raise ValueError(f"artifact {relative} is missing a valid sha256")
+        artifact_by_path[relative] = record
+    if len(raw_artifacts) != int(manifest.get("artifact_count", -1)):
+        raise ValueError("bundle artifact_count does not match artifact list")
+    if sum(int(record["size"]) for record in raw_artifacts) != int(
+        manifest.get("artifact_bytes", -1)
+    ):
+        raise ValueError("bundle artifact_bytes does not match artifact list")
+    artifact_set_sha256 = _artifact_set_sha256(raw_artifacts)
+    if manifest.get("artifact_set_sha256") != artifact_set_sha256:
+        raise ValueError("bundle artifact_set_sha256 does not match artifact list")
+    bundle_id = manifest.get("bundle_id")
+    if (
+        not isinstance(bundle_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", bundle_id)
+        or not bundle_id.endswith(artifact_set_sha256[:16])
+    ):
+        raise ValueError("bundle_id is not safely bound to artifact_set_sha256")
     objective_materialization = manifest.get("objective_materialization")
     if (
         not isinstance(objective_materialization, dict)
@@ -1868,6 +2055,8 @@ def _validate_logical_manifest_contract(manifest: dict) -> None:
             raise ValueError(f"unsupported objective artifact schema for {bucket}")
         if descriptor["contract_schema"] != "cppmega_pre_materialized_objectives_v1":
             raise ValueError(f"unsupported objective contract schema for {bucket}")
+        artifact_path = _validate_artifact_relative_path(descriptor["artifact_path"])
+        contract_path = _validate_artifact_relative_path(descriptor["contract_path"])
         for field in (
             "artifact_set_sha256",
             "artifact_file_sha256",
@@ -1878,8 +2067,110 @@ def _validate_logical_manifest_contract(manifest: dict) -> None:
                 raise ValueError(
                     f"objective materialization {bucket}.{field} is invalid"
                 )
+        if artifact_by_path.get(artifact_path, {}).get("sha256") != descriptor[
+            "artifact_file_sha256"
+        ]:
+            raise ValueError(
+                f"objective materialization {bucket} artifact is not artifact-bound"
+            )
+        if artifact_by_path.get(contract_path, {}).get("sha256") != descriptor[
+            "contract_file_sha256"
+        ]:
+            raise ValueError(
+                f"objective materialization {bucket} contract is not artifact-bound"
+            )
         _validate_objective_source_summary(
             descriptor["source_snapshot"], bucket=int(bucket)
+        )
+
+    tokenizer = manifest.get("tokenizer")
+    if (
+        not isinstance(tokenizer, dict)
+        or tokenizer.get("contract") != EXPECTED_BUNDLE_TOKENIZER_CONTRACT
+        or int(tokenizer.get("vocab_size", -1)) != EXPECTED_VOCAB_SIZE
+        or not isinstance(tokenizer.get("files"), list)
+        or not tokenizer["files"]
+    ):
+        raise ValueError("bundle tokenizer descriptor is missing")
+    tokenizer_path = _validate_artifact_relative_path(tokenizer.get("path"))
+    tokenizer_records: list[dict[str, object]] = []
+    for record in tokenizer["files"]:
+        if not isinstance(record, dict):
+            raise ValueError("bundle tokenizer descriptor file must be an object")
+        relative = _validate_artifact_relative_path(record.get("path"))
+        if relative != tokenizer_path and not relative.startswith(tokenizer_path + "/"):
+            raise ValueError("bundle tokenizer descriptor file escapes tokenizer path")
+        size = record.get("size")
+        digest = record.get("sha256")
+        if (
+            not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or not isinstance(digest, str)
+            or not SHA256_RE.fullmatch(digest)
+        ):
+            raise ValueError("bundle tokenizer descriptor file identity is invalid")
+        canonical_record = {"path": relative, "size": size, "sha256": digest}
+        if artifact_by_path.get(relative) != canonical_record:
+            raise ValueError(
+                f"bundle tokenizer descriptor is not artifact-bound: {relative}"
+            )
+        tokenizer_records.append(canonical_record)
+    if tokenizer.get("artifact_set_sha256") != _artifact_set_sha256(tokenizer_records):
+        raise ValueError("bundle tokenizer artifact_set_sha256 is invalid")
+
+    data_contracts = manifest.get("data_contracts")
+    if not isinstance(data_contracts, dict) or not data_contracts:
+        raise ValueError("bundle data_contracts descriptor is missing")
+    for name, descriptor in data_contracts.items():
+        if not isinstance(name, str) or not isinstance(descriptor, dict):
+            raise ValueError("bundle data contract descriptors must be objects")
+        relative = _validate_artifact_relative_path(descriptor.get("path"))
+        size = descriptor.get("size")
+        digest = descriptor.get("sha256")
+        canonical_record = {"path": relative, "size": size, "sha256": digest}
+        if (
+            not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or not isinstance(digest, str)
+            or not SHA256_RE.fullmatch(digest)
+            or artifact_by_path.get(relative) != canonical_record
+        ):
+            raise ValueError(f"bundle data contract {name} is not artifact-bound")
+
+    buckets = manifest.get("buckets")
+    if (
+        not isinstance(buckets, list)
+        or not buckets
+        or any(not isinstance(bucket, int) or isinstance(bucket, bool) for bucket in buckets)
+        or len(buckets) != len(set(buckets))
+    ):
+        raise ValueError("bundle buckets must be a non-empty unique integer list")
+    bucket_results = manifest.get("bucket_results")
+    if not isinstance(bucket_results, list) or not bucket_results:
+        raise ValueError("bundle bucket_results must be a non-empty list")
+    result_buckets: list[int] = []
+    for result in bucket_results:
+        if not isinstance(result, dict):
+            raise ValueError("bundle bucket_results entries must be objects")
+        bucket = result.get("bucket")
+        if not isinstance(bucket, int) or isinstance(bucket, bool):
+            raise ValueError("bundle bucket result has invalid bucket")
+        result_buckets.append(bucket)
+        prefix_name = _validate_artifact_relative_path(result.get("prefix"))
+        descriptor = objective_materialization["buckets"].get(str(bucket))
+        if not isinstance(descriptor, dict):
+            raise ValueError(f"bundle bucket result has no objective descriptor for {bucket}")
+        _validate_embedded_prefix_manifest_contract(
+            result.get("manifest"),
+            prefix_name=prefix_name,
+            objective_descriptor=descriptor,
+            artifact_by_path=artifact_by_path,
+        )
+    if result_buckets != buckets:
+        raise ValueError(
+            f"bundle bucket_results do not match buckets: {result_buckets} != {buckets}"
         )
 
 
@@ -2202,10 +2493,20 @@ def _head_matches(head: dict | None, *, size: int, sha256: str) -> bool:
     }
     if metadata.get("sha256") != sha256:
         return False
-    if head.get("ChecksumType") not in (None, "FULL_OBJECT"):
+    if head.get("ChecksumType") != "FULL_OBJECT":
         return False
     expected_checksum = base64.b64encode(bytes.fromhex(sha256)).decode("ascii")
     return head.get("ChecksumSHA256") == expected_checksum
+
+
+def _verified_head_receipt(head: dict, *, sha256: str) -> dict[str, object]:
+    return {
+        "checksum_algorithm": "SHA256",
+        "checksum_type": head["ChecksumType"],
+        "checksum_sha256": head["ChecksumSHA256"],
+        "metadata_sha256": sha256,
+        "etag": head.get("ETag"),
+    }
 
 
 def _multipart_layout(size: int) -> tuple[int, int]:
@@ -2873,11 +3174,13 @@ def _upload_file(
             allow_overwrite=allow_overwrite,
         )
     if _head_matches(head, size=size, sha256=sha256):
+        assert head is not None
         return {
             "key": key,
             "size": size,
             "sha256": sha256,
             "status": "already_verified",
+            "verification": _verified_head_receipt(head, sha256=sha256),
         }
     if head is not None and not allow_overwrite:
         remote_metadata = {
@@ -2936,7 +3239,14 @@ def _upload_file(
     head = _head(endpoint=endpoint, bucket=bucket, key=key, env=env)
     if not _head_matches(head, size=size, sha256=sha256):
         raise RuntimeError(f"remote verification failed for s3://{bucket}/{key}")
-    return {"key": key, "size": size, "sha256": sha256, "status": "uploaded_verified"}
+    assert head is not None
+    return {
+        "key": key,
+        "size": size,
+        "sha256": sha256,
+        "status": "uploaded_verified",
+        "verification": _verified_head_receipt(head, sha256=sha256),
+    }
 
 
 def _publish_json(

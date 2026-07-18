@@ -42,6 +42,24 @@ def _env_flag(name: str) -> bool:
     raise ValueError(f"{name} has invalid boolean value {raw!r}")
 
 
+def _graph_capacity(name: str) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        raise RuntimeError(
+            f"[cppmega-patch] {name} is required when graph routes are enabled; "
+            "derive it from the bound CSR sidecars"
+        )
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"[cppmega-patch] {name} must be an integer, got {raw!r}"
+        ) from exc
+    if value <= 0:
+        raise RuntimeError(f"[cppmega-patch] {name} must be positive, got {value}")
+    return value
+
+
 def _set_current_structure_batch(batch: Dict[str, torch.Tensor] | None) -> None:
     _local_storage.current_structure_batch = batch
 
@@ -1355,8 +1373,8 @@ try:
             for col in _TOKEN_BATCH_COLS:
                 sample[col] = _padded_token_sidecar_tensor(sample["tokens"], col=col)
             if os.environ.get("CPPMEGA_GRAPH_ROUTES_ENABLED", "0") == "1":
-                max_edges = int(os.environ.get("CPPMEGA_GRAPH_MAX_EDGES", "256"))
-                max_chunks = int(os.environ.get("CPPMEGA_GRAPH_MAX_CHUNKS", "256"))
+                max_edges = _graph_capacity("CPPMEGA_GRAPH_MAX_EDGES")
+                max_chunks = _graph_capacity("CPPMEGA_GRAPH_MAX_CHUNKS")
                 graph = _build_graph_route_tensors(
                     {
                         "token_call_edges": {
@@ -1505,8 +1523,8 @@ try:
                 raise RuntimeError(
                     "[cppmega-patch] no graph sidecars loaded while CPPMEGA_GRAPH_ROUTES_ENABLED=1"
                 )
-            max_edges = int(os.environ.get("CPPMEGA_GRAPH_MAX_EDGES", "256"))
-            max_chunks = int(os.environ.get("CPPMEGA_GRAPH_MAX_CHUNKS", "256"))
+            max_edges = _graph_capacity("CPPMEGA_GRAPH_MAX_EDGES")
+            max_chunks = _graph_capacity("CPPMEGA_GRAPH_MAX_CHUNKS")
             spans = _get_sample_token_spans(self, idx)
             graph = _build_graph_route_tensors(
                 graph_sidecars,

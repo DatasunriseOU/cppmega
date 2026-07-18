@@ -34,6 +34,7 @@ from scripts.nebius_h200_megatron_cpp_world_sweep import (
     make_multi_sidecar_tar,
     remote_run_script,
     validate_docker_image_digest,
+    validate_nebius_resource_id,
 )
 from scripts.h200_megatron_preflight import (
     derive_graph_capacity_receipt,
@@ -728,6 +729,16 @@ def test_docker_image_must_be_an_immutable_digest():
         )
 
 
+def test_nebius_resource_ids_are_strictly_bound():
+    assert validate_nebius_resource_id(
+        "computeimage-e00hbfk8kmf3w3prch", name="--image-id"
+    ) == "computeimage-e00hbfk8kmf3w3prch"
+    with pytest.raises(ValueError, match="resource identifier"):
+        validate_nebius_resource_id("../escape", name="--image-id")
+    with pytest.raises(ValueError, match="resource identifier"):
+        validate_nebius_resource_id("ab", name="--image-id")
+
+
 def test_remote_script_enables_graph_routes_and_uses_selected_data_prefix():
     script = remote_run_script(
         [256],
@@ -989,9 +1000,12 @@ def test_fp8_tensorwise_dry_run_disables_nvrtc_by_default(tmp_path, capsys):
     _write_test_bundle(bundle_root, prefix, tokenizer)
     pubkey = tmp_path / "id_ed25519.pub"
     pubkey.write_text("ssh-ed25519 TESTKEY codex\n")
+    plan_script = tmp_path / "leader-plan.sh"
     rc = main(
         [
             "--dry-run",
+            "--plan-script",
+            str(plan_script),
             "--bundle-root",
             str(bundle_root),
             "--sidecar-prefix",
@@ -1009,6 +1023,10 @@ def test_fp8_tensorwise_dry_run_disables_nvrtc_by_default(tmp_path, capsys):
 
     assert rc == 0
     assert 'export NVTE_DISABLE_NVRTC="1"' in capsys.readouterr().out
+    assert plan_script.stat().st_mode & 0o777 == 0o700
+    plan = plan_script.read_text(encoding="utf-8")
+    assert plan.startswith("#!/usr/bin/env bash\n")
+    assert f"sudo docker pull {DEFAULT_DOCKER_IMAGE}" in plan
 
 
 def test_fp8_tensorwise_can_keep_nvrtc_enabled_for_perf_probe(tmp_path, capsys):

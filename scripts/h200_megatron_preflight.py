@@ -28,6 +28,7 @@ from cppmega.recipes.run_profiles import (  # noqa: E402
     profile_shell_assignments,
 )
 from scripts.data.publish_megatron_bundle_to_nebius_s3 import (  # noqa: E402
+    _safe_prefix_file,
     _sha256,
     _validate_bundle,
     _validate_prefix_manifest_contract,
@@ -51,6 +52,23 @@ _GRAPH_CHUNK_SIDECARS = (
     "token_chunk_dep_levels",
 )
 _GRAPH_EDGE_KINDS = frozenset({"edge_pairs", "edge_triples"})
+STACK_LOCK_PATH = ROOT / "STACK.lock"
+STACK_REQUIRED_IMPORTS = (
+    "transformer_engine",
+    "transformer_engine.pytorch",
+    "flash_attn",
+    "flash_attn_3",
+    "flash_attn.cute",
+    "mamba_ssm",
+    "causal_conv1d",
+    "fast_hadamard_transform",
+    "tilelang",
+    "qoptim_cuda",
+    "cutlass",
+    "quack",
+    "megatron.core",
+    "cppmega",
+)
 
 
 def _write_json_atomic(path: Path, payload: object) -> None:
@@ -71,6 +89,8 @@ def _csr_offsets_receipt(
 ) -> tuple[dict[str, object], array]:
     if offset_dtype != "int64":
         raise RuntimeError(f"graph CSR offsets must be int64: {path}")
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"graph CSR offset path must be a regular file: {path}")
     expected_entries = document_count + 1
     expected_bytes = expected_entries * 8
     if path.stat().st_size != expected_bytes:
@@ -108,16 +128,16 @@ def _csr_offsets_receipt(
     )
 
 
-def derive_graph_capacity_receipt(
+def _derive_graph_capacity_from_manifest(
     data_prefix: Path,
     *,
+    manifest: dict,
     sequence_length: int,
 ) -> dict[str, object]:
-    """Derive exact graph tensor capacities from a manifest-bound CSR prefix."""
+    """Derive exact graph tensor capacities from manifest-bound CSR offsets."""
     if sequence_length <= 0:
         raise ValueError("sequence_length must be positive")
     data_prefix = data_prefix.resolve()
-    manifest, _referenced = _validate_prefix_manifest_contract(data_prefix)
     document_count = int(manifest.get("document_count", 0))
     if document_count <= 0:
         raise RuntimeError("graph capacity derivation requires document_count > 0")
@@ -146,7 +166,7 @@ def derive_graph_capacity_receipt(
         item_count = int(raw_entry.get("item_count", -1))
         if item_count < 0:
             raise RuntimeError(f"graph sidecar lacks nonnegative item_count: {name}")
-        offsets_path = data_prefix.parent / offsets_name
+        offsets_path = _safe_prefix_file(data_prefix.parent, offsets_name)
         receipt, offsets = _csr_offsets_receipt(
             offsets_path,
             document_count=document_count,
@@ -188,6 +208,21 @@ def derive_graph_capacity_receipt(
         "derivation": "max_per_fixed_capacity_document_from_csr_offsets_v1",
         "sidecars": sidecar_receipts,
     }
+
+
+def derive_graph_capacity_receipt(
+    data_prefix: Path,
+    *,
+    sequence_length: int,
+) -> dict[str, object]:
+    """Derive exact graph tensor capacities from a manifest-bound CSR prefix."""
+    data_prefix = data_prefix.resolve()
+    manifest, _referenced = _validate_prefix_manifest_contract(data_prefix)
+    return _derive_graph_capacity_from_manifest(
+        data_prefix,
+        manifest=manifest,
+        sequence_length=sequence_length,
+    )
 
 
 def write_graph_capacity_receipt(
@@ -272,10 +307,16 @@ def _profile_environment(
     sequence_length: int,
     micro_batch_size: int,
     fp8_recipe: str,
-    graph_max_edges: int,
-    graph_max_chunks: int,
-    enable_dsa_patch: bool,
+    graph_max_edges: int | None = None,
+    graph_max_chunks: int | None = None,
+    enable_dsa_patch: bool = True,
 ) -> dict[str, str]:
+    if graph_max_edges is None or graph_max_chunks is None:
+        raise ValueError(
+            "H200 preflight requires graph capacities derived from CSR offsets"
+        )
+    if graph_max_edges <= 0 or graph_max_chunks <= 0:
+        raise ValueError("derived graph capacities must be positive")
     profile = get_run_profile("h200_cpp_world_mini")
     profile.training.seq_length = sequence_length
     profile.training.micro_batch_size = micro_batch_size
@@ -609,6 +650,85 @@ def _dsa_graph_gradient_evidence(
     }
 
 
+def _load_stack_lock(path: Path = STACK_LOCK_PATH) -> dict[str, object]:
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"STACK.lock must be a regular file: {path}")
+    try:
+        import yaml
+    except ImportError as error:
+        raise RuntimeError(
+            "H200 preflight requires PyYAML to parse the authoritative STACK.lock"
+        ) from error
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("STACK.lock must decode to an object")
+    return payload
+
+
+def validate_stack_compatibility(
+    stack_lock: dict[str, object],
+    *,
+    python_version: tuple[int, int],
+    torch_version: object,
+    cuda_runtime: object,
+    transformer_engine_version: object,
+    imported_modules: Iterable[str],
+) -> dict[str, object]:
+    base = stack_lock.get("base")
+    wheels = stack_lock.get("wheels")
+    if not isinstance(base, dict) or not isinstance(wheels, dict):
+        raise RuntimeError("STACK.lock lacks base/wheels contracts")
+    te = wheels.get("transformer_engine")
+    if not isinstance(te, dict):
+        raise RuntimeError("STACK.lock lacks transformer_engine contract")
+
+    expected_python = str(base.get("python", ""))
+    actual_python = f"{python_version[0]}.{python_version[1]}"
+    if actual_python != expected_python:
+        raise RuntimeError(
+            f"Python version mismatch: runtime={actual_python} STACK.lock={expected_python}"
+        )
+    expected_torch = str(base.get("torch", ""))
+    if str(torch_version) != expected_torch:
+        raise RuntimeError(
+            f"torch version mismatch: runtime={torch_version!r} "
+            f"STACK.lock={expected_torch!r}"
+        )
+    cuda_image = str(base.get("cuda_image", ""))
+    match = re.search(r"cuda:(\d+\.\d+)", cuda_image)
+    if match is None:
+        raise RuntimeError("STACK.lock base.cuda_image does not encode a CUDA version")
+    expected_cuda = match.group(1)
+    if str(cuda_runtime) != expected_cuda:
+        raise RuntimeError(
+            f"CUDA runtime mismatch: torch={cuda_runtime!r} "
+            f"STACK.lock={expected_cuda!r}"
+        )
+    expected_te = str(te.get("version", ""))
+    actual_te = str(transformer_engine_version)
+    if not (
+        actual_te == expected_te
+        or actual_te.startswith(expected_te + ".")
+        or actual_te.startswith(expected_te + "+")
+    ):
+        raise RuntimeError(
+            "Transformer Engine version mismatch: "
+            f"runtime={actual_te!r} STACK.lock={expected_te!r}"
+        )
+    imported = set(imported_modules)
+    missing = sorted(set(STACK_REQUIRED_IMPORTS) - imported)
+    if missing:
+        raise RuntimeError(f"required H200 extension imports are missing: {missing}")
+    return {
+        "status": "verified",
+        "python": expected_python,
+        "torch": expected_torch,
+        "cuda_runtime": expected_cuda,
+        "transformer_engine": expected_te,
+        "required_imports": sorted(STACK_REQUIRED_IMPORTS),
+    }
+
+
 def _stack_report(environment: dict[str, str]) -> dict[str, object]:
     import torch
 
@@ -621,14 +741,7 @@ def _stack_report(environment: dict[str, str]) -> dict[str, object]:
             f"capability={torch.cuda.get_device_capability(0)!r}"
         )
     modules = {}
-    base_modules = (
-        "torch",
-        "transformer_engine",
-        "transformer_engine.pytorch",
-        "flash_attn",
-        "megatron.core",
-        "cppmega",
-    )
+    base_modules = ("torch", *STACK_REQUIRED_IMPORTS)
     backend_claims = _claimed_backend_modules(environment)
     for name in (*base_modules, *backend_claims):
         module = importlib.import_module(name)
@@ -636,6 +749,15 @@ def _stack_report(environment: dict[str, str]) -> dict[str, object]:
             "file": getattr(module, "__file__", None),
             "version": getattr(module, "__version__", None),
         }
+    stack_lock = _load_stack_lock()
+    compatibility = validate_stack_compatibility(
+        stack_lock,
+        python_version=(sys.version_info.major, sys.version_info.minor),
+        torch_version=torch.__version__,
+        cuda_runtime=torch.version.cuda,
+        transformer_engine_version=modules["transformer_engine"]["version"],
+        imported_modules=modules,
+    )
     nvidia_smi = subprocess.run(
         [
             "nvidia-smi",
@@ -658,6 +780,11 @@ def _stack_report(environment: dict[str, str]) -> dict[str, object]:
         },
         "nvidia_smi": nvidia_smi,
         "backend_claims": list(backend_claims),
+        "stack_lock": {
+            "path": str(STACK_LOCK_PATH),
+            "sha256": _sha256(STACK_LOCK_PATH),
+            "compatibility": compatibility,
+        },
     }
 
 
@@ -1133,6 +1260,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Iterable[str] | None = None) -> int:
     raw_argv = list(argv) if argv is not None else list(sys.argv[1:])
     args = build_arg_parser().parse_args(raw_argv)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", args.run_id):
+        raise ValueError("H200 preflight run_id is not a safe identifier")
     if args.sequence_length <= 0 or args.micro_batch_size <= 0 or args.hash_jobs <= 0:
         raise ValueError("sequence length, micro batch size, and hash jobs must be positive")
 
