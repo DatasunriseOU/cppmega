@@ -629,6 +629,13 @@ def test_failed_results_or_checkpoint_scp_preserves_instance(
         str(pubkey),
         "--ssh-key",
         str(tmp_path / "id_ed25519"),
+        "--ssh-host-key",
+        (
+            "ssh-ed25519 "
+            "AAAAC3NzaC1lZDI1NTE5AAAAIJRwravCVfVsFZfdgfvC/OlW0K7vrJ7pBjl5p86YKSSs"
+        ),
+        "--ssh-host-key-fingerprint",
+        "SHA256:xGOQHYDUpAKZPiHLlYNYp01FiayrndE1tGC9wBoA+xw",
         "--instance-name",
         "retrieval-gate-test",
         "--no-ghcr-auth",

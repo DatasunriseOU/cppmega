@@ -4,6 +4,7 @@ import base64
 import hashlib
 from pathlib import Path
 import struct
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,6 +29,13 @@ from scripts.data.restore_megatron_bundle_from_nebius_s3 import (
     _remove_partial_tree,
     _validate_run_id,
 )
+from scripts.nebius_h200_megatron_cpp_world_sweep import (
+    _host_key_fingerprint,
+    _ssh_host_key_failure,
+    scp_base,
+    ssh_base,
+    validate_ssh_host_key_contract,
+)
 from scripts.h200_megatron_preflight import (
     STACK_REQUIRED_IMPORTS,
     _derive_graph_capacity_from_manifest,
@@ -45,6 +53,34 @@ TASKS = (
     "commit_diff",
     "pre_to_post",
 )
+
+
+PINNED_NEBIUS_HOST_KEY = (
+    "ssh-ed25519 "
+    "AAAAC3NzaC1lZDI1NTE5AAAAIJRwravCVfVsFZfdgfvC/OlW0K7vrJ7pBjl5p86YKSSs"
+)
+PINNED_NEBIUS_HOST_KEY_FINGERPRINT = (
+    "SHA256:xGOQHYDUpAKZPiHLlYNYp01FiayrndE1tGC9wBoA+xw"
+)
+OTHER_NEBIUS_HOST_KEY = (
+    "ssh-ed25519 "
+    "AAAAC3NzaC1lZDI1NTE5AAAAIASmjUl/IUCFfvXkXpCWWGJJ04Tx5FWEevIdFRYJCBic"
+)
+
+
+def _ssh_contract_args(
+    *,
+    host_key: str | None = PINNED_NEBIUS_HOST_KEY,
+    host_key_file: Path | None = None,
+    fingerprint: str | None = PINNED_NEBIUS_HOST_KEY_FINGERPRINT,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        ssh_key=Path("/tmp/cppmega-test-ssh-key"),
+        ssh_user="dave",
+        ssh_host_key=host_key,
+        ssh_host_key_file=host_key_file,
+        ssh_host_key_fingerprint=fingerprint,
+    )
 
 
 def _valid_objective_contract() -> dict[str, object]:
@@ -110,6 +146,78 @@ def _valid_objective_contract() -> dict[str, object]:
             "source_document_id_column": "token_source_doc_ids",
         },
     }
+
+
+def test_nebius_ssh_contract_has_no_unpinned_default() -> None:
+    args = _ssh_contract_args(host_key=None, fingerprint=None)
+
+    with pytest.raises(RuntimeError, match="host-key pin is required"):
+        validate_ssh_host_key_contract(args)
+
+
+def test_nebius_ssh_contract_rejects_missing_host_key_file(tmp_path: Path) -> None:
+    args = _ssh_contract_args(
+        host_key=None,
+        host_key_file=tmp_path / "missing-host-key.pub",
+    )
+
+    with pytest.raises(FileNotFoundError, match="host public-key file not found"):
+        validate_ssh_host_key_contract(args)
+
+
+def test_nebius_ssh_contract_rejects_mismatched_key_fingerprint() -> None:
+    args = _ssh_contract_args(host_key=OTHER_NEBIUS_HOST_KEY)
+
+    with pytest.raises(ValueError, match="fingerprint does not match"):
+        validate_ssh_host_key_contract(args)
+
+
+def test_nebius_ssh_contract_treats_presented_key_mismatch_as_fatal() -> None:
+    assert _ssh_host_key_failure(
+        "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\n"
+        "Host key verification failed."
+    )
+
+
+def test_nebius_ssh_contract_accepts_pinned_key_for_ssh_and_scp(
+    tmp_path: Path,
+) -> None:
+    host_key_file = tmp_path / "nebius-host-ed25519.pub"
+    host_key_file.write_text(PINNED_NEBIUS_HOST_KEY + "\n", encoding="ascii")
+    args = _ssh_contract_args(host_key=None, host_key_file=host_key_file)
+    args._nebius_ssh_known_hosts_dir = tmp_path
+
+    contract = validate_ssh_host_key_contract(args)
+    ssh_command = ssh_base(args, "203.0.113.10")
+    scp_command = scp_base(args, "203.0.113.10")
+
+    assert contract == (
+        "ssh-ed25519",
+        PINNED_NEBIUS_HOST_KEY.split()[1],
+        PINNED_NEBIUS_HOST_KEY_FINGERPRINT,
+    )
+    assert _host_key_fingerprint(contract[1]) == PINNED_NEBIUS_HOST_KEY_FINGERPRINT
+    known_hosts = Path(args._nebius_ssh_known_hosts_path)
+    assert known_hosts.read_text(encoding="ascii") == (
+        f"203.0.113.10 {PINNED_NEBIUS_HOST_KEY}\n"
+    )
+    assert known_hosts.stat().st_mode & 0o777 == 0o600
+
+    for command in (ssh_command, scp_command):
+        rendered = " ".join(command)
+        assert "BatchMode=yes" in rendered
+        assert "PasswordAuthentication=no" in rendered
+        assert "KbdInteractiveAuthentication=no" in rendered
+        assert "PreferredAuthentications=publickey" in rendered
+        assert "StrictHostKeyChecking=yes" in rendered
+        assert f"UserKnownHostsFile={known_hosts}" in rendered
+        assert "GlobalKnownHostsFile=/dev/null" in rendered
+        assert "HostKeyAlgorithms=ssh-ed25519" in rendered
+        assert "IdentitiesOnly=yes" in rendered
+        assert "ForwardAgent=no" in rendered
+        assert "StrictHostKeyChecking=no" not in rendered
+        assert "UserKnownHostsFile=/dev/null" not in rendered
+    assert ssh_command[-1] == "dave@203.0.113.10"
 
 
 def test_remote_logical_manifest_rejects_legacy_training_before_archive() -> None:

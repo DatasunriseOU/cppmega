@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
+import hashlib
 import ipaddress
 import json
 import os
@@ -66,6 +68,10 @@ OVERLAY_PATHS = (
 )
 _IMMUTABLE_IMAGE_RE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
 _NEBIUS_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,255}$")
+SSH_HOST_KEY_ENV = "NEBIUS_SSH_HOST_KEY"
+SSH_HOST_KEY_FILE_ENV = "NEBIUS_SSH_HOST_KEY_FILE"
+SSH_HOST_KEY_FINGERPRINT_ENV = "NEBIUS_SSH_HOST_KEY_FINGERPRINT"
+SSH_HOST_KEY_ALGORITHM = "ssh-ed25519"
 
 
 def validate_docker_image_digest(image: str) -> str:
@@ -89,6 +95,118 @@ def default_ssh_key() -> Path:
         if path.exists() and Path(str(path) + ".pub").exists():
             return path
     return Path.home() / ".ssh" / "id_ed25519"
+
+
+def _host_key_fingerprint(public_key: str) -> str:
+    try:
+        decoded = base64.b64decode(public_key, validate=True)
+    except (binascii.Error, ValueError, TypeError) as exc:
+        raise ValueError("SSH host public key is not valid base64") from exc
+    digest = base64.b64encode(hashlib.sha256(decoded).digest()).decode("ascii")
+    return f"SHA256:{digest.rstrip('=')}"
+
+
+def _parse_host_public_key(raw: str, *, source: str) -> tuple[str, str]:
+    lines = [
+        line.strip()
+        for line in raw.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if len(lines) != 1:
+        raise ValueError(
+            f"{source} must contain exactly one OpenSSH host public-key line"
+        )
+    parts = lines[0].split()
+    if len(parts) < 2:
+        raise ValueError(f"{source} must contain an algorithm and public key")
+    algorithm, public_key = parts[:2]
+    if algorithm != SSH_HOST_KEY_ALGORITHM:
+        raise ValueError(
+            f"{source} must pin {SSH_HOST_KEY_ALGORITHM}; got {algorithm!r}"
+        )
+    try:
+        decoded = base64.b64decode(public_key, validate=True)
+    except (binascii.Error, ValueError, TypeError) as exc:
+        raise ValueError(f"{source} contains an invalid base64 public key") from exc
+    algorithm_bytes = algorithm.encode("ascii")
+    if len(decoded) < 4 or decoded[:4] != len(algorithm_bytes).to_bytes(4, "big"):
+        raise ValueError(f"{source} does not contain a valid {algorithm} key blob")
+    if decoded[4 : 4 + len(algorithm_bytes)] != algorithm_bytes:
+        raise ValueError(f"{source} key blob algorithm does not match {algorithm}")
+    return algorithm, public_key
+
+
+def validate_ssh_host_key_contract(
+    args: argparse.Namespace,
+    *,
+    required: bool = True,
+) -> tuple[str, str, str] | None:
+    """Validate the out-of-band Nebius SSH host-key pin.
+
+    The pin is intentionally independent of the instance's user-authentication
+    key.  A public key may be supplied inline or through a public-key file, but
+    callers must also provide its SHA-256 fingerprint so an accidental or stale
+    key file cannot silently become the transport identity.
+    """
+
+    missing = object()
+    host_key = getattr(args, "ssh_host_key", missing)
+    if host_key is missing:
+        host_key = os.environ.get(SSH_HOST_KEY_ENV)
+    host_key_file = getattr(args, "ssh_host_key_file", missing)
+    if host_key_file is missing:
+        host_key_file = os.environ.get(SSH_HOST_KEY_FILE_ENV)
+    fingerprint = getattr(args, "ssh_host_key_fingerprint", missing)
+    if fingerprint is missing:
+        fingerprint = os.environ.get(SSH_HOST_KEY_FINGERPRINT_ENV)
+
+    if not host_key and not host_key_file and not fingerprint:
+        if required:
+            raise RuntimeError(
+                "Nebius SSH host-key pin is required: provide --ssh-host-key "
+                "or --ssh-host-key-file together with --ssh-host-key-fingerprint, "
+                f"or set {SSH_HOST_KEY_ENV}/{SSH_HOST_KEY_FILE_ENV} and "
+                f"{SSH_HOST_KEY_FINGERPRINT_ENV}"
+            )
+        return None
+    if bool(host_key) == bool(host_key_file):
+        raise RuntimeError(
+            "provide exactly one of --ssh-host-key or --ssh-host-key-file for the "
+            "Nebius SSH host-key pin"
+        )
+    if not fingerprint:
+        raise RuntimeError(
+            "--ssh-host-key-fingerprint is required with the Nebius SSH host-key pin"
+        )
+
+    if host_key_file:
+        path = Path(host_key_file).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"SSH host public-key file not found: {path}")
+        try:
+            host_key = path.read_text(encoding="ascii")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"SSH host public-key file is not ASCII: {path}") from exc
+        source = str(path)
+    else:
+        source = "--ssh-host-key"
+
+    algorithm, public_key = _parse_host_public_key(str(host_key), source=source)
+    actual_fingerprint = _host_key_fingerprint(public_key)
+    expected_fingerprint = str(fingerprint).strip()
+    if not re.fullmatch(r"SHA256:[A-Za-z0-9+/]+={0,2}", expected_fingerprint):
+        raise ValueError(
+            "--ssh-host-key-fingerprint must use OpenSSH SHA256:<base64> format"
+        )
+    if expected_fingerprint.rstrip("=") != actual_fingerprint:
+        raise ValueError(
+            "Nebius SSH host-key fingerprint does not match the pinned public key: "
+            f"expected {expected_fingerprint}, calculated {actual_fingerprint}"
+        )
+
+    contract = (algorithm, public_key, actual_fingerprint)
+    setattr(args, "_nebius_ssh_host_key_contract", contract)
+    return contract
 
 
 def run(
@@ -513,19 +631,127 @@ def wait_for_ip(instance_id: str, timeout_s: int = 900) -> str:
     raise TimeoutError(f"timed out waiting for public IP for {instance_id}")
 
 
+def _normalize_ssh_ip(ip: str) -> str:
+    try:
+        return str(ipaddress.ip_address(ip))
+    except ValueError as exc:
+        raise ValueError(f"Nebius SSH target must be an IP address, got {ip!r}") from exc
+
+
+def _ssh_known_hosts_path(args: argparse.Namespace, ip: str) -> Path:
+    normalized_ip = _normalize_ssh_ip(ip)
+    cached_ip = getattr(args, "_nebius_ssh_known_hosts_ip", None)
+    cached_path = getattr(args, "_nebius_ssh_known_hosts_path", None)
+    if cached_path is not None:
+        if cached_ip != normalized_ip:
+            raise RuntimeError(
+                "one SSH argument namespace cannot be reused for multiple Nebius IPs"
+            )
+        return Path(cached_path)
+
+    contract = getattr(args, "_nebius_ssh_host_key_contract", None)
+    if contract is None:
+        contract = validate_ssh_host_key_contract(args)
+    algorithm, public_key, _fingerprint = contract
+
+    known_hosts_dir = getattr(args, "_nebius_ssh_known_hosts_dir", None)
+    if known_hosts_dir is None:
+        temporary = tempfile.TemporaryDirectory(prefix="cppmega-nebius-ssh-")
+        setattr(args, "_nebius_ssh_known_hosts_tmpdir", temporary)
+        known_hosts_dir = temporary.name
+    directory = Path(known_hosts_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "known_hosts"
+    host_pattern = (
+        normalized_ip
+        if ":" not in normalized_ip
+        else f"[{normalized_ip}]:22"
+    )
+    path.write_text(f"{host_pattern} {algorithm} {public_key}\n", encoding="ascii")
+    path.chmod(0o600)
+    setattr(args, "_nebius_ssh_known_hosts_ip", normalized_ip)
+    setattr(args, "_nebius_ssh_known_hosts_path", path)
+    return path
+
+
+def _ssh_transport_options(args: argparse.Namespace, ip: str) -> list[str]:
+    known_hosts = _ssh_known_hosts_path(args, ip)
+    contract = getattr(args, "_nebius_ssh_host_key_contract", None)
+    if contract is None:
+        contract = validate_ssh_host_key_contract(args)
+    algorithm = contract[0]
+    return [
+        "-F",
+        "/dev/null",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "PasswordAuthentication=no",
+        "-o",
+        "KbdInteractiveAuthentication=no",
+        "-o",
+        "PreferredAuthentications=publickey",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        f"UserKnownHostsFile={known_hosts}",
+        "-o",
+        "GlobalKnownHostsFile=/dev/null",
+        "-o",
+        "UpdateHostKeys=no",
+        "-o",
+        "VerifyHostKeyDNS=no",
+        "-o",
+        f"HostKeyAlgorithms={algorithm}",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "ForwardAgent=no",
+        "-o",
+        "ClearAllForwardings=yes",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "PermitLocalCommand=no",
+        "-o",
+        "RequestTTY=no",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "ConnectionAttempts=1",
+    ]
+
+
 def ssh_base(args: argparse.Namespace, ip: str) -> list[str]:
+    normalized_ip = _normalize_ssh_ip(ip)
     return [
         "ssh",
         "-i",
         str(args.ssh_key),
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
-        "-o",
-        "ConnectTimeout=15",
-        f"{args.ssh_user}@{ip}",
+        *_ssh_transport_options(args, normalized_ip),
+        f"{args.ssh_user}@{normalized_ip}",
     ]
+
+
+def scp_base(args: argparse.Namespace, ip: str) -> list[str]:
+    return [
+        "scp",
+        "-i",
+        str(args.ssh_key),
+        *_ssh_transport_options(args, ip),
+    ]
+
+
+def _ssh_host_key_failure(stderr: str) -> bool:
+    lowered = stderr.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "host key verification failed",
+            "remote host identification has changed",
+            "no ed25519 host key is known",
+        )
+    )
 
 
 def wait_for_ssh(args: argparse.Namespace, ip: str, timeout_s: int = 900) -> None:
@@ -534,11 +760,17 @@ def wait_for_ssh(args: argparse.Namespace, ip: str, timeout_s: int = 900) -> Non
         proc = subprocess.run(
             ssh_base(args, ip) + ["true"],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
         )
         if proc.returncode == 0:
             print("[nebius-sweep] ssh ready", flush=True)
             return
+        if _ssh_host_key_failure(proc.stderr or ""):
+            raise RuntimeError(
+                f"SSH host-key verification failed for Nebius host {ip}; "
+                "the presented key does not match the pinned contract"
+            )
         time.sleep(10)
     raise TimeoutError(f"timed out waiting for ssh to {ip}")
 
@@ -1060,6 +1292,32 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--ssh-user", default="dave")
     parser.add_argument("--ssh-key", type=Path, default=default_ssh_key())
     parser.add_argument("--ssh-pubkey", type=Path, default=None)
+    parser.add_argument(
+        "--ssh-host-key",
+        default=os.environ.get(SSH_HOST_KEY_ENV),
+        help=(
+            "Pinned Nebius ssh-ed25519 host public-key line. Required for live runs "
+            "with --ssh-host-key-fingerprint."
+        ),
+    )
+    parser.add_argument(
+        "--ssh-host-key-file",
+        type=Path,
+        default=(
+            Path(os.environ[SSH_HOST_KEY_FILE_ENV])
+            if os.environ.get(SSH_HOST_KEY_FILE_ENV)
+            else None
+        ),
+        help=(
+            "File containing the pinned Nebius ssh-ed25519 host public-key line; "
+            "alternative to --ssh-host-key."
+        ),
+    )
+    parser.add_argument(
+        "--ssh-host-key-fingerprint",
+        default=os.environ.get(SSH_HOST_KEY_FINGERPRINT_ENV),
+        help="SHA256 fingerprint corresponding exactly to the pinned host key.",
+    )
     parser.add_argument("--docker-image", default=DEFAULT_DOCKER_IMAGE)
     parser.add_argument("--bundle-root", type=Path, required=True)
     parser.add_argument("--hash-jobs", type=int, default=4)
@@ -1151,6 +1409,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
+    validate_ssh_host_key_contract(args, required=not args.dry_run)
     validate_docker_image_digest(args.docker_image)
     for name, value in (
         ("--parent-id", args.parent_id),
@@ -1262,6 +1521,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     retrieval_succeeded = False
     try:
         with tempfile.TemporaryDirectory(prefix="cppmega-h200-sweep-") as tmp:
+            args._nebius_ssh_known_hosts_dir = Path(tmp)
             overlay_tar = Path(tmp) / "cppmega_overlay.tgz"
             sidecar_tar = Path(tmp) / "cppmega_sidecar.tgz"
             ghcr_auth_tar = Path(tmp) / "cppmega_ghcr_auth.tgz"
@@ -1320,16 +1580,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 training_failed = sys.exc_info()[0] is not None
                 out_dir = ROOT / "outputs" / "nebius" / args.instance_name
                 out_dir.mkdir(parents=True, exist_ok=True)
-                scp_cmd = [
-                    "scp",
-                    "-i",
-                    str(args.ssh_key),
-                    "-o",
-                    "StrictHostKeyChecking=no",
-                    "-o",
-                    "UserKnownHostsFile=/dev/null",
-                    "-o",
-                    "ConnectTimeout=15",
+                scp_cmd = scp_base(args, ip) + [
                     "-r",
                     f"{args.ssh_user}@{ip}:/data/cppmega_h200_results/.",
                     str(out_dir),
@@ -1349,16 +1600,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 if args.save_checkpoint:
                     ckpt_dir = ROOT / "outputs" / "checkpoints" / args.instance_name
                     ckpt_dir.mkdir(parents=True, exist_ok=True)
-                    ckpt_scp_cmd = [
-                        "scp",
-                        "-i",
-                        str(args.ssh_key),
-                        "-o",
-                        "StrictHostKeyChecking=no",
-                        "-o",
-                        "UserKnownHostsFile=/dev/null",
-                        "-o",
-                        "ConnectTimeout=15",
+                    ckpt_scp_cmd = scp_base(args, ip) + [
                         "-r",
                         f"{args.ssh_user}@{ip}:/data/cppmega_h200_checkpoints/.",
                         str(ckpt_dir),
