@@ -819,8 +819,7 @@ def _graph_objective_from_index_scores(
         seqlen_k=seqlen_k,
         device=index_scores.device,
     )
-    graph_beta = _env_float("CPPMEGA_DSA_GRAPH_BIAS_BETA", 1.0)
-    neural_scores = index_scores.float() - graph_beta * route_bias
+    neural_scores = index_scores.float() - config.bias_beta * route_bias
     pair_mask = pair_mask & torch.isfinite(neural_scores)
     graph_loss, _components = graph_auxiliary_loss(
         neural_scores,
@@ -1231,6 +1230,10 @@ def compute_index_scores_fused_bf16(
         )
         if beta.numel() != 1:
             raise ValueError(f"graph_beta must be scalar, got {tuple(beta.shape)}")
+        if not bool(torch.isfinite(beta).item()) or float(beta.item()) <= 0.0:
+            raise ValueError(
+                f"graph_beta must be a finite positive scalar, got {float(beta.item())}"
+            )
         index_scores.add_(graph_bias.to(device=q.device, dtype=torch.float32) * beta)
     return index_scores
 

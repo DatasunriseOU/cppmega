@@ -8,7 +8,22 @@ from cppmega.megatron.graph_objective_loss import (
     GraphAuxiliaryLossConfig,
     graph_auxiliary_loss,
     require_active_dsa_graph_objective,
+    validate_runtime_graph_contract,
 )
+from cppmega.megatron.graph_recipe import (
+    stage1_graph_recipe_binding,
+    stage1_graph_recipe_payload,
+)
+
+
+def _included_graph_contract() -> dict[str, object]:
+    return {
+        **stage1_graph_recipe_payload(),
+        "recipe": stage1_graph_recipe_binding(),
+        "eligible_samples": 1,
+        "positive_edges": 1,
+        "included_in_total_loss": True,
+    }
 
 
 def test_weighted_graph_losses_enter_total_and_backpropagate() -> None:
@@ -323,3 +338,31 @@ def test_graph_runtime_config_rejects_non_finite_weight(
 
     with pytest.raises(ValueError, match="global_weight"):
         GraphAuxiliaryLossConfig.from_env()
+
+
+def test_included_graph_contract_fails_closed_when_auxiliary_is_disabled() -> None:
+    environment = {
+        "CPPMEGA_STRUCTURE_ENABLED": "1",
+        "CPPMEGA_GRAPH_ROUTES_ENABLED": "1",
+        "CPPMEGA_DSA_GRAPH_AUX_ENABLED": "0",
+    }
+
+    with pytest.raises(ValueError, match="included_in_total_loss.*auxiliary"):
+        validate_runtime_graph_contract(
+            _included_graph_contract(),
+            environment=environment,
+        )
+
+
+def test_runtime_graph_contract_rejects_selector_beta_drift() -> None:
+    contract = _included_graph_contract()
+    contract["bias_beta"] = "1"
+    environment = {
+        "CPPMEGA_STRUCTURE_ENABLED": "1",
+        "CPPMEGA_GRAPH_ROUTES_ENABLED": "1",
+        "CPPMEGA_DSA_GRAPH_AUX_ENABLED": "1",
+        "CPPMEGA_DSA_GRAPH_BIAS_BETA": "0",
+    }
+
+    with pytest.raises(ValueError, match="bias beta"):
+        validate_runtime_graph_contract(contract, environment=environment)

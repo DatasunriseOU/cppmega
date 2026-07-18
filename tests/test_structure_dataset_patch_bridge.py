@@ -271,6 +271,20 @@ def test_pop_structure_batch_removes_sidecars_and_sets_thread_local():
     assert patch._get_current_structure_batch() is structure
 
 
+def test_pop_structure_batch_carries_objective_ids_for_unified_mix_receipt():
+    batch = {
+        "tokens": torch.tensor([[1, 2, 3]]),
+        "labels": torch.tensor([[2, 3, 4]]),
+        "objective_ids": torch.tensor([[2, 4, 5]]),
+    }
+
+    structure = patch._pop_structure_batch(batch)
+
+    assert structure is not None
+    assert "objective_ids" not in batch
+    assert torch.equal(structure["objective_ids"], torch.tensor([[2, 4, 5]]))
+
+
 def test_symbol_sidecar_tensor_preserves_unsigned_values_above_int64() -> None:
     tensor = patch._token_sidecar_tensor(
         np.array(_OPAQUE_VALUES, dtype=np.uint64),

@@ -28,6 +28,7 @@ class GraphAuxiliaryLossConfig:
     layer_weight: float = 1.0
     pos_weight: float = 1.0
     margin: float = 1.0
+    bias_beta: float = 1.0
     relations: tuple[str, ...] = STAGE1_GRAPH_RELATIONS
 
     def __post_init__(self) -> None:
@@ -47,6 +48,8 @@ class GraphAuxiliaryLossConfig:
             raise ValueError("pos_weight must be > 0")
         if not math.isfinite(float(self.margin)) or self.margin < 0.0:
             raise ValueError("margin must be >= 0")
+        if not math.isfinite(float(self.bias_beta)) or self.bias_beta <= 0.0:
+            raise ValueError("bias beta (bias_beta) must be > 0")
         if not self.relations or any(not relation for relation in self.relations):
             raise ValueError("relations must contain at least one non-empty name")
         if len(set(self.relations)) != len(self.relations):
@@ -115,6 +118,12 @@ class GraphAuxiliaryLossConfig:
                         "CPPMEGA_DSA_GRAPH_MARGIN", str(defaults["margin"])
                     )
                 ),
+                bias_beta=float(
+                    source.get(
+                        "CPPMEGA_DSA_GRAPH_BIAS_BETA",
+                        str(defaults["bias_beta"]),
+                    )
+                ),
                 relations=relations,
             )
         except ValueError as exc:
@@ -125,7 +134,7 @@ def validate_runtime_graph_contract(
     graph_contract: Mapping[str, object],
     *,
     environment: Mapping[str, str] | None = None,
-    require_included_auxiliary: bool = False,
+    require_included_auxiliary: bool = True,
 ) -> None:
     """Require runtime graph-loss knobs to exactly match the data receipt."""
 
@@ -168,14 +177,16 @@ def validate_runtime_graph_contract(
         "coverage_weight": config.coverage_weight,
         "pos_weight": config.pos_weight,
         "margin": config.margin,
+        "bias_beta": config.bias_beta,
     }
     for field, runtime_value in comparisons.items():
         raw_contract = graph_contract.get(field)
         if not isinstance(raw_contract, str):
             raise ValueError(f"graph_auxiliary.{field} contract value must be exact")
         if Fraction(str(runtime_value)) != Fraction(raw_contract):
+            display_name = "bias beta" if field == "bias_beta" else field
             raise ValueError(
-                f"graph auxiliary runtime {field}={runtime_value} differs from "
+                f"graph auxiliary runtime {display_name}={runtime_value} differs from "
                 f"contract={raw_contract}"
             )
     if config.topk != graph_contract.get("topk"):

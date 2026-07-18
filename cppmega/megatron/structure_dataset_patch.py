@@ -131,6 +131,8 @@ _GRAPH_BATCH_COLS = (
     "graph_document_ids",
 )
 
+_OBJECTIVE_BATCH_COLS = ("objective_ids",)
+
 _TOKEN_COL_ALIASES = {
     "domain_ids": ("token_domain_ids", "domain_ids"),
     "role_ids": ("token_role_ids", "role_ids"),
@@ -193,7 +195,7 @@ _LOSS_MASK_ALIGNMENT = "source_token_predicts_next_v1"
 
 _GRAPH_ROUTE_COLS = GRAPH_ROUTE_COLUMNS
 
-_CPPMEGA_BATCH_COLS = _TOKEN_BATCH_COLS + _GRAPH_BATCH_COLS
+_CPPMEGA_BATCH_COLS = _TOKEN_BATCH_COLS + _GRAPH_BATCH_COLS + _OBJECTIVE_BATCH_COLS
 _TP_SIDECAR_MAX_DIMS = 4
 _TP_BRIDGE_OK = 0
 _TP_BRIDGE_MISSING = 1

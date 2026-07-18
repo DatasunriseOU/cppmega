@@ -225,6 +225,22 @@ def test_fused_scores_add_graph_route_bias_before_topk():
     assert scores[0, 0, 0].item() == 0.0
 
 
+def test_fused_scores_reject_nonpositive_graph_beta():
+    q = torch.zeros((2, 1, 1, 4), dtype=torch.bfloat16)
+    k = torch.zeros((2, 1, 4), dtype=torch.bfloat16)
+    weights = torch.ones((2, 1, 1), dtype=torch.bfloat16)
+    graph_bias = torch.zeros((1, 2, 2), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="graph_beta"):
+        compute_index_scores_fused_bf16(
+            q,
+            weights,
+            k,
+            graph_bias=graph_bias,
+            graph_beta=0.0,
+        )
+
+
 def test_scatter_edges_vectorized_matches_reference_loop():
     from cppmega.megatron.dsa_indexer_fused_patch import _scatter_edges_
 

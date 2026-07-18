@@ -81,7 +81,10 @@ def _valid_contract() -> dict[str, object]:
             "layer_reduction": "sum",
             "bce_weight": "1/10",
             "coverage_weight": "1/20",
+            "bias_beta": "1",
             "topk": STAGE1_GRAPH_TOPK,
+            "score_formula": "i_neural_plus_beta_s_graph_v1",
+            "score_stage": "before_topk",
             "pos_weight": "1",
             "margin": "1",
             "included_in_total_loss": True,
@@ -350,6 +353,14 @@ def test_contract_rejects_declared_but_inactive_graph_objective(
         validate_objective_contract(contract)
 
 
+def test_contract_requires_the_bound_pre_topk_graph_selector_beta() -> None:
+    contract = _valid_contract()
+    contract["graph_auxiliary"].pop("bias_beta")  # type: ignore[union-attr]
+
+    with pytest.raises(ValueError, match="graph_auxiliary.bias_beta"):
+        validate_objective_contract(contract)
+
+
 @pytest.mark.parametrize(
     ("field", "bad_value"),
     [
@@ -515,6 +526,7 @@ def test_graph_enabled_dataset_ingress_validates_bound_objective_ids(
     dataset = SimpleNamespace(dataset=SimpleNamespace(bin_path=str(prefix) + ".bin"))
     monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
     monkeypatch.setenv("CPPMEGA_STRUCTURE_ENABLED", "1")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_ENABLED", "1")
 
     _path, manifest = dataset_patch._load_sidecar_manifest(dataset)
 
