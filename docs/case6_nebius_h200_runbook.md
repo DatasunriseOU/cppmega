@@ -26,6 +26,8 @@ export CASE6_BUCKET=cppmega-sidecar-20260627
 export CASE6_PREFIX_S3=cppmega-megatron/case6
 export CASE6_ENDPOINT=https://storage.eu-north1.nebius.cloud
 export CPPMEGA_IMAGE='ghcr.io/datasunriseou/cppmega@sha256:REPLACE_WITH_64_LOWERCASE_HEX'
+export NEBIUS_SSH_HOST_KEY_FILE=/absolute/path/to/trusted/nebius-host-ed25519.pub
+export NEBIUS_SSH_HOST_KEY_FINGERPRINT='SHA256:REPLACE_WITH_OUT_OF_BAND_FINGERPRINT'
 mkdir -p "$CASE6_STAGE"
 cd "$CASE6_ROOT"
 ```
@@ -34,6 +36,12 @@ cd "$CASE6_ROOT"
 prefix manifests, tokenizer, objective receipts, and graph sidecars refer to
 the same artifact set. The launcher derives graph capacities from those
 manifest-bound CSR offsets; hand-written `256/256` defaults are not accepted.
+
+`NEBIUS_SSH_HOST_KEY_FILE` and `NEBIUS_SSH_HOST_KEY_FINGERPRINT` must come from
+an out-of-band trusted host inventory and must describe the same `ssh-ed25519`
+key. If no out-of-band trusted host key is available, stop. Do not use
+`ssh-keyscan`, `StrictHostKeyChecking=no`, `accept-new`, or a key learned from
+the instance under test to manufacture a trust decision.
 
 ## 2. Local verification
 
@@ -116,6 +124,8 @@ MEGATRON_LM_REPO="$MEGATRON_LM_REPO" \
   --image-id "${NEBIUS_IMAGE_ID:?set a current image ID}" \
   --ssh-key "$HOME/.ssh/id_ed25519" \
   --ssh-pubkey "$HOME/.ssh/id_ed25519.pub" \
+  --ssh-host-key-file "$NEBIUS_SSH_HOST_KEY_FILE" \
+  --ssh-host-key-fingerprint "$NEBIUS_SSH_HOST_KEY_FINGERPRINT" \
   --docker-image "$CPPMEGA_IMAGE" \
   --bundle-root "$CASE6_BUNDLE" \
   --sidecar-prefix "$CASE6_PREFIX" \
@@ -131,7 +141,9 @@ test -x "$CASE6_STAGE/h200_remote_leader.sh"
 
 The image must use a lower-case immutable digest. Mutable tags such as
 `:latest` are rejected. The plan script is an atomic, executable artifact and
-must be reviewed together with the preflight receipts.
+must be reviewed together with the preflight receipts. Its dry-run receipt must
+show the exact objective contract SHA, objective IDs/rates/planned samples and
+totals, the canonical graph recipe binding, and the graph bias-beta binding.
 
 ## 4. Leader-only remote sequence
 
@@ -142,7 +154,7 @@ NVIDIA runtime, and the Nebius CLI.
 1. Export one complete S3 credential family. Prefer
    `NEBIUS_S3_ACCESS_KEY_ID` and `NEBIUS_S3_SECRET_ACCESS_KEY`; do not mix them
    with an unrelated AWS session token.
-2. Restore the committed transport into a dedicated output root:
+2. Restore the committed transport into a new, empty dedicated output root:
 
    ```bash
    "$CASE6_PYTHON" scripts/data/restore_megatron_bundle_from_nebius_s3.py \
@@ -152,17 +164,26 @@ NVIDIA runtime, and the Nebius CLI.
      --prefix "$CASE6_PREFIX_S3" \
      --endpoint-url "$CASE6_ENDPOINT" \
      --hash-jobs 4 \
-     --free-space-headroom-gb 40
+     --free-space-headroom-gb 40 \
+     --require-empty-output-root
    ```
 
+   `--require-empty-output-root` checks the root before remote reads and again
+   before promotion. It rejects a reused bundle, archive, lock, receipt, or
+   other stale entry; do not remove a trusted host-key gate or reuse a dirty
+   root to make the restore proceed.
    The restore lock is scoped to the bundle, not the run ID. The logical
    manifest is validated before archive acquisition; archive members, sizes,
    hashes, destination paths, and final artifact bindings are checked before
    promotion. A failed restore must not leave a promoted destination.
 3. Run the H200 preflight in the pinned image or equivalent pinned runtime.
-   It must prove stack compatibility, save/cold staging, full-state restore,
-   finite loss and gradient norm, zero skipped/NaN iterations, graph-prior
-   consumption, and bound receipts.
+   It must prove stack compatibility, the first production batch with a
+   nonzero graph route and objective mix, save/cold staging, full-state
+   restore, finite positive loss and gradient norm for the expected iteration,
+   zero skipped/NaN iterations, graph-prior consumption with the canonical
+   recipe and beta binding, and bound receipts. The save and restore phase
+   receipts must include the checkpoint hash, explicit load-at-iteration-1
+   evidence, and matching model/optimizer/RNG fingerprints.
 4. Execute only the reviewed digest-pinned leader script. Keep the same bundle,
    tokenizer, prefix, and run ID values used by the receipts.
 5. Copy `/data/cppmega_h200_results`, all preflight and checkpoint receipts,

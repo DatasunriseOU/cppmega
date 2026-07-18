@@ -44,6 +44,13 @@ from scripts.h200_megatron_preflight import (
 
 _DTYPE_SIZES = publisher.DTYPE_SIZES
 _TEST_GRAPH_CAPACITY = (1, 1)
+_TEST_SSH_HOST_KEY = (
+    "ssh-ed25519 "
+    "AAAAC3NzaC1lZDI1NTE5AAAAIJRwravCVfVsFZfdgfvC/OlW0K7vrJ7pBjl5p86YKSSs"
+)
+_TEST_SSH_HOST_KEY_FINGERPRINT = (
+    "SHA256:xGOQHYDUpAKZPiHLlYNYp01FiayrndE1tGC9wBoA+xw"
+)
 NONZERO_GRAPH_SIDECARS = publisher.NONZERO_GRAPH_SIDECARS
 REQUIRED_GRAPH_SIDECARS = publisher.REQUIRED_GRAPH_SIDECARS
 REQUIRED_TOKEN_SIDECARS = publisher.REQUIRED_TOKEN_SIDECARS
@@ -1012,25 +1019,36 @@ def test_fp8_tensorwise_dry_run_disables_nvrtc_by_default(tmp_path, capsys):
     pubkey = tmp_path / "id_ed25519.pub"
     pubkey.write_text("ssh-ed25519 TESTKEY codex\n")
     plan_script = tmp_path / "leader-plan.sh"
-    rc = main(
+    argv = [
+        "--dry-run",
+        "--plan-script",
+        str(plan_script),
+        "--bundle-root",
+        str(bundle_root),
+        "--sidecar-prefix",
+        str(prefix),
+        "--fp8-recipe",
+        "tensorwise",
+        "--batch-sizes",
+        "64",
+        "--train-iters",
+        "1",
+        "--ssh-pubkey",
+        str(pubkey),
+    ]
+
+    with pytest.raises(RuntimeError, match="host-key pin is required"):
+        main(argv)
+
+    argv.extend(
         [
-            "--dry-run",
-            "--plan-script",
-            str(plan_script),
-            "--bundle-root",
-            str(bundle_root),
-            "--sidecar-prefix",
-            str(prefix),
-            "--fp8-recipe",
-            "tensorwise",
-            "--batch-sizes",
-            "64",
-            "--train-iters",
-            "1",
-            "--ssh-pubkey",
-            str(pubkey),
+            "--ssh-host-key",
+            _TEST_SSH_HOST_KEY,
+            "--ssh-host-key-fingerprint",
+            _TEST_SSH_HOST_KEY_FINGERPRINT,
         ]
     )
+    rc = main(argv)
 
     assert rc == 0
     assert 'export NVTE_DISABLE_NVRTC="1"' in capsys.readouterr().out
@@ -1278,6 +1296,12 @@ def test_h200_preflight_real_local_dry_run_writes_bound_commands(tmp_path):
         receipt["commands"]["save"].index("--eval-interval") + 1
     ] == "1"
     assert receipt["config"]["enable_dsa_patch"] is True
+    objective_binding = receipt["data"]["objective_graph_binding"]
+    assert objective_binding["objective_sha256"] == (
+        receipt["data"]["manifest"]["objective_contract"]["sha256"]
+    )
+    assert objective_binding["graph_recipe"] == stage1_graph_recipe_binding()
+    assert objective_binding["bias_beta"]["value"] == "1"
     save_command = receipt["commands"]["save"]
     assert save_command[save_command.index("--experimental-attention-variant") + 1] == "dsa"
     assert "--multi-latent-attention" in save_command

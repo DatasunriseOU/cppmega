@@ -14,6 +14,7 @@ from cppmega.receipt_binding import (
     validate_receipt_binding,
 )
 from cppmega.megatron.graph_objective_loss import graph_bias_beta_binding
+from cppmega.megatron.graph_recipe import stage1_graph_recipe_binding
 from cppmega.megatron.objective_contract import OBJECTIVE_IDS
 
 
@@ -496,6 +497,10 @@ def observe_graph_prior(
             raise RuntimeError(
                 f"existing H200 graph-prior receipt beta differs from runtime: {output}"
             )
+        if existing.get("graph_recipe") != stage1_graph_recipe_binding():
+            raise RuntimeError(
+                f"existing H200 graph-prior receipt recipe differs from runtime: {output}"
+            )
         if receipt_binding is not None:
             validate_receipt_binding(
                 existing.get("binding"),
@@ -517,6 +522,7 @@ def observe_graph_prior(
         "observed_at": datetime.now(timezone.utc).isoformat(),
         "rank": int(os.environ.get("RANK", "0")),
         "consumer": consumer,
+        "graph_recipe": stage1_graph_recipe_binding(),
         "bias_beta": beta_binding,
         "prior": {
             "shape": [int(value) for value in detached.shape],

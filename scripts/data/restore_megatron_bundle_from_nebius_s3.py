@@ -138,6 +138,21 @@ def _contained_output_path(output_root: Path, name: str) -> Path:
     return path
 
 
+def _require_empty_output_root(output_root: Path) -> None:
+    if not output_root.exists():
+        return
+    if output_root.is_symlink() or not output_root.is_dir():
+        raise RuntimeError(
+            "fresh restore requires an empty output root directory: "
+            f"{output_root}"
+        )
+    try:
+        next(output_root.iterdir())
+    except StopIteration:
+        return
+    raise RuntimeError(f"fresh restore requires an empty output root: {output_root}")
+
+
 def _remove_partial_tree(partial: Path) -> None:
     if not partial.exists() and not partial.is_symlink():
         return
@@ -510,6 +525,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hash-jobs", type=int, default=4)
     parser.add_argument("--free-space-headroom-gb", type=int, default=10)
     parser.add_argument("--keep-archive", action="store_true")
+    parser.add_argument(
+        "--require-empty-output-root",
+        action="store_true",
+        help="refuse reuse and require the restore output root to start empty",
+    )
     return parser
 
 
@@ -525,6 +545,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         raise ValueError(
             "hash jobs must be positive and free-space headroom nonnegative"
         )
+    output_root = args.output_root.expanduser().absolute()
+    if args.require_empty_output_root:
+        _require_empty_output_root(output_root)
     _load_env_file(args.env_file)
     env = _s3_env()
     prefix = args.prefix.strip("/")
@@ -577,7 +600,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     ):
         raise ValueError("remote logical manifest counts do not match transport")
 
-    output_root = args.output_root.resolve()
+    if args.require_empty_output_root:
+        _require_empty_output_root(output_root)
+    output_root = output_root.resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     restore_config = {
         "schema": "cppmega_nebius_bundle_restore_config_v1",
@@ -589,6 +614,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "hash_jobs": args.hash_jobs,
         "free_space_headroom_gb": args.free_space_headroom_gb,
         "keep_archive": args.keep_archive,
+        "require_empty_output_root": args.require_empty_output_root,
     }
     receipt_binding = build_receipt_binding(
         bundle_id=bundle_id,

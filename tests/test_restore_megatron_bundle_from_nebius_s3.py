@@ -364,6 +364,13 @@ def test_validate_restore_run_id_accepts_safe_identifier() -> None:
     )
 
 
+def test_fresh_restore_rejects_nonempty_output_root(tmp_path: Path) -> None:
+    (tmp_path / "stale-marker").write_text("keep", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="fresh restore requires an empty output root"):
+        restore._require_empty_output_root(tmp_path)
+
+
 def test_restore_requires_space_for_archive_expansion(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "scripts.data.restore_megatron_bundle_from_nebius_s3.shutil.disk_usage",

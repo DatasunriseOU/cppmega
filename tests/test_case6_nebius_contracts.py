@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import os
 from pathlib import Path
 import struct
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +22,7 @@ from cppmega.megatron.objective_contract import (
     OBJECTIVE_IDS,
     validate_objective_contract,
 )
+from cppmega.megatron.graph_objective_loss import graph_bias_beta_binding
 from scripts.data.publish_megatron_bundle_to_nebius_s3 import (
     _head_matches,
     _resolve_s3_env,
@@ -39,6 +43,8 @@ from scripts.nebius_h200_megatron_cpp_world_sweep import (
 from scripts.h200_megatron_preflight import (
     STACK_REQUIRED_IMPORTS,
     _derive_graph_capacity_from_manifest,
+    _iteration_evidence,
+    _validate_graph_prior_receipt,
     _profile_environment,
     build_megatron_command,
     validate_stack_compatibility,
@@ -315,6 +321,101 @@ def test_restore_refuses_symlink_partial_tree(tmp_path: Path) -> None:
         _remove_partial_tree(partial)
 
     assert target.is_dir()
+
+
+def test_case6_runbook_requires_fresh_restore_and_trusted_host_key() -> None:
+    runbook = (
+        Path(__file__).resolve().parents[1] / "docs/case6_nebius_h200_runbook.md"
+    ).read_text(encoding="utf-8")
+
+    assert "--require-empty-output-root" in runbook
+    assert "NEBIUS_SSH_HOST_KEY_FILE" in runbook
+    assert "NEBIUS_SSH_HOST_KEY_FINGERPRINT" in runbook
+    assert "--ssh-host-key-file" in runbook
+    assert "--ssh-host-key-fingerprint" in runbook
+    assert "out-of-band trusted host key" in runbook
+    assert "ssh-keyscan" in runbook
+
+
+def test_fresh_restore_rejects_symlink_root_before_remote_reads(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    output_root = tmp_path / "output"
+    output_root.symlink_to(target, target_is_directory=True)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "aws-called"
+    fake_aws = fake_bin / "aws"
+    fake_aws.write_text(
+        "#!/bin/sh\nprintf called > \"$CASE6_AWS_MARKER\"\nexit 99\n",
+        encoding="ascii",
+    )
+    fake_aws.chmod(0o700)
+    env = {
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "AWS_ACCESS_KEY_ID": "test-access-key",
+        "AWS_SECRET_ACCESS_KEY": "test-secret-key",
+        "CASE6_AWS_MARKER": str(marker),
+        "HOME": str(tmp_path),
+    }
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(root / "scripts/data/restore_megatron_bundle_from_nebius_s3.py"),
+            "--output-root",
+            str(output_root),
+            "--bundle-id",
+            "bundle-1",
+            "--run-id",
+            "fresh",
+            "--env-file",
+            str(tmp_path / "missing.env"),
+            "--require-empty-output-root",
+        ],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "fresh restore requires an empty output root directory" in result.stderr
+    assert not marker.exists()
+
+
+def test_iteration_proof_cannot_borrow_metrics_from_a_later_iteration() -> None:
+    log = (
+        "iteration 1/ 1 | lm loss: nan | grad norm: 0.25 | "
+        "number of skipped iterations: 0 | number of nan iterations: 1 |\n"
+        "iteration 2/ 2 | lm loss: 6.5 | grad norm: 0.25 | "
+        "number of skipped iterations: 0 | number of nan iterations: 0 |\n"
+    )
+
+    with pytest.raises(RuntimeError, match="finite positive LM loss"):
+        _iteration_evidence(log, expected_iteration=1)
+
+
+def test_graph_prior_receipt_uses_canonical_recipe_and_beta_binding() -> None:
+    receipt = {
+        "status": "verified",
+        "consumer": "dsa_indexer",
+        "graph_recipe": stage1_graph_recipe_binding(),
+        "bias_beta": graph_bias_beta_binding(1.0),
+        "prior": {"nonzero": 1},
+    }
+
+    assert _validate_graph_prior_receipt(receipt, expected_beta=1.0) is receipt
+
+    stale = dict(receipt)
+    stale["graph_recipe"] = {
+        "schema": stage1_graph_recipe_binding()["schema"],
+        "sha256": "0" * 64,
+    }
+    with pytest.raises(RuntimeError, match="graph recipe"):
+        _validate_graph_prior_receipt(stale, expected_beta=1.0)
 
 
 def test_profile_requires_derived_graph_capacity() -> None:

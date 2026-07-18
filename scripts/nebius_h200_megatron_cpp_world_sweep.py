@@ -1409,7 +1409,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    validate_ssh_host_key_contract(args, required=not args.dry_run)
+    validate_ssh_host_key_contract(
+        args,
+        required=(not args.dry_run) or args.plan_script is not None,
+    )
     validate_docker_image_digest(args.docker_image)
     for name, value in (
         ("--parent-id", args.parent_id),

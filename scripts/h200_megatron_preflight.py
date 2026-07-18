@@ -45,6 +45,9 @@ from cppmega.megatron.graph_objective_loss import (  # noqa: E402
     resolve_graph_bias_beta,
     validate_runtime_graph_contract,
 )
+from cppmega.megatron.graph_recipe import (  # noqa: E402
+    stage1_graph_recipe_binding,
+)
 
 PENDING_CHECKPOINT_SHA256 = "0" * 64
 _GRAPH_CHUNK_SIDECARS = (
@@ -571,6 +574,8 @@ def _validate_graph_prior_receipt(
         )
     if receipt.get("bias_beta") != graph_bias_beta_binding(expected_beta):
         raise RuntimeError("DSA graph prior receipt beta binding is missing or stale")
+    if receipt.get("graph_recipe") != stage1_graph_recipe_binding():
+        raise RuntimeError("DSA graph prior receipt graph recipe is missing or stale")
     prior = receipt.get("prior")
     if not isinstance(prior, dict) or int(prior.get("nonzero", 0)) <= 0:
         raise RuntimeError("DSA graph prior receipt lacks a nonzero prior")
@@ -804,15 +809,21 @@ def _stack_report(environment: dict[str, str]) -> dict[str, object]:
 
 
 def _iteration_evidence(text: str, *, expected_iteration: int) -> dict[str, object]:
-    if not re.search(
-        rf"iteration\s+{expected_iteration}/\s*{expected_iteration}", text
-    ):
+    iteration_pattern = re.compile(
+        rf"\biteration\s+{expected_iteration}\s*/\s*{expected_iteration}\b",
+        flags=re.IGNORECASE,
+    )
+    iteration_lines = [
+        line for line in text.splitlines() if iteration_pattern.search(line)
+    ]
+    if not iteration_lines:
         raise RuntimeError(
             f"H200 preflight log lacks iteration {expected_iteration} completion"
         )
+    iteration_text = iteration_lines[-1]
 
     def last_float(label: str, pattern: str) -> float:
-        values = re.findall(pattern, text, flags=re.IGNORECASE)
+        values = re.findall(pattern, iteration_text, flags=re.IGNORECASE)
         if not values:
             raise RuntimeError(f"H200 preflight log lacks {label}")
         try:
@@ -831,10 +842,14 @@ def _iteration_evidence(text: str, *, expected_iteration: int) -> dict[str, obje
             f"H200 preflight requires finite positive grad norm, got {grad_norm}"
         )
     skipped_values = re.findall(
-        r"number of skipped iterations:\s*(\d+)", text, flags=re.IGNORECASE
+        r"number of skipped iterations:\s*(\d+)",
+        iteration_text,
+        flags=re.IGNORECASE,
     )
     nan_values = re.findall(
-        r"number of nan iterations:\s*(\d+)", text, flags=re.IGNORECASE
+        r"number of nan iterations:\s*(\d+)",
+        iteration_text,
+        flags=re.IGNORECASE,
     )
     if not skipped_values or int(skipped_values[-1]) != 0:
         raise RuntimeError("H200 preflight log reports skipped iterations")
@@ -1037,6 +1052,26 @@ def _bundle_identity(
     if not found:
         raise RuntimeError("H200 data prefix is not declared by bundle bucket_results")
     return manifest, dict(sorted(prefix_hashes.items()))
+
+
+def _objective_graph_binding(
+    objective_descriptor: dict[str, object],
+    graph_contract: dict[str, object],
+    environment: dict[str, str],
+) -> dict[str, object]:
+    payload = objective_descriptor.get("payload")
+    if not isinstance(payload, dict):
+        raise RuntimeError("H200 objective receipt lacks a validated payload")
+    return {
+        "objective_schema": objective_descriptor.get("schema"),
+        "objective_sha256": objective_descriptor.get("sha256"),
+        "objective_ids": dict(payload["objective_ids"]),
+        "configured_rates": dict(payload["configured_rates"]),
+        "planned_samples": dict(payload["planned_samples"]),
+        "totals": dict(payload["totals"]),
+        "graph_recipe": dict(graph_contract["recipe"]),
+        "bias_beta": graph_bias_beta_binding(resolve_graph_bias_beta(environment)),
+    }
 
 
 def _finalize_bound_receipt(
@@ -1339,6 +1374,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         environment=environment,
         require_included_auxiliary=True,
     )
+    objective_graph_binding = _objective_graph_binding(
+        objective_descriptor,
+        graph_contract,
+        environment,
+    )
     backend_claims = _claimed_backend_modules(environment)
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1379,6 +1419,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "enable_dsa_patch": args.enable_dsa_patch,
         "graph_max_edges": graph_capacity["graph_max_edges"],
         "graph_max_chunks": graph_capacity["graph_max_chunks"],
+        "objective_graph_binding": objective_graph_binding,
         "checkpoint_root": str(checkpoint_root),
         "cold_checkpoint_root": str(cold_checkpoint_root),
     }
@@ -1454,6 +1495,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 "micro_batch_size": args.micro_batch_size,
                 "graph_capacity": graph_capacity,
                 "graph_capacity_receipt": str(graph_capacity_output),
+                "objective_graph_binding": objective_graph_binding,
             },
             "checkpoint": {
                 "root": str(checkpoint_root),
