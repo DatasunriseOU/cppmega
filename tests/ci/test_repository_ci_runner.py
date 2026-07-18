@@ -148,6 +148,30 @@ def test_local_macos_uses_owned_source_environment() -> None:
     assert "/nanochat/.venv/" not in host["python"]
 
 
+def test_macos_lane_covers_cross_repo_case_contracts_and_preserves_peer_paths() -> None:
+    lanes = ci.load_lanes(LANES_CONFIG)
+    lane = lanes["macos-contracts"]
+    argv = {
+        argument
+        for command in lane["commands"]
+        for argument in command["argv"]
+    }
+
+    assert {
+        "tests/test_case4_identity_parity.py",
+        "tests/test_case6_nebius_contracts.py",
+        "tests/test_graph_objective_loss.py",
+        "tests/test_graph_recipe.py",
+        "tests/test_megatron_objective_contract.py",
+        "tests/test_recipe_artifact_parity.py",
+    }.issubset(argv)
+    assert {
+        "CPPMEGA_MLX_REFERENCE_ROOT",
+        "CPPMEGA_RECIPE_PARITY_PEER_ROOT",
+        "CPPMEGA_RECIPE_PARITY_PYTHON",
+    }.issubset(ci._PASSTHROUGH_ENV)
+
+
 def test_repository_runner_module_entrypoint_executes_cli() -> None:
     runner = REPO_ROOT / "scripts" / "ci" / "repository_runner.py"
     result = subprocess.run(
