@@ -337,6 +337,7 @@ def _profile_environment(
             "CPPMEGA_GRAPH_MAX_CHUNKS": str(graph_max_chunks),
             "CPPMEGA_DSA_PATCH_ENABLED": "1" if enable_dsa_patch else "0",
             "CPPMEGA_DSA_GRAPH_AUX_ENABLED": "1",
+            "CPPMEGA_OBJECTIVE_CONTRACT_REQUIRED": "1",
             "CPPMEGA_DSA_GRAPH_AUX_WEIGHT": "1",
             "CPPMEGA_DSA_INDEXER_LOSS_COEFF": "0.001",
             "CPPMEGA_DSA_SKIP_INDEXER_LOSS": "0",
@@ -1121,14 +1122,20 @@ def _run_phase(
     batch = json.loads(batch_receipt.read_text(encoding="utf-8"))
     active_graph = batch.get("active_graph")
     source_provenance = batch.get("source_provenance")
+    objective_mix = batch.get("objective_mix")
     if (
         batch.get("status") != "verified"
         or not isinstance(active_graph, dict)
         or int(active_graph.get("route_edge_count", 0)) <= 0
         or not isinstance(source_provenance, dict)
         or int(source_provenance.get("minimum_source_doc_id", 0)) <= 0
+        or not isinstance(objective_mix, dict)
+        or not objective_mix.get("observed_objective_ids")
     ):
-        raise RuntimeError(f"H200 preflight {name} production batch is not verified")
+        raise RuntimeError(
+            f"H200 preflight {name} production batch is not verified or lacks "
+            "objective mix accounting"
+        )
     if not graph_prior_receipt.is_file():
         raise RuntimeError(
             f"H200 preflight {name} did not record graph-prior consumption"

@@ -28,6 +28,7 @@ from cppmega.megatron.domain_route_contract import (
     TOKENIZER_CONTRACT_SHA256,  # noqa: F401 - compatibility export for loader callers
     is_accepted_case5_contract_hash_triple,
 )
+from cppmega.megatron.objective_contract import OBJECTIVE_IDS
 
 # Thread-local storage to safely pass the current batch's structure inputs to model forward
 _local_storage = threading.local()
@@ -132,6 +133,7 @@ _GRAPH_BATCH_COLS = (
 )
 
 _OBJECTIVE_BATCH_COLS = ("objective_ids",)
+_OBJECTIVE_ID_TO_TASK = {value: task for task, value in OBJECTIVE_IDS.items()}
 
 _TOKEN_COL_ALIASES = {
     "domain_ids": ("token_domain_ids", "domain_ids"),
@@ -248,6 +250,14 @@ def _pop_structure_batch(
     structure_batch = {
         col: batch.pop(col) for col in _CPPMEGA_BATCH_COLS if col in batch
     }
+    if (
+        _env_flag("CPPMEGA_OBJECTIVE_CONTRACT_REQUIRED")
+        and "objective_ids" not in structure_batch
+    ):
+        raise RuntimeError(
+            "[cppmega-patch] production objective contract requires objective_ids "
+            "in every Megatron batch"
+        )
     if structure_batch:
         receipt_path = os.environ.get("CPPMEGA_H200_BATCH_RECEIPT")
         if receipt_path:
@@ -559,6 +569,15 @@ def _make_get_batch_on_this_tp_rank_bridge(original_get_batch):
 
         tp_rank = int(bound.arguments["tp_rank"])
         source_sidecars = _take_cppmega_sidecars(input_batch)
+        if (
+            tp_rank == 0
+            and _env_flag("CPPMEGA_OBJECTIVE_CONTRACT_REQUIRED")
+            and "objective_ids" not in source_sidecars
+        ):
+            raise RuntimeError(
+                "[cppmega-patch] production objective contract requires the "
+                "document-aligned objective_ids sidecar before TP broadcast"
+            )
         source_device = _batch_transport_device(input_batch) if tp_rank == 0 else None
         batch = original_get_batch(*args, **kwargs)
         if batch is not None and not isinstance(batch, dict):
@@ -681,6 +700,76 @@ def _load_sidecar_manifest(dataset: Any) -> tuple[str, dict[str, Any]]:
         validate_runtime_graph_contract(validated_objectives.payload["graph_auxiliary"])
     dataset._cppmega_sidecar_manifest = (json_path, sidecar)
     return json_path, sidecar
+
+
+def _lazy_init_objective_ids(dataset: Any) -> np.ndarray | None:
+    """Map the document-aligned objective IDs required by production mixing."""
+
+    if hasattr(dataset, "_cppmega_objective_ids"):
+        return dataset._cppmega_objective_ids
+    if not _env_flag("CPPMEGA_STRUCTURE_ENABLED"):
+        return None
+
+    json_path, sidecar = _load_sidecar_manifest(dataset)
+    wrapper = sidecar.get("objective_contract")
+    if wrapper is None:
+        if _env_flag("CPPMEGA_OBJECTIVE_CONTRACT_REQUIRED"):
+            raise RuntimeError(
+                f"[cppmega-patch] production objective contract missing in "
+                f"{json_path!r}"
+            )
+        dataset._cppmega_objective_ids = None
+        return None
+    if not isinstance(wrapper, dict):
+        raise ValueError(
+            f"[cppmega-patch] objective_contract must be an object in {json_path!r}"
+        )
+    binding = wrapper.get("objective_id_sidecar")
+    if not isinstance(binding, dict):
+        raise KeyError(
+            f"[cppmega-patch] objective_contract.objective_id_sidecar missing in "
+            f"{json_path!r}"
+        )
+    if binding.get("dtype") != "uint8" or binding.get("document_aligned") is not True:
+        raise ValueError(
+            f"[cppmega-patch] objective ID sidecar binding is not document-aligned "
+            f"uint8 in {json_path!r}"
+        )
+    rel_path = binding.get("path")
+    if not isinstance(rel_path, str) or not rel_path:
+        raise ValueError(
+            f"[cppmega-patch] objective ID sidecar path is invalid in {json_path!r}"
+        )
+    path = _safe_sidecar_path(
+        os.path.dirname(json_path),
+        rel_path,
+        col="objective_ids",
+        field="objective_contract.objective_id_sidecar.path",
+        json_path=json_path,
+    )
+    objective_ids = np.memmap(path, mode="r", dtype=np.uint8)
+    document_count = sidecar.get("document_count")
+    if not isinstance(document_count, int) or document_count <= 0:
+        raise ValueError(
+            f"[cppmega-patch] document_count must be positive in {json_path!r}"
+        )
+    if objective_ids.size != document_count:
+        raise ValueError(
+            f"[cppmega-patch] objective ID sidecar has {objective_ids.size} entries, "
+            f"expected {document_count} in {json_path!r}"
+        )
+    unknown = sorted(
+        int(value)
+        for value in np.unique(objective_ids)
+        if int(value) not in _OBJECTIVE_ID_TO_TASK
+    )
+    if unknown:
+        raise ValueError(
+            f"[cppmega-patch] objective ID sidecar contains unknown IDs {unknown} "
+            f"in {json_path!r}"
+        )
+    dataset._cppmega_objective_ids = objective_ids
+    return objective_ids
 
 
 def _safe_sidecar_path(
@@ -1052,6 +1141,61 @@ def _align_token_sidecar_tensor(
     return tensor.contiguous()
 
 
+def _sample_objective_ids(
+    objective_ids: np.ndarray,
+    spans: list[dict[str, int]],
+    *,
+    target_len: int,
+) -> torch.Tensor:
+    """Expand document-aligned objective IDs over one packed Megatron sample."""
+
+    values = np.asarray(objective_ids).reshape(-1)
+    if target_len <= 0:
+        raise ValueError(f"objective ID target_len must be positive, got {target_len}")
+    result = torch.zeros((target_len,), dtype=torch.long)
+    expected_target_start = 0
+    for span_index, span in enumerate(spans):
+        real_doc = int(span["real_doc"])
+        source_start = int(span["source_start"])
+        source_end = int(span["source_end"])
+        target_start = int(span["target_start"])
+        length = source_end - source_start
+        if (
+            real_doc < 0
+            or real_doc >= values.size
+            or source_start < 0
+            or length <= 0
+            or target_start < 0
+            or target_start != expected_target_start
+        ):
+            raise ValueError(
+                "objective ID sample span is invalid: "
+                f"index={span_index} real_doc={real_doc} source=({source_start},{source_end}) "
+                f"target_start={target_start} target_len={target_len}"
+            )
+        objective_id = int(values[real_doc])
+        if objective_id not in _OBJECTIVE_ID_TO_TASK:
+            raise ValueError(
+                f"objective ID sample span {span_index} has unknown ID {objective_id}"
+            )
+        available = min(length, target_len - target_start)
+        if available <= 0:
+            raise ValueError(
+                "objective ID sample span exceeds target length: "
+                f"index={span_index} target_start={target_start} length={length} "
+                f"target_len={target_len}"
+            )
+        if available < length and span_index != len(spans) - 1:
+            raise ValueError(
+                "objective ID sample span was truncated before the final span: "
+                f"index={span_index} target_start={target_start} length={length} "
+                f"target_len={target_len}"
+            )
+        result[target_start : target_start + available] = objective_id
+        expected_target_start = target_start + available
+    return result
+
+
 def _token_sidecar_tensor(values: np.ndarray, *, col: str) -> torch.Tensor:
     """Preserve opaque identity bits instead of narrowing them to int64."""
 
@@ -1370,6 +1514,8 @@ try:
                 pass
             return sample
 
+        objective_id_mmap = _lazy_init_objective_ids(self)
+
         if idx is None:
             # Padded sequence: return zero tensors matching the tokens shape
             for col in _TOKEN_BATCH_COLS:
@@ -1435,6 +1581,12 @@ try:
                     device=sample["tokens"].device,
                 )
                 sample.update(graph)
+            if objective_id_mmap is not None:
+                sample["objective_ids"] = torch.zeros(
+                    sample["tokens"].shape,
+                    dtype=torch.long,
+                    device=sample["tokens"].device,
+                )
             return sample
 
         # Initialize and fetch side-channels
@@ -1449,6 +1601,22 @@ try:
         # enabled is a real misconfiguration and RAISES with WHERE+WHAT.
         indices = _get_absolute_token_indices(self, idx)
         target_len = int(sample["tokens"].shape[-1])
+        spans = (
+            _get_sample_token_spans(self, idx)
+            if objective_id_mmap is not None
+            or _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED")
+            else None
+        )
+        if objective_id_mmap is not None:
+            if spans is None:
+                raise RuntimeError(
+                    "[cppmega-patch] objective IDs require sampled document spans"
+                )
+            sample["objective_ids"] = _sample_objective_ids(
+                objective_id_mmap,
+                spans,
+                target_len=target_len,
+            ).to(device=sample["tokens"].device)
 
         # Packed cppmega parquet carries loss_mask that suppresses pad and
         # inter-document boundary labels. Megatron's default GPTDataset mask is
@@ -1528,6 +1696,10 @@ try:
             max_edges = _graph_capacity("CPPMEGA_GRAPH_MAX_EDGES")
             max_chunks = _graph_capacity("CPPMEGA_GRAPH_MAX_CHUNKS")
             spans = _get_sample_token_spans(self, idx)
+            if spans is None:
+                raise RuntimeError(
+                    "[cppmega-patch] graph routes require sampled document spans"
+                )
             graph = _build_graph_route_tensors(
                 graph_sidecars,
                 spans,

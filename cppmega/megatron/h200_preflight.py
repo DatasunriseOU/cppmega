@@ -13,6 +13,7 @@ from cppmega.receipt_binding import (
     validate_binding_shape,
     validate_receipt_binding,
 )
+from cppmega.megatron.objective_contract import OBJECTIVE_IDS
 
 
 class GraphChunkKind(IntEnum):
@@ -69,6 +70,7 @@ _ROUTE_FAMILIES = (
     ("diagnostic", 3, "token"),
     ("cross_domain", 3, "token"),
 )
+_OBJECTIVE_ID_TO_TASK = {value: task for task, value in OBJECTIVE_IDS.items()}
 
 
 def _tensor_summary(value: object) -> dict[str, object]:
@@ -85,6 +87,57 @@ def _tensor_summary(value: object) -> dict[str, object]:
         "numel": int(value.numel()),
         "nonzero": int(detached.count_nonzero().item()),
         "sum": float(detached.to(dtype=torch.float64).sum().item()),
+    }
+
+
+def _objective_mix_summary(
+    *,
+    batch: Mapping[str, object],
+    structure_batch: Mapping[str, object],
+    valid_tokens: object,
+) -> dict[str, object]:
+    import torch
+
+    objective_ids = structure_batch.get("objective_ids")
+    if not isinstance(objective_ids, torch.Tensor):
+        raise RuntimeError("production objective batch is missing objective_ids")
+    token_shape = tuple(batch["tokens"].shape)
+    if tuple(objective_ids.shape) != token_shape:
+        raise RuntimeError(
+            "production objective_ids shape "
+            f"{tuple(objective_ids.shape)} != tokens {token_shape}"
+        )
+    ids = objective_ids.detach().to(device="cpu", dtype=torch.int64)
+    valid = valid_tokens.detach().to(device="cpu", dtype=torch.bool)
+    nonzero_ids = ids[ids > 0]
+    unknown = sorted(
+        int(value)
+        for value in torch.unique(nonzero_ids).tolist()
+        if int(value) not in _OBJECTIVE_ID_TO_TASK
+    )
+    if unknown:
+        raise RuntimeError(f"production objective_ids contain unknown IDs: {unknown}")
+    if torch.any(ids[valid] <= 0):
+        raise RuntimeError(
+            "production objective_ids must be positive for every valid token"
+        )
+    loss_mask = batch["loss_mask"].detach().to(device="cpu")
+    trained = valid & loss_mask.ne(0)
+    observed_ids = sorted(int(value) for value in torch.unique(ids[valid]).tolist())
+    return {
+        "input_tokens_by_objective": {
+            _OBJECTIVE_ID_TO_TASK[objective_id]: int(
+                ((ids == objective_id) & valid).sum().item()
+            )
+            for objective_id in observed_ids
+        },
+        "loss_tokens_by_objective": {
+            _OBJECTIVE_ID_TO_TASK[objective_id]: int(
+                ((ids == objective_id) & trained).sum().item()
+            )
+            for objective_id in observed_ids
+        },
+        "observed_objective_ids": observed_ids,
     }
 
 
@@ -310,9 +363,11 @@ def observe_production_batch(
     structure_batch: Mapping[str, object],
     receipt_path: str | Path,
     receipt_binding: Mapping[str, object] | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     """Record the first real Megatron batch after sidecar materialization."""
 
+    environment = os.environ if environment is None else environment
     if receipt_binding is None:
         receipt_binding = _binding_from_environment()
     output = Path(receipt_path)
@@ -339,13 +394,23 @@ def observe_production_batch(
         raise RuntimeError(f"missing graph batch fields: {missing_graph}")
     if "structure_ids" not in structure_batch:
         raise RuntimeError("production structure batch is missing structure_ids")
+    if (
+        environment.get("CPPMEGA_OBJECTIVE_CONTRACT_REQUIRED", "0") == "1"
+        and "objective_ids" not in structure_batch
+    ):
+        raise RuntimeError(
+            "production objective contract requires objective_ids in the batch"
+        )
 
     batch_summary = {
         name: _tensor_summary(batch[name]) for name in REQUIRED_BATCH_FIELDS
     }
+    structure_names = ("structure_ids", *REQUIRED_GRAPH_BATCH_FIELDS)
+    if "objective_ids" in structure_batch:
+        structure_names = (*structure_names, "objective_ids")
     structure_summary = {
         name: _tensor_summary(structure_batch[name])
-        for name in ("structure_ids", *REQUIRED_GRAPH_BATCH_FIELDS)
+        for name in structure_names
     }
     if batch_summary["tokens"]["numel"] <= 0:
         raise RuntimeError("production tokens batch is empty")
@@ -358,6 +423,21 @@ def observe_production_batch(
     if structure_summary["graph_chunk_ends"]["nonzero"] <= 0:
         raise RuntimeError("production graph_chunk_ends must contain nonzero values")
     active_graph = _validate_active_graph(batch, structure_batch)
+    valid_tokens = (
+        batch["tokens"].detach().to(device="cpu").ne(0)
+        | batch["labels"].detach().to(device="cpu").ne(0)
+        | batch["loss_mask"].detach().to(device="cpu").ne(0)
+        | structure_batch["structure_ids"].detach().to(device="cpu").ne(0)
+    )
+    objective_mix = (
+        _objective_mix_summary(
+            batch=batch,
+            structure_batch=structure_batch,
+            valid_tokens=valid_tokens,
+        )
+        if "objective_ids" in structure_batch
+        else None
+    )
     source_doc_ids = structure_batch["source_doc_ids"].detach().to(device="cpu")
     positive_source_ids = source_doc_ids[source_doc_ids > 0]
 
@@ -375,6 +455,8 @@ def observe_production_batch(
             "minimum_source_doc_id": int(positive_source_ids.min().item()),
         },
     }
+    if objective_mix is not None:
+        receipt["objective_mix"] = objective_mix
     if receipt_binding is not None:
         receipt["binding"] = validate_binding_shape(
             receipt_binding, where="H200 batch receipt"

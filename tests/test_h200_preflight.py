@@ -44,6 +44,7 @@ def _structure_batch():
         "graph_chunk_kinds": torch.tensor([[1, 2]], dtype=torch.int64),
         "graph_chunk_dep_levels": torch.tensor([[0, 1]], dtype=torch.int64),
         "graph_chunk_counts": torch.tensor([2], dtype=torch.int64),
+        "objective_ids": torch.tensor([[2, 4, 5, 5]], dtype=torch.int64),
     }
     for family in ("call", "type"):
         batch[f"graph_{family}_edges"] = torch.empty((1, 0, 2), dtype=torch.int64)
@@ -91,7 +92,33 @@ def test_observe_production_batch_records_nonzero_structure_and_graph(tmp_path):
         "route_edge_count": 1,
         "route_edge_counts": {"domain": 1},
     }
+    assert receipt["objective_mix"] == {
+        "input_tokens_by_objective": {
+            "fim": 1,
+            "ifim": 1,
+            "commit_diff": 2,
+        },
+        "loss_tokens_by_objective": {
+            "fim": 1,
+            "ifim": 1,
+            "commit_diff": 1,
+        },
+        "observed_objective_ids": [2, 4, 5],
+    }
     assert json.loads(receipt_path.read_text(encoding="utf-8")) == receipt
+
+
+def test_observe_production_batch_requires_objective_ids_for_contract_mode(tmp_path):
+    structure = _structure_batch()
+    structure.pop("objective_ids")
+
+    with pytest.raises(RuntimeError, match="objective_ids"):
+        observe_production_batch(
+            batch=_production_batch(),
+            structure_batch=structure,
+            receipt_path=tmp_path / "batch.json",
+            environment={"CPPMEGA_OBJECTIVE_CONTRACT_REQUIRED": "1"},
+        )
 
 
 def test_observe_production_batch_accepts_canonical_other_chunk_kind_zero(tmp_path):

@@ -203,6 +203,7 @@ def test_production_preflight_uses_derived_capacity_and_active_dsa_auxiliary():
     assert environment["CPPMEGA_GRAPH_MAX_CHUNKS"] == "419"
     assert environment["CPPMEGA_DSA_PATCH_ENABLED"] == "1"
     assert environment["CPPMEGA_DSA_GRAPH_AUX_ENABLED"] == "1"
+    assert environment["CPPMEGA_OBJECTIVE_CONTRACT_REQUIRED"] == "1"
     assert environment["CPPMEGA_DSA_GRAPH_AUX_WEIGHT"] == "1"
     assert environment["CPPMEGA_DSA_INDEXER_LOSS_COEFF"] == "0.001"
     assert environment["CPPMEGA_DSA_SKIP_INDEXER_LOSS"] == "0"
