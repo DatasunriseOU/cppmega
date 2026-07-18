@@ -322,6 +322,58 @@ def test_builder_rejects_token_spanning_mapped_and_unmapped_text(
         )
 
 
+def test_root_and_data_prompt_graph_artifacts_have_identical_payload_contract() -> None:
+    modules = [
+        importlib.import_module("cppmega.prompt_graph"),
+        importlib.import_module("cppmega.data.prompt_graph"),
+    ]
+    payloads: list[dict[str, object]] = []
+    windows: list[dict[str, object]] = []
+
+    for prompt_graph in modules:
+        index = prompt_graph.PromptProjectIndex.from_dict(_v3_payload())
+        first, second = index.documents
+        artifact = prompt_graph.PromptGraphBuilder(
+            _CharacterOffsetTokenizer()
+        ).build(
+            index,
+            prompt_graph.PromptGraphContext(
+                segments=(
+                    prompt_graph.PromptGraphSegment(
+                        first.source,
+                        document_id=first.id,
+                        source_path=first.source_path,
+                        source_start=0,
+                    ),
+                    prompt_graph.PromptGraphSegment("\n", role="separator"),
+                    prompt_graph.PromptGraphSegment(
+                        second.source,
+                        document_id=second.id,
+                        source_path=second.source_path,
+                        source_start=0,
+                    ),
+                )
+            ),
+        )
+        payloads.append(artifact.to_dict())
+        model_inputs = artifact.model_inputs(
+            total_token_count=artifact.token_count,
+            window_start=0,
+            window_end=artifact.token_count,
+        )
+        windows.append(
+            {
+                "side_channels": model_inputs.side_channels,
+                "graph_routes": model_inputs.graph_routes,
+                "receipt": model_inputs.receipt,
+                "token_count": model_inputs.token_count,
+            }
+        )
+
+    assert payloads[0] == payloads[1]
+    assert windows[0] == windows[1]
+
+
 def test_prompt_graph_model_inputs_reject_non_enum_token_def_use() -> None:
     index = PromptProjectIndex.from_dict(_v3_payload())
     first, second = index.documents

@@ -54,6 +54,10 @@ from cppmega.megatron.objective_contract import (  # noqa: E402
 
 DEFAULT_BUCKETS = (1024, 2048, 4096, 8192, 16384)
 BUILD_PLAN_SCHEMA = "cppmega_macro_routes_build_plan_v1"
+BUNDLE_KNOWN_LIMITATIONS = (
+    "the source snapshot is the manifest-complete subset; failed or live "
+    "conveyor units are excluded",
+)
 DTYPE_SIZES = {
     "uint8": 1,
     "uint16": 2,
@@ -1422,12 +1426,7 @@ def _run_build(
             "buckets": objective_descriptors,
         },
         "buckets": list(buckets),
-        "known_limitations": [
-            "semantic symbol IDs and some local/global lookups are qname-based; "
-            "overloaded or same-qname symbols can collapse until clang USR identity is adopted",
-            "this frozen generation has no observed shell, diagnostic, or cross-domain graph edges",
-            "the source snapshot is the manifest-complete subset; failed/live conveyor units are excluded",
-        ],
+        "known_limitations": list(BUNDLE_KNOWN_LIMITATIONS),
         "source_snapshot": {
             "file_count": source_manifest["file_count"],
             "manifest": "provenance/source_manifest.json",

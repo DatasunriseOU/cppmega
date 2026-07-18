@@ -10,6 +10,7 @@ import pytest
 
 import scripts.data.build_macro_routes_megatron_bundle as builder
 from scripts.data.build_macro_routes_megatron_bundle import (
+    BUNDLE_KNOWN_LIMITATIONS,
     _acquire_build_lock,
     _artifact_set_sha256,
     build_arg_parser,
@@ -26,6 +27,16 @@ from scripts.data.build_macro_routes_megatron_bundle import (
     _validate_objective_source_binding,
     _write_repaired_snapshot_manifest,
 )
+
+
+def test_bundle_known_limitations_do_not_claim_retired_qname_or_domain_gaps() -> None:
+    assert BUNDLE_KNOWN_LIMITATIONS == (
+        "the source snapshot is the manifest-complete subset; failed or live "
+        "conveyor units are excluded",
+    )
+    text = " ".join(BUNDLE_KNOWN_LIMITATIONS).lower()
+    assert "qname" not in text
+    assert "no observed shell" not in text
 
 
 def test_artifact_set_fingerprint_is_order_independent_and_content_bound() -> None:

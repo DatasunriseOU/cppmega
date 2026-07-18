@@ -1,9 +1,11 @@
-"""Typed prompt-time projection of repository graphs onto tokenizer coordinates.
+"""Domain-edge extension of the canonical prompt-graph artifact contract.
 
-The builder consumes an existing project index with stable source offsets. It
-never parses source code. Graph inference therefore has one deterministic path
-and fails closed when the index, tokenizer offsets, cache, or visible routes are
-invalid.
+The serialized index, artifact, sidecars, routes, identity spans, and receipts
+must remain byte-identical to cppmega.prompt_graph. This module adds only
+categorical edge-kind bias helpers used by the tokenizer/data path. Production
+generation imports the canonical module directly; the parity regression in
+tests/test_prompt_graph_schema_v2.py prevents either implementation from
+silently drifting.
 """
 
 from __future__ import annotations
