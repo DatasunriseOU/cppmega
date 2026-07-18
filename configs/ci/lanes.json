@@ -25,25 +25,54 @@
             "-m",
             "pytest",
             "-q",
+            "tests/test_audit_sidecar_parquet.py",
             "tests/test_custom_embedding.py",
+            "tests/test_case4_identity_parity.py",
+            "tests/test_case5_v7_parser_token_span_regressions.py",
             "tests/test_data_pipeline_contracts.py",
             "tests/test_data_prep_parquet_to_megatron.py",
+            "tests/test_case5_ksh_domain_contract.py",
             "tests/test_domain_embedding.py",
             "tests/test_domain_megatron_sidecars.py",
             "tests/test_dsa_indexer_fused_patch.py",
+            "tests/test_eval_domain_routed_codegen.py",
             "tests/test_fastmtp_layer.py",
             "tests/test_graph_route_attention_bias_patch.py",
+            "tests/test_graph_objective_loss.py",
+            "tests/test_graph_recipe.py",
+            "tests/test_h200_megatron_preflight.py",
+            "tests/test_h200_preflight.py",
+            "tests/test_ksh_python_domain_parsers.py",
+            "tests/test_megatron_objective_contract.py",
             "tests/test_nebius_h200_megatron_cpp_generation_eval.py",
             "tests/test_nebius_h200_megatron_cpp_world_sweep.py",
+            "tests/test_prompt_graph_index_loader_contract.py",
+            "tests/test_prompt_graph_schema_v2.py",
             "tests/test_structure_dataset_patch_bridge.py",
             "tests/test_structure_embedding.py",
             "tests/test_subset_megatron_sidecar_prefix.py",
             "tests/test_build_macro_routes_megatron_bundle.py",
             "tests/test_dsa_sparse_attention.py",
             "tests/test_publish_megatron_bundle_to_nebius_s3.py",
+            "tests/test_recipe_artifact_parity.py",
             "tests/test_restore_megatron_bundle_from_nebius_s3.py",
+            "tests/test_case6_nebius_contracts.py",
             "tests/test_workflow_runner_policy.py",
             "tests/ci/test_repository_ci_runner.py"
+          ]
+        },
+        {
+          "name": "frozen-domain-eval",
+          "timeout_seconds": 120,
+          "argv": [
+            "{python}",
+            "scripts/eval_domain_routed_codegen.py",
+            "--prompts",
+            "evals/domain_routed_prompts.jsonl",
+            "--completions",
+            "evals/domain_routed_gold_completions.jsonl",
+            "--out",
+            "/tmp/cppmega-domain-routed-codegen.json"
           ]
         },
         {
@@ -100,7 +129,10 @@
             "-q",
             "tests/test_data_pipeline_contracts.py",
             "tests/test_data_prep_parquet_to_megatron.py",
+            "tests/test_case5_ksh_domain_contract.py",
             "tests/test_domain_megatron_sidecars.py",
+            "tests/test_eval_domain_routed_codegen.py",
+            "tests/test_ksh_python_domain_parsers.py",
             "tests/test_nebius_h200_megatron_cpp_generation_eval.py",
             "tests/test_nebius_h200_megatron_cpp_world_sweep.py",
             "tests/test_subset_megatron_sidecar_prefix.py",
@@ -109,6 +141,20 @@
             "tests/test_restore_megatron_bundle_from_nebius_s3.py",
             "tests/test_workflow_runner_policy.py",
             "tests/ci/test_repository_ci_runner.py"
+          ]
+        },
+        {
+          "name": "frozen-domain-eval",
+          "timeout_seconds": 120,
+          "argv": [
+            "{python}",
+            "scripts/eval_domain_routed_codegen.py",
+            "--prompts",
+            "evals/domain_routed_prompts.jsonl",
+            "--completions",
+            "evals/domain_routed_gold_completions.jsonl",
+            "--out",
+            "/tmp/cppmega-domain-routed-codegen.json"
           ]
         },
         {

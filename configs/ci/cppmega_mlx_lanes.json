@@ -29,6 +29,7 @@
             "tests/test_data_package_imports.py",
             "tests/test_domain_graph_routes.py",
             "tests/test_inference_generation.py",
+            "tests/test_train_eval_graph_routes.py",
             "tests/test_self_hosted_ci.py",
             "tests/test_workflow_runner_policy.py"
           ]

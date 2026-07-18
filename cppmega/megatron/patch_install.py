@@ -20,13 +20,21 @@ working unchanged; the reading sites still read os.environ.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import importlib
 import os
 from dataclasses import dataclass
 
+from cppmega.megatron.graph_objective_loss import resolve_graph_bias_beta
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
+
+def _env_bool(
+    name: str,
+    default: bool = False,
+    *,
+    source: Mapping[str, str] | None = None,
+) -> bool:
+    raw = (os.environ if source is None else source).get(name)
     if raw is None:
         return default
     value = raw.strip().lower()
@@ -37,8 +45,13 @@ def _env_bool(name: str, default: bool = False) -> bool:
     raise ValueError(f"{name}: invalid boolean value {raw!r}")
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
+def _env_int(
+    name: str,
+    default: int,
+    *,
+    source: Mapping[str, str] | None = None,
+) -> int:
+    raw = (os.environ if source is None else source).get(name)
     if raw is None:
         return default
     try:
@@ -47,8 +60,13 @@ def _env_int(name: str, default: int) -> int:
         raise ValueError(f"{name}: expected integer, got {raw!r}") from exc
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
+def _env_float(
+    name: str,
+    default: float,
+    *,
+    source: Mapping[str, str] | None = None,
+) -> float:
+    raw = (os.environ if source is None else source).get(name)
     if raw is None:
         return default
     try:
@@ -87,35 +105,70 @@ class CppMegaFeatureConfig:
     dsa_graph_bias_beta: float
 
     @classmethod
-    def from_env(cls) -> "CppMegaFeatureConfig":
+    def from_env(
+        cls, environment: Mapping[str, str] | None = None
+    ) -> "CppMegaFeatureConfig":
+        source = os.environ if environment is None else environment
         cfg = cls(
-            structure_enabled=_env_bool("CPPMEGA_STRUCTURE_ENABLED"),
-            graph_routes_enabled=_env_bool("CPPMEGA_GRAPH_ROUTES_ENABLED"),
-            graph_dense_attention_bias=_env_bool("CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS", True),
-            graph_dense_max_seq=_env_int("CPPMEGA_GRAPH_DENSE_MAX_SEQ", 16384),
-            graph_max_edges=_env_int("CPPMEGA_GRAPH_MAX_EDGES", 256),
-            graph_max_chunks=_env_int("CPPMEGA_GRAPH_MAX_CHUNKS", 256),
-            domain_embedding_enabled=_env_bool("CPPMEGA_DOMAIN_EMBEDDING_ENABLED"),
-            domain_bottleneck_dim=_env_int("CPPMEGA_DOMAIN_BOTTLENECK_DIM", 32),
-            ngram_hash_enabled=_env_bool("CPPMEGA_NGRAM_HASH_ENABLED"),
-            structure_components=os.environ.get("CPPMEGA_STRUCTURE_COMPONENTS", ""),
-            structure_bottleneck_dim=_env_int("CPPMEGA_STRUCTURE_BOTTLENECK_DIM", 32),
-            graph_attention_call_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_CALL_WEIGHT", 1.0),
-            graph_attention_type_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_TYPE_WEIGHT", 1.0),
-            graph_attention_domain_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_DOMAIN_WEIGHT", 1.0),
-            graph_attention_build_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_BUILD_WEIGHT", 1.0),
-            graph_attention_shell_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_SHELL_WEIGHT", 1.0),
-            graph_attention_diagnostic_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_DIAGNOSTIC_WEIGHT", 1.0),
-            graph_attention_cross_domain_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_CROSS_DOMAIN_WEIGHT", 1.0),
-            dsa_graph_bias_beta=_env_float("CPPMEGA_DSA_GRAPH_BIAS_BETA", 1.0),
+            structure_enabled=_env_bool("CPPMEGA_STRUCTURE_ENABLED", source=source),
+            graph_routes_enabled=_env_bool("CPPMEGA_GRAPH_ROUTES_ENABLED", source=source),
+            graph_dense_attention_bias=_env_bool(
+                "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS", True, source=source
+            ),
+            graph_dense_max_seq=_env_int(
+                "CPPMEGA_GRAPH_DENSE_MAX_SEQ", 16384, source=source
+            ),
+            graph_max_edges=_env_int(
+                "CPPMEGA_GRAPH_MAX_EDGES", 256, source=source
+            ),
+            graph_max_chunks=_env_int(
+                "CPPMEGA_GRAPH_MAX_CHUNKS", 256, source=source
+            ),
+            domain_embedding_enabled=_env_bool(
+                "CPPMEGA_DOMAIN_EMBEDDING_ENABLED", source=source
+            ),
+            domain_bottleneck_dim=_env_int(
+                "CPPMEGA_DOMAIN_BOTTLENECK_DIM", 32, source=source
+            ),
+            ngram_hash_enabled=_env_bool(
+                "CPPMEGA_NGRAM_HASH_ENABLED", source=source
+            ),
+            structure_components=source.get("CPPMEGA_STRUCTURE_COMPONENTS", ""),
+            structure_bottleneck_dim=_env_int(
+                "CPPMEGA_STRUCTURE_BOTTLENECK_DIM", 32, source=source
+            ),
+            graph_attention_call_weight=_env_float(
+                "CPPMEGA_GRAPH_ATTENTION_CALL_WEIGHT", 1.0, source=source
+            ),
+            graph_attention_type_weight=_env_float(
+                "CPPMEGA_GRAPH_ATTENTION_TYPE_WEIGHT", 1.0, source=source
+            ),
+            graph_attention_domain_weight=_env_float(
+                "CPPMEGA_GRAPH_ATTENTION_DOMAIN_WEIGHT", 1.0, source=source
+            ),
+            graph_attention_build_weight=_env_float(
+                "CPPMEGA_GRAPH_ATTENTION_BUILD_WEIGHT", 1.0, source=source
+            ),
+            graph_attention_shell_weight=_env_float(
+                "CPPMEGA_GRAPH_ATTENTION_SHELL_WEIGHT", 1.0, source=source
+            ),
+            graph_attention_diagnostic_weight=_env_float(
+                "CPPMEGA_GRAPH_ATTENTION_DIAGNOSTIC_WEIGHT", 1.0, source=source
+            ),
+            graph_attention_cross_domain_weight=_env_float(
+                "CPPMEGA_GRAPH_ATTENTION_CROSS_DOMAIN_WEIGHT", 1.0, source=source
+            ),
+            dsa_graph_bias_beta=resolve_graph_bias_beta(source),
         )
         # The DENSE flag DEFAULTS on but is gated by routes at runtime
         # (graph_dense_bias_enabled() returns False when routes are off), so a
         # default dense=True with routes off is harmless — do NOT reject it. Only
         # an EXPLICIT CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS=1 with routes off is a
         # misconfiguration (the user asked for dense bias that will silently no-op).
-        raw_dense = os.environ.get("CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS")
-        if raw_dense is not None and _env_bool("CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS"):
+        raw_dense = source.get("CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS")
+        if raw_dense is not None and _env_bool(
+            "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS", source=source
+        ):
             if not cfg.graph_routes_enabled:
                 raise ValueError(
                     "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS is set but "
@@ -123,6 +176,13 @@ class CppMegaFeatureConfig:
                     "off without graph routes, so this flag would silently no-op"
                 )
         cfg.validate()
+        if cfg.graph_routes_enabled:
+            for name in ("CPPMEGA_GRAPH_MAX_EDGES", "CPPMEGA_GRAPH_MAX_CHUNKS"):
+                if not source.get(name, "").strip():
+                    raise ValueError(
+                        f"{name} is required when graph routes are enabled; "
+                        "derive it from the bound CSR sidecars"
+                    )
         return cfg
 
     def validate(self) -> None:

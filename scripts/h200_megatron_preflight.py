@@ -28,6 +28,7 @@ from cppmega.recipes.run_profiles import (  # noqa: E402
     profile_shell_assignments,
 )
 from scripts.data.publish_megatron_bundle_to_nebius_s3 import (  # noqa: E402
+    _safe_prefix_file,
     _sha256,
     _validate_bundle,
     _validate_prefix_manifest_contract,
@@ -36,11 +37,17 @@ from scripts.data.publish_megatron_bundle_to_nebius_s3 import (  # noqa: E402
 from cppmega.receipt_binding import (  # noqa: E402
     build_receipt_binding,
     canonical_sha256,
+    complete_training_implementation_binding,
     validate_binding_shape,
     validate_receipt_binding,
 )
 from cppmega.megatron.graph_objective_loss import (  # noqa: E402
+    graph_bias_beta_binding,
+    resolve_graph_bias_beta,
     validate_runtime_graph_contract,
+)
+from cppmega.megatron.graph_recipe import (  # noqa: E402
+    stage1_graph_recipe_binding,
 )
 
 PENDING_CHECKPOINT_SHA256 = "0" * 64
@@ -51,6 +58,23 @@ _GRAPH_CHUNK_SIDECARS = (
     "token_chunk_dep_levels",
 )
 _GRAPH_EDGE_KINDS = frozenset({"edge_pairs", "edge_triples"})
+STACK_LOCK_PATH = ROOT / "STACK.lock"
+STACK_REQUIRED_IMPORTS = (
+    "transformer_engine",
+    "transformer_engine.pytorch",
+    "flash_attn",
+    "flash_attn_3",
+    "flash_attn.cute",
+    "mamba_ssm",
+    "causal_conv1d",
+    "fast_hadamard_transform",
+    "tilelang",
+    "qoptim_cuda",
+    "cutlass",
+    "quack",
+    "megatron.core",
+    "cppmega",
+)
 
 
 def _write_json_atomic(path: Path, payload: object) -> None:
@@ -71,6 +95,8 @@ def _csr_offsets_receipt(
 ) -> tuple[dict[str, object], array]:
     if offset_dtype != "int64":
         raise RuntimeError(f"graph CSR offsets must be int64: {path}")
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"graph CSR offset path must be a regular file: {path}")
     expected_entries = document_count + 1
     expected_bytes = expected_entries * 8
     if path.stat().st_size != expected_bytes:
@@ -108,16 +134,16 @@ def _csr_offsets_receipt(
     )
 
 
-def derive_graph_capacity_receipt(
+def _derive_graph_capacity_from_manifest(
     data_prefix: Path,
     *,
+    manifest: dict,
     sequence_length: int,
 ) -> dict[str, object]:
-    """Derive exact graph tensor capacities from a manifest-bound CSR prefix."""
+    """Derive exact graph tensor capacities from manifest-bound CSR offsets."""
     if sequence_length <= 0:
         raise ValueError("sequence_length must be positive")
     data_prefix = data_prefix.resolve()
-    manifest, _referenced = _validate_prefix_manifest_contract(data_prefix)
     document_count = int(manifest.get("document_count", 0))
     if document_count <= 0:
         raise RuntimeError("graph capacity derivation requires document_count > 0")
@@ -146,7 +172,7 @@ def derive_graph_capacity_receipt(
         item_count = int(raw_entry.get("item_count", -1))
         if item_count < 0:
             raise RuntimeError(f"graph sidecar lacks nonnegative item_count: {name}")
-        offsets_path = data_prefix.parent / offsets_name
+        offsets_path = _safe_prefix_file(data_prefix.parent, offsets_name)
         receipt, offsets = _csr_offsets_receipt(
             offsets_path,
             document_count=document_count,
@@ -188,6 +214,21 @@ def derive_graph_capacity_receipt(
         "derivation": "max_per_fixed_capacity_document_from_csr_offsets_v1",
         "sidecars": sidecar_receipts,
     }
+
+
+def derive_graph_capacity_receipt(
+    data_prefix: Path,
+    *,
+    sequence_length: int,
+) -> dict[str, object]:
+    """Derive exact graph tensor capacities from a manifest-bound CSR prefix."""
+    data_prefix = data_prefix.resolve()
+    manifest, _referenced = _validate_prefix_manifest_contract(data_prefix)
+    return _derive_graph_capacity_from_manifest(
+        data_prefix,
+        manifest=manifest,
+        sequence_length=sequence_length,
+    )
 
 
 def write_graph_capacity_receipt(
@@ -272,10 +313,16 @@ def _profile_environment(
     sequence_length: int,
     micro_batch_size: int,
     fp8_recipe: str,
-    graph_max_edges: int,
-    graph_max_chunks: int,
-    enable_dsa_patch: bool,
+    graph_max_edges: int | None = None,
+    graph_max_chunks: int | None = None,
+    enable_dsa_patch: bool = True,
 ) -> dict[str, str]:
+    if graph_max_edges is None or graph_max_chunks is None:
+        raise ValueError(
+            "H200 preflight requires graph capacities derived from CSR offsets"
+        )
+    if graph_max_edges <= 0 or graph_max_chunks <= 0:
+        raise ValueError("derived graph capacities must be positive")
     profile = get_run_profile("h200_cpp_world_mini")
     profile.training.seq_length = sequence_length
     profile.training.micro_batch_size = micro_batch_size
@@ -296,6 +343,7 @@ def _profile_environment(
             "CPPMEGA_GRAPH_MAX_CHUNKS": str(graph_max_chunks),
             "CPPMEGA_DSA_PATCH_ENABLED": "1" if enable_dsa_patch else "0",
             "CPPMEGA_DSA_GRAPH_AUX_ENABLED": "1",
+            "CPPMEGA_OBJECTIVE_CONTRACT_REQUIRED": "1",
             "CPPMEGA_DSA_GRAPH_AUX_WEIGHT": "1",
             "CPPMEGA_DSA_INDEXER_LOSS_COEFF": "0.001",
             "CPPMEGA_DSA_SKIP_INDEXER_LOSS": "0",
@@ -512,7 +560,12 @@ def _load_backend_dispatch_receipt(
     return receipt
 
 
-def _validate_graph_prior_receipt(receipt: object) -> dict[str, object]:
+def _validate_graph_prior_receipt(
+    receipt: object,
+    *,
+    expected_beta: float | None = None,
+    require_selector: bool = False,
+) -> dict[str, object]:
     if not isinstance(receipt, dict):
         raise RuntimeError("DSA graph prior receipt must be an object")
     if receipt.get("status") != "verified":
@@ -521,9 +574,52 @@ def _validate_graph_prior_receipt(receipt: object) -> dict[str, object]:
         raise RuntimeError(
             "DSA graph prior receipt consumer must be exactly dsa_indexer"
         )
+    if receipt.get("bias_beta") != graph_bias_beta_binding(expected_beta):
+        raise RuntimeError("DSA graph prior receipt beta binding is missing or stale")
+    if receipt.get("graph_recipe") != stage1_graph_recipe_binding():
+        raise RuntimeError("DSA graph prior receipt graph recipe is missing or stale")
     prior = receipt.get("prior")
     if not isinstance(prior, dict) or int(prior.get("nonzero", 0)) <= 0:
         raise RuntimeError("DSA graph prior receipt lacks a nonzero prior")
+    selector = receipt.get("selector")
+    if selector is not None:
+        if (
+            not isinstance(selector, dict)
+            or selector.get("schema") != "cppmega_h200_dsa_selector_v1"
+            or selector.get("status") != "verified"
+            or selector.get("formula") != "I_neural + beta*S_graph -> mask -> topk"
+        ):
+            raise RuntimeError("DSA selector receipt is malformed")
+        observations = selector.get("observations")
+        if not isinstance(observations, list) or not observations:
+            raise RuntimeError("DSA selector receipt lacks observations")
+        for observation in observations:
+            if not isinstance(observation, dict):
+                raise RuntimeError("DSA selector observation must be an object")
+            if observation.get("beta") != receipt.get("bias_beta"):
+                raise RuntimeError("DSA selector observation beta binding is stale")
+            if observation.get("indices_match") is not True:
+                raise RuntimeError("DSA selector observation did not verify top-k")
+            for field in ("neural", "graph", "post_add", "post_mask"):
+                tensor = observation.get(field)
+                if (
+                    not isinstance(tensor, dict)
+                    or not re.fullmatch(r"[0-9a-f]{64}", str(tensor.get("sha256", "")))
+                ):
+                    raise RuntimeError(f"DSA selector observation lacks {field} digest")
+            topk = observation.get("topk_indices")
+            if (
+                not isinstance(topk, dict)
+                or not re.fullmatch(r"[0-9a-f]{64}", str(topk.get("sha256", "")))
+                or not isinstance(topk.get("sample"), list)
+            ):
+                raise RuntimeError("DSA selector observation lacks top-k evidence")
+            if float(observation.get("equation_max_abs_error", math.inf)) > 1e-5:
+                raise RuntimeError("DSA selector neural+graph equation is not verified")
+            if float(observation.get("mask_max_abs_error", math.inf)) > 1e-5:
+                raise RuntimeError("DSA selector mask equation is not verified")
+    elif require_selector:
+        raise RuntimeError("DSA graph prior receipt lacks selector-level top-k evidence")
     return receipt
 
 
@@ -531,6 +627,7 @@ def _dsa_graph_gradient_evidence(
     text: str,
     *,
     expected_coefficient: float,
+    expected_beta: float | None = None,
 ) -> dict[str, object]:
     objective_records: list[dict[str, object]] = []
     gradient_records: list[dict[str, object]] = []
@@ -569,6 +666,11 @@ def _dsa_graph_gradient_evidence(
             raise RuntimeError(
                 "DSA graph receipt coefficient differs from the configured indexer coefficient"
             )
+        if (
+            expected_beta is not None
+            and record.get("bias_beta") != graph_bias_beta_binding(expected_beta)
+        ):
+            raise RuntimeError("DSA graph receipt beta binding is missing or stale")
         coefficients.append(coefficient)
 
     for record in gradient_records:
@@ -609,6 +711,85 @@ def _dsa_graph_gradient_evidence(
     }
 
 
+def _load_stack_lock(path: Path = STACK_LOCK_PATH) -> dict[str, object]:
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"STACK.lock must be a regular file: {path}")
+    try:
+        import yaml
+    except ImportError as error:
+        raise RuntimeError(
+            "H200 preflight requires PyYAML to parse the authoritative STACK.lock"
+        ) from error
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("STACK.lock must decode to an object")
+    return payload
+
+
+def validate_stack_compatibility(
+    stack_lock: dict[str, object],
+    *,
+    python_version: tuple[int, int],
+    torch_version: object,
+    cuda_runtime: object,
+    transformer_engine_version: object,
+    imported_modules: Iterable[str],
+) -> dict[str, object]:
+    base = stack_lock.get("base")
+    wheels = stack_lock.get("wheels")
+    if not isinstance(base, dict) or not isinstance(wheels, dict):
+        raise RuntimeError("STACK.lock lacks base/wheels contracts")
+    te = wheels.get("transformer_engine")
+    if not isinstance(te, dict):
+        raise RuntimeError("STACK.lock lacks transformer_engine contract")
+
+    expected_python = str(base.get("python", ""))
+    actual_python = f"{python_version[0]}.{python_version[1]}"
+    if actual_python != expected_python:
+        raise RuntimeError(
+            f"Python version mismatch: runtime={actual_python} STACK.lock={expected_python}"
+        )
+    expected_torch = str(base.get("torch", ""))
+    if str(torch_version) != expected_torch:
+        raise RuntimeError(
+            f"torch version mismatch: runtime={torch_version!r} "
+            f"STACK.lock={expected_torch!r}"
+        )
+    cuda_image = str(base.get("cuda_image", ""))
+    match = re.search(r"cuda:(\d+\.\d+)", cuda_image)
+    if match is None:
+        raise RuntimeError("STACK.lock base.cuda_image does not encode a CUDA version")
+    expected_cuda = match.group(1)
+    if str(cuda_runtime) != expected_cuda:
+        raise RuntimeError(
+            f"CUDA runtime mismatch: torch={cuda_runtime!r} "
+            f"STACK.lock={expected_cuda!r}"
+        )
+    expected_te = str(te.get("version", ""))
+    actual_te = str(transformer_engine_version)
+    if not (
+        actual_te == expected_te
+        or actual_te.startswith(expected_te + ".")
+        or actual_te.startswith(expected_te + "+")
+    ):
+        raise RuntimeError(
+            "Transformer Engine version mismatch: "
+            f"runtime={actual_te!r} STACK.lock={expected_te!r}"
+        )
+    imported = set(imported_modules)
+    missing = sorted(set(STACK_REQUIRED_IMPORTS) - imported)
+    if missing:
+        raise RuntimeError(f"required H200 extension imports are missing: {missing}")
+    return {
+        "status": "verified",
+        "python": expected_python,
+        "torch": expected_torch,
+        "cuda_runtime": expected_cuda,
+        "transformer_engine": expected_te,
+        "required_imports": sorted(STACK_REQUIRED_IMPORTS),
+    }
+
+
 def _stack_report(environment: dict[str, str]) -> dict[str, object]:
     import torch
 
@@ -621,14 +802,7 @@ def _stack_report(environment: dict[str, str]) -> dict[str, object]:
             f"capability={torch.cuda.get_device_capability(0)!r}"
         )
     modules = {}
-    base_modules = (
-        "torch",
-        "transformer_engine",
-        "transformer_engine.pytorch",
-        "flash_attn",
-        "megatron.core",
-        "cppmega",
-    )
+    base_modules = ("torch", *STACK_REQUIRED_IMPORTS)
     backend_claims = _claimed_backend_modules(environment)
     for name in (*base_modules, *backend_claims):
         module = importlib.import_module(name)
@@ -636,6 +810,15 @@ def _stack_report(environment: dict[str, str]) -> dict[str, object]:
             "file": getattr(module, "__file__", None),
             "version": getattr(module, "__version__", None),
         }
+    stack_lock = _load_stack_lock()
+    compatibility = validate_stack_compatibility(
+        stack_lock,
+        python_version=(sys.version_info.major, sys.version_info.minor),
+        torch_version=torch.__version__,
+        cuda_runtime=torch.version.cuda,
+        transformer_engine_version=modules["transformer_engine"]["version"],
+        imported_modules=modules,
+    )
     nvidia_smi = subprocess.run(
         [
             "nvidia-smi",
@@ -658,19 +841,30 @@ def _stack_report(environment: dict[str, str]) -> dict[str, object]:
         },
         "nvidia_smi": nvidia_smi,
         "backend_claims": list(backend_claims),
+        "stack_lock": {
+            "path": str(STACK_LOCK_PATH),
+            "sha256": _sha256(STACK_LOCK_PATH),
+            "compatibility": compatibility,
+        },
     }
 
 
 def _iteration_evidence(text: str, *, expected_iteration: int) -> dict[str, object]:
-    if not re.search(
-        rf"iteration\s+{expected_iteration}/\s*{expected_iteration}", text
-    ):
+    iteration_pattern = re.compile(
+        rf"\biteration\s+{expected_iteration}\s*/\s*{expected_iteration}\b",
+        flags=re.IGNORECASE,
+    )
+    iteration_lines = [
+        line for line in text.splitlines() if iteration_pattern.search(line)
+    ]
+    if not iteration_lines:
         raise RuntimeError(
             f"H200 preflight log lacks iteration {expected_iteration} completion"
         )
+    iteration_text = iteration_lines[-1]
 
     def last_float(label: str, pattern: str) -> float:
-        values = re.findall(pattern, text, flags=re.IGNORECASE)
+        values = re.findall(pattern, iteration_text, flags=re.IGNORECASE)
         if not values:
             raise RuntimeError(f"H200 preflight log lacks {label}")
         try:
@@ -689,10 +883,14 @@ def _iteration_evidence(text: str, *, expected_iteration: int) -> dict[str, obje
             f"H200 preflight requires finite positive grad norm, got {grad_norm}"
         )
     skipped_values = re.findall(
-        r"number of skipped iterations:\s*(\d+)", text, flags=re.IGNORECASE
+        r"number of skipped iterations:\s*(\d+)",
+        iteration_text,
+        flags=re.IGNORECASE,
     )
     nan_values = re.findall(
-        r"number of nan iterations:\s*(\d+)", text, flags=re.IGNORECASE
+        r"number of nan iterations:\s*(\d+)",
+        iteration_text,
+        flags=re.IGNORECASE,
     )
     if not skipped_values or int(skipped_values[-1]) != 0:
         raise RuntimeError("H200 preflight log reports skipped iterations")
@@ -713,6 +911,7 @@ def write_training_loss_receipt(
     expected_iteration: int,
     output: Path,
     expected_dsa_coefficient: float | None = None,
+    expected_dsa_beta: float | None = None,
 ) -> dict[str, object]:
     if expected_iteration <= 0:
         raise ValueError("expected_iteration must be positive")
@@ -734,6 +933,7 @@ def write_training_loss_receipt(
         receipt["dsa_graph_gradient"] = _dsa_graph_gradient_evidence(
             log_text,
             expected_coefficient=expected_dsa_coefficient,
+            expected_beta=expected_dsa_beta,
         )
     _write_json_atomic(output, receipt)
     return receipt
@@ -897,6 +1097,26 @@ def _bundle_identity(
     return manifest, dict(sorted(prefix_hashes.items()))
 
 
+def _objective_graph_binding(
+    objective_descriptor: dict[str, object],
+    graph_contract: dict[str, object],
+    environment: dict[str, str],
+) -> dict[str, object]:
+    payload = objective_descriptor.get("payload")
+    if not isinstance(payload, dict):
+        raise RuntimeError("H200 objective receipt lacks a validated payload")
+    return {
+        "objective_schema": objective_descriptor.get("schema"),
+        "objective_sha256": objective_descriptor.get("sha256"),
+        "objective_ids": dict(payload["objective_ids"]),
+        "configured_rates": dict(payload["configured_rates"]),
+        "planned_samples": dict(payload["planned_samples"]),
+        "totals": dict(payload["totals"]),
+        "graph_recipe": dict(graph_contract["recipe"]),
+        "bias_beta": graph_bias_beta_binding(resolve_graph_bias_beta(environment)),
+    }
+
+
 def _finalize_bound_receipt(
     path: Path, *, expected_pending: dict[str, object], final: dict[str, object]
 ) -> dict[str, object]:
@@ -974,6 +1194,7 @@ def _run_phase(
     dsa_graph_gradient = _dsa_graph_gradient_evidence(
         text,
         expected_coefficient=float(environment["CPPMEGA_DSA_INDEXER_LOSS_COEFF"]),
+        expected_beta=resolve_graph_bias_beta(environment),
     )
     load_evidence = (
         _checkpoint_load_evidence(
@@ -994,20 +1215,30 @@ def _run_phase(
     batch = json.loads(batch_receipt.read_text(encoding="utf-8"))
     active_graph = batch.get("active_graph")
     source_provenance = batch.get("source_provenance")
+    objective_mix = batch.get("objective_mix")
     if (
         batch.get("status") != "verified"
         or not isinstance(active_graph, dict)
         or int(active_graph.get("route_edge_count", 0)) <= 0
         or not isinstance(source_provenance, dict)
         or int(source_provenance.get("minimum_source_doc_id", 0)) <= 0
+        or not isinstance(objective_mix, dict)
+        or not objective_mix.get("observed_objective_ids")
     ):
-        raise RuntimeError(f"H200 preflight {name} production batch is not verified")
+        raise RuntimeError(
+            f"H200 preflight {name} production batch is not verified or lacks "
+            "objective mix accounting"
+        )
     if not graph_prior_receipt.is_file():
         raise RuntimeError(
             f"H200 preflight {name} did not record graph-prior consumption"
         )
     graph_prior = json.loads(graph_prior_receipt.read_text(encoding="utf-8"))
-    _validate_graph_prior_receipt(graph_prior)
+    _validate_graph_prior_receipt(
+        graph_prior,
+        expected_beta=resolve_graph_bias_beta(environment),
+        require_selector=True,
+    )
     if not checkpoint_state_receipt.is_file():
         raise RuntimeError(
             f"H200 preflight {name} did not record checkpoint runtime state"
@@ -1109,6 +1340,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-prefix", type=Path, required=True)
     parser.add_argument("--tokenizer-model", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument(
+        "--megatron-commit",
+        default=os.environ.get("CPPMEGA_MEGATRON_COMMIT"),
+        help="exact Megatron-LM commit; defaults to CPPMEGA_MEGATRON_COMMIT",
+    )
     parser.add_argument("--sequence-length", type=int, required=True)
     parser.add_argument("--micro-batch-size", type=int, default=1)
     parser.add_argument("--fp8-recipe", choices=("off", "tensorwise"), default="off")
@@ -1133,6 +1369,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Iterable[str] | None = None) -> int:
     raw_argv = list(argv) if argv is not None else list(sys.argv[1:])
     args = build_arg_parser().parse_args(raw_argv)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", args.run_id):
+        raise ValueError("H200 preflight run_id is not a safe identifier")
+    if not isinstance(args.megatron_commit, str) or re.fullmatch(
+        r"[0-9a-f]{40}(?:[0-9a-f]{24})?", args.megatron_commit
+    ) is None:
+        raise ValueError(
+            "H200 preflight requires --megatron-commit or "
+            "CPPMEGA_MEGATRON_COMMIT with an exact lowercase Git SHA"
+        )
     if args.sequence_length <= 0 or args.micro_batch_size <= 0 or args.hash_jobs <= 0:
         raise ValueError("sequence length, micro batch size, and hash jobs must be positive")
 
@@ -1141,6 +1386,10 @@ def main(argv: Iterable[str] | None = None) -> int:
     tokenizer_model = args.tokenizer_model.resolve()
     manifest, prefix_manifest_hashes = _bundle_identity(
         bundle_root, data_prefix, hash_jobs=args.hash_jobs
+    )
+    implementation = complete_training_implementation_binding(
+        manifest.get("implementation"),
+        megatron_commit=args.megatron_commit,
     )
     tokenizer_descriptor = manifest["tokenizer"]
     expected_tokenizer = (bundle_root / str(tokenizer_descriptor["path"])).resolve()
@@ -1185,6 +1434,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         environment=environment,
         require_included_auxiliary=True,
     )
+    objective_graph_binding = _objective_graph_binding(
+        objective_descriptor,
+        graph_contract,
+        environment,
+    )
     backend_claims = _claimed_backend_modules(environment)
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1225,6 +1479,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "enable_dsa_patch": args.enable_dsa_patch,
         "graph_max_edges": graph_capacity["graph_max_edges"],
         "graph_max_chunks": graph_capacity["graph_max_chunks"],
+        "objective_graph_binding": objective_graph_binding,
         "checkpoint_root": str(checkpoint_root),
         "cold_checkpoint_root": str(cold_checkpoint_root),
     }
@@ -1232,6 +1487,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "bundle_id": str(manifest["bundle_id"]),
         "artifact_set_sha256": str(manifest["artifact_set_sha256"]),
         "prefix_manifest_sha256s": prefix_manifest_hashes,
+        "implementation": implementation,
     }
 
     with tempfile.TemporaryDirectory(prefix="cppmega-h200-preflight-") as raw_workdir:
@@ -1300,6 +1556,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 "micro_batch_size": args.micro_batch_size,
                 "graph_capacity": graph_capacity,
                 "graph_capacity_receipt": str(graph_capacity_output),
+                "objective_graph_binding": objective_graph_binding,
             },
             "checkpoint": {
                 "root": str(checkpoint_root),

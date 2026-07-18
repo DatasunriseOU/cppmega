@@ -173,7 +173,10 @@ def _objective_contract() -> dict[str, object]:
             "layer_reduction": "sum",
             "bce_weight": "1/10",
             "coverage_weight": "1/20",
+            "bias_beta": "1",
             "topk": STAGE1_GRAPH_TOPK,
+            "score_formula": "i_neural_plus_beta_s_graph_v1",
+            "score_stage": "before_topk",
             "pos_weight": "1",
             "margin": "1",
             "included_in_total_loss": True,
@@ -209,6 +212,7 @@ def _write_objective_artifact(input_dir: Path) -> Path:
     shards = sorted(input_dir.glob("*.parquet"))
     artifact = {
         "schema": OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA,
+        "graph_recipe": stage1_graph_recipe_binding(),
         "documents": contract["totals"]["samples"],  # type: ignore[index]
         "objective_contract": {
             "path": contract_path.name,

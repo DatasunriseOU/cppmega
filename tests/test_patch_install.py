@@ -37,11 +37,16 @@ def test_default_dense_on_with_routes_off_does_not_raise():
     assert not cfg.graph_routes_enabled
 
 
-def test_valid_full_stack(monkeypatch):
-    monkeypatch.setenv("CPPMEGA_STRUCTURE_ENABLED", "1")
-    monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
-    monkeypatch.setenv("CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS", "1")
-    cfg = CppMegaFeatureConfig.from_env()
+def test_valid_full_stack():
+    cfg = CppMegaFeatureConfig.from_env(
+        {
+            "CPPMEGA_STRUCTURE_ENABLED": "1",
+            "CPPMEGA_GRAPH_ROUTES_ENABLED": "1",
+            "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS": "1",
+            "CPPMEGA_GRAPH_MAX_EDGES": "7",
+            "CPPMEGA_GRAPH_MAX_CHUNKS": "5",
+        }
+    )
     assert cfg.structure_enabled and cfg.graph_routes_enabled and cfg.graph_dense_attention_bias
 
 
@@ -49,6 +54,16 @@ def test_graph_routes_require_structure(monkeypatch):
     monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
     with pytest.raises(ValueError, match="requires CPPMEGA_STRUCTURE_ENABLED"):
         CppMegaFeatureConfig.from_env()
+
+
+def test_graph_routes_require_csr_derived_capacities():
+    with pytest.raises(ValueError, match="CPPMEGA_GRAPH_MAX_EDGES is required"):
+        CppMegaFeatureConfig.from_env(
+            {
+                "CPPMEGA_STRUCTURE_ENABLED": "1",
+                "CPPMEGA_GRAPH_ROUTES_ENABLED": "1",
+            }
+        )
 
 
 def test_explicit_dense_requires_routes(monkeypatch):
@@ -85,10 +100,16 @@ def test_install_applies_in_canonical_order(monkeypatch):
     monkeypatch.setattr(te, "apply_te_checkpoint_kwarg_patch", lambda: calls.append("te") or True)
     monkeypatch.setattr(dsa, "apply_dsa_indexer_fused_patch", lambda: calls.append("dsa") or True)
     monkeypatch.setattr(gr, "apply_graph_route_attention_bias_patch", lambda: calls.append("gr") or True)
-    monkeypatch.setenv("CPPMEGA_STRUCTURE_ENABLED", "1")
-    monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
+    config = CppMegaFeatureConfig.from_env(
+        {
+            "CPPMEGA_STRUCTURE_ENABLED": "1",
+            "CPPMEGA_GRAPH_ROUTES_ENABLED": "1",
+            "CPPMEGA_GRAPH_MAX_EDGES": "7",
+            "CPPMEGA_GRAPH_MAX_CHUNKS": "5",
+        }
+    )
 
-    cfg = install_cppmega_stack()
+    cfg = install_cppmega_stack(config)
     assert calls == ["te", "dsa", "gr"]  # canonical order, structure imported last
     assert cfg.structure_enabled and cfg.graph_routes_enabled
 

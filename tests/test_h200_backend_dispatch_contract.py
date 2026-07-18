@@ -4,12 +4,13 @@ import json
 
 import pytest
 
+from cppmega.receipt_binding import build_implementation_binding
 from scripts.h200_megatron_preflight import _load_backend_dispatch_receipt
 
 
 def _binding() -> dict[str, object]:
     return {
-        "schema": "cppmega_case6_receipt_binding_v1",
+        "schema": "cppmega_case6_receipt_binding_v2",
         "bundle_id": "bundle-1",
         "artifact_set_sha256": "a" * 64,
         "prefix_manifest_sha256s": {"data/train.json": "b" * 64},
@@ -17,6 +18,15 @@ def _binding() -> dict[str, object]:
         "config_sha256": "d" * 64,
         "command_sha256": "e" * 64,
         "run_id": "run-1",
+        "implementation": build_implementation_binding(
+            cppmega_commit="1" * 40,
+            cppmega_tree_sha256="2" * 64,
+            megatron_commit="3" * 40,
+            cppmega_mlx_commit="4" * 40,
+            cppmega_mlx_tree_sha256="5" * 64,
+            clang_indexer_sha256="6" * 64,
+            clang_indexer_dependency_closure_sha256="7" * 64,
+        ),
     }
 
 

@@ -10,7 +10,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from cppmega.megatron.graph_objective_loss import validate_runtime_graph_contract
+from cppmega.megatron.graph_objective_loss import (
+    graph_bias_beta_binding,
+    validate_runtime_graph_contract,
+)
 from cppmega.megatron.graph_recipe import (
     stage1_graph_recipe_binding,
     stage1_graph_recipe_payload,
@@ -203,6 +206,7 @@ def test_production_preflight_uses_derived_capacity_and_active_dsa_auxiliary():
     assert environment["CPPMEGA_GRAPH_MAX_CHUNKS"] == "419"
     assert environment["CPPMEGA_DSA_PATCH_ENABLED"] == "1"
     assert environment["CPPMEGA_DSA_GRAPH_AUX_ENABLED"] == "1"
+    assert environment["CPPMEGA_OBJECTIVE_CONTRACT_REQUIRED"] == "1"
     assert environment["CPPMEGA_DSA_GRAPH_AUX_WEIGHT"] == "1"
     assert environment["CPPMEGA_DSA_INDEXER_LOSS_COEFF"] == "0.001"
     assert environment["CPPMEGA_DSA_SKIP_INDEXER_LOSS"] == "0"
@@ -325,20 +329,34 @@ def test_preflight_validates_graph_contract_before_model_wrapper() -> None:
 
 
 def test_dsa_graph_receipt_requires_actual_module_loss_coefficient_and_gradients():
+    objective = {
+        "layer_number": 3,
+        "actual_dsa_module": (
+            "megatron.core.transformer.experimental_attention_variant."
+            "dsa.DSAttention"
+        ),
+        "effective_coefficient": 0.001,
+        "bias_beta": graph_bias_beta_binding(1.0),
+        "graph_loss": 0.25,
+    }
+    gradient = {
+        "layer_number": 3,
+        "actual_indexer_module": (
+            "megatron.core.transformer.experimental_attention_variant."
+            "dsa.DSAIndexer"
+        ),
+        "grad_norm": 0.5,
+        "parameter_grad_norms": {"linear_wk.weight": 0.5},
+    }
     text = (
-        'CPPMEGA_DSA_GRAPH_OBJECTIVE {"layer_number": 3, '
-        '"actual_dsa_module": '
-        '"megatron.core.transformer.experimental_attention_variant.dsa.DSAttention", '
-        '"effective_coefficient": 0.001, "graph_loss": 0.25}\n'
-        'CPPMEGA_DSA_INDEXER_GRAD {"layer_number": 3, '
-        '"actual_indexer_module": '
-        '"megatron.core.transformer.experimental_attention_variant.dsa.DSAIndexer", '
-        '"grad_norm": 0.5, "parameter_grad_norms": {"linear_wk.weight": 0.5}}\n'
+        f"CPPMEGA_DSA_GRAPH_OBJECTIVE {json.dumps(objective)}\n"
+        f"CPPMEGA_DSA_INDEXER_GRAD {json.dumps(gradient)}\n"
     )
 
     evidence = preflight._dsa_graph_gradient_evidence(
         text,
         expected_coefficient=0.001,
+        expected_beta=1.0,
     )
 
     assert evidence["actual_dsa_modules"] == [
@@ -356,6 +374,26 @@ def test_graph_prior_receipt_requires_dsa_indexer_consumer():
                 "consumer": "dense_attention",
                 "prior": {"nonzero": 1},
             }
+        )
+
+
+def test_graph_prior_receipt_rejects_stale_beta_binding():
+    with pytest.raises(RuntimeError, match="beta binding"):
+        preflight._validate_graph_prior_receipt(
+            {
+                "status": "verified",
+                "consumer": "dsa_indexer",
+                "bias_beta": {
+                    "canonical_env": "CPPMEGA_GRAPH_BIAS_BETA",
+                    "legacy_envs": [
+                        "CPPMEGA_DSA_GRAPH_BIAS_BETA",
+                        "CPPMEGA_GRAPH_ATTENTION_BIAS_BETA",
+                    ],
+                    "value": "2",
+                },
+                "prior": {"nonzero": 1},
+            },
+            expected_beta=1.0,
         )
 
 

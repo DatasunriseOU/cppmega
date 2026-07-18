@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from cppmega.receipt_binding import build_implementation_binding
 import scripts.data.restore_megatron_bundle_from_nebius_s3 as restore
 from scripts.data.restore_megatron_bundle_from_nebius_s3 import (
     _acquire_archive,
@@ -364,6 +365,13 @@ def test_validate_restore_run_id_accepts_safe_identifier() -> None:
     )
 
 
+def test_fresh_restore_rejects_nonempty_output_root(tmp_path: Path) -> None:
+    (tmp_path / "stale-marker").write_text("keep", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="fresh restore requires an empty output root"):
+        restore._require_empty_output_root(tmp_path)
+
+
 def test_restore_requires_space_for_archive_expansion(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "scripts.data.restore_megatron_bundle_from_nebius_s3.shutil.disk_usage",
@@ -380,7 +388,7 @@ def test_restore_rejects_legacy_manifest_before_archive_download(
     tmp_path, monkeypatch
 ):
     logical_manifest = {
-        "schema": "cppmega_megatron_bundle_v1",
+        "schema": "cppmega_megatron_bundle_v2",
         "bundle_id": "bundle-1",
         "tokenizer_contract": "megacpp-vocab-65536",
         "vocab_size": 65536,
@@ -423,6 +431,8 @@ def test_restore_rejects_legacy_manifest_before_archive_download(
                 "bundle-1",
                 "--run-id",
                 "preflight",
+                "--megatron-commit",
+                "1" * 40,
             ]
         )
 
@@ -494,12 +504,61 @@ def test_archive_download_never_promotes_partial_payload(tmp_path, monkeypatch):
     assert not archive.with_name(archive.name + ".receipt.json").exists()
 
 
+def test_archive_download_reacquires_matching_archive_with_failed_receipt(tmp_path):
+    payload = b"reacquired archive"
+    digest = hashlib.sha256(payload).hexdigest()
+    archive = tmp_path / ".bundle.tar.zst"
+    archive.write_bytes(payload)
+    receipt_path = archive.with_name(archive.name + ".receipt.json")
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "schema": "cppmega_megatron_archive_download_receipt_v1",
+                "uri": "s3://bucket/bundle.tar.zst",
+                "size": len(payload),
+                "sha256": digest,
+                "status": "failed",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    aws_bin = tmp_path / "bin"
+    aws_bin.mkdir()
+    marker = tmp_path / "reacquired.marker"
+    aws = aws_bin / "aws"
+    aws.write_text(
+        "#!/bin/sh\n"
+        f"printf reacquired > {marker}\n"
+        "printf 'reacquired archive' > \"$4\"\n",
+        encoding="utf-8",
+    )
+    aws.chmod(0o755)
+
+    result = _acquire_archive(
+        uri="s3://bucket/bundle.tar.zst",
+        archive=archive,
+        endpoint="https://storage.example",
+        env={"PATH": str(aws_bin)},
+        expected_size=len(payload),
+        expected_sha256=digest,
+    )
+
+    assert marker.read_text(encoding="utf-8") == "reacquired"
+    assert result["status"] in {
+        "downloaded_verified",
+        "recovered_download_verified",
+    }
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] != "failed"
+
+
 def test_archive_download_receipt_rejects_stale_case6_binding(tmp_path, monkeypatch):
     payload = b"verified archive"
     digest = hashlib.sha256(payload).hexdigest()
     archive = tmp_path / ".bundle.tar.zst"
     binding = {
-        "schema": "cppmega_case6_receipt_binding_v1",
+        "schema": "cppmega_case6_receipt_binding_v2",
         "bundle_id": "bundle-1",
         "artifact_set_sha256": "a" * 64,
         "prefix_manifest_sha256s": {"data/train.json": "b" * 64},
@@ -507,6 +566,15 @@ def test_archive_download_receipt_rejects_stale_case6_binding(tmp_path, monkeypa
         "config_sha256": "d" * 64,
         "command_sha256": "e" * 64,
         "run_id": "cold-restore-1",
+        "implementation": build_implementation_binding(
+            cppmega_commit="1" * 40,
+            cppmega_tree_sha256="2" * 64,
+            megatron_commit="3" * 40,
+            cppmega_mlx_commit="4" * 40,
+            cppmega_mlx_tree_sha256="5" * 64,
+            clang_indexer_sha256="6" * 64,
+            clang_indexer_dependency_closure_sha256="7" * 64,
+        ),
     }
 
     def fake_download(_uri, destination, *, endpoint, env):

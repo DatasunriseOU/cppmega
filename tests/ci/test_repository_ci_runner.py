@@ -148,6 +148,34 @@ def test_local_macos_uses_owned_source_environment() -> None:
     assert "/nanochat/.venv/" not in host["python"]
 
 
+def test_macos_lane_covers_cross_repo_case_contracts_and_preserves_peer_paths() -> None:
+    lanes = ci.load_lanes(LANES_CONFIG)
+    lane = lanes["macos-contracts"]
+    argv = {
+        argument
+        for command in lane["commands"]
+        for argument in command["argv"]
+    }
+
+    assert {
+        "tests/test_audit_sidecar_parquet.py",
+        "tests/test_case4_identity_parity.py",
+        "tests/test_case5_v7_parser_token_span_regressions.py",
+        "tests/test_case6_nebius_contracts.py",
+        "tests/test_graph_objective_loss.py",
+        "tests/test_graph_recipe.py",
+        "tests/test_megatron_objective_contract.py",
+        "tests/test_prompt_graph_index_loader_contract.py",
+        "tests/test_prompt_graph_schema_v2.py",
+        "tests/test_recipe_artifact_parity.py",
+    }.issubset(argv)
+    assert {
+        "CPPMEGA_MLX_REFERENCE_ROOT",
+        "CPPMEGA_RECIPE_PARITY_PEER_ROOT",
+        "CPPMEGA_RECIPE_PARITY_PYTHON",
+    }.issubset(ci._PASSTHROUGH_ENV)
+
+
 def test_repository_runner_module_entrypoint_executes_cli() -> None:
     runner = REPO_ROOT / "scripts" / "ci" / "repository_runner.py"
     result = subprocess.run(
@@ -337,6 +365,59 @@ def test_sanitized_environment_disables_user_site_and_unsafe_path(
     assert environment["PYTHONNOUSERSITE"] == "1"
     assert environment["PYTHONSAFEPATH"] == "1"
     assert environment["PYTHONPATH"] == str(tmp_path)
+
+
+def test_lane_subprocess_binds_project_imports_to_reviewed_checkout(
+    tmp_path: Path,
+) -> None:
+    foreign_root = tmp_path / "foreign-editable-checkout"
+    foreign_package = foreign_root / "cppmega"
+    foreign_package.mkdir(parents=True)
+    (foreign_package / "__init__.py").write_text(
+        "__file_marker__ = 'foreign'\n", encoding="utf-8"
+    )
+    lanes_path = _minimal_lane_config(
+        tmp_path / "lanes.json",
+        command=[
+            "{python}",
+            "-c",
+            "from pathlib import Path; import cppmega; "
+            "print(Path(cppmega.__file__).resolve())",
+        ],
+    )
+    receipt_dir = tmp_path / "lane-receipt"
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(foreign_root)
+    runner = REPO_ROOT / "scripts" / "ci" / "run_repository_ci.py"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "lane",
+            "--lanes-config",
+            str(lanes_path),
+            "--lane",
+            "local-test",
+            "--repo-root",
+            str(REPO_ROOT),
+            "--receipt-dir",
+            str(receipt_dir),
+            "--python",
+            sys.executable,
+        ],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    log = (receipt_dir / "test-command.log").read_text(encoding="utf-8")
+    assert result.returncode == 0, result.stdout + result.stderr
+    resolved = Path(log.strip()).resolve()
+    assert resolved.is_relative_to(REPO_ROOT)
+    assert not resolved.is_relative_to(foreign_root)
 
 
 def test_run_step_preserves_explicit_test_profile(tmp_path: Path) -> None:
@@ -565,6 +646,39 @@ def test_lane_receipt_captures_provenance_before_and_after_tests(
     assert receipt["provenance"]["unchanged"] is True
 
 
+def test_lane_rejects_a_mismatched_requested_source_commit(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    lanes_path = _minimal_lane_config(tmp_path / "lanes.json")
+    receipt_dir = tmp_path / "lane-receipt"
+    expected_tree = _git(repo, "rev-parse", "HEAD^{tree}")
+
+    exit_code = ci.main(
+        [
+            "lane",
+            "--lanes-config",
+            str(lanes_path),
+            "--lane",
+            "local-test",
+            "--repo-root",
+            str(repo),
+            "--receipt-dir",
+            str(receipt_dir),
+            "--python",
+            sys.executable,
+            "--expected-source-commit",
+            "0" * 40,
+            "--expected-source-tree",
+            expected_tree,
+        ]
+    )
+    receipt = json.loads((receipt_dir / "receipt.json").read_text(encoding="utf-8"))
+
+    assert exit_code == 1
+    assert receipt["status"] == "failed"
+    assert "does not match the requested source commit" in receipt["error"]
+
+
 def test_lane_fails_when_a_test_mutates_the_tracked_worktree(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     _init_repo(repo)
@@ -621,5 +735,6 @@ def test_contract_lane_manifests_include_runner_regressions_and_cuda_probes() ->
         for part in command["argv"]
     ]
     assert "tests/test_inference_generation.py" in mlx_argv
+    assert "tests/test_train_eval_graph_routes.py" in mlx_argv
     assert "tests/test_self_hosted_ci.py" in mlx_argv
     assert "tests/test_workflow_runner_policy.py" in mlx_argv

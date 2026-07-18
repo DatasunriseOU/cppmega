@@ -4,7 +4,7 @@ from importlib.machinery import ModuleSpec
 from pathlib import Path
 import subprocess
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -86,12 +86,19 @@ assert sys.path is before
     "loader_module",
     (prompt_graph_index, data_prompt_graph_index),
 )
-def test_both_loaders_accept_explicit_location_identity_without_signature(loader_module):
+def test_both_loaders_accept_explicit_location_identity_without_signature(
+    loader_module,
+    tmp_path: Path,
+):
+    repo_root = tmp_path / "repo"
+    source = repo_root / "src" / "a.cpp"
+    source.parent.mkdir(parents=True)
+    source.write_text("int run();\n", encoding="utf-8")
     key = (
         "repo_file_location:"
         f"schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}\x1f"
-        "project=owner/repo\x1ffile=src/a.cpp\x1fline=1\x1f"
-        "kind=function\x1fqname=run"
+        "project=owner/repo\x1ffile=src/a.cpp\x1fline=1\x1fcolumn=5\x1f"
+        "kind=FUNCTION_DECL\x1fqname=run"
     )
 
     class _Indexer:
@@ -104,15 +111,29 @@ def test_both_loaders_accept_explicit_location_identity_without_signature(loader
                 "symbol_id": compute_symbol_id(key),
                 "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
                 "qname": "run",
-                "symbol_kind": "function",
+                "symbol_kind": "FUNCTION_DECL",
+                "project": "owner/repo",
+                "file": "src/a.cpp",
+                "line": 1,
+                "column": 5,
+                "provider": "",
+                "include_provenance": "",
             }
 
     identity = loader_module._identity_for_cursor(
         _Indexer(),
-        object(),
-        repo_root=ROOT,
+        SimpleNamespace(
+            location=SimpleNamespace(
+                file=SimpleNamespace(name=str(source)),
+                line=1,
+                column=5,
+            )
+        ),
+        repo_root=repo_root,
         project_id="owner/repo",
         source_path="src/a.cpp",
     )
     assert identity is not None
     assert identity.symbol_key == key
+    assert identity.identity_file == "src/a.cpp"
+    assert identity.identity_column == 5

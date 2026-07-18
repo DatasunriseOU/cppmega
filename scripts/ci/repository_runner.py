@@ -84,13 +84,21 @@ _PASSTHROUGH_ENV = {
     "CUDA_HOME",
     "CUDA_PATH",
     "CUDA_VISIBLE_DEVICES",
+    "CPPMEGA_MEGATRON_COMMIT",
+    "CPPMEGA_MLX_REFERENCE_COMMIT",
     "CPPMEGA_TEST_PROFILE",
+    "CPPMEGA_MLX_REFERENCE_ROOT",
+    "CPPMEGA_RECIPE_PARITY_PEER_ROOT",
+    "CPPMEGA_RECIPE_PARITY_PEER_COMMIT",
+    "CPPMEGA_RECIPE_PARITY_PYTHON",
     "DYLD_LIBRARY_PATH",
     "HOME",
     "LANG",
     "LC_ALL",
     "LC_CTYPE",
     "LD_LIBRARY_PATH",
+    "MEGATRON_LM_REPO",
+    "MEGATRON_ROOT",
     "NVIDIA_VISIBLE_DEVICES",
     "PATH",
     "SSH_AUTH_SOCK",
@@ -1173,6 +1181,14 @@ def run_lane(args: argparse.Namespace) -> int:
             )
         python = _resolve_executable(args.python)
         before = capture_provenance(repo_root)
+        if (
+            args.expected_source_commit
+            and before["head_commit"] != args.expected_source_commit
+        ):
+            raise RepositoryCIError(
+                "staged worktree commit does not match the requested source commit: "
+                f"expected {args.expected_source_commit}, got {before['head_commit']}"
+            )
         if (
             args.expected_source_tree
             and before["head_tree"] != args.expected_source_tree

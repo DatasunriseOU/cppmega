@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
 from cppmega.receipt_binding import (  # noqa: E402
     NO_CHECKPOINT_SHA256,
     build_receipt_binding,
+    complete_training_implementation_binding,
     validate_binding_shape,
     validate_receipt_binding,
 )
@@ -44,6 +45,13 @@ from scripts.data.publish_megatron_bundle_to_nebius_s3 import (  # noqa: E402
 
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_REUSABLE_ARCHIVE_RECEIPT_STATUSES = frozenset(
+    {
+        "recovered_verified",
+        "recovered_download_verified",
+        "downloaded_verified",
+    }
+)
 
 
 def _aws_read(uri: str, *, endpoint: str, env: dict[str, str]) -> bytes:
@@ -138,6 +146,21 @@ def _contained_output_path(output_root: Path, name: str) -> Path:
     return path
 
 
+def _require_empty_output_root(output_root: Path) -> None:
+    if not output_root.exists():
+        return
+    if output_root.is_symlink() or not output_root.is_dir():
+        raise RuntimeError(
+            "fresh restore requires an empty output root directory: "
+            f"{output_root}"
+        )
+    try:
+        next(output_root.iterdir())
+    except StopIteration:
+        return
+    raise RuntimeError(f"fresh restore requires an empty output root: {output_root}")
+
+
 def _remove_partial_tree(partial: Path) -> None:
     if not partial.exists() and not partial.is_symlink():
         return
@@ -149,6 +172,8 @@ def _remove_partial_tree(partial: Path) -> None:
 def _acquire_restore_lock(output_root: Path, *, bundle_id: str, run_id: str):
     run_id = _validate_run_id(run_id)
     lock_path = _contained_output_path(output_root, f".{bundle_id}.restore.lock")
+    if lock_path.is_symlink() or (lock_path.exists() and not lock_path.is_file()):
+        raise ValueError(f"restore lock path is not a regular file: {lock_path}")
     handle = lock_path.open("a+", encoding="utf-8")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -172,6 +197,9 @@ def _acquire_archive(
 ) -> dict[str, object]:
     download = archive.with_name(archive.name + ".download")
     receipt_path = _archive_receipt_path(archive)
+    for path in (archive, download, receipt_path):
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise ValueError(f"restore archive path is not a regular file: {path}")
     binding = {
         "schema": "cppmega_megatron_archive_download_receipt_v1",
         "uri": uri,
@@ -190,23 +218,32 @@ def _acquire_archive(
             raise ValueError("existing archive does not match transport descriptor")
         if receipt_path.exists():
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-            if any(
-                receipt.get(key) != value
-                for key, value in binding.items()
-                if key != "binding"
-            ):
-                raise ValueError("archive download receipt binding mismatch")
-            if receipt_binding is not None:
-                try:
-                    validate_receipt_binding(
-                        receipt.get("binding"),
-                        expected=receipt_binding,
-                        where="archive download receipt binding",
-                    )
-                except (RuntimeError, ValueError) as error:
-                    raise ValueError(
-                        f"archive download receipt binding mismatch: {error}"
-                    ) from error
+            if receipt.get("status") not in _REUSABLE_ARCHIVE_RECEIPT_STATUSES:
+                archive.unlink()
+                receipt_path.unlink()
+            else:
+                if any(
+                    receipt.get(key) != value
+                    for key, value in binding.items()
+                    if key != "binding"
+                ):
+                    raise ValueError("archive download receipt binding mismatch")
+                if receipt_binding is not None:
+                    try:
+                        validate_receipt_binding(
+                            receipt.get("binding"),
+                            expected=receipt_binding,
+                            where="archive download receipt binding",
+                        )
+                    except (RuntimeError, ValueError) as error:
+                        raise ValueError(
+                            f"archive download receipt binding mismatch: {error}"
+                        ) from error
+                return {
+                    **binding,
+                    "status": "reused_verified",
+                    "receipt": str(receipt_path),
+                }
         else:
             _write_json_atomic(
                 receipt_path,
@@ -216,7 +253,11 @@ def _acquire_archive(
                     "verified_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
-        return {**binding, "status": "reused_verified", "receipt": str(receipt_path)}
+            return {
+                **binding,
+                "status": "reused_verified",
+                "receipt": str(receipt_path),
+            }
 
     if receipt_path.exists():
         receipt_path.unlink()
@@ -498,6 +539,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--bundle-id")
     parser.add_argument("--run-id", required=True)
+    parser.add_argument(
+        "--megatron-commit",
+        default=os.environ.get("CPPMEGA_MEGATRON_COMMIT"),
+        help="exact Megatron-LM commit; defaults to CPPMEGA_MEGATRON_COMMIT",
+    )
     parser.add_argument("--bucket", default=DEFAULT_BUCKET)
     parser.add_argument("--prefix", default=DEFAULT_PREFIX)
     parser.add_argument("--endpoint-url", default=DEFAULT_ENDPOINT)
@@ -505,6 +551,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hash-jobs", type=int, default=4)
     parser.add_argument("--free-space-headroom-gb", type=int, default=10)
     parser.add_argument("--keep-archive", action="store_true")
+    parser.add_argument(
+        "--require-empty-output-root",
+        action="store_true",
+        help="refuse reuse and require the restore output root to start empty",
+    )
     return parser
 
 
@@ -512,10 +563,24 @@ def main(argv: Iterable[str] | None = None) -> int:
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     args = build_arg_parser().parse_args(raw_argv)
     args.run_id = _validate_run_id(args.run_id)
+    if not isinstance(args.megatron_commit, str) or re.fullmatch(
+        r"[0-9a-f]{40}(?:[0-9a-f]{24})?", args.megatron_commit
+    ) is None:
+        raise ValueError(
+            "bundle restore requires --megatron-commit or "
+            "CPPMEGA_MEGATRON_COMMIT with an exact lowercase Git SHA"
+        )
     if args.bundle_id is not None and not re.fullmatch(
         r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", args.bundle_id
     ):
         raise ValueError(f"unsafe requested bundle ID: {args.bundle_id!r}")
+    if args.hash_jobs <= 0 or args.free_space_headroom_gb < 0:
+        raise ValueError(
+            "hash jobs must be positive and free-space headroom nonnegative"
+        )
+    output_root = args.output_root.expanduser().absolute()
+    if args.require_empty_output_root:
+        _require_empty_output_root(output_root)
     _load_env_file(args.env_file)
     env = _s3_env()
     prefix = args.prefix.strip("/")
@@ -567,8 +632,14 @@ def main(argv: Iterable[str] | None = None) -> int:
         transport["artifact_bytes"]
     ):
         raise ValueError("remote logical manifest counts do not match transport")
+    implementation = complete_training_implementation_binding(
+        logical_manifest.get("implementation"),
+        megatron_commit=args.megatron_commit,
+    )
 
-    output_root = args.output_root.resolve()
+    if args.require_empty_output_root:
+        _require_empty_output_root(output_root)
+    output_root = output_root.resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     restore_config = {
         "schema": "cppmega_nebius_bundle_restore_config_v1",
@@ -580,6 +651,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "hash_jobs": args.hash_jobs,
         "free_space_headroom_gb": args.free_space_headroom_gb,
         "keep_archive": args.keep_archive,
+        "require_empty_output_root": args.require_empty_output_root,
     }
     receipt_binding = build_receipt_binding(
         bundle_id=bundle_id,
@@ -589,12 +661,18 @@ def main(argv: Iterable[str] | None = None) -> int:
         config=restore_config,
         command=[str(Path(__file__).resolve()), *raw_argv],
         run_id=args.run_id,
+        implementation=implementation,
     )
     _restore_lock = _acquire_restore_lock(
         output_root, bundle_id=bundle_id, run_id=args.run_id
     )
     destination = _contained_output_path(output_root, bundle_id)
     if destination.exists():
+        if destination.is_symlink() or not destination.is_dir():
+            raise ValueError(
+                "existing restore destination is not a regular directory: "
+                f"{destination}"
+            )
         manifest, _artifacts = _validate_bundle(destination, args.hash_jobs)
         if manifest["bundle_id"] != bundle_id:
             raise ValueError("existing destination contains a different bundle")
@@ -667,6 +745,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         _remove_partial_tree(partial)
         raise
 
+    if destination.exists():
+        raise RuntimeError(f"restore destination appeared during extraction: {destination}")
     os.replace(partial, destination)
     if not args.keep_archive:
         archive.unlink()

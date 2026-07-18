@@ -15,6 +15,7 @@ import copy
 import hashlib
 import json
 import os
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from fractions import Fraction
@@ -23,10 +24,17 @@ from typing import Any
 
 import numpy as np
 
-from cppmega.megatron.graph_recipe import validate_stage1_graph_contract
+from cppmega.megatron.graph_recipe import (
+    STAGE1_GRAPH_RELATIONS,
+    stage1_graph_recipe_binding,
+    validate_stage1_graph_contract,
+)
 
 OBJECTIVE_CONTRACT_SCHEMA = "cppmega_pre_materialized_objectives_v1"
 OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA = (
+    "cppmega_objective_materialization_artifact_v2"
+)
+LEGACY_OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA = (
     "cppmega_objective_materialization_artifact_v1"
 )
 LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1 = (
@@ -81,6 +89,15 @@ OBJECTIVE_IDS: dict[str, int] = {
 REQUIRED_PRODUCTION_OBJECTIVES = frozenset(
     {"causal_lm", "fim", "ast_fim", "ifim", "commit_diff", "pre_to_post"}
 )
+GRAPH_RELATIONS = frozenset(STAGE1_GRAPH_RELATIONS)
+OBJECTIVE_SOURCE_SELECTION_SCHEMA = "cppmega_objective_source_selection_v3"
+OBJECTIVE_SOURCE_RESUME_SCHEMA = "cppmega_objective_source_resume_v1"
+OBJECTIVE_SCHEDULE_WINDOW_SCHEMA = "cppmega_objective_schedule_window_v1"
+OBJECTIVE_SCHEDULE_RECEIPT_SCHEMA = "cppmega_objective_schedule_v1"
+OBJECTIVE_SCHEDULE_ALGORITHM = (
+    "bounded_eligibility_bipartite_graph_capability_v1"
+)
+GRAPH_ELIGIBILITY_RECEIPT_SCHEMA = "cppmega_objective_graph_eligibility_v1"
 
 _EXPECTED_TYPED_SOURCES = {
     "ifim_instruction": "ifim_instruction_token_ids",
@@ -147,6 +164,292 @@ def _canonical_sha256(payload: Mapping[str, Any]) -> str:
         ensure_ascii=True,
     ).encode("ascii")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_value_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_graph_eligibility_receipt(
+    raw_receipt: object,
+    *,
+    task: str,
+    relations: tuple[str, ...],
+    where: str,
+) -> tuple[bool, int]:
+    receipt = _mapping(raw_receipt, where=where)
+    required_keys = {
+        "schema",
+        "objective",
+        "eligible",
+        "reason",
+        "positive_edges",
+        "relations",
+        "route_mode",
+        "route_receipt",
+    }
+    keys = set(receipt)
+    if keys != required_keys and keys != required_keys | {"detail"}:
+        raise ValueError(f"{where} keys are invalid")
+    if receipt.get("schema") != GRAPH_ELIGIBILITY_RECEIPT_SCHEMA:
+        raise ValueError(f"{where}.schema is invalid")
+    if receipt.get("objective") != task:
+        raise ValueError(f"{where}.objective differs from its assignment")
+    if receipt.get("relations") != list(relations):
+        raise ValueError(f"{where}.relations differ from graph_auxiliary.relations")
+    positive_edges = _positive_int(
+        receipt.get("positive_edges"),
+        where=f"{where}.positive_edges",
+        allow_zero=True,
+    )
+    eligible = receipt.get("eligible")
+    if not isinstance(eligible, bool) or eligible != (positive_edges > 0):
+        raise ValueError(f"{where}.eligible is inconsistent with positive_edges")
+    reason = receipt.get("reason")
+    if eligible:
+        if reason is not None:
+            raise ValueError(f"{where}.reason must be null when eligible")
+    elif not isinstance(reason, str) or not reason:
+        raise ValueError(f"{where}.reason must explicitly explain ineligibility")
+
+    route_mode = receipt.get("route_mode")
+    route_receipt = receipt.get("route_receipt")
+    if route_mode == "unavailable":
+        if (
+            reason != "missing_exact_source_token_route_map"
+            or route_receipt is not None
+        ):
+            raise ValueError(f"{where} unavailable route receipt is inconsistent")
+    else:
+        route = _mapping(route_receipt, where=f"{where}.route_receipt")
+        if route.get("mode") != route_mode:
+            raise ValueError(f"{where}.route_mode differs from route_receipt.mode")
+    if task in {"commit_diff", "pre_to_post"} and (
+        eligible
+        or route_mode != "excluded"
+        or reason != "exact_source_route_map_unavailable"
+    ):
+        raise ValueError(
+            f"{where}: commit objectives without exact route maps must be "
+            "explicitly graph-ineligible"
+        )
+    return eligible, positive_edges
+
+
+def validate_objective_source_selection(
+    raw_receipt: object,
+    *,
+    total_samples: int,
+    quota_window_samples: int,
+    window_quotas: Mapping[str, int],
+    graph_relations: tuple[str, ...],
+) -> None:
+    """Validate the canonical bounded source-selection schedule receipt."""
+
+    receipt = _mapping(raw_receipt, where="source_selection")
+    expected_keys = {
+        "schema",
+        "algorithm",
+        "output_samples",
+        "source_rows_consumed",
+        "unused_buffered_sources",
+        "quota_window_samples",
+        "quota_lookahead_samples",
+        "max_source_pool_samples",
+        "max_source_pool_observed",
+        "required_graph_relations",
+        "windows",
+        "windows_sha256",
+        "resume",
+        "schedule",
+    }
+    if set(receipt) != expected_keys:
+        raise ValueError(
+            f"source_selection keys must be exactly {sorted(expected_keys)}"
+        )
+    if receipt.get("schema") != OBJECTIVE_SOURCE_SELECTION_SCHEMA:
+        raise ValueError("source_selection.schema is invalid")
+    if receipt.get("algorithm") != OBJECTIVE_SCHEDULE_ALGORITHM:
+        raise ValueError("source_selection.algorithm is invalid")
+    if receipt.get("output_samples") != total_samples:
+        raise ValueError("source_selection.output_samples differs from totals.samples")
+    if receipt.get("quota_window_samples") != quota_window_samples:
+        raise ValueError("source_selection quota window differs from the contract")
+    lookahead = _positive_int(
+        receipt.get("quota_lookahead_samples"),
+        where="source_selection.quota_lookahead_samples",
+        allow_zero=True,
+    )
+    max_pool = _positive_int(
+        receipt.get("max_source_pool_samples"),
+        where="source_selection.max_source_pool_samples",
+    )
+    if max_pool != quota_window_samples + lookahead:
+        raise ValueError("source_selection max pool does not bind its lookahead")
+    max_observed = _positive_int(
+        receipt.get("max_source_pool_observed"),
+        where="source_selection.max_source_pool_observed",
+    )
+    if not quota_window_samples <= max_observed <= max_pool:
+        raise ValueError("source_selection max observed pool is outside its bound")
+    consumed = _positive_int(
+        receipt.get("source_rows_consumed"),
+        where="source_selection.source_rows_consumed",
+    )
+    unused = _positive_int(
+        receipt.get("unused_buffered_sources"),
+        where="source_selection.unused_buffered_sources",
+        allow_zero=True,
+    )
+    if consumed != total_samples + unused:
+        raise ValueError(
+            "source_selection source_rows_consumed must equal output plus buffered"
+        )
+    if receipt.get("required_graph_relations") != list(graph_relations):
+        raise ValueError("source_selection graph relations drifted")
+
+    raw_windows = receipt.get("windows")
+    if not isinstance(raw_windows, list):
+        raise ValueError("source_selection.windows must be a list")
+    if len(raw_windows) != total_samples // quota_window_samples:
+        raise ValueError("source_selection window count is invalid")
+    window_digest = _canonical_value_sha256(raw_windows)
+    if receipt.get("windows_sha256") != window_digest:
+        raise ValueError("source_selection.windows_sha256 is invalid")
+    schedule = _mapping(receipt.get("schedule"), where="source_selection.schedule")
+    if dict(schedule) != {
+        "schema": OBJECTIVE_SCHEDULE_RECEIPT_SCHEMA,
+        "algorithm": OBJECTIVE_SCHEDULE_ALGORITHM,
+        "windows_sha256": window_digest,
+    }:
+        raise ValueError("source_selection.schedule binding is invalid")
+
+    expected_window_keys = {
+        "schema",
+        "algorithm",
+        "start_step",
+        "output_samples",
+        "source_pool_samples",
+        "source_rows_consumed",
+        "selected_source_indices",
+        "task_counts",
+        "assignments",
+        "graph_positive_assignments",
+        "graph_positive_edges",
+    }
+    expected_assignment_keys = {
+        "source_index",
+        "source_pool_index",
+        "task",
+        "graph_eligibility",
+    }
+    selected_sources: set[int] = set()
+    previous_consumed = 0
+    for window_index, raw_window in enumerate(raw_windows):
+        where = f"source_selection.windows[{window_index}]"
+        window = _mapping(raw_window, where=where)
+        if set(window) != expected_window_keys:
+            raise ValueError(f"{where} keys are invalid")
+        if window.get("schema") != OBJECTIVE_SCHEDULE_WINDOW_SCHEMA:
+            raise ValueError(f"{where}.schema is invalid")
+        if window.get("algorithm") != OBJECTIVE_SCHEDULE_ALGORITHM:
+            raise ValueError(f"{where}.algorithm is invalid")
+        if window.get("start_step") != window_index * quota_window_samples:
+            raise ValueError(f"{where}.start_step is not contiguous")
+        if window.get("output_samples") != quota_window_samples:
+            raise ValueError(f"{where}.output_samples differs from the quota window")
+        pool_samples = _positive_int(
+            window.get("source_pool_samples"),
+            where=f"{where}.source_pool_samples",
+        )
+        if not quota_window_samples <= pool_samples <= max_pool:
+            raise ValueError(f"{where}.source_pool_samples is outside its bound")
+        window_consumed = _positive_int(
+            window.get("source_rows_consumed"),
+            where=f"{where}.source_rows_consumed",
+        )
+        if not previous_consumed <= window_consumed <= consumed:
+            raise ValueError(f"{where}.source_rows_consumed is not monotonic")
+        previous_consumed = window_consumed
+        assignments = window.get("assignments")
+        if not isinstance(assignments, list) or len(assignments) != quota_window_samples:
+            raise ValueError(f"{where}.assignments must fill one quota window")
+        rows = [
+            _mapping(assignment, where=f"{where}.assignments[{index}]")
+            for index, assignment in enumerate(assignments)
+        ]
+        if any(set(row) != expected_assignment_keys for row in rows):
+            raise ValueError(f"{where} assignment keys are invalid")
+        source_indices = [
+            _positive_int(
+                row.get("source_index"),
+                where=f"{where}.assignments.source_index",
+                allow_zero=True,
+            )
+            for row in rows
+        ]
+        if len(set(source_indices)) != quota_window_samples:
+            raise ValueError(f"{where} reuses a source row")
+        if selected_sources.intersection(source_indices):
+            raise ValueError("source_selection reuses a source row across windows")
+        selected_sources.update(source_indices)
+        if window.get("selected_source_indices") != source_indices:
+            raise ValueError(f"{where}.selected_source_indices drifted")
+        task_counts = Counter(str(row.get("task")) for row in rows)
+        if window.get("task_counts") != dict(sorted(task_counts.items())):
+            raise ValueError(f"{where}.task_counts differ from assignments")
+        if task_counts != Counter(window_quotas):
+            raise ValueError(f"{where}.task_counts differ from Hamilton quotas")
+
+        positive_assignments = 0
+        positive_edges = 0
+        for assignment_index, row in enumerate(rows):
+            pool_index = _positive_int(
+                row.get("source_pool_index"),
+                where=f"{where}.assignments[{assignment_index}].source_pool_index",
+                allow_zero=True,
+            )
+            if pool_index >= pool_samples:
+                raise ValueError(f"{where} assignment pool index is invalid")
+            eligible, edges = _validate_graph_eligibility_receipt(
+                row.get("graph_eligibility"),
+                task=str(row.get("task")),
+                relations=graph_relations,
+                where=f"{where}.assignments[{assignment_index}].graph_eligibility",
+            )
+            positive_assignments += int(eligible)
+            positive_edges += edges
+        if window.get("graph_positive_assignments") != positive_assignments:
+            raise ValueError(f"{where}.graph_positive_assignments drifted")
+        if window.get("graph_positive_edges") != positive_edges:
+            raise ValueError(f"{where}.graph_positive_edges drifted")
+        if positive_assignments < 1:
+            raise ValueError(f"{where} has no graph-positive assignment")
+
+    if previous_consumed != consumed:
+        raise ValueError("source_selection final window consumption drifted")
+    resume = _mapping(receipt.get("resume"), where="source_selection.resume")
+    if resume.get("schema") != OBJECTIVE_SOURCE_RESUME_SCHEMA:
+        raise ValueError("source_selection.resume.schema is invalid")
+    if resume.get("cursor_semantics") != (
+        "replay_buffered_rows_then_continue_after_last_yielded_v1"
+    ):
+        raise ValueError("source_selection.resume.cursor_semantics is invalid")
+    last_cursor = _mapping(
+        resume.get("last_yielded_cursor"),
+        where="source_selection.resume.last_yielded_cursor",
+    )
+    if last_cursor.get("source_index") != consumed - 1:
+        raise ValueError("source_selection resume cursor is not the final source row")
+    buffered = resume.get("buffered_source_cursors")
+    if not isinstance(buffered, list) or len(buffered) != unused:
+        raise ValueError("source_selection buffered resume cursors are invalid")
 
 
 @dataclass(frozen=True)
@@ -343,7 +646,6 @@ def validate_objective_contract(
             )
 
     graph = _mapping(contract.get("graph_auxiliary"), where="graph_auxiliary")
-    validate_stage1_graph_contract(graph)
     relations = graph.get("relations")
     if (
         not isinstance(relations, list)
@@ -351,9 +653,22 @@ def validate_objective_contract(
         or any(not isinstance(item, str) or not item for item in relations)
     ):
         raise ValueError("graph_auxiliary.relations must be a non-empty string list")
-    _positive_int(
+    if len(set(relations)) != len(relations):
+        raise ValueError("graph_auxiliary.relations contains duplicates")
+    unknown_relations = sorted(set(relations) - GRAPH_RELATIONS)
+    if unknown_relations:
+        raise ValueError(
+            "graph_auxiliary.relations contains unknown relations: "
+            f"{unknown_relations}"
+        )
+    validate_stage1_graph_contract(graph)
+    eligible_samples = _positive_int(
         graph.get("eligible_samples"), where="graph_auxiliary.eligible_samples"
     )
+    if eligible_samples > total_samples:
+        raise ValueError(
+            "graph_auxiliary.eligible_samples cannot exceed totals.samples"
+        )
     _positive_int(graph.get("positive_edges"), where="graph_auxiliary.positive_edges")
     for field in (
         "global_weight",
@@ -383,6 +698,14 @@ def validate_objective_contract(
     if graph.get("chunk_edge_expansion") != "cartesian_token_spans_v1":
         raise ValueError(
             "graph_auxiliary.chunk_edge_expansion must be 'cartesian_token_spans_v1'"
+        )
+    if "source_selection" in contract:
+        validate_objective_source_selection(
+            contract["source_selection"],
+            total_samples=total_samples,
+            quota_window_samples=window,
+            window_quotas=window_quotas,
+            graph_relations=tuple(relations),
         )
 
     materialization = _mapping(contract.get("materialization"), where="materialization")
@@ -487,8 +810,14 @@ def load_objective_materialization_artifact(
     with artifact_path.open(encoding="utf-8") as handle:
         raw = json.load(handle)
     artifact = dict(_mapping(raw, where="objective materialization artifact"))
+    if artifact.get("schema") == LEGACY_OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA:
+        raise ValueError(
+            "legacy objective materialization artifact schema detected; migration "
+            "required: regenerate the objective contract and artifact"
+        )
     expected_top = {
         "schema",
+        "graph_recipe",
         "documents",
         "objective_contract",
         "parquet_shards",
@@ -510,6 +839,11 @@ def load_objective_materialization_artifact(
     if artifact_set_sha256 != _canonical_sha256(artifact_set_payload):
         raise ValueError(
             "objective materialization artifact_set_sha256 does not match payload"
+        )
+    if artifact.get("graph_recipe") != stage1_graph_recipe_binding():
+        raise ValueError(
+            "objective materialization graph recipe binding is missing or stale; "
+            "regenerate the objective artifact"
         )
     root = artifact_path.parent.resolve()
 
@@ -833,8 +1167,14 @@ def validate_materialized_objective_artifact(
     """Validate the artifact binding embedded by the canonical converter."""
 
     binding = _mapping(value, where="objective_materialization")
+    if binding.get("schema") == LEGACY_OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA:
+        raise ValueError(
+            "legacy objective materialization artifact schema detected; migration "
+            "required: regenerate the objective contract and artifact"
+        )
     expected_keys = {
         "schema",
+        "graph_recipe",
         "artifact_file_sha256",
         "documents",
         "objective_contract",
@@ -848,6 +1188,11 @@ def validate_materialized_objective_artifact(
         )
     if binding.get("schema") != OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA:
         raise ValueError("objective_materialization schema is invalid")
+    if binding.get("graph_recipe") != stage1_graph_recipe_binding():
+        raise ValueError(
+            "objective_materialization graph recipe binding is missing or stale; "
+            "regenerate the objective artifact"
+        )
     for field in ("artifact_set_sha256", "artifact_file_sha256"):
         value = binding.get(field)
         if (
@@ -906,11 +1251,18 @@ def validate_materialized_objective_artifact(
 
 
 __all__ = [
+    "GRAPH_ELIGIBILITY_RECEIPT_SCHEMA",
     "LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1",
     "OBJECTIVE_CONTRACT_SCHEMA",
     "OBJECTIVE_GRAPH_SIDECARS",
+    "OBJECTIVE_SCHEDULE_ALGORITHM",
+    "OBJECTIVE_SCHEDULE_RECEIPT_SCHEMA",
+    "OBJECTIVE_SCHEDULE_WINDOW_SCHEMA",
+    "OBJECTIVE_SOURCE_RESUME_SCHEMA",
+    "OBJECTIVE_SOURCE_SELECTION_SCHEMA",
     "OBJECTIVE_IDS",
     "OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA",
+    "LEGACY_OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA",
     "OBJECTIVE_TOKEN_SIDE_CHANNELS",
     "ObjectiveMaterializationArtifact",
     "ObjectiveMaterializationTracker",
@@ -921,4 +1273,5 @@ __all__ = [
     "validate_materialized_objective_artifact",
     "validate_materialized_objective_contract",
     "validate_objective_contract",
+    "validate_objective_source_selection",
 ]

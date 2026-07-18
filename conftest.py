@@ -34,7 +34,10 @@ _PORTABLE_TEST_ALLOWLIST = frozenset(
     {
         "tests/test_data_pipeline_contracts.py",
         "tests/test_data_prep_parquet_to_megatron.py",
+        "tests/test_case5_ksh_domain_contract.py",
         "tests/test_domain_megatron_sidecars.py",
+        "tests/test_eval_domain_routed_codegen.py",
+        "tests/test_ksh_python_domain_parsers.py",
         "tests/test_nebius_h200_megatron_cpp_generation_eval.py",
         "tests/test_nebius_h200_megatron_cpp_world_sweep.py",
         "tests/test_subset_megatron_sidecar_prefix.py",

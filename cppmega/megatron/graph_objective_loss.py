@@ -18,6 +18,88 @@ from cppmega.megatron.graph_recipe import (
 )
 
 
+GRAPH_BIAS_BETA_ENV = "CPPMEGA_GRAPH_BIAS_BETA"
+GRAPH_BIAS_BETA_LEGACY_ENVS = (
+    "CPPMEGA_DSA_GRAPH_BIAS_BETA",
+    "CPPMEGA_GRAPH_ATTENTION_BIAS_BETA",
+)
+
+
+def validate_graph_bias_beta(
+    value: object, *, source: str = "graph bias beta"
+) -> float:
+    try:
+        beta = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{source} must be a finite positive scalar, got {value!r}"
+        ) from exc
+    if not math.isfinite(beta) or beta <= 0.0:
+        raise ValueError(f"{source} must be a finite positive scalar, got {value!r}")
+    return beta
+
+
+def resolve_graph_bias_beta(
+    environment: Mapping[str, str] | None = None,
+) -> float:
+    """Resolve one beta for DSA selection, dense attention, and graph loss.
+
+    ``CPPMEGA_GRAPH_BIAS_BETA`` is the canonical name. The historical DSA and
+    dense-attention names remain accepted as aliases, but every present alias
+    must represent the exact same rational value.
+    """
+
+    source = os.environ if environment is None else environment
+    values: list[tuple[str, float]] = []
+    for name in (GRAPH_BIAS_BETA_ENV, *GRAPH_BIAS_BETA_LEGACY_ENVS):
+        raw = source.get(name)
+        if raw is None or not raw.strip():
+            continue
+        values.append(
+            (
+                name,
+                validate_graph_bias_beta(
+                    raw,
+                    source=f"graph bias beta ({name})",
+                ),
+            )
+        )
+
+    if not values:
+        return validate_graph_bias_beta(
+            stage1_graph_config_kwargs()["bias_beta"],
+            source="Stage-1 graph recipe bias beta",
+        )
+
+    _, first_value = values[0]
+    for _, value in values[1:]:
+        if Fraction(str(value)) != Fraction(str(first_value)):
+            details = ", ".join(
+                f"{value_name}={value_value:g}"
+                for value_name, value_value in values
+            )
+            raise ValueError(
+                "graph bias beta knobs differ; all aliases must match exactly: "
+                f"{details}"
+            )
+    return first_value
+
+
+def graph_bias_beta_binding(beta: float | None = None) -> dict[str, object]:
+    """Return the exact beta binding carried by runtime receipts."""
+
+    value = (
+        resolve_graph_bias_beta()
+        if beta is None
+        else validate_graph_bias_beta(beta)
+    )
+    return {
+        "canonical_env": GRAPH_BIAS_BETA_ENV,
+        "legacy_envs": list(GRAPH_BIAS_BETA_LEGACY_ENVS),
+        "value": str(Fraction(str(value))),
+    }
+
+
 @dataclass(frozen=True)
 class GraphAuxiliaryLossConfig:
     global_weight: float
@@ -28,6 +110,7 @@ class GraphAuxiliaryLossConfig:
     layer_weight: float = 1.0
     pos_weight: float = 1.0
     margin: float = 1.0
+    bias_beta: float = 1.0
     relations: tuple[str, ...] = STAGE1_GRAPH_RELATIONS
 
     def __post_init__(self) -> None:
@@ -47,6 +130,8 @@ class GraphAuxiliaryLossConfig:
             raise ValueError("pos_weight must be > 0")
         if not math.isfinite(float(self.margin)) or self.margin < 0.0:
             raise ValueError("margin must be >= 0")
+        if not math.isfinite(float(self.bias_beta)) or self.bias_beta <= 0.0:
+            raise ValueError("bias beta (bias_beta) must be > 0")
         if not self.relations or any(not relation for relation in self.relations):
             raise ValueError("relations must contain at least one non-empty name")
         if len(set(self.relations)) != len(self.relations):
@@ -115,6 +200,9 @@ class GraphAuxiliaryLossConfig:
                         "CPPMEGA_DSA_GRAPH_MARGIN", str(defaults["margin"])
                     )
                 ),
+                bias_beta=float(
+                    resolve_graph_bias_beta(source)
+                ),
                 relations=relations,
             )
         except ValueError as exc:
@@ -125,7 +213,7 @@ def validate_runtime_graph_contract(
     graph_contract: Mapping[str, object],
     *,
     environment: Mapping[str, str] | None = None,
-    require_included_auxiliary: bool = False,
+    require_included_auxiliary: bool = True,
 ) -> None:
     """Require runtime graph-loss knobs to exactly match the data receipt."""
 
@@ -168,14 +256,16 @@ def validate_runtime_graph_contract(
         "coverage_weight": config.coverage_weight,
         "pos_weight": config.pos_weight,
         "margin": config.margin,
+        "bias_beta": config.bias_beta,
     }
     for field, runtime_value in comparisons.items():
         raw_contract = graph_contract.get(field)
         if not isinstance(raw_contract, str):
             raise ValueError(f"graph_auxiliary.{field} contract value must be exact")
         if Fraction(str(runtime_value)) != Fraction(raw_contract):
+            display_name = "bias beta" if field == "bias_beta" else field
             raise ValueError(
-                f"graph auxiliary runtime {field}={runtime_value} differs from "
+                f"graph auxiliary runtime {display_name}={runtime_value} differs from "
                 f"contract={raw_contract}"
             )
     if config.topk != graph_contract.get("topk"):
@@ -282,6 +372,16 @@ def _validate_inputs(
         raise ValueError("edge_targets must contain only 0/1 values")
     if torch.any((edge_targets > 0) & (pair_mask <= 0)):
         raise ValueError("edge_targets contains a positive edge outside pair_mask")
+    positive_non_finite = (
+        (edge_targets > 0)
+        & (pair_mask > 0)
+        & ~torch.isfinite(indexer_scores)
+    )
+    if torch.any(positive_non_finite):
+        raise ValueError(
+            "positive graph target has a non-finite indexer score; "
+            "refusing invalid graph batch"
+        )
     return tuple(int(value) for value in indexer_scores.shape)
 
 
@@ -304,8 +404,10 @@ def graph_auxiliary_loss(
     """Return weighted graph loss and exact differentiable components.
 
     Samples without positive graph edges are excluded rather than assigned
-    fabricated negatives. A fully graph-ineligible batch returns a connected
-    zero scalar; dataset-level eligibility is enforced by the objective receipt.
+    fabricated negatives. A positive graph target with a non-finite score is an
+    invalid batch and raises before any finite-score filtering. A fully
+    graph-ineligible batch returns a connected zero scalar; dataset-level
+    eligibility is enforced by the objective receipt.
     """
 
     _batch, _queries, keys = _validate_inputs(indexer_scores, edge_targets, pair_mask)
@@ -342,7 +444,12 @@ def graph_auxiliary_loss(
         boundary = torch.topk(masked_scores, k=config.topk + 1, dim=-1).values[..., -1:]
         finite_boundary = torch.isfinite(boundary)
         deficits = torch.relu(boundary + config.margin - safe_scores)
-        penalties = deficits * targets * finite_boundary.to(scores.dtype)
+        penalties = (
+            deficits
+            * targets
+            * valid_pairs.to(scores.dtype)
+            * finite_boundary.to(scores.dtype)
+        )
         coverage = penalties.sum() / positive_edges.clamp_min(1.0)
 
     unscaled = config.global_weight * config.layer_weight * (
@@ -358,8 +465,13 @@ def graph_auxiliary_loss(
 
 __all__ = [
     "GraphAuxiliaryLossConfig",
+    "GRAPH_BIAS_BETA_ENV",
+    "GRAPH_BIAS_BETA_LEGACY_ENVS",
+    "graph_bias_beta_binding",
     "graph_objective_requested",
     "graph_auxiliary_loss",
     "require_active_dsa_graph_objective",
+    "resolve_graph_bias_beta",
+    "validate_graph_bias_beta",
     "validate_runtime_graph_contract",
 ]

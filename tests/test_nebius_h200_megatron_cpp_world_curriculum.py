@@ -1,6 +1,8 @@
 import json
 import subprocess
 
+import pytest
+
 from scripts.nebius_h200_megatron_cpp_world_curriculum import (
     _default_stages,
     _make_curriculum_manifest,
@@ -107,11 +109,13 @@ def test_curriculum_container_is_fail_closed_and_bash_parseable(tmp_path):
     script_path.write_text(script, encoding="utf-8")
 
     assert "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS" in script
-    assert 'export CPPMEGA_DSA_PATCH_ENABLED="0"' in script
-    assert "--enable-dsa-patch" not in script
+    assert 'export CPPMEGA_DSA_PATCH_ENABLED="1"' in script
+    assert "--enable-dsa-patch" in script
     assert "if os.environ.get('CPPMEGA_DSA_PATCH_ENABLED', '0') == '1'" in script
-    assert "export CPPMEGA_DSA_GRAPH_AUX_ENABLED=0" in script
-    assert "export CPPMEGA_DSA_INDEXER_LOSS_COEFF=0" in script
+    assert "export CPPMEGA_DSA_GRAPH_AUX_ENABLED=1" in script
+    assert "export CPPMEGA_DSA_INDEXER_LOSS_COEFF=0.001" in script
+    assert "GRAPH_PRIOR_RECEIPT=\"/data/cppmega_h200_results/stage_${STAGE_IDX}_graph_prior.json\"" in script
+    assert "reason=dsa_selector_gate" in script
     assert "apply_graph_route_attention_bias_patch()" in script
     assert "--micro-batch-size ${MBS}" in script
     assert "--global-batch-size ${BS}" in script
@@ -138,3 +142,16 @@ def test_curriculum_container_is_fail_closed_and_bash_parseable(tmp_path):
     )
     assert 'export CPPMEGA_DSA_PATCH_ENABLED="1"' in dsa_script
     assert "--enable-dsa-patch" in dsa_script
+
+
+def test_curriculum_rejects_dense_only_mode():
+    stage = _default_stages()[0]
+    with pytest.raises(ValueError, match="requires the fused DSA patch"):
+        _remote_script(
+            [stage],
+            docker_image=DEFAULT_DOCKER_IMAGE,
+            fp8_recipe="tensorwise",
+            remote_prefixes={stage.index: "data/seq_1024/train"},
+            graph_capacities={stage.index: _capacity(stage)},
+            enable_dsa_patch=False,
+        )

@@ -16,6 +16,7 @@ from cppmega.megatron.graph_recipe import (
     STAGE1_GRAPH_TOPK,
     stage1_graph_recipe_binding,
 )
+from cppmega.receipt_binding import build_data_producer_binding
 import scripts.data.publish_megatron_bundle_to_nebius_s3 as publisher
 import scripts.nebius_h200_megatron_cpp_world_sweep as sweep_module
 
@@ -34,6 +35,7 @@ from scripts.nebius_h200_megatron_cpp_world_sweep import (
     make_multi_sidecar_tar,
     remote_run_script,
     validate_docker_image_digest,
+    validate_nebius_resource_id,
 )
 from scripts.h200_megatron_preflight import (
     derive_graph_capacity_receipt,
@@ -43,6 +45,13 @@ from scripts.h200_megatron_preflight import (
 
 _DTYPE_SIZES = publisher.DTYPE_SIZES
 _TEST_GRAPH_CAPACITY = (1, 1)
+_TEST_SSH_HOST_KEY = (
+    "ssh-ed25519 "
+    "AAAAC3NzaC1lZDI1NTE5AAAAIJRwravCVfVsFZfdgfvC/OlW0K7vrJ7pBjl5p86YKSSs"
+)
+_TEST_SSH_HOST_KEY_FINGERPRINT = (
+    "SHA256:xGOQHYDUpAKZPiHLlYNYp01FiayrndE1tGC9wBoA+xw"
+)
 NONZERO_GRAPH_SIDECARS = publisher.NONZERO_GRAPH_SIDECARS
 REQUIRED_GRAPH_SIDECARS = publisher.REQUIRED_GRAPH_SIDECARS
 REQUIRED_TOKEN_SIDECARS = publisher.REQUIRED_TOKEN_SIDECARS
@@ -280,7 +289,10 @@ def _write_valid_sidecar_prefix(
             "layer_reduction": "sum",
             "bce_weight": "1/10",
             "coverage_weight": "1/20",
+            "bias_beta": "1",
             "topk": STAGE1_GRAPH_TOPK,
+            "score_formula": "i_neural_plus_beta_s_graph_v1",
+            "score_stage": "before_topk",
             "pos_weight": "1",
             "margin": "1",
             "included_in_total_loss": True,
@@ -394,7 +406,8 @@ def _write_test_bundle(root, prefix, tokenizer):
     objective_path.write_text(json.dumps(objective["payload"]), encoding="utf-8")
     objective_file_sha256 = hashlib.sha256(objective_path.read_bytes()).hexdigest()
     artifact_payload = {
-        "schema": "cppmega_objective_materialization_artifact_v1",
+        "schema": "cppmega_objective_materialization_artifact_v2",
+        "graph_recipe": stage1_graph_recipe_binding(),
         "documents": prefix_manifest["document_count"],
         "objective_contract": {
             "path": objective_path.name,
@@ -465,17 +478,25 @@ def _write_test_bundle(root, prefix, tokenizer):
     ]
     tokenizer_sha256 = publisher._artifact_set_sha256(tokenizer_records)
     manifest = {
-        "schema": "cppmega_megatron_bundle_v1",
+        "schema": "cppmega_megatron_bundle_v2",
         "bundle_id": f"test-bundle-{artifact_set_sha256[:16]}",
         "tokenizer_contract": "megacpp-vocab-65536",
         "vocab_size": 65536,
         "training_contract": "objective_materialized",
+        "implementation": build_data_producer_binding(
+            cppmega_commit="a" * 40,
+            cppmega_tree_sha256="b" * 64,
+            cppmega_mlx_commit="c" * 40,
+            cppmega_mlx_tree_sha256="d" * 64,
+            clang_indexer_sha256="e" * 64,
+            clang_indexer_dependency_closure_sha256="f" * 64,
+        ),
         "objective_materialization": {
             "schema": "cppmega_bucketed_objective_materializations_v1",
             "buckets": {
                 "1024": {
                     "artifact_path": artifact_path.relative_to(root).as_posix(),
-                    "artifact_schema": "cppmega_objective_materialization_artifact_v1",
+                    "artifact_schema": "cppmega_objective_materialization_artifact_v2",
                     "artifact_set_sha256": objective_artifact_sha256,
                     "artifact_file_sha256": artifact_file_sha256,
                     "contract_path": objective_path.relative_to(root).as_posix(),
@@ -624,6 +645,13 @@ def test_failed_results_or_checkpoint_scp_preserves_instance(
         str(pubkey),
         "--ssh-key",
         str(tmp_path / "id_ed25519"),
+        "--ssh-host-key",
+        (
+            "ssh-ed25519 "
+            "AAAAC3NzaC1lZDI1NTE5AAAAIJRwravCVfVsFZfdgfvC/OlW0K7vrJ7pBjl5p86YKSSs"
+        ),
+        "--ssh-host-key-fingerprint",
+        "SHA256:xGOQHYDUpAKZPiHLlYNYp01FiayrndE1tGC9wBoA+xw",
         "--instance-name",
         "retrieval-gate-test",
         "--no-ghcr-auth",
@@ -728,6 +756,16 @@ def test_docker_image_must_be_an_immutable_digest():
         )
 
 
+def test_nebius_resource_ids_are_strictly_bound():
+    assert validate_nebius_resource_id(
+        "computeimage-e00hbfk8kmf3w3prch", name="--image-id"
+    ) == "computeimage-e00hbfk8kmf3w3prch"
+    with pytest.raises(ValueError, match="resource identifier"):
+        validate_nebius_resource_id("../escape", name="--image-id")
+    with pytest.raises(ValueError, match="resource identifier"):
+        validate_nebius_resource_id("ab", name="--image-id")
+
+
 def test_remote_script_enables_graph_routes_and_uses_selected_data_prefix():
     script = remote_run_script(
         [256],
@@ -827,6 +865,10 @@ def test_remote_script_can_sweep_multiple_seq_lengths_with_separate_prefixes():
     assert "--max-position-embeddings ${SEQ}" in script
     assert "seq_${SEQ}_bs_${BS}.log" in script
     assert "CPPMEGA_BATCH_RESULT seq=${SEQ} batch=${BS}" in script
+    assert "GRAPH_PRIOR_RECEIPT=\"/data/cppmega_h200_results/seq_${SEQ}_bs_${BS}_graph_prior.json\"" in script
+    assert "require_selector=True" in script
+    assert "expected_dsa_beta=1.0" in script
+    assert "reason=dsa_selector_gate" in script
 
 
 def test_remote_script_can_enable_tensorwise_fp8_flags():
@@ -989,26 +1031,44 @@ def test_fp8_tensorwise_dry_run_disables_nvrtc_by_default(tmp_path, capsys):
     _write_test_bundle(bundle_root, prefix, tokenizer)
     pubkey = tmp_path / "id_ed25519.pub"
     pubkey.write_text("ssh-ed25519 TESTKEY codex\n")
-    rc = main(
+    plan_script = tmp_path / "leader-plan.sh"
+    argv = [
+        "--dry-run",
+        "--plan-script",
+        str(plan_script),
+        "--bundle-root",
+        str(bundle_root),
+        "--sidecar-prefix",
+        str(prefix),
+        "--fp8-recipe",
+        "tensorwise",
+        "--batch-sizes",
+        "64",
+        "--train-iters",
+        "1",
+        "--ssh-pubkey",
+        str(pubkey),
+    ]
+
+    with pytest.raises(RuntimeError, match="host-key pin is required"):
+        main(argv)
+
+    argv.extend(
         [
-            "--dry-run",
-            "--bundle-root",
-            str(bundle_root),
-            "--sidecar-prefix",
-            str(prefix),
-            "--fp8-recipe",
-            "tensorwise",
-            "--batch-sizes",
-            "64",
-            "--train-iters",
-            "1",
-            "--ssh-pubkey",
-            str(pubkey),
+            "--ssh-host-key",
+            _TEST_SSH_HOST_KEY,
+            "--ssh-host-key-fingerprint",
+            _TEST_SSH_HOST_KEY_FINGERPRINT,
         ]
     )
+    rc = main(argv)
 
     assert rc == 0
     assert 'export NVTE_DISABLE_NVRTC="1"' in capsys.readouterr().out
+    assert plan_script.stat().st_mode & 0o777 == 0o700
+    plan = plan_script.read_text(encoding="utf-8")
+    assert plan.startswith("#!/usr/bin/env bash\n")
+    assert f"sudo docker pull {DEFAULT_DOCKER_IMAGE}" in plan
 
 
 def test_fp8_tensorwise_can_keep_nvrtc_enabled_for_perf_probe(tmp_path, capsys):
@@ -1216,6 +1276,8 @@ def test_h200_preflight_real_local_dry_run_writes_bound_commands(tmp_path):
                 str(prefix),
                 "--tokenizer-model",
                 str(tokenizer),
+                "--megatron-commit",
+                "9" * 40,
                 "--run-id",
                 "local-dry-run",
                 "--sequence-length",
@@ -1249,6 +1311,12 @@ def test_h200_preflight_real_local_dry_run_writes_bound_commands(tmp_path):
         receipt["commands"]["save"].index("--eval-interval") + 1
     ] == "1"
     assert receipt["config"]["enable_dsa_patch"] is True
+    objective_binding = receipt["data"]["objective_graph_binding"]
+    assert objective_binding["objective_sha256"] == (
+        receipt["data"]["manifest"]["objective_contract"]["sha256"]
+    )
+    assert objective_binding["graph_recipe"] == stage1_graph_recipe_binding()
+    assert objective_binding["bias_beta"]["value"] == "1"
     save_command = receipt["commands"]["save"]
     assert save_command[save_command.index("--experimental-attention-variant") + 1] == "dsa"
     assert "--multi-latent-attention" in save_command

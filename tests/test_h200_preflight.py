@@ -7,21 +7,33 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from cppmega.receipt_binding import build_implementation_binding  # noqa: E402
+
 from cppmega.megatron.h200_preflight import (  # noqa: E402
     GRAPH_CHUNK_KIND_COUNT,
     GraphChunkKind,
+    observe_dsa_selector,
     observe_graph_prior,
     observe_production_batch,
 )
 from cppmega.megatron.checkpoint_restore_preflight import state_fingerprint  # noqa: E402
+from cppmega.megatron.graph_objective_loss import (  # noqa: E402
+    validate_runtime_graph_contract,
+)
+from cppmega.megatron.graph_recipe import (  # noqa: E402
+    stage1_graph_recipe_binding,
+    stage1_graph_recipe_payload,
+)
 from scripts.h200_megatron_preflight import (  # noqa: E402
     _claimed_backend_modules,
     _checkpoint_load_evidence,
     _checkpoint_tree_sha256,
     _iteration_evidence,
+    _profile_environment,
     _stage_cold_checkpoint,
     _validate_backend_dispatch_receipt,
     _validate_checkpoint_state_restore,
+    _validate_graph_prior_receipt,
     build_arg_parser,
     build_megatron_command,
 )
@@ -44,6 +56,7 @@ def _structure_batch():
         "graph_chunk_kinds": torch.tensor([[1, 2]], dtype=torch.int64),
         "graph_chunk_dep_levels": torch.tensor([[0, 1]], dtype=torch.int64),
         "graph_chunk_counts": torch.tensor([2], dtype=torch.int64),
+        "objective_ids": torch.tensor([[2, 4, 5, 5]], dtype=torch.int64),
     }
     for family in ("call", "type"):
         batch[f"graph_{family}_edges"] = torch.empty((1, 0, 2), dtype=torch.int64)
@@ -58,7 +71,7 @@ def _structure_batch():
 
 def _receipt_binding():
     return {
-        "schema": "cppmega_case6_receipt_binding_v1",
+        "schema": "cppmega_case6_receipt_binding_v2",
         "bundle_id": "bundle-1",
         "artifact_set_sha256": "a" * 64,
         "prefix_manifest_sha256s": {"data/train.json": "b" * 64},
@@ -66,6 +79,15 @@ def _receipt_binding():
         "config_sha256": "d" * 64,
         "command_sha256": "e" * 64,
         "run_id": "run-1",
+        "implementation": build_implementation_binding(
+            cppmega_commit="1" * 40,
+            cppmega_tree_sha256="2" * 64,
+            megatron_commit="3" * 40,
+            cppmega_mlx_commit="4" * 40,
+            cppmega_mlx_tree_sha256="5" * 64,
+            clang_indexer_sha256="6" * 64,
+            clang_indexer_dependency_closure_sha256="7" * 64,
+        ),
     }
 
 
@@ -91,7 +113,33 @@ def test_observe_production_batch_records_nonzero_structure_and_graph(tmp_path):
         "route_edge_count": 1,
         "route_edge_counts": {"domain": 1},
     }
+    assert receipt["objective_mix"] == {
+        "input_tokens_by_objective": {
+            "fim": 1,
+            "ifim": 1,
+            "commit_diff": 2,
+        },
+        "loss_tokens_by_objective": {
+            "fim": 1,
+            "ifim": 1,
+            "commit_diff": 1,
+        },
+        "observed_objective_ids": [2, 4, 5],
+    }
     assert json.loads(receipt_path.read_text(encoding="utf-8")) == receipt
+
+
+def test_observe_production_batch_requires_objective_ids_for_contract_mode(tmp_path):
+    structure = _structure_batch()
+    structure.pop("objective_ids")
+
+    with pytest.raises(RuntimeError, match="objective_ids"):
+        observe_production_batch(
+            batch=_production_batch(),
+            structure_batch=structure,
+            receipt_path=tmp_path / "batch.json",
+            environment={"CPPMEGA_OBJECTIVE_CONTRACT_REQUIRED": "1"},
+        )
 
 
 def test_observe_production_batch_accepts_canonical_other_chunk_kind_zero(tmp_path):
@@ -193,6 +241,7 @@ def test_observe_graph_prior_requires_nonzero_consumer_input(tmp_path):
 
     assert receipt["status"] == "verified"
     assert receipt["consumer"] == "dense_attention"
+    assert receipt["bias_beta"]["value"] == "1"
     assert receipt["prior"]["nonzero"] == 1
 
     with pytest.raises(RuntimeError, match="graph prior.*nonzero"):
@@ -200,6 +249,122 @@ def test_observe_graph_prior_requires_nonzero_consumer_input(tmp_path):
             prior=torch.zeros((1, 1, 2, 2)),
             consumer="dsa_indexer",
             receipt_path=tmp_path / "zero.json",
+        )
+
+
+def test_observe_graph_prior_rejects_stale_beta_receipt(tmp_path):
+    receipt_path = tmp_path / "prior.json"
+    observe_graph_prior(
+        prior=torch.tensor([[[[0.0, 2.0], [0.0, 0.0]]]]),
+        consumer="dsa_indexer",
+        receipt_path=receipt_path,
+        bias_beta=1.0,
+    )
+
+    with pytest.raises(RuntimeError, match="receipt beta"):
+        observe_graph_prior(
+            prior=torch.tensor([[[[0.0, 2.0], [0.0, 0.0]]]]),
+            consumer="dsa_indexer",
+            receipt_path=receipt_path,
+            bias_beta=2.0,
+        )
+
+
+def test_observe_dsa_selector_records_equation_mask_and_topk(tmp_path):
+    receipt_path = tmp_path / "prior.json"
+    neural = torch.zeros((1, 2, 4), dtype=torch.float32)
+    graph = torch.zeros_like(neural)
+    graph[0, 0, 3] = 2.0
+    graph[0, 1, 1] = 3.0
+    mask = torch.zeros_like(neural)
+    mask[0, 0, 3] = float("-inf")
+    post_add = neural + graph
+    post_mask = post_add + mask
+    topk = post_mask.topk(2, dim=-1).indices
+
+    observe_graph_prior(
+        prior=graph,
+        consumer="dsa_indexer",
+        receipt_path=receipt_path,
+        bias_beta=1.0,
+    )
+    receipt = observe_dsa_selector(
+        neural_scores=neural,
+        graph_prior=graph,
+        beta=1.0,
+        mask=mask,
+        actual_post_add_scores=post_add,
+        actual_post_mask_scores=post_mask,
+        actual_topk_indices=topk,
+        index_topk=2,
+        receipt_path=receipt_path,
+        layer_number=3,
+    )
+
+    assert receipt["selector"]["status"] == "verified"
+    assert receipt["selector"]["formula"] == "I_neural + beta*S_graph -> mask -> topk"
+    observation = receipt["selector"]["observations"][0]
+    assert observation["indices_match"] is True
+    assert observation["topk_indices"]["sample"] == [
+        int(value) for value in topk.reshape(-1)
+    ]
+    assert observation["equation_max_abs_error"] == 0.0
+    assert observation["mask_max_abs_error"] == 0.0
+    assert observation["post_mask"]["negative_infinity_count"] == 1
+    assert "-Infinity" not in receipt_path.read_text(encoding="utf-8")
+    _validate_graph_prior_receipt(receipt, expected_beta=1.0, require_selector=True)
+
+
+def test_h200_graph_preflight_contract_rejects_tensor_only_without_gpu(tmp_path):
+    environment = _profile_environment(
+        sequence_length=1024,
+        micro_batch_size=1,
+        fp8_recipe="off",
+        graph_max_edges=8,
+        graph_max_chunks=4,
+        enable_dsa_patch=True,
+    )
+    graph_contract = {
+        **stage1_graph_recipe_payload(),
+        "recipe": stage1_graph_recipe_binding(),
+        "included_in_total_loss": True,
+    }
+
+    assert environment["CPPMEGA_GRAPH_ROUTES_ENABLED"] == "1"
+    assert environment["CPPMEGA_STRUCTURE_ENABLED"] == "1"
+    assert environment["CPPMEGA_DSA_GRAPH_AUX_ENABLED"] == "1"
+    assert environment["CPPMEGA_DSA_PATCH_ENABLED"] == "1"
+    assert "CPPMEGA_GRAPH_ROUTES_ABLATION" not in environment
+    validate_runtime_graph_contract(
+        graph_contract,
+        environment=environment,
+        require_included_auxiliary=True,
+    )
+
+    tensor_only = {
+        **environment,
+        "CPPMEGA_GRAPH_ROUTES_ENABLED": "0",
+        "CPPMEGA_GRAPH_ROUTES_ABLATION": "1",
+    }
+    with pytest.raises(ValueError, match="requires CPPMEGA_GRAPH_ROUTES_ENABLED=1"):
+        validate_runtime_graph_contract(
+            graph_contract,
+            environment=tensor_only,
+            require_included_auxiliary=True,
+        )
+
+    receipt_path = tmp_path / "graph-prior-without-selector.json"
+    graph_prior = observe_graph_prior(
+        prior=torch.tensor([[[0.0, 2.0], [0.0, 0.0]]]),
+        consumer="dsa_indexer",
+        receipt_path=receipt_path,
+        bias_beta=1.0,
+    )
+    with pytest.raises(RuntimeError, match="selector-level top-k evidence"):
+        _validate_graph_prior_receipt(
+            graph_prior,
+            expected_beta=1.0,
+            require_selector=True,
         )
 
 

@@ -21,6 +21,7 @@ from cppmega.megatron.graph_recipe import (
     STAGE1_GRAPH_TOPK,
     stage1_graph_recipe_binding,
 )
+from cppmega.receipt_binding import build_data_producer_binding
 import scripts.data.publish_megatron_bundle_to_nebius_s3 as publisher
 from scripts.data.publish_megatron_bundle_to_nebius_s3 import (
     _head,
@@ -248,7 +249,10 @@ def _objective_payload():
             "layer_reduction": "sum",
             "bce_weight": "1/10",
             "coverage_weight": "1/20",
+            "bias_beta": "1",
             "topk": STAGE1_GRAPH_TOPK,
+            "score_formula": "i_neural_plus_beta_s_graph_v1",
+            "score_stage": "before_topk",
             "pos_weight": "1",
             "margin": "1",
             "included_in_total_loss": True,
@@ -482,7 +486,8 @@ def _prefix_bundle(tmp_path):
     objective_source = provenance_dir / "objective_contract_seq1024.json"
     objective_source.write_text(json.dumps(objective_payload), encoding="utf-8")
     artifact_payload = {
-        "schema": "cppmega_objective_materialization_artifact_v1",
+        "schema": "cppmega_objective_materialization_artifact_v2",
+        "graph_recipe": stage1_graph_recipe_binding(),
         "documents": document_count,
         "objective_contract": {
             "path": objective_source.name,
@@ -620,17 +625,25 @@ def _prefix_bundle(tmp_path):
         json.dumps(tokenizer_records, separators=(",", ":"), sort_keys=True).encode()
     ).hexdigest()
     manifest = {
-        "schema": "cppmega_megatron_bundle_v1",
+        "schema": "cppmega_megatron_bundle_v2",
         "bundle_id": f"test-bundle-{artifact_set_sha256[:16]}",
         "tokenizer_contract": "megacpp-vocab-65536",
         "vocab_size": 65536,
         "training_contract": "objective_materialized",
+        "implementation": build_data_producer_binding(
+            cppmega_commit="a" * 40,
+            cppmega_tree_sha256="b" * 64,
+            cppmega_mlx_commit="c" * 40,
+            cppmega_mlx_tree_sha256="d" * 64,
+            clang_indexer_sha256="e" * 64,
+            clang_indexer_dependency_closure_sha256="f" * 64,
+        ),
         "objective_materialization": {
             "schema": "cppmega_bucketed_objective_materializations_v1",
             "buckets": {
                 "1024": {
                     "artifact_path": "provenance/objective_artifact_seq1024.json",
-                    "artifact_schema": "cppmega_objective_materialization_artifact_v1",
+                    "artifact_schema": "cppmega_objective_materialization_artifact_v2",
                     "artifact_set_sha256": artifact_payload["artifact_set_sha256"],
                     "artifact_file_sha256": artifact_file_sha256,
                     "contract_path": "provenance/objective_contract_seq1024.json",
@@ -1505,6 +1518,25 @@ def test_validate_bundle_rejects_embedded_prefix_manifest_drift(tmp_path):
         _validate_bundle(tmp_path, hash_jobs=1)
 
 
+def test_logical_manifest_preflight_rejects_nested_graph_contract_before_archive(
+    tmp_path,
+):
+    _prefix_bundle(tmp_path)
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    manifest["bucket_results"][0]["manifest"]["graph_sidecar_schema"] = (
+        "stale_graph_schema"
+    )
+
+    with pytest.raises(ValueError, match="graph_sidecar_schema"):
+        publisher._validate_logical_manifest_contract(manifest)
+
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    objective = manifest["bucket_results"][0]["manifest"]["objective_contract"]
+    objective["payload"]["graph_auxiliary"]["relations"] = ["unknown"]
+    with pytest.raises(ValueError, match="unknown relations"):
+        publisher._validate_logical_manifest_contract(manifest)
+
+
 def test_validate_bundle_rejects_wrong_prefix_graph_schema(tmp_path):
     prefix = _prefix_bundle(tmp_path)
     manifest_path = prefix.with_suffix(".json")
@@ -1606,6 +1638,7 @@ def test_head_contract_requires_size_metadata_and_exact_server_sha256():
             "ContentLength": 8,
             "Metadata": {"sha256": digest},
             "ChecksumSHA256": expected_checksum,
+            "ChecksumType": "FULL_OBJECT",
         },
         size=8,
         sha256=digest,
@@ -1649,6 +1682,7 @@ def test_head_contract_accepts_nebius_metadata_key_casing():
             "ChecksumSHA256": base64.b64encode(bytes.fromhex(digest)).decode(
                 "ascii"
             ),
+            "ChecksumType": "FULL_OBJECT",
         },
         size=8,
         sha256=digest,
@@ -1822,6 +1856,7 @@ def test_small_upload_is_checksum_bound_and_create_only(tmp_path, monkeypatch):
                 "ContentLength": artifact.stat().st_size,
                 "Metadata": {"sha256": digest},
                 "ChecksumSHA256": expected_checksum,
+                "ChecksumType": "FULL_OBJECT",
                 "ETag": '"etag"',
             },
         ]
@@ -2203,6 +2238,7 @@ def test_latest_pointer_update_uses_remote_etag_compare_and_swap(tmp_path, monke
                 "ContentLength": artifact.stat().st_size,
                 "Metadata": {"sha256": digest},
                 "ChecksumSHA256": expected_checksum,
+                "ChecksumType": "FULL_OBJECT",
                 "ETag": '"new-etag"',
             },
         ]

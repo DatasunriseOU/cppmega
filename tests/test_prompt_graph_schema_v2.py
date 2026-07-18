@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import importlib
 
 import pytest
 
@@ -25,6 +26,19 @@ class _CharacterOffsetTokenizer:
         return list(range(1, len(text) + 1)), [
             (index, index + 1) for index in range(len(text))
         ]
+
+
+class _BoundaryMergingTokenizer:
+    name_or_path = "case3-schema-boundary-tokenizer"
+
+    def __init__(self, mapped_length: int):
+        self.mapped_length = mapped_length
+
+    def encode_with_offsets(self, text: str):
+        merge_start = self.mapped_length - 1
+        spans = [(index, index + 1) for index in range(merge_start)]
+        spans.append((merge_start, len(text)))
+        return list(range(1, len(spans) + 1)), spans
 
 
 PROJECT_ID = "tests/prompt-graph"
@@ -253,6 +267,111 @@ def test_v3_index_rejects_noncanonical_project_and_symbol_ids() -> None:
     payload["symbols"][0]["symbol_id"] += 1
     with pytest.raises(ValueError, match="does not match.*canonical ID"):
         PromptProjectIndex.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    ("cppmega.prompt_graph", "cppmega.data.prompt_graph"),
+)
+def test_structural_v3_payload_with_checksum_is_not_production_provenance(
+    module_name: str,
+) -> None:
+    prompt_graph = importlib.import_module(module_name)
+    index = prompt_graph.PromptProjectIndex.from_dict(_v3_payload()).with_integrity()
+
+    with pytest.raises(ValueError, match="production repository index requires producer"):
+        index.validate_production_repository_index()
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    ("cppmega.prompt_graph", "cppmega.data.prompt_graph"),
+)
+def test_builder_rejects_token_spanning_mapped_and_unmapped_text(
+    module_name: str,
+) -> None:
+    prompt_graph = importlib.import_module(module_name)
+    index = prompt_graph.PromptProjectIndex.from_dict(_v3_payload())
+    first, second = index.documents
+    mapped = first.source + "\n" + second.source
+    context = prompt_graph.PromptGraphContext(
+        segments=(
+            prompt_graph.PromptGraphSegment(
+                first.source,
+                document_id=first.id,
+                source_path=first.source_path,
+                source_start=0,
+            ),
+            prompt_graph.PromptGraphSegment("\n", role="separator"),
+            prompt_graph.PromptGraphSegment(
+                second.source,
+                document_id=second.id,
+                source_path=second.source_path,
+                source_start=0,
+            ),
+            prompt_graph.PromptGraphSegment(" synthetic", role="synthetic"),
+        )
+    )
+
+    with pytest.raises(ValueError, match="mapped and unmapped"):
+        prompt_graph.PromptGraphBuilder(
+            _BoundaryMergingTokenizer(len(mapped))
+        ).build(
+            index,
+            context,
+        )
+
+
+def test_root_and_data_prompt_graph_artifacts_have_identical_payload_contract() -> None:
+    modules = [
+        importlib.import_module("cppmega.prompt_graph"),
+        importlib.import_module("cppmega.data.prompt_graph"),
+    ]
+    payloads: list[dict[str, object]] = []
+    windows: list[dict[str, object]] = []
+
+    for prompt_graph in modules:
+        index = prompt_graph.PromptProjectIndex.from_dict(_v3_payload())
+        first, second = index.documents
+        artifact = prompt_graph.PromptGraphBuilder(
+            _CharacterOffsetTokenizer()
+        ).build(
+            index,
+            prompt_graph.PromptGraphContext(
+                segments=(
+                    prompt_graph.PromptGraphSegment(
+                        first.source,
+                        document_id=first.id,
+                        source_path=first.source_path,
+                        source_start=0,
+                    ),
+                    prompt_graph.PromptGraphSegment("\n", role="separator"),
+                    prompt_graph.PromptGraphSegment(
+                        second.source,
+                        document_id=second.id,
+                        source_path=second.source_path,
+                        source_start=0,
+                    ),
+                )
+            ),
+        )
+        payloads.append(artifact.to_dict())
+        model_inputs = artifact.model_inputs(
+            total_token_count=artifact.token_count,
+            window_start=0,
+            window_end=artifact.token_count,
+        )
+        windows.append(
+            {
+                "side_channels": model_inputs.side_channels,
+                "graph_routes": model_inputs.graph_routes,
+                "receipt": model_inputs.receipt,
+                "token_count": model_inputs.token_count,
+            }
+        )
+
+    assert payloads[0] == payloads[1]
+    assert windows[0] == windows[1]
 
 
 def test_prompt_graph_model_inputs_reject_non_enum_token_def_use() -> None:
