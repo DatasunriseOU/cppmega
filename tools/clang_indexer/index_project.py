@@ -1310,6 +1310,7 @@ def symbol_reference_for_cursor(
         relative_file = location_identity.file
         reference_project = location_identity.project
         reference_line = location_identity.line
+        reference_column = location_identity.column
     else:
         relative_file, is_project_local = _cursor_identity_location(
             cursor,
@@ -1318,6 +1319,7 @@ def symbol_reference_for_cursor(
         )
         reference_project = project_id if is_project_local else ""
         reference_line = int(getattr(location, "line", 0) or 0)
+        reference_column = int(getattr(location, "column", 0) or 0)
     provider, include_provenance = symbol_provider_provenance(relative_file)
     return {
         "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
@@ -1330,6 +1332,7 @@ def symbol_reference_for_cursor(
         "project": reference_project,
         "file": relative_file,
         "line": reference_line,
+        "column": reference_column,
         "provider": provider,
         "include_provenance": include_provenance,
     }

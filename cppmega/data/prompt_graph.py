@@ -30,6 +30,7 @@ from cppmega.symbol_identity import (
 from cppmega.prompt_graph_provenance import (
     INDEX_INTEGRITY_VERSION,
     INDEX_PAYLOAD_HASH_KEY,
+    PRODUCTION_IDENTITY_PROVENANCE_CONTRACT,
     PRODUCTION_INDEX_PRODUCER,
     PRODUCTION_INDEX_VERSION,
     TRUSTED_IDENTITY_ADAPTERS,
@@ -514,6 +515,13 @@ class PromptGraphSymbol:
     canonical_signature: str = ""
     qname: str = ""
     chunk_identity: str = ""
+    identity_project: str = ""
+    identity_file: str = ""
+    identity_line: int = 0
+    identity_column: int = 0
+    identity_kind: str = ""
+    identity_provider: str = ""
+    identity_include_provenance: str = ""
 
     @classmethod
     def from_dict(cls, row: Mapping[str, Any]) -> "PromptGraphSymbol":
@@ -542,6 +550,19 @@ class PromptGraphSymbol:
             canonical_signature=str(row.get("canonical_signature") or ""),
             qname=str(row.get("qname") or ""),
             chunk_identity=str(row.get("chunk_identity") or ""),
+            identity_project=str(row.get("identity_project") or ""),
+            identity_file=str(row.get("identity_file") or ""),
+            identity_line=_require_int(
+                row.get("identity_line", 0), where="symbol.identity_line"
+            ),
+            identity_column=_require_int(
+                row.get("identity_column", 0), where="symbol.identity_column"
+            ),
+            identity_kind=str(row.get("identity_kind") or ""),
+            identity_provider=str(row.get("identity_provider") or ""),
+            identity_include_provenance=str(
+                row.get("identity_include_provenance") or ""
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -560,6 +581,13 @@ class PromptGraphSymbol:
             "start": self.start,
             "end": self.end,
             "chunk_identity": self.chunk_identity,
+            "identity_project": self.identity_project,
+            "identity_file": self.identity_file,
+            "identity_line": self.identity_line,
+            "identity_column": self.identity_column,
+            "identity_kind": self.identity_kind,
+            "identity_provider": self.identity_provider,
+            "identity_include_provenance": self.identity_include_provenance,
         }
 
 
@@ -3202,6 +3230,7 @@ __all__ = [
     "PromptProjectIndex",
     "PRODUCTION_INDEX_PRODUCER",
     "PRODUCTION_INDEX_VERSION",
+    "PRODUCTION_IDENTITY_PROVENANCE_CONTRACT",
     "TOKEN_SIDECAR_DEFAULTS",
     "TOKEN_SIDECAR_NAMES",
     "TRIPLE_ROUTE_KEYS",
