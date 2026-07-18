@@ -123,6 +123,17 @@ def test_package_data_includes_cuda_headers_needed_by_extension_build() -> None:
     package_data = pyproject["tool"]["setuptools"]["package-data"]["cppmega"]
 
     assert "megatron/cuda_ext/*.hpp" in package_data
+    assert "data/domain_schema_v1.json" in package_data
+    assert "tokenizer/tokenizer.json" in package_data
+    assert "tokenizer/tokenizer_contract_v1.json" in package_data
+
+
+def test_package_discovery_does_not_publish_sibling_mlx_namespace() -> None:
+    pyproject = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text())
+    include = pyproject["tool"]["setuptools"]["packages"]["find"]["include"]
+
+    assert include == ["cppmega", "cppmega.*"]
+    assert "cppmega*" not in include
 
 
 def test_prepare_data_dispatcher_runs_fail_closed_gates_before_trainable_verify() -> None:
@@ -150,6 +161,35 @@ def test_tokenizer_contract_verifier_rejects_unpaired_domain_delimiter() -> None
 
     with pytest.raises(verify.ContractError, match="CPP_CODE_END"):
         verify.check_domain_delimiter_roles(contract, id_to_token)
+
+
+def test_tokenizer_contract_verifier_derives_all_case5_delimiters_from_schema() -> None:
+    verify = _load_module(
+        "verify_tokenizer_contract_case5_schema",
+        "scripts/data/verify_tokenizer_contract.py",
+    )
+
+    pairs = verify.load_domain_delimiter_role_pairs(
+        _REPO_ROOT / "data/domain_schema_v1.json"
+    )
+
+    assert len(pairs) == 29
+    assert ("CONFIGURE_START", "CONFIGURE_END") in pairs
+    assert ("KSH_START", "KSH_END") in pairs
+    assert ("PYTHON_START", "PYTHON_END") in pairs
+    assert ("SQL_START", "SQL_END") in pairs
+    assert ("LINKER_DIAGNOSTIC_START", "LINKER_DIAGNOSTIC_END") in pairs
+    assert ("SANITIZER_OUTPUT_START", "SANITIZER_OUTPUT_END") in pairs
+
+
+def test_self_hosted_ci_verifies_only_explicit_checked_out_tokenizer_contracts() -> None:
+    workflow = (_REPO_ROOT / ".github/workflows/ci-self-hosted.yml").read_text()
+    invocation = workflow.split("scripts/data/verify_tokenizer_contract.py", 1)[1]
+
+    assert '--contract "${GITHUB_WORKSPACE}/data/tokenizer_v2/tokenizer_contract_v1.json"' in invocation
+    assert '--tokenizer "${GITHUB_WORKSPACE}/data/tokenizer_v2/tokenizer.json"' in invocation
+    assert '--domain-schema "${GITHUB_WORKSPACE}/data/domain_schema_v1.json"' in invocation
+    assert "--root /Volumes/external/sources" not in invocation
 
 
 def test_tokenizer_contract_verifier_rejects_reserved_whitespace_slot(

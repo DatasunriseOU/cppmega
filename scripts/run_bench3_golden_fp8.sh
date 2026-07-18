@@ -12,7 +12,7 @@
 # Iterations:    15 (override with TRAIN_ITERS env)
 #
 # Prerequisites:
-#   - bench3 stack: torch 2.12+cu132, mamba_ssm 2.3.1, TE 2.13, Megatron 0.18
+#   - bench3 stack: torch 2.13.0+cu132, mamba_ssm 2.3.1, TE 2.13, Megatron 0.18
 #   - ${REMOTE_ROOT:-/mnt/data/cppmega-root}/cppmega checked out at commit
 #     a9ebb78+ (post-dd4da34 unconditional patches)
 #   - Dataset prepared via scripts/data_prep_parquet_to_megatron.py

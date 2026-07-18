@@ -43,7 +43,7 @@ def test_selective_attention_filters_pp_layer_offset_from_mla_path(monkeypatch):
 
     monkeypatch.setattr(nam56r_full_spec.TransformerLayer, "__init__", fake_transformer_layer_init)
 
-    config = object()
+    config = SimpleNamespace(experimental_attention_variant="original")
     attention_layers = (1, 5, 9, 13)
 
     nam56r_full_spec.CppMegaSelectiveAttentionLayer(
@@ -68,8 +68,15 @@ def test_selective_attention_filters_pp_layer_offset_from_mla_path(monkeypatch):
     mla_kwargs = init_calls[0]
     dsa_kwargs = init_calls[1]
 
+    mla_config = mla_kwargs.pop("config")
+    dsa_config = dsa_kwargs.pop("config")
+    assert mla_config is not config
+    assert mla_config.experimental_attention_variant is None
+    assert dsa_config is not config
+    assert dsa_config.experimental_attention_variant == "dsa"
+    assert config.experimental_attention_variant == "original"
+
     assert mla_kwargs == {
-        "config": config,
         "submodules": "mla-submodules",
         "layer_number": 1,
         "pg_collection": "pg",
@@ -78,7 +85,6 @@ def test_selective_attention_filters_pp_layer_offset_from_mla_path(monkeypatch):
         "is_mtp_layer": True,
     }
     assert dsa_kwargs == {
-        "config": config,
         "submodules": "dsa-submodules",
         "layer_number": 5,
         "pg_collection": "pg",

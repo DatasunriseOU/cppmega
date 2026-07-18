@@ -2,14 +2,14 @@
 """Mirror the cppmega.mlx token-enriched parquet rewrite onto OUR parquet, plus
 backfill of GENUINELY DERIVABLE missing metadata.
 
-RUN WITH: /Volumes/external/sources/cppmega.mlx/.venv/bin/python (pyarrow 21.x).
+Run with a cppmega-local Python environment that provides pyarrow 21.x.
 
 WHAT THIS DOES (and what it deliberately does NOT do)
 =====================================================
 Forensic finding (verified on disk, NOT assumed):
 
   * The cppmega.mlx token transformation (the 13 `token_*` columns added by
-    materialize_tokenized_enriched_batch, with narrow uint32/uint16/uint8 dtypes
+    materialize_tokenized_enriched_batch, with field-specific integer dtypes
     and an EMPTY schema-level key/value metadata footer) is ALREADY APPLIED
     in place to both clang keeper datasets:
         - clang_semantic_4k_v10   (CODE,    66 shards)
@@ -82,6 +82,17 @@ import pyarrow as pa  # type: ignore[import-not-found]
 import pyarrow.compute as pc  # type: ignore[import-not-found]
 import pyarrow.parquet as pq  # type: ignore[import-not-found]
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from cppmega.symbol_identity import (  # noqa: E402
+    SYMBOL_IDENTITIES_COLUMN,
+    SYMBOL_IDENTITY_SCHEMA_METADATA_KEY,
+    SYMBOL_IDENTITY_SCHEMA_VERSION,
+    SymbolIdentityRegistry,
+)
+
 
 PARQUET_ROOT = Path("/Users/dave/sources/parquet")
 
@@ -111,6 +122,11 @@ MLX_TOKEN_COLUMNS: dict[str, pa.DataType] = {
 
 # Original columns whose preservation we verify with extra emphasis.
 CRITICAL_PRESERVE_COLUMNS = ("text", "token_ids", "actual_token_count")
+SYMBOL_ID_TOKEN_COLUMNS = (
+    "token_symbol_ids",
+    "token_call_targets",
+    "token_type_refs",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -222,13 +238,69 @@ def assert_mlx_token_columns(schema: pa.Schema, shard: Path) -> None:
                 f"[mirror] WHERE={shard} WHAT=dtype mismatch on {col!r}: "
                 f"on-disk={actual} expected(mlx)={expected}"
             )
+    symbol_columns = set(SYMBOL_ID_TOKEN_COLUMNS) & names
     footer = schema.metadata or {}
-    if footer:
+    if not symbol_columns and footer:
         raise ValueError(
             f"[mirror] WHERE={shard} WHAT=unexpected schema footer metadata "
             f"{list(footer.keys())!r}; mlx live shards have an EMPTY footer. "
             f"Refusing to alter metadata semantics."
         )
+    if symbol_columns:
+        if symbol_columns != set(SYMBOL_ID_TOKEN_COLUMNS):
+            raise ValueError(
+                f"[mirror] WHERE={shard} WHAT=partial semantic symbol columns: "
+                f"{sorted(symbol_columns)}"
+            )
+        raw_version = footer.get(
+            SYMBOL_IDENTITY_SCHEMA_METADATA_KEY.encode("ascii")
+        )
+        if raw_version != str(SYMBOL_IDENTITY_SCHEMA_VERSION).encode("ascii"):
+            raise ValueError(
+                f"[mirror] WHERE={shard} WHAT=semantic symbol columns require "
+                f"identity schema v{SYMBOL_IDENTITY_SCHEMA_VERSION}, got "
+                f"{raw_version!r}"
+            )
+        for column in SYMBOL_ID_TOKEN_COLUMNS:
+            column_type = schema.field(column).type
+            if not (
+                pa.types.is_list(column_type)
+                or pa.types.is_large_list(column_type)
+            ) or column_type.value_type != pa.uint64():
+                raise ValueError(
+                    f"[mirror] WHERE={shard}:{column} WHAT=expected list<uint64>, "
+                    f"got {column_type}"
+                )
+        if SYMBOL_IDENTITIES_COLUMN not in names:
+            raise ValueError(
+                f"[mirror] WHERE={shard} WHAT=missing {SYMBOL_IDENTITIES_COLUMN}"
+            )
+
+
+def validate_symbol_identity_rows(
+    table: pa.Table,
+    shard: Path,
+    corpus_registry: SymbolIdentityRegistry,
+) -> None:
+    if not (set(SYMBOL_ID_TOKEN_COLUMNS) & set(table.column_names)):
+        return
+    identity_rows = table.column(SYMBOL_IDENTITIES_COLUMN).to_pylist()
+    semantic_rows = {
+        column: table.column(column).to_pylist()
+        for column in SYMBOL_ID_TOKEN_COLUMNS
+    }
+    for row_index, records in enumerate(identity_rows):
+        source = f"{shard}:row={row_index}"
+        row_registry = SymbolIdentityRegistry()
+        row_registry.register_records(records, source=source)
+        corpus_registry.register_records(records, source=source)
+        used_ids = {
+            int(value)
+            for rows in semantic_rows.values()
+            for value in rows[row_index]
+            if int(value) != 0
+        }
+        row_registry.require_ids(used_ids, source=source)
 
 
 def build_backfilled_table(
@@ -467,6 +539,7 @@ def process_shard(
     shard: Path,
     plan: dict,
     mode: str,
+    identity_registry: SymbolIdentityRegistry,
 ) -> dict:
     """Process one shard. Returns a JSON-serializable per-shard record."""
     backfills: list[BackfillSpec] = plan["backfills"]
@@ -474,6 +547,7 @@ def process_shard(
 
     # VERIFY (mirror): mlx token columns + empty footer must already be in place.
     assert_mlx_token_columns(original.schema, shard)
+    validate_symbol_identity_rows(original, shard, identity_registry)
 
     # Build the backfilled table (or identity if verify_only / no backfills).
     new_table, build_report = build_backfilled_table(original, backfills, shard)
@@ -636,10 +710,11 @@ def main() -> int:
         "rows_total": 0,
         "rows_backfilled": 0,
     }
+    identity_registry = SymbolIdentityRegistry()
 
     for shard in shards:
         try:
-            rec = process_shard(shard, plan, args.mode)
+            rec = process_shard(shard, plan, args.mode, identity_registry)
         except Exception as exc:  # noqa: BLE001 - we re-raise after recording WHERE/WHAT
             summary["errors"] += 1
             print(json.dumps({"shard": str(shard), "state": "error", "error": str(exc)}))

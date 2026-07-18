@@ -1,18 +1,36 @@
-"""Numerical-parity tests for the TileLang Path C FP8 amax/quantize port.
+"""Optional parity tests for a separately supplied TileLang FP8 reference.
 
-The kernels under test live at
-``cppmega_mlx/nn/_tilelang/fp8_amax.py`` and replace the CUDA-only Triton
-``_amax_kernel`` / ``_quantize_kernel`` in
-``cppmega/megatron/fp8_activations.py`` on hosts where TileLang is available
-(both CUDA and Apple Metal SIMDgroup).
+Set ``CPPMEGA_MLX_REFERENCE_ROOT`` to a cppmega.mlx checkout to enable these
+tests. Production dispatch remains in ``cppmega.megatron`` and never imports
+the reference package.
 """
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import sys
+
 import pytest
 import torch
 
-pytest.importorskip("cppmega_mlx.nn._tilelang.fp8_amax")
+
+_REFERENCE_ROOT_RAW = os.environ.get("CPPMEGA_MLX_REFERENCE_ROOT")
+if not _REFERENCE_ROOT_RAW:
+    pytest.skip(
+        "set CPPMEGA_MLX_REFERENCE_ROOT to enable optional FP8 parity tests",
+        allow_module_level=True,
+    )
+_REFERENCE_ROOT = Path(_REFERENCE_ROOT_RAW).expanduser().resolve()
+if not (_REFERENCE_ROOT / "cppmega_mlx" / "__init__.py").is_file():
+    pytest.skip(
+        f"invalid CPPMEGA_MLX_REFERENCE_ROOT: {_REFERENCE_ROOT}",
+        allow_module_level=True,
+    )
+sys.path.insert(0, str(_REFERENCE_ROOT))
+
+_reference_module = pytest.importorskip("cppmega_mlx.nn._tilelang.fp8_amax")
+assert Path(_reference_module.__file__).resolve().is_relative_to(_REFERENCE_ROOT)
 from cppmega_mlx.nn._tilelang.fp8_amax import (  # noqa: E402
     _FP8_E4M3_MAX,
     _bucket_n,
@@ -356,7 +374,8 @@ def test_wave9_concurrent_amax_compile():
 
     import threading
 
-    if not tilelang_supports():
+    device = _pick_device()
+    if device.type == "cpu" or not tilelang_supports(device):
         pytest.skip("tilelang build path unreachable on this host")
 
     from cppmega_mlx.nn._tilelang.fp8_amax import (  # noqa: E402

@@ -23,7 +23,6 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange
 
 from megatron.core.ssm.mamba_mixer import MambaMixerSubmodules
@@ -33,7 +32,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.inference.contexts.base_context import BaseInferenceContext
-from megatron.core.inference.contexts.static_context import deprecate_inference_params
+from megatron.core.utils import deprecate_inference_params
 
 from cppmega.features.mamba3 import build_author_mamba3_config
 
@@ -48,9 +47,6 @@ from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 from mamba_ssm.ops.triton.mamba3.mamba3_siso_combined import mamba3_siso_combined
 from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo as mamba3_mimo_combined
 from mamba_ssm.ops.triton.angle_cumsum import angle_dt
-from mamba_ssm.ops.triton.mamba3.mamba3_mimo_rotary_step import (
-    apply_rotary_qk_inference_fwd,
-)
 
 try:
     from mamba_ssm.ops.cute.mamba3.mamba3_step_fn import mamba3_step_fn
@@ -180,11 +176,6 @@ class CppMegaMamba3TE(MegatronModule):
         trap_size = self.nheads_local_tp
         angle_size = self.num_rope_angles  # broadcast, not TP-sharded per head
 
-        # Total per-TP-rank output size (before TP concat)
-        d_in_proj_local = (
-            z_size + x_size + B_size + C_size
-            + dd_dt_size + dd_A_size + trap_size + angle_size
-        )
         # Global output size for the full (unsharded) projection
         d_in_proj_global = (
             2 * self.d_inner

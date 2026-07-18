@@ -8,7 +8,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from cppmega.megatron import structure_dataset_patch as patch
+from cppmega.megatron import structure_dataset_patch as patch  # noqa: E402
 
 
 def _load_converter_module():
@@ -31,7 +31,10 @@ def _load_converter_module():
 def test_megatron_converter_defaults_include_domain_token_and_graph_sidecars():
     converter = _load_converter_module()
     token_names = [name for name, _ in converter.DEFAULT_CPPMEGA_TOKEN_SIDE_CHANNELS]
-    graph_specs = {name: (kind, dtype) for name, kind, dtype in converter.DEFAULT_CPPMEGA_GRAPH_SIDECARS}
+    graph_specs = {
+        name: (kind, dtype)
+        for name, kind, dtype in converter.DEFAULT_CPPMEGA_GRAPH_SIDECARS
+    }
 
     assert "token_domain_ids" in token_names
     assert "token_role_ids" in token_names
@@ -73,8 +76,14 @@ def test_structure_patch_requires_only_consumed_token_sidecars(monkeypatch):
 
 def test_structure_dataset_patch_remaps_domain_edge_triples_to_batch_tensors():
     graph_sidecars = {
-        "token_call_edges": {"offsets": np.array([0, 0]), "data": np.empty((0, 2), dtype=np.int32)},
-        "token_type_edges": {"offsets": np.array([0, 0]), "data": np.empty((0, 2), dtype=np.int32)},
+        "token_call_edges": {
+            "offsets": np.array([0, 0]),
+            "data": np.empty((0, 2), dtype=np.int32),
+        },
+        "token_type_edges": {
+            "offsets": np.array([0, 0]),
+            "data": np.empty((0, 2), dtype=np.int32),
+        },
         "token_domain_edges": {
             "offsets": np.array([0, 2]),
             "data": np.array([[1, 3, 20], [7, 8, 20]], dtype=np.int32),
@@ -83,7 +92,10 @@ def test_structure_dataset_patch_remaps_domain_edge_triples_to_batch_tensors():
             "offsets": np.array([0, 1]),
             "data": np.array([[2, 4, 21]], dtype=np.int32),
         },
-        "token_shell_edges": {"offsets": np.array([0, 0]), "data": np.empty((0, 3), dtype=np.int32)},
+        "token_shell_edges": {
+            "offsets": np.array([0, 0]),
+            "data": np.empty((0, 3), dtype=np.int32),
+        },
         "token_diagnostic_edges": {
             "offsets": np.array([0, 1]),
             "data": np.array([[4, 1, 60]], dtype=np.int32),
@@ -92,10 +104,22 @@ def test_structure_dataset_patch_remaps_domain_edge_triples_to_batch_tensors():
             "offsets": np.array([0, 1]),
             "data": np.array([[4, 2, 62]], dtype=np.int32),
         },
-        "token_chunk_starts": {"offsets": np.array([0, 0]), "data": np.empty((0,), dtype=np.uint32)},
-        "token_chunk_ends": {"offsets": np.array([0, 0]), "data": np.empty((0,), dtype=np.uint32)},
-        "token_chunk_kinds": {"offsets": np.array([0, 0]), "data": np.empty((0,), dtype=np.uint16)},
-        "token_chunk_dep_levels": {"offsets": np.array([0, 0]), "data": np.empty((0,), dtype=np.uint16)},
+        "token_chunk_starts": {
+            "offsets": np.array([0, 0]),
+            "data": np.empty((0,), dtype=np.uint32),
+        },
+        "token_chunk_ends": {
+            "offsets": np.array([0, 0]),
+            "data": np.empty((0,), dtype=np.uint32),
+        },
+        "token_chunk_kinds": {
+            "offsets": np.array([0, 0]),
+            "data": np.empty((0,), dtype=np.uint8),
+        },
+        "token_chunk_dep_levels": {
+            "offsets": np.array([0, 0]),
+            "data": np.empty((0,), dtype=np.uint16),
+        },
     }
     spans = [
         {
@@ -115,9 +139,17 @@ def test_structure_dataset_patch_remaps_domain_edge_triples_to_batch_tensors():
         max_chunks=1,
     )
 
-    assert torch.equal(out["graph_domain_edges"], torch.tensor([[0, 2, 20], [-1, -1, -1]]))
+    assert torch.equal(
+        out["graph_domain_edges"], torch.tensor([[0, 2, 20], [-1, -1, -1]])
+    )
     assert out["graph_domain_edge_counts"].item() == 1
-    assert torch.equal(out["graph_build_edges"], torch.tensor([[1, 3, 21], [-1, -1, -1]]))
+    assert torch.equal(
+        out["graph_build_edges"], torch.tensor([[1, 3, 21], [-1, -1, -1]])
+    )
     assert out["graph_build_edge_counts"].item() == 1
-    assert torch.equal(out["graph_diagnostic_edges"], torch.tensor([[3, 0, 60], [-1, -1, -1]]))
-    assert torch.equal(out["graph_cross_domain_edges"], torch.tensor([[3, 1, 62], [-1, -1, -1]]))
+    assert torch.equal(
+        out["graph_diagnostic_edges"], torch.tensor([[3, 0, 60], [-1, -1, -1]])
+    )
+    assert torch.equal(
+        out["graph_cross_domain_edges"], torch.tensor([[3, 1, 62], [-1, -1, -1]])
+    )

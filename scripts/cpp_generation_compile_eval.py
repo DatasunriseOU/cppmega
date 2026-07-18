@@ -33,6 +33,65 @@ COMPLETION_KEYS = ("completion", "generated_text", "text", "candidate")
 FENCE_RE = re.compile(r"```(?:[A-Za-z0-9_+.#-]+)?\s*\n(.*?)```", re.DOTALL)
 
 
+def resolve_clang_format(command: str) -> str:
+    """Resolve the default formatter without weakening the format gate."""
+
+    if os.path.sep in command or (os.path.altsep and os.path.altsep in command):
+        return command
+
+    resolved = shutil.which(command)
+    if resolved is not None:
+        return resolved
+
+    if command == DEFAULT_CLANG_FORMAT and shutil.which("xcrun") is not None:
+        try:
+            probe = subprocess.run(
+                ["xcrun", "--find", command],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            probe = None
+        if probe is not None:
+            candidate = probe.stdout.strip()
+            if probe.returncode == 0 and candidate:
+                return candidate
+
+    if command == DEFAULT_CLANG_FORMAT:
+        for candidate in (
+            Path("/opt/homebrew/opt/llvm/bin/clang-format"),
+            Path("/usr/local/opt/llvm/bin/clang-format"),
+        ):
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+
+    return command
+
+
+def _relative_path(raw: Any, *, where: str) -> Path:
+    if not isinstance(raw, str) or not raw:
+        raise ValueError(f"{where} must be a non-empty relative path")
+    path = Path(raw)
+    if path.is_absolute() or ".." in path.parts or not path.parts:
+        raise ValueError(f"{where} must be a contained relative path")
+    return path
+
+
+def _contained_path(root: Path, raw: Any, *, where: str) -> Path:
+    if raw == ".":
+        return root.resolve()
+    relative = _relative_path(raw, where=where)
+    root = root.resolve()
+    resolved = (root / relative).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{where} escapes {root}") from exc
+    return resolved
+
+
 @dataclass(frozen=True)
 class CppGenerationCase:
     task_id: str
@@ -43,9 +102,18 @@ class CppGenerationCase:
     compile_args: tuple[str, ...] = DEFAULT_COMPILE_ARGS
     timeout_s: float = DEFAULT_TIMEOUT_S
     sidecar_contract: dict[str, Any] | None = None
+    compile_context: str = "standalone"
+    repository_root: Path | None = None
+    candidate_source_path: Path | None = None
+    compile_sources: tuple[Path, ...] = ()
 
     @classmethod
-    def from_json(cls, row: dict[str, Any]) -> "CppGenerationCase":
+    def from_json(
+        cls,
+        row: dict[str, Any],
+        *,
+        cases_dir: Path | None = None,
+    ) -> "CppGenerationCase":
         for key in ("task_id", "prompt", "source_prefix", "source_suffix"):
             if not isinstance(row.get(key), str) or not row[key]:
                 raise ValueError(f"case row needs non-empty string field {key!r}")
@@ -70,6 +138,92 @@ class CppGenerationCase:
         sidecar_contract = row.get("sidecar_contract")
         if sidecar_contract is not None and not isinstance(sidecar_contract, dict):
             raise ValueError(f"{row['task_id']}: sidecar_contract must be object")
+        compile_context = str(row.get("compile_context", "standalone"))
+        if compile_context not in {"standalone", "repository"}:
+            raise ValueError(
+                f"{row['task_id']}: compile_context must be standalone or repository"
+            )
+        if row.get("prompt_graph_mode") == "repo" and compile_context != "repository":
+            raise ValueError(
+                f"{row['task_id']}: repository graph cases require "
+                "compile_context='repository'"
+            )
+
+        repository_root: Path | None = None
+        candidate_source_path: Path | None = None
+        compile_sources: tuple[Path, ...] = ()
+        if compile_context == "repository":
+            if cases_dir is None:
+                raise ValueError(
+                    f"{row['task_id']}: repository compile context requires cases_dir"
+                )
+            repository_root = _contained_path(
+                cases_dir,
+                row.get("prompt_graph_repo"),
+                where=f"{row['task_id']}.prompt_graph_repo",
+            )
+            if not repository_root.is_dir():
+                raise FileNotFoundError(
+                    f"{row['task_id']}: repository root not found: {repository_root}"
+                )
+            candidate_source_path = _relative_path(
+                row.get("prompt_source_path"),
+                where=f"{row['task_id']}.prompt_source_path",
+            )
+            raw_sources = row.get("compile_sources")
+            if not isinstance(raw_sources, list) or not raw_sources:
+                raise ValueError(
+                    f"{row['task_id']}: repository compile requires compile_sources"
+                )
+            compile_sources = tuple(
+                _relative_path(
+                    value,
+                    where=f"{row['task_id']}.compile_sources[{index}]",
+                )
+                for index, value in enumerate(raw_sources)
+            )
+            if candidate_source_path not in compile_sources:
+                raise ValueError(
+                    f"{row['task_id']}: compile_sources must include "
+                    f"{candidate_source_path}"
+                )
+            for relative in compile_sources:
+                source = (repository_root / relative).resolve()
+                try:
+                    source.relative_to(repository_root)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{row['task_id']}: compile source escapes repository"
+                    ) from exc
+                if not source.is_file():
+                    raise FileNotFoundError(
+                        f"{row['task_id']}: compile source not found: {source}"
+                    )
+            original = (repository_root / candidate_source_path).read_text(
+                encoding="utf-8"
+            )
+            if not original.startswith(row["source_prefix"]) or not original.endswith(
+                row["source_suffix"]
+            ):
+                raise ValueError(
+                    f"{row['task_id']}: repository candidate source does not match "
+                    "source_prefix/source_suffix"
+                )
+            forbidden_link_flags = {
+                "-c",
+                "-E",
+                "-M",
+                "-MM",
+                "-S",
+                "-fsyntax-only",
+                "-o",
+            }
+            present = forbidden_link_flags.intersection(compile_args)
+            if present:
+                raise ValueError(
+                    f"{row['task_id']}: repository compile must link; forbidden "
+                    f"compile_args={sorted(present)}"
+                )
         return cls(
             task_id=row["task_id"],
             prompt=row["prompt"],
@@ -79,6 +233,10 @@ class CppGenerationCase:
             compile_args=tuple(compile_args),
             timeout_s=timeout_s,
             sidecar_contract=sidecar_contract,
+            compile_context=compile_context,
+            repository_root=repository_root,
+            candidate_source_path=candidate_source_path,
+            compile_sources=compile_sources,
         )
 
 
@@ -100,7 +258,10 @@ def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
 def load_cases(path: Path) -> dict[str, CppGenerationCase]:
     cases: dict[str, CppGenerationCase] = {}
     for row in iter_jsonl(path):
-        case = CppGenerationCase.from_json(row)
+        case = CppGenerationCase.from_json(
+            row,
+            cases_dir=path.resolve().parent,
+        )
         if case.task_id in cases:
             raise ValueError(f"duplicate task_id in cases: {case.task_id}")
         cases[case.task_id] = case
@@ -245,7 +406,6 @@ def evaluate_case(
 ) -> dict[str, Any]:
     case_dir = work_root / case.task_id
     case_dir.mkdir(parents=True, exist_ok=True)
-    source_path = case_dir / ("candidate.c" if case.language == "c" else "candidate.cpp")
     exe_path = case_dir / "candidate"
 
     if completion is None:
@@ -255,10 +415,25 @@ def evaluate_case(
             "compile_ok": False,
             "run_ok": False,
             "missing_completion": True,
+            "compile_context": case.compile_context,
             "sidecar_contract": case.sidecar_contract or {},
         }
 
     source = compose_source(case, completion)
+    if case.compile_context == "repository":
+        assert case.repository_root is not None
+        assert case.candidate_source_path is not None
+        repository_workdir = case_dir / "repository"
+        shutil.copytree(case.repository_root, repository_workdir)
+        source_path = repository_workdir / case.candidate_source_path
+        compile_cwd = repository_workdir
+        compile_inputs = [str(path) for path in case.compile_sources]
+    else:
+        source_path = case_dir / (
+            "candidate.c" if case.language == "c" else "candidate.cpp"
+        )
+        compile_cwd = case_dir
+        compile_inputs = [str(source_path)]
     format_result: dict[str, Any] | None = None
     if clang_format is not None:
         source, format_result = _run_clang_format(
@@ -276,6 +451,7 @@ def evaluate_case(
             "compile_ok": False,
             "run_ok": False,
             "missing_completion": False,
+            "compile_context": case.compile_context,
             "source_path": str(source_path),
             "clang_format": format_result,
             "compile_cmd": None,
@@ -284,11 +460,19 @@ def evaluate_case(
             "sidecar_contract": case.sidecar_contract or {},
         }
 
-    compile_cmd = [compiler, *case.compile_args, str(source_path), "-o", str(exe_path)]
-    compile_result = _run_cmd(compile_cmd, cwd=case_dir, timeout_s=case.timeout_s)
+    compile_cmd = [compiler, *case.compile_args, *compile_inputs, "-o", str(exe_path)]
+    compile_result = _run_cmd(
+        compile_cmd,
+        cwd=compile_cwd,
+        timeout_s=case.timeout_s,
+    )
     run_result: dict[str, Any] | None = None
     if compile_result["ok"]:
-        run_result = _run_cmd([str(exe_path)], cwd=case_dir, timeout_s=case.timeout_s)
+        run_result = _run_cmd(
+            [str(exe_path)],
+            cwd=compile_cwd,
+            timeout_s=case.timeout_s,
+        )
 
     compile_ok = bool(compile_result["ok"])
     run_ok = bool(run_result and run_result["ok"])
@@ -298,6 +482,9 @@ def evaluate_case(
         "compile_ok": compile_ok,
         "run_ok": run_ok,
         "missing_completion": False,
+        "compile_context": case.compile_context,
+        "compile_cwd": str(compile_cwd),
+        "linked_sources": compile_inputs,
         "source_path": str(source_path),
         "clang_format": format_result,
         "compile_cmd": compile_cmd,
@@ -392,6 +579,9 @@ def evaluate_suite(
             "c_compiler": c_compiler,
             "clang_format": clang_format,
             "jobs": jobs,
+            "repository_cases": sum(
+                1 for case in cases.values() if case.compile_context == "repository"
+            ),
         },
         "results": results,
     }
@@ -425,7 +615,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--c-compiler", default=os.environ.get("CC", "clang"))
     parser.add_argument(
         "--clang-format",
-        default=os.environ.get("CLANG_FORMAT", DEFAULT_CLANG_FORMAT),
+        default=resolve_clang_format(
+            os.environ.get("CLANG_FORMAT", DEFAULT_CLANG_FORMAT)
+        ),
         help="clang-format binary used before compile; default: %(default)s",
     )
     parser.add_argument(

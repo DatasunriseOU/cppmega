@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>cppmega | Hardening 2026-07-16</title>
+  <style>
+    :root { color-scheme: light; --ink:#17212b; --muted:#5f6b76; --line:#d8dee5; --paper:#f7f9fb; --blue:#1769aa; --green:#16794b; --amber:#a85b00; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--paper); color:var(--ink); font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { max-width:1120px; margin:0 auto; padding:42px 24px 72px; }
+    header { border-bottom:3px solid var(--ink); padding-bottom:24px; margin-bottom:28px; }
+    h1 { font-size:clamp(30px,5vw,52px); line-height:1.05; margin:0 0 12px; letter-spacing:0; }
+    h2 { margin:34px 0 12px; font-size:25px; border-bottom:1px solid var(--line); padding-bottom:8px; }
+    h3 { margin:22px 0 8px; font-size:19px; }
+    p { margin:9px 0; }
+    a { color:var(--blue); }
+    .meta { color:var(--muted); }
+    .summary { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:12px; margin:26px 0; }
+    .metric { background:#fff; border:1px solid var(--line); border-left:5px solid var(--green); padding:15px 16px; }
+    .metric strong { display:block; font-size:24px; line-height:1.15; }
+    .metric span { color:var(--muted); font-size:13px; }
+    .table-wrap { max-width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; margin:12px 0 20px; }
+    table { border-collapse:collapse; width:100%; background:#fff; margin:0; }
+    th,td { border:1px solid var(--line); padding:10px 12px; text-align:left; vertical-align:top; }
+    th { background:#edf2f6; font-weight:700; }
+    code { background:#eaf0f5; padding:2px 5px; border-radius:3px; font-size:.92em; overflow-wrap:anywhere; word-break:break-word; }
+    .ok { color:var(--green); font-weight:700; }
+    .warn { color:var(--amber); font-weight:700; }
+    .bar { height:12px; background:#e5ebf0; margin-top:7px; }
+    .bar i { display:block; height:100%; background:var(--green); }
+    .source-list { columns:2 360px; column-gap:36px; }
+    .source-list li { break-inside:avoid; margin:5px 0; }
+    footer { border-top:1px solid var(--line); margin-top:40px; padding-top:16px; color:var(--muted); font-size:13px; }
+    @media (max-width:650px) { main { padding:25px 15px 48px; } table { min-width:560px; font-size:14px; } th,td { padding:8px; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>cppmega: hardening окружения и CI</h1>
+    <p class="meta">16 июля 2026 · ветка <code>codex/canonical-complete-20260715</code> · <a href="https://github.com/DatasunriseOU/cppmega/tree/codex/canonical-complete-20260715">исходный репозиторий</a></p>
+  </header>
+
+  <section class="summary">
+    <div class="metric"><strong class="ok">1385</strong><span>passed в полном Megatron suite</span><div class="bar"><i style="width:100%"></i></div></div>
+    <div class="metric"><strong>159</strong><span>skipped, в основном hardware/receipt gates</span><div class="bar"><i style="width:12%"></i></div></div>
+    <div class="metric"><strong>104</strong><span>selected environment/CI tests</span><div class="bar"><i style="width:82%"></i></div></div>
+    <div class="metric"><strong class="ok">PASS</strong><span>Ruff changed files, compileall, bash -n, diff check</span><div class="bar"><i style="width:100%"></i></div></div>
+  </section>
+
+  <h2>Что сделано</h2>
+  <h3>Dedicated Megatron receipt</h3>
+  <p>Pytest больше не принимает случайный namespace или ambient source tree. Выбранный Megatron должен быть реальным Git checkout с чистым состоянием и exact commit receipt. Альтернативный root, не совпадающий с receipt, требует отдельный <code>CPPMEGA_MEGATRON_COMMIT</code>.</p>
+  <ul class="source-list">
+    <li><a href="https://github.com/DatasunriseOU/cppmega/blob/codex/canonical-complete-20260715/conftest.py">conftest.py</a></li>
+    <li><a href="https://github.com/DatasunriseOU/cppmega/blob/codex/canonical-complete-20260715/scripts/env/cppmega_env.py">scripts/env/cppmega_env.py</a></li>
+    <li><a href="https://github.com/DatasunriseOU/cppmega/blob/codex/canonical-complete-20260715/docs/environment.md">docs/environment.md</a></li>
+  </ul>
+
+  <h3>Self-hosted runner contract</h3>
+  <p>macOS lane указывает на <code>/Volumes/external/sources/.venvs/cppmega.source/bin/python</code>. Каждый lane subprocess получает <code>PYTHONNOUSERSITE=1</code> и <code>PYTHONSAFEPATH=1</code>, а portable profile объявлен в lane JSON, а не спрятан в коде.</p>
+  <ul class="source-list">
+    <li><a href="https://github.com/DatasunriseOU/cppmega/blob/codex/canonical-complete-20260715/configs/ci/hosts.json">configs/ci/hosts.json</a></li>
+    <li><a href="https://github.com/DatasunriseOU/cppmega/blob/codex/canonical-complete-20260715/configs/ci/lanes.json">configs/ci/lanes.json</a></li>
+    <li><a href="https://github.com/DatasunriseOU/cppmega/blob/codex/canonical-complete-20260715/scripts/ci/repository_runner.py">scripts/ci/repository_runner.py</a></li>
+    <li><a href="https://github.com/DatasunriseOU/cppmega/blob/codex/canonical-complete-20260715/.github/workflows/ci-self-hosted.yml">self-hosted workflow</a></li>
+  </ul>
+
+  <h3>Локальный prompt graph и C++ generation</h3>
+  <p>Graph/indexer loader теперь принадлежит этому checkout и восстанавливает исходный объект <code>sys.path</code>. H200 eval по умолчанию не тянет indexer из MLX checkout. Formatter resolution использует PATH, Xcode и LLVM Homebrew без ослабления compile gate; broken/timeout <code>xcrun</code> даёт контролируемый fallback. Restore Megatron bundle CLI также работает при direct execution и safe-path.</p>
+  <ul class="source-list">
+    <li><a href="https://github.com/DatasunriseOU/cppmega/blob/codex/canonical-complete-20260715/cppmega/prompt_graph_index.py">cppmega/prompt_graph_index.py</a></li>
+    <li><a href="https://github.com/DatasunriseOU/cppmega/blob/codex/canonical-complete-20260715/cppmega/data/prompt_graph_index.py">cppmega/data/prompt_graph_index.py</a></li>
+    <li><a href="https://github.com/DatasunriseOU/cppmega/blob/codex/canonical-complete-20260715/scripts/nebius_h200_megatron_cpp_generation_eval.py">H200 generation eval</a></li>
+    <li><a href="https://github.com/DatasunriseOU/cppmega/blob/codex/canonical-complete-20260715/scripts/cpp_generation_compile_eval.py">compile/format gate</a></li>
+    <li><a href="https://github.com/DatasunriseOU/cppmega/blob/codex/canonical-complete-20260715/scripts/data/restore_megatron_bundle_from_nebius_s3.py">restore bundle CLI</a></li>
+  </ul>
+
+  <h3>Current RSS memory guard</h3>
+  <p>Вместо исторического <code>ru_maxrss</code> используются live probes: procfs, psutil и Unix <code>ps</code>. Если ни один probe не работает, watchdog завершается fail-closed.</p>
+  <ul class="source-list">
+    <li><a href="https://github.com/DatasunriseOU/cppmega/blob/codex/canonical-complete-20260715/scripts/data/memory_guard.py">scripts/data/memory_guard.py</a></li>
+    <li><a href="https://github.com/DatasunriseOU/cppmega/blob/codex/canonical-complete-20260715/scripts/nanochat_data/memory_guard.py">scripts/nanochat_data/memory_guard.py</a></li>
+  </ul>
+
+  <h3>Package boundary</h3>
+  <p>Tracked egg-info пересобран из текущего <code>pyproject.toml</code>: Python <code>&gt;=3.11</code>, optional data dependency <code>datasketch==1.10.0</code>. Setuptools discovery ограничен <code>cppmega</code> и <code>cppmega.*</code>; wheel содержит runtime contracts <code>domain_schema_v1.json</code>, <code>tokenizer.json</code> и <code>tokenizer_contract_v1.json</code>, но не публикует namespace <code>cppmega_mlx</code>.</p>
+
+  <h2>Проверки</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Проверка</th><th>Receipt</th><th>Комментарий</th></tr></thead>
+    <tbody>
+      <tr><td>Full pytest</td><td class="ok">PASS</td><td>1385 passed, 159 skipped, 24 warnings, 50.87s</td></tr>
+      <tr><td>Megatron source</td><td class="ok">PASS</td><td>clean exact commit <code>ba7b5ebce12af60627a80985792a1449ce45f46c</code></td></tr>
+      <tr><td>Selected environment/CI/regression</td><td class="ok">PASS</td><td>104 passed</td></tr>
+      <tr><td>Changed-file Ruff</td><td class="ok">PASS</td><td>Ruff 0.15.22</td></tr>
+      <tr><td>compileall</td><td class="ok">PASS</td><td><code>cppmega scripts tests tools</code></td></tr>
+      <tr><td>Tracked bash syntax</td><td class="ok">PASS</td><td>all tracked <code>*.sh</code></td></tr>
+      <tr><td>git diff --check</td><td class="ok">PASS</td><td>no whitespace errors</td></tr>
+      <tr><td>HTML changelog desktop/mobile</td><td class="ok">PASS</td><td>1440px и 390px; без page-level horizontal overflow</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Что не включено</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Группа</th><th>Решение</th></tr></thead>
+    <tbody>
+      <tr><td><code>.gitignore</code> report patterns</td><td>Оставлено dirty: широкое подавление review artifacts не относится к hardening.</td></tr>
+      <tr><td>Cross-repo M2RNN/Mamba tests</td><td>Оставлены receipt-gated: cppmega не должен выдавать MLX runtime за CUDA proof.</td></tr>
+      <tr><td>Stale superpowers plan</td><td>Не production documentation.</td></tr>
+      <tr><td><code>tests/test_pr_export_batches.py</code></td><td>Cross-repo MLX namespace smoke, не CUDA/Megatron gate.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Dependabot: review 17 июля 2026</h2>
+  <p>Alert <code>GHSA-rrmf-rvhw-rf47</code> закрыт заменой vulnerable reproducer pin <code>torch==2.12.0.dev20260410+cu132</code> на стабильный CUDA-релиз <code>torch==2.13.0+cu132</code>. Тот же стабильный pin теперь используется в <code>STACK.lock</code>, CUDA Docker и self-hosted wheel workflow; активные H200/B200 Modal-образы больше не разрешают nightly. <code>cppmega.mlx</code> уже имел стабильный <code>torch 2.13.0</code> в <code>uv.lock</code>, а optional Path C теперь явно требует именно этот релиз. Исторические отчёты о старых nightly-прогонах сохранены как история, но текущий production/reproducer contract больше не зависит от dev-сборки.</p>
+
+  <h2>Остаточные риски</h2>
+  <p class="warn">Локальный Mac не даёт доказательства H200/CUDA kernel runtime. Self-hosted workflow и contracts проверены, но GPU receipt должен быть получен на выделенном CUDA runner.</p>
+  <p>Warnings Transformer Engine/Apex в dedicated Mac environment ожидаемы и не считаются GPU результатом.</p>
+  <p>Repo-wide Ruff ещё содержит 202 legacy violations в нетронутых файлах; все Python-файлы production diff проходят pinned changed-file Ruff.</p>
+  <p>Для CUDA wheel ABI требуется пересобрать custom Transformer Engine и остальные C++/CUDA wheels после смены torch pin; локальный Mac не заменяет этот self-hosted GPU receipt.</p>
+
+  <footer>Отчёт сгенерирован из текущего source tree; ссылки указывают на ветку hardening, а не на старые review notes.</footer>
+</main>
+</body>
+</html>

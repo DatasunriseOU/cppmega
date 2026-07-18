@@ -15,8 +15,9 @@ EXCLUDED from compilation (already fast or break Inductor):
 Always on — no env var gates.  If compile fails, crash.
 
 The approach: define small pure-PyTorch compiled functions for the elementwise
-math, then monkey-patch the mixer forward methods to call them instead of
-inline code.  The scan kernels remain untouched.
+math.  The TE mixer imports the data-dependent-A helper directly; the scan
+kernels remain untouched.  Only the legacy NoConv mixin still receives an
+explicit patch below.
 """
 from __future__ import annotations
 
@@ -93,10 +94,10 @@ def _compiled_postprocess_siso(y: torch.Tensor,
     RMSNormGated itself is already Triton-fused, so we only compile the
     surrounding rearranges + float casts that feed into it.
     """
-    # y: (b, l, h, p) -> (b, l, d)
-    b, l, h, p = y.shape
-    y_flat = y.reshape(b, l, h * p)
-    z_flat = z.reshape(b, l, h * p)
+    # y: (b, seq_len, h, p) -> (b, seq_len, d)
+    b, seq_len, h, p = y.shape
+    y_flat = y.reshape(b, seq_len, h * p)
+    z_flat = z.reshape(b, seq_len, h * p)
     return y_flat, z_flat
 
 
@@ -112,10 +113,10 @@ def _compiled_postprocess_mimo(y: torch.Tensor,
     """
     # z: (b, l, h, p), mimo_z: (h, r, p)
     z_f = torch.einsum("blhp,hrp->blrhp", z.float(), mimo_z)
-    # (b, l, r, h, p) -> (b, l, r, h*p)
-    b, l, r, h, p = z_f.shape
-    z_f = z_f.reshape(b, l, r, h * p)
-    # y: (b, l, r, h, p) -> (b, l, r, h*p)
+    # (b, seq_len, r, h, p) -> (b, seq_len, r, h*p)
+    b, seq_len, r, h, p = z_f.shape
+    z_f = z_f.reshape(b, seq_len, r, h * p)
+    # y: (b, seq_len, r, h, p) -> (b, seq_len, r, h*p)
     y_f = y.reshape(y.shape[0], y.shape[1], y.shape[2], -1).float()
     return y_f, z_f
 
@@ -128,171 +129,12 @@ def _compiled_postprocess_mimo_out(y: torch.Tensor,
 
     After RMSNormGated, we reshape back and apply the output einsum.
     """
-    # y: (b, l, r, h*p) -> (b, l, r, h, p)
-    b, l, r, d = y.shape
+    # y: (b, seq_len, r, h*p) -> (b, seq_len, r, h, p)
+    b, seq_len, r, d = y.shape
     h = d // headdim
-    y = y.reshape(b, l, r, h, headdim)
+    y = y.reshape(b, seq_len, r, h, headdim)
     y = torch.einsum("blrhp,hrp->blhp", y, mimo_o)
     return y
-
-
-# ---------------------------------------------------------------------------
-# Monkey-patch helpers
-# ---------------------------------------------------------------------------
-
-def _patch_cppmega_mamba3_te():
-    """Patch CppMegaMamba3TE.forward to use compiled elementwise functions."""
-    from cppmega.megatron.mamba3_te_mixer import CppMegaMamba3TE
-    from einops import rearrange
-
-    if getattr(CppMegaMamba3TE, "_cppmega_compiled", False):
-        return
-
-    _orig_forward = CppMegaMamba3TE.forward
-
-    # Disable dynamo tracing on the outer forward — only the 4 inner
-    # @torch.compile sub-functions need compilation.  Preventing dynamo
-    # from tracing this function avoids two problems:
-    #   1. Spurious kwargs (padding_mask, etc.) passed through te_checkpoint
-    #      or torch.utils.checkpoint hitting dynamo's kwarg validation.
-    #   2. Scan kernels (mamba3_siso_combined, mamba3_mimo_combined) that are
-    #      explicitly excluded from Inductor being pulled into a trace.
-    @torch._dynamo.disable
-    def _compiled_forward(
-        self,
-        hidden_states,
-        inference_context=None,
-        *,
-        inference_params=None,
-        packed_seq_params=None,
-        **kwargs,
-    ):
-        from megatron.core.inference.contexts.static_context import deprecate_inference_params
-        from mamba_ssm.ops.triton.mamba3.mamba3_siso_combined import mamba3_siso_combined
-        from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo as mamba3_mimo_combined
-        from mamba_ssm.ops.triton.angle_cumsum import angle_dt
-
-        inference_context = deprecate_inference_params(
-            inference_context, inference_params
-        )
-
-        # --- TE in_proj ---
-        zxBCdt_packed, _ = self.in_proj(hidden_states)
-        zxBCdt_packed = rearrange(zxBCdt_packed, "l b d -> b l d").contiguous()
-
-        batch, seqlen, _ = zxBCdt_packed.shape
-
-        z_size = self.d_inner_local_tp
-        x_size = self.d_inner_local_tp
-        B_size = self.ngroups_local_tp * self.d_state * self.mimo_rank
-        C_size = self.ngroups_local_tp * self.d_state * self.mimo_rank
-        dd_dt_size = self.nheads_local_tp
-        dd_A_size = self.nheads_local_tp
-        trap_size = self.nheads_local_tp
-
-        z, x, B, C, dd_dt, dd_A, trap, angles = torch.split(
-            zxBCdt_packed,
-            [z_size, x_size, B_size, C_size,
-             dd_dt_size, dd_A_size, trap_size, self.num_rope_angles],
-            dim=-1,
-        )
-
-        # Reshape for scan kernels
-        z = rearrange(z, "b l (h p) -> b l h p", p=self.headdim)
-        x = rearrange(x, "b l (h p) -> b l h p", p=self.headdim)
-        B = rearrange(
-            B, "b l (r g n) -> b l r g n",
-            r=self.mimo_rank, g=self.ngroups_local_tp,
-        )
-        C = rearrange(
-            C, "b l (r g n) -> b l r g n",
-            r=self.mimo_rank, g=self.ngroups_local_tp,
-        )
-        trap = rearrange(trap, "b l h -> b h l")
-
-        # === COMPILED REGION 1: Data-dependent A (5.93x) ===
-        ADT, DT, _A = _compiled_data_dep_A(
-            dd_A, self.A_floor, dd_dt, self.dt_bias,
-        )
-
-        # --- Complex RoPE angles (NOT compiled — already fast) ---
-        angles = angles.unsqueeze(-2).expand(
-            -1, -1, self.nheads_local_tp, -1
-        )
-
-        # --- QK-Norm on B and C (NOT compiled — already Triton-fused) ---
-        B = self.B_norm(B)
-        C = self.C_norm(C)
-
-        # --- Packed sequence support ---
-        cu_seqlens = None
-        if packed_seq_params is not None:
-            cu_seqlens = packed_seq_params.cu_seqlens_q
-
-        # --- SSM scan (NOT compiled — scan kernels break Inductor) ---
-        if self.is_mimo:
-            angles = angle_dt(angles, DT.transpose(-1, -2))
-            mimo_chunk = min(self.chunk_size, max(1, 64 // self.mimo_rank))
-            y = mamba3_mimo_combined(
-                Q=C, K=B, V=x, ADT=ADT, DT=DT, Trap=trap,
-                Q_bias=self.C_bias.float(),
-                K_bias=self.B_bias.float(),
-                MIMO_V=self.mimo_x.float(),
-                MIMO_Z=self.mimo_z.float(),
-                MIMO_Out=self.mimo_o.float() if not self.is_outproj_norm else None,
-                Angles=angles,
-                D=self.D.float(),
-                Z=z if not self.is_outproj_norm else None,
-                chunk_size=mimo_chunk,
-                rotary_dim_divisor=self.rotary_dim_divisor,
-                dtype=x.dtype,
-                return_state=False,
-                cu_seqlens=cu_seqlens,
-            )
-            # === COMPILED REGION 4: Post-processing (1.84x) ===
-            if self.is_outproj_norm:
-                y_f, z_f = _compiled_postprocess_mimo(
-                    y, z, self.mimo_z, self.headdim,
-                )
-                # RMSNormGated — NOT compiled (already Triton-fused)
-                y_normed = self.norm(y_f, z_f)
-                y = _compiled_postprocess_mimo_out(
-                    y_normed, self.mimo_o, self.headdim,
-                )
-            y = rearrange(y, "b l h p -> b l (h p)")
-        else:
-            y = mamba3_siso_combined(
-                Q=C.squeeze(2), K=B.squeeze(2), V=x,
-                ADT=ADT, DT=DT, Trap=trap,
-                Q_bias=self.C_bias.squeeze(1),
-                K_bias=self.B_bias.squeeze(1),
-                Angles=angles,
-                D=self.D,
-                Z=z if not self.is_outproj_norm else None,
-                chunk_size=self.chunk_size,
-                Input_States=None,
-                return_final_states=False,
-                cu_seqlens=cu_seqlens,
-            )
-            # === COMPILED REGION 4: Post-processing (1.84x) ===
-            if self.is_outproj_norm:
-                y_flat, z_flat = _compiled_postprocess_siso(y, z)
-                # RMSNormGated — NOT compiled (already Triton-fused)
-                y = self.norm(y_flat, z_flat)
-            else:
-                y = rearrange(y, "b l h p -> b l (h p)")
-
-        # Transpose back to Megatron layout
-        y = rearrange(y, "b l d -> l b d").contiguous()
-
-        # --- TE out_proj ---
-        out, out_bias = self.out_proj(y.to(hidden_states.dtype))
-        return out, out_bias
-
-    CppMegaMamba3TE.forward = _compiled_forward
-    CppMegaMamba3TE._cppmega_compiled = True
-    log.info("mamba3_compile_patch: CppMegaMamba3TE.forward patched with "
-             "4 compiled elementwise regions")
 
 
 def _patch_noconv_mamba3():
@@ -303,7 +145,6 @@ def _patch_noconv_mamba3():
     from cppmega.megatron.noconv_mamba_mixer import (
         Mamba3ScanMixin,
         NoConvMambaMixer,
-        _compute_data_dependent_A,
     )
     from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
@@ -420,11 +261,7 @@ def apply_mamba3_compile_patch() -> None:
 
     Always on.  Crashes on failure — no fallbacks.
     """
-    import torch
-
-    # CppMegaMamba3TE: compile is now INLINE (import _compiled_data_dep_A
-    # directly in mamba3_te_mixer.py). No monkey-patch needed.
-    # _patch_cppmega_mamba3_te()  # REMOVED — inline in mamba3_te_mixer.py
+    # CppMegaMamba3TE: compile is inline in mamba3_te_mixer.py.
     _patch_noconv_mamba3()
 
     print(

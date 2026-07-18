@@ -38,9 +38,9 @@ env:
   CUDA_VERSION: "13.2.1"
   PYTHON_VERSION: "3.13"
   # Keep exact: C++ extension wheels, especially TransformerEngine, are ABI
-  # tied to the precise torch nightly they were compiled against.
-  TORCH_VERSION: "2.13.0.dev20260611+cu132"
-  TORCH_INDEX: "https://download.pytorch.org/whl/nightly/cu132"
+  # tied to the precise stable CUDA torch wheel they were compiled against.
+  TORCH_VERSION: "2.13.0+cu132"
+  TORCH_INDEX: "https://download.pytorch.org/whl/cu132"
   TORCH_CUDA_ARCH_LIST: "9.0;10.0;12.1"
 
 jobs:
@@ -317,7 +317,7 @@ jobs:
         run: |
           set -euo pipefail
           pip install --upgrade pip setuptools wheel
-          n=0; until pip install --pre --retries 10 --timeout 60 \
+          n=0; until pip install --retries 10 --timeout 60 \
                        --extra-index-url ${{ env.TORCH_INDEX }} \
                        "torch==${{ env.TORCH_VERSION }}"; do
             n=$((n+1))

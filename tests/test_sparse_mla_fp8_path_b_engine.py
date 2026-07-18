@@ -77,24 +77,21 @@ def test_path_b_module_is_engine_flag_invariant(mode: str | None) -> None:
             assert hasattr(mod, name), f"missing {name} after reload with mode={mode!r}"
 
 
-def test_wave6_deferral_marker_present_in_docstring() -> None:
-    """Module docstring documents the FP8 factory blocker."""
+def test_docstring_records_direct_msl_retirement() -> None:
+    """Path B must remain an explicit retired compatibility surface."""
 
     pb = importlib.import_module(_pb_mod_name)
     doc = pb.__doc__ or ""
-    assert "Wave-6" in doc, "missing wave-6 deferral note"
-    assert "simdgroup_a_fp8" in doc or "FP8" in doc, "must mention FP8 factory blocker"
-    assert "Apple" in doc or "MSL" in doc, "must mention MSL float8 hardware blocker"
+    assert "retired" in doc.lower()
+    assert "direct-msl" in doc.lower()
+    assert "sparse_mla_fp8_path_c" in doc
 
 
-def test_path_c_fp8_sister_carries_todo_marker() -> None:
-    """`sparse_mla_fp8_path_c` module exists but is marked deferred until factories land."""
+def test_path_c_fp8_sister_documents_prepared_owner_output_contract() -> None:
+    """The replacement route must consume prepared buffers through tvm-ffi."""
 
     pc = importlib.import_module("cppmega_mlx.nn._tilelang.sparse_mla_fp8_path_c")
-    doc = (pc.__doc__ or "")
-    # The Phase-3 sparse_mla agent (commit a3dd633) added an FP8 factory TODO
-    # to this sister module — keep that marker locked in until the factories
-    # land in tilelang/language/extern.py.
-    assert any(
-        token in doc for token in ("TODO", "tirx.metal.fp8_e4m3_dot4", "simdgroup_a_fp8", "Wave-6", "wave-6", "deferred")
-    ), "fp8 path_c sister must keep its FP8 factory deferral marker"
+    doc = pc.__doc__ or ""
+    assert "prepared" in doc.lower()
+    assert "tvm-ffi" in doc.lower()
+    assert "direct-MSL Path B" in doc

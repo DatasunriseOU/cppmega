@@ -24,6 +24,10 @@ from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
 from cppmega.megatron.custom_gpt_model import CppMegaGPTModel
 from cppmega.megatron.deprecated_paths import require_deprecated_ack
+from cppmega.megatron.graph_objective_loss import (
+    graph_objective_requested,
+    require_active_dsa_graph_objective,
+)
 
 
 def cppmega_gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
@@ -33,6 +37,9 @@ def cppmega_gpt_builder(args, pre_process, post_process, vp_stage=None, config=N
             config = core_transformer_config_from_yaml(args, "language_model")
         else:
             config = core_transformer_config_from_args(args)
+    require_active_dsa_graph_objective(
+        config, required=graph_objective_requested()
+    )
     if args.use_legacy_models:
         require_deprecated_ack(
             feature="--use-legacy-models in cppmega GPT builder",

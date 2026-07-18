@@ -5,6 +5,8 @@ Tests that require the ``megatron`` package are skipped when it is not installed
 (the module only runs on the remote H200 bench).
 """
 
+import importlib.util
+
 import pytest
 
 # ``find_spec("megatron")`` alone is unsafe here: an earlier test may have
@@ -15,6 +17,7 @@ import pytest
 from tests._megatron_stub import install_megatron_stub, is_real_megatron_available
 
 _has_megatron = is_real_megatron_available()
+_has_mamba_ssm = importlib.util.find_spec("mamba_ssm") is not None
 if not _has_megatron:
     install_megatron_stub()
 
@@ -23,7 +26,10 @@ if not _has_megatron:
 # Test: module is importable (megatron required)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not _has_megatron, reason="megatron not installed locally")
+@pytest.mark.skipif(
+    not (_has_megatron and _has_mamba_ssm),
+    reason="megatron and mamba_ssm are required for runtime import",
+)
 def test_cppmega_mamba3_te_importable():
     from cppmega.megatron.mamba3_te_mixer import CppMegaMamba3TE
     assert CppMegaMamba3TE is not None
@@ -183,15 +189,6 @@ def test_partition_sizes_sum_with_tp(tp_size):
         num_rope_angles,       # angles (broadcast)
     ]
 
-    # The total should match what TE ColumnParallelLinear produces per rank
-    # (the global dim divided by tp, modulo the broadcast angle component)
-    global_dim = (
-        2 * d_inner
-        + 2 * ngroups * d_state * mimo_rank
-        + 3 * nheads
-        + num_rope_angles
-    )
-
     # Per-rank dim is NOT simply global_dim // tp because angles are broadcast.
     # Verify the split sizes are internally consistent.
     assert partition_sizes[0] == d_inner_local
@@ -239,10 +236,8 @@ def test_state_shapes_siso():
 def test_state_shapes_mimo():
     """Verify state shapes for MIMO config."""
     nheads_local = 8
-    headdim = 64
     d_state = 128
     mimo_rank = 4
-    num_rope_angles = 32
 
     k_shape = (mimo_rank, nheads_local, d_state)
     assert k_shape == (4, 8, 128)
@@ -333,9 +328,8 @@ def test_source_supports_all_mamba3_features():
     assert "num_rope_angles" in text
     assert "rotary_dim_divisor" in text
 
-    # Data-dependent A: dd_A, softplus, A_floor
+    # Data-dependent A fields remain part of the mixer contract.
     assert "dd_A" in text
-    assert "F.softplus" in text
     assert "A_floor" in text
 
     # MIMO: mimo_x, mimo_z, mimo_o
@@ -343,6 +337,36 @@ def test_source_supports_all_mamba3_features():
     assert "self.mimo_z" in text
     assert "self.mimo_o" in text
     assert "is_mimo" in text
+
+
+def test_compiled_data_dependent_a_matches_reference_math():
+    torch = pytest.importorskip("torch")
+    from cppmega.megatron.mamba3_compile_patch import _compiled_data_dep_A
+
+    dd_a = torch.tensor(
+        [[[0.0, 1.0], [-1.0, 2.0]]],
+        dtype=torch.float32,
+    )
+    dd_dt = torch.tensor(
+        [[[0.5, -0.5], [1.0, 0.0]]],
+        dtype=torch.float32,
+    )
+    dt_bias = torch.tensor([0.25, -0.25], dtype=torch.float32)
+    a_floor = 0.1
+
+    adt, dt, decay = _compiled_data_dep_A(dd_a, a_floor, dd_dt, dt_bias)
+
+    expected_decay = -torch.nn.functional.softplus(dd_a.float())
+    expected_decay = torch.clamp(expected_decay, max=-a_floor)
+    expected_dt_untransposed = torch.nn.functional.softplus(
+        (dd_dt + dt_bias).float()
+    )
+    expected_adt = (expected_decay * expected_dt_untransposed).transpose(1, 2)
+    expected_dt = expected_dt_untransposed.transpose(1, 2)
+
+    torch.testing.assert_close(decay, expected_decay)
+    torch.testing.assert_close(dt, expected_dt)
+    torch.testing.assert_close(adt, expected_adt)
 
 
 # ---------------------------------------------------------------------------

@@ -8,7 +8,9 @@ Compare FP4 vs FP8 vs BF16 latency + memory for the indexer inner loop
 (4 replicated linear sub-modules + index-score einsum + topk).
 
 This is **NOT** a training run. It does not touch megatron-core, does not
-pull Stream E's FP8 port, and does not mutate any source. It inlines the
+pull Stream E's FP8 port, and does not mutate any source. It intentionally
+uses the Torch/Transformer Engine shipped by the NGC base image, rather than
+the cppmega stable CUDA wheel contract. It inlines the
 DSA indexer math exactly as written in
 `megatron/core/transformer/experimental_attention_variant/dsa.py`
 (bench3 ref, fetched 2026-04-12, 1119 LOC) — the 4 linears, LayerNorm,
@@ -41,8 +43,6 @@ from typing import Any
 import modal
 
 _PYTHON = "3.13"
-_TORCH_NIGHTLY_INDEX = "https://download.pytorch.org/whl/nightly/cu132"
-
 # B200 single-GPU — DSA indexer is replicated, not TP-split.
 _GPU_SPEC = os.environ.get("CPPMEGA_MODAL_GPU", "B200:1")
 
@@ -113,7 +113,7 @@ def rotate_activation_bf16(x: torch.Tensor) -> torch.Tensor:
     """BF16 Hadamard rotation — pure-torch FWHT stand-in.
 
     The real DSA uses fast_hadamard_transform which has no prebuilt wheel
-    for our torch 2.12/cu132 image. This is mathematically equivalent for
+    for the NGC image's Torch runtime. This is mathematically equivalent for
     power-of-two last-dim sizes (DSA uses index_head_dim=64, a power of 2),
     is applied in BF16 in ALL variants (the dsa.py reference asserts bf16),
     and therefore cancels out of the precision comparison.

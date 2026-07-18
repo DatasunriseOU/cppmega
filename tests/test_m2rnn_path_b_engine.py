@@ -143,21 +143,18 @@ def test_m2rnn_fwd_metal_launches_when_metal_available(_m2rnn_module):
     if not status.available:
         pytest.skip(f"m2rnn Metal kernel unavailable: {status.reason}")
 
-    B, S, K, V = 1, 4, 4, 4
+    B, S, H, K, V = 1, 4, 1, 4, 4
     rng = mx.random.key(0xBEEF)
-    sub = lambda i: mx.random.split(rng, i + 2)[i]  # noqa: E731
-    q = mx.random.normal(shape=(B, S, K), key=sub(0)).astype(mx.float16)
-    k = mx.random.normal(shape=(B, S, K), key=sub(1)).astype(mx.float16)
-    v = mx.random.normal(shape=(B, S, V), key=sub(2)).astype(mx.float16)
-    f = mx.sigmoid(mx.random.normal(shape=(B, S, K), key=sub(3)).astype(mx.float32))
-    W = mx.random.normal(shape=(K, V), key=sub(4)).astype(mx.float16) * 0.1
-    h0 = mx.zeros((B, K, V), dtype=mx.float32)
+    keys = mx.random.split(rng, 5)
+    q = mx.random.normal(shape=(B, S, H, K), key=keys[0]).astype(mx.float16)
+    k = mx.random.normal(shape=(B, S, H, K), key=keys[1]).astype(mx.float16)
+    v = mx.random.normal(shape=(B, S, H, V), key=keys[2]).astype(mx.float16)
+    W = mx.random.normal(shape=(H, V, V), key=keys[3]).astype(mx.float16) * 0.1
+    xf = mx.sigmoid(
+        mx.random.normal(shape=(B, S, H), key=keys[4]).astype(mx.float16)
+    )
+    h0 = mx.zeros((B, H, K, V), dtype=mx.float16)
 
-    try:
-        result = _m2rnn_module.m2rnn_fwd_metal(q, k, v, f, W, h0)
-    except TypeError:
-        # Signature drift between versions — the contract test only
-        # cares that *some* canonical signature exists.
-        pytest.skip("m2rnn_fwd_metal signature drifted; wave-7 will refresh")
+    result = _m2rnn_module.m2rnn_fwd_metal(q, k, v, W, xf, h0)
 
     mx.eval(*result if isinstance(result, tuple) else (result,))

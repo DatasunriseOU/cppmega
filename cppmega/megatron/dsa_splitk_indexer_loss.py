@@ -37,54 +37,36 @@ which has the same signature as Megatron's ``compute_dsa_indexer_loss``.
 
 from __future__ import annotations
 
-from typing import Any, Optional
-
 import torch
-import triton
-import triton.language as tl
+
+try:
+    import triton
+    import triton.language as tl
+except ImportError as error:  # pragma: no cover - depends on the production runtime
+    triton = None  # type: ignore[assignment]
+    tl = None  # type: ignore[assignment]
+    _TRITON_IMPORT_ERROR: ImportError | None = error
+else:
+    _TRITON_IMPORT_ERROR = None
 
 __all__ = [
     "compute_dsa_indexer_loss_splitk",
 ]
 
 
-# ---------------------------------------------------------------------------
-# Tier-2 of the unified TileLang fused-kernel pipeline (sibling of
-# ``fp8_activations.py``'s amax/quantize hand-off): the Path C port of
-# ``_fwd_fused_indexer_loss_stage1_kernel`` and ``_stage2`` lives in
-# cppmega.mlx and runs on both CUDA and Apple Metal SIMDgroup. The probes
-# below are import-time; ``_dsa_tilelang_supports(device)`` is the per-call
-# dispatch gate that replaces the implicit ``tensor.is_cuda`` requirement
-# of the Triton-only path on hosts that have a TileLang install.
-# ---------------------------------------------------------------------------
-_has_dsa_tilelang = False
-_dsa_tilelang_fn: Any | None = None
+def _compile_triton_kernel(function):
+    """Compile a kernel when Triton is installed; keep imports usable otherwise."""
 
-
-def _dsa_tilelang_supports(_device: torch.device) -> bool:  # noqa: D401 - thin shim
-    """Default no-op gate, replaced below when the Path C module imports."""
-
-    return False
-
-
-try:
-    from cppmega_mlx.nn._tilelang.dsa_splitk_indexer_loss import (  # type: ignore[import-not-found]
-        dsa_splitk_indexer_loss_tilelang as _dsa_splitk_indexer_loss_tilelang,
-        tilelang_supports as _dsa_tilelang_supports_impl,
-    )
-
-    _has_dsa_tilelang = True
-    _dsa_tilelang_fn = _dsa_splitk_indexer_loss_tilelang
-    _dsa_tilelang_supports = _dsa_tilelang_supports_impl  # type: ignore[assignment]
-except Exception:  # pragma: no cover - hosts without cppmega.mlx / TileLang
-    _has_dsa_tilelang = False
+    if triton is None:
+        return None
+    return triton.jit(function)
 
 
 # ---------------------------------------------------------------------------
 # Stage 1: compute softmax statistics (online max + denominator)
 # ---------------------------------------------------------------------------
 
-@triton.jit
+@_compile_triton_kernel
 def _fwd_fused_indexer_loss_stage1_kernel(
     Attn_Query_ptr,
     Attn_Key_ptr,
@@ -222,7 +204,7 @@ def _fwd_fused_indexer_loss_stage1_kernel(
 # Stage 2: recompute Q@K^T blockwise, apply normalised softmax, compute KL
 # ---------------------------------------------------------------------------
 
-@triton.jit
+@_compile_triton_kernel
 def _fwd_fused_indexer_loss_stage2_kernel(
     Attn_Query_ptr,
     Attn_Key_ptr,
@@ -374,35 +356,28 @@ def compute_dsa_indexer_loss_splitk(
 
     The ``pg_collection`` argument is accepted for API compatibility but TP
     all-reduce is NOT fused into the kernel (upstream PR notes this too).
-    When ``pg_collection.tp.size() > 1`` the caller should fall back to the
-    native path — the monkey-patch routing in ``dsa_fp8_patch.py`` handles
-    this.
+    When ``pg_collection.tp.size() > 1`` the caller must route to Megatron's
+    native indexer loss before invoking this function.
 
     Memory saving vs upstream: avoids materialising ``[b*np, sq, sk]``
     attention_scores tensor. At production shapes (b=1, np=128, sq=4096,
     sk=4096) this saves ~7.5 GiB -> ~0.06 GiB for softmax stats, i.e.
     ~60% of the forward peak for the indexer loss computation.
     """
-    # Path C TileLang dispatch -- replaces the implicit ``tensor.is_cuda``
-    # gate on hosts where a TileLang JIT (CUDA or Apple Metal) is available.
-    # When tp.size() > 1 the upstream caller has already routed around the
-    # split-K path; here we only need to pick between TileLang and the legacy
-    # Triton emission, leaving the Triton fallback intact.
-    if (
-        _has_dsa_tilelang
-        and _dsa_tilelang_fn is not None
-        and _dsa_tilelang_supports(query.device)
-    ):
-        return _dsa_tilelang_fn(
-            index_scores,
-            topk_indices,
-            query,
-            key,
-            softmax_scale,
-            loss_coeff,
-            sparse_loss,
-            pg_collection,
+    if query.device.type != "cuda":
+        raise RuntimeError(
+            "cppmega split-K DSA indexer loss requires CUDA tensors; "
+            "use Megatron's native indexer loss on other devices"
         )
+    if triton is None or tl is None:
+        raise RuntimeError(
+            "cppmega split-K DSA indexer loss requires the Triton runtime"
+        ) from _TRITON_IMPORT_ERROR
+    if (
+        _fwd_fused_indexer_loss_stage1_kernel is None
+        or _fwd_fused_indexer_loss_stage2_kernel is None
+    ):
+        raise RuntimeError("cppmega split-K DSA Triton kernels are unavailable")
 
     # query: [sq, b, np, hn]  key: [sk, b, np, hn]
     ASq, AB, AH, AD = query.shape

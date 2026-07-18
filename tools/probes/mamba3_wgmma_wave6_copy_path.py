@@ -13,6 +13,7 @@ paths:
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import pathlib
 import sys
@@ -20,10 +21,10 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+sys.path = [entry for entry in sys.path if entry != str(ROOT)]
+sys.path.insert(0, str(ROOT))
 
-from tools.probes import mamba3_wgmma_wave4_schedule as wave4
+wave4 = importlib.import_module("tools.probes.mamba3_wgmma_wave4_schedule")
 
 
 BF16_BYTES = wave4.BF16_BYTES

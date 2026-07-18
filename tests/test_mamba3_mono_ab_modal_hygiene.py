@@ -1,3 +1,8 @@
+import pytest
+
+
+pytest.importorskip("modal")
+
 from scripts.modal_mamba3_cuda_full_bwd_ab import (
     _modal_description_reuse_warnings,
     _modal_hygiene_verdict,

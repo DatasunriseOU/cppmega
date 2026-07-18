@@ -4,8 +4,9 @@
 # HYBRID strategy: GraphQL is PRIMARY. This script is the documented fallback
 # path that graphql_pr_stream.TokenExhausted points at. It runs the BigQuery
 # extraction in gharchive_query.sql for the resolved repo list, then optionally
-# loads the resulting PR/Review/Comment events into pr_store when PR_STORE_DB is
-# set.
+# loads the resulting PR/Review/Comment events into the unified pr_store when
+# PR_STORE_DB is set. The SQL emits both raw and projected fields so old root
+# receipts and the normalized production store remain compatible.
 #
 # RULE #1: no silent success. If bq is missing or the query fails, we exit
 # non-zero and print why -- we do NOT pretend data was fetched.
@@ -26,8 +27,9 @@ if [[ ! -f "$REPO_LIST" ]]; then
   exit 2
 fi
 
-# Build the IN-list from the resolved repo_list.json (real owner/repo entries).
-IN_LIST=$(python3 -c "import json,sys; d=json.load(open('$REPO_LIST')); print(', '.join(\"'\"+r['owner_repo'].replace(\"'\",\"''\")+\"'\" for r in d['repos']))")
+# Build the IN-list from GitHub-only repo_names. Mixed-forge identities stay in
+# repo_list.json but are intentionally excluded from this GitHub-only query.
+IN_LIST=$(python3 -c "import json; d=json.load(open('$REPO_LIST')); names=d.get('repo_names') or [r['owner_repo'] for r in d.get('repos', []) if r.get('owner_repo')]; print(', '.join(\"'\"+name.replace(\"'\", \"''\")+\"'\" for name in names))")
 if [[ -z "$IN_LIST" ]]; then
   echo "FATAL: repo list resolved to zero repos; refusing to query." >&2
   exit 2
@@ -36,11 +38,21 @@ fi
 SQL=$(sed -e "s|{table_glob}|$TABLE_GLOB|g" -e "s|{repo_in_list}|$IN_LIST|g" \
   "$(dirname "$0")/gharchive_query.sql")
 
-echo "[gharchive] project=$PROJECT table=$TABLE_GLOB repos=$(python3 -c "import json;print(len(json.load(open('$REPO_LIST'))['repos']))")" >&2
+REPO_COUNT=$(python3 -c "import json; d=json.load(open('$REPO_LIST')); print(len(d.get('repo_names') or [r for r in d.get('repos', []) if r.get('owner_repo')]))")
+echo "[gharchive] project=$PROJECT table=$TABLE_GLOB repos=$REPO_COUNT" >&2
+echo "[gharchive] dry-run cost gate" >&2
+bq --project_id="$PROJECT" query --use_legacy_sql=false --dry_run "$SQL"
+if [[ "${DRY_RUN_ONLY:-0}" == "1" ]]; then
+  echo "[gharchive] DRY_RUN_ONLY=1; stopping before real query." >&2
+  exit 0
+fi
+
+mkdir -p "$(dirname "$OUT")"
 bq --project_id="$PROJECT" query --use_legacy_sql=false --format=prettyjson "$SQL" > "$OUT"
 echo "[gharchive] wrote $OUT" >&2
 if [[ -n "$PR_STORE_DB" ]]; then
-  python3 "$(dirname "$0")/gharchive_load_pr_store.py" --events "$OUT" --db "$PR_STORE_DB"
+  python3 "$(dirname "$0")/pr_store.py" ingest-gharchive \
+    --store "$PR_STORE_DB" --input "$OUT"
 else
   echo "[gharchive] PR_STORE_DB not set; raw events only, pr_store load skipped." >&2
 fi
