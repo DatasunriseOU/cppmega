@@ -5,7 +5,6 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import sys
 
 import pytest
 
@@ -40,10 +39,55 @@ def _mlx_root() -> Path:
     pytest.skip("cross-repository artifact parity worktree is unavailable")
 
 
+def _mlx_python(peer_root: Path) -> Path:
+    """Select an interpreter that can actually import MLX.
+
+    The root Megatron environment intentionally does not install MLX.  Using
+    ``sys.executable`` here would turn a cross-repository parity test into an
+    accidental environment test, so the peer interpreter is an explicit
+    contract.  CI can bind it with ``CPPMEGA_RECIPE_PARITY_PYTHON``.
+    """
+    configured = os.environ.get("CPPMEGA_RECIPE_PARITY_PYTHON")
+    if configured:
+        candidates = [Path(configured)]
+        explicit = True
+    else:
+        candidates = [
+            peer_root / ".venv" / "bin" / "python",
+            peer_root.parent / ".venvs" / "cppmega.mlx" / "bin" / "python",
+            Path("/Volumes/external/sources/.venvs/cppmega.mlx/bin/python"),
+        ]
+        explicit = False
+
+    for candidate in candidates:
+        if not candidate.is_file():
+            if explicit:
+                pytest.fail(f"configured MLX parity interpreter is missing: {candidate}")
+            continue
+        probe = subprocess.run(
+            [str(candidate), "-c", "import mlx.core"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if probe.returncode == 0:
+            return candidate
+        if explicit:
+            pytest.fail(
+                "configured MLX parity interpreter cannot import mlx.core: "
+                f"{candidate}\n{probe.stderr or probe.stdout}"
+            )
+    pytest.skip(
+        "cross-repository artifact parity requires an interpreter that imports "
+        "mlx.core; set CPPMEGA_RECIPE_PARITY_PYTHON in the root lane"
+    )
+
+
 def test_mlx_generated_objective_artifact_is_root_loadable_and_recipe_bound(
     tmp_path: Path,
 ) -> None:
     peer_root = _mlx_root()
+    peer_python = _mlx_python(peer_root)
 
     contract = _valid_contract()
     contract_path = tmp_path / "input_contract.json"
@@ -88,7 +132,7 @@ write_objective_materialization_artifact(
         }
     )
     completed = subprocess.run(
-        [sys.executable, "-c", peer_code],
+        [str(peer_python), "-c", peer_code],
         cwd=peer_root,
         env=environment,
         capture_output=True,
