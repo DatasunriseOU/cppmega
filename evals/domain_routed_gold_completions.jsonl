@@ -1,0 +1,7 @@
+{"id":"cpp_docstring_add","completion":"int add(int a, int b) { return a + b; }"}
+{"id":"fim_compile_fix_missing_header","completion":"#include <vector>\n"}
+{"id":"cmake_link_library_fix","completion":"find_package(Threads REQUIRED)\ntarget_link_libraries(app PRIVATE Threads::Threads)\n"}
+{"id":"shell_build_command","completion":"cmake --build build -j8\n"}
+{"id":"ksh_build_sidecar_route","completion":"The command sends input through tee while preserving the build diagnostic route."}
+{"id":"compiler_diagnostic_packet","completion":"src/main.cpp:7:5: error: use of undeclared identifier 'value'\n"}
+{"id":"linker_diagnostic_packet","completion":"ld: error: undefined reference to `pthread_create'\n"}
