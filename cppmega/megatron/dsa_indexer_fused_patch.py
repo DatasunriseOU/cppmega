@@ -67,6 +67,9 @@ import torch
 
 from cppmega.megatron.graph_objective_loss import (
     graph_bias_beta_binding,
+    graph_objective_requested,
+    graph_routes_ablation_requested,
+    graph_routes_active,
     resolve_graph_bias_beta,
     validate_graph_bias_beta,
 )
@@ -122,6 +125,20 @@ _GRAPH_ROUTE_BATCH_KEYS = (
     "graph_chunk_counts",
     "graph_document_ids",
 )
+_INTEGER_TORCH_DTYPES = frozenset(
+    dtype
+    for name in (
+        "uint8",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint16",
+        "uint32",
+        "uint64",
+    )
+    if (dtype := getattr(torch, name, None)) is not None
+)
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -144,7 +161,7 @@ def require_graph_routes_for_production() -> None:
     the deliberately named ``CPPMEGA_GRAPH_ROUTES_ABLATION=1`` opt-in.
     """
 
-    if _env_flag("CPPMEGA_GRAPH_ROUTES_ABLATION"):
+    if graph_routes_ablation_requested():
         return
     receipt_marker = bool(os.environ.get("CPPMEGA_H200_GRAPH_PRIOR_RECEIPT"))
     production_marker = receipt_marker or any(
@@ -155,7 +172,7 @@ def require_graph_routes_for_production() -> None:
             "CPPMEGA_OBJECTIVE_CONTRACT_REQUIRED",
         )
     )
-    if production_marker and not _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
+    if production_marker and not graph_routes_active():
         raise RuntimeError(
             "production Megatron graph routes are mandatory; refusing tensor-only "
             "DSA/attention path. Set CPPMEGA_GRAPH_ROUTES_ENABLED=1 or explicitly "
@@ -176,6 +193,94 @@ def _env_float(name: str, default: float) -> float:
 def _qualified_name(value: object) -> str:
     cls = value if isinstance(value, type) else type(value)
     return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def _require_integer_tensor(value: torch.Tensor, *, name: str) -> None:
+    if value.dtype not in _INTEGER_TORCH_DTYPES:
+        raise TypeError(
+            f"graph sidecar {name!r} must use an integer dtype, got {value.dtype}"
+        )
+
+
+def _require_pinned_signature(
+    value: object,
+    *,
+    qualified_name: str,
+    expected: tuple[str, ...],
+) -> None:
+    try:
+        actual = tuple(inspect.signature(value).parameters)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"cannot inspect pinned Megatron seam {qualified_name}"
+        ) from exc
+    if actual != expected:
+        raise RuntimeError(
+            f"pinned Megatron seam {qualified_name} has parameters {actual}, "
+            f"expected {expected} from STACK.lock core_v0.18.0"
+        )
+
+
+def _validate_pinned_dsa_seam(dsa_mod: object) -> None:
+    compute_scores = getattr(dsa_mod, "_compute_index_scores", None)
+    selector = getattr(dsa_mod, "fused_qk_topk_naive", None)
+    indexer_loss = getattr(dsa_mod, "compute_dsa_indexer_loss", None)
+    fused_loss = getattr(dsa_mod, "FusedDSAIndexerLoss", None)
+    if any(value is None for value in (compute_scores, selector, indexer_loss, fused_loss)):
+        raise RuntimeError(
+            "Megatron core_v0.18.0 DSA score/selector/loss seam is incomplete"
+        )
+    if not getattr(compute_scores, _PATCH_MARKER, False):
+        _require_pinned_signature(
+            compute_scores,
+            qualified_name="dsa._compute_index_scores",
+            expected=("q", "weights", "k"),
+        )
+    if not getattr(selector, _SELECTOR_RECEIPT_PATCH_MARKER, False):
+        _require_pinned_signature(
+            selector,
+            qualified_name="dsa.fused_qk_topk_naive",
+            expected=("q", "k", "weights", "index_topk", "mask"),
+        )
+    if not getattr(indexer_loss, _GRAPH_OBJECTIVE_PATCH_MARKER, False):
+        _require_pinned_signature(
+            indexer_loss,
+            qualified_name="dsa.compute_dsa_indexer_loss",
+            expected=(
+                "index_scores",
+                "topk_indices",
+                "query",
+                "key",
+                "softmax_scale",
+                "loss_coeff",
+                "sparse_loss",
+                "pg_collection",
+            ),
+        )
+    if not getattr(fused_loss, _AUTOGRAD_PATCH_MARKER, False):
+        _require_pinned_signature(
+            fused_loss.forward,
+            qualified_name="dsa.FusedDSAIndexerLoss.forward",
+            expected=(
+                "ctx",
+                "q",
+                "weights",
+                "k",
+                "query",
+                "key",
+                "softmax_scale",
+                "topk",
+                "loss_coeff",
+                "mask",
+                "sparse_loss",
+                "pg_collection",
+            ),
+        )
+        _require_pinned_signature(
+            fused_loss.backward,
+            qualified_name="dsa.FusedDSAIndexerLoss.backward",
+            expected=("ctx", "grad_topk_indices", "grad_loss"),
+        )
 
 
 def _emit_runtime_receipt(prefix: str, payload: dict[str, object]) -> None:
@@ -207,6 +312,8 @@ def _as_batched_edges(
             f"graph route sidecars {edge_key!r}/{count_key!r} must be torch.Tensor, "
             f"got {type(edges).__name__}/{type(counts).__name__}"
         )
+    _require_integer_tensor(edges, name=edge_key)
+    _require_integer_tensor(counts, name=count_key)
     if edges.dim() == 2:
         edges = edges.unsqueeze(0)
     if edges.dim() != 3 or int(edges.shape[-1]) != 2:
@@ -248,6 +355,8 @@ def _as_batched_edge_triples(
             f"domain graph route sidecars {edge_key!r}/{count_key!r} must be "
             f"torch.Tensor, got {type(edges).__name__}/{type(counts).__name__}"
         )
+    _require_integer_tensor(edges, name=edge_key)
+    _require_integer_tensor(counts, name=count_key)
     if edges.dim() == 2:
         edges = edges.unsqueeze(0)
     if edges.dim() != 3 or int(edges.shape[-1]) != 3:
@@ -357,6 +466,9 @@ def _as_batched_chunks(
         )
     if not all(isinstance(value, torch.Tensor) for value in (starts, ends, counts)):
         raise TypeError("graph chunk sidecars must be torch.Tensor")
+    _require_integer_tensor(starts, name="graph_chunk_starts")
+    _require_integer_tensor(ends, name="graph_chunk_ends")
+    _require_integer_tensor(counts, name="graph_chunk_counts")
     if starts.dim() == 1:
         starts = starts.unsqueeze(0)
     if ends.dim() == 1:
@@ -521,6 +633,11 @@ def build_graph_route_bias_from_structure_batch(
         raise RuntimeError(
             "CPPMEGA_GRAPH_ROUTES_ENABLED=1 but no current cppmega structure "
             "batch is available; refusing token-only DSA indexer"
+        )
+    if not isinstance(structure_batch, dict):
+        raise TypeError(
+            "graph route structure batch must be a dict of sidecar tensors, got "
+            f"{type(structure_batch).__name__}"
         )
     if batch_size <= 0 or seqlen_q <= 0 or seqlen_k <= 0:
         raise ValueError(
@@ -815,6 +932,7 @@ def build_graph_objective_tensors(
             "graph auxiliary loss requires graph_document_ids derived from "
             "packed document boundaries"
         )
+    _require_integer_tensor(document_ids, name="graph_document_ids")
     if document_ids.dim() == 1:
         document_ids = document_ids.unsqueeze(0)
     if document_ids.dim() != 2:
@@ -948,9 +1066,9 @@ def _patch_dsa_graph_objective(dsa_mod) -> None:
 
     def compute_dsa_indexer_loss_with_graph(index_scores, *args, **kwargs):
         indexer_loss = existing(index_scores, *args, **kwargs)
-        if not _env_flag("CPPMEGA_DSA_GRAPH_AUX_ENABLED"):
+        if not graph_objective_requested():
             return indexer_loss
-        if not _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
+        if not graph_routes_active():
             raise RuntimeError(
                 "DSA graph auxiliary objective requires graph routes to be enabled"
             )
@@ -984,7 +1102,7 @@ def _patch_dsa_graph_objective(dsa_mod) -> None:
         sparse_existing, _GRAPH_OBJECTIVE_PATCH_MARKER, False
     ):
         def sparse_loss_requires_dense_graph_scores(*args, **kwargs):
-            if _env_flag("CPPMEGA_DSA_GRAPH_AUX_ENABLED"):
+            if graph_objective_requested():
                 raise RuntimeError(
                     "graph auxiliary loss requires full DSA indexer scores; "
                     "top-k-only sparse indexer loss cannot satisfy the objective "
@@ -1132,7 +1250,7 @@ def _patch_dsa_runtime_receipts(dsa_mod) -> None:
                 q, k, weights, index_topk, mask, *args, **kwargs
             )
             receipt_path = os.environ.get("CPPMEGA_H200_GRAPH_PRIOR_RECEIPT")
-            if not receipt_path or not _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
+            if not receipt_path or not graph_routes_active():
                 return result
 
             layer_context = _DSA_LAYER_CONTEXT.get()
@@ -1218,10 +1336,10 @@ def _patch_fused_dsa_autograd(dsa_mod) -> None:
         token = None
         upstream_mask = None
         mask_token = None
-        if _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
+        if graph_routes_active():
             captured = _capture_current_graph_batch()
             token = _set_graph_batch_override(captured)
-        if _env_flag("CPPMEGA_DSA_GRAPH_AUX_ENABLED"):
+        if graph_objective_requested():
             upstream_mask = _bind_upstream_mask(
                 original_forward,
                 ctx,
@@ -1250,7 +1368,7 @@ def _patch_fused_dsa_autograd(dsa_mod) -> None:
             token = _set_graph_batch_override(captured)
         try:
             original_grads = original_backward(ctx, *args, **kwargs)
-            if not _env_flag("CPPMEGA_DSA_GRAPH_AUX_ENABLED"):
+            if not graph_objective_requested():
                 return original_grads
             grad_loss = args[1] if len(args) > 1 else kwargs.get("grad_loss")
             if grad_loss is None:
@@ -1434,6 +1552,7 @@ def apply_dsa_indexer_fused_patch(*, force: bool = False) -> bool:
 
     from megatron.core.transformer.experimental_attention_variant import dsa as dsa_mod
 
+    _validate_pinned_dsa_seam(dsa_mod)
     existing = getattr(dsa_mod, "_compute_index_scores", None)
     if existing is None:
         raise RuntimeError(
@@ -1449,7 +1568,7 @@ def apply_dsa_indexer_fused_patch(*, force: bool = False) -> bool:
         require_graph_routes_for_production()
         graph_bias = None
         graph_beta = 1.0
-        if _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
+        if graph_routes_active():
             sq, b, _h, _d = q.shape
             sk = k.shape[0]
             graph_beta = resolve_graph_bias_beta()

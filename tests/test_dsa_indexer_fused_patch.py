@@ -14,6 +14,7 @@ import subprocess
 import sys
 import json
 import os
+import inspect
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
@@ -25,6 +26,26 @@ from cppmega.megatron.dsa_indexer_fused_patch import (
     build_graph_route_bias_from_structure_batch,
     compute_index_scores_fused_bf16,
 )
+
+
+def _real_megatron_subprocess_environment(
+    **overrides: str,
+) -> dict[str, str]:
+    from megatron.core.transformer.experimental_attention_variant import dsa
+
+    source_file = Path(inspect.getsourcefile(dsa) or "").resolve()
+    source_root = source_file.parents[4]
+    repo_root = Path(__file__).resolve().parents[1]
+    environment = os.environ.copy()
+    pythonpath = [str(repo_root), str(source_root)]
+    if environment.get("PYTHONPATH"):
+        pythonpath.append(environment["PYTHONPATH"])
+    environment["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    # core_v0.18.0 package_info otherwise shells out to git during every clean
+    # subprocess import; the source checkout is pinned by the pytest receipt.
+    environment["NO_VCS_VERSION"] = "1"
+    environment.update(overrides)
+    return environment
 
 
 def _upstream_reference(
@@ -202,6 +223,41 @@ def test_graph_route_bias_from_structure_batch_scatter_domain_edge_triples():
     assert bias[0, 0, 2].item() == 2.0
     assert bias[0, 1, 3].item() == 5.0
     assert bias.sum().item() == 7.0
+
+
+def test_graph_route_bias_rejects_fractional_production_sidecars():
+    structure_batch = {
+        "graph_domain_edges": torch.tensor(
+            [[[1.5, 0.0, 5.0]]], dtype=torch.float32
+        ),
+        "graph_domain_edge_counts": torch.tensor([1], dtype=torch.long),
+    }
+
+    with pytest.raises(TypeError, match="integer"):
+        build_graph_route_bias_from_structure_batch(
+            structure_batch,
+            batch_size=1,
+            seqlen_q=2,
+            seqlen_k=2,
+            device=torch.device("cpu"),
+        )
+
+
+def test_explicit_empty_graph_batch_has_zero_prior():
+    structure_batch = {
+        "graph_domain_edges": torch.empty((1, 0, 3), dtype=torch.long),
+        "graph_domain_edge_counts": torch.zeros((1,), dtype=torch.long),
+    }
+
+    bias = build_graph_route_bias_from_structure_batch(
+        structure_batch,
+        batch_size=1,
+        seqlen_q=2,
+        seqlen_k=2,
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(bias, torch.zeros_like(bias))
 
 
 def test_fused_scores_add_graph_route_bias_before_topk():
@@ -386,6 +442,232 @@ finally:
     assert output["plain_scores"][0][0][3] == pytest.approx(4.0)
     assert output["masked_indices"][0][0][0] != 3
     assert output["masked_scores"][0][0][3] == float("-inf")
+
+
+def test_real_pinned_dsa_token_only_fallback_matches_upstream():
+    script = r'''
+import inspect
+import json
+import torch
+
+from megatron.core.transformer.experimental_attention_variant import dsa
+from cppmega.megatron import dsa_indexer_fused_patch as fused_patch
+
+assert tuple(inspect.signature(dsa.FusedDSAIndexerLoss.forward).parameters) == (
+    "ctx", "q", "weights", "k", "query", "key", "softmax_scale", "topk",
+    "loss_coeff", "mask", "sparse_loss", "pg_collection",
+)
+fused_patch.apply_dsa_indexer_fused_patch(force=True)
+q = torch.tensor(
+    [[[[1.0, 0.5]]], [[[0.5, 1.0]]]], dtype=torch.float32
+)
+k = torch.tensor(
+    [[[1.0, 0.0]], [[0.0, 1.0]]], dtype=torch.float32
+)
+weights = torch.ones((2, 1, 1), dtype=torch.float32)
+reference = torch.einsum("sbhd,tbd->sbht", q, k)
+reference = torch.relu(reference) * weights.unsqueeze(-1)
+reference = reference.sum(dim=2).transpose(0, 1)
+scores, indices = dsa.fused_qk_topk_naive(q, k, weights, 1, None)
+print(json.dumps({
+    "scores": scores.tolist(),
+    "reference": reference.tolist(),
+    "indices": indices.tolist(),
+}))
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        env=_real_megatron_subprocess_environment(
+            CPPMEGA_GRAPH_ROUTES_ENABLED="0",
+            CPPMEGA_DSA_GRAPH_AUX_ENABLED="0",
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr + "\n" + result.stdout
+    output = json.loads(result.stdout.strip().splitlines()[-1])
+    assert output["scores"] == output["reference"]
+    assert output["indices"] == [[[0], [1]]]
+
+
+def test_real_pinned_fused_dsa_edge_changes_selection_total_loss_and_gradients():
+    script = r'''
+import json
+from types import SimpleNamespace
+
+import torch
+
+from megatron.core.transformer.experimental_attention_variant import dsa
+from cppmega.megatron import dsa_indexer_fused_patch as fused_patch
+from cppmega.megatron.structure_dataset_patch import _set_current_structure_batch
+
+class TPGroup:
+    @staticmethod
+    def size():
+        return 1
+
+pg_collection = SimpleNamespace(tp=TPGroup())
+fused_patch.apply_dsa_indexer_fused_patch(force=True)
+
+def run(edge_destination):
+    structure = {
+        "graph_domain_edges": torch.tensor(
+            [[[3, edge_destination, 5]]], dtype=torch.long
+        ),
+        "graph_domain_edge_counts": torch.tensor([1], dtype=torch.long),
+        "graph_document_ids": torch.full((1, 4), 11, dtype=torch.long),
+    }
+    _set_current_structure_batch(structure)
+    q = torch.ones((4, 1, 1, 2), dtype=torch.float32, requires_grad=True)
+    k = torch.tensor(
+        [[[2.0, 0.0]], [[0.5, 0.0]], [[0.25, 0.0]], [[0.1, 0.0]]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    weights = torch.ones((4, 1, 1), dtype=torch.float32, requires_grad=True)
+    query = torch.zeros((4, 1, 1, 2), dtype=torch.float32)
+    key = torch.zeros((4, 1, 1, 2), dtype=torch.float32)
+    mask = torch.triu(
+        torch.full((4, 4), float("-inf"), dtype=torch.float32), diagonal=1
+    )
+    indices, total_loss = dsa.FusedDSAIndexerLoss.apply(
+        q,
+        weights,
+        k,
+        query,
+        key,
+        1.0,
+        1,
+        0.0,
+        mask,
+        False,
+        pg_collection,
+    )
+    total_loss.backward()
+    return {
+        "selected": int(indices[0, 3, 0]),
+        "loss": float(total_loss.detach()),
+        "q_grad": q.grad.tolist(),
+        "weights_grad": weights.grad.tolist(),
+        "k_grad": k.grad.tolist(),
+    }
+
+try:
+    first = run(0)
+    second = run(1)
+finally:
+    _set_current_structure_batch(None)
+print(json.dumps({"first": first, "second": second}))
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        env=_real_megatron_subprocess_environment(
+            CPPMEGA_STRUCTURE_ENABLED="1",
+            CPPMEGA_GRAPH_ROUTES_ENABLED="1",
+            CPPMEGA_DSA_GRAPH_AUX_ENABLED="1",
+            CPPMEGA_DSA_GRAPH_AUX_RELATIONS="domain",
+            CPPMEGA_DSA_GRAPH_AUX_WEIGHT="1",
+            CPPMEGA_DSA_INDEXER_LOSS_COEFF="1",
+            CPPMEGA_DSA_GRAPH_LAYER_WEIGHT="1",
+            CPPMEGA_DSA_GRAPH_BCE_WEIGHT="1",
+            CPPMEGA_DSA_GRAPH_COVERAGE_WEIGHT="1",
+            CPPMEGA_DSA_GRAPH_AUX_TOPK="1",
+            CPPMEGA_DSA_GRAPH_POS_WEIGHT="1",
+            CPPMEGA_DSA_GRAPH_MARGIN="1",
+            CPPMEGA_GRAPH_BIAS_BETA="8",
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr + "\n" + result.stdout
+    output = json.loads(result.stdout.strip().splitlines()[-1])
+    first = output["first"]
+    second = output["second"]
+    assert first["selected"] == 0
+    assert second["selected"] == 1
+    assert first["loss"] != pytest.approx(second["loss"])
+    assert first["q_grad"] != second["q_grad"]
+    assert first["weights_grad"] != second["weights_grad"]
+    assert first["k_grad"] != second["k_grad"]
+
+
+def test_real_pinned_fused_dsa_explicit_ablation_is_token_only():
+    script = r'''
+import json
+from types import SimpleNamespace
+
+import torch
+
+from megatron.core.transformer.experimental_attention_variant import dsa
+from cppmega.megatron import dsa_indexer_fused_patch as fused_patch
+
+class TPGroup:
+    @staticmethod
+    def size():
+        return 1
+
+fused_patch.apply_dsa_indexer_fused_patch(force=True)
+q = torch.ones((2, 1, 1, 2), dtype=torch.float32, requires_grad=True)
+k = torch.tensor(
+    [[[1.0, 0.0]], [[0.0, 1.0]]], dtype=torch.float32, requires_grad=True
+)
+weights = torch.ones((2, 1, 1), dtype=torch.float32, requires_grad=True)
+query = torch.zeros((2, 1, 1, 2), dtype=torch.float32)
+key = torch.zeros((2, 1, 1, 2), dtype=torch.float32)
+mask = torch.triu(
+    torch.full((2, 2), float("-inf"), dtype=torch.float32), diagonal=1
+)
+indices, total_loss = dsa.FusedDSAIndexerLoss.apply(
+    q,
+    weights,
+    k,
+    query,
+    key,
+    1.0,
+    1,
+    0.0,
+    mask,
+    False,
+    SimpleNamespace(tp=TPGroup()),
+)
+total_loss.backward()
+print(json.dumps({
+    "indices": indices.tolist(),
+    "loss": float(total_loss.detach()),
+    "q_grad_nonzero": int(torch.count_nonzero(q.grad)),
+    "weights_grad_nonzero": int(torch.count_nonzero(weights.grad)),
+    "k_grad_nonzero": int(torch.count_nonzero(k.grad)),
+}))
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        env=_real_megatron_subprocess_environment(
+            CPPMEGA_STRUCTURE_ENABLED="1",
+            CPPMEGA_GRAPH_ROUTES_ENABLED="0",
+            CPPMEGA_GRAPH_ROUTES_ABLATION="1",
+            CPPMEGA_DSA_GRAPH_AUX_ENABLED="1",
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr + "\n" + result.stdout
+    output = json.loads(result.stdout.strip().splitlines()[-1])
+    assert output["loss"] == 0.0
+    assert output["q_grad_nonzero"] == 0
+    assert output["weights_grad_nonzero"] == 0
+    assert output["k_grad_nonzero"] == 0
 
 
 def test_graph_edges_change_production_indexer_loss_and_gradient():

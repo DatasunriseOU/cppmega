@@ -7,6 +7,7 @@ from cppmega.megatron.patch_install import CppMegaFeatureConfig, install_cppmega
 _FEATURE_FLAGS = (
     "CPPMEGA_STRUCTURE_ENABLED",
     "CPPMEGA_GRAPH_ROUTES_ENABLED",
+    "CPPMEGA_GRAPH_ROUTES_ABLATION",
     "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS",
     "CPPMEGA_DOMAIN_EMBEDDING_ENABLED",
     "CPPMEGA_NGRAM_HASH_ENABLED",
@@ -48,6 +49,33 @@ def test_valid_full_stack():
         }
     )
     assert cfg.structure_enabled and cfg.graph_routes_enabled and cfg.graph_dense_attention_bias
+
+
+def test_explicit_ablation_is_a_first_class_token_only_mode():
+    cfg = CppMegaFeatureConfig.from_env(
+        {
+            "CPPMEGA_STRUCTURE_ENABLED": "1",
+            "CPPMEGA_GRAPH_ROUTES_ENABLED": "0",
+            "CPPMEGA_GRAPH_ROUTES_ABLATION": "1",
+            "CPPMEGA_DSA_GRAPH_AUX_ENABLED": "1",
+        }
+    )
+
+    assert cfg.graph_routes_ablation is True
+    assert cfg.graph_routes_enabled is False
+
+
+def test_ablation_overrides_enabled_routes_without_structure_or_capacities():
+    cfg = CppMegaFeatureConfig.from_env(
+        {
+            "CPPMEGA_STRUCTURE_ENABLED": "0",
+            "CPPMEGA_GRAPH_ROUTES_ENABLED": "1",
+            "CPPMEGA_GRAPH_ROUTES_ABLATION": "1",
+        }
+    )
+
+    assert cfg.graph_routes_ablation is True
+    assert cfg.graph_routes_enabled is True
 
 
 def test_graph_routes_require_structure(monkeypatch):

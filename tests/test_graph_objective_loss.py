@@ -9,6 +9,7 @@ from cppmega.megatron.graph_objective_loss import (
     GRAPH_BIAS_BETA_LEGACY_ENVS,
     GraphAuxiliaryLossConfig,
     graph_bias_beta_binding,
+    graph_objective_requested,
     graph_auxiliary_loss,
     require_active_dsa_graph_objective,
     resolve_graph_bias_beta,
@@ -321,6 +322,31 @@ def test_dense_graph_routes_do_not_require_a_dsa_indexer_coefficient(
     require_active_dsa_graph_objective(
         SimpleNamespace(dsa_indexer_loss_coeff=None), required=False
     )
+
+
+def test_explicit_graph_ablation_disables_auxiliary_request() -> None:
+    environment = {
+        "CPPMEGA_GRAPH_ROUTES_ENABLED": "0",
+        "CPPMEGA_GRAPH_ROUTES_ABLATION": "1",
+        "CPPMEGA_DSA_GRAPH_AUX_ENABLED": "1",
+    }
+
+    assert graph_objective_requested(environment=environment) is False
+
+
+def test_production_graph_contract_rejects_ablation_even_with_route_flags_on() -> None:
+    environment = {
+        "CPPMEGA_STRUCTURE_ENABLED": "1",
+        "CPPMEGA_GRAPH_ROUTES_ENABLED": "1",
+        "CPPMEGA_GRAPH_ROUTES_ABLATION": "1",
+        "CPPMEGA_DSA_GRAPH_AUX_ENABLED": "1",
+    }
+
+    with pytest.raises(ValueError, match="ablation"):
+        validate_runtime_graph_contract(
+            _included_graph_contract(),
+            environment=environment,
+        )
 
 
 def test_graph_runtime_config_rejects_non_finite_weight(

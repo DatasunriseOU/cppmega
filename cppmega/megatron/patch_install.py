@@ -86,6 +86,7 @@ class CppMegaFeatureConfig:
 
     structure_enabled: bool
     graph_routes_enabled: bool
+    graph_routes_ablation: bool
     graph_dense_attention_bias: bool
     graph_dense_max_seq: int
     graph_max_edges: int
@@ -112,6 +113,9 @@ class CppMegaFeatureConfig:
         cfg = cls(
             structure_enabled=_env_bool("CPPMEGA_STRUCTURE_ENABLED", source=source),
             graph_routes_enabled=_env_bool("CPPMEGA_GRAPH_ROUTES_ENABLED", source=source),
+            graph_routes_ablation=_env_bool(
+                "CPPMEGA_GRAPH_ROUTES_ABLATION", source=source
+            ),
             graph_dense_attention_bias=_env_bool(
                 "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS", True, source=source
             ),
@@ -169,14 +173,17 @@ class CppMegaFeatureConfig:
         if raw_dense is not None and _env_bool(
             "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS", source=source
         ):
-            if not cfg.graph_routes_enabled:
+            if not cfg.graph_routes_enabled and not cfg.graph_routes_ablation:
                 raise ValueError(
                     "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS is set but "
                     "CPPMEGA_GRAPH_ROUTES_ENABLED is not — dense graph bias is gated "
                     "off without graph routes, so this flag would silently no-op"
                 )
         cfg.validate()
-        if cfg.graph_routes_enabled:
+        effective_graph_routes = (
+            cfg.graph_routes_enabled and not cfg.graph_routes_ablation
+        )
+        if effective_graph_routes:
             for name in ("CPPMEGA_GRAPH_MAX_EDGES", "CPPMEGA_GRAPH_MAX_CHUNKS"):
                 if not source.get(name, "").strip():
                     raise ValueError(
@@ -188,7 +195,11 @@ class CppMegaFeatureConfig:
     def validate(self) -> None:
         # RULE #1: an invalid feature combination must fail loud HERE, not survive
         # to a later forward pass where it silently runs token-only / mis-shaped.
-        if self.graph_routes_enabled and not self.structure_enabled:
+        if (
+            self.graph_routes_enabled
+            and not self.graph_routes_ablation
+            and not self.structure_enabled
+        ):
             raise ValueError(
                 "CPPMEGA_GRAPH_ROUTES_ENABLED=1 requires CPPMEGA_STRUCTURE_ENABLED=1 "
                 "(graph sidecars ride the structure ingest)"

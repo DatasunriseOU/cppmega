@@ -1,5 +1,6 @@
 import json
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -383,6 +384,136 @@ def test_dense_tensor_only_production_path_requires_explicit_ablation():
         assert graph_dense_bias_enabled() is False
 
 
+def test_dense_graph_bias_is_disabled_by_explicit_ablation(monkeypatch):
+    structure_batch = {
+        "graph_domain_edges": torch.tensor([[[1, 0, 5]]], dtype=torch.long),
+        "graph_domain_edge_counts": torch.tensor([1], dtype=torch.long),
+    }
+    monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
+    monkeypatch.setenv("CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS", "1")
+    monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ABLATION", "1")
+    _set_current_structure_batch(structure_batch)
+    try:
+        assert (
+            _graph_attention_bias_for_layer(
+                _Layer(_DenseSelfAttention()),
+                torch.zeros(2, 1, 8),
+            )
+            is None
+        )
+    finally:
+        _set_current_structure_batch(None)
+
+
+def test_pinned_transformer_layer_preserves_positional_attention_bias(monkeypatch):
+    from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    from cppmega.megatron.graph_route_attention_bias_patch import (
+        apply_graph_route_attention_bias_patch,
+    )
+
+    class DenseProbe(TransformerLayer):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.self_attention = _DenseSelfAttention()
+            self.config = SimpleNamespace(
+                sequence_parallel=False,
+                context_parallel_size=1,
+            )
+            self.seen_attention_bias = None
+
+        def _forward_attention(self, *args, **kwargs):
+            hidden_states = args[0] if args else kwargs["hidden_states"]
+            self.seen_attention_bias = kwargs.get("attention_bias")
+            if len(args) > 8:
+                self.seen_attention_bias = args[8]
+            return hidden_states, None
+
+        def _forward_mlp(self, hidden_states, *_args, **_kwargs):
+            return hidden_states
+
+    original_forward = TransformerLayer.forward
+    structure_batch = {
+        "graph_domain_edges": torch.tensor([[[1, 0, 5]]], dtype=torch.long),
+        "graph_domain_edge_counts": torch.tensor([1], dtype=torch.long),
+    }
+    supplied_bias = torch.full((1, 1, 2, 2), 7.0)
+    hidden_states = torch.zeros(2, 1, 8)
+    monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
+    monkeypatch.setenv("CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS", "1")
+    _set_current_structure_batch(structure_batch)
+    try:
+        apply_graph_route_attention_bias_patch(force=True)
+        layer = DenseProbe()
+        output, _context = layer.forward(
+            hidden_states,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            supplied_bias,
+        )
+    finally:
+        TransformerLayer.forward = original_forward
+        _set_current_structure_batch(None)
+
+    assert output is hidden_states
+    assert layer.seen_attention_bias is supplied_bias
+
+
+def test_pinned_transformer_layer_injects_sidecar_bias_at_dense_gqa_seam(monkeypatch):
+    from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    from cppmega.megatron.graph_route_attention_bias_patch import (
+        apply_graph_route_attention_bias_patch,
+    )
+
+    class DenseProbe(TransformerLayer):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.self_attention = _DenseSelfAttention()
+            self.config = SimpleNamespace(
+                sequence_parallel=False,
+                context_parallel_size=1,
+            )
+            self.seen_attention_bias = None
+
+        def _forward_attention(self, *args, **kwargs):
+            self.seen_attention_bias = kwargs.get("attention_bias")
+            if self.seen_attention_bias is None and len(args) > 8:
+                self.seen_attention_bias = args[8]
+            return args[0] if args else kwargs["hidden_states"], None
+
+        def _forward_mlp(self, hidden_states, *_args, **_kwargs):
+            return hidden_states
+
+    original_forward = TransformerLayer.forward
+    structure_batch = {
+        "graph_domain_edges": torch.tensor([[[1, 0, 5]]], dtype=torch.long),
+        "graph_domain_edge_counts": torch.tensor([1], dtype=torch.long),
+    }
+    hidden_states = torch.zeros(2, 1, 8)
+    monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
+    monkeypatch.setenv("CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS", "1")
+    monkeypatch.setenv("CPPMEGA_GRAPH_BIAS_BETA", "3")
+    _set_current_structure_batch(structure_batch)
+    try:
+        apply_graph_route_attention_bias_patch(force=True)
+        layer = DenseProbe()
+        output, _context = layer.forward(hidden_states, attention_bias=None)
+    finally:
+        TransformerLayer.forward = original_forward
+        _set_current_structure_batch(None)
+
+    assert output is hidden_states
+    assert layer.seen_attention_bias is not None
+    assert layer.seen_attention_bias.shape == (1, 1, 2, 2)
+    assert layer.seen_attention_bias[0, 0, 1, 0].item() == pytest.approx(3.0)
+
+
 def test_env_flag_accepts_only_documented_values_and_fails_closed():
     name = "CPPMEGA_TEST_STRICT_GRAPH_FLAG"
     previous = os.environ.get(name)
@@ -409,3 +540,34 @@ def test_env_flag_accepts_only_documented_values_and_fails_closed():
             os.environ.pop(name, None)
         else:
             os.environ[name] = previous
+
+
+def test_graph_dense_bias_enabled_rejects_malformed_flag_cr02(monkeypatch):
+    """CR-02 regression: malformed CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS must raise.
+
+    Previously _env_flag mapped every unrecognized value to False, so a typo
+    like 'tru' silently disabled the dense graph bias path instead of failing
+    loudly.  This test exercises the full graph_dense_bias_enabled() entry
+    point with routes enabled.
+    """
+    monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
+
+    # Malformed values must raise ValueError, not silently return False.
+    for bad_value in ("tru", "0x1", "  tru  ", " true1", " 0x1 ", ""):
+        monkeypatch.setenv("CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS", bad_value)
+        with pytest.raises(ValueError):
+            graph_dense_bias_enabled()
+
+    # Documented true spellings enable the bias.
+    for good_true in ("1", "true", "TRUE", "True", "yes", "on", " true "):
+        monkeypatch.setenv("CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS", good_true)
+        assert graph_dense_bias_enabled() is True
+
+    # Documented false spellings disable the bias.
+    for good_false in ("0", "false", "FALSE", "False", "no", "off", " false "):
+        monkeypatch.setenv("CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS", good_false)
+        assert graph_dense_bias_enabled() is False
+
+    # Default (env var unset) remains enabled when routes are enabled.
+    monkeypatch.delenv("CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS", raising=False)
+    assert graph_dense_bias_enabled() is True

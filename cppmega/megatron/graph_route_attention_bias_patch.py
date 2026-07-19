@@ -27,6 +27,7 @@ from cppmega.megatron.dsa_indexer_fused_patch import (
     require_graph_routes_for_production,
 )
 from cppmega.megatron.graph_objective_loss import (
+    graph_routes_active,
     resolve_graph_bias_beta,
     validate_graph_bias_beta,
 )
@@ -44,7 +45,25 @@ __all__ = [
 ]
 
 _PATCH_MARKER = "__cppmega_graph_route_attention_bias_patched__"
+_ORIGINAL_FORWARD_ATTRIBUTE = "__cppmega_graph_route_attention_bias_original__"
 _INFERENCE_STATE_ATTRIBUTE = "_cppmega_prompt_graph_inference_state"
+_PINNED_TRANSFORMER_PARAMETERS = (
+    "self",
+    "hidden_states",
+    "attention_mask",
+    "context",
+    "context_mask",
+    "rotary_pos_emb",
+    "rotary_pos_cos",
+    "rotary_pos_sin",
+    "rotary_pos_cos_sin",
+    "attention_bias",
+    "inference_context",
+    "packed_seq_params",
+    "sequence_len_offset",
+    "padding_mask",
+    "inference_params",
+)
 
 
 @dataclass(frozen=True)
@@ -120,11 +139,32 @@ def _env_int(name: str, default: int) -> int:
         raise ValueError(f"{name} must be an int, got {raw!r}") from exc
 
 
+def _require_pinned_transformer_signature(
+    value: object,
+    *,
+    qualified_name: str,
+) -> inspect.Signature:
+    try:
+        signature = inspect.signature(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"cannot inspect pinned Megatron seam {qualified_name}"
+        ) from exc
+    actual = tuple(signature.parameters)
+    if actual != _PINNED_TRANSFORMER_PARAMETERS:
+        raise RuntimeError(
+            f"pinned Megatron seam {qualified_name} has parameters {actual}, "
+            "expected the core_v0.18.0 TransformerLayer attention signature "
+            f"{_PINNED_TRANSFORMER_PARAMETERS}"
+        )
+    return signature
+
+
 def graph_dense_bias_enabled() -> bool:
     """Default dense graph bias on whenever graph routes are enabled."""
 
     require_graph_routes_for_production()
-    if not _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
+    if not graph_routes_active():
         return False
     return _env_flag("CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS", "1")
 
@@ -577,36 +617,57 @@ def apply_graph_route_attention_bias_patch(*, force: bool = False) -> bool:
 
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
-    existing = getattr(TransformerLayer, "forward", None)
-    if existing is None:
+    installed_forward = getattr(TransformerLayer, "forward", None)
+    if installed_forward is None:
         raise RuntimeError("Megatron TransformerLayer.forward not found")
-    if getattr(existing, _PATCH_MARKER, False) and not force:
+    if getattr(installed_forward, _PATCH_MARKER, False) and not force:
         log.info("cppmega graph-route attention bias patch already applied")
         return True
 
-    _forward_param_names = list(inspect.signature(existing).parameters)
+    existing = installed_forward
+    if getattr(existing, _PATCH_MARKER, False):
+        existing = getattr(existing, _ORIGINAL_FORWARD_ATTRIBUTE, None)
+        if existing is None:
+            raise RuntimeError(
+                "graph-route attention bias patch marker has no original pinned forward"
+            )
+    forward_signature = _require_pinned_transformer_signature(
+        existing,
+        qualified_name="TransformerLayer.forward",
+    )
+    _require_pinned_transformer_signature(
+        TransformerLayer._forward_attention,
+        qualified_name="TransformerLayer._forward_attention",
+    )
 
     def _forward_with_graph_route_bias(self, *args, **kwargs):
-        if kwargs.get("attention_bias") is None and graph_dense_bias_enabled():
-            if "hidden_states" in kwargs:
-                hidden_states = kwargs["hidden_states"]
-            elif args:
-                hidden_states = args[0]
-            else:
-                hidden_states = None
+        try:
+            bound = forward_signature.bind(self, *args, **kwargs)
+        except TypeError:
+            # Preserve Megatron's native argument error and traceback for calls
+            # that do not match the pinned signature.
+            return existing(self, *args, **kwargs)
+        if bound.arguments.get("attention_bias") is None and graph_dense_bias_enabled():
+            hidden_states = bound.arguments.get("hidden_states")
             if hidden_states is None:
                 raise RuntimeError(
                     "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS=1 but TransformerLayer.forward "
                     "received no hidden_states"
                 )
+            inference_context = bound.arguments.get("inference_context")
+            if inference_context is None:
+                inference_context = bound.arguments.get("inference_params")
             bias = _graph_attention_bias_for_layer(
-                self, hidden_states, _forward_inference_context(_forward_param_names, args, kwargs)
+                self,
+                hidden_states,
+                inference_context,
             )
             if bias is not None:
-                kwargs["attention_bias"] = bias
-        return existing(self, *args, **kwargs)
+                bound.arguments["attention_bias"] = bias
+        return existing(*bound.args, **bound.kwargs)
 
     setattr(_forward_with_graph_route_bias, _PATCH_MARKER, True)
+    setattr(_forward_with_graph_route_bias, _ORIGINAL_FORWARD_ATTRIBUTE, existing)
     TransformerLayer.forward = _forward_with_graph_route_bias
 
     log.info("cppmega graph-route attention bias patch applied")

@@ -23,6 +23,7 @@ GRAPH_BIAS_BETA_LEGACY_ENVS = (
     "CPPMEGA_DSA_GRAPH_BIAS_BETA",
     "CPPMEGA_GRAPH_ATTENTION_BIAS_BETA",
 )
+GRAPH_ROUTES_ABLATION_ENV = "CPPMEGA_GRAPH_ROUTES_ABLATION"
 
 
 def validate_graph_bias_beta(
@@ -98,6 +99,31 @@ def graph_bias_beta_binding(beta: float | None = None) -> dict[str, object]:
         "legacy_envs": list(GRAPH_BIAS_BETA_LEGACY_ENVS),
         "value": str(Fraction(str(value))),
     }
+
+
+def graph_routes_ablation_requested(
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> bool:
+    return _env_flag(GRAPH_ROUTES_ABLATION_ENV, environment=environment)
+
+
+def graph_routes_active(
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> bool:
+    """Return the effective route mode shared by every runtime consumer.
+
+    Parse both flags even when ablation is requested so a misspelled route
+    flag cannot be hidden by the token-only override.
+    """
+
+    ablation = graph_routes_ablation_requested(environment=environment)
+    routes_enabled = _env_flag(
+        "CPPMEGA_GRAPH_ROUTES_ENABLED",
+        environment=environment,
+    )
+    return routes_enabled and not ablation
 
 
 @dataclass(frozen=True)
@@ -217,7 +243,12 @@ def validate_runtime_graph_contract(
 ) -> None:
     """Require runtime graph-loss knobs to exactly match the data receipt."""
 
-    if not _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED", environment=environment):
+    if graph_routes_ablation_requested(environment=environment):
+        raise ValueError(
+            "production graph objective forbids explicit graph-route ablation "
+            "(CPPMEGA_GRAPH_ROUTES_ABLATION=1)"
+        )
+    if not graph_routes_active(environment=environment):
         raise ValueError(
             "production graph objective requires CPPMEGA_GRAPH_ROUTES_ENABLED=1"
         )
@@ -295,7 +326,7 @@ def graph_objective_requested(
     *,
     environment: Mapping[str, str] | None = None,
 ) -> bool:
-    return _env_flag(
+    return graph_routes_active(environment=environment) and _env_flag(
         "CPPMEGA_DSA_GRAPH_AUX_ENABLED",
         environment=environment,
     )
@@ -310,11 +341,15 @@ def require_active_dsa_graph_objective(
 
     if not required:
         return
-    if not graph_objective_requested():
+    if graph_routes_ablation_requested():
+        raise ValueError(
+            "DSA graph objective is unavailable during explicit graph-route ablation"
+        )
+    if not _env_flag("CPPMEGA_DSA_GRAPH_AUX_ENABLED"):
         raise ValueError(
             "DSA graph objective requested but CPPMEGA_DSA_GRAPH_AUX_ENABLED is disabled"
         )
-    if not _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
+    if not graph_routes_active():
         raise ValueError(
             "DSA graph objective requested but CPPMEGA_GRAPH_ROUTES_ENABLED is disabled"
         )
@@ -467,8 +502,11 @@ __all__ = [
     "GraphAuxiliaryLossConfig",
     "GRAPH_BIAS_BETA_ENV",
     "GRAPH_BIAS_BETA_LEGACY_ENVS",
+    "GRAPH_ROUTES_ABLATION_ENV",
     "graph_bias_beta_binding",
     "graph_objective_requested",
+    "graph_routes_ablation_requested",
+    "graph_routes_active",
     "graph_auxiliary_loss",
     "require_active_dsa_graph_objective",
     "resolve_graph_bias_beta",
