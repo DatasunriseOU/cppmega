@@ -2904,6 +2904,154 @@ def find_shell_files(
     return files
 
 
+# ---------------------------------------------------------------------------
+# Shell edge extraction (regex-based, lightweight)
+# ---------------------------------------------------------------------------
+
+_SHELL_PIPE_RE = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_./-]*)"  # command before pipe
+    r"[ \t]*\|[ \t]*"               # pipe operator
+    r"([A-Za-z_][A-Za-z0-9_./-]*)"  # command after pipe
+)
+
+_SHELL_SOURCE_RE = re.compile(
+    r"(?m)^[ \t]*(?:\.|source)[ \t]+([^\s;#]+)"
+)
+
+_SHELL_VAR_DEF_RE = re.compile(
+    r"(?m)^[ \t]*(?:export[ \t]+|declare[ \t]+(?:-[a-zA-Z]+[ \t]+)*|local[ \t]+)?"
+    r"([A-Za-z_][A-Za-z0-9_]*)="
+)
+
+_SHELL_VAR_USE_RE = re.compile(
+    r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+_SHELL_COMMAND_FILE_RE = re.compile(
+    r"(?m)^[ \t]*([A-Za-z_][A-Za-z0-9_./-]*)"  # command
+    r"(?:[ \t]+-{1,2}[A-Za-z0-9_-]*(?:=[^\s]*)?)*"  # optional flags
+    r"[ \t]+([^\s;|&<>#]+\.[A-Za-z0-9]+)"  # file argument with extension
+)
+
+_PS_CMDLET_RE = re.compile(
+    r"(?m)^[ \t]*([A-Z][a-z]+-[A-Z][A-Za-z]+)"  # Verb-Noun cmdlet
+    r"((?:[ \t]+-[A-Za-z]+[ \t]+[^\s;#|]+)*)"   # -Param Value pairs
+)
+
+_PS_PARAM_RE = re.compile(
+    r"-([A-Za-z]+)[ \t]+([^\s;#|]+)"
+)
+
+_TCSH_SETENV_RE = re.compile(
+    r"(?m)^[ \t]*setenv[ \t]+([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+_TCSH_VAR_USE_RE = re.compile(
+    r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?"
+)
+
+
+def _shell_edges_from_script(text: str, shell_kind: str) -> list[dict[str, int]]:
+    """Extract graph edges from shell script text using lightweight regex parsing.
+
+    Returns a list of char-level edge triples:
+        {"from_char": int, "to_char": int, "kind": int}
+
+    Edge kinds (from DomainEdgeKind):
+        SHELL_PIPE = 40          cmd1 | cmd2
+        SHELL_REDIR_IN = 41      cmd < file
+        SHELL_REDIR_OUT = 42     cmd > file
+        SHELL_VAR_DEF_USE = 43   VAR=... → $VAR usage
+        SHELL_COMMAND_FILE = 44  command → file argument / source dep
+    """
+    from cppmega.data.domain_schema import DomainEdgeKind
+
+    edges: list[dict[str, int]] = []
+    text_len = len(text)
+    seen: set[tuple[int, int, int]] = set()
+
+    def _add_edge(from_char: int, to_char: int, kind: int) -> None:
+        if from_char < 0 or to_char < 0 or from_char >= text_len or to_char >= text_len:
+            return
+        if from_char == to_char:
+            return
+        key = (from_char, to_char, kind)
+        if key not in seen:
+            seen.add(key)
+            edges.append({"from_char": from_char, "to_char": to_char, "kind": kind})
+
+    is_powershell = shell_kind in {"powershell", "pwsh", "ps1"}
+    is_tcsh = shell_kind in {"tcsh", "csh"}
+
+    # --- Pipe edges: cmd1 | cmd2 → cmd1 feeds cmd2 ---
+    for m in _SHELL_PIPE_RE.finditer(text):
+        cmd1_start = m.start(1)
+        cmd2_start = m.start(2)
+        _add_edge(cmd1_start, cmd2_start, int(DomainEdgeKind.SHELL_PIPE))
+
+    # --- Source/dot edges: . ./script.sh or source ./script.sh ---
+    for m in _SHELL_SOURCE_RE.finditer(text):
+        source_kw_start = m.start(0) + len(m.group(0)) - len(m.group(0).lstrip())
+        # Find the actual keyword start (skip leading whitespace)
+        line_start = text.rfind("\n", 0, m.start(0)) + 1
+        stripped = text[line_start:m.end(0)]
+        kw_offset = len(stripped) - len(stripped.lstrip())
+        from_char = line_start + kw_offset
+        target_start = m.start(1)
+        _add_edge(from_char, target_start, int(DomainEdgeKind.SHELL_COMMAND_FILE))
+
+    # --- Env variable def→use edges ---
+    if is_tcsh:
+        # tcsh uses setenv VAR value
+        var_defs: dict[str, int] = {}
+        for m in _TCSH_SETENV_RE.finditer(text):
+            var_defs[m.group(1)] = m.start(1)
+        for m in _TCSH_VAR_USE_RE.finditer(text):
+            var_name = m.group(1)
+            if var_name in var_defs:
+                def_pos = var_defs[var_name]
+                use_pos = m.start(0)
+                if use_pos != def_pos:
+                    _add_edge(use_pos, def_pos, int(DomainEdgeKind.SHELL_VAR_DEF_USE))
+    elif not is_powershell:
+        # bash/sh/zsh/ksh: VAR=value definitions
+        var_defs_posix: dict[str, int] = {}
+        for m in _SHELL_VAR_DEF_RE.finditer(text):
+            var_defs_posix[m.group(1)] = m.start(1)
+        for m in _SHELL_VAR_USE_RE.finditer(text):
+            var_name = m.group(1) or m.group(2)
+            if var_name in var_defs_posix:
+                def_pos = var_defs_posix[var_name]
+                use_pos = m.start(0)
+                if use_pos != def_pos:
+                    _add_edge(use_pos, def_pos, int(DomainEdgeKind.SHELL_VAR_DEF_USE))
+
+    # --- Command→file argument edges ---
+    if not is_powershell:
+        for m in _SHELL_COMMAND_FILE_RE.finditer(text):
+            cmd_start = m.start(1)
+            file_start = m.start(2)
+            _add_edge(cmd_start, file_start, int(DomainEdgeKind.SHELL_COMMAND_FILE))
+
+    # --- PowerShell: cmdlet→parameter edges ---
+    if is_powershell:
+        for m in _PS_CMDLET_RE.finditer(text):
+            cmdlet_start = m.start(1)
+            params_str = m.group(2)
+            if not params_str:
+                continue
+            params_offset = m.start(2)
+            for pm in _PS_PARAM_RE.finditer(params_str):
+                param_value_start = params_offset + pm.start(2)
+                _add_edge(
+                    cmdlet_start,
+                    param_value_start,
+                    int(DomainEdgeKind.SHELL_COMMAND_FILE),
+                )
+
+    return edges
+
+
 def load_compile_commands(project_dir: str) -> Optional[dict]:
     """Load compile_commands.json if available."""
     cc_path = find_compile_commands_file(project_dir)
@@ -5469,6 +5617,11 @@ def build_build_doc(
         DomainKind.TCSH,
         DomainKind.KSH,
     }
+    if is_shell_doc:
+        shell_kind_for_edges = build_kind.lower().replace("-", "_")
+        extracted_shell_edges = _shell_edges_from_script(text, shell_kind_for_edges)
+        if extracted_shell_edges:
+            cast(list, domain_sidecars["shell_edges"]).extend(extracted_shell_edges)
     is_python_doc = domain == DomainKind.PYTHON
     is_diagnostic_doc = int(domain) >= int(DomainKind.COMPILER_DIAGNOSTIC)
     doc_type = (
