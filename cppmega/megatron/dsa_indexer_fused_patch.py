@@ -66,6 +66,7 @@ from contextvars import ContextVar, Token
 import torch
 
 from cppmega.megatron.graph_objective_loss import (
+    compose_dsa_indexer_total_loss,
     graph_bias_beta_binding,
     resolve_graph_bias_beta,
     validate_graph_bias_beta,
@@ -968,8 +969,12 @@ def _patch_dsa_graph_objective(dsa_mod) -> None:
             captured_mask = _UPSTREAM_MASK_OVERRIDE.get()
             if captured_mask is not _NO_UPSTREAM_MASK:
                 upstream_mask = captured_mask
-        return indexer_loss + _graph_objective_from_index_scores(
-            index_scores, upstream_mask=upstream_mask
+        return compose_dsa_indexer_total_loss(
+            indexer_loss,
+            _graph_objective_from_index_scores(
+                index_scores,
+                upstream_mask=upstream_mask,
+            ),
         )
 
     setattr(

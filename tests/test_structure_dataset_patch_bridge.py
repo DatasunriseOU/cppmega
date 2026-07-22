@@ -285,6 +285,59 @@ def test_pop_structure_batch_carries_objective_ids_for_unified_mix_receipt():
     assert torch.equal(structure["objective_ids"], torch.tensor([[2, 4, 5]]))
 
 
+def test_production_objective_batch_rejects_unattributed_loss_tokens():
+    batch = {
+        "tokens": torch.tensor([[11, 12, 13]]),
+        "labels": torch.tensor([[12, 13, 0]]),
+        "loss_mask": torch.tensor([[1.0, 1.0, 0.0]]),
+    }
+    structure = {"objective_ids": torch.tensor([[1, 0, 0]])}
+
+    with pytest.raises(ValueError, match="positive objective ID for every loss token"):
+        patch._validate_production_objective_batch(batch, structure)
+
+
+def test_production_objective_batch_rejects_unattributed_structure_tokens():
+    batch = {
+        "tokens": torch.zeros((1, 2), dtype=torch.long),
+        "labels": torch.zeros((1, 2), dtype=torch.long),
+        "loss_mask": torch.zeros((1, 2), dtype=torch.float32),
+    }
+    structure = {
+        "objective_ids": torch.zeros((1, 2), dtype=torch.long),
+        "structure_ids": torch.ones((1, 2), dtype=torch.long),
+    }
+
+    with pytest.raises(ValueError, match="positive objective ID for every loss token"):
+        patch._validate_production_objective_batch(batch, structure)
+
+
+def test_production_objective_batch_rejects_unknown_objective_ids():
+    batch = {
+        "tokens": torch.tensor([[11, 12]]),
+        "labels": torch.tensor([[12, 0]]),
+        "loss_mask": torch.tensor([[1.0, 0.0]]),
+    }
+    structure = {"objective_ids": torch.tensor([[255, 0]])}
+
+    with pytest.raises(ValueError, match="unknown objective IDs"):
+        patch._validate_production_objective_batch(batch, structure)
+
+
+def test_objective_transport_is_mandatory_for_training_but_not_route_only_eval():
+    route_only = {
+        "CPPMEGA_GRAPH_ROUTES_ENABLED": "1",
+        "CPPMEGA_DSA_GRAPH_AUX_ENABLED": "0",
+    }
+    graph_training = {
+        "CPPMEGA_GRAPH_ROUTES_ENABLED": "1",
+        "CPPMEGA_DSA_GRAPH_AUX_ENABLED": "1",
+    }
+
+    assert patch._production_objective_required(route_only) is False
+    assert patch._production_objective_required(graph_training) is True
+
+
 def test_sample_objective_ids_expand_document_aligned_ids_over_packed_spans():
     objective_ids = np.array([2, 5], dtype=np.uint8)
     spans = [

@@ -27,7 +27,7 @@ import numpy as np
 from cppmega.megatron.graph_recipe import (
     STAGE1_GRAPH_RELATIONS,
     stage1_graph_recipe_binding,
-    validate_stage1_graph_contract,
+    validate_stage1_graph_total_loss_contract,
 )
 
 OBJECTIVE_CONTRACT_SCHEMA = "cppmega_pre_materialized_objectives_v1"
@@ -174,6 +174,46 @@ def _canonical_value_sha256(value: object) -> str:
         ensure_ascii=True,
     ).encode("ascii")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _schedule_receipt_locations(value: object, *, where: str) -> list[str]:
+    """Find every schedule receipt so production has one unambiguous source."""
+
+    locations: list[str] = []
+    if isinstance(value, Mapping):
+        if value.get("schema") == OBJECTIVE_SCHEDULE_RECEIPT_SCHEMA:
+            locations.append(where)
+        for key, child in value.items():
+            locations.extend(
+                _schedule_receipt_locations(
+                    child,
+                    where=f"{where}.{key}",
+                )
+            )
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            locations.extend(
+                _schedule_receipt_locations(
+                    child,
+                    where=f"{where}[{index}]",
+                )
+            )
+    return locations
+
+
+def _require_canonical_schedule_receipt(contract: Mapping[str, Any]) -> None:
+    locations = _schedule_receipt_locations(contract, where="contract")
+    expected = ["contract.source_selection.schedule"]
+    if not locations:
+        raise ValueError(
+            "production objective contract requires one canonical schedule "
+            "receipt at source_selection.schedule"
+        )
+    if locations != expected:
+        raise ValueError(
+            "production objective contract has ambiguous schedule receipts; "
+            f"expected only source_selection.schedule, found {locations}"
+        )
 
 
 def _validate_graph_eligibility_receipt(
@@ -477,8 +517,15 @@ ObjectiveShardStat = tuple[int, int, int, int, int]
 
 def validate_objective_contract(
     raw_contract: Mapping[str, Any],
+    *,
+    require_schedule_receipt: bool = False,
 ) -> ValidatedObjectiveContract:
-    """Validate one upstream objective receipt without filling any defaults."""
+    """Validate one upstream objective receipt without filling any defaults.
+
+    ``require_schedule_receipt`` is reserved for the production Megatron
+    handoff.  Generic callers may inspect older receipts, but production
+    ingress must prove exactly one canonical ``source_selection.schedule``.
+    """
 
     contract = copy.deepcopy(dict(raw_contract))
     if contract.get("schema") != OBJECTIVE_CONTRACT_SCHEMA:
@@ -661,7 +708,7 @@ def validate_objective_contract(
             "graph_auxiliary.relations contains unknown relations: "
             f"{unknown_relations}"
         )
-    validate_stage1_graph_contract(graph)
+    validate_stage1_graph_total_loss_contract(graph)
     eligible_samples = _positive_int(
         graph.get("eligible_samples"), where="graph_auxiliary.eligible_samples"
     )
@@ -687,8 +734,6 @@ def validate_objective_contract(
             positive=field == "pos_weight",
         )
     _positive_int(graph.get("topk"), where="graph_auxiliary.topk")
-    if graph.get("included_in_total_loss") is not True:
-        raise ValueError("graph_auxiliary.included_in_total_loss must be true")
     if graph.get("runtime") != "megatron_dsa_indexer_v1":
         raise ValueError("graph_auxiliary.runtime must be 'megatron_dsa_indexer_v1'")
     if graph.get("pair_mask") != "causal_same_document_upstream_v1":
@@ -707,6 +752,8 @@ def validate_objective_contract(
             window_quotas=window_quotas,
             graph_relations=tuple(relations),
         )
+    if require_schedule_receipt:
+        _require_canonical_schedule_receipt(contract)
 
     materialization = _mapping(contract.get("materialization"), where="materialization")
     if materialization.get("format") != "shifted_lm_document_v1":
@@ -730,6 +777,14 @@ def validate_objective_contract(
         task_order=task_order,
         planned_samples=planned_samples,
     )
+
+
+def validate_production_objective_contract(
+    raw_contract: Mapping[str, Any],
+) -> ValidatedObjectiveContract:
+    """Validate the fail-closed contract admitted to production training."""
+
+    return validate_objective_contract(raw_contract, require_schedule_receipt=True)
 
 
 def _artifact_file(root: Path, value: object, *, where: str) -> Path:
@@ -1092,6 +1147,7 @@ def validate_materialized_objective_contract(
     *,
     base_dir: str | None = None,
     document_count: int | None = None,
+    require_schedule_receipt: bool = False,
 ) -> ValidatedObjectiveContract:
     """Validate an embedded converter receipt and its objective-ID sidecar."""
 
@@ -1101,7 +1157,11 @@ def validate_materialized_objective_contract(
             f"objective_contract.schema must be {OBJECTIVE_CONTRACT_SCHEMA!r}"
         )
     payload = _mapping(wrapper.get("payload"), where="objective_contract.payload")
-    validated = validate_objective_contract(payload)
+    validated = (
+        validate_production_objective_contract(payload)
+        if require_schedule_receipt
+        else validate_objective_contract(payload)
+    )
     if wrapper.get("sha256") != validated.sha256:
         raise ValueError("objective_contract.sha256 does not match its payload")
     sidecar = _mapping(
@@ -1273,5 +1333,6 @@ __all__ = [
     "validate_materialized_objective_artifact",
     "validate_materialized_objective_contract",
     "validate_objective_contract",
+    "validate_production_objective_contract",
     "validate_objective_source_selection",
 ]

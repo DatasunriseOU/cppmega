@@ -11,6 +11,7 @@ import inspect
 import json
 import os
 import threading
+from collections.abc import Mapping
 from functools import wraps
 from math import prod
 from typing import Dict, Any, Optional
@@ -34,8 +35,13 @@ from cppmega.megatron.objective_contract import OBJECTIVE_IDS
 _local_storage = threading.local()
 
 
-def _env_flag(name: str) -> bool:
-    raw = os.environ.get(name, "0").strip().lower()
+def _env_flag(
+    name: str,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> bool:
+    source = os.environ if environment is None else environment
+    raw = source.get(name, "0").strip().lower()
     if raw in {"1", "true", "yes", "on"}:
         return True
     if raw in {"0", "false", "no", "off"}:
@@ -208,6 +214,92 @@ _TP_BRIDGE_DEVICE = 5
 _TPBridgeIssue = tuple[int, int, BaseException | None]
 
 
+def _production_objective_required(
+    environment: Mapping[str, str] | None = None,
+) -> bool:
+    """Require objective transport for the training graph path, not eval routes."""
+
+    if _env_flag(
+        "CPPMEGA_OBJECTIVE_CONTRACT_REQUIRED",
+        environment=environment,
+    ):
+        return True
+    return _env_flag(
+        "CPPMEGA_GRAPH_ROUTES_ENABLED",
+        environment=environment,
+    ) and _env_flag(
+        "CPPMEGA_DSA_GRAPH_AUX_ENABLED",
+        environment=environment,
+    )
+
+
+def _validate_production_objective_batch(
+    batch: Mapping[str, Any],
+    structure_batch: Mapping[str, Any],
+) -> None:
+    """Require every valid token to belong to one materialized objective."""
+
+    missing = sorted({"tokens", "labels", "loss_mask"} - set(batch))
+    if missing:
+        raise ValueError(
+            f"production objective batch is missing core fields: {missing}"
+        )
+    objective_ids = structure_batch.get("objective_ids")
+    if not isinstance(objective_ids, torch.Tensor):
+        raise ValueError("production objective batch requires objective_ids tensor")
+    tokens = batch["tokens"]
+    labels = batch["labels"]
+    loss_mask = batch["loss_mask"]
+    if not all(isinstance(value, torch.Tensor) for value in (tokens, labels, loss_mask)):
+        raise TypeError("production objective batch core fields must be tensors")
+    token_shape = tuple(tokens.shape)
+    for name, value in (("labels", labels), ("loss_mask", loss_mask)):
+        if tuple(value.shape) != token_shape:
+            raise ValueError(
+                f"production {name} shape {tuple(value.shape)} != tokens {token_shape}"
+            )
+    if tuple(objective_ids.shape) != token_shape:
+        raise ValueError(
+            "production objective_ids shape "
+            f"{tuple(objective_ids.shape)} != tokens {token_shape}"
+        )
+    if objective_ids.is_floating_point() or objective_ids.dtype == torch.bool:
+        raise ValueError("production objective_ids must use an integer dtype")
+    for name in ("structure_ids", "source_doc_ids", "graph_document_ids"):
+        marker = structure_batch.get(name)
+        if marker is None:
+            continue
+        if not isinstance(marker, torch.Tensor):
+            raise TypeError(f"production {name} must be a tensor")
+        if tuple(marker.shape) != token_shape:
+            raise ValueError(
+                f"production {name} shape {tuple(marker.shape)} != tokens {token_shape}"
+            )
+    if not bool(torch.isfinite(loss_mask).all().item()):
+        raise ValueError("production loss_mask must be finite")
+    if bool(((loss_mask != 0) & (loss_mask != 1)).any().item()):
+        raise ValueError("production loss_mask must contain only 0/1 values")
+
+    ids = objective_ids.to(dtype=torch.long)
+    known = ids == 0
+    for objective_id in _OBJECTIVE_ID_TO_TASK:
+        known |= ids == objective_id
+    if bool((~known).any().item()):
+        unknown = sorted(int(value) for value in torch.unique(ids[~known]).tolist())
+        raise ValueError(f"production objective_ids contain unknown objective IDs: {unknown}")
+
+    valid_tokens = tokens.ne(0) | labels.ne(0) | loss_mask.ne(0)
+    for name in ("structure_ids", "source_doc_ids", "graph_document_ids"):
+        marker = structure_batch.get(name)
+        if isinstance(marker, torch.Tensor):
+            valid_tokens |= marker.ne(0)
+    if bool((valid_tokens & (ids <= 0)).any().item()):
+        raise ValueError(
+            "production objective_ids must contain a positive objective ID for "
+            "every loss token and valid token"
+        )
+
+
 def _required_token_batch_cols() -> set[str]:
     """Return only sidecars consumed by enabled input embeddings."""
 
@@ -250,14 +342,14 @@ def _pop_structure_batch(
     structure_batch = {
         col: batch.pop(col) for col in _CPPMEGA_BATCH_COLS if col in batch
     }
-    if (
-        _env_flag("CPPMEGA_OBJECTIVE_CONTRACT_REQUIRED")
-        and "objective_ids" not in structure_batch
-    ):
+    production_required = _production_objective_required()
+    if production_required and "objective_ids" not in structure_batch:
         raise RuntimeError(
             "[cppmega-patch] production objective contract requires objective_ids "
             "in every Megatron batch"
         )
+    if production_required:
+        _validate_production_objective_batch(batch, structure_batch)
     if structure_batch:
         receipt_path = os.environ.get("CPPMEGA_H200_BATCH_RECEIPT")
         if receipt_path:
@@ -569,15 +661,13 @@ def _make_get_batch_on_this_tp_rank_bridge(original_get_batch):
 
         tp_rank = int(bound.arguments["tp_rank"])
         source_sidecars = _take_cppmega_sidecars(input_batch)
-        if (
-            tp_rank == 0
-            and _env_flag("CPPMEGA_OBJECTIVE_CONTRACT_REQUIRED")
-            and "objective_ids" not in source_sidecars
-        ):
-            raise RuntimeError(
-                "[cppmega-patch] production objective contract requires the "
-                "document-aligned objective_ids sidecar before TP broadcast"
-            )
+        if tp_rank == 0 and _production_objective_required():
+            if "objective_ids" not in source_sidecars:
+                raise RuntimeError(
+                    "[cppmega-patch] production objective contract requires the "
+                    "document-aligned objective_ids sidecar before TP broadcast"
+                )
+            _validate_production_objective_batch(input_batch, source_sidecars)
         source_device = _batch_transport_device(input_batch) if tp_rank == 0 else None
         batch = original_get_batch(*args, **kwargs)
         if batch is not None and not isinstance(batch, dict):
@@ -687,6 +777,7 @@ def _load_sidecar_manifest(dataset: Any) -> tuple[str, dict[str, Any]]:
             objective_contract,
             base_dir=os.path.dirname(json_path),
             document_count=document_count,
+            require_schedule_receipt=True,
         )
         validate_materialized_objective_artifact(
             objective_materialization,

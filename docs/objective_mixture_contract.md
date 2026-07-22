@@ -37,6 +37,12 @@ document mixer, not separate token-only loader paths. Every configured task must
 receive a nonzero quota. Missing or empty typed fields make that source
 ineligible, and an unsatisfiable window aborts.
 
+The production contract must contain exactly one schedule receipt at
+`source_selection.schedule`. It is bound to the canonical window digest and
+the assignment list for every quota window. A missing, zero/invalid, or
+duplicated schedule receipt is rejected at Megatron dataset ingress; no loader
+may choose a fallback schedule or infer one from observed rows.
+
 Authoritative typed inputs are:
 
 - IFIM: `ifim_instruction_token_ids`
@@ -119,6 +125,11 @@ BCE, positive-edge normalization, and coverage. A positive graph target paired
 with a non-finite score is an invalid batch and fails closed; it must never be
 converted into zero positives or zero loss.
 
+For every production batch, each non-padding token and each nonzero
+`loss_mask` position must carry one positive document-aligned `objective_ids`
+value. Unknown or zero IDs are rejected before the tensor-parallel bridge, so a
+token-only or separate objective loader cannot bypass the mixer.
+
 When graph routes are enabled, the fused DSA score passed to selector top-k is
 exactly `I_neural + beta*S_graph`, with one resolved beta shared by DSA, dense
 attention, and graph-loss subtraction. The canonical runtime name is
@@ -162,6 +173,11 @@ row-local document IDs, and Megatron's upstream `mask=` before adding the
 weighted BCE and coverage terms to total DSA indexer loss. This is the required
 fail-closed behavior until every CASE6 bundle path consumes the canonical
 artifact directly.
+
+The base DSA indexer loss and graph auxiliary loss are composed into one scalar
+before Megatron's `DSAIndexerLossAutoScaler` attaches it to the attention output.
+The normal token-loss backward therefore carries both components; a graph loss
+computed only for logging or in a detached side path is not production-valid.
 
 The first real H200 batch receipt also contains `objective_mix` with
 `input_tokens_by_objective`, `loss_tokens_by_objective`, and

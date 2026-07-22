@@ -119,6 +119,14 @@ def validate_stage1_graph_contract(graph: Mapping[str, object]) -> None:
             )
 
 
+def validate_stage1_graph_total_loss_contract(graph: Mapping[str, object]) -> None:
+    """Validate the graph recipe and its required total-loss inclusion."""
+
+    validate_stage1_graph_contract(graph)
+    if graph.get("included_in_total_loss") is not True:
+        raise ValueError("graph_auxiliary.included_in_total_loss must be true")
+
+
 __all__ = [
     "STAGE1_GRAPH_CHUNK_EDGE_EXPANSION",
     "STAGE1_GRAPH_BIAS_BETA",
@@ -137,4 +145,5 @@ __all__ = [
     "stage1_graph_recipe_binding",
     "stage1_graph_recipe_payload",
     "validate_stage1_graph_contract",
+    "validate_stage1_graph_total_loss_contract",
 ]

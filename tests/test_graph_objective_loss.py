@@ -8,6 +8,7 @@ from cppmega.megatron.graph_objective_loss import (
     GRAPH_BIAS_BETA_ENV,
     GRAPH_BIAS_BETA_LEGACY_ENVS,
     GraphAuxiliaryLossConfig,
+    compose_dsa_indexer_total_loss,
     graph_bias_beta_binding,
     graph_auxiliary_loss,
     require_active_dsa_graph_objective,
@@ -99,6 +100,23 @@ def test_indexer_weight_scales_graph_loss_exactly_once() -> None:
     )
 
     assert torch.equal(milli_loss, unit_loss * 0.001)
+
+
+def test_indexer_and_graph_losses_compose_into_one_total_loss_scalar() -> None:
+    indexer_parameter = torch.tensor(2.0, requires_grad=True)
+    graph_parameter = torch.tensor(3.0, requires_grad=True)
+    indexer_loss = indexer_parameter.square()
+    graph_loss = graph_parameter.square()
+
+    total_loss = compose_dsa_indexer_total_loss(indexer_loss, graph_loss)
+    total_loss.backward()
+
+    assert total_loss.ndim == 0
+    assert total_loss.item() == pytest.approx(13.0)
+    assert indexer_parameter.grad is not None
+    assert graph_parameter.grad is not None
+    assert indexer_parameter.grad.item() == pytest.approx(4.0)
+    assert graph_parameter.grad.item() == pytest.approx(6.0)
 
 
 def test_graph_loss_ignores_graph_ineligible_batch_without_fabricating_edges() -> None:
