@@ -16,6 +16,7 @@ from .symbol_identity import (
     external_provider_project,
     SYMBOL_IDENTITY_SCHEMA_VERSION,
     is_repo_file_location_identity,
+    parse_usr_identity,
     parse_repo_file_location_identity,
 )
 
@@ -23,7 +24,7 @@ from .symbol_identity import (
 PRODUCTION_INDEX_PRODUCER = "ClangPromptProjectIndexProducer"
 PRODUCTION_INDEX_VERSION = "3"
 PRODUCTION_IDENTITY_PROVENANCE_CONTRACT = (
-    "case4_symbol_reference_v3_repo_binding_v1"
+    "case4_symbol_reference_v3_repo_binding_v2_scoped_fallback"
 )
 INDEX_INTEGRITY_VERSION = "1"
 INDEX_PAYLOAD_HASH_KEY = "index_payload_sha256"
@@ -488,18 +489,6 @@ def verify_integrity(index: Any) -> None:
         )
 
 
-def _project_marker(symbol_key: str) -> str | None:
-    for part in symbol_key.split("\x1f"):
-        if part.startswith("project="):
-            return part.removeprefix("project=")
-    if "\x1fscope=" in symbol_key:
-        scope = symbol_key.split("\x1fscope=", 1)[1].split("\x1f", 1)[0]
-        for part in scope.split("|"):
-            if part.startswith("project="):
-                return part.removeprefix("project=")
-    return None
-
-
 def _validate_symbol_identity(
     symbol: Any,
     *,
@@ -547,17 +536,29 @@ def _validate_symbol_identity(
                 f"production repository index symbol {symbol.identity!r} "
                 "lacks a canonical signature"
             )
-        expected_key = (
-            f"usr:schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}\x1f"
-            f"project={project_id}\x1fusr={symbol.usr}"
-        )
-        if symbol.symbol_key != expected_key:
-            marker = _project_marker(symbol.symbol_key)
-            if symbol.kind in definition_kinds or marker is not None:
-                raise ValueError(
-                    f"production repository index symbol {symbol.identity!r} "
-                    "USR/project identity is inconsistent"
-                )
+        try:
+            parsed = parse_usr_identity(
+                symbol.symbol_key,
+                source=f"production symbol {symbol.identity}",
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"production repository index symbol {symbol.identity!r} "
+                "USR/project identity is inconsistent"
+            ) from exc
+        if parsed.project != project_id or parsed.usr != symbol.usr:
+            raise ValueError(
+                f"production repository index symbol {symbol.identity!r} "
+                "USR/project identity is inconsistent"
+            )
+        if parsed.file and (
+            parsed.file != symbol.identity_file
+            or parsed.canonical_signature != " ".join(symbol.canonical_signature.split())
+        ):
+            raise ValueError(
+                f"production repository index symbol {symbol.identity!r} "
+                "scoped USR identity is inconsistent"
+            )
         return
 
     if not symbol.canonical_signature or not symbol.symbol_key.startswith(
@@ -577,17 +578,173 @@ def _validate_symbol_identity(
             f"production repository index symbol {symbol.identity!r} "
             "signature identity schema is inconsistent"
         )
-    if fields.get("sig") != symbol.canonical_signature:
+    scope = {
+        key: value
+        for key, separator, value in (
+            part.partition("=") for part in fields.get("scope", "").split("|")
+        )
+        if separator
+    }
+    if (
+        fields.get("qname") != symbol.qname
+        or fields.get("kind") != symbol.identity_kind
+        or fields.get("sig") != " ".join(symbol.canonical_signature.split())
+        or scope.get("project") != project_id
+        or scope.get("file") != symbol.identity_file
+        or scope.get("line") != str(symbol.identity_line)
+        or scope.get("column") != str(symbol.identity_column)
+    ):
         raise ValueError(
             f"production repository index symbol {symbol.identity!r} "
-            "canonical signature is inconsistent"
+            "signature/location identity is inconsistent"
         )
-    if symbol.kind in definition_kinds:
-        scope = fields.get("scope", "").split("|")
-        if f"project={project_id}" not in scope:
+
+
+def validate_repository_graph_contract(index: Any) -> None:
+    """Require a sealed, non-synthetic repository graph payload.
+
+    This is the filesystem-independent gate used when an already-validated
+    index is projected into an inference prompt. Exact checkout and indexer
+    freshness remain the responsibility of ``validate_production_repository_index``.
+    """
+
+    index.validate()
+    provenance = index.provenance
+    if provenance.get("producer") != PRODUCTION_INDEX_PRODUCER:
+        raise ValueError(
+            "production repository index requires producer "
+            f"{PRODUCTION_INDEX_PRODUCER!r}"
+        )
+    if str(provenance.get("producer_version")) != PRODUCTION_INDEX_VERSION:
+        raise ValueError(
+            "production repository index has unsupported producer_version"
+        )
+    if provenance.get("index_integrity_version") != INDEX_INTEGRITY_VERSION:
+        raise ValueError("production repository index integrity version mismatch")
+    if provenance.get("schema") != index.schema:
+        raise ValueError("production repository index schema provenance mismatch")
+    if provenance.get("identity_provenance_contract") != (
+        PRODUCTION_IDENTITY_PROVENANCE_CONTRACT
+    ):
+        raise ValueError(
+            "production repository index identity provenance contract mismatch"
+        )
+    if provenance.get("project_id") != index.project_id:
+        raise ValueError("production repository index project identity mismatch")
+    if provenance.get("strict_diagnostics") is not True:
+        raise ValueError(
+            "production repository index must be built with strict diagnostics"
+        )
+    if int(provenance.get("symbol_identity_schema_version") or 0) != (
+        SYMBOL_IDENTITY_SCHEMA_VERSION
+    ):
+        raise ValueError(
+            "production repository index symbol identity schema mismatch"
+        )
+    verify_integrity(index)
+    adapters = provenance.get("identity_adapters")
+    if not isinstance(adapters, Sequence) or isinstance(adapters, (str, bytes)):
+        raise ValueError("production repository index identity adapters are missing")
+    if {str(adapter) for adapter in adapters} != TRUSTED_IDENTITY_ADAPTERS:
+        raise ValueError("production repository index uses an untrusted identity adapter")
+    for symbol in index.symbols:
+        if (
+            symbol.identity_project != index.project_id
+            or not symbol.identity_file
+            or symbol.identity_line <= 0
+            or symbol.identity_column <= 0
+            or not symbol.identity_kind
+        ):
             raise ValueError(
-                f"production repository index symbol {symbol.identity!r} "
-                "does not preserve project identity"
+                "production repository graph symbol identity provenance is incomplete"
+            )
+        _validate_symbol_identity(
+            symbol,
+            project_id=index.project_id,
+            definition_kinds={"function", "type", "variable"},
+        )
+    if not index.symbols:
+        raise ValueError("production repository graph has no indexed symbols")
+    if not index.chunks:
+        raise ValueError("production repository graph has no definition chunks")
+    external_references = provenance.get("external_references")
+    if not isinstance(external_references, list):
+        raise ValueError("production repository graph external references are missing")
+    validate_external_references(
+        provenance,
+        project_id=index.project_id,
+        index=index,
+    )
+    if not index.edges and not external_references:
+        raise ValueError("production repository graph has no semantic edges")
+    repository_manifest = provenance.get("repository_manifest")
+    dependency_manifest = provenance.get("dependency_manifest")
+    if not isinstance(repository_manifest, Mapping) or not repository_manifest:
+        raise ValueError("production repository graph has no repository manifest")
+    if not isinstance(dependency_manifest, Mapping) or not dependency_manifest:
+        raise ValueError("production repository graph has no indexed dependency manifest")
+    hashes = provenance.get("hashes")
+    required_hashes = {
+        "repository_sha256",
+        "dependency_closure_sha256",
+        "compile_args_sha256",
+        "indexer_sha256",
+        INDEXER_DEPENDENCY_HASH_KEY,
+        "libclang_version_sha256",
+    }
+    if not isinstance(hashes, Mapping) or not required_hashes <= set(hashes):
+        raise ValueError("production repository graph hashes are incomplete")
+    if any(not _is_sha256(hashes.get(name)) for name in required_hashes):
+        raise ValueError("production repository graph hashes are invalid")
+    indexer_manifest = provenance.get(INDEXER_DEPENDENCY_MANIFEST_KEY)
+    if not isinstance(indexer_manifest, Mapping) or not indexer_manifest:
+        raise ValueError("production repository graph indexer closure is missing")
+    for name, manifest in (
+        ("repository", repository_manifest),
+        ("dependency", dependency_manifest),
+        ("indexer dependency", indexer_manifest),
+    ):
+        if any(
+            not isinstance(path, str) or not isinstance(digest, str)
+            or not _is_sha256(digest)
+            for path, digest in manifest.items()
+        ):
+            raise ValueError(
+                f"production repository graph {name} manifest is invalid"
+            )
+    if _sha_json(dict(repository_manifest)) != hashes["repository_sha256"]:
+        raise ValueError("production repository graph repository hash is inconsistent")
+    if _sha_json(dict(dependency_manifest)) != hashes["dependency_closure_sha256"]:
+        raise ValueError("production repository graph dependency hash is inconsistent")
+    if _sha_json(dict(indexer_manifest)) != hashes[INDEXER_DEPENDENCY_HASH_KEY]:
+        raise ValueError("production repository graph indexer closure hash is inconsistent")
+    if (
+        "tools/clang_indexer/index_project.py" not in indexer_manifest
+        or indexer_manifest["tools/clang_indexer/index_project.py"]
+        != hashes["indexer_sha256"]
+    ):
+        raise ValueError("production repository graph indexer hash is inconsistent")
+    for document in index.documents:
+        expected_source_hash = repository_manifest.get(document.source_path)
+        actual_source_hash = sha256(document.source.encode("utf-8")).hexdigest()
+        if expected_source_hash != actual_source_hash:
+            raise ValueError(
+                "production repository graph document is not covered by its "
+                "repository manifest"
+            )
+    if not set(dependency_manifest) <= set(repository_manifest):
+        raise ValueError(
+            "production repository graph dependency manifest is not covered "
+            "by its repository manifest"
+        )
+    for key, expected in (
+        ("document_count", len(index.documents)),
+        ("symbol_count", len(index.symbols)),
+        ("chunk_count", len(index.chunks)),
+    ):
+        if int(provenance.get(key, -1)) != expected:
+            raise ValueError(
+                f"production repository graph {key} does not match payload"
             )
 
 
@@ -647,7 +804,7 @@ def validate_production_repository_index(
         raise ValueError(
             "production repository index symbol identity schema mismatch"
         )
-    verify_integrity(index)
+    validate_repository_graph_contract(index)
 
     hashes = provenance.get("hashes")
     required_hashes = {
@@ -880,12 +1037,21 @@ def validate_production_repository_index(
             definition_kinds=definitions,
         )
         if symbol.usr:
-            expected_prefix = (
-                f"usr:schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}\x1f"
-                f"project={index.project_id}\x1fusr="
+            parsed_usr = parse_usr_identity(
+                symbol.symbol_key,
+                source=f"production repository index {symbol.identity}",
             )
-            if not symbol.symbol_key.startswith(expected_prefix) or (
-                symbol.symbol_key.removeprefix(expected_prefix) != symbol.usr
+            if (
+                parsed_usr.project != index.project_id
+                or parsed_usr.usr != symbol.usr
+                or (
+                    parsed_usr.file
+                    and (
+                        parsed_usr.file != symbol.identity_file
+                        or parsed_usr.canonical_signature
+                        != " ".join(symbol.canonical_signature.split())
+                    )
+                )
             ):
                 raise ValueError(
                     "production repository index USR/project identity "
@@ -900,19 +1066,28 @@ def validate_production_repository_index(
                 )
                 if separator == "="
             }
-            scope = fields.get("scope", "")
+            scope = {
+                key: value
+                for key, separator, value in (
+                    part.partition("=")
+                    for part in fields.get("scope", "").split("|")
+                )
+                if separator == "="
+            }
             if (
                 parts[0]
                 != f"fallback:schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}"
-                or not (
-                    scope == f"project={index.project_id}"
-                    or scope.startswith(f"project={index.project_id}|")
-                )
+                or fields.get("qname") != symbol.qname
+                or fields.get("kind") != symbol.identity_kind
                 or fields.get("sig")
                 != " ".join(symbol.canonical_signature.split())
+                or scope.get("project") != index.project_id
+                or scope.get("file") != symbol.identity_file
+                or scope.get("line") != str(symbol.identity_line)
+                or scope.get("column") != str(symbol.identity_column)
             ):
                 raise ValueError(
-                    "production repository index signature/project identity "
+                    "production repository index signature/location identity "
                     f"mismatch for {symbol.identity!r}"
                 )
         else:

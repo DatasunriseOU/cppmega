@@ -26,10 +26,20 @@ def test_loader_rejects_foreign_cached_module(
     monkeypatch: pytest.MonkeyPatch,
     loader_module: ModuleType,
 ) -> None:
-    module_name = (
-        "_cppmega_prompt_graph_clang_indexer_"
-        + loader_module._sha_file(INDEXER_PATH)[:12]
-    )
+    if hasattr(loader_module, "_indexer_module_name"):
+        _manifest, dependency_hash = loader_module.indexer_dependency_hash(
+            INDEXER_PATH,
+            ROOT,
+        )
+        module_name = loader_module._indexer_module_name(
+            INDEXER_PATH,
+            dependency_hash,
+        )
+    else:
+        module_name = (
+            "_cppmega_prompt_graph_clang_indexer_"
+            + loader_module._sha_file(INDEXER_PATH)[:12]
+        )
     foreign_path = Path("/tmp/foreign/index_project.py")
     foreign = ModuleType(module_name)
     foreign.__file__ = str(foreign_path)

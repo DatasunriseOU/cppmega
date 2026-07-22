@@ -35,6 +35,7 @@ from .prompt_graph_provenance import (
     integrity_payload as _integrity_payload_for_index,
     payload_sha256 as _payload_sha256_for_index,
     validate_production_repository_index as _validate_production_index,
+    validate_repository_graph_contract as _validate_repository_graph_contract,
     verify_integrity as _verify_index_integrity,
     with_integrity as _with_index_integrity,
 )
@@ -1073,6 +1074,11 @@ class PromptProjectIndex:
             require_project_id=require_prompt_graph_project_id,
         )
 
+    def validate_repository_graph_contract(self) -> None:
+        """Require a sealed, non-synthetic graph before repository projection."""
+
+        _validate_repository_graph_contract(self)
+
 
 def _upgrade_legacy_single_document_index(
     payload: Mapping[str, Any],
@@ -1230,6 +1236,7 @@ class PromptGraphContext:
         language: str = "cpp",
     ) -> "PromptGraphContext":
         """Prepend the transitive definitions referenced by a source prompt."""
+        _validate_repository_graph_contract(project_index)
         prompt_segment = PromptGraphSegment(
             prompt,
             document_id=document_id,
