@@ -152,6 +152,9 @@ def _identity_for_cursor(
         raise TypeError(
             "CASE 4 v3 symbol_reference_for_cursor must return a mapping"
         )
+    reference_normalizer = getattr(indexer, "_normalize_symbol_reference", None)
+    if callable(reference_normalizer):
+        reference_normalizer(dict(reference))
     provenance_fields = (
         "project",
         "file",
@@ -341,6 +344,65 @@ def _identity_for_cursor(
     )
 
 
+_INDEXER_MODULE_PREFIX = "_cppmega_prompt_graph_clang_indexer_"
+_INDEXER_DEPENDENCY_HASH_ATTR = "__cppmega_indexer_dependency_hash__"
+_INDEXER_DEPENDENCY_MANIFEST_ATTR = "__cppmega_indexer_dependency_manifest__"
+_INDEXER_CLOSURE_SNAPSHOTS: dict[str, tuple[dict[str, str], str]] = {}
+
+
+def _indexer_module_name(indexer_path: Path, dependency_hash: str) -> str:
+    """Bind the in-process module cache to the complete local closure."""
+
+    if not isinstance(dependency_hash, str) or len(dependency_hash) < 12:
+        raise ValueError("indexer dependency hash is missing or invalid")
+    return (
+        f"{_INDEXER_MODULE_PREFIX}{_sha_file(indexer_path)[:12]}_"
+        f"{dependency_hash[:12]}"
+    )
+
+
+def _module_name_for_relative_path(relative: str) -> str | None:
+    path = Path(relative)
+    if path.suffix != ".py":
+        return None
+    parts = list(path.with_suffix("").parts)
+    if parts and parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts) if parts else None
+
+
+def _validate_loaded_dependency_modules(
+    indexer_root: Path,
+    dependency_manifest: Mapping[str, str],
+) -> None:
+    """Reject local package modules already loaded from another checkout."""
+
+    expected_by_name = {
+        module_name: indexer_root / relative
+        for relative in dependency_manifest
+        if (module_name := _module_name_for_relative_path(relative)) is not None
+    }
+    for module_name, expected_path in expected_by_name.items():
+        loaded = sys.modules.get(module_name)
+        if loaded is None:
+            continue
+        origins = (
+            getattr(loaded, "__file__", None),
+            getattr(getattr(loaded, "__spec__", None), "origin", None),
+        )
+        if any(
+            not isinstance(origin, (str, os.PathLike))
+            or Path(origin).expanduser().resolve(strict=False)
+            != expected_path.resolve(strict=False)
+            for origin in origins
+        ):
+            raise ValueError(
+                "clang indexer dependency closure is loaded from the wrong "
+                f"checkout: module={module_name!r} expected={expected_path} "
+                f"origins={origins!r}"
+            )
+
+
 def _load_indexer(indexer_root: Path) -> tuple[ModuleType, Path]:
     indexer_root = indexer_root.expanduser().resolve()
     if indexer_root != _REPOSITORY_ROOT:
@@ -353,7 +415,20 @@ def _load_indexer(indexer_root: Path) -> tuple[ModuleType, Path]:
     path = indexer_root / "tools" / "clang_indexer" / "index_project.py"
     if not path.is_file():
         raise FileNotFoundError(f"clang indexer module not found: {path}")
-    module_name = "_cppmega_prompt_graph_clang_indexer_" + _sha_file(path)[:12]
+    dependency_manifest, dependency_hash = indexer_dependency_hash(
+        path,
+        indexer_root,
+    )
+    snapshot_key = str(indexer_root)
+    previous_snapshot = _INDEXER_CLOSURE_SNAPSHOTS.get(snapshot_key)
+    current_snapshot = (dict(dependency_manifest), dependency_hash)
+    if previous_snapshot is not None and previous_snapshot != current_snapshot:
+        raise ValueError(
+            "clang indexer dependency closure changed after import; restart "
+            "the process before building a repository prompt graph"
+        )
+    _validate_loaded_dependency_modules(indexer_root, dependency_manifest)
+    module_name = _indexer_module_name(path, dependency_hash)
     existing = sys.modules.get(module_name)
     if existing is not None:
         existing_file = getattr(existing, "__file__", None)
@@ -370,6 +445,19 @@ def _load_indexer(indexer_root: Path) -> tuple[ModuleType, Path]:
                 f"module: requested={path}, file={existing_file!r}, "
                 f"spec_origin={existing_origin!r}"
             )
+        if getattr(existing, _INDEXER_DEPENDENCY_HASH_ATTR, None) != dependency_hash:
+            raise ValueError(
+                "cached clang indexer dependency closure hash does not match "
+                "the requested checkout"
+            )
+        if dict(
+            getattr(existing, _INDEXER_DEPENDENCY_MANIFEST_ATTR, {})
+        ) != dependency_manifest:
+            raise ValueError(
+                "cached clang indexer dependency closure manifest does not match "
+                "the requested checkout"
+            )
+        _INDEXER_CLOSURE_SNAPSHOTS[snapshot_key] = current_snapshot
         return existing, path
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
@@ -389,6 +477,14 @@ def _load_indexer(indexer_root: Path) -> tuple[ModuleType, Path]:
     finally:
         original_sys_path[:] = original_entries
         sys.path = original_sys_path
+    try:
+        setattr(module, _INDEXER_DEPENDENCY_HASH_ATTR, dependency_hash)
+        setattr(module, _INDEXER_DEPENDENCY_MANIFEST_ATTR, dependency_manifest)
+        _validate_loaded_dependency_modules(indexer_root, dependency_manifest)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    _INDEXER_CLOSURE_SNAPSHOTS[snapshot_key] = current_snapshot
     return module, path
 
 
@@ -639,6 +735,18 @@ class ClangPromptProjectIndexProducer:
         indexer_dependency_manifest, indexer_dependency_sha256 = (
             indexer_dependency_hash(indexer_path, self.indexer_root)
         )
+        if (
+            getattr(indexer, _INDEXER_DEPENDENCY_HASH_ATTR, None)
+            != indexer_dependency_sha256
+            or dict(
+                getattr(indexer, _INDEXER_DEPENDENCY_MANIFEST_ATTR, {})
+            )
+            != indexer_dependency_manifest
+        ):
+            raise RuntimeError(
+                "loaded clang indexer dependency closure does not match the "
+                "provenance being recorded"
+            )
         fingerprint_hashes = {
             "repository_sha256": repository_sha256,
             "dependency_closure_sha256": _sha_json(dependency_manifest),

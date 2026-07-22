@@ -420,14 +420,48 @@ def test_prompt_graph_model_inputs_reject_non_enum_token_def_use() -> None:
 def test_repository_context_includes_referenced_cross_file_definition() -> None:
     index = PromptProjectIndex.from_dict(_v3_payload())
     second = index.document_for_path("src/second.cpp")
+    from cppmega.prompt_graph import _repository_dependency_chunks
 
-    context = PromptGraphContext.from_repository_prompt(
+    dependencies = _repository_dependency_chunks(
         index,
-        second.source,
         document_id=second.id,
-        source_path=second.source_path,
         source_start=0,
+        source_end=len(second.source),
     )
+    segments = []
+    for chunk in dependencies:
+        document = index.document_for_id(chunk.document_id)
+        segments.extend(
+            (
+                PromptGraphSegment(
+                    f"\n// cppmega dependency: {chunk.source_path}\n",
+                    role="dependency_boundary",
+                ),
+                PromptGraphSegment(
+                    document.source[chunk.start : chunk.end],
+                    document_id=chunk.document_id,
+                    source_path=chunk.source_path,
+                    source_start=chunk.start,
+                    role="dependency",
+                ),
+            )
+        )
+    segments.extend(
+        (
+            PromptGraphSegment(
+                f"\n// cppmega target: {second.source_path}\n",
+                role="target_boundary",
+            ),
+            PromptGraphSegment(
+                second.source,
+                document_id=second.id,
+                source_path=second.source_path,
+                source_start=0,
+                role="target",
+            ),
+        )
+    )
+    context = PromptGraphContext(segments=tuple(segments))
     artifact = PromptGraphBuilder(_CharacterOffsetTokenizer()).build(index, context)
 
     dependencies = [

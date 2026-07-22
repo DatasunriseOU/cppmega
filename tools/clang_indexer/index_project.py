@@ -67,11 +67,13 @@ from cppmega.symbol_identity import (
     SymbolIdentityRegistry,
     canonical_external_provider_file,
     canonical_external_usr_identity,
+    canonical_usr_identity,
     compute_symbol_id,
     external_provider_project,
     is_repo_file_location_identity,
     parse_external_provider_file,
     parse_repo_file_location_identity,
+    parse_usr_identity,
     require_project_identity,
 )
 from cppmega.data.source_identity import source_identity, source_identity_for_path
@@ -779,9 +781,7 @@ def normalize_inline_namespace_qname(qname: str) -> str:
 def _normalize_signature_text(value: str | None) -> str:
     if not value:
         return ""
-    return _normalize_inline_namespace_text(
-        re.sub(r"\s+", " ", str(value)).strip()
-    )
+    return re.sub(r"\s+", " ", str(value)).strip()
 
 
 _PROVIDER_PATH_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -992,6 +992,7 @@ def _identity_scope_key(
     project: str | None = None,
     file: str | None = None,
     line: int | None = None,
+    column: int | None = None,
     force_file_scope: bool = False,
 ) -> str:
     parts: list[str] = []
@@ -1001,6 +1002,8 @@ def _identity_scope_key(
         parts.append(f"file={file}")
     if line is not None and line > 0 and force_file_scope:
         parts.append(f"line={int(line)}")
+    if column is not None and column > 0 and force_file_scope:
+        parts.append(f"column={int(column)}")
     return "|".join(parts)
 
 
@@ -1048,10 +1051,21 @@ def canonical_symbol_identity(
             source="canonical_symbol_identity external provider",
         )
     if normalized_usr:
-        project_scope = f"project={owning_project}\x1f" if owning_project else ""
-        return (
-            f"usr:schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}\x1f"
-            f"{project_scope}usr={normalized_usr}"
+        if not owning_project:
+            raise SymbolIdentityError(
+                "clang USR identity requires a canonical project"
+            )
+        scoped_file = (
+            _normalize_repo_relative_identity_file(file)
+            if force_file_scope
+            else None
+        )
+        return canonical_usr_identity(
+            usr=normalized_usr,
+            project=owning_project,
+            file=scoped_file,
+            canonical_signature=normalized_signature,
+            source="canonical_symbol_identity",
         )
     if repo_file_location_fallback and not normalized_signature:
         normalized_file = _normalize_repo_relative_identity_file(file)
@@ -1066,9 +1080,10 @@ def canonical_symbol_identity(
             raise SymbolIdentityError(
                 "repo_file_location identity requires a canonical project"
             )
-        if not normalized_file or normalized_line <= 0:
+        if not normalized_file or normalized_line <= 0 or normalized_column <= 0:
             raise SymbolIdentityError(
-                "repo_file_location identity requires a repo-relative file and line"
+                "repo_file_location identity requires a repo-relative file, line, "
+                "and column"
             )
         payload = [f"schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}"]
         if owning_project:
@@ -1096,6 +1111,7 @@ def canonical_symbol_identity(
         project=owning_project,
         file=file,
         line=line,
+        column=column,
         force_file_scope=force_file_scope,
     )
     payload = [
@@ -1312,7 +1328,38 @@ def symbol_identity_for_cursor(
         "CONVERSION_FUNCTION",
         "LAMBDA_EXPR",
     }
-    if "INTERNAL" in linkage_name or storage_name == "STATIC" or is_local:
+    if (
+        any(
+            marker in linkage_name
+            for marker in ("INTERNAL", "NO_LINKAGE", "UNIQUE_EXTERNAL")
+        )
+        or storage_name == "STATIC"
+        or is_local
+    ):
+        file_scope = True
+    if not is_external and not usr and signature:
+        if not identity_project:
+            raise SymbolIdentityError(
+                "signature fallback requires a canonical project"
+            )
+        line = getattr(loc, "line", None)
+        column = getattr(loc, "column", None)
+        if (
+            isinstance(line, bool)
+            or not isinstance(line, int)
+            or line <= 0
+            or isinstance(column, bool)
+            or not isinstance(column, int)
+            or column <= 0
+        ):
+            raise SymbolIdentityError(
+                "signature fallback requires a positive line and column"
+            )
+        rel_file = _normalize_repo_relative_identity_file(rel_file)
+        if not rel_file:
+            raise SymbolIdentityError(
+                "signature fallback requires a repository-relative file"
+            )
         file_scope = True
     if is_external and usr:
         identity_key = canonical_external_usr_identity(
@@ -1333,7 +1380,7 @@ def symbol_identity_for_cursor(
             file=rel_file,
             line=getattr(loc, "line", None),
             column=getattr(loc, "column", None),
-            force_file_scope=file_scope or is_external,
+            force_file_scope=file_scope or is_external or not usr,
             repo_file_location_fallback=uses_repo_file_location,
         )
     return identity_key, usr, signature
@@ -1423,10 +1470,29 @@ def _normalize_symbol_reference(value: object) -> SymbolReference | None:
         )
     expected_symbol_id = _compute_symbol_id(key)
     claimed_symbol_id = value.get("symbol_id")
-    if claimed_symbol_id is not None and int(claimed_symbol_id) != expected_symbol_id:
+    if (
+        claimed_symbol_id is not None
+        and (
+            isinstance(claimed_symbol_id, bool)
+            or int(claimed_symbol_id) != expected_symbol_id
+        )
+    ):
         raise SymbolIdentityError(
             "symbol reference ID does not match canonical key: "
             f"claimed={claimed_symbol_id} expected={expected_symbol_id} key={key!r}"
+        )
+    raw_line = value.get("line")
+    raw_column = value.get("column")
+    if (
+        isinstance(raw_line, bool)
+        or not isinstance(raw_line, int)
+        or raw_line <= 0
+        or isinstance(raw_column, bool)
+        or not isinstance(raw_column, int)
+        or raw_column <= 0
+    ):
+        raise SymbolIdentityError(
+            "normalized symbol reference requires positive line and column"
         )
     normalized = {
         "symbol_identity_schema_version": identity_version,
@@ -1440,7 +1506,8 @@ def _normalize_symbol_reference(value: object) -> SymbolReference | None:
         "symbol_kind": str(value.get("symbol_kind") or value.get("kind") or ""),
         "project": str(value.get("project") or ""),
         "file": str(value.get("file") or ""),
-        "line": int(value.get("line") or 0),
+        "line": int(raw_line),
+        "column": int(raw_column),
         "provider": str(value.get("provider") or ""),
         "include_provenance": str(value.get("include_provenance") or ""),
     }
@@ -1478,6 +1545,78 @@ def _normalize_symbol_reference(value: object) -> SymbolReference | None:
                 raise SymbolIdentityError(
                     "normalized external symbol reference key is inconsistent"
                 )
+    else:
+        if not reference_project:
+            raise SymbolIdentityError(
+                "normalized local symbol reference project provenance is missing"
+            )
+        if normalized["usr"]:
+            parsed_usr = parse_usr_identity(
+                key,
+                source="normalized local symbol reference",
+            )
+            if parsed_usr.project != reference_project or parsed_usr.usr != normalized[
+                "usr"
+            ]:
+                raise SymbolIdentityError(
+                    "normalized local symbol reference USR/project identity is inconsistent"
+                )
+            if parsed_usr.file and (
+                parsed_usr.file != reference_file
+                or parsed_usr.canonical_signature
+                != normalized["canonical_signature"]
+            ):
+                raise SymbolIdentityError(
+                    "normalized scoped local symbol reference provenance is inconsistent"
+                )
+        elif normalized["canonical_signature"]:
+            if not key.startswith("fallback:"):
+                raise SymbolIdentityError(
+                    "normalized local symbol reference has an unsupported fallback key"
+                )
+            fields: dict[str, str] = {}
+            for part in key.removeprefix("fallback:").split("\x1f"):
+                field, separator, field_value = part.partition("=")
+                if separator:
+                    fields[field] = field_value
+            scope: dict[str, str] = {}
+            for part in fields.get("scope", "").split("|"):
+                field, separator, field_value = part.partition("=")
+                if separator:
+                    scope[field] = field_value
+            if (
+                fields.get("schema") != f"v{SYMBOL_IDENTITY_SCHEMA_VERSION}"
+                or fields.get("qname") != normalized["qname"]
+                or fields.get("kind") != normalized["symbol_kind"]
+                or fields.get("sig") != normalized["canonical_signature"]
+                or scope.get("project") != reference_project
+                or scope.get("file") != reference_file
+                or scope.get("line") != str(normalized["line"])
+                or scope.get("column") != str(normalized["column"])
+            ):
+                raise SymbolIdentityError(
+                    "normalized local symbol reference fallback provenance is inconsistent"
+                )
+        elif is_repo_file_location_identity(key):
+            location_identity = parse_repo_file_location_identity(
+                key,
+                source="normalized local symbol reference",
+            )
+            if (
+                location_identity.project != reference_project
+                or location_identity.file != reference_file
+                or location_identity.line != normalized["line"]
+                or location_identity.column != normalized["column"]
+                or location_identity.kind != normalized["symbol_kind"]
+                or location_identity.qname != normalized["qname"]
+            ):
+                raise SymbolIdentityError(
+                    "normalized local symbol reference location provenance is inconsistent"
+                )
+        else:
+            raise SymbolIdentityError(
+                "normalized local symbol reference lacks a trusted identity"
+            )
     return normalized
 
 

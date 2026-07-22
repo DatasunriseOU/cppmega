@@ -57,6 +57,16 @@ class RepoFileLocationIdentity:
     qname: str
 
 
+@dataclass(frozen=True)
+class UsrIdentity:
+    """Parsed clang USR identity, optionally scoped to one repository file."""
+
+    project: str
+    usr: str
+    file: str
+    canonical_signature: str
+
+
 _IDENTITY_COMPONENT_SAFE = "-._~"
 _INVALID_PERCENT_ESCAPE_RE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _ENCODED_PATH_SEPARATOR_RE = re.compile(r"%(?:2[fF]|5[cC])")
@@ -277,6 +287,150 @@ def is_repo_file_location_identity(value: object) -> bool:
         return False
     parse_repo_file_location_identity(value)
     return True
+
+
+def _validate_usr_text(value: object, *, source: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or "\x1f" in value
+        or any(
+            char.isspace() or ord(char) < 32 or ord(char) == 127
+            for char in value
+        )
+    ):
+        raise SymbolIdentityError(f"{source}: clang USR is missing or unsafe")
+    return value
+
+
+def _validate_usr_signature(value: object, *, source: str) -> str:
+    signature = " ".join(str(value or "").split())
+    if not signature or "\x1f" in signature:
+        raise SymbolIdentityError(
+            f"{source}: canonical signature is required for scoped USR identity"
+        )
+    return signature
+
+
+def _validate_usr_file(value: object, *, source: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != posixpath.normpath(value)
+        or value.startswith("/")
+        or _WINDOWS_LOCAL_PATH_RE.match(value)
+        or "\\" in value
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+        or any(
+            char.isspace() or ord(char) < 32 or ord(char) == 127
+            for char in value
+        )
+    ):
+        raise SymbolIdentityError(
+            f"{source}: scoped USR file must be canonical and repository-relative"
+        )
+    return value
+
+
+def canonical_usr_identity(
+    *,
+    usr: object,
+    project: object,
+    file: object | None = None,
+    canonical_signature: object = "",
+    source: str = "clang USR identity",
+) -> str:
+    """Return a project-bound clang USR key.
+
+    The historical three-field form is retained for externally-linkable
+    symbols. File-local or otherwise explicitly scoped symbols use the
+    five-field form and bind the USR to the repository file and canonical
+    signature. A qname is never part of either identity form.
+    """
+
+    canonical_project = require_project_identity(project, source=f"{source}:project")
+    canonical_usr = _validate_usr_text(usr, source=source)
+    if file is None:
+        return (
+            f"usr:schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}\x1f"
+            f"project={canonical_project}\x1fusr={canonical_usr}"
+        )
+    canonical_file = _validate_usr_file(file, source=f"{source}:file")
+    signature = _validate_usr_signature(
+        canonical_signature,
+        source=f"{source}:signature",
+    )
+    encoded_signature = quote(signature, safe=_IDENTITY_COMPONENT_SAFE)
+    return (
+        f"usr:schema=v{SYMBOL_IDENTITY_SCHEMA_VERSION}\x1f"
+        f"project={canonical_project}\x1ffile={canonical_file}\x1f"
+        f"sig={encoded_signature}\x1fusr={canonical_usr}"
+    )
+
+
+def parse_usr_identity(
+    value: object,
+    *,
+    source: str = "clang USR identity",
+) -> UsrIdentity:
+    """Parse either the historical or file-scoped canonical USR form."""
+
+    if not isinstance(value, str) or not value.startswith("usr:"):
+        raise SymbolIdentityError(f"{source}: expected a usr: identity")
+    parts = value.removeprefix("usr:").split("\x1f")
+    if len(parts) == 3:
+        expected = ("schema", "project", "usr")
+    elif len(parts) == 5:
+        expected = ("schema", "project", "file", "sig", "usr")
+    else:
+        raise SymbolIdentityError(
+            f"{source}: USR identity has {len(parts)} fields; expected 3 or 5"
+        )
+    fields: dict[str, str] = {}
+    for part, key in zip(parts, expected, strict=True):
+        actual_key, separator, field_value = part.partition("=")
+        if separator != "=" or actual_key != key or not field_value:
+            raise SymbolIdentityError(
+                f"{source}: USR identity requires ordered non-empty field {key!r}"
+            )
+        fields[key] = field_value
+    if fields["schema"] != f"v{SYMBOL_IDENTITY_SCHEMA_VERSION}":
+        raise SymbolIdentityError(
+            f"{source}: USR identity schema must be v{SYMBOL_IDENTITY_SCHEMA_VERSION}"
+        )
+    project = require_project_identity(fields["project"], source=f"{source}:project")
+    usr = _validate_usr_text(fields["usr"], source=source)
+    if len(parts) == 3:
+        return UsrIdentity(project, usr, "", "")
+    file = _validate_usr_file(fields["file"], source=f"{source}:file")
+    try:
+        signature = unquote_to_bytes(fields["sig"]).decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise SymbolIdentityError(
+            f"{source}: USR identity signature is not valid UTF-8"
+        ) from exc
+    signature = _validate_usr_signature(signature, source=f"{source}:signature")
+    if quote(signature, safe=_IDENTITY_COMPONENT_SAFE) != fields["sig"]:
+        raise SymbolIdentityError(
+            f"{source}: USR identity signature is not canonically encoded"
+        )
+    expected = canonical_usr_identity(
+        usr=usr,
+        project=project,
+        file=file,
+        canonical_signature=signature,
+        source=source,
+    )
+    if value != expected:
+        raise SymbolIdentityError(f"{source}: USR identity is not canonical")
+    return UsrIdentity(project, usr, file, signature)
+
+
+def is_scoped_usr_identity(value: object) -> bool:
+    """Return whether a valid USR identity carries repository-file scope."""
+
+    return bool(parse_usr_identity(value).file)
 
 
 def external_provider_project(
@@ -712,15 +866,19 @@ __all__ = [
     "SYMBOL_ID_MAX",
     "ResolvedProjectIdentity",
     "RepoFileLocationIdentity",
+    "UsrIdentity",
     "SymbolIdentityError",
     "SymbolIdentityRegistry",
     "canonical_external_provider_file",
     "canonical_external_usr_identity",
+    "canonical_usr_identity",
     "compute_symbol_id",
     "external_provider_project",
     "is_repo_file_location_identity",
+    "is_scoped_usr_identity",
     "parse_external_provider_file",
     "parse_repo_file_location_identity",
+    "parse_usr_identity",
     "require_project_identity",
     "resolve_remote_project_identity",
 ]
