@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from cppmega.megatron.graph_recipe import (
     STAGE1_GRAPH_RELATIONS,
     stage1_graph_config_kwargs,
-    validate_stage1_graph_contract,
+    validate_stage1_graph_total_loss_contract,
 )
 
 
@@ -124,6 +124,44 @@ def graph_routes_active(
         environment=environment,
     )
     return routes_enabled and not ablation
+
+
+
+def compose_dsa_indexer_total_loss(
+    indexer_loss: torch.Tensor,
+    graph_loss: torch.Tensor,
+) -> torch.Tensor:
+    """Compose the one DSA loss scalar carried by Megatron's total backward.
+
+    The returned scalar is attached to the attention output by
+    ``DSAIndexerLossAutoScaler``. Requiring both components here prevents the
+    graph objective from becoming a detached logging-only or post-hoc path.
+    """
+
+    components = {
+        "indexer_loss": indexer_loss,
+        "graph_loss": graph_loss,
+    }
+    for name, value in components.items():
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
+        if value.ndim != 0:
+            raise ValueError(f"{name} must be a scalar tensor, got {tuple(value.shape)}")
+        if not value.is_floating_point():
+            raise ValueError(f"{name} must be floating point, got {value.dtype}")
+        if not bool(torch.isfinite(value.detach()).item()):
+            raise ValueError(f"{name} must be finite")
+    if indexer_loss.device != graph_loss.device:
+        raise ValueError(
+            "indexer_loss and graph_loss must be on the same device: "
+            f"{indexer_loss.device} != {graph_loss.device}"
+        )
+    if indexer_loss.dtype != graph_loss.dtype:
+        raise ValueError(
+            "indexer_loss and graph_loss must use the same dtype: "
+            f"{indexer_loss.dtype} != {graph_loss.dtype}"
+        )
+    return indexer_loss + graph_loss
 
 
 @dataclass(frozen=True)
@@ -256,7 +294,7 @@ def validate_runtime_graph_contract(
         raise ValueError(
             "production graph objective requires CPPMEGA_STRUCTURE_ENABLED=1"
         )
-    validate_stage1_graph_contract(graph_contract)
+    validate_stage1_graph_total_loss_contract(graph_contract)
     requested = graph_objective_requested(environment=environment)
     if (
         require_included_auxiliary
@@ -503,6 +541,7 @@ __all__ = [
     "GRAPH_BIAS_BETA_ENV",
     "GRAPH_BIAS_BETA_LEGACY_ENVS",
     "GRAPH_ROUTES_ABLATION_ENV",
+    "compose_dsa_indexer_total_loss",
     "graph_bias_beta_binding",
     "graph_objective_requested",
     "graph_routes_ablation_requested",

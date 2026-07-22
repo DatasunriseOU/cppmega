@@ -30,7 +30,9 @@ from cppmega.megatron.objective_contract import (
     ObjectiveMaterializationTracker,
     load_objective_materialization_artifact,
     materialized_objective_artifact_manifest,
+    validate_materialized_objective_contract,
     validate_objective_contract,
+    validate_production_objective_contract,
     verify_objective_materialization_shard,
 )
 
@@ -283,6 +285,81 @@ def test_contract_validates_canonical_bounded_schedule_receipt() -> None:
     validated = validate_objective_contract(contract)
 
     assert validated.payload["source_selection"] == contract["source_selection"]
+
+
+def test_production_contract_accepts_one_schedule_for_all_required_objectives() -> None:
+    contract = _valid_contract()
+
+    validated = validate_production_objective_contract(contract)
+
+    assert set(TASKS).issubset(set(validated.task_order))
+    assert validated.payload["source_selection"]["schedule"]["schema"] == (
+        OBJECTIVE_SCHEDULE_RECEIPT_SCHEMA
+    )
+
+
+def test_production_contract_rejects_missing_schedule_receipt() -> None:
+    contract = _valid_contract()
+    contract.pop("source_selection")
+
+    with pytest.raises(ValueError, match="canonical.*schedule receipt"):
+        validate_production_objective_contract(contract)
+
+
+def test_production_contract_rejects_empty_schedule_receipt() -> None:
+    contract = _valid_contract()
+    source_selection = contract["source_selection"]
+    assert isinstance(source_selection, dict)
+    source_selection["schedule"] = {}
+
+    with pytest.raises(ValueError, match="source_selection.schedule binding"):
+        validate_production_objective_contract(contract)
+
+
+def test_production_contract_rejects_zero_schedule_digest() -> None:
+    contract = _valid_contract()
+    source_selection = contract["source_selection"]
+    assert isinstance(source_selection, dict)
+    schedule = source_selection["schedule"]
+    assert isinstance(schedule, dict)
+    schedule["windows_sha256"] = "0" * 64
+
+    with pytest.raises(ValueError, match="source_selection.schedule binding"):
+        validate_production_objective_contract(contract)
+
+
+def test_production_contract_rejects_ambiguous_schedule_receipts() -> None:
+    contract = _valid_contract()
+    source_selection = contract["source_selection"]
+    assert isinstance(source_selection, dict)
+    schedule = source_selection["schedule"]
+    assert isinstance(schedule, dict)
+    contract["alternate_schedule_receipt"] = copy.deepcopy(schedule)
+
+    with pytest.raises(ValueError, match="ambiguous.*schedule receipt"):
+        validate_production_objective_contract(contract)
+
+
+def test_materialized_production_contract_rejects_missing_schedule_receipt() -> None:
+    contract = _valid_contract()
+    contract.pop("source_selection")
+    legacy = validate_objective_contract(contract)
+    wrapper = {
+        "schema": OBJECTIVE_CONTRACT_SCHEMA,
+        "sha256": legacy.sha256,
+        "payload": legacy.payload,
+        "objective_id_sidecar": {
+            "path": "objective_ids.bin",
+            "dtype": "uint8",
+            "document_aligned": True,
+        },
+    }
+
+    with pytest.raises(ValueError, match="canonical.*schedule receipt"):
+        validate_materialized_objective_contract(
+            wrapper,
+            require_schedule_receipt=True,
+        )
 
 
 def test_contract_rejects_materializer_runner_assignment_divergence() -> None:

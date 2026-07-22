@@ -16,6 +16,7 @@ from cppmega.megatron.graph_recipe import (
     stage1_graph_recipe_binding,
     stage1_graph_recipe_payload,
     validate_stage1_graph_contract,
+    validate_stage1_graph_total_loss_contract,
 )
 
 
@@ -150,6 +151,16 @@ def test_stage1_graph_contract_rejects_stale_recipe_sha() -> None:
 
     with pytest.raises(ValueError, match="recipe binding is missing or stale"):
         validate_stage1_graph_contract(graph)
+
+
+def test_stage1_graph_total_loss_contract_requires_inclusion() -> None:
+    graph = _graph_contract()
+    graph["included_in_total_loss"] = True
+    validate_stage1_graph_total_loss_contract(graph)
+
+    graph["included_in_total_loss"] = False
+    with pytest.raises(ValueError, match="included_in_total_loss"):
+        validate_stage1_graph_total_loss_contract(graph)
 
 
 @pytest.mark.parametrize(
