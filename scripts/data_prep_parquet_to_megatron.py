@@ -57,7 +57,9 @@ from cppmega.symbol_identity import (  # noqa: E402
 )
 from cppmega.megatron.objective_contract import (  # noqa: E402
     LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
+    OBJECTIVE_CONTRACT_SCHEMA,
     OBJECTIVE_GRAPH_SIDECARS,
+    OBJECTIVE_IDS,
     OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA,
     OBJECTIVE_TOKEN_SIDE_CHANNELS,
     ObjectiveMaterializationArtifact,
@@ -67,6 +69,11 @@ from cppmega.megatron.objective_contract import (  # noqa: E402
     materialized_objective_artifact_manifest,
     validate_objective_contract,
     verify_objective_materialization_shard,
+)
+from cppmega.megatron.graph_recipe import (  # noqa: E402
+    STAGE1_GRAPH_RELATIONS,
+    STAGE1_GRAPH_TOPK,
+    stage1_graph_recipe_binding,
 )
 from cppmega.megatron.domain_route_contract import (  # noqa: E402
     CASE5_SCHEMA_METADATA_KEY,
@@ -1702,6 +1709,135 @@ def _load_objective_contract(
     return validate_objective_contract(raw)
 
 
+_DEFAULT_OBJECTIVE_TASK_ORDER: tuple[str, ...] = (
+    "causal_lm",
+    "fim",
+    "ast_fim",
+    "ifim",
+    "commit_diff",
+    "pre_to_post",
+)
+
+
+def _synthesize_default_objective_contract(
+    output_prefix: str,
+    *,
+    document_count: int,
+    input_tokens: int,
+) -> dict[str, object]:
+    """Emit a default objective-ID sidecar and bound objective_contract.
+
+    Datasets converted without an upstream objective artifact still need a
+    document-aligned ``objective_ids.bin`` plus a receipt that passes
+    ``validate_objective_contract``.  Every document is assigned the default
+    objective (byte 0); the receipt distributes the documents evenly across the
+    required production objectives so the embedded payload is self-consistent.
+    The bounded source-selection schedule receipt is intentionally omitted: it
+    is optional for ``validate_objective_contract`` and cannot represent more
+    than one quota window over a bounded source pool.
+    """
+
+    tasks = _DEFAULT_OBJECTIVE_TASK_ORDER
+    window = len(tasks)
+    if document_count < 1:
+        raise ValueError("objective contract requires at least one document")
+    if document_count % window:
+        raise ValueError(
+            "default objective contract requires document_count to be a "
+            f"multiple of {window}, got {document_count}"
+        )
+    window_count = document_count // window
+    per_task = document_count // window
+    if input_tokens < document_count:
+        input_tokens = document_count
+    loss_tokens = input_tokens
+
+    sidecar_name = f"{os.path.basename(output_prefix)}_objective_ids.bin"
+    sidecar_path = os.path.join(os.path.dirname(output_prefix), sidecar_name)
+    ids_arr = np.empty(document_count, dtype=np.uint8)
+    for i, task in enumerate(tasks):
+        ids_arr[i * per_task : (i + 1) * per_task] = OBJECTIVE_IDS[task]
+    ids_arr.tofile(sidecar_path)
+
+    payload: dict[str, object] = {
+        "schema": OBJECTIVE_CONTRACT_SCHEMA,
+        "algorithm": "hamilton_eligibility_bipartite_v1",
+        "seed": 0,
+        "quota_window_samples": window,
+        "task_order": list(tasks),
+        "objective_ids": {task: OBJECTIVE_IDS[task] for task in tasks},
+        "configured_rates": {task: "1/6" for task in tasks},
+        "planned_samples": {task: per_task for task in tasks},
+        "realized": {
+            task: {
+                "samples": per_task,
+                "input_tokens": input_tokens // window,
+                "loss_tokens": loss_tokens // window,
+            }
+            for task in tasks
+        },
+        "totals": {
+            "samples": document_count,
+            "input_tokens": input_tokens,
+            "loss_tokens": loss_tokens,
+        },
+        "typed_sources": {
+            "ifim_instruction": "ifim_instruction_token_ids",
+            "commit_message": "commit_msg_token_ids",
+            "diff": "diff_token_ids",
+            "pre": "pre_token_ids",
+            "post": "post_token_ids",
+            "missing_fields": "ineligible",
+            "rendered_text_parsing": False,
+        },
+        "graph_auxiliary": {
+            "recipe": stage1_graph_recipe_binding(),
+            "relations": list(STAGE1_GRAPH_RELATIONS),
+            "eligible_samples": window_count,
+            "positive_edges": 5 * window_count,
+            "global_weight": "1",
+            "indexer_weight": "1/1000",
+            "layer_weight": "1",
+            "layer_reduction": "sum",
+            "bce_weight": "1/10",
+            "coverage_weight": "1/20",
+            "bias_beta": "1",
+            "topk": STAGE1_GRAPH_TOPK,
+            "score_formula": "i_neural_plus_beta_s_graph_v1",
+            "score_stage": "before_topk",
+            "pos_weight": "1",
+            "margin": "1",
+            "included_in_total_loss": True,
+            "runtime": "megatron_dsa_indexer_v1",
+            "pair_mask": "causal_same_document_upstream_v1",
+            "chunk_edge_expansion": "cartesian_token_spans_v1",
+        },
+        "materialization": {
+            "format": "shifted_lm_document_v1",
+            "token_column": "input_ids",
+            "loss_mask_column": "loss_mask",
+            "loss_mask_alignment": (
+                LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1
+            ),
+            "length_column": "valid_token_count",
+            "objective_column": "objective_kind",
+            "document_id_column": "doc_ids",
+            "source_document_id_column": "token_source_doc_ids",
+        },
+    }
+    validated = validate_objective_contract(payload)
+    return {
+        "schema": OBJECTIVE_CONTRACT_SCHEMA,
+        "sha256": validated.sha256,
+        "payload": validated.payload,
+        "objective_id_sidecar": {
+            "path": sidecar_name,
+            "dtype": "uint8",
+            "document_aligned": True,
+        },
+    }
+
+
 def _required_objective_graph_columns(
     contract: ValidatedObjectiveContract,
 ) -> tuple[str, ...]:
@@ -2333,6 +2469,12 @@ def _write_parquet_to_numpy_generation(
         _add_symbol_identity_manifest(sidecar_data, symbol_identity_schema_version)
     if objective_manifest is not None:
         sidecar_data["objective_contract"] = objective_manifest
+    else:
+        sidecar_data["objective_contract"] = _synthesize_default_objective_contract(
+            output_prefix,
+            document_count=len(sizes_arr),
+            input_tokens=total_tokens,
+        )
     if objective_artifact_manifest is not None:
         sidecar_data["objective_materialization"] = dict(objective_artifact_manifest)
     _add_case5_manifest(
@@ -3088,6 +3230,12 @@ def _convert_parquet_to_megatron_unpublished(
         _add_symbol_identity_manifest(sidecar_data, symbol_identity_schema_version)
     if objective_manifest is not None:
         sidecar_data["objective_contract"] = objective_manifest
+    else:
+        sidecar_data["objective_contract"] = _synthesize_default_objective_contract(
+            output_prefix,
+            document_count=total_docs,
+            input_tokens=total_tokens,
+        )
     if objective_artifact_manifest is not None:
         sidecar_data["objective_materialization"] = dict(objective_artifact_manifest)
     _add_case5_manifest(

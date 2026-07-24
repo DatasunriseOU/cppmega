@@ -1,0 +1,16 @@
+FROM ghcr.io/datasunriseou/cppmega@sha256:08c5db7368d1037d930e0825281468927de9c85b12ba10373fe07e082150d983
+
+LABEL org.opencontainers.image.version="beta23-slim-v6"
+
+# Force-remove namespace package files that pip uninstall cannot touch
+RUN rm -rf /usr/local/lib/python3.13/dist-packages/nvidia_cutlass_dsl* \
+           /usr/local/lib/python3.13/dist-packages/cutlass* \
+           /usr/local/lib/python3.13/dist-packages/tvm_ffi* \
+           /usr/local/lib/python3.13/dist-packages/apache_tvm_ffi* \
+           /usr/local/lib/python3.13/dist-packages/flash_attn* && \
+    pip install --pre --no-cache-dir 'flash-attn-4==4.0.0b23' 2>&1 | tail -15
+
+# Verify
+RUN python3 -c "from flash_attn.cute.interface import flash_attn_func; print('FA4 beta23 OK')" && \
+    python3 -c "import tvm_ffi; print('tvm-ffi OK')" && \
+    python3 -c "import nvidia_cutlass_dsl; print(f'cutlass-dsl: {nvidia_cutlass_dsl.__file__}')"

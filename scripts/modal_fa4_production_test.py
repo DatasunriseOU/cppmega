@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import sys
 from typing import Any, cast
 
 import modal
@@ -18,23 +19,47 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 GHCR_REPO = "ghcr.io/datasunriseou/cppmega"
 GHCR_DIGEST = "sha256:08c5db7368d1037d930e0825281468927de9c85b12ba10373fe07e082150d983"
-GHCR_REF = f"{GHCR_REPO}@{GHCR_DIGEST}"
+# FA4 beta23 image digest (flash-attn-4 4.0.0b23 + apache-tvm-ffi >=0.1.12).
+# Placeholder until docker/Dockerfile.beta23 is built and pushed to GHCR; see
+# docs/fa4_beta23_upgrade_plan.md. Replace with the real digest from:
+#   docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/datasunriseou/cppmega:beta23
+GHCR_DIGEST_BETA23 = os.environ.get(
+    "GHCR_DIGEST_BETA23",
+    "sha256:eb6a4e11f9997b766924c32002601c3dc9d812fb12b9e57ad09b56f48881ea1f",
+)
+# Opt into the beta23 image with CPPMEGA_BETA23=1 or a --beta23 flag on the
+# modal run command line. Image selection happens at import time because the
+# @app.function decorators build the image when the module loads.
+USE_BETA23 = os.environ.get("CPPMEGA_BETA23", "0") == "1" or "--beta23" in sys.argv
+GHCR_REF = f"{GHCR_REPO}@{GHCR_DIGEST_BETA23 if USE_BETA23 else GHCR_DIGEST}"
 
 app = modal.App("cppmega-fa4-prod-test")
 results_vol = modal.Volume.from_name("cppmega-fa4-test-results", create_if_missing=True)
 
 
 def _image() -> modal.Image:
+    # Always use the default (b19) GHCR image as base.
+    # Beta23 upgrade is done in run_commands to avoid namespace package conflicts.
     img: Any = modal.Image.from_registry(
-        GHCR_REF,
+        f"{GHCR_REPO}@{GHCR_DIGEST}",
         secret=modal.Secret.from_name("ghcr-pull"),
         add_python=None,
     ).env({
         "PYTHONPATH": "/opt/cppmega:/opt/megatron-lm",
     })
-    # Upgrade to beta23 + tvm-ffi 0.1.13
+    # Remove base image's locally-built cutlass-dsl/tvm-ffi (incompatible namespace
+    # packages that shadow PyPI versions), then fresh-install FA4 beta23.
+    # This matches what worked on Nebius H200 (fresh venv, pip resolves deps).
     img = img.run_commands(
-        "pip install --pre 'flash-attn-4==4.0.0b23' 'apache-tvm-ffi>=0.1.12,<0.2' 2>&1 | tail -5"
+        "python3 -c \""
+        "import shutil, glob, os; "
+        "base='/usr/local/lib/python3.13/dist-packages/'; "
+        "patterns=['nvidia_cutlass_dsl*','cutlass*','tvm_ffi*','apache_tvm_ffi*','flash_attn*']; "
+        "[shutil.rmtree(p) for pat in patterns for p in glob.glob(base+pat) if os.path.isdir(p)]; "
+        "[os.remove(p) for pat in patterns for p in glob.glob(base+pat) if os.path.isfile(p)]; "
+        "print('cleaned')\"",
+        "pip install --pre --no-cache-dir flash-attn-4==4.0.0b23 2>&1 | tail -10",
+        "python3 -c 'from flash_attn.cute.interface import flash_attn_func; print(\"FA4 beta23 OK\")'",
     )
     img = (
         img.add_local_dir(str(_REPO_ROOT / "cppmega"), remote_path="/opt/cppmega/cppmega", copy=True)
@@ -109,9 +134,9 @@ def test_fa4_production_forward_backward() -> dict[str, Any]:
         call_edge_counts[b] = 4
 
     structure_batch = {
-        "token_chunk_starts": chunk_starts,
-        "token_chunk_ends": chunk_ends,
-        "token_chunk_counts": chunk_counts,
+        "graph_chunk_starts": chunk_starts,
+        "graph_chunk_ends": chunk_ends,
+        "graph_chunk_counts": chunk_counts,
         "graph_call_edges": call_edges,
         "graph_call_edge_counts": call_edge_counts,
     }
@@ -222,9 +247,9 @@ def test_te_parity() -> dict[str, Any]:
     call_edge_counts = torch.tensor([2], dtype=torch.long, device=device)
 
     structure_batch = {
-        "token_chunk_starts": chunk_starts,
-        "token_chunk_ends": chunk_ends,
-        "token_chunk_counts": chunk_counts,
+        "graph_chunk_starts": chunk_starts,
+        "graph_chunk_ends": chunk_ends,
+        "graph_chunk_counts": chunk_counts,
         "graph_call_edges": call_edges,
         "graph_call_edge_counts": call_edge_counts,
     }
@@ -306,9 +331,16 @@ def test_te_parity() -> dict[str, Any]:
 
 
 @app.local_entrypoint()
-def main() -> None:
+def main(beta23: bool = False) -> None:
+    """Run FA4 production tests on Modal H200.
+
+    Pass --beta23 to target the FA4 beta23 GHCR image (requires the beta23
+    image to have been built and pushed; see docs/fa4_beta23_upgrade_plan.md).
+    """
     import json
 
+    print(f"Image: {GHCR_REF}")
+    print(f"Image variant: {'beta23' if (beta23 or USE_BETA23) else 'default (b19 + runtime upgrade)'}")
     print("=" * 60)
     print("TEST 1: Production FA4 forward/backward")
     print("=" * 60)

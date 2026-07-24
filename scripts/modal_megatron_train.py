@@ -29,7 +29,19 @@ GHCR_DIGEST = os.environ.get(
     "GHCR_DIGEST",
     "sha256:08c5db7368d1037d930e0825281468927de9c85b12ba10373fe07e082150d983",
 )
-GHCR_REF = f"{GHCR_REPO}@{GHCR_DIGEST}"
+# FA4 beta23 image digest (flash-attn-4 4.0.0b23 + apache-tvm-ffi >=0.1.12).
+# Placeholder until docker/Dockerfile.beta23 is built and pushed to GHCR; see
+# docs/fa4_beta23_upgrade_plan.md. Replace with the real digest from:
+#   docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/datasunriseou/cppmega:beta23
+GHCR_DIGEST_BETA23 = os.environ.get(
+    "GHCR_DIGEST_BETA23",
+    "sha256:PLACEHOLDER_BETA23_DIGEST_NOT_YET_PUSHED",
+)
+# Opt into the beta23 image with CPPMEGA_BETA23=1 or a --beta23 flag on the
+# modal run command line. Image selection happens at import time because the
+# @app.function decorators build the image when the module loads.
+USE_BETA23 = os.environ.get("CPPMEGA_BETA23", "0") == "1" or "--beta23" in sys.argv
+GHCR_REF = f"{GHCR_REPO}@{GHCR_DIGEST_BETA23 if USE_BETA23 else GHCR_DIGEST}"
 GPU_SPEC = os.environ.get("CPPMEGA_MODAL_GPU", "H200:1")
 MEGATRON_ROOT = "/opt/megatron-lm"
 
@@ -384,9 +396,10 @@ runpy.run_path(_inner, run_name='__main__')
 
         ckpt_dir = f"{CHECKPOINT_DIR}/stage_seq{stage.seq}_bs{stage.batch}"
 
-        # Data path
+        # Data path — Megatron expects blend as separate tokens: weight path weight path
         code_prefix = f"{MEGATRON_DATA_DIR}/cppmega_code_{stage.seq}_train"
         commits_prefix = f"{MEGATRON_DATA_DIR}/cppmega_commits_{stage.seq}_train"
+        data_path_args = [str(code_weight), code_prefix, str(commits_weight), commits_prefix]
         data_path = f"{code_weight} {code_prefix} {commits_weight} {commits_prefix}"
 
         # Checkpoint: warm-start from previous stage (model weights only)
@@ -404,7 +417,7 @@ runpy.run_path(_inner, run_name='__main__')
             _sys.executable, "-m", "torch.distributed.run",
             "--nproc_per_node=1",
             f"{workdir}/pretrain_mamba.py",
-            "--data-path", data_path,
+            "--data-path", *data_path_args,
             "--tokenizer-type", "HuggingFaceTokenizer",
             "--tokenizer-model", env.get("CPPMEGA_TOKENIZER_MODEL", TOKENIZER_DIR),
             "--vocab-size", "65536",
@@ -505,12 +518,18 @@ def main(
     save_interval: int = 500,
     eval_interval: int = 500,
     fa4_score_mod: bool = False,
+    beta23: bool = False,
 ) -> None:
-    """Launch CppMega Megatron curriculum on Modal H200."""
+    """Launch CppMega Megatron curriculum on Modal H200.
+
+    Pass --beta23 to target the FA4 beta23 GHCR image (requires the beta23
+    image to have been built and pushed; see docs/fa4_beta23_upgrade_plan.md).
+    """
     seq_list = [int(s) for s in stages.split(",")]
     print("CppMega Megatron Curriculum Training")
     print(f"  GPU: {GPU_SPEC}")
     print(f"  Image: {GHCR_REF}")
+    print(f"  Image variant: {'beta23' if (beta23 or USE_BETA23) else 'default (b19)'}")
     print(f"  Stages: {seq_list}")
     print(f"  Mix: code={code_weight}, commits={commits_weight}")
 
