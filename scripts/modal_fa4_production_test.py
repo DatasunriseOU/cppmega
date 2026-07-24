@@ -47,18 +47,20 @@ def _image() -> modal.Image:
     ).env({
         "PYTHONPATH": "/opt/cppmega:/opt/megatron-lm",
     })
-    # Remove base image's locally-built cutlass-dsl/tvm-ffi (incompatible namespace
-    # packages that shadow PyPI versions), then fresh-install FA4 beta23.
-    # This matches what worked on Nebius H200 (fresh venv, pip resolves deps).
+    # Remove base image's locally-built cutlass-dsl/tvm-ffi (incompatible
+    # namespace packages that shadow the PyPI versions bundled with FA4 beta23),
+    # then fresh-install FA4 beta23. The cleanup is done by a standalone Python
+    # script (pathlib + shutil, no shell globs) to avoid Modal's image-builder
+    # shell-quoting issues that broke earlier inline `python3 -c` / `rm -rf`
+    # attempts. Each run_commands entry is kept intentionally SIMPLE.
+    img = img.add_local_file(
+        str(_REPO_ROOT / "scripts" / "fix_cutlass_namespace.py"),
+        remote_path="/opt/fix_cutlass_namespace.py",
+        copy=True,
+    )
     img = img.run_commands(
-        "python3 -c \""
-        "import shutil, glob, os; "
-        "base='/usr/local/lib/python3.13/dist-packages/'; "
-        "patterns=['nvidia_cutlass_dsl*','cutlass*','tvm_ffi*','apache_tvm_ffi*','flash_attn*']; "
-        "[shutil.rmtree(p) for pat in patterns for p in glob.glob(base+pat) if os.path.isdir(p)]; "
-        "[os.remove(p) for pat in patterns for p in glob.glob(base+pat) if os.path.isfile(p)]; "
-        "print('cleaned')\"",
-        "pip install --pre --no-cache-dir flash-attn-4==4.0.0b23 2>&1 | tail -10",
+        "python3 /opt/fix_cutlass_namespace.py",
+        "pip install --pre --no-cache-dir flash-attn-4==4.0.0b23",
         "python3 -c 'from flash_attn.cute.interface import flash_attn_func; print(\"FA4 beta23 OK\")'",
     )
     img = (
