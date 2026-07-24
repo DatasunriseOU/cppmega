@@ -252,6 +252,12 @@ class RuntimePatchProfile:
     # assign.
     dsa_indexer_loss_coeff: str = "0"
     dsa_skip_indexer_loss: bool = True
+    # Opt-in FA4 score_mod graph-route attention. When True the launcher exports
+    # CPPMEGA_FA4_SCORE_MOD=1 and cppmega_mamba_builder swaps the core
+    # attention spec (TEDotProductAttention) for CppMegaFA4ScoreModAttention.
+    # Default off: the stock TE dot-product attention path stays the default and
+    # FA4 is only selected explicitly via this flag / the env var.
+    fa4_graph_attention: bool = False
     ngram_hash_enabled: bool = True
     structure_enabled: bool = True
     structure_components: str = "core"
@@ -661,6 +667,13 @@ def set_h200_cpp_world_mini_profile(profile: RunProfile | None = None) -> RunPro
         structure_enabled=True,
         structure_components="core",
         mtp_ce_kernel="native",
+        # FA4 score_mod graph-route attention (CppMegaFA4ScoreModAttention)
+        # is available for this lane via CPPMEGA_FA4_SCORE_MOD=1 /
+        # fa4_graph_attention=True, which swaps the core_attention spec in
+        # cppmega_mamba_builder. It is intentionally NOT enabled by default:
+        # the smoke lane stays on stock TE dot-product attention so baseline
+        # runs are unaffected until FA4 is opted into explicitly.
+        fa4_graph_attention=False,
     )
     return profile
 
@@ -823,6 +836,7 @@ def profile_shell_assignments(profile: RunProfile) -> dict[str, str]:
         "CPPMEGA_DSA_FP8_ATTENTION": _bool(profile.runtime.dsa_fp8_attention),
         "CPPMEGA_DSA_INDEXER_LOSS_COEFF": profile.runtime.dsa_indexer_loss_coeff,
         "CPPMEGA_DSA_SKIP_INDEXER_LOSS": _bool(profile.runtime.dsa_skip_indexer_loss),
+        "CPPMEGA_FA4_SCORE_MOD": _bool(profile.runtime.fa4_graph_attention),
         "CPPMEGA_NGRAM_HASH_ENABLED": _bool(profile.runtime.ngram_hash_enabled),
         "CPPMEGA_STRUCTURE_ENABLED": _bool(profile.runtime.structure_enabled),
         "CPPMEGA_STRUCTURE_COMPONENTS": profile.runtime.structure_components,

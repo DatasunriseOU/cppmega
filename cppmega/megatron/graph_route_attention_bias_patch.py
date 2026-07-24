@@ -31,6 +31,11 @@ from cppmega.megatron.graph_objective_loss import (
     resolve_graph_bias_beta,
     validate_graph_bias_beta,
 )
+from cppmega.megatron.fa4_score_mod_adapter import (
+    ChunkNativeGraphBias,
+    build_fa4_attention_bias_from_structure_batch,
+    fa4_score_mod_enabled,
+)
 
 log = logging.getLogger(__name__)
 
@@ -522,7 +527,7 @@ def _forward_inference_context(param_names: list[str], args: tuple, kwargs: dict
 
 def _graph_attention_bias_for_layer(
     layer: Any, hidden_states: Any, inference_context: Any = None
-) -> torch.Tensor | None:
+) -> "torch.Tensor | ChunkNativeGraphBias | None":
     if not graph_dense_bias_enabled():
         return None
 
@@ -552,6 +557,126 @@ def _graph_attention_bias_for_layer(
             "dense graph-route attention bias does not support context_parallel_size > 1 yet"
         )
     beta = resolve_graph_bias_beta()
+
+    # --- FA4 chunk-native path: return ChunkNativeGraphBias instead of dense ---
+    if fa4_score_mod_enabled():
+        from cppmega.megatron.fa4_score_mod_adapter import (
+            build_chunk_native_graph_bias,
+        )
+        from cppmega.megatron.structure_dataset_patch import _get_current_structure_batch
+
+        if inference_context is not None:
+            # Decode mode: rectangular geometry (Sq=new tokens, Sk=full cache).
+            state = _prompt_graph_inference_state(inference_context)
+            offset = getattr(inference_context, "sequence_len_offset", None)
+            if offset is not None and int(offset) != state.query_start:
+                raise RuntimeError(
+                    "prompt graph inference state is stale: "
+                    f"context.sequence_len_offset={int(offset)} "
+                    f"query_start={state.query_start}"
+                )
+            sq = int(tensor.shape[0])
+            sk = state.key_length
+            if state.query_start + sq != sk:
+                raise RuntimeError(
+                    "prompt graph inference state does not match query/KV geometry: "
+                    f"query_start={state.query_start} Sq={sq} Sk={sk}"
+                )
+            # Build full-length chunk bias then slice query map to the new
+            # token window [query_start, query_start+sq).  Key map covers all
+            # cached tokens [0, sk).  chunk_bias stays [B, C+1, C+1].
+            full_bias = build_chunk_native_graph_bias(
+                state.structure_batch,
+                batch_size=int(tensor.shape[1]),
+                seqlen_q=sk,
+                seqlen_k=sk,
+                device=tensor.device,
+                dtype=tensor.dtype if tensor.is_floating_point() else torch.float32,
+                beta=beta,
+                call_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_CALL_WEIGHT", 1.0),
+                type_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_TYPE_WEIGHT", 1.0),
+                domain_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_DOMAIN_WEIGHT", 1.0),
+                build_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_BUILD_WEIGHT", 1.0),
+                shell_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_SHELL_WEIGHT", 1.0),
+                diagnostic_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_DIAGNOSTIC_WEIGHT", 1.0),
+                cross_domain_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_CROSS_DOMAIN_WEIGHT", 1.0),
+            )
+            # Slice the query token-to-chunk map to the decode window and
+            # rebase rare_q positions to local indices [0, sq).
+            from dataclasses import replace as _dc_replace
+
+            batch_sz = int(tensor.shape[1])
+            max_rare = full_bias.rare_q.shape[1]
+            new_rare_q = torch.full(
+                (batch_sz, max_rare), -1, device=tensor.device, dtype=torch.int32
+            )
+            new_rare_k = torch.full(
+                (batch_sz, max_rare), -1, device=tensor.device, dtype=torch.int32
+            )
+            new_rare_w = torch.zeros(
+                (batch_sz, max_rare), device=tensor.device,
+                dtype=full_bias.rare_w.dtype,
+            )
+            q_start = state.query_start
+            q_end = state.query_start + sq
+            for b_idx in range(batch_sz):
+                # Filter rare edges whose query is in the decode window.
+                mask = (full_bias.rare_q[b_idx] >= q_start) & (
+                    full_bias.rare_q[b_idx] < q_end
+                )
+                n_keep = int(mask.sum().item())
+                if n_keep > max_rare:
+                    n_keep = max_rare
+                if n_keep > 0:
+                    sel_q = full_bias.rare_q[b_idx][mask][:n_keep]
+                    sel_k = full_bias.rare_k[b_idx][mask][:n_keep]
+                    sel_w = full_bias.rare_w[b_idx][mask][:n_keep]
+                    new_rare_q[b_idx, :n_keep] = sel_q - q_start
+                    new_rare_k[b_idx, :n_keep] = sel_k
+                    new_rare_w[b_idx, :n_keep] = sel_w
+
+            # Build local rare_row_offsets [B, sq+1] for the decode window.
+            new_row_offsets = torch.zeros(
+                (batch_sz, sq + 1), device=tensor.device, dtype=torch.int32
+            )
+            for b_idx in range(batch_sz):
+                row_counts = torch.zeros(sq, device=tensor.device, dtype=torch.int32)
+                valid_q = new_rare_q[b_idx][new_rare_q[b_idx] >= 0]
+                if valid_q.numel() > 0:
+                    row_counts.scatter_add_(
+                        0, valid_q.long(),
+                        torch.ones(valid_q.numel(), device=tensor.device, dtype=torch.int32),
+                    )
+                new_row_offsets[b_idx, 1:] = torch.cumsum(row_counts, dim=0)
+
+            return _dc_replace(
+                full_bias,
+                token_to_chunk_q=full_bias.token_to_chunk_q[
+                    :, q_start:q_end
+                ].contiguous(),
+                rare_row_offsets=new_row_offsets,
+                rare_q=new_rare_q,
+                rare_k=new_rare_k,
+                rare_w=new_rare_w,
+            )
+
+        return build_fa4_attention_bias_from_structure_batch(
+            _get_current_structure_batch(),
+            batch_size=int(tensor.shape[1]),
+            seqlen_q=int(tensor.shape[0]),
+            seqlen_k=int(tensor.shape[0]),
+            device=tensor.device,
+            dtype=tensor.dtype if tensor.is_floating_point() else torch.float32,
+            beta=beta,
+            call_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_CALL_WEIGHT", 1.0),
+            type_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_TYPE_WEIGHT", 1.0),
+            domain_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_DOMAIN_WEIGHT", 1.0),
+            build_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_BUILD_WEIGHT", 1.0),
+            shell_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_SHELL_WEIGHT", 1.0),
+            diagnostic_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_DIAGNOSTIC_WEIGHT", 1.0),
+            cross_domain_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_CROSS_DOMAIN_WEIGHT", 1.0),
+        )
+
     if inference_context is not None:
         state = _prompt_graph_inference_state(inference_context)
         offset = getattr(inference_context, "sequence_len_offset", None)
