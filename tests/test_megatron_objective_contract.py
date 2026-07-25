@@ -683,6 +683,7 @@ def test_graph_enabled_dataset_ingress_requires_objective_contract(
     )
     dataset = SimpleNamespace(dataset=SimpleNamespace(bin_path=str(prefix) + ".bin"))
     monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "1")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_ENABLED", "1")
 
     with pytest.raises(KeyError, match="objective_contract"):
         dataset_patch._load_sidecar_manifest(dataset)
@@ -699,6 +700,7 @@ def test_graph_enabled_boolean_alias_still_requires_objective_contract(
     )
     dataset = SimpleNamespace(dataset=SimpleNamespace(bin_path=str(prefix) + ".bin"))
     monkeypatch.setenv("CPPMEGA_GRAPH_ROUTES_ENABLED", "true")
+    monkeypatch.setenv("CPPMEGA_DSA_GRAPH_AUX_ENABLED", "1")
 
     with pytest.raises(KeyError, match="objective_contract"):
         dataset_patch._load_sidecar_manifest(dataset)

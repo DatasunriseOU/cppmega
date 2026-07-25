@@ -96,7 +96,7 @@ def _build_production_aux_tensors(
         [0] token_to_chunk_q  [B, S] int32
         [1] token_to_chunk_k  [B, S] int32
         [2] chunk_bias_flat   [B, (C+1)*(C+1)] float32
-        [3] rare_q            [B, max_rare] int32
+        [3] rare_row_offsets  [B, S+1] int32
         [4] rare_k            [B, max_rare] int32
         [5] rare_w            [B, max_rare] float32
     """
@@ -111,7 +111,8 @@ def _build_production_aux_tensors(
         batch, c_plus_1 * c_plus_1, dtype=torch.float32, device=device
     )
 
-    rare_q = torch.zeros(batch, max_rare, dtype=torch.int32, device=device)
+    # CSR row offsets for rare edges [B, S+1] (all zeros = no rare edges)
+    rare_row_offsets = torch.zeros(batch, seqlen + 1, dtype=torch.int32, device=device)
     rare_k = torch.full((batch, max_rare), -1, dtype=torch.int32, device=device)
     rare_w = torch.zeros(batch, max_rare, dtype=torch.float32, device=device)
 
@@ -119,7 +120,7 @@ def _build_production_aux_tensors(
         token_to_chunk_q,
         token_to_chunk_k,
         chunk_bias_flat,
-        rare_q,
+        rare_row_offsets,
         rare_k,
         rare_w,
     ]
@@ -155,9 +156,10 @@ def test_production_score_mod_forward() -> None:
     aux_tensors, c_plus_1 = _build_production_aux_tensors(
         batch, seqlen, num_chunks, device
     )
+    max_rare = int(aux_tensors[4].shape[1])
 
     # Create score_mod via production factory
-    score_mod = _make_graph_score_mod(c_plus_1)
+    score_mod = _make_graph_score_mod(c_plus_1, max_rare)
     score_mod_bwd = _make_graph_score_mod_bwd(c_plus_1)
 
     out = flash_attn_func(
@@ -214,9 +216,10 @@ def test_production_score_mod_backward() -> None:
     aux_tensors, c_plus_1 = _build_production_aux_tensors(
         batch, seqlen, num_chunks, device
     )
+    max_rare = int(aux_tensors[4].shape[1])
 
     # Create score_mod via production factory
-    score_mod = _make_graph_score_mod(c_plus_1)
+    score_mod = _make_graph_score_mod(c_plus_1, max_rare)
     score_mod_bwd = _make_graph_score_mod_bwd(c_plus_1)
 
     out = flash_attn_func(
@@ -291,7 +294,8 @@ def test_production_score_mod_nonzero_bias() -> None:
     aux_nonzero[2] = aux_nonzero[2].clone()
     aux_nonzero[2][0, 0] = 5.0  # strong bias for chunk pair (0, 0)
 
-    score_mod = _make_graph_score_mod(c_plus_1)
+    max_rare = int(aux_zero[4].shape[1])
+    score_mod = _make_graph_score_mod(c_plus_1, max_rare)
     score_mod_bwd = _make_graph_score_mod_bwd(c_plus_1)
 
     out_zero = flash_attn_func(

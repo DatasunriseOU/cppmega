@@ -1,0 +1,7 @@
+[
+  {
+    "directory": "/Volumes/external/sources/cppmega/review_probe_case3_external",
+    "command": "clang++ -std=c++17 -I/Volumes/external/sources/cppmega/review_probe_case3_provider/include -c main.cpp",
+    "file": "/Volumes/external/sources/cppmega/review_probe_case3_external/main.cpp"
+  }
+]

@@ -60,7 +60,7 @@ def _image() -> modal.Image:
     )
     img = img.run_commands(
         "python3 /opt/fix_cutlass_namespace.py",
-        "pip install --pre --no-cache-dir flash-attn-4==4.0.0b23",
+        "python3 -m pip install --pre --no-cache-dir flash-attn-4==4.0.0b23",
         "python3 -c 'from flash_attn.cute.interface import flash_attn_func; print(\"FA4 beta23 OK\")'",
     )
     img = (
@@ -151,7 +151,7 @@ def test_fa4_production_forward_backward() -> dict[str, Any]:
             seqlen_q=S,
             seqlen_k=S,
             device=device,
-            dtype=torch.float32,
+            dtype=torch.bfloat16,
             beta=1.0,
         )
         results["bias_built"] = True
@@ -258,14 +258,14 @@ def test_te_parity() -> dict[str, Any]:
 
     bias_state = build_chunk_native_graph_bias(
         structure_batch, batch_size=B, seqlen_q=S, seqlen_k=S,
-        device=device, dtype=torch.float32, beta=1.0,
+        device=device, dtype=torch.bfloat16, beta=1.0,
     )
 
-    # Build dense [B, 1, S, S] bias from chunk_bias for TE
+    # Build dense [B, 1, S, S] bias from chunk_bias for TE (must match QKV dtype)
     chunk_bias = bias_state.chunk_bias  # [B, C+1, C+1]
     t2c_q = bias_state.token_to_chunk_q  # [B, S]
     t2c_k = bias_state.token_to_chunk_k  # [B, S]
-    dense_bias = torch.zeros(B, 1, S, S, device=device, dtype=torch.float32)
+    dense_bias = torch.zeros(B, 1, S, S, device=device, dtype=torch.bfloat16)
     for b in range(B):
         for qi in range(S):
             for ki in range(S):
@@ -279,6 +279,7 @@ def test_te_parity() -> dict[str, Any]:
             num_attention_heads=H,
             kv_channels=D,
             attention_dropout=0.0,
+            qkv_format="bshd",
             attn_mask_type="causal",
         ).to(device)
 
@@ -286,7 +287,12 @@ def test_te_parity() -> dict[str, Any]:
         q_te = q_bshd.clone()
         k_te = k_bshd.clone()
         v_te = v_bshd.clone()
-        te_out = te_attn(q_te, k_te, v_te, attention_bias=dense_bias)
+        te_out = te_attn(q_te, k_te, v_te,
+                         qkv_format="bshd",
+                         max_seqlen_q=S,
+                         max_seqlen_kv=S,
+                         core_attention_bias_type="post_scale_bias",
+                         core_attention_bias=dense_bias)
         results["te_forward_ok"] = True
         results["te_output_shape"] = list(te_out.shape)
     except Exception as e:
@@ -338,6 +344,11 @@ def main(beta23: bool = False) -> None:
 
     Pass --beta23 to target the FA4 beta23 GHCR image (requires the beta23
     image to have been built and pushed; see docs/fa4_beta23_upgrade_plan.md).
+
+    Exit codes:
+        0 - all tests passed
+        1 - one or more tests FAILED
+        2 - TE parity was SKIPPED (no failure, but parity not verified)
     """
     import json
 
@@ -355,9 +366,43 @@ def main(beta23: bool = False) -> None:
     r2 = test_te_parity.remote()
     print(json.dumps(r2, indent=2, default=str))
 
-    # Save results
+    # Classify results
+    status1 = r1.get("status", "UNKNOWN")
+    status2 = r2.get("status", "UNKNOWN")
+
+    failures: list[str] = []
+    skips: list[str] = []
+
+    if status1.startswith("FAIL") or status1 == "UNKNOWN":
+        failures.append(f"Forward/Backward: {status1} -- {r1.get('error', 'no error detail')}")
+    if status2.startswith("FAIL") or status2 == "UNKNOWN":
+        failures.append(f"TE Parity: {status2} -- {r2.get('fa4_error', r2.get('te_error', 'no error detail'))}")
+    if status2.startswith("SKIP"):
+        skip_reason = status2
+        if "te_error" in r2:
+            skip_reason += f" ({r2['te_error']})"
+        skips.append(f"TE parity SKIPPED: {skip_reason}")
+
+    # Summary
     print(f"\n{'='*60}")
-    print(f"SUMMARY:")
-    print(f"  Forward/Backward: {r1.get('status', 'UNKNOWN')}")
-    print(f"  TE Parity: {r2.get('status', 'UNKNOWN')}")
+    print("SUMMARY:")
+    print(f"  Forward/Backward: {status1}")
+    print(f"  TE Parity:        {status2}")
     print(f"{'='*60}")
+
+    if failures:
+        print("\n*** FAILURE ***")
+        for f in failures:
+            print(f"  FAILED: {f}")
+        sys.exit(1)
+
+    if skips:
+        print("\n" + "!" * 60)
+        print("*** WARNING: TE parity was NOT verified ***")
+        for s in skips:
+            print(f"  {s}")
+        print("!" * 60)
+        sys.exit(2)
+
+    print("\nAll tests PASSED.")
+    sys.exit(0)

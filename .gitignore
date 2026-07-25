@@ -61,3 +61,9 @@ outputs/megatron_ready/h200_fp8_recompute_debug_1024_train_token_type_refs.bin
 outputs/megatron_ready/h200_fp8_recompute_debug_1024_train.bin
 outputs/megatron_ready/h200_fp8_recompute_debug_1024_train.idx
 outputs/megatron_ready/h200_fp8_recompute_debug_1024_train.json
+.qoder/sessions/d*
+.qoder/scheduled_tasks.lock
+outputs/ci_diagnostics/*
+reports/chatgpt/*
+outputs/source_cache/*
+outputs/source_cache/code/test_make_lib/vector.c

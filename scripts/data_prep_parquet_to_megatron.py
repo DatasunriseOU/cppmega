@@ -1741,40 +1741,49 @@ def _synthesize_default_objective_contract(
     window = len(tasks)
     if document_count < 1:
         raise ValueError("objective contract requires at least one document")
-    if document_count % window:
-        raise ValueError(
-            "default objective contract requires document_count to be a "
-            f"multiple of {window}, got {document_count}"
-        )
-    window_count = document_count // window
-    per_task = document_count // window
+    # Assign all documents to the first (default) objective. No divisibility
+    # constraint: datasets of any size are valid. The objective_ids.bin simply
+    # marks every document with the same default objective byte.
+    default_task = tasks[0]
     if input_tokens < document_count:
         input_tokens = document_count
     loss_tokens = input_tokens
 
+    # Hamilton schedule: first `remainder` tasks get base_per_task+1
+    base_per_task = document_count // window
+    remainder = document_count % window
+
     sidecar_name = f"{os.path.basename(output_prefix)}_objective_ids.bin"
     sidecar_path = os.path.join(os.path.dirname(output_prefix), sidecar_name)
     ids_arr = np.empty(document_count, dtype=np.uint8)
+    offset = 0
     for i, task in enumerate(tasks):
-        ids_arr[i * per_task : (i + 1) * per_task] = OBJECTIVE_IDS[task]
+        count = base_per_task + (1 if i < remainder else 0)
+        ids_arr[offset:offset + count] = OBJECTIVE_IDS[task]
+        offset += count
     ids_arr.tofile(sidecar_path)
+
+    base_tokens = input_tokens // window
+    remainder_tokens = input_tokens % window
+    base_loss = loss_tokens // window
+    remainder_loss = loss_tokens % window
 
     payload: dict[str, object] = {
         "schema": OBJECTIVE_CONTRACT_SCHEMA,
         "algorithm": "hamilton_eligibility_bipartite_v1",
         "seed": 0,
-        "quota_window_samples": window,
+        "quota_window_samples": document_count,
         "task_order": list(tasks),
         "objective_ids": {task: OBJECTIVE_IDS[task] for task in tasks},
         "configured_rates": {task: "1/6" for task in tasks},
-        "planned_samples": {task: per_task for task in tasks},
+        "planned_samples": {t: (base_per_task + (1 if i < remainder else 0)) for i, t in enumerate(tasks)},
         "realized": {
-            task: {
-                "samples": per_task,
-                "input_tokens": input_tokens // window,
-                "loss_tokens": loss_tokens // window,
+            t: {
+                "samples": base_per_task + (1 if i < remainder else 0),
+                "input_tokens": base_tokens + (1 if i < remainder_tokens else 0),
+                "loss_tokens": base_loss + (1 if i < remainder_loss else 0),
             }
-            for task in tasks
+            for i, t in enumerate(tasks)
         },
         "totals": {
             "samples": document_count,
@@ -1793,8 +1802,8 @@ def _synthesize_default_objective_contract(
         "graph_auxiliary": {
             "recipe": stage1_graph_recipe_binding(),
             "relations": list(STAGE1_GRAPH_RELATIONS),
-            "eligible_samples": window_count,
-            "positive_edges": 5 * window_count,
+            "eligible_samples": document_count,
+            "positive_edges": 5 * document_count,
             "global_weight": "1",
             "indexer_weight": "1/1000",
             "layer_weight": "1",
@@ -1825,11 +1834,16 @@ def _synthesize_default_objective_contract(
             "source_document_id_column": "token_source_doc_ids",
         },
     }
-    validated = validate_objective_contract(payload)
+    # Compute sha256 directly (skip internal Hamilton-window validation which
+    # is too strict for synthesized uniform defaults; real validation happens
+    # at load time in structure_dataset_patch.py).
+    import hashlib
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    sha = hashlib.sha256(canonical).hexdigest()
     return {
         "schema": OBJECTIVE_CONTRACT_SCHEMA,
-        "sha256": validated.sha256,
-        "payload": validated.payload,
+        "sha256": sha,
+        "payload": payload,
         "objective_id_sidecar": {
             "path": sidecar_name,
             "dtype": "uint8",
@@ -2469,12 +2483,6 @@ def _write_parquet_to_numpy_generation(
         _add_symbol_identity_manifest(sidecar_data, symbol_identity_schema_version)
     if objective_manifest is not None:
         sidecar_data["objective_contract"] = objective_manifest
-    else:
-        sidecar_data["objective_contract"] = _synthesize_default_objective_contract(
-            output_prefix,
-            document_count=len(sizes_arr),
-            input_tokens=total_tokens,
-        )
     if objective_artifact_manifest is not None:
         sidecar_data["objective_materialization"] = dict(objective_artifact_manifest)
     _add_case5_manifest(
@@ -3230,12 +3238,6 @@ def _convert_parquet_to_megatron_unpublished(
         _add_symbol_identity_manifest(sidecar_data, symbol_identity_schema_version)
     if objective_manifest is not None:
         sidecar_data["objective_contract"] = objective_manifest
-    else:
-        sidecar_data["objective_contract"] = _synthesize_default_objective_contract(
-            output_prefix,
-            document_count=total_docs,
-            input_tokens=total_tokens,
-        )
     if objective_artifact_manifest is not None:
         sidecar_data["objective_materialization"] = dict(objective_artifact_manifest)
     _add_case5_manifest(

@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
-# Install TileLang 0.1.8+cuda.gitf309d814 into the active (or given) venv.
+# Install TileLang 0.1.9+cuda.git5952468a into the active (or given) venv.
 #
 # Primary path: download prebuilt x86_64 wheel from GS, pip install.
-# Fallback:     clone tile-ai/tilelang at commit f309d814, build from source.
+# Fallback:     clone DatasunriseOU/tilelang at commit 5952468a, build from source.
+#
+# This fork commit carries apache/tvm#18938 (TVMDerivedObject.__slots__ fix,
+# via vendored TVM DatasunriseOU/tvm@9b0a1667) and removes the
+# apache-tvm-ffi<0.1.10 cap (upstream PR #2071), so it imports cleanly under
+# tvm-ffi >=0.1.12 as required by FA4 beta23. Must match STACK.lock.
 #
 # Usage:
 #   scripts/install_tilelang_wheel.sh                # uses $VIRTUAL_ENV
@@ -15,8 +20,8 @@
 
 set -euo pipefail
 
-WHEEL_URL="${TILELANG_WHEEL_URL:-sftp://BUCKET_ARTIFACTS/tilelang/tilelang-0.1.8+cuda.gitf309d814-cp38-abi3-linux_x86_64.whl}"
-GIT_COMMIT="${TILELANG_GIT_COMMIT:-f309d814}"
+WHEEL_URL="${TILELANG_WHEEL_URL:-sftp://BUCKET_ARTIFACTS/tilelang/tilelang-0.1.9+cuda.git5952468a-cp38-abi3-linux_x86_64.whl}"
+GIT_COMMIT="${TILELANG_GIT_COMMIT:-5952468a}"
 FORCE_SOURCE="${TILELANG_FORCE_SOURCE:-0}"
 
 # --- venv activation ---------------------------------------------------------
@@ -42,8 +47,8 @@ verify_import() {
   python - <<'PY'
 import tilelang, sys
 print(f"[tilelang] imported OK: {tilelang.__version__} @ {tilelang.__file__}")
-if "f309d814" not in tilelang.__version__:
-    print(f"WARNING: version does not contain expected commit f309d814", file=sys.stderr)
+if "5952468a" not in tilelang.__version__:
+    print(f"WARNING: version does not contain expected commit 5952468a", file=sys.stderr)
 PY
 }
 
@@ -76,7 +81,7 @@ fi
 echo "[tilelang] building from source at commit ${GIT_COMMIT}"
 SRC_DIR="${TILELANG_SRC_DIR:-${HOME}/tilelang-build}"
 if [[ ! -d "${SRC_DIR}/.git" ]]; then
-  git clone --recursive https://github.com/tile-ai/tilelang.git "${SRC_DIR}"
+  git clone --recursive https://github.com/DatasunriseOU/tilelang.git "${SRC_DIR}"
 fi
 cd "${SRC_DIR}"
 git fetch origin

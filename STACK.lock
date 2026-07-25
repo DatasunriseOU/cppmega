@@ -86,9 +86,18 @@ wheels:
       - fast_hadamard_transform-*.whl
 
   tilelang:
-    repo: tile-ai/tilelang
-    ref: f309d814
-    version: 0.1.8+cuda.gitf309d814
+    # DatasunriseOU/tilelang fork at 5952468a carries:
+    #   - upstream tile-ai/tilelang#2071 (046b1bd): removes apache-tvm-ffi<0.1.10 cap
+    #     → pyproject pin is "apache-tvm-ffi>=0.1.dev0,<0.2" (compatible with FA4 beta23's >=0.1.12)
+    #   - vendored TVM submodule bumped to DatasunriseOU/tvm@9b0a1667, which includes
+    #     apache/tvm#18938 (44dbd138d): TVMDerivedObject.__slots__ = ("__dict__", "__weakref__")
+    #     → fixes the '_NestedLoopCheckVisitor' object has no attribute '_inst' import crash
+    #       under tvm-ffi >=0.1.10 (_ObjectSlotsMeta enforcement).
+    # Upstream tile-ai/tilelang HEAD still caps apache-tvm-ffi<0.1.12 (PR #2373/#2736),
+    # so it is NOT usable for the FA4 beta23 image. The fork is the clean path (§4 option 1).
+    repo: DatasunriseOU/tilelang
+    ref: 5952468a
+    version: 0.1.9+cuda.git5952468a
     submodules: true
     build: |
       pip wheel . --no-build-isolation -w /wheels

@@ -199,12 +199,16 @@ def _te_reference_attention_forward(
     )
     attn = attn.to(device=q.device, dtype=q.dtype)
 
-    # TE forward: (query, key, value, attention_mask=None, core_attention_bias_type="post_scale_bias", core_attention_bias=dense_bias)
+    # TE 2.16 forward: pass qkv_format and max_seqlen explicitly so cuDNN
+    # FusedAttention selects the correct backend for post_scale_bias.
     out = attn(
         q,
         k,
         v,
         attention_mask=None,
+        qkv_format="bshd",
+        max_seqlen_q=q.shape[1],
+        max_seqlen_kv=k.shape[1],
         core_attention_bias_type="post_scale_bias",
         core_attention_bias=dense_bias,
     )
@@ -309,17 +313,20 @@ def _fa4_attention_forward(
     ).contiguous()
 
     # 6 flat aux_tensors (c_plus_1 is in the factory closure, not in the list)
+    # Layout: [token_to_chunk_q, token_to_chunk_k, chunk_bias_flat,
+    #          rare_row_offsets, rare_k, rare_w]
     aux_tensors = [
         bias_state.token_to_chunk_q,
         bias_state.token_to_chunk_k,
         chunk_bias_flat,
-        bias_state.rare_q,
+        bias_state.rare_row_offsets,
         bias_state.rare_k,
         bias_state.rare_w,
     ]
 
     # Create score_mod via production factory
-    score_mod = _make_graph_score_mod(c_plus_1)
+    max_rare = int(bias_state.rare_k.shape[1])
+    score_mod = _make_graph_score_mod(c_plus_1, max_rare)
     score_mod_bwd = _make_graph_score_mod_bwd(c_plus_1)
 
     out = flash_attn_func(
@@ -361,14 +368,14 @@ class TestFA4H200Parity:
 
         sb = _parity_structure_batch()
 
-        # Build dense bias (TE reference path)
+        # Build dense bias (TE reference path) — must match QKV dtype (bf16)
         dense_bias = build_dense_graph_attention_bias_from_structure_batch(
             sb,
             batch_size=B,
             seqlen_q=S,
             seqlen_k=S,
             device=device,
-            dtype=torch.float32,
+            dtype=torch.bfloat16,
             call_weight=CALL_WEIGHT,
             type_weight=TYPE_WEIGHT,
             domain_weight=DOMAIN_WEIGHT,

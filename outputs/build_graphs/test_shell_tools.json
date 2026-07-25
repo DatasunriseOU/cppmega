@@ -1,0 +1,56 @@
+{
+  "repo": "test_shell_tools",
+  "build_system": "shell",
+  "graph_file": "",
+  "nodes": [
+    {
+      "id": "deploy.sh",
+      "type": "script",
+      "file": "deploy.sh"
+    },
+    {
+      "id": "lib/common.sh",
+      "type": "script",
+      "file": "lib/common.sh"
+    },
+    {
+      "id": "lib/deploy_helpers.sh",
+      "type": "script",
+      "file": "lib/deploy_helpers.sh"
+    },
+    {
+      "id": "lib/logging.sh",
+      "type": "script",
+      "file": "lib/logging.sh"
+    }
+  ],
+  "edges": [
+    {
+      "from": "deploy.sh",
+      "to": "lib/common.sh",
+      "kind": "source_dep"
+    },
+    {
+      "from": "deploy.sh",
+      "to": "lib/deploy_helpers.sh",
+      "kind": "source_dep"
+    },
+    {
+      "from": "lib/common.sh",
+      "to": "lib/logging.sh",
+      "kind": "source_dep"
+    },
+    {
+      "from": "lib/deploy_helpers.sh",
+      "to": "lib/common.sh",
+      "kind": "source_dep"
+    }
+  ],
+  "diagnostics": [],
+  "cross_file_includes": [
+    "lib/common.sh",
+    "lib/deploy_helpers.sh",
+    "lib/logging.sh"
+  ],
+  "configure_success": true
+}

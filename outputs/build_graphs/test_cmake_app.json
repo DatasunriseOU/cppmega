@@ -1,0 +1,70 @@
+{
+  "repo": "test_cmake_app",
+  "build_system": "cmake",
+  "graph_file": "deps.dot",
+  "nodes": [
+    {
+      "id": "core_lib",
+      "type": "static_library"
+    },
+    {
+      "id": "extra_module",
+      "type": "interface_library"
+    },
+    {
+      "id": "myapp",
+      "type": "executable"
+    },
+    {
+      "id": "Threads::Threads",
+      "type": "interface_library"
+    },
+    {
+      "id": "src/core.cpp",
+      "type": "source",
+      "file": "CMakeLists.txt"
+    },
+    {
+      "id": "src/utils.cpp",
+      "type": "source",
+      "file": "CMakeLists.txt"
+    },
+    {
+      "id": "src/main.cpp",
+      "type": "source",
+      "file": "CMakeLists.txt"
+    }
+  ],
+  "edges": [
+    {
+      "from": "myapp",
+      "to": "Threads::Threads",
+      "kind": "link_dep"
+    },
+    {
+      "from": "myapp",
+      "to": "core_lib",
+      "kind": "link_dep"
+    },
+    {
+      "from": "core_lib",
+      "to": "src/core.cpp",
+      "kind": "target_source"
+    },
+    {
+      "from": "core_lib",
+      "to": "src/utils.cpp",
+      "kind": "target_source"
+    },
+    {
+      "from": "myapp",
+      "to": "src/main.cpp",
+      "kind": "target_source"
+    }
+  ],
+  "diagnostics": [],
+  "cross_file_includes": [
+    "cmake/modules/CMakeLists.txt"
+  ],
+  "configure_success": true
+}

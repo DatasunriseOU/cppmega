@@ -45,6 +45,7 @@ __all__ = [
     "build_dense_graph_attention_bias_from_structure_batch",
     "build_rectangular_graph_attention_bias_from_structure_batch",
     "graph_dense_bias_enabled",
+    "invalidate_bias_cache",
     "PromptGraphInferenceState",
     "set_prompt_graph_inference_state",
 ]
@@ -52,6 +53,60 @@ __all__ = [
 _PATCH_MARKER = "__cppmega_graph_route_attention_bias_patched__"
 _ORIGINAL_FORWARD_ATTRIBUTE = "__cppmega_graph_route_attention_bias_original__"
 _INFERENCE_STATE_ATTRIBUTE = "_cppmega_prompt_graph_inference_state"
+
+# ---------------------------------------------------------------------------
+# Content-based bias cache.
+#
+# The same structure_batch flows through every TransformerLayer for one
+# microbatch.  Rebuilding scatter/sort/CSR bias at each layer is wasteful.
+# We cache the LAST result and validate by (data_ptr, shape) of the first
+# available edge tensor plus geometry.  data_ptr changes when new storage is
+# allocated for a different batch, unlike id() which CPython may reuse.
+# ---------------------------------------------------------------------------
+_BIAS_CACHE_KEYS = (
+    "graph_call_edges",
+    "graph_type_edges",
+    "graph_domain_edges",
+    "graph_build_edges",
+    "graph_shell_edges",
+    "graph_diagnostic_edges",
+    "graph_cross_domain_edges",
+    "graph_generated_query_edges",
+)
+_bias_cache: dict[str, Any] = {"key": None, "result": None}
+
+
+def _structure_batch_cache_key(
+    structure_batch: dict[str, torch.Tensor] | None,
+) -> tuple | None:
+    """Derive a content-based identity tuple from a structure_batch.
+
+    Returns None when the batch is empty or has no recognised edge tensors
+    (caller should skip caching in that case).
+    """
+    if not structure_batch:
+        return None
+    for key in _BIAS_CACHE_KEYS:
+        tensor = structure_batch.get(key)
+        if tensor is not None and isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
+            return (tensor.data_ptr(), tuple(tensor.shape))
+    return None
+
+
+def invalidate_bias_cache() -> None:
+    """Explicitly flush the dense/FA4 bias cache.
+
+    Call this when new data is loaded into the structure batch tensors (e.g.
+    from the dataloader hook) to guarantee the next layer forward rebuilds the
+    bias from fresh data.  In practice the content-based key (data_ptr + shape)
+    already detects new allocations, but this provides a deterministic flush
+    point for callers that reuse tensor storage in-place.
+    """
+    _bias_cache["key"] = None
+    _bias_cache["result"] = None
+
+
+# FA4 bias is built fresh each call when caching is not applicable.
 _PINNED_TRANSFORMER_PARAMETERS = (
     "self",
     "hidden_states",
@@ -558,24 +613,112 @@ def _graph_attention_bias_for_layer(
         )
     beta = resolve_graph_bias_beta()
 
+    # --- Resolve weights once (used in cache key and all build paths) ---
+    w_call = _env_float("CPPMEGA_GRAPH_ATTENTION_CALL_WEIGHT", 1.0)
+    w_type = _env_float("CPPMEGA_GRAPH_ATTENTION_TYPE_WEIGHT", 1.0)
+    w_domain = _env_float("CPPMEGA_GRAPH_ATTENTION_DOMAIN_WEIGHT", 1.0)
+    w_build = _env_float("CPPMEGA_GRAPH_ATTENTION_BUILD_WEIGHT", 1.0)
+    w_shell = _env_float("CPPMEGA_GRAPH_ATTENTION_SHELL_WEIGHT", 1.0)
+    w_diag = _env_float("CPPMEGA_GRAPH_ATTENTION_DIAGNOSTIC_WEIGHT", 1.0)
+    w_cross = _env_float("CPPMEGA_GRAPH_ATTENTION_CROSS_DOMAIN_WEIGHT", 1.0)
+
+    # --- Resolve structure_batch early for cache key ---
+    from cppmega.megatron.structure_dataset_patch import _get_current_structure_batch
+
+    if inference_context is not None:
+        state = _prompt_graph_inference_state(inference_context)
+        offset = getattr(inference_context, "sequence_len_offset", None)
+        if offset is not None and int(offset) != state.query_start:
+            raise RuntimeError(
+                "prompt graph inference state is stale: "
+                f"context.sequence_len_offset={int(offset)} "
+                f"query_start={state.query_start}"
+            )
+        sb_for_key = state.structure_batch
+    else:
+        state = None
+        sb_for_key = _get_current_structure_batch()
+
+    # --- Content-based cache lookup ---
+    sb_identity = _structure_batch_cache_key(sb_for_key)
+    batch_sz = int(tensor.shape[1])
+    seqlen_q = int(tensor.shape[0])
+    use_fa4 = fa4_score_mod_enabled()
+
+    # Geometry differs between decode (rectangular) and prefill/train (square).
+    if state is not None:
+        geom = (batch_sz, seqlen_q, state.key_length, state.query_start)
+    else:
+        geom = (batch_sz, seqlen_q, seqlen_q, 0)
+
+    cache_key: tuple | None = None
+    if sb_identity is not None:
+        cache_key = (
+            sb_identity,
+            use_fa4,
+            geom,
+            beta,
+            w_call, w_type, w_domain, w_build, w_shell, w_diag, w_cross,
+        )
+        if _bias_cache["key"] == cache_key:
+            return _bias_cache["result"]
+
+    # --- Cache miss: compute bias ---
+    result = _build_bias_uncached(
+        tensor=tensor,
+        state=state,
+        inference_context=inference_context,
+        sb_for_key=sb_for_key,
+        use_fa4=use_fa4,
+        beta=beta,
+        batch_sz=batch_sz,
+        seqlen_q=seqlen_q,
+        w_call=w_call,
+        w_type=w_type,
+        w_domain=w_domain,
+        w_build=w_build,
+        w_shell=w_shell,
+        w_diag=w_diag,
+        w_cross=w_cross,
+    )
+
+    # --- Store in cache ---
+    if cache_key is not None:
+        _bias_cache["key"] = cache_key
+        _bias_cache["result"] = result
+
+    return result
+
+
+def _build_bias_uncached(
+    *,
+    tensor: torch.Tensor,
+    state: "PromptGraphInferenceState | None",
+    inference_context: Any,
+    sb_for_key: "dict[str, torch.Tensor] | None",
+    use_fa4: bool,
+    beta: float,
+    batch_sz: int,
+    seqlen_q: int,
+    w_call: float,
+    w_type: float,
+    w_domain: float,
+    w_build: float,
+    w_shell: float,
+    w_diag: float,
+    w_cross: float,
+) -> "torch.Tensor | ChunkNativeGraphBias | None":
+    """Compute the graph attention bias (cache-miss path)."""
+
     # --- FA4 chunk-native path: return ChunkNativeGraphBias instead of dense ---
-    if fa4_score_mod_enabled():
+    if use_fa4:
         from cppmega.megatron.fa4_score_mod_adapter import (
             build_chunk_native_graph_bias,
         )
-        from cppmega.megatron.structure_dataset_patch import _get_current_structure_batch
 
-        if inference_context is not None:
+        if state is not None:
             # Decode mode: rectangular geometry (Sq=new tokens, Sk=full cache).
-            state = _prompt_graph_inference_state(inference_context)
-            offset = getattr(inference_context, "sequence_len_offset", None)
-            if offset is not None and int(offset) != state.query_start:
-                raise RuntimeError(
-                    "prompt graph inference state is stale: "
-                    f"context.sequence_len_offset={int(offset)} "
-                    f"query_start={state.query_start}"
-                )
-            sq = int(tensor.shape[0])
+            sq = seqlen_q
             sk = state.key_length
             if state.query_start + sq != sk:
                 raise RuntimeError(
@@ -587,25 +730,24 @@ def _graph_attention_bias_for_layer(
             # cached tokens [0, sk).  chunk_bias stays [B, C+1, C+1].
             full_bias = build_chunk_native_graph_bias(
                 state.structure_batch,
-                batch_size=int(tensor.shape[1]),
+                batch_size=batch_sz,
                 seqlen_q=sk,
                 seqlen_k=sk,
                 device=tensor.device,
                 dtype=tensor.dtype if tensor.is_floating_point() else torch.float32,
                 beta=beta,
-                call_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_CALL_WEIGHT", 1.0),
-                type_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_TYPE_WEIGHT", 1.0),
-                domain_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_DOMAIN_WEIGHT", 1.0),
-                build_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_BUILD_WEIGHT", 1.0),
-                shell_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_SHELL_WEIGHT", 1.0),
-                diagnostic_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_DIAGNOSTIC_WEIGHT", 1.0),
-                cross_domain_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_CROSS_DOMAIN_WEIGHT", 1.0),
+                call_weight=w_call,
+                type_weight=w_type,
+                domain_weight=w_domain,
+                build_weight=w_build,
+                shell_weight=w_shell,
+                diagnostic_weight=w_diag,
+                cross_domain_weight=w_cross,
             )
             # Slice the query token-to-chunk map to the decode window and
             # rebase rare_q positions to local indices [0, sq).
             from dataclasses import replace as _dc_replace
 
-            batch_sz = int(tensor.shape[1])
             max_rare = full_bias.rare_q.shape[1]
             new_rare_q = torch.full(
                 (batch_sz, max_rare), -1, device=tensor.device, dtype=torch.int32
@@ -660,72 +802,63 @@ def _graph_attention_bias_for_layer(
                 rare_w=new_rare_w,
             )
 
-        return build_fa4_attention_bias_from_structure_batch(
-            _get_current_structure_batch(),
-            batch_size=int(tensor.shape[1]),
-            seqlen_q=int(tensor.shape[0]),
-            seqlen_k=int(tensor.shape[0]),
+        bias_state = build_fa4_attention_bias_from_structure_batch(
+            sb_for_key,
+            batch_size=batch_sz,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_q,
             device=tensor.device,
             dtype=tensor.dtype if tensor.is_floating_point() else torch.float32,
             beta=beta,
-            call_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_CALL_WEIGHT", 1.0),
-            type_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_TYPE_WEIGHT", 1.0),
-            domain_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_DOMAIN_WEIGHT", 1.0),
-            build_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_BUILD_WEIGHT", 1.0),
-            shell_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_SHELL_WEIGHT", 1.0),
-            diagnostic_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_DIAGNOSTIC_WEIGHT", 1.0),
-            cross_domain_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_CROSS_DOMAIN_WEIGHT", 1.0),
+            call_weight=w_call,
+            type_weight=w_type,
+            domain_weight=w_domain,
+            build_weight=w_build,
+            shell_weight=w_shell,
+            diagnostic_weight=w_diag,
+            cross_domain_weight=w_cross,
         )
+        return bias_state
 
-    if inference_context is not None:
-        state = _prompt_graph_inference_state(inference_context)
-        offset = getattr(inference_context, "sequence_len_offset", None)
-        if offset is not None and int(offset) != state.query_start:
-            raise RuntimeError(
-                "prompt graph inference state is stale: "
-                f"context.sequence_len_offset={int(offset)} "
-                f"query_start={state.query_start}"
-            )
-        if state.query_start + int(tensor.shape[0]) != state.key_length:
+    if state is not None:
+        if state.query_start + seqlen_q != state.key_length:
             raise RuntimeError(
                 "prompt graph inference state does not match query/KV geometry: "
-                f"query_start={state.query_start} Sq={int(tensor.shape[0])} "
+                f"query_start={state.query_start} Sq={seqlen_q} "
                 f"Sk={state.key_length}"
             )
         return build_rectangular_graph_attention_bias_from_structure_batch(
             state.structure_batch,
-            batch_size=int(tensor.shape[1]),
+            batch_size=batch_sz,
             query_start=state.query_start,
-            seqlen_q=int(tensor.shape[0]),
+            seqlen_q=seqlen_q,
             seqlen_k=state.key_length,
             device=tensor.device,
             dtype=tensor.dtype if tensor.is_floating_point() else torch.float32,
-            call_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_CALL_WEIGHT", 1.0),
-            type_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_TYPE_WEIGHT", 1.0),
-            domain_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_DOMAIN_WEIGHT", 1.0),
-            build_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_BUILD_WEIGHT", 1.0),
-            shell_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_SHELL_WEIGHT", 1.0),
-            diagnostic_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_DIAGNOSTIC_WEIGHT", 1.0),
-            cross_domain_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_CROSS_DOMAIN_WEIGHT", 1.0),
+            call_weight=w_call,
+            type_weight=w_type,
+            domain_weight=w_domain,
+            build_weight=w_build,
+            shell_weight=w_shell,
+            diagnostic_weight=w_diag,
+            cross_domain_weight=w_cross,
             beta=beta,
         )
 
-    from cppmega.megatron.structure_dataset_patch import _get_current_structure_batch
-
     return build_dense_graph_attention_bias_from_structure_batch(
-        _get_current_structure_batch(),
-        batch_size=int(tensor.shape[1]),
-        seqlen_q=int(tensor.shape[0]),
-        seqlen_k=int(tensor.shape[0]),
+        sb_for_key,
+        batch_size=batch_sz,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_q,
         device=tensor.device,
         dtype=tensor.dtype if tensor.is_floating_point() else torch.float32,
-        call_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_CALL_WEIGHT", 1.0),
-        type_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_TYPE_WEIGHT", 1.0),
-        domain_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_DOMAIN_WEIGHT", 1.0),
-        build_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_BUILD_WEIGHT", 1.0),
-        shell_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_SHELL_WEIGHT", 1.0),
-        diagnostic_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_DIAGNOSTIC_WEIGHT", 1.0),
-        cross_domain_weight=_env_float("CPPMEGA_GRAPH_ATTENTION_CROSS_DOMAIN_WEIGHT", 1.0),
+        call_weight=w_call,
+        type_weight=w_type,
+        domain_weight=w_domain,
+        build_weight=w_build,
+        shell_weight=w_shell,
+        diagnostic_weight=w_diag,
+        cross_domain_weight=w_cross,
         beta=beta,
     )
 

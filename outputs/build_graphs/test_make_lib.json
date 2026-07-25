@@ -1,0 +1,135 @@
+{
+  "repo": "test_make_lib",
+  "build_system": "make",
+  "graph_file": "makefile",
+  "nodes": [
+    {
+      "id": "matrix.h",
+      "type": "source"
+    },
+    {
+      "id": "vector.h",
+      "type": "source"
+    },
+    {
+      "id": "all",
+      "type": "executable"
+    },
+    {
+      "id": "main.c",
+      "type": "source"
+    },
+    {
+      "id": "deps.mk",
+      "type": "target"
+    },
+    {
+      "id": "makefile",
+      "type": "executable"
+    },
+    {
+      "id": "matrix.o",
+      "type": "object"
+    },
+    {
+      "id": "matrix_internal.h",
+      "type": "source"
+    },
+    {
+      "id": "vector.o",
+      "type": "object"
+    },
+    {
+      "id": "clean",
+      "type": "executable"
+    },
+    {
+      "id": "main.o",
+      "type": "object"
+    },
+    {
+      "id": "linmath",
+      "type": "executable"
+    },
+    {
+      "id": "matrix.c",
+      "type": "source"
+    },
+    {
+      "id": "vector.c",
+      "type": "source"
+    }
+  ],
+  "edges": [
+    {
+      "from": "all",
+      "to": "linmath",
+      "kind": "depends_on"
+    },
+    {
+      "from": "matrix.o",
+      "to": "matrix.c",
+      "kind": "target_source"
+    },
+    {
+      "from": "matrix.o",
+      "to": "matrix.h",
+      "kind": "header_dep"
+    },
+    {
+      "from": "matrix.o",
+      "to": "vector.h",
+      "kind": "header_dep"
+    },
+    {
+      "from": "matrix.o",
+      "to": "matrix_internal.h",
+      "kind": "header_dep"
+    },
+    {
+      "from": "vector.o",
+      "to": "vector.c",
+      "kind": "target_source"
+    },
+    {
+      "from": "vector.o",
+      "to": "vector.h",
+      "kind": "header_dep"
+    },
+    {
+      "from": "main.o",
+      "to": "main.c",
+      "kind": "target_source"
+    },
+    {
+      "from": "main.o",
+      "to": "vector.h",
+      "kind": "header_dep"
+    },
+    {
+      "from": "main.o",
+      "to": "matrix.h",
+      "kind": "header_dep"
+    },
+    {
+      "from": "linmath",
+      "to": "vector.o",
+      "kind": "object_dep"
+    },
+    {
+      "from": "linmath",
+      "to": "matrix.o",
+      "kind": "object_dep"
+    },
+    {
+      "from": "linmath",
+      "to": "main.o",
+      "kind": "object_dep"
+    }
+  ],
+  "diagnostics": [],
+  "cross_file_includes": [
+    "deps.mk"
+  ],
+  "configure_success": true
+}

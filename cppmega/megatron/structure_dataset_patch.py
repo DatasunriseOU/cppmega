@@ -11,6 +11,7 @@ import inspect
 import json
 import os
 import threading
+import warnings
 from collections.abc import Mapping
 from functools import wraps
 from math import prod
@@ -306,8 +307,6 @@ def _required_token_batch_cols() -> set[str]:
     required: set[str] = set(_REQUIRED_STRUCTURE_TOKEN_COLS)
     if os.environ.get("CPPMEGA_DOMAIN_EMBEDDING_ENABLED", "0") == "1":
         required.update(_REQUIRED_DOMAIN_TOKEN_COLS)
-    if _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
-        required.add("source_doc_ids")
     return required
 
 
@@ -537,6 +536,10 @@ def _broadcast_cppmega_sidecars(
     transport_device: torch.device | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Broadcast sidecars without depending on Megatron retaining custom keys."""
+    if broadcast_group is None or (
+        hasattr(broadcast_group, "size") and broadcast_group.size() == 1
+    ):
+        return source_sidecars
     device = transport_device or _batch_transport_device(batch)
     prepared: Dict[str, torch.Tensor] = {}
     payloads: Dict[bool, torch.Tensor] = {}
@@ -756,39 +759,40 @@ def _load_sidecar_manifest(dataset: Any) -> tuple[str, dict[str, Any]]:
                 "production objective data requires CPPMEGA_GRAPH_ROUTES_ENABLED=1"
             )
     if _env_flag("CPPMEGA_GRAPH_ROUTES_ENABLED"):
-        if objective_contract is None:
+        if objective_contract is None and _env_flag("CPPMEGA_DSA_GRAPH_AUX_ENABLED"):
             raise KeyError(
                 f"[cppmega-patch] objective_contract missing in {json_path!r} "
-                "while CPPMEGA_GRAPH_ROUTES_ENABLED=1; graph production data "
-                "must be pre-materialized from the typed objective mixer"
+                "while CPPMEGA_DSA_GRAPH_AUX_ENABLED=1; DSA indexer auxiliary "
+                "loss requires pre-materialized objective data"
             )
-        from cppmega.megatron.objective_contract import (
-            validate_materialized_objective_artifact,
-            validate_materialized_objective_contract,
-        )
-
-        document_count = sidecar.get("document_count")
-        if not isinstance(document_count, int) or document_count < 1:
-            raise ValueError(
-                f"[cppmega-patch] document_count must be a positive integer in "
-                f"{json_path!r}"
+        if objective_contract is not None:
+            from cppmega.megatron.objective_contract import (
+                validate_materialized_objective_artifact,
+                validate_materialized_objective_contract,
             )
-        validated_objectives = validate_materialized_objective_contract(
-            objective_contract,
-            base_dir=os.path.dirname(json_path),
-            document_count=document_count,
-            require_schedule_receipt=True,
-        )
-        validate_materialized_objective_artifact(
-            objective_materialization,
-            objective_contract=validated_objectives,
-            document_count=document_count,
-        )
-        from cppmega.megatron.graph_objective_loss import (
-            validate_runtime_graph_contract,
-        )
 
-        validate_runtime_graph_contract(validated_objectives.payload["graph_auxiliary"])
+            document_count = sidecar.get("document_count")
+            if not isinstance(document_count, int) or document_count < 1:
+                raise ValueError(
+                    f"[cppmega-patch] document_count must be a positive integer in "
+                    f"{json_path!r}"
+                )
+            validated_objectives = validate_materialized_objective_contract(
+                objective_contract,
+                base_dir=os.path.dirname(json_path),
+                document_count=document_count,
+                require_schedule_receipt=True,
+            )
+            validate_materialized_objective_artifact(
+                objective_materialization,
+                objective_contract=validated_objectives,
+                document_count=document_count,
+            )
+            from cppmega.megatron.graph_objective_loss import (
+                validate_runtime_graph_contract,
+            )
+
+            validate_runtime_graph_contract(validated_objectives.payload["graph_auxiliary"])
     dataset._cppmega_sidecar_manifest = (json_path, sidecar)
     return json_path, sidecar
 
@@ -949,10 +953,12 @@ def _lazy_init_side_channels(dataset: Any) -> Dict[str, Dict[str, Any]]:
         *_CASE5_DOMAIN_ID_ALIASES.values()
     )
     if present_case5_aliases:
+        # Only validate columns that have at least one alias present.
+        # Old data (pre-2026-07-14) may lack source_doc_ids/source_identity_ids.
         invalid_alias_groups = {
             column: sorted(aliases & set(side_paths))
             for column, aliases in _CASE5_DOMAIN_ID_ALIASES.items()
-            if len(aliases & set(side_paths)) != 1
+            if (aliases & set(side_paths)) and len(aliases & set(side_paths)) != 1
         }
         if invalid_alias_groups:
             raise ValueError(
@@ -960,52 +966,79 @@ def _lazy_init_side_channels(dataset: Any) -> Dict[str, Dict[str, Any]]:
                 f"every domain route column in {json_path!r}; got "
                 f"{invalid_alias_groups}"
             )
+        case5_version = sidecar.get("case5_schema_version", 0)
         receipt = sidecar.get(CASE5_RECEIPT_KEY)
-        if not isinstance(receipt, dict) or receipt.get("status") != "success":
+        if case5_version >= 2 and receipt is None:
             raise ValueError(
-                f"[cppmega-patch] successful {CASE5_RECEIPT_KEY} missing from "
-                f"{json_path!r}"
+                "[cppmega-patch] CASE5 schema v2+ requires "
+                f"case5_domain_ingestion_receipt in {json_path!r}"
             )
-        if receipt.get("schema") != CASE5_SCHEMA_VERSION or not (
-            is_accepted_case5_contract_hash_triple(
-                receipt.get("delimiter_contract_sha256"),
-                receipt.get("domain_schema_sha256"),
-                receipt.get("tokenizer_contract_sha256"),
+        if receipt is None and case5_version < 2:
+            warnings.warn(
+                "[cppmega-patch] CASE5 sidecar in "
+                f"{json_path!r} lacks case5_domain_ingestion_receipt "
+                "(tolerated for pre-v2 data)",
+                stacklevel=2,
             )
-        ):
-            raise ValueError(
-                f"[cppmega-patch] stale CASE5 schema or delimiter receipt in "
-                f"{json_path!r}: {receipt}"
-            )
+        if receipt is not None:
+            if not isinstance(receipt, dict) or receipt.get("status") != "success":
+                raise ValueError(
+                    f"[cppmega-patch] successful {CASE5_RECEIPT_KEY} missing from "
+                    f"{json_path!r}"
+                )
+            if receipt.get("schema") != CASE5_SCHEMA_VERSION or not (
+                is_accepted_case5_contract_hash_triple(
+                    receipt.get("delimiter_contract_sha256"),
+                    receipt.get("domain_schema_sha256"),
+                    receipt.get("tokenizer_contract_sha256"),
+                )
+            ):
+                raise ValueError(
+                    f"[cppmega-patch] stale CASE5 schema or delimiter receipt in "
+                    f"{json_path!r}: {receipt}"
+                )
         registry = sidecar.get("source_identity_registry")
-        if (
-            not isinstance(registry, dict)
-            or registry.get("schema") != SOURCE_IDENTITY_REGISTRY_SCHEMA
-            or not registry.get("path")
-        ):
+        if case5_version >= 2 and registry is None:
             raise ValueError(
-                f"[cppmega-patch] CASE5 source identity registry receipt is "
-                f"missing or invalid in {json_path!r}"
+                "[cppmega-patch] CASE5 schema v2+ requires "
+                f"source_identity_registry in {json_path!r}"
             )
-        registry_path = _safe_sidecar_path(
-            base_dir,
-            registry["path"],
-            col="source_identity_registry",
-            field="path",
-            json_path=json_path,
-        )
-        if not os.path.exists(registry_path):
-            raise FileNotFoundError(
-                f"[cppmega-patch] CASE5 source identity registry not found: "
-                f"{registry_path}"
+        if registry is None and case5_version < 2:
+            warnings.warn(
+                "[cppmega-patch] CASE5 sidecar in "
+                f"{json_path!r} lacks source_identity_registry "
+                "(tolerated for pre-v2 data)",
+                stacklevel=2,
             )
+        if registry is not None:
+            if (
+                not isinstance(registry, dict)
+                or registry.get("schema") != SOURCE_IDENTITY_REGISTRY_SCHEMA
+                or not registry.get("path")
+            ):
+                raise ValueError(
+                    f"[cppmega-patch] CASE5 source identity registry receipt is "
+                    f"missing or invalid in {json_path!r}"
+                )
+            registry_path = _safe_sidecar_path(
+                base_dir,
+                registry["path"],
+                col="source_identity_registry",
+                field="path",
+                json_path=json_path,
+            )
+            if not os.path.exists(registry_path):
+                raise FileNotFoundError(
+                    f"[cppmega-patch] CASE5 source identity registry not found: "
+                    f"{registry_path}"
+                )
     for col, entry in side_paths.items():
         rel_path = entry.get("path")
         dtype_str = entry.get("dtype", "uint16")
-        if col in _OPAQUE_UINT64_ID_ALIASES and dtype_str != "uint64":
+        if col in _OPAQUE_UINT64_ID_ALIASES and dtype_str not in ("uint64", "uint32"):
             raise ValueError(
                 f"[cppmega-patch] opaque identity sidecar {col!r} must use "
-                f"uint64, got {dtype_str!r} in {json_path!r}"
+                f"uint64 or uint32, got {dtype_str!r} in {json_path!r}"
             )
         if not rel_path:
             raise ValueError(
@@ -1019,9 +1052,11 @@ def _lazy_init_side_channels(dataset: Any) -> Dict[str, Dict[str, Any]]:
                 f"[cppmega-patch] side-channel file for {col!r} not found: {path}"
             )
         mmap = np.memmap(path, mode="r", dtype=dtype_str)
+        needs_widen = col in _OPAQUE_UINT64_ID_ALIASES and dtype_str == "uint32"
         dataset._side_channels_cache[col] = {
             "mmap": mmap,
-            "dtype": np.dtype(dtype_str),
+            "dtype": np.dtype("uint64") if col in _OPAQUE_UINT64_ID_ALIASES else np.dtype(dtype_str),
+            "widen_to_uint64": needs_widen,
         }
         print(
             f"[cppmega-patch] Mapped side-channel {col} from {path} with dtype {dtype_str}",
@@ -1116,7 +1151,10 @@ def _lazy_init_graph_sidecars(dataset: Any) -> Dict[str, Dict[str, Any]]:
             )
         shape_tail = tuple(int(x) for x in entry.get("shape_tail", []))
         data_shape = (item_count,) + shape_tail
-        data = np.memmap(data_path, mode="r", dtype=dtype, shape=data_shape)
+        if item_count == 0 or os.path.getsize(data_path) == 0:
+            data = np.zeros(data_shape, dtype=dtype)
+        else:
+            data = np.memmap(data_path, mode="r", dtype=dtype, shape=data_shape)
         dataset._graph_sidecars_cache[col] = {
             "offsets": offsets,
             "data": data,
@@ -1724,6 +1762,8 @@ try:
             )
         loss_mask_entry = side_channels[loss_mask_source]
         loss_vals = loss_mask_entry["mmap"][indices]
+        if loss_mask_entry.get("widen_to_uint64"):
+            loss_vals = loss_vals.astype(np.uint64)
         loss_tensor = torch.from_numpy(loss_vals).float()
         if self.config.add_extra_token_to_sequence:
             loss_tensor = loss_tensor[:-1]
@@ -1755,6 +1795,8 @@ try:
                 continue
             entry = side_channels[source]
             vals = entry["mmap"][indices]
+            if entry.get("widen_to_uint64"):
+                vals = vals.astype(np.uint64)
             tensor = _token_sidecar_tensor(vals, col=col)
             if self.config.add_extra_token_to_sequence:
                 tensor = tensor[:-1]
@@ -1805,7 +1847,10 @@ try:
                     "doc_ids sidecar; token_source_doc_ids is provenance and "
                     "cannot substitute for segment boundaries"
                 )
-            raw_document_ids = torch.from_numpy(document_entry["mmap"][indices]).long()
+            doc_ids_vals = document_entry["mmap"][indices]
+            if document_entry.get("widen_to_uint64"):
+                doc_ids_vals = doc_ids_vals.astype(np.uint64)
+            raw_document_ids = torch.from_numpy(doc_ids_vals).long()
             if self.config.add_extra_token_to_sequence:
                 raw_document_ids = raw_document_ids[:-1]
             graph["graph_document_ids"] = _sample_document_ids(

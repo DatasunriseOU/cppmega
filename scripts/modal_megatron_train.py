@@ -316,14 +316,17 @@ runpy.run_path(_inner, run_name='__main__')
     env["CPPMEGA_TOKENIZER_MODEL"] = TOKENIZER_DIR
 
     # FORCE graph routes + structure + ngram AFTER profile parsing.
-    # Dense GQA model: enable graph attention BIAS (dense [B,1,Sq,Sk] additive
-    # bias from compiler edges) WITHOUT the DSA indexer auxiliary OBJECTIVE
-    # (top-k sparse attention training signal requires DSA architecture).
+    # Dense GQA model: graph attention BIAS enabled (additive bias in attention),
+    # but DSA indexer auxiliary objective DISABLED (no DSA layers in dense model).
+    # Graph attention bias != DSA indexer loss. Bias goes through attention_bias
+    # mechanism; DSA indexer loss requires actual DSA layers which don't exist here.
     env["CPPMEGA_DSA_PATCH_ENABLED"] = "0"
     env["CPPMEGA_DSA_GRAPH_AUX_ENABLED"] = "0"
     env["CPPMEGA_NGRAM_HASH_ENABLED"] = "1"
     env["CPPMEGA_STRUCTURE_ENABLED"] = "1"
     env["CPPMEGA_GRAPH_ROUTES_ENABLED"] = "1"
+    env["CPPMEGA_GRAPH_MAX_EDGES"] = "256"
+    env["CPPMEGA_GRAPH_MAX_CHUNKS"] = "256"
 
     # Opt-in FA4 score_mod (default off; profile exports CPPMEGA_FA4_SCORE_MOD=0).
     # Enable only for explicit FA4 testing -- the GHCR image has b19 and the
@@ -452,8 +455,9 @@ runpy.run_path(_inner, run_name='__main__')
             "--use-mcore-models",
             "--transformer-impl", "transformer_engine",
             "--attention-backend", "auto",
-            # Nebius baseline used dropout=0.1 with cuDNN. FA4 requires dropout=0
-            # but is not enabled by default. Let the profile default (0.1) apply.
+            # Nebius baseline used dropout=0.1 with cuDNN.  When FA4 score_mod
+            # is active, --attention-dropout 0 is appended below (hard kernel
+            # constraint).  Otherwise the profile default (0.1) applies.
             "--no-gradient-accumulation-fusion",
             "--no-persist-layer-norm",
             "--no-masked-softmax-fusion",
@@ -469,6 +473,12 @@ runpy.run_path(_inner, run_name='__main__')
             *dsa_native_args,
             *checkpoint_args,
         ]
+
+        # FA4 beta23 does not support attention dropout; setting to 0 is
+        # required.  This is a hard constraint of the FA4 kernel, not a
+        # feature toggle -- the score_mod path has no dropout support.
+        if fa4_score_mod:
+            cmd.extend(["--attention-dropout", "0"])
 
         print(f"\n{'='*70}")
         print(f"STAGE seq={stage.seq} bs={stage.batch} micro_bs={stage.micro_batch} iters={train_iters}")

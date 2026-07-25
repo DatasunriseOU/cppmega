@@ -67,10 +67,12 @@ class CppMegaLanguageModelEmbedding(LanguageModelEmbedding):
         if os.environ.get("CPPMEGA_STRUCTURE_ENABLED", "0") == "1":
             self.cppmega_structure = CppMegaStructureEmbedding(
                 hidden_size=self.config.hidden_size,
+                num_categories=int(os.environ.get("CPPMEGA_NUM_STRUCTURE_CATEGORIES", "16")),
                 active_components=os.environ.get("CPPMEGA_STRUCTURE_COMPONENTS", "core"),
-                max_ast_depth=int(os.environ.get("CPPMEGA_MAX_AST_DEPTH", "20")),
-                max_sibling_index=int(os.environ.get("CPPMEGA_MAX_SIBLING_INDEX", "10")),
-                num_node_types=int(os.environ.get("CPPMEGA_NUM_NODE_TYPES", "64")),
+                max_dep_level=int(os.environ.get("CPPMEGA_MAX_DEP_LEVEL", "32")),
+                max_ast_depth=int(os.environ.get("CPPMEGA_MAX_AST_DEPTH", "64")),
+                max_sibling_index=int(os.environ.get("CPPMEGA_MAX_SIBLING_INDEX", "64")),
+                num_node_types=int(os.environ.get("CPPMEGA_NUM_NODE_TYPES", "256")),
                 bottleneck_dim=int(os.environ.get("CPPMEGA_STRUCTURE_BOTTLENECK_DIM", "64")),
             )
 

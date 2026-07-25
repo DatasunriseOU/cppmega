@@ -233,11 +233,19 @@ def test_case5_training_loader_requires_success_receipt_and_registry(
 
     assert loaded["token_source_identity_ids"]["dtype"] == np.dtype(np.uint64)
 
+    # Old data (no case5_schema_version): missing receipt → warning, no crash
     del manifest[CASE5_RECEIPT_KEY]
     prefix.with_suffix(".json").write_text(json.dumps(manifest))
     unreceipted = SimpleNamespace(dataset=SimpleNamespace(bin_path=f"{prefix}.bin"))
-    with pytest.raises(ValueError, match="successful case5_domain_ingestion_receipt"):
+    with pytest.warns(UserWarning, match="lacks case5_domain_ingestion_receipt"):
         patch._lazy_init_side_channels(unreceipted)
+
+    # New data (case5_schema_version=2): missing receipt → ValueError
+    manifest["case5_schema_version"] = 2
+    prefix.with_suffix(".json").write_text(json.dumps(manifest))
+    unreceipted_v2 = SimpleNamespace(dataset=SimpleNamespace(bin_path=f"{prefix}.bin"))
+    with pytest.raises(ValueError, match="CASE5 schema v2\\+ requires"):
+        patch._lazy_init_side_channels(unreceipted_v2)
 
 
 def test_pop_structure_batch_removes_sidecars_and_sets_thread_local():

@@ -157,8 +157,16 @@ jobs:
             submodules: "false"
             extra_env: "MAX_JOBS=1 NVCC_THREADS=2"
           - name: tilelang
-            repo: tile-ai/tilelang
-            ref: f309d814
+            # DatasunriseOU/tilelang fork (not upstream tile-ai/tilelang) because:
+            #   - 5952468a carries upstream PR #2071 (removes apache-tvm-ffi<0.1.10 cap)
+            #   - vendored TVM submodule (DatasunriseOU/tvm@9b0a1667) includes
+            #     apache/tvm#18938 (TVMDerivedObject.__slots__ fix) → no
+            #     '_NestedLoopCheckVisitor' import crash under tvm-ffi >=0.1.12
+            #   - upstream tile-ai/tilelang HEAD still caps apache-tvm-ffi<0.1.12,
+            #     incompatible with FA4 beta23's >=0.1.12 floor.
+            # Must match STACK.lock wheels.tilelang.ref.
+            repo: DatasunriseOU/tilelang
+            ref: 5952468a
             submodules: "true"
             extra_env: ""
           - name: qoptim_cuda

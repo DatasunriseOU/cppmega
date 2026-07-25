@@ -7,10 +7,11 @@ Stack (all cp313 prebuilt, no source builds):
   - mamba_ssm 2.3.1 (local wheel — @31f3d7b + bench patches baked in)
   - causal_conv1d 1.6.1 (local wheel)
   - flash_attn 2.8.3 (local wheel)
-  - tilelang 0.1.8+cuda.gitf309d814 (local wheel, abi3)
+  - tilelang 0.1.9+cuda.git5952468a (local wheel, abi3; DatasunriseOU fork —
+    carries apache/tvm#18938 __slots__ fix + removes apache-tvm-ffi<0.1.10 cap)
   - qoptim_cuda 0.0.0 (local wheel)
   - fast_hadamard_transform 1.1.0 (local wheel)
-  - apache-tvm-ffi 0.1.9 (pypi, <0.1.10 for TileLang)
+  - apache-tvm-ffi 0.1.9 (pypi; fork also imports cleanly under >=0.1.12 for FA4 beta23)
   - megatron-core 0.18 from origin/dev HEAD (editable)
 
 Wheels are downloaded once from HETZ_1_IP:/data/gs-* to
@@ -43,7 +44,7 @@ _WHEEL_FILES = [
     "causal_conv1d-1.6.1-cp313-cp313-linux_x86_64.whl",
     "flash_attn-2.8.3-cp313-cp313-linux_x86_64.whl",
     "qoptim_cuda-0.0.0-cp313-cp313-linux_x86_64.whl",
-    "tilelang-0.1.8+cuda.gitf309d814-cp38-abi3-linux_x86_64.whl",
+    "tilelang-0.1.9+cuda.git5952468a-cp38-abi3-linux_x86_64.whl",
     "fast_hadamard_transform-1.1.0-cp313-cp313-linux_x86_64.whl",
 ]
 
