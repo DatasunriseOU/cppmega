@@ -196,6 +196,33 @@ def test_cmake_ninja_gcc_cuda_success_sections_entities_and_edges() -> None:
     _assert_conserved(result)
 
 
+def test_package_inventory_rows_are_not_build_actions() -> None:
+    raw = _timestamped(
+        "cmake                     4.3.2  h8cb302d_0  conda-forge  18MB",
+        "make                      4.4.1  hc9fafa5_2  conda-forge  Cached",
+        "ninja                    1.13.2  h49c215f_0  conda-forge  Cached",
+        "bazel                     8.3.0",
+        "cmake/jammy-updates,now 3.22.1-1ubuntu1.22.04.2 amd64 [installed]",
+        "[command]cmake -S . -B build",
+        "[command]cmake --build build --target app",
+        "[command]ninja -C build app",
+    )
+
+    result = canonicalize_ci_log(raw)
+    actions = result["sidecar"]["classifications"]["build_actions"]
+
+    assert [action["command"] for action in actions] == [
+        "cmake -S . -B build",
+        "cmake --build build --target app",
+        "ninja -C build app",
+    ]
+    assert all(
+        action["confidence"]["source"] == "build_system_command_v1"
+        for action in actions
+    )
+    _assert_conserved(result)
+
+
 def test_bazel_pytest_gtest_ctest_failure_diagnostics_and_sanitizer() -> None:
     raw = _timestamped(
         "##[group]Run bazel test //lib:all_tests",

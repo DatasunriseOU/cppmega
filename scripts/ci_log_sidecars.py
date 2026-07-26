@@ -436,6 +436,22 @@ _LINK_ARCHIVE_TOOL_RE = re.compile(
     r"(?=\s|$)"
 )
 
+_PACKAGE_VERSION_RE = re.compile(
+    r"^[vV]?\d+(?:\.\d+)+(?:[-+._~]?[A-Za-z0-9]+)*$"
+)
+_PACKAGE_BUILD_ID_RE = re.compile(r"^[A-Za-z0-9.+-]+_\d+$")
+_PACKAGE_SIZE_RE = re.compile(r"(?i)^\d+(?:\.\d+)?(?:[KMGT]i?B)$")
+_PACKAGE_CHANNELS = frozenset(
+    {
+        "anaconda",
+        "conda-forge",
+        "defaults",
+        "pkgs/main",
+        "pkgs/r",
+        "pypi",
+    }
+)
+
 
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
@@ -2096,6 +2112,32 @@ def _compiler_action_match(content: str) -> tuple[str, re.Match[str]] | None:
     return name, match
 
 
+def _is_package_listing_row(
+    content: str, tool_match: re.Match[str]
+) -> bool:
+    """Reject package inventory rows that merely begin with a build tool."""
+
+    suffix = content[tool_match.end() :]
+    if suffix.startswith("/") and re.search(
+        r"(?i)\[(?:installed|upgradable)\]", suffix
+    ):
+        return True
+    tokens = content[tool_match.start() :].strip().split()
+    if len(tokens) < 2:
+        return False
+    version = tokens[1].rstrip(",;")
+    if _PACKAGE_VERSION_RE.fullmatch(version) is None:
+        return False
+    if re.match(r"^\s{2,}", suffix):
+        return True
+    remaining = [token.rstrip(",;") for token in tokens[2:]]
+    return bool(
+        any(token.lower() in _PACKAGE_CHANNELS for token in remaining)
+        or any(_PACKAGE_BUILD_ID_RE.fullmatch(token) for token in remaining)
+        or any(_PACKAGE_SIZE_RE.fullmatch(token) for token in remaining)
+    )
+
+
 def _build_action_paths(
     line_paths: Sequence[Mapping[str, Any]],
     *,
@@ -2261,6 +2303,7 @@ def _extract_build_actions(
         tool_match: re.Match[str] | None = None
         tool: str | None = None
         kind: str | None = None
+        action_method: str | None = None
         if compiler_match is not None:
             compiler_name, candidate = compiler_match
             candidate_command = content[candidate.start() :]
@@ -2285,6 +2328,7 @@ def _extract_build_actions(
                 tool_match = candidate
                 tool = compiler_name
                 kind = "compile" if has_compile_signal else "link"
+                action_method = "compiler_command_v1"
         if (
             tool_match is None
             and linker_match is not None
@@ -2293,6 +2337,7 @@ def _extract_build_actions(
             tool_match = linker_match
             tool = _tool_basename(linker_match.group("tool"))
             kind = "archive" if tool in {"ar", "llvm-ar", "lib"} else "link"
+            action_method = "linker_archive_command_v1"
         if tool_match is None:
             build_candidates: list[
                 tuple[int, str, re.Match[str]]
@@ -2316,7 +2361,9 @@ def _extract_build_actions(
                     )
                     or re.match(r"^cd\s+.+?\s+&&$", prefix)
                 )
-                if command_prefix:
+                if command_prefix and not _is_package_listing_row(
+                    content, candidate
+                ):
                     tool_match = candidate
                     tool = build_name
                     kind = (
@@ -2329,8 +2376,14 @@ def _extract_build_actions(
                         )
                         else "build"
                     )
+                    action_method = "build_system_command_v1"
 
-        if tool_match is None or tool is None or kind is None:
+        if (
+            tool_match is None
+            or tool is None
+            or kind is None
+            or action_method is None
+        ):
             continue
         local_start = tool_match.start()
         action_start = int(line["start"]) + local_start
@@ -2388,7 +2441,7 @@ def _extract_build_actions(
                 "step_ordinal": step_ordinal,
                 "chunk_id": _chunk_for_char(chunks, action_start),
                 "confidence": _confidence(
-                    0.98, source="compiler_linker_action_v1"
+                    0.98, source=action_method
                 ),
             }
         )
