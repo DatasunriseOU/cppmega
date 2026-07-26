@@ -30,7 +30,8 @@ Usage:
       --store out/pr_store.sqlite \
       --tokens ~/.gh_pats.txt \
       --targets targets.jsonl \
-      --misses out/graphql_misses.jsonl
+      --misses out/graphql_misses.jsonl \
+      --completion-receipt out/graphql_gap_completion.json
 
   targets.jsonl: one JSON per line, {"repo":"owner/repo","pr_number":1234}
   (Typically produced by diffing the corpus PR set against `pr_store stats`.)
@@ -38,6 +39,7 @@ Usage:
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
 import os
 import subprocess
@@ -45,7 +47,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 if __package__ in (None, ""):
     repo_root = os.path.dirname(
@@ -60,7 +62,8 @@ GQL_URL = "https://api.github.com/graphql"
 
 PR_QUERY = """
 query($owner:String!, $name:String!, $number:Int!,
-      $cComments:String, $cReviews:String, $cThreads:String) {
+      $cComments:String, $cReviews:String, $cThreads:String,
+      $cLinked:String) {
   repository(owner:$owner, name:$name) {
     pullRequest(number:$number) {
       number
@@ -68,20 +71,46 @@ query($owner:String!, $name:String!, $number:Int!,
       body
       mergeCommit { oid }
       comments(first:100, after:$cComments) {
+        totalCount
         pageInfo { hasNextPage endCursor }
         nodes { author { login } body createdAt }
       }
       reviews(first:100, after:$cReviews) {
+        totalCount
         pageInfo { hasNextPage endCursor }
         nodes { author { login } body state submittedAt }
       }
       reviewThreads(first:50, after:$cThreads) {
+        totalCount
         pageInfo { hasNextPage endCursor }
-        nodes { comments(first:100) {
-          nodes { author { login } body path createdAt } } }
+        nodes {
+          id
+          comments(first:100) {
+            totalCount
+            pageInfo { hasNextPage endCursor }
+            nodes { id author { login } body path createdAt }
+          }
+        }
       }
-      closingIssuesReferences(first:50) {
+      closingIssuesReferences(first:50, after:$cLinked) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
         nodes { number title body }
+      }
+    }
+  }
+}
+"""
+
+THREAD_COMMENTS_QUERY = """
+query($threadId:ID!, $cursor:String) {
+  node(id:$threadId) {
+    ... on PullRequestReviewThread {
+      id
+      comments(first:100, after:$cursor) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes { id author { login } body path createdAt }
       }
     }
   }
@@ -116,9 +145,13 @@ class TokenPool:
         self.cooldown_until[self.idx] = time.time() + max(1.0, seconds)
 
 
-def _post(token: str, variables: dict) -> tuple[int, dict, dict]:
-    """POST the GraphQL query. Return (status, headers, json_body)."""
-    payload = json.dumps({"query": PR_QUERY, "variables": variables}).encode()
+def _post_query(
+    query: str,
+    token: str,
+    variables: dict,
+) -> tuple[int, dict, dict]:
+    """POST one GraphQL query. Return (status, headers, json_body)."""
+    payload = json.dumps({"query": query, "variables": variables}).encode()
     req = urllib.request.Request(GQL_URL, data=payload, method="POST")
     req.add_header("Authorization", f"bearer {token}")
     req.add_header("Content-Type", "application/json")
@@ -136,61 +169,80 @@ def _post(token: str, variables: dict) -> tuple[int, dict, dict]:
         return e.code, headers, body
 
 
-def fetch_pr(pool: TokenPool, owner: str, name: str, number: int,
-             max_retries: int = 8) -> dict:
-    """Fetch one PR, paginating connections. RAISE on auth/quota exhaustion."""
-    comments: list[dict] = []
-    reviews: list[dict] = []
-    linked: list[dict] = []
-    title = body = ""
-    merge_sha = None
+def _post(token: str, variables: dict) -> tuple[int, dict, dict]:
+    return _post_query(PR_QUERY, token, variables)
 
-    c_comments = c_reviews = c_threads = None
-    seen_first_page = False
+
+def _post_thread_comments(
+    token: str,
+    variables: dict,
+) -> tuple[int, dict, dict]:
+    return _post_query(THREAD_COMMENTS_QUERY, token, variables)
+
+
+def _request_graphql_page(
+    pool: TokenPool,
+    variables: dict,
+    *,
+    context: str,
+    max_retries: int,
+    post_fn: Callable[[str, dict], tuple[int, dict, dict]],
+) -> dict:
     attempts = 0
-
     while True:
-        variables = {
-            "owner": owner, "name": name, "number": number,
-            "cComments": c_comments, "cReviews": c_reviews, "cThreads": c_threads,
-        }
-        status, headers, jb = _post(pool.current(), variables)
-
-        # --- Auth failures: fail loud across all tokens ---------------------
-        if status in (401,):
+        status, headers, payload = post_fn(pool.current(), variables)
+        if status == 401:
             raise SystemExit(
                 f"[graphql] 401 Unauthorized for token #{pool.idx} "
-                f"({owner}/{name}#{number}); fix the PAT(s) in --tokens"
+                f"({context}); fix the PAT(s) in --tokens"
             )
 
-        # --- Rate / abuse limits: rotate + backoff -------------------------
+        errors = payload.get("errors") if isinstance(payload, dict) else None
+        rate_limited_error = bool(
+            errors
+            and any(
+                isinstance(error, dict)
+                and error.get("type") == "RATE_LIMITED"
+                for error in errors
+            )
+        )
         remaining = headers.get("X-RateLimit-Remaining")
         retry_after = headers.get("Retry-After")
+        serialized_payload = json.dumps(payload).lower()
         is_secondary = status == 403 and (
             retry_after is not None
-            or "secondary rate limit" in json.dumps(jb).lower()
-            or "abuse" in json.dumps(jb).lower()
+            or "secondary rate limit" in serialized_payload
+            or "abuse" in serialized_payload
         )
-        if status == 403 and not is_secondary and "rate limit" not in json.dumps(jb).lower():
+        is_rate_limited = (
+            rate_limited_error
+            or is_secondary
+            or str(remaining) == "0"
+            or status == 429
+        )
+        if status == 403 and not is_rate_limited:
             raise SystemExit(
-                f"[graphql] 403 Forbidden (not a rate limit) for {owner}/{name}#{number}: "
-                f"{jb.get('message', jb)}"
+                f"[graphql] 403 Forbidden (not a rate limit) for {context}: "
+                f"{payload.get('message', payload)}"
             )
-        if is_secondary or (remaining is not None and remaining == "0") or status in (429,):
+        if is_rate_limited:
             attempts += 1
             if attempts > max_retries:
                 raise SystemExit(
                     f"[graphql] exceeded {max_retries} retries on rate limits for "
-                    f"{owner}/{name}#{number}; add more PATs or wait"
+                    f"{context}; add more PATs or wait"
                 )
             if retry_after is not None:
                 wait = float(retry_after)
             else:
                 reset = headers.get("X-RateLimit-Reset")
-                wait = max(1.0, float(reset) - time.time()) if reset else 30.0
+                wait = (
+                    max(1.0, float(reset) - time.time())
+                    if reset
+                    else 30.0
+                )
             pool.cool(wait)
             if not pool.advance():
-                # Every token is cooling -> quota exhausted. Fail loud.
                 soonest = min(pool.cooldown_until) - time.time()
                 raise SystemExit(
                     f"[graphql] ALL tokens rate-limited (soonest reset in "
@@ -200,13 +252,125 @@ def fetch_pr(pool: TokenPool, owner: str, name: str, number: int,
             continue
 
         if status != 200:
+            raise SystemExit(f"[graphql] HTTP {status} for {context}: {payload}")
+        if errors:
             raise SystemExit(
-                f"[graphql] HTTP {status} for {owner}/{name}#{number}: {jb}"
+                f"[graphql] GraphQL errors for {context}: {errors}"
             )
-        if "errors" in jb and jb["errors"]:
-            raise SystemExit(
-                f"[graphql] GraphQL errors for {owner}/{name}#{number}: {jb['errors']}"
+        return payload
+
+
+def _normalize_review_comment(node: dict) -> dict:
+    return {
+        "user": (node.get("author") or {}).get("login", ""),
+        "body": node.get("body", ""),
+        "path": node.get("path"),
+        "created_at": node.get("createdAt", ""),
+        "kind": "review_comment",
+    }
+
+
+def _fetch_complete_thread_comments(
+    pool: TokenPool,
+    *,
+    owner: str,
+    name: str,
+    number: int,
+    thread_id: str,
+    first_connection: dict,
+    max_retries: int,
+    post_fn: Callable[[str, dict], tuple[int, dict, dict]],
+) -> list[dict]:
+    expected_total = int(first_connection.get("totalCount") or 0)
+    comments: list[dict] = []
+    seen_comment_ids: set[str] = set()
+
+    def consume(connection: dict) -> tuple[bool, str | None]:
+        page_total = int(connection.get("totalCount") or 0)
+        if page_total != expected_total:
+            raise RuntimeError(
+                f"[graphql] {owner}/{name}#{number}: review thread "
+                f"{thread_id} comment totalCount changed during pagination "
+                f"({expected_total}->{page_total})"
             )
+        for node in connection.get("nodes", []):
+            comment_id = node.get("id")
+            if isinstance(comment_id, str) and comment_id:
+                if comment_id in seen_comment_ids:
+                    raise RuntimeError(
+                        f"[graphql] {owner}/{name}#{number}: duplicate review "
+                        f"comment during thread pagination: {comment_id}"
+                    )
+                seen_comment_ids.add(comment_id)
+            comments.append(_normalize_review_comment(node))
+        page_info = connection.get("pageInfo") or {}
+        has_next = bool(page_info.get("hasNextPage"))
+        cursor = page_info.get("endCursor")
+        if has_next and (not isinstance(cursor, str) or not cursor):
+            raise RuntimeError(
+                f"[graphql] {owner}/{name}#{number}: review thread "
+                f"{thread_id} hasNextPage without an endCursor"
+            )
+        return has_next, cursor
+
+    has_next, cursor = consume(first_connection)
+    while has_next:
+        payload = _request_graphql_page(
+            pool,
+            {"threadId": thread_id, "cursor": cursor},
+            context=f"{owner}/{name}#{number} review-thread {thread_id}",
+            max_retries=max_retries,
+            post_fn=post_fn,
+        )
+        node = (payload.get("data") or {}).get("node")
+        if not isinstance(node, dict) or node.get("id") != thread_id:
+            raise RuntimeError(
+                f"[graphql] {owner}/{name}#{number}: review thread "
+                f"{thread_id} disappeared or changed identity during pagination"
+            )
+        has_next, cursor = consume(node.get("comments") or {})
+
+    if len(comments) != expected_total:
+        raise RuntimeError(
+            f"[graphql] {owner}/{name}#{number}: review thread {thread_id} "
+            f"comment pagination incomplete ({len(comments)}/{expected_total})"
+        )
+    return comments
+
+
+def fetch_pr(pool: TokenPool, owner: str, name: str, number: int,
+             max_retries: int = 8,
+             post_fn: Callable[[str, dict], tuple[int, dict, dict]] = _post,
+             thread_post_fn: Callable[
+                 [str, dict], tuple[int, dict, dict]
+             ] = _post_thread_comments) -> dict:
+    """Fetch one PR, paginating connections. RAISE on auth/quota exhaustion."""
+    comments: list[dict] = []
+    reviews: list[dict] = []
+    linked: list[dict] = []
+    title = body = ""
+    merge_sha = None
+
+    c_comments = c_reviews = c_threads = c_linked = None
+    comments_active = reviews_active = threads_active = linked_active = True
+    seen_first_page = False
+    expected_comments = expected_reviews = expected_threads = None
+    expected_linked = None
+    seen_thread_ids: set[str] = set()
+
+    while True:
+        variables = {
+            "owner": owner, "name": name, "number": number,
+            "cComments": c_comments, "cReviews": c_reviews, "cThreads": c_threads,
+            "cLinked": c_linked,
+        }
+        jb = _request_graphql_page(
+            pool,
+            variables,
+            context=f"{owner}/{name}#{number}",
+            max_retries=max_retries,
+            post_fn=post_fn,
+        )
 
         pr = (jb.get("data") or {}).get("repository", {})
         pr = (pr or {}).get("pullRequest")
@@ -219,55 +383,147 @@ def fetch_pr(pool: TokenPool, owner: str, name: str, number: int,
             body = pr.get("body") or ""
             mc = pr.get("mergeCommit")
             merge_sha = mc.get("oid") if mc else None
-            for li in (pr.get("closingIssuesReferences") or {}).get("nodes", []):
-                linked.append({"number": li["number"], "title": li.get("title", ""),
-                               "body": li.get("body", "")})
             seen_first_page = True
 
-        cn = pr.get("comments") or {}
-        for n in cn.get("nodes", []):
-            comments.append({
-                "user": (n.get("author") or {}).get("login", ""),
-                "body": n.get("body", ""), "created_at": n.get("createdAt", ""),
-                "kind": "comment",
-            })
-        rv = pr.get("reviews") or {}
-        for n in rv.get("nodes", []):
-            reviews.append({
-                "user": (n.get("author") or {}).get("login", ""),
-                "state": n.get("state", ""), "body": n.get("body", ""),
-                "created_at": n.get("submittedAt", ""),
-            })
-        rt = pr.get("reviewThreads") or {}
-        for thread in rt.get("nodes", []):
-            for n in (thread.get("comments") or {}).get("nodes", []):
+        more = False
+        if comments_active:
+            cn = pr.get("comments") or {}
+            page_expected_comments = int(cn.get("totalCount") or 0)
+            if expected_comments is None:
+                expected_comments = page_expected_comments
+            elif expected_comments != page_expected_comments:
+                raise RuntimeError(
+                    f"[graphql] {owner}/{name}#{number}: comment totalCount changed "
+                    f"during pagination ({expected_comments}->{page_expected_comments})"
+                )
+            for n in cn.get("nodes", []):
                 comments.append({
                     "user": (n.get("author") or {}).get("login", ""),
-                    "body": n.get("body", ""), "path": n.get("path"),
-                    "created_at": n.get("createdAt", ""), "kind": "review_comment",
+                    "body": n.get("body", ""), "created_at": n.get("createdAt", ""),
+                    "kind": "comment",
                 })
+            cpi = cn.get("pageInfo") or {}
+            comments_active = bool(cpi.get("hasNextPage"))
+            if comments_active:
+                c_comments = cpi.get("endCursor")
+                more = True
 
-        # Advance any connection that still has pages.
-        more = False
-        cpi = cn.get("pageInfo") or {}
-        if cpi.get("hasNextPage"):
-            c_comments = cpi.get("endCursor")
-            more = True
-        rpi = rv.get("pageInfo") or {}
-        if rpi.get("hasNextPage"):
-            c_reviews = rpi.get("endCursor")
-            more = True
-        tpi = rt.get("pageInfo") or {}
-        if tpi.get("hasNextPage"):
-            c_threads = tpi.get("endCursor")
-            more = True
+        if reviews_active:
+            rv = pr.get("reviews") or {}
+            page_expected_reviews = int(rv.get("totalCount") or 0)
+            if expected_reviews is None:
+                expected_reviews = page_expected_reviews
+            elif expected_reviews != page_expected_reviews:
+                raise RuntimeError(
+                    f"[graphql] {owner}/{name}#{number}: review totalCount changed "
+                    f"during pagination ({expected_reviews}->{page_expected_reviews})"
+                )
+            for n in rv.get("nodes", []):
+                reviews.append({
+                    "user": (n.get("author") or {}).get("login", ""),
+                    "state": n.get("state", ""), "body": n.get("body", ""),
+                    "created_at": n.get("submittedAt", ""),
+                })
+            rpi = rv.get("pageInfo") or {}
+            reviews_active = bool(rpi.get("hasNextPage"))
+            if reviews_active:
+                c_reviews = rpi.get("endCursor")
+                more = True
+
+        if threads_active:
+            rt = pr.get("reviewThreads") or {}
+            page_expected_threads = int(rt.get("totalCount") or 0)
+            if expected_threads is None:
+                expected_threads = page_expected_threads
+            elif expected_threads != page_expected_threads:
+                raise RuntimeError(
+                    f"[graphql] {owner}/{name}#{number}: review-thread totalCount "
+                    f"changed during pagination "
+                    f"({expected_threads}->{page_expected_threads})"
+                )
+            for thread in rt.get("nodes", []):
+                thread_id = thread.get("id")
+                if not isinstance(thread_id, str) or not thread_id:
+                    raise RuntimeError(
+                        f"[graphql] {owner}/{name}#{number}: review thread lacks id"
+                    )
+                if thread_id in seen_thread_ids:
+                    raise RuntimeError(
+                        f"[graphql] {owner}/{name}#{number}: duplicate review "
+                        f"thread during pagination: {thread_id}"
+                    )
+                seen_thread_ids.add(thread_id)
+                thread_comments = thread.get("comments") or {}
+                comments.extend(
+                    _fetch_complete_thread_comments(
+                        pool,
+                        owner=owner,
+                        name=name,
+                        number=number,
+                        thread_id=thread_id,
+                        first_connection=thread_comments,
+                        max_retries=max_retries,
+                        post_fn=thread_post_fn,
+                    )
+                )
+            tpi = rt.get("pageInfo") or {}
+            threads_active = bool(tpi.get("hasNextPage"))
+            if threads_active:
+                c_threads = tpi.get("endCursor")
+                more = True
+
+        if linked_active:
+            li_connection = pr.get("closingIssuesReferences") or {}
+            page_expected_linked = int(li_connection.get("totalCount") or 0)
+            if expected_linked is None:
+                expected_linked = page_expected_linked
+            elif expected_linked != page_expected_linked:
+                raise RuntimeError(
+                    f"[graphql] {owner}/{name}#{number}: linked-issue totalCount "
+                    f"changed during pagination ({expected_linked}->"
+                    f"{page_expected_linked})"
+                )
+            for li in li_connection.get("nodes", []):
+                linked.append({
+                    "number": li["number"],
+                    "title": li.get("title", ""),
+                    "body": li.get("body", ""),
+                })
+            lpi = li_connection.get("pageInfo") or {}
+            linked_active = bool(lpi.get("hasNextPage"))
+            if linked_active:
+                c_linked = lpi.get("endCursor")
+                more = True
+
         if not more:
             break
-        attempts = 0  # reset retry budget on a successful page
 
     # Comments arrived across two connections; order by created_at.
     comments.sort(key=lambda c: c.get("created_at") or "")
     reviews.sort(key=lambda r: r.get("created_at") or "")
+    plain_comment_count = sum(
+        1 for comment in comments if comment.get("kind") == "comment"
+    )
+    if plain_comment_count != int(expected_comments or 0):
+        raise RuntimeError(
+            f"[graphql] {owner}/{name}#{number}: comment pagination incomplete "
+            f"({plain_comment_count}/{expected_comments})"
+        )
+    if len(reviews) != int(expected_reviews or 0):
+        raise RuntimeError(
+            f"[graphql] {owner}/{name}#{number}: review pagination incomplete "
+            f"({len(reviews)}/{expected_reviews})"
+        )
+    if len(seen_thread_ids) != int(expected_threads or 0):
+        raise RuntimeError(
+            f"[graphql] {owner}/{name}#{number}: review-thread pagination incomplete "
+            f"({len(seen_thread_ids)}/{expected_threads})"
+        )
+    if len(linked) != int(expected_linked or 0):
+        raise RuntimeError(
+            f"[graphql] {owner}/{name}#{number}: linked-issue projection incomplete "
+            f"({len(linked)}/{expected_linked})"
+        )
     return {
         "repo": f"{owner}/{name}", "pr_number": number,
         "merge_commit_sha": merge_sha, "pr_title": title, "pr_body": body,
@@ -455,12 +711,269 @@ def fetch_one(store: pr_store.PRStore, rotator: TokenRotator, owner: str, name: 
 
 
 
-def main() -> None:
+def _canonical_target_set_sha256(
+    targets: list[tuple[str, int]] | tuple[tuple[str, int], ...],
+) -> str:
+    normalized = [
+        {"repo": repo, "pr_number": number}
+        for repo, number in sorted(
+            {(str(repo), int(number)) for repo, number in targets}
+        )
+    ]
+    payload = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def build_gap_completion_receipt(
+    *,
+    targets: tuple[tuple[str, int], ...],
+    completed: tuple[tuple[str, int], ...],
+    completed_record_sha256s: dict[tuple[str, int], str],
+    misses: tuple[tuple[str, int], ...],
+    skipped: tuple[tuple[str, int], ...],
+) -> dict:
+    target_set = set(targets)
+    completed_set = set(completed)
+    miss_set = set(misses)
+    skipped_set = set(skipped)
+    unresolved = target_set - completed_set
+    hashes_complete = (
+        set(completed_record_sha256s) == completed_set
+        and all(
+            isinstance(value, str)
+            and len(value) == 64
+            and all(char in "0123456789abcdef" for char in value)
+            for value in completed_record_sha256s.values()
+        )
+    )
+    status = (
+        "verified"
+        if completed_set == target_set
+        and not miss_set
+        and not skipped_set
+        and hashes_complete
+        else "incomplete"
+    )
+    return {
+        "schema": "cppmega_pr_gap_completion_v1",
+        "status": status,
+        "targets_sha256": _canonical_target_set_sha256(tuple(target_set)),
+        "target_count": len(target_set),
+        "completed_count": len(completed_set),
+        "miss_count": len(miss_set),
+        "skipped_count": len(skipped_set),
+        "unresolved_count": len(unresolved),
+        "completed": [
+            {
+                "repo": repo,
+                "pr_number": number,
+                "record_sha256": completed_record_sha256s.get((repo, number)),
+            }
+            for repo, number in sorted(completed_set)
+        ],
+        "misses": [
+            {"repo": repo, "pr_number": number}
+            for repo, number in sorted(miss_set)
+        ],
+        "skipped": [
+            {"repo": repo, "pr_number": number}
+            for repo, number in sorted(skipped_set)
+        ],
+    }
+
+
+def _atomic_write_json(path: str, payload: dict) -> None:
+    destination = os.path.abspath(path)
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    tmp = f"{destination}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, destination)
+    directory_fd = os.open(os.path.dirname(destination), os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _atomic_write_misses(
+    path: str,
+    misses: list[tuple[str, int]] | tuple[tuple[str, int], ...],
+) -> None:
+    destination = os.path.abspath(path)
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    tmp = f"{destination}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        for repo, number in sorted(set(misses)):
+            handle.write(
+                json.dumps(
+                    {"repo": repo, "pr_number": number},
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, destination)
+    directory_fd = os.open(os.path.dirname(destination), os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def load_gap_resume_state(
+    *,
+    completion_receipt: str,
+    targets: tuple[tuple[str, int], ...],
+    conn: Any,
+) -> tuple[list[tuple[str, int]], dict[tuple[str, int], str]]:
+    """Load only receipt-proven completed targets from a prior interrupted run.
+
+    A row's mere presence in ``prs.sqlite`` is not completion evidence.  The
+    prior receipt must bind the exact target set and each completed row's
+    canonical content hash must still match the store.
+    """
+
+    if not os.path.exists(completion_receipt):
+        return [], {}
+    try:
+        with open(completion_receipt, encoding="utf-8") as handle:
+            receipt = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"[graphql] cannot resume from completion receipt "
+            f"{completion_receipt}: {exc}"
+        ) from exc
+    if not isinstance(receipt, dict):
+        raise RuntimeError(
+            f"[graphql] completion receipt must be an object: "
+            f"{completion_receipt}"
+        )
+    if receipt.get("schema") != "cppmega_pr_gap_completion_v1":
+        raise RuntimeError(
+            f"[graphql] cannot resume unsupported completion receipt schema: "
+            f"{receipt.get('schema')!r}"
+        )
+
+    target_set = set(targets)
+    expected_target_hash = _canonical_target_set_sha256(targets)
+    if (
+        receipt.get("targets_sha256") != expected_target_hash
+        or receipt.get("target_count") != len(target_set)
+    ):
+        raise RuntimeError(
+            "[graphql] existing completion receipt is bound to a different "
+            "target set; archive it before starting this gap-fill"
+        )
+
+    completed_raw = receipt.get("completed")
+    if not isinstance(completed_raw, list):
+        raise RuntimeError(
+            "[graphql] existing completion receipt lacks a completed list"
+        )
+    completed: list[tuple[str, int]] = []
+    completed_hashes: dict[tuple[str, int], str] = {}
+    for index, item in enumerate(completed_raw):
+        if not isinstance(item, dict):
+            raise RuntimeError(
+                f"[graphql] completion receipt completed[{index}] is not an object"
+            )
+        repo = item.get("repo")
+        number = item.get("pr_number")
+        record_sha256 = item.get("record_sha256")
+        target = (repo, number)
+        if (
+            not isinstance(repo, str)
+            or not isinstance(number, int)
+            or isinstance(number, bool)
+            or target not in target_set
+        ):
+            raise RuntimeError(
+                f"[graphql] completion receipt completed[{index}] is not in "
+                f"the bound target set: {target!r}"
+            )
+        if target in completed_hashes:
+            raise RuntimeError(
+                f"[graphql] duplicate completed target in receipt: "
+                f"{repo}#{number}"
+            )
+        if (
+            not isinstance(record_sha256, str)
+            or len(record_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in record_sha256)
+        ):
+            raise RuntimeError(
+                f"[graphql] invalid record hash for resumed target "
+                f"{repo}#{number}"
+            )
+        stored = pr_store.get_by_pr(conn, repo, number)
+        if stored is None:
+            raise RuntimeError(
+                f"[graphql] receipt-proven target disappeared from store: "
+                f"{repo}#{number}"
+            )
+        actual_sha256 = pr_store.record_content_sha256(stored)
+        if actual_sha256 != record_sha256:
+            raise RuntimeError(
+                f"[graphql] receipt/store content hash mismatch for "
+                f"{repo}#{number}; refusing to silently trust or overwrite "
+                "corrupted resume state"
+            )
+        completed.append(target)
+        completed_hashes[target] = record_sha256
+    if receipt.get("completed_count") != len(completed):
+        raise RuntimeError(
+            "[graphql] completion receipt completed_count does not match its "
+            "completed list"
+        )
+    return completed, completed_hashes
+
+
+def _persist_gap_progress(
+    *,
+    completion_receipt: str,
+    misses_path: str,
+    targets: tuple[tuple[str, int], ...],
+    completed: list[tuple[str, int]],
+    completed_record_sha256s: dict[tuple[str, int], str],
+    misses: list[tuple[str, int]],
+    skipped: list[tuple[str, int]],
+) -> dict:
+    receipt = build_gap_completion_receipt(
+        targets=targets,
+        completed=tuple(completed),
+        completed_record_sha256s=completed_record_sha256s,
+        misses=tuple(misses),
+        skipped=tuple(skipped),
+    )
+    # The misses file is diagnostic; publish it before the authoritative
+    # receipt so a crash can never expose a newer receipt with older misses.
+    _atomic_write_misses(misses_path, misses)
+    _atomic_write_json(completion_receipt, receipt)
+    return receipt
+
+
+def main() -> int:
     ap = argparse.ArgumentParser(description="GitHub GraphQL PR gap-filler.")
     ap.add_argument("--store", required=True)
     ap.add_argument("--tokens", required=True, help="File of GitHub PATs, one/line.")
     ap.add_argument("--targets", required=True, help="JSONL of {repo,pr_number}.")
     ap.add_argument("--misses", required=True, help="JSONL output for PR misses.")
+    ap.add_argument(
+        "--completion-receipt",
+        required=True,
+        help="Atomic cppmega_pr_gap_completion_v1 receipt. The command exits "
+             "non-zero unless every target was fetched completely.",
+    )
     ap.add_argument("--skip-present", action="store_true",
                     help="Skip targets already in the store.")
     args = ap.parse_args()
@@ -468,35 +981,119 @@ def main() -> None:
     pool = TokenPool(load_tokens(args.tokens))
     conn = pr_store.connect(args.store, create=True)
 
-    n_fetched = n_miss = n_skip = 0
-    with open(args.targets) as tf, open(args.misses, "w") as mf:
-        for line in tf:
-            line = line.strip()
+    targets: list[tuple[str, int]] = []
+    with open(args.targets, encoding="utf-8") as tf:
+        for line_number, raw_line in enumerate(tf, start=1):
+            line = raw_line.strip()
             if not line:
                 continue
-            tgt = json.loads(line)
-            repo = tgt["repo"]
-            number = int(tgt["pr_number"])
+            target = json.loads(line)
+            if not isinstance(target, dict):
+                raise ValueError(
+                    f"{args.targets}:{line_number}: target must be an object"
+                )
+            repo = target.get("repo")
+            number = target.get("pr_number")
+            if not isinstance(repo, str) or "/" not in repo:
+                raise ValueError(
+                    f"{args.targets}:{line_number}: invalid repo {repo!r}"
+                )
+            if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+                raise ValueError(
+                    f"{args.targets}:{line_number}: invalid pr_number {number!r}"
+                )
+            targets.append((repo, number))
+    if len(set(targets)) != len(targets):
+        raise ValueError(f"{args.targets}: duplicate PR gap targets are forbidden")
+
+    target_tuple = tuple(targets)
+    completed, completed_record_sha256s = load_gap_resume_state(
+        completion_receipt=args.completion_receipt,
+        targets=target_tuple,
+        conn=conn,
+    )
+    resumed = len(completed)
+    completed_set = set(completed)
+    misses: list[tuple[str, int]] = []
+    skipped: list[tuple[str, int]] = []
+    receipt = _persist_gap_progress(
+        completion_receipt=args.completion_receipt,
+        misses_path=args.misses,
+        targets=target_tuple,
+        completed=completed,
+        completed_record_sha256s=completed_record_sha256s,
+        misses=misses,
+        skipped=skipped,
+    )
+    try:
+        for repo, number in targets:
+            target = (repo, number)
+            if target in completed_set:
+                continue
             owner, name = repo.split("/", 1)
 
             if args.skip_present and pr_store.get_by_pr(conn, repo, number):
-                n_skip += 1
+                skipped.append(target)
+                receipt = _persist_gap_progress(
+                    completion_receipt=args.completion_receipt,
+                    misses_path=args.misses,
+                    targets=target_tuple,
+                    completed=completed,
+                    completed_record_sha256s=completed_record_sha256s,
+                    misses=misses,
+                    skipped=skipped,
+                )
                 continue
 
             rec = fetch_pr(pool, owner, name, number)
             if rec.get("__miss__"):
-                mf.write(json.dumps({"repo": repo, "pr_number": number}) + "\n")
-                n_miss += 1
+                misses.append(target)
+                receipt = _persist_gap_progress(
+                    completion_receipt=args.completion_receipt,
+                    misses_path=args.misses,
+                    targets=target_tuple,
+                    completed=completed,
+                    completed_record_sha256s=completed_record_sha256s,
+                    misses=misses,
+                    skipped=skipped,
+                )
                 continue
-            pr_store.upsert_record(conn, rec)
-            n_fetched += 1
-
+            expected_record_sha256 = pr_store.record_content_sha256(rec)
+            pr_store.upsert_record(conn, rec, replace_children=True)
+            stored = pr_store.get_by_pr(conn, repo, number)
+            if stored is None:
+                raise RuntimeError(
+                    f"[graphql] {repo}#{number}: record disappeared after upsert"
+                )
+            stored_record_sha256 = pr_store.record_content_sha256(stored)
+            if stored_record_sha256 != expected_record_sha256:
+                raise RuntimeError(
+                    f"[graphql] {repo}#{number}: PR store cannot losslessly "
+                    "represent the complete GraphQL record"
+                )
+            completed.append(target)
+            completed_set.add(target)
+            completed_record_sha256s[target] = expected_record_sha256
+            receipt = _persist_gap_progress(
+                completion_receipt=args.completion_receipt,
+                misses_path=args.misses,
+                targets=target_tuple,
+                completed=completed,
+                completed_record_sha256s=completed_record_sha256s,
+                misses=misses,
+                skipped=skipped,
+            )
+    finally:
+        conn.close()
     print(
-        f"[graphql] fetched={n_fetched} miss={n_miss} skipped={n_skip} "
-        f"misses->{args.misses}",
+        f"[graphql] fetched={len(completed) - resumed} resumed={resumed} "
+        f"completed={len(completed)} miss={len(misses)} "
+        f"skipped={len(skipped)} misses->{args.misses} "
+        f"completion->{args.completion_receipt} status={receipt['status']}",
         file=sys.stderr,
     )
+    return 0 if receipt["status"] == "verified" else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

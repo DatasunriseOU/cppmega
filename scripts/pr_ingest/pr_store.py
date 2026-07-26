@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -111,25 +112,34 @@ def _ensure_pr_columns(conn: sqlite3.Connection) -> None:
         str(row["name"])
         for row in conn.execute("PRAGMA table_info(prs)")
     }
+    added: set[str] = set()
     for name, definition in _PR_COLUMN_DEFINITIONS.items():
         if name not in columns:
             conn.execute(f"ALTER TABLE prs ADD COLUMN {name} {definition}")
-    conn.execute(
-        "UPDATE prs SET title=pr_title "
-        "WHERE (title IS NULL OR title='') AND pr_title IS NOT NULL"
-    )
-    conn.execute(
-        "UPDATE prs SET body=pr_body "
-        "WHERE (body IS NULL OR body='') AND pr_body IS NOT NULL"
-    )
-    conn.execute(
-        "UPDATE prs SET pr_title=title "
-        "WHERE (pr_title IS NULL OR pr_title='') AND title IS NOT NULL"
-    )
-    conn.execute(
-        "UPDATE prs SET pr_body=body "
-        "WHERE (pr_body IS NULL OR pr_body='') AND body IS NOT NULL"
-    )
+            added.add(name)
+
+    # These aliases only need backfilling when one side was introduced by this
+    # migration. Running four whole-table UPDATEs on every connection turned a
+    # resumable multi-gigabyte PR scan into a long writer transaction and made
+    # concurrent workers fail with ``database is locked``.
+    if {"title", "pr_title"} & added:
+        conn.execute(
+            "UPDATE prs SET title=pr_title "
+            "WHERE (title IS NULL OR title='') AND pr_title IS NOT NULL"
+        )
+        conn.execute(
+            "UPDATE prs SET pr_title=title "
+            "WHERE (pr_title IS NULL OR pr_title='') AND title IS NOT NULL"
+        )
+    if {"body", "pr_body"} & added:
+        conn.execute(
+            "UPDATE prs SET body=pr_body "
+            "WHERE (body IS NULL OR body='') AND pr_body IS NOT NULL"
+        )
+        conn.execute(
+            "UPDATE prs SET pr_body=body "
+            "WHERE (pr_body IS NULL OR pr_body='') AND body IS NOT NULL"
+        )
 
 
 def connect(
@@ -137,11 +147,20 @@ def connect(
     create: bool = True,
     *,
     readonly: bool = False,
+    initialize: bool = True,
 ) -> sqlite3.Connection:
-    """Open the PR store, creating or compatibly migrating it when writable."""
+    """Open the PR store, optionally creating or compatibly migrating it.
+
+    ``initialize=False`` is the worker-connection path after one parent
+    connection has already initialized the schema. It deliberately performs no
+    DDL or compatibility UPDATEs, so concurrent stream workers do not contend
+    on an otherwise-idempotent migration transaction.
+    """
 
     if readonly and create:
         raise ValueError("readonly PR store connections cannot create a database")
+    if create and not initialize:
+        raise ValueError("non-initializing PR store connections cannot create a database")
     if not create and not os.path.exists(store_path):
         raise SystemExit(f"[pr_store] store does not exist: {store_path}")
     if create:
@@ -155,6 +174,17 @@ def connect(
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=60000")
     if readonly:
+        return conn
+
+    if not initialize:
+        journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        if journal_mode != "wal":
+            conn.close()
+            raise RuntimeError(
+                "non-initializing PR store connection requires a parent-initialized "
+                f"WAL database, got journal_mode={journal_mode!r}"
+            )
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     conn.execute("PRAGMA journal_mode=WAL")
@@ -215,6 +245,47 @@ def _normalize_review(review: dict[str, Any]) -> dict[str, Any]:
         "body": str(review.get("body") or ""),
         "created_at": str(review.get("created_at") or ""),
     }
+
+
+def record_content_sha256(rec: dict[str, Any]) -> str:
+    """Hash the authoritative PR fields populated by the GraphQL gap filler."""
+
+    comments = [_normalize_comment(dict(item)) for item in rec.get("comments", [])]
+    reviews = [_normalize_review(dict(item)) for item in rec.get("reviews", [])]
+    linked_issues = [
+        {
+            "number": int(item["number"]),
+            "title": str(item.get("title") or ""),
+            "body": str(item.get("body") or ""),
+        }
+        for item in rec.get("linked_issues", [])
+    ]
+
+    def canonical_item(item: dict[str, Any]) -> str:
+        return json.dumps(
+            item,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    payload = {
+        "repo": str(rec["repo"]),
+        "pr_number": int(rec["pr_number"]),
+        "merge_commit_sha": rec.get("merge_commit_sha"),
+        "pr_title": str(rec.get("pr_title", rec.get("title")) or ""),
+        "pr_body": str(rec.get("pr_body", rec.get("body")) or ""),
+        "comments": sorted(comments, key=canonical_item),
+        "reviews": sorted(reviews, key=canonical_item),
+        "linked_issues": sorted(linked_issues, key=canonical_item),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _upsert_pr_meta(
@@ -571,11 +642,18 @@ def upsert_record(
     rec: dict[str, Any],
     *,
     commit: bool = True,
+    replace_children: bool = False,
 ) -> None:
     """Insert an assembled production record while retaining root metadata."""
 
     repo = rec["repo"]
     pr_number = int(rec["pr_number"])
+    if replace_children:
+        for table in ("comments", "reviews", "linked_issues"):
+            conn.execute(
+                f"DELETE FROM {table} WHERE repo=? AND pr_number=?",
+                (repo, pr_number),
+            )
     _upsert_pr_meta(
         conn,
         repo,
