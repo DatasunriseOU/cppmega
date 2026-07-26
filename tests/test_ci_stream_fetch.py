@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import io
 import json
 from pathlib import Path
@@ -159,6 +160,112 @@ def _zip_bytes(
         for name, value in (members or {"0_build.txt": b"hello build world\n"}).items():
             archive.writestr(name, value)
     return output.getvalue()
+
+
+class _IncompleteArchiveResponse:
+    status = 200
+    headers: dict[str, str] = {}
+
+    def __init__(self) -> None:
+        self._reads = 0
+
+    def read(self, _size: int) -> bytes:
+        self._reads += 1
+        if self._reads == 1:
+            return b"partial archive bytes"
+        raise http.client.IncompleteRead(b"truncated", 100)
+
+
+def test_incomplete_chunked_archive_response_is_retryable(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "archive.zip.partial"
+    with pytest.raises(
+        ci.ArchiveError,
+        match="transport failed before EOF: IncompleteRead",
+    ):
+        ci._stream_signed_archive_response(
+            _IncompleteArchiveResponse(),
+            destination,
+            max_bytes=1024,
+        )
+    assert destination.read_bytes() == b"partial archive bytes"
+
+
+def test_fetch_state_script_binding_upgrade_is_explicit_and_audited(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path / "inventory.sqlite", 1)
+    tokenizer = ci.ExactTokenizer(_tokenizer(tmp_path / "tokenizer.json"))
+    state_path = tmp_path / "state.sqlite"
+    store_path = tmp_path / "store"
+    state = ci.FetchState(
+        state_path,
+        inventory_path=inventory,
+        content_store_path=store_path,
+        tokenizer=tokenizer,
+        resume=False,
+    )
+    state.close()
+
+    previous_sha256 = "a" * 64
+    with sqlite3.connect(state_path) as connection:
+        connection.execute(
+            """
+            UPDATE settings SET value=?
+            WHERE key='fetcher_script_sha256'
+            """,
+            (previous_sha256,),
+        )
+
+    with pytest.raises(ci.BindingError, match="fetcher_script_sha256"):
+        ci.FetchState(
+            state_path,
+            inventory_path=inventory,
+            content_store_path=store_path,
+            tokenizer=tokenizer,
+            resume=True,
+        )
+    with pytest.raises(ci.BindingError, match="fetcher_script_sha256"):
+        ci.FetchState(
+            state_path,
+            inventory_path=inventory,
+            content_store_path=store_path,
+            tokenizer=tokenizer,
+            resume=True,
+            allow_fetcher_script_upgrade_from_sha256="b" * 64,
+        )
+
+    upgraded = ci.FetchState(
+        state_path,
+        inventory_path=inventory,
+        content_store_path=store_path,
+        tokenizer=tokenizer,
+        resume=True,
+        allow_fetcher_script_upgrade_from_sha256=previous_sha256,
+    )
+    try:
+        assert upgraded._connection.execute(
+            """
+            SELECT value FROM settings
+            WHERE key='fetcher_script_sha256'
+            """
+        ).fetchone()[0] == ci._script_sha256()
+        assert upgraded.summary()["binding_upgrades"] == [
+            {
+                "binding_key": "fetcher_script_sha256",
+                "from_sha256": previous_sha256,
+                "to_sha256": ci._script_sha256(),
+                "reason": (
+                    "signed archive incomplete transport is retryable"
+                ),
+                "upgraded_at": upgraded._connection.execute(
+                    "SELECT upgraded_at FROM binding_upgrades"
+                ).fetchone()[0],
+            }
+        ]
+    finally:
+        upgraded.close()
 
 
 def _fake_parser(

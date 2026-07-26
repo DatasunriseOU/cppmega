@@ -24,6 +24,7 @@ from concurrent.futures import (
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import http.client
 import json
 import math
 import multiprocessing
@@ -456,46 +457,83 @@ def _default_archive_downloader(
         headers={"User-Agent": "cppmega-ci-stream-fetch/1"},
         method="GET",
     )
-    digest = hashlib.sha256()
-    total = 0
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            status_code = int(response.status)
-            if status_code != 200:
-                raise APIError(
-                    f"signed archive URL returned HTTP {status_code}"
-                )
-            content_length = response.headers.get("Content-Length")
-            if content_length is not None:
-                try:
-                    declared = int(content_length)
-                except ValueError as exc:
-                    raise MalformedResponseError(
-                        "signed archive Content-Length is not an integer"
-                    ) from exc
-                if declared < 0 or declared > max_bytes:
-                    raise ArchiveError(
-                        f"archive Content-Length {declared} exceeds limit "
-                        f"{max_bytes}"
-                    )
-            with destination.open("xb") as output:
-                while True:
-                    block = response.read(1024 * 1024)
-                    if not block:
-                        break
-                    total += len(block)
-                    if total > max_bytes:
-                        raise ArchiveError(
-                            f"archive exceeded byte limit {max_bytes}"
-                        )
-                    output.write(block)
-                    digest.update(block)
-                output.flush()
-                os.fsync(output.fileno())
+            return _stream_signed_archive_response(
+                response,
+                destination,
+                max_bytes=max_bytes,
+            )
     except urllib.error.HTTPError as exc:
         raise APIError(
             f"signed archive URL returned HTTP {exc.code}"
         ) from exc
+    except (
+        urllib.error.URLError,
+        http.client.HTTPException,
+        TimeoutError,
+        ConnectionError,
+    ) as exc:
+        raise ArchiveError(
+            "signed archive transport failed before a complete response: "
+            f"{type(exc).__name__}"
+        ) from exc
+
+
+def _stream_signed_archive_response(
+    response: Any,
+    destination: Path,
+    *,
+    max_bytes: int,
+) -> tuple[int, str]:
+    """Durably stream one complete signed-URL response into a bounded file."""
+
+    status_code = int(response.status)
+    if status_code != 200:
+        raise APIError(
+            f"signed archive URL returned HTTP {status_code}"
+        )
+    content_length = response.headers.get("Content-Length")
+    if content_length is not None:
+        try:
+            declared = int(content_length)
+        except ValueError as exc:
+            raise MalformedResponseError(
+                "signed archive Content-Length is not an integer"
+            ) from exc
+        if declared < 0 or declared > max_bytes:
+            raise ArchiveError(
+                f"archive Content-Length {declared} exceeds limit "
+                f"{max_bytes}"
+            )
+
+    digest = hashlib.sha256()
+    total = 0
+    with destination.open("xb") as output:
+        while True:
+            try:
+                block = response.read(1024 * 1024)
+            except (
+                urllib.error.URLError,
+                http.client.HTTPException,
+                TimeoutError,
+                ConnectionError,
+            ) as exc:
+                raise ArchiveError(
+                    "signed archive transport failed before EOF: "
+                    f"{type(exc).__name__}"
+                ) from exc
+            if not block:
+                break
+            total += len(block)
+            if total > max_bytes:
+                raise ArchiveError(
+                    f"archive exceeded byte limit {max_bytes}"
+                )
+            output.write(block)
+            digest.update(block)
+        output.flush()
+        os.fsync(output.fileno())
     if total == 0:
         raise ArchiveError("signed archive response was empty")
     return total, digest.hexdigest()
@@ -777,6 +815,17 @@ CREATE TABLE IF NOT EXISTS request_ledger (
     error_class TEXT,
     error_message TEXT
 );
+CREATE TABLE IF NOT EXISTS binding_upgrades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    binding_key TEXT NOT NULL CHECK (
+      binding_key = 'fetcher_script_sha256'
+    ),
+    from_sha256 TEXT NOT NULL CHECK (length(from_sha256) = 64),
+    to_sha256 TEXT NOT NULL CHECK (length(to_sha256) = 64),
+    reason TEXT NOT NULL,
+    upgraded_at TEXT NOT NULL,
+    UNIQUE(binding_key,from_sha256,to_sha256)
+);
 """
 
 
@@ -791,6 +840,7 @@ class FetchState:
         content_store_path: str | os.PathLike[str],
         tokenizer: ExactTokenizer,
         resume: bool,
+        allow_fetcher_script_upgrade_from_sha256: str | None = None,
     ):
         self.path = Path(path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -825,6 +875,22 @@ class FetchState:
                 "payload-only-no-framing-v2"
             ),
         }
+        if allow_fetcher_script_upgrade_from_sha256 is not None:
+            if not resume:
+                raise ValueError(
+                    "fetcher script binding upgrade requires resume=True"
+                )
+            if (
+                re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    allow_fetcher_script_upgrade_from_sha256,
+                )
+                is None
+            ):
+                raise ValueError(
+                    "fetcher script binding upgrade source must be a "
+                    "lowercase SHA-256"
+                )
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
             try:
@@ -838,10 +904,20 @@ class FetchState:
                         raise BindingError(
                             f"fetch state exists at {self.path}; pass --resume"
                         )
+                    script_upgrade = (
+                        current.get("fetcher_script_sha256")
+                        != expected["fetcher_script_sha256"]
+                        and current.get("fetcher_script_sha256")
+                        == allow_fetcher_script_upgrade_from_sha256
+                    )
                     mismatches = {
                         key: (current.get(key), value)
                         for key, value in expected.items()
                         if current.get(key) != value
+                        and not (
+                            key == "fetcher_script_sha256"
+                            and script_upgrade
+                        )
                     }
                     if mismatches:
                         rendered = ", ".join(
@@ -850,6 +926,39 @@ class FetchState:
                         )
                         raise BindingError(
                             f"fetch-state binding mismatch: {rendered}"
+                        )
+                    if script_upgrade:
+                        previous_script_sha256 = str(
+                            current["fetcher_script_sha256"]
+                        )
+                        next_script_sha256 = str(
+                            expected["fetcher_script_sha256"]
+                        )
+                        self._connection.execute(
+                            """
+                            INSERT INTO binding_upgrades(
+                              binding_key,from_sha256,to_sha256,
+                              reason,upgraded_at
+                            ) VALUES (
+                              'fetcher_script_sha256',?,?,?,?
+                            )
+                            """,
+                            (
+                                previous_script_sha256,
+                                next_script_sha256,
+                                (
+                                    "signed archive incomplete transport "
+                                    "is retryable"
+                                ),
+                                _utc_now(),
+                            ),
+                        )
+                        self._connection.execute(
+                            """
+                            UPDATE settings SET value=?
+                            WHERE key='fetcher_script_sha256'
+                            """,
+                            (next_script_sha256,),
                         )
                 else:
                     self._connection.executemany(
@@ -1527,6 +1636,23 @@ class FetchState:
                         f"{row['archive_member']}\t{row['sidecar_sha256']}\n"
                     ).encode("utf-8")
                 )
+            binding_upgrades = [
+                {
+                    "binding_key": str(row["binding_key"]),
+                    "from_sha256": str(row["from_sha256"]),
+                    "to_sha256": str(row["to_sha256"]),
+                    "reason": str(row["reason"]),
+                    "upgraded_at": str(row["upgraded_at"]),
+                }
+                for row in self._connection.execute(
+                    """
+                    SELECT binding_key,from_sha256,to_sha256,
+                           reason,upgraded_at
+                    FROM binding_upgrades
+                    ORDER BY id
+                    """
+                )
+            ]
             return {
                 "attempt_statuses": status_counts,
                 "attempts_terminal": int(totals["attempts"]),
@@ -1546,6 +1672,7 @@ class FetchState:
                     ),
                     "content_attempts_without_exact_metadata": 0,
                 },
+                "binding_upgrades": binding_upgrades,
             }
 
 
@@ -2151,6 +2278,7 @@ class CIStreamFetcher:
         rescue_path: str | os.PathLike[str] | None = None,
         work_path: str | os.PathLike[str] | None = None,
         resume: bool = False,
+        allow_fetcher_script_upgrade_from_sha256: str | None = None,
         target_unique_tokens: int = DEFAULT_TARGET,
         max_chunk_chars: int = DEFAULT_MAX_CHUNK_CHARS,
         max_archive_bytes: int = DEFAULT_MAX_ARCHIVE_BYTES,
@@ -2197,6 +2325,9 @@ class CIStreamFetcher:
             content_store_path=content_store_path,
             tokenizer=self.tokenizer,
             resume=resume,
+            allow_fetcher_script_upgrade_from_sha256=(
+                allow_fetcher_script_upgrade_from_sha256
+            ),
         )
         self.store = CIContentStore(content_store_path)
         self.client = GitHubAttemptClient(
@@ -2702,6 +2833,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rescue-dir")
     parser.add_argument("--work-dir")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--allow-fetcher-script-upgrade-from-sha256",
+        help=(
+            "explicitly authorize one resume migration from this exact "
+            "previous fetcher script SHA-256"
+        ),
+    )
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--max-runs", type=int)
     parser.add_argument("--workers", type=int, default=4)
@@ -2766,6 +2904,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             rescue_path=args.rescue_dir,
             work_path=args.work_dir,
             resume=args.resume,
+            allow_fetcher_script_upgrade_from_sha256=(
+                args.allow_fetcher_script_upgrade_from_sha256
+            ),
             target_unique_tokens=args.target_exact_unique_payload_tokens,
             max_chunk_chars=args.max_chunk_chars,
             max_archive_bytes=args.max_archive_bytes,
