@@ -159,7 +159,7 @@ class _ScriptedOpener:
         self,
         api_actions: Mapping[int, list[object]],
         *,
-        signed_bodies: Mapping[str, bytes] | None = None,
+        signed_bodies: Mapping[str, bytes | tuple[int, bytes]] | None = None,
     ):
         self._api_actions = {
             job_id: list(actions) for job_id, actions in api_actions.items()
@@ -221,7 +221,11 @@ class _ScriptedOpener:
         self.signed_calls.append(url)
         if url not in self._signed_bodies:
             raise AssertionError(f"unexpected signed URL {url}")
-        body = self._signed_bodies[url]
+        signed_result = self._signed_bodies[url]
+        if isinstance(signed_result, tuple):
+            status, body = signed_result
+            return _Response(status, body)
+        body = signed_result
         return _Response(
             200,
             body,
@@ -578,6 +582,42 @@ def test_safe_signed_redirect_streams_without_forwarding_authorization(
     assert result["failed_attempts"] == 0
     assert opener.signed_calls == [signed_url]
     assert b"signed-secret" not in _artifact_bytes(tmp_path / "rescue-work")
+    assert b"signed-secret" not in _artifact_bytes(tmp_path / "rescue-spool")
+
+
+def test_safe_signed_redirect_proven_404_is_terminal(
+    tmp_path: Path,
+) -> None:
+    state = _state(tmp_path / "fetch.sqlite", [_job(101, "expired")])
+    signed_url = (
+        "https://productionresultssa0.blob.core.windows.net/"
+        "actions-results/job.log?se=2026-07-26T10%3A00Z&sig=signed-secret"
+    )
+    opener = _ScriptedOpener(
+        {101: [_ScriptedOpener.redirect(signed_url)]},
+        signed_bodies={signed_url: (404, b"api-secret expired")},
+    )
+    worker = _worker(tmp_path, state, opener)
+    try:
+        result = worker.run_once(target=("owner/repo", 17, 1))
+    finally:
+        worker.close()
+
+    assert result["failed_attempts"] == 0
+    record = result["results"][0]["receipt"]
+    assert record["coverage"]["terminal_404"] == 1
+    assert record["coverage"]["unresolved_jobs"] == 0
+    resolved_path = (
+        tmp_path / "rescue-spool" / "owner__repo--17--attempt-1.resolved_jobs.jsonl"
+    )
+    [resolved] = [
+        json.loads(line)
+        for line in resolved_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert resolved["api_http_status"] == 302
+    assert resolved["signed_http_status"] == 404
+    assert resolved["terminal"]["http_status"] == 404
+    assert b"api-secret" not in _artifact_bytes(tmp_path / "rescue-work")
     assert b"signed-secret" not in _artifact_bytes(tmp_path / "rescue-spool")
 
 

@@ -1160,10 +1160,12 @@ class JobLogClient:
         source: SourceAttempt,
         job: JobEvidence,
         *,
-        status: int,
+        api_status: int,
+        signed_status: int | None,
         response: Any,
         request_attempts: int,
     ) -> dict[str, object]:
+        status = api_status if signed_status is None else signed_status
         captured, body_sha, truncated = _read_error_prefix(response)
         return {
             "schema": JOB_RECORD_SCHEMA,
@@ -1178,8 +1180,8 @@ class JobLogClient:
             "endpoint": job.endpoint,
             "member_name": None,
             "outcome": f"terminal_{status}",
-            "api_http_status": status,
-            "signed_http_status": None,
+            "api_http_status": api_status,
+            "signed_http_status": signed_status,
             "request_attempts": request_attempts,
             "log": None,
             "terminal": {
@@ -1257,7 +1259,8 @@ class JobLogClient:
                     record = self._record_terminal(
                         source,
                         job,
-                        status=api_status,
+                        api_status=api_status,
+                        signed_status=None,
                         response=api_response,
                         request_attempts=request_attempt,
                     )
@@ -1387,6 +1390,16 @@ class JobLogClient:
                             "terminal": None,
                         },
                     )
+                if signed_status in {404, 410}:
+                    record = self._record_terminal(
+                        source,
+                        job,
+                        api_status=302,
+                        signed_status=signed_status,
+                        response=signed_response,
+                        request_attempts=request_attempt,
+                    )
+                    return JobOutcome(job, record)
                 _read_error_prefix(signed_response)
                 if 300 <= signed_status < 400:
                     raise UnsafeRedirectError(
@@ -1660,8 +1673,16 @@ class JobLogRescueWorker:
                     "body_truncated",
                 }
                 or terminal.get("http_status") != expected_status
-                or record.get("api_http_status") != expected_status
-                or record.get("signed_http_status") is not None
+                or (
+                    (
+                        record.get("api_http_status"),
+                        record.get("signed_http_status"),
+                    )
+                    not in {
+                        (expected_status, None),
+                        (302, expected_status),
+                    }
+                )
                 or isinstance(terminal.get("body_prefix_bytes"), bool)
                 or not isinstance(terminal.get("body_prefix_bytes"), int)
                 or int(terminal["body_prefix_bytes"]) < 0
