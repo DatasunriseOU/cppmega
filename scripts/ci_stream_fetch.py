@@ -175,6 +175,80 @@ class RequestResult:
     body: bytes
 
 
+@dataclass(frozen=True)
+class RepositoryIdentity:
+    requested: str
+    canonical: str
+    repository_id: int | None
+    source: str
+    source_repository_id: int | None
+
+
+_REPOSITORY_FULL_NAME_RE = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/"
+    r"[A-Za-z0-9_.-]+"
+)
+
+
+def _repository_object_identity(
+    value: object,
+    *,
+    field: str,
+) -> tuple[str, int | None] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise MalformedResponseError(
+            f"run metadata {field} is not an object"
+        )
+    full_name = value.get("full_name")
+    if (
+        not isinstance(full_name, str)
+        or _REPOSITORY_FULL_NAME_RE.fullmatch(full_name) is None
+    ):
+        raise MalformedResponseError(
+            f"run metadata {field}.full_name is invalid"
+        )
+    raw_id = value.get("id")
+    if raw_id is None:
+        repository_id = None
+    elif (
+        isinstance(raw_id, bool)
+        or not isinstance(raw_id, int)
+        or raw_id <= 0
+    ):
+        raise MalformedResponseError(
+            f"run metadata {field}.id is invalid"
+        )
+    else:
+        repository_id = raw_id
+    return full_name, repository_id
+
+
+def _repository_identity(attempt: Attempt) -> RepositoryIdentity:
+    canonical = _repository_object_identity(
+        attempt.run_metadata.get("repository"),
+        field="repository",
+    )
+    source = _repository_object_identity(
+        attempt.run_metadata.get("head_repository"),
+        field="head_repository",
+    )
+    canonical_name, repository_id = (
+        (attempt.repo, None) if canonical is None else canonical
+    )
+    source_name, source_repository_id = (
+        (canonical_name, repository_id) if source is None else source
+    )
+    return RepositoryIdentity(
+        requested=attempt.repo,
+        canonical=canonical_name,
+        repository_id=repository_id,
+        source=source_name,
+        source_repository_id=source_repository_id,
+    )
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(
         value,
@@ -1343,8 +1417,9 @@ class GitHubAttemptClient:
         raise AssertionError("unreachable request loop")
 
     def fetch_jobs(self, attempt: Attempt) -> list[dict[str, Any]]:
+        repository = _repository_identity(attempt).canonical
         endpoint = (
-            f"/repos/{attempt.repo}/actions/runs/{attempt.run_id}/"
+            f"/repos/{repository}/actions/runs/{attempt.run_id}/"
             f"attempts/{attempt.attempt}/jobs"
         )
         jobs: list[dict[str, Any]] = []
@@ -1414,8 +1489,9 @@ class GitHubAttemptClient:
         return jobs
 
     def fetch_archive(self, attempt: Attempt, destination: Path) -> ArchiveSource:
+        repository = _repository_identity(attempt).canonical
         endpoint = (
-            f"/repos/{attempt.repo}/actions/runs/{attempt.run_id}/"
+            f"/repos/{repository}/actions/runs/{attempt.run_id}/"
             f"attempts/{attempt.attempt}/logs"
         )
         result = self._request(
@@ -1852,10 +1928,17 @@ class CIStreamFetcher:
             f"{job_id if isinstance(job_id, int) else 'unresolved'}:"
             f"{info.filename}"
         )
+        repository_identity = _repository_identity(attempt)
         metadata: dict[str, object] = dict(attempt.run_metadata)
         metadata.update(
             {
-                "repository": attempt.repo,
+                "repository": repository_identity.canonical,
+                "repository_requested": repository_identity.requested,
+                "repository_id": repository_identity.repository_id,
+                "source_repository": repository_identity.source,
+                "source_repository_id": (
+                    repository_identity.source_repository_id
+                ),
                 "run_id": attempt.run_id,
                 "run_attempt": attempt.attempt,
                 "job": job,
@@ -1928,8 +2011,15 @@ class CIStreamFetcher:
                 f"{chunk.get('step_ordinal') if chunk.get('step_ordinal') is not None else 'none'}"
             )
             provenance: dict[str, object] = {
-                "schema": "cppmega_ci_chunk_occurrence_v1",
-                "repository": attempt.repo,
+                "schema": "cppmega_ci_chunk_occurrence_v2",
+                "repository": repository_identity.canonical,
+                "repository_requested": repository_identity.requested,
+                "repository_id": repository_identity.repository_id,
+                "source_repository": repository_identity.source,
+                "source_repository_id": (
+                    repository_identity.source_repository_id
+                ),
+                "repository_scope_key": attempt.repo,
                 "run_id": attempt.run_id,
                 "run_attempt": attempt.attempt,
                 "run_metadata_sha256": attempt.run_metadata_sha256,

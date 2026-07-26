@@ -100,6 +100,10 @@ def test_cmake_ninja_gcc_cuda_success_sections_entities_and_edges() -> None:
     )
     metadata = {
         "repository": {"full_name": "owner/project"},
+        "repository_requested": "old-owner/project",
+        "repository_id": 101,
+        "source_repository": "contributor/project",
+        "source_repository_id": 202,
         "workflow": {"name": "CI", "path": ".github/workflows/ci.yml"},
         "run": {"id": 41, "attempt": 2},
         "event_name": "pull_request",
@@ -147,6 +151,14 @@ def test_cmake_ninja_gcc_cuda_success_sections_entities_and_edges() -> None:
     assert sidecar["canonicalization"]["accounting"][
         "character_count_conserved"
     ]
+    assert sidecar["provenance"]["repository"] == "owner/project"
+    assert sidecar["provenance"]["repository_requested"] == (
+        "old-owner/project"
+    )
+    assert sidecar["provenance"]["repository_alias_changed"] is True
+    assert sidecar["provenance"]["source_repository"] == (
+        "contributor/project"
+    )
 
     assert [section["kind"] for section in result["sections"]] == [
         "job_preamble",
@@ -174,6 +186,18 @@ def test_cmake_ninja_gcc_cuda_success_sections_entities_and_edges() -> None:
     assert ninja_action["target"] == "cuda_app"
     assert ninja_action["source_inputs"] == ["src/kernel.cu"]
     assert ninja_action["outputs"] == ["build/cuda_app"]
+    assert ninja_action["repository_source_bindings"] == [
+        {
+            "repository": "contributor/project",
+            "head_sha": "a" * 40,
+            "source_path": "src/kernel.cu",
+            "confidence": {
+                "score": 0.95,
+                "level": "high",
+                "source": "relative_source_path_v1",
+            },
+        }
+    ]
     training = next(
         chunk["training_sidecars"]
         for chunk in result["chunks"]

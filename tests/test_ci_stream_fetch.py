@@ -233,6 +233,7 @@ class FakeGitHub:
     def __init__(self, archive: bytes):
         self.archive = archive
         self.api_headers: list[dict[str, str]] = []
+        self.api_urls: list[str] = []
         self.signed_url: str | None = None
 
     def request(
@@ -245,6 +246,7 @@ class FakeGitHub:
         assert method == "GET"
         assert timeout > 0
         self.api_headers.append(dict(headers))
+        self.api_urls.append(url)
         if url.endswith("/jobs?filter=all&per_page=100&page=1"):
             body = {
                 "total_count": 1,
@@ -361,6 +363,70 @@ def test_full_attempt_streams_through_parser_tokenizer_and_cas_idempotently(
         assert resumed.store.status()["counters"]["occurrence_count"] == 1
     finally:
         resumed.close()
+
+
+def test_renamed_repository_uses_canonical_api_route_and_preserves_alias(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path / "inventory.sqlite", 1)
+    with sqlite3.connect(inventory) as connection:
+        row = connection.execute(
+            "SELECT metadata_blob FROM runs WHERE run_id=1"
+        ).fetchone()
+        metadata = json.loads(zlib.decompress(row[0]))
+        metadata["repository"] = {
+            "full_name": "new-owner/repo",
+            "id": 123,
+        }
+        metadata["head_repository"] = {
+            "full_name": "contributor/repo",
+            "id": 456,
+        }
+        raw = json.dumps(
+            metadata,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        connection.execute(
+            """
+            UPDATE runs
+            SET metadata_blob=?, metadata_sha256=?
+            WHERE run_id=1
+            """,
+            (zlib.compress(raw, 6), hashlib.sha256(raw).hexdigest()),
+        )
+
+    github = FakeGitHub(_zip_bytes())
+    fetcher = ci.CIStreamFetcher(
+        inventory_path=inventory,
+        state_path=tmp_path / "fetch.sqlite",
+        content_store_path=tmp_path / "store",
+        tokenizer_path=_tokenizer(tmp_path / "tokenizer.json"),
+        tokens=["api-secret"],
+        progress_path=tmp_path / "progress.json",
+        receipt_path=tmp_path / "receipt.json",
+        parser=_fake_parser,
+        requester=github.request,
+        archive_downloader=github.download,
+        target_unique_tokens=1_000_000,
+        sleeper=lambda _: None,
+    )
+    try:
+        fetcher.run(continuous=False, max_runs=1)
+        assert github.api_urls
+        assert all("/repos/new-owner/repo/" in url for url in github.api_urls)
+        occurrence = next(fetcher.store.iter_occurrences())
+        provenance = occurrence["provenance"]
+        assert provenance["schema"] == "cppmega_ci_chunk_occurrence_v2"
+        assert provenance["repository"] == "new-owner/repo"
+        assert provenance["repository_requested"] == "owner/repo"
+        assert provenance["repository_id"] == 123
+        assert provenance["source_repository"] == "contributor/repo"
+        assert provenance["source_repository_id"] == 456
+        assert provenance["repository_scope_key"] == "owner/repo"
+    finally:
+        fetcher.close()
 
 
 def test_rescue_terminal_410_is_proven_and_never_downloaded(tmp_path: Path) -> None:

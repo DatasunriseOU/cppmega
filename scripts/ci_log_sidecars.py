@@ -991,6 +991,19 @@ def _extract_provenance(
             "repo",
             "owner_repo",
         ),
+        "repository_requested": (
+            "repository_requested",
+            "requested_repository",
+        ),
+        "repository_id": ("repository.id", "repository_id"),
+        "source_repository": (
+            "source_repository",
+            "head_repository.full_name",
+        ),
+        "source_repository_id": (
+            "source_repository_id",
+            "head_repository.id",
+        ),
         "workflow": (
             "workflow.name",
             "workflow_name",
@@ -1088,6 +1101,20 @@ def _extract_provenance(
 
     provenance = {
         "repository": values["repository"],
+        "repository_requested": (
+            values["repository_requested"] or values["repository"]
+        ),
+        "repository_id": values["repository_id"],
+        "source_repository": (
+            values["source_repository"] or values["repository"]
+        ),
+        "source_repository_id": (
+            values["source_repository_id"] or values["repository_id"]
+        ),
+        "repository_alias_changed": (
+            values["repository_requested"] is not None
+            and values["repository_requested"] != values["repository"]
+        ),
         "workflow": {
             "name": values["workflow"],
             "id": values["workflow_id"],
@@ -2475,7 +2502,10 @@ def _repo_source_binding(
     path: str,
     provenance: Mapping[str, Any],
 ) -> dict[str, Any] | None:
-    repository = provenance.get("repository")
+    repository = (
+        provenance.get("source_repository")
+        or provenance.get("repository")
+    )
     run = provenance.get("run") or {}
     head_sha = run.get("head_sha") if isinstance(run, Mapping) else None
     if not isinstance(repository, str) or not repository:
