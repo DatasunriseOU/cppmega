@@ -2545,19 +2545,26 @@ def _action_flags(command: str) -> tuple[list[str], str]:
 def _repo_source_binding(
     path: str,
     provenance: Mapping[str, Any],
+    *,
+    cwd: str | None,
 ) -> dict[str, Any] | None:
-    repository = (
-        provenance.get("source_repository")
-        or provenance.get("repository")
-    )
     run = provenance.get("run") or {}
     head_sha = run.get("head_sha") if isinstance(run, Mapping) else None
+    event = run.get("event") if isinstance(run, Mapping) else None
+    canonical_repository = provenance.get("repository")
+    source_repository = provenance.get("source_repository")
+    repository = (
+        canonical_repository
+        if event in {"pull_request", "pull_request_target"}
+        else source_repository or canonical_repository
+    )
     if not isinstance(repository, str) or not repository:
         return None
     if not isinstance(head_sha, str) or not head_sha:
         return None
     repo_name = repository.rsplit("/", 1)[-1]
     normalized = path.replace("\\", "/")
+    normalized_cwd = cwd.replace("\\", "/") if isinstance(cwd, str) else None
     marker = f"/{repo_name}/"
     marker_index = normalized.rfind(marker)
     if marker_index >= 0:
@@ -2565,7 +2572,9 @@ def _repo_source_binding(
         score = 0.8
         method = "workspace_repo_basename_suffix_v1"
     elif not normalized.startswith("/"):
-        source_path = normalized.removeprefix("./")
+        source_path = _normalized_repo_relative_path(normalized, normalized_cwd)
+        if source_path is None:
+            return None
         score = 0.95
         method = "relative_source_path_v1"
     else:
@@ -2576,6 +2585,46 @@ def _repo_source_binding(
         "source_path": source_path,
         "confidence": _confidence(score, source=method),
     }
+
+
+def _normalized_repo_relative_path(
+    source_path: str,
+    cwd: str | None,
+) -> str | None:
+    cwd_suffix: list[str] = []
+    if cwd:
+        cwd_components = [part for part in cwd.split("/") if part]
+        folded = [part.casefold() for part in cwd_components]
+        if (
+            len(cwd_components) >= 5
+            and folded[:3] in (
+                ["home", "runner", "work"],
+                ["users", "runner", "work"],
+            )
+        ):
+            cwd_suffix = cwd_components[5:]
+        elif len(cwd_components) >= 3 and folded[0] == "__w":
+            cwd_suffix = cwd_components[3:]
+        elif (
+            len(cwd_components) >= 4
+            and re.fullmatch(r"[a-z]:", folded[0])
+            and folded[1] == "a"
+        ):
+            cwd_suffix = cwd_components[4:]
+
+    components = list(cwd_suffix)
+    for component in source_path.split("/"):
+        if component in {"", "."}:
+            continue
+        if component == "..":
+            if not components:
+                return None
+            components.pop()
+            continue
+        if "\0" in component:
+            return None
+        components.append(component)
+    return "/".join(components) or None
 
 
 def _extract_build_actions(
@@ -2715,7 +2764,14 @@ def _extract_build_actions(
         bindings = [
             binding
             for source in source_inputs
-            if (binding := _repo_source_binding(source, provenance)) is not None
+            if (
+                binding := _repo_source_binding(
+                    source,
+                    provenance,
+                    cwd=inline_cwd or current_cwd,
+                )
+            )
+            is not None
         ]
         action_domain = {
             "cmake": "CMAKE",

@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from scripts.ci_content_store import CIContentStore, hash_token_sequence
+from scripts.ci_log_sidecars import canonicalize_ci_log
 from scripts.ci_source_sidecars import (
     _FRAME_HEADER,
     CASE5_EXPORT_SCHEMA,
@@ -344,6 +345,50 @@ def _valid_provenance(
             }
         },
     }
+
+
+def _producer_checkout_provenance(
+    *,
+    head: str,
+    event: str,
+    repository: str,
+    source_repository: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    raw = (
+        "2026-07-26T04:35:00Z "
+        "Working directory is '/home/runner/work/workspace/checkout/build'\n"
+        "2026-07-26T04:35:01Z "
+        "[command]g++ -c ../src/nested/main.cpp -o main.o\n"
+    ).encode()
+    produced = canonicalize_ci_log(
+        raw,
+        {
+            "repository": {"full_name": repository},
+            "source_repository": source_repository,
+            "event_name": event,
+            "head_sha": head,
+            "job": {"labels": ["ubuntu-24.04", "x64"]},
+        },
+    )
+    actions = [
+        action
+        for chunk in produced["chunks"]
+        for action in chunk["training_sidecars"]["build_actions"]
+    ]
+    assert len(actions) == 1
+    producer_provenance = produced["sidecar"]["provenance"]
+    return (
+        {
+            "repository": producer_provenance["repository"],
+            "source_repository": producer_provenance["source_repository"],
+            "workflow": {
+                "event": producer_provenance["run"]["event"],
+                "head_sha": producer_provenance["run"]["head_sha"],
+            },
+            "job": {"labels": producer_provenance["runner"]["labels"]},
+        },
+        actions[0],
+    )
 
 
 def _frozen_case5_fixture(
@@ -737,6 +782,82 @@ def test_path_normalization_is_platform_aware_and_has_no_basename_heuristic() ->
     )
     assert drive_relative.status == GENERATED_OR_MUTATED_UNRESOLVABLE
     assert drive_relative.reason == "windows_drive_relative_path"
+
+
+def test_real_log_binding_normalizes_relative_path_against_action_cwd() -> None:
+    head = "a" * 40
+    provenance, action = _producer_checkout_provenance(
+        head=head,
+        event="push",
+        repository="owner/repo",
+        source_repository="owner/repo",
+    )
+
+    repository, checkout_head, normalization, evidence = _checkout_binding(
+        provenance,
+        action,
+        source_index=0,
+        source_input=action["source_inputs"][0],
+        cwd=action["cwd"],
+    )
+
+    assert action["repository_source_bindings"][0]["source_path"] == (
+        "src/nested/main.cpp"
+    )
+    assert repository == "owner/repo"
+    assert checkout_head == head
+    assert normalization.status == RESOLVED
+    assert normalization.candidates == ("src/nested/main.cpp",)
+    assert evidence["reason"] is None
+
+
+def test_real_log_fork_pr_binding_uses_canonical_merge_checkout_tuple() -> None:
+    head = "b" * 40
+    provenance, action = _producer_checkout_provenance(
+        head=head,
+        event="pull_request",
+        repository="owner/base",
+        source_repository="fork/head",
+    )
+
+    repository, checkout_head, normalization, evidence = _checkout_binding(
+        provenance,
+        action,
+        source_index=0,
+        source_input=action["source_inputs"][0],
+        cwd=action["cwd"],
+    )
+
+    assert action["repository_source_bindings"][0]["repository"] == "owner/base"
+    assert repository == "owner/base"
+    assert checkout_head == head
+    assert normalization.status == RESOLVED
+    assert evidence["checkout_kind"] == "pull_request_merge"
+    assert evidence["canonical_repository"] == "owner/base"
+    assert evidence["head_repository"] == "fork/head"
+    assert evidence["reason"] is None
+
+
+def test_real_log_unproven_fork_checkout_is_a_typed_gap() -> None:
+    head = "c" * 40
+    provenance, action = _producer_checkout_provenance(
+        head=head,
+        event="workflow_dispatch",
+        repository="owner/base",
+        source_repository="fork/head",
+    )
+
+    _repository, _head, normalization, evidence = _checkout_binding(
+        provenance,
+        action,
+        source_index=0,
+        source_input=action["source_inputs"][0],
+        cwd=action["cwd"],
+    )
+
+    assert normalization.status == CHECKOUT_PROVENANCE_UNRESOLVABLE
+    assert evidence["checkout_kind"] == "unproven_head_or_fork_checkout"
+    assert evidence["reason"] == "workflow_event_cannot_prove_checkout_tuple"
 
 
 @pytest.mark.parametrize(
@@ -1175,6 +1296,25 @@ def test_cli_incomplete_is_nonzero_and_existing_receipts_need_authorization(
     existing_sha = _sha256_file(receipt)
     assert main([*args, "--expected-receipt-sha256", existing_sha]) == 3
     capsys.readouterr()
+
+
+def test_cli_verify_returns_incomplete_for_missing_bindings(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _mirror, head, _base = _git_fixture(tmp_path)
+    inventory = _write_inventory(
+        tmp_path / "inventory.jsonl",
+        [_binding(head, "src/nested/main.cpp")],
+    )
+    store = tmp_path / "store"
+    with _new_source_store(store, inventory):
+        pass
+
+    assert main(["verify", "--store", str(store)]) == 3
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "incomplete"
+    assert result["missing_binding_count"] == 1
 
 
 def test_complete_cli_receipt_is_also_protected_from_overwrite(

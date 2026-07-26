@@ -239,7 +239,7 @@ def test_cmake_ninja_gcc_cuda_success_sections_entities_and_edges() -> None:
     assert ninja_action["outputs"] == ["build/cuda_app"]
     assert ninja_action["repository_source_bindings"] == [
         {
-            "repository": "contributor/project",
+            "repository": "owner/project",
             "head_sha": "a" * 40,
             "source_path": "src/kernel.cu",
             "confidence": {

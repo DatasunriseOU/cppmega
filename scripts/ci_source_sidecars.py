@@ -5278,6 +5278,12 @@ class SourceSidecarStore:
                     )
         if binding_count > self.input_binding_count:
             raise SourceStoreError("stored binding count exceeds frozen inventory")
+        missing_binding_count = self.input_binding_count - binding_count
+        complete = (
+            missing_binding_count == 0
+            and int(status_counts.get(RESOLVED, 0)) == self.input_binding_count
+            and not any(status_counts.get(status, 0) for status in GAP_STATUSES)
+        )
         reference_summary = self._reference_ledger_summary_locked()
         input_reference_count = int(self._settings["input_reference_count"])
         if int(reference_summary["reference_count"]) > input_reference_count:
@@ -5285,9 +5291,10 @@ class SourceSidecarStore:
         recovery = self.recovery_records()
         return {
             "ok": True,
+            "status": "complete" if complete else "incomplete",
             "schema": STORE_SCHEMA,
             "binding_count": binding_count,
-            "missing_binding_count": self.input_binding_count - binding_count,
+            "missing_binding_count": missing_binding_count,
             "reference_count": reference_summary["reference_count"],
             "missing_reference_count": (
                 input_reference_count - int(reference_summary["reference_count"])
@@ -5342,11 +5349,7 @@ class SourceSidecarStore:
             status: int(status_counts.get(status, 0)) for status in sorted(ALL_STATUSES)
         }
         missing_count = int(verification["missing_binding_count"])
-        complete = (
-            missing_count == 0
-            and resolved_count == self.input_binding_count
-            and not gap_counts
-        )
+        complete = verification["status"] == "complete"
         ledger = verification["reference_ledger"]
         assert isinstance(ledger, Mapping)
         return {
