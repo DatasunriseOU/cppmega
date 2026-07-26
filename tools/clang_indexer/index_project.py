@@ -669,6 +669,13 @@ BUILD_NAME_KINDS: dict[str, str] = {
     "WORKSPACE": "bazel",
     "WORKSPACE.bazel": "bazel",
     "MODULE.bazel": "bazel",
+    # GN
+    "BUILD.gn": "gn",
+    # SCons
+    "SConstruct": "scons",
+    "SConscript": "scons",
+    # xmake
+    "xmake.lua": "xmake",
     # Meson
     "meson.build": "meson",
     "meson_options.txt": "meson",
@@ -688,6 +695,8 @@ BUILD_EXT_KINDS: dict[str, str] = {
     ".mk": "make",
     ".m4": "autoconf",
     ".bzl": "bazel",
+    ".gn": "gn",
+    ".gni": "gn",
     ".ninja": "ninja",
     ".vcxproj": "msvc",
     ".sln": "msvc",
@@ -702,6 +711,11 @@ SHELL_EXT_KINDS: dict[str, str] = {
     ".zsh": "zsh",
     ".csh": "tcsh",
     ".tcsh": "tcsh",
+    ".ps1": "powershell",
+    ".psm1": "powershell",
+    ".psd1": "powershell",
+    ".bat": "cmd",
+    ".cmd": "cmd",
 }
 
 # Source structure ids.  The first 0-8 values are the historical code kinds used
@@ -3123,8 +3137,19 @@ def _classify_shell_file(filepath: str, fname: str) -> str | None:
         return None
     if first_line.startswith("#!"):
         words = set(re.findall(r"[a-z0-9_+.-]+", first_line))
-        for shell in ("tcsh", "csh", "zsh", "bash", "ksh", "sh"):
+        for shell in (
+            "powershell",
+            "pwsh",
+            "tcsh",
+            "csh",
+            "zsh",
+            "bash",
+            "ksh",
+            "sh",
+        ):
             if shell in words:
+                if shell in {"powershell", "pwsh"}:
+                    return "powershell"
                 return "tcsh" if shell == "csh" else shell
     return extension_kind
 
@@ -3160,14 +3185,31 @@ def find_shell_files(
 
 
 # ---------------------------------------------------------------------------
-# Shell edge extraction (regex-based, lightweight)
+# Shell edge extraction (lexical, lightweight)
 # ---------------------------------------------------------------------------
 
-_SHELL_PIPE_RE = re.compile(
-    r"([A-Za-z_][A-Za-z0-9_./-]*)"  # command before pipe
-    r"[ \t]*\|[ \t]*"               # pipe operator
-    r"([A-Za-z_][A-Za-z0-9_./-]*)"  # command after pipe
+_SHELL_COMMAND_TOKEN_RE = re.compile(
+    r"[A-Za-z_./][A-Za-z0-9_./:+-]*"
 )
+
+_SHELL_ASSIGNMENT_PREFIX_RE = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*=[^\s]*[ \t]*"
+)
+_SHELL_CONTROL_WORDS = {
+    "begin",
+    "case",
+    "do",
+    "elif",
+    "else",
+    "end",
+    "esac",
+    "if",
+    "in",
+    "process",
+    "then",
+    "until",
+    "while",
+}
 
 _SHELL_SOURCE_RE = re.compile(
     r"(?m)^[ \t]*(?:\.|source)[ \t]+([^\s;#]+)"
@@ -3205,6 +3247,748 @@ _TCSH_VAR_USE_RE = re.compile(
     r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?"
 )
 
+_PS_VAR_DEF_RE = re.compile(
+    r"(?m)(?:^|[;{}])[ \t]*"
+    r"(?P<variable>\$\{?(?P<name>[A-Za-z_][A-Za-z0-9_:]*)\}?)"
+    r"[ \t]*(?:=|\+=|-=|\*=|/=)"
+)
+_PS_TYPED_VAR_DEF_RE = re.compile(
+    r"(?m)(?:^|[;{}])[ \t]*"
+    r"(?:\[[^\]\r\n]+\][ \t]*)+"
+    r"(?P<variable>\$\{?(?P<name>[A-Za-z_][A-Za-z0-9_:]*)\}?)"
+    r"[ \t]*(?:=|\+=|-=|\*=|/=)"
+)
+_PS_PARAM_START_RE = re.compile(r"(?i)\bparam[ \t\r\n]*\(")
+_PS_PARAM_VAR_RE = re.compile(
+    r"(?:^|,)[ \t\r\n]*"
+    r"(?:\[[^\]\r\n]+\][ \t\r\n]*)*"
+    r"(?P<variable>\$\{?(?P<name>[A-Za-z_][A-Za-z0-9_:]*)\}?)"
+)
+
+_PS_VAR_USE_RE = re.compile(
+    r"\$\{?([A-Za-z_][A-Za-z0-9_:]*)\}?"
+)
+
+_SHELL_REDIR_OP_RE = re.compile(
+    r"(?P<op>(?:[0-9]+|&)?>{1,2}|<)"
+)
+_SHELL_HEREDOC_RE = re.compile(
+    r"<<(?P<strip>-?)[ \t]*(?P<quote>['\"]?)"
+    r"(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)"
+)
+
+
+def _powershell_variable_definitions(
+    structural_text: str,
+) -> Iterator[tuple[str, int]]:
+    """Yield typed, untyped, and param-block PowerShell definitions."""
+
+    seen: set[tuple[str, int]] = set()
+    for pattern in (_PS_VAR_DEF_RE, _PS_TYPED_VAR_DEF_RE):
+        for match in pattern.finditer(structural_text):
+            item = (match.group("name").casefold(), match.start("variable"))
+            if item not in seen:
+                seen.add(item)
+                yield item
+    for param_start in _PS_PARAM_START_RE.finditer(structural_text):
+        body_start = param_start.end()
+        depth = 1
+        cursor = body_start
+        while cursor < len(structural_text) and depth:
+            if structural_text[cursor] == "(":
+                depth += 1
+            elif structural_text[cursor] == ")":
+                depth -= 1
+            cursor += 1
+        if depth:
+            continue
+        body = structural_text[body_start : cursor - 1]
+        for match in _PS_PARAM_VAR_RE.finditer(body):
+            item = (
+                match.group("name").casefold(),
+                body_start + match.start("variable"),
+            )
+            if item not in seen:
+                seen.add(item)
+                yield item
+
+
+def _shell_heredoc_regions(
+    text: str,
+) -> list[tuple[int, int, int, int, int, bool]]:
+    """Return declaration/body/closing spans for POSIX-style heredocs."""
+
+    lines = text.splitlines(keepends=True)
+    offsets: list[int] = []
+    offset = 0
+    for line in lines:
+        offsets.append(offset)
+        offset += len(line)
+
+    def declarations(line: str, line_start: int) -> list[tuple[int, int, str, bool, bool]]:
+        code = [True] * len(line)
+        quote: str | None = None
+        escaped = False
+        comment = False
+        for index, char in enumerate(line):
+            if comment:
+                code[index] = False
+                continue
+            if escaped:
+                code[index] = False
+                escaped = False
+                continue
+            if char == "\\" and quote != "'":
+                code[index] = False
+                escaped = True
+                continue
+            if quote is not None:
+                code[index] = False
+                if char == quote:
+                    quote = None
+                continue
+            if char in {"'", '"'}:
+                code[index] = False
+                quote = char
+                continue
+            if char == "#" and (
+                index == 0
+                or line[index - 1].isspace()
+                or line[index - 1] in ";|&(){}"
+            ):
+                code[index] = False
+                comment = True
+
+        found: list[tuple[int, int, str, bool, bool]] = []
+        for match in _SHELL_HEREDOC_RE.finditer(line):
+            if match.start() >= len(code) or not code[match.start()]:
+                continue
+            if match.start() > 0 and line[match.start() - 1] == "<":
+                continue
+            prefix = line[: match.start()]
+            if prefix.rfind("((") > prefix.rfind("))"):
+                continue
+            found.append(
+                (
+                    line_start + match.start(),
+                    line_start + match.end(),
+                    match.group("delimiter"),
+                    match.group("strip") == "-",
+                    not bool(match.group("quote")),
+                )
+            )
+        return found
+
+    regions: list[tuple[int, int, int, int, int, bool]] = []
+    line_index = 0
+    while line_index < len(lines):
+        pending = declarations(lines[line_index], offsets[line_index])
+        if not pending:
+            line_index += 1
+            continue
+        scan_index = line_index + 1
+        for declaration_start, declaration_end, delimiter, strip_tabs, interpolate in pending:
+            body_start = offsets[scan_index] if scan_index < len(lines) else len(text)
+            close_start = len(text)
+            close_end = len(text)
+            while scan_index < len(lines):
+                candidate = lines[scan_index].rstrip("\r\n")
+                comparison = candidate.lstrip("\t") if strip_tabs else candidate
+                if comparison == delimiter:
+                    close_start = offsets[scan_index]
+                    close_end = close_start + len(lines[scan_index])
+                    scan_index += 1
+                    break
+                scan_index += 1
+            regions.append(
+                (
+                    declaration_start,
+                    declaration_end,
+                    body_start,
+                    close_start,
+                    close_end,
+                    interpolate,
+                )
+            )
+        line_index = max(line_index + 1, scan_index)
+    return regions
+
+
+def _unquoted_pipe_offsets(
+    text: str,
+    *,
+    is_powershell: bool,
+) -> list[int]:
+    """Return single-pipe offsets outside quotes/comments (never ``||``)."""
+
+    masked = _mask_shell_quotes_and_comment(
+        text,
+        is_powershell=is_powershell,
+    )
+    offsets: list[int] = []
+    for index, char in enumerate(masked):
+        if (
+            char == "|"
+            and (index == 0 or masked[index - 1] != "|")
+            and (index + 1 == len(masked) or masked[index + 1] != "|")
+        ):
+            offsets.append(index)
+    return offsets
+
+
+def _powershell_comment_boundary(text: str, index: int) -> bool:
+    return (
+        index == 0
+        or text[index - 1].isspace()
+        or text[index - 1] in ";|&(){}[],=+-*/%!?:<>"
+    )
+
+
+def _mask_shell_quotes_and_comment(
+    text: str,
+    *,
+    is_powershell: bool,
+) -> str:
+    """Blank shell strings/comments while preserving newlines and offsets."""
+
+    masked = list(text)
+    quote: str | None = None
+    escaped = False
+    line_comment = False
+    block_comment = False
+    here_string_end: str | None = None
+    escape_char = "`" if is_powershell else "\\"
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if block_comment:
+            if text.startswith("#>", index):
+                masked[index : index + 2] = [" ", " "]
+                block_comment = False
+                index += 2
+                continue
+            if char not in "\r\n":
+                masked[index] = " "
+            index += 1
+            continue
+        if here_string_end is not None:
+            at_line_start = index == 0 or text[index - 1] in "\r\n"
+            if at_line_start:
+                line_end = len(text)
+                for newline in ("\n", "\r"):
+                    candidate = text.find(newline, index)
+                    if candidate >= 0:
+                        line_end = min(line_end, candidate)
+                content = text[index:line_end]
+                stripped = content.strip(" \t")
+                if stripped == here_string_end:
+                    for position in range(index, line_end):
+                        masked[position] = " "
+                    here_string_end = None
+                    index = line_end
+                    continue
+            if char not in "\r\n":
+                masked[index] = " "
+            index += 1
+            continue
+        if line_comment:
+            if char in "\r\n":
+                line_comment = False
+            else:
+                masked[index] = " "
+            index += 1
+            continue
+        if escaped:
+            masked[index] = " "
+            escaped = False
+            index += 1
+            continue
+        if char == escape_char and quote != "'":
+            masked[index] = " "
+            escaped = True
+            index += 1
+            continue
+        if quote is not None:
+            if char not in "\r\n":
+                masked[index] = " "
+            if char == quote:
+                if (
+                    is_powershell
+                    and quote == "'"
+                    and index + 1 < len(text)
+                    and text[index + 1] == "'"
+                ):
+                    masked[index + 1] = " "
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+        if (
+            is_powershell
+            and text.startswith("<#", index)
+            and _powershell_comment_boundary(text, index)
+        ):
+            masked[index : index + 2] = [" ", " "]
+            block_comment = True
+            index += 2
+            continue
+        if is_powershell and text.startswith(("@'", '@"'), index):
+            line_end = len(text)
+            for newline in ("\n", "\r"):
+                candidate = text.find(newline, index)
+                if candidate >= 0:
+                    line_end = min(line_end, candidate)
+            if not text[index + 2 : line_end].strip(" \t"):
+                here_string_end = "'@" if text[index + 1] == "'" else '"@'
+                for position in range(index, line_end):
+                    masked[position] = " "
+                index = line_end
+                continue
+        if char in {"'", '"'}:
+            masked[index] = " "
+            quote = char
+            index += 1
+            continue
+        if (
+            char == "#"
+            and not (
+                is_powershell
+                and index > 0
+                and text[index - 1] == "<"
+            )
+            and (
+            (is_powershell and _powershell_comment_boundary(text, index))
+            or (not is_powershell and index == 0)
+            or text[index - 1].isspace()
+            or text[index - 1] in ";|&(){}"
+            )
+        ):
+            masked[index] = " "
+            line_comment = True
+        index += 1
+    if not is_powershell:
+        for (
+            declaration_start,
+            declaration_end,
+            body_start,
+            _close_start,
+            close_end,
+            _interpolate,
+        ) in _shell_heredoc_regions(text):
+            for position in range(declaration_start, declaration_end):
+                masked[position] = " "
+            for position in range(body_start, close_end):
+                if text[position] not in "\r\n":
+                    masked[position] = " "
+    return "".join(masked)
+
+
+def _mask_powershell_non_interpolating_regions(text: str) -> str:
+    """Keep live PowerShell variable syntax and blank non-interpolating regions."""
+
+    masked = list(text)
+    quote: str | None = None
+    escaped = False
+    line_comment = False
+    block_comment = False
+    here_string_end: str | None = None
+    here_string_interpolates = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if block_comment:
+            if text.startswith("#>", index):
+                masked[index : index + 2] = [" ", " "]
+                block_comment = False
+                index += 2
+                continue
+            if char not in "\r\n":
+                masked[index] = " "
+            index += 1
+            continue
+        if here_string_end is not None:
+            at_line_start = index == 0 or text[index - 1] in "\r\n"
+            if at_line_start:
+                line_end = len(text)
+                for newline in ("\n", "\r"):
+                    candidate = text.find(newline, index)
+                    if candidate >= 0:
+                        line_end = min(line_end, candidate)
+                if text[index:line_end].strip(" \t") == here_string_end:
+                    for position in range(index, line_end):
+                        masked[position] = " "
+                    here_string_end = None
+                    here_string_interpolates = False
+                    index = line_end
+                    continue
+            if here_string_interpolates and char == "`":
+                masked[index] = " "
+                if index + 1 < len(text):
+                    masked[index + 1] = " "
+                    index += 2
+                    continue
+            if not here_string_interpolates and char not in "\r\n":
+                masked[index] = " "
+            index += 1
+            continue
+        if line_comment:
+            if char in "\r\n":
+                line_comment = False
+            else:
+                masked[index] = " "
+            index += 1
+            continue
+        if escaped:
+            masked[index] = " "
+            escaped = False
+            index += 1
+            continue
+        if char == "`" and quote != "'":
+            masked[index] = " "
+            escaped = True
+            index += 1
+            continue
+        if quote == "'":
+            masked[index] = " "
+            if char == "'":
+                if index + 1 < len(text) and text[index + 1] == "'":
+                    masked[index + 1] = " "
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+        if quote == '"':
+            if char == '"':
+                quote = None
+            index += 1
+            continue
+        if text.startswith("<#", index) and _powershell_comment_boundary(
+            text,
+            index,
+        ):
+            masked[index : index + 2] = [" ", " "]
+            block_comment = True
+            index += 2
+            continue
+        if text.startswith(("@'", '@"'), index):
+            line_end = len(text)
+            for newline in ("\n", "\r"):
+                candidate = text.find(newline, index)
+                if candidate >= 0:
+                    line_end = min(line_end, candidate)
+            if not text[index + 2 : line_end].strip(" \t"):
+                here_string_end = "'@" if text[index + 1] == "'" else '"@'
+                here_string_interpolates = text[index + 1] == '"'
+                for position in range(index, line_end):
+                    masked[position] = " "
+                index = line_end
+                continue
+        if char == "'":
+            masked[index] = " "
+            quote = "'"
+        elif char == '"':
+            quote = '"'
+        elif (
+            char == "#"
+            and not (index > 0 and text[index - 1] == "<")
+            and _powershell_comment_boundary(text, index)
+        ):
+            masked[index] = " "
+            line_comment = True
+        index += 1
+    return "".join(masked)
+
+
+def _mask_posix_variable_regions(text: str) -> str:
+    """Keep live `$` expansions while blanking comments and single quotes."""
+
+    masked = list(text)
+    quote: str | None = None
+    escaped = False
+    line_comment = False
+    for index, char in enumerate(text):
+        if line_comment:
+            if char in "\r\n":
+                line_comment = False
+            else:
+                masked[index] = " "
+            continue
+        if escaped:
+            masked[index] = " "
+            escaped = False
+            continue
+        if char == "\\" and quote != "'":
+            masked[index] = " "
+            escaped = True
+            continue
+        if quote == "'":
+            masked[index] = " "
+            if char == "'":
+                quote = None
+            continue
+        if quote == '"':
+            if char == '"':
+                quote = None
+            continue
+        if char == "'":
+            masked[index] = " "
+            quote = "'"
+        elif char == '"':
+            quote = '"'
+        elif char == "#" and (
+            index == 0
+            or text[index - 1].isspace()
+            or text[index - 1] in ";|&(){}"
+        ):
+            masked[index] = " "
+            line_comment = True
+    for (
+        declaration_start,
+        declaration_end,
+        body_start,
+        close_start,
+        close_end,
+        interpolate,
+    ) in _shell_heredoc_regions(text):
+        for position in range(declaration_start, declaration_end):
+            masked[position] = " "
+        for position in range(body_start, close_end):
+            if text[position] not in "\r\n":
+                masked[position] = " "
+        if interpolate:
+            body = text[body_start:close_start]
+            for match in _SHELL_VAR_USE_RE.finditer(body):
+                absolute_start = body_start + match.start()
+                backslashes = 0
+                cursor = absolute_start - 1
+                while cursor >= body_start and text[cursor] == "\\":
+                    backslashes += 1
+                    cursor -= 1
+                if backslashes % 2:
+                    continue
+                for position in range(
+                    absolute_start,
+                    body_start + match.end(),
+                ):
+                    masked[position] = text[position]
+    return "".join(masked)
+
+
+def _shell_segment_command_start(
+    line: str,
+    start: int,
+    end: int,
+    *,
+    is_powershell: bool,
+    prefer_innermost_block: bool = False,
+) -> int | None:
+    """Locate the command/expression head in one pipeline segment."""
+
+    cursor = start
+    while cursor < end and line[cursor].isspace():
+        cursor += 1
+    if cursor >= end:
+        return None
+
+    block_start = -1
+    if prefer_innermost_block:
+        for position in range(cursor, end):
+            if line[position] != "{":
+                continue
+            if position > 0 and line[position - 1] in {"$", "@"}:
+                continue
+            if not is_powershell:
+                previous_is_boundary = (
+                    position == 0
+                    or line[position - 1].isspace()
+                    or line[position - 1] in ";|&()"
+                )
+                following_is_boundary = (
+                    position + 1 >= len(line)
+                    or line[position + 1].isspace()
+                )
+                if not (previous_is_boundary and following_is_boundary):
+                    continue
+            block_start = position
+    if block_start >= 0:
+        cursor = block_start + 1
+        while cursor < end and line[cursor].isspace():
+            cursor += 1
+    elif not is_powershell:
+        prefix = line[cursor:end]
+        if re.search(r"\bcase\b", prefix) and re.search(r"\bin\b", prefix):
+            case_label_end = line.rfind(")", cursor, end)
+            if case_label_end >= 0:
+                cursor = case_label_end + 1
+                while cursor < end and line[cursor].isspace():
+                    cursor += 1
+
+    if is_powershell:
+        assignment = re.match(
+            r"\$\{?[A-Za-z_][A-Za-z0-9_:]*\}?[ \t]*=[ \t]*",
+            line[cursor:end],
+        )
+        if assignment is not None:
+            cursor += assignment.end()
+            while cursor < end and line[cursor].isspace():
+                cursor += 1
+        if cursor < end and line[cursor] == "$":
+            return cursor
+        if cursor < end and line[cursor] == "&":
+            cursor += 1
+    else:
+        while assignment := _SHELL_ASSIGNMENT_PREFIX_RE.match(line, cursor, end):
+            cursor = assignment.end()
+
+    match = _SHELL_COMMAND_TOKEN_RE.search(line, cursor, end)
+    while match is not None:
+        if (
+            (match.start() == 0 or line[match.start() - 1] not in {"$", "-"})
+            and match.group(0).casefold() not in _SHELL_CONTROL_WORDS
+        ):
+            return match.start()
+        match = _SHELL_COMMAND_TOKEN_RE.search(line, match.end(), end)
+    return None
+
+
+def _shell_redirect_edges(
+    text: str,
+    *,
+    is_powershell: bool,
+) -> Iterator[tuple[int, int, bool]]:
+    """Yield command, target, and input/output direction for redirects."""
+
+    masked = _mask_shell_quotes_and_comment(
+        text,
+        is_powershell=is_powershell,
+    )
+    separator_ends = [
+        match.end()
+        for match in re.finditer(r"\r\n|\r|\n|;|&&|\|\|", masked)
+    ]
+    separator_ends.extend(
+        offset + 1
+        for offset in _unquoted_pipe_offsets(
+            text,
+            is_powershell=is_powershell,
+        )
+    )
+    separator_ends.sort()
+    for match in _SHELL_REDIR_OP_RE.finditer(masked):
+        target_start = match.end()
+        while target_start < len(text) and text[target_start] in " \t":
+            target_start += 1
+        if target_start >= len(text) or text[target_start] in "\r\n;|&<>#":
+            continue
+        if text[target_start] in {"'", '"'}:
+            quote = text[target_start]
+            target_end = target_start + 1
+            escaped = False
+            while target_end < len(text):
+                char = text[target_end]
+                if escaped:
+                    escaped = False
+                elif char == ("\\" if not is_powershell else "`"):
+                    escaped = True
+                elif char == quote:
+                    break
+                elif char in "\r\n":
+                    target_end = target_start
+                    break
+                target_end += 1
+            if target_end <= target_start or target_end >= len(text):
+                continue
+        elif not masked[target_start : target_start + 1].strip():
+            continue
+        segment_start = max(
+            (
+                separator_end
+                for separator_end in separator_ends
+                if separator_end <= match.start()
+            ),
+            default=0,
+        )
+        command_start = _shell_segment_command_start(
+            masked,
+            segment_start,
+            match.start(),
+            is_powershell=is_powershell,
+            prefer_innermost_block=True,
+        )
+        if command_start is None:
+            continue
+        yield (
+            command_start,
+            target_start,
+            match.group("op") == "<",
+        )
+
+
+def _shell_pipeline_command_pairs(
+    text: str,
+    *,
+    is_powershell: bool,
+) -> Iterator[tuple[int, int]]:
+    """Yield command-head pairs for each lexical pipeline edge."""
+
+    masked = _mask_shell_quotes_and_comment(
+        text,
+        is_powershell=is_powershell,
+    )
+    pipe_offsets = _unquoted_pipe_offsets(
+        text,
+        is_powershell=is_powershell,
+    )
+    control_spans = [
+        match.span()
+        for match in re.finditer(r"\r\n|\r|\n|;|&&|\|\|", masked)
+    ]
+    for pipe_index, pipe_offset in enumerate(pipe_offsets):
+        left_start = max(
+            (
+                end
+                for start, end in control_spans
+                if end <= pipe_offset
+            ),
+            default=0,
+        )
+        if pipe_index > 0:
+            left_start = max(left_start, pipe_offsets[pipe_index - 1] + 1)
+
+        right_cursor = pipe_offset + 1
+        while right_cursor < len(masked) and masked[right_cursor].isspace():
+            right_cursor += 1
+        if right_cursor >= len(masked):
+            continue
+        right_end = min(
+            (
+                start
+                for start, _end in control_spans
+                if start >= right_cursor
+            ),
+            default=len(masked),
+        )
+        if pipe_index + 1 < len(pipe_offsets):
+            right_end = min(right_end, pipe_offsets[pipe_index + 1])
+
+        left = _shell_segment_command_start(
+            masked,
+            left_start,
+            pipe_offset,
+            is_powershell=is_powershell,
+            prefer_innermost_block=True,
+        )
+        right = _shell_segment_command_start(
+            masked,
+            right_cursor,
+            right_end,
+            is_powershell=is_powershell,
+        )
+        if left is not None and right is not None:
+            yield left, right
+
 
 def _shell_edges_from_script(text: str, shell_kind: str) -> list[dict[str, int]]:
     """Extract graph edges from shell script text using lightweight regex parsing.
@@ -3237,60 +4021,117 @@ def _shell_edges_from_script(text: str, shell_kind: str) -> list[dict[str, int]]
 
     is_powershell = shell_kind in {"powershell", "pwsh", "ps1"}
     is_tcsh = shell_kind in {"tcsh", "csh"}
+    structural_text = _mask_shell_quotes_and_comment(
+        text,
+        is_powershell=is_powershell,
+    )
 
     # --- Pipe edges: cmd1 | cmd2 → cmd1 feeds cmd2 ---
-    for m in _SHELL_PIPE_RE.finditer(text):
-        cmd1_start = m.start(1)
-        cmd2_start = m.start(2)
+    for cmd1_start, cmd2_start in _shell_pipeline_command_pairs(
+        text,
+        is_powershell=is_powershell,
+    ):
         _add_edge(cmd1_start, cmd2_start, int(DomainEdgeKind.SHELL_PIPE))
 
     # --- Source/dot edges: . ./script.sh or source ./script.sh ---
-    for m in _SHELL_SOURCE_RE.finditer(text):
-        source_kw_start = m.start(0) + len(m.group(0)) - len(m.group(0).lstrip())
-        # Find the actual keyword start (skip leading whitespace)
-        line_start = text.rfind("\n", 0, m.start(0)) + 1
-        stripped = text[line_start:m.end(0)]
-        kw_offset = len(stripped) - len(stripped.lstrip())
-        from_char = line_start + kw_offset
+    for m in _SHELL_SOURCE_RE.finditer(structural_text):
+        from_char = m.start(0) + len(m.group(0)) - len(m.group(0).lstrip())
         target_start = m.start(1)
         _add_edge(from_char, target_start, int(DomainEdgeKind.SHELL_COMMAND_FILE))
 
     # --- Env variable def→use edges ---
     if is_tcsh:
         # tcsh uses setenv VAR value
-        var_defs: dict[str, int] = {}
-        for m in _TCSH_SETENV_RE.finditer(text):
-            var_defs[m.group(1)] = m.start(1)
-        for m in _TCSH_VAR_USE_RE.finditer(text):
+        var_defs: defaultdict[str, list[int]] = defaultdict(list)
+        for m in _TCSH_SETENV_RE.finditer(structural_text):
+            var_defs[m.group(1)].append(m.start(1))
+        variable_text = _mask_posix_variable_regions(text)
+        for m in _TCSH_VAR_USE_RE.finditer(variable_text):
             var_name = m.group(1)
-            if var_name in var_defs:
-                def_pos = var_defs[var_name]
-                use_pos = m.start(0)
-                if use_pos != def_pos:
-                    _add_edge(use_pos, def_pos, int(DomainEdgeKind.SHELL_VAR_DEF_USE))
-    elif not is_powershell:
+            use_pos = m.start(0)
+            def_pos = next(
+                (
+                    position
+                    for position in reversed(var_defs.get(var_name, []))
+                    if position < use_pos
+                ),
+                None,
+            )
+            if def_pos is not None:
+                _add_edge(def_pos, use_pos, int(DomainEdgeKind.SHELL_VAR_DEF_USE))
+    elif is_powershell:
+        var_defs_ps: defaultdict[str, list[int]] = defaultdict(list)
+        powershell_definition_text = _mask_shell_quotes_and_comment(
+            text,
+            is_powershell=True,
+        )
+        for name, position in _powershell_variable_definitions(
+            powershell_definition_text
+        ):
+            var_defs_ps[name].append(position)
+        ps_definition_positions = {
+            position
+            for positions in var_defs_ps.values()
+            for position in positions
+        }
+        powershell_variable_text = _mask_powershell_non_interpolating_regions(text)
+        for m in _PS_VAR_USE_RE.finditer(powershell_variable_text):
+            var_name = m.group(1).casefold()
+            use_pos = m.start(0)
+            if use_pos in ps_definition_positions:
+                continue
+            def_pos = next(
+                (
+                    position
+                    for position in reversed(var_defs_ps.get(var_name, []))
+                    if position < use_pos
+                ),
+                None,
+            )
+            if def_pos is not None:
+                _add_edge(def_pos, use_pos, int(DomainEdgeKind.SHELL_VAR_DEF_USE))
+    else:
         # bash/sh/zsh/ksh: VAR=value definitions
-        var_defs_posix: dict[str, int] = {}
-        for m in _SHELL_VAR_DEF_RE.finditer(text):
-            var_defs_posix[m.group(1)] = m.start(1)
-        for m in _SHELL_VAR_USE_RE.finditer(text):
+        var_defs_posix: defaultdict[str, list[int]] = defaultdict(list)
+        for m in _SHELL_VAR_DEF_RE.finditer(structural_text):
+            var_defs_posix[m.group(1)].append(m.start(1))
+        variable_text = _mask_posix_variable_regions(text)
+        for m in _SHELL_VAR_USE_RE.finditer(variable_text):
             var_name = m.group(1) or m.group(2)
-            if var_name in var_defs_posix:
-                def_pos = var_defs_posix[var_name]
-                use_pos = m.start(0)
-                if use_pos != def_pos:
-                    _add_edge(use_pos, def_pos, int(DomainEdgeKind.SHELL_VAR_DEF_USE))
+            use_pos = m.start(0)
+            def_pos = next(
+                (
+                    position
+                    for position in reversed(var_defs_posix.get(var_name, []))
+                    if position < use_pos
+                ),
+                None,
+            )
+            if def_pos is not None:
+                _add_edge(def_pos, use_pos, int(DomainEdgeKind.SHELL_VAR_DEF_USE))
+
+    # --- Redirect edges: command < input / command > output ---
+    for command_start, target_start, is_input in _shell_redirect_edges(
+        text,
+        is_powershell=is_powershell,
+    ):
+        edge_kind = (
+            DomainEdgeKind.SHELL_REDIR_IN
+            if is_input
+            else DomainEdgeKind.SHELL_REDIR_OUT
+        )
+        _add_edge(command_start, target_start, int(edge_kind))
 
     # --- Command→file argument edges ---
     if not is_powershell:
-        for m in _SHELL_COMMAND_FILE_RE.finditer(text):
+        for m in _SHELL_COMMAND_FILE_RE.finditer(structural_text):
             cmd_start = m.start(1)
             file_start = m.start(2)
             _add_edge(cmd_start, file_start, int(DomainEdgeKind.SHELL_COMMAND_FILE))
 
     # --- PowerShell: cmdlet→parameter edges ---
     if is_powershell:
-        for m in _PS_CMDLET_RE.finditer(text):
+        for m in _PS_CMDLET_RE.finditer(structural_text):
             cmdlet_start = m.start(1)
             params_str = m.group(2)
             if not params_str:
@@ -5710,11 +6551,21 @@ def _build_domain_sidecars(
         "bazel": "BUILD.bazel",
         "build_bazel": "BUILD.bazel",
         "workspace_bazel": "WORKSPACE.bazel",
+        "meson": "meson.build",
+        "gn": "BUILD.gn",
+        "scons": "SConstruct",
+        "xmake": "xmake.lua",
         "bash": "script.bash",
         "sh": "script.sh",
         "zsh": "script.zsh",
         "tcsh": "script.tcsh",
         "ksh": "script.ksh",
+        "powershell": "script.ps1",
+        "pwsh": "script.ps1",
+        "ps1": "script.ps1",
+        "batch": "script.cmd",
+        "cmd": "script.cmd",
+        "sql": "schema.sql",
         "python": "module.py",
     }
     parser_path = parser_path_by_kind.get(kind)
@@ -5803,9 +6654,8 @@ def build_build_doc(
 ) -> dict:
     """Build a single 'build' enriched doc from a build/compilation file.
 
-    Callers pass already-read text. Empty/whitespace-only build files are skipped
-    before this function is called: they carry no training signal and should not
-    make an otherwise valid C/C++ repo fail indexing.
+    Callers pass already-read text. Zero-length inputs are skipped by the
+    emitter; non-empty whitespace remains source content and is represented.
     """
     emitted_filepath = filepath
     if source_root is not None:
@@ -5876,10 +6726,35 @@ def build_build_doc(
     }
     if is_shell_doc:
         shell_kind_for_edges = build_kind.lower().replace("-", "_")
-        extracted_shell_edges = _shell_edges_from_script(text, shell_kind_for_edges)
+        # CMD/batch shares the frozen SH domain ID, but its escaping and
+        # comments are not POSIX-compatible. Keep native parser edges when a
+        # grammar exists; never manufacture POSIX edges for a RAW CMD document.
+        extracted_shell_edges = (
+            []
+            if shell_kind_for_edges in {"cmd", "batch"}
+            else _shell_edges_from_script(text, shell_kind_for_edges)
+        )
         if extracted_shell_edges:
-            cast(list, domain_sidecars["shell_edges"]).extend(extracted_shell_edges)
+            shell_edges = cast(list[dict[str, int]], domain_sidecars["shell_edges"])
+            seen_shell_edges = {
+                (
+                    int(edge["from_char"]),
+                    int(edge["to_char"]),
+                    int(edge["kind"]),
+                )
+                for edge in shell_edges
+            }
+            for edge in extracted_shell_edges:
+                triple = (
+                    int(edge["from_char"]),
+                    int(edge["to_char"]),
+                    int(edge["kind"]),
+                )
+                if triple not in seen_shell_edges:
+                    shell_edges.append(edge)
+                    seen_shell_edges.add(triple)
     is_python_doc = domain == DomainKind.PYTHON
+    is_sql_doc = domain == DomainKind.SQL
     is_diagnostic_doc = int(domain) >= int(DomainKind.COMPILER_DIAGNOSTIC)
     doc_type = (
         "shell"
@@ -5889,19 +6764,25 @@ def build_build_doc(
         else "diagnostic"
         if is_diagnostic_doc
         else "sql"
-        if domain == DomainKind.SQL
+        if is_sql_doc
         else "build"
     )
     language_info = {
         "primary_language": build_kind,
-        "primary_standard": (build_info or {}).get("standard"),
-        "primary_dialect": None,
+        "primary_standard": (
+            None
+            if is_shell_doc or is_sql_doc
+            else (build_info or {}).get("standard")
+        ),
+        "primary_dialect": build_kind if is_shell_doc else None,
         "embedded_languages": [],
         "signals": [
             f"shell_file:{build_kind}"
             if is_shell_doc
             else f"code_file:{build_kind}"
             if is_python_doc
+            else f"sql_file:{build_kind}"
+            if is_sql_doc
             else f"build_file:{build_kind}"
         ],
         "detector_sources": [
@@ -5909,6 +6790,8 @@ def build_build_doc(
             if is_shell_doc
             else "code_file"
             if is_python_doc
+            else "sql_file"
+            if is_sql_doc
             else "build_file"
         ],
         "confidence": "high",
@@ -7459,6 +8342,7 @@ def emit_build_documents(
     project_id: str | None = None,
     default_build_info: dict | None,
     compile_index: object | None = None,
+    max_chunk_bytes: int = BUILD_FILE_SIZE_CAP,
     tokenizer_path: str | None = None,
     dedup_db: str | None = None,
     dedup_stage_id: str | None = None,
@@ -7467,18 +8351,20 @@ def emit_build_documents(
     emit_doc: Callable[[dict[str, object]], None] | None = None,
     skip_invalid_inputs: bool = False,
 ) -> list[dict]:
-    """Emit bounded domain docs with tokenized-hash dedup.
+    """Emit every bounded domain source chunk in source order.
 
     Inputs within the domain cap remain one whole-file document. Oversized SQL,
     build, shell, and diagnostic text use deterministic typed chunks; each
-    chunk is deduplicated independently and carries its exact source
-    byte/character span. Uses the SAME shared DedupStore tables (token-id exact
-    + near) so domain docs dedup globally and resumably.
+    chunk carries its exact source byte/character span. Chunk-level content
+    dedup is intentionally disabled: repeated source chunks are still distinct
+    source spans, and dropping one would create an unrecoverable hole. The
+    tokenizer/dedup parameters remain accepted for caller compatibility; code
+    function dedup continues in ``dedup_root_functions``.
 
     FAIL LOUD (RULE #1): an unreadable discovered file or a non-empty build file
-    that tokenizes empty RAISES. NUL-bearing and invalid UTF-8 explicit domain
-    inputs also raise before any chunk is emitted. Truly empty/whitespace files
-    are counted and skipped.
+    with invalid text RAISES. NUL-bearing and invalid UTF-8 explicit domain
+    inputs also raise before any chunk is emitted. Only zero-length inputs are
+    skipped; whitespace is source content and remains losslessly represented.
     """
     docs: list[dict] = []
     if not build_files:
@@ -7494,35 +8380,22 @@ def emit_build_documents(
             emit_doc(doc)
         emitted += 1
 
-    tok = None
-    store = None
-    seen_local: set[bytes] = set()
-    if tokenizer_path:
-        tok = _load_cppmega_tokenizer(tokenizer_path)
-        if dedup_db:
-            DedupStore, _sha1_tokens = _import_dedup_store_symbols()
-            store = DedupStore(
-                dedup_db,
-                near=dedup_near,
-                commit_every=2000,
-                stage_id=dedup_stage_id,
-                stage_db_path=dedup_stage_db,
-            )
-
-    dropped = 0
-    skipped_empty = 0
+    skipped_zero_length = 0
+    source_chars_in = 0
+    source_chars_out = 0
     from cppmega.data.domain_ingestion import iter_domain_file_chunks
 
     for filepath, build_kind in sorted(build_files):
         try:
             source_chunks = iter_domain_file_chunks(
                 filepath,
-                max_chunk_bytes=BUILD_FILE_SIZE_CAP,
+                max_chunk_bytes=max_chunk_bytes,
             )
             for source_chunk in source_chunks:
                 text = source_chunk.text
-                if not text or not text.strip():
-                    skipped_empty += 1
+                source_chars_in += len(text)
+                if not text:
+                    skipped_zero_length += 1
                     continue
 
                 per_file_build_info = dict(default_build_info) if default_build_info else {}
@@ -7532,6 +8405,11 @@ def emit_build_documents(
                     "zsh",
                     "tcsh",
                     "ksh",
+                    "powershell",
+                    "pwsh",
+                    "ps1",
+                    "batch",
+                    "cmd",
                     "python",
                     "sql",
                     "compiler_diagnostic",
@@ -7542,28 +8420,6 @@ def emit_build_documents(
                     "tool_output",
                 }:
                     per_file_build_info["build_system"] = build_kind
-
-                if tok is not None:
-                    token_ids = tok.encode(text)
-                    if not token_ids:
-                        raise RuntimeError(
-                            f"build file {filepath} ({build_kind}) tokenized to ZERO ids; "
-                            f"tokenizer/build-doc bug (RULE #1: fail loud)"
-                        )
-                    if store is not None:
-                        if store.seen_exact_tokens(token_ids):
-                            dropped += 1
-                            continue
-                        if dedup_near and store.seen_near_tokens(token_ids):
-                            dropped += 1
-                            continue
-                    else:
-                        _DedupStore, _sha1_tokens = _import_dedup_store_symbols()
-                        h = _sha1_tokens(token_ids)
-                        if h in seen_local:
-                            dropped += 1
-                            continue
-                        seen_local.add(h)
 
                 record_doc(
                     build_build_doc(
@@ -7576,6 +8432,7 @@ def emit_build_documents(
                         source_span=source_chunk.source_span(),
                     )
                 )
+                source_chars_out += len(text)
         except ValueError as exc:
             if skip_invalid_inputs and str(exc).startswith(
                 (
@@ -7589,14 +8446,12 @@ def emit_build_documents(
                 continue
             raise
 
-    if store is not None:
-        store.commit()
-        store.close()
-
     print(
-        f"  Build docs: emitted={emitted} dropped_dup={dropped} "
-        f"skipped_empty={skipped_empty} "
-        "(bounded-domain tokenized-hash dedup)",
+        f"  Build docs: emitted={emitted} "
+        f"source_chars_in={source_chars_in} "
+        f"source_chars_out={source_chars_out} "
+        f"skipped_zero_length={skipped_zero_length} "
+        "source_chunk_dedup=disabled_for_lossless_spans",
         file=sys.stderr,
     )
     return docs
@@ -8183,9 +9038,15 @@ def process_project(
     }
     for discovered in typed_domain_files:
         filepath = os.path.abspath(discovered.path)
+        # PowerShell deliberately shares the frozen SH domain ID, so its
+        # adapter (not DomainKind.name) owns the dialect used downstream.
+        discovered_kind = {
+            "powershell": "powershell",
+            "cmd": "cmd",
+        }.get(discovered.adapter, discovered.domain.name.lower())
         domain_files_by_path[filepath] = (
             filepath,
-            discovered.domain.name.lower(),
+            discovered_kind,
         )
     domain_files = sorted(domain_files_by_path.values())
     if invalid_domain_paths:

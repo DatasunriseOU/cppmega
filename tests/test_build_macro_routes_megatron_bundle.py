@@ -16,6 +16,7 @@ from scripts.data.build_macro_routes_megatron_bundle import (
     build_arg_parser,
     _canonical_sha256,
     _ensure_partial_build_plan,
+    _load_ci_manifest_allowlist,
     _load_manifest_allowlist,
     _parse_objective_artifacts,
     _portable_bucket_results,
@@ -28,6 +29,288 @@ from scripts.data.build_macro_routes_megatron_bundle import (
     _validate_objective_source_binding,
     _write_repaired_snapshot_manifest,
 )
+
+_CI_PRODUCER_COMMIT = "c" * 40
+_CI_PRODUCER_TREE_SHA256 = "d" * 64
+
+
+def _write_ci_generation(
+    root: Path,
+    *,
+    buckets: tuple[int, ...] = (1024, 2048, 4096, 8192, 16384),
+) -> Path:
+    source_inventory = [
+        {
+            "name": "ci_logs_enriched.jsonl",
+            "path": "/corpus/ci_logs_enriched.jsonl",
+            "size": 123,
+            "mtime_ns": 456,
+            "sha256": "a" * 64,
+        },
+        {
+            "name": "ci_paired_enriched.jsonl",
+            "path": "/corpus/ci_paired_enriched.jsonl",
+            "size": 789,
+            "mtime_ns": 987,
+            "sha256": "e" * 64,
+        },
+    ]
+    bucket_receipts: dict[str, dict[str, object]] = {}
+    for bucket in buckets:
+        bucket_dir = root / str(bucket)
+        bucket_dir.mkdir(parents=True, exist_ok=True)
+        parquet = bucket_dir / f"ci_packed_{bucket}.parquet"
+        parquet.write_bytes(f"ci-{bucket}".encode("ascii"))
+        persisted = {
+            "schema": builder.CI_BUCKET_MANIFEST_SCHEMA,
+            "kind": "ci",
+            "bucket_seq_length": bucket,
+            "fragments": 1,
+            "packed_rows": 1,
+            "valid_tokens": bucket,
+            "trained_tokens": bucket - 1,
+            "capacity_tokens": bucket,
+            "packing_overflow_docs": 0,
+            "parquet": {
+                "path": parquet.name,
+                "size": parquet.stat().st_size,
+                "sha256": hashlib.sha256(parquet.read_bytes()).hexdigest(),
+            },
+            "domain_kind_counts": {"BUILD_DIAGNOSTIC": 1},
+            "fixed_width_verified": True,
+        }
+        bucket_manifest = bucket_dir / "manifest.json"
+        bucket_manifest.write_text(
+            json.dumps(persisted, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        bucket_receipts[str(bucket)] = {
+            **persisted,
+            "manifest": {
+                "path": f"{bucket}/manifest.json",
+                "sha256": hashlib.sha256(bucket_manifest.read_bytes()).hexdigest(),
+            },
+            "parquet": {
+                **persisted["parquet"],
+                "path": f"{bucket}/{parquet.name}",
+            },
+        }
+    total_tokens = sum(buckets)
+    manifest = {
+        "schema": builder.CI_MANIFEST_SCHEMA,
+        "kind": "ci",
+        "seq_lengths": list(buckets),
+        "source_inventory": source_inventory,
+        "source_inventory_sha256": _canonical_sha256(source_inventory),
+        "source_completion": {
+            "schema": builder.CI_LOG_COMPLETION_SCHEMA,
+            "status": "complete",
+            "receipt_sha256": "f" * 64,
+            "unique_job_count": len(buckets),
+            "fetched_count": len(buckets),
+            "expired_count": 0,
+            "too_short_count": 0,
+            "unresolved_count": 0,
+            "output": {
+                "row_count": len(buckets),
+                "size": source_inventory[0]["size"],
+                "sha256": source_inventory[0]["sha256"],
+            },
+            "state": {
+                "row_count": len(buckets),
+                "sha256": "9" * 64,
+            },
+            "expired_jobs": [],
+        },
+        "counters": {
+            "input_docs": len(buckets),
+            "tokenized_docs": len(buckets),
+            "source_tokens": total_tokens,
+            "fragment_tokens": total_tokens,
+            "fragments": len(buckets),
+            "split_source_docs": 0,
+            "cross_boundary_chunk_edges": 2,
+            "cross_boundary_token_edges": 3,
+            "malformed_json_rows": 0,
+            "empty_text_docs": 0,
+            "zero_token_docs": 0,
+            "normalization_rejects": 0,
+            "packing_overflow_docs": 0,
+            "unexpected_rejects": 0,
+        },
+        "split_policy": {
+            "schema": "cppmega_ci_lossless_token_fragmentation_v1",
+            "token_loss": 0,
+            "cross_boundary_edges_are_counted": True,
+        },
+        "producer": {
+            "script": "tokenize_ci_enriched.py",
+            "script_sha256": "b" * 64,
+            "code_revision": {
+                "schema": "cppmega_ci_code_revision_v2",
+                "schema_version": 2,
+                "repository_identity": "cppmega.mlx",
+                "git_commit": _CI_PRODUCER_COMMIT,
+                "source_tree_sha256": _CI_PRODUCER_TREE_SHA256,
+                "dirty": False,
+                "status_sha256": hashlib.sha256(b"").hexdigest(),
+            },
+        },
+        "buckets": bucket_receipts,
+        "verification": {
+            "fixed_width_all_rows": True,
+            "source_tokens_equal_fragment_tokens": True,
+            "unexpected_rejects": 0,
+            "packing_overflow_docs": 0,
+        },
+    }
+    manifest_path = root / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return manifest_path
+
+
+def test_ci_manifest_allowlist_binds_five_buckets_and_lossless_counters(
+    tmp_path: Path,
+) -> None:
+    ci_root = tmp_path / "ci"
+    manifest_path = _write_ci_generation(ci_root)
+
+    allowed, metadata = _load_ci_manifest_allowlist(
+        manifest_path,
+        ci_root,
+        builder.DEFAULT_BUCKETS,
+        cppmega_mlx_commit=_CI_PRODUCER_COMMIT,
+        cppmega_mlx_tree_sha256=_CI_PRODUCER_TREE_SHA256,
+    )
+
+    assert set(allowed) == {
+        ("ci", bucket) for bucket in builder.DEFAULT_BUCKETS
+    }
+    assert metadata["valid_tokens"] == sum(builder.DEFAULT_BUCKETS)
+    assert metadata["cross_boundary_chunk_edges"] == 2
+    assert metadata["cross_boundary_token_edges"] == 3
+
+
+def test_ci_manifest_allowlist_rejects_hash_drift_rejects_and_orphans(
+    tmp_path: Path,
+) -> None:
+    ci_root = tmp_path / "ci"
+    manifest_path = _write_ci_generation(ci_root)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    manifest["counters"]["normalization_rejects"] = 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="reject counters"):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit=_CI_PRODUCER_COMMIT,
+            cppmega_mlx_tree_sha256=_CI_PRODUCER_TREE_SHA256,
+        )
+
+    manifest_path = _write_ci_generation(ci_root)
+    (ci_root / "1024" / "ci_packed_1024.parquet").write_bytes(b"drifted")
+    with pytest.raises(RuntimeError, match="artifact binding drifted"):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit=_CI_PRODUCER_COMMIT,
+            cppmega_mlx_tree_sha256=_CI_PRODUCER_TREE_SHA256,
+        )
+
+    manifest_path = _write_ci_generation(ci_root)
+    (ci_root / "1024" / "orphan.parquet").write_bytes(b"orphan")
+    with pytest.raises(RuntimeError, match="inventory differs"):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit=_CI_PRODUCER_COMMIT,
+            cppmega_mlx_tree_sha256=_CI_PRODUCER_TREE_SHA256,
+        )
+
+
+def test_ci_manifest_rejects_incomplete_or_unbound_log_extraction(
+    tmp_path: Path,
+) -> None:
+    ci_root = tmp_path / "ci"
+    manifest_path = _write_ci_generation(ci_root)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["source_completion"]["unresolved_count"] = 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="completion is missing or incomplete"):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit=_CI_PRODUCER_COMMIT,
+            cppmega_mlx_tree_sha256=_CI_PRODUCER_TREE_SHA256,
+        )
+
+    manifest_path = _write_ci_generation(ci_root)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["source_completion"]["output"]["sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="artifact binding drifted"):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit=_CI_PRODUCER_COMMIT,
+            cppmega_mlx_tree_sha256=_CI_PRODUCER_TREE_SHA256,
+        )
+
+
+def test_ci_manifest_rejects_stale_or_forged_mlx_revision_and_inventory(
+    tmp_path: Path,
+) -> None:
+    ci_root = tmp_path / "ci"
+
+    manifest_path = _write_ci_generation(ci_root)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["producer"]["code_revision"]["git_commit"] = "f" * 40
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="producer commit"):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit=_CI_PRODUCER_COMMIT,
+            cppmega_mlx_tree_sha256=_CI_PRODUCER_TREE_SHA256,
+        )
+
+    manifest_path = _write_ci_generation(ci_root)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["producer"]["code_revision"]["source_tree_sha256"] = "f" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="producer source tree"):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit=_CI_PRODUCER_COMMIT,
+            cppmega_mlx_tree_sha256=_CI_PRODUCER_TREE_SHA256,
+        )
+
+    manifest_path = _write_ci_generation(ci_root)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["source_inventory"][1]["name"] = "ambient_fallback.jsonl"
+    manifest["source_inventory_sha256"] = _canonical_sha256(
+        manifest["source_inventory"]
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="canonical ordered pair"):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit=_CI_PRODUCER_COMMIT,
+            cppmega_mlx_tree_sha256=_CI_PRODUCER_TREE_SHA256,
+        )
 
 
 def test_bundle_known_limitations_do_not_claim_retired_qname_or_domain_gaps() -> None:
@@ -47,6 +330,8 @@ def _conveyor_revision_binding() -> dict[str, object]:
             "git_commit": "a" * 40,
             "dirty": False,
             "source_tree_sha256": "b" * 64,
+            "producer_role": "canonical_source_conveyor",
+            "repository_identity": "cppmega",
             "indexer_dependency_closure_sha256": "d" * 64,
             "indexer_provenance": {
                 "schema": "cppmega_indexer_dependency_binding_v1",
@@ -64,8 +349,10 @@ def _conveyor_revision_binding() -> dict[str, object]:
 def test_bundle_producer_binding_covers_cppmega_mlx_and_indexer_closure() -> None:
     binding = _producer_binding_from_conveyor(
         _conveyor_revision_binding(),
-        cppmega_commit="e" * 40,
-        cppmega_tree_sha256="f" * 64,
+        cppmega_commit="a" * 40,
+        cppmega_tree_sha256="b" * 64,
+        cppmega_mlx_commit="e" * 40,
+        cppmega_mlx_tree_sha256="f" * 64,
     )
 
     assert set(binding["components"]) == {
@@ -76,6 +363,14 @@ def test_bundle_producer_binding_covers_cppmega_mlx_and_indexer_closure() -> Non
     assert binding["components"]["clang_indexer"][
         "dependency_closure_sha256"
     ] == "d" * 64
+    assert binding["components"]["cppmega"] == {
+        "commit": "a" * 40,
+        "tree_sha256": "b" * 64,
+    }
+    assert binding["components"]["cppmega_mlx"] == {
+        "commit": "e" * 40,
+        "tree_sha256": "f" * 64,
+    }
 
 
 def test_bundle_producer_binding_rejects_legacy_revision_receipt() -> None:
@@ -84,6 +379,33 @@ def test_bundle_producer_binding_rejects_legacy_revision_receipt() -> None:
             {"code_revision": {"schema_version": 1, "dirty": False}},
             cppmega_commit="e" * 40,
             cppmega_tree_sha256="f" * 64,
+            cppmega_mlx_commit="a" * 40,
+            cppmega_mlx_tree_sha256="b" * 64,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("producer_role", "unknown", "producer role"),
+        ("repository_identity", "cppmega_mlx", "not bound to cppmega"),
+        ("git_commit", "9" * 40, "cppmega commit"),
+        ("source_tree_sha256", "8" * 64, "cppmega source tree"),
+    ],
+)
+def test_bundle_producer_binding_rejects_wrong_repository_provenance(
+    field: str, value: str, error: str
+) -> None:
+    conveyor = _conveyor_revision_binding()
+    conveyor["code_revision"][field] = value
+
+    with pytest.raises(RuntimeError, match=error):
+        _producer_binding_from_conveyor(
+            conveyor,
+            cppmega_commit="a" * 40,
+            cppmega_tree_sha256="b" * 64,
+            cppmega_mlx_commit="e" * 40,
+            cppmega_mlx_tree_sha256="f" * 64,
         )
 
 

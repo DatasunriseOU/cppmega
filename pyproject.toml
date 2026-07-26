@@ -34,3 +34,6 @@ include = ["cppmega", "cppmega.*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "native_toolchain: requires libclang or local C/C++ compilation",
+]

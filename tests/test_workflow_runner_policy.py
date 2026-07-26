@@ -99,6 +99,17 @@ def test_workflow_delegates_to_authoritative_lanes_with_source_binding() -> None
     assert lanes["linux-contracts"]["test_profile"] == "portable-data"
 
 
+def test_macos_workflow_does_not_expand_an_empty_array_under_bash_3() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci-self-hosted.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "mlx_contract_args=()" not in workflow
+    assert '"${mlx_contract_args[@]}"' not in workflow
+    assert workflow.count("scripts/data/verify_tokenizer_contract.py") == 3
+    assert workflow.count('--mlx-root "${CPPMEGA_MLX_REFERENCE_ROOT}"') == 1
+
+
 def test_frozen_domain_eval_is_wired_into_repository_owned_ci() -> None:
     workflow = (REPO_ROOT / ".github" / "workflows" / "ci-self-hosted.yml").read_text(
         encoding="utf-8"

@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Tier-2 PR ingest, component (5): GraphQL-PRIMARY whole-repo PR streamer.
 
-The HYBRID strategy the user chose: GraphQL is the PRIMARY (free) path; GH
-Archive is only the FALLBACK when we hit a wall on a particular repo (too many
-PRs / chronic rate limiting). Where ``github_graphql_fallback.py`` fetches ONE
-(repo, pr_number) at a time (gap-filling), THIS module streams EVERY PR of EVERY
-repo in ``repo_list.json`` by paginating the ``pullRequests`` connection, and
-folds each PR into the same ``pr_store`` (by (repo,pr_number) AND by
+GraphQL is the canonical whole-repository path. Where
+``github_graphql_fallback.py`` fetches ONE (repo, pr_number) at a time for
+explicit, receipt-bound gap filling, THIS module streams EVERY PR of EVERY repo
+in ``repo_list.json`` by paginating the ``pullRequests`` connection, and folds
+each PR into the same ``pr_store`` (by (repo,pr_number) AND by
 (repo, mergeCommit.oid)).
 
 For each repo we page::
@@ -36,12 +35,12 @@ silently drop a repo):
     their saved cursor. The manifest is rewritten atomically after each
     committed page, so resume is per-repo AND per-cursor.
 
-GH Archive FALLBACK HOOK (does NOT block the stream): if a repo trips the
-fallback heuristic — its total PR count exceeds ``--fallback-pr-threshold`` or it
-rate-limits us more than ``--fallback-ratelimit-trips`` times — we mark it
-``fallback`` in the manifest AND append it to ``--fallback-list`` (JSONL) for the
-gharchive_run.sh path to pick up, then MOVE ON to the next repo. We do not abort
-the whole stream for one pathological repo.
+Legacy fallback entries are non-terminal. They are retried only when
+``--retry-fallback`` is explicit, and the process exits non-zero until every
+expected repository is ``done``. The fallback thresholds default to disabled;
+enabling them creates resumable work, never a successful completion receipt.
+Every PR whose nested discussion connections exceed the inline page is recorded
+in the persistent ``--truncated-targets`` set for the explicit gap filler.
 
 Usage:
   python3 scripts/pr_ingest/graphql_pr_stream.py \
@@ -49,7 +48,8 @@ Usage:
       --store out/pr_store.sqlite \
       --tokens secrets/gh_tokens.txt \
       --manifest out/graphql_stream_manifest.json \
-      --fallback-list out/graphql_fallback_repos.jsonl
+      --fallback-list out/graphql_fallback_repos.jsonl \
+      --truncated-targets out/graphql_truncated_targets.jsonl
 
   # Validate on ONE explicit repo before repo_list.json exists:
   python3 scripts/pr_ingest/graphql_pr_stream.py \
@@ -61,6 +61,7 @@ Usage:
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime as _dt
+import hashlib
 import json
 import os
 import subprocess
@@ -84,15 +85,16 @@ from scripts.pr_ingest.github_graphql_fallback import load_tokens  # noqa: E402
 
 GQL_URL = "https://api.github.com/graphql"
 
-# One page of a repo's pullRequests connection. Each PR's comments/reviews are
-# fetched first-page only (100 comments / 50 reviews) inline; the rare PR with
-# MORE than that is finished by the per-PR gap-filler in
-# github_graphql_fallback.py (we record it for that path). This keeps the stream
-# query cheap and bounded so we page repos fast and rate-limit-lightly.
+# One bounded page of a repo's pullRequests connection. Review-thread comments
+# must be fetched inline too: treating every PR with any review thread as a gap
+# target produced hundreds of thousands of unnecessary per-PR follow-up calls.
+# The 50 x (20 x 50) nested bound stays well below GitHub's 500,000-node query
+# cap; only a connection that actually exceeds an inline bound is routed to the
+# exact per-PR gap filler.
 REPO_PR_QUERY = """
 query($owner:String!, $name:String!, $cursor:String) {
   repository(owner:$owner, name:$name) {
-    pullRequests(first:100, after:$cursor,
+    pullRequests(first:50, after:$cursor,
                  states:[MERGED,CLOSED,OPEN],
                  orderBy:{field:CREATED_AT, direction:ASC}) {
       totalCount
@@ -110,7 +112,18 @@ query($owner:String!, $name:String!, $cursor:String) {
           totalCount
           nodes { author { login } state body submittedAt }
         }
+        reviewThreads(first:20) {
+          totalCount
+          nodes {
+            id
+            comments(first:50) {
+              totalCount
+              nodes { id author { login } body path createdAt }
+            }
+          }
+        }
         closingIssuesReferences(first:20) {
+          totalCount
           nodes { number title body }
         }
       }
@@ -118,6 +131,14 @@ query($owner:String!, $name:String!, $cursor:String) {
   }
 }
 """
+GRAPHQL_MANIFEST_SCHEMA = "cppmega_graphql_pr_stream_manifest_v3"
+GRAPHQL_STREAM_SEMANTICS_VERSION = 3
+GRAPHQL_QUERY_CONTRACT_SHA256 = hashlib.sha256(
+    (
+        REPO_PR_QUERY
+        + f"\nsemantic-normalization-v{GRAPHQL_STREAM_SEMANTICS_VERSION}\n"
+    ).encode("utf-8")
+).hexdigest()
 
 
 # --------------------------------------------------------------------------- #
@@ -160,10 +181,16 @@ def load_all_tokens(tokens_file: str, include_gh_cli: bool = True) -> list[str]:
 class Manifest:
     """Per-(repo, endCursor) resumable checkpoint, persisted atomically."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, restart_query_contract: bool = False):
         self.path = path
         self._lock = threading.RLock()
-        self.data: dict = {"repos": {}}
+        self.restart_tag: str | None = None
+        empty = {
+            "schema": GRAPHQL_MANIFEST_SCHEMA,
+            "query_contract_sha256": GRAPHQL_QUERY_CONTRACT_SHA256,
+            "repos": {},
+        }
+        self.data: dict = dict(empty)
         if os.path.exists(path):
             with open(path) as f:
                 try:
@@ -173,6 +200,31 @@ class Manifest:
                         f"[graphql-stream] manifest {path} is corrupt JSON: {e}. "
                         f"Move it aside to start fresh (RULE #1: not silently overwriting)."
                     )
+            contract_matches = (
+                self.data.get("schema") == GRAPHQL_MANIFEST_SCHEMA
+                and self.data.get("query_contract_sha256")
+                == GRAPHQL_QUERY_CONTRACT_SHA256
+            )
+            if not contract_matches and restart_query_contract:
+                self.restart_tag = (
+                    f"{GRAPHQL_MANIFEST_SCHEMA}-"
+                    f"{int(time.time())}-{os.getpid()}"
+                )
+                backup = f"{path}.pre-{self.restart_tag}.json"
+                os.replace(path, backup)
+                sys.stderr.write(
+                    "[graphql-stream] archived incompatible manifest to "
+                    f"{backup}; restarting every repo under query contract "
+                    f"{GRAPHQL_QUERY_CONTRACT_SHA256}\n"
+                )
+                self.data = dict(empty)
+            elif not contract_matches:
+                raise SystemExit(
+                    "[graphql-stream] manifest query contract is missing or stale; "
+                    "refusing to reuse done/cursor state produced without complete "
+                    "review-thread and linked-issue accounting. Rerun once with "
+                    "--restart-query-contract to archive it and rescan every repo."
+                )
             if "repos" not in self.data:
                 raise SystemExit(
                     f"[graphql-stream] manifest {path} missing 'repos' key (wrong file?)"
@@ -202,6 +254,27 @@ class Manifest:
             json.dump(self.data, f, indent=2, sort_keys=True)
             f.write("\n")
         os.replace(tmp, self.path)  # atomic on POSIX
+
+
+def archive_query_bound_side_files(
+    manifest: Manifest,
+    paths: tuple[str, ...],
+) -> list[str]:
+    """Archive side files whose contents were produced by a stale query."""
+
+    if manifest.restart_tag is None:
+        return []
+    archived: list[str] = []
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        backup = f"{path}.pre-{manifest.restart_tag}"
+        os.replace(path, backup)
+        archived.append(backup)
+        sys.stderr.write(
+            f"[graphql-stream] archived query-bound side file to {backup}\n"
+        )
+    return archived
 
 
 class StreamAborted(Exception):
@@ -292,7 +365,10 @@ class RepoRateLimited(Exception):
 
 def _post_with_rotation(pool: "SharedTokenPool", variables: dict, owner: str, name: str,
                         max_retries: int,
-                        stop_event: threading.Event | None = None) -> dict:
+                        stop_event: threading.Event | None = None,
+                        post_fn: Callable[
+                            [str, dict], tuple[int, dict, dict]
+                        ] = _post) -> dict:
     """POST one page via the SHARED pool, rotating tokens on rate limits.
 
     Returns the JSON body on success. RAISES:
@@ -312,7 +388,7 @@ def _post_with_rotation(pool: "SharedTokenPool", variables: dict, owner: str, na
         # Reserve a usable token from the SHARED pool (raises AllTokensExhausted
         # when every token is cooling) -- cooldowns set below are seen by all.
         idx, token = pool.acquire()
-        status, headers, jb = _post(token, variables)
+        status, headers, jb = post_fn(token, variables)
 
         if status == 401:
             unauthorized += 1
@@ -332,6 +408,10 @@ def _post_with_rotation(pool: "SharedTokenPool", variables: dict, owner: str, na
         remaining = headers.get("X-RateLimit-Remaining")
         retry_after = headers.get("Retry-After")
         jb_lower = json.dumps(jb).lower()
+        graphql_rate_limited = any(
+            isinstance(error, dict) and error.get("type") == "RATE_LIMITED"
+            for error in jb.get("errors", ())
+        )
         is_secondary = status == 403 and (
             retry_after is not None
             or "secondary rate limit" in jb_lower
@@ -342,7 +422,12 @@ def _post_with_rotation(pool: "SharedTokenPool", variables: dict, owner: str, na
                 f"[graphql-stream] 403 Forbidden (not a rate limit) for "
                 f"{owner}/{name}: {jb.get('message', jb)}"
             )
-        if is_secondary or (remaining is not None and remaining == "0") or status == 429:
+        if (
+            graphql_rate_limited
+            or is_secondary
+            or (remaining is not None and remaining == "0")
+            or status == 429
+        ):
             attempts += 1
             if attempts > max_retries:
                 # Burned the per-page budget on THIS repo -> soft signal up.
@@ -375,7 +460,7 @@ def _post_with_rotation(pool: "SharedTokenPool", variables: dict, owner: str, na
 # --------------------------------------------------------------------------- #
 def _pr_node_to_record(repo: str, node: dict) -> tuple[dict, bool]:
     """Return (record, truncated). ``truncated`` is True when this PR had MORE
-    comments/reviews than one page (the per-PR gap-filler should finish it)."""
+    nested records than an inline connection bound."""
     number = node["number"]
     mc = node.get("mergeCommit")
     merge_sha = mc.get("oid") if mc else None
@@ -407,12 +492,44 @@ def _pr_node_to_record(repo: str, node: dict) -> tuple[dict, bool]:
     if (rv.get("totalCount") or 0) > len(rv.get("nodes", [])):
         truncated = True
 
-    for li in (node.get("closingIssuesReferences") or {}).get("nodes", []):
+    review_threads = node.get("reviewThreads") or {}
+    thread_nodes = review_threads.get("nodes", [])
+    if (review_threads.get("totalCount") or 0) > len(thread_nodes):
+        truncated = True
+    for thread in thread_nodes:
+        thread_comments = thread.get("comments")
+        if not isinstance(thread_comments, dict):
+            truncated = True
+            continue
+        inline_nodes = thread_comments.get("nodes", [])
+        for comment in inline_nodes:
+            comments.append(
+                {
+                    "user": (
+                        (comment.get("author") or {}).get("login", "")
+                        if comment.get("author")
+                        else ""
+                    ),
+                    "body": comment.get("body", "") or "",
+                    "path": comment.get("path"),
+                    "created_at": comment.get("createdAt", "") or "",
+                    "kind": "review_comment",
+                }
+            )
+        if (thread_comments.get("totalCount") or 0) > len(inline_nodes):
+            truncated = True
+
+    linked_connection = node.get("closingIssuesReferences") or {}
+    for li in linked_connection.get("nodes", []):
         linked.append({
             "number": li["number"],
             "title": li.get("title", "") or "",
             "body": li.get("body", "") or "",
         })
+    if (linked_connection.get("totalCount") or 0) > len(
+        linked_connection.get("nodes", [])
+    ):
+        truncated = True
 
     comments.sort(key=lambda c: c.get("created_at") or "")
     reviews.sort(key=lambda r: r.get("created_at") or "")
@@ -445,6 +562,7 @@ def stream_repo(
     max_retries: int = 8,
     truncated_targets_path: str | None = None,
     append_lock: threading.Lock | None = None,
+    truncated_target_keys: set[tuple[str, int]] | None = None,
     stop_event: threading.Event | None = None,
 ) -> dict:
     """Stream all PRs of ``repo``. Resumes from manifest cursor if present.
@@ -473,13 +591,23 @@ def stream_repo(
                                      stop_event=stop_event)
         except RepoRateLimited:
             stats["ratelimit_trips"] += 1
-            if stats["ratelimit_trips"] >= fallback_ratelimit_trips:
+            if (
+                fallback_ratelimit_trips > 0
+                and stats["ratelimit_trips"] >= fallback_ratelimit_trips
+            ):
                 _route_to_fallback(
                     manifest, repo, fallback_list_path, cursor,
                     reason="ratelimit", stats=stats, total_count=total_count,
                     append_lock=append_lock,
                 )
                 return stats
+            if fallback_ratelimit_trips <= 0:
+                raise SystemExit(
+                    f"[graphql-stream] {repo}: per-page rate-limit retry budget "
+                    f"exhausted at cursor={cursor!r}; progress is saved. Automated "
+                    "fallback is disabled, so rerun after reset or explicitly set "
+                    "--fallback-ratelimit-trips."
+                )
             # Another wall on the same page but under the trip cap: brief pause,
             # then retry the SAME cursor (no progress lost).
             time.sleep(2.0)
@@ -497,7 +625,10 @@ def stream_repo(
             total_count = prconn.get("totalCount")
             # Fallback heuristic on size: a huge repo is routed to GH Archive at
             # the very first page, BEFORE we burn quota paging it here.
-            if (total_count or 0) > fallback_pr_threshold:
+            if (
+                fallback_pr_threshold > 0
+                and (total_count or 0) > fallback_pr_threshold
+            ):
                 _route_to_fallback(
                     manifest, repo, fallback_list_path, cursor,
                     reason="too_many_prs", stats=stats, total_count=total_count,
@@ -507,11 +638,32 @@ def stream_repo(
 
         for node in prconn.get("nodes", []):
             rec, truncated = _pr_node_to_record(repo, node)
-            pr_store.upsert_record(conn, rec, commit=False)
+            pr_store.upsert_record(
+                conn,
+                rec,
+                commit=False,
+                replace_children=True,
+            )
             stats["prs"] += 1
             if truncated:
                 stats["truncated"] += 1
-                if truncated_targets_path:
+                if truncated_targets_path is None or truncated_target_keys is None:
+                    raise SystemExit(
+                        f"[graphql-stream] {repo}#{rec['pr_number']}: truncated "
+                        "discussion requires --truncated-targets and exact gap-fill "
+                        "accounting"
+                    )
+                target_key = (repo, int(rec["pr_number"]))
+                should_append = False
+                if append_lock is not None:
+                    with append_lock:
+                        if target_key not in truncated_target_keys:
+                            truncated_target_keys.add(target_key)
+                            should_append = True
+                elif target_key not in truncated_target_keys:
+                    truncated_target_keys.add(target_key)
+                    should_append = True
+                if should_append:
                     _append_jsonl(
                         truncated_targets_path,
                         {"repo": repo, "pr_number": rec["pr_number"]},
@@ -521,7 +673,17 @@ def stream_repo(
                 conn.commit()
                 manifest.update(
                     repo, status="in_progress", cursor=cursor,
-                    prs=stats["prs"], total_count=total_count,
+                    prs=int(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM prs WHERE repo=?",
+                            (repo,),
+                        ).fetchone()[0]
+                    ),
+                    truncated=sum(
+                        1 for target_repo, _number in truncated_target_keys
+                        if target_repo == repo
+                    ),
+                    total_count=total_count,
                     note=f"stopped at --max-prs={max_prs}",
                 )
                 stats["pages"] += 1
@@ -540,7 +702,16 @@ def stream_repo(
             repo,
             status="in_progress" if has_next else "done",
             cursor=cursor if has_next else None,
-            prs=stats["prs"], truncated=stats["truncated"],
+            prs=int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM prs WHERE repo=?",
+                    (repo,),
+                ).fetchone()[0]
+            ),
+            truncated=sum(
+                1 for target_repo, _number in truncated_target_keys
+                if target_repo == repo
+            ),
             total_count=total_count,
         )
         if not has_next:
@@ -579,6 +750,44 @@ def _append_jsonl(path: str, obj: dict, *, lock: threading.Lock | None = None) -
         return
     with open(path, "a") as f:
         f.write(json.dumps(obj) + "\n")
+
+
+def load_truncated_target_keys(path: str) -> set[tuple[str, int]]:
+    """Load the durable unique gap-target set used for resume accounting."""
+
+    if not os.path.exists(path):
+        return set()
+    targets: set[tuple[str, int]] = set()
+    with open(path, encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise SystemExit(
+                    f"[graphql-stream] {path}:{line_number}: invalid truncated "
+                    f"target JSON: {exc}"
+                ) from exc
+            if not isinstance(item, dict):
+                raise SystemExit(
+                    f"[graphql-stream] {path}:{line_number}: target must be an object"
+                )
+            repo = item.get("repo")
+            number = item.get("pr_number")
+            if (
+                not isinstance(repo, str)
+                or "/" not in repo
+                or not isinstance(number, int)
+                or isinstance(number, bool)
+                or number < 1
+            ):
+                raise SystemExit(
+                    f"[graphql-stream] {path}:{line_number}: invalid target {item!r}"
+                )
+            targets.add((repo, number))
+    return targets
 
 
 # --------------------------------------------------------------------------- #
@@ -628,6 +837,39 @@ def load_repo_list(path: str) -> list[str]:
     if not out:
         raise SystemExit(f"[graphql-stream] {path} resolved zero repos")
     return out
+
+
+def manifest_completion_summary(manifest: Manifest, repos: list[str]) -> dict:
+    """Return an exact terminal-state summary for the requested repo set.
+
+    A GraphQL stream invocation is successful only when every expected repo is
+    ``done``.  ``fallback`` is intentionally non-terminal here: a separate
+    reconciliation/completion receipt must prove any non-GraphQL source before
+    training can consume it.
+    """
+
+    counts = {
+        "done": 0,
+        "fallback": 0,
+        "in_progress": 0,
+        "pending": 0,
+        "other": 0,
+    }
+    incomplete: list[dict[str, str]] = []
+    for repo in repos:
+        status = manifest.status(repo)
+        if status in counts:
+            counts[status] += 1
+        else:
+            counts["other"] += 1
+        if status != "done":
+            incomplete.append({"repo": repo, "status": status})
+    return {
+        "status": "complete" if not incomplete else "incomplete",
+        "expected": len(repos),
+        **counts,
+        "incomplete_repos": incomplete,
+    }
 
 
 
@@ -884,16 +1126,32 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--manifest", required=True, help="Per-repo resume manifest JSON")
     ap.add_argument("--fallback-list", required=True,
                     help="JSONL of repos routed to the GH Archive fallback")
-    ap.add_argument("--truncated-targets",
+    ap.add_argument("--truncated-targets", required=True,
                     help="JSONL of (repo,pr_number) whose comments/reviews "
                          "overflowed one page (finish via github_graphql_fallback.py)")
     ap.add_argument("--no-gh-cli", dest="include_gh_cli", action="store_false",
                     help="Do NOT append `gh auth token` as the 6th token")
-    ap.add_argument("--fallback-pr-threshold", type=int, default=20000,
-                    help="Route a repo to GH Archive if totalCount exceeds this")
-    ap.add_argument("--fallback-ratelimit-trips", type=int, default=3,
+    ap.add_argument("--fallback-pr-threshold", type=int, default=0,
+                    help="Route a repo to GH Archive if totalCount exceeds this. "
+                         "0 disables automated fallback (production default).")
+    ap.add_argument("--fallback-ratelimit-trips", type=int, default=0,
                     help="Route a repo to GH Archive after this many page-level "
-                         "rate-limit walls")
+                         "rate-limit walls. 0 disables automated fallback.")
+    ap.add_argument(
+        "--retry-fallback",
+        action="store_true",
+        help="Explicitly resume repos currently marked fallback from their saved "
+             "cursor. With production defaults they stay on the GraphQL path.",
+    )
+    ap.add_argument(
+        "--restart-query-contract",
+        action="store_true",
+        help=(
+            "Archive an incompatible legacy manifest and rescan every repo under "
+            "the current complete nested-connection query contract. The PR store "
+            "is retained and authoritatively refreshed."
+        ),
+    )
     ap.add_argument("--max-retries", type=int, default=8,
                     help="Per-page rate-limit retry budget before a fallback trip")
     ap.add_argument("--max-prs", type=int,
@@ -919,10 +1177,19 @@ def main(argv: list[str] | None = None) -> int:
     # workers open their own connections.
     parent_conn = pr_store.connect(args.store, create=True)
     parent_conn.close()
-    manifest = Manifest(args.manifest)
+    manifest = Manifest(
+        args.manifest,
+        restart_query_contract=args.restart_query_contract,
+    )
+    archive_query_bound_side_files(
+        manifest,
+        (args.truncated_targets, args.fallback_list),
+    )
     append_lock = threading.Lock()
+    truncated_target_keys = load_truncated_target_keys(args.truncated_targets)
 
-    repos = [args.repo] if args.repo else load_repo_list(args.repo_list)
+    expected_repos = [args.repo] if args.repo else load_repo_list(args.repo_list)
+    repos = list(expected_repos)
     if args.max_repos is not None:
         repos = repos[: args.max_repos]
 
@@ -938,13 +1205,28 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"[graphql-stream] {repo}: already done, skipping\n")
             continue
         if st == "fallback":
-            sys.stderr.write(f"[graphql-stream] {repo}: already routed to fallback, skipping\n")
-            totals["repos_fallback"] += 1
-            continue
+            if args.retry_fallback:
+                manifest.update(repo, status="in_progress")
+                sys.stderr.write(
+                    f"[graphql-stream] {repo}: explicitly retrying prior fallback "
+                    f"from cursor={manifest.cursor(repo)!r}\n"
+                )
+            else:
+                sys.stderr.write(
+                    f"[graphql-stream] {repo}: already routed to fallback; "
+                    "remaining incomplete (use --retry-fallback after choosing "
+                    "the GraphQL completion path)\n"
+                )
+                totals["repos_fallback"] += 1
+                continue
         runnable.append(repo)
 
     def run_one(repo: str, worker_index: int) -> dict:
-        conn = pr_store.connect(args.store, create=True)
+        conn = pr_store.connect(
+            args.store,
+            create=False,
+            initialize=False,
+        )
         try:
             st = manifest.status(repo)
             sys.stderr.write(
@@ -961,6 +1243,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_prs=args.max_prs, max_retries=args.max_retries,
                 truncated_targets_path=args.truncated_targets,
                 append_lock=append_lock,
+                truncated_target_keys=truncated_target_keys,
                 stop_event=stop_event,
             )
         finally:
@@ -1031,11 +1314,21 @@ def main(argv: list[str] | None = None) -> int:
             stop_event.set()
             executor.shutdown(wait=False, cancel_futures=True)
 
+    completion = manifest_completion_summary(manifest, expected_repos)
     sys.stderr.write(
         f"[graphql-stream] DONE repos_done={totals['repos_done']} "
         f"repos_fallback={totals['repos_fallback']} prs={totals['prs']} "
-        f"truncated={totals['truncated']} store={args.store}\n"
+        f"truncated={totals['truncated']} store={args.store} "
+        f"completion={completion['status']} "
+        f"done={completion['done']}/{completion['expected']}\n"
     )
+    if completion["status"] != "complete":
+        sample = completion["incomplete_repos"][:20]
+        sys.stderr.write(
+            "[graphql-stream] INCOMPLETE: expected repo set still contains "
+            f"non-terminal entries; sample={sample}. Returning non-zero.\n"
+        )
+        return 1
     return 0
 
 

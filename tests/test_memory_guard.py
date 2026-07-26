@@ -91,5 +91,7 @@ def test_embedded_data_apis_accept_explicit_unbounded_fixture_budget(
         overflow_policy="drop",
         memory_limit_gb=0.0,
     )
-    assert summary == {"docs_in": 1, "docs_out": 1}
+    assert summary["docs_in"] == 1
+    assert summary["docs_out"] == 1
+    assert summary["dropped_input_docs"] == 0
     assert output_path.is_file()

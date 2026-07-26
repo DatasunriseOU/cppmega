@@ -212,6 +212,31 @@ def test_sidecar_audit_requires_all_source_roots_explicitly(capsys):
     assert "--pr-root" in stderr
 
 
+def test_sidecar_audit_routes_explicit_ci_root_as_ci_kind(tmp_path):
+    audit = _load_audit_module()
+    ci_path = tmp_path / "ci" / "1024" / "ci.parquet"
+    ci_path.parent.mkdir(parents=True)
+    ci_path.touch()
+
+    args = audit.build_arg_parser().parse_args(
+        [
+            "--code-root",
+            str(tmp_path / "code"),
+            "--commit-root",
+            str(tmp_path / "commits"),
+            "--pr-root",
+            str(tmp_path / "pr"),
+            "--ci-root",
+            str(tmp_path / "ci"),
+        ]
+    )
+
+    assert args.ci_root == tmp_path / "ci"
+    assert audit._discover(args.ci_root, "ci", {"1024"}) == [
+        (str(ci_path), "ci", "1024")
+    ]
+
+
 def test_sidecar_audit_accepts_valid_chunk_indexed_edges(tmp_path):
     code_root = tmp_path / "code"
     commit_root = tmp_path / "commits"

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from cppmega.data.build_parsers.base import ParsedDomainDocument, is_option
 from cppmega.data.domain_schema import (
     DomainEdgeKind,
@@ -21,6 +23,156 @@ _KSH_KEYWORDS = {"compound", "function", "integer", "nameref", "typeset"}
 _TCSH_KEYWORDS = {"setenv", "unsetenv", "alias", "foreach", "endif", "switch", "endsw"}
 _REDIR_OUT = {">", ">>", "2>", "&>"}
 _REDIR_IN = {"<"}
+_HEREDOC_RE = re.compile(
+    r"<<(?P<strip>-?)[ \t]*(?P<quote>['\"]?)"
+    r"(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)"
+)
+
+
+def _shell_lexical_spans(
+    text: str,
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """Return comment and quoted spans without losing source offsets."""
+
+    comments: list[tuple[int, int]] = []
+    quotes: list[tuple[int, int]] = []
+    quote: str | None = None
+    quote_start = 0
+    escaped = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if quote == "'":
+            if char == "'":
+                quotes.append((quote_start, index + 1))
+                quote = None
+            index += 1
+            continue
+        if quote == '"':
+            if char == "\\":
+                escaped = True
+            elif char == '"':
+                quotes.append((quote_start, index + 1))
+                quote = None
+            index += 1
+            continue
+        if char == "\\":
+            escaped = True
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            quote_start = index
+            index += 1
+            continue
+        if char == "#" and (
+            index == 0
+            or text[index - 1].isspace()
+            or text[index - 1] in ";|&(){}<>"
+        ):
+            end = text.find("\n", index)
+            if end < 0:
+                end = len(text)
+            comments.append((index, end))
+            index = end
+            continue
+        index += 1
+    if quote is not None:
+        quotes.append((quote_start, len(text)))
+    return comments, quotes
+
+
+def _shell_heredoc_spans(
+    text: str,
+    *,
+    protected_spans: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Return heredoc declaration and payload spans, including terminators."""
+
+    lines = text.splitlines(keepends=True)
+    offsets: list[int] = []
+    offset = 0
+    for line in lines:
+        offsets.append(offset)
+        offset += len(line)
+
+    def protected(position: int) -> bool:
+        return any(start <= position < end for start, end in protected_spans)
+
+    spans: list[tuple[int, int]] = []
+    line_index = 0
+    while line_index < len(lines):
+        line = lines[line_index]
+        pending: list[tuple[int, int, str, bool]] = []
+        for match in _HEREDOC_RE.finditer(line):
+            declaration_start = offsets[line_index] + match.start()
+            if protected(declaration_start):
+                continue
+            if match.start() > 0 and line[match.start() - 1] == "<":
+                continue
+            prefix = line[: match.start()]
+            if prefix.rfind("((") > prefix.rfind("))"):
+                continue
+            pending.append(
+                (
+                    declaration_start,
+                    offsets[line_index] + match.end(),
+                    match.group("delimiter"),
+                    match.group("strip") == "-",
+                )
+            )
+        if not pending:
+            line_index += 1
+            continue
+
+        scan_index = line_index + 1
+        for declaration_start, declaration_end, delimiter, strip_tabs in pending:
+            spans.append((declaration_start, declaration_end))
+            body_start = offsets[scan_index] if scan_index < len(lines) else len(text)
+            close_end = len(text)
+            while scan_index < len(lines):
+                candidate = lines[scan_index].rstrip("\r\n")
+                comparison = candidate.lstrip("\t") if strip_tabs else candidate
+                if comparison == delimiter:
+                    close_end = offsets[scan_index] + len(lines[scan_index])
+                    scan_index += 1
+                    break
+                scan_index += 1
+            spans.append((body_start, close_end))
+        line_index = max(line_index + 1, scan_index)
+    return spans
+
+
+def _ignored_shell_spans(text: str) -> list[tuple[int, int]]:
+    """Find regions that cannot contain shell commands or graph operators."""
+
+    comments, quotes = _shell_lexical_spans(text)
+    ignored = list(comments)
+    ignored.extend(
+        span
+        for span in quotes
+        if "\n" in text[span[0] : span[1]] or "\r" in text[span[0] : span[1]]
+    )
+    ignored.extend(
+        _shell_heredoc_spans(
+            text,
+            protected_spans=comments + quotes,
+        )
+    )
+    return sorted(ignored)
+
+
+def _mask_ignored_shell_spans(text: str) -> str:
+    masked = list(text)
+    for start, end in _ignored_shell_spans(text):
+        for index in range(start, end):
+            if masked[index] not in "\r\n":
+                masked[index] = " "
+    return "".join(masked)
 
 
 def _shell_syntax_words(text: str) -> tuple[list[str], bool]:
@@ -133,6 +285,13 @@ def parse_shell(
     previous_command: int | None = None
     command_expected = True
     pending_redir: tuple[int, DomainEdgeKind] | None = None
+    ignored_spans = _ignored_shell_spans(text)
+
+    def ignored(token_start: int, token_end: int) -> bool:
+        return any(
+            token_start < span_end and token_end > span_start
+            for span_start, span_end in ignored_spans
+        )
 
     idx = 0
     while idx < len(doc.tokens):
@@ -141,6 +300,9 @@ def parse_shell(
             previous_command = None
             command_expected = True
             pending_redir = None
+        if ignored(token.start, token.end):
+            idx += 1
+            continue
         value = token.text
         if shell_kind == "tcsh" and value in _TCSH_KEYWORDS:
             doc.set_role(idx, DomainRoleKind.KEYWORD, entity=next_entity)
@@ -259,7 +421,10 @@ def parse_shell(
             command_expected = True
         idx += 1
 
-    if _has_unbalanced_shell_syntax(text, shell_kind):
+    if _has_unbalanced_shell_syntax(
+        _mask_ignored_shell_spans(text),
+        shell_kind,
+    ):
         return doc.mark_raw(malformed_reason or f"malformed_{shell_kind}_shell")
     return doc
 

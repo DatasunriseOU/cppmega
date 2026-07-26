@@ -62,7 +62,18 @@ def _comment_safe(text: str) -> str:
 
 
 def _render_training_doc(rec: dict) -> str:
-    discussion = render_discussion(rec)
+    # The standalone PR corpus must retain the complete assembled discussion.
+    # render_discussion's defaults are appropriate for embedding PR context in
+    # an atomic commit sample, but would silently clip bodies/items and cap
+    # comments before this lossless splitter sees them.
+    discussion = render_discussion(
+        rec,
+        max_comments=len(rec.get("comments") or []),
+        max_reviews=len(rec.get("reviews") or []),
+        max_body_chars=sys.maxsize,
+        max_item_chars=sys.maxsize,
+        max_total_chars=sys.maxsize,
+    )
     if not discussion:
         return ""
     lines = [
@@ -215,6 +226,7 @@ def export_pr_parquet(args: argparse.Namespace) -> dict:
 
     pipeline = _load_pipeline()
     sr, route_by_fit, _recompress_zstd_max = pipeline
+    materialize_budget = sr.lossless_materialize_budget(lengths)
     conn = connect(str(store), create=False)
     try:
         shard_name = _shard_name(args.repo, int(args.offset))
@@ -233,7 +245,10 @@ def export_pr_parquet(args: argparse.Namespace) -> dict:
                 jsonl,
                 work,
                 memory_limit_gb=float(args.memory_limit_gb),
+                max_tokens=materialize_budget,
+                fixed_shape_max_tokens=max(lengths),
             )
+            materialize_stats = sr.read_materialize_stats(tok)
             routed = route_by_fit(tok, lengths, work / "routed")
             if not routed:
                 raise RuntimeError(f"no PR docs routed for {jsonl}")
@@ -252,6 +267,7 @@ def export_pr_parquet(args: argparse.Namespace) -> dict:
         "shard": shard_name,
         "rendered_docs": n_docs,
         "lengths": per_length,
+        "materialize_stats": materialize_stats,
     }
 
 
@@ -265,6 +281,7 @@ def export_pr_parquet_batches(args: argparse.Namespace) -> dict:
     batch_size = int(args.batch_size)
     if batch_size <= 0:
         raise ValueError("--batch-size must be > 0")
+    sr, _route_by_fit, _recompress_zstd_max = _load_pipeline()
 
     conn = connect(str(store), create=False)
     try:
@@ -332,6 +349,7 @@ def export_pr_parquet_batches(args: argparse.Namespace) -> dict:
             "shards": shards,
             "n_shards": len(shards),
             "lengths": totals_by_length,
+            "materialize_split_totals": sr.summarize_materialize_stats(shards),
         }
     finally:
         conn.close()

@@ -100,6 +100,7 @@ from cppmega.data.nanochat_pipeline.tokenized_enriched import (
 )
 from cppmega.data.nanochat_pipeline.tokenized_enriched_schema import (
     AUTHOR_TIMESTAMP_COLUMN,
+    BUILD_KIND_COLUMN,
     CHANGED_CHUNK_IDS_COLUMN,
     CHANGED_CHUNK_SPANS_COLUMN,
     COMMIT_MSG_TEXT_COLUMN,
@@ -174,6 +175,12 @@ GCS_OUTPUT_PREFIX_TEMPLATE = "data/parquet/clang_enriched_{size}"
 _TOKENIZED_ENRICHED_TOKENIZER = None
 _MEMORY_LIMIT_GB = 10.0
 _OVERFLOW_POLICIES = ("split", "drop")
+_MATERIALIZE_SPLIT_STATS_SCHEMA = "cppmega.materialize_split_stats_v1"
+_CROSS_PIECE_EDGE_FIELDS = (
+    "call_edges",
+    "type_edges",
+    *DOMAIN_EDGE_FIELD_FAMILIES,
+)
 REQUIRED_SYMBOL_IDENTITY_SCHEMA_VERSION = SYMBOL_IDENTITY_SCHEMA_VERSION
 _CHAR_LEVEL_METADATA_FIELDS = (
     "ast_depth",
@@ -455,6 +462,7 @@ _SCHEMA = pa.schema([
     pa.field("source_doc_id", pa.string()),
     pa.field(DOC_TYPE_COLUMN, pa.string()),
     pa.field(HEADER_FRAGMENT_KIND_COLUMN, pa.string()),
+    pa.field(BUILD_KIND_COLUMN, pa.string()),
     pa.field("tokenizer_fingerprint", pa.string()),
     pa.field("actual_token_count", pa.int32()),
     pa.field("structure_ids", pa.list_(pa.int8())),
@@ -676,6 +684,7 @@ def rows_to_table(
     source_doc_ids = []
     doc_types = []
     header_fragment_kinds = []
+    build_kinds = []
     tokenizer_fingerprints = []
     token_counts = []
     structure_ids_col = []
@@ -844,6 +853,10 @@ def rows_to_table(
             None
             if raw_header_fragment_kind is None
             else str(raw_header_fragment_kind)
+        )
+        raw_build_kind = row.get(BUILD_KIND_COLUMN)
+        build_kinds.append(
+            None if raw_build_kind is None else str(raw_build_kind)
         )
         raw_tokenizer_fingerprint = row.get("tokenizer_fingerprint")
         tokenizer_fingerprints.append(
@@ -1082,6 +1095,10 @@ def rows_to_table(
             HEADER_FRAGMENT_KIND_COLUMN: pa.array(
                 header_fragment_kinds,
                 type=_SCHEMA.field(HEADER_FRAGMENT_KIND_COLUMN).type,
+            ),
+            BUILD_KIND_COLUMN: pa.array(
+                build_kinds,
+                type=_SCHEMA.field(BUILD_KIND_COLUMN).type,
             ),
             "tokenizer_fingerprint": pa.array(
                 tokenizer_fingerprints,
@@ -1448,10 +1465,11 @@ def _align_structure_ids(values: list, text_len: int) -> list[int]:
     """Return per-char structure IDs aligned to the emitted text length."""
     if not values:
         return [0] * text_len
-    aligned = [int(v) for v in values[:text_len]]
-    if len(aligned) < text_len:
-        aligned.extend([0] * (text_len - len(aligned)))
-    return aligned
+    if len(values) != text_len:
+        raise ValueError(
+            f"structure_ids length {len(values)} does not match text length {text_len}"
+        )
+    return [int(v) for v in values]
 
 
 def _align_optional_char_metadata(values: list, text_len: int) -> list[int]:
@@ -1832,7 +1850,7 @@ def _convert_local_jsonl_to_parquet_path(
     local_batch_size: int = 512,
     memory_limit_gb: float = 10.0,
     default_repo: str | None = None,
-) -> dict[str, int]:
+) -> dict[str, object]:
     """Convert a local clang JSONL/JSONL.GZ file into one parquet file."""
     if overflow_policy not in _OVERFLOW_POLICIES:
         raise ValueError(
@@ -1842,8 +1860,30 @@ def _convert_local_jsonl_to_parquet_path(
 
     source = Path(input_path)
     target = Path(output_path)
-    docs_in = 0
-    docs_out = 0
+    stats: dict[str, object] = {
+        "schema": _MATERIALIZE_SPLIT_STATS_SCHEMA,
+        "overflow_policy": overflow_policy,
+        "max_tokens": int(max_tokens),
+        "docs_in": 0,
+        "docs_out": 0,
+        "source_docs_emitted": 0,
+        "split_input_docs": 0,
+        "split_output_docs": 0,
+        "dropped_input_docs": 0,
+        "emitted_valid_tokens": 0,
+        "split_emitted_tokens": 0,
+        "emitted_chars": 0,
+        "split_emitted_chars": 0,
+        "max_emitted_tokens": 0,
+        "max_emitted_chars": 0,
+        "materialized_rows": 0,
+        "materialized_output_tokens": 0,
+        "max_materialized_tokens": 0,
+        **{
+            f"cross_piece_{edge_field}": 0
+            for edge_field in _CROSS_PIECE_EDGE_FIELDS
+        },
+    }
     rows: list[dict] = []
     wrote_rows = False
     active_tokenizer_fingerprint = tokenizer_fingerprint(tokenizer)
@@ -1862,6 +1902,20 @@ def _convert_local_jsonl_to_parquet_path(
             if materialize_tokenized_enriched
             else None
         )
+        if tokenized_rows is not None:
+            materialized_lengths = [
+                len(row.get(TOKEN_IDS_COLUMN, [])) for row in tokenized_rows
+            ]
+            stats["materialized_rows"] = int(stats["materialized_rows"]) + len(
+                materialized_lengths
+            )
+            stats["materialized_output_tokens"] = int(
+                stats["materialized_output_tokens"]
+            ) + sum(materialized_lengths)
+            stats["max_materialized_tokens"] = max(
+                int(stats["max_materialized_tokens"]),
+                max(materialized_lengths, default=0),
+            )
         table = rows_to_table(
             rows,
             tokenized_rows=tokenized_rows,
@@ -1885,7 +1939,7 @@ def _convert_local_jsonl_to_parquet_path(
                     json.loads(line),
                     default_repo=default_repo,
                 )
-                docs_in += 1
+                stats["docs_in"] = int(stats["docs_in"]) + 1
                 sub_docs = process_record_with_policy(
                     record,
                     tokenizer,
@@ -1902,22 +1956,84 @@ def _convert_local_jsonl_to_parquet_path(
                         from cppmega.data.nanochat_pipeline.document_identity import (
                             stable_doc_signature)
                         sig = stable_doc_signature(record)
-                        source_doc_id = sig or f"{source.name}:{docs_in}"
+                        source_doc_id = sig or f"{source.name}:{stats['docs_in']}"
                     except SymbolIdentityError:
                         raise
                     except Exception:
-                        source_doc_id = f"{source.name}:{docs_in}"
+                        source_doc_id = f"{source.name}:{stats['docs_in']}"
+                if not sub_docs:
+                    stats["dropped_input_docs"] = int(
+                        stats["dropped_input_docs"]
+                    ) + 1
+                    if overflow_policy == "split":
+                        raise ValueError(
+                            "lossless split emitted zero pieces for "
+                            f"repo={record.get('repo')!r} "
+                            f"filepath={record.get('filepath')!r}"
+                        )
+                else:
+                    stats["source_docs_emitted"] = int(
+                        stats["source_docs_emitted"]
+                    ) + 1
+                is_split = len(sub_docs) > 1
+                if is_split:
+                    stats["split_input_docs"] = int(stats["split_input_docs"]) + 1
+                    stats["split_output_docs"] = int(
+                        stats["split_output_docs"]
+                    ) + len(sub_docs)
                 for sub_doc in sub_docs:
                     sub_doc.setdefault("source_doc_id", source_doc_id)
                     sub_doc.setdefault(
                         "tokenizer_fingerprint",
                         active_tokenizer_fingerprint,
                     )
+                    emitted_tokens = int(sub_doc.get("actual_token_count", 0))
+                    emitted_chars = len(str(sub_doc.get("text", "")))
+                    if emitted_tokens > max_tokens:
+                        raise ValueError(
+                            "split emitted an over-budget document: "
+                            f"{emitted_tokens} > {max_tokens}"
+                        )
+                    stats["emitted_valid_tokens"] = int(
+                        stats["emitted_valid_tokens"]
+                    ) + emitted_tokens
+                    stats["emitted_chars"] = int(stats["emitted_chars"]) + emitted_chars
+                    stats["max_emitted_tokens"] = max(
+                        int(stats["max_emitted_tokens"]), emitted_tokens
+                    )
+                    stats["max_emitted_chars"] = max(
+                        int(stats["max_emitted_chars"]), emitted_chars
+                    )
+                    if is_split:
+                        stats["split_emitted_tokens"] = int(
+                            stats["split_emitted_tokens"]
+                        ) + emitted_tokens
+                        stats["split_emitted_chars"] = int(
+                            stats["split_emitted_chars"]
+                        ) + emitted_chars
+                    split_audit = sub_doc.get("_lossless_split_audit", {})
+                    cross_piece_edges = (
+                        split_audit.get("cross_piece_edges", {})
+                        if isinstance(split_audit, dict)
+                        else {}
+                    )
+                    if not isinstance(cross_piece_edges, dict):
+                        raise ValueError(
+                            "_lossless_split_audit.cross_piece_edges must be an object"
+                        )
+                    for edge_field in _CROSS_PIECE_EDGE_FIELDS:
+                        counter_name = f"cross_piece_{edge_field}"
+                        edge_count = int(cross_piece_edges.get(edge_field, 0))
+                        if edge_count < 0:
+                            raise ValueError(
+                                f"{counter_name} must be non-negative, got {edge_count}"
+                            )
+                        stats[counter_name] = int(stats[counter_name]) + edge_count
                 rows.extend(sub_docs)
-                docs_out += len(sub_docs)
+                stats["docs_out"] = int(stats["docs_out"]) + len(sub_docs)
                 if len(rows) >= local_batch_size:
                     flush_rows()
-                if docs_in % 1000 == 0:
+                if int(stats["docs_in"]) % 1000 == 0:
                     check_memory_limit(memory_limit_gb, label="clang_enriched_to_parquet")
         flush_rows()
     finally:
@@ -1929,24 +2045,49 @@ def _convert_local_jsonl_to_parquet_path(
             "[DRY RUN] local convert %s -> %s docs_in=%d docs_out=%d policy=%s",
             source,
             target,
-            docs_in,
-            docs_out,
+            stats["docs_in"],
+            stats["docs_out"],
             overflow_policy,
         )
-        return {"docs_in": docs_in, "docs_out": docs_out}
+        return stats
 
     if not wrote_rows:
         target.unlink(missing_ok=True)
         log.info("empty parquet")
-        return {"docs_in": docs_in, "docs_out": docs_out}
+        return stats
     log.info(
         "wrote local parquet %s docs_in=%d docs_out=%d policy=%s",
         target,
-        docs_in,
-        docs_out,
+        stats["docs_in"],
+        stats["docs_out"],
         overflow_policy,
     )
-    return {"docs_in": docs_in, "docs_out": docs_out}
+    return stats
+
+
+def _write_materialize_stats(
+    stats_file: str | os.PathLike[str],
+    stats: dict[str, object],
+) -> None:
+    target = Path(stats_file)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staged = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        staged.write_text(
+            json.dumps(stats, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(staged, target)
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def convert_local_jsonl_to_parquet(
@@ -1961,7 +2102,8 @@ def convert_local_jsonl_to_parquet(
     local_batch_size: int = 512,
     memory_limit_gb: float = 10.0,
     default_repo: str | None = None,
-) -> dict[str, int]:
+    stats_file: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
     """Convert locally, publishing the parquet only after full validation."""
 
     if default_repo is not None:
@@ -1979,13 +2121,21 @@ def convert_local_jsonl_to_parquet(
         "default_repo": default_repo,
     }
     if dry_run:
+        if stats_file is not None:
+            raise ValueError("stats_file is not supported with dry_run")
         return _convert_local_jsonl_to_parquet_path(
             input_path, output_path, **kwargs
         )
     with atomic_output_file(output_path) as staged_output:
-        return _convert_local_jsonl_to_parquet_path(
+        summary = _convert_local_jsonl_to_parquet_path(
             input_path, staged_output, **kwargs
         )
+    if stats_file is not None:
+        published = Path(output_path)
+        summary["output_file_size"] = published.stat().st_size
+        summary["output_file_sha256"] = _sha256_file(published)
+        _write_materialize_stats(stats_file, summary)
+    return summary
 
 
 def process_input_file(gcs_uri: str, tmpdir: str,
@@ -2210,6 +2360,14 @@ def main():
         help="Local parquet output path for single-file conversion mode.",
     )
     parser.add_argument(
+        "--stats-file",
+        default="",
+        help=(
+            "Atomically write an exact local split/materialization receipt. "
+            "Supported only with --input-file/--output-file."
+        ),
+    )
+    parser.add_argument(
         "--max-files", type=int, default=0,
         help="Maximum number of input files to process (0 = all).",
     )
@@ -2267,6 +2425,10 @@ def main():
         parser.error("--input-prefix is only supported in GCS mode")
     if local_mode and args.output_prefix:
         parser.error("--output-prefix is only supported in GCS mode")
+    if args.stats_file and not local_mode:
+        parser.error("--stats-file is only supported in local mode")
+    if args.stats_file and args.dry_run:
+        parser.error("--stats-file cannot be combined with --dry-run")
     if args.local_batch_size <= 0:
         parser.error("--local-batch-size must be positive")
     if not local_mode and not args.output_prefix:
@@ -2284,6 +2446,7 @@ def main():
             local_batch_size=args.local_batch_size,
             memory_limit_gb=args.memory_limit_gb,
             default_repo=args.default_repo or None,
+            stats_file=args.stats_file or None,
         )
         log.info(
             "Done. Local convert: %d docs in -> %d docs out.",

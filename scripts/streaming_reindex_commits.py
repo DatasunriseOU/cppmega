@@ -22,12 +22,11 @@ Design (RULE #1: fail-loud, no silent fallback; checkpoints EXACT):
         -> for each range fan a task to the pool:
              slice the records JSONL by line range -> <repo>_r<start>.jsonl
                -> process_commits.py (--format both; edit-signal columns)
-               -> clang_enriched_to_parquet.py (tokenize @65536, materialize)
-               -> ROUTE-BY-FIT: split tokenized docs by token count into the
-                  smallest length bucket that fits the whole commit doc
-                  (commits are ATOMIC blocks; never split a doc), ladder
-                  1024/2048/4096/8192/16384; N>16384 is explicitly dropped
-                  from fixed-shape output and reported as over-long.
+               -> clang_enriched_to_parquet.py (lossless source-order split,
+                  aligned sidecars, materialize)
+               -> ROUTE-BY-FIT: route each materialized split piece into the
+                  smallest fitting 1024/2048/4096/8192/16384 bucket; a residual
+                  N>16384 row fails the range before any bucket publication.
                -> pack_enriched_rows.py per non-empty bucket at ITS length
                -> recompress packed parquet with MAX zstd (level 22)
                -> outputs/reindexed_commits/{L}/<repo>_r<start>.parquet
@@ -151,6 +150,8 @@ def stage_materialize_commit_range(
     *,
     project_id: str,
     memory_limit_gb: float = 10.0,
+    max_tokens: int = sr.TOKENIZE_BUDGET,
+    fixed_shape_max_tokens: int | None = None,
 ) -> Path:
     """Materialize one range under the repo's canonical owner/repo identity."""
     return stage_materialize(
@@ -159,6 +160,8 @@ def stage_materialize_commit_range(
         work=work,
         memory_limit_gb=memory_limit_gb,
         project_id=project_id,
+        max_tokens=max_tokens,
+        fixed_shape_max_tokens=fixed_shape_max_tokens,
     )
 
 
@@ -387,31 +390,58 @@ def route_by_fit(tok_parquet: Path, lengths_sorted: Sequence[int], out_dir: Path
     """Split tok parquet rows into per-length parquet files by whole-doc token count.
 
     Each commit doc (one row) is routed INTACT to the smallest length bucket that
-    fits its full ``token_ids`` length. Docs longer than the largest length are
-    excluded from fixed-shape output and reported in ``dropped_overlong.json``
-    (written into ``out_dir`` only when at least one doc is dropped).
+    fits its full ``token_ids`` length. The upstream materializer must losslessly
+    split source documents first. Any residual over-long tokenized row is a
+    contract violation and fails the whole unit before a routed file is written.
     Returns {length: parquet_path} for non-empty buckets only.
-
-    NOTE: ``out_dir`` is the caller's (per-range) temp dir, so the JSON receipt
-    is not durable on its own. Callers that need a durable audit must lift the
-    counts out before deleting ``out_dir`` (see ``read_dropped_overlong``). The
-    return type is kept as the plain {length: path} dict because this function is
-    SHARED by the code stream and the PR export, which only consume the paths.
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
 
+    normalized_lengths = tuple(int(length) for length in lengths_sorted)
+    if (
+        not normalized_lengths
+        or any(length <= 0 for length in normalized_lengths)
+        or normalized_lengths != tuple(sorted(set(normalized_lengths)))
+    ):
+        raise RepoFailure(
+            tok_parquet.parent.name,
+            "route_by_fit",
+            f"lengths must be unique positive ascending values: {normalized_lengths}",
+        )
     pf = pq.ParquetFile(str(tok_parquet))
     if TOKEN_IDS_COLUMN not in set(pf.schema_arrow.names):
         raise RepoFailure(tok_parquet.parent.name, "route_by_fit",
                           f"{tok_parquet} missing column {TOKEN_IDS_COLUMN}")
     schema = pf.schema_arrow
+    max_length = normalized_lengths[-1]
+
+    # Validate first so failure cannot leave a partial routed dataset that looks
+    # publishable. Exact counts are included in the durable failed-unit receipt.
+    overlong_rows = 0
+    overlong_tokens = 0
+    max_observed = 0
+    for batch in pf.iter_batches(batch_size=512, columns=[TOKEN_IDS_COLUMN]):
+        for ids in batch.column(0).to_pylist():
+            token_count = len(ids) if ids is not None else 0
+            max_observed = max(max_observed, token_count)
+            if token_count > max_length:
+                overlong_rows += 1
+                overlong_tokens += token_count
+    if overlong_rows:
+        raise RepoFailure(
+            tok_parquet.parent.name,
+            "route_by_fit",
+            "lossless materializer contract violation: "
+            f"overlong_rows={overlong_rows} "
+            f"overlong_tokens={overlong_tokens} "
+            f"max_observed={max_observed} "
+            f"fixed_shape_max={max_length}",
+        )
+
     writers: dict[int, pq.ParquetWriter] = {}
     paths: dict[int, Path] = {}
     out_dir.mkdir(parents=True, exist_ok=True)
-    dropped_overlong = 0
-    dropped_overlong_tokens = 0
-    max_length = int(lengths_sorted[-1])
     try:
         for batch in pf.iter_batches(batch_size=512):
             tbl = pa.Table.from_batches([batch], schema=schema)
@@ -420,11 +450,9 @@ def route_by_fit(tok_parquet: Path, lengths_sorted: Sequence[int], out_dir: Path
             by_len: dict[int, list[int]] = {}
             for ri, ids in enumerate(tok_col):
                 n = len(ids) if ids is not None else 0
-                L = bucket_for(n, lengths_sorted)
-                if L is None:
-                    dropped_overlong += 1
-                    dropped_overlong_tokens += n
-                    continue
+                L = bucket_for(n, normalized_lengths)
+                if L is None:  # guarded by the exact preflight above
+                    raise AssertionError(f"preflight missed overlong row with {n} tokens")
                 by_len.setdefault(L, []).append(ri)
             for L, idxs in by_len.items():
                 sub = tbl.take(pa.array(idxs))
@@ -437,44 +465,7 @@ def route_by_fit(tok_parquet: Path, lengths_sorted: Sequence[int], out_dir: Path
         for w in writers.values():
             w.close()
         release_arrow_unused()
-    if dropped_overlong:
-        report = {
-            "source": str(tok_parquet),
-            "max_length": max_length,
-            "dropped_overlong_rows": dropped_overlong,
-            "dropped_overlong_tokens": dropped_overlong_tokens,
-        }
-        (out_dir / "dropped_overlong.json").write_text(json.dumps(report, indent=2) + "\n")
-        print(
-            "DROP overlong docs in route_by_fit: "
-            f"rows={dropped_overlong} tokens={dropped_overlong_tokens} "
-            f"max_length={max_length} source={tok_parquet}",
-            file=sys.stderr,
-            flush=True,
-        )
     return paths
-
-
-def read_dropped_overlong(route_dir: Path) -> dict[str, int]:
-    """Lift route_by_fit's over-long drop counts out of its ephemeral receipt.
-
-    ``route_by_fit`` writes ``dropped_overlong.json`` into ``route_dir`` only when
-    it drops at least one over-long doc, and ``route_dir`` lives under the
-    per-range temp tree that ``process_range`` rmtree's. This reads the receipt
-    BEFORE that cleanup so the counts can be recorded durably in the manifest.
-
-    Contract (RULE #1, one clear path): no receipt == zero drops. A receipt that
-    exists but is malformed/missing its keys RAISES (KeyError/JSONDecodeError) --
-    that is a real route_by_fit bug, never silently swallowed.
-    """
-    receipt = route_dir / "dropped_overlong.json"
-    if not receipt.exists():
-        return {"rows": 0, "tokens": 0}
-    report = json.loads(receipt.read_text())
-    return {
-        "rows": int(report["dropped_overlong_rows"]),
-        "tokens": int(report["dropped_overlong_tokens"]),
-    }
 
 
 def recompress_zstd_max(path: Path) -> None:
@@ -564,6 +555,7 @@ def process_range(
 ) -> dict:
     """Full per-range pipeline. RAISES RepoFailure on any failure (no fallback)."""
     project_id = sr.resolve_project_identity(repo, repo_list)
+    materialize_budget = sr.lossless_materialize_budget(lengths_sorted)
     rkey = range_key(repo, start_idx)
     rwork = repo_work / f"r{start_idx}"
     rwork.mkdir(parents=True, exist_ok=True)
@@ -616,21 +608,19 @@ def process_range(
             rwork,
             project_id=project_id,
             memory_limit_gb=memory_limit_gb,
+            max_tokens=materialize_budget,
+            fixed_shape_max_tokens=int(lengths_sorted[-1]),
         )
+        materialize_stats = sr.read_materialize_stats(tok)
         timings["materialize_s"] = round(time.monotonic() - started, 6)
 
         started = time.monotonic()
         route_dir = rwork / "routed"
         routed = route_by_fit(tok, lengths_sorted, route_dir)
-        # Lift the over-long drop counts out of route_by_fit's receipt BEFORE the
-        # finally below rmtree's rwork, so corpus-scale drops are durably audited.
-        dropped_overlong = read_dropped_overlong(route_dir)
         if not routed:
             raise RepoFailure(
                 repo, "route_by_fit",
-                f"no docs routed for range [{start_idx}:{end_idx}] "
-                f"(all {dropped_overlong['rows']} docs over-long, "
-                f"{dropped_overlong['tokens']} tokens dropped)",
+                f"no docs routed for range [{start_idx}:{end_idx}]",
             )
         timings["route_by_fit_s"] = round(time.monotonic() - started, 6)
 
@@ -667,11 +657,10 @@ def process_range(
             "n_records": n_records,
             "lengths": per_length,
             "stage_timings_s": timings,
-            # Durable record of over-long docs excluded from all fixed buckets.
-            # The per-range temp dir (and route_by_fit's dropped_overlong.json
-            # receipt) is rmtree'd below, so this is the only surviving audit of
-            # the drop; main() aggregates it into the final run summary.
-            "dropped_overlong": dropped_overlong,
+            "materialize_stats": materialize_stats,
+            # Backward-compatible manifest field. New lossless producers never
+            # drop over-long rows; a residual row fails the range above.
+            "dropped_overlong": {"rows": 0, "tokens": 0},
         }
         if deferred_stage is not None:
             info["dedup_stage"] = deferred_stage
@@ -817,12 +806,9 @@ def summarize_done_manifest(
 ) -> tuple[dict[str, dict], dict[str, int]]:
     """Aggregate a manifest's ``done`` entries into the run-level report.
 
-    Returns ``(per_length_totals, dropped_overlong_total)``. ``dropped_overlong_total``
-    is the durable corpus-scale audit of over-long commit docs that route_by_fit
-    excluded from every fixed bucket (see process_range): the per-range temp dir
-    holding the ``dropped_overlong.json`` receipt is rmtree'd, so the manifest is
-    the only surviving record. Done entries written before this field existed
-    simply contribute nothing (None -> skipped).
+    Returns ``(per_length_totals, dropped_overlong_total)``. The latter is kept
+    only to surface loss recorded by legacy manifests. New lossless producers
+    always write zero; any residual over-long row fails before publication.
     """
     totals = {
         str(tl): {"rows": 0, "valid_tokens": 0, "pad_tokens": 0, "capacity_tokens": 0}
@@ -1030,6 +1016,9 @@ def main(argv: list[str]) -> int:
         "cumulative_valid_tokens_this_run": cumulative["valid"],
         "per_length_totals": totals,
         "dropped_overlong_total": dropped_overlong_total,
+        "materialize_split_totals": sr.summarize_materialize_stats(
+            list(manifest.done.values())
+        ),
         "manifest": str(COMMIT_MANIFEST),
     }
     print(json.dumps(summary, indent=2))

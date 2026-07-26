@@ -18,6 +18,8 @@ Rate limit: ~5000 req/hr on GitHub API. 1855 jobs fits in one batch.
 """
 
 import argparse
+from dataclasses import dataclass
+import hashlib
 import json
 import os
 import re
@@ -149,8 +151,33 @@ def extract_relevant_portion(log_text: str, max_lines: int = 500) -> str:
     return "\n".join(relevant[:max_lines])
 
 
-def fetch_job_log(owner: str, repo: str, job_id: int) -> str | None:
-    """Download job log via gh api."""
+@dataclass(frozen=True)
+class JobLogFetch:
+    status: str
+    text: str = ""
+    detail: str = ""
+
+
+def _classify_job_log_process_result(
+    owner: str,
+    repo: str,
+    job_id: int,
+    result: subprocess.CompletedProcess[str],
+) -> JobLogFetch:
+    if result.returncode == 0:
+        return JobLogFetch(status="fetched", text=result.stdout)
+    stderr = (result.stderr or "").strip()
+    if re.search(r"\bHTTP\s+410\b", stderr, re.IGNORECASE):
+        return JobLogFetch(status="expired", detail=stderr)
+    raise RuntimeError(
+        f"{owner}/{repo} job {job_id}: GitHub log request failed "
+        f"(exit={result.returncode}): {stderr[:500]}"
+    )
+
+
+def fetch_job_log(owner: str, repo: str, job_id: int) -> JobLogFetch:
+    """Download one job log, distinguishing true expiry from fetch failure."""
+
     try:
         result = subprocess.run(
             ["gh", "api", f"repos/{owner}/{repo}/actions/jobs/{job_id}/logs"],
@@ -158,14 +185,18 @@ def fetch_job_log(owner: str, repo: str, job_id: int) -> str | None:
             text=True,
             timeout=60,
         )
-        if result.returncode == 0:
-            return result.stdout
-        # 410 = log expired (GitHub keeps logs ~90 days)
-        if "410" in result.stderr or "expired" in result.stderr.lower():
-            return None
-        return None
-    except (subprocess.TimeoutExpired, Exception):
-        return None
+    except FileNotFoundError as exc:
+        raise RuntimeError("GitHub CLI `gh` is required to fetch CI logs") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"{owner}/{repo} job {job_id}: GitHub log request timed out"
+        ) from exc
+    return _classify_job_log_process_result(
+        owner,
+        repo,
+        job_id,
+        result,
+    )
 
 
 def format_ci_document(record: dict, log_text: str) -> dict:
@@ -225,6 +256,250 @@ def format_ci_document(record: dict, log_text: str) -> dict:
     }
 
 
+def _canonical_sha256(value: object) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_json_atomic(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def _append_jsonl_fsync(path: Path, value: object) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _load_ci_source_records(
+    ci_root: Path,
+) -> tuple[list[dict], list[dict], int, list[dict]]:
+    paths = sorted(ci_root.glob("*.jsonl"))
+    if not paths:
+        raise RuntimeError(f"no .jsonl files in {ci_root}")
+
+    records: list[dict] = []
+    non_job_records = 0
+    inventory: list[dict] = []
+    for path in paths:
+        inventory.append(
+            {
+                "name": path.name,
+                "size": path.stat().st_size,
+                "sha256": _sha256_file(path),
+            }
+        )
+        with path.open(encoding="utf-8") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"{path}:{line_number}: invalid JSON: {exc}"
+                    ) from exc
+                if not isinstance(record, dict):
+                    raise RuntimeError(
+                        f"{path}:{line_number}: CI source row must be an object"
+                    )
+                if not record.get("job_id") or not record.get("repo"):
+                    non_job_records += 1
+                    continue
+                if (
+                    not isinstance(record["job_id"], int)
+                    or isinstance(record["job_id"], bool)
+                    or record["job_id"] < 1
+                    or not isinstance(record["repo"], str)
+                    or "/" not in record["repo"]
+                ):
+                    raise RuntimeError(
+                        f"{path}:{line_number}: invalid repo/job identity"
+                    )
+                records.append(record)
+
+    unique: dict[int, dict] = {}
+    aliases: list[dict] = []
+    for record in records:
+        job_id = int(record["job_id"])
+        previous = unique.get(job_id)
+        if previous is None:
+            unique[job_id] = record
+            continue
+        previous_without_repo = {**previous, "repo": ""}
+        current_without_repo = {**record, "repo": ""}
+        if previous_without_repo != current_without_repo:
+            raise RuntimeError(
+                f"job_id {job_id} maps to conflicting CI source records"
+            )
+        aliases.append(
+            {
+                "job_id": job_id,
+                "canonical_repo": previous["repo"],
+                "alias_repo": record["repo"],
+            }
+        )
+    return list(unique.values()), inventory, non_job_records, aliases
+
+
+def _load_existing_output(path: Path) -> dict[int, dict]:
+    output: dict[int, dict] = {}
+    if not path.exists():
+        return output
+    with path.open(encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                document = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"{path}:{line_number}: invalid JSON output row: {exc}"
+                ) from exc
+            metadata = document.get("ci_metadata") if isinstance(document, dict) else None
+            job_id = metadata.get("job_id") if isinstance(metadata, dict) else None
+            if (
+                not isinstance(job_id, int)
+                or isinstance(job_id, bool)
+                or job_id < 1
+            ):
+                raise RuntimeError(
+                    f"{path}:{line_number}: output row lacks an integer CI job_id"
+                )
+            if job_id in output:
+                raise RuntimeError(f"{path}: duplicate output job_id {job_id}")
+            output[job_id] = document
+    return output
+
+
+def _load_fetch_state(path: Path) -> dict[int, dict]:
+    states: dict[int, dict] = {}
+    if not path.exists():
+        return states
+    with path.open(encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                state = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"{path}:{line_number}: invalid fetch state: {exc}"
+                ) from exc
+            job_id = state.get("job_id") if isinstance(state, dict) else None
+            if (
+                not isinstance(job_id, int)
+                or isinstance(job_id, bool)
+                or job_id < 1
+                or state.get("status") not in {"fetched", "expired", "too_short"}
+            ):
+                raise RuntimeError(f"{path}:{line_number}: malformed fetch state")
+            if job_id in states:
+                raise RuntimeError(f"{path}: duplicate fetch state for job {job_id}")
+            states[job_id] = state
+    return states
+
+
+def _completion_receipt(
+    *,
+    source_inventory: list[dict],
+    records: list[dict],
+    source_row_count: int,
+    non_job_records: int,
+    aliases: list[dict],
+    output_path: Path,
+    output: dict[int, dict],
+    state_path: Path,
+    states: dict[int, dict],
+    errors: list[str],
+    max_jobs: int,
+) -> dict:
+    expected_jobs = {int(record["job_id"]) for record in records}
+    accounted_jobs = set(states)
+    unresolved = sorted(expected_jobs - accounted_jobs)
+    fetched = sorted(
+        job_id for job_id, state in states.items() if state["status"] == "fetched"
+    )
+    expired = sorted(
+        job_id for job_id, state in states.items() if state["status"] == "expired"
+    )
+    too_short = sorted(
+        job_id for job_id, state in states.items() if state["status"] == "too_short"
+    )
+    status = (
+        "complete"
+        if not unresolved
+        and not errors
+        and not max_jobs
+        and set(output) == set(fetched)
+        else "incomplete"
+    )
+    return {
+        "schema": "cppmega_ci_log_extraction_v1",
+        "status": status,
+        "source_inventory": source_inventory,
+        "source_inventory_sha256": _canonical_sha256(source_inventory),
+        "source_row_count": source_row_count,
+        "non_job_source_row_count": non_job_records,
+        "unique_job_count": len(expected_jobs),
+        "duplicate_alias_count": len(aliases),
+        "duplicate_aliases": aliases,
+        "job_set_sha256": _canonical_sha256(sorted(expected_jobs)),
+        "fetched_count": len(fetched),
+        "expired_count": len(expired),
+        "too_short_count": len(too_short),
+        "unresolved_count": len(unresolved),
+        "expired_jobs": [
+            {
+                "job_id": job_id,
+                "repo": states[job_id]["repo"],
+                "detail": states[job_id].get("detail", ""),
+            }
+            for job_id in expired
+        ],
+        "unresolved_jobs": unresolved,
+        "errors": errors,
+        "scope_limit": max_jobs or None,
+        "output": {
+            "path": str(output_path.resolve()),
+            "row_count": len(output),
+            "size": output_path.stat().st_size if output_path.exists() else 0,
+            "sha256": _sha256_file(output_path) if output_path.exists() else None,
+            "job_set_sha256": _canonical_sha256(sorted(output)),
+        },
+        "state": {
+            "path": str(state_path.resolve()),
+            "row_count": len(states),
+            "size": state_path.stat().st_size if state_path.exists() else 0,
+            "sha256": _sha256_file(state_path) if state_path.exists() else None,
+        },
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Fetch CI logs and produce enriched JSONL")
     parser.add_argument("--ci-root", required=True, help="Path to ci_diagnostics/ directory")
@@ -234,27 +509,32 @@ def main():
     parser.add_argument("--min-text-chars", type=int, default=200, help="Skip docs shorter than this")
     parser.add_argument("--delay", type=float, default=0.5, help="Delay between API calls (sec)")
     parser.add_argument("--dry-run", action="store_true", help="Count records without fetching")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Validate and continue an existing output/state pair.",
+    )
+    parser.add_argument(
+        "--state",
+        help="Durable per-job outcome JSONL (default: OUTPUT.fetch-state.jsonl).",
+    )
+    parser.add_argument(
+        "--completion-receipt",
+        help="Atomic extraction receipt (default: OUTPUT.completion.json).",
+    )
+    parser.add_argument("--max-retries", type=int, default=3)
     args = parser.parse_args()
 
     ci_root = Path(args.ci_root)
-    jsonl_files = sorted(ci_root.glob("*.jsonl"))
-    if not jsonl_files:
-        print(f"ERROR: no .jsonl files in {ci_root}", file=sys.stderr)
-        return 1
-
-    # Load all records
-    records = []
-    for f in jsonl_files:
-        with open(f) as fh:
-            for line in fh:
-                try:
-                    obj = json.loads(line)
-                    if obj.get("job_id") and obj.get("repo"):
-                        records.append(obj)
-                except json.JSONDecodeError:
-                    pass
-
-    print(f"Loaded {len(records)} CI records from {len(jsonl_files)} files")
+    records, source_inventory, non_job_records, aliases = _load_ci_source_records(
+        ci_root
+    )
+    source_row_count = len(records) + len(aliases) + non_job_records
+    print(
+        f"Loaded {len(records)} unique CI jobs from {len(source_inventory)} files "
+        f"({source_row_count} total rows, {non_job_records} non-job records, "
+        f"{len(aliases)} duplicate aliases)"
+    )
 
     if args.dry_run:
         repos = set(r["repo"] for r in records)
@@ -262,65 +542,173 @@ def main():
         print(f"Unique job_ids: {len(set(r['job_id'] for r in records))}")
         return 0
 
-    # Deduplicate by job_id (some records may repeat)
-    seen_jobs = set()
-    unique_records = []
-    for r in records:
-        jid = r["job_id"]
-        if jid not in seen_jobs:
-            seen_jobs.add(jid)
-            unique_records.append(r)
-
+    unique_records = records
     if args.max_jobs > 0:
         unique_records = unique_records[: args.max_jobs]
 
-    print(f"Fetching logs for {len(unique_records)} unique jobs...")
-
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path = Path(args.state or f"{output_path}.fetch-state.jsonl")
+    receipt_path = Path(
+        args.completion_receipt or f"{output_path}.completion.json"
+    )
+    if (output_path.exists() or state_path.exists()) and not args.resume:
+        raise RuntimeError(
+            "output/state already exists; pass --resume to validate and continue "
+            "instead of silently overwriting CI evidence"
+        )
+    output_path.touch(exist_ok=True)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.touch(exist_ok=True)
 
-    fetched = 0
-    written = 0
-    expired = 0
-    too_short = 0
-    failed = 0
+    source_by_job = {int(record["job_id"]): record for record in records}
+    output = _load_existing_output(output_path)
+    states = _load_fetch_state(state_path)
+    unexpected_output = sorted(set(output) - set(source_by_job))
+    unexpected_states = sorted(set(states) - set(source_by_job))
+    if unexpected_output or unexpected_states:
+        raise RuntimeError(
+            f"resume evidence contains jobs outside the source corpus: "
+            f"output={unexpected_output[:10]} state={unexpected_states[:10]}"
+        )
 
-    with open(output_path, "w") as out:
-        for i, record in enumerate(unique_records):
-            repo_full = record["repo"]
-            if "/" not in repo_full:
-                failed += 1
-                continue
-            owner, repo = repo_full.split("/", 1)
-            job_id = record["job_id"]
+    for job_id, state in states.items():
+        source_sha256 = _canonical_sha256(source_by_job[job_id])
+        if state.get("source_sha256") != source_sha256:
+            raise RuntimeError(f"source record drifted for resumed job {job_id}")
+        if state["status"] == "fetched":
+            document = output.get(job_id)
+            if document is None:
+                raise RuntimeError(
+                    f"fetch state says job {job_id} was fetched but output is missing"
+                )
+            if state.get("document_sha256") != _canonical_sha256(document):
+                raise RuntimeError(
+                    f"output document drifted for resumed job {job_id}"
+                )
+        elif job_id in output:
+            raise RuntimeError(
+                f"job {job_id} has both {state['status']} state and an output row"
+            )
 
-            log_text = fetch_job_log(owner, repo, job_id)
-            if log_text is None:
-                expired += 1
-                if (i + 1) % 50 == 0:
-                    print(f"  [{i+1}/{len(unique_records)}] fetched={fetched} expired={expired} written={written}")
-                continue
+    # An interrupted process can fsync the output row just before its matching
+    # state row. Recover that one-way window by deriving and appending the state.
+    for job_id in sorted(set(output) - set(states)):
+        record = source_by_job[job_id]
+        document = output[job_id]
+        if document.get("repo") not in {
+            record["repo"],
+            *(
+                item["alias_repo"]
+                for item in aliases
+                if item["job_id"] == job_id
+            ),
+        }:
+            raise RuntimeError(f"output repo drifted for job {job_id}")
+        state = {
+            "job_id": job_id,
+            "repo": document["repo"],
+            "status": "fetched",
+            "source_sha256": _canonical_sha256(record),
+            "document_sha256": _canonical_sha256(document),
+        }
+        _append_jsonl_fsync(state_path, state)
+        states[job_id] = state
 
-            fetched += 1
-            relevant = extract_relevant_portion(log_text, max_lines=args.max_log_lines)
+    pending = [
+        record
+        for record in unique_records
+        if int(record["job_id"]) not in states
+    ]
+    print(
+        f"Fetching {len(pending)} pending of {len(unique_records)} selected jobs "
+        f"(resumed={len(states)})..."
+    )
+    errors: list[str] = []
+    for index, record in enumerate(pending, start=1):
+        repo_full = record["repo"]
+        owner, repo = repo_full.split("/", 1)
+        job_id = int(record["job_id"])
+        fetch: JobLogFetch | None = None
+        for attempt in range(1, max(1, args.max_retries) + 1):
+            try:
+                fetch = fetch_job_log(owner, repo, job_id)
+                break
+            except RuntimeError as exc:
+                if attempt >= max(1, args.max_retries):
+                    errors.append(str(exc))
+                    break
+                time.sleep(min(8.0, float(2 ** (attempt - 1))))
+        if fetch is None:
+            break
 
+        state = {
+            "job_id": job_id,
+            "repo": repo_full,
+            "status": fetch.status,
+            "source_sha256": _canonical_sha256(record),
+        }
+        if fetch.status == "fetched":
+            relevant = extract_relevant_portion(
+                fetch.text,
+                max_lines=args.max_log_lines,
+            )
             if len(relevant) < args.min_text_chars:
-                too_short += 1
-                continue
+                state["status"] = "too_short"
+                state["relevant_text_chars"] = len(relevant)
+            else:
+                document = format_ci_document(record, relevant)
+                state["document_sha256"] = _canonical_sha256(document)
+                _append_jsonl_fsync(output_path, document)
+                output[job_id] = document
+                time.sleep(args.delay)
+        elif fetch.status == "expired":
+            state["http_status"] = 410
+            state["detail"] = fetch.detail
+        else:
+            raise RuntimeError(
+                f"unsupported fetch outcome for job {job_id}: {fetch.status!r}"
+            )
+        _append_jsonl_fsync(state_path, state)
+        states[job_id] = state
 
-            doc = format_ci_document(record, relevant)
-            out.write(json.dumps(doc, ensure_ascii=False) + "\n")
-            written += 1
+        if index % 50 == 0 or index == len(pending):
+            counts = {
+                status: sum(
+                    1 for item in states.values() if item["status"] == status
+                )
+                for status in ("fetched", "expired", "too_short")
+            }
+            print(
+                f"  [{index}/{len(pending)}] fetched={counts['fetched']} "
+                f"expired={counts['expired']} too_short={counts['too_short']}"
+            )
 
-            if (i + 1) % 50 == 0:
-                print(f"  [{i+1}/{len(unique_records)}] fetched={fetched} expired={expired} written={written}")
+    receipt = _completion_receipt(
+        source_inventory=source_inventory,
+        records=records,
+        source_row_count=source_row_count,
+        non_job_records=non_job_records,
+        aliases=aliases,
+        output_path=output_path,
+        output=output,
+        state_path=state_path,
+        states=states,
+        errors=errors,
+        max_jobs=args.max_jobs,
+    )
+    _write_json_atomic(receipt_path, receipt)
 
-            time.sleep(args.delay)
-
-    print(f"\nDone: fetched={fetched} expired={expired} too_short={too_short} failed={failed} written={written}")
+    print(
+        f"\nDone: status={receipt['status']} fetched={receipt['fetched_count']} "
+        f"expired={receipt['expired_count']} "
+        f"too_short={receipt['too_short_count']} "
+        f"unresolved={receipt['unresolved_count']}"
+    )
     print(f"Output: {output_path}")
+    print(f"Completion: {receipt_path}")
 
-    if written > 0:
+    if output:
         # Quick token estimate
         total_chars = 0
         with open(output_path) as f:
@@ -331,7 +719,7 @@ def main():
         steps = est_tokens // (192 * 1024)
         print(f"Estimated: ~{est_tokens:,} tokens = ~{steps} steps (bs=192 seq=1024)")
 
-    return 0
+    return 0 if receipt["status"] == "complete" else 1
 
 
 if __name__ == "__main__":

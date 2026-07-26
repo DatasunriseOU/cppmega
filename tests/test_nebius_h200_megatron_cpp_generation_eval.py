@@ -90,6 +90,7 @@ def _reseal_index_payload(payload: dict[str, object]) -> dict[str, object]:
     return payload
 
 
+@pytest.mark.native_toolchain
 def test_actual_parser_defaults_require_stable_project_identity(tmp_path):
     args = parse_args(
         ["--dry-run"]
@@ -345,6 +346,7 @@ def test_generation_worker_boundary_executes_restore_graph_and_receipt_contract(
         )
 
 
+@pytest.mark.native_toolchain
 def test_prompt_graph_builder_serializes_h200_structure_inputs(tmp_path):
     from cppmega.prompt_graph import (
         PromptGraphBuilder,
@@ -431,6 +433,7 @@ def test_prompt_graph_builder_serializes_h200_structure_inputs(tmp_path):
     assert model_inputs.side_channels["confidence_ids"][-2:] == [1, 1]
 
 
+@pytest.mark.native_toolchain
 def test_real_producer_preserves_overloads_and_caller_target_identity(tmp_path):
     from cppmega.prompt_graph_index import ClangPromptProjectIndexProducer
 
@@ -468,6 +471,7 @@ def test_real_producer_preserves_overloads_and_caller_target_identity(tmp_path):
     assert target.canonical_signature.startswith("display=repository_helper(int)")
 
 
+@pytest.mark.native_toolchain
 def test_production_validator_rejects_resealed_semantic_edge_tamper(tmp_path):
     from cppmega.prompt_graph_index import ClangPromptProjectIndexProducer
 
@@ -501,6 +505,7 @@ def test_production_validator_rejects_resealed_semantic_edge_tamper(tmp_path):
         )
 
 
+@pytest.mark.native_toolchain
 def test_production_validator_rejects_resealed_non_definition_edge_target(tmp_path):
     from cppmega.prompt_graph_index import ClangPromptProjectIndexProducer
 
@@ -527,6 +532,7 @@ def test_production_validator_rejects_resealed_non_definition_edge_target(tmp_pa
         )
 
 
+@pytest.mark.native_toolchain
 def test_eval_staging_rejects_resealed_synthetic_index_provenance(tmp_path):
     from cppmega.prompt_graph_index import ClangPromptProjectIndexProducer
 
@@ -596,6 +602,7 @@ return value;
 """
 
 
+@pytest.mark.native_toolchain
 def test_make_eval_tar_builds_and_contains_real_project_index(tmp_path):
     out = tmp_path / "eval.tgz"
     cases, prompts, _repo = _v3_eval_fixture(tmp_path / "fixture")
@@ -660,6 +667,7 @@ def test_make_eval_tar_fails_closed_when_repo_checkout_is_missing(tmp_path):
         )
 
 
+@pytest.mark.native_toolchain
 def test_case3_gold_fixture_passes_repository_compile_and_link_gate(tmp_path):
     report = tmp_path / "compile_report.json"
 
@@ -683,6 +691,7 @@ def test_case3_gold_fixture_passes_repository_compile_and_link_gate(tmp_path):
     ]
 
 
+@pytest.mark.native_toolchain
 def test_local_compile_gate_returns_nonzero_for_failed_candidate(tmp_path):
     cases = tmp_path / "cases.jsonl"
     completions = tmp_path / "completions.jsonl"
@@ -744,6 +753,7 @@ def test_make_checkpoint_plain_tar_archives_checkpoint_without_gzip(tmp_path):
     assert "iter_0000006/metadata.json" not in names
 
 
+@pytest.mark.native_toolchain
 def test_dry_run_prints_remote_generation_script(tmp_path, capsys):
     pubkey = tmp_path / "id_ed25519.pub"
     pubkey.write_text("ssh-ed25519 TESTKEY codex\n")

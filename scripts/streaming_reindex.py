@@ -6,8 +6,8 @@ Pipeline (one repo at a time, fail-loud per repo, continue on failure):
     extract cpp_all/<repo> subtree from the zstd tarball  ->  temp dir
       -> index_project.py  (--enriched; channel A build_info from the repo's
          own compile_commands.json when present, empty otherwise -- NO boilerplate)
-      -> clang_enriched_to_parquet.py (tokenize @ 65536, --materialize-tokenized-enriched,
-         --overflow-policy drop)
+      -> clang_enriched_to_parquet.py (--materialize-tokenized-enriched,
+         --overflow-policy split at the largest fixed bucket)
       -> pack_enriched_rows.py once per --target-length (best_fit, no-crop)
       -> append packed parquet to outputs/reindexed/{1024,2048,4096}/<repo>.parquet
       -> mark <repo> done in outputs/reindexed/_done.json
@@ -31,6 +31,7 @@ Source: /Users/dave/sources/parquet/data-cpp_all/data-cpp_all.tar.zst
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -74,8 +75,18 @@ OUTPUT_ROOT = ROOT / "outputs" / "reindexed"
 MANIFEST_PATH = OUTPUT_ROOT / "_done.json"
 DEFAULT_REPO_LIST = ROOT / "outputs" / "pr_ingest" / "repo_list.json"
 
-# Tokenize at the model's full context so packing decides the final lengths.
+# Compatibility default for direct stage_materialize callers. Production
+# route-by-fit callers pass a target-derived lossless split budget explicitly.
 TOKENIZE_BUDGET = 65536
+# Upstream indexers historically discarded docs above --max-tokens before the
+# lossless materializer could see them. Use an effectively unbounded signed
+# 64-bit value so token length alone never filters an enriched source document.
+LOSSLESS_INDEX_MAX_TOKENS = (1 << 63) - 1
+# materialize_tokenized_enriched adds BOS and, for routed domains, a pair of
+# domain delimiter tokens. Further embedded-domain expansion is checked against
+# the actual token_ids length and fails closed before routing.
+MATERIALIZED_ROW_RESERVED_TOKENS = 3
+MATERIALIZE_SPLIT_STATS_SCHEMA = "cppmega.materialize_split_stats_v1"
 DEFAULT_TARGET_LENGTHS = (1024, 2048, 4096)
 
 # Directories never worth indexing (VCS / build artifacts). index_project has its
@@ -155,6 +166,21 @@ def _route_by_fit_impl():
     return bucket_for, route_by_fit
 
 
+def lossless_materialize_budget(target_lengths: Sequence[int]) -> int:
+    """Raw-text budget that leaves room for mandatory tokenized-row markers."""
+
+    lengths = sorted({int(length) for length in target_lengths})
+    if not lengths or lengths[0] <= 0:
+        raise ValueError(f"target lengths must be positive and non-empty: {lengths}")
+    budget = lengths[-1] - MATERIALIZED_ROW_RESERVED_TOKENS
+    if budget <= 0:
+        raise ValueError(
+            "largest target length is too small for BOS/domain delimiters: "
+            f"{lengths[-1]} <= {MATERIALIZED_ROW_RESERVED_TOKENS}"
+        )
+    return budget
+
+
 class RepoFailure(RuntimeError):
     """A single repo failed at a specific stage. Recorded; driver continues."""
 
@@ -183,7 +209,10 @@ _FUNCTION_DEDUP_RE = re.compile(
     r"dropped_exact=(\d+)\s+dropped_near=(\d+)\b"
 )
 _BUILD_DOCS_RE = re.compile(
-    r"\bBuild docs:\s+emitted=(\d+)\s+dropped_dup=(\d+)\s+skipped_empty=(\d+)\b"
+    r"\bBuild docs:\s+emitted=(\d+)\s+"
+    r"source_chars_in=(\d+)\s+source_chars_out=(\d+)\s+"
+    r"skipped_zero_length=(\d+)\s+"
+    r"source_chunk_dedup=disabled_for_lossless_spans\b"
 )
 
 
@@ -212,9 +241,13 @@ def _classify_empty_index_project_log(text: str) -> str | None:
     if dedup is not None:
         _kept, dropped_exact, dropped_near = (int(dedup.group(i)) for i in (1, 2, 3))
         dropped_functions = dropped_exact + dropped_near
-    dropped_build_docs = int(build_docs.group(2)) if build_docs is not None else 0
+    if build_docs is not None:
+        source_chars_in = int(build_docs.group(2))
+        source_chars_out = int(build_docs.group(3))
+        if source_chars_in != source_chars_out:
+            return "domain_source_loss"
 
-    if dropped_functions > 0 or dropped_build_docs > 0:
+    if dropped_functions > 0:
         return "dedup_exhausted"
     if cpp_files == 0 and build_files == 0:
         return "no_trainable_source"
@@ -643,29 +676,21 @@ def _mark_source_cache_complete(repo_dir: Path, repo: str) -> None:
 
 
 def _copy_tar_member_file(src, target: Path, *, repo: str, member_name: str) -> bool:
-    """Copy a tar file member, explicitly skipping legacy file/dir conflicts.
-
-    Some old source archives contain path-type collisions, for example a
-    directory and a regular file at the same path. Blocking the whole corpus on
-    that single path is worse than losing one impossible-to-materialize member,
-    but the skip must be visible in logs.
-    """
+    """Copy one tar member without silently dropping path-type collisions."""
     if target.exists() and target.is_dir():
-        print(
-            f"WARN {repo}: skip tar file {member_name!r}; target path is already "
-            f"a directory: {target}",
-            file=sys.stderr,
-            flush=True,
+        raise RepoFailure(
+            repo,
+            "stream",
+            f"tar member {member_name!r} collides with an existing directory "
+            f"at {target}; refusing to drop source content",
         )
-        return False
     if target.parent.exists() and not target.parent.is_dir():
-        print(
-            f"WARN {repo}: skip tar file {member_name!r}; parent path is not a "
-            f"directory: {target.parent}",
-            file=sys.stderr,
-            flush=True,
+        raise RepoFailure(
+            repo,
+            "stream",
+            f"tar member {member_name!r} has a non-directory parent "
+            f"{target.parent}; refusing to drop source content",
         )
-        return False
     target.parent.mkdir(parents=True, exist_ok=True)
     with open(target, "wb") as out:
         shutil.copyfileobj(src, out)
@@ -918,7 +943,7 @@ def stage_index_source(
         "--project-id", project_id,
         "--output", enriched,
         "--enriched",
-        "--max-tokens", str(TOKENIZE_BUDGET),
+        "--max-tokens", str(LOSSLESS_INDEX_MAX_TOKENS),
         "--exclude-dirs", SOURCE_EXTRA_EXCLUDE,
         "--tokenizer-path", TOKENIZER_PATH,
         "--memory-limit-gb", str(memory_limit_gb),
@@ -990,7 +1015,7 @@ def stage_index_commits(repo: str, commit_inputs: Sequence[Path], work: Path,
         VENV_PYTHON, PROCESS_COMMITS,
         "--inputs", *[str(p) for p in commit_inputs],
         "--output", enriched,
-        "--max-tokens", str(TOKENIZE_BUDGET),
+        "--max-tokens", str(LOSSLESS_INDEX_MAX_TOKENS),
         "--tokenizer-path", TOKENIZER_PATH,
         "--format", "both",
         "--memory-limit-gb", str(memory_limit_gb),
@@ -1033,6 +1058,8 @@ def stage_materialize(
     memory_limit_gb: float = 10.0,
     *,
     project_id: str | None = None,
+    max_tokens: int = TOKENIZE_BUDGET,
+    fixed_shape_max_tokens: int | None = None,
 ) -> Path:
     """clang_enriched_to_parquet.py -> tokenized enriched parquet (single file).
 
@@ -1041,15 +1068,25 @@ def stage_materialize(
     that omit it must carry canonical repo identity in every input row; the
     materializer validates that contract fail-closed.
     """
+    if max_tokens <= 0:
+        raise RepoFailure(repo, "materialize", f"max_tokens must be positive: {max_tokens}")
+    if fixed_shape_max_tokens is not None and fixed_shape_max_tokens <= 0:
+        raise RepoFailure(
+            repo,
+            "materialize",
+            f"fixed_shape_max_tokens must be positive: {fixed_shape_max_tokens}",
+        )
     tok = work / f"{repo}.tok.parquet"
+    stats_path = materialize_stats_path(tok)
     cmd = [
         VENV_PYTHON, MATERIALIZER,
         "--input-file", enriched,
         "--output-file", tok,
         "--tokenizer-path", TOKENIZER_PATH,
         "--materialize-tokenized-enriched",
-        "--overflow-policy", "drop",
-        "--size", _budget_size_label(TOKENIZE_BUDGET),
+        "--overflow-policy", "split",
+        "--size", str(max_tokens),
+        "--stats-file", stats_path,
         "--memory-limit-gb", str(memory_limit_gb),
     ]
     if project_id is not None:
@@ -1057,6 +1094,9 @@ def stage_materialize(
             project_id, source=f"stage_materialize({repo})"
         )
         cmd += ["--default-repo", project_id]
+    # A failed/retried materialization must never validate a newly replaced
+    # parquet against a receipt left by an earlier attempt.
+    stats_path.unlink(missing_ok=True)
     run_checked(
         repo,
         "materialize",
@@ -1065,13 +1105,194 @@ def stage_materialize(
     )
     if not tok.exists() or tok.stat().st_size == 0:
         raise RepoFailure(repo, "materialize", f"empty tokenized parquet: {tok}")
+    try:
+        read_materialize_stats(
+            tok,
+            fixed_shape_max_tokens=fixed_shape_max_tokens,
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RepoFailure(
+            repo,
+            "materialize_stats",
+            f"invalid lossless materialization receipt {stats_path}: {exc}",
+        ) from exc
     return tok
 
 
-def _budget_size_label(budget: int) -> str:
-    if budget % 1024 != 0:
-        raise ValueError(f"budget {budget} is not a multiple of 1024")
-    return f"{budget // 1024}k"
+def materialize_stats_path(tok: Path) -> Path:
+    return Path(f"{tok}.materialize_stats.json")
+
+
+def read_materialize_stats(
+    tok: Path,
+    *,
+    fixed_shape_max_tokens: int | None = None,
+) -> dict[str, object]:
+    """Load and validate the exact split receipt paired with tokenized parquet."""
+
+    path = materialize_stats_path(tok)
+    if not path.is_file():
+        raise ValueError(f"missing materialization stats receipt: {path}")
+    stats = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(stats, dict):
+        raise ValueError("materialization stats must be a JSON object")
+    if stats.get("schema") != MATERIALIZE_SPLIT_STATS_SCHEMA:
+        raise ValueError(
+            f"unsupported materialization stats schema: {stats.get('schema')!r}"
+        )
+    if stats.get("overflow_policy") != "split":
+        raise ValueError(
+            "production materialization receipt must use overflow_policy='split'"
+        )
+
+    integer_fields = (
+        "max_tokens",
+        "docs_in",
+        "docs_out",
+        "source_docs_emitted",
+        "split_input_docs",
+        "split_output_docs",
+        "dropped_input_docs",
+        "emitted_valid_tokens",
+        "split_emitted_tokens",
+        "emitted_chars",
+        "split_emitted_chars",
+        "max_emitted_tokens",
+        "max_emitted_chars",
+        "materialized_rows",
+        "materialized_output_tokens",
+        "max_materialized_tokens",
+        "output_file_size",
+        "cross_piece_call_edges",
+        "cross_piece_type_edges",
+        "cross_piece_domain_edges",
+        "cross_piece_build_edges",
+        "cross_piece_shell_edges",
+        "cross_piece_diagnostic_edges",
+        "cross_piece_cross_domain_edges",
+    )
+    normalized: dict[str, object] = {
+        "schema": stats["schema"],
+        "overflow_policy": stats["overflow_policy"],
+    }
+    for counter_name in integer_fields:
+        value = int(stats[counter_name])
+        if value < 0:
+            raise ValueError(f"{counter_name} must be non-negative, got {value}")
+        normalized[counter_name] = value
+    output_file_sha256 = stats.get("output_file_sha256")
+    if (
+        not isinstance(output_file_sha256, str)
+        or len(output_file_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in output_file_sha256)
+    ):
+        raise ValueError("output_file_sha256 must be a lowercase SHA-256")
+    normalized["output_file_sha256"] = output_file_sha256
+    actual_size = tok.stat().st_size
+    if int(normalized["output_file_size"]) != actual_size:
+        raise ValueError(
+            "materialized parquet size does not match its receipt: "
+            f"{actual_size} != {normalized['output_file_size']}"
+        )
+    digest = hashlib.sha256()
+    with tok.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    actual_sha256 = digest.hexdigest()
+    if actual_sha256 != output_file_sha256:
+        raise ValueError(
+            "materialized parquet hash does not match its receipt: "
+            f"{actual_sha256} != {output_file_sha256}"
+        )
+
+    docs_in = int(normalized["docs_in"])
+    docs_out = int(normalized["docs_out"])
+    emitted = int(normalized["source_docs_emitted"])
+    dropped = int(normalized["dropped_input_docs"])
+    if docs_in != emitted + dropped:
+        raise ValueError(
+            "docs_in must equal source_docs_emitted + dropped_input_docs: "
+            f"{docs_in} != {emitted} + {dropped}"
+        )
+    if dropped:
+        raise ValueError(f"lossless split dropped {dropped} input document(s)")
+    if docs_out < emitted:
+        raise ValueError(f"docs_out {docs_out} is smaller than emitted inputs {emitted}")
+    if int(normalized["materialized_rows"]) != docs_out:
+        raise ValueError(
+            "materialized_rows must equal docs_out: "
+            f"{normalized['materialized_rows']} != {docs_out}"
+        )
+    if int(normalized["max_emitted_tokens"]) > int(normalized["max_tokens"]):
+        raise ValueError(
+            "max_emitted_tokens exceeds the requested raw split budget: "
+            f"{normalized['max_emitted_tokens']} > {normalized['max_tokens']}"
+        )
+    if (
+        fixed_shape_max_tokens is not None
+        and int(normalized["max_materialized_tokens"]) > fixed_shape_max_tokens
+    ):
+        raise ValueError(
+            "materialized token row exceeds the largest fixed bucket: "
+            f"{normalized['max_materialized_tokens']} > {fixed_shape_max_tokens}"
+        )
+    return normalized
+
+
+_MATERIALIZE_SUM_FIELDS = (
+    "docs_in",
+    "docs_out",
+    "source_docs_emitted",
+    "split_input_docs",
+    "split_output_docs",
+    "dropped_input_docs",
+    "emitted_valid_tokens",
+    "split_emitted_tokens",
+    "emitted_chars",
+    "split_emitted_chars",
+    "materialized_rows",
+    "materialized_output_tokens",
+    "output_file_size",
+    "cross_piece_call_edges",
+    "cross_piece_type_edges",
+    "cross_piece_domain_edges",
+    "cross_piece_build_edges",
+    "cross_piece_shell_edges",
+    "cross_piece_diagnostic_edges",
+    "cross_piece_cross_domain_edges",
+)
+_MATERIALIZE_MAX_FIELDS = (
+    "max_tokens",
+    "max_emitted_tokens",
+    "max_emitted_chars",
+    "max_materialized_tokens",
+)
+
+
+def summarize_materialize_stats(entries: Sequence[dict]) -> dict[str, int]:
+    """Aggregate durable per-unit split receipts; old entries are counted absent."""
+
+    totals = {
+        "receipts": 0,
+        **{field: 0 for field in _MATERIALIZE_SUM_FIELDS},
+        **{field: 0 for field in _MATERIALIZE_MAX_FIELDS},
+    }
+    for info in entries:
+        stats = info.get("materialize_stats")
+        if not isinstance(stats, dict):
+            continue
+        if stats.get("schema") != MATERIALIZE_SPLIT_STATS_SCHEMA:
+            raise ValueError(
+                f"unexpected materialize_stats schema: {stats.get('schema')!r}"
+            )
+        totals["receipts"] += 1
+        for counter_name in _MATERIALIZE_SUM_FIELDS:
+            totals[counter_name] += int(stats[counter_name])
+        for counter_name in _MATERIALIZE_MAX_FIELDS:
+            totals[counter_name] = max(
+                totals[counter_name], int(stats[counter_name])
+            )
+    return totals
 
 
 def stage_pack(repo: str, tok: Path, target_length: int, work: Path) -> Path:
@@ -1288,11 +1509,10 @@ def process_one_repo(
     """Index a repo, then ROUTE each code doc to exactly ONE length bucket.
 
     Corrected design (route-by-fit, carried over from the commits driver):
-    materialize the repo's tokenized docs ONCE, then split rows by whole-doc
-    token count into the smallest fitting length bucket. Docs longer than the
-    largest length are explicitly dropped from fixed-shape parquet output and
-    reported by the router instead of being written as invalid oversized rows.
-    Each routed bucket is packed independently and landed at
+    losslessly split and materialize the repo's docs ONCE, then route each
+    aligned split piece by token count into the smallest fitting length bucket.
+    Any residual row longer than the largest bucket fails the repo before
+    publication. Each routed bucket is packed independently and landed at
     outputs/reindexed/<L>/<repo>.parquet. A given doc therefore appears in
     exactly one bucket -- never replicated across 1024/2048/4096.
     """
@@ -1302,6 +1522,7 @@ def process_one_repo(
     )
     work.mkdir(parents=True, exist_ok=True)
     lengths_sorted = sorted(int(x) for x in target_lengths)
+    materialize_budget = lossless_materialize_budget(lengths_sorted)
     stage_id = code_stage_id(repo) if dedup_db is not None else None
     stage_db = code_stage_db(work, repo) if dedup_db is not None else None
     promoted = False
@@ -1330,7 +1551,10 @@ def process_one_repo(
             work=work,
             memory_limit_gb=memory_limit_gb,
             project_id=project_id,
+            max_tokens=materialize_budget,
+            fixed_shape_max_tokens=lengths_sorted[-1],
         )
+        materialize_stats = read_materialize_stats(tok)
         timings["materialize_s"] = round(time.monotonic() - started, 6)
 
         started = time.monotonic()
@@ -1352,7 +1576,12 @@ def process_one_repo(
             promoted = True
         else:
             success_without_promote = True
-        return {"source": "code", "lengths": per_length, "stage_timings_s": timings}
+        return {
+            "source": "code",
+            "lengths": per_length,
+            "stage_timings_s": timings,
+            "materialize_stats": materialize_stats,
+        }
     finally:
         if not promoted and not success_without_promote:
             discard_dedup_stage(dedup_db, stage_id, stage_db)
@@ -1378,6 +1607,7 @@ def process_one_commit_source(
     )
     work.mkdir(parents=True, exist_ok=True)
     lengths_sorted = sorted(int(x) for x in target_lengths)
+    materialize_budget = lossless_materialize_budget(lengths_sorted)
     stage_id = commit_stage_id(key) if dedup_db is not None else None
     stage_db = commit_stage_db(work, key) if dedup_db is not None else None
     promoted = False
@@ -1402,7 +1632,10 @@ def process_one_commit_source(
             work=work,
             memory_limit_gb=memory_limit_gb,
             project_id=project_id,
+            max_tokens=materialize_budget,
+            fixed_shape_max_tokens=lengths_sorted[-1],
         )
+        materialize_stats = read_materialize_stats(tok)
         timings["materialize_s"] = round(time.monotonic() - started, 6)
 
         started = time.monotonic()
@@ -1421,7 +1654,12 @@ def process_one_commit_source(
         timings["pack_s"] = round(time.monotonic() - started, 6)
         timings.update(promote_dedup_stage(dedup_db, stage_id, stage_db))
         promoted = True
-        return {"source": "commits", "lengths": per_length, "stage_timings_s": timings}
+        return {
+            "source": "commits",
+            "lengths": per_length,
+            "stage_timings_s": timings,
+            "materialize_stats": materialize_stats,
+        }
     finally:
         if not promoted:
             discard_dedup_stage(dedup_db, stage_id, stage_db)
@@ -1737,6 +1975,9 @@ def main(argv: list[str]) -> int:
         "total_done": len(manifest.done),
         "total_failed": len(manifest.failed),
         "per_length_totals": totals,
+        "materialize_split_totals": summarize_materialize_stats(
+            list(run_report.values())
+        ),
         "manifest": str(MANIFEST_PATH),
     }
     print(json.dumps(summary, indent=2))

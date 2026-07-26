@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from cppmega.data.build_parsers.base import (
@@ -37,11 +38,15 @@ _SHELL_DOMAIN_MAP = {
     "zsh": DomainKind.ZSH,
     "tcsh": DomainKind.TCSH,
     "csh": DomainKind.TCSH,
-    "powershell": DomainKind.POWERSHELL,
-    "pwsh": DomainKind.POWERSHELL,
-    "ps1": DomainKind.POWERSHELL,
-    "batch": DomainKind.BATCH,
-    "cmd": DomainKind.BATCH,
+    # The frozen domain/tokenizer contract has no dedicated PowerShell or
+    # Windows-batch IDs. Keep their dialect identity in parser metadata while
+    # routing them through the existing shared shell domain. In particular,
+    # do not send PowerShell text through the POSIX parser.
+    "powershell": DomainKind.SH,
+    "pwsh": DomainKind.SH,
+    "ps1": DomainKind.SH,
+    "batch": DomainKind.SH,
+    "cmd": DomainKind.SH,
 }
 
 _PIPE_NODE_TYPES = {"pipe", "pipeline"}
@@ -64,6 +69,41 @@ _FILE_EXTENSIONS = {
     ".conf", ".ini", ".log", ".out", ".err", ".dat", ".bin", ".tar", ".gz",
     ".zip", ".xz", ".bz2", ".zst", ".parquet", ".csv", ".tsv",
 }
+
+_POWERSHELL_VARIABLE_RE = re.compile(
+    r"\$\{?([A-Za-z_][A-Za-z0-9_:]*)\}?"
+)
+_POWERSHELL_DEFINITION_RE = re.compile(
+    r"(?m)(?:^|[;{}])[ \t]*"
+    r"(?P<variable>\$\{?(?P<name>[A-Za-z_][A-Za-z0-9_:]*)\}?)"
+    r"[ \t]*(?:=|\+=|-=|\*=|/=)"
+)
+_POWERSHELL_TYPED_DEFINITION_RE = re.compile(
+    r"(?m)(?:^|[;{}])[ \t]*"
+    r"(?:\[[^\]\r\n]+\][ \t]*)+"
+    r"(?P<variable>\$\{?(?P<name>[A-Za-z_][A-Za-z0-9_:]*)\}?)"
+    r"[ \t]*(?:=|\+=|-=|\*=|/=)"
+)
+_POWERSHELL_PARAM_START_RE = re.compile(r"(?i)\bparam[ \t\r\n]*\(")
+_POWERSHELL_PARAM_VAR_RE = re.compile(
+    r"(?:^|,)[ \t\r\n]*"
+    r"(?:\[[^\]\r\n]+\][ \t\r\n]*)*"
+    r"(?P<variable>\$\{?(?P<name>[A-Za-z_][A-Za-z0-9_:]*)\}?)"
+)
+_POWERSHELL_COMMAND_RE = re.compile(
+    r"(?m)(?:^|[;|]|(?<!\$)[{}])[ \t\r\n]*(?:&[ \t]*)?"
+    r"(?P<command>[A-Za-z_][A-Za-z0-9_.-]*)"
+)
+_POWERSHELL_ASSIGNMENT_COMMAND_RE = re.compile(
+    r"(?m)(?:^|[;{}])[ \t]*"
+    r"(?:\[[^\]\r\n]+\][ \t]*)*"
+    r"\$\{?[A-Za-z_][A-Za-z0-9_:]*\}?"
+    r"[ \t]*(?:=|\+=|-=|\*=|/=)[ \t]*"
+    r"(?P<command>[A-Za-z_][A-Za-z0-9_.]*-[A-Za-z0-9_.-]+)"
+)
+_POWERSHELL_REDIRECT_RE = re.compile(
+    r"(?P<op>(?:[0-9]+|&)?>{1,2}|<)"
+)
 
 
 def _looks_like_file(text: str) -> bool:
@@ -113,6 +153,20 @@ def _node_text(node: Any, source: bytes) -> str:
     return source[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
 
 
+def _utf8_byte_to_char_offsets(source: bytes) -> list[int]:
+    """Map every UTF-8 byte boundary to the containing Python char offset."""
+
+    offsets = [0] * (len(source) + 1)
+    byte_offset = 0
+    for char_offset, char in enumerate(source.decode("utf-8")):
+        encoded_length = len(char.encode("utf-8"))
+        for index in range(byte_offset, byte_offset + encoded_length):
+            offsets[index] = char_offset
+        byte_offset += encoded_length
+        offsets[byte_offset] = char_offset + 1
+    return offsets
+
+
 def _walk(node: Any):
     yield node
     for child in node.children:
@@ -121,6 +175,184 @@ def _walk(node: Any):
 
 def _find_children_of_type(node: Any, types: set[str]) -> list[Any]:
     return [c for c in node.children if c.type in types]
+
+
+def _powershell_comment_boundary(text: str, index: int) -> bool:
+    return (
+        index == 0
+        or text[index - 1].isspace()
+        or text[index - 1] in ";|&(){}[],=+-*/%!?:<>"
+    )
+
+
+def _mask_powershell_text(
+    text: str,
+    *,
+    preserve_interpolated_strings: bool,
+) -> str:
+    """Mask comments/literals while preserving offsets and live interpolation."""
+
+    masked = list(text)
+    quote: str | None = None
+    escaped = False
+    line_comment = False
+    block_comment = False
+    here_string_end: str | None = None
+    here_string_interpolates = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if block_comment:
+            if text.startswith("#>", index):
+                masked[index : index + 2] = [" ", " "]
+                block_comment = False
+                index += 2
+                continue
+            if char not in "\r\n":
+                masked[index] = " "
+            index += 1
+            continue
+        if here_string_end is not None:
+            at_line_start = index == 0 or text[index - 1] in "\r\n"
+            if at_line_start:
+                line_end = len(text)
+                for newline in ("\n", "\r"):
+                    candidate = text.find(newline, index)
+                    if candidate >= 0:
+                        line_end = min(line_end, candidate)
+                if text[index:line_end].strip(" \t") == here_string_end:
+                    for position in range(index, line_end):
+                        masked[position] = " "
+                    here_string_end = None
+                    here_string_interpolates = False
+                    index = line_end
+                    continue
+            if (
+                preserve_interpolated_strings
+                and here_string_interpolates
+                and char == "`"
+            ):
+                masked[index] = " "
+                if index + 1 < len(text):
+                    masked[index + 1] = " "
+                    index += 2
+                    continue
+            if (
+                not preserve_interpolated_strings
+                or not here_string_interpolates
+            ) and char not in "\r\n":
+                masked[index] = " "
+            index += 1
+            continue
+        if line_comment:
+            if char in "\r\n":
+                line_comment = False
+            else:
+                masked[index] = " "
+            index += 1
+            continue
+        if escaped:
+            masked[index] = " "
+            escaped = False
+            index += 1
+            continue
+        if char == "`" and quote != "'":
+            masked[index] = " "
+            escaped = True
+            index += 1
+            continue
+        if quote == "'":
+            masked[index] = " "
+            if char == "'":
+                if index + 1 < len(text) and text[index + 1] == "'":
+                    masked[index + 1] = " "
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+        if quote == '"':
+            if not preserve_interpolated_strings and char not in "\r\n":
+                masked[index] = " "
+            if char == '"':
+                quote = None
+            index += 1
+            continue
+        if text.startswith("<#", index) and _powershell_comment_boundary(
+            text,
+            index,
+        ):
+            masked[index : index + 2] = [" ", " "]
+            block_comment = True
+            index += 2
+            continue
+        if text.startswith(("@'", '@"'), index):
+            line_end = len(text)
+            for newline in ("\n", "\r"):
+                candidate = text.find(newline, index)
+                if candidate >= 0:
+                    line_end = min(line_end, candidate)
+            if not text[index + 2 : line_end].strip(" \t"):
+                here_string_end = "'@" if text[index + 1] == "'" else '"@'
+                here_string_interpolates = text[index + 1] == '"'
+                for position in range(index, line_end):
+                    masked[position] = " "
+                index = line_end
+                continue
+        if char == "'":
+            masked[index] = " "
+            quote = "'"
+        elif char == '"':
+            if not preserve_interpolated_strings:
+                masked[index] = " "
+            quote = '"'
+        elif (
+            char == "#"
+            and not (index > 0 and text[index - 1] == "<")
+            and _powershell_comment_boundary(text, index)
+        ):
+            masked[index] = " "
+            line_comment = True
+        index += 1
+    return "".join(masked)
+
+
+def _powershell_variable_definitions(
+    structural_text: str,
+) -> list[tuple[str, int]]:
+    definitions: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    for pattern in (
+        _POWERSHELL_DEFINITION_RE,
+        _POWERSHELL_TYPED_DEFINITION_RE,
+    ):
+        for match in pattern.finditer(structural_text):
+            item = (match.group("name").casefold(), match.start("variable"))
+            if item not in seen:
+                seen.add(item)
+                definitions.append(item)
+    for param_start in _POWERSHELL_PARAM_START_RE.finditer(structural_text):
+        body_start = param_start.end()
+        depth = 1
+        cursor = body_start
+        while cursor < len(structural_text) and depth:
+            if structural_text[cursor] == "(":
+                depth += 1
+            elif structural_text[cursor] == ")":
+                depth -= 1
+            cursor += 1
+        if depth:
+            continue
+        body = structural_text[body_start : cursor - 1]
+        for match in _POWERSHELL_PARAM_VAR_RE.finditer(body):
+            item = (
+                match.group("name").casefold(),
+                body_start + match.start("variable"),
+            )
+            if item not in seen:
+                seen.add(item)
+                definitions.append(item)
+    return definitions
 
 
 def _extract_bash_edges(root: Any, source: bytes) -> list[tuple[int, int, int]]:
@@ -162,7 +394,6 @@ def _extract_bash_edges(root: Any, source: bytes) -> list[tuple[int, int, int]]:
             if words:
                 cmd_name = _node_text(words[0], source)
                 if cmd_name in _SOURCE_COMMANDS and len(words) > 1:
-                    target = _node_text(words[1], source)
                     edges.append(
                         (
                             words[0].start_byte,
@@ -239,7 +470,7 @@ def _extract_powershell_edges(root: Any, source: bytes) -> list[tuple[int, int, 
                 if child.type == "left_assignment_expression":
                     for var_node in _walk(child):
                         if var_node.type == "variable":
-                            name = _node_text(var_node, source).lstrip("$")
+                            name = _node_text(var_node, source).lstrip("$").casefold()
                             var_defs.setdefault(name, []).append(var_node.start_byte)
                             assignment_vars.add(id(var_node))
                             break
@@ -247,7 +478,7 @@ def _extract_powershell_edges(root: Any, source: bytes) -> list[tuple[int, int, 
 
         elif node.type == "variable":
             if id(node) not in assignment_vars:
-                name = _node_text(node, source).lstrip("$")
+                name = _node_text(node, source).lstrip("$").casefold()
                 if name and name[0:1].isalpha():
                     var_uses.append((name, node.start_byte))
 
@@ -414,6 +645,218 @@ def _extract_tcsh_edges(root: Any, source: bytes) -> list[tuple[int, int, int]]:
     return edges
 
 
+def _heuristic_assign_powershell_roles_and_edges(
+    doc: ParsedDomainDocument,
+) -> None:
+    """PowerShell-aware fallback that never reinterprets syntax as POSIX shell."""
+
+    tokens = doc.tokens
+    if not tokens:
+        return
+
+    def char_to_token_idx(char_offset: int) -> int | None:
+        for token_index, token in enumerate(tokens):
+            if token.start <= char_offset < token.end:
+                return token_index
+            if token.start > char_offset:
+                break
+        return None
+
+    structural_text = _mask_powershell_text(
+        doc.text,
+        preserve_interpolated_strings=False,
+    )
+    variable_text = _mask_powershell_text(
+        doc.text,
+        preserve_interpolated_strings=True,
+    )
+
+    next_entity = 1
+    definitions: dict[str, list[tuple[int, int]]] = {}
+    definition_positions: set[int] = set()
+    variable_positions: list[tuple[int, int]] = []
+    for name, char_offset in _powershell_variable_definitions(structural_text):
+        token_index = char_to_token_idx(char_offset)
+        if token_index is None:
+            continue
+        definitions.setdefault(name, []).append((char_offset, token_index))
+        definition_positions.add(char_offset)
+        variable_positions.append((char_offset, token_index))
+        doc.set_role(
+            token_index,
+            DomainRoleKind.ENVIRONMENT,
+            entity=next_entity,
+        )
+        next_entity += 1
+
+    for match in _POWERSHELL_VARIABLE_RE.finditer(variable_text):
+        char_offset = match.start()
+        if char_offset in definition_positions:
+            continue
+        token_index = char_to_token_idx(char_offset)
+        if token_index is None:
+            continue
+        doc.set_role(token_index, DomainRoleKind.VARIABLE)
+        variable_positions.append((char_offset, token_index))
+        name = match.group(1).casefold()
+        definition = next(
+            (
+                item
+                for item in reversed(definitions.get(name, []))
+                if item[0] < char_offset
+            ),
+            None,
+        )
+        if definition is not None:
+            doc.add_edge(
+                definition[1],
+                token_index,
+                DomainEdgeKind.SHELL_VAR_DEF_USE,
+            )
+
+    command_positions: list[tuple[int, int]] = []
+    command_offsets = sorted(
+        {
+            match.start("command")
+            for pattern in (
+                _POWERSHELL_COMMAND_RE,
+                _POWERSHELL_ASSIGNMENT_COMMAND_RE,
+            )
+            for match in pattern.finditer(structural_text)
+        }
+    )
+    for char_offset in command_offsets:
+        token_index = char_to_token_idx(char_offset)
+        if token_index is None:
+            continue
+        command_positions.append((char_offset, token_index))
+        if doc.role_ids[token_index] == int(DomainRoleKind.NONE):
+            doc.set_role(
+                token_index,
+                DomainRoleKind.COMMAND,
+                entity=next_entity,
+            )
+            next_entity += 1
+
+    pipe_positions = [
+        index
+        for index, char in enumerate(structural_text)
+        if char == "|"
+        and (index == 0 or structural_text[index - 1] != "|")
+        and (index + 1 == len(structural_text) or structural_text[index + 1] != "|")
+    ]
+    for pipe_position in pipe_positions:
+        pipe_token = char_to_token_idx(pipe_position)
+        if pipe_token is not None:
+            doc.set_role(pipe_token, DomainRoleKind.PIPE)
+        left_segment_start = max(
+            structural_text.rfind("\n", 0, pipe_position) + 1,
+            structural_text.rfind("\r", 0, pipe_position) + 1,
+            structural_text.rfind(";", 0, pipe_position) + 1,
+            max(
+                (
+                    previous_pipe + 1
+                    for previous_pipe in pipe_positions
+                    if previous_pipe < pipe_position
+                ),
+                default=0,
+            ),
+        )
+        right_cursor = pipe_position + 1
+        while (
+            right_cursor < len(structural_text)
+            and structural_text[right_cursor].isspace()
+        ):
+            right_cursor += 1
+        right_segment_end = min(
+            (
+                boundary
+                for boundary in (
+                    structural_text.find("\n", right_cursor),
+                    structural_text.find("\r", right_cursor),
+                    structural_text.find(";", right_cursor),
+                    next(
+                        (
+                            following_pipe
+                            for following_pipe in pipe_positions
+                            if following_pipe > pipe_position
+                        ),
+                        -1,
+                    ),
+                )
+                if boundary >= 0
+            ),
+            default=len(structural_text),
+        )
+        left_candidates = [
+            item
+            for item in command_positions
+            if left_segment_start <= item[0] < pipe_position
+        ]
+        if not left_candidates:
+            left_candidates = [
+                item
+                for item in variable_positions
+                if left_segment_start <= item[0] < pipe_position
+            ]
+        right_candidates = [
+            item
+            for item in command_positions
+            if right_cursor <= item[0] < right_segment_end
+        ]
+        if not right_candidates:
+            right_candidates = [
+                item
+                for item in variable_positions
+                if right_cursor <= item[0] < right_segment_end
+            ]
+        left = left_candidates[0] if left_candidates else None
+        right = right_candidates[0] if right_candidates else None
+        if left is not None and right is not None:
+            doc.add_edge(left[1], right[1], DomainEdgeKind.SHELL_PIPE)
+
+    for redirect in _POWERSHELL_REDIRECT_RE.finditer(structural_text):
+        token_index = char_to_token_idx(redirect.start())
+        if token_index is None:
+            continue
+        target_start = redirect.end()
+        while target_start < len(doc.text) and doc.text[target_start] in " \t":
+            target_start += 1
+        target_index = char_to_token_idx(target_start)
+        if target_index is None:
+            continue
+        target = tokens[target_index]
+        quoted_target = doc.text[target_start : target_start + 1] in {"'", '"'}
+        if not quoted_target and not structural_text[
+            target.start : target.end
+        ].strip():
+            continue
+        doc.set_role(token_index, DomainRoleKind.REDIRECT)
+        doc.set_role(
+            target_index,
+            DomainRoleKind.PATH,
+            entity=next_entity,
+        )
+        next_entity += 1
+        command = next(
+            (
+                item
+                for item in reversed(command_positions)
+                if item[0] < redirect.start()
+            ),
+            None,
+        )
+        if command is not None:
+            edge_kind = (
+                DomainEdgeKind.SHELL_REDIR_IN
+                if redirect.group("op") == "<"
+                else DomainEdgeKind.SHELL_REDIR_OUT
+            )
+            doc.add_edge(command[1], target_index, edge_kind)
+
+    doc.metadata["fallback_dialect_engine"] = "powershell-lexical"
+
+
 def _heuristic_assign_roles_and_edges(doc: ParsedDomainDocument, shell_kind: str) -> None:
     """Token-level heuristic role/edge assignment when tree-sitter is unavailable."""
     tokens = doc.tokens
@@ -421,6 +864,9 @@ def _heuristic_assign_roles_and_edges(doc: ParsedDomainDocument, shell_kind: str
         return
 
     keywords = _DIALECT_KEYWORDS.get(shell_kind, _SHELL_KEYWORDS)
+    if shell_kind in {"powershell", "pwsh", "ps1"}:
+        _heuristic_assign_powershell_roles_and_edges(doc)
+        return
     redir_out = {">", ">>", "2>", "&>"}
     redir_in = {"<"}
 
@@ -512,13 +958,24 @@ def parse_shell(text: str, shell_kind: str = "bash") -> ParsedDomainDocument:
         domain=domain,
         text=text,
         confidence=ParseConfidence.HEURISTIC,
-        metadata={"parser": "tree-sitter", "shell_kind": shell_kind},
+        metadata={
+            "parser": "tree-sitter",
+            "parse_engine": "tree-sitter",
+            "parser_adapter": f"{shell_kind}-tree-sitter",
+            "shell_kind": shell_kind,
+            "shell_dialect": shell_kind,
+            "shared_domain": domain.name.lower(),
+        },
     )
 
     try:
         parser = _get_parser(shell_kind)
     except Exception:
         doc.metadata["parser"] = "heuristic-fallback"
+        doc.metadata["parse_engine"] = "heuristic-fallback"
+        doc.metadata["parser_adapter"] = f"{shell_kind}-heuristic"
+        if shell_kind in {"batch", "cmd"}:
+            return doc.mark_raw("cmd_native_parser_unavailable")
         _heuristic_assign_roles_and_edges(doc, shell_kind)
         return doc
 
@@ -539,7 +996,7 @@ def parse_shell(text: str, shell_kind: str = "bash") -> ParsedDomainDocument:
     else:
         raw_edges = _extract_bash_edges(root, source_bytes)
 
-    _attach_edges_to_doc(doc, raw_edges)
+    _attach_edges_to_doc(doc, raw_edges, source_bytes)
     _assign_roles(doc, root, source_bytes, lang, shell_kind)
 
     doc.metadata["tree_sitter_language"] = lang
@@ -557,6 +1014,10 @@ def parse_shell(text: str, shell_kind: str = "bash") -> ParsedDomainDocument:
 
 def _has_unbalanced_control_flow(doc: ParsedDomainDocument, shell_kind: str) -> bool:
     """Detect unmatched shell control-flow closers in the token stream."""
+    if shell_kind in {"powershell", "pwsh", "ps1", "batch", "cmd"}:
+        # These dialects use braces/keywords rather than POSIX fi/esac/done.
+        # Tree-sitter's syntax status is authoritative when available.
+        return False
     if shell_kind in ("tcsh", "csh"):
         openers = {"if": "endif", "foreach": "end", "while": "end", "switch": "endsw"}
         closers = {"end", "endsw", "endif"}
@@ -614,12 +1075,17 @@ def _assign_roles(
     if not tokens:
         return
 
+    byte_to_char_offsets = _utf8_byte_to_char_offsets(source)
+
     def byte_to_token_idx(byte_offset: int) -> int | None:
+        if not 0 <= byte_offset <= len(source):
+            return None
+        char_offset = byte_to_char_offsets[byte_offset]
         best: int | None = None
         for idx, tok in enumerate(tokens):
-            if tok.start <= byte_offset < tok.end:
+            if tok.start <= char_offset < tok.end:
                 return idx
-            if tok.start <= byte_offset:
+            if tok.start <= char_offset:
                 best = idx
             else:
                 break
@@ -749,19 +1215,26 @@ def _assign_roles(
 
 
 def _attach_edges_to_doc(
-    doc: ParsedDomainDocument, raw_edges: list[tuple[int, int, int]]
+    doc: ParsedDomainDocument,
+    raw_edges: list[tuple[int, int, int]],
+    source: bytes,
 ) -> None:
     """Map byte-offset edges to token-index edges on the ParsedDomainDocument."""
     tokens = doc.tokens
     if not tokens:
         return
 
+    byte_to_char_offsets = _utf8_byte_to_char_offsets(source)
+
     def byte_to_token_idx(byte_offset: int) -> int | None:
+        if not 0 <= byte_offset <= len(source):
+            return None
+        char_offset = byte_to_char_offsets[byte_offset]
         best: int | None = None
         for idx, tok in enumerate(tokens):
-            if tok.start <= byte_offset < tok.end:
+            if tok.start <= char_offset < tok.end:
                 return idx
-            if tok.start <= byte_offset:
+            if tok.start <= char_offset:
                 best = idx
             else:
                 break

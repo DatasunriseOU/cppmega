@@ -94,7 +94,18 @@ def verify_file(kind: str, path: Path, bucket: str) -> dict[str, Any]:
     columns = ["input_ids"]
     columns += [name for name in TOKEN_SIDECARS if name in names]
     columns += [name for name in EDGE_COLUMNS if name in names]
-    columns += [name for name in ("valid_token_count", "build_kind", "doc_type", "text") if name in names]
+    columns += [
+        name
+        for name in (
+            "valid_token_count",
+            "doc_ids",
+            "build_kind",
+            "source_build_kinds",
+            "doc_type",
+            "text",
+        )
+        if name in names
+    ]
     table = pq.read_table(path, columns=columns)
     rows = table.num_rows
     input_lengths = _list_lengths(table.column("input_ids"))
@@ -169,10 +180,68 @@ def verify_file(kind: str, path: Path, bucket: str) -> dict[str, Any]:
             f"{int(np.count_nonzero(bad_diag))} diagnostic/error rows have no token_diagnostic_edges and no RAW confidence"
         )
 
-    if "build_kind" in names:
-        result["build_kind_counts"].update(Counter(str(x) for x in table.column("build_kind").to_pylist() if x))
+    if "source_build_kinds" in names:
+        source_build_kinds = table.column("source_build_kinds").to_pylist()
+        result["build_kind_counts"].update(
+            Counter(
+                str(kind)
+                for row_kinds in source_build_kinds
+                for kind in (row_kinds or [])
+                if kind
+            )
+        )
+        if "doc_ids" not in names:
+            result["errors"].append(
+                "source_build_kinds is present but doc_ids is missing"
+            )
+        elif "token_domain_ids" in names:
+            flat_doc_ids = _flat(table.column("doc_ids")).astype(np.int64)
+            domain_flat = _flat(table.column("token_domain_ids")).astype(np.int64)
+            if len(flat_doc_ids) != len(domain_flat):
+                result["errors"].append(
+                    "doc_ids and token_domain_ids have different flattened lengths"
+                )
+            else:
+                missing_build_kinds = 0
+                offset = 0
+                for length, row_kinds in zip(
+                    input_lengths,
+                    source_build_kinds,
+                    strict=True,
+                ):
+                    stop = offset + int(length)
+                    row_domain_ids = domain_flat[offset:stop]
+                    row_doc_ids = flat_doc_ids[offset:stop]
+                    build_doc_ids = set(
+                        int(doc_id)
+                        for doc_id in row_doc_ids[
+                            np.isin(row_domain_ids, list(BUILD_DOMAINS))
+                        ]
+                        if int(doc_id) > 0
+                    )
+                    kinds = list(row_kinds or [])
+                    missing_build_kinds += sum(
+                        doc_id > len(kinds) or not kinds[doc_id - 1]
+                        for doc_id in build_doc_ids
+                    )
+                    offset = stop
+                if missing_build_kinds:
+                    result["errors"].append(
+                        f"{missing_build_kinds} packed build document(s) have "
+                        "no aligned source_build_kinds value"
+                    )
+    elif "build_kind" in names:
+        result["build_kind_counts"].update(
+            Counter(
+                str(value)
+                for value in table.column("build_kind").to_pylist()
+                if value
+            )
+        )
     elif np.any(build_rows):
-        result["errors"].append("build domain rows present but build_kind column is missing")
+        result["errors"].append(
+            "build domain rows present but build_kind/source_build_kinds is missing"
+        )
 
     if "text" in names and "doc_type" in names:
         for text, doc_type in zip(table.column("text").to_pylist(), table.column("doc_type").to_pylist(), strict=False):

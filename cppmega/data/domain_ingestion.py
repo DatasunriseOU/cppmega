@@ -18,6 +18,8 @@ from cppmega.data.build_parsers import (
     parse_make,
     parse_ninja,
 )
+from cppmega.data.build_parsers.meson import parse_meson
+from cppmega.data.build_parsers.shell import parse_shell as parse_extended_shell
 from cppmega.data.build_parsers.base import (
     ParsedDomainDocument,
     lex_text,
@@ -186,6 +188,10 @@ _EXPLICIT_DOMAIN_NAMES = frozenset(
         "Makefile.in",
         "meson.build",
         "meson_options.txt",
+        "BUILD.gn",
+        "SConstruct",
+        "SConscript",
+        "xmake.lua",
         "conanfile.txt",
         "conanfile.py",
         "vcpkg.json",
@@ -204,9 +210,16 @@ _EXPLICIT_DOMAIN_SUFFIXES = frozenset(
         ".tcsh",
         ".csh",
         ".ksh",
+        ".ps1",
+        ".psm1",
+        ".psd1",
+        ".bat",
+        ".cmd",
         ".sql",
         ".py",
         ".m4",
+        ".gn",
+        ".gni",
         ".vcxproj",
         ".sln",
     }
@@ -678,6 +691,39 @@ def _parse_raw_output(text: str) -> ParsedDomainDocument:
     )
 
 
+def _raw_typed_parser(
+    domain: DomainKind,
+    adapter: str,
+) -> Parser:
+    """Keep a known dialect distinct when no native graph parser exists yet."""
+
+    def parse(text: str) -> ParsedDomainDocument:
+        return ParsedDomainDocument.new(
+            domain=domain,
+            text=text,
+            confidence=ParseConfidence.RAW,
+            metadata={
+                "parser_adapter": adapter,
+                "unsupported_syntax": f"{adapter}_native_parser_unavailable",
+                "raw_reason": f"{adapter}_native_parser_unavailable",
+            },
+        )
+
+    return parse
+
+
+def parse_powershell(text: str) -> ParsedDomainDocument:
+    """Parse PowerShell with its own dialect parser on the shared shell domain."""
+
+    return parse_extended_shell(text, "powershell")
+
+
+def parse_batch(text: str) -> ParsedDomainDocument:
+    """Parse Windows batch/cmd with its own parser on the shared shell domain."""
+
+    return parse_extended_shell(text, "cmd")
+
+
 _ADAPTERS = {
     "cpp": DomainParserAdapter("cpp-lexical", DomainKind.CPP, parse_cpp_lexical),
     "cmake": DomainParserAdapter("cmake", DomainKind.CMAKE, parse_cmake),
@@ -687,11 +733,37 @@ _ADAPTERS = {
     "configure": DomainParserAdapter("configure-shell", DomainKind.CONFIGURE, parse_configure),
     "autoconf": DomainParserAdapter("autoconf", DomainKind.AUTOCONF, parse_autoconf),
     "automake": DomainParserAdapter("automake", DomainKind.AUTOMAKE, parse_automake),
+    "meson": DomainParserAdapter("meson", DomainKind.MESON, parse_meson),
+    "gn": DomainParserAdapter(
+        "gn-raw",
+        DomainKind.GN,
+        _raw_typed_parser(DomainKind.GN, "gn-raw"),
+    ),
+    "scons": DomainParserAdapter(
+        "scons-raw",
+        DomainKind.SCONS,
+        _raw_typed_parser(DomainKind.SCONS, "scons-raw"),
+    ),
+    "xmake": DomainParserAdapter(
+        "xmake-raw",
+        DomainKind.XMAKE,
+        _raw_typed_parser(DomainKind.XMAKE, "xmake-raw"),
+    ),
     "bash": DomainParserAdapter("bash", DomainKind.BASH, parse_bash),
     "sh": DomainParserAdapter("posix-sh", DomainKind.SH, parse_sh),
     "zsh": DomainParserAdapter("zsh", DomainKind.ZSH, parse_zsh),
     "tcsh": DomainParserAdapter("tcsh", DomainKind.TCSH, parse_tcsh),
     "ksh": DomainParserAdapter("ksh", DomainKind.KSH, parse_ksh),
+    "powershell": DomainParserAdapter(
+        "powershell",
+        DomainKind.SH,
+        parse_powershell,
+    ),
+    "cmd": DomainParserAdapter(
+        "cmd",
+        DomainKind.SH,
+        parse_batch,
+    ),
     "compiler": DomainParserAdapter(
         "clang-diagnostic",
         DomainKind.COMPILER_DIAGNOSTIC,
@@ -726,6 +798,8 @@ def _script_kind_from_shebang(text: str) -> str | None:
     if not first_line.startswith("#!"):
         return None
     words = re.findall(r"[A-Za-z0-9_+.-]+", first_line.lower())
+    if "powershell" in words or "pwsh" in words:
+        return "powershell"
     for kind in ("tcsh", "csh", "zsh", "bash", "ksh", "sh"):
         if kind in words:
             return "tcsh" if kind == "csh" else kind
@@ -756,6 +830,14 @@ def resolve_domain_parser(path: str | Path, text: str = "") -> DomainParserAdapt
         return _ADAPTERS["autoconf"]
     if name in {"Makefile.am", "Makefile.in"}:
         return _ADAPTERS["automake"]
+    if name in {"meson.build", "meson_options.txt"}:
+        return _ADAPTERS["meson"]
+    if name == "BUILD.gn":
+        return _ADAPTERS["gn"]
+    if name in {"SConstruct", "SConscript"}:
+        return _ADAPTERS["scons"]
+    if name == "xmake.lua":
+        return _ADAPTERS["xmake"]
 
     shebang_kind = _script_kind_from_shebang(text)
     if shebang_kind is not None:
@@ -781,6 +863,12 @@ def resolve_domain_parser(path: str | Path, text: str = "") -> DomainParserAdapt
         return _ADAPTERS["tcsh"]
     if suffix == ".ksh":
         return _ADAPTERS["ksh"]
+    if suffix in {".ps1", ".psm1", ".psd1"}:
+        return _ADAPTERS["powershell"]
+    if suffix in {".bat", ".cmd"}:
+        return _ADAPTERS["cmd"]
+    if suffix in {".gn", ".gni"}:
+        return _ADAPTERS["gn"]
     if suffix == ".sql":
         return _ADAPTERS["sql"]
     if suffix == ".py":
@@ -1228,7 +1316,9 @@ __all__ = [
     "extract_embedded_domain_blocks",
     "iter_domain_file_chunks",
     "parse_cpp_lexical",
+    "parse_batch",
     "parse_domain_document",
+    "parse_powershell",
     "parse_python",
     "parse_sql_lexical",
     "resolve_domain_parser",

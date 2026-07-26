@@ -66,6 +66,7 @@ from cppmega.data.nanochat_pipeline.packed_rows_schema import (
     SOURCE_PR_DISCUSSION_LINES_COLUMN,
     SOURCE_PR_NUMBERS_COLUMN,
     SOURCE_REPO_STABLE_IDS_COLUMN,
+    SOURCE_BUILD_KINDS_COLUMN,
     SOURCE_DOC_TYPES_COLUMN,
     TARGET_IDS_COLUMN,
     TOKEN_PLATFORM_IDS_COLUMN,
@@ -73,6 +74,7 @@ from cppmega.data.nanochat_pipeline.packed_rows_schema import (
 )
 from cppmega.data.nanochat_pipeline.tokenized_enriched_schema import (
     AUTHOR_TIMESTAMP_COLUMN,
+    BUILD_KIND_COLUMN,
     COMMIT_HASH_COLUMN,
     COMMIT_TIMESTAMP_COLUMN,
     DOC_TYPE_COLUMN,
@@ -281,6 +283,7 @@ PACKED_ROW_SCHEMA = pa.schema(
         pa.field(SOURCE_PR_DISCUSSION_LINES_COLUMN, pa.list_(pa.int32())),
         pa.field(SOURCE_DOC_TYPES_COLUMN, pa.list_(pa.string())),
         pa.field(SOURCE_HEADER_FRAGMENT_KINDS_COLUMN, pa.list_(pa.string())),
+        pa.field(SOURCE_BUILD_KINDS_COLUMN, pa.list_(pa.string())),
         pa.field(
             SOURCE_IFIM_INSTRUCTION_TOKEN_IDS_COLUMN,
             pa.list_(pa.list_(pa.uint32())),
@@ -804,6 +807,7 @@ def _normalize_chronology(record: dict[str, Any]) -> dict[str, Any]:
         FILEPATH_STABLE_ID_COLUMN: filepath_stable_id,
         DOC_TYPE_COLUMN: record.get(DOC_TYPE_COLUMN),
         HEADER_FRAGMENT_KIND_COLUMN: record.get(HEADER_FRAGMENT_KIND_COLUMN),
+        BUILD_KIND_COLUMN: record.get(BUILD_KIND_COLUMN),
     }
     parent_count = record.get(PARENT_COUNT_COLUMN)
     if parent_count is None:
@@ -1337,6 +1341,7 @@ def _selected_input_columns(available: set[str]) -> list[str]:
             PR_DISCUSSION_LINES_COLUMN,
             DOC_TYPE_COLUMN,
             HEADER_FRAGMENT_KIND_COLUMN,
+            BUILD_KIND_COLUMN,
             *PACKED_TOKEN_METADATA_COLUMNS,
             *PACKED_CHUNK_METADATA_COLUMNS,
             *PACKED_ROWS_OBJECTIVE_SOURCE_TO_TOKEN_COLUMN.values(),
@@ -1565,6 +1570,7 @@ def _materialize_packed_row(
     source_pr_discussion_lines: list[int] = []
     source_doc_types: list[str | None] = []
     source_header_fragment_kinds: list[str | None] = []
+    source_build_kinds: list[str | None] = []
     objective_source_ids: dict[str, list[list[int]]] = {
         source_column: []
         for source_column in PACKED_ROWS_OBJECTIVE_SOURCE_TO_TOKEN_COLUMN
@@ -1624,6 +1630,7 @@ def _materialize_packed_row(
         source_header_fragment_kinds.append(
             doc.chronology.get(HEADER_FRAGMENT_KIND_COLUMN)
         )
+        source_build_kinds.append(doc.chronology.get(BUILD_KIND_COLUMN))
         for source_column, token_column in (
             PACKED_ROWS_OBJECTIVE_SOURCE_TO_TOKEN_COLUMN.items()
         ):
@@ -1769,6 +1776,7 @@ def _materialize_packed_row(
         SOURCE_PR_DISCUSSION_LINES_COLUMN: source_pr_discussion_lines,
         SOURCE_DOC_TYPES_COLUMN: source_doc_types,
         SOURCE_HEADER_FRAGMENT_KINDS_COLUMN: source_header_fragment_kinds,
+        SOURCE_BUILD_KINDS_COLUMN: source_build_kinds,
         **objective_source_ids,
         ROW_PLATFORM_IDS_COLUMN: _merged_platform_ids_for_docs(ordered_docs),
         SYMBOL_IDENTITIES_COLUMN: symbol_identity_registry.records(used_symbol_ids),
@@ -1904,6 +1912,10 @@ def rows_to_table(rows: list[dict[str, Any]]) -> pa.Table:
                 SOURCE_HEADER_FRAGMENT_KINDS_COLUMN: [
                     None if item is None else str(item)
                     for item in row.get(SOURCE_HEADER_FRAGMENT_KINDS_COLUMN, [])
+                ],
+                SOURCE_BUILD_KINDS_COLUMN: [
+                    None if item is None else str(item)
+                    for item in row.get(SOURCE_BUILD_KINDS_COLUMN, [])
                 ],
                 **{
                     source_column: [
