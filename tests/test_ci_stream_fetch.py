@@ -48,6 +48,8 @@ def _run_metadata(run_id: int, *, attempt: int = 1) -> dict[str, Any]:
             "committer": {"name": "builder"},
         },
         "actor": {"login": "builder"},
+        "repository": {"full_name": "owner/repo", "id": 1},
+        "head_repository": {"full_name": "owner/repo", "id": 1},
     }
 
 
@@ -82,6 +84,35 @@ def _inventory(path: Path, count: int) -> Path:
                 ),
             )
     return path
+
+
+def _replace_inventory_run(path: Path, metadata: Mapping[str, object]) -> str:
+    raw = json.dumps(
+        metadata,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    digest = hashlib.sha256(raw).hexdigest()
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            UPDATE runs SET
+              run_attempt=?,
+              created_at=?,
+              metadata_blob=?,
+              metadata_sha256=?
+            WHERE run_id=?
+            """,
+            (
+                metadata["run_attempt"],
+                metadata["created_at"],
+                zlib.compress(raw, 6),
+                digest,
+                metadata["id"],
+            ),
+        )
+    return digest
 
 
 def _tokenizer(path: Path) -> Path:
@@ -199,6 +230,148 @@ def test_discovery_keyset_sweeps_beyond_first_batch_and_wraps(tmp_path: Path) ->
         state.close()
 
 
+def test_rerun_attempt_binds_exact_attempt_metadata_before_cas_write(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path / "inventory.sqlite", 1)
+    seed = _run_metadata(1, attempt=2)
+    seed["display_title"] = "second attempt"
+    seed["conclusion"] = "success"
+    seed_sha = _replace_inventory_run(inventory, seed)
+    first = _run_metadata(1, attempt=1)
+    first["display_title"] = "first attempt"
+    first["conclusion"] = "failure"
+    first_raw = json.dumps(
+        first,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    first_sha = hashlib.sha256(first_raw).hexdigest()
+    github = FakeGitHub(
+        _zip_bytes(),
+        attempt_metadata={1: first},
+    )
+    fetcher = ci.CIStreamFetcher(
+        inventory_path=inventory,
+        state_path=tmp_path / "fetch.sqlite",
+        content_store_path=tmp_path / "store",
+        tokenizer_path=_tokenizer(tmp_path / "tokenizer.json"),
+        tokens=["api-secret"],
+        progress_path=tmp_path / "progress.json",
+        receipt_path=tmp_path / "receipt.json",
+        parser=_fake_parser,
+        requester=github.request,
+        archive_downloader=github.download,
+        target_unique_tokens=1_000_000,
+        sleeper=lambda _: None,
+    )
+    try:
+        progress = fetcher.run(continuous=False, max_runs=1)
+        assert progress["fetch"]["attempt_statuses"] == {
+            "done": 1,
+            "pending": 1,
+        }
+        rows = fetcher.state._connection.execute(
+            """
+            SELECT attempt,run_metadata_sha256,run_metadata_source,
+                   run_metadata_source_attempt,run_metadata_exact,
+                   inventory_seed_attempt,inventory_seed_metadata_sha256
+            FROM attempts ORDER BY attempt
+            """
+        ).fetchall()
+        assert tuple(rows[0]) == (
+            1,
+            first_sha,
+            "github-workflow-run-attempt-api",
+            1,
+            1,
+            2,
+            seed_sha,
+        )
+        assert tuple(rows[1]) == (
+            2,
+            seed_sha,
+            "inventory-run-list",
+            2,
+            1,
+            2,
+            seed_sha,
+        )
+        assert github.api_urls[0].endswith(
+            "/repos/owner/repo/actions/runs/1/attempts/1"
+        )
+        occurrence = next(fetcher.store.iter_occurrences())
+        provenance = occurrence["provenance"]
+        assert provenance["schema"] == "cppmega_ci_chunk_occurrence_v3"
+        assert provenance["workflow"]["display_title"] == "first attempt"
+        assert provenance["workflow"]["conclusion"] == "failure"
+        assert provenance["run_metadata_evidence"] == {
+            "exact_attempt_match": True,
+            "source": "github-workflow-run-attempt-api",
+            "source_attempt": 1,
+            "sha256": first_sha,
+            "inventory_seed_attempt": 2,
+            "inventory_seed_metadata_sha256": seed_sha,
+        }
+        assert progress["fetch"]["run_metadata"] == {
+            "exact_attempts": 2,
+            "unresolved_attempts": 0,
+            "exact_by_source": {
+                "github-workflow-run-attempt-api": 1,
+                "inventory-run-list": 1,
+            },
+            "unresolved_by_status": {},
+            "content_attempts_without_exact_metadata": 0,
+        }
+    finally:
+        fetcher.close()
+
+
+def test_rerun_metadata_identity_mismatch_fails_before_cas_write(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path / "inventory.sqlite", 1)
+    seed = _run_metadata(1, attempt=2)
+    _replace_inventory_run(inventory, seed)
+    github = FakeGitHub(
+        _zip_bytes(),
+        attempt_metadata={1: _run_metadata(1, attempt=2)},
+    )
+    fetcher = ci.CIStreamFetcher(
+        inventory_path=inventory,
+        state_path=tmp_path / "fetch.sqlite",
+        content_store_path=tmp_path / "store",
+        tokenizer_path=_tokenizer(tmp_path / "tokenizer.json"),
+        tokens=["api-secret"],
+        progress_path=tmp_path / "progress.json",
+        receipt_path=tmp_path / "receipt.json",
+        parser=_fake_parser,
+        requester=github.request,
+        archive_downloader=github.download,
+        target_unique_tokens=1_000_000,
+        sleeper=lambda _: None,
+    )
+    try:
+        progress = fetcher.run(continuous=False, max_runs=1)
+        assert progress["fetch"]["attempt_statuses"] == {
+            "pending": 1,
+            "retry": 1,
+        }
+        assert fetcher.store.status()["counters"]["occurrence_count"] == 0
+        row = fetcher.state._connection.execute(
+            """
+            SELECT run_metadata_exact,error_class,error_message
+            FROM attempts WHERE attempt=1
+            """
+        ).fetchone()
+        assert int(row["run_metadata_exact"]) == 0
+        assert row["error_class"] == "MalformedResponseError"
+        assert "does not match 1" in row["error_message"]
+    finally:
+        fetcher.close()
+
+
 def test_zip_validation_rejects_traversal_symlink_and_duplicate(
     tmp_path: Path,
 ) -> None:
@@ -240,8 +413,17 @@ def test_zip_validation_rejects_traversal_symlink_and_duplicate(
 
 
 class FakeGitHub:
-    def __init__(self, archive: bytes):
+    def __init__(
+        self,
+        archive: bytes,
+        *,
+        attempt_metadata: Mapping[int, Mapping[str, object]] | None = None,
+    ):
         self.archive = archive
+        self.attempt_metadata = {
+            int(attempt): dict(value)
+            for attempt, value in (attempt_metadata or {}).items()
+        }
         self.api_headers: list[dict[str, str]] = []
         self.api_urls: list[str] = []
         self.signed_url: str | None = None
@@ -257,6 +439,16 @@ class FakeGitHub:
         assert timeout > 0
         self.api_headers.append(dict(headers))
         self.api_urls.append(url)
+        attempt_suffix = url.rsplit("/attempts/", 1)[-1]
+        if attempt_suffix.isdigit():
+            attempt = int(attempt_suffix)
+            if attempt not in self.attempt_metadata:
+                raise AssertionError(url)
+            return ci.HTTPResponse(
+                200,
+                {},
+                json.dumps(self.attempt_metadata[attempt]).encode(),
+            )
         if url.endswith("/jobs?filter=all&per_page=100&page=1"):
             body = {
                 "total_count": 1,
@@ -428,13 +620,23 @@ def test_renamed_repository_uses_canonical_api_route_and_preserves_alias(
         assert all("/repos/new-owner/repo/" in url for url in github.api_urls)
         occurrence = next(fetcher.store.iter_occurrences())
         provenance = occurrence["provenance"]
-        assert provenance["schema"] == "cppmega_ci_chunk_occurrence_v2"
+        assert provenance["schema"] == "cppmega_ci_chunk_occurrence_v3"
         assert provenance["repository"] == "new-owner/repo"
         assert provenance["repository_requested"] == "owner/repo"
         assert provenance["repository_id"] == 123
         assert provenance["source_repository"] == "contributor/repo"
         assert provenance["source_repository_id"] == 456
         assert provenance["repository_scope_key"] == "owner/repo"
+        assert provenance["run_metadata_evidence"] == {
+            "exact_attempt_match": True,
+            "source": "inventory-run-list",
+            "source_attempt": 1,
+            "sha256": provenance["run_metadata_evidence"]["sha256"],
+            "inventory_seed_attempt": 1,
+            "inventory_seed_metadata_sha256": (
+                provenance["run_metadata_evidence"]["sha256"]
+            ),
+        }
         assert provenance["workflow"]["path"] == (
             ".github/workflows/ci.yml"
         )

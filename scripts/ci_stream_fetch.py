@@ -68,9 +68,9 @@ from cppmega.tokenizer.cpp_tokenizer import (  # noqa: E402
 )
 
 
-SCHEMA_VERSION = "cppmega_ci_stream_fetch_v2"
-PROGRESS_SCHEMA = "cppmega_ci_stream_fetch_progress_v2"
-RECEIPT_SCHEMA = "cppmega_ci_stream_fetch_receipt_v2"
+SCHEMA_VERSION = "cppmega_ci_stream_fetch_v3"
+PROGRESS_SCHEMA = "cppmega_ci_stream_fetch_progress_v3"
+RECEIPT_SCHEMA = "cppmega_ci_stream_fetch_receipt_v3"
 DEFAULT_TOKENIZER = (
     "../cppmega.mlx/outputs/megatron_ready/"
     "case5_v4_20260714_093120_mini9/tokenizer/tokenizer.json"
@@ -101,6 +101,10 @@ _TERMINAL_STATES = {
     "terminal_404",
     "terminal_410",
     "failed",
+}
+_RUN_METADATA_SOURCES = {
+    "inventory-run-list",
+    "github-workflow-run-attempt-api",
 }
 _MAIN_MEMBER_RE = re.compile(r"^(?P<ordinal>\d+)_(?P<name>.+)\.txt$")
 _SECRET_QUERY_KEYS = {
@@ -153,6 +157,11 @@ class Attempt:
     created_at: str
     run_metadata: dict[str, Any]
     run_metadata_sha256: str
+    run_metadata_source: str
+    run_metadata_source_attempt: int
+    run_metadata_exact: bool
+    inventory_seed_attempt: int
+    inventory_seed_metadata_sha256: str
 
     @property
     def run_attempt_key(self) -> str:
@@ -247,6 +256,36 @@ def _repository_identity(attempt: Attempt) -> RepositoryIdentity:
         source=source_name,
         source_repository_id=source_repository_id,
     )
+
+
+def _validate_run_metadata_identity(
+    value: Mapping[str, object],
+    *,
+    run_id: int,
+    attempt: int,
+) -> None:
+    metadata_run_id = value.get("id")
+    metadata_attempt = value.get("run_attempt")
+    if (
+        isinstance(metadata_run_id, bool)
+        or not isinstance(metadata_run_id, int)
+        or metadata_run_id != run_id
+    ):
+        raise MalformedResponseError(
+            f"run metadata id {metadata_run_id!r} does not match {run_id}"
+        )
+    if (
+        isinstance(metadata_attempt, bool)
+        or not isinstance(metadata_attempt, int)
+        or metadata_attempt != attempt
+    ):
+        raise MalformedResponseError(
+            "run metadata attempt "
+            f"{metadata_attempt!r} does not match {attempt}"
+        )
+    created_at = value.get("created_at")
+    if not isinstance(created_at, str) or not created_at:
+        raise MalformedResponseError("run metadata created_at is invalid")
 
 
 def _canonical_json(value: object) -> str:
@@ -660,6 +699,24 @@ CREATE TABLE IF NOT EXISTS attempts (
     run_metadata_sha256 TEXT NOT NULL,
     run_metadata_raw_size INTEGER NOT NULL,
     run_metadata_zlib BLOB NOT NULL,
+    run_metadata_source TEXT NOT NULL CHECK (
+      run_metadata_source IN (
+        'inventory-run-list',
+        'github-workflow-run-attempt-api'
+      )
+    ),
+    run_metadata_source_attempt INTEGER NOT NULL CHECK (
+      run_metadata_source_attempt >= 1
+    ),
+    run_metadata_exact INTEGER NOT NULL CHECK (
+      run_metadata_exact IN (0,1)
+    ),
+    inventory_seed_attempt INTEGER NOT NULL CHECK (
+      inventory_seed_attempt >= 1
+    ),
+    inventory_seed_metadata_sha256 TEXT NOT NULL CHECK (
+      length(inventory_seed_metadata_sha256) = 64
+    ),
     status TEXT NOT NULL CHECK (
       status IN (
         'pending','processing','retry','done','empty',
@@ -911,31 +968,88 @@ class FetchState:
                     if metadata_sha != str(row["metadata_sha256"]):
                         raise FetchError("inventory run metadata digest mismatch")
                     raw_attempt = int(row["run_attempt"])
-                    maximum_attempt = max(1, raw_attempt)
-                    for attempt in range(1, maximum_attempt + 1):
+                    if raw_attempt < 1:
+                        raise FetchError(
+                            "inventory run attempt must be positive"
+                        )
+                    run_id = int(row["run_id"])
+                    _validate_run_metadata_identity(
+                        metadata,
+                        run_id=run_id,
+                        attempt=raw_attempt,
+                    )
+                    for attempt in range(1, raw_attempt + 1):
+                        exact = int(attempt == raw_attempt)
                         cursor = self._connection.execute(
                             """
                             INSERT INTO attempts(
                               repo,run_id,attempt,created_at,
                               run_metadata_sha256,run_metadata_raw_size,
-                              run_metadata_zlib,status,discovered_at,updated_at
-                            ) VALUES (?,?,?,?,?,?,?,'pending',?,?)
+                              run_metadata_zlib,run_metadata_source,
+                              run_metadata_source_attempt,run_metadata_exact,
+                              inventory_seed_attempt,
+                              inventory_seed_metadata_sha256,
+                              status,discovered_at,updated_at
+                            ) VALUES (
+                              ?,?,?,?,?,?,?,
+                              'inventory-run-list',?,?,?,?,
+                              'pending',?,?
+                            )
                             ON CONFLICT(repo,run_id,attempt) DO UPDATE SET
-                              created_at=excluded.created_at,
-                              run_metadata_sha256=excluded.run_metadata_sha256,
-                              run_metadata_raw_size=excluded.run_metadata_raw_size,
-                              run_metadata_zlib=excluded.run_metadata_zlib,
+                              inventory_seed_attempt=
+                                excluded.inventory_seed_attempt,
+                              inventory_seed_metadata_sha256=
+                                excluded.inventory_seed_metadata_sha256,
+                              created_at=CASE
+                                WHEN attempts.run_metadata_exact=1
+                                  THEN attempts.created_at
+                                ELSE excluded.created_at
+                              END,
+                              run_metadata_sha256=CASE
+                                WHEN attempts.run_metadata_exact=1
+                                  THEN attempts.run_metadata_sha256
+                                ELSE excluded.run_metadata_sha256
+                              END,
+                              run_metadata_raw_size=CASE
+                                WHEN attempts.run_metadata_exact=1
+                                  THEN attempts.run_metadata_raw_size
+                                ELSE excluded.run_metadata_raw_size
+                              END,
+                              run_metadata_zlib=CASE
+                                WHEN attempts.run_metadata_exact=1
+                                  THEN attempts.run_metadata_zlib
+                                ELSE excluded.run_metadata_zlib
+                              END,
+                              run_metadata_source=CASE
+                                WHEN attempts.run_metadata_exact=1
+                                  THEN attempts.run_metadata_source
+                                ELSE excluded.run_metadata_source
+                              END,
+                              run_metadata_source_attempt=CASE
+                                WHEN attempts.run_metadata_exact=1
+                                  THEN attempts.run_metadata_source_attempt
+                                ELSE excluded.run_metadata_source_attempt
+                              END,
+                              run_metadata_exact=CASE
+                                WHEN attempts.run_metadata_exact=1
+                                  THEN 1
+                                ELSE excluded.run_metadata_exact
+                              END,
                               updated_at=excluded.updated_at
                             WHERE attempts.status IN ('pending','retry')
                             """,
                             (
                                 str(row["repo_key"]),
-                                int(row["run_id"]),
+                                run_id,
                                 attempt,
                                 str(row["created_at"]),
                                 metadata_sha,
                                 len(metadata_bytes),
                                 sqlite3.Binary(zlib.compress(metadata_bytes, 6)),
+                                raw_attempt,
+                                exact,
+                                raw_attempt,
+                                metadata_sha,
                                 now,
                                 now,
                             ),
@@ -962,13 +1076,45 @@ class FetchState:
         digest = _sha256_bytes(raw)
         if digest != str(row["run_metadata_sha256"]):
             raise FetchError("fetch-state run metadata digest mismatch")
+        run_id = int(row["run_id"])
+        attempt = int(row["attempt"])
+        source = str(row["run_metadata_source"])
+        source_attempt = int(row["run_metadata_source_attempt"])
+        exact_raw = int(row["run_metadata_exact"])
+        seed_attempt = int(row["inventory_seed_attempt"])
+        seed_sha = str(row["inventory_seed_metadata_sha256"])
+        if source not in _RUN_METADATA_SOURCES:
+            raise FetchError("fetch-state run metadata source is invalid")
+        if exact_raw not in {0, 1}:
+            raise FetchError("fetch-state run metadata exactness is invalid")
+        exact = bool(exact_raw)
+        if seed_attempt < attempt:
+            raise FetchError("inventory seed attempt precedes target attempt")
+        if re.fullmatch(r"[0-9a-f]{64}", seed_sha) is None:
+            raise FetchError("inventory seed metadata digest is invalid")
+        if source == "inventory-run-list" and source_attempt != seed_attempt:
+            raise FetchError("inventory metadata source attempt is inconsistent")
+        if source == "github-workflow-run-attempt-api" and not exact:
+            raise FetchError("attempt API metadata must be exact")
+        if exact != (source_attempt == attempt):
+            raise FetchError("fetch-state run metadata exactness is inconsistent")
+        _validate_run_metadata_identity(
+            value,
+            run_id=run_id,
+            attempt=source_attempt,
+        )
         return Attempt(
             repo=str(row["repo"]),
-            run_id=int(row["run_id"]),
-            attempt=int(row["attempt"]),
+            run_id=run_id,
+            attempt=attempt,
             created_at=str(row["created_at"]),
             run_metadata=value,
             run_metadata_sha256=digest,
+            run_metadata_source=source,
+            run_metadata_source_attempt=source_attempt,
+            run_metadata_exact=exact,
+            inventory_seed_attempt=seed_attempt,
+            inventory_seed_metadata_sha256=seed_sha,
         )
 
     def next_attempt(self) -> Attempt | None:
@@ -1004,6 +1150,113 @@ class FetchState:
                 self._connection.execute("ROLLBACK")
                 raise
         return self._decode_attempt(row)
+
+    def bind_exact_run_metadata(
+        self,
+        attempt: Attempt,
+        metadata: Mapping[str, object],
+    ) -> Attempt:
+        if attempt.run_metadata_exact:
+            raise BindingError("run metadata is already exact")
+        exact = dict(metadata)
+        _validate_run_metadata_identity(
+            exact,
+            run_id=attempt.run_id,
+            attempt=attempt.attempt,
+        )
+        seed_repository = _repository_identity(attempt)
+        exact_repository = _repository_object_identity(
+            exact.get("repository"),
+            field="repository",
+        )
+        if exact_repository is None:
+            raise MalformedResponseError(
+                "attempt API metadata has no repository identity"
+            )
+        exact_name, exact_id = exact_repository
+        if exact_name.casefold() != seed_repository.canonical.casefold():
+            raise MalformedResponseError(
+                "attempt API repository does not match inventory metadata"
+            )
+        if (
+            exact_id is not None
+            and seed_repository.repository_id is not None
+            and exact_id != seed_repository.repository_id
+        ):
+            raise MalformedResponseError(
+                "attempt API repository id does not match inventory metadata"
+            )
+        raw = _canonical_json_bytes(exact)
+        digest = _sha256_bytes(raw)
+        now = _utc_now()
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._connection.execute(
+                    """
+                    SELECT status,run_metadata_sha256,run_metadata_exact,
+                           (SELECT COUNT(*) FROM members
+                            WHERE repo=attempts.repo
+                              AND run_id=attempts.run_id
+                              AND attempt=attempts.attempt) AS member_count
+                    FROM attempts
+                    WHERE repo=? AND run_id=? AND attempt=?
+                    """,
+                    (attempt.repo, attempt.run_id, attempt.attempt),
+                ).fetchone()
+                if row is None:
+                    raise BindingError("attempt disappeared before metadata bind")
+                if str(row["status"]) != "processing":
+                    raise BindingError(
+                        "attempt metadata can bind only while processing"
+                    )
+                if int(row["run_metadata_exact"]) != 0:
+                    raise BindingError("attempt metadata became exact concurrently")
+                if str(row["run_metadata_sha256"]) != attempt.run_metadata_sha256:
+                    raise BindingError("attempt seed metadata changed concurrently")
+                if int(row["member_count"]) != 0:
+                    raise BindingError(
+                        "attempt metadata cannot change after member commits"
+                    )
+                self._connection.execute(
+                    """
+                    UPDATE attempts SET
+                      created_at=?,
+                      run_metadata_sha256=?,
+                      run_metadata_raw_size=?,
+                      run_metadata_zlib=?,
+                      run_metadata_source=
+                        'github-workflow-run-attempt-api',
+                      run_metadata_source_attempt=?,
+                      run_metadata_exact=1,
+                      updated_at=?
+                    WHERE repo=? AND run_id=? AND attempt=?
+                    """,
+                    (
+                        str(exact["created_at"]),
+                        digest,
+                        len(raw),
+                        sqlite3.Binary(zlib.compress(raw, 6)),
+                        attempt.attempt,
+                        now,
+                        attempt.repo,
+                        attempt.run_id,
+                        attempt.attempt,
+                    ),
+                )
+                updated = self._connection.execute(
+                    """
+                    SELECT * FROM attempts
+                    WHERE repo=? AND run_id=? AND attempt=?
+                    """,
+                    (attempt.repo, attempt.run_id, attempt.attempt),
+                ).fetchone()
+                self._connection.execute("COMMIT")
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                raise
+        assert updated is not None
+        return self._decode_attempt(updated)
 
     def record_request(
         self,
@@ -1057,6 +1310,10 @@ class FetchState:
         chunk_count: int,
         occurrence_tokens: int,
     ) -> None:
+        if not attempt.run_metadata_exact:
+            raise BindingError(
+                "cannot store a member without exact attempt metadata"
+            )
         sidecar_bytes = _canonical_json_bytes(sidecar)
         sidecar_sha = _sha256_bytes(sidecar_bytes)
         compressed = zlib.compress(sidecar_bytes, 6)
@@ -1153,6 +1410,10 @@ class FetchState:
             raise ValueError(f"invalid attempt status {status!r}")
         if retry and status != "retry":
             raise ValueError("retry flag requires retry status")
+        if status in {"done", "empty"} and not attempt.run_metadata_exact:
+            raise BindingError(
+                f"cannot mark {status} without exact attempt metadata"
+            )
         jobs_bytes = (
             None if jobs is None else _canonical_json_bytes(list(jobs))
         )
@@ -1216,6 +1477,42 @@ class FetchState:
                     "SELECT COUNT(*) FROM request_ledger"
                 ).fetchone()[0]
             )
+            metadata_rows = self._connection.execute(
+                """
+                SELECT run_metadata_source,run_metadata_exact,status,
+                       COUNT(*) AS n
+                FROM attempts
+                GROUP BY run_metadata_source,run_metadata_exact,status
+                """
+            ).fetchall()
+            exact_metadata = sum(
+                int(row["n"])
+                for row in metadata_rows
+                if int(row["run_metadata_exact"]) == 1
+            )
+            unresolved_by_status: dict[str, int] = {}
+            exact_by_source: dict[str, int] = {}
+            for row in metadata_rows:
+                count = int(row["n"])
+                if int(row["run_metadata_exact"]) == 1:
+                    source = str(row["run_metadata_source"])
+                    exact_by_source[source] = (
+                        exact_by_source.get(source, 0) + count
+                    )
+                else:
+                    status = str(row["status"])
+                    unresolved_by_status[status] = (
+                        unresolved_by_status.get(status, 0) + count
+                    )
+            content_without_exact_metadata = sum(
+                count
+                for status, count in unresolved_by_status.items()
+                if status in {"done", "empty"}
+            )
+            if content_without_exact_metadata:
+                raise BindingError(
+                    "completed content attempt lacks exact run metadata"
+                )
             sidecar_digest = hashlib.sha256()
             for row in self._connection.execute(
                 """
@@ -1238,6 +1535,17 @@ class FetchState:
                 "occurrence_tokens": int(totals["occurrence_tokens"]),
                 "requests": requests,
                 "sidecar_set_sha256": sidecar_digest.hexdigest(),
+                "run_metadata": {
+                    "exact_attempts": exact_metadata,
+                    "unresolved_attempts": sum(
+                        unresolved_by_status.values()
+                    ),
+                    "exact_by_source": dict(sorted(exact_by_source.items())),
+                    "unresolved_by_status": dict(
+                        sorted(unresolved_by_status.items())
+                    ),
+                    "content_attempts_without_exact_metadata": 0,
+                },
             }
 
 
@@ -1415,6 +1723,38 @@ class GitHubAttemptClient:
                 body=response.body,
             )
         raise AssertionError("unreachable request loop")
+
+    def fetch_run_metadata(self, attempt: Attempt) -> dict[str, Any]:
+        if attempt.run_metadata_exact:
+            raise BindingError("exact run metadata does not need refetching")
+        repository = _repository_identity(attempt).canonical
+        endpoint = (
+            f"/repos/{repository}/actions/runs/{attempt.run_id}/"
+            f"attempts/{attempt.attempt}"
+        )
+        result = self._request(
+            attempt,
+            endpoint,
+            accepted={200, 404, 410},
+        )
+        if result.status in {404, 410}:
+            raise TerminalHTTP(result.status, result.body, endpoint)
+        try:
+            value = json.loads(result.body)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise MalformedResponseError(
+                "workflow run attempt metadata is not JSON"
+            ) from exc
+        if not isinstance(value, dict):
+            raise MalformedResponseError(
+                "workflow run attempt metadata is not an object"
+            )
+        _validate_run_metadata_identity(
+            value,
+            run_id=attempt.run_id,
+            attempt=attempt.attempt,
+        )
+        return dict(value)
 
     def fetch_jobs(self, attempt: Attempt) -> list[dict[str, Any]]:
         repository = _repository_identity(attempt).canonical
@@ -1917,6 +2257,10 @@ class CIStreamFetcher:
         info: zipfile.ZipInfo,
         jobs: Sequence[Mapping[str, object]],
     ) -> tuple[int, int]:
+        if not attempt.run_metadata_exact:
+            raise BindingError(
+                "cannot parse a member without exact attempt metadata"
+            )
         raw = _read_zip_member(
             archive.path, info, max_member_bytes=self.max_member_bytes
         )
@@ -2011,7 +2355,7 @@ class CIStreamFetcher:
                 f"{chunk.get('step_ordinal') if chunk.get('step_ordinal') is not None else 'none'}"
             )
             provenance: dict[str, object] = {
-                "schema": "cppmega_ci_chunk_occurrence_v2",
+                "schema": "cppmega_ci_chunk_occurrence_v3",
                 "repository": repository_identity.canonical,
                 "repository_requested": repository_identity.requested,
                 "repository_id": repository_identity.repository_id,
@@ -2022,7 +2366,18 @@ class CIStreamFetcher:
                 "repository_scope_key": attempt.repo,
                 "run_id": attempt.run_id,
                 "run_attempt": attempt.attempt,
-                "run_metadata_sha256": attempt.run_metadata_sha256,
+                "run_metadata_evidence": {
+                    "exact_attempt_match": attempt.run_metadata_exact,
+                    "source": attempt.run_metadata_source,
+                    "source_attempt": attempt.run_metadata_source_attempt,
+                    "sha256": attempt.run_metadata_sha256,
+                    "inventory_seed_attempt": (
+                        attempt.inventory_seed_attempt
+                    ),
+                    "inventory_seed_metadata_sha256": (
+                        attempt.inventory_seed_metadata_sha256
+                    ),
+                },
                 "workflow": {
                     "id": attempt.run_metadata.get("workflow_id"),
                     "name": attempt.run_metadata.get("name"),
@@ -2106,6 +2461,12 @@ class CIStreamFetcher:
             rescued = self.rescue.locate(attempt)
             if isinstance(rescued, TerminalHTTP):
                 raise rescued
+            if not attempt.run_metadata_exact:
+                exact_metadata = self.client.fetch_run_metadata(attempt)
+                attempt = self.state.bind_exact_run_metadata(
+                    attempt,
+                    exact_metadata,
+                )
             jobs = self.client.fetch_jobs(attempt)
             if isinstance(rescued, ArchiveSource):
                 archive = rescued
