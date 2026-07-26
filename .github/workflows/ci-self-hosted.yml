@@ -34,19 +34,22 @@ jobs:
           test -x "${python_bin}"
           test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           expected_tree="$(git rev-parse HEAD^{tree})"
-          mlx_contract_args=()
           if [[ -n "${CPPMEGA_MLX_REFERENCE_ROOT:-}" || -n "${CPPMEGA_MLX_REFERENCE_COMMIT:-}" ]]; then
             : "${CPPMEGA_MLX_REFERENCE_ROOT:?set both CPPMEGA_MLX_REFERENCE_ROOT and CPPMEGA_MLX_REFERENCE_COMMIT}"
             : "${CPPMEGA_MLX_REFERENCE_COMMIT:?set both CPPMEGA_MLX_REFERENCE_ROOT and CPPMEGA_MLX_REFERENCE_COMMIT}"
             test "$(git -C "${CPPMEGA_MLX_REFERENCE_ROOT}" rev-parse HEAD)" = "${CPPMEGA_MLX_REFERENCE_COMMIT}"
             test -z "$(git -C "${CPPMEGA_MLX_REFERENCE_ROOT}" status --porcelain --untracked-files=no)"
-            mlx_contract_args=(--mlx-root "${CPPMEGA_MLX_REFERENCE_ROOT}")
+            "${python_bin}" "${GITHUB_WORKSPACE}/scripts/data/verify_tokenizer_contract.py" \
+              --contract "${GITHUB_WORKSPACE}/data/tokenizer_v2/tokenizer_contract_v1.json" \
+              --tokenizer "${GITHUB_WORKSPACE}/data/tokenizer_v2/tokenizer.json" \
+              --domain-schema "${GITHUB_WORKSPACE}/data/domain_schema_v1.json" \
+              --mlx-root "${CPPMEGA_MLX_REFERENCE_ROOT}"
+          else
+            "${python_bin}" "${GITHUB_WORKSPACE}/scripts/data/verify_tokenizer_contract.py" \
+              --contract "${GITHUB_WORKSPACE}/data/tokenizer_v2/tokenizer_contract_v1.json" \
+              --tokenizer "${GITHUB_WORKSPACE}/data/tokenizer_v2/tokenizer.json" \
+              --domain-schema "${GITHUB_WORKSPACE}/data/domain_schema_v1.json"
           fi
-          "${python_bin}" "${GITHUB_WORKSPACE}/scripts/data/verify_tokenizer_contract.py" \
-            --contract "${GITHUB_WORKSPACE}/data/tokenizer_v2/tokenizer_contract_v1.json" \
-            --tokenizer "${GITHUB_WORKSPACE}/data/tokenizer_v2/tokenizer.json" \
-            --domain-schema "${GITHUB_WORKSPACE}/data/domain_schema_v1.json" \
-            "${mlx_contract_args[@]}"
           "${python_bin}" scripts/ci/run_repository_ci.py lane \
             --lanes-config "${GITHUB_WORKSPACE}/configs/ci/lanes.json" \
             --lane macos-contracts \
