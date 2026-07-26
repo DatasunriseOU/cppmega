@@ -3,38 +3,67 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
 import sqlite3
 import subprocess
+from pathlib import Path
 
 import pytest
 
 from scripts.ci_content_store import CIContentStore, hash_token_sequence
 from scripts.ci_source_sidecars import (
-    AMBIGUOUS_PATH,
-    COMMIT_ABSENT,
+    _FRAME_HEADER,
+    CASE5_EXPORT_SCHEMA,
+    CHECKOUT_PROVENANCE_UNRESOLVABLE,
     CONTENT_SEMANTICS,
-    DELETED_FORK,
-    ExtractionError,
     FETCH_RECEIPT_SCHEMA,
     GENERATED_OR_MUTATED_UNRESOLVABLE,
     INVENTORY_SCHEMA,
-    LocalGitResolver,
     PATH_ABSENT,
     RECEIPT_SCHEMA,
-    REPO_UNAVAILABLE,
+    REPRESENTATIVE_LEDGER_SCHEMA,
     RESOLVED,
-    ResolutionIntegrityError,
+    UNSUPPORTED_OBJECT,
+    ExtractionError,
+    LocalGitResolver,
     SourceSidecarStore,
     SourceStoreError,
-    UNSUPPORTED_OBJECT,
+    _checkout_binding,
+    _content_store_sqlite_logical_sha256,
     _hash_records,
+    _inventory_logical_sha256,
+    _sha256_file,
     extract_binding_inventory,
+    main,
     materialize_inventory,
     normalize_source_candidates,
     normalize_source_path,
     verify_binding_inventory,
 )
+
+
+def _canonical(value: object) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _write_json(path: Path, value: object) -> bytes:
+    raw = (
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    path.write_bytes(raw)
+    return raw
 
 
 def _run(
@@ -46,8 +75,7 @@ def _run(
         list(args),
         cwd=cwd,
         input=input_bytes,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         check=False,
     )
     if result.returncode != 0:
@@ -57,23 +85,28 @@ def _run(
     return result.stdout
 
 
-def _git_fixture(tmp_path: Path) -> tuple[Path, str, str]:
-    work = tmp_path / "work"
-    mirror = tmp_path / "repo.git"
+def _git_fixture(
+    tmp_path: Path,
+    *,
+    object_format: str = "sha1",
+) -> tuple[Path, str, str]:
+    suffix = "" if object_format == "sha1" else f"-{object_format}"
+    work = tmp_path / f"work{suffix}"
+    mirror = tmp_path / f"repo{suffix}.git"
     work.mkdir()
-    _run("git", "init", "-q", str(work))
+    init = ["git", "init", "-q"]
+    if object_format != "sha1":
+        init.append(f"--object-format={object_format}")
+    init.append(str(work))
+    _run(*init)
     _run("git", "config", "user.name", "CI Source Test", cwd=work)
     _run("git", "config", "user.email", "ci-source@example.test", cwd=work)
 
     (work / "src" / "nested").mkdir(parents=True)
-    (work / "src" / "nested" / "main.cpp").write_text(
-        "int main() { return 0; }\n",
-        encoding="utf-8",
-    )
-    (work / "src" / "copy.cpp").write_text(
-        "int main() { return 0; }\n",
-        encoding="utf-8",
-    )
+    payload = b"int main() { return 0; }\n"
+    (work / "src" / "nested" / "main.cpp").write_bytes(payload)
+    (work / "src" / "copy.cpp").write_bytes(payload)
+    (work / "src" / "large.cpp").write_bytes(b"x" * 256)
     (work / "assets").mkdir()
     (work / "assets" / "bytes.bin").write_bytes(b"\x00\xff\x10binary\r\n")
     (work / "model.lfs").write_bytes(
@@ -84,8 +117,6 @@ def _git_fixture(tmp_path: Path) -> tuple[Path, str, str]:
     _run("git", "add", ".", cwd=work)
     _run("git", "commit", "-q", "-m", "base", cwd=work)
     base = _run("git", "rev-parse", "HEAD", cwd=work).decode().strip()
-
-    # Add a gitlink without fetching or dereferencing another repository.
     _run(
         "git",
         "update-index",
@@ -107,568 +138,1068 @@ def _binding(
     repository: str = "owner/repo",
     status: str = RESOLVED,
 ) -> dict[str, object]:
-    candidates = [source_path] if status == RESOLVED else []
-    evidence = [
-        {
-            "source_input": source_path,
-            "cwd": ".",
-            "normalization_status": status,
-        }
-    ]
     return {
+        "schema": INVENTORY_SCHEMA,
+        "record_type": "binding",
         "repository": repository,
         "head_sha": head,
         "source_path": source_path,
         "normalization_status": status,
-        "normalized_candidates": candidates,
-        "evidence": evidence,
-        "evidence_sha256": _hash_records(
-            "cppmega-ci-source-binding-evidence-v1",
-            evidence,
-        ),
+        "normalized_candidates": [source_path] if status == RESOLVED else [],
     }
 
 
-def _inventory(bindings: list[dict[str, object]]) -> dict[str, object]:
-    ordered = sorted(
-        bindings,
-        key=lambda item: (
-            str(item["repository"]),
-            str(item["head_sha"]),
-            str(item["source_path"]),
-        ),
-    )
-    inventory_hash = _hash_records(
-        "cppmega-ci-source-binding-inventory-v1",
-        (
-            {
-                "repository": binding["repository"],
-                "head_sha": binding["head_sha"],
-                "source_path": binding["source_path"],
-                "normalization_status": binding["normalization_status"],
-                "normalized_candidates": binding["normalized_candidates"],
-                "evidence_sha256": binding["evidence_sha256"],
-                "evidence": binding["evidence"],
-            }
-            for binding in ordered
-        ),
-    )
+def _reference(
+    binding: dict[str, object],
+    *,
+    ordinal: int,
+) -> dict[str, object]:
+    digit = f"{(ordinal % 10):x}"
+    occurrence_key = {
+        "repo": "owner/repo",
+        "run_attempt": "1:1",
+        "job": f"linux-{ordinal}",
+        "step": "compile:0",
+        "chunk_ordinal": ordinal,
+    }
+    normalization = {
+        "schema": "cppmega_ci_source_path_normalization_v2",
+        "status": binding["normalization_status"],
+        "candidates": binding["normalized_candidates"],
+        "source_input": binding["source_path"],
+        "cwd": "/home/runner/work/workspace/checkout",
+        "reason": None,
+    }
     return {
         "schema": INVENTORY_SCHEMA,
+        "record_type": "reference",
+        "repository": binding["repository"],
+        "head_sha": binding["head_sha"],
+        "source_path": binding["source_path"],
+        "token_sequence_sha256": digit * 64,
+        "representative_occurrence_key": occurrence_key,
+        "representative_content_sha256": "a" * 64,
+        "representative_provenance_sha256": "b" * 64,
+        "representative_selection_record_sha256": "c" * 64,
+        "action_index": 0,
+        "action_entity_id": "entity:compile",
+        "action_shape_sha256": "d" * 64,
+        "command_sha256": "e" * 64,
+        "source_input_index": 0,
+        "source_input": binding["source_path"],
+        "cwd": "/home/runner/work/workspace/checkout",
+        "normalization": normalization,
+        "checkout_evidence": {
+            "workflow_event": "push",
+            "reason": None,
+        },
+    }
+
+
+def _write_inventory(
+    path: Path,
+    bindings: list[dict[str, object]],
+) -> Path:
+    ordered_bindings = sorted(
+        bindings,
+        key=lambda value: (
+            str(value["repository"]),
+            str(value["head_sha"]),
+            str(value["source_path"]),
+        ),
+    )
+    references = [
+        _reference(binding, ordinal=index + 1)
+        for index, binding in enumerate(ordered_bindings)
+    ]
+    references.sort(
+        key=lambda value: (
+            str(value["repository"]),
+            str(value["head_sha"]),
+            str(value["source_path"]),
+            hashlib.sha256(_canonical(value)).hexdigest(),
+        )
+    )
+    header: dict[str, object] = {
+        "schema": INVENTORY_SCHEMA,
+        "record_type": "header",
+        "occurrence_schema": "cppmega_ci_chunk_occurrence_v3",
+        "training_sidecar_schema": "cppmega_ci_chunk_training_sidecars_v2",
+        "normalization_schema": "cppmega_ci_source_path_normalization_v2",
+        "content_semantics": CONTENT_SEMANTICS,
         "occurrence_set_sha256": "1" * 64,
         "upstream_fetch_receipt_sha256": "2" * 64,
-        "binding_count": len(ordered),
-        "binding_inventory_sha256": inventory_hash,
-        "bindings": ordered,
+        "content_store_receipt_sha256": "3" * 64,
+        "content_store_sqlite_schema_sha256": "4" * 64,
+        "content_store_sqlite_logical_sha256": "5" * 64,
+        "case5_export_receipt_sha256": "6" * 64,
+        "representative_ledger_schema": REPRESENTATIVE_LEDGER_SCHEMA,
+        "representative_count": len(references),
+        "representative_ledger_sha256": "7" * 64,
+        "representative_ledger_artifact_sha256": "8" * 64,
+        "binding_count": len(ordered_bindings),
+        "reference_count": len(references),
+        "binding_records_sha256": _hash_records(
+            "cppmega-ci-source-binding-records-v2",
+            ordered_bindings,
+        ),
+        "reference_records_sha256": _hash_records(
+            "cppmega-ci-source-reference-records-v2",
+            references,
+        ),
     }
+    header["inventory_logical_sha256"] = _inventory_logical_sha256(header)
+    with path.open("wb") as handle:
+        for record in [header, *ordered_bindings, *references]:
+            handle.write(_canonical(record) + b"\n")
+    verify_binding_inventory(path)
+    return path
 
 
 def _new_source_store(
     root: Path,
-    bindings: list[dict[str, object]],
+    inventory_path: Path,
+    *,
+    max_pack_bytes: int = 1024,
 ) -> SourceSidecarStore:
-    frozen_inventory = _inventory(bindings)
     return SourceSidecarStore(
         root,
-        occurrence_set_sha256="1" * 64,
-        upstream_fetch_receipt_sha256="2" * 64,
-        binding_inventory_sha256=str(frozen_inventory["binding_inventory_sha256"]),
-        input_binding_count=len(bindings),
-        max_pack_bytes=1024,
+        inventory=verify_binding_inventory(inventory_path),
+        max_pack_bytes=max_pack_bytes,
     )
 
 
-def test_path_normalization_handles_posix_windows_relative_cd_and_escape() -> None:
+def _valid_provenance(
+    head: str,
+    *,
+    event: str = "push",
+    repository: str = "owner/repo",
+    source_repository: str = "owner/repo",
+    cwd: str | None = "/home/runner/work/workspace/checkout/build",
+    binding_repository: str | None = None,
+    binding_method: str = "relative_source_path_v1",
+    binding_count_delta: int = 0,
+    additional_binding_repository: str | None = None,
+    source_input: str = "../src/nested/main.cpp",
+    bound_source_path: str = "src/nested/main.cpp",
+) -> dict[str, object]:
+    bindings = [
+        {
+            "repository": binding_repository or repository,
+            "head_sha": head,
+            "source_path": bound_source_path,
+            "confidence": {
+                "score": 0.95,
+                "level": "high",
+                "source": binding_method,
+            },
+        }
+    ]
+    source_inputs = [source_input]
+    if additional_binding_repository is not None:
+        source_inputs.append("../src/other.cpp")
+        bindings.append(
+            {
+                "repository": additional_binding_repository,
+                "head_sha": head,
+                "source_path": "src/other.cpp",
+                "confidence": {
+                    "score": 0.95,
+                    "level": "high",
+                    "source": "relative_source_path_v1",
+                },
+            }
+        )
+    for index in range(binding_count_delta):
+        bindings.append(
+            {
+                "repository": f"other/repo{index}",
+                "head_sha": head,
+                "source_path": bound_source_path,
+            }
+        )
+    action = {
+        "action_entity_id": "entity:compile",
+        "action_shape_sha256": "4" * 64,
+        "command_sha256": "5" * 64,
+        "cwd": cwd,
+        "source_inputs": source_inputs,
+        "repository_source_bindings": bindings,
+        "repository_source_binding_count": len(bindings),
+    }
+    return {
+        "schema": "cppmega_ci_chunk_occurrence_v3",
+        "repository": repository,
+        "source_repository": source_repository,
+        "workflow": {
+            "event": event,
+            "head_sha": head,
+        },
+        "run_metadata_evidence": {"exact_attempt_match": True},
+        "job": {"labels": ["ubuntu-24.04", "x64"]},
+        "chunk": {
+            "training_sidecars": {
+                "schema": "cppmega_ci_chunk_training_sidecars_v2",
+                "build_actions": [action],
+            }
+        },
+    }
+
+
+def _frozen_case5_fixture(
+    tmp_path: Path,
+    head: str,
+) -> dict[str, object]:
+    root = tmp_path / "ci-store"
+    content = "compile output\n"
+    content_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    token_sequence_sha = hash_token_sequence([1, 2])
+    selected_key = {
+        "repo": "owner/repo",
+        "run_attempt": "1:1",
+        "job": "a-linux",
+        "step": "compile:0",
+        "chunk_ordinal": 0,
+    }
+    nonrepresentative_key = {
+        "repo": "owner/repo",
+        "run_attempt": "1:1",
+        "job": "z-linux",
+        "step": "compile:0",
+        "chunk_ordinal": 0,
+    }
+    selected_provenance = _valid_provenance(head)
+    # This deliberately stale non-representative proves that only the selected
+    # occurrence is interpreted as source provenance after receipt verification.
+    nonrepresentative_provenance = {
+        "schema": "stale_nonrepresentative_schema",
+        "note": "must not be source-scanned",
+    }
+    with CIContentStore(root, max_pack_bytes=1024) as store:
+        store.add_chunk(
+            content,
+            selected_provenance,
+            selected_key,
+            token_count=2,
+            tokenizer_fingerprint="tokenizer-test-v1",
+            token_sequence_sha256=token_sequence_sha,
+        )
+        store.add_chunk(
+            content,
+            nonrepresentative_provenance,
+            nonrepresentative_key,
+            token_count=2,
+            tokenizer_fingerprint="tokenizer-test-v1",
+            token_sequence_sha256=token_sequence_sha,
+        )
+        content_receipt = store.completion_receipt(target_unique_tokens=2)
+
+    content_receipt_path = tmp_path / "content-receipt.json"
+    content_receipt_raw = _write_json(content_receipt_path, content_receipt)
+    fetch_receipt = {
+        "schema": FETCH_RECEIPT_SCHEMA,
+        "content_store_receipt": content_receipt,
+    }
+    fetch_path = tmp_path / "fetch-receipt.json"
+    _write_json(fetch_path, fetch_receipt)
+
+    representative = {
+        "schema": REPRESENTATIVE_LEDGER_SCHEMA,
+        "token_sequence_sha256": token_sequence_sha,
+        "token_count": 2,
+        "candidate_content_count": 1,
+        "candidate_occurrence_count": 2,
+        "candidate_content_sha256_sequence_sha256": _hash_records(
+            "cppmega-ci-candidate-content-sha256-sequence-v1",
+            [content_sha],
+        ),
+        "representative_content_sha256": content_sha,
+        "representative_occurrence_key": selected_key,
+        "representative_provenance_sha256": hashlib.sha256(
+            _canonical(selected_provenance)
+        ).hexdigest(),
+    }
+    ledger_path = tmp_path / "representative_ledger.jsonl"
+    ledger_raw = _canonical(representative) + b"\n"
+    ledger_path.write_bytes(ledger_raw)
+    ledger_logical = _hash_records(
+        "cppmega-ci-case5-representative-ledger-v1",
+        [representative],
+    )
+    ledger_artifact = hashlib.sha256(ledger_raw).hexdigest()
+    export_receipt = {
+        "schema": CASE5_EXPORT_SCHEMA,
+        "status": "complete",
+        "input_store": {
+            "receipt_sha256": hashlib.sha256(content_receipt_raw).hexdigest(),
+            "sqlite_schema_sha256": content_receipt["sqlite_schema_sha256"],
+            "sqlite_logical_sha256": content_receipt["sqlite_logical_sha256"],
+            "logical_content_set_sha256": content_receipt[
+                "logical_content_set_sha256"
+            ],
+            "logical_token_sequence_set_sha256": content_receipt[
+                "logical_token_sequence_set_sha256"
+            ],
+            "occurrence_set_sha256": content_receipt["occurrence_set_sha256"],
+            "pack_hashes": content_receipt["pack_hashes"],
+        },
+        "representatives": {
+            "schema": REPRESENTATIVE_LEDGER_SCHEMA,
+            "selection": (
+                "one-per-eligible-token-sequence; "
+                "content-sha256-then-eligible-occurrence-key"
+            ),
+            "count": 1,
+            "ledger_artifact": ledger_path.name,
+            "ledger_sha256": ledger_logical,
+            "ledger_artifact_sha256": ledger_artifact,
+        },
+        "artifacts": [
+            {
+                "path": ledger_path.name,
+                "kind": "representative_ledger",
+                "rows": 1,
+                "byte_size": len(ledger_raw),
+                "sha256": ledger_artifact,
+            }
+        ],
+    }
+    export_path = tmp_path / "case5-export-receipt.json"
+    _write_json(export_path, export_receipt)
+    return {
+        "root": root,
+        "fetch_path": fetch_path,
+        "content_receipt_path": content_receipt_path,
+        "export_path": export_path,
+        "ledger_path": ledger_path,
+        "selected_key": selected_key,
+        "nonrepresentative_key": nonrepresentative_key,
+        "representative": representative,
+        "content_receipt": content_receipt,
+        "export_receipt": export_receipt,
+    }
+
+
+def _sync_case5_receipts(fixture: dict[str, object]) -> None:
+    content_receipt = fixture["content_receipt"]
+    export_receipt = fixture["export_receipt"]
+    assert isinstance(content_receipt, dict)
+    assert isinstance(export_receipt, dict)
+    content_raw = _write_json(
+        fixture["content_receipt_path"],  # type: ignore[arg-type]
+        content_receipt,
+    )
+    _write_json(
+        fixture["fetch_path"],  # type: ignore[arg-type]
+        {
+            "schema": FETCH_RECEIPT_SCHEMA,
+            "content_store_receipt": content_receipt,
+        },
+    )
+    input_store = export_receipt["input_store"]
+    assert isinstance(input_store, dict)
+    input_store.update(
+        {
+            "receipt_sha256": hashlib.sha256(content_raw).hexdigest(),
+            "sqlite_schema_sha256": content_receipt["sqlite_schema_sha256"],
+            "sqlite_logical_sha256": content_receipt["sqlite_logical_sha256"],
+            "logical_content_set_sha256": content_receipt[
+                "logical_content_set_sha256"
+            ],
+            "logical_token_sequence_set_sha256": content_receipt[
+                "logical_token_sequence_set_sha256"
+            ],
+            "occurrence_set_sha256": content_receipt["occurrence_set_sha256"],
+            "pack_hashes": content_receipt["pack_hashes"],
+        }
+    )
+    _write_json(fixture["export_path"], export_receipt)  # type: ignore[arg-type]
+
+
+def _sync_representative_ledger(
+    fixture: dict[str, object],
+    records: list[dict[str, object]],
+) -> None:
+    ledger_path = fixture["ledger_path"]
+    export_receipt = fixture["export_receipt"]
+    assert isinstance(ledger_path, Path)
+    assert isinstance(export_receipt, dict)
+    raw = b"".join(_canonical(record) + b"\n" for record in records)
+    ledger_path.write_bytes(raw)
+    artifact_sha = hashlib.sha256(raw).hexdigest()
+    logical_sha = _hash_records(
+        "cppmega-ci-case5-representative-ledger-v1",
+        records,
+    )
+    representatives = export_receipt["representatives"]
+    artifact = export_receipt["artifacts"][0]
+    assert isinstance(representatives, dict)
+    assert isinstance(artifact, dict)
+    representatives.update(
+        {
+            "count": len(records),
+            "ledger_sha256": logical_sha,
+            "ledger_artifact_sha256": artifact_sha,
+        }
+    )
+    artifact.update(
+        {
+            "rows": len(records),
+            "byte_size": len(raw),
+            "sha256": artifact_sha,
+        }
+    )
+    _write_json(fixture["export_path"], export_receipt)  # type: ignore[arg-type]
+
+
+def _extract_fixture(
+    fixture: dict[str, object],
+    output: Path,
+) -> dict[str, object]:
+    return extract_binding_inventory(
+        fixture["root"],  # type: ignore[arg-type]
+        fixture["fetch_path"],  # type: ignore[arg-type]
+        content_store_receipt_path=fixture["content_receipt_path"],  # type: ignore[arg-type]
+        case5_export_receipt_path=fixture["export_path"],  # type: ignore[arg-type]
+        representative_ledger_path=fixture["ledger_path"],  # type: ignore[arg-type]
+        output_path=output,
+    )
+
+
+def _inventory_records(path: Path) -> list[dict[str, object]]:
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def test_representative_only_inventory_build_and_receipt_hash_chain(
+    tmp_path: Path,
+) -> None:
+    mirror, head, _base = _git_fixture(tmp_path)
+    fixture = _frozen_case5_fixture(tmp_path, head)
+    inventory_path = tmp_path / "source-inventory.jsonl"
+
+    extraction = _extract_fixture(fixture, inventory_path)
+    verified = verify_binding_inventory(inventory_path)
+    records = _inventory_records(inventory_path)
+    header = records[0]
+    binding = next(record for record in records if record["record_type"] == "binding")
+    reference = next(
+        record for record in records if record["record_type"] == "reference"
+    )
+
+    assert extraction["status"] == "complete"
+    assert extraction["representative_count"] == 1
+    assert verified.artifact_sha256 == hashlib.sha256(
+        inventory_path.read_bytes()
+    ).hexdigest()
+    assert header["representative_ledger_sha256"] == fixture[
+        "export_receipt"
+    ]["representatives"]["ledger_sha256"]  # type: ignore[index]
+    assert header["representative_ledger_artifact_sha256"] == hashlib.sha256(
+        fixture["ledger_path"].read_bytes()  # type: ignore[union-attr]
+    ).hexdigest()
+    assert binding["source_path"] == "src/nested/main.cpp"
+    assert binding["normalization_status"] == RESOLVED
+    assert reference["representative_occurrence_key"] == fixture["selected_key"]
+    assert reference["representative_occurrence_key"] != fixture[
+        "nonrepresentative_key"
+    ]
+
+    receipt = materialize_inventory(
+        inventory_path,
+        {"owner/repo": mirror},
+        tmp_path / "source-store",
+        max_pack_bytes=1024,
+    )
+    assert receipt["schema"] == RECEIPT_SCHEMA
+    assert receipt["status"] == "complete"
+    assert receipt["input_inventory_artifact_sha256"] == verified.artifact_sha256
+    assert receipt["representative_ledger_sha256"] == header[
+        "representative_ledger_sha256"
+    ]
+    assert receipt["representative_ledger_artifact_sha256"] == header[
+        "representative_ledger_artifact_sha256"
+    ]
+    assert receipt["build_action_reference_count"] == 1
+    assert receipt["missing_reference_count"] == 0
+
+    ledger_path = tmp_path / "source-reference-ledger.jsonl"
+    with SourceSidecarStore(tmp_path / "source-store") as store:
+        summary = store.reference_ledger()
+        written = store.write_reference_ledger(ledger_path)
+    assert "entries" not in summary
+    assert written["reference_count"] == 1
+    ledger_records = _inventory_records(ledger_path)
+    assert ledger_records[0]["record_type"] == "header"
+    assert ledger_records[1]["representative_reference"][
+        "token_sequence_sha256"
+    ] == fixture["representative"]["token_sequence_sha256"]  # type: ignore[index]
+    assert "body" not in ledger_path.read_text(encoding="utf-8")
+    assert "content_bytes" not in ledger_path.read_text(encoding="utf-8")
+
+
+def test_representative_ledger_rejects_nonmember_duplicate_and_count_drift(
+    tmp_path: Path,
+) -> None:
+    _mirror, head, _base = _git_fixture(tmp_path)
+    fixture = _frozen_case5_fixture(tmp_path, head)
+    representative = dict(fixture["representative"])  # type: ignore[arg-type]
+    wrong_key = dict(representative["representative_occurrence_key"])
+    wrong_key["job"] = "missing-job"
+    representative["representative_occurrence_key"] = wrong_key
+    _sync_representative_ledger(fixture, [representative])
+    with pytest.raises(ExtractionError, match="exact member"):
+        _extract_fixture(fixture, tmp_path / "wrong-member.jsonl")
+
+    fixture = _frozen_case5_fixture(tmp_path / "duplicate", head)
+    representative = dict(fixture["representative"])  # type: ignore[arg-type]
+    _sync_representative_ledger(fixture, [representative, representative])
+    with pytest.raises(ExtractionError, match="sorted and unique"):
+        _extract_fixture(fixture, tmp_path / "duplicate.jsonl")
+
+    fixture = _frozen_case5_fixture(tmp_path / "count", head)
+    export_receipt = fixture["export_receipt"]
+    assert isinstance(export_receipt, dict)
+    export_receipt["representatives"]["count"] = 2  # type: ignore[index]
+    _write_json(fixture["export_path"], export_receipt)  # type: ignore[arg-type]
+    with pytest.raises(ExtractionError, match="artifact metadata differs"):
+        _extract_fixture(fixture, tmp_path / "count-drift.jsonl")
+
+    fixture = _frozen_case5_fixture(tmp_path / "selection", head)
+    export_receipt = fixture["export_receipt"]
+    assert isinstance(export_receipt, dict)
+    export_receipt["representatives"]["selection"] = (  # type: ignore[index]
+        "one-per-token-sequence; content-sha256-then-occurrence-key"
+    )
+    _write_json(fixture["export_path"], export_receipt)  # type: ignore[arg-type]
+    with pytest.raises(ExtractionError, match="missing or stale"):
+        _extract_fixture(fixture, tmp_path / "selection-drift.jsonl")
+
+    fixture = _frozen_case5_fixture(tmp_path / "zero-eligible", head)
+    _sync_representative_ledger(fixture, [])
+    empty_result = _extract_fixture(
+        fixture,
+        tmp_path / "zero-eligible-inventory.jsonl",
+    )
+    assert empty_result["representative_count"] == 0
+    assert empty_result["binding_count"] == 0
+    assert empty_result["reference_count"] == 0
+
+
+def test_path_normalization_is_platform_aware_and_has_no_basename_heuristic() -> None:
     assert (
         normalize_source_path(
             "../src/main.cpp",
-            "/home/runner/work/repo/repo/build",
-            repository="owner/repo",
+            "/home/runner/work/workspace/checkout/build",
+            platform="posix",
         )
         == "src/main.cpp"
     )
     assert (
         normalize_source_path(
             r"..\src\main.cpp",
-            r"D:\a\repo\repo\build",
-            repository="owner/repo",
+            r"D:\a\workspace\checkout\build",
+            platform="windows",
         )
         == "src/main.cpp"
     )
     assert (
         normalize_source_path(
-            "../../src/main.cpp",
-            "build/nested",
-            repository="owner/repo",
+            r"d:\A\WORKSPACE\CHECKOUT\src\main.cpp",
+            r"D:\a\workspace\checkout\build",
+            platform="windows",
         )
         == "src/main.cpp"
     )
-    assert (
-        normalize_source_path(
-            "src/main.cpp",
-            "build/..",
-            repository="owner/repo",
+    posix_backslash = normalize_source_candidates(
+        r"src\main.cpp",
+        "/home/runner/work/workspace/checkout",
+        platform="posix",
+    )
+    assert posix_backslash.status == RESOLVED
+    assert posix_backslash.candidates == (r"src\main.cpp",)
+
+    basename_trick = normalize_source_candidates(
+        "../src/main.cpp",
+        "/opt/cache/repo/repo/build",
+        repository="owner/repo",
+        platform="posix",
+    )
+    assert basename_trick.status == CHECKOUT_PROVENANCE_UNRESOLVABLE
+    assert basename_trick.candidates == ()
+
+    drive_relative = normalize_source_candidates(
+        r"C:src\main.cpp",
+        r"D:\a\workspace\checkout",
+        platform="windows",
+    )
+    assert drive_relative.status == GENERATED_OR_MUTATED_UNRESOLVABLE
+    assert drive_relative.reason == "windows_drive_relative_path"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        (
+            {
+                "event": "pull_request",
+                "repository": "owner/base",
+                "source_repository": "fork/head",
+                "binding_repository": "owner/base",
+            },
+            RESOLVED,
+        ),
+        (
+            {
+                "event": "pull_request",
+                "repository": "owner/base",
+                "source_repository": "fork/head",
+                "binding_repository": "fork/head",
+            },
+            CHECKOUT_PROVENANCE_UNRESOLVABLE,
+        ),
+        (
+            {"binding_count_delta": 1},
+            CHECKOUT_PROVENANCE_UNRESOLVABLE,
+        ),
+        (
+            {"additional_binding_repository": "other/checkout"},
+            CHECKOUT_PROVENANCE_UNRESOLVABLE,
+        ),
+        (
+            {"binding_method": "workspace_repo_basename_suffix_v1"},
+            CHECKOUT_PROVENANCE_UNRESOLVABLE,
+        ),
+        (
+            {"cwd": "/home/runner/work/workspace/checkout/custom/build"},
+            CHECKOUT_PROVENANCE_UNRESOLVABLE,
+        ),
+        (
+            {"cwd": None},
+            CHECKOUT_PROVENANCE_UNRESOLVABLE,
+        ),
+        (
+            {
+                "source_input": r"src\nested\main.cpp",
+                "bound_source_path": "src/nested/main.cpp",
+            },
+            CHECKOUT_PROVENANCE_UNRESOLVABLE,
+        ),
+    ],
+)
+def test_checkout_tuple_and_path_fail_closed(
+    kwargs: dict[str, object],
+    expected: str,
+) -> None:
+    head = "a" * 40
+    provenance = _valid_provenance(head, **kwargs)
+    action = provenance["chunk"]["training_sidecars"]["build_actions"][0]  # type: ignore[index]
+    source_input = action["source_inputs"][0]
+    _repository, _head, normalization, evidence = _checkout_binding(
+        provenance,
+        action,
+        source_index=0,
+        source_input=source_input,
+        cwd=action["cwd"],
+    )
+    assert normalization.status == expected
+    if expected != RESOLVED:
+        assert evidence["reason"]
+        resolution = LocalGitResolver({}).resolve(
+            {
+                "schema": INVENTORY_SCHEMA,
+                "record_type": "binding",
+                "repository": _repository,
+                "head_sha": _head,
+                "source_path": f"!unresolved/{'f' * 64}",
+                "normalization_status": normalization.status,
+                "normalized_candidates": [],
+            }
         )
-        == "src/main.cpp"
-    )
-    assert (
-        normalize_source_path(
-            "/__w/repo/repo/src/main.cpp",
-            None,
-            repository="owner/repo",
-        )
-        == "src/main.cpp"
-    )
-
-    escaped = normalize_source_candidates(
-        "../../outside.cpp",
-        "build",
-        repository="owner/repo",
-    )
-    assert escaped.status == GENERATED_OR_MUTATED_UNRESOLVABLE
-    assert escaped.candidates == ()
-
-    outside = normalize_source_candidates(
-        "/tmp/generated.cpp",
-        ".",
-        repository="owner/repo",
-    )
-    assert outside.status == GENERATED_OR_MUTATED_UNRESOLVABLE
-
-    ambiguous = normalize_source_candidates(
-        "/home/runner/work/repo/repo/generated/repo/repo/source.cpp",
-        ".",
-        repository="owner/repo",
-    )
-    assert ambiguous.status == AMBIGUOUS_PATH
-    assert ambiguous.candidates == (
-        "generated/repo/repo/source.cpp",
-        "source.cpp",
-    )
+        assert resolution.status == expected
 
 
-def test_exact_local_commit_and_component_tree_traversal(tmp_path: Path) -> None:
-    mirror, head, _base = _git_fixture(tmp_path)
-    resolver = LocalGitResolver({"owner/repo": mirror})
-    result = resolver.resolve(_binding(head, "src/nested/main.cpp"))
+@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+def test_exact_git_resolution_supports_sha1_and_sha256(
+    tmp_path: Path,
+    object_format: str,
+) -> None:
+    mirror, head, _base = _git_fixture(tmp_path, object_format=object_format)
+    binding = _binding(head, "src/nested/main.cpp")
+    result = LocalGitResolver({"owner/repo": mirror}).resolve(binding)
+    payload = b"int main() { return 0; }\n"
+    constructor = hashlib.sha1 if object_format == "sha1" else hashlib.sha256
+    expected_oid = constructor(
+        f"blob {len(payload)}\0".encode("ascii") + payload
+    ).hexdigest()
 
-    expected = b"int main() { return 0; }\n"
     assert result.status == RESOLVED
+    assert result.object_format == object_format
     assert result.commit_oid == head
-    assert result.root_tree_oid
-    assert result.parent_tree_oid
-    assert result.object_format == "sha1"
-    assert result.mode == "100644"
-    assert result.object_type == "blob"
-    assert result.content_kind == "text"
-    assert result.content == expected
-    assert result.content_sha256 == hashlib.sha256(expected).hexdigest()
-    assert (
-        result.blob_oid
-        == hashlib.sha1(f"blob {len(expected)}\0".encode() + expected).hexdigest()
-    )
-    assert [entry["component"] for entry in result.traversal] == [
-        "src",
-        "nested",
-        "main.cpp",
-    ]
-    assert all(entry["tree_oid"] for entry in result.traversal)
+    assert result.blob_oid == expected_oid
+    assert result.content == payload
     assert result.evidence["runner_filesystem_equivalence_claimed"] is False
 
 
-def test_binary_symlink_submodule_and_lfs_pointer_are_not_dereferenced(
+def test_binary_symlink_submodule_and_bounded_git_object_are_fail_closed(
     tmp_path: Path,
 ) -> None:
     mirror, head, base = _git_fixture(tmp_path)
     resolver = LocalGitResolver({"owner/repo": mirror})
-
     binary = resolver.resolve(_binding(head, "assets/bytes.bin"))
+    symlink = resolver.resolve(_binding(head, "main-link"))
+    submodule = resolver.resolve(_binding(head, "vendor/component"))
+    nested_submodule = resolver.resolve(
+        _binding(head, "vendor/component/source.cpp")
+    )
+    oversized = LocalGitResolver(
+        {"owner/repo": mirror},
+        max_git_object_bytes=64,
+    ).resolve(_binding(head, "src/large.cpp"))
+
     assert binary.status == RESOLVED
     assert binary.content_kind == "binary"
-    assert binary.content == b"\x00\xff\x10binary\r\n"
-
-    symlink = resolver.resolve(_binding(head, "main-link"))
     assert symlink.status == RESOLVED
-    assert symlink.mode == "120000"
     assert symlink.object_type == "symlink"
-    assert symlink.content_kind == "symlink"
     assert symlink.content == b"src/nested/main.cpp"
-    assert symlink.evidence["dereferenced"] is False
-
-    lfs = resolver.resolve(_binding(head, "model.lfs"))
-    assert lfs.status == RESOLVED
-    assert lfs.content_kind == "lfs_pointer"
-    assert lfs.lfs_oid_sha256 == "a" * 64
-    assert lfs.lfs_size == 123456
-    assert lfs.content is not None and lfs.content.startswith(
-        b"version https://git-lfs.github.com/spec/v1\n"
-    )
-
-    submodule = resolver.resolve(_binding(head, "vendor/component"))
     assert submodule.status == UNSUPPORTED_OBJECT
-    assert submodule.mode == "160000"
-    assert submodule.object_type == "submodule"
     assert submodule.object_oid == base
-    assert submodule.content is None
-    assert submodule.evidence["dereferenced"] is False
+    assert nested_submodule.status == UNSUPPORTED_OBJECT
+    assert oversized.status == UNSUPPORTED_OBJECT
+    assert oversized.evidence["reason"] == "git_object_exceeds_bounded_read_policy"
 
 
-def test_gap_statuses_are_distinct_and_fail_closed(tmp_path: Path) -> None:
-    mirror, head, _base = _git_fixture(tmp_path)
-    binding = _binding(head, "src/nested/main.cpp")
-
-    assert LocalGitResolver({}).resolve(binding).status == REPO_UNAVAILABLE
-    assert (
-        LocalGitResolver({"owner/repo": {"status": DELETED_FORK}})
-        .resolve(binding)
-        .status
-        == DELETED_FORK
-    )
-
-    wrong_commit = _binding("f" * 40, "src/nested/main.cpp")
-    assert (
-        LocalGitResolver({"owner/repo": mirror}).resolve(wrong_commit).status
-        == COMMIT_ABSENT
-    )
-    absent = _binding(head, "src/does-not-exist.cpp")
-    assert (
-        LocalGitResolver({"owner/repo": mirror}).resolve(absent).status == PATH_ABSENT
-    )
-
-
-def test_one_blob_referenced_by_multiple_bindings_is_stored_once(
+def test_store_deduplicates_batches_and_rejects_arbitrary_partial_membership(
     tmp_path: Path,
 ) -> None:
     mirror, head, _base = _git_fixture(tmp_path)
+    first = _binding(head, "src/nested/main.cpp")
+    second = _binding(head, "src/copy.cpp")
+    inventory = _write_inventory(tmp_path / "inventory.jsonl", [first, second])
     resolver = LocalGitResolver({"owner/repo": mirror})
-    first_binding = _binding(head, "src/nested/main.cpp")
-    second_binding = _binding(head, "src/copy.cpp")
-    first = resolver.resolve(first_binding)
-    second = resolver.resolve(second_binding)
-    assert first.content_sha256 == second.content_sha256
-    assert first.blob_oid == second.blob_oid
+    resolutions = [resolver.resolve(first), resolver.resolve(second)]
+    assert resolutions[0].content_sha256 == resolutions[1].content_sha256
 
-    with _new_source_store(
-        tmp_path / "store",
-        [first_binding, second_binding],
-    ) as store:
-        store.add_resolution(first)
-        store.add_resolution(second)
+    root = tmp_path / "store"
+    with _new_source_store(root, inventory) as store:
+        assert store.add_resolutions(iter(resolutions), batch_size=2) == 2
         verification = store.verify()
         assert verification["binding_count"] == 2
         assert verification["blob_count"] == 1
-        assert verification["git_object_count"] == 1
-        assert store.read_blob(str(first.content_sha256)) == first.content
+        assert verification["reference_count"] == 2
         receipt = store.receipt()
         assert receipt["status"] == "complete"
-        assert receipt["content_semantics"] == CONTENT_SEMANTICS
-        ledger = store.reference_ledger()
-        assert ledger["reference_count"] == 2
-        assert all(entry["content_sha256"] for entry in ledger["entries"])
-        assert all("content_bytes" not in entry for entry in ledger["entries"])
-        assert all("body" not in entry for entry in ledger["entries"])
 
-    with sqlite3.connect(tmp_path / "store" / "index.sqlite3") as connection:
-        assert connection.execute("SELECT COUNT(*) FROM blobs").fetchone()[0] == 1
-        assert connection.execute("SELECT COUNT(*) FROM bindings").fetchone()[0] == 2
-
-
-class _CorruptBlobResolver(LocalGitResolver):
-    def _run_git(
-        self,
-        mirror: Path,
-        args: list[str] | tuple[str, ...],
-        *,
-        absent_ok: bool = False,
-    ) -> bytes:
-        value = super()._run_git(mirror, args, absent_ok=absent_ok)
-        if len(args) == 3 and list(args[:2]) == ["cat-file", "blob"]:
-            return value + b"corrupt"
-        return value
+    wrong = _binding(head, "assets/bytes.bin")
+    wrong_resolution = resolver.resolve(wrong)
+    one_inventory = _write_inventory(
+        tmp_path / "one-inventory.jsonl",
+        [first],
+    )
+    with _new_source_store(
+        tmp_path / "one-store", one_inventory
+    ) as store, pytest.raises(SourceStoreError, match="not a member"):
+        store.add_resolution(wrong_resolution)
 
 
-def test_corrupt_git_bytes_and_corrupt_pack_fail_verification(
+def test_frame_size_is_validated_before_hostile_uint64_read(
     tmp_path: Path,
 ) -> None:
     mirror, head, _base = _git_fixture(tmp_path)
     binding = _binding(head, "src/nested/main.cpp")
-    with pytest.raises(ResolutionIntegrityError, match="hash to"):
-        _CorruptBlobResolver({"owner/repo": mirror}).resolve(binding)
-
+    inventory = _write_inventory(tmp_path / "inventory.jsonl", [binding])
     resolution = LocalGitResolver({"owner/repo": mirror}).resolve(binding)
     root = tmp_path / "store"
-    with _new_source_store(root, [binding]) as store:
+    with _new_source_store(root, inventory) as store:
         store.add_resolution(resolution)
-        pack = root / str(store.verify()["pack_hashes"][0]["filename"])
+        row = store._connection.execute(
+            "SELECT content_sha256, pack_id, offset FROM blobs"
+        ).fetchone()
+        assert row is not None
+        pack = root / store._connection.execute(
+            "SELECT filename FROM packs WHERE pack_id = ?",
+            (int(row["pack_id"]),),
+        ).fetchone()[0]
+        offset = int(row["offset"])
+        digest = str(row["content_sha256"])
     with pack.open("r+b") as handle:
-        handle.seek(-1, os.SEEK_END)
-        byte = handle.read(1)
-        handle.seek(-1, os.SEEK_END)
-        handle.write(bytes([byte[0] ^ 0xFF]))
+        handle.seek(offset)
+        header = handle.read(_FRAME_HEADER.size)
+        magic, raw_digest, _size = _FRAME_HEADER.unpack(header)
+        handle.seek(offset)
+        handle.write(_FRAME_HEADER.pack(magic, raw_digest, 2**64 - 1))
         handle.flush()
         os.fsync(handle.fileno())
 
-    with _new_source_store(root, [binding]) as reopened:
-        with pytest.raises(SourceStoreError, match="frame verification"):
-            reopened.verify()
-
-
-def test_inventory_order_is_frozen_and_noncanonical_insertion_order_is_refused(
-    tmp_path: Path,
-) -> None:
-    mirror, head, _base = _git_fixture(tmp_path)
-    inventory = _inventory(
-        [
-            _binding(head, "src/nested/main.cpp"),
-            _binding(head, "assets/bytes.bin"),
-            _binding(head, "src/copy.cpp"),
-        ]
-    )
-    receipt_a = materialize_inventory(
-        inventory,
-        {"owner/repo": mirror},
-        tmp_path / "store-a",
-        max_pack_bytes=100,
-    )
-    with pytest.raises(ExtractionError, match="not sorted and unique"):
-        materialize_inventory(
-            {**inventory, "bindings": list(reversed(inventory["bindings"]))},
-            {"owner/repo": mirror},
-            tmp_path / "store-b",
-            max_pack_bytes=100,
-        )
-    assert receipt_a["status"] == "complete"
-
-
-def test_canonical_materialization_has_identical_logical_and_pack_receipts(
-    tmp_path: Path,
-) -> None:
-    mirror, head, _base = _git_fixture(tmp_path)
-    inventory = _inventory(
-        [
-            _binding(head, "assets/bytes.bin"),
-            _binding(head, "src/nested/main.cpp"),
-        ]
-    )
-    first = materialize_inventory(
-        inventory,
-        {"owner/repo": mirror},
-        tmp_path / "first",
-        max_pack_bytes=100,
-    )
-    second = materialize_inventory(
-        inventory,
-        {"owner/repo": mirror},
-        tmp_path / "second",
-        max_pack_bytes=100,
-    )
-    for field in (
-        "logical_blob_set_sha256",
-        "logical_git_object_set_sha256",
-        "logical_binding_set_sha256",
-        "binding_reference_ledger_sha256",
-        "pack_hashes",
+    with SourceSidecarStore(root) as reopened, pytest.raises(
+        SourceStoreError, match="header is invalid"
     ):
-        assert first[field] == second[field]
+        reopened.read_blob(digest)
 
 
-def test_uncommitted_pack_tail_is_quarantined_and_truncated_on_reopen(
+def test_pack_policy_rejects_first_blob_larger_than_pack(
     tmp_path: Path,
 ) -> None:
     mirror, head, _base = _git_fixture(tmp_path)
     binding = _binding(head, "src/nested/main.cpp")
+    inventory = _write_inventory(tmp_path / "inventory.jsonl", [binding])
     resolution = LocalGitResolver({"owner/repo": mirror}).resolve(binding)
-    root = tmp_path / "store"
-    with _new_source_store(root, [binding]) as store:
-        store.add_resolution(resolution)
-        pack_record = store.verify()["pack_hashes"][0]
-        pack = root / str(pack_record["filename"])
-        committed_end = int(pack_record["committed_end"])
-    with pack.open("ab") as handle:
-        handle.write(b"simulated-crash-tail\x00\xff")
-        handle.flush()
-        os.fsync(handle.fileno())
-
-    with _new_source_store(root, [binding]) as reopened:
-        verification = reopened.verify()
-        assert pack.stat().st_size == committed_end
-        assert verification["recovery"]["orphan_count"] == 1
-        record = verification["recovery"]["records"][0]
-        assert record["reason"] == "uncommitted_pack_tail"
-        assert record["byte_size"] == len(b"simulated-crash-tail\x00\xff")
-        assert reopened.read_blob(str(resolution.content_sha256)) == (
-            resolution.content
-        )
-
-
-def test_receipt_is_explicitly_incomplete_for_any_gap_or_missing_binding(
-    tmp_path: Path,
-) -> None:
-    mirror, head, _base = _git_fixture(tmp_path)
-    resolver = LocalGitResolver({"owner/repo": mirror})
-    resolved_binding = _binding(head, "src/nested/main.cpp")
-    gap_binding = _binding(head, "missing.cpp")
-    unattempted_binding = _binding(head, "not-attempted.cpp")
-    resolved = resolver.resolve(resolved_binding)
-    gap = resolver.resolve(gap_binding)
     with _new_source_store(
         tmp_path / "store",
-        [resolved_binding, gap_binding, unattempted_binding],
-    ) as store:
-        store.add_resolution(resolved)
-        store.add_resolution(gap)
-        receipt = store.receipt()
-
-    assert receipt["schema"] == RECEIPT_SCHEMA
-    assert receipt["status"] == "incomplete"
-    assert receipt["input_binding_count"] == 3
-    assert receipt["resolved_binding_count"] == 1
-    assert receipt["missing_binding_count"] == 1
-    assert receipt["gap_status_counts"] == {PATH_ABSENT: 1}
-    assert receipt["content_semantics"] == "repository_blob_content"
-    assert "exact_runner" not in json.dumps(receipt)
+        inventory,
+        max_pack_bytes=len(b"CISSPK1\n") + _FRAME_HEADER.size,
+    ) as store, pytest.raises(SourceStoreError, match="pack size policy"):
+        store.add_resolution(resolution)
 
 
-def test_receipt_refuses_same_count_bindings_outside_frozen_inventory(
+@pytest.mark.parametrize("setting", ["creator_script_sha256", "resolver_sha256"])
+def test_resume_requires_current_script_and_resolver(
     tmp_path: Path,
+    setting: str,
+) -> None:
+    _mirror, head, _base = _git_fixture(tmp_path)
+    binding = _binding(head, "src/nested/main.cpp")
+    inventory = _write_inventory(tmp_path / "inventory.jsonl", [binding])
+    root = tmp_path / "store"
+    with _new_source_store(root, inventory):
+        pass
+    with sqlite3.connect(root / "index.sqlite3") as connection:
+        connection.execute(
+            "UPDATE settings SET value = ? WHERE key = ?",
+            ("f" * 64, setting),
+        )
+        connection.commit()
+    with pytest.raises(SourceStoreError, match="script differs|resolver differs"):
+        SourceSidecarStore(root)
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("sqlite_schema_sha256", "schema SHA-256 differs"),
+        ("sqlite_logical_sha256", "logical SHA-256 differs"),
+    ],
+)
+def test_full_content_store_receipt_binds_sqlite_hashes(
+    tmp_path: Path,
+    field: str,
+    message: str,
+) -> None:
+    _mirror, head, _base = _git_fixture(tmp_path)
+    fixture = _frozen_case5_fixture(tmp_path, head)
+    receipt = fixture["content_receipt"]
+    assert isinstance(receipt, dict)
+    receipt[field] = "f" * 64
+    _sync_case5_receipts(fixture)
+    with pytest.raises(ExtractionError, match=message):
+        _extract_fixture(fixture, tmp_path / "inventory.jsonl")
+
+
+def test_frozen_receipts_policy_and_recovery_artifacts_are_exact(
+    tmp_path: Path,
+) -> None:
+    _mirror, head, _base = _git_fixture(tmp_path)
+    fixture = _frozen_case5_fixture(tmp_path / "symlink", head)
+    receipt_path = fixture["content_receipt_path"]
+    assert isinstance(receipt_path, Path)
+    target = receipt_path.with_name("actual-content-receipt.json")
+    receipt_path.rename(target)
+    receipt_path.symlink_to(target.name)
+    with pytest.raises(ExtractionError, match="non-symlink"):
+        _extract_fixture(fixture, tmp_path / "symlink-inventory.jsonl")
+
+    fixture = _frozen_case5_fixture(tmp_path / "policy", head)
+    receipt = fixture["content_receipt"]
+    assert isinstance(receipt, dict)
+    policy = dict(receipt["policy"])
+    policy["compression"] = {"algorithm": "tampered"}
+    receipt["policy"] = policy
+    receipt["policy_sha256"] = hashlib.sha256(_canonical(policy)).hexdigest()
+    _sync_case5_receipts(fixture)
+    with pytest.raises(ExtractionError, match="policy digest differs"):
+        _extract_fixture(fixture, tmp_path / "policy-inventory.jsonl")
+
+    fixture = _frozen_case5_fixture(tmp_path / "recovery", head)
+    root = fixture["root"]
+    assert isinstance(root, Path)
+    quarantine = root / "orphaned"
+    quarantine.mkdir()
+    (quarantine / "unmanifested.bin").write_bytes(b"orphan")
+    with pytest.raises(ExtractionError, match="unmanifested artifacts"):
+        _extract_fixture(fixture, tmp_path / "recovery-inventory.jsonl")
+
+    fixture = _frozen_case5_fixture(tmp_path / "pack-frame", head)
+    root = fixture["root"]
+    receipt = fixture["content_receipt"]
+    assert isinstance(root, Path)
+    assert isinstance(receipt, dict)
+    pack_record = receipt["pack_hashes"][0]
+    pack_path = root / pack_record["filename"]
+    pack_bytes = bytearray(pack_path.read_bytes())
+    pack_bytes[-1] ^= 1
+    pack_path.write_bytes(pack_bytes)
+    pack_record["sha256"] = hashlib.sha256(pack_bytes).hexdigest()
+    _sync_case5_receipts(fixture)
+    with pytest.raises(ExtractionError, match="frame encoding|frame verification"):
+        _extract_fixture(fixture, tmp_path / "pack-frame-inventory.jsonl")
+
+    fixture = _frozen_case5_fixture(tmp_path / "counter", head)
+    root = fixture["root"]
+    receipt = fixture["content_receipt"]
+    assert isinstance(root, Path)
+    assert isinstance(receipt, dict)
+    with sqlite3.connect(root / "index.sqlite3") as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute(
+            "UPDATE stats SET occurrence_count = occurrence_count + 1"
+        )
+        connection.commit()
+        receipt["sqlite_logical_sha256"] = (
+            _content_store_sqlite_logical_sha256(connection)
+        )
+    receipt["counters"]["occurrence_count"] += 1
+    _sync_case5_receipts(fixture)
+    with pytest.raises(ExtractionError, match="counter mismatch"):
+        _extract_fixture(fixture, tmp_path / "counter-inventory.jsonl")
+
+
+def test_selected_provenance_rejects_zlib_trailing_garbage(
+    tmp_path: Path,
+) -> None:
+    _mirror, head, _base = _git_fixture(tmp_path)
+    fixture = _frozen_case5_fixture(tmp_path, head)
+    root = fixture["root"]
+    selected = fixture["selected_key"]
+    assert isinstance(root, Path)
+    assert isinstance(selected, dict)
+    with sqlite3.connect(root / "index.sqlite3") as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            """
+            SELECT provenance_zlib FROM occurrences
+            WHERE repo = ? AND run_attempt = ? AND job = ?
+              AND step = ? AND chunk_ordinal = ?
+            """,
+            (
+                selected["repo"],
+                selected["run_attempt"],
+                selected["job"],
+                selected["step"],
+                selected["chunk_ordinal"],
+            ),
+        ).fetchone()
+        assert row is not None
+        connection.execute(
+            """
+            UPDATE occurrences SET provenance_zlib = ?
+            WHERE repo = ? AND run_attempt = ? AND job = ?
+              AND step = ? AND chunk_ordinal = ?
+            """,
+            (
+                bytes(row["provenance_zlib"]) + b"trailing-garbage",
+                selected["repo"],
+                selected["run_attempt"],
+                selected["job"],
+                selected["step"],
+                selected["chunk_ordinal"],
+            ),
+        )
+        connection.commit()
+        logical = _content_store_sqlite_logical_sha256(connection)
+    receipt = fixture["content_receipt"]
+    assert isinstance(receipt, dict)
+    receipt["sqlite_logical_sha256"] = logical
+    _sync_case5_receipts(fixture)
+
+    with pytest.raises(ExtractionError, match="non-canonical zlib"):
+        _extract_fixture(fixture, tmp_path / "inventory.jsonl")
+
+
+def test_inventory_stream_verifier_rejects_orphan_reference(
+    tmp_path: Path,
+) -> None:
+    _mirror, head, _base = _git_fixture(tmp_path)
+    binding = _binding(head, "src/nested/main.cpp")
+    inventory = _write_inventory(tmp_path / "inventory.jsonl", [binding])
+    records = _inventory_records(inventory)
+    reference = dict(records[-1])
+    reference["source_path"] = "src/not-a-binding.cpp"
+    references = [reference]
+    header = records[0]
+    header["reference_records_sha256"] = _hash_records(
+        "cppmega-ci-source-reference-records-v2",
+        references,
+    )
+    header["inventory_logical_sha256"] = _inventory_logical_sha256(header)
+    with inventory.open("wb") as handle:
+        for record in [header, records[1], *references]:
+            handle.write(_canonical(record) + b"\n")
+    with pytest.raises(ExtractionError, match="not a member"):
+        verify_binding_inventory(inventory)
+
+
+def test_cli_incomplete_is_nonzero_and_existing_receipts_need_authorization(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     mirror, head, _base = _git_fixture(tmp_path)
-    required = _binding(head, "src/nested/main.cpp")
-    wrong = _binding(head, "assets/bytes.bin")
-    resolution = LocalGitResolver({"owner/repo": mirror}).resolve(wrong)
+    missing = _binding(head, "src/missing.cpp")
+    inventory = _write_inventory(tmp_path / "inventory.jsonl", [missing])
+    mirrors = tmp_path / "mirrors.json"
+    _write_json(mirrors, {"owner/repo": str(mirror)})
+    receipt = tmp_path / "receipt.json"
+    store = tmp_path / "store"
+    args = [
+        "build",
+        "--inventory",
+        str(inventory),
+        "--mirrors",
+        str(mirrors),
+        "--store",
+        str(store),
+        "--receipt",
+        str(receipt),
+        "--max-pack-bytes",
+        "1024",
+    ]
+    assert main(args) == 3
+    capsys.readouterr()
+    value = json.loads(receipt.read_text(encoding="utf-8"))
+    assert value["status"] == "incomplete"
+    assert value["gap_status_counts"] == {PATH_ABSENT: 1}
 
-    with _new_source_store(tmp_path / "store", [required]) as store:
-        store.add_resolution(resolution)
-        with pytest.raises(
-            SourceStoreError,
-            match="differs from frozen input inventory",
-        ):
-            store.receipt()
-
-
-def _ci_occurrence_provenance(
-    head: str,
-    *,
-    exact_attempt_match: bool = True,
-) -> dict[str, object]:
-    return {
-        "schema": "cppmega_ci_chunk_occurrence_v3",
-        "source_repository": "owner/repo",
-        "workflow": {"head_sha": head},
-        "run_metadata_evidence": {
-            "exact_attempt_match": exact_attempt_match,
-        },
-        "chunk": {
-            "training_sidecars": {
-                "schema": "cppmega_ci_chunk_training_sidecars_v2",
-                "build_actions": [
-                    {
-                        "action_entity_id": "entity:compile",
-                        "action_shape_sha256": "4" * 64,
-                        "command_sha256": "5" * 64,
-                        "cwd": "/home/runner/work/repo/repo/build",
-                        "source_inputs": ["../src/main.cpp"],
-                        "repository_source_bindings": [
-                            {
-                                "repository": "wrong/heuristic",
-                                "head_sha": "f" * 40,
-                                "source_path": "wrong.cpp",
-                            }
-                        ],
-                    },
-                    {
-                        "action_entity_id": "entity:duplicate",
-                        "action_shape_sha256": "6" * 64,
-                        "command_sha256": "7" * 64,
-                        "cwd": "build",
-                        "source_inputs": ["../src/main.cpp"],
-                        "repository_source_bindings": [],
-                    },
-                ],
-            }
-        },
-    }
+    assert main(args) == 2
+    assert "refusing to overwrite existing artifact" in capsys.readouterr().err
+    existing_sha = _sha256_file(receipt)
+    assert main([*args, "--expected-receipt-sha256", existing_sha]) == 3
+    capsys.readouterr()
 
 
-def _frozen_ci_fixture(
+def test_complete_cli_receipt_is_also_protected_from_overwrite(
     tmp_path: Path,
-    head: str,
-    *,
-    exact_attempt_match: bool = True,
-) -> tuple[Path, Path, dict[str, object]]:
-    root = tmp_path / "ci-store"
-    with CIContentStore(root, max_pack_bytes=1024) as store:
-        store.add_chunk(
-            "compile output\n",
-            _ci_occurrence_provenance(
-                head,
-                exact_attempt_match=exact_attempt_match,
-            ),
-            {
-                "repo": "owner/repo",
-                "run_attempt": "1:1",
-                "job": "linux",
-                "step": "compile:0",
-                "chunk_ordinal": 0,
-            },
-            token_count=1,
-            tokenizer_fingerprint="tokenizer-test-v1",
-            token_sequence_sha256=hash_token_sequence([1]),
-        )
-        content_receipt = store.completion_receipt(target_unique_tokens=1)
-    fetch_receipt = {
-        "schema": FETCH_RECEIPT_SCHEMA,
-        "content_store_receipt": content_receipt,
-    }
-    fetch_path = tmp_path / "fetch-receipt.json"
-    encoded = (json.dumps(fetch_receipt, indent=2, sort_keys=True) + "\n").encode()
-    fetch_path.write_bytes(encoded)
-    return root, fetch_path, fetch_receipt
-
-
-def test_tiny_immutable_ci_fixture_extracts_unique_exact_binding_inventory(
-    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _mirror, head, _base = _git_fixture(tmp_path)
-    root, fetch_path, _receipt = _frozen_ci_fixture(tmp_path, head)
-
-    inventory = extract_binding_inventory(root, fetch_path)
-    verify_binding_inventory(inventory)
-
-    assert inventory["schema"] == INVENTORY_SCHEMA
-    assert inventory["binding_count"] == 1
-    assert len(str(inventory["binding_inventory_sha256"])) == 64
-    assert (
-        inventory["upstream_fetch_receipt_sha256"]
-        == hashlib.sha256(fetch_path.read_bytes()).hexdigest()
-    )
-    binding = inventory["bindings"][0]
-    assert binding["repository"] == "owner/repo"
-    assert binding["head_sha"] == head
-    assert binding["source_path"] == "src/main.cpp"
-    assert binding["normalization_status"] == RESOLVED
-    assert len(binding["evidence"]) == 2
-    assert all(
-        evidence["normalization"]["candidates"] == ["src/main.cpp"]
-        for evidence in binding["evidence"]
-    )
-    assert all(
-        evidence["discarded_heuristic_bindings_sha256"]
-        for evidence in binding["evidence"]
-    )
-
-
-def test_inventory_extraction_refuses_non_exact_attempt_metadata(
-    tmp_path: Path,
-) -> None:
-    _mirror, head, _base = _git_fixture(tmp_path)
-    root, fetch_path, _receipt = _frozen_ci_fixture(
-        tmp_path,
-        head,
-        exact_attempt_match=False,
-    )
-    with pytest.raises(
-        ExtractionError,
-        match="exact-attempt run metadata evidence",
-    ):
-        extract_binding_inventory(root, fetch_path)
+    mirror, head, _base = _git_fixture(tmp_path)
+    binding = _binding(head, "src/nested/main.cpp")
+    inventory = _write_inventory(tmp_path / "inventory.jsonl", [binding])
+    mirrors = tmp_path / "mirrors.json"
+    _write_json(mirrors, {"owner/repo": str(mirror)})
+    receipt = tmp_path / "receipt.json"
+    args = [
+        "build",
+        "--inventory",
+        str(inventory),
+        "--mirrors",
+        str(mirrors),
+        "--store",
+        str(tmp_path / "store"),
+        "--receipt",
+        str(receipt),
+    ]
+    assert main(args) == 0
+    capsys.readouterr()
+    assert json.loads(receipt.read_text(encoding="utf-8"))["status"] == "complete"
+    assert main(args) == 2
+    assert "refusing to overwrite existing artifact" in capsys.readouterr().err
