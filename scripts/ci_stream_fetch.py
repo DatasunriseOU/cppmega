@@ -84,6 +84,7 @@ DEFAULT_MAX_MEMBERS = 20_000
 DEFAULT_MAX_CHUNK_CHARS = 128_000
 DEFAULT_DISCOVERY_ROWS = 20_000
 DEFAULT_API_ATTEMPTS = 12
+DEFAULT_ARCHIVE_TRANSFER_ATTEMPTS = 16
 DEFAULT_TIMEOUT = 90.0
 
 _RUN_ATTEMPT_STATES = {
@@ -452,6 +453,8 @@ def _default_archive_downloader(
     *,
     timeout: float,
     max_bytes: int,
+    urlopen: Callable[..., Any] = urllib.request.urlopen,
+    max_transfer_attempts: int = DEFAULT_ARCHIVE_TRANSFER_ATTEMPTS,
 ) -> tuple[int, str]:
     parsed = urllib.parse.urlsplit(url)
     if (
@@ -461,33 +464,304 @@ def _default_archive_downloader(
         or parsed.password is not None
     ):
         raise ArchiveError("GitHub returned an unsafe signed archive URL")
-    # Deliberately no Authorization header: the signed URL is the credential.
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "cppmega-ci-stream-fetch/1"},
-        method="GET",
-    )
+    if (
+        isinstance(max_transfer_attempts, bool)
+        or not isinstance(max_transfer_attempts, int)
+        or max_transfer_attempts < 1
+    ):
+        raise ValueError("max_transfer_attempts must be a positive integer")
+    if destination.exists() or destination.is_symlink():
+        raise ArchiveError("archive download destination already exists")
+
+    open_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    open_flags |= getattr(os, "O_CLOEXEC", 0)
+    open_flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return _stream_signed_archive_response(
-                response,
-                destination,
-                max_bytes=max_bytes,
-            )
-    except urllib.error.HTTPError as exc:
-        raise APIError(
-            f"signed archive URL returned HTTP {exc.code}"
-        ) from exc
-    except (
-        urllib.error.URLError,
-        http.client.HTTPException,
-        TimeoutError,
-        ConnectionError,
-    ) as exc:
+        destination_fd = os.open(destination, open_flags, 0o600)
+    except FileExistsError as exc:
         raise ArchiveError(
-            "signed archive transport failed before a complete response: "
-            f"{type(exc).__name__}"
+            "archive download destination already exists"
         ) from exc
+    except OSError as exc:
+        raise ArchiveError(
+            "archive download destination could not be created safely"
+        ) from exc
+
+    created_stat = os.fstat(destination_fd)
+    created_identity = (created_stat.st_dev, created_stat.st_ino)
+
+    def verify_destination_identity() -> os.stat_result:
+        current = os.fstat(destination_fd)
+        try:
+            visible = destination.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise ArchiveError(
+                "archive download destination identity changed"
+            ) from exc
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or not stat.S_ISREG(visible.st_mode)
+            or (current.st_dev, current.st_ino) != created_identity
+            or (visible.st_dev, visible.st_ino) != created_identity
+        ):
+            raise ArchiveError(
+                "archive download destination identity changed"
+            )
+        return current
+
+    def strong_etag(headers: Mapping[str, str]) -> str | None:
+        value = headers.get("ETag")
+        if value is None:
+            return None
+        value = value.strip()
+        if (
+            len(value) < 2
+            or not value.startswith('"')
+            or not value.endswith('"')
+            or value[:2].casefold() == "w/"
+        ):
+            return None
+        return value
+
+    def write_all(payload: bytes) -> None:
+        view = memoryview(payload)
+        while view:
+            written = os.write(destination_fd, view)
+            if written <= 0:
+                raise OSError("archive destination write made no progress")
+            view = view[written:]
+
+    def digest_created_file() -> str:
+        verify_destination_identity()
+        os.lseek(destination_fd, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        while block := os.read(destination_fd, 1024 * 1024):
+            digest.update(block)
+        verify_destination_identity()
+        return digest.hexdigest()
+
+    expected_total: int | None = None
+    validator: str | None = None
+    last_transport_error: BaseException | None = None
+    try:
+        for transfer_attempt in range(1, max_transfer_attempts + 1):
+            current = verify_destination_identity()
+            offset = current.st_size
+            resume_offset = offset if offset and validator is not None else 0
+
+            # Deliberately no Authorization header: the signed URL is the
+            # credential. A byte-range append is allowed only with a strong
+            # ETag for this exact signed representation.
+            headers = {"User-Agent": "cppmega-ci-stream-fetch/1"}
+            if resume_offset:
+                headers["Range"] = f"bytes={resume_offset}-"
+                headers["If-Range"] = validator
+            request = urllib.request.Request(
+                url,
+                headers=headers,
+                method="GET",
+            )
+            try:
+                with urlopen(request, timeout=timeout) as response:
+                    status_code = int(response.status)
+                    response_validator = strong_etag(response.headers)
+                    response_end_exclusive: int | None = None
+                    append = resume_offset > 0 and status_code == 206
+                    if append:
+                        content_range = response.headers.get("Content-Range")
+                        match = (
+                            None
+                            if content_range is None
+                            else re.fullmatch(
+                                r"bytes ([0-9]+)-([0-9]+)/([0-9]+)",
+                                content_range.strip(),
+                            )
+                        )
+                        if match is None:
+                            raise MalformedResponseError(
+                                "signed archive resume lacks a valid "
+                                "Content-Range"
+                            )
+                        start, end, total = (
+                            int(value) for value in match.groups()
+                        )
+                        if (
+                            start != resume_offset
+                            or end < start
+                            or end >= total
+                            or total > max_bytes
+                            or (
+                                expected_total is not None
+                                and total != expected_total
+                            )
+                            or response_validator != validator
+                        ):
+                            raise MalformedResponseError(
+                                "signed archive resumed byte range is "
+                                "inconsistent"
+                            )
+                        content_length = response.headers.get(
+                            "Content-Length"
+                        )
+                        if content_length is not None:
+                            try:
+                                remaining = int(content_length)
+                            except ValueError as exc:
+                                raise MalformedResponseError(
+                                    "signed archive Content-Length is not an "
+                                    "integer"
+                                ) from exc
+                            if remaining != end - start + 1:
+                                raise MalformedResponseError(
+                                    "signed archive resumed Content-Length is "
+                                    "inconsistent"
+                                )
+                        expected_total = total
+                        response_end_exclusive = end + 1
+                        os.lseek(destination_fd, resume_offset, os.SEEK_SET)
+                    elif status_code == 206:
+                        raise MalformedResponseError(
+                            "signed archive returned a byte range without a "
+                            "strong resume validator"
+                        )
+                    elif status_code == 200:
+                        # If-Range permits a complete 200 when the
+                        # representation changed. It is safe only as a full
+                        # restart of the stable private file descriptor.
+                        content_length = response.headers.get(
+                            "Content-Length"
+                        )
+                        if content_length is None:
+                            expected_total = None
+                        else:
+                            try:
+                                expected_total = int(content_length)
+                            except ValueError as exc:
+                                raise MalformedResponseError(
+                                    "signed archive Content-Length is not an "
+                                    "integer"
+                                ) from exc
+                            if (
+                                expected_total < 0
+                                or expected_total > max_bytes
+                            ):
+                                raise ArchiveError(
+                                    f"archive Content-Length {expected_total} "
+                                    f"exceeds limit {max_bytes}"
+                                )
+                        validator = response_validator
+                        response_end_exclusive = expected_total
+                        os.ftruncate(destination_fd, 0)
+                        os.lseek(destination_fd, 0, os.SEEK_SET)
+                    else:
+                        raise APIError(
+                            f"signed archive URL returned HTTP {status_code}"
+                        )
+
+                    verify_destination_identity()
+                    while True:
+                        try:
+                            block = response.read(1024 * 1024)
+                        except (
+                            urllib.error.URLError,
+                            http.client.HTTPException,
+                            TimeoutError,
+                            ConnectionError,
+                        ) as exc:
+                            partial = getattr(exc, "partial", b"")
+                            if isinstance(partial, bytes) and partial:
+                                position = os.lseek(
+                                    destination_fd, 0, os.SEEK_CUR
+                                )
+                                if (
+                                    response_end_exclusive is not None
+                                    and position + len(partial)
+                                    > response_end_exclusive
+                                ):
+                                    raise MalformedResponseError(
+                                        "signed archive response exceeded its "
+                                        "declared byte range"
+                                    ) from exc
+                                if position + len(partial) > max_bytes:
+                                    raise ArchiveError(
+                                        f"archive exceeded byte limit "
+                                        f"{max_bytes}"
+                                    ) from exc
+                                write_all(partial)
+                            os.fsync(destination_fd)
+                            raise
+                        if not block:
+                            break
+                        position = os.lseek(
+                            destination_fd, 0, os.SEEK_CUR
+                        )
+                        if (
+                            response_end_exclusive is not None
+                            and position + len(block)
+                            > response_end_exclusive
+                        ):
+                            raise MalformedResponseError(
+                                "signed archive response exceeded its "
+                                "declared byte range"
+                            )
+                        if position + len(block) > max_bytes:
+                            raise ArchiveError(
+                                f"archive exceeded byte limit {max_bytes}"
+                            )
+                        write_all(block)
+                    os.fsync(destination_fd)
+                    position = os.lseek(
+                        destination_fd, 0, os.SEEK_CUR
+                    )
+                    if (
+                        response_end_exclusive is not None
+                        and position != response_end_exclusive
+                    ):
+                        raise http.client.IncompleteRead(
+                            b"",
+                            max(0, response_end_exclusive - position),
+                        )
+                    completed = verify_destination_identity()
+                    if (
+                        expected_total is not None
+                        and completed.st_size != expected_total
+                    ):
+                        raise http.client.IncompleteRead(
+                            b"",
+                            max(0, expected_total - completed.st_size),
+                        )
+                    if completed.st_size == 0:
+                        raise ArchiveError(
+                            "signed archive response was empty"
+                        )
+                    return completed.st_size, digest_created_file()
+            except urllib.error.HTTPError as exc:
+                raise APIError(
+                    f"signed archive URL returned HTTP {exc.code}"
+                ) from exc
+            except (
+                urllib.error.URLError,
+                http.client.HTTPException,
+                TimeoutError,
+                ConnectionError,
+            ) as exc:
+                last_transport_error = exc
+                current = verify_destination_identity()
+                if current.st_size > max_bytes:
+                    raise ArchiveError(
+                        f"archive exceeded byte limit {max_bytes}"
+                    ) from exc
+                if transfer_attempt == max_transfer_attempts:
+                    break
+                continue
+
+        assert last_transport_error is not None
+        raise ArchiveError(
+            "signed archive transport retries exhausted before EOF: "
+            f"{type(last_transport_error).__name__}"
+        ) from last_transport_error
+    finally:
+        os.close(destination_fd)
 
 
 def _stream_signed_archive_response(
@@ -2941,8 +3215,13 @@ class CIStreamFetcher:
                     if not futures:
                         break
                     completed, _pending = wait(
-                        futures, return_when=FIRST_COMPLETED
+                        futures,
+                        timeout=max(0.1, poll_seconds),
+                        return_when=FIRST_COMPLETED,
                     )
+                    if not completed:
+                        self.write_progress()
+                        continue
                     for future in completed:
                         future.result()
                         futures.pop(future)

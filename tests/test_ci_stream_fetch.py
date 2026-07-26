@@ -8,6 +8,7 @@ from pathlib import Path
 import sqlite3
 import threading
 from typing import Any, Mapping
+import urllib.error
 import zipfile
 import zlib
 
@@ -190,6 +191,384 @@ def test_incomplete_chunked_archive_response_is_retryable(
             max_bytes=1024,
         )
     assert destination.read_bytes() == b"partial archive bytes"
+
+
+class _SignedArchiveResponse:
+    def __init__(
+        self,
+        *,
+        status: int,
+        headers: Mapping[str, str],
+        reads: list[bytes | BaseException],
+    ) -> None:
+        self.status = status
+        self.headers = dict(headers)
+        self._reads = iter(reads)
+
+    def __enter__(self) -> "_SignedArchiveResponse":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self, _size: int) -> bytes:
+        try:
+            value = next(self._reads)
+        except StopIteration:
+            return b""
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+
+def test_signed_archive_download_resumes_exact_range_after_incomplete_read(
+    tmp_path: Path,
+) -> None:
+    payload = b"abcdefgh"
+    responses = iter(
+        [
+            _SignedArchiveResponse(
+                status=200,
+                headers={"Content-Length": "8", "ETag": '"stable"'},
+                reads=[
+                    b"abc",
+                    http.client.IncompleteRead(b"de", 3),
+                ],
+            ),
+            _SignedArchiveResponse(
+                status=206,
+                headers={
+                    "Content-Length": "3",
+                    "Content-Range": "bytes 5-7/8",
+                    "ETag": '"stable"',
+                },
+                reads=[b"fgh", b""],
+            ),
+        ]
+    )
+    requests: list[Any] = []
+
+    def urlopen(request: Any, *, timeout: float) -> _SignedArchiveResponse:
+        assert timeout == 4.0
+        requests.append(request)
+        return next(responses)
+
+    destination = tmp_path / "archive.zip.partial"
+    size, digest = ci._default_archive_downloader(
+        "https://signed.example/archive.zip",
+        destination,
+        timeout=4.0,
+        max_bytes=1024,
+        urlopen=urlopen,
+        max_transfer_attempts=2,
+    )
+
+    assert destination.read_bytes() == payload
+    assert size == len(payload)
+    assert digest == hashlib.sha256(payload).hexdigest()
+    assert requests[0].get_header("Range") is None
+    assert requests[1].get_header("Range") == "bytes=5-"
+    assert requests[1].get_header("If-range") == '"stable"'
+
+
+def test_signed_archive_resume_rejects_inconsistent_content_range(
+    tmp_path: Path,
+) -> None:
+    responses = iter(
+        [
+            _SignedArchiveResponse(
+                status=200,
+                headers={"Content-Length": "8", "ETag": '"stable"'},
+                reads=[b"abc", http.client.IncompleteRead(b"", 5)],
+            ),
+            _SignedArchiveResponse(
+                status=206,
+                headers={
+                    "Content-Length": "5",
+                    "Content-Range": "bytes 2-6/8",
+                    "ETag": '"stable"',
+                },
+                reads=[b"defgh"],
+            ),
+        ]
+    )
+
+    def urlopen(request: Any, *, timeout: float) -> _SignedArchiveResponse:
+        del request, timeout
+        return next(responses)
+
+    with pytest.raises(
+        ci.MalformedResponseError,
+        match="resumed byte range is inconsistent",
+    ):
+        ci._default_archive_downloader(
+            "https://signed.example/archive.zip",
+            tmp_path / "archive.zip.partial",
+            timeout=4.0,
+            max_bytes=1024,
+            urlopen=urlopen,
+            max_transfer_attempts=2,
+        )
+
+
+@pytest.mark.parametrize("etag", [None, 'W/"weak"'])
+def test_signed_archive_download_without_strong_validator_restarts_full(
+    tmp_path: Path,
+    etag: str | None,
+) -> None:
+    payload = b"abcdefgh"
+    first_headers = {"Content-Length": "8"}
+    if etag is not None:
+        first_headers["ETag"] = etag
+    responses = iter(
+        [
+            _SignedArchiveResponse(
+                status=200,
+                headers=first_headers,
+                reads=[b"abc", http.client.IncompleteRead(b"de", 3)],
+            ),
+            _SignedArchiveResponse(
+                status=200,
+                headers={"Content-Length": "8"},
+                reads=[payload, b""],
+            ),
+        ]
+    )
+    requests: list[Any] = []
+
+    def urlopen(request: Any, *, timeout: float) -> _SignedArchiveResponse:
+        del timeout
+        requests.append(request)
+        return next(responses)
+
+    destination = tmp_path / "archive.zip.partial"
+    size, digest = ci._default_archive_downloader(
+        "https://signed.example/archive.zip",
+        destination,
+        timeout=4.0,
+        max_bytes=1024,
+        urlopen=urlopen,
+        max_transfer_attempts=2,
+    )
+
+    assert destination.read_bytes() == payload
+    assert size == len(payload)
+    assert digest == hashlib.sha256(payload).hexdigest()
+    assert requests[1].get_header("Range") is None
+    assert requests[1].get_header("If-range") is None
+
+
+def test_signed_archive_range_mismatch_restarts_from_complete_200(
+    tmp_path: Path,
+) -> None:
+    replacement = b"replacement"
+    responses = iter(
+        [
+            _SignedArchiveResponse(
+                status=200,
+                headers={"Content-Length": "8", "ETag": '"old"'},
+                reads=[b"abc", http.client.IncompleteRead(b"", 5)],
+            ),
+            _SignedArchiveResponse(
+                status=200,
+                headers={
+                    "Content-Length": str(len(replacement)),
+                    "ETag": '"new"',
+                },
+                reads=[replacement, b""],
+            ),
+        ]
+    )
+    requests: list[Any] = []
+
+    def urlopen(request: Any, *, timeout: float) -> _SignedArchiveResponse:
+        del timeout
+        requests.append(request)
+        return next(responses)
+
+    destination = tmp_path / "archive.zip.partial"
+    size, digest = ci._default_archive_downloader(
+        "https://signed.example/archive.zip",
+        destination,
+        timeout=4.0,
+        max_bytes=1024,
+        urlopen=urlopen,
+        max_transfer_attempts=2,
+    )
+
+    assert requests[1].get_header("Range") == "bytes=3-"
+    assert requests[1].get_header("If-range") == '"old"'
+    assert destination.read_bytes() == replacement
+    assert size == len(replacement)
+    assert digest == hashlib.sha256(replacement).hexdigest()
+
+
+def test_signed_archive_resume_requires_same_strong_validator(
+    tmp_path: Path,
+) -> None:
+    responses = iter(
+        [
+            _SignedArchiveResponse(
+                status=200,
+                headers={"Content-Length": "8", "ETag": '"stable"'},
+                reads=[b"abc", http.client.IncompleteRead(b"", 5)],
+            ),
+            _SignedArchiveResponse(
+                status=206,
+                headers={
+                    "Content-Length": "5",
+                    "Content-Range": "bytes 3-7/8",
+                },
+                reads=[b"defgh", b""],
+            ),
+        ]
+    )
+
+    def urlopen(request: Any, *, timeout: float) -> _SignedArchiveResponse:
+        del request, timeout
+        return next(responses)
+
+    with pytest.raises(
+        ci.MalformedResponseError,
+        match="resumed byte range is inconsistent",
+    ):
+        ci._default_archive_downloader(
+            "https://signed.example/archive.zip",
+            tmp_path / "archive.zip.partial",
+            timeout=4.0,
+            max_bytes=1024,
+            urlopen=urlopen,
+            max_transfer_attempts=2,
+        )
+
+
+def test_signed_archive_download_accepts_multiple_valid_ranges(
+    tmp_path: Path,
+) -> None:
+    payload = b"abcdefghij"
+    responses = iter(
+        [
+            _SignedArchiveResponse(
+                status=200,
+                headers={"Content-Length": "10", "ETag": '"stable"'},
+                reads=[b"abc", http.client.IncompleteRead(b"", 7)],
+            ),
+            _SignedArchiveResponse(
+                status=206,
+                headers={
+                    "Content-Length": "3",
+                    "Content-Range": "bytes 3-5/10",
+                    "ETag": '"stable"',
+                },
+                reads=[b"def", b""],
+            ),
+            _SignedArchiveResponse(
+                status=206,
+                headers={
+                    "Content-Length": "4",
+                    "Content-Range": "bytes 6-9/10",
+                    "ETag": '"stable"',
+                },
+                reads=[b"ghij", b""],
+            ),
+        ]
+    )
+    requests: list[Any] = []
+
+    def urlopen(request: Any, *, timeout: float) -> _SignedArchiveResponse:
+        del timeout
+        requests.append(request)
+        return next(responses)
+
+    destination = tmp_path / "archive.zip.partial"
+    size, digest = ci._default_archive_downloader(
+        "https://signed.example/archive.zip",
+        destination,
+        timeout=4.0,
+        max_bytes=1024,
+        urlopen=urlopen,
+        max_transfer_attempts=3,
+    )
+
+    assert [request.get_header("Range") for request in requests] == [
+        None,
+        "bytes=3-",
+        "bytes=6-",
+    ]
+    assert destination.read_bytes() == payload
+    assert size == len(payload)
+    assert digest == hashlib.sha256(payload).hexdigest()
+
+
+def test_signed_archive_resume_rejects_body_beyond_declared_range(
+    tmp_path: Path,
+) -> None:
+    responses = iter(
+        [
+            _SignedArchiveResponse(
+                status=200,
+                headers={"Content-Length": "8", "ETag": '"stable"'},
+                reads=[b"abcde", http.client.IncompleteRead(b"", 3)],
+            ),
+            _SignedArchiveResponse(
+                status=206,
+                headers={
+                    "Content-Range": "bytes 5-6/8",
+                    "ETag": '"stable"',
+                },
+                reads=[b"XYZ", b""],
+            ),
+        ]
+    )
+
+    def urlopen(request: Any, *, timeout: float) -> _SignedArchiveResponse:
+        del request, timeout
+        return next(responses)
+
+    destination = tmp_path / "archive.zip.partial"
+    with pytest.raises(
+        ci.MalformedResponseError,
+        match="exceeded its declared byte range",
+    ):
+        ci._default_archive_downloader(
+            "https://signed.example/archive.zip",
+            destination,
+            timeout=4.0,
+            max_bytes=1024,
+            urlopen=urlopen,
+            max_transfer_attempts=2,
+        )
+
+    assert destination.read_bytes() == b"abcde"
+
+
+def test_signed_archive_download_keeps_stable_destination_fd(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "archive.zip.partial"
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"do not overwrite")
+
+    def urlopen(request: Any, *, timeout: float) -> _SignedArchiveResponse:
+        del request, timeout
+        destination.unlink()
+        destination.symlink_to(victim)
+        raise urllib.error.URLError("transport failed")
+
+    with pytest.raises(
+        ci.ArchiveError,
+        match="destination identity changed",
+    ):
+        ci._default_archive_downloader(
+            "https://signed.example/archive.zip",
+            destination,
+            timeout=4.0,
+            max_bytes=1024,
+            urlopen=urlopen,
+            max_transfer_attempts=2,
+        )
+
+    assert victim.read_bytes() == b"do not overwrite"
 
 
 def test_fetch_state_script_binding_upgrade_is_explicit_and_audited(
@@ -657,6 +1036,82 @@ def test_terminal_log_probe_does_not_spend_a_jobs_request(
         assert github.signed_url is None
     finally:
         fetcher.close()
+
+
+def test_progress_heartbeat_is_written_while_parser_is_still_running(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path / "inventory.sqlite", 1)
+    github = FakeGitHub(_zip_bytes())
+    parser_started = threading.Event()
+    release_parser = threading.Event()
+    progress_path = tmp_path / "progress.json"
+    results: list[dict[str, object]] = []
+    errors: list[BaseException] = []
+
+    def slow_parser(
+        raw: bytes,
+        metadata: Mapping[str, object],
+        *,
+        max_chunk_chars: int,
+    ) -> dict[str, object]:
+        parser_started.set()
+        if not release_parser.wait(5):
+            raise AssertionError("test parser was not released")
+        return _fake_parser(
+            raw,
+            metadata,
+            max_chunk_chars=max_chunk_chars,
+        )
+
+    fetcher = ci.CIStreamFetcher(
+        inventory_path=inventory,
+        state_path=tmp_path / "fetch.sqlite",
+        content_store_path=tmp_path / "store",
+        tokenizer_path=_tokenizer(tmp_path / "tokenizer.json"),
+        tokens=["api-secret"],
+        progress_path=progress_path,
+        receipt_path=tmp_path / "receipt.json",
+        parser=slow_parser,
+        requester=github.request,
+        archive_downloader=github.download,
+        target_unique_tokens=1_000_000,
+        sleeper=lambda _: None,
+    )
+
+    def run_fetcher() -> None:
+        try:
+            results.append(
+                fetcher.run(
+                    continuous=False,
+                    max_runs=1,
+                    poll_seconds=0.01,
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    runner = threading.Thread(target=run_fetcher)
+    runner.start()
+    try:
+        assert parser_started.wait(2)
+        for _ in range(100):
+            if progress_path.is_file():
+                break
+            release_parser.wait(0.01)
+        assert progress_path.is_file()
+        heartbeat = json.loads(progress_path.read_text())
+        assert heartbeat["fetch"]["attempt_statuses"] == {"processing": 1}
+        assert heartbeat["content_store"]["counters"][
+            "exact_unique_payload_tokens"
+        ] is None
+    finally:
+        release_parser.set()
+        runner.join(5)
+        fetcher.close()
+    assert not runner.is_alive()
+    assert not errors
+    assert len(results) == 1
 
 
 def test_full_attempt_streams_through_parser_tokenizer_and_cas_idempotently(
