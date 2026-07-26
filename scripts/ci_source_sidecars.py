@@ -2847,6 +2847,8 @@ def verify_binding_inventory(
         "content_semantics",
         "occurrence_set_sha256",
         "upstream_fetch_receipt_sha256",
+        "frozen_fetch_state",
+        "frozen_fetch_state_sha256",
         "content_store_receipt_sha256",
         "content_store_sqlite_schema_sha256",
         "content_store_sqlite_logical_sha256",
@@ -2866,6 +2868,7 @@ def verify_binding_inventory(
     for name in (
         "occurrence_set_sha256",
         "upstream_fetch_receipt_sha256",
+        "frozen_fetch_state_sha256",
         "content_store_receipt_sha256",
         "content_store_sqlite_schema_sha256",
         "content_store_sqlite_logical_sha256",
@@ -2888,6 +2891,13 @@ def verify_binding_inventory(
     }
     if any(header.get(key) != value for key, value in expected_shape.items()):
         raise ExtractionError("inventory header contract is stale")
+    frozen_fetch_state = header.get("frozen_fetch_state")
+    if (
+        not isinstance(frozen_fetch_state, Mapping)
+        or header.get("frozen_fetch_state_sha256")
+        != _sha256_bytes(_canonical_json_bytes(frozen_fetch_state))
+    ):
+        raise ExtractionError("inventory frozen fetch-state binding differs")
     for name, actual in (
         ("binding_count", binding_hasher.count),
         ("reference_count", reference_hasher.count),
@@ -2945,6 +2955,21 @@ def extract_binding_inventory(
         raise ExtractionError("fetch and standalone content-store receipts differ")
     if export_receipt.get("schema") != CASE5_EXPORT_SCHEMA:
         raise ExtractionError("CASE5 export receipt schema is missing or stale")
+    frozen_fetch_state = fetch_receipt.get("frozen_fetch_state")
+    input_fetch_state = export_receipt.get("input_fetch_state")
+    if not isinstance(frozen_fetch_state, Mapping) or not isinstance(
+        input_fetch_state,
+        Mapping,
+    ):
+        raise ExtractionError("frozen fetch-state lineage binding is missing")
+    if dict(frozen_fetch_state) != dict(input_fetch_state):
+        raise ExtractionError(
+            "upstream and CASE5 frozen fetch-state bindings differ"
+        )
+    frozen_fetch_state_binding = dict(frozen_fetch_state)
+    frozen_fetch_state_sha256 = _sha256_bytes(
+        _canonical_json_bytes(frozen_fetch_state_binding)
+    )
     input_store = export_receipt.get("input_store")
     content_receipt_sha256 = _sha256_bytes(content_receipt_raw)
     if (
@@ -3004,6 +3029,8 @@ def extract_binding_inventory(
                     "occurrence_set_sha256"
                 ],
                 "upstream_fetch_receipt_sha256": _sha256_bytes(fetch_raw),
+                "frozen_fetch_state": frozen_fetch_state_binding,
+                "frozen_fetch_state_sha256": frozen_fetch_state_sha256,
                 "content_store_receipt_sha256": content_receipt_sha256,
                 "content_store_sqlite_schema_sha256": content_receipt[
                     "sqlite_schema_sha256"
@@ -4000,6 +4027,9 @@ class SourceSidecarStore:
                     "upstream_fetch_receipt_sha256": str(
                         header["upstream_fetch_receipt_sha256"]
                     ),
+                    "frozen_fetch_state_sha256": str(
+                        header["frozen_fetch_state_sha256"]
+                    ),
                     "content_store_receipt_sha256": str(
                         header["content_store_receipt_sha256"]
                     ),
@@ -4134,6 +4164,7 @@ class SourceSidecarStore:
             "reference_ledger_schema",
             "occurrence_set_sha256",
             "upstream_fetch_receipt_sha256",
+            "frozen_fetch_state_sha256",
             "content_store_receipt_sha256",
             "content_store_sqlite_schema_sha256",
             "content_store_sqlite_logical_sha256",
@@ -4166,6 +4197,7 @@ class SourceSidecarStore:
         for name in (
             "occurrence_set_sha256",
             "upstream_fetch_receipt_sha256",
+            "frozen_fetch_state_sha256",
             "content_store_receipt_sha256",
             "content_store_sqlite_schema_sha256",
             "content_store_sqlite_logical_sha256",
@@ -4271,6 +4303,9 @@ class SourceSidecarStore:
                     ),
                     "upstream_fetch_receipt_sha256": str(
                         inventory.header["upstream_fetch_receipt_sha256"]
+                    ),
+                    "frozen_fetch_state_sha256": str(
+                        inventory.header["frozen_fetch_state_sha256"]
                     ),
                     "inventory_logical_sha256": str(
                         inventory.header["inventory_logical_sha256"]
@@ -5279,15 +5314,18 @@ class SourceSidecarStore:
         if binding_count > self.input_binding_count:
             raise SourceStoreError("stored binding count exceeds frozen inventory")
         missing_binding_count = self.input_binding_count - binding_count
+        reference_summary = self._reference_ledger_summary_locked()
+        input_reference_count = int(self._settings["input_reference_count"])
+        reference_count = int(reference_summary["reference_count"])
+        if reference_count > input_reference_count:
+            raise SourceStoreError("stored references exceed frozen inventory")
+        missing_reference_count = input_reference_count - reference_count
         complete = (
             missing_binding_count == 0
+            and missing_reference_count == 0
             and int(status_counts.get(RESOLVED, 0)) == self.input_binding_count
             and not any(status_counts.get(status, 0) for status in GAP_STATUSES)
         )
-        reference_summary = self._reference_ledger_summary_locked()
-        input_reference_count = int(self._settings["input_reference_count"])
-        if int(reference_summary["reference_count"]) > input_reference_count:
-            raise SourceStoreError("stored references exceed frozen inventory")
         recovery = self.recovery_records()
         return {
             "ok": True,
@@ -5295,10 +5333,8 @@ class SourceSidecarStore:
             "schema": STORE_SCHEMA,
             "binding_count": binding_count,
             "missing_binding_count": missing_binding_count,
-            "reference_count": reference_summary["reference_count"],
-            "missing_reference_count": (
-                input_reference_count - int(reference_summary["reference_count"])
-            ),
+            "reference_count": reference_count,
+            "missing_reference_count": missing_reference_count,
             "reference_ledger": reference_summary,
             "blob_count": blob_count,
             "git_object_count": int(
@@ -5367,6 +5403,9 @@ class SourceSidecarStore:
             "occurrence_set_sha256": self._settings["occurrence_set_sha256"],
             "upstream_fetch_receipt_sha256": self._settings[
                 "upstream_fetch_receipt_sha256"
+            ],
+            "frozen_fetch_state_sha256": self._settings[
+                "frozen_fetch_state_sha256"
             ],
             "content_store_receipt_sha256": self._settings[
                 "content_store_receipt_sha256"

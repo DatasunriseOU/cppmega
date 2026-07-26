@@ -197,6 +197,47 @@ def _reference(
     }
 
 
+def _frozen_fetch_state_binding(root: Path) -> dict[str, object]:
+    sidecar_set_sha256 = "9" * 64
+    return {
+        "schema": "cppmega_ci_stream_fetch_v3",
+        "artifact": {
+            "path": str(root / "fetch-state.sqlite3"),
+            "byte_size": 16_384,
+            "mtime_ns": 1_774_444_500_000_000_000,
+            "inode": 424_242,
+            "sha256": "a" * 64,
+        },
+        "sqlite_schema_sha256": "b" * 64,
+        "sqlite_logical_sha256": "c" * 64,
+        "settings": {
+            "schema": "cppmega_ci_stream_fetch_v3",
+            "inventory_path": str(root / "inventory.sqlite3"),
+            "content_store_path": str(root / "ci-store"),
+            "tokenizer_contract": '{"schema":"cppmega-tokenizer-v1"}',
+            "tokenizer_fingerprint": "tokenizer-test-v1",
+            "fetcher_script_sha256": "d" * 64,
+            "parser_script_sha256": "e" * 64,
+            "content_store_script_sha256": "f" * 64,
+            "chunk_semantics": (
+                "parser-dedup-text-cppmega-training-tokenizer-payload-only-"
+                "no-framing-v2"
+            ),
+            "created_at": "2026-07-26T04:35:00Z",
+        },
+        "summary": {
+            "attempt_statuses": {"done": 1},
+            "attempts_terminal": 1,
+            "members": 1,
+            "chunks": 2,
+            "occurrence_tokens": 4,
+            "requests": 3,
+            "sidecar_set_sha256": sidecar_set_sha256,
+        },
+        "sidecar_set_sha256": sidecar_set_sha256,
+    }
+
+
 def _write_inventory(
     path: Path,
     bindings: list[dict[str, object]],
@@ -221,6 +262,7 @@ def _write_inventory(
             hashlib.sha256(_canonical(value)).hexdigest(),
         )
     )
+    frozen_fetch_state = _frozen_fetch_state_binding(path.parent)
     header: dict[str, object] = {
         "schema": INVENTORY_SCHEMA,
         "record_type": "header",
@@ -230,6 +272,10 @@ def _write_inventory(
         "content_semantics": CONTENT_SEMANTICS,
         "occurrence_set_sha256": "1" * 64,
         "upstream_fetch_receipt_sha256": "2" * 64,
+        "frozen_fetch_state": frozen_fetch_state,
+        "frozen_fetch_state_sha256": hashlib.sha256(
+            _canonical(frozen_fetch_state)
+        ).hexdigest(),
         "content_store_receipt_sha256": "3" * 64,
         "content_store_sqlite_schema_sha256": "4" * 64,
         "content_store_sqlite_logical_sha256": "5" * 64,
@@ -441,8 +487,10 @@ def _frozen_case5_fixture(
 
     content_receipt_path = tmp_path / "content-receipt.json"
     content_receipt_raw = _write_json(content_receipt_path, content_receipt)
+    frozen_fetch_state = _frozen_fetch_state_binding(tmp_path)
     fetch_receipt = {
         "schema": FETCH_RECEIPT_SCHEMA,
+        "frozen_fetch_state": frozen_fetch_state,
         "content_store_receipt": content_receipt,
     }
     fetch_path = tmp_path / "fetch-receipt.json"
@@ -475,6 +523,7 @@ def _frozen_case5_fixture(
     export_receipt = {
         "schema": CASE5_EXPORT_SCHEMA,
         "status": "complete",
+        "input_fetch_state": json.loads(_canonical(frozen_fetch_state)),
         "input_store": {
             "receipt_sha256": hashlib.sha256(content_receipt_raw).hexdigest(),
             "sqlite_schema_sha256": content_receipt["sqlite_schema_sha256"],
@@ -522,6 +571,7 @@ def _frozen_case5_fixture(
         "representative": representative,
         "content_receipt": content_receipt,
         "export_receipt": export_receipt,
+        "frozen_fetch_state": frozen_fetch_state,
     }
 
 
@@ -538,6 +588,7 @@ def _sync_case5_receipts(fixture: dict[str, object]) -> None:
         fixture["fetch_path"],  # type: ignore[arg-type]
         {
             "schema": FETCH_RECEIPT_SCHEMA,
+            "frozen_fetch_state": fixture["frozen_fetch_state"],
             "content_store_receipt": content_receipt,
         },
     )
@@ -645,6 +696,10 @@ def test_representative_only_inventory_build_and_receipt_hash_chain(
     assert header["representative_ledger_artifact_sha256"] == hashlib.sha256(
         fixture["ledger_path"].read_bytes()  # type: ignore[union-attr]
     ).hexdigest()
+    assert header["frozen_fetch_state"] == fixture["frozen_fetch_state"]
+    assert header["frozen_fetch_state_sha256"] == hashlib.sha256(
+        _canonical(fixture["frozen_fetch_state"])
+    ).hexdigest()
     assert binding["source_path"] == "src/nested/main.cpp"
     assert binding["normalization_status"] == RESOLVED
     assert reference["representative_occurrence_key"] == fixture["selected_key"]
@@ -666,6 +721,9 @@ def test_representative_only_inventory_build_and_receipt_hash_chain(
     ]
     assert receipt["representative_ledger_artifact_sha256"] == header[
         "representative_ledger_artifact_sha256"
+    ]
+    assert receipt["frozen_fetch_state_sha256"] == header[
+        "frozen_fetch_state_sha256"
     ]
     assert receipt["build_action_reference_count"] == 1
     assert receipt["missing_reference_count"] == 0
@@ -731,6 +789,29 @@ def test_representative_ledger_rejects_nonmember_duplicate_and_count_drift(
     assert empty_result["representative_count"] == 0
     assert empty_result["binding_count"] == 0
     assert empty_result["reference_count"] == 0
+
+
+def test_inventory_requires_exact_frozen_fetch_state_lineage(
+    tmp_path: Path,
+) -> None:
+    _mirror, head, _base = _git_fixture(tmp_path)
+    missing = _frozen_case5_fixture(tmp_path / "missing", head)
+    fetch_receipt = json.loads(
+        missing["fetch_path"].read_text(encoding="utf-8")  # type: ignore[union-attr]
+    )
+    del fetch_receipt["frozen_fetch_state"]
+    _write_json(missing["fetch_path"], fetch_receipt)  # type: ignore[arg-type]
+    with pytest.raises(ExtractionError, match="lineage binding is missing"):
+        _extract_fixture(missing, tmp_path / "missing-inventory.jsonl")
+
+    mismatch = _frozen_case5_fixture(tmp_path / "mismatch", head)
+    export_receipt = json.loads(
+        mismatch["export_path"].read_text(encoding="utf-8")  # type: ignore[union-attr]
+    )
+    export_receipt["input_fetch_state"]["summary"]["requests"] += 1
+    _write_json(mismatch["export_path"], export_receipt)  # type: ignore[arg-type]
+    with pytest.raises(ExtractionError, match="bindings differ"):
+        _extract_fixture(mismatch, tmp_path / "mismatch-inventory.jsonl")
 
 
 def test_path_normalization_is_platform_aware_and_has_no_basename_heuristic() -> None:
@@ -1023,6 +1104,38 @@ def test_store_deduplicates_batches_and_rejects_arbitrary_partial_membership(
         tmp_path / "one-store", one_inventory
     ) as store, pytest.raises(SourceStoreError, match="not a member"):
         store.add_resolution(wrong_resolution)
+
+
+def test_store_reference_closure_is_required_for_complete_status(
+    tmp_path: Path,
+) -> None:
+    mirror, head, _base = _git_fixture(tmp_path)
+    binding = _binding(head, "src/nested/main.cpp")
+    inventory = _write_inventory(tmp_path / "inventory.jsonl", [binding])
+    root = tmp_path / "store"
+
+    with _new_source_store(root, inventory) as store:
+        store.add_resolution(
+            LocalGitResolver({"owner/repo": mirror}).resolve(binding)
+        )
+        assert store.receipt()["status"] == "complete"
+        store._connection.execute("DELETE FROM inventory_references")
+        store._connection.commit()
+
+        verification = store.verify()
+        receipt = store.receipt()
+        assert verification["binding_count"] == 1
+        assert verification["missing_binding_count"] == 0
+        assert verification["reference_count"] == 0
+        assert verification["missing_reference_count"] == 1
+        assert verification["status"] == "incomplete"
+        assert receipt["status"] == "incomplete"
+        assert receipt["missing_reference_count"] == 1
+
+    with sqlite3.connect(root / "index.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM inventory_references"
+        ).fetchone()[0] == 0
 
 
 def test_frame_size_is_validated_before_hostile_uint64_read(
