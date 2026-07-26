@@ -183,6 +183,23 @@ def test_cmake_ninja_gcc_cuda_success_sections_entities_and_edges() -> None:
         )
     )
     assert training["schema"] == TRAINING_SIDECAR_SCHEMA
+    training_ninja_action = next(
+        action
+        for action in training["build_actions"]
+        if action["tool"] == "ninja"
+    )
+    assert training_ninja_action["action_entity_id"].startswith("entity:")
+    assert not any(
+        key.endswith("entityid")
+        for record_group in (
+            training["commands"],
+            training["build_actions"],
+            training["tests"],
+            training["diagnostics"],
+        )
+        for record in record_group
+        for key in record
+    )
     assert {
         edge["kind_id"] for edge in training["edges"]
     } >= {
@@ -269,6 +286,34 @@ def test_package_inventory_rows_are_not_build_actions() -> None:
         for action in actions
     )
     _assert_conserved(result)
+
+
+def test_build_action_graph_links_non_output_path_inputs() -> None:
+    result = canonicalize_ci_log(
+        _timestamped(
+            "[command]msbuild.exe project/app.sln /t:Build "
+            "/p:Configuration=Release",
+        )
+    )
+    training = result["chunks"][0]["training_sidecars"]
+    action = training["build_actions"][0]
+    input_entity = next(
+        entity
+        for entity in training["entities"]
+        if entity["kind"] == "path"
+        and result["chunks"][0]["text"][
+            entity["start_char"] : entity["end_char"]
+        ]
+        == "project/app.sln"
+    )
+
+    assert action["action_entity_id"].startswith("entity:")
+    assert any(
+        edge["kind"] == "BUILD_ACTION_INPUT"
+        and edge["source"] == action["action_entity_id"]
+        and edge["target"] == input_entity["entity_id"]
+        for edge in training["edges"]
+    )
 
 
 def test_bazel_pytest_gtest_ctest_failure_diagnostics_and_sanitizer() -> None:

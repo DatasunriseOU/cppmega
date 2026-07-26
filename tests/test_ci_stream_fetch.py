@@ -496,7 +496,7 @@ def test_spawned_parser_worker_emits_full_training_sidecars(
         assert progress["fetch"]["attempt_statuses"] == {"done": 1}
         occurrence = next(fetcher.store.iter_occurrences())
         training = occurrence["provenance"]["chunk"]["training_sidecars"]
-        assert training["schema"] == "cppmega_ci_chunk_training_sidecars_v1"
+        assert training["schema"] == "cppmega_ci_chunk_training_sidecars_v2"
         assert training["build_actions"]
         assert training["edges"]
     finally:

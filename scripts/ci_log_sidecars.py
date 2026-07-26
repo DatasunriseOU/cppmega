@@ -27,8 +27,8 @@ from typing import Any
 
 CANONICALIZATION_SCHEMA = "github_actions_ci_log_canonical_v1"
 DEDUPLICATION_SCHEMA = "github_actions_ci_log_dedup_v1"
-SIDECAR_SCHEMA = "cppmega_ci_log_sidecar_v1"
-TRAINING_SIDECAR_SCHEMA = "cppmega_ci_chunk_training_sidecars_v1"
+SIDECAR_SCHEMA = "cppmega_ci_log_sidecar_v2"
+TRAINING_SIDECAR_SCHEMA = "cppmega_ci_chunk_training_sidecars_v2"
 BUILD_ACTION_NORMALIZATION_SCHEMA = "ci_build_action_shape_v1"
 DEFAULT_MAX_CHUNK_CHARS = 128_000
 MAX_AUDIT_SAMPLES = 8
@@ -2676,7 +2676,7 @@ def _extract_build_actions(
             if int(path["start_char"]) < action_start:
                 continue
             category = str(path.get("category") or "")
-            if category in {"source", "build", "shell"}:
+            if category != "output":
                 builder.edge(
                     action_entity_ref,
                     path.get("entity_ref"),
@@ -3536,8 +3536,8 @@ def _replace_entity_refs(value: Any, id_for_temp: Mapping[int, str]) -> Any:
     if isinstance(value, dict):
         output: dict[str, Any] = {}
         for key, item in value.items():
-            if key.endswith("entity_ref"):
-                output[key[:-4] + "id"] = (
+            if key == "entity_ref" or key.endswith("_entity_ref"):
+                output[key.removesuffix("_ref") + "_id"] = (
                     id_for_temp[item] if isinstance(item, int) else None
                 )
             else:
