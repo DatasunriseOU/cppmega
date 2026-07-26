@@ -14,12 +14,19 @@ can be imported through the same validation/parser/tokenizer path.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    wait,
+)
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import multiprocessing
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -414,6 +421,122 @@ class ExactTokenizer:
         if len(token_ids) != len(texts):
             raise FetchError("tokenizer changed the batch cardinality")
         return token_ids
+
+
+_PROCESS_TOKENIZERS: dict[str, ExactTokenizer] = {}
+
+
+def _section_for_parsed_chunk(
+    parsed: Mapping[str, object], chunk: Mapping[str, object]
+) -> Mapping[str, object] | None:
+    ordinal = chunk.get("section_ordinal")
+    sections = parsed.get("sections")
+    if (
+        isinstance(ordinal, int)
+        and not isinstance(ordinal, bool)
+        and isinstance(sections, list)
+        and 0 <= ordinal < len(sections)
+        and isinstance(sections[ordinal], dict)
+    ):
+        return sections[ordinal]
+    return None
+
+
+def _materialize_parsed_member(
+    raw: bytes,
+    metadata: Mapping[str, object],
+    *,
+    max_chunk_chars: int,
+    parser: Callable[..., Mapping[str, object]],
+    tokenizer: ExactTokenizer,
+) -> dict[str, object]:
+    parsed = parser(raw, metadata, max_chunk_chars=max_chunk_chars)
+    if not isinstance(parsed, Mapping):
+        raise FetchError("CI parser returned a non-mapping result")
+    canonical_text = parsed.get("canonical_text")
+    dedup_text = parsed.get("dedup_text")
+    chunks = parsed.get("chunks")
+    sidecar = parsed.get("sidecar")
+    if (
+        not isinstance(canonical_text, str)
+        or not isinstance(dedup_text, str)
+        or not isinstance(chunks, list)
+        or not isinstance(sidecar, dict)
+        or any(not isinstance(item, dict) for item in chunks)
+    ):
+        raise FetchError("CI parser returned an invalid result contract")
+
+    retained_chunks: list[dict[str, object]] = []
+    chunk_texts: list[str] = []
+    for raw_chunk in chunks:
+        text = raw_chunk.get("text")
+        if not isinstance(text, str):
+            raise FetchError("parser chunk text is missing")
+        if not text:
+            continue
+        retained_chunks.append(dict(raw_chunk))
+        chunk_texts.append(text)
+    token_batches = tokenizer.encode_batch(chunk_texts)
+    materialized_chunks: list[dict[str, object]] = []
+    for chunk, text, token_ids in zip(
+        retained_chunks, chunk_texts, token_batches, strict=True
+    ):
+        ordinal = chunk.get("ordinal")
+        if (
+            isinstance(ordinal, bool)
+            or not isinstance(ordinal, int)
+            or ordinal < 0
+        ):
+            raise FetchError("parser chunk ordinal is invalid")
+        section = _section_for_parsed_chunk(parsed, chunk)
+        compact_chunk = {
+            key: value
+            for key, value in chunk.items()
+            if key not in {"text", "canonical_text", "dedup_text"}
+        }
+        compact_section = None
+        if section is not None:
+            compact_section = {
+                key: value
+                for key, value in section.items()
+                if key not in {"text", "dedup_text"}
+            }
+        materialized_chunks.append(
+            {
+                "ordinal": ordinal,
+                "text": text,
+                "token_count": len(token_ids),
+                "token_sequence_sha256": hash_token_sequence(token_ids),
+                "chunk": compact_chunk,
+                "section": compact_section,
+            }
+        )
+    return {
+        "canonical_sha256": _sha256_bytes(canonical_text.encode("utf-8")),
+        "dedup_sha256": _sha256_bytes(dedup_text.encode("utf-8")),
+        "sidecar": sidecar,
+        "chunks": materialized_chunks,
+        "tokenizer_fingerprint": tokenizer.fingerprint,
+    }
+
+
+def _process_parse_member(
+    raw: bytes,
+    metadata: Mapping[str, object],
+    max_chunk_chars: int,
+    tokenizer_path: str,
+) -> dict[str, object]:
+    tokenizer = _PROCESS_TOKENIZERS.get(tokenizer_path)
+    if tokenizer is None:
+        tokenizer = ExactTokenizer(tokenizer_path)
+        _PROCESS_TOKENIZERS[tokenizer_path] = tokenizer
+    return _materialize_parsed_member(
+        raw,
+        metadata,
+        max_chunk_chars=max_chunk_chars,
+        parser=canonicalize_ci_log,
+        tokenizer=tokenizer,
+    )
 
 
 _STATE_SCHEMA = """
@@ -1584,6 +1707,7 @@ class CIStreamFetcher:
         max_member_bytes: int = DEFAULT_MAX_MEMBER_BYTES,
         max_uncompressed_bytes: int = DEFAULT_MAX_UNCOMPRESSED_BYTES,
         max_members: int = DEFAULT_MAX_MEMBERS,
+        parser_workers: int = 0,
         parser: Callable[..., Mapping[str, object]] = canonicalize_ci_log,
         requester: Callable[
             [str, str, Mapping[str, str], float], HTTPResponse
@@ -1595,6 +1719,16 @@ class CIStreamFetcher:
     ):
         if target_unique_tokens <= 0:
             raise ValueError("target_unique_tokens must be positive")
+        if (
+            isinstance(parser_workers, bool)
+            or not isinstance(parser_workers, int)
+            or parser_workers < 0
+        ):
+            raise ValueError("parser_workers must be a non-negative integer")
+        if parser_workers and parser is not canonicalize_ci_log:
+            raise ValueError(
+                "parser_workers requires the canonical production parser"
+            )
         self.inventory_path = Path(inventory_path).expanduser().resolve()
         self.progress_path = Path(progress_path).expanduser().resolve()
         self.receipt_path = Path(receipt_path).expanduser().resolve()
@@ -1631,9 +1765,21 @@ class CIStreamFetcher:
         self.max_uncompressed_bytes = max_uncompressed_bytes
         self.max_members = max_members
         self.parser = parser
+        self.parser_workers = parser_workers
+        self._parser_executor = (
+            ProcessPoolExecutor(
+                max_workers=parser_workers,
+                mp_context=multiprocessing.get_context("spawn"),
+            )
+            if parser_workers
+            else None
+        )
         self.sleeper = sleeper
 
     def close(self) -> None:
+        if self._parser_executor is not None:
+            self._parser_executor.shutdown(wait=True, cancel_futures=False)
+            self._parser_executor = None
         self.store.close()
         self.state.close()
 
@@ -1652,22 +1798,6 @@ class CIStreamFetcher:
         # freshly allocated path inside the validated temp directory.
         path.unlink()
         return path
-
-    @staticmethod
-    def _section_for_chunk(
-        parsed: Mapping[str, object], chunk: Mapping[str, object]
-    ) -> Mapping[str, object] | None:
-        ordinal = chunk.get("section_ordinal")
-        sections = parsed.get("sections")
-        if (
-            isinstance(ordinal, int)
-            and not isinstance(ordinal, bool)
-            and isinstance(sections, list)
-            and 0 <= ordinal < len(sections)
-            and isinstance(sections[ordinal], dict)
-        ):
-            return sections[ordinal]
-        return None
 
     def _process_member(
         self,
@@ -1701,47 +1831,61 @@ class CIStreamFetcher:
                 "archive_member_raw_sha256": raw_sha,
             }
         )
-        parsed = self.parser(
-            raw, metadata, max_chunk_chars=self.max_chunk_chars
-        )
-        if not isinstance(parsed, Mapping):
-            raise FetchError("CI parser returned a non-mapping result")
-        canonical_text = parsed.get("canonical_text")
-        dedup_text = parsed.get("dedup_text")
-        chunks = parsed.get("chunks")
-        sidecar = parsed.get("sidecar")
+        if self._parser_executor is None:
+            materialized = _materialize_parsed_member(
+                raw,
+                metadata,
+                max_chunk_chars=self.max_chunk_chars,
+                parser=self.parser,
+                tokenizer=self.tokenizer,
+            )
+        else:
+            materialized = self._parser_executor.submit(
+                _process_parse_member,
+                raw,
+                metadata,
+                self.max_chunk_chars,
+                str(self.tokenizer.path),
+            ).result()
+        sidecar = materialized.get("sidecar")
+        chunks = materialized.get("chunks")
         if (
-            not isinstance(canonical_text, str)
-            or not isinstance(dedup_text, str)
+            materialized.get("tokenizer_fingerprint")
+            != self.tokenizer.fingerprint
             or not isinstance(chunks, list)
             or not isinstance(sidecar, dict)
             or any(not isinstance(item, dict) for item in chunks)
         ):
-            raise FetchError("CI parser returned an invalid result contract")
-        chunk_texts: list[str] = []
-        retained_chunks: list[dict[str, object]] = []
-        for raw_chunk in chunks:
-            text = raw_chunk.get("text")
-            if not isinstance(text, str):
-                raise FetchError("parser chunk text is missing")
-            if not text:
-                continue
-            retained_chunks.append(dict(raw_chunk))
-            chunk_texts.append(text)
-        token_batches = self.tokenizer.encode_batch(chunk_texts)
+            raise FetchError("materialized parser result is invalid")
         records: list[dict[str, object]] = []
         occurrence_tokens = 0
-        for chunk, text, token_ids in zip(
-            retained_chunks, chunk_texts, token_batches
-        ):
-            ordinal = chunk.get("ordinal")
+        for materialized_chunk in chunks:
+            ordinal = materialized_chunk.get("ordinal")
+            text = materialized_chunk.get("text")
+            token_count = materialized_chunk.get("token_count")
+            sequence_sha = materialized_chunk.get(
+                "token_sequence_sha256"
+            )
+            chunk = materialized_chunk.get("chunk")
+            compact_section = materialized_chunk.get("section")
             if (
                 isinstance(ordinal, bool)
                 or not isinstance(ordinal, int)
                 or ordinal < 0
+                or not isinstance(text, str)
+                or not text
+                or isinstance(token_count, bool)
+                or not isinstance(token_count, int)
+                or token_count < 0
+                or not isinstance(sequence_sha, str)
+                or re.fullmatch(r"[0-9a-f]{64}", sequence_sha) is None
+                or not isinstance(chunk, dict)
+                or (
+                    compact_section is not None
+                    and not isinstance(compact_section, dict)
+                )
             ):
-                raise FetchError("parser chunk ordinal is invalid")
-            section = self._section_for_chunk(parsed, chunk)
+                raise FetchError("materialized parser chunk is invalid")
             section_id = (
                 str(chunk.get("section_id") or f"section:{ordinal}")
             )
@@ -1749,18 +1893,6 @@ class CIStreamFetcher:
                 f"{section_id}:"
                 f"{chunk.get('step_ordinal') if chunk.get('step_ordinal') is not None else 'none'}"
             )
-            compact_chunk = {
-                key: value
-                for key, value in chunk.items()
-                if key not in {"text", "canonical_text", "dedup_text"}
-            }
-            compact_section = None
-            if section is not None:
-                compact_section = {
-                    key: value
-                    for key, value in section.items()
-                    if key not in {"text", "dedup_text"}
-                }
             provenance: dict[str, object] = {
                 "schema": "cppmega_ci_chunk_occurrence_v1",
                 "repository": attempt.repo,
@@ -1784,10 +1916,9 @@ class CIStreamFetcher:
                     "member_raw_sha256": raw_sha,
                 },
                 "parser_sidecar_sha256": sidecar.get("sidecar_sha256"),
-                "chunk": compact_chunk,
+                "chunk": chunk,
                 "section": compact_section,
             }
-            sequence_sha = hash_token_sequence(token_ids)
             records.append(
                 {
                     "content": text,
@@ -1799,16 +1930,23 @@ class CIStreamFetcher:
                         "step": step_key,
                         "chunk_ordinal": ordinal,
                     },
-                    "token_count": len(token_ids),
+                    "token_count": token_count,
                     "tokenizer_fingerprint": self.tokenizer.fingerprint,
                     "token_sequence_sha256": sequence_sha,
                 }
             )
-            occurrence_tokens += len(token_ids)
+            occurrence_tokens += token_count
         if records:
             self.store.add_chunks(records)
-        canonical_sha = _sha256_bytes(canonical_text.encode("utf-8"))
-        dedup_sha = _sha256_bytes(dedup_text.encode("utf-8"))
+        canonical_sha = materialized.get("canonical_sha256")
+        dedup_sha = materialized.get("dedup_sha256")
+        if (
+            not isinstance(canonical_sha, str)
+            or re.fullmatch(r"[0-9a-f]{64}", canonical_sha) is None
+            or not isinstance(dedup_sha, str)
+            or re.fullmatch(r"[0-9a-f]{64}", dedup_sha) is None
+        ):
+            raise FetchError("materialized member digests are invalid")
         self.state.store_member(
             attempt,
             archive_member=info.filename,
@@ -1828,10 +1966,10 @@ class CIStreamFetcher:
         archive: ArchiveSource | None = None
         temporary: Path | None = None
         try:
-            jobs = self.client.fetch_jobs(attempt)
             rescued = self.rescue.locate(attempt)
             if isinstance(rescued, TerminalHTTP):
                 raise rescued
+            jobs = self.client.fetch_jobs(attempt)
             if isinstance(rescued, ArchiveSource):
                 archive = rescued
             else:
@@ -1997,38 +2135,46 @@ class CIStreamFetcher:
         if workers <= 0:
             raise ValueError("workers must be positive")
         processed = 0
+        submitted = 0
         with ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="ci-stream-fetch"
         ) as executor:
             while True:
                 self.state.discover()
+                futures: dict[Future[None], Attempt] = {}
+                work_exhausted = False
                 while True:
-                    if self.threshold_met():
-                        self.write_progress()
-                        return self.write_receipt()
-                    if max_runs is not None and processed >= max_runs:
-                        return self.write_progress()
-                    remaining = (
-                        workers
-                        if max_runs is None
-                        else min(workers, max_runs - processed)
-                    )
-                    attempts: list[Attempt] = []
-                    for _ in range(remaining):
+                    threshold_met = self.threshold_met()
+                    while (
+                        not threshold_met
+                        and not work_exhausted
+                        and len(futures) < workers
+                        and (max_runs is None or submitted < max_runs)
+                    ):
                         attempt = self.state.next_attempt()
                         if attempt is None:
+                            work_exhausted = True
                             break
-                        attempts.append(attempt)
-                    if not attempts:
+                        future = executor.submit(
+                            self.process_attempt, attempt
+                        )
+                        futures[future] = attempt
+                        submitted += 1
+                    if not futures:
                         break
-                    futures = {
-                        executor.submit(self.process_attempt, attempt): attempt
-                        for attempt in attempts
-                    }
-                    for future in as_completed(futures):
+                    completed, _pending = wait(
+                        futures, return_when=FIRST_COMPLETED
+                    )
+                    for future in completed:
                         future.result()
+                        futures.pop(future)
                         processed += 1
                         self.write_progress()
+                if self.threshold_met():
+                    self.write_progress()
+                    return self.write_receipt()
+                if max_runs is not None and submitted >= max_runs:
+                    return self.write_progress()
                 if not continuous:
                     return self.write_progress()
                 self.write_progress()
@@ -2052,6 +2198,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--max-runs", type=int)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument(
+        "--parser-workers",
+        type=int,
+        default=8,
+        help=(
+            "spawned CPU workers for canonicalization/tokenization; "
+            "use 0 only for deterministic inline diagnostics"
+        ),
+    )
     parser.add_argument("--poll-seconds", type=float, default=5.0)
     parser.add_argument(
         "--target-exact-unique-payload-tokens",
@@ -2088,6 +2243,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--max-runs must be positive")
     if args.workers <= 0:
         raise SystemExit("--workers must be positive")
+    if args.parser_workers < 0:
+        raise SystemExit("--parser-workers must be non-negative")
     tokens = load_token_pool(args.tokens)
     fetcher: CIStreamFetcher | None = None
     try:
@@ -2108,6 +2265,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_member_bytes=args.max_member_bytes,
             max_uncompressed_bytes=args.max_uncompressed_bytes,
             max_members=args.max_members,
+            parser_workers=args.parser_workers,
         )
         result = fetcher.run(
             continuous=not args.once,

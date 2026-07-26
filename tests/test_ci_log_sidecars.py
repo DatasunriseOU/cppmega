@@ -18,6 +18,7 @@ from ci_log_sidecars import (  # noqa: E402
     DEDUPLICATION_SCHEMA,
     EDGE_IDS,
     SIDECAR_SCHEMA,
+    TRAINING_SIDECAR_SCHEMA,
     canonicalize_ci_log,
     extract_ci_log_sidecar,
     stable_json_dumps,
@@ -173,6 +174,53 @@ def test_cmake_ninja_gcc_cuda_success_sections_entities_and_edges() -> None:
     assert ninja_action["target"] == "cuda_app"
     assert ninja_action["source_inputs"] == ["src/kernel.cu"]
     assert ninja_action["outputs"] == ["build/cuda_app"]
+    training = next(
+        chunk["training_sidecars"]
+        for chunk in result["chunks"]
+        if any(
+            action["tool"] == "ninja"
+            for action in chunk["training_sidecars"]["build_actions"]
+        )
+    )
+    assert training["schema"] == TRAINING_SIDECAR_SCHEMA
+    assert {
+        edge["kind_id"] for edge in training["edges"]
+    } >= {
+        EDGE_IDS["BUILD_ACTION_INPUT"],
+        EDGE_IDS["BUILD_ACTION_OUTPUT"],
+        EDGE_IDS["BUILD_COMMAND_TARGET"],
+    }
+    assert all(
+        0 <= record["start_char"] < record["end_char"]
+        <= training["chunk_char_count"]
+        for records in (
+            training["entities"],
+            training["commands"],
+            training["build_actions"],
+        )
+        for record in records
+    )
+    assert all(
+        "training_sidecars" not in chunk
+        for chunk in sidecar["chunk_index"]
+    )
+    outbound_cross_chunk_edges = [
+        edge
+        for chunk in result["chunks"]
+        for edge in chunk["training_sidecars"]["cross_chunk_edges"]
+    ]
+    training_receipt = sidecar["evidence_accounting"]["training_sidecars"]
+    assert training_receipt["cross_chunk_edge_count"] == len(
+        outbound_cross_chunk_edges
+    )
+    assert all(
+        0
+        <= edge["from_char"]
+        < chunk["training_sidecars"]["chunk_char_count"]
+        and 0 <= edge["to_member_char"] < len(result["canonical_text"])
+        for chunk in result["chunks"]
+        for edge in chunk["training_sidecars"]["cross_chunk_edges"]
+    )
     assert "CUDA" in {item["name"] for item in classes["languages"]}
     assert classes["platform"]["os"]["value"] == "Linux"
     assert classes["platform"]["os_version"]["value"] == "24.04.4"
@@ -570,4 +618,16 @@ def test_high_cardinality_evidence_is_bounded_and_fully_digested() -> None:
         and span["domain_id"] == 1
         for span in last_source_chunk["domain_spans"]
     )
+    exhaustive_entities = last_source_chunk["training_sidecars"]["entities"]
+    assert any(
+        entity["role_id"] == 13
+        and last_source_chunk["text"][
+            entity["start_char"] : entity["end_char"]
+        ]
+        == "src/file_079.cpp"
+        for entity in exhaustive_entities
+    )
+    assert sidecar["evidence_accounting"]["training_sidecars"][
+        "entity_span_count"
+    ] > len(sidecar["entities"])
     _assert_conserved(result)

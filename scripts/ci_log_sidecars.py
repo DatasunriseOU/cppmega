@@ -28,6 +28,7 @@ from typing import Any
 CANONICALIZATION_SCHEMA = "github_actions_ci_log_canonical_v1"
 DEDUPLICATION_SCHEMA = "github_actions_ci_log_dedup_v1"
 SIDECAR_SCHEMA = "cppmega_ci_log_sidecar_v1"
+TRAINING_SIDECAR_SCHEMA = "cppmega_ci_chunk_training_sidecars_v1"
 BUILD_ACTION_NORMALIZATION_SCHEMA = "ci_build_action_shape_v1"
 DEFAULT_MAX_CHUNK_CHARS = 128_000
 MAX_AUDIT_SAMPLES = 8
@@ -1591,6 +1592,241 @@ class _EntityBuilder:
         return entities, edges, id_for_temp
 
 
+def _localized_training_record(
+    record: Mapping[str, Any],
+    *,
+    chunk_start: int,
+    chunk_end: int,
+    omitted_text_fields: frozenset[str] = frozenset(),
+) -> dict[str, Any] | None:
+    raw_start = record.get("start_char")
+    raw_end = record.get("end_char")
+    if (
+        isinstance(raw_start, bool)
+        or not isinstance(raw_start, int)
+        or isinstance(raw_end, bool)
+        or not isinstance(raw_end, int)
+        or raw_end <= chunk_start
+        or raw_start >= chunk_end
+    ):
+        return None
+    output = {
+        key: _json_safe(value)
+        for key, value in record.items()
+        if key not in omitted_text_fields
+    }
+    clipped_start = max(raw_start, chunk_start)
+    clipped_end = min(raw_end, chunk_end)
+    output["start_char"] = clipped_start - chunk_start
+    output["end_char"] = clipped_end - chunk_start
+    output["source_span_clipped"] = (
+        clipped_start != raw_start or clipped_end != raw_end
+    )
+    return output
+
+
+def _attach_chunk_training_sidecars(
+    chunks: Sequence[dict[str, Any]],
+    entities: Sequence[Mapping[str, Any]],
+    edges: Sequence[Mapping[str, Any]],
+    *,
+    commands: Sequence[Mapping[str, Any]],
+    build_actions: Sequence[Mapping[str, Any]],
+    tests: Sequence[Mapping[str, Any]],
+    diagnostics: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Attach exhaustive, token-projectable records to each payload chunk."""
+
+    total_entities = 0
+    total_edges = 0
+    total_cross_chunk_edge_references = 0
+    total_cross_chunk_edges = 0
+    total_actions = 0
+    total_tests = 0
+    total_diagnostics = 0
+    training_receipts: list[dict[str, Any]] = []
+
+    for chunk in chunks:
+        chunk_start = int(chunk["char_start"])
+        chunk_end = int(chunk["char_end"])
+        chunk_length = chunk_end - chunk_start
+        localized_entities: list[dict[str, Any]] = []
+        local_entity_ids: set[str] = set()
+        for entity in entities:
+            localized = _localized_training_record(
+                entity,
+                chunk_start=chunk_start,
+                chunk_end=chunk_end,
+                omitted_text_fields=frozenset({"text"}),
+            )
+            if localized is None:
+                continue
+            entity_id = str(entity["entity_id"])
+            local_entity_ids.add(entity_id)
+            localized_entities.append(localized)
+
+        localized_edges: list[dict[str, Any]] = []
+        crossing_edges: list[dict[str, Any]] = []
+        outbound_cross_chunk_edges: list[dict[str, Any]] = []
+        for edge in edges:
+            from_char = int(edge["from_char"])
+            to_char = int(edge["to_char"])
+            from_local = chunk_start <= from_char < chunk_end
+            to_local = chunk_start <= to_char < chunk_end
+            if from_local and to_local:
+                source = str(edge["source"])
+                target = str(edge["target"])
+                if source not in local_entity_ids or target not in local_entity_ids:
+                    raise AssertionError(
+                        "in-chunk training edge is missing an entity endpoint"
+                    )
+                localized_edges.append(
+                    {
+                        **{
+                            key: _json_safe(value)
+                            for key, value in edge.items()
+                            if key not in {"from_char", "to_char"}
+                        },
+                        "from_char": from_char - chunk_start,
+                        "to_char": to_char - chunk_start,
+                    }
+                )
+            elif from_local or to_local:
+                crossing_edges.append(
+                    {
+                        "edge_id": edge["edge_id"],
+                        "kind_id": int(edge["kind_id"]),
+                        "from_char": from_char,
+                        "to_char": to_char,
+                    }
+                )
+                if from_local:
+                    outbound_cross_chunk_edges.append(
+                        {
+                            **{
+                                key: _json_safe(value)
+                                for key, value in edge.items()
+                                if key not in {"from_char", "to_char"}
+                            },
+                            "from_char": from_char - chunk_start,
+                            "to_member_char": to_char,
+                            "target_coordinate_space": (
+                                "canonical_member_chars_v1"
+                            ),
+                        }
+                    )
+
+        localized_commands = [
+            localized
+            for record in commands
+            if (
+                localized := _localized_training_record(
+                    record,
+                    chunk_start=chunk_start,
+                    chunk_end=chunk_end,
+                    omitted_text_fields=frozenset({"text"}),
+                )
+            )
+            is not None
+        ]
+        localized_actions = [
+            localized
+            for record in build_actions
+            if (
+                localized := _localized_training_record(
+                    record,
+                    chunk_start=chunk_start,
+                    chunk_end=chunk_end,
+                    omitted_text_fields=frozenset({"command"}),
+                )
+            )
+            is not None
+        ]
+        localized_tests = [
+            localized
+            for record in tests
+            if (
+                localized := _localized_training_record(
+                    record,
+                    chunk_start=chunk_start,
+                    chunk_end=chunk_end,
+                )
+            )
+            is not None
+        ]
+        localized_diagnostics = [
+            localized
+            for record in diagnostics
+            if (
+                localized := _localized_training_record(
+                    record,
+                    chunk_start=chunk_start,
+                    chunk_end=chunk_end,
+                    omitted_text_fields=frozenset({"message"}),
+                )
+            )
+            is not None
+        ]
+
+        training = {
+            "schema": TRAINING_SIDECAR_SCHEMA,
+            "coordinate_space": "chunk_local_dedup_chars_v1",
+            "dedup_offsets_equal_canonical_offsets": True,
+            "chunk_char_count": chunk_length,
+            "entities": localized_entities,
+            "edges": localized_edges,
+            "commands": localized_commands,
+            "build_actions": localized_actions,
+            "tests": localized_tests,
+            "diagnostics": localized_diagnostics,
+            "cross_chunk_edges": outbound_cross_chunk_edges,
+            "cross_chunk_edge_accounting": {
+                "count": len(crossing_edges),
+                "outbound_count": len(outbound_cross_chunk_edges),
+                "sha256": _sequence_digest(crossing_edges),
+            },
+        }
+        if any(
+            not 0 <= int(record["start_char"]) < int(record["end_char"]) <= chunk_length
+            for records in (
+                localized_entities,
+                localized_commands,
+                localized_actions,
+                localized_tests,
+                localized_diagnostics,
+            )
+            for record in records
+        ):
+            raise AssertionError("training sidecar span is outside its chunk")
+        chunk["training_sidecars"] = training
+        total_entities += len(localized_entities)
+        total_edges += len(localized_edges)
+        total_cross_chunk_edge_references += len(crossing_edges)
+        total_cross_chunk_edges += len(outbound_cross_chunk_edges)
+        total_actions += len(localized_actions)
+        total_tests += len(localized_tests)
+        total_diagnostics += len(localized_diagnostics)
+        training_receipts.append(
+            {
+                "chunk_id": chunk["chunk_id"],
+                "sha256": _sha256_text(stable_json_dumps(training)),
+            }
+        )
+
+    return {
+        "schema": TRAINING_SIDECAR_SCHEMA,
+        "chunk_count": len(chunks),
+        "entity_span_count": total_entities,
+        "in_chunk_edge_count": total_edges,
+        "cross_chunk_edge_reference_count": total_cross_chunk_edge_references,
+        "cross_chunk_edge_count": total_cross_chunk_edges,
+        "build_action_count": total_actions,
+        "test_record_count": total_tests,
+        "diagnostic_record_count": total_diagnostics,
+        "chunk_sidecar_set_sha256": _sequence_digest(training_receipts),
+    }
+
+
 def _line_context(
     line: Mapping[str, Any],
     sections: Sequence[Mapping[str, Any]],
@@ -2274,7 +2510,8 @@ def _extract_build_actions(
     chunks: Sequence[Mapping[str, Any]],
     paths: Sequence[Mapping[str, Any]],
     provenance: Mapping[str, Any],
-) -> list[dict[str, Any]]:
+    builder: _EntityBuilder,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Extract bounded compile/link/archive/build actions from exact log lines."""
 
     paths_by_line: defaultdict[int, list[Mapping[str, Any]]] = defaultdict(list)
@@ -2406,6 +2643,77 @@ def _extract_build_actions(
             for source in source_inputs
             if (binding := _repo_source_binding(source, provenance)) is not None
         ]
+        action_domain = {
+            "cmake": "CMAKE",
+            "make": "MAKE",
+            "ninja": "NINJA",
+            "bazel": "BAZEL",
+            "meson": "MESON",
+            "autotools": "CONFIGURE",
+            "gn": "GN",
+            "scons": "SCONS",
+            "xmake": "XMAKE",
+            "msbuild": "BUILD_DIAGNOSTIC",
+        }.get(tool, "CPP" if kind == "compile" else "BUILD_DIAGNOSTIC")
+        action_entity_ref = builder.add(
+            kind="build_action",
+            role="COMMAND",
+            domain=action_domain,
+            start=action_start,
+            end=command_end,
+            confidence=0.98,
+            method=action_method,
+            line_index=int(line["index"]),
+            section_ordinal=section_ordinal,
+            step_ordinal=step_ordinal,
+            attributes={
+                "tool": tool,
+                "action_kind": kind,
+                "command_sha256": _sha256_text(command),
+            },
+        )
+        for path in paths_by_line[int(line["index"])]:
+            if int(path["start_char"]) < action_start:
+                continue
+            category = str(path.get("category") or "")
+            if category in {"source", "build", "shell"}:
+                builder.edge(
+                    action_entity_ref,
+                    path.get("entity_ref"),
+                    "BUILD_ACTION_INPUT",
+                    confidence=0.95,
+                    method="build_action_path_role_v1",
+                )
+            elif category == "output":
+                builder.edge(
+                    action_entity_ref,
+                    path.get("entity_ref"),
+                    "BUILD_ACTION_OUTPUT",
+                    confidence=0.95,
+                    method="build_action_path_role_v1",
+                )
+        for target_match in _target_matches(command):
+            target_value = target_match.group("target").rstrip(",;")
+            target_start = action_start + target_match.start("target")
+            target_ref = builder.add(
+                kind="build_target",
+                role="TARGET",
+                domain="BUILD_DIAGNOSTIC",
+                start=target_start,
+                end=target_start + len(target_value),
+                confidence=0.95,
+                method="build_action_explicit_target_v1",
+                line_index=int(line["index"]),
+                section_ordinal=section_ordinal,
+                step_ordinal=step_ordinal,
+            )
+            builder.edge(
+                action_entity_ref,
+                target_ref,
+                "BUILD_COMMAND_TARGET",
+                confidence=0.95,
+                method="build_action_explicit_target_v1",
+            )
         raw_actions.append(
             {
                 "normalization_schema": BUILD_ACTION_NORMALIZATION_SCHEMA,
@@ -2418,10 +2726,10 @@ def _extract_build_actions(
                 "action_shape_sha256": _sha256_text(shape),
                 "flags": flags,
                 "all_flags_sha256": flags_sha256,
-                "source_inputs": source_inputs[:8],
+                "source_inputs": source_inputs,
                 "source_input_count": len(source_inputs),
                 "all_source_inputs_sha256": _sequence_digest(source_inputs),
-                "outputs": outputs[:8],
+                "outputs": outputs,
                 "output_count": len(outputs),
                 "all_outputs_sha256": _sequence_digest(outputs),
                 "target": (
@@ -2432,8 +2740,9 @@ def _extract_build_actions(
                     else None
                 ),
                 "cwd": inline_cwd or current_cwd,
-                "repository_source_bindings": bindings[:8],
+                "repository_source_bindings": bindings,
                 "repository_source_binding_count": len(bindings),
+                "action_entity_ref": action_entity_ref,
                 "start_char": action_start,
                 "end_char": command_end,
                 "line_index": int(line["index"]),
@@ -2459,6 +2768,11 @@ def _extract_build_actions(
     aggregated: list[dict[str, Any]] = []
     for _key, actions in groups.items():
         representative = dict(actions[0])
+        representative["source_inputs"] = representative["source_inputs"][:8]
+        representative["outputs"] = representative["outputs"][:8]
+        representative["repository_source_bindings"] = representative[
+            "repository_source_bindings"
+        ][:8]
         representative["occurrence_count"] = len(actions)
         evidence = []
         for sample in _bounded_samples(
@@ -2487,7 +2801,7 @@ def _extract_build_actions(
         _clip_evidence_field(representative, "command")
         _clip_evidence_field(representative, "action_shape")
         aggregated.append(representative)
-    return aggregated
+    return aggregated, raw_actions
 
 
 def _duration_ms(value: str, unit: str) -> float:
@@ -3971,12 +4285,13 @@ def canonicalize_ci_log(
         lines, sections, builder, commands
     )
     targets = _extract_targets(commands, paths, builder)
-    build_actions = _extract_build_actions(
+    build_actions, raw_build_actions = _extract_build_actions(
         lines,
         sections,
         chunks,
         paths,
         provenance,
+        builder,
     )
     tests, test_summaries = _extract_tests(
         lines, sections, builder, commands
@@ -3986,6 +4301,21 @@ def canonicalize_ci_log(
     )
     raw_entities, raw_edges, id_for_temp = builder.finish()
     _attach_chunk_semantic_rle(chunks, raw_entities)
+    training_accounting = _attach_chunk_training_sidecars(
+        chunks,
+        raw_entities,
+        raw_edges,
+        commands=_replace_entity_refs(commands, id_for_temp),
+        build_actions=_replace_entity_refs(raw_build_actions, id_for_temp),
+        tests=_replace_entity_refs(tests, id_for_temp),
+        diagnostics=_replace_entity_refs(diagnostics, id_for_temp),
+    )
+    for chunk in chunks:
+        training_sidecars = chunk["training_sidecars"]
+        if _secret_candidates(stable_json_dumps(training_sidecars)):
+            raise ValueError(
+                "chunk training sidecars retained a secret-like value"
+            )
 
     classifications: dict[str, Any] = {
         "shell_dialects": shell_dialects,
@@ -4116,6 +4446,7 @@ def canonicalize_ci_log(
         "evidence_accounting": {
             "graph": graph_accounting,
             "classifications": classification_accounting,
+            "training_sidecars": training_accounting,
         },
         "section_index": _compact_section_index(sections),
         "chunk_index": [
@@ -4128,6 +4459,7 @@ def canonicalize_ci_log(
                     "canonical_text",
                     "role_spans",
                     "domain_spans",
+                    "training_sidecars",
                 }
             }
             for chunk in chunks
@@ -4181,6 +4513,7 @@ __all__ = [
     "EDGE_IDS",
     "ROLE_IDS",
     "SIDECAR_SCHEMA",
+    "TRAINING_SIDECAR_SCHEMA",
     "canonicalize_ci_log",
     "canonicalize_job_log",
     "extract_ci_log_sidecar",

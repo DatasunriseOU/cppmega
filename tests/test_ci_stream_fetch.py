@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import Path
 import sqlite3
+import threading
 from typing import Any, Mapping
 import zipfile
 import zlib
@@ -376,8 +377,97 @@ def test_rescue_terminal_410_is_proven_and_never_downloaded(tmp_path: Path) -> N
             410,
             hashlib.sha256(body).hexdigest(),
         )
-        # Jobs metadata is still captured before accepting the rescue proof.
-        assert len(github.api_headers) == 1
+        # A durable rescue proof avoids spending a GitHub API request on a
+        # log archive that is already known to be irretrievably expired.
+        assert github.api_headers == []
         assert github.signed_url is None
+    finally:
+        fetcher.close()
+
+
+def test_rolling_scheduler_refills_a_slot_before_a_slow_attempt_finishes() -> None:
+    release_slow = threading.Event()
+    third_started = threading.Event()
+    attempts = iter([1, 2, 3])
+
+    class State:
+        def discover(self) -> None:
+            return None
+
+        def next_attempt(self) -> int | None:
+            return next(attempts, None)
+
+    class Store:
+        @staticmethod
+        def status() -> dict[str, object]:
+            return {"counters": {"exact_unique_payload_tokens": 0}}
+
+    fetcher = object.__new__(ci.CIStreamFetcher)
+    fetcher.state = State()
+    fetcher.store = Store()
+    fetcher.target_unique_tokens = 1_000_000
+    fetcher.sleeper = lambda _: None
+    fetcher.write_progress = lambda: {"status": "ok"}
+
+    def process(attempt: int) -> None:
+        if attempt == 1:
+            assert release_slow.wait(2), (
+                "scheduler waited for the whole fixed wave"
+            )
+        elif attempt == 3:
+            third_started.set()
+            release_slow.set()
+
+    fetcher.process_attempt = process
+    result = fetcher.run(
+        continuous=False,
+        max_runs=3,
+        workers=2,
+    )
+
+    assert result == {"status": "ok"}
+    assert third_started.is_set()
+
+
+def test_spawned_parser_worker_emits_full_training_sidecars(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path / "inventory.sqlite", 1)
+    tokenizer = _tokenizer(tmp_path / "tokenizer.json")
+    github = FakeGitHub(
+        _zip_bytes(
+            {
+                "0_build.txt": (
+                    b"[command]ninja -C build app src/a.cpp -o build/app\n"
+                )
+            }
+        )
+    )
+    fetcher = ci.CIStreamFetcher(
+        inventory_path=inventory,
+        state_path=tmp_path / "fetch.sqlite",
+        content_store_path=tmp_path / "store",
+        tokenizer_path=tokenizer,
+        tokens=["api-secret"],
+        progress_path=tmp_path / "progress.json",
+        receipt_path=tmp_path / "receipt.json",
+        requester=github.request,
+        archive_downloader=github.download,
+        target_unique_tokens=1_000_000,
+        parser_workers=2,
+        sleeper=lambda _: None,
+    )
+    try:
+        progress = fetcher.run(
+            continuous=False,
+            max_runs=1,
+            workers=1,
+        )
+        assert progress["fetch"]["attempt_statuses"] == {"done": 1}
+        occurrence = next(fetcher.store.iter_occurrences())
+        training = occurrence["provenance"]["chunk"]["training_sidecars"]
+        assert training["schema"] == "cppmega_ci_chunk_training_sidecars_v1"
+        assert training["build_actions"]
+        assert training["edges"]
     finally:
         fetcher.close()
