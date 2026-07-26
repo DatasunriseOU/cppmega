@@ -563,6 +563,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     args = build_arg_parser().parse_args(raw_argv)
     args.run_id = _validate_run_id(args.run_id)
+    output_root = args.output_root.expanduser().absolute()
+    if args.require_empty_output_root:
+        _require_empty_output_root(output_root)
     if not isinstance(args.megatron_commit, str) or re.fullmatch(
         r"[0-9a-f]{40}(?:[0-9a-f]{24})?", args.megatron_commit
     ) is None:
@@ -578,9 +581,6 @@ def main(argv: Iterable[str] | None = None) -> int:
         raise ValueError(
             "hash jobs must be positive and free-space headroom nonnegative"
         )
-    output_root = args.output_root.expanduser().absolute()
-    if args.require_empty_output_root:
-        _require_empty_output_root(output_root)
     _load_env_file(args.env_file)
     env = _s3_env()
     prefix = args.prefix.strip("/")

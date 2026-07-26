@@ -346,7 +346,7 @@ def test_h200_graph_preflight_contract_rejects_tensor_only_without_gpu(tmp_path)
         "CPPMEGA_GRAPH_ROUTES_ENABLED": "0",
         "CPPMEGA_GRAPH_ROUTES_ABLATION": "1",
     }
-    with pytest.raises(ValueError, match="requires CPPMEGA_GRAPH_ROUTES_ENABLED=1"):
+    with pytest.raises(ValueError, match="forbids explicit graph-route ablation"):
         validate_runtime_graph_contract(
             graph_contract,
             environment=tensor_only,

@@ -16,6 +16,7 @@ from cppmega.megatron.graph_recipe import (
 )
 from cppmega.megatron.objective_contract import (
     GRAPH_ELIGIBILITY_RECEIPT_SCHEMA,
+    OBJECTIVE_REALIZATION_RECEIPT_SCHEMA,
     LOSS_MASK_ALIGNMENT_SOURCE_TOKEN_PREDICTS_NEXT_V1,
     OBJECTIVE_CONTRACT_SCHEMA,
     OBJECTIVE_IDS,
@@ -64,6 +65,16 @@ def _source_selection_receipt() -> dict[str, object]:
                 "source_index": index,
                 "source_pool_index": index,
                 "task": task,
+                "realization": {
+                    "schema": OBJECTIVE_REALIZATION_RECEIPT_SCHEMA,
+                    "task": task,
+                    "selected_packet_index": 0,
+                    "example_sha256": hashlib.sha256(
+                        f"{index}:{task}".encode("ascii")
+                    ).hexdigest(),
+                    "input_tokens": 3,
+                    "loss_tokens": 2,
+                },
                 "graph_eligibility": {
                     "schema": GRAPH_ELIGIBILITY_RECEIPT_SCHEMA,
                     "objective": task,
@@ -82,6 +93,7 @@ def _source_selection_receipt() -> dict[str, object]:
         "start_step": 0,
         "output_samples": len(TASKS),
         "source_pool_samples": len(TASKS),
+        "source_pool_source_indices": list(range(len(TASKS))),
         "source_rows_consumed": len(TASKS),
         "selected_source_indices": list(range(len(TASKS))),
         "task_counts": {task: 1 for task in TASKS},
@@ -393,6 +405,30 @@ def test_contract_requires_explicit_commit_graph_ineligibility_receipt() -> None
     contract["source_selection"] = source_selection
 
     with pytest.raises(ValueError, match="commit objectives without exact route maps"):
+        validate_objective_contract(contract)
+
+
+def test_contract_rejects_source_pool_binding_drift() -> None:
+    contract = _valid_contract()
+    source_selection = _source_selection_receipt()
+    window = source_selection["windows"][0]  # type: ignore[index]
+    window["source_pool_source_indices"][:2] = [1, 0]
+    _refresh_source_selection_digest(source_selection)
+    contract["source_selection"] = source_selection
+
+    with pytest.raises(ValueError, match="source pool binding drifted"):
+        validate_objective_contract(contract)
+
+
+def test_contract_rejects_objective_realization_drift() -> None:
+    contract = _valid_contract()
+    source_selection = _source_selection_receipt()
+    assignments = source_selection["windows"][0]["assignments"]  # type: ignore[index]
+    assignments[0]["realization"]["task"] = "fim"
+    _refresh_source_selection_digest(source_selection)
+    contract["source_selection"] = source_selection
+
+    with pytest.raises(ValueError, match="realization.task differs"):
         validate_objective_contract(contract)
 
 

@@ -98,6 +98,7 @@ OBJECTIVE_SCHEDULE_ALGORITHM = (
     "bounded_eligibility_bipartite_graph_capability_v1"
 )
 GRAPH_ELIGIBILITY_RECEIPT_SCHEMA = "cppmega_objective_graph_eligibility_v1"
+OBJECTIVE_REALIZATION_RECEIPT_SCHEMA = "cppmega_objective_realization_v1"
 
 _EXPECTED_TYPED_SOURCES = {
     "ifim_instruction": "ifim_instruction_token_ids",
@@ -282,6 +283,51 @@ def _validate_graph_eligibility_receipt(
     return eligible, positive_edges
 
 
+def _validate_objective_realization_receipt(
+    raw_receipt: object,
+    *,
+    task: str,
+    where: str,
+) -> None:
+    receipt = _mapping(raw_receipt, where=where)
+    expected_keys = {
+        "schema",
+        "task",
+        "selected_packet_index",
+        "example_sha256",
+        "input_tokens",
+        "loss_tokens",
+    }
+    if set(receipt) != expected_keys:
+        raise ValueError(f"{where} keys are invalid")
+    if receipt.get("schema") != OBJECTIVE_REALIZATION_RECEIPT_SCHEMA:
+        raise ValueError(f"{where}.schema is invalid")
+    if receipt.get("task") != task:
+        raise ValueError(f"{where}.task differs from its assignment")
+    _positive_int(
+        receipt.get("selected_packet_index"),
+        where=f"{where}.selected_packet_index",
+        allow_zero=True,
+    )
+    digest = receipt.get("example_sha256")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise ValueError(f"{where}.example_sha256 is invalid")
+    _positive_int(
+        receipt.get("input_tokens"),
+        where=f"{where}.input_tokens",
+        allow_zero=True,
+    )
+    _positive_int(
+        receipt.get("loss_tokens"),
+        where=f"{where}.loss_tokens",
+        allow_zero=True,
+    )
+
+
 def validate_objective_source_selection(
     raw_receipt: object,
     *,
@@ -376,6 +422,7 @@ def validate_objective_source_selection(
         "start_step",
         "output_samples",
         "source_pool_samples",
+        "source_pool_source_indices",
         "source_rows_consumed",
         "selected_source_indices",
         "task_counts",
@@ -387,6 +434,7 @@ def validate_objective_source_selection(
         "source_index",
         "source_pool_index",
         "task",
+        "realization",
         "graph_eligibility",
     }
     selected_sources: set[int] = set()
@@ -410,12 +458,32 @@ def validate_objective_source_selection(
         )
         if not quota_window_samples <= pool_samples <= max_pool:
             raise ValueError(f"{where}.source_pool_samples is outside its bound")
+        raw_pool_source_indices = window.get("source_pool_source_indices")
+        if (
+            not isinstance(raw_pool_source_indices, list)
+            or len(raw_pool_source_indices) != pool_samples
+        ):
+            raise ValueError(f"{where}.source_pool_source_indices is invalid")
+        pool_source_indices = [
+            _positive_int(
+                source_index,
+                where=f"{where}.source_pool_source_indices",
+                allow_zero=True,
+            )
+            for source_index in raw_pool_source_indices
+        ]
+        if len(set(pool_source_indices)) != len(pool_source_indices):
+            raise ValueError(f"{where}.source_pool_source_indices reuses a source row")
         window_consumed = _positive_int(
             window.get("source_rows_consumed"),
             where=f"{where}.source_rows_consumed",
         )
         if not previous_consumed <= window_consumed <= consumed:
             raise ValueError(f"{where}.source_rows_consumed is not monotonic")
+        if any(source_index >= window_consumed for source_index in pool_source_indices):
+            raise ValueError(
+                f"{where}.source_pool_source_indices is ahead of the consumed cursor"
+            )
         previous_consumed = window_consumed
         assignments = window.get("assignments")
         if not isinstance(assignments, list) or len(assignments) != quota_window_samples:
@@ -457,6 +525,13 @@ def validate_objective_source_selection(
             )
             if pool_index >= pool_samples:
                 raise ValueError(f"{where} assignment pool index is invalid")
+            if source_indices[assignment_index] != pool_source_indices[pool_index]:
+                raise ValueError(f"{where} assignment source pool binding drifted")
+            _validate_objective_realization_receipt(
+                row.get("realization"),
+                task=str(row.get("task")),
+                where=f"{where}.assignments[{assignment_index}].realization",
+            )
             eligible, edges = _validate_graph_eligibility_receipt(
                 row.get("graph_eligibility"),
                 task=str(row.get("task")),
@@ -1322,6 +1397,7 @@ __all__ = [
     "OBJECTIVE_SOURCE_SELECTION_SCHEMA",
     "OBJECTIVE_IDS",
     "OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA",
+    "OBJECTIVE_REALIZATION_RECEIPT_SCHEMA",
     "LEGACY_OBJECTIVE_MATERIALIZATION_ARTIFACT_SCHEMA",
     "OBJECTIVE_TOKEN_SIDE_CHANNELS",
     "ObjectiveMaterializationArtifact",
