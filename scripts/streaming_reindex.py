@@ -676,29 +676,21 @@ def _mark_source_cache_complete(repo_dir: Path, repo: str) -> None:
 
 
 def _copy_tar_member_file(src, target: Path, *, repo: str, member_name: str) -> bool:
-    """Copy a tar file member, explicitly skipping legacy file/dir conflicts.
-
-    Some old source archives contain path-type collisions, for example a
-    directory and a regular file at the same path. Blocking the whole corpus on
-    that single path is worse than losing one impossible-to-materialize member,
-    but the skip must be visible in logs.
-    """
+    """Copy one tar member without silently dropping path-type collisions."""
     if target.exists() and target.is_dir():
-        print(
-            f"WARN {repo}: skip tar file {member_name!r}; target path is already "
-            f"a directory: {target}",
-            file=sys.stderr,
-            flush=True,
+        raise RepoFailure(
+            repo,
+            "stream",
+            f"tar member {member_name!r} collides with an existing directory "
+            f"at {target}; refusing to drop source content",
         )
-        return False
     if target.parent.exists() and not target.parent.is_dir():
-        print(
-            f"WARN {repo}: skip tar file {member_name!r}; parent path is not a "
-            f"directory: {target.parent}",
-            file=sys.stderr,
-            flush=True,
+        raise RepoFailure(
+            repo,
+            "stream",
+            f"tar member {member_name!r} has a non-directory parent "
+            f"{target.parent}; refusing to drop source content",
         )
-        return False
     target.parent.mkdir(parents=True, exist_ok=True)
     with open(target, "wb") as out:
         shutil.copyfileobj(src, out)

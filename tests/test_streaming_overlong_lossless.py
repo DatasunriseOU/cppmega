@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 
@@ -57,6 +58,21 @@ def test_empty_index_log_rejects_lossy_build_receipt() -> None:
     )
 
     assert sr._classify_empty_index_project_log(log) == "domain_source_loss"
+
+
+def test_tar_member_path_collision_fails_instead_of_dropping_source(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "occupied"
+    target.mkdir()
+
+    with pytest.raises(sr.RepoFailure, match="refusing to drop source content"):
+        sr._copy_tar_member_file(
+            io.BytesIO(b"preserve me"),
+            target,
+            repo="owner/repo",
+            member_name="cpp_all/owner/repo/occupied",
+        )
 
 
 def _aligned_overlong_doc() -> dict:
