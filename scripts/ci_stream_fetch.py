@@ -179,6 +179,16 @@ class ArchiveSource:
 
 
 @dataclass(frozen=True)
+class PreparedArchive:
+    repository: str
+    run_id: int
+    attempt: int
+    source: str
+    inline_body: bytes | None
+    signed_url: str | None
+
+
+@dataclass(frozen=True)
 class RequestResult:
     status: int
     headers: Mapping[str, str]
@@ -841,6 +851,7 @@ class FetchState:
         tokenizer: ExactTokenizer,
         resume: bool,
         allow_fetcher_script_upgrade_from_sha256: str | None = None,
+        fetcher_script_upgrade_reason: str | None = None,
     ):
         self.path = Path(path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -891,6 +902,27 @@ class FetchState:
                     "fetcher script binding upgrade source must be a "
                     "lowercase SHA-256"
                 )
+            if (
+                fetcher_script_upgrade_reason is None
+                or not fetcher_script_upgrade_reason.strip()
+                or fetcher_script_upgrade_reason != (
+                    fetcher_script_upgrade_reason.strip()
+                )
+                or len(fetcher_script_upgrade_reason) > 200
+                or any(
+                    ord(character) < 0x20 or ord(character) == 0x7F
+                    for character in fetcher_script_upgrade_reason
+                )
+            ):
+                raise ValueError(
+                    "fetcher script binding upgrade reason must be 1-200 "
+                    "printable characters without surrounding whitespace"
+                )
+        elif fetcher_script_upgrade_reason is not None:
+            raise ValueError(
+                "fetcher script binding upgrade reason requires an "
+                "authorized source SHA-256"
+            )
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
             try:
@@ -946,10 +978,7 @@ class FetchState:
                             (
                                 previous_script_sha256,
                                 next_script_sha256,
-                                (
-                                    "signed archive incomplete transport "
-                                    "is retryable"
-                                ),
+                                fetcher_script_upgrade_reason,
                                 _utc_now(),
                             ),
                         )
@@ -1497,6 +1526,50 @@ class FetchState:
                 self._connection.execute("ROLLBACK")
                 raise
 
+    def replayed_member(
+        self,
+        attempt: Attempt,
+        *,
+        archive_member: str,
+        job_key: str,
+        raw_sha256: str,
+        raw_size: int,
+    ) -> tuple[int, int] | None:
+        """Return durable member totals only after exact replay validation."""
+
+        with self._lock:
+            previous = self._connection.execute(
+                """
+                SELECT job_key,raw_sha256,raw_size,
+                       chunk_count,occurrence_tokens
+                FROM members
+                WHERE repo=? AND run_id=? AND attempt=?
+                  AND archive_member=?
+                """,
+                (
+                    attempt.repo,
+                    attempt.run_id,
+                    attempt.attempt,
+                    archive_member,
+                ),
+            ).fetchone()
+        if previous is None:
+            return None
+        expected = (job_key, raw_sha256, raw_size)
+        actual = (
+            str(previous["job_key"]),
+            str(previous["raw_sha256"]),
+            int(previous["raw_size"]),
+        )
+        if actual != expected:
+            raise BindingError(
+                f"committed member replay changed: {archive_member}"
+            )
+        return (
+            int(previous["chunk_count"]),
+            int(previous["occurrence_tokens"]),
+        )
+
     def finish_attempt(
         self,
         attempt: Attempt,
@@ -1955,7 +2028,7 @@ class GitHubAttemptClient:
             )
         return jobs
 
-    def fetch_archive(self, attempt: Attempt, destination: Path) -> ArchiveSource:
+    def prepare_archive(self, attempt: Attempt) -> PreparedArchive:
         repository = _repository_identity(attempt).canonical
         endpoint = (
             f"/repos/{repository}/actions/runs/{attempt.run_id}/"
@@ -1971,16 +2044,13 @@ class GitHubAttemptClient:
         if result.status == 200:
             if len(result.body) > self.max_archive_bytes:
                 raise ArchiveError("inline archive exceeds byte limit")
-            with destination.open("xb") as output:
-                output.write(result.body)
-                output.flush()
-                os.fsync(output.fileno())
-            return ArchiveSource(
-                path=destination,
+            return PreparedArchive(
+                repository=repository,
+                run_id=attempt.run_id,
+                attempt=attempt.attempt,
                 source="github-inline",
-                raw_sha256=_sha256_bytes(result.body),
-                raw_size=len(result.body),
-                recoverable=False,
+                inline_body=result.body,
+                signed_url=None,
             )
         location = None
         for key, value in result.headers.items():
@@ -1991,8 +2061,61 @@ class GitHubAttemptClient:
             raise MalformedResponseError(
                 "attempt-log redirect lacks Location"
             )
+        return PreparedArchive(
+            repository=repository,
+            run_id=attempt.run_id,
+            attempt=attempt.attempt,
+            source="github-signed-url",
+            inline_body=None,
+            signed_url=location,
+        )
+
+    def fetch_archive(
+        self,
+        attempt: Attempt,
+        destination: Path,
+        *,
+        prepared: PreparedArchive | None = None,
+    ) -> ArchiveSource:
+        archive = (
+            self.prepare_archive(attempt)
+            if prepared is None
+            else prepared
+        )
+        if (
+            archive.repository != _repository_identity(attempt).canonical
+            or archive.run_id != attempt.run_id
+            or archive.attempt != attempt.attempt
+        ):
+            raise BindingError(
+                "prepared archive does not match the requested attempt"
+            )
+        if archive.source == "github-inline":
+            if archive.inline_body is None or archive.signed_url is not None:
+                raise BindingError("inline archive preparation is invalid")
+            if len(archive.inline_body) > self.max_archive_bytes:
+                raise ArchiveError("inline archive exceeds byte limit")
+            with destination.open("xb") as output:
+                output.write(archive.inline_body)
+                output.flush()
+                os.fsync(output.fileno())
+            return ArchiveSource(
+                path=destination,
+                source="github-inline",
+                raw_sha256=_sha256_bytes(archive.inline_body),
+                raw_size=len(archive.inline_body),
+                recoverable=False,
+            )
+        if (
+            archive.source != "github-signed-url"
+            or archive.inline_body is not None
+            or archive.signed_url is None
+        ):
+            raise BindingError(
+                "signed archive preparation is invalid"
+            )
         size, digest = self.archive_downloader(
-            location,
+            archive.signed_url,
             destination,
             timeout=self.timeout,
             max_bytes=self.max_archive_bytes,
@@ -2279,6 +2402,7 @@ class CIStreamFetcher:
         work_path: str | os.PathLike[str] | None = None,
         resume: bool = False,
         allow_fetcher_script_upgrade_from_sha256: str | None = None,
+        fetcher_script_upgrade_reason: str | None = None,
         target_unique_tokens: int = DEFAULT_TARGET,
         max_chunk_chars: int = DEFAULT_MAX_CHUNK_CHARS,
         max_archive_bytes: int = DEFAULT_MAX_ARCHIVE_BYTES,
@@ -2328,6 +2452,7 @@ class CIStreamFetcher:
             allow_fetcher_script_upgrade_from_sha256=(
                 allow_fetcher_script_upgrade_from_sha256
             ),
+            fetcher_script_upgrade_reason=fetcher_script_upgrade_reason,
         )
         self.store = CIContentStore(content_store_path)
         self.client = GitHubAttemptClient(
@@ -2403,6 +2528,15 @@ class CIStreamFetcher:
             f"{job_id if isinstance(job_id, int) else 'unresolved'}:"
             f"{info.filename}"
         )
+        replayed = self.state.replayed_member(
+            attempt,
+            archive_member=info.filename,
+            job_key=job_key,
+            raw_sha256=raw_sha,
+            raw_size=len(raw),
+        )
+        if replayed is not None:
+            return replayed
         repository_identity = _repository_identity(attempt)
         metadata: dict[str, object] = dict(attempt.run_metadata)
         metadata.update(
@@ -2598,12 +2732,18 @@ class CIStreamFetcher:
                     attempt,
                     exact_metadata,
                 )
-            jobs = self.client.fetch_jobs(attempt)
             if isinstance(rescued, ArchiveSource):
                 archive = rescued
+                jobs = self.client.fetch_jobs(attempt)
             else:
                 temporary = self._temp_archive_path(attempt)
-                archive = self.client.fetch_archive(attempt, temporary)
+                prepared = self.client.prepare_archive(attempt)
+                jobs = self.client.fetch_jobs(attempt)
+                archive = self.client.fetch_archive(
+                    attempt,
+                    temporary,
+                    prepared=prepared,
+                )
             if archive.raw_size > self.max_archive_bytes:
                 raise ArchiveError("archive exceeds configured byte limit")
             if archive.path.stat().st_size != archive.raw_size:
@@ -2840,6 +2980,13 @@ def _build_parser() -> argparse.ArgumentParser:
             "previous fetcher script SHA-256"
         ),
     )
+    parser.add_argument(
+        "--fetcher-script-upgrade-reason",
+        help=(
+            "required printable audit reason for an explicitly authorized "
+            "fetcher script migration"
+        ),
+    )
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--max-runs", type=int)
     parser.add_argument("--workers", type=int, default=4)
@@ -2906,6 +3053,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             resume=args.resume,
             allow_fetcher_script_upgrade_from_sha256=(
                 args.allow_fetcher_script_upgrade_from_sha256
+            ),
+            fetcher_script_upgrade_reason=(
+                args.fetcher_script_upgrade_reason
             ),
             target_unique_tokens=args.target_exact_unique_payload_tokens,
             max_chunk_chars=args.max_chunk_chars,

@@ -226,7 +226,7 @@ def test_fetch_state_script_binding_upgrade_is_explicit_and_audited(
             tokenizer=tokenizer,
             resume=True,
         )
-    with pytest.raises(ci.BindingError, match="fetcher_script_sha256"):
+    with pytest.raises(ValueError, match="upgrade reason"):
         ci.FetchState(
             state_path,
             inventory_path=inventory,
@@ -235,7 +235,18 @@ def test_fetch_state_script_binding_upgrade_is_explicit_and_audited(
             resume=True,
             allow_fetcher_script_upgrade_from_sha256="b" * 64,
         )
+    with pytest.raises(ci.BindingError, match="fetcher_script_sha256"):
+        ci.FetchState(
+            state_path,
+            inventory_path=inventory,
+            content_store_path=store_path,
+            tokenizer=tokenizer,
+            resume=True,
+            allow_fetcher_script_upgrade_from_sha256="b" * 64,
+            fetcher_script_upgrade_reason="test wrong source binding",
+        )
 
+    reason = "skip terminal jobs requests and replay committed members"
     upgraded = ci.FetchState(
         state_path,
         inventory_path=inventory,
@@ -243,6 +254,7 @@ def test_fetch_state_script_binding_upgrade_is_explicit_and_audited(
         tokenizer=tokenizer,
         resume=True,
         allow_fetcher_script_upgrade_from_sha256=previous_sha256,
+        fetcher_script_upgrade_reason=reason,
     )
     try:
         assert upgraded._connection.execute(
@@ -256,9 +268,7 @@ def test_fetch_state_script_binding_upgrade_is_explicit_and_audited(
                 "binding_key": "fetcher_script_sha256",
                 "from_sha256": previous_sha256,
                 "to_sha256": ci._script_sha256(),
-                "reason": (
-                    "signed archive incomplete transport is retryable"
-                ),
+                "reason": reason,
                 "upgraded_at": upgraded._connection.execute(
                     "SELECT upgraded_at FROM binding_upgrades"
                 ).fetchone()[0],
@@ -525,8 +535,10 @@ class FakeGitHub:
         archive: bytes,
         *,
         attempt_metadata: Mapping[int, Mapping[str, object]] | None = None,
+        log_status: int = 302,
     ):
         self.archive = archive
+        self.log_status = log_status
         self.attempt_metadata = {
             int(attempt): dict(value)
             for attempt, value in (attempt_metadata or {}).items()
@@ -573,6 +585,21 @@ class FakeGitHub:
             }
             return ci.HTTPResponse(200, {}, json.dumps(body).encode())
         if url.endswith("/logs"):
+            if self.log_status in {404, 410}:
+                return ci.HTTPResponse(
+                    self.log_status,
+                    {},
+                    json.dumps(
+                        {
+                            "message": (
+                                "Not Found"
+                                if self.log_status == 404
+                                else "Gone"
+                            )
+                        }
+                    ).encode(),
+                )
+            assert self.log_status == 302
             return ci.HTTPResponse(
                 302,
                 {
@@ -598,6 +625,38 @@ class FakeGitHub:
         self.signed_url = url
         destination.write_bytes(self.archive)
         return len(self.archive), hashlib.sha256(self.archive).hexdigest()
+
+
+def test_terminal_log_probe_does_not_spend_a_jobs_request(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path / "inventory.sqlite", 1)
+    github = FakeGitHub(_zip_bytes(), log_status=410)
+    fetcher = ci.CIStreamFetcher(
+        inventory_path=inventory,
+        state_path=tmp_path / "fetch.sqlite",
+        content_store_path=tmp_path / "store",
+        tokenizer_path=_tokenizer(tmp_path / "tokenizer.json"),
+        tokens=["api-secret"],
+        progress_path=tmp_path / "progress.json",
+        receipt_path=tmp_path / "receipt.json",
+        parser=_fake_parser,
+        requester=github.request,
+        archive_downloader=github.download,
+        target_unique_tokens=1_000_000,
+        sleeper=lambda _: None,
+    )
+    try:
+        fetcher.run(continuous=False, max_runs=1)
+        assert any(url.endswith("/logs") for url in github.api_urls)
+        assert not any("/jobs?" in url for url in github.api_urls)
+        row = fetcher.state._connection.execute(
+            "SELECT status,terminal_http_status FROM attempts"
+        ).fetchone()
+        assert tuple(row) == ("terminal_410", 410)
+        assert github.signed_url is None
+    finally:
+        fetcher.close()
 
 
 def test_full_attempt_streams_through_parser_tokenizer_and_cas_idempotently(
@@ -670,6 +729,86 @@ def test_full_attempt_streams_through_parser_tokenizer_and_cas_idempotently(
     try:
         resumed.run(continuous=False)
         assert resumed.store.status()["counters"]["occurrence_count"] == 1
+    finally:
+        resumed.close()
+
+
+def test_retry_validates_and_skips_a_committed_member(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path / "inventory.sqlite", 1)
+    tokenizer = _tokenizer(tmp_path / "tokenizer.json")
+    github = FakeGitHub(_zip_bytes())
+    state_path = tmp_path / "fetch.sqlite"
+    store_path = tmp_path / "store"
+    parser_calls: list[str] = []
+
+    def counting_parser(
+        raw: bytes,
+        metadata: Mapping[str, object],
+        *,
+        max_chunk_chars: int,
+    ) -> dict[str, object]:
+        parser_calls.append(str(metadata["archive_member"]))
+        return _fake_parser(
+            raw,
+            metadata,
+            max_chunk_chars=max_chunk_chars,
+        )
+
+    first = ci.CIStreamFetcher(
+        inventory_path=inventory,
+        state_path=state_path,
+        content_store_path=store_path,
+        tokenizer_path=tokenizer,
+        tokens=["api-secret"],
+        progress_path=tmp_path / "progress.json",
+        receipt_path=tmp_path / "receipt.json",
+        parser=counting_parser,
+        requester=github.request,
+        archive_downloader=github.download,
+        target_unique_tokens=1_000_000,
+        sleeper=lambda _: None,
+    )
+    try:
+        first.run(continuous=False, max_runs=1)
+        assert parser_calls == ["0_build.txt"]
+    finally:
+        first.close()
+
+    with sqlite3.connect(state_path) as connection:
+        connection.execute(
+            """
+            UPDATE attempts SET
+              status='retry',
+              error_class='SyntheticInterruptedAttempt',
+              error_message='test replay'
+            """
+        )
+
+    resumed = ci.CIStreamFetcher(
+        inventory_path=inventory,
+        state_path=state_path,
+        content_store_path=store_path,
+        tokenizer_path=tokenizer,
+        tokens=["api-secret"],
+        progress_path=tmp_path / "progress.json",
+        receipt_path=tmp_path / "receipt.json",
+        parser=counting_parser,
+        requester=github.request,
+        archive_downloader=github.download,
+        target_unique_tokens=1_000_000,
+        resume=True,
+        sleeper=lambda _: None,
+    )
+    try:
+        resumed.run(continuous=False, max_runs=1)
+        assert parser_calls == ["0_build.txt"]
+        assert resumed.store.status()["counters"]["occurrence_count"] == 1
+        row = resumed.state._connection.execute(
+            "SELECT status,tries FROM attempts"
+        ).fetchone()
+        assert tuple(row) == ("done", 2)
     finally:
         resumed.close()
 
