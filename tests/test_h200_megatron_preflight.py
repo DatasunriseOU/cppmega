@@ -125,6 +125,40 @@ def test_portable_profile_accepts_node_id_and_pytest_option_value(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_portable_profile_skips_explicit_native_toolchain_test(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    environment["CPPMEGA_TEST_PROFILE"] = "portable-data"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-ra",
+            (
+                "tests/test_nebius_h200_megatron_cpp_generation_eval.py"
+                "::test_actual_parser_defaults_require_stable_project_identity"
+            ),
+            "--basetemp",
+            str(tmp_path / "pytest-base"),
+        ],
+        cwd=repo_root,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "1 skipped" in output
+    assert "libclang or a local C/C++ compiler" in output
+
+
 def test_explicit_megatron_root_without_receipt_requires_exact_commit(
     tmp_path: Path,
 ) -> None:

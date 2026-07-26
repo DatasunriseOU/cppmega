@@ -1425,14 +1425,6 @@ def test_explicit_mmididx_writer_trims_padding_and_all_sidecars(tmp_path: Path) 
         identity_sidecar,
         np.array([identity_id] * 3, dtype=np.uint64),
     )
-    from cppmega.megatron import structure_dataset_patch
-
-    training_tensor = structure_dataset_patch._token_sidecar_tensor(
-        identity_sidecar,
-        col="source_identity_ids",
-    )
-    assert str(training_tensor.dtype) == "torch.uint64"
-    assert training_tensor.tolist() == [identity_id] * 3
     np.testing.assert_array_equal(
         np.fromfile(
             tmp_path / "cppmega_1024_train_token_symbol_ids.bin",

@@ -29,6 +29,7 @@ _DEFAULT_SOURCE_ROOTS = (
 _ENVIRONMENT_MANIFEST = "cppmega-environment.json"
 _ENVIRONMENT_SCHEMA = 1
 _PORTABLE_TEST_PROFILE = "portable-data"
+_NATIVE_TOOLCHAIN_MARKER = "native_toolchain"
 _EXPLICIT_SOURCE_COMMIT_ENV = "CPPMEGA_MEGATRON_COMMIT"
 _PORTABLE_TEST_ALLOWLIST = frozenset(
     {
@@ -383,7 +384,7 @@ def _portable_profile_requested(
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Enforce the portable allowlist after pytest has parsed its CLI."""
+    """Enforce the portable allowlist and its explicit dependency boundary."""
     if not _portable_profile_requested():
         return
     selected: list[str] = []
@@ -407,6 +408,15 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             "portable-data profile refuses non-portable tests: "
             + ", ".join(disallowed)
         )
+    native_toolchain_skip = pytest.mark.skip(
+        reason=(
+            "portable-data profile excludes tests that require libclang "
+            "or a local C/C++ compiler"
+        )
+    )
+    for item in items:
+        if item.get_closest_marker(_NATIVE_TOOLCHAIN_MARKER) is not None:
+            item.add_marker(native_toolchain_skip)
 
 
 MEGATRON_SOURCE_ROOT = (
