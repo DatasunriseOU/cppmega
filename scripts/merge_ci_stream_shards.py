@@ -14,10 +14,12 @@ and their external source-ID maps commit together through an attached SQLite
 transaction.  The destination fetch-state itself remains the exact standard
 v3 schema; merge maps and progress never leak into that schema.
 
-This v1 implementation intentionally requires every shard to use a
-byte-identical frozen inventory.  Divergent inventories fail closed instead
-of pretending that concatenating inventory window proofs would produce a
-valid inventory.
+One completed full inventory is the publication anchor.  Additional inputs
+may either name the same byte-identical completed inventory or use the exact
+``cppmega_ci_inventory_time_shard_v1`` projection produced for time-sharded
+fetching.  A time shard is accepted only after every run row is proven
+byte-for-byte identical to the anchor; it need not cover its whole declared
+time window.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ import signal
 import shutil
 import sqlite3
 import stat
+import struct
 import sys
 from types import SimpleNamespace
 from typing import Any, Iterable, Iterator, Mapping, Sequence, cast
@@ -63,6 +66,8 @@ from scripts.ci_stream_inventory import (  # noqa: E402
     InventoryError,
     RECEIPT_SCHEMA as INVENTORY_RECEIPT_SCHEMA,
     _SCHEMA_SQL as INVENTORY_SQL,
+    format_utc_instant,
+    parse_utc_instant,
 )
 from scripts.export_ci_content_store_case5 import (  # noqa: E402
     ExportError,
@@ -84,6 +89,8 @@ REQUEST_MAP_SCHEMA = "cppmega_ci_stream_request_id_map_v1"
 BINDING_MAP_SCHEMA = "cppmega_ci_stream_binding_id_map_v1"
 ATTEMPT_MAP_SCHEMA = "cppmega_ci_stream_attempt_resolution_v1"
 MEMBER_MAP_SCHEMA = "cppmega_ci_stream_member_resolution_v1"
+TIME_SHARD_INVENTORY_SCHEMA = "cppmega_ci_inventory_time_shard_v1"
+INVENTORY_BINDING_SCHEMA = "cppmega_ci_stream_union_inventory_binding_v1"
 
 _INVENTORY_NAME = "inventory.sqlite3"
 _INVENTORY_RECEIPT_NAME = "inventory_receipt.json"
@@ -146,6 +153,35 @@ _ATTEMPT_COLUMNS = (
     "updated_at",
 )
 _ATTEMPT_KEY = ("repo", "run_id", "attempt")
+_INVENTORY_RUN_COLUMNS = (
+    "repo_key",
+    "run_id",
+    "run_attempt",
+    "created_at",
+    "updated_at",
+    "run_started_at",
+    "status",
+    "conclusion",
+    "workflow_id",
+    "workflow_name",
+    "event",
+    "head_branch",
+    "head_sha",
+    "run_number",
+    "html_url",
+    "api_url",
+    "metadata_blob",
+    "metadata_sha256",
+    "first_seen_at",
+)
+_TIME_SHARD_META_KEYS = {
+    "schema",
+    "source_inventory_path",
+    "created_at",
+    "created_at_gte",
+    "created_at_lt",
+    "run_count",
+}
 _ATTEMPT_IMMUTABLE_EVIDENCE = (
     "repo",
     "run_id",
@@ -292,6 +328,13 @@ class FileDescriptor:
 
 
 @dataclass(frozen=True)
+class InventoryDescriptor:
+    path: Path
+    sha256: str
+    receipt: ReceiptDescriptor | None
+
+
+@dataclass(frozen=True)
 class StoreDescriptor:
     path: Path
     artifact_set_sha256: str
@@ -304,7 +347,7 @@ class ShardSpec:
     original_inventory: str
     original_store: str
     original_state: str
-    inventory: FileDescriptor
+    inventory: InventoryDescriptor
     store: StoreDescriptor
     state: FileDescriptor
 
@@ -338,7 +381,9 @@ class SourceAudit:
     spec: ShardSpec
     store_receipt: dict[str, Any]
     fetch_receipt: dict[str, Any]
-    inventory_receipt: dict[str, Any]
+    inventory_receipt: dict[str, Any] | None
+    inventory_role: str
+    inventory_proof: dict[str, Any]
     store_files: tuple[SnapshotFile, ...]
     state_file: SnapshotFile
     inventory_file: SnapshotFile
@@ -346,6 +391,12 @@ class SourceAudit:
     state_binding: dict[str, Any]
     store_counts: dict[str, int]
     state_counts: dict[str, int]
+
+
+@dataclass(frozen=True)
+class InventoryContract:
+    anchor: SourceAudit
+    binding: dict[str, Any]
 
 
 def _utc_now() -> str:
@@ -482,6 +533,28 @@ def _file_descriptor(value: object, *, where: str) -> FileDescriptor:
         path=_local_path(item["path"], where=f"{where}.path"),
         sha256=_require_hex64(item["sha256"], where=f"{where}.sha256"),
         receipt=_receipt_descriptor(item["receipt"], where=f"{where}.receipt"),
+    )
+
+
+def _inventory_descriptor(
+    value: object,
+    *,
+    where: str,
+) -> InventoryDescriptor:
+    item = _require_mapping(value, where=where)
+    if set(item) not in ({"path", "sha256"}, {"path", "sha256", "receipt"}):
+        raise MergeError(
+            f"{where} keys differ; expected path/sha256 with an optional receipt"
+        )
+    raw_receipt = item.get("receipt")
+    return InventoryDescriptor(
+        path=_local_path(item["path"], where=f"{where}.path"),
+        sha256=_require_hex64(item["sha256"], where=f"{where}.sha256"),
+        receipt=(
+            None
+            if raw_receipt is None
+            else _receipt_descriptor(raw_receipt, where=f"{where}.receipt")
+        ),
     )
 
 
@@ -638,7 +711,7 @@ def load_manifest(path: str | os.PathLike[str]) -> Manifest:
                     originals["fetch_state"],
                     where=f"{where}.original_paths.fetch_state",
                 ),
-                inventory=_file_descriptor(
+                inventory=_inventory_descriptor(
                     staged["inventory"],
                     where=f"{where}.staged.inventory",
                 ),
@@ -655,35 +728,36 @@ def load_manifest(path: str | os.PathLike[str]) -> Manifest:
     shard_ids = [shard.shard_id for shard in shards]
     if shard_ids != sorted(shard_ids) or len(set(shard_ids)) != len(shard_ids):
         raise MergeError("shards must be uniquely sorted by canonical id")
-    staged_paths: list[Path] = []
-    for shard in shards:
-        staged_paths.extend(
-            (
-                shard.inventory.path,
-                shard.inventory.receipt.path,
-                shard.store.path,
-                shard.store.receipt.path,
-                shard.state.path,
-                shard.state.receipt.path,
-            )
+    inventory_paths = [shard.inventory.path for shard in shards]
+    inventory_receipt_paths = [
+        shard.inventory.receipt.path
+        for shard in shards
+        if shard.inventory.receipt is not None
+    ]
+    exclusive_paths = [
+        path
+        for shard in shards
+        for path in (
+            shard.store.path,
+            shard.store.receipt.path,
+            shard.state.path,
+            shard.state.receipt.path,
         )
-    if len({str(item) for item in staged_paths}) != len(staged_paths):
-        # A shared frozen inventory is intentionally allowed.
-        non_inventory_paths = [
-            path
-            for shard in shards
-            for path in (
-                shard.inventory.receipt.path,
-                shard.store.path,
-                shard.store.receipt.path,
-                shard.state.path,
-                shard.state.receipt.path,
-            )
-        ]
-        if len({str(item) for item in non_inventory_paths}) != len(
-            non_inventory_paths
-        ):
-            raise MergeError("non-inventory staged artifact paths must be distinct")
+    ]
+    if len({str(item) for item in exclusive_paths}) != len(exclusive_paths):
+        raise MergeError("non-inventory staged artifact paths must be distinct")
+    inventory_artifact_paths = {
+        str(path) for path in (*inventory_paths, *inventory_receipt_paths)
+    }
+    if len(inventory_artifact_paths) != (
+        len({str(path) for path in inventory_paths})
+        + len({str(path) for path in inventory_receipt_paths})
+    ):
+        raise MergeError(
+            "an inventory database path cannot also be an inventory receipt path"
+        )
+    if inventory_artifact_paths & {str(path) for path in exclusive_paths}:
+        raise MergeError("inventory and non-inventory staged paths overlap")
     return Manifest(
         path=manifest_path,
         sha256=_sha256_bytes(raw),
@@ -1066,11 +1140,21 @@ def _verify_cas_fetch_join(
 
 
 def _snapshot_receipts(spec: ShardSpec) -> tuple[SnapshotFile, ...]:
-    return (
-        _snapshot_file(spec.inventory.receipt.path, label="inventory receipt"),
-        _snapshot_file(spec.store.receipt.path, label="store receipt"),
-        _snapshot_file(spec.state.receipt.path, label="fetch receipt"),
+    snapshots: list[SnapshotFile] = []
+    if spec.inventory.receipt is not None:
+        snapshots.append(
+            _snapshot_file(
+                spec.inventory.receipt.path,
+                label="inventory receipt",
+            )
+        )
+    snapshots.extend(
+        (
+            _snapshot_file(spec.store.receipt.path, label="store receipt"),
+            _snapshot_file(spec.state.receipt.path, label="fetch receipt"),
+        )
     )
+    return tuple(snapshots)
 
 
 def _integer_counts(value: Mapping[str, Any], fields: Sequence[str]) -> dict[str, int]:
@@ -1083,6 +1167,395 @@ def _integer_counts(value: Mapping[str, Any], fields: Sequence[str]) -> dict[str
     return result
 
 
+_TIME_SHARD_SQL = """
+CREATE TABLE runs (
+    repo_key TEXT NOT NULL,
+    run_id INTEGER NOT NULL,
+    run_attempt INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT,
+    run_started_at TEXT,
+    status TEXT,
+    conclusion TEXT,
+    workflow_id INTEGER,
+    workflow_name TEXT,
+    event TEXT,
+    head_branch TEXT,
+    head_sha TEXT,
+    run_number INTEGER,
+    html_url TEXT,
+    api_url TEXT,
+    metadata_blob BLOB NOT NULL,
+    metadata_sha256 TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    PRIMARY KEY(repo_key, run_id, run_attempt)
+);
+CREATE INDEX idx_runs_created
+    ON runs(repo_key, created_at, run_id, run_attempt);
+CREATE TABLE shard_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"""
+
+
+def _normalized_sql(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())
+
+
+def _time_shard_schema_contract(
+    connection: sqlite3.Connection,
+) -> dict[str, Any]:
+    objects = [
+        [str(row["type"]), str(row["name"]), str(row["tbl_name"])]
+        for row in connection.execute(
+            """
+            SELECT type,name,tbl_name
+            FROM sqlite_schema
+            WHERE name NOT LIKE 'sqlite_%'
+            ORDER BY type,name
+            """
+        )
+    ]
+    tables: dict[str, list[list[object]]] = {}
+    foreign_keys: dict[str, list[list[object]]] = {}
+    for table in ("runs", "shard_meta"):
+        tables[table] = [
+            [
+                int(row["cid"]),
+                str(row["name"]),
+                str(row["type"]),
+                int(row["notnull"]),
+                row["dflt_value"],
+                int(row["pk"]),
+            ]
+            for row in connection.execute(f"PRAGMA table_info({table})")
+        ]
+        foreign_keys[table] = [
+            list(row)
+            for row in connection.execute(f"PRAGMA foreign_key_list({table})")
+        ]
+    indexes = [
+        [
+            int(row["seqno"]),
+            int(row["cid"]),
+            None if row["name"] is None else str(row["name"]),
+            int(row["desc"]),
+            str(row["coll"]),
+            int(row["key"]),
+        ]
+        for row in connection.execute("PRAGMA index_xinfo(idx_runs_created)")
+    ]
+    sql = {
+        str(row["name"]): _normalized_sql(row["sql"])
+        for row in connection.execute(
+            """
+            SELECT name,sql FROM sqlite_schema
+            WHERE name IN ('runs','idx_runs_created','shard_meta')
+            ORDER BY name
+            """
+        )
+    }
+    return {
+        "objects": objects,
+        "tables": tables,
+        "foreign_keys": foreign_keys,
+        "idx_runs_created": indexes,
+        "sql": sql,
+    }
+
+
+def _expected_time_shard_schema_contract() -> dict[str, Any]:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.executescript(_TIME_SHARD_SQL)
+        return _time_shard_schema_contract(connection)
+    finally:
+        connection.close()
+
+
+def _canonical_utc(value: object, *, where: str) -> tuple[str, int]:
+    raw = _require_string(value, where=where)
+    try:
+        epoch = parse_utc_instant(raw)
+    except ValueError as exc:
+        raise MergeError(f"{where} is not a valid UTC instant: {exc}") from exc
+    if format_utc_instant(epoch) != raw:
+        raise MergeError(f"{where} must use canonical second-precision UTC form")
+    return raw, epoch
+
+
+def _inventory_row_hash_record(row: sqlite3.Row) -> list[object]:
+    values: list[object] = []
+    for column in _INVENTORY_RUN_COLUMNS:
+        value = row[column]
+        if column == "metadata_blob":
+            if not isinstance(value, bytes):
+                raise MergeError("inventory metadata_blob is not a SQLite BLOB")
+            values.append(
+                {
+                    "byte_size": len(value),
+                    "sha256": _sha256_bytes(value),
+                }
+            )
+        else:
+            values.append(value)
+    return values
+
+
+def _record_digest(domain: str) -> Any:
+    digest = hashlib.sha256()
+    digest.update(domain.encode("ascii"))
+    digest.update(b"\0")
+    return digest
+
+
+def _update_record_digest(digest: Any, record: object) -> None:
+    encoded = _canonical_json_bytes(record)
+    digest.update(struct.pack(">Q", len(encoded)))
+    digest.update(encoded)
+
+
+def _bounded_zlib_decode(
+    blob: bytes,
+    *,
+    max_blob_bytes: int,
+    where: str,
+) -> bytes:
+    decompressor = zlib.decompressobj()
+    try:
+        raw = decompressor.decompress(blob, max_blob_bytes + 1)
+        if len(raw) > max_blob_bytes or decompressor.unconsumed_tail:
+            raise MergeError(f"{where} exceeds its decoded bound")
+        raw += decompressor.flush(max_blob_bytes + 1 - len(raw))
+    except zlib.error as exc:
+        raise MergeError(f"{where} is invalid zlib") from exc
+    if (
+        len(raw) > max_blob_bytes
+        or not decompressor.eof
+        or decompressor.unused_data
+        or decompressor.unconsumed_tail
+    ):
+        raise MergeError(f"{where} is invalid or exceeds its decoded bound")
+    return raw
+
+
+def _validate_inventory_run_rows(
+    connection: sqlite3.Connection,
+    manifest: Manifest,
+    *,
+    label: str,
+) -> tuple[int, str]:
+    count = 0
+    digest = _record_digest("cppmega-ci-inventory-run-rows-v1")
+    columns = ",".join(_INVENTORY_RUN_COLUMNS)
+    for row in connection.execute(
+        f"""
+        SELECT {columns}
+        FROM runs
+        ORDER BY repo_key,run_id,run_attempt
+        """
+    ):
+        key = f"{row['repo_key']}/{row['run_id']}/{row['run_attempt']}"
+        blob = row["metadata_blob"]
+        if not isinstance(blob, bytes):
+            raise MergeError(f"{label} inventory metadata is not a BLOB: {key}")
+        if len(blob) > manifest.limits.max_state_blob_bytes:
+            raise MergeError(f"{label} inventory metadata BLOB exceeds its bound: {key}")
+        raw = _bounded_zlib_decode(
+            blob,
+            max_blob_bytes=manifest.limits.max_state_blob_bytes,
+            where=f"{label} inventory metadata",
+        )
+        if _sha256_bytes(raw) != row["metadata_sha256"]:
+            raise MergeError(f"{label} inventory metadata digest mismatch: {key}")
+        _update_record_digest(digest, _inventory_row_hash_record(row))
+        count += 1
+    return count, digest.hexdigest()
+
+
+def _validate_time_shard_inventory(
+    connection: sqlite3.Connection,
+    manifest: Manifest,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    schema_contract = _time_shard_schema_contract(connection)
+    if schema_contract != _expected_time_shard_schema_contract():
+        raise MergeError(f"{label} time-shard inventory schema is not exact v1")
+    meta_count = int(
+        connection.execute("SELECT COUNT(*) FROM shard_meta").fetchone()[0]
+    )
+    if meta_count != len(_TIME_SHARD_META_KEYS):
+        raise MergeError(
+            f"{label} time-shard metadata has {meta_count} rows; "
+            f"expected {len(_TIME_SHARD_META_KEYS)}"
+        )
+    oversized_meta = connection.execute(
+        """
+        SELECT key FROM shard_meta
+        WHERE length(CAST(key AS BLOB)) > ?
+           OR length(CAST(value AS BLOB)) > ?
+        LIMIT 1
+        """,
+        (
+            manifest.limits.max_state_blob_bytes,
+            manifest.limits.max_state_blob_bytes,
+        ),
+    ).fetchone()
+    if oversized_meta is not None:
+        raise MergeError(f"{label} time-shard metadata exceeds its bound")
+    meta: dict[str, str] = {}
+    for row in connection.execute(
+        "SELECT key,value FROM shard_meta ORDER BY key"
+    ):
+        key = str(row["key"])
+        if key in meta:
+            raise MergeError(f"{label} time-shard metadata has a duplicate key")
+        meta[key] = str(row["value"])
+    if set(meta) != _TIME_SHARD_META_KEYS:
+        raise MergeError(
+            f"{label} time-shard metadata keys differ; "
+            f"missing={sorted(_TIME_SHARD_META_KEYS - set(meta))}, "
+            f"extra={sorted(set(meta) - _TIME_SHARD_META_KEYS)}"
+        )
+    if meta["schema"] != TIME_SHARD_INVENTORY_SCHEMA:
+        raise MergeError(f"{label} time-shard metadata schema is not v1")
+    source_inventory_path = _original_path(
+        meta["source_inventory_path"],
+        where=f"{label} shard_meta.source_inventory_path",
+    )
+    created_at, _created_epoch = _canonical_utc(
+        meta["created_at"],
+        where=f"{label} shard_meta.created_at",
+    )
+    created_at_gte, lower = _canonical_utc(
+        meta["created_at_gte"],
+        where=f"{label} shard_meta.created_at_gte",
+    )
+    created_at_lt, upper = _canonical_utc(
+        meta["created_at_lt"],
+        where=f"{label} shard_meta.created_at_lt",
+    )
+    if lower >= upper:
+        raise MergeError(f"{label} time-shard bounds are empty or reversed")
+    raw_count = meta["run_count"]
+    if (
+        len(raw_count) > 19
+        or re.fullmatch(r"0|[1-9][0-9]*", raw_count) is None
+    ):
+        raise MergeError(f"{label} time-shard run_count is not canonical")
+    declared_count = int(raw_count)
+    if declared_count > 0x7FFF_FFFF_FFFF_FFFF:
+        raise MergeError(f"{label} time-shard run_count exceeds SQLite bounds")
+    run_count, logical_sha256 = _validate_inventory_run_rows(
+        connection,
+        manifest,
+        label=label,
+    )
+    if run_count != declared_count:
+        raise MergeError(f"{label} time-shard run_count differs from its rows")
+    for row in connection.execute(
+        """
+        SELECT repo_key,run_id,run_attempt,created_at
+        FROM runs ORDER BY repo_key,run_id,run_attempt
+        """
+    ):
+        _raw_created, created_epoch = _canonical_utc(
+            row["created_at"],
+            where=(
+                f"{label} run {row['repo_key']}/{row['run_id']}/"
+                f"{row['run_attempt']} created_at"
+            ),
+        )
+        if not lower <= created_epoch < upper:
+            raise MergeError(f"{label} time-shard run lies outside its bounds")
+    return {
+        "schema": TIME_SHARD_INVENTORY_SCHEMA,
+        "sqlite_schema_sha256": _sqlite_schema_sha256(connection),
+        "sqlite_schema_contract_sha256": _sha256_bytes(
+            _canonical_json_bytes(schema_contract)
+        ),
+        "source_inventory_path": source_inventory_path,
+        "created_at": created_at,
+        "created_at_gte": created_at_gte,
+        "created_at_lt": created_at_lt,
+        "run_count": run_count,
+        "run_rows_logical_sha256": logical_sha256,
+    }
+
+
+def _verify_state_inventory_join(
+    inventory: sqlite3.Connection,
+    state: sqlite3.Connection,
+    *,
+    label: str,
+    max_blob_bytes: int,
+) -> tuple[int, str]:
+    joined = 0
+    digest = _record_digest("cppmega-ci-fetch-state-inventory-join-v1")
+    for row in state.execute(
+        """
+        SELECT repo,run_id,attempt,run_metadata_sha256,
+               run_metadata_raw_size,run_metadata_zlib,
+               run_metadata_source,run_metadata_source_attempt,
+               inventory_seed_attempt,inventory_seed_metadata_sha256
+        FROM attempts ORDER BY repo,run_id,attempt
+        """
+    ):
+        seed = inventory.execute(
+            """
+            SELECT metadata_blob,metadata_sha256
+            FROM runs
+            WHERE repo_key=? AND run_id=? AND run_attempt=?
+            """,
+            (
+                str(row["repo"]),
+                int(row["run_id"]),
+                int(row["inventory_seed_attempt"]),
+            ),
+        ).fetchone()
+        key = f"{row['repo']}/{row['run_id']}/{row['attempt']}"
+        if seed is None:
+            raise MergeError(f"{label} fetch-state attempt lacks an inventory seed: {key}")
+        if row["inventory_seed_metadata_sha256"] != seed["metadata_sha256"]:
+            raise MergeError(f"{label} fetch-state inventory seed binding differs: {key}")
+        if row["run_metadata_source"] == "inventory-run-list":
+            inventory_raw = _bounded_zlib_decode(
+                bytes(seed["metadata_blob"]),
+                max_blob_bytes=max_blob_bytes,
+                where=f"{label} inventory seed metadata",
+            )
+            state_raw = _bounded_zlib_decode(
+                bytes(row["run_metadata_zlib"]),
+                max_blob_bytes=max_blob_bytes,
+                where=f"{label} fetch-state run metadata",
+            )
+            if (
+                int(row["run_metadata_source_attempt"])
+                != int(row["inventory_seed_attempt"])
+                or row["run_metadata_sha256"] != seed["metadata_sha256"]
+                or int(row["run_metadata_raw_size"]) != len(inventory_raw)
+                or _sha256_bytes(state_raw) != row["run_metadata_sha256"]
+                or state_raw != inventory_raw
+            ):
+                raise MergeError(
+                    f"{label} fetch-state inventory metadata binding differs: {key}"
+                )
+        _update_record_digest(
+            digest,
+            [
+                str(row["repo"]),
+                int(row["run_id"]),
+                int(row["attempt"]),
+                int(row["inventory_seed_attempt"]),
+                str(row["inventory_seed_metadata_sha256"]),
+            ],
+        )
+        joined += 1
+    return joined, digest.hexdigest()
+
+
 def _preflight_source(
     manifest: Manifest,
     spec: ShardSpec,
@@ -1090,22 +1563,24 @@ def _preflight_source(
     scratch_directory: Path,
 ) -> SourceAudit:
     receipt_files = _snapshot_receipts(spec)
-    for snapshot, descriptor, label in (
+    receipt_descriptors: list[tuple[ReceiptDescriptor, str]] = []
+    if spec.inventory.receipt is not None:
+        receipt_descriptors.append(
+            (
+                spec.inventory.receipt,
+                f"{spec.shard_id} inventory receipt",
+            )
+        )
+    receipt_descriptors.extend(
         (
-            receipt_files[0],
-            spec.inventory.receipt,
-            f"{spec.shard_id} inventory receipt",
-        ),
-        (
-            receipt_files[1],
-            spec.store.receipt,
-            f"{spec.shard_id} store receipt",
-        ),
-        (
-            receipt_files[2],
-            spec.state.receipt,
-            f"{spec.shard_id} fetch receipt",
-        ),
+            (spec.store.receipt, f"{spec.shard_id} store receipt"),
+            (spec.state.receipt, f"{spec.shard_id} fetch receipt"),
+        )
+    )
+    for snapshot, (descriptor, label) in zip(
+        receipt_files,
+        receipt_descriptors,
+        strict=True,
     ):
         if snapshot.sha256 != descriptor.sha256:
             raise MergeError(f"{label} SHA-256 differs from the manifest")
@@ -1141,66 +1616,45 @@ def _preflight_source(
             )
         if inventory_connection.execute("PRAGMA foreign_key_check").fetchall():
             raise MergeError(f"{spec.shard_id} inventory foreign_key_check failed")
-        if (
-            _sqlite_schema_sha256(inventory_connection)
-            != _expected_inventory_schema_sha256()
-        ):
-            raise MergeError(f"{spec.shard_id} inventory schema is not canonical v2")
-        for row in inventory_connection.execute(
-            """
-            SELECT repo_key,run_id,run_attempt,metadata_blob
-            FROM runs
-            WHERE length(metadata_blob) > ?
-               OR length(metadata_blob) IS NULL
-            LIMIT 1
-            """,
-            (manifest.limits.max_state_blob_bytes,),
-        ):
-            raise MergeError(
-                f"{spec.shard_id} inventory metadata BLOB exceeds its bound: "
-                f"{row['repo_key']}/{row['run_id']}/{row['run_attempt']}"
+        schema_sha256 = _sqlite_schema_sha256(inventory_connection)
+        if schema_sha256 == _expected_inventory_schema_sha256():
+            if spec.inventory.receipt is None:
+                raise MergeError(
+                    f"{spec.shard_id} completed anchor candidate lacks its receipt"
+                )
+            run_count, rows_sha256 = _validate_inventory_run_rows(
+                inventory_connection,
+                manifest,
+                label=spec.shard_id,
             )
-        for row in inventory_connection.execute(
-            """
-            SELECT repo_key,run_id,run_attempt,metadata_blob
-            FROM runs ORDER BY repo_key,run_id,run_attempt
-            """
-        ):
-            compressed = bytes(row["metadata_blob"])
-            decompressor = zlib.decompressobj()
-            try:
-                raw = decompressor.decompress(
-                    compressed,
-                    manifest.limits.max_state_blob_bytes + 1,
-                )
-                if (
-                    len(raw) > manifest.limits.max_state_blob_bytes
-                    or decompressor.unconsumed_tail
-                ):
-                    raise MergeError(
-                        f"{spec.shard_id} inventory metadata exceeds its decoded bound"
-                    )
-                raw += decompressor.flush(
-                    manifest.limits.max_state_blob_bytes + 1 - len(raw)
-                )
-            except zlib.error as exc:
+            inventory_role = "anchor_candidate"
+            inventory_proof = {
+                "schema": INVENTORY_RECEIPT_SCHEMA,
+                "sqlite_schema_sha256": schema_sha256,
+                "run_count": run_count,
+                "run_rows_logical_sha256": rows_sha256,
+            }
+        else:
+            if spec.inventory.receipt is not None:
                 raise MergeError(
-                    f"{spec.shard_id} inventory metadata is invalid zlib"
-                ) from exc
-            if (
-                len(raw) > manifest.limits.max_state_blob_bytes
-                or not decompressor.eof
-                or decompressor.unused_data
-                or decompressor.unconsumed_tail
-            ):
-                raise MergeError(
-                    f"{spec.shard_id} inventory metadata exceeds its decoded bound"
+                    f"{spec.shard_id} non-anchor inventory must not claim "
+                    "an anchor completion receipt"
                 )
+            inventory_role = "exact_subset_candidate"
+            inventory_proof = _validate_time_shard_inventory(
+                inventory_connection,
+                manifest,
+                label=spec.shard_id,
+            )
     finally:
         inventory_connection.close()
-    inventory_receipt = _load_bound_receipt(
-        spec.inventory.receipt,
-        where=f"{spec.shard_id} inventory receipt",
+    inventory_receipt = (
+        None
+        if spec.inventory.receipt is None
+        else _load_bound_receipt(
+            spec.inventory.receipt,
+            where=f"{spec.shard_id} inventory receipt",
+        )
     )
     store_receipt_declared = _load_bound_receipt(
         spec.store.receipt,
@@ -1210,12 +1664,31 @@ def _preflight_source(
         spec.state.receipt,
         where=f"{spec.shard_id} fetch receipt",
     )
-    if (
-        inventory_receipt.get("schema") != INVENTORY_RECEIPT_SCHEMA
-        or inventory_receipt.get("database") != spec.original_inventory
-    ):
-        raise MergeError(
-            f"{spec.shard_id} inventory receipt does not bind its original path"
+    if inventory_role == "anchor_candidate":
+        assert inventory_receipt is not None
+        if (
+            inventory_receipt.get("schema") != INVENTORY_RECEIPT_SCHEMA
+            or inventory_receipt.get("database") != spec.original_inventory
+        ):
+            raise MergeError(
+                f"{spec.shard_id} inventory receipt does not bind its original path"
+            )
+        try:
+            computed_inventory_receipt = InventoryDB(
+                spec.inventory.path
+            ).completion_receipt()
+        except (InventoryError, OSError, ValueError, sqlite3.Error) as exc:
+            raise MergeError(
+                f"{spec.shard_id} anchor completion proof is invalid"
+            ) from exc
+        if _inventory_logical_projection(
+            computed_inventory_receipt
+        ) != _inventory_logical_projection(inventory_receipt):
+            raise MergeError(
+                f"{spec.shard_id} anchor completion receipt differs from SQLite"
+            )
+        inventory_proof["completion_receipt_sha256"] = (
+            spec.inventory.receipt.sha256
         )
     if fetch_receipt.get("schema") != FETCH_RECEIPT_SCHEMA:
         raise MergeError(f"{spec.shard_id} fetch receipt schema is not v3")
@@ -1406,6 +1879,23 @@ def _preflight_source(
                 / f"{spec.shard_id}-source-coverage.sqlite3",
                 limits=manifest.limits,
             )
+            source_inventory = sqlite3.connect(
+                f"{spec.inventory.path.as_uri()}?mode=ro&immutable=1",
+                uri=True,
+            )
+            source_inventory.row_factory = sqlite3.Row
+            try:
+                (
+                    inventory_join_count,
+                    inventory_join_sha256,
+                ) = _verify_state_inventory_join(
+                    source_inventory,
+                    state.connection,
+                    label=spec.shard_id,
+                    max_blob_bytes=manifest.limits.max_state_blob_bytes,
+                )
+            finally:
+                source_inventory.close()
             state.require_unchanged()
             state_counts = {
                 "attempts": int(
@@ -1435,7 +1925,15 @@ def _preflight_source(
                     ).fetchone()[0]
                 ),
                 "joined_occurrences": join_count,
+                "inventory_joined_attempts": inventory_join_count,
             }
+            if inventory_join_count != state_counts["attempts"]:
+                raise MergeError(
+                    f"{spec.shard_id} inventory join did not cover every attempt"
+                )
+            inventory_proof["source_state_join_sha256"] = (
+                inventory_join_sha256
+            )
             state_binding = state.receipt_binding()
         store.require_unchanged()
         counters = cast(Mapping[str, Any], store.receipt["counters"])
@@ -1464,6 +1962,8 @@ def _preflight_source(
         store_receipt=store_receipt_declared,
         fetch_receipt=fetch_receipt,
         inventory_receipt=inventory_receipt,
+        inventory_role=inventory_role,
+        inventory_proof=inventory_proof,
         store_files=store_files,
         state_file=state_file,
         inventory_file=inventory_file,
@@ -1492,12 +1992,181 @@ def _expected_inventory_schema_sha256() -> str:
         connection.close()
 
 
+def _sqlite_values_byte_identical(left: object, right: object) -> bool:
+    if isinstance(left, memoryview):
+        left = left.tobytes()
+    if isinstance(right, memoryview):
+        right = right.tobytes()
+    return type(left) is type(right) and left == right
+
+
+def _prove_exact_subset(
+    subset: SourceAudit,
+    anchor: SourceAudit,
+) -> dict[str, Any]:
+    if (
+        subset.inventory_proof["source_inventory_path"]
+        != anchor.spec.original_inventory
+    ):
+        raise MergeError(
+            f"{subset.spec.shard_id} time-shard source_inventory_path "
+            "does not bind the selected anchor original path"
+        )
+    assert anchor.inventory_receipt is not None
+    anchor_interval = _require_mapping(
+        anchor.inventory_receipt.get("interval"),
+        where="anchor completion receipt interval",
+    )
+    _require_exact_keys(
+        anchor_interval,
+        {"start", "end", "semantics"},
+        where="anchor completion receipt interval",
+    )
+    if anchor_interval["semantics"] != "[start,end)":
+        raise MergeError("anchor completion receipt interval semantics differ")
+    _anchor_start, anchor_lower = _canonical_utc(
+        anchor_interval["start"],
+        where="anchor completion receipt interval.start",
+    )
+    _anchor_end, anchor_upper = _canonical_utc(
+        anchor_interval["end"],
+        where="anchor completion receipt interval.end",
+    )
+    _subset_start, subset_lower = _canonical_utc(
+        subset.inventory_proof["created_at_gte"],
+        where=f"{subset.spec.shard_id} time-shard lower bound",
+    )
+    _subset_end, subset_upper = _canonical_utc(
+        subset.inventory_proof["created_at_lt"],
+        where=f"{subset.spec.shard_id} time-shard upper bound",
+    )
+    if subset_lower < anchor_lower or subset_upper > anchor_upper:
+        raise MergeError(
+            f"{subset.spec.shard_id} time-shard bounds escape the anchor interval"
+        )
+    subset_connection = sqlite3.connect(
+        f"{subset.spec.inventory.path.as_uri()}?mode=ro&immutable=1",
+        uri=True,
+    )
+    anchor_connection = sqlite3.connect(
+        f"{anchor.spec.inventory.path.as_uri()}?mode=ro&immutable=1",
+        uri=True,
+    )
+    subset_connection.row_factory = sqlite3.Row
+    anchor_connection.row_factory = sqlite3.Row
+    matched_count = 0
+    match_digest = _record_digest(
+        "cppmega-ci-time-shard-anchor-match-v1"
+    )
+    columns = ",".join(_INVENTORY_RUN_COLUMNS)
+    try:
+        for subset_row in subset_connection.execute(
+            f"""
+            SELECT {columns}
+            FROM runs ORDER BY repo_key,run_id,run_attempt
+            """
+        ):
+            anchor_row = anchor_connection.execute(
+                f"""
+                SELECT {columns}
+                FROM runs
+                WHERE repo_key=? AND run_id=? AND run_attempt=?
+                """,
+                (
+                    subset_row["repo_key"],
+                    subset_row["run_id"],
+                    subset_row["run_attempt"],
+                ),
+            ).fetchone()
+            key = (
+                f"{subset_row['repo_key']}/{subset_row['run_id']}/"
+                f"{subset_row['run_attempt']}"
+            )
+            if anchor_row is None:
+                raise MergeError(
+                    f"{subset.spec.shard_id} time-shard run is absent "
+                    f"from the anchor: {key}"
+                )
+            for column in _INVENTORY_RUN_COLUMNS:
+                if not _sqlite_values_byte_identical(
+                    subset_row[column],
+                    anchor_row[column],
+                ):
+                    raise MergeError(
+                        f"{subset.spec.shard_id} time-shard column {column} "
+                        f"differs from the anchor: {key}"
+                    )
+            _update_record_digest(
+                match_digest,
+                _inventory_row_hash_record(subset_row),
+            )
+            matched_count += 1
+    finally:
+        subset_connection.close()
+        anchor_connection.close()
+    if matched_count != subset.inventory_proof["run_count"]:
+        raise MergeError(
+            f"{subset.spec.shard_id} time-shard match count changed during proof"
+        )
+    return {
+        **subset.inventory_proof,
+        "anchor_source_id": anchor.spec.shard_id,
+        "anchor_original_path": anchor.spec.original_inventory,
+        "matched_run_count": matched_count,
+        "anchor_match_logical_sha256": match_digest.hexdigest(),
+    }
+
+
 def _validate_cross_source_contracts(
     audits: Sequence[SourceAudit],
-) -> None:
+) -> InventoryContract:
+    anchor_candidates = [
+        audit for audit in audits if audit.inventory_role == "anchor_candidate"
+    ]
+    if not anchor_candidates:
+        raise MergeError("exactly one completed full inventory anchor is required")
+    subsets = [
+        audit
+        for audit in audits
+        if audit.inventory_role == "exact_subset_candidate"
+    ]
+    if subsets:
+        subset_source_paths = {
+            str(audit.inventory_proof["source_inventory_path"])
+            for audit in subsets
+        }
+        if len(subset_source_paths) != 1:
+            raise MergeError(
+                "time-shard inventories disagree on their full anchor path"
+            )
+        anchor_path = next(iter(subset_source_paths))
+        matching_candidates = [
+            audit
+            for audit in anchor_candidates
+            if audit.spec.original_inventory == anchor_path
+        ]
+        if not matching_candidates:
+            raise MergeError(
+                "no completed anchor binds the time-shard source_inventory_path"
+            )
+        anchor = matching_candidates[0]
+    else:
+        anchor = anchor_candidates[0]
+    assert anchor.inventory_receipt is not None
+    inventory_sha = anchor.inventory_file.sha256
+    inventory_projection = _inventory_logical_projection(anchor.inventory_receipt)
+    for candidate in anchor_candidates:
+        assert candidate.inventory_receipt is not None
+        if (
+            candidate.inventory_file.sha256 != inventory_sha
+            or _inventory_logical_projection(candidate.inventory_receipt)
+            != inventory_projection
+        ):
+            raise MergeError(
+                "multiple distinct completed inventory anchors are ambiguous"
+            )
+
     first = audits[0]
-    inventory_sha = first.inventory_file.sha256
-    inventory_projection = _inventory_logical_projection(first.inventory_receipt)
     semantic_settings = {
         key: value
         for key, value in cast(
@@ -1513,15 +2182,6 @@ def _validate_cross_source_contracts(
         }
     }
     for audit in audits[1:]:
-        if (
-            audit.inventory_file.sha256 != inventory_sha
-            or _inventory_logical_projection(audit.inventory_receipt)
-            != inventory_projection
-        ):
-            raise MergeError(
-                "v1 only supports byte-identical frozen inventories with "
-                "equivalent completion receipts"
-            )
         candidate_settings = {
             key: value
             for key, value in cast(
@@ -1539,27 +2199,102 @@ def _validate_cross_source_contracts(
         if candidate_settings != semantic_settings:
             raise MergeError("source fetch-state semantic settings conflict")
 
+    subset_proofs = {
+        audit.spec.shard_id: _prove_exact_subset(audit, anchor)
+        for audit in subsets
+    }
+    source_bindings: list[dict[str, Any]] = []
+    for audit in audits:
+        if audit.inventory_role == "exact_subset_candidate":
+            role = "byte_identical_row_subset"
+            proof = subset_proofs[audit.spec.shard_id]
+        elif audit is anchor:
+            role = "anchor"
+            proof = audit.inventory_proof
+        else:
+            role = "byte_identical_anchor_alias"
+            proof = {
+                **audit.inventory_proof,
+                "anchor_source_id": anchor.spec.shard_id,
+                "anchor_original_path": anchor.spec.original_inventory,
+            }
+        source_bindings.append(
+            {
+                "source_id": audit.spec.shard_id,
+                "role": role,
+                "original_inventory_path": audit.spec.original_inventory,
+                "staged_inventory_path": str(audit.spec.inventory.path),
+                "manifest_inventory_sha256": audit.spec.inventory.sha256,
+                "artifact_sha256": audit.inventory_file.sha256,
+                "artifact_byte_size": audit.inventory_file.size,
+                "receipt_sha256": (
+                    None
+                    if audit.spec.inventory.receipt is None
+                    else audit.spec.inventory.receipt.sha256
+                ),
+                "proof": proof,
+                "source_state_joined_attempts": audit.state_counts[
+                    "inventory_joined_attempts"
+                ],
+            }
+        )
+    binding = {
+        "schema": INVENTORY_BINDING_SCHEMA,
+        "policy": "completed-anchor-with-time-bounded-row-subsets-v1",
+        "coverage_semantics": "subset_only_no_range_completeness",
+        "anchor": {
+            "source_id": anchor.spec.shard_id,
+            "original_inventory_path": anchor.spec.original_inventory,
+            "staged_inventory_path": str(anchor.spec.inventory.path),
+            "artifact_sha256": anchor.inventory_file.sha256,
+            "artifact_byte_size": anchor.inventory_file.size,
+            "completion_receipt_sha256": (
+                anchor.spec.inventory.receipt.sha256
+            ),
+            "completion_receipt_logical_sha256": _sha256_bytes(
+                _canonical_json_bytes(inventory_projection)
+            ),
+            "sqlite_schema_sha256": anchor.inventory_proof[
+                "sqlite_schema_sha256"
+            ],
+            "interval": anchor.inventory_receipt["interval"],
+            "db_logical_sha256": anchor.inventory_receipt[
+                "db_logical_sha256"
+            ],
+            "run_count": anchor.inventory_proof["run_count"],
+            "run_rows_logical_sha256": anchor.inventory_proof[
+                "run_rows_logical_sha256"
+            ],
+        },
+        "source_count": len(audits),
+        "time_subset_count": len(subsets),
+        "time_subset_run_count": sum(
+            int(proof["matched_run_count"])
+            for proof in subset_proofs.values()
+        ),
+        "sources": source_bindings,
+    }
+    binding["binding_sha256"] = _sha256_bytes(_canonical_json_bytes(binding))
+    return InventoryContract(anchor=anchor, binding=binding)
+
 
 def _validate_output_geometry(manifest: Manifest) -> Path:
     destination = manifest.destination
     partial = destination.with_name(f".{destination.name}.partial")
     lock_path = destination.with_name(f".{destination.name}.merge.lock")
-    staged_paths = [
-        manifest.path,
-        manifest.tokenizer_path,
-        *(
-            path
-            for shard in manifest.shards
-            for path in (
-                shard.inventory.path,
-                shard.inventory.receipt.path,
+    staged_paths = [manifest.path, manifest.tokenizer_path]
+    for shard in manifest.shards:
+        staged_paths.append(shard.inventory.path)
+        if shard.inventory.receipt is not None:
+            staged_paths.append(shard.inventory.receipt.path)
+        staged_paths.extend(
+            (
                 shard.store.path,
                 shard.store.receipt.path,
                 shard.state.path,
                 shard.state.receipt.path,
             )
-        ),
-    ]
+        )
     for path in staged_paths:
         if (
             path == destination
@@ -2103,14 +2838,15 @@ def _load_destination_store_receipt(partial: Path) -> dict[str, Any]:
 def _copy_and_validate_inventory(
     partial: Path,
     manifest: Manifest,
-    audits: Sequence[SourceAudit],
+    inventory_contract: InventoryContract,
     journal: sqlite3.Connection,
 ) -> None:
+    anchor = inventory_contract.anchor
     destination = partial / _INVENTORY_NAME
     if not destination.exists():
         temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
         try:
-            with audits[0].spec.inventory.path.open("rb") as source:
+            with anchor.spec.inventory.path.open("rb") as source:
                 with temporary.open("xb") as target:
                     shutil.copyfileobj(source, target, 1024 * 1024)
                     target.flush()
@@ -2121,7 +2857,7 @@ def _copy_and_validate_inventory(
             if temporary.exists():
                 temporary.unlink()
     copied = _snapshot_file(destination, label="destination inventory")
-    if copied.sha256 != audits[0].inventory_file.sha256:
+    if copied.sha256 != anchor.inventory_file.sha256:
         raise MergeError("destination inventory copy differs from frozen source")
     try:
         inventory_receipt = InventoryDB(destination).completion_receipt()
@@ -2130,7 +2866,8 @@ def _copy_and_validate_inventory(
     inventory_receipt["database"] = str(
         manifest.destination / _INVENTORY_NAME
     )
-    expected = _inventory_logical_projection(audits[0].inventory_receipt)
+    assert anchor.inventory_receipt is not None
+    expected = _inventory_logical_projection(anchor.inventory_receipt)
     if _inventory_logical_projection(inventory_receipt) != expected:
         raise MergeError("validated union inventory differs from source receipt")
     _require_frozen_sqlite(destination, label="destination inventory")
@@ -3025,14 +3762,15 @@ def _outcome_counts(
 def _validate_destination_inventory(
     partial: Path,
     manifest: Manifest,
-    audits: Sequence[SourceAudit],
+    inventory_contract: InventoryContract,
 ) -> None:
+    anchor = inventory_contract.anchor
     path = partial / _INVENTORY_NAME
     _require_frozen_sqlite(path, label="destination inventory")
     snapshot = _snapshot_file(path, label="destination inventory")
     if (
-        snapshot.sha256 != audits[0].inventory_file.sha256
-        or snapshot.size != audits[0].inventory_file.size
+        snapshot.sha256 != anchor.inventory_file.sha256
+        or snapshot.size != anchor.inventory_file.size
     ):
         raise MergeError("destination inventory differs from its frozen source")
     try:
@@ -3375,12 +4113,13 @@ def _finalize_receipts(
     partial: Path,
     manifest: Manifest,
     audits: Sequence[SourceAudit],
+    inventory_contract: InventoryContract,
     tokenizer: ExactTokenizer,
     journal: sqlite3.Connection,
     *,
     merge_script_sha256: str,
 ) -> dict[str, Any]:
-    _validate_destination_inventory(partial, manifest, audits)
+    _validate_destination_inventory(partial, manifest, inventory_contract)
     _validate_completed_journal(
         manifest,
         audits,
@@ -3417,11 +4156,35 @@ def _finalize_receipts(
                 scratch_path=partial / ".union-coverage.sqlite3",
                 limits=manifest.limits,
             )
+            destination_inventory = sqlite3.connect(
+                (
+                    f"{(partial / _INVENTORY_NAME).as_uri()}"
+                    "?mode=ro&immutable=1"
+                ),
+                uri=True,
+            )
+            destination_inventory.row_factory = sqlite3.Row
+            try:
+                (
+                    inventory_joined_attempts,
+                    inventory_join_sha256,
+                ) = _verify_state_inventory_join(
+                    destination_inventory,
+                    state.connection,
+                    label="destination",
+                    max_blob_bytes=manifest.limits.max_state_blob_bytes,
+                )
+            finally:
+                destination_inventory.close()
             frozen_binding = state.receipt_binding()
             frozen_binding["artifact"]["path"] = str(
                 manifest.destination / _FETCH_STATE_NAME
             )
             destination_state_counts = _state_counts(state.connection)
+            if inventory_joined_attempts != destination_state_counts["attempts"]:
+                raise MergeError(
+                    "destination full-anchor join did not cover every attempt"
+                )
             state.require_unchanged()
         store.require_unchanged()
     source_scratch = partial / ".source-verification"
@@ -3465,6 +4228,7 @@ def _finalize_receipts(
         "frozen_fetch_state": frozen_binding,
         "content_store_receipt": store_receipt,
         "inventory_path": str(manifest.destination / _INVENTORY_NAME),
+        "inventory_binding": inventory_contract.binding,
         "tokenizer_contract": tokenizer.contract,
         "tokenizer_fingerprint": tokenizer.fingerprint,
     }
@@ -3613,6 +4377,13 @@ def _finalize_receipts(
             )
     artifacts.extend(store_files)
 
+    inventory_sources = {
+        str(item["source_id"]): item
+        for item in cast(
+            Sequence[Mapping[str, Any]],
+            inventory_contract.binding["sources"],
+        )
+    }
     receipt = {
         "schema": MERGE_RECEIPT_SCHEMA,
         "status": "complete",
@@ -3637,7 +4408,12 @@ def _finalize_receipts(
                     "inventory": {
                         "path": str(audit.spec.inventory.path),
                         "sha256": audit.inventory_file.sha256,
-                        "receipt_sha256": audit.spec.inventory.receipt.sha256,
+                        "receipt_sha256": (
+                            None
+                            if audit.spec.inventory.receipt is None
+                            else audit.spec.inventory.receipt.sha256
+                        ),
+                        "binding": inventory_sources[audit.spec.shard_id],
                     },
                     "content_store": {
                         "path": str(audit.spec.store.path),
@@ -3658,12 +4434,7 @@ def _finalize_receipts(
             }
             for audit in audits
         ],
-        "inventory": {
-            "policy": "byte-identical-completed-inventory-v1",
-            "input_artifacts": len(audits),
-            "unique_artifacts": 1,
-            "overlap_count": len(audits) - 1,
-        },
+        "inventory": inventory_contract.binding,
         "store_conservation": {
             "input_multiplicity": input_store_totals,
             "output_union": output_store_counts,
@@ -3748,6 +4519,9 @@ def _finalize_receipts(
         "verification": {
             "full_cas_fetch_join": True,
             "joined_occurrences": joined,
+            "full_anchor_fetch_state_join": True,
+            "inventory_joined_attempts": inventory_joined_attempts,
+            "inventory_join_sha256": inventory_join_sha256,
             "sources_frozen_before_after": True,
             "destination_frozen": True,
             "threshold_recomputed_after_global_dedup": True,
@@ -4015,7 +4789,7 @@ def merge_shards(
                     scratch,
                 )
             )
-        _validate_cross_source_contracts(audits)
+        inventory_contract = _validate_cross_source_contracts(audits)
         phase = _journal_phase(journal)
         if phase == "store":
             receipt = _merge_store(
@@ -4031,7 +4805,7 @@ def merge_shards(
             _copy_and_validate_inventory(
                 partial,
                 manifest,
-                audits,
+                inventory_contract,
                 journal,
             )
             phase = _journal_phase(journal)
@@ -4052,6 +4826,7 @@ def merge_shards(
                 partial,
                 manifest,
                 audits,
+                inventory_contract,
                 tokenizer,
                 journal,
                 merge_script_sha256=merge_script_snapshot.sha256,

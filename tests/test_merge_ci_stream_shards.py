@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from pathlib import Path
@@ -11,6 +11,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 from typing import Any, cast
+import zlib
 
 import pytest
 
@@ -30,10 +31,14 @@ from scripts.merge_ci_stream_shards import (
     MANIFEST_SCHEMA,
     MergeError,
     MergePaused,
+    TIME_SHARD_INVENTORY_SCHEMA,
+    _INVENTORY_RUN_COLUMNS,
+    _TIME_SHARD_SQL,
     _acquire_merge_lock,
     _canonical_json_bytes,
     _release_merge_lock,
     _require_complete_bundle_tree,
+    _verify_state_inventory_join,
     frozen_store_artifact_set_sha256,
     merge_shards,
 )
@@ -41,6 +46,7 @@ from tests.test_export_ci_content_store_case5 import (
     TOKENIZER_JSON,
     _build_store,
     _provenance,
+    _run_metadata,
 )
 
 
@@ -48,7 +54,7 @@ from tests.test_export_ci_content_store_case5 import (
 class BuiltShard:
     root: Path
     inventory: Path
-    inventory_receipt: Path
+    inventory_receipt: Path | None
     store: Path
     store_receipt: Path
     state: Path
@@ -80,18 +86,39 @@ def _empty_inventory_template(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
     try:
         connection.execute("PRAGMA journal_mode=DELETE")
         connection.executescript(INVENTORY_SQL)
+        run_rows: list[tuple[int, bytes, str, dict[str, Any]]] = []
+        for run_id in (100, 200, 300):
+            _text, provenance = _record(
+                f"inventory seed {run_id}",
+                run_id=run_id,
+                archive_member=f"{run_id}.txt",
+            )
+            run_metadata = _run_metadata(provenance)
+            raw = _canonical_json_bytes(run_metadata)
+            run_rows.append(
+                (
+                    run_id,
+                    raw,
+                    hashlib.sha256(raw).hexdigest(),
+                    run_metadata,
+                )
+            )
+        run_keys_sha256 = _hash_lines(
+            f"owner/repo\t{run_id}\t1\t{metadata_sha256}"
+            for run_id, _raw, metadata_sha256, _metadata in run_rows
+        )
         metadata = {
             "schema": INVENTORY_SCHEMA,
             "repo_list_path": "/frozen/repositories.json",
             "repo_list_sha256": "1" * 64,
-            "repo_scope_sha256": _hash_lines(()),
-            "repo_count": "0",
-            "original_repo_count": "0",
+            "repo_scope_sha256": _hash_lines(("owner/repo",)),
+            "repo_count": "1",
+            "original_repo_count": "1",
             "unresolved_count": "0",
-            "start_epoch": "1",
-            "end_epoch": "2",
-            "start_utc": "1970-01-01T00:00:01Z",
-            "end_utc": "1970-01-01T00:00:02Z",
+            "start_epoch": "1780272000",
+            "end_epoch": "1785542400",
+            "start_utc": "2026-06-01T00:00:00Z",
+            "end_utc": "2026-08-01T00:00:00Z",
             "script_sha256": "2" * 64,
             "metadata_encoding": METADATA_ENCODING,
             "smoke": "0",
@@ -100,6 +127,83 @@ def _empty_inventory_template(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
         connection.executemany(
             "INSERT INTO inventory_meta(key,value) VALUES (?,?)",
             sorted(metadata.items()),
+        )
+        connection.execute(
+            """
+            INSERT INTO repos(repo_key,owner,name,canonical,ordinal)
+            VALUES ('owner/repo','owner','repo','owner/repo',0)
+            """
+        )
+        window_id = int(
+            connection.execute(
+                """
+                INSERT INTO search_windows(
+                  repo_key,start_epoch,end_epoch,parent_id,depth,status,
+                  expected_total,expected_pages,pages_done,raw_items,
+                  distinct_items,duplicate_items,run_keys_sha256,
+                  created_at,updated_at
+                ) VALUES (
+                  'owner/repo',1780272000,1785542400,NULL,0,'done',
+                  3,1,1,3,3,0,?,
+                  '2026-07-26T09:00:00Z','2026-07-26T09:00:00Z'
+                )
+                """,
+                (run_keys_sha256,),
+            ).lastrowid
+        )
+        for run_id, raw, metadata_sha256, run_metadata in run_rows:
+            connection.execute(
+                """
+                INSERT INTO runs(
+                  repo_key,run_id,run_attempt,created_at,updated_at,
+                  run_started_at,status,conclusion,workflow_id,workflow_name,
+                  event,head_branch,head_sha,run_number,html_url,api_url,
+                  metadata_blob,metadata_sha256,first_seen_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    "owner/repo",
+                    run_id,
+                    1,
+                    run_metadata["created_at"],
+                    run_metadata["updated_at"],
+                    run_metadata["run_started_at"],
+                    run_metadata["status"],
+                    run_metadata["conclusion"],
+                    run_metadata["workflow_id"],
+                    run_metadata["name"],
+                    run_metadata["event"],
+                    run_metadata["head_branch"],
+                    run_metadata["head_sha"],
+                    run_metadata["run_number"],
+                    None,
+                    None,
+                    sqlite3.Binary(zlib.compress(raw, 6)),
+                    metadata_sha256,
+                    "2026-07-26T09:00:00Z",
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO window_runs(
+                  window_id,repo_key,run_id,run_attempt,metadata_sha256
+                ) VALUES (?,?,?,?,?)
+                """,
+                (window_id, "owner/repo", run_id, 1, metadata_sha256),
+            )
+        connection.execute(
+            """
+            INSERT INTO window_pages(
+              window_id,page_no,total_count,item_count,distinct_item_count,
+              duplicate_item_count,payload_sha256,run_keys_sha256,fetched_at
+            ) VALUES (?,1,3,3,3,0,?,?,?)
+            """,
+            (
+                window_id,
+                "3" * 64,
+                run_keys_sha256,
+                "2026-07-26T09:00:00Z",
+            ),
         )
         connection.commit()
     finally:
@@ -313,6 +417,86 @@ def _record(
     return text, provenance
 
 
+def _make_time_subset(
+    shard: BuiltShard,
+    anchor: BuiltShard,
+    *,
+    created_at_gte: str = "2026-06-01T00:00:00Z",
+    created_at_lt: str = "2026-08-01T00:00:00Z",
+) -> BuiltShard:
+    subset_path = shard.root / "time-shard-inventory.sqlite3"
+    state = sqlite3.connect(shard.state)
+    try:
+        seed_keys = [
+            (str(row[0]), int(row[1]), int(row[2]))
+            for row in state.execute(
+                """
+                SELECT DISTINCT repo,run_id,inventory_seed_attempt
+                FROM attempts ORDER BY repo,run_id,inventory_seed_attempt
+                """
+            )
+        ]
+    finally:
+        state.close()
+    anchor_connection = sqlite3.connect(anchor.inventory)
+    anchor_connection.row_factory = sqlite3.Row
+    subset = sqlite3.connect(subset_path)
+    try:
+        subset.execute("PRAGMA journal_mode=DELETE")
+        subset.executescript(_TIME_SHARD_SQL)
+        columns = ",".join(_INVENTORY_RUN_COLUMNS)
+        for key in seed_keys:
+            row = anchor_connection.execute(
+                f"""
+                SELECT {columns} FROM runs
+                WHERE repo_key=? AND run_id=? AND run_attempt=?
+                """,
+                key,
+            ).fetchone()
+            assert row is not None
+            subset.execute(
+                f"""
+                INSERT INTO runs({columns})
+                VALUES ({",".join("?" for _ in _INVENTORY_RUN_COLUMNS)})
+                """,
+                tuple(row[column] for column in _INVENTORY_RUN_COLUMNS),
+            )
+        metadata = {
+            "schema": TIME_SHARD_INVENTORY_SCHEMA,
+            "source_inventory_path": anchor.original_inventory,
+            "created_at": "2026-07-27T12:00:00Z",
+            "created_at_gte": created_at_gte,
+            "created_at_lt": created_at_lt,
+            "run_count": str(len(seed_keys)),
+        }
+        subset.executemany(
+            "INSERT INTO shard_meta(key,value) VALUES (?,?)",
+            sorted(metadata.items()),
+        )
+        subset.commit()
+    finally:
+        subset.close()
+        anchor_connection.close()
+    return replace(
+        shard,
+        inventory=subset_path,
+        inventory_receipt=None,
+    )
+
+
+def _inventory_manifest_descriptor(shard: BuiltShard) -> dict[str, Any]:
+    descriptor: dict[str, Any] = {
+        "path": str(shard.inventory),
+        "sha256": _sha256(shard.inventory),
+    }
+    if shard.inventory_receipt is not None:
+        descriptor["receipt"] = {
+            "path": str(shard.inventory_receipt),
+            "sha256": _sha256(shard.inventory_receipt),
+        }
+    return descriptor
+
+
 def _manifest(
     tmp_path: Path,
     tokenizer: ExactTokenizer,
@@ -351,14 +535,7 @@ def _manifest(
                     "fetch_state": shard.original_state,
                 },
                 "staged": {
-                    "inventory": {
-                        "path": str(shard.inventory),
-                        "sha256": _sha256(shard.inventory),
-                        "receipt": {
-                            "path": str(shard.inventory_receipt),
-                            "sha256": _sha256(shard.inventory_receipt),
-                        },
-                    },
+                    "inventory": _inventory_manifest_descriptor(shard),
                     "content_store": {
                         "path": str(shard.store),
                         "artifact_set_sha256": frozen_store_artifact_set_sha256(
@@ -386,6 +563,53 @@ def _manifest(
     path = tmp_path / "union-manifest.json"
     path.write_bytes(_canonical_json_bytes(value) + b"\n")
     return path, destination
+
+
+def _anchor_and_time_subset(
+    tmp_path: Path,
+    tokenizer: ExactTokenizer,
+    *,
+    relocated: bool = False,
+) -> tuple[BuiltShard, BuiltShard]:
+    inventory, inventory_receipt = _empty_inventory_template(tmp_path)
+    anchor = _build_shard(
+        tmp_path / "anchor-stage",
+        tokenizer,
+        inventory,
+        inventory_receipt,
+        [_record("anchor payload", run_id=100, archive_member="anchor.txt")],
+        relocated_prefix=(
+            "/Volumes/frozen/ci/full-anchor" if relocated else None
+        ),
+    )
+    subset = _build_shard(
+        tmp_path / "subset-stage",
+        tokenizer,
+        inventory,
+        inventory_receipt,
+        [_record("subset payload", run_id=200, archive_member="subset.txt")],
+        relocated_prefix=(
+            "/home/davidgor/frozen-ci/time-subset" if relocated else None
+        ),
+    )
+    return anchor, _make_time_subset(subset, anchor)
+
+
+def _update_time_subset_meta(
+    subset: BuiltShard,
+    key: str,
+    value: str,
+) -> None:
+    connection = sqlite3.connect(subset.inventory)
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute(
+            "UPDATE shard_meta SET value=? WHERE key=?",
+            (value, key),
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def _insert_zero_evidence_pending(
@@ -1331,4 +1555,428 @@ def test_cas_bearing_non_done_attempt_fails_closed(
     ):
         merge_shards(manifest)
 
+    assert not destination.exists()
+
+
+def test_time_bounded_row_subset_publishes_full_anchor_with_receipted_proof(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    anchor, subset = _anchor_and_time_subset(
+        tmp_path,
+        exact_tokenizer,
+        relocated=True,
+    )
+    manifest, destination = _manifest(
+        tmp_path,
+        exact_tokenizer,
+        [subset, anchor],
+    )
+
+    receipt = merge_shards(manifest)
+
+    assert _sha256(destination / "inventory.sqlite3") == _sha256(
+        anchor.inventory
+    )
+    binding = receipt["inventory"]
+    assert binding["policy"] == (
+        "completed-anchor-with-time-bounded-row-subsets-v1"
+    )
+    assert binding["coverage_semantics"] == (
+        "subset_only_no_range_completeness"
+    )
+    assert binding["time_subset_count"] == 1
+    assert binding["time_subset_run_count"] == 1
+    sources = {
+        item["source_id"]: item for item in binding["sources"]
+    }
+    assert sources["s00"]["role"] == "byte_identical_row_subset"
+    assert sources["s01"]["role"] == "anchor"
+    subset_proof = sources["s00"]["proof"]
+    assert subset_proof["matched_run_count"] == 1
+    assert subset_proof["sqlite_schema_sha256"] == (
+        "91990153359d65201c18e181b636d4e379443c54f7cbb71b03a0682f652d8f14"
+    )
+    assert len(subset_proof["anchor_match_logical_sha256"]) == 64
+    assert receipt["verification"]["inventory_joined_attempts"] == 2
+    assert len(receipt["verification"]["inventory_join_sha256"]) == 64
+    fetch_receipt = json.loads(
+        (destination / "fetch_receipt.json").read_text(encoding="utf-8")
+    )
+    assert fetch_receipt["inventory_binding"] == binding
+
+
+def test_time_subset_row_absent_from_anchor_fails_closed(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    anchor, subset = _anchor_and_time_subset(tmp_path, exact_tokenizer)
+    connection = sqlite3.connect(subset.inventory)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        columns = ",".join(_INVENTORY_RUN_COLUMNS)
+        row = connection.execute(
+            f"SELECT {columns} FROM runs WHERE run_id=200"
+        ).fetchone()
+        assert row is not None
+        values = {
+            column: row[column] for column in _INVENTORY_RUN_COLUMNS
+        }
+        values["run_id"] = 999
+        connection.execute(
+            f"""
+            INSERT INTO runs({columns})
+            VALUES ({",".join("?" for _ in _INVENTORY_RUN_COLUMNS)})
+            """,
+            tuple(values[column] for column in _INVENTORY_RUN_COLUMNS),
+        )
+        connection.execute(
+            "UPDATE shard_meta SET value='2' WHERE key='run_count'"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    manifest, destination = _manifest(
+        tmp_path,
+        exact_tokenizer,
+        [anchor, subset],
+    )
+
+    with pytest.raises(MergeError, match="absent from the anchor"):
+        merge_shards(manifest)
+
+    assert not destination.exists()
+
+
+def test_state_inventory_join_allows_api_exact_created_at_to_differ(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    _anchor, subset = _anchor_and_time_subset(tmp_path, exact_tokenizer)
+    state = sqlite3.connect(subset.state)
+    state.row_factory = sqlite3.Row
+    inventory = sqlite3.connect(subset.inventory)
+    inventory.row_factory = sqlite3.Row
+    try:
+        state.execute("PRAGMA journal_mode=DELETE")
+        state.execute(
+            """
+            UPDATE attempts SET
+              run_metadata_source='github-workflow-run-attempt-api',
+              created_at='2026-07-26T10:00:01Z'
+            """
+        )
+        state.commit()
+        count, digest = _verify_state_inventory_join(
+            inventory,
+            state,
+            label="api-exact-test",
+            max_blob_bytes=1024 * 1024,
+        )
+        assert count == 1
+        assert len(digest) == 64
+        state.execute(
+            """
+            UPDATE attempts
+            SET inventory_seed_metadata_sha256=?
+            """,
+            ("0" * 64,),
+        )
+        state.commit()
+        with pytest.raises(MergeError, match="seed binding differs"):
+            _verify_state_inventory_join(
+                inventory,
+                state,
+                label="api-exact-test",
+                max_blob_bytes=1024 * 1024,
+            )
+    finally:
+        inventory.close()
+        state.close()
+
+
+@pytest.mark.parametrize(
+    "column",
+    ["updated_at", "first_seen_at", "metadata_blob"],
+)
+def test_time_subset_any_column_or_blob_mismatch_fails_closed(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+    column: str,
+) -> None:
+    anchor, subset = _anchor_and_time_subset(tmp_path, exact_tokenizer)
+    connection = sqlite3.connect(subset.inventory)
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        if column == "metadata_blob":
+            blob = bytes(
+                connection.execute(
+                    "SELECT metadata_blob FROM runs WHERE run_id=200"
+                ).fetchone()[0]
+            )
+            raw = zlib.decompress(blob)
+            replacement: object = sqlite3.Binary(zlib.compress(raw, 0))
+            assert bytes(replacement) != blob
+        else:
+            replacement = "2026-07-27T13:00:00Z"
+        connection.execute(
+            f"UPDATE runs SET {column}=? WHERE run_id=200",
+            (replacement,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    manifest, destination = _manifest(
+        tmp_path,
+        exact_tokenizer,
+        [anchor, subset],
+    )
+
+    with pytest.raises(MergeError, match=rf"column {column} differs"):
+        merge_shards(manifest)
+
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        ("bounds", "bounds are empty or reversed"),
+        ("lower-escape", "bounds escape the anchor interval"),
+        ("upper-escape", "bounds escape the anchor interval"),
+        ("count", "run_count differs"),
+        ("path", "no completed anchor binds"),
+        ("meta-schema", "metadata schema is not v1"),
+        ("sqlite-schema", "inventory schema is not exact v1"),
+    ],
+)
+def test_time_subset_bad_bounds_count_path_or_schema_fails_closed(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+    mutation: str,
+    error: str,
+) -> None:
+    anchor, subset = _anchor_and_time_subset(tmp_path, exact_tokenizer)
+    if mutation == "bounds":
+        _update_time_subset_meta(
+            subset,
+            "created_at_gte",
+            "2026-08-01T00:00:00Z",
+        )
+    elif mutation == "lower-escape":
+        _update_time_subset_meta(
+            subset,
+            "created_at_gte",
+            "2026-05-31T23:59:59Z",
+        )
+    elif mutation == "upper-escape":
+        _update_time_subset_meta(
+            subset,
+            "created_at_lt",
+            "2026-08-01T00:00:01Z",
+        )
+    elif mutation == "count":
+        _update_time_subset_meta(subset, "run_count", "2")
+    elif mutation == "path":
+        _update_time_subset_meta(
+            subset,
+            "source_inventory_path",
+            "/frozen/wrong-anchor.sqlite3",
+        )
+    elif mutation == "meta-schema":
+        _update_time_subset_meta(subset, "schema", "invented_schema_v9")
+    else:
+        connection = sqlite3.connect(subset.inventory)
+        try:
+            connection.execute("PRAGMA journal_mode=DELETE")
+            connection.execute("CREATE TABLE unexpected(value TEXT)")
+            connection.commit()
+        finally:
+            connection.close()
+    manifest, destination = _manifest(
+        tmp_path,
+        exact_tokenizer,
+        [anchor, subset],
+    )
+
+    with pytest.raises(MergeError, match=error):
+        merge_shards(manifest)
+
+    assert not destination.exists()
+
+
+def test_time_subset_without_completed_anchor_is_role_ambiguous(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    _anchor, subset = _anchor_and_time_subset(tmp_path, exact_tokenizer)
+    manifest, destination = _manifest(
+        tmp_path,
+        exact_tokenizer,
+        [subset],
+    )
+
+    with pytest.raises(MergeError, match="completed full inventory anchor"):
+        merge_shards(manifest)
+
+    assert not destination.exists()
+
+
+def test_multiple_distinct_completed_anchors_fail_closed(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    inventory, inventory_receipt = _empty_inventory_template(tmp_path)
+    second_inventory = tmp_path / "inventory-template-second.sqlite3"
+    shutil.copyfile(inventory, second_inventory)
+    connection = sqlite3.connect(second_inventory)
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("PRAGMA user_version=1")
+        connection.commit()
+    finally:
+        connection.close()
+    second_inventory_receipt = InventoryDB(
+        second_inventory
+    ).completion_receipt()
+    assert _sha256(second_inventory) != _sha256(inventory)
+    anchor_a = _build_shard(
+        tmp_path / "a",
+        exact_tokenizer,
+        inventory,
+        inventory_receipt,
+        [_record("a", run_id=100, archive_member="a.txt")],
+    )
+    anchor_b = _build_shard(
+        tmp_path / "b",
+        exact_tokenizer,
+        second_inventory,
+        second_inventory_receipt,
+        [_record("b", run_id=200, archive_member="b.txt")],
+    )
+    manifest, destination = _manifest(
+        tmp_path,
+        exact_tokenizer,
+        [anchor_a, anchor_b],
+    )
+
+    with pytest.raises(MergeError, match="multiple distinct completed"):
+        merge_shards(manifest)
+
+    assert not destination.exists()
+
+
+def test_byte_identical_anchor_and_shared_receipt_preserve_identical_mode(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    inventory, inventory_receipt = _empty_inventory_template(tmp_path)
+    anchor = _build_shard(
+        tmp_path / "a",
+        exact_tokenizer,
+        inventory,
+        inventory_receipt,
+        [_record("a", run_id=100, archive_member="a.txt")],
+    )
+    second = _build_shard(
+        tmp_path / "b",
+        exact_tokenizer,
+        inventory,
+        inventory_receipt,
+        [_record("b", run_id=200, archive_member="b.txt")],
+    )
+    _set_original_bindings(
+        second.state,
+        inventory_path=anchor.original_inventory,
+        store_path=second.original_store,
+    )
+    shared = replace(
+        second,
+        inventory=anchor.inventory,
+        inventory_receipt=anchor.inventory_receipt,
+        original_inventory=anchor.original_inventory,
+    )
+    _write_json(
+        shared.fetch_receipt,
+        _fetch_receipt(shared, exact_tokenizer),
+    )
+    manifest, destination = _manifest(
+        tmp_path,
+        exact_tokenizer,
+        [anchor, shared],
+    )
+
+    receipt = merge_shards(manifest)
+
+    roles = [
+        source["role"] for source in receipt["inventory"]["sources"]
+    ]
+    assert roles == ["anchor", "byte_identical_anchor_alias"]
+    assert _sha256(destination / "inventory.sqlite3") == _sha256(
+        anchor.inventory
+    )
+
+
+def test_ready_resume_rejects_time_subset_first_seen_at_tamper(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    anchor, subset = _anchor_and_time_subset(tmp_path, exact_tokenizer)
+    manifest, destination = _manifest(
+        tmp_path,
+        exact_tokenizer,
+        [anchor, subset],
+    )
+    partial = _prepare_ready_partial(manifest, destination)
+    connection = sqlite3.connect(subset.inventory)
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute(
+            """
+            UPDATE runs SET first_seen_at='2026-07-27T13:00:00Z'
+            WHERE run_id=200
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(MergeError, match="inventory hash differs"):
+        merge_shards(manifest)
+
+    assert partial.exists()
+    assert not destination.exists()
+
+
+def test_ready_resume_rejects_destination_inventory_seed_tamper(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    anchor, subset = _anchor_and_time_subset(tmp_path, exact_tokenizer)
+    manifest, destination = _manifest(
+        tmp_path,
+        exact_tokenizer,
+        [subset, anchor],
+    )
+    partial = _prepare_ready_partial(manifest, destination)
+    connection = sqlite3.connect(partial / "fetch_state.sqlite3")
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute(
+            """
+            UPDATE attempts
+            SET inventory_seed_metadata_sha256=?
+            WHERE run_id=200
+            """,
+            ("0" * 64,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(MergeError):
+        merge_shards(manifest)
+
+    assert partial.exists()
     assert not destination.exists()
