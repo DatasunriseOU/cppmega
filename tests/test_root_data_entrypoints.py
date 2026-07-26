@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -55,6 +57,142 @@ def _dry_run_commands(output: str) -> list[list[str]]:
 
 def _option_value(command: list[str], option: str) -> str:
     return command[command.index(option) + 1]
+
+
+def test_source_conveyor_default_is_the_complete_five_bucket_ladder() -> None:
+    conveyor = _load_source_conveyor_module()
+
+    args = conveyor.build_arg_parser().parse_args(
+        ["--source-root", "/sources", "--output-root", "/packed"]
+    )
+
+    assert args.target_lengths == (1024, 2048, 4096, 8192, 16384)
+
+
+def test_public_data_entrypoints_default_to_the_complete_five_bucket_ladder(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    output_root = tmp_path / "packed"
+    tokenizer_result = _run(
+        [
+            sys.executable,
+            str(TOKENIZE_ENTRYPOINT),
+            "--source-root",
+            str(source_root),
+            "--output-root",
+            str(output_root),
+            "--dry-run",
+        ],
+        env=_entrypoint_env(tmp_path),
+    )
+    assert tokenizer_result.returncode == 0, tokenizer_result.stderr
+    tokenizer_command = _dry_run_commands(tokenizer_result.stdout)[0]
+    assert _option_value(tokenizer_command, "--target-lengths") == (
+        "1024,2048,4096,8192,16384"
+    )
+
+    shell_result = _run(
+        [
+            "bash",
+            str(DATA_ENTRYPOINT),
+            "tokenize",
+            "--source-root",
+            str(source_root),
+            "--output-root",
+            str(output_root),
+            "--dry-run",
+        ],
+        env=_entrypoint_env(tmp_path),
+    )
+    assert shell_result.returncode == 0, shell_result.stderr
+    shell_command = _dry_run_commands(shell_result.stdout)[0]
+    assert _option_value(shell_command, "--target-lengths") == (
+        "1024,2048,4096,8192,16384"
+    )
+
+
+def test_root_source_entrypoint_writes_schema_v2_manifest(
+    tmp_path: Path,
+) -> None:
+    checkout = tmp_path / "checkout"
+    ignored = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
+    for relative in ("scripts", "cppmega", "tools/clang_indexer"):
+        shutil.copytree(
+            REPO_ROOT / relative,
+            checkout / relative,
+            ignore=ignored,
+        )
+    (checkout / ".gitignore").write_text(
+        "__pycache__/\n*.py[cod]\n",
+        encoding="utf-8",
+    )
+    for command in (
+        ["git", "init", "-q"],
+        ["git", "config", "user.name", "Root Entry Test"],
+        ["git", "config", "user.email", "root-entry@example.test"],
+        ["git", "add", "."],
+        ["git", "commit", "-q", "-m", "fixture"],
+    ):
+        subprocess.run(command, cwd=checkout, check=True)
+    revision = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=checkout,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    output_root = tmp_path / "packed"
+    env = os.environ.copy()
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(checkout / "scripts" / "data" / "source_conveyor.py"),
+            "--source-root",
+            str(source_root),
+            "--output-root",
+            str(output_root),
+            "--tokenizer",
+            str(checkout / "cppmega" / "tokenizer" / "tokenizer.json"),
+            "--max-repos",
+            "0",
+            "--min-free-disk-gb",
+            "0",
+            "--expected-code-revision",
+            revision,
+        ],
+        cwd=checkout,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest = json.loads(
+        (output_root / ".conveyor" / "_done.json").read_text(encoding="utf-8")
+    )
+    receipt = manifest["code_revision"]
+    assert receipt["schema_version"] == 2
+    assert receipt["producer_role"] == "canonical_source_conveyor"
+    assert receipt["repository_identity"] == "cppmega"
+    assert receipt["git_commit"] == revision
+    assert receipt["dirty"] is False
+    assert len(receipt["source_tree_sha256"]) == 64
+    assert receipt["indexer_dependency_closure_sha256"] == (
+        receipt["indexer_provenance"]["dependency_closure_sha256"]
+    )
+    assert {
+        int(path.name)
+        for path in output_root.iterdir()
+        if path.is_dir() and path.name.isdigit()
+    } == {1024, 2048, 4096, 8192, 16384}
 
 
 def test_root_data_entrypoint_help_is_explicit_and_has_no_sibling_contract(

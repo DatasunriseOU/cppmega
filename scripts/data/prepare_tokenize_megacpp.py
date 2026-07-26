@@ -20,7 +20,7 @@ HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[1]
 SOURCE_CONVEYOR = HERE / "source_conveyor.py"
 DEFAULT_TOKENIZER = REPO_ROOT / "data" / "tokenizer_v2" / "tokenizer.json"
-DEFAULT_TARGET_LENGTHS = (1024, 2048, 4096)
+DEFAULT_TARGET_LENGTHS = (1024, 2048, 4096, 8192, 16384)
 
 
 def _parse_target_lengths(value: str) -> tuple[int, ...]:
@@ -71,7 +71,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=_parse_target_lengths,
         default=DEFAULT_TARGET_LENGTHS,
         metavar="CSV",
-        help="Comma-separated packed lengths (default: 1024,2048,4096).",
+        help="Comma-separated packed lengths "
+             "(default: 1024,2048,4096,8192,16384).",
     )
     parser.add_argument(
         "--repo-list",

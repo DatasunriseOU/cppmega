@@ -70,9 +70,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--target-lengths",
         type=_parse_target_lengths,
-        default=(1024, 2048, 4096),
+        default=(1024, 2048, 4096, 8192, 16384),
         metavar="CSV",
-        help="Comma-separated packed CODE lengths (default: 1024,2048,4096).",
+        help="Comma-separated packed CODE lengths "
+        "(default: 1024,2048,4096,8192,16384).",
     )
     parser.add_argument(
         "--repo-list",

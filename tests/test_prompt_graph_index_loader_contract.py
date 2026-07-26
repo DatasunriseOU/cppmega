@@ -68,7 +68,19 @@ def test_deferred_dedup_import_survives_loader_sys_path_restore(
         dedup_db=str(tmp_path / "dedup.sqlite"),
     )
 
-    assert documents == []
+    assert len(documents) == 1
+    assert documents[0]["text"] == "\n"
+    assert documents[0]["build_kind"] == "ninja"
+    assert documents[0]["source_span"] == {
+        "chunk_index": 0,
+        "byte_start": 0,
+        "byte_end": 1,
+        "char_start": 0,
+        "char_end": 1,
+        "source_size_bytes": 1,
+        "chunk_limit_bytes": 500_000,
+        "split_reason": "eof",
+    }
 
 
 def test_loader_restores_the_original_sys_path_object() -> None:

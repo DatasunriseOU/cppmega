@@ -53,3 +53,62 @@ def test_verify_domain_routed_dataset_reports_domain_counts(tmp_path):
     assert report["valid_tokens"] == 4
     assert str(int(DomainKind.COMPILER_ERROR)) in report["domain_token_counts"]
     assert report["errors"] == []
+
+
+def test_verify_packed_build_kinds_are_aligned_to_source_documents(tmp_path):
+    mod = _load_verifier()
+    path = tmp_path / "build.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "input_ids": [10, 11, 12, 0],
+                    "valid_token_count": 3,
+                    "doc_ids": [1, 1, 2, 0],
+                    "token_domain_ids": [
+                        int(DomainKind.CMAKE),
+                        int(DomainKind.CMAKE),
+                        int(DomainKind.CPP),
+                        0,
+                    ],
+                    "source_build_kinds": ["cmake", None],
+                }
+            ]
+        ),
+        path,
+    )
+
+    result = mod.verify_file("code", path, "4")
+
+    assert result["build_kind_counts"] == {"cmake": 1}
+    assert result["errors"] == []
+
+
+def test_verify_packed_build_kind_missing_for_build_doc_fails(tmp_path):
+    mod = _load_verifier()
+    path = tmp_path / "build-missing.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {
+                    "input_ids": [10, 11, 0, 0],
+                    "valid_token_count": 2,
+                    "doc_ids": [1, 1, 0, 0],
+                    "token_domain_ids": [
+                        int(DomainKind.CMAKE),
+                        int(DomainKind.CMAKE),
+                        0,
+                        0,
+                    ],
+                    "source_build_kinds": [None],
+                }
+            ]
+        ),
+        path,
+    )
+
+    result = mod.verify_file("code", path, "4")
+
+    assert result["errors"] == [
+        "1 packed build document(s) have no aligned source_build_kinds value"
+    ]

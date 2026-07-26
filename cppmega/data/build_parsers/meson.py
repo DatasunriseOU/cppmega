@@ -7,12 +7,10 @@ from typing import Any
 from cppmega.data.build_parsers.base import (
     ParsedDomainDocument,
     is_source_path,
-    strip_quotes,
 )
 from cppmega.data.domain_schema import (
     DomainEdgeKind,
     DomainKind,
-    DomainRoleKind,
     ParseConfidence,
 )
 
@@ -49,6 +47,20 @@ def _get_parser():
 
 def _node_text(node: Any, source: bytes) -> str:
     return source[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
+
+
+def _utf8_byte_to_char_offsets(source: bytes) -> list[int]:
+    """Map UTF-8 byte positions to the character offsets used by lexed tokens."""
+
+    offsets = [0] * (len(source) + 1)
+    byte_offset = 0
+    for char_offset, char in enumerate(source.decode("utf-8")):
+        encoded_length = len(char.encode("utf-8"))
+        for index in range(byte_offset, byte_offset + encoded_length):
+            offsets[index] = char_offset
+        byte_offset += encoded_length
+        offsets[byte_offset] = char_offset + 1
+    return offsets
 
 
 def _walk(node: Any):
@@ -139,7 +151,7 @@ def parse_meson(text: str) -> ParsedDomainDocument:
                 )
             )
 
-    _attach_edges_to_doc(doc, edges)
+    _attach_edges_to_doc(doc, edges, source_bytes)
     doc.metadata["tree_sitter_language"] = "meson"
     doc.metadata["ast_root_type"] = root.type
     doc.metadata["ast_has_error"] = root.has_error
@@ -147,18 +159,25 @@ def parse_meson(text: str) -> ParsedDomainDocument:
 
 
 def _attach_edges_to_doc(
-    doc: ParsedDomainDocument, raw_edges: list[tuple[int, int, int]]
+    doc: ParsedDomainDocument,
+    raw_edges: list[tuple[int, int, int]],
+    source: bytes,
 ) -> None:
     tokens = doc.tokens
     if not tokens:
         return
 
+    byte_to_char_offsets = _utf8_byte_to_char_offsets(source)
+
     def byte_to_token_idx(byte_offset: int) -> int | None:
+        if not 0 <= byte_offset <= len(source):
+            return None
+        char_offset = byte_to_char_offsets[byte_offset]
         best: int | None = None
         for idx, tok in enumerate(tokens):
-            if tok.start <= byte_offset < tok.end:
+            if tok.start <= char_offset < tok.end:
                 return idx
-            if tok.start <= byte_offset:
+            if tok.start <= char_offset:
                 best = idx
             else:
                 break

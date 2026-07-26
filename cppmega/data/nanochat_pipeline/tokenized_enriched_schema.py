@@ -113,6 +113,7 @@ DIFF_TOKEN_IDS_COLUMN = "diff_token_ids"
 
 DOC_TYPE_COLUMN = "doc_type"
 HEADER_FRAGMENT_KIND_COLUMN = "header_fragment_kind"
+BUILD_KIND_COLUMN = "build_kind"
 
 REPO_COLUMN = "repo"
 FILEPATH_COLUMN = "filepath"
@@ -394,6 +395,7 @@ __all__ = [
     "SOURCE_IDENTITY_REGISTRY_COLUMN",
     "DOC_TYPE_COLUMN",
     "HEADER_FRAGMENT_KIND_COLUMN",
+    "BUILD_KIND_COLUMN",
     "REPO_COLUMN",
     "FILEPATH_COLUMN",
     "COMMIT_HASH_COLUMN",

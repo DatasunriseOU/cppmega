@@ -101,7 +101,10 @@ def _best_split_char_index(
             hi = mid - 1
 
     if best <= 0:
-        return 1
+        raise ValueError(
+            "cannot split document losslessly: no non-empty character prefix "
+            f"fits the exact {max_tokens}-token budget"
+        )
 
     window_start = max(1, best - search_window)
     preferred_breaks = ("\n\n", "\n", " ", "\t")
@@ -120,13 +123,58 @@ _CHAR_LEVEL_METADATA_FIELDS = (
     "call_targets",
     "type_refs",
     "def_use",
+    "change_mask_pre",
+    "change_mask_post",
+    "token_change_mask",
+    "hunk_id_per_char",
+    "edit_op_per_char",
+    "token_edit_op",
     "domain_ids",
     "domain_role_ids",
+    "role_ids",
     "domain_entity_ids",
+    "entity_ids",
     "domain_scope_ids",
+    "scope_ids",
     "domain_source_doc_ids",
+    "source_doc_ids",
+    "domain_source_identity_ids",
     "domain_confidence_ids",
+    "confidence_ids",
 )
+_SPLIT_AUDIT_FIELD = "_lossless_split_audit"
+
+
+def _validate_aligned_character_metadata(
+    doc: dict[str, Any],
+    *,
+    text_length: int,
+) -> None:
+    """Reject present character sidecars that cannot be sliced exactly."""
+
+    structure_ids = doc.get("structure_ids", [])
+    if structure_ids and len(structure_ids) != text_length:
+        raise ValueError(
+            "structure_ids length "
+            f"{len(structure_ids)} does not match text length {text_length}"
+        )
+    for field in _CHAR_LEVEL_METADATA_FIELDS:
+        values = doc.get(field, [])
+        if values and len(values) != text_length:
+            raise ValueError(
+                f"{field} sidecar length {len(values)} does not match "
+                f"text length {text_length}"
+            )
+
+    source_text = doc.get("source_text")
+    if source_text is not None:
+        if not isinstance(source_text, str):
+            raise ValueError("source_text must be a string when present")
+        if len(source_text) != text_length:
+            raise ValueError(
+                "source_text length "
+                f"{len(source_text)} does not match text length {text_length}"
+            )
 
 
 def _slice_doc_char_range(
@@ -138,12 +186,14 @@ def _slice_doc_char_range(
 ) -> dict[str, Any]:
     """Slice an enriched document by char range and preserve compatible metadata."""
     text = doc.get("text", "")
+    _validate_aligned_character_metadata(doc, text_length=len(text))
     sliced = {
         k: v
         for k, v in doc.items()
         if k
         not in {
             "text",
+            "source_text",
             "structure_ids",
             "chunk_boundaries",
             "call_edges",
@@ -154,6 +204,11 @@ def _slice_doc_char_range(
         }
     }
     sliced["text"] = text[start_char:end_char]
+    if "source_text" in doc:
+        source_text = doc.get("source_text")
+        sliced["source_text"] = (
+            None if source_text is None else source_text[start_char:end_char]
+        )
     sliced["embedded_domain_spans"] = slice_embedded_domain_spans(
         doc.get("embedded_domain_spans", []),
         source_length=len(text),
@@ -268,19 +323,114 @@ def _split_doc_without_boundaries(
     while remaining:
         exact = count_tokens(remaining, tokenizer)
         if exact <= max_tokens:
-            piece = _slice_doc_char_range(doc, cursor, len(text), selected_boundaries=[])
+            piece = _slice_doc_char_range(doc, cursor, len(text))
             piece["actual_token_count"] = exact
             pieces.append(piece)
             break
 
         cut = _best_split_char_index(remaining, max_tokens, tokenizer)
         abs_cut = cursor + cut
-        piece = _slice_doc_char_range(doc, cursor, abs_cut, selected_boundaries=[])
+        piece = _slice_doc_char_range(doc, cursor, abs_cut)
         piece["actual_token_count"] = count_tokens(piece["text"], tokenizer)
+        if piece["actual_token_count"] > max_tokens:
+            raise ValueError(
+                "lossless split produced an over-budget piece: "
+                f"{piece['actual_token_count']} > {max_tokens}"
+            )
         pieces.append(piece)
         cursor = abs_cut
         remaining = text[cursor:]
     return pieces
+
+
+def _annotate_cross_piece_edge_audit(
+    doc: dict[str, Any],
+    pieces: list[dict[str, Any]],
+) -> None:
+    """Record graph edges that cannot exist inside any one split sequence."""
+
+    if len(pieces) <= 1:
+        return
+    text_length = len(doc.get("text", ""))
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    for piece in pieces:
+        end = cursor + len(piece.get("text", ""))
+        ranges.append((cursor, end))
+        cursor = end
+    if cursor != text_length:
+        raise ValueError(
+            f"split pieces cover {cursor} chars but source has {text_length}"
+        )
+
+    def point_piece(offset: int) -> int:
+        if offset == text_length and ranges:
+            return len(ranges) - 1
+        if offset < 0 or offset >= text_length:
+            raise ValueError(
+                f"edge character offset {offset} is outside [0, {text_length}]"
+            )
+        for piece_index, (start, end) in enumerate(ranges):
+            if start <= offset < end:
+                return piece_index
+        raise AssertionError(f"no split piece owns character offset {offset}")
+
+    cross_piece: dict[str, int] = {}
+    for edge_field, family in DOMAIN_EDGE_FIELD_FAMILIES.items():
+        count = 0
+        for src, dst, _kind in (
+            normalize_domain_edge_record(edge, family=family)
+            for edge in doc.get(edge_field, []) or []
+        ):
+            if point_piece(src) != point_piece(dst):
+                count += 1
+        cross_piece[edge_field] = count
+
+    boundaries = doc.get("chunk_boundaries", []) or []
+
+    def boundary_pieces(boundary_index: int) -> set[int]:
+        if boundary_index < 0 or boundary_index >= len(boundaries):
+            raise ValueError(
+                f"chunk edge references boundary {boundary_index}, "
+                f"but only {len(boundaries)} boundaries exist"
+            )
+        boundary = boundaries[boundary_index]
+        start = int(boundary.get("start", 0))
+        end = int(boundary.get("end", start))
+        if start < 0 or end < start or end > text_length:
+            raise ValueError(
+                f"invalid chunk boundary [{start}, {end}) for text length {text_length}"
+            )
+        if start == end:
+            return {point_piece(start)}
+        return {
+            piece_index
+            for piece_index, (piece_start, piece_end) in enumerate(ranges)
+            if start < piece_end and end > piece_start
+        }
+
+    def chunk_cross_count(raw_edges: Any) -> int:
+        count = 0
+        for edge in raw_edges or []:
+            if isinstance(edge, dict) and "from" in edge and "to" in edge:
+                source_index = int(edge["from"])
+                target_index = int(edge["to"])
+            elif isinstance(edge, (list, tuple)) and len(edge) >= 2:
+                source_index = int(edge[0])
+                target_index = int(edge[1])
+            else:
+                raise ValueError(f"invalid chunk edge record: {edge!r}")
+            if not (
+                boundary_pieces(source_index) & boundary_pieces(target_index)
+            ):
+                count += 1
+        return count
+
+    cross_piece["call_edges"] = chunk_cross_count(doc.get("call_edges", []))
+    cross_piece["type_edges"] = chunk_cross_count(doc.get("type_edges", []))
+    pieces[0][_SPLIT_AUDIT_FIELD] = {
+        "cross_piece_edges": cross_piece,
+    }
 
 
 def chunk_enriched_document(
@@ -290,101 +440,27 @@ def chunk_enriched_document(
     *,
     boundary_sort_key=None,
 ) -> list[dict[str, Any]]:
-    """Split an enriched document so every emitted piece fits `max_tokens` exactly."""
+    """Split a document into contiguous, sidecar-aligned, exact-budget pieces.
+
+    Output pieces cover ``text`` exactly once and remain in source order. Chunk
+    boundaries are clipped/remapped into each piece; aligned character sidecars
+    are sliced over the identical character ranges. This is intentionally a
+    lossless text path: semantic boundaries may influence metadata, but they may
+    never cause uncovered prefix/suffix characters or reordered source spans.
+    """
+    if max_tokens <= 0:
+        raise ValueError(f"max_tokens must be positive, got {max_tokens}")
     text = doc.get("text", "")
+    _validate_aligned_character_metadata(doc, text_length=len(text))
     exact_total = count_tokens(text, tokenizer)
     if exact_total <= max_tokens:
         out = dict(doc)
         out["actual_token_count"] = exact_total
         return [out]
-
-    raw_boundaries = list(enumerate(doc.get("chunk_boundaries", []) or []))
-    if not raw_boundaries:
-        return _split_doc_without_boundaries(doc, max_tokens, tokenizer)
-
-    key_fn = boundary_sort_key or (lambda item: int(item[1].get("start", 0)))
-    ordered = sorted(raw_boundaries, key=key_fn)
-    source_ordered = sorted(raw_boundaries, key=lambda item: int(item[1].get("start", 0)))
-    source_rank = {orig_idx: rank for rank, (orig_idx, _) in enumerate(source_ordered)}
-
-    chunks: list[dict[str, Any]] = []
-    current: list[tuple[int, dict[str, Any]]] = []
-    consumed_orig: set[int] = set()
-    consumed_ranks: set[int] = set()
-
-    def _expanded_source_span(
-        entries: list[tuple[int, dict[str, Any]]],
-    ) -> list[tuple[int, dict[str, Any]]] | None:
-        ranks = [
-            source_rank[orig_idx]
-            for orig_idx, _ in entries
-            if orig_idx not in consumed_orig
-        ]
-        if not ranks:
-            return []
-        lo = min(ranks)
-        hi = max(ranks)
-        if any(rank in consumed_ranks for rank in range(lo, hi + 1)):
-            return None
-        return source_ordered[lo : hi + 1]
-
-    def _entries_text(
-        entries: list[tuple[int, dict[str, Any]]],
-    ) -> tuple[int, int, str, list[tuple[int, dict[str, Any]]]] | None:
-        by_source = _expanded_source_span(entries)
-        if by_source is None:
-            return None
-        if not by_source:
-            return (0, 0, "", [])
-        start = int(by_source[0][1].get("start", 0))
-        end = int(by_source[-1][1].get("end", start))
-        return start, end, text[start:end], by_source
-
-    def _flush(entries: list[tuple[int, dict[str, Any]]]) -> None:
-        if not entries:
-            return
-        payload = _entries_text(entries)
-        if payload is None:
-            return
-        start, end, chunk_text, by_source = payload
-        if not by_source:
-            return
-        exact = count_tokens(chunk_text, tokenizer)
-        if exact <= max_tokens:
-            piece = _slice_doc_char_range(doc, start, end, selected_boundaries=by_source)
-            piece["actual_token_count"] = exact
-            chunks.append(piece)
-        else:
-            # Single oversized boundary/span: fall back to exact prefix splitting.
-            temp_piece = _slice_doc_char_range(doc, start, end, selected_boundaries=by_source)
-            chunks.extend(_split_doc_without_boundaries(temp_piece, max_tokens, tokenizer))
-
-        for orig_idx, _ in by_source:
-            consumed_orig.add(orig_idx)
-            consumed_ranks.add(source_rank[orig_idx])
-
-    for entry in ordered:
-        if entry[0] in consumed_orig:
-            continue
-        candidate = current + [entry]
-        payload = _entries_text(candidate)
-        if payload is not None:
-            _, _, candidate_text, _ = payload
-        else:
-            candidate_text = None
-        if candidate_text is not None and count_tokens(candidate_text, tokenizer) <= max_tokens:
-            current = candidate
-            continue
-        if current:
-            _flush(current)
-            if entry[0] not in consumed_orig:
-                current = [entry]
-            else:
-                current = []
-        else:
-            _flush([entry])
-            current = []
-
-    if current:
-        _flush(current)
-    return chunks
+    # `boundary_sort_key` remains in the public signature for compatibility.
+    # Output order is deliberately source order; callers may not use dependency
+    # sorting to omit or reorder characters.
+    del boundary_sort_key
+    pieces = _split_doc_without_boundaries(doc, max_tokens, tokenizer)
+    _annotate_cross_piece_edge_audit(doc, pieces)
+    return pieces
