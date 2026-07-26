@@ -164,12 +164,33 @@ def test_repo_scope_deduplicates_github_identity_and_requires_smoke_limit(
             "owner/repo",
             "https://github.com/Second/Thing.git",
             "git@github.com:SECOND/thing.git",
+            "github.com/Third/Bare.git",
         ],
     )
     scope = ci.load_repo_scope(path)
-    assert [repo.key for repo in scope.repos] == ["owner/repo", "second/thing"]
+    assert [repo.key for repo in scope.repos] == [
+        "owner/repo",
+        "second/thing",
+        "third/bare",
+    ]
     with pytest.raises(ci.ScopeError, match="only with explicit --smoke"):
         ci.load_repo_scope(path, max_repos=1)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://example.invalid/github.com/Owner/Repo",
+        "github.com.evil.invalid/Owner/Repo",
+        "github.com@evil.invalid/Owner/Repo",
+    ],
+)
+def test_repo_scope_rejects_spoofed_github_hosts(
+    tmp_path: Path, value: str
+) -> None:
+    path = _write_repo_list(tmp_path / "repo_list.json", [value])
+    with pytest.raises(ci.ScopeError, match="GitHub"):
+        ci.load_repo_scope(path)
 
 
 def test_paginates_and_preserves_full_compressed_metadata_and_attempts(

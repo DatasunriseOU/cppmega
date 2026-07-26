@@ -194,8 +194,10 @@ def _normalize_owner_repo(value: str) -> tuple[str, str]:
         if parsed.hostname is None or parsed.hostname.casefold() != "github.com":
             raise ScopeError(f"not a GitHub repository: {value!r}")
         candidate = urllib.parse.unquote(parsed.path).strip("/")
-    elif candidate.casefold().startswith("github.com/"):
-        candidate = candidate[len("github.com/") :]
+    elif "/" in candidate:
+        parsed = urllib.parse.urlparse(f"//{candidate}")
+        if parsed.netloc.casefold() == "github.com":
+            candidate = urllib.parse.unquote(parsed.path).strip("/")
     candidate = candidate.strip("/")
     if candidate.endswith(".git"):
         candidate = candidate[:-4]

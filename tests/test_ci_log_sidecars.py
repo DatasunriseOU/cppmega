@@ -19,6 +19,7 @@ from ci_log_sidecars import (  # noqa: E402
     EDGE_IDS,
     SIDECAR_SCHEMA,
     TRAINING_SIDECAR_SCHEMA,
+    _is_package_version,
     canonicalize_ci_log,
     extract_ci_log_sidecar,
     stable_json_dumps,
@@ -361,6 +362,16 @@ def test_package_inventory_rows_are_not_build_actions() -> None:
         for action in actions
     )
     _assert_conserved(result)
+
+
+def test_package_version_parser_is_linear_and_rejects_ambiguous_suffixes() -> None:
+    assert _is_package_version("v4.3.2")
+    assert _is_package_version("3.22.1-1ubuntu1.22.04.2")
+    assert _is_package_version("1.2rc1")
+    assert not _is_package_version("1")
+    assert not _is_package_version("1.2-")
+    assert not _is_package_version("1.2--post")
+    assert not _is_package_version("0.0" + ("0" * 100_000) + "!")
 
 
 def test_build_action_graph_links_non_output_path_inputs() -> None:

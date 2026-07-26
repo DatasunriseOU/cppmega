@@ -437,9 +437,6 @@ _LINK_ARCHIVE_TOOL_RE = re.compile(
     r"(?=\s|$)"
 )
 
-_PACKAGE_VERSION_RE = re.compile(
-    r"^[vV]?\d+(?:\.\d+)+(?:[-+._~]?[A-Za-z0-9]+)*$"
-)
 _PACKAGE_BUILD_ID_RE = re.compile(r"^[A-Za-z0-9.+-]+_\d+$")
 _PACKAGE_SIZE_RE = re.compile(r"(?i)^\d+(?:\.\d+)?(?:[KMGT]i?B)$")
 _PACKAGE_CHANNELS = frozenset(
@@ -2419,6 +2416,48 @@ def _compiler_action_match(content: str) -> tuple[str, re.Match[str]] | None:
     return name, match
 
 
+def _is_package_version(value: str) -> bool:
+    """Recognize dotted package versions in linear time."""
+
+    if not value:
+        return False
+    offset = 1 if value[0] in {"v", "V"} else 0
+    numeric_components = 0
+    length = len(value)
+    while offset < length:
+        start = offset
+        while offset < length and "0" <= value[offset] <= "9":
+            offset += 1
+        if offset == start:
+            return False
+        numeric_components += 1
+        if (
+            offset + 1 < length
+            and value[offset] == "."
+            and "0" <= value[offset + 1] <= "9"
+        ):
+            offset += 1
+            continue
+        break
+    if numeric_components < 2:
+        return False
+    while offset < length:
+        if value[offset] in "-+._~":
+            offset += 1
+            if offset == length:
+                return False
+        start = offset
+        while offset < length and (
+            ("0" <= value[offset] <= "9")
+            or ("A" <= value[offset] <= "Z")
+            or ("a" <= value[offset] <= "z")
+        ):
+            offset += 1
+        if offset == start:
+            return False
+    return True
+
+
 def _is_package_listing_row(
     content: str, tool_match: re.Match[str]
 ) -> bool:
@@ -2433,7 +2472,7 @@ def _is_package_listing_row(
     if len(tokens) < 2:
         return False
     version = tokens[1].rstrip(",;")
-    if _PACKAGE_VERSION_RE.fullmatch(version) is None:
+    if not _is_package_version(version):
         return False
     if re.match(r"^\s{2,}", suffix):
         return True
