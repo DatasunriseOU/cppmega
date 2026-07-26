@@ -30,13 +30,23 @@ def _run_metadata(run_id: int, *, attempt: int = 1) -> dict[str, Any]:
         "run_attempt": attempt,
         "created_at": f"2026-04-27T16:{run_id % 60:02d}:00Z",
         "updated_at": f"2026-04-27T16:{run_id % 60:02d}:01Z",
+        "run_started_at": f"2026-04-27T16:{run_id % 60:02d}:00Z",
         "status": "completed",
         "conclusion": "success",
         "workflow_id": 77,
+        "path": ".github/workflows/ci.yml",
+        "run_number": run_id,
+        "display_title": f"CI run {run_id}",
         "name": "CI",
         "event": "push",
         "head_branch": "main",
         "head_sha": f"{run_id:040x}"[-40:],
+        "head_commit": {
+            "id": f"{run_id:040x}"[-40:],
+            "message": f"commit {run_id}",
+            "author": {"name": "builder"},
+            "committer": {"name": "builder"},
+        },
         "actor": {"login": "builder"},
     }
 
@@ -425,6 +435,18 @@ def test_renamed_repository_uses_canonical_api_route_and_preserves_alias(
         assert provenance["source_repository"] == "contributor/repo"
         assert provenance["source_repository_id"] == 456
         assert provenance["repository_scope_key"] == "owner/repo"
+        assert provenance["workflow"]["path"] == (
+            ".github/workflows/ci.yml"
+        )
+        assert provenance["workflow"]["run_number"] == 1
+        assert provenance["workflow"]["status"] == "completed"
+        assert provenance["workflow"]["conclusion"] == "success"
+        assert provenance["workflow"]["created_at"] == (
+            "2026-04-27T16:01:00Z"
+        )
+        assert provenance["workflow"]["head_commit"]["id"] == (
+            f"{1:040x}"
+        )
     finally:
         fetcher.close()
 

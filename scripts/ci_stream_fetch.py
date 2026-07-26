@@ -2026,9 +2026,22 @@ class CIStreamFetcher:
                 "workflow": {
                     "id": attempt.run_metadata.get("workflow_id"),
                     "name": attempt.run_metadata.get("name"),
+                    "path": attempt.run_metadata.get("path"),
                     "event": attempt.run_metadata.get("event"),
+                    "run_number": attempt.run_metadata.get("run_number"),
+                    "status": attempt.run_metadata.get("status"),
+                    "conclusion": attempt.run_metadata.get("conclusion"),
+                    "created_at": attempt.run_metadata.get("created_at"),
+                    "updated_at": attempt.run_metadata.get("updated_at"),
+                    "started_at": attempt.run_metadata.get(
+                        "run_started_at"
+                    ),
+                    "display_title": attempt.run_metadata.get(
+                        "display_title"
+                    ),
                     "head_branch": attempt.run_metadata.get("head_branch"),
                     "head_sha": attempt.run_metadata.get("head_sha"),
+                    "head_commit": attempt.run_metadata.get("head_commit"),
                     "actor": attempt.run_metadata.get("actor"),
                     "triggering_actor": attempt.run_metadata.get(
                         "triggering_actor"

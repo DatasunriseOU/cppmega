@@ -106,8 +106,24 @@ def test_cmake_ninja_gcc_cuda_success_sections_entities_and_edges() -> None:
         "source_repository_id": 202,
         "workflow": {"name": "CI", "path": ".github/workflows/ci.yml"},
         "run": {"id": 41, "attempt": 2},
+        "run_number": 19,
+        "status": "completed",
+        "conclusion": "success",
+        "created_at": "2026-07-26T04:34:00Z",
+        "updated_at": "2026-07-26T04:36:00Z",
+        "run_started_at": "2026-07-26T04:34:05Z",
+        "display_title": "CUDA build",
         "event_name": "pull_request",
         "head_sha": "a" * 40,
+        "head_commit": {
+            "id": "a" * 40,
+            "message": "exercise CUDA build",
+            "author": {"name": "Contributor", "email": "author@example.test"},
+            "committer": {
+                "name": "Contributor",
+                "email": "author@example.test",
+            },
+        },
         "head_branch": "feature/cuda",
         "actor": {"login": "octocat"},
         "triggering_actor": {"login": "maintainer"},
@@ -115,6 +131,12 @@ def test_cmake_ninja_gcc_cuda_success_sections_entities_and_edges() -> None:
             "id": 9,
             "name": "build (ubuntu-24.04, gcc)",
             "conclusion": "success",
+            "started_at": "2026-07-26T04:34:05Z",
+            "completed_at": "2026-07-26T04:36:00Z",
+            "runner_name": "GitHub Actions 1001",
+            "runner_group_id": 2,
+            "runner_group_name": "GitHub Actions",
+            "labels": ["ubuntu-24.04", "x64"],
             "matrix": {"compiler": "gcc", "os": "ubuntu-24.04"},
             "steps": [
                 {"name": "cmake -S . -B build -DCMAKE_CUDA_COMPILER=nvcc"},
@@ -159,6 +181,35 @@ def test_cmake_ninja_gcc_cuda_success_sections_entities_and_edges() -> None:
     assert sidecar["provenance"]["source_repository"] == (
         "contributor/project"
     )
+    assert sidecar["provenance"]["run"] == {
+        "id": 41,
+        "attempt": 2,
+        "number": 19,
+        "status": "completed",
+        "conclusion": "success",
+        "created_at": "2026-07-26T04:34:00Z",
+        "updated_at": "2026-07-26T04:36:00Z",
+        "started_at": "2026-07-26T04:34:05Z",
+        "display_title": "CUDA build",
+        "event": "pull_request",
+        "head_sha": "a" * 40,
+        "head_commit": metadata["head_commit"],
+        "branch": "feature/cuda",
+    }
+    assert sidecar["provenance"]["job"]["started_at"] == (
+        "2026-07-26T04:34:05Z"
+    )
+    assert sidecar["provenance"]["job"]["completed_at"] == (
+        "2026-07-26T04:36:00Z"
+    )
+    assert sidecar["provenance"]["runner"]["name"] == (
+        "GitHub Actions 1001"
+    )
+    assert sidecar["provenance"]["runner"]["group_id"] == 2
+    assert sidecar["provenance"]["runner"]["labels"] == [
+        "ubuntu-24.04",
+        "x64",
+    ]
 
     assert [section["kind"] for section in result["sections"]] == [
         "job_preamble",
