@@ -1,0 +1,2129 @@
+#!/usr/bin/env python3
+"""Stream GitHub Actions logs into the exact-deduplicated CI content store.
+
+The inventory stage and this fetch stage deliberately use separate SQLite
+databases.  The inventory may continue adding immutable run identities while
+this process consumes the oldest visible runs.  A content-store commit happens
+before an attempt is marked complete, so replay after a crash is idempotent.
+
+Only canonical, secret-redacted payload chunks enter the content store.  Raw
+ZIP archives are bounded temporary inputs.  A separately created rescue spool
+can be imported through the same validation/parser/tokenizer path.
+"""
+
+from __future__ import annotations
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
+import json
+import math
+import os
+from pathlib import Path, PurePosixPath
+import re
+import sqlite3
+import stat
+import sys
+import tempfile
+import threading
+import time
+from typing import Any, Callable, Iterable, Mapping, Sequence
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+import zlib
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts.ci_content_store import (  # noqa: E402
+    CIContentStore,
+    PRODUCTION_TARGET_UNIQUE_TOKENS,
+    hash_token_sequence,
+)
+from scripts.ci_log_sidecars import canonicalize_ci_log  # noqa: E402
+from scripts.ci_stream_inventory import (  # noqa: E402
+    GITHUB_API_VERSION,
+    HTTPResponse,
+    TokenPool,
+    load_token_pool,
+)
+
+
+SCHEMA_VERSION = "cppmega_ci_stream_fetch_v1"
+PROGRESS_SCHEMA = "cppmega_ci_stream_fetch_progress_v1"
+RECEIPT_SCHEMA = "cppmega_ci_stream_fetch_receipt_v1"
+DEFAULT_TOKENIZER = (
+    "../cppmega.mlx/outputs/megatron_ready/"
+    "case5_v4_20260714_093120_mini9/tokenizer/tokenizer.json"
+)
+DEFAULT_TARGET = PRODUCTION_TARGET_UNIQUE_TOKENS
+DEFAULT_MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
+DEFAULT_MAX_MEMBER_BYTES = 1024 * 1024 * 1024
+DEFAULT_MAX_UNCOMPRESSED_BYTES = 8 * 1024 * 1024 * 1024
+DEFAULT_MAX_MEMBERS = 20_000
+DEFAULT_MAX_CHUNK_CHARS = 128_000
+DEFAULT_DISCOVERY_ROWS = 20_000
+DEFAULT_API_ATTEMPTS = 12
+DEFAULT_TIMEOUT = 90.0
+
+_RUN_ATTEMPT_STATES = {
+    "pending",
+    "processing",
+    "retry",
+    "done",
+    "empty",
+    "terminal_404",
+    "terminal_410",
+    "failed",
+}
+_TERMINAL_STATES = {
+    "done",
+    "empty",
+    "terminal_404",
+    "terminal_410",
+    "failed",
+}
+_MAIN_MEMBER_RE = re.compile(r"^(?P<ordinal>\d+)_(?P<name>.+)\.txt$")
+_SECRET_QUERY_KEYS = {
+    "sig",
+    "signature",
+    "token",
+    "se",
+    "sp",
+    "sv",
+    "srt",
+    "spr",
+}
+
+
+class FetchError(RuntimeError):
+    """Base fail-closed fetch error."""
+
+
+class BindingError(FetchError):
+    """Durable state does not match the current producer contract."""
+
+
+class APIError(FetchError):
+    """A GitHub API operation exhausted its safe retry policy."""
+
+
+class MalformedResponseError(APIError):
+    """A response cannot prove the expected endpoint contract."""
+
+
+class ArchiveError(FetchError):
+    """A workflow log archive violates a safety or conservation rule."""
+
+
+class TerminalHTTP(FetchError):
+    """An immutable endpoint result proves that no archive can be fetched."""
+
+    def __init__(self, status: int, body: bytes, endpoint: str):
+        super().__init__(f"GitHub HTTP {status} for {endpoint}")
+        self.status = status
+        self.body = body
+        self.endpoint = endpoint
+
+
+@dataclass(frozen=True)
+class Attempt:
+    repo: str
+    run_id: int
+    attempt: int
+    created_at: str
+    run_metadata: dict[str, Any]
+    run_metadata_sha256: str
+
+    @property
+    def run_attempt_key(self) -> str:
+        return f"{self.run_id}:{self.attempt}"
+
+
+@dataclass(frozen=True)
+class ArchiveSource:
+    path: Path
+    source: str
+    raw_sha256: str
+    raw_size: int
+    recoverable: bool
+
+
+@dataclass(frozen=True)
+class RequestResult:
+    status: int
+    headers: Mapping[str, str]
+    body: bytes
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return _canonical_json(value).encode("utf-8")
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            block = handle.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _script_sha256() -> str:
+    return _sha256_file(Path(__file__).resolve())
+
+
+def _parser_sha256() -> str:
+    import scripts.ci_log_sidecars as parser_module
+
+    return _sha256_file(Path(parser_module.__file__).resolve())
+
+
+def _content_store_sha256() -> str:
+    import scripts.ci_content_store as store_module
+
+    return _sha256_file(Path(store_module.__file__).resolve())
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def atomic_write_json(path: str | os.PathLike[str], value: object) -> None:
+    destination = Path(path).expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    ) + "\n").encode("utf-8")
+    temporary = destination.with_name(
+        f".{destination.name}.tmp-{os.getpid()}-{threading.get_ident()}"
+    )
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        _fsync_directory(destination.parent)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _safe_error(value: object, secrets: Iterable[str] = ()) -> str:
+    text = str(value)
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "<redacted>")
+    return text[:4000]
+
+
+def _safe_url_for_ledger(url: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    if not parsed.query:
+        return urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path, "", "")
+        )
+    keys = []
+    for key, _ in urllib.parse.parse_qsl(
+        parsed.query, keep_blank_values=True
+    ):
+        keys.append("<redacted>" if key.casefold() in _SECRET_QUERY_KEYS else key)
+    query = "&".join(f"{key}=<redacted>" for key in keys)
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, query, "")
+    )
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Mapping[str, str],
+        newurl: str,
+    ) -> None:
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
+def _default_no_redirect_requester(
+    method: str,
+    url: str,
+    headers: Mapping[str, str],
+    timeout: float,
+) -> HTTPResponse:
+    request = urllib.request.Request(
+        url, headers=dict(headers), method=method
+    )
+    try:
+        with _NO_REDIRECT_OPENER.open(request, timeout=timeout) as response:
+            return HTTPResponse(
+                status=int(response.status),
+                headers=dict(response.headers.items()),
+                body=response.read(),
+            )
+    except urllib.error.HTTPError as exc:
+        return HTTPResponse(
+            status=int(exc.code),
+            headers=dict(exc.headers.items()) if exc.headers is not None else {},
+            body=exc.read(),
+        )
+
+
+def _default_archive_downloader(
+    url: str,
+    destination: Path,
+    *,
+    timeout: float,
+    max_bytes: int,
+) -> tuple[int, str]:
+    parsed = urllib.parse.urlsplit(url)
+    if (
+        parsed.scheme.casefold() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ArchiveError("GitHub returned an unsafe signed archive URL")
+    # Deliberately no Authorization header: the signed URL is the credential.
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "cppmega-ci-stream-fetch/1"},
+        method="GET",
+    )
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status_code = int(response.status)
+            if status_code != 200:
+                raise APIError(
+                    f"signed archive URL returned HTTP {status_code}"
+                )
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None:
+                try:
+                    declared = int(content_length)
+                except ValueError as exc:
+                    raise MalformedResponseError(
+                        "signed archive Content-Length is not an integer"
+                    ) from exc
+                if declared < 0 or declared > max_bytes:
+                    raise ArchiveError(
+                        f"archive Content-Length {declared} exceeds limit "
+                        f"{max_bytes}"
+                    )
+            with destination.open("xb") as output:
+                while True:
+                    block = response.read(1024 * 1024)
+                    if not block:
+                        break
+                    total += len(block)
+                    if total > max_bytes:
+                        raise ArchiveError(
+                            f"archive exceeded byte limit {max_bytes}"
+                        )
+                    output.write(block)
+                    digest.update(block)
+                output.flush()
+                os.fsync(output.fileno())
+    except urllib.error.HTTPError as exc:
+        raise APIError(
+            f"signed archive URL returned HTTP {exc.code}"
+        ) from exc
+    if total == 0:
+        raise ArchiveError("signed archive response was empty")
+    return total, digest.hexdigest()
+
+
+class ExactTokenizer:
+    """Frozen tokenizer adapter with an auditable, option-bound fingerprint."""
+
+    def __init__(self, tokenizer_json: str | os.PathLike[str]):
+        path = Path(tokenizer_json).expanduser().resolve()
+        try:
+            from tokenizers import Tokenizer, __version__ as tokenizers_version
+        except ImportError as exc:
+            raise FetchError(
+                "the existing project environment lacks the tokenizers package"
+            ) from exc
+        if not path.is_file() or path.is_symlink():
+            raise FetchError(f"tokenizer.json is missing or unsafe: {path}")
+        raw = path.read_bytes()
+        self.path = path
+        self.artifact_sha256 = _sha256_bytes(raw)
+        self._tokenizer = Tokenizer.from_file(str(path))
+        self.contract = {
+            "schema": "cppmega_exact_ci_tokenizer_v1",
+            "artifact": str(path),
+            "artifact_sha256": self.artifact_sha256,
+            "library": "tokenizers",
+            "library_version": str(tokenizers_version),
+            "add_special_tokens": False,
+            "payload_only": True,
+        }
+        self.fingerprint = _sha256_bytes(
+            _canonical_json_bytes(self.contract)
+        )
+
+    def encode_batch(self, texts: Sequence[str]) -> list[list[int]]:
+        if not texts:
+            return []
+        encodings = self._tokenizer.encode_batch(
+            list(texts), add_special_tokens=False
+        )
+        token_ids = [list(item.ids) for item in encodings]
+        if len(token_ids) != len(texts):
+            raise FetchError("tokenizer changed the batch cardinality")
+        return token_ids
+
+
+_STATE_SCHEMA = """
+PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS attempts (
+    repo TEXT NOT NULL,
+    run_id INTEGER NOT NULL,
+    attempt INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    run_metadata_sha256 TEXT NOT NULL,
+    run_metadata_raw_size INTEGER NOT NULL,
+    run_metadata_zlib BLOB NOT NULL,
+    status TEXT NOT NULL CHECK (
+      status IN (
+        'pending','processing','retry','done','empty',
+        'terminal_404','terminal_410','failed'
+      )
+    ),
+    tries INTEGER NOT NULL DEFAULT 0,
+    archive_source TEXT,
+    archive_sha256 TEXT,
+    archive_size INTEGER,
+    jobs_sha256 TEXT,
+    jobs_raw_size INTEGER,
+    jobs_zlib BLOB,
+    member_count INTEGER NOT NULL DEFAULT 0,
+    chunk_count INTEGER NOT NULL DEFAULT 0,
+    occurrence_tokens INTEGER NOT NULL DEFAULT 0,
+    terminal_http_status INTEGER,
+    terminal_body_sha256 TEXT,
+    error_class TEXT,
+    error_message TEXT,
+    discovered_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(repo,run_id,attempt)
+);
+CREATE INDEX IF NOT EXISTS idx_attempts_work
+ON attempts(status,created_at,repo,run_id,attempt);
+CREATE TABLE IF NOT EXISTS members (
+    repo TEXT NOT NULL,
+    run_id INTEGER NOT NULL,
+    attempt INTEGER NOT NULL,
+    archive_member TEXT NOT NULL,
+    job_key TEXT NOT NULL,
+    raw_sha256 TEXT NOT NULL,
+    raw_size INTEGER NOT NULL,
+    canonical_sha256 TEXT NOT NULL,
+    dedup_sha256 TEXT NOT NULL,
+    sidecar_sha256 TEXT NOT NULL,
+    sidecar_raw_size INTEGER NOT NULL,
+    sidecar_zlib BLOB NOT NULL,
+    chunk_count INTEGER NOT NULL,
+    occurrence_tokens INTEGER NOT NULL,
+    PRIMARY KEY(repo,run_id,attempt,archive_member),
+    FOREIGN KEY(repo,run_id,attempt)
+      REFERENCES attempts(repo,run_id,attempt)
+);
+CREATE TABLE IF NOT EXISTS request_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    requested_at TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    run_id INTEGER NOT NULL,
+    attempt INTEGER NOT NULL,
+    endpoint TEXT NOT NULL,
+    page_no INTEGER,
+    request_attempt INTEGER NOT NULL,
+    http_status INTEGER,
+    outcome TEXT NOT NULL,
+    latency_ms INTEGER NOT NULL,
+    error_class TEXT,
+    error_message TEXT
+);
+"""
+
+
+class FetchState:
+    """Durable attempt, request, and compact full-sidecar ledger."""
+
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        inventory_path: str | os.PathLike[str],
+        content_store_path: str | os.PathLike[str],
+        tokenizer: ExactTokenizer,
+        resume: bool,
+    ):
+        self.path = Path(path).expanduser().resolve()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.inventory_path = Path(inventory_path).expanduser().resolve()
+        self.content_store_path = (
+            Path(content_store_path).expanduser().resolve()
+        )
+        self._discovery_cursor: tuple[str, str, int, int] | None = None
+        self._lock = threading.RLock()
+        self._connection = sqlite3.connect(
+            self.path,
+            timeout=60.0,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        self._connection.row_factory = sqlite3.Row
+        self._connection.execute("PRAGMA busy_timeout=60000")
+        self._connection.execute("PRAGMA journal_mode=WAL")
+        self._connection.execute("PRAGMA synchronous=FULL")
+        self._connection.executescript(_STATE_SCHEMA)
+        expected = {
+            "schema": SCHEMA_VERSION,
+            "inventory_path": str(self.inventory_path),
+            "content_store_path": str(self.content_store_path),
+            "tokenizer_contract": _canonical_json(tokenizer.contract),
+            "tokenizer_fingerprint": tokenizer.fingerprint,
+            "fetcher_script_sha256": _script_sha256(),
+            "parser_script_sha256": _parser_sha256(),
+            "content_store_script_sha256": _content_store_sha256(),
+            "chunk_semantics": (
+                "parser-dedup-text-payload-only-no-framing-v1"
+            ),
+        }
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                current = dict(
+                    self._connection.execute(
+                        "SELECT key,value FROM settings"
+                    ).fetchall()
+                )
+                if current:
+                    if not resume:
+                        raise BindingError(
+                            f"fetch state exists at {self.path}; pass --resume"
+                        )
+                    mismatches = {
+                        key: (current.get(key), value)
+                        for key, value in expected.items()
+                        if current.get(key) != value
+                    }
+                    if mismatches:
+                        rendered = ", ".join(
+                            f"{key}={old!r}->{new!r}"
+                            for key, (old, new) in sorted(mismatches.items())
+                        )
+                        raise BindingError(
+                            f"fetch-state binding mismatch: {rendered}"
+                        )
+                else:
+                    self._connection.executemany(
+                        "INSERT INTO settings(key,value) VALUES (?,?)",
+                        sorted(expected.items()),
+                    )
+                    self._connection.execute(
+                        "INSERT INTO settings(key,value) VALUES ('created_at',?)",
+                        (_utc_now(),),
+                    )
+                if resume:
+                    self._connection.execute(
+                        """
+                        UPDATE attempts SET status='retry',
+                            error_class='InterruptedAttempt',
+                            error_message='processing interrupted before closure',
+                            updated_at=?
+                        WHERE status='processing'
+                        """,
+                        (_utc_now(),),
+                    )
+                self._connection.execute("COMMIT")
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                self._connection.close()
+                raise
+
+    def close(self) -> None:
+        self._connection.close()
+
+    def _inventory_connection(self) -> sqlite3.Connection:
+        if not self.inventory_path.is_file():
+            raise FetchError(
+                f"inventory SQLite does not exist: {self.inventory_path}"
+            )
+        connection = sqlite3.connect(
+            f"file:{self.inventory_path}?mode=ro",
+            uri=True,
+            timeout=60.0,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=60000")
+        connection.execute("PRAGMA query_only=ON")
+        return connection
+
+    def discover(self, *, row_limit: int = DEFAULT_DISCOVERY_ROWS) -> int:
+        if row_limit <= 0:
+            raise ValueError("row_limit must be positive")
+        inventory = self._inventory_connection()
+        try:
+            if self._discovery_cursor is None:
+                rows = inventory.execute(
+                    """
+                    SELECT repo_key,run_id,run_attempt,created_at,
+                           metadata_blob,metadata_sha256
+                    FROM runs
+                    ORDER BY created_at,repo_key,run_id,run_attempt
+                    LIMIT ?
+                    """,
+                    (row_limit,),
+                ).fetchall()
+            else:
+                created_at, repo_key, run_id, run_attempt = (
+                    self._discovery_cursor
+                )
+                rows = inventory.execute(
+                    """
+                    SELECT repo_key,run_id,run_attempt,created_at,
+                           metadata_blob,metadata_sha256
+                    FROM runs
+                    WHERE (created_at,repo_key,run_id,run_attempt)
+                          > (?,?,?,?)
+                    ORDER BY created_at,repo_key,run_id,run_attempt
+                    LIMIT ?
+                    """,
+                    (
+                        created_at,
+                        repo_key,
+                        run_id,
+                        run_attempt,
+                        row_limit,
+                    ),
+                ).fetchall()
+        finally:
+            inventory.close()
+        if rows:
+            final_row = rows[-1]
+            self._discovery_cursor = (
+                str(final_row["created_at"]),
+                str(final_row["repo_key"]),
+                int(final_row["run_id"]),
+                int(final_row["run_attempt"]),
+            )
+        else:
+            # A completed sweep restarts so runs inserted late into an older
+            # repository/window cannot be missed permanently.
+            self._discovery_cursor = None
+        now = _utc_now()
+        inserted = 0
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                for row in rows:
+                    blob = bytes(row["metadata_blob"])
+                    try:
+                        metadata_bytes = zlib.decompress(blob)
+                        metadata = json.loads(metadata_bytes)
+                    except (zlib.error, UnicodeError, json.JSONDecodeError) as exc:
+                        raise FetchError(
+                            f"corrupt inventory metadata for "
+                            f"{row['repo_key']}#{row['run_id']}"
+                        ) from exc
+                    if not isinstance(metadata, dict):
+                        raise FetchError("inventory run metadata is not an object")
+                    metadata_sha = _sha256_bytes(metadata_bytes)
+                    if metadata_sha != str(row["metadata_sha256"]):
+                        raise FetchError("inventory run metadata digest mismatch")
+                    raw_attempt = int(row["run_attempt"])
+                    maximum_attempt = max(1, raw_attempt)
+                    for attempt in range(1, maximum_attempt + 1):
+                        cursor = self._connection.execute(
+                            """
+                            INSERT INTO attempts(
+                              repo,run_id,attempt,created_at,
+                              run_metadata_sha256,run_metadata_raw_size,
+                              run_metadata_zlib,status,discovered_at,updated_at
+                            ) VALUES (?,?,?,?,?,?,?,'pending',?,?)
+                            ON CONFLICT(repo,run_id,attempt) DO UPDATE SET
+                              created_at=excluded.created_at,
+                              run_metadata_sha256=excluded.run_metadata_sha256,
+                              run_metadata_raw_size=excluded.run_metadata_raw_size,
+                              run_metadata_zlib=excluded.run_metadata_zlib,
+                              updated_at=excluded.updated_at
+                            WHERE attempts.status IN ('pending','retry')
+                            """,
+                            (
+                                str(row["repo_key"]),
+                                int(row["run_id"]),
+                                attempt,
+                                str(row["created_at"]),
+                                metadata_sha,
+                                len(metadata_bytes),
+                                sqlite3.Binary(zlib.compress(metadata_bytes, 6)),
+                                now,
+                                now,
+                            ),
+                        )
+                        inserted += int(cursor.rowcount > 0)
+                self._connection.execute("COMMIT")
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                raise
+        return inserted
+
+    @staticmethod
+    def _decode_attempt(row: sqlite3.Row) -> Attempt:
+        blob = bytes(row["run_metadata_zlib"])
+        try:
+            raw = zlib.decompress(blob)
+            value = json.loads(raw)
+        except (zlib.error, UnicodeError, json.JSONDecodeError) as exc:
+            raise FetchError("fetch-state run metadata is corrupt") from exc
+        if not isinstance(value, dict):
+            raise FetchError("fetch-state run metadata is not an object")
+        if len(raw) != int(row["run_metadata_raw_size"]):
+            raise FetchError("fetch-state run metadata size mismatch")
+        digest = _sha256_bytes(raw)
+        if digest != str(row["run_metadata_sha256"]):
+            raise FetchError("fetch-state run metadata digest mismatch")
+        return Attempt(
+            repo=str(row["repo"]),
+            run_id=int(row["run_id"]),
+            attempt=int(row["attempt"]),
+            created_at=str(row["created_at"]),
+            run_metadata=value,
+            run_metadata_sha256=digest,
+        )
+
+    def next_attempt(self) -> Attempt | None:
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._connection.execute(
+                    """
+                    SELECT * FROM attempts
+                    WHERE status IN ('pending','retry')
+                    ORDER BY created_at,repo,run_id,attempt
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if row is None:
+                    self._connection.execute("COMMIT")
+                    return None
+                self._connection.execute(
+                    """
+                    UPDATE attempts SET status='processing',tries=tries+1,
+                      error_class=NULL,error_message=NULL,updated_at=?
+                    WHERE repo=? AND run_id=? AND attempt=?
+                    """,
+                    (
+                        _utc_now(),
+                        str(row["repo"]),
+                        int(row["run_id"]),
+                        int(row["attempt"]),
+                    ),
+                )
+                self._connection.execute("COMMIT")
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                raise
+        return self._decode_attempt(row)
+
+    def record_request(
+        self,
+        attempt: Attempt,
+        *,
+        endpoint: str,
+        page_no: int | None,
+        request_attempt: int,
+        http_status: int | None,
+        outcome: str,
+        latency_ms: int,
+        error: BaseException | str | None = None,
+        secrets: Iterable[str] = (),
+    ) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO request_ledger(
+                  requested_at,repo,run_id,attempt,endpoint,page_no,
+                  request_attempt,http_status,outcome,latency_ms,
+                  error_class,error_message
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    _utc_now(),
+                    attempt.repo,
+                    attempt.run_id,
+                    attempt.attempt,
+                    endpoint,
+                    page_no,
+                    request_attempt,
+                    http_status,
+                    outcome,
+                    latency_ms,
+                    None if error is None else type(error).__name__,
+                    None if error is None else _safe_error(error, secrets),
+                ),
+            )
+
+    def store_member(
+        self,
+        attempt: Attempt,
+        *,
+        archive_member: str,
+        job_key: str,
+        raw_sha256: str,
+        raw_size: int,
+        canonical_sha256: str,
+        dedup_sha256: str,
+        sidecar: Mapping[str, object],
+        chunk_count: int,
+        occurrence_tokens: int,
+    ) -> None:
+        sidecar_bytes = _canonical_json_bytes(sidecar)
+        sidecar_sha = _sha256_bytes(sidecar_bytes)
+        compressed = zlib.compress(sidecar_bytes, 6)
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                previous = self._connection.execute(
+                    """
+                    SELECT raw_sha256,canonical_sha256,dedup_sha256,
+                           sidecar_sha256,chunk_count,occurrence_tokens
+                    FROM members
+                    WHERE repo=? AND run_id=? AND attempt=?
+                      AND archive_member=?
+                    """,
+                    (
+                        attempt.repo,
+                        attempt.run_id,
+                        attempt.attempt,
+                        archive_member,
+                    ),
+                ).fetchone()
+                identity = (
+                    raw_sha256,
+                    canonical_sha256,
+                    dedup_sha256,
+                    sidecar_sha,
+                    chunk_count,
+                    occurrence_tokens,
+                )
+                if previous is not None:
+                    old = (
+                        str(previous["raw_sha256"]),
+                        str(previous["canonical_sha256"]),
+                        str(previous["dedup_sha256"]),
+                        str(previous["sidecar_sha256"]),
+                        int(previous["chunk_count"]),
+                        int(previous["occurrence_tokens"]),
+                    )
+                    if old != identity:
+                        raise BindingError(
+                            f"member replay changed: {archive_member}"
+                        )
+                else:
+                    self._connection.execute(
+                        """
+                        INSERT INTO members(
+                          repo,run_id,attempt,archive_member,job_key,
+                          raw_sha256,raw_size,canonical_sha256,dedup_sha256,
+                          sidecar_sha256,sidecar_raw_size,sidecar_zlib,
+                          chunk_count,occurrence_tokens
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            attempt.repo,
+                            attempt.run_id,
+                            attempt.attempt,
+                            archive_member,
+                            job_key,
+                            raw_sha256,
+                            raw_size,
+                            canonical_sha256,
+                            dedup_sha256,
+                            sidecar_sha,
+                            len(sidecar_bytes),
+                            sqlite3.Binary(compressed),
+                            chunk_count,
+                            occurrence_tokens,
+                        ),
+                    )
+                self._connection.execute("COMMIT")
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                raise
+
+    def finish_attempt(
+        self,
+        attempt: Attempt,
+        *,
+        status: str,
+        archive_source: str | None = None,
+        archive_sha256: str | None = None,
+        archive_size: int | None = None,
+        jobs: Sequence[Mapping[str, object]] | None = None,
+        member_count: int = 0,
+        chunk_count: int = 0,
+        occurrence_tokens: int = 0,
+        terminal_http_status: int | None = None,
+        terminal_body_sha256: str | None = None,
+        error: BaseException | str | None = None,
+        retry: bool = False,
+        secrets: Iterable[str] = (),
+    ) -> None:
+        if status not in _RUN_ATTEMPT_STATES:
+            raise ValueError(f"invalid attempt status {status!r}")
+        if retry and status != "retry":
+            raise ValueError("retry flag requires retry status")
+        jobs_bytes = (
+            None if jobs is None else _canonical_json_bytes(list(jobs))
+        )
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE attempts SET
+                  status=?,archive_source=?,archive_sha256=?,archive_size=?,
+                  jobs_sha256=?,jobs_raw_size=?,jobs_zlib=?,
+                  member_count=?,chunk_count=?,occurrence_tokens=?,
+                  terminal_http_status=?,terminal_body_sha256=?,
+                  error_class=?,error_message=?,updated_at=?
+                WHERE repo=? AND run_id=? AND attempt=?
+                """,
+                (
+                    status,
+                    archive_source,
+                    archive_sha256,
+                    archive_size,
+                    None if jobs_bytes is None else _sha256_bytes(jobs_bytes),
+                    None if jobs_bytes is None else len(jobs_bytes),
+                    None
+                    if jobs_bytes is None
+                    else sqlite3.Binary(zlib.compress(jobs_bytes, 6)),
+                    member_count,
+                    chunk_count,
+                    occurrence_tokens,
+                    terminal_http_status,
+                    terminal_body_sha256,
+                    None if error is None else type(error).__name__,
+                    None if error is None else _safe_error(error, secrets),
+                    _utc_now(),
+                    attempt.repo,
+                    attempt.run_id,
+                    attempt.attempt,
+                ),
+            )
+
+    def summary(self) -> dict[str, object]:
+        with self._lock:
+            status_counts = {
+                str(row["status"]): int(row["n"])
+                for row in self._connection.execute(
+                    "SELECT status,COUNT(*) AS n FROM attempts GROUP BY status"
+                )
+            }
+            totals = self._connection.execute(
+                """
+                SELECT COUNT(*) AS attempts,
+                       COALESCE(SUM(member_count),0) AS members,
+                       COALESCE(SUM(chunk_count),0) AS chunks,
+                       COALESCE(SUM(occurrence_tokens),0) AS occurrence_tokens
+                FROM attempts
+                WHERE status IN (
+                  'done','empty','terminal_404','terminal_410'
+                )
+                """
+            ).fetchone()
+            requests = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM request_ledger"
+                ).fetchone()[0]
+            )
+            sidecar_digest = hashlib.sha256()
+            for row in self._connection.execute(
+                """
+                SELECT repo,run_id,attempt,archive_member,sidecar_sha256
+                FROM members
+                ORDER BY repo,run_id,attempt,archive_member
+                """
+            ):
+                sidecar_digest.update(
+                    (
+                        f"{row['repo']}\t{row['run_id']}\t{row['attempt']}\t"
+                        f"{row['archive_member']}\t{row['sidecar_sha256']}\n"
+                    ).encode("utf-8")
+                )
+            return {
+                "attempt_statuses": status_counts,
+                "attempts_terminal": int(totals["attempts"]),
+                "members": int(totals["members"]),
+                "chunks": int(totals["chunks"]),
+                "occurrence_tokens": int(totals["occurrence_tokens"]),
+                "requests": requests,
+                "sidecar_set_sha256": sidecar_digest.hexdigest(),
+            }
+
+
+class GitHubAttemptClient:
+    """Jobs and attempt-log client that never forwards API auth to blob URLs."""
+
+    def __init__(
+        self,
+        tokens: Sequence[str],
+        state: FetchState,
+        *,
+        requester: Callable[
+            [str, str, Mapping[str, str], float], HTTPResponse
+        ] = _default_no_redirect_requester,
+        archive_downloader: Callable[..., tuple[int, str]] = (
+            _default_archive_downloader
+        ),
+        timeout: float = DEFAULT_TIMEOUT,
+        max_attempts: int = DEFAULT_API_ATTEMPTS,
+        max_archive_bytes: int = DEFAULT_MAX_ARCHIVE_BYTES,
+        sleeper: Callable[[float], None] = time.sleep,
+    ):
+        self.pool = TokenPool(tokens, sleeper=sleeper)
+        self.state = state
+        self.requester = requester
+        self.archive_downloader = archive_downloader
+        self.timeout = timeout
+        self.max_attempts = max_attempts
+        self.max_archive_bytes = max_archive_bytes
+        self.sleeper = sleeper
+        self.api_base = "https://api.github.com"
+
+    @property
+    def secrets(self) -> tuple[str, ...]:
+        return self.pool.secrets
+
+    @staticmethod
+    def _body_message(body: bytes) -> str:
+        try:
+            value = json.loads(body)
+        except (UnicodeError, json.JSONDecodeError):
+            return body.decode("utf-8", errors="replace")[:1000]
+        if isinstance(value, dict):
+            return str(value.get("message") or value)[:1000]
+        return str(value)[:1000]
+
+    def _request(
+        self,
+        attempt: Attempt,
+        endpoint: str,
+        *,
+        query: Mapping[str, object] | None = None,
+        page_no: int | None = None,
+        accepted: set[int],
+    ) -> RequestResult:
+        url = f"{self.api_base}{endpoint}"
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        for request_attempt in range(1, self.max_attempts + 1):
+            token_index, token = self.pool.acquire()
+            headers = {
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "cppmega-ci-stream-fetch/1",
+                "X-GitHub-Api-Version": GITHUB_API_VERSION,
+            }
+            started = time.monotonic()
+            try:
+                response = self.requester(
+                    "GET", url, headers, self.timeout
+                )
+            except Exception as exc:
+                elapsed = int((time.monotonic() - started) * 1000)
+                self.state.record_request(
+                    attempt,
+                    endpoint=endpoint,
+                    page_no=page_no,
+                    request_attempt=request_attempt,
+                    http_status=None,
+                    outcome="transport_retry",
+                    latency_ms=elapsed,
+                    error=exc,
+                    secrets=self.secrets,
+                )
+                if request_attempt == self.max_attempts:
+                    raise APIError(
+                        f"transport retries exhausted for {endpoint}"
+                    ) from exc
+                self.sleeper(min(2 ** (request_attempt - 1), 30))
+                continue
+            elapsed = int((time.monotonic() - started) * 1000)
+            self.pool.observe(token_index, response.headers)
+            lowered = {
+                str(key).casefold(): str(value)
+                for key, value in response.headers.items()
+            }
+            message = self._body_message(response.body)
+            rate_limited = response.status == 429 or (
+                response.status == 403
+                and (
+                    lowered.get("x-ratelimit-remaining") == "0"
+                    or "rate limit" in message.casefold()
+                    or "abuse" in message.casefold()
+                )
+            )
+            if rate_limited:
+                self.pool.rate_limited(
+                    token_index,
+                    response.headers,
+                    secondary="secondary" in message.casefold(),
+                )
+                self.state.record_request(
+                    attempt,
+                    endpoint=endpoint,
+                    page_no=page_no,
+                    request_attempt=request_attempt,
+                    http_status=response.status,
+                    outcome="rate_limit_retry",
+                    latency_ms=elapsed,
+                    error=message,
+                    secrets=self.secrets,
+                )
+                if request_attempt == self.max_attempts:
+                    raise APIError(
+                        f"rate-limit retries exhausted for {endpoint}"
+                    )
+                continue
+            if response.status >= 500:
+                self.state.record_request(
+                    attempt,
+                    endpoint=endpoint,
+                    page_no=page_no,
+                    request_attempt=request_attempt,
+                    http_status=response.status,
+                    outcome="server_retry",
+                    latency_ms=elapsed,
+                    error=message,
+                    secrets=self.secrets,
+                )
+                if request_attempt == self.max_attempts:
+                    raise APIError(
+                        f"server retries exhausted for {endpoint}"
+                    )
+                self.sleeper(min(2 ** (request_attempt - 1), 30))
+                continue
+            if response.status not in accepted:
+                self.state.record_request(
+                    attempt,
+                    endpoint=endpoint,
+                    page_no=page_no,
+                    request_attempt=request_attempt,
+                    http_status=response.status,
+                    outcome="permanent_error",
+                    latency_ms=elapsed,
+                    error=message,
+                    secrets=self.secrets,
+                )
+                raise APIError(
+                    f"GitHub HTTP {response.status} for {endpoint}: "
+                    f"{_safe_error(message, self.secrets)}"
+                )
+            self.state.record_request(
+                attempt,
+                endpoint=endpoint,
+                page_no=page_no,
+                request_attempt=request_attempt,
+                http_status=response.status,
+                outcome="success",
+                latency_ms=elapsed,
+                secrets=self.secrets,
+            )
+            return RequestResult(
+                status=response.status,
+                headers=response.headers,
+                body=response.body,
+            )
+        raise AssertionError("unreachable request loop")
+
+    def fetch_jobs(self, attempt: Attempt) -> list[dict[str, Any]]:
+        endpoint = (
+            f"/repos/{attempt.repo}/actions/runs/{attempt.run_id}/"
+            f"attempts/{attempt.attempt}/jobs"
+        )
+        jobs: list[dict[str, Any]] = []
+        total: int | None = None
+        page = 1
+        while True:
+            result = self._request(
+                attempt,
+                endpoint,
+                query={"filter": "all", "per_page": 100, "page": page},
+                page_no=page,
+                accepted={200, 404, 410},
+            )
+            if result.status in {404, 410}:
+                raise TerminalHTTP(result.status, result.body, endpoint)
+            try:
+                payload = json.loads(result.body)
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                raise MalformedResponseError(
+                    f"jobs page {page} is not JSON"
+                ) from exc
+            if (
+                not isinstance(payload, dict)
+                or isinstance(payload.get("total_count"), bool)
+                or not isinstance(payload.get("total_count"), int)
+                or int(payload["total_count"]) < 0
+                or not isinstance(payload.get("jobs"), list)
+                or any(not isinstance(item, dict) for item in payload["jobs"])
+            ):
+                raise MalformedResponseError(
+                    f"jobs page {page} has an invalid schema"
+                )
+            page_total = int(payload["total_count"])
+            if total is None:
+                total = page_total
+            elif total != page_total:
+                raise MalformedResponseError(
+                    f"jobs total_count changed {total}->{page_total}"
+                )
+            page_jobs = [dict(item) for item in payload["jobs"]]
+            expected_pages = max(1, math.ceil(page_total / 100))
+            expected_items = (
+                100
+                if page < expected_pages
+                else page_total - 100 * (expected_pages - 1)
+            )
+            if len(page_jobs) != expected_items:
+                raise MalformedResponseError(
+                    f"jobs page {page} has {len(page_jobs)} items, "
+                    f"expected {expected_items}"
+                )
+            jobs.extend(page_jobs)
+            if page >= expected_pages:
+                break
+            page += 1
+        assert total is not None
+        ids = []
+        for job in jobs:
+            job_id = job.get("id")
+            if isinstance(job_id, bool) or not isinstance(job_id, int):
+                raise MalformedResponseError("job id is not an integer")
+            ids.append(job_id)
+        if len(jobs) != total or len(set(ids)) != total:
+            raise MalformedResponseError(
+                "jobs enumeration is incomplete or contains duplicates"
+            )
+        return jobs
+
+    def fetch_archive(self, attempt: Attempt, destination: Path) -> ArchiveSource:
+        endpoint = (
+            f"/repos/{attempt.repo}/actions/runs/{attempt.run_id}/"
+            f"attempts/{attempt.attempt}/logs"
+        )
+        result = self._request(
+            attempt,
+            endpoint,
+            accepted={200, 302, 404, 410},
+        )
+        if result.status in {404, 410}:
+            raise TerminalHTTP(result.status, result.body, endpoint)
+        if result.status == 200:
+            if len(result.body) > self.max_archive_bytes:
+                raise ArchiveError("inline archive exceeds byte limit")
+            with destination.open("xb") as output:
+                output.write(result.body)
+                output.flush()
+                os.fsync(output.fileno())
+            return ArchiveSource(
+                path=destination,
+                source="github-inline",
+                raw_sha256=_sha256_bytes(result.body),
+                raw_size=len(result.body),
+                recoverable=False,
+            )
+        location = None
+        for key, value in result.headers.items():
+            if str(key).casefold() == "location":
+                location = str(value)
+                break
+        if not location:
+            raise MalformedResponseError(
+                "attempt-log redirect lacks Location"
+            )
+        size, digest = self.archive_downloader(
+            location,
+            destination,
+            timeout=self.timeout,
+            max_bytes=self.max_archive_bytes,
+        )
+        return ArchiveSource(
+            path=destination,
+            source="github-signed-url",
+            raw_sha256=digest,
+            raw_size=size,
+            recoverable=False,
+        )
+
+
+def _normalized_job_name(value: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", value.casefold()).split())
+
+
+def _member_job_hint(name: str) -> tuple[int | None, str]:
+    posix = PurePosixPath(name)
+    if len(posix.parts) >= 2 and posix.name.casefold() == "system.txt":
+        return None, posix.parts[-2]
+    match = _MAIN_MEMBER_RE.fullmatch(posix.name)
+    if match:
+        return int(match.group("ordinal")), match.group("name")
+    return None, posix.stem
+
+
+def _job_for_member(
+    name: str, jobs: Sequence[Mapping[str, object]]
+) -> dict[str, object] | None:
+    ordinal, hint = _member_job_hint(name)
+    normalized_hint = _normalized_job_name(hint)
+    exact = [
+        dict(job)
+        for job in jobs
+        if _normalized_job_name(str(job.get("name") or "")) == normalized_hint
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    if ordinal is not None and 0 <= ordinal < len(jobs):
+        return dict(jobs[ordinal])
+    return None
+
+
+def _safe_zip_infos(
+    archive: Path,
+    *,
+    max_members: int,
+    max_member_bytes: int,
+    max_uncompressed_bytes: int,
+) -> list[zipfile.ZipInfo]:
+    if archive.is_symlink() or not archive.is_file():
+        raise ArchiveError(f"archive path is unsafe: {archive}")
+    try:
+        handle = zipfile.ZipFile(archive)
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise ArchiveError(f"invalid ZIP archive: {exc}") from exc
+    with handle:
+        infos = handle.infolist()
+        if len(infos) > max_members:
+            raise ArchiveError(
+                f"ZIP member count {len(infos)} exceeds {max_members}"
+            )
+        names: set[str] = set()
+        total = 0
+        safe: list[zipfile.ZipInfo] = []
+        for info in infos:
+            name = info.filename
+            if "\x00" in name or "\\" in name:
+                raise ArchiveError(f"unsafe ZIP member name: {name!r}")
+            pure = PurePosixPath(name)
+            if pure.is_absolute() or any(part == ".." for part in pure.parts):
+                raise ArchiveError(f"unsafe ZIP traversal member: {name!r}")
+            if name in names:
+                raise ArchiveError(f"duplicate ZIP member: {name!r}")
+            names.add(name)
+            mode = (info.external_attr >> 16) & 0xFFFF
+            if mode and stat.S_ISLNK(mode):
+                raise ArchiveError(f"ZIP symlink member is forbidden: {name!r}")
+            if info.flag_bits & 0x1:
+                raise ArchiveError(f"encrypted ZIP member is forbidden: {name!r}")
+            if info.file_size < 0 or info.compress_size < 0:
+                raise ArchiveError("ZIP member has negative size")
+            if info.file_size > max_member_bytes:
+                raise ArchiveError(
+                    f"ZIP member {name!r} exceeds {max_member_bytes} bytes"
+                )
+            total += info.file_size
+            if total > max_uncompressed_bytes:
+                raise ArchiveError(
+                    "ZIP uncompressed total exceeds configured limit"
+                )
+            if not info.is_dir():
+                safe.append(info)
+        return safe
+
+
+def _read_zip_member(
+    archive: Path, info: zipfile.ZipInfo, *, max_member_bytes: int
+) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        with zipfile.ZipFile(archive) as handle, handle.open(info) as source:
+            while True:
+                block = source.read(1024 * 1024)
+                if not block:
+                    break
+                total += len(block)
+                if total > max_member_bytes or total > info.file_size:
+                    raise ArchiveError(
+                        f"ZIP member changed size while reading: {info.filename}"
+                    )
+                chunks.append(block)
+    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+        raise ArchiveError(
+            f"cannot read ZIP member {info.filename!r}: {exc}"
+        ) from exc
+    if total != info.file_size:
+        raise ArchiveError(
+            f"ZIP member {info.filename!r} is truncated "
+            f"({total}!={info.file_size})"
+        )
+    return b"".join(chunks)
+
+
+def _load_rescue_manifest(root: Path) -> dict[tuple[str, int, int], dict[str, str]]:
+    path = root / "manifest.tsv"
+    if not path.is_file():
+        return {}
+    records: dict[tuple[str, int, int], dict[str, str]] = {}
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if not lines:
+        return {}
+    fields = lines[0].split("\t")
+    expected = [
+        "repo",
+        "run_id",
+        "attempt",
+        "created_at",
+        "status",
+        "bytes",
+        "sha256",
+        "finished_at",
+    ]
+    if fields != expected:
+        raise ArchiveError("rescue manifest header is invalid")
+    for line_no, line in enumerate(lines[1:], start=2):
+        values = line.split("\t")
+        if len(values) != len(fields):
+            raise ArchiveError(
+                f"rescue manifest line {line_no} has invalid field count"
+            )
+        record = dict(zip(fields, values))
+        try:
+            key = (
+                record["repo"].casefold(),
+                int(record["run_id"]),
+                int(record["attempt"]),
+            )
+        except ValueError as exc:
+            raise ArchiveError(
+                f"rescue manifest line {line_no} has invalid identity"
+            ) from exc
+        previous = records.get(key)
+        # The one-off rescue may have retried a failed record.  Prefer the
+        # latest valid ZIP/terminal proof, otherwise retain the latest row.
+        if previous is None or record["status"] in {"zip", "http410"}:
+            records[key] = record
+    return records
+
+
+class RescueSpool:
+    def __init__(self, root: str | os.PathLike[str] | None):
+        self.root = (
+            None if root is None else Path(root).expanduser().resolve()
+        )
+        self.manifest = (
+            {} if self.root is None else _load_rescue_manifest(self.root)
+        )
+
+    @staticmethod
+    def _base_name(attempt: Attempt) -> str:
+        return (
+            f"{attempt.repo.replace('/', '__')}--{attempt.run_id}"
+            f"--attempt-{attempt.attempt}"
+        )
+
+    def locate(
+        self, attempt: Attempt
+    ) -> ArchiveSource | TerminalHTTP | None:
+        if self.root is None:
+            return None
+        key = (attempt.repo.casefold(), attempt.run_id, attempt.attempt)
+        manifest = self.manifest.get(key)
+        candidates: list[tuple[str, Path]] = []
+        for directory in (self.root, self.root / "consumed"):
+            base = directory / self._base_name(attempt)
+            candidates.extend(
+                [
+                    ("zip", base.with_suffix(".zip")),
+                    ("http410", base.with_suffix(".http410.json")),
+                    ("invalid", base.with_suffix(".invalid")),
+                ]
+            )
+        for kind, path in candidates:
+            if not path.is_file() or path.is_symlink():
+                continue
+            size = path.stat().st_size
+            digest = _sha256_file(path)
+            if (
+                manifest is not None
+                and manifest.get("status") in {"zip", "http410"}
+            ):
+                if (
+                    int(manifest["bytes"]) != size
+                    or manifest["sha256"] != digest
+                ):
+                    raise ArchiveError(
+                        f"rescue artifact digest mismatch: {path.name}"
+                    )
+            if kind == "http410":
+                return TerminalHTTP(410, path.read_bytes(), "rescue-spool")
+            if kind == "invalid":
+                raw = path.read_bytes()
+                try:
+                    payload = json.loads(raw)
+                except (UnicodeError, json.JSONDecodeError):
+                    payload = None
+                if isinstance(payload, dict) and payload.get("status") in {
+                    404,
+                    410,
+                }:
+                    return TerminalHTTP(
+                        int(payload["status"]), raw, "rescue-spool"
+                    )
+                if not zipfile.is_zipfile(path):
+                    continue
+            return ArchiveSource(
+                path=path,
+                source="rescue-spool",
+                raw_sha256=digest,
+                raw_size=size,
+                recoverable=True,
+            )
+        return None
+
+    def mark_consumed(self, source: ArchiveSource) -> None:
+        if not source.recoverable or self.root is None:
+            return
+        consumed = self.root / "consumed"
+        consumed.mkdir(exist_ok=True)
+        if source.path.parent == consumed:
+            return
+        destination = consumed / source.path.name
+        if destination.exists():
+            if (
+                destination.stat().st_size != source.raw_size
+                or _sha256_file(destination) != source.raw_sha256
+            ):
+                raise ArchiveError(
+                    f"conflicting consumed rescue archive: {destination.name}"
+                )
+            if source.path.exists():
+                source.path.unlink()
+            return
+        os.replace(source.path, destination)
+        _fsync_directory(consumed)
+        _fsync_directory(self.root)
+
+
+class CIStreamFetcher:
+    def __init__(
+        self,
+        *,
+        inventory_path: str | os.PathLike[str],
+        state_path: str | os.PathLike[str],
+        content_store_path: str | os.PathLike[str],
+        tokenizer_path: str | os.PathLike[str],
+        tokens: Sequence[str],
+        progress_path: str | os.PathLike[str],
+        receipt_path: str | os.PathLike[str],
+        rescue_path: str | os.PathLike[str] | None = None,
+        work_path: str | os.PathLike[str] | None = None,
+        resume: bool = False,
+        target_unique_tokens: int = DEFAULT_TARGET,
+        max_chunk_chars: int = DEFAULT_MAX_CHUNK_CHARS,
+        max_archive_bytes: int = DEFAULT_MAX_ARCHIVE_BYTES,
+        max_member_bytes: int = DEFAULT_MAX_MEMBER_BYTES,
+        max_uncompressed_bytes: int = DEFAULT_MAX_UNCOMPRESSED_BYTES,
+        max_members: int = DEFAULT_MAX_MEMBERS,
+        parser: Callable[..., Mapping[str, object]] = canonicalize_ci_log,
+        requester: Callable[
+            [str, str, Mapping[str, str], float], HTTPResponse
+        ] = _default_no_redirect_requester,
+        archive_downloader: Callable[..., tuple[int, str]] = (
+            _default_archive_downloader
+        ),
+        sleeper: Callable[[float], None] = time.sleep,
+    ):
+        if target_unique_tokens <= 0:
+            raise ValueError("target_unique_tokens must be positive")
+        self.inventory_path = Path(inventory_path).expanduser().resolve()
+        self.progress_path = Path(progress_path).expanduser().resolve()
+        self.receipt_path = Path(receipt_path).expanduser().resolve()
+        self.work_path = (
+            Path(work_path).expanduser().resolve()
+            if work_path is not None
+            else Path(state_path).expanduser().resolve().with_suffix(".work")
+        )
+        self.work_path.mkdir(parents=True, exist_ok=True)
+        (self.work_path / "tmp").mkdir(exist_ok=True)
+        (self.work_path / "failed").mkdir(exist_ok=True)
+        self.tokenizer = ExactTokenizer(tokenizer_path)
+        self.state = FetchState(
+            state_path,
+            inventory_path=self.inventory_path,
+            content_store_path=content_store_path,
+            tokenizer=self.tokenizer,
+            resume=resume,
+        )
+        self.store = CIContentStore(content_store_path)
+        self.client = GitHubAttemptClient(
+            tokens,
+            self.state,
+            requester=requester,
+            archive_downloader=archive_downloader,
+            max_archive_bytes=max_archive_bytes,
+            sleeper=sleeper,
+        )
+        self.rescue = RescueSpool(rescue_path)
+        self.target_unique_tokens = target_unique_tokens
+        self.max_chunk_chars = max_chunk_chars
+        self.max_archive_bytes = max_archive_bytes
+        self.max_member_bytes = max_member_bytes
+        self.max_uncompressed_bytes = max_uncompressed_bytes
+        self.max_members = max_members
+        self.parser = parser
+        self.sleeper = sleeper
+
+    def close(self) -> None:
+        self.store.close()
+        self.state.close()
+
+    def _temp_archive_path(self, attempt: Attempt) -> Path:
+        descriptor, raw_path = tempfile.mkstemp(
+            prefix=(
+                f"{attempt.repo.replace('/', '__')}--{attempt.run_id}"
+                f"--{attempt.attempt}--"
+            ),
+            suffix=".zip.partial",
+            dir=self.work_path / "tmp",
+        )
+        os.close(descriptor)
+        path = Path(raw_path)
+        # Downloaders require exclusive creation so remove only this empty,
+        # freshly allocated path inside the validated temp directory.
+        path.unlink()
+        return path
+
+    @staticmethod
+    def _section_for_chunk(
+        parsed: Mapping[str, object], chunk: Mapping[str, object]
+    ) -> Mapping[str, object] | None:
+        ordinal = chunk.get("section_ordinal")
+        sections = parsed.get("sections")
+        if (
+            isinstance(ordinal, int)
+            and not isinstance(ordinal, bool)
+            and isinstance(sections, list)
+            and 0 <= ordinal < len(sections)
+            and isinstance(sections[ordinal], dict)
+        ):
+            return sections[ordinal]
+        return None
+
+    def _process_member(
+        self,
+        attempt: Attempt,
+        *,
+        archive: ArchiveSource,
+        info: zipfile.ZipInfo,
+        jobs: Sequence[Mapping[str, object]],
+    ) -> tuple[int, int]:
+        raw = _read_zip_member(
+            archive.path, info, max_member_bytes=self.max_member_bytes
+        )
+        raw_sha = _sha256_bytes(raw)
+        job = _job_for_member(info.filename, jobs)
+        job_id = None if job is None else job.get("id")
+        job_name = None if job is None else job.get("name")
+        job_key = (
+            f"{job_id if isinstance(job_id, int) else 'unresolved'}:"
+            f"{info.filename}"
+        )
+        metadata: dict[str, object] = dict(attempt.run_metadata)
+        metadata.update(
+            {
+                "repository": attempt.repo,
+                "run_id": attempt.run_id,
+                "run_attempt": attempt.attempt,
+                "job": job,
+                "job_id": job_id,
+                "job_name": job_name,
+                "archive_member": info.filename,
+                "archive_member_raw_sha256": raw_sha,
+            }
+        )
+        parsed = self.parser(
+            raw, metadata, max_chunk_chars=self.max_chunk_chars
+        )
+        if not isinstance(parsed, Mapping):
+            raise FetchError("CI parser returned a non-mapping result")
+        canonical_text = parsed.get("canonical_text")
+        dedup_text = parsed.get("dedup_text")
+        chunks = parsed.get("chunks")
+        sidecar = parsed.get("sidecar")
+        if (
+            not isinstance(canonical_text, str)
+            or not isinstance(dedup_text, str)
+            or not isinstance(chunks, list)
+            or not isinstance(sidecar, dict)
+            or any(not isinstance(item, dict) for item in chunks)
+        ):
+            raise FetchError("CI parser returned an invalid result contract")
+        chunk_texts: list[str] = []
+        retained_chunks: list[dict[str, object]] = []
+        for raw_chunk in chunks:
+            text = raw_chunk.get("text")
+            if not isinstance(text, str):
+                raise FetchError("parser chunk text is missing")
+            if not text:
+                continue
+            retained_chunks.append(dict(raw_chunk))
+            chunk_texts.append(text)
+        token_batches = self.tokenizer.encode_batch(chunk_texts)
+        records: list[dict[str, object]] = []
+        occurrence_tokens = 0
+        for chunk, text, token_ids in zip(
+            retained_chunks, chunk_texts, token_batches
+        ):
+            ordinal = chunk.get("ordinal")
+            if (
+                isinstance(ordinal, bool)
+                or not isinstance(ordinal, int)
+                or ordinal < 0
+            ):
+                raise FetchError("parser chunk ordinal is invalid")
+            section = self._section_for_chunk(parsed, chunk)
+            section_id = (
+                str(chunk.get("section_id") or f"section:{ordinal}")
+            )
+            step_key = (
+                f"{section_id}:"
+                f"{chunk.get('step_ordinal') if chunk.get('step_ordinal') is not None else 'none'}"
+            )
+            compact_chunk = {
+                key: value
+                for key, value in chunk.items()
+                if key not in {"text", "canonical_text", "dedup_text"}
+            }
+            compact_section = None
+            if section is not None:
+                compact_section = {
+                    key: value
+                    for key, value in section.items()
+                    if key not in {"text", "dedup_text"}
+                }
+            provenance: dict[str, object] = {
+                "schema": "cppmega_ci_chunk_occurrence_v1",
+                "repository": attempt.repo,
+                "run_id": attempt.run_id,
+                "run_attempt": attempt.attempt,
+                "run_metadata_sha256": attempt.run_metadata_sha256,
+                "workflow": {
+                    "id": attempt.run_metadata.get("workflow_id"),
+                    "name": attempt.run_metadata.get("name"),
+                    "event": attempt.run_metadata.get("event"),
+                    "head_branch": attempt.run_metadata.get("head_branch"),
+                    "head_sha": attempt.run_metadata.get("head_sha"),
+                    "actor": attempt.run_metadata.get("actor"),
+                    "triggering_actor": attempt.run_metadata.get(
+                        "triggering_actor"
+                    ),
+                },
+                "job": job,
+                "archive": {
+                    "member": info.filename,
+                    "member_raw_sha256": raw_sha,
+                },
+                "parser_sidecar_sha256": sidecar.get("sidecar_sha256"),
+                "chunk": compact_chunk,
+                "section": compact_section,
+            }
+            sequence_sha = hash_token_sequence(token_ids)
+            records.append(
+                {
+                    "content": text,
+                    "provenance": provenance,
+                    "occurrence_key": {
+                        "repo": attempt.repo,
+                        "run_attempt": attempt.run_attempt_key,
+                        "job": job_key,
+                        "step": step_key,
+                        "chunk_ordinal": ordinal,
+                    },
+                    "token_count": len(token_ids),
+                    "tokenizer_fingerprint": self.tokenizer.fingerprint,
+                    "token_sequence_sha256": sequence_sha,
+                }
+            )
+            occurrence_tokens += len(token_ids)
+        if records:
+            self.store.add_chunks(records)
+        canonical_sha = _sha256_bytes(canonical_text.encode("utf-8"))
+        dedup_sha = _sha256_bytes(dedup_text.encode("utf-8"))
+        self.state.store_member(
+            attempt,
+            archive_member=info.filename,
+            job_key=job_key,
+            raw_sha256=raw_sha,
+            raw_size=len(raw),
+            canonical_sha256=canonical_sha,
+            dedup_sha256=dedup_sha,
+            sidecar=sidecar,
+            chunk_count=len(records),
+            occurrence_tokens=occurrence_tokens,
+        )
+        return len(records), occurrence_tokens
+
+    def process_attempt(self, attempt: Attempt) -> None:
+        jobs: list[dict[str, Any]] | None = None
+        archive: ArchiveSource | None = None
+        temporary: Path | None = None
+        try:
+            jobs = self.client.fetch_jobs(attempt)
+            rescued = self.rescue.locate(attempt)
+            if isinstance(rescued, TerminalHTTP):
+                raise rescued
+            if isinstance(rescued, ArchiveSource):
+                archive = rescued
+            else:
+                temporary = self._temp_archive_path(attempt)
+                archive = self.client.fetch_archive(attempt, temporary)
+            if archive.raw_size > self.max_archive_bytes:
+                raise ArchiveError("archive exceeds configured byte limit")
+            if archive.path.stat().st_size != archive.raw_size:
+                raise ArchiveError("archive size changed before processing")
+            if _sha256_file(archive.path) != archive.raw_sha256:
+                raise ArchiveError("archive digest changed before processing")
+            infos = _safe_zip_infos(
+                archive.path,
+                max_members=self.max_members,
+                max_member_bytes=self.max_member_bytes,
+                max_uncompressed_bytes=self.max_uncompressed_bytes,
+            )
+            chunk_count = 0
+            occurrence_tokens = 0
+            for info in infos:
+                member_chunks, member_tokens = self._process_member(
+                    attempt, archive=archive, info=info, jobs=jobs
+                )
+                chunk_count += member_chunks
+                occurrence_tokens += member_tokens
+            status = "done" if chunk_count else "empty"
+            self.state.finish_attempt(
+                attempt,
+                status=status,
+                archive_source=archive.source,
+                archive_sha256=archive.raw_sha256,
+                archive_size=archive.raw_size,
+                jobs=jobs,
+                member_count=len(infos),
+                chunk_count=chunk_count,
+                occurrence_tokens=occurrence_tokens,
+                secrets=self.client.secrets,
+            )
+            self.rescue.mark_consumed(archive)
+        except TerminalHTTP as exc:
+            status = (
+                "terminal_410" if exc.status == 410 else "terminal_404"
+            )
+            self.state.finish_attempt(
+                attempt,
+                status=status,
+                jobs=jobs,
+                terminal_http_status=exc.status,
+                terminal_body_sha256=_sha256_bytes(exc.body),
+                error=exc,
+                secrets=self.client.secrets,
+            )
+        except (APIError, ArchiveError, FetchError, OSError, zipfile.BadZipFile) as exc:
+            with self.state._lock:
+                tries_row = self.state._connection.execute(
+                    """
+                    SELECT tries FROM attempts
+                    WHERE repo=? AND run_id=? AND attempt=?
+                    """,
+                    (attempt.repo, attempt.run_id, attempt.attempt),
+                ).fetchone()
+            tries = 1 if tries_row is None else int(tries_row[0])
+            retry = tries < 4
+            self.state.finish_attempt(
+                attempt,
+                status="retry" if retry else "failed",
+                archive_source=None if archive is None else archive.source,
+                archive_sha256=None if archive is None else archive.raw_sha256,
+                archive_size=None if archive is None else archive.raw_size,
+                jobs=jobs,
+                error=exc,
+                retry=retry,
+                secrets=self.client.secrets,
+            )
+        finally:
+            if temporary is not None and temporary.exists():
+                if archive is not None:
+                    failed = self.work_path / "failed" / temporary.name
+                    if failed.exists():
+                        failed = failed.with_name(
+                            f"{failed.name}.{int(time.time())}"
+                        )
+                    # Preserve a failed raw archive for diagnosis.  Successful
+                    # attempts were already durably committed and can discard
+                    # their bounded network temporary.
+                    with self.state._lock:
+                        row = self.state._connection.execute(
+                            """
+                            SELECT status FROM attempts
+                            WHERE repo=? AND run_id=? AND attempt=?
+                            """,
+                            (attempt.repo, attempt.run_id, attempt.attempt),
+                        ).fetchone()
+                    terminal = None if row is None else str(row[0])
+                    if terminal in {"done", "empty"}:
+                        temporary.unlink()
+                    else:
+                        os.replace(temporary, failed)
+                        _fsync_directory(failed.parent)
+                else:
+                    temporary.unlink()
+
+    def progress(self) -> dict[str, object]:
+        store_status = self.store.status()
+        inventory_progress = None
+        candidate = self.inventory_path.with_suffix(".progress.json")
+        if candidate.is_file():
+            try:
+                inventory_progress = json.loads(
+                    candidate.read_text(encoding="utf-8")
+                )
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                inventory_progress = None
+        return {
+            "schema": PROGRESS_SCHEMA,
+            "generated_at": _utc_now(),
+            "inventory": (
+                {"path": str(self.inventory_path)}
+                if inventory_progress is None
+                else inventory_progress
+            ),
+            "fetch": self.state.summary(),
+            "content_store": store_status,
+            "target_exact_unique_payload_tokens": self.target_unique_tokens,
+        }
+
+    def write_progress(self) -> dict[str, object]:
+        value = self.progress()
+        atomic_write_json(self.progress_path, value)
+        return value
+
+    def threshold_met(self) -> bool:
+        counters = self.store.status()["counters"]
+        assert isinstance(counters, dict)
+        value = counters.get("exact_unique_payload_tokens")
+        return value is not None and int(value) >= self.target_unique_tokens
+
+    def write_receipt(self) -> dict[str, object]:
+        store_receipt = self.store.completion_receipt(
+            target_unique_tokens=self.target_unique_tokens
+        )
+        receipt = {
+            "schema": RECEIPT_SCHEMA,
+            "completed_at": _utc_now(),
+            "target_exact_unique_payload_tokens": self.target_unique_tokens,
+            "fetch_state": self.state.summary(),
+            "content_store_receipt": store_receipt,
+            "inventory_path": str(self.inventory_path),
+            "tokenizer_contract": self.tokenizer.contract,
+            "tokenizer_fingerprint": self.tokenizer.fingerprint,
+        }
+        atomic_write_json(self.receipt_path, receipt)
+        return receipt
+
+    def run(
+        self,
+        *,
+        continuous: bool,
+        max_runs: int | None = None,
+        poll_seconds: float = 5.0,
+        workers: int = 1,
+    ) -> dict[str, object]:
+        if workers <= 0:
+            raise ValueError("workers must be positive")
+        processed = 0
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="ci-stream-fetch"
+        ) as executor:
+            while True:
+                self.state.discover()
+                while True:
+                    if self.threshold_met():
+                        self.write_progress()
+                        return self.write_receipt()
+                    if max_runs is not None and processed >= max_runs:
+                        return self.write_progress()
+                    remaining = (
+                        workers
+                        if max_runs is None
+                        else min(workers, max_runs - processed)
+                    )
+                    attempts: list[Attempt] = []
+                    for _ in range(remaining):
+                        attempt = self.state.next_attempt()
+                        if attempt is None:
+                            break
+                        attempts.append(attempt)
+                    if not attempts:
+                        break
+                    futures = {
+                        executor.submit(self.process_attempt, attempt): attempt
+                        for attempt in attempts
+                    }
+                    for future in as_completed(futures):
+                        future.result()
+                        processed += 1
+                        self.write_progress()
+                if not continuous:
+                    return self.write_progress()
+                self.write_progress()
+                self.sleeper(max(0.1, poll_seconds))
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Stream GitHub Actions attempt logs into the cppmega CI CAS"
+    )
+    parser.add_argument("--inventory", required=True)
+    parser.add_argument("--state", required=True)
+    parser.add_argument("--content-store", required=True)
+    parser.add_argument("--tokenizer", default=DEFAULT_TOKENIZER)
+    parser.add_argument("--tokens")
+    parser.add_argument("--progress", required=True)
+    parser.add_argument("--receipt", required=True)
+    parser.add_argument("--rescue-dir")
+    parser.add_argument("--work-dir")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--max-runs", type=int)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--poll-seconds", type=float, default=5.0)
+    parser.add_argument(
+        "--target-exact-unique-payload-tokens",
+        type=int,
+        default=DEFAULT_TARGET,
+    )
+    parser.add_argument(
+        "--max-chunk-chars",
+        type=int,
+        default=DEFAULT_MAX_CHUNK_CHARS,
+    )
+    parser.add_argument(
+        "--max-archive-bytes",
+        type=int,
+        default=DEFAULT_MAX_ARCHIVE_BYTES,
+    )
+    parser.add_argument(
+        "--max-member-bytes",
+        type=int,
+        default=DEFAULT_MAX_MEMBER_BYTES,
+    )
+    parser.add_argument(
+        "--max-uncompressed-bytes",
+        type=int,
+        default=DEFAULT_MAX_UNCOMPRESSED_BYTES,
+    )
+    parser.add_argument("--max-members", type=int, default=DEFAULT_MAX_MEMBERS)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    if args.max_runs is not None and args.max_runs <= 0:
+        raise SystemExit("--max-runs must be positive")
+    if args.workers <= 0:
+        raise SystemExit("--workers must be positive")
+    tokens = load_token_pool(args.tokens)
+    fetcher: CIStreamFetcher | None = None
+    try:
+        fetcher = CIStreamFetcher(
+            inventory_path=args.inventory,
+            state_path=args.state,
+            content_store_path=args.content_store,
+            tokenizer_path=args.tokenizer,
+            tokens=tokens,
+            progress_path=args.progress,
+            receipt_path=args.receipt,
+            rescue_path=args.rescue_dir,
+            work_path=args.work_dir,
+            resume=args.resume,
+            target_unique_tokens=args.target_exact_unique_payload_tokens,
+            max_chunk_chars=args.max_chunk_chars,
+            max_archive_bytes=args.max_archive_bytes,
+            max_member_bytes=args.max_member_bytes,
+            max_uncompressed_bytes=args.max_uncompressed_bytes,
+            max_members=args.max_members,
+        )
+        result = fetcher.run(
+            continuous=not args.once,
+            max_runs=args.max_runs,
+            poll_seconds=args.poll_seconds,
+            workers=args.workers,
+        )
+    except (FetchError, sqlite3.Error, OSError, ValueError) as exc:
+        print(f"[ci-stream-fetch] ERROR: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if fetcher is not None:
+            fetcher.close()
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

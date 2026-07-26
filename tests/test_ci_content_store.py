@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 from pathlib import Path
@@ -100,6 +101,30 @@ def test_duplicate_content_is_stored_once_but_every_occurrence_is_counted(
             "exact_unique_payload_tokens": 3,
         }
         assert store.verify()["ok"] is True
+
+
+def test_one_store_connection_is_safely_serialized_across_fetch_threads(
+    tmp_path: Path,
+) -> None:
+    with CIContentStore(tmp_path / "store") as store:
+        def add(ordinal: int) -> None:
+            store.add_chunk(
+                f"threaded-{ordinal % 5}\n",
+                {"worker_record": ordinal},
+                _key(ordinal),
+                token_count=2,
+                tokenizer_fingerprint="tokenizer-v1",
+                token_sequence_sha256=_sequence(100, ordinal % 5),
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(add, range(80)))
+
+        counters = store.verify()["counters"]
+        assert counters["occurrence_count"] == 80
+        assert counters["unique_content_count"] == 5
+        assert counters["unique_token_sequence_count"] == 5
+        assert counters["exact_unique_payload_tokens"] == 10
 
 
 def test_batch_is_atomic_and_whole_batch_replay_is_idempotent(

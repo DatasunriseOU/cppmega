@@ -253,6 +253,7 @@ class CIContentStore:
             self.db_path,
             isolation_level=None,
             timeout=60.0,
+            check_same_thread=False,
         )
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA busy_timeout = 60000")
