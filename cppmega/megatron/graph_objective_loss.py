@@ -7,15 +7,16 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from fractions import Fraction
-
-import torch
-import torch.nn.functional as F
+from typing import TYPE_CHECKING
 
 from cppmega.megatron.graph_recipe import (
     STAGE1_GRAPH_RELATIONS,
     stage1_graph_config_kwargs,
     validate_stage1_graph_total_loss_contract,
 )
+
+if TYPE_CHECKING:
+    import torch
 
 
 GRAPH_BIAS_BETA_ENV = "CPPMEGA_GRAPH_BIAS_BETA"
@@ -137,6 +138,7 @@ def compose_dsa_indexer_total_loss(
     ``DSAIndexerLossAutoScaler``. Requiring both components here prevents the
     graph objective from becoming a detached logging-only or post-hoc path.
     """
+    import torch
 
     components = {
         "indexer_loss": indexer_loss,
@@ -427,6 +429,8 @@ def _validate_inputs(
     edge_targets: torch.Tensor,
     pair_mask: torch.Tensor,
 ) -> tuple[int, int, int]:
+    import torch
+
     if indexer_scores.ndim != 3:
         raise ValueError(
             "indexer_scores must be (B,Q,K), got " f"{tuple(indexer_scores.shape)}"
@@ -459,6 +463,8 @@ def _validate_inputs(
 
 
 def _finite_connected_zero(scores: torch.Tensor) -> torch.Tensor:
+    import torch
+
     finite_scores = torch.where(
         torch.isfinite(scores),
         scores,
@@ -482,6 +488,8 @@ def graph_auxiliary_loss(
     graph-ineligible batch returns a connected zero scalar; dataset-level
     eligibility is enforced by the objective receipt.
     """
+    import torch
+    import torch.nn.functional as F
 
     _batch, _queries, keys = _validate_inputs(indexer_scores, edge_targets, pair_mask)
     scores = indexer_scores.float()
