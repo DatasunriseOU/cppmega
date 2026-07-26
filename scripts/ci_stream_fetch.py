@@ -59,11 +59,18 @@ from scripts.ci_stream_inventory import (  # noqa: E402
     TokenPool,
     load_token_pool,
 )
+from cppmega.data.tokenizer_contract import (  # noqa: E402
+    TOKENIZER_CONTRACT_SHA256,
+)
+from cppmega.tokenizer.cpp_tokenizer import (  # noqa: E402
+    TokenizerContractError,
+    load_cppmega_tokenizer,
+)
 
 
-SCHEMA_VERSION = "cppmega_ci_stream_fetch_v1"
-PROGRESS_SCHEMA = "cppmega_ci_stream_fetch_progress_v1"
-RECEIPT_SCHEMA = "cppmega_ci_stream_fetch_receipt_v1"
+SCHEMA_VERSION = "cppmega_ci_stream_fetch_v2"
+PROGRESS_SCHEMA = "cppmega_ci_stream_fetch_progress_v2"
+RECEIPT_SCHEMA = "cppmega_ci_stream_fetch_receipt_v2"
 DEFAULT_TOKENIZER = (
     "../cppmega.mlx/outputs/megatron_ready/"
     "case5_v4_20260714_093120_mini9/tokenizer/tokenizer.json"
@@ -382,12 +389,12 @@ def _default_archive_downloader(
 
 
 class ExactTokenizer:
-    """Frozen tokenizer adapter with an auditable, option-bound fingerprint."""
+    """Frozen training-tokenizer adapter with an auditable fingerprint."""
 
     def __init__(self, tokenizer_json: str | os.PathLike[str]):
         path = Path(tokenizer_json).expanduser().resolve()
         try:
-            from tokenizers import Tokenizer, __version__ as tokenizers_version
+            from tokenizers import __version__ as tokenizers_version
         except ImportError as exc:
             raise FetchError(
                 "the existing project environment lacks the tokenizers package"
@@ -397,14 +404,38 @@ class ExactTokenizer:
         raw = path.read_bytes()
         self.path = path
         self.artifact_sha256 = _sha256_bytes(raw)
-        self._tokenizer = Tokenizer.from_file(str(path))
+        try:
+            self._tokenizer = load_cppmega_tokenizer(path)
+        except TokenizerContractError as exc:
+            raise FetchError(
+                f"tokenizer.json does not satisfy the frozen cppmega "
+                f"training contract: {path}: {exc}"
+            ) from exc
+        import cppmega.data.prompt_graph as prompt_graph_module
+        import cppmega.tokenizer.cpp_tokenizer as tokenizer_module
+
         self.contract = {
-            "schema": "cppmega_exact_ci_tokenizer_v1",
-            "artifact": str(path),
+            "schema": "cppmega_exact_ci_training_tokenizer_v2",
             "artifact_sha256": self.artifact_sha256,
+            "tokenizer_contract_sha256": TOKENIZER_CONTRACT_SHA256,
             "library": "tokenizers",
             "library_version": str(tokenizers_version),
-            "add_special_tokens": False,
+            "training_adapter": (
+                "cppmega.tokenizer.cpp_tokenizer."
+                "CppMegaTokenizer.encode_batch"
+            ),
+            "training_adapter_module_sha256": _sha256_file(
+                Path(tokenizer_module.__file__).resolve()
+            ),
+            "whitespace_normalizer": (
+                "cppmega.data.prompt_graph."
+                "normalize_cpp_whitespace_with_offsets"
+            ),
+            "whitespace_normalizer_module_sha256": _sha256_file(
+                Path(prompt_graph_module.__file__).resolve()
+            ),
+            "prepend_token": None,
+            "append_token": None,
             "payload_only": True,
         }
         self.fingerprint = _sha256_bytes(
@@ -414,10 +445,12 @@ class ExactTokenizer:
     def encode_batch(self, texts: Sequence[str]) -> list[list[int]]:
         if not texts:
             return []
-        encodings = self._tokenizer.encode_batch(
-            list(texts), add_special_tokens=False
-        )
-        token_ids = [list(item.ids) for item in encodings]
+        try:
+            token_ids = self._tokenizer.encode_batch(list(texts))
+        except (TypeError, ValueError) as exc:
+            raise FetchError(
+                f"cppmega training tokenizer rejected a CI payload: {exc}"
+            ) from exc
         if len(token_ids) != len(texts):
             raise FetchError("tokenizer changed the batch cardinality")
         return token_ids
@@ -657,7 +690,8 @@ class FetchState:
             "parser_script_sha256": _parser_sha256(),
             "content_store_script_sha256": _content_store_sha256(),
             "chunk_semantics": (
-                "parser-dedup-text-payload-only-no-framing-v1"
+                "parser-dedup-text-cppmega-training-tokenizer-"
+                "payload-only-no-framing-v2"
             ),
         }
         with self._lock:
@@ -2093,6 +2127,15 @@ class CIStreamFetcher:
             ),
             "fetch": self.state.summary(),
             "content_store": store_status,
+            "token_accounting": {
+                "semantics": (
+                    "exact unique token-id sequences over canonical "
+                    "dedup payloads after cppmega training whitespace "
+                    "normalization; excludes framing and padding"
+                ),
+                "tokenizer_contract": self.tokenizer.contract,
+                "tokenizer_fingerprint": self.tokenizer.fingerprint,
+            },
             "target_exact_unique_payload_tokens": self.target_unique_tokens,
         }
 

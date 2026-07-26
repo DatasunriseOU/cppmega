@@ -11,11 +11,17 @@ import zipfile
 import zlib
 
 import pytest
-from tokenizers import Tokenizer
-from tokenizers.models import WordLevel
-from tokenizers.pre_tokenizers import Whitespace
 
+from cppmega.tokenizer.cpp_tokenizer import load_cppmega_tokenizer
 from scripts import ci_stream_fetch as ci
+
+
+_FROZEN_TOKENIZER = (
+    Path(__file__).resolve().parents[1]
+    / "data"
+    / "tokenizer_v2"
+    / "tokenizer.json"
+)
 
 
 def _run_metadata(run_id: int, *, attempt: int = 1) -> dict[str, Any]:
@@ -69,20 +75,39 @@ def _inventory(path: Path, count: int) -> Path:
 
 
 def _tokenizer(path: Path) -> Path:
-    tokenizer = Tokenizer(
-        WordLevel(
-            {
-                "[UNK]": 0,
-                "hello": 1,
-                "build": 2,
-                "world": 3,
-            },
-            unk_token="[UNK]",
-        )
+    del path
+    return _FROZEN_TOKENIZER
+
+
+def test_exact_tokenizer_matches_training_wrapper_and_rejects_other_artifacts(
+    tmp_path: Path,
+) -> None:
+    payloads = [
+        "hello  build\tworld\r\nnext\n",
+        '[command]cmake  -S . -B build && ninja -C build\n',
+        'printf("literal   whitespace\\n"); // comment  text\n',
+    ]
+    exact = ci.ExactTokenizer(_FROZEN_TOKENIZER)
+    training = load_cppmega_tokenizer(_FROZEN_TOKENIZER)
+    expected = training.encode_batch(payloads)
+
+    assert exact.encode_batch(payloads) == expected
+    assert exact.contract["schema"] == (
+        "cppmega_exact_ci_training_tokenizer_v2"
     )
-    tokenizer.pre_tokenizer = Whitespace()
-    tokenizer.save(str(path))
-    return path
+    assert exact.contract["whitespace_normalizer"].endswith(
+        "normalize_cpp_whitespace_with_offsets"
+    )
+    assert exact.contract["tokenizer_contract_sha256"]
+    assert all(
+        ci.hash_token_sequence(actual) == ci.hash_token_sequence(wanted)
+        for actual, wanted in zip(exact.encode_batch(payloads), expected)
+    )
+
+    invalid = tmp_path / "not-cppmega-tokenizer.json"
+    invalid.write_text('{"version":"1.0"}')
+    with pytest.raises(ci.FetchError, match="frozen cppmega training contract"):
+        ci.ExactTokenizer(invalid)
 
 
 def _zip_bytes(
@@ -295,7 +320,12 @@ def test_full_attempt_streams_through_parser_tokenizer_and_cas_idempotently(
         counters = progress["content_store"]["counters"]
         assert counters["occurrence_count"] == 1
         assert counters["unique_content_count"] == 1
-        assert counters["exact_unique_payload_tokens"] == 3
+        expected_tokens = len(
+            load_cppmega_tokenizer(tokenizer).encode_batch(
+                ["hello build world\n"]
+            )[0]
+        )
+        assert counters["exact_unique_payload_tokens"] == expected_tokens
         assert progress["fetch"]["attempt_statuses"] == {"done": 1}
         assert progress["fetch"]["members"] == 1
         assert progress["fetch"]["chunks"] == 1
