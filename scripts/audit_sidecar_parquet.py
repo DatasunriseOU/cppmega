@@ -1742,6 +1742,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--commit-root", type=Path, required=True)
     ap.add_argument("--pr-root", type=Path, required=True)
     ap.add_argument(
+        "--ci-root",
+        type=Path,
+        default=None,
+        help="Optional fixed-bucket CI parquet root, reported as kind=ci.",
+    )
+    ap.add_argument(
         "--buckets",
         default="",
         help="Comma-separated buckets to include, e.g. 1024,2048",
@@ -1776,6 +1782,8 @@ def main(argv: list[str] | None = None) -> int:
     files.extend(_discover(args.code_root, "code", buckets))
     files.extend(_discover(args.commit_root, "commits", buckets))
     files.extend(_discover(args.pr_root, "pr", buckets))
+    if args.ci_root is not None:
+        files.extend(_discover(args.ci_root, "ci", buckets))
     if not files:
         raise SystemExit("no parquet files selected")
 

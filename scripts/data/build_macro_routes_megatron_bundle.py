@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import struct
 import subprocess
@@ -55,6 +56,9 @@ from cppmega.receipt_binding import build_data_producer_binding  # noqa: E402
 
 DEFAULT_BUCKETS = (1024, 2048, 4096, 8192, 16384)
 BUILD_PLAN_SCHEMA = "cppmega_macro_routes_build_plan_v1"
+CI_MANIFEST_SCHEMA = "cppmega_ci_fixed_buckets_manifest_v3"
+CI_BUCKET_MANIFEST_SCHEMA = "cppmega_ci_fixed_bucket_v2"
+CI_LOG_COMPLETION_SCHEMA = "cppmega_ci_log_extraction_v1"
 BUNDLE_KNOWN_LIMITATIONS = (
     "the source snapshot is the manifest-complete subset; failed or live "
     "conveyor units are excluded",
@@ -209,6 +213,8 @@ def _producer_binding_from_conveyor(
     *,
     cppmega_commit: str,
     cppmega_tree_sha256: str,
+    cppmega_mlx_commit: str,
+    cppmega_mlx_tree_sha256: str,
 ) -> dict[str, object]:
     revision = conveyor_manifest.get("code_revision")
     if not isinstance(revision, dict):
@@ -216,6 +222,24 @@ def _producer_binding_from_conveyor(
     if int(revision.get("schema_version", 0)) < 2 or revision.get("dirty") is not False:
         raise RuntimeError(
             "conveyor manifest requires a clean code revision schema v2 receipt"
+        )
+    if revision.get("producer_role") != "canonical_source_conveyor":
+        raise RuntimeError(
+            "conveyor manifest code revision has an unsupported producer role"
+        )
+    if revision.get("repository_identity") != "cppmega":
+        raise RuntimeError(
+            "conveyor manifest code revision is not bound to cppmega"
+        )
+    if revision.get("git_commit") != cppmega_commit:
+        raise RuntimeError(
+            "conveyor manifest cppmega commit does not match the reviewed "
+            "bundle-builder commit"
+        )
+    if revision.get("source_tree_sha256") != cppmega_tree_sha256:
+        raise RuntimeError(
+            "conveyor manifest cppmega source tree does not match the reviewed "
+            "bundle-builder tree"
         )
     indexer = revision.get("indexer_provenance")
     if not isinstance(indexer, dict):
@@ -230,8 +254,8 @@ def _producer_binding_from_conveyor(
     return build_data_producer_binding(
         cppmega_commit=cppmega_commit,
         cppmega_tree_sha256=cppmega_tree_sha256,
-        cppmega_mlx_commit=str(revision.get("git_commit", "")),
-        cppmega_mlx_tree_sha256=str(revision.get("source_tree_sha256", "")),
+        cppmega_mlx_commit=cppmega_mlx_commit,
+        cppmega_mlx_tree_sha256=cppmega_mlx_tree_sha256,
         clang_indexer_sha256=str(indexer.get("source_sha256", "")),
         clang_indexer_dependency_closure_sha256=str(closure or ""),
     )
@@ -332,16 +356,375 @@ def _load_manifest_allowlist(
     return allowed, metadata
 
 
+def _load_ci_manifest_allowlist(
+    manifest_path: Path,
+    ci_root: Path,
+    buckets: tuple[int, ...],
+    *,
+    cppmega_mlx_commit: str,
+    cppmega_mlx_tree_sha256: str,
+) -> tuple[dict[tuple[str, int], dict[str, int]], dict[str, object]]:
+    """Validate the immutable CI generation and return its exact shard allowlist."""
+
+    manifest_path = manifest_path.resolve()
+    ci_root = ci_root.resolve()
+    if manifest_path != ci_root / "manifest.json":
+        raise RuntimeError(
+            "CI manifest must be the generation-root manifest: "
+            f"{ci_root / 'manifest.json'}"
+        )
+    manifest_bytes = manifest_path.read_bytes()
+    try:
+        manifest = json.loads(manifest_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"invalid CI manifest {manifest_path}: {error}") from error
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema") != CI_MANIFEST_SCHEMA
+        or manifest.get("kind") != "ci"
+        or manifest.get("seq_lengths") != list(buckets)
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: unsupported CI manifest or bucket ladder"
+        )
+    verification = manifest.get("verification")
+    if (
+        not isinstance(verification, dict)
+        or verification.get("fixed_width_all_rows") is not True
+        or verification.get("source_tokens_equal_fragment_tokens") is not True
+        or verification.get("unexpected_rejects") != 0
+        or verification.get("packing_overflow_docs") != 0
+    ):
+        raise RuntimeError(f"{manifest_path}: CI verification is not green")
+    counters = manifest.get("counters")
+    if not isinstance(counters, dict):
+        raise RuntimeError(f"{manifest_path}: CI counters are missing")
+    zero_counters = (
+        "malformed_json_rows",
+        "empty_text_docs",
+        "zero_token_docs",
+        "normalization_rejects",
+        "packing_overflow_docs",
+        "unexpected_rejects",
+    )
+    if any(
+        not isinstance(counters.get(name), int)
+        or isinstance(counters.get(name), bool)
+        or int(counters[name]) != 0
+        for name in zero_counters
+    ):
+        raise RuntimeError(f"{manifest_path}: CI reject counters are not zero")
+    for name in (
+        "input_docs",
+        "tokenized_docs",
+        "source_tokens",
+        "fragment_tokens",
+        "fragments",
+    ):
+        value = counters.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise RuntimeError(f"{manifest_path}: invalid CI counter {name}={value!r}")
+    if (
+        counters["input_docs"] != counters["tokenized_docs"]
+        or counters["source_tokens"] != counters["fragment_tokens"]
+    ):
+        raise RuntimeError(f"{manifest_path}: CI token/document conservation failed")
+    split_policy = manifest.get("split_policy")
+    if (
+        not isinstance(split_policy, dict)
+        or split_policy.get("schema")
+        != "cppmega_ci_lossless_token_fragmentation_v1"
+        or split_policy.get("token_loss") != 0
+        or split_policy.get("cross_boundary_edges_are_counted") is not True
+    ):
+        raise RuntimeError(f"{manifest_path}: CI split policy is not lossless")
+    producer = manifest.get("producer")
+    revision = producer.get("code_revision") if isinstance(producer, dict) else None
+    if (
+        not isinstance(producer, dict)
+        or producer.get("script") != "tokenize_ci_enriched.py"
+        or not isinstance(producer.get("script_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", producer["script_sha256"])
+        or not isinstance(revision, dict)
+        or revision.get("schema") != "cppmega_ci_code_revision_v2"
+        or revision.get("schema_version") != 2
+        or revision.get("repository_identity") != "cppmega.mlx"
+        or revision.get("dirty") is not False
+        or not isinstance(revision.get("git_commit"), str)
+        or not re.fullmatch(r"[0-9a-f]{40}", revision["git_commit"])
+        or not isinstance(revision.get("source_tree_sha256"), str)
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", revision["source_tree_sha256"]
+        )
+        or revision.get("status_sha256") != hashlib.sha256(b"").hexdigest()
+    ):
+        raise RuntimeError(f"{manifest_path}: CI producer revision is not clean/bound")
+    if revision["git_commit"] != cppmega_mlx_commit:
+        raise RuntimeError(
+            f"{manifest_path}: CI producer commit does not match the reviewed "
+            "cppmega.mlx commit"
+        )
+    if revision["source_tree_sha256"] != cppmega_mlx_tree_sha256:
+        raise RuntimeError(
+            f"{manifest_path}: CI producer source tree does not match the "
+            "reviewed cppmega.mlx tree"
+        )
+
+    source_inventory = manifest.get("source_inventory")
+    if (
+        not isinstance(source_inventory, list)
+        or len(source_inventory) != 2
+    ):
+        raise RuntimeError(f"{manifest_path}: CI source inventory is missing")
+    inventory_digest = _canonical_sha256(source_inventory)
+    if manifest.get("source_inventory_sha256") != inventory_digest:
+        raise RuntimeError(f"{manifest_path}: CI source inventory digest drifted")
+    for record in source_inventory:
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"name", "path", "size", "mtime_ns", "sha256"}
+            or not isinstance(record["name"], str)
+            or not record["name"]
+            or not isinstance(record["path"], str)
+            or not record["path"]
+            or not isinstance(record["size"], int)
+            or isinstance(record["size"], bool)
+            or record["size"] < 1
+            or not isinstance(record["mtime_ns"], int)
+            or isinstance(record["mtime_ns"], bool)
+            or record["mtime_ns"] < 1
+            or not isinstance(record["sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", record["sha256"])
+        ):
+            raise RuntimeError(f"{manifest_path}: malformed CI source inventory")
+    inventory_names = [str(record["name"]) for record in source_inventory]
+    if inventory_names != [
+        "ci_logs_enriched.jsonl",
+        "ci_paired_enriched.jsonl",
+    ]:
+        raise RuntimeError(
+            f"{manifest_path}: CI source inventory is not the canonical ordered "
+            f"pair: {inventory_names}"
+        )
+    source_completion = manifest.get("source_completion")
+    if (
+        not isinstance(source_completion, dict)
+        or source_completion.get("schema") != CI_LOG_COMPLETION_SCHEMA
+        or source_completion.get("status") != "complete"
+        or source_completion.get("unresolved_count") != 0
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: CI log extraction completion is missing or incomplete"
+        )
+    completion_counts: dict[str, int] = {}
+    for name in (
+        "unique_job_count",
+        "fetched_count",
+        "expired_count",
+        "too_short_count",
+    ):
+        value = source_completion.get(name)
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+        ):
+            raise RuntimeError(
+                f"{manifest_path}: invalid CI extraction counter {name}"
+            )
+        completion_counts[name] = value
+    if completion_counts["unique_job_count"] != (
+        completion_counts["fetched_count"]
+        + completion_counts["expired_count"]
+        + completion_counts["too_short_count"]
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: CI extraction job accounting drifted"
+        )
+    if counters["input_docs"] < completion_counts["fetched_count"]:
+        raise RuntimeError(
+            f"{manifest_path}: tokenized CI docs omit fetched log documents"
+        )
+    completion_output = source_completion.get("output")
+    completion_state = source_completion.get("state")
+    logs_inventory = source_inventory[0]
+    if (
+        not isinstance(completion_output, dict)
+        or completion_output.get("row_count")
+        != completion_counts["fetched_count"]
+        or completion_output.get("size") != logs_inventory["size"]
+        or completion_output.get("sha256") != logs_inventory["sha256"]
+        or not isinstance(completion_state, dict)
+        or completion_state.get("row_count")
+        != completion_counts["unique_job_count"]
+        or not isinstance(completion_state.get("sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", completion_state["sha256"])
+        or not isinstance(source_completion.get("receipt_sha256"), str)
+        or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            source_completion["receipt_sha256"],
+        )
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: CI extraction artifact binding drifted"
+        )
+    expired_jobs = source_completion.get("expired_jobs")
+    if (
+        not isinstance(expired_jobs, list)
+        or len(expired_jobs) != completion_counts["expired_count"]
+        or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("job_id"), int)
+            or "HTTP 410" not in str(item.get("detail", ""))
+            for item in expired_jobs
+        )
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: CI expired-job accounting lacks HTTP 410 evidence"
+        )
+
+    raw_buckets = manifest.get("buckets")
+    if not isinstance(raw_buckets, dict) or set(raw_buckets) != {
+        str(bucket) for bucket in buckets
+    }:
+        raise RuntimeError(f"{manifest_path}: CI bucket receipts are incomplete")
+    allowed: dict[tuple[str, int], dict[str, int]] = {}
+    total_fragments = 0
+    total_valid_tokens = 0
+    allowed_relative_parquets: set[Path] = set()
+    for bucket in buckets:
+        receipt = raw_buckets[str(bucket)]
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("schema") != CI_BUCKET_MANIFEST_SCHEMA
+            or receipt.get("kind") != "ci"
+            or receipt.get("bucket_seq_length") != bucket
+            or receipt.get("fixed_width_verified") is not True
+            or receipt.get("packing_overflow_docs") != 0
+        ):
+            raise RuntimeError(
+                f"{manifest_path}: invalid CI bucket receipt for {bucket}"
+            )
+        fragments = receipt.get("fragments")
+        rows = receipt.get("packed_rows")
+        valid_tokens = receipt.get("valid_tokens")
+        capacity_tokens = receipt.get("capacity_tokens")
+        if any(
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 1
+            for value in (fragments, rows, valid_tokens, capacity_tokens)
+        ):
+            raise RuntimeError(
+                f"{manifest_path}: CI bucket {bucket} has invalid counts"
+            )
+        if capacity_tokens != rows * bucket or valid_tokens > capacity_tokens:
+            raise RuntimeError(
+                f"{manifest_path}: CI bucket {bucket} capacity drifted"
+            )
+        parquet = receipt.get("parquet")
+        bucket_manifest = receipt.get("manifest")
+        if not isinstance(parquet, dict) or not isinstance(bucket_manifest, dict):
+            raise RuntimeError(
+                f"{manifest_path}: CI bucket {bucket} lacks file bindings"
+            )
+        expected_parquet = Path(str(bucket)) / f"ci_packed_{bucket}.parquet"
+        expected_bucket_manifest = Path(str(bucket)) / "manifest.json"
+        if (
+            Path(str(parquet.get("path"))) != expected_parquet
+            or Path(str(bucket_manifest.get("path"))) != expected_bucket_manifest
+        ):
+            raise RuntimeError(
+                f"{manifest_path}: CI bucket {bucket} paths are not canonical"
+            )
+        parquet_path = ci_root / expected_parquet
+        bucket_manifest_path = ci_root / expected_bucket_manifest
+        if (
+            parquet_path.is_symlink()
+            or not parquet_path.is_file()
+            or parquet_path.stat().st_size != parquet.get("size")
+            or _sha256(parquet_path) != parquet.get("sha256")
+            or bucket_manifest_path.is_symlink()
+            or not bucket_manifest_path.is_file()
+            or _sha256(bucket_manifest_path) != bucket_manifest.get("sha256")
+        ):
+            raise RuntimeError(
+                f"{manifest_path}: CI bucket {bucket} artifact binding drifted"
+            )
+        persisted_bucket = json.loads(
+            bucket_manifest_path.read_text(encoding="utf-8")
+        )
+        expected_persisted = {
+            key: value
+            for key, value in receipt.items()
+            if key != "manifest"
+        }
+        expected_persisted["parquet"] = {
+            **receipt["parquet"],
+            "path": parquet_path.name,
+        }
+        if persisted_bucket != expected_persisted:
+            raise RuntimeError(
+                f"{manifest_path}: CI bucket {bucket} manifest drifted"
+            )
+        allowed[("ci", bucket)] = {parquet_path.name: int(rows)}
+        allowed_relative_parquets.add(expected_parquet)
+        total_fragments += int(fragments)
+        total_valid_tokens += int(valid_tokens)
+
+    actual_relative_parquets = {
+        path.relative_to(ci_root)
+        for path in ci_root.glob("*/*.parquet")
+        if path.is_file()
+    }
+    if actual_relative_parquets != allowed_relative_parquets:
+        raise RuntimeError(
+            f"{manifest_path}: CI parquet inventory differs from manifest: "
+            f"extra={sorted(actual_relative_parquets - allowed_relative_parquets)} "
+            f"missing={sorted(allowed_relative_parquets - actual_relative_parquets)}"
+        )
+    if (
+        total_fragments != counters["fragments"]
+        or total_valid_tokens != counters["fragment_tokens"]
+    ):
+        raise RuntimeError(f"{manifest_path}: CI bucket totals drifted")
+    metadata = {
+        "path": str(manifest_path),
+        "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "schema": CI_MANIFEST_SCHEMA,
+        "source_inventory_sha256": inventory_digest,
+        "producer_revision": revision,
+        "producer_script_sha256": producer["script_sha256"],
+        "source_completion": source_completion,
+        "input_docs": counters["input_docs"],
+        "fragments": counters["fragments"],
+        "valid_tokens": counters["fragment_tokens"],
+        "cross_boundary_chunk_edges": counters.get(
+            "cross_boundary_chunk_edges", 0
+        ),
+        "cross_boundary_token_edges": counters.get(
+            "cross_boundary_token_edges", 0
+        ),
+        "allowlist_counts": {
+            f"ci/{bucket}": len(allowed[("ci", bucket)])
+            for bucket in buckets
+        },
+    }
+    return allowed, metadata
+
+
 def _snapshot_sources(
     *,
     code_root: Path,
     commit_root: Path,
+    ci_root: Path | None = None,
     snapshot_root: Path,
     buckets: tuple[int, ...],
     min_age_seconds: float,
     hash_jobs: int,
     allowed: dict[tuple[str, int], dict[str, int]],
     conveyor_manifest: dict[str, object],
+    ci_manifest: dict[str, object] | None = None,
 ) -> dict[str, object]:
     manifest_path = snapshot_root / "source_manifest.json"
     if manifest_path.exists():
@@ -349,6 +732,7 @@ def _snapshot_sources(
         if (
             existing.get("schema") != "cppmega_parquet_snapshot_v1"
             or existing.get("conveyor_manifest") != conveyor_manifest
+            or existing.get("ci_manifest") != ci_manifest
         ):
             raise RuntimeError("existing source snapshot does not match build inputs")
         return existing
@@ -358,12 +742,19 @@ def _snapshot_sources(
         )
 
     candidates: list[tuple[str, int, Path, Path, int]] = []
-    for kind, source_root in (("code", code_root), ("commits", commit_root)):
+    source_roots = [("code", code_root), ("commits", commit_root)]
+    if ci_root is not None:
+        if ci_manifest is None:
+            raise RuntimeError("CI snapshot root requires a validated CI manifest")
+        source_roots.append(("ci", ci_root))
+    elif ci_manifest is not None:
+        raise RuntimeError("CI manifest supplied without a CI snapshot root")
+    for kind, source_root in source_roots:
         for bucket in buckets:
             source_paths = _stable_parquets(
                 source_root,
                 bucket,
-                min_age_seconds,
+                0.0 if kind == "ci" else min_age_seconds,
                 set(allowed[(kind, bucket)]),
             )
             if not source_paths:
@@ -415,7 +806,7 @@ def _snapshot_sources(
         by_kind_bucket[key] = by_kind_bucket.get(key, 0) + 1
     expected_counts = {
         f"{kind}/{bucket}": len(allowed[(kind, bucket)])
-        for kind in ("code", "commits")
+        for kind, _source_root in source_roots
         for bucket in buckets
     }
     if by_kind_bucket != expected_counts:
@@ -430,6 +821,7 @@ def _snapshot_sources(
         "file_count": len(records),
         "by_kind_bucket": by_kind_bucket,
         "conveyor_manifest": conveyor_manifest,
+        "ci_manifest": ci_manifest,
         "files": records,
     }
     _write_json_atomic(manifest_path, payload)
@@ -539,14 +931,19 @@ def _run_boundary_repair(
 ) -> dict[str, object]:
     receipt_path = repair_root / "packed_document_boundary_repair.json"
     if not receipt_path.exists():
+        roots = [snapshot_root / "code", snapshot_root / "commits"]
+        if (snapshot_root / "ci").is_dir():
+            roots.append(snapshot_root / "ci")
+        root_args = [
+            argument
+            for root in roots
+            for argument in ("--root", str(root))
+        ]
         subprocess.run(
             [
                 sys.executable,
                 str(repair_script),
-                "--root",
-                str(snapshot_root / "code"),
-                "--root",
-                str(snapshot_root / "commits"),
+                *root_args,
                 "--buckets",
                 ",".join(str(bucket) for bucket in buckets),
                 "--workers",
@@ -589,6 +986,11 @@ def _run_snapshot_audit(
     else:
         empty_pr_root = audit_root / "empty_standalone_pr_root"
         empty_pr_root.mkdir(parents=True, exist_ok=True)
+        ci_args = (
+            ["--ci-root", str(snapshot_root / "ci")]
+            if (snapshot_root / "ci").is_dir()
+            else []
+        )
         subprocess.run(
             [
                 sys.executable,
@@ -599,6 +1001,7 @@ def _run_snapshot_audit(
                 str(snapshot_root / "commits"),
                 "--pr-root",
                 str(empty_pr_root),
+                *ci_args,
                 "--buckets",
                 ",".join(str(bucket) for bucket in buckets),
                 "--workers",
@@ -700,7 +1103,7 @@ def _validate_objective_source_binding(
         if (
             relative.is_absolute()
             or len(relative.parts) != 3
-            or relative.parts[0] not in {"code", "commits"}
+            or relative.parts[0] not in {"code", "commits", "ci"}
             or relative.parts[1] != str(bucket)
             or relative.name in {"", ".", ".."}
         ):
@@ -1111,6 +1514,7 @@ def _create_build_plan(
     output_dir: Path,
     objective_artifacts: dict[int, Path],
     conveyor_manifest: dict[str, object],
+    ci_manifest: dict[str, object],
 ) -> dict[str, object]:
     objective_records = _objective_build_records(objective_artifacts, buckets)
     tokenizer_dir = args.tokenizer_dir.resolve()
@@ -1127,12 +1531,16 @@ def _create_build_plan(
         "source_roots": {
             "code": str(args.code_root.resolve()),
             "commits": str(args.commit_root.resolve()),
+            "ci": str(args.ci_root.resolve()),
         },
         "conveyor_manifest": conveyor_manifest,
+        "ci_manifest": ci_manifest,
         "implementation": _producer_binding_from_conveyor(
             conveyor_manifest,
             cppmega_commit=args.cppmega_commit,
             cppmega_tree_sha256=args.cppmega_tree_sha256,
+            cppmega_mlx_commit=args.cppmega_mlx_commit,
+            cppmega_mlx_tree_sha256=args.cppmega_mlx_tree_sha256,
         ),
         "buckets": list(buckets),
         "min_age_seconds": args.min_age_seconds,
@@ -1216,12 +1624,20 @@ def _assert_build_plan_inputs(
     _allowed, conveyor_manifest = _load_manifest_allowlist(
         args.conveyor_manifest.resolve(), buckets
     )
+    _ci_allowed, ci_manifest = _load_ci_manifest_allowlist(
+        args.ci_manifest.resolve(),
+        args.ci_root.resolve(),
+        buckets,
+        cppmega_mlx_commit=args.cppmega_mlx_commit,
+        cppmega_mlx_tree_sha256=args.cppmega_mlx_tree_sha256,
+    )
     actual = _create_build_plan(
         args=args,
         buckets=buckets,
         output_dir=output_dir,
         objective_artifacts=objective_artifacts,
         conveyor_manifest=conveyor_manifest,
+        ci_manifest=ci_manifest,
     )
     if actual == build_plan:
         return
@@ -1252,6 +1668,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="explicit root containing bucketed commit parquet shards",
+    )
+    parser.add_argument(
+        "--ci-root",
+        type=Path,
+        default=None,
+        help="explicit immutable root containing five-bucket CI parquet shards",
+    )
+    parser.add_argument(
+        "--ci-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "explicit cppmega_ci_fixed_buckets_manifest_v3 binding the CI "
+            "source inventory, lossless splits, shard hashes and reject counters"
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -1290,6 +1721,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="SHA-256 of the reviewed cppmega tracked source tree",
     )
     parser.add_argument(
+        "--cppmega-mlx-commit",
+        default=None,
+        help="exact clean cppmega.mlx commit used to produce objective sidecars",
+    )
+    parser.add_argument(
+        "--cppmega-mlx-tree-sha256",
+        default=None,
+        help="SHA-256 of the reviewed cppmega.mlx tracked source tree",
+    )
+    parser.add_argument(
         "--objective-artifact",
         action="append",
         default=[],
@@ -1318,9 +1759,13 @@ def _require_explicit_source_inputs(args: argparse.Namespace) -> None:
         for attribute, option in (
             ("code_root", "--code-root"),
             ("commit_root", "--commit-root"),
+            ("ci_root", "--ci-root"),
+            ("ci_manifest", "--ci-manifest"),
             ("conveyor_manifest", "--conveyor-manifest"),
             ("cppmega_commit", "--cppmega-commit"),
             ("cppmega_tree_sha256", "--cppmega-tree-sha256"),
+            ("cppmega_mlx_commit", "--cppmega-mlx-commit"),
+            ("cppmega_mlx_tree_sha256", "--cppmega-mlx-tree-sha256"),
         )
         if getattr(args, attribute) is None
     ]
@@ -1344,12 +1789,24 @@ def _run_build(
     allowlist, conveyor_manifest = _load_manifest_allowlist(
         args.conveyor_manifest.resolve(), buckets
     )
+    ci_allowlist, ci_manifest = _load_ci_manifest_allowlist(
+        args.ci_manifest.resolve(),
+        args.ci_root.resolve(),
+        buckets,
+        cppmega_mlx_commit=args.cppmega_mlx_commit,
+        cppmega_mlx_tree_sha256=args.cppmega_mlx_tree_sha256,
+    )
+    overlap = set(allowlist).intersection(ci_allowlist)
+    if overlap:
+        raise RuntimeError(f"CI allowlist collides with conveyor kinds: {overlap}")
+    allowlist.update(ci_allowlist)
     build_plan = _create_build_plan(
         args=args,
         buckets=buckets,
         output_dir=output_dir,
         objective_artifacts=objective_artifacts,
         conveyor_manifest=conveyor_manifest,
+        ci_manifest=ci_manifest,
     )
     _ensure_partial_build_plan(partial_dir, build_plan)
 
@@ -1357,12 +1814,14 @@ def _run_build(
     source_manifest = _snapshot_sources(
         code_root=args.code_root.resolve(),
         commit_root=args.commit_root.resolve(),
+        ci_root=args.ci_root.resolve(),
         snapshot_root=snapshot_root,
         buckets=buckets,
         min_age_seconds=args.min_age_seconds,
         hash_jobs=args.hash_jobs,
         allowed=allowlist,
         conveyor_manifest=conveyor_manifest,
+        ci_manifest=ci_manifest,
     )
     repair_receipt = _run_boundary_repair(
         snapshot_root=snapshot_root,
@@ -1420,6 +1879,15 @@ def _run_build(
         provenance_root / "repaired_snapshot_manifest.json",
         repaired_snapshot_manifest,
     )
+    staged_ci_manifest = provenance_root / "ci_manifest.json"
+    shutil.copy2(args.ci_manifest.resolve(), staged_ci_manifest)
+    for bucket in buckets:
+        staged_bucket_manifest = provenance_root / "ci" / str(bucket) / "manifest.json"
+        staged_bucket_manifest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(
+            args.ci_root.resolve() / str(bucket) / "manifest.json",
+            staged_bucket_manifest,
+        )
     objective_descriptors: dict[str, dict[str, object]] = {}
     for bucket in buckets:
         artifact = load_objective_materialization_artifact(objective_artifacts[bucket])
@@ -1482,6 +1950,22 @@ def _run_build(
             "file_count": source_manifest["file_count"],
             "manifest": "provenance/source_manifest.json",
             "repaired_manifest": "provenance/repaired_snapshot_manifest.json",
+            "ci_manifest": {
+                "path": "provenance/ci_manifest.json",
+                "sha256": _sha256(staged_ci_manifest),
+                "source_inventory_sha256": ci_manifest[
+                    "source_inventory_sha256"
+                ],
+                "input_docs": ci_manifest["input_docs"],
+                "fragments": ci_manifest["fragments"],
+                "valid_tokens": ci_manifest["valid_tokens"],
+                "cross_boundary_chunk_edges": ci_manifest[
+                    "cross_boundary_chunk_edges"
+                ],
+                "cross_boundary_token_edges": ci_manifest[
+                    "cross_boundary_token_edges"
+                ],
+            },
             "local_snapshot_retained": bool(args.keep_snapshot),
         },
         "boundary_repair": {
@@ -1509,6 +1993,8 @@ def _run_build(
             conveyor_manifest,
             cppmega_commit=args.cppmega_commit,
             cppmega_tree_sha256=args.cppmega_tree_sha256,
+            cppmega_mlx_commit=args.cppmega_mlx_commit,
+            cppmega_mlx_tree_sha256=args.cppmega_mlx_tree_sha256,
         ),
         "implementation_sha256": {
             "builder": _sha256(Path(__file__).resolve()),
