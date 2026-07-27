@@ -1565,7 +1565,7 @@ def process_one_repo(
         started = time.monotonic()
         _bucket_for, route_by_fit = _route_by_fit_impl()
         route_dir = work / "routed"
-        routed = route_by_fit(tok, lengths_sorted, route_dir)
+        routed = route_by_fit(tok, lengths_sorted, route_dir, repo=repo)
         if not routed:
             raise RepoFailure(repo, "route_by_fit", f"no docs routed for {repo}")
         timings["route_by_fit_s"] = round(time.monotonic() - started, 6)
@@ -1646,7 +1646,7 @@ def process_one_commit_source(
         started = time.monotonic()
         _bucket_for, route_by_fit = _route_by_fit_impl()
         route_dir = work / "routed"
-        routed = route_by_fit(tok, lengths_sorted, route_dir)
+        routed = route_by_fit(tok, lengths_sorted, route_dir, repo=key)
         if not routed:
             raise RepoFailure(key, "route_by_fit", f"no docs routed for {key}")
         timings["route_by_fit_s"] = round(time.monotonic() - started, 6)

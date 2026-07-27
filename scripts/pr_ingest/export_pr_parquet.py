@@ -523,7 +523,12 @@ def export_pr_parquet(
                 fixed_shape_max_tokens=max(lengths),
             )
             materialize_stats = sr.read_materialize_stats(tok)
-            routed = route_by_fit(tok, lengths, work / "routed")
+            routed = route_by_fit(
+                tok,
+                lengths,
+                work / "routed",
+                repo=args.repo,
+            )
             if not routed:
                 raise RuntimeError(f"no PR docs routed for {jsonl}")
             per_length: dict[str, dict] = {}
