@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -475,6 +476,95 @@ def test_max_prs_finishes_page_and_advances_exact_scan_cursor(tmp_path):
             "SELECT COUNT(*) FROM prs WHERE scan_id=?",
             (manifest.scan_id,),
         ).fetchone()[0] == 2
+    finally:
+        store.close()
+
+
+def test_truncated_target_count_is_snapshotted_once_per_repo(tmp_path):
+    from graphql_pr_stream import Manifest, SharedTokenPool, stream_repo
+    from pr_store import connect
+
+    class CountingTargetSet(set):
+        iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            return super().__iter__()
+
+    manifest = Manifest(str(tmp_path / "manifest.json"))
+    store = connect(str(tmp_path / "prs.sqlite"), create=True)
+    target_keys = CountingTargetSet(
+        {("other/repo", number) for number in range(1, 101)}
+    )
+    targets_path = tmp_path / "targets.jsonl"
+    targets_path.write_text(
+        "".join(
+            json.dumps(
+                {"repo": repo, "pr_number": number},
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+            for repo, number in sorted(target_keys)
+        ),
+        encoding="utf-8",
+    )
+    target_keys.iterations = 0
+    base = {
+        "title": "title",
+        "body": "body",
+        "reviews": {"totalCount": 0, "nodes": []},
+        "reviewThreads": {"totalCount": 0, "nodes": []},
+        "closingIssuesReferences": {"totalCount": 0, "nodes": []},
+    }
+
+    def post(_token: str, variables: dict) -> tuple[int, dict, dict]:
+        first = variables["cursor"] is None
+        return (
+            200,
+            {"X-RateLimit-Remaining": "100"},
+            {
+                "data": {
+                    "repository": {
+                        "pullRequests": {
+                            "totalCount": 2,
+                            "pageInfo": {
+                                "hasNextPage": first,
+                                "endCursor": "page-one" if first else None,
+                            },
+                            "nodes": [
+                                {
+                                    **base,
+                                    "number": 1 if first else 2,
+                                    "comments": {
+                                        "totalCount": 1 if first else 0,
+                                        "nodes": [],
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                }
+            },
+        )
+
+    try:
+        stream_repo(
+            SharedTokenPool(["token"]),
+            store,
+            manifest,
+            "owner/repo",
+            fallback_pr_threshold=0,
+            fallback_ratelimit_trips=0,
+            fallback_list_path=str(tmp_path / "fallback.jsonl"),
+            truncated_targets_path=str(targets_path),
+            truncated_target_keys=target_keys,
+            append_lock=threading.Lock(),
+            post_fn=post,
+        )
+        assert manifest.get("owner/repo")["truncated"] == 1
+        assert ("owner/repo", 1) in target_keys
+        assert target_keys.iterations == 1
     finally:
         store.close()
 

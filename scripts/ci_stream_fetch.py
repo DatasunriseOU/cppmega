@@ -1010,6 +1010,7 @@ def _process_parse_member(
 _BINDING_KEYS = (
     "fetcher_script_sha256",
     "parser_script_sha256",
+    "content_store_script_sha256",
 )
 _BINDING_UPGRADES_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS binding_upgrades (
@@ -1017,7 +1018,8 @@ CREATE TABLE IF NOT EXISTS binding_upgrades (
     binding_key TEXT NOT NULL CHECK (
       binding_key IN (
         'fetcher_script_sha256',
-        'parser_script_sha256'
+        'parser_script_sha256',
+        'content_store_script_sha256'
       )
     ),
     from_sha256 TEXT NOT NULL CHECK (length(from_sha256) = 64),
@@ -1164,7 +1166,7 @@ def _validate_binding_upgrade_authorization(
 def _ensure_binding_upgrades_table_schema(
     connection: sqlite3.Connection,
 ) -> None:
-    """Atomically widen the legacy fetcher-only audit ledger when required."""
+    """Atomically widen either known legacy binding-upgrade ledger."""
 
     row = connection.execute(
         """
@@ -1191,18 +1193,42 @@ def _ensure_binding_upgrades_table_schema(
     )
     if columns != expected_columns:
         raise BindingError("fetch-state binding-upgrade table is unsupported")
-    if "'parser_script_sha256'" in table_sql:
+    if "'content_store_script_sha256'" in table_sql:
         return
+    has_parser_binding = "'parser_script_sha256'" in table_sql
     required_legacy_fragments = (
-        "binding_key = 'fetcher_script_sha256'",
         "length(from_sha256) = 64",
         "length(to_sha256) = 64",
         "UNIQUE(binding_key,from_sha256,to_sha256)",
     )
     compact_sql = " ".join(table_sql.split())
-    if any(fragment not in compact_sql for fragment in required_legacy_fragments):
+    if (
+        any(fragment not in compact_sql for fragment in required_legacy_fragments)
+        or "'fetcher_script_sha256'" not in compact_sql
+        or (
+            has_parser_binding
+            and "binding_key IN" not in compact_sql
+        )
+        or (
+            not has_parser_binding
+            and "binding_key = 'fetcher_script_sha256'" not in compact_sql
+        )
+    ):
         raise BindingError(
             "fetch-state binding-upgrade table is not the known legacy schema"
+        )
+    allowed_legacy_keys = {"fetcher_script_sha256"}
+    if has_parser_binding:
+        allowed_legacy_keys.add("parser_script_sha256")
+    stored_keys = {
+        str(item[0])
+        for item in connection.execute(
+            "SELECT DISTINCT binding_key FROM binding_upgrades"
+        )
+    }
+    if not stored_keys.issubset(allowed_legacy_keys):
+        raise BindingError(
+            "fetch-state binding-upgrade table contains unsupported keys"
         )
     unique_indexes = [
         str(index[1])
@@ -1262,6 +1288,8 @@ class FetchState:
         fetcher_script_upgrade_reason: str | None = None,
         allow_parser_script_upgrade_from_sha256: str | None = None,
         parser_script_upgrade_reason: str | None = None,
+        allow_content_store_script_upgrade_from_sha256: str | None = None,
+        content_store_script_upgrade_reason: str | None = None,
     ):
         self.path = Path(path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1304,6 +1332,10 @@ class FetchState:
             "parser_script_sha256": (
                 allow_parser_script_upgrade_from_sha256,
                 parser_script_upgrade_reason,
+            ),
+            "content_store_script_sha256": (
+                allow_content_store_script_upgrade_from_sha256,
+                content_store_script_upgrade_reason,
             ),
         }
         for binding_key, (source_sha256, reason) in (
@@ -2097,6 +2129,44 @@ class FetchState:
             None if jobs is None else _canonical_json_bytes(list(jobs))
         )
         with self._lock, self._connection:
+            if status in {"done", "empty"}:
+                durable = self._connection.execute(
+                    """
+                    SELECT COUNT(*) AS member_count,
+                           COALESCE(SUM(chunk_count),0) AS chunk_count,
+                           COALESCE(SUM(occurrence_tokens),0)
+                             AS occurrence_tokens
+                    FROM members
+                    WHERE repo=? AND run_id=? AND attempt=?
+                    """,
+                    (attempt.repo, attempt.run_id, attempt.attempt),
+                ).fetchone()
+                if durable is None:
+                    raise BindingError(
+                        "completed attempt durable-member accounting is missing"
+                    )
+                durable_counts = (
+                    int(durable["member_count"]),
+                    int(durable["chunk_count"]),
+                    int(durable["occurrence_tokens"]),
+                )
+                reported_counts = (
+                    int(member_count),
+                    int(chunk_count),
+                    int(occurrence_tokens),
+                )
+                if any(
+                    actual < reported
+                    for actual, reported in zip(
+                        durable_counts,
+                        reported_counts,
+                        strict=True,
+                    )
+                ):
+                    raise BindingError(
+                        "completed attempt counters exceed its durable members"
+                    )
+                member_count, chunk_count, occurrence_tokens = durable_counts
             self._connection.execute(
                 """
                 UPDATE attempts SET
@@ -2902,6 +2972,8 @@ class CIStreamFetcher:
         fetcher_script_upgrade_reason: str | None = None,
         allow_parser_script_upgrade_from_sha256: str | None = None,
         parser_script_upgrade_reason: str | None = None,
+        allow_content_store_script_upgrade_from_sha256: str | None = None,
+        content_store_script_upgrade_reason: str | None = None,
         target_unique_tokens: int = DEFAULT_TARGET,
         max_chunk_chars: int = DEFAULT_MAX_CHUNK_CHARS,
         max_archive_bytes: int = DEFAULT_MAX_ARCHIVE_BYTES,
@@ -2956,6 +3028,12 @@ class CIStreamFetcher:
                 allow_parser_script_upgrade_from_sha256
             ),
             parser_script_upgrade_reason=parser_script_upgrade_reason,
+            allow_content_store_script_upgrade_from_sha256=(
+                allow_content_store_script_upgrade_from_sha256
+            ),
+            content_store_script_upgrade_reason=(
+                content_store_script_upgrade_reason
+            ),
         )
         self.store = CIContentStore(content_store_path)
         self.client = GitHubAttemptClient(
@@ -3503,6 +3581,20 @@ def _build_parser() -> argparse.ArgumentParser:
             "CI sidecar parser migration"
         ),
     )
+    parser.add_argument(
+        "--allow-content-store-script-upgrade-from-sha256",
+        help=(
+            "explicitly authorize one resume migration from this exact "
+            "previous content-store script SHA-256"
+        ),
+    )
+    parser.add_argument(
+        "--content-store-script-upgrade-reason",
+        help=(
+            "required printable audit reason for an explicitly authorized "
+            "content-store script migration"
+        ),
+    )
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--max-runs", type=int)
     parser.add_argument("--workers", type=int, default=4)
@@ -3579,6 +3671,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             parser_script_upgrade_reason=(
                 args.parser_script_upgrade_reason
+            ),
+            allow_content_store_script_upgrade_from_sha256=(
+                args.allow_content_store_script_upgrade_from_sha256
+            ),
+            content_store_script_upgrade_reason=(
+                args.content_store_script_upgrade_reason
             ),
             target_unique_tokens=args.target_exact_unique_payload_tokens,
             max_chunk_chars=args.max_chunk_chars,

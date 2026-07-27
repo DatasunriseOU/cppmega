@@ -148,6 +148,7 @@ def _fetch_state_logical_digest(connection: sqlite3.Connection) -> str:
 
 
 def _canonical_summary(connection: sqlite3.Connection) -> tuple[dict[str, object], str]:
+    _require_attempt_member_accounting(connection)
     statuses = {
         str(row["status"]): int(row["count"])
         for row in connection.execute(
@@ -215,6 +216,62 @@ def _canonical_summary(connection: sqlite3.Connection) -> tuple[dict[str, object
         },
         sidecar_set_sha256,
     )
+
+
+def _require_attempt_member_accounting(
+    connection: sqlite3.Connection,
+) -> None:
+    mismatch = connection.execute(
+        """
+        SELECT
+          attempts.repo,
+          attempts.run_id,
+          attempts.attempt,
+          attempts.member_count,
+          attempts.chunk_count,
+          attempts.occurrence_tokens,
+          COUNT(members.archive_member) AS actual_member_count,
+          COALESCE(SUM(members.chunk_count),0) AS actual_chunk_count,
+          COALESCE(SUM(members.occurrence_tokens),0)
+            AS actual_occurrence_tokens
+        FROM attempts
+        LEFT JOIN members
+          ON members.repo=attempts.repo
+         AND members.run_id=attempts.run_id
+         AND members.attempt=attempts.attempt
+        GROUP BY attempts.repo,attempts.run_id,attempts.attempt
+        HAVING attempts.member_count != actual_member_count
+            OR attempts.chunk_count != actual_chunk_count
+            OR attempts.occurrence_tokens != actual_occurrence_tokens
+        ORDER BY attempts.repo,attempts.run_id,attempts.attempt
+        LIMIT 1
+        """
+    ).fetchone()
+    if mismatch is not None:
+        raise ReceiptFinalizationError(
+            "fetch-state per-attempt member accounting is inconsistent: "
+            f"{mismatch['repo']}/{mismatch['run_id']}/{mismatch['attempt']} "
+            f"declared=({mismatch['member_count']},"
+            f"{mismatch['chunk_count']},{mismatch['occurrence_tokens']}) "
+            f"actual=({mismatch['actual_member_count']},"
+            f"{mismatch['actual_chunk_count']},"
+            f"{mismatch['actual_occurrence_tokens']})"
+        )
+
+
+def _preflight_fetch_state_accounting(state_path: Path) -> None:
+    """Reject broken derived counters before scanning the full content store."""
+
+    connection = sqlite3.connect(
+        f"{state_path.as_uri()}?mode=ro&immutable=1",
+        uri=True,
+    )
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only=ON")
+    try:
+        _require_attempt_member_accounting(connection)
+    finally:
+        connection.close()
 
 
 def _verify_cas_member_coverage(
@@ -593,6 +650,7 @@ def finalize_fetch_receipts(
         raise ValueError("receipt paths must be outside the content store")
     _freeze_fetch_state_sqlite(state)
     _require_frozen_sqlite(index_path, label="content store")
+    _preflight_fetch_state_accounting(state)
     initial_state = state.stat()
     initial_state_identity = (
         initial_state.st_size,
