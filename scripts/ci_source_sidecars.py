@@ -45,11 +45,13 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from scripts.ci_source_binding_projection import (
+    LEGACY_PARSER_SHA256,
     MAX_SOURCE_BINDING_PROJECTION_RECORD_BYTES,
     SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN,
     SOURCE_BINDING_PROJECTION_SCHEMA,
     SourceBindingProjectionError,
     SourceBindingProjector,
+    SourceBindingProjectionRouter,
     projection_record_key,
     projection_script_sha256,
     target_parser_script_sha256,
@@ -2246,7 +2248,26 @@ def _validate_projection_record(
         key = projection_record_key(record)
     except SourceBindingProjectionError as exc:
         raise ExtractionError(f"{where} is invalid: {exc}") from exc
-    if (
+    if section["mode"] == SourceBindingProjectionRouter.MIXED_MODE:
+        parser_lineage = section["parser_lineage"]
+        record_mode = record.get("mode")
+        record_input = record.get("input_parser_sha256")
+        allowed_pair = (
+            record_mode == "current_audit"
+            and record_input == section["target_parser_script_sha256"]
+        ) or (
+            record_mode == "legacy_projection"
+            and record_input == LEGACY_PARSER_SHA256
+        )
+        if (
+            not isinstance(parser_lineage, list)
+            or record_input not in parser_lineage
+            or not allowed_pair
+            or record.get("target_parser_sha256")
+            != section["target_parser_script_sha256"]
+        ):
+            raise ExtractionError(f"{where} parser lineage differs")
+    elif (
         record.get("mode") != section["mode"]
         or record.get("input_parser_sha256")
         != section["input_parser_script_sha256"]
@@ -2304,7 +2325,10 @@ def _prepare_source_binding_projection(
     content_receipt: Mapping[str, Any],
     frozen_fetch_state: Mapping[str, Any],
     projection_scope: Mapping[str, int],
-) -> tuple[dict[str, object], SourceBindingProjector]:
+) -> tuple[
+    dict[str, object],
+    SourceBindingProjector | SourceBindingProjectionRouter,
+]:
     section = export_receipt.get("source_binding_projection")
     required_section = {
         "schema",
@@ -2323,11 +2347,26 @@ def _prepare_source_binding_projection(
         "ledger_artifact_sha256",
         "claim_boundary",
     }
+    mixed = (
+        isinstance(section, Mapping)
+        and section.get("mode") == SourceBindingProjectionRouter.MIXED_MODE
+    )
+    if mixed:
+        required_section |= {
+            "parser_lineage",
+            "selection_policy",
+            "selection_counts",
+        }
     if (
         not isinstance(section, Mapping)
         or set(section) != required_section
         or section.get("schema") != SOURCE_BINDING_PROJECTION_SCHEMA
-        or section.get("mode") not in {"legacy_projection", "current_audit"}
+        or section.get("mode")
+        not in {
+            "legacy_projection",
+            "current_audit",
+            SourceBindingProjectionRouter.MIXED_MODE,
+        }
         or section.get("ledger_artifact")
         != _SOURCE_BINDING_PROJECTION_ARTIFACT
         or ledger_path.name != _SOURCE_BINDING_PROJECTION_ARTIFACT
@@ -2365,14 +2404,38 @@ def _prepare_source_binding_projection(
             "source-binding projection implementation lineage differs"
         )
     try:
-        projector = SourceBindingProjector(
-            input_parser,
-            authorized_legacy_sha256=(
-                input_parser
-                if section["mode"] == "legacy_projection"
-                else None
-            ),
-        )
+        if mixed:
+            parser_lineage = section.get("parser_lineage")
+            if not isinstance(parser_lineage, list):
+                raise SourceBindingProjectionError(
+                    "mixed parser_lineage must be a list"
+                )
+            projector: SourceBindingProjector | SourceBindingProjectionRouter = (
+                SourceBindingProjectionRouter(
+                    parser_lineage,
+                    authorized_legacy_sha256=(
+                        LEGACY_PARSER_SHA256
+                        if LEGACY_PARSER_SHA256 in parser_lineage
+                        else None
+                    ),
+                )
+            )
+            if (
+                section.get("selection_policy")
+                != SourceBindingProjectionRouter.SELECTION_POLICY
+            ):
+                raise SourceBindingProjectionError(
+                    "mixed parser selection policy is unsupported"
+                )
+        else:
+            projector = SourceBindingProjector(
+                input_parser,
+                authorized_legacy_sha256=(
+                    input_parser
+                    if section["mode"] == "legacy_projection"
+                    else None
+                ),
+            )
     except SourceBindingProjectionError as exc:
         raise ExtractionError(
             f"source-binding projection parser lineage is unsupported: {exc}"
@@ -2464,6 +2527,24 @@ def _prepare_source_binding_projection(
         for name, value in expected_change_counts.items()
     ):
         raise ExtractionError("source-binding projection change counts are invalid")
+    expected_selection_counts = section.get("selection_counts") if mixed else None
+    if mixed and (
+        not isinstance(expected_selection_counts, Mapping)
+        or (expected_count > 0 and not expected_selection_counts)
+        or set(expected_selection_counts)
+        - {"legacy_projection", "current_audit"}
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 1
+            for value in expected_selection_counts.values()
+        )
+        or sum(int(value) for value in expected_selection_counts.values())
+        != expected_count
+    ):
+        raise ExtractionError(
+            "source-binding projection selection counts are invalid"
+        )
 
     artifacts = export_receipt.get("artifacts")
     if not isinstance(artifacts, list):
@@ -2551,6 +2632,7 @@ def _prepare_source_binding_projection(
     record_occurrence_count = 0
     record_action_count = 0
     change_counts: Counter[str] = Counter()
+    selection_counts: Counter[str] = Counter()
     projected_binding_count = 0
     old_binding_count = 0
     decoded_occurrence_key: tuple[str, str, str, str, int] | None = None
@@ -2670,6 +2752,7 @@ def _prepare_source_binding_projection(
         physical.update(raw)
         physical_size += len(raw)
         change_counts[str(record["change_kind"])] += 1
+        selection_counts[str(record["mode"])] += 1
         old_binding_count += record["old_binding"] is not None
         projected_binding_count += record["projected_binding"] is not None
         if occurrence_key != previous_record_occurrence:
@@ -2685,6 +2768,11 @@ def _prepare_source_binding_projection(
         or physical.hexdigest() != expected_artifact
         or dict(sorted(change_counts.items()))
         != dict(sorted(expected_change_counts.items()))
+        or (
+            mixed
+            and dict(sorted(selection_counts.items()))
+            != dict(sorted(expected_selection_counts.items()))
+        )
         or old_binding_count != coverage["old_binding_count"]
         or projected_binding_count != coverage["projected_binding_count"]
         or record_occurrence_count > coverage["occurrence_count"]
@@ -2995,7 +3083,7 @@ def _insert_inventory_record(
 def _spool_selected_inventory(
     connection: sqlite3.Connection,
     *,
-    projector: SourceBindingProjector,
+    projector: SourceBindingProjector | SourceBindingProjectionRouter,
 ) -> None:
     _create_inventory_spool(connection)
     selected_count = 0
@@ -3720,7 +3808,11 @@ def verify_binding_inventory(
         or not isinstance(projection_record_count, int)
         or projection_record_count < 0
         or header.get("source_binding_projection_mode")
-        not in {"legacy_projection", "current_audit"}
+        not in {
+            "legacy_projection",
+            "current_audit",
+            SourceBindingProjectionRouter.MIXED_MODE,
+        }
     ):
         raise ExtractionError("inventory source-binding projection is invalid")
     if (

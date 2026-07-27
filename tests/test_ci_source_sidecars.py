@@ -16,6 +16,7 @@ from scripts.ci_source_binding_projection import (
     SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN,
     SOURCE_BINDING_PROJECTION_SCHEMA,
     SourceBindingProjector,
+    SourceBindingProjectionRouter,
     projection_script_sha256,
     target_parser_script_sha256,
 )
@@ -479,13 +480,18 @@ def _frozen_case5_fixture(
     head: str,
     *,
     legacy_projection: bool = False,
+    mixed_projection: bool = False,
     unbound_projection: bool = False,
 ) -> dict[str, object]:
     root = tmp_path / "ci-store"
     content = "compile output\n"
     content_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
     token_sequence_sha = hash_token_sequence([1, 2])
-    occurrence_repo = "owner/base" if legacy_projection else "owner/repo"
+    occurrence_repo = (
+        "owner/base"
+        if legacy_projection or mixed_projection
+        else "owner/repo"
+    )
     selected_key = {
         "repo": occurrence_repo,
         "run_attempt": "1:1",
@@ -501,7 +507,7 @@ def _frozen_case5_fixture(
         "chunk_ordinal": 0,
     }
     provenance_kwargs: dict[str, object] = {}
-    if legacy_projection:
+    if legacy_projection or mixed_projection:
         provenance_kwargs = {
             "event": "pull_request",
             "repository": "owner/base",
@@ -518,6 +524,23 @@ def _frozen_case5_fixture(
         head,
         **provenance_kwargs,
     )
+    if mixed_projection:
+        current_action = nonrepresentative_provenance["chunk"][
+            "training_sidecars"
+        ]["build_actions"][0]
+        current_action["repository_source_bindings"] = [
+            {
+                "repository": "owner/base",
+                "head_sha": head,
+                "source_path": "src/nested/main.cpp",
+                "confidence": {
+                    "score": 0.95,
+                    "level": "high",
+                    "source": "relative_source_path_v1",
+                },
+            }
+        ]
+        current_action["repository_source_binding_count"] = 1
     if unbound_projection:
         for provenance in (selected_provenance, nonrepresentative_provenance):
             action = provenance["chunk"]["training_sidecars"]["build_actions"][0]
@@ -585,11 +608,18 @@ def _frozen_case5_fixture(
         [representative],
     )
     ledger_artifact = hashlib.sha256(ledger_raw).hexdigest()
-    projector = SourceBindingProjector(
-        input_parser_sha256,
-        authorized_legacy_sha256=(
-            LEGACY_PARSER_SHA256 if legacy_projection else None
-        ),
+    projector = (
+        SourceBindingProjectionRouter(
+            [LEGACY_PARSER_SHA256, target_parser_script_sha256()],
+            authorized_legacy_sha256=LEGACY_PARSER_SHA256,
+        )
+        if mixed_projection
+        else SourceBindingProjector(
+            input_parser_sha256,
+            authorized_legacy_sha256=(
+                LEGACY_PARSER_SHA256 if legacy_projection else None
+            ),
+        )
     )
     projection_records: list[dict[str, object]] = []
     for occurrence_key, provenance in (
@@ -653,6 +683,24 @@ def _frozen_case5_fixture(
             "projection_script_sha256": projection_script_sha256(),
             "input_parser_script_sha256": projector.input_parser_sha256,
             "target_parser_script_sha256": projector.target_parser_sha256,
+            **(
+                {
+                    "parser_lineage": list(projector.parser_lineage),
+                    "selection_policy": projector.SELECTION_POLICY,
+                    "selection_counts": {
+                        mode: sum(
+                            record["mode"] == mode
+                            for record in projection_records
+                        )
+                        for mode in {
+                            str(record["mode"])
+                            for record in projection_records
+                        }
+                    },
+                }
+                if mixed_projection
+                else {}
+            ),
             "input_occurrence_set_sha256": content_receipt[
                 "occurrence_set_sha256"
             ],
@@ -1018,6 +1066,44 @@ def test_inventory_consumes_legacy_projection_instead_of_stale_action_binding(
     assert reference["checkout_evidence"]["repository_source_binding"][
         "repository"
     ] == "owner/base"
+
+
+def test_inventory_recomputes_mixed_parser_lineage_per_occurrence(
+    tmp_path: Path,
+) -> None:
+    _mirror, head, _base = _git_fixture(tmp_path)
+    fixture = _frozen_case5_fixture(
+        tmp_path,
+        head,
+        mixed_projection=True,
+    )
+    inventory_path = tmp_path / "mixed-source-inventory.jsonl"
+
+    _extract_fixture(fixture, inventory_path)
+    records = _inventory_records(inventory_path)
+    header = records[0]
+    binding = next(
+        record for record in records if record["record_type"] == "binding"
+    )
+    reference = next(
+        record for record in records if record["record_type"] == "reference"
+    )
+
+    assert header["source_binding_projection_mode"] == (
+        SourceBindingProjectionRouter.MIXED_MODE
+    )
+    assert header["source_binding_projection_input_parser_sha256"] == (
+        target_parser_script_sha256()
+    )
+    assert binding["repository"] == "owner/base"
+    assert binding["source_path"] == "src/nested/main.cpp"
+    assert reference["source_binding_projection"]["change_kind"] == "modified"
+    projection_records = fixture["projection_records"]
+    assert isinstance(projection_records, list)
+    assert {record["mode"] for record in projection_records} == {
+        "legacy_projection",
+        "current_audit",
+    }
 
 
 def test_verified_unbound_projection_uses_a_typed_gap_reason(

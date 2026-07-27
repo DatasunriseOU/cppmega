@@ -1307,6 +1307,186 @@ def test_legacy_source_bindings_require_authorization_and_export_as_overlay(
     } == input_hashes
 
 
+def test_mixed_parser_generation_store_routes_legacy_and_current_actions(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    def mixed_provenance(
+        text: str,
+        *,
+        run_id: int,
+        archive_member: str,
+        binding_repository: str,
+        binding_source_path: str,
+    ) -> dict[str, Any]:
+        provenance = _provenance(text)
+        provenance["repository"] = "owner/base"
+        provenance["repository_requested"] = "owner/base"
+        provenance["repository_scope_key"] = "owner/base"
+        provenance["source_repository"] = "fork/base"
+        provenance["source_repository_id"] = 2
+        provenance["run_id"] = run_id
+        provenance["workflow"]["id"] = run_id
+        provenance["workflow"]["event"] = "pull_request"
+        provenance["archive"]["member"] = archive_member
+        provenance["job"] = {
+            "id": run_id + 1000,
+            "name": f"build-{run_id}",
+            "status": "completed",
+            "conclusion": "success",
+            "labels": ["ubuntu-24.04", "x64"],
+        }
+        provenance["chunk"]["training_sidecars"]["build_actions"] = [
+            {
+                "normalization_schema": (
+                    "cppmega_ci_build_action_normalization_v1"
+                ),
+                "tool": "clang++",
+                "kind": "compile",
+                "cwd": "/home/runner/work/base/base/build",
+                "source_inputs": ["src/main.cpp"],
+                "source_input_count": 1,
+                "outputs": [],
+                "output_count": 0,
+                "flags": ["-c"],
+                "repository_source_bindings": [
+                    {
+                        "repository": binding_repository,
+                        "head_sha": "a" * 40,
+                        "source_path": binding_source_path,
+                        "confidence": {
+                            "score": 0.95,
+                            "level": "high",
+                            "source": "relative_source_path_v1",
+                        },
+                    }
+                ],
+                "repository_source_binding_count": 1,
+                "command_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                "action_shape_sha256": hashlib.sha256(
+                    f"shape:{text}".encode()
+                ).hexdigest(),
+                "start_char": 0,
+                "end_char": len(text),
+                "line_index": 0,
+                "section_ordinal": 0,
+                "step_ordinal": None,
+                "confidence": {
+                    "score": 0.98,
+                    "level": "high",
+                    "source": "fixture",
+                },
+            }
+        ]
+        return provenance
+
+    legacy_text = "clang++ -c src/legacy.cpp"
+    current_text = "clang++ -c src/current.cpp"
+    legacy = mixed_provenance(
+        legacy_text,
+        run_id=101,
+        archive_member="0_build-101.txt",
+        binding_repository="fork/base",
+        binding_source_path="src/main.cpp",
+    )
+    current = mixed_provenance(
+        current_text,
+        run_id=102,
+        archive_member="0_build-102.txt",
+        binding_repository="owner/base",
+        binding_source_path="build/src/main.cpp",
+    )
+    store_root, receipt_path, fetch_state = _build_store(
+        tmp_path,
+        exact_tokenizer,
+        [(legacy_text, legacy), (current_text, current)],
+    )
+    with sqlite3.connect(fetch_state) as connection:
+        connection.execute(
+            """
+            INSERT INTO binding_upgrades(
+              binding_key,from_sha256,to_sha256,reason,upgraded_at
+            ) VALUES (?,?,?,?,?)
+            """,
+            (
+                "parser_script_sha256",
+                LEGACY_PARSER_SHA256,
+                target_parser_script_sha256(),
+                "source binding semantics changed without rewriting frozen CAS",
+                "2026-07-26T23:00:00Z",
+            ),
+        )
+        connection.commit()
+
+    refused = tmp_path / "mixed-refused"
+    with pytest.raises(
+        ExportError,
+        match="requires exact explicit authorization",
+    ):
+        export_store(
+            store_root=store_root,
+            store_receipt=receipt_path,
+            fetch_state=fetch_state,
+            tokenizer_json=TOKENIZER_JSON,
+            output=refused,
+        )
+    assert not refused.exists()
+
+    output = tmp_path / "mixed-projected"
+    receipt = export_store(
+        store_root=store_root,
+        store_receipt=receipt_path,
+        fetch_state=fetch_state,
+        tokenizer_json=TOKENIZER_JSON,
+        output=output,
+        source_binding_projection_from_parser_sha256=LEGACY_PARSER_SHA256,
+    )
+    projection = receipt["source_binding_projection"]
+    assert projection["mode"] == "mixed_lineage_projection"
+    assert projection["parser_lineage"] == [
+        LEGACY_PARSER_SHA256,
+        target_parser_script_sha256(),
+    ]
+    assert projection["selection_policy"] == (
+        "stored-binding-semantics-current-first-v1"
+    )
+    assert projection["selection_counts"] == {
+        "current_audit": 1,
+        "legacy_projection": 1,
+    }
+    records = [
+        json.loads(line)
+        for line in (output / projection["ledger_artifact"])
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert {record["mode"] for record in records} == {
+        "current_audit",
+        "legacy_projection",
+    }
+    assert {
+        (record["mode"], record["change_kind"])
+        for record in records
+    } == {
+        ("current_audit", "unchanged"),
+        ("legacy_projection", "modified"),
+    }
+    metadata = [
+        json.loads(line)
+        for line in (
+            output / receipt["representative_metadata"]["artifact"]
+        )
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert {
+        item["training_sidecars"]["build_actions"][0][
+            "source_binding_projection"
+        ]["mode"]
+        for item in metadata
+    } == {"current_audit", "legacy_projection"}
+
+
 def test_projection_writer_rejects_rows_the_consumer_cannot_read(
     tmp_path: Path,
 ) -> None:
