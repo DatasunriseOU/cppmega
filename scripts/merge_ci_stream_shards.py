@@ -58,6 +58,7 @@ from scripts.ci_content_store import (  # noqa: E402
 from scripts.ci_stream_fetch import (  # noqa: E402
     RECEIPT_SCHEMA as FETCH_RECEIPT_SCHEMA,
     SCHEMA_VERSION as FETCH_STATE_SCHEMA,
+    _BINDING_KEYS,
     _STATE_SCHEMA as FETCH_STATE_SQL_SCHEMA,
     ExactTokenizer,
 )
@@ -83,10 +84,10 @@ from scripts.export_ci_content_store_case5 import (  # noqa: E402
 
 
 MANIFEST_SCHEMA = "cppmega_ci_stream_shard_union_manifest_v1"
-MERGE_RECEIPT_SCHEMA = "cppmega_ci_stream_shard_union_receipt_v1"
-JOURNAL_SCHEMA = "cppmega_ci_stream_shard_union_journal_v1"
+MERGE_RECEIPT_SCHEMA = "cppmega_ci_stream_shard_union_receipt_v2"
+JOURNAL_SCHEMA = "cppmega_ci_stream_shard_union_journal_v2"
 REQUEST_MAP_SCHEMA = "cppmega_ci_stream_request_id_map_v1"
-BINDING_MAP_SCHEMA = "cppmega_ci_stream_binding_id_map_v1"
+BINDING_MAP_SCHEMA = "cppmega_ci_stream_binding_id_map_v2"
 ATTEMPT_MAP_SCHEMA = "cppmega_ci_stream_attempt_resolution_v1"
 MEMBER_MAP_SCHEMA = "cppmega_ci_stream_member_resolution_v1"
 TIME_SHARD_INVENTORY_SCHEMA = "cppmega_ci_inventory_time_shard_v1"
@@ -292,7 +293,9 @@ CREATE TABLE IF NOT EXISTS binding_id_map (
     source_id INTEGER NOT NULL,
     destination_id INTEGER NOT NULL,
     source_row_sha256 TEXT NOT NULL,
-    outcome TEXT NOT NULL CHECK(outcome IN ('inserted','exact_overlap')),
+    outcome TEXT NOT NULL CHECK(
+      outcome IN ('inserted','exact_overlap','canonical_overlap')
+    ),
     PRIMARY KEY(shard_id,source_id)
 );
 """
@@ -986,39 +989,65 @@ def _reject_unsafe_attempt_states(connection: sqlite3.Connection) -> None:
 def _validate_binding_history(
     connection: sqlite3.Connection,
     *,
-    current_fetcher_sha256: str,
+    current_bindings: Mapping[str, str],
 ) -> None:
-    current = _require_hex64(
-        current_fetcher_sha256,
-        where="fetch-state fetcher_script_sha256",
-    )
-    previous_to: str | None = None
+    currents = {
+        binding_key: _require_hex64(
+            current_bindings.get(binding_key, ""),
+            where=f"fetch-state {binding_key}",
+        )
+        for binding_key in _BINDING_KEYS
+    }
+    histories: dict[str, list[sqlite3.Row]] = {
+        binding_key: [] for binding_key in _BINDING_KEYS
+    }
     for row in connection.execute(
         """
-        SELECT binding_key,from_sha256,to_sha256
+        SELECT binding_key,from_sha256,to_sha256,upgraded_at
         FROM binding_upgrades
         ORDER BY id
         """
     ):
-        if str(row["binding_key"]) != "fetcher_script_sha256":
+        binding_key = str(row["binding_key"])
+        if binding_key not in histories:
             raise MergeError("fetch-state binding history has an unsupported key")
-        source = _require_hex64(
-            row["from_sha256"],
-            where="binding upgrade from_sha256",
-        )
-        destination = _require_hex64(
-            row["to_sha256"],
-            where="binding upgrade to_sha256",
-        )
-        if source == destination:
-            raise MergeError("fetch-state binding history contains a no-op upgrade")
-        if previous_to is not None and source != previous_to:
-            raise MergeError("fetch-state binding history is not a linear chain")
-        previous_to = destination
-    if previous_to is not None and previous_to != current:
-        raise MergeError(
-            "fetch-state binding history does not terminate at the current fetcher"
-        )
+        _canonical_binding_upgrade_time(row["upgraded_at"])
+        histories[binding_key].append(row)
+    for binding_key, rows in histories.items():
+        previous_to: str | None = None
+        for row in rows:
+            source = _require_hex64(
+                row["from_sha256"],
+                where=f"{binding_key} upgrade from_sha256",
+            )
+            destination = _require_hex64(
+                row["to_sha256"],
+                where=f"{binding_key} upgrade to_sha256",
+            )
+            if source == destination:
+                raise MergeError(
+                    f"{binding_key} history contains a no-op upgrade"
+                )
+            if previous_to is not None and source != previous_to:
+                raise MergeError(
+                    f"{binding_key} history is not a linear chain"
+                )
+            previous_to = destination
+        if previous_to is not None and previous_to != currents[binding_key]:
+            raise MergeError(
+                f"{binding_key} history does not terminate at its current binding"
+            )
+
+
+def _canonical_binding_upgrade_time(value: object) -> str:
+    raw = str(value)
+    try:
+        canonical = format_utc_instant(parse_utc_instant(raw))
+    except ValueError as exc:
+        raise MergeError("binding upgrade timestamp is invalid") from exc
+    if raw != canonical:
+        raise MergeError("binding upgrade timestamp is not canonical UTC")
+    return canonical
 
 
 def _create_seen_chunks(path: Path) -> sqlite3.Connection:
@@ -1795,10 +1824,7 @@ def _preflight_source(
             }
             _validate_binding_history(
                 state_precheck,
-                current_fetcher_sha256=state_settings.get(
-                    "fetcher_script_sha256",
-                    "",
-                ),
+                current_bindings=state_settings,
             )
         finally:
             state_precheck.close()
@@ -2487,7 +2513,7 @@ def _initialize_journal_file(
             connection.rollback()
             raise
         if _sqlite_schema_sha256(connection) != _expected_journal_schema_sha256():
-            raise MergeError("new merge journal schema is not canonical v1")
+            raise MergeError("new merge journal schema is not canonical v2")
         if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise MergeError("new merge journal failed integrity_check")
     finally:
@@ -2530,7 +2556,7 @@ def _open_journal(
     connection.execute("PRAGMA synchronous=FULL")
     if _sqlite_schema_sha256(connection) != _expected_journal_schema_sha256():
         connection.close()
-        raise MergeError("existing merge journal schema is not canonical v1")
+        raise MergeError("existing merge journal schema is not canonical v2")
     expected = {
         "schema": JOURNAL_SCHEMA,
         "manifest_sha256": manifest.sha256,
@@ -3234,11 +3260,27 @@ def _merge_binding_row(
         destination_id = int(existing["id"])
         if existing["to_sha256"] != incoming["to_sha256"]:
             raise MergeError("conflicting binding-upgrade branch")
-        if _row_values(existing, _BINDING_COLUMNS[1:]) != _row_values(
-            incoming, _BINDING_COLUMNS[1:]
-        ):
+        if existing["reason"] != incoming["reason"]:
             raise MergeError("conflicting binding-upgrade overlap")
-        outcome = "exact_overlap"
+        existing_time = _canonical_binding_upgrade_time(
+            existing["upgraded_at"]
+        )
+        incoming_time = _canonical_binding_upgrade_time(
+            incoming["upgraded_at"]
+        )
+        if existing_time == incoming_time:
+            outcome = "exact_overlap"
+        else:
+            canonical_time = min(existing_time, incoming_time)
+            connection.execute(
+                """
+                UPDATE destination.binding_upgrades
+                SET upgraded_at=?
+                WHERE id=?
+                """,
+                (canonical_time, destination_id),
+            )
+            outcome = "canonical_overlap"
     connection.execute(
         """
         INSERT INTO binding_id_map(
@@ -3445,58 +3487,84 @@ def _merge_fetch_state(
 def _canonicalize_destination_binding_history(
     connection: sqlite3.Connection,
 ) -> None:
-    rows = [
-        _mapping_row(row)
-        for row in connection.execute(
-            "SELECT * FROM destination.binding_upgrades ORDER BY id"
-        )
-    ]
-    current_row = connection.execute(
-        """
-        SELECT value FROM destination.settings
-        WHERE key='fetcher_script_sha256'
-        """
-    ).fetchone()
-    if current_row is None:
-        raise MergeError("destination fetcher-script binding is missing")
-    current = _require_hex64(
-        current_row[0],
-        where="destination fetcher_script_sha256",
-    )
-    by_from: dict[str, dict[str, Any]] = {}
-    destinations: set[str] = set()
-    for row in rows:
-        source = _require_hex64(
-            row["from_sha256"],
-            where="destination binding from_sha256",
-        )
-        destination = _require_hex64(
-            row["to_sha256"],
-            where="destination binding to_sha256",
-        )
-        if source == destination or source in by_from:
-            raise MergeError("destination binding history contains a branch")
-        by_from[source] = row
-        destinations.add(destination)
-    if not rows:
-        return
-    starts = sorted(set(by_from) - destinations)
-    if len(starts) != 1:
-        raise MergeError("destination binding history is not one linear chain")
     ordered: list[dict[str, Any]] = []
-    cursor = starts[0]
-    visited: set[str] = set()
-    while cursor in by_from:
-        if cursor in visited:
-            raise MergeError("destination binding history contains a cycle")
-        visited.add(cursor)
-        row = by_from[cursor]
-        ordered.append(row)
-        cursor = str(row["to_sha256"])
-    if len(ordered) != len(rows) or cursor != current:
-        raise MergeError(
-            "destination binding history does not terminate at the current fetcher"
+    rows_by_key: dict[str, list[dict[str, Any]]] = {
+        binding_key: [] for binding_key in _BINDING_KEYS
+    }
+    for row in connection.execute(
+        "SELECT * FROM destination.binding_upgrades ORDER BY id"
+    ):
+        materialized = _mapping_row(row)
+        binding_key = str(materialized["binding_key"])
+        if binding_key not in rows_by_key:
+            raise MergeError(
+                "destination binding history has an unsupported key"
+            )
+        rows_by_key[binding_key].append(materialized)
+
+    for binding_key in _BINDING_KEYS:
+        current_row = connection.execute(
+            """
+            SELECT value FROM destination.settings
+            WHERE key=?
+            """,
+            (binding_key,),
+        ).fetchone()
+        if current_row is None:
+            raise MergeError(
+                f"destination {binding_key} binding is missing"
+            )
+        current = _require_hex64(
+            current_row[0],
+            where=f"destination {binding_key}",
         )
+        rows = rows_by_key[binding_key]
+        by_from: dict[str, dict[str, Any]] = {}
+        destinations: set[str] = set()
+        for row in rows:
+            source = _require_hex64(
+                row["from_sha256"],
+                where=f"destination {binding_key} from_sha256",
+            )
+            destination = _require_hex64(
+                row["to_sha256"],
+                where=f"destination {binding_key} to_sha256",
+            )
+            _canonical_binding_upgrade_time(row["upgraded_at"])
+            if source == destination or source in by_from:
+                raise MergeError(
+                    f"destination {binding_key} history contains a branch"
+                )
+            by_from[source] = row
+            destinations.add(destination)
+        if not rows:
+            continue
+        starts = sorted(set(by_from) - destinations)
+        if len(starts) != 1:
+            raise MergeError(
+                f"destination {binding_key} history is not one linear chain"
+            )
+        cursor = starts[0]
+        visited: set[str] = set()
+        key_ordered: list[dict[str, Any]] = []
+        while cursor in by_from:
+            if cursor in visited:
+                raise MergeError(
+                    f"destination {binding_key} history contains a cycle"
+                )
+            visited.add(cursor)
+            row = by_from[cursor]
+            key_ordered.append(row)
+            cursor = str(row["to_sha256"])
+        if len(key_ordered) != len(rows) or cursor != current:
+            raise MergeError(
+                f"destination {binding_key} history does not terminate at "
+                "its current binding"
+            )
+        ordered.extend(key_ordered)
+
+    if not ordered:
+        return
 
     old_ids = [int(row["id"]) for row in ordered]
     if old_ids == list(range(1, len(ordered) + 1)):
@@ -4146,9 +4214,7 @@ def _finalize_receipts(
             _reject_unsafe_attempt_states(state.connection)
             _validate_binding_history(
                 state.connection,
-                current_fetcher_sha256=state.settings[
-                    "fetcher_script_sha256"
-                ],
+                current_bindings=state.settings,
             )
             joined = _verify_cas_fetch_join(
                 store,
