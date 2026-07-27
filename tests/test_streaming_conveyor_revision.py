@@ -235,6 +235,35 @@ def test_pr_completion_binding_rejects_legacy_receipt_without_scan_membership(
         )
 
 
+def test_pr_completion_finish_revalidation_detects_input_drift(
+    tmp_path: Path,
+) -> None:
+    receipt_path, pr_store, repo_list = _write_pr_completion_fixture(tmp_path)
+    binding = conveyor.load_pr_completion_binding(
+        receipt_path,
+        pr_store=pr_store,
+        repo_list=repo_list,
+    )
+    conveyor.revalidate_pr_completion_binding(
+        binding,
+        receipt_path,
+        pr_store=pr_store,
+        repo_list=repo_list,
+    )
+
+    repo_list.write_text('{"repos":["other/repo"]}\n', encoding="utf-8")
+    with pytest.raises(
+        conveyor.PRCompletionBindingError,
+        match="repo_list hash mismatch",
+    ):
+        conveyor.revalidate_pr_completion_binding(
+            binding,
+            receipt_path,
+            pr_store=pr_store,
+            repo_list=repo_list,
+        )
+
+
 def test_manifest_pr_completion_binding_is_preserved_and_resume_bound(
     tmp_path: Path,
 ) -> None:
@@ -261,8 +290,19 @@ def test_manifest_pr_completion_binding_is_preserved_and_resume_bound(
         reloaded.bind_pr_completion(changed)
 
 
+@pytest.mark.parametrize(
+    "legacy_key",
+    (
+        "owner_repo::r0",
+        "owner_repo::commits",
+        "owner_repo::commit_plan",
+        "owner_repo::no_git",
+        "owner_repo::repo",
+    ),
+)
 def test_manifest_rejects_legacy_commit_receipts_without_pr_binding(
     tmp_path: Path,
+    legacy_key: str,
 ) -> None:
     receipt_path, pr_store, repo_list = _write_pr_completion_fixture(tmp_path)
     binding = conveyor.load_pr_completion_binding(
@@ -271,7 +311,7 @@ def test_manifest_rejects_legacy_commit_receipts_without_pr_binding(
         repo_list=repo_list,
     )
     manifest = conveyor.ConcurrentManifest.load(tmp_path / "_done.json")
-    manifest.mark_done("owner_repo::r0", {"rows": 1})
+    manifest.mark_done(legacy_key, {"rows": 1})
 
     with pytest.raises(
         conveyor.PRCompletionBindingError,

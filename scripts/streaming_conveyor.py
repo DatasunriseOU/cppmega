@@ -206,12 +206,14 @@ def _sha256_file(path: Path) -> str:
         before.st_ino,
         before.st_size,
         before.st_mtime_ns,
+        before.st_ctime_ns,
     )
     after_identity = (
         after.st_dev,
         after.st_ino,
         after.st_size,
         after.st_mtime_ns,
+        after.st_ctime_ns,
     )
     if before_identity != after_identity:
         raise PRCompletionBindingError(
@@ -438,6 +440,26 @@ def _pr_completion_identity(binding: dict) -> tuple:
             "manifest PR completion unverified_store_pr_count is invalid"
         )
     return tuple(binding[field] for field in required)
+
+
+def revalidate_pr_completion_binding(
+    binding: dict,
+    receipt_path: Path,
+    *,
+    pr_store: Path,
+    repo_list: Path,
+) -> None:
+    """Prove the commit stream's external PR inputs stayed unchanged."""
+
+    current = load_pr_completion_binding(
+        receipt_path,
+        pr_store=pr_store,
+        repo_list=repo_list,
+    )
+    if _pr_completion_identity(current) != _pr_completion_identity(binding):
+        raise PRCompletionBindingError(
+            "PR completion binding changed while the commit stream was running"
+        )
 
 
 def _bounded_git_output(
@@ -2420,7 +2442,7 @@ class ConcurrentManifest(Manifest):
                     key
                     for key in (*state["done"], *state["failed"])
                     if re.search(
-                        r"::(?:r\d+|commits|commit_plan|no_git)$",
+                        r"::(?:r\d+|commits|commit_plan|no_git|repo)$",
                         key,
                     )
                 ]
@@ -4563,6 +4585,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     configure_runtime_paths_from_args(args)
+    pr_store = Path(args.pr_store) if args.pr_store else None
+    repo_list = Path(args.repo_list) if args.repo_list else None
+    pr_completion_binding: dict[str, object] | None = None
     if args.streams in {"both", "commits"}:
         missing_pr_options = [
             option
@@ -4578,6 +4603,23 @@ def main(argv: list[str]) -> int:
                 "commits/both requires explicit immutable PR inputs: "
                 + ", ".join(missing_pr_options)
             )
+        assert pr_store is not None
+        assert repo_list is not None
+        try:
+            pr_completion_binding = load_pr_completion_binding(
+                Path(args.pr_completion_receipt),
+                pr_store=pr_store,
+                repo_list=repo_list,
+            )
+        except PRCompletionBindingError as exc:
+            raise SystemExit(f"PR_COMPLETION_FAILED: {exc}") from exc
+        _log(
+            "PR-store: verified immutable completion receipt "
+            f"{pr_completion_binding['receipt_sha256']} for {pr_store}; "
+            f"repos={pr_completion_binding['expected_repo_count']} "
+            f"prs={pr_completion_binding['stored_pr_count']} "
+            f"(repo_list={repo_list})"
+        )
     try:
         revision_guard = CodeRevisionGuard.for_production(
             args.expected_code_revision,
@@ -4733,31 +4775,10 @@ def main(argv: list[str]) -> int:
              f"tokenized hash)")
 
     # PR-discussion live lookup (fail-loud on bad paths up front).
-    pr_store = Path(args.pr_store) if args.pr_store else None
-    repo_list = Path(args.repo_list) if args.repo_list else None
-    pr_completion_binding: dict[str, object] | None = None
     if pr_store is not None and not pr_store.exists():
         raise SystemExit(f"--pr-store does not exist: {pr_store}")
     if repo_list is not None and not repo_list.exists():
         raise SystemExit(f"--repo-list does not exist: {repo_list}")
-    if args.streams in {"both", "commits"}:
-        assert pr_store is not None
-        assert repo_list is not None
-        try:
-            pr_completion_binding = load_pr_completion_binding(
-                Path(args.pr_completion_receipt),
-                pr_store=pr_store,
-                repo_list=repo_list,
-            )
-        except PRCompletionBindingError as exc:
-            raise SystemExit(f"PR_COMPLETION_FAILED: {exc}") from exc
-        _log(
-            "PR-store: verified immutable completion receipt "
-            f"{pr_completion_binding['receipt_sha256']} for {pr_store}; "
-            f"repos={pr_completion_binding['expected_repo_count']} "
-            f"prs={pr_completion_binding['stored_pr_count']} "
-            f"(repo_list={repo_list})"
-        )
 
     # Optional cross-repo base-lib symbol index. FAIL LOUD if given but missing.
     global_symbol_index = (
@@ -5179,6 +5200,21 @@ def main(argv: list[str]) -> int:
         if recompress_error is not None:
             raise recompress_error
 
+    pr_completion_reverified_at_finish = False
+    if pr_completion_binding is not None and not interrupted:
+        assert pr_store is not None
+        assert repo_list is not None
+        try:
+            revalidate_pr_completion_binding(
+                pr_completion_binding,
+                Path(args.pr_completion_receipt),
+                pr_store=pr_store,
+                repo_list=repo_list,
+            )
+        except PRCompletionBindingError as exc:
+            raise SystemExit(f"PR_COMPLETION_DRIFT: {exc}") from exc
+        pr_completion_reverified_at_finish = True
+
     # ----- cumulative per-length report from the manifest (both streams) -----
     def _empty_totals(lengths):
         return {str(L): {"rows": 0, "valid_tokens": 0, "pad_tokens": 0,
@@ -5222,6 +5258,9 @@ def main(argv: list[str]) -> int:
         "manifest": str(CONVEYOR_MANIFEST),
         "code_revision": revision_guard.receipt,
         "pr_completion": pr_completion_binding,
+        "pr_completion_reverified_at_finish": (
+            pr_completion_reverified_at_finish
+        ),
         "extract_cache": extract_cache_config_receipt(),
         "extract_cache_metrics": progress.extract_cache_metrics(),
         "interrupted": interrupted,
