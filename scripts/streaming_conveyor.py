@@ -274,7 +274,7 @@ def load_pr_completion_binding(
         ) from exc
     if not isinstance(receipt, dict):
         raise PRCompletionBindingError("PR completion receipt must be an object")
-    if receipt.get("schema") != "cppmega_pr_completion_v1":
+    if receipt.get("schema") != "cppmega_pr_completion_v2":
         raise PRCompletionBindingError(
             f"unsupported PR completion schema: {receipt.get('schema')!r}"
         )
@@ -328,9 +328,14 @@ def load_pr_completion_binding(
         receipt.get("expected_repos_sha256"),
         field="expected_repos_sha256",
     )
+    scan_id = _require_sha256(
+        receipt.get("scan_id"),
+        field="scan_id",
+    )
     expected_repo_count = receipt.get("expected_repo_count")
     stored_pr_count = receipt.get("stored_pr_count")
     declared_pr_count = receipt.get("declared_pr_count")
+    unverified_store_pr_count = receipt.get("unverified_store_pr_count")
     if (
         isinstance(expected_repo_count, bool)
         or not isinstance(expected_repo_count, int)
@@ -351,15 +356,26 @@ def load_pr_completion_binding(
         raise PRCompletionBindingError(
             "PR completion declared_pr_count does not match stored_pr_count"
         )
+    if (
+        isinstance(unverified_store_pr_count, bool)
+        or not isinstance(unverified_store_pr_count, int)
+        or unverified_store_pr_count < 0
+    ):
+        raise PRCompletionBindingError(
+            "PR completion unverified_store_pr_count must be a "
+            "non-negative integer"
+        )
     return {
-        "schema": "cppmega_pr_completion_v1",
+        "schema": "cppmega_pr_completion_v2",
         "status": "verified",
         "receipt_sha256": _sha256_bytes(receipt_bytes),
         "pr_store_sha256": pr_store_sha256,
         "repo_list_sha256": repo_list_sha256,
         "expected_repos_sha256": expected_repos_sha256,
+        "scan_id": scan_id,
         "expected_repo_count": expected_repo_count,
         "stored_pr_count": stored_pr_count,
+        "unverified_store_pr_count": unverified_store_pr_count,
     }
 
 
@@ -371,15 +387,17 @@ def _pr_completion_identity(binding: dict) -> tuple:
         "pr_store_sha256",
         "repo_list_sha256",
         "expected_repos_sha256",
+        "scan_id",
         "expected_repo_count",
         "stored_pr_count",
+        "unverified_store_pr_count",
     )
     missing = [field for field in required if field not in binding]
     if missing:
         raise PRCompletionBindingError(
             "manifest PR completion binding is missing: " + ", ".join(missing)
         )
-    if binding["schema"] != "cppmega_pr_completion_v1":
+    if binding["schema"] != "cppmega_pr_completion_v2":
         raise PRCompletionBindingError(
             f"manifest PR completion schema is unsupported: {binding['schema']!r}"
         )
@@ -392,6 +410,7 @@ def _pr_completion_identity(binding: dict) -> tuple:
         "pr_store_sha256",
         "repo_list_sha256",
         "expected_repos_sha256",
+        "scan_id",
     ):
         _require_sha256(binding[field], field=field)
     if (
@@ -409,6 +428,14 @@ def _pr_completion_identity(binding: dict) -> tuple:
     ):
         raise PRCompletionBindingError(
             "manifest PR completion stored_pr_count is invalid"
+        )
+    if (
+        isinstance(binding["unverified_store_pr_count"], bool)
+        or not isinstance(binding["unverified_store_pr_count"], int)
+        or binding["unverified_store_pr_count"] < 0
+    ):
+        raise PRCompletionBindingError(
+            "manifest PR completion unverified_store_pr_count is invalid"
         )
     return tuple(binding[field] for field in required)
 
@@ -4438,7 +4465,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument(
         "--pr-completion-receipt",
         default=None,
-        help="Verified cppmega_pr_completion_v1 JSON receipt. Required for "
+        help="Verified cppmega_pr_completion_v2 JSON receipt. Required for "
              "commits/both and hash-checked against the explicit --pr-store and "
              "--repo-list before any work starts.",
     )

@@ -32,7 +32,7 @@ from scripts.pr_ingest.graphql_pr_stream import (
 )
 
 
-PR_COMPLETION_SCHEMA = "cppmega_pr_completion_v1"
+PR_COMPLETION_SCHEMA = "cppmega_pr_completion_v2"
 PR_GAP_COMPLETION_SCHEMA = "cppmega_pr_gap_completion_v1"
 
 
@@ -257,6 +257,15 @@ def verify_pr_completion(
             "GraphQL PR stream manifest query contract does not match the "
             "complete nested-connection contract"
         )
+    scan_id = manifest.get("scan_id")
+    if (
+        not isinstance(scan_id, str)
+        or len(scan_id) != 64
+        or any(char not in "0123456789abcdef" for char in scan_id)
+    ):
+        raise PRCompletionError(
+            "GraphQL PR stream manifest lacks a valid exact scan_id"
+        )
     manifest_repos = manifest.get("repos")
     if not isinstance(manifest_repos, dict):
         raise PRCompletionError("GraphQL PR stream manifest lacks a repos object")
@@ -326,14 +335,24 @@ def verify_pr_completion(
             stored_counts = {
                 str(repo): int(count)
                 for repo, count in conn.execute(
-                    "SELECT repo, COUNT(*) FROM prs GROUP BY repo"
+                    "SELECT repo, COUNT(*) FROM prs "
+                    "WHERE scan_id=? GROUP BY repo",
+                    (scan_id,),
                 )
             }
+            total_store_pr_count = int(
+                conn.execute("SELECT COUNT(*) FROM prs").fetchone()[0]
+            )
             for target, expected_record_sha256 in gap_record_sha256s.items():
                 stored = pr_store.get_by_pr(conn, target[0], target[1])
                 if stored is None:
                     raise PRCompletionError(
                         f"gap-completed PR is absent from the store: "
+                        f"{target[0]}#{target[1]}"
+                    )
+                if stored.get("scan_id") != scan_id:
+                    raise PRCompletionError(
+                        f"gap-completed PR is outside the verified scan: "
                         f"{target[0]}#{target[1]}"
                     )
                 actual_record_sha256 = pr_store.record_content_sha256(stored)
@@ -378,6 +397,7 @@ def verify_pr_completion(
             "path": str(graphql_manifest_path.resolve()),
             "sha256": sha256_file(graphql_manifest_path),
         },
+        "scan_id": scan_id,
         "pr_store": {
             "path": str(store_path.resolve()),
             "sha256": sha256_file(store_path),
@@ -388,6 +408,9 @@ def verify_pr_completion(
         "expected_repos_sha256": _canonical_json_sha256(list(expected_repos)),
         "declared_pr_count": sum(declared_counts.values()),
         "stored_pr_count": sum(stored_counts.values()),
+        "unverified_store_pr_count": (
+            total_store_pr_count - sum(stored_counts.values())
+        ),
         "truncated_target_count": len(targets),
     }
     if output_path is not None:

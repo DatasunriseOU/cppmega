@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS prs (
     reviews_json     TEXT NOT NULL DEFAULT '[]',
     raw_json         TEXT,
     fetched_at       TEXT,
+    scan_id          TEXT,
     PRIMARY KEY (repo, pr_number)
 );
 CREATE TABLE IF NOT EXISTS pr_by_sha (
@@ -104,6 +105,7 @@ _PR_COLUMN_DEFINITIONS = {
     "reviews_json": "TEXT NOT NULL DEFAULT '[]'",
     "raw_json": "TEXT",
     "fetched_at": "TEXT",
+    "scan_id": "TEXT",
 }
 
 
@@ -140,6 +142,10 @@ def _ensure_pr_columns(conn: sqlite3.Connection) -> None:
             "UPDATE prs SET pr_body=body "
             "WHERE (pr_body IS NULL OR pr_body='') AND body IS NOT NULL"
         )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prs_scan_repo "
+        "ON prs(scan_id, repo, pr_number)"
+    )
 
 
 def connect(
@@ -302,6 +308,7 @@ def _upsert_pr_meta(
     merged_at: object = None,
     raw: object = None,
     fetched_at: object = None,
+    scan_id: object = None,
 ) -> None:
     if not repo or pr_number is None:
         raise ValueError(
@@ -324,8 +331,8 @@ def _upsert_pr_meta(
             INSERT INTO prs(
                 repo, pr_number, title, body, pr_title, pr_body, state, author,
                 created_at, merged_at, merge_commit_sha, comments_json,
-                reviews_json, raw_json, fetched_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,'[]','[]',?,?)
+                reviews_json, raw_json, fetched_at, scan_id
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,'[]','[]',?,?,?)
             """,
             (
                 repo,
@@ -341,6 +348,7 @@ def _upsert_pr_meta(
                 merge_commit_sha,
                 raw_json,
                 fetched_at,
+                scan_id,
             ),
         )
     else:
@@ -352,7 +360,7 @@ def _upsert_pr_meta(
             UPDATE prs
             SET title=?, body=?, pr_title=?, pr_body=?, state=?, author=?,
                 created_at=?, merged_at=?, merge_commit_sha=?, raw_json=?,
-                fetched_at=?
+                fetched_at=?, scan_id=?
             WHERE repo=? AND pr_number=?
             """,
             (
@@ -367,6 +375,7 @@ def _upsert_pr_meta(
                 new_sha,
                 raw_json,
                 _nonempty(fetched_at, row["fetched_at"]),
+                _nonempty(scan_id, row["scan_id"]),
                 repo,
                 int(pr_number),
             ),
@@ -643,6 +652,7 @@ def upsert_record(
     *,
     commit: bool = True,
     replace_children: bool = False,
+    scan_id: str | None = None,
 ) -> None:
     """Insert an assembled production record while retaining root metadata."""
 
@@ -667,6 +677,7 @@ def upsert_record(
         merged_at=rec.get("merged_at"),
         raw=rec.get("raw"),
         fetched_at=rec.get("fetched_at"),
+        scan_id=scan_id if scan_id is not None else rec.get("scan_id"),
     )
     _insert_comments(conn, repo, pr_number, rec.get("comments", []))
     _insert_reviews(conn, repo, pr_number, rec.get("reviews", []))
@@ -919,6 +930,7 @@ def _assemble(
         "created_at": row["created_at"],
         "merged_at": row["merged_at"],
         "fetched_at": row["fetched_at"],
+        "scan_id": row["scan_id"],
         "raw": raw,
         "comments": comments,
         "reviews": reviews,

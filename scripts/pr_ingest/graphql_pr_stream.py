@@ -131,8 +131,8 @@ query($owner:String!, $name:String!, $cursor:String) {
   }
 }
 """
-GRAPHQL_MANIFEST_SCHEMA = "cppmega_graphql_pr_stream_manifest_v3"
-GRAPHQL_STREAM_SEMANTICS_VERSION = 3
+GRAPHQL_MANIFEST_SCHEMA = "cppmega_graphql_pr_stream_manifest_v4"
+GRAPHQL_STREAM_SEMANTICS_VERSION = 4
 GRAPHQL_QUERY_CONTRACT_SHA256 = hashlib.sha256(
     (
         REPO_PR_QUERY
@@ -188,6 +188,12 @@ class Manifest:
         empty = {
             "schema": GRAPHQL_MANIFEST_SCHEMA,
             "query_contract_sha256": GRAPHQL_QUERY_CONTRACT_SHA256,
+            "scan_id": hashlib.sha256(
+                (
+                    f"{GRAPHQL_QUERY_CONTRACT_SHA256}:"
+                    f"{time.time_ns()}:{os.getpid()}"
+                ).encode("utf-8")
+            ).hexdigest(),
             "repos": {},
         }
         self.data: dict = dict(empty)
@@ -205,7 +211,18 @@ class Manifest:
                 and self.data.get("query_contract_sha256")
                 == GRAPHQL_QUERY_CONTRACT_SHA256
             )
-            if not contract_matches and restart_query_contract:
+            loaded_scan_id = self.data.get("scan_id")
+            scan_id_matches = (
+                isinstance(loaded_scan_id, str)
+                and len(loaded_scan_id) == 64
+                and all(
+                    char in "0123456789abcdef"
+                    for char in loaded_scan_id
+                )
+            )
+            if (
+                not contract_matches or not scan_id_matches
+            ) and restart_query_contract:
                 self.restart_tag = (
                     f"{GRAPHQL_MANIFEST_SCHEMA}-"
                     f"{int(time.time())}-{os.getpid()}"
@@ -225,10 +242,30 @@ class Manifest:
                     "review-thread and linked-issue accounting. Rerun once with "
                     "--restart-query-contract to archive it and rescan every repo."
                 )
+            elif not scan_id_matches:
+                raise SystemExit(
+                    f"[graphql-stream] manifest {path} has invalid scan_id; "
+                    "rerun once with --restart-query-contract to archive it "
+                    "and rescan every repo"
+                )
             if "repos" not in self.data:
                 raise SystemExit(
                     f"[graphql-stream] manifest {path} missing 'repos' key (wrong file?)"
                 )
+        scan_id = self.data.get("scan_id")
+        if (
+            not isinstance(scan_id, str)
+            or len(scan_id) != 64
+            or any(char not in "0123456789abcdef" for char in scan_id)
+        ):
+            raise SystemExit(
+                f"[graphql-stream] manifest {path} has invalid scan_id; "
+                "restart the query contract instead of mixing scan identities"
+            )
+
+    @property
+    def scan_id(self) -> str:
+        return str(self.data["scan_id"])
 
     def get(self, repo: str) -> dict:
         with self._lock:
@@ -564,6 +601,7 @@ def stream_repo(
     append_lock: threading.Lock | None = None,
     truncated_target_keys: set[tuple[str, int]] | None = None,
     stop_event: threading.Event | None = None,
+    post_fn: Callable[[str, dict], tuple[int, dict, dict]] = _post,
 ) -> dict:
     """Stream all PRs of ``repo``. Resumes from manifest cursor if present.
 
@@ -577,7 +615,19 @@ def stream_repo(
         raise SystemExit(f"[graphql-stream] repo must be 'owner/name', got {repo!r}")
     owner, name = repo.split("/", 1)
 
+    prior_status = manifest.status(repo)
     cursor = manifest.cursor(repo)  # None on a fresh repo, else resume point
+    scan_id = manifest.scan_id
+    if prior_status == "in_progress" and cursor is None:
+        # The prior process may have committed a page before it could persist
+        # that page's cursor, or may be retrying a terminal count mismatch.
+        # Restarting the repo from the first page must also restart its exact
+        # membership proof; stale content remains available but is unverified.
+        conn.execute(
+            "UPDATE prs SET scan_id=NULL WHERE repo=? AND scan_id=?",
+            (repo, scan_id),
+        )
+        conn.commit()
     manifest.update(repo, status="in_progress")
     stats = {"repo": repo, "prs": 0, "truncated": 0, "pages": 0, "ratelimit_trips": 0}
     total_count = None
@@ -588,7 +638,7 @@ def stream_repo(
         variables = {"owner": owner, "name": name, "cursor": cursor}
         try:
             jb = _post_with_rotation(pool, variables, owner, name, max_retries,
-                                     stop_event=stop_event)
+                                     stop_event=stop_event, post_fn=post_fn)
         except RepoRateLimited:
             stats["ratelimit_trips"] += 1
             if (
@@ -621,13 +671,23 @@ def stream_repo(
                 f"(repo missing or no PR access): {jb}"
             )
 
+        page_total_count = prconn.get("totalCount")
+        if (
+            not isinstance(page_total_count, int)
+            or isinstance(page_total_count, bool)
+            or page_total_count < 0
+        ):
+            raise SystemExit(
+                f"[graphql-stream] {repo}: pullRequests.totalCount is invalid: "
+                f"{page_total_count!r}"
+            )
         if total_count is None:
-            total_count = prconn.get("totalCount")
+            total_count = page_total_count
             # Fallback heuristic on size: a huge repo is routed to GH Archive at
             # the very first page, BEFORE we burn quota paging it here.
             if (
                 fallback_pr_threshold > 0
-                and (total_count or 0) > fallback_pr_threshold
+                and total_count > fallback_pr_threshold
             ):
                 _route_to_fallback(
                     manifest, repo, fallback_list_path, cursor,
@@ -635,14 +695,68 @@ def stream_repo(
                     append_lock=append_lock,
                 )
                 return stats
+        elif page_total_count != total_count:
+            manifest.update(
+                repo,
+                status="in_progress",
+                cursor=None,
+                note=(
+                    "pull request membership changed during scan: "
+                    f"first_total_count={total_count} "
+                    f"page_total_count={page_total_count}; "
+                    "next resume restarts this repo from the first page"
+                ),
+            )
+            raise SystemExit(
+                f"[graphql-stream] {repo}: pull request membership changed "
+                f"during scan: first_total_count={total_count} "
+                f"page_total_count={page_total_count}; progress remains "
+                "fail-closed and the next resume will rescan this repo"
+            )
 
-        for node in prconn.get("nodes", []):
+        nodes = prconn.get("nodes")
+        page_info = prconn.get("pageInfo")
+        if not isinstance(nodes, list) or any(
+            not isinstance(node, dict) for node in nodes
+        ):
+            raise SystemExit(
+                f"[graphql-stream] {repo}: pullRequests.nodes is not a list "
+                "of objects"
+            )
+        if not isinstance(page_info, dict):
+            raise SystemExit(
+                f"[graphql-stream] {repo}: pullRequests.pageInfo is invalid"
+            )
+        has_next = page_info.get("hasNextPage")
+        end_cursor = page_info.get("endCursor")
+        if not isinstance(has_next, bool):
+            raise SystemExit(
+                f"[graphql-stream] {repo}: pageInfo.hasNextPage is invalid: "
+                f"{has_next!r}"
+            )
+        if has_next and (
+            not isinstance(end_cursor, str) or not end_cursor
+        ):
+            raise SystemExit(
+                f"[graphql-stream] {repo}: a non-terminal page lacks a valid "
+                "endCursor"
+            )
+        if not has_next and end_cursor is not None and not isinstance(
+            end_cursor, str
+        ):
+            raise SystemExit(
+                f"[graphql-stream] {repo}: terminal page endCursor is invalid: "
+                f"{end_cursor!r}"
+            )
+
+        for node in nodes:
             rec, truncated = _pr_node_to_record(repo, node)
             pr_store.upsert_record(
                 conn,
                 rec,
                 commit=False,
                 replace_children=True,
+                scan_id=scan_id,
             )
             stats["prs"] += 1
             if truncated:
@@ -669,51 +783,74 @@ def stream_repo(
                         {"repo": repo, "pr_number": rec["pr_number"]},
                         lock=append_lock,
                     )
-            if max_prs is not None and stats["prs"] >= max_prs:
-                conn.commit()
-                manifest.update(
-                    repo, status="in_progress", cursor=cursor,
-                    prs=int(
-                        conn.execute(
-                            "SELECT COUNT(*) FROM prs WHERE repo=?",
-                            (repo,),
-                        ).fetchone()[0]
-                    ),
-                    truncated=sum(
-                        1 for target_repo, _number in truncated_target_keys
-                        if target_repo == repo
-                    ),
-                    total_count=total_count,
-                    note=f"stopped at --max-prs={max_prs}",
-                )
-                stats["pages"] += 1
-                return stats
-
         stats["pages"] += 1
         conn.commit()
-        pi = prconn.get("pageInfo") or {}
-        end_cursor = pi.get("endCursor")
-        has_next = pi.get("hasNextPage")
 
         # Checkpoint AFTER the page's PRs are committed: resume continues from
         # this exact endCursor (per-repo + per-cursor resumability).
         cursor = end_cursor
+        scanned_prs = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM prs WHERE repo=? AND scan_id=?",
+                (repo, scan_id),
+            ).fetchone()[0]
+        )
+        terminal_count_mismatch = (
+            not has_next
+            and isinstance(total_count, int)
+            and scanned_prs != total_count
+        )
         manifest.update(
             repo,
-            status="in_progress" if has_next else "done",
+            status="in_progress"
+            if has_next or terminal_count_mismatch
+            else "done",
             cursor=cursor if has_next else None,
-            prs=int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM prs WHERE repo=?",
-                    (repo,),
-                ).fetchone()[0]
-            ),
+            prs=scanned_prs,
             truncated=sum(
                 1 for target_repo, _number in truncated_target_keys
                 if target_repo == repo
             ),
             total_count=total_count,
+            **(
+                {
+                    "note": (
+                        "scan membership count mismatch at terminal page: "
+                        f"scanned={scanned_prs} total_count={total_count}; "
+                        "next resume restarts this repo from the first page"
+                    )
+                }
+                if terminal_count_mismatch
+                else {}
+            ),
         )
+        if terminal_count_mismatch:
+            raise SystemExit(
+                f"[graphql-stream] {repo}: scan membership count mismatch at "
+                f"terminal page: scanned={scanned_prs} total_count={total_count}; "
+                "progress remains fail-closed and the next resume will rescan "
+                "this repo from the first page"
+            )
+        if max_prs is not None and stats["prs"] >= max_prs and has_next:
+            # A GraphQL cursor addresses a complete page, not a prefix of its
+            # nodes. Finish and commit the page before applying the test/debug
+            # cap so resume always advances instead of replaying the same page.
+            manifest.update(
+                repo,
+                status="in_progress",
+                cursor=cursor,
+                prs=scanned_prs,
+                truncated=sum(
+                    1 for target_repo, _number in truncated_target_keys
+                    if target_repo == repo
+                ),
+                total_count=total_count,
+                note=(
+                    f"stopped after complete page at --max-prs={max_prs}; "
+                    f"processed_this_run={stats['prs']}"
+                ),
+            )
+            return stats
         if not has_next:
             break
 

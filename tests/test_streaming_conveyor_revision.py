@@ -138,7 +138,7 @@ def _write_pr_completion_fixture(
     receipt_path.write_text(
         json.dumps(
             {
-                "schema": "cppmega_pr_completion_v1",
+                "schema": "cppmega_pr_completion_v2",
                 "status": "verified",
                 "pr_store": {
                     "path": str(pr_store.resolve()),
@@ -149,9 +149,11 @@ def _write_pr_completion_fixture(
                     "sha256": sha256(repo_list),
                 },
                 "expected_repos_sha256": "a" * 64,
+                "scan_id": "1" * 64,
                 "expected_repo_count": 1,
                 "declared_pr_count": 7,
                 "stored_pr_count": 7,
+                "unverified_store_pr_count": 0,
             },
             sort_keys=True,
         )
@@ -185,20 +187,46 @@ def test_pr_completion_binding_hashes_explicit_store_and_repo_list(
     )
 
     assert binding == {
-        "schema": "cppmega_pr_completion_v1",
+        "schema": "cppmega_pr_completion_v2",
         "status": "verified",
         "receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
         "pr_store_sha256": hashlib.sha256(pr_store.read_bytes()).hexdigest(),
         "repo_list_sha256": hashlib.sha256(repo_list.read_bytes()).hexdigest(),
         "expected_repos_sha256": "a" * 64,
+        "scan_id": "1" * 64,
         "expected_repo_count": 1,
         "stored_pr_count": 7,
+        "unverified_store_pr_count": 0,
     }
 
     pr_store.write_bytes(b"changed after verification")
     with pytest.raises(
         conveyor.PRCompletionBindingError,
         match="pr_store hash mismatch",
+    ):
+        conveyor.load_pr_completion_binding(
+            receipt_path,
+            pr_store=pr_store,
+            repo_list=repo_list,
+        )
+
+
+def test_pr_completion_binding_rejects_legacy_receipt_without_scan_membership(
+    tmp_path: Path,
+) -> None:
+    receipt_path, pr_store, repo_list = _write_pr_completion_fixture(tmp_path)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["schema"] = "cppmega_pr_completion_v1"
+    receipt.pop("scan_id")
+    receipt.pop("unverified_store_pr_count")
+    receipt_path.write_text(
+        json.dumps(receipt, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        conveyor.PRCompletionBindingError,
+        match="unsupported PR completion schema",
     ):
         conveyor.load_pr_completion_binding(
             receipt_path,
