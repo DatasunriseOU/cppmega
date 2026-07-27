@@ -4,8 +4,11 @@ import hashlib
 import http.client
 import io
 import json
+import os
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 import threading
 from typing import Any, Mapping
 import urllib.error
@@ -1496,6 +1499,24 @@ def test_cli_finalizes_merge_compatible_receipts_after_resume(
     store_receipt = json.loads(store_receipt_path.read_text(encoding="utf-8"))
     assert receipt["content_store_receipt"] == store_receipt
     assert receipt["fetch_state"] == receipt["frozen_fetch_state"]["summary"]
+
+
+def test_receipt_cli_bootstraps_repo_from_foreign_cwd(tmp_path: Path) -> None:
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    script = Path(ci.__file__).with_name("ci_stream_receipts.py")
+
+    completed = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "Finalize frozen store/fetch receipts" in completed.stdout
 
 
 def test_receipt_refuses_cas_bound_to_retry_attempt(tmp_path: Path) -> None:
