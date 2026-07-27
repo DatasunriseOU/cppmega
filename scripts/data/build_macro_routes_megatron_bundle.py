@@ -86,6 +86,45 @@ def _sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def _inventory_regular_files_fail_closed(root: Path) -> set[Path]:
+    """Inventory regular files without following links outside ``root``."""
+
+    if root.is_symlink() or not root.is_dir():
+        raise RuntimeError(f"inventory root is not a regular directory: {root}")
+
+    files: set[Path] = set()
+    pending = [(root, Path())]
+    while pending:
+        directory, relative_directory = pending.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                entries = list(iterator)
+        except OSError as error:
+            raise RuntimeError(
+                f"cannot inventory export directory {directory}: {error}"
+            ) from error
+        for entry in entries:
+            relative = relative_directory / entry.name
+            try:
+                if entry.is_symlink():
+                    raise RuntimeError(
+                        f"export inventory contains a symlink: {relative}"
+                    )
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append((Path(entry.path), relative))
+                elif entry.is_file(follow_symlinks=False):
+                    files.add(relative)
+                else:
+                    raise RuntimeError(
+                        f"export inventory contains a non-regular entry: {relative}"
+                    )
+            except OSError as error:
+                raise RuntimeError(
+                    f"cannot inspect export inventory entry {relative}: {error}"
+                ) from error
+    return files
+
+
 def _canonical_sha256(payload: object) -> str:
     encoded = json.dumps(
         payload,
@@ -585,6 +624,7 @@ def _load_content_store_ci_export_allowlist(
             raise RuntimeError(f"{manifest_path}: duplicate CI audit path {audit_path}")
         audits[audit_path] = raw_audit
 
+    actual_relative_files = _inventory_regular_files_fail_closed(ci_root)
     allowed: dict[tuple[str, int], dict[str, int]] = {
         ("ci", bucket): {} for bucket in buckets
     }
@@ -631,8 +671,7 @@ def _load_content_store_ci_export_allowlist(
             or row_count < 0
             or not isinstance(sha256, str)
             or not re.fullmatch(r"[0-9a-f]{64}", sha256)
-            or artifact_path.is_symlink()
-            or not artifact_path.is_file()
+            or relative not in actual_relative_files
             or artifact_path.stat().st_size != byte_size
             or _sha256(artifact_path) != sha256
         ):
@@ -732,19 +771,12 @@ def _load_content_store_ci_export_allowlist(
             f"{manifest_path}: CI export has no Parquet shards for buckets {missing}"
         )
     actual_relative_parquets = {
-        path.relative_to(ci_root)
-        for path in ci_root.rglob("*.parquet")
-        if path.is_file()
+        path for path in actual_relative_files if path.suffix == ".parquet"
     }
     if actual_relative_parquets != expected_relative_parquets:
         raise RuntimeError(
             f"{manifest_path}: CI export Parquet inventory differs from receipt"
         )
-    actual_relative_files = {
-        path.relative_to(ci_root)
-        for path in ci_root.rglob("*")
-        if path.is_file()
-    }
     if actual_relative_files != expected_artifact_paths | {
         Path("export_receipt.json")
     }:

@@ -407,6 +407,45 @@ def test_content_store_export_allowlist_rejects_drift_and_orphans(
         )
 
 
+def test_content_store_export_rejects_symlinked_bucket_parent(
+    tmp_path: Path,
+) -> None:
+    ci_root = tmp_path / "ci"
+    manifest_path = _write_content_store_ci_export(ci_root)
+    outside_bucket = tmp_path / "outside-1024"
+    (ci_root / "1024").rename(outside_bucket)
+    (ci_root / "1024").symlink_to(outside_bucket, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="contains a symlink"):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit="unused",
+            cppmega_mlx_tree_sha256="unused",
+        )
+
+
+def test_content_store_export_rejects_unlisted_symlink_directory(
+    tmp_path: Path,
+) -> None:
+    ci_root = tmp_path / "ci"
+    manifest_path = _write_content_store_ci_export(ci_root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "not-in-export.parquet").write_bytes(b"outside")
+    (ci_root / "escape").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="contains a symlink"):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit="unused",
+            cppmega_mlx_tree_sha256="unused",
+        )
+
+
 def test_ci_manifest_allowlist_rejects_hash_drift_rejects_and_orphans(
     tmp_path: Path,
 ) -> None:
