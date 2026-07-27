@@ -257,13 +257,15 @@ def load_pr_completion_binding(
             "PR store has an uncheckpointed WAL and is not the immutable snapshot "
             f"bound by the receipt: {pr_store_wal}"
         )
+    receipt_max_bytes = 4 * 1024 * 1024
     try:
-        receipt_bytes = receipt_path.read_bytes()
+        with receipt_path.open("rb") as handle:
+            receipt_bytes = handle.read(receipt_max_bytes + 1)
     except OSError as exc:
         raise PRCompletionBindingError(
             f"cannot read PR completion receipt {receipt_path}: {exc}"
         ) from exc
-    if len(receipt_bytes) > 4 * 1024 * 1024:
+    if len(receipt_bytes) > receipt_max_bytes:
         raise PRCompletionBindingError(
             "PR completion receipt exceeds the 4 MiB metadata bound: "
             f"{receipt_path}"

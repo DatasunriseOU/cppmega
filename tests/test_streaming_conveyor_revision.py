@@ -235,6 +235,23 @@ def test_pr_completion_binding_rejects_legacy_receipt_without_scan_membership(
         )
 
 
+def test_pr_completion_binding_rejects_receipt_over_metadata_bound(
+    tmp_path: Path,
+) -> None:
+    receipt_path, pr_store, repo_list = _write_pr_completion_fixture(tmp_path)
+    receipt_path.write_bytes(b"x" * (4 * 1024 * 1024 + 1))
+
+    with pytest.raises(
+        conveyor.PRCompletionBindingError,
+        match="exceeds the 4 MiB metadata bound",
+    ):
+        conveyor.load_pr_completion_binding(
+            receipt_path,
+            pr_store=pr_store,
+            repo_list=repo_list,
+        )
+
+
 def test_pr_completion_finish_revalidation_detects_input_drift(
     tmp_path: Path,
 ) -> None:
