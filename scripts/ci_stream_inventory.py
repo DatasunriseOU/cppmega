@@ -2108,7 +2108,8 @@ class InventoryDB:
             ).fetchone()
             if mismatch is not None:
                 raise UnstableEnumerationError(
-                    "convergence metadata differs from an adjacent window for "
+                    "convergence metadata differs from a previously recorded "
+                    "inventory run for "
                     f"{mismatch['repo_key']}#{mismatch['run_id']} attempt "
                     f"{mismatch['run_attempt']}"
                 )
