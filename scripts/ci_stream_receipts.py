@@ -20,7 +20,7 @@ import sys
 from typing import Iterable, Mapping
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(_REPO_ROOT) not in sys.path:
+if not __package__ and str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from scripts.ci_content_store import (  # noqa: E402
