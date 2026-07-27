@@ -3112,6 +3112,8 @@ def find_build_files(
 
 
 def _classify_shell_file(filepath: str, fname: str) -> str | None:
+    from cppmega.data.domain_ingestion import decode_domain_prefix
+
     if classify_build_file(fname) is not None:
         return None
     suffix = os.path.splitext(fname)[1].lower()
@@ -3120,20 +3122,21 @@ def _classify_shell_file(filepath: str, fname: str) -> str | None:
         return None
     try:
         with Path(filepath).open("rb") as fh:
-            first_line_bytes = fh.readline(512)
+            first_line_bytes = fh.readline(1024)
+            prefix_reaches_eof = fh.tell() == os.fstat(fh.fileno()).st_size
     except OSError as exc:
         if extension_kind is not None:
             raise OSError(f"failed to read shell/domain input {filepath}: {exc}") from exc
         return None
-    if b"\0" in first_line_bytes:
-        if extension_kind is not None:
-            raise ValueError(f"binary shell/domain input contains NUL byte: {filepath}")
-        return None
     try:
-        first_line = first_line_bytes.decode("utf-8", errors="strict").lower()
-    except UnicodeDecodeError as exc:
+        first_line = decode_domain_prefix(
+            first_line_bytes,
+            path=filepath,
+            allow_trailing_nul=prefix_reaches_eof,
+        ).lower()
+    except ValueError:
         if extension_kind is not None:
-            raise ValueError(f"invalid UTF-8 shell/domain input {filepath}: {exc}") from exc
+            raise
         return None
     if first_line.startswith("#!"):
         words = set(re.findall(r"[a-z0-9_+.-]+", first_line))
@@ -8362,9 +8365,11 @@ def emit_build_documents(
     function dedup continues in ``dedup_root_functions``.
 
     FAIL LOUD (RULE #1): an unreadable discovered file or a non-empty build file
-    with invalid text RAISES. NUL-bearing and invalid UTF-8 explicit domain
-    inputs also raise before any chunk is emitted. Only zero-length inputs are
-    skipped; whitespace is source content and remains losslessly represented.
+    with invalid text RAISES. NUL-bearing or malformed supported-encoding
+    explicit domain inputs also raise before any chunk is emitted. UTF-8,
+    BOM-marked UTF-16, and strict Windows-1252 are decoded without replacement.
+    Only zero-length inputs are skipped; whitespace is source content and
+    remains losslessly represented.
     """
     docs: list[dict] = []
     if not build_files:
@@ -8437,7 +8442,11 @@ def emit_build_documents(
             if skip_invalid_inputs and str(exc).startswith(
                 (
                     "binary domain input contains NUL byte",
+                    "decoded domain input contains NUL character",
                     "invalid UTF-8 domain input",
+                    "invalid UTF-8 or Windows-1252 domain input",
+                    "invalid UTF-16LE domain input",
+                    "invalid UTF-16BE domain input",
                     "binary shell/domain input contains NUL byte",
                     "invalid UTF-8 shell/domain input",
                 )
@@ -9302,8 +9311,8 @@ def main() -> int:
         '--skip-invalid-domain-inputs',
         action='store_true',
         help='Corpus mode: log and skip individual typed domain files containing '
-             'NUL or invalid UTF-8 instead of failing the entire project. The '
-             'default remains fail-loud.',
+             'NUL or malformed supported encodings instead of failing the entire '
+             'project. The default remains fail-loud.',
     )
     parser.add_argument('--memory-limit-gb', type=float, default=10.0,
                         help='Abort if this Python wrapper exceeds this max RSS in GiB (default: 10)')

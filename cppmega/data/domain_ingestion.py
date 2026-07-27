@@ -85,11 +85,13 @@ class DomainFileChunk:
     source_size_bytes: int
     chunk_limit_bytes: int
     split_reason: str
+    source_encoding: str = "utf-8"
+    source_trailing_nul_bytes: int = 0
 
     def source_span(self) -> dict[str, int | str]:
         """Return the exact original-file span represented by this chunk."""
 
-        return {
+        span: dict[str, int | str] = {
             "chunk_index": self.index,
             "byte_start": self.byte_start,
             "byte_end": self.byte_end,
@@ -99,6 +101,20 @@ class DomainFileChunk:
             "chunk_limit_bytes": self.chunk_limit_bytes,
             "split_reason": self.split_reason,
         }
+        if self.source_encoding != "utf-8":
+            span["source_encoding"] = self.source_encoding
+        if self.source_trailing_nul_bytes:
+            span["source_trailing_nul_bytes"] = self.source_trailing_nul_bytes
+        return span
+
+
+@dataclass(frozen=True)
+class _ValidatedDomainText:
+    codec: str
+    source_encoding: str
+    bom: bytes
+    signature_text: str
+    trailing_nul_bytes: int
 
 
 @dataclass(frozen=True)
@@ -238,51 +254,215 @@ class _SqlLexState:
 _SQL_DOLLAR_QUOTE_RE = re.compile(rb"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
 
 
-def _validate_utf8_domain_stream(
+def _scan_domain_stream(
     stream: BinaryIO,
     *,
     path: Path,
     expected_size: int,
-) -> bytes:
-    decoder = codecs.getincrementaldecoder("utf-8")("strict")
-    bytes_read = 0
-    prefix = bytearray()
-    try:
-        while block := stream.read(DOMAIN_STREAM_READ_BYTES):
-            bytes_read += len(block)
-            if b"\0" in block:
-                raise ValueError(f"binary domain input contains NUL byte: {path}")
-            decoder.decode(block, final=False)
-            if len(prefix) < DOMAIN_SIGNATURE_READ_BYTES:
-                remaining = DOMAIN_SIGNATURE_READ_BYTES - len(prefix)
-                prefix.extend(block[:remaining])
-        decoder.decode(b"", final=True)
-    except UnicodeDecodeError as exc:
-        raise ValueError(f"invalid UTF-8 domain input {path}: {exc}") from exc
+    codec: str,
+    source_encoding: str,
+    reject_raw_nul: bool,
+    bom: bytes = b"",
+    trailing_nul_bytes: int = 0,
+) -> _ValidatedDomainText:
+    stream.seek(0)
+    if bom:
+        actual_bom = stream.read(len(bom))
+        if actual_bom != bom:
+            raise ValueError(f"domain input encoding marker changed: {path}")
+    decoder = codecs.getincrementaldecoder(codec)("strict")
+    bytes_read = len(bom)
+    signature_parts: list[str] = []
+    signature_chars = 0
+    content_end = expected_size - trailing_nul_bytes
+    while bytes_read < content_end:
+        block = stream.read(min(DOMAIN_STREAM_READ_BYTES, content_end - bytes_read))
+        if not block:
+            break
+        bytes_read += len(block)
+        if reject_raw_nul and b"\0" in block:
+            raise ValueError(f"binary domain input contains NUL byte: {path}")
+        decoded = decoder.decode(block, final=False)
+        if "\0" in decoded:
+            raise ValueError(f"decoded domain input contains NUL character: {path}")
+        if signature_chars < DOMAIN_SIGNATURE_READ_BYTES:
+            remaining = DOMAIN_SIGNATURE_READ_BYTES - signature_chars
+            signature_parts.append(decoded[:remaining])
+            signature_chars += len(decoded[:remaining])
+    decoded = decoder.decode(b"", final=True)
+    if "\0" in decoded:
+        raise ValueError(f"decoded domain input contains NUL character: {path}")
+    if signature_chars < DOMAIN_SIGNATURE_READ_BYTES:
+        signature_parts.append(decoded[: DOMAIN_SIGNATURE_READ_BYTES - signature_chars])
+    if trailing_nul_bytes:
+        terminator = stream.read(trailing_nul_bytes)
+        if terminator != b"\0" * trailing_nul_bytes:
+            raise ValueError(f"domain input trailing NUL marker changed: {path}")
+        bytes_read += trailing_nul_bytes
     if bytes_read != expected_size:
         raise OSError(
             f"domain input changed size while reading {path}: "
             f"expected {expected_size}, read {bytes_read}"
         )
-    return bytes(prefix)
+    return _ValidatedDomainText(
+        codec=codec,
+        source_encoding=source_encoding,
+        bom=bom,
+        signature_text="".join(signature_parts),
+        trailing_nul_bytes=trailing_nul_bytes,
+    )
 
 
-def _validate_utf8_domain_path(path: Path, *, expected_size: int) -> bytes:
+def _trailing_nul_bytes(
+    stream: BinaryIO,
+    *,
+    expected_size: int,
+    codec: str,
+) -> int:
+    width = 2 if codec in {"utf-16-le", "utf-16-be"} else 1
+    if expected_size < width:
+        return 0
+    stream.seek(-width, os.SEEK_END)
+    return width if stream.read(width) == b"\0" * width else 0
+
+
+def _validate_domain_stream(
+    stream: BinaryIO,
+    *,
+    path: Path,
+    expected_size: int,
+) -> _ValidatedDomainText:
+    stream.seek(0)
+    marker = stream.read(3)
+    if marker.startswith(codecs.BOM_UTF16_LE):
+        trailing_nul_bytes = _trailing_nul_bytes(
+            stream,
+            expected_size=expected_size,
+            codec="utf-16-le",
+        )
+        try:
+            return _scan_domain_stream(
+                stream,
+                path=path,
+                expected_size=expected_size,
+                codec="utf-16-le",
+                source_encoding="utf-16-le",
+                bom=codecs.BOM_UTF16_LE,
+                reject_raw_nul=False,
+                trailing_nul_bytes=trailing_nul_bytes,
+            )
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"invalid UTF-16LE domain input {path}: {exc}") from exc
+    if marker.startswith(codecs.BOM_UTF16_BE):
+        trailing_nul_bytes = _trailing_nul_bytes(
+            stream,
+            expected_size=expected_size,
+            codec="utf-16-be",
+        )
+        try:
+            return _scan_domain_stream(
+                stream,
+                path=path,
+                expected_size=expected_size,
+                codec="utf-16-be",
+                source_encoding="utf-16-be",
+                bom=codecs.BOM_UTF16_BE,
+                reject_raw_nul=False,
+                trailing_nul_bytes=trailing_nul_bytes,
+            )
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"invalid UTF-16BE domain input {path}: {exc}") from exc
+    if marker.startswith(codecs.BOM_UTF8):
+        trailing_nul_bytes = _trailing_nul_bytes(
+            stream,
+            expected_size=expected_size,
+            codec="utf-8",
+        )
+        try:
+            return _scan_domain_stream(
+                stream,
+                path=path,
+                expected_size=expected_size,
+                codec="utf-8",
+                source_encoding="utf-8-sig",
+                bom=codecs.BOM_UTF8,
+                reject_raw_nul=True,
+                trailing_nul_bytes=trailing_nul_bytes,
+            )
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"invalid UTF-8 domain input {path}: {exc}") from exc
+    trailing_nul_bytes = _trailing_nul_bytes(
+        stream,
+        expected_size=expected_size,
+        codec="utf-8",
+    )
+    try:
+        return _scan_domain_stream(
+            stream,
+            path=path,
+            expected_size=expected_size,
+            codec="utf-8",
+            source_encoding="utf-8",
+            reject_raw_nul=True,
+            trailing_nul_bytes=trailing_nul_bytes,
+        )
+    except UnicodeDecodeError as utf8_exc:
+        try:
+            return _scan_domain_stream(
+                stream,
+                path=path,
+                expected_size=expected_size,
+                codec="cp1252",
+                source_encoding="windows-1252",
+                reject_raw_nul=True,
+                trailing_nul_bytes=trailing_nul_bytes,
+            )
+        except UnicodeDecodeError as cp1252_exc:
+            raise ValueError(
+                f"invalid UTF-8 or Windows-1252 domain input {path}: "
+                f"utf-8={utf8_exc}; windows-1252={cp1252_exc}"
+            ) from cp1252_exc
+
+
+def _validate_domain_path(
+    path: Path,
+    *,
+    expected_size: int,
+) -> _ValidatedDomainText:
     with path.open("rb") as stream:
-        return _validate_utf8_domain_stream(
+        return _validate_domain_stream(
             stream,
             path=path,
             expected_size=expected_size,
         )
 
 
-def _decode_domain_bytes(raw: bytes, *, path: Path) -> str:
-    if b"\0" in raw:
+def _decode_domain_bytes(
+    raw: bytes,
+    *,
+    path: Path,
+    validated: _ValidatedDomainText,
+) -> str:
+    selected = validated
+    if not raw.startswith(selected.bom):
+        raise ValueError(f"domain input encoding marker changed: {path}")
+    if selected.trailing_nul_bytes and not raw.endswith(
+        b"\0" * selected.trailing_nul_bytes
+    ):
+        raise ValueError(f"domain input trailing NUL marker changed: {path}")
+    payload_end = len(raw) - selected.trailing_nul_bytes
+    payload = raw[len(selected.bom) : payload_end]
+    if selected.codec in {"utf-8", "cp1252"} and b"\0" in payload:
         raise ValueError(f"binary domain input contains NUL byte: {path}")
     try:
-        return raw.decode("utf-8", errors="strict")
+        text = payload.decode(selected.codec, errors="strict")
     except UnicodeDecodeError as exc:
-        raise ValueError(f"invalid UTF-8 domain input {path}: {exc}") from exc
+        raise ValueError(
+            f"invalid {selected.source_encoding} domain input {path}: {exc}"
+        ) from exc
+    if "\0" in text:
+        raise ValueError(f"decoded domain input contains NUL character: {path}")
+    return text
 
 
 def _read_validated_domain_text(path: Path, *, expected_size: int) -> str:
@@ -297,13 +477,18 @@ def _read_validated_domain_text(path: Path, *, expected_size: int) -> str:
             f"domain input changed size while reading {path}: "
             f"expected {expected_size}, read {len(raw)}"
         )
-    return _decode_domain_bytes(raw, path=path)
+    validated = _validate_domain_path(path, expected_size=expected_size)
+    return _decode_domain_bytes(raw, path=path, validated=validated)
 
 
 def _is_domain_text_integrity_error(exc: ValueError) -> bool:
     message = str(exc)
-    return message.startswith("binary domain input contains NUL byte") or message.startswith(
-        "invalid UTF-8 domain input"
+    return (
+        message.startswith("binary domain input contains NUL byte")
+        or message.startswith("decoded domain input contains NUL character")
+        or message.startswith("invalid UTF-8")
+        or message.startswith("invalid UTF-16")
+        or message.startswith("invalid windows-1252")
     )
 
 
@@ -450,6 +635,129 @@ def _line_chunk_cut(
     return limit, "hard_limit"
 
 
+def _decodable_prefix_at_or_before(
+    data: bytearray,
+    *,
+    limit: int,
+    codec: str,
+) -> int:
+    cut = min(int(limit), len(data))
+    if codec == "utf-8":
+        return _utf8_boundary_at_or_before(data, cut)
+    if codec == "cp1252":
+        return cut
+    if codec not in {"utf-16-le", "utf-16-be"}:
+        raise ValueError(f"unsupported domain source codec {codec!r}")
+    cut -= cut % 2
+    while cut > 0:
+        try:
+            bytes(data[:cut]).decode(codec, errors="strict")
+            return cut
+        except UnicodeDecodeError:
+            cut -= 2
+    raise UnicodeDecodeError(
+        codec,
+        bytes(data[: min(len(data), 4)]),
+        0,
+        min(len(data), 2),
+        "no complete code point within chunk limit",
+    )
+
+
+def decode_domain_prefix(
+    raw: bytes,
+    *,
+    path: str | Path,
+    allow_trailing_nul: bool = False,
+) -> str:
+    """Decode a bounded discovery prefix without consuming an incomplete tail."""
+
+    path_obj = Path(path)
+    if raw.startswith(codecs.BOM_UTF16_LE):
+        codec = "utf-16-le"
+        payload = bytearray(raw[len(codecs.BOM_UTF16_LE) :])
+    elif raw.startswith(codecs.BOM_UTF16_BE):
+        codec = "utf-16-be"
+        payload = bytearray(raw[len(codecs.BOM_UTF16_BE) :])
+    else:
+        payload_bytes = raw[len(codecs.BOM_UTF8) :] if raw.startswith(
+            codecs.BOM_UTF8
+        ) else raw
+        if allow_trailing_nul and payload_bytes.endswith(b"\0"):
+            payload_bytes = payload_bytes[:-1]
+        if b"\0" in payload_bytes:
+            raise ValueError(f"binary domain input contains NUL byte: {path_obj}")
+        try:
+            return codecs.getincrementaldecoder("utf-8")("strict").decode(
+                payload_bytes,
+                final=False,
+            )
+        except UnicodeDecodeError as utf8_exc:
+            try:
+                return codecs.getincrementaldecoder("cp1252")("strict").decode(
+                    payload_bytes,
+                    final=False,
+                )
+            except UnicodeDecodeError as cp1252_exc:
+                raise ValueError(
+                    f"invalid UTF-8 or Windows-1252 domain input {path_obj}: "
+                    f"utf-8={utf8_exc}; windows-1252={cp1252_exc}"
+                ) from cp1252_exc
+    if allow_trailing_nul and payload.endswith(b"\0\0"):
+        del payload[-2:]
+    if not payload:
+        return ""
+    cut = _decodable_prefix_at_or_before(
+        payload,
+        limit=len(payload),
+        codec=codec,
+    )
+    text = bytes(payload[:cut]).decode(codec, errors="strict")
+    if "\0" in text:
+        raise ValueError(f"decoded domain input contains NUL character: {path_obj}")
+    return text
+
+
+def _encoded_chunk_cut(
+    data: bytearray,
+    *,
+    max_source_bytes: int,
+    codec: str,
+    sql: bool,
+    sql_state: _SqlLexState,
+) -> tuple[int, str, _SqlLexState]:
+    source_limit = _decodable_prefix_at_or_before(
+        data,
+        limit=max_source_bytes,
+        codec=codec,
+    )
+    candidate_text = bytes(data[:source_limit]).decode(codec, errors="strict")
+    normalized = bytearray(candidate_text.encode("utf-8"))
+    if sql:
+        normalized_cut, split_reason, next_state = _sql_chunk_cut(
+            normalized,
+            max_chunk_bytes=len(normalized),
+            initial_state=sql_state,
+        )
+    else:
+        normalized_cut, split_reason = _line_chunk_cut(
+            normalized,
+            max_chunk_bytes=len(normalized),
+        )
+        next_state = sql_state
+    selected_text = bytes(normalized[:normalized_cut]).decode(
+        "utf-8",
+        errors="strict",
+    )
+    source_cut = len(selected_text.encode(codec, errors="strict"))
+    if source_cut <= 0 or source_cut > source_limit:
+        raise ValueError(
+            "domain chunk boundary could not be mapped to original encoding: "
+            f"codec={codec} source_cut={source_cut} source_limit={source_limit}"
+        )
+    return source_cut, split_reason, next_state
+
+
 def _is_explicit_domain_path(path: Path, *, include_cpp: bool) -> bool:
     if path.name in _EXPLICIT_DOMAIN_NAMES:
         return True
@@ -478,13 +786,14 @@ def iter_domain_file_chunks(
     *,
     max_chunk_bytes: int = DOMAIN_INPUT_SIZE_LIMIT_BYTES,
 ) -> Iterator[DomainFileChunk]:
-    """Yield complete, bounded UTF-8 chunks for one typed domain input.
+    """Yield complete, bounded text chunks for one typed domain input.
 
     Inputs are validated in a bounded first pass before any chunk is yielded, so
-    invalid UTF-8 or binary data cannot leave a partially ingested document.
-    SQL prefers statement boundaries; build, shell, and diagnostic text prefers
-    line boundaries. Every emitted chunk has an explicit hard byte cap and exact
-    byte/character provenance into the original file.
+    invalid encodings or binary data cannot leave a partially ingested document.
+    UTF-8, BOM-marked UTF-16, and strict Windows-1252 are decoded without
+    replacement. SQL prefers statement boundaries; build, shell, and diagnostic
+    text prefers line boundaries. Every emitted chunk has an explicit hard byte
+    cap and exact byte/character provenance into the original encoded file.
     """
 
     if not 4 <= max_chunk_bytes <= DOMAIN_INPUT_SIZE_LIMIT_BYTES:
@@ -496,21 +805,26 @@ def iter_domain_file_chunks(
     try:
         with path_obj.open("rb") as stream:
             source_size = os.fstat(stream.fileno()).st_size
-            signature_prefix = _validate_utf8_domain_stream(
+            validated = _validate_domain_stream(
                 stream,
                 path=path_obj,
                 expected_size=source_size,
             )
-            stream.seek(0)
+            stream.seek(len(validated.bom))
 
             if source_size <= max_chunk_bytes:
+                stream.seek(0)
                 raw = stream.read(max_chunk_bytes + 1)
                 if len(raw) != source_size:
                     raise OSError(
                         f"domain input changed size while reading {path_obj}: "
                         f"expected {source_size}, read {len(raw)}"
                     )
-                text = _decode_domain_bytes(raw, path=path_obj)
+                text = _decode_domain_bytes(
+                    raw,
+                    path=path_obj,
+                    validated=validated,
+                )
                 adapter = resolve_domain_parser(path_obj, text)
                 yield DomainFileChunk(
                     path=path_obj,
@@ -525,11 +839,15 @@ def iter_domain_file_chunks(
                     source_size_bytes=source_size,
                     chunk_limit_bytes=max_chunk_bytes,
                     split_reason="eof",
+                    source_encoding=validated.source_encoding,
+                    source_trailing_nul_bytes=validated.trailing_nul_bytes,
                 )
                 return
 
-            prefix_text = _decode_domain_bytes(signature_prefix, path=path_obj)
-            path_adapter = resolve_domain_parser(path_obj, prefix_text)
+            path_adapter = resolve_domain_parser(
+                path_obj,
+                validated.signature_text,
+            )
             if not _large_domain_is_chunkable(path_obj, path_adapter):
                 raise ValueError(
                     f"domain input exceeds {max_chunk_bytes}-byte limit and "
@@ -538,27 +856,48 @@ def iter_domain_file_chunks(
 
             buffer = bytearray()
             byte_start = 0
+            source_cursor = len(validated.bom)
             char_start = 0
             chunk_index = 0
             sql_state = _SqlLexState()
-            while block := stream.read(DOMAIN_STREAM_READ_BYTES):
+            payload_remaining = (
+                source_size - len(validated.bom) - validated.trailing_nul_bytes
+            )
+            while payload_remaining:
+                block = stream.read(
+                    min(DOMAIN_STREAM_READ_BYTES, payload_remaining)
+                )
+                if not block:
+                    raise OSError(
+                        f"domain input changed size while reading {path_obj}: "
+                        f"{payload_remaining} payload bytes missing"
+                    )
+                payload_remaining -= len(block)
                 buffer.extend(block)
-                while len(buffer) > max_chunk_bytes:
-                    if path_adapter.domain == DomainKind.SQL:
-                        cut, split_reason, sql_state = _sql_chunk_cut(
-                            buffer,
-                            max_chunk_bytes=max_chunk_bytes,
-                            initial_state=sql_state,
-                        )
-                    else:
-                        cut, split_reason = _line_chunk_cut(
-                            buffer,
-                            max_chunk_bytes=max_chunk_bytes,
-                        )
+                leading_bytes = len(validated.bom) if chunk_index == 0 else 0
+                payload_limit = (
+                    max_chunk_bytes
+                    - leading_bytes
+                    - validated.trailing_nul_bytes
+                )
+                if payload_limit <= 0:
+                    raise ValueError(
+                        "max_chunk_bytes cannot hold source encoding markers: "
+                        f"{path_obj}"
+                    )
+                while len(buffer) > payload_limit:
+                    cut, split_reason, sql_state = _encoded_chunk_cut(
+                        buffer,
+                        max_source_bytes=payload_limit,
+                        codec=validated.codec,
+                        sql=path_adapter.domain == DomainKind.SQL,
+                        sql_state=sql_state,
+                    )
                     raw = bytes(buffer[:cut])
                     del buffer[:cut]
-                    text = _decode_domain_bytes(raw, path=path_obj)
-                    byte_end = byte_start + len(raw)
+                    text = raw.decode(validated.codec, errors="strict")
+                    source_cursor += len(raw)
+                    byte_end = source_cursor
                     char_end = char_start + len(text)
                     yield DomainFileChunk(
                         path=path_obj,
@@ -573,14 +912,29 @@ def iter_domain_file_chunks(
                         source_size_bytes=source_size,
                         chunk_limit_bytes=max_chunk_bytes,
                         split_reason=split_reason,
+                        source_encoding=validated.source_encoding,
+                        source_trailing_nul_bytes=validated.trailing_nul_bytes,
                     )
                     byte_start = byte_end
                     char_start = char_end
                     chunk_index += 1
+                    payload_limit = (
+                        max_chunk_bytes - validated.trailing_nul_bytes
+                    )
 
             raw = bytes(buffer)
-            text = _decode_domain_bytes(raw, path=path_obj)
-            byte_end = byte_start + len(raw)
+            text = raw.decode(validated.codec, errors="strict")
+            if "\0" in text:
+                raise ValueError(
+                    f"decoded domain input contains NUL character: {path_obj}"
+                )
+            terminator = stream.read(validated.trailing_nul_bytes)
+            if terminator != b"\0" * validated.trailing_nul_bytes:
+                raise ValueError(
+                    f"domain input trailing NUL marker changed: {path_obj}"
+                )
+            source_cursor += len(raw) + validated.trailing_nul_bytes
+            byte_end = source_cursor
             if byte_end != source_size:
                 raise OSError(
                     f"domain input changed size while reading {path_obj}: "
@@ -599,6 +953,8 @@ def iter_domain_file_chunks(
                 source_size_bytes=source_size,
                 chunk_limit_bytes=max_chunk_bytes,
                 split_reason="eof",
+                source_encoding=validated.source_encoding,
+                source_trailing_nul_bytes=validated.trailing_nul_bytes,
             )
     except OSError as exc:
         raise OSError(f"failed to read domain input {path_obj}: {exc}") from exc
@@ -1242,7 +1598,7 @@ def discover_project_domain_files(
                 with path.open("rb") as stream:
                     prefix = stream.read(DOMAIN_SIGNATURE_READ_BYTES)
                 try:
-                    prefix_text = _decode_domain_bytes(prefix, path=path)
+                    prefix_text = decode_domain_prefix(prefix, path=path)
                 except ValueError:
                     continue
                 prefix_adapter = resolve_domain_parser(path, prefix_text)
@@ -1253,10 +1609,13 @@ def discover_project_domain_files(
                 implicit_typed = False
 
             if source_size > DOMAIN_INPUT_SIZE_LIMIT_BYTES:
-                prefix = _validate_utf8_domain_path(path, expected_size=source_size)
+                validated = _validate_domain_path(
+                    path,
+                    expected_size=source_size,
+                )
                 adapter = resolve_domain_parser(
                     path,
-                    _decode_domain_bytes(prefix, path=path),
+                    validated.signature_text,
                 )
                 if adapter.name == "raw-output" and not explicit_candidate:
                     continue
@@ -1311,6 +1670,7 @@ __all__ = [
     "DiscoveredDomainFile",
     "DomainFileChunk",
     "DomainParserAdapter",
+    "decode_domain_prefix",
     "EmbeddedDomainBlock",
     "discover_project_domain_files",
     "extract_embedded_domain_blocks",

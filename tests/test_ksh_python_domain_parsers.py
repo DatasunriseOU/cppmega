@@ -184,6 +184,107 @@ def test_domain_dispatch_and_discovery_cover_ksh_and_python(tmp_path: Path) -> N
     }
 
 
+def test_utf16le_sql_chunks_preserve_original_encoded_byte_spans(
+    tmp_path: Path,
+) -> None:
+    from cppmega.data.domain_ingestion import (
+        DiscoveredDomainFile,
+        discover_project_domain_files,
+        iter_domain_file_chunks,
+    )
+
+    sql = (
+        "-- generated SQL\r\n"
+        + "INSERT INTO audit_log VALUES (N'café', N'Москва');\r\n" * 32
+    )
+    encoded = b"\xff\xfe" + sql.encode("utf-16-le")
+    path = tmp_path / "legacy/schema.sql"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(encoded)
+
+    assert discover_project_domain_files(tmp_path) == [
+        DiscoveredDomainFile(
+            path=path,
+            domain=DomainKind.SQL,
+            adapter="sql-lexical",
+        )
+    ]
+    chunks = list(iter_domain_file_chunks(path, max_chunk_bytes=128))
+    assert len(chunks) > 2
+    assert "".join(chunk.text for chunk in chunks) == sql
+    assert {chunk.source_encoding for chunk in chunks} == {"utf-16-le"}
+    assert all(chunk.byte_end - chunk.byte_start <= 128 for chunk in chunks)
+
+    byte_cursor = 0
+    char_cursor = 0
+    for chunk in chunks:
+        assert (chunk.byte_start, chunk.char_start) == (byte_cursor, char_cursor)
+        raw = encoded[chunk.byte_start : chunk.byte_end]
+        if chunk.index == 0:
+            assert raw.startswith(b"\xff\xfe")
+            raw = raw[2:]
+        assert raw.decode("utf-16-le") == chunk.text
+        assert chunk.source_span()["source_encoding"] == "utf-16-le"
+        byte_cursor = chunk.byte_end
+        char_cursor = chunk.char_end
+    assert (byte_cursor, char_cursor) == (len(encoded), len(sql))
+
+
+def test_utf16be_chunks_do_not_split_non_bmp_code_points(tmp_path: Path) -> None:
+    from cppmega.data.domain_ingestion import iter_domain_file_chunks
+
+    sql = "SELECT N'😀';\n" * 12
+    encoded = b"\xfe\xff" + sql.encode("utf-16-be")
+    path = tmp_path / "legacy-be.sql"
+    path.write_bytes(encoded)
+
+    chunks = list(iter_domain_file_chunks(path, max_chunk_bytes=24))
+    assert "".join(chunk.text for chunk in chunks) == sql
+    assert {chunk.source_encoding for chunk in chunks} == {"utf-16-be"}
+    for chunk in chunks:
+        raw = encoded[chunk.byte_start : chunk.byte_end]
+        if chunk.index == 0:
+            raw = raw[2:]
+        assert raw.decode("utf-16-be") == chunk.text
+
+
+def test_windows_1252_sql_is_decoded_without_replacement(tmp_path: Path) -> None:
+    from cppmega.data.domain_ingestion import iter_domain_file_chunks
+
+    sql = "-- Microsoft’s legacy export\r\nSELECT 'café';\r\n"
+    encoded = sql.encode("cp1252")
+    path = tmp_path / "legacy.sql"
+    path.write_bytes(encoded)
+
+    chunks = list(iter_domain_file_chunks(path, max_chunk_bytes=32))
+    assert "".join(chunk.text for chunk in chunks) == sql
+    assert {chunk.source_encoding for chunk in chunks} == {"windows-1252"}
+    assert b"".join(chunk.text.encode("cp1252") for chunk in chunks) == encoded
+    assert all(chunk.byte_end - chunk.byte_start <= 32 for chunk in chunks)
+
+
+def test_single_trailing_nul_is_explicit_in_source_provenance(
+    tmp_path: Path,
+) -> None:
+    from cppmega.data.domain_ingestion import iter_domain_file_chunks
+
+    sql = "BEGIN TRANSACTION;\r\nCOMMIT TRANSACTION;\r\n"
+    encoded = sql.encode("utf-8") + b"\0"
+    path = tmp_path / "terminated.sql"
+    path.write_bytes(encoded)
+
+    chunks = list(iter_domain_file_chunks(path, max_chunk_bytes=24))
+    assert "".join(chunk.text for chunk in chunks) == sql
+    assert chunks[-1].byte_end == len(encoded)
+    assert all(chunk.source_trailing_nul_bytes == 1 for chunk in chunks)
+    assert all(
+        chunk.source_span()["source_trailing_nul_bytes"] == 1
+        for chunk in chunks
+    )
+    rebuilt = b"".join(chunk.text.encode("utf-8") for chunk in chunks) + b"\0"
+    assert rebuilt == encoded
+
+
 @pytest.mark.parametrize("name", ["module.py", "script.ksh", "Makefile"])
 def test_domain_discovery_can_audit_and_skip_invalid_explicit_inputs(
     tmp_path: Path,
@@ -192,7 +293,7 @@ def test_domain_discovery_can_audit_and_skip_invalid_explicit_inputs(
     from cppmega.data.domain_ingestion import discover_project_domain_files
 
     explicit = tmp_path / name
-    explicit.write_bytes(b"explicit domain\xff")
+    explicit.write_bytes(b"explicit domain\x81")
     rejected: list[tuple[Path, str]] = []
 
     discovered = discover_project_domain_files(
@@ -203,16 +304,16 @@ def test_domain_discovery_can_audit_and_skip_invalid_explicit_inputs(
     assert discovered == []
     assert len(rejected) == 1
     assert rejected[0][0] == explicit
-    assert rejected[0][1].startswith("invalid UTF-8 domain input")
+    assert rejected[0][1].startswith("invalid UTF-8 or Windows-1252")
 
 
 @pytest.mark.parametrize(
     ("name", "payload", "raises"),
     [
         ("compiler-output.txt", b"error: candidate\0binary", False),
-        ("compiler-output.txt", b"error: candidate\xff", False),
-        ("module.py", b"print('typed')\xff", True),
-        ("script.ksh", b"print typed\xff", True),
+        ("compiler-output.txt", b"error: candidate\x81", False),
+        ("module.py", b"print('typed')\x81", True),
+        ("script.ksh", b"print typed\x81", True),
     ],
 )
 def test_domain_discovery_only_rejects_invalid_explicit_inputs(
@@ -225,7 +326,7 @@ def test_domain_discovery_only_rejects_invalid_explicit_inputs(
 
     (tmp_path / name).write_bytes(payload)
     if raises:
-        with pytest.raises(ValueError, match="invalid UTF-8 domain input"):
+        with pytest.raises(ValueError, match="invalid UTF-8 or Windows-1252"):
             discover_project_domain_files(tmp_path)
     else:
         assert discover_project_domain_files(tmp_path) == []
@@ -251,3 +352,19 @@ def test_indexer_classifies_ksh_and_python_documents(tmp_path: Path) -> None:
     assert doc["doc_type"] == "code"
     assert doc["domain_parse_info"]["parser"] == "python-ast-tokenize"
     assert doc["language_info"]["primary_language"] == "python"
+
+
+def test_indexer_accepts_shell_file_with_trailing_nul_terminator(
+    tmp_path: Path,
+) -> None:
+    from cppmega.data.domain_ingestion import discover_project_domain_files
+    from tools.clang_indexer import index_project
+
+    script = tmp_path / "single.ksh"
+    script.write_bytes(b"#!/bin/ksh\nprint ok\0")
+
+    assert index_project.find_shell_files(str(tmp_path)) == [(str(script), "ksh")]
+    discovered = discover_project_domain_files(tmp_path)
+    assert [(item.path, item.domain) for item in discovered] == [
+        (script, DomainKind.KSH)
+    ]
