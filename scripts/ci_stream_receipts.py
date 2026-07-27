@@ -453,6 +453,25 @@ def _default_store_receipt_path(fetch_receipt_path: Path) -> Path:
     return fetch_receipt_path.with_name(f"{fetch_receipt_path.stem}.store.json")
 
 
+def _resolved_non_symlink_path(
+    value: str | os.PathLike[str],
+    *,
+    label: str,
+) -> Path:
+    candidate = Path(value).expanduser()
+    if candidate.is_symlink():
+        raise ReceiptFinalizationError(f"{label} cannot be a symlink: {candidate}")
+    return candidate.resolve()
+
+
+def _is_within(path: Path, directory: Path) -> bool:
+    try:
+        path.relative_to(directory)
+    except ValueError:
+        return False
+    return True
+
+
 def finalize_fetch_receipts(
     *,
     state_path: str | os.PathLike[str],
@@ -473,13 +492,25 @@ def finalize_fetch_receipts(
         or target_unique_tokens <= 0
     ):
         raise ValueError("target_unique_tokens must be a positive integer")
-    state = Path(state_path).expanduser().resolve()
-    store_root = Path(content_store_path).expanduser().resolve()
-    fetch_receipt = Path(fetch_receipt_path).expanduser().resolve()
+    state = _resolved_non_symlink_path(state_path, label="fetch state")
+    store_root = _resolved_non_symlink_path(
+        content_store_path,
+        label="content store",
+    )
+    fetch_receipt = _resolved_non_symlink_path(
+        fetch_receipt_path,
+        label="fetch receipt",
+    )
     store_receipt = (
-        _default_store_receipt_path(fetch_receipt)
+        _resolved_non_symlink_path(
+            _default_store_receipt_path(fetch_receipt),
+            label="content-store receipt",
+        )
         if store_receipt_path is None
-        else Path(store_receipt_path).expanduser().resolve()
+        else _resolved_non_symlink_path(
+            store_receipt_path,
+            label="content-store receipt",
+        )
     )
     original_state = (
         state
@@ -497,9 +528,29 @@ def finalize_fetch_receipts(
         else Path(original_inventory_path).expanduser().resolve()
     )
     index_path = store_root / "index.sqlite3"
+    tokenizer_file = _resolved_non_symlink_path(
+        tokenizer_path,
+        label="tokenizer",
+    )
+    if fetch_receipt == store_receipt:
+        raise ValueError("fetch and content-store receipt paths must differ")
+    protected_inputs = {state, index_path, tokenizer_file}
+    if fetch_receipt in protected_inputs or store_receipt in protected_inputs:
+        raise ValueError("a receipt path collides with an immutable input")
+    if _is_within(fetch_receipt, store_root) or _is_within(
+        store_receipt,
+        store_root,
+    ):
+        raise ValueError("receipt paths must be outside the content store")
     _require_frozen_sqlite(state, label="fetch state")
     _require_frozen_sqlite(index_path, label="content store")
-    tokenizer = ExactTokenizer(tokenizer_path)
+    initial_state = state.stat()
+    initial_state_identity = (
+        initial_state.st_size,
+        initial_state.st_mtime_ns,
+        initial_state.st_ino,
+    )
+    tokenizer = ExactTokenizer(tokenizer_file)
 
     store = CIContentStore(store_root)
     try:
@@ -510,7 +561,6 @@ def finalize_fetch_receipts(
     finally:
         store.close()
     _require_frozen_sqlite(index_path, label="content store")
-    atomic_write_json(store_receipt, store_value)
 
     frozen_state, bound_inventory = _frozen_state_binding(
         state,
@@ -531,6 +581,16 @@ def finalize_fetch_receipts(
         "tokenizer_contract": tokenizer.contract,
         "tokenizer_fingerprint": tokenizer.fingerprint,
     }
+    final_state = state.stat()
+    if (
+        final_state.st_size,
+        final_state.st_mtime_ns,
+        final_state.st_ino,
+    ) != initial_state_identity:
+        raise ReceiptFinalizationError(
+            "fetch-state artifact changed during receipt finalization"
+        )
+    atomic_write_json(store_receipt, store_value)
     atomic_write_json(fetch_receipt, value)
     _require_frozen_sqlite(state, label="fetch state")
     _require_frozen_sqlite(index_path, label="content store")

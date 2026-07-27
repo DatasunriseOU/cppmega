@@ -1377,6 +1377,30 @@ def test_threshold_receipt_is_finalized_only_after_writers_close(
     finally:
         fetcher.close()
 
+    with pytest.raises(ValueError, match="paths must differ"):
+        finalize_fetch_receipts(
+            state_path=state_path,
+            content_store_path=store_path,
+            tokenizer_path=tokenizer,
+            target_unique_tokens=1,
+            fetch_receipt_path=fetch_receipt_path,
+            store_receipt_path=fetch_receipt_path,
+        )
+    assert not fetch_receipt_path.exists()
+
+    symlink_receipt = tmp_path / "fetch-receipt-link.json"
+    symlink_receipt.symlink_to(fetch_receipt_path)
+    with pytest.raises(RuntimeError, match="cannot be a symlink"):
+        finalize_fetch_receipts(
+            state_path=state_path,
+            content_store_path=store_path,
+            tokenizer_path=tokenizer,
+            target_unique_tokens=1,
+            fetch_receipt_path=symlink_receipt,
+            store_receipt_path=store_receipt_path,
+        )
+    symlink_receipt.unlink()
+
     receipt = finalize_fetch_receipts(
         state_path=state_path,
         content_store_path=store_path,
