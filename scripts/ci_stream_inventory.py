@@ -3416,7 +3416,9 @@ class InventoryDB:
                     "GitHub total_count observations at each split parent "
                     "versus its later child enumeration; nonzero means the "
                     "source cardinality changed or pagination contradicted "
-                    "itself during inventory"
+                    "itself during inventory; zero means no such "
+                    "contradiction was observed, not proof of an atomic "
+                    "GitHub snapshot"
                 ),
             }
             logical_document = {

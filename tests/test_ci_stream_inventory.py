@@ -440,7 +440,8 @@ def test_split_parent_count_drift_is_explicit_and_not_production_complete(
             "GitHub total_count observations at each split parent versus "
             "its later child enumeration; nonzero means the source "
             "cardinality changed or pagination contradicted itself during "
-            "inventory"
+            "inventory; zero means no such contradiction was observed, not "
+            "proof of an atomic GitHub snapshot"
         ),
     }
 
