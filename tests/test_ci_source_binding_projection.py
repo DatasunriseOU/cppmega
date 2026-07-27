@@ -12,6 +12,7 @@ from scripts.ci_source_binding_projection import (
     SOURCE_BINDING_PROJECTION_SCHEMA,
     SourceBindingProjectionError,
     SourceBindingProjector,
+    SourceBindingProjectionRouter,
     projection_record_key,
     projection_script_sha256,
     summarize_projection_records,
@@ -245,6 +246,89 @@ def test_current_parser_is_audit_only_and_deterministic() -> None:
     assert first.records[1]["old_binding"] is None
     assert first.records[1]["projected_binding"] is None
     assert first.records[0]["cwd_sha256"] is None
+
+
+def test_mixed_parser_lineage_routes_each_stored_action_fail_closed() -> None:
+    source_inputs = ["src/main.cpp"]
+    cwd = "/home/runner/work/base/base/build"
+    legacy_binding = _legacy_binding(source_inputs[0])
+    assert legacy_binding is not None
+    legacy_action = _action(source_inputs, [legacy_binding], cwd=cwd)
+    current_action = _action(
+        source_inputs,
+        _current_bindings(source_inputs, cwd=cwd),
+        cwd=cwd,
+    )
+
+    with pytest.raises(
+        SourceBindingProjectionError,
+        match="requires exact explicit authorization",
+    ):
+        SourceBindingProjectionRouter(
+            [LEGACY_PARSER_SHA256, target_parser_script_sha256()]
+        )
+    with pytest.raises(
+        SourceBindingProjectionError,
+        match="not a supported monotonic",
+    ):
+        SourceBindingProjectionRouter(
+            [target_parser_script_sha256(), LEGACY_PARSER_SHA256],
+            authorized_legacy_sha256=LEGACY_PARSER_SHA256,
+        )
+
+    router = SourceBindingProjectionRouter(
+        [LEGACY_PARSER_SHA256, target_parser_script_sha256()],
+        authorized_legacy_sha256=LEGACY_PARSER_SHA256,
+    )
+    legacy = router.project_action(
+        _OCCURRENCE_KEY,
+        _PROVENANCE_SHA256,
+        _PROVENANCE,
+        legacy_action,
+        0,
+    )
+    current = router.project_action(
+        _OCCURRENCE_KEY,
+        _PROVENANCE_SHA256,
+        _PROVENANCE,
+        current_action,
+        1,
+    )
+
+    assert router.mode == SourceBindingProjectionRouter.MIXED_MODE
+    assert router.parser_lineage == (
+        LEGACY_PARSER_SHA256,
+        target_parser_script_sha256(),
+    )
+    assert legacy.selected_mode == "legacy_projection"
+    assert legacy.selected_input_parser_sha256 == LEGACY_PARSER_SHA256
+    assert legacy.records[0]["change_kind"] == "modified"
+    assert current.selected_mode == "current_audit"
+    assert (
+        current.selected_input_parser_sha256
+        == target_parser_script_sha256()
+    )
+    assert current.records[0]["change_kind"] == "unchanged"
+    assert legacy.projected_bindings == current.projected_bindings
+
+    corrupted = dict(current_action)
+    corrupted["repository_source_bindings"] = [
+        {
+            **current_action["repository_source_bindings"][0],
+            "repository": "wrong/repo",
+        }
+    ]
+    with pytest.raises(
+        SourceBindingProjectionError,
+        match="every authorized parser lineage generation",
+    ):
+        router.project_action(
+            _OCCURRENCE_KEY,
+            _PROVENANCE_SHA256,
+            _PROVENANCE,
+            corrupted,
+            2,
+        )
 
 
 def test_projection_is_exhaustive_beyond_member_sidecar_clip_limit() -> None:

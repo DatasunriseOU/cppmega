@@ -109,6 +109,7 @@ from scripts.ci_source_binding_projection import (  # noqa: E402
     SOURCE_BINDING_PROJECTION_SCHEMA,
     SourceBindingProjectionError,
     SourceBindingProjector,
+    SourceBindingProjectionRouter,
     projection_record_key,
     projection_script_sha256,
     target_parser_script_sha256,
@@ -2099,6 +2100,42 @@ class FrozenFetchState:
         if current != self._snapshot:
             raise ExportError("fetch-state snapshot changed while export was running")
 
+    def parser_lineage(self) -> tuple[str, ...]:
+        """Return the exact linear parser generation chain bound by the state."""
+
+        rows = self.connection.execute(
+            """
+            SELECT from_sha256,to_sha256
+            FROM binding_upgrades
+            WHERE binding_key='parser_script_sha256'
+            ORDER BY id
+            """
+        ).fetchall()
+        current = self.settings["parser_script_sha256"]
+        if not rows:
+            return (current,)
+        lineage = [str(rows[0]["from_sha256"])]
+        for row in rows:
+            source = _require_hex64(
+                row["from_sha256"],
+                where="parser binding upgrade from_sha256",
+            )
+            target = _require_hex64(
+                row["to_sha256"],
+                where="parser binding upgrade to_sha256",
+            )
+            if source != lineage[-1] or source == target:
+                raise ExportError(
+                    "fetch-state parser binding history is not one linear chain"
+                )
+            lineage.append(target)
+        if lineage[-1] != current or len(set(lineage)) != len(lineage):
+            raise ExportError(
+                "fetch-state parser binding history does not terminate at "
+                "the current parser"
+            )
+        return tuple(lineage)
+
     def receipt_binding(self) -> dict[str, object]:
         if self._snapshot is None:
             raise ExportError("fetch-state snapshot was not initialized")
@@ -3865,7 +3902,8 @@ def _representative_metadata_record(
     content: ContentRecord,
     occurrence: OccurrenceRecord,
     parser_sidecar: Mapping[str, Any],
-    source_binding_projector: SourceBindingProjector,
+    source_binding_projector: SourceBindingProjector
+    | SourceBindingProjectionRouter,
 ) -> dict[str, object]:
     provenance = occurrence.provenance
     workflow = _sanitize_workflow(provenance.get("workflow"))
@@ -3910,9 +3948,9 @@ def _representative_metadata_record(
         )
         sanitized_action["source_binding_projection"] = {
             "schema": SOURCE_BINDING_PROJECTION_SCHEMA,
-            "mode": source_binding_projector.mode,
+            "mode": projection.selected_mode,
             "input_parser_script_sha256": (
-                source_binding_projector.input_parser_sha256
+                projection.selected_input_parser_sha256
             ),
             "target_parser_script_sha256": (
                 source_binding_projector.target_parser_sha256
@@ -4080,6 +4118,23 @@ def _representative_metadata_record(
             "target_parser_script_sha256": (
                 source_binding_projector.target_parser_sha256
             ),
+            **(
+                {
+                    "parser_lineage": list(
+                        source_binding_projector.parser_lineage
+                    ),
+                    "selection_policy": (
+                        source_binding_projector.SELECTION_POLICY
+                    ),
+                }
+                if isinstance(
+                    source_binding_projector,
+                    SourceBindingProjectionRouter,
+                )
+                and source_binding_projector.mode
+                == SourceBindingProjectionRouter.MIXED_MODE
+                else {}
+            ),
             "record_count": len(representative_projection_records),
             "records_sha256": _hash_records(
                 "cppmega-ci-source-binding-projection-representative-v1",
@@ -4220,8 +4275,8 @@ def export_store(
             if expected_content_count < 1 or expected_occurrence_count < 1:
                 raise ExportError("content store has no exportable occurrences")
 
-            source_binding_projector = SourceBindingProjector(
-                frozen_fetch_state.settings["parser_script_sha256"],
+            source_binding_projector = SourceBindingProjectionRouter(
+                frozen_fetch_state.parser_lineage(),
                 authorized_legacy_sha256=(
                     source_binding_projection_from_parser_sha256
                 ),
@@ -4328,6 +4383,9 @@ def export_store(
                             ] += 1
                         source_binding_projection_counts[
                             f"change_kind:{record['change_kind']}"
+                        ] += 1
+                        source_binding_projection_counts[
+                            f"selection_mode:{projection.selected_mode}"
                         ] += 1
                 content = store.get_content_record(occurrence.content_sha256)
                 try:
@@ -5142,6 +5200,26 @@ def export_store(
                     ),
                     "target_parser_script_sha256": (
                         source_binding_projector.target_parser_sha256
+                    ),
+                    **(
+                        {
+                            "parser_lineage": list(
+                                source_binding_projector.parser_lineage
+                            ),
+                            "selection_policy": (
+                                source_binding_projector.SELECTION_POLICY
+                            ),
+                            "selection_counts": {
+                                key.removeprefix("selection_mode:"): value
+                                for key, value in sorted(
+                                    source_binding_projection_counts.items()
+                                )
+                                if key.startswith("selection_mode:")
+                            },
+                        }
+                        if source_binding_projector.mode
+                        == SourceBindingProjectionRouter.MIXED_MODE
+                        else {}
                     ),
                     "input_occurrence_set_sha256": store.receipt[
                         "occurrence_set_sha256"

@@ -94,6 +94,8 @@ class SourceBindingActionProjection:
 
     records: tuple[dict[str, object], ...]
     projected_bindings: tuple[dict[str, Any], ...]
+    selected_mode: str
+    selected_input_parser_sha256: str
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -479,7 +481,147 @@ class SourceBindingProjector:
             projected_bindings=tuple(
                 dict(binding) for binding in projected if binding is not None
             ),
+            selected_mode=self.mode,
+            selected_input_parser_sha256=self.input_parser_sha256,
         )
+
+
+class SourceBindingProjectionRouter:
+    """Audit a CAS that can contain sidecars from one parser upgrade lineage.
+
+    A fetch-state parser upgrade changes the state binding for future writes; it
+    does not rewrite already committed occurrence provenance.  The router
+    therefore verifies each action against every explicitly authorized parser
+    generation and prefers current semantics whenever the stored bindings are
+    compatible with them.  A legacy-only match is projected to the current
+    semantics without mutating the upstream CAS.
+    """
+
+    SELECTION_POLICY = "stored-binding-semantics-current-first-v1"
+    MIXED_MODE = "mixed_lineage_projection"
+
+    def __init__(
+        self,
+        parser_lineage: Iterable[str],
+        *,
+        authorized_legacy_sha256: str | None = None,
+    ) -> None:
+        lineage = tuple(
+            _require_hex64(value, where="parser_lineage entry")
+            for value in parser_lineage
+        )
+        if not lineage:
+            raise SourceBindingProjectionError("parser_lineage must not be empty")
+        if len(set(lineage)) != len(lineage):
+            raise SourceBindingProjectionError(
+                "parser_lineage must not contain a cycle or repeated generation"
+            )
+        target = target_parser_script_sha256()
+        if lineage not in {
+            (LEGACY_PARSER_SHA256,),
+            (target,),
+            (LEGACY_PARSER_SHA256, target),
+        }:
+            raise SourceBindingProjectionError(
+                "parser_lineage is not a supported monotonic parser generation "
+                "chain"
+            )
+        if (
+            LEGACY_PARSER_SHA256 in lineage
+            and authorized_legacy_sha256 != LEGACY_PARSER_SHA256
+        ):
+            raise SourceBindingProjectionError(
+                "legacy parser lineage requires exact explicit authorization"
+            )
+        if (
+            authorized_legacy_sha256 is not None
+            and LEGACY_PARSER_SHA256 not in lineage
+        ):
+            _require_hex64(
+                authorized_legacy_sha256,
+                where="authorized_legacy_sha256",
+            )
+            raise SourceBindingProjectionError(
+                "legacy parser authorization is outside parser_lineage"
+            )
+
+        projectors: list[SourceBindingProjector] = []
+        if target in lineage:
+            projectors.append(SourceBindingProjector(target))
+        if LEGACY_PARSER_SHA256 in lineage:
+            projectors.append(
+                SourceBindingProjector(
+                    LEGACY_PARSER_SHA256,
+                    authorized_legacy_sha256=authorized_legacy_sha256,
+                )
+            )
+        if not projectors:
+            raise SourceBindingProjectionError(
+                "parser_lineage has no supported source-binding semantics"
+            )
+        self.parser_lineage = lineage
+        self.input_parser_sha256 = lineage[-1]
+        self.target_parser_sha256 = target
+        self.implementation_sha256 = projection_script_sha256()
+        self._projectors = tuple(projectors)
+        self.mode = (
+            self.MIXED_MODE
+            if len(self._projectors) > 1
+            else self._projectors[0].mode
+        )
+
+    def descriptor(self) -> dict[str, object]:
+        """Return the immutable mixed-lineage projection contract."""
+
+        return {
+            "schema": SOURCE_BINDING_PROJECTION_SCHEMA,
+            "ledger_domain": SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN,
+            "mode": self.mode,
+            "input_parser_sha256": self.input_parser_sha256,
+            "target_parser_sha256": self.target_parser_sha256,
+            "projection_script_sha256": self.implementation_sha256,
+            "parser_lineage": list(self.parser_lineage),
+            "selection_policy": self.SELECTION_POLICY,
+        }
+
+    def project_action(
+        self,
+        occurrence_key: Mapping[str, object],
+        provenance_sha256: str,
+        provenance: Mapping[str, object],
+        action: Mapping[str, object],
+        action_index: int,
+    ) -> SourceBindingActionProjection:
+        """Select the exact stored semantics and return a current projection."""
+
+        matches: list[SourceBindingActionProjection] = []
+        errors: list[str] = []
+        for projector in self._projectors:
+            try:
+                matches.append(
+                    projector.project_action(
+                        occurrence_key,
+                        provenance_sha256,
+                        provenance,
+                        action,
+                        action_index,
+                    )
+                )
+            except SourceBindingProjectionError as exc:
+                errors.append(f"{projector.mode}: {exc}")
+        if not matches:
+            raise SourceBindingProjectionError(
+                "stored repository source bindings disagree with every "
+                f"authorized parser lineage generation: {'; '.join(errors)}"
+            )
+        selected = matches[0]
+        for compatible in matches[1:]:
+            if compatible.projected_bindings != selected.projected_bindings:
+                raise SourceBindingProjectionError(
+                    "authorized parser generations produce divergent current "
+                    "source bindings"
+                )
+        return selected
 
 
 def projection_record_key(
