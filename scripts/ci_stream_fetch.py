@@ -2097,6 +2097,44 @@ class FetchState:
             None if jobs is None else _canonical_json_bytes(list(jobs))
         )
         with self._lock, self._connection:
+            if status in {"done", "empty"}:
+                durable = self._connection.execute(
+                    """
+                    SELECT COUNT(*) AS member_count,
+                           COALESCE(SUM(chunk_count),0) AS chunk_count,
+                           COALESCE(SUM(occurrence_tokens),0)
+                             AS occurrence_tokens
+                    FROM members
+                    WHERE repo=? AND run_id=? AND attempt=?
+                    """,
+                    (attempt.repo, attempt.run_id, attempt.attempt),
+                ).fetchone()
+                if durable is None:
+                    raise BindingError(
+                        "completed attempt durable-member accounting is missing"
+                    )
+                durable_counts = (
+                    int(durable["member_count"]),
+                    int(durable["chunk_count"]),
+                    int(durable["occurrence_tokens"]),
+                )
+                reported_counts = (
+                    int(member_count),
+                    int(chunk_count),
+                    int(occurrence_tokens),
+                )
+                if any(
+                    actual < reported
+                    for actual, reported in zip(
+                        durable_counts,
+                        reported_counts,
+                        strict=True,
+                    )
+                ):
+                    raise BindingError(
+                        "completed attempt counters exceed its durable members"
+                    )
+                member_count, chunk_count, occurrence_tokens = durable_counts
             self._connection.execute(
                 """
                 UPDATE attempts SET

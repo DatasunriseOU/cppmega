@@ -1655,6 +1655,66 @@ def test_receipt_refuses_cas_bound_to_retry_attempt(tmp_path: Path) -> None:
     assert not store_receipt_path.exists()
 
 
+def test_receipt_preflights_per_attempt_accounting_before_publication(
+    tmp_path: Path,
+) -> None:
+    from scripts.ci_stream_receipts import finalize_fetch_receipts
+
+    inventory = _inventory(tmp_path / "inventory.sqlite", 1)
+    tokenizer = _tokenizer(tmp_path / "tokenizer.json")
+    state_path = tmp_path / "fetch.sqlite"
+    store_path = tmp_path / "store"
+    fetch_receipt_path = tmp_path / "fetch-receipt.json"
+    store_receipt_path = tmp_path / "store-receipt.json"
+    github = FakeGitHub(_zip_bytes())
+    fetcher = ci.CIStreamFetcher(
+        inventory_path=inventory,
+        state_path=state_path,
+        content_store_path=store_path,
+        tokenizer_path=tokenizer,
+        tokens=["api-secret"],
+        progress_path=tmp_path / "progress.json",
+        receipt_path=fetch_receipt_path,
+        parser=_fake_parser,
+        requester=github.request,
+        archive_downloader=github.download,
+        target_unique_tokens=1,
+        sleeper=lambda _: None,
+    )
+    try:
+        fetcher.run(continuous=False, max_runs=1)
+    finally:
+        fetcher.close()
+
+    connection = sqlite3.connect(state_path)
+    try:
+        connection.execute(
+            "UPDATE attempts SET member_count=0,chunk_count=0,"
+            "occurrence_tokens=0"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"per-attempt member accounting is inconsistent: "
+            r"owner/repo/1/1"
+        ),
+    ):
+        finalize_fetch_receipts(
+            state_path=state_path,
+            content_store_path=store_path,
+            tokenizer_path=tokenizer,
+            target_unique_tokens=1,
+            fetch_receipt_path=fetch_receipt_path,
+            store_receipt_path=store_receipt_path,
+        )
+    assert not fetch_receipt_path.exists()
+    assert not store_receipt_path.exists()
+
+
 def test_retry_validates_and_skips_a_committed_member(
     tmp_path: Path,
 ) -> None:
@@ -1695,6 +1755,23 @@ def test_retry_validates_and_skips_a_committed_member(
     try:
         first.run(continuous=False, max_runs=1)
         assert parser_calls == ["0_build.txt"]
+        attempt_row = first.state._connection.execute(
+            "SELECT * FROM attempts"
+        ).fetchone()
+        assert attempt_row is not None
+        synthetic_attempt = first.state._decode_attempt(attempt_row)
+        first.state.store_member(
+            synthetic_attempt,
+            archive_member="stale-from-earlier-snapshot.txt",
+            job_key="synthetic:stale-from-earlier-snapshot.txt",
+            raw_sha256="1" * 64,
+            raw_size=17,
+            canonical_sha256="2" * 64,
+            dedup_sha256="3" * 64,
+            sidecar={"schema": "synthetic-retry-sidecar-v1"},
+            chunk_count=2,
+            occurrence_tokens=17,
+        )
     finally:
         first.close()
 
@@ -1728,9 +1805,20 @@ def test_retry_validates_and_skips_a_committed_member(
         assert parser_calls == ["0_build.txt"]
         assert resumed.store.status()["counters"]["occurrence_count"] == 1
         row = resumed.state._connection.execute(
-            "SELECT status,tries FROM attempts"
+            """
+            SELECT status,tries,member_count,chunk_count,occurrence_tokens
+            FROM attempts
+            """
         ).fetchone()
-        assert tuple(row) == ("done", 2)
+        actual = resumed.state._connection.execute(
+            """
+            SELECT COUNT(*),COALESCE(SUM(chunk_count),0),
+                   COALESCE(SUM(occurrence_tokens),0)
+            FROM members
+            """
+        ).fetchone()
+        assert tuple(row[:2]) == ("done", 2)
+        assert tuple(row[2:]) == tuple(actual)
     finally:
         resumed.close()
 
