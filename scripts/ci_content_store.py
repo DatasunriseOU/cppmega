@@ -41,6 +41,13 @@ _TOKEN_SEQUENCE_MAGIC = TOKEN_SEQUENCE_ENCODING.encode("ascii") + b"\0"
 _PACK_GLOB = "pack-*.cicp"
 _SQLITE_NAME = "index.sqlite3"
 _ORPHAN_DIRECTORY = "orphaned"
+_ORPHAN_TOKEN_SEQUENCE_QUERY = """
+    SELECT token_sequence_sha256 FROM token_sequences
+    EXCEPT
+    SELECT token_sequence_sha256 FROM contents
+    WHERE token_sequence_sha256 IS NOT NULL
+    LIMIT 1
+"""
 _OCCURRENCE_FIELDS = (
     "repo",
     "run_attempt",
@@ -2405,17 +2412,12 @@ class CIContentStore:
             raise VerificationError(
                 "content token metadata disagrees with its token sequence"
             )
+        # The frozen schema intentionally has no index on the content sequence.
+        # A correlated NOT EXISTS therefore rescans all contents per sequence
+        # (quadratic at corpus scale). EXCEPT scans each table once and builds
+        # one temporary set without changing the receipt-bound schema.
         orphan_sequences = self._connection.execute(
-            """
-            SELECT token_sequence_sha256
-            FROM token_sequences
-            WHERE NOT EXISTS (
-                SELECT 1 FROM contents
-                WHERE contents.token_sequence_sha256 =
-                      token_sequences.token_sequence_sha256
-            )
-            LIMIT 1
-            """
+            _ORPHAN_TOKEN_SEQUENCE_QUERY
         ).fetchone()
         if orphan_sequences is not None:
             raise VerificationError("unreferenced token sequence is indexed")
