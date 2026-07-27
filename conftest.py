@@ -33,6 +33,9 @@ _NATIVE_TOOLCHAIN_MARKER = "native_toolchain"
 _EXPLICIT_SOURCE_COMMIT_ENV = "CPPMEGA_MEGATRON_COMMIT"
 _PORTABLE_TEST_ALLOWLIST = frozenset(
     {
+        "tests/test_ci_source_binding_projection.py",
+        "tests/test_ci_source_sidecars.py",
+        "tests/test_export_ci_content_store_case5.py",
         "tests/test_data_pipeline_contracts.py",
         "tests/test_data_prep_parquet_to_megatron.py",
         "tests/test_case5_ksh_domain_contract.py",

@@ -11,6 +11,14 @@ import pytest
 
 from scripts.ci_content_store import CIContentStore, hash_token_sequence
 from scripts.ci_log_sidecars import canonicalize_ci_log
+from scripts.ci_source_binding_projection import (
+    LEGACY_PARSER_SHA256,
+    SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN,
+    SOURCE_BINDING_PROJECTION_SCHEMA,
+    SourceBindingProjector,
+    projection_script_sha256,
+    target_parser_script_sha256,
+)
 from scripts.ci_source_sidecars import (
     _FRAME_HEADER,
     CASE5_EXPORT_SCHEMA,
@@ -19,6 +27,7 @@ from scripts.ci_source_sidecars import (
     FETCH_RECEIPT_SCHEMA,
     GENERATED_OR_MUTATED_UNRESOLVABLE,
     INVENTORY_SCHEMA,
+    MAX_JSONL_RECORD_BYTES,
     PATH_ABSENT,
     RECEIPT_SCHEMA,
     REPRESENTATIVE_LEDGER_SCHEMA,
@@ -30,9 +39,11 @@ from scripts.ci_source_sidecars import (
     SourceStoreError,
     _checkout_binding,
     _content_store_sqlite_logical_sha256,
+    _create_inventory_spool,
     _hash_records,
     _inventory_logical_sha256,
     _sha256_file,
+    _write_inventory_jsonl,
     extract_binding_inventory,
     main,
     materialize_inventory,
@@ -189,6 +200,13 @@ def _reference(
         "source_input_index": 0,
         "source_input": binding["source_path"],
         "cwd": "/home/runner/work/workspace/checkout",
+        "source_binding_projection": {
+            "schema": "cppmega_ci_source_binding_projection_v1",
+            "mode": "current_audit",
+            "record_sha256": "f" * 64,
+            "change_kind": "unchanged",
+            "reason": "current_binding_verified",
+        },
         "normalization": normalization,
         "checkout_evidence": {
             "workflow_event": "push",
@@ -197,7 +215,11 @@ def _reference(
     }
 
 
-def _frozen_fetch_state_binding(root: Path) -> dict[str, object]:
+def _frozen_fetch_state_binding(
+    root: Path,
+    *,
+    parser_sha256: str | None = None,
+) -> dict[str, object]:
     sidecar_set_sha256 = "9" * 64
     return {
         "schema": "cppmega_ci_stream_fetch_v3",
@@ -217,7 +239,11 @@ def _frozen_fetch_state_binding(root: Path) -> dict[str, object]:
             "tokenizer_contract": '{"schema":"cppmega-tokenizer-v1"}',
             "tokenizer_fingerprint": "tokenizer-test-v1",
             "fetcher_script_sha256": "d" * 64,
-            "parser_script_sha256": "e" * 64,
+            "parser_script_sha256": (
+                target_parser_script_sha256()
+                if parser_sha256 is None
+                else parser_sha256
+            ),
             "content_store_script_sha256": "f" * 64,
             "chunk_semantics": (
                 "parser-dedup-text-cppmega-training-tokenizer-payload-only-"
@@ -284,14 +310,24 @@ def _write_inventory(
         "representative_count": len(references),
         "representative_ledger_sha256": "7" * 64,
         "representative_ledger_artifact_sha256": "8" * 64,
+        "source_binding_projection_schema": (
+            "cppmega_ci_source_binding_projection_v1"
+        ),
+        "source_binding_projection_mode": "current_audit",
+        "source_binding_projection_script_sha256": "a" * 64,
+        "source_binding_projection_input_parser_sha256": "b" * 64,
+        "source_binding_projection_target_parser_sha256": "c" * 64,
+        "source_binding_projection_ledger_record_count": len(references),
+        "source_binding_projection_ledger_sha256": "d" * 64,
+        "source_binding_projection_ledger_artifact_sha256": "e" * 64,
         "binding_count": len(ordered_bindings),
         "reference_count": len(references),
         "binding_records_sha256": _hash_records(
-            "cppmega-ci-source-binding-records-v2",
+            "cppmega-ci-source-binding-records-v3",
             ordered_bindings,
         ),
         "reference_records_sha256": _hash_records(
-            "cppmega-ci-source-reference-records-v2",
+            "cppmega-ci-source-reference-records-v3",
             references,
         ),
     }
@@ -371,6 +407,7 @@ def _valid_provenance(
         "command_sha256": "5" * 64,
         "cwd": cwd,
         "source_inputs": source_inputs,
+        "source_input_count": len(source_inputs),
         "repository_source_bindings": bindings,
         "repository_source_binding_count": len(bindings),
     }
@@ -401,11 +438,11 @@ def _producer_checkout_provenance(
     source_repository: str,
 ) -> tuple[dict[str, object], dict[str, object]]:
     raw = (
-        "2026-07-26T04:35:00Z "
-        "Working directory is '/home/runner/work/workspace/checkout/build'\n"
-        "2026-07-26T04:35:01Z "
-        "[command]g++ -c ../src/nested/main.cpp -o main.o\n"
-    ).encode()
+        b"2026-07-26T04:35:00Z "
+        b"Working directory is '/home/runner/work/workspace/checkout/build'\n"
+        b"2026-07-26T04:35:01Z "
+        b"[command]g++ -c ../src/nested/main.cpp -o main.o\n"
+    )
     produced = canonicalize_ci_log(
         raw,
         {
@@ -440,32 +477,52 @@ def _producer_checkout_provenance(
 def _frozen_case5_fixture(
     tmp_path: Path,
     head: str,
+    *,
+    legacy_projection: bool = False,
+    unbound_projection: bool = False,
 ) -> dict[str, object]:
     root = tmp_path / "ci-store"
     content = "compile output\n"
     content_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
     token_sequence_sha = hash_token_sequence([1, 2])
+    occurrence_repo = "owner/base" if legacy_projection else "owner/repo"
     selected_key = {
-        "repo": "owner/repo",
+        "repo": occurrence_repo,
         "run_attempt": "1:1",
         "job": "a-linux",
         "step": "compile:0",
         "chunk_ordinal": 0,
     }
     nonrepresentative_key = {
-        "repo": "owner/repo",
+        "repo": occurrence_repo,
         "run_attempt": "1:1",
         "job": "z-linux",
         "step": "compile:0",
         "chunk_ordinal": 0,
     }
-    selected_provenance = _valid_provenance(head)
-    # This deliberately stale non-representative proves that only the selected
-    # occurrence is interpreted as source provenance after receipt verification.
-    nonrepresentative_provenance = {
-        "schema": "stale_nonrepresentative_schema",
-        "note": "must not be source-scanned",
-    }
+    provenance_kwargs: dict[str, object] = {}
+    if legacy_projection:
+        provenance_kwargs = {
+            "event": "pull_request",
+            "repository": "owner/base",
+            "source_repository": "fork/head",
+            "binding_repository": "fork/head",
+            "bound_source_path": "../src/nested/main.cpp",
+        }
+    elif unbound_projection:
+        provenance_kwargs = {
+            "source_input": "/outside/checkout.cpp",
+        }
+    selected_provenance = _valid_provenance(head, **provenance_kwargs)
+    nonrepresentative_provenance = _valid_provenance(
+        head,
+        **provenance_kwargs,
+    )
+    if unbound_projection:
+        for provenance in (selected_provenance, nonrepresentative_provenance):
+            action = provenance["chunk"]["training_sidecars"]["build_actions"][0]
+            action["repository_source_bindings"] = []
+            action["repository_source_binding_count"] = 0
     with CIContentStore(root, max_pack_bytes=1024) as store:
         store.add_chunk(
             content,
@@ -487,7 +544,15 @@ def _frozen_case5_fixture(
 
     content_receipt_path = tmp_path / "content-receipt.json"
     content_receipt_raw = _write_json(content_receipt_path, content_receipt)
-    frozen_fetch_state = _frozen_fetch_state_binding(tmp_path)
+    input_parser_sha256 = (
+        LEGACY_PARSER_SHA256
+        if legacy_projection
+        else target_parser_script_sha256()
+    )
+    frozen_fetch_state = _frozen_fetch_state_binding(
+        tmp_path,
+        parser_sha256=input_parser_sha256,
+    )
     fetch_receipt = {
         "schema": FETCH_RECEIPT_SCHEMA,
         "frozen_fetch_state": frozen_fetch_state,
@@ -520,6 +585,40 @@ def _frozen_case5_fixture(
         [representative],
     )
     ledger_artifact = hashlib.sha256(ledger_raw).hexdigest()
+    projector = SourceBindingProjector(
+        input_parser_sha256,
+        authorized_legacy_sha256=(
+            LEGACY_PARSER_SHA256 if legacy_projection else None
+        ),
+    )
+    projection_records: list[dict[str, object]] = []
+    for occurrence_key, provenance in (
+        (selected_key, selected_provenance),
+        (nonrepresentative_key, nonrepresentative_provenance),
+    ):
+        actions = provenance["chunk"]["training_sidecars"]["build_actions"]  # type: ignore[index]
+        for action_index, action in enumerate(actions):
+            projection_records.extend(
+                projector.project_action(
+                    occurrence_key=occurrence_key,
+                    provenance_sha256=hashlib.sha256(
+                        _canonical(provenance)
+                    ).hexdigest(),
+                    provenance=provenance,
+                    action=action,
+                    action_index=action_index,
+                ).records
+            )
+    projection_path = tmp_path / "source_binding_projection.jsonl"
+    projection_raw = b"".join(
+        _canonical(record) + b"\n" for record in projection_records
+    )
+    projection_path.write_bytes(projection_raw)
+    projection_logical = _hash_records(
+        SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN,
+        projection_records,
+    )
+    projection_artifact = hashlib.sha256(projection_raw).hexdigest()
     export_receipt = {
         "schema": CASE5_EXPORT_SCHEMA,
         "status": "complete",
@@ -548,6 +647,56 @@ def _frozen_case5_fixture(
             "ledger_sha256": ledger_logical,
             "ledger_artifact_sha256": ledger_artifact,
         },
+        "source_binding_projection": {
+            "schema": SOURCE_BINDING_PROJECTION_SCHEMA,
+            "mode": projector.mode,
+            "projection_script_sha256": projection_script_sha256(),
+            "input_parser_script_sha256": projector.input_parser_sha256,
+            "target_parser_script_sha256": projector.target_parser_sha256,
+            "input_occurrence_set_sha256": content_receipt[
+                "occurrence_set_sha256"
+            ],
+            "input_fetch_state_sqlite_logical_sha256": frozen_fetch_state[
+                "sqlite_logical_sha256"
+            ],
+            "input_fetch_state_sidecar_set_sha256": frozen_fetch_state[
+                "sidecar_set_sha256"
+            ],
+            "coverage": {
+                "order": (
+                    "occurrence-key-then-action-index-then-source-input-index"
+                ),
+                "occurrence_count": 2,
+                "action_count": 2,
+                "source_input_count": len(projection_records),
+                "old_binding_count": sum(
+                    record["old_binding"] is not None
+                    for record in projection_records
+                ),
+                "projected_binding_count": sum(
+                    record["projected_binding"] is not None
+                    for record in projection_records
+                ),
+            },
+            "change_counts": {
+                kind: sum(
+                    record["change_kind"] == kind
+                    for record in projection_records
+                )
+                for kind in {
+                    str(record["change_kind"]) for record in projection_records
+                }
+            },
+            "ledger_artifact": projection_path.name,
+            "ledger_record_count": len(projection_records),
+            "ledger_sha256": projection_logical,
+            "ledger_artifact_sha256": projection_artifact,
+            "claim_boundary": (
+                "derived source-binding semantics only; upstream parser "
+                "sidecars, parser hashes, occurrence provenance, payload bytes, "
+                "token IDs, token counts and CAS receipts are unchanged"
+            ),
+        },
         "artifacts": [
             {
                 "path": ledger_path.name,
@@ -555,7 +704,14 @@ def _frozen_case5_fixture(
                 "rows": 1,
                 "byte_size": len(ledger_raw),
                 "sha256": ledger_artifact,
-            }
+            },
+            {
+                "path": projection_path.name,
+                "kind": "source_binding_projection",
+                "rows": len(projection_records),
+                "byte_size": len(projection_raw),
+                "sha256": projection_artifact,
+            },
         ],
     }
     export_path = tmp_path / "case5-export-receipt.json"
@@ -566,6 +722,8 @@ def _frozen_case5_fixture(
         "content_receipt_path": content_receipt_path,
         "export_path": export_path,
         "ledger_path": ledger_path,
+        "projection_path": projection_path,
+        "projection_records": projection_records,
         "selected_key": selected_key,
         "nonrepresentative_key": nonrepresentative_key,
         "representative": representative,
@@ -609,6 +767,11 @@ def _sync_case5_receipts(fixture: dict[str, object]) -> None:
             "pack_hashes": content_receipt["pack_hashes"],
         }
     )
+    projection = export_receipt["source_binding_projection"]
+    assert isinstance(projection, dict)
+    projection["input_occurrence_set_sha256"] = content_receipt[
+        "occurrence_set_sha256"
+    ]
     _write_json(fixture["export_path"], export_receipt)  # type: ignore[arg-type]
 
 
@@ -637,6 +800,66 @@ def _sync_representative_ledger(
             "ledger_sha256": logical_sha,
             "ledger_artifact_sha256": artifact_sha,
         }
+    )
+    artifact.update(
+        {
+            "rows": len(records),
+            "byte_size": len(raw),
+            "sha256": artifact_sha,
+        }
+    )
+    _write_json(fixture["export_path"], export_receipt)  # type: ignore[arg-type]
+
+
+def _sync_projection_ledger(
+    fixture: dict[str, object],
+    records: list[dict[str, object]],
+) -> None:
+    projection_path = fixture["projection_path"]
+    export_receipt = fixture["export_receipt"]
+    assert isinstance(projection_path, Path)
+    assert isinstance(export_receipt, dict)
+    raw = b"".join(_canonical(record) + b"\n" for record in records)
+    projection_path.write_bytes(raw)
+    artifact_sha = hashlib.sha256(raw).hexdigest()
+    logical_sha = _hash_records(
+        SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN,
+        records,
+    )
+    section = export_receipt["source_binding_projection"]
+    assert isinstance(section, dict)
+    section.update(
+        {
+            "ledger_record_count": len(records),
+            "ledger_sha256": logical_sha,
+            "ledger_artifact_sha256": artifact_sha,
+            "change_counts": dict(
+                sorted(
+                    {
+                        kind: sum(
+                            record["change_kind"] == kind for record in records
+                        )
+                        for kind in {
+                            str(record["change_kind"]) for record in records
+                        }
+                    }.items()
+                )
+            ),
+        }
+    )
+    coverage = section["coverage"]
+    assert isinstance(coverage, dict)
+    coverage["source_input_count"] = len(records)
+    coverage["old_binding_count"] = sum(
+        record["old_binding"] is not None for record in records
+    )
+    coverage["projected_binding_count"] = sum(
+        record["projected_binding"] is not None for record in records
+    )
+    artifact = next(
+        item
+        for item in export_receipt["artifacts"]
+        if item["kind"] == "source_binding_projection"
     )
     artifact.update(
         {
@@ -687,6 +910,7 @@ def test_representative_only_inventory_build_and_receipt_hash_chain(
 
     assert extraction["status"] == "complete"
     assert extraction["representative_count"] == 1
+    assert extraction["source_binding_projection_ledger_record_count"] == 2
     assert verified.artifact_sha256 == hashlib.sha256(
         inventory_path.read_bytes()
     ).hexdigest()
@@ -700,12 +924,28 @@ def test_representative_only_inventory_build_and_receipt_hash_chain(
     assert header["frozen_fetch_state_sha256"] == hashlib.sha256(
         _canonical(fixture["frozen_fetch_state"])
     ).hexdigest()
+    projection_receipt = fixture["export_receipt"][
+        "source_binding_projection"
+    ]  # type: ignore[index]
+    assert header["source_binding_projection_schema"] == (
+        SOURCE_BINDING_PROJECTION_SCHEMA
+    )
+    assert header["source_binding_projection_ledger_sha256"] == (
+        projection_receipt["ledger_sha256"]
+    )
+    assert header["source_binding_projection_ledger_artifact_sha256"] == (
+        projection_receipt["ledger_artifact_sha256"]
+    )
     assert binding["source_path"] == "src/nested/main.cpp"
     assert binding["normalization_status"] == RESOLVED
     assert reference["representative_occurrence_key"] == fixture["selected_key"]
     assert reference["representative_occurrence_key"] != fixture[
         "nonrepresentative_key"
     ]
+    assert reference["source_binding_projection"]["change_kind"] == "unchanged"
+    assert reference["checkout_evidence"][
+        "source_binding_projection_applied"
+    ] is True
 
     receipt = materialize_inventory(
         inventory_path,
@@ -741,6 +981,156 @@ def test_representative_only_inventory_build_and_receipt_hash_chain(
     ] == fixture["representative"]["token_sequence_sha256"]  # type: ignore[index]
     assert "body" not in ledger_path.read_text(encoding="utf-8")
     assert "content_bytes" not in ledger_path.read_text(encoding="utf-8")
+
+
+def test_inventory_consumes_legacy_projection_instead_of_stale_action_binding(
+    tmp_path: Path,
+) -> None:
+    _mirror, head, _base = _git_fixture(tmp_path)
+    fixture = _frozen_case5_fixture(
+        tmp_path,
+        head,
+        legacy_projection=True,
+    )
+    inventory_path = tmp_path / "legacy-source-inventory.jsonl"
+
+    _extract_fixture(fixture, inventory_path)
+    records = _inventory_records(inventory_path)
+    header = records[0]
+    binding = next(
+        record for record in records if record["record_type"] == "binding"
+    )
+    reference = next(
+        record for record in records if record["record_type"] == "reference"
+    )
+
+    assert header["source_binding_projection_mode"] == "legacy_projection"
+    assert header["source_binding_projection_input_parser_sha256"] == (
+        LEGACY_PARSER_SHA256
+    )
+    assert binding["repository"] == "owner/base"
+    assert binding["source_path"] == "src/nested/main.cpp"
+    assert binding["normalization_status"] == RESOLVED
+    assert reference["source_binding_projection"]["change_kind"] == "modified"
+    assert reference["source_binding_projection"]["reason"] == (
+        "repository_and_source_path_corrected"
+    )
+    assert reference["checkout_evidence"]["repository_source_binding"][
+        "repository"
+    ] == "owner/base"
+
+
+def test_verified_unbound_projection_uses_a_typed_gap_reason(
+    tmp_path: Path,
+) -> None:
+    _mirror, head, _base = _git_fixture(tmp_path)
+    fixture = _frozen_case5_fixture(
+        tmp_path,
+        head,
+        unbound_projection=True,
+    )
+    inventory_path = tmp_path / "unbound-source-inventory.jsonl"
+
+    _extract_fixture(fixture, inventory_path)
+    records = _inventory_records(inventory_path)
+    binding = next(
+        record for record in records if record["record_type"] == "binding"
+    )
+    reference = next(
+        record for record in records if record["record_type"] == "reference"
+    )
+
+    assert binding["normalization_status"] == CHECKOUT_PROVENANCE_UNRESOLVABLE
+    assert reference["source_binding_projection"]["reason"] == (
+        "current_binding_verified"
+    )
+    assert reference["checkout_evidence"]["reason"] == (
+        "source_binding_projection_verified_unbound_input"
+    )
+    assert reference["checkout_evidence"][
+        "source_binding_projection_gap_reason"
+    ] == "source_binding_projection_verified_unbound_input"
+
+
+def test_inventory_oversized_record_fails_before_publication(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "oversized-inventory.jsonl"
+    with sqlite3.connect(":memory:") as connection:
+        connection.row_factory = sqlite3.Row
+        _create_inventory_spool(connection)
+        connection.execute(
+            """
+            INSERT INTO inventory_bindings(
+                repository, head_sha, source_path, record_json
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                "owner/repo",
+                "a" * 40,
+                "src/main.cpp",
+                json.dumps(
+                    {"oversized": "x" * MAX_JSONL_RECORD_BYTES},
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            ),
+        )
+        with pytest.raises(ExtractionError, match="record size limit"):
+            _write_inventory_jsonl(
+                connection,
+                header={"schema": INVENTORY_SCHEMA},
+                destination=output,
+                force=False,
+                expected_existing_sha256=None,
+            )
+
+    assert not output.exists()
+
+
+def test_inventory_projection_is_required_and_selected_records_are_recomputed(
+    tmp_path: Path,
+) -> None:
+    _mirror, head, _base = _git_fixture(tmp_path)
+    missing = _frozen_case5_fixture(tmp_path / "missing", head)
+    export_receipt = missing["export_receipt"]
+    assert isinstance(export_receipt, dict)
+    del export_receipt["source_binding_projection"]
+    _write_json(missing["export_path"], export_receipt)  # type: ignore[arg-type]
+    with pytest.raises(ExtractionError, match="projection receipt"):
+        _extract_fixture(missing, tmp_path / "missing-inventory.jsonl")
+
+    tampered = _frozen_case5_fixture(tmp_path / "tampered", head)
+    records = [
+        dict(record)
+        for record in tampered["projection_records"]  # type: ignore[union-attr]
+    ]
+    selected = dict(records[0])
+    fake_binding = dict(selected["projected_binding"])  # type: ignore[arg-type]
+    fake_binding["source_path"] = "src/other.cpp"
+    selected["old_binding"] = fake_binding
+    selected["projected_binding"] = fake_binding
+    records[0] = selected
+    _sync_projection_ledger(tampered, records)
+    with pytest.raises(ExtractionError, match="differs from provenance"):
+        _extract_fixture(tampered, tmp_path / "tampered-inventory.jsonl")
+
+    scope = _frozen_case5_fixture(tmp_path / "scope", head)
+    export_receipt = scope["export_receipt"]
+    assert isinstance(export_receipt, dict)
+    export_receipt["source_binding_projection"]["coverage"][  # type: ignore[index]
+        "action_count"
+    ] += 1
+    _write_json(scope["export_path"], export_receipt)  # type: ignore[arg-type]
+    with pytest.raises(ExtractionError, match="coverage differs"):
+        _extract_fixture(scope, tmp_path / "scope-inventory.jsonl")
+
+    corrupt = _frozen_case5_fixture(tmp_path / "corrupt", head)
+    projection_path = corrupt["projection_path"]
+    assert isinstance(projection_path, Path)
+    projection_path.write_bytes(projection_path.read_bytes() + b" ")
+    with pytest.raises(ExtractionError, match="canonical JSONL"):
+        _extract_fixture(corrupt, tmp_path / "corrupt-inventory.jsonl")
 
 
 def test_representative_ledger_rejects_nonmember_duplicate_and_count_drift(
@@ -1363,7 +1753,7 @@ def test_inventory_stream_verifier_rejects_orphan_reference(
     references = [reference]
     header = records[0]
     header["reference_records_sha256"] = _hash_records(
-        "cppmega-ci-source-reference-records-v2",
+        "cppmega-ci-source-reference-records-v3",
         references,
     )
     header["inventory_logical_sha256"] = _inventory_logical_sha256(header)
