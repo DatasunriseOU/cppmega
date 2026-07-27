@@ -5,10 +5,19 @@ from pathlib import Path
 
 import pytest
 
-from tools.clang_indexer import index_project
+
+def _load_indexer():
+    try:
+        from tools.clang_indexer import index_project
+
+        index_project._configure_libclang()
+    except Exception as exc:  # pragma: no cover - environment without libclang
+        pytest.skip(f"libclang unavailable: {exc}")
+    return index_project
 
 
 def test_parse_file_batch_fails_loud_with_file_and_cause(tmp_path: Path) -> None:
+    index_project = _load_indexer()
     source = tmp_path / "broken.cpp"
     source.write_text("int main() { return 0; }\n", encoding="utf-8")
 
@@ -25,12 +34,14 @@ def test_parse_file_batch_fails_loud_with_file_and_cause(tmp_path: Path) -> None
 
     message = str(raised.value)
     assert str(source) in message
+    assert "TranslationUnitLoadError" in message
     assert "libclang parse failed" in message
 
 
 def test_sequential_project_parse_fails_loud_instead_of_publishing(
     tmp_path: Path,
 ) -> None:
+    index_project = _load_indexer()
     source = tmp_path / "broken.cpp"
     source.write_text("int main() { return 0; }\n", encoding="utf-8")
     (tmp_path / "compile_commands.json").write_text(
@@ -61,4 +72,5 @@ def test_sequential_project_parse_fails_loud_instead_of_publishing(
 
     message = str(raised.value)
     assert str(source) in message
+    assert "TranslationUnitLoadError" in message
     assert "libclang parse failed" in message
