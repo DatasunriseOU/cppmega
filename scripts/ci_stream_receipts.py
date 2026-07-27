@@ -60,6 +60,51 @@ def _require_frozen_sqlite(path: Path, *, label: str) -> None:
             )
 
 
+def _freeze_fetch_state_sqlite(path: Path) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise ReceiptFinalizationError(
+            f"fetch state is missing or unsafe: {path}"
+        )
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            path,
+            isolation_level=None,
+            timeout=0.25,
+        )
+        connection.execute("PRAGMA busy_timeout=250")
+        mode_row = connection.execute("PRAGMA journal_mode").fetchone()
+        mode = "" if mode_row is None else str(mode_row[0]).lower()
+        if mode == "wal":
+            checkpoint = connection.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+            if (
+                checkpoint is None
+                or len(checkpoint) != 3
+                or int(checkpoint[0]) != 0
+            ):
+                raise ReceiptFinalizationError(
+                    f"fetch-state WAL checkpoint is busy: {checkpoint}"
+                )
+            mode_row = connection.execute(
+                "PRAGMA journal_mode=DELETE"
+            ).fetchone()
+            mode = "" if mode_row is None else str(mode_row[0]).lower()
+        if mode != "delete":
+            raise ReceiptFinalizationError(
+                f"fetch-state journal mode did not freeze: {mode!r}"
+            )
+    except sqlite3.Error as exc:
+        raise ReceiptFinalizationError(
+            f"fetch state could not be frozen: {exc}"
+        ) from exc
+    finally:
+        if connection is not None:
+            connection.close()
+    _require_frozen_sqlite(path, label="fetch state")
+
+
 def _expected_fetch_state_schema_sha256() -> str:
     connection = sqlite3.connect(":memory:")
     try:
@@ -542,7 +587,7 @@ def finalize_fetch_receipts(
         store_root,
     ):
         raise ValueError("receipt paths must be outside the content store")
-    _require_frozen_sqlite(state, label="fetch state")
+    _freeze_fetch_state_sqlite(state)
     _require_frozen_sqlite(index_path, label="content store")
     initial_state = state.stat()
     initial_state_identity = (

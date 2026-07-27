@@ -1365,7 +1365,7 @@ def test_threshold_receipt_is_finalized_only_after_writers_close(
             "exact_unique_payload_tokens"
         ] >= 1
         assert not fetch_receipt_path.exists()
-        with pytest.raises(RuntimeError, match="not frozen"):
+        with pytest.raises(RuntimeError, match="could not be frozen|not frozen"):
             finalize_fetch_receipts(
                 state_path=state_path,
                 content_store_path=store_path,
@@ -1409,6 +1409,10 @@ def test_threshold_receipt_is_finalized_only_after_writers_close(
         fetch_receipt_path=fetch_receipt_path,
         store_receipt_path=store_receipt_path,
     )
+    with sqlite3.connect(state_path) as frozen_connection:
+        assert frozen_connection.execute(
+            "PRAGMA journal_mode"
+        ).fetchone()[0] == "delete"
     assert receipt["fetch_state"] == receipt["frozen_fetch_state"]["summary"]
     assert receipt["content_store_receipt"]["status"] == "complete"
 
