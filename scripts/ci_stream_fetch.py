@@ -1692,17 +1692,26 @@ class FetchState:
             inventory_seed_metadata_sha256=seed_sha,
         )
 
-    def next_attempt(self) -> Attempt | None:
+    def next_attempt(self, *, retry_only: bool = False) -> Attempt | None:
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
             try:
                 row = self._connection.execute(
-                    """
+                    (
+                        """
+                    SELECT * FROM attempts
+                    WHERE status='retry'
+                    ORDER BY created_at,repo,run_id,attempt
+                    LIMIT 1
+                        """
+                        if retry_only
+                        else """
                     SELECT * FROM attempts
                     WHERE status IN ('pending','retry')
                     ORDER BY created_at,repo,run_id,attempt
                     LIMIT 1
-                    """
+                        """
+                    )
                 ).fetchone()
                 if row is None:
                     self._connection.execute("COMMIT")
@@ -3328,23 +3337,6 @@ class CIStreamFetcher:
         value = counters.get("exact_unique_payload_tokens")
         return value is not None and int(value) >= self.target_unique_tokens
 
-    def write_receipt(self) -> dict[str, object]:
-        store_receipt = self.store.completion_receipt(
-            target_unique_tokens=self.target_unique_tokens
-        )
-        receipt = {
-            "schema": RECEIPT_SCHEMA,
-            "completed_at": _utc_now(),
-            "target_exact_unique_payload_tokens": self.target_unique_tokens,
-            "fetch_state": self.state.summary(),
-            "content_store_receipt": store_receipt,
-            "inventory_path": str(self.inventory_path),
-            "tokenizer_contract": self.tokenizer.contract,
-            "tokenizer_fingerprint": self.tokenizer.fingerprint,
-        }
-        atomic_write_json(self.receipt_path, receipt)
-        return receipt
-
     def run(
         self,
         *,
@@ -3367,12 +3359,13 @@ class CIStreamFetcher:
                 while True:
                     threshold_met = self.threshold_met()
                     while (
-                        not threshold_met
-                        and not work_exhausted
+                        not work_exhausted
                         and len(futures) < workers
                         and (max_runs is None or submitted < max_runs)
                     ):
-                        attempt = self.state.next_attempt()
+                        attempt = self.state.next_attempt(
+                            retry_only=threshold_met
+                        )
                         if attempt is None:
                             work_exhausted = True
                             break
@@ -3397,8 +3390,7 @@ class CIStreamFetcher:
                         processed += 1
                         self.write_progress()
                 if self.threshold_met():
-                    self.write_progress()
-                    return self.write_receipt()
+                    return self.write_progress()
                 if max_runs is not None and submitted >= max_runs:
                     return self.write_progress()
                 if not continuous:
@@ -3418,6 +3410,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tokens")
     parser.add_argument("--progress", required=True)
     parser.add_argument("--receipt", required=True)
+    parser.add_argument(
+        "--store-receipt",
+        help=(
+            "separate frozen content-store receipt; defaults beside --receipt"
+        ),
+    )
     parser.add_argument("--rescue-dir")
     parser.add_argument("--work-dir")
     parser.add_argument("--resume", action="store_true")
@@ -3501,6 +3499,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--parser-workers must be non-negative")
     tokens = load_token_pool(args.tokens)
     fetcher: CIStreamFetcher | None = None
+    threshold_met = False
     try:
         fetcher = CIStreamFetcher(
             inventory_path=args.inventory,
@@ -3539,12 +3538,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             poll_seconds=args.poll_seconds,
             workers=args.workers,
         )
+        threshold_met = fetcher.threshold_met()
     except (FetchError, sqlite3.Error, OSError, ValueError) as exc:
         print(f"[ci-stream-fetch] ERROR: {exc}", file=sys.stderr)
         return 1
     finally:
         if fetcher is not None:
             fetcher.close()
+    if threshold_met:
+        try:
+            from scripts.ci_stream_receipts import finalize_fetch_receipts
+
+            result = finalize_fetch_receipts(
+                state_path=args.state,
+                content_store_path=args.content_store,
+                tokenizer_path=args.tokenizer,
+                target_unique_tokens=args.target_exact_unique_payload_tokens,
+                fetch_receipt_path=args.receipt,
+                store_receipt_path=args.store_receipt,
+                original_state_path=args.state,
+                original_content_store_path=args.content_store,
+                original_inventory_path=args.inventory,
+            )
+        except (OSError, RuntimeError, sqlite3.Error, ValueError) as exc:
+            print(f"[ci-stream-fetch] ERROR: {exc}", file=sys.stderr)
+            return 1
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
