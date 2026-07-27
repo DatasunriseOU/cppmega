@@ -268,6 +268,34 @@ def test_split_preserves_document_larger_than_65k_tokens() -> None:
     assert max(piece["actual_token_count"] for piece in pieces) <= 16_381
 
 
+def test_split_rechecks_preferred_break_for_nonmonotonic_tokenizer() -> None:
+    class NonmonotonicPrefixTokenizer:
+        def encode(self, text: str) -> list[int]:
+            token_count = {
+                4: 6,
+                5: 5,
+                6: 5,
+            }.get(len(text), len(text))
+            return list(range(token_count))
+
+    text = "abc\ndefghi"
+    doc = {
+        "text": text,
+        "structure_ids": [1] * len(text),
+        "chunk_boundaries": [],
+    }
+
+    pieces = chunk_enriched_document(
+        doc,
+        max_tokens=5,
+        tokenizer=NonmonotonicPrefixTokenizer(),
+    )
+
+    assert "".join(piece["text"] for piece in pieces) == text
+    assert pieces[0]["text"] == text[:6]
+    assert max(piece["actual_token_count"] for piece in pieces) <= 5
+
+
 def test_route_by_fit_fails_closed_instead_of_dropping_overlong_rows(
     tmp_path: Path,
 ) -> None:
