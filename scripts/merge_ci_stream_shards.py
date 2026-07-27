@@ -84,8 +84,8 @@ from scripts.export_ci_content_store_case5 import (  # noqa: E402
 
 
 MANIFEST_SCHEMA = "cppmega_ci_stream_shard_union_manifest_v1"
-MERGE_RECEIPT_SCHEMA = "cppmega_ci_stream_shard_union_receipt_v1"
-JOURNAL_SCHEMA = "cppmega_ci_stream_shard_union_journal_v1"
+MERGE_RECEIPT_SCHEMA = "cppmega_ci_stream_shard_union_receipt_v2"
+JOURNAL_SCHEMA = "cppmega_ci_stream_shard_union_journal_v2"
 REQUEST_MAP_SCHEMA = "cppmega_ci_stream_request_id_map_v1"
 BINDING_MAP_SCHEMA = "cppmega_ci_stream_binding_id_map_v2"
 ATTEMPT_MAP_SCHEMA = "cppmega_ci_stream_attempt_resolution_v1"
@@ -2513,7 +2513,7 @@ def _initialize_journal_file(
             connection.rollback()
             raise
         if _sqlite_schema_sha256(connection) != _expected_journal_schema_sha256():
-            raise MergeError("new merge journal schema is not canonical v1")
+            raise MergeError("new merge journal schema is not canonical v2")
         if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise MergeError("new merge journal failed integrity_check")
     finally:
@@ -2556,7 +2556,7 @@ def _open_journal(
     connection.execute("PRAGMA synchronous=FULL")
     if _sqlite_schema_sha256(connection) != _expected_journal_schema_sha256():
         connection.close()
-        raise MergeError("existing merge journal schema is not canonical v1")
+        raise MergeError("existing merge journal schema is not canonical v2")
     expected = {
         "schema": JOURNAL_SCHEMA,
         "manifest_sha256": manifest.sha256,
