@@ -8901,7 +8901,6 @@ def _parse_file_batch(args_tuple):
     clang_index = Index.create()
     func_results: list[dict] = []
     type_results: list[dict] = []
-    errors = 0
     last_heartbeat = time.monotonic()
     for idx, filepath in enumerate(filepaths, start=1):
         args = _resolve_file_args(filepath, compile_db, default_args)
@@ -8917,8 +8916,13 @@ def _parse_file_batch(args_tuple):
             type_results.extend(t.to_dict() for t in typedefs)
         except SymbolIdentityError:
             raise
-        except (Exception, RecursionError):
-            errors += 1
+        except Exception as exc:
+            cause = exc.__cause__ or exc
+            context = f"; {exc}" if cause is not exc else ""
+            raise RuntimeError(
+                f"C/C++ parse failed for {filepath}: "
+                f"{type(cause).__name__}: {cause}{context}"
+            ) from exc
         now = time.monotonic()
         if (
             idx == len(filepaths)
@@ -8931,7 +8935,7 @@ def _parse_file_batch(args_tuple):
                 flush=True,
             )
             last_heartbeat = now
-    return {"functions": func_results, "typedefs": type_results}, len(filepaths), errors
+    return {"functions": func_results, "typedefs": type_results}, len(filepaths)
 
 
 def _iter_parse_batch_results(
@@ -9114,9 +9118,8 @@ def process_project(
             )
 
         total_parsed = 0
-        total_errors = 0
         with ProcessPoolExecutor(max_workers=effective_workers) as executor:
-            for payload, parsed_count, error_count in _iter_parse_batch_results(
+            for payload, parsed_count in _iter_parse_batch_results(
                 executor,
                 batches,
                 max_in_flight=submit_window,
@@ -9126,7 +9129,6 @@ def process_project(
                 for td in payload["typedefs"]:
                     index_obj.add_typedef(TypeDef.from_dict(td))
                 total_parsed += parsed_count
-                total_errors += error_count
                 check_memory_limit(memory_limit_gb, label="index_project")
                 print(
                     f"  Parsed {total_parsed}/{len(cpp_files)} files, "
@@ -9135,7 +9137,7 @@ def process_project(
                 )
 
         print(
-            f"  Parsed {total_parsed} files ({total_errors} errors), "
+            f"  Parsed {total_parsed} files, "
             f"{len(index_obj.functions)} functions indexed",
             file=sys.stderr,
         )
@@ -9143,7 +9145,6 @@ def process_project(
         # Sequential for small projects
         clang_index = Index.create()
         parsed = 0
-        errors = 0
         last_heartbeat = time.monotonic()
         for filepath in cpp_files:
             args = _resolve_file_args(filepath, compile_db, default_args)
@@ -9162,11 +9163,14 @@ def process_project(
                 parsed += 1
             except SymbolIdentityError:
                 raise
-            except Exception as e:
-                errors += 1
-                if errors <= 5:
-                    print(f"  ERROR parsing {filepath}: {e}", file=sys.stderr)
-            processed = parsed + errors
+            except Exception as exc:
+                cause = exc.__cause__ or exc
+                context = f"; {exc}" if cause is not exc else ""
+                raise RuntimeError(
+                    f"C/C++ parse failed for {filepath}: "
+                    f"{type(cause).__name__}: {cause}{context}"
+                ) from exc
+            processed = parsed
             now = time.monotonic()
             if (
                 processed == len(cpp_files)
@@ -9175,13 +9179,13 @@ def process_project(
             ):
                 check_memory_limit(memory_limit_gb, label="index_project")
                 print(
-                    f"  Parsed {processed}/{len(cpp_files)} files "
-                    f"({errors} errors), {len(index_obj.functions)} functions",
+                    f"  Parsed {processed}/{len(cpp_files)} files, "
+                    f"{len(index_obj.functions)} functions",
                     file=sys.stderr,
                     flush=True,
                 )
                 last_heartbeat = now
-        print(f"  Parsed {parsed} files ({errors} errors), "
+        print(f"  Parsed {parsed} files, "
               f"{len(index_obj.functions)} functions indexed", file=sys.stderr)
 
     # Build training documents (C/C++ code path -- unchanged).
