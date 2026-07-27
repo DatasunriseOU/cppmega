@@ -29,7 +29,7 @@ fi
 
 # Build the IN-list from GitHub-only repo_names. Mixed-forge identities stay in
 # repo_list.json but are intentionally excluded from this GitHub-only query.
-IN_LIST=$(python3 -c "import json; d=json.load(open('$REPO_LIST')); names=d.get('repo_names') or [r['owner_repo'] for r in d.get('repos', []) if r.get('owner_repo')]; print(', '.join(\"'\"+name.replace(\"'\", \"''\")+\"'\" for name in names))")
+IN_LIST=$(python3 -c 'import json, sys; d=json.load(open(sys.argv[1])); raw=d.get("repo_names") or [r["owner_repo"] for r in d.get("repos", []) if r.get("owner_repo")]; names=list(dict.fromkeys(raw)); quote=chr(39); print(", ".join(quote + name.replace(quote, quote * 2) + quote for name in names))' "$REPO_LIST")
 if [[ -z "$IN_LIST" ]]; then
   echo "FATAL: repo list resolved to zero repos; refusing to query." >&2
   exit 2
@@ -38,7 +38,7 @@ fi
 SQL=$(sed -e "s|{table_glob}|$TABLE_GLOB|g" -e "s|{repo_in_list}|$IN_LIST|g" \
   "$(dirname "$0")/gharchive_query.sql")
 
-REPO_COUNT=$(python3 -c "import json; d=json.load(open('$REPO_LIST')); print(len(d.get('repo_names') or [r for r in d.get('repos', []) if r.get('owner_repo')]))")
+REPO_COUNT=$(python3 -c 'import json, sys; d=json.load(open(sys.argv[1])); raw=d.get("repo_names") or [r["owner_repo"] for r in d.get("repos", []) if r.get("owner_repo")]; print(len(dict.fromkeys(raw)))' "$REPO_LIST")
 echo "[gharchive] project=$PROJECT table=$TABLE_GLOB repos=$REPO_COUNT" >&2
 echo "[gharchive] dry-run cost gate" >&2
 bq --project_id="$PROJECT" query --use_legacy_sql=false --dry_run "$SQL"

@@ -108,6 +108,38 @@ _PR_COLUMN_DEFINITIONS = {
     "scan_id": "TEXT",
 }
 
+_READONLY_REQUIRED_COLUMNS = {
+    "prs": {"repo", "pr_number", *_PR_COLUMN_DEFINITIONS},
+    "pr_by_sha": {"repo", "merge_commit_sha", "pr_number"},
+    "fetch_cursor": {
+        "repo",
+        "kind",
+        "cursor",
+        "page_count",
+        "pr_count",
+        "done",
+        "updated_at",
+    },
+    "comments": {
+        "repo",
+        "pr_number",
+        "user",
+        "body",
+        "path",
+        "created_at",
+        "kind",
+    },
+    "reviews": {
+        "repo",
+        "pr_number",
+        "user",
+        "state",
+        "body",
+        "created_at",
+    },
+    "linked_issues": {"repo", "pr_number", "number", "title", "body"},
+}
+
 
 def _ensure_pr_columns(conn: sqlite3.Connection) -> None:
     columns = {
@@ -148,6 +180,33 @@ def _ensure_pr_columns(conn: sqlite3.Connection) -> None:
     )
 
 
+def _require_readonly_schema(
+    conn: sqlite3.Connection,
+    *,
+    store_path: str,
+) -> None:
+    """Fail clearly when a read-only caller points at an unmigrated store."""
+
+    problems: list[str] = []
+    for table, required in _READONLY_REQUIRED_COLUMNS.items():
+        actual = {
+            str(row["name"])
+            for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        if not actual:
+            problems.append(f"missing table {table}")
+            continue
+        missing = sorted(required - actual)
+        if missing:
+            problems.append(f"{table} missing columns {missing}")
+    if problems:
+        raise RuntimeError(
+            "[pr_store] readonly PR store schema is incompatible: "
+            f"{store_path}: {'; '.join(problems)}; open it once with a "
+            "read-write initialized connection to perform the explicit migration"
+        )
+
+
 def connect(
     store_path: str,
     create: bool = True,
@@ -180,6 +239,11 @@ def connect(
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=60000")
     if readonly:
+        try:
+            _require_readonly_schema(conn, store_path=store_path)
+        except Exception:
+            conn.close()
+            raise
         return conn
 
     if not initialize:
@@ -999,6 +1063,122 @@ def get_by_sha(
     )
 
 
+_JSON_ARRAY_CHUNK_CHARS = 1024 * 1024
+_JSON_ARRAY_MAX_ROW_CHARS = 256 * 1024 * 1024
+
+
+def _iter_json_array(
+    handle,
+    path: str,
+    *,
+    chunk_size: int = _JSON_ARRAY_CHUNK_CHARS,
+    max_row_chars: int = _JSON_ARRAY_MAX_ROW_CHARS,
+):
+    """Incrementally decode a BigQuery ``prettyjson`` array one row at a time."""
+
+    if chunk_size < 1 or max_row_chars < 1:
+        raise ValueError("JSON array chunk and row bounds must be positive")
+    decoder = json.JSONDecoder()
+    buffer = ""
+    position = 0
+    eof = False
+    row_index = 0
+
+    def refill(*, preserve_from: int | None = None) -> None:
+        nonlocal buffer, position, eof
+        if preserve_from is None:
+            preserve_from = position
+        if preserve_from:
+            buffer = buffer[preserve_from:]
+            position -= preserve_from
+        chunk = handle.read(chunk_size)
+        if chunk == "":
+            eof = True
+            return
+        if not isinstance(chunk, str):
+            raise SystemExit(f"[pr_store] {path}: JSON input is not text")
+        buffer += chunk
+
+    def skip_whitespace() -> bool:
+        nonlocal position
+        while True:
+            while position < len(buffer) and buffer[position].isspace():
+                position += 1
+            if position < len(buffer):
+                return True
+            if eof:
+                return False
+            refill()
+
+    def finish_array() -> None:
+        nonlocal position
+        position += 1
+        if skip_whitespace():
+            raise SystemExit(
+                f"[pr_store] {path}: JSON array has trailing content"
+            )
+
+    refill()
+    if not skip_whitespace() or buffer[position] != "[":
+        raise SystemExit(f"[pr_store] {path}: JSON root must be an array")
+    position += 1
+    first_row = True
+
+    while True:
+        if not skip_whitespace():
+            raise SystemExit(f"[pr_store] {path}: unterminated JSON array")
+        if buffer[position] == "]":
+            if not first_row:
+                finish_array()
+                return
+            finish_array()
+            return
+        if not first_row:
+            if buffer[position] != ",":
+                raise SystemExit(
+                    f"[pr_store] {path}: expected ',' after row {row_index - 1}"
+                )
+            position += 1
+            if not skip_whitespace():
+                raise SystemExit(f"[pr_store] {path}: unterminated JSON array")
+            if buffer[position] == "]":
+                raise SystemExit(
+                    f"[pr_store] {path}: JSON array has a trailing comma"
+                )
+
+        value_start = position
+        while True:
+            try:
+                value, value_end = decoder.raw_decode(buffer, position)
+                break
+            except json.JSONDecodeError as exc:
+                buffered_row_chars = len(buffer) - value_start
+                if buffered_row_chars > max_row_chars:
+                    raise SystemExit(
+                        f"[pr_store] {path}: row {row_index} exceeds the "
+                        f"{max_row_chars}-character streaming bound"
+                    ) from exc
+                if eof:
+                    raise SystemExit(
+                        f"[pr_store] {path}: row {row_index} is invalid JSON: {exc}"
+                    ) from exc
+                refill(preserve_from=value_start)
+                value_start = 0
+        if value_end - position > max_row_chars:
+            raise SystemExit(
+                f"[pr_store] {path}: row {row_index} exceeds the "
+                f"{max_row_chars}-character streaming bound"
+            )
+        if not isinstance(value, dict):
+            raise SystemExit(
+                f"[pr_store] {path}: row {row_index} must be a JSON object"
+            )
+        position = value_end
+        row_index += 1
+        first_row = False
+        yield value
+
+
 def _iter_ndjson(paths: list[str]):
     for path in paths:
         with open(path, "r", encoding="utf-8") as handle:
@@ -1007,15 +1187,7 @@ def _iter_ndjson(paths: list[str]):
                 first = handle.read(1)
             handle.seek(0)
             if first == "[":
-                values = json.load(handle)
-                if not isinstance(values, list):
-                    raise SystemExit(f"[pr_store] {path}: JSON root must be a list")
-                for index, value in enumerate(values):
-                    if not isinstance(value, dict):
-                        raise SystemExit(
-                            f"[pr_store] {path}: row {index} must be a JSON object"
-                        )
-                    yield value
+                yield from _iter_json_array(handle, path)
                 continue
             for lineno, line in enumerate(handle, 1):
                 line = line.strip()

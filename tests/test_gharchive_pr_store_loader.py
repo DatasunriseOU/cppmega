@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -69,3 +71,52 @@ def test_gharchive_loader_materializes_raw_pull_request_event_into_pr_store(
         assert row["title"] == "Fix parser"
         assert row["merge_commit_sha"] == "abc123"
         assert store.get_by_sha("owner/repo", "abc123")["pr_number"] == 42
+
+
+def test_gharchive_runner_deduplicates_repo_filter(tmp_path: Path) -> None:
+    repo_list = tmp_path / "repo_list.json"
+    repo_list.write_text(
+        json.dumps(
+            {
+                "repos": [
+                    {"owner_repo": "owner/repo"},
+                    {"owner_repo": "owner/repo"},
+                    {"owner_repo": "other/repo"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    bq_log = tmp_path / "bq-args.txt"
+    fake_bq = fake_bin / "bq"
+    fake_bq.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'printf "%s\\n" "$@" > "$BQ_ARG_LOG"\n',
+        encoding="utf-8",
+    )
+    fake_bq.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
+            "BQ_ARG_LOG": str(bq_log),
+            "DRY_RUN_ONLY": "1",
+            "REPO_LIST": str(repo_list),
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(_PR_INGEST_DIR / "gharchive_run.sh")],
+        cwd=_REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    sql = bq_log.read_text(encoding="utf-8")
+    assert "AND repo.name IN ('owner/repo', 'other/repo')" in sql
+    assert "repos=2" in result.stderr

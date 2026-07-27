@@ -665,6 +665,11 @@ def stream_repo(
             repo,
             append_lock=append_lock,
         )
+    repo_truncated_count = count_repo_truncated_targets(
+        truncated_target_keys,
+        repo,
+        append_lock=append_lock,
+    )
     manifest.update(repo, status="in_progress")
     stats = {"repo": repo, "prs": 0, "truncated": 0, "pages": 0, "ratelimit_trips": 0}
     initial_total_count: int | None = None
@@ -852,6 +857,7 @@ def stream_repo(
                         {"repo": repo, "pr_number": rec["pr_number"]},
                         lock=append_lock,
                     )
+                    repo_truncated_count += 1
         stats["pages"] += 1
         conn.commit()
 
@@ -876,10 +882,7 @@ def stream_repo(
             else "done",
             cursor=cursor if has_next else None,
             prs=scanned_prs,
-            truncated=sum(
-                1 for target_repo, _number in (truncated_target_keys or ())
-                if target_repo == repo
-            ),
+            truncated=repo_truncated_count,
             initial_total_count=initial_total_count,
             total_count=total_count,
             source_growth_count=total_count - initial_total_count,
@@ -911,10 +914,7 @@ def stream_repo(
                 status="in_progress",
                 cursor=cursor,
                 prs=scanned_prs,
-                truncated=sum(
-                    1 for target_repo, _number in (truncated_target_keys or ())
-                    if target_repo == repo
-                ),
+                truncated=repo_truncated_count,
                 initial_total_count=initial_total_count,
                 total_count=total_count,
                 source_growth_count=total_count - initial_total_count,
@@ -999,6 +999,26 @@ def reset_repo_truncated_targets(
         return rewrite()
     with append_lock:
         return rewrite()
+
+
+def count_repo_truncated_targets(
+    targets: set[tuple[str, int]] | None,
+    repo: str,
+    *,
+    append_lock: threading.Lock | None = None,
+) -> int:
+    """Snapshot one repo's durable gap-target count once per stream invocation."""
+
+    if targets is None:
+        return 0
+
+    def count() -> int:
+        return sum(1 for target_repo, _number in targets if target_repo == repo)
+
+    if append_lock is None:
+        return count()
+    with append_lock:
+        return count()
 
 
 def load_truncated_target_keys(path: str) -> set[tuple[str, int]]:
