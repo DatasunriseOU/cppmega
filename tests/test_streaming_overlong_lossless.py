@@ -310,11 +310,26 @@ def test_route_by_fit_fails_closed_instead_of_dropping_overlong_rows(
         tokenized,
     )
 
-    with pytest.raises(sr.RepoFailure, match=r"overlong_rows=1.*overlong_tokens=17"):
-        src.route_by_fit(tokenized, (8, 16), tmp_path / "routed")
+    with pytest.raises(
+        sr.RepoFailure,
+        match=r"overlong_rows=1.*overlong_tokens=17",
+    ) as caught:
+        src.route_by_fit(
+            tokenized,
+            (8, 16),
+            tmp_path / "routed",
+            repo="owner/repo",
+        )
 
+    assert caught.value.repo == "owner/repo"
     assert not (tmp_path / "routed" / "route_8.parquet").exists()
     assert not (tmp_path / "routed" / "dropped_overlong.json").exists()
+
+
+def test_token_list_lengths_stay_in_arrow_and_treat_null_as_zero() -> None:
+    values = pa.array([[1, 2, 3], None, [], [4]], type=pa.list_(pa.int64()))
+
+    assert src._token_list_lengths(values) == [3, 0, 0, 1]
 
 
 def test_route_by_fit_preserves_every_fitting_row_once(tmp_path: Path) -> None:

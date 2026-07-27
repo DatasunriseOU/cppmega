@@ -386,7 +386,22 @@ def release_arrow_unused() -> None:
     pa.default_memory_pool().release_unused()
 
 
-def route_by_fit(tok_parquet: Path, lengths_sorted: Sequence[int], out_dir: Path) -> dict[int, Path]:
+def _token_list_lengths(column) -> list[int]:
+    """Compute list lengths in Arrow without materializing token payloads."""
+
+    import pyarrow.compute as pc
+
+    lengths = pc.fill_null(pc.list_value_length(column), 0)
+    return [int(value) for value in lengths.to_pylist()]
+
+
+def route_by_fit(
+    tok_parquet: Path,
+    lengths_sorted: Sequence[int],
+    out_dir: Path,
+    *,
+    repo: str | None = None,
+) -> dict[int, Path]:
     """Split tok parquet rows into per-length parquet files by whole-doc token count.
 
     Each commit doc (one row) is routed INTACT to the smallest length bucket that
@@ -398,6 +413,9 @@ def route_by_fit(tok_parquet: Path, lengths_sorted: Sequence[int], out_dir: Path
     import pyarrow as pa
     import pyarrow.parquet as pq
 
+    failure_repo = repo or tok_parquet.name.removesuffix(".tok.parquet").removesuffix(
+        ".parquet"
+    )
     normalized_lengths = tuple(int(length) for length in lengths_sorted)
     if (
         not normalized_lengths
@@ -405,15 +423,16 @@ def route_by_fit(tok_parquet: Path, lengths_sorted: Sequence[int], out_dir: Path
         or normalized_lengths != tuple(sorted(set(normalized_lengths)))
     ):
         raise RepoFailure(
-            tok_parquet.parent.name,
+            failure_repo,
             "route_by_fit",
             f"lengths must be unique positive ascending values: {normalized_lengths}",
         )
     pf = pq.ParquetFile(str(tok_parquet))
     if TOKEN_IDS_COLUMN not in set(pf.schema_arrow.names):
-        raise RepoFailure(tok_parquet.parent.name, "route_by_fit",
+        raise RepoFailure(failure_repo, "route_by_fit",
                           f"{tok_parquet} missing column {TOKEN_IDS_COLUMN}")
     schema = pf.schema_arrow
+    token_ids_index = schema.get_field_index(TOKEN_IDS_COLUMN)
     max_length = normalized_lengths[-1]
 
     # Validate first so failure cannot leave a partial routed dataset that looks
@@ -422,15 +441,14 @@ def route_by_fit(tok_parquet: Path, lengths_sorted: Sequence[int], out_dir: Path
     overlong_tokens = 0
     max_observed = 0
     for batch in pf.iter_batches(batch_size=512, columns=[TOKEN_IDS_COLUMN]):
-        for ids in batch.column(0).to_pylist():
-            token_count = len(ids) if ids is not None else 0
+        for token_count in _token_list_lengths(batch.column(0)):
             max_observed = max(max_observed, token_count)
             if token_count > max_length:
                 overlong_rows += 1
                 overlong_tokens += token_count
     if overlong_rows:
         raise RepoFailure(
-            tok_parquet.parent.name,
+            failure_repo,
             "route_by_fit",
             "lossless materializer contract violation: "
             f"overlong_rows={overlong_rows} "
@@ -445,14 +463,17 @@ def route_by_fit(tok_parquet: Path, lengths_sorted: Sequence[int], out_dir: Path
     try:
         for batch in pf.iter_batches(batch_size=512):
             tbl = pa.Table.from_batches([batch], schema=schema)
-            tok_col = tbl.column(TOKEN_IDS_COLUMN).to_pylist()
+            token_lengths = _token_list_lengths(batch.column(token_ids_index))
             # group row indices by destination length
             by_len: dict[int, list[int]] = {}
-            for ri, ids in enumerate(tok_col):
-                n = len(ids) if ids is not None else 0
+            for ri, n in enumerate(token_lengths):
                 L = bucket_for(n, normalized_lengths)
                 if L is None:  # guarded by the exact preflight above
-                    raise AssertionError(f"preflight missed overlong row with {n} tokens")
+                    raise RepoFailure(
+                        failure_repo,
+                        "route_by_fit",
+                        f"preflight missed overlong row with {n} tokens",
+                    )
                 by_len.setdefault(L, []).append(ri)
             for L, idxs in by_len.items():
                 sub = tbl.take(pa.array(idxs))
@@ -619,7 +640,7 @@ def process_range(
 
         started = time.monotonic()
         route_dir = rwork / "routed"
-        routed = route_by_fit(tok, lengths_sorted, route_dir)
+        routed = route_by_fit(tok, lengths_sorted, route_dir, repo=repo)
         if not routed:
             raise RepoFailure(
                 repo, "route_by_fit",
