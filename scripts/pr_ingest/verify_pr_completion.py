@@ -322,6 +322,7 @@ def verify_pr_completion(
     nonterminal: list[tuple[str, object]] = []
     declared_counts: dict[str, int] = {}
     declared_truncated = 0
+    declared_source_growth = 0
     for repo in expected_repos:
         record = manifest_repos.get(repo)
         if not isinstance(record, dict) or record.get("status") != "done":
@@ -341,6 +342,27 @@ def verify_pr_completion(
             raise PRCompletionError(
                 f"GraphQL-done repo lacks a valid total_count: {repo}: {total_count!r}"
             )
+        initial_total_count = record.get("initial_total_count")
+        source_growth_count = record.get("source_growth_count")
+        if (
+            not isinstance(initial_total_count, int)
+            or isinstance(initial_total_count, bool)
+            or initial_total_count < 0
+            or initial_total_count > total_count
+        ):
+            raise PRCompletionError(
+                "GraphQL-done repo lacks a valid initial_total_count: "
+                f"{repo}: {initial_total_count!r}"
+            )
+        if (
+            not isinstance(source_growth_count, int)
+            or isinstance(source_growth_count, bool)
+            or source_growth_count != total_count - initial_total_count
+        ):
+            raise PRCompletionError(
+                "GraphQL-done repo has inconsistent source_growth_count: "
+                f"{repo}: {source_growth_count!r}"
+            )
         truncated = record.get("truncated", 0)
         if (
             not isinstance(truncated, int)
@@ -352,6 +374,7 @@ def verify_pr_completion(
             )
         declared_counts[repo] = total_count
         declared_truncated += truncated
+        declared_source_growth += source_growth_count
     if nonterminal:
         raise PRCompletionError(
             "expected repos are not terminal GraphQL-done: "
@@ -475,6 +498,7 @@ def verify_pr_completion(
         "expected_repo_count": len(expected_repos),
         "expected_repos_sha256": _canonical_json_sha256(list(expected_repos)),
         "declared_pr_count": sum(declared_counts.values()),
+        "source_growth_during_scan": declared_source_growth,
         "stored_pr_count": sum(stored_counts.values()),
         "unverified_store_pr_count": (
             total_store_pr_count - sum(stored_counts.values())

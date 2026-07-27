@@ -64,13 +64,17 @@ def _write_manifest(
                     "owner/one": {
                         "status": first_status,
                         "cursor": None,
+                        "initial_total_count": first_total,
                         "total_count": first_total,
+                        "source_growth_count": 0,
                         "truncated": first_truncated,
                     },
                     "owner/empty": {
                         "status": "done",
                         "cursor": None,
+                        "initial_total_count": 0,
                         "total_count": 0,
+                        "source_growth_count": 0,
                         "truncated": 0,
                     },
                 }
@@ -123,6 +127,7 @@ def test_verified_pr_completion_binds_repo_manifest_and_store(tmp_path: Path) ->
     assert receipt["expected_repo_count"] == 2
     assert receipt["stored_pr_count"] == 1
     assert receipt["declared_pr_count"] == 1
+    assert receipt["source_growth_during_scan"] == 0
     assert receipt["scan_id"] == SCAN_ID
     assert receipt["unverified_store_pr_count"] == 0
     assert receipt["repo_list"]["sha256"]
@@ -156,6 +161,36 @@ def test_pr_completion_rejects_store_count_drift(tmp_path: Path) -> None:
     _write_store(store)
 
     with pytest.raises(PRCompletionError, match="stored PR count mismatch"):
+        verify_pr_completion(
+            repo_list_path=repo_list,
+            graphql_manifest_path=manifest,
+            store_path=store,
+        )
+
+
+def test_pr_completion_binds_monotonic_source_growth(tmp_path: Path) -> None:
+    repo_list = tmp_path / "repo_list.json"
+    manifest = tmp_path / "graphql_manifest.json"
+    store = tmp_path / "prs.sqlite"
+    _write_repo_list(repo_list)
+    _write_manifest(manifest)
+    _write_store(store)
+
+    value = json.loads(manifest.read_text(encoding="utf-8"))
+    value["repos"]["owner/one"]["initial_total_count"] = 0
+    value["repos"]["owner/one"]["source_growth_count"] = 1
+    manifest.write_text(json.dumps(value) + "\n", encoding="utf-8")
+
+    receipt = verify_pr_completion(
+        repo_list_path=repo_list,
+        graphql_manifest_path=manifest,
+        store_path=store,
+    )
+    assert receipt["source_growth_during_scan"] == 1
+
+    value["repos"]["owner/one"]["source_growth_count"] = 0
+    manifest.write_text(json.dumps(value) + "\n", encoding="utf-8")
+    with pytest.raises(PRCompletionError, match="source_growth_count"):
         verify_pr_completion(
             repo_list_path=repo_list,
             graphql_manifest_path=manifest,
