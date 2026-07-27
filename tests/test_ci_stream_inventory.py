@@ -139,6 +139,9 @@ def _inventory(
     db_name: str = "inventory.sqlite",
     start: str = START,
     end: str = END,
+    allow_script_upgrade_from_sha256: str | None = None,
+    script_upgrade_reason: str | None = None,
+    script_path: Path | None = None,
 ) -> ci.GitHubActionsInventory:
     return ci.GitHubActionsInventory(
         db_path=tmp_path / db_name,
@@ -147,10 +150,15 @@ def _inventory(
         end=end,
         tokens=["secret-one", "secret-two"],
         resume=resume,
+        allow_script_upgrade_from_sha256=(
+            allow_script_upgrade_from_sha256
+        ),
+        script_upgrade_reason=script_upgrade_reason,
         progress_path=tmp_path / f"{db_name}.progress.json",
         requester=api,
         sleeper=lambda _: None,
         max_attempts=max_attempts,
+        script_path=script_path or ci.__file__,
     )
 
 
@@ -409,6 +417,200 @@ def test_one_second_drift_requires_two_stable_complete_sets(
     assert len(api.calls) == 6
 
 
+class UnstableTiePaginationAPI:
+    def __init__(
+        self,
+        start: int,
+        patterns: list[list[int]],
+    ):
+        self.start = start
+        self.patterns = patterns
+        self.pass_index = -1
+        self.calls: list[tuple[int, int]] = []
+
+    def __call__(
+        self,
+        method: str,
+        url: str,
+        headers: Mapping[str, str],
+        timeout: float,
+    ) -> ci.HTTPResponse:
+        assert method == "GET"
+        start, end, page, per_page = DatasetAPI._query(url)
+        assert (start, end, per_page) == (
+            self.start,
+            self.start + 1,
+            ci.DEFAULT_PER_PAGE,
+        )
+        if page == 1:
+            self.pass_index += 1
+        if self.pass_index >= len(self.patterns):
+            raise AssertionError("unexpected extra pagination pass")
+        unique_ids = self.patterns[self.pass_index]
+        assert len(unique_ids) == 100
+        page_ids = unique_ids if page == 1 else [unique_ids[-1]]
+        self.calls.append((self.pass_index, page))
+        return ci.HTTPResponse(
+            status=200,
+            headers={"X-RateLimit-Remaining": "4999"},
+            body=json.dumps(
+                {
+                    "total_count": 101,
+                    "workflow_runs": [
+                        _run(run_id, self.start) for run_id in page_ids
+                    ],
+                }
+            ).encode(),
+        )
+
+
+class FailOnCallAPI:
+    def __init__(self, delegate: Any, call_no: int):
+        self.delegate = delegate
+        self.call_no = call_no
+        self.calls = 0
+
+    def __call__(
+        self,
+        method: str,
+        url: str,
+        headers: Mapping[str, str],
+        timeout: float,
+    ) -> ci.HTTPResponse:
+        self.calls += 1
+        if self.calls == self.call_no:
+            return ci.HTTPResponse(
+                status=503,
+                headers={},
+                body=b'{"message":"temporary proof interruption"}',
+            )
+        return self.delegate(method, url, headers, timeout)
+
+
+def _tie_patterns() -> tuple[list[int], list[int], list[int]]:
+    missing_last = list(range(1, 101))
+    missing_first = list(range(2, 102))
+    missing_middle = [1, *range(3, 102)]
+    return missing_last, missing_first, missing_middle
+
+
+def test_one_second_tie_pagination_closes_from_audited_cardinality_union(
+    tmp_path: Path,
+) -> None:
+    start = ci.parse_utc_instant(START)
+    missing_last, missing_first, missing_middle = _tie_patterns()
+    api = UnstableTiePaginationAPI(
+        start,
+        [
+            missing_last,
+            missing_last,
+            missing_first,
+            missing_middle,
+        ],
+    )
+    inventory = _inventory(tmp_path, api, end=_iso(start + 1))
+
+    inventory.run()
+    receipt = inventory.write_completion_receipt(tmp_path / "receipt.json")
+
+    assert receipt["run_count"] == 101
+    assert len(api.calls) == 8
+    with sqlite3.connect(tmp_path / "inventory.sqlite") as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM window_pages"
+        ).fetchone() == (0,)
+        assert conn.execute(
+            """
+            SELECT distinct_item_count,accumulated_distinct_count,
+                   min_observation_count
+            FROM convergence_passes ORDER BY pass_no
+            """
+        ).fetchall() == [
+            (100, 100, 1),
+            (100, 101, 1),
+            (100, 101, 2),
+        ]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM convergence_pass_pages"
+        ).fetchone() == (6,)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM convergence_pass_runs"
+        ).fetchone() == (300,)
+        assert conn.execute(
+            """
+            SELECT pass_count,observed_page_count,observed_item_count,
+                   distinct_run_count,min_observation_count
+            FROM window_union_closures
+            """
+        ).fetchone() == (3, 6, 303, 101, 2)
+        assert conn.execute(
+            """
+            SELECT MIN(observation_count),MAX(observation_count)
+            FROM convergence_runs
+            """
+        ).fetchone() == (2, 3)
+
+        conn.execute(
+            """
+            UPDATE convergence_runs SET observation_count=1
+            WHERE run_id=(SELECT MIN(run_id) FROM convergence_runs)
+            """
+        )
+    with pytest.raises(ci.CompletionError, match="observation proof"):
+        inventory.db.completion_receipt()
+
+
+def test_cardinality_union_proof_survives_process_resume(
+    tmp_path: Path,
+) -> None:
+    start = ci.parse_utc_instant(START)
+    missing_last, missing_first, missing_middle = _tie_patterns()
+    interrupted_api = FailOnCallAPI(
+        UnstableTiePaginationAPI(
+            start,
+            [missing_last, missing_last],
+        ),
+        call_no=5,
+    )
+    first = _inventory(
+        tmp_path,
+        interrupted_api,
+        end=_iso(start + 1),
+        max_attempts=1,
+    )
+    with pytest.raises(ci.InventoryError, match="server retries exhausted"):
+        first.run()
+    with sqlite3.connect(tmp_path / "inventory.sqlite") as conn:
+        assert conn.execute(
+            "SELECT pass_no FROM convergence_passes"
+        ).fetchall() == [(1,)]
+        assert conn.execute(
+            "SELECT status FROM search_windows"
+        ).fetchall() == [("failed",)]
+
+    resumed_api = UnstableTiePaginationAPI(
+        start,
+        [missing_first, missing_middle],
+    )
+    resumed = _inventory(
+        tmp_path,
+        resumed_api,
+        end=_iso(start + 1),
+        resume=True,
+    )
+    resumed.run()
+    receipt = resumed.write_completion_receipt(tmp_path / "receipt.json")
+
+    assert receipt["run_count"] == 101
+    with sqlite3.connect(tmp_path / "inventory.sqlite") as conn:
+        assert conn.execute(
+            "SELECT pass_no FROM convergence_passes ORDER BY pass_no"
+        ).fetchall() == [(1,), (2,), (3,)]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM window_convergence"
+        ).fetchone() == (0,)
+
+
 class RateLimitOnceAPI:
     def __init__(self, delegate: DatasetAPI):
         self.delegate = delegate
@@ -529,6 +731,181 @@ def test_failed_page_resumes_from_sqlite_without_replaying_completed_pages(
             ("success",),
             ("success",),
         ]
+
+
+def test_v2_to_v3_resume_requires_exact_audited_producer_migration(
+    tmp_path: Path,
+) -> None:
+    old_v1_script = "1" * 64
+    old_v2_script = "2" * 64
+    reason = (
+        "recover unstable one-second pagination with cardinality union proof"
+    )
+    _inventory(tmp_path, DatasetAPI([]))
+    with sqlite3.connect(tmp_path / "inventory.sqlite") as conn:
+        conn.execute(
+            "UPDATE inventory_meta SET value=? WHERE key='schema'",
+            (ci.PREVIOUS_SCHEMA_VERSION,),
+        )
+        conn.execute(
+            "UPDATE inventory_meta SET value=? WHERE key='script_sha256'",
+            (old_v2_script,),
+        )
+        conn.execute(
+            """
+            INSERT INTO inventory_upgrades(
+                from_schema,to_schema,from_script_sha256,
+                to_script_sha256,upgraded_at
+            ) VALUES (?,?,?,?,?)
+            """,
+            (
+                "cppmega_ci_stream_inventory_v1",
+                ci.PREVIOUS_SCHEMA_VERSION,
+                old_v1_script,
+                old_v2_script,
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+
+    with pytest.raises(ci.BindingError, match="exact bound producer"):
+        _inventory(tmp_path, DatasetAPI([]), resume=True)
+    with pytest.raises(ci.BindingError, match="exact bound producer"):
+        _inventory(
+            tmp_path,
+            DatasetAPI([]),
+            resume=True,
+            allow_script_upgrade_from_sha256="3" * 64,
+            script_upgrade_reason=reason,
+        )
+    with pytest.raises(ci.BindingError, match="requires a reason"):
+        _inventory(
+            tmp_path,
+            DatasetAPI([]),
+            resume=True,
+            allow_script_upgrade_from_sha256=old_v2_script,
+        )
+
+    migrated = _inventory(
+        tmp_path,
+        DatasetAPI([]),
+        resume=True,
+        allow_script_upgrade_from_sha256=old_v2_script,
+        script_upgrade_reason=reason,
+    )
+    migrated.run()
+    receipt = migrated.write_completion_receipt(
+        tmp_path / "receipt.json"
+    )
+
+    assert [
+        upgrade["reason"] for upgrade in receipt["binding_upgrades"]
+    ] == [ci.IMPORTED_UPGRADE_REASON, reason]
+    assert receipt["binding_upgrades"][-1][
+        "from_script_sha256"
+    ] == old_v2_script
+    assert receipt["binding_upgrades"][-1][
+        "to_script_sha256"
+    ] == migrated.script_sha256
+    with sqlite3.connect(tmp_path / "inventory.sqlite") as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM inventory_upgrades"
+        ).fetchone() == (2,)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM inventory_binding_upgrades"
+        ).fetchone() == (2,)
+        assert conn.execute(
+            "SELECT value FROM inventory_meta WHERE key='schema'"
+        ).fetchone() == (ci.SCHEMA_VERSION,)
+
+    repeated_api = DatasetAPI([])
+    repeated = _inventory(
+        tmp_path,
+        repeated_api,
+        resume=True,
+        allow_script_upgrade_from_sha256=old_v2_script,
+        script_upgrade_reason=reason,
+    )
+    repeated.run()
+    assert repeated_api.calls == []
+    with sqlite3.connect(tmp_path / "inventory.sqlite") as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM inventory_binding_upgrades"
+        ).fetchone() == (2,)
+    with pytest.raises(ci.BindingError, match="does not exactly replay"):
+        _inventory(
+            tmp_path,
+            DatasetAPI([]),
+            resume=True,
+            allow_script_upgrade_from_sha256=old_v2_script,
+            script_upgrade_reason=f"{reason} but changed",
+        )
+
+
+def test_v2_incomplete_convergence_resumes_with_persisted_attempt_number(
+    tmp_path: Path,
+) -> None:
+    start = ci.parse_utc_instant(START)
+    missing_last, missing_first, missing_middle = _tie_patterns()
+    interrupted = _inventory(
+        tmp_path,
+        FailOnCallAPI(
+            UnstableTiePaginationAPI(start, [missing_last]),
+            call_no=3,
+        ),
+        end=_iso(start + 1),
+        max_attempts=1,
+    )
+    with pytest.raises(ci.InventoryError, match="server retries exhausted"):
+        interrupted.run()
+
+    old_v2_script = "4" * 64
+    reason = "resume the exact failed v2 one-second convergence state"
+    with sqlite3.connect(tmp_path / "inventory.sqlite") as conn:
+        conn.execute(
+            """
+            UPDATE window_convergence
+            SET attempts=12,candidate_total=101,
+                candidate_sha256=?,stable_observations=0
+            """,
+            ("5" * 64,),
+        )
+        conn.execute(
+            "UPDATE inventory_meta SET value=? WHERE key='schema'",
+            (ci.PREVIOUS_SCHEMA_VERSION,),
+        )
+        conn.execute(
+            "UPDATE inventory_meta SET value=? WHERE key='script_sha256'",
+            (old_v2_script,),
+        )
+
+    resumed = _inventory(
+        tmp_path,
+        UnstableTiePaginationAPI(
+            start,
+            [missing_last, missing_first, missing_middle],
+        ),
+        end=_iso(start + 1),
+        resume=True,
+        allow_script_upgrade_from_sha256=old_v2_script,
+        script_upgrade_reason=reason,
+    )
+    resumed.run()
+    receipt = resumed.write_completion_receipt(
+        tmp_path / "receipt.json"
+    )
+
+    assert receipt["run_count"] == 101
+    assert receipt["binding_upgrades"][-1]["reason"] == reason
+    with sqlite3.connect(tmp_path / "inventory.sqlite") as conn:
+        assert conn.execute(
+            "SELECT pass_no FROM convergence_passes ORDER BY pass_no"
+        ).fetchall() == [(13,), (14,), (15,)]
+        assert conn.execute(
+            """
+            SELECT first_pass_no,last_pass_no,pass_count
+            FROM window_union_closures
+            """
+        ).fetchone() == (13, 15, 3)
 
 
 class MalformedAPI:
