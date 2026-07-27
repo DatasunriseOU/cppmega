@@ -36,15 +36,20 @@ import urllib.request
 import zlib
 
 
-SCHEMA_VERSION = "cppmega_ci_stream_inventory_v2"
-RECEIPT_SCHEMA = "cppmega_ci_stream_inventory_receipt_v2"
-PROGRESS_SCHEMA = "cppmega_ci_stream_inventory_progress_v2"
+SCHEMA_VERSION = "cppmega_ci_stream_inventory_v3"
+RECEIPT_SCHEMA = "cppmega_ci_stream_inventory_receipt_v3"
+PROGRESS_SCHEMA = "cppmega_ci_stream_inventory_progress_v3"
+PREVIOUS_SCHEMA_VERSION = "cppmega_ci_stream_inventory_v2"
 GITHUB_API_VERSION = "2022-11-28"
 DEFAULT_REPO_LIST = "../cppmega.mlx/outputs/pr_ingest/repo_list.json"
 DEFAULT_PER_PAGE = 100
 GITHUB_FILTER_LIMIT = 1000
 METADATA_ENCODING = "zlib6-canonical-json-utf8-v1"
-CONVERGENCE_MAX_PASSES = 6
+CONVERGENCE_MAX_PASSES = 64
+MAX_UPGRADE_REASON_CHARS = 1000
+IMPORTED_UPGRADE_REASON = (
+    "imported pre-v3 inventory producer upgrade audit record"
+)
 
 _OWNER_REPO_RE = re.compile(
     r"^(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99}))/"
@@ -152,6 +157,24 @@ def _hash_lines(lines: Iterable[str]) -> str:
         digest.update(line.encode("utf-8"))
         digest.update(b"\n")
     return digest.hexdigest()
+
+
+def _validate_upgrade_reason(value: str | None) -> str:
+    if value is None:
+        raise BindingError(
+            "an explicit inventory script upgrade requires a reason"
+        )
+    reason = value.strip()
+    if (
+        not reason
+        or len(reason) > MAX_UPGRADE_REASON_CHARS
+        or any(not character.isprintable() for character in reason)
+    ):
+        raise BindingError(
+            "inventory script upgrade reason must be non-empty printable text "
+            f"of at most {MAX_UPGRADE_REASON_CHARS} characters"
+        )
+    return reason
 
 
 def _utc_now() -> str:
@@ -719,6 +742,15 @@ CREATE TABLE IF NOT EXISTS inventory_upgrades (
     to_script_sha256 TEXT NOT NULL,
     upgraded_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS inventory_binding_upgrades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_schema TEXT NOT NULL,
+    to_schema TEXT NOT NULL,
+    from_script_sha256 TEXT NOT NULL,
+    to_script_sha256 TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    upgraded_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS repos (
     repo_key TEXT PRIMARY KEY,
     owner TEXT NOT NULL,
@@ -808,6 +840,95 @@ CREATE TABLE IF NOT EXISTS window_convergence (
     last_error TEXT,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS convergence_passes (
+    window_id INTEGER NOT NULL REFERENCES search_windows(id),
+    pass_no INTEGER NOT NULL CHECK(pass_no >= 1),
+    total_count INTEGER NOT NULL CHECK(total_count >= 0),
+    page_count INTEGER NOT NULL CHECK(page_count >= 1),
+    raw_item_count INTEGER NOT NULL CHECK(raw_item_count >= 0),
+    distinct_item_count INTEGER NOT NULL CHECK(distinct_item_count >= 0),
+    duplicate_item_count INTEGER NOT NULL CHECK(duplicate_item_count >= 0),
+    page_payload_set_sha256 TEXT NOT NULL,
+    run_keys_sha256 TEXT NOT NULL,
+    accumulated_distinct_count INTEGER NOT NULL
+        CHECK(accumulated_distinct_count >= 0),
+    min_observation_count INTEGER NOT NULL CHECK(min_observation_count >= 0),
+    observed_at TEXT NOT NULL,
+    PRIMARY KEY(window_id, pass_no)
+);
+CREATE TABLE IF NOT EXISTS convergence_pass_pages (
+    window_id INTEGER NOT NULL,
+    pass_no INTEGER NOT NULL,
+    page_no INTEGER NOT NULL CHECK(page_no >= 1),
+    total_count INTEGER NOT NULL CHECK(total_count >= 0),
+    item_count INTEGER NOT NULL CHECK(item_count >= 0),
+    distinct_item_count INTEGER NOT NULL CHECK(distinct_item_count >= 0),
+    duplicate_item_count INTEGER NOT NULL CHECK(duplicate_item_count >= 0),
+    payload_sha256 TEXT NOT NULL,
+    run_keys_sha256 TEXT NOT NULL,
+    PRIMARY KEY(window_id, pass_no, page_no),
+    FOREIGN KEY(window_id,pass_no)
+        REFERENCES convergence_passes(window_id,pass_no)
+);
+CREATE TABLE IF NOT EXISTS convergence_runs (
+    window_id INTEGER NOT NULL REFERENCES search_windows(id),
+    repo_key TEXT NOT NULL REFERENCES repos(repo_key),
+    run_id INTEGER NOT NULL,
+    run_attempt INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT,
+    run_started_at TEXT,
+    status TEXT,
+    conclusion TEXT,
+    workflow_id INTEGER,
+    workflow_name TEXT,
+    event TEXT,
+    head_branch TEXT,
+    head_sha TEXT,
+    run_number INTEGER,
+    html_url TEXT,
+    api_url TEXT,
+    metadata_blob BLOB NOT NULL,
+    metadata_sha256 TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    first_pass INTEGER NOT NULL CHECK(first_pass >= 1),
+    last_pass INTEGER NOT NULL CHECK(last_pass >= first_pass),
+    observation_count INTEGER NOT NULL CHECK(observation_count >= 1),
+    PRIMARY KEY(window_id, repo_key, run_id, run_attempt)
+);
+CREATE INDEX IF NOT EXISTS idx_convergence_runs_identity
+    ON convergence_runs(repo_key,run_id,run_attempt,window_id);
+CREATE TABLE IF NOT EXISTS convergence_pass_runs (
+    window_id INTEGER NOT NULL,
+    pass_no INTEGER NOT NULL,
+    repo_key TEXT NOT NULL,
+    run_id INTEGER NOT NULL,
+    run_attempt INTEGER NOT NULL,
+    metadata_sha256 TEXT NOT NULL,
+    PRIMARY KEY(
+        window_id,pass_no,repo_key,run_id,run_attempt
+    ),
+    FOREIGN KEY(window_id,pass_no)
+        REFERENCES convergence_passes(window_id,pass_no),
+    FOREIGN KEY(window_id,repo_key,run_id,run_attempt)
+        REFERENCES convergence_runs(
+            window_id,repo_key,run_id,run_attempt
+        )
+);
+CREATE TABLE IF NOT EXISTS window_union_closures (
+    window_id INTEGER PRIMARY KEY REFERENCES search_windows(id),
+    total_count INTEGER NOT NULL CHECK(total_count >= 0),
+    pass_count INTEGER NOT NULL CHECK(pass_count >= 2),
+    first_pass_no INTEGER NOT NULL CHECK(first_pass_no >= 1),
+    last_pass_no INTEGER NOT NULL CHECK(last_pass_no >= first_pass_no),
+    observed_page_count INTEGER NOT NULL CHECK(observed_page_count >= 2),
+    observed_item_count INTEGER NOT NULL CHECK(observed_item_count >= 0),
+    distinct_run_count INTEGER NOT NULL CHECK(distinct_run_count >= 0),
+    min_observation_count INTEGER NOT NULL CHECK(min_observation_count >= 2),
+    pass_set_sha256 TEXT NOT NULL,
+    run_keys_sha256 TEXT NOT NULL,
+    closed_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS request_ledger (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     requested_at TEXT NOT NULL,
@@ -861,6 +982,90 @@ class InventoryDB:
             for row in conn.execute("SELECT key,value FROM inventory_meta")
         }
 
+    @staticmethod
+    def _backfill_binding_upgrade_history_locked(
+        conn: sqlite3.Connection,
+        *,
+        current_schema: str,
+        current_script_sha256: str,
+    ) -> None:
+        legacy = list(
+            conn.execute(
+                """
+                SELECT from_schema,to_schema,from_script_sha256,
+                       to_script_sha256,upgraded_at
+                FROM inventory_upgrades ORDER BY id
+                """
+            )
+        )
+        binding = list(
+            conn.execute(
+                """
+                SELECT from_schema,to_schema,from_script_sha256,
+                       to_script_sha256,reason,upgraded_at
+                FROM inventory_binding_upgrades ORDER BY id
+                """
+            )
+        )
+        projected = [
+            (
+                str(row["from_schema"]),
+                str(row["to_schema"]),
+                str(row["from_script_sha256"]),
+                str(row["to_script_sha256"]),
+                str(row["upgraded_at"]),
+            )
+            for row in binding
+        ]
+        legacy_values = [
+            (
+                str(row["from_schema"]),
+                str(row["to_schema"]),
+                str(row["from_script_sha256"]),
+                str(row["to_script_sha256"]),
+                str(row["upgraded_at"]),
+            )
+            for row in legacy
+        ]
+        if binding:
+            if projected != legacy_values:
+                raise BindingError(
+                    "inventory producer upgrade ledgers disagree before "
+                    "migration"
+                )
+            for row in binding:
+                _validate_upgrade_reason(str(row["reason"]))
+        elif legacy_values:
+            conn.executemany(
+                """
+                INSERT INTO inventory_binding_upgrades(
+                    from_schema,to_schema,from_script_sha256,
+                    to_script_sha256,reason,upgraded_at
+                ) VALUES (?,?,?,?,?,?)
+                """,
+                [
+                    (*row[:4], IMPORTED_UPGRADE_REASON, row[4])
+                    for row in legacy_values
+                ],
+            )
+        if legacy_values:
+            for index, row in enumerate(legacy_values):
+                if index and (
+                    legacy_values[index - 1][1] != row[0]
+                    or legacy_values[index - 1][3] != row[2]
+                ):
+                    raise BindingError(
+                        "legacy inventory producer upgrade chain is broken"
+                    )
+            if (
+                legacy_values[-1][1] != current_schema
+                or legacy_values[-1][3] != current_script_sha256
+            ):
+                raise BindingError(
+                    "legacy inventory producer upgrade chain does not bind "
+                    "the current database producer"
+                )
+
     def bind(
         self,
         *,
@@ -869,6 +1074,8 @@ class InventoryDB:
         end_epoch: int,
         script_sha256: str,
         resume: bool,
+        allow_script_upgrade_from_sha256: str | None = None,
+        script_upgrade_reason: str | None = None,
     ) -> None:
         if start_epoch >= end_epoch:
             raise BindingError("inventory interval must satisfy start < end")
@@ -899,11 +1106,69 @@ class InventoryDB:
                             f"inventory database already exists at {self.path}; "
                             "pass --resume after verifying its binding"
                         )
-                    upgrade_v1 = current.get("schema") == (
-                        "cppmega_ci_stream_inventory_v1"
+                    current_schema = current.get("schema")
+                    previous_script = current.get("script_sha256", "")
+                    upgrade_v1 = (
+                        current_schema == "cppmega_ci_stream_inventory_v1"
                     )
+                    upgrade_v2 = current_schema == PREVIOUS_SCHEMA_VERSION
+                    upgrade_reason: str | None = None
+                    if upgrade_v2:
+                        if (
+                            allow_script_upgrade_from_sha256
+                            != previous_script
+                        ):
+                            raise BindingError(
+                                "inventory v2 to v3 migration requires "
+                                "--allow-inventory-script-upgrade-from-sha256 "
+                                "to match the exact bound producer"
+                            )
+                        upgrade_reason = _validate_upgrade_reason(
+                            script_upgrade_reason
+                        )
+                    elif (
+                        allow_script_upgrade_from_sha256 is not None
+                        or script_upgrade_reason is not None
+                    ):
+                        repeated_reason = _validate_upgrade_reason(
+                            script_upgrade_reason
+                        )
+                        repeated_upgrade = conn.execute(
+                            """
+                            SELECT from_schema,to_schema,from_script_sha256,
+                                   to_script_sha256,reason
+                            FROM inventory_binding_upgrades
+                            ORDER BY id DESC LIMIT 1
+                            """
+                        ).fetchone()
+                        if (
+                            current_schema != SCHEMA_VERSION
+                            or previous_script != script_sha256
+                            or repeated_upgrade is None
+                            or str(repeated_upgrade["to_schema"])
+                            != SCHEMA_VERSION
+                            or str(
+                                repeated_upgrade[
+                                    "from_script_sha256"
+                                ]
+                            )
+                            != allow_script_upgrade_from_sha256
+                            or str(
+                                repeated_upgrade["to_script_sha256"]
+                            )
+                            != script_sha256
+                            or str(repeated_upgrade["reason"])
+                            != repeated_reason
+                        ):
+                            raise BindingError(
+                                "inventory script upgrade authorization does "
+                                "not exactly replay the latest completed "
+                                "producer migration"
+                            )
                     ignored_upgrade_keys = (
-                        {"schema", "script_sha256"} if upgrade_v1 else set()
+                        {"schema", "script_sha256"}
+                        if upgrade_v1 or upgrade_v2
+                        else set()
                     )
                     mismatches = {
                         key: (current.get(key), value)
@@ -919,8 +1184,19 @@ class InventoryDB:
                         raise BindingError(
                             f"resume binding mismatch in {self.path}: {rendered}"
                         )
-                    if upgrade_v1:
-                        previous_script = current.get("script_sha256", "")
+                    if upgrade_v1 or upgrade_v2:
+                        self._backfill_binding_upgrade_history_locked(
+                            conn,
+                            current_schema=str(current_schema),
+                            current_script_sha256=previous_script,
+                        )
+                        reason = (
+                            "audited legacy inventory v1 recovery migration"
+                            if upgrade_v1
+                            else upgrade_reason
+                        )
+                        assert reason is not None
+                        upgraded_at = _utc_now()
                         conn.execute(
                             """
                             INSERT INTO inventory_upgrades(
@@ -933,7 +1209,23 @@ class InventoryDB:
                                 SCHEMA_VERSION,
                                 previous_script,
                                 script_sha256,
-                                _utc_now(),
+                                upgraded_at,
+                            ),
+                        )
+                        conn.execute(
+                            """
+                            INSERT INTO inventory_binding_upgrades(
+                                from_schema,to_schema,from_script_sha256,
+                                to_script_sha256,reason,upgraded_at
+                            ) VALUES (?,?,?,?,?,?)
+                            """,
+                            (
+                                current["schema"],
+                                SCHEMA_VERSION,
+                                previous_script,
+                                script_sha256,
+                                reason,
+                                upgraded_at,
                             ),
                         )
                         conn.execute(
@@ -952,10 +1244,18 @@ class InventoryDB:
                         )
                     elif current.get("script_sha256") != script_sha256:
                         raise BindingError(
-                            "resume script hash mismatch; only the audited "
-                            "inventory v1 to v2 recovery migration is allowed"
+                            "resume script hash mismatch; no authorized "
+                            "inventory producer migration applies"
                         )
                 else:
+                    if (
+                        allow_script_upgrade_from_sha256 is not None
+                        or script_upgrade_reason is not None
+                    ):
+                        raise BindingError(
+                            "inventory script upgrade authorization cannot be "
+                            "used when creating a new database"
+                        )
                     conn.executemany(
                         "INSERT INTO inventory_meta(key,value) VALUES (?,?)",
                         sorted(expected.items()),
@@ -1277,6 +1577,31 @@ class InventoryDB:
                 (repo_key, run_id, run_attempt),
             )
 
+    @staticmethod
+    def _clear_convergence_proof_locked(
+        conn: sqlite3.Connection, *, window_id: int
+    ) -> None:
+        conn.execute(
+            "DELETE FROM window_union_closures WHERE window_id=?",
+            (window_id,),
+        )
+        conn.execute(
+            "DELETE FROM convergence_pass_runs WHERE window_id=?",
+            (window_id,),
+        )
+        conn.execute(
+            "DELETE FROM convergence_pass_pages WHERE window_id=?",
+            (window_id,),
+        )
+        conn.execute(
+            "DELETE FROM convergence_passes WHERE window_id=?",
+            (window_id,),
+        )
+        conn.execute(
+            "DELETE FROM convergence_runs WHERE window_id=?",
+            (window_id,),
+        )
+
     def recover_pagination_drift(
         self,
         conn: sqlite3.Connection,
@@ -1302,6 +1627,9 @@ class InventoryDB:
                     f"cannot recover window in status {current['status']!r}"
                 )
             self._clear_window_payload_locked(conn, window_id=window_id)
+            self._clear_convergence_proof_locked(
+                conn, window_id=window_id
+            )
             if end - start > 1:
                 midpoint = start + (end - start) // 2
                 conn.execute(
@@ -1418,9 +1746,56 @@ class InventoryDB:
                 (_utc_now(), window_id),
             )
 
-    def validate_convergence_pass(
-        self, row: sqlite3.Row, pages: Sequence[PageResponse]
-    ) -> tuple[int, str]:
+    @staticmethod
+    def _convergence_pass_set_sha256(
+        conn: sqlite3.Connection, *, window_id: int
+    ) -> str:
+        return _hash_lines(
+            "\t".join(
+                str(row[field])
+                for field in (
+                    "pass_no",
+                    "total_count",
+                    "page_count",
+                    "raw_item_count",
+                    "distinct_item_count",
+                    "duplicate_item_count",
+                    "page_payload_set_sha256",
+                    "run_keys_sha256",
+                    "accumulated_distinct_count",
+                    "min_observation_count",
+                )
+            )
+            for row in conn.execute(
+                """
+                SELECT pass_no,total_count,page_count,raw_item_count,
+                       distinct_item_count,duplicate_item_count,
+                       page_payload_set_sha256,run_keys_sha256,
+                       accumulated_distinct_count,min_observation_count
+                FROM convergence_passes
+                WHERE window_id=?
+                ORDER BY pass_no
+                """,
+                (window_id,),
+            )
+        )
+
+    def accumulate_convergence_pass(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        pages: Sequence[PageResponse],
+    ) -> tuple[bool, str | None]:
+        """Accumulate one complete API pass into a cardinality-bound union.
+
+        GitHub does not provide a stable tie-breaker when more than one page of
+        workflow runs shares the same ``created_at`` second.  A single pass can
+        therefore contain duplicates across pages.  The union is allowed to
+        close only after it contains exactly ``total_count`` unique run keys
+        and every key has appeared with identical metadata in at least two
+        distinct passes.
+        """
+
         if not pages:
             raise PaginationDrift(
                 "convergence pass returned no pages", observed_total=0
@@ -1438,7 +1813,16 @@ class InventoryDB:
                 f"{expected_pages}",
                 observed_total=total,
             )
-        keys: dict[tuple[int, int], str] = {}
+
+        repo_key = str(row["repo_key"])
+        normalized: dict[
+            tuple[int, int], tuple[dict[str, Any], str]
+        ] = {}
+        page_lines: list[str] = []
+        page_proofs: list[
+            tuple[int, int, int, int, int, str, str]
+        ] = []
+        raw_item_count = 0
         for page_no, page in enumerate(pages, start=1):
             if page.total_count != total:
                 raise PaginationDrift(
@@ -1457,97 +1841,372 @@ class InventoryDB:
                     f"{len(page.workflow_runs)} items, expected {expected_items}",
                     observed_total=total,
                 )
+            page_keys: list[str] = []
             for run in page.workflow_runs:
-                _, metadata_sha, (run_id, run_attempt) = self._normalize_run(
-                    str(row["repo_key"]),
+                record, metadata_sha, key = self._normalize_run(
+                    repo_key,
                     run,
                     start_epoch=int(row["start_epoch"]),
                     end_epoch=int(row["end_epoch"]),
                 )
-                key = (run_id, run_attempt)
-                previous_sha = keys.get(key)
-                if previous_sha is not None and previous_sha != metadata_sha:
+                previous = normalized.get(key)
+                if previous is not None and previous[1] != metadata_sha:
                     raise PaginationDrift(
-                        f"convergence run {run_id} attempt {run_attempt} "
+                        f"convergence run {key[0]} attempt {key[1]} "
                         "changed metadata within one pass",
                         observed_total=total,
                     )
-                keys[key] = metadata_sha
-        if len(keys) != total:
+                normalized[key] = (record, metadata_sha)
+                page_keys.append(
+                    f"{repo_key}\t{key[0]}\t{key[1]}\t{metadata_sha}"
+                )
+            raw_item_count += len(page.workflow_runs)
+            page_key_digest = _hash_lines(sorted(page_keys))
+            page_line = (
+                f"{page_no}\t{page.total_count}\t"
+                f"{len(page.workflow_runs)}\t{len(set(page_keys))}\t"
+                f"{len(page_keys) - len(set(page_keys))}\t"
+                f"{page.payload_sha256}\t{page_key_digest}"
+            )
+            page_lines.append(page_line)
+            page_proofs.append(
+                (
+                    page_no,
+                    page.total_count,
+                    len(page.workflow_runs),
+                    len(set(page_keys)),
+                    len(page_keys) - len(set(page_keys)),
+                    page.payload_sha256,
+                    page_key_digest,
+                )
+            )
+        if raw_item_count != total:
             raise PaginationDrift(
-                f"convergence pass returned {len(keys)} distinct runs "
+                f"convergence pass returned {raw_item_count} raw items "
                 f"for total_count={total}",
                 observed_total=total,
             )
-        return total, _hash_lines(
-            f"{row['repo_key']}\t{run_id}\t{run_attempt}\t{metadata_sha}"
-            for (run_id, run_attempt), metadata_sha in sorted(keys.items())
-        )
 
-    def record_convergence_observation(
-        self,
-        conn: sqlite3.Connection,
-        *,
-        window_id: int,
-        total: int | None,
-        digest: str | None,
-        error: str | None,
-    ) -> int:
+        pass_run_sha256 = _hash_lines(
+            f"{repo_key}\t{run_id}\t{run_attempt}\t{metadata_sha}"
+            for (run_id, run_attempt), (_record, metadata_sha) in sorted(
+                normalized.items()
+            )
+        )
+        page_payload_set_sha256 = _hash_lines(page_lines)
+        now = _utc_now()
+        window_id = int(row["id"])
         with self._write_lock, conn:
-            previous = conn.execute(
-                "SELECT * FROM window_convergence WHERE window_id=?", (window_id,)
+            state = conn.execute(
+                "SELECT * FROM window_convergence WHERE window_id=?",
+                (window_id,),
             ).fetchone()
-            if previous is None:
+            if state is None:
                 raise UnstableEnumerationError(
                     f"window {window_id} lost convergence state"
                 )
-            stable = 0
-            if digest is not None:
-                stable = (
-                    int(previous["stable_observations"]) + 1
-                    if previous["candidate_total"] == total
-                    and previous["candidate_sha256"] == digest
-                    else 1
+            if (
+                state["candidate_total"] is not None
+                and int(state["candidate_total"]) != total
+            ):
+                raise PaginationDrift(
+                    f"convergence total_count changed "
+                    f"{state['candidate_total']} -> {total}",
+                    observed_total=total,
                 )
+            pass_no = int(state["attempts"]) + 1
+            for (run_id, run_attempt), (
+                record,
+                metadata_sha,
+            ) in sorted(normalized.items()):
+                existing = conn.execute(
+                    """
+                    SELECT metadata_sha256,last_pass,observation_count
+                    FROM convergence_runs
+                    WHERE window_id=? AND repo_key=? AND run_id=?
+                      AND run_attempt=?
+                    """,
+                    (window_id, repo_key, run_id, run_attempt),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing["metadata_sha256"]) != metadata_sha:
+                        raise PaginationDrift(
+                            f"convergence run {run_id} attempt {run_attempt} "
+                            "changed metadata across passes",
+                            observed_total=total,
+                        )
+                    if int(existing["last_pass"]) != pass_no:
+                        conn.execute(
+                            """
+                            UPDATE convergence_runs
+                            SET last_pass=?,observation_count=observation_count+1
+                            WHERE window_id=? AND repo_key=? AND run_id=?
+                              AND run_attempt=?
+                            """,
+                            (
+                                pass_no,
+                                window_id,
+                                repo_key,
+                                run_id,
+                                run_attempt,
+                            ),
+                        )
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO convergence_runs(
+                        window_id,repo_key,run_id,run_attempt,created_at,
+                        updated_at,run_started_at,status,conclusion,workflow_id,
+                        workflow_name,event,head_branch,head_sha,run_number,
+                        html_url,api_url,metadata_blob,metadata_sha256,
+                        first_seen_at,first_pass,last_pass,observation_count
+                    ) VALUES (
+                        :window_id,:repo_key,:run_id,:run_attempt,:created_at,
+                        :updated_at,:run_started_at,:status,:conclusion,
+                        :workflow_id,:workflow_name,:event,:head_branch,
+                        :head_sha,:run_number,:html_url,:api_url,:metadata_blob,
+                        :metadata_sha256,:first_seen_at,:first_pass,:last_pass,1
+                    )
+                    """,
+                    {
+                        **record,
+                        "window_id": window_id,
+                        "first_seen_at": now,
+                        "first_pass": pass_no,
+                        "last_pass": pass_no,
+                    },
+                )
+
+            aggregate = conn.execute(
+                """
+                SELECT COUNT(*) AS distinct_count,
+                       COALESCE(MIN(observation_count),0) AS min_observations
+                FROM convergence_runs WHERE window_id=?
+                """,
+                (window_id,),
+            ).fetchone()
+            distinct_count = int(aggregate["distinct_count"])
+            min_observations = int(aggregate["min_observations"])
+            if distinct_count > total:
+                raise UnstableEnumerationError(
+                    f"convergence union for window {window_id} contains "
+                    f"{distinct_count} runs, above total_count={total}"
+                )
+            union_sha256 = _hash_lines(
+                f"{item['repo_key']}\t{item['run_id']}\t"
+                f"{item['run_attempt']}\t{item['metadata_sha256']}"
+                for item in conn.execute(
+                    """
+                    SELECT repo_key,run_id,run_attempt,metadata_sha256
+                    FROM convergence_runs WHERE window_id=?
+                    ORDER BY repo_key,run_id,run_attempt
+                    """,
+                    (window_id,),
+                )
+            )
+            conn.execute(
+                """
+                INSERT INTO convergence_passes(
+                    window_id,pass_no,total_count,page_count,raw_item_count,
+                    distinct_item_count,duplicate_item_count,
+                    page_payload_set_sha256,run_keys_sha256,
+                    accumulated_distinct_count,min_observation_count,observed_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    window_id,
+                    pass_no,
+                    total,
+                    expected_pages,
+                    raw_item_count,
+                    len(normalized),
+                    raw_item_count - len(normalized),
+                    page_payload_set_sha256,
+                    pass_run_sha256,
+                    distinct_count,
+                    min_observations,
+                    now,
+                ),
+            )
+            conn.executemany(
+                """
+                INSERT INTO convergence_pass_pages(
+                    window_id,pass_no,page_no,total_count,item_count,
+                    distinct_item_count,duplicate_item_count,payload_sha256,
+                    run_keys_sha256
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                [
+                    (window_id, pass_no, *page_proof)
+                    for page_proof in page_proofs
+                ],
+            )
+            conn.executemany(
+                """
+                INSERT INTO convergence_pass_runs(
+                    window_id,pass_no,repo_key,run_id,run_attempt,
+                    metadata_sha256
+                ) VALUES (?,?,?,?,?,?)
+                """,
+                [
+                    (
+                        window_id,
+                        pass_no,
+                        repo_key,
+                        run_id,
+                        run_attempt,
+                        metadata_sha,
+                    )
+                    for (run_id, run_attempt), (
+                        _record,
+                        metadata_sha,
+                    ) in sorted(normalized.items())
+                ],
+            )
             conn.execute(
                 """
                 UPDATE window_convergence
-                SET attempts=attempts+1,candidate_total=?,
-                    candidate_sha256=?,stable_observations=?,
-                    last_error=?,updated_at=?
+                SET attempts=?,candidate_total=?,candidate_sha256=?,
+                    stable_observations=?,last_error=?,updated_at=?
                 WHERE window_id=?
                 """,
-                (total, digest, stable, error, _utc_now(), window_id),
+                (
+                    pass_no,
+                    total,
+                    union_sha256,
+                    min_observations if distinct_count == total else 0,
+                    (
+                        None
+                        if distinct_count == total and min_observations >= 2
+                        else (
+                            f"cardinality union has {distinct_count}/{total} "
+                            f"runs; minimum distinct-pass observations="
+                            f"{min_observations}"
+                        )
+                    ),
+                    now,
+                    window_id,
+                ),
             )
-            return stable
+            if distinct_count != total or min_observations < 2:
+                return False, None
 
-    def finish_convergence(
-        self, conn: sqlite3.Connection, *, window_id: int, digest: str
-    ) -> None:
-        with self._write_lock, conn:
-            window = conn.execute(
-                "SELECT status,run_keys_sha256 FROM search_windows WHERE id=?",
+            mismatch = conn.execute(
+                """
+                SELECT candidate.repo_key,candidate.run_id,
+                       candidate.run_attempt
+                FROM convergence_runs candidate
+                JOIN runs existing
+                  ON existing.repo_key=candidate.repo_key
+                 AND existing.run_id=candidate.run_id
+                 AND existing.run_attempt=candidate.run_attempt
+                WHERE candidate.window_id=?
+                  AND existing.metadata_sha256 != candidate.metadata_sha256
+                LIMIT 1
+                """,
                 (window_id,),
             ).fetchone()
-            state = conn.execute(
-                "SELECT candidate_sha256,stable_observations "
-                "FROM window_convergence WHERE window_id=?",
-                (window_id,),
-            ).fetchone()
-            if (
-                window is None
-                or state is None
-                or window["status"] != "done"
-                or window["run_keys_sha256"] != digest
-                or state["candidate_sha256"] != digest
-                or int(state["stable_observations"]) < 2
-            ):
+            if mismatch is not None:
                 raise UnstableEnumerationError(
-                    f"window {window_id} lacks a complete convergence proof"
+                    "convergence metadata differs from a previously recorded "
+                    "inventory run for "
+                    f"{mismatch['repo_key']}#{mismatch['run_id']} attempt "
+                    f"{mismatch['run_attempt']}"
                 )
             conn.execute(
-                "DELETE FROM window_convergence WHERE window_id=?", (window_id,)
+                """
+                INSERT OR IGNORE INTO runs(
+                    repo_key,run_id,run_attempt,created_at,updated_at,
+                    run_started_at,status,conclusion,workflow_id,workflow_name,
+                    event,head_branch,head_sha,run_number,html_url,api_url,
+                    metadata_blob,metadata_sha256,first_seen_at
+                )
+                SELECT repo_key,run_id,run_attempt,created_at,updated_at,
+                       run_started_at,status,conclusion,workflow_id,
+                       workflow_name,event,head_branch,head_sha,run_number,
+                       html_url,api_url,metadata_blob,metadata_sha256,
+                       first_seen_at
+                FROM convergence_runs WHERE window_id=?
+                """,
+                (window_id,),
             )
+            conn.execute(
+                """
+                INSERT INTO window_runs(
+                    window_id,repo_key,run_id,run_attempt,metadata_sha256
+                )
+                SELECT window_id,repo_key,run_id,run_attempt,metadata_sha256
+                FROM convergence_runs WHERE window_id=?
+                ORDER BY repo_key,run_id,run_attempt
+                """,
+                (window_id,),
+            )
+            pass_stats = conn.execute(
+                """
+                SELECT COUNT(*) AS pass_count,MIN(pass_no) AS first_pass,
+                       MAX(pass_no) AS last_pass,
+                       SUM(page_count) AS observed_pages,
+                       SUM(raw_item_count) AS observed_items
+                FROM convergence_passes WHERE window_id=?
+                """,
+                (window_id,),
+            ).fetchone()
+            pass_set_sha256 = self._convergence_pass_set_sha256(
+                conn, window_id=window_id
+            )
+            pass_count = int(pass_stats["pass_count"])
+            observed_pages = int(pass_stats["observed_pages"])
+            observed_items = int(pass_stats["observed_items"])
+            conn.execute(
+                """
+                INSERT INTO window_union_closures(
+                    window_id,total_count,pass_count,first_pass_no,last_pass_no,
+                    observed_page_count,observed_item_count,distinct_run_count,
+                    min_observation_count,pass_set_sha256,run_keys_sha256,
+                    closed_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    window_id,
+                    total,
+                    pass_count,
+                    int(pass_stats["first_pass"]),
+                    int(pass_stats["last_pass"]),
+                    observed_pages,
+                    observed_items,
+                    distinct_count,
+                    min_observations,
+                    pass_set_sha256,
+                    union_sha256,
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE search_windows
+                SET status='done',expected_total=?,expected_pages=?,
+                    pages_done=?,raw_items=?,distinct_items=?,
+                    duplicate_items=?,run_keys_sha256=?,failure_class=NULL,
+                    failure_message=NULL,updated_at=?
+                WHERE id=?
+                """,
+                (
+                    total,
+                    expected_pages,
+                    observed_pages,
+                    observed_items,
+                    distinct_count,
+                    observed_items - distinct_count,
+                    union_sha256,
+                    now,
+                    window_id,
+                ),
+            )
+            conn.execute(
+                "DELETE FROM window_convergence WHERE window_id=?",
+                (window_id,),
+            )
+            return True, union_sha256
 
     def store_page(
         self,
@@ -1906,6 +2565,81 @@ class InventoryDB:
                 )
             if int(meta["unresolved_count"]) != 0:
                 raise CompletionError("unresolved repository count is not zero")
+            legacy_upgrades = [
+                (
+                    str(row["from_schema"]),
+                    str(row["to_schema"]),
+                    str(row["from_script_sha256"]),
+                    str(row["to_script_sha256"]),
+                    str(row["upgraded_at"]),
+                )
+                for row in conn.execute(
+                    """
+                    SELECT from_schema,to_schema,from_script_sha256,
+                           to_script_sha256,upgraded_at
+                    FROM inventory_upgrades ORDER BY id
+                    """
+                )
+            ]
+            binding_upgrades = [
+                {
+                    "from_schema": str(row["from_schema"]),
+                    "to_schema": str(row["to_schema"]),
+                    "from_script_sha256": str(
+                        row["from_script_sha256"]
+                    ),
+                    "to_script_sha256": str(row["to_script_sha256"]),
+                    "reason": str(row["reason"]),
+                    "upgraded_at": str(row["upgraded_at"]),
+                }
+                for row in conn.execute(
+                    """
+                    SELECT from_schema,to_schema,from_script_sha256,
+                           to_script_sha256,reason,upgraded_at
+                    FROM inventory_binding_upgrades ORDER BY id
+                    """
+                )
+            ]
+            projected_upgrades = [
+                (
+                    row["from_schema"],
+                    row["to_schema"],
+                    row["from_script_sha256"],
+                    row["to_script_sha256"],
+                    row["upgraded_at"],
+                )
+                for row in binding_upgrades
+            ]
+            if legacy_upgrades != projected_upgrades:
+                raise CompletionError(
+                    "inventory producer upgrade ledgers disagree"
+                )
+            for index, upgrade in enumerate(binding_upgrades):
+                try:
+                    _validate_upgrade_reason(upgrade["reason"])
+                except BindingError as exc:
+                    raise CompletionError(
+                        f"inventory producer upgrade {index} reason is invalid"
+                    ) from exc
+                if index and (
+                    binding_upgrades[index - 1]["to_schema"]
+                    != upgrade["from_schema"]
+                    or binding_upgrades[index - 1]["to_script_sha256"]
+                    != upgrade["from_script_sha256"]
+                ):
+                    raise CompletionError(
+                        f"inventory producer upgrade {index} breaks the "
+                        "upgrade chain"
+                    )
+            if binding_upgrades and (
+                binding_upgrades[-1]["to_schema"] != SCHEMA_VERSION
+                or binding_upgrades[-1]["to_script_sha256"]
+                != meta["script_sha256"]
+            ):
+                raise CompletionError(
+                    "inventory producer upgrade chain does not bind the "
+                    "completed producer"
+                )
             start = int(meta["start_epoch"])
             end = int(meta["end_epoch"])
 
@@ -1947,6 +2681,44 @@ class InventoryDB:
                 raise CompletionError(
                     f"inventory has {convergence_left} unresolved convergence proofs"
                 )
+            orphan_proof = conn.execute(
+                """
+                SELECT proof.window_id
+                FROM (
+                    SELECT window_id FROM convergence_passes
+                    UNION
+                    SELECT window_id FROM convergence_pass_pages
+                    UNION
+                    SELECT window_id FROM convergence_pass_runs
+                    UNION
+                    SELECT window_id FROM convergence_runs
+                ) proof
+                LEFT JOIN window_union_closures closure
+                  ON closure.window_id=proof.window_id
+                WHERE closure.window_id IS NULL
+                LIMIT 1
+                """
+            ).fetchone()
+            if orphan_proof is not None:
+                raise CompletionError(
+                    "inventory has convergence proof rows without a union "
+                    f"closure for window {orphan_proof['window_id']}"
+                )
+            invalid_union_window = conn.execute(
+                """
+                SELECT closure.window_id
+                FROM window_union_closures closure
+                JOIN search_windows window ON window.id=closure.window_id
+                WHERE window.status != 'done'
+                   OR window.end_epoch - window.start_epoch != 1
+                LIMIT 1
+                """
+            ).fetchone()
+            if invalid_union_window is not None:
+                raise CompletionError(
+                    "inventory union closure is attached to an invalid window "
+                    f"{invalid_union_window['window_id']}"
+                )
 
             all_windows = list(
                 conn.execute(
@@ -1964,6 +2736,7 @@ class InventoryDB:
                     by_parent.setdefault(int(row["parent_id"]), []).append(row)
 
             leaf_ids: list[int] = []
+            union_closure_lines: list[str] = []
             for repo in repos:
                 repo_key = str(repo["repo_key"])
                 windows = by_repo.get(repo_key, [])
@@ -2001,34 +2774,431 @@ class InventoryDB:
                         raise CompletionError(
                             f"dense leaf window {leaf['id']} was not split"
                         )
-                    if (
-                        int(leaf["expected_pages"]) != expected_pages
-                        or int(leaf["pages_done"]) != expected_pages
-                        or int(leaf["raw_items"]) != total
-                        or int(leaf["distinct_items"]) != total
-                        or int(leaf["duplicate_items"]) != 0
-                    ):
-                        raise CompletionError(
-                            f"leaf window {leaf['id']} has incomplete page/count closure"
-                        )
+                    window_id = int(leaf["id"])
                     pages = list(
                         conn.execute(
                             """
                             SELECT * FROM window_pages
                             WHERE window_id=? ORDER BY page_no
                             """,
-                            (int(leaf["id"]),),
+                            (window_id,),
                         )
                     )
-                    if [int(page["page_no"]) for page in pages] != list(
-                        range(1, expected_pages + 1)
-                    ):
-                        raise CompletionError(
-                            f"leaf window {leaf['id']} page sequence is incomplete"
+                    union = conn.execute(
+                        """
+                        SELECT * FROM window_union_closures
+                        WHERE window_id=?
+                        """,
+                        (window_id,),
+                    ).fetchone()
+                    if union is None:
+                        if (
+                            int(leaf["expected_pages"]) != expected_pages
+                            or int(leaf["pages_done"]) != expected_pages
+                            or int(leaf["raw_items"]) != total
+                            or int(leaf["distinct_items"]) != total
+                            or int(leaf["duplicate_items"]) != 0
+                        ):
+                            raise CompletionError(
+                                f"leaf window {leaf['id']} has incomplete "
+                                "page/count closure"
+                            )
+                        if [int(page["page_no"]) for page in pages] != list(
+                            range(1, expected_pages + 1)
+                        ):
+                            raise CompletionError(
+                                f"leaf window {leaf['id']} page sequence "
+                                "is incomplete"
+                            )
+                        if any(
+                            int(page["total_count"]) != total for page in pages
+                        ):
+                            raise CompletionError(
+                                f"leaf window {leaf['id']} has unstable "
+                                "total_count"
+                            )
+                        stale_proof_rows = int(
+                            conn.execute(
+                                """
+                                SELECT
+                                  (SELECT COUNT(*)
+                                   FROM convergence_passes
+                                   WHERE window_id=?)
+                                + (SELECT COUNT(*)
+                                   FROM convergence_pass_pages
+                                   WHERE window_id=?)
+                                + (SELECT COUNT(*)
+                                   FROM convergence_pass_runs
+                                   WHERE window_id=?)
+                                + (SELECT COUNT(*)
+                                   FROM convergence_runs
+                                   WHERE window_id=?)
+                                """,
+                                (
+                                    window_id,
+                                    window_id,
+                                    window_id,
+                                    window_id,
+                                ),
+                            ).fetchone()[0]
                         )
-                    if any(int(page["total_count"]) != total for page in pages):
-                        raise CompletionError(
-                            f"leaf window {leaf['id']} has unstable total_count"
+                        if stale_proof_rows:
+                            raise CompletionError(
+                                f"ordinary leaf window {leaf['id']} retains "
+                                "convergence proof rows"
+                            )
+                    else:
+                        if leaf_end - leaf_start != 1:
+                            raise CompletionError(
+                                f"union leaf window {leaf['id']} is not one second"
+                            )
+                        if pages:
+                            raise CompletionError(
+                                f"union leaf window {leaf['id']} also has "
+                                "ordinary page rows"
+                            )
+                        passes = list(
+                            conn.execute(
+                                """
+                                SELECT * FROM convergence_passes
+                                WHERE window_id=? ORDER BY pass_no
+                                """,
+                                (window_id,),
+                            )
+                        )
+                        pass_numbers = [
+                            int(item["pass_no"]) for item in passes
+                        ]
+                        first_pass_no = int(union["first_pass_no"])
+                        last_pass_no = int(union["last_pass_no"])
+                        if (
+                            len(passes) != int(union["pass_count"])
+                            or not passes
+                            or pass_numbers
+                            != list(
+                                range(first_pass_no, last_pass_no + 1)
+                            )
+                        ):
+                            raise CompletionError(
+                                f"union leaf window {leaf['id']} has an "
+                                "invalid pass sequence"
+                            )
+                        observed_run_passes: dict[
+                            tuple[str, int, int], list[int]
+                        ] = {}
+                        observed_run_metadata: dict[
+                            tuple[str, int, int], str
+                        ] = {}
+                        for proof_pass in passes:
+                            pass_no = int(proof_pass["pass_no"])
+                            pass_raw = int(proof_pass["raw_item_count"])
+                            pass_distinct = int(
+                                proof_pass["distinct_item_count"]
+                            )
+                            if (
+                                int(proof_pass["total_count"]) != total
+                                or int(proof_pass["page_count"])
+                                != expected_pages
+                                or pass_raw != total
+                                or pass_distinct > total
+                                or int(proof_pass["duplicate_item_count"])
+                                != pass_raw - pass_distinct
+                                or int(
+                                    proof_pass["accumulated_distinct_count"]
+                                )
+                                > total
+                            ):
+                                raise CompletionError(
+                                    f"union leaf window {leaf['id']} has "
+                                    "invalid pass accounting"
+                                )
+                            proof_pages = list(
+                                conn.execute(
+                                    """
+                                    SELECT * FROM convergence_pass_pages
+                                    WHERE window_id=? AND pass_no=?
+                                    ORDER BY page_no
+                                    """,
+                                    (window_id, pass_no),
+                                )
+                            )
+                            if [
+                                int(page["page_no"])
+                                for page in proof_pages
+                            ] != list(range(1, expected_pages + 1)):
+                                raise CompletionError(
+                                    f"union leaf window {leaf['id']} pass "
+                                    f"{pass_no} page sequence is incomplete"
+                                )
+                            page_lines: list[str] = []
+                            for page in proof_pages:
+                                page_no = int(page["page_no"])
+                                item_count = int(page["item_count"])
+                                page_distinct = int(
+                                    page["distinct_item_count"]
+                                )
+                                expected_items = (
+                                    DEFAULT_PER_PAGE
+                                    if page_no < expected_pages
+                                    else total
+                                    - DEFAULT_PER_PAGE
+                                    * (expected_pages - 1)
+                                )
+                                if (
+                                    int(page["total_count"]) != total
+                                    or item_count != expected_items
+                                    or page_distinct > item_count
+                                    or int(page["duplicate_item_count"])
+                                    != item_count - page_distinct
+                                ):
+                                    raise CompletionError(
+                                        f"union leaf window {leaf['id']} "
+                                        f"pass {pass_no} page accounting "
+                                        "is invalid"
+                                    )
+                                page_lines.append(
+                                    f"{page_no}\t{page['total_count']}\t"
+                                    f"{item_count}\t{page_distinct}\t"
+                                    f"{page['duplicate_item_count']}\t"
+                                    f"{page['payload_sha256']}\t"
+                                    f"{page['run_keys_sha256']}"
+                                )
+                            if (
+                                sum(
+                                    int(page["item_count"])
+                                    for page in proof_pages
+                                )
+                                != pass_raw
+                                or _hash_lines(page_lines)
+                                != str(
+                                    proof_pass[
+                                        "page_payload_set_sha256"
+                                    ]
+                                )
+                            ):
+                                raise CompletionError(
+                                    f"union leaf window {leaf['id']} pass "
+                                    f"{pass_no} page proof digest mismatch"
+                                )
+                            pass_members = list(
+                                conn.execute(
+                                    """
+                                    SELECT repo_key,run_id,run_attempt,
+                                           metadata_sha256
+                                    FROM convergence_pass_runs
+                                    WHERE window_id=? AND pass_no=?
+                                    ORDER BY repo_key,run_id,run_attempt
+                                    """,
+                                    (window_id, pass_no),
+                                )
+                            )
+                            pass_member_digest = _hash_lines(
+                                f"{member['repo_key']}\t"
+                                f"{member['run_id']}\t"
+                                f"{member['run_attempt']}\t"
+                                f"{member['metadata_sha256']}"
+                                for member in pass_members
+                            )
+                            if (
+                                len(pass_members) != pass_distinct
+                                or pass_member_digest
+                                != str(proof_pass["run_keys_sha256"])
+                            ):
+                                raise CompletionError(
+                                    f"union leaf window {leaf['id']} pass "
+                                    f"{pass_no} run-set proof mismatch"
+                                )
+                            for member in pass_members:
+                                key = (
+                                    str(member["repo_key"]),
+                                    int(member["run_id"]),
+                                    int(member["run_attempt"]),
+                                )
+                                metadata_sha256 = str(
+                                    member["metadata_sha256"]
+                                )
+                                previous_metadata = (
+                                    observed_run_metadata.get(key)
+                                )
+                                if (
+                                    previous_metadata is not None
+                                    and previous_metadata
+                                    != metadata_sha256
+                                ):
+                                    raise CompletionError(
+                                        f"union leaf window {leaf['id']} "
+                                        f"run {key} changed metadata "
+                                        "across passes"
+                                    )
+                                observed_run_metadata[key] = (
+                                    metadata_sha256
+                                )
+                                observed_run_passes.setdefault(
+                                    key, []
+                                ).append(pass_no)
+                            reconstructed_minimum = min(
+                                (
+                                    len(observed)
+                                    for observed in (
+                                        observed_run_passes.values()
+                                    )
+                                ),
+                                default=0,
+                            )
+                            if (
+                                int(
+                                    proof_pass[
+                                        "accumulated_distinct_count"
+                                    ]
+                                )
+                                != len(observed_run_passes)
+                                or int(
+                                    proof_pass[
+                                        "min_observation_count"
+                                    ]
+                                )
+                                != reconstructed_minimum
+                            ):
+                                raise CompletionError(
+                                    f"union leaf window {leaf['id']} pass "
+                                    f"{pass_no} cumulative proof mismatch"
+                                )
+                        observed_pages = sum(
+                            int(item["page_count"]) for item in passes
+                        )
+                        observed_items = sum(
+                            int(item["raw_item_count"]) for item in passes
+                        )
+                        pass_set_sha256 = (
+                            self._convergence_pass_set_sha256(
+                                conn, window_id=window_id
+                            )
+                        )
+                        candidates = list(
+                            conn.execute(
+                                """
+                                SELECT * FROM convergence_runs
+                                WHERE window_id=?
+                                ORDER BY repo_key,run_id,run_attempt
+                                """,
+                                (window_id,),
+                            )
+                        )
+                        if len(candidates) != total:
+                            raise CompletionError(
+                                f"union leaf window {leaf['id']} candidate "
+                                "count differs from total_count"
+                            )
+                        candidate_digest = hashlib.sha256()
+                        candidate_keys: set[
+                            tuple[str, int, int]
+                        ] = set()
+                        for candidate in candidates:
+                            candidate_key = (
+                                str(candidate["repo_key"]),
+                                int(candidate["run_id"]),
+                                int(candidate["run_attempt"]),
+                            )
+                            candidate_keys.add(candidate_key)
+                            observed_passes = observed_run_passes.get(
+                                candidate_key, []
+                            )
+                            observation_count = int(
+                                candidate["observation_count"]
+                            )
+                            first_pass = int(candidate["first_pass"])
+                            last_pass = int(candidate["last_pass"])
+                            if (
+                                observation_count < 2
+                                or observation_count
+                                != len(observed_passes)
+                                or not observed_passes
+                                or first_pass != observed_passes[0]
+                                or last_pass != observed_passes[-1]
+                                or str(candidate["metadata_sha256"])
+                                != observed_run_metadata.get(candidate_key)
+                            ):
+                                raise CompletionError(
+                                    f"union leaf window {leaf['id']} candidate "
+                                    "observation proof is invalid"
+                                )
+                            metadata_blob = candidate["metadata_blob"]
+                            if not isinstance(metadata_blob, bytes):
+                                raise CompletionError(
+                                    f"union leaf window {leaf['id']} metadata "
+                                    "is not a BLOB"
+                                )
+                            try:
+                                metadata_bytes = zlib.decompress(metadata_blob)
+                            except zlib.error as exc:
+                                raise CompletionError(
+                                    f"union leaf window {leaf['id']} metadata "
+                                    f"is corrupt: {exc}"
+                                ) from exc
+                            metadata_sha256 = _sha256_bytes(metadata_bytes)
+                            if metadata_sha256 != str(
+                                candidate["metadata_sha256"]
+                            ):
+                                raise CompletionError(
+                                    f"union leaf window {leaf['id']} metadata "
+                                    "digest mismatch"
+                                )
+                            candidate_digest.update(
+                                (
+                                    f"{candidate['repo_key']}\t"
+                                    f"{candidate['run_id']}\t"
+                                    f"{candidate['run_attempt']}\t"
+                                    f"{metadata_sha256}\n"
+                                ).encode()
+                            )
+                        if candidate_keys != set(observed_run_passes):
+                            raise CompletionError(
+                                f"union leaf window {leaf['id']} pass "
+                                "membership and candidate sets disagree"
+                            )
+                        candidate_sha256 = candidate_digest.hexdigest()
+                        minimum_observations = min(
+                            (
+                                len(observations)
+                                for observations in (
+                                    observed_run_passes.values()
+                                )
+                            ),
+                            default=0,
+                        )
+                        if (
+                            int(union["total_count"]) != total
+                            or int(union["distinct_run_count"]) != total
+                            or int(union["min_observation_count"])
+                            != minimum_observations
+                            or minimum_observations < 2
+                            or int(union["observed_page_count"])
+                            != observed_pages
+                            or int(union["observed_item_count"])
+                            != observed_items
+                            or str(union["pass_set_sha256"])
+                            != pass_set_sha256
+                            or str(union["run_keys_sha256"])
+                            != candidate_sha256
+                            or int(leaf["expected_pages"]) != expected_pages
+                            or int(leaf["pages_done"]) != observed_pages
+                            or int(leaf["raw_items"]) != observed_items
+                            or int(leaf["distinct_items"]) != total
+                            or int(leaf["duplicate_items"])
+                            != observed_items - total
+                        ):
+                            raise CompletionError(
+                                f"union leaf window {leaf['id']} closure "
+                                "accounting is invalid"
+                            )
+                        union_closure_lines.append(
+                            f"U\t{repo_key}\t{leaf_start}\t{leaf_end}\t"
+                            f"{union['pass_count']}\t"
+                            f"{union['first_pass_no']}\t"
+                            f"{union['last_pass_no']}\t{observed_pages}\t"
+                            f"{observed_items}\t{total}\t"
+                            f"{minimum_observations}\t{pass_set_sha256}\t"
+                            f"{candidate_sha256}"
                         )
                     actual_leaf_digest = _hash_lines(
                         str(item["repo_key"])
@@ -2044,7 +3214,7 @@ class InventoryDB:
                             FROM window_runs WHERE window_id=?
                             ORDER BY repo_key,run_id,run_attempt
                             """,
-                            (int(leaf["id"]),),
+                            (window_id,),
                         )
                     )
                     if actual_leaf_digest != str(leaf["run_keys_sha256"]):
@@ -2190,6 +3360,7 @@ class InventoryDB:
                     """
                 )
             )
+            closure_lines.extend(sorted(union_closure_lines))
             closure_sha = _hash_lines(closure_lines)
             logical_document = {
                 "schema": SCHEMA_VERSION,
@@ -2202,6 +3373,9 @@ class InventoryDB:
                 "run_count": run_count,
                 "run_set_sha256": run_set_sha,
                 "window_closure_sha256": closure_sha,
+                "binding_upgrades_sha256": _sha256_json(
+                    binding_upgrades
+                ),
             }
             return {
                 "meta": meta,
@@ -2214,6 +3388,7 @@ class InventoryDB:
                 "request_count": int(
                     conn.execute("SELECT COUNT(*) FROM request_ledger").fetchone()[0]
                 ),
+                "binding_upgrades": binding_upgrades,
             }
         finally:
             conn.close()
@@ -2249,6 +3424,7 @@ class InventoryDB:
             "run_set_sha256": validated["run_set_sha256"],
             "window_closure_sha256": validated["window_closure_sha256"],
             "db_logical_sha256": validated["db_logical_sha256"],
+            "binding_upgrades": validated["binding_upgrades"],
         }
 
 
@@ -2293,6 +3469,8 @@ class GitHubActionsInventory:
         end: str | int,
         tokens: Sequence[str],
         resume: bool = False,
+        allow_script_upgrade_from_sha256: str | None = None,
+        script_upgrade_reason: str | None = None,
         progress_path: str | os.PathLike[str] | None = None,
         requester: Callable[
             [str, str, Mapping[str, str], float], HTTPResponse
@@ -2317,6 +3495,10 @@ class GitHubActionsInventory:
             end_epoch=self.end_epoch,
             script_sha256=self.script_sha256,
             resume=resume,
+            allow_script_upgrade_from_sha256=(
+                allow_script_upgrade_from_sha256
+            ),
+            script_upgrade_reason=script_upgrade_reason,
         )
         self.progress_path = (
             str(Path(progress_path).expanduser().resolve())
@@ -2395,41 +3577,29 @@ class GitHubActionsInventory:
                     )
                 )
             try:
-                total, digest = self.db.validate_convergence_pass(row, pages)
+                total = pages[0].total_count
                 if expected_total is not None and total != expected_total:
                     raise PaginationDrift(
                         f"one-second convergence total changed "
                         f"{expected_total} -> {total}",
                         observed_total=total,
                     )
-            except PaginationDrift as exc:
-                self.db.record_convergence_observation(
-                    conn,
-                    window_id=window_id,
-                    total=exc.observed_total,
-                    digest=None,
-                    error=str(exc)[:4000],
+                complete, _digest = self.db.accumulate_convergence_pass(
+                    conn, row, pages
                 )
+            except PaginationDrift as exc:
+                raise UnstableEnumerationError(
+                    f"window {window_id} convergence pass is malformed: {exc}"
+                ) from exc
+            if not complete:
+                self._write_progress()
                 continue
-            stable = self.db.record_convergence_observation(
-                conn,
-                window_id=window_id,
-                total=total,
-                digest=digest,
-                error=None,
-            )
-            if stable < 2:
-                continue
-            for page_no, page in enumerate(pages, start=1):
-                self.db.store_page(conn, row, page_no=page_no, page=page)
-            self.db.finish_convergence(
-                conn, window_id=window_id, digest=digest
-            )
             self._write_progress()
             return
         raise UnstableEnumerationError(
-            f"window {window_id} did not produce two consecutive identical, "
-            f"complete run sets in {CONVERGENCE_MAX_PASSES} passes"
+            f"window {window_id} did not accumulate total_count unique runs "
+            "with two stable metadata observations each in "
+            f"{CONVERGENCE_MAX_PASSES} passes"
         )
 
     def _process_repo(self, repo: Repo) -> None:
@@ -2620,6 +3790,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
+        "--allow-inventory-script-upgrade-from-sha256",
+        help=(
+            "explicitly authorize one v2 to v3 resume migration from this "
+            "exact previously bound producer SHA-256"
+        ),
+    )
+    parser.add_argument(
+        "--inventory-script-upgrade-reason",
+        help=(
+            "required printable audit reason for an explicitly authorized "
+            "inventory producer migration"
+        ),
+    )
+    parser.add_argument(
         "--progress",
         help="atomic progress JSON (default: <db>.progress.json)",
     )
@@ -2676,6 +3860,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             end=args.end,
             tokens=tokens,
             resume=args.resume,
+            allow_script_upgrade_from_sha256=(
+                args.allow_inventory_script_upgrade_from_sha256
+            ),
+            script_upgrade_reason=args.inventory_script_upgrade_reason,
             progress_path=progress_path,
             max_attempts=args.max_attempts,
             progress_interval_seconds=args.progress_interval,
