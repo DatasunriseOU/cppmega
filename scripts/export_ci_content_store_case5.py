@@ -4630,7 +4630,12 @@ def export_store(
                 split_name, bucket_size = key
                 table = rows_to_table(buffered)
                 if key not in parquet_writers:
-                    directory = temp_path / split_name / str(bucket_size)
+                    # Keep the immutable export directly consumable by the
+                    # production bundle builder.  The split remains encoded in
+                    # the collision-free filename, while the bucket-first
+                    # directory layout preserves the canonical
+                    # ``<kind>/<bucket>/*.parquet`` snapshot geometry.
+                    directory = temp_path / str(bucket_size)
                     directory.mkdir(parents=True, exist_ok=True)
                     shard_index = shard_counts[key]
                     path = directory / (
@@ -5010,8 +5015,14 @@ def export_store(
             artifact_records: list[dict[str, Any]] = []
             audits: list[dict[str, Any]] = []
             for path in sorted(parquet_paths):
-                split = path.parents[1].name
                 bucket = int(path.parent.name)
+                match = re.fullmatch(
+                    rf"ci-case5-(train|validation|test)-{bucket}-[0-9]{{6}}\.parquet",
+                    path.name,
+                )
+                if match is None:
+                    raise ExportError(f"generated CASE5 path is not canonical: {path}")
+                split = match.group(1)
                 parquet_rows = int(pq.ParquetFile(path).metadata.num_rows)
                 audit_result = _audit_file(
                     str(path), "ci", str(bucket), EXPECTED_VOCAB_SIZE
@@ -5195,6 +5206,7 @@ def export_store(
                 },
                 "case5_contract": {
                     "schema": CASE5_SCHEMA_VERSION,
+                    "parquet_layout": "bucket-first-split-in-filename-v1",
                     "domain_delimiter_contract_sha256": (
                         DOMAIN_DELIMITER_CONTRACT_SHA256
                     ),

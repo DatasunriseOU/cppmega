@@ -169,6 +169,162 @@ def _write_ci_generation(
     return manifest_path
 
 
+def _write_content_store_ci_export(
+    root: Path,
+    *,
+    buckets: tuple[int, ...] = (1024, 2048, 4096, 8192, 16384),
+) -> Path:
+    artifacts: list[dict[str, object]] = []
+    audits: list[dict[str, object]] = []
+    fragments = 0
+    capacity_tokens = 0
+    valid_tokens = 0
+    trained_tokens = 0
+    for bucket in buckets:
+        bucket_dir = root / str(bucket)
+        bucket_dir.mkdir(parents=True, exist_ok=True)
+        for shard, split in enumerate(("train", "validation")):
+            parquet = (
+                bucket_dir
+                / f"ci-case5-{split}-{bucket}-{shard:06d}.parquet"
+            )
+            parquet.write_bytes(f"ci-{bucket}-{split}".encode("ascii"))
+            row_valid_tokens = bucket - shard - 1
+            row_trained_tokens = row_valid_tokens - 1
+            relative = parquet.relative_to(root).as_posix()
+            artifacts.append(
+                {
+                    "path": relative,
+                    "kind": "case5_parquet",
+                    "split": split,
+                    "bucket": bucket,
+                    "rows": 1,
+                    "byte_size": parquet.stat().st_size,
+                    "sha256": hashlib.sha256(parquet.read_bytes()).hexdigest(),
+                }
+            )
+            audits.append(
+                {
+                    "path": relative,
+                    "rows": 1,
+                    "capacity_tokens": bucket,
+                    "valid_tokens": row_valid_tokens,
+                    "trained_tokens": row_trained_tokens,
+                    "bad_files": 0,
+                    "bad_rows": 0,
+                }
+            )
+            fragments += 1
+            capacity_tokens += bucket
+            valid_tokens += row_valid_tokens
+            trained_tokens += row_trained_tokens
+
+    for kind, filename in (
+        ("representative_ledger", "representative_ledger.jsonl"),
+        ("fragment_ledger", "fragment_ledger.jsonl"),
+        ("dropped_graph_edges", "dropped_graph_edges.jsonl"),
+        ("representative_metadata", "representative_metadata.jsonl"),
+        ("excluded_opaque_artifacts", "excluded_opaque_artifacts.jsonl"),
+        ("source_binding_projection", "source_binding_projection.jsonl"),
+    ):
+        ledger = root / filename
+        ledger.write_text("{}\n", encoding="utf-8")
+        artifacts.append(
+            {
+                "path": filename,
+                "kind": kind,
+                "rows": 1,
+                "byte_size": ledger.stat().st_size,
+                "sha256": hashlib.sha256(ledger.read_bytes()).hexdigest(),
+            }
+        )
+
+    payload_tokens = 20_000_000_123
+    exporter_path = (
+        builder.REPO_ROOT / "scripts/export_ci_content_store_case5.py"
+    )
+    manifest = {
+        "schema": builder.CI_CONTENT_STORE_EXPORT_SCHEMA,
+        "status": "complete",
+        "exporter_script_sha256": hashlib.sha256(
+            exporter_path.read_bytes()
+        ).hexdigest(),
+        "input_store": {
+            "schema": "cppmega_ci_content_store_v1",
+            "receipt_schema": "cppmega_ci_content_store_receipt_v1",
+            "receipt_sha256": "5" * 64,
+            "policy_sha256": "6" * 64,
+            "sqlite_schema_sha256": "7" * 64,
+            "logical_content_set_sha256": "8" * 64,
+            "logical_token_sequence_set_sha256": "9" * 64,
+            "occurrence_set_sha256": "a" * 64,
+            "sqlite_logical_sha256": "b" * 64,
+            "pack_hashes": [{"path": "pack-00000000.cicp", "sha256": "c" * 64}],
+            "verified_before_export": True,
+            "unchanged_after_export": True,
+        },
+        "input_fetch_state": {
+            "schema": "cppmega_ci_stream_fetch_v3",
+            "artifact": {"sha256": "1" * 64},
+            "sqlite_schema_sha256": "d" * 64,
+            "sqlite_logical_sha256": "2" * 64,
+            "sidecar_set_sha256": "3" * 64,
+            "settings": {
+                "fetcher_script_sha256": "e" * 64,
+                "parser_script_sha256": "f" * 64,
+                "content_store_script_sha256": "0" * 64,
+            },
+        },
+        "case5_contract": {
+            "buckets": list(buckets),
+            "overflow_rows": 0,
+            "parquet_shard_max_rows": 512,
+            "parquet_layout": "bucket-first-split-in-filename-v1",
+        },
+        "eligibility": {
+            "target_exact_unique_payload_tokens": 20_000_000_000,
+            "target_met": True,
+            "eligible": {
+                "unique_token_sequences": len(buckets),
+                "exact_unique_payload_tokens": payload_tokens,
+            },
+            "conservation": {
+                "exact_unique_payload_tokens": True,
+                "unique_token_sequences": True,
+            },
+        },
+        "representatives": {
+            "count": len(buckets),
+            "ledger_sha256": "4" * 64,
+        },
+        "counts": {
+            "representatives": len(buckets),
+            "fragments": fragments,
+            "payload_tokens": payload_tokens,
+            "valid_tokens": valid_tokens,
+            "trained_tokens": trained_tokens,
+            "capacity_tokens": capacity_tokens,
+        },
+        "graph_accounting": {
+            "cross_chunk_outbound_edges_dropped": 2,
+            "cross_fragment_edges_dropped": 3,
+        },
+        "artifacts": artifacts,
+        "validation": {
+            "all_passed": True,
+            "fixed_widths": True,
+            "zero_overflow": True,
+            "payload_conserved": True,
+            "payload_identity_and_order_verified": True,
+            "post_normalize_pack_sidecars_and_edges_verified": True,
+            "case5_audit": audits,
+        },
+    }
+    manifest_path = root / "export_receipt.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return manifest_path
+
+
 def test_ci_manifest_allowlist_binds_five_buckets_and_lossless_counters(
     tmp_path: Path,
 ) -> None:
@@ -189,6 +345,105 @@ def test_ci_manifest_allowlist_binds_five_buckets_and_lossless_counters(
     assert metadata["valid_tokens"] == sum(builder.DEFAULT_BUCKETS)
     assert metadata["cross_boundary_chunk_edges"] == 2
     assert metadata["cross_boundary_token_edges"] == 3
+
+
+def test_content_store_export_allowlist_binds_all_split_shards(
+    tmp_path: Path,
+) -> None:
+    ci_root = tmp_path / "ci"
+    manifest_path = _write_content_store_ci_export(ci_root)
+
+    allowed, metadata = _load_ci_manifest_allowlist(
+        manifest_path,
+        ci_root,
+        builder.DEFAULT_BUCKETS,
+        cppmega_mlx_commit="unused-for-content-store-export",
+        cppmega_mlx_tree_sha256="unused-for-content-store-export",
+    )
+
+    assert {
+        key: len(value) for key, value in allowed.items()
+    } == {
+        ("ci", bucket): 2 for bucket in builder.DEFAULT_BUCKETS
+    }
+    assert metadata["schema"] == builder.CI_CONTENT_STORE_EXPORT_SCHEMA
+    assert metadata["valid_tokens"] == sum(
+        2 * bucket - 3 for bucket in builder.DEFAULT_BUCKETS
+    )
+    assert metadata["cross_boundary_chunk_edges"] == 2
+    assert metadata["cross_boundary_token_edges"] == 3
+
+
+def test_content_store_export_allowlist_rejects_drift_and_orphans(
+    tmp_path: Path,
+) -> None:
+    ci_root = tmp_path / "ci"
+    manifest_path = _write_content_store_ci_export(ci_root)
+    first = (
+        ci_root
+        / "1024"
+        / "ci-case5-train-1024-000000.parquet"
+    )
+    first.write_bytes(b"drifted")
+
+    with pytest.raises(RuntimeError, match="artifact binding drifted"):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit="unused",
+            cppmega_mlx_tree_sha256="unused",
+        )
+
+    manifest_path = _write_content_store_ci_export(ci_root)
+    (ci_root / "1024" / "orphan.parquet").write_bytes(b"orphan")
+    with pytest.raises(RuntimeError, match="inventory differs"):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit="unused",
+            cppmega_mlx_tree_sha256="unused",
+        )
+
+
+def test_content_store_export_rejects_symlinked_bucket_parent(
+    tmp_path: Path,
+) -> None:
+    ci_root = tmp_path / "ci"
+    manifest_path = _write_content_store_ci_export(ci_root)
+    outside_bucket = tmp_path / "outside-1024"
+    (ci_root / "1024").rename(outside_bucket)
+    (ci_root / "1024").symlink_to(outside_bucket, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="contains a symlink"):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit="unused",
+            cppmega_mlx_tree_sha256="unused",
+        )
+
+
+def test_content_store_export_rejects_unlisted_symlink_directory(
+    tmp_path: Path,
+) -> None:
+    ci_root = tmp_path / "ci"
+    manifest_path = _write_content_store_ci_export(ci_root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "not-in-export.parquet").write_bytes(b"outside")
+    (ci_root / "escape").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="contains a symlink"):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit="unused",
+            cppmega_mlx_tree_sha256="unused",
+        )
 
 
 def test_ci_manifest_allowlist_rejects_hash_drift_rejects_and_orphans(
