@@ -15,6 +15,7 @@ from scripts.ci_content_store import (
     CIContentStore,
     ContentMetadataConflictError,
     HashCollisionError,
+    _ORPHAN_TOKEN_SEQUENCE_QUERY,
     OccurrenceConflictError,
     ThresholdNotMetError,
     TOKEN_SEQUENCE_ENCODING,
@@ -580,6 +581,59 @@ def test_threshold_refusal_pass_and_receipt_are_deterministic_across_reopen(
     assert len(first["sqlite_logical_sha256"]) == 64
     assert first["pack_hashes"]
     assert "database_file_sha256" not in first
+
+
+def test_orphan_token_sequence_check_is_set_based_and_fail_closed(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "store"
+    with CIContentStore(root) as store:
+        store.add_chunk(
+            "referenced",
+            {"entry": "one"},
+            _key(0),
+            token_count=2,
+            tokenizer_fingerprint="tokenizer-v1",
+            token_sequence_sha256=_sequence(1, 2),
+        )
+        plan = [
+            str(row[3])
+            for row in store._connection.execute(
+                f"EXPLAIN QUERY PLAN {_ORPHAN_TOKEN_SEQUENCE_QUERY}"
+            )
+        ]
+
+    assert any("EXCEPT" in step for step in plan)
+    assert all("CORRELATED" not in step for step in plan)
+    assert sum("SCAN token_sequences" in step for step in plan) == 1
+    assert sum("SCAN contents" in step for step in plan) == 1
+
+    with sqlite3.connect(root / "index.sqlite3") as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(
+            """
+            INSERT INTO token_sequences(
+                token_sequence_sha256,token_count,tokenizer_fingerprint
+            ) VALUES (?,?,?)
+            """,
+            (_sequence(90, 91, 92), 3, "tokenizer-v1"),
+        )
+        connection.execute(
+            """
+            UPDATE stats
+            SET unique_token_sequence_count=unique_token_sequence_count+1,
+                exact_unique_payload_tokens=exact_unique_payload_tokens+3
+            WHERE singleton=1
+            """
+        )
+        connection.commit()
+
+    with CIContentStore(root) as store:
+        with pytest.raises(
+            VerificationError,
+            match="unreferenced token sequence",
+        ):
+            store.verify()
 
 
 def test_cli_status_verify_and_receipt(tmp_path: Path) -> None:
