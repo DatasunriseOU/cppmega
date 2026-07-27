@@ -75,7 +75,9 @@ def _verified_pr_inputs(
                         "status": "done",
                         "cursor": None,
                         "prs": count,
+                        "initial_total_count": count,
                         "total_count": count,
+                        "source_growth_count": 0,
                         "truncated": 0,
                     }
                     for repo, count in sorted(repo_counts.items())

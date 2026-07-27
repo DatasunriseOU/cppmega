@@ -23,9 +23,10 @@ Token rotation (REUSED from github_graphql_fallback.TokenPool): round-robin over
 the 6 tokens (the 5 PATs in ``secrets/gh_tokens.txt`` PLUS the ``gh auth token``
 of the logged-in CLI account). On a token's primary limit
 (X-RateLimit-Remaining==0), secondary/abuse limit, or 429 we cool that token and
-rotate to the next; when EVERY token is cooling we FAIL LOUD (RULE #1) after
-recording the (repo, cursor) so a later run resumes mid-repo — we never silently
-skip a repo on token exhaustion.
+rotate to the next. By default, when EVERY token is cooling we FAIL LOUD
+(RULE #1) after recording the (repo, cursor). A single-worker production stream
+may instead pass ``--wait-for-rate-limit`` to sleep until the earliest reset and
+resume from that exact cursor without an external restart loop.
 
 Checkpointing / resume (RULE #1: a crash must not lose progress, and must not
 silently drop a repo):
@@ -63,6 +64,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime as _dt
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -131,8 +133,8 @@ query($owner:String!, $name:String!, $cursor:String) {
   }
 }
 """
-GRAPHQL_MANIFEST_SCHEMA = "cppmega_graphql_pr_stream_manifest_v4"
-GRAPHQL_STREAM_SEMANTICS_VERSION = 4
+GRAPHQL_MANIFEST_SCHEMA = "cppmega_graphql_pr_stream_manifest_v5"
+GRAPHQL_STREAM_SEMANTICS_VERSION = 5
 GRAPHQL_QUERY_CONTRACT_SHA256 = hashlib.sha256(
     (
         REPO_PR_QUERY
@@ -396,6 +398,34 @@ class AllTokensExhausted(Exception):
         self.soonest_s = soonest_s
 
 
+def run_with_optional_rate_limit_wait(
+    run_once: Callable[[], dict],
+    *,
+    wait: bool,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    on_wait: Callable[[AllTokensExhausted, int], None] | None = None,
+) -> dict:
+    """Run one resumable repo stream, optionally waiting for token reset.
+
+    ``stream_repo`` checkpoints only after committing a complete GraphQL page.
+    Retrying ``run_once`` therefore reopens the store and resumes from the
+    manifest cursor.  Only the explicit all-token-cooling condition is retried;
+    authentication, source-contract, SQLite, and all other failures remain
+    terminal.
+    """
+
+    while True:
+        try:
+            return run_once()
+        except AllTokensExhausted as exc:
+            if not wait:
+                raise
+            seconds = max(1, math.ceil(max(0.0, exc.soonest_s)) + 1)
+            if on_wait is not None:
+                on_wait(exc, seconds)
+            sleep_fn(float(seconds))
+
+
 class RepoRateLimited(Exception):
     """Soft signal: this page kept rate-limiting; caller may route to fallback."""
 
@@ -615,6 +645,7 @@ def stream_repo(
         raise SystemExit(f"[graphql-stream] repo must be 'owner/name', got {repo!r}")
     owner, name = repo.split("/", 1)
 
+    prior_record = manifest.get(repo)
     prior_status = manifest.status(repo)
     cursor = manifest.cursor(repo)  # None on a fresh repo, else resume point
     scan_id = manifest.scan_id
@@ -628,9 +659,31 @@ def stream_repo(
             (repo, scan_id),
         )
         conn.commit()
+        reset_repo_truncated_targets(
+            truncated_targets_path,
+            truncated_target_keys,
+            repo,
+            append_lock=append_lock,
+        )
     manifest.update(repo, status="in_progress")
     stats = {"repo": repo, "prs": 0, "truncated": 0, "pages": 0, "ratelimit_trips": 0}
-    total_count = None
+    initial_total_count: int | None = None
+    total_count: int | None = None
+    if cursor is not None:
+        initial_total_count = prior_record.get("initial_total_count")
+        total_count = prior_record.get("total_count")
+        if (
+            not isinstance(initial_total_count, int)
+            or isinstance(initial_total_count, bool)
+            or initial_total_count < 0
+            or not isinstance(total_count, int)
+            or isinstance(total_count, bool)
+            or total_count < initial_total_count
+        ):
+            raise SystemExit(
+                f"[graphql-stream] {repo}: resumable v5 manifest lacks a valid "
+                "initial/latest totalCount contract"
+            )
 
     while True:
         if stop_event is not None and stop_event.is_set():
@@ -683,6 +736,7 @@ def stream_repo(
             )
         if total_count is None:
             total_count = page_total_count
+            initial_total_count = page_total_count
             # Fallback heuristic on size: a huge repo is routed to GH Archive at
             # the very first page, BEFORE we burn quota paging it here.
             if (
@@ -695,24 +749,39 @@ def stream_repo(
                     append_lock=append_lock,
                 )
                 return stats
-        elif page_total_count != total_count:
+        elif page_total_count < total_count:
             manifest.update(
                 repo,
                 status="in_progress",
                 cursor=None,
+                initial_total_count=initial_total_count,
+                total_count=page_total_count,
+                source_growth_count=0,
                 note=(
-                    "pull request membership changed during scan: "
-                    f"first_total_count={total_count} "
+                    "pull request membership shrank during scan: "
+                    f"previous_total_count={total_count} "
                     f"page_total_count={page_total_count}; "
                     "next resume restarts this repo from the first page"
                 ),
             )
             raise SystemExit(
-                f"[graphql-stream] {repo}: pull request membership changed "
-                f"during scan: first_total_count={total_count} "
+                f"[graphql-stream] {repo}: pull request membership shrank "
+                f"during scan: previous_total_count={total_count} "
                 f"page_total_count={page_total_count}; progress remains "
                 "fail-closed and the next resume will rescan this repo"
             )
+        elif page_total_count > total_count:
+            previous_total_count = total_count
+            total_count = page_total_count
+            sys.stderr.write(
+                f"[graphql-stream] {repo}: observed append-only PR growth "
+                f"{previous_total_count}->{total_count}; continuing toward the "
+                "new terminal count\n"
+            )
+            sys.stderr.flush()
+
+        assert initial_total_count is not None
+        assert total_count is not None
 
         nodes = prconn.get("nodes")
         page_info = prconn.get("pageInfo")
@@ -811,7 +880,9 @@ def stream_repo(
                 1 for target_repo, _number in (truncated_target_keys or ())
                 if target_repo == repo
             ),
+            initial_total_count=initial_total_count,
             total_count=total_count,
+            source_growth_count=total_count - initial_total_count,
             **(
                 {
                     "note": (
@@ -844,7 +915,9 @@ def stream_repo(
                     1 for target_repo, _number in (truncated_target_keys or ())
                     if target_repo == repo
                 ),
+                initial_total_count=initial_total_count,
                 total_count=total_count,
+                source_growth_count=total_count - initial_total_count,
                 note=(
                     f"stopped after complete page at --max-prs={max_prs}; "
                     f"processed_this_run={stats['prs']}"
@@ -887,6 +960,45 @@ def _append_jsonl(path: str, obj: dict, *, lock: threading.Lock | None = None) -
         return
     with open(path, "a") as f:
         f.write(json.dumps(obj) + "\n")
+
+
+def reset_repo_truncated_targets(
+    path: str | None,
+    targets: set[tuple[str, int]] | None,
+    repo: str,
+    *,
+    append_lock: threading.Lock | None = None,
+) -> int:
+    """Remove stale gap targets when one repo's exact membership is restarted."""
+
+    if path is None or targets is None:
+        return 0
+
+    def rewrite() -> int:
+        removed = {target for target in targets if target[0] == repo}
+        if not removed:
+            return 0
+        targets.difference_update(removed)
+        destination = os.path.abspath(path)
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        temporary = destination + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            for target_repo, number in sorted(targets):
+                handle.write(
+                    json.dumps(
+                        {"repo": target_repo, "pr_number": number},
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+        os.replace(temporary, destination)
+        return len(removed)
+
+    if append_lock is None:
+        return rewrite()
+    with append_lock:
+        return rewrite()
 
 
 def load_truncated_target_keys(path: str) -> set[tuple[str, int]]:
@@ -1299,6 +1411,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="Number of repos to stream concurrently. Each worker "
                          "gets its own SQLite connection; ALL workers share ONE "
                          "token pool so per-PAT rate limits are accounted once.")
+    ap.add_argument(
+        "--wait-for-rate-limit",
+        action="store_true",
+        help=(
+            "With --workers=1, wait for the earliest shared-token reset and "
+            "resume the exact saved cursor. Other failures still terminate."
+        ),
+    )
     args = ap.parse_args(argv)
 
     tokens = load_all_tokens(args.tokens, include_gh_cli=args.include_gh_cli)
@@ -1403,10 +1523,32 @@ def main(argv: list[str] | None = None) -> int:
     workers = max(1, int(args.workers or 1))
     if args.repo:
         workers = 1
+    if args.wait_for_rate_limit and workers != 1:
+        raise SystemExit(
+            "[graphql-stream] --wait-for-rate-limit requires --workers=1 so a "
+            "single resumed repo owns the saved cursor"
+        )
     if workers == 1:
         for i, repo in enumerate(runnable):
             try:
-                record_stats(repo, run_one(repo, i))
+                def report_wait(
+                    exc: AllTokensExhausted,
+                    seconds: int,
+                ) -> None:
+                    sys.stderr.write(
+                        f"[graphql-stream] ALL {len(tokens)} tokens cooling while "
+                        f"streaming {repo}; cursor={manifest.cursor(repo)!r}; "
+                        f"waiting {seconds}s (earliest reset "
+                        f"~{exc.soonest_s:.0f}s) before exact resume\n"
+                    )
+                    sys.stderr.flush()
+
+                stats = run_with_optional_rate_limit_wait(
+                    lambda: run_one(repo, i),
+                    wait=args.wait_for_rate_limit,
+                    on_wait=report_wait,
+                )
+                record_stats(repo, stats)
             except AllTokensExhausted as e:
                 cur = manifest.cursor(repo)
                 raise SystemExit(
