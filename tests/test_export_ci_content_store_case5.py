@@ -35,6 +35,9 @@ from scripts.ci_stream_fetch import (
     _STATE_SCHEMA as FETCH_STATE_SQL_SCHEMA,
     ExactTokenizer,
 )
+from scripts.data.build_macro_routes_megatron_bundle import (
+    _load_ci_manifest_allowlist,
+)
 from scripts.export_ci_content_store_case5 import (
     BUCKETS,
     EXPORT_SCHEMA,
@@ -781,6 +784,10 @@ def test_tiny_end_to_end_selects_stable_token_sequence_representative(
     assert receipt["representatives"]["count"] == 1
     assert receipt["counts"]["payload_tokens"] == len(token_rows[0])
     assert receipt["case5_contract"]["overflow_rows"] == 0
+    assert (
+        receipt["case5_contract"]["parquet_layout"]
+        == "bucket-first-split-in-filename-v1"
+    )
     ledger = [
         json.loads(line)
         for line in (output / receipt["representatives"]["ledger_artifact"])
@@ -817,8 +824,29 @@ def test_tiny_end_to_end_selects_stable_token_sequence_representative(
     ]
     assert len(parquet_artifacts) == 1
     artifact = parquet_artifacts[0]
+    assert Path(str(artifact["path"])).parts == (
+        str(artifact["bucket"]),
+        (
+            f"ci-case5-{artifact['split']}-{artifact['bucket']}-"
+            "000000.parquet"
+        ),
+    )
     row = pq.read_table(output / artifact["path"]).to_pylist()[0]
     _assert_balanced_case5_row(row, bucket=int(artifact["bucket"]))
+    allowed, normalized = _load_ci_manifest_allowlist(
+        output / "export_receipt.json",
+        output,
+        (int(artifact["bucket"]),),
+        cppmega_mlx_commit="unused-for-content-store-export",
+        cppmega_mlx_tree_sha256="unused-for-content-store-export",
+    )
+    assert allowed == {
+        ("ci", int(artifact["bucket"])): {
+            Path(str(artifact["path"])).name: int(artifact["rows"])
+        }
+    }
+    assert normalized["schema"] == EXPORT_SCHEMA
+    assert len(normalized["provenance_artifacts"]) == 6
 
 
 def test_nested_zip_binary_garbage_is_conserved_but_not_trained(

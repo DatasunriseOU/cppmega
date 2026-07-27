@@ -59,6 +59,7 @@ BUILD_PLAN_SCHEMA = "cppmega_macro_routes_build_plan_v1"
 CI_MANIFEST_SCHEMA = "cppmega_ci_fixed_buckets_manifest_v3"
 CI_BUCKET_MANIFEST_SCHEMA = "cppmega_ci_fixed_bucket_v2"
 CI_LOG_COMPLETION_SCHEMA = "cppmega_ci_log_extraction_v1"
+CI_CONTENT_STORE_EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v2"
 BUNDLE_KNOWN_LIMITATIONS = (
     "the source snapshot is the manifest-complete subset; failed or live "
     "conveyor units are excluded",
@@ -356,6 +357,465 @@ def _load_manifest_allowlist(
     return allowed, metadata
 
 
+def _load_content_store_ci_export_allowlist(
+    *,
+    manifest_path: Path,
+    manifest_bytes: bytes,
+    manifest: dict[str, object],
+    ci_root: Path,
+    buckets: tuple[int, ...],
+) -> tuple[dict[tuple[str, int], dict[str, int]], dict[str, object]]:
+    """Validate the receipt-bound multi-shard CI CASE5 export."""
+
+    expected_manifest_path = ci_root / "export_receipt.json"
+    if manifest_path != expected_manifest_path:
+        raise RuntimeError(
+            "content-store CI manifest must be the export-root receipt: "
+            f"{expected_manifest_path}"
+        )
+    if manifest.get("status") != "complete":
+        raise RuntimeError(f"{manifest_path}: CI content-store export is incomplete")
+
+    exporter_sha256 = manifest.get("exporter_script_sha256")
+    exporter_path = REPO_ROOT / "scripts/export_ci_content_store_case5.py"
+    if (
+        not isinstance(exporter_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", exporter_sha256)
+        or exporter_sha256 != _sha256(exporter_path)
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: CI exporter is not bound to the reviewed source"
+        )
+
+    validation = manifest.get("validation")
+    required_validation = (
+        "all_passed",
+        "fixed_widths",
+        "zero_overflow",
+        "payload_conserved",
+        "payload_identity_and_order_verified",
+        "post_normalize_pack_sidecars_and_edges_verified",
+    )
+    if not isinstance(validation, dict) or any(
+        validation.get(name) is not True for name in required_validation
+    ):
+        raise RuntimeError(f"{manifest_path}: CI export validation is not green")
+
+    case5 = manifest.get("case5_contract")
+    if (
+        not isinstance(case5, dict)
+        or case5.get("buckets") != list(DEFAULT_BUCKETS)
+        or not buckets
+        or len(set(buckets)) != len(buckets)
+        or any(bucket not in DEFAULT_BUCKETS for bucket in buckets)
+        or case5.get("overflow_rows") != 0
+        or case5.get("parquet_shard_max_rows") != 512
+        or case5.get("parquet_layout")
+        != "bucket-first-split-in-filename-v1"
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: unsupported CI export CASE5 bucket contract"
+        )
+
+    input_store = manifest.get("input_store")
+    input_fetch_state = manifest.get("input_fetch_state")
+    fetch_artifact = (
+        input_fetch_state.get("artifact")
+        if isinstance(input_fetch_state, dict)
+        else None
+    )
+    if (
+        not isinstance(input_store, dict)
+        or input_store.get("schema") != "cppmega_ci_content_store_v1"
+        or input_store.get("receipt_schema")
+        != "cppmega_ci_content_store_receipt_v1"
+        or input_store.get("verified_before_export") is not True
+        or input_store.get("unchanged_after_export") is not True
+        or not isinstance(input_fetch_state, dict)
+        or not isinstance(fetch_artifact, dict)
+        or not isinstance(fetch_artifact.get("sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", str(fetch_artifact["sha256"]))
+        or not isinstance(input_fetch_state.get("sqlite_logical_sha256"), str)
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", str(input_fetch_state["sqlite_logical_sha256"])
+        )
+        or not isinstance(input_fetch_state.get("sidecar_set_sha256"), str)
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", str(input_fetch_state["sidecar_set_sha256"])
+        )
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: CI export input store/fetch binding is incomplete"
+        )
+    store_hash_fields = (
+        "receipt_sha256",
+        "policy_sha256",
+        "sqlite_schema_sha256",
+        "logical_content_set_sha256",
+        "logical_token_sequence_set_sha256",
+        "occurrence_set_sha256",
+        "sqlite_logical_sha256",
+    )
+    fetch_settings = input_fetch_state.get("settings")
+    if (
+        any(
+            not isinstance(input_store.get(name), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", str(input_store[name]))
+            for name in store_hash_fields
+        )
+        or not isinstance(input_store.get("pack_hashes"), list)
+        or not input_store["pack_hashes"]
+        or input_fetch_state.get("schema") != "cppmega_ci_stream_fetch_v3"
+        or not isinstance(input_fetch_state.get("sqlite_schema_sha256"), str)
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", str(input_fetch_state["sqlite_schema_sha256"])
+        )
+        or not isinstance(fetch_settings, dict)
+        or any(
+            not isinstance(fetch_settings.get(name), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", str(fetch_settings[name]))
+            for name in (
+                "fetcher_script_sha256",
+                "parser_script_sha256",
+                "content_store_script_sha256",
+            )
+        )
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: CI export immutable producer binding is incomplete"
+        )
+
+    eligibility = manifest.get("eligibility")
+    conservation = (
+        eligibility.get("conservation")
+        if isinstance(eligibility, dict)
+        else None
+    )
+    eligible = (
+        eligibility.get("eligible") if isinstance(eligibility, dict) else None
+    )
+    if (
+        not isinstance(eligibility, dict)
+        or eligibility.get("target_met") is not True
+        or not isinstance(conservation, dict)
+        or conservation.get("exact_unique_payload_tokens") is not True
+        or conservation.get("unique_token_sequences") is not True
+        or not isinstance(eligible, dict)
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: CI export eligibility/conservation is not green"
+        )
+
+    counts = manifest.get("counts")
+    representatives = manifest.get("representatives")
+    graph = manifest.get("graph_accounting")
+    if (
+        not isinstance(counts, dict)
+        or not isinstance(representatives, dict)
+        or not isinstance(graph, dict)
+    ):
+        raise RuntimeError(f"{manifest_path}: CI export accounting is incomplete")
+
+    def positive_int(value: object, *, where: str) -> int:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise RuntimeError(f"{manifest_path}: invalid {where}={value!r}")
+        return value
+
+    def nonnegative_int(value: object, *, where: str) -> int:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise RuntimeError(f"{manifest_path}: invalid {where}={value!r}")
+        return value
+
+    fragment_count = positive_int(counts.get("fragments"), where="fragment count")
+    valid_tokens = positive_int(counts.get("valid_tokens"), where="valid token count")
+    trained_tokens = positive_int(
+        counts.get("trained_tokens"), where="trained token count"
+    )
+    capacity_tokens = positive_int(
+        counts.get("capacity_tokens"), where="capacity token count"
+    )
+    payload_tokens = positive_int(
+        counts.get("payload_tokens"), where="payload token count"
+    )
+    representative_count = positive_int(
+        representatives.get("count"), where="representative count"
+    )
+    eligible_tokens = positive_int(
+        eligible.get("exact_unique_payload_tokens"),
+        where="eligible exact unique payload tokens",
+    )
+    target_tokens = nonnegative_int(
+        eligibility.get("target_exact_unique_payload_tokens"),
+        where="target exact unique payload tokens",
+    )
+    eligible_sequences = positive_int(
+        eligible.get("unique_token_sequences"),
+        where="eligible unique token sequences",
+    )
+    cross_chunk_edges = nonnegative_int(
+        graph.get("cross_chunk_outbound_edges_dropped"),
+        where="cross-chunk outbound edges dropped",
+    )
+    cross_fragment_edges = nonnegative_int(
+        graph.get("cross_fragment_edges_dropped"),
+        where="cross-fragment edges dropped",
+    )
+    if (
+        payload_tokens != eligible_tokens
+        or counts.get("representatives") != representative_count
+        or eligible_sequences != representative_count
+        or eligible_tokens < target_tokens
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: CI export representative/token conservation drifted"
+        )
+
+    raw_artifacts = manifest.get("artifacts")
+    raw_audits = validation.get("case5_audit")
+    if not isinstance(raw_artifacts, list) or not isinstance(raw_audits, list):
+        raise RuntimeError(f"{manifest_path}: CI export artifact audit is missing")
+    audits: dict[str, dict[str, object]] = {}
+    for raw_audit in raw_audits:
+        if not isinstance(raw_audit, dict) or not isinstance(
+            raw_audit.get("path"), str
+        ):
+            raise RuntimeError(f"{manifest_path}: malformed CI export audit record")
+        audit_path = str(raw_audit["path"])
+        if audit_path in audits:
+            raise RuntimeError(f"{manifest_path}: duplicate CI audit path {audit_path}")
+        audits[audit_path] = raw_audit
+
+    allowed: dict[tuple[str, int], dict[str, int]] = {
+        ("ci", bucket): {} for bucket in buckets
+    }
+    expected_artifact_paths: set[Path] = set()
+    expected_relative_parquets: set[Path] = set()
+    provenance_artifacts: list[dict[str, object]] = []
+    expected_ledger_names = {
+        "representative_ledger": "representative_ledger.jsonl",
+        "fragment_ledger": "fragment_ledger.jsonl",
+        "dropped_graph_edges": "dropped_graph_edges.jsonl",
+        "representative_metadata": "representative_metadata.jsonl",
+        "excluded_opaque_artifacts": "excluded_opaque_artifacts.jsonl",
+        "source_binding_projection": "source_binding_projection.jsonl",
+    }
+    observed_ledger_kinds: set[str] = set()
+    observed_rows = 0
+    observed_capacity_tokens = 0
+    observed_valid_tokens = 0
+    observed_trained_tokens = 0
+    canonical_name = re.compile(
+        r"ci-case5-(train|validation|test)-([0-9]+)-([0-9]{6})\.parquet"
+    )
+    for raw_artifact in raw_artifacts:
+        if not isinstance(raw_artifact, dict):
+            raise RuntimeError(f"{manifest_path}: malformed CI export artifact")
+        raw_relative = raw_artifact.get("path")
+        if not isinstance(raw_relative, str):
+            raise RuntimeError(f"{manifest_path}: CI artifact path is missing")
+        relative = Path(raw_relative)
+        byte_size = raw_artifact.get("byte_size")
+        row_count = raw_artifact.get("rows")
+        sha256 = raw_artifact.get("sha256")
+        artifact_path = ci_root / relative
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or ".." in relative.parts
+            or relative in expected_artifact_paths
+            or not isinstance(byte_size, int)
+            or isinstance(byte_size, bool)
+            or byte_size < 0
+            or not isinstance(row_count, int)
+            or isinstance(row_count, bool)
+            or row_count < 0
+            or not isinstance(sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", sha256)
+            or artifact_path.is_symlink()
+            or not artifact_path.is_file()
+            or artifact_path.stat().st_size != byte_size
+            or _sha256(artifact_path) != sha256
+        ):
+            raise RuntimeError(
+                f"{manifest_path}: CI export artifact binding drifted: {relative}"
+            )
+        expected_artifact_paths.add(relative)
+
+        kind = raw_artifact.get("kind")
+        if kind != "case5_parquet":
+            expected_name = (
+                expected_ledger_names.get(kind)
+                if isinstance(kind, str)
+                else None
+            )
+            if (
+                expected_name is None
+                or len(relative.parts) != 1
+                or relative.name != expected_name
+                or kind in observed_ledger_kinds
+            ):
+                raise RuntimeError(
+                    f"{manifest_path}: unsupported CI export artifact: {relative}"
+                )
+            observed_ledger_kinds.add(kind)
+            provenance_artifacts.append(
+                {
+                    "path": relative.as_posix(),
+                    "kind": kind,
+                    "rows": row_count,
+                    "byte_size": byte_size,
+                    "sha256": sha256,
+                }
+            )
+            continue
+
+        name_match = canonical_name.fullmatch(relative.name)
+        if (
+            len(relative.parts) != 2
+            or name_match is None
+        ):
+            raise RuntimeError(
+                f"{manifest_path}: CI parquet path is not canonical: {relative}"
+            )
+        bucket = int(name_match.group(2))
+        split = name_match.group(1)
+        if (
+            bucket not in buckets
+            or relative.parts[0] != str(bucket)
+            or raw_artifact.get("bucket") != bucket
+            or raw_artifact.get("split") != split
+        ):
+            raise RuntimeError(
+                f"{manifest_path}: CI parquet split/bucket binding drifted: {relative}"
+            )
+        rows = positive_int(raw_artifact.get("rows"), where=f"{relative} rows")
+        if (
+            relative in expected_relative_parquets
+            or relative.name in allowed[("ci", bucket)]
+        ):
+            raise RuntimeError(
+                f"{manifest_path}: CI parquet artifact binding drifted: {relative}"
+            )
+        audit = audits.get(relative.as_posix())
+        if (
+            not isinstance(audit, dict)
+            or audit.get("rows") != rows
+            or audit.get("capacity_tokens") != rows * bucket
+            or audit.get("bad_files") != 0
+            or audit.get("bad_rows") != 0
+            or not isinstance(audit.get("valid_tokens"), int)
+            or isinstance(audit.get("valid_tokens"), bool)
+            or int(audit["valid_tokens"]) < 1
+            or not isinstance(audit.get("trained_tokens"), int)
+            or isinstance(audit.get("trained_tokens"), bool)
+            or int(audit["trained_tokens"]) < 1
+        ):
+            raise RuntimeError(
+                f"{manifest_path}: CI parquet audit binding drifted: {relative}"
+            )
+        expected_relative_parquets.add(relative)
+        allowed[("ci", bucket)][relative.name] = rows
+        observed_rows += rows
+        observed_capacity_tokens += rows * bucket
+        observed_valid_tokens += int(audit["valid_tokens"])
+        observed_trained_tokens += int(audit["trained_tokens"])
+
+    if observed_ledger_kinds != set(expected_ledger_names):
+        raise RuntimeError(
+            f"{manifest_path}: CI export ledger inventory is incomplete"
+        )
+    if any(not files for files in allowed.values()):
+        missing = [
+            bucket for bucket in buckets if not allowed[("ci", bucket)]
+        ]
+        raise RuntimeError(
+            f"{manifest_path}: CI export has no Parquet shards for buckets {missing}"
+        )
+    actual_relative_parquets = {
+        path.relative_to(ci_root)
+        for path in ci_root.rglob("*.parquet")
+        if path.is_file()
+    }
+    if actual_relative_parquets != expected_relative_parquets:
+        raise RuntimeError(
+            f"{manifest_path}: CI export Parquet inventory differs from receipt"
+        )
+    actual_relative_files = {
+        path.relative_to(ci_root)
+        for path in ci_root.rglob("*")
+        if path.is_file()
+    }
+    if actual_relative_files != expected_artifact_paths | {
+        Path("export_receipt.json")
+    }:
+        raise RuntimeError(
+            f"{manifest_path}: CI export file inventory differs from receipt"
+        )
+    if set(audits) != {
+        relative.as_posix() for relative in expected_relative_parquets
+    }:
+        raise RuntimeError(
+            f"{manifest_path}: CI export audit inventory differs from Parquet receipt"
+        )
+    if (
+        observed_rows != fragment_count
+        or observed_capacity_tokens != capacity_tokens
+        or observed_valid_tokens != valid_tokens
+        or observed_trained_tokens != trained_tokens
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: CI export aggregate Parquet accounting drifted"
+        )
+
+    representative_ledger_sha256 = representatives.get("ledger_sha256")
+    if (
+        not isinstance(representative_ledger_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", representative_ledger_sha256)
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: CI representative ledger binding is missing"
+        )
+    source_binding = {
+        "fetch_state_sqlite_logical_sha256": input_fetch_state[
+            "sqlite_logical_sha256"
+        ],
+        "fetch_state_sidecar_set_sha256": input_fetch_state["sidecar_set_sha256"],
+        "representative_ledger_sha256": representative_ledger_sha256,
+    }
+    source_binding_sha256 = _canonical_sha256(source_binding)
+    metadata: dict[str, object] = {
+        "path": str(manifest_path),
+        "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "schema": CI_CONTENT_STORE_EXPORT_SCHEMA,
+        "source_inventory_sha256": source_binding_sha256,
+        "source_binding": source_binding,
+        "source_binding_sha256": source_binding_sha256,
+        "producer_revision": {
+            "schema": CI_CONTENT_STORE_EXPORT_SCHEMA,
+            "repository_identity": "cppmega",
+            "script": "export_ci_content_store_case5.py",
+            "script_sha256": exporter_sha256,
+        },
+        "producer_script_sha256": exporter_sha256,
+        "source_completion": {
+            "schema": CI_CONTENT_STORE_EXPORT_SCHEMA,
+            "status": "complete",
+            "target_exact_unique_payload_tokens": target_tokens,
+            "eligible_exact_unique_payload_tokens": eligible_tokens,
+        },
+        "input_docs": representative_count,
+        "fragments": fragment_count,
+        "valid_tokens": valid_tokens,
+        "cross_boundary_chunk_edges": cross_chunk_edges,
+        "cross_boundary_token_edges": cross_fragment_edges,
+        "allowlist_counts": {
+            f"ci/{bucket}": len(allowed[("ci", bucket)]) for bucket in buckets
+        },
+        "provenance_artifacts": provenance_artifacts,
+    }
+    return allowed, metadata
+
+
 def _load_ci_manifest_allowlist(
     manifest_path: Path,
     ci_root: Path,
@@ -368,16 +828,27 @@ def _load_ci_manifest_allowlist(
 
     manifest_path = manifest_path.resolve()
     ci_root = ci_root.resolve()
-    if manifest_path != ci_root / "manifest.json":
-        raise RuntimeError(
-            "CI manifest must be the generation-root manifest: "
-            f"{ci_root / 'manifest.json'}"
-        )
     manifest_bytes = manifest_path.read_bytes()
     try:
         manifest = json.loads(manifest_bytes)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RuntimeError(f"invalid CI manifest {manifest_path}: {error}") from error
+    if (
+        isinstance(manifest, dict)
+        and manifest.get("schema") == CI_CONTENT_STORE_EXPORT_SCHEMA
+    ):
+        return _load_content_store_ci_export_allowlist(
+            manifest_path=manifest_path,
+            manifest_bytes=manifest_bytes,
+            manifest=manifest,
+            ci_root=ci_root,
+            buckets=buckets,
+        )
+    if manifest_path != ci_root / "manifest.json":
+        raise RuntimeError(
+            "CI manifest must be the generation-root manifest: "
+            f"{ci_root / 'manifest.json'}"
+        )
     if (
         not isinstance(manifest, dict)
         or manifest.get("schema") != CI_MANIFEST_SCHEMA
@@ -1680,7 +2151,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "explicit cppmega_ci_fixed_buckets_manifest_v3 binding the CI "
+            "explicit cppmega_ci_fixed_buckets_manifest_v3 or immutable "
+            "cppmega_ci_content_store_case5_export_v2 receipt binding the CI "
             "source inventory, lossless splits, shard hashes and reject counters"
         ),
     )
@@ -1881,13 +2353,37 @@ def _run_build(
     )
     staged_ci_manifest = provenance_root / "ci_manifest.json"
     shutil.copy2(args.ci_manifest.resolve(), staged_ci_manifest)
-    for bucket in buckets:
-        staged_bucket_manifest = provenance_root / "ci" / str(bucket) / "manifest.json"
-        staged_bucket_manifest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(
-            args.ci_root.resolve() / str(bucket) / "manifest.json",
-            staged_bucket_manifest,
-        )
+    if ci_manifest["schema"] == CI_MANIFEST_SCHEMA:
+        for bucket in buckets:
+            staged_bucket_manifest = (
+                provenance_root / "ci" / str(bucket) / "manifest.json"
+            )
+            staged_bucket_manifest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(
+                args.ci_root.resolve() / str(bucket) / "manifest.json",
+                staged_bucket_manifest,
+            )
+    elif ci_manifest["schema"] == CI_CONTENT_STORE_EXPORT_SCHEMA:
+        raw_provenance_artifacts = ci_manifest.get("provenance_artifacts")
+        if not isinstance(raw_provenance_artifacts, list):
+            raise RuntimeError("CI export provenance artifact list is missing")
+        for raw_artifact in raw_provenance_artifacts:
+            if not isinstance(raw_artifact, dict):
+                raise RuntimeError("CI export provenance artifact is malformed")
+            relative = Path(str(raw_artifact["path"]))
+            source = args.ci_root.resolve() / relative
+            target = provenance_root / "ci_export" / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            if (
+                target.stat().st_size != int(raw_artifact["byte_size"])
+                or _sha256(target) != str(raw_artifact["sha256"])
+            ):
+                raise RuntimeError(
+                    f"staged CI export provenance drifted: {relative}"
+                )
+    else:  # pragma: no cover - loader establishes the closed schema set
+        raise RuntimeError(f"unsupported normalized CI manifest: {ci_manifest}")
     objective_descriptors: dict[str, dict[str, object]] = {}
     for bucket in buckets:
         artifact = load_objective_materialization_artifact(objective_artifacts[bucket])
