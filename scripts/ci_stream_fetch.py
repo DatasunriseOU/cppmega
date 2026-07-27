@@ -1007,6 +1007,27 @@ def _process_parse_member(
     )
 
 
+_BINDING_KEYS = (
+    "fetcher_script_sha256",
+    "parser_script_sha256",
+)
+_BINDING_UPGRADES_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS binding_upgrades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    binding_key TEXT NOT NULL CHECK (
+      binding_key IN (
+        'fetcher_script_sha256',
+        'parser_script_sha256'
+      )
+    ),
+    from_sha256 TEXT NOT NULL CHECK (length(from_sha256) = 64),
+    to_sha256 TEXT NOT NULL CHECK (length(to_sha256) = 64),
+    reason TEXT NOT NULL,
+    upgraded_at TEXT NOT NULL,
+    UNIQUE(binding_key,from_sha256,to_sha256)
+)
+"""
+
 _STATE_SCHEMA = """
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS settings (
@@ -1099,18 +1120,131 @@ CREATE TABLE IF NOT EXISTS request_ledger (
     error_class TEXT,
     error_message TEXT
 );
-CREATE TABLE IF NOT EXISTS binding_upgrades (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    binding_key TEXT NOT NULL CHECK (
-      binding_key = 'fetcher_script_sha256'
-    ),
-    from_sha256 TEXT NOT NULL CHECK (length(from_sha256) = 64),
-    to_sha256 TEXT NOT NULL CHECK (length(to_sha256) = 64),
-    reason TEXT NOT NULL,
-    upgraded_at TEXT NOT NULL,
-    UNIQUE(binding_key,from_sha256,to_sha256)
-);
-"""
+""" + _BINDING_UPGRADES_TABLE_SQL + ";\n"
+
+
+def _validate_binding_upgrade_authorization(
+    *,
+    binding_key: str,
+    source_sha256: str | None,
+    reason: str | None,
+    resume: bool,
+) -> None:
+    label = binding_key.removesuffix("_sha256").replace("_", " ")
+    if source_sha256 is not None:
+        if not resume:
+            raise ValueError(f"{label} binding upgrade requires resume=True")
+        if (
+            not isinstance(source_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", source_sha256) is None
+        ):
+            raise ValueError(
+                f"{label} binding upgrade source must be a lowercase SHA-256"
+            )
+        if (
+            not isinstance(reason, str)
+            or not reason.strip()
+            or reason != reason.strip()
+            or len(reason) > 200
+            or any(
+                ord(character) < 0x20 or ord(character) == 0x7F
+                for character in reason
+            )
+        ):
+            raise ValueError(
+                f"{label} binding upgrade reason must be 1-200 printable "
+                "characters without surrounding whitespace"
+            )
+    elif reason is not None:
+        raise ValueError(
+            f"{label} binding upgrade reason requires an authorized source SHA-256"
+        )
+
+
+def _ensure_binding_upgrades_table_schema(
+    connection: sqlite3.Connection,
+) -> None:
+    """Atomically widen the legacy fetcher-only audit ledger when required."""
+
+    row = connection.execute(
+        """
+        SELECT sql FROM sqlite_master
+        WHERE type='table' AND name='binding_upgrades'
+        """
+    ).fetchone()
+    if row is None or not isinstance(row[0], str):
+        raise BindingError("fetch-state binding-upgrade table is missing")
+    table_sql = str(row[0])
+    columns = tuple(
+        str(item[1])
+        for item in connection.execute(
+            "PRAGMA table_info(binding_upgrades)"
+        )
+    )
+    expected_columns = (
+        "id",
+        "binding_key",
+        "from_sha256",
+        "to_sha256",
+        "reason",
+        "upgraded_at",
+    )
+    if columns != expected_columns:
+        raise BindingError("fetch-state binding-upgrade table is unsupported")
+    if "'parser_script_sha256'" in table_sql:
+        return
+    required_legacy_fragments = (
+        "binding_key = 'fetcher_script_sha256'",
+        "length(from_sha256) = 64",
+        "length(to_sha256) = 64",
+        "UNIQUE(binding_key,from_sha256,to_sha256)",
+    )
+    compact_sql = " ".join(table_sql.split())
+    if any(fragment not in compact_sql for fragment in required_legacy_fragments):
+        raise BindingError(
+            "fetch-state binding-upgrade table is not the known legacy schema"
+        )
+    unique_indexes = [
+        str(index[1])
+        for index in connection.execute(
+            "PRAGMA index_list(binding_upgrades)"
+        )
+        if int(index[2]) == 1
+    ]
+    if len(unique_indexes) != 1:
+        raise BindingError(
+            "fetch-state binding-upgrade uniqueness contract is unsupported"
+        )
+    unique_columns = tuple(
+        str(item[2])
+        for item in connection.execute(
+            f"PRAGMA index_info({unique_indexes[0]!r})"
+        )
+    )
+    if unique_columns != (
+        "binding_key",
+        "from_sha256",
+        "to_sha256",
+    ):
+        raise BindingError(
+            "fetch-state binding-upgrade uniqueness contract is unsupported"
+        )
+
+    connection.execute(
+        "ALTER TABLE binding_upgrades RENAME TO binding_upgrades_legacy"
+    )
+    connection.execute(_BINDING_UPGRADES_TABLE_SQL)
+    connection.execute(
+        """
+        INSERT INTO binding_upgrades(
+          id,binding_key,from_sha256,to_sha256,reason,upgraded_at
+        )
+        SELECT id,binding_key,from_sha256,to_sha256,reason,upgraded_at
+        FROM binding_upgrades_legacy
+        ORDER BY id
+        """
+    )
+    connection.execute("DROP TABLE binding_upgrades_legacy")
 
 
 class FetchState:
@@ -1126,6 +1260,8 @@ class FetchState:
         resume: bool,
         allow_fetcher_script_upgrade_from_sha256: str | None = None,
         fetcher_script_upgrade_reason: str | None = None,
+        allow_parser_script_upgrade_from_sha256: str | None = None,
+        parser_script_upgrade_reason: str | None = None,
     ):
         self.path = Path(path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1160,42 +1296,24 @@ class FetchState:
                 "payload-only-no-framing-v2"
             ),
         }
-        if allow_fetcher_script_upgrade_from_sha256 is not None:
-            if not resume:
-                raise ValueError(
-                    "fetcher script binding upgrade requires resume=True"
-                )
-            if (
-                re.fullmatch(
-                    r"[0-9a-f]{64}",
-                    allow_fetcher_script_upgrade_from_sha256,
-                )
-                is None
-            ):
-                raise ValueError(
-                    "fetcher script binding upgrade source must be a "
-                    "lowercase SHA-256"
-                )
-            if (
-                fetcher_script_upgrade_reason is None
-                or not fetcher_script_upgrade_reason.strip()
-                or fetcher_script_upgrade_reason != (
-                    fetcher_script_upgrade_reason.strip()
-                )
-                or len(fetcher_script_upgrade_reason) > 200
-                or any(
-                    ord(character) < 0x20 or ord(character) == 0x7F
-                    for character in fetcher_script_upgrade_reason
-                )
-            ):
-                raise ValueError(
-                    "fetcher script binding upgrade reason must be 1-200 "
-                    "printable characters without surrounding whitespace"
-                )
-        elif fetcher_script_upgrade_reason is not None:
-            raise ValueError(
-                "fetcher script binding upgrade reason requires an "
-                "authorized source SHA-256"
+        upgrade_authorizations = {
+            "fetcher_script_sha256": (
+                allow_fetcher_script_upgrade_from_sha256,
+                fetcher_script_upgrade_reason,
+            ),
+            "parser_script_sha256": (
+                allow_parser_script_upgrade_from_sha256,
+                parser_script_upgrade_reason,
+            ),
+        }
+        for binding_key, (source_sha256, reason) in (
+            upgrade_authorizations.items()
+        ):
+            _validate_binding_upgrade_authorization(
+                binding_key=binding_key,
+                source_sha256=source_sha256,
+                reason=reason,
+                resume=resume,
             )
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
@@ -1210,20 +1328,32 @@ class FetchState:
                         raise BindingError(
                             f"fetch state exists at {self.path}; pass --resume"
                         )
-                    script_upgrade = (
-                        current.get("fetcher_script_sha256")
-                        != expected["fetcher_script_sha256"]
-                        and current.get("fetcher_script_sha256")
-                        == allow_fetcher_script_upgrade_from_sha256
-                    )
+                    script_upgrades: dict[
+                        str,
+                        tuple[str, str, str],
+                    ] = {}
+                    for binding_key in _BINDING_KEYS:
+                        current_value = current.get(binding_key)
+                        expected_value = expected[binding_key]
+                        source_sha256, reason = upgrade_authorizations[
+                            binding_key
+                        ]
+                        if (
+                            current_value != expected_value
+                            and current_value == source_sha256
+                        ):
+                            assert current_value is not None
+                            assert reason is not None
+                            script_upgrades[binding_key] = (
+                                current_value,
+                                expected_value,
+                                reason,
+                            )
                     mismatches = {
                         key: (current.get(key), value)
                         for key, value in expected.items()
                         if current.get(key) != value
-                        and not (
-                            key == "fetcher_script_sha256"
-                            and script_upgrade
-                        )
+                        and key not in script_upgrades
                     }
                     if mismatches:
                         rendered = ", ".join(
@@ -1233,35 +1363,68 @@ class FetchState:
                         raise BindingError(
                             f"fetch-state binding mismatch: {rendered}"
                         )
-                    if script_upgrade:
-                        previous_script_sha256 = str(
-                            current["fetcher_script_sha256"]
-                        )
-                        next_script_sha256 = str(
-                            expected["fetcher_script_sha256"]
+                    for binding_key in _BINDING_KEYS:
+                        source_sha256, reason = upgrade_authorizations[
+                            binding_key
+                        ]
+                        if (
+                            source_sha256 is None
+                            or binding_key in script_upgrades
+                        ):
+                            continue
+                        replay = self._connection.execute(
+                            """
+                            SELECT from_sha256,to_sha256,reason
+                            FROM binding_upgrades
+                            WHERE binding_key=?
+                            ORDER BY id DESC
+                            LIMIT 1
+                            """,
+                            (binding_key,),
+                        ).fetchone()
+                        if replay is None or (
+                            str(replay["from_sha256"]),
+                            str(replay["to_sha256"]),
+                            str(replay["reason"]),
+                        ) != (
+                            source_sha256,
+                            expected[binding_key],
+                            reason,
+                        ):
+                            raise BindingError(
+                                f"{binding_key} upgrade authorization does not "
+                                "replay the latest audited transition"
+                            )
+                    _ensure_binding_upgrades_table_schema(self._connection)
+                    upgraded_at = _utc_now()
+                    for binding_key in _BINDING_KEYS:
+                        upgrade = script_upgrades.get(binding_key)
+                        if upgrade is None:
+                            continue
+                        previous_script_sha256, next_script_sha256, reason = (
+                            upgrade
                         )
                         self._connection.execute(
                             """
                             INSERT INTO binding_upgrades(
                               binding_key,from_sha256,to_sha256,
                               reason,upgraded_at
-                            ) VALUES (
-                              'fetcher_script_sha256',?,?,?,?
-                            )
+                            ) VALUES (?,?,?,?,?)
                             """,
                             (
+                                binding_key,
                                 previous_script_sha256,
                                 next_script_sha256,
-                                fetcher_script_upgrade_reason,
-                                _utc_now(),
+                                reason,
+                                upgraded_at,
                             ),
                         )
                         self._connection.execute(
                             """
                             UPDATE settings SET value=?
-                            WHERE key='fetcher_script_sha256'
+                            WHERE key=?
                             """,
-                            (next_script_sha256,),
+                            (next_script_sha256, binding_key),
                         )
                 else:
                     self._connection.executemany(
@@ -2677,6 +2840,8 @@ class CIStreamFetcher:
         resume: bool = False,
         allow_fetcher_script_upgrade_from_sha256: str | None = None,
         fetcher_script_upgrade_reason: str | None = None,
+        allow_parser_script_upgrade_from_sha256: str | None = None,
+        parser_script_upgrade_reason: str | None = None,
         target_unique_tokens: int = DEFAULT_TARGET,
         max_chunk_chars: int = DEFAULT_MAX_CHUNK_CHARS,
         max_archive_bytes: int = DEFAULT_MAX_ARCHIVE_BYTES,
@@ -2727,6 +2892,10 @@ class CIStreamFetcher:
                 allow_fetcher_script_upgrade_from_sha256
             ),
             fetcher_script_upgrade_reason=fetcher_script_upgrade_reason,
+            allow_parser_script_upgrade_from_sha256=(
+                allow_parser_script_upgrade_from_sha256
+            ),
+            parser_script_upgrade_reason=parser_script_upgrade_reason,
         )
         self.store = CIContentStore(content_store_path)
         self.client = GitHubAttemptClient(
@@ -3266,6 +3435,20 @@ def _build_parser() -> argparse.ArgumentParser:
             "fetcher script migration"
         ),
     )
+    parser.add_argument(
+        "--allow-parser-script-upgrade-from-sha256",
+        help=(
+            "explicitly authorize one resume migration from this exact "
+            "previous CI sidecar parser SHA-256"
+        ),
+    )
+    parser.add_argument(
+        "--parser-script-upgrade-reason",
+        help=(
+            "required printable audit reason for an explicitly authorized "
+            "CI sidecar parser migration"
+        ),
+    )
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--max-runs", type=int)
     parser.add_argument("--workers", type=int, default=4)
@@ -3335,6 +3518,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             fetcher_script_upgrade_reason=(
                 args.fetcher_script_upgrade_reason
+            ),
+            allow_parser_script_upgrade_from_sha256=(
+                args.allow_parser_script_upgrade_from_sha256
+            ),
+            parser_script_upgrade_reason=(
+                args.parser_script_upgrade_reason
             ),
             target_unique_tokens=args.target_exact_unique_payload_tokens,
             max_chunk_chars=args.max_chunk_chars,

@@ -657,6 +657,149 @@ def test_fetch_state_script_binding_upgrade_is_explicit_and_audited(
         upgraded.close()
 
 
+def test_fetch_state_parser_upgrade_migrates_legacy_ledger_and_replays_exactly(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path / "inventory.sqlite", 1)
+    tokenizer = ci.ExactTokenizer(_tokenizer(tmp_path / "tokenizer.json"))
+    state_path = tmp_path / "state.sqlite"
+    store_path = tmp_path / "store"
+    state = ci.FetchState(
+        state_path,
+        inventory_path=inventory,
+        content_store_path=store_path,
+        tokenizer=tokenizer,
+        resume=False,
+    )
+    state.close()
+
+    previous_sha256 = "b" * 64
+    with sqlite3.connect(state_path) as connection:
+        connection.execute(
+            """
+            UPDATE settings SET value=?
+            WHERE key='parser_script_sha256'
+            """,
+            (previous_sha256,),
+        )
+        connection.execute("DROP TABLE binding_upgrades")
+        connection.executescript(
+            """
+            CREATE TABLE binding_upgrades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                binding_key TEXT NOT NULL CHECK (
+                  binding_key = 'fetcher_script_sha256'
+                ),
+                from_sha256 TEXT NOT NULL CHECK (length(from_sha256) = 64),
+                to_sha256 TEXT NOT NULL CHECK (length(to_sha256) = 64),
+                reason TEXT NOT NULL,
+                upgraded_at TEXT NOT NULL,
+                UNIQUE(binding_key,from_sha256,to_sha256)
+            );
+            """
+        )
+        connection.commit()
+
+    with pytest.raises(ci.BindingError, match="parser_script_sha256"):
+        ci.FetchState(
+            state_path,
+            inventory_path=inventory,
+            content_store_path=store_path,
+            tokenizer=tokenizer,
+            resume=True,
+        )
+    with sqlite3.connect(state_path) as connection:
+        legacy_sql = str(
+            connection.execute(
+                """
+                SELECT sql FROM sqlite_master
+                WHERE type='table' AND name='binding_upgrades'
+                """
+            ).fetchone()[0]
+        )
+    assert "'parser_script_sha256'" not in legacy_sql
+
+    with pytest.raises(ValueError, match="parser script binding upgrade reason"):
+        ci.FetchState(
+            state_path,
+            inventory_path=inventory,
+            content_store_path=store_path,
+            tokenizer=tokenizer,
+            resume=True,
+            allow_parser_script_upgrade_from_sha256=previous_sha256,
+        )
+    with pytest.raises(ci.BindingError, match="parser_script_sha256"):
+        ci.FetchState(
+            state_path,
+            inventory_path=inventory,
+            content_store_path=store_path,
+            tokenizer=tokenizer,
+            resume=True,
+            allow_parser_script_upgrade_from_sha256="c" * 64,
+            parser_script_upgrade_reason="wrong parser source",
+        )
+
+    reason = "replace quadratic scans with output-equivalent linear bucketing"
+    upgraded = ci.FetchState(
+        state_path,
+        inventory_path=inventory,
+        content_store_path=store_path,
+        tokenizer=tokenizer,
+        resume=True,
+        allow_parser_script_upgrade_from_sha256=previous_sha256,
+        parser_script_upgrade_reason=reason,
+    )
+    try:
+        rows = upgraded.summary()["binding_upgrades"]
+        assert rows == [
+            {
+                "binding_key": "parser_script_sha256",
+                "from_sha256": previous_sha256,
+                "to_sha256": ci._parser_sha256(),
+                "reason": reason,
+                "upgraded_at": rows[0]["upgraded_at"],
+            }
+        ]
+        widened_sql = str(
+            upgraded._connection.execute(
+                """
+                SELECT sql FROM sqlite_master
+                WHERE type='table' AND name='binding_upgrades'
+                """
+            ).fetchone()[0]
+        )
+        assert "'parser_script_sha256'" in widened_sql
+    finally:
+        upgraded.close()
+
+    replayed = ci.FetchState(
+        state_path,
+        inventory_path=inventory,
+        content_store_path=store_path,
+        tokenizer=tokenizer,
+        resume=True,
+        allow_parser_script_upgrade_from_sha256=previous_sha256,
+        parser_script_upgrade_reason=reason,
+    )
+    try:
+        assert len(replayed.summary()["binding_upgrades"]) == 1
+    finally:
+        replayed.close()
+    with pytest.raises(
+        ci.BindingError,
+        match="does not replay the latest audited transition",
+    ):
+        ci.FetchState(
+            state_path,
+            inventory_path=inventory,
+            content_store_path=store_path,
+            tokenizer=tokenizer,
+            resume=True,
+            allow_parser_script_upgrade_from_sha256=previous_sha256,
+            parser_script_upgrade_reason="different parser migration reason",
+        )
+
+
 def _fake_parser(
     raw: bytes,
     metadata: Mapping[str, object],

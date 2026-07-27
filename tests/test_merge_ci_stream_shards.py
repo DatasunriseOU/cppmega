@@ -288,23 +288,29 @@ def _append_request_and_binding(state_path: Path) -> None:
 def _replace_binding_history(
     state_path: Path,
     transitions: tuple[tuple[str, str], ...],
+    *,
+    binding_key: str = "fetcher_script_sha256",
+    clear: bool = True,
+    upgraded_at: str = "2026-07-26T08:00:00Z",
 ) -> None:
     connection = sqlite3.connect(state_path)
     try:
         connection.execute("PRAGMA journal_mode=DELETE")
-        connection.execute("DELETE FROM binding_upgrades")
+        if clear:
+            connection.execute("DELETE FROM binding_upgrades")
         for source, destination in transitions:
             connection.execute(
                 """
                 INSERT INTO binding_upgrades(
                   binding_key,from_sha256,to_sha256,reason,upgraded_at
-                ) VALUES ('fetcher_script_sha256',?,?,?,?)
+                ) VALUES (?,?,?,?,?)
                 """,
                 (
+                    binding_key,
                     source,
                     destination,
                     f"fixture {source[:8]} to {destination[:8]}",
-                    "2026-07-26T08:00:00Z",
+                    upgraded_at,
                 ),
             )
         connection.commit()
@@ -926,6 +932,119 @@ def test_compatible_binding_prefix_is_canonically_ordered(
         (2, "7" * 64, "4" * 64),
     ]
     assert receipt["fetch_state_conservation"]["overlap"]["bindings"] == 1
+
+
+def test_fetcher_and_parser_histories_merge_as_independent_canonical_chains(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    inventory, inventory_receipt = _empty_inventory_template(tmp_path)
+    shard_suffix = _build_shard(
+        tmp_path / "a",
+        exact_tokenizer,
+        inventory,
+        inventory_receipt,
+        [_record("suffix", run_id=100, archive_member="a.txt")],
+        add_ledgers=True,
+    )
+    shard_full = _build_shard(
+        tmp_path / "b",
+        exact_tokenizer,
+        inventory,
+        inventory_receipt,
+        [_record("full history", run_id=200, archive_member="b.txt")],
+        add_ledgers=True,
+    )
+    with sqlite3.connect(shard_suffix.state) as connection:
+        parser_current = str(
+            connection.execute(
+                """
+                SELECT value FROM settings
+                WHERE key='parser_script_sha256'
+                """
+            ).fetchone()[0]
+        )
+
+    _replace_binding_history(
+        shard_suffix.state,
+        (("7" * 64, "4" * 64),),
+        upgraded_at="2026-07-26T08:00:00Z",
+    )
+    _replace_binding_history(
+        shard_suffix.state,
+        (("b" * 64, parser_current),),
+        binding_key="parser_script_sha256",
+        clear=False,
+        upgraded_at="2026-07-26T08:01:00Z",
+    )
+    _replace_binding_history(
+        shard_full.state,
+        (("6" * 64, "7" * 64), ("7" * 64, "4" * 64)),
+        upgraded_at="2026-07-26T09:00:00Z",
+    )
+    _replace_binding_history(
+        shard_full.state,
+        (("a" * 64, "b" * 64), ("b" * 64, parser_current)),
+        binding_key="parser_script_sha256",
+        clear=False,
+        upgraded_at="2026-07-26T09:01:00Z",
+    )
+    _write_json(
+        shard_suffix.fetch_receipt,
+        _fetch_receipt(shard_suffix, exact_tokenizer),
+    )
+    _write_json(
+        shard_full.fetch_receipt,
+        _fetch_receipt(shard_full, exact_tokenizer),
+    )
+    manifest, destination = _manifest(
+        tmp_path,
+        exact_tokenizer,
+        [shard_suffix, shard_full],
+    )
+
+    receipt = merge_shards(manifest)
+
+    with sqlite3.connect(destination / "fetch_state.sqlite3") as connection:
+        rows = connection.execute(
+            """
+            SELECT id,binding_key,from_sha256,to_sha256,upgraded_at
+            FROM binding_upgrades ORDER BY id
+            """
+        ).fetchall()
+    assert rows == [
+        (
+            1,
+            "fetcher_script_sha256",
+            "6" * 64,
+            "7" * 64,
+            "2026-07-26T09:00:00Z",
+        ),
+        (
+            2,
+            "fetcher_script_sha256",
+            "7" * 64,
+            "4" * 64,
+            "2026-07-26T08:00:00Z",
+        ),
+        (
+            3,
+            "parser_script_sha256",
+            "a" * 64,
+            "b" * 64,
+            "2026-07-26T09:01:00Z",
+        ),
+        (
+            4,
+            "parser_script_sha256",
+            "b" * 64,
+            parser_current,
+            "2026-07-26T08:01:00Z",
+        ),
+    ]
+    conservation = receipt["fetch_state_conservation"]
+    assert conservation["overlap"]["bindings"] == 2
+    assert conservation["binding_outcomes"]["canonical_overlap"] == 2
 
 
 def test_conflicting_occurrence_fails_without_publication(
