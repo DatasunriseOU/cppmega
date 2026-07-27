@@ -941,6 +941,78 @@ def test_fetch_state_content_store_upgrade_migrates_two_key_ledger(
         replayed.close()
 
 
+def test_fetcher_binds_state_to_immutable_content_store_creator(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path / "inventory.sqlite", 1)
+    tokenizer_path = _tokenizer(tmp_path / "tokenizer.json")
+    tokenizer = ci.ExactTokenizer(tokenizer_path)
+    state_path = tmp_path / "state.sqlite"
+    store_path = tmp_path / "store"
+
+    store = ci.CIContentStore(store_path)
+    store_db = store.db_path
+    store.close()
+    creator_sha256 = "c" * 64
+    with sqlite3.connect(store_db) as connection:
+        connection.execute(
+            """
+            UPDATE settings SET value=?
+            WHERE key='creator_script_sha256'
+            """,
+            (creator_sha256,),
+        )
+
+    # Reproduce the bad durable state produced by the old resume path: it
+    # recorded the current verifier hash instead of the immutable CAS creator.
+    state = ci.FetchState(
+        state_path,
+        inventory_path=inventory,
+        content_store_path=store_path,
+        tokenizer=tokenizer,
+        resume=False,
+    )
+    state.close()
+    runtime_sha256 = ci._content_store_sha256()
+    assert runtime_sha256 != creator_sha256
+
+    reason = "restore immutable content-store creator binding"
+    fetcher = ci.CIStreamFetcher(
+        inventory_path=inventory,
+        state_path=state_path,
+        content_store_path=store_path,
+        tokenizer_path=tokenizer_path,
+        tokens=["api-secret"],
+        progress_path=tmp_path / "progress.json",
+        receipt_path=tmp_path / "receipt.json",
+        resume=True,
+        allow_content_store_script_upgrade_from_sha256=runtime_sha256,
+        content_store_script_upgrade_reason=reason,
+    )
+    try:
+        assert fetcher.store.script_sha256 == creator_sha256
+        assert fetcher.state._connection.execute(
+            """
+            SELECT value FROM settings
+            WHERE key='content_store_script_sha256'
+            """
+        ).fetchone()[0] == creator_sha256
+        assert fetcher.state.summary()["binding_upgrades"][-1] == {
+            "binding_key": "content_store_script_sha256",
+            "from_sha256": runtime_sha256,
+            "to_sha256": creator_sha256,
+            "reason": reason,
+            "upgraded_at": fetcher.state._connection.execute(
+                """
+                SELECT upgraded_at FROM binding_upgrades
+                ORDER BY id DESC LIMIT 1
+                """
+            ).fetchone()[0],
+        }
+    finally:
+        fetcher.close()
+
+
 def _fake_parser(
     raw: bytes,
     metadata: Mapping[str, object],

@@ -1284,6 +1284,7 @@ class FetchState:
         content_store_path: str | os.PathLike[str],
         tokenizer: ExactTokenizer,
         resume: bool,
+        content_store_creator_script_sha256: str | None = None,
         allow_fetcher_script_upgrade_from_sha256: str | None = None,
         fetcher_script_upgrade_reason: str | None = None,
         allow_parser_script_upgrade_from_sha256: str | None = None,
@@ -1297,6 +1298,19 @@ class FetchState:
         self.content_store_path = (
             Path(content_store_path).expanduser().resolve()
         )
+        content_store_binding = (
+            _content_store_sha256()
+            if content_store_creator_script_sha256 is None
+            else content_store_creator_script_sha256
+        )
+        if (
+            not isinstance(content_store_binding, str)
+            or re.fullmatch(r"[0-9a-f]{64}", content_store_binding) is None
+        ):
+            raise ValueError(
+                "content-store creator script binding must be a lowercase "
+                "SHA-256"
+            )
         self._discovery_cursor: tuple[str, str, int, int] | None = None
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(
@@ -1318,7 +1332,7 @@ class FetchState:
             "tokenizer_fingerprint": tokenizer.fingerprint,
             "fetcher_script_sha256": _script_sha256(),
             "parser_script_sha256": _parser_sha256(),
-            "content_store_script_sha256": _content_store_sha256(),
+            "content_store_script_sha256": content_store_binding,
             "chunk_semantics": (
                 "parser-dedup-text-cppmega-training-tokenizer-"
                 "payload-only-no-framing-v2"
@@ -3014,28 +3028,35 @@ class CIStreamFetcher:
         (self.work_path / "tmp").mkdir(exist_ok=True)
         (self.work_path / "failed").mkdir(exist_ok=True)
         self.tokenizer = ExactTokenizer(tokenizer_path)
-        self.state = FetchState(
-            state_path,
-            inventory_path=self.inventory_path,
-            content_store_path=content_store_path,
-            tokenizer=self.tokenizer,
-            resume=resume,
-            allow_fetcher_script_upgrade_from_sha256=(
-                allow_fetcher_script_upgrade_from_sha256
-            ),
-            fetcher_script_upgrade_reason=fetcher_script_upgrade_reason,
-            allow_parser_script_upgrade_from_sha256=(
-                allow_parser_script_upgrade_from_sha256
-            ),
-            parser_script_upgrade_reason=parser_script_upgrade_reason,
-            allow_content_store_script_upgrade_from_sha256=(
-                allow_content_store_script_upgrade_from_sha256
-            ),
-            content_store_script_upgrade_reason=(
-                content_store_script_upgrade_reason
-            ),
-        )
         self.store = CIContentStore(content_store_path)
+        try:
+            self.state = FetchState(
+                state_path,
+                inventory_path=self.inventory_path,
+                content_store_path=content_store_path,
+                tokenizer=self.tokenizer,
+                resume=resume,
+                # The store receipt reports the immutable producer binding,
+                # not the hash of whichever read-only verifier opened it.
+                content_store_creator_script_sha256=self.store.script_sha256,
+                allow_fetcher_script_upgrade_from_sha256=(
+                    allow_fetcher_script_upgrade_from_sha256
+                ),
+                fetcher_script_upgrade_reason=fetcher_script_upgrade_reason,
+                allow_parser_script_upgrade_from_sha256=(
+                    allow_parser_script_upgrade_from_sha256
+                ),
+                parser_script_upgrade_reason=parser_script_upgrade_reason,
+                allow_content_store_script_upgrade_from_sha256=(
+                    allow_content_store_script_upgrade_from_sha256
+                ),
+                content_store_script_upgrade_reason=(
+                    content_store_script_upgrade_reason
+                ),
+            )
+        except BaseException:
+            self.store.close()
+            raise
         self.client = GitHubAttemptClient(
             tokens,
             self.state,
