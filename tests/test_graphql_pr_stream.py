@@ -432,13 +432,13 @@ def test_max_prs_finishes_page_and_advances_exact_scan_cursor(tmp_path):
             fallback_list_path=str(tmp_path / "fallback.jsonl"),
             max_prs=1,
             truncated_targets_path=str(tmp_path / "targets.jsonl"),
-            truncated_target_keys=set(),
             post_fn=post,
         )
         assert stats["prs"] == 2
         assert manifest.status("owner/repo") == "in_progress"
         assert manifest.cursor("owner/repo") == "page-one-end"
         assert manifest.get("owner/repo")["prs"] == 2
+        assert manifest.get("owner/repo")["truncated"] == 0
         assert store.execute(
             "SELECT COUNT(*) FROM prs WHERE scan_id=?",
             (manifest.scan_id,),

@@ -808,7 +808,7 @@ def stream_repo(
             cursor=cursor if has_next else None,
             prs=scanned_prs,
             truncated=sum(
-                1 for target_repo, _number in truncated_target_keys
+                1 for target_repo, _number in (truncated_target_keys or ())
                 if target_repo == repo
             ),
             total_count=total_count,
@@ -841,7 +841,7 @@ def stream_repo(
                 cursor=cursor,
                 prs=scanned_prs,
                 truncated=sum(
-                    1 for target_repo, _number in truncated_target_keys
+                    1 for target_repo, _number in (truncated_target_keys or ())
                     if target_repo == repo
                 ),
                 total_count=total_count,
