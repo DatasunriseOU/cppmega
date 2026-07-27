@@ -19,12 +19,16 @@ import sqlite3
 import sys
 from typing import Iterable, Mapping
 
-from scripts.ci_content_store import (
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if not __package__ and str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts.ci_content_store import (  # noqa: E402
     CIContentStore,
     _hash_records,
     _sqlite_schema_sha256,
 )
-from scripts.ci_stream_fetch import (
+from scripts.ci_stream_fetch import (  # noqa: E402
     RECEIPT_SCHEMA,
     SCHEMA_VERSION,
     _STATE_SCHEMA,
