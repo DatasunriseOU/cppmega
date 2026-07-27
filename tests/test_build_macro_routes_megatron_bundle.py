@@ -18,6 +18,7 @@ from scripts.data.build_macro_routes_megatron_bundle import (
     _ensure_partial_build_plan,
     _load_ci_manifest_allowlist,
     _load_manifest_allowlist,
+    _load_pr_export_allowlist,
     _parse_objective_artifacts,
     _portable_bucket_results,
     _producer_binding_from_conveyor,
@@ -325,6 +326,85 @@ def _write_content_store_ci_export(
     return manifest_path
 
 
+def _write_pr_export(
+    root: Path,
+    *,
+    buckets: tuple[int, ...] = (1024, 2048, 4096, 8192, 16384),
+) -> Path:
+    scan_id = "1" * 64
+    artifacts: list[dict[str, object]] = []
+    for bucket in buckets:
+        bucket_root = root / str(bucket)
+        bucket_root.mkdir(parents=True, exist_ok=True)
+        parquet = (
+            bucket_root
+            / f"pr_discussions_all_{scan_id[:12]}_{bucket:08d}.parquet"
+        )
+        parquet.write_bytes(f"pr-{bucket}".encode("ascii"))
+        artifacts.append(
+            {
+                "path": parquet.relative_to(root).as_posix(),
+                "bucket": bucket,
+                "rows": 1,
+                "valid_tokens": bucket - 1,
+                "pad_tokens": 1,
+                "capacity_tokens": bucket,
+                "byte_size": parquet.stat().st_size,
+                "sha256": hashlib.sha256(parquet.read_bytes()).hexdigest(),
+            }
+        )
+    completion = {
+        "schema": "cppmega_pr_completion_v2",
+        "status": "verified",
+        "receipt_sha256": "2" * 64,
+        "pr_store_sha256": "3" * 64,
+        "repo_list_sha256": "4" * 64,
+        "expected_repos_sha256": "5" * 64,
+        "scan_id": scan_id,
+        "expected_repo_count": 1,
+        "stored_pr_count": 1,
+        "unverified_store_pr_count": 0,
+    }
+    done_manifest = root / "_done.json"
+    done_manifest.write_text(
+        json.dumps(
+            {
+                "schema": "cppmega_pr_parquet_export_manifest_v2",
+                "status": "complete",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    exporter = builder.REPO_ROOT / "scripts/pr_ingest/export_pr_parquet.py"
+    receipt = {
+        "schema": builder.PR_EXPORT_SCHEMA,
+        "status": "complete",
+        "source": "pr",
+        "scan_id": scan_id,
+        "pr_completion": completion,
+        "exporter_script_sha256": hashlib.sha256(exporter.read_bytes()).hexdigest(),
+        "target_lengths": list(buckets),
+        "selected_pr_count": 1,
+        "rendered_docs": 1,
+        "manifest": {
+            "path": str(done_manifest.resolve()),
+            "sha256": hashlib.sha256(done_manifest.read_bytes()).hexdigest(),
+        },
+        "artifacts": artifacts,
+        "validation": {
+            "exact_scan_membership": True,
+            "input_revalidated_after_export": True,
+            "document_conservation": True,
+            "all_requested_buckets_present": True,
+            "artifact_hashes_verified": True,
+        },
+    }
+    receipt_path = root / "export_receipt.json"
+    receipt_path.write_text(json.dumps(receipt) + "\n", encoding="utf-8")
+    return receipt_path
+
+
 def test_ci_manifest_allowlist_binds_five_buckets_and_lossless_counters(
     tmp_path: Path,
 ) -> None:
@@ -345,6 +425,40 @@ def test_ci_manifest_allowlist_binds_five_buckets_and_lossless_counters(
     assert metadata["valid_tokens"] == sum(builder.DEFAULT_BUCKETS)
     assert metadata["cross_boundary_chunk_edges"] == 2
     assert metadata["cross_boundary_token_edges"] == 3
+
+
+def test_pr_export_allowlist_binds_exact_scan_and_every_artifact(
+    tmp_path: Path,
+) -> None:
+    pr_root = tmp_path / "pr"
+    receipt_path = _write_pr_export(pr_root)
+
+    allowed, metadata = _load_pr_export_allowlist(
+        receipt_path,
+        pr_root,
+        (1024, 2048, 4096, 8192, 16384),
+    )
+
+    assert metadata["schema"] == builder.PR_EXPORT_SCHEMA
+    assert metadata["input_docs"] == 1
+    assert metadata["fragments"] == 5
+    assert metadata["source_binding"]["scan_id"] == "1" * 64
+    assert set(allowed) == {
+        ("pr", 1024),
+        ("pr", 2048),
+        ("pr", 4096),
+        ("pr", 8192),
+        ("pr", 16384),
+    }
+    assert all(len(files) == 1 for files in allowed.values())
+
+    (pr_root / "1024" / "orphan.parquet").write_bytes(b"orphan")
+    with pytest.raises(RuntimeError, match="inventory differs"):
+        _load_pr_export_allowlist(
+            receipt_path,
+            pr_root,
+            (1024, 2048, 4096, 8192, 16384),
+        )
 
 
 def test_content_store_export_allowlist_binds_all_split_shards(

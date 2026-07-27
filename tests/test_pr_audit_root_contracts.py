@@ -148,6 +148,7 @@ def test_pr_rendering_keeps_metadata_and_exact_constituent_provenance(tmp_path):
     db = tmp_path / "prs.sqlite"
     conn = store_mod.connect(str(db), create=True)
     try:
+        scan_id = "1" * 64
         store_mod.upsert_record(
             conn,
             {
@@ -160,6 +161,7 @@ def test_pr_rendering_keeps_metadata_and_exact_constituent_provenance(tmp_path):
                 "reviews": [{"user": "carol", "state": "APPROVED", "body": "Ship it.", "created_at": "2"}],
                 "linked_issues": [{"number": 99, "title": "Parser bug", "body": "Repro"}],
             },
+            scan_id=scan_id,
         )
         record = store_mod.get_by_pr(conn, "owner/repo", 11)
         assert record is not None
@@ -171,7 +173,12 @@ def test_pr_rendering_keeps_metadata_and_exact_constituent_provenance(tmp_path):
 
         output = tmp_path / "pr.jsonl"
         assert export_mod._write_pr_jsonl(
-            conn, output, repo="owner/repo", offset=0, limit=None
+            conn,
+            output,
+            repo="owner/repo",
+            scan_id=scan_id,
+            offset=0,
+            limit=None,
         ) == 1
         payload = json.loads(output.read_text(encoding="utf-8"))
         assert payload["doc_type"] == "pr_discussion"
@@ -183,6 +190,11 @@ def test_pr_rendering_keeps_metadata_and_exact_constituent_provenance(tmp_path):
                 "repo": "owner/repo",
                 "pr_number": 11,
                 "merge_commit_sha": "merge11",
+                "scan_id": scan_id,
+                "state": "",
+                "author": "",
+                "created_at": "",
+                "merged_at": "",
             }
         ]
     finally:
