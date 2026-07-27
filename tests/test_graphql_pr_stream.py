@@ -213,11 +213,14 @@ def test_manifest_rejects_stale_query_contract_and_archives_on_explicit_restart(
         Manifest(str(path))
 
     restarted = Manifest(str(path), restart_query_contract=True)
-    assert restarted.data == {
-        "schema": GRAPHQL_MANIFEST_SCHEMA,
-        "query_contract_sha256": GRAPHQL_QUERY_CONTRACT_SHA256,
-        "repos": {},
-    }
+    assert restarted.data["schema"] == GRAPHQL_MANIFEST_SCHEMA
+    assert (
+        restarted.data["query_contract_sha256"]
+        == GRAPHQL_QUERY_CONTRACT_SHA256
+    )
+    assert restarted.data["scan_id"] == restarted.scan_id
+    assert len(restarted.scan_id) == 64
+    assert restarted.data["repos"] == {}
     backups = list(tmp_path.glob("manifest.json.pre-*.json"))
     assert len(backups) == 1
     assert json.loads(backups[0].read_text(encoding="utf-8"))["repos"][
@@ -235,6 +238,36 @@ def test_manifest_rejects_stale_query_contract_and_archives_on_explicit_restart(
     assert not targets.exists()
     assert not fallback.exists()
     assert all(Path(item).is_file() for item in archived)
+
+
+def test_manifest_can_explicitly_restart_an_invalid_scan_identity(tmp_path):
+    from graphql_pr_stream import (
+        GRAPHQL_MANIFEST_SCHEMA,
+        GRAPHQL_QUERY_CONTRACT_SHA256,
+        Manifest,
+    )
+
+    path = tmp_path / "manifest.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema": GRAPHQL_MANIFEST_SCHEMA,
+                "query_contract_sha256": GRAPHQL_QUERY_CONTRACT_SHA256,
+                "scan_id": "invalid",
+                "repos": {"owner/repo": {"status": "done"}},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit, match="invalid scan_id"):
+        Manifest(str(path))
+    restarted = Manifest(str(path), restart_query_contract=True)
+
+    assert len(restarted.scan_id) == 64
+    assert restarted.data["repos"] == {}
+    assert len(list(tmp_path.glob("manifest.json.pre-*.json"))) == 1
 
 
 def test_truncated_target_resume_accounting_is_unique_and_fail_closed(tmp_path):
@@ -347,3 +380,241 @@ def test_pr_node_keeps_inline_review_thread_comments_without_gap_target():
             "kind": "review_comment",
         }
     ]
+
+
+def test_max_prs_finishes_page_and_advances_exact_scan_cursor(tmp_path):
+    from graphql_pr_stream import Manifest, SharedTokenPool, stream_repo
+    from pr_store import connect
+
+    manifest = Manifest(str(tmp_path / "manifest.json"))
+    store = connect(str(tmp_path / "prs.sqlite"), create=True)
+    node = {
+        "title": "title",
+        "body": "body",
+        "comments": {"totalCount": 0, "nodes": []},
+        "reviews": {"totalCount": 0, "nodes": []},
+        "reviewThreads": {"totalCount": 0, "nodes": []},
+        "closingIssuesReferences": {"totalCount": 0, "nodes": []},
+    }
+
+    def post(_token: str, variables: dict) -> tuple[int, dict, dict]:
+        assert variables["cursor"] is None
+        return (
+            200,
+            {"X-RateLimit-Remaining": "100"},
+            {
+                "data": {
+                    "repository": {
+                        "pullRequests": {
+                            "totalCount": 3,
+                            "pageInfo": {
+                                "hasNextPage": True,
+                                "endCursor": "page-one-end",
+                            },
+                            "nodes": [
+                                {**node, "number": 1},
+                                {**node, "number": 2},
+                            ],
+                        }
+                    }
+                }
+            },
+        )
+
+    try:
+        stats = stream_repo(
+            SharedTokenPool(["token"]),
+            store,
+            manifest,
+            "owner/repo",
+            fallback_pr_threshold=0,
+            fallback_ratelimit_trips=0,
+            fallback_list_path=str(tmp_path / "fallback.jsonl"),
+            max_prs=1,
+            truncated_targets_path=str(tmp_path / "targets.jsonl"),
+            post_fn=post,
+        )
+        assert stats["prs"] == 2
+        assert manifest.status("owner/repo") == "in_progress"
+        assert manifest.cursor("owner/repo") == "page-one-end"
+        assert manifest.get("owner/repo")["prs"] == 2
+        assert manifest.get("owner/repo")["truncated"] == 0
+        assert store.execute(
+            "SELECT COUNT(*) FROM prs WHERE scan_id=?",
+            (manifest.scan_id,),
+        ).fetchone()[0] == 2
+    finally:
+        store.close()
+
+
+def test_terminal_count_mismatch_restarts_exact_repo_membership(tmp_path):
+    from graphql_pr_stream import Manifest, SharedTokenPool, stream_repo
+    from pr_store import connect
+
+    manifest = Manifest(str(tmp_path / "manifest.json"))
+    store = connect(str(tmp_path / "prs.sqlite"), create=True)
+    node = {
+        "title": "title",
+        "body": "body",
+        "comments": {"totalCount": 0, "nodes": []},
+        "reviews": {"totalCount": 0, "nodes": []},
+        "reviewThreads": {"totalCount": 0, "nodes": []},
+        "closingIssuesReferences": {"totalCount": 0, "nodes": []},
+    }
+
+    def incomplete_post(
+        _token: str, _variables: dict
+    ) -> tuple[int, dict, dict]:
+        return (
+            200,
+            {"X-RateLimit-Remaining": "100"},
+            {
+                "data": {
+                    "repository": {
+                        "pullRequests": {
+                            "totalCount": 2,
+                            "pageInfo": {
+                                "hasNextPage": False,
+                                "endCursor": None,
+                            },
+                            "nodes": [{**node, "number": 1}],
+                        }
+                    }
+                }
+            },
+        )
+
+    def complete_post(
+        _token: str, variables: dict
+    ) -> tuple[int, dict, dict]:
+        assert variables["cursor"] is None
+        return (
+            200,
+            {"X-RateLimit-Remaining": "100"},
+            {
+                "data": {
+                    "repository": {
+                        "pullRequests": {
+                            "totalCount": 1,
+                            "pageInfo": {
+                                "hasNextPage": False,
+                                "endCursor": None,
+                            },
+                            "nodes": [{**node, "number": 2}],
+                        }
+                    }
+                }
+            },
+        )
+
+    kwargs = {
+        "fallback_pr_threshold": 0,
+        "fallback_ratelimit_trips": 0,
+        "fallback_list_path": str(tmp_path / "fallback.jsonl"),
+        "truncated_targets_path": str(tmp_path / "targets.jsonl"),
+        "truncated_target_keys": set(),
+    }
+    try:
+        with pytest.raises(SystemExit, match="membership count mismatch"):
+            stream_repo(
+                SharedTokenPool(["token"]),
+                store,
+                manifest,
+                "owner/repo",
+                post_fn=incomplete_post,
+                **kwargs,
+            )
+        assert manifest.status("owner/repo") == "in_progress"
+        assert manifest.cursor("owner/repo") is None
+        assert store.execute(
+            "SELECT COUNT(*) FROM prs WHERE scan_id=?",
+            (manifest.scan_id,),
+        ).fetchone()[0] == 1
+
+        stream_repo(
+            SharedTokenPool(["token"]),
+            store,
+            manifest,
+            "owner/repo",
+            post_fn=complete_post,
+            **kwargs,
+        )
+
+        assert manifest.status("owner/repo") == "done"
+        assert store.execute("SELECT COUNT(*) FROM prs").fetchone()[0] == 2
+        assert store.execute(
+            "SELECT COUNT(*) FROM prs WHERE scan_id=?",
+            (manifest.scan_id,),
+        ).fetchone()[0] == 1
+        assert store.execute(
+            "SELECT scan_id FROM prs WHERE repo=? AND pr_number=1",
+            ("owner/repo",),
+        ).fetchone()[0] is None
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("page_info", "match"),
+    [
+        ({"hasNextPage": True, "endCursor": None}, "lacks a valid endCursor"),
+        ({"hasNextPage": "yes", "endCursor": "cursor"}, "hasNextPage is invalid"),
+    ],
+)
+def test_stream_rejects_invalid_page_contract_before_store_write(
+    tmp_path, page_info, match
+):
+    from graphql_pr_stream import Manifest, SharedTokenPool, stream_repo
+    from pr_store import connect
+
+    manifest = Manifest(str(tmp_path / "manifest.json"))
+    store = connect(str(tmp_path / "prs.sqlite"), create=True)
+
+    def post(_token: str, _variables: dict) -> tuple[int, dict, dict]:
+        return (
+            200,
+            {"X-RateLimit-Remaining": "100"},
+            {
+                "data": {
+                    "repository": {
+                        "pullRequests": {
+                            "totalCount": 1,
+                            "pageInfo": page_info,
+                            "nodes": [
+                                {
+                                    "number": 1,
+                                    "comments": {"totalCount": 0, "nodes": []},
+                                    "reviews": {"totalCount": 0, "nodes": []},
+                                    "reviewThreads": {
+                                        "totalCount": 0,
+                                        "nodes": [],
+                                    },
+                                    "closingIssuesReferences": {
+                                        "totalCount": 0,
+                                        "nodes": [],
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                }
+            },
+        )
+
+    try:
+        with pytest.raises(SystemExit, match=match):
+            stream_repo(
+                SharedTokenPool(["token"]),
+                store,
+                manifest,
+                "owner/repo",
+                fallback_pr_threshold=0,
+                fallback_ratelimit_trips=0,
+                fallback_list_path=str(tmp_path / "fallback.jsonl"),
+                truncated_targets_path=str(tmp_path / "targets.jsonl"),
+                truncated_target_keys=set(),
+                post_fn=post,
+            )
+        assert store.execute("SELECT COUNT(*) FROM prs").fetchone()[0] == 0
+    finally:
+        store.close()

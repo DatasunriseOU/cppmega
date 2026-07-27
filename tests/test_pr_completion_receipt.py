@@ -23,6 +23,8 @@ from scripts.pr_ingest.verify_pr_completion import (
     verify_pr_completion,
 )
 
+SCAN_ID = "1" * 64
+
 
 def _write_repo_list(path: Path) -> None:
     path.write_text(
@@ -57,6 +59,7 @@ def _write_manifest(
             {
                 "schema": GRAPHQL_MANIFEST_SCHEMA,
                 "query_contract_sha256": GRAPHQL_QUERY_CONTRACT_SHA256,
+                "scan_id": SCAN_ID,
                 "repos": {
                     "owner/one": {
                         "status": first_status,
@@ -93,6 +96,7 @@ def _write_store(path: Path) -> None:
                 "reviews": [],
                 "linked_issues": [],
             },
+            scan_id=SCAN_ID,
         )
     finally:
         conn.close()
@@ -114,11 +118,13 @@ def test_verified_pr_completion_binds_repo_manifest_and_store(tmp_path: Path) ->
         output_path=output,
     )
 
-    assert receipt["schema"] == "cppmega_pr_completion_v1"
+    assert receipt["schema"] == "cppmega_pr_completion_v2"
     assert receipt["status"] == "verified"
     assert receipt["expected_repo_count"] == 2
     assert receipt["stored_pr_count"] == 1
     assert receipt["declared_pr_count"] == 1
+    assert receipt["scan_id"] == SCAN_ID
+    assert receipt["unverified_store_pr_count"] == 0
     assert receipt["repo_list"]["sha256"]
     assert receipt["graphql_manifest"]["sha256"]
     assert receipt["pr_store"]["sha256"]
@@ -155,6 +161,73 @@ def test_pr_completion_rejects_store_count_drift(tmp_path: Path) -> None:
             graphql_manifest_path=manifest,
             store_path=store,
         )
+
+
+def test_pr_completion_does_not_let_stale_rows_mask_missing_scan_membership(
+    tmp_path: Path,
+) -> None:
+    repo_list = tmp_path / "repo_list.json"
+    manifest = tmp_path / "graphql_manifest.json"
+    store = tmp_path / "prs.sqlite"
+    _write_repo_list(repo_list)
+    _write_manifest(manifest)
+
+    conn = pr_store.connect(str(store), create=True)
+    try:
+        pr_store.upsert_record(
+            conn,
+            {
+                "repo": "owner/one",
+                "pr_number": 999,
+                "pr_title": "stale row from an older scan",
+                "comments": [],
+                "reviews": [],
+                "linked_issues": [],
+            },
+        )
+    finally:
+        conn.close()
+
+    with pytest.raises(PRCompletionError, match="stored PR count mismatch"):
+        verify_pr_completion(
+            repo_list_path=repo_list,
+            graphql_manifest_path=manifest,
+            store_path=store,
+        )
+
+
+def test_pr_completion_ignores_stale_rows_outside_exact_scan(tmp_path: Path) -> None:
+    repo_list = tmp_path / "repo_list.json"
+    manifest = tmp_path / "graphql_manifest.json"
+    store = tmp_path / "prs.sqlite"
+    _write_repo_list(repo_list)
+    _write_manifest(manifest)
+    _write_store(store)
+
+    conn = pr_store.connect(str(store), create=False)
+    try:
+        pr_store.upsert_record(
+            conn,
+            {
+                "repo": "owner/one",
+                "pr_number": 999,
+                "pr_title": "stale row from an older scan",
+                "comments": [],
+                "reviews": [],
+                "linked_issues": [],
+            },
+        )
+    finally:
+        conn.close()
+
+    receipt = verify_pr_completion(
+        repo_list_path=repo_list,
+        graphql_manifest_path=manifest,
+        store_path=store,
+    )
+
+    assert receipt["stored_pr_count"] == 1
+    assert receipt["unverified_store_pr_count"] == 1
 
 
 def test_truncated_prs_require_exact_gap_completion_receipt(tmp_path: Path) -> None:

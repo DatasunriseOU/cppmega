@@ -32,7 +32,7 @@ from scripts.pr_ingest.graphql_pr_stream import (
 )
 
 
-PR_COMPLETION_SCHEMA = "cppmega_pr_completion_v1"
+PR_COMPLETION_SCHEMA = "cppmega_pr_completion_v2"
 PR_GAP_COMPLETION_SCHEMA = "cppmega_pr_gap_completion_v1"
 
 
@@ -44,10 +44,51 @@ def sha256_file(path: Path) -> str:
     if not path.is_file():
         raise PRCompletionError(f"required PR input is missing: {path}")
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
+    try:
+        before = path.stat()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+        after = path.stat()
+    except OSError as exc:
+        raise PRCompletionError(f"cannot hash required PR input {path}: {exc}") from exc
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if before_identity != after_identity:
+        raise PRCompletionError(f"required PR input changed while hashing: {path}")
     return digest.hexdigest()
+
+
+def _require_unchanged_file(path: Path, expected_sha256: str, *, what: str) -> None:
+    actual_sha256 = sha256_file(path)
+    if actual_sha256 != expected_sha256:
+        raise PRCompletionError(
+            f"{what} changed while building the completion receipt: {path}"
+        )
+
+
+def _require_checkpointed_store(path: Path) -> None:
+    wal_path = Path(f"{path}-wal")
+    try:
+        wal_size = wal_path.stat().st_size if wal_path.exists() else 0
+    except OSError as exc:
+        raise PRCompletionError(f"cannot inspect PR store WAL {wal_path}: {exc}") from exc
+    if wal_size:
+        raise PRCompletionError(
+            f"PR store has an uncheckpointed WAL while building receipt: {wal_path}"
+        )
 
 
 def _canonical_json_sha256(value: object) -> str:
@@ -242,6 +283,8 @@ def verify_pr_completion(
     gap_completion_path: Path | None = None,
     output_path: Path | None = None,
 ) -> dict:
+    repo_list_sha256 = sha256_file(repo_list_path)
+    graphql_manifest_sha256 = sha256_file(graphql_manifest_path)
     expected_repos = tuple(load_repo_list(str(repo_list_path)))
     manifest = _load_json_object(
         graphql_manifest_path,
@@ -256,6 +299,15 @@ def verify_pr_completion(
         raise PRCompletionError(
             "GraphQL PR stream manifest query contract does not match the "
             "complete nested-connection contract"
+        )
+    scan_id = manifest.get("scan_id")
+    if (
+        not isinstance(scan_id, str)
+        or len(scan_id) != 64
+        or any(char not in "0123456789abcdef" for char in scan_id)
+    ):
+        raise PRCompletionError(
+            "GraphQL PR stream manifest lacks a valid exact scan_id"
         )
     manifest_repos = manifest.get("repos")
     if not isinstance(manifest_repos, dict):
@@ -318,6 +370,8 @@ def verify_pr_completion(
     )
 
     _checkpoint_sqlite(store_path)
+    _require_checkpointed_store(store_path)
+    store_sha256 = sha256_file(store_path)
     try:
         uri = store_path.resolve().as_uri() + "?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=60.0)
@@ -326,14 +380,24 @@ def verify_pr_completion(
             stored_counts = {
                 str(repo): int(count)
                 for repo, count in conn.execute(
-                    "SELECT repo, COUNT(*) FROM prs GROUP BY repo"
+                    "SELECT repo, COUNT(*) FROM prs "
+                    "WHERE scan_id=? GROUP BY repo",
+                    (scan_id,),
                 )
             }
+            total_store_pr_count = int(
+                conn.execute("SELECT COUNT(*) FROM prs").fetchone()[0]
+            )
             for target, expected_record_sha256 in gap_record_sha256s.items():
                 stored = pr_store.get_by_pr(conn, target[0], target[1])
                 if stored is None:
                     raise PRCompletionError(
                         f"gap-completed PR is absent from the store: "
+                        f"{target[0]}#{target[1]}"
+                    )
+                if stored.get("scan_id") != scan_id:
+                    raise PRCompletionError(
+                        f"gap-completed PR is outside the verified scan: "
                         f"{target[0]}#{target[1]}"
                     )
                 actual_record_sha256 = pr_store.record_content_sha256(stored)
@@ -367,20 +431,44 @@ def verify_pr_completion(
             )
         )
 
+    _require_checkpointed_store(store_path)
+    _require_unchanged_file(
+        store_path,
+        store_sha256,
+        what="PR store",
+    )
+    _require_unchanged_file(
+        repo_list_path,
+        repo_list_sha256,
+        what="PR repo list",
+    )
+    _require_unchanged_file(
+        graphql_manifest_path,
+        graphql_manifest_sha256,
+        what="GraphQL PR stream manifest",
+    )
+    if gap_binding is not None:
+        _require_unchanged_file(
+            Path(str(gap_binding["path"])),
+            str(gap_binding["sha256"]),
+            what="PR gap completion receipt",
+        )
+
     receipt = {
         "schema": PR_COMPLETION_SCHEMA,
         "status": "verified",
         "repo_list": {
             "path": str(repo_list_path.resolve()),
-            "sha256": sha256_file(repo_list_path),
+            "sha256": repo_list_sha256,
         },
         "graphql_manifest": {
             "path": str(graphql_manifest_path.resolve()),
-            "sha256": sha256_file(graphql_manifest_path),
+            "sha256": graphql_manifest_sha256,
         },
+        "scan_id": scan_id,
         "pr_store": {
             "path": str(store_path.resolve()),
-            "sha256": sha256_file(store_path),
+            "sha256": store_sha256,
             "size": store_path.stat().st_size,
         },
         "gap_completion": gap_binding,
@@ -388,6 +476,9 @@ def verify_pr_completion(
         "expected_repos_sha256": _canonical_json_sha256(list(expected_repos)),
         "declared_pr_count": sum(declared_counts.values()),
         "stored_pr_count": sum(stored_counts.values()),
+        "unverified_store_pr_count": (
+            total_store_pr_count - sum(stored_counts.values())
+        ),
         "truncated_target_count": len(targets),
     }
     if output_path is not None:

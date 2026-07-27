@@ -83,5 +83,15 @@ def test_pr_store_backfills_aliases_only_when_legacy_columns_are_added(tmp_path)
             "SELECT title, body FROM prs WHERE repo='owner/repo' AND pr_number=1"
         ).fetchone()
         assert tuple(row) == ("legacy title", "legacy body")
+        columns = {
+            str(row["name"])
+            for row in migrated.execute("PRAGMA table_info(prs)")
+        }
+        indexes = {
+            str(row["name"])
+            for row in migrated.execute("PRAGMA index_list(prs)")
+        }
+        assert "scan_id" in columns
+        assert "idx_prs_scan_repo" in indexes
     finally:
         migrated.close()

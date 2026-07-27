@@ -214,6 +214,92 @@ def test_commit_pr_lookup_supports_root_store_readonly(tmp_path: Path) -> None:
         lookup.close()
 
 
+def test_commit_pr_lookup_is_bound_to_exact_scan_membership(
+    tmp_path: Path,
+) -> None:
+    from scripts.pr_ingest import pr_store
+    from tools.clang_indexer.process_commits import PRDiscussionLookup
+
+    current_scan = "a" * 64
+    stale_scan = "b" * 64
+    store_path = tmp_path / "pull_requests.sqlite"
+    conn = pr_store.connect(str(store_path), create=True)
+    try:
+        pr_store.upsert_record(
+            conn,
+            {
+                "repo": "owner/project",
+                "pr_number": 1,
+                "merge_commit_sha": "old-sha",
+                "pr_title": "Old membership",
+                "pr_body": "Must not be attached.",
+                "comments": [],
+                "reviews": [],
+                "linked_issues": [],
+            },
+            scan_id=stale_scan,
+        )
+        pr_store.upsert_record(
+            conn,
+            {
+                "repo": "owner/project",
+                "pr_number": 1,
+                "merge_commit_sha": "current-sha",
+                "pr_title": "Current membership",
+                "pr_body": "Verified discussion.",
+                "comments": [],
+                "reviews": [],
+                "linked_issues": [],
+            },
+            scan_id=current_scan,
+        )
+        pr_store.upsert_record(
+            conn,
+            {
+                "repo": "owner/project",
+                "pr_number": 2,
+                "merge_commit_sha": "stale-sha",
+                "pr_title": "Stale row",
+                "pr_body": "Must not be attached.",
+                "comments": [],
+                "reviews": [],
+                "linked_issues": [],
+            },
+            scan_id=stale_scan,
+        )
+    finally:
+        conn.close()
+
+    lookup = PRDiscussionLookup(
+        str(store_path),
+        None,
+        scan_id=current_scan,
+    )
+    try:
+        current = {
+            "repo": "owner/project",
+            "commit_hash": "current-sha",
+        }
+        assert lookup.attach(current) is True
+        assert current["pr_number"] == 1
+        assert "Verified discussion." in current["pr_discussion"]
+
+        assert lookup.attach(
+            {"repo": "owner/project", "commit_hash": "old-sha"}
+        ) is False
+        assert lookup.attach(
+            {"repo": "owner/project", "commit_hash": "stale-sha"}
+        ) is False
+        assert lookup.attach(
+            {"repo": "owner/project", "pr_number": 2}
+        ) is False
+    finally:
+        lookup.close()
+
+    with pytest.raises(ValueError, match="invalid PR scan_id"):
+        PRDiscussionLookup(str(store_path), None, scan_id="not-a-scan")
+
+
 def test_atomic_publish_replaces_only_after_success(tmp_path: Path) -> None:
     from scripts.data.atomic_publish import atomic_output_file
 

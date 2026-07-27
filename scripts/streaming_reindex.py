@@ -1002,6 +1002,7 @@ def stage_index_commits(repo: str, commit_inputs: Sequence[Path], work: Path,
                         analysis_cache_entries: int = 128,
                         allow_empty: bool = False,
                         *,
+                        pr_scan_id: str | None = None,
                         project_id: str) -> Path | None:
     """process_commits.py -> <repo>.enriched.jsonl (commit edit-signal docs).
 
@@ -1039,6 +1040,10 @@ def stage_index_commits(repo: str, commit_inputs: Sequence[Path], work: Path,
         cmd += ["--repo-dir", str(repo_dir)]
     if pr_store is not None:
         cmd += ["--pr-store", str(pr_store)]
+    if pr_scan_id is not None:
+        if pr_store is None:
+            raise ValueError("pr_scan_id requires pr_store")
+        cmd += ["--pr-scan-id", pr_scan_id]
     if repo_list is not None:
         cmd += ["--repo-list", str(repo_list)]
     run_checked(repo, "process_commits", cmd, log_path=work / f"{repo}.commits.log")
