@@ -60,6 +60,7 @@ CI_MANIFEST_SCHEMA = "cppmega_ci_fixed_buckets_manifest_v3"
 CI_BUCKET_MANIFEST_SCHEMA = "cppmega_ci_fixed_bucket_v2"
 CI_LOG_COMPLETION_SCHEMA = "cppmega_ci_log_extraction_v1"
 CI_CONTENT_STORE_EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v2"
+PR_EXPORT_SCHEMA = "cppmega_pr_case5_export_v1"
 BUNDLE_KNOWN_LIMITATIONS = (
     "the source snapshot is the manifest-complete subset; failed or live "
     "conveyor units are excluded",
@@ -1216,11 +1217,239 @@ def _load_ci_manifest_allowlist(
     return allowed, metadata
 
 
+def _load_pr_export_allowlist(
+    manifest_path: Path,
+    pr_root: Path,
+    buckets: tuple[int, ...],
+) -> tuple[dict[tuple[str, int], dict[str, int]], dict[str, object]]:
+    """Validate one exact-scan PR CASE5 export and return its shard allowlist."""
+
+    manifest_path = manifest_path.resolve()
+    pr_root = pr_root.resolve()
+    expected_manifest_path = pr_root / "export_receipt.json"
+    if manifest_path != expected_manifest_path:
+        raise RuntimeError(
+            f"PR export receipt must be {expected_manifest_path}"
+        )
+    manifest_bytes = manifest_path.read_bytes()
+    try:
+        receipt = json.loads(manifest_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"invalid PR export receipt {manifest_path}: {error}"
+        ) from error
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("schema") != PR_EXPORT_SCHEMA
+        or receipt.get("status") != "complete"
+        or receipt.get("source") != "pr"
+        or receipt.get("target_lengths") != list(buckets)
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: unsupported or incomplete PR export receipt"
+        )
+    exporter_sha256 = receipt.get("exporter_script_sha256")
+    exporter_path = REPO_ROOT / "scripts/pr_ingest/export_pr_parquet.py"
+    if (
+        not isinstance(exporter_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", exporter_sha256)
+        or exporter_sha256 != _sha256(exporter_path)
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: PR exporter is not bound to reviewed source"
+        )
+    validation = receipt.get("validation")
+    required_validation = (
+        "exact_scan_membership",
+        "input_revalidated_after_export",
+        "document_conservation",
+        "all_requested_buckets_present",
+        "artifact_hashes_verified",
+    )
+    if not isinstance(validation, dict) or any(
+        validation.get(field) is not True for field in required_validation
+    ):
+        raise RuntimeError(f"{manifest_path}: PR export validation is not green")
+    completion = receipt.get("pr_completion")
+    if (
+        not isinstance(completion, dict)
+        or completion.get("schema") != "cppmega_pr_completion_v2"
+        or completion.get("status") != "verified"
+        or completion.get("scan_id") != receipt.get("scan_id")
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: PR completion binding is missing or inconsistent"
+        )
+    for field in (
+        "receipt_sha256",
+        "pr_store_sha256",
+        "repo_list_sha256",
+        "expected_repos_sha256",
+        "scan_id",
+    ):
+        value = completion.get(field)
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+        ):
+            raise RuntimeError(
+                f"{manifest_path}: invalid PR completion {field}"
+            )
+    selected_pr_count = receipt.get("selected_pr_count")
+    rendered_docs = receipt.get("rendered_docs")
+    if (
+        not isinstance(selected_pr_count, int)
+        or isinstance(selected_pr_count, bool)
+        or selected_pr_count < 1
+        or rendered_docs != selected_pr_count
+        or completion.get("stored_pr_count") != selected_pr_count
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: PR document/scan conservation failed"
+        )
+    export_manifest = receipt.get("manifest")
+    expected_done_path = pr_root / "_done.json"
+    if not isinstance(export_manifest, dict):
+        raise RuntimeError(f"{manifest_path}: PR export manifest binding is missing")
+    raw_done_path = export_manifest.get("path")
+    try:
+        bound_done_path = Path(str(raw_done_path)).expanduser().resolve()
+    except OSError as error:
+        raise RuntimeError(
+            f"{manifest_path}: invalid PR done-manifest path"
+        ) from error
+    if (
+        bound_done_path != expected_done_path
+        or export_manifest.get("sha256") != _sha256(expected_done_path)
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: PR done-manifest binding drifted"
+        )
+
+    raw_artifacts = receipt.get("artifacts")
+    if not isinstance(raw_artifacts, list) or not raw_artifacts:
+        raise RuntimeError(f"{manifest_path}: PR export artifact list is empty")
+    actual_files = _inventory_regular_files_fail_closed(pr_root)
+    expected_files = {
+        Path("export_receipt.json"),
+        Path("_done.json"),
+    }
+    allowed: dict[tuple[str, int], dict[str, int]] = {
+        ("pr", bucket): {} for bucket in buckets
+    }
+    seen_paths: set[Path] = set()
+    fragments = 0
+    valid_tokens = 0
+    for index, raw_artifact in enumerate(raw_artifacts):
+        if not isinstance(raw_artifact, dict):
+            raise RuntimeError(
+                f"{manifest_path}: PR artifact[{index}] is malformed"
+            )
+        relative = Path(str(raw_artifact.get("path", "")))
+        bucket = raw_artifact.get("bucket")
+        rows = raw_artifact.get("rows")
+        byte_size = raw_artifact.get("byte_size")
+        sha256 = raw_artifact.get("sha256")
+        if (
+            relative.is_absolute()
+            or len(relative.parts) != 2
+            or ".." in relative.parts
+            or relative.suffix != ".parquet"
+            or relative in seen_paths
+            or not isinstance(bucket, int)
+            or isinstance(bucket, bool)
+            or bucket not in buckets
+            or relative.parts[0] != str(bucket)
+            or not isinstance(rows, int)
+            or isinstance(rows, bool)
+            or rows < 1
+            or not isinstance(byte_size, int)
+            or isinstance(byte_size, bool)
+            or byte_size < 1
+            or not isinstance(sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+        ):
+            raise RuntimeError(
+                f"{manifest_path}: invalid PR artifact[{index}]"
+            )
+        artifact_path = pr_root / relative
+        if (
+            relative not in actual_files
+            or artifact_path.stat().st_size != byte_size
+            or _sha256(artifact_path) != sha256
+            or relative.name in allowed[("pr", bucket)]
+        ):
+            raise RuntimeError(
+                f"{manifest_path}: PR artifact binding drifted: {relative}"
+            )
+        seen_paths.add(relative)
+        expected_files.add(relative)
+        allowed[("pr", bucket)][relative.name] = rows
+        fragments += rows
+        artifact_valid_tokens = raw_artifact.get("valid_tokens")
+        if (
+            not isinstance(artifact_valid_tokens, int)
+            or isinstance(artifact_valid_tokens, bool)
+            or artifact_valid_tokens < 1
+        ):
+            raise RuntimeError(
+                f"{manifest_path}: invalid PR valid-token count: {relative}"
+            )
+        valid_tokens += artifact_valid_tokens
+    if actual_files != expected_files:
+        raise RuntimeError(
+            f"{manifest_path}: PR export inventory differs from receipt: "
+            f"extra={sorted(actual_files - expected_files)} "
+            f"missing={sorted(expected_files - actual_files)}"
+        )
+    if any(not allowed[("pr", bucket)] for bucket in buckets):
+        missing = [bucket for bucket in buckets if not allowed[("pr", bucket)]]
+        raise RuntimeError(
+            f"{manifest_path}: PR export has no shards for buckets {missing}"
+        )
+    source_binding = {
+        "pr_completion_receipt_sha256": completion["receipt_sha256"],
+        "pr_store_sha256": completion["pr_store_sha256"],
+        "repo_list_sha256": completion["repo_list_sha256"],
+        "expected_repos_sha256": completion["expected_repos_sha256"],
+        "scan_id": completion["scan_id"],
+    }
+    source_inventory_sha256 = _canonical_sha256(source_binding)
+    metadata: dict[str, object] = {
+        "path": str(manifest_path),
+        "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "schema": PR_EXPORT_SCHEMA,
+        "source_inventory_sha256": source_inventory_sha256,
+        "source_binding": source_binding,
+        "producer_revision": {
+            "schema": PR_EXPORT_SCHEMA,
+            "repository_identity": "cppmega",
+            "script": "scripts/pr_ingest/export_pr_parquet.py",
+            "script_sha256": exporter_sha256,
+        },
+        "producer_script_sha256": exporter_sha256,
+        "source_completion": completion,
+        "export_manifest": {
+            "path": str(expected_done_path),
+            "sha256": str(export_manifest["sha256"]),
+        },
+        "input_docs": selected_pr_count,
+        "fragments": fragments,
+        "valid_tokens": valid_tokens,
+        "allowlist_counts": {
+            f"pr/{bucket}": len(allowed[("pr", bucket)])
+            for bucket in buckets
+        },
+    }
+    return allowed, metadata
+
+
 def _snapshot_sources(
     *,
     code_root: Path,
     commit_root: Path,
     ci_root: Path | None = None,
+    pr_root: Path | None = None,
     snapshot_root: Path,
     buckets: tuple[int, ...],
     min_age_seconds: float,
@@ -1228,6 +1457,7 @@ def _snapshot_sources(
     allowed: dict[tuple[str, int], dict[str, int]],
     conveyor_manifest: dict[str, object],
     ci_manifest: dict[str, object] | None = None,
+    pr_manifest: dict[str, object] | None = None,
 ) -> dict[str, object]:
     manifest_path = snapshot_root / "source_manifest.json"
     if manifest_path.exists():
@@ -1236,6 +1466,7 @@ def _snapshot_sources(
             existing.get("schema") != "cppmega_parquet_snapshot_v1"
             or existing.get("conveyor_manifest") != conveyor_manifest
             or existing.get("ci_manifest") != ci_manifest
+            or existing.get("pr_manifest") != pr_manifest
         ):
             raise RuntimeError("existing source snapshot does not match build inputs")
         return existing
@@ -1252,12 +1483,18 @@ def _snapshot_sources(
         source_roots.append(("ci", ci_root))
     elif ci_manifest is not None:
         raise RuntimeError("CI manifest supplied without a CI snapshot root")
+    if pr_root is not None:
+        if pr_manifest is None:
+            raise RuntimeError("PR snapshot root requires a validated PR manifest")
+        source_roots.append(("pr", pr_root))
+    elif pr_manifest is not None:
+        raise RuntimeError("PR manifest supplied without a PR snapshot root")
     for kind, source_root in source_roots:
         for bucket in buckets:
             source_paths = _stable_parquets(
                 source_root,
                 bucket,
-                0.0 if kind == "ci" else min_age_seconds,
+                0.0 if kind in {"ci", "pr"} else min_age_seconds,
                 set(allowed[(kind, bucket)]),
             )
             if not source_paths:
@@ -1325,6 +1562,7 @@ def _snapshot_sources(
         "by_kind_bucket": by_kind_bucket,
         "conveyor_manifest": conveyor_manifest,
         "ci_manifest": ci_manifest,
+        "pr_manifest": pr_manifest,
         "files": records,
     }
     _write_json_atomic(manifest_path, payload)
@@ -1437,6 +1675,8 @@ def _run_boundary_repair(
         roots = [snapshot_root / "code", snapshot_root / "commits"]
         if (snapshot_root / "ci").is_dir():
             roots.append(snapshot_root / "ci")
+        if (snapshot_root / "pr").is_dir():
+            roots.append(snapshot_root / "pr")
         root_args = [
             argument
             for root in roots
@@ -1487,8 +1727,12 @@ def _run_snapshot_audit(
             raise RuntimeError("existing audit receipt snapshot binding mismatch")
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     else:
-        empty_pr_root = audit_root / "empty_standalone_pr_root"
-        empty_pr_root.mkdir(parents=True, exist_ok=True)
+        pr_root = (
+            snapshot_root / "pr"
+            if (snapshot_root / "pr").is_dir()
+            else audit_root / "empty_standalone_pr_root"
+        )
+        pr_root.mkdir(parents=True, exist_ok=True)
         ci_args = (
             ["--ci-root", str(snapshot_root / "ci")]
             if (snapshot_root / "ci").is_dir()
@@ -1503,7 +1747,7 @@ def _run_snapshot_audit(
                 "--commit-root",
                 str(snapshot_root / "commits"),
                 "--pr-root",
-                str(empty_pr_root),
+                str(pr_root),
                 *ci_args,
                 "--buckets",
                 ",".join(str(bucket) for bucket in buckets),
@@ -1606,7 +1850,7 @@ def _validate_objective_source_binding(
         if (
             relative.is_absolute()
             or len(relative.parts) != 3
-            or relative.parts[0] not in {"code", "commits", "ci"}
+            or relative.parts[0] not in {"code", "commits", "ci", "pr"}
             or relative.parts[1] != str(bucket)
             or relative.name in {"", ".", ".."}
         ):
@@ -2018,6 +2262,7 @@ def _create_build_plan(
     objective_artifacts: dict[int, Path],
     conveyor_manifest: dict[str, object],
     ci_manifest: dict[str, object],
+    pr_manifest: dict[str, object],
 ) -> dict[str, object]:
     objective_records = _objective_build_records(objective_artifacts, buckets)
     tokenizer_dir = args.tokenizer_dir.resolve()
@@ -2035,9 +2280,11 @@ def _create_build_plan(
             "code": str(args.code_root.resolve()),
             "commits": str(args.commit_root.resolve()),
             "ci": str(args.ci_root.resolve()),
+            "pr": str(args.pr_root.resolve()),
         },
         "conveyor_manifest": conveyor_manifest,
         "ci_manifest": ci_manifest,
+        "pr_manifest": pr_manifest,
         "implementation": _producer_binding_from_conveyor(
             conveyor_manifest,
             cppmega_commit=args.cppmega_commit,
@@ -2134,6 +2381,11 @@ def _assert_build_plan_inputs(
         cppmega_mlx_commit=args.cppmega_mlx_commit,
         cppmega_mlx_tree_sha256=args.cppmega_mlx_tree_sha256,
     )
+    _pr_allowed, pr_manifest = _load_pr_export_allowlist(
+        args.pr_manifest.resolve(),
+        args.pr_root.resolve(),
+        buckets,
+    )
     actual = _create_build_plan(
         args=args,
         buckets=buckets,
@@ -2141,6 +2393,7 @@ def _assert_build_plan_inputs(
         objective_artifacts=objective_artifacts,
         conveyor_manifest=conveyor_manifest,
         ci_manifest=ci_manifest,
+        pr_manifest=pr_manifest,
     )
     if actual == build_plan:
         return
@@ -2186,6 +2439,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "explicit cppmega_ci_fixed_buckets_manifest_v3 or immutable "
             "cppmega_ci_content_store_case5_export_v2 receipt binding the CI "
             "source inventory, lossless splits, shard hashes and reject counters"
+        ),
+    )
+    parser.add_argument(
+        "--pr-root",
+        type=Path,
+        default=None,
+        help="explicit immutable root containing exact-scan PR CASE5 shards",
+    )
+    parser.add_argument(
+        "--pr-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "explicit cppmega_pr_case5_export_v1 receipt binding scan "
+            "membership, input hashes, document conservation and every shard"
         ),
     )
     parser.add_argument(
@@ -2265,6 +2533,8 @@ def _require_explicit_source_inputs(args: argparse.Namespace) -> None:
             ("commit_root", "--commit-root"),
             ("ci_root", "--ci-root"),
             ("ci_manifest", "--ci-manifest"),
+            ("pr_root", "--pr-root"),
+            ("pr_manifest", "--pr-manifest"),
             ("conveyor_manifest", "--conveyor-manifest"),
             ("cppmega_commit", "--cppmega-commit"),
             ("cppmega_tree_sha256", "--cppmega-tree-sha256"),
@@ -2300,10 +2570,19 @@ def _run_build(
         cppmega_mlx_commit=args.cppmega_mlx_commit,
         cppmega_mlx_tree_sha256=args.cppmega_mlx_tree_sha256,
     )
+    pr_allowlist, pr_manifest = _load_pr_export_allowlist(
+        args.pr_manifest.resolve(),
+        args.pr_root.resolve(),
+        buckets,
+    )
     overlap = set(allowlist).intersection(ci_allowlist)
     if overlap:
         raise RuntimeError(f"CI allowlist collides with conveyor kinds: {overlap}")
     allowlist.update(ci_allowlist)
+    overlap = set(allowlist).intersection(pr_allowlist)
+    if overlap:
+        raise RuntimeError(f"PR allowlist collides with existing kinds: {overlap}")
+    allowlist.update(pr_allowlist)
     build_plan = _create_build_plan(
         args=args,
         buckets=buckets,
@@ -2311,6 +2590,7 @@ def _run_build(
         objective_artifacts=objective_artifacts,
         conveyor_manifest=conveyor_manifest,
         ci_manifest=ci_manifest,
+        pr_manifest=pr_manifest,
     )
     _ensure_partial_build_plan(partial_dir, build_plan)
 
@@ -2319,6 +2599,7 @@ def _run_build(
         code_root=args.code_root.resolve(),
         commit_root=args.commit_root.resolve(),
         ci_root=args.ci_root.resolve(),
+        pr_root=args.pr_root.resolve(),
         snapshot_root=snapshot_root,
         buckets=buckets,
         min_age_seconds=args.min_age_seconds,
@@ -2326,6 +2607,7 @@ def _run_build(
         allowed=allowlist,
         conveyor_manifest=conveyor_manifest,
         ci_manifest=ci_manifest,
+        pr_manifest=pr_manifest,
     )
     repair_receipt = _run_boundary_repair(
         snapshot_root=snapshot_root,
@@ -2385,6 +2667,19 @@ def _run_build(
     )
     staged_ci_manifest = provenance_root / "ci_manifest.json"
     shutil.copy2(args.ci_manifest.resolve(), staged_ci_manifest)
+    staged_pr_manifest = provenance_root / "pr_export_receipt.json"
+    staged_pr_done_manifest = provenance_root / "pr_export_done_manifest.json"
+    shutil.copy2(args.pr_manifest.resolve(), staged_pr_manifest)
+    shutil.copy2(
+        Path(str(pr_manifest["export_manifest"]["path"])),
+        staged_pr_done_manifest,
+    )
+    if (
+        _sha256(staged_pr_manifest) != str(pr_manifest["sha256"])
+        or _sha256(staged_pr_done_manifest)
+        != str(pr_manifest["export_manifest"]["sha256"])
+    ):
+        raise RuntimeError("staged PR export provenance drifted")
     if ci_manifest["schema"] == CI_MANIFEST_SCHEMA:
         for bucket in buckets:
             staged_bucket_manifest = (
@@ -2493,6 +2788,19 @@ def _run_build(
                 "cross_boundary_token_edges": ci_manifest[
                     "cross_boundary_token_edges"
                 ],
+            },
+            "pr_manifest": {
+                "path": "provenance/pr_export_receipt.json",
+                "sha256": _sha256(staged_pr_manifest),
+                "done_manifest_path": "provenance/pr_export_done_manifest.json",
+                "done_manifest_sha256": _sha256(staged_pr_done_manifest),
+                "source_inventory_sha256": pr_manifest[
+                    "source_inventory_sha256"
+                ],
+                "input_docs": pr_manifest["input_docs"],
+                "fragments": pr_manifest["fragments"],
+                "valid_tokens": pr_manifest["valid_tokens"],
+                "scan_id": pr_manifest["source_binding"]["scan_id"],
             },
             "local_snapshot_retained": bool(args.keep_snapshot),
         },
