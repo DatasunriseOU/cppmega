@@ -160,6 +160,7 @@ _MIDSTREAM_RECORD_BOM_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
     r"(?:\.\d{1,9})?Z[ \t])"
 )
+_PHYSICAL_LINE_BOUNDARY_RE = re.compile(r"\r\n|\r|\n")
 _ANSI_RE = re.compile(
     r"(?:"
     r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
@@ -669,29 +670,26 @@ def _normalize_record_boundaries(text: str) -> tuple[str, list[dict], int]:
 def _physical_lines(text: str) -> list[dict[str, Any]]:
     lines: list[dict[str, Any]] = []
     cursor = 0
-    while cursor < len(text):
-        boundary = re.search(r"\r\n|\r|\n", text[cursor:])
-        if boundary is None:
-            lines.append(
-                {
-                    "source_start": cursor,
-                    "source_end": len(text),
-                    "content": text[cursor:],
-                    "terminator": "",
-                }
-            )
-            break
-        start = cursor + boundary.start()
-        end = cursor + boundary.end()
+    for boundary in _PHYSICAL_LINE_BOUNDARY_RE.finditer(text):
+        start, end = boundary.span()
         lines.append(
             {
                 "source_start": cursor,
                 "source_end": end,
                 "content": text[cursor:start],
-                "terminator": text[start:end],
+                "terminator": boundary.group(0),
             }
         )
         cursor = end
+    if cursor < len(text):
+        lines.append(
+            {
+                "source_start": cursor,
+                "source_end": len(text),
+                "content": text[cursor:],
+                "terminator": "",
+            }
+        )
     return lines
 
 
@@ -1520,13 +1518,16 @@ def _attach_chunk_semantic_rle(
     chunks: Sequence[dict[str, Any]],
     entities: Sequence[Mapping[str, Any]],
 ) -> None:
-    for chunk in chunks:
+    entities_by_chunk = _records_by_overlapping_chunk(chunks, entities)
+    for chunk, chunk_entities in zip(
+        chunks, entities_by_chunk, strict=True
+    ):
         chunk["semantic_span_offset_basis"] = "chunk_local_canonical_chars"
         chunk["role_spans"] = _chunk_semantic_rle(
-            chunk, entities, field="role"
+            chunk, chunk_entities, field="role"
         )
         chunk["domain_spans"] = _chunk_semantic_rle(
-            chunk, entities, field="domain"
+            chunk, chunk_entities, field="domain"
         )
 
 
@@ -1693,6 +1694,66 @@ def _localized_training_record(
     return output
 
 
+def _records_by_overlapping_chunk(
+    chunks: Sequence[Mapping[str, Any]],
+    records: Sequence[Mapping[str, Any]],
+) -> list[list[Mapping[str, Any]]]:
+    """Bucket interval records without rescanning every record per chunk."""
+
+    buckets: list[list[Mapping[str, Any]]] = [[] for _chunk in chunks]
+    if not chunks:
+        return buckets
+    chunk_starts = [int(chunk["char_start"]) for chunk in chunks]
+    chunk_ends = [int(chunk["char_end"]) for chunk in chunks]
+    for record in records:
+        raw_start = record.get("start_char")
+        raw_end = record.get("end_char")
+        if (
+            isinstance(raw_start, bool)
+            or not isinstance(raw_start, int)
+            or isinstance(raw_end, bool)
+            or not isinstance(raw_end, int)
+            or raw_end <= raw_start
+        ):
+            continue
+        first = bisect_right(chunk_ends, raw_start)
+        last = bisect_right(chunk_starts, raw_end - 1)
+        for index in range(first, last):
+            if (
+                raw_start < chunk_ends[index]
+                and raw_end > chunk_starts[index]
+            ):
+                buckets[index].append(record)
+    return buckets
+
+
+def _edges_by_endpoint_chunk(
+    chunks: Sequence[Mapping[str, Any]],
+    edges: Sequence[Mapping[str, Any]],
+) -> list[list[Mapping[str, Any]]]:
+    """Bucket each edge only with chunks that contain one of its endpoints."""
+
+    buckets: list[list[Mapping[str, Any]]] = [[] for _chunk in chunks]
+    if not chunks:
+        return buckets
+    chunk_starts = [int(chunk["char_start"]) for chunk in chunks]
+    chunk_ends = [int(chunk["char_end"]) for chunk in chunks]
+    for edge in edges:
+        indexes: list[int] = []
+        for field in ("from_char", "to_char"):
+            offset = int(edge[field])
+            index = bisect_right(chunk_starts, offset) - 1
+            if (
+                0 <= index < len(chunks)
+                and offset < chunk_ends[index]
+                and index not in indexes
+            ):
+                indexes.append(index)
+        for index in indexes:
+            buckets[index].append(edge)
+    return buckets
+
+
 def _attach_chunk_training_sidecars(
     chunks: Sequence[dict[str, Any]],
     entities: Sequence[Mapping[str, Any]],
@@ -1714,13 +1775,24 @@ def _attach_chunk_training_sidecars(
     total_diagnostics = 0
     training_receipts: list[dict[str, Any]] = []
 
-    for chunk in chunks:
+    entities_by_chunk = _records_by_overlapping_chunk(chunks, entities)
+    edges_by_chunk = _edges_by_endpoint_chunk(chunks, edges)
+    commands_by_chunk = _records_by_overlapping_chunk(chunks, commands)
+    actions_by_chunk = _records_by_overlapping_chunk(
+        chunks, build_actions
+    )
+    tests_by_chunk = _records_by_overlapping_chunk(chunks, tests)
+    diagnostics_by_chunk = _records_by_overlapping_chunk(
+        chunks, diagnostics
+    )
+
+    for chunk_index, chunk in enumerate(chunks):
         chunk_start = int(chunk["char_start"])
         chunk_end = int(chunk["char_end"])
         chunk_length = chunk_end - chunk_start
         localized_entities: list[dict[str, Any]] = []
         local_entity_ids: set[str] = set()
-        for entity in entities:
+        for entity in entities_by_chunk[chunk_index]:
             localized = _localized_training_record(
                 entity,
                 chunk_start=chunk_start,
@@ -1736,7 +1808,7 @@ def _attach_chunk_training_sidecars(
         localized_edges: list[dict[str, Any]] = []
         crossing_edges: list[dict[str, Any]] = []
         outbound_cross_chunk_edges: list[dict[str, Any]] = []
-        for edge in edges:
+        for edge in edges_by_chunk[chunk_index]:
             from_char = int(edge["from_char"])
             to_char = int(edge["to_char"])
             from_local = chunk_start <= from_char < chunk_end
@@ -1786,7 +1858,7 @@ def _attach_chunk_training_sidecars(
 
         localized_commands = [
             localized
-            for record in commands
+            for record in commands_by_chunk[chunk_index]
             if (
                 localized := _localized_training_record(
                     record,
@@ -1799,7 +1871,7 @@ def _attach_chunk_training_sidecars(
         ]
         localized_actions = [
             localized
-            for record in build_actions
+            for record in actions_by_chunk[chunk_index]
             if (
                 localized := _localized_training_record(
                     record,
@@ -1812,7 +1884,7 @@ def _attach_chunk_training_sidecars(
         ]
         localized_tests = [
             localized
-            for record in tests
+            for record in tests_by_chunk[chunk_index]
             if (
                 localized := _localized_training_record(
                     record,
@@ -1824,7 +1896,7 @@ def _attach_chunk_training_sidecars(
         ]
         localized_diagnostics = [
             localized
-            for record in diagnostics
+            for record in diagnostics_by_chunk[chunk_index]
             if (
                 localized := _localized_training_record(
                     record,

@@ -19,7 +19,10 @@ from ci_log_sidecars import (  # noqa: E402
     EDGE_IDS,
     SIDECAR_SCHEMA,
     TRAINING_SIDECAR_SCHEMA,
+    _attach_chunk_semantic_rle,
+    _attach_chunk_training_sidecars,
     _is_package_version,
+    _physical_lines,
     canonicalize_ci_log,
     extract_ci_log_sidecar,
     stable_json_dumps,
@@ -32,6 +35,115 @@ def _timestamped(*payloads: str, crlf: bool = False) -> bytes:
         f"2026-07-26T04:35:{index:02d}.{index:07d}Z {payload}{terminator}"
         for index, payload in enumerate(payloads)
     ).encode()
+
+
+class _SuffixSliceTrackingString(str):
+    unbounded_suffix_slices: int
+
+    def __new__(cls, value: str):
+        instance = super().__new__(cls, value)
+        instance.unbounded_suffix_slices = 0
+        return instance
+
+    def __getitem__(self, key: object) -> str:
+        if (
+            isinstance(key, slice)
+            and key.stop is None
+            and key.start not in (None, 0)
+        ):
+            self.unbounded_suffix_slices += 1
+        return super().__getitem__(key)
+
+
+def test_physical_line_scan_is_linear_and_preserves_mixed_boundaries() -> None:
+    text = _SuffixSliceTrackingString("alpha\r\nbeta\rgamma\ndelta")
+
+    assert _physical_lines(text) == [
+        {
+            "source_start": 0,
+            "source_end": 7,
+            "content": "alpha",
+            "terminator": "\r\n",
+        },
+        {
+            "source_start": 7,
+            "source_end": 12,
+            "content": "beta",
+            "terminator": "\r",
+        },
+        {
+            "source_start": 12,
+            "source_end": 18,
+            "content": "gamma",
+            "terminator": "\n",
+        },
+        {
+            "source_start": 18,
+            "source_end": 23,
+            "content": "delta",
+            "terminator": "",
+        },
+    ]
+    assert text.unbounded_suffix_slices == 1
+
+
+class _IterationTrackingSequence:
+    def __init__(self, values: list[dict]) -> None:
+        self.values = values
+        self.iterations = 0
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __getitem__(self, index: int) -> dict:
+        return self.values[index]
+
+    def __iter__(self):
+        self.iterations += 1
+        return iter(self.values)
+
+
+def test_chunk_sidecar_attachment_buckets_each_record_sequence_once() -> None:
+    chunks = [
+        {"chunk_id": "chunk:000000", "char_start": 0, "char_end": 5},
+        {"chunk_id": "chunk:000001", "char_start": 5, "char_end": 10},
+    ]
+    entity = {
+        "entity_id": "entity:000000",
+        "role": "SOURCE_FILE",
+        "role_id": 1,
+        "domain": "CPP",
+        "domain_id": 1,
+        "start_char": 2,
+        "end_char": 8,
+        "text": "234567",
+        "confidence": {"score": 1.0},
+    }
+    semantic_entities = _IterationTrackingSequence([entity])
+
+    _attach_chunk_semantic_rle(chunks, semantic_entities)
+
+    assert semantic_entities.iterations == 1
+    training_entities = _IterationTrackingSequence([entity])
+    empty_sequences = [
+        _IterationTrackingSequence([]) for _field in range(5)
+    ]
+    _attach_chunk_training_sidecars(
+        chunks,
+        training_entities,
+        empty_sequences[0],
+        commands=empty_sequences[1],
+        build_actions=empty_sequences[2],
+        tests=empty_sequences[3],
+        diagnostics=empty_sequences[4],
+    )
+    assert training_entities.iterations == 1
+    assert all(sequence.iterations == 1 for sequence in empty_sequences)
+    assert [
+        record["source_span_clipped"]
+        for chunk in chunks
+        for record in chunk["training_sidecars"]["entities"]
+    ] == [True, True]
 
 
 def _assert_conserved(result: dict) -> None:
