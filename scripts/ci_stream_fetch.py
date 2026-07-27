@@ -2016,6 +2016,57 @@ class FetchState:
             int(previous["occurrence_tokens"]),
         )
 
+    def fail_terminal_probe_with_durable_members(
+        self,
+        attempt: Attempt,
+        *,
+        error: TerminalHTTP,
+        secrets: Iterable[str] = (),
+    ) -> bool:
+        """Refuse a terminal classification when this attempt already owns CAS.
+
+        A retry can observe HTTP 404/410 after an earlier process parsed only
+        part of a complete archive.  Marking that attempt terminal would hide
+        its durable members from the normal terminal summary while leaving
+        their CAS occurrences behind.  Keep the row explicitly failed so
+        receipt finalization remains blocked until an audited archive recovery
+        completes the attempt.
+        """
+
+        with self._lock, self._connection:
+            durable_members = int(
+                self._connection.execute(
+                    """
+                    SELECT COUNT(*) FROM members
+                    WHERE repo=? AND run_id=? AND attempt=?
+                    """,
+                    (attempt.repo, attempt.run_id, attempt.attempt),
+                ).fetchone()[0]
+            )
+            if durable_members == 0:
+                return False
+            self._connection.execute(
+                """
+                UPDATE attempts SET
+                  status='failed',
+                  member_count=0,chunk_count=0,occurrence_tokens=0,
+                  terminal_http_status=?,terminal_body_sha256=?,
+                  error_class=?,error_message=?,updated_at=?
+                WHERE repo=? AND run_id=? AND attempt=?
+                """,
+                (
+                    error.status,
+                    _sha256_bytes(error.body),
+                    type(error).__name__,
+                    _safe_error(error, secrets),
+                    _utc_now(),
+                    attempt.repo,
+                    attempt.run_id,
+                    attempt.attempt,
+                ),
+            )
+        return True
+
     def finish_attempt(
         self,
         attempt: Attempt,
@@ -3231,18 +3282,23 @@ class CIStreamFetcher:
             )
             self.rescue.mark_consumed(archive)
         except TerminalHTTP as exc:
-            status = (
-                "terminal_410" if exc.status == 410 else "terminal_404"
-            )
-            self.state.finish_attempt(
+            if not self.state.fail_terminal_probe_with_durable_members(
                 attempt,
-                status=status,
-                jobs=jobs,
-                terminal_http_status=exc.status,
-                terminal_body_sha256=_sha256_bytes(exc.body),
                 error=exc,
                 secrets=self.client.secrets,
-            )
+            ):
+                status = (
+                    "terminal_410" if exc.status == 410 else "terminal_404"
+                )
+                self.state.finish_attempt(
+                    attempt,
+                    status=status,
+                    jobs=jobs,
+                    terminal_http_status=exc.status,
+                    terminal_body_sha256=_sha256_bytes(exc.body),
+                    error=exc,
+                    secrets=self.client.secrets,
+                )
         except (APIError, ArchiveError, FetchError, OSError, zipfile.BadZipFile) as exc:
             with self.state._lock:
                 tries_row = self.state._connection.execute(
