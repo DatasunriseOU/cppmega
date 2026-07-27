@@ -45,6 +45,10 @@ from scripts.ci_stream_fetch import (  # noqa: E402
     _fsync_directory,
     _safe_zip_infos,
 )
+from scripts.ci_stream_inventory import (  # noqa: E402
+    format_utc_instant,
+    parse_utc_instant,
+)
 
 
 SCHEMA = "cppmega_ci_preserved_archive_recovery_v1"
@@ -469,6 +473,17 @@ def _receipt(plan: RecoveryPlan) -> tuple[Path, dict[str, object], str]:
             "proof": proof,
         }
         _atomic_write_bytes(path, _canonical_json_bytes(value) + b"\n")
+    verified_at = value.get("verified_at")
+    try:
+        canonical_verified_at = (
+            None
+            if not isinstance(verified_at, str)
+            else format_utc_instant(parse_utc_instant(verified_at))
+        )
+    except ValueError:
+        canonical_verified_at = None
+    if canonical_verified_at != verified_at:
+        raise RecoveryError(f"invalid receipt verification time: {path}")
     return path, value, _sha256_file(path)
 
 
