@@ -1184,6 +1184,87 @@ def test_terminal_log_probe_does_not_spend_a_jobs_request(
         fetcher.close()
 
 
+def test_terminal_probe_cannot_hide_durable_member_occurrences(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path / "inventory.sqlite", 1)
+    tokenizer = _tokenizer(tmp_path / "tokenizer.json")
+    state_path = tmp_path / "fetch.sqlite"
+    store_path = tmp_path / "store"
+    first = ci.CIStreamFetcher(
+        inventory_path=inventory,
+        state_path=state_path,
+        content_store_path=store_path,
+        tokenizer_path=tokenizer,
+        tokens=["api-secret"],
+        progress_path=tmp_path / "progress.json",
+        receipt_path=tmp_path / "receipt.json",
+        parser=_fake_parser,
+        requester=FakeGitHub(_zip_bytes()).request,
+        archive_downloader=FakeGitHub(_zip_bytes()).download,
+        target_unique_tokens=1_000_000,
+        sleeper=lambda _: None,
+    )
+    try:
+        first.run(continuous=False, max_runs=1)
+        assert first.state._connection.execute(
+            "SELECT COUNT(*) FROM members"
+        ).fetchone()[0] == 1
+    finally:
+        first.close()
+
+    with sqlite3.connect(state_path) as connection:
+        connection.execute(
+            """
+            UPDATE attempts SET
+              status='retry',
+              error_class='SyntheticInterruptedAttempt',
+              error_message='test terminal probe after durable member'
+            """
+        )
+
+    terminal_github = FakeGitHub(_zip_bytes(), log_status=410)
+    resumed = ci.CIStreamFetcher(
+        inventory_path=inventory,
+        state_path=state_path,
+        content_store_path=store_path,
+        tokenizer_path=tokenizer,
+        tokens=["api-secret"],
+        progress_path=tmp_path / "progress.json",
+        receipt_path=tmp_path / "receipt.json",
+        parser=_fake_parser,
+        requester=terminal_github.request,
+        archive_downloader=terminal_github.download,
+        target_unique_tokens=1_000_000,
+        resume=True,
+        sleeper=lambda _: None,
+    )
+    try:
+        resumed.run(continuous=False, max_runs=1)
+        row = resumed.state._connection.execute(
+            """
+            SELECT status,terminal_http_status,member_count,
+                   chunk_count,occurrence_tokens,error_class
+            FROM attempts
+            """
+        ).fetchone()
+        assert tuple(row) == (
+            "failed",
+            410,
+            0,
+            0,
+            0,
+            "TerminalHTTP",
+        )
+        assert resumed.state._connection.execute(
+            "SELECT COUNT(*) FROM members"
+        ).fetchone()[0] == 1
+        assert resumed.store.status()["counters"]["occurrence_count"] == 1
+        assert not any("/jobs?" in url for url in terminal_github.api_urls)
+    finally:
+        resumed.close()
+
+
 def test_progress_heartbeat_is_written_while_parser_is_still_running(
     tmp_path: Path,
 ) -> None:
