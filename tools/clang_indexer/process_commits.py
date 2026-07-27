@@ -240,9 +240,18 @@ class PRDiscussionLookup:
     does NOT fail — it simply leaves record['pr_discussion'] absent.
     """
 
-    def __init__(self, store_path: str, repo_list_path: str | None) -> None:
+    def __init__(
+        self,
+        store_path: str,
+        repo_list_path: str | None,
+        *,
+        scan_id: str | None = None,
+    ) -> None:
         if not os.path.exists(store_path):
             raise FileNotFoundError(f"--pr-store does not exist: {store_path}")
+        if scan_id is not None and re.fullmatch(r"[0-9a-f]{64}", scan_id) is None:
+            raise ValueError(f"invalid PR scan_id: {scan_id!r}")
+        self.scan_id = scan_id
         if all(
             callable(getattr(_pr_store_mod, name, None))
             for name in ("connect", "get_by_pr", "get_by_sha")
@@ -290,21 +299,43 @@ class PRDiscussionLookup:
 
     def _get_by_pr(self, owner_repo: str, pr_number: int) -> object | None:
         if not self._legacy_store:
-            return _pr_store_mod.get_by_pr(self._conn, owner_repo, pr_number)
+            return _pr_store_mod.get_by_pr(
+                self._conn,
+                owner_repo,
+                pr_number,
+                scan_id=self.scan_id,
+            )
+        if self.scan_id is None:
+            return self._conn.execute(
+                "SELECT * FROM prs WHERE repo=? AND pr_number=?",
+                (owner_repo, pr_number),
+            ).fetchone()
         return self._conn.execute(
-            "SELECT * FROM prs WHERE repo=? AND pr_number=?",
-            (owner_repo, pr_number),
+            "SELECT * FROM prs WHERE repo=? AND pr_number=? AND scan_id=?",
+            (owner_repo, pr_number, self.scan_id),
         ).fetchone()
 
     def _get_by_sha(self, owner_repo: str, sha: str) -> object | None:
         if not self._legacy_store:
-            return _pr_store_mod.get_by_sha(self._conn, owner_repo, sha)
-        return self._conn.execute(
-            """SELECT p.* FROM prs p
-               JOIN pr_by_sha s ON s.repo=p.repo AND s.pr_number=p.pr_number
-               WHERE s.repo=? AND s.merge_commit_sha=?""",
-            (owner_repo, sha),
-        ).fetchone()
+            return _pr_store_mod.get_by_sha(
+                self._conn,
+                owner_repo,
+                sha,
+                scan_id=self.scan_id,
+            )
+        query = """
+            SELECT p.* FROM prs AS p
+            JOIN pr_by_sha AS s
+              ON s.repo=p.repo
+             AND s.pr_number=p.pr_number
+             AND s.merge_commit_sha=p.merge_commit_sha
+            WHERE s.repo=? AND s.merge_commit_sha=?
+        """
+        values: tuple[object, ...] = (owner_repo, sha)
+        if self.scan_id is not None:
+            query += " AND p.scan_id=?"
+            values = (*values, self.scan_id)
+        return self._conn.execute(query, values).fetchone()
 
     def attach(self, record: dict) -> bool:
         """Look up the PR for this commit and set record['pr_discussion'] on hit.
@@ -329,6 +360,13 @@ class PRDiscussionLookup:
             self.misses += 1
             return False
         normalized = _normalize_pr_record(rec)
+        if (
+            self.scan_id is not None
+            and normalized.get("scan_id") != self.scan_id
+        ):
+            raise ValueError(
+                f"PR store returned a row outside scan_id={self.scan_id}"
+            )
         discussion = _render_discussion(normalized)
         if not discussion:
             self.misses += 1
@@ -3040,6 +3078,12 @@ def main() -> int:
              'A miss leaves the record Tier-1 (git-only) — never fails.',
     )
     parser.add_argument(
+        '--pr-scan-id', default=None,
+        help='Exact 64-hex PR scan identity. When set, --pr-store lookups are '
+             'restricted to rows proven by that scan; stale archival rows are '
+             'treated as normal misses.',
+    )
+    parser.add_argument(
         '--repo-list', default=None,
         help='Path to outputs/pr_ingest/repo_list.json (bare-name -> owner/repo '
              'map) used to resolve the PR-store key for records whose repo is a '
@@ -3047,6 +3091,13 @@ def main() -> int:
              "'/' are used as-is.",
     )
     args = parser.parse_args()
+    if args.pr_scan_id is not None:
+        if re.fullmatch(r"[0-9a-f]{64}", args.pr_scan_id) is None:
+            print(f"ERROR: invalid --pr-scan-id: {args.pr_scan_id!r}", file=sys.stderr)
+            return 1
+        if not args.pr_store:
+            print("ERROR: --pr-scan-id requires --pr-store", file=sys.stderr)
+            return 1
     missing_inputs = [path for path in args.inputs if not os.path.exists(path)]
     if missing_inputs:
         print(
@@ -3140,9 +3191,14 @@ def main() -> int:
     # Tier-2 PR-discussion lookup glue (fail-loud on a bad store/repo-list path).
     pr_lookup: PRDiscussionLookup | None = None
     if args.pr_store:
-        pr_lookup = PRDiscussionLookup(args.pr_store, args.repo_list)
+        pr_lookup = PRDiscussionLookup(
+            args.pr_store,
+            args.repo_list,
+            scan_id=args.pr_scan_id,
+        )
         print(f"  pr_store: live lookup at {args.pr_store} "
-              f"(repo_list={args.repo_list})", file=sys.stderr)
+              f"(repo_list={args.repo_list}, scan_id={args.pr_scan_id})",
+              file=sys.stderr)
 
     clang_index = Index.create()
     build_context = BuildContextResolver(repo_root=args.repo_root, repo_dir=args.repo_dir)

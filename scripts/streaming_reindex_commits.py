@@ -552,6 +552,8 @@ def process_range(
     analysis_cache_entries: int = 128,
     defer_promote: bool = False,
     deferred_stage_dir: Path | None = None,
+    *,
+    pr_scan_id: str | None = None,
 ) -> dict:
     """Full per-range pipeline. RAISES RepoFailure on any failure (no fallback)."""
     project_id = sr.resolve_project_identity(repo, repo_list)
@@ -593,6 +595,7 @@ def process_range(
                                        memory_limit_gb=memory_limit_gb,
                                        analysis_cache_entries=analysis_cache_entries,
                                        allow_empty=True,
+                                       pr_scan_id=pr_scan_id,
                                        project_id=project_id)
         timings["process_commits_s"] = round(time.monotonic() - started, 6)
         if enriched is None:

@@ -3572,6 +3572,7 @@ def run_commits_half(
     commit_records_override: CommitRecordsProvider | None = None,
     revision_guard: CodeRevisionGuard | None = None,
     project_id: str | None = None,
+    pr_scan_id: str | None = None,
 ) -> tuple[int, int, bool]:
     """Extract commit records once (checkpointed), fan ranges to the pool.
 
@@ -3794,13 +3795,19 @@ def run_commits_half(
         active_process_range = (
             process_range if range_runner_override is None else range_runner_override
         )
+        scan_kwargs = (
+            {"pr_scan_id": pr_scan_id}
+            if active_process_range is process_range
+            else {}
+        )
         if defer_range_promotes:
             return active_process_range(
                 *args,
                 defer_promote=True,
                 deferred_stage_dir=deferred_stage_dir,
+                **scan_kwargs,
             )
-        return active_process_range(*args)
+        return active_process_range(*args, **scan_kwargs)
 
     def mark_failed_range(
         failed_start: int,
@@ -4098,6 +4105,7 @@ def process_one_repo(
     dedup_promote_batch_size: int = DEFAULT_DEDUP_PROMOTE_BATCH_SIZE,
     retain_partial_work: bool = False,
     revision_guard: CodeRevisionGuard | None = None,
+    pr_scan_id: str | None = None,
 ) -> dict:
     """Run BOTH halves for one already-extracted repo subtree, then delete it.
 
@@ -4293,6 +4301,7 @@ def process_one_repo(
                     range_target_bytes=range_target_bytes,
                     dedup_promote_batch_size=dedup_promote_batch_size,
                     revision_guard=revision_guard,
+                    pr_scan_id=pr_scan_id,
                 )
                 result["commits_done"] = done
                 result["commits_failed"] = failed
@@ -4585,8 +4594,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     configure_runtime_paths_from_args(args)
-    pr_store = Path(args.pr_store) if args.pr_store else None
-    repo_list = Path(args.repo_list) if args.repo_list else None
+    pr_store = (
+        Path(args.pr_store).expanduser().resolve()
+        if args.pr_store
+        else None
+    )
+    repo_list = (
+        Path(args.repo_list).expanduser().resolve()
+        if args.repo_list
+        else None
+    )
+    pr_completion_receipt_path = (
+        Path(args.pr_completion_receipt).expanduser().resolve()
+        if args.pr_completion_receipt
+        else None
+    )
     pr_completion_binding: dict[str, object] | None = None
     if args.streams in {"both", "commits"}:
         missing_pr_options = [
@@ -4605,9 +4627,10 @@ def main(argv: list[str]) -> int:
             )
         assert pr_store is not None
         assert repo_list is not None
+        assert pr_completion_receipt_path is not None
         try:
             pr_completion_binding = load_pr_completion_binding(
-                Path(args.pr_completion_receipt),
+                pr_completion_receipt_path,
                 pr_store=pr_store,
                 repo_list=repo_list,
             )
@@ -4620,6 +4643,11 @@ def main(argv: list[str]) -> int:
             f"prs={pr_completion_binding['stored_pr_count']} "
             f"(repo_list={repo_list})"
         )
+    pr_scan_id = (
+        str(pr_completion_binding["scan_id"])
+        if pr_completion_binding is not None
+        else None
+    )
     try:
         revision_guard = CodeRevisionGuard.for_production(
             args.expected_code_revision,
@@ -5057,6 +5085,7 @@ def main(argv: list[str]) -> int:
                     dedup_promote_batch_size=dedup_promote_batch_size,
                     retain_partial_work=args.retain_partial_work,
                     revision_guard=revision_guard,
+                    pr_scan_id=pr_scan_id,
                 )
                 processed_repos += 1
                 if isinstance(res.get("code"), dict):
@@ -5164,6 +5193,7 @@ def main(argv: list[str]) -> int:
                     dedup_promote_batch_size=dedup_promote_batch_size,
                     retain_partial_work=args.retain_partial_work,
                     revision_guard=revision_guard,
+                    pr_scan_id=pr_scan_id,
                 )
                 inflight[fut] = repo
                 submitted_repos += 1
@@ -5204,10 +5234,11 @@ def main(argv: list[str]) -> int:
     if pr_completion_binding is not None and not interrupted:
         assert pr_store is not None
         assert repo_list is not None
+        assert pr_completion_receipt_path is not None
         try:
             revalidate_pr_completion_binding(
                 pr_completion_binding,
-                Path(args.pr_completion_receipt),
+                pr_completion_receipt_path,
                 pr_store=pr_store,
                 repo_list=repo_list,
             )

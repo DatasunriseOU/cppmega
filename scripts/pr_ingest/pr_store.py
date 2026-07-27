@@ -874,11 +874,19 @@ def _assemble(
     conn: sqlite3.Connection,
     repo: str,
     pr_number: int,
+    *,
+    scan_id: str | None = None,
 ) -> Optional[dict[str, Any]]:
-    row = conn.execute(
-        "SELECT * FROM prs WHERE repo=? AND pr_number=?",
-        (repo, int(pr_number)),
-    ).fetchone()
+    if scan_id is None:
+        row = conn.execute(
+            "SELECT * FROM prs WHERE repo=? AND pr_number=?",
+            (repo, int(pr_number)),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM prs WHERE repo=? AND pr_number=? AND scan_id=?",
+            (repo, int(pr_number), scan_id),
+        ).fetchone()
     if row is None:
         return None
 
@@ -942,22 +950,53 @@ def get_by_pr(
     conn: sqlite3.Connection,
     repo: str,
     pr_number: int,
+    *,
+    scan_id: str | None = None,
 ) -> Optional[dict[str, Any]]:
-    return _assemble(conn, repo, int(pr_number))
+    return _assemble(conn, repo, int(pr_number), scan_id=scan_id)
 
 
 def get_by_sha(
     conn: sqlite3.Connection,
     repo: str,
     sha: str,
+    *,
+    scan_id: str | None = None,
 ) -> Optional[dict[str, Any]]:
-    row = conn.execute(
-        "SELECT pr_number FROM pr_by_sha WHERE repo=? AND merge_commit_sha=?",
-        (repo, sha),
-    ).fetchone()
+    if scan_id is None:
+        row = conn.execute(
+            """
+            SELECT p.pr_number
+            FROM pr_by_sha AS s
+            JOIN prs AS p
+              ON p.repo=s.repo
+             AND p.pr_number=s.pr_number
+             AND p.merge_commit_sha=s.merge_commit_sha
+            WHERE s.repo=? AND s.merge_commit_sha=?
+            """,
+            (repo, sha),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """
+            SELECT p.pr_number
+            FROM pr_by_sha AS s
+            JOIN prs AS p
+              ON p.repo=s.repo
+             AND p.pr_number=s.pr_number
+             AND p.merge_commit_sha=s.merge_commit_sha
+            WHERE s.repo=? AND s.merge_commit_sha=? AND p.scan_id=?
+            """,
+            (repo, sha, scan_id),
+        ).fetchone()
     if row is None:
         return None
-    return _assemble(conn, repo, int(row["pr_number"]))
+    return _assemble(
+        conn,
+        repo,
+        int(row["pr_number"]),
+        scan_id=scan_id,
+    )
 
 
 def _iter_ndjson(paths: list[str]):
