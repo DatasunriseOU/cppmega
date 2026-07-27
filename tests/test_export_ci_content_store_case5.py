@@ -24,6 +24,12 @@ from cppmega.megatron.domain_route_contract import (
 )
 from scripts.ci_content_store import CIContentStore, _hash_records, hash_token_sequence
 from scripts.ci_log_sidecars import SIDECAR_SCHEMA as PARSER_SIDECAR_SCHEMA
+from scripts.ci_source_binding_projection import (
+    LEGACY_PARSER_SHA256,
+    MAX_SOURCE_BINDING_PROJECTION_RECORD_BYTES,
+    SOURCE_BINDING_PROJECTION_SCHEMA,
+    target_parser_script_sha256,
+)
 from scripts.ci_stream_fetch import (
     SCHEMA_VERSION as FETCH_STATE_SCHEMA,
     _STATE_SCHEMA as FETCH_STATE_SQL_SCHEMA,
@@ -39,11 +45,12 @@ from scripts.export_ci_content_store_case5 import (
     FrozenStore,
     OccurrenceRecord,
     _fragment_ranges,
-    _publish_directory_no_replace,
     _project_content,
+    _publish_directory_no_replace,
     _sequence_digest,
-    _split_for_sequence,
     _smallest_bucket,
+    _source_binding_projection_writer,
+    _split_for_sequence,
     _validate_occurrence_v3,
     export_store,
 )
@@ -408,6 +415,7 @@ def _write_fetch_state(
     store_receipt: dict[str, Any],
     exact_tokenizer: ExactTokenizer,
     records: list[tuple[str, dict[str, Any], int]],
+    parser_script_sha256: str,
 ) -> None:
     attempts: dict[tuple[str, int, int], list[tuple[str, dict[str, Any], int]]] = {}
     members: dict[tuple[str, int, int, str], list[tuple[str, dict[str, Any], int]]] = {}
@@ -432,7 +440,7 @@ def _write_fetch_state(
             "tokenizer_contract": _canonical_bytes(exact_tokenizer.contract).decode(),
             "tokenizer_fingerprint": exact_tokenizer.fingerprint,
             "fetcher_script_sha256": "4" * 64,
-            "parser_script_sha256": "5" * 64,
+            "parser_script_sha256": parser_script_sha256,
             "content_store_script_sha256": store_receipt["script_sha256"],
             "chunk_semantics": (
                 "parser-dedup-text-cppmega-training-tokenizer-"
@@ -610,6 +618,7 @@ def _build_store(
     *,
     wrong_token_sequence: bool = False,
     target_unique_tokens: int = 0,
+    parser_script_sha256: str | None = None,
 ) -> tuple[Path, Path, Path]:
     for _text, provenance in records:
         if provenance.get("job") == {}:
@@ -694,6 +703,11 @@ def _build_store(
         store_receipt=receipt,
         exact_tokenizer=exact_tokenizer,
         records=prepared_records,
+        parser_script_sha256=(
+            target_parser_script_sha256()
+            if parser_script_sha256 is None
+            else parser_script_sha256
+        ),
     )
     return store_root, receipt_path, fetch_state
 
@@ -988,7 +1002,9 @@ def test_representative_metadata_is_explicit_sanitized_and_receipt_bound(
             "kind": "compile",
             "cwd": "/work/repo",
             "source_inputs": ["src/main.C"],
+            "source_input_count": 1,
             "outputs": ["build/main.o"],
+            "output_count": 1,
             "flags": ["-O2", "-c"],
             "target": "build/main.o",
             "command": "clang++ -O2 -c src/main.cpp",
@@ -1002,11 +1018,11 @@ def test_representative_metadata_is_explicit_sanitized_and_receipt_bound(
                     "confidence": {
                         "score": 0.95,
                         "level": "high",
-                        "source": "fixture",
+                        "source": "relative_source_path_v1",
                     },
-                    "url": "https://api.example.test/blob",
                 }
             ],
+            "repository_source_binding_count": 1,
             "start_char": 0,
             "end_char": len("compile"),
             "line_index": 0,
@@ -1134,6 +1150,154 @@ def test_representative_metadata_is_explicit_sanitized_and_receipt_bound(
     assert classifications["test"]["value"]["framework"]["values"] == ["pytest"]
     assert classifications["tool"]["values"] == ["clang", "clang++"]
     assert classifications["action_kind"]["values"] == ["compile"]
+
+
+def test_legacy_source_bindings_require_authorization_and_export_as_overlay(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    text = "clang++ -c src/main.cpp"
+    provenance = _provenance(text)
+    provenance["repository"] = "owner/base"
+    provenance["repository_requested"] = "owner/base"
+    provenance["repository_scope_key"] = "owner/base"
+    provenance["source_repository"] = "fork/base"
+    provenance["source_repository_id"] = 2
+    provenance["workflow"]["event"] = "pull_request"
+    provenance["archive"]["member"] = "0_build.txt"
+    provenance["job"] = {
+        "id": 99,
+        "name": "build",
+        "status": "completed",
+        "conclusion": "success",
+        "labels": ["ubuntu-24.04", "x64"],
+    }
+    action = {
+        "normalization_schema": "cppmega_ci_build_action_normalization_v1",
+        "tool": "clang++",
+        "kind": "compile",
+        "cwd": "/home/runner/work/base/base/build",
+        "source_inputs": ["src/main.cpp"],
+        "source_input_count": 1,
+        "outputs": [],
+        "output_count": 0,
+        "flags": ["-c"],
+        "repository_source_bindings": [
+            {
+                "repository": "fork/base",
+                "head_sha": "a" * 40,
+                "source_path": "src/main.cpp",
+                "confidence": {
+                    "score": 0.95,
+                    "level": "high",
+                    "source": "relative_source_path_v1",
+                },
+            }
+        ],
+        "repository_source_binding_count": 1,
+        "command_sha256": "5" * 64,
+        "action_shape_sha256": "6" * 64,
+        "start_char": 0,
+        "end_char": len(text),
+        "line_index": 0,
+        "section_ordinal": 0,
+        "step_ordinal": None,
+        "confidence": {
+            "score": 0.98,
+            "level": "high",
+            "source": "fixture",
+        },
+    }
+    provenance["chunk"]["training_sidecars"]["build_actions"] = [action]
+    store_root, receipt_path, fetch_state = _build_store(
+        tmp_path,
+        exact_tokenizer,
+        [(text, provenance)],
+        parser_script_sha256=LEGACY_PARSER_SHA256,
+    )
+    store_index = store_root / "index.sqlite3"
+    input_hashes = {
+        "receipt": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+        "store_index": hashlib.sha256(store_index.read_bytes()).hexdigest(),
+        "fetch_state": hashlib.sha256(fetch_state.read_bytes()).hexdigest(),
+    }
+
+    refused_output = tmp_path / "legacy-refused"
+    with pytest.raises(ExportError, match="requires exact explicit authorization"):
+        export_store(
+            store_root=store_root,
+            store_receipt=receipt_path,
+            fetch_state=fetch_state,
+            tokenizer_json=TOKENIZER_JSON,
+            output=refused_output,
+        )
+    assert not refused_output.exists()
+
+    output = tmp_path / "legacy-projected"
+    receipt = export_store(
+        store_root=store_root,
+        store_receipt=receipt_path,
+        fetch_state=fetch_state,
+        tokenizer_json=TOKENIZER_JSON,
+        output=output,
+        source_binding_projection_from_parser_sha256=LEGACY_PARSER_SHA256,
+    )
+    projection = receipt["source_binding_projection"]
+    assert projection["schema"] == SOURCE_BINDING_PROJECTION_SCHEMA
+    assert projection["mode"] == "legacy_projection"
+    assert projection["input_parser_script_sha256"] == LEGACY_PARSER_SHA256
+    assert projection["coverage"] == {
+        "order": "occurrence-key-then-action-index-then-source-input-index",
+        "occurrence_count": 1,
+        "action_count": 1,
+        "source_input_count": 1,
+        "old_binding_count": 1,
+        "projected_binding_count": 1,
+    }
+    assert projection["change_counts"] == {"modified": 1}
+    ledger = json.loads(
+        (output / projection["ledger_artifact"]).read_text(encoding="utf-8")
+    )
+    assert ledger["old_binding"]["repository"] == "fork/base"
+    assert ledger["projected_binding"]["repository"] == "owner/base"
+    assert ledger["projected_binding"]["source_path"] == "build/src/main.cpp"
+
+    metadata_path = output / receipt["representative_metadata"]["artifact"]
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    projected_action = metadata["training_sidecars"]["build_actions"][0]
+    assert projected_action["repository_source_bindings"][0]["repository"] == (
+        "owner/base"
+    )
+    assert projected_action["repository_source_bindings"][0]["source_path"] == (
+        "build/src/main.cpp"
+    )
+    assert metadata["source_binding_projection"]["mode"] == "legacy_projection"
+    assert {
+        "receipt": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+        "store_index": hashlib.sha256(store_index.read_bytes()).hexdigest(),
+        "fetch_state": hashlib.sha256(fetch_state.read_bytes()).hexdigest(),
+    } == input_hashes
+
+
+def test_projection_writer_rejects_rows_the_consumer_cannot_read(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source_binding_projection.jsonl"
+    writer = _source_binding_projection_writer(path)
+    try:
+        with pytest.raises(ExportError, match="record exceeds"):
+            writer.append(
+                {
+                    "source_input": (
+                        "x" * MAX_SOURCE_BINDING_PROJECTION_RECORD_BYTES
+                    )
+                }
+            )
+    finally:
+        writer.close()
+
+    assert writer.count == 0
+    assert path.read_bytes() == b""
 
 
 def test_split_contract_declares_and_uses_the_exact_hash_projection() -> None:

@@ -12,6 +12,8 @@ The exporter is deliberately fail closed:
   exclusion ledger and never enter representative selection;
 * every occurrence must carry exact-attempt v3 provenance and exhaustive v2
   chunk training sidecars;
+* every build-action source input is audited against its parser generation and
+  emitted through a receipt-bound source-binding projection ledger;
 * every unique content is re-tokenized with ``ExactTokenizer`` before token
   sequence representatives are selected;
 * payload token arrays are split before BOS/domain framing, with no truncation;
@@ -101,6 +103,16 @@ from scripts.ci_content_store import (  # noqa: E402
     _sqlite_schema_sha256,
     hash_token_sequence,
 )
+from scripts.ci_source_binding_projection import (  # noqa: E402
+    MAX_SOURCE_BINDING_PROJECTION_RECORD_BYTES,
+    SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN,
+    SOURCE_BINDING_PROJECTION_SCHEMA,
+    SourceBindingProjectionError,
+    SourceBindingProjector,
+    projection_record_key,
+    projection_script_sha256,
+    target_parser_script_sha256,
+)
 from scripts.ci_log_sidecars import SIDECAR_SCHEMA as PARSER_SIDECAR_SCHEMA  # noqa: E402
 from scripts.ci_stream_fetch import (  # noqa: E402
     SCHEMA_VERSION as FETCH_STATE_SCHEMA,
@@ -118,9 +130,9 @@ from scripts.nanochat_data.pack_enriched_rows import (  # noqa: E402
 )
 
 
-EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v1"
+EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v2"
 REPRESENTATIVE_LEDGER_SCHEMA = "cppmega_ci_token_sequence_representative_ledger_v1"
-REPRESENTATIVE_METADATA_SCHEMA = "cppmega_ci_case5_representative_metadata_v1"
+REPRESENTATIVE_METADATA_SCHEMA = "cppmega_ci_case5_representative_metadata_v2"
 DERIVED_CLASSIFICATION_SCHEMA = "cppmega_ci_case5_derived_classifications_v1"
 OPAQUE_ARTIFACT_LEDGER_SCHEMA = "cppmega_ci_case5_excluded_opaque_artifact_v1"
 OPAQUE_ARTIFACT_POLICY_SCHEMA = "cppmega_ci_opaque_artifact_policy_v1"
@@ -283,7 +295,13 @@ class FetchMemberEvidence:
 class CanonicalLedgerWriter:
     """Stream canonical JSONL while hashing the logical framed record sequence."""
 
-    def __init__(self, path: Path, *, domain: str | None = None):
+    def __init__(
+        self,
+        path: Path,
+        *,
+        domain: str | None = None,
+        max_record_bytes: int | None = None,
+    ):
         self.path = path
         self._handle: BinaryIO = path.open("wb")
         self._logical_digest = hashlib.sha256()
@@ -292,11 +310,20 @@ class CanonicalLedgerWriter:
             self._logical_digest.update(b"\0")
         self.count = 0
         self._closed = False
+        self._max_record_bytes = max_record_bytes
 
     def append(self, value: object) -> None:
         if self._closed:
             raise ExportError(f"ledger is already closed: {self.path}")
         encoded = _canonical_json_bytes(value)
+        if (
+            self._max_record_bytes is not None
+            and len(encoded) + 1 > self._max_record_bytes
+        ):
+            raise ExportError(
+                f"{self.path.name} record exceeds "
+                f"{self._max_record_bytes} bytes"
+            )
         self._handle.write(encoded)
         self._handle.write(b"\n")
         self._logical_digest.update(len(encoded).to_bytes(8, "big"))
@@ -316,6 +343,14 @@ class CanonicalLedgerWriter:
         os.fsync(self._handle.fileno())
         self._handle.close()
         self._closed = True
+
+
+def _source_binding_projection_writer(path: Path) -> CanonicalLedgerWriter:
+    return CanonicalLedgerWriter(
+        path,
+        domain=SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN,
+        max_record_bytes=MAX_SOURCE_BINDING_PROJECTION_RECORD_BYTES,
+    )
 
 
 class CanonicalSequenceHasher:
@@ -3830,6 +3865,7 @@ def _representative_metadata_record(
     content: ContentRecord,
     occurrence: OccurrenceRecord,
     parser_sidecar: Mapping[str, Any],
+    source_binding_projector: SourceBindingProjector,
 ) -> dict[str, object]:
     provenance = occurrence.provenance
     workflow = _sanitize_workflow(provenance.get("workflow"))
@@ -3842,15 +3878,64 @@ def _representative_metadata_record(
         chunk.get("training_sidecars"),
         where="representative training sidecars",
     )
-    build_actions = [
-        _sanitize_build_action(item, index=index)
-        for index, item in enumerate(
-            _require_list(
-                training.get("build_actions"),
-                where="training_sidecars.build_actions",
-            )
+    build_actions: list[dict[str, object]] = []
+    representative_projection_records: list[Mapping[str, object]] = []
+    for index, raw_action in enumerate(
+        _require_list(
+            training.get("build_actions"),
+            where="training_sidecars.build_actions",
         )
-    ]
+    ):
+        action = _require_mapping(
+            raw_action,
+            where=f"training_sidecars.build_actions[{index}]",
+        )
+        projection = source_binding_projector.project_action(
+            occurrence_key=occurrence.key_dict,
+            provenance_sha256=occurrence.provenance_sha256,
+            provenance=provenance,
+            action=action,
+            action_index=index,
+        )
+        projected_action = dict(action)
+        projected_action["repository_source_bindings"] = list(
+            projection.projected_bindings
+        )
+        projected_action["repository_source_binding_count"] = len(
+            projection.projected_bindings
+        )
+        sanitized_action = _sanitize_build_action(
+            projected_action,
+            index=index,
+        )
+        sanitized_action["source_binding_projection"] = {
+            "schema": SOURCE_BINDING_PROJECTION_SCHEMA,
+            "mode": source_binding_projector.mode,
+            "input_parser_script_sha256": (
+                source_binding_projector.input_parser_sha256
+            ),
+            "target_parser_script_sha256": (
+                source_binding_projector.target_parser_sha256
+            ),
+            "record_count": len(projection.records),
+            "records_sha256": _hash_records(
+                "cppmega-ci-source-binding-projection-action-v1",
+                projection.records,
+            ),
+            "upstream_repository_source_binding_count": _require_int(
+                action.get("repository_source_binding_count"),
+                where=(
+                    f"training_sidecars.build_actions[{index}]"
+                    ".repository_source_binding_count"
+                ),
+                minimum=0,
+            ),
+            "projected_repository_source_binding_count": len(
+                projection.projected_bindings
+            ),
+        }
+        build_actions.append(sanitized_action)
+        representative_projection_records.extend(projection.records)
     tests = [
         _sanitize_training_record(
             item,
@@ -3986,6 +4071,21 @@ def _representative_metadata_record(
             provenance.get("parser_sidecar_sha256"),
             where="provenance.parser_sidecar_sha256",
         ),
+        "source_binding_projection": {
+            "schema": SOURCE_BINDING_PROJECTION_SCHEMA,
+            "mode": source_binding_projector.mode,
+            "input_parser_script_sha256": (
+                source_binding_projector.input_parser_sha256
+            ),
+            "target_parser_script_sha256": (
+                source_binding_projector.target_parser_sha256
+            ),
+            "record_count": len(representative_projection_records),
+            "records_sha256": _hash_records(
+                "cppmega-ci-source-binding-projection-representative-v1",
+                representative_projection_records,
+            ),
+        },
         "derived_classifications": derived_classifications,
         "training_sidecars": {
             "schema": training.get("schema"),
@@ -4047,10 +4147,12 @@ def export_store(
     fetch_state: str | os.PathLike[str],
     tokenizer_json: str | os.PathLike[str],
     output: str | os.PathLike[str],
+    source_binding_projection_from_parser_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Export one receipt-frozen store and atomically publish a CASE5 directory."""
 
     exporter_script_sha256 = _script_sha256()
+    source_binding_projection_script_sha256 = projection_script_sha256()
     output_path = Path(output).expanduser().resolve()
     if output_path.exists():
         raise ExportError(f"output already exists: {output_path}")
@@ -4071,6 +4173,7 @@ def export_store(
     representative_metadata_writer: CanonicalLedgerWriter | None = None
     representative_ledger_writer: CanonicalLedgerWriter | None = None
     excluded_opaque_writer: CanonicalLedgerWriter | None = None
+    source_binding_projection_writer: CanonicalLedgerWriter | None = None
     eligibility_connection: sqlite3.Connection | None = None
     parquet_writers: dict[tuple[str, int], pq.ParquetWriter] = {}
     try:
@@ -4117,6 +4220,20 @@ def export_store(
             if expected_content_count < 1 or expected_occurrence_count < 1:
                 raise ExportError("content store has no exportable occurrences")
 
+            source_binding_projector = SourceBindingProjector(
+                frozen_fetch_state.settings["parser_script_sha256"],
+                authorized_legacy_sha256=(
+                    source_binding_projection_from_parser_sha256
+                ),
+            )
+            source_binding_projection_writer = _source_binding_projection_writer(
+                temp_path / "source_binding_projection.jsonl"
+            )
+            source_binding_projection_counts: Counter[str] = Counter()
+            previous_source_binding_projection_key: (
+                tuple[str, str, str, str, int, int, int] | None
+            ) = None
+
             eligibility_path = temp_path / ".eligibility.sqlite3"
             eligibility_connection = sqlite3.connect(eligibility_path)
             eligibility_connection.row_factory = sqlite3.Row
@@ -4159,6 +4276,59 @@ def export_store(
             eligibility_connection.execute("BEGIN")
             for occurrence in store.iter_occurrences():
                 member = frozen_fetch_state.validate_occurrence(occurrence)
+                raw_training = _require_mapping(
+                    _require_mapping(
+                        occurrence.provenance.get("chunk"),
+                        where="source-binding projection chunk",
+                    ).get("training_sidecars"),
+                    where="source-binding projection training sidecars",
+                )
+                raw_actions = _require_list(
+                    raw_training.get("build_actions"),
+                    where="source-binding projection build_actions",
+                )
+                source_binding_projection_counts["occurrences"] += 1
+                for action_index, raw_action in enumerate(raw_actions):
+                    action = _require_mapping(
+                        raw_action,
+                        where=(
+                            "source-binding projection "
+                            f"build_actions[{action_index}]"
+                        ),
+                    )
+                    projection = source_binding_projector.project_action(
+                        occurrence_key=occurrence.key_dict,
+                        provenance_sha256=occurrence.provenance_sha256,
+                        provenance=occurrence.provenance,
+                        action=action,
+                        action_index=action_index,
+                    )
+                    source_binding_projection_counts["actions"] += 1
+                    for record in projection.records:
+                        projection_key = projection_record_key(record)
+                        if (
+                            previous_source_binding_projection_key is not None
+                            and projection_key
+                            <= previous_source_binding_projection_key
+                        ):
+                            raise ExportError(
+                                "source-binding projection records are not in "
+                                "strict canonical order"
+                            )
+                        previous_source_binding_projection_key = projection_key
+                        source_binding_projection_writer.append(record)
+                        source_binding_projection_counts["source_inputs"] += 1
+                        if record["old_binding"] is not None:
+                            source_binding_projection_counts[
+                                "old_bindings"
+                            ] += 1
+                        if record["projected_binding"] is not None:
+                            source_binding_projection_counts[
+                                "projected_bindings"
+                            ] += 1
+                        source_binding_projection_counts[
+                            f"change_kind:{record['change_kind']}"
+                        ] += 1
                 content = store.get_content_record(occurrence.content_sha256)
                 try:
                     eligibility_connection.execute(
@@ -4231,6 +4401,16 @@ def export_store(
                 )
             frozen_fetch_state.verify_member_coverage(eligibility_connection)
             excluded_opaque_writer.close()
+            source_binding_projection_writer.close()
+            if (
+                source_binding_projection_counts["occurrences"]
+                != expected_occurrence_count
+                or source_binding_projection_counts["source_inputs"]
+                != source_binding_projection_writer.count
+            ):
+                raise ExportError(
+                    "source-binding projection coverage differs from the CAS"
+                )
             excluded_member_count = int(
                 eligibility_connection.execute(
                     """
@@ -4546,6 +4726,7 @@ def export_store(
                         content=representative_content,
                         occurrence=representative_occurrence,
                         parser_sidecar=representative_fetch_member.sidecar,
+                        source_binding_projector=source_binding_projector,
                     )
                 )
                 projected = _project_content(
@@ -4890,6 +5071,11 @@ def export_store(
                     "excluded_opaque_artifacts",
                     excluded_opaque_writer.count,
                 ),
+                (
+                    source_binding_projection_writer.path,
+                    "source_binding_projection",
+                    source_binding_projection_writer.count,
+                ),
             ):
                 artifact_records.append(
                     {
@@ -4934,6 +5120,72 @@ def export_store(
                     "unchanged_after_export": True,
                 },
                 "input_fetch_state": frozen_fetch_state.receipt_binding(),
+                "source_binding_projection": {
+                    "schema": SOURCE_BINDING_PROJECTION_SCHEMA,
+                    "mode": source_binding_projector.mode,
+                    "projection_script_sha256": (
+                        source_binding_projection_script_sha256
+                    ),
+                    "input_parser_script_sha256": (
+                        source_binding_projector.input_parser_sha256
+                    ),
+                    "target_parser_script_sha256": (
+                        source_binding_projector.target_parser_sha256
+                    ),
+                    "input_occurrence_set_sha256": store.receipt[
+                        "occurrence_set_sha256"
+                    ],
+                    "input_fetch_state_sqlite_logical_sha256": (
+                        frozen_fetch_state.sqlite_logical_sha256
+                    ),
+                    "input_fetch_state_sidecar_set_sha256": (
+                        frozen_fetch_state.sidecar_set_sha256
+                    ),
+                    "coverage": {
+                        "order": (
+                            "occurrence-key-then-action-index-then-source-input-index"
+                        ),
+                        "occurrence_count": source_binding_projection_counts[
+                            "occurrences"
+                        ],
+                        "action_count": source_binding_projection_counts["actions"],
+                        "source_input_count": source_binding_projection_counts[
+                            "source_inputs"
+                        ],
+                        "old_binding_count": source_binding_projection_counts[
+                            "old_bindings"
+                        ],
+                        "projected_binding_count": (
+                            source_binding_projection_counts[
+                                "projected_bindings"
+                            ]
+                        ),
+                    },
+                    "change_counts": {
+                        key.removeprefix("change_kind:"): value
+                        for key, value in sorted(
+                            source_binding_projection_counts.items()
+                        )
+                        if key.startswith("change_kind:")
+                    },
+                    "ledger_artifact": (
+                        source_binding_projection_writer.path.relative_to(
+                            temp_path
+                        ).as_posix()
+                    ),
+                    "ledger_record_count": source_binding_projection_writer.count,
+                    "ledger_sha256": (
+                        source_binding_projection_writer.logical_sha256
+                    ),
+                    "ledger_artifact_sha256": _sha256_file(
+                        source_binding_projection_writer.path
+                    ),
+                    "claim_boundary": (
+                        "derived source-binding semantics only; upstream parser "
+                        "sidecars, parser hashes, occurrence provenance, payload "
+                        "bytes, token IDs, token counts and CAS receipts are unchanged"
+                    ),
+                },
                 "tokenizer": {
                     "exact_tokenizer_schema": tokenizer.contract["schema"],
                     "fingerprint": tokenizer.fingerprint,
@@ -5091,6 +5343,10 @@ def export_store(
                         "training_sidecars": (
                             "allowlisted-build-test-diagnostic-and-semantic-fields"
                         ),
+                        "source_bindings": (
+                            "receipt-bound-derived-projection-with-upstream-parser-"
+                            "sidecars-and-hashes-unchanged"
+                        ),
                         "derived_classifications": (
                             "explicit-typed-full-parser-plus-retained-chunk-evidence"
                         ),
@@ -5148,6 +5404,20 @@ def export_store(
             frozen_fetch_state.require_unchanged()
             if _script_sha256() != exporter_script_sha256:
                 raise ExportError("exporter script changed while export was running")
+            if (
+                projection_script_sha256()
+                != source_binding_projection_script_sha256
+            ):
+                raise ExportError(
+                    "source-binding projection script changed while export was running"
+                )
+            if (
+                target_parser_script_sha256()
+                != source_binding_projector.target_parser_sha256
+            ):
+                raise ExportError(
+                    "target parser script changed while export was running"
+                )
             _publish_directory_no_replace(temp_path, output_path)
             parent_descriptor = os.open(output_path.parent, os.O_RDONLY)
             try:
@@ -5156,6 +5426,8 @@ def export_store(
                 os.close(parent_descriptor)
             published = True
             return receipt
+    except SourceBindingProjectionError as exc:
+        raise ExportError(f"source-binding projection refused: {exc}") from exc
     finally:
         if fragment_writer is not None:
             fragment_writer.close()
@@ -5167,6 +5439,8 @@ def export_store(
             representative_ledger_writer.close()
         if excluded_opaque_writer is not None:
             excluded_opaque_writer.close()
+        if source_binding_projection_writer is not None:
+            source_binding_projection_writer.close()
         if eligibility_connection is not None:
             eligibility_connection.close()
         for writer in parquet_writers.values():
@@ -5183,6 +5457,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--fetch-state", required=True, type=Path)
     parser.add_argument("--tokenizer-json", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--source-binding-projection-from-parser-sha256",
+        help=(
+            "explicitly authorize the exact legacy parser SHA-256 whose "
+            "source bindings will be projected; required for legacy stores"
+        ),
+    )
     return parser
 
 
@@ -5195,8 +5476,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             fetch_state=args.fetch_state,
             tokenizer_json=args.tokenizer_json,
             output=args.output,
+            source_binding_projection_from_parser_sha256=(
+                args.source_binding_projection_from_parser_sha256
+            ),
         )
-    except (ExportError, OSError, sqlite3.Error, ValueError) as exc:
+    except (
+        ExportError,
+        SourceBindingProjectionError,
+        OSError,
+        sqlite3.Error,
+        ValueError,
+    ) as exc:
         raise SystemExit(f"CI CASE5 export refused: {exc}") from exc
     print(
         json.dumps(

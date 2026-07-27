@@ -40,15 +40,30 @@ from pathlib import Path
 from typing import Any, Self
 from urllib.parse import quote
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts.ci_source_binding_projection import (
+    MAX_SOURCE_BINDING_PROJECTION_RECORD_BYTES,
+    SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN,
+    SOURCE_BINDING_PROJECTION_SCHEMA,
+    SourceBindingProjectionError,
+    SourceBindingProjector,
+    projection_record_key,
+    projection_script_sha256,
+    target_parser_script_sha256,
+)
+
 OCCURRENCE_SCHEMA = "cppmega_ci_chunk_occurrence_v3"
 TRAINING_SIDECAR_SCHEMA = "cppmega_ci_chunk_training_sidecars_v2"
 CONTENT_STORE_SCHEMA = "cppmega_ci_content_store_v1"
 CONTENT_STORE_RECEIPT_SCHEMA = "cppmega_ci_content_store_receipt_v1"
 CONTENT_STORE_PACK_SCHEMA = "cppmega_ci_content_pack_v1"
 FETCH_RECEIPT_SCHEMA = "cppmega_ci_stream_fetch_receipt_v3"
-CASE5_EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v1"
+CASE5_EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v2"
 REPRESENTATIVE_LEDGER_SCHEMA = "cppmega_ci_token_sequence_representative_ledger_v1"
-INVENTORY_SCHEMA = "cppmega_ci_source_binding_inventory_v2"
+INVENTORY_SCHEMA = "cppmega_ci_source_binding_inventory_v3"
 STORE_SCHEMA = "cppmega_ci_source_sidecar_store_v2"
 PACK_SCHEMA = "cppmega_ci_source_blob_pack_v1"
 RECEIPT_SCHEMA = "cppmega_ci_source_sidecar_receipt_v2"
@@ -90,7 +105,7 @@ ALL_STATUSES = GAP_STATUSES | {RESOLVED}
 DEFAULT_MAX_PACK_BYTES = 256 * 1024 * 1024
 DEFAULT_MAX_GIT_OBJECT_BYTES = 64 * 1024 * 1024
 MAX_JSON_BYTES = 64 * 1024 * 1024
-MAX_JSONL_RECORD_BYTES = 4 * 1024 * 1024
+MAX_JSONL_RECORD_BYTES = MAX_SOURCE_BINDING_PROJECTION_RECORD_BYTES
 MAX_PROVENANCE_BYTES = 64 * 1024 * 1024
 MAX_PACK_RECORDS = 100_000
 MAX_RECOVERY_RECORDS = 100_000
@@ -123,6 +138,33 @@ _REPRESENTATIVE_SELECTION = (
     "one-per-eligible-token-sequence; "
     "content-sha256-then-eligible-occurrence-key"
 )
+_SOURCE_BINDING_PROJECTION_ARTIFACT = "source_binding_projection.jsonl"
+_SOURCE_BINDING_PROJECTION_ORDER = (
+    "occurrence-key-then-action-index-then-source-input-index"
+)
+_SOURCE_BINDING_PROJECTION_CLAIM_BOUNDARY = (
+    "derived source-binding semantics only; upstream parser sidecars, parser "
+    "hashes, occurrence provenance, payload bytes, token IDs, token counts "
+    "and CAS receipts are unchanged"
+)
+_SOURCE_BINDING_PROJECTION_VERIFIED_GAP = (
+    "source_binding_projection_verified_unbound_input"
+)
+_SOURCE_BINDING_PROJECTION_REASONS = {
+    "unchanged": {
+        "current_binding_verified",
+        "legacy_binding_already_current",
+    },
+    "added": {"binding_added_by_current_semantics"},
+    "dropped": {"unsafe_or_unresolvable_binding_dropped"},
+    "modified": {
+        "repository_and_source_path_corrected",
+        "pull_request_repository_corrected",
+        "runner_cwd_relative_path_normalized",
+        "binding_semantics_corrected",
+    },
+}
+_NO_PROJECTED_BINDING = object()
 
 
 class SourceSidecarError(RuntimeError):
@@ -981,6 +1023,8 @@ def _content_store_sqlite_logical_sha256(
 
 def _content_store_occurrence_set_sha256(
     connection: sqlite3.Connection,
+    *,
+    projection_scope: Counter[str] | None = None,
 ) -> str:
     def records() -> Iterator[object]:
         for row in connection.execute(
@@ -992,6 +1036,80 @@ def _content_store_occurrence_set_sha256(
             ORDER BY repo, run_attempt, job, step, chunk_ordinal
             """
         ):
+            provenance = _decode_provenance(row)
+            if projection_scope is not None:
+                if provenance.get("schema") != OCCURRENCE_SCHEMA:
+                    raise ExtractionError(
+                        "source-binding projection occurrence schema is stale"
+                    )
+                chunk = provenance.get("chunk")
+                training = (
+                    chunk.get("training_sidecars")
+                    if isinstance(chunk, Mapping)
+                    else None
+                )
+                actions = (
+                    training.get("build_actions")
+                    if isinstance(training, Mapping)
+                    and training.get("schema") == TRAINING_SIDECAR_SCHEMA
+                    else None
+                )
+                if not isinstance(actions, list):
+                    raise ExtractionError(
+                        "source-binding projection build_actions is invalid"
+                    )
+                projection_scope["occurrences"] += 1
+                projection_scope["actions"] += len(actions)
+                for action in actions:
+                    if not isinstance(action, Mapping):
+                        raise ExtractionError(
+                            "source-binding projection build action is invalid"
+                        )
+                    if action.get("cwd") is not None and not isinstance(
+                        action.get("cwd"),
+                        str,
+                    ):
+                        raise ExtractionError(
+                            "source-binding projection action cwd is invalid"
+                        )
+                    source_inputs = action.get("source_inputs")
+                    if not isinstance(source_inputs, list) or any(
+                        not isinstance(item, str) or not item
+                        for item in source_inputs
+                    ):
+                        raise ExtractionError(
+                            "source-binding projection source_inputs is invalid"
+                        )
+                    declared_source_count = action.get("source_input_count")
+                    if (
+                        isinstance(declared_source_count, bool)
+                        or not isinstance(declared_source_count, int)
+                        or declared_source_count != len(source_inputs)
+                    ):
+                        raise ExtractionError(
+                            "source-binding projection source_inputs are truncated"
+                        )
+                    stored_bindings = action.get("repository_source_bindings")
+                    if not isinstance(stored_bindings, list) or any(
+                        not isinstance(binding, Mapping)
+                        for binding in stored_bindings
+                    ):
+                        raise ExtractionError(
+                            "source-binding projection stored bindings are invalid"
+                        )
+                    declared_binding_count = action.get(
+                        "repository_source_binding_count"
+                    )
+                    if (
+                        isinstance(declared_binding_count, bool)
+                        or not isinstance(declared_binding_count, int)
+                        or declared_binding_count != len(stored_bindings)
+                    ):
+                        raise ExtractionError(
+                            "source-binding projection stored bindings are truncated"
+                        )
+                    projection_scope["source_inputs"] += len(source_inputs)
+                    projection_scope["old_bindings"] += len(stored_bindings)
             yield {
                 "repo": str(row["repo"]),
                 "run_attempt": str(row["run_attempt"]),
@@ -1000,7 +1118,7 @@ def _content_store_occurrence_set_sha256(
                 "chunk_ordinal": int(row["chunk_ordinal"]),
                 "content_sha256": str(row["content_sha256"]),
                 "provenance_sha256": str(row["provenance_sha256"]),
-                "provenance": _decode_provenance(row),
+                "provenance": provenance,
             }
 
     return _hash_records("cppmega-ci-occurrence-set-v1", records())
@@ -1546,7 +1664,7 @@ def _verify_frozen_content_store(
     receipt: Mapping[str, Any],
     *,
     snapshot_db: Path,
-) -> sqlite3.Connection:
+) -> tuple[sqlite3.Connection, dict[str, int]]:
     required_receipt_keys = {
         "schema",
         "status",
@@ -1773,8 +1891,12 @@ def _verify_frozen_content_store(
             raise ExtractionError("content-store SQLite schema SHA-256 differs")
         if _content_store_sqlite_logical_sha256(connection) != expected_sqlite_logical:
             raise ExtractionError("content-store SQLite logical SHA-256 differs")
+        projection_scope: Counter[str] = Counter()
         if (
-            _content_store_occurrence_set_sha256(connection)
+            _content_store_occurrence_set_sha256(
+                connection,
+                projection_scope=projection_scope,
+            )
             != expected_occurrence_set
         ):
             raise ExtractionError("content-store occurrence set differs")
@@ -1815,7 +1937,12 @@ def _verify_frozen_content_store(
     except BaseException:
         connection.close()
         raise
-    return connection
+    return connection, {
+        "occurrence_count": int(projection_scope["occurrences"]),
+        "action_count": int(projection_scope["actions"]),
+        "source_input_count": int(projection_scope["source_inputs"]),
+        "old_binding_count": int(projection_scope["old_bindings"]),
+    }
 
 
 def _unresolved_source_path(
@@ -2063,6 +2190,524 @@ def _prepare_representatives(
     }
 
 
+def _validate_projection_binding(
+    value: object,
+    *,
+    where: str,
+) -> Mapping[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ExtractionError(f"{where} must be a binding object or null")
+    _repository_name(value.get("repository"), where=f"{where}.repository")
+    _require_git_oid(value.get("head_sha"), where=f"{where}.head_sha")
+    source_path = value.get("source_path")
+    confidence = value.get("confidence")
+    if (
+        not isinstance(source_path, str)
+        or not source_path
+        or not isinstance(confidence, Mapping)
+    ):
+        raise ExtractionError(f"{where} fields are invalid")
+    return value
+
+
+def _validate_projection_record(
+    record: Mapping[str, Any],
+    *,
+    index: int,
+    section: Mapping[str, Any],
+) -> tuple[str, str, str, str, int, int, int]:
+    required = {
+        "schema",
+        "mode",
+        "input_parser_sha256",
+        "target_parser_sha256",
+        "occurrence_key",
+        "provenance_sha256",
+        "action_index",
+        "source_index",
+        "source_input",
+        "source_input_sha256",
+        "cwd",
+        "cwd_sha256",
+        "action_sha256",
+        "old_binding",
+        "projected_binding",
+        "change_kind",
+        "reason",
+    }
+    where = f"source-binding projection record {index}"
+    if set(record) != required or record.get("schema") != (
+        SOURCE_BINDING_PROJECTION_SCHEMA
+    ):
+        raise ExtractionError(f"{where} shape is invalid")
+    try:
+        key = projection_record_key(record)
+    except SourceBindingProjectionError as exc:
+        raise ExtractionError(f"{where} is invalid: {exc}") from exc
+    if (
+        record.get("mode") != section["mode"]
+        or record.get("input_parser_sha256")
+        != section["input_parser_script_sha256"]
+        or record.get("target_parser_sha256")
+        != section["target_parser_script_sha256"]
+    ):
+        raise ExtractionError(f"{where} parser lineage differs")
+    _require_hex64(
+        record.get("provenance_sha256"),
+        where=f"{where}.provenance_sha256",
+    )
+    source_input = record.get("source_input")
+    if not isinstance(source_input, str):
+        raise ExtractionError(f"{where}.source_input is invalid")
+    if record.get("source_input_sha256") != _sha256_bytes(
+        source_input.encode("utf-8")
+    ):
+        raise ExtractionError(f"{where}.source_input_sha256 differs")
+    cwd = record.get("cwd")
+    cwd_sha256 = record.get("cwd_sha256")
+    if cwd is None:
+        if cwd_sha256 is not None:
+            raise ExtractionError(f"{where}.cwd_sha256 must be null")
+    elif not isinstance(cwd, str) or cwd_sha256 != _sha256_bytes(
+        cwd.encode("utf-8")
+    ):
+        raise ExtractionError(f"{where}.cwd binding differs")
+    _require_hex64(record.get("action_sha256"), where=f"{where}.action_sha256")
+    old_binding = _validate_projection_binding(
+        record.get("old_binding"),
+        where=f"{where}.old_binding",
+    )
+    projected_binding = _validate_projection_binding(
+        record.get("projected_binding"),
+        where=f"{where}.projected_binding",
+    )
+    change_kind = record.get("change_kind")
+    reason = record.get("reason")
+    if (
+        not isinstance(change_kind, str)
+        or not change_kind
+        or (reason is not None and (not isinstance(reason, str) or not reason))
+        or (projected_binding is None and reason is None)
+        or (change_kind == "unchanged" and old_binding != projected_binding)
+    ):
+        raise ExtractionError(f"{where} change evidence is invalid")
+    return key
+
+
+def _prepare_source_binding_projection(
+    connection: sqlite3.Connection,
+    *,
+    ledger_path: Path,
+    export_receipt: Mapping[str, Any],
+    content_receipt: Mapping[str, Any],
+    frozen_fetch_state: Mapping[str, Any],
+    projection_scope: Mapping[str, int],
+) -> tuple[dict[str, object], SourceBindingProjector]:
+    section = export_receipt.get("source_binding_projection")
+    required_section = {
+        "schema",
+        "mode",
+        "projection_script_sha256",
+        "input_parser_script_sha256",
+        "target_parser_script_sha256",
+        "input_occurrence_set_sha256",
+        "input_fetch_state_sqlite_logical_sha256",
+        "input_fetch_state_sidecar_set_sha256",
+        "coverage",
+        "change_counts",
+        "ledger_artifact",
+        "ledger_record_count",
+        "ledger_sha256",
+        "ledger_artifact_sha256",
+        "claim_boundary",
+    }
+    if (
+        not isinstance(section, Mapping)
+        or set(section) != required_section
+        or section.get("schema") != SOURCE_BINDING_PROJECTION_SCHEMA
+        or section.get("mode") not in {"legacy_projection", "current_audit"}
+        or section.get("ledger_artifact")
+        != _SOURCE_BINDING_PROJECTION_ARTIFACT
+        or ledger_path.name != _SOURCE_BINDING_PROJECTION_ARTIFACT
+        or section.get("claim_boundary")
+        != _SOURCE_BINDING_PROJECTION_CLAIM_BOUNDARY
+    ):
+        raise ExtractionError(
+            "CASE5 source-binding projection receipt is missing or stale"
+        )
+    projection_script = _require_hex64(
+        section.get("projection_script_sha256"),
+        where="source-binding projection script SHA-256",
+    )
+    input_parser = _require_hex64(
+        section.get("input_parser_script_sha256"),
+        where="source-binding projection input parser SHA-256",
+    )
+    target_parser = _require_hex64(
+        section.get("target_parser_script_sha256"),
+        where="source-binding projection target parser SHA-256",
+    )
+    expected_logical = _require_hex64(
+        section.get("ledger_sha256"),
+        where="source-binding projection ledger SHA-256",
+    )
+    expected_artifact = _require_hex64(
+        section.get("ledger_artifact_sha256"),
+        where="source-binding projection artifact SHA-256",
+    )
+    if (
+        projection_script != projection_script_sha256()
+        or target_parser != target_parser_script_sha256()
+    ):
+        raise ExtractionError(
+            "source-binding projection implementation lineage differs"
+        )
+    try:
+        projector = SourceBindingProjector(
+            input_parser,
+            authorized_legacy_sha256=(
+                input_parser
+                if section["mode"] == "legacy_projection"
+                else None
+            ),
+        )
+    except SourceBindingProjectionError as exc:
+        raise ExtractionError(
+            f"source-binding projection parser lineage is unsupported: {exc}"
+        ) from exc
+    if (
+        projector.mode != section["mode"]
+        or projector.target_parser_sha256 != target_parser
+        or projector.implementation_sha256 != projection_script
+    ):
+        raise ExtractionError(
+            "source-binding projection descriptor differs from implementation"
+        )
+    settings = frozen_fetch_state.get("settings")
+    if (
+        not isinstance(settings, Mapping)
+        or settings.get("parser_script_sha256") != input_parser
+        or section.get("input_occurrence_set_sha256")
+        != content_receipt.get("occurrence_set_sha256")
+        or section.get("input_fetch_state_sqlite_logical_sha256")
+        != frozen_fetch_state.get("sqlite_logical_sha256")
+        or section.get("input_fetch_state_sidecar_set_sha256")
+        != frozen_fetch_state.get("sidecar_set_sha256")
+    ):
+        raise ExtractionError(
+            "source-binding projection input scope differs"
+        )
+    for name in (
+        "input_occurrence_set_sha256",
+        "input_fetch_state_sqlite_logical_sha256",
+        "input_fetch_state_sidecar_set_sha256",
+    ):
+        _require_hex64(section.get(name), where=f"source-binding projection {name}")
+
+    coverage = section.get("coverage")
+    if (
+        not isinstance(coverage, Mapping)
+        or set(coverage)
+        != {
+            "order",
+            "occurrence_count",
+            "action_count",
+            "source_input_count",
+            "old_binding_count",
+            "projected_binding_count",
+        }
+        or coverage.get("order") != _SOURCE_BINDING_PROJECTION_ORDER
+        or any(
+            isinstance(coverage.get(name), bool)
+            or not isinstance(coverage.get(name), int)
+            or int(coverage[name]) < 0
+            for name in (
+                "occurrence_count",
+                "action_count",
+                "source_input_count",
+                "old_binding_count",
+                "projected_binding_count",
+            )
+        )
+        or any(
+            int(coverage[name]) != int(projection_scope[name])
+            for name in (
+                "occurrence_count",
+                "action_count",
+                "source_input_count",
+                "old_binding_count",
+            )
+        )
+    ):
+        raise ExtractionError(
+            "source-binding projection coverage differs from the frozen store"
+        )
+    expected_count = section.get("ledger_record_count")
+    if (
+        isinstance(expected_count, bool)
+        or not isinstance(expected_count, int)
+        or expected_count < 0
+        or expected_count != coverage["source_input_count"]
+    ):
+        raise ExtractionError(
+            "source-binding projection ledger count differs from coverage"
+        )
+    expected_change_counts = section.get("change_counts")
+    if not isinstance(expected_change_counts, Mapping) or any(
+        not isinstance(name, str)
+        or not name
+        or isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 1
+        for name, value in expected_change_counts.items()
+    ):
+        raise ExtractionError("source-binding projection change counts are invalid")
+
+    artifacts = export_receipt.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise ExtractionError("CASE5 export artifacts are invalid")
+    matches = [
+        item
+        for item in artifacts
+        if isinstance(item, Mapping)
+        and item.get("kind") == "source_binding_projection"
+    ]
+    if len(matches) != 1:
+        raise ExtractionError(
+            "CASE5 export must bind one source-binding projection artifact"
+        )
+    artifact = matches[0]
+    artifact_size = artifact.get("byte_size")
+    if (
+        set(artifact) != {"path", "kind", "rows", "byte_size", "sha256"}
+        or artifact.get("path") != _SOURCE_BINDING_PROJECTION_ARTIFACT
+        or artifact.get("rows") != expected_count
+        or isinstance(artifact_size, bool)
+        or not isinstance(artifact_size, int)
+        or artifact_size < 0
+        or artifact.get("sha256") != expected_artifact
+    ):
+        raise ExtractionError(
+            "CASE5 source-binding projection artifact metadata differs"
+        )
+
+    connection.executescript(
+        """
+        CREATE TEMP TABLE selected_source_binding_projection(
+            repo TEXT NOT NULL,
+            run_attempt TEXT NOT NULL,
+            job TEXT NOT NULL,
+            step TEXT NOT NULL,
+            chunk_ordinal INTEGER NOT NULL,
+            action_index INTEGER NOT NULL,
+            source_index INTEGER NOT NULL,
+            record_json TEXT NOT NULL,
+            PRIMARY KEY(
+                repo, run_attempt, job, step, chunk_ordinal,
+                action_index, source_index
+            )
+        );
+        """
+    )
+    selected_cursor = iter(
+        connection.execute(
+            """
+            SELECT repo, run_attempt, job, step, chunk_ordinal
+            FROM selected_representatives
+            ORDER BY repo, run_attempt, job, step, chunk_ordinal
+            """
+        )
+    )
+    selected_row = next(selected_cursor, None)
+    occurrence_cursor = iter(
+        connection.execute(
+            """
+            SELECT repo, run_attempt, job, step, chunk_ordinal,
+                   provenance_sha256, provenance_raw_size, provenance_zlib
+            FROM occurrences
+            ORDER BY repo, run_attempt, job, step, chunk_ordinal
+            """
+        )
+    )
+    occurrence_row = next(occurrence_cursor, None)
+
+    def row_key(row: sqlite3.Row) -> tuple[str, str, str, str, int]:
+        return (
+            str(row["repo"]),
+            str(row["run_attempt"]),
+            str(row["job"]),
+            str(row["step"]),
+            int(row["chunk_ordinal"]),
+        )
+
+    logical = _RecordHasher(SOURCE_BINDING_PROJECTION_LEDGER_DOMAIN)
+    physical = hashlib.sha256()
+    physical_size = 0
+    previous_key: tuple[str, str, str, str, int, int, int] | None = None
+    previous_record_occurrence: tuple[str, str, str, str, int] | None = None
+    previous_record_action: tuple[str, str, str, str, int, int] | None = None
+    record_occurrence_count = 0
+    record_action_count = 0
+    change_counts: Counter[str] = Counter()
+    projected_binding_count = 0
+    old_binding_count = 0
+    decoded_occurrence_key: tuple[str, str, str, str, int] | None = None
+    decoded_provenance: dict[str, Any] | None = None
+    decoded_actions: list[Any] | None = None
+    decoded_action_index: int | None = None
+    decoded_action_projection: tuple[dict[str, object], ...] | None = None
+    for index, (record, raw) in enumerate(
+        _iter_canonical_jsonl(
+            ledger_path,
+            where="source-binding projection ledger",
+            allow_empty=expected_count == 0,
+        )
+    ):
+        key = _validate_projection_record(record, index=index, section=section)
+        if previous_key is not None and key <= previous_key:
+            raise ExtractionError(
+                "source-binding projection records are not sorted and unique"
+            )
+        if (
+            previous_key is None
+            or key[:6] != previous_key[:6]
+        ):
+            if key[6] != 0:
+                raise ExtractionError(
+                    "source-binding projection source indexes are not contiguous"
+                )
+        elif key[6] != previous_key[6] + 1:
+            raise ExtractionError(
+                "source-binding projection source indexes are not contiguous"
+            )
+        previous_key = key
+        occurrence_key = key[:5]
+        while occurrence_row is not None and row_key(occurrence_row) < occurrence_key:
+            occurrence_row = next(occurrence_cursor, None)
+        if (
+            occurrence_row is None
+            or row_key(occurrence_row) != occurrence_key
+            or str(occurrence_row["provenance_sha256"])
+            != record["provenance_sha256"]
+        ):
+            raise ExtractionError(
+                "source-binding projection record is outside the frozen occurrence set"
+            )
+        if decoded_occurrence_key != occurrence_key:
+            decoded_occurrence_key = occurrence_key
+            decoded_provenance = _decode_provenance(occurrence_row)
+            chunk = decoded_provenance.get("chunk")
+            training = (
+                chunk.get("training_sidecars")
+                if isinstance(chunk, Mapping)
+                else None
+            )
+            decoded_actions = (
+                training.get("build_actions")
+                if isinstance(training, Mapping)
+                else None
+            )
+            if not isinstance(decoded_actions, list):
+                raise ExtractionError(
+                    "source-binding projection occurrence actions are invalid"
+                )
+            decoded_action_index = None
+            decoded_action_projection = None
+        action_index = key[5]
+        source_index = key[6]
+        if decoded_provenance is None or decoded_actions is None:
+            raise ExtractionError(
+                "source-binding projection occurrence state is incomplete"
+            )
+        if action_index >= len(decoded_actions) or not isinstance(
+            decoded_actions[action_index],
+            Mapping,
+        ):
+            raise ExtractionError(
+                "source-binding projection action index is outside provenance"
+            )
+        if decoded_action_index != action_index:
+            try:
+                action_projection = projector.project_action(
+                    occurrence_key=record["occurrence_key"],
+                    provenance_sha256=str(record["provenance_sha256"]),
+                    provenance=decoded_provenance,
+                    action=decoded_actions[action_index],
+                    action_index=action_index,
+                )
+            except SourceBindingProjectionError as exc:
+                raise ExtractionError(
+                    f"source-binding projection cannot be recomputed: {exc}"
+                ) from exc
+            decoded_action_index = action_index
+            decoded_action_projection = action_projection.records
+        if decoded_action_projection is None:
+            raise ExtractionError(
+                "source-binding projection action state is incomplete"
+            )
+        if (
+            source_index >= len(decoded_action_projection)
+            or record != decoded_action_projection[source_index]
+        ):
+            raise ExtractionError(
+                "source-binding projection record differs from provenance"
+            )
+        while selected_row is not None and row_key(selected_row) < occurrence_key:
+            selected_row = next(selected_cursor, None)
+        if selected_row is not None and row_key(selected_row) == occurrence_key:
+            connection.execute(
+                """
+                INSERT INTO selected_source_binding_projection(
+                    repo, run_attempt, job, step, chunk_ordinal,
+                    action_index, source_index, record_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (*key, _canonical_json(record)),
+            )
+        logical.update(record)
+        physical.update(raw)
+        physical_size += len(raw)
+        change_counts[str(record["change_kind"])] += 1
+        old_binding_count += record["old_binding"] is not None
+        projected_binding_count += record["projected_binding"] is not None
+        if occurrence_key != previous_record_occurrence:
+            record_occurrence_count += 1
+            previous_record_occurrence = occurrence_key
+        if key[:6] != previous_record_action:
+            record_action_count += 1
+            previous_record_action = key[:6]
+    if (
+        logical.count != expected_count
+        or logical.hexdigest != expected_logical
+        or physical_size != artifact_size
+        or physical.hexdigest() != expected_artifact
+        or dict(sorted(change_counts.items()))
+        != dict(sorted(expected_change_counts.items()))
+        or old_binding_count != coverage["old_binding_count"]
+        or projected_binding_count != coverage["projected_binding_count"]
+        or record_occurrence_count > coverage["occurrence_count"]
+        or record_action_count > coverage["action_count"]
+    ):
+        raise ExtractionError(
+            "source-binding projection ledger receipt differs"
+        )
+    return (
+        {
+            "source_binding_projection_schema": SOURCE_BINDING_PROJECTION_SCHEMA,
+            "source_binding_projection_mode": section["mode"],
+            "source_binding_projection_script_sha256": projection_script,
+            "source_binding_projection_input_parser_sha256": input_parser,
+            "source_binding_projection_target_parser_sha256": target_parser,
+            "source_binding_projection_ledger_record_count": expected_count,
+            "source_binding_projection_ledger_sha256": expected_logical,
+            "source_binding_projection_ledger_artifact_sha256": expected_artifact,
+        },
+        projector,
+    )
+
+
 def _repository_name(value: object, *, where: str) -> str:
     if (
         not isinstance(value, str)
@@ -2103,6 +2748,8 @@ def _checkout_binding(
     source_index: int,
     source_input: str,
     cwd: str | None,
+    projected_binding: object = _NO_PROJECTED_BINDING,
+    projection_gap_reason: str | None = None,
 ) -> tuple[str, str, PathNormalization, dict[str, object]]:
     workflow = provenance.get("workflow")
     if not isinstance(workflow, Mapping):
@@ -2122,20 +2769,31 @@ def _checkout_binding(
         provenance.get("source_repository"),
         where="v3 source_repository",
     )
-    bindings = action.get("repository_source_bindings")
-    binding_count = action.get("repository_source_binding_count")
     checkout_reason: str | None = None
     selected: Mapping[str, Any] | None = None
-    if (
-        not isinstance(bindings, list)
-        or binding_count != len(bindings)
-        or len(bindings) != len(action.get("source_inputs", []))
-        or source_index >= len(bindings)
-        or not isinstance(bindings[source_index], Mapping)
-    ):
-        checkout_reason = "missing_or_ambiguous_repository_source_binding"
+    uses_projection = projected_binding is not _NO_PROJECTED_BINDING
+    bindings = action.get("repository_source_bindings")
+    if uses_projection:
+        if projected_binding is None:
+            checkout_reason = (
+                projection_gap_reason or "source_binding_projection_typed_gap"
+            )
+        elif isinstance(projected_binding, Mapping):
+            selected = projected_binding
+        else:
+            checkout_reason = "source_binding_projection_record_is_invalid"
     else:
-        selected = bindings[source_index]
+        binding_count = action.get("repository_source_binding_count")
+        if (
+            not isinstance(bindings, list)
+            or binding_count != len(bindings)
+            or len(bindings) != len(action.get("source_inputs", []))
+            or source_index >= len(bindings)
+            or not isinstance(bindings[source_index], Mapping)
+        ):
+            checkout_reason = "missing_or_ambiguous_repository_source_binding"
+        else:
+            selected = bindings[source_index]
 
     if event in {"pull_request", "pull_request_target"}:
         expected_repository = canonical_repository
@@ -2152,7 +2810,7 @@ def _checkout_binding(
         checkout_kind = "unproven_head_or_fork_checkout"
         checkout_reason = checkout_reason or "workflow_event_cannot_prove_checkout_tuple"
 
-    if isinstance(bindings, list):
+    if not uses_projection and isinstance(bindings, list):
         for candidate in bindings:
             if not isinstance(candidate, Mapping):
                 checkout_reason = checkout_reason or (
@@ -2252,6 +2910,10 @@ def _checkout_binding(
         "repository_source_binding": (
             None if selected is None else dict(selected)
         ),
+        "source_binding_projection_applied": uses_projection,
+        "source_binding_projection_gap_reason": (
+            projection_gap_reason if uses_projection else None
+        ),
         "reason": checkout_reason,
     }
     if checkout_reason is not None:
@@ -2332,6 +2994,8 @@ def _insert_inventory_record(
 
 def _spool_selected_inventory(
     connection: sqlite3.Connection,
+    *,
+    projector: SourceBindingProjector,
 ) -> None:
     _create_inventory_spool(connection)
     selected_count = 0
@@ -2410,9 +3074,43 @@ def _spool_selected_inventory(
             "chunk_ordinal": int(row["chunk_ordinal"]),
         }
         representative_record = json.loads(str(row["representative_record_json"]))
+        projected_rows = {
+            (int(projected["action_index"]), int(projected["source_index"])): (
+                json.loads(str(projected["record_json"]))
+            )
+            for projected in connection.execute(
+                """
+                SELECT action_index, source_index, record_json
+                FROM selected_source_binding_projection
+                WHERE repo = ? AND run_attempt = ? AND job = ?
+                  AND step = ? AND chunk_ordinal = ?
+                ORDER BY action_index, source_index
+                """,
+                (
+                    occurrence_key["repo"],
+                    occurrence_key["run_attempt"],
+                    occurrence_key["job"],
+                    occurrence_key["step"],
+                    occurrence_key["chunk_ordinal"],
+                ),
+            )
+        }
+        consumed_projection_records = 0
         for action_index, action in enumerate(actions):
             if not isinstance(action, Mapping):
                 raise ExtractionError("representative build action is invalid")
+            try:
+                expected_projection = projector.project_action(
+                    occurrence_key=occurrence_key,
+                    provenance_sha256=str(row["provenance_sha256"]),
+                    provenance=provenance,
+                    action=action,
+                    action_index=action_index,
+                )
+            except SourceBindingProjectionError as exc:
+                raise ExtractionError(
+                    f"representative source projection cannot be recomputed: {exc}"
+                ) from exc
             source_inputs = action.get("source_inputs")
             if not isinstance(source_inputs, list) or any(
                 not isinstance(item, str) for item in source_inputs
@@ -2422,6 +3120,39 @@ def _spool_selected_inventory(
             if cwd is not None and not isinstance(cwd, str):
                 raise ExtractionError("representative build action cwd is invalid")
             for source_index, source_input in enumerate(source_inputs):
+                projection_record = projected_rows.get(
+                    (action_index, source_index)
+                )
+                if projection_record is None:
+                    raise ExtractionError(
+                        "representative source input lacks its exact projection record"
+                    )
+                consumed_projection_records += 1
+                if (
+                    projection_record
+                    != expected_projection.records[source_index]
+                    or projection_record.get("provenance_sha256")
+                    != str(row["provenance_sha256"])
+                    or projection_record.get("occurrence_key")
+                    != occurrence_key
+                    or projection_record.get("action_sha256")
+                    != _sha256_bytes(_canonical_json_bytes(action))
+                    or projection_record.get("source_input") != source_input
+                    or projection_record.get("cwd") != cwd
+                ):
+                    raise ExtractionError(
+                        "representative source projection differs from provenance"
+                    )
+                projected_binding = projection_record.get("projected_binding")
+                projection_reason = projection_record.get("reason")
+                projection_gap_reason: str | None = None
+                if projected_binding is None:
+                    projection_gap_reason = (
+                        projection_reason
+                        if projection_record.get("change_kind") == "dropped"
+                        and isinstance(projection_reason, str)
+                        else _SOURCE_BINDING_PROJECTION_VERIFIED_GAP
+                    )
                 repository, head_sha, normalization, checkout_evidence = (
                     _checkout_binding(
                         provenance,
@@ -2429,7 +3160,12 @@ def _spool_selected_inventory(
                         source_index=source_index,
                         source_input=source_input,
                         cwd=cwd,
+                        projected_binding=projected_binding,
+                        projection_gap_reason=projection_gap_reason,
                     )
+                )
+                projection_record_sha256 = _sha256_bytes(
+                    _canonical_json_bytes(projection_record)
                 )
                 reference_core = {
                     "schema": INVENTORY_SCHEMA,
@@ -2452,6 +3188,13 @@ def _spool_selected_inventory(
                     "source_input_index": source_index,
                     "source_input": source_input,
                     "cwd": cwd,
+                    "source_binding_projection": {
+                        "schema": SOURCE_BINDING_PROJECTION_SCHEMA,
+                        "mode": projection_record["mode"],
+                        "record_sha256": projection_record_sha256,
+                        "change_kind": projection_record["change_kind"],
+                        "reason": projection_reason,
+                    },
                     "normalization": normalization.as_dict(),
                     "checkout_evidence": checkout_evidence,
                 }
@@ -2483,6 +3226,10 @@ def _spool_selected_inventory(
                     binding=binding,
                     reference=reference,
                 )
+        if consumed_projection_records != len(projected_rows):
+            raise ExtractionError(
+                "representative occurrence has extra projection records"
+            )
     expected = int(
         connection.execute(
             "SELECT COUNT(*) FROM selected_representatives"
@@ -2519,7 +3266,7 @@ def _inventory_logical_sha256(header: Mapping[str, object]) -> str:
         if key != "inventory_logical_sha256"
     }
     return _hash_records(
-        "cppmega-ci-source-binding-inventory-v2",
+        "cppmega-ci-source-binding-inventory-v3",
         (semantic_header,),
     )
 
@@ -2543,6 +3290,10 @@ def _write_inventory_jsonl(
         with temporary.open("xb") as handle:
             for value in (header,):
                 raw = _canonical_json_bytes(value) + b"\n"
+                if len(raw) > MAX_JSONL_RECORD_BYTES:
+                    raise ExtractionError(
+                        "source binding inventory header exceeds the record size limit"
+                    )
                 handle.write(raw)
                 digest.update(raw)
             for table in ("inventory_bindings", "inventory_references"):
@@ -2558,6 +3309,11 @@ def _write_inventory_jsonl(
                     """
                 ):
                     raw = str(row["record_json"]).encode("utf-8") + b"\n"
+                    if len(raw) > MAX_JSONL_RECORD_BYTES:
+                        raise ExtractionError(
+                            "source binding inventory record exceeds the "
+                            "record size limit"
+                        )
                     handle.write(raw)
                     digest.update(raw)
             handle.flush()
@@ -2671,6 +3427,7 @@ def _validate_inventory_reference(
         "source_input_index",
         "source_input",
         "cwd",
+        "source_binding_projection",
         "normalization",
         "checkout_evidence",
     }
@@ -2719,12 +3476,42 @@ def _validate_inventory_reference(
             )
     if (
         not isinstance(record.get("source_input"), str)
+        or not isinstance(record.get("source_binding_projection"), Mapping)
         or not isinstance(record.get("normalization"), Mapping)
         or not isinstance(record.get("checkout_evidence"), Mapping)
     ):
         raise ExtractionError(
             f"inventory reference record {index} evidence is invalid"
         )
+    projection = record["source_binding_projection"]
+    projection_change_kind = projection.get("change_kind")
+    projection_reason = projection.get("reason")
+    if (
+        set(projection)
+        != {"schema", "mode", "record_sha256", "change_kind", "reason"}
+        or projection.get("schema") != SOURCE_BINDING_PROJECTION_SCHEMA
+        or projection.get("mode") not in {"legacy_projection", "current_audit"}
+        or projection_change_kind not in _SOURCE_BINDING_PROJECTION_REASONS
+        or projection_reason
+        not in _SOURCE_BINDING_PROJECTION_REASONS.get(
+            str(projection_change_kind),
+            set(),
+        )
+        or (
+            projection.get("mode") == "current_audit"
+            and (
+                projection_change_kind != "unchanged"
+                or projection_reason != "current_binding_verified"
+            )
+        )
+    ):
+        raise ExtractionError(
+            f"inventory reference record {index} projection is invalid"
+        )
+    _require_hex64(
+        projection.get("record_sha256"),
+        where=f"inventory reference record {index} projection record",
+    )
     return (
         repository,
         head_sha,
@@ -2797,13 +3584,13 @@ def _verify_inventory_reference_membership(path: Path) -> None:
 def verify_binding_inventory(
     inventory_path: str | os.PathLike[str],
 ) -> VerifiedInventory:
-    """Stream-verify a canonical v2 JSONL inventory without materializing it."""
+    """Stream-verify a canonical v3 JSONL inventory without materializing it."""
 
     path = Path(inventory_path)
     artifact = hashlib.sha256()
     header: dict[str, Any] | None = None
-    binding_hasher = _RecordHasher("cppmega-ci-source-binding-records-v2")
-    reference_hasher = _RecordHasher("cppmega-ci-source-reference-records-v2")
+    binding_hasher = _RecordHasher("cppmega-ci-source-binding-records-v3")
+    reference_hasher = _RecordHasher("cppmega-ci-source-reference-records-v3")
     previous_binding: tuple[str, str, str] | None = None
     previous_reference: tuple[str, str, str, str] | None = None
     phase = "header"
@@ -2857,6 +3644,14 @@ def verify_binding_inventory(
         "representative_count",
         "representative_ledger_sha256",
         "representative_ledger_artifact_sha256",
+        "source_binding_projection_schema",
+        "source_binding_projection_mode",
+        "source_binding_projection_script_sha256",
+        "source_binding_projection_input_parser_sha256",
+        "source_binding_projection_target_parser_sha256",
+        "source_binding_projection_ledger_record_count",
+        "source_binding_projection_ledger_sha256",
+        "source_binding_projection_ledger_artifact_sha256",
         "binding_count",
         "reference_count",
         "binding_records_sha256",
@@ -2875,6 +3670,11 @@ def verify_binding_inventory(
         "case5_export_receipt_sha256",
         "representative_ledger_sha256",
         "representative_ledger_artifact_sha256",
+        "source_binding_projection_script_sha256",
+        "source_binding_projection_input_parser_sha256",
+        "source_binding_projection_target_parser_sha256",
+        "source_binding_projection_ledger_sha256",
+        "source_binding_projection_ledger_artifact_sha256",
         "binding_records_sha256",
         "reference_records_sha256",
         "inventory_logical_sha256",
@@ -2888,6 +3688,7 @@ def verify_binding_inventory(
         "normalization_schema": NORMALIZATION_SCHEMA,
         "content_semantics": CONTENT_SEMANTICS,
         "representative_ledger_schema": REPRESENTATIVE_LEDGER_SCHEMA,
+        "source_binding_projection_schema": SOURCE_BINDING_PROJECTION_SCHEMA,
     }
     if any(header.get(key) != value for key, value in expected_shape.items()):
         raise ExtractionError("inventory header contract is stale")
@@ -2911,6 +3712,17 @@ def verify_binding_inventory(
         or representative_count < 0
     ):
         raise ExtractionError("inventory representative_count is invalid")
+    projection_record_count = header.get(
+        "source_binding_projection_ledger_record_count"
+    )
+    if (
+        isinstance(projection_record_count, bool)
+        or not isinstance(projection_record_count, int)
+        or projection_record_count < 0
+        or header.get("source_binding_projection_mode")
+        not in {"legacy_projection", "current_audit"}
+    ):
+        raise ExtractionError("inventory source-binding projection is invalid")
     if (
         header.get("binding_records_sha256") != binding_hasher.hexdigest
         or header.get("reference_records_sha256") != reference_hasher.hexdigest
@@ -2996,7 +3808,7 @@ def extract_binding_inventory(
     output = Path(output_path)
     with tempfile.TemporaryDirectory(prefix="ci-source-inventory-") as temporary:
         snapshot_db = Path(temporary) / "snapshot.sqlite3"
-        connection = _verify_frozen_content_store(
+        connection, projection_scope = _verify_frozen_content_store(
             root,
             content_receipt,
             snapshot_db=snapshot_db,
@@ -3007,17 +3819,41 @@ def extract_binding_inventory(
                 ledger_path=Path(representative_ledger_path),
                 export_receipt=export_receipt,
             )
-            _spool_selected_inventory(connection)
+            projection_binding, projector = _prepare_source_binding_projection(
+                connection,
+                ledger_path=(
+                    Path(case5_export_receipt_path).parent
+                    / _SOURCE_BINDING_PROJECTION_ARTIFACT
+                ),
+                export_receipt=export_receipt,
+                content_receipt=content_receipt,
+                frozen_fetch_state=frozen_fetch_state_binding,
+                projection_scope=projection_scope,
+            )
+            _spool_selected_inventory(connection, projector=projector)
             binding_count, binding_sha = _spool_record_digest(
                 connection,
                 table="inventory_bindings",
-                domain="cppmega-ci-source-binding-records-v2",
+                domain="cppmega-ci-source-binding-records-v3",
             )
             reference_count, reference_sha = _spool_record_digest(
                 connection,
                 table="inventory_references",
-                domain="cppmega-ci-source-reference-records-v2",
+                domain="cppmega-ci-source-reference-records-v3",
             )
+            if (
+                projection_binding[
+                    "source_binding_projection_script_sha256"
+                ]
+                != projection_script_sha256()
+                or projection_binding[
+                    "source_binding_projection_target_parser_sha256"
+                ]
+                != target_parser_script_sha256()
+            ):
+                raise ExtractionError(
+                    "source-binding projection implementation changed during extraction"
+                )
             header: dict[str, object] = {
                 "schema": INVENTORY_SCHEMA,
                 "record_type": "header",
@@ -3041,6 +3877,7 @@ def extract_binding_inventory(
                 "case5_export_receipt_sha256": _sha256_bytes(export_receipt_raw),
                 "representative_ledger_schema": REPRESENTATIVE_LEDGER_SCHEMA,
                 **representative_binding,
+                **projection_binding,
                 "binding_count": binding_count,
                 "reference_count": reference_count,
                 "binding_records_sha256": binding_sha,
@@ -3069,6 +3906,15 @@ def extract_binding_inventory(
         "binding_count": header["binding_count"],
         "reference_count": header["reference_count"],
         "representative_count": header["representative_count"],
+        "source_binding_projection_ledger_record_count": header[
+            "source_binding_projection_ledger_record_count"
+        ],
+        "source_binding_projection_ledger_sha256": header[
+            "source_binding_projection_ledger_sha256"
+        ],
+        "source_binding_projection_ledger_artifact_sha256": header[
+            "source_binding_projection_ledger_artifact_sha256"
+        ],
     }
 
 
@@ -3998,7 +4844,7 @@ class SourceSidecarStore:
             if not existing:
                 if inventory is None:
                     raise SourceStoreError(
-                        "new source store requires a verified v2 inventory"
+                        "new source store requires a verified v3 inventory"
                     )
                 for statement in statements:
                     self._connection.execute(statement)
@@ -4256,7 +5102,7 @@ class SourceSidecarStore:
         ):
             raise SourceStoreError("stored inventory membership count differs")
         binding_digest = _hash_records(
-            "cppmega-ci-source-binding-records-v2",
+            "cppmega-ci-source-binding-records-v3",
             (
                 json.loads(str(row["record_json"]))
                 for row in self._connection.execute(
@@ -4268,7 +5114,7 @@ class SourceSidecarStore:
             ),
         )
         reference_digest = _hash_records(
-            "cppmega-ci-source-reference-records-v2",
+            "cppmega-ci-source-reference-records-v3",
             (
                 json.loads(str(row["record_json"]))
                 for row in self._connection.execute(
