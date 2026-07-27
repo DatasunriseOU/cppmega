@@ -1331,6 +1331,200 @@ def test_full_attempt_streams_through_parser_tokenizer_and_cas_idempotently(
         resumed.close()
 
 
+def test_threshold_receipt_is_finalized_only_after_writers_close(
+    tmp_path: Path,
+) -> None:
+    from scripts.ci_stream_receipts import finalize_fetch_receipts
+    from scripts.export_ci_content_store_case5 import FrozenFetchState, FrozenStore
+
+    inventory = _inventory(tmp_path / "inventory.sqlite", 1)
+    tokenizer = _tokenizer(tmp_path / "tokenizer.json")
+    github = FakeGitHub(_zip_bytes())
+    state_path = tmp_path / "fetch.sqlite"
+    store_path = tmp_path / "store"
+    progress_path = tmp_path / "progress.json"
+    fetch_receipt_path = tmp_path / "fetch-receipt.json"
+    store_receipt_path = tmp_path / "store-receipt.json"
+    fetcher = ci.CIStreamFetcher(
+        inventory_path=inventory,
+        state_path=state_path,
+        content_store_path=store_path,
+        tokenizer_path=tokenizer,
+        tokens=["api-secret"],
+        progress_path=progress_path,
+        receipt_path=fetch_receipt_path,
+        parser=_fake_parser,
+        requester=github.request,
+        archive_downloader=github.download,
+        target_unique_tokens=1,
+        sleeper=lambda _: None,
+    )
+    try:
+        progress = fetcher.run(continuous=False, max_runs=1)
+        assert progress["content_store"]["counters"][
+            "exact_unique_payload_tokens"
+        ] >= 1
+        assert not fetch_receipt_path.exists()
+        with pytest.raises(RuntimeError, match="not frozen"):
+            finalize_fetch_receipts(
+                state_path=state_path,
+                content_store_path=store_path,
+                tokenizer_path=tokenizer,
+                target_unique_tokens=1,
+                fetch_receipt_path=fetch_receipt_path,
+                store_receipt_path=store_receipt_path,
+            )
+    finally:
+        fetcher.close()
+
+    receipt = finalize_fetch_receipts(
+        state_path=state_path,
+        content_store_path=store_path,
+        tokenizer_path=tokenizer,
+        target_unique_tokens=1,
+        fetch_receipt_path=fetch_receipt_path,
+        store_receipt_path=store_receipt_path,
+    )
+    assert receipt["fetch_state"] == receipt["frozen_fetch_state"]["summary"]
+    assert receipt["content_store_receipt"]["status"] == "complete"
+
+    exact_tokenizer = ci.ExactTokenizer(tokenizer)
+    with FrozenStore(store_path, store_receipt_path) as frozen_store:
+        with FrozenFetchState(
+            state_path,
+            tokenizer=exact_tokenizer,
+            store=frozen_store,
+        ) as frozen_state:
+            expected_binding = frozen_state.receipt_binding()
+            expected_binding["artifact"]["path"] = str(state_path.resolve())
+            assert receipt["frozen_fetch_state"] == expected_binding
+            assert receipt["fetch_state"] == frozen_state.summary
+            frozen_state.require_unchanged()
+        frozen_store.require_unchanged()
+
+
+def test_cli_finalizes_merge_compatible_receipts_after_resume(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path / "inventory.sqlite", 1)
+    tokenizer = _tokenizer(tmp_path / "tokenizer.json")
+    github = FakeGitHub(_zip_bytes())
+    state_path = tmp_path / "fetch.sqlite"
+    store_path = tmp_path / "store"
+    progress_path = tmp_path / "progress.json"
+    fetch_receipt_path = tmp_path / "fetch-receipt.json"
+    store_receipt_path = tmp_path / "store-receipt.json"
+    tokens_path = tmp_path / "tokens.txt"
+    tokens_path.write_text("api-secret\n", encoding="utf-8")
+    fetcher = ci.CIStreamFetcher(
+        inventory_path=inventory,
+        state_path=state_path,
+        content_store_path=store_path,
+        tokenizer_path=tokenizer,
+        tokens=["api-secret"],
+        progress_path=progress_path,
+        receipt_path=fetch_receipt_path,
+        parser=_fake_parser,
+        requester=github.request,
+        archive_downloader=github.download,
+        target_unique_tokens=1,
+        sleeper=lambda _: None,
+    )
+    try:
+        fetcher.run(continuous=False, max_runs=1)
+    finally:
+        fetcher.close()
+
+    result = ci.main(
+        [
+            "--inventory",
+            str(inventory),
+            "--state",
+            str(state_path),
+            "--content-store",
+            str(store_path),
+            "--tokenizer",
+            str(tokenizer),
+            "--tokens",
+            str(tokens_path),
+            "--progress",
+            str(progress_path),
+            "--receipt",
+            str(fetch_receipt_path),
+            "--store-receipt",
+            str(store_receipt_path),
+            "--resume",
+            "--once",
+            "--workers",
+            "1",
+            "--parser-workers",
+            "0",
+            "--target-exact-unique-payload-tokens",
+            "1",
+        ]
+    )
+    assert result == 0
+    receipt = json.loads(fetch_receipt_path.read_text(encoding="utf-8"))
+    store_receipt = json.loads(store_receipt_path.read_text(encoding="utf-8"))
+    assert receipt["content_store_receipt"] == store_receipt
+    assert receipt["fetch_state"] == receipt["frozen_fetch_state"]["summary"]
+
+
+def test_receipt_refuses_cas_bound_to_retry_attempt(tmp_path: Path) -> None:
+    from scripts.ci_stream_receipts import finalize_fetch_receipts
+
+    inventory = _inventory(tmp_path / "inventory.sqlite", 1)
+    tokenizer = _tokenizer(tmp_path / "tokenizer.json")
+    state_path = tmp_path / "fetch.sqlite"
+    store_path = tmp_path / "store"
+    fetch_receipt_path = tmp_path / "fetch-receipt.json"
+    store_receipt_path = tmp_path / "store-receipt.json"
+    github = FakeGitHub(_zip_bytes())
+    fetcher = ci.CIStreamFetcher(
+        inventory_path=inventory,
+        state_path=state_path,
+        content_store_path=store_path,
+        tokenizer_path=tokenizer,
+        tokens=["api-secret"],
+        progress_path=tmp_path / "progress.json",
+        receipt_path=fetch_receipt_path,
+        parser=_fake_parser,
+        requester=github.request,
+        archive_downloader=github.download,
+        target_unique_tokens=1,
+        sleeper=lambda _: None,
+    )
+    try:
+        fetcher.run(continuous=False, max_runs=1)
+    finally:
+        fetcher.close()
+
+    with sqlite3.connect(state_path) as connection:
+        connection.execute(
+            """
+            UPDATE attempts SET
+              status='retry',
+              error_class='SyntheticInterruptedAttempt',
+              error_message='test hidden CAS'
+            """
+        )
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.execute("PRAGMA journal_mode=DELETE").fetchone()
+
+    with pytest.raises(RuntimeError, match="non-done attempt"):
+        finalize_fetch_receipts(
+            state_path=state_path,
+            content_store_path=store_path,
+            tokenizer_path=tokenizer,
+            target_unique_tokens=1,
+            fetch_receipt_path=fetch_receipt_path,
+            store_receipt_path=store_receipt_path,
+        )
+    assert not fetch_receipt_path.exists()
+    assert not store_receipt_path.exists()
+
+
 def test_retry_validates_and_skips_a_committed_member(
     tmp_path: Path,
 ) -> None:
@@ -1558,7 +1752,8 @@ def test_rolling_scheduler_refills_a_slot_before_a_slow_attempt_finishes() -> No
         def discover(self) -> None:
             return None
 
-        def next_attempt(self) -> int | None:
+        def next_attempt(self, *, retry_only: bool = False) -> int | None:
+            assert not retry_only
             return next(attempts, None)
 
     class Store:
@@ -1591,6 +1786,52 @@ def test_rolling_scheduler_refills_a_slot_before_a_slow_attempt_finishes() -> No
 
     assert result == {"status": "ok"}
     assert third_started.is_set()
+
+
+def test_scheduler_drains_retry_work_after_token_target_is_met() -> None:
+    class State:
+        def __init__(self) -> None:
+            self.calls: list[bool] = []
+            self.pending = ["pending"]
+            self.retries = ["retry"]
+
+        def discover(self) -> None:
+            return None
+
+        def next_attempt(self, *, retry_only: bool = False) -> str | None:
+            self.calls.append(retry_only)
+            queue = self.retries if retry_only else self.pending
+            return queue.pop(0) if queue else None
+
+    class Store:
+        def __init__(self) -> None:
+            self.tokens = 0
+
+        def status(self) -> dict[str, object]:
+            return {
+                "counters": {
+                    "exact_unique_payload_tokens": self.tokens,
+                }
+            }
+
+    fetcher = object.__new__(ci.CIStreamFetcher)
+    fetcher.state = State()
+    fetcher.store = Store()
+    fetcher.target_unique_tokens = 1
+    fetcher.sleeper = lambda _: None
+    fetcher.write_progress = lambda: {"status": "ok"}
+    processed: list[str] = []
+
+    def process(attempt: str) -> None:
+        processed.append(attempt)
+        fetcher.store.tokens = 1
+
+    fetcher.process_attempt = process
+    result = fetcher.run(continuous=False, workers=1)
+
+    assert result == {"status": "ok"}
+    assert processed == ["pending", "retry"]
+    assert fetcher.state.calls == [False, True, True]
 
 
 def test_spawned_parser_worker_emits_full_training_sidecars(
