@@ -111,7 +111,14 @@ def _best_split_char_index(
     for marker in preferred_breaks:
         idx = text.rfind(marker, window_start, best + 1)
         if idx > 0:
-            return idx + len(marker)
+            preferred = idx + len(marker)
+            # BPE token counts are not monotonic over character prefixes: a
+            # longer prefix can merge tokens that remain separate in a shorter
+            # one. ``best`` was measured exactly above, but this prettier,
+            # shorter boundary was not necessarily one of the binary-search
+            # probes. Never return it without an exact budget check.
+            if count_tokens(text[:preferred], tokenizer) <= max_tokens:
+                return preferred
     return best
 
 
