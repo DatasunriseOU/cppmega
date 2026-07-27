@@ -223,7 +223,10 @@ def test_paginates_and_preserves_full_compressed_metadata_and_attempts(
 
     assert [call["page"] for call in api.calls] == [1, 2, 3]
     assert progress["runs"] == 205
+    assert receipt["enumeration_complete"] is True
+    assert receipt["source_snapshot_stable"] is True
     assert receipt["production_complete"] is True
+    assert receipt["source_count_drift"]["windows"] == 0
     assert receipt["run_count"] == 205
     assert receipt["metadata_encoding"] == ci.METADATA_ENCODING
     final_progress = json.loads(
@@ -349,6 +352,43 @@ class CrossWindowDuplicateAPI(DatasetAPI):
         )
 
 
+class SplitCountDriftAPI(DatasetAPI):
+    """Return one contradictory parent count, then stable child counts."""
+
+    def __init__(self, start: int):
+        runs = [
+            *[_run(run_id, start + 1) for run_id in range(1, 51)],
+            *[_run(run_id, start + 2) for run_id in range(51, 101)],
+        ]
+        super().__init__(runs)
+        self.start = start
+
+    def __call__(
+        self,
+        method: str,
+        url: str,
+        headers: Mapping[str, str],
+        timeout: float,
+    ) -> ci.HTTPResponse:
+        start, end, page, per_page = self._query(url)
+        if start != self.start or end != self.start + 4:
+            return super().__call__(method, url, headers, timeout)
+        assert method == "GET"
+        assert timeout > 0
+        assert headers["Authorization"].startswith("Bearer ")
+        page_runs = self.runs if page == 1 else [self.runs[-1]]
+        return ci.HTTPResponse(
+            status=200,
+            headers={"X-RateLimit-Remaining": "4999"},
+            body=json.dumps(
+                {
+                    "total_count": 101,
+                    "workflow_runs": page_runs[:per_page],
+                }
+            ).encode(),
+        )
+
+
 def test_cross_page_duplicate_invalidates_leaf_and_recovers_by_split(
     tmp_path: Path,
 ) -> None:
@@ -370,6 +410,40 @@ def test_cross_page_duplicate_invalidates_leaf_and_recovers_by_split(
         assert conn.execute(
             "SELECT COUNT(*) FROM search_windows WHERE status='split'"
         ).fetchone()[0] == 1
+
+
+def test_split_parent_count_drift_is_explicit_and_not_production_complete(
+    tmp_path: Path,
+) -> None:
+    start = ci.parse_utc_instant(START)
+    inventory = _inventory(tmp_path, SplitCountDriftAPI(start))
+
+    inventory.run()
+    receipt = inventory.write_completion_receipt(tmp_path / "receipt.json")
+
+    drift_line = (
+        f"S\towner/repo\t{start}\t{start + 4}\t101\t100\t1"
+    )
+    assert receipt["schema"] == ci.RECEIPT_SCHEMA
+    assert receipt["enumeration_complete"] is True
+    assert receipt["source_snapshot_stable"] is False
+    assert receipt["production_complete"] is False
+    assert receipt["run_count"] == 100
+    assert receipt["source_count_drift"] == {
+        "windows": 1,
+        "parent_total": 101,
+        "child_total": 100,
+        "net_parent_minus_children": 1,
+        "absolute_delta": 1,
+        "sha256": ci._hash_lines([drift_line]),
+        "semantics": (
+            "GitHub total_count observations at each split parent versus "
+            "its later child enumeration; nonzero means the source "
+            "cardinality changed or pagination contradicted itself during "
+            "inventory; zero means no such contradiction was observed, not "
+            "proof of an atomic GitHub snapshot"
+        ),
+    }
 
 
 def test_cross_window_overlap_still_fails_closed(tmp_path: Path) -> None:
@@ -841,6 +915,88 @@ def test_v2_to_v3_resume_requires_exact_audited_producer_migration(
         )
 
 
+def test_same_schema_resume_requires_exact_audited_producer_migration(
+    tmp_path: Path,
+) -> None:
+    old_script = tmp_path / "old_inventory_producer.py"
+    new_script = tmp_path / "new_inventory_producer.py"
+    old_script.write_text("old producer\n", encoding="utf-8")
+    new_script.write_text("new producer\n", encoding="utf-8")
+    reason = "record split-parent source count drift in the receipt"
+
+    original = _inventory(
+        tmp_path,
+        DatasetAPI([]),
+        script_path=old_script,
+    )
+    original.run()
+
+    with pytest.raises(ci.BindingError, match="resume binding mismatch"):
+        _inventory(
+            tmp_path,
+            DatasetAPI([]),
+            resume=True,
+            script_path=new_script,
+        )
+    with pytest.raises(ci.BindingError, match="exact bound producer"):
+        _inventory(
+            tmp_path,
+            DatasetAPI([]),
+            resume=True,
+            script_path=new_script,
+            allow_script_upgrade_from_sha256="3" * 64,
+            script_upgrade_reason=reason,
+        )
+    with pytest.raises(ci.BindingError, match="requires a reason"):
+        _inventory(
+            tmp_path,
+            DatasetAPI([]),
+            resume=True,
+            script_path=new_script,
+            allow_script_upgrade_from_sha256=original.script_sha256,
+        )
+
+    migrated_api = DatasetAPI([])
+    migrated = _inventory(
+        tmp_path,
+        migrated_api,
+        resume=True,
+        script_path=new_script,
+        allow_script_upgrade_from_sha256=original.script_sha256,
+        script_upgrade_reason=reason,
+    )
+    migrated.run()
+    receipt = migrated.write_completion_receipt(tmp_path / "receipt.json")
+
+    assert migrated_api.calls == []
+    assert receipt["binding_upgrades"][-1] == {
+        "from_schema": ci.SCHEMA_VERSION,
+        "to_schema": ci.SCHEMA_VERSION,
+        "from_script_sha256": original.script_sha256,
+        "to_script_sha256": migrated.script_sha256,
+        "reason": reason,
+        "upgraded_at": receipt["binding_upgrades"][-1]["upgraded_at"],
+    }
+    repeated_api = DatasetAPI([])
+    repeated = _inventory(
+        tmp_path,
+        repeated_api,
+        resume=True,
+        script_path=new_script,
+        allow_script_upgrade_from_sha256=original.script_sha256,
+        script_upgrade_reason=reason,
+    )
+    repeated.run()
+    assert repeated_api.calls == []
+    with sqlite3.connect(tmp_path / "inventory.sqlite") as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM inventory_binding_upgrades"
+        ).fetchone() == (1,)
+        assert conn.execute(
+            "SELECT from_schema,to_schema FROM inventory_upgrades"
+        ).fetchone() == (ci.SCHEMA_VERSION, ci.SCHEMA_VERSION)
+
+
 def test_v2_incomplete_convergence_resumes_with_persisted_attempt_number(
     tmp_path: Path,
 ) -> None:
@@ -965,6 +1121,8 @@ def test_receipt_refuses_open_windows_and_smoke_never_claims_production(
     smoke_inventory.run()
     receipt = smoke_inventory.write_completion_receipt(smoke_dir / "receipt.json")
     assert receipt["mode"] == "smoke"
+    assert receipt["enumeration_complete"] is True
+    assert receipt["source_snapshot_stable"] is True
     assert receipt["production_complete"] is False
     assert receipt["repo_list"]["repos"] == 1
     assert receipt["repo_list"]["original_repos"] == 2

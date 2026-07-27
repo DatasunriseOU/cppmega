@@ -37,7 +37,7 @@ import zlib
 
 
 SCHEMA_VERSION = "cppmega_ci_stream_inventory_v3"
-RECEIPT_SCHEMA = "cppmega_ci_stream_inventory_receipt_v3"
+RECEIPT_SCHEMA = "cppmega_ci_stream_inventory_receipt_v4"
 PROGRESS_SCHEMA = "cppmega_ci_stream_inventory_progress_v3"
 PREVIOUS_SCHEMA_VERSION = "cppmega_ci_stream_inventory_v2"
 GITHUB_API_VERSION = "2022-11-28"
@@ -1112,6 +1112,14 @@ class InventoryDB:
                         current_schema == "cppmega_ci_stream_inventory_v1"
                     )
                     upgrade_v2 = current_schema == PREVIOUS_SCHEMA_VERSION
+                    same_schema_upgrade = (
+                        current_schema == SCHEMA_VERSION
+                        and previous_script != script_sha256
+                        and (
+                            allow_script_upgrade_from_sha256 is not None
+                            or script_upgrade_reason is not None
+                        )
+                    )
                     upgrade_reason: str | None = None
                     if upgrade_v2:
                         if (
@@ -1120,6 +1128,20 @@ class InventoryDB:
                         ):
                             raise BindingError(
                                 "inventory v2 to v3 migration requires "
+                                "--allow-inventory-script-upgrade-from-sha256 "
+                                "to match the exact bound producer"
+                            )
+                        upgrade_reason = _validate_upgrade_reason(
+                            script_upgrade_reason
+                        )
+                    elif same_schema_upgrade:
+                        if (
+                            allow_script_upgrade_from_sha256
+                            != previous_script
+                        ):
+                            raise BindingError(
+                                "same-schema inventory producer migration "
+                                "requires "
                                 "--allow-inventory-script-upgrade-from-sha256 "
                                 "to match the exact bound producer"
                             )
@@ -1168,6 +1190,8 @@ class InventoryDB:
                     ignored_upgrade_keys = (
                         {"schema", "script_sha256"}
                         if upgrade_v1 or upgrade_v2
+                        else {"script_sha256"}
+                        if same_schema_upgrade
                         else set()
                     )
                     mismatches = {
@@ -1184,7 +1208,7 @@ class InventoryDB:
                         raise BindingError(
                             f"resume binding mismatch in {self.path}: {rendered}"
                         )
-                    if upgrade_v1 or upgrade_v2:
+                    if upgrade_v1 or upgrade_v2 or same_schema_upgrade:
                         self._backfill_binding_upgrade_history_locked(
                             conn,
                             current_schema=str(current_schema),
@@ -2737,6 +2761,10 @@ class InventoryDB:
 
             leaf_ids: list[int] = []
             union_closure_lines: list[str] = []
+            split_count_drift_lines: list[str] = []
+            split_count_drift_parent_total = 0
+            split_count_drift_child_total = 0
+            split_count_drift_absolute_delta = 0
             for repo in repos:
                 repo_key = str(repo["repo_key"])
                 windows = by_repo.get(repo_key, [])
@@ -3260,10 +3288,17 @@ class InventoryDB:
                             f"split window {window_id} children overlap or leave a gap"
                         )
                     child_total = sum(int(child["expected_total"]) for child in children)
-                    if child_total != int(window["expected_total"]):
-                        raise CompletionError(
-                            f"split window {window_id} count changed: parent "
-                            f"{window['expected_total']} != children {child_total}"
+                    parent_total = int(window["expected_total"])
+                    if child_total != parent_total:
+                        split_count_drift_parent_total += parent_total
+                        split_count_drift_child_total += child_total
+                        split_count_drift_absolute_delta += abs(
+                            parent_total - child_total
+                        )
+                        split_count_drift_lines.append(
+                            f"S\t{repo_key}\t{window['start_epoch']}\t"
+                            f"{window['end_epoch']}\t{parent_total}\t"
+                            f"{child_total}\t{parent_total - child_total}"
                         )
 
             if not leaf_ids and repos:
@@ -3361,7 +3396,31 @@ class InventoryDB:
                 )
             )
             closure_lines.extend(sorted(union_closure_lines))
+            sorted_split_count_drift_lines = sorted(
+                split_count_drift_lines
+            )
+            closure_lines.extend(sorted_split_count_drift_lines)
             closure_sha = _hash_lines(closure_lines)
+            split_count_drift_net = (
+                split_count_drift_parent_total
+                - split_count_drift_child_total
+            )
+            source_count_drift = {
+                "windows": len(sorted_split_count_drift_lines),
+                "parent_total": split_count_drift_parent_total,
+                "child_total": split_count_drift_child_total,
+                "net_parent_minus_children": split_count_drift_net,
+                "absolute_delta": split_count_drift_absolute_delta,
+                "sha256": _hash_lines(sorted_split_count_drift_lines),
+                "semantics": (
+                    "GitHub total_count observations at each split parent "
+                    "versus its later child enumeration; nonzero means the "
+                    "source cardinality changed or pagination contradicted "
+                    "itself during inventory; zero means no such "
+                    "contradiction was observed, not proof of an atomic "
+                    "GitHub snapshot"
+                ),
+            }
             logical_document = {
                 "schema": SCHEMA_VERSION,
                 "repo_list_sha256": meta["repo_list_sha256"],
@@ -3376,6 +3435,7 @@ class InventoryDB:
                 "binding_upgrades_sha256": _sha256_json(
                     binding_upgrades
                 ),
+                "source_count_drift": source_count_drift,
             }
             return {
                 "meta": meta,
@@ -3389,6 +3449,7 @@ class InventoryDB:
                     conn.execute("SELECT COUNT(*) FROM request_ledger").fetchone()[0]
                 ),
                 "binding_upgrades": binding_upgrades,
+                "source_count_drift": source_count_drift,
             }
         finally:
             conn.close()
@@ -3397,10 +3458,15 @@ class InventoryDB:
         validated = self._validate_and_digests()
         meta = validated["meta"]
         smoke = meta["smoke"] == "1"
+        source_snapshot_stable = (
+            validated["source_count_drift"]["windows"] == 0
+        )
         return {
             "schema": RECEIPT_SCHEMA,
             "completed_at": _utc_now(),
-            "production_complete": not smoke,
+            "enumeration_complete": True,
+            "source_snapshot_stable": source_snapshot_stable,
+            "production_complete": not smoke and source_snapshot_stable,
             "mode": "smoke" if smoke else "production",
             "database": self.path,
             "repo_list": {
@@ -3425,6 +3491,7 @@ class InventoryDB:
             "window_closure_sha256": validated["window_closure_sha256"],
             "db_logical_sha256": validated["db_logical_sha256"],
             "binding_upgrades": validated["binding_upgrades"],
+            "source_count_drift": validated["source_count_drift"],
         }
 
 
@@ -3792,7 +3859,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--allow-inventory-script-upgrade-from-sha256",
         help=(
-            "explicitly authorize one v2 to v3 resume migration from this "
+            "explicitly authorize one audited resume migration from this "
             "exact previously bound producer SHA-256"
         ),
     )
