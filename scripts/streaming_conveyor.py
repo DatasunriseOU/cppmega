@@ -61,6 +61,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -167,6 +168,16 @@ EXTRACT_CACHE_MODE_EXTERNAL = "external"
 EXTRACT_CACHE_MODE = EXTRACT_CACHE_MODE_RUN_LOCAL
 
 _PRINT_LOCK = threading.Lock()
+
+
+def _handle_source_stream_read_error(
+    error: tarfile.ReadError,
+    *,
+    interrupted: bool,
+) -> None:
+    if not interrupted:
+        raise error
+    _log(f"Source stream closed after checkpoint signal: {error}")
 
 
 class CodeRevisionError(RuntimeError):
@@ -5237,6 +5248,8 @@ def main(argv: list[str]) -> int:
 
             while inflight:
                 drain_one_or_more(block=True)
+    except tarfile.ReadError as exc:
+        _handle_source_stream_read_error(exc, interrupted=STOP_EVENT.is_set())
     finally:
         recompress_error: Exception | None = None
         if repo_pool is not None:

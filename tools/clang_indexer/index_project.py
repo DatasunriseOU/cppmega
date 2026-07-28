@@ -808,6 +808,40 @@ def _normalize_signature_text(value: str | None) -> str:
     return re.sub(r"\s+", " ", str(value)).strip()
 
 
+def _project_identity_path_prefixes(project_dir: str | None) -> tuple[str, ...]:
+    """Return native and cross-platform spellings of the checkout prefix."""
+
+    if not project_dir:
+        return ()
+    roots = {
+        os.path.abspath(str(project_dir)),
+        os.path.realpath(str(project_dir)),
+    }
+    prefixes: set[str] = set()
+    for root in roots:
+        stripped = root.rstrip("/\\")
+        for spelling in {
+            stripped,
+            stripped.replace("\\", "/"),
+            stripped.replace("/", "\\"),
+        }:
+            prefixes.add(spelling.rstrip("/\\") + "/")
+            prefixes.add(spelling.rstrip("/\\") + "\\")
+    return tuple(sorted(prefixes, key=len, reverse=True))
+
+
+def _canonicalize_clang_identity_text(
+    value: str | None,
+    project_dir: str | None,
+) -> str:
+    """Remove checkout-specific prefixes from clang-generated identity text."""
+
+    text = str(value or "")
+    for prefix in _project_identity_path_prefixes(project_dir):
+        text = text.replace(prefix, "")
+    return _normalize_signature_text(text)
+
+
 _PROVIDER_PATH_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "libc++",
@@ -908,7 +942,7 @@ def _cursor_kind_name(cursor: Cursor) -> str:
     return text.rsplit(".", 1)[-1]
 
 
-def _cursor_usr(cursor: Cursor) -> str:
+def _cursor_usr(cursor: Cursor, *, project_dir: str | None = None) -> str:
     get_usr = getattr(cursor, "get_usr", None)
     if not callable(get_usr):
         return ""
@@ -919,7 +953,25 @@ def _cursor_usr(cursor: Cursor) -> str:
     except Exception as exc:
         raise SymbolIdentityError("clang USR extraction failed") from exc
     # Clang can surface empty/placeholder USRs for unexposed/local constructs.
-    if not usr or usr.startswith("<") or "invalid" in usr.lower():
+    # Anonymous declarations can also carry a checkout-absolute path and spaces
+    # inside the USR. Such a value is not portable and is invalid under the
+    # canonical USR contract, so route it through the scoped fallback identity.
+    if (
+        not usr
+        or usr.startswith("<")
+        or "invalid" in usr.lower()
+        or usr != usr.strip()
+        or "\x1f" in usr
+        # Whitespace is legal semantic payload in Clang USRs for conversion
+        # operators (for example ``operator int``).  Reject only control
+        # characters here; checkout-bound anonymous USRs are rejected by the
+        # explicit project-prefix check below.
+        or any(ord(char) < 32 or ord(char) == 127 for char in usr)
+        or any(
+            prefix in usr
+            for prefix in _project_identity_path_prefixes(project_dir)
+        )
+    ):
         return ""
     return usr
 
@@ -1349,9 +1401,15 @@ def symbol_identity_for_cursor(
     force_file_scope: bool = False,
 ) -> tuple[str, str, str]:
     """Return ``(identity_key, usr, canonical_signature)`` for a clang cursor."""
-    qname = get_qualified_name(cursor)
-    usr = _cursor_usr(cursor)
-    signature = _cursor_canonical_signature(cursor)
+    qname = _canonicalize_clang_identity_text(
+        get_qualified_name(cursor),
+        project_dir,
+    )
+    usr = _cursor_usr(cursor, project_dir=project_dir)
+    signature = _canonicalize_clang_identity_text(
+        _cursor_canonical_signature(cursor),
+        project_dir,
+    )
     file_scope = force_file_scope
     uses_repo_file_location = not usr and not signature
     rel_file, identity_project = _cursor_repo_file_location_identity(
@@ -1491,7 +1549,10 @@ def symbol_reference_for_cursor(
         "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
         "symbol_key": key,
         "symbol_id": _compute_symbol_id(key),
-        "qname": get_qualified_name(cursor),
+        "qname": _canonicalize_clang_identity_text(
+            get_qualified_name(cursor),
+            project_dir,
+        ),
         "usr": usr,
         "canonical_signature": signature,
         "symbol_kind": _cursor_kind_name(cursor),
@@ -2874,6 +2935,8 @@ def parse_translation_unit(
     *,
     project_id: str,
     external_reference_omissions: ExternalReferenceOmissions | None = None,
+    allow_include_recovery: bool = False,
+    parse_recovery_records: list[dict[str, object]] | None = None,
 ) -> tuple[list[FunctionDef], list[TypeDef]]:
     """Parse a single C/C++ file (source OR header) and extract function
     definitions (with callees + referenced types) AND type definitions
@@ -2905,19 +2968,14 @@ def parse_translation_unit(
     except OSError:
         return functions, typedefs
 
-    try:
-        tu = index.parse(
-            filepath,
-            args=compile_args,
-            # Corpus indexing parses each translation unit once. PCH preamble
-            # caches are a native-memory win only for repeated reparses; here they
-            # make many parallel clang workers retain large buffers.
-            options=TranslationUnit.PARSE_INCOMPLETE,
-        )
-    except SymbolIdentityError:
-        raise
-    except Exception as exc:
-        raise RuntimeError(f"libclang parse failed for {filepath}: {exc}") from exc
+    tu = _load_translation_unit_with_include_recovery(
+        filepath,
+        index,
+        compile_args,
+        project_dir,
+        allow_include_recovery=allow_include_recovery,
+        parse_recovery_records=parse_recovery_records,
+    )
 
     rel_path = os.path.relpath(filepath, project_dir)
     ast_depth, sibling_index, ast_node_type = extract_clang_ast_metadata(
@@ -3021,7 +3079,10 @@ def parse_translation_unit(
                 referenced_type_keys = [
                     str(ref["symbol_key"]) for ref in referenced_type_refs
                 ]
-                qname = get_qualified_name(cursor)
+                qname = _canonicalize_clang_identity_text(
+                    get_qualified_name(cursor),
+                    project_dir,
+                )
                 symbol_key, usr, canonical_signature = symbol_identity_for_cursor(
                     cursor,
                     project_dir=project_dir,
@@ -3080,7 +3141,10 @@ def parse_translation_unit(
         # declaration never shadows the real body.
         type_bucket = _TYPE_DEF_KIND_BUCKET.get(kind)
         if type_bucket is not None and cursor.is_definition():
-            qname = get_qualified_name(cursor)
+            qname = _canonicalize_clang_identity_text(
+                get_qualified_name(cursor),
+                project_dir,
+            )
             # Normal path drops std::/boost:: ("system") type names; the std
             # cross-link builder sets allow_system_types so std:: class templates
             # (std::vector/std::map/std::basic_string/...) ARE captured.
@@ -3119,7 +3183,10 @@ def parse_translation_unit(
                     in_primary_file=in_primary_file,
                 )
         if header_decl_kind is not None and header_decl_text and len(header_decl_text) >= 8:
-            qname = get_qualified_name(cursor)
+            qname = _canonicalize_clang_identity_text(
+                get_qualified_name(cursor),
+                project_dir,
+            )
             if qname and (allow_system_types or not is_system_function(qname)):
                 symbol_key, usr, canonical_signature = symbol_identity_for_cursor(
                     cursor,
@@ -4292,6 +4359,464 @@ def _discover_include_dirs(project_dir: str) -> list[str]:
         if os.path.basename(root) == 'include':
             include_dirs.add(root)
     return sorted(include_dirs)
+
+
+_RECOVERY_INCLUDE_DIR_CACHE: dict[str, tuple[str, ...]] = {}
+_RECOVERY_INCLUDE_DIR_RE = re.compile(
+    r"(?:include|inc(?:\.[A-Za-z0-9_-]+)?)",
+    re.IGNORECASE,
+)
+_MISSING_INCLUDE_DIAGNOSTIC_MARKERS = (
+    "file not found",
+    "cannot open include file",
+    "no such file or directory",
+)
+_RECOVERY_SOURCE_INCLUDE_RE = re.compile(
+    r'^\s*#\s*include\s+["<]([^">]+)[">]',
+)
+_RECOVERY_SOURCE_SCAN_MAX_BYTES = 4 * 1024 * 1024
+_RECOVERY_MAX_ROUNDS = 3
+
+
+def _discover_recovery_include_dirs(project_dir: str) -> tuple[str, ...]:
+    """Find nested include roots for a receipt-recorded legacy parse retry.
+
+    This is deliberately separate from the normal inferred build context.  It
+    is consulted only after libclang cannot load a translation unit or reports
+    a missing include and only when no compile-command entry exists.
+    """
+
+    project_root = os.path.realpath(os.path.abspath(project_dir))
+    cached = _RECOVERY_INCLUDE_DIR_CACHE.get(project_root)
+    if cached is not None:
+        return cached
+
+    discovered: list[str] = []
+    for root, dirs, _files in os.walk(project_root):
+        dirs[:] = sorted(
+            directory
+            for directory in dirs
+            if directory not in {".git", ".hg", ".svn"}
+            and not os.path.islink(os.path.join(root, directory))
+        )
+        if _RECOVERY_INCLUDE_DIR_RE.fullmatch(os.path.basename(root)):
+            discovered.append(os.path.abspath(root))
+    result = tuple(sorted(set(discovered)))
+    _RECOVERY_INCLUDE_DIR_CACHE[project_root] = result
+    return result
+
+
+def _compile_arg_include_dirs(
+    compile_args: Sequence[str],
+    *,
+    project_dir: str,
+) -> set[str]:
+    """Return normalized include directories already present in clang args."""
+
+    existing: set[str] = set()
+    expect_path = False
+    for value in compile_args:
+        text = str(value)
+        if expect_path:
+            candidate = text
+            expect_path = False
+        elif text in {"-I", "-isystem", "-iquote"}:
+            expect_path = True
+            continue
+        elif text.startswith("-I") and text != "-I":
+            candidate = text[2:]
+        elif text.startswith("-isystem") and text != "-isystem":
+            candidate = text.removeprefix("-isystem")
+        elif text.startswith("-iquote") and text != "-iquote":
+            candidate = text.removeprefix("-iquote")
+        else:
+            continue
+        if not os.path.isabs(candidate):
+            candidate = os.path.join(project_dir, candidate)
+        existing.add(os.path.realpath(os.path.abspath(candidate)))
+    return existing
+
+
+def _normalize_recovery_include_name(value: object) -> str | None:
+    text = str(value or "").strip().replace("\\", "/")
+    if (
+        not text
+        or len(text) > 4096
+        or text.startswith("/")
+        or re.match(r"^[A-Za-z]:/", text)
+        or "\x00" in text
+        or any(ord(char) < 32 or ord(char) == 127 for char in text)
+    ):
+        return None
+    parts = tuple(part for part in text.split("/") if part not in {"", "."})
+    if not parts or any(part == ".." for part in parts):
+        return None
+    return "/".join(parts)
+
+
+def _diagnostic_missing_include_names(
+    diagnostics: Sequence[str],
+) -> tuple[str, ...]:
+    names: set[str] = set()
+    for spelling in diagnostics:
+        match = re.search(r"""['"]([^'"]+)['"]""", str(spelling))
+        if match is None:
+            continue
+        normalized = _normalize_recovery_include_name(match.group(1))
+        if normalized is not None:
+            names.add(normalized)
+    return tuple(sorted(names))
+
+
+def _forced_include_names(compile_args: Sequence[str]) -> tuple[str, ...]:
+    names: set[str] = set()
+    expect_path = False
+    for value in compile_args:
+        text = str(value)
+        candidate: str | None = None
+        if expect_path:
+            candidate = text
+            expect_path = False
+        elif text == "-include":
+            expect_path = True
+            continue
+        elif text.startswith("-include") and text != "-include":
+            candidate = text.removeprefix("-include")
+        elif text.lower().startswith("/fi") and len(text) > 3:
+            candidate = text[3:]
+        if candidate is None:
+            continue
+        normalized = _normalize_recovery_include_name(candidate)
+        if normalized is not None:
+            names.add(normalized)
+    return tuple(sorted(names))
+
+
+def _source_include_names(filepath: str) -> tuple[str, ...]:
+    names: set[str] = set()
+    try:
+        with open(filepath, "rb") as stream:
+            raw = stream.read(_RECOVERY_SOURCE_SCAN_MAX_BYTES + 1)
+    except OSError:
+        return ()
+    raw = raw[:_RECOVERY_SOURCE_SCAN_MAX_BYTES]
+    encoding = "utf-16" if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8"
+    text = raw.decode(encoding, errors="ignore")
+    for line in text.splitlines():
+        match = _RECOVERY_SOURCE_INCLUDE_RE.match(line)
+        if match is None:
+            continue
+        normalized = _normalize_recovery_include_name(match.group(1))
+        if normalized is not None:
+            names.add(normalized)
+    return tuple(sorted(names))
+
+
+def _seed_recovery_include_names(
+    *,
+    filepath: str,
+    compile_args: Sequence[str],
+    missing_diagnostics: Sequence[str],
+) -> tuple[str, ...]:
+    diagnostic_names = _diagnostic_missing_include_names(missing_diagnostics)
+    if diagnostic_names:
+        return diagnostic_names
+    return tuple(
+        sorted(
+            {
+                *_forced_include_names(compile_args),
+                *_source_include_names(filepath),
+            }
+        )
+    )
+
+
+def _include_recovery_args(
+    compile_args: Sequence[str],
+    *,
+    filepath: str,
+    project_dir: str,
+    include_names: Sequence[str],
+) -> tuple[list[str], list[str], list[str]]:
+    """Add only roots that contain requested headers, choosing the closest."""
+
+    project_root = os.path.realpath(os.path.abspath(project_dir))
+    source_dir = os.path.realpath(os.path.abspath(os.path.dirname(filepath)))
+    candidates = {source_dir, *_discover_recovery_include_dirs(project_root)}
+    existing = _compile_arg_include_dirs(
+        compile_args,
+        project_dir=project_root,
+    )
+
+    def _relative_parts(path: str) -> tuple[str, ...]:
+        try:
+            relative = os.path.relpath(path, project_root)
+        except ValueError:
+            return ()
+        if relative == ".." or relative.startswith(f"..{os.sep}"):
+            return ()
+        return Path(relative).parts
+
+    source_parts = _relative_parts(source_dir)
+
+    def _rank(path: str) -> tuple[int, int, str]:
+        parts = _relative_parts(path)
+        shared = 0
+        for left, right in zip(source_parts, parts):
+            if left != right:
+                break
+            shared += 1
+        return (-shared, len(parts), Path(*parts).as_posix())
+
+    ranked_candidates = sorted(candidates, key=_rank)
+
+    def _contains_project_local_header(candidate: str, name: str) -> bool:
+        header = os.path.join(candidate, *name.split("/"))
+        if not os.path.isfile(header):
+            return False
+        try:
+            return os.path.commonpath(
+                (project_root, os.path.realpath(header))
+            ) == project_root
+        except ValueError:
+            return False
+
+    selected: set[str] = set()
+    unresolved: list[str] = []
+    for include_name in sorted(set(map(str, include_names))):
+        normalized = _normalize_recovery_include_name(include_name)
+        if normalized is None:
+            continue
+        matches = [
+            candidate
+            for candidate in ranked_candidates
+            if _contains_project_local_header(candidate, normalized)
+        ]
+        if not matches:
+            unresolved.append(normalized)
+            continue
+        selected.add(matches[0])
+
+    added_absolute = [
+        candidate
+        for candidate in ranked_candidates
+        if candidate in selected and candidate not in existing
+    ]
+    added_relative = [
+        Path(*_relative_parts(candidate)).as_posix()
+        for candidate in added_absolute
+    ]
+    return (
+        [*map(str, compile_args), *(f"-I{path}" for path in added_absolute)],
+        added_relative,
+        unresolved,
+    )
+
+
+def _missing_include_diagnostics(tu: TranslationUnit) -> list[str]:
+    diagnostics: list[str] = []
+    for diagnostic in getattr(tu, "diagnostics", ()):
+        spelling = str(getattr(diagnostic, "spelling", "") or "")
+        lowered = spelling.lower()
+        if any(marker in lowered for marker in _MISSING_INCLUDE_DIAGNOSTIC_MARKERS):
+            diagnostics.append(spelling)
+    return diagnostics
+
+
+def _translation_unit_load_error(exc: BaseException) -> bool:
+    return type(exc).__name__ == "TranslationUnitLoadError"
+
+
+def _load_translation_unit(
+    filepath: str,
+    index: Index,
+    compile_args: Sequence[str],
+) -> TranslationUnit:
+    return index.parse(
+        filepath,
+        args=list(compile_args),
+        # Corpus indexing parses each translation unit once. PCH preamble
+        # caches are a native-memory win only for repeated reparses; here they
+        # make many parallel clang workers retain large buffers.
+        options=TranslationUnit.PARSE_INCOMPLETE,
+    )
+
+
+def _load_translation_unit_with_include_recovery(
+    filepath: str,
+    index: Index,
+    compile_args: Sequence[str],
+    project_dir: str,
+    *,
+    allow_include_recovery: bool,
+    parse_recovery_records: list[dict[str, object]] | None,
+) -> TranslationUnit:
+    """Load one TU, retrying missing legacy include context transparently."""
+
+    initial_tu: TranslationUnit | None = None
+    initial_error: Exception | None = None
+    try:
+        initial_tu = _load_translation_unit(filepath, index, compile_args)
+    except SymbolIdentityError:
+        raise
+    except Exception as exc:
+        if not _translation_unit_load_error(exc):
+            raise RuntimeError(
+                f"libclang parse failed for {filepath}: {exc}"
+            ) from exc
+        initial_error = exc
+
+    initial_missing = (
+        _missing_include_diagnostics(initial_tu)
+        if initial_tu is not None
+        else []
+    )
+    if initial_error is None and not initial_missing:
+        assert initial_tu is not None
+        return initial_tu
+    if not allow_include_recovery:
+        if initial_error is not None:
+            raise RuntimeError(
+                f"libclang parse failed for {filepath}: {initial_error}"
+            ) from initial_error
+        assert initial_tu is not None
+        return initial_tu
+
+    include_names = _seed_recovery_include_names(
+        filepath=filepath,
+        compile_args=compile_args,
+        missing_diagnostics=initial_missing,
+    )
+    if not include_names:
+        if initial_error is not None:
+            raise RuntimeError(
+                f"libclang parse failed for {filepath}: {initial_error}"
+            ) from initial_error
+        assert initial_tu is not None
+        return initial_tu
+
+    relative_path = Path(os.path.relpath(filepath, project_dir)).as_posix()
+    active_args = list(map(str, compile_args))
+    added_include_dirs: list[str] = []
+    unresolved_include_names: set[str] = set()
+    recovered_tu: TranslationUnit | None = None
+    recovered_missing: list[str] = []
+    retry_error: Exception | None = None
+    retry_round_count = 0
+    requested_include_names: set[str] = set(include_names)
+    for _round in range(_RECOVERY_MAX_ROUNDS):
+        recovery_args, round_added, round_unresolved = _include_recovery_args(
+            active_args,
+            filepath=filepath,
+            project_dir=project_dir,
+            include_names=include_names,
+        )
+        unresolved_include_names.update(round_unresolved)
+        if not round_added:
+            break
+        retry_round_count += 1
+        active_args = recovery_args
+        added_include_dirs.extend(round_added)
+        try:
+            candidate_tu = _load_translation_unit(
+                filepath,
+                index,
+                active_args,
+            )
+        except Exception as recovery_error:
+            retry_error = recovery_error
+            break
+        candidate_missing = _missing_include_diagnostics(candidate_tu)
+        recovered_tu = candidate_tu
+        recovered_missing = candidate_missing
+        include_names = _diagnostic_missing_include_names(candidate_missing)
+        requested_include_names.update(include_names)
+        if not include_names:
+            break
+
+    if not added_include_dirs:
+        if initial_error is not None:
+            raise RuntimeError(
+                f"libclang parse failed for {filepath}: {initial_error}"
+            ) from initial_error
+        assert initial_tu is not None
+        return initial_tu
+
+    encoded_include_dirs = json.dumps(
+        added_include_dirs,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encoded_include_names = json.dumps(
+        sorted(requested_include_names),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    record: dict[str, object] = {
+        "relative_path": relative_path,
+        "trigger": (
+            "translation_unit_load_error"
+            if initial_error is not None
+            else "missing_include_diagnostic"
+        ),
+        "added_include_dir_count": len(added_include_dirs),
+        "added_include_dirs_sha256": hashlib.sha256(
+            encoded_include_dirs
+        ).hexdigest(),
+        "added_include_dir_examples": added_include_dirs[:8],
+        "added_include_dir_examples_truncated": len(added_include_dirs) > 8,
+        "requested_include_name_count": len(requested_include_names),
+        "requested_include_names_sha256": hashlib.sha256(
+            encoded_include_names
+        ).hexdigest(),
+        "requested_include_name_examples": sorted(requested_include_names)[:8],
+        "requested_include_name_examples_truncated": (
+            len(requested_include_names) > 8
+        ),
+        "unresolved_include_name_count": len(unresolved_include_names),
+        "retry_round_count": retry_round_count,
+        "initial_missing_include_count": len(initial_missing),
+    }
+    if recovered_tu is None:
+        assert retry_error is not None
+        record.update(
+            {
+                "status": "unresolved",
+                "retry_error_type": type(retry_error).__name__,
+            }
+        )
+        if parse_recovery_records is not None:
+            parse_recovery_records.append(record)
+        if initial_error is not None:
+            raise RuntimeError(
+                f"libclang parse failed for {filepath} after nested include "
+                f"recovery: {retry_error}"
+            ) from retry_error
+        assert initial_tu is not None
+        return initial_tu
+
+    recovered = initial_error is not None or (
+        len(recovered_missing) < len(initial_missing)
+    )
+    record.update(
+        {
+            "status": "recovered" if recovered else "unresolved",
+            "retry_missing_include_count": len(recovered_missing),
+        }
+    )
+    if parse_recovery_records is not None:
+        parse_recovery_records.append(record)
+    if recovered:
+        print(
+            "  Parse include recovery: "
+            f"{relative_path} added_dirs={len(added_include_dirs)} "
+            f"missing_includes={len(initial_missing)}->{len(recovered_missing)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return recovered_tu
+    assert initial_tu is not None
+    return initial_tu
 
 
 def _is_sane_compile_args(args: list[str]) -> bool:
@@ -9015,6 +9540,7 @@ def _parse_file_batch(args_tuple):
     func_results: list[dict] = []
     type_results: list[dict] = []
     external_reference_omissions: ExternalReferenceOmissions = {}
+    parse_recovery_records: list[dict[str, object]] = []
     last_heartbeat = time.monotonic()
     for idx, filepath in enumerate(filepaths, start=1):
         args = _resolve_file_args(filepath, compile_db, default_args)
@@ -9026,6 +9552,10 @@ def _parse_file_batch(args_tuple):
                 project_dir,
                 project_id=project_id,
                 external_reference_omissions=external_reference_omissions,
+                allow_include_recovery=not (
+                    compile_db and filepath in compile_db
+                ),
+                parse_recovery_records=parse_recovery_records,
             )
             func_results.extend(f.to_dict() for f in functions)
             type_results.extend(t.to_dict() for t in typedefs)
@@ -9054,6 +9584,7 @@ def _parse_file_batch(args_tuple):
         "functions": func_results,
         "typedefs": type_results,
         "external_reference_omissions": external_reference_omissions,
+        "parse_recovery_records": parse_recovery_records,
     }, len(filepaths)
 
 
@@ -9206,6 +9737,48 @@ def _external_reference_omission_summary(
     }
 
 
+def _parse_recovery_summary(
+    records: Iterable[dict[str, object]],
+) -> dict[str, object]:
+    normalized = sorted(
+        (dict(record) for record in records),
+        key=lambda record: (
+            str(record.get("relative_path") or ""),
+            str(record.get("trigger") or ""),
+            str(record.get("status") or ""),
+        ),
+    )
+    encoded = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    recovered_count = sum(
+        record.get("status") == "recovered" for record in normalized
+    )
+    unresolved_count = sum(
+        record.get("status") == "unresolved" for record in normalized
+    )
+    return {
+        "schema": "cppmega.source_parse_recovery_v1",
+        "status": (
+            "complete_with_unresolved"
+            if unresolved_count
+            else "complete"
+        ),
+        "policy": (
+            "retry_missing_includes_with_header_matched_project_local_dirs_"
+            "only_without_compile_command"
+        ),
+        "attempted_file_count": len(normalized),
+        "recovered_file_count": recovered_count,
+        "unresolved_file_count": unresolved_count,
+        "records_sha256": hashlib.sha256(encoded).hexdigest(),
+        "records": normalized,
+    }
+
+
 def process_project(
     project_dir: str,
     max_tokens: int = 16384,
@@ -9266,6 +9839,7 @@ def process_project(
     )
     quarantine_receipt: dict[str, object] | None = None
     external_reference_omissions: ExternalReferenceOmissions = {}
+    parse_recovery_records: list[dict[str, object]] = []
 
     invalid_domain_paths: set[str] = set()
 
@@ -9401,6 +9975,7 @@ def process_project(
                     external_reference_omissions[key] = (
                         external_reference_omissions.get(key, 0) + int(count)
                     )
+                parse_recovery_records.extend(payload["parse_recovery_records"])
                 total_parsed += parsed_count
                 check_memory_limit(memory_limit_gb, label="index_project")
                 print(
@@ -9429,6 +10004,10 @@ def process_project(
                     project_dir,
                     project_id=stable_project_id,
                     external_reference_omissions=external_reference_omissions,
+                    allow_include_recovery=not (
+                        compile_db and filepath in compile_db
+                    ),
+                    parse_recovery_records=parse_recovery_records,
                 )
                 for func in functions:
                     index_obj.add_function(func)
@@ -9465,6 +10044,7 @@ def process_project(
     external_reference_omission_summary = _external_reference_omission_summary(
         external_reference_omissions
     )
+    parse_recovery_summary = _parse_recovery_summary(parse_recovery_records)
     print(
         "  Unknown external graph references omitted: "
         f"observations={external_reference_omission_summary['observation_count']} "
@@ -9473,10 +10053,19 @@ def process_project(
         f"{external_reference_omission_summary['reference_records_sha256']}",
         file=sys.stderr,
     )
+    print(
+        "  Source parse recovery: "
+        f"attempted={parse_recovery_summary['attempted_file_count']} "
+        f"recovered={parse_recovery_summary['recovered_file_count']} "
+        f"unresolved={parse_recovery_summary['unresolved_file_count']} "
+        f"records_sha256={parse_recovery_summary['records_sha256']}",
+        file=sys.stderr,
+    )
     if quarantine_receipt is not None:
         quarantine_receipt["external_reference_omissions"] = (
             external_reference_omission_summary
         )
+        quarantine_receipt["parse_recovery"] = parse_recovery_summary
         assert source_quarantine_receipt is not None
         _write_source_quarantine_receipt(
             source_quarantine_receipt,

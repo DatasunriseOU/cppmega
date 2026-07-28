@@ -102,6 +102,20 @@ EXCLUDE_PARTS = frozenset(SOURCE_EXTRA_EXCLUDE.split(","))
 _PUBLICATION_LOCK = threading.Lock()
 
 
+def iter_tar_members_without_cache(tar):
+    """Yield streaming tar members without retaining all prior metadata.
+
+    Python's ``tarfile`` keeps appending ``TarInfo`` objects to ``members`` even
+    in ``r|`` mode.  Clearing that lookup cache after each header keeps archive
+    traversal bounded on multi-million-file corpora.  The caller receives the
+    current ``TarInfo`` object directly, so extracting that member remains safe.
+    """
+
+    for member in tar:
+        tar.members.clear()
+        yield member
+
+
 def load_project_identity_map(repo_list: Path) -> dict[str, str]:
     if not repo_list.exists():
         raise FileNotFoundError(f"repo identity map does not exist: {repo_list}")
@@ -279,12 +293,8 @@ def commit_stage_db(work: Path, key: str) -> Path:
 
 
 def is_code_worktree_repo(repo: str) -> bool:
-    """Return False for archive members that are not C/C++ source worktrees."""
-    if repo.endswith(".bare"):
-        return False
-    if repo.startswith("windows_"):
-        return False
-    return True
+    """Exclude bare Git object stores, but retain extracted source dumps."""
+    return not repo.endswith(".bare")
 
 
 def _dedup_store_cls():
@@ -767,7 +777,7 @@ def stream_repo_subtrees(
     cur_final_dir: Path | None = None
     active = False
     try:
-        for member in tar:
+        for member in iter_tar_members_without_cache(tar):
             name = member.name
             if not name.startswith(prefix):
                 continue
