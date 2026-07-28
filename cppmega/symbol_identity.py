@@ -317,6 +317,7 @@ def _validate_usr_file(value: object, *, source: str) -> str:
     if (
         not isinstance(value, str)
         or not value
+        or value != value.strip()
         or value != posixpath.normpath(value)
         or value.startswith("/")
         or _WINDOWS_LOCAL_PATH_RE.match(value)

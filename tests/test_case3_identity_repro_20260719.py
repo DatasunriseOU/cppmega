@@ -363,6 +363,8 @@ def test_scoped_usr_identity_accepts_repository_path_with_spaces() -> None:
         "src/\x1f/main.c",
         "src/\tmain.c",
         "src/\u00a0main.c",
+        " src/main.c",
+        "src/main.c ",
     ),
 )
 def test_scoped_usr_identity_still_rejects_unsafe_repository_paths(
