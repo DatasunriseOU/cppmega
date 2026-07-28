@@ -122,8 +122,9 @@ def test_root_runtime_defaults_do_not_name_external_projects() -> None:
 
     assert "from nanochat." not in fp8_source
     assert "NANOCHAT_FP8_" not in fp8_source
-    assert "cppmega.mlx" not in builder_source
-    assert "cppmega_mlx" not in builder_source
+    assert "from cppmega_mlx" not in builder_source
+    assert "import cppmega_mlx" not in builder_source
+    assert "/Volumes/external/sources/cppmega.mlx" not in builder_source
     assert "/Volumes/external/sources/cppmega.mlx" not in mirror_source
 
 
@@ -134,7 +135,7 @@ def test_bundle_builder_defaults_are_root_local_or_explicit() -> None:
 
     assert args.code_root is None
     assert args.commit_root is None
-    assert args.conveyor_manifest is None
+    assert args.source_composition is None
     for attribute in ("output_dir", "audit_script", "repair_script", "tokenizer_dir"):
         value = getattr(args, attribute)
         assert isinstance(value, Path)

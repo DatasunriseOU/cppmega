@@ -17,11 +17,10 @@ from scripts.data.build_macro_routes_megatron_bundle import (
     _canonical_sha256,
     _ensure_partial_build_plan,
     _load_ci_manifest_allowlist,
-    _load_manifest_allowlist,
     _load_pr_export_allowlist,
     _parse_objective_artifacts,
     _portable_bucket_results,
-    _producer_binding_from_conveyor,
+    _producer_binding_from_local_revision,
     _publish_validated_bundle,
     _run_snapshot_audit,
     _snapshot_sources,
@@ -715,41 +714,36 @@ def test_ci_manifest_rejects_stale_or_forged_mlx_revision_and_inventory(
 
 
 def test_bundle_known_limitations_do_not_claim_retired_qname_or_domain_gaps() -> None:
-    assert BUNDLE_KNOWN_LIMITATIONS == (
-        "the source snapshot is the manifest-complete subset; failed or live "
-        "conveyor units are excluded",
-    )
+    assert BUNDLE_KNOWN_LIMITATIONS == ()
     text = " ".join(BUNDLE_KNOWN_LIMITATIONS).lower()
     assert "qname" not in text
     assert "no observed shell" not in text
 
 
-def _conveyor_revision_binding() -> dict[str, object]:
+def _builder_revision_binding() -> dict[str, object]:
     return {
-        "code_revision": {
-            "schema_version": 2,
-            "git_commit": "a" * 40,
-            "dirty": False,
-            "source_tree_sha256": "b" * 64,
-            "producer_role": "canonical_source_conveyor",
-            "repository_identity": "cppmega",
-            "indexer_dependency_closure_sha256": "d" * 64,
-            "indexer_provenance": {
-                "schema": "cppmega_indexer_dependency_binding_v1",
-                "path": "tools/clang_indexer/index_project.py",
-                "source_sha256": "c" * 64,
-                "dependency_closure_sha256": "d" * 64,
-                "dependency_manifest": {
-                    "tools/clang_indexer/index_project.py": "c" * 64,
-                },
+        "schema_version": 2,
+        "git_commit": "a" * 40,
+        "dirty": False,
+        "source_tree_sha256": "b" * 64,
+        "producer_role": "canonical_source_conveyor",
+        "repository_identity": "cppmega",
+        "indexer_dependency_closure_sha256": "d" * 64,
+        "indexer_provenance": {
+            "schema": "cppmega_indexer_dependency_binding_v1",
+            "path": "tools/clang_indexer/index_project.py",
+            "source_sha256": "c" * 64,
+            "dependency_closure_sha256": "d" * 64,
+            "dependency_manifest": {
+                "tools/clang_indexer/index_project.py": "c" * 64,
             },
-        }
+        },
     }
 
 
 def test_bundle_producer_binding_covers_cppmega_mlx_and_indexer_closure() -> None:
-    binding = _producer_binding_from_conveyor(
-        _conveyor_revision_binding(),
+    binding = _producer_binding_from_local_revision(
+        _builder_revision_binding(),
         cppmega_commit="a" * 40,
         cppmega_tree_sha256="b" * 64,
         cppmega_mlx_commit="e" * 40,
@@ -772,60 +766,6 @@ def test_bundle_producer_binding_covers_cppmega_mlx_and_indexer_closure() -> Non
         "commit": "e" * 40,
         "tree_sha256": "f" * 64,
     }
-
-
-def test_manifest_allowlist_preserves_conveyor_revision_for_bundle_binding(
-    tmp_path: Path,
-) -> None:
-    revision = _conveyor_revision_binding()["code_revision"]
-    manifest_path = tmp_path / "_done.json"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "done": {
-                    "repo::code": {"lengths": {"1024": {"rows": 1}}},
-                    "repo::r0": {"lengths": {"1024": {"rows": 1}}},
-                },
-                "failed": {},
-                "code_revision": revision,
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    _allowed, conveyor = _load_manifest_allowlist(manifest_path, (1024,))
-    binding = _producer_binding_from_conveyor(
-        conveyor,
-        cppmega_commit="a" * 40,
-        cppmega_tree_sha256="b" * 64,
-        cppmega_mlx_commit="e" * 40,
-        cppmega_mlx_tree_sha256="f" * 64,
-    )
-
-    assert conveyor["code_revision"] == revision
-    assert binding["components"]["cppmega"]["commit"] == "a" * 40
-
-
-def test_manifest_allowlist_rejects_malformed_conveyor_revision(
-    tmp_path: Path,
-) -> None:
-    manifest_path = tmp_path / "_done.json"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "done": {
-                    "repo::code": {"lengths": {"1024": {"rows": 1}}},
-                    "repo::r0": {"lengths": {"1024": {"rows": 1}}},
-                },
-                "failed": {},
-                "code_revision": "not-an-object",
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(RuntimeError, match=r"_done\.json: malformed code_revision"):
-        _load_manifest_allowlist(manifest_path, (1024,))
 
 
 def test_bundle_builder_verifies_its_live_clean_cppmega_revision(
@@ -882,8 +822,8 @@ def test_bundle_builder_verifies_its_live_clean_cppmega_revision(
 
 def test_bundle_producer_binding_rejects_legacy_revision_receipt() -> None:
     with pytest.raises(RuntimeError, match="schema v2"):
-        _producer_binding_from_conveyor(
-            {"code_revision": {"schema_version": 1, "dirty": False}},
+        _producer_binding_from_local_revision(
+            {"schema_version": 1, "dirty": False},
             cppmega_commit="e" * 40,
             cppmega_tree_sha256="f" * 64,
             cppmega_mlx_commit="a" * 40,
@@ -903,12 +843,12 @@ def test_bundle_producer_binding_rejects_legacy_revision_receipt() -> None:
 def test_bundle_producer_binding_rejects_wrong_repository_provenance(
     field: str, value: str, error: str
 ) -> None:
-    conveyor = _conveyor_revision_binding()
-    conveyor["code_revision"][field] = value
+    revision = _builder_revision_binding()
+    revision[field] = value
 
     with pytest.raises(RuntimeError, match=error):
-        _producer_binding_from_conveyor(
-            conveyor,
+        _producer_binding_from_local_revision(
+            revision,
             cppmega_commit="a" * 40,
             cppmega_tree_sha256="b" * 64,
             cppmega_mlx_commit="e" * 40,
@@ -1448,7 +1388,7 @@ def _write(path: Path, value: bytes) -> None:
     path.write_bytes(value)
 
 
-def test_manifest_allowlist_excludes_uncommitted_parquet_orphans(
+def test_source_composition_allowlist_excludes_uncommitted_parquet_orphans(
     tmp_path: Path,
 ) -> None:
     code_root = tmp_path / "code"
@@ -1457,21 +1397,14 @@ def test_manifest_allowlist_excludes_uncommitted_parquet_orphans(
     _write(code_root / "1024" / "orphan.parquet", b"orphan")
     _write(commit_root / "1024" / "repo_r0.parquet", b"commit")
     _write(commit_root / "1024" / "orphan_r0.parquet", b"orphan")
-    manifest_path = tmp_path / "_done.json"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "done": {
-                    "repo::code": {"lengths": {"1024": {"rows": 1}}},
-                    "repo::r0": {"lengths": {"1024": {"rows": 1}}},
-                },
-                "failed": {},
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    allowed, conveyor = _load_manifest_allowlist(manifest_path, (1024,))
+    allowed = {
+        ("code", 1024): {"repo.parquet": 1},
+        ("commits", 1024): {"repo_r0.parquet": 1},
+    }
+    source_composition = {
+        "schema": "cppmega_source_conveyor_composition_v1",
+        "status": "complete",
+    }
     snapshot = tmp_path / "snapshot"
     receipt = _snapshot_sources(
         code_root=code_root,
@@ -1481,7 +1414,7 @@ def test_manifest_allowlist_excludes_uncommitted_parquet_orphans(
         min_age_seconds=0,
         hash_jobs=1,
         allowed=allowed,
-        conveyor_manifest=conveyor,
+        source_composition=source_composition,
     )
 
     assert receipt["by_kind_bucket"] == {"code/1024": 1, "commits/1024": 1}
@@ -1496,30 +1429,6 @@ def test_manifest_allowlist_excludes_uncommitted_parquet_orphans(
         (snapshot / "code/1024/repo.parquet").stat().st_ino
         != (code_root / "1024/repo.parquet").stat().st_ino
     )
-
-
-def test_manifest_allowlist_rejects_failed_conveyor_units(tmp_path: Path) -> None:
-    manifest_path = tmp_path / "_done.json"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "done": {
-                    "repo::code": {"lengths": {"1024": {"rows": 1}}},
-                    "repo::r0": {"lengths": {"1024": {"rows": 1}}},
-                },
-                "failed": {
-                    "broken::code": {
-                        "stage": "index_project",
-                        "detail": "exit 137",
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(RuntimeError, match="refusing to freeze.*1 failed units"):
-        _load_manifest_allowlist(manifest_path, (1024,))
 
 
 def test_repaired_snapshot_manifest_hashes_and_binds_replaced_files(
@@ -1604,7 +1513,7 @@ def test_snapshot_rejects_source_mutation_during_private_copy(
                 ("code", 1024): {"repo.parquet": 2},
                 ("commits", 1024): {"repo_r0.parquet": 3},
             },
-            conveyor_manifest={"sha256": "a" * 64},
+            source_composition={"schema": "cppmega_source_conveyor_composition_v1"},
         )
 
     assert not (snapshot / "source_manifest.json").exists()

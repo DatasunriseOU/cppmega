@@ -52,19 +52,20 @@ from cppmega.megatron.objective_contract import (  # noqa: E402
     validate_materialized_objective_contract,
 )
 from cppmega.receipt_binding import build_data_producer_binding  # noqa: E402
+from cppmega.data.source_conveyor_composition import (  # noqa: E402
+    SourceComposition,
+    load_source_composition,
+)
 
 
 DEFAULT_BUCKETS = (1024, 2048, 4096, 8192, 16384)
-BUILD_PLAN_SCHEMA = "cppmega_macro_routes_build_plan_v1"
+BUILD_PLAN_SCHEMA = "cppmega_macro_routes_build_plan_v2"
 CI_MANIFEST_SCHEMA = "cppmega_ci_fixed_buckets_manifest_v3"
 CI_BUCKET_MANIFEST_SCHEMA = "cppmega_ci_fixed_bucket_v2"
 CI_LOG_COMPLETION_SCHEMA = "cppmega_ci_log_extraction_v1"
 CI_CONTENT_STORE_EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v2"
 PR_EXPORT_SCHEMA = "cppmega_pr_case5_export_v1"
-BUNDLE_KNOWN_LIMITATIONS = (
-    "the source snapshot is the manifest-complete subset; failed or live "
-    "conveyor units are excluded",
-)
+BUNDLE_KNOWN_LIMITATIONS: tuple[str, ...] = ()
 DTYPE_SIZES = {
     "uint8": 1,
     "uint16": 2,
@@ -277,48 +278,41 @@ def _verify_local_cppmega_revision(
     return revision
 
 
-def _producer_binding_from_conveyor(
-    conveyor_manifest: dict[str, object],
+def _producer_binding_from_local_revision(
+    revision: dict[str, object],
     *,
     cppmega_commit: str,
     cppmega_tree_sha256: str,
     cppmega_mlx_commit: str,
     cppmega_mlx_tree_sha256: str,
 ) -> dict[str, object]:
-    revision = conveyor_manifest.get("code_revision")
-    if not isinstance(revision, dict):
-        raise RuntimeError("conveyor manifest lacks a code_revision receipt")
     if int(revision.get("schema_version", 0)) < 2 or revision.get("dirty") is not False:
         raise RuntimeError(
-            "conveyor manifest requires a clean code revision schema v2 receipt"
+            "local bundle builder requires a clean code revision schema v2 receipt"
         )
     if revision.get("producer_role") != "canonical_source_conveyor":
         raise RuntimeError(
-            "conveyor manifest code revision has an unsupported producer role"
+            "local bundle builder code revision has an unsupported producer role"
         )
     if revision.get("repository_identity") != "cppmega":
-        raise RuntimeError(
-            "conveyor manifest code revision is not bound to cppmega"
-        )
+        raise RuntimeError("local bundle builder code revision is not bound to cppmega")
     if revision.get("git_commit") != cppmega_commit:
         raise RuntimeError(
-            "conveyor manifest cppmega commit does not match the reviewed "
-            "bundle-builder commit"
+            "local cppmega commit does not match the reviewed bundle-builder commit"
         )
     if revision.get("source_tree_sha256") != cppmega_tree_sha256:
         raise RuntimeError(
-            "conveyor manifest cppmega source tree does not match the reviewed "
-            "bundle-builder tree"
+            "local cppmega source tree does not match the reviewed bundle-builder tree"
         )
     indexer = revision.get("indexer_provenance")
     if not isinstance(indexer, dict):
-        raise RuntimeError("conveyor manifest lacks clang indexer provenance")
+        raise RuntimeError("local bundle builder lacks clang indexer provenance")
     if indexer.get("schema") != "cppmega_indexer_dependency_binding_v1":
-        raise RuntimeError("conveyor manifest clang indexer provenance is unsupported")
+        raise RuntimeError("local bundle builder clang indexer provenance is unsupported")
     closure = indexer.get("dependency_closure_sha256")
     if closure != revision.get("indexer_dependency_closure_sha256"):
         raise RuntimeError(
-            "conveyor manifest clang indexer dependency closure is inconsistent"
+            "local bundle builder clang indexer dependency closure is inconsistent"
         )
     return build_data_producer_binding(
         cppmega_commit=cppmega_commit,
@@ -345,90 +339,6 @@ def _stable_parquets(
         for path in sorted(bucket_root.glob("*.parquet"))
         if path.name in allowed_names and path.stat().st_mtime_ns <= cutoff_ns
     ]
-
-
-def _load_manifest_allowlist(
-    manifest_path: Path,
-    buckets: tuple[int, ...],
-) -> tuple[dict[tuple[str, int], dict[str, int]], dict[str, object]]:
-    manifest_bytes = manifest_path.read_bytes()
-    blob = json.loads(manifest_bytes)
-    done = blob.get("done")
-    if not isinstance(done, dict):
-        raise ValueError(f"{manifest_path}: missing done map")
-    failed = blob.get("failed")
-    if not isinstance(failed, dict):
-        raise ValueError(f"{manifest_path}: missing failed map")
-    if failed:
-        sample = sorted(str(key) for key in failed)[:10]
-        raise RuntimeError(
-            f"{manifest_path}: refusing to freeze a conveyor with "
-            f"{len(failed)} failed units; sample={sample}"
-        )
-    allowed: dict[tuple[str, int], dict[str, int]] = {
-        (kind, bucket): {} for kind in ("code", "commits") for bucket in buckets
-    }
-    for key, info in done.items():
-        if not isinstance(info, dict):
-            continue
-        lengths = info.get("lengths")
-        if not isinstance(lengths, dict) or not lengths:
-            continue
-        if key.endswith("::code"):
-            kind = "code"
-            repo = key[: -len("::code")]
-            filename = f"{repo}.parquet"
-        elif "::r" in key:
-            kind = "commits"
-            repo, start = key.rsplit("::r", 1)
-            try:
-                int(start)
-            except ValueError:
-                continue
-            filename = f"{repo}_r{start}.parquet"
-        else:
-            continue
-        for bucket in buckets:
-            length_info = lengths.get(str(bucket))
-            if length_info is None:
-                continue
-            if not isinstance(length_info, dict):
-                raise RuntimeError(
-                    f"manifest has malformed length metadata for {key}/{bucket}"
-                )
-            rows = length_info.get("rows")
-            if not isinstance(rows, int) or isinstance(rows, bool) or rows < 1:
-                raise RuntimeError(
-                    f"manifest has invalid row count for {key}/{bucket}: {rows!r}"
-                )
-            bucket_rows = allowed[(kind, bucket)]
-            if filename in bucket_rows:
-                raise RuntimeError(
-                    f"manifest maps duplicate shard {kind}/{bucket}/{filename}"
-                )
-            bucket_rows[filename] = rows
-    if any(not names for names in allowed.values()):
-        empty = [
-            f"{kind}/{bucket}" for (kind, bucket), names in allowed.items() if not names
-        ]
-        raise RuntimeError(f"manifest has no completed files for: {', '.join(empty)}")
-    code_revision = blob.get("code_revision")
-    if code_revision is not None and not isinstance(code_revision, dict):
-        raise RuntimeError(
-            f"{manifest_path}: malformed code_revision receipt; expected an object"
-        )
-    metadata = {
-        "path": str(manifest_path.resolve()),
-        "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
-        "done_units": len(done),
-        "failed_units": 0,
-        "code_revision": code_revision,
-        "allowlist_counts": {
-            f"{kind}/{bucket}": len(names)
-            for (kind, bucket), names in sorted(allowed.items())
-        },
-    }
-    return allowed, metadata
 
 
 def _load_content_store_ci_export_allowlist(
@@ -1509,7 +1419,7 @@ def _snapshot_sources(
     min_age_seconds: float,
     hash_jobs: int,
     allowed: dict[tuple[str, int], dict[str, int]],
-    conveyor_manifest: dict[str, object],
+    source_composition: dict[str, object],
     ci_manifest: dict[str, object] | None = None,
     pr_manifest: dict[str, object] | None = None,
 ) -> dict[str, object]:
@@ -1518,7 +1428,7 @@ def _snapshot_sources(
         existing = json.loads(manifest_path.read_text(encoding="utf-8"))
         if (
             existing.get("schema") != "cppmega_parquet_snapshot_v1"
-            or existing.get("conveyor_manifest") != conveyor_manifest
+            or existing.get("source_composition") != source_composition
             or existing.get("ci_manifest") != ci_manifest
             or existing.get("pr_manifest") != pr_manifest
         ):
@@ -1614,7 +1524,7 @@ def _snapshot_sources(
         "min_age_seconds": min_age_seconds,
         "file_count": len(records),
         "by_kind_bucket": by_kind_bucket,
-        "conveyor_manifest": conveyor_manifest,
+        "source_composition": source_composition,
         "ci_manifest": ci_manifest,
         "pr_manifest": pr_manifest,
         "files": records,
@@ -2314,7 +2224,8 @@ def _create_build_plan(
     buckets: tuple[int, ...],
     output_dir: Path,
     objective_artifacts: dict[int, Path],
-    conveyor_manifest: dict[str, object],
+    source_composition: dict[str, object],
+    builder_revision: dict[str, object],
     ci_manifest: dict[str, object],
     pr_manifest: dict[str, object],
 ) -> dict[str, object]:
@@ -2336,11 +2247,11 @@ def _create_build_plan(
             "ci": str(args.ci_root.resolve()),
             "pr": str(args.pr_root.resolve()),
         },
-        "conveyor_manifest": conveyor_manifest,
+        "source_composition": source_composition,
         "ci_manifest": ci_manifest,
         "pr_manifest": pr_manifest,
-        "implementation": _producer_binding_from_conveyor(
-            conveyor_manifest,
+        "implementation": _producer_binding_from_local_revision(
+            builder_revision,
             cppmega_commit=args.cppmega_commit,
             cppmega_tree_sha256=args.cppmega_tree_sha256,
             cppmega_mlx_commit=args.cppmega_mlx_commit,
@@ -2425,8 +2336,15 @@ def _assert_build_plan_inputs(
     output_dir: Path,
     build_plan: dict[str, object],
 ) -> None:
-    _allowed, conveyor_manifest = _load_manifest_allowlist(
-        args.conveyor_manifest.resolve(), buckets
+    builder_revision = _verify_local_cppmega_revision(
+        expected_commit=args.cppmega_commit,
+        expected_tree_sha256=args.cppmega_tree_sha256,
+    )
+    source_composition = load_source_composition(
+        args.source_composition,
+        buckets=buckets,
+        code_root=args.code_root,
+        commit_root=args.commit_root,
     )
     _ci_allowed, ci_manifest = _load_ci_manifest_allowlist(
         args.ci_manifest.resolve(),
@@ -2445,7 +2363,8 @@ def _assert_build_plan_inputs(
         buckets=buckets,
         output_dir=output_dir,
         objective_artifacts=objective_artifacts,
-        conveyor_manifest=conveyor_manifest,
+        source_composition=source_composition.receipt,
+        builder_revision=builder_revision,
         ci_manifest=ci_manifest,
         pr_manifest=pr_manifest,
     )
@@ -2463,6 +2382,116 @@ def _publish_validated_bundle(
 ) -> None:
     _validate_bundle(partial_dir, hash_jobs)
     os.replace(partial_dir, output_dir)
+
+
+def _stage_source_composition(
+    composition: SourceComposition,
+    *,
+    partial_dir: Path,
+    provenance_root: Path,
+) -> dict[str, object]:
+    target_root = provenance_root / "source_composition"
+    target_root.mkdir(parents=True, exist_ok=True)
+    receipt_path = target_root / "receipt.json"
+    _write_json_atomic(receipt_path, composition.receipt)
+
+    plan_path = target_root / "plan.json"
+    shutil.copy2(composition.plan_path, plan_path)
+    if _sha256(plan_path) != str(composition.receipt["plan_sha256"]):
+        raise RuntimeError("staged source composition plan drifted")
+
+    dedup = composition.receipt.get("dedup")
+    if not isinstance(dedup, dict):
+        raise RuntimeError("source composition has no portable dedup receipt")
+    dedup_receipt_path = target_root / "global_dedup_receipt.json"
+    shutil.copy2(composition.dedup_receipt_path, dedup_receipt_path)
+    if _sha256(dedup_receipt_path) != str(dedup["receipt_sha256"]):
+        raise RuntimeError("staged global dedup receipt drifted")
+    verifier = dedup.get("verifier")
+    if not isinstance(verifier, dict):
+        raise RuntimeError("global dedup receipt has no verifier binding")
+    verifier_source = REPO_ROOT / str(verifier.get("script"))
+    if (
+        verifier_source.is_symlink()
+        or not verifier_source.is_file()
+        or _sha256(verifier_source) != verifier.get("script_sha256")
+    ):
+        raise RuntimeError("global dedup verifier does not match the reviewed source")
+    verifier_target = target_root / "verify_global_dedup_store.py"
+    shutil.copy2(verifier_source, verifier_target)
+
+    run_descriptors: list[dict[str, object]] = []
+    run_receipts = composition.receipt.get("runs")
+    if not isinstance(run_receipts, list) or len(run_receipts) != len(
+        composition.run_files
+    ):
+        raise RuntimeError("source composition run provenance is inconsistent")
+    input_file_keys = {
+        "archive_sha256_receipt": "archive_sha256_receipt",
+        "archive_inventory": "archive_inventory_receipt",
+        "repo_list": "repo_list",
+        "source_quarantine_manifest": "source_quarantine_manifest",
+        "tokenizer": "tokenizer",
+    }
+    for run, files in zip(run_receipts, composition.run_files, strict=True):
+        if not isinstance(run, dict):
+            raise RuntimeError("source composition run receipt is malformed")
+        run_id = str(run["run_id"])
+        run_root = target_root / "runs" / run_id
+        run_root.mkdir(parents=True, exist_ok=True)
+        input_artifacts = run.get("input_artifacts")
+        if not isinstance(input_artifacts, dict):
+            raise RuntimeError(f"source composition run {run_id} has no inputs")
+        expected_hashes = {
+            "launch": str(run["launch"]["sha256"]),
+            "exit": str(run["exit"]["sha256"]),
+            "manifest": str(run["manifest"]["sha256"]),
+            **{
+                file_key: str(input_artifacts[binding_key])
+                for file_key, binding_key in input_file_keys.items()
+            },
+        }
+        artifacts: dict[str, dict[str, object]] = {}
+        for name, source in sorted(files.items()):
+            expected_sha256 = expected_hashes.get(name)
+            if expected_sha256 is None:
+                raise RuntimeError(
+                    f"source composition run {run_id} has an unknown artifact {name}"
+                )
+            target = run_root / f"{name}{source.suffix}"
+            shutil.copy2(source, target)
+            actual_sha256 = _sha256(target)
+            if actual_sha256 != expected_sha256:
+                raise RuntimeError(
+                    f"staged source composition artifact drifted: {run_id}/{name}"
+                )
+            artifacts[name] = {
+                "path": target.relative_to(partial_dir).as_posix(),
+                "size_bytes": target.stat().st_size,
+                "sha256": actual_sha256,
+            }
+        run_descriptors.append({"run_id": run_id, "artifacts": artifacts})
+
+    return {
+        "schema": str(composition.receipt["schema"]),
+        "receipt": {
+            "path": receipt_path.relative_to(partial_dir).as_posix(),
+            "sha256": _sha256(receipt_path),
+        },
+        "plan": {
+            "path": plan_path.relative_to(partial_dir).as_posix(),
+            "sha256": _sha256(plan_path),
+        },
+        "dedup_receipt": {
+            "path": dedup_receipt_path.relative_to(partial_dir).as_posix(),
+            "sha256": _sha256(dedup_receipt_path),
+        },
+        "dedup_verifier": {
+            "path": verifier_target.relative_to(partial_dir).as_posix(),
+            "sha256": _sha256(verifier_target),
+        },
+        "runs": run_descriptors,
+    }
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -2526,10 +2555,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=REPO_ROOT / "scripts/repair_packed_document_boundaries.py",
     )
     parser.add_argument(
-        "--conveyor-manifest",
+        "--source-composition",
         type=Path,
         default=None,
-        help="explicit completed conveyor manifest binding the source shards",
+        help=(
+            "explicit cppmega_source_conveyor_composition_plan_v1 binding "
+            "complete multi-revision code and commit source coverage"
+        ),
     )
     parser.add_argument(
         "--tokenizer-dir",
@@ -2589,7 +2621,7 @@ def _require_explicit_source_inputs(args: argparse.Namespace) -> None:
             ("ci_manifest", "--ci-manifest"),
             ("pr_root", "--pr-root"),
             ("pr_manifest", "--pr-manifest"),
-            ("conveyor_manifest", "--conveyor-manifest"),
+            ("source_composition", "--source-composition"),
             ("cppmega_commit", "--cppmega-commit"),
             ("cppmega_tree_sha256", "--cppmega-tree-sha256"),
             ("cppmega_mlx_commit", "--cppmega-mlx-commit"),
@@ -2614,13 +2646,19 @@ def _run_build(
     if output_dir.exists():
         raise SystemExit(f"final bundle already exists: {output_dir}")
 
-    _verify_local_cppmega_revision(
+    builder_revision = _verify_local_cppmega_revision(
         expected_commit=args.cppmega_commit,
         expected_tree_sha256=args.cppmega_tree_sha256,
     )
-    allowlist, conveyor_manifest = _load_manifest_allowlist(
-        args.conveyor_manifest.resolve(), buckets
+    source_composition = load_source_composition(
+        args.source_composition,
+        buckets=buckets,
+        code_root=args.code_root,
+        commit_root=args.commit_root,
     )
+    allowlist = {
+        key: dict(files) for key, files in source_composition.allowlist.items()
+    }
     ci_allowlist, ci_manifest = _load_ci_manifest_allowlist(
         args.ci_manifest.resolve(),
         args.ci_root.resolve(),
@@ -2646,7 +2684,8 @@ def _run_build(
         buckets=buckets,
         output_dir=output_dir,
         objective_artifacts=objective_artifacts,
-        conveyor_manifest=conveyor_manifest,
+        source_composition=source_composition.receipt,
+        builder_revision=builder_revision,
         ci_manifest=ci_manifest,
         pr_manifest=pr_manifest,
     )
@@ -2663,7 +2702,7 @@ def _run_build(
         min_age_seconds=args.min_age_seconds,
         hash_jobs=args.hash_jobs,
         allowed=allowlist,
-        conveyor_manifest=conveyor_manifest,
+        source_composition=source_composition.receipt,
         ci_manifest=ci_manifest,
         pr_manifest=pr_manifest,
     )
@@ -2722,6 +2761,11 @@ def _run_build(
     _write_json_atomic(
         provenance_root / "repaired_snapshot_manifest.json",
         repaired_snapshot_manifest,
+    )
+    staged_source_composition = _stage_source_composition(
+        source_composition,
+        partial_dir=partial_dir,
+        provenance_root=provenance_root,
     )
     staged_ci_manifest = provenance_root / "ci_manifest.json"
     shutil.copy2(args.ci_manifest.resolve(), staged_ci_manifest)
@@ -2803,7 +2847,7 @@ def _run_build(
     artifact_set_sha256 = _artifact_set_sha256(artifacts)
     audit_total = audit_receipt["total"]
     manifest = {
-        "schema": "cppmega_megatron_bundle_v2",
+        "schema": "cppmega_megatron_bundle_v3",
         "bundle_id": f"{output_dir.name}-{artifact_set_sha256[:16]}",
         "created_at": _utc_now(),
         "tokenizer_contract": EXPECTED_BUNDLE_TOKENIZER_CONTRACT,
@@ -2831,6 +2875,7 @@ def _run_build(
             "file_count": source_manifest["file_count"],
             "manifest": "provenance/source_manifest.json",
             "repaired_manifest": "provenance/repaired_snapshot_manifest.json",
+            "source_composition": staged_source_composition,
             "ci_manifest": {
                 "path": "provenance/ci_manifest.json",
                 "sha256": _sha256(staged_ci_manifest),
@@ -2883,8 +2928,8 @@ def _run_build(
         "git": {
             "cppmega": _git_sha(REPO_ROOT),
         },
-        "implementation": _producer_binding_from_conveyor(
-            conveyor_manifest,
+        "implementation": _producer_binding_from_local_revision(
+            builder_revision,
             cppmega_commit=args.cppmega_commit,
             cppmega_tree_sha256=args.cppmega_tree_sha256,
             cppmega_mlx_commit=args.cppmega_mlx_commit,
