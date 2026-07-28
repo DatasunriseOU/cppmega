@@ -48,8 +48,10 @@ Output root is SEPARATE from the code stream: outputs/reindexed_commits/.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -58,8 +60,10 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Sequence
+from types import MappingProxyType
+from typing import Callable, Mapping, Sequence
 
 # Reuse the proven machinery from the code driver.  Select the import spelling
 # from our actual package mode; a try/except probe can succeed through the repo
@@ -78,11 +82,13 @@ TAR_MEMBER_ROOT = sr.TAR_MEMBER_ROOT
 RepoFailure = sr.RepoFailure
 Manifest = sr.Manifest
 run_checked = sr.run_checked
-stage_index_commits = sr.stage_index_commits
 stage_materialize = sr.stage_materialize
 stage_pack = sr.stage_pack
 _parquet_stats = sr._parquet_stats
 _subprocess_env = sr._subprocess_env
+PROCESS_COMMITS = sr.PROCESS_COMMITS
+TOKENIZER_PATH = sr.TOKENIZER_PATH
+LOSSLESS_INDEX_MAX_TOKENS = sr.LOSSLESS_INDEX_MAX_TOKENS
 
 EXTRACT_GIT = ROOT / "scripts" / "nanochat_data" / "extract_git_history.py"
 COMMIT_OUTPUT_ROOT = ROOT / "outputs" / "reindexed_commits"
@@ -106,6 +112,809 @@ _PRINT_LOCK = threading.Lock()
 def _log(msg: str) -> None:
     with _PRINT_LOCK:
         print(msg, file=sys.stderr, flush=True)
+
+
+def build_process_commits_command(
+    commit_inputs: Sequence[Path],
+    enriched: Path,
+    repo_root: Path | None,
+    repo_dir: Path | None,
+    dedup_db: Path | None = None,
+    dedup_near: bool = True,
+    dedup_stage_id: str | None = None,
+    dedup_stage_db: Path | None = None,
+    pr_store: Path | None = None,
+    memory_limit_gb: float = 10.0,
+    analysis_cache_entries: int = 128,
+    *,
+    project_id: str,
+    pr_owner_repo: str | None = None,
+    pr_scan_id: str | None = None,
+) -> list[object]:
+    """Build one production commit-index command from already-frozen scalars."""
+
+    canonical_project_id = sr.require_project_identity(
+        project_id,
+        source="streaming_reindex_commits project_id",
+    )
+    canonical_pr_repo = (
+        sr.require_project_identity(
+            pr_owner_repo,
+            source="streaming_reindex_commits pr_owner_repo",
+        )
+        if pr_owner_repo is not None
+        else None
+    )
+    if canonical_pr_repo is not None and pr_store is None:
+        raise ValueError("pr_owner_repo requires pr_store")
+    if pr_scan_id is not None:
+        if (
+            not isinstance(pr_scan_id, str)
+            or re.fullmatch(r"[0-9a-f]{64}", pr_scan_id) is None
+        ):
+            raise ValueError(f"invalid pr_scan_id: {pr_scan_id!r}")
+        if pr_store is None or canonical_pr_repo is None:
+            raise ValueError("pr_scan_id requires pr_store and pr_owner_repo")
+
+    cmd: list[object] = [
+        VENV_PYTHON,
+        PROCESS_COMMITS,
+        "--inputs",
+        *commit_inputs,
+        "--output",
+        enriched,
+        "--max-tokens",
+        str(LOSSLESS_INDEX_MAX_TOKENS),
+        "--tokenizer-path",
+        TOKENIZER_PATH,
+        "--format",
+        "both",
+        "--memory-limit-gb",
+        str(memory_limit_gb),
+        "--analysis-cache-entries",
+        str(max(0, int(analysis_cache_entries))),
+        "--project-id",
+        canonical_project_id,
+    ]
+    if dedup_db is not None:
+        cmd += ["--dedup-db", dedup_db]
+        if dedup_stage_id is not None:
+            cmd += ["--dedup-stage-id", dedup_stage_id]
+            if dedup_stage_db is not None:
+                cmd += ["--dedup-stage-db", dedup_stage_db]
+    if not dedup_near:
+        cmd += ["--no-near-dedup"]
+    if repo_root is not None:
+        cmd += ["--repo-root", repo_root]
+    if repo_dir is not None:
+        cmd += ["--repo-dir", repo_dir]
+    if canonical_pr_repo is not None:
+        # Source-only projects intentionally receive none of the PR options.
+        assert pr_store is not None
+        cmd += ["--pr-store", pr_store, "--pr-repo", canonical_pr_repo]
+        if pr_scan_id is not None:
+            cmd += ["--pr-scan-id", pr_scan_id]
+    return cmd
+
+
+def stage_index_commits(
+    repo: str,
+    commit_inputs: Sequence[Path],
+    work: Path,
+    repo_root: Path | None,
+    repo_dir: Path | None,
+    dedup_db: Path | None = None,
+    dedup_near: bool = True,
+    dedup_stage_id: str | None = None,
+    dedup_stage_db: Path | None = None,
+    pr_store: Path | None = None,
+    memory_limit_gb: float = 10.0,
+    analysis_cache_entries: int = 128,
+    allow_empty: bool = False,
+    *,
+    project_id: str,
+    pr_owner_repo: str | None = None,
+    pr_scan_id: str | None = None,
+) -> Path | None:
+    """Run process_commits with source and PR identities kept independent."""
+
+    enriched = work / f"{repo}.enriched.jsonl"
+    cmd = build_process_commits_command(
+        commit_inputs,
+        enriched,
+        repo_root,
+        repo_dir,
+        dedup_db,
+        dedup_near,
+        dedup_stage_id,
+        dedup_stage_db,
+        pr_store,
+        memory_limit_gb,
+        analysis_cache_entries,
+        project_id=project_id,
+        pr_owner_repo=pr_owner_repo,
+        pr_scan_id=pr_scan_id,
+    )
+    run_checked(
+        repo,
+        "process_commits",
+        cmd,
+        log_path=work / f"{repo}.commits.log",
+    )
+    if not enriched.exists():
+        raise RepoFailure(
+            repo,
+            "process_commits",
+            f"empty enriched jsonl: {enriched}",
+        )
+    if enriched.stat().st_size == 0:
+        if allow_empty:
+            return None
+        raise RepoFailure(
+            repo,
+            "process_commits",
+            f"empty enriched jsonl: {enriched}",
+        )
+    return enriched
+
+
+def load_pr_owner_repo_map(repo_list: Path) -> dict[str, str]:
+    """Load the optional GitHub key for each bare repo once for direct runs."""
+
+    with repo_list.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    entries = data.get("repos")
+    if not isinstance(entries, list):
+        raise sr.SymbolIdentityError(f"{repo_list}: expected a repos list")
+    result: dict[str, str] = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise sr.SymbolIdentityError(
+                f"{repo_list}: repos[{index}] must be an object"
+            )
+        bare_name = entry.get("bare_name") or entry.get("name")
+        owner_repo = entry.get("owner_repo")
+        if owner_repo is None:
+            continue
+        if not isinstance(bare_name, str) or not bare_name:
+            raise sr.SymbolIdentityError(
+                f"{repo_list}: repos[{index}] with owner_repo lacks a bare name"
+            )
+        canonical = sr.require_project_identity(
+            owner_repo,
+            source=f"{repo_list}:repos[{index}].owner_repo",
+        )
+        previous = result.get(bare_name)
+        if previous is not None and previous != canonical:
+            raise sr.SymbolIdentityError(
+                f"{repo_list}: bare repo {bare_name!r} maps to both "
+                f"{previous!r} and {canonical!r}"
+            )
+        result[bare_name] = canonical
+    return result
+
+
+class RepoListBindingError(ValueError):
+    """A v2 source/PR repository-list contract is malformed."""
+
+
+class PRCompletionBindingError(RuntimeError):
+    """A requested PR input set lacks an immutable verified completion proof."""
+
+
+@dataclass(frozen=True)
+class RepoListSnapshot:
+    """One strictly validated and frozen v2 repository-list snapshot."""
+
+    path: Path
+    sha256: str
+    canonical_mapping_sha256: str
+    mapping_count: int
+    project_id_by_bare_name: Mapping[str, str]
+    owner_repo_by_bare_name: Mapping[str, str | None]
+    github_repos: tuple[str, ...]
+
+
+def _canonical_json_sha256(value: object) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _stat_identity(stat_result: os.stat_result) -> tuple[int, ...]:
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
+
+
+def sha256_stable_file(path: Path, *, role: str) -> str:
+    """Hash one file while rejecting an in-flight replacement or mutation."""
+
+    digest = hashlib.sha256()
+    try:
+        before = path.stat()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+        after = path.stat()
+    except OSError as exc:
+        raise RepoListBindingError(f"cannot hash {role} {path}: {exc}") from exc
+    if _stat_identity(before) != _stat_identity(after):
+        raise RepoListBindingError(f"{role} changed while hashing: {path}")
+    return digest.hexdigest()
+
+
+def hash_immutable_pr_store(path: Path) -> str:
+    """Hash a standalone PR store only when no uncheckpointed WAL exists."""
+
+    wal = Path(f"{path}-wal")
+    if wal.exists() and wal.stat().st_size:
+        raise RepoListBindingError(
+            f"PR store has an uncheckpointed WAL: {wal}"
+        )
+    digest = sha256_stable_file(path, role="PR store")
+    if wal.exists() and wal.stat().st_size:
+        raise RepoListBindingError(f"PR store WAL appeared while hashing: {wal}")
+    return digest
+
+
+def load_repo_list_snapshot(
+    repo_list: Path,
+    *,
+    role: str,
+) -> RepoListSnapshot:
+    """Strictly validate and freeze one canonical v2 repository list."""
+
+    path = repo_list.expanduser().resolve()
+    if not path.is_file():
+        raise RepoListBindingError(f"{role} repo list is missing: {path}")
+    max_bytes = 32 * 1024 * 1024
+    try:
+        before = path.stat()
+        with path.open("rb") as handle:
+            payload = handle.read(max_bytes + 1)
+        after = path.stat()
+    except OSError as exc:
+        raise RepoListBindingError(
+            f"cannot read {role} repo list {path}: {exc}"
+        ) from exc
+    if len(payload) > max_bytes:
+        raise RepoListBindingError(
+            f"{role} repo list exceeds the 32 MiB metadata bound: {path}"
+        )
+    if _stat_identity(before) != _stat_identity(after):
+        raise RepoListBindingError(
+            f"{role} repo list changed while reading: {path}"
+        )
+    try:
+        document = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise RepoListBindingError(
+            f"{role} repo list is invalid JSON: {path}: {exc}"
+        ) from exc
+    if not isinstance(document, dict):
+        raise RepoListBindingError(f"{role} repo list must be an object")
+    if document.get("schema_version") != 2:
+        raise RepoListBindingError(
+            f"{role} repo list has unsupported schema_version: "
+            f"{document.get('schema_version')!r}"
+        )
+    unresolved = document.get("unresolved")
+    if not isinstance(unresolved, list):
+        raise RepoListBindingError(
+            f"{role} repo list must contain an unresolved list"
+        )
+    if unresolved:
+        raise RepoListBindingError(
+            f"{role} repo list has {len(unresolved)} unresolved mappings"
+        )
+    rows = document.get("repos")
+    if not isinstance(rows, list) or not rows:
+        raise RepoListBindingError(
+            f"{role} repo list must contain a non-empty repos list"
+        )
+
+    project_ids: dict[str, str] = {}
+    owner_repos: dict[str, str | None] = {}
+    github_repos: list[str] = []
+    seen_github_repos: set[str] = set()
+    canonical_rows: list[dict[str, str]] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise RepoListBindingError(
+                f"{role} repo list repos[{index}] must be an object"
+            )
+        bare_name = row.get("bare_name")
+        if (
+            not isinstance(bare_name, str)
+            or not bare_name
+            or bare_name != bare_name.strip()
+        ):
+            raise RepoListBindingError(
+                f"{role} repo list repos[{index}] has invalid bare_name: "
+                f"{bare_name!r}"
+            )
+        if bare_name in project_ids:
+            raise RepoListBindingError(
+                f"{role} repo list has duplicate bare_name {bare_name!r}"
+            )
+        try:
+            project_id = sr.require_project_identity(
+                row.get("project_identity"),
+                source=f"{path}:repos[{index}].project_identity",
+            )
+            owner_repo_raw = row.get("owner_repo")
+            owner_repo = (
+                sr.require_project_identity(
+                    owner_repo_raw,
+                    source=f"{path}:repos[{index}].owner_repo",
+                )
+                if owner_repo_raw is not None
+                else None
+            )
+        except sr.SymbolIdentityError as exc:
+            raise RepoListBindingError(str(exc)) from exc
+        if owner_repo is not None and owner_repo != project_id:
+            raise RepoListBindingError(
+                f"{role} repo list repos[{index}] project_identity "
+                f"{project_id!r} does not match owner_repo {owner_repo!r}"
+            )
+        project_ids[bare_name] = project_id
+        owner_repos[bare_name] = owner_repo
+        if owner_repo is not None and owner_repo not in seen_github_repos:
+            seen_github_repos.add(owner_repo)
+            github_repos.append(owner_repo)
+        canonical_row = {
+            "bare_name": bare_name,
+            "project_identity": project_id,
+        }
+        if owner_repo is not None:
+            canonical_row["owner_repo"] = owner_repo
+        canonical_rows.append(canonical_row)
+
+    derived_projects = dict(sorted(project_ids.items()))
+    derived_owners = dict(sorted(owner_repos.items()))
+    if document.get("by_bare_name") != derived_projects:
+        raise RepoListBindingError(
+            f"{role} repo list by_bare_name does not match repos rows"
+        )
+    if document.get("project_identities") != sorted(set(project_ids.values())):
+        raise RepoListBindingError(
+            f"{role} repo list project_identities does not match repos rows"
+        )
+    derived_repo_names = sorted(
+        {owner for owner in owner_repos.values() if owner is not None}
+    )
+    if document.get("repo_names") != derived_repo_names:
+        raise RepoListBindingError(
+            f"{role} repo list repo_names does not match repos rows"
+        )
+    canonical_rows.sort(
+        key=lambda row: (row["bare_name"], row["project_identity"])
+    )
+    return RepoListSnapshot(
+        path=path,
+        sha256=hashlib.sha256(payload).hexdigest(),
+        canonical_mapping_sha256=_canonical_json_sha256(canonical_rows),
+        mapping_count=len(canonical_rows),
+        project_id_by_bare_name=MappingProxyType(derived_projects),
+        owner_repo_by_bare_name=MappingProxyType(derived_owners),
+        github_repos=tuple(github_repos),
+    )
+
+
+def validate_repo_list_pair(
+    source: RepoListSnapshot,
+    pr: RepoListSnapshot,
+) -> None:
+    """Require the PR scope to be a consistent subset of the source list."""
+
+    source_names = set(source.project_id_by_bare_name)
+    pr_names = set(pr.project_id_by_bare_name)
+    pr_only = sorted(pr_names - source_names)
+    missing = sorted(
+        bare_name
+        for bare_name, owner_repo in source.owner_repo_by_bare_name.items()
+        if owner_repo is not None and bare_name not in pr_names
+    )
+    mismatched = sorted(
+        bare_name
+        for bare_name in pr_names & source_names
+        if (
+            source.project_id_by_bare_name[bare_name]
+            != pr.project_id_by_bare_name[bare_name]
+            or source.owner_repo_by_bare_name[bare_name]
+            != pr.owner_repo_by_bare_name[bare_name]
+        )
+    )
+    if pr_only or missing or mismatched:
+        raise RepoListBindingError(
+            "PR repo list does not match the source scope: "
+            f"pr_only={pr_only[:10]} missing={missing[:10]} "
+            f"mismatched={mismatched[:10]}"
+        )
+
+
+def load_repo_list_contracts(
+    source_repo_list: Path,
+    pr_repo_list: Path,
+) -> tuple[RepoListSnapshot, RepoListSnapshot]:
+    """Require the PR scope to be a consistent subset of the source list."""
+
+    source = load_repo_list_snapshot(
+        source_repo_list,
+        role="source",
+    )
+    pr = load_repo_list_snapshot(
+        pr_repo_list,
+        role="PR",
+    )
+    validate_repo_list_pair(source, pr)
+    return source, pr
+
+
+def _require_completion_sha256(value: object, *, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[0-9a-f]{64}", value) is None
+    ):
+        raise PRCompletionBindingError(
+            f"PR completion receipt has invalid {field}: {value!r}"
+        )
+    return value
+
+
+def _completion_file_sha256(
+    path: Path,
+    *,
+    role: str,
+    immutable_pr_store: bool = False,
+) -> str:
+    try:
+        if immutable_pr_store:
+            return hash_immutable_pr_store(path)
+        return sha256_stable_file(path, role=role)
+    except RepoListBindingError as exc:
+        raise PRCompletionBindingError(str(exc)) from exc
+
+
+def load_pr_completion_binding(
+    receipt_path: Path,
+    *,
+    pr_store: Path,
+    repo_list: Path,
+    repo_list_snapshot: RepoListSnapshot | None = None,
+) -> dict[str, object]:
+    """Validate and normalize one immutable cppmega_pr_completion_v2 receipt."""
+
+    receipt_path = receipt_path.expanduser().resolve()
+    pr_store = pr_store.expanduser().resolve()
+    repo_list = repo_list.expanduser().resolve()
+    for label, path in (
+        ("PR completion receipt", receipt_path),
+        ("PR store", pr_store),
+        ("PR repo list", repo_list),
+    ):
+        if not path.is_file():
+            raise PRCompletionBindingError(f"{label} is missing: {path}")
+
+    receipt_max_bytes = 4 * 1024 * 1024
+    try:
+        with receipt_path.open("rb") as handle:
+            receipt_bytes = handle.read(receipt_max_bytes + 1)
+    except OSError as exc:
+        raise PRCompletionBindingError(
+            f"cannot read PR completion receipt {receipt_path}: {exc}"
+        ) from exc
+    if len(receipt_bytes) > receipt_max_bytes:
+        raise PRCompletionBindingError(
+            "PR completion receipt exceeds the 4 MiB metadata bound: "
+            f"{receipt_path}"
+        )
+    try:
+        receipt = json.loads(receipt_bytes)
+    except json.JSONDecodeError as exc:
+        raise PRCompletionBindingError(
+            f"PR completion receipt is invalid JSON: {receipt_path}: {exc}"
+        ) from exc
+    if not isinstance(receipt, dict):
+        raise PRCompletionBindingError("PR completion receipt must be an object")
+    if receipt.get("schema") != "cppmega_pr_completion_v2":
+        raise PRCompletionBindingError(
+            f"unsupported PR completion schema: {receipt.get('schema')!r}"
+        )
+    if receipt.get("status") != "verified":
+        raise PRCompletionBindingError(
+            f"PR completion status is not verified: {receipt.get('status')!r}"
+        )
+
+    def require_bound_artifact(
+        field: str,
+        expected_path: Path,
+        *,
+        immutable_pr_store: bool = False,
+    ) -> str:
+        artifact = receipt.get(field)
+        if not isinstance(artifact, dict):
+            raise PRCompletionBindingError(
+                f"PR completion receipt lacks {field} binding"
+            )
+        raw_path = artifact.get("path")
+        if not isinstance(raw_path, str):
+            raise PRCompletionBindingError(
+                f"PR completion receipt has invalid {field}.path"
+            )
+        try:
+            bound_path = Path(raw_path).expanduser().resolve()
+        except OSError as exc:
+            raise PRCompletionBindingError(
+                f"cannot resolve PR completion {field}.path: {raw_path}: {exc}"
+            ) from exc
+        if bound_path != expected_path:
+            raise PRCompletionBindingError(
+                f"PR completion {field} path mismatch: "
+                f"receipt={bound_path} requested={expected_path}"
+            )
+        expected_sha256 = _require_completion_sha256(
+            artifact.get("sha256"),
+            field=f"{field}.sha256",
+        )
+        actual_sha256 = _completion_file_sha256(
+            expected_path,
+            role=f"PR completion {field}",
+            immutable_pr_store=immutable_pr_store,
+        )
+        if actual_sha256 != expected_sha256:
+            raise PRCompletionBindingError(
+                f"PR completion {field} hash mismatch: "
+                f"receipt={expected_sha256} current={actual_sha256}"
+            )
+        return actual_sha256
+
+    pr_store_sha256 = require_bound_artifact(
+        "pr_store",
+        pr_store,
+        immutable_pr_store=True,
+    )
+    repo_list_sha256 = require_bound_artifact("repo_list", repo_list)
+    if repo_list_snapshot is None:
+        try:
+            repo_list_snapshot = load_repo_list_snapshot(repo_list, role="PR")
+        except RepoListBindingError as exc:
+            raise PRCompletionBindingError(str(exc)) from exc
+    if repo_list_snapshot.path != repo_list:
+        raise PRCompletionBindingError(
+            "validated PR repo-list path does not match the requested artifact: "
+            f"snapshot={repo_list_snapshot.path} requested={repo_list}"
+        )
+    if repo_list_snapshot.sha256 != repo_list_sha256:
+        raise PRCompletionBindingError(
+            "PR repo list changed between mapping validation and receipt binding"
+        )
+
+    expected_repos_sha256 = _require_completion_sha256(
+        receipt.get("expected_repos_sha256"),
+        field="expected_repos_sha256",
+    )
+    scan_id = _require_completion_sha256(
+        receipt.get("scan_id"),
+        field="scan_id",
+    )
+    expected_repo_count = receipt.get("expected_repo_count")
+    stored_pr_count = receipt.get("stored_pr_count")
+    declared_pr_count = receipt.get("declared_pr_count")
+    unverified_store_pr_count = receipt.get("unverified_store_pr_count")
+    if (
+        isinstance(expected_repo_count, bool)
+        or not isinstance(expected_repo_count, int)
+        or expected_repo_count <= 0
+    ):
+        raise PRCompletionBindingError(
+            "PR completion expected_repo_count must be a positive integer"
+        )
+    if expected_repo_count != len(repo_list_snapshot.github_repos):
+        raise PRCompletionBindingError(
+            "PR completion expected_repo_count does not match the validated "
+            f"PR repo list: receipt={expected_repo_count} "
+            f"list={len(repo_list_snapshot.github_repos)}"
+        )
+    actual_expected_repos_sha256 = _canonical_json_sha256(
+        list(repo_list_snapshot.github_repos)
+    )
+    if expected_repos_sha256 != actual_expected_repos_sha256:
+        raise PRCompletionBindingError(
+            "PR completion expected_repos_sha256 does not match the validated "
+            f"PR repo list: receipt={expected_repos_sha256} "
+            f"list={actual_expected_repos_sha256}"
+        )
+    if (
+        isinstance(stored_pr_count, bool)
+        or not isinstance(stored_pr_count, int)
+        or stored_pr_count < 0
+    ):
+        raise PRCompletionBindingError(
+            "PR completion stored_pr_count must be a non-negative integer"
+        )
+    if declared_pr_count != stored_pr_count:
+        raise PRCompletionBindingError(
+            "PR completion declared_pr_count does not match stored_pr_count"
+        )
+    if (
+        isinstance(unverified_store_pr_count, bool)
+        or not isinstance(unverified_store_pr_count, int)
+        or unverified_store_pr_count < 0
+    ):
+        raise PRCompletionBindingError(
+            "PR completion unverified_store_pr_count must be a "
+            "non-negative integer"
+        )
+    return {
+        "schema": "cppmega_pr_completion_v2",
+        "status": "verified",
+        "receipt_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
+        "pr_store_sha256": pr_store_sha256,
+        "repo_list_sha256": repo_list_sha256,
+        "expected_repos_sha256": expected_repos_sha256,
+        "scan_id": scan_id,
+        "expected_repo_count": expected_repo_count,
+        "stored_pr_count": stored_pr_count,
+        "unverified_store_pr_count": unverified_store_pr_count,
+    }
+
+
+def pr_completion_identity(binding: Mapping[str, object]) -> tuple[object, ...]:
+    required = (
+        "schema",
+        "status",
+        "receipt_sha256",
+        "pr_store_sha256",
+        "repo_list_sha256",
+        "expected_repos_sha256",
+        "scan_id",
+        "expected_repo_count",
+        "stored_pr_count",
+        "unverified_store_pr_count",
+    )
+    missing = [field for field in required if field not in binding]
+    if missing:
+        raise PRCompletionBindingError(
+            "manifest PR completion binding is missing: " + ", ".join(missing)
+        )
+    if binding["schema"] != "cppmega_pr_completion_v2":
+        raise PRCompletionBindingError(
+            f"manifest PR completion schema is unsupported: {binding['schema']!r}"
+        )
+    if binding["status"] != "verified":
+        raise PRCompletionBindingError(
+            f"manifest PR completion status is not verified: {binding['status']!r}"
+        )
+    for field in (
+        "receipt_sha256",
+        "pr_store_sha256",
+        "repo_list_sha256",
+        "expected_repos_sha256",
+        "scan_id",
+    ):
+        _require_completion_sha256(binding[field], field=field)
+    for field, minimum in (
+        ("expected_repo_count", 1),
+        ("stored_pr_count", 0),
+        ("unverified_store_pr_count", 0),
+    ):
+        value = binding[field]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < minimum
+        ):
+            raise PRCompletionBindingError(
+                f"manifest PR completion {field} is invalid"
+            )
+    return tuple(binding[field] for field in required)
+
+
+def resolve_verified_pr_scan_id(
+    pr_completion: Mapping[str, object] | None,
+    asserted_scan_id: str | None,
+) -> str | None:
+    """Derive the worker scan from a receipt, with an optional exact assertion."""
+
+    if asserted_scan_id is not None:
+        if re.fullmatch(r"[0-9a-f]{64}", asserted_scan_id) is None:
+            raise PRCompletionBindingError(
+                f"invalid --pr-scan-id: {asserted_scan_id!r}"
+            )
+        if pr_completion is None:
+            raise PRCompletionBindingError(
+                "--pr-scan-id requires --pr-completion-receipt"
+            )
+    if pr_completion is None:
+        return None
+    pr_completion_identity(pr_completion)
+    receipt_scan_id = str(pr_completion["scan_id"])
+    if asserted_scan_id is not None and asserted_scan_id != receipt_scan_id:
+        raise PRCompletionBindingError(
+            "--pr-scan-id does not match the verified PR completion receipt: "
+            f"asserted={asserted_scan_id} receipt={receipt_scan_id}"
+        )
+    return receipt_scan_id
+
+
+def revalidate_pr_completion_binding(
+    binding: Mapping[str, object],
+    receipt_path: Path,
+    *,
+    pr_store: Path,
+    repo_list: Path,
+    repo_list_snapshot: RepoListSnapshot | None = None,
+) -> None:
+    """Prove the receipt, store, and PR scope stayed unchanged."""
+
+    current = load_pr_completion_binding(
+        receipt_path,
+        pr_store=pr_store,
+        repo_list=repo_list,
+        repo_list_snapshot=repo_list_snapshot,
+    )
+    if pr_completion_identity(current) != pr_completion_identity(binding):
+        raise PRCompletionBindingError(
+            "PR completion binding changed while the commit stream was running"
+        )
+
+
+VERIFIED_INPUT_BINDING_KEY = "__verified_commit_inputs_v1__"
+
+
+def bind_verified_manifest_inputs(
+    manifest: Manifest,
+    *,
+    source: RepoListSnapshot,
+    pr: RepoListSnapshot,
+    pr_completion: Mapping[str, object],
+) -> dict[str, object]:
+    """Bind standalone verified resume to the exact frozen input contract."""
+
+    pr_completion_identity(pr_completion)
+    if pr_completion["repo_list_sha256"] != pr.sha256:
+        raise RepoListBindingError(
+            "verified PR completion repo-list hash does not match the frozen "
+            "PR repo-list snapshot"
+        )
+    binding = {
+        "schema": "cppmega_verified_commit_inputs_v1",
+        "source_sha256": source.sha256,
+        "source_mapping_sha256": source.canonical_mapping_sha256,
+        "source_mapping_count": source.mapping_count,
+        "pr_sha256": pr.sha256,
+        "pr_mapping_sha256": pr.canonical_mapping_sha256,
+        "pr_mapping_count": pr.mapping_count,
+        "pr_completion": dict(pr_completion),
+    }
+    existing = manifest.done.get(VERIFIED_INPUT_BINDING_KEY)
+    if existing is None:
+        work_keys = [
+            key for key in manifest.done if key != VERIFIED_INPUT_BINDING_KEY
+        ]
+        if work_keys or manifest.failed:
+            raise RepoListBindingError(
+                "existing standalone commit manifest has work receipts but no "
+                "verified input binding; use a new commit output root"
+            )
+        manifest.mark_done(VERIFIED_INPUT_BINDING_KEY, binding)
+    elif existing != binding:
+        raise RepoListBindingError(
+            "standalone commit manifest verified input mismatch; "
+            "source/PR lists and PR completion receipt must match on resume"
+        )
+    return binding
 
 
 def _is_excluded_commit(within: str) -> bool:
@@ -570,7 +1379,8 @@ def process_range(
     dedup_db: Path | None = None,
     dedup_near: bool = True,
     pr_store: Path | None = None,
-    repo_list: Path | None = None,
+    project_id: str | None = None,
+    pr_owner_repo: str | None = None,
     memory_limit_gb: float = 10.0,
     analysis_cache_entries: int = 128,
     defer_promote: bool = False,
@@ -579,7 +1389,21 @@ def process_range(
     pr_scan_id: str | None = None,
 ) -> dict:
     """Full per-range pipeline. RAISES RepoFailure on any failure (no fallback)."""
-    project_id = sr.resolve_project_identity(repo, repo_list)
+    if project_id is None:
+        raise RepoFailure(
+            repo,
+            "project_identity",
+            "commit range requires an already-resolved project_id",
+        )
+    project_id = sr.require_project_identity(
+        project_id,
+        source=f"streaming_reindex_commits.process_range({repo})",
+    )
+    if pr_owner_repo is not None:
+        pr_owner_repo = sr.require_project_identity(
+            pr_owner_repo,
+            source=f"streaming_reindex_commits.process_range({repo}) PR key",
+        )
     materialize_budget = sr.lossless_materialize_budget(lengths_sorted)
     rkey = range_key(repo, start_idx)
     rwork = repo_work / f"r{start_idx}"
@@ -611,19 +1435,35 @@ def process_range(
 
         # process_commits needs the source tree for include resolution.
         started = time.monotonic()
-        enriched = stage_index_commits(rkey, [slice_jsonl], rwork, repo_dir, None,
-                                       dedup_db, dedup_near, stage_id,
-                                       stage_db,
-                                       pr_store=pr_store, repo_list=repo_list,
-                                       memory_limit_gb=memory_limit_gb,
-                                       analysis_cache_entries=analysis_cache_entries,
-                                       allow_empty=True,
-                                       pr_scan_id=pr_scan_id,
-                                       project_id=project_id)
+        enriched = stage_index_commits(
+            rkey,
+            [slice_jsonl],
+            rwork,
+            repo_dir,
+            None,
+            dedup_db,
+            dedup_near,
+            stage_id,
+            stage_db,
+            pr_store=pr_store if pr_owner_repo is not None else None,
+            memory_limit_gb=memory_limit_gb,
+            analysis_cache_entries=analysis_cache_entries,
+            allow_empty=True,
+            pr_scan_id=pr_scan_id if pr_owner_repo is not None else None,
+            project_id=project_id,
+            pr_owner_repo=pr_owner_repo,
+        )
         timings["process_commits_s"] = round(time.monotonic() - started, 6)
         if enriched is None:
             sr.discard_dedup_stage(dedup_db, stage_id, stage_db)
-            info = empty_after_dedup_info(repo, start_idx, end_idx, n_records)
+            info = empty_after_dedup_info(
+                repo,
+                start_idx,
+                end_idx,
+                n_records,
+                project_id=project_id,
+                pr_eligible=pr_owner_repo is not None,
+            )
             info["stage_timings_s"] = timings
             return info
         started = time.monotonic()
@@ -679,6 +1519,8 @@ def process_range(
         info = {
             "source": "commits",
             "repo": repo,
+            "project_id": project_id,
+            "pr_eligible": pr_owner_repo is not None,
             "range": [start_idx, end_idx],
             "n_records": n_records,
             "lengths": per_length,
@@ -698,12 +1540,20 @@ def process_range(
 
 
 def empty_after_dedup_info(
-    repo: str, start_idx: int, end_idx: int, n_records: int
+    repo: str,
+    start_idx: int,
+    end_idx: int,
+    n_records: int,
+    *,
+    project_id: str,
+    pr_eligible: bool = False,
 ) -> dict:
     """Manifest info for a commit range whose docs all deduped away."""
     return {
         "source": "commits",
         "repo": repo,
+        "project_id": project_id,
+        "pr_eligible": pr_eligible,
         "range": [start_idx, end_idx],
         "n_records": n_records,
         "lengths": {},
@@ -734,6 +1584,10 @@ def process_one_repo(
     repo_list: Path | None = None,
     memory_limit_gb: float = 10.0,
     analysis_cache_entries: int = 128,
+    *,
+    project_id: str | None = None,
+    pr_owner_repo: str | None = None,
+    pr_scan_id: str | None = None,
 ) -> int:
     """Extract one repo, fan its ranges to the pool, wait for completion.
 
@@ -749,7 +1603,29 @@ def process_one_repo(
     repo_work.mkdir(parents=True, exist_ok=True)
     smallest = lengths_sorted[0]
     try:
-        project_id = sr.resolve_project_identity(repo, repo_list)
+        if project_id is None:
+            if pr_scan_id is not None:
+                raise RepoFailure(
+                    repo,
+                    "project_identity",
+                    "verified PR scan requires a project_id frozen at startup",
+                )
+            project_id = sr.resolve_project_identity(repo, repo_list)
+        project_id = sr.require_project_identity(
+            project_id,
+            source=f"streaming_reindex_commits.process_one_repo({repo})",
+        )
+        if pr_owner_repo is not None:
+            pr_owner_repo = sr.require_project_identity(
+                pr_owner_repo,
+                source=f"streaming_reindex_commits.process_one_repo({repo}) PR key",
+            )
+        if pr_owner_repo is not None and pr_store is None:
+            raise RepoFailure(
+                repo,
+                "pr_binding",
+                "pr_owner_repo requires pr_store",
+            )
         commit_list = get_commit_list(repo_dir)
         if not commit_list:
             raise RepoFailure(repo, "git_log", "no --no-merges --diff-filter=M commits")
@@ -788,8 +1664,11 @@ def process_one_repo(
             fut = pool.submit(
                 process_range, repo, repo_dir, records_jsonl,
                 start, end, lengths_sorted, repo_work,
-                dedup_db, dedup_near, pr_store, repo_list, memory_limit_gb,
+                dedup_db, dedup_near,
+                pr_store if pr_owner_repo is not None else None,
+                project_id, pr_owner_repo, memory_limit_gb,
                 analysis_cache_entries,
+                pr_scan_id=pr_scan_id if pr_owner_repo is not None else None,
             )
             futures[fut] = (start, end)
 
@@ -893,9 +1772,30 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "record['pr_discussion'] (HEAD of the commit doc). Miss "
                         "= Tier-1 git-only (no fail).")
     p.add_argument("--repo-list", default=str(sr.DEFAULT_REPO_LIST),
-                   help="Path to outputs/pr_ingest/repo_list.json (bare-name -> "
-                        "owner/repo map) for canonical materialization identity "
-                        f"and the PR-store key. Default {sr.DEFAULT_REPO_LIST}.")
+                   help="Canonical source/archive repo_list.json used only for "
+                        "project identity. "
+                        f"Default {sr.DEFAULT_REPO_LIST}.")
+    p.add_argument(
+        "--pr-repo-list",
+        default=None,
+        help="Optional PR repo_list.json used only to resolve GitHub PR keys. "
+             "Required with --pr-completion-receipt. Without a verified "
+             "receipt, omitting it retains the unverified direct/dev behavior "
+             "of reading PR keys from --repo-list.",
+    )
+    p.add_argument(
+        "--pr-completion-receipt",
+        default=None,
+        help="Verified cppmega_pr_completion_v2 JSON receipt binding the exact "
+             "--pr-store, --pr-repo-list, and scan. Required for verified "
+             "standalone PR enrichment.",
+    )
+    p.add_argument(
+        "--pr-scan-id",
+        default=None,
+        help="Optional exact 64-hex assertion against the scan identity derived "
+             "from --pr-completion-receipt. It cannot verify a run by itself.",
+    )
     p.add_argument("--memory-limit-gb", type=float, default=10.0,
                    help="Per-stage fail-loud RSS limit passed to process_commits/"
                         "materializer (default 10.0).")
@@ -918,6 +1818,93 @@ def main(argv: list[str]) -> int:
         if not Path(path).exists():
             raise SystemExit(f"required path missing: {path}")
 
+    # Tier-2 PR-discussion live lookup (fail-loud on a bad path up front).
+    pr_store = (
+        Path(args.pr_store).expanduser().resolve() if args.pr_store else None
+    )
+    repo_list = (
+        Path(args.repo_list).expanduser().resolve() if args.repo_list else None
+    )
+    pr_repo_list = (
+        Path(args.pr_repo_list).expanduser().resolve()
+        if args.pr_repo_list
+        else None
+    )
+    pr_completion_receipt = (
+        Path(args.pr_completion_receipt).expanduser().resolve()
+        if args.pr_completion_receipt
+        else None
+    )
+    if pr_store is not None and not pr_store.exists():
+        raise SystemExit(f"--pr-store does not exist: {pr_store}")
+    if repo_list is not None and not repo_list.exists():
+        raise SystemExit(f"--repo-list does not exist: {repo_list}")
+    if pr_repo_list is not None and not pr_repo_list.exists():
+        raise SystemExit(f"--pr-repo-list does not exist: {pr_repo_list}")
+    if pr_repo_list is not None and pr_store is None:
+        raise SystemExit("--pr-repo-list requires --pr-store")
+    effective_pr_scan_id: str | None = None
+    if pr_completion_receipt is not None:
+        if pr_store is None or repo_list is None or pr_repo_list is None:
+            raise SystemExit(
+                "--pr-completion-receipt requires --repo-list, --pr-store, "
+                "and --pr-repo-list"
+            )
+    else:
+        try:
+            effective_pr_scan_id = resolve_verified_pr_scan_id(
+                None,
+                args.pr_scan_id,
+            )
+        except PRCompletionBindingError as exc:
+            raise SystemExit(str(exc)) from exc
+
+    source_snapshot: RepoListSnapshot | None = None
+    pr_snapshot: RepoListSnapshot | None = None
+    pr_completion_binding: dict[str, object] | None = None
+    if pr_completion_receipt is not None:
+        assert repo_list is not None
+        assert pr_repo_list is not None
+        assert pr_store is not None
+        try:
+            source_snapshot, pr_snapshot = load_repo_list_contracts(
+                repo_list,
+                pr_repo_list,
+            )
+            pr_completion_binding = load_pr_completion_binding(
+                pr_completion_receipt,
+                pr_store=pr_store,
+                repo_list=pr_repo_list,
+                repo_list_snapshot=pr_snapshot,
+            )
+            effective_pr_scan_id = resolve_verified_pr_scan_id(
+                pr_completion_binding,
+                args.pr_scan_id,
+            )
+        except (RepoListBindingError, PRCompletionBindingError) as exc:
+            raise SystemExit(f"VERIFIED_PR_INPUT_FAILED: {exc}") from exc
+        project_id_by_repo = source_snapshot.project_id_by_bare_name
+        pr_owner_repo_by_repo = pr_snapshot.owner_repo_by_bare_name
+    else:
+        # Compatibility is intentionally limited to unverified direct/dev runs.
+        project_id_by_repo = (
+            sr.load_project_identity_map(repo_list)
+            if repo_list is not None
+            else {}
+        )
+        if pr_repo_list is not None:
+            pr_owner_repo_by_repo = load_pr_owner_repo_map(pr_repo_list)
+        elif pr_store is not None and repo_list is not None:
+            pr_owner_repo_by_repo = load_pr_owner_repo_map(repo_list)
+        else:
+            pr_owner_repo_by_repo = {}
+    if pr_store is not None:
+        _log(f"PR-store: live lookup into record['pr_discussion'] from {pr_store} "
+             f"(pr_repo_list={pr_repo_list}, scan_id={effective_pr_scan_id}, "
+             f"verified={pr_completion_binding is not None})")
+
+    # Do not create run outputs or touch the shared dedup store until verified
+    # PR inputs have passed their exact list/store/receipt contract.
     COMMIT_OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     for tl in lengths_sorted:
         (COMMIT_OUTPUT_ROOT / str(tl)).mkdir(parents=True, exist_ok=True)
@@ -936,20 +1923,24 @@ def main(argv: list[str]) -> int:
         _log(f"Dedup: SHARED global commit-doc store at {dedup_db} "
              f"(exact{'+near' if dedup_near else ''}, tokenized hash)")
 
-    # Tier-2 PR-discussion live lookup (fail-loud on a bad path up front).
-    pr_store = Path(args.pr_store) if args.pr_store else None
-    repo_list = Path(args.repo_list) if args.repo_list else None
-    if pr_store is not None and not pr_store.exists():
-        raise SystemExit(f"--pr-store does not exist: {pr_store}")
-    if repo_list is not None and not repo_list.exists():
-        raise SystemExit(f"--repo-list does not exist: {repo_list}")
-    if repo_list is not None:
-        sr.load_project_identity_map(repo_list)
-    if pr_store is not None:
-        _log(f"PR-store: live lookup into record['pr_discussion'] from {pr_store} "
-             f"(repo_list={repo_list})")
-
     manifest = Manifest.load(COMMIT_MANIFEST)
+    if pr_completion_binding is not None:
+        assert source_snapshot is not None
+        assert pr_snapshot is not None
+        try:
+            bind_verified_manifest_inputs(
+                manifest,
+                source=source_snapshot,
+                pr=pr_snapshot,
+                pr_completion=pr_completion_binding,
+            )
+        except (RepoListBindingError, PRCompletionBindingError) as exc:
+            raise SystemExit(f"VERIFIED_MANIFEST_BINDING_FAILED: {exc}") from exc
+    elif VERIFIED_INPUT_BINDING_KEY in manifest.done:
+        raise SystemExit(
+            "unverified direct mode cannot reuse a verified standalone manifest; "
+            "use a new commit output root"
+        )
     manifest_lock = threading.Lock()
     resume = not args.no_resume
 
@@ -1006,6 +1997,9 @@ def main(argv: list[str]) -> int:
                     dedup_db, dedup_near, pr_store, repo_list,
                     args.memory_limit_gb,
                     args.analysis_cache_entries,
+                    project_id=project_id_by_repo.get(repo),
+                    pr_owner_repo=pr_owner_repo_by_repo.get(repo),
+                    pr_scan_id=effective_pr_scan_id,
                 )
                 ranges_done += done
                 processed_repos += 1
@@ -1027,6 +2021,34 @@ def main(argv: list[str]) -> int:
         if own_work_root and not args.keep_temp:
             shutil.rmtree(work_root, ignore_errors=True)
 
+    pr_completion_reverified_at_finish = False
+    if pr_completion_binding is not None:
+        assert repo_list is not None
+        assert pr_repo_list is not None
+        assert pr_store is not None
+        assert pr_completion_receipt is not None
+        assert source_snapshot is not None
+        try:
+            current_source, current_pr = load_repo_list_contracts(
+                repo_list,
+                pr_repo_list,
+            )
+            if current_source.sha256 != source_snapshot.sha256:
+                raise RepoListBindingError(
+                    "source repo list changed while the standalone commit run "
+                    "was active"
+                )
+            revalidate_pr_completion_binding(
+                pr_completion_binding,
+                pr_completion_receipt,
+                pr_store=pr_store,
+                repo_list=pr_repo_list,
+                repo_list_snapshot=current_pr,
+            )
+        except (RepoListBindingError, PRCompletionBindingError) as exc:
+            raise SystemExit(f"VERIFIED_INPUT_DRIFT: {exc}") from exc
+        pr_completion_reverified_at_finish = True
+
     # ----- cumulative per-length + dropped-overlong report from the manifest -----
     totals, dropped_overlong_total = summarize_done_manifest(
         manifest.done, lengths_sorted
@@ -1037,13 +2059,19 @@ def main(argv: list[str]) -> int:
         "workers": workers,
         "range_size": args.range_size,
         "target_lengths": list(lengths_sorted),
-        "total_done_ranges": len([k for k in manifest.done]),
+        "total_done_ranges": len(
+            [key for key in manifest.done if key != VERIFIED_INPUT_BINDING_KEY]
+        ),
         "total_failed": len(manifest.failed),
         "cumulative_valid_tokens_this_run": cumulative["valid"],
         "per_length_totals": totals,
         "dropped_overlong_total": dropped_overlong_total,
         "materialize_split_totals": sr.summarize_materialize_stats(
             list(manifest.done.values())
+        ),
+        "pr_completion": pr_completion_binding,
+        "pr_completion_reverified_at_finish": (
+            pr_completion_reverified_at_finish
         ),
         "manifest": str(COMMIT_MANIFEST),
     }
