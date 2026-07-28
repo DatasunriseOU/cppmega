@@ -274,6 +274,7 @@ def test_commit_pr_lookup_is_bound_to_exact_scan_membership(
         str(store_path),
         None,
         scan_id=current_scan,
+        owner_repo="owner/project",
     )
     try:
         current = {
@@ -298,6 +299,88 @@ def test_commit_pr_lookup_is_bound_to_exact_scan_membership(
 
     with pytest.raises(ValueError, match="invalid PR scan_id"):
         PRDiscussionLookup(str(store_path), None, scan_id="not-a-scan")
+
+    with pytest.raises(ValueError, match="explicit PR owner/repo"):
+        PRDiscussionLookup(str(store_path), None, scan_id=current_scan)
+
+
+def test_commit_pr_lookup_fixed_key_overrides_record_slash_identity(
+    tmp_path: Path,
+) -> None:
+    from scripts.pr_ingest import pr_store
+    from tools.clang_indexer.process_commits import PRDiscussionLookup
+
+    scan_id = "c" * 64
+    store_path = tmp_path / "pull_requests.sqlite"
+    conn = pr_store.connect(str(store_path), create=True)
+    try:
+        pr_store.upsert_record(
+            conn,
+            {
+                "repo": "owner/project",
+                "pr_number": 7,
+                "merge_commit_sha": "fixed-key-sha",
+                "pr_title": "Fixed key",
+                "pr_body": "Attached through the explicit repository key.",
+                "comments": [],
+                "reviews": [],
+                "linked_issues": [],
+            },
+            scan_id=scan_id,
+        )
+    finally:
+        conn.close()
+
+    lookup = PRDiscussionLookup(
+        str(store_path),
+        None,
+        scan_id=scan_id,
+        owner_repo="owner/project",
+    )
+    try:
+        record = {
+            "repo": "different/source-identity",
+            "commit_hash": "fixed-key-sha",
+        }
+        assert lookup.attach(record) is True
+        assert record["pr_number"] == 7
+    finally:
+        lookup.close()
+
+
+def test_corpus_local_identity_never_becomes_a_github_lookup_key(
+    tmp_path: Path,
+) -> None:
+    from scripts.pr_ingest import pr_store
+    from tools.clang_indexer.process_commits import (
+        PRDiscussionLookup,
+        SymbolIdentityError,
+    )
+
+    store_path = tmp_path / "pull_requests.sqlite"
+    conn = pr_store.connect(str(store_path), create=True)
+    conn.close()
+
+    lookup = PRDiscussionLookup(str(store_path), None)
+    try:
+        record = {
+            "repo": "corpus.local/local-source",
+            "commit_hash": "unused",
+        }
+        assert lookup._store_key(record) is None
+        assert lookup.attach(record) is False
+    finally:
+        lookup.close()
+
+    with pytest.raises(
+        SymbolIdentityError,
+        match="project identity must contain exactly one slash",
+    ):
+        PRDiscussionLookup(
+            str(store_path),
+            None,
+            owner_repo="not-a-github-key",
+        )
 
 
 def test_atomic_publish_replaces_only_after_success(tmp_path: Path) -> None:

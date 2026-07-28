@@ -51,14 +51,29 @@ def _verified_pr_inputs(
         repo = str(record["repo"])
         repo_counts[repo] = repo_counts.get(repo, 0) + 1
     repo_list = tmp_path / "repo_list.json"
+    repo_rows = [
+        {
+            "bare_name": f"pr-export-{index:06d}",
+            "project_identity": repo,
+            "owner_repo": repo,
+        }
+        for index, repo in enumerate(sorted(repo_counts))
+    ]
     repo_list.write_text(
         json.dumps(
             {
-                "repos": [
-                    {"owner_repo": repo}
-                    for repo in sorted(repo_counts)
-                ]
-            }
+                "schema_version": 2,
+                "repos": repo_rows,
+                "by_bare_name": {
+                    row["bare_name"]: row["project_identity"]
+                    for row in repo_rows
+                },
+                "project_identities": sorted(repo_counts),
+                "repo_names": sorted(repo_counts),
+                "unresolved": [],
+            },
+            indent=2,
+            sort_keys=True,
         )
         + "\n",
         encoding="utf-8",

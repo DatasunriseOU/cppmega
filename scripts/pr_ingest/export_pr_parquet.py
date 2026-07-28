@@ -73,13 +73,13 @@ def _load_pipeline():
 
 def _load_completion_api():
     try:
-        from streaming_conveyor import (
+        from streaming_reindex_commits import (
             load_pr_completion_binding,
             revalidate_pr_completion_binding,
         )
     except ModuleNotFoundError as exc:
         raise RuntimeError(
-            "PR parquet export requires root scripts/streaming_conveyor.py "
+            "PR parquet export requires root scripts/streaming_reindex_commits.py "
             "to verify cppmega_pr_completion_v2; no unverified fallback is "
             "permitted"
         ) from exc
