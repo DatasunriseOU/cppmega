@@ -214,6 +214,37 @@ def test_commit_pr_lookup_supports_root_store_readonly(tmp_path: Path) -> None:
         lookup.close()
 
 
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ([], "must contain a JSON object"),
+        ({"repos": "owner/project"}, "field 'repos' must be a list"),
+        (
+            {"repos": ["owner/project"]},
+            r"field 'repos\[0\]' must be an object",
+        ),
+    ],
+)
+def test_commit_pr_lookup_rejects_malformed_repo_list_shape_with_path(
+    tmp_path: Path,
+    payload: object,
+    message: str,
+) -> None:
+    from scripts.pr_ingest import pr_store
+    from tools.clang_indexer.process_commits import PRDiscussionLookup
+
+    store_path = tmp_path / "pull_requests.sqlite"
+    connection = pr_store.connect(str(store_path), create=True)
+    connection.close()
+    repo_list = tmp_path / "malformed-repos.json"
+    repo_list.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message) as exc_info:
+        PRDiscussionLookup(str(store_path), str(repo_list))
+
+    assert str(repo_list) in str(exc_info.value)
+
+
 def test_commit_pr_lookup_is_bound_to_exact_scan_membership(
     tmp_path: Path,
 ) -> None:
