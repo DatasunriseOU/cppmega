@@ -20,6 +20,35 @@ def test_source_stream_read_error_is_only_suppressed_after_checkpoint_signal() -
     conveyor._handle_source_stream_read_error(error, interrupted=True)
 
 
+@pytest.mark.parametrize("dedup_near", (True, False))
+def test_adaptive_code_retry_preserves_configured_dedup_policy(
+    tmp_path: Path,
+    dedup_near: bool,
+) -> None:
+    calls: list[tuple[int, bool]] = []
+
+    def runner(*args: object) -> dict[str, object]:
+        calls.append((int(args[9]), bool(args[6])))
+        if len(calls) == 1:
+            raise conveyor.RepoFailure("repo", "index_project", "exit code 137")
+        return {"status": "done"}
+
+    result = conveyor.run_code_half_adaptive(
+        "repo",
+        "owner/repo",
+        tmp_path / "repo",
+        (1024,),
+        tmp_path / "work",
+        tmp_path / "dedup.sqlite",
+        dedup_near,
+        parse_workers=4,
+        runner=runner,
+    )
+
+    assert result == {"status": "done"}
+    assert calls == [(4, dedup_near), (1, dedup_near)]
+
+
 def _git(repo: Path, *args: str) -> str:
     completed = subprocess.run(
         ["git", "-C", str(repo), *args],
