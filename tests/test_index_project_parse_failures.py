@@ -132,15 +132,27 @@ def test_parse_batch_recovers_nested_legacy_include_context(
     index_project = _load_indexer()
     source_dir = tmp_path / "legacy" / "src"
     include_dir = tmp_path / "legacy" / "vendor" / "include"
+    nested_include_dir = tmp_path / "legacy" / "vendor" / "inc.next"
+    decoy_include_dir = tmp_path / "other" / "include"
     source_dir.mkdir(parents=True)
     include_dir.mkdir(parents=True)
+    nested_include_dir.mkdir(parents=True)
+    decoy_include_dir.mkdir(parents=True)
     source = source_dir / "main.cpp"
     source.write_text(
         "int legacy_answer() { return LEGACY_ANSWER; }\n",
         encoding="utf-8",
     )
     (include_dir / "legacy_prelude.h").write_text(
+        '#include "legacy_value.h"\n',
+        encoding="utf-8",
+    )
+    (nested_include_dir / "legacy_value.h").write_text(
         "#define LEGACY_ANSWER 42\n",
+        encoding="utf-8",
+    )
+    (decoy_include_dir / "legacy_prelude.h").write_text(
+        "#define LEGACY_ANSWER 13\n",
         encoding="utf-8",
     )
 
@@ -163,15 +175,27 @@ def test_parse_batch_recovers_nested_legacy_include_context(
             "relative_path": "legacy/src/main.cpp",
             "trigger": "missing_include_diagnostic",
             "added_include_dir_examples": [
-                "legacy/src",
                 "legacy/vendor/include",
+                "legacy/vendor/inc.next",
             ],
             "added_include_dir_count": 2,
             "added_include_dirs_sha256": (
-                "4437a42f22c598ba16c76c070b73c097adc1bee77328c2091d72"
-                "a49501c6ee5b"
+                "5a4a956e5ff09b51e6b2a395d66cb09a9407c0414f8b6b8c563"
+                "f0433660d1704"
             ),
             "added_include_dir_examples_truncated": False,
+            "requested_include_name_count": 2,
+            "requested_include_names_sha256": (
+                "9a69b537257773714a90564239bc0d5722c84333c6e26c2ac851"
+                "8af299ac3241"
+            ),
+            "requested_include_name_examples": [
+                "legacy_prelude.h",
+                "legacy_value.h",
+            ],
+            "requested_include_name_examples_truncated": False,
+            "unresolved_include_name_count": 0,
+            "retry_round_count": 2,
             "initial_missing_include_count": 1,
             "status": "recovered",
             "retry_missing_include_count": 0,

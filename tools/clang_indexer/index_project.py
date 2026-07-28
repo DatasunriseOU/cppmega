@@ -4371,6 +4371,11 @@ _MISSING_INCLUDE_DIAGNOSTIC_MARKERS = (
     "cannot open include file",
     "no such file or directory",
 )
+_RECOVERY_SOURCE_INCLUDE_RE = re.compile(
+    r'^\s*#\s*include\s+["<]([^">]+)[">]',
+)
+_RECOVERY_SOURCE_SCAN_MAX_BYTES = 4 * 1024 * 1024
+_RECOVERY_MAX_ROUNDS = 3
 
 
 def _discover_recovery_include_dirs(project_dir: str) -> tuple[str, ...]:
@@ -4432,13 +4437,108 @@ def _compile_arg_include_dirs(
     return existing
 
 
+def _normalize_recovery_include_name(value: object) -> str | None:
+    text = str(value or "").strip().replace("\\", "/")
+    if (
+        not text
+        or len(text) > 4096
+        or text.startswith("/")
+        or re.match(r"^[A-Za-z]:/", text)
+        or "\x00" in text
+        or any(ord(char) < 32 or ord(char) == 127 for char in text)
+    ):
+        return None
+    parts = tuple(part for part in text.split("/") if part not in {"", "."})
+    if not parts or any(part == ".." for part in parts):
+        return None
+    return "/".join(parts)
+
+
+def _diagnostic_missing_include_names(
+    diagnostics: Sequence[str],
+) -> tuple[str, ...]:
+    names: set[str] = set()
+    for spelling in diagnostics:
+        match = re.search(r"""['"]([^'"]+)['"]""", str(spelling))
+        if match is None:
+            continue
+        normalized = _normalize_recovery_include_name(match.group(1))
+        if normalized is not None:
+            names.add(normalized)
+    return tuple(sorted(names))
+
+
+def _forced_include_names(compile_args: Sequence[str]) -> tuple[str, ...]:
+    names: set[str] = set()
+    expect_path = False
+    for value in compile_args:
+        text = str(value)
+        candidate: str | None = None
+        if expect_path:
+            candidate = text
+            expect_path = False
+        elif text == "-include":
+            expect_path = True
+            continue
+        elif text.startswith("-include") and text != "-include":
+            candidate = text.removeprefix("-include")
+        elif text.lower().startswith("/fi") and len(text) > 3:
+            candidate = text[3:]
+        if candidate is None:
+            continue
+        normalized = _normalize_recovery_include_name(candidate)
+        if normalized is not None:
+            names.add(normalized)
+    return tuple(sorted(names))
+
+
+def _source_include_names(filepath: str) -> tuple[str, ...]:
+    names: set[str] = set()
+    try:
+        with open(filepath, "rb") as stream:
+            raw = stream.read(_RECOVERY_SOURCE_SCAN_MAX_BYTES + 1)
+    except OSError:
+        return ()
+    raw = raw[:_RECOVERY_SOURCE_SCAN_MAX_BYTES]
+    encoding = "utf-16" if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8"
+    text = raw.decode(encoding, errors="ignore")
+    for line in text.splitlines():
+        match = _RECOVERY_SOURCE_INCLUDE_RE.match(line)
+        if match is None:
+            continue
+        normalized = _normalize_recovery_include_name(match.group(1))
+        if normalized is not None:
+            names.add(normalized)
+    return tuple(sorted(names))
+
+
+def _seed_recovery_include_names(
+    *,
+    filepath: str,
+    compile_args: Sequence[str],
+    missing_diagnostics: Sequence[str],
+) -> tuple[str, ...]:
+    diagnostic_names = _diagnostic_missing_include_names(missing_diagnostics)
+    if diagnostic_names:
+        return diagnostic_names
+    return tuple(
+        sorted(
+            {
+                *_forced_include_names(compile_args),
+                *_source_include_names(filepath),
+            }
+        )
+    )
+
+
 def _include_recovery_args(
     compile_args: Sequence[str],
     *,
     filepath: str,
     project_dir: str,
-) -> tuple[list[str], list[str]]:
-    """Add ranked project-local include roots and return their relative paths."""
+    include_names: Sequence[str],
+) -> tuple[list[str], list[str], list[str]]:
+    """Add only roots that contain requested headers, choosing the closest."""
 
     project_root = os.path.realpath(os.path.abspath(project_dir))
     source_dir = os.path.realpath(os.path.abspath(os.path.dirname(filepath)))
@@ -4468,18 +4568,48 @@ def _include_recovery_args(
             shared += 1
         return (-shared, len(parts), Path(*parts).as_posix())
 
-    added_absolute: list[str] = []
-    added_relative: list[str] = []
-    for candidate in sorted(candidates, key=_rank):
-        parts = _relative_parts(candidate)
-        if not parts or candidate in existing:
+    ranked_candidates = sorted(candidates, key=_rank)
+
+    def _contains_project_local_header(candidate: str, name: str) -> bool:
+        header = os.path.join(candidate, *name.split("/"))
+        if not os.path.isfile(header):
+            return False
+        try:
+            return os.path.commonpath(
+                (project_root, os.path.realpath(header))
+            ) == project_root
+        except ValueError:
+            return False
+
+    selected: set[str] = set()
+    unresolved: list[str] = []
+    for include_name in sorted(set(map(str, include_names))):
+        normalized = _normalize_recovery_include_name(include_name)
+        if normalized is None:
             continue
-        added_absolute.append(candidate)
-        added_relative.append(Path(*parts).as_posix())
-        existing.add(candidate)
+        matches = [
+            candidate
+            for candidate in ranked_candidates
+            if _contains_project_local_header(candidate, normalized)
+        ]
+        if not matches:
+            unresolved.append(normalized)
+            continue
+        selected.add(matches[0])
+
+    added_absolute = [
+        candidate
+        for candidate in ranked_candidates
+        if candidate in selected and candidate not in existing
+    ]
+    added_relative = [
+        Path(*_relative_parts(candidate)).as_posix()
+        for candidate in added_absolute
+    ]
     return (
         [*map(str, compile_args), *(f"-I{path}" for path in added_absolute)],
         added_relative,
+        unresolved,
     )
 
 
@@ -4552,12 +4682,12 @@ def _load_translation_unit_with_include_recovery(
         assert initial_tu is not None
         return initial_tu
 
-    recovery_args, added_include_dirs = _include_recovery_args(
-        compile_args,
+    include_names = _seed_recovery_include_names(
         filepath=filepath,
-        project_dir=project_dir,
+        compile_args=compile_args,
+        missing_diagnostics=initial_missing,
     )
-    if not added_include_dirs:
+    if not include_names:
         if initial_error is not None:
             raise RuntimeError(
                 f"libclang parse failed for {filepath}: {initial_error}"
@@ -4566,8 +4696,59 @@ def _load_translation_unit_with_include_recovery(
         return initial_tu
 
     relative_path = Path(os.path.relpath(filepath, project_dir)).as_posix()
+    active_args = list(map(str, compile_args))
+    added_include_dirs: list[str] = []
+    unresolved_include_names: set[str] = set()
+    recovered_tu: TranslationUnit | None = None
+    recovered_missing: list[str] = []
+    retry_error: Exception | None = None
+    retry_round_count = 0
+    requested_include_names: set[str] = set(include_names)
+    for _round in range(_RECOVERY_MAX_ROUNDS):
+        recovery_args, round_added, round_unresolved = _include_recovery_args(
+            active_args,
+            filepath=filepath,
+            project_dir=project_dir,
+            include_names=include_names,
+        )
+        unresolved_include_names.update(round_unresolved)
+        if not round_added:
+            break
+        retry_round_count += 1
+        active_args = recovery_args
+        added_include_dirs.extend(round_added)
+        try:
+            candidate_tu = _load_translation_unit(
+                filepath,
+                index,
+                active_args,
+            )
+        except Exception as recovery_error:
+            retry_error = recovery_error
+            break
+        candidate_missing = _missing_include_diagnostics(candidate_tu)
+        recovered_tu = candidate_tu
+        recovered_missing = candidate_missing
+        include_names = _diagnostic_missing_include_names(candidate_missing)
+        requested_include_names.update(include_names)
+        if not include_names:
+            break
+
+    if not added_include_dirs:
+        if initial_error is not None:
+            raise RuntimeError(
+                f"libclang parse failed for {filepath}: {initial_error}"
+            ) from initial_error
+        assert initial_tu is not None
+        return initial_tu
+
     encoded_include_dirs = json.dumps(
         added_include_dirs,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encoded_include_names = json.dumps(
+        sorted(requested_include_names),
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -4584,15 +4765,24 @@ def _load_translation_unit_with_include_recovery(
         ).hexdigest(),
         "added_include_dir_examples": added_include_dirs[:8],
         "added_include_dir_examples_truncated": len(added_include_dirs) > 8,
+        "requested_include_name_count": len(requested_include_names),
+        "requested_include_names_sha256": hashlib.sha256(
+            encoded_include_names
+        ).hexdigest(),
+        "requested_include_name_examples": sorted(requested_include_names)[:8],
+        "requested_include_name_examples_truncated": (
+            len(requested_include_names) > 8
+        ),
+        "unresolved_include_name_count": len(unresolved_include_names),
+        "retry_round_count": retry_round_count,
         "initial_missing_include_count": len(initial_missing),
     }
-    try:
-        recovered_tu = _load_translation_unit(filepath, index, recovery_args)
-    except Exception as recovery_error:
+    if recovered_tu is None:
+        assert retry_error is not None
         record.update(
             {
                 "status": "unresolved",
-                "retry_error_type": type(recovery_error).__name__,
+                "retry_error_type": type(retry_error).__name__,
             }
         )
         if parse_recovery_records is not None:
@@ -4600,12 +4790,11 @@ def _load_translation_unit_with_include_recovery(
         if initial_error is not None:
             raise RuntimeError(
                 f"libclang parse failed for {filepath} after nested include "
-                f"recovery: {recovery_error}"
-            ) from recovery_error
+                f"recovery: {retry_error}"
+            ) from retry_error
         assert initial_tu is not None
         return initial_tu
 
-    recovered_missing = _missing_include_diagnostics(recovered_tu)
     recovered = initial_error is not None or (
         len(recovered_missing) < len(initial_missing)
     )
@@ -9579,7 +9768,7 @@ def _parse_recovery_summary(
             else "complete"
         ),
         "policy": (
-            "retry_missing_includes_with_ranked_project_local_include_dirs_"
+            "retry_missing_includes_with_header_matched_project_local_dirs_"
             "only_without_compile_command"
         ),
         "attempted_file_count": len(normalized),
