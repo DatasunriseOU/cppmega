@@ -249,6 +249,34 @@ def _git_sha(root: Path) -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def _verify_local_cppmega_revision(
+    *,
+    expected_commit: str,
+    expected_tree_sha256: str,
+    repo_root: Path = REPO_ROOT,
+) -> dict[str, object]:
+    from scripts.streaming_conveyor import capture_code_revision
+
+    revision = capture_code_revision(repo_root)
+    if revision.get("producer_role") != "canonical_source_conveyor":
+        raise RuntimeError("local cppmega checkout has an unsupported producer role")
+    if revision.get("repository_identity") != "cppmega":
+        raise RuntimeError("local bundle builder is not bound to cppmega")
+    if revision.get("dirty") is not False:
+        raise RuntimeError(
+            "local cppmega checkout is dirty within the executable source scope"
+        )
+    if revision.get("git_commit") != expected_commit:
+        raise RuntimeError(
+            "local cppmega checkout commit does not match --cppmega-commit"
+        )
+    if revision.get("source_tree_sha256") != expected_tree_sha256:
+        raise RuntimeError(
+            "local cppmega source tree does not match --cppmega-tree-sha256"
+        )
+    return revision
+
+
 def _producer_binding_from_conveyor(
     conveyor_manifest: dict[str, object],
     *,
@@ -2581,6 +2609,10 @@ def _run_build(
     if output_dir.exists():
         raise SystemExit(f"final bundle already exists: {output_dir}")
 
+    _verify_local_cppmega_revision(
+        expected_commit=args.cppmega_commit,
+        expected_tree_sha256=args.cppmega_tree_sha256,
+    )
     allowlist, conveyor_manifest = _load_manifest_allowlist(
         args.conveyor_manifest.resolve(), buckets
     )

@@ -27,6 +27,7 @@ from scripts.data.build_macro_routes_megatron_bundle import (
     _snapshot_sources,
     _stage_data_contracts,
     _stage_tokenizer,
+    _verify_local_cppmega_revision,
     _validate_objective_source_binding,
     _write_repaired_snapshot_manifest,
 )
@@ -803,6 +804,58 @@ def test_manifest_allowlist_preserves_conveyor_revision_for_bundle_binding(
 
     assert conveyor["code_revision"] == revision
     assert binding["components"]["cppmega"]["commit"] == "a" * 40
+
+
+def test_bundle_builder_verifies_its_live_clean_cppmega_revision(
+    tmp_path: Path,
+) -> None:
+    from scripts import streaming_conveyor
+
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    (repo / "scripts" / "worker.py").write_text("VALUE = 1\n", encoding="utf-8")
+    indexer_root = repo / "tools" / "clang_indexer"
+    indexer_root.mkdir(parents=True)
+    (indexer_root / "index_project.py").write_text(
+        "INDEXER_VALUE = 1\n",
+        encoding="utf-8",
+    )
+    for command in (
+        ("init", "-q"),
+        ("config", "user.name", "Bundle Test"),
+        ("config", "user.email", "bundle@example.test"),
+        ("add", "."),
+        ("commit", "-q", "-m", "initial"),
+    ):
+        builder.subprocess.run(
+            ["git", "-C", str(repo), *command],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    revision = streaming_conveyor.capture_code_revision(repo)
+
+    verified = _verify_local_cppmega_revision(
+        expected_commit=revision["git_commit"],
+        expected_tree_sha256=revision["source_tree_sha256"],
+        repo_root=repo,
+    )
+    assert verified["git_commit"] == revision["git_commit"]
+
+    with pytest.raises(RuntimeError, match="--cppmega-commit"):
+        _verify_local_cppmega_revision(
+            expected_commit="f" * 40,
+            expected_tree_sha256=revision["source_tree_sha256"],
+            repo_root=repo,
+        )
+
+    (repo / "scripts" / "worker.py").write_text("VALUE = 2\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="checkout is dirty"):
+        _verify_local_cppmega_revision(
+            expected_commit=revision["git_commit"],
+            expected_tree_sha256=revision["source_tree_sha256"],
+            repo_root=repo,
+        )
 
 
 def test_bundle_producer_binding_rejects_legacy_revision_receipt() -> None:
