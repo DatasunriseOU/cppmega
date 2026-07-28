@@ -74,3 +74,58 @@ def test_sequential_project_parse_fails_loud_instead_of_publishing(
     assert str(source) in message
     assert "TranslationUnitLoadError" in message
     assert "libclang parse failed" in message
+
+
+def test_cp1252_source_round_trips_without_clang_token_utf8_decode(
+    tmp_path: Path,
+) -> None:
+    index_project = _load_indexer()
+    source = tmp_path / "legacy.cpp"
+    raw_type = b"struct /* compiler\x92s type */ LegacyType { int value; };\r\n"
+    raw_function = (
+        b"int /* compiler\x92s invalid candidate */ "
+        b"legacy_answer() { return 42; }\r\n"
+    )
+    raw_source = raw_type + raw_function
+    source.write_bytes(raw_source)
+
+    payload, parsed_count = index_project._parse_file_batch(
+        (
+            [str(source)],
+            {},
+            ["-std=c++17", "-fsyntax-only", "-Wno-everything"],
+            str(tmp_path),
+            "fixture/cp1252-source",
+        )
+    )
+
+    assert parsed_count == 1
+    function = next(
+        item for item in payload["functions"]
+        if item["name"] == "legacy_answer"
+    )
+    type_definition = next(
+        item for item in payload["typedefs"]
+        if item["name"] == "LegacyType"
+    )
+    assert function["text"] == raw_function[:-2].decode("cp1252")
+    assert "compiler’s invalid candidate" in function["text"]
+    assert type_definition["text"] == raw_type[:-3].decode("cp1252")
+    assert "compiler’s type" in type_definition["text"]
+    for field in (
+        "ast_depth",
+        "sibling_index",
+        "ast_node_type",
+        "semantic_symbol_ids",
+        "semantic_call_targets",
+        "semantic_type_refs",
+        "semantic_def_use",
+    ):
+        assert len(function[field]) == len(function["text"])
+
+
+def test_source_with_nul_byte_is_rejected() -> None:
+    index_project = _load_indexer()
+
+    with pytest.raises(ValueError, match="source contains NUL byte"):
+        index_project._decode_source_bytes(b"int value = 0;\0\n", "binary.cpp")
