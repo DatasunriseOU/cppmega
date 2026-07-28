@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import errno
@@ -40,12 +41,20 @@ import stat
 import sys
 import threading
 import time
-from typing import Any, BinaryIO, Callable, Iterable, Mapping, Sequence, cast
+from typing import (
+    Any,
+    BinaryIO,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+    cast,
+)
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-import zlib
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -54,14 +63,40 @@ if str(_REPO_ROOT) not in sys.path:
 
 from scripts.ci_stream_fetch import (  # noqa: E402
     ArchiveError as FetchArchiveError,
+    BindingError as FetchBindingError,
+    JOB_RESCUE_LEDGER_EVIDENCE_LEGACY_SCHEMA,
+    JOB_RESCUE_LEDGER_EVIDENCE_SCHEMA,
+    JOB_RESCUE_LEGACY_SEMANTIC_CONTRACT_SHA256,
+    JOB_RESCUE_SEMANTIC_CONTRACT_SHA256,
+    _authorize_producer_lineage_upgrade,
+    _acquire_fetch_state_process_lease,
+    _current_job_rescue_producer_binding,
     _fsync_directory,
+    _is_canonical_utc_timestamp,
+    _parsed_producer_lineage,
+    _producer_lineage,
     _safe_zip_infos,
+    _release_fetch_state_process_lease,
+    _validate_producer_lineage,
+    _validate_fetch_state_process_lease,
+    _validated_producer_binding,
 )
 from scripts.ci_stream_inventory import (  # noqa: E402
     GITHUB_API_VERSION,
     InventoryError,
     TokenPool,
     load_token_pool,
+)
+from scripts.ci_zlib_evidence import (  # noqa: E402
+    MAX_JOBS_EVIDENCE_BYTES,
+    MAX_JOBS_EVIDENCE_COMPRESSED_BYTES,
+    MAX_RUN_METADATA_BYTES,
+    MAX_RUN_METADATA_COMPRESSED_BYTES,
+    ZlibEvidenceError,
+    constrain_sqlite_evidence_rows,
+    fetch_state_attempt_evidence_bound_violation,
+    fetch_state_evidence_bound_violation,
+    strict_bounded_zlib_decode,
 )
 
 
@@ -71,6 +106,7 @@ RESOLVED_JOBS_SCHEMA = "cppmega_ci_job_log_rescue_resolved_jobs_v1"
 RECEIPT_SCHEMA = "cppmega_ci_job_log_rescue_receipt_v1"
 PROGRESS_SCHEMA = "cppmega_ci_job_log_rescue_progress_v1"
 BINDING_SCHEMA = "cppmega_ci_job_log_rescue_binding_v1"
+LEDGER_EVIDENCE_SCHEMA = JOB_RESCUE_LEDGER_EVIDENCE_SCHEMA
 
 DEFAULT_TIMEOUT = 90.0
 DEFAULT_JOB_ATTEMPTS = 8
@@ -171,6 +207,14 @@ class SourceAttempt:
     @property
     def spool_base_name(self) -> str:
         return f"{self.repo.replace('/', '__')}--{self.run_id}--attempt-{self.attempt}"
+
+
+@dataclass(frozen=True)
+class StoredRescueAudit:
+    ledger_id: int
+    raw: str
+    format: str
+    evidence: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -304,6 +348,43 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _producer_binding() -> dict[str, str]:
+    binding = _current_job_rescue_producer_binding()
+    if (
+        binding.get("semantic_contract_sha256")
+        != JOB_RESCUE_SEMANTIC_CONTRACT_SHA256
+    ):
+        raise StateBindingError("job-rescue semantic contract drifted")
+    return binding
+
+
+def _receipt_source_state(source: SourceAttempt) -> dict[str, object]:
+    return {
+        "path": str(source.state_path),
+        "repo": source.repo,
+        "canonical_repo": source.canonical_repo,
+        "run_id": source.run_id,
+        "attempt": source.attempt,
+        "created_at": source.created_at,
+        "status": source.status,
+        "tries": source.tries,
+        "error_class": source.error_class,
+        "failed_raw_archive": {
+            "source": source.archive_source,
+            "sha256": source.archive_sha256,
+            "bytes": source.archive_size,
+            "preservation": "source fetcher artifact is not modified",
+        },
+        "attempt_row_sha256": source.row_sha256,
+        "run_metadata_sha256": source.run_metadata_sha256,
+        "run_metadata_raw_size": source.run_metadata_raw_size,
+        "jobs_sha256": source.jobs_sha256,
+        "jobs_raw_size": source.jobs_raw_size,
+        "jobs_ledger_sha256": source.jobs_ledger_sha256,
+        "jobs_ledger_ids": list(source.jobs_ledger_ids),
+    }
+
+
 def _safe_error(value: object, secrets: Iterable[str] = ()) -> str:
     text = str(value)
     for secret in secrets:
@@ -370,10 +451,6 @@ def _decode_canonical_blob(
         raise StateBindingError(f"failed attempt has no {label} evidence")
     if not isinstance(raw_blob, (bytes, bytearray, memoryview)):
         raise StateBindingError(f"{label} evidence is not a SQLite BLOB")
-    try:
-        raw = zlib.decompress(bytes(raw_blob))
-    except (TypeError, zlib.error) as exc:
-        raise StateBindingError(f"{label} evidence is not valid zlib") from exc
     expected_size = row[size_column]
     expected_digest = row[digest_column]
     if (
@@ -384,8 +461,25 @@ def _decode_canonical_blob(
         or _SHA256_RE.fullmatch(expected_digest) is None
     ):
         raise StateBindingError(f"{label} evidence metadata is invalid")
-    if len(raw) != expected_size or _sha256_bytes(raw) != expected_digest:
-        raise StateBindingError(f"{label} evidence digest/size mismatch")
+    if label == "run metadata":
+        max_raw_size = MAX_RUN_METADATA_BYTES
+        max_compressed_size = MAX_RUN_METADATA_COMPRESSED_BYTES
+    else:
+        max_raw_size = MAX_JOBS_EVIDENCE_BYTES
+        max_compressed_size = MAX_JOBS_EVIDENCE_COMPRESSED_BYTES
+    try:
+        raw = strict_bounded_zlib_decode(
+            raw_blob,
+            expected_raw_size=expected_size,
+            expected_sha256=expected_digest,
+            max_raw_size=max_raw_size,
+            max_compressed_size=max_compressed_size,
+            where=f"{label} evidence",
+        )
+    except ZlibEvidenceError as exc:
+        raise StateBindingError(
+            f"{label} evidence is not exact bounded zlib"
+        ) from exc
     try:
         value = json.loads(raw)
     except (UnicodeError, json.JSONDecodeError) as exc:
@@ -527,38 +621,120 @@ class FetchStateEvidence:
     """Read and transactionally mutate only the explicitly named fetch state."""
 
     def __init__(self, path: str | os.PathLike[str]):
-        self.path = Path(path).expanduser().resolve()
-        if self.path.is_symlink() or not self.path.is_file():
+        raw_path = Path(path).expanduser()
+        self.path = Path(os.path.abspath(os.fspath(raw_path)))
+        self._lease_descriptor = -1
+        try:
+            initial = os.lstat(self.path)
+        except OSError as exc:
             raise StateBindingError(
                 f"fetch-state SQLite does not exist safely: {self.path}"
+            ) from exc
+        if stat.S_ISLNK(initial.st_mode) or not stat.S_ISREG(
+            initial.st_mode
+        ):
+            raise StateBindingError(
+                f"fetch-state SQLite path is a symlink or non-file: "
+                f"{self.path}"
             )
-        state_stat = self.path.stat(follow_symlinks=False)
-        self._file_identity = (state_stat.st_dev, state_stat.st_ino)
-        self.connection = sqlite3.connect(
-            f"{self.path.as_uri()}?mode=rw",
-            uri=True,
-            timeout=60.0,
-            isolation_level=None,
-            check_same_thread=False,
-        )
-        self.connection.row_factory = sqlite3.Row
-        self.connection.execute("PRAGMA busy_timeout=60000")
-        self.connection.execute("PRAGMA foreign_keys=ON")
-        self._lock = threading.RLock()
+        self._acquire_process_lease()
         try:
+            locked = os.lstat(self.path)
+        except OSError as exc:
+            self._release_process_lease()
+            raise StateBindingError(
+                "fetch-state SQLite disappeared before rescue lease"
+            ) from exc
+        if (
+            not stat.S_ISREG(locked.st_mode)
+            or (locked.st_dev, locked.st_ino)
+            != (initial.st_dev, initial.st_ino)
+        ):
+            self._release_process_lease()
+            raise StateBindingError(
+                "fetch-state SQLite identity changed before rescue lease"
+            )
+        guard_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        guard_flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            self._identity_guard_fd = os.open(self.path, guard_flags)
+        except OSError as exc:
+            self._release_process_lease()
+            raise StateBindingError(
+                f"fetch-state SQLite cannot be opened without following "
+                f"links: {self.path}"
+            ) from exc
+        guard_stat = os.fstat(self._identity_guard_fd)
+        self._file_identity = (guard_stat.st_dev, guard_stat.st_ino)
+        if (
+            not stat.S_ISREG(guard_stat.st_mode)
+            or self._file_identity != (initial.st_dev, initial.st_ino)
+        ):
+            os.close(self._identity_guard_fd)
+            self._identity_guard_fd = -1
+            self._release_process_lease()
+            raise StateBindingError(
+                "fetch-state SQLite identity changed during no-follow open"
+            )
+        try:
+            self.connection = sqlite3.connect(
+                f"{self.path.as_uri()}?mode=rw",
+                uri=True,
+                timeout=60.0,
+                isolation_level=None,
+                check_same_thread=False,
+            )
+            constrain_sqlite_evidence_rows(self.connection)
+            self.connection.row_factory = sqlite3.Row
+            self.connection.execute("PRAGMA busy_timeout=60000")
+            self.connection.execute("PRAGMA foreign_keys=ON")
+            self._lock = threading.RLock()
+            self._assert_file_identity()
             self._validate_schema()
         except BaseException:
-            self.connection.close()
+            connection = getattr(self, "connection", None)
+            if connection is not None:
+                connection.close()
+            if self._identity_guard_fd >= 0:
+                os.close(self._identity_guard_fd)
+                self._identity_guard_fd = -1
+            self._release_process_lease()
             raise
+
+    def _acquire_process_lease(self) -> None:
+        try:
+            self._lease_descriptor = _acquire_fetch_state_process_lease(
+                self.path,
+                owner="job-log-rescue",
+            )
+        except FetchBindingError as exc:
+            raise StateBindingError(str(exc)) from exc
+
+    def _release_process_lease(self) -> None:
+        descriptor = getattr(self, "_lease_descriptor", -1)
+        if descriptor < 0:
+            return
+        self._lease_descriptor = -1
+        _release_fetch_state_process_lease(descriptor)
 
     def _assert_file_identity(self) -> None:
         try:
-            current = self.path.stat(follow_symlinks=False)
+            _validate_fetch_state_process_lease(
+                self._lease_descriptor,
+                state_path=self.path,
+            )
+        except FetchBindingError as exc:
+            raise StateBindingError(str(exc)) from exc
+        try:
+            current = os.lstat(self.path)
+            guarded = os.fstat(self._identity_guard_fd)
         except OSError as exc:
             raise StateBindingError("fetch-state SQLite path disappeared") from exc
         if (
             not stat.S_ISREG(current.st_mode)
             or (current.st_dev, current.st_ino) != self._file_identity
+            or not stat.S_ISREG(guarded.st_mode)
+            or (guarded.st_dev, guarded.st_ino) != self._file_identity
         ):
             raise StateBindingError("fetch-state SQLite path identity changed")
 
@@ -570,7 +746,7 @@ class FetchStateEvidence:
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
         }
-        required = {"settings", "attempts", "request_ledger"}
+        required = {"settings", "attempts", "members", "request_ledger"}
         if not required.issubset(tables):
             raise StateBindingError("fetch-state SQLite lacks required durable tables")
         settings = dict(self.connection.execute("SELECT key,value FROM settings"))
@@ -608,9 +784,52 @@ class FetchStateEvidence:
         }
         if not required_attempt_columns.issubset(attempt_columns):
             raise StateBindingError("fetch-state attempts schema is incompatible")
+        violation = fetch_state_evidence_bound_violation(self.connection)
+        if violation is not None:
+            record_type, repo, run_id, attempt, field = violation
+            raise StateBindingError(
+                "fetch-state evidence exceeds its versioned SQLite byte "
+                f"bounds: {record_type} {repo}#{run_id}/{attempt} {field}"
+            )
+
+    @contextmanager
+    def _read_snapshot(self) -> Iterator[None]:
+        self.connection.execute("BEGIN")
+        try:
+            yield
+            self.connection.execute("COMMIT")
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
+    def _require_bounded_attempt_evidence(
+        self,
+        identity: tuple[str, int, int],
+    ) -> None:
+        repo, run_id, attempt = identity
+        field = fetch_state_attempt_evidence_bound_violation(
+            self.connection,
+            repo=repo,
+            run_id=run_id,
+            attempt=attempt,
+        )
+        if field is not None:
+            raise StateBindingError(
+                "fetch-state attempt evidence exceeds its versioned SQLite "
+                f"byte bounds: {repo}#{run_id}/{attempt} {field}"
+            )
 
     def close(self) -> None:
-        self.connection.close()
+        try:
+            self.connection.close()
+        finally:
+            try:
+                if self._identity_guard_fd >= 0:
+                    os.close(self._identity_guard_fd)
+                    self._identity_guard_fd = -1
+            finally:
+                self._release_process_lease()
 
     def scan(
         self,
@@ -707,8 +926,9 @@ class FetchStateEvidence:
         explicit: bool,
     ) -> SourceAttempt:
         repo, run_id, attempt = identity
-        with self._lock:
+        with self._lock, self._read_snapshot():
             self._assert_file_identity()
+            self._require_bounded_attempt_evidence(identity)
             row = self.connection.execute(
                 """
                 SELECT * FROM attempts
@@ -912,15 +1132,34 @@ class FetchStateEvidence:
         source: SourceAttempt,
         *,
         receipt_sha256: str,
+        synthetic_zip_sha256: str,
+        synthetic_zip_bytes: int,
         publish: Callable[[], None],
     ) -> None:
-        audit_message = (
-            f"receipt_sha256={receipt_sha256} source_row_sha256={source.row_sha256}"
-        )
+        source_state = _receipt_source_state(source)
+        audit_message = _canonical_json_bytes(
+            {
+                "schema": LEDGER_EVIDENCE_SCHEMA,
+                "producer_lineage": _producer_lineage(
+                    _producer_binding()
+                ),
+                "receipt_sha256": receipt_sha256,
+                "source_row_sha256": source.row_sha256,
+                "source_state_sha256": _sha256_bytes(
+                    _canonical_json_bytes(source_state)
+                ),
+                "synthetic_zip": {
+                    "sha256": synthetic_zip_sha256,
+                    "bytes": synthetic_zip_bytes,
+                },
+                "jobs_ledger_sha256": source.jobs_ledger_sha256,
+            }
+        ).decode("utf-8")
         with self._lock:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
                 self._assert_file_identity()
+                self._require_bounded_attempt_evidence(source.identity)
                 current = self.connection.execute(
                     """
                     SELECT * FROM attempts
@@ -993,8 +1232,8 @@ class FetchStateEvidence:
     def completed_rescue_audit(
         self,
         identity: tuple[str, int, int],
-    ) -> tuple[str, str] | None:
-        """Return the bound receipt/source digests for an earlier requeue."""
+    ) -> StoredRescueAudit | None:
+        """Return exact durable audit bytes for an earlier requeue."""
 
         with self._lock:
             self._assert_file_identity()
@@ -1009,7 +1248,7 @@ class FetchStateEvidence:
                 return None
             audit = self.connection.execute(
                 """
-                SELECT error_message FROM request_ledger
+                SELECT id,error_message FROM request_ledger
                 WHERE repo=? AND run_id=? AND attempt=?
                   AND endpoint='operator/job_rescue'
                   AND outcome='operator/job_rescue'
@@ -1020,14 +1259,174 @@ class FetchStateEvidence:
             ).fetchone()
         if audit is None or not isinstance(audit["error_message"], str):
             return None
-        match = re.fullmatch(
-            r"receipt_sha256=([0-9a-f]{64}) "
-            r"source_row_sha256=([0-9a-f]{64})",
-            str(audit["error_message"]),
+        raw = str(audit["error_message"])
+        try:
+            evidence = json.loads(raw)
+        except json.JSONDecodeError:
+            match = re.fullmatch(
+                r"receipt_sha256=([0-9a-f]{64}) "
+                r"source_row_sha256=([0-9a-f]{64})",
+                raw,
+            )
+            if match is None:
+                raise StateBindingError(
+                    "legacy job-rescue audit encoding is invalid"
+                )
+            return StoredRescueAudit(
+                ledger_id=int(audit["id"]),
+                raw=raw,
+                format="legacy-v1",
+                evidence={
+                    "receipt_sha256": match.group(1),
+                    "source_row_sha256": match.group(2),
+                },
+            )
+        if (
+            not isinstance(evidence, dict)
+            or _canonical_json_bytes(evidence).decode("utf-8")
+            != raw
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(evidence.get("receipt_sha256")),
+            )
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(evidence.get("source_row_sha256")),
+            )
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(evidence.get("source_state_sha256")),
+            )
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(evidence.get("jobs_ledger_sha256")),
+            )
+            is None
+            or not isinstance(evidence.get("synthetic_zip"), dict)
+            or set(evidence["synthetic_zip"]) != {"sha256", "bytes"}
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(evidence["synthetic_zip"].get("sha256")),
+            )
+            is None
+            or isinstance(evidence["synthetic_zip"].get("bytes"), bool)
+            or not isinstance(evidence["synthetic_zip"].get("bytes"), int)
+            or int(evidence["synthetic_zip"]["bytes"]) <= 0
+        ):
+            raise StateBindingError(
+                "job-rescue audit evidence is malformed"
+            )
+        schema = evidence.get("schema")
+        if schema == JOB_RESCUE_LEDGER_EVIDENCE_LEGACY_SCHEMA:
+            expected_fields = {
+                "schema",
+                "producer_binding",
+                "receipt_sha256",
+                "source_row_sha256",
+                "source_state_sha256",
+                "synthetic_zip",
+                "jobs_ledger_sha256",
+            }
+            if set(evidence) != expected_fields:
+                raise StateBindingError(
+                    "legacy job-rescue JSON audit shape is invalid"
+                )
+            _validated_producer_binding(
+                evidence.get("producer_binding"),
+                source="legacy job-rescue audit",
+            )
+            audit_format = "ledger-v2"
+        elif schema == LEDGER_EVIDENCE_SCHEMA:
+            expected_fields = {
+                "schema",
+                "producer_lineage",
+                "receipt_sha256",
+                "source_row_sha256",
+                "source_state_sha256",
+                "synthetic_zip",
+                "jobs_ledger_sha256",
+            }
+            if set(evidence) != expected_fields:
+                raise StateBindingError(
+                    "current job-rescue audit shape is invalid"
+                )
+            _parsed_producer_lineage(evidence.get("producer_lineage"))
+            audit_format = "ledger-v3"
+        else:
+            raise StateBindingError(
+                "job-rescue audit schema is unsupported"
+            )
+        return StoredRescueAudit(
+            ledger_id=int(audit["id"]),
+            raw=raw,
+            format=audit_format,
+            evidence=dict(evidence),
         )
-        if match is None:
-            return None
-        return match.group(1), match.group(2)
+
+    def append_rescue_audit_migration(
+        self,
+        identity: tuple[str, int, int],
+        *,
+        prior: StoredRescueAudit,
+        evidence: Mapping[str, object],
+    ) -> None:
+        encoded = _canonical_json_bytes(evidence).decode("utf-8")
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._assert_file_identity()
+                attempt = self.connection.execute(
+                    """
+                    SELECT status FROM attempts
+                    WHERE repo=? AND run_id=? AND attempt=?
+                    """,
+                    identity,
+                ).fetchone()
+                latest = self.connection.execute(
+                    """
+                    SELECT id,error_message FROM request_ledger
+                    WHERE repo=? AND run_id=? AND attempt=?
+                      AND endpoint='operator/job_rescue'
+                      AND outcome='operator/job_rescue'
+                      AND error_class='JobRescueReceipt'
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    identity,
+                ).fetchone()
+                if (
+                    attempt is None
+                    or str(attempt["status"]) == "failed"
+                    or latest is None
+                    or int(latest["id"]) != prior.ledger_id
+                    or str(latest["error_message"]) != prior.raw
+                ):
+                    raise StateBindingError(
+                        "job-rescue audit changed during lineage migration"
+                    )
+                self.connection.execute(
+                    """
+                    INSERT INTO request_ledger(
+                      requested_at,repo,run_id,attempt,endpoint,page_no,
+                      request_attempt,http_status,outcome,latency_ms,
+                      error_class,error_message
+                    ) VALUES (?,?,?,?,?,NULL,1,NULL,?,0,?,?)
+                    """,
+                    (
+                        _utc_now(),
+                        *identity,
+                        "operator/job_rescue",
+                        "operator/job_rescue",
+                        "JobRescueReceipt",
+                        encoded,
+                    ),
+                )
+                self.connection.execute("COMMIT")
+            except BaseException:
+                self.connection.execute("ROLLBACK")
+                raise
 
 
 class JobLogClient:
@@ -1459,11 +1858,35 @@ class JobLogRescueWorker:
         opener: Callable[..., Any] = _default_opener,
         sleeper: Callable[[float], None] = time.sleep,
         before_publish: Callable[[SourceAttempt], None] | None = None,
+        allow_producer_upgrade_from_sha256: str | None = None,
+        producer_upgrade_reason: str | None = None,
     ):
         if workers <= 0:
             raise ValueError("workers must be positive")
         if max_total_bytes < 0 or max_zip_bytes < 0:
             raise ValueError("byte limits must be non-negative")
+        if (
+            allow_producer_upgrade_from_sha256 is None
+        ) != (producer_upgrade_reason is None):
+            raise ValueError(
+                "producer upgrade requires both source SHA-256 and reason"
+            )
+        if allow_producer_upgrade_from_sha256 is not None and (
+            re.fullmatch(
+                r"[0-9a-f]{64}",
+                allow_producer_upgrade_from_sha256,
+            )
+            is None
+            or not isinstance(producer_upgrade_reason, str)
+            or not 1 <= len(producer_upgrade_reason) <= 200
+            or any(
+                ord(char) < 32 or ord(char) == 127
+                for char in producer_upgrade_reason
+            )
+        ):
+            raise ValueError(
+                "producer upgrade source/reason authorization is invalid"
+            )
         self.state = FetchStateEvidence(state_path)
         try:
             self.work_dir = Path(work_dir).expanduser().resolve()
@@ -1490,6 +1913,10 @@ class JobLogRescueWorker:
             )
             self.sleeper = sleeper
             self.before_publish = before_publish
+            self.allow_producer_upgrade_from_sha256 = (
+                allow_producer_upgrade_from_sha256
+            )
+            self.producer_upgrade_reason = producer_upgrade_reason
         except BaseException:
             self.state.close()
             raise
@@ -1762,6 +2189,7 @@ class JobLogRescueWorker:
                         "ordinal": job.ordinal,
                         "job_id": job.job_id,
                         "job_name": job.name,
+                        "endpoint": job.endpoint,
                         "member_name": record["member_name"],
                         "outcome": record["outcome"],
                         "api_http_status": record["api_http_status"],
@@ -1873,30 +2301,8 @@ class JobLogRescueWorker:
         return {
             "schema": RECEIPT_SCHEMA,
             "completed_at": completed_at,
-            "source_state": {
-                "path": str(source.state_path),
-                "repo": source.repo,
-                "canonical_repo": source.canonical_repo,
-                "run_id": source.run_id,
-                "attempt": source.attempt,
-                "created_at": source.created_at,
-                "status": source.status,
-                "tries": source.tries,
-                "error_class": source.error_class,
-                "failed_raw_archive": {
-                    "source": source.archive_source,
-                    "sha256": source.archive_sha256,
-                    "bytes": source.archive_size,
-                    "preservation": "source fetcher artifact is not modified",
-                },
-                "attempt_row_sha256": source.row_sha256,
-                "run_metadata_sha256": source.run_metadata_sha256,
-                "run_metadata_raw_size": source.run_metadata_raw_size,
-                "jobs_sha256": source.jobs_sha256,
-                "jobs_raw_size": source.jobs_raw_size,
-                "jobs_ledger_sha256": source.jobs_ledger_sha256,
-                "jobs_ledger_ids": list(source.jobs_ledger_ids),
-            },
+            "producer_binding": _producer_binding(),
+            "source_state": _receipt_source_state(source),
             "coverage": {
                 "expected_jobs": len(source.jobs),
                 "resolved_jobs": len(records),
@@ -2196,6 +2602,8 @@ class JobLogRescueWorker:
         self.state.commit_rescue(
             source,
             receipt_sha256=receipt_sha,
+            synthetic_zip_sha256=_zip_sha,
+            synthetic_zip_bytes=_zip_size,
             publish=lambda: self._publish(
                 source,
                 receipt_path=receipt_path,
@@ -2224,7 +2632,8 @@ class JobLogRescueWorker:
         audit = self.state.completed_rescue_audit(identity)
         if audit is None:
             return None
-        receipt_sha, source_row_sha = audit
+        receipt_sha = str(audit.evidence["receipt_sha256"])
+        source_row_sha = str(audit.evidence["source_row_sha256"])
         repo, run_id, attempt = identity
         base = f"{repo.replace('/', '__')}--{run_id}--attempt-{attempt}"
         receipt_path = self.rescue_spool / f"{base}.receipt.json"
@@ -2255,15 +2664,29 @@ class JobLogRescueWorker:
             receipt = json.loads(receipt_raw)
         except (UnicodeError, json.JSONDecodeError) as exc:
             raise StateBindingError("prior job-rescue receipt is not JSON") from exc
+        current_receipt_fields = {
+            "schema",
+            "completed_at",
+            "producer_binding",
+            "source_state",
+            "coverage",
+            "artifacts",
+        }
+        legacy_receipt_fields = current_receipt_fields - {
+            "producer_binding"
+        }
         if (
             not isinstance(receipt, dict)
             or receipt_raw != _canonical_json_bytes(receipt) + b"\n"
+            or set(receipt)
+            not in (current_receipt_fields, legacy_receipt_fields)
         ):
             raise StateBindingError("prior job-rescue receipt encoding is invalid")
         source_value = receipt.get("source_state")
         artifacts = receipt.get("artifacts")
         if (
             receipt.get("schema") != RECEIPT_SCHEMA
+            or not _is_canonical_utc_timestamp(receipt.get("completed_at"))
             or not isinstance(source_value, dict)
             or source_value.get("attempt_row_sha256") != source_row_sha
             or source_value.get("repo") != repo
@@ -2274,10 +2697,74 @@ class JobLogRescueWorker:
             or not isinstance(artifacts.get("resolved_jobs"), dict)
         ):
             raise StateBindingError("prior job-rescue receipt binding changed")
+        raw_receipt_binding = receipt.get("producer_binding")
+        if raw_receipt_binding is not None:
+            try:
+                artifact_binding = _validated_producer_binding(
+                    raw_receipt_binding,
+                    source="prior job-rescue receipt",
+                )
+            except FetchBindingError as exc:
+                raise StateBindingError(str(exc)) from exc
+        elif audit.format == "ledger-v3":
+            try:
+                artifact_binding, _current, _upgrades = (
+                    _parsed_producer_lineage(
+                        audit.evidence.get("producer_lineage")
+                    )
+                )
+            except FetchBindingError as exc:
+                raise StateBindingError(str(exc)) from exc
+            if (
+                artifact_binding["semantic_contract_sha256"]
+                != JOB_RESCUE_LEGACY_SEMANTIC_CONTRACT_SHA256
+            ):
+                raise StateBindingError(
+                    "legacy job-rescue receipt has no legacy producer "
+                    "lineage"
+                )
+        elif audit.format == "ledger-v2":
+            try:
+                artifact_binding = _validated_producer_binding(
+                    audit.evidence.get("producer_binding"),
+                    source="legacy job-rescue audit",
+                )
+            except FetchBindingError as exc:
+                raise StateBindingError(str(exc)) from exc
+        else:
+            prior_sha = self.allow_producer_upgrade_from_sha256
+            if prior_sha is None:
+                raise StateBindingError(
+                    "explicit producer upgrade authorization must name the "
+                    "legacy job-rescue script SHA-256"
+                )
+            artifact_binding = {
+                "script_sha256": prior_sha,
+                "semantic_contract_sha256": (
+                    JOB_RESCUE_LEGACY_SEMANTIC_CONTRACT_SHA256
+                ),
+            }
+        if raw_receipt_binding is not None and audit.format == "ledger-v2":
+            try:
+                legacy_audit_binding = _validated_producer_binding(
+                    audit.evidence.get("producer_binding"),
+                    source="legacy job-rescue audit",
+                )
+            except FetchBindingError as exc:
+                raise StateBindingError(str(exc)) from exc
+            if legacy_audit_binding != artifact_binding:
+                raise StateBindingError(
+                    "legacy job-rescue audit/receipt producer differs"
+                )
         zip_value = artifacts["synthetic_zip"]
-        if zip_value.get("bytes") != zip_path.stat().st_size or zip_value.get(
-            "sha256"
-        ) != _sha256_file(zip_path):
+        current_zip = {
+            "sha256": _sha256_file(zip_path),
+            "bytes": zip_path.stat().st_size,
+        }
+        if (
+            zip_value.get("bytes") != current_zip["bytes"]
+            or zip_value.get("sha256") != current_zip["sha256"]
+        ):
             raise StateBindingError("prior synthetic ZIP changed")
         resolved_path = self.rescue_spool / f"{base}.resolved_jobs.jsonl"
         resolved_value = artifacts["resolved_jobs"]
@@ -2288,6 +2775,60 @@ class JobLogRescueWorker:
             or resolved_value.get("sha256") != _sha256_file(resolved_path)
         ):
             raise StateBindingError("prior resolved-jobs evidence changed")
+        if audit.format == "ledger-v3":
+            prior_lineage: object = audit.evidence.get(
+                "producer_lineage"
+            )
+        elif audit.format == "ledger-v2":
+            prior_lineage = _producer_lineage(artifact_binding)
+        else:
+            prior_lineage = _producer_lineage(artifact_binding)
+        try:
+            producer_lineage = _authorize_producer_lineage_upgrade(
+                prior_lineage,
+                current_binding=_producer_binding(),
+                allow_from_sha256=(
+                    self.allow_producer_upgrade_from_sha256
+                ),
+                reason=self.producer_upgrade_reason,
+                authorized_at=_utc_now(),
+            )
+            _validate_producer_lineage(
+                producer_lineage,
+                artifact_binding=artifact_binding,
+                current_binding=_producer_binding(),
+            )
+        except (FetchBindingError, ValueError) as exc:
+            raise StateBindingError(str(exc)) from exc
+        migrated_evidence: dict[str, object] = {
+            "schema": LEDGER_EVIDENCE_SCHEMA,
+            "producer_lineage": producer_lineage,
+            "receipt_sha256": receipt_sha,
+            "source_row_sha256": source_row_sha,
+            "source_state_sha256": _sha256_bytes(
+                _canonical_json_bytes(source_value)
+            ),
+            "synthetic_zip": current_zip,
+            "jobs_ledger_sha256": source_value.get(
+                "jobs_ledger_sha256"
+            ),
+        }
+        if audit.format == "ledger-v3":
+            for field in (
+                "source_state_sha256",
+                "synthetic_zip",
+                "jobs_ledger_sha256",
+            ):
+                if audit.evidence.get(field) != migrated_evidence[field]:
+                    raise StateBindingError(
+                        "prior job-rescue ledger binding changed"
+                    )
+        if audit.evidence != migrated_evidence:
+            self.state.append_rescue_audit_migration(
+                identity,
+                prior=audit,
+                evidence=migrated_evidence,
+            )
         return {
             "status": "complete",
             "idempotent_replay": True,
@@ -2387,6 +2928,17 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_POLL_SECONDS,
     )
+    parser.add_argument(
+        "--allow-producer-upgrade-from-sha256",
+        help=(
+            "authorize an append-only producer-lineage upgrade from this "
+            "exact prior script SHA-256"
+        ),
+    )
+    parser.add_argument(
+        "--producer-upgrade-reason",
+        help="printable audit reason for an authorized producer upgrade",
+    )
     return parser
 
 
@@ -2433,6 +2985,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_job_bytes=args.max_job_bytes,
             max_total_bytes=args.max_total_bytes,
             max_zip_bytes=args.max_zip_bytes,
+            allow_producer_upgrade_from_sha256=(
+                args.allow_producer_upgrade_from_sha256
+            ),
+            producer_upgrade_reason=args.producer_upgrade_reason,
         )
         result = worker.run(
             target=target,

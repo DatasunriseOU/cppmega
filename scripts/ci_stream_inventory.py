@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import sys
 import tempfile
 import threading
@@ -35,18 +36,34 @@ import urllib.parse
 import urllib.request
 import zlib
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts.ci_zlib_evidence import (
+    MAX_RUN_METADATA_BYTES,
+    MAX_RUN_METADATA_COMPRESSED_BYTES,
+    ZlibEvidenceError,
+    strict_bounded_zlib_decode,
+)
+
 
 SCHEMA_VERSION = "cppmega_ci_stream_inventory_v3"
-RECEIPT_SCHEMA = "cppmega_ci_stream_inventory_receipt_v4"
+RECEIPT_SCHEMA = "cppmega_ci_stream_inventory_receipt_v5"
 PROGRESS_SCHEMA = "cppmega_ci_stream_inventory_progress_v3"
 PREVIOUS_SCHEMA_VERSION = "cppmega_ci_stream_inventory_v2"
 GITHUB_API_VERSION = "2022-11-28"
-DEFAULT_REPO_LIST = "../cppmega.mlx/outputs/pr_ingest/repo_list.json"
 DEFAULT_PER_PAGE = 100
 GITHUB_FILTER_LIMIT = 1000
 METADATA_ENCODING = "zlib6-canonical-json-utf8-v1"
 CONVERGENCE_MAX_PASSES = 64
 MAX_UPGRADE_REASON_CHARS = 1000
+MAX_INVENTORY_RECEIPT_BYTES = 128 * 1024 * 1024
+MAX_INVENTORY_SQLITE_ROW_BYTES = (
+    MAX_RUN_METADATA_COMPRESSED_BYTES
+    + MAX_RUN_METADATA_BYTES
+    + 256 * 1024
+)
 IMPORTED_UPGRADE_REASON = (
     "imported pre-v3 inventory producer upgrade audit record"
 )
@@ -89,6 +106,32 @@ class PaginationDrift(UnstableEnumerationError):
 
 class CompletionError(InventoryError):
     """The SQLite inventory cannot support a completion receipt."""
+
+
+def _constrain_inventory_connection(connection: sqlite3.Connection) -> int:
+    current = connection.getlimit(sqlite3.SQLITE_LIMIT_LENGTH)
+    if current > MAX_INVENTORY_SQLITE_ROW_BYTES:
+        connection.setlimit(
+            sqlite3.SQLITE_LIMIT_LENGTH,
+            MAX_INVENTORY_SQLITE_ROW_BYTES,
+        )
+    configured = connection.getlimit(sqlite3.SQLITE_LIMIT_LENGTH)
+    if configured > MAX_INVENTORY_SQLITE_ROW_BYTES:
+        raise InventoryError(
+            "inventory SQLite row length limit could not be constrained"
+        )
+    return configured
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 @dataclass(frozen=True)
@@ -137,6 +180,7 @@ class _TokenState:
 def _canonical_json(value: Any) -> str:
     return json.dumps(
         value,
+        allow_nan=False,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -147,8 +191,249 @@ def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _sha256_file(path: str | os.PathLike[str]) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while block := handle.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def _sha256_json(value: Any) -> str:
     return _sha256_bytes(_canonical_json(value).encode("utf-8"))
+
+
+def _require_canonical_utc(value: object, *, where: str) -> str:
+    if not isinstance(value, str):
+        raise CompletionError(f"{where} must be a canonical UTC timestamp")
+    try:
+        epoch = parse_utc_instant(value)
+    except ValueError as exc:
+        raise CompletionError(
+            f"{where} must be a canonical UTC timestamp"
+        ) from exc
+    if format_utc_instant(epoch) != value:
+        raise CompletionError(f"{where} must be a canonical UTC timestamp")
+    return value
+
+
+def _require_canonical_decimal(
+    value: object,
+    *,
+    where: str,
+    minimum: int = 0,
+) -> int:
+    if (
+        not isinstance(value, str)
+        or not value
+        or not value.isascii()
+        or not value.isdecimal()
+    ):
+        raise CompletionError(
+            f"{where} must be a canonical decimal integer"
+        )
+    parsed = int(value)
+    if parsed < minimum or str(parsed) != value:
+        raise CompletionError(
+            f"{where} must be a canonical decimal integer >= {minimum}"
+        )
+    return parsed
+
+
+def _require_exact_json(
+    actual: object,
+    expected: object,
+    *,
+    where: str,
+) -> None:
+    """Require exact JSON shape, scalar type, and value equality."""
+
+    if type(actual) is not type(expected):
+        raise CompletionError(f"{where} has the wrong JSON type")
+    if isinstance(expected, dict):
+        assert isinstance(actual, dict)
+        if set(actual) != set(expected):
+            raise CompletionError(f"{where} has extra/missing fields")
+        for key in expected:
+            _require_exact_json(
+                actual[key],
+                expected[key],
+                where=f"{where}.{key}",
+            )
+        return
+    if isinstance(expected, list):
+        assert isinstance(actual, list)
+        if len(actual) != len(expected):
+            raise CompletionError(f"{where} has the wrong item count")
+        for index, (actual_item, expected_item) in enumerate(
+            zip(actual, expected, strict=True)
+        ):
+            _require_exact_json(
+                actual_item,
+                expected_item,
+                where=f"{where}[{index}]",
+            )
+        return
+    if actual != expected:
+        raise CompletionError(f"{where} differs from SQLite")
+
+
+def _require_safe_checkpoint_sidecars(database: Path) -> None:
+    for suffix in ("-wal", "-journal"):
+        sidecar = Path(f"{database}{suffix}")
+        if sidecar.is_symlink():
+            raise CompletionError(
+                "inventory database has a non-empty/unsafe checkpoint "
+                f"sidecar: {sidecar.name}"
+            )
+        if sidecar.exists() and (
+            not sidecar.is_file() or sidecar.stat().st_size != 0
+        ):
+            raise CompletionError(
+                "inventory database has a non-empty/unsafe checkpoint "
+                f"sidecar: {sidecar.name}"
+            )
+    shm = Path(f"{database}-shm")
+    if shm.is_symlink() or (shm.exists() and not shm.is_file()):
+        raise CompletionError(
+            f"inventory database has an unsafe checkpoint sidecar: {shm.name}"
+        )
+
+
+def _read_bounded_regular_file(
+    path: Path,
+    *,
+    max_bytes: int,
+    where: str,
+) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise CompletionError(f"{where} is not a regular file")
+        if before.st_size > max_bytes:
+            raise CompletionError(
+                f"{where} exceeds its {max_bytes}-byte limit"
+            )
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            block = os.read(descriptor, min(1024 * 1024, remaining))
+            if not block:
+                raise CompletionError(f"{where} changed while it was read")
+            chunks.append(block)
+            remaining -= len(block)
+        if os.read(descriptor, 1):
+            raise CompletionError(f"{where} changed while it was read")
+        after = os.fstat(descriptor)
+        identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        if identity != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise CompletionError(f"{where} changed while it was read")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _copy_database_snapshot_once(
+    source: Path,
+    destination: Path,
+) -> tuple[int, str, tuple[int, int, int, int, int]]:
+    """Copy and hash one stable database identity in a single bounded pass."""
+
+    source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    source_flags |= getattr(os, "O_NOFOLLOW", 0)
+    source_descriptor = os.open(source, source_flags)
+    destination_descriptor = -1
+    try:
+        before = os.fstat(source_descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise CompletionError(
+                "inventory database snapshot source is not a regular file"
+            )
+        destination_descriptor = os.open(
+            destination,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        digest = hashlib.sha256()
+        copied = 0
+        while True:
+            block = os.read(source_descriptor, 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+            view = memoryview(block)
+            while view:
+                written = os.write(destination_descriptor, view)
+                if written <= 0:
+                    raise CompletionError(
+                        "inventory database snapshot write made no progress"
+                    )
+                view = view[written:]
+            copied += len(block)
+        os.fsync(destination_descriptor)
+        after = os.fstat(source_descriptor)
+        identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        if (
+            identity
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            or copied != before.st_size
+        ):
+            raise CompletionError(
+                "inventory database changed while its private snapshot "
+                "was copied"
+            )
+        path_after = source.lstat()
+        if (
+            not stat.S_ISREG(path_after.st_mode)
+            or identity
+            != (
+                path_after.st_dev,
+                path_after.st_ino,
+                path_after.st_size,
+                path_after.st_mtime_ns,
+                path_after.st_ctime_ns,
+            )
+        ):
+            raise CompletionError(
+                "inventory database path changed while its private snapshot "
+                "was copied"
+            )
+        return copied, digest.hexdigest(), identity
+    finally:
+        if destination_descriptor >= 0:
+            os.close(destination_descriptor)
+        os.close(source_descriptor)
 
 
 def _hash_lines(lines: Iterable[str]) -> str:
@@ -235,7 +520,7 @@ def _normalize_owner_repo(value: str) -> tuple[str, str]:
 
 
 def load_repo_scope(
-    path: str | os.PathLike[str] = DEFAULT_REPO_LIST,
+    path: str | os.PathLike[str],
     *,
     smoke: bool = False,
     max_repos: int | None = None,
@@ -951,29 +1236,386 @@ CREATE INDEX IF NOT EXISTS idx_request_ledger_window
     ON request_ledger(window_id, id);
 """
 
+_SQLITE_SCHEMA_OBJECT_TYPES = frozenset(
+    {"index", "table", "trigger", "view"}
+)
+_SQLITE_INTERNAL_SCHEMA_OBJECTS = frozenset(
+    {
+        (
+            "index",
+            "sqlite_autoindex_convergence_pass_pages_1",
+            "convergence_pass_pages",
+            None,
+        ),
+        (
+            "index",
+            "sqlite_autoindex_convergence_pass_runs_1",
+            "convergence_pass_runs",
+            None,
+        ),
+        (
+            "index",
+            "sqlite_autoindex_convergence_passes_1",
+            "convergence_passes",
+            None,
+        ),
+        (
+            "index",
+            "sqlite_autoindex_convergence_runs_1",
+            "convergence_runs",
+            None,
+        ),
+        (
+            "index",
+            "sqlite_autoindex_inventory_meta_1",
+            "inventory_meta",
+            None,
+        ),
+        (
+            "index",
+            "sqlite_autoindex_repos_1",
+            "repos",
+            None,
+        ),
+        (
+            "index",
+            "sqlite_autoindex_repos_2",
+            "repos",
+            None,
+        ),
+        (
+            "index",
+            "sqlite_autoindex_runs_1",
+            "runs",
+            None,
+        ),
+        (
+            "index",
+            "sqlite_autoindex_search_windows_1",
+            "search_windows",
+            None,
+        ),
+        (
+            "index",
+            "sqlite_autoindex_window_pages_1",
+            "window_pages",
+            None,
+        ),
+        (
+            "index",
+            "sqlite_autoindex_window_runs_1",
+            "window_runs",
+            None,
+        ),
+        (
+            "table",
+            "sqlite_sequence",
+            "sqlite_sequence",
+            "CREATE TABLE sqlite_sequence(name,seq)",
+        ),
+    }
+)
+
+
+def _sqlite_schema_rows(
+    conn: sqlite3.Connection,
+) -> tuple[tuple[str, str, str, str | None], ...]:
+    rows: list[tuple[str, str, str, str | None]] = []
+    for raw_row in conn.execute(
+        """
+        SELECT type,name,tbl_name,sql
+        FROM sqlite_schema
+        ORDER BY type,name,tbl_name,sql
+        """
+    ):
+        object_type, name, table_name, sql = tuple(raw_row)
+        if (
+            not isinstance(object_type, str)
+            or object_type not in _SQLITE_SCHEMA_OBJECT_TYPES
+            or not isinstance(name, str)
+            or not name
+            or not isinstance(table_name, str)
+            or not table_name
+            or (sql is not None and not isinstance(sql, str))
+        ):
+            raise CompletionError(
+                "inventory SQLite schema contains a malformed object"
+            )
+        row = (object_type, name, table_name, sql)
+        if name.startswith("sqlite_") and (
+            row not in _SQLITE_INTERNAL_SCHEMA_OBJECTS
+        ):
+            raise CompletionError(
+                "inventory SQLite schema contains an unauthorized internal "
+                f"object {object_type}:{name}"
+            )
+        rows.append(row)
+    return tuple(rows)
+
+
+def _build_expected_sqlite_schema_rows(
+) -> tuple[tuple[str, str, str, str | None], ...]:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(_SCHEMA_SQL)
+        rows = _sqlite_schema_rows(conn)
+    finally:
+        conn.close()
+    observed_internal = frozenset(
+        row for row in rows if row[1].startswith("sqlite_")
+    )
+    if observed_internal != _SQLITE_INTERNAL_SCHEMA_OBJECTS:
+        raise RuntimeError(
+            "versioned inventory schema internal-object policy is stale"
+        )
+    return rows
+
+
+_EXPECTED_SQLITE_SCHEMA_ROWS = _build_expected_sqlite_schema_rows()
+_EXPECTED_SQLITE_SCHEMA_SHA256 = _sha256_json(
+    [
+        {
+            "type": object_type,
+            "name": name,
+            "tbl_name": table_name,
+            "sql": sql,
+        }
+        for object_type, name, table_name, sql in _EXPECTED_SQLITE_SCHEMA_ROWS
+    ]
+)
+_EXPECTED_INVENTORY_META_KEYS = frozenset(
+    {
+        "schema",
+        "repo_list_path",
+        "repo_list_sha256",
+        "repo_scope_sha256",
+        "repo_count",
+        "original_repo_count",
+        "unresolved_count",
+        "start_epoch",
+        "end_epoch",
+        "start_utc",
+        "end_utc",
+        "script_sha256",
+        "metadata_encoding",
+        "smoke",
+        "max_repos",
+        "created_at",
+    }
+)
+_LOGICAL_TABLE_ORDER = (
+    ("inventory_meta", "key"),
+    ("inventory_upgrades", "id"),
+    ("inventory_binding_upgrades", "id"),
+    ("repos", "ordinal,repo_key"),
+    ("search_windows", "id"),
+    ("runs", "repo_key,run_id,run_attempt"),
+    ("window_runs", "window_id,repo_key,run_id,run_attempt"),
+    ("window_pages", "window_id,page_no"),
+    ("window_convergence", "window_id"),
+    ("convergence_passes", "window_id,pass_no"),
+    ("convergence_pass_pages", "window_id,pass_no,page_no"),
+    (
+        "convergence_runs",
+        "window_id,repo_key,run_id,run_attempt",
+    ),
+    (
+        "convergence_pass_runs",
+        "window_id,pass_no,repo_key,run_id,run_attempt",
+    ),
+    ("window_union_closures", "window_id"),
+    ("request_ledger", "id"),
+    ("sqlite_sequence", "name"),
+)
+_AUTOINCREMENT_TABLES = frozenset(
+    {
+        "inventory_upgrades",
+        "inventory_binding_upgrades",
+        "search_windows",
+        "request_ledger",
+    }
+)
+_REQUEST_OUTCOMES = frozenset(
+    {
+        "transport_retry",
+        "rate_limit_retry",
+        "server_retry",
+        "permanent_error",
+        "malformed",
+        "success",
+        "pagination_drift_split",
+        "pagination_drift_converge",
+        "window_error",
+    }
+)
+_REQUEST_SYNTHETIC_OUTCOMES = frozenset(
+    {
+        "pagination_drift_split",
+        "pagination_drift_converge",
+        "window_error",
+    }
+)
+_EXPECTED_SQLITE_TABLE_NAMES = frozenset(
+    row[1]
+    for row in _EXPECTED_SQLITE_SCHEMA_ROWS
+    if row[0] == "table"
+)
+if (
+    frozenset(table for table, _order_by in _LOGICAL_TABLE_ORDER)
+    != _EXPECTED_SQLITE_TABLE_NAMES
+):
+    raise RuntimeError(
+        "inventory logical-table coverage does not match the exact schema"
+    )
+
 
 class InventoryDB:
     """SQLite state and fail-closed completion validation."""
 
-    def __init__(self, path: str | os.PathLike[str]):
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        initialize_schema: bool = True,
+    ):
         self.path = str(Path(path).expanduser().resolve())
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._write_lock = threading.RLock()
-        conn = self.connect()
-        try:
-            conn.executescript(_SCHEMA_SQL)
-            conn.commit()
-        finally:
-            conn.close()
+        if initialize_schema:
+            database_path = Path(self.path)
+            existing = (
+                database_path.exists()
+                and database_path.stat().st_size > 0
+            )
+            conn = (
+                sqlite3.connect(self.path, timeout=60.0)
+                if existing
+                else self.connect()
+            )
+            try:
+                _constrain_inventory_connection(conn)
+                if existing:
+                    conn.execute("PRAGMA busy_timeout=60000")
+                    conn.execute("PRAGMA synchronous=FULL")
+                    conn.execute("PRAGMA foreign_keys=ON")
+                conn.executescript(_SCHEMA_SQL)
+                conn.commit()
+            finally:
+                conn.close()
 
-    def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=60.0)
+    def connect(
+        self,
+        *,
+        readonly: bool = False,
+        immutable: bool = False,
+    ) -> sqlite3.Connection:
+        if immutable and not readonly:
+            raise ValueError("immutable inventory connections are read-only")
+        if readonly:
+            uri = f"{Path(self.path).as_uri()}?mode=ro"
+            if immutable:
+                uri += "&immutable=1"
+            conn = sqlite3.connect(uri, uri=True, timeout=60.0)
+        else:
+            conn = sqlite3.connect(self.path, timeout=60.0)
+        try:
+            _constrain_inventory_connection(conn)
+        except BaseException:
+            conn.close()
+            raise
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=60000")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
+        if readonly:
+            conn.execute("PRAGMA query_only=ON")
+        else:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=FULL")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
+
+    def _freeze_for_receipt(self) -> None:
+        path = Path(self.path)
+        if path.is_symlink() or not path.is_file():
+            raise CompletionError(f"inventory database is missing or unsafe: {path}")
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(
+                path,
+                isolation_level=None,
+                timeout=5.0,
+            )
+            _constrain_inventory_connection(connection)
+            connection.execute("PRAGMA busy_timeout=5000")
+            mode_row = connection.execute("PRAGMA journal_mode").fetchone()
+            mode = "" if mode_row is None else str(mode_row[0]).lower()
+            if mode == "wal":
+                checkpoint = connection.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()
+                if (
+                    checkpoint is None
+                    or len(checkpoint) != 3
+                    or int(checkpoint[0]) != 0
+                ):
+                    raise CompletionError(
+                        f"inventory WAL checkpoint is busy: {checkpoint}"
+                    )
+                mode_row = connection.execute(
+                    "PRAGMA journal_mode=DELETE"
+                ).fetchone()
+                mode = "" if mode_row is None else str(mode_row[0]).lower()
+            if mode not in {"delete", "wal"}:
+                raise CompletionError(
+                    f"inventory journal mode is unsupported: {mode!r}"
+                )
+        except sqlite3.Error as exc:
+            raise CompletionError(
+                f"inventory database could not be frozen: {exc}"
+            ) from exc
+        finally:
+            if connection is not None:
+                connection.close()
+        if mode != "delete":
+            raise CompletionError(
+                "inventory database did not enter DELETE journal mode"
+            )
+        # The WAL was truncated and the DELETE transition obtained SQLite's
+        # exclusive journal-mode lock.  Only after that connection is closed is
+        # it safe to remove stale zero-WAL/SHM artifacts copied with a private
+        # merge destination.  Receipt hashing happens after this header change.
+        removed_sidecar = False
+        wal = Path(f"{path}-wal")
+        if wal.is_symlink():
+            raise CompletionError(
+                "inventory database checkpoint left an unsafe "
+                f"{wal.name}"
+            )
+        if wal.exists():
+            wal_stat = wal.stat()
+            if not wal.is_file() or wal_stat.st_size != 0:
+                raise CompletionError(
+                    "inventory database checkpoint left a non-empty/unsafe "
+                    f"{wal.name}"
+                )
+            wal.unlink()
+            removed_sidecar = True
+        journal = Path(f"{path}-journal")
+        if journal.exists() or journal.is_symlink():
+            raise CompletionError(
+                "inventory database checkpoint left an unsafe rollback "
+                f"journal: {journal.name}"
+            )
+        shm = Path(f"{path}-shm")
+        if shm.is_symlink() or (shm.exists() and not shm.is_file()):
+            raise CompletionError(
+                "inventory database checkpoint left an unsafe "
+                f"{shm.name}"
+            )
+        if shm.exists():
+            shm.unlink()
+            removed_sidecar = True
+        if removed_sidecar:
+            _fsync_directory(path.parent)
 
     @staticmethod
     def _meta(conn: sqlite3.Connection) -> dict[str, str]:
@@ -1475,8 +2117,18 @@ class InventoryDB:
         status = self._run_text(run, "status")
         conclusion = self._run_text(run, "conclusion")
         metadata_json = _canonical_json(run)
-        metadata_sha = _sha256_bytes(metadata_json.encode("utf-8"))
-        metadata_blob = zlib.compress(metadata_json.encode("utf-8"), level=6)
+        metadata_bytes = metadata_json.encode("utf-8")
+        if len(metadata_bytes) > MAX_RUN_METADATA_BYTES:
+            raise MalformedAPIError(
+                "workflow run metadata exceeds the versioned raw-byte limit"
+            )
+        metadata_sha = _sha256_bytes(metadata_bytes)
+        metadata_blob = zlib.compress(metadata_bytes, level=6)
+        if len(metadata_blob) > MAX_RUN_METADATA_COMPRESSED_BYTES:
+            raise MalformedAPIError(
+                "workflow run metadata exceeds the versioned compressed-byte "
+                "limit"
+            )
         normalized = {
             "repo_key": repo_key,
             "run_id": run_id,
@@ -2509,7 +3161,7 @@ class InventoryDB:
         ).fetchone()
 
     def progress(self) -> dict[str, Any]:
-        conn = self.connect()
+        conn = self.connect(readonly=True)
         try:
             conn.execute("BEGIN")
             meta = self._meta(conn)
@@ -2557,29 +3209,487 @@ class InventoryDB:
         finally:
             conn.close()
 
-    def _validate_and_digests(self) -> dict[str, Any]:
-        conn = self.connect()
+    @staticmethod
+    def _logical_table_ledgers(
+        conn: sqlite3.Connection,
+    ) -> list[dict[str, object]]:
+        ledgers: list[dict[str, object]] = []
+        for table, order_by in _LOGICAL_TABLE_ORDER:
+            table_info = list(
+                conn.execute(f'PRAGMA table_info("{table}")')
+            )
+            if not table_info:
+                raise CompletionError(
+                    f"inventory logical table {table!r} has no columns"
+                )
+            columns = [str(item["name"]) for item in table_info]
+            declared_types = {
+                str(item["name"]): str(item["type"]).upper()
+                for item in table_info
+            }
+            digest = hashlib.sha256()
+            digest.update(
+                _canonical_json(
+                    {
+                        "domain": (
+                            "cppmega-ci-inventory-complete-table-v1"
+                        ),
+                        "table": table,
+                        "columns": [
+                            {
+                                "name": str(item["name"]),
+                                "type": str(item["type"]).upper(),
+                                "notnull": int(item["notnull"]),
+                                "pk": int(item["pk"]),
+                            }
+                            for item in table_info
+                        ],
+                    }
+                ).encode("utf-8")
+            )
+            digest.update(b"\n")
+            selected_columns = ",".join(
+                f'"{column}"' for column in columns
+            )
+            row_count = 0
+            for row in conn.execute(
+                f'SELECT {selected_columns} FROM "{table}" '
+                f"ORDER BY {order_by}"
+            ):
+                digest.update(b"R")
+                for column in columns:
+                    value = row[column]
+                    declared_type = declared_types[column]
+                    if value is None:
+                        digest.update(b"N")
+                    elif type(value) is int:
+                        if declared_type not in {"", "INTEGER"}:
+                            raise CompletionError(
+                                f"{table}.{column} has INTEGER storage "
+                                f"under declared type {declared_type!r}"
+                            )
+                        raw = str(value).encode("ascii")
+                        digest.update(b"I")
+                        digest.update(len(raw).to_bytes(8, "big"))
+                        digest.update(raw)
+                    elif type(value) is str:
+                        if declared_type not in {"", "TEXT"}:
+                            raise CompletionError(
+                                f"{table}.{column} has TEXT storage under "
+                                f"declared type {declared_type!r}"
+                            )
+                        raw = value.encode("utf-8")
+                        digest.update(b"T")
+                        digest.update(len(raw).to_bytes(8, "big"))
+                        digest.update(raw)
+                    elif type(value) is bytes:
+                        if declared_type != "BLOB":
+                            raise CompletionError(
+                                f"{table}.{column} has BLOB storage under "
+                                f"declared type {declared_type!r}"
+                            )
+                        digest.update(b"B")
+                        digest.update(len(value).to_bytes(8, "big"))
+                        digest.update(hashlib.sha256(value).digest())
+                    else:
+                        raise CompletionError(
+                            f"{table}.{column} has unsupported SQLite "
+                            f"storage type {type(value).__name__}"
+                        )
+                    digest.update(b"\x1f")
+                digest.update(b"\n")
+                row_count += 1
+            ledgers.append(
+                {
+                    "table": table,
+                    "row_count": row_count,
+                    "sha256": digest.hexdigest(),
+                }
+            )
+        return ledgers
+
+    @staticmethod
+    def _validate_sqlite_sequence(conn: sqlite3.Connection) -> None:
+        sequence_rows = list(
+            conn.execute(
+                "SELECT name,seq FROM sqlite_sequence ORDER BY name"
+            )
+        )
+        observed: dict[str, int] = {}
+        for row in sequence_rows:
+            name = row["name"]
+            sequence = row["seq"]
+            if (
+                type(name) is not str
+                or name not in _AUTOINCREMENT_TABLES
+                or type(sequence) is not int
+                or sequence < 0
+            ):
+                raise CompletionError(
+                    "inventory SQLite sequence ledger is malformed or "
+                    "contains an unauthorized table"
+                )
+            if name in observed:
+                raise CompletionError(
+                    "inventory SQLite sequence ledger contains duplicate "
+                    f"table {name!r}"
+                )
+            observed[name] = sequence
+        expected: dict[str, int] = {}
+        for table in sorted(_AUTOINCREMENT_TABLES):
+            maximum = conn.execute(
+                f'SELECT MAX(id) FROM "{table}"'
+            ).fetchone()[0]
+            if maximum is not None:
+                if type(maximum) is not int or maximum < 1:
+                    raise CompletionError(
+                        f"inventory {table} primary-key maximum is invalid"
+                    )
+                expected[table] = maximum
+        if observed != expected:
+            raise CompletionError(
+                "inventory SQLite sequence ledger differs from exact "
+                f"table maxima: observed={observed}, expected={expected}"
+            )
+
+    def _validate_stored_run_projection(
+        self,
+        row: sqlite3.Row,
+        metadata_bytes: bytes,
+        *,
+        start_epoch: int,
+        end_epoch: int,
+        where: str,
+    ) -> None:
+        try:
+            metadata = json.loads(metadata_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CompletionError(
+                f"{where} metadata is not valid UTF-8 JSON: {exc}"
+            ) from exc
+        if not isinstance(metadata, dict):
+            raise CompletionError(f"{where} metadata root is not an object")
+        try:
+            canonical_metadata = _canonical_json(metadata).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise CompletionError(
+                f"{where} metadata is not canonical JSON: {exc}"
+            ) from exc
+        if canonical_metadata != metadata_bytes:
+            raise CompletionError(
+                f"{where} metadata bytes are not the exact canonical JSON"
+            )
+        try:
+            normalized, metadata_sha256, _identity = self._normalize_run(
+                str(row["repo_key"]),
+                metadata,
+                start_epoch=start_epoch,
+                end_epoch=end_epoch,
+            )
+        except InventoryError as exc:
+            raise CompletionError(
+                f"{where} metadata cannot reconstruct its stored "
+                f"projection: {exc}"
+            ) from exc
+        projection_columns = (
+            "repo_key",
+            "run_id",
+            "run_attempt",
+            "created_at",
+            "updated_at",
+            "run_started_at",
+            "status",
+            "conclusion",
+            "workflow_id",
+            "workflow_name",
+            "event",
+            "head_branch",
+            "head_sha",
+            "run_number",
+            "html_url",
+            "api_url",
+        )
+        for column in projection_columns:
+            if row[column] != normalized[column]:
+                raise CompletionError(
+                    f"{where}.{column} differs from its canonical decoded "
+                    "metadata projection"
+                )
+        if str(row["metadata_sha256"]) != metadata_sha256:
+            raise CompletionError(
+                f"{where}.metadata_sha256 differs from canonical metadata"
+            )
+        for column in (
+            "created_at",
+            "updated_at",
+            "run_started_at",
+            "first_seen_at",
+        ):
+            value = row[column]
+            if value is not None:
+                _require_canonical_utc(
+                    value,
+                    where=f"{where}.{column}",
+                )
+        head_sha = row["head_sha"]
+        if head_sha is not None and (
+            not isinstance(head_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
+        ):
+            raise CompletionError(
+                f"{where}.head_sha is not a lowercase 40-hex commit"
+            )
+
+    @staticmethod
+    def _validate_request_ledger(
+        conn: sqlite3.Connection,
+    ) -> int:
+        rows = conn.execute(
+            """
+            SELECT request.*,repo.canonical AS repo_canonical,
+                   window.repo_key AS window_repo_key
+            FROM request_ledger request
+            LEFT JOIN repos repo
+              ON repo.repo_key=request.repo_key
+            LEFT JOIN search_windows window
+              ON window.id=request.window_id
+            ORDER BY request.id
+            """
+        )
+        expected_id = 1
+        for row in rows:
+            request_id = int(row["id"])
+            if request_id != expected_id:
+                raise CompletionError(
+                    "inventory request ledger IDs are not exact and "
+                    "contiguous"
+                )
+            expected_id += 1
+            where = f"request_ledger[{request_id}]"
+            _require_canonical_utc(
+                row["requested_at"],
+                where=f"{where}.requested_at",
+            )
+            if (
+                row["repo_canonical"] is None
+                or row["window_repo_key"] is None
+                or row["repo_key"] != row["window_repo_key"]
+            ):
+                raise CompletionError(
+                    f"{where} is not bound to its repository window"
+                )
+            expected_endpoint = (
+                f"/repos/{row['repo_canonical']}/actions/runs"
+            )
+            if row["endpoint"] != expected_endpoint:
+                raise CompletionError(
+                    f"{where}.endpoint differs from its exact repository "
+                    "workflow-runs endpoint"
+                )
+            page_no = int(row["page_no"])
+            per_page = int(row["per_page"])
+            attempt = int(row["attempt"])
+            latency_ms = int(row["latency_ms"])
+            outcome = str(row["outcome"])
+            http_status = row["http_status"]
+            if (
+                page_no < 1
+                or per_page != DEFAULT_PER_PAGE
+                or attempt < 0
+                or latency_ms < 0
+                or outcome not in _REQUEST_OUTCOMES
+                or (
+                    http_status is not None
+                    and (
+                        type(http_status) is not int
+                        or not 100 <= http_status <= 599
+                    )
+                )
+            ):
+                raise CompletionError(
+                    f"{where} has an invalid page/attempt/status/outcome/"
+                    "latency domain"
+                )
+            error_class = row["error_class"]
+            error_message = row["error_message"]
+            if outcome == "success":
+                if (
+                    attempt < 1
+                    or http_status != 200
+                    or error_class is not None
+                    or error_message is not None
+                ):
+                    raise CompletionError(
+                        f"{where} success shape is invalid"
+                    )
+            else:
+                if (
+                    not isinstance(error_class, str)
+                    or not error_class
+                    or not isinstance(error_message, str)
+                ):
+                    raise CompletionError(
+                        f"{where} error evidence shape is invalid"
+                    )
+                if outcome in _REQUEST_SYNTHETIC_OUTCOMES:
+                    if (
+                        attempt != 0
+                        or http_status is not None
+                        or latency_ms != 0
+                    ):
+                        raise CompletionError(
+                            f"{where} synthetic recovery shape is invalid"
+                        )
+                elif attempt < 1:
+                    raise CompletionError(
+                        f"{where} API request attempt must be positive"
+                    )
+                if (
+                    outcome == "transport_retry"
+                    and http_status is not None
+                ):
+                    raise CompletionError(
+                        f"{where} transport retry cannot have HTTP status"
+                    )
+                if outcome == "rate_limit_retry" and http_status not in {
+                    403,
+                    429,
+                }:
+                    raise CompletionError(
+                        f"{where} rate-limit status is invalid"
+                    )
+                if outcome == "server_retry" and (
+                    http_status is None or http_status < 500
+                ):
+                    raise CompletionError(
+                        f"{where} server-retry status is invalid"
+                    )
+                if outcome == "malformed" and http_status != 200:
+                    raise CompletionError(
+                        f"{where} malformed-response status is invalid"
+                    )
+        return expected_id - 1
+
+    def _validate_and_digests(
+        self,
+        *,
+        immutable: bool = False,
+    ) -> dict[str, Any]:
+        conn = self.connect(readonly=True, immutable=immutable)
         try:
             # One SQLite read transaction makes every count and digest belong
             # to the same WAL snapshot, even if a separate process is still
             # writing request/page progress.
             conn.execute("BEGIN")
+            _constrain_inventory_connection(conn)
+            sqlite_schema_rows = _sqlite_schema_rows(conn)
+            if sqlite_schema_rows != _EXPECTED_SQLITE_SCHEMA_ROWS:
+                expected_by_identity = {
+                    (row[0], row[1]): row
+                    for row in _EXPECTED_SQLITE_SCHEMA_ROWS
+                }
+                actual_by_identity = {
+                    (row[0], row[1]): row
+                    for row in sqlite_schema_rows
+                }
+                missing = sorted(
+                    set(expected_by_identity) - set(actual_by_identity)
+                )
+                extra = sorted(
+                    set(actual_by_identity) - set(expected_by_identity)
+                )
+                altered = sorted(
+                    identity
+                    for identity in (
+                        set(expected_by_identity) & set(actual_by_identity)
+                    )
+                    if (
+                        expected_by_identity[identity]
+                        != actual_by_identity[identity]
+                    )
+                )
+                raise CompletionError(
+                    "inventory SQLite schema differs from the exact "
+                    "versioned contract "
+                    f"(missing={missing}, extra={extra}, altered={altered})"
+                )
+            for table, identity_columns in (
+                ("runs", "repo_key,run_id,run_attempt"),
+                (
+                    "convergence_runs",
+                    "window_id,repo_key,run_id,run_attempt",
+                ),
+            ):
+                invalid_blob = conn.execute(
+                    f"""
+                    SELECT {identity_columns},
+                           typeof(metadata_blob) AS blob_type,
+                           length(metadata_blob) AS compressed_bytes
+                    FROM {table}
+                    WHERE typeof(metadata_blob)!='blob'
+                       OR length(metadata_blob)>?
+                    LIMIT 1
+                    """,
+                    (MAX_RUN_METADATA_COMPRESSED_BYTES,),
+                ).fetchone()
+                if invalid_blob is not None:
+                    raise CompletionError(
+                        f"{table} metadata BLOB exceeds the versioned "
+                        "compressed-byte bound or is not a BLOB"
+                    )
+            integrity_cursor = conn.execute("PRAGMA integrity_check")
+            integrity_first = integrity_cursor.fetchone()
+            integrity_second = integrity_cursor.fetchone()
+            if (
+                integrity_first is None
+                or tuple(integrity_first) != ("ok",)
+                or integrity_second is not None
+            ):
+                details = (
+                    []
+                    if integrity_first is None
+                    else [str(integrity_first[0])]
+                )
+                if integrity_second is not None:
+                    details.append(str(integrity_second[0]))
+                raise CompletionError(
+                    "inventory SQLite integrity check failed: "
+                    + ("; ".join(details) if details else "no result")
+                )
+            foreign_key_violation = conn.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchone()
+            if foreign_key_violation is not None:
+                raise CompletionError(
+                    "inventory SQLite foreign-key check failed: "
+                    f"{tuple(foreign_key_violation)!r}"
+                )
+            self._validate_sqlite_sequence(conn)
+            logical_table_ledgers = self._logical_table_ledgers(conn)
+            invalid_meta_storage = conn.execute(
+                """
+                SELECT key,typeof(key) AS key_type,
+                       typeof(value) AS value_type
+                FROM inventory_meta
+                WHERE typeof(key)!='text' OR typeof(value)!='text'
+                LIMIT 1
+                """
+            ).fetchone()
+            if invalid_meta_storage is not None:
+                raise CompletionError(
+                    "inventory metadata keys and values must use exact TEXT "
+                    "SQLite storage"
+                )
             meta = self._meta(conn)
-            required_meta = {
-                "schema",
-                "repo_list_sha256",
-                "repo_scope_sha256",
-                "repo_count",
-                "unresolved_count",
-                "start_epoch",
-                "end_epoch",
-                "script_sha256",
-                "metadata_encoding",
-                "smoke",
-            }
-            missing = sorted(required_meta - meta.keys())
-            if missing:
-                raise CompletionError(f"database metadata missing: {missing}")
+            if set(meta) != _EXPECTED_INVENTORY_META_KEYS:
+                missing = sorted(
+                    _EXPECTED_INVENTORY_META_KEYS - set(meta)
+                )
+                extra = sorted(set(meta) - _EXPECTED_INVENTORY_META_KEYS)
+                raise CompletionError(
+                    "database metadata keys differ from the exact versioned "
+                    f"contract (missing={missing}, extra={extra})"
+                )
             if meta["schema"] != SCHEMA_VERSION:
                 raise CompletionError(f"unsupported database schema {meta['schema']!r}")
             if meta["metadata_encoding"] != METADATA_ENCODING:
@@ -2587,8 +3697,69 @@ class InventoryDB:
                     "database workflow-run metadata encoding does not match "
                     f"{METADATA_ENCODING}"
                 )
-            if int(meta["unresolved_count"]) != 0:
+            for key in (
+                "repo_list_sha256",
+                "repo_scope_sha256",
+                "script_sha256",
+            ):
+                if re.fullmatch(r"[0-9a-f]{64}", meta[key]) is None:
+                    raise CompletionError(
+                        f"database metadata {key} is not lowercase hex SHA-256"
+                    )
+            repo_count_binding = _require_canonical_decimal(
+                meta["repo_count"],
+                where="database metadata repo_count",
+                minimum=1,
+            )
+            original_repo_count = _require_canonical_decimal(
+                meta["original_repo_count"],
+                where="database metadata original_repo_count",
+                minimum=1,
+            )
+            unresolved_count = _require_canonical_decimal(
+                meta["unresolved_count"],
+                where="database metadata unresolved_count",
+            )
+            if unresolved_count != 0:
                 raise CompletionError("unresolved repository count is not zero")
+            if repo_count_binding > original_repo_count:
+                raise CompletionError(
+                    "database repository count exceeds its original scope"
+                )
+            if meta["smoke"] not in {"0", "1"}:
+                raise CompletionError(
+                    "database metadata smoke must be exactly '0' or '1'"
+                )
+            max_repos_text = meta["max_repos"]
+            if not max_repos_text:
+                if repo_count_binding != original_repo_count:
+                    raise CompletionError(
+                        "database metadata without max_repos must retain the "
+                        "full original repository scope"
+                    )
+            else:
+                max_repos = _require_canonical_decimal(
+                    max_repos_text,
+                    where="database metadata max_repos",
+                    minimum=1,
+                )
+                if (
+                    meta["smoke"] != "1"
+                    or repo_count_binding
+                    != min(max_repos, original_repo_count)
+                ):
+                    raise CompletionError(
+                        "database metadata max_repos is inconsistent with "
+                        "smoke mode and repository counts"
+                    )
+            if meta["smoke"] == "0" and max_repos_text:
+                raise CompletionError(
+                    "production inventory metadata cannot set max_repos"
+                )
+            _require_canonical_utc(
+                meta["created_at"],
+                where="database metadata created_at",
+            )
             legacy_upgrades = [
                 (
                     str(row["from_schema"]),
@@ -2634,17 +3805,68 @@ class InventoryDB:
                 )
                 for row in binding_upgrades
             ]
+            legacy_upgrade_ids = [
+                int(row[0])
+                for row in conn.execute(
+                    "SELECT id FROM inventory_upgrades ORDER BY id"
+                )
+            ]
+            binding_upgrade_ids = [
+                int(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT id FROM inventory_binding_upgrades
+                    ORDER BY id
+                    """
+                )
+            ]
+            expected_upgrade_ids = list(
+                range(1, len(binding_upgrades) + 1)
+            )
+            if (
+                legacy_upgrade_ids != expected_upgrade_ids
+                or binding_upgrade_ids != expected_upgrade_ids
+            ):
+                raise CompletionError(
+                    "inventory producer upgrade ledger IDs are not exact, "
+                    "contiguous, and paired"
+                )
             if legacy_upgrades != projected_upgrades:
                 raise CompletionError(
                     "inventory producer upgrade ledgers disagree"
                 )
             for index, upgrade in enumerate(binding_upgrades):
+                if (
+                    upgrade["from_schema"],
+                    upgrade["to_schema"],
+                ) not in {
+                    (
+                        "cppmega_ci_stream_inventory_v1",
+                        PREVIOUS_SCHEMA_VERSION,
+                    ),
+                    (
+                        "cppmega_ci_stream_inventory_v1",
+                        SCHEMA_VERSION,
+                    ),
+                    (PREVIOUS_SCHEMA_VERSION, SCHEMA_VERSION),
+                    (SCHEMA_VERSION, SCHEMA_VERSION),
+                }:
+                    raise CompletionError(
+                        f"inventory producer upgrade {index} has an "
+                        "unsupported schema transition"
+                    )
                 try:
                     _validate_upgrade_reason(upgrade["reason"])
                 except BindingError as exc:
                     raise CompletionError(
                         f"inventory producer upgrade {index} reason is invalid"
                     ) from exc
+                _require_canonical_utc(
+                    upgrade["upgraded_at"],
+                    where=(
+                        f"inventory producer upgrade {index} upgraded_at"
+                    ),
+                )
                 if index and (
                     binding_upgrades[index - 1]["to_schema"]
                     != upgrade["from_schema"]
@@ -2664,8 +3886,21 @@ class InventoryDB:
                     "inventory producer upgrade chain does not bind the "
                     "completed producer"
                 )
-            start = int(meta["start_epoch"])
-            end = int(meta["end_epoch"])
+            start = _require_canonical_decimal(
+                meta["start_epoch"],
+                where="database metadata start_epoch",
+            )
+            end = _require_canonical_decimal(
+                meta["end_epoch"],
+                where="database metadata end_epoch",
+            )
+            if (
+                meta["start_utc"] != format_utc_instant(start)
+                or meta["end_utc"] != format_utc_instant(end)
+            ):
+                raise CompletionError(
+                    "database UTC interval text differs from its epoch binding"
+                )
 
             repos = list(
                 conn.execute(
@@ -2675,11 +3910,27 @@ class InventoryDB:
                     """
                 )
             )
-            if len(repos) != int(meta["repo_count"]):
+            if len(repos) != repo_count_binding:
                 raise CompletionError("database repository count differs from binding")
+            for ordinal, repo in enumerate(repos):
+                owner = str(repo["owner"])
+                name = str(repo["name"])
+                canonical = str(repo["canonical"])
+                repo_key = str(repo["repo_key"])
+                if (
+                    int(repo["ordinal"]) != ordinal
+                    or _OWNER_REPO_RE.fullmatch(f"{owner}/{name}") is None
+                    or canonical != f"{owner}/{name}"
+                    or repo_key != canonical.casefold()
+                ):
+                    raise CompletionError(
+                        f"repository row {repo_key!r} violates its exact "
+                        "owner/name/canonical/ordinal identity"
+                    )
             scope_digest = _hash_lines(str(row["repo_key"]) for row in repos)
             if scope_digest != meta["repo_scope_sha256"]:
                 raise CompletionError("database repository scope digest mismatch")
+            request_count = self._validate_request_ledger(conn)
 
             unfinished = list(
                 conn.execute(
@@ -2754,10 +4005,67 @@ class InventoryDB:
             )
             by_repo: dict[str, list[sqlite3.Row]] = {}
             by_parent: dict[int, list[sqlite3.Row]] = {}
+            windows_by_id = {
+                int(row["id"]): row for row in all_windows
+            }
             for row in all_windows:
                 by_repo.setdefault(str(row["repo_key"]), []).append(row)
+                _require_canonical_utc(
+                    row["created_at"],
+                    where=f"search_windows[{row['id']}].created_at",
+                )
+                _require_canonical_utc(
+                    row["updated_at"],
+                    where=f"search_windows[{row['id']}].updated_at",
+                )
+                if (
+                    row["failure_class"] is not None
+                    or row["failure_message"] is not None
+                ):
+                    raise CompletionError(
+                        f"completed search window {row['id']} retains "
+                        "failure evidence"
+                    )
                 if row["parent_id"] is not None:
-                    by_parent.setdefault(int(row["parent_id"]), []).append(row)
+                    parent_id = int(row["parent_id"])
+                    parent = windows_by_id.get(parent_id)
+                    if (
+                        parent is None
+                        or parent["repo_key"] != row["repo_key"]
+                        or int(row["depth"]) != int(parent["depth"]) + 1
+                    ):
+                        raise CompletionError(
+                            f"search window {row['id']} has a cross-repository "
+                            "or depth-inconsistent parent"
+                        )
+                    by_parent.setdefault(parent_id, []).append(row)
+                elif int(row["depth"]) != 0:
+                    raise CompletionError(
+                        f"root search window {row['id']} has nonzero depth"
+                    )
+            nonleaf_payload = conn.execute(
+                """
+                SELECT window.id
+                FROM search_windows window
+                WHERE window.status!='done'
+                  AND (
+                    EXISTS (
+                      SELECT 1 FROM window_pages page
+                      WHERE page.window_id=window.id
+                    )
+                    OR EXISTS (
+                      SELECT 1 FROM window_runs member
+                      WHERE member.window_id=window.id
+                    )
+                  )
+                LIMIT 1
+                """
+            ).fetchone()
+            if nonleaf_payload is not None:
+                raise CompletionError(
+                    "non-leaf search window retains page or run payload: "
+                    f"{nonleaf_payload['id']}"
+                )
 
             leaf_ids: list[int] = []
             union_closure_lines: list[str] = []
@@ -2812,6 +4120,75 @@ class InventoryDB:
                             (window_id,),
                         )
                     )
+                    for page in pages:
+                        _require_canonical_utc(
+                            page["fetched_at"],
+                            where=(
+                                f"window_pages[{window_id},"
+                                f"{page['page_no']}].fetched_at"
+                            ),
+                        )
+                        for column in (
+                            "payload_sha256",
+                            "run_keys_sha256",
+                        ):
+                            if (
+                                re.fullmatch(
+                                    r"[0-9a-f]{64}",
+                                    str(page[column]),
+                                )
+                                is None
+                            ):
+                                raise CompletionError(
+                                    f"window page {window_id}:"
+                                    f"{page['page_no']} has invalid {column}"
+                                )
+                    members = list(
+                        conn.execute(
+                            """
+                            SELECT member.repo_key,member.run_id,
+                                   member.run_attempt,
+                                   member.metadata_sha256,
+                                   run.metadata_sha256 AS run_metadata_sha256,
+                                   run.created_at AS run_created_at
+                            FROM window_runs member
+                            JOIN runs run
+                              ON run.repo_key=member.repo_key
+                             AND run.run_id=member.run_id
+                             AND run.run_attempt=member.run_attempt
+                            WHERE member.window_id=?
+                            ORDER BY member.repo_key,member.run_id,
+                                     member.run_attempt
+                            """,
+                            (window_id,),
+                        )
+                    )
+                    if len(members) != total or any(
+                        member["repo_key"] != repo_key
+                        or member["metadata_sha256"]
+                        != member["run_metadata_sha256"]
+                        or not (
+                            leaf_start
+                            <= parse_utc_instant(
+                                _require_canonical_utc(
+                                    member["run_created_at"],
+                                    where=(
+                                        f"window_runs[{window_id},"
+                                        f"{member['repo_key']},"
+                                        f"{member['run_id']},"
+                                        f"{member['run_attempt']}]"
+                                        ".run_created_at"
+                                    ),
+                                )
+                            )
+                            < leaf_end
+                        )
+                        for member in members
+                    ):
+                        raise CompletionError(
+                            f"leaf window {window_id} run membership differs "
+                            "from its repository, total, or canonical metadata"
+                        )
                     union = conn.execute(
                         """
                         SELECT * FROM window_union_closures
@@ -2845,6 +4222,24 @@ class InventoryDB:
                                 f"leaf window {leaf['id']} has unstable "
                                 "total_count"
                             )
+                        for page in pages:
+                            page_no = int(page["page_no"])
+                            expected_items = (
+                                DEFAULT_PER_PAGE
+                                if page_no < expected_pages
+                                else total
+                                - DEFAULT_PER_PAGE * (expected_pages - 1)
+                            )
+                            if (
+                                int(page["item_count"]) != expected_items
+                                or int(page["distinct_item_count"])
+                                != expected_items
+                                or int(page["duplicate_item_count"]) != 0
+                            ):
+                                raise CompletionError(
+                                    f"ordinary leaf window {window_id} page "
+                                    f"{page_no} item accounting is invalid"
+                                )
                         stale_proof_rows = int(
                             conn.execute(
                                 """
@@ -2919,6 +4314,28 @@ class InventoryDB:
                         ] = {}
                         for proof_pass in passes:
                             pass_no = int(proof_pass["pass_no"])
+                            _require_canonical_utc(
+                                proof_pass["observed_at"],
+                                where=(
+                                    f"convergence_passes[{window_id},"
+                                    f"{pass_no}].observed_at"
+                                ),
+                            )
+                            for column in (
+                                "page_payload_set_sha256",
+                                "run_keys_sha256",
+                            ):
+                                if (
+                                    re.fullmatch(
+                                        r"[0-9a-f]{64}",
+                                        str(proof_pass[column]),
+                                    )
+                                    is None
+                                ):
+                                    raise CompletionError(
+                                        f"convergence pass {window_id}:"
+                                        f"{pass_no} has invalid {column}"
+                                    )
                             pass_raw = int(proof_pass["raw_item_count"])
                             pass_distinct = int(
                                 proof_pass["distinct_item_count"]
@@ -2961,6 +4378,22 @@ class InventoryDB:
                             page_lines: list[str] = []
                             for page in proof_pages:
                                 page_no = int(page["page_no"])
+                                for column in (
+                                    "payload_sha256",
+                                    "run_keys_sha256",
+                                ):
+                                    if (
+                                        re.fullmatch(
+                                            r"[0-9a-f]{64}",
+                                            str(page[column]),
+                                        )
+                                        is None
+                                    ):
+                                        raise CompletionError(
+                                            f"convergence page {window_id}:"
+                                            f"{pass_no}:{page_no} has "
+                                            f"invalid {column}"
+                                        )
                                 item_count = int(page["item_count"])
                                 page_distinct = int(
                                     page["distinct_item_count"]
@@ -3042,6 +4475,12 @@ class InventoryDB:
                                     int(member["run_id"]),
                                     int(member["run_attempt"]),
                                 )
+                                if key[0] != repo_key:
+                                    raise CompletionError(
+                                        f"union leaf window {leaf['id']} pass "
+                                        f"{pass_no} contains a cross-repository "
+                                        "run"
+                                    )
                                 metadata_sha256 = str(
                                     member["metadata_sha256"]
                                 )
@@ -3117,6 +4556,28 @@ class InventoryDB:
                                 f"union leaf window {leaf['id']} candidate "
                                 "count differs from total_count"
                             )
+                        _require_canonical_utc(
+                            union["closed_at"],
+                            where=(
+                                f"window_union_closures[{window_id}]"
+                                ".closed_at"
+                            ),
+                        )
+                        for column in (
+                            "pass_set_sha256",
+                            "run_keys_sha256",
+                        ):
+                            if (
+                                re.fullmatch(
+                                    r"[0-9a-f]{64}",
+                                    str(union[column]),
+                                )
+                                is None
+                            ):
+                                raise CompletionError(
+                                    f"union closure {window_id} has invalid "
+                                    f"{column}"
+                                )
                         candidate_digest = hashlib.sha256()
                         candidate_keys: set[
                             tuple[str, int, int]
@@ -3128,6 +4589,11 @@ class InventoryDB:
                                 int(candidate["run_attempt"]),
                             )
                             candidate_keys.add(candidate_key)
+                            if candidate_key[0] != repo_key:
+                                raise CompletionError(
+                                    f"union leaf window {leaf['id']} has a "
+                                    "cross-repository convergence candidate"
+                                )
                             observed_passes = observed_run_passes.get(
                                 candidate_key, []
                             )
@@ -3157,20 +4623,39 @@ class InventoryDB:
                                     "is not a BLOB"
                                 )
                             try:
-                                metadata_bytes = zlib.decompress(metadata_blob)
-                            except zlib.error as exc:
+                                metadata_bytes = strict_bounded_zlib_decode(
+                                    metadata_blob,
+                                    expected_raw_size=None,
+                                    expected_sha256=str(
+                                        candidate["metadata_sha256"]
+                                    ),
+                                    max_raw_size=MAX_RUN_METADATA_BYTES,
+                                    max_compressed_size=(
+                                        MAX_RUN_METADATA_COMPRESSED_BYTES
+                                    ),
+                                    where=(
+                                        f"union leaf window {leaf['id']} "
+                                        "metadata"
+                                    ),
+                                )
+                            except ZlibEvidenceError as exc:
                                 raise CompletionError(
                                     f"union leaf window {leaf['id']} metadata "
                                     f"is corrupt: {exc}"
                                 ) from exc
+                            self._validate_stored_run_projection(
+                                candidate,
+                                metadata_bytes,
+                                start_epoch=start,
+                                end_epoch=end,
+                                where=(
+                                    "convergence_runs["
+                                    f"{window_id},{candidate['repo_key']},"
+                                    f"{candidate['run_id']},"
+                                    f"{candidate['run_attempt']}]"
+                                ),
+                            )
                             metadata_sha256 = _sha256_bytes(metadata_bytes)
-                            if metadata_sha256 != str(
-                                candidate["metadata_sha256"]
-                            ):
-                                raise CompletionError(
-                                    f"union leaf window {leaf['id']} metadata "
-                                    "digest mismatch"
-                                )
                             candidate_digest.update(
                                 (
                                     f"{candidate['repo_key']}\t"
@@ -3183,6 +4668,29 @@ class InventoryDB:
                             raise CompletionError(
                                 f"union leaf window {leaf['id']} pass "
                                 "membership and candidate sets disagree"
+                            )
+                        candidate_member_rows = {
+                            (
+                                str(candidate["repo_key"]),
+                                int(candidate["run_id"]),
+                                int(candidate["run_attempt"]),
+                                str(candidate["metadata_sha256"]),
+                            )
+                            for candidate in candidates
+                        }
+                        final_member_rows = {
+                            (
+                                str(member["repo_key"]),
+                                int(member["run_id"]),
+                                int(member["run_attempt"]),
+                                str(member["metadata_sha256"]),
+                            )
+                            for member in members
+                        }
+                        if candidate_member_rows != final_member_rows:
+                            raise CompletionError(
+                                f"union leaf window {leaf['id']} candidate "
+                                "and final member sets disagree"
                             )
                         candidate_sha256 = candidate_digest.hexdigest()
                         minimum_observations = min(
@@ -3236,14 +4744,7 @@ class InventoryDB:
                         + str(item["run_attempt"])
                         + "\t"
                         + str(item["metadata_sha256"])
-                        for item in conn.execute(
-                            """
-                            SELECT repo_key,run_id,run_attempt,metadata_sha256
-                            FROM window_runs WHERE window_id=?
-                            ORDER BY repo_key,run_id,run_attempt
-                            """,
-                            (window_id,),
-                        )
+                        for item in members
                     )
                     if actual_leaf_digest != str(leaf["run_keys_sha256"]):
                         raise CompletionError(
@@ -3272,6 +4773,18 @@ class InventoryDB:
                         raise CompletionError(
                             f"window {window_id} has nonterminal status "
                             f"{window['status']!r}"
+                        )
+                    if (
+                        window["expected_pages"] is not None
+                        or int(window["pages_done"]) != 0
+                        or int(window["raw_items"]) != 0
+                        or int(window["distinct_items"]) != 0
+                        or int(window["duplicate_items"]) != 0
+                        or window["run_keys_sha256"] is not None
+                    ):
+                        raise CompletionError(
+                            f"split window {window_id} retains leaf page/run "
+                            "accounting"
                         )
                     if len(children) != 2:
                         raise CompletionError(
@@ -3339,37 +4852,120 @@ class InventoryDB:
             if unlinked:
                 raise CompletionError(f"database contains {unlinked} unlinked runs")
 
+            duplicate_run = conn.execute(
+                """
+                SELECT repo_key,run_id,COUNT(*) AS versions
+                FROM runs
+                GROUP BY repo_key,run_id
+                HAVING COUNT(*) != 1
+                LIMIT 1
+                """
+            ).fetchone()
+            if duplicate_run is not None:
+                raise CompletionError(
+                    "inventory contains more than one attempt ceiling for a "
+                    "workflow run: "
+                    f"{duplicate_run['repo_key']}#{duplicate_run['run_id']}"
+                )
             run_count = int(conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0])
             run_digest = hashlib.sha256()
+            attempt_digest = hashlib.sha256()
+            expected_attempt_count = 0
+            repo_accumulators: dict[str, dict[str, Any]] = {
+                str(repo["repo_key"]): {
+                    "repo": str(repo["repo_key"]),
+                    "canonical": str(repo["canonical"]),
+                    "ordinal": int(repo["ordinal"]),
+                    "run_count": 0,
+                    "expected_attempt_count": 0,
+                    "_run_digest": hashlib.sha256(),
+                    "_attempt_digest": hashlib.sha256(),
+                }
+                for repo in repos
+            }
             for row in conn.execute(
                 """
-                SELECT repo_key,run_id,run_attempt,metadata_blob,metadata_sha256
+                SELECT *
                 FROM runs ORDER BY repo_key,run_id,run_attempt
                 """
             ):
+                run_attempt = int(row["run_attempt"])
+                if run_attempt < 1:
+                    raise CompletionError(
+                        f"run {row['repo_key']}#{row['run_id']} has a "
+                        "non-positive run_attempt"
+                    )
                 blob = row["metadata_blob"]
                 if not isinstance(blob, bytes):
                     raise CompletionError(
                         f"run {row['repo_key']}#{row['run_id']} metadata is not a BLOB"
                     )
                 try:
-                    metadata_bytes = zlib.decompress(blob)
-                except zlib.error as exc:
+                    metadata_bytes = strict_bounded_zlib_decode(
+                        blob,
+                        expected_raw_size=None,
+                        expected_sha256=str(row["metadata_sha256"]),
+                        max_raw_size=MAX_RUN_METADATA_BYTES,
+                        max_compressed_size=(
+                            MAX_RUN_METADATA_COMPRESSED_BYTES
+                        ),
+                        where=(
+                            f"run {row['repo_key']}#{row['run_id']} metadata"
+                        ),
+                    )
+                except ZlibEvidenceError as exc:
                     raise CompletionError(
                         f"run {row['repo_key']}#{row['run_id']} metadata is corrupt: "
                         f"{exc}"
                     ) from exc
+                self._validate_stored_run_projection(
+                    row,
+                    metadata_bytes,
+                    start_epoch=start,
+                    end_epoch=end,
+                    where=(
+                        f"runs[{row['repo_key']},{row['run_id']},"
+                        f"{row['run_attempt']}]"
+                    ),
+                )
                 actual_metadata_sha = _sha256_bytes(metadata_bytes)
-                if actual_metadata_sha != str(row["metadata_sha256"]):
-                    raise CompletionError(
-                        f"run {row['repo_key']}#{row['run_id']} metadata digest mismatch"
-                    )
                 line = (
-                    f"{row['repo_key']}\t{row['run_id']}\t{row['run_attempt']}\t"
+                    f"{row['repo_key']}\t{row['run_id']}\t{run_attempt}\t"
                     f"{actual_metadata_sha}\n"
                 )
                 run_digest.update(line.encode("utf-8"))
+                repo_item = repo_accumulators[str(row["repo_key"])]
+                repo_item["run_count"] += 1
+                repo_item["expected_attempt_count"] += run_attempt
+                repo_item["_run_digest"].update(line.encode("utf-8"))
+                for attempt in range(1, run_attempt + 1):
+                    attempt_line = (
+                        f"{row['repo_key']}\t{row['run_id']}\t{attempt}\n"
+                    ).encode("utf-8")
+                    attempt_digest.update(attempt_line)
+                    repo_item["_attempt_digest"].update(attempt_line)
+                expected_attempt_count += run_attempt
             run_set_sha = run_digest.hexdigest()
+            expected_attempt_set_sha = attempt_digest.hexdigest()
+            per_repo_ledger = []
+            for repo in repos:
+                item = repo_accumulators[str(repo["repo_key"])]
+                per_repo_ledger.append(
+                    {
+                        "repo": item["repo"],
+                        "canonical": item["canonical"],
+                        "ordinal": item["ordinal"],
+                        "run_count": item["run_count"],
+                        "expected_attempt_count": item[
+                            "expected_attempt_count"
+                        ],
+                        "run_set_sha256": item["_run_digest"].hexdigest(),
+                        "expected_attempt_set_sha256": item[
+                            "_attempt_digest"
+                        ].hexdigest(),
+                    }
+                )
+            per_repo_ledger_sha256 = _sha256_json(per_repo_ledger)
 
             closure_lines = [
                 f"W\t{row['repo_key']}\t{row['start_epoch']}\t"
@@ -3423,6 +5019,9 @@ class InventoryDB:
             }
             logical_document = {
                 "schema": SCHEMA_VERSION,
+                "sqlite_schema_sha256": _EXPECTED_SQLITE_SCHEMA_SHA256,
+                "inventory_meta_sha256": _sha256_json(meta),
+                "logical_table_ledgers": logical_table_ledgers,
                 "repo_list_sha256": meta["repo_list_sha256"],
                 "repo_scope_sha256": meta["repo_scope_sha256"],
                 "start_epoch": start,
@@ -3431,6 +5030,9 @@ class InventoryDB:
                 "repo_count": len(repos),
                 "run_count": run_count,
                 "run_set_sha256": run_set_sha,
+                "expected_attempt_count": expected_attempt_count,
+                "expected_attempt_set_sha256": expected_attempt_set_sha,
+                "per_repo_ledger_sha256": per_repo_ledger_sha256,
                 "window_closure_sha256": closure_sha,
                 "binding_upgrades_sha256": _sha256_json(
                     binding_upgrades
@@ -3442,33 +5044,89 @@ class InventoryDB:
                 "repo_count": len(repos),
                 "run_count": run_count,
                 "run_set_sha256": run_set_sha,
+                "expected_attempt_count": expected_attempt_count,
+                "expected_attempt_set_sha256": expected_attempt_set_sha,
+                "per_repo_ledger": per_repo_ledger,
+                "per_repo_ledger_sha256": per_repo_ledger_sha256,
                 "window_closure_sha256": closure_sha,
+                "sqlite_schema_sha256": _EXPECTED_SQLITE_SCHEMA_SHA256,
+                "logical_table_ledgers": logical_table_ledgers,
                 "db_logical_sha256": _sha256_json(logical_document),
                 "leaf_window_count": len(leaf_ids),
-                "request_count": int(
-                    conn.execute("SELECT COUNT(*) FROM request_ledger").fetchone()[0]
-                ),
+                "request_count": request_count,
                 "binding_upgrades": binding_upgrades,
                 "source_count_drift": source_count_drift,
             }
+        except sqlite3.Error as exc:
+            raise CompletionError(
+                f"inventory SQLite validation failed: {exc}"
+            ) from exc
         finally:
             conn.close()
 
-    def completion_receipt(self) -> dict[str, Any]:
+    def completion_receipt(
+        self,
+        *,
+        allow_nonproduction: bool = False,
+    ) -> dict[str, Any]:
+        self._freeze_for_receipt()
         validated = self._validate_and_digests()
         meta = validated["meta"]
         smoke = meta["smoke"] == "1"
         source_snapshot_stable = (
             validated["source_count_drift"]["windows"] == 0
         )
-        return {
+        production_complete = not smoke and source_snapshot_stable
+        if not production_complete and not allow_nonproduction:
+            reason = (
+                "smoke inventory"
+                if smoke
+                else "source count drift prevents a stable production snapshot"
+            )
+            raise CompletionError(
+                f"production inventory receipt refused: {reason}; "
+                "request an explicit diagnostic non-production receipt if "
+                "the incomplete proof must be retained"
+            )
+        database_path = Path(self.path)
+        before = database_path.stat()
+        artifact_sha256 = _sha256_file(database_path)
+        after = database_path.stat()
+        if (
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ino,
+        ) != (
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ino,
+        ):
+            raise CompletionError(
+                "inventory database changed while its receipt was built"
+            )
+        if self._validate_and_digests() != validated:
+            raise CompletionError(
+                "inventory logical contents changed while its receipt was built"
+            )
+        receipt = {
             "schema": RECEIPT_SCHEMA,
             "completed_at": _utc_now(),
             "enumeration_complete": True,
             "source_snapshot_stable": source_snapshot_stable,
-            "production_complete": not smoke and source_snapshot_stable,
-            "mode": "smoke" if smoke else "production",
+            "production_complete": production_complete,
+            "mode": (
+                "production"
+                if production_complete
+                else "smoke-diagnostic"
+                if smoke
+                else "unstable-diagnostic"
+            ),
             "database": self.path,
+            "database_artifact": {
+                "path": self.path,
+                "byte_size": after.st_size,
+                "sha256": artifact_sha256,
+            },
             "repo_list": {
                 "path": meta["repo_list_path"],
                 "sha256": meta["repo_list_sha256"],
@@ -3485,6 +5143,16 @@ class InventoryDB:
             "script_sha256": meta["script_sha256"],
             "metadata_encoding": meta["metadata_encoding"],
             "run_count": validated["run_count"],
+            "expected_attempt_count": validated[
+                "expected_attempt_count"
+            ],
+            "expected_attempt_set_sha256": validated[
+                "expected_attempt_set_sha256"
+            ],
+            "per_repo_ledger": validated["per_repo_ledger"],
+            "per_repo_ledger_sha256": validated[
+                "per_repo_ledger_sha256"
+            ],
             "leaf_window_count": validated["leaf_window_count"],
             "request_count": validated["request_count"],
             "run_set_sha256": validated["run_set_sha256"],
@@ -3493,6 +5161,11 @@ class InventoryDB:
             "binding_upgrades": validated["binding_upgrades"],
             "source_count_drift": validated["source_count_drift"],
         }
+        if _sha256_file(database_path) != artifact_sha256:
+            raise CompletionError(
+                "inventory database changed after its receipt was built"
+            )
+        return receipt
 
 
 def atomic_write_json(path: str | os.PathLike[str], document: Any) -> None:
@@ -3522,6 +5195,246 @@ def atomic_write_json(path: str | os.PathLike[str], document: Any) -> None:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+
+
+def verify_inventory_completion_receipt(
+    database_path: str | os.PathLike[str],
+    receipt_path: str | os.PathLike[str],
+    *,
+    require_production: bool = True,
+    expected_original_database_path: str | os.PathLike[str] | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Verify a frozen inventory and its byte-bound completion receipt."""
+
+    raw_database = Path(database_path).expanduser()
+    raw_receipt = Path(receipt_path).expanduser()
+    for path, label in (
+        (raw_database, "inventory database"),
+        (raw_receipt, "inventory receipt"),
+    ):
+        if path.is_symlink() or not path.is_file():
+            raise CompletionError(f"{label} is missing or unsafe: {path}")
+    database = raw_database.resolve()
+    receipt_file = raw_receipt.resolve()
+    _require_safe_checkpoint_sidecars(database)
+    raw = _read_bounded_regular_file(
+        receipt_file,
+        max_bytes=MAX_INVENTORY_RECEIPT_BYTES,
+        where="inventory receipt",
+    )
+
+    def reject_duplicates(
+        pairs: list[tuple[str, Any]],
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise CompletionError(
+                    f"inventory receipt contains duplicate key {key!r}"
+                )
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(raw, object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CompletionError(f"inventory receipt is invalid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise CompletionError("inventory receipt root must be an object")
+    expected_top_fields = {
+        "schema",
+        "completed_at",
+        "enumeration_complete",
+        "source_snapshot_stable",
+        "production_complete",
+        "mode",
+        "database",
+        "database_artifact",
+        "repo_list",
+        "interval",
+        "script_sha256",
+        "metadata_encoding",
+        "run_count",
+        "expected_attempt_count",
+        "expected_attempt_set_sha256",
+        "per_repo_ledger",
+        "per_repo_ledger_sha256",
+        "leaf_window_count",
+        "request_count",
+        "run_set_sha256",
+        "window_closure_sha256",
+        "db_logical_sha256",
+        "binding_upgrades",
+        "source_count_drift",
+    }
+    if set(value) != expected_top_fields:
+        raise CompletionError(
+            "inventory receipt root has extra/missing fields"
+        )
+    if value.get("schema") != RECEIPT_SCHEMA:
+        raise CompletionError(
+            f"inventory receipt schema must be {RECEIPT_SCHEMA!r}"
+        )
+    completed_at = _require_canonical_utc(
+        value["completed_at"],
+        where="inventory receipt completed_at",
+    )
+    original_input = (
+        raw_database
+        if expected_original_database_path is None
+        else Path(expected_original_database_path).expanduser()
+    )
+    original = Path(os.path.abspath(original_input))
+    if value.get("database") != str(original):
+        raise CompletionError(
+            "inventory receipt database path differs from the expected "
+            "original path"
+        )
+    artifact = value.get("database_artifact")
+    if not isinstance(artifact, dict):
+        raise CompletionError("inventory receipt lacks its database artifact")
+    if artifact.get("path") != str(original):
+        raise CompletionError(
+            "inventory receipt artifact path differs from its database path"
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="cppmega-inventory-verify-"
+    ) as snapshot_directory:
+        snapshot = Path(snapshot_directory) / "inventory.sqlite3"
+        (
+            database_size,
+            database_sha256,
+            database_identity,
+        ) = _copy_database_snapshot_once(database, snapshot)
+        if (
+            artifact.get("byte_size") != database_size
+            or artifact.get("sha256") != database_sha256
+        ):
+            raise CompletionError(
+                "inventory database bytes differ from the completion receipt"
+            )
+        snapshot.chmod(0o400)
+        snapshot_before = snapshot.stat()
+        snapshot_identity = (
+            snapshot_before.st_dev,
+            snapshot_before.st_ino,
+            snapshot_before.st_size,
+            snapshot_before.st_mtime_ns,
+            snapshot_before.st_ctime_ns,
+        )
+        validated = InventoryDB(
+            snapshot,
+            initialize_schema=False,
+        )._validate_and_digests(immutable=True)
+        snapshot_after = snapshot.stat()
+        if snapshot_identity != (
+            snapshot_after.st_dev,
+            snapshot_after.st_ino,
+            snapshot_after.st_size,
+            snapshot_after.st_mtime_ns,
+            snapshot_after.st_ctime_ns,
+        ):
+            raise CompletionError(
+                "private inventory database snapshot changed during "
+                "logical validation"
+            )
+
+    final_database_stat = database.lstat()
+    if (
+        not stat.S_ISREG(final_database_stat.st_mode)
+        or database_identity
+        != (
+            final_database_stat.st_dev,
+            final_database_stat.st_ino,
+            final_database_stat.st_size,
+            final_database_stat.st_mtime_ns,
+            final_database_stat.st_ctime_ns,
+        )
+    ):
+        raise CompletionError(
+            "inventory database changed while its receipt was verified"
+        )
+    _require_safe_checkpoint_sidecars(database)
+    meta = validated["meta"]
+    database_stable = validated["source_count_drift"]["windows"] == 0
+    database_production = meta["smoke"] == "0" and database_stable
+    expected_mode = (
+        "production"
+        if database_production
+        else "smoke-diagnostic"
+        if meta["smoke"] == "1"
+        else "unstable-diagnostic"
+    )
+    expected_receipt = {
+        "schema": RECEIPT_SCHEMA,
+        "completed_at": completed_at,
+        "enumeration_complete": True,
+        "source_snapshot_stable": database_stable,
+        "production_complete": database_production,
+        "mode": expected_mode,
+        "database": str(original),
+        "database_artifact": {
+            "path": str(original),
+            "byte_size": database_size,
+            "sha256": database_sha256,
+        },
+        "repo_list": {
+            "path": meta["repo_list_path"],
+            "sha256": meta["repo_list_sha256"],
+            "scope_sha256": meta["repo_scope_sha256"],
+            "repos": validated["repo_count"],
+            "original_repos": int(meta["original_repo_count"]),
+            "unresolved": int(meta["unresolved_count"]),
+        },
+        "interval": {
+            "start": meta["start_utc"],
+            "end": meta["end_utc"],
+            "semantics": "[start,end)",
+        },
+        "script_sha256": meta["script_sha256"],
+        "metadata_encoding": meta["metadata_encoding"],
+        "run_count": validated["run_count"],
+        "expected_attempt_count": validated["expected_attempt_count"],
+        "expected_attempt_set_sha256": validated[
+            "expected_attempt_set_sha256"
+        ],
+        "per_repo_ledger": validated["per_repo_ledger"],
+        "per_repo_ledger_sha256": validated[
+            "per_repo_ledger_sha256"
+        ],
+        "leaf_window_count": validated["leaf_window_count"],
+        "request_count": validated["request_count"],
+        "run_set_sha256": validated["run_set_sha256"],
+        "window_closure_sha256": validated[
+            "window_closure_sha256"
+        ],
+        "db_logical_sha256": validated["db_logical_sha256"],
+        "binding_upgrades": validated["binding_upgrades"],
+        "source_count_drift": validated["source_count_drift"],
+    }
+    try:
+        _require_exact_json(
+            value,
+            expected_receipt,
+            where="inventory receipt",
+        )
+    except CompletionError as exc:
+        if (
+            value.get("source_snapshot_stable") is not database_stable
+            or value.get("production_complete") is not database_production
+            or value.get("mode") != expected_mode
+        ):
+            raise CompletionError(
+                "inventory receipt production classification differs from "
+                "SQLite"
+            ) from exc
+        raise
+    if require_production and not database_production:
+        raise CompletionError(
+            "inventory receipt is diagnostic/non-production or unstable"
+        )
+    return value, _sha256_bytes(raw)
 
 
 class GitHubActionsInventory:
@@ -3832,9 +5745,14 @@ class GitHubActionsInventory:
         return self.db.progress()
 
     def write_completion_receipt(
-        self, path: str | os.PathLike[str]
+        self,
+        path: str | os.PathLike[str],
+        *,
+        allow_nonproduction: bool = False,
     ) -> dict[str, Any]:
-        receipt = self.db.completion_receipt()
+        receipt = self.db.completion_receipt(
+            allow_nonproduction=allow_nonproduction
+        )
         atomic_write_json(path, receipt)
         return receipt
 
@@ -3849,7 +5767,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default="inventory-only",
         help="this stage intentionally supports metadata inventory only",
     )
-    parser.add_argument("--repo-list", default=DEFAULT_REPO_LIST)
+    parser.add_argument("--repo-list", required=True)
     parser.add_argument("--db", required=True)
     parser.add_argument("--start", help="inclusive UTC boundary")
     parser.add_argument("--end", help="exclusive UTC boundary")
@@ -3884,6 +5802,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="print current SQLite progress without making requests",
     )
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument(
+        "--diagnostic-nonproduction-receipt",
+        action="store_true",
+        help=(
+            "explicitly allow a diagnostic receipt with "
+            "production_complete=false; never accepted by exhaustive fetch, "
+            "merge, or export"
+        ),
+    )
     parser.add_argument("--max-repos", type=int)
     parser.add_argument("--max-attempts", type=int, default=12)
     parser.add_argument(
@@ -3936,7 +5863,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             progress_interval_seconds=args.progress_interval,
         )
         progress = inventory.run(workers=args.workers)
-        receipt = inventory.write_completion_receipt(receipt_path)
+        receipt = inventory.write_completion_receipt(
+            receipt_path,
+            allow_nonproduction=(
+                args.smoke or args.diagnostic_nonproduction_receipt
+            ),
+        )
     except InventoryError as exc:
         print(f"[ci-stream-inventory] ERROR: {exc}", file=sys.stderr)
         return 1

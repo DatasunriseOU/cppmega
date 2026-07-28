@@ -56,6 +56,10 @@ from scripts.ci_source_binding_projection import (
     projection_script_sha256,
     target_parser_script_sha256,
 )
+from scripts.ci_zlib_evidence import (
+    MAX_CONTENT_FRAME_COMPRESSED_BYTES,
+    MAX_CONTENT_FRAME_RAW_BYTES,
+)
 
 OCCURRENCE_SCHEMA = "cppmega_ci_chunk_occurrence_v3"
 TRAINING_SIDECAR_SCHEMA = "cppmega_ci_chunk_training_sidecars_v2"
@@ -63,8 +67,16 @@ CONTENT_STORE_SCHEMA = "cppmega_ci_content_store_v1"
 CONTENT_STORE_RECEIPT_SCHEMA = "cppmega_ci_content_store_receipt_v1"
 CONTENT_STORE_PACK_SCHEMA = "cppmega_ci_content_pack_v1"
 FETCH_RECEIPT_SCHEMA = "cppmega_ci_stream_fetch_receipt_v3"
+PRODUCTION_FETCH_RECEIPT_SCHEMA = "cppmega_ci_stream_fetch_receipt_v4"
 CASE5_EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v2"
+PRODUCTION_CASE5_EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v3"
 REPRESENTATIVE_LEDGER_SCHEMA = "cppmega_ci_token_sequence_representative_ledger_v1"
+PRODUCTION_INVENTORY_RECEIPT_SCHEMA = "cppmega_ci_stream_inventory_receipt_v5"
+PRODUCTION_MERGE_RECEIPT_SCHEMA = "cppmega_ci_stream_shard_union_receipt_v3"
+PRODUCTION_COMPLETION_MODE = "inventory-exhaustive"
+PRODUCTION_COVERAGE_SEMANTICS = (
+    "exact-production-inventory-attempt-equality"
+)
 INVENTORY_SCHEMA = "cppmega_ci_source_binding_inventory_v3"
 STORE_SCHEMA = "cppmega_ci_source_sidecar_store_v2"
 PACK_SCHEMA = "cppmega_ci_source_blob_pack_v1"
@@ -1177,7 +1189,10 @@ def _verify_content_store_pack(
                 compressed_size = int(content_row["compressed_size"])
                 if (
                     raw_size < 0
+                    or raw_size > MAX_CONTENT_FRAME_RAW_BYTES
                     or compressed_size < 0
+                    or compressed_size
+                    > MAX_CONTENT_FRAME_COMPRESSED_BYTES
                     or offset != expected_offset
                     or frame_size != _CONTENT_FRAME_HEADER.size + compressed_size
                     or frame_size > committed_end - offset
@@ -2025,7 +2040,8 @@ def _prepare_representatives(
 ) -> dict[str, object]:
     representatives = export_receipt.get("representatives")
     if (
-        export_receipt.get("schema") != CASE5_EXPORT_SCHEMA
+        export_receipt.get("schema")
+        not in {CASE5_EXPORT_SCHEMA, PRODUCTION_CASE5_EXPORT_SCHEMA}
         or export_receipt.get("status") != "complete"
         or not isinstance(representatives, Mapping)
         or representatives.get("schema") != REPRESENTATIVE_LEDGER_SCHEMA
@@ -3826,6 +3842,925 @@ def verify_binding_inventory(
     return VerifiedInventory(path, header, artifact.hexdigest())
 
 
+def _receipt_nonnegative_int(value: object, *, where: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+    ):
+        raise ExtractionError(f"{where} must be a non-negative integer")
+    return value
+
+
+def _require_production_fetch_semantics(
+    fetch_receipt: Mapping[str, Any],
+    content_receipt: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    if (
+        fetch_receipt.get("completion_mode")
+        != PRODUCTION_COMPLETION_MODE
+        or fetch_receipt.get("production_complete") is not True
+        or fetch_receipt.get("coverage_semantics")
+        != PRODUCTION_COVERAGE_SEMANTICS
+    ):
+        raise ExtractionError(
+            "production fetch receipt lacks inventory-exhaustive semantics"
+        )
+    frozen = fetch_receipt.get("frozen_fetch_state")
+    summary = fetch_receipt.get("fetch_state")
+    coverage = fetch_receipt.get("exhaustive_coverage")
+    if (
+        not isinstance(frozen, Mapping)
+        or not isinstance(summary, Mapping)
+        or frozen.get("summary") != summary
+        or not isinstance(coverage, Mapping)
+    ):
+        raise ExtractionError(
+            "production fetch receipt lacks bound exhaustive coverage"
+        )
+    expected_runs = _receipt_nonnegative_int(
+        coverage.get("expected_run_count"),
+        where="production coverage expected_run_count",
+    )
+    expected_attempts = _receipt_nonnegative_int(
+        coverage.get("expected_attempt_count"),
+        where="production coverage expected_attempt_count",
+    )
+    if (
+        coverage.get("completion_mode") != PRODUCTION_COMPLETION_MODE
+        or _receipt_nonnegative_int(
+            coverage.get("observed_attempt_count"),
+            where="production coverage observed_attempt_count",
+        )
+        != expected_attempts
+        or any(
+            _receipt_nonnegative_int(
+                coverage.get(field),
+                where=f"production coverage {field}",
+            )
+            != 0
+            for field in (
+                "missing_attempt_count",
+                "extra_attempt_count",
+                "incomplete_attempt_count",
+            )
+        )
+    ):
+        raise ExtractionError(
+            "production fetch receipt lacks exact terminal-attempt equality"
+        )
+    attempt_set_sha256 = _require_hex64(
+        coverage.get("attempt_set_sha256"),
+        where="production coverage attempt_set_sha256",
+    )
+    _require_hex64(
+        coverage.get("terminal_proof_sha256"),
+        where="production coverage terminal_proof_sha256",
+    )
+    statuses = coverage.get("terminal_statuses")
+    per_repo = coverage.get("per_repo_ledger")
+    if not isinstance(statuses, Mapping) or not isinstance(per_repo, list):
+        raise ExtractionError(
+            "production fetch exhaustive ledgers are missing"
+        )
+    status_total = 0
+    for status, count in statuses.items():
+        if status not in {
+            "done",
+            "empty",
+            "terminal_404",
+            "terminal_410",
+        }:
+            raise ExtractionError(
+                "production fetch coverage contains a non-terminal status"
+            )
+        status_total += _receipt_nonnegative_int(
+            count,
+            where=f"production coverage status {status}",
+        )
+    if (
+        status_total != expected_attempts
+        or summary.get("attempt_statuses") != statuses
+        or summary.get("attempts_terminal") != expected_attempts
+    ):
+        raise ExtractionError(
+            "production fetch terminal status accounting differs"
+        )
+    repo_names: set[str] = set()
+    repo_runs = 0
+    repo_attempts = 0
+    for item in per_repo:
+        if not isinstance(item, Mapping):
+            raise ExtractionError(
+                "production per-repository coverage is malformed"
+            )
+        repo = item.get("repo")
+        if not isinstance(repo, str) or not repo or repo in repo_names:
+            raise ExtractionError(
+                "production per-repository coverage has duplicate repos"
+            )
+        repo_names.add(repo)
+        repo_runs += _receipt_nonnegative_int(
+            item.get("expected_run_count"),
+            where=f"production coverage {repo} expected runs",
+        )
+        expected_repo_attempts = _receipt_nonnegative_int(
+            item.get("expected_attempt_count"),
+            where=f"production coverage {repo} expected attempts",
+        )
+        if (
+            _receipt_nonnegative_int(
+                item.get("observed_attempt_count"),
+                where=f"production coverage {repo} observed attempts",
+            )
+            != expected_repo_attempts
+        ):
+            raise ExtractionError(
+                "production per-repository attempt equality differs"
+            )
+        repo_attempts += expected_repo_attempts
+        _require_hex64(
+            item.get("attempt_set_sha256"),
+            where=f"production coverage {repo} attempt_set_sha256",
+        )
+        _require_hex64(
+            item.get("terminal_proof_sha256"),
+            where=f"production coverage {repo} terminal_proof_sha256",
+        )
+    if (
+        repo_runs != expected_runs
+        or repo_attempts != expected_attempts
+        or coverage.get("per_repo_ledger_sha256")
+        != _sha256_bytes(_canonical_json_bytes(per_repo))
+    ):
+        raise ExtractionError(
+            "production per-repository coverage digest/count differs"
+        )
+    discovery = coverage.get("discovery")
+    if (
+        not isinstance(discovery, Mapping)
+        or discovery.get("eof") is not True
+        or discovery.get("rows_seen") != expected_runs
+        or discovery.get("source")
+        not in {
+            "persisted-fetch-sweep",
+            "merge-recomputed-exact-union",
+        }
+    ):
+        raise ExtractionError(
+            "production fetch receipt lacks exact discovery EOF"
+        )
+    if discovery.get("source") == "persisted-fetch-sweep":
+        if (
+            discovery.get("completion_mode")
+            != PRODUCTION_COMPLETION_MODE
+            or discovery.get("expected_run_count") != expected_runs
+            or discovery.get("expected_attempt_count") != expected_attempts
+            or discovery.get("expected_attempt_set_sha256")
+            != attempt_set_sha256
+        ):
+            raise ExtractionError(
+                "production discovery proof differs from coverage"
+            )
+        for field in (
+            "inventory_receipt_sha256",
+            "inventory_database_sha256",
+            "inventory_db_logical_sha256",
+        ):
+            _require_hex64(
+                discovery.get(field),
+                where=f"production discovery {field}",
+            )
+
+    inventory_binding = fetch_receipt.get("inventory_binding")
+    if not isinstance(inventory_binding, Mapping):
+        raise ExtractionError(
+            "production fetch receipt lacks inventory binding"
+        )
+    database = inventory_binding.get("database")
+    completion = inventory_binding.get("completion_receipt")
+    if not isinstance(database, Mapping) or not isinstance(
+        completion,
+        Mapping,
+    ):
+        raise ExtractionError(
+            "production inventory artifacts are not bound"
+        )
+    _require_hex64(
+        database.get("sha256"),
+        where="production inventory database sha256",
+    )
+    _require_hex64(
+        database.get("db_logical_sha256"),
+        where="production inventory logical sha256",
+    )
+    _receipt_nonnegative_int(
+        database.get("byte_size"),
+        where="production inventory byte_size",
+    )
+    _require_hex64(
+        completion.get("sha256"),
+        where="production inventory receipt sha256",
+    )
+    if (
+        not isinstance(database.get("path"), str)
+        or not database.get("path")
+        or not isinstance(completion.get("path"), str)
+        or not completion.get("path")
+        or completion.get("schema")
+        != PRODUCTION_INVENTORY_RECEIPT_SCHEMA
+        or inventory_binding.get("repo_count") != len(per_repo)
+        or inventory_binding.get("expected_run_count") != expected_runs
+        or inventory_binding.get("expected_attempt_count")
+        != expected_attempts
+        or inventory_binding.get("attempt_set_sha256")
+        != attempt_set_sha256
+    ):
+        raise ExtractionError(
+            "production inventory binding differs from coverage"
+        )
+
+    conservation = fetch_receipt.get("conservation")
+    counters = content_receipt.get("counters")
+    if not isinstance(conservation, Mapping) or not isinstance(
+        counters,
+        Mapping,
+    ):
+        raise ExtractionError("production CAS conservation is missing")
+    target = _receipt_nonnegative_int(
+        fetch_receipt.get("target_exact_unique_payload_tokens"),
+        where="production fetch target",
+    )
+    exact_tokens = _receipt_nonnegative_int(
+        counters.get("exact_unique_payload_tokens"),
+        where="production content-store exact tokens",
+    )
+    occurrences = _receipt_nonnegative_int(
+        counters.get("occurrence_count"),
+        where="production content-store occurrences",
+    )
+    if (
+        content_receipt.get("target_exact_unique_payload_tokens") != target
+        or conservation.get("cas_occurrences") != occurrences
+        or conservation.get("fetch_members") != summary.get("members")
+        or conservation.get("fetch_chunks") != summary.get("chunks")
+        or conservation.get("fetch_occurrence_tokens")
+        != summary.get("occurrence_tokens")
+        or conservation.get("fetch_chunks") != occurrences
+        or conservation.get("exact_unique_payload_tokens") != exact_tokens
+        or conservation.get(
+            "secondary_minimum_exact_unique_payload_tokens"
+        )
+        != target
+        or exact_tokens < target
+        or conservation.get("cas_member_chunk_join_complete") is not True
+        or conservation.get("occurrence_chunk_count_equal") is not True
+        or conservation.get("secondary_token_minimum_met") is not True
+        or (
+            "occurrence_token_count_equal" in conservation
+            and conservation.get("occurrence_token_count_equal") is not True
+        )
+    ):
+        raise ExtractionError(
+            "production CAS conservation differs from bound receipts"
+        )
+    return coverage, inventory_binding
+
+
+def _require_production_export_semantics(
+    *,
+    export_receipt: Mapping[str, Any],
+    fetch_receipt_raw: bytes,
+    content_receipt_raw: bytes,
+    coverage: Mapping[str, Any],
+    inventory_binding: Mapping[str, Any],
+    frozen_fetch_state: Mapping[str, Any],
+) -> None:
+    if (
+        export_receipt.get("completion_mode")
+        != PRODUCTION_COMPLETION_MODE
+        or export_receipt.get("production_complete") is not True
+    ):
+        raise ExtractionError(
+            "production CASE5 export lacks inventory-exhaustive semantics"
+        )
+    provenance = export_receipt.get("acquisition_provenance")
+    if (
+        not isinstance(provenance, Mapping)
+        or provenance.get("completion_mode")
+        != PRODUCTION_COMPLETION_MODE
+        or provenance.get("production_complete") is not True
+    ):
+        raise ExtractionError(
+            "production CASE5 export lacks verified acquisition provenance"
+        )
+    inventory = provenance.get("inventory")
+    fetch = provenance.get("fetch")
+    store = provenance.get("store")
+    merge = provenance.get("merge")
+    database = inventory_binding.get("database")
+    inventory_receipt = inventory_binding.get("completion_receipt")
+    state_artifact = frozen_fetch_state.get("artifact")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (
+            inventory,
+            fetch,
+            store,
+            merge,
+            database,
+            inventory_receipt,
+            state_artifact,
+        )
+    ):
+        raise ExtractionError(
+            "production CASE5 acquisition provenance is incomplete"
+        )
+    assert isinstance(inventory, Mapping)
+    assert isinstance(fetch, Mapping)
+    assert isinstance(store, Mapping)
+    assert isinstance(merge, Mapping)
+    assert isinstance(database, Mapping)
+    assert isinstance(inventory_receipt, Mapping)
+    assert isinstance(state_artifact, Mapping)
+    for label, value in (
+        ("inventory sha256", inventory.get("sha256")),
+        ("inventory logical sha256", inventory.get("logical_sha256")),
+        ("inventory receipt sha256", inventory.get("receipt_sha256")),
+        ("fetch state sha256", fetch.get("state_sha256")),
+        ("fetch receipt sha256", fetch.get("receipt_sha256")),
+        ("fetch attempt set sha256", fetch.get("attempt_set_sha256")),
+        ("fetch terminal proof sha256", fetch.get("terminal_proof_sha256")),
+        ("store receipt sha256", store.get("receipt_sha256")),
+        ("merge receipt sha256", merge.get("receipt_sha256")),
+    ):
+        _require_hex64(value, where=f"production acquisition {label}")
+    path_fields = (
+        inventory.get("path"),
+        inventory.get("receipt_path"),
+        fetch.get("state_path"),
+        fetch.get("receipt_path"),
+        store.get("path"),
+        store.get("receipt_path"),
+        merge.get("receipt_path"),
+    )
+    if any(not isinstance(value, str) or not value for value in path_fields):
+        raise ExtractionError(
+            "production CASE5 acquisition paths are incomplete"
+        )
+    if (
+        inventory.get("path") != database.get("path")
+        or inventory.get("sha256") != database.get("sha256")
+        or inventory.get("logical_sha256")
+        != database.get("db_logical_sha256")
+        or inventory.get("receipt_path")
+        != inventory_receipt.get("path")
+        or inventory.get("receipt_sha256")
+        != inventory_receipt.get("sha256")
+        or fetch.get("state_path") != state_artifact.get("path")
+        or fetch.get("state_sha256") != state_artifact.get("sha256")
+        or fetch.get("receipt_sha256")
+        != _sha256_bytes(fetch_receipt_raw)
+        or fetch.get("attempt_set_sha256")
+        != coverage.get("attempt_set_sha256")
+        or fetch.get("terminal_proof_sha256")
+        != coverage.get("terminal_proof_sha256")
+        or store.get("receipt_sha256")
+        != _sha256_bytes(content_receipt_raw)
+        or merge.get("schema") != PRODUCTION_MERGE_RECEIPT_SCHEMA
+    ):
+        raise ExtractionError(
+            "production CASE5 acquisition provenance is not mutually bound"
+        )
+
+
+def _production_artifact_path(value: object, *, where: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ExtractionError(f"{where} path is missing")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise ExtractionError(f"{where} path must be absolute")
+    path = Path(os.path.abspath(path))
+    if path.is_symlink():
+        raise ExtractionError(f"{where} is unsafe: {path}")
+    return path
+
+
+def _require_same_production_path(
+    actual: Path,
+    expected: str | os.PathLike[str] | None,
+    *,
+    where: str,
+) -> None:
+    if expected is None:
+        return
+    expected_path = Path(os.path.abspath(Path(expected).expanduser()))
+    if actual != expected_path:
+        raise ExtractionError(f"{where} path differs from the supplied artifact")
+
+
+def verify_production_acquisition_chain(
+    export_receipt_path: str | os.PathLike[str],
+    *,
+    expected_export_receipt: Mapping[str, Any] | None = None,
+    expected_export_receipt_raw: bytes | None = None,
+    expected_fetch_receipt_path: str | os.PathLike[str] | None = None,
+    expected_fetch_receipt: Mapping[str, Any] | None = None,
+    expected_fetch_receipt_raw: bytes | None = None,
+    expected_content_store_path: str | os.PathLike[str] | None = None,
+    expected_content_store_receipt_path: str | os.PathLike[str] | None = None,
+    expected_content_receipt: Mapping[str, Any] | None = None,
+    expected_content_receipt_raw: bytes | None = None,
+) -> dict[str, Any]:
+    """Reopen and independently verify a production acquisition bundle.
+
+    The CASE5 receipt is only a claim until every declared path is opened.
+    Reuse the exporter and merger's production verifiers, then recompute the
+    final CAS/state/inventory joins against the published merge bundle.
+    """
+
+    from scripts.ci_stream_fetch import ExactTokenizer, FetchError
+    from scripts.ci_stream_inventory import (
+        CompletionError as InventoryCompletionError,
+        verify_inventory_completion_receipt,
+    )
+    from scripts.ci_stream_receipts import (
+        ReceiptFinalizationError,
+        exhaustive_coverage_proof,
+    )
+    from scripts.export_ci_content_store_case5 import (
+        ExportError,
+        FrozenFetchState,
+        FrozenStore,
+        _verify_exhaustive_export_provenance,
+    )
+    from scripts.merge_ci_stream_shards import (
+        COMPLETION_MODE_INVENTORY_EXHAUSTIVE,
+        PRODUCTION_MANIFEST_SCHEMA,
+        MergeError,
+        _require_complete_bundle_tree,
+        _verify_cas_fetch_join,
+        _verify_state_inventory_join,
+        load_manifest,
+    )
+
+    export_path = Path(
+        os.path.abspath(Path(export_receipt_path).expanduser())
+    )
+    export_receipt, export_raw = _read_json_object(
+        export_path,
+        where="production CASE5 export receipt",
+    )
+    if (
+        expected_export_receipt is not None
+        and dict(expected_export_receipt) != export_receipt
+    ):
+        raise ExtractionError(
+            "production CASE5 export receipt changed after it was loaded"
+        )
+    if (
+        expected_export_receipt_raw is not None
+        and expected_export_receipt_raw != export_raw
+    ):
+        raise ExtractionError(
+            "production CASE5 export receipt bytes changed after loading"
+        )
+    if (
+        export_receipt.get("schema") != PRODUCTION_CASE5_EXPORT_SCHEMA
+        or export_receipt.get("completion_mode")
+        != PRODUCTION_COMPLETION_MODE
+        or export_receipt.get("production_complete") is not True
+    ):
+        raise ExtractionError(
+            "production CASE5 export lacks inventory-exhaustive semantics"
+        )
+    provenance = export_receipt.get("acquisition_provenance")
+    if not isinstance(provenance, Mapping):
+        raise ExtractionError(
+            "production CASE5 acquisition provenance is incomplete"
+        )
+    inventory = provenance.get("inventory")
+    fetch = provenance.get("fetch")
+    store = provenance.get("store")
+    merge = provenance.get("merge")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (inventory, fetch, store, merge)
+    ):
+        raise ExtractionError(
+            "production CASE5 acquisition provenance is incomplete"
+        )
+    assert isinstance(inventory, Mapping)
+    assert isinstance(fetch, Mapping)
+    assert isinstance(store, Mapping)
+    assert isinstance(merge, Mapping)
+
+    inventory_path = _production_artifact_path(
+        inventory.get("path"),
+        where="production inventory database",
+    )
+    inventory_receipt_path = _production_artifact_path(
+        inventory.get("receipt_path"),
+        where="production inventory receipt",
+    )
+    fetch_state_path = _production_artifact_path(
+        fetch.get("state_path"),
+        where="production fetch state",
+    )
+    fetch_receipt_path = _production_artifact_path(
+        fetch.get("receipt_path"),
+        where="production fetch receipt",
+    )
+    content_store_path = _production_artifact_path(
+        store.get("path"),
+        where="production content store",
+    )
+    content_receipt_path = _production_artifact_path(
+        store.get("receipt_path"),
+        where="production content-store receipt",
+    )
+    merge_receipt_path = _production_artifact_path(
+        merge.get("receipt_path"),
+        where="production merge receipt",
+    )
+    _require_same_production_path(
+        fetch_receipt_path,
+        expected_fetch_receipt_path,
+        where="production fetch receipt",
+    )
+    _require_same_production_path(
+        content_store_path,
+        expected_content_store_path,
+        where="production content store",
+    )
+    _require_same_production_path(
+        content_receipt_path,
+        expected_content_store_receipt_path,
+        where="production content-store receipt",
+    )
+
+    try:
+        inventory_receipt, inventory_receipt_sha256 = (
+            verify_inventory_completion_receipt(
+                inventory_path,
+                inventory_receipt_path,
+                require_production=True,
+                expected_original_database_path=inventory_path,
+            )
+        )
+    except InventoryCompletionError as exc:
+        raise ExtractionError(str(exc)) from exc
+
+    fetch_receipt, fetch_raw = _read_json_object(
+        fetch_receipt_path,
+        where="production fetch receipt",
+    )
+    content_receipt, content_raw = _read_json_object(
+        content_receipt_path,
+        where="production content-store receipt",
+    )
+    merge_receipt, merge_raw = _read_json_object(
+        merge_receipt_path,
+        where="production merge receipt",
+    )
+    if (
+        expected_fetch_receipt is not None
+        and dict(expected_fetch_receipt) != fetch_receipt
+    ):
+        raise ExtractionError(
+            "production fetch receipt differs from the supplied receipt"
+        )
+    if (
+        expected_fetch_receipt_raw is not None
+        and expected_fetch_receipt_raw != fetch_raw
+    ):
+        raise ExtractionError(
+            "production fetch receipt bytes differ from the supplied receipt"
+        )
+    if (
+        expected_content_receipt is not None
+        and dict(expected_content_receipt) != content_receipt
+    ):
+        raise ExtractionError(
+            "production content-store receipt differs from the supplied receipt"
+        )
+    if (
+        expected_content_receipt_raw is not None
+        and expected_content_receipt_raw != content_raw
+    ):
+        raise ExtractionError(
+            "production content-store receipt bytes differ from the supplied receipt"
+        )
+
+    coverage, inventory_binding = _require_production_fetch_semantics(
+        fetch_receipt,
+        content_receipt,
+    )
+    frozen_fetch_state = fetch_receipt.get("frozen_fetch_state")
+    if not isinstance(frozen_fetch_state, Mapping):
+        raise ExtractionError(
+            "production fetch receipt lacks its frozen state binding"
+        )
+    _require_production_export_semantics(
+        export_receipt=export_receipt,
+        fetch_receipt_raw=fetch_raw,
+        content_receipt_raw=content_raw,
+        coverage=coverage,
+        inventory_binding=inventory_binding,
+        frozen_fetch_state=frozen_fetch_state,
+    )
+
+    try:
+        recomputed_provenance = _verify_exhaustive_export_provenance(
+            store_root=content_store_path,
+            store_receipt_path=content_receipt_path,
+            fetch_state_path=fetch_state_path,
+            inventory_path=inventory_path,
+            inventory_receipt_path=inventory_receipt_path,
+            fetch_receipt_path=fetch_receipt_path,
+            merge_receipt_path=merge_receipt_path,
+        )
+    except (ExportError, OSError, sqlite3.Error) as exc:
+        raise ExtractionError(
+            f"production acquisition artifact verification failed: {exc}"
+        ) from exc
+    if dict(provenance) != recomputed_provenance:
+        raise ExtractionError(
+            "production acquisition provenance differs from real artifacts"
+        )
+
+    merge_root = merge_receipt_path.parent
+    if (
+        merge_receipt_path.name != "merge_receipt.json"
+        or merge_root.is_symlink()
+        or not merge_root.is_dir()
+    ):
+        raise ExtractionError(
+            "production merge bundle path is missing or unsafe"
+        )
+    expected_bundle_paths = {
+        "inventory database": merge_root / "inventory.sqlite3",
+        "inventory receipt": merge_root / "inventory_receipt.json",
+        "fetch state": merge_root / "fetch_state.sqlite3",
+        "fetch receipt": merge_root / "fetch_receipt.json",
+        "content store": merge_root / "content_store",
+        "content-store receipt": merge_root / "store_receipt.json",
+    }
+    actual_bundle_paths = {
+        "inventory database": inventory_path,
+        "inventory receipt": inventory_receipt_path,
+        "fetch state": fetch_state_path,
+        "fetch receipt": fetch_receipt_path,
+        "content store": content_store_path,
+        "content-store receipt": content_receipt_path,
+    }
+    for label, expected_path in expected_bundle_paths.items():
+        if actual_bundle_paths[label] != expected_path:
+            raise ExtractionError(
+                f"production {label} is outside the merge bundle"
+            )
+
+    try:
+        _require_complete_bundle_tree(merge_root, merge_receipt)
+    except (MergeError, OSError, sqlite3.Error) as exc:
+        raise ExtractionError(
+            f"production merge bundle verification failed: {exc}"
+        ) from exc
+    if _sha256_bytes(merge_raw) != merge.get("receipt_sha256"):
+        raise ExtractionError(
+            "production merge receipt SHA-256 differs from provenance"
+        )
+
+    manifest_binding = merge_receipt.get("manifest")
+    verification = merge_receipt.get("verification")
+    sources = merge_receipt.get("sources")
+    if (
+        not isinstance(manifest_binding, Mapping)
+        or not isinstance(verification, Mapping)
+        or not isinstance(sources, list)
+        or not sources
+        or any(
+            not isinstance(source, Mapping)
+            or source.get("verified_before_merge") is not True
+            or source.get("unchanged_after_merge") is not True
+            for source in sources
+        )
+    ):
+        raise ExtractionError(
+            "production merge receipt lacks semantic source verification"
+        )
+    required_merge_proofs = (
+        "full_cas_fetch_join",
+        "full_anchor_fetch_state_join",
+        "sources_frozen_before_after",
+        "destination_frozen",
+        "threshold_recomputed_after_global_dedup",
+        "exact_production_inventory_attempt_equality",
+    )
+    if any(
+        verification.get(name) is not True for name in required_merge_proofs
+    ):
+        raise ExtractionError(
+            "production merge receipt lacks required semantic proofs"
+        )
+    manifest_path = _production_artifact_path(
+        manifest_binding.get("path"),
+        where="production merge manifest",
+    )
+    try:
+        manifest = load_manifest(manifest_path)
+    except (MergeError, OSError) as exc:
+        raise ExtractionError(
+            f"production merge manifest verification failed: {exc}"
+        ) from exc
+    if (
+        manifest_binding.get("schema") != PRODUCTION_MANIFEST_SCHEMA
+        or manifest_binding.get("sha256") != manifest.sha256
+        or _stable_file_sha256(manifest_path) != manifest.sha256
+        or manifest.completion_mode
+        != COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+        or manifest.destination != merge_root
+        or merge_receipt.get("destination") != str(merge_root)
+        or merge_receipt.get("target_exact_unique_payload_tokens")
+        != manifest.target_unique_tokens
+    ):
+        raise ExtractionError(
+            "production merge manifest/destination binding differs"
+        )
+    if (
+        _stable_file_sha256(manifest.tokenizer_path)
+        != manifest.tokenizer_sha256
+    ):
+        raise ExtractionError(
+            "production merge tokenizer differs from its manifest"
+        )
+
+    try:
+        tokenizer = ExactTokenizer(manifest.tokenizer_path)
+        with tempfile.TemporaryDirectory(
+            prefix="ci-source-production-chain-"
+        ) as scratch_directory:
+            scratch = Path(scratch_directory)
+            with FrozenStore(
+                content_store_path,
+                content_receipt_path,
+            ) as frozen_store:
+                if (
+                    frozen_store.receipt != content_receipt
+                    or frozen_store.receipt_sha256
+                    != _sha256_bytes(content_raw)
+                ):
+                    raise ExtractionError(
+                        "production content store differs from its receipt"
+                    )
+                with FrozenFetchState(
+                    fetch_state_path,
+                    tokenizer=tokenizer,
+                    store=frozen_store,
+                ) as frozen_state:
+                    if (
+                        frozen_state.receipt_binding()
+                        != dict(frozen_fetch_state)
+                        or fetch_receipt.get("fetch_state")
+                        != frozen_state.summary
+                        or Path(
+                            frozen_state.settings["inventory_path"]
+                        ).expanduser().resolve()
+                        != inventory_path
+                    ):
+                        raise ExtractionError(
+                            "production fetch state differs from its receipt"
+                        )
+                    joined_occurrences = _verify_cas_fetch_join(
+                        frozen_store,
+                        frozen_state,
+                        scratch_path=scratch / "cas-fetch-join.sqlite3",
+                        limits=manifest.limits,
+                    )
+                    inventory_connection = sqlite3.connect(
+                        (
+                            f"{inventory_path.as_uri()}"
+                            "?mode=ro&immutable=1"
+                        ),
+                        uri=True,
+                    )
+                    inventory_connection.row_factory = sqlite3.Row
+                    inventory_connection.execute("PRAGMA query_only=ON")
+                    try:
+                        (
+                            inventory_joined_attempts,
+                            inventory_join_sha256,
+                        ) = _verify_state_inventory_join(
+                            inventory_connection,
+                            frozen_state.connection,
+                            label="production acquisition",
+                            max_blob_bytes=(
+                                manifest.limits.max_state_blob_bytes
+                            ),
+                        )
+                        actual_coverage = exhaustive_coverage_proof(
+                            inventory_connection,
+                            frozen_state.connection,
+                            inventory_receipt=inventory_receipt,
+                            require_discovery_eof=False,
+                        )
+                    finally:
+                        inventory_connection.close()
+                    if actual_coverage != coverage:
+                        raise ExtractionError(
+                            "production exhaustive coverage differs from "
+                            "inventory/fetch artifacts"
+                        )
+                    if (
+                        verification.get("joined_occurrences")
+                        != joined_occurrences
+                        or verification.get("inventory_joined_attempts")
+                        != inventory_joined_attempts
+                        or verification.get("inventory_join_sha256")
+                        != inventory_join_sha256
+                        or merge_receipt.get("frozen_fetch_state")
+                        != dict(frozen_fetch_state)
+                    ):
+                        raise ExtractionError(
+                            "production merge semantic proof differs from "
+                            "recomputed artifacts"
+                        )
+                    frozen_state.require_unchanged()
+                frozen_store.require_unchanged()
+    except ExtractionError:
+        raise
+    except (
+        ExportError,
+        FetchError,
+        MergeError,
+        ReceiptFinalizationError,
+        OSError,
+        sqlite3.Error,
+    ) as exc:
+        raise ExtractionError(
+            f"production acquisition semantic verification failed: {exc}"
+        ) from exc
+
+    inventory_artifact = inventory_receipt.get("database_artifact")
+    if (
+        not isinstance(inventory_artifact, Mapping)
+        or inventory.get("sha256") != inventory_artifact.get("sha256")
+        or inventory.get("logical_sha256")
+        != inventory_receipt.get("db_logical_sha256")
+        or inventory.get("receipt_sha256")
+        != inventory_receipt_sha256
+    ):
+        raise ExtractionError(
+            "production inventory provenance differs from verified artifacts"
+        )
+    expected_inventory_size = inventory_artifact.get("byte_size")
+    if (
+        isinstance(expected_inventory_size, bool)
+        or not isinstance(expected_inventory_size, int)
+        or _stable_file_sha256(
+            inventory_path,
+            expected_size=expected_inventory_size,
+        )
+        != inventory_artifact.get("sha256")
+        or _stable_file_sha256(inventory_receipt_path)
+        != inventory_receipt_sha256
+        or _stable_file_sha256(fetch_receipt_path)
+        != _sha256_bytes(fetch_raw)
+        or _stable_file_sha256(content_receipt_path)
+        != _sha256_bytes(content_raw)
+        or _stable_file_sha256(merge_receipt_path)
+        != _sha256_bytes(merge_raw)
+        or _stable_file_sha256(manifest_path) != manifest.sha256
+        or _stable_file_sha256(manifest.tokenizer_path)
+        != manifest.tokenizer_sha256
+    ):
+        raise ExtractionError(
+            "production acquisition artifacts changed during verification"
+        )
+    return dict(recomputed_provenance)
+
+
+def _require_legacy_completion_semantics(
+    fetch_receipt: Mapping[str, Any],
+    export_receipt: Mapping[str, Any],
+) -> None:
+    if (
+        fetch_receipt.get("production_complete") is True
+        or fetch_receipt.get("completion_mode")
+        == PRODUCTION_COMPLETION_MODE
+        or "exhaustive_coverage" in fetch_receipt
+        or "coverage_semantics" in fetch_receipt
+        or export_receipt.get("production_complete") is True
+        or export_receipt.get("completion_mode")
+        == PRODUCTION_COMPLETION_MODE
+        or "acquisition_provenance" in export_receipt
+    ):
+        raise ExtractionError(
+            "legacy v3/v2 receipts cannot claim production-exhaustive "
+            "semantics"
+        )
+
+
 def extract_binding_inventory(
     content_store_root: str | os.PathLike[str],
     upstream_fetch_receipt_path: str | os.PathLike[str],
@@ -3852,13 +4787,45 @@ def extract_binding_inventory(
         Path(case5_export_receipt_path),
         where="CASE5 export receipt",
     )
-    if fetch_receipt.get("schema") != FETCH_RECEIPT_SCHEMA:
+    fetch_schema = fetch_receipt.get("schema")
+    export_schema = export_receipt.get("schema")
+    if fetch_schema not in {
+        FETCH_RECEIPT_SCHEMA,
+        PRODUCTION_FETCH_RECEIPT_SCHEMA,
+    }:
         raise ExtractionError("upstream fetch receipt schema is missing or stale")
     nested = fetch_receipt.get("content_store_receipt")
     if not isinstance(nested, Mapping) or dict(nested) != content_receipt:
         raise ExtractionError("fetch and standalone content-store receipts differ")
-    if export_receipt.get("schema") != CASE5_EXPORT_SCHEMA:
+    if export_schema not in {
+        CASE5_EXPORT_SCHEMA,
+        PRODUCTION_CASE5_EXPORT_SCHEMA,
+    }:
         raise ExtractionError("CASE5 export receipt schema is missing or stale")
+    if (
+        fetch_schema == PRODUCTION_FETCH_RECEIPT_SCHEMA
+    ) != (
+        export_schema == PRODUCTION_CASE5_EXPORT_SCHEMA
+    ):
+        raise ExtractionError(
+            "fetch and CASE5 export completion modes differ"
+        )
+    production_pair = fetch_schema == PRODUCTION_FETCH_RECEIPT_SCHEMA
+    production_coverage: Mapping[str, Any] | None = None
+    production_inventory_binding: Mapping[str, Any] | None = None
+    if production_pair:
+        (
+            production_coverage,
+            production_inventory_binding,
+        ) = _require_production_fetch_semantics(
+            fetch_receipt,
+            content_receipt,
+        )
+    else:
+        _require_legacy_completion_semantics(
+            fetch_receipt,
+            export_receipt,
+        )
     frozen_fetch_state = fetch_receipt.get("frozen_fetch_state")
     input_fetch_state = export_receipt.get("input_fetch_state")
     if not isinstance(frozen_fetch_state, Mapping) or not isinstance(
@@ -3896,6 +4863,31 @@ def extract_binding_inventory(
             raise ExtractionError(
                 f"CASE5 export input_store {export_name} differs from receipt"
             )
+    if production_pair:
+        assert production_coverage is not None
+        assert production_inventory_binding is not None
+        _require_production_export_semantics(
+            export_receipt=export_receipt,
+            fetch_receipt_raw=fetch_raw,
+            content_receipt_raw=content_receipt_raw,
+            coverage=production_coverage,
+            inventory_binding=production_inventory_binding,
+            frozen_fetch_state=frozen_fetch_state_binding,
+        )
+        verify_production_acquisition_chain(
+            case5_export_receipt_path,
+            expected_export_receipt=export_receipt,
+            expected_export_receipt_raw=export_receipt_raw,
+            expected_fetch_receipt_path=upstream_fetch_receipt_path,
+            expected_fetch_receipt=fetch_receipt,
+            expected_fetch_receipt_raw=fetch_raw,
+            expected_content_store_path=content_store_root,
+            expected_content_store_receipt_path=(
+                content_store_receipt_path
+            ),
+            expected_content_receipt=content_receipt,
+            expected_content_receipt_raw=content_receipt_raw,
+        )
 
     output = Path(output_path)
     with tempfile.TemporaryDirectory(prefix="ci-source-inventory-") as temporary:

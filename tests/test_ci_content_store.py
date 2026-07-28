@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 import hashlib
 import json
 from pathlib import Path
@@ -8,6 +9,9 @@ import sqlite3
 import struct
 import subprocess
 import sys
+import threading
+from typing import Callable
+import zlib
 
 import pytest
 
@@ -22,6 +26,26 @@ from scripts.ci_content_store import (
     VerificationError,
     hash_token_sequence,
 )
+from scripts.ci_zlib_evidence import (
+    MAX_STATE_JSON_EVIDENCE_BYTES,
+    MAX_STATE_JSON_EVIDENCE_COMPRESSED_BYTES,
+)
+
+
+@lru_cache(maxsize=None)
+def _compressed_repetition(raw_size: int) -> tuple[bytes, str]:
+    compressor = zlib.compressobj(9)
+    digest = hashlib.sha256()
+    parts: list[bytes] = []
+    chunk = b"x" * (1024 * 1024)
+    remaining = raw_size
+    while remaining:
+        current = chunk[: min(len(chunk), remaining)]
+        digest.update(current)
+        parts.append(compressor.compress(current))
+        remaining -= len(current)
+    parts.append(compressor.flush())
+    return b"".join(parts), digest.hexdigest()
 
 
 def _key(ordinal: int, *, step: str = "collect") -> dict[str, object]:
@@ -236,6 +260,169 @@ def test_corrupt_compressed_provenance_fails_full_verification(
         assert store.verify(raise_on_error=False)["ok"] is False
         with pytest.raises(VerificationError, match="provenance"):
             store.verify()
+
+
+def test_provenance_bomb_is_preflighted_before_resume_replay_and_receipt(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "store"
+    raw_size = MAX_STATE_JSON_EVIDENCE_BYTES + 1
+    compressed, digest = _compressed_repetition(raw_size)
+    with CIContentStore(root) as store:
+        store.add_chunk("payload", {"entry": "job.log"}, _key(0))
+        with store._connection:
+            store._connection.execute(
+                """
+                UPDATE occurrences SET
+                  provenance_sha256=?,
+                  provenance_raw_size=?,
+                  provenance_zlib=?
+                """,
+                (digest, raw_size, sqlite3.Binary(compressed)),
+            )
+        assert store.verify(raise_on_error=False)["ok"] is False
+        with pytest.raises(VerificationError, match="byte bounds"):
+            store.verify()
+        with pytest.raises(VerificationError, match="byte bounds"):
+            store.completion_receipt(target_unique_tokens=0)
+        with pytest.raises(VerificationError, match="byte bounds"):
+            store.add_chunk("payload", {"entry": "job.log"}, _key(0))
+        with pytest.raises(VerificationError, match="byte bounds"):
+            list(store.iter_occurrences())
+
+    with pytest.raises(VerificationError, match="byte bounds"):
+        CIContentStore(root)
+
+
+def test_mutable_store_operations_pin_preflight_and_blob_read_to_one_snapshot(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "store"
+    provenance = {"entry": "job.log"}
+    provenance_raw = json.dumps(
+        provenance,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    provenance_digest = hashlib.sha256(provenance_raw).hexdigest()
+    provenance_zlib = zlib.compress(provenance_raw, 6)
+
+    with CIContentStore(root) as store:
+        store.add_chunk("payload", provenance, _key(0))
+        largest_materialized_blob = 0
+
+        def guarded_row_factory(
+            cursor: sqlite3.Cursor,
+            values: tuple[object, ...],
+        ) -> sqlite3.Row:
+            nonlocal largest_materialized_blob
+            largest_materialized_blob = max(
+                (
+                    len(value)
+                    for value in values
+                    if isinstance(value, bytes)
+                ),
+                default=largest_materialized_blob,
+            )
+            if (
+                largest_materialized_blob
+                > MAX_STATE_JSON_EVIDENCE_COMPRESSED_BYTES
+            ):
+                raise AssertionError("oversized provenance BLOB was materialized")
+            return sqlite3.Row(cursor, values)
+
+        store._connection.row_factory = guarded_row_factory
+
+        def restore_valid_provenance() -> None:
+            with sqlite3.connect(store.db_path) as connection:
+                connection.execute(
+                    """
+                    UPDATE occurrences SET
+                      provenance_sha256=?,
+                      provenance_raw_size=?,
+                      provenance_zlib=?
+                    WHERE repo='owner/repo' AND chunk_ordinal=0
+                    """,
+                    (
+                        provenance_digest,
+                        len(provenance_raw),
+                        sqlite3.Binary(provenance_zlib),
+                    ),
+                )
+
+        def assert_surface_rejects_before_materialization(
+            invoke: Callable[[], object],
+        ) -> None:
+            trigger = threading.Event()
+            finished = threading.Event()
+            writer_errors: list[BaseException] = []
+            trace_triggered = False
+
+            def attacker() -> None:
+                trigger.wait()
+                try:
+                    with sqlite3.connect(store.db_path, timeout=30.0) as connection:
+                        connection.execute(
+                            """
+                            UPDATE occurrences
+                            SET provenance_zlib=zeroblob(?)
+                            WHERE repo='owner/repo' AND chunk_ordinal=0
+                            """,
+                            (MAX_STATE_JSON_EVIDENCE_COMPRESSED_BYTES + 1,),
+                        )
+                except BaseException as exc:
+                    writer_errors.append(exc)
+                finally:
+                    finished.set()
+
+            writer = threading.Thread(target=attacker)
+            writer.start()
+
+            def trace(statement: str) -> None:
+                nonlocal trace_triggered
+                normalized = " ".join(statement.split()).upper()
+                evidence_select = (
+                    normalized.startswith("SELECT")
+                    and "PROVENANCE_ZLIB" in normalized
+                    and "FROM OCCURRENCES" in normalized
+                    and "LENGTH(PROVENANCE_ZLIB)" not in normalized
+                )
+                if not trace_triggered and (
+                    normalized.startswith("BEGIN") or evidence_select
+                ):
+                    trace_triggered = True
+                    trigger.set()
+                    finished.wait(30.0)
+
+            store._connection.set_trace_callback(trace)
+            try:
+                with pytest.raises(
+                    VerificationError,
+                    match="occurrence provenance exceeds its versioned byte bounds",
+                ):
+                    invoke()
+            finally:
+                store._connection.set_trace_callback(None)
+                trigger.set()
+                writer.join(timeout=30.0)
+            assert not writer.is_alive()
+            assert trace_triggered
+            assert writer_errors == []
+            assert (
+                largest_materialized_blob
+                <= MAX_STATE_JSON_EVIDENCE_COMPRESSED_BYTES
+            )
+
+        surfaces = (
+            lambda: store.add_chunk("payload", provenance, _key(0)),
+            lambda: list(store.iter_occurrences()),
+            store.verify,
+        )
+        for invoke in surfaces:
+            restore_valid_provenance()
+            assert_surface_rejects_before_materialization(invoke)
 
 
 def test_identical_replay_is_idempotent_and_conflicting_replay_fails(

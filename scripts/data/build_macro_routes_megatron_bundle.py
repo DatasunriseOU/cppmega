@@ -56,6 +56,13 @@ from cppmega.data.source_conveyor_composition import (  # noqa: E402
     SourceComposition,
     load_source_composition,
 )
+from scripts.ci_source_sidecars import (  # noqa: E402
+    ExtractionError as CISourceExtractionError,
+    verify_production_acquisition_chain,
+)
+from scripts.ci_stream_fetch import (  # noqa: E402
+    SCHEMA_VERSION as CI_FETCH_STATE_SCHEMA,
+)
 
 
 DEFAULT_BUCKETS = (1024, 2048, 4096, 8192, 16384)
@@ -64,6 +71,13 @@ CI_MANIFEST_SCHEMA = "cppmega_ci_fixed_buckets_manifest_v3"
 CI_BUCKET_MANIFEST_SCHEMA = "cppmega_ci_fixed_bucket_v2"
 CI_LOG_COMPLETION_SCHEMA = "cppmega_ci_log_extraction_v1"
 CI_CONTENT_STORE_EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v2"
+PRODUCTION_CI_CONTENT_STORE_EXPORT_SCHEMA = (
+    "cppmega_ci_content_store_case5_export_v3"
+)
+PRODUCTION_CI_COMPLETION_MODE = "inventory-exhaustive"
+PRODUCTION_CI_MERGE_RECEIPT_SCHEMA = (
+    "cppmega_ci_stream_shard_union_receipt_v3"
+)
 PR_EXPORT_SCHEMA = "cppmega_pr_case5_export_v1"
 BUNDLE_KNOWN_LIMITATIONS: tuple[str, ...] = ()
 DTYPE_SIZES = {
@@ -341,6 +355,133 @@ def _stable_parquets(
     ]
 
 
+def _require_content_store_export_completion_semantics(
+    *,
+    manifest_path: Path,
+    manifest_bytes: bytes,
+    manifest: dict[str, object],
+    input_store: dict[str, object],
+    input_fetch_state: dict[str, object],
+) -> dict[str, object] | None:
+    schema = manifest.get("schema")
+    if schema == CI_CONTENT_STORE_EXPORT_SCHEMA:
+        if (
+            manifest.get("production_complete") is True
+            or manifest.get("completion_mode")
+            == PRODUCTION_CI_COMPLETION_MODE
+            or "acquisition_provenance" in manifest
+        ):
+            raise RuntimeError(
+                f"{manifest_path}: legacy CI export v2 cannot claim "
+                "production-exhaustive semantics"
+            )
+        return None
+    if (
+        schema != PRODUCTION_CI_CONTENT_STORE_EXPORT_SCHEMA
+        or manifest.get("completion_mode")
+        != PRODUCTION_CI_COMPLETION_MODE
+        or manifest.get("production_complete") is not True
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: production CI export lacks "
+            "inventory-exhaustive semantics"
+        )
+    provenance = manifest.get("acquisition_provenance")
+    if (
+        not isinstance(provenance, dict)
+        or provenance.get("completion_mode")
+        != PRODUCTION_CI_COMPLETION_MODE
+        or provenance.get("production_complete") is not True
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: production CI export lacks verified "
+            "acquisition provenance"
+        )
+    inventory = provenance.get("inventory")
+    fetch = provenance.get("fetch")
+    store = provenance.get("store")
+    merge = provenance.get("merge")
+    state_artifact = input_fetch_state.get("artifact")
+    if not all(
+        isinstance(value, dict)
+        for value in (
+            inventory,
+            fetch,
+            store,
+            merge,
+            state_artifact,
+        )
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: production acquisition provenance is incomplete"
+        )
+    assert isinstance(inventory, dict)
+    assert isinstance(fetch, dict)
+    assert isinstance(store, dict)
+    assert isinstance(merge, dict)
+    assert isinstance(state_artifact, dict)
+    digest_fields = (
+        ("inventory sha256", inventory.get("sha256")),
+        ("inventory logical sha256", inventory.get("logical_sha256")),
+        ("inventory receipt sha256", inventory.get("receipt_sha256")),
+        ("fetch state sha256", fetch.get("state_sha256")),
+        ("fetch receipt sha256", fetch.get("receipt_sha256")),
+        ("fetch attempt set sha256", fetch.get("attempt_set_sha256")),
+        ("fetch terminal proof sha256", fetch.get("terminal_proof_sha256")),
+        ("store receipt sha256", store.get("receipt_sha256")),
+        ("merge receipt sha256", merge.get("receipt_sha256")),
+    )
+    if any(
+        not isinstance(value, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", value)
+        for _label, value in digest_fields
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: production acquisition digest binding is "
+            "incomplete"
+        )
+    path_fields = (
+        inventory.get("path"),
+        inventory.get("receipt_path"),
+        fetch.get("state_path"),
+        fetch.get("receipt_path"),
+        store.get("path"),
+        store.get("receipt_path"),
+        merge.get("receipt_path"),
+    )
+    if any(not isinstance(value, str) or not value for value in path_fields):
+        raise RuntimeError(
+            f"{manifest_path}: production acquisition path binding is "
+            "incomplete"
+        )
+    if (
+        fetch.get("state_path") != state_artifact.get("path")
+        or fetch.get("state_sha256") != state_artifact.get("sha256")
+        or store.get("receipt_sha256")
+        != input_store.get("receipt_sha256")
+        or merge.get("schema")
+        != PRODUCTION_CI_MERGE_RECEIPT_SCHEMA
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: production acquisition provenance is not "
+            "mutually bound"
+        )
+    try:
+        verified = verify_production_acquisition_chain(
+            manifest_path,
+            expected_export_receipt=manifest,
+            expected_export_receipt_raw=manifest_bytes,
+        )
+    except CISourceExtractionError as exc:
+        raise RuntimeError(f"{manifest_path}: {exc}") from exc
+    if verified != provenance:
+        raise RuntimeError(
+            f"{manifest_path}: production acquisition provenance differs "
+            "from verified artifacts"
+        )
+    return verified
+
+
 def _load_content_store_ci_export_allowlist(
     *,
     manifest_path: Path,
@@ -351,6 +492,7 @@ def _load_content_store_ci_export_allowlist(
 ) -> tuple[dict[tuple[str, int], dict[str, int]], dict[str, object]]:
     """Validate the receipt-bound multi-shard CI CASE5 export."""
 
+    export_schema = str(manifest["schema"])
     expected_manifest_path = ci_root / "export_receipt.json"
     if manifest_path != expected_manifest_path:
         raise RuntimeError(
@@ -449,7 +591,7 @@ def _load_content_store_ci_export_allowlist(
         )
         or not isinstance(input_store.get("pack_hashes"), list)
         or not input_store["pack_hashes"]
-        or input_fetch_state.get("schema") != "cppmega_ci_stream_fetch_v3"
+        or input_fetch_state.get("schema") != CI_FETCH_STATE_SCHEMA
         or not isinstance(input_fetch_state.get("sqlite_schema_sha256"), str)
         or not re.fullmatch(
             r"[0-9a-f]{64}", str(input_fetch_state["sqlite_schema_sha256"])
@@ -468,6 +610,15 @@ def _load_content_store_ci_export_allowlist(
         raise RuntimeError(
             f"{manifest_path}: CI export immutable producer binding is incomplete"
         )
+    production_provenance = (
+        _require_content_store_export_completion_semantics(
+            manifest_path=manifest_path,
+            manifest_bytes=manifest_bytes,
+            manifest=manifest,
+            input_store=input_store,
+            input_fetch_state=input_fetch_state,
+        )
+    )
 
     eligibility = manifest.get("eligibility")
     conservation = (
@@ -778,19 +929,19 @@ def _load_content_store_ci_export_allowlist(
     metadata: dict[str, object] = {
         "path": str(manifest_path),
         "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
-        "schema": CI_CONTENT_STORE_EXPORT_SCHEMA,
+        "schema": export_schema,
         "source_inventory_sha256": source_binding_sha256,
         "source_binding": source_binding,
         "source_binding_sha256": source_binding_sha256,
         "producer_revision": {
-            "schema": CI_CONTENT_STORE_EXPORT_SCHEMA,
+            "schema": export_schema,
             "repository_identity": "cppmega",
             "script": "export_ci_content_store_case5.py",
             "script_sha256": exporter_sha256,
         },
         "producer_script_sha256": exporter_sha256,
         "source_completion": {
-            "schema": CI_CONTENT_STORE_EXPORT_SCHEMA,
+            "schema": export_schema,
             "status": "complete",
             "target_exact_unique_payload_tokens": target_tokens,
             "target_source": target_source,
@@ -810,6 +961,16 @@ def _load_content_store_ci_export_allowlist(
         },
         "provenance_artifacts": provenance_artifacts,
     }
+    if production_provenance is not None:
+        source_completion = metadata["source_completion"]
+        assert isinstance(source_completion, dict)
+        source_completion["completion_mode"] = (
+            PRODUCTION_CI_COMPLETION_MODE
+        )
+        source_completion["production_complete"] = True
+        source_completion["acquisition_provenance_sha256"] = (
+            _canonical_sha256(production_provenance)
+        )
     return allowed, metadata
 
 
@@ -832,7 +993,11 @@ def _load_ci_manifest_allowlist(
         raise RuntimeError(f"invalid CI manifest {manifest_path}: {error}") from error
     if (
         isinstance(manifest, dict)
-        and manifest.get("schema") == CI_CONTENT_STORE_EXPORT_SCHEMA
+        and manifest.get("schema")
+        in {
+            CI_CONTENT_STORE_EXPORT_SCHEMA,
+            PRODUCTION_CI_CONTENT_STORE_EXPORT_SCHEMA,
+        }
     ):
         return _load_content_store_ci_export_allowlist(
             manifest_path=manifest_path,
@@ -2520,7 +2685,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "explicit cppmega_ci_fixed_buckets_manifest_v3 or immutable "
-            "cppmega_ci_content_store_case5_export_v2 receipt binding the CI "
+            "cppmega_ci_content_store_case5_export_v2/v3 receipt binding the CI "
             "source inventory, lossless splits, shard hashes and reject counters"
         ),
     )
@@ -2792,7 +2957,10 @@ def _run_build(
                 args.ci_root.resolve() / str(bucket) / "manifest.json",
                 staged_bucket_manifest,
             )
-    elif ci_manifest["schema"] == CI_CONTENT_STORE_EXPORT_SCHEMA:
+    elif ci_manifest["schema"] in {
+        CI_CONTENT_STORE_EXPORT_SCHEMA,
+        PRODUCTION_CI_CONTENT_STORE_EXPORT_SCHEMA,
+    }:
         raw_provenance_artifacts = ci_manifest.get("provenance_artifacts")
         if not isinstance(raw_provenance_artifacts, list):
             raise RuntimeError("CI export provenance artifact list is missing")

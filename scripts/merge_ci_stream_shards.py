@@ -41,6 +41,7 @@ import sqlite3
 import stat
 import struct
 import sys
+import tempfile
 from types import SimpleNamespace
 from typing import Any, Iterable, Iterator, Mapping, Sequence, cast
 import zlib
@@ -53,24 +54,48 @@ if str(_REPO_ROOT) not in sys.path:
 from scripts.ci_content_store import (  # noqa: E402
     CIContentStore,
     ContentStoreError,
+    RECEIPT_SCHEMA as STORE_RECEIPT_SCHEMA,
+    STORE_SCHEMA,
     ThresholdNotMetError,
     _hash_records,
+    _script_sha256 as _current_store_script_sha256,
     _sqlite_schema_sha256,
 )
+from scripts.ci_fetch_state_migration import (  # noqa: E402
+    CURRENT_V4_SQLITE_SCHEMA_SHA256,
+    FetchStateMigrationError,
+    LEGACY_FETCH_STATE_SCHEMA,
+    LEGACY_V3_SQLITE_SCHEMA_SHA256,
+    PROJECTION_SCHEMA as FETCH_STATE_PROJECTION_SCHEMA,
+    project_fetch_state_v3_to_v4,
+)
 from scripts.ci_stream_fetch import (  # noqa: E402
+    COMPLETION_MODE_INVENTORY_EXHAUSTIVE,
+    COMPLETION_MODE_THRESHOLD,
+    EXHAUSTIVE_RECEIPT_SCHEMA,
     RECEIPT_SCHEMA as FETCH_RECEIPT_SCHEMA,
     SCHEMA_VERSION as FETCH_STATE_SCHEMA,
     _BINDING_KEYS,
     _STATE_SCHEMA as FETCH_STATE_SQL_SCHEMA,
     ExactTokenizer,
+    _parser_sha256 as _current_parser_script_sha256,
+    _script_sha256 as _current_fetcher_script_sha256,
+)
+from scripts.ci_stream_receipts import (  # noqa: E402
+    ReceiptFinalizationError,
+    convergent_transition_layout,
+    exhaustive_coverage_proof,
+    verify_continuation_seed_inclusion,
 )
 from scripts.ci_stream_inventory import (  # noqa: E402
+    CompletionError as InventoryCompletionError,
     InventoryDB,
     InventoryError,
     RECEIPT_SCHEMA as INVENTORY_RECEIPT_SCHEMA,
     _SCHEMA_SQL as INVENTORY_SQL,
     format_utc_instant,
     parse_utc_instant,
+    verify_inventory_completion_receipt,
 )
 from scripts.export_ci_content_store_case5 import (  # noqa: E402
     ExportError,
@@ -86,11 +111,19 @@ from scripts.export_ci_content_store_case5 import (  # noqa: E402
 
 
 MANIFEST_SCHEMA = "cppmega_ci_stream_shard_union_manifest_v1"
+PRODUCTION_MANIFEST_SCHEMA = "cppmega_ci_stream_shard_union_manifest_v2"
 MERGE_RECEIPT_SCHEMA = "cppmega_ci_stream_shard_union_receipt_v2"
-JOURNAL_SCHEMA = "cppmega_ci_stream_shard_union_journal_v2"
+PRODUCTION_MERGE_RECEIPT_SCHEMA = "cppmega_ci_stream_shard_union_receipt_v3"
+JOURNAL_SCHEMA = "cppmega_ci_stream_shard_union_journal_v3"
+LEGACY_JOURNAL_SCHEMA = "cppmega_ci_stream_shard_union_journal_v2"
+LEGACY_JOURNAL_V2_SQLITE_SCHEMA_SHA256 = (
+    "4c6b8ca741d23cef72dd3db379620e34d18969863622de42daded25b50f2ac28"
+)
+MIGRATION_SCHEMA = "cppmega_ci_stream_union_fresh_replay_migration_v1"
+MIGRATION_MODE = "fresh-v3-journal-v4-state-replay"
 REQUEST_MAP_SCHEMA = "cppmega_ci_stream_request_id_map_v1"
-BINDING_MAP_SCHEMA = "cppmega_ci_stream_binding_id_map_v2"
-ATTEMPT_MAP_SCHEMA = "cppmega_ci_stream_attempt_resolution_v1"
+BINDING_MAP_SCHEMA = "cppmega_ci_stream_binding_id_map_v3"
+ATTEMPT_MAP_SCHEMA = "cppmega_ci_stream_attempt_resolution_v2"
 MEMBER_MAP_SCHEMA = "cppmega_ci_stream_member_resolution_v1"
 TIME_SHARD_INVENTORY_SCHEMA = "cppmega_ci_inventory_time_shard_v1"
 INVENTORY_BINDING_SCHEMA = "cppmega_ci_stream_union_inventory_binding_v2"
@@ -142,6 +175,7 @@ _ATTEMPT_COLUMNS = (
     "archive_source",
     "archive_sha256",
     "archive_size",
+    "archive_zlib",
     "jobs_sha256",
     "jobs_raw_size",
     "jobs_zlib",
@@ -274,10 +308,21 @@ CREATE TABLE IF NOT EXISTS attempt_map (
     outcome TEXT NOT NULL CHECK(
       outcome IN (
         'inserted','exact_overlap','pending_shadowed_by_done',
-        'done_replaced_zero_evidence_pending'
+        'done_replaced_zero_evidence_pending',
+        'lower_evidence_shadowed','higher_evidence_replaced',
+        'exact_overlap_promoted_higher_precedence'
       )
     ),
     PRIMARY KEY(shard_id,source_key_json)
+);
+CREATE TABLE IF NOT EXISTS attempt_winners (
+    source_key_json TEXT PRIMARY KEY,
+    shard_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(
+      role IN ('legacy-coverage','coverage','seed')
+    ),
+    evidence_rank INTEGER NOT NULL,
+    source_row_sha256 TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS member_map (
     shard_id TEXT NOT NULL,
@@ -350,8 +395,28 @@ class StoreDescriptor:
 
 
 @dataclass(frozen=True)
+class MigrationSpec:
+    schema: str
+    mode: str
+    legacy_partial: Path
+    legacy_partial_artifact_set_sha256: str
+    source_manifest: Path
+    source_manifest_sha256: str
+    source_manifest_schema: str
+    source_journal: Path
+    source_journal_sha256: str
+    source_journal_schema: str
+    source_journal_sqlite_schema_sha256: str
+    source_cas: Path
+    source_cas_artifact_set_sha256: str
+    source_cas_receipt_schema: str
+    source_cas_store_schema: str
+
+
+@dataclass(frozen=True)
 class ShardSpec:
     shard_id: str
+    role: str
     original_inventory: str
     original_store: str
     original_state: str
@@ -382,6 +447,8 @@ class Manifest:
     tokenizer_sha256: str
     limits: Limits
     shards: tuple[ShardSpec, ...]
+    completion_mode: str
+    migration: MigrationSpec | None
 
 
 @dataclass(frozen=True)
@@ -394,11 +461,29 @@ class SourceAudit:
     inventory_proof: dict[str, Any]
     store_files: tuple[SnapshotFile, ...]
     state_file: SnapshotFile
+    effective_state_path: Path
+    effective_state_file: SnapshotFile
+    original_state_binding: dict[str, Any]
     inventory_file: SnapshotFile
     receipt_files: tuple[SnapshotFile, ...]
     state_binding: dict[str, Any]
     store_counts: dict[str, int]
     state_counts: dict[str, int]
+    continuation_seed_path: Path | None
+    continuation_inclusion: dict[str, object] | None
+    continuation_base_state: Path | None
+    state_projection: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class MigrationAudit:
+    spec: MigrationSpec
+    legacy_partial_files: tuple[SnapshotFile, ...]
+    legacy_partial_file_identities: frozenset[tuple[int, int]]
+    source_manifest_file: SnapshotFile
+    source_journal_file: SnapshotFile
+    source_journal_settings: dict[str, str]
+    source_journal_audit: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -583,6 +668,152 @@ def _store_descriptor(value: object, *, where: str) -> StoreDescriptor:
     )
 
 
+def _migration_spec(value: object, *, where: str) -> MigrationSpec:
+    item = _require_mapping(value, where=where)
+    _require_exact_keys(
+        item,
+        {
+            "schema",
+            "mode",
+            "legacy_partial",
+            "source_manifest",
+            "source_journal",
+            "source_cas",
+        },
+        where=where,
+    )
+    if item.get("schema") != MIGRATION_SCHEMA:
+        raise MergeError(f"{where}.schema must be {MIGRATION_SCHEMA!r}")
+    if item.get("mode") != MIGRATION_MODE:
+        raise MergeError(f"{where}.mode must be {MIGRATION_MODE!r}")
+
+    partial = _require_mapping(
+        item["legacy_partial"],
+        where=f"{where}.legacy_partial",
+    )
+    _require_exact_keys(
+        partial,
+        {"path", "artifact_set_sha256"},
+        where=f"{where}.legacy_partial",
+    )
+    source_manifest = _require_mapping(
+        item["source_manifest"],
+        where=f"{where}.source_manifest",
+    )
+    _require_exact_keys(
+        source_manifest,
+        {"path", "sha256", "schema"},
+        where=f"{where}.source_manifest",
+    )
+    source_journal = _require_mapping(
+        item["source_journal"],
+        where=f"{where}.source_journal",
+    )
+    _require_exact_keys(
+        source_journal,
+        {"path", "sha256", "schema", "sqlite_schema_sha256"},
+        where=f"{where}.source_journal",
+    )
+    source_cas = _require_mapping(
+        item["source_cas"],
+        where=f"{where}.source_cas",
+    )
+    _require_exact_keys(
+        source_cas,
+        {
+            "path",
+            "artifact_set_sha256",
+            "receipt_schema",
+            "store_schema",
+        },
+        where=f"{where}.source_cas",
+    )
+
+    manifest_schema = _require_string(
+        source_manifest["schema"],
+        where=f"{where}.source_manifest.schema",
+    )
+    if manifest_schema != MANIFEST_SCHEMA:
+        raise MergeError(
+            f"{where}.source_manifest.schema must be the legacy threshold "
+            f"schema {MANIFEST_SCHEMA!r}"
+        )
+    journal_schema = _require_string(
+        source_journal["schema"],
+        where=f"{where}.source_journal.schema",
+    )
+    if journal_schema != LEGACY_JOURNAL_SCHEMA:
+        raise MergeError(
+            f"{where}.source_journal.schema must be {LEGACY_JOURNAL_SCHEMA!r}"
+        )
+    journal_sqlite_schema = _require_hex64(
+        source_journal["sqlite_schema_sha256"],
+        where=f"{where}.source_journal.sqlite_schema_sha256",
+    )
+    if journal_sqlite_schema != LEGACY_JOURNAL_V2_SQLITE_SCHEMA_SHA256:
+        raise MergeError(
+            f"{where}.source_journal.sqlite_schema_sha256 must bind the "
+            "canonical legacy v2 journal"
+        )
+    receipt_schema = _require_string(
+        source_cas["receipt_schema"],
+        where=f"{where}.source_cas.receipt_schema",
+    )
+    store_schema = _require_string(
+        source_cas["store_schema"],
+        where=f"{where}.source_cas.store_schema",
+    )
+    if (receipt_schema, store_schema) != (
+        STORE_RECEIPT_SCHEMA,
+        STORE_SCHEMA,
+    ):
+        raise MergeError(
+            f"{where}.source_cas receipt/store schema tuple is unsupported"
+        )
+
+    return MigrationSpec(
+        schema=MIGRATION_SCHEMA,
+        mode=MIGRATION_MODE,
+        legacy_partial=_local_path(
+            partial["path"],
+            where=f"{where}.legacy_partial.path",
+        ),
+        legacy_partial_artifact_set_sha256=_require_hex64(
+            partial["artifact_set_sha256"],
+            where=f"{where}.legacy_partial.artifact_set_sha256",
+        ),
+        source_manifest=_local_path(
+            source_manifest["path"],
+            where=f"{where}.source_manifest.path",
+        ),
+        source_manifest_sha256=_require_hex64(
+            source_manifest["sha256"],
+            where=f"{where}.source_manifest.sha256",
+        ),
+        source_manifest_schema=manifest_schema,
+        source_journal=_local_path(
+            source_journal["path"],
+            where=f"{where}.source_journal.path",
+        ),
+        source_journal_sha256=_require_hex64(
+            source_journal["sha256"],
+            where=f"{where}.source_journal.sha256",
+        ),
+        source_journal_schema=journal_schema,
+        source_journal_sqlite_schema_sha256=journal_sqlite_schema,
+        source_cas=_local_path(
+            source_cas["path"],
+            where=f"{where}.source_cas.path",
+        ),
+        source_cas_artifact_set_sha256=_require_hex64(
+            source_cas["artifact_set_sha256"],
+            where=f"{where}.source_cas.artifact_set_sha256",
+        ),
+        source_cas_receipt_schema=receipt_schema,
+        source_cas_store_schema=store_schema,
+    )
+
+
 def load_manifest(path: str | os.PathLike[str]) -> Manifest:
     """Load and strictly validate one canonical shard-union manifest."""
 
@@ -590,13 +821,43 @@ def load_manifest(path: str | os.PathLike[str]) -> Manifest:
     value, raw = _load_json(manifest_path, where="union manifest")
     if raw != _canonical_json_bytes(value) + b"\n":
         raise MergeError("union manifest is not canonical compact JSON plus newline")
-    _require_exact_keys(
-        value,
-        {"schema", "destination", "tokenizer", "limits", "shards"},
-        where="union manifest",
-    )
-    if value["schema"] != MANIFEST_SCHEMA:
-        raise MergeError(f"union manifest schema must be {MANIFEST_SCHEMA!r}")
+    schema = value.get("schema")
+    if schema == MANIFEST_SCHEMA:
+        expected = {"schema", "destination", "tokenizer", "limits", "shards"}
+        if "migration" in value:
+            expected.add("migration")
+        _require_exact_keys(value, expected, where="union manifest")
+        completion_mode = COMPLETION_MODE_THRESHOLD
+    elif schema == PRODUCTION_MANIFEST_SCHEMA:
+        expected = {
+            "schema",
+            "completion_mode",
+            "destination",
+            "tokenizer",
+            "limits",
+            "shards",
+        }
+        if "migration" in value:
+            expected.add("migration")
+        _require_exact_keys(
+            value,
+            expected,
+            where="union manifest",
+        )
+        if (
+            value.get("completion_mode")
+            != COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+        ):
+            raise MergeError(
+                "production union manifest completion_mode must be "
+                "'inventory-exhaustive'"
+            )
+        completion_mode = COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+    else:
+        raise MergeError(
+            "union manifest schema must be a supported threshold v1 or "
+            "production exhaustive v2 schema"
+        )
 
     destination = _require_mapping(value["destination"], where="destination")
     _require_exact_keys(
@@ -681,11 +942,12 @@ def load_manifest(path: str | os.PathLike[str]) -> Manifest:
     for index, raw_shard in enumerate(raw_shards):
         where = f"shards[{index}]"
         item = _require_mapping(raw_shard, where=where)
-        _require_exact_keys(
-            item,
-            {"id", "original_paths", "staged"},
-            where=where,
+        expected_shard_keys = (
+            {"id", "original_paths", "staged"}
+            if completion_mode == COMPLETION_MODE_THRESHOLD
+            else {"id", "role", "original_paths", "staged"}
         )
+        _require_exact_keys(item, expected_shard_keys, where=where)
         shard_id = _require_string(item["id"], where=f"{where}.id")
         if _SHARD_ID_RE.fullmatch(shard_id) is None:
             raise MergeError(f"{where}.id is not a canonical shard identifier")
@@ -707,6 +969,14 @@ def load_manifest(path: str | os.PathLike[str]) -> Manifest:
         shards.append(
             ShardSpec(
                 shard_id=shard_id,
+                role=(
+                    "legacy-coverage"
+                    if completion_mode == COMPLETION_MODE_THRESHOLD
+                    else _require_string(
+                        item["role"],
+                        where=f"{where}.role",
+                    )
+                ),
                 original_inventory=_original_path(
                     originals["inventory"],
                     where=f"{where}.original_paths.inventory",
@@ -733,6 +1003,14 @@ def load_manifest(path: str | os.PathLike[str]) -> Manifest:
                 ),
             )
         )
+        if shards[-1].role not in {
+            "legacy-coverage",
+            "coverage",
+            "seed",
+        }:
+            raise MergeError(
+                f"{where}.role must be 'coverage' or 'seed'"
+            )
     shard_ids = [shard.shard_id for shard in shards]
     if shard_ids != sorted(shard_ids) or len(set(shard_ids)) != len(shard_ids):
         raise MergeError("shards must be uniquely sorted by canonical id")
@@ -766,6 +1044,55 @@ def load_manifest(path: str | os.PathLike[str]) -> Manifest:
         )
     if inventory_artifact_paths & {str(path) for path in exclusive_paths}:
         raise MergeError("inventory and non-inventory staged paths overlap")
+    migration = (
+        None
+        if "migration" not in value
+        else _migration_spec(value["migration"], where="migration")
+    )
+    if migration is not None:
+        if completion_mode != COMPLETION_MODE_THRESHOLD:
+            raise MergeError(
+                "fresh replay migration currently accepts only a legacy "
+                "threshold union as its complete semantic oracle"
+            )
+        if len(shards) != 1:
+            raise MergeError(
+                "fresh replay migration requires exactly one legacy union source"
+            )
+        source = shards[0]
+        expected_paths = {
+            source.inventory.path: migration.legacy_partial / _INVENTORY_NAME,
+            source.store.path: migration.legacy_partial / _STORE_DIRECTORY,
+            source.store.receipt.path: (
+                migration.legacy_partial / _STORE_RECEIPT_NAME
+            ),
+            source.state.path: migration.legacy_partial / _FETCH_STATE_NAME,
+            source.state.receipt.path: (
+                migration.legacy_partial / _FETCH_RECEIPT_NAME
+            ),
+        }
+        if any(actual != expected for actual, expected in expected_paths.items()):
+            raise MergeError(
+                "fresh replay shard paths must name the canonical artifacts "
+                "inside migration.legacy_partial"
+            )
+        if source.inventory.receipt is None or source.inventory.receipt.path != (
+            migration.legacy_partial / _INVENTORY_RECEIPT_NAME
+        ):
+            raise MergeError(
+                "fresh replay requires the canonical legacy inventory receipt"
+            )
+        if (
+            migration.source_journal
+            != migration.legacy_partial / _JOURNAL_NAME
+            or migration.source_cas != source.store.path
+            or migration.source_cas_artifact_set_sha256
+            != source.store.artifact_set_sha256
+        ):
+            raise MergeError(
+                "fresh replay migration journal/CAS bindings do not match "
+                "the legacy partial shard"
+            )
     return Manifest(
         path=manifest_path,
         sha256=_sha256_bytes(raw),
@@ -776,6 +1103,8 @@ def load_manifest(path: str | os.PathLike[str]) -> Manifest:
         tokenizer_sha256=tokenizer_sha256,
         limits=limits,
         shards=tuple(shards),
+        completion_mode=completion_mode,
+        migration=migration,
     )
 
 
@@ -866,6 +1195,94 @@ def _store_artifact_set_digest(files: Iterable[SnapshotFile]) -> str:
     return _hash_records("cppmega-ci-frozen-store-artifact-set-v1", records)
 
 
+def _snapshot_directory(
+    root: Path,
+    *,
+    label: str,
+) -> tuple[SnapshotFile, ...]:
+    if root.is_symlink() or not root.is_dir():
+        raise MergeError(f"{label} is missing or unsafe: {root}")
+    snapshots: list[SnapshotFile] = []
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise MergeError(f"{label} contains a symlink: {path}")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise MergeError(f"{label} contains a non-regular artifact: {path}")
+        snapshot = _snapshot_file(path, label=f"{label} artifact")
+        snapshots.append(
+            SnapshotFile(
+                relative_path=path.relative_to(root).as_posix(),
+                size=snapshot.size,
+                mtime_ns=snapshot.mtime_ns,
+                inode=snapshot.inode,
+                sha256=snapshot.sha256,
+            )
+        )
+    return tuple(snapshots)
+
+
+def _snapshot_directory_file_identities(
+    root: Path,
+    snapshots: Sequence[SnapshotFile],
+    *,
+    label: str,
+) -> frozenset[tuple[int, int]]:
+    identities: set[tuple[int, int]] = set()
+    for snapshot in snapshots:
+        path = root / snapshot.relative_path
+        try:
+            metadata = os.lstat(path)
+        except OSError as exc:
+            raise MergeError(f"{label} artifact disappeared: {path}") from exc
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or (
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ino,
+            )
+            != (
+                snapshot.size,
+                snapshot.mtime_ns,
+                snapshot.inode,
+            )
+        ):
+            raise MergeError(
+                f"{label} artifact identity changed while it was frozen: {path}"
+            )
+        identities.add((metadata.st_dev, metadata.st_ino))
+    return frozenset(identities)
+
+
+def _directory_artifact_set_sha256(
+    root: Path,
+    *,
+    label: str,
+) -> str:
+    return _directory_snapshot_digest(
+        _snapshot_directory(root, label=label)
+    )
+
+
+def _directory_snapshot_digest(
+    snapshots: Iterable[SnapshotFile],
+) -> str:
+    return _hash_records(
+        "cppmega-ci-directory-artifact-set-v1",
+        (
+            {
+                "path": snapshot.relative_path,
+                "byte_size": snapshot.size,
+                "sha256": snapshot.sha256,
+            }
+            for snapshot in snapshots
+        ),
+    )
+
+
 def frozen_store_artifact_set_sha256(
     store_path: str | os.PathLike[str],
     receipt_path: str | os.PathLike[str],
@@ -878,12 +1295,721 @@ def frozen_store_artifact_set_sha256(
         return result
 
 
+def build_canonical_manifest(
+    output_path: str | os.PathLike[str],
+    *,
+    destination: str | os.PathLike[str],
+    tokenizer_path: str | os.PathLike[str],
+    target_unique_tokens: int,
+    shards: Sequence[Mapping[str, object]],
+    completion_mode: str = COMPLETION_MODE_INVENTORY_EXHAUSTIVE,
+    limits: Mapping[str, int] | None = None,
+    migration: Mapping[str, object] | None = None,
+) -> dict[str, Any]:
+    """Build the strict manifest from frozen artifacts instead of hand hashes."""
+
+    if completion_mode not in {
+        COMPLETION_MODE_INVENTORY_EXHAUSTIVE,
+        COMPLETION_MODE_THRESHOLD,
+    }:
+        raise ValueError("completion_mode is unsupported")
+    if (
+        completion_mode == COMPLETION_MODE_THRESHOLD
+        and migration is None
+    ):
+        raise ValueError(
+            "the canonical builder emits threshold manifests only for an "
+            "explicit fresh replay migration"
+        )
+    if (
+        completion_mode == COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+        and migration is not None
+    ):
+        raise ValueError(
+            "fresh replay migration accepts one complete legacy threshold "
+            "union, not a production coverage manifest"
+        )
+    tokenizer = Path(tokenizer_path).expanduser().resolve()
+    bundle = Path(destination).expanduser().resolve()
+    defaults = {
+        "max_shards": 128,
+        "occurrences_per_batch": 10_000,
+        "state_rows_per_batch": 10_000,
+        "uncompressed_bytes_per_batch": 512 * 1024 * 1024,
+        "max_content_bytes": 128 * 1024 * 1024,
+        "max_provenance_bytes": 128 * 1024 * 1024,
+        "max_state_blob_bytes": 128 * 1024 * 1024,
+    }
+    if limits is not None:
+        if set(limits) != set(defaults):
+            raise ValueError("manifest limits must provide the exact limit set")
+        defaults = {key: int(limits[key]) for key in defaults}
+    built_shards: list[dict[str, object]] = []
+    for index, item in enumerate(shards):
+        required = {
+            "id",
+            "role",
+            "inventory",
+            "inventory_receipt",
+            "content_store",
+            "store_receipt",
+            "fetch_state",
+            "fetch_receipt",
+        }
+        if set(item) != required:
+            raise ValueError(
+                f"shard {index} keys differ; expected {sorted(required)}"
+            )
+        inventory = Path(str(item["inventory"])).expanduser().resolve()
+        inventory_receipt = (
+            None
+            if item["inventory_receipt"] is None
+            else Path(
+                str(item["inventory_receipt"])
+            ).expanduser().resolve()
+        )
+        store = Path(str(item["content_store"])).expanduser().resolve()
+        store_receipt = Path(
+            str(item["store_receipt"])
+        ).expanduser().resolve()
+        state = Path(str(item["fetch_state"])).expanduser().resolve()
+        fetch_receipt_path = Path(
+            str(item["fetch_receipt"])
+        ).expanduser().resolve()
+        inventory_value = None
+        if inventory_receipt is not None:
+            inventory_value, _inventory_raw = _load_json(
+                inventory_receipt,
+                where=f"builder shard {index} inventory receipt",
+            )
+        fetch_value, _fetch_raw = _load_json(
+            fetch_receipt_path,
+            where=f"builder shard {index} fetch receipt",
+        )
+        frozen_state = _require_mapping(
+            fetch_value.get("frozen_fetch_state"),
+            where=f"builder shard {index} frozen_fetch_state",
+        )
+        state_artifact = _require_mapping(
+            frozen_state.get("artifact"),
+            where=f"builder shard {index} frozen_fetch_state.artifact",
+        )
+        settings = _require_mapping(
+            frozen_state.get("settings"),
+            where=f"builder shard {index} frozen_fetch_state.settings",
+        )
+        inventory_descriptor: dict[str, object] = {
+            "path": str(inventory),
+            "sha256": _sha256_file(inventory),
+        }
+        if inventory_receipt is not None:
+            inventory_descriptor["receipt"] = {
+                "path": str(inventory_receipt),
+                "sha256": _sha256_file(inventory_receipt),
+            }
+        built_shard: dict[str, object] = {
+            "id": str(item["id"]),
+            "original_paths": {
+                "inventory": (
+                    str(inventory_value["database"])
+                    if inventory_value is not None
+                    else str(settings["inventory_path"])
+                ),
+                "content_store": str(settings["content_store_path"]),
+                "fetch_state": str(state_artifact["path"]),
+            },
+            "staged": {
+                "inventory": inventory_descriptor,
+                "content_store": {
+                    "path": str(store),
+                    "artifact_set_sha256": (
+                        frozen_store_artifact_set_sha256(
+                            store,
+                            store_receipt,
+                        )
+                    ),
+                    "receipt": {
+                        "path": str(store_receipt),
+                        "sha256": _sha256_file(store_receipt),
+                    },
+                },
+                "fetch_state": {
+                    "path": str(state),
+                    "sha256": _sha256_file(state),
+                    "receipt": {
+                        "path": str(fetch_receipt_path),
+                        "sha256": _sha256_file(fetch_receipt_path),
+                    },
+                },
+            },
+        }
+        if completion_mode == COMPLETION_MODE_INVENTORY_EXHAUSTIVE:
+            built_shard["role"] = str(item["role"])
+        built_shards.append(built_shard)
+    built_shards.sort(key=lambda value: str(value["id"]))
+    value: dict[str, Any] = {
+        "schema": (
+            PRODUCTION_MANIFEST_SCHEMA
+            if completion_mode == COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+            else MANIFEST_SCHEMA
+        ),
+        "destination": {
+            "bundle_path": str(bundle),
+            "target_exact_unique_payload_tokens": target_unique_tokens,
+        },
+        "tokenizer": {
+            "path": str(tokenizer),
+            "sha256": _sha256_file(tokenizer),
+        },
+        "limits": defaults,
+        "shards": built_shards,
+    }
+    if completion_mode == COMPLETION_MODE_INVENTORY_EXHAUSTIVE:
+        value["completion_mode"] = COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+    if migration is not None:
+        if set(migration) != {
+            "legacy_partial",
+            "source_manifest",
+            "source_journal",
+        }:
+            raise ValueError(
+                "migration must provide exactly legacy_partial, "
+                "source_manifest, and source_journal"
+            )
+        if len(built_shards) != 1:
+            raise ValueError(
+                "fresh replay migration requires one complete legacy source"
+            )
+        legacy_partial = Path(
+            str(migration["legacy_partial"])
+        ).expanduser().resolve()
+        source_manifest_path = Path(
+            str(migration["source_manifest"])
+        ).expanduser().resolve()
+        source_journal_path = Path(
+            str(migration["source_journal"])
+        ).expanduser().resolve()
+        source_manifest_value, source_manifest_raw = _load_json(
+            source_manifest_path,
+            where="builder legacy source manifest",
+        )
+        if (
+            source_manifest_raw
+            != _canonical_json_bytes(source_manifest_value) + b"\n"
+            or source_manifest_value.get("schema") != MANIFEST_SCHEMA
+        ):
+            raise ValueError(
+                "legacy source manifest is not canonical threshold v1"
+            )
+        _require_frozen_sqlite(
+            source_journal_path,
+            label="builder legacy merge journal",
+        )
+        source_journal_connection = sqlite3.connect(
+            (
+                f"{source_journal_path.as_uri()}"
+                "?mode=ro&immutable=1"
+            ),
+            uri=True,
+        )
+        source_journal_connection.row_factory = sqlite3.Row
+        try:
+            source_journal_schema_sha256 = _sqlite_schema_sha256(
+                source_journal_connection
+            )
+        finally:
+            source_journal_connection.close()
+        if (
+            source_journal_schema_sha256
+            != LEGACY_JOURNAL_V2_SQLITE_SCHEMA_SHA256
+        ):
+            raise ValueError(
+                "source journal is not the canonical immutable legacy v2 journal"
+            )
+        source_store = legacy_partial / _STORE_DIRECTORY
+        source_store_receipt = legacy_partial / _STORE_RECEIPT_NAME
+        source_store_receipt_value, _source_store_receipt_raw = _load_json(
+            source_store_receipt,
+            where="builder legacy store receipt",
+        )
+        source_cas_artifact_set_sha256 = (
+            frozen_store_artifact_set_sha256(
+                source_store,
+                source_store_receipt,
+            )
+        )
+        value["migration"] = {
+            "schema": MIGRATION_SCHEMA,
+            "mode": MIGRATION_MODE,
+            "legacy_partial": {
+                "path": str(legacy_partial),
+                "artifact_set_sha256": _directory_artifact_set_sha256(
+                    legacy_partial,
+                    label="builder legacy partial",
+                ),
+            },
+            "source_manifest": {
+                "path": str(source_manifest_path),
+                "sha256": _sha256_bytes(source_manifest_raw),
+                "schema": MANIFEST_SCHEMA,
+            },
+            "source_journal": {
+                "path": str(source_journal_path),
+                "sha256": _sha256_file(source_journal_path),
+                "schema": LEGACY_JOURNAL_SCHEMA,
+                "sqlite_schema_sha256": (
+                    LEGACY_JOURNAL_V2_SQLITE_SCHEMA_SHA256
+                ),
+            },
+            "source_cas": {
+                "path": str(source_store),
+                "artifact_set_sha256": source_cas_artifact_set_sha256,
+                "receipt_schema": source_store_receipt_value.get("schema"),
+                "store_schema": source_store_receipt_value.get(
+                    "store_schema"
+                ),
+            },
+        }
+    output = Path(output_path).expanduser().resolve()
+    _atomic_write(output, _canonical_json_bytes(value) + b"\n")
+    # Reuse the production parser as the final builder self-check.
+    load_manifest(output)
+    return value
+
+
 def _load_bound_receipt(descriptor: ReceiptDescriptor, *, where: str) -> dict[str, Any]:
     value, raw = _load_json(descriptor.path, where=where)
     actual = _sha256_bytes(raw)
     if actual != descriptor.sha256:
         raise MergeError(f"{where} SHA-256 differs from the manifest")
     return value
+
+
+def _legacy_progress_cursor(
+    value: object,
+    *,
+    expected_items: int,
+    where: str,
+) -> tuple[object, ...] | None:
+    if value is None:
+        return None
+    raw = str(value)
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise MergeError(f"{where} cursor is invalid JSON") from exc
+    if (
+        not isinstance(decoded, list)
+        or len(decoded) != expected_items
+        or _canonical_json(decoded) != raw
+    ):
+        raise MergeError(f"{where} cursor is not canonical or has the wrong shape")
+    return tuple(decoded)
+
+
+def _audit_legacy_ready_journal(
+    journal: sqlite3.Connection,
+    *,
+    source_shard_ids: Sequence[str],
+) -> dict[str, Any]:
+    expected_shards = set(source_shard_ids)
+    store_rows = {
+        str(row["shard_id"]): row
+        for row in journal.execute(
+            "SELECT * FROM store_progress ORDER BY shard_id"
+        )
+    }
+    if set(store_rows) != expected_shards:
+        raise MergeError(
+            "legacy ready journal store progress differs from its source manifest"
+        )
+
+    state_tables = (
+        "attempts",
+        "members",
+        "request_ledger",
+        "binding_upgrades",
+    )
+    state_rows = {
+        (str(row["shard_id"]), str(row["table_name"])): row
+        for row in journal.execute(
+            "SELECT * FROM state_progress ORDER BY shard_id,table_name"
+        )
+    }
+    expected_state_rows = {
+        (shard_id, table)
+        for shard_id in expected_shards
+        for table in state_tables
+    }
+    if set(state_rows) != expected_state_rows:
+        raise MergeError(
+            "legacy ready journal state progress differs from its source manifest"
+        )
+
+    def validate_progress(
+        row: sqlite3.Row,
+        *,
+        cursor_items: int,
+        where: str,
+    ) -> tuple[int, int]:
+        processed_rows = int(row["processed_rows"])
+        batches = int(row["batches"])
+        cursor = _legacy_progress_cursor(
+            row["cursor_json"],
+            expected_items=cursor_items,
+            where=where,
+        )
+        if (
+            int(row["done"]) != 1
+            or processed_rows < 0
+            or batches < 0
+            or (
+                processed_rows == 0
+                and (cursor is not None or batches != 0)
+            )
+            or (
+                processed_rows > 0
+                and (
+                    cursor is None
+                    or not 1 <= batches <= processed_rows
+                )
+            )
+        ):
+            raise MergeError(
+                f"{where} is not a canonical completed traversal"
+            )
+        return processed_rows, batches
+
+    store_processed = 0
+    store_batches = 0
+    for shard_id, row in store_rows.items():
+        processed, batches = validate_progress(
+            row,
+            cursor_items=5,
+            where=f"legacy store progress {shard_id}",
+        )
+        store_processed += processed
+        store_batches += batches
+
+    cursor_items = {
+        "attempts": 3,
+        "members": 4,
+        "request_ledger": 1,
+        "binding_upgrades": 1,
+    }
+    state_processed: dict[str, int] = {table: 0 for table in state_tables}
+    state_batches = 0
+    for (shard_id, table), row in state_rows.items():
+        processed, batches = validate_progress(
+            row,
+            cursor_items=cursor_items[table],
+            where=f"legacy state progress {shard_id}/{table}",
+        )
+        state_processed[table] += processed
+        state_batches += batches
+
+    map_by_state_table = {
+        "attempts": "attempt_map",
+        "members": "member_map",
+        "request_ledger": "request_id_map",
+        "binding_upgrades": "binding_id_map",
+    }
+    resolution_counts: dict[str, int] = {}
+    for state_table, map_table in map_by_state_table.items():
+        counts = {
+            str(row["shard_id"]): int(row["n"])
+            for row in journal.execute(
+                f"""
+                SELECT shard_id,COUNT(*) AS n
+                FROM {map_table}
+                GROUP BY shard_id
+                ORDER BY shard_id
+                """
+            )
+        }
+        if set(counts) - expected_shards:
+            raise MergeError(
+                f"legacy ready journal {map_table} contains an unknown shard"
+            )
+        for shard_id in expected_shards:
+            expected_rows = int(
+                state_rows[(shard_id, state_table)]["processed_rows"]
+            )
+            if counts.get(shard_id, 0) != expected_rows:
+                raise MergeError(
+                    f"legacy ready journal {map_table} does not account for "
+                    f"every processed {state_table} row in {shard_id}"
+                )
+        resolution_counts[map_table] = sum(counts.values())
+
+    return {
+        "schema": "cppmega_ci_stream_legacy_journal_audit_v1",
+        "phase": "ready",
+        "source_shards": list(source_shard_ids),
+        "store_progress": {
+            "rows": len(store_rows),
+            "processed_rows": store_processed,
+            "batches": store_batches,
+            "all_done": True,
+            "cursor_shapes_valid": True,
+        },
+        "state_progress": {
+            "rows": len(state_rows),
+            "processed_rows": dict(sorted(state_processed.items())),
+            "batches": state_batches,
+            "all_done": True,
+            "cursor_shapes_valid": True,
+        },
+        "resolution_maps": {
+            **dict(sorted(resolution_counts.items())),
+            "counts_equal_state_progress": True,
+        },
+        "semantic_role": "immutable-lineage-only",
+        "used_for_resume": False,
+        "used_for_output_semantics": False,
+    }
+
+
+def _preflight_migration(manifest: Manifest) -> MigrationAudit | None:
+    spec = manifest.migration
+    if spec is None:
+        return None
+    if (
+        spec.legacy_partial == manifest.destination
+        or spec.legacy_partial
+        == manifest.destination.with_name(f".{manifest.destination.name}.partial")
+        or manifest.destination in spec.legacy_partial.parents
+        or spec.legacy_partial in manifest.destination.parents
+    ):
+        raise MergeError(
+            "fresh replay destination must be disjoint from the legacy partial"
+        )
+    source_manifest_file = _snapshot_file(
+        spec.source_manifest,
+        label="legacy source manifest",
+    )
+    if source_manifest_file.sha256 != spec.source_manifest_sha256:
+        raise MergeError("legacy source manifest hash differs from migration")
+    source_manifest_value, source_manifest_raw = _load_json(
+        spec.source_manifest,
+        where="legacy source manifest",
+    )
+    if (
+        source_manifest_raw
+        != _canonical_json_bytes(source_manifest_value) + b"\n"
+        or source_manifest_value.get("schema")
+        != spec.source_manifest_schema
+    ):
+        raise MergeError(
+            "legacy source manifest is not canonical threshold v1"
+        )
+    source_manifest = load_manifest(spec.source_manifest)
+    if (
+        source_manifest.sha256 != spec.source_manifest_sha256
+        or source_manifest.completion_mode != COMPLETION_MODE_THRESHOLD
+        or source_manifest.migration is not None
+    ):
+        raise MergeError(
+            "legacy source manifest is not an original threshold replay"
+        )
+    source_shard_ids = tuple(
+        shard.shard_id for shard in source_manifest.shards
+    )
+    source_destination = _require_mapping(
+        source_manifest_value.get("destination"),
+        where="legacy source manifest destination",
+    )
+    source_destination_path = _local_path(
+        source_destination.get("bundle_path"),
+        where="legacy source manifest destination.bundle_path",
+    )
+    if spec.legacy_partial != source_destination_path.with_name(
+        f".{source_destination_path.name}.partial"
+    ):
+        raise MergeError(
+            "legacy partial path is not derived from its source manifest destination"
+        )
+    if spec.source_manifest == manifest.path:
+        raise MergeError(
+            "fresh replay source manifest must differ from its destination manifest"
+        )
+
+    _require_frozen_sqlite(
+        spec.source_journal,
+        label="legacy merge journal",
+    )
+    source_journal_file = _snapshot_file(
+        spec.source_journal,
+        label="legacy merge journal",
+    )
+    if source_journal_file.sha256 != spec.source_journal_sha256:
+        raise MergeError("legacy merge journal hash differs from migration")
+    journal = sqlite3.connect(
+        f"{spec.source_journal.as_uri()}?mode=ro&immutable=1",
+        uri=True,
+    )
+    journal.row_factory = sqlite3.Row
+    try:
+        integrity = [
+            str(row[0])
+            for row in journal.execute("PRAGMA integrity_check").fetchall()
+        ]
+        if integrity != ["ok"]:
+            raise MergeError(
+                f"legacy merge journal integrity_check failed: {integrity}"
+            )
+        if journal.execute("PRAGMA foreign_key_check").fetchall():
+            raise MergeError("legacy merge journal foreign_key_check failed")
+        actual_journal_schema = _sqlite_schema_sha256(journal)
+        if (
+            actual_journal_schema
+            != spec.source_journal_sqlite_schema_sha256
+            or actual_journal_schema
+            != LEGACY_JOURNAL_V2_SQLITE_SCHEMA_SHA256
+        ):
+            raise MergeError(
+                "legacy merge journal is not the canonical immutable v2 schema"
+            )
+        journal_settings = {
+            str(row["key"]): str(row["value"])
+            for row in journal.execute(
+                "SELECT key,value FROM settings ORDER BY key"
+            )
+        }
+        source_journal_audit = _audit_legacy_ready_journal(
+            journal,
+            source_shard_ids=source_shard_ids,
+        )
+    finally:
+        journal.close()
+    expected_journal_keys = {
+        "schema",
+        "manifest_sha256",
+        "merge_script_sha256",
+        "destination",
+        "phase",
+        "created_at",
+        "completed_at",
+    }
+    if (
+        set(journal_settings) != expected_journal_keys
+        or journal_settings.get("schema") != spec.source_journal_schema
+        or journal_settings.get("manifest_sha256")
+        != spec.source_manifest_sha256
+        or journal_settings.get("destination")
+        != str(source_destination_path)
+        or journal_settings.get("phase") != "ready"
+    ):
+        raise MergeError(
+            "legacy merge journal is not a ready receipt-bound v2 replay"
+        )
+    _require_hex64(
+        journal_settings.get("merge_script_sha256"),
+        where="legacy merge journal merge_script_sha256",
+    )
+    _canonical_binding_upgrade_time(journal_settings.get("created_at"))
+    _canonical_binding_upgrade_time(journal_settings.get("completed_at"))
+
+    legacy_partial_files = _snapshot_directory(
+        spec.legacy_partial,
+        label="legacy partial",
+    )
+    if (
+        _directory_snapshot_digest(legacy_partial_files)
+        != spec.legacy_partial_artifact_set_sha256
+    ):
+        raise MergeError(
+            "legacy partial artifact set differs from migration manifest"
+        )
+    legacy_partial_file_identities = _snapshot_directory_file_identities(
+        spec.legacy_partial,
+        legacy_partial_files,
+        label="legacy partial",
+    )
+    source_manifest_metadata = os.lstat(spec.source_manifest)
+    legacy_partial_file_identities = frozenset(
+        {
+            *legacy_partial_file_identities,
+            (
+                source_manifest_metadata.st_dev,
+                source_manifest_metadata.st_ino,
+            ),
+        }
+    )
+    return MigrationAudit(
+        spec=spec,
+        legacy_partial_files=legacy_partial_files,
+        legacy_partial_file_identities=legacy_partial_file_identities,
+        source_manifest_file=source_manifest_file,
+        source_journal_file=source_journal_file,
+        source_journal_settings=journal_settings,
+        source_journal_audit=source_journal_audit,
+    )
+
+
+def _migration_still_unchanged(audit: MigrationAudit | None) -> None:
+    if audit is None:
+        return
+    if (
+        _snapshot_file(
+            audit.spec.source_manifest,
+            label="legacy source manifest",
+        )
+        != audit.source_manifest_file
+        or _snapshot_file(
+            audit.spec.source_journal,
+            label="legacy merge journal",
+        )
+        != audit.source_journal_file
+        or _snapshot_directory(
+            audit.spec.legacy_partial,
+            label="legacy partial",
+        )
+        != audit.legacy_partial_files
+    ):
+        raise MergeError("legacy migration inputs changed during fresh replay")
+
+
+def _reject_migration_output_aliases(
+    partial: Path,
+    audit: MigrationAudit | None,
+    *,
+    where: str,
+) -> None:
+    if audit is None or not partial.exists():
+        return
+    try:
+        root_metadata = os.lstat(partial)
+    except OSError as exc:
+        raise MergeError(f"{where} output partial cannot be inspected") from exc
+    if (
+        stat.S_ISLNK(root_metadata.st_mode)
+        or not stat.S_ISDIR(root_metadata.st_mode)
+    ):
+        raise MergeError(f"{where} output partial is unsafe")
+    for path in sorted(partial.rglob("*")):
+        try:
+            metadata = os.lstat(path)
+        except OSError as exc:
+            raise MergeError(
+                f"{where} output artifact cannot be inspected: {path}"
+            ) from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise MergeError(f"{where} output partial contains a symlink: {path}")
+        if stat.S_ISDIR(metadata.st_mode):
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise MergeError(
+                f"{where} output partial contains a non-regular artifact: {path}"
+            )
+        if (
+            metadata.st_dev,
+            metadata.st_ino,
+        ) in audit.legacy_partial_file_identities:
+            raise MergeError(
+                "fresh replay output artifact hardlinks an immutable legacy "
+                f"input: {path}"
+            )
 
 
 def _state_blob_limits(connection: sqlite3.Connection, limits: Limits) -> None:
@@ -973,21 +2099,27 @@ def _reject_unsafe_attempt_states(connection: sqlite3.Connection) -> None:
             "CAS-bearing non-done fetch attempt is unsupported: "
             f"{tuple(cas_non_done)}"
         )
-    positive_member = connection.execute(
+    non_done_member = connection.execute(
         """
         SELECT members.repo,members.run_id,members.attempt,
                members.archive_member,attempts.status
         FROM members
         JOIN attempts USING(repo,run_id,attempt)
-        WHERE attempts.status!='done'
-          AND (members.chunk_count>0 OR members.occurrence_tokens>0)
+        WHERE attempts.status NOT IN ('done','empty')
+           OR (
+             attempts.status='empty'
+             AND (
+               members.chunk_count!=0
+               OR members.occurrence_tokens!=0
+             )
+           )
         LIMIT 1
         """
     ).fetchone()
-    if positive_member is not None:
+    if non_done_member is not None:
         raise MergeError(
-            "CAS-bearing member belongs to a non-done attempt: "
-            f"{tuple(positive_member)}"
+            "fetch-state member violates done/parsed-empty conservation: "
+            f"{tuple(non_done_member)}"
         )
 
 
@@ -1003,7 +2135,7 @@ def _validate_binding_history(
         )
         for binding_key in _BINDING_KEYS
     }
-    histories: dict[str, list[sqlite3.Row]] = {
+    histories: dict[str, list[dict[str, Any]]] = {
         binding_key: [] for binding_key in _BINDING_KEYS
     }
     for row in connection.execute(
@@ -1016,32 +2148,13 @@ def _validate_binding_history(
         binding_key = str(row["binding_key"])
         if binding_key not in histories:
             raise MergeError("fetch-state binding history has an unsupported key")
-        _canonical_binding_upgrade_time(row["upgraded_at"])
-        histories[binding_key].append(row)
+        histories[binding_key].append(_mapping_row(row))
     for binding_key, rows in histories.items():
-        previous_to: str | None = None
-        for row in rows:
-            source = _require_hex64(
-                row["from_sha256"],
-                where=f"{binding_key} upgrade from_sha256",
-            )
-            destination = _require_hex64(
-                row["to_sha256"],
-                where=f"{binding_key} upgrade to_sha256",
-            )
-            if source == destination:
-                raise MergeError(
-                    f"{binding_key} history contains a no-op upgrade"
-                )
-            if previous_to is not None and source != previous_to:
-                raise MergeError(
-                    f"{binding_key} history is not a linear chain"
-                )
-            previous_to = destination
-        if previous_to is not None and previous_to != currents[binding_key]:
-            raise MergeError(
-                f"{binding_key} history does not terminate at its current binding"
-            )
+        _canonical_convergent_binding_rows(
+            rows,
+            current=currents[binding_key],
+            label=binding_key,
+        )
 
 
 def _canonical_binding_upgrade_time(value: object) -> str:
@@ -1053,6 +2166,79 @@ def _canonical_binding_upgrade_time(value: object) -> str:
     if raw != canonical:
         raise MergeError("binding upgrade timestamp is not canonical UTC")
     return canonical
+
+
+def _canonical_convergent_binding_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    current: str,
+    label: str,
+) -> list[dict[str, Any]]:
+    """Validate transition evidence whose condensed graph ends at current."""
+
+    materialized: dict[tuple[str, str], dict[str, Any]] = {}
+    adjacency: dict[str, set[str]] = {}
+    nodes: set[str] = {current}
+    for raw in rows:
+        row = dict(raw)
+        source = _require_hex64(
+            row.get("from_sha256"),
+            where=f"{label} upgrade from_sha256",
+        )
+        destination = _require_hex64(
+            row.get("to_sha256"),
+            where=f"{label} upgrade to_sha256",
+        )
+        _canonical_binding_upgrade_time(row.get("upgraded_at"))
+        if source == destination:
+            raise MergeError(f"{label} history contains a no-op upgrade")
+        edge = (source, destination)
+        if edge in materialized:
+            raise MergeError(f"{label} history contains a duplicate edge")
+        materialized[edge] = row
+        adjacency.setdefault(source, set()).add(destination)
+        nodes.update(edge)
+    if not materialized:
+        return []
+
+    try:
+        component_by_node, component_distance = convergent_transition_layout(
+            materialized,
+            current=current,
+        )
+    except ValueError as exc:
+        raise MergeError(
+            f"{label} history diverges or cannot reach its current binding"
+        ) from exc
+
+    def canonical_key(row: Mapping[str, Any]) -> tuple[object, ...]:
+        source = str(row["from_sha256"])
+        destination = str(row["to_sha256"])
+        source_component = component_by_node[source]
+        destination_component = component_by_node[destination]
+        timestamp = _canonical_binding_upgrade_time(row["upgraded_at"])
+        if source_component == destination_component:
+            edge_key: tuple[object, ...] = (
+                0,
+                timestamp,
+                source,
+                destination,
+                str(row.get("reason", "")),
+            )
+        else:
+            edge_key = (
+                1,
+                source,
+                destination,
+                timestamp,
+                str(row.get("reason", "")),
+            )
+        return (-component_distance[source_component], *edge_key)
+
+    return sorted(
+        materialized.values(),
+        key=canonical_key,
+    )
 
 
 def _create_seen_chunks(path: Path) -> sqlite3.Connection:
@@ -1523,75 +2709,467 @@ def _validate_time_shard_inventory(
     }
 
 
+def _verified_continuation_lineage(
+    fetch_receipt: Mapping[str, Any],
+    *,
+    state_path: Path,
+    store_path: Path,
+    label: str,
+) -> tuple[Path | None, dict[str, object] | None, Path | None]:
+    declared = fetch_receipt.get("continuation_seed")
+    if declared is None:
+        return None, None, None
+    if not isinstance(declared, Mapping):
+        raise MergeError(f"{label} continuation seed proof is malformed")
+    seed_value = declared.get("seed_receipt_path")
+    if not isinstance(seed_value, str) or not seed_value:
+        raise MergeError(f"{label} continuation seed path is missing")
+    seed_input = Path(seed_value).expanduser()
+    try:
+        verified = verify_continuation_seed_inclusion(
+            seed_input,
+            final_state_path=state_path,
+            final_store_root=store_path,
+        )
+    except ReceiptFinalizationError as exc:
+        raise MergeError(
+            f"{label} continuation seed inclusion proof failed: {exc}"
+        ) from exc
+    if dict(declared) != verified:
+        raise MergeError(
+            f"{label} continuation seed proof differs from its frozen lineage"
+        )
+    base_union = Path(str(verified["base_union_path"]))
+    base_state = base_union / _FETCH_STATE_NAME
+    _require_frozen_sqlite(
+        base_state,
+        label=f"{label} continuation base fetch state",
+    )
+    return seed_input.resolve(), verified, base_state
+
+
 def _verify_state_inventory_join(
     inventory: sqlite3.Connection,
     state: sqlite3.Connection,
     *,
     label: str,
     max_blob_bytes: int,
+    continuation_base_states: Sequence[Path] = (),
 ) -> tuple[int, str]:
     joined = 0
-    digest = _record_digest("cppmega-ci-fetch-state-inventory-join-v1")
-    for row in state.execute(
-        """
-        SELECT repo,run_id,attempt,run_metadata_sha256,
-               run_metadata_raw_size,run_metadata_zlib,
-               run_metadata_source,run_metadata_source_attempt,
-               inventory_seed_attempt,inventory_seed_metadata_sha256
-        FROM attempts ORDER BY repo,run_id,attempt
-        """
-    ):
-        seed = inventory.execute(
+    digest = _record_digest("cppmega-ci-fetch-state-inventory-join-v2")
+    base_connections: list[sqlite3.Connection] = []
+    try:
+        for base_state in continuation_base_states:
+            _require_frozen_sqlite(
+                base_state,
+                label=f"{label} continuation base fetch state",
+            )
+            connection = sqlite3.connect(
+                f"{base_state.as_uri()}?mode=ro&immutable=1",
+                uri=True,
+            )
+            connection.row_factory = sqlite3.Row
+            base_connections.append(connection)
+
+        immutable_columns = ",".join(_ATTEMPT_IMMUTABLE_EVIDENCE)
+        for row in state.execute(
+            f"""
+            SELECT {immutable_columns}
+            FROM attempts ORDER BY repo,run_id,attempt
             """
-            SELECT metadata_blob,metadata_sha256
-            FROM runs
-            WHERE repo_key=? AND run_id=? AND run_attempt=?
-            """,
-            (
-                str(row["repo"]),
-                int(row["run_id"]),
-                int(row["inventory_seed_attempt"]),
-            ),
-        ).fetchone()
-        key = f"{row['repo']}/{row['run_id']}/{row['attempt']}"
-        if seed is None:
-            raise MergeError(f"{label} fetch-state attempt lacks an inventory seed: {key}")
-        if row["inventory_seed_metadata_sha256"] != seed["metadata_sha256"]:
-            raise MergeError(f"{label} fetch-state inventory seed binding differs: {key}")
-        if row["run_metadata_source"] == "inventory-run-list":
-            inventory_raw = _bounded_zlib_decode(
-                bytes(seed["metadata_blob"]),
-                max_blob_bytes=max_blob_bytes,
-                where=f"{label} inventory seed metadata",
-            )
-            state_raw = _bounded_zlib_decode(
-                bytes(row["run_metadata_zlib"]),
-                max_blob_bytes=max_blob_bytes,
-                where=f"{label} fetch-state run metadata",
-            )
-            if (
-                int(row["run_metadata_source_attempt"])
-                != int(row["inventory_seed_attempt"])
-                or row["run_metadata_sha256"] != seed["metadata_sha256"]
-                or int(row["run_metadata_raw_size"]) != len(inventory_raw)
-                or _sha256_bytes(state_raw) != row["run_metadata_sha256"]
-                or state_raw != inventory_raw
+        ):
+            seed = inventory.execute(
+                """
+                SELECT run_attempt,metadata_blob,metadata_sha256
+                FROM runs
+                WHERE repo_key=? AND run_id=?
+                """,
+                (
+                    str(row["repo"]),
+                    int(row["run_id"]),
+                ),
+            ).fetchone()
+            key = f"{row['repo']}/{row['run_id']}/{row['attempt']}"
+            if seed is None:
+                raise MergeError(
+                    f"{label} fetch-state attempt lacks an inventory run: {key}"
+                )
+            inventory_ceiling = int(seed["run_attempt"])
+            seed_attempt = int(row["inventory_seed_attempt"])
+            attempt = int(row["attempt"])
+            if inventory_ceiling < seed_attempt or inventory_ceiling < attempt:
+                raise MergeError(
+                    f"{label} fetch-state attempt exceeds its inventory "
+                    f"ceiling: {key}"
+                )
+
+            historical_seed = inventory_ceiling > seed_attempt
+            if historical_seed:
+                row_values = tuple(
+                    bytes(row[column])
+                    if isinstance(row[column], memoryview)
+                    else row[column]
+                    for column in _ATTEMPT_IMMUTABLE_EVIDENCE
+                )
+                historical_proven = False
+                for base in base_connections:
+                    base_row = base.execute(
+                        f"""
+                        SELECT {immutable_columns}
+                        FROM attempts
+                        WHERE repo=? AND run_id=? AND attempt=?
+                        """,
+                        (
+                            str(row["repo"]),
+                            int(row["run_id"]),
+                            attempt,
+                        ),
+                    ).fetchone()
+                    if base_row is None:
+                        continue
+                    base_values = tuple(
+                        bytes(base_row[column])
+                        if isinstance(base_row[column], memoryview)
+                        else base_row[column]
+                        for column in _ATTEMPT_IMMUTABLE_EVIDENCE
+                    )
+                    if base_values == row_values:
+                        historical_proven = True
+                        break
+                if not historical_proven:
+                    raise MergeError(
+                        f"{label} historical inventory seed lacks verified "
+                        f"continuation lineage: {key}"
+                    )
+            elif (
+                row["inventory_seed_metadata_sha256"]
+                != seed["metadata_sha256"]
             ):
                 raise MergeError(
-                    f"{label} fetch-state inventory metadata binding differs: {key}"
+                    f"{label} fetch-state inventory seed binding differs: {key}"
                 )
-        _update_record_digest(
-            digest,
-            [
-                str(row["repo"]),
-                int(row["run_id"]),
-                int(row["attempt"]),
-                int(row["inventory_seed_attempt"]),
-                str(row["inventory_seed_metadata_sha256"]),
-            ],
+
+            if row["run_metadata_source"] == "inventory-run-list":
+                state_raw = _bounded_zlib_decode(
+                    bytes(row["run_metadata_zlib"]),
+                    max_blob_bytes=max_blob_bytes,
+                    where=f"{label} fetch-state run metadata",
+                )
+                if (
+                    int(row["run_metadata_source_attempt"]) != seed_attempt
+                    or row["run_metadata_sha256"]
+                    != row["inventory_seed_metadata_sha256"]
+                    or int(row["run_metadata_raw_size"]) != len(state_raw)
+                    or _sha256_bytes(state_raw)
+                    != row["run_metadata_sha256"]
+                ):
+                    raise MergeError(
+                        f"{label} fetch-state inventory metadata binding "
+                        f"differs: {key}"
+                    )
+                if not historical_seed:
+                    inventory_raw = _bounded_zlib_decode(
+                        bytes(seed["metadata_blob"]),
+                        max_blob_bytes=max_blob_bytes,
+                        where=f"{label} inventory seed metadata",
+                    )
+                    if state_raw != inventory_raw:
+                        raise MergeError(
+                            f"{label} fetch-state inventory metadata "
+                            f"binding differs: {key}"
+                        )
+            _update_record_digest(
+                digest,
+                [
+                    str(row["repo"]),
+                    int(row["run_id"]),
+                    attempt,
+                    seed_attempt,
+                    str(row["inventory_seed_metadata_sha256"]),
+                    inventory_ceiling,
+                    str(seed["metadata_sha256"]),
+                    historical_seed,
+                ],
+            )
+            joined += 1
+        return joined, digest.hexdigest()
+    finally:
+        for connection in base_connections:
+            connection.close()
+
+
+def _state_summary_projection(
+    connection: sqlite3.Connection,
+) -> tuple[dict[str, object], str]:
+    status_counts = {
+        str(row["status"]): int(row["n"])
+        for row in connection.execute(
+            "SELECT status,COUNT(*) AS n FROM attempts GROUP BY status"
         )
-        joined += 1
-    return joined, digest.hexdigest()
+    }
+    totals = connection.execute(
+        """
+        SELECT COUNT(*) AS attempts,
+               COALESCE(SUM(member_count),0) AS members,
+               COALESCE(SUM(chunk_count),0) AS chunks,
+               COALESCE(SUM(occurrence_tokens),0) AS occurrence_tokens
+        FROM attempts
+        WHERE status IN ('done','empty','terminal_404','terminal_410')
+        """
+    ).fetchone()
+    if totals is None:
+        raise MergeError("fetch-state summary aggregate is missing")
+    sidecar_digest = hashlib.sha256()
+    for row in connection.execute(
+        """
+        SELECT repo,run_id,attempt,archive_member,sidecar_sha256
+        FROM members
+        ORDER BY repo,run_id,attempt,archive_member
+        """
+    ):
+        sidecar_digest.update(
+            (
+                f"{row['repo']}\t{row['run_id']}\t{row['attempt']}\t"
+                f"{row['archive_member']}\t{row['sidecar_sha256']}\n"
+            ).encode("utf-8")
+        )
+    sidecar_set_sha256 = sidecar_digest.hexdigest()
+    return (
+        {
+            "attempt_statuses": dict(sorted(status_counts.items())),
+            "attempts_terminal": int(totals["attempts"]),
+            "members": int(totals["members"]),
+            "chunks": int(totals["chunks"]),
+            "occurrence_tokens": int(totals["occurrence_tokens"]),
+            "requests": int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM request_ledger"
+                ).fetchone()[0]
+            ),
+            "sidecar_set_sha256": sidecar_set_sha256,
+        },
+        sidecar_set_sha256,
+    )
+
+
+def _legacy_state_binding(
+    spec: ShardSpec,
+    state_file: SnapshotFile,
+    *,
+    expected_sqlite_schema_sha256: str,
+) -> dict[str, Any]:
+    connection = sqlite3.connect(
+        f"{spec.state.path.as_uri()}?mode=ro&immutable=1",
+        uri=True,
+    )
+    connection.row_factory = sqlite3.Row
+    try:
+        actual_schema = _sqlite_schema_sha256(connection)
+        if actual_schema != expected_sqlite_schema_sha256:
+            raise MergeError(
+                f"{spec.shard_id} legacy source schema changed during projection"
+            )
+        settings = {
+            str(row["key"]): str(row["value"])
+            for row in connection.execute(
+                "SELECT key,value FROM settings ORDER BY key"
+            )
+        }
+        if settings.get("schema") != LEGACY_FETCH_STATE_SCHEMA:
+            raise MergeError(
+                f"{spec.shard_id} legacy source settings schema is not v3"
+            )
+        summary, sidecar_set_sha256 = _state_summary_projection(connection)
+        logical_sha256 = _fetch_state_logical_digest(connection)
+    finally:
+        connection.close()
+    return {
+        "schema": LEGACY_FETCH_STATE_SCHEMA,
+        "artifact": {
+            "path": spec.original_state,
+            "byte_size": state_file.size,
+            "mtime_ns": state_file.mtime_ns,
+            "inode": state_file.inode,
+            "sha256": state_file.sha256,
+        },
+        "sqlite_schema_sha256": expected_sqlite_schema_sha256,
+        "sqlite_logical_sha256": logical_sha256,
+        "settings": dict(sorted(settings.items())),
+        "summary": summary,
+        "sidecar_set_sha256": sidecar_set_sha256,
+    }
+
+
+def _validate_fetch_receipt_schema_tuple(
+    manifest: Manifest,
+    spec: ShardSpec,
+    fetch_receipt: Mapping[str, Any],
+    store_receipt: Mapping[str, Any],
+) -> None:
+    frozen_state = _require_mapping(
+        fetch_receipt.get("frozen_fetch_state"),
+        where=f"{spec.shard_id} frozen_fetch_state",
+    )
+    frozen_settings = _require_mapping(
+        frozen_state.get("settings"),
+        where=f"{spec.shard_id} frozen_fetch_state.settings",
+    )
+    actual = (
+        fetch_receipt.get("schema"),
+        frozen_state.get("schema"),
+        frozen_settings.get("schema"),
+        store_receipt.get("schema"),
+        store_receipt.get("store_schema"),
+    )
+    current_threshold = (
+        FETCH_RECEIPT_SCHEMA,
+        FETCH_STATE_SCHEMA,
+        FETCH_STATE_SCHEMA,
+        STORE_RECEIPT_SCHEMA,
+        STORE_SCHEMA,
+    )
+    current_exhaustive = (
+        EXHAUSTIVE_RECEIPT_SCHEMA,
+        FETCH_STATE_SCHEMA,
+        FETCH_STATE_SCHEMA,
+        STORE_RECEIPT_SCHEMA,
+        STORE_SCHEMA,
+    )
+    legacy_migration = (
+        FETCH_RECEIPT_SCHEMA,
+        LEGACY_FETCH_STATE_SCHEMA,
+        LEGACY_FETCH_STATE_SCHEMA,
+        STORE_RECEIPT_SCHEMA,
+        STORE_SCHEMA,
+    )
+    if manifest.migration is not None:
+        allowed = {legacy_migration}
+    elif manifest.completion_mode == COMPLETION_MODE_THRESHOLD:
+        allowed = {current_threshold}
+    elif spec.role == "coverage":
+        # Let the production-role validation below report the precise missing
+        # exhaustive-completion proof for an otherwise coherent threshold
+        # tuple.
+        allowed = {current_threshold, current_exhaustive}
+    else:
+        allowed = {current_threshold, current_exhaustive}
+    if actual not in allowed:
+        raise MergeError(
+            f"{spec.shard_id} fetch/state/store receipt schema tuple is "
+            f"unsupported: {actual!r}"
+        )
+
+
+def _validate_declared_state_binding(
+    spec: ShardSpec,
+    declared: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> None:
+    declared_artifact = _require_mapping(
+        declared.get("artifact"),
+        where=f"{spec.shard_id} frozen_fetch_state.artifact",
+    )
+    expected_artifact = _require_mapping(
+        expected.get("artifact"),
+        where=f"{spec.shard_id} expected state artifact",
+    )
+    if (
+        set(declared) != set(expected)
+        or set(declared_artifact) != set(expected_artifact)
+        or isinstance(declared_artifact.get("mtime_ns"), bool)
+        or not isinstance(declared_artifact.get("mtime_ns"), int)
+        or int(declared_artifact["mtime_ns"]) < 0
+        or isinstance(declared_artifact.get("inode"), bool)
+        or not isinstance(declared_artifact.get("inode"), int)
+        or int(declared_artifact["inode"]) < 0
+    ):
+        raise MergeError(
+            f"{spec.shard_id} frozen fetch-state receipt shape differs"
+        )
+    declared_semantics = {
+        key: value for key, value in declared.items() if key != "artifact"
+    }
+    expected_semantics = {
+        key: value for key, value in expected.items() if key != "artifact"
+    }
+    if (
+        declared_semantics != expected_semantics
+        or declared_artifact.get("path") != spec.original_state
+        or declared_artifact.get("byte_size")
+        != expected_artifact.get("byte_size")
+        or declared_artifact.get("sha256")
+        != expected_artifact.get("sha256")
+    ):
+        raise MergeError(
+            f"{spec.shard_id} frozen fetch-state receipt binding differs"
+        )
+
+
+def _project_legacy_source_state(
+    spec: ShardSpec,
+    state_file: SnapshotFile,
+    scratch_directory: Path,
+) -> tuple[Path, SnapshotFile, dict[str, Any], dict[str, Any]]:
+    projection_path = (
+        scratch_directory / f".{spec.shard_id}-effective-fetch-state-v4.sqlite3"
+    )
+    _remove_scratch_sqlite(projection_path)
+    try:
+        result = project_fetch_state_v3_to_v4(
+            spec.state.path,
+            projection_path,
+        )
+    except FetchStateMigrationError as exc:
+        raise MergeError(
+            f"{spec.shard_id} legacy fetch-state projection failed: {exc}"
+        ) from exc
+    projection = result.receipt_fields()
+    source = _require_mapping(
+        projection.get("source"),
+        where=f"{spec.shard_id} projection source",
+    )
+    destination = _require_mapping(
+        projection.get("destination"),
+        where=f"{spec.shard_id} projection destination",
+    )
+    if (
+        projection.get("schema") != FETCH_STATE_PROJECTION_SCHEMA
+        or source.get("sha256") != state_file.sha256
+        or source.get("sqlite_schema_sha256")
+        not in {
+            LEGACY_V3_SQLITE_SCHEMA_SHA256,
+            CURRENT_V4_SQLITE_SCHEMA_SHA256,
+        }
+        or source.get("settings_schema") != LEGACY_FETCH_STATE_SCHEMA
+        or destination.get("settings_schema") != FETCH_STATE_SCHEMA
+        or destination.get("sqlite_schema_sha256")
+        != CURRENT_V4_SQLITE_SCHEMA_SHA256
+    ):
+        raise MergeError(
+            f"{spec.shard_id} projection receipt has an unsupported identity tuple"
+        )
+    effective_state_file = _snapshot_file(
+        projection_path,
+        label=f"{spec.shard_id} effective fetch state",
+    )
+    if effective_state_file.sha256 != destination.get("sha256"):
+        raise MergeError(
+            f"{spec.shard_id} projected fetch-state bytes differ from its ledger"
+        )
+    original_binding = _legacy_state_binding(
+        spec,
+        state_file,
+        expected_sqlite_schema_sha256=str(
+            source["sqlite_schema_sha256"]
+        ),
+    )
+    return (
+        projection_path,
+        effective_state_file,
+        dict(projection),
+        original_binding,
+    )
 
 
 def _preflight_source(
@@ -1702,6 +3280,12 @@ def _preflight_source(
         spec.state.receipt,
         where=f"{spec.shard_id} fetch receipt",
     )
+    _validate_fetch_receipt_schema_tuple(
+        manifest,
+        spec,
+        fetch_receipt,
+        store_receipt_declared,
+    )
     if inventory_role == "anchor_candidate":
         assert inventory_receipt is not None
         if (
@@ -1712,13 +3296,33 @@ def _preflight_source(
                 f"{spec.shard_id} inventory receipt does not bind its original path"
             )
         try:
-            computed_inventory_receipt = InventoryDB(
-                spec.inventory.path
-            ).completion_receipt()
-        except (InventoryError, OSError, ValueError, sqlite3.Error) as exc:
+            computed_inventory_receipt, computed_receipt_sha256 = (
+                verify_inventory_completion_receipt(
+                    spec.inventory.path,
+                    spec.inventory.receipt.path,
+                    require_production=(
+                        manifest.completion_mode
+                        == COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+                    ),
+                    expected_original_database_path=Path(
+                        spec.original_inventory
+                    ),
+                )
+            )
+        except (
+            InventoryCompletionError,
+            OSError,
+            ValueError,
+            sqlite3.Error,
+        ) as exc:
             raise MergeError(
                 f"{spec.shard_id} anchor completion proof is invalid"
             ) from exc
+        if computed_receipt_sha256 != spec.inventory.receipt.sha256:
+            raise MergeError(
+                f"{spec.shard_id} anchor completion receipt hash differs "
+                "from the manifest"
+            )
         if _inventory_logical_projection(
             computed_inventory_receipt
         ) != _inventory_logical_projection(inventory_receipt):
@@ -1728,11 +3332,63 @@ def _preflight_source(
         inventory_proof["completion_receipt_sha256"] = (
             spec.inventory.receipt.sha256
         )
-    if fetch_receipt.get("schema") != FETCH_RECEIPT_SCHEMA:
-        raise MergeError(f"{spec.shard_id} fetch receipt schema is not v3")
+        if manifest.completion_mode == COMPLETION_MODE_INVENTORY_EXHAUSTIVE:
+            if (
+                inventory_receipt.get("production_complete") is not True
+                or inventory_receipt.get("source_snapshot_stable") is not True
+                or inventory_receipt.get("enumeration_complete") is not True
+                or inventory_receipt.get("mode") != "production"
+            ):
+                raise MergeError(
+                    f"{spec.shard_id} production inventory receipt is "
+                    "unstable or non-production"
+                )
+    if manifest.completion_mode == COMPLETION_MODE_THRESHOLD:
+        if fetch_receipt.get("schema") != FETCH_RECEIPT_SCHEMA:
+            raise MergeError(
+                f"{spec.shard_id} legacy fetch receipt schema is not v3"
+            )
+    elif spec.role == "coverage":
+        if (
+            fetch_receipt.get("schema") != EXHAUSTIVE_RECEIPT_SCHEMA
+            or fetch_receipt.get("completion_mode")
+            != COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+            or fetch_receipt.get("production_complete") is not True
+        ):
+            raise MergeError(
+                f"{spec.shard_id} production coverage requires a verified "
+                "inventory-exhaustive fetch receipt v4"
+            )
+        if inventory_role != "anchor_candidate":
+            raise MergeError(
+                f"{spec.shard_id} production coverage must use the full "
+                "completed inventory anchor"
+            )
+    elif fetch_receipt.get("schema") not in {
+        FETCH_RECEIPT_SCHEMA,
+        EXHAUSTIVE_RECEIPT_SCHEMA,
+    }:
+        raise MergeError(
+            f"{spec.shard_id} seed fetch receipt schema is unsupported"
+        )
     if fetch_receipt.get("inventory_path") != spec.original_inventory:
         raise MergeError(
             f"{spec.shard_id} fetch receipt inventory path is not original"
+        )
+    effective_state_path = spec.state.path
+    effective_state_file = state_file
+    state_projection: dict[str, Any] | None = None
+    original_state_binding: dict[str, Any] | None = None
+    if manifest.migration is not None:
+        (
+            effective_state_path,
+            effective_state_file,
+            state_projection,
+            original_state_binding,
+        ) = _project_legacy_source_state(
+            spec,
+            state_file,
+            scratch_directory,
         )
 
     source_index = spec.store.path / "index.sqlite3"
@@ -1780,6 +3436,17 @@ def _preflight_source(
     finally:
         source_index_connection.close()
 
+    (
+        continuation_seed_path,
+        continuation_inclusion,
+        continuation_base_state,
+    ) = _verified_continuation_lineage(
+        fetch_receipt,
+        state_path=spec.state.path,
+        store_path=spec.store.path,
+        label=spec.shard_id,
+    )
+
     with FrozenStore(spec.store.path, spec.store.receipt.path) as store:
         if store.receipt != store_receipt_declared:
             raise MergeError(f"{spec.shard_id} store receipt changed while loaded")
@@ -1818,7 +3485,7 @@ def _preflight_source(
         ):
             raise MergeError(f"{spec.shard_id} fetch receipt tokenizer differs")
         state_precheck = sqlite3.connect(
-            f"{spec.state.path.as_uri()}?mode=ro&immutable=1",
+            f"{effective_state_path.as_uri()}?mode=ro&immutable=1",
             uri=True,
         )
         state_precheck.row_factory = sqlite3.Row
@@ -1842,7 +3509,7 @@ def _preflight_source(
             receipt=store.receipt,
         )
         with FrozenFetchState(
-            spec.state.path,
+            effective_state_path,
             tokenizer=tokenizer,
             store=cast(Any, binding_store),
         ) as state:
@@ -1853,60 +3520,30 @@ def _preflight_source(
             if state.settings["content_store_path"] != spec.original_store:
                 raise MergeError(
                     f"{spec.shard_id} state store binding differs from manifest"
-                )
+            )
             _state_blob_limits(state.connection, manifest.limits)
             _reject_unsafe_attempt_states(state.connection)
-            if fetch_receipt.get("fetch_state") != state.summary:
-                raise MergeError(
-                    f"{spec.shard_id} fetch receipt summary differs from state"
-                )
             expected_binding = state.receipt_binding()
+            if original_state_binding is None:
+                original_state_binding = dict(expected_binding)
+            original_summary = _require_mapping(
+                original_state_binding.get("summary"),
+                where=f"{spec.shard_id} original state summary",
+            )
+            if fetch_receipt.get("fetch_state") != original_summary:
+                raise MergeError(
+                    f"{spec.shard_id} fetch receipt summary differs from "
+                    "its original immutable state"
+                )
             declared_binding = _require_mapping(
                 fetch_receipt.get("frozen_fetch_state"),
                 where=f"{spec.shard_id} frozen_fetch_state",
             )
-            declared_artifact = _require_mapping(
-                declared_binding.get("artifact"),
-                where=f"{spec.shard_id} frozen_fetch_state.artifact",
+            _validate_declared_state_binding(
+                spec,
+                declared_binding,
+                original_state_binding,
             )
-            expected_artifact = cast(
-                Mapping[str, Any],
-                expected_binding["artifact"],
-            )
-            if (
-                set(declared_binding) != set(expected_binding)
-                or set(declared_artifact) != set(expected_artifact)
-                or isinstance(declared_artifact.get("mtime_ns"), bool)
-                or not isinstance(declared_artifact.get("mtime_ns"), int)
-                or int(declared_artifact["mtime_ns"]) < 0
-                or isinstance(declared_artifact.get("inode"), bool)
-                or not isinstance(declared_artifact.get("inode"), int)
-                or int(declared_artifact["inode"]) < 0
-            ):
-                raise MergeError(
-                    f"{spec.shard_id} frozen fetch-state receipt shape differs"
-                )
-            declared_semantics = {
-                key: value
-                for key, value in declared_binding.items()
-                if key != "artifact"
-            }
-            expected_semantics = {
-                key: value
-                for key, value in expected_binding.items()
-                if key != "artifact"
-            }
-            if (
-                declared_semantics != expected_semantics
-                or declared_artifact.get("path") != spec.original_state
-                or declared_artifact.get("byte_size")
-                != expected_artifact["byte_size"]
-                or declared_artifact.get("sha256")
-                != expected_artifact["sha256"]
-            ):
-                raise MergeError(
-                    f"{spec.shard_id} frozen fetch-state receipt binding differs"
-                )
             join_count = _verify_cas_fetch_join(
                 store,
                 state,
@@ -1928,7 +3565,79 @@ def _preflight_source(
                     state.connection,
                     label=spec.shard_id,
                     max_blob_bytes=manifest.limits.max_state_blob_bytes,
+                    continuation_base_states=(
+                        ()
+                        if continuation_base_state is None
+                        else (continuation_base_state,)
+                    ),
                 )
+                if (
+                    manifest.completion_mode
+                    == COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+                    and spec.role == "coverage"
+                ):
+                    assert inventory_receipt is not None
+                    declared_exhaustive = _require_mapping(
+                        fetch_receipt.get("exhaustive_coverage"),
+                        where=(
+                            f"{spec.shard_id} exhaustive_coverage"
+                        ),
+                    )
+                    declared_discovery = _require_mapping(
+                        declared_exhaustive.get("discovery"),
+                        where=(
+                            f"{spec.shard_id} exhaustive_coverage.discovery"
+                        ),
+                    )
+                    try:
+                        exhaustive_proof = exhaustive_coverage_proof(
+                            source_inventory,
+                            state.connection,
+                            inventory_receipt=inventory_receipt,
+                            require_discovery_eof=True,
+                            discovery_sweep=declared_discovery,
+                        )
+                    except ReceiptFinalizationError as exc:
+                        raise MergeError(
+                            f"{spec.shard_id} exhaustive coverage proof "
+                            f"failed: {exc}"
+                        ) from exc
+                    if (
+                        declared_exhaustive != exhaustive_proof
+                    ):
+                        raise MergeError(
+                            f"{spec.shard_id} declared exhaustive coverage "
+                            "differs from the frozen inventory/state"
+                        )
+                    inventory_binding = _require_mapping(
+                        fetch_receipt.get("inventory_binding"),
+                        where=f"{spec.shard_id} inventory_binding",
+                    )
+                    bound_database = _require_mapping(
+                        inventory_binding.get("database"),
+                        where=f"{spec.shard_id} inventory_binding.database",
+                    )
+                    bound_receipt = _require_mapping(
+                        inventory_binding.get("completion_receipt"),
+                        where=(
+                            f"{spec.shard_id} inventory_binding."
+                            "completion_receipt"
+                        ),
+                    )
+                    if (
+                        bound_database.get("path")
+                        != spec.original_inventory
+                        or bound_database.get("sha256")
+                        != inventory_file.sha256
+                        or bound_database.get("db_logical_sha256")
+                        != inventory_receipt.get("db_logical_sha256")
+                        or bound_receipt.get("sha256")
+                        != spec.inventory.receipt.sha256
+                    ):
+                        raise MergeError(
+                            f"{spec.shard_id} exhaustive fetch receipt does "
+                            "not bind the production inventory bytes/receipt"
+                        )
             finally:
                 source_inventory.close()
             state.require_unchanged()
@@ -1992,6 +3701,7 @@ def _preflight_source(
         store_files = store._initial_snapshot
     if _snapshot_receipts(spec) != receipt_files:
         raise MergeError(f"{spec.shard_id} source receipts changed during preflight")
+    assert original_state_binding is not None
     return SourceAudit(
         spec=spec,
         store_receipt=store_receipt_declared,
@@ -2001,20 +3711,33 @@ def _preflight_source(
         inventory_proof=inventory_proof,
         store_files=store_files,
         state_file=state_file,
+        effective_state_path=effective_state_path,
+        effective_state_file=effective_state_file,
+        original_state_binding=original_state_binding,
         inventory_file=inventory_file,
         receipt_files=receipt_files,
         state_binding=state_binding,
         store_counts=store_counts,
         state_counts=state_counts,
+        continuation_seed_path=continuation_seed_path,
+        continuation_inclusion=continuation_inclusion,
+        continuation_base_state=continuation_base_state,
+        state_projection=state_projection,
     )
 
 
 def _inventory_logical_projection(receipt: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    projected = {
         key: value
         for key, value in receipt.items()
         if key not in {"completed_at", "database"}
     }
+    artifact = projected.get("database_artifact")
+    if isinstance(artifact, Mapping):
+        projected["database_artifact"] = {
+            key: value for key, value in artifact.items() if key != "path"
+        }
+    return projected
 
 
 def _expected_inventory_schema_sha256() -> str:
@@ -2371,6 +4094,15 @@ def _validate_output_geometry(manifest: Manifest) -> Path:
     partial = destination.with_name(f".{destination.name}.partial")
     lock_path = destination.with_name(f".{destination.name}.merge.lock")
     staged_paths = [manifest.path, manifest.tokenizer_path]
+    if manifest.migration is not None:
+        staged_paths.extend(
+            (
+                manifest.migration.legacy_partial,
+                manifest.migration.source_manifest,
+                manifest.migration.source_journal,
+                manifest.migration.source_cas,
+            )
+        )
     for shard in manifest.shards:
         staged_paths.append(shard.inventory.path)
         if shard.inventory.receipt is not None:
@@ -2575,7 +4307,9 @@ def _initialize_journal_file(
             connection.rollback()
             raise
         if _sqlite_schema_sha256(connection) != _expected_journal_schema_sha256():
-            raise MergeError("new merge journal schema is not canonical v2")
+            raise MergeError(
+                f"new merge journal schema is not canonical {JOURNAL_SCHEMA}"
+            )
         if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise MergeError("new merge journal failed integrity_check")
     finally:
@@ -2618,7 +4352,9 @@ def _open_journal(
     connection.execute("PRAGMA synchronous=FULL")
     if _sqlite_schema_sha256(connection) != _expected_journal_schema_sha256():
         connection.close()
-        raise MergeError("existing merge journal schema is not canonical v2")
+        raise MergeError(
+            f"existing merge journal schema is not canonical {JOURNAL_SCHEMA}"
+        )
     expected = {
         "schema": JOURNAL_SCHEMA,
         "manifest_sha256": manifest.sha256,
@@ -2948,10 +4684,19 @@ def _copy_and_validate_inventory(
     if copied.sha256 != anchor.inventory_file.sha256:
         raise MergeError("destination inventory copy differs from frozen source")
     try:
-        inventory_receipt = InventoryDB(destination).completion_receipt()
+        inventory_receipt = InventoryDB(
+            destination,
+            initialize_schema=False,
+        ).completion_receipt()
     except (InventoryError, OSError, ValueError, sqlite3.Error) as exc:
         raise MergeError("copied union inventory failed full validation") from exc
     inventory_receipt["database"] = str(
+        manifest.destination / _INVENTORY_NAME
+    )
+    database_artifact = inventory_receipt.get("database_artifact")
+    if not isinstance(database_artifact, dict):
+        raise MergeError("validated union inventory lacks its artifact binding")
+    database_artifact["path"] = str(
         manifest.destination / _INVENTORY_NAME
     )
     assert anchor.inventory_receipt is not None
@@ -2974,14 +4719,26 @@ def _destination_state_settings(
     ]
     created_at = min(str(settings["created_at"]) for settings in source_settings)
     first = source_settings[0]
+    if manifest.migration is None:
+        fetcher_script_sha256 = str(first["fetcher_script_sha256"])
+        parser_script_sha256 = str(first["parser_script_sha256"])
+    else:
+        fetcher_script_sha256 = _current_fetcher_script_sha256()
+        parser_script_sha256 = _current_parser_script_sha256()
+        current_store_sha256 = _current_store_script_sha256()
+        if store_receipt.get("script_sha256") != current_store_sha256:
+            raise MergeError(
+                "fresh replay destination CAS was not created by the "
+                "current content-store implementation"
+            )
     return {
         "schema": FETCH_STATE_SCHEMA,
         "inventory_path": str(manifest.destination / _INVENTORY_NAME),
         "content_store_path": str(manifest.destination / _STORE_DIRECTORY),
         "tokenizer_contract": str(first["tokenizer_contract"]),
         "tokenizer_fingerprint": str(first["tokenizer_fingerprint"]),
-        "fetcher_script_sha256": str(first["fetcher_script_sha256"]),
-        "parser_script_sha256": str(first["parser_script_sha256"]),
+        "fetcher_script_sha256": fetcher_script_sha256,
+        "parser_script_sha256": parser_script_sha256,
         "content_store_script_sha256": str(store_receipt["script_sha256"]),
         "chunk_semantics": str(first["chunk_semantics"]),
         "created_at": created_at,
@@ -3094,6 +4851,7 @@ def _is_zero_evidence_pending(row: Mapping[str, Any]) -> bool:
         "archive_source",
         "archive_sha256",
         "archive_size",
+        "archive_zlib",
         "jobs_sha256",
         "jobs_raw_size",
         "jobs_zlib",
@@ -3110,6 +4868,26 @@ def _is_zero_evidence_pending(row: Mapping[str, Any]) -> bool:
         and int(row["occurrence_tokens"]) == 0
         and all(row[field] is None for field in nullable_evidence)
     )
+
+
+def _attempt_evidence_rank(
+    row: Mapping[str, Any],
+    *,
+    role: str,
+) -> int:
+    status = str(row["status"])
+    if status == "done":
+        return 4
+    if status == "empty":
+        return 3
+    if status in {"terminal_404", "terminal_410"}:
+        # Production coverage shards have already replayed the endpoint/body
+        # request ledger in exhaustive_coverage_proof.  A seed terminal row
+        # is diagnostic only and must never displace verified evidence.
+        return 2 if role in {"coverage", "legacy-coverage"} else 0
+    if _is_zero_evidence_pending(row):
+        return 1
+    return 0
 
 
 def _mapping_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -3135,10 +4913,14 @@ def _insert_named_row(
 def _merge_attempt_row(
     connection: sqlite3.Connection,
     shard_id: str,
+    role: str,
     row: sqlite3.Row,
 ) -> None:
     incoming = _mapping_row(row)
     key = tuple(incoming[column] for column in _ATTEMPT_KEY)
+    key_json = _canonical_json(list(key))
+    incoming_sha256 = _row_sha256(incoming, _ATTEMPT_COLUMNS)
+    incoming_rank = _attempt_evidence_rank(incoming, role=role)
     existing_row = connection.execute(
         """
         SELECT * FROM destination.attempts
@@ -3155,39 +4937,98 @@ def _merge_attempt_row(
             columns=_ATTEMPT_COLUMNS,
             values=_row_values(incoming, _ATTEMPT_COLUMNS),
         )
+        connection.execute(
+            """
+            INSERT INTO attempt_winners(
+              source_key_json,shard_id,role,evidence_rank,source_row_sha256
+            ) VALUES (?,?,?,?,?)
+            """,
+            (
+                key_json,
+                shard_id,
+                role,
+                incoming_rank,
+                incoming_sha256,
+            ),
+        )
     else:
         existing = _mapping_row(existing_row)
+        winner = connection.execute(
+            """
+            SELECT * FROM attempt_winners WHERE source_key_json=?
+            """,
+            (key_json,),
+        ).fetchone()
+        if winner is None:
+            raise MergeError(f"attempt winner audit is missing: {key}")
+        existing_rank = int(winner["evidence_rank"])
         if _row_values(existing, _ATTEMPT_COLUMNS) == _row_values(
             incoming, _ATTEMPT_COLUMNS
         ):
-            outcome = "exact_overlap"
-        elif (
-            existing["status"] == "done"
-            and _is_zero_evidence_pending(incoming)
-            and _row_values(existing, _ATTEMPT_IMMUTABLE_EVIDENCE)
-            == _row_values(incoming, _ATTEMPT_IMMUTABLE_EVIDENCE)
-        ):
-            outcome = "pending_shadowed_by_done"
-        elif (
-            incoming["status"] == "done"
-            and _is_zero_evidence_pending(existing)
-            and _row_values(existing, _ATTEMPT_IMMUTABLE_EVIDENCE)
-            == _row_values(incoming, _ATTEMPT_IMMUTABLE_EVIDENCE)
-        ):
-            assignments = ",".join(
-                f"{column}=?" for column in _ATTEMPT_COLUMNS
-            )
-            connection.execute(
-                f"""
-                UPDATE destination.attempts SET {assignments}
-                WHERE repo=? AND run_id=? AND attempt=?
-                """,
-                (*_row_values(incoming, _ATTEMPT_COLUMNS), *key),
-            )
-            outcome = "done_replaced_zero_evidence_pending"
+            if incoming_rank > existing_rank:
+                connection.execute(
+                    """
+                    UPDATE attempt_winners
+                    SET shard_id=?,role=?,evidence_rank=?,
+                        source_row_sha256=?
+                    WHERE source_key_json=?
+                    """,
+                    (
+                        shard_id,
+                        role,
+                        incoming_rank,
+                        incoming_sha256,
+                        key_json,
+                    ),
+                )
+                outcome = "exact_overlap_promoted_higher_precedence"
+            else:
+                outcome = "exact_overlap"
         else:
-            raise MergeError(f"conflicting fetch attempt overlap: {key}")
-    key_json = _canonical_json(list(key))
+            immutable_equal = _row_values(
+                existing,
+                _ATTEMPT_IMMUTABLE_EVIDENCE,
+            ) == _row_values(incoming, _ATTEMPT_IMMUTABLE_EVIDENCE)
+            if not immutable_equal or incoming_rank == existing_rank:
+                raise MergeError(f"conflicting fetch attempt overlap: {key}")
+            if incoming_rank < existing_rank:
+                outcome = (
+                    "pending_shadowed_by_done"
+                    if existing["status"] == "done"
+                    and _is_zero_evidence_pending(incoming)
+                    else "lower_evidence_shadowed"
+                )
+            else:
+                assignments = ",".join(
+                    f"{column}=?" for column in _ATTEMPT_COLUMNS
+                )
+                connection.execute(
+                    f"""
+                    UPDATE destination.attempts SET {assignments}
+                    WHERE repo=? AND run_id=? AND attempt=?
+                    """,
+                    (*_row_values(incoming, _ATTEMPT_COLUMNS), *key),
+                )
+                connection.execute(
+                    """
+                    UPDATE attempt_winners
+                    SET shard_id=?,role=?,evidence_rank=?,source_row_sha256=?
+                    WHERE source_key_json=?
+                    """,
+                    (
+                        shard_id,
+                        role,
+                        incoming_rank,
+                        incoming_sha256,
+                        key_json,
+                    ),
+                )
+                outcome = (
+                    "done_replaced_zero_evidence_pending"
+                    if incoming["status"] == "done"
+                    and _is_zero_evidence_pending(existing)
+                    else "higher_evidence_replaced"
+                )
     connection.execute(
         """
         INSERT INTO attempt_map(
@@ -3197,7 +5038,7 @@ def _merge_attempt_row(
         (
             shard_id,
             key_json,
-            _row_sha256(incoming, _ATTEMPT_COLUMNS),
+            incoming_sha256,
             outcome,
         ),
     )
@@ -3294,11 +5135,12 @@ def _merge_binding_row(
     existing_row = connection.execute(
         """
         SELECT * FROM destination.binding_upgrades
-        WHERE binding_key=? AND from_sha256=?
+        WHERE binding_key=? AND from_sha256=? AND to_sha256=?
         """,
         (
             incoming["binding_key"],
             incoming["from_sha256"],
+            incoming["to_sha256"],
         ),
     ).fetchone()
     outcome = "inserted"
@@ -3320,8 +5162,6 @@ def _merge_binding_row(
     else:
         existing = _mapping_row(existing_row)
         destination_id = int(existing["id"])
-        if existing["to_sha256"] != incoming["to_sha256"]:
-            raise MergeError("conflicting binding-upgrade branch")
         if existing["reason"] != incoming["reason"]:
             raise MergeError("conflicting binding-upgrade overlap")
         existing_time = _canonical_binding_upgrade_time(
@@ -3410,6 +5250,7 @@ def _merge_state_table(
     source: sqlite3.Connection,
     *,
     shard_id: str,
+    role: str,
     table: str,
     limit: int,
     batch_budget: list[int | None],
@@ -3453,7 +5294,7 @@ def _merge_state_table(
         try:
             for row in rows:
                 if table == "attempts":
-                    _merge_attempt_row(journal, shard_id, row)
+                    _merge_attempt_row(journal, shard_id, role, row)
                 elif table == "members":
                     _merge_member_row(journal, shard_id, row)
                 elif table == "request_ledger":
@@ -3484,6 +5325,147 @@ def _merge_state_table(
                 return False
 
 
+def _fresh_replay_convergence_plan(
+    audits: Sequence[SourceAudit],
+    destination_settings: Mapping[str, str],
+) -> list[dict[str, str]]:
+    if not any(audit.state_projection is not None for audit in audits):
+        return []
+    source_edges: set[tuple[str, str, str]] = set()
+    for audit in audits:
+        connection = sqlite3.connect(
+            (
+                f"{audit.effective_state_path.as_uri()}"
+                "?mode=ro&immutable=1"
+            ),
+            uri=True,
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            source_edges.update(
+                (
+                    str(row["binding_key"]),
+                    str(row["from_sha256"]),
+                    str(row["to_sha256"]),
+                )
+                for row in connection.execute(
+                    """
+                    SELECT binding_key,from_sha256,to_sha256
+                    FROM binding_upgrades
+                    """
+                )
+            )
+        finally:
+            connection.close()
+    plan: list[dict[str, str]] = []
+    for binding_key in _BINDING_KEYS:
+        current = _require_hex64(
+            destination_settings.get(binding_key),
+            where=f"fresh replay destination {binding_key}",
+        )
+        endpoints = sorted(
+            {
+                _require_hex64(
+                    cast(
+                        Mapping[str, Any],
+                        audit.state_binding["settings"],
+                    ).get(binding_key),
+                    where=(
+                        f"{audit.spec.shard_id} effective {binding_key}"
+                    ),
+                )
+                for audit in audits
+            }
+        )
+        for source in endpoints:
+            if source == current:
+                continue
+            edge = (binding_key, source, current)
+            plan.append(
+                {
+                    "binding_key": binding_key,
+                    "from_sha256": source,
+                    "to_sha256": current,
+                    "reason": (
+                        "fresh replay convergence from immutable legacy "
+                        f"{binding_key} to current runtime"
+                    ),
+                    "action": (
+                        "already-present"
+                        if edge in source_edges
+                        else "appended"
+                    ),
+                }
+            )
+    return sorted(
+        plan,
+        key=lambda row: (
+            row["binding_key"],
+            row["from_sha256"],
+            row["to_sha256"],
+        ),
+    )
+
+
+def _append_fresh_replay_convergence(
+    connection: sqlite3.Connection,
+    plan: Sequence[Mapping[str, str]],
+    *,
+    upgraded_at: str,
+) -> None:
+    if not plan:
+        return
+    upgraded_at = _canonical_binding_upgrade_time(upgraded_at)
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for record in plan:
+            existing = connection.execute(
+                """
+                SELECT reason,upgraded_at
+                FROM destination.binding_upgrades
+                WHERE binding_key=? AND from_sha256=? AND to_sha256=?
+                """,
+                (
+                    record["binding_key"],
+                    record["from_sha256"],
+                    record["to_sha256"],
+                ),
+            ).fetchone()
+            if existing is not None:
+                continue
+            if record["action"] != "appended":
+                raise MergeError(
+                    "fresh replay convergence plan lost a source transition"
+                )
+            connection.execute(
+                """
+                INSERT INTO destination.binding_upgrades(
+                  binding_key,from_sha256,to_sha256,reason,upgraded_at
+                ) VALUES (?,?,?,?,?)
+                """,
+                (
+                    record["binding_key"],
+                    record["from_sha256"],
+                    record["to_sha256"],
+                    record["reason"],
+                    upgraded_at,
+                ),
+            )
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def _journal_created_at(connection: sqlite3.Connection) -> str:
+    row = connection.execute(
+        "SELECT value FROM settings WHERE key='created_at'"
+    ).fetchone()
+    if row is None:
+        raise MergeError("merge journal created_at is missing")
+    return _canonical_binding_upgrade_time(row[0])
+
+
 def _merge_fetch_state(
     partial: Path,
     manifest: Manifest,
@@ -3507,7 +5489,7 @@ def _merge_fetch_state(
         attached = True
         journal.execute("PRAGMA foreign_keys=ON")
         for audit in audits:
-            source_path = audit.spec.state.path
+            source_path = audit.effective_state_path
             _require_frozen_sqlite(
                 source_path,
                 label=f"{audit.spec.shard_id} fetch state",
@@ -3528,6 +5510,7 @@ def _merge_fetch_state(
                         journal,
                         source,
                         shard_id=audit.spec.shard_id,
+                        role=audit.spec.role,
                         table=table,
                         limit=manifest.limits.state_rows_per_batch,
                         batch_budget=batch_budget,
@@ -3536,6 +5519,11 @@ def _merge_fetch_state(
                         return False
             finally:
                 source.close()
+        _append_fresh_replay_convergence(
+            journal,
+            _fresh_replay_convergence_plan(audits, settings),
+            upgraded_at=_journal_created_at(journal),
+        )
         _canonicalize_destination_binding_history(journal)
     finally:
         if attached:
@@ -3581,49 +5569,13 @@ def _canonicalize_destination_binding_history(
             where=f"destination {binding_key}",
         )
         rows = rows_by_key[binding_key]
-        by_from: dict[str, dict[str, Any]] = {}
-        destinations: set[str] = set()
-        for row in rows:
-            source = _require_hex64(
-                row["from_sha256"],
-                where=f"destination {binding_key} from_sha256",
+        ordered.extend(
+            _canonical_convergent_binding_rows(
+                rows,
+                current=current,
+                label=f"destination {binding_key}",
             )
-            destination = _require_hex64(
-                row["to_sha256"],
-                where=f"destination {binding_key} to_sha256",
-            )
-            _canonical_binding_upgrade_time(row["upgraded_at"])
-            if source == destination or source in by_from:
-                raise MergeError(
-                    f"destination {binding_key} history contains a branch"
-                )
-            by_from[source] = row
-            destinations.add(destination)
-        if not rows:
-            continue
-        starts = sorted(set(by_from) - destinations)
-        if len(starts) != 1:
-            raise MergeError(
-                f"destination {binding_key} history is not one linear chain"
-            )
-        cursor = starts[0]
-        visited: set[str] = set()
-        key_ordered: list[dict[str, Any]] = []
-        while cursor in by_from:
-            if cursor in visited:
-                raise MergeError(
-                    f"destination {binding_key} history contains a cycle"
-                )
-            visited.add(cursor)
-            row = by_from[cursor]
-            key_ordered.append(row)
-            cursor = str(row["to_sha256"])
-        if len(key_ordered) != len(rows) or cursor != current:
-            raise MergeError(
-                f"destination {binding_key} history does not terminate at "
-                "its current binding"
-            )
-        ordered.extend(key_ordered)
+        )
 
     if not ordered:
         return
@@ -3821,6 +5773,7 @@ def _journal_logical_sha256(connection: sqlite3.Connection) -> str:
         ("store_progress", "shard_id"),
         ("state_progress", "shard_id,table_name"),
         ("attempt_map", "shard_id,source_key_json"),
+        ("attempt_winners", "source_key_json"),
         ("member_map", "shard_id,source_key_json"),
         ("request_id_map", "shard_id,source_id"),
         ("binding_id_map", "shard_id,source_id"),
@@ -3848,10 +5801,135 @@ def _source_still_unchanged(audit: SourceAudit) -> None:
         or _snapshot_receipts(spec) != audit.receipt_files
     ):
         raise MergeError(f"source shard {spec.shard_id} changed during merge")
+    if audit.continuation_seed_path is not None:
+        try:
+            continuation = verify_continuation_seed_inclusion(
+                audit.continuation_seed_path,
+                final_state_path=spec.state.path,
+                final_store_root=spec.store.path,
+            )
+        except ReceiptFinalizationError as exc:
+            raise MergeError(
+                f"source shard {spec.shard_id} continuation lineage changed"
+            ) from exc
+        if continuation != audit.continuation_inclusion:
+            raise MergeError(
+                f"source shard {spec.shard_id} continuation lineage changed"
+            )
     with FrozenStore(spec.store.path, spec.store.receipt.path) as store:
         if store._initial_snapshot != audit.store_files:
             raise MergeError(f"source store {spec.shard_id} changed during merge")
         store.require_unchanged()
+
+
+def _cleanup_effective_state_projections(
+    audits: Sequence[SourceAudit],
+) -> None:
+    for audit in audits:
+        if audit.state_projection is None:
+            continue
+        _remove_scratch_sqlite(audit.effective_state_path)
+
+
+def _cleanup_projection_temporary_residue(
+    manifest: Manifest,
+    scratch_directory: Path,
+) -> None:
+    if manifest.migration is None or not scratch_directory.exists():
+        return
+    try:
+        scratch_metadata = os.lstat(scratch_directory)
+    except OSError as exc:
+        raise MergeError(
+            "source-verification scratch directory cannot be inspected"
+        ) from exc
+    if (
+        stat.S_ISLNK(scratch_metadata.st_mode)
+        or not stat.S_ISDIR(scratch_metadata.st_mode)
+        or scratch_metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(scratch_metadata.st_mode) & 0o077
+    ):
+        raise MergeError(
+            "source-verification scratch directory is unsafe for cleanup"
+        )
+    prefixes = tuple(
+        (
+            f"..{spec.shard_id}-effective-fetch-state-v4.sqlite3"
+            ".project-v4-"
+        )
+        for spec in manifest.shards
+    )
+    removed = False
+    for path in sorted(scratch_directory.iterdir()):
+        name = path.name
+        if not any(name.startswith(prefix) for prefix in prefixes):
+            continue
+        base_name = name
+        for sidecar_suffix in ("-journal", "-wal", "-shm"):
+            if base_name.endswith(sidecar_suffix):
+                base_name = base_name[: -len(sidecar_suffix)]
+                break
+        if not base_name.endswith(".sqlite"):
+            continue
+        metadata = os.lstat(path)
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+        ):
+            raise MergeError(
+                f"unsafe projector temporary residue: {path}"
+            )
+        path.unlink()
+        removed = True
+    if removed:
+        _fsync_directory(scratch_directory)
+
+
+def _cleanup_manifest_projections(
+    manifest: Manifest,
+    scratch_directory: Path,
+) -> None:
+    if manifest.migration is None:
+        return
+    for spec in manifest.shards:
+        _remove_scratch_sqlite(
+            scratch_directory
+            / f".{spec.shard_id}-effective-fetch-state-v4.sqlite3"
+        )
+    _cleanup_projection_temporary_residue(
+        manifest,
+        scratch_directory,
+    )
+
+
+def _append_source_drift_notes(
+    primary: BaseException,
+    audits: Sequence[SourceAudit],
+) -> None:
+    """Audit every source without replacing the exception already in flight."""
+
+    for audit in audits:
+        try:
+            _source_still_unchanged(audit)
+        except BaseException as drift:
+            primary.add_note(
+                "source drift audit failed for "
+                f"{audit.spec.shard_id}: {type(drift).__name__}: {drift}"
+            )
+
+
+def _append_migration_drift_note(
+    primary: BaseException,
+    audit: MigrationAudit | None,
+) -> None:
+    try:
+        _migration_still_unchanged(audit)
+    except BaseException as drift:
+        primary.add_note(
+            "legacy migration drift audit failed: "
+            f"{type(drift).__name__}: {drift}"
+        )
 
 
 def _state_counts(connection: sqlite3.Connection) -> dict[str, int]:
@@ -3904,7 +5982,10 @@ def _validate_destination_inventory(
     ):
         raise MergeError("destination inventory differs from its frozen source")
     try:
-        computed = InventoryDB(path).completion_receipt()
+        computed = InventoryDB(
+            path,
+            initialize_schema=False,
+        ).completion_receipt()
     except (InventoryError, OSError, ValueError, sqlite3.Error) as exc:
         raise MergeError("destination inventory failed final validation") from exc
     computed["database"] = str(manifest.destination / _INVENTORY_NAME)
@@ -3979,6 +6060,7 @@ def _require_completed_progress_row(
 def _resolution_map_digest(connection: sqlite3.Connection) -> str:
     tables = (
         ("attempt_map", "shard_id,source_key_json"),
+        ("attempt_winners", "source_key_json"),
         ("member_map", "shard_id,source_key_json"),
         ("request_id_map", "shard_id,source_id"),
         ("binding_id_map", "shard_id,source_id"),
@@ -4004,6 +6086,7 @@ def _replay_and_validate_state_union(
     *,
     scratch_directory: Path,
     expected_settings: Mapping[str, str],
+    convergence_at: str,
 ) -> None:
     replay_journal_path = scratch_directory / "journal-replay.sqlite3"
     replay_state_path = scratch_directory / "state-replay.sqlite3"
@@ -4041,7 +6124,10 @@ def _replay_and_validate_state_union(
         try:
             for audit in audits:
                 source = sqlite3.connect(
-                    f"{audit.spec.state.path.as_uri()}?mode=ro&immutable=1",
+                    (
+                        f"{audit.effective_state_path.as_uri()}"
+                        "?mode=ro&immutable=1"
+                    ),
                     uri=True,
                 )
                 source.row_factory = sqlite3.Row
@@ -4052,6 +6138,7 @@ def _replay_and_validate_state_union(
                         _merge_attempt_row(
                             replay_journal,
                             audit.spec.shard_id,
+                            audit.spec.role,
                             row,
                         )
                     for row in source.execute(
@@ -4087,6 +6174,11 @@ def _replay_and_validate_state_union(
         except BaseException:
             replay_journal.rollback()
             raise
+        _append_fresh_replay_convergence(
+            replay_journal,
+            _fresh_replay_convergence_plan(audits, expected_settings),
+            upgraded_at=convergence_at,
+        )
         _canonicalize_destination_binding_history(replay_journal)
         replay_journal.execute("DETACH DATABASE destination")
         attached = False
@@ -4193,7 +6285,10 @@ def _validate_completed_journal(
             )
 
             source_state = sqlite3.connect(
-                f"{audit.spec.state.path.as_uri()}?mode=ro&immutable=1",
+                (
+                    f"{audit.effective_state_path.as_uri()}"
+                    "?mode=ro&immutable=1"
+                ),
                 uri=True,
             )
             source_state.row_factory = sqlite3.Row
@@ -4234,9 +6329,63 @@ def _validate_completed_journal(
             scratch_directory=destination_state.parent
             / ".source-verification",
             expected_settings=expected_settings,
+            convergence_at=_journal_created_at(journal),
         )
     finally:
         destination.close()
+
+
+def _store_semantic_oracle(
+    receipt: Mapping[str, Any],
+    *,
+    where: str,
+) -> dict[str, Any]:
+    if (
+        receipt.get("schema") != STORE_RECEIPT_SCHEMA
+        or receipt.get("store_schema") != STORE_SCHEMA
+    ):
+        raise MergeError(f"{where} store receipt/schema tuple is unsupported")
+    counters = _require_mapping(
+        receipt.get("counters"),
+        where=f"{where} counters",
+    )
+    integer_fields = (
+        "raw_occurrence_bytes",
+        "unique_bytes",
+        "duplicate_bytes",
+        "unique_content_count",
+        "occurrence_count",
+        "tokenized_unique_content_count",
+        "unique_token_sequence_count",
+        "exact_unique_payload_tokens",
+    )
+    normalized_counters: dict[str, object] = _integer_counts(
+        counters,
+        integer_fields,
+    )
+    fingerprint = _require_string(
+        counters.get("tokenizer_fingerprint"),
+        where=f"{where} tokenizer_fingerprint",
+    )
+    normalized_counters["tokenizer_fingerprint"] = fingerprint
+    digests = {
+        field: _require_hex64(
+            receipt.get(field),
+            where=f"{where} {field}",
+        )
+        for field in (
+            "logical_content_set_sha256",
+            "logical_token_sequence_set_sha256",
+            "occurrence_set_sha256",
+        )
+    }
+    return {
+        "schema": STORE_RECEIPT_SCHEMA,
+        "store_schema": STORE_SCHEMA,
+        "semantic_digests": digests,
+        "counters": normalized_counters,
+        "tokenizer_fingerprint": fingerprint,
+    }
 
 
 def _finalize_receipts(
@@ -4248,16 +6397,27 @@ def _finalize_receipts(
     journal: sqlite3.Connection,
     *,
     merge_script_sha256: str,
+    migration_audit: MigrationAudit | None,
 ) -> dict[str, Any]:
     _validate_destination_inventory(partial, manifest, inventory_contract)
+    store_receipt = _load_destination_store_receipt(partial)
+    destination_settings = _destination_state_settings(
+        manifest,
+        audits,
+        store_receipt,
+    )
+    convergence_plan = _fresh_replay_convergence_plan(
+        audits,
+        destination_settings,
+    )
     _validate_completed_journal(
         manifest,
         audits,
         journal,
         partial / _FETCH_STATE_NAME,
     )
+    _cleanup_effective_state_projections(audits)
     ledgers = _mapping_ledgers(partial, audits, journal)
-    store_receipt = _load_destination_store_receipt(partial)
     state_path = partial / _FETCH_STATE_NAME
     binding_store = SimpleNamespace(
         root=(manifest.destination / _STORE_DIRECTORY).resolve(),
@@ -4292,6 +6452,8 @@ def _finalize_receipts(
                 uri=True,
             )
             destination_inventory.row_factory = sqlite3.Row
+            exhaustive_proof: dict[str, object] | None = None
+            destination_inventory_receipt: dict[str, Any] | None = None
             try:
                 (
                     inventory_joined_attempts,
@@ -4301,7 +6463,34 @@ def _finalize_receipts(
                     state.connection,
                     label="destination",
                     max_blob_bytes=manifest.limits.max_state_blob_bytes,
+                    continuation_base_states=tuple(
+                        audit.continuation_base_state
+                        for audit in audits
+                        if audit.continuation_base_state is not None
+                    ),
                 )
+                if (
+                    manifest.completion_mode
+                    == COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+                ):
+                    destination_inventory_receipt, _receipt_raw = _load_json(
+                        partial / _INVENTORY_RECEIPT_NAME,
+                        where="destination inventory receipt",
+                    )
+                    try:
+                        exhaustive_proof = exhaustive_coverage_proof(
+                            destination_inventory,
+                            state.connection,
+                            inventory_receipt=(
+                                destination_inventory_receipt
+                            ),
+                            require_discovery_eof=False,
+                        )
+                    except ReceiptFinalizationError as exc:
+                        raise MergeError(
+                            "destination attempt union is not exactly equal "
+                            f"to the production inventory: {exc}"
+                        ) from exc
             finally:
                 destination_inventory.close()
             frozen_binding = state.receipt_binding()
@@ -4347,9 +6536,68 @@ def _finalize_receipts(
     if completed_at_row is None:
         raise MergeError("ready journal lacks completed_at")
     completed_at = str(completed_at_row[0])
+    input_store_totals = {
+        field: sum(audit.store_counts[field] for audit in audits)
+        for field in audits[0].store_counts
+    }
+    output_store_counts = _integer_counts(
+        cast(Mapping[str, Any], store_receipt["counters"]),
+        tuple(input_store_totals),
+    )
+    if (
+        output_store_counts["exact_unique_payload_tokens"]
+        < manifest.target_unique_tokens
+    ):
+        raise MergeError(
+            "destination store does not meet the secondary token minimum"
+        )
+    migration_semantic_oracle: dict[str, Any] | None = None
+    if manifest.migration is not None:
+        if len(audits) != 1 or audits[0].state_projection is None:
+            raise MergeError(
+                "fresh replay migration lost its one projected source audit"
+            )
+        source_store_oracle = _store_semantic_oracle(
+            audits[0].store_receipt,
+            where="legacy source CAS",
+        )
+        destination_store_oracle = _store_semantic_oracle(
+            store_receipt,
+            where="fresh destination CAS",
+        )
+        if source_store_oracle != destination_store_oracle:
+            raise MergeError(
+                "fresh destination CAS semantic oracle differs from the "
+                "legacy partial"
+            )
+        destination_creator = _require_hex64(
+            store_receipt.get("script_sha256"),
+            where="fresh destination CAS creator",
+        )
+        current_creator = _current_store_script_sha256()
+        if destination_creator != current_creator:
+            raise MergeError(
+                "fresh destination CAS creator is not the current implementation"
+            )
+        migration_semantic_oracle = {
+            "source": source_store_oracle,
+            "destination": destination_store_oracle,
+            "equal": True,
+            "physical_cas_identity_may_differ": True,
+            "source_creator_script_sha256": _require_hex64(
+                audits[0].store_receipt.get("script_sha256"),
+                where="legacy source CAS creator",
+            ),
+            "destination_creator_script_sha256": destination_creator,
+        }
 
     fetch_receipt = {
-        "schema": FETCH_RECEIPT_SCHEMA,
+        "schema": (
+            EXHAUSTIVE_RECEIPT_SCHEMA
+            if manifest.completion_mode
+            == COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+            else FETCH_RECEIPT_SCHEMA
+        ),
         "completed_at": completed_at,
         "target_exact_unique_payload_tokens": manifest.target_unique_tokens,
         "fetch_state": frozen_binding["summary"],
@@ -4360,16 +6608,72 @@ def _finalize_receipts(
         "tokenizer_contract": tokenizer.contract,
         "tokenizer_fingerprint": tokenizer.fingerprint,
     }
+    if exhaustive_proof is not None:
+        fetch_receipt["completion_mode"] = manifest.completion_mode
+        fetch_receipt["production_complete"] = True
+        fetch_receipt["coverage_semantics"] = (
+            "exact-production-inventory-attempt-equality"
+        )
+        assert destination_inventory_receipt is not None
+        database_artifact = _require_mapping(
+            destination_inventory_receipt.get("database_artifact"),
+            where="destination inventory receipt database_artifact",
+        )
+        fetch_receipt["inventory_binding"] = {
+            "database": {
+                "path": str(manifest.destination / _INVENTORY_NAME),
+                "byte_size": database_artifact["byte_size"],
+                "sha256": database_artifact["sha256"],
+                "db_logical_sha256": destination_inventory_receipt[
+                    "db_logical_sha256"
+                ],
+            },
+            "completion_receipt": {
+                "path": str(
+                    manifest.destination / _INVENTORY_RECEIPT_NAME
+                ),
+                "sha256": _sha256_file(
+                    partial / _INVENTORY_RECEIPT_NAME
+                ),
+                "schema": INVENTORY_RECEIPT_SCHEMA,
+            },
+            "repo_count": destination_inventory_receipt["repo_list"][
+                "repos"
+            ],
+            "expected_run_count": destination_inventory_receipt[
+                "run_count"
+            ],
+            "expected_attempt_count": destination_inventory_receipt[
+                "expected_attempt_count"
+            ],
+            "attempt_set_sha256": destination_inventory_receipt[
+                "expected_attempt_set_sha256"
+            ],
+        }
+        fetch_receipt["exhaustive_coverage"] = exhaustive_proof
+        fetch_receipt["conservation"] = {
+            "cas_occurrences": output_store_counts["occurrence_count"],
+            "fetch_members": destination_state_counts["members"],
+            "fetch_chunks": destination_state_counts["chunks"],
+            "fetch_occurrence_tokens": destination_state_counts[
+                "occurrence_tokens"
+            ],
+            "exact_unique_payload_tokens": output_store_counts[
+                "exact_unique_payload_tokens"
+            ],
+            "secondary_minimum_exact_unique_payload_tokens": (
+                manifest.target_unique_tokens
+            ),
+            "cas_member_chunk_join_complete": True,
+            "occurrence_chunk_count_equal": (
+                output_store_counts["occurrence_count"]
+                == destination_state_counts["chunks"]
+            ),
+            "secondary_token_minimum_met": True,
+        }
+        fetch_receipt["continuation_seed"] = None
     _write_json(partial / _FETCH_RECEIPT_NAME, fetch_receipt)
 
-    input_store_totals = {
-        field: sum(audit.store_counts[field] for audit in audits)
-        for field in audits[0].store_counts
-    }
-    output_store_counts = _integer_counts(
-        cast(Mapping[str, Any], store_receipt["counters"]),
-        tuple(input_store_totals),
-    )
     store_overlap = {
         "unique_contents": (
             input_store_totals["unique_content_count"]
@@ -4434,8 +6738,20 @@ def _finalize_receipts(
         raise MergeError("attempt resolution map is not exhaustive")
     if member_map_count != input_state_totals["members"]:
         raise MergeError("member resolution map is not exhaustive")
+    generated_binding_count = sum(
+        record["action"] == "appended"
+        for record in convergence_plan
+    )
     state_overlap = {
-        field: input_state_totals[field] - destination_state_counts[field]
+        field: (
+            input_state_totals[field]
+            + (
+                generated_binding_count
+                if field == "bindings"
+                else 0
+            )
+            - destination_state_counts[field]
+        )
         for field in (
             "attempts",
             "members",
@@ -4513,13 +6829,18 @@ def _finalize_receipts(
         )
     }
     receipt = {
-        "schema": MERGE_RECEIPT_SCHEMA,
+        "schema": (
+            PRODUCTION_MERGE_RECEIPT_SCHEMA
+            if manifest.completion_mode
+            == COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+            else MERGE_RECEIPT_SCHEMA
+        ),
         "status": "complete",
         "completed_at": completed_at,
         "manifest": {
             "path": str(manifest.path),
             "sha256": manifest.sha256,
-            "schema": MANIFEST_SCHEMA,
+            "schema": str(manifest.value["schema"]),
         },
         "merge_script_sha256": merge_script_sha256,
         "destination": str(manifest.destination),
@@ -4527,6 +6848,12 @@ def _finalize_receipts(
         "sources": [
             {
                 "id": audit.spec.shard_id,
+                **(
+                    {"role": audit.spec.role}
+                    if manifest.completion_mode
+                    == COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+                    else {}
+                ),
                 "original_paths": {
                     "inventory": audit.spec.original_inventory,
                     "content_store": audit.spec.original_store,
@@ -4552,9 +6879,45 @@ def _finalize_receipts(
                         "path": str(audit.spec.state.path),
                         "sha256": audit.state_file.sha256,
                         "receipt_sha256": audit.spec.state.receipt.sha256,
-                        "sqlite_logical_sha256": audit.state_binding[
+                        "sqlite_logical_sha256": audit.original_state_binding[
                             "sqlite_logical_sha256"
                         ],
+                        "original": {
+                            "path": str(audit.spec.state.path),
+                            "byte_size": audit.state_file.size,
+                            "sha256": audit.state_file.sha256,
+                            "settings_schema": audit.original_state_binding[
+                                "settings"
+                            ]["schema"],
+                            "sqlite_schema_sha256": (
+                                audit.original_state_binding[
+                                    "sqlite_schema_sha256"
+                                ]
+                            ),
+                            "sqlite_logical_sha256": (
+                                audit.original_state_binding[
+                                    "sqlite_logical_sha256"
+                                ]
+                            ),
+                        },
+                        "effective": {
+                            "path": str(audit.effective_state_path),
+                            "byte_size": audit.effective_state_file.size,
+                            "sha256": audit.effective_state_file.sha256,
+                            "settings_schema": audit.state_binding[
+                                "settings"
+                            ]["schema"],
+                            "sqlite_schema_sha256": audit.state_binding[
+                                "sqlite_schema_sha256"
+                            ],
+                            "sqlite_logical_sha256": audit.state_binding[
+                                "sqlite_logical_sha256"
+                            ],
+                            "ephemeral_projection": (
+                                audit.state_projection is not None
+                            ),
+                        },
+                        "projection": audit.state_projection,
                     },
                 },
                 "verified_before_merge": True,
@@ -4621,6 +6984,7 @@ def _finalize_receipts(
                 ),
                 "bindings": (
                     input_state_totals["bindings"]
+                    + generated_binding_count
                     == destination_state_counts["bindings"]
                     + state_overlap["bindings"]
                 ),
@@ -4643,6 +7007,9 @@ def _finalize_receipts(
             "attempt_outcomes": attempt_outcomes,
             "member_outcomes": member_outcomes,
             "binding_outcomes": binding_outcomes,
+            "generated_current_convergence_bindings": (
+                generated_binding_count
+            ),
         },
         "verification": {
             "full_cas_fetch_join": True,
@@ -4653,6 +7020,12 @@ def _finalize_receipts(
             "sources_frozen_before_after": True,
             "destination_frozen": True,
             "threshold_recomputed_after_global_dedup": True,
+            **(
+                {"exact_production_inventory_attempt_equality": True}
+                if manifest.completion_mode
+                == COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+                else {}
+            ),
         },
         "frozen_fetch_state": frozen_binding,
         "ledgers": ledgers,
@@ -4664,21 +7037,139 @@ def _finalize_receipts(
         },
         "artifacts": sorted(artifacts, key=lambda item: str(item["path"])),
     }
+    if manifest.migration is not None:
+        assert migration_semantic_oracle is not None
+        if migration_audit is None:
+            raise MergeError("fresh replay lost its legacy journal audit")
+        projection = audits[0].state_projection
+        assert projection is not None
+        convergence_at = _journal_created_at(journal)
+        receipt["migration"] = {
+            "schema": MIGRATION_SCHEMA,
+            "mode": MIGRATION_MODE,
+            "manifest_binding": cast(
+                Mapping[str, Any],
+                manifest.value["migration"],
+            ),
+            "legacy_source": {
+                "partial_path": str(
+                    manifest.migration.legacy_partial
+                ),
+                "partial_artifact_set_sha256": (
+                    manifest.migration
+                    .legacy_partial_artifact_set_sha256
+                ),
+                "source_manifest": {
+                    "path": str(
+                        manifest.migration.source_manifest
+                    ),
+                    "sha256": (
+                        manifest.migration.source_manifest_sha256
+                    ),
+                    "schema": (
+                        manifest.migration.source_manifest_schema
+                    ),
+                },
+                "journal": {
+                    "path": str(
+                        manifest.migration.source_journal
+                    ),
+                    "sha256": (
+                        manifest.migration.source_journal_sha256
+                    ),
+                    "schema": (
+                        manifest.migration.source_journal_schema
+                    ),
+                    "sqlite_schema_sha256": (
+                        manifest.migration
+                        .source_journal_sqlite_schema_sha256
+                    ),
+                    "resumed_or_mutated": False,
+                    "unchanged_during_fresh_replay": True,
+                    "used_for_resume": False,
+                    "used_for_output_semantics": False,
+                    "audit": migration_audit.source_journal_audit,
+                },
+                "cas": {
+                    "path": str(manifest.migration.source_cas),
+                    "artifact_set_sha256": (
+                        manifest.migration
+                        .source_cas_artifact_set_sha256
+                    ),
+                    "receipt_schema": (
+                        manifest.migration.source_cas_receipt_schema
+                    ),
+                    "store_schema": (
+                        manifest.migration.source_cas_store_schema
+                    ),
+                },
+            },
+            "state_projection": projection,
+            "convergence_lineage": [
+                {
+                    **record,
+                    "upgraded_at": convergence_at,
+                }
+                for record in convergence_plan
+            ],
+            "cas_semantic_oracle": migration_semantic_oracle,
+            "orphan_content_rows_rejected_preflight": True,
+            "fresh_destination": {
+                "path": str(manifest.destination),
+                "state_schema": FETCH_STATE_SCHEMA,
+                "state_sqlite_schema_sha256": (
+                    CURRENT_V4_SQLITE_SCHEMA_SHA256
+                ),
+                "journal_schema": JOURNAL_SCHEMA,
+                "journal_sqlite_schema_sha256": (
+                    _expected_journal_schema_sha256()
+                ),
+                "cas_artifact_set_sha256": (
+                    frozen_store_artifact_set_sha256(
+                        partial / _STORE_DIRECTORY,
+                        partial / _STORE_RECEIPT_NAME,
+                    )
+                ),
+                "legacy_artifacts_overwritten": False,
+            },
+        }
+    if (
+        manifest.completion_mode
+        == COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+    ):
+        receipt["completion_mode"] = manifest.completion_mode
+        receipt["production_complete"] = True
     _write_json(partial / _MERGE_RECEIPT_NAME, receipt)
     return receipt
 
 
 def _fsync_tree(root: Path) -> None:
-    directories = {root}
-    for path in root.rglob("*"):
-        if path.is_symlink():
-            raise MergeError(f"bundle contains a symlink: {path}")
-        if path.is_file():
+    for directory, directory_names, file_names in os.walk(
+        root,
+        topdown=False,
+        followlinks=False,
+    ):
+        current = Path(directory)
+        for name in file_names:
+            path = current / name
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise MergeError(f"bundle contains a symlink: {path}")
+            if not stat.S_ISREG(metadata.st_mode):
+                raise MergeError(
+                    f"bundle contains an unsupported artifact: {path}"
+                )
             _fsync_file(path)
-        elif path.is_dir():
-            directories.add(path)
-    for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
-        _fsync_directory(directory)
+        for name in directory_names:
+            path = current / name
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise MergeError(f"bundle contains a symlink: {path}")
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise MergeError(
+                    f"bundle contains an unsupported artifact: {path}"
+                )
+        _fsync_directory(current)
 
 
 def _require_complete_bundle_tree(
@@ -4688,98 +7179,197 @@ def _require_complete_bundle_tree(
     raw_artifacts = receipt.get("artifacts")
     if not isinstance(raw_artifacts, list):
         raise MergeError("merge receipt artifacts must be a list")
-    expected_files = {_MERGE_RECEIPT_NAME}
-    expected_artifacts: dict[str, tuple[int, str]] = {}
-    for index, raw_artifact in enumerate(raw_artifacts):
-        artifact = _require_mapping(
-            raw_artifact,
-            where=f"merge receipt artifact {index}",
-        )
-        _require_exact_keys(
-            artifact,
-            {"path", "byte_size", "sha256"},
-            where=f"merge receipt artifact {index}",
-        )
-        relative = _require_string(
-            artifact.get("path"),
-            where=f"merge receipt artifact {index}.path",
-        )
-        pure = PurePosixPath(relative)
-        if (
-            pure.is_absolute()
-            or str(pure) != relative
-            or relative in {"", "."}
-            or ".." in pure.parts
-        ):
-            raise MergeError("merge receipt contains an unsafe artifact path")
-        if relative in expected_files:
-            raise MergeError("merge receipt contains a duplicate artifact path")
-        expected_files.add(relative)
-        expected_artifacts[relative] = (
-            _require_nonnegative_int(
-                artifact.get("byte_size"),
-                where=f"merge receipt artifact {index}.byte_size",
-            ),
-            _require_hex64(
-                artifact.get("sha256"),
-                where=f"merge receipt artifact {index}.sha256",
-            ),
-        )
-
-    expected_directories: set[str] = set()
-    for relative in expected_files:
-        parent = PurePosixPath(relative).parent
-        while str(parent) != ".":
-            expected_directories.add(str(parent))
-            parent = parent.parent
-
-    actual_files: set[str] = set()
-    actual_directories: set[str] = set()
-    for path in partial.rglob("*"):
-        if path.is_symlink():
-            raise MergeError(f"bundle contains a symlink: {path}")
-        relative = path.relative_to(partial).as_posix()
-        if path.is_file():
-            actual_files.add(relative)
-        elif path.is_dir():
-            actual_directories.add(relative)
-        else:
-            raise MergeError(f"bundle contains an unsupported artifact: {path}")
-    if actual_files != expected_files:
-        raise MergeError(
-            "partial bundle files differ from the receipt; "
-            f"missing={sorted(expected_files - actual_files)}, "
-            f"unexpected={sorted(actual_files - expected_files)}"
-        )
-    if actual_directories != expected_directories:
-        raise MergeError(
-            "partial bundle directories differ from the receipt; "
-            f"missing={sorted(expected_directories - actual_directories)}, "
-            f"unexpected={sorted(actual_directories - expected_directories)}"
-        )
-    for relative, (expected_size, expected_sha256) in sorted(
-        expected_artifacts.items()
-    ):
-        path = partial / relative
-        stat_before = path.stat()
-        if stat_before.st_size != expected_size:
-            raise MergeError(f"bundle artifact size changed: {relative}")
-        actual_sha256 = _sha256_file(path)
-        stat_after = path.stat()
-        if (
-            actual_sha256 != expected_sha256
-            or (
-                stat_before.st_size,
-                stat_before.st_mtime_ns,
-                stat_before.st_ino,
+    # Receipt bundles may contain millions of CAS files.  Keep the comparison
+    # disk-backed so verification does not duplicate that cardinality in
+    # Python dictionaries and sets.
+    with tempfile.TemporaryDirectory(
+        prefix=f".{partial.name}.tree-verification-",
+        dir=partial.parent,
+    ) as scratch_directory:
+        scratch_path = Path(scratch_directory) / "tree.sqlite3"
+        scratch = sqlite3.connect(scratch_path)
+        try:
+            scratch.executescript(
+                """
+                PRAGMA journal_mode=DELETE;
+                CREATE TABLE expected_files(
+                    path TEXT PRIMARY KEY,
+                    byte_size INTEGER,
+                    sha256 TEXT,
+                    verify_content INTEGER NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE expected_directories(
+                    path TEXT PRIMARY KEY
+                ) WITHOUT ROWID;
+                CREATE TABLE actual_files(
+                    path TEXT PRIMARY KEY
+                ) WITHOUT ROWID;
+                CREATE TABLE actual_directories(
+                    path TEXT PRIMARY KEY
+                ) WITHOUT ROWID;
+                """
             )
-            != (
-                stat_after.st_size,
-                stat_after.st_mtime_ns,
-                stat_after.st_ino,
+            scratch.execute(
+                """
+                INSERT INTO expected_files(path, byte_size, sha256, verify_content)
+                VALUES (?, NULL, NULL, 0)
+                """,
+                (_MERGE_RECEIPT_NAME,),
             )
-        ):
-            raise MergeError(f"bundle artifact changed after its receipt: {relative}")
+            for index, raw_artifact in enumerate(raw_artifacts):
+                artifact = _require_mapping(
+                    raw_artifact,
+                    where=f"merge receipt artifact {index}",
+                )
+                _require_exact_keys(
+                    artifact,
+                    {"path", "byte_size", "sha256"},
+                    where=f"merge receipt artifact {index}",
+                )
+                relative = _require_string(
+                    artifact.get("path"),
+                    where=f"merge receipt artifact {index}.path",
+                )
+                pure = PurePosixPath(relative)
+                if (
+                    pure.is_absolute()
+                    or str(pure) != relative
+                    or relative in {"", "."}
+                    or ".." in pure.parts
+                ):
+                    raise MergeError("merge receipt contains an unsafe artifact path")
+                expected_size = _require_nonnegative_int(
+                    artifact.get("byte_size"),
+                    where=f"merge receipt artifact {index}.byte_size",
+                )
+                expected_sha256 = _require_hex64(
+                    artifact.get("sha256"),
+                    where=f"merge receipt artifact {index}.sha256",
+                )
+                try:
+                    scratch.execute(
+                        """
+                        INSERT INTO expected_files(
+                            path, byte_size, sha256, verify_content
+                        ) VALUES (?, ?, ?, 1)
+                        """,
+                        (relative, expected_size, expected_sha256),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise MergeError(
+                        "merge receipt contains a duplicate artifact path"
+                    ) from exc
+                parent = pure.parent
+                while str(parent) != ".":
+                    scratch.execute(
+                        "INSERT OR IGNORE INTO expected_directories(path) VALUES (?)",
+                        (str(parent),),
+                    )
+                    parent = parent.parent
+
+            for root, directory_names, file_names in os.walk(
+                partial,
+                followlinks=False,
+            ):
+                root_path = Path(root)
+                for name in directory_names:
+                    path = root_path / name
+                    metadata = path.lstat()
+                    if stat.S_ISLNK(metadata.st_mode):
+                        raise MergeError(f"bundle contains a symlink: {path}")
+                    if not stat.S_ISDIR(metadata.st_mode):
+                        raise MergeError(
+                            f"bundle contains an unsupported artifact: {path}"
+                        )
+                    scratch.execute(
+                        "INSERT INTO actual_directories(path) VALUES (?)",
+                        (path.relative_to(partial).as_posix(),),
+                    )
+                for name in file_names:
+                    path = root_path / name
+                    metadata = path.lstat()
+                    if stat.S_ISLNK(metadata.st_mode):
+                        raise MergeError(f"bundle contains a symlink: {path}")
+                    if not stat.S_ISREG(metadata.st_mode):
+                        raise MergeError(
+                            f"bundle contains an unsupported artifact: {path}"
+                        )
+                    scratch.execute(
+                        "INSERT INTO actual_files(path) VALUES (?)",
+                        (path.relative_to(partial).as_posix(),),
+                    )
+
+            def difference(
+                left: str,
+                right: str,
+            ) -> list[str]:
+                return [
+                    str(row[0])
+                    for row in scratch.execute(
+                        f"""
+                        SELECT path FROM {left}
+                        EXCEPT
+                        SELECT path FROM {right}
+                        ORDER BY path
+                        LIMIT 21
+                        """
+                    )
+                ]
+
+            missing_files = difference("expected_files", "actual_files")
+            unexpected_files = difference("actual_files", "expected_files")
+            if missing_files or unexpected_files:
+                raise MergeError(
+                    "partial bundle files differ from the receipt; "
+                    f"missing={missing_files}, unexpected={unexpected_files}"
+                )
+            missing_directories = difference(
+                "expected_directories",
+                "actual_directories",
+            )
+            unexpected_directories = difference(
+                "actual_directories",
+                "expected_directories",
+            )
+            if missing_directories or unexpected_directories:
+                raise MergeError(
+                    "partial bundle directories differ from the receipt; "
+                    f"missing={missing_directories}, "
+                    f"unexpected={unexpected_directories}"
+                )
+
+            for relative, expected_size, expected_sha256 in scratch.execute(
+                """
+                SELECT path, byte_size, sha256
+                FROM expected_files
+                WHERE verify_content = 1
+                ORDER BY path
+                """
+            ):
+                path = partial / str(relative)
+                stat_before = path.stat()
+                if stat_before.st_size != int(expected_size):
+                    raise MergeError(f"bundle artifact size changed: {relative}")
+                actual_sha256 = _sha256_file(path)
+                stat_after = path.stat()
+                if (
+                    actual_sha256 != str(expected_sha256)
+                    or (
+                        stat_before.st_size,
+                        stat_before.st_mtime_ns,
+                        stat_before.st_ino,
+                    )
+                    != (
+                        stat_after.st_size,
+                        stat_after.st_mtime_ns,
+                        stat_after.st_ino,
+                    )
+                ):
+                    raise MergeError(
+                        f"bundle artifact changed after its receipt: {relative}"
+                    )
+        finally:
+            scratch.close()
     declared_receipt, raw_receipt = _load_json(
         partial / _MERGE_RECEIPT_NAME,
         where="on-disk merge receipt",
@@ -4886,14 +7476,25 @@ def merge_shards(
     if tokenizer_snapshot.sha256 != manifest.tokenizer_sha256:
         raise MergeError("tokenizer artifact differs from the manifest")
     _validate_output_geometry(manifest)
+    migration_audit = _preflight_migration(manifest)
     lock_descriptor = _acquire_merge_lock(manifest.destination)
     try:
         partial = _ensure_safe_partial(manifest)
+        _reject_migration_output_aliases(
+            partial,
+            migration_audit,
+            where="pre-journal",
+        )
         journal = _open_journal(
             partial,
             manifest,
             merge_script_sha256=merge_script_snapshot.sha256,
             fault_inject_sigkill_after=fault_inject_sigkill_after,
+        )
+        _reject_migration_output_aliases(
+            partial,
+            migration_audit,
+            where="post-journal",
         )
     except BaseException:
         _release_merge_lock(lock_descriptor)
@@ -4902,7 +7503,15 @@ def merge_shards(
     scratch = partial / ".source-verification"
     audits: list[SourceAudit] = []
     try:
-        scratch.mkdir(exist_ok=True)
+        scratch.mkdir(mode=0o700, exist_ok=True)
+        if scratch.is_symlink() or not scratch.is_dir():
+            raise MergeError("source-verification scratch directory is unsafe")
+        if scratch.stat().st_uid != os.geteuid():
+            raise MergeError(
+                "source-verification scratch directory has the wrong owner"
+            )
+        os.chmod(scratch, 0o700)
+        _cleanup_manifest_projections(manifest, scratch)
         tokenizer = _load_pinned_tokenizer(
             manifest.tokenizer_path,
             tokenizer_snapshot,
@@ -4917,9 +7526,27 @@ def merge_shards(
                     scratch,
                 )
             )
+        if (
+            manifest.completion_mode
+            == COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+        ):
+            coverage = [
+                audit for audit in audits if audit.spec.role == "coverage"
+            ]
+            if len(coverage) != 1:
+                raise MergeError(
+                    "production exhaustive merge requires exactly one v4 "
+                    "coverage shard; v3 threshold shards may appear only as "
+                    "verified seed lineage"
+                )
         inventory_contract = _validate_cross_source_contracts(audits)
         phase = _journal_phase(journal)
         if phase == "store":
+            _reject_migration_output_aliases(
+                partial,
+                migration_audit,
+                where="pre-store replay",
+            )
             receipt = _merge_store(
                 partial,
                 manifest,
@@ -4927,17 +7554,42 @@ def merge_shards(
                 batch_budget=batch_budget,
             )
             if receipt is None:
+                _reject_migration_output_aliases(
+                    partial,
+                    migration_audit,
+                    where="paused-store replay",
+                )
                 raise MergePaused("merge paused at the requested batch bound")
+            _reject_migration_output_aliases(
+                partial,
+                migration_audit,
+                where="post-store replay",
+            )
             phase = _journal_phase(journal)
         if phase == "inventory":
+            _reject_migration_output_aliases(
+                partial,
+                migration_audit,
+                where="pre-inventory replay",
+            )
             _copy_and_validate_inventory(
                 partial,
                 manifest,
                 inventory_contract,
                 journal,
             )
+            _reject_migration_output_aliases(
+                partial,
+                migration_audit,
+                where="post-inventory replay",
+            )
             phase = _journal_phase(journal)
         if phase == "state":
+            _reject_migration_output_aliases(
+                partial,
+                migration_audit,
+                where="pre-state replay",
+            )
             completed = _merge_fetch_state(
                 partial,
                 manifest,
@@ -4947,9 +7599,24 @@ def merge_shards(
                 fault_inject_sigkill_after=fault_inject_sigkill_after,
             )
             if not completed:
+                _reject_migration_output_aliases(
+                    partial,
+                    migration_audit,
+                    where="paused-state replay",
+                )
                 raise MergePaused("merge paused at the requested batch bound")
+            _reject_migration_output_aliases(
+                partial,
+                migration_audit,
+                where="post-state replay",
+            )
             phase = _journal_phase(journal)
         if phase in {"verify", "ready"}:
+            _reject_migration_output_aliases(
+                partial,
+                migration_audit,
+                where="pre-finalization",
+            )
             receipt = _finalize_receipts(
                 partial,
                 manifest,
@@ -4958,6 +7625,12 @@ def merge_shards(
                 tokenizer,
                 journal,
                 merge_script_sha256=merge_script_snapshot.sha256,
+                migration_audit=migration_audit,
+            )
+            _reject_migration_output_aliases(
+                partial,
+                migration_audit,
+                where="post-finalization",
             )
         else:
             raise MergeError(f"unsupported terminal merge phase {phase!r}")
@@ -4970,6 +7643,12 @@ def merge_shards(
         _fsync_tree(partial)
         for audit in audits:
             _source_still_unchanged(audit)
+        _migration_still_unchanged(migration_audit)
+        _reject_migration_output_aliases(
+            partial,
+            migration_audit,
+            where="post-fsync",
+        )
         _require_control_inputs_unchanged(
             manifest,
             manifest_snapshot=manifest_snapshot,
@@ -4979,8 +7658,14 @@ def merge_shards(
         if manifest.destination.exists() or manifest.destination.is_symlink():
             raise MergeError(f"destination appeared during merge: {manifest.destination}")
         _require_complete_bundle_tree(partial, receipt)
+        _reject_migration_output_aliases(
+            partial,
+            migration_audit,
+            where="post-tree-verification",
+        )
         for audit in audits:
             _source_still_unchanged(audit)
+        _migration_still_unchanged(migration_audit)
         _require_control_inputs_unchanged(
             manifest,
             manifest_snapshot=manifest_snapshot,
@@ -4989,32 +7674,47 @@ def merge_shards(
         )
         if manifest.destination.exists() or manifest.destination.is_symlink():
             raise MergeError("destination appeared during final verification")
+        _reject_migration_output_aliases(
+            partial,
+            migration_audit,
+            where="pre-publication",
+        )
         _publish_directory_no_replace(partial, manifest.destination)
         _fsync_directory(manifest.destination.parent)
         return receipt
-    except MergePaused:
-        for audit in audits:
-            _source_still_unchanged(audit)
-        _require_control_inputs_unchanged(
-            manifest,
-            manifest_snapshot=manifest_snapshot,
-            tokenizer_snapshot=tokenizer_snapshot,
-            merge_script_snapshot=merge_script_snapshot,
-        )
+    except MergePaused as exc:
+        _append_source_drift_notes(exc, audits)
+        _append_migration_drift_note(exc, migration_audit)
+        try:
+            _require_control_inputs_unchanged(
+                manifest,
+                manifest_snapshot=manifest_snapshot,
+                tokenizer_snapshot=tokenizer_snapshot,
+                merge_script_snapshot=merge_script_snapshot,
+            )
+        except BaseException as drift:
+            exc.add_note(
+                "control-input drift audit failed while preserving pause: "
+                f"{type(drift).__name__}: {drift}"
+            )
         raise
     except (ExportError, sqlite3.Error) as exc:
-        for audit in audits:
-            _source_still_unchanged(audit)
-        raise MergeError(str(exc)) from exc
-    except BaseException:
-        for audit in audits:
-            _source_still_unchanged(audit)
+        primary = MergeError(str(exc))
+        _append_source_drift_notes(primary, audits)
+        _append_migration_drift_note(primary, migration_audit)
+        raise primary from exc
+    except BaseException as exc:
+        _append_source_drift_notes(exc, audits)
+        _append_migration_drift_note(exc, migration_audit)
         raise
     finally:
         try:
-            journal.close()
+            _cleanup_manifest_projections(manifest, scratch)
         finally:
-            _release_merge_lock(lock_descriptor)
+            try:
+                journal.close()
+            finally:
+                _release_merge_lock(lock_descriptor)
 
 
 def _build_parser() -> argparse.ArgumentParser:

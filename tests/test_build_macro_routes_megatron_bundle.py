@@ -174,6 +174,7 @@ def _write_content_store_ci_export(
     root: Path,
     *,
     buckets: tuple[int, ...] = (1024, 2048, 4096, 8192, 16384),
+    schema: str = builder.CI_CONTENT_STORE_EXPORT_SCHEMA,
 ) -> Path:
     artifacts: list[dict[str, object]] = []
     audits: list[dict[str, object]] = []
@@ -245,7 +246,7 @@ def _write_content_store_ci_export(
         builder.REPO_ROOT / "scripts/export_ci_content_store_case5.py"
     )
     manifest = {
-        "schema": builder.CI_CONTENT_STORE_EXPORT_SCHEMA,
+        "schema": schema,
         "status": "complete",
         "exporter_script_sha256": hashlib.sha256(
             exporter_path.read_bytes()
@@ -265,8 +266,11 @@ def _write_content_store_ci_export(
             "unchanged_after_export": True,
         },
         "input_fetch_state": {
-            "schema": "cppmega_ci_stream_fetch_v3",
-            "artifact": {"sha256": "1" * 64},
+            "schema": builder.CI_FETCH_STATE_SCHEMA,
+            "artifact": {
+                "path": str(root / "fetch_state.sqlite3"),
+                "sha256": "1" * 64,
+            },
             "sqlite_schema_sha256": "d" * 64,
             "sqlite_logical_sha256": "2" * 64,
             "sidecar_set_sha256": "3" * 64,
@@ -324,6 +328,46 @@ def _write_content_store_ci_export(
             "case5_audit": audits,
         },
     }
+    if schema == builder.PRODUCTION_CI_CONTENT_STORE_EXPORT_SCHEMA:
+        manifest.update(
+            {
+                "completion_mode": "inventory-exhaustive",
+                "production_complete": True,
+                "acquisition_provenance": {
+                    "completion_mode": "inventory-exhaustive",
+                    "production_complete": True,
+                    "inventory": {
+                        "path": str(root / "inventory.sqlite3"),
+                        "sha256": "d" * 64,
+                        "logical_sha256": "e" * 64,
+                        "receipt_path": str(
+                            root / "inventory_receipt.json"
+                        ),
+                        "receipt_sha256": "f" * 64,
+                    },
+                    "fetch": {
+                        "state_path": str(root / "fetch_state.sqlite3"),
+                        "state_sha256": "1" * 64,
+                        "receipt_path": str(root / "fetch_receipt.json"),
+                        "receipt_sha256": "2" * 64,
+                        "attempt_set_sha256": "3" * 64,
+                        "terminal_proof_sha256": "4" * 64,
+                    },
+                    "store": {
+                        "path": str(root / "content_store"),
+                        "receipt_path": str(root / "store_receipt.json"),
+                        "receipt_sha256": "5" * 64,
+                    },
+                    "merge": {
+                        "receipt_path": str(root / "merge_receipt.json"),
+                        "receipt_sha256": "6" * 64,
+                        "schema": (
+                            "cppmega_ci_stream_shard_union_receipt_v3"
+                        ),
+                    },
+                },
+            }
+        )
     manifest_path = root / "export_receipt.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     return manifest_path
@@ -517,6 +561,80 @@ def test_content_store_export_allowlist_binds_all_split_shards(
     assert metadata["source_completion"][
         "cas_reserve_exact_unique_payload_tokens"
     ] == 200_000_000
+
+
+def test_content_store_export_rejects_legacy_fetch_state_schema(
+    tmp_path: Path,
+) -> None:
+    ci_root = tmp_path / "ci"
+    manifest_path = _write_content_store_ci_export(ci_root)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["input_fetch_state"]["schema"] = "cppmega_ci_stream_fetch_v3"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="immutable producer binding is incomplete",
+    ):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit="unused",
+            cppmega_mlx_tree_sha256="unused",
+        )
+
+
+def test_production_content_store_export_rejects_nonexistent_artifact_chain(
+    tmp_path: Path,
+) -> None:
+    ci_root = tmp_path / "ci-production"
+    manifest_path = _write_content_store_ci_export(
+        ci_root,
+        schema=builder.PRODUCTION_CI_CONTENT_STORE_EXPORT_SCHEMA,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="inventory database is missing or unsafe",
+    ):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit="unused-for-content-store-export",
+            cppmega_mlx_tree_sha256="unused-for-content-store-export",
+        )
+
+
+def test_production_export_schema_label_cannot_masquerade_as_exhaustive(
+    tmp_path: Path,
+) -> None:
+    ci_root = tmp_path / "ci-masquerade"
+    manifest_path = _write_content_store_ci_export(ci_root)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema"] = (
+        builder.PRODUCTION_CI_CONTENT_STORE_EXPORT_SCHEMA
+    )
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="lacks inventory-exhaustive semantics",
+    ):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit="unused",
+            cppmega_mlx_tree_sha256="unused",
+        )
 
 
 def test_content_store_export_allowlist_rejects_drift_and_orphans(
