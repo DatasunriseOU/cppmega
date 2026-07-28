@@ -63,6 +63,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime as _dt
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -86,6 +87,14 @@ from scripts.pr_ingest import pr_store  # noqa: E402
 from scripts.pr_ingest.github_graphql_fallback import load_tokens  # noqa: E402
 
 GQL_URL = "https://api.github.com/graphql"
+TRANSIENT_RETRY_MAX_BACKOFF_S = 30.0
+_TRANSIENT_TRANSPORT_ERRORS = (
+    http.client.IncompleteRead,
+    http.client.RemoteDisconnected,
+    TimeoutError,
+    ConnectionError,
+    urllib.error.URLError,
+)
 
 # One bounded page of a repo's pullRequests connection. Review-thread comments
 # must be fetched inline too: treating every PR with any review thread as a gap
@@ -430,32 +439,103 @@ class RepoRateLimited(Exception):
     """Soft signal: this page kept rate-limiting; caller may route to fallback."""
 
 
-def _post_with_rotation(pool: "SharedTokenPool", variables: dict, owner: str, name: str,
-                        max_retries: int,
-                        stop_event: threading.Event | None = None,
-                        post_fn: Callable[
-                            [str, dict], tuple[int, dict, dict]
-                        ] = _post) -> dict:
+def _transient_retry_delay(
+    retry_number: int,
+    retry_after: str | None = None,
+) -> float:
+    """Return a bounded delay for an idempotent GraphQL query retry."""
+
+    if retry_after is not None:
+        try:
+            requested_delay = float(retry_after)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if math.isfinite(requested_delay) and requested_delay >= 0:
+                return min(
+                    TRANSIENT_RETRY_MAX_BACKOFF_S,
+                    max(1.0, requested_delay),
+                )
+    exponent = min(5, max(0, retry_number - 1))
+    return min(TRANSIENT_RETRY_MAX_BACKOFF_S, float(2**exponent))
+
+
+def _post_with_rotation(
+    pool: "SharedTokenPool",
+    variables: dict,
+    owner: str,
+    name: str,
+    max_retries: int,
+    stop_event: threading.Event | None = None,
+    post_fn: Callable[[str, dict], tuple[int, dict, dict]] = _post,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> dict:
     """POST one page via the SHARED pool, rotating tokens on rate limits.
+
+    Transport failures and HTTP 5xx responses retry the same read-only query
+    with the same token and variables. They neither cool nor rotate a healthy
+    token. Authentication, malformed response, GraphQL, and source-contract
+    failures remain terminal.
 
     Returns the JSON body on success. RAISES:
       * StreamAborted when ``stop_event`` was set by a sibling worker's fatal
         failure (so we abort promptly instead of hanging the pool).
-      * SystemExit on auth/other-403/GraphQL-errors (fail loud — real bug).
+      * SystemExit on exhausted transient retries, auth, other-403, or GraphQL
+        errors (fail loud — real bug or persistent upstream failure).
       * AllTokensExhausted when every (shared) token is cooling (caller records
         cursor and re-raises as a loud failure).
       * RepoRateLimited when we burn the per-page retry budget on THIS repo
         (caller decides: route to GH Archive fallback, do NOT abort the stream).
     """
-    attempts = 0
+    rate_limit_attempts = 0
+    transient_attempts = 0
     unauthorized = 0
+
+    def wait_for_transient_retry(
+        reason: str,
+        retry_after: str | None = None,
+    ) -> None:
+        nonlocal transient_attempts
+        transient_attempts += 1
+        if transient_attempts > max_retries:
+            raise SystemExit(
+                f"[graphql-stream] transient retry budget exhausted for "
+                f"{owner}/{name} at cursor={variables.get('cursor')!r} after "
+                f"{transient_attempts} failed attempts ({reason}); progress "
+                "through the prior complete page is saved"
+            )
+        if stop_event is not None and stop_event.is_set():
+            raise StreamAborted(
+                f"{owner}/{name}: aborted by sibling worker failure"
+            )
+        wait = _transient_retry_delay(transient_attempts, retry_after)
+        sys.stderr.write(
+            f"[graphql-stream] transient {reason} for {owner}/{name}; retrying "
+            f"same token/cursor in {wait:.1f}s "
+            f"({transient_attempts}/{max_retries})\n"
+        )
+        sys.stderr.flush()
+        sleep_fn(wait)
+
+    idx: int | None = None
+    token: str | None = None
     while True:
         if stop_event is not None and stop_event.is_set():
             raise StreamAborted(f"{owner}/{name}: aborted by sibling worker failure")
-        # Reserve a usable token from the SHARED pool (raises AllTokensExhausted
-        # when every token is cooling) -- cooldowns set below are seen by all.
-        idx, token = pool.acquire()
-        status, headers, jb = post_fn(token, variables)
+        if idx is None or token is None:
+            # Acquire only when a token has not already been selected for this
+            # request. Transient retries intentionally retain the same token.
+            idx, token = pool.acquire()
+        try:
+            status, headers, jb = post_fn(token, variables)
+        except urllib.error.HTTPError:
+            # Production _post normalizes HTTP responses to (status, headers,
+            # body). An injected raw HTTPError may be an auth/contract error,
+            # so never misclassify it as a transport failure via URLError.
+            raise
+        except _TRANSIENT_TRANSPORT_ERRORS as exc:
+            wait_for_transient_retry(type(exc).__name__)
+            continue
 
         if status == 401:
             unauthorized += 1
@@ -470,10 +550,21 @@ def _post_with_rotation(pool: "SharedTokenPool", variables: dict, owner: str, na
                     f"[graphql-stream] all tokens unauthorized while streaming "
                     f"{owner}/{name}; fix the PAT(s)/gh token"
                 )
+            idx, token = None, None
+            continue
+
+        retry_after = headers.get("Retry-After")
+        if 500 <= status <= 599:
+            # A gateway/service failure says nothing authoritative about the
+            # GraphQL response body or the token's rate-limit state.  Retry the
+            # exact read-only query first, before interpreting either.
+            wait_for_transient_retry(
+                f"HTTP {status}",
+                retry_after=retry_after,
+            )
             continue
 
         remaining = headers.get("X-RateLimit-Remaining")
-        retry_after = headers.get("Retry-After")
         jb_lower = json.dumps(jb).lower()
         graphql_rate_limited = any(
             isinstance(error, dict) and error.get("type") == "RATE_LIMITED"
@@ -495,8 +586,8 @@ def _post_with_rotation(pool: "SharedTokenPool", variables: dict, owner: str, na
             or (remaining is not None and remaining == "0")
             or status == 429
         ):
-            attempts += 1
-            if attempts > max_retries:
+            rate_limit_attempts += 1
+            if rate_limit_attempts > max_retries:
                 # Burned the per-page budget on THIS repo -> soft signal up.
                 raise RepoRateLimited()
             if retry_after is not None:
@@ -507,17 +598,18 @@ def _post_with_rotation(pool: "SharedTokenPool", variables: dict, owner: str, na
             # Cool THIS token for all workers; the next loop's acquire() rotates
             # to the next usable token or raises AllTokensExhausted when none.
             pool.cool(idx, wait)
+            idx, token = None, None
             continue
 
-        if status != 200:
-            raise SystemExit(
-                f"[graphql-stream] HTTP {status} for {owner}/{name}: {jb}"
-            )
         if jb.get("errors"):
             # A NOT_FOUND on the repository is a real, recordable outcome, not a
             # transient. Surface it loudly with the repo so the caller logs it.
             raise SystemExit(
                 f"[graphql-stream] GraphQL errors for {owner}/{name}: {jb['errors']}"
+            )
+        if status != 200:
+            raise SystemExit(
+                f"[graphql-stream] HTTP {status} for {owner}/{name}: {jb}"
             )
         return jb
 
@@ -1438,8 +1530,12 @@ def main(argv: list[str] | None = None) -> int:
             "is retained and authoritatively refreshed."
         ),
     )
-    ap.add_argument("--max-retries", type=int, default=8,
-                    help="Per-page rate-limit retry budget before a fallback trip")
+    ap.add_argument(
+        "--max-retries",
+        type=int,
+        default=8,
+        help="Per-page rate-limit and transient transport retry budgets",
+    )
     ap.add_argument("--max-prs", type=int,
                     help="Stop each repo after N PRs (validation/smoke)")
     ap.add_argument("--max-repos", type=int,
