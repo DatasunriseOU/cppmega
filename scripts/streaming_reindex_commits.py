@@ -196,7 +196,7 @@ def stream_repo_subtrees_with_git(
     cur_dir: Path | None = None
     active = False
     try:
-        for member in tar:
+        for member in sr.iter_tar_members_without_cache(tar):
             name = member.name
             if not name.startswith(prefix):
                 continue

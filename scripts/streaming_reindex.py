@@ -102,6 +102,20 @@ EXCLUDE_PARTS = frozenset(SOURCE_EXTRA_EXCLUDE.split(","))
 _PUBLICATION_LOCK = threading.Lock()
 
 
+def iter_tar_members_without_cache(tar):
+    """Yield streaming tar members without retaining all prior metadata.
+
+    Python's ``tarfile`` keeps appending ``TarInfo`` objects to ``members`` even
+    in ``r|`` mode.  Clearing that lookup cache after each header keeps archive
+    traversal bounded on multi-million-file corpora.  The caller receives the
+    current ``TarInfo`` object directly, so extracting that member remains safe.
+    """
+
+    for member in tar:
+        tar.members.clear()
+        yield member
+
+
 def load_project_identity_map(repo_list: Path) -> dict[str, str]:
     if not repo_list.exists():
         raise FileNotFoundError(f"repo identity map does not exist: {repo_list}")
@@ -767,7 +781,7 @@ def stream_repo_subtrees(
     cur_final_dir: Path | None = None
     active = False
     try:
-        for member in tar:
+        for member in iter_tar_members_without_cache(tar):
             name = member.name
             if not name.startswith(prefix):
                 continue
