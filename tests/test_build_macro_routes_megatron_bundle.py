@@ -806,6 +806,28 @@ def test_manifest_allowlist_preserves_conveyor_revision_for_bundle_binding(
     assert binding["components"]["cppmega"]["commit"] == "a" * 40
 
 
+def test_manifest_allowlist_rejects_malformed_conveyor_revision(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "_done.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "done": {
+                    "repo::code": {"lengths": {"1024": {"rows": 1}}},
+                    "repo::r0": {"lengths": {"1024": {"rows": 1}}},
+                },
+                "failed": {},
+                "code_revision": "not-an-object",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match=r"_done\.json: malformed code_revision"):
+        _load_manifest_allowlist(manifest_path, (1024,))
+
+
 def test_bundle_builder_verifies_its_live_clean_cppmega_revision(
     tmp_path: Path,
 ) -> None:

@@ -412,12 +412,17 @@ def _load_manifest_allowlist(
             f"{kind}/{bucket}" for (kind, bucket), names in allowed.items() if not names
         ]
         raise RuntimeError(f"manifest has no completed files for: {', '.join(empty)}")
+    code_revision = blob.get("code_revision")
+    if code_revision is not None and not isinstance(code_revision, dict):
+        raise RuntimeError(
+            f"{manifest_path}: malformed code_revision receipt; expected an object"
+        )
     metadata = {
         "path": str(manifest_path.resolve()),
         "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "done_units": len(done),
         "failed_units": 0,
-        "code_revision": blob.get("code_revision"),
+        "code_revision": code_revision,
         "allowlist_counts": {
             f"{kind}/{bucket}": len(names)
             for (kind, bucket), names in sorted(allowed.items())
