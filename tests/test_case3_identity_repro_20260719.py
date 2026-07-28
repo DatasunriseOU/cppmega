@@ -18,6 +18,11 @@ from cppmega.prompt_graph import (
     PromptProjectIndex,
     repository_snapshot,
 )
+from cppmega.symbol_identity import (
+    SymbolIdentityError,
+    canonical_usr_identity,
+    parse_usr_identity,
+)
 from tools.clang_indexer import index_project as indexer
 
 
@@ -327,6 +332,52 @@ def test_anonymous_namespace_uses_stable_kind_signature_and_file_scope(
     assert first_key != second_key
     assert "file=one.cpp" in first_key
     assert "sig=kind%3DNAMESPACE" in first_key
+
+
+def test_scoped_usr_identity_accepts_repository_path_with_spaces() -> None:
+    repository_path = (
+        "third_party/libsdl2/Xcode-iOS/Template/"
+        "SDL iOS Application/main.c"
+    )
+
+    identity = canonical_usr_identity(
+        usr="c:main.c@221@F@randomInt@min",
+        project="google/filament",
+        file=repository_path,
+        canonical_signature="display=min|type=int|exception=UNPARSED",
+    )
+
+    parsed = parse_usr_identity(identity)
+    assert parsed.file == repository_path
+    assert f"file={repository_path}" in identity
+
+
+@pytest.mark.parametrize(
+    "repository_path",
+    (
+        "/absolute/main.c",
+        "C:/absolute/main.c",
+        "../main.c",
+        "src/../main.c",
+        r"src\main.c",
+        "src/\x1f/main.c",
+        "src/\tmain.c",
+        "src/\u00a0main.c",
+    ),
+)
+def test_scoped_usr_identity_still_rejects_unsafe_repository_paths(
+    repository_path: str,
+) -> None:
+    with pytest.raises(
+        SymbolIdentityError,
+        match="canonical and repository-relative",
+    ):
+        canonical_usr_identity(
+            usr="c:main.c@221@F@randomInt@min",
+            project="google/filament",
+            file=repository_path,
+            canonical_signature="display=min|type=int|exception=UNPARSED",
+        )
 
 
 def test_signature_fallback_contains_project_file_and_location(

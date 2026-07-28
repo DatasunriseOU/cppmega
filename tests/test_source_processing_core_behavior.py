@@ -46,6 +46,51 @@ def test_compile_database_preserves_current_cpp_standards(
     assert set(standard_args) == {f"-std={standard}"}
 
 
+def test_autoconf_preserves_separated_compile_flag_operands() -> None:
+    from cppmega.data.build_context import detect_build_context_from_loader
+
+    configure = (
+        "AC_PROG_CXX\n"
+        "CXXFLAGS='-I include -D NAME=1 -U OLD -x c++ "
+        "-isystem sysinc -iquote quoted -include config.h "
+        "-isystemsysinc2 -iquotequoted2 -includeconfig2.h "
+        "-imacrosdefs.h "
+        "--sysroot=/sdk -isysroot=/sdk2 -resource-dir=/res'\n"
+    )
+
+    platform, default_args, compile_index = detect_build_context_from_loader(
+        lambda name: configure if name == "configure.ac" else None
+    )
+
+    assert compile_index is None
+    assert platform["build_system"] == "autoconf"
+    assert default_args == [
+        "-I",
+        "include",
+        "-D",
+        "NAME=1",
+        "-U",
+        "OLD",
+        "-x",
+        "c++",
+        "-isystem",
+        "sysinc",
+        "-iquote",
+        "quoted",
+        "-include",
+        "config.h",
+        "-isystemsysinc2",
+        "-iquotequoted2",
+        "-includeconfig2.h",
+        "-imacrosdefs.h",
+        "--sysroot=/sdk",
+        "-isysroot=/sdk2",
+        "-resource-dir=/res",
+        "-fsyntax-only",
+        "-Wno-everything",
+    ]
+
+
 def test_domain_parsers_keep_build_shell_and_diagnostics_distinct() -> None:
     import numpy as np
 

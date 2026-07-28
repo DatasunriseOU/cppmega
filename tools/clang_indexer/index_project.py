@@ -4421,7 +4421,15 @@ def _discover_recovery_include_dirs(project_dir: str) -> tuple[str, ...]:
             if directory not in {".git", ".hg", ".svn"}
             and not os.path.islink(os.path.join(root, directory))
         )
-        if _RECOVERY_INCLUDE_DIR_RE.fullmatch(os.path.basename(root)):
+        basename = os.path.basename(root)
+        is_vex_public_headers = (
+            basename.lower() == "pub"
+            and os.path.basename(os.path.dirname(root)).lower() == "vex"
+        )
+        if (
+            _RECOVERY_INCLUDE_DIR_RE.fullmatch(basename)
+            or is_vex_public_headers
+        ):
             discovered.append(os.path.abspath(root))
     result = tuple(sorted(set(discovered)))
     _RECOVERY_INCLUDE_DIR_CACHE[project_root] = result
@@ -4841,26 +4849,320 @@ def _load_translation_unit_with_include_recovery(
     return initial_tu
 
 
+_UNRESOLVED_AUTOCONF_ARG_MARKERS = (
+    "@<:@",
+    "@:>@",
+    "@S|@",
+    "@%:@",
+    "@{:@",
+    "@:}@",
+    "<arch>",
+    "<os>",
+    "<variant>",
+)
+_UNRESOLVED_M4_SUBSTITUTION_RE = re.compile(
+    r"@[A-Za-z_][A-Za-z0-9_]*@",
+    re.ASCII,
+)
+_MACRO_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z", re.ASCII)
+_TARGET_VALUE_RE = re.compile(r"[A-Za-z0-9_.+:-]+\Z", re.ASCII)
+_STANDARD_FLAG_PREFIXES = ("-std=", "--std=", "-cl-std=")
+_CLANG_STANDARD_CONTEXTS: dict[str, tuple[str, str]] = {
+    "c89": ("c", "c89"),
+    "c90": ("c", "c90"),
+    "iso9899:1990": ("c", "c90"),
+    "iso9899:199409": ("c", "c95"),
+    "gnu89": ("c", "c89"),
+    "gnu90": ("c", "c90"),
+    "c99": ("c", "c99"),
+    "c9x": ("c", "c99"),
+    "iso9899:1999": ("c", "c99"),
+    "iso9899:199x": ("c", "c99"),
+    "gnu99": ("c", "c99"),
+    "gnu9x": ("c", "c99"),
+    "c11": ("c", "c11"),
+    "c1x": ("c", "c11"),
+    "iso9899:2011": ("c", "c11"),
+    "iso9899:201x": ("c", "c11"),
+    "gnu11": ("c", "c11"),
+    "gnu1x": ("c", "c11"),
+    "c17": ("c", "c17"),
+    "c18": ("c", "c17"),
+    "iso9899:2017": ("c", "c17"),
+    "iso9899:2018": ("c", "c17"),
+    "gnu17": ("c", "c17"),
+    "gnu18": ("c", "c17"),
+    "c23": ("c", "c23"),
+    "c2x": ("c", "c23"),
+    "gnu23": ("c", "c23"),
+    "gnu2x": ("c", "c23"),
+    "c2y": ("c", "c23"),
+    "gnu2y": ("c", "c23"),
+    "c++98": ("c++", "c++98"),
+    "c++03": ("c++", "c++98"),
+    "gnu++98": ("c++", "c++98"),
+    "gnu++03": ("c++", "c++98"),
+    "c++11": ("c++", "c++11"),
+    "c++0x": ("c++", "c++11"),
+    "gnu++11": ("c++", "c++11"),
+    "gnu++0x": ("c++", "c++11"),
+    "c++14": ("c++", "c++14"),
+    "c++1y": ("c++", "c++14"),
+    "gnu++14": ("c++", "c++14"),
+    "gnu++1y": ("c++", "c++14"),
+    "c++17": ("c++", "c++17"),
+    "c++1z": ("c++", "c++17"),
+    "gnu++17": ("c++", "c++17"),
+    "gnu++1z": ("c++", "c++17"),
+    "c++20": ("c++", "c++20"),
+    "c++2a": ("c++", "c++20"),
+    "gnu++20": ("c++", "c++20"),
+    "gnu++2a": ("c++", "c++20"),
+    "c++23": ("c++", "c++23"),
+    "c++2b": ("c++", "c++23"),
+    "gnu++23": ("c++", "c++23"),
+    "gnu++2b": ("c++", "c++23"),
+    "c++26": ("c++", "c++26"),
+    "c++2c": ("c++", "c++26"),
+    "gnu++26": ("c++", "c++26"),
+    "gnu++2c": ("c++", "c++26"),
+    "cl1.0": ("opencl", "cl1.0"),
+    "cl1.1": ("opencl", "cl1.1"),
+    "cl1.2": ("opencl", "cl1.2"),
+    "cl2.0": ("opencl", "cl2.0"),
+    "cl3.0": ("opencl", "cl3.0"),
+    "clc++": ("opencl", "clc++1.0"),
+    "clc++1.0": ("opencl", "clc++1.0"),
+    "clc++2021": ("opencl", "clc++2021"),
+}
+_CLANG_LANGUAGE_FAMILIES = {
+    "c": "c",
+    "c-header": "c",
+    "cpp-output": "c",
+    "objective-c": "c",
+    "objective-c-header": "c",
+    "objective-c-cpp-output": "c",
+    "c++": "c++",
+    "c++-header": "c++",
+    "c++-cpp-output": "c++",
+    "c++-module": "c++",
+    "c++-system-header": "c++",
+    "objective-c++": "c++",
+    "objective-c++-header": "c++",
+    "objective-c++-cpp-output": "c++",
+    "cuda": "c++",
+    "hip": "c++",
+    "cl": "opencl",
+    "opencl": "opencl",
+    "opencl-c": "opencl",
+    "clcpp": "opencl",
+    "openclcpp": "opencl",
+}
+_CLANG_LANGUAGE_VALUES = frozenset(
+    {
+        *_CLANG_LANGUAGE_FAMILIES,
+        "assembler",
+        "assembler-with-cpp",
+        "ir",
+        "ast",
+        "pcm",
+        "precompiled-header",
+    }
+)
+_COMPILE_ARG_VALUE_KINDS = {
+    "-D": "define",
+    "-U": "undef",
+    "-x": "language",
+    "-I": "path",
+    "-isystem": "path",
+    "-iquote": "path",
+    "-idirafter": "path",
+    "-F": "path",
+    "-iframework": "path",
+    "-include": "path",
+    "-imacros": "path",
+    "-isysroot": "path",
+    "--sysroot": "path",
+    "-resource-dir": "path",
+    "-target": "target",
+    "--target": "target",
+}
+_NONEMPTY_EQUALS_ARG_PREFIXES = (
+    "--target=",
+    "-march=",
+    "-mcpu=",
+    "--sysroot=",
+    "-isysroot=",
+    "-resource-dir=",
+)
+_JOINED_PATH_ARG_PREFIXES = (
+    "-isystem",
+    "-iquote",
+    "-idirafter",
+    "-iframework",
+    "-include",
+    "-imacros",
+    "-I",
+    "-F",
+)
+
+
+def _compile_arg_has_garbage(value: object) -> bool:
+    return (
+        not isinstance(value, str)
+        or not value
+        or ";" in value
+        or "$" in value
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        or any(marker in value for marker in _UNRESOLVED_AUTOCONF_ARG_MARKERS)
+        or _UNRESOLVED_M4_SUBSTITUTION_RE.search(value) is not None
+    )
+
+
+def _standard_flag_context(
+    arg: str,
+) -> tuple[str, str, str] | None:
+    for prefix in _STANDARD_FLAG_PREFIXES:
+        if arg.startswith(prefix):
+            raw_value = arg.removeprefix(prefix).lower()
+            context = _CLANG_STANDARD_CONTEXTS.get(raw_value)
+            if context is None:
+                return None
+            family, canonical_standard = context
+            return raw_value, family, canonical_standard
+    return None
+
+
+def _standard_flag_contexts(
+    args: Sequence[str],
+) -> list[tuple[str, str, str]]:
+    return [
+        context
+        for arg in args
+        if any(arg.startswith(prefix) for prefix in _STANDARD_FLAG_PREFIXES)
+        if (context := _standard_flag_context(arg)) is not None
+    ]
+
+
 def _is_sane_compile_args(args: list[str]) -> bool:
     """Check if build_context returned usable args (not shell script garbage)."""
-    for arg in args:
-        if arg is None:
+    if not args:
+        return False
+
+    machine_width_flags: set[str] = set()
+    language_values: set[str] = set()
+    standard_values: set[str] = set()
+    standard_families: set[str] = set()
+    has_opencl_standard_flag = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if _compile_arg_has_garbage(arg):
             return False
-        # Garbage indicators: semicolons, unresolved $vars, paths after -x
-        if ';' in arg or '$' in arg:
+
+        value_kind = _COMPILE_ARG_VALUE_KINDS.get(arg)
+        if value_kind is not None:
+            if index + 1 >= len(args):
+                return False
+            operand = args[index + 1]
+            if _compile_arg_has_garbage(operand) or operand.startswith("-"):
+                return False
+            if value_kind == "define":
+                macro_name = operand.split("=", 1)[0].split("(", 1)[0]
+                if _MACRO_NAME_RE.fullmatch(macro_name) is None:
+                    return False
+            elif value_kind == "undef":
+                if _MACRO_NAME_RE.fullmatch(operand) is None:
+                    return False
+            elif value_kind == "language":
+                language = operand.lower()
+                if language not in _CLANG_LANGUAGE_VALUES:
+                    return False
+                language_values.add(language)
+            elif value_kind == "target":
+                if _TARGET_VALUE_RE.fullmatch(operand) is None:
+                    return False
+            index += 2
+            continue
+
+        if arg in {"-std", "--std", "-cl-std"}:
             return False
-        # Empty -I flags
-        if arg == '-I':
+        if any(arg.startswith(prefix) for prefix in _STANDARD_FLAG_PREFIXES):
+            context = _standard_flag_context(arg)
+            if context is None:
+                return False
+            if arg.startswith("-cl-std="):
+                has_opencl_standard_flag = True
+            raw_standard, standard_family, _canonical_standard = context
+            standard_values.add(raw_standard)
+            standard_families.add(standard_family)
+        elif arg.startswith("-x"):
+            language = arg.removeprefix("-x").lower()
+            if language not in _CLANG_LANGUAGE_VALUES:
+                return False
+            language_values.add(language)
+        elif arg.startswith("-D"):
+            definition = arg.removeprefix("-D")
+            macro_name = definition.split("=", 1)[0].split("(", 1)[0]
+            if _MACRO_NAME_RE.fullmatch(macro_name) is None:
+                return False
+        elif arg.startswith("-U"):
+            if _MACRO_NAME_RE.fullmatch(arg.removeprefix("-U")) is None:
+                return False
+
+        for prefix in _NONEMPTY_EQUALS_ARG_PREFIXES:
+            if arg.startswith(prefix):
+                value = arg.removeprefix(prefix)
+                if not value:
+                    return False
+                if prefix in {"--target=", "-march=", "-mcpu="} and (
+                    _TARGET_VALUE_RE.fullmatch(value) is None
+                ):
+                    return False
+
+        for prefix in _JOINED_PATH_ARG_PREFIXES:
+            if arg.startswith(prefix) and arg != prefix:
+                if not arg.removeprefix(prefix):
+                    return False
+                break
+
+        if arg in {"-m32", "-m64"}:
+            machine_width_flags.add(arg)
+
+        if not arg.startswith("-"):
             return False
-        # Compound flags (multiple args jammed into one string)
-        # e.g., "-std=c89 -Werror -O0" — legitimate args never have spaces
-        # except -x <lang> which is handled as separate args
         if ' ' in arg and not arg.startswith('-D'):
+            return False
+        index += 1
+
+    if {"-m32", "-m64"}.issubset(machine_width_flags):
+        return False
+    if len(language_values) > 1 or len(standard_values) > 1:
+        return False
+    if len(standard_families) > 1:
+        return False
+    if language_values and standard_families:
+        language_family = _CLANG_LANGUAGE_FAMILIES.get(
+            next(iter(language_values))
+        )
+        if language_family != next(iter(standard_families)):
+            return False
+    if has_opencl_standard_flag:
+        if len(language_values) != 1:
+            return False
+        language_family = _CLANG_LANGUAGE_FAMILIES.get(
+            next(iter(language_values))
+        )
+        if language_family != "opencl":
             return False
     return True
 
 
 _SIMPLE_FALLBACK_ARGS = ["-fsyntax-only", "-Wno-everything"]
+_DEFAULT_BUILD_INFO_KEYS = frozenset(
+    {"build_system", "source", "compiler", "standard"}
+)
+_UNUSABLE_DETECTED_ARGS_STATUS = "fallback_unusable_detected_args"
 DEFAULT_PARSE_BATCH_FILES = 25
 PARSE_SUBMIT_WINDOW_PER_WORKER = 2
 PARSE_HEARTBEAT_FILES = 25
@@ -4890,12 +5192,15 @@ def compute_parse_batch_size(
     return min(max_batch_files, nominal)
 
 
-def get_default_compile_args(project_dir: str) -> list[str]:
-    """Generate default compile args for projects without compile_commands.json."""
-    _platform_info, args, _compile_index = detect_build_context(project_dir)
-
-    if _is_sane_compile_args(args):
-        result = list(args)
+def _resolve_default_compile_context(
+    project_dir: str,
+    platform_info: dict[str, object],
+    detected_args: list[str],
+) -> tuple[list[str], dict[str, object]]:
+    """Resolve one atomic default parser context and its emitted provenance."""
+    detected_args_usable = _is_sane_compile_args(detected_args)
+    if detected_args_usable:
+        result = list(detected_args)
     else:
         # build_context returned garbage (e.g., shell fragments from configure)
         result = list(_SIMPLE_FALLBACK_ARGS)
@@ -4904,6 +5209,48 @@ def get_default_compile_args(project_dir: str) -> list[str]:
         result.append(f'-I{project_dir}')
         for d in _discover_include_dirs(project_dir):
             result.append(f'-I{d}')
+
+    build_info = {
+        key: value
+        for key, value in platform_info.items()
+        if key in _DEFAULT_BUILD_INFO_KEYS and value is not None
+    }
+    if not detected_args_usable:
+        # Compiler/standard were inferred from the rejected aggregate and do not
+        # describe the simple parser fallback that actually loaded the source.
+        build_info.pop("compiler", None)
+        build_info.pop("standard", None)
+        build_info["compile_args_status"] = _UNUSABLE_DETECTED_ARGS_STATUS
+    else:
+        standard_contexts = _standard_flag_contexts(result)
+        if standard_contexts:
+            build_info["standard"] = standard_contexts[-1][2]
+    return result, build_info
+
+
+def _harmonize_build_info_with_compile_args(
+    build_info: dict | None,
+    compile_args: Sequence[str],
+) -> dict | None:
+    """Align emitted dialect provenance with the args that parsed this file."""
+    if not build_info:
+        return build_info
+    standard_contexts = _standard_flag_contexts(compile_args)
+    if not standard_contexts:
+        return build_info
+    harmonized = dict(build_info)
+    harmonized["standard"] = standard_contexts[-1][2]
+    return harmonized
+
+
+def get_default_compile_args(project_dir: str) -> list[str]:
+    """Generate default compile args for projects without compile_commands.json."""
+    platform_info, args, _compile_index = detect_build_context(project_dir)
+    result, _build_info = _resolve_default_compile_context(
+        project_dir,
+        platform_info,
+        args,
+    )
     return result
 
 
@@ -4951,6 +5298,7 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
     if ext in C_EXTENSIONS:
         adapted = []
         skip_next = False
+        has_c_standard = False
         for arg in args:
             if skip_next:
                 skip_next = False
@@ -4959,16 +5307,30 @@ def _adapt_args_for_file(args: list[str], filepath: str) -> list[str]:
                 # Skip -x <lang> pair
                 skip_next = True
                 continue
-            if arg.startswith('-std=c++'):
-                adapted.append('-std=c11')
+            if arg.startswith('-x') and arg != '-x':
                 continue
-            if arg.startswith('-xc') or arg.startswith('-x '):
-                # -xc++ joined form — replace with -xc
+
+            standard_context = (
+                _standard_flag_context(arg)
+                if any(
+                    arg.startswith(prefix)
+                    for prefix in _STANDARD_FLAG_PREFIXES
+                )
+                else None
+            )
+            if standard_context is not None:
+                if standard_context[1] == 'c':
+                    adapted.append(arg)
+                    has_c_standard = True
+                # A non-C standard cannot describe the C translation unit.
                 continue
             adapted.append(arg)
-        # Ensure C mode is set
-        adapted = ['-x', 'c', '-std=c11'] + adapted
-        return adapted
+        # Ensure C mode is set, and use the established parser fallback only
+        # when the build context did not supply a valid C dialect.
+        prefix = ['-x', 'c']
+        if not has_c_standard:
+            prefix.append('-std=c11')
+        return prefix + adapted
     return args
 
 
@@ -8663,13 +9025,21 @@ def _compile_context_for_rel_file(
 ) -> tuple[list[str], dict | None]:
     compile_args = list(default_args or [])
     build_info = dict(default_build_info) if default_build_info else None
-    if project_dir is None:
-        return compile_args, build_info
-    abs_path = os.path.normpath(os.path.join(project_dir, rel_file))
-    file_build = compile_db.get(abs_path) if compile_db else None
-    if file_build:
-        compile_args = file_build.get("compile_args", compile_args)
-        build_info = file_build.get("build_info") or build_info
+    context_path = rel_file
+    if project_dir is not None:
+        context_path = os.path.normpath(os.path.join(project_dir, rel_file))
+        file_build = compile_db.get(context_path) if compile_db else None
+        if file_build:
+            compile_args = file_build.get("compile_args", compile_args)
+            build_info = file_build.get("build_info") or build_info
+    compile_args = _adapt_args_for_file(
+        _sanitize_compile_args_for_clang(compile_args),
+        context_path,
+    )
+    build_info = _harmonize_build_info_with_compile_args(
+        build_info,
+        compile_args,
+    )
     return compile_args, build_info
 
 
@@ -9463,12 +9833,22 @@ def build_training_documents(
 
                 compile_args = list(default_args or [])
                 build_info = dict(default_build_info) if default_build_info else None
+                context_path = func.file
                 if project_dir is not None:
                     abs_func_path = os.path.normpath(os.path.join(project_dir, func.file))
+                    context_path = abs_func_path
                     file_build = compile_db.get(abs_func_path) if compile_db else None
                     if file_build:
                         compile_args = file_build.get("compile_args", compile_args)
                         build_info = file_build.get("build_info") or build_info
+                compile_args = _adapt_args_for_file(
+                    _sanitize_compile_args_for_clang(compile_args),
+                    context_path,
+                )
+                build_info = _harmonize_build_info_with_compile_args(
+                    build_info,
+                    compile_args,
+                )
                 out_doc = build_enriched_doc(
                     parts_info,
                     index,
@@ -9940,14 +10320,12 @@ def process_project(
     # (no C/C++ at all) still get A-platform enrichment for their build docs.
     compile_db = load_compile_commands(project_dir)
     _platform_info, _raw_args, _compile_index = detect_build_context(project_dir)
-    default_args = _sanitize_compile_args_for_clang(
-        get_default_compile_args(project_dir)
+    default_args, default_build_info = _resolve_default_compile_context(
+        project_dir,
+        _platform_info,
+        _raw_args,
     )
-    default_build_info = {
-        key: value
-        for key, value in _platform_info.items()
-        if key in {"build_system", "source", "compiler", "standard"} and value is not None
-    }
+    default_args = _sanitize_compile_args_for_clang(default_args)
 
     # Parse all files and build index
     index_obj = ProjectIndex()
