@@ -389,6 +389,7 @@ def _load_manifest_allowlist(
         "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "done_units": len(done),
         "failed_units": 0,
+        "code_revision": blob.get("code_revision"),
         "allowlist_counts": {
             f"{kind}/{bucket}": len(names)
             for (kind, bucket), names in sorted(allowed.items())

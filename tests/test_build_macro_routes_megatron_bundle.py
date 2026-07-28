@@ -773,6 +773,38 @@ def test_bundle_producer_binding_covers_cppmega_mlx_and_indexer_closure() -> Non
     }
 
 
+def test_manifest_allowlist_preserves_conveyor_revision_for_bundle_binding(
+    tmp_path: Path,
+) -> None:
+    revision = _conveyor_revision_binding()["code_revision"]
+    manifest_path = tmp_path / "_done.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "done": {
+                    "repo::code": {"lengths": {"1024": {"rows": 1}}},
+                    "repo::r0": {"lengths": {"1024": {"rows": 1}}},
+                },
+                "failed": {},
+                "code_revision": revision,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _allowed, conveyor = _load_manifest_allowlist(manifest_path, (1024,))
+    binding = _producer_binding_from_conveyor(
+        conveyor,
+        cppmega_commit="a" * 40,
+        cppmega_tree_sha256="b" * 64,
+        cppmega_mlx_commit="e" * 40,
+        cppmega_mlx_tree_sha256="f" * 64,
+    )
+
+    assert conveyor["code_revision"] == revision
+    assert binding["components"]["cppmega"]["commit"] == "a" * 40
+
+
 def test_bundle_producer_binding_rejects_legacy_revision_receipt() -> None:
     with pytest.raises(RuntimeError, match="schema v2"):
         _producer_binding_from_conveyor(
