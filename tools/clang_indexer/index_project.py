@@ -2245,6 +2245,32 @@ def _sanitize_compile_args_for_clang(args: list[str] | None) -> list[str]:
     return sanitized
 
 
+def _decode_source_bytes(raw: bytes, filename: str) -> tuple[str, str]:
+    """Decode source losslessly using the corpus' explicit legacy contract."""
+
+    if b"\0" in raw:
+        raise ValueError(f"source contains NUL byte: {filename}")
+    try:
+        return raw.decode("utf-8", errors="strict"), "utf-8"
+    except UnicodeDecodeError as utf8_error:
+        try:
+            return raw.decode("cp1252", errors="strict"), "cp1252"
+        except UnicodeDecodeError as cp1252_error:
+            raise ValueError(
+                f"source is neither strict UTF-8 nor Windows-1252: {filename}; "
+                f"utf-8={utf8_error}; windows-1252={cp1252_error}"
+            ) from cp1252_error
+
+
+def _read_source_file(filename: str) -> tuple[str, bytes, str]:
+    with open(filename, "rb") as source_file:
+        source_bytes = source_file.read()
+    source, source_encoding = _decode_source_bytes(source_bytes, filename)
+    if source.encode(source_encoding, errors="strict") != source_bytes:
+        raise ValueError(f"source decoding did not round-trip exactly: {filename}")
+    return source, source_bytes, source_encoding
+
+
 def get_function_text(cursor: Cursor, tu: TranslationUnit) -> str:
     """Extract the source text for a cursor's extent."""
     extent = cursor.extent
@@ -2256,23 +2282,26 @@ def get_function_text(cursor: Cursor, tu: TranslationUnit) -> str:
         if not filename or not os.path.exists(filename):
             return ""
 
-        with open(filename, 'r', errors='replace') as f:
-            content = f.read()
-
-        # Convert offsets
-        start_offset = start.offset
-        end_offset = end.offset
-        if start_offset < len(content) and end_offset <= len(content):
-            return content[start_offset:end_offset]
+        _content, content_bytes, source_encoding = _read_source_file(filename)
+        start_offset = int(start.offset)
+        end_offset = int(end.offset)
+        if 0 <= start_offset < end_offset <= len(content_bytes):
+            return content_bytes[start_offset:end_offset].decode(
+                source_encoding,
+                errors="strict",
+            )
     except SymbolIdentityError:
         raise
-    except Exception:
-        pass
+    except OSError:
+        return ""
     return ""
 
 
-def _byte_to_char_mapper(source: str) -> Callable[[int], int]:
-    source_bytes = source.encode("utf-8", errors="replace")
+def _byte_to_char_mapper(
+    source: str,
+    source_encoding: str = "utf-8",
+) -> Callable[[int], int]:
+    source_bytes = source.encode(source_encoding, errors="strict")
     byte_len = len(source_bytes)
     if byte_len == len(source):
         return lambda byte_offset: max(0, min(byte_offset, len(source)))
@@ -2280,7 +2309,7 @@ def _byte_to_char_mapper(source: str) -> Callable[[int], int]:
     byte_to_char = [0] * (byte_len + 1)
     byte_offset = 0
     for char_idx, ch in enumerate(source):
-        ch_len = len(ch.encode("utf-8", errors="replace"))
+        ch_len = len(ch.encode(source_encoding, errors="strict"))
         for inner in range(ch_len):
             if byte_offset + inner < byte_len:
                 byte_to_char[byte_offset + inner] = char_idx
@@ -2412,6 +2441,7 @@ def extract_clang_ast_metadata(
     source: str,
     tu: TranslationUnit,
     filename: str,
+    source_encoding: str = "utf-8",
 ) -> tuple[list[int], list[int], list[int]]:
     """Extract per-character AST metadata from clang cursor extents."""
     text_len = len(source)
@@ -2421,7 +2451,7 @@ def extract_clang_ast_metadata(
     if text_len == 0 or tu is None:
         return ast_depth, sibling_index, ast_node_type
 
-    byte_to_char = _byte_to_char_mapper(source)
+    byte_to_char = _byte_to_char_mapper(source, source_encoding)
     stack: list[tuple[Cursor, int, int]] = [(tu.cursor, 0, 0)]
     while stack:
         cursor, depth, sib_idx = stack.pop()
@@ -2794,8 +2824,7 @@ def parse_translation_unit(
         source=f"parse_translation_unit({filepath})",
     )
     try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as source_file:
-            source = source_file.read()
+        source, _source_bytes, source_encoding = _read_source_file(filepath)
     except OSError:
         return functions, typedefs
 
@@ -2818,6 +2847,7 @@ def parse_translation_unit(
         source,
         tu,
         filepath,
+        source_encoding,
     )
     semantic_meta = extract_semantic_metadata(
         source,
@@ -2826,8 +2856,9 @@ def parse_translation_unit(
         project_dir=project_dir,
         project_id=stable_project_id,
         fallback_file=rel_path,
+        source_encoding=source_encoding,
     )
-    byte_to_char = _byte_to_char_mapper(source)
+    byte_to_char = _byte_to_char_mapper(source, source_encoding)
     project_dir_abs = os.path.abspath(project_dir)
 
     def _in_project(cursor) -> bool:
@@ -4875,6 +4906,7 @@ def extract_semantic_metadata(
     project_dir: str | None = None,
     project_id: str,
     fallback_file: str | None = None,
+    source_encoding: str = "utf-8",
 ) -> dict:
     """Extract per-character semantic metadata from a translation unit.
 
@@ -4912,28 +4944,8 @@ def extract_semantic_metadata(
             SYMBOL_IDENTITIES_COLUMN: [],
         }
 
-    source_bytes = source.encode("utf-8")
-    byte_len = len(source_bytes)
-
-    # Build byte-to-char mapping for non-ASCII sources
-    if byte_len != text_len:
-        byte_to_char = [0] * byte_len
-        byte_offset = 0
-        for char_idx, ch in enumerate(source):
-            ch_bytes = len(ch.encode("utf-8"))
-            for b in range(ch_bytes):
-                if byte_offset + b < byte_len:
-                    byte_to_char[byte_offset + b] = char_idx
-            byte_offset += ch_bytes
-    else:
-        byte_to_char = None  # identity mapping
-
-    def _byte_to_char_offset(byte_off: int) -> int:
-        if byte_to_char is None:
-            return byte_off
-        if byte_off >= byte_len:
-            return text_len
-        return byte_to_char[byte_off]
+    source_bytes = source.encode(source_encoding, errors="strict")
+    byte_to_char = _byte_to_char_mapper(source, source_encoding)
 
     def _register_symbol_key(symbol_key: str, cursor: Cursor) -> int:
         return identity_registry.register(
@@ -4945,8 +4957,8 @@ def extract_semantic_metadata(
         )
 
     def _char_span(byte_start: int, byte_end: int) -> tuple[int, int] | None:
-        char_start = _byte_to_char_offset(byte_start)
-        char_end = _byte_to_char_offset(byte_end)
+        char_start = byte_to_char(byte_start)
+        char_end = byte_to_char(byte_end)
         if char_start >= text_len or char_start >= char_end:
             return None
         return char_start, min(char_end, text_len)
@@ -4977,11 +4989,22 @@ def extract_semantic_metadata(
             operator_token = spelling.removeprefix("operator").strip()
             if operator_token:
                 token_spellings.add(operator_token)
+        token_spelling_bytes = {
+            value.encode(source_encoding, errors="strict")
+            for value in token_spellings
+        }
         matches: list[tuple[int, int]] = []
         for token in cursor.get_tokens():
-            if token.spelling not in token_spellings:
+            byte_start = int(token.extent.start.offset)
+            byte_end = int(token.extent.end.offset)
+            if (
+                byte_start < 0
+                or byte_start >= byte_end
+                or byte_end > len(source_bytes)
+                or source_bytes[byte_start:byte_end] not in token_spelling_bytes
+            ):
                 continue
-            span = _char_span(token.extent.start.offset, token.extent.end.offset)
+            span = _char_span(byte_start, byte_end)
             if span is not None:
                 matches.append(span)
         return matches[:1]
