@@ -264,6 +264,33 @@ class PRDiscussionLookup:
         if scan_id is not None and self._fixed_owner_repo is None:
             raise ValueError("PR scan_id requires an explicit PR owner/repo key")
         self.scan_id = scan_id
+        self._name_to_owner_repo: dict[str, str] = {}
+        if repo_list_path:
+            if not os.path.exists(repo_list_path):
+                raise FileNotFoundError(
+                    f"--repo-list does not exist: {repo_list_path}")
+            with open(repo_list_path, "r") as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict):
+                raise ValueError(
+                    f"--repo-list {repo_list_path} must contain a JSON object"
+                )
+            entries = data.get("repos", [])
+            if not isinstance(entries, list):
+                raise ValueError(
+                    f"--repo-list {repo_list_path} field 'repos' must be a list"
+                )
+            for index, entry in enumerate(entries):
+                if not isinstance(entry, dict):
+                    raise ValueError(
+                        f"--repo-list {repo_list_path} field 'repos[{index}]' "
+                        "must be an object"
+                    )
+                name = entry.get("bare_name") or entry.get("name")
+                owner_repo = entry.get("owner_repo")
+                if name and owner_repo:
+                    self._name_to_owner_repo[name] = owner_repo
+        # Validate every control input before acquiring the read-only handle.
         if all(
             callable(getattr(_pr_store_mod, name, None))
             for name in ("connect", "get_by_pr", "get_by_sha")
@@ -279,18 +306,6 @@ class PRDiscussionLookup:
             uri = Path(store_path).resolve().as_uri() + "?mode=ro"
             self._conn = sqlite3.connect(uri, uri=True, timeout=60.0)
             self._conn.row_factory = sqlite3.Row
-        self._name_to_owner_repo: dict[str, str] = {}
-        if repo_list_path:
-            if not os.path.exists(repo_list_path):
-                raise FileNotFoundError(
-                    f"--repo-list does not exist: {repo_list_path}")
-            with open(repo_list_path, "r") as fh:
-                data = json.load(fh)
-            for entry in data.get("repos", []):
-                name = entry.get("bare_name") or entry.get("name")
-                owner_repo = entry.get("owner_repo")
-                if name and owner_repo:
-                    self._name_to_owner_repo[name] = owner_repo
         self.hits = 0
         self.misses = 0
 
