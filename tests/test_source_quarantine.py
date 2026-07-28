@@ -187,3 +187,11 @@ def test_process_project_writes_atomic_bound_receipt(
         manifest.read_bytes()
     ).hexdigest()
     assert receipt["quarantined_count"] == 1
+    omission_receipt = receipt["external_reference_omissions"]
+    assert omission_receipt["schema"] == "cppmega.external_reference_omissions_v1"
+    assert omission_receipt["status"] == "complete"
+    assert omission_receipt["reason"] == "unknown_external_provider"
+    assert omission_receipt["observation_count"] == 0
+    assert omission_receipt["unique_reference_count"] == 0
+    assert omission_receipt["location_count"] == 0
+    assert omission_receipt["locations"] == []

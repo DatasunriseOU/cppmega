@@ -211,6 +211,74 @@ def test_external_provider_reference_keeps_provider_identity(tmp_path: Path) -> 
     assert data_identity.__dict__ == identity.__dict__
 
 
+def test_unknown_external_graph_reference_is_omitted_with_receipt(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "repo"
+    project.mkdir()
+    cursor = _cursor(
+        Path("/usr/local/include/openssl/kdf.h"),
+        usr="c:@F@EVP_KDF_fetch",
+    )
+    omissions: indexer.ExternalReferenceOmissions = {}
+
+    with pytest.raises(SymbolIdentityError, match="stable provider identity"):
+        indexer.symbol_reference_for_cursor(
+            cursor,
+            project_dir=str(project),
+            project_id="aws/s2n-tls",
+            fallback_file="src/kdf.c",
+        )
+
+    assert (
+        indexer._optional_symbol_reference_for_cursor(
+            cursor,
+            relation="call",
+            omissions=omissions,
+            project_dir=str(project),
+            project_id="aws/s2n-tls",
+            fallback_file="src/kdf.c",
+        )
+        is None
+    )
+    summary = indexer._external_reference_omission_summary(omissions)
+    assert summary["schema"] == "cppmega.external_reference_omissions_v1"
+    assert summary["status"] == "complete"
+    assert summary["reason"] == "unknown_external_provider"
+    assert summary["observation_count"] == 1
+    assert summary["unique_reference_count"] == 1
+    assert summary["location_count"] == 1
+    location = summary["locations"][0]
+    assert location["relation"] == "call"
+    assert location["symbol_kind"] == "FUNCTION_DECL"
+    assert location["observed_path"] == "/usr/local/include/openssl/kdf.h"
+    assert location["observations"] == 1
+    assert location["unique_qname_count"] == 1
+    assert location["qname_examples"] == ["std::move"]
+    assert location["qname_examples_truncated"] is False
+
+
+def test_optional_external_reference_does_not_swallow_other_identity_errors(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "repo"
+    project.mkdir()
+    cursor = _cursor(
+        project / "route.hpp",
+        usr="c:@N@api@F@route#I#",
+    )
+
+    with pytest.raises(SymbolIdentityError):
+        indexer._optional_symbol_reference_for_cursor(
+            cursor,
+            relation="call",
+            omissions={},
+            project_dir=str(project),
+            project_id="not-a-canonical-project",
+            fallback_file="route.hpp",
+        )
+
+
 def test_external_reference_receipt_is_typed_and_fail_closed(tmp_path: Path) -> None:
     project = tmp_path / "repo"
     project.mkdir()
