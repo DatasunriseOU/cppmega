@@ -51,6 +51,14 @@ def test_streaming_tar_iteration_does_not_cache_member_metadata() -> None:
     assert observed == expected
 
 
+def test_extracted_windows_source_dumps_are_code_repos() -> None:
+    assert not sr.is_code_worktree_repo("repo.bare")
+    assert sr.is_code_worktree_repo("windows_2000_source_code")
+    assert sr.is_code_worktree_repo("windows_10_shared_source_kit")
+    assert sr.is_code_worktree_repo("windows_ce_5_121231")
+    assert sr.is_code_worktree_repo("llvm-project")
+
+
 def test_empty_index_log_accepts_new_lossless_build_receipt() -> None:
     log = "\n".join(
         [

@@ -293,12 +293,8 @@ def commit_stage_db(work: Path, key: str) -> Path:
 
 
 def is_code_worktree_repo(repo: str) -> bool:
-    """Return False for archive members that are not C/C++ source worktrees."""
-    if repo.endswith(".bare"):
-        return False
-    if repo.startswith("windows_"):
-        return False
-    return True
+    """Exclude bare Git object stores, but retain extracted source dumps."""
+    return not repo.endswith(".bare")
 
 
 def _dedup_store_cls():
