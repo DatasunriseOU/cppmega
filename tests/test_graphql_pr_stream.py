@@ -196,6 +196,68 @@ def test_graphql_rate_limited_error_rotates_to_another_token():
     assert used_tokens == ["first", "second"]
 
 
+def test_graphql_rate_limit_accepts_http_date_retry_after():
+    from graphql_pr_stream import SharedTokenPool, _post_with_rotation
+
+    responses = iter(
+        [
+            (
+                429,
+                {
+                    "Retry-After": "Fri, 31 Dec 9999 23:59:59 GMT",
+                    "X-RateLimit-Remaining": "10",
+                },
+                {"message": "secondary rate limit"},
+            ),
+            (200, {"X-RateLimit-Remaining": "10"}, {"data": {"repository": {}}}),
+        ]
+    )
+    used_tokens: list[str] = []
+
+    def post(token: str, _variables: dict) -> tuple[int, dict, dict]:
+        used_tokens.append(token)
+        return next(responses)
+
+    result = _post_with_rotation(
+        SharedTokenPool(["first", "second"]),
+        {"owner": "a", "name": "one"},
+        "a",
+        "one",
+        max_retries=2,
+        post_fn=post,
+    )
+
+    assert result == {"data": {"repository": {}}}
+    assert used_tokens == ["first", "second"]
+
+
+def test_graphql_rate_limit_rejects_malformed_retry_after_loudly():
+    from graphql_pr_stream import SharedTokenPool, _post_with_rotation
+
+    def post(_token: str, _variables: dict) -> tuple[int, dict, dict]:
+        return (
+            429,
+            {
+                "Retry-After": "not-a-delay-or-http-date",
+                "X-RateLimit-Remaining": "10",
+            },
+            {"message": "secondary rate limit"},
+        )
+
+    with pytest.raises(
+        SystemExit,
+        match=r"invalid Retry-After for a/one",
+    ):
+        _post_with_rotation(
+            SharedTokenPool(["first"]),
+            {"owner": "a", "name": "one"},
+            "a",
+            "one",
+            max_retries=2,
+            post_fn=post,
+        )
+
+
 @pytest.mark.parametrize(
     ("first_result", "expected_sleep"),
     [
