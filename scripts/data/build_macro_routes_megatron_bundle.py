@@ -2058,7 +2058,7 @@ def _artifact_records(root: Path, hash_jobs: int) -> list[dict[str, object]]:
         for path in root.rglob("*")
         if path.is_file()
         and "snapshot" not in path.relative_to(root).parts
-        and path.name != "manifest.json"
+        and path != root / "manifest.json"
     )
 
     def record(path: Path) -> dict[str, object]:
