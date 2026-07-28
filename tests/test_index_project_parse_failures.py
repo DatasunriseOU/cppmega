@@ -153,6 +153,36 @@ def test_mixed_legacy_source_uses_byte_exact_latin1_fallback() -> None:
     assert mixed_text.encode(mixed_encoding) == mixed_source
 
 
+def test_header_macro_emission_preserves_mixed_legacy_bytes(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer import index_project
+
+    header = tmp_path / "mixed.h"
+    raw = b'#define MIXED "\x8d"\n'
+    header.write_bytes(raw)
+    docs: list[dict] = []
+
+    stats = index_project.emit_header_documents(
+        index=index_project.ProjectIndex(),
+        header_files=[str(header)],
+        project_dir=str(tmp_path),
+        project_id="fixture/mixed-header",
+        compile_db=None,
+        default_args=[],
+        default_build_info=None,
+        max_tokens=4096,
+        enriched=True,
+        chunk_claims=None,
+        emit_doc=docs.append,
+    )
+
+    assert stats["header_macro"] == 1
+    assert len(docs) == 1
+    assert docs[0]["text"].encode("latin-1") == raw
+    assert "\ufffd" not in docs[0]["text"]
+
+
 def test_parse_pool_emits_heartbeat_while_a_batch_is_still_running(
     capsys,
 ) -> None:
