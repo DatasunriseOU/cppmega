@@ -62,6 +62,7 @@ Usage:
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime as _dt
+from email.utils import parsedate_to_datetime
 import hashlib
 import http.client
 import json
@@ -439,6 +440,32 @@ class RepoRateLimited(Exception):
     """Soft signal: this page kept rate-limiting; caller may route to fallback."""
 
 
+def _retry_after_delay(
+    value: str,
+    *,
+    now_s: float | None = None,
+) -> float:
+    """Parse RFC 9110 Retry-After as delay-seconds or an HTTP-date."""
+
+    try:
+        delay = float(value)
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"invalid Retry-After value {value!r}") from exc
+        if retry_at.tzinfo is None:
+            raise ValueError(f"invalid Retry-After HTTP-date {value!r}")
+        current_time = time.time() if now_s is None else now_s
+        delay = max(0.0, retry_at.timestamp() - current_time)
+    else:
+        if not math.isfinite(delay) or delay < 0:
+            raise ValueError(f"invalid Retry-After delay-seconds {value!r}")
+    if not math.isfinite(delay):
+        raise ValueError(f"invalid Retry-After delay {value!r}")
+    return max(1.0, delay)
+
+
 def _transient_retry_delay(
     retry_number: int,
     retry_after: str | None = None,
@@ -447,15 +474,11 @@ def _transient_retry_delay(
 
     if retry_after is not None:
         try:
-            requested_delay = float(retry_after)
-        except (TypeError, ValueError):
+            requested_delay = _retry_after_delay(retry_after)
+        except ValueError:
             pass
         else:
-            if math.isfinite(requested_delay) and requested_delay >= 0:
-                return min(
-                    TRANSIENT_RETRY_MAX_BACKOFF_S,
-                    max(1.0, requested_delay),
-                )
+            return min(TRANSIENT_RETRY_MAX_BACKOFF_S, requested_delay)
     exponent = min(5, max(0, retry_number - 1))
     return min(TRANSIENT_RETRY_MAX_BACKOFF_S, float(2**exponent))
 
@@ -591,7 +614,13 @@ def _post_with_rotation(
                 # Burned the per-page budget on THIS repo -> soft signal up.
                 raise RepoRateLimited()
             if retry_after is not None:
-                wait = float(retry_after)
+                try:
+                    wait = _retry_after_delay(retry_after)
+                except ValueError as exc:
+                    raise SystemExit(
+                        f"[graphql-stream] invalid Retry-After for "
+                        f"{owner}/{name}: {retry_after!r}"
+                    ) from exc
             else:
                 reset = headers.get("X-RateLimit-Reset")
                 wait = max(1.0, float(reset) - time.time()) if reset else 30.0
