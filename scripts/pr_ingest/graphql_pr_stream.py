@@ -842,21 +842,12 @@ def stream_repo(
                         "accounting"
                     )
                 target_key = (repo, int(rec["pr_number"]))
-                should_append = False
-                if append_lock is not None:
-                    with append_lock:
-                        if target_key not in truncated_target_keys:
-                            truncated_target_keys.add(target_key)
-                            should_append = True
-                elif target_key not in truncated_target_keys:
-                    truncated_target_keys.add(target_key)
-                    should_append = True
-                if should_append:
-                    _append_jsonl(
-                        truncated_targets_path,
-                        {"repo": repo, "pr_number": rec["pr_number"]},
-                        lock=append_lock,
-                    )
+                if _record_truncated_target(
+                    truncated_targets_path,
+                    truncated_target_keys,
+                    target_key,
+                    append_lock=append_lock,
+                ):
                     repo_truncated_count += 1
         stats["pages"] += 1
         conn.commit()
@@ -960,6 +951,32 @@ def _append_jsonl(path: str, obj: dict, *, lock: threading.Lock | None = None) -
         return
     with open(path, "a") as f:
         f.write(json.dumps(obj) + "\n")
+
+
+def _record_truncated_target(
+    path: str,
+    targets: set[tuple[str, int]],
+    target: tuple[str, int],
+    *,
+    append_lock: threading.Lock | None = None,
+) -> bool:
+    """Keep the in-memory target set and its JSONL projection in one lock."""
+
+    def record() -> bool:
+        if target in targets:
+            return False
+        repo, pr_number = target
+        _append_jsonl(
+            path,
+            {"repo": repo, "pr_number": pr_number},
+        )
+        targets.add(target)
+        return True
+
+    if append_lock is None:
+        return record()
+    with append_lock:
+        return record()
 
 
 def reset_repo_truncated_targets(
