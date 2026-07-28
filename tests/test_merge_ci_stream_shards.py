@@ -1686,6 +1686,18 @@ def test_time_bounded_row_subset_publishes_full_anchor_with_receipted_proof(
         exact_tokenizer,
         relocated=True,
     )
+    subset_connection = sqlite3.connect(subset.inventory)
+    try:
+        subset_connection.execute("PRAGMA journal_mode=DELETE")
+        subset_connection.execute(
+            """
+            UPDATE runs SET first_seen_at='2026-07-26T08:00:00Z'
+            WHERE run_id=200
+            """
+        )
+        subset_connection.commit()
+    finally:
+        subset_connection.close()
     manifest, destination = _manifest(
         tmp_path,
         exact_tokenizer,
@@ -1698,8 +1710,9 @@ def test_time_bounded_row_subset_publishes_full_anchor_with_receipted_proof(
         anchor.inventory
     )
     binding = receipt["inventory"]
+    assert binding["schema"] == "cppmega_ci_stream_union_inventory_binding_v2"
     assert binding["policy"] == (
-        "completed-anchor-with-time-bounded-row-subsets-v1"
+        "completed-anchor-with-time-bounded-authoritative-row-subsets-v2"
     )
     assert binding["coverage_semantics"] == (
         "subset_only_no_range_completeness"
@@ -1709,14 +1722,32 @@ def test_time_bounded_row_subset_publishes_full_anchor_with_receipted_proof(
     sources = {
         item["source_id"]: item for item in binding["sources"]
     }
-    assert sources["s00"]["role"] == "byte_identical_row_subset"
+    assert sources["s00"]["role"] == (
+        "authoritative_row_subset_with_observation_audit"
+    )
     assert sources["s01"]["role"] == "anchor"
     subset_proof = sources["s00"]["proof"]
     assert subset_proof["matched_run_count"] == 1
+    assert subset_proof["anchor_match_semantics"] == (
+        "authoritative_github_fields_exact_first_seen_at_audited"
+    )
+    assert subset_proof["first_seen_at_equal_count"] == 0
+    assert subset_proof["first_seen_at_difference_count"] == 1
+    assert subset_proof["first_seen_at_subset_earlier_count"] == 1
+    assert subset_proof["first_seen_at_subset_later_count"] == 0
+    assert binding["time_subset_first_seen_at_difference_count"] == 1
     assert subset_proof["sqlite_schema_sha256"] == (
         "91990153359d65201c18e181b636d4e379443c54f7cbb71b03a0682f652d8f14"
     )
     assert len(subset_proof["anchor_match_logical_sha256"]) == 64
+    assert (
+        len(
+            subset_proof[
+                "first_seen_at_observation_pairs_logical_sha256"
+            ]
+        )
+        == 64
+    )
     assert receipt["verification"]["inventory_joined_attempts"] == 2
     assert len(receipt["verification"]["inventory_join_sha256"]) == 64
     fetch_receipt = json.loads(
@@ -1817,9 +1848,9 @@ def test_state_inventory_join_allows_api_exact_created_at_to_differ(
 
 @pytest.mark.parametrize(
     "column",
-    ["updated_at", "first_seen_at", "metadata_blob"],
+    ["updated_at", "metadata_blob"],
 )
-def test_time_subset_any_column_or_blob_mismatch_fails_closed(
+def test_time_subset_authoritative_column_or_blob_mismatch_fails_closed(
     tmp_path: Path,
     exact_tokenizer: ExactTokenizer,
     column: str,
@@ -1853,6 +1884,35 @@ def test_time_subset_any_column_or_blob_mismatch_fails_closed(
     )
 
     with pytest.raises(MergeError, match=rf"column {column} differs"):
+        merge_shards(manifest)
+
+    assert not destination.exists()
+
+
+def test_time_subset_noncanonical_first_seen_at_fails_closed(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    anchor, subset = _anchor_and_time_subset(tmp_path, exact_tokenizer)
+    connection = sqlite3.connect(subset.inventory)
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute(
+            "UPDATE runs SET first_seen_at='not-a-time' WHERE run_id=200"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    manifest, destination = _manifest(
+        tmp_path,
+        exact_tokenizer,
+        [anchor, subset],
+    )
+
+    with pytest.raises(
+        MergeError,
+        match=r"time-shard .* first_seen_at is not a valid UTC instant",
+    ):
         merge_shards(manifest)
 
     assert not destination.exists()

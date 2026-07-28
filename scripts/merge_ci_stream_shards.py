@@ -17,9 +17,11 @@ v3 schema; merge maps and progress never leak into that schema.
 One completed full inventory is the publication anchor.  Additional inputs
 may either name the same byte-identical completed inventory or use the exact
 ``cppmega_ci_inventory_time_shard_v1`` projection produced for time-sharded
-fetching.  A time shard is accepted only after every run row is proven
-byte-for-byte identical to the anchor; it need not cover its whole declared
-time window.
+fetching.  A time shard is accepted only after every authoritative GitHub run
+field is proven byte-for-byte identical to the anchor.  The local
+``first_seen_at`` observation time may differ when the same immutable run was
+discovered by independent inventory workers; both values remain validated and
+bound into the proof.  A time shard need not cover its whole declared window.
 """
 
 from __future__ import annotations
@@ -91,7 +93,7 @@ BINDING_MAP_SCHEMA = "cppmega_ci_stream_binding_id_map_v2"
 ATTEMPT_MAP_SCHEMA = "cppmega_ci_stream_attempt_resolution_v1"
 MEMBER_MAP_SCHEMA = "cppmega_ci_stream_member_resolution_v1"
 TIME_SHARD_INVENTORY_SCHEMA = "cppmega_ci_inventory_time_shard_v1"
-INVENTORY_BINDING_SCHEMA = "cppmega_ci_stream_union_inventory_binding_v1"
+INVENTORY_BINDING_SCHEMA = "cppmega_ci_stream_union_inventory_binding_v2"
 
 _INVENTORY_NAME = "inventory.sqlite3"
 _INVENTORY_RECEIPT_NAME = "inventory_receipt.json"
@@ -174,6 +176,9 @@ _INVENTORY_RUN_COLUMNS = (
     "metadata_blob",
     "metadata_sha256",
     "first_seen_at",
+)
+_INVENTORY_AUTHORITATIVE_RUN_COLUMNS = tuple(
+    column for column in _INVENTORY_RUN_COLUMNS if column != "first_seen_at"
 )
 _TIME_SHARD_META_KEYS = {
     "schema",
@@ -1314,9 +1319,13 @@ def _canonical_utc(value: object, *, where: str) -> tuple[str, int]:
     return raw, epoch
 
 
-def _inventory_row_hash_record(row: sqlite3.Row) -> list[object]:
+def _inventory_row_hash_record(
+    row: sqlite3.Row,
+    *,
+    columns: Sequence[str] = _INVENTORY_RUN_COLUMNS,
+) -> list[object]:
     values: list[object] = []
-    for column in _INVENTORY_RUN_COLUMNS:
+    for column in columns:
         value = row[column]
         if column == "metadata_blob":
             if not isinstance(value, bytes):
@@ -2081,8 +2090,14 @@ def _prove_exact_subset(
     subset_connection.row_factory = sqlite3.Row
     anchor_connection.row_factory = sqlite3.Row
     matched_count = 0
+    first_seen_equal_count = 0
+    first_seen_subset_earlier_count = 0
+    first_seen_subset_later_count = 0
     match_digest = _record_digest(
-        "cppmega-ci-time-shard-anchor-match-v1"
+        "cppmega-ci-time-shard-authoritative-anchor-match-v2"
+    )
+    observation_digest = _record_digest(
+        "cppmega-ci-time-shard-first-seen-observation-pairs-v1"
     )
     columns = ",".join(_INVENTORY_RUN_COLUMNS)
     try:
@@ -2113,7 +2128,7 @@ def _prove_exact_subset(
                     f"{subset.spec.shard_id} time-shard run is absent "
                     f"from the anchor: {key}"
                 )
-            for column in _INVENTORY_RUN_COLUMNS:
+            for column in _INVENTORY_AUTHORITATIVE_RUN_COLUMNS:
                 if not _sqlite_values_byte_identical(
                     subset_row[column],
                     anchor_row[column],
@@ -2122,9 +2137,36 @@ def _prove_exact_subset(
                         f"{subset.spec.shard_id} time-shard column {column} "
                         f"differs from the anchor: {key}"
                     )
+            subset_first_seen, subset_first_seen_epoch = _canonical_utc(
+                subset_row["first_seen_at"],
+                where=f"{subset.spec.shard_id} time-shard {key} first_seen_at",
+            )
+            anchor_first_seen, anchor_first_seen_epoch = _canonical_utc(
+                anchor_row["first_seen_at"],
+                where=f"anchor {key} first_seen_at",
+            )
+            if subset_first_seen_epoch == anchor_first_seen_epoch:
+                first_seen_equal_count += 1
+            elif subset_first_seen_epoch < anchor_first_seen_epoch:
+                first_seen_subset_earlier_count += 1
+            else:
+                first_seen_subset_later_count += 1
             _update_record_digest(
                 match_digest,
-                _inventory_row_hash_record(subset_row),
+                _inventory_row_hash_record(
+                    subset_row,
+                    columns=_INVENTORY_AUTHORITATIVE_RUN_COLUMNS,
+                ),
+            )
+            _update_record_digest(
+                observation_digest,
+                [
+                    subset_row["repo_key"],
+                    subset_row["run_id"],
+                    subset_row["run_attempt"],
+                    subset_first_seen,
+                    anchor_first_seen,
+                ],
             )
             matched_count += 1
     finally:
@@ -2139,7 +2181,21 @@ def _prove_exact_subset(
         "anchor_source_id": anchor.spec.shard_id,
         "anchor_original_path": anchor.spec.original_inventory,
         "matched_run_count": matched_count,
+        "anchor_match_semantics": (
+            "authoritative_github_fields_exact_first_seen_at_audited"
+        ),
         "anchor_match_logical_sha256": match_digest.hexdigest(),
+        "first_seen_at_equal_count": first_seen_equal_count,
+        "first_seen_at_difference_count": (
+            first_seen_subset_earlier_count + first_seen_subset_later_count
+        ),
+        "first_seen_at_subset_earlier_count": (
+            first_seen_subset_earlier_count
+        ),
+        "first_seen_at_subset_later_count": first_seen_subset_later_count,
+        "first_seen_at_observation_pairs_logical_sha256": (
+            observation_digest.hexdigest()
+        ),
     }
 
 
@@ -2232,7 +2288,7 @@ def _validate_cross_source_contracts(
     source_bindings: list[dict[str, Any]] = []
     for audit in audits:
         if audit.inventory_role == "exact_subset_candidate":
-            role = "byte_identical_row_subset"
+            role = "authoritative_row_subset_with_observation_audit"
             proof = subset_proofs[audit.spec.shard_id]
         elif audit is anchor:
             role = "anchor"
@@ -2266,7 +2322,9 @@ def _validate_cross_source_contracts(
         )
     binding = {
         "schema": INVENTORY_BINDING_SCHEMA,
-        "policy": "completed-anchor-with-time-bounded-row-subsets-v1",
+        "policy": (
+            "completed-anchor-with-time-bounded-authoritative-row-subsets-v2"
+        ),
         "coverage_semantics": "subset_only_no_range_completeness",
         "anchor": {
             "source_id": anchor.spec.shard_id,
@@ -2296,6 +2354,10 @@ def _validate_cross_source_contracts(
         "time_subset_count": len(subsets),
         "time_subset_run_count": sum(
             int(proof["matched_run_count"])
+            for proof in subset_proofs.values()
+        ),
+        "time_subset_first_seen_at_difference_count": sum(
+            int(proof["first_seen_at_difference_count"])
             for proof in subset_proofs.values()
         ),
         "sources": source_bindings,
