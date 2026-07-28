@@ -61,12 +61,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Sequence
 
-# Reuse the proven machinery from the code driver.  Tests import this module as
-# ``scripts.streaming_reindex_commits`` while production launches it as a file;
-# support both without relying on ambient sys.path order.
-try:
+# Reuse the proven machinery from the code driver.  Select the import spelling
+# from our actual package mode; a try/except probe can succeed through the repo
+# root while this module is loaded as top-level ``streaming_reindex_commits``,
+# creating a second ``scripts.streaming_reindex`` module with incompatible
+# RepoFailure/Manifest class identities.
+if __package__:
     from scripts import streaming_reindex as sr
-except ImportError:  # pragma: no cover - exercised by file-mode execution.
+else:  # pragma: no cover - exercised by direct file-mode execution.
     import streaming_reindex as sr
 
 ROOT = sr.ROOT
