@@ -284,6 +284,9 @@ def _write_content_store_ci_export(
         },
         "eligibility": {
             "target_exact_unique_payload_tokens": 20_000_000_000,
+            "target_source": "explicit_export_requirement",
+            "cas_acquisition_target_exact_unique_payload_tokens": 20_200_000_000,
+            "cas_reserve_exact_unique_payload_tokens": 200_000_000,
             "target_met": True,
             "eligible": {
                 "unique_token_sequences": len(buckets),
@@ -427,6 +430,31 @@ def test_ci_manifest_allowlist_binds_five_buckets_and_lossless_counters(
     assert metadata["cross_boundary_token_edges"] == 3
 
 
+def test_content_store_export_rejects_inconsistent_cas_reserve(
+    tmp_path: Path,
+) -> None:
+    ci_root = tmp_path / "ci"
+    manifest_path = _write_content_store_ci_export(ci_root)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["eligibility"]["cas_reserve_exact_unique_payload_tokens"] += 1
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="representative/token conservation drifted",
+    ):
+        _load_ci_manifest_allowlist(
+            manifest_path,
+            ci_root,
+            builder.DEFAULT_BUCKETS,
+            cppmega_mlx_commit="unused",
+            cppmega_mlx_tree_sha256="unused",
+        )
+
+
 def test_pr_export_allowlist_binds_exact_scan_and_every_artifact(
     tmp_path: Path,
 ) -> None:
@@ -486,6 +514,9 @@ def test_content_store_export_allowlist_binds_all_split_shards(
     )
     assert metadata["cross_boundary_chunk_edges"] == 2
     assert metadata["cross_boundary_token_edges"] == 3
+    assert metadata["source_completion"][
+        "cas_reserve_exact_unique_payload_tokens"
+    ] == 200_000_000
 
 
 def test_content_store_export_allowlist_rejects_drift_and_orphans(

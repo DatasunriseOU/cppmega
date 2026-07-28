@@ -588,6 +588,17 @@ def _load_content_store_ci_export_allowlist(
         eligibility.get("target_exact_unique_payload_tokens"),
         where="target exact unique payload tokens",
     )
+    acquisition_target_tokens = nonnegative_int(
+        eligibility.get(
+            "cas_acquisition_target_exact_unique_payload_tokens"
+        ),
+        where="CAS acquisition target exact unique payload tokens",
+    )
+    reserve_tokens = nonnegative_int(
+        eligibility.get("cas_reserve_exact_unique_payload_tokens"),
+        where="CAS reserve exact unique payload tokens",
+    )
+    target_source = eligibility.get("target_source")
     eligible_sequences = positive_int(
         eligible.get("unique_token_sequences"),
         where="eligible unique token sequences",
@@ -605,6 +616,10 @@ def _load_content_store_ci_export_allowlist(
         or counts.get("representatives") != representative_count
         or eligible_sequences != representative_count
         or eligible_tokens < target_tokens
+        or acquisition_target_tokens < target_tokens
+        or acquisition_target_tokens - target_tokens != reserve_tokens
+        or target_source not in {"store_receipt", "explicit_export_requirement"}
+        or (target_source == "store_receipt" and reserve_tokens != 0)
     ):
         raise RuntimeError(
             f"{manifest_path}: CI export representative/token conservation drifted"
@@ -834,6 +849,11 @@ def _load_content_store_ci_export_allowlist(
             "schema": CI_CONTENT_STORE_EXPORT_SCHEMA,
             "status": "complete",
             "target_exact_unique_payload_tokens": target_tokens,
+            "target_source": target_source,
+            "cas_acquisition_target_exact_unique_payload_tokens": (
+                acquisition_target_tokens
+            ),
+            "cas_reserve_exact_unique_payload_tokens": reserve_tokens,
             "eligible_exact_unique_payload_tokens": eligible_tokens,
         },
         "input_docs": representative_count,

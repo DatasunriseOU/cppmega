@@ -949,6 +949,76 @@ def test_opaque_tokens_cannot_satisfy_the_eligible_target(
     assert not output.exists()
 
 
+def test_explicit_eligible_target_uses_receipt_bound_cas_reserve(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    eligible_text = "eligible compiler output with exact provenance"
+    opaque_text = "PK\u0003\u0004\ufffd\ufffd\ufffd opaque nested zip reserve"
+    eligible_tokens, opaque_tokens = (
+        len(row)
+        for row in exact_tokenizer.encode_batch([eligible_text, opaque_text])
+    )
+    acquisition_target = eligible_tokens + opaque_tokens
+    store_root, receipt_path, fetch_state = _build_store(
+        tmp_path,
+        exact_tokenizer,
+        [
+            (
+                eligible_text,
+                _provenance(eligible_text, archive_member="job-log.txt"),
+            ),
+            (
+                opaque_text,
+                _provenance(
+                    opaque_text,
+                    archive_member="runner-diagnostic-logs/runner.zip",
+                ),
+            ),
+        ],
+        target_unique_tokens=acquisition_target,
+    )
+    output = tmp_path / "receipt-bound-cas-reserve"
+
+    receipt = export_store(
+        store_root=store_root,
+        store_receipt=receipt_path,
+        fetch_state=fetch_state,
+        tokenizer_json=TOKENIZER_JSON,
+        output=output,
+        required_eligible_exact_unique_payload_tokens=eligible_tokens,
+    )
+
+    eligibility = receipt["eligibility"]
+    assert eligibility["target_exact_unique_payload_tokens"] == eligible_tokens
+    assert eligibility["target_source"] == "explicit_export_requirement"
+    assert (
+        eligibility["cas_acquisition_target_exact_unique_payload_tokens"]
+        == acquisition_target
+    )
+    assert (
+        eligibility["cas_reserve_exact_unique_payload_tokens"]
+        == opaque_tokens
+    )
+    assert eligibility["eligible"]["exact_unique_payload_tokens"] == eligible_tokens
+    assert eligibility["target_met"] is True
+
+    with pytest.raises(
+        ExportError,
+        match="exceed the receipt-bound CAS acquisition target",
+    ):
+        export_store(
+            store_root=store_root,
+            store_receipt=receipt_path,
+            fetch_state=fetch_state,
+            tokenizer_json=TOKENIZER_JSON,
+            output=tmp_path / "invalid-target",
+            required_eligible_exact_unique_payload_tokens=(
+                acquisition_target + 1
+            ),
+        )
+
+
 def test_representative_metadata_is_explicit_sanitized_and_receipt_bound(
     tmp_path: Path,
     exact_tokenizer: ExactTokenizer,
