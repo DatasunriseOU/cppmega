@@ -228,7 +228,7 @@ def test_nebius_ssh_contract_accepts_pinned_key_for_ssh_and_scp(
 
 def test_remote_logical_manifest_rejects_legacy_training_before_archive() -> None:
     manifest = {
-        "schema": "cppmega_megatron_bundle_v2",
+        "schema": "cppmega_megatron_bundle_v3",
         "tokenizer_contract": "megacpp-vocab-65536",
         "vocab_size": 65536,
         "training_contract": "legacy_causal",

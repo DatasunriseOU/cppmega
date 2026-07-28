@@ -388,7 +388,7 @@ def test_restore_rejects_legacy_manifest_before_archive_download(
     tmp_path, monkeypatch
 ):
     logical_manifest = {
-        "schema": "cppmega_megatron_bundle_v2",
+        "schema": "cppmega_megatron_bundle_v3",
         "bundle_id": "bundle-1",
         "tokenizer_contract": "megacpp-vocab-65536",
         "vocab_size": 65536,

@@ -1,0 +1,1054 @@
+"""Fail-closed composition of revision-bound source conveyor runs."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+import hashlib
+import json
+from pathlib import Path
+import re
+from typing import Any
+
+
+SOURCE_COMPOSITION_PLAN_SCHEMA = "cppmega_source_conveyor_composition_plan_v1"
+SOURCE_COMPOSITION_SCHEMA = "cppmega_source_conveyor_composition_v1"
+GLOBAL_DEDUP_RECEIPT_SCHEMA = "cppmega_global_dedup_store_receipt_v1"
+_FULL_LAUNCH_SCHEMA = "cppmega.canonical_source_launch_v1"
+_FULL_EXIT_SCHEMA = "cppmega.canonical_source_exit_v1"
+_TARGETED_LAUNCH_SCHEMA = "cppmega.canonical_source_targeted_retry_launch_v1"
+_TARGETED_EXIT_SCHEMA = "cppmega.canonical_source_targeted_retry_exit_v1"
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_MAX_PLAN_BYTES = 4 * 1024 * 1024
+_MAX_RECEIPT_BYTES = 4 * 1024 * 1024
+_MAX_MANIFEST_BYTES = 64 * 1024 * 1024
+_DEDUP_TABLES = frozenset(
+    {
+        "exact",
+        "minhash",
+        "lsh",
+        "dedup_meta",
+        "chunk_claims",
+        "dedup_stages",
+        "exact_stage",
+        "minhash_stage",
+        "lsh_stage",
+        "chunk_claims_stage",
+    }
+)
+_STAGED_DEDUP_TABLES = frozenset(
+    {
+        "dedup_stages",
+        "exact_stage",
+        "minhash_stage",
+        "lsh_stage",
+        "chunk_claims_stage",
+    }
+)
+
+
+@dataclass(frozen=True)
+class SourceComposition:
+    """Validated source composition and the exact files that prove it."""
+
+    allowlist: dict[tuple[str, int], dict[str, int]]
+    receipt: dict[str, object]
+    plan_path: Path
+    dedup_receipt_path: Path
+    run_files: tuple[dict[str, Path], ...]
+
+
+def _canonical_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _require_sha256(value: object, *, where: str) -> str:
+    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+        raise ValueError(f"{where} must be a lowercase SHA-256")
+    return value
+
+
+def _require_nonnegative_int(value: object, *, where: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{where} must be a non-negative integer")
+    return value
+
+
+def _require_positive_int(value: object, *, where: str) -> int:
+    result = _require_nonnegative_int(value, where=where)
+    if result < 1:
+        raise ValueError(f"{where} must be positive")
+    return result
+
+
+def _resolve_regular_file(path: Path, *, where: str) -> Path:
+    expanded = path.expanduser()
+    if expanded.is_symlink():
+        raise ValueError(f"{where} must not be a symlink: {expanded}")
+    resolved = expanded.resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(resolved)
+    return resolved
+
+
+def _load_json_object(path: Path, *, where: str, max_bytes: int) -> tuple[bytes, dict]:
+    path = _resolve_regular_file(path, where=where)
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise ValueError(f"{where} exceeds the {max_bytes}-byte metadata bound")
+    raw = path.read_bytes()
+
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"{where} contains duplicate JSON key {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        payload = json.loads(raw, object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{where} is not valid UTF-8 JSON: {path}") from error
+    if not isinstance(payload, dict):
+        raise ValueError(f"{where} must be a JSON object: {path}")
+    return raw, payload
+
+
+def _require_mapping(value: object, *, where: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{where} must be an object")
+    return dict(value)
+
+
+def _require_exact_fields(
+    value: Mapping[str, object], expected: set[str], *, where: str
+) -> None:
+    actual = set(value)
+    if actual != expected:
+        raise ValueError(
+            f"{where} fields drifted: missing={sorted(expected - actual)} "
+            f"extra={sorted(actual - expected)}"
+        )
+
+
+def _resolve_bound_path(raw: object, *, where: str) -> Path:
+    if not isinstance(raw, str) or not raw:
+        raise ValueError(f"{where} path must be a non-empty string")
+    return _resolve_regular_file(Path(raw), where=where)
+
+
+def _single_option(command: Sequence[object], name: str) -> str:
+    indexes = [index for index, value in enumerate(command) if value == name]
+    if len(indexes) != 1:
+        raise ValueError(f"source launch command must contain exactly one {name}")
+    index = indexes[0]
+    if index + 1 >= len(command) or not isinstance(command[index + 1], str):
+        raise ValueError(f"source launch command has no value for {name}")
+    return str(command[index + 1])
+
+
+def _repeated_option(command: Sequence[object], name: str) -> list[str]:
+    values: list[str] = []
+    for index, value in enumerate(command):
+        if value != name:
+            continue
+        if index + 1 >= len(command) or not isinstance(command[index + 1], str):
+            raise ValueError(f"source launch command has no value for {name}")
+        values.append(str(command[index + 1]))
+    return values
+
+
+def _revision_binding(value: object, *, where: str) -> dict[str, object]:
+    revision = _require_mapping(value, where=where)
+    if (
+        _require_positive_int(
+            revision.get("schema_version"), where=f"{where}.schema_version"
+        )
+        < 2
+        or revision.get("dirty") is not False
+        or revision.get("producer_role") != "canonical_source_conveyor"
+        or revision.get("repository_identity") != "cppmega"
+    ):
+        raise ValueError(f"{where} is not a clean canonical cppmega revision")
+    commit = revision.get("git_commit")
+    if not isinstance(commit, str) or _COMMIT_RE.fullmatch(commit) is None:
+        raise ValueError(f"{where}.git_commit is invalid")
+    tree_sha256 = _require_sha256(
+        revision.get("source_tree_sha256"), where=f"{where}.source_tree_sha256"
+    )
+    indexer = _require_mapping(
+        revision.get("indexer_provenance"), where=f"{where}.indexer_provenance"
+    )
+    if indexer.get("schema") != "cppmega_indexer_dependency_binding_v1":
+        raise ValueError(f"{where} indexer provenance schema is unsupported")
+    source_sha256 = _require_sha256(
+        indexer.get("source_sha256"), where=f"{where}.indexer.source_sha256"
+    )
+    closure_sha256 = _require_sha256(
+        indexer.get("dependency_closure_sha256"),
+        where=f"{where}.indexer.dependency_closure_sha256",
+    )
+    if revision.get("indexer_dependency_closure_sha256") != closure_sha256:
+        raise ValueError(f"{where} indexer dependency closure drifted")
+    return {
+        "cppmega": {
+            "commit": commit,
+            "tree_sha256": tree_sha256,
+        },
+        "clang_indexer": {
+            "source_sha256": source_sha256,
+            "dependency_closure_sha256": closure_sha256,
+        },
+    }
+
+
+def _unit_repo(unit: str) -> str:
+    repo, separator, suffix = unit.rpartition("::")
+    if not separator or not repo or not suffix:
+        raise ValueError(f"invalid conveyor unit key: {unit!r}")
+    return repo
+
+
+def _terminal_repositories(
+    *,
+    done: Mapping[str, object],
+    failed: Mapping[str, object],
+    stream: str,
+) -> set[str]:
+    if stream == "code":
+        successful = {
+            _unit_repo(unit) for unit in done if str(unit).endswith("::code")
+        }
+    else:
+        successful = {
+            _unit_repo(unit)
+            for unit in done
+            if str(unit).endswith(("::commits", "::no_git"))
+        }
+    return successful | {_unit_repo(str(unit)) for unit in failed}
+
+
+def _manifest_allowlist(
+    *,
+    manifest: Mapping[str, object],
+    buckets: tuple[int, ...],
+    run_id: str,
+) -> dict[tuple[str, int], dict[str, int]]:
+    done = _require_mapping(manifest.get("done"), where=f"{run_id} done")
+    allowed: dict[tuple[str, int], dict[str, int]] = {
+        (kind, bucket): {} for kind in ("code", "commits") for bucket in buckets
+    }
+    for unit, raw_info in done.items():
+        if not isinstance(unit, str) or not isinstance(raw_info, Mapping):
+            continue
+        info = dict(raw_info)
+        lengths = info.get("lengths")
+        if not isinstance(lengths, Mapping) or not lengths:
+            continue
+        if unit.endswith("::code"):
+            kind = "code"
+            filename = f"{_unit_repo(unit)}.parquet"
+        elif "::r" in unit:
+            repo, raw_start = unit.rsplit("::r", 1)
+            if not repo or not raw_start.isdecimal():
+                raise ValueError(f"{run_id} has an invalid commit range unit {unit!r}")
+            kind = "commits"
+            filename = f"{repo}_r{int(raw_start)}.parquet"
+        else:
+            continue
+        unknown_lengths = sorted(set(lengths) - {str(bucket) for bucket in buckets})
+        if unknown_lengths:
+            raise ValueError(
+                f"{run_id} unit {unit} has unexpected buckets {unknown_lengths}"
+            )
+        for bucket in buckets:
+            raw_length = lengths.get(str(bucket))
+            if raw_length is None:
+                continue
+            length = _require_mapping(
+                raw_length, where=f"{run_id} {unit}/{bucket}"
+            )
+            rows = _require_positive_int(
+                length.get("rows"), where=f"{run_id} {unit}/{bucket}.rows"
+            )
+            if filename in allowed[(kind, bucket)]:
+                raise ValueError(
+                    f"{run_id} maps multiple units to source shard "
+                    f"{kind}/{bucket}/{filename}"
+                )
+            allowed[(kind, bucket)][filename] = rows
+    return allowed
+
+
+def _validate_input_artifact(
+    inputs: Mapping[str, object],
+    name: str,
+    *,
+    run_id: str,
+    max_bytes: int | None = None,
+) -> tuple[dict[str, Any], Path]:
+    binding = _require_mapping(inputs.get(name), where=f"{run_id} {name}")
+    path = _resolve_bound_path(binding.get("path"), where=f"{run_id} {name}")
+    expected_sha256 = _require_sha256(
+        binding.get("sha256"), where=f"{run_id} {name}.sha256"
+    )
+    if max_bytes is not None and path.stat().st_size > max_bytes:
+        raise ValueError(f"{run_id} {name} exceeds the metadata size bound")
+    if _sha256(path) != expected_sha256:
+        raise ValueError(f"{run_id} {name} artifact binding drifted")
+    return binding, path
+
+
+def _archive_identity(
+    archive: Mapping[str, object],
+    *,
+    run_id: str,
+) -> tuple[dict[str, object], str]:
+    resolved_path = archive.get("resolved_path")
+    if not isinstance(resolved_path, str) or not resolved_path:
+        raise ValueError(f"{run_id} archive.resolved_path is invalid")
+    identity: dict[str, object] = {
+        "resolved_path": resolved_path,
+        "sha256": _require_sha256(
+            archive.get("sha256"), where=f"{run_id} archive.sha256"
+        ),
+        "size_bytes": _require_positive_int(
+            archive.get("size_bytes"), where=f"{run_id} archive.size_bytes"
+        ),
+        "mtime_epoch": _require_positive_int(
+            archive.get("mtime_epoch"), where=f"{run_id} archive.mtime_epoch"
+        ),
+        "inode": _require_positive_int(
+            archive.get("inode"), where=f"{run_id} archive.inode"
+        ),
+        "device": _require_positive_int(
+            archive.get("device"), where=f"{run_id} archive.device"
+        ),
+    }
+    return identity, _canonical_sha256(identity)
+
+
+def _validate_dedup_receipt(path: Path) -> tuple[dict[str, object], Path]:
+    raw, receipt = _load_json_object(
+        path, where="global dedup receipt", max_bytes=_MAX_RECEIPT_BYTES
+    )
+    _require_exact_fields(
+        receipt,
+        {
+            "schema",
+            "status",
+            "created_at",
+            "database",
+            "checkpoint",
+            "integrity_check",
+            "sqlite_schema_sha256",
+            "logical_hash_algorithm",
+            "logical_sha256",
+            "tables",
+            "policy",
+            "verifier",
+        },
+        where="global dedup receipt",
+    )
+    if (
+        receipt.get("schema") != GLOBAL_DEDUP_RECEIPT_SCHEMA
+        or receipt.get("status") != "verified"
+        or receipt.get("integrity_check") != "ok"
+    ):
+        raise ValueError("global dedup receipt is not verified")
+    created_at = receipt.get("created_at")
+    if not isinstance(created_at, str) or not created_at:
+        raise ValueError("global dedup receipt has no creation timestamp")
+    database = _require_mapping(receipt.get("database"), where="dedup database")
+    _require_exact_fields(
+        database, {"path", "size_bytes", "sha256"}, where="dedup database"
+    )
+    database_path = _resolve_bound_path(
+        database.get("path"), where="dedup database"
+    )
+    size = _require_positive_int(
+        database.get("size_bytes"), where="dedup database.size_bytes"
+    )
+    digest = _require_sha256(
+        database.get("sha256"), where="dedup database.sha256"
+    )
+    if database_path.stat().st_size != size or _sha256(database_path) != digest:
+        raise ValueError("global dedup database artifact binding drifted")
+    _require_sha256(
+        receipt.get("sqlite_schema_sha256"), where="dedup sqlite_schema_sha256"
+    )
+    if receipt.get("logical_hash_algorithm") != "cppmega_sqlite_rows_lenprefixed_v1":
+        raise ValueError("global dedup logical hash algorithm is unsupported")
+    _require_sha256(receipt.get("logical_sha256"), where="dedup logical_sha256")
+    checkpoint = _require_mapping(receipt.get("checkpoint"), where="dedup checkpoint")
+    _require_exact_fields(
+        checkpoint,
+        {
+            "mode",
+            "busy",
+            "log_frames",
+            "checkpointed_frames",
+            "wal_size_bytes",
+        },
+        where="dedup checkpoint",
+    )
+    if checkpoint != {
+        "mode": "TRUNCATE",
+        "busy": 0,
+        "log_frames": 0,
+        "checkpointed_frames": 0,
+        "wal_size_bytes": 0,
+    }:
+        raise ValueError("global dedup WAL is not fully checkpointed")
+    tables = _require_mapping(receipt.get("tables"), where="dedup tables")
+    if set(tables) != _DEDUP_TABLES:
+        raise ValueError("global dedup table inventory drifted")
+    for name, raw_table in tables.items():
+        table = _require_mapping(raw_table, where=f"dedup table {name}")
+        _require_exact_fields(
+            table, {"rows", "logical_sha256"}, where=f"dedup table {name}"
+        )
+        rows = _require_nonnegative_int(
+            table.get("rows"), where=f"dedup table {name}.rows"
+        )
+        _require_sha256(
+            table.get("logical_sha256"),
+            where=f"dedup table {name}.logical_sha256",
+        )
+        if name in _STAGED_DEDUP_TABLES and rows:
+            raise ValueError(f"global dedup table {name} contains unpromoted rows")
+        if name not in _STAGED_DEDUP_TABLES and rows < 1:
+            raise ValueError(f"global dedup production table {name} is empty")
+    policy = _require_mapping(receipt.get("policy"), where="dedup policy")
+    _require_exact_fields(
+        policy, {"exact", "chunk", "near"}, where="dedup policy"
+    )
+    near = _require_mapping(policy.get("near"), where="dedup near policy")
+    if (
+        policy.get("exact") != "sha1_token_ids_v1"
+        or policy.get("chunk") != "tokenized_chunk_claims_v1"
+        or near
+        != {
+            "enabled": True,
+            "threshold": 0.7,
+            "num_perm": 256,
+            "shingle_k": 5,
+        }
+    ):
+        raise ValueError("global dedup policy is not the production exact+near policy")
+    verifier = _require_mapping(receipt.get("verifier"), where="dedup verifier")
+    _require_exact_fields(
+        verifier,
+        {"repository_identity", "script", "script_sha256"},
+        where="dedup verifier",
+    )
+    if (
+        verifier.get("repository_identity") != "cppmega"
+        or verifier.get("script") != "scripts/data/verify_global_dedup_store.py"
+    ):
+        raise ValueError("global dedup verifier identity drifted")
+    _require_sha256(verifier.get("script_sha256"), where="dedup verifier.script_sha256")
+    portable = dict(receipt)
+    portable["receipt_sha256"] = hashlib.sha256(raw).hexdigest()
+    portable_database = dict(database)
+    portable_database.pop("path")
+    portable["database"] = portable_database
+    return portable, database_path
+
+
+def _load_run(
+    raw_run: object,
+    *,
+    buckets: tuple[int, ...],
+    code_root: Path,
+    commit_root: Path,
+) -> tuple[
+    dict[str, object],
+    dict[tuple[str, int], dict[str, int]],
+    dict[str, Path],
+    set[str],
+    set[str],
+    set[str],
+    set[str],
+    str,
+    str,
+    dict[str, object],
+]:
+    run = _require_mapping(raw_run, where="source composition run")
+    _require_exact_fields(
+        run,
+        {"run_id", "launch_receipt", "exit_receipt", "manifest"},
+        where="source composition run",
+    )
+    run_id = run.get("run_id")
+    if not isinstance(run_id, str) or _RUN_ID_RE.fullmatch(run_id) is None:
+        raise ValueError("source composition run_id is invalid")
+    launch_path = _resolve_bound_path(
+        run.get("launch_receipt"), where=f"{run_id} launch receipt"
+    )
+    exit_path = _resolve_bound_path(
+        run.get("exit_receipt"), where=f"{run_id} exit receipt"
+    )
+    manifest_path = _resolve_bound_path(
+        run.get("manifest"), where=f"{run_id} conveyor manifest"
+    )
+    launch_raw, launch = _load_json_object(
+        launch_path, where=f"{run_id} launch receipt", max_bytes=_MAX_RECEIPT_BYTES
+    )
+    exit_raw, exit_receipt = _load_json_object(
+        exit_path, where=f"{run_id} exit receipt", max_bytes=_MAX_RECEIPT_BYTES
+    )
+    manifest_raw, manifest = _load_json_object(
+        manifest_path,
+        where=f"{run_id} conveyor manifest",
+        max_bytes=_MAX_MANIFEST_BYTES,
+    )
+
+    launch_schema = launch.get("schema")
+    expected_exit_schema = {
+        _FULL_LAUNCH_SCHEMA: _FULL_EXIT_SCHEMA,
+        _TARGETED_LAUNCH_SCHEMA: _TARGETED_EXIT_SCHEMA,
+    }.get(launch_schema)
+    if expected_exit_schema is None or exit_receipt.get("schema") != expected_exit_schema:
+        raise ValueError(f"{run_id} source supervisor schemas are unsupported")
+    if launch.get("status") != "running":
+        raise ValueError(f"{run_id} launch receipt is not the executed receipt")
+    exit_code = _require_nonnegative_int(
+        exit_receipt.get("exit_code"), where=f"{run_id} exit_code"
+    )
+    expected_status = "success" if exit_code == 0 else "failed"
+    if exit_receipt.get("status") != expected_status:
+        raise ValueError(f"{run_id} exit status does not match its exit code")
+    if exit_receipt.get("launch_receipt_sha256") != hashlib.sha256(
+        launch_raw
+    ).hexdigest():
+        raise ValueError(f"{run_id} exit receipt does not bind the launch receipt")
+    done_binding = _require_mapping(
+        exit_receipt.get("done_manifest"), where=f"{run_id} exit done_manifest"
+    )
+    bound_manifest_path = _resolve_bound_path(
+        done_binding.get("path"), where=f"{run_id} exit done_manifest"
+    )
+    if (
+        bound_manifest_path != manifest_path
+        or _require_sha256(
+            done_binding.get("sha256"),
+            where=f"{run_id} exit done_manifest.sha256",
+        )
+        != hashlib.sha256(manifest_raw).hexdigest()
+    ):
+        raise ValueError(f"{run_id} exit receipt does not bind the conveyor manifest")
+
+    if launch.get("repository_identity") != "cppmega":
+        raise ValueError(f"{run_id} launch receipt is not bound to cppmega")
+    command = launch.get("command")
+    if not isinstance(command, list) or not command:
+        raise ValueError(f"{run_id} launch command is missing")
+    streams = _single_option(command, "--streams")
+    if streams not in {"code", "commits", "both"}:
+        raise ValueError(f"{run_id} launch streams are invalid")
+    if "--no-near-dedup" in command:
+        raise ValueError(f"{run_id} launch explicitly disabled near dedup")
+    expected_revision = _single_option(command, "--expected-code-revision")
+    if (
+        launch.get("code_revision") != expected_revision
+        or exit_receipt.get("code_revision") != expected_revision
+    ):
+        raise ValueError(f"{run_id} source revision binding drifted")
+    revision = _revision_binding(
+        manifest.get("code_revision"), where=f"{run_id} manifest code revision"
+    )
+    if revision["cppmega"]["commit"] != expected_revision:
+        raise ValueError(f"{run_id} manifest revision does not match its launch")
+
+    target_lengths = launch.get("target_lengths")
+    if target_lengths != list(buckets):
+        raise ValueError(f"{run_id} target length ladder drifted")
+    for option in (
+        "--target-lengths-code",
+        "--target-lengths-commits",
+    ):
+        if option in command:
+            parsed = [int(value) for value in _single_option(command, option).split(",")]
+            if parsed != list(buckets):
+                raise ValueError(f"{run_id} {option} drifted")
+    outputs = _require_mapping(launch.get("outputs"), where=f"{run_id} outputs")
+    if streams in {"code", "both"}:
+        raw_code_root = outputs.get("code_output_root")
+        if (
+            not isinstance(raw_code_root, str)
+            or Path(raw_code_root).expanduser().resolve() != code_root
+        ):
+            raise ValueError(f"{run_id} code output root drifted")
+    if streams in {"commits", "both"}:
+        raw_commit_root = outputs.get("commit_output_root")
+        if (
+            not isinstance(raw_commit_root, str)
+            or Path(raw_commit_root).expanduser().resolve() != commit_root
+        ):
+            raise ValueError(f"{run_id} commit output root drifted")
+    raw_dedup_path = outputs.get("dedup_db")
+    if not isinstance(raw_dedup_path, str) or not raw_dedup_path:
+        raise ValueError(f"{run_id} dedup output path is missing")
+    dedup_path = Path(raw_dedup_path).expanduser().resolve()
+    if Path(_single_option(command, "--dedup-db")).expanduser().resolve() != dedup_path:
+        raise ValueError(f"{run_id} dedup path drifted")
+
+    inputs = _require_mapping(launch.get("inputs"), where=f"{run_id} inputs")
+    archive = _require_mapping(inputs.get("archive"), where=f"{run_id} archive")
+    archive_fields, archive_identity = _archive_identity(
+        archive,
+        run_id=run_id,
+    )
+    input_artifacts: dict[str, tuple[dict[str, Any], Path]] = {
+        name: _validate_input_artifact(
+            inputs,
+            name,
+            run_id=run_id,
+            max_bytes=_MAX_RECEIPT_BYTES if name.endswith("_receipt") else None,
+        )
+        for name in (
+            "archive_sha256_receipt",
+            "archive_inventory_receipt",
+            "repo_list",
+            "source_quarantine_manifest",
+            "tokenizer",
+        )
+    }
+    input_binding_hashes = {
+        name: _require_sha256(
+            binding.get("sha256"), where=f"{run_id} {name}.sha256"
+        )
+        for name, (binding, _path) in input_artifacts.items()
+    }
+    input_binding = _canonical_sha256(input_binding_hashes)
+    if (
+        Path(_single_option(command, "--repo-list")).expanduser().resolve()
+        != input_artifacts["repo_list"][1]
+        or Path(
+            _single_option(command, "--source-quarantine-manifest")
+        ).expanduser().resolve()
+        != input_artifacts["source_quarantine_manifest"][1]
+    ):
+        raise ValueError(f"{run_id} launch command input paths drifted")
+
+    archive_receipt_path = input_artifacts["archive_sha256_receipt"][1]
+    _archive_receipt_raw, archive_receipt = _load_json_object(
+        archive_receipt_path,
+        where=f"{run_id} archive SHA-256 receipt",
+        max_bytes=_MAX_RECEIPT_BYTES,
+    )
+    if (
+        archive_receipt.get("schema")
+        != "cppmega.source_archive_sha256_verification_v1"
+        or archive_receipt.get("status") != "verified"
+        or archive_receipt.get("exit_code") != 0
+        or any(
+            archive_receipt.get(name) != value
+            for name, value in archive_fields.items()
+        )
+    ):
+        raise ValueError(f"{run_id} archive SHA-256 receipt identity drifted")
+
+    inventory_binding, inventory_path = input_artifacts[
+        "archive_inventory_receipt"
+    ]
+    inventory_raw, inventory = _load_json_object(
+        inventory_path,
+        where=f"{run_id} archive inventory",
+        max_bytes=_MAX_RECEIPT_BYTES,
+    )
+    if _require_sha256(
+        inventory_binding.get("sha256"),
+        where=f"{run_id} archive inventory receipt.sha256",
+    ) != hashlib.sha256(inventory_raw).hexdigest():
+        raise ValueError(f"{run_id} archive inventory artifact binding drifted")
+    if (
+        inventory.get("schema") != "cppmega.source_archive_inventory_binding_v1"
+        or inventory.get("status") != "verified"
+    ):
+        raise ValueError(f"{run_id} archive inventory is not verified")
+    inventory_archive_receipt = _require_mapping(
+        inventory.get("archive_sha256_receipt"),
+        where=f"{run_id} inventory archive SHA-256 receipt",
+    )
+    inventory_repo_list = _require_mapping(
+        inventory.get("canonical_repo_list"),
+        where=f"{run_id} inventory canonical repo list",
+    )
+    if (
+        _resolve_bound_path(
+            inventory_archive_receipt.get("path"),
+            where=f"{run_id} inventory archive SHA-256 receipt",
+        )
+        != archive_receipt_path
+        or _require_sha256(
+            inventory_archive_receipt.get("sha256"),
+            where=f"{run_id} inventory archive SHA-256 receipt.sha256",
+        )
+        != input_binding_hashes["archive_sha256_receipt"]
+        or _resolve_bound_path(
+            inventory_repo_list.get("path"),
+            where=f"{run_id} inventory canonical repo list",
+        )
+        != input_artifacts["repo_list"][1]
+        or _require_sha256(
+            inventory_repo_list.get("sha256"),
+            where=f"{run_id} inventory canonical repo list.sha256",
+        )
+        != input_binding_hashes["repo_list"]
+    ):
+        raise ValueError(f"{run_id} archive inventory input bindings drifted")
+
+    done = _require_mapping(manifest.get("done"), where=f"{run_id} done")
+    failed = _require_mapping(manifest.get("failed"), where=f"{run_id} failed")
+    selected: set[str] = set()
+    if launch_schema == _TARGETED_LAUNCH_SCHEMA:
+        raw_selected = launch.get("selected_repositories")
+        if (
+            not isinstance(raw_selected, list)
+            or not raw_selected
+            or any(not isinstance(repo, str) or not repo for repo in raw_selected)
+            or len(set(raw_selected)) != len(raw_selected)
+        ):
+            raise ValueError(f"{run_id} targeted repository selection is invalid")
+        selected = set(raw_selected)
+        if exit_receipt.get("selected_repositories") != raw_selected:
+            raise ValueError(f"{run_id} targeted exit selection drifted")
+        if launch.get("expected_selected_repository_count") != len(selected):
+            raise ValueError(f"{run_id} targeted repository count drifted")
+        if _repeated_option(command, "--only-repo") != raw_selected:
+            raise ValueError(f"{run_id} targeted command selection drifted")
+        if int(_single_option(command, "--max-repos")) != len(selected):
+            raise ValueError(f"{run_id} targeted command repository count drifted")
+    elif "--only-repo" in command or "--max-repos" in command:
+        raise ValueError(f"{run_id} full launch contains a targeted repository limit")
+
+    code_terminal = (
+        _terminal_repositories(done=done, failed=failed, stream="code")
+        if streams in {"code", "both"}
+        else set()
+    )
+    commit_terminal = (
+        _terminal_repositories(done=done, failed=failed, stream="commits")
+        if streams in {"commits", "both"}
+        else set()
+    )
+    terminal = code_terminal | commit_terminal
+    if selected and terminal != selected:
+        raise ValueError(f"{run_id} targeted terminal repository set drifted")
+    if selected and any(_unit_repo(str(unit)) not in selected for unit in (*done, *failed)):
+        raise ValueError(f"{run_id} contains units outside its targeted selection")
+
+    allowed = _manifest_allowlist(
+        manifest=manifest, buckets=buckets, run_id=run_id
+    )
+    portable = {
+        "run_id": run_id,
+        "launch": {
+            "schema": launch_schema,
+            "sha256": hashlib.sha256(launch_raw).hexdigest(),
+        },
+        "exit": {
+            "schema": expected_exit_schema,
+            "sha256": hashlib.sha256(exit_raw).hexdigest(),
+            "exit_code": exit_code,
+        },
+        "manifest": {
+            "sha256": hashlib.sha256(manifest_raw).hexdigest(),
+            "done_units": len(done),
+            "failed_units": len(failed),
+            "done_unit_set_sha256": _canonical_sha256(sorted(done)),
+            "failed_unit_set_sha256": _canonical_sha256(sorted(failed)),
+        },
+        "streams": streams,
+        "selected_repositories": sorted(selected),
+        "terminal_repositories": sorted(terminal),
+        "terminal_repository_set_sha256": _canonical_sha256(sorted(terminal)),
+        "input_artifacts": input_binding_hashes,
+        "code_revision": revision,
+        "allowlist_counts": {
+            f"{kind}/{bucket}": len(files)
+            for (kind, bucket), files in sorted(allowed.items())
+        },
+    }
+    files = {
+        "launch": launch_path,
+        "exit": exit_path,
+        "manifest": manifest_path,
+        "archive_sha256_receipt": archive_receipt_path,
+        "archive_inventory": inventory_path,
+        "repo_list": input_artifacts["repo_list"][1],
+        "source_quarantine_manifest": input_artifacts[
+            "source_quarantine_manifest"
+        ][1],
+        "tokenizer": input_artifacts["tokenizer"][1],
+    }
+    return (
+        portable,
+        allowed,
+        files,
+        code_terminal,
+        commit_terminal,
+        {_unit_repo(str(unit)) for unit in failed},
+        set(str(unit) for unit in failed),
+        archive_identity,
+        input_binding,
+        {
+            "dedup_path": str(dedup_path),
+            "inventory": inventory,
+            "launch_schema": launch_schema,
+            "streams": streams,
+            "expected_repository_count": launch.get("expected_repository_count"),
+            "done": done,
+            "failed": failed,
+        },
+    )
+
+
+def load_source_composition(
+    plan_path: Path,
+    *,
+    buckets: tuple[int, ...],
+    code_root: Path,
+    commit_root: Path,
+) -> SourceComposition:
+    """Load and fully verify a multi-run source composition plan."""
+
+    plan_path = _resolve_regular_file(
+        plan_path, where="source composition plan"
+    )
+    plan_raw, plan = _load_json_object(
+        plan_path, where="source composition plan", max_bytes=_MAX_PLAN_BYTES
+    )
+    _require_exact_fields(
+        plan,
+        {"schema", "runs", "dedup_receipt"},
+        where="source composition plan",
+    )
+    if plan.get("schema") != SOURCE_COMPOSITION_PLAN_SCHEMA:
+        raise ValueError("source composition plan schema is unsupported")
+    raw_runs = plan.get("runs")
+    if not isinstance(raw_runs, list) or not raw_runs:
+        raise ValueError("source composition plan has no runs")
+    dedup_receipt_path = _resolve_bound_path(
+        plan.get("dedup_receipt"), where="source composition dedup receipt"
+    )
+    dedup_receipt, dedup_database_path = _validate_dedup_receipt(dedup_receipt_path)
+
+    code_root = code_root.expanduser().resolve()
+    commit_root = commit_root.expanduser().resolve()
+    combined_allowlist: dict[tuple[str, int], dict[str, int]] = {
+        (kind, bucket): {} for kind in ("code", "commits") for bucket in buckets
+    }
+    run_receipts: list[dict[str, object]] = []
+    run_files: list[dict[str, Path]] = []
+    run_details: list[dict[str, object]] = []
+    run_ids: set[str] = set()
+    archive_identities: set[str] = set()
+    input_bindings: set[str] = set()
+    all_code_terminal: set[str] = set()
+    all_commit_terminal: set[str] = set()
+    failed_repositories: set[str] = set()
+    failed_units: list[tuple[str, str, str]] = []
+    producers: dict[str, dict[str, object]] = {}
+
+    for raw_run in raw_runs:
+        (
+            portable,
+            allowed,
+            files,
+            code_terminal,
+            commit_terminal,
+            run_failed_repositories,
+            run_failed_units,
+            archive_identity,
+            input_binding,
+            details,
+        ) = _load_run(
+            raw_run,
+            buckets=buckets,
+            code_root=code_root,
+            commit_root=commit_root,
+        )
+        run_id = str(portable["run_id"])
+        if run_id in run_ids:
+            raise ValueError(f"duplicate source composition run_id: {run_id}")
+        run_ids.add(run_id)
+        if Path(str(details["dedup_path"])).resolve() != dedup_database_path:
+            raise ValueError(f"{run_id} did not use the receipt-bound global dedup DB")
+        for key, files_for_bucket in allowed.items():
+            for filename, rows in files_for_bucket.items():
+                if filename in combined_allowlist[key]:
+                    raise ValueError(
+                        f"duplicate source shard across runs: "
+                        f"{key[0]}/{key[1]}/{filename}"
+                    )
+                combined_allowlist[key][filename] = rows
+        producer = dict(portable["code_revision"])
+        producers[_canonical_sha256(producer)] = producer
+        archive_identities.add(archive_identity)
+        input_bindings.add(input_binding)
+        all_code_terminal.update(code_terminal)
+        all_commit_terminal.update(commit_terminal)
+        failed_repositories.update(run_failed_repositories)
+        streams = str(details["streams"])
+        for unit in run_failed_units:
+            failed_units.append((run_id, streams, unit))
+        run_receipts.append(portable)
+        run_files.append(files)
+        run_details.append(details)
+
+    if len(archive_identities) != 1 or len(input_bindings) != 1:
+        raise ValueError("source composition runs do not share one immutable input set")
+    if any(not files for files in combined_allowlist.values()):
+        missing = [
+            f"{kind}/{bucket}"
+            for (kind, bucket), files in combined_allowlist.items()
+            if not files
+        ]
+        raise ValueError(
+            "source composition has no trainable shards for: " + ", ".join(missing)
+        )
+
+    full_code_sets: list[set[str]] = []
+    full_commit_sets: list[set[str]] = []
+    inventory: dict[str, object] | None = None
+    for portable, details in zip(run_receipts, run_details, strict=True):
+        if details["launch_schema"] != _FULL_LAUNCH_SCHEMA:
+            continue
+        current_inventory = dict(details["inventory"])
+        if inventory is None:
+            inventory = current_inventory
+        streams = str(details["streams"])
+        terminals = set(portable["terminal_repositories"])
+        if streams in {"code", "both"}:
+            full_code_sets.append(terminals)
+        if streams in {"commits", "both"}:
+            full_commit_sets.append(terminals)
+    if inventory is None or not full_code_sets or not full_commit_sets:
+        raise ValueError("source composition requires full code and commit runs")
+    expected_count = _require_positive_int(
+        inventory.get("archive_unique_worktree_repo_count"),
+        where="archive inventory repository count",
+    )
+    expected_names_sha256 = _require_sha256(
+        inventory.get("archive_sorted_repo_names_json_sha256"),
+        where="archive inventory repository names SHA-256",
+    )
+    for portable, details in zip(run_receipts, run_details, strict=True):
+        if details["launch_schema"] != _FULL_LAUNCH_SCHEMA:
+            continue
+        if details["expected_repository_count"] != expected_count:
+            raise ValueError(
+                f"{portable['run_id']} full launch repository count drifted"
+            )
+    expected_repositories = full_code_sets[0]
+    if (
+        len(expected_repositories) != expected_count
+        or _canonical_sha256(sorted(expected_repositories)) != expected_names_sha256
+    ):
+        raise ValueError("full code run does not match the archive repository inventory")
+    if any(repositories != expected_repositories for repositories in full_code_sets):
+        raise ValueError("full code run repository sets disagree")
+    if any(repositories != expected_repositories for repositories in full_commit_sets):
+        raise ValueError("full commit run repository set differs from the archive")
+    if all_code_terminal != expected_repositories:
+        raise ValueError("final code coverage differs from the archive repository set")
+    if all_commit_terminal != expected_repositories:
+        raise ValueError("final commit coverage differs from the archive repository set")
+
+    code_success = {
+        _unit_repo(str(unit))
+        for details in run_details
+        for unit in _require_mapping(details["done"], where="run done")
+        if str(unit).endswith("::code")
+    }
+    commit_success = {
+        _unit_repo(str(unit))
+        for details in run_details
+        for unit in _require_mapping(details["done"], where="run done")
+        if str(unit).endswith(("::commits", "::no_git"))
+    }
+    unresolved: list[str] = []
+    for run_id, streams, unit in failed_units:
+        repo = _unit_repo(unit)
+        if streams in {"code", "both"} and repo not in code_success:
+            unresolved.append(f"{run_id}:{unit}:code")
+        if streams in {"commits", "both"} and repo not in commit_success:
+            unresolved.append(f"{run_id}:{unit}:commits")
+    if unresolved:
+        raise ValueError(
+            "source composition has unresolved failed units: "
+            + ", ".join(sorted(unresolved)[:20])
+        )
+    if code_success != expected_repositories:
+        raise ValueError("not every archive repository has terminal code success")
+    if commit_success != expected_repositories:
+        raise ValueError("not every archive repository has terminal commit success")
+
+    source_producers = [producers[digest] for digest in sorted(producers)]
+    receipt: dict[str, object] = {
+        "schema": SOURCE_COMPOSITION_SCHEMA,
+        "status": "complete",
+        "plan_sha256": hashlib.sha256(plan_raw).hexdigest(),
+        "buckets": list(buckets),
+        "archive": {
+            "repository_count": expected_count,
+            "repository_names_sha256": expected_names_sha256,
+            "input_binding_sha256": next(iter(input_bindings)),
+            "archive_identity_sha256": next(iter(archive_identities)),
+        },
+        "dedup": dedup_receipt,
+        "runs": run_receipts,
+        "source_producers": source_producers,
+        "source_producer_set_sha256": _canonical_sha256(source_producers),
+        "coverage": {
+            "expected_repositories": expected_count,
+            "code_success_repositories": len(code_success),
+            "commit_success_repositories": len(commit_success),
+            "failed_repositories_observed": len(failed_repositories),
+            "failed_units_observed": len(failed_units),
+            "unresolved_failed_units": 0,
+            "repository_set_sha256": _canonical_sha256(
+                sorted(expected_repositories)
+            ),
+            "allowlist_counts": {
+                f"{kind}/{bucket}": len(files)
+                for (kind, bucket), files in sorted(combined_allowlist.items())
+            },
+        },
+    }
+    return SourceComposition(
+        allowlist=combined_allowlist,
+        receipt=receipt,
+        plan_path=plan_path,
+        dedup_receipt_path=dedup_receipt_path,
+        run_files=tuple(run_files),
+    )
+
+
+__all__ = [
+    "GLOBAL_DEDUP_RECEIPT_SCHEMA",
+    "SOURCE_COMPOSITION_PLAN_SCHEMA",
+    "SOURCE_COMPOSITION_SCHEMA",
+    "SourceComposition",
+    "load_source_composition",
+]

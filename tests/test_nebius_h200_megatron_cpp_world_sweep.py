@@ -19,6 +19,9 @@ from cppmega.megatron.graph_recipe import (
 from cppmega.receipt_binding import build_data_producer_binding
 import scripts.data.publish_megatron_bundle_to_nebius_s3 as publisher
 import scripts.nebius_h200_megatron_cpp_world_sweep as sweep_module
+from tests.test_publish_megatron_bundle_to_nebius_s3 import (
+    _write_source_composition_provenance,
+)
 
 from scripts.nebius_h200_megatron_cpp_world_sweep import (
     DEFAULT_DOCKER_IMAGE,
@@ -462,6 +465,7 @@ def _write_test_bundle(root, prefix, tokenizer):
         / "data/tokenizer_v2/tokenizer_contract_v1.json",
         tokenizer_contract,
     )
+    source_composition = _write_source_composition_provenance(root)
     paths = sorted(path for path in root.rglob("*") if path.is_file())
     records = [
         {
@@ -478,11 +482,13 @@ def _write_test_bundle(root, prefix, tokenizer):
     ]
     tokenizer_sha256 = publisher._artifact_set_sha256(tokenizer_records)
     manifest = {
-        "schema": "cppmega_megatron_bundle_v2",
+        "schema": "cppmega_megatron_bundle_v3",
         "bundle_id": f"test-bundle-{artifact_set_sha256[:16]}",
         "tokenizer_contract": "megacpp-vocab-65536",
         "vocab_size": 65536,
         "training_contract": "objective_materialized",
+        "known_limitations": [],
+        "source_snapshot": {"source_composition": source_composition},
         "implementation": build_data_producer_binding(
             cppmega_commit="a" * 40,
             cppmega_tree_sha256="b" * 64,
