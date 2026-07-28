@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import Future
 from pathlib import Path
+from threading import Timer
 
 import pytest
 
@@ -129,3 +131,36 @@ def test_source_with_nul_byte_is_rejected() -> None:
 
     with pytest.raises(ValueError, match="source contains NUL byte"):
         index_project._decode_source_bytes(b"int value = 0;\0\n", "binary.cpp")
+
+
+def test_parse_pool_emits_heartbeat_while_a_batch_is_still_running(
+    capsys,
+) -> None:
+    from tools.clang_indexer import index_project
+
+    class DelayedExecutor:
+        def __init__(self) -> None:
+            self.future = Future()
+            self.timer = Timer(
+                0.05,
+                self.future.set_result,
+                args=[("batch-result", 1)],
+            )
+
+        def submit(self, _fn, _batch):
+            self.timer.start()
+            return self.future
+
+    executor = DelayedExecutor()
+    results = list(
+        index_project._iter_parse_batch_results(
+            executor,
+            ["slow-batch"],
+            max_in_flight=1,
+            heartbeat_interval_s=0.01,
+        )
+    )
+    executor.timer.join()
+
+    assert results == [("batch-result", 1)]
+    assert "Parse pool heartbeat:" in capsys.readouterr().err

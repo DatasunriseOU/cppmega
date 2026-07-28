@@ -44,7 +44,7 @@ import warnings
 # Increase recursion limit for deeply nested ASTs (gcc-mirror, llvm-project, boost)
 sys.setrecursionlimit(50000)
 from collections import defaultdict, deque
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Optional, Protocol, Sequence, TypeAlias, cast
 
@@ -9061,31 +9061,59 @@ def _iter_parse_batch_results(
     batches: Iterable,
     *,
     max_in_flight: int,
+    heartbeat_interval_s: float = PARSE_HEARTBEAT_SECONDS,
 ):
-    """Yield every batch result while retaining only a bounded future window."""
+    """Yield batch results while keeping the parent process observably alive."""
 
     if max_in_flight <= 0:
         raise ValueError(f"max_in_flight must be positive, got {max_in_flight}")
+    if heartbeat_interval_s <= 0:
+        raise ValueError(
+            "heartbeat_interval_s must be positive, got "
+            f"{heartbeat_interval_s}"
+        )
     batch_iter = iter(batches)
     pending = set()
+    submitted_batches = 0
+    completed_batches = 0
 
     def submit_one() -> bool:
+        nonlocal submitted_batches
         try:
             batch = next(batch_iter)
         except StopIteration:
             return False
         pending.add(executor.submit(_parse_file_batch, batch))
+        submitted_batches += 1
         return True
 
     try:
         while len(pending) < max_in_flight and submit_one():
             pass
         while pending:
-            future = next(as_completed(tuple(pending)))
-            pending.remove(future)
-            yield future.result()
-            while len(pending) < max_in_flight and submit_one():
-                pass
+            done, _ = wait(
+                tuple(pending),
+                timeout=heartbeat_interval_s,
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                running_batches = sum(future.running() for future in pending)
+                print(
+                    "  Parse pool heartbeat: "
+                    f"completed_batches={completed_batches} "
+                    f"submitted_batches={submitted_batches} "
+                    f"pending_batches={len(pending)} "
+                    f"running_batches={running_batches}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+            for future in done:
+                pending.remove(future)
+                completed_batches += 1
+                yield future.result()
+                while len(pending) < max_in_flight and submit_one():
+                    pass
     finally:
         for future in pending:
             future.cancel()
