@@ -808,6 +808,40 @@ def _normalize_signature_text(value: str | None) -> str:
     return re.sub(r"\s+", " ", str(value)).strip()
 
 
+def _project_identity_path_prefixes(project_dir: str | None) -> tuple[str, ...]:
+    """Return native and cross-platform spellings of the checkout prefix."""
+
+    if not project_dir:
+        return ()
+    roots = {
+        os.path.abspath(str(project_dir)),
+        os.path.realpath(str(project_dir)),
+    }
+    prefixes: set[str] = set()
+    for root in roots:
+        stripped = root.rstrip("/\\")
+        for spelling in {
+            stripped,
+            stripped.replace("\\", "/"),
+            stripped.replace("/", "\\"),
+        }:
+            prefixes.add(spelling.rstrip("/\\") + "/")
+            prefixes.add(spelling.rstrip("/\\") + "\\")
+    return tuple(sorted(prefixes, key=len, reverse=True))
+
+
+def _canonicalize_clang_identity_text(
+    value: str | None,
+    project_dir: str | None,
+) -> str:
+    """Remove checkout-specific prefixes from clang-generated identity text."""
+
+    text = str(value or "")
+    for prefix in _project_identity_path_prefixes(project_dir):
+        text = text.replace(prefix, "")
+    return _normalize_signature_text(text)
+
+
 _PROVIDER_PATH_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "libc++",
@@ -908,7 +942,7 @@ def _cursor_kind_name(cursor: Cursor) -> str:
     return text.rsplit(".", 1)[-1]
 
 
-def _cursor_usr(cursor: Cursor) -> str:
+def _cursor_usr(cursor: Cursor, *, project_dir: str | None = None) -> str:
     get_usr = getattr(cursor, "get_usr", None)
     if not callable(get_usr):
         return ""
@@ -919,7 +953,24 @@ def _cursor_usr(cursor: Cursor) -> str:
     except Exception as exc:
         raise SymbolIdentityError("clang USR extraction failed") from exc
     # Clang can surface empty/placeholder USRs for unexposed/local constructs.
-    if not usr or usr.startswith("<") or "invalid" in usr.lower():
+    # Anonymous declarations can also carry a checkout-absolute path and spaces
+    # inside the USR. Such a value is not portable and is invalid under the
+    # canonical USR contract, so route it through the scoped fallback identity.
+    if (
+        not usr
+        or usr.startswith("<")
+        or "invalid" in usr.lower()
+        or usr != usr.strip()
+        or "\x1f" in usr
+        or any(
+            char.isspace() or ord(char) < 32 or ord(char) == 127
+            for char in usr
+        )
+        or any(
+            prefix in usr
+            for prefix in _project_identity_path_prefixes(project_dir)
+        )
+    ):
         return ""
     return usr
 
@@ -1349,9 +1400,15 @@ def symbol_identity_for_cursor(
     force_file_scope: bool = False,
 ) -> tuple[str, str, str]:
     """Return ``(identity_key, usr, canonical_signature)`` for a clang cursor."""
-    qname = get_qualified_name(cursor)
-    usr = _cursor_usr(cursor)
-    signature = _cursor_canonical_signature(cursor)
+    qname = _canonicalize_clang_identity_text(
+        get_qualified_name(cursor),
+        project_dir,
+    )
+    usr = _cursor_usr(cursor, project_dir=project_dir)
+    signature = _canonicalize_clang_identity_text(
+        _cursor_canonical_signature(cursor),
+        project_dir,
+    )
     file_scope = force_file_scope
     uses_repo_file_location = not usr and not signature
     rel_file, identity_project = _cursor_repo_file_location_identity(
@@ -1491,7 +1548,10 @@ def symbol_reference_for_cursor(
         "symbol_identity_schema_version": SYMBOL_IDENTITY_SCHEMA_VERSION,
         "symbol_key": key,
         "symbol_id": _compute_symbol_id(key),
-        "qname": get_qualified_name(cursor),
+        "qname": _canonicalize_clang_identity_text(
+            get_qualified_name(cursor),
+            project_dir,
+        ),
         "usr": usr,
         "canonical_signature": signature,
         "symbol_kind": _cursor_kind_name(cursor),
@@ -3021,7 +3081,10 @@ def parse_translation_unit(
                 referenced_type_keys = [
                     str(ref["symbol_key"]) for ref in referenced_type_refs
                 ]
-                qname = get_qualified_name(cursor)
+                qname = _canonicalize_clang_identity_text(
+                    get_qualified_name(cursor),
+                    project_dir,
+                )
                 symbol_key, usr, canonical_signature = symbol_identity_for_cursor(
                     cursor,
                     project_dir=project_dir,
@@ -3080,7 +3143,10 @@ def parse_translation_unit(
         # declaration never shadows the real body.
         type_bucket = _TYPE_DEF_KIND_BUCKET.get(kind)
         if type_bucket is not None and cursor.is_definition():
-            qname = get_qualified_name(cursor)
+            qname = _canonicalize_clang_identity_text(
+                get_qualified_name(cursor),
+                project_dir,
+            )
             # Normal path drops std::/boost:: ("system") type names; the std
             # cross-link builder sets allow_system_types so std:: class templates
             # (std::vector/std::map/std::basic_string/...) ARE captured.
@@ -3119,7 +3185,10 @@ def parse_translation_unit(
                     in_primary_file=in_primary_file,
                 )
         if header_decl_kind is not None and header_decl_text and len(header_decl_text) >= 8:
-            qname = get_qualified_name(cursor)
+            qname = _canonicalize_clang_identity_text(
+                get_qualified_name(cursor),
+                project_dir,
+            )
             if qname and (allow_system_types or not is_system_function(qname)):
                 symbol_key, usr, canonical_signature = symbol_identity_for_cursor(
                     cursor,

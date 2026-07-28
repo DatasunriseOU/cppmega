@@ -50,6 +50,38 @@ def _cursor(path: Path, *, usr: str, displayname: str = "move(int)") -> SimpleNa
     )
 
 
+def test_checkout_bound_unsafe_usr_uses_stable_scoped_fallback(
+    tmp_path: Path,
+) -> None:
+    references = []
+    for checkout_name in ("checkout-a", "checkout-b"):
+        checkout = tmp_path / checkout_name
+        header = checkout / "include" / "EALoad.h"
+        header.parent.mkdir(parents=True)
+        header.write_text("struct { int value; };\n", encoding="utf-8")
+        generated_name = f"(unnamed struct at {header}:9:9)"
+        cursor = _cursor(
+            header,
+            usr=f"c:EALoad.h@S@189@F@{generated_name}#",
+            displayname=f"{generated_name}()",
+        )
+        references.append(
+            indexer.symbol_reference_for_cursor(
+                cursor,
+                project_dir=str(checkout),
+                project_id="owner/repo",
+            )
+        )
+
+    left, right = references
+    assert left["usr"] == right["usr"] == ""
+    assert left["symbol_key"] == right["symbol_key"]
+    assert left["canonical_signature"] == right["canonical_signature"]
+    assert str(tmp_path / "checkout-a") not in left["canonical_signature"]
+    assert str(tmp_path / "checkout-b") not in right["canonical_signature"]
+    assert "include/EALoad.h:9:9" in left["canonical_signature"]
+
+
 def test_mlx_emits_the_shared_integrity_version() -> None:
     probe = (
         "from cppmega_mlx.data import prompt_graph_index as m; "
