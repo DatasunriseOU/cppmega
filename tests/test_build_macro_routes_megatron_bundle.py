@@ -1607,3 +1607,25 @@ def test_strict_validation_runs_before_atomic_publication(
     _publish_validated_bundle(partial, output, hash_jobs=3)
 
     assert events == ["validate", "publish"]
+
+
+def test_artifact_records_include_nested_source_run_manifest(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "manifest.json").write_text("{}\n", encoding="utf-8")
+    run_manifest = (
+        bundle
+        / "provenance"
+        / "source_composition"
+        / "runs"
+        / "full"
+        / "manifest.json"
+    )
+    run_manifest.parent.mkdir(parents=True)
+    run_manifest.write_text('{"schema":"fixture"}\n', encoding="utf-8")
+
+    records = builder._artifact_records(bundle, hash_jobs=1)
+    paths = {record["path"] for record in records}
+
+    assert "manifest.json" not in paths
+    assert "provenance/source_composition/runs/full/manifest.json" in paths
