@@ -262,6 +262,37 @@ def test_external_provider_reference_keeps_provider_identity(tmp_path: Path) -> 
     assert data_identity.__dict__ == identity.__dict__
 
 
+def test_vendored_provider_named_directory_keeps_repository_identity(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "repo"
+    vendored_header = (
+        project
+        / "VTK"
+        / "Infovis"
+        / "Boost"
+        / "vtkVariantBoostSerialization.h"
+    )
+    vendored_header.parent.mkdir(parents=True)
+    vendored_header.write_text("#pragma once\n", encoding="utf-8")
+    cursor = _cursor(
+        vendored_header,
+        usr="c:@F@vtkVariantBoostSerialization",
+    )
+
+    reference = indexer.symbol_reference_for_cursor(
+        cursor,
+        project_dir=str(project),
+        project_id="Kitware/ParaView",
+    )
+
+    assert reference["project"] == "Kitware/ParaView"
+    assert reference["file"] == "VTK/Infovis/Boost/vtkVariantBoostSerialization.h"
+    assert reference["provider"] == ""
+    assert reference["include_provenance"] == ""
+    assert indexer._normalize_symbol_reference(reference) == reference
+
+
 def test_unknown_external_graph_reference_is_omitted_with_receipt(
     tmp_path: Path,
 ) -> None:

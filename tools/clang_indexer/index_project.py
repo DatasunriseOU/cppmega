@@ -1548,7 +1548,11 @@ def symbol_reference_for_cursor(
         )
         reference_line = int(getattr(location, "line", 0) or 0)
         reference_column = int(getattr(location, "column", 0) or 0)
-    provider, include_provenance = symbol_provider_provenance(relative_file)
+    provider, include_provenance = (
+        symbol_provider_provenance(relative_file)
+        if relative_file.startswith("@provider/")
+        else ("", "")
+    )
     if reference_project != project_id:
         if not provider or not include_provenance:
             raise SymbolIdentityError(
