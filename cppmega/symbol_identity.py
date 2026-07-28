@@ -317,13 +317,16 @@ def _validate_usr_file(value: object, *, source: str) -> str:
     if (
         not isinstance(value, str)
         or not value
+        or value != value.strip()
         or value != posixpath.normpath(value)
         or value.startswith("/")
         or _WINDOWS_LOCAL_PATH_RE.match(value)
         or "\\" in value
         or any(part in {"", ".", ".."} for part in value.split("/"))
         or any(
-            char.isspace() or ord(char) < 32 or ord(char) == 127
+            (char.isspace() and char != " ")
+            or ord(char) < 32
+            or ord(char) == 127
             for char in value
         )
     ):

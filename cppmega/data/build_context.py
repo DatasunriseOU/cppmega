@@ -84,8 +84,17 @@ _PATH_JOINED_PREFIXES = (
     "-idirafter",
     "-F",
     "-iframework",
+    "-include",
+    "-imacros",
 )
 _PATH_EQ_PREFIXES = ("--sysroot=", "-isysroot=", "-resource-dir=")
+_SEPARATE_FLAG_VALUE_OPTIONS = _PATH_VALUE_FLAGS | {
+    "-D",
+    "-U",
+    "-x",
+    "-target",
+    "--target",
+}
 _COMPILE_COMMANDS_COMMON_DIRS = (
     "build",
     "build-debug",
@@ -389,11 +398,20 @@ def _extract_flag_tokens(tokens: list[str]) -> list[str]:
     while i < len(tokens):
         token = tokens[i]
         stripped = token.strip().rstrip(",)")
-        if stripped in _VERBATIM_FLAGS or stripped.startswith(_FLAG_PREFIXES):
+        if stripped in _SEPARATE_FLAG_VALUE_OPTIONS:
             selected.append(stripped)
-        elif stripped == "-x" and i + 1 < len(tokens):
-            selected.extend(["-x", tokens[i + 1].strip().rstrip(",)")])
-            i += 1
+            if i + 1 < len(tokens):
+                operand = tokens[i + 1].strip().rstrip(",)")
+                if operand:
+                    selected.append(operand)
+                    i += 1
+        elif (
+            stripped in _VERBATIM_FLAGS
+            or stripped.startswith(_FLAG_PREFIXES)
+            or stripped.startswith(_PATH_JOINED_PREFIXES)
+            or stripped.startswith(_PATH_EQ_PREFIXES)
+        ):
+            selected.append(stripped)
         elif stripped.startswith("-x") and len(stripped) > 2:
             selected.append(stripped)
         i += 1
@@ -404,6 +422,17 @@ def _normalize_standard(raw_value: str | None) -> str | None:
     if not isinstance(raw_value, str):
         return None
     value = raw_value.strip().lower()
+    if value.startswith("iso9899:"):
+        return {
+            "iso9899:1990": "c90",
+            "iso9899:199409": "c95",
+            "iso9899:1999": "c99",
+            "iso9899:199x": "c99",
+            "iso9899:2011": "c11",
+            "iso9899:201x": "c11",
+            "iso9899:2017": "c17",
+            "iso9899:2018": "c17",
+        }.get(value)
     if value.startswith("gnu++"):
         return f"c++{value.removeprefix('gnu++')}"
     if value.startswith("c++"):
@@ -533,6 +562,11 @@ def _detection_to_context(detection: BuildDetection) -> tuple[dict, list[str]]:
     standard = detection.standard or _extract_standard_from_flags(_extract_flag_tokens(detection.flags))[0]
     if standard:
         result["standard"] = standard
+    else:
+        # DEFAULT_PLATFORM describes the no-build-files fallback only.  Once a
+        # real build system is detected, do not claim its dialect is C++17
+        # unless the project supplied evidence for that standard.
+        result.pop("standard", None)
     arch = detection.arch or _infer_arch_from_flags(_extract_flag_tokens(detection.flags))
     if arch:
         result["arch"] = arch
@@ -616,7 +650,18 @@ def _parse_autoconf(text: str) -> BuildDetection | None:
     elif "ac_prog_cc" in text.lower():
         compiler = "gcc"
     standard = _extract_standard_from_flags(flags)[0]
-    language = "c++" if compiler == "g++" or (standard and standard.startswith("c++")) else ("c" if standard else None)
+    if standard and standard.startswith("c++"):
+        language = "c++"
+    elif standard and standard.startswith("cl"):
+        language = "opencl"
+    elif standard and standard.startswith("c"):
+        language = "c"
+    elif compiler == "g++":
+        language = "c++"
+    elif compiler == "gcc":
+        language = "c"
+    else:
+        language = None
     if not (flags or compiler or standard):
         return None
     return BuildDetection(

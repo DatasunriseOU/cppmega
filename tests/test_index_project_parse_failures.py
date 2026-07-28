@@ -8,6 +8,62 @@ from threading import Timer
 import pytest
 
 
+_VALGRIND_AUTOCONF_ARGS = [
+    "-x",
+    "c++",
+    "-std=c++1y",
+    "-m32",
+    "-DVGPV_<arch>_<os>_<variant>",
+    "-DVGP_<arch>_<os>",
+    "-DVGP_arm_linux",
+    "-DVGPV_arm_linux_vanilla",
+    "-DVGP_arm_linux",
+    "-DVGPV_arm_linux_android",
+    "-std=c++1y",
+    "-std=c++0x",
+    "-march=@<:@^",
+    "-march=mips64r2",
+    "-march=mips64r2",
+    "-m32",
+    "-m64",
+    "-march=octeon",
+    "-march=octeon]",
+    "-march=octeon2",
+    "-march=octeon2]",
+    "-march=mips64r2",
+    "-m32",
+    "-std=gnu99.",
+    "-std=gnu99",
+    "-D__user=",
+    "-m32",
+    "-m64",
+    "-fsyntax-only",
+    "-Wno-everything",
+]
+
+
+def _write_valgrind_style_configure(project_dir: Path) -> None:
+    detected_flags = _VALGRIND_AUTOCONF_ARGS[3:-2]
+    (project_dir / "configure.ac").write_text(
+        "AC_PROG_CXX\n"
+        f"CXXFLAGS='{' '.join(detected_flags)}'\n",
+        encoding="utf-8",
+    )
+
+
+def _write_autoconf_flags(
+    project_dir: Path,
+    *,
+    compiler_macro: str,
+    variable: str,
+    flags: str,
+) -> None:
+    (project_dir / "configure.ac").write_text(
+        f"{compiler_macro}\n{variable}='{flags}'\n",
+        encoding="utf-8",
+    )
+
+
 def _load_indexer():
     try:
         from tools.clang_indexer import index_project
@@ -161,6 +217,730 @@ int reopened_answer() { return 43; }
     assert {item["name"] for item in payload["functions"]} == {
         "nested_answer",
         "reopened_answer",
+    }
+
+
+def test_no_linkage_parameter_in_spaced_repository_path_parses(
+    tmp_path: Path,
+) -> None:
+    index_project = _load_indexer()
+    source = (
+        tmp_path
+        / "third_party/libsdl2/Xcode-iOS/Template"
+        / "SDL iOS Application"
+        / "main.c"
+    )
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "int randomInt(const int min, const int max) {\n"
+        "    return min < max ? min : max;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    payload, parsed_count = index_project._parse_file_batch(
+        (
+            [str(source)],
+            {},
+            ["-std=c11", "-fsyntax-only", "-Wno-everything"],
+            str(tmp_path),
+            "fixture/spaced-repository-path",
+        )
+    )
+
+    assert parsed_count == 1
+    assert [item["name"] for item in payload["functions"]] == ["randomInt"]
+
+
+@pytest.mark.parametrize(
+    "compile_args",
+    (
+        [
+            "-x",
+            "c",
+            "-std=iso9899:199x",
+            "-D",
+            "FEATURE_LEVEL=2",
+            "-U",
+            "LEGACY_FEATURE",
+            "-I",
+            "include",
+            "-isystem",
+            "sysinc",
+            "-iquote",
+            "quoted",
+            "-include",
+            "config.h",
+            "--target=x86_64-unknown-linux-gnu",
+            "-march=x86-64",
+        ],
+        [
+            "-xc++",
+            "--std=c++20",
+            "-DFEATURE_LEVEL=2",
+            "-ULEGACY_FEATURE",
+            "-m64",
+        ],
+        ["-x", "c", "-std=iso9899:199409"],
+        ["-x", "c", "-std=iso9899:201x"],
+        ["-x", "c++", "-std=c++2c"],
+        ["-x", "cl", "-std=cl3.0"],
+        ["-x", "cl", "-cl-std=CL3.0"],
+        [
+            "-xc++",
+            "-isystemsysinc",
+            "-iquotequoted",
+            "-includeconfig.h",
+            "--sysroot=/sdk",
+            "-isysroot=/sdk2",
+            "-resource-dir=/res",
+        ],
+    ),
+)
+def test_sane_compile_arg_matrix_is_accepted(
+    compile_args: list[str],
+) -> None:
+    from tools.clang_indexer import index_project
+
+    assert index_project._is_sane_compile_args(compile_args)
+
+
+@pytest.mark.parametrize(
+    "compile_args",
+    (
+        [],
+        ["-march=@<:@^"],
+        ["-DVGPV_<arch>_<os>_<variant>"],
+        ["-DVERSION=@VERSION@"],
+        ["-DSEPARATOR=@S|@"],
+        ["-std=cbanana"],
+        ["-std=iso9899:1990:123"],
+        ["-std=iso9899:2024"],
+        ["-std=gnu99."],
+        ["-std="],
+        ["-std"],
+        ["--std=gnu99."],
+        ["-D"],
+        ["-U"],
+        ["-x"],
+        ["-D", "-ULEGACY_FEATURE"],
+        ["-x", "not-a-clang-language"],
+        ["--target="],
+        ["--target=x86/64"],
+        ["-march="],
+        ["-march=bad]"],
+        ["-mcpu="],
+        ["-mcpu=bad]"],
+        ["-m32", "-m64"],
+        ["-x", "c++", "-std=iso9899:199x"],
+        ["-x", "c++", "-std=c++17", "-std=c++20"],
+        ["-x", "c++", "-std=c++20", "-std=c++17"],
+        ["-x", "c++", "-std=c++20", "-std=c11"],
+        ["-cl-std=CL3.0"],
+        ["-x", "c", "-cl-std=CL3.0"],
+        ["-x", "c++", "-cl-std=CL3.0"],
+    ),
+)
+def test_unusable_detected_compile_args_are_rejected_atomically(
+    compile_args: list[str],
+) -> None:
+    from tools.clang_indexer import index_project
+
+    assert not index_project._is_sane_compile_args(compile_args)
+
+
+def test_empty_detected_args_use_fallback_without_false_provenance(
+    tmp_path: Path,
+) -> None:
+    from tools.clang_indexer import index_project
+
+    default_args, default_build_info = (
+        index_project._resolve_default_compile_context(
+            str(tmp_path),
+            {
+                "build_system": "autoconf",
+                "source": "build_files",
+                "compiler": "gcc",
+                "standard": "c11",
+            },
+            [],
+        )
+    )
+
+    assert default_args[:2] == ["-fsyntax-only", "-Wno-everything"]
+    assert default_build_info == {
+        "build_system": "autoconf",
+        "source": "build_files",
+        "compile_args_status": "fallback_unusable_detected_args",
+    }
+
+
+def test_valgrind_autoconf_args_fall_back_atomically(tmp_path: Path) -> None:
+    from cppmega.data.build_context import detect_build_context
+    from tools.clang_indexer import index_project
+
+    _write_valgrind_style_configure(tmp_path)
+
+    platform_info, detected_args, compile_index = detect_build_context(
+        str(tmp_path)
+    )
+    assert compile_index is None
+    assert detected_args == _VALGRIND_AUTOCONF_ARGS
+    assert len(detected_args) == 30
+    assert platform_info["compiler"] == "g++"
+    assert platform_info["standard"] == "c++1y"
+
+    default_args, default_build_info = (
+        index_project._resolve_default_compile_context(
+            str(tmp_path),
+            platform_info,
+            detected_args,
+        )
+    )
+
+    assert default_args[:2] == ["-fsyntax-only", "-Wno-everything"]
+    assert not any(
+        arg.startswith(("-march=", "-std=", "-DVGP"))
+        or arg in {"-m32", "-m64"}
+        for arg in default_args
+    )
+    assert default_build_info == {
+        "build_system": "autoconf",
+        "source": "build_files",
+        "compile_args_status": "fallback_unusable_detected_args",
+    }
+    assert index_project.get_default_compile_args(str(tmp_path)) == default_args
+
+
+@pytest.mark.parametrize(
+    ("iso_alias", "canonical_standard"),
+    (
+        ("iso9899:199x", "c99"),
+        ("iso9899:201x", "c11"),
+    ),
+)
+def test_iso_c_alias_has_truthful_emitted_sidecars(
+    tmp_path: Path,
+    iso_alias: str,
+    canonical_standard: str,
+) -> None:
+    from cppmega.data.build_context import detect_build_context
+
+    index_project = _load_indexer()
+    _write_autoconf_flags(
+        tmp_path,
+        compiler_macro="AC_PROG_CC",
+        variable="CFLAGS",
+        flags=f"-std={iso_alias}",
+    )
+    source = tmp_path / "src" / "iso_alias.c"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "int iso_alias_sum(int first, int second, int third) {\n"
+        "    int first_pair = first + second;\n"
+        "    int bounded_third = third < 0 ? 0 : third;\n"
+        "    return first_pair + bounded_third;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    platform_info, detected_args, _compile_index = detect_build_context(
+        str(tmp_path)
+    )
+    assert platform_info["standard"] == canonical_standard
+
+    default_args, default_build_info = (
+        index_project._resolve_default_compile_context(
+            str(tmp_path),
+            platform_info,
+            detected_args,
+        )
+    )
+    assert default_args[:2] == ["-x", "c"]
+    assert f"-std={iso_alias}" in default_args
+    assert default_build_info["compiler"] == "gcc"
+    assert default_build_info["standard"] == canonical_standard
+    assert "compile_args_status" not in default_build_info
+
+    file_args = index_project._resolve_file_args(
+        str(source),
+        {},
+        default_args,
+    )
+    translation_unit = index_project._load_translation_unit(
+        str(source),
+        index_project.Index.create(),
+        file_args,
+    )
+    assert not [
+        diagnostic
+        for diagnostic in translation_unit.diagnostics
+        if int(diagnostic.severity) >= 3
+    ]
+
+    documents = index_project.process_project(
+        str(tmp_path),
+        enriched=True,
+        project_id="fixture/iso-c-sidecar",
+    )
+    code_document = next(
+        document
+        for document in documents
+        if document["doc_type"] == "code"
+        and document["filepath"] == "src/iso_alias.c"
+    )
+    assert code_document["build_info"]["compiler"] == "gcc"
+    assert code_document["build_info"]["standard"] == canonical_standard
+    assert code_document["language_info"]["primary_language"] == "c"
+    assert (
+        code_document["language_info"]["primary_standard"]
+        == canonical_standard
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "compiler_macro",
+        "variable",
+        "flags",
+        "case_label",
+        "suffix",
+        "expected_compiler",
+        "expected_language",
+        "expected_standard",
+    ),
+    (
+        (
+            "AC_PROG_CC",
+            "CFLAGS",
+            "-DNAME=1",
+            "c-flags",
+            ".c",
+            "gcc",
+            "c",
+            "c11",
+        ),
+        (
+            "AC_PROG_CC",
+            "CFLAGS",
+            None,
+            "plain-c",
+            ".c",
+            "gcc",
+            "c",
+            "c11",
+        ),
+        (
+            "AC_PROG_CXX",
+            "CXXFLAGS",
+            "-DNAME=1",
+            "cpp-flags",
+            ".cpp",
+            "g++",
+            "c++",
+            None,
+        ),
+    ),
+)
+def test_autoconf_compiler_without_standard_has_truthful_parser_sidecars(
+    tmp_path: Path,
+    compiler_macro: str,
+    variable: str,
+    flags: str | None,
+    case_label: str,
+    suffix: str,
+    expected_compiler: str,
+    expected_language: str,
+    expected_standard: str | None,
+) -> None:
+    from cppmega.data.build_context import detect_build_context
+
+    index_project = _load_indexer()
+    if flags is None:
+        (tmp_path / "configure.ac").write_text(
+            f"{compiler_macro}\n",
+            encoding="utf-8",
+        )
+    else:
+        _write_autoconf_flags(
+            tmp_path,
+            compiler_macro=compiler_macro,
+            variable=variable,
+            flags=flags,
+        )
+    source = tmp_path / "src" / f"configured_answer{suffix}"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "int configured_answer(int first, int second, int third) {\n"
+        "    int first_pair = first + second;\n"
+        "    int bounded_third = third < 0 ? 0 : third;\n"
+        "    return first_pair + bounded_third + 1;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    platform_info, detected_args, _compile_index = detect_build_context(
+        str(tmp_path)
+    )
+    assert "standard" not in platform_info
+    assert detected_args[:2] == ["-x", expected_language]
+
+    default_args, default_build_info = (
+        index_project._resolve_default_compile_context(
+            str(tmp_path),
+            platform_info,
+            detected_args,
+        )
+    )
+    assert default_build_info["compiler"] == expected_compiler
+    assert "standard" not in default_build_info
+    file_args = index_project._resolve_file_args(
+        str(source),
+        {},
+        default_args,
+    )
+    if expected_standard is None:
+        assert not any(arg.startswith("-std=") for arg in file_args)
+    else:
+        assert f"-std={expected_standard}" in file_args
+
+    documents = index_project.process_project(
+        str(tmp_path),
+        enriched=True,
+        project_id=f"fixture/autoconf-{case_label}-no-standard",
+    )
+    code_document = next(
+        document
+        for document in documents
+        if document["doc_type"] == "code"
+        and document["filepath"] == f"src/configured_answer{suffix}"
+    )
+    assert code_document["build_info"]["compiler"] == expected_compiler
+    if expected_standard is None:
+        assert "standard" not in code_document["build_info"]
+    else:
+        assert (
+            code_document["build_info"]["standard"]
+            == expected_standard
+        )
+    assert (
+        code_document["language_info"]["primary_language"]
+        == expected_language
+    )
+    assert (
+        code_document["language_info"]["primary_standard"]
+        == expected_standard
+    )
+
+
+def test_mixed_c_and_cpp_sidecars_match_each_files_adapted_parser_args(
+    tmp_path: Path,
+) -> None:
+    from cppmega.data.build_context import detect_build_context
+
+    index_project = _load_indexer()
+    _write_autoconf_flags(
+        tmp_path,
+        compiler_macro="AC_PROG_CXX",
+        variable="CXXFLAGS",
+        flags="-std=c++20",
+    )
+    c_source = tmp_path / "src" / "mixed.c"
+    cpp_source = tmp_path / "src" / "mixed.cpp"
+    c_source.parent.mkdir(parents=True)
+    c_source.write_text(
+        "int mixed_c_answer(int first, int second, int third) {\n"
+        "    int first_pair = first + second;\n"
+        "    int bounded_third = third < 0 ? 0 : third;\n"
+        "    return first_pair + bounded_third + 20;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    cpp_source.write_text(
+        "int mixed_cpp_answer(int first, int second, int third) {\n"
+        "    int first_pair = first + second;\n"
+        "    int bounded_third = third < 0 ? 0 : third;\n"
+        "    return first_pair + bounded_third + 21;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    platform_info, detected_args, _compile_index = detect_build_context(
+        str(tmp_path)
+    )
+    default_args, default_build_info = (
+        index_project._resolve_default_compile_context(
+            str(tmp_path),
+            platform_info,
+            detected_args,
+        )
+    )
+    assert default_build_info["standard"] == "c++20"
+
+    c_args = index_project._resolve_file_args(
+        str(c_source),
+        {},
+        default_args,
+    )
+    cpp_args = index_project._resolve_file_args(
+        str(cpp_source),
+        {},
+        default_args,
+    )
+    assert c_args[:3] == ["-x", "c", "-std=c11"]
+    assert not any(arg.startswith("-std=c++") for arg in c_args)
+    assert cpp_args[:2] == ["-x", "c++"]
+    assert "-std=c++20" in cpp_args
+
+    documents = index_project.process_project(
+        str(tmp_path),
+        enriched=True,
+        project_id="fixture/autoconf-mixed-dialects",
+    )
+    code_documents = {
+        document["filepath"]: document
+        for document in documents
+        if document["doc_type"] == "code"
+    }
+    c_document = code_documents["src/mixed.c"]
+    cpp_document = code_documents["src/mixed.cpp"]
+
+    assert c_document["build_info"]["standard"] == "c11"
+    assert c_document["language_info"]["primary_language"] == "c"
+    assert c_document["language_info"]["primary_standard"] == "c11"
+    assert (
+        c_document["language_info"]["provenance"]["standard_flag"]
+        == "-std=c11"
+    )
+
+    assert cpp_document["build_info"]["standard"] == "c++20"
+    assert cpp_document["language_info"]["primary_language"] == "c++"
+    assert cpp_document["language_info"]["primary_standard"] == "c++20"
+    assert (
+        cpp_document["language_info"]["provenance"]["standard_flag"]
+        == "-std=c++20"
+    )
+
+
+@pytest.mark.parametrize(
+    ("flags", "misleading_detected_standard"),
+    (
+        ("-std=c++17 -std=c++20", "c++17"),
+        ("-std=c++20 -std=c++17", "c++20"),
+        ("-std=c++20 -std=c11", "c++20"),
+    ),
+)
+def test_distinct_detected_standards_fall_back_without_false_sidecars(
+    tmp_path: Path,
+    flags: str,
+    misleading_detected_standard: str,
+) -> None:
+    from cppmega.data.build_context import detect_build_context
+    from tools.clang_indexer import index_project
+
+    _write_autoconf_flags(
+        tmp_path,
+        compiler_macro="AC_PROG_CXX",
+        variable="CXXFLAGS",
+        flags=flags,
+    )
+    platform_info, detected_args, _compile_index = detect_build_context(
+        str(tmp_path)
+    )
+    assert platform_info["standard"] == misleading_detected_standard
+
+    default_args, default_build_info = (
+        index_project._resolve_default_compile_context(
+            str(tmp_path),
+            platform_info,
+            detected_args,
+        )
+    )
+    assert default_args[:2] == ["-fsyntax-only", "-Wno-everything"]
+    assert not any(arg.startswith(("-std=", "--std=")) for arg in default_args)
+    assert default_build_info == {
+        "build_system": "autoconf",
+        "source": "build_files",
+        "compile_args_status": "fallback_unusable_detected_args",
+    }
+
+
+@pytest.mark.parametrize(
+    ("language", "standard", "suffix", "source_text", "expected_name"),
+    (
+        (
+            "c",
+            "-std=iso9899:199x",
+            ".c",
+            "int exact_iso_c_answer(void) { return 42; }\n",
+            "exact_iso_c_answer",
+        ),
+        (
+            "c",
+            "-std=iso9899:201x",
+            ".c",
+            "int exact_iso_c11_answer(void) { return 44; }\n",
+            "exact_iso_c11_answer",
+        ),
+        (
+            "c++",
+            "-std=c++20",
+            ".cpp",
+            "constexpr int exact_cpp_answer() { return 43; }\n",
+            "exact_cpp_answer",
+        ),
+    ),
+)
+def test_valid_standard_context_loads_cleanly_and_extracts(
+    tmp_path: Path,
+    language: str,
+    standard: str,
+    suffix: str,
+    source_text: str,
+    expected_name: str,
+) -> None:
+    index_project = _load_indexer()
+    source = tmp_path / f"standard_probe{suffix}"
+    source.write_text(source_text, encoding="utf-8")
+    compile_args = [
+        "-x",
+        language,
+        standard,
+        "-fsyntax-only",
+        "-Wno-everything",
+    ]
+
+    assert index_project._is_sane_compile_args(compile_args)
+    translation_unit = index_project._load_translation_unit(
+        str(source),
+        index_project.Index.create(),
+        compile_args,
+    )
+    assert not [
+        diagnostic
+        for diagnostic in translation_unit.diagnostics
+        if int(diagnostic.severity) >= 3
+    ]
+    payload, parsed_count = index_project._parse_file_batch(
+        (
+            [str(source)],
+            {},
+            compile_args,
+            str(tmp_path),
+            "fixture/valid-standard-load",
+        )
+    )
+    assert parsed_count == 1
+    assert expected_name in {
+        function["name"] for function in payload["functions"]
+    }
+
+
+def test_valgrind_style_header_loads_with_sane_fallback_args(
+    tmp_path: Path,
+) -> None:
+    index_project = _load_indexer()
+    _write_valgrind_style_configure(tmp_path)
+    dependency = tmp_path / "VEX" / "pub" / "libvex_basictypes.h"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text(
+        "typedef unsigned long UWord;\n",
+        encoding="utf-8",
+    )
+    header = tmp_path / "drd" / "drd_clientobj.h"
+    header.parent.mkdir(parents=True)
+    header.write_text(
+        '#include "libvex_basictypes.h"\n'
+        "typedef struct {\n"
+        "    UWord start;\n"
+        "    UWord end;\n"
+        "} DrdClientObject;\n"
+        "static inline UWord drd_client_object_span(\n"
+        "    const DrdClientObject *object) {\n"
+        "    return object->end - object->start;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    default_args = index_project.get_default_compile_args(str(tmp_path))
+    header_args = index_project._adapt_args_for_file(
+        default_args,
+        str(header),
+    )
+
+    assert header_args[:2] == ["-x", "c++-header"]
+    assert not any(
+        arg.startswith(("-march=", "-std=", "-DVGP"))
+        or arg in {"-m32", "-m64"}
+        for arg in header_args
+    )
+    recovery_records: list[dict[str, object]] = []
+    translation_unit = index_project._load_translation_unit_with_include_recovery(
+        str(header),
+        index_project.Index.create(),
+        header_args,
+        str(tmp_path),
+        allow_include_recovery=True,
+        parse_recovery_records=recovery_records,
+    )
+    assert not [
+        diagnostic
+        for diagnostic in translation_unit.diagnostics
+        if int(diagnostic.severity) >= 3
+    ]
+    assert recovery_records[0]["status"] == "recovered"
+    assert recovery_records[0]["added_include_dir_examples"] == ["VEX/pub"]
+    payload, parsed_count = index_project._parse_file_batch(
+        (
+            [str(header)],
+            {},
+            default_args,
+            str(tmp_path),
+            "fixture/valgrind-header-load",
+        )
+    )
+    assert parsed_count == 1
+    assert "DrdClientObject" in {
+        type_definition["name"]
+        for type_definition in payload["typedefs"]
+    }
+    assert "drd_client_object_span" in {
+        function["name"] for function in payload["functions"]
+    }
+
+
+def test_valgrind_fallback_status_is_emitted_in_source_sidecars(
+    tmp_path: Path,
+) -> None:
+    index_project = _load_indexer()
+    _write_valgrind_style_configure(tmp_path)
+    source = tmp_path / "drd" / "client_registry.cpp"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "int register_client_object(int start, int end, int generation) {\n"
+        "    int bounded_start = start < 0 ? 0 : start;\n"
+        "    int bounded_end = end < bounded_start ? bounded_start : end;\n"
+        "    return bounded_end - bounded_start + generation;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    documents = index_project.process_project(
+        str(tmp_path),
+        enriched=True,
+        project_id="fixture/valgrind-fallback-sidecar",
+    )
+
+    code_document = next(
+        document
+        for document in documents
+        if document["doc_type"] == "code"
+        and document["filepath"] == "drd/client_registry.cpp"
+    )
+    assert code_document["build_info"] == {
+        "build_system": "autoconf",
+        "source": "build_files",
+        "compile_args_status": "fallback_unusable_detected_args",
     }
 
 
