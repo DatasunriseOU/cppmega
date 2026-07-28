@@ -3197,6 +3197,12 @@ def failed_code_unit_was_index_memory(
     return True
 
 
+def code_index_retry_policy(dedup_near: bool) -> tuple[int, bool]:
+    """Reduce parser concurrency without weakening the configured dedup policy."""
+
+    return 1, bool(dedup_near)
+
+
 def run_code_half_adaptive(
     repo: str,
     project_id: str,
@@ -3256,12 +3262,14 @@ def run_code_half_adaptive(
         _raise_if_revision_subprocess_failure(exc)
         if parse_workers <= 1 or not is_retryable_index_project_failure(exc):
             raise
+        retry_parse_workers, retry_dedup_near = code_index_retry_policy(dedup_near)
         _log(
             f"RETRY {code_key(repo)}: {exc.stage} retryable failure with "
-            f"parse_workers={parse_workers}; retrying parse_workers=1 with "
-            "global exact/chunk dedup and near-dedup disabled"
+            f"parse_workers={parse_workers}; retrying "
+            f"parse_workers={retry_parse_workers} with the configured "
+            "global exact/chunk and near-dedup policy preserved"
         )
-        return invoke(1, False)
+        return invoke(retry_parse_workers, retry_dedup_near)
 
 
 RangeRunner = Callable[
@@ -4213,13 +4221,15 @@ def process_one_repo(
                                 parse_workers=parse_workers,
                             )
                         ):
-                            code_parse_workers = 1
+                            code_parse_workers, code_dedup_near = (
+                                code_index_retry_policy(dedup_near)
+                            )
                             code_dedup_db = dedup_db
-                            code_dedup_near = False
                             _log(
                                 f"RETRY {ck}: prior manifest failure was "
-                                "retryable index_project failure; starting parse_workers=1 "
-                                "with global exact/chunk dedup and near-dedup disabled"
+                                "retryable index_project failure; starting "
+                                f"parse_workers={code_parse_workers} with the configured "
+                                "global exact/chunk and near-dedup policy preserved"
                             )
                         with manifest_lock:
                             manifest.mark_started(ck)
