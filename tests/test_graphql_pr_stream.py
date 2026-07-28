@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import sys
 import threading
@@ -193,6 +194,213 @@ def test_graphql_rate_limited_error_rotates_to_another_token():
 
     assert result == {"data": {"repository": {}}}
     assert used_tokens == ["first", "second"]
+
+
+@pytest.mark.parametrize(
+    ("first_result", "expected_sleep"),
+    [
+        pytest.param(
+            http.client.IncompleteRead(b'{"data":', 10),
+            1.0,
+            id="incomplete-read",
+        ),
+        pytest.param(
+            (
+                503,
+                {
+                    "Retry-After": "120",
+                    "X-RateLimit-Remaining": "10",
+                },
+                {"message": "Service Unavailable"},
+            ),
+            30.0,
+            id="http-503",
+        ),
+        pytest.param(
+            (
+                502,
+                {"X-RateLimit-Remaining": "10"},
+                {
+                    "errors": [
+                        {
+                            "type": "GRAPHQL_VALIDATION_FAILED",
+                            "message": "upstream proxy body is not authoritative",
+                        }
+                    ]
+                },
+            ),
+            1.0,
+            id="http-502-with-errors",
+        ),
+        pytest.param(
+            (
+                504,
+                {
+                    "Retry-After": "0",
+                    "X-RateLimit-Remaining": "0",
+                },
+                {"message": "Gateway Timeout"},
+            ),
+            1.0,
+            id="http-504-with-zero-remaining",
+        ),
+    ],
+)
+def test_transient_failure_retries_same_token_and_exact_cursor(
+    first_result,
+    expected_sleep,
+):
+    from graphql_pr_stream import SharedTokenPool, _post_with_rotation
+
+    variables = {
+        "owner": "a",
+        "name": "one",
+        "cursor": "opaque-resume-cursor",
+    }
+    calls: list[tuple[str, dict]] = []
+    sleeps: list[float] = []
+
+    def post(token: str, requested: dict) -> tuple[int, dict, dict]:
+        calls.append((token, dict(requested)))
+        if len(calls) == 1:
+            if isinstance(first_result, BaseException):
+                raise first_result
+            return first_result
+        return (
+            200,
+            {"X-RateLimit-Remaining": "10"},
+            {"data": {"repository": {}}},
+        )
+
+    pool = SharedTokenPool(["first", "second"])
+    result = _post_with_rotation(
+        pool,
+        variables,
+        "a",
+        "one",
+        max_retries=2,
+        post_fn=post,
+        sleep_fn=sleeps.append,
+    )
+
+    assert result == {"data": {"repository": {}}}
+    assert calls == [("first", variables), ("first", variables)]
+    assert sleeps == [expected_sleep]
+    assert pool.acquire() == (1, "second")
+
+
+def test_transient_retry_budget_is_bounded_and_fails_loud():
+    from graphql_pr_stream import SharedTokenPool, _post_with_rotation
+
+    used_tokens: list[str] = []
+    sleeps: list[float] = []
+
+    def post(token: str, _variables: dict) -> tuple[int, dict, dict]:
+        used_tokens.append(token)
+        raise http.client.IncompleteRead(b"", 1)
+
+    with pytest.raises(SystemExit, match="transient retry budget exhausted"):
+        _post_with_rotation(
+            SharedTokenPool(["first", "second"]),
+            {"owner": "a", "name": "one", "cursor": "resume-here"},
+            "a",
+            "one",
+            max_retries=2,
+            post_fn=post,
+            sleep_fn=sleeps.append,
+        )
+
+    assert used_tokens == ["first", "first", "first"]
+    assert sleeps == [1.0, 2.0]
+
+
+@pytest.mark.parametrize(
+    ("failure", "exc_type", "match"),
+    [
+        pytest.param(
+            ValueError("malformed GraphQL JSON"),
+            ValueError,
+            "malformed GraphQL JSON",
+            id="malformed-json",
+        ),
+        pytest.param(
+            (
+                200,
+                {"X-RateLimit-Remaining": "10"},
+                {
+                    "errors": [
+                        {
+                            "type": "GRAPHQL_VALIDATION_FAILED",
+                            "message": "Cannot query field",
+                        }
+                    ]
+                },
+            ),
+            SystemExit,
+            "GraphQL errors",
+            id="graphql-contract",
+        ),
+    ],
+)
+def test_non_transient_failure_remains_fail_loud_without_retry(
+    failure,
+    exc_type,
+    match,
+):
+    from graphql_pr_stream import SharedTokenPool, _post_with_rotation
+
+    calls = 0
+    sleeps: list[float] = []
+
+    def post(_token: str, _variables: dict) -> tuple[int, dict, dict]:
+        nonlocal calls
+        calls += 1
+        if isinstance(failure, BaseException):
+            raise failure
+        return failure
+
+    with pytest.raises(exc_type, match=match):
+        _post_with_rotation(
+            SharedTokenPool(["first", "second"]),
+            {"owner": "a", "name": "one", "cursor": None},
+            "a",
+            "one",
+            max_retries=2,
+            post_fn=post,
+            sleep_fn=sleeps.append,
+        )
+
+    assert calls == 1
+    assert sleeps == []
+
+
+def test_auth_failures_remain_fail_loud_without_transient_backoff():
+    from graphql_pr_stream import SharedTokenPool, _post_with_rotation
+
+    used_tokens: list[str] = []
+    sleeps: list[float] = []
+
+    def post(token: str, _variables: dict) -> tuple[int, dict, dict]:
+        used_tokens.append(token)
+        return (
+            401,
+            {"X-RateLimit-Remaining": "10"},
+            {"message": "Bad credentials"},
+        )
+
+    with pytest.raises(SystemExit, match="all tokens unauthorized"):
+        _post_with_rotation(
+            SharedTokenPool(["first", "second"]),
+            {"owner": "a", "name": "one", "cursor": None},
+            "a",
+            "one",
+            max_retries=2,
+            post_fn=post,
+            sleep_fn=sleeps.append,
+        )
+
+    assert used_tokens == ["first", "second"]
+    assert sleeps == []
 
 
 def test_explicit_rate_limit_wait_retries_only_all_token_cooling():
