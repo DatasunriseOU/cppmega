@@ -269,7 +269,7 @@ class PRDiscussionLookup:
             if not os.path.exists(repo_list_path):
                 raise FileNotFoundError(
                     f"--repo-list does not exist: {repo_list_path}")
-            with open(repo_list_path, "r") as fh:
+            with open(repo_list_path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
             if not isinstance(data, dict):
                 raise ValueError(
