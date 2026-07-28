@@ -36,10 +36,10 @@ from pathlib import Path
 import re
 import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 from typing import Any, BinaryIO, Iterable, Mapping, Sequence
-import zlib
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -116,12 +116,39 @@ from scripts.ci_source_binding_projection import (  # noqa: E402
 )
 from scripts.ci_log_sidecars import SIDECAR_SCHEMA as PARSER_SIDECAR_SCHEMA  # noqa: E402
 from scripts.ci_stream_fetch import (  # noqa: E402
+    COMPLETION_MODE_INVENTORY_EXHAUSTIVE,
+    COMPLETION_MODE_THRESHOLD,
+    EXHAUSTIVE_RECEIPT_SCHEMA,
     SCHEMA_VERSION as FETCH_STATE_SCHEMA,
     _STATE_SCHEMA as FETCH_STATE_SQL_SCHEMA,
     _job_for_member,
     _validate_run_metadata_identity,
     ExactTokenizer,
     MalformedResponseError,
+)
+from scripts.ci_zlib_evidence import (  # noqa: E402
+    MAX_CONTENT_FRAME_BYTES,
+    MAX_CONTENT_FRAME_COMPRESSED_BYTES,
+    MAX_JOBS_EVIDENCE_BYTES,
+    MAX_JOBS_EVIDENCE_COMPRESSED_BYTES,
+    MAX_RUN_METADATA_BYTES,
+    MAX_RUN_METADATA_COMPRESSED_BYTES,
+    MAX_STATE_JSON_EVIDENCE_BYTES,
+    MAX_STATE_JSON_EVIDENCE_COMPRESSED_BYTES,
+    ZlibEvidenceError,
+    constrain_sqlite_evidence_rows,
+    content_store_evidence_bound_violation,
+    fetch_state_evidence_bound_violation,
+    strict_bounded_zlib_decode,
+)
+from scripts.ci_stream_inventory import (  # noqa: E402
+    CompletionError as InventoryCompletionError,
+    verify_inventory_completion_receipt,
+)
+from scripts.ci_stream_receipts import (  # noqa: E402
+    ReceiptFinalizationError,
+    convergent_transition_layout,
+    exhaustive_coverage_proof,
 )
 from scripts.nanochat_data.pack_enriched_rows import (  # noqa: E402
     NormalizedDoc,
@@ -132,6 +159,8 @@ from scripts.nanochat_data.pack_enriched_rows import (  # noqa: E402
 
 
 EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v2"
+PRODUCTION_EXPORT_SCHEMA = "cppmega_ci_content_store_case5_export_v3"
+PRODUCTION_MERGE_RECEIPT_SCHEMA = "cppmega_ci_stream_shard_union_receipt_v3"
 REPRESENTATIVE_LEDGER_SCHEMA = "cppmega_ci_token_sequence_representative_ledger_v1"
 REPRESENTATIVE_METADATA_SCHEMA = "cppmega_ci_case5_representative_metadata_v2"
 DERIVED_CLASSIFICATION_SCHEMA = "cppmega_ci_case5_derived_classifications_v1"
@@ -218,6 +247,47 @@ _EDGE_COLUMN_BY_FAMILY = {
 
 class ExportError(RuntimeError):
     """The frozen input or generated CASE5 output violated its contract."""
+
+
+def _constrain_evidence_connection(
+    connection: sqlite3.Connection,
+    *,
+    where: str,
+) -> None:
+    try:
+        constrain_sqlite_evidence_rows(connection)
+    except ZlibEvidenceError as exc:
+        raise ExportError(
+            f"{where} SQLite evidence row limit could not be constrained"
+        ) from exc
+
+
+def _require_bounded_fetch_state_evidence(
+    connection: sqlite3.Connection,
+) -> None:
+    violation = fetch_state_evidence_bound_violation(connection)
+    if violation is None:
+        return
+    record_type, repo, run_id, attempt, field = violation
+    raise ExportError(
+        "fetch-state evidence is not exact and bounded by its versioned "
+        "SQLite byte contract: "
+        f"{record_type} {repo}#{run_id}/{attempt} {field}"
+    )
+
+
+def _require_bounded_content_store_evidence(
+    connection: sqlite3.Connection,
+) -> None:
+    violation = content_store_evidence_bound_violation(connection)
+    if violation is None:
+        return
+    repo, run_attempt, job, step, chunk_ordinal = violation
+    raise ExportError(
+        "content-store provenance is not exact and bounded by its versioned "
+        "SQLite byte contract: "
+        f"{repo}/{run_attempt}/{job}/{step}/{chunk_ordinal}"
+    )
 
 
 @dataclass(frozen=True)
@@ -451,17 +521,37 @@ def _sequence_digest(values: Sequence[object]) -> str:
     return digest.hexdigest()
 
 
-def _load_receipt(path: Path) -> tuple[dict[str, Any], str]:
+def _load_json_object(
+    path: Path,
+    *,
+    where: str,
+) -> tuple[dict[str, Any], str]:
     path = path.expanduser()
     if path.is_symlink() or not path.is_file():
-        raise ExportError(f"store receipt is missing or unsafe: {path}")
+        raise ExportError(f"{where} is missing or unsafe: {path}")
     raw = path.read_bytes()
+
+    def reject_duplicates(
+        pairs: Sequence[tuple[str, Any]],
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ExportError(f"{where} contains duplicate key {key!r}")
+            result[key] = value
+        return result
+
     try:
-        value = json.loads(raw)
+        value = json.loads(raw, object_pairs_hook=reject_duplicates)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ExportError(f"store receipt is invalid JSON: {path}: {exc}") from exc
+        raise ExportError(f"{where} is invalid JSON: {path}: {exc}") from exc
     if not isinstance(value, dict):
-        raise ExportError("store receipt must contain one JSON object")
+        raise ExportError(f"{where} must contain one JSON object")
+    return value, _sha256_bytes(raw)
+
+
+def _load_receipt(path: Path) -> tuple[dict[str, Any], str]:
+    value, digest = _load_json_object(path, where="store receipt")
     if value.get("schema") != STORE_RECEIPT_SCHEMA:
         raise ExportError(f"store receipt schema must be {STORE_RECEIPT_SCHEMA!r}")
     if value.get("store_schema") != STORE_SCHEMA or value.get("status") != "complete":
@@ -471,31 +561,259 @@ def _load_receipt(path: Path) -> tuple[dict[str, Any], str]:
     )
     if verification.get("mode") != "full" or verification.get("ok") is not True:
         raise ExportError("store receipt does not bind a successful full verification")
-    return value, _sha256_bytes(raw)
+    return value, digest
+
+
+def _verify_exhaustive_export_provenance(
+    *,
+    store_root: Path,
+    store_receipt_path: Path,
+    fetch_state_path: Path,
+    inventory_path: Path,
+    inventory_receipt_path: Path,
+    fetch_receipt_path: Path,
+    merge_receipt_path: Path,
+) -> dict[str, object]:
+    """Fail closed unless all production acquisition/merge proofs recompute."""
+
+    try:
+        inventory_receipt, inventory_receipt_sha256 = (
+            verify_inventory_completion_receipt(
+                inventory_path,
+                inventory_receipt_path,
+                require_production=True,
+                expected_original_database_path=inventory_path,
+            )
+        )
+    except InventoryCompletionError as exc:
+        raise ExportError(
+            f"production inventory provenance refused: {exc}"
+        ) from exc
+    fetch_receipt, fetch_receipt_sha256 = _load_json_object(
+        fetch_receipt_path,
+        where="fetch receipt",
+    )
+    merge_receipt, merge_receipt_sha256 = _load_json_object(
+        merge_receipt_path,
+        where="merge receipt",
+    )
+    store_receipt, store_receipt_sha256 = _load_receipt(
+        store_receipt_path
+    )
+    if (
+        fetch_receipt.get("schema") != EXHAUSTIVE_RECEIPT_SCHEMA
+        or fetch_receipt.get("completion_mode")
+        != COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+        or fetch_receipt.get("production_complete") is not True
+        or fetch_receipt.get("coverage_semantics")
+        != "exact-production-inventory-attempt-equality"
+    ):
+        raise ExportError(
+            "production export requires an inventory-exhaustive fetch "
+            "receipt v4; threshold-only v3 is non-production"
+        )
+    if fetch_receipt.get("content_store_receipt") != store_receipt:
+        raise ExportError(
+            "fetch receipt does not bind the supplied content-store receipt"
+        )
+    frozen_state = _require_mapping(
+        fetch_receipt.get("frozen_fetch_state"),
+        where="fetch receipt frozen_fetch_state",
+    )
+    state_artifact = _require_mapping(
+        frozen_state.get("artifact"),
+        where="fetch receipt frozen_fetch_state.artifact",
+    )
+    if (
+        state_artifact.get("path") != str(fetch_state_path)
+        or state_artifact.get("byte_size") != fetch_state_path.stat().st_size
+        or state_artifact.get("sha256") != _sha256_file(fetch_state_path)
+    ):
+        raise ExportError(
+            "frozen fetch-state bytes/path differ from the v4 receipt"
+        )
+    inventory_binding = _require_mapping(
+        fetch_receipt.get("inventory_binding"),
+        where="fetch receipt inventory_binding",
+    )
+    bound_database = _require_mapping(
+        inventory_binding.get("database"),
+        where="fetch receipt inventory_binding.database",
+    )
+    bound_inventory_receipt = _require_mapping(
+        inventory_binding.get("completion_receipt"),
+        where="fetch receipt inventory_binding.completion_receipt",
+    )
+    inventory_artifact = _require_mapping(
+        inventory_receipt.get("database_artifact"),
+        where="inventory receipt database_artifact",
+    )
+    if (
+        bound_database.get("path") != str(inventory_path)
+        or bound_database.get("sha256")
+        != inventory_artifact.get("sha256")
+        or bound_database.get("db_logical_sha256")
+        != inventory_receipt.get("db_logical_sha256")
+        or bound_inventory_receipt.get("path")
+        != str(inventory_receipt_path)
+        or bound_inventory_receipt.get("sha256")
+        != inventory_receipt_sha256
+    ):
+        raise ExportError(
+            "fetch receipt inventory binding differs from the supplied "
+            "production inventory/receipt"
+        )
+    inventory_connection = sqlite3.connect(
+        f"{inventory_path.as_uri()}?mode=ro&immutable=1",
+        uri=True,
+    )
+    state_connection = sqlite3.connect(
+        f"{fetch_state_path.as_uri()}?mode=ro&immutable=1",
+        uri=True,
+    )
+    inventory_connection.row_factory = sqlite3.Row
+    state_connection.row_factory = sqlite3.Row
+    try:
+        try:
+            proof = exhaustive_coverage_proof(
+                inventory_connection,
+                state_connection,
+                inventory_receipt=inventory_receipt,
+                require_discovery_eof=False,
+            )
+        except ReceiptFinalizationError as exc:
+            raise ExportError(
+                f"fetch-state exhaustive equality proof failed: {exc}"
+            ) from exc
+    finally:
+        state_connection.close()
+        inventory_connection.close()
+    if fetch_receipt.get("exhaustive_coverage") != proof:
+        raise ExportError(
+            "fetch receipt exhaustive proof differs from inventory/state"
+        )
+
+    if (
+        merge_receipt.get("schema")
+        != PRODUCTION_MERGE_RECEIPT_SCHEMA
+        or merge_receipt.get("status") != "complete"
+        or merge_receipt.get("completion_mode")
+        != COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+        or merge_receipt.get("production_complete") is not True
+    ):
+        raise ExportError(
+            "production export requires a production merge receipt v3"
+        )
+    verification = _require_mapping(
+        merge_receipt.get("verification"),
+        where="merge receipt verification",
+    )
+    if (
+        verification.get("exact_production_inventory_attempt_equality")
+        is not True
+        or verification.get("full_cas_fetch_join") is not True
+        or verification.get("destination_frozen") is not True
+    ):
+        raise ExportError(
+            "merge receipt lacks exact inventory/CAS/frozen verification"
+        )
+    destination = Path(
+        _require_nonempty_string(
+            merge_receipt.get("destination"),
+            where="merge receipt destination",
+        )
+    ).expanduser().resolve()
+    if (
+        inventory_path.parent != destination
+        or fetch_state_path.parent != destination
+        or store_root.parent != destination
+        or store_receipt_path.parent != destination
+        or fetch_receipt_path.parent != destination
+        or merge_receipt_path.parent != destination
+    ):
+        raise ExportError(
+            "production inputs are not the single receipt-bound merge bundle"
+        )
+    raw_artifacts = merge_receipt.get("artifacts")
+    if not isinstance(raw_artifacts, list):
+        raise ExportError("merge receipt artifacts must be a list")
+    artifacts: dict[str, Mapping[str, Any]] = {}
+    for raw_item in raw_artifacts:
+        item = _require_mapping(raw_item, where="merge receipt artifact")
+        relative = item.get("path")
+        if not isinstance(relative, str) or relative in artifacts:
+            raise ExportError(
+                "merge receipt has an invalid/duplicate artifact path"
+            )
+        artifacts[relative] = item
+    required_artifacts = {
+        "inventory.sqlite3": inventory_path,
+        "inventory_receipt.json": inventory_receipt_path,
+        "fetch_state.sqlite3": fetch_state_path,
+        "store_receipt.json": store_receipt_path,
+        "fetch_receipt.json": fetch_receipt_path,
+    }
+    for relative, actual_path in required_artifacts.items():
+        artifact = artifacts.get(relative)
+        if (
+            artifact is None
+            or artifact.get("byte_size") != actual_path.stat().st_size
+            or artifact.get("sha256") != _sha256_file(actual_path)
+        ):
+            raise ExportError(
+                f"merge receipt artifact binding differs for {relative}"
+            )
+    return {
+        "completion_mode": COMPLETION_MODE_INVENTORY_EXHAUSTIVE,
+        "production_complete": True,
+        "inventory": {
+            "path": str(inventory_path),
+            "sha256": inventory_artifact["sha256"],
+            "logical_sha256": inventory_receipt["db_logical_sha256"],
+            "receipt_path": str(inventory_receipt_path),
+            "receipt_sha256": inventory_receipt_sha256,
+        },
+        "fetch": {
+            "state_path": str(fetch_state_path),
+            "state_sha256": state_artifact["sha256"],
+            "receipt_path": str(fetch_receipt_path),
+            "receipt_sha256": fetch_receipt_sha256,
+            "attempt_set_sha256": proof["attempt_set_sha256"],
+            "terminal_proof_sha256": proof["terminal_proof_sha256"],
+        },
+        "store": {
+            "path": str(store_root),
+            "receipt_path": str(store_receipt_path),
+            "receipt_sha256": store_receipt_sha256,
+        },
+        "merge": {
+            "receipt_path": str(merge_receipt_path),
+            "receipt_sha256": merge_receipt_sha256,
+            "schema": PRODUCTION_MERGE_RECEIPT_SCHEMA,
+        },
+    }
 
 
 def _strict_zlib_decompress(
     compressed: bytes,
     *,
     expected_size: int,
+    expected_sha256: str,
+    max_raw_size: int,
+    max_compressed_size: int,
     where: str,
 ) -> bytes:
-    if expected_size < 0:
-        raise ExportError(f"{where} expected size must be non-negative")
-    decompressor = zlib.decompressobj()
     try:
-        raw = decompressor.decompress(compressed, expected_size + 1)
-        raw += decompressor.flush()
-    except zlib.error as exc:
-        raise ExportError(f"{where} zlib payload is invalid") from exc
-    if (
-        len(raw) != expected_size
-        or not decompressor.eof
-        or decompressor.unused_data
-        or decompressor.unconsumed_tail
-    ):
-        raise ExportError(f"{where} zlib stream is not exact")
-    return raw
+        return strict_bounded_zlib_decode(
+            compressed,
+            expected_raw_size=expected_size,
+            expected_sha256=expected_sha256,
+            max_raw_size=max_raw_size,
+            max_compressed_size=max_compressed_size,
+            where=where,
+        )
+    except ZlibEvidenceError as exc:
+        raise ExportError(f"{where} zlib stream is not exact and bounded") from exc
 
 
 def _decode_canonical_zlib_value(
@@ -504,14 +822,17 @@ def _decode_canonical_zlib_value(
     expected_size: int,
     expected_sha256: str,
     where: str,
+    max_raw_size: int = MAX_STATE_JSON_EVIDENCE_BYTES,
+    max_compressed_size: int = MAX_STATE_JSON_EVIDENCE_COMPRESSED_BYTES,
 ) -> tuple[object, bytes]:
     raw = _strict_zlib_decompress(
         compressed,
         expected_size=expected_size,
+        expected_sha256=expected_sha256,
+        max_raw_size=max_raw_size,
+        max_compressed_size=max_compressed_size,
         where=where,
     )
-    if _sha256_bytes(raw) != expected_sha256:
-        raise ExportError(f"{where} SHA-256 is inconsistent")
     try:
         value = json.loads(raw.decode("utf-8", errors="strict"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -527,12 +848,16 @@ def _decode_canonical_zlib_mapping(
     expected_size: int,
     expected_sha256: str,
     where: str,
+    max_raw_size: int = MAX_STATE_JSON_EVIDENCE_BYTES,
+    max_compressed_size: int = MAX_STATE_JSON_EVIDENCE_COMPRESSED_BYTES,
 ) -> tuple[Mapping[str, Any], bytes]:
     value, raw = _decode_canonical_zlib_value(
         compressed,
         expected_size=expected_size,
         expected_sha256=expected_sha256,
         where=where,
+        max_raw_size=max_raw_size,
+        max_compressed_size=max_compressed_size,
     )
     if not isinstance(value, Mapping):
         raise ExportError(f"{where} is not one canonical JSON object")
@@ -541,7 +866,7 @@ def _decode_canonical_zlib_mapping(
 
 def _decode_provenance(row: sqlite3.Row) -> tuple[dict[str, Any], bytes]:
     value, raw = _decode_canonical_zlib_mapping(
-        bytes(row["provenance_zlib"]),
+        row["provenance_zlib"],
         expected_size=int(row["provenance_raw_size"]),
         expected_sha256=str(row["provenance_sha256"]),
         where="occurrence provenance",
@@ -715,12 +1040,21 @@ def _sqlite_logical_digest(connection: sqlite3.Connection) -> str:
 
 
 def _require_frozen_sqlite(path: Path, *, label: str) -> None:
-    for suffix in ("-wal", "-shm", "-journal"):
+    if path.is_symlink() or not path.is_file():
+        raise ExportError(f"{label} SQLite is missing or unsafe: {path}")
+    for suffix in ("-wal", "-journal"):
         pending = Path(f"{path}{suffix}")
-        if pending.exists():
+        if pending.is_symlink() or (
+            pending.exists() and pending.stat().st_size != 0
+        ):
             raise ExportError(
                 f"{label} is not a frozen SQLite snapshot; found {pending.name}"
             )
+    shm = Path(f"{path}-shm")
+    if shm.is_symlink() or (shm.exists() and not shm.is_file()):
+        raise ExportError(
+            f"{label} has an unsafe SQLite sidecar: {shm.name}"
+        )
 
 
 def _open_immutable_sqlite(
@@ -733,6 +1067,14 @@ def _open_immutable_sqlite(
         f"{path.as_uri()}?mode=ro&immutable=1",
         uri=True,
     )
+    try:
+        _constrain_evidence_connection(
+            connection,
+            where=label,
+        )
+    except BaseException:
+        connection.close()
+        raise
     stat_after = path.stat()
     before_identity = (
         stat_before.st_size,
@@ -938,9 +1280,25 @@ class FrozenStore:
                 (pack_id,),
             )
             for content_row in content_rows:
-                if int(content_row["offset"]) != expected_offset:
+                raw_size = int(content_row["raw_size"])
+                compressed_size = int(content_row["compressed_size"])
+                frame_size = int(content_row["frame_size"])
+                if (
+                    raw_size < 0
+                    or raw_size > MAX_CONTENT_FRAME_BYTES
+                    or compressed_size < 0
+                    or compressed_size
+                    > MAX_CONTENT_FRAME_COMPRESSED_BYTES
+                ):
+                    raise ExportError(
+                        f"{filename} frame exceeds its semantic byte bounds"
+                    )
+                if (
+                    int(content_row["offset"]) != expected_offset
+                    or frame_size != _FRAME_HEADER.size + compressed_size
+                ):
                     raise ExportError(f"{filename} has a frame gap or overlap")
-                expected_offset += int(content_row["frame_size"])
+                expected_offset += frame_size
                 count += 1
             if expected_offset != committed_end or count != int(pack["content_count"]):
                 raise ExportError(f"{filename} frame accounting is inconsistent")
@@ -1061,6 +1419,7 @@ class FrozenStore:
             or self.receipt.get("sqlite_schema_sha256") != schema_sha
         ):
             raise ExportError("SQLite schema SHA-256 differs from the receipt")
+        _require_bounded_content_store_evidence(self.connection)
         expected_digests = {
             "logical_content_set_sha256": _content_set_digest(self.connection),
             "logical_token_sequence_set_sha256": _token_sequence_set_digest(
@@ -1201,6 +1560,13 @@ class FrozenStore:
         if len(header) != _FRAME_HEADER.size:
             raise ExportError("content frame header is truncated")
         magic, digest_bytes, raw_size, compressed_size = _FRAME_HEADER.unpack(header)
+        if (
+            raw_size > MAX_CONTENT_FRAME_BYTES
+            or compressed_size > MAX_CONTENT_FRAME_COMPRESSED_BYTES
+        ):
+            raise ExportError(
+                "content frame exceeds the versioned raw/compressed byte bound"
+            )
         compressed = os.pread(
             descriptor,
             compressed_size,
@@ -1216,12 +1582,14 @@ class FrozenStore:
             or bytes.fromhex(str(row["sha256"])) != digest_bytes
         ):
             raise ExportError("content frame metadata differs from SQLite")
-        try:
-            content = zlib.decompress(compressed)
-        except zlib.error as exc:
-            raise ExportError("content frame zlib payload is invalid") from exc
-        if len(content) != raw_size or _sha256_bytes(content) != str(row["sha256"]):
-            raise ExportError("content frame bytes fail SHA-256/size verification")
+        content = _strict_zlib_decompress(
+            compressed,
+            expected_size=raw_size,
+            expected_sha256=str(row["sha256"]),
+            max_raw_size=MAX_CONTENT_FRAME_BYTES,
+            max_compressed_size=MAX_CONTENT_FRAME_COMPRESSED_BYTES,
+            where="content frame",
+        )
         return content
 
     @staticmethod
@@ -1337,7 +1705,7 @@ def _decode_fetch_run_metadata(
     if not isinstance(compressed, (bytes, bytearray, memoryview)):
         raise ExportError(f"fetch-state attempt {key} run_metadata_zlib is not a BLOB")
     metadata, _ = _decode_canonical_zlib_mapping(
-        bytes(compressed),
+        compressed,
         expected_size=_require_int(
             row["run_metadata_raw_size"],
             where=f"fetch-state attempt {key} run_metadata_raw_size",
@@ -1348,6 +1716,8 @@ def _decode_fetch_run_metadata(
             where=f"fetch-state attempt {key} run_metadata_sha256",
         ),
         where=f"fetch-state attempt {key} metadata",
+        max_raw_size=MAX_RUN_METADATA_BYTES,
+        max_compressed_size=MAX_RUN_METADATA_COMPRESSED_BYTES,
     )
     if int(row["run_metadata_exact"]) != 1:
         raise ExportError(f"fetch-state attempt {key} run metadata is not marked exact")
@@ -1425,7 +1795,7 @@ def _decode_fetch_jobs(
     if not isinstance(compressed, (bytes, bytearray, memoryview)):
         raise ExportError(f"fetch-state attempt {key} jobs_zlib is not a BLOB")
     value, _ = _decode_canonical_zlib_value(
-        bytes(compressed),
+        compressed,
         expected_size=_require_int(
             row["jobs_raw_size"],
             where=f"fetch-state attempt {key} jobs_raw_size",
@@ -1436,6 +1806,8 @@ def _decode_fetch_jobs(
             where=f"fetch-state attempt {key} jobs_sha256",
         ),
         where=f"fetch-state attempt {key} jobs",
+        max_raw_size=MAX_JOBS_EVIDENCE_BYTES,
+        max_compressed_size=MAX_JOBS_EVIDENCE_COMPRESSED_BYTES,
     )
     if not isinstance(value, list):
         raise ExportError(f"fetch-state attempt {key} jobs must be a JSON list")
@@ -1469,6 +1841,7 @@ class FrozenFetchState:
         *,
         tokenizer: ExactTokenizer,
         store: FrozenStore,
+        bound_store_path: Path | None = None,
     ):
         candidate = path.expanduser()
         self.path = candidate.resolve()
@@ -1481,6 +1854,11 @@ class FrozenFetchState:
         )
         self.tokenizer = tokenizer
         self.store = store
+        self.bound_store_path = (
+            store.root
+            if bound_store_path is None
+            else bound_store_path.expanduser().resolve()
+        )
         self.settings: dict[str, str] = {}
         self.summary: dict[str, object] = {}
         self.sqlite_schema_sha256 = ""
@@ -1547,7 +1925,8 @@ class FrozenFetchState:
             raise ExportError("fetch-state foreign_key_check failed")
         self.sqlite_schema_sha256 = _sqlite_schema_sha256(self.connection)
         if self.sqlite_schema_sha256 != _expected_fetch_state_schema_sha256():
-            raise ExportError("fetch-state SQLite schema is not the frozen v3 schema")
+            raise ExportError("fetch-state SQLite schema is not the frozen v4 schema")
+        _require_bounded_fetch_state_evidence(self.connection)
         self.settings = {
             str(row["key"]): str(row["value"])
             for row in self.connection.execute(
@@ -1568,7 +1947,7 @@ class FrozenFetchState:
         }
         if set(self.settings) != expected_setting_keys:
             raise ExportError(
-                "fetch-state settings do not match the frozen v3 contract"
+                "fetch-state settings do not match the frozen v4 contract"
             )
         if self.settings["schema"] != FETCH_STATE_SCHEMA:
             raise ExportError("fetch-state schema setting is unsupported")
@@ -1581,7 +1960,10 @@ class FrozenFetchState:
             or self.settings["tokenizer_fingerprint"] != self.tokenizer.fingerprint
         ):
             raise ExportError("fetch-state tokenizer binding differs from the export")
-        if Path(self.settings["content_store_path"]).resolve() != self.store.root:
+        if (
+            Path(self.settings["content_store_path"]).resolve()
+            != self.bound_store_path
+        ):
             raise ExportError("fetch-state content-store path binding is inconsistent")
         if self.settings["content_store_script_sha256"] != self.store.receipt.get(
             "script_sha256"
@@ -1660,6 +2042,33 @@ class FrozenFetchState:
                 row,
                 key=key,
             )
+            if str(row["status"]) == "empty":
+                member_count = int(row["member_count"])
+                if (
+                    int(row["chunk_count"]) != 0
+                    or int(row["occurrence_tokens"]) != 0
+                    or member_count < 0
+                    or (member_count == 0) != (row["archive_zlib"] is not None)
+                ):
+                    raise ExportError(
+                        "fetch-state empty proof modes are inconsistent: "
+                        f"{key}"
+                    )
+                if member_count:
+                    nonempty_member = self.connection.execute(
+                        """
+                        SELECT archive_member FROM members
+                        WHERE repo=? AND run_id=? AND attempt=?
+                          AND (chunk_count!=0 OR occurrence_tokens!=0)
+                        LIMIT 1
+                        """,
+                        key,
+                    ).fetchone()
+                    if nonempty_member is not None:
+                        raise ExportError(
+                            "fetch-state parsed-empty member retains training "
+                            f"content: {key}"
+                        )
         totals = self.connection.execute(
             """
             SELECT COUNT(*) AS attempts,
@@ -1781,7 +2190,7 @@ class FrozenFetchState:
                 "fetch-state member job key differs from exact jobs evidence"
             )
         sidecar, _ = _decode_canonical_zlib_mapping(
-            bytes(row["sidecar_zlib"]),
+            row["sidecar_zlib"],
             expected_size=int(row["sidecar_raw_size"]),
             expected_sha256=str(row["sidecar_sha256"]),
             where=f"fetch-state member {key} sidecar",
@@ -2101,7 +2510,7 @@ class FrozenFetchState:
             raise ExportError("fetch-state snapshot changed while export was running")
 
     def parser_lineage(self) -> tuple[str, ...]:
-        """Return the exact linear parser generation chain bound by the state."""
+        """Return every unique generation in convergent transition evidence."""
 
         rows = self.connection.execute(
             """
@@ -2111,10 +2520,14 @@ class FrozenFetchState:
             ORDER BY id
             """
         ).fetchall()
-        current = self.settings["parser_script_sha256"]
+        current = _require_hex64(
+            self.settings["parser_script_sha256"],
+            where="current parser binding",
+        )
         if not rows:
             return (current,)
-        lineage = [str(rows[0]["from_sha256"])]
+        materialized: set[tuple[str, str]] = set()
+        first_seen: dict[str, int] = {}
         for row in rows:
             source = _require_hex64(
                 row["from_sha256"],
@@ -2124,16 +2537,35 @@ class FrozenFetchState:
                 row["to_sha256"],
                 where="parser binding upgrade to_sha256",
             )
-            if source != lineage[-1] or source == target:
+            edge = (source, target)
+            if source == target or edge in materialized:
                 raise ExportError(
-                    "fetch-state parser binding history is not one linear chain"
+                    "fetch-state parser binding history contains an invalid edge"
                 )
-            lineage.append(target)
-        if lineage[-1] != current or len(set(lineage)) != len(lineage):
-            raise ExportError(
-                "fetch-state parser binding history does not terminate at "
-                "the current parser"
+            materialized.add(edge)
+            first_seen.setdefault(source, len(first_seen))
+            first_seen.setdefault(target, len(first_seen))
+        try:
+            component_by_node, component_distance = (
+                convergent_transition_layout(
+                    materialized,
+                    current=current,
+                )
             )
+        except ValueError as exc:
+            raise ExportError(
+                "fetch-state parser binding history diverges or cannot return "
+                "to the current parser"
+            ) from exc
+        lineage = sorted(
+            (node for node in component_by_node if node != current),
+            key=lambda node: (
+                -component_distance[component_by_node[node]],
+                first_seen.get(node, len(first_seen)),
+                node,
+            ),
+        )
+        lineage.append(current)
         return tuple(lineage)
 
     def receipt_binding(self) -> dict[str, object]:
@@ -3069,18 +3501,33 @@ def _stable_doc_id(token_sequence_sha256: str, fragment_index: int) -> int:
 
 
 def _fsync_tree(root: Path) -> None:
-    directories: set[Path] = {root}
-    for path in root.rglob("*"):
-        if path.is_file():
+    for directory, directory_names, file_names in os.walk(
+        root,
+        topdown=False,
+        followlinks=False,
+    ):
+        current = Path(directory)
+        for name in file_names:
+            path = current / name
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ExportError(f"export tree contains a symlink: {path}")
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ExportError(
+                    f"export tree contains an unsupported artifact: {path}"
+                )
             with path.open("rb") as handle:
                 os.fsync(handle.fileno())
-            directories.add(path.parent)
-        elif path.is_dir():
-            directories.add(path)
-    for directory in sorted(
-        directories, key=lambda item: len(item.parts), reverse=True
-    ):
-        descriptor = os.open(directory, os.O_RDONLY)
+        for name in directory_names:
+            path = current / name
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ExportError(f"export tree contains a symlink: {path}")
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ExportError(
+                    f"export tree contains an unsupported artifact: {path}"
+                )
+        descriptor = os.open(current, os.O_RDONLY)
         try:
             os.fsync(descriptor)
         finally:
@@ -4204,16 +4651,96 @@ def export_store(
     output: str | os.PathLike[str],
     source_binding_projection_from_parser_sha256: str | None = None,
     required_eligible_exact_unique_payload_tokens: int | None = None,
+    completion_mode: str = COMPLETION_MODE_THRESHOLD,
+    inventory: str | os.PathLike[str] | None = None,
+    inventory_receipt: str | os.PathLike[str] | None = None,
+    fetch_receipt: str | os.PathLike[str] | None = None,
+    merge_receipt: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     """Export one receipt-frozen store and atomically publish a CASE5 directory."""
 
+    raw_store_root = Path(store_root).expanduser()
+    raw_store_receipt = Path(store_receipt).expanduser()
+    raw_fetch_state = Path(fetch_state).expanduser()
+    raw_tokenizer = Path(tokenizer_json).expanduser()
+    raw_output = Path(output).expanduser()
+    for path, label, require_directory in (
+        (raw_store_root, "content store", True),
+        (raw_store_receipt, "store receipt", False),
+        (raw_fetch_state, "fetch state", False),
+        (raw_tokenizer, "tokenizer", False),
+    ):
+        if path.is_symlink() or not (
+            path.is_dir() if require_directory else path.is_file()
+        ):
+            raise ExportError(f"{label} is missing or unsafe: {path}")
+    if raw_output.is_symlink():
+        raise ExportError(f"output cannot be a symlink: {raw_output}")
+    resolved_store_root = raw_store_root.resolve()
+    resolved_store_receipt = raw_store_receipt.resolve()
+    resolved_fetch_state = raw_fetch_state.resolve()
+    resolved_tokenizer = raw_tokenizer.resolve()
     exporter_script_sha256 = _script_sha256()
     source_binding_projection_script_sha256 = projection_script_sha256()
-    output_path = Path(output).expanduser().resolve()
+    tokenizer_snapshot = {
+        "byte_size": resolved_tokenizer.stat().st_size,
+        "sha256": _sha256_file(resolved_tokenizer),
+    }
+    output_path = raw_output.resolve()
+    if completion_mode not in {
+        COMPLETION_MODE_THRESHOLD,
+        COMPLETION_MODE_INVENTORY_EXHAUSTIVE,
+    }:
+        raise ExportError(
+            f"unsupported completion mode: {completion_mode!r}"
+        )
+    production_provenance: dict[str, object] | None = None
+    production_paths: tuple[Path, Path, Path, Path] | None = None
+    if completion_mode == COMPLETION_MODE_INVENTORY_EXHAUSTIVE:
+        if (
+            inventory is None
+            or inventory_receipt is None
+            or fetch_receipt is None
+            or merge_receipt is None
+        ):
+            raise ExportError(
+                "inventory-exhaustive export requires inventory, inventory "
+                "receipt, fetch receipt, and merge receipt"
+            )
+        raw_production_paths = (
+            Path(inventory).expanduser(),
+            Path(inventory_receipt).expanduser(),
+            Path(fetch_receipt).expanduser(),
+            Path(merge_receipt).expanduser(),
+        )
+        for path, label in zip(
+            raw_production_paths,
+            (
+                "inventory",
+                "inventory receipt",
+                "fetch receipt",
+                "merge receipt",
+            ),
+            strict=True,
+        ):
+            if path.is_symlink() or not path.is_file():
+                raise ExportError(f"{label} is missing or unsafe: {path}")
+        production_paths = tuple(
+            path.resolve() for path in raw_production_paths
+        )
+        production_provenance = _verify_exhaustive_export_provenance(
+            store_root=resolved_store_root,
+            store_receipt_path=resolved_store_receipt,
+            fetch_state_path=resolved_fetch_state,
+            inventory_path=production_paths[0],
+            inventory_receipt_path=production_paths[1],
+            fetch_receipt_path=production_paths[2],
+            merge_receipt_path=production_paths[3],
+        )
     if output_path.exists():
         raise ExportError(f"output already exists: {output_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tokenizer = ExactTokenizer(tokenizer_json)
+    tokenizer = ExactTokenizer(resolved_tokenizer)
     if tokenizer._tokenizer.vocab_size != EXPECTED_VOCAB_SIZE:
         raise ExportError("ExactTokenizer vocabulary differs from frozen CASE5")
 
@@ -4235,11 +4762,11 @@ def export_store(
     try:
         with (
             FrozenStore(
-                Path(store_root).expanduser(),
-                Path(store_receipt).expanduser(),
+                resolved_store_root,
+                resolved_store_receipt,
             ) as store,
             FrozenFetchState(
-                Path(fetch_state).expanduser(),
+                resolved_fetch_state,
                 tokenizer=tokenizer,
                 store=store,
             ) as frozen_fetch_state,
@@ -5183,7 +5710,12 @@ def export_store(
                 for item in store._initial_snapshot
             ]
             receipt = {
-                "schema": EXPORT_SCHEMA,
+                "schema": (
+                    PRODUCTION_EXPORT_SCHEMA
+                    if completion_mode
+                    == COMPLETION_MODE_INVENTORY_EXHAUSTIVE
+                    else EXPORT_SCHEMA
+                ),
                 "status": "complete",
                 "exporter_script_sha256": exporter_script_sha256,
                 "input_store": {
@@ -5511,6 +6043,10 @@ def export_store(
                     "post_normalize_pack_sidecars_and_edges_verified": True,
                 },
             }
+            if production_provenance is not None:
+                receipt["completion_mode"] = completion_mode
+                receipt["production_complete"] = True
+                receipt["acquisition_provenance"] = production_provenance
             receipt_path = temp_path / "export_receipt.json"
             _write_json(receipt_path, receipt)
             _fsync_tree(temp_path)
@@ -5532,6 +6068,28 @@ def export_store(
                 raise ExportError(
                     "target parser script changed while export was running"
                 )
+            if {
+                "byte_size": resolved_tokenizer.stat().st_size,
+                "sha256": _sha256_file(resolved_tokenizer),
+            } != tokenizer_snapshot:
+                raise ExportError(
+                    "tokenizer changed while export was running"
+                )
+            if production_provenance is not None:
+                assert production_paths is not None
+                final_provenance = _verify_exhaustive_export_provenance(
+                    store_root=resolved_store_root,
+                    store_receipt_path=resolved_store_receipt,
+                    fetch_state_path=resolved_fetch_state,
+                    inventory_path=production_paths[0],
+                    inventory_receipt_path=production_paths[1],
+                    fetch_receipt_path=production_paths[2],
+                    merge_receipt_path=production_paths[3],
+                )
+                if final_provenance != production_provenance:
+                    raise ExportError(
+                        "production control artifacts changed during export"
+                    )
             _publish_directory_no_replace(temp_path, output_path)
             parent_descriptor = os.open(output_path.parent, os.O_RDONLY)
             try:
@@ -5569,6 +6127,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--store", required=True, type=Path)
     parser.add_argument("--store-receipt", required=True, type=Path)
     parser.add_argument("--fetch-state", required=True, type=Path)
+    parser.add_argument(
+        "--completion-mode",
+        choices=(
+            COMPLETION_MODE_THRESHOLD,
+            COMPLETION_MODE_INVENTORY_EXHAUSTIVE,
+        ),
+        default=COMPLETION_MODE_THRESHOLD,
+    )
+    parser.add_argument("--inventory", type=Path)
+    parser.add_argument("--inventory-receipt", type=Path)
+    parser.add_argument("--fetch-receipt", type=Path)
+    parser.add_argument("--merge-receipt", type=Path)
     parser.add_argument("--tokenizer-json", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument(
@@ -5604,6 +6174,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             required_eligible_exact_unique_payload_tokens=(
                 args.required_eligible_exact_unique_payload_tokens
             ),
+            completion_mode=args.completion_mode,
+            inventory=args.inventory,
+            inventory_receipt=args.inventory_receipt,
+            fetch_receipt=args.fetch_receipt,
+            merge_receipt=args.merge_receipt,
         )
     except (
         ExportError,

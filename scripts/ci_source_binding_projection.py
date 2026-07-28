@@ -491,10 +491,10 @@ class SourceBindingProjectionRouter:
 
     A fetch-state parser upgrade changes the state binding for future writes; it
     does not rewrite already committed occurrence provenance.  The router
-    therefore verifies each action against every explicitly authorized parser
-    generation and prefers current semantics whenever the stored bindings are
-    compatible with them.  A legacy-only match is projected to the current
-    semantics without mutating the upstream CAS.
+    therefore preserves the full audited lineage while executing only semantics
+    implemented here: the current sink and, when explicitly authorized, the
+    exact legacy parser.  Unknown intermediate generations remain audit-only
+    lineage nodes and can never instantiate an implicit projector.
     """
 
     SELECTION_POLICY = "stored-binding-semantics-current-first-v1"
@@ -517,14 +517,16 @@ class SourceBindingProjectionRouter:
                 "parser_lineage must not contain a cycle or repeated generation"
             )
         target = target_parser_script_sha256()
-        if lineage not in {
-            (LEGACY_PARSER_SHA256,),
-            (target,),
-            (LEGACY_PARSER_SHA256, target),
-        }:
+        if authorized_legacy_sha256 is not None:
+            _require_hex64(
+                authorized_legacy_sha256,
+                where="authorized_legacy_sha256",
+            )
+        legacy_singleton = lineage == (LEGACY_PARSER_SHA256,)
+        if not legacy_singleton and lineage[-1] != target:
             raise SourceBindingProjectionError(
-                "parser_lineage is not a supported monotonic parser generation "
-                "chain"
+                "parser_lineage must terminate at the current parser; only "
+                "the exact authorized legacy singleton may have a legacy sink"
             )
         if (
             LEGACY_PARSER_SHA256 in lineage
@@ -537,16 +539,12 @@ class SourceBindingProjectionRouter:
             authorized_legacy_sha256 is not None
             and LEGACY_PARSER_SHA256 not in lineage
         ):
-            _require_hex64(
-                authorized_legacy_sha256,
-                where="authorized_legacy_sha256",
-            )
             raise SourceBindingProjectionError(
                 "legacy parser authorization is outside parser_lineage"
             )
 
         projectors: list[SourceBindingProjector] = []
-        if target in lineage:
+        if lineage[-1] == target:
             projectors.append(SourceBindingProjector(target))
         if LEGACY_PARSER_SHA256 in lineage:
             projectors.append(
@@ -557,7 +555,8 @@ class SourceBindingProjectionRouter:
             )
         if not projectors:
             raise SourceBindingProjectionError(
-                "parser_lineage has no supported source-binding semantics"
+                "parser_lineage has no executable supported source-binding "
+                "semantics"
             )
         self.parser_lineage = lineage
         self.input_parser_sha256 = lineage[-1]
@@ -566,7 +565,7 @@ class SourceBindingProjectionRouter:
         self._projectors = tuple(projectors)
         self.mode = (
             self.MIXED_MODE
-            if len(self._projectors) > 1
+            if len(self.parser_lineage) > 1
             else self._projectors[0].mode
         )
 
@@ -612,7 +611,8 @@ class SourceBindingProjectionRouter:
         if not matches:
             raise SourceBindingProjectionError(
                 "stored repository source bindings disagree with every "
-                f"authorized parser lineage generation: {'; '.join(errors)}"
+                "executable supported parser semantics: "
+                f"{'; '.join(errors)}"
             )
         selected = matches[0]
         for compatible in matches[1:]:

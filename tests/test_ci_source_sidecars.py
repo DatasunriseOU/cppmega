@@ -21,6 +21,7 @@ from scripts.ci_source_binding_projection import (
     target_parser_script_sha256,
 )
 from scripts.ci_source_sidecars import (
+    _CONTENT_FRAME_HEADER,
     _FRAME_HEADER,
     CASE5_EXPORT_SCHEMA,
     CHECKOUT_PROVENANCE_UNRESOLVABLE,
@@ -30,6 +31,8 @@ from scripts.ci_source_sidecars import (
     INVENTORY_SCHEMA,
     MAX_JSONL_RECORD_BYTES,
     PATH_ABSENT,
+    PRODUCTION_CASE5_EXPORT_SCHEMA,
+    PRODUCTION_FETCH_RECEIPT_SCHEMA,
     RECEIPT_SCHEMA,
     REPRESENTATIVE_LEDGER_SCHEMA,
     RESOLVED,
@@ -45,13 +48,16 @@ from scripts.ci_source_sidecars import (
     _inventory_logical_sha256,
     _sha256_file,
     _write_inventory_jsonl,
+    _verify_content_store_pack,
     extract_binding_inventory,
     main,
     materialize_inventory,
     normalize_source_candidates,
     normalize_source_path,
     verify_binding_inventory,
+    verify_production_acquisition_chain,
 )
+from scripts.ci_zlib_evidence import MAX_CONTENT_FRAME_RAW_BYTES
 
 
 def _canonical(value: object) -> bytes:
@@ -823,6 +829,158 @@ def _sync_case5_receipts(fixture: dict[str, object]) -> None:
     _write_json(fixture["export_path"], export_receipt)  # type: ignore[arg-type]
 
 
+def _promote_case5_fixture_to_production(
+    fixture: dict[str, object],
+) -> None:
+    fetch_path = fixture["fetch_path"]
+    content_receipt_path = fixture["content_receipt_path"]
+    export_path = fixture["export_path"]
+    root = fixture["root"]
+    frozen = fixture["frozen_fetch_state"]
+    content_receipt = fixture["content_receipt"]
+    export_receipt = fixture["export_receipt"]
+    assert isinstance(fetch_path, Path)
+    assert isinstance(content_receipt_path, Path)
+    assert isinstance(export_path, Path)
+    assert isinstance(root, Path)
+    assert isinstance(frozen, dict)
+    assert isinstance(content_receipt, dict)
+    assert isinstance(export_receipt, dict)
+    counters = content_receipt["counters"]
+    summary = frozen["summary"]
+    assert isinstance(counters, dict)
+    assert isinstance(summary, dict)
+    attempt_set_sha256 = "1" * 64
+    terminal_proof_sha256 = "2" * 64
+    per_repo = [
+        {
+            "repo": "owner/repo",
+            "canonical": "owner/repo",
+            "ordinal": 0,
+            "expected_run_count": 1,
+            "expected_attempt_count": 1,
+            "observed_attempt_count": 1,
+            "attempt_set_sha256": attempt_set_sha256,
+            "terminal_statuses": {"done": 1},
+            "terminal_proof_sha256": terminal_proof_sha256,
+        }
+    ]
+    database_path = export_path.parent / "inventory.sqlite3"
+    inventory_receipt_path = export_path.parent / "inventory-receipt.json"
+    merge_receipt_path = export_path.parent / "merge-receipt.json"
+    inventory_binding = {
+        "database": {
+            "path": str(database_path),
+            "byte_size": 16_384,
+            "sha256": "3" * 64,
+            "db_logical_sha256": "4" * 64,
+        },
+        "completion_receipt": {
+            "path": str(inventory_receipt_path),
+            "sha256": "5" * 64,
+            "schema": "cppmega_ci_stream_inventory_receipt_v5",
+        },
+        "repo_count": 1,
+        "expected_run_count": 1,
+        "expected_attempt_count": 1,
+        "attempt_set_sha256": attempt_set_sha256,
+    }
+    coverage = {
+        "completion_mode": "inventory-exhaustive",
+        "expected_run_count": 1,
+        "expected_attempt_count": 1,
+        "observed_attempt_count": 1,
+        "missing_attempt_count": 0,
+        "extra_attempt_count": 0,
+        "incomplete_attempt_count": 0,
+        "attempt_set_sha256": attempt_set_sha256,
+        "terminal_statuses": {"done": 1},
+        "terminal_proof_sha256": terminal_proof_sha256,
+        "per_repo_ledger": per_repo,
+        "per_repo_ledger_sha256": hashlib.sha256(
+            _canonical(per_repo)
+        ).hexdigest(),
+        "discovery": {
+            "source": "merge-recomputed-exact-union",
+            "eof": True,
+            "batches": 0,
+            "rows_seen": 1,
+        },
+    }
+    target = int(content_receipt["target_exact_unique_payload_tokens"])
+    fetch = {
+        "schema": PRODUCTION_FETCH_RECEIPT_SCHEMA,
+        "completion_mode": "inventory-exhaustive",
+        "production_complete": True,
+        "coverage_semantics": (
+            "exact-production-inventory-attempt-equality"
+        ),
+        "target_exact_unique_payload_tokens": target,
+        "fetch_state": summary,
+        "frozen_fetch_state": frozen,
+        "content_store_receipt": content_receipt,
+        "inventory_binding": inventory_binding,
+        "exhaustive_coverage": coverage,
+        "conservation": {
+            "cas_occurrences": counters["occurrence_count"],
+            "fetch_members": summary["members"],
+            "fetch_chunks": summary["chunks"],
+            "fetch_occurrence_tokens": summary["occurrence_tokens"],
+            "exact_unique_payload_tokens": counters[
+                "exact_unique_payload_tokens"
+            ],
+            "secondary_minimum_exact_unique_payload_tokens": target,
+            "cas_member_chunk_join_complete": True,
+            "occurrence_chunk_count_equal": True,
+            "occurrence_token_count_equal": True,
+            "secondary_token_minimum_met": True,
+        },
+    }
+    fetch_raw = _write_json(fetch_path, fetch)
+    content_raw = content_receipt_path.read_bytes()
+    state_artifact = frozen["artifact"]
+    assert isinstance(state_artifact, dict)
+    export_receipt.update(
+        {
+            "schema": PRODUCTION_CASE5_EXPORT_SCHEMA,
+            "completion_mode": "inventory-exhaustive",
+            "production_complete": True,
+            "acquisition_provenance": {
+                "completion_mode": "inventory-exhaustive",
+                "production_complete": True,
+                "inventory": {
+                    "path": str(database_path),
+                    "sha256": "3" * 64,
+                    "logical_sha256": "4" * 64,
+                    "receipt_path": str(inventory_receipt_path),
+                    "receipt_sha256": "5" * 64,
+                },
+                "fetch": {
+                    "state_path": state_artifact["path"],
+                    "state_sha256": state_artifact["sha256"],
+                    "receipt_path": str(fetch_path),
+                    "receipt_sha256": hashlib.sha256(fetch_raw).hexdigest(),
+                    "attempt_set_sha256": attempt_set_sha256,
+                    "terminal_proof_sha256": terminal_proof_sha256,
+                },
+                "store": {
+                    "path": str(root),
+                    "receipt_path": str(content_receipt_path),
+                    "receipt_sha256": hashlib.sha256(
+                        content_raw
+                    ).hexdigest(),
+                },
+                "merge": {
+                    "receipt_path": str(merge_receipt_path),
+                    "receipt_sha256": "6" * 64,
+                    "schema": "cppmega_ci_stream_shard_union_receipt_v3",
+                },
+            },
+        }
+    )
+    _write_json(export_path, export_receipt)
+
+
 def _sync_representative_ledger(
     fixture: dict[str, object],
     records: list[dict[str, object]],
@@ -1029,6 +1187,106 @@ def test_representative_only_inventory_build_and_receipt_hash_chain(
     ] == fixture["representative"]["token_sequence_sha256"]  # type: ignore[index]
     assert "body" not in ledger_path.read_text(encoding="utf-8")
     assert "content_bytes" not in ledger_path.read_text(encoding="utf-8")
+
+
+def test_production_receipts_cannot_promote_nonexistent_artifacts(
+    tmp_path: Path,
+) -> None:
+    _mirror, head, _base = _git_fixture(tmp_path)
+    fixture = _frozen_case5_fixture(tmp_path, head)
+    _promote_case5_fixture_to_production(fixture)
+
+    with pytest.raises(
+        ExtractionError,
+        match="inventory database is missing or unsafe",
+    ):
+        _extract_fixture(
+            fixture,
+            tmp_path / "production-source-inventory.jsonl",
+        )
+
+
+def _exercise_genuine_production_chain(tmp_path: Path) -> tuple[Path, Path]:
+    # Reuse the production inventory/fetch/merge/export/source/macro E2E
+    # instead of manufacturing another internally consistent receipt graph.
+    from tests.test_merge_ci_stream_shards import (
+        test_genuine_inventory_fetch_merge_export_source_and_macro_e2e,
+    )
+
+    test_genuine_inventory_fetch_merge_export_source_and_macro_e2e(tmp_path)
+    return (
+        tmp_path / "case5" / "export_receipt.json",
+        tmp_path / "union",
+    )
+
+
+def test_genuine_production_chain_rejects_fetch_state_byte_tamper(
+    tmp_path: Path,
+) -> None:
+    export_receipt_path, union_root = _exercise_genuine_production_chain(
+        tmp_path
+    )
+    fetch_state = union_root / "fetch_state.sqlite3"
+    with fetch_state.open("ab") as handle:
+        handle.write(b"\0")
+
+    with pytest.raises(
+        ExtractionError,
+        match="frozen fetch-state bytes/path differ",
+    ):
+        verify_production_acquisition_chain(export_receipt_path)
+
+
+def test_genuine_production_chain_rejects_false_merge_semantics(
+    tmp_path: Path,
+) -> None:
+    export_receipt_path, union_root = _exercise_genuine_production_chain(
+        tmp_path
+    )
+    merge_receipt_path = union_root / "merge_receipt.json"
+    merge_receipt = json.loads(
+        merge_receipt_path.read_text(encoding="utf-8")
+    )
+    merge_receipt["verification"]["full_cas_fetch_join"] = False
+    merge_raw = _write_json(merge_receipt_path, merge_receipt)
+    export_receipt = json.loads(
+        export_receipt_path.read_text(encoding="utf-8")
+    )
+    export_receipt["acquisition_provenance"]["merge"][
+        "receipt_sha256"
+    ] = hashlib.sha256(merge_raw).hexdigest()
+    _write_json(export_receipt_path, export_receipt)
+
+    with pytest.raises(
+        ExtractionError,
+        match="lacks exact inventory/CAS/frozen verification",
+    ):
+        verify_production_acquisition_chain(export_receipt_path)
+
+
+def test_production_schema_labels_cannot_masquerade_as_exhaustive(
+    tmp_path: Path,
+) -> None:
+    _mirror, head, _base = _git_fixture(tmp_path)
+    fixture = _frozen_case5_fixture(tmp_path, head)
+    fetch = json.loads(
+        fixture["fetch_path"].read_text(encoding="utf-8")  # type: ignore[union-attr]
+    )
+    fetch["schema"] = PRODUCTION_FETCH_RECEIPT_SCHEMA
+    _write_json(fixture["fetch_path"], fetch)  # type: ignore[arg-type]
+    export = fixture["export_receipt"]
+    assert isinstance(export, dict)
+    export["schema"] = PRODUCTION_CASE5_EXPORT_SCHEMA
+    _write_json(fixture["export_path"], export)  # type: ignore[arg-type]
+
+    with pytest.raises(
+        ExtractionError,
+        match="lacks inventory-exhaustive semantics",
+    ):
+        _extract_fixture(
+            fixture,
+            tmp_path / "masquerading-source-inventory.jsonl",
+        )
 
 
 def test_inventory_consumes_legacy_projection_instead_of_stale_action_binding(
@@ -1705,6 +1963,60 @@ def test_full_content_store_receipt_binds_sqlite_hashes(
     _sync_case5_receipts(fixture)
     with pytest.raises(ExtractionError, match=message):
         _extract_fixture(fixture, tmp_path / "inventory.jsonl")
+
+
+def test_content_store_pack_preflights_semantic_frame_size_cap(
+    tmp_path: Path,
+) -> None:
+    _mirror, head, _base = _git_fixture(tmp_path)
+    fixture = _frozen_case5_fixture(tmp_path / "frame-cap", head)
+    root = fixture["root"]
+    receipt = fixture["content_receipt"]
+    assert isinstance(root, Path)
+    assert isinstance(receipt, dict)
+    pack_record = receipt["pack_hashes"][0]
+    pack_path = root / pack_record["filename"]
+    with sqlite3.connect(root / "index.sqlite3") as connection:
+        connection.row_factory = sqlite3.Row
+        content = connection.execute(
+            "SELECT pack_id,offset FROM contents LIMIT 1"
+        ).fetchone()
+        assert content is not None
+        pack_bytes = bytearray(pack_path.read_bytes())
+        offset = int(content["offset"])
+        header = bytes(
+            pack_bytes[offset : offset + _CONTENT_FRAME_HEADER.size]
+        )
+        magic, digest, _raw_size, compressed_size = (
+            _CONTENT_FRAME_HEADER.unpack(header)
+        )
+        forged_raw_size = MAX_CONTENT_FRAME_RAW_BYTES + 1
+        pack_bytes[
+            offset : offset + _CONTENT_FRAME_HEADER.size
+        ] = _CONTENT_FRAME_HEADER.pack(
+            magic,
+            digest,
+            forged_raw_size,
+            compressed_size,
+        )
+        pack_path.write_bytes(pack_bytes)
+        connection.execute(
+            "UPDATE contents SET raw_size=?",
+            (forged_raw_size,),
+        )
+        pack_row = connection.execute(
+            "SELECT * FROM packs WHERE pack_id=?",
+            (int(content["pack_id"]),),
+        ).fetchone()
+        assert pack_row is not None
+        pack_record["sha256"] = hashlib.sha256(pack_bytes).hexdigest()
+        with pytest.raises(ExtractionError, match="frame metadata differs"):
+            _verify_content_store_pack(
+                connection,
+                root=root,
+                pack_row=pack_row,
+                receipt_record=pack_record,
+            )
 
 
 def test_frozen_receipts_policy_and_recovery_artifacts_are_exact(

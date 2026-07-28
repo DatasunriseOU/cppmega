@@ -30,6 +30,20 @@ DOMAIN_CONTRACT_TESTS = (
     "tests/test_eval_domain_routed_codegen.py",
     "tests/test_ksh_python_domain_parsers.py",
 )
+CI_STREAMING_CONTRACT_TESTS = frozenset(
+    {
+        "tests/test_ci_stream_inventory.py",
+        "tests/test_ci_content_store.py",
+        "tests/test_ci_log_sidecars.py",
+        "tests/test_ci_stream_fetch.py",
+        "tests/test_ci_job_log_rescue.py",
+        "tests/test_recover_ci_preserved_archives.py",
+        "tests/test_ci_source_binding_projection.py",
+        "tests/test_ci_source_sidecars.py",
+        "tests/test_export_ci_content_store_case5.py",
+        "tests/test_merge_ci_stream_shards.py",
+    }
+)
 
 
 def test_workflows_do_not_use_github_hosted_runners() -> None:
@@ -139,3 +153,22 @@ def test_frozen_domain_eval_is_wired_into_repository_owned_ci() -> None:
             "--out",
             "/tmp/cppmega-domain-routed-codegen.json",
         ]
+
+
+def test_ci_streaming_contracts_are_portable_and_run_on_both_platforms() -> None:
+    import conftest
+
+    payload = json.loads(
+        (REPO_ROOT / "configs" / "ci" / "lanes.json").read_text(encoding="utf-8")
+    )
+    lanes = {lane["id"]: lane for lane in payload["lanes"]}
+
+    assert CI_STREAMING_CONTRACT_TESTS <= conftest._PORTABLE_TEST_ALLOWLIST
+    for lane_id in ("macos-contracts", "linux-contracts"):
+        pytest_argv = next(
+            command["argv"]
+            for command in lanes[lane_id]["commands"]
+            if command["argv"][:4] == ["{python}", "-m", "pytest", "-q"]
+        )
+        assert CI_STREAMING_CONTRACT_TESTS <= set(pytest_argv)
+        assert "tests/test_build_macro_routes_megatron_bundle.py" in pytest_argv

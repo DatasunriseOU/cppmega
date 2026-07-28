@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+from functools import lru_cache
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -22,7 +25,14 @@ from cppmega.megatron.domain_route_contract import (
     DOMAIN_END_DELIMITER_IDS,
     DOMAIN_START_DELIMITER_IDS,
 )
-from scripts.ci_content_store import CIContentStore, _hash_records, hash_token_sequence
+from scripts.ci_content_store import (
+    CIContentStore,
+    _FRAME_HEADER,
+    _FRAME_MAGIC,
+    _PACK_MAGIC,
+    _hash_records,
+    hash_token_sequence,
+)
 from scripts.ci_log_sidecars import SIDECAR_SCHEMA as PARSER_SIDECAR_SCHEMA
 from scripts.ci_source_binding_projection import (
     LEGACY_PARSER_SHA256,
@@ -47,6 +57,7 @@ from scripts.export_ci_content_store_case5 import (
     ExportError,
     FrozenStore,
     OccurrenceRecord,
+    _decode_provenance,
     _fragment_ranges,
     _project_content,
     _publish_directory_no_replace,
@@ -57,10 +68,31 @@ from scripts.export_ci_content_store_case5 import (
     _validate_occurrence_v3,
     export_store,
 )
+from scripts.ci_zlib_evidence import (
+    MAX_CONTENT_FRAME_RAW_BYTES,
+    MAX_JOBS_EVIDENCE_BYTES,
+    MAX_STATE_JSON_EVIDENCE_BYTES,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 TOKENIZER_JSON = ROOT / "cppmega" / "tokenizer" / "tokenizer.json"
+
+
+@lru_cache(maxsize=None)
+def _compressed_repetition(raw_size: int) -> tuple[bytes, str]:
+    compressor = zlib.compressobj(9)
+    digest = hashlib.sha256()
+    parts: list[bytes] = []
+    chunk = b"x" * (1024 * 1024)
+    remaining = raw_size
+    while remaining:
+        current = chunk[: min(len(chunk), remaining)]
+        digest.update(current)
+        parts.append(compressor.compress(current))
+        remaining -= len(current)
+    parts.append(compressor.flush())
+    return b"".join(parts), digest.hexdigest()
 
 
 @pytest.fixture(scope="module")
@@ -1557,6 +1589,99 @@ def test_mixed_parser_generation_store_routes_legacy_and_current_actions(
     } == {"current_audit", "legacy_projection"}
 
 
+def test_parser_binding_rollback_preserves_generation_evidence(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    text = "clang++ -c src/current.cpp"
+    provenance = _provenance(text)
+    store_root, receipt_path, fetch_state = _build_store(
+        tmp_path,
+        exact_tokenizer,
+        [(text, provenance)],
+    )
+    current = target_parser_script_sha256()
+    rolled_back_from = "7" * 64
+    with sqlite3.connect(fetch_state) as connection:
+        connection.executemany(
+            """
+            INSERT INTO binding_upgrades(
+              binding_key,from_sha256,to_sha256,reason,upgraded_at
+            ) VALUES (?,?,?,?,?)
+            """,
+            (
+                (
+                    "parser_script_sha256",
+                    current,
+                    rolled_back_from,
+                    "fixture upgrade",
+                    "2026-07-26T22:00:00Z",
+                ),
+                (
+                    "parser_script_sha256",
+                    rolled_back_from,
+                    current,
+                    "fixture rollback",
+                    "2026-07-26T23:00:00Z",
+                ),
+            ),
+        )
+        connection.commit()
+
+    output = tmp_path / "rollback-export"
+    receipt = export_store(
+        store_root=store_root,
+        store_receipt=receipt_path,
+        fetch_state=fetch_state,
+        tokenizer_json=TOKENIZER_JSON,
+        output=output,
+    )
+
+    projection = receipt["source_binding_projection"]
+    assert projection["mode"] == "mixed_lineage_projection"
+    assert projection["parser_lineage"] == [rolled_back_from, current]
+
+
+def test_parser_binding_history_disconnected_from_current_fails_closed(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    text = "clang++ -c src/current.cpp"
+    provenance = _provenance(text)
+    store_root, receipt_path, fetch_state = _build_store(
+        tmp_path,
+        exact_tokenizer,
+        [(text, provenance)],
+    )
+    with sqlite3.connect(fetch_state) as connection:
+        connection.execute(
+            """
+            INSERT INTO binding_upgrades(
+              binding_key,from_sha256,to_sha256,reason,upgraded_at
+            ) VALUES (?,?,?,?,?)
+            """,
+            (
+                "parser_script_sha256",
+                "6" * 64,
+                "7" * 64,
+                "disconnected fixture",
+                "2026-07-26T23:00:00Z",
+            ),
+        )
+        connection.commit()
+
+    output = tmp_path / "disconnected-export"
+    with pytest.raises(ExportError, match="cannot return to the current parser"):
+        export_store(
+            store_root=store_root,
+            store_receipt=receipt_path,
+            fetch_state=fetch_state,
+            tokenizer_json=TOKENIZER_JSON,
+            output=output,
+        )
+    assert not output.exists()
+
+
 def test_projection_writer_rejects_rows_the_consumer_cannot_read(
     tmp_path: Path,
 ) -> None:
@@ -1647,6 +1772,115 @@ def test_fetch_state_sidecar_rejects_trailing_compressed_bytes(
             output=output,
         )
     assert not output.exists()
+
+
+def test_exporter_rejects_jobs_zlib_bomb_before_json_decode(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    text = "bounded jobs evidence"
+    store_root, receipt_path, fetch_state = _build_store(
+        tmp_path,
+        exact_tokenizer,
+        [(text, _provenance(text))],
+    )
+    raw_size = MAX_JOBS_EVIDENCE_BYTES + 1
+    compressed, digest = _compressed_repetition(raw_size)
+    with sqlite3.connect(fetch_state) as connection:
+        connection.execute(
+            """
+            UPDATE attempts SET
+              jobs_raw_size=?,jobs_sha256=?,jobs_zlib=?
+            """,
+            (raw_size, digest, sqlite3.Binary(compressed)),
+        )
+    with pytest.raises(ExportError, match="not exact and bounded"):
+        export_store(
+            store_root=store_root,
+            store_receipt=receipt_path,
+            fetch_state=fetch_state,
+            tokenizer_json=TOKENIZER_JSON,
+            output=tmp_path / "jobs-bomb",
+        )
+
+
+def test_exporter_rejects_provenance_zlib_bomb_before_json_decode() -> None:
+    raw_size = MAX_STATE_JSON_EVIDENCE_BYTES + 1
+    compressed, digest = _compressed_repetition(raw_size)
+    with pytest.raises(ExportError, match="not exact and bounded"):
+        _decode_provenance(
+            {
+                "provenance_raw_size": raw_size,
+                "provenance_sha256": digest,
+                "provenance_zlib": compressed,
+            }
+        )
+
+
+def test_exporter_rejects_member_sidecar_zlib_bomb(
+    tmp_path: Path,
+    exact_tokenizer: ExactTokenizer,
+) -> None:
+    text = "bounded member sidecar evidence"
+    store_root, receipt_path, fetch_state = _build_store(
+        tmp_path,
+        exact_tokenizer,
+        [(text, _provenance(text))],
+    )
+    raw_size = MAX_STATE_JSON_EVIDENCE_BYTES + 1
+    compressed, digest = _compressed_repetition(raw_size)
+    with sqlite3.connect(fetch_state) as connection:
+        connection.execute(
+            """
+            UPDATE members SET
+              sidecar_raw_size=?,sidecar_sha256=?,sidecar_zlib=?
+            """,
+            (raw_size, digest, sqlite3.Binary(compressed)),
+        )
+    with pytest.raises(ExportError, match="not exact and bounded"):
+        export_store(
+            store_root=store_root,
+            store_receipt=receipt_path,
+            fetch_state=fetch_state,
+            tokenizer_json=TOKENIZER_JSON,
+            output=tmp_path / "sidecar-bomb",
+        )
+
+
+def test_exporter_content_frame_cap_precedes_payload_pread(
+    tmp_path: Path,
+) -> None:
+    raw_size = MAX_CONTENT_FRAME_RAW_BYTES + 1
+    compressed, digest = _compressed_repetition(raw_size)
+    pack = tmp_path / "pack-00000001.cicp"
+    pack.write_bytes(
+        _PACK_MAGIC
+        + _FRAME_HEADER.pack(
+            _FRAME_MAGIC,
+            bytes.fromhex(digest),
+            raw_size,
+            len(compressed),
+        )
+        + compressed
+    )
+    frozen = object.__new__(FrozenStore)
+    frozen.root = tmp_path
+    frozen.pack_paths = {1: pack}
+    frozen._pack_fds = OrderedDict()
+    row = {
+        "pack_id": 1,
+        "offset": len(_PACK_MAGIC),
+        "frame_size": _FRAME_HEADER.size + len(compressed),
+        "compressed_size": len(compressed),
+        "raw_size": raw_size,
+        "sha256": digest,
+    }
+    try:
+        with pytest.raises(ExportError, match="byte bound"):
+            frozen.read_content_row(row)
+    finally:
+        for descriptor in frozen._pack_fds.values():
+            os.close(descriptor)
 
 
 def test_fetch_state_done_attempt_requires_exact_jobs_payload(

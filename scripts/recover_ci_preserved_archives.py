@@ -12,6 +12,7 @@ import argparse
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -38,12 +39,24 @@ from scripts.ci_job_log_rescue import (  # noqa: E402
 )
 from scripts.ci_stream_fetch import (  # noqa: E402
     ArchiveError as FetchArchiveError,
+    BindingError as FetchBindingError,
     DEFAULT_MAX_ARCHIVE_BYTES,
     DEFAULT_MAX_MEMBER_BYTES,
     DEFAULT_MAX_MEMBERS,
     DEFAULT_MAX_UNCOMPRESSED_BYTES,
+    PRESERVED_RECOVERY_LEDGER_LEGACY_SCHEMA,
+    PRESERVED_RECOVERY_LEDGER_SCHEMA,
+    PRESERVED_RECOVERY_LEGACY_SEMANTIC_CONTRACT_SHA256,
+    PRESERVED_RECOVERY_RECEIPT_SCHEMA,
+    PRESERVED_RECOVERY_SEMANTIC_CONTRACT_SHA256,
+    _authorize_producer_lineage_upgrade,
+    _current_preserved_recovery_producer_binding,
     _fsync_directory,
+    _producer_lineage,
     _safe_zip_infos,
+    _validate_preserved_recovery_receipt,
+    _validate_producer_lineage,
+    _validated_producer_binding,
 )
 from scripts.ci_stream_inventory import (  # noqa: E402
     format_utc_instant,
@@ -51,7 +64,7 @@ from scripts.ci_stream_inventory import (  # noqa: E402
 )
 
 
-SCHEMA = "cppmega_ci_preserved_archive_recovery_v1"
+SCHEMA = PRESERVED_RECOVERY_RECEIPT_SCHEMA
 _STREAM_BYTES = 1024 * 1024
 _RECEIPT_MAX_BYTES = 4 * 1024 * 1024
 _MANIFEST_MAX_BYTES = 16 * 1024 * 1024
@@ -70,6 +83,16 @@ _ELIGIBLE = ("failed", "terminal_404", "terminal_410")
 
 class RecoveryError(RuntimeError):
     """Preserved-archive evidence is absent, unsafe, changed, or ambiguous."""
+
+
+def _producer_binding() -> dict[str, str]:
+    value = _current_preserved_recovery_producer_binding()
+    if (
+        value.get("semantic_contract_sha256")
+        != PRESERVED_RECOVERY_SEMANTIC_CONTRACT_SHA256
+    ):
+        raise RecoveryError("preserved-recovery semantic contract drifted")
+    return value
 
 
 @dataclass(frozen=True)
@@ -111,6 +134,17 @@ class RecoveryPlan:
 
     def proof(self) -> dict[str, object]:
         repo, run_id, attempt = self.identity
+        witness_records = [
+            {
+                "archive_member": str(item[0]),
+                "job_key": str(item[1]),
+                "raw_sha256": str(item[2]),
+                "raw_size": int(item[3]),
+                "chunk_count": int(item[4]),
+                "occurrence_tokens": int(item[5]),
+            }
+            for item in self.witnesses
+        ]
         return {
             "state": {
                 "path": str(self.state_path),
@@ -133,6 +167,7 @@ class RecoveryPlan:
                     int(item[5]) for item in self.witnesses
                 ),
                 "set_sha256": self.witness_set_sha256,
+                "members": witness_records,
             },
             "source_archive": {
                 "path": str(self.archive.path),
@@ -458,9 +493,19 @@ def _receipt(plan: RecoveryPlan) -> tuple[Path, dict[str, object], str]:
             raise RecoveryError(f"invalid prior receipt: {path}") from exc
         if (
             not isinstance(value, dict)
+            or set(value)
+            != {
+                "schema",
+                "status",
+                "verified_at",
+                "recovery_id",
+                "producer_binding",
+                "proof",
+            }
             or value.get("schema") != SCHEMA
             or value.get("status") != "verified"
             or value.get("recovery_id") != recovery_id
+            or value.get("producer_binding") != _producer_binding()
             or value.get("proof") != proof
         ):
             raise RecoveryError(f"conflicting prior receipt: {path}")
@@ -470,6 +515,7 @@ def _receipt(plan: RecoveryPlan) -> tuple[Path, dict[str, object], str]:
             "status": "verified",
             "verified_at": _utc_now(),
             "recovery_id": recovery_id,
+            "producer_binding": _producer_binding(),
             "proof": proof,
         }
         _atomic_write_bytes(path, _canonical_json_bytes(value) + b"\n")
@@ -558,11 +604,26 @@ def apply_plan(plan: RecoveryPlan) -> dict[str, object]:
                 plan.rescue_archive.unlink()
                 _fsync_directory(plan.rescue_spool)
             raise RecoveryError("published rescue archive changed identity")
-        audit = (
-            f"recovery_id={receipt['recovery_id']} "
-            f"receipt_sha256={receipt_sha} "
-            f"source_row_sha256={plan.row_sha256}"
-        )
+        audit = _canonical_json_bytes(
+            {
+                "schema": PRESERVED_RECOVERY_LEDGER_SCHEMA,
+                "producer_lineage": _producer_lineage(
+                    _producer_binding()
+                ),
+                "recovery_id": receipt["recovery_id"],
+                "receipt": {
+                    "name": receipt_path.name,
+                    "bytes": receipt_path.stat().st_size,
+                    "sha256": receipt_sha,
+                },
+                "source_row_sha256": plan.row_sha256,
+                "witness_set_sha256": plan.witness_set_sha256,
+                "archive": {
+                    "sha256": plan.archive.sha256,
+                    "bytes": plan.archive.byte_size,
+                },
+            }
+        ).decode("utf-8")
         cursor = state.connection.execute(
             """
             UPDATE attempts SET
@@ -621,6 +682,383 @@ def apply_plan(plan: RecoveryPlan) -> dict[str, object]:
         state.close()
 
 
+def _read_bounded_regular_file(path: Path, limit: int) -> bytes:
+    try:
+        initial = os.lstat(path)
+    except OSError as exc:
+        raise RecoveryError(f"recovery receipt is missing: {path}") from exc
+    if stat.S_ISLNK(initial.st_mode) or not stat.S_ISREG(initial.st_mode):
+        raise RecoveryError(f"recovery receipt path is unsafe: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise RecoveryError(
+            f"recovery receipt cannot be opened safely: {path}"
+        ) from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino)
+            != (initial.st_dev, initial.st_ino)
+        ):
+            raise RecoveryError(
+                f"recovery receipt identity changed while opening: {path}"
+            )
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            raw = handle.read(limit + 1)
+        if len(raw) > limit:
+            raise RecoveryError(f"recovery receipt is oversized: {path}")
+        return raw
+    finally:
+        os.close(descriptor)
+
+
+def migrate_producer_lineage(
+    *,
+    state_path: Path,
+    rescue_spool: Path,
+    target: tuple[str, int, int],
+    allow_producer_upgrade_from_sha256: str | None,
+    producer_upgrade_reason: str | None,
+) -> dict[str, object]:
+    """Append a current lineage audit without rewriting legacy evidence."""
+
+    if (
+        allow_producer_upgrade_from_sha256 is None
+    ) != (producer_upgrade_reason is None):
+        raise RecoveryError(
+            "producer upgrade requires both source SHA-256 and reason"
+        )
+    state_path = Path(state_path)
+    rescue_spool = _safe_directory(Path(rescue_spool))
+    state = FetchStateEvidence(state_path)
+    try:
+        state.connection.execute("BEGIN IMMEDIATE")
+        state._assert_file_identity()
+        attempt_row = state.connection.execute(
+            """
+            SELECT * FROM attempts
+            WHERE repo=? AND run_id=? AND attempt=?
+            """,
+            target,
+        ).fetchone()
+        latest = state.connection.execute(
+            """
+            SELECT id,error_message FROM request_ledger
+            WHERE repo=? AND run_id=? AND attempt=?
+              AND endpoint='operator/preserved_archive_recovery'
+              AND outcome='operator/preserved_archive_recovery'
+              AND error_class='PreservedArchiveRecoveryReceipt'
+            ORDER BY id DESC LIMIT 1
+            """,
+            target,
+        ).fetchone()
+        if (
+            attempt_row is None
+            or str(attempt_row["status"]) != "retry"
+            or str(attempt_row["archive_source"])
+            != "preserved-local-archive"
+            or str(attempt_row["error_class"])
+            != "PreservedArchiveRecovery"
+            or latest is None
+            or not isinstance(latest["error_message"], str)
+            or str(attempt_row["error_message"])
+            != str(latest["error_message"])
+        ):
+            raise RecoveryError(
+                "target is not bound to one preserved-recovery audit"
+            )
+        raw_audit = str(latest["error_message"])
+        try:
+            parsed_audit = json.loads(raw_audit)
+        except json.JSONDecodeError:
+            legacy = re.fullmatch(
+                r"recovery_id=([0-9a-f]{64}) "
+                r"receipt_sha256=([0-9a-f]{64}) "
+                r"source_row_sha256=([0-9a-f]{64})",
+                raw_audit,
+            )
+            if legacy is None:
+                raise RecoveryError(
+                    "legacy preserved-recovery audit encoding is invalid"
+                )
+            audit_format = "legacy-v0"
+            audit_evidence: dict[str, object] = {
+                "recovery_id": legacy.group(1),
+                "receipt_sha256": legacy.group(2),
+                "source_row_sha256": legacy.group(3),
+            }
+        else:
+            if (
+                not isinstance(parsed_audit, dict)
+                or _canonical_json_bytes(parsed_audit).decode("utf-8")
+                != raw_audit
+            ):
+                raise RecoveryError(
+                    "preserved-recovery audit JSON is not canonical"
+                )
+            audit_evidence = dict(parsed_audit)
+            if (
+                audit_evidence.get("schema")
+                == PRESERVED_RECOVERY_LEDGER_LEGACY_SCHEMA
+                and set(audit_evidence)
+                == {
+                    "schema",
+                    "producer_binding",
+                    "recovery_id",
+                    "receipt",
+                    "source_row_sha256",
+                    "witness_set_sha256",
+                    "archive",
+                }
+            ):
+                audit_format = "ledger-v1"
+            elif (
+                audit_evidence.get("schema")
+                == PRESERVED_RECOVERY_LEDGER_SCHEMA
+                and set(audit_evidence)
+                == {
+                    "schema",
+                    "producer_lineage",
+                    "recovery_id",
+                    "receipt",
+                    "source_row_sha256",
+                    "witness_set_sha256",
+                    "archive",
+                }
+            ):
+                audit_format = "ledger-v2"
+            else:
+                raise RecoveryError(
+                    "preserved-recovery audit schema/shape is unsupported"
+                )
+
+        recovery_id = str(audit_evidence.get("recovery_id"))
+        if re.fullmatch(r"[0-9a-f]{64}", recovery_id) is None:
+            raise RecoveryError("preserved-recovery ID is invalid")
+        base = (
+            f"{target[0].replace('/', '__')}--{target[1]}"
+            f"--attempt-{target[2]}"
+        )
+        if audit_format == "legacy-v0":
+            receipt_name = (
+                f"{base}.preserved-recovery-{recovery_id[:16]}.json"
+            )
+        else:
+            raw_receipt_descriptor = audit_evidence.get("receipt")
+            if (
+                not isinstance(raw_receipt_descriptor, Mapping)
+                or set(raw_receipt_descriptor)
+                != {"name", "bytes", "sha256"}
+                or not isinstance(
+                    raw_receipt_descriptor.get("name"),
+                    str,
+                )
+            ):
+                raise RecoveryError(
+                    "preserved-recovery receipt descriptor is invalid"
+                )
+            receipt_name = str(raw_receipt_descriptor["name"])
+        if (
+            Path(receipt_name).name != receipt_name
+            or receipt_name
+            != f"{base}.preserved-recovery-{recovery_id[:16]}.json"
+        ):
+            raise RecoveryError(
+                "preserved-recovery receipt name is not target-bound"
+            )
+        receipt_path = rescue_spool / receipt_name
+        receipt_raw = _read_bounded_regular_file(
+            receipt_path,
+            _RECEIPT_MAX_BYTES,
+        )
+        receipt_sha256 = _sha256_bytes(receipt_raw)
+        try:
+            receipt = json.loads(receipt_raw)
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise RecoveryError(
+                "preserved-recovery receipt is not JSON"
+            ) from exc
+        if (
+            not isinstance(receipt, dict)
+            or receipt_raw != _canonical_json_bytes(receipt) + b"\n"
+        ):
+            raise RecoveryError(
+                "preserved-recovery receipt encoding is not canonical"
+            )
+        archive_sha256 = str(attempt_row["archive_sha256"])
+        archive_size = attempt_row["archive_size"]
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", archive_sha256) is None
+            or isinstance(archive_size, bool)
+            or not isinstance(archive_size, int)
+            or archive_size <= 0
+            or not isinstance(receipt.get("verified_at"), str)
+        ):
+            raise RecoveryError(
+                "preserved-recovery attempt archive binding is invalid"
+            )
+        try:
+            (
+                validated_recovery_id,
+                source_row_sha256,
+                witness_set_sha256,
+                _witnesses,
+                artifact_binding,
+            ) = _validate_preserved_recovery_receipt(
+                receipt,
+                repo=target[0],
+                run_id=target[1],
+                attempt=target[2],
+                created_at=str(attempt_row["created_at"]),
+                archive_sha256=archive_sha256,
+                archive_size=archive_size,
+                verified_at=str(receipt["verified_at"]),
+            )
+        except FetchBindingError as exc:
+            raise RecoveryError(str(exc)) from exc
+        expected_receipt = {
+            "name": receipt_name,
+            "bytes": len(receipt_raw),
+            "sha256": receipt_sha256,
+        }
+        expected_archive = {
+            "sha256": archive_sha256,
+            "bytes": archive_size,
+        }
+        if (
+            validated_recovery_id != recovery_id
+            or audit_evidence.get("source_row_sha256")
+            != source_row_sha256
+            or (
+                audit_format == "legacy-v0"
+                and audit_evidence.get("receipt_sha256")
+                != receipt_sha256
+            )
+        ):
+            raise RecoveryError(
+                "legacy preserved-recovery audit/receipt binding differs"
+            )
+        if audit_format == "ledger-v1":
+            try:
+                legacy_binding = _validated_producer_binding(
+                    audit_evidence.get("producer_binding"),
+                    source="legacy preserved-recovery audit",
+                )
+            except FetchBindingError as exc:
+                raise RecoveryError(str(exc)) from exc
+            if legacy_binding != artifact_binding:
+                raise RecoveryError(
+                    "legacy preserved-recovery producer differs from receipt"
+                )
+            prior_lineage: object = _producer_lineage(legacy_binding)
+        elif audit_format == "ledger-v2":
+            prior_lineage = audit_evidence.get("producer_lineage")
+        else:
+            if (
+                artifact_binding["semantic_contract_sha256"]
+                != PRESERVED_RECOVERY_LEGACY_SEMANTIC_CONTRACT_SHA256
+            ):
+                raise RecoveryError(
+                    "legacy preserved-recovery receipt lineage is invalid"
+                )
+            prior_lineage = _producer_lineage(artifact_binding)
+        try:
+            producer_lineage = _authorize_producer_lineage_upgrade(
+                prior_lineage,
+                current_binding=_producer_binding(),
+                allow_from_sha256=(
+                    allow_producer_upgrade_from_sha256
+                ),
+                reason=producer_upgrade_reason,
+                authorized_at=_utc_now(),
+            )
+            _validate_producer_lineage(
+                producer_lineage,
+                artifact_binding=artifact_binding,
+                current_binding=_producer_binding(),
+            )
+        except (FetchBindingError, ValueError) as exc:
+            raise RecoveryError(str(exc)) from exc
+        migrated_audit: dict[str, object] = {
+            "schema": PRESERVED_RECOVERY_LEDGER_SCHEMA,
+            "producer_lineage": producer_lineage,
+            "recovery_id": recovery_id,
+            "receipt": expected_receipt,
+            "source_row_sha256": source_row_sha256,
+            "witness_set_sha256": witness_set_sha256,
+            "archive": expected_archive,
+        }
+        if audit_format in {"ledger-v1", "ledger-v2"}:
+            for field in (
+                "receipt",
+                "source_row_sha256",
+                "witness_set_sha256",
+                "archive",
+            ):
+                if audit_evidence.get(field) != migrated_audit[field]:
+                    raise RecoveryError(
+                        "preserved-recovery audit evidence changed"
+                    )
+        if audit_evidence == migrated_audit:
+            state.connection.execute("COMMIT")
+            return {
+                "identity": list(target),
+                "status": "current",
+                "recovery_id": recovery_id,
+                "receipt_sha256": receipt_sha256,
+            }
+        encoded = _canonical_json_bytes(migrated_audit).decode("utf-8")
+        state._assert_file_identity()
+        cursor = state.connection.execute(
+            """
+            UPDATE attempts SET error_message=?
+            WHERE repo=? AND run_id=? AND attempt=?
+              AND status='retry'
+              AND error_class='PreservedArchiveRecovery'
+              AND error_message=?
+            """,
+            (encoded, *target, raw_audit),
+        )
+        if cursor.rowcount != 1:
+            raise RecoveryError(
+                "preserved-recovery attempt changed during migration"
+            )
+        state.connection.execute(
+            """
+            INSERT INTO request_ledger(
+              requested_at,repo,run_id,attempt,endpoint,page_no,
+              request_attempt,http_status,outcome,latency_ms,
+              error_class,error_message
+            ) VALUES (?,?,?,?,?,NULL,1,NULL,?,0,?,?)
+            """,
+            (
+                _utc_now(),
+                *target,
+                "operator/preserved_archive_recovery",
+                "operator/preserved_archive_recovery",
+                "PreservedArchiveRecoveryReceipt",
+                encoded,
+            ),
+        )
+        state.connection.execute("COMMIT")
+        return {
+            "identity": list(target),
+            "status": "migrated",
+            "recovery_id": recovery_id,
+            "receipt_sha256": receipt_sha256,
+        }
+    except BaseException:
+        if state.connection.in_transaction:
+            state.connection.execute("ROLLBACK")
+        raise
+    finally:
+        state.close()
+
+
 def _target(value: str) -> tuple[str, int, int]:
     try:
         repo, run_id, attempt = value.rsplit(":", 2)
@@ -646,6 +1084,25 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--target", type=_target)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument(
+        "--migrate-producer-lineage",
+        action="store_true",
+        help=(
+            "append a current producer-lineage audit for one already "
+            "requeued target"
+        ),
+    )
+    parser.add_argument(
+        "--allow-producer-upgrade-from-sha256",
+        help=(
+            "authorize migration from this exact prior producer script "
+            "SHA-256"
+        ),
+    )
+    parser.add_argument(
+        "--producer-upgrade-reason",
+        help="printable audit reason for an authorized producer upgrade",
+    )
+    parser.add_argument(
         "--max-archive-bytes", type=int, default=DEFAULT_MAX_ARCHIVE_BYTES
     )
     parser.add_argument(
@@ -662,6 +1119,20 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.apply and args.migrate_producer_lineage:
+        print(
+            "[preserved-recovery] ERROR: --apply and "
+            "--migrate-producer-lineage are mutually exclusive",
+            file=sys.stderr,
+        )
+        return 1
+    if args.migrate_producer_lineage and args.target is None:
+        print(
+            "[preserved-recovery] ERROR: lineage migration requires "
+            "--target",
+            file=sys.stderr,
+        )
+        return 1
     limits = {
         "max_archive_bytes": args.max_archive_bytes,
         "max_member_bytes": args.max_member_bytes,
@@ -672,38 +1143,58 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("[preserved-recovery] ERROR: limits must be positive", file=sys.stderr)
         return 1
     try:
-        plans = build_plans(
-            state_path=Path(args.state),
-            work_dir=Path(args.work_dir),
-            rescue_spool=Path(args.rescue_spool),
-            target=args.target,
-            **limits,
-        )
-        result = {
-            "schema": SCHEMA,
-            "mode": "apply" if args.apply else "dry-run",
-            "eligible_attempts": len(plans),
-            "plans": [
-                {
-                    "identity": list(plan.identity),
-                    "prior_status": str(plan.row["status"]),
-                    "archive": str(plan.archive.path),
-                    "archive_bytes": plan.archive.byte_size,
-                    "archive_sha256": plan.archive.sha256,
-                    "durable_members": len(plan.witnesses),
-                    "durable_occurrence_tokens": sum(
-                        int(item[5]) for item in plan.witnesses
+        if args.migrate_producer_lineage:
+            assert args.target is not None
+            result = {
+                "schema": SCHEMA,
+                "mode": "migrate-producer-lineage",
+                "migration": migrate_producer_lineage(
+                    state_path=Path(args.state),
+                    rescue_spool=Path(args.rescue_spool),
+                    target=args.target,
+                    allow_producer_upgrade_from_sha256=(
+                        args.allow_producer_upgrade_from_sha256
                     ),
-                    "rejected_candidates": list(plan.rejected_candidates),
-                }
-                for plan in plans
-            ],
-            "applied": (
-                [apply_plan(plan) for plan in plans]
-                if args.apply
-                else []
-            ),
-        }
+                    producer_upgrade_reason=(
+                        args.producer_upgrade_reason
+                    ),
+                ),
+            }
+        else:
+            plans = build_plans(
+                state_path=Path(args.state),
+                work_dir=Path(args.work_dir),
+                rescue_spool=Path(args.rescue_spool),
+                target=args.target,
+                **limits,
+            )
+            result = {
+                "schema": SCHEMA,
+                "mode": "apply" if args.apply else "dry-run",
+                "eligible_attempts": len(plans),
+                "plans": [
+                    {
+                        "identity": list(plan.identity),
+                        "prior_status": str(plan.row["status"]),
+                        "archive": str(plan.archive.path),
+                        "archive_bytes": plan.archive.byte_size,
+                        "archive_sha256": plan.archive.sha256,
+                        "durable_members": len(plan.witnesses),
+                        "durable_occurrence_tokens": sum(
+                            int(item[5]) for item in plan.witnesses
+                        ),
+                        "rejected_candidates": list(
+                            plan.rejected_candidates
+                        ),
+                    }
+                    for plan in plans
+                ],
+                "applied": (
+                    [apply_plan(plan) for plan in plans]
+                    if args.apply
+                    else []
+                ),
+            }
     except (
         OSError,
         RecoveryError,

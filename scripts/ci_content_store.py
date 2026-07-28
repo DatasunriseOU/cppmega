@@ -24,6 +24,21 @@ import threading
 from typing import Iterable, Iterator, Mapping, Sequence
 import zlib
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts.ci_zlib_evidence import (
+    MAX_CONTENT_FRAME_COMPRESSED_BYTES,
+    MAX_CONTENT_FRAME_RAW_BYTES,
+    MAX_STATE_JSON_EVIDENCE_BYTES,
+    MAX_STATE_JSON_EVIDENCE_COMPRESSED_BYTES,
+    ZlibEvidenceError,
+    content_store_evidence_bound_violation,
+    content_store_occurrence_evidence_bound_violation,
+    strict_bounded_zlib_decode,
+)
+
 
 STORE_SCHEMA = "cppmega_ci_content_store_v1"
 RECEIPT_SCHEMA = "cppmega_ci_content_store_receipt_v1"
@@ -41,6 +56,13 @@ _TOKEN_SEQUENCE_MAGIC = TOKEN_SEQUENCE_ENCODING.encode("ascii") + b"\0"
 _PACK_GLOB = "pack-*.cicp"
 _SQLITE_NAME = "index.sqlite3"
 _ORPHAN_DIRECTORY = "orphaned"
+_SQLITE_EVIDENCE_ROW_LIMIT = (
+    max(
+        MAX_CONTENT_FRAME_COMPRESSED_BYTES,
+        MAX_STATE_JSON_EVIDENCE_COMPRESSED_BYTES,
+    )
+    + 1024 * 1024
+)
 _ORPHAN_TOKEN_SEQUENCE_QUERY = """
     SELECT token_sequence_sha256 FROM token_sequences
     EXCEPT
@@ -262,6 +284,27 @@ class CIContentStore:
             timeout=60.0,
             check_same_thread=False,
         )
+        if hasattr(self._connection, "getlimit") and hasattr(
+            self._connection,
+            "setlimit",
+        ):
+            current_length_limit = self._connection.getlimit(
+                sqlite3.SQLITE_LIMIT_LENGTH
+            )
+            if current_length_limit > _SQLITE_EVIDENCE_ROW_LIMIT:
+                self._connection.setlimit(
+                    sqlite3.SQLITE_LIMIT_LENGTH,
+                    _SQLITE_EVIDENCE_ROW_LIMIT,
+                )
+            if (
+                self._connection.getlimit(sqlite3.SQLITE_LIMIT_LENGTH)
+                > _SQLITE_EVIDENCE_ROW_LIMIT
+            ):
+                self._connection.close()
+                self._closed = True
+                raise VerificationError(
+                    "content-store SQLite row length limit could not be constrained"
+                )
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA busy_timeout = 60000")
         self._connection.execute("PRAGMA foreign_keys = ON")
@@ -277,6 +320,7 @@ class CIContentStore:
                 _fsync_file(self.db_path)
                 _fsync_directory(self.root)
             self._recover_pack_tails()
+            self._preflight_evidence_bounds()
         except BaseException:
             self._connection.close()
             self._closed = True
@@ -290,6 +334,47 @@ class CIContentStore:
         if value < minimum:
             raise ValueError(
                 f"max_pack_bytes must be at least {minimum} bytes"
+            )
+
+    def _preflight_evidence_bounds(self) -> None:
+        oversized_provenance = content_store_evidence_bound_violation(
+            self._connection
+        )
+        if oversized_provenance is not None:
+            raise VerificationError(
+                "occurrence provenance exceeds its versioned byte bounds"
+            )
+        oversized_content = self._connection.execute(
+            """
+            SELECT sha256 FROM contents
+            WHERE raw_size < 0 OR raw_size > ?
+               OR compressed_size < 0 OR compressed_size > ?
+            LIMIT 1
+            """,
+            (
+                MAX_CONTENT_FRAME_RAW_BYTES,
+                MAX_CONTENT_FRAME_COMPRESSED_BYTES,
+            ),
+        ).fetchone()
+        if oversized_content is not None:
+            raise VerificationError(
+                "content frame exceeds its versioned byte bounds"
+            )
+
+    def _preflight_occurrence_evidence_bounds(
+        self,
+        key: OccurrenceKey,
+    ) -> None:
+        if content_store_occurrence_evidence_bound_violation(
+            self._connection,
+            repo=key.repo,
+            run_attempt=key.run_attempt,
+            job=key.job,
+            step=key.step,
+            chunk_ordinal=key.chunk_ordinal,
+        ):
+            raise VerificationError(
+                "occurrence provenance exceeds its versioned byte bounds"
             )
 
     @staticmethod
@@ -1218,6 +1303,16 @@ class CIContentStore:
             )
         offset = int(row["offset"])
         compressed_size = int(row["compressed_size"])
+        raw_size = int(row["raw_size"])
+        if (
+            raw_size < 0
+            or raw_size > MAX_CONTENT_FRAME_RAW_BYTES
+            or compressed_size < 0
+            or compressed_size > MAX_CONTENT_FRAME_COMPRESSED_BYTES
+        ):
+            raise VerificationError(
+                f"content {row['sha256']} exceeds its frame byte bounds"
+            )
         frame_size = int(row["frame_size"])
         expected_frame_size = _FRAME_HEADER.size + compressed_size
         if frame_size != expected_frame_size:
@@ -1262,25 +1357,19 @@ class CIContentStore:
                 f"content {row['sha256']} compressed size disagrees with SQLite"
             )
         try:
-            decompressor = zlib.decompressobj()
-            content = decompressor.decompress(compressed)
-            content += decompressor.flush()
-        except zlib.error as exc:
+            content = strict_bounded_zlib_decode(
+                compressed,
+                expected_raw_size=int(row["raw_size"]),
+                expected_sha256=str(row["sha256"]),
+                max_raw_size=MAX_CONTENT_FRAME_RAW_BYTES,
+                max_compressed_size=MAX_CONTENT_FRAME_COMPRESSED_BYTES,
+                where=f"content {row['sha256']} frame",
+                digest_function=self._content_sha256,
+            )
+        except ZlibEvidenceError as exc:
             raise VerificationError(
                 f"content {row['sha256']} cannot be decompressed"
             ) from exc
-        if (
-            not decompressor.eof
-            or decompressor.unused_data
-            or decompressor.unconsumed_tail
-        ):
-            raise VerificationError(
-                f"content {row['sha256']} has an invalid zlib stream"
-            )
-        if len(content) != int(row["raw_size"]):
-            raise VerificationError(
-                f"content {row['sha256']} decompressed size mismatch"
-            )
         try:
             canonical = self._canonical_content(content)
         except UnicodeError as exc:
@@ -1328,31 +1417,23 @@ class CIContentStore:
             raise VerificationError(
                 "invalid provenance SHA-256 in SQLite"
             )
-        compressed = bytes(row["provenance_zlib"])
+        compressed = row["provenance_zlib"]
+        raw_size = int(row["provenance_raw_size"])
         try:
-            decompressor = zlib.decompressobj()
-            encoded = decompressor.decompress(compressed)
-            encoded += decompressor.flush()
-        except zlib.error as exc:
+            encoded = strict_bounded_zlib_decode(
+                compressed,
+                expected_raw_size=raw_size,
+                expected_sha256=provenance_digest,
+                max_raw_size=MAX_STATE_JSON_EVIDENCE_BYTES,
+                max_compressed_size=(
+                    MAX_STATE_JSON_EVIDENCE_COMPRESSED_BYTES
+                ),
+                where="occurrence provenance",
+            )
+        except ZlibEvidenceError as exc:
             raise VerificationError(
                 "occurrence provenance cannot be decompressed"
             ) from exc
-        if (
-            not decompressor.eof
-            or decompressor.unused_data
-            or decompressor.unconsumed_tail
-        ):
-            raise VerificationError(
-                "occurrence provenance has an invalid zlib stream"
-            )
-        if len(encoded) != int(row["provenance_raw_size"]):
-            raise VerificationError(
-                "occurrence provenance decompressed size mismatch"
-            )
-        if hashlib.sha256(encoded).hexdigest() != provenance_digest:
-            raise VerificationError(
-                "occurrence provenance SHA-256 mismatch"
-            )
         try:
             provenance = json.loads(encoded.decode("utf-8", errors="strict"))
         except (UnicodeError, json.JSONDecodeError) as exc:
@@ -1524,6 +1605,7 @@ class CIContentStore:
             token_sequence_sha256,
         )
 
+        self._preflight_occurrence_evidence_bounds(key)
         occurrence = self._connection.execute(
             """
             SELECT content_sha256, provenance_sha256,
@@ -1583,6 +1665,14 @@ class CIContentStore:
             provenance_bytes,
             level=self.compression_level,
         )
+        if (
+            len(provenance_bytes) > MAX_STATE_JSON_EVIDENCE_BYTES
+            or len(provenance_compressed)
+            > MAX_STATE_JSON_EVIDENCE_COMPRESSED_BYTES
+        ):
+            raise ValueError(
+                "occurrence provenance exceeds its versioned byte bounds"
+            )
         if content_row is not None:
             self._assert_same_content(
                 content_row,
@@ -1644,6 +1734,13 @@ class CIContentStore:
             canonical_content,
             level=self.compression_level,
         )
+        if (
+            len(canonical_content) > MAX_CONTENT_FRAME_RAW_BYTES
+            or len(compressed) > MAX_CONTENT_FRAME_COMPRESSED_BYTES
+        ):
+            raise ValueError(
+                "content chunk exceeds its versioned frame byte bounds"
+            )
         frame_size = _FRAME_HEADER.size + len(compressed)
         if len(_PACK_MAGIC) + frame_size > self.max_pack_bytes:
             raise ValueError(
@@ -1928,29 +2025,36 @@ class CIContentStore:
         with self._lock:
             if self._closed:
                 raise ContentStoreError("content store is closed")
-            cursor = self._connection.execute(
-                """
-                SELECT repo, run_attempt, job, step, chunk_ordinal,
-                       content_sha256, provenance_sha256,
-                       provenance_raw_size, provenance_zlib
-                FROM occurrences
-                ORDER BY repo, run_attempt, job, step, chunk_ordinal
-                """
-            )
-            for row in cursor:
-                provenance, _ = self._decode_provenance_row(row)
-                yield {
-                    "occurrence_key": {
-                        "repo": str(row["repo"]),
-                        "run_attempt": str(row["run_attempt"]),
-                        "job": str(row["job"]),
-                        "step": str(row["step"]),
-                        "chunk_ordinal": int(row["chunk_ordinal"]),
-                    },
-                    "content_sha256": str(row["content_sha256"]),
-                    "provenance_sha256": str(row["provenance_sha256"]),
-                    "provenance": provenance,
-                }
+            self._connection.execute("BEGIN")
+            try:
+                self._preflight_evidence_bounds()
+                cursor = self._connection.execute(
+                    """
+                    SELECT repo, run_attempt, job, step, chunk_ordinal,
+                           content_sha256, provenance_sha256,
+                           provenance_raw_size, provenance_zlib
+                    FROM occurrences
+                    ORDER BY repo, run_attempt, job, step, chunk_ordinal
+                    """
+                )
+                for row in cursor:
+                    provenance, _ = self._decode_provenance_row(row)
+                    yield {
+                        "occurrence_key": {
+                            "repo": str(row["repo"]),
+                            "run_attempt": str(row["run_attempt"]),
+                            "job": str(row["job"]),
+                            "step": str(row["step"]),
+                            "chunk_ordinal": int(row["chunk_ordinal"]),
+                        },
+                        "content_sha256": str(row["content_sha256"]),
+                        "provenance_sha256": str(row["provenance_sha256"]),
+                        "provenance": provenance,
+                    }
+                self._connection.execute("COMMIT")
+            except BaseException:
+                self._rollback()
+                raise
 
     @staticmethod
     def _counters_from_row(row: sqlite3.Row) -> dict[str, object]:
@@ -2458,6 +2562,7 @@ class CIContentStore:
             with self._lock:
                 self._begin_write()
                 try:
+                    self._preflight_evidence_bounds()
                     report = self._verify_locked()
                     self._connection.execute("COMMIT")
                     return report

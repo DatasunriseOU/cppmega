@@ -14,6 +14,8 @@ import urllib.parse
 import zipfile
 import zlib
 
+import pytest
+
 from scripts import ci_job_log_rescue as rescue
 from scripts import ci_stream_fetch as fetch
 
@@ -275,6 +277,218 @@ def _artifact_bytes(root: Path) -> bytes:
     return bytes(payload)
 
 
+def _guard_oversized_run_metadata(
+    evidence: rescue.FetchStateEvidence,
+) -> list[int]:
+    largest_materialized_blob = [0]
+
+    def guarded_row_factory(
+        cursor: sqlite3.Cursor,
+        values: tuple[object, ...],
+    ) -> sqlite3.Row:
+        largest_materialized_blob[0] = max(
+            (
+                len(value)
+                for value in values
+                if isinstance(value, bytes)
+            ),
+            default=largest_materialized_blob[0],
+        )
+        if (
+            largest_materialized_blob[0]
+            > rescue.MAX_RUN_METADATA_COMPRESSED_BYTES
+        ):
+            raise AssertionError("oversized fetch-state BLOB was materialized")
+        return sqlite3.Row(cursor, values)
+
+    evidence.connection.row_factory = guarded_row_factory
+    return largest_materialized_blob
+
+
+def test_load_attempt_rechecks_bounds_after_second_connection_mutation(
+    tmp_path: Path,
+) -> None:
+    state = _state(tmp_path / "fetch.sqlite", [_job(101, "build")])
+    evidence = rescue.FetchStateEvidence(state)
+    try:
+        largest = _guard_oversized_run_metadata(evidence)
+        with sqlite3.connect(state) as attacker:
+            attacker.execute(
+                """
+                UPDATE attempts SET run_metadata_zlib=zeroblob(?)
+                WHERE repo='owner/repo' AND run_id=17 AND attempt=1
+                """,
+                (rescue.MAX_RUN_METADATA_COMPRESSED_BYTES + 1,),
+            )
+        with pytest.raises(
+            rescue.StateBindingError,
+            match="attempt evidence exceeds its versioned SQLite byte bounds",
+        ):
+            evidence.load_attempt(("owner/repo", 17, 1), explicit=True)
+        assert largest[0] <= rescue.MAX_RUN_METADATA_COMPRESSED_BYTES
+    finally:
+        evidence.close()
+
+
+def test_commit_rescue_preflights_mutated_row_before_publish(
+    tmp_path: Path,
+) -> None:
+    state = _state(tmp_path / "fetch.sqlite", [_job(101, "build")])
+    evidence = rescue.FetchStateEvidence(state)
+    try:
+        source = evidence.load_attempt(("owner/repo", 17, 1), explicit=True)
+        largest = _guard_oversized_run_metadata(evidence)
+        with sqlite3.connect(state) as attacker:
+            attacker.execute(
+                """
+                UPDATE attempts SET run_metadata_zlib=zeroblob(?)
+                WHERE repo='owner/repo' AND run_id=17 AND attempt=1
+                """,
+                (rescue.MAX_RUN_METADATA_COMPRESSED_BYTES + 1,),
+            )
+        publish_called = False
+
+        def publish() -> None:
+            nonlocal publish_called
+            publish_called = True
+
+        with pytest.raises(
+            rescue.StateBindingError,
+            match="attempt evidence exceeds its versioned SQLite byte bounds",
+        ):
+            evidence.commit_rescue(
+                source,
+                receipt_sha256="a" * 64,
+                synthetic_zip_sha256="b" * 64,
+                synthetic_zip_bytes=1,
+                publish=publish,
+            )
+        assert publish_called is False
+        assert largest[0] <= rescue.MAX_RUN_METADATA_COMPRESSED_BYTES
+    finally:
+        evidence.close()
+
+
+def test_fetch_state_evidence_rejects_raw_symlink_without_touching_target(
+    tmp_path: Path,
+) -> None:
+    target = _state(
+        tmp_path / "target.sqlite",
+        [_job(101, "build")],
+    )
+    target_before = target.read_bytes()
+    alias = tmp_path / "alias.sqlite"
+    alias.symlink_to(target)
+
+    with pytest.raises(
+        rescue.StateBindingError,
+        match="symlink|does not exist safely",
+    ):
+        rescue.FetchStateEvidence(alias)
+
+    assert alias.is_symlink()
+    assert target.read_bytes() == target_before
+
+
+def test_fetch_state_evidence_refuses_live_finalization_lease(
+    tmp_path: Path,
+) -> None:
+    from scripts import ci_stream_receipts as receipts
+
+    state = _state(
+        tmp_path / "fetch.sqlite",
+        [_job(101, "build")],
+    )
+    state_before = state.read_bytes()
+    state_stat_before = state.stat()
+    descriptor = receipts._acquire_fetch_state_finalization_lease(state)
+    try:
+        with pytest.raises(
+            rescue.StateBindingError,
+            match="live process lease",
+        ):
+            rescue.FetchStateEvidence(state)
+    finally:
+        receipts._release_fetch_state_finalization_lease(descriptor)
+
+    state_stat_after = state.stat()
+    assert state.read_bytes() == state_before
+    assert state_stat_after.st_size == state_stat_before.st_size
+    assert state_stat_after.st_mtime_ns == state_stat_before.st_mtime_ns
+
+
+def test_fetch_state_evidence_holds_lease_until_close(
+    tmp_path: Path,
+) -> None:
+    from scripts import ci_stream_receipts as receipts
+
+    state = _state(
+        tmp_path / "fetch.sqlite",
+        [_job(101, "build")],
+    )
+    evidence = rescue.FetchStateEvidence(state)
+    try:
+        with pytest.raises(
+            receipts.ReceiptFinalizationError,
+            match="live process lease",
+        ):
+            receipts._acquire_fetch_state_finalization_lease(state)
+    finally:
+        evidence.close()
+
+    descriptor = receipts._acquire_fetch_state_finalization_lease(state)
+    receipts._release_fetch_state_finalization_lease(descriptor)
+
+
+def test_fetch_state_path_swap_fails_before_publish_and_preserves_target(
+    tmp_path: Path,
+) -> None:
+    state = _state(
+        tmp_path / "fetch.sqlite",
+        [_job(101, "build")],
+    )
+    target = _state(
+        tmp_path / "target.sqlite",
+        [_job(202, "other")],
+        run_id=18,
+    )
+    target_before = target.read_bytes()
+    evidence = rescue.FetchStateEvidence(state)
+    original = tmp_path / "fetch.original.sqlite"
+    try:
+        source = evidence.load_attempt(
+            ("owner/repo", 17, 1),
+            explicit=True,
+        )
+        state.replace(original)
+        state.symlink_to(target)
+        publish_called = False
+
+        def publish() -> None:
+            nonlocal publish_called
+            publish_called = True
+
+        with pytest.raises(
+            rescue.StateBindingError,
+            match="identity changed|symlink|path is unsafe",
+        ):
+            evidence.commit_rescue(
+                source,
+                receipt_sha256="a" * 64,
+                synthetic_zip_sha256="b" * 64,
+                synthetic_zip_bytes=1,
+                publish=publish,
+            )
+        assert publish_called is False
+        assert target.read_bytes() == target_before
+    finally:
+        evidence.close()
+        if state.is_symlink():
+            state.unlink()
+        if original.exists():
+            original.replace(state)
+
+
 def test_full_200_log_and_proven_404_complete_and_requeue(
     tmp_path: Path,
 ) -> None:
@@ -318,24 +532,56 @@ def test_full_200_log_and_proven_404_complete_and_requeue(
         "operator/job_rescue",
         "JobRescueReceipt",
     )
-    assert "receipt_sha256=" in audit[3]
+    audit_evidence = json.loads(audit[3])
+    assert audit[3] == _canonical(audit_evidence).decode("utf-8")
+    assert set(audit_evidence) == {
+        "schema",
+        "producer_lineage",
+        "receipt_sha256",
+        "source_row_sha256",
+        "source_state_sha256",
+        "synthetic_zip",
+        "jobs_ledger_sha256",
+    }
+    assert audit_evidence["schema"] == rescue.LEDGER_EVIDENCE_SCHEMA
+    assert audit_evidence["producer_lineage"] == rescue._producer_lineage(
+        rescue._producer_binding()
+    )
+    for field in (
+        "receipt_sha256",
+        "source_row_sha256",
+        "source_state_sha256",
+        "jobs_ledger_sha256",
+    ):
+        assert re.fullmatch(r"[0-9a-f]{64}", audit_evidence[field])
 
     spool = tmp_path / "rescue-spool"
     archive_path = spool / "owner__repo--17--attempt-1.zip"
+    with sqlite3.connect(state) as connection:
+        metadata_row = connection.execute(
+            """
+            SELECT run_metadata_sha256,run_metadata_zlib
+            FROM attempts
+            WHERE repo='owner/repo' AND run_id=17 AND attempt=1
+            """
+        ).fetchone()
+    assert metadata_row is not None
+    run_metadata = json.loads(zlib.decompress(metadata_row[1]))
     located = fetch.RescueSpool(spool).locate(
         fetch.Attempt(
             repo="owner/repo",
             run_id=17,
             attempt=1,
             created_at="2026-07-25T10:00:00Z",
-            run_metadata={},
-            run_metadata_sha256="a" * 64,
+            run_metadata=run_metadata,
+            run_metadata_sha256=metadata_row[0],
             run_metadata_source="github-workflow-run-attempt-api",
             run_metadata_source_attempt=1,
             run_metadata_exact=True,
             inventory_seed_attempt=1,
             inventory_seed_metadata_sha256="a" * 64,
-        )
+        ),
+        audit=audit_evidence,
     )
     assert isinstance(located, fetch.ArchiveSource)
     assert located.path == archive_path
@@ -371,6 +617,110 @@ def test_full_200_log_and_proven_404_complete_and_requeue(
         "unresolved_jobs": 0,
         "zip_members": 1,
     }
+    durable_members = {
+        "0_101.txt": (
+            hashlib.sha256(b"complete build log\n").hexdigest(),
+            len(b"complete build log\n"),
+        )
+    }
+    validation_kwargs = {
+        "repo": "owner/repo",
+        "canonical_repo": "owner/repo",
+        "run_id": 17,
+        "attempt": 1,
+        "created_at": "2026-07-25T10:00:00Z",
+        "run_metadata_sha256": str(row["run_metadata_sha256"]),
+        "run_metadata_raw_size": int(row["run_metadata_raw_size"]),
+        "archive_sha256": located.raw_sha256,
+        "archive_size": located.raw_size,
+        "jobs_sha256": str(row["jobs_sha256"]),
+        "jobs_raw_size": int(row["jobs_raw_size"]),
+        "job_count": len(jobs),
+        "member_count": 1,
+        "member_uncompressed_bytes": len(b"complete build log\n"),
+        "jobs": jobs,
+    }
+    fetch._validate_rescue_archive_provenance(
+        located.provenance,
+        **validation_kwargs,
+        durable_members=durable_members,
+    )
+
+    forged_provenance = json.loads(_canonical(located.provenance))
+    forged_record = forged_provenance["resolved_jobs"]["records"][0]
+    forged_record["log"]["sha256"] = "f" * 64
+    with pytest.raises(
+        fetch.BindingError,
+        match="artifact differs from embedded records",
+    ):
+        fetch._validate_rescue_archive_provenance(
+            forged_provenance,
+            **validation_kwargs,
+        )
+    forged_resolved_raw = b"".join(
+        _canonical(record) + b"\n"
+        for record in forged_provenance["resolved_jobs"]["records"]
+    )
+    forged_resolved_sha256 = hashlib.sha256(
+        forged_resolved_raw
+    ).hexdigest()
+    forged_provenance["resolved_jobs"].update(
+        {
+            "bytes": len(forged_resolved_raw),
+            "sha256": forged_resolved_sha256,
+        }
+    )
+    forged_receipt = forged_provenance["job_rescue_receipt"]["receipt"]
+    forged_receipt["artifacts"]["resolved_jobs"].update(
+        {
+            "bytes": len(forged_resolved_raw),
+            "sha256": forged_resolved_sha256,
+        }
+    )
+    forged_receipt_raw = _canonical(forged_receipt) + b"\n"
+    forged_provenance["job_rescue_receipt"].update(
+        {
+            "bytes": len(forged_receipt_raw),
+            "sha256": hashlib.sha256(forged_receipt_raw).hexdigest(),
+        }
+    )
+    forged_audit = dict(audit_evidence)
+    forged_audit.update(
+        {
+            "receipt_sha256": hashlib.sha256(
+                forged_receipt_raw
+            ).hexdigest(),
+            "source_state_sha256": hashlib.sha256(
+                _canonical(forged_receipt["source_state"])
+            ).hexdigest(),
+            "jobs_ledger_sha256": forged_receipt["source_state"][
+                "jobs_ledger_sha256"
+            ],
+        }
+    )
+    forged_receipt_sha256, forged_source_row_sha256 = (
+        fetch._validate_rescue_archive_provenance(
+            forged_provenance,
+            **validation_kwargs,
+        )
+    )
+    fetch._validate_job_rescue_operator_audit(
+        forged_audit,
+        receipt_sha256=forged_receipt_sha256,
+        source_row_sha256=forged_source_row_sha256,
+        source_state=forged_receipt["source_state"],
+        archive_sha256=located.raw_sha256,
+        archive_size=located.raw_size,
+    )
+    with pytest.raises(
+        fetch.BindingError,
+        match="resolved log differs from current durable member",
+    ):
+        fetch._validate_rescue_archive_provenance(
+            forged_provenance,
+            **validation_kwargs,
+            durable_members=durable_members,
+        )
     assert b"api-secret" not in _artifact_bytes(tmp_path / "rescue-work")
     assert b"api-secret" not in _artifact_bytes(spool)
 
@@ -492,6 +842,123 @@ def test_resume_is_deterministic_and_completed_replay_is_idempotent(
     assert (
         other / "rescue-spool" / "owner__repo--17--attempt-1.zip"
     ).read_bytes() == archive_bytes
+
+
+def test_legacy_job_rescue_audit_requires_explicit_append_only_migration(
+    tmp_path: Path,
+) -> None:
+    jobs = [_job(101, "build")]
+    state = _state(tmp_path / "fetch.sqlite", jobs)
+    opener = _ScriptedOpener(
+        {101: [_ScriptedOpener.inline(b"legacy build log\n")]}
+    )
+    worker = _worker(tmp_path, state, opener)
+    try:
+        first = worker.run_once(target=("owner/repo", 17, 1))
+    finally:
+        worker.close()
+    assert first["failed_attempts"] == 0
+
+    spool = tmp_path / "rescue-spool"
+    base = "owner__repo--17--attempt-1"
+    receipt_path = spool / f"{base}.receipt.json"
+    receipt = json.loads(receipt_path.read_bytes())
+    original_binding = dict(receipt.pop("producer_binding"))
+    legacy_receipt_raw = _canonical(receipt) + b"\n"
+    receipt_path.write_bytes(legacy_receipt_raw)
+    legacy_receipt_sha = hashlib.sha256(legacy_receipt_raw).hexdigest()
+    source_row_sha = str(receipt["source_state"]["attempt_row_sha256"])
+    legacy_audit = (
+        f"receipt_sha256={legacy_receipt_sha} "
+        f"source_row_sha256={source_row_sha}"
+    )
+    with sqlite3.connect(state) as connection:
+        connection.execute(
+            """
+            UPDATE request_ledger SET error_message=?
+            WHERE endpoint='operator/job_rescue'
+              AND outcome='operator/job_rescue'
+              AND error_class='JobRescueReceipt'
+            """,
+            (legacy_audit,),
+        )
+
+    denied = _worker(
+        tmp_path,
+        state,
+        _ScriptedOpener(
+            {101: [AssertionError("completed rescue must not refetch")]}
+        ),
+    )
+    try:
+        denied_result = denied.run_once(target=("owner/repo", 17, 1))
+    finally:
+        denied.close()
+    assert denied_result["failed_attempts"] == 1
+    assert "explicit producer upgrade authorization" in str(
+        denied_result["results"][0]["error_message"]
+    )
+
+    prior_sha = "6ac4ac14" + "0" * 56
+    reason = "authorize audited migration of the legacy rescue producer"
+    migrated = _worker(
+        tmp_path,
+        state,
+        _ScriptedOpener(
+            {101: [AssertionError("completed rescue must not refetch")]}
+        ),
+        allow_producer_upgrade_from_sha256=prior_sha,
+        producer_upgrade_reason=reason,
+    )
+    try:
+        migrated_result = migrated.run_once(
+            target=("owner/repo", 17, 1)
+        )
+    finally:
+        migrated.close()
+    assert migrated_result["failed_attempts"] == 0
+    assert migrated_result["results"][0]["idempotent_replay"] is True
+    assert receipt_path.read_bytes() == legacy_receipt_raw
+
+    with sqlite3.connect(state) as connection:
+        rows = connection.execute(
+            """
+            SELECT error_message FROM request_ledger
+            WHERE endpoint='operator/job_rescue'
+              AND outcome='operator/job_rescue'
+              AND error_class='JobRescueReceipt'
+            ORDER BY id
+            """
+        ).fetchall()
+    assert len(rows) == 2
+    assert rows[0][0] == legacy_audit
+    migrated_audit = json.loads(rows[1][0])
+    lineage = migrated_audit["producer_lineage"]
+    assert lineage["origin"] == {
+        "script_sha256": prior_sha,
+        "semantic_contract_sha256": (
+            fetch.JOB_RESCUE_LEGACY_SEMANTIC_CONTRACT_SHA256
+        ),
+    }
+    assert lineage["current"] == rescue._producer_binding()
+    assert lineage["upgrades"][-1]["reason"] == reason
+    assert lineage["upgrades"][-1]["from"]["script_sha256"] == prior_sha
+    assert (
+        lineage["upgrades"][-1]["to"]["script_sha256"]
+        == rescue._producer_binding()["script_sha256"]
+    )
+    assert original_binding != lineage["origin"]
+
+    zip_path = spool / f"{base}.zip"
+    fetch._validate_job_rescue_operator_audit(
+        migrated_audit,
+        receipt_sha256=legacy_receipt_sha,
+        source_row_sha256=source_row_sha,
+        source_state=receipt["source_state"],
+        archive_sha256=hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+        archive_size=zip_path.stat().st_size,
+        receipt_producer_binding=None,
+    )
 
 
 def test_row_changed_race_fails_before_spool_publish(tmp_path: Path) -> None:

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from functools import lru_cache
+import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
 import sqlite3
 from typing import Any, Mapping
 import urllib.parse
@@ -15,6 +19,22 @@ from scripts import ci_stream_inventory as ci
 
 START = "2026-01-01T00:00:00Z"
 END = "2026-01-01T00:00:04Z"
+
+
+@lru_cache(maxsize=None)
+def _compressed_repetition(raw_size: int) -> tuple[bytes, str]:
+    compressor = zlib.compressobj(9)
+    digest = hashlib.sha256()
+    parts: list[bytes] = []
+    chunk = b"x" * (1024 * 1024)
+    remaining = raw_size
+    while remaining:
+        current = chunk[: min(len(chunk), remaining)]
+        digest.update(current)
+        parts.append(compressor.compress(current))
+        remaining -= len(current)
+    parts.append(compressor.flush())
+    return b"".join(parts), digest.hexdigest()
 
 
 def _write_repo_list(path: Path, names: list[str]) -> Path:
@@ -129,6 +149,21 @@ def _scope(tmp_path: Path, names: list[str] | None = None, **kwargs: Any) -> ci.
     return ci.load_repo_scope(repo_list, **kwargs)
 
 
+def test_inventory_cli_requires_explicit_repo_list() -> None:
+    parser = ci._build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--db", "inventory.sqlite3"])
+    args = parser.parse_args(
+        [
+            "--repo-list",
+            "canonical-repos.json",
+            "--db",
+            "inventory.sqlite3",
+        ]
+    )
+    assert args.repo_list == "canonical-repos.json"
+
+
 def _inventory(
     tmp_path: Path,
     api: Any,
@@ -228,6 +263,10 @@ def test_paginates_and_preserves_full_compressed_metadata_and_attempts(
     assert receipt["production_complete"] is True
     assert receipt["source_count_drift"]["windows"] == 0
     assert receipt["run_count"] == 205
+    assert receipt["expected_attempt_count"] == sum(
+        int(run["run_attempt"]) for run in runs
+    )
+    assert len(receipt["expected_attempt_set_sha256"]) == 64
     assert receipt["metadata_encoding"] == ci.METADATA_ENCODING
     final_progress = json.loads(
         (tmp_path / "inventory.sqlite.progress.json").read_text()
@@ -249,6 +288,67 @@ def test_paginates_and_preserves_full_compressed_metadata_and_attempts(
         restored = json.loads(zlib.decompress(row[0]))
         assert restored == runs[-1]
         assert row[1:] == (2, "in_progress", None)
+
+
+def test_inventory_rejects_oversized_run_metadata_at_api_ingest(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, DatasetAPI([]))
+    start = ci.parse_utc_instant(START)
+    run = _run(1, start + 1)
+    run["oversized"] = "x" * ci.MAX_RUN_METADATA_BYTES
+    with pytest.raises(
+        ci.MalformedAPIError,
+        match="versioned raw-byte limit",
+    ):
+        inventory.db._normalize_run(
+            "owner/repo",
+            run,
+            start_epoch=start,
+            end_epoch=ci.parse_utc_instant(END),
+        )
+
+
+def test_inventory_completion_rejects_metadata_zlib_bomb(
+    tmp_path: Path,
+) -> None:
+    start = ci.parse_utc_instant(START)
+    inventory = _inventory(
+        tmp_path,
+        DatasetAPI([_run(1, start + 1)]),
+    )
+    inventory.run()
+    raw_size = ci.MAX_RUN_METADATA_BYTES + 1
+    compressed, digest = _compressed_repetition(raw_size)
+    run_set_sha256 = ci._hash_lines(
+        [f"owner/repo\t1\t1\t{digest}"]
+    )
+    with sqlite3.connect(tmp_path / "inventory.sqlite") as connection:
+        connection.execute(
+            """
+            UPDATE runs SET metadata_blob=?,metadata_sha256=?
+            WHERE repo_key='owner/repo' AND run_id=1
+            """,
+            (sqlite3.Binary(compressed), digest),
+        )
+        connection.execute(
+            """
+            UPDATE window_runs SET metadata_sha256=?
+            WHERE repo_key='owner/repo' AND run_id=1
+            """,
+            (digest,),
+        )
+        connection.execute(
+            "UPDATE search_windows SET run_keys_sha256=? WHERE status='done'",
+            (run_set_sha256,),
+        )
+        connection.execute(
+            "UPDATE window_pages SET run_keys_sha256=?",
+            (run_set_sha256,),
+        )
+    connection.close()
+    with pytest.raises(ci.CompletionError, match="bound"):
+        inventory.db.completion_receipt()
 
 
 def test_recursively_splits_over_1000_and_assigns_boundary_to_right_window(
@@ -419,7 +519,15 @@ def test_split_parent_count_drift_is_explicit_and_not_production_complete(
     inventory = _inventory(tmp_path, SplitCountDriftAPI(start))
 
     inventory.run()
-    receipt = inventory.write_completion_receipt(tmp_path / "receipt.json")
+    with pytest.raises(
+        ci.CompletionError,
+        match="production inventory receipt refused",
+    ):
+        inventory.write_completion_receipt(tmp_path / "production.json")
+    receipt = inventory.write_completion_receipt(
+        tmp_path / "receipt.json",
+        allow_nonproduction=True,
+    )
 
     drift_line = (
         f"S\towner/repo\t{start}\t{start + 4}\t101\t100\t1"
@@ -661,6 +769,7 @@ def test_cardinality_union_proof_survives_process_resume(
         assert conn.execute(
             "SELECT status FROM search_windows"
         ).fetchall() == [("failed",)]
+    conn.close()
 
     resumed_api = UnstableTiePaginationAPI(
         start,
@@ -771,6 +880,7 @@ def test_failed_page_resumes_from_sqlite_without_replaying_completed_pages(
             "UPDATE inventory_meta SET value=? WHERE key='script_sha256'",
             ("legacy-script-sha",),
         )
+    conn.close()
 
     # The failed first request committed no page.  --resume resets only the
     # failed window and reuses the exact scope/interval/script binding.
@@ -840,6 +950,7 @@ def test_v2_to_v3_resume_requires_exact_audited_producer_migration(
                 "2026-01-01T00:00:00Z",
             ),
         )
+    conn.close()
 
     with pytest.raises(ci.BindingError, match="exact bound producer"):
         _inventory(tmp_path, DatasetAPI([]), resume=True)
@@ -1033,6 +1144,7 @@ def test_v2_incomplete_convergence_resumes_with_persisted_attempt_number(
             "UPDATE inventory_meta SET value=? WHERE key='script_sha256'",
             (old_v2_script,),
         )
+    conn.close()
 
     resumed = _inventory(
         tmp_path,
@@ -1093,6 +1205,7 @@ def test_malformed_api_is_ledgered_and_receipt_is_refused(tmp_path: Path) -> Non
         assert conn.execute(
             "SELECT status FROM search_windows"
         ).fetchall() == [("failed",)]
+    conn.close()
     with pytest.raises(ci.CompletionError, match="open/failed windows"):
         inventory.write_completion_receipt(tmp_path / "must-not-exist.json")
     assert not (tmp_path / "must-not-exist.json").exists()
@@ -1119,10 +1232,905 @@ def test_receipt_refuses_open_windows_and_smoke_never_claims_production(
         smoke_dir, DatasetAPI([]), scope=scope, db_name="smoke.sqlite"
     )
     smoke_inventory.run()
-    receipt = smoke_inventory.write_completion_receipt(smoke_dir / "receipt.json")
-    assert receipt["mode"] == "smoke"
+    with pytest.raises(
+        ci.CompletionError,
+        match="production inventory receipt refused",
+    ):
+        smoke_inventory.write_completion_receipt(
+            smoke_dir / "production.json"
+        )
+    receipt = smoke_inventory.write_completion_receipt(
+        smoke_dir / "receipt.json",
+        allow_nonproduction=True,
+    )
+    assert receipt["mode"] == "smoke-diagnostic"
     assert receipt["enumeration_complete"] is True
     assert receipt["source_snapshot_stable"] is True
     assert receipt["production_complete"] is False
     assert receipt["repo_list"]["repos"] == 1
+    forged = dict(receipt)
+    forged["production_complete"] = True
+    forged["mode"] = "production"
+    ci.atomic_write_json(smoke_dir / "forged.json", forged)
+    with pytest.raises(
+        ci.CompletionError,
+        match="production classification differs",
+    ):
+        ci.verify_inventory_completion_receipt(
+            smoke_dir / "smoke.sqlite",
+            smoke_dir / "forged.json",
+            require_production=True,
+        )
+
+
+def test_completion_receipt_verifier_is_immutable_and_read_only(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, DatasetAPI([]))
+    inventory.run()
+    database = tmp_path / "inventory.sqlite"
+    receipt_path = tmp_path / "receipt.json"
+    inventory.write_completion_receipt(receipt_path)
+    database.chmod(0o444)
+    try:
+        stat_before = database.stat()
+        snapshot_before = (
+            stat_before.st_size,
+            stat_before.st_mtime_ns,
+            stat_before.st_ino,
+            ci._sha256_bytes(database.read_bytes()),
+        )
+
+        verified, _receipt_sha256 = ci.verify_inventory_completion_receipt(
+            database,
+            receipt_path,
+            require_production=True,
+        )
+
+        stat_after = database.stat()
+        snapshot_after = (
+            stat_after.st_size,
+            stat_after.st_mtime_ns,
+            stat_after.st_ino,
+            ci._sha256_bytes(database.read_bytes()),
+        )
+        assert verified["production_complete"] is True
+        assert snapshot_after == snapshot_before
+    finally:
+        database.chmod(0o644)
+
+
+def _refresh_forged_database_artifact(
+    receipt_path: Path,
+    database: Path,
+) -> None:
+    forged = json.loads(receipt_path.read_text(encoding="utf-8"))
+    forged["database_artifact"].update(
+        {
+            "byte_size": database.stat().st_size,
+            "sha256": ci._sha256_file(database),
+        }
+    )
+    ci.atomic_write_json(receipt_path, forged)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "sql"),
+    (
+        (
+            "extra_table",
+            "CREATE TABLE attacker_controlled(payload TEXT);",
+        ),
+        (
+            "extra_view",
+            "CREATE VIEW attacker_view AS SELECT repo_key FROM repos;",
+        ),
+        (
+            "extra_trigger",
+            """
+            CREATE TRIGGER attacker_trigger
+            AFTER INSERT ON request_ledger
+            BEGIN
+              SELECT NEW.endpoint;
+            END;
+            """,
+        ),
+        (
+            "extra_index",
+            "CREATE INDEX attacker_index ON request_ledger(endpoint);",
+        ),
+        (
+            "altered_table",
+            "ALTER TABLE runs ADD COLUMN injected TEXT;",
+        ),
+        (
+            "dropped_index",
+            "DROP INDEX idx_request_ledger_window;",
+        ),
+    ),
+)
+def test_v5_verifier_rejects_exact_sqlite_schema_mutation_matrix(
+    tmp_path: Path,
+    mutation: str,
+    sql: str,
+) -> None:
+    del mutation
+    inventory = _inventory(tmp_path, DatasetAPI([]))
+    inventory.run()
+    database = tmp_path / "inventory.sqlite"
+    receipt_path = tmp_path / "receipt.json"
+    inventory.write_completion_receipt(receipt_path)
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.executescript(sql)
+        connection.commit()
+    _refresh_forged_database_artifact(receipt_path, database)
+
+    with pytest.raises(
+        ci.CompletionError,
+        match="SQLite schema differs from the exact versioned contract",
+    ):
+        ci.verify_inventory_completion_receipt(
+            database,
+            receipt_path,
+            require_production=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "sql", "error"),
+    (
+        (
+            "extra_key",
+            """
+            INSERT INTO inventory_meta(key,value)
+            VALUES ('attacker_controlled','x');
+            """,
+            "metadata keys differ from the exact versioned contract",
+        ),
+        (
+            "missing_key",
+            "DELETE FROM inventory_meta WHERE key='max_repos';",
+            "metadata keys differ from the exact versioned contract",
+        ),
+        (
+            "production_max_repos",
+            """
+            UPDATE inventory_meta SET value='1'
+            WHERE key='max_repos';
+            """,
+            "max_repos is inconsistent",
+        ),
+        (
+            "invalid_created_at",
+            """
+            UPDATE inventory_meta SET value='2026-01-01T00:00:00+00:00'
+            WHERE key='created_at';
+            """,
+            "created_at must be a canonical UTC timestamp",
+        ),
+    ),
+)
+def test_v5_verifier_rejects_exact_inventory_meta_contract_mutations(
+    tmp_path: Path,
+    mutation: str,
+    sql: str,
+    error: str,
+) -> None:
+    del mutation
+    inventory = _inventory(tmp_path, DatasetAPI([]))
+    inventory.run()
+    database = tmp_path / "inventory.sqlite"
+    receipt_path = tmp_path / "receipt.json"
+    inventory.write_completion_receipt(receipt_path)
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.executescript(sql)
+        connection.commit()
+    _refresh_forged_database_artifact(receipt_path, database)
+
+    with pytest.raises(ci.CompletionError, match=error):
+        ci.verify_inventory_completion_receipt(
+            database,
+            receipt_path,
+            require_production=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "sql", "error"),
+    (
+        (
+            "repo_identity",
+            """
+            UPDATE repos SET owner='Mallory',name='Forged'
+            WHERE repo_key='owner/repo';
+            """,
+            "owner/name/canonical/ordinal identity",
+        ),
+        (
+            "request_shape",
+            """
+            UPDATE request_ledger
+            SET requested_at='not-utc',endpoint='Mallory',
+                outcome='forged',latency_ms=-999
+            WHERE id=1;
+            """,
+            "requested_at must be a canonical UTC timestamp",
+        ),
+        (
+            "run_projection",
+            """
+            UPDATE runs
+            SET status='forged',conclusion='forged',head_sha='bad'
+            WHERE repo_key='owner/repo' AND run_id=1;
+            """,
+            "status differs from its canonical decoded metadata projection",
+        ),
+        (
+            "window_timestamp",
+            """
+            UPDATE search_windows SET created_at='not-utc'
+            WHERE id=1;
+            """,
+            "created_at must be a canonical UTC timestamp",
+        ),
+        (
+            "page_timestamp",
+            """
+            UPDATE window_pages SET fetched_at='not-utc'
+            WHERE window_id=1 AND page_no=1;
+            """,
+            "fetched_at must be a canonical UTC timestamp",
+        ),
+        (
+            "window_member_metadata",
+            """
+            UPDATE window_runs SET metadata_sha256=?
+            WHERE window_id=1 AND repo_key='owner/repo' AND run_id=1;
+            """,
+            "run membership differs",
+        ),
+        (
+            "sequence_poison",
+            """
+            UPDATE sqlite_sequence SET seq=9223372036854775807
+            WHERE name='request_ledger';
+            """,
+            "sequence ledger differs from exact table maxima",
+        ),
+    ),
+)
+def test_v5_verifier_rejects_semantic_table_mutation_matrix(
+    tmp_path: Path,
+    mutation: str,
+    sql: str,
+    error: str,
+) -> None:
+    start = ci.parse_utc_instant(START)
+    inventory = _inventory(
+        tmp_path,
+        DatasetAPI([_run(1, start + 1)]),
+    )
+    inventory.run()
+    database = tmp_path / "inventory.sqlite"
+    receipt_path = tmp_path / "receipt.json"
+    inventory.write_completion_receipt(receipt_path)
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        if mutation == "window_member_metadata":
+            connection.execute(sql, ("0" * 64,))
+        else:
+            connection.executescript(sql)
+        connection.commit()
+    _refresh_forged_database_artifact(receipt_path, database)
+
+    with pytest.raises(ci.CompletionError, match=error):
+        ci.verify_inventory_completion_receipt(
+            database,
+            receipt_path,
+            require_production=True,
+        )
+
+
+def test_v5_logical_digest_covers_every_exact_table_and_persisted_column(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, DatasetAPI([]))
+    inventory.run()
+    database = tmp_path / "inventory.sqlite"
+    receipt_path = tmp_path / "receipt.json"
+    inventory.write_completion_receipt(receipt_path)
+    validated = ci.InventoryDB(
+        database,
+        initialize_schema=False,
+    )._validate_and_digests()
+    ledgers = validated["logical_table_ledgers"]
+
+    assert {item["table"] for item in ledgers} == {
+        row[1]
+        for row in ci._EXPECTED_SQLITE_SCHEMA_ROWS
+        if row[0] == "table"
+    }
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute(
+            """
+            UPDATE request_ledger SET rate_remaining='persisted-poison'
+            WHERE id=1
+            """
+        )
+        connection.commit()
+    _refresh_forged_database_artifact(receipt_path, database)
+
+    with pytest.raises(ci.CompletionError):
+        ci.verify_inventory_completion_receipt(
+            database,
+            receipt_path,
+            require_production=True,
+        )
+
+
+def test_v5_verifier_rejects_cross_repository_window_parent(
+    tmp_path: Path,
+) -> None:
+    scope = _scope(tmp_path, ["Owner/Repo", "Other/Repo"])
+    inventory = _inventory(
+        tmp_path,
+        DatasetAPI([]),
+        scope=scope,
+    )
+    inventory.run()
+    database = tmp_path / "inventory.sqlite"
+    receipt_path = tmp_path / "receipt.json"
+    inventory.write_completion_receipt(receipt_path)
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        roots = connection.execute(
+            """
+            SELECT id,repo_key FROM search_windows
+            ORDER BY repo_key
+            """
+        ).fetchall()
+        assert len(roots) == 2
+        connection.execute(
+            """
+            UPDATE search_windows SET parent_id=?,depth=1
+            WHERE id=?
+            """,
+            (roots[0][0], roots[1][0]),
+        )
+        connection.commit()
+    _refresh_forged_database_artifact(receipt_path, database)
+
+    with pytest.raises(
+        ci.CompletionError,
+        match="cross-repository or depth-inconsistent parent",
+    ):
+        ci.verify_inventory_completion_receipt(
+            database,
+            receipt_path,
+            require_production=True,
+        )
+
+
+def test_v5_verifier_rejects_split_window_leaf_accounting(
+    tmp_path: Path,
+) -> None:
+    start = ci.parse_utc_instant(START)
+    inventory = _inventory(
+        tmp_path,
+        DuplicatePageAPI(
+            [_run(run_id, start + 1) for run_id in range(1, 102)]
+        ),
+    )
+    inventory.run()
+    database = tmp_path / "inventory.sqlite"
+    receipt_path = tmp_path / "receipt.json"
+    inventory.write_completion_receipt(receipt_path)
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        assert connection.execute(
+            "SELECT COUNT(*) FROM search_windows WHERE status='split'"
+        ).fetchone() == (1,)
+        connection.execute(
+            """
+            UPDATE search_windows SET pages_done=1
+            WHERE status='split'
+            """
+        )
+        connection.commit()
+    _refresh_forged_database_artifact(receipt_path, database)
+
+    with pytest.raises(
+        ci.CompletionError,
+        match="retains leaf page/run accounting",
+    ):
+        ci.verify_inventory_completion_receipt(
+            database,
+            receipt_path,
+            require_production=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "sql", "error"),
+    (
+        (
+            "pass_timestamp",
+            """
+            UPDATE convergence_passes SET observed_at='not-utc'
+            WHERE pass_no=(SELECT MIN(pass_no) FROM convergence_passes);
+            """,
+            "observed_at must be a canonical UTC timestamp",
+        ),
+        (
+            "candidate_projection",
+            """
+            UPDATE convergence_runs SET status='forged'
+            WHERE run_id=(SELECT MIN(run_id) FROM convergence_runs);
+            """,
+            "status differs from its canonical decoded metadata projection",
+        ),
+        (
+            "closure_timestamp",
+            """
+            UPDATE window_union_closures SET closed_at='not-utc';
+            """,
+            "closed_at must be a canonical UTC timestamp",
+        ),
+    ),
+)
+def test_v5_verifier_rejects_dense_union_semantic_mutations(
+    tmp_path: Path,
+    mutation: str,
+    sql: str,
+    error: str,
+) -> None:
+    del mutation
+    start = ci.parse_utc_instant(START)
+    missing_last, missing_first, missing_middle = _tie_patterns()
+    inventory = _inventory(
+        tmp_path,
+        UnstableTiePaginationAPI(
+            start,
+            [
+                missing_last,
+                missing_last,
+                missing_first,
+                missing_middle,
+            ],
+        ),
+        end=_iso(start + 1),
+    )
+    inventory.run()
+    database = tmp_path / "inventory.sqlite"
+    receipt_path = tmp_path / "receipt.json"
+    inventory.write_completion_receipt(receipt_path)
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.executescript(sql)
+        connection.commit()
+    _refresh_forged_database_artifact(receipt_path, database)
+
+    with pytest.raises(ci.CompletionError, match=error):
+        ci.verify_inventory_completion_receipt(
+            database,
+            receipt_path,
+            require_production=True,
+        )
+
+
+def test_v5_verifier_rejects_foreign_key_violation_after_artifact_refresh(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, DatasetAPI([]))
+    inventory.run()
+    database = tmp_path / "inventory.sqlite"
+    receipt_path = tmp_path / "receipt.json"
+    inventory.write_completion_receipt(receipt_path)
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute(
+            """
+            INSERT INTO window_pages(
+              window_id,page_no,total_count,item_count,
+              distinct_item_count,duplicate_item_count,
+              payload_sha256,run_keys_sha256,fetched_at
+            ) VALUES (999999,1,0,0,0,0,?,?,?)
+            """,
+            (
+                "0" * 64,
+                "0" * 64,
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        connection.commit()
+        violation = connection.execute(
+            "PRAGMA foreign_key_check"
+        ).fetchone()
+    assert violation is not None
+    assert violation[0] == "window_pages"
+    assert violation[2] == "search_windows"
+    _refresh_forged_database_artifact(receipt_path, database)
+
+    with pytest.raises(
+        ci.CompletionError,
+        match="SQLite foreign-key check failed",
+    ):
+        ci.verify_inventory_completion_receipt(
+            database,
+            receipt_path,
+            require_production=True,
+        )
+
+
+def test_v5_verifier_rejects_corrupt_freelist_after_artifact_refresh(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, DatasetAPI([]))
+    inventory.run()
+    database = tmp_path / "inventory.sqlite"
+    receipt_path = tmp_path / "receipt.json"
+    inventory.write_completion_receipt(receipt_path)
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("CREATE TABLE integrity_padding(payload BLOB)")
+        connection.execute(
+            "INSERT INTO integrity_padding(payload) VALUES (zeroblob(?))",
+            (2 * 1024 * 1024,),
+        )
+        connection.execute("DROP TABLE integrity_padding")
+        connection.commit()
+
+    with database.open("r+b") as handle:
+        header = handle.read(100)
+        page_size = int.from_bytes(header[16:18], "big")
+        if page_size == 1:
+            page_size = 65_536
+        page_count = int.from_bytes(header[28:32], "big")
+        first_freelist_trunk = int.from_bytes(header[32:36], "big")
+        assert page_size > 0
+        assert page_count > 0
+        assert 0 < first_freelist_trunk <= page_count
+        handle.seek((first_freelist_trunk - 1) * page_size)
+        handle.write((page_count + 1000).to_bytes(4, "big"))
+        handle.flush()
+        os.fsync(handle.fileno())
+    _refresh_forged_database_artifact(receipt_path, database)
+
+    with pytest.raises(
+        ci.CompletionError,
+        match="SQLite integrity check failed",
+    ):
+        ci.verify_inventory_completion_receipt(
+            database,
+            receipt_path,
+            require_production=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "extra_top_key",
+        "invalid_completed_at",
+        "repo_list_path",
+        "repo_list_original_repos",
+        "repo_list_unresolved",
+        "repo_list_extra_key",
+        "interval_start",
+        "interval_end",
+        "interval_semantics",
+        "script_sha256",
+        "metadata_encoding",
+        "leaf_window_count",
+        "request_count",
+        "binding_upgrades",
+        "database_artifact_extra_key",
+    ),
+)
+def test_v5_receipt_verifier_rejects_exact_field_mutation_matrix(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    inventory = _inventory(tmp_path, DatasetAPI([]))
+    inventory.run()
+    database = tmp_path / "inventory.sqlite"
+    receipt_path = tmp_path / "receipt.json"
+    receipt = inventory.write_completion_receipt(receipt_path)
+    forged = json.loads(json.dumps(receipt))
+
+    if mutation == "extra_top_key":
+        forged["unexpected"] = "forged"
+    elif mutation == "invalid_completed_at":
+        forged["completed_at"] = "2026-01-01T00:00:00+00:00"
+    elif mutation == "repo_list_path":
+        forged["repo_list"]["path"] = "/forged/repos.json"
+    elif mutation == "repo_list_original_repos":
+        forged["repo_list"]["original_repos"] += 1
+    elif mutation == "repo_list_unresolved":
+        forged["repo_list"]["unresolved"] = 1
+    elif mutation == "repo_list_extra_key":
+        forged["repo_list"]["unexpected"] = "forged"
+    elif mutation == "interval_start":
+        forged["interval"]["start"] = "2026-01-01T00:00:01Z"
+    elif mutation == "interval_end":
+        forged["interval"]["end"] = "2026-01-01T00:00:03Z"
+    elif mutation == "interval_semantics":
+        forged["interval"]["semantics"] = "[start,end]"
+    elif mutation == "script_sha256":
+        forged["script_sha256"] = "0" * 64
+    elif mutation == "metadata_encoding":
+        forged["metadata_encoding"] = "forged-encoding"
+    elif mutation == "leaf_window_count":
+        forged["leaf_window_count"] += 1
+    elif mutation == "request_count":
+        forged["request_count"] += 1
+    elif mutation == "binding_upgrades":
+        forged["binding_upgrades"] = [{"forged": True}]
+    elif mutation == "database_artifact_extra_key":
+        forged["database_artifact"]["unexpected"] = "forged"
+    else:
+        raise AssertionError(mutation)
+
+    ci.atomic_write_json(tmp_path / "forged.json", forged)
+    with pytest.raises(ci.CompletionError):
+        ci.verify_inventory_completion_receipt(
+            database,
+            tmp_path / "forged.json",
+            require_production=True,
+        )
+
+
+def test_v5_receipt_verifier_caps_receipt_before_reading_json(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "inventory.sqlite"
+    database.write_bytes(b"not reached")
+    oversized_receipt = tmp_path / "oversized.json"
+    with oversized_receipt.open("wb") as handle:
+        handle.truncate(ci.MAX_INVENTORY_RECEIPT_BYTES + 1)
+
+    with pytest.raises(ci.CompletionError, match="exceeds its .*byte limit"):
+        ci.verify_inventory_completion_receipt(
+            database,
+            oversized_receipt,
+        )
+
+
+def test_v5_verifier_preflights_metadata_blob_before_sqlite_allocation(
+    tmp_path: Path,
+) -> None:
+    start = ci.parse_utc_instant(START)
+    inventory = _inventory(
+        tmp_path,
+        DatasetAPI([_run(1, start + 1)]),
+    )
+    inventory.run()
+    database = tmp_path / "inventory.sqlite"
+    receipt_path = tmp_path / "receipt.json"
+    receipt = inventory.write_completion_receipt(receipt_path)
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            UPDATE runs SET metadata_blob=zeroblob(?)
+            WHERE repo_key='owner/repo' AND run_id=1
+            """,
+            (ci.MAX_RUN_METADATA_COMPRESSED_BYTES + 1,),
+        )
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    forged = json.loads(json.dumps(receipt))
+    forged["database_artifact"].update(
+        {
+            "byte_size": database.stat().st_size,
+            "sha256": ci._sha256_file(database),
+        }
+    )
+    ci.atomic_write_json(tmp_path / "forged.json", forged)
+
+    with pytest.raises(
+        ci.CompletionError,
+        match="metadata BLOB exceeds the versioned compressed-byte bound",
+    ):
+        ci.verify_inventory_completion_receipt(
+            database,
+            tmp_path / "forged.json",
+            require_production=True,
+        )
+
+
+def test_completion_freezes_copied_wal_inventory_and_removes_sidecars(
+    tmp_path: Path,
+) -> None:
+    start = ci.parse_utc_instant(START)
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    inventory = _inventory(
+        source_root,
+        DatasetAPI([_run(1, start + 1)]),
+    )
+    inventory.run()
+    source = source_root / "inventory.sqlite"
+    destination_root = tmp_path / "copied"
+    destination_root.mkdir()
+    destination = destination_root / "inventory.sqlite"
+
+    keeper = sqlite3.connect(source, isolation_level=None)
+    try:
+        assert keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        checkpoint = keeper.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        assert checkpoint is not None and checkpoint[0] == 0
+        assert Path(f"{source}-wal").is_file()
+        assert Path(f"{source}-shm").is_file()
+        shutil.copy2(source, destination)
+        shutil.copy2(Path(f"{source}-wal"), Path(f"{destination}-wal"))
+        shutil.copy2(Path(f"{source}-shm"), Path(f"{destination}-shm"))
+    finally:
+        keeper.close()
+
+    copied = ci.InventoryDB(destination, initialize_schema=False)
+    receipt = copied.completion_receipt(allow_nonproduction=True)
+    assert receipt["schema"] == ci.RECEIPT_SCHEMA
+    assert not Path(f"{destination}-wal").exists()
+    assert not Path(f"{destination}-shm").exists()
+    assert not Path(f"{destination}-journal").exists()
+    with sqlite3.connect(destination) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+
+    resumed = copied.connect()
+    try:
+        assert resumed.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        resumed.close()
+
+
+def test_completion_freeze_fails_closed_with_live_wal_reader(
+    tmp_path: Path,
+) -> None:
+    start = ci.parse_utc_instant(START)
+    inventory = _inventory(
+        tmp_path,
+        DatasetAPI([_run(1, start + 1)]),
+    )
+    inventory.run()
+    database = tmp_path / "inventory.sqlite"
+    live_reader = sqlite3.connect(database, isolation_level=None)
+    try:
+        assert live_reader.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        live_reader.execute("BEGIN")
+        live_reader.execute("SELECT COUNT(*) FROM runs").fetchone()
+        with pytest.raises(
+            ci.CompletionError,
+            match="could not be frozen|did not enter DELETE",
+        ):
+            ci.InventoryDB(
+                database,
+                initialize_schema=False,
+            )._freeze_for_receipt()
+    finally:
+        if live_reader.in_transaction:
+            live_reader.execute("ROLLBACK")
+        live_reader.close()
+
+
+def test_v5_verifier_checkpoint_sidecar_allowlist(
+    tmp_path: Path,
+) -> None:
+    inventory = _inventory(tmp_path, DatasetAPI([]))
+    inventory.run()
+    database = tmp_path / "inventory.sqlite"
+    receipt_path = tmp_path / "receipt.json"
+    inventory.write_completion_receipt(receipt_path)
+    wal = Path(f"{database}-wal")
+    shm = Path(f"{database}-shm")
+    wal.write_bytes(b"")
+    shm.write_bytes(b"regular shared-memory sidecar")
+
+    verified, _ = ci.verify_inventory_completion_receipt(
+        database,
+        receipt_path,
+        require_production=True,
+    )
+    assert verified["production_complete"] is True
+
+
+@pytest.mark.parametrize(
+    "sidecar_case",
+    (
+        "nonempty_wal",
+        "nonempty_journal",
+        "symlink_wal",
+        "symlink_journal",
+        "symlink_shm",
+    ),
+)
+def test_v5_verifier_rejects_unsafe_checkpoint_sidecar_matrix(
+    tmp_path: Path,
+    sidecar_case: str,
+) -> None:
+    inventory = _inventory(tmp_path, DatasetAPI([]))
+    inventory.run()
+    database = tmp_path / "inventory.sqlite"
+    receipt_path = tmp_path / "receipt.json"
+    inventory.write_completion_receipt(receipt_path)
+    suffix = {
+        "nonempty_wal": "-wal",
+        "nonempty_journal": "-journal",
+        "symlink_wal": "-wal",
+        "symlink_journal": "-journal",
+        "symlink_shm": "-shm",
+    }[sidecar_case]
+    sidecar = Path(f"{database}{suffix}")
+    if sidecar.exists() or sidecar.is_symlink():
+        sidecar.unlink()
+    if sidecar_case.startswith("nonempty_"):
+        sidecar.write_bytes(b"nonempty")
+    else:
+        sidecar.symlink_to(receipt_path)
+
+    with pytest.raises(ci.CompletionError, match="checkpoint sidecar"):
+        ci.verify_inventory_completion_receipt(
+            database,
+            receipt_path,
+            require_production=True,
+        )
+
+
+def test_production_receipt_ledger_includes_zero_run_repositories(
+    tmp_path: Path,
+) -> None:
+    start = ci.parse_utc_instant(START)
+    owner_api = DatasetAPI([_run(1, start + 1, attempt=2)])
+
+    class PerRepoAPI:
+        def __call__(
+            self,
+            method: str,
+            url: str,
+            headers: Mapping[str, str],
+            timeout: float,
+        ) -> ci.HTTPResponse:
+            if "/repos/Other/Repo/" in url:
+                return ci.HTTPResponse(
+                    status=200,
+                    headers={"X-RateLimit-Remaining": "4999"},
+                    body=b'{"total_count":0,"workflow_runs":[]}',
+                )
+            return owner_api(method, url, headers, timeout)
+
+    scope = _scope(tmp_path, ["Owner/Repo", "Other/Repo"])
+    inventory = _inventory(tmp_path, PerRepoAPI(), scope=scope)
+    inventory.run()
+
+    receipt = inventory.write_completion_receipt(
+        tmp_path / "receipt.json"
+    )
+
+    assert receipt["repo_list"]["repos"] == 2
+    assert receipt["run_count"] == 1
+    assert receipt["expected_attempt_count"] == 2
+    ledger = {
+        item["repo"]: item for item in receipt["per_repo_ledger"]
+    }
+    assert set(ledger) == {"other/repo", "owner/repo"}
+    assert ledger["other/repo"]["run_count"] == 0
+    assert ledger["other/repo"]["expected_attempt_count"] == 0
+    assert ledger["other/repo"]["run_set_sha256"] == ci._hash_lines(())
+    assert (
+        ledger["other/repo"]["expected_attempt_set_sha256"]
+        == ci._hash_lines(())
+    )
     assert receipt["repo_list"]["original_repos"] == 2
