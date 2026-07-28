@@ -569,6 +569,104 @@ def test_truncated_target_count_is_snapshotted_once_per_repo(tmp_path):
         store.close()
 
 
+def test_truncated_target_set_and_file_update_share_one_lock(tmp_path):
+    from graphql_pr_stream import (
+        Manifest,
+        SharedTokenPool,
+        reset_repo_truncated_targets,
+        stream_repo,
+    )
+    from pr_store import connect
+
+    targets_path = tmp_path / "targets.jsonl"
+    targets_path.write_text(
+        '{"pr_number":9,"repo":"other/repo"}\n',
+        encoding="utf-8",
+    )
+    target_keys = {("other/repo", 9)}
+
+    class InterleavingLock:
+        def __init__(self):
+            self.acquisitions = 0
+
+        def __enter__(self):
+            self.acquisitions += 1
+            if self.acquisitions == 3:
+                reset_repo_truncated_targets(
+                    str(targets_path),
+                    target_keys,
+                    "other/repo",
+                )
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    append_lock = InterleavingLock()
+    manifest = Manifest(str(tmp_path / "manifest.json"))
+    store = connect(str(tmp_path / "prs.sqlite"), create=True)
+    node = {
+        "number": 1,
+        "title": "title",
+        "body": "body",
+        "comments": {"totalCount": 1, "nodes": []},
+        "reviews": {"totalCount": 0, "nodes": []},
+        "reviewThreads": {"totalCount": 0, "nodes": []},
+        "closingIssuesReferences": {"totalCount": 0, "nodes": []},
+    }
+
+    def post(_token: str, _variables: dict) -> tuple[int, dict, dict]:
+        return (
+            200,
+            {"X-RateLimit-Remaining": "100"},
+            {
+                "data": {
+                    "repository": {
+                        "pullRequests": {
+                            "totalCount": 1,
+                            "pageInfo": {
+                                "hasNextPage": False,
+                                "endCursor": None,
+                            },
+                            "nodes": [node],
+                        }
+                    }
+                }
+            },
+        )
+
+    try:
+        stream_repo(
+            SharedTokenPool(["token"]),
+            store,
+            manifest,
+            "owner/repo",
+            fallback_pr_threshold=0,
+            fallback_ratelimit_trips=0,
+            fallback_list_path=str(tmp_path / "fallback.jsonl"),
+            truncated_targets_path=str(targets_path),
+            truncated_target_keys=target_keys,
+            append_lock=append_lock,
+            post_fn=post,
+        )
+    finally:
+        store.close()
+
+    persisted = {
+        (item["repo"], item["pr_number"])
+        for item in (
+            json.loads(line)
+            for line in targets_path.read_text(encoding="utf-8").splitlines()
+        )
+    }
+    assert append_lock.acquisitions == 2
+    assert persisted == target_keys == {
+        ("other/repo", 9),
+        ("owner/repo", 1),
+    }
+    assert len(targets_path.read_text(encoding="utf-8").splitlines()) == 2
+
+
 def test_stream_accepts_append_only_membership_growth_and_binds_final_count(
     tmp_path,
 ):
