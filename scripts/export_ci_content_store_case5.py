@@ -4203,6 +4203,7 @@ def export_store(
     tokenizer_json: str | os.PathLike[str],
     output: str | os.PathLike[str],
     source_binding_projection_from_parser_sha256: str | None = None,
+    required_eligible_exact_unique_payload_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Export one receipt-frozen store and atomically publish a CASE5 directory."""
 
@@ -4267,11 +4268,27 @@ def export_store(
                 where="store counters.exact_unique_payload_tokens",
                 minimum=0,
             )
-            eligible_target_tokens = _require_int(
+            cas_acquisition_target_tokens = _require_int(
                 store.receipt.get("target_exact_unique_payload_tokens"),
                 where="store receipt target_exact_unique_payload_tokens",
                 minimum=0,
             )
+            if required_eligible_exact_unique_payload_tokens is None:
+                eligible_target_tokens = cas_acquisition_target_tokens
+                eligible_target_source = "store_receipt"
+            else:
+                eligible_target_tokens = _require_int(
+                    required_eligible_exact_unique_payload_tokens,
+                    where="required eligible exact unique payload tokens",
+                    minimum=0,
+                )
+                if eligible_target_tokens > cas_acquisition_target_tokens:
+                    raise ExportError(
+                        "required eligible exact unique payload tokens "
+                        f"{eligible_target_tokens} exceed the receipt-bound CAS "
+                        f"acquisition target {cas_acquisition_target_tokens}"
+                    )
+                eligible_target_source = "explicit_export_requirement"
             if expected_content_count < 1 or expected_occurrence_count < 1:
                 raise ExportError("content store has no exportable occurrences")
 
@@ -5361,6 +5378,13 @@ def export_store(
                         "raw_magic_retained": False,
                     },
                     "target_exact_unique_payload_tokens": eligible_target_tokens,
+                    "target_source": eligible_target_source,
+                    "cas_acquisition_target_exact_unique_payload_tokens": (
+                        cas_acquisition_target_tokens
+                    ),
+                    "cas_reserve_exact_unique_payload_tokens": (
+                        cas_acquisition_target_tokens - eligible_target_tokens
+                    ),
                     "target_met": expected_payload >= eligible_target_tokens,
                     "cas": {
                         "unique_token_sequences": cas_unique_sequence_count,
@@ -5554,6 +5578,14 @@ def _parser() -> argparse.ArgumentParser:
             "source bindings will be projected; required for legacy stores"
         ),
     )
+    parser.add_argument(
+        "--required-eligible-exact-unique-payload-tokens",
+        type=int,
+        help=(
+            "explicit training-eligible token minimum after opaque-artifact "
+            "exclusion; must not exceed the receipt-bound CAS acquisition target"
+        ),
+    )
     return parser
 
 
@@ -5568,6 +5600,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             output=args.output,
             source_binding_projection_from_parser_sha256=(
                 args.source_binding_projection_from_parser_sha256
+            ),
+            required_eligible_exact_unique_payload_tokens=(
+                args.required_eligible_exact_unique_payload_tokens
             ),
         )
     except (
