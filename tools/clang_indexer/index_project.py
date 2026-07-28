@@ -80,6 +80,14 @@ from cppmega.data.source_identity import source_identity, source_identity_for_pa
 from scripts.data.memory_guard import check_memory_limit, start_memory_guard
 from scripts.data.atomic_publish import atomic_output_file
 
+if __package__:
+    from .source_quarantine import ProjectSourceQuarantine
+else:
+    _INDEXER_MODULE_ROOT = Path(__file__).resolve().parent
+    if str(_INDEXER_MODULE_ROOT) not in sys.path:
+        sys.path.insert(0, str(_INDEXER_MODULE_ROOT))
+    from source_quarantine import ProjectSourceQuarantine
+
 if TYPE_CHECKING:
     import clang.cindex as clang_cindex  # pyright: ignore[reportMissingImports]
     from clang.cindex import Config as ClangConfig  # pyright: ignore[reportMissingImports]
@@ -3072,15 +3080,10 @@ def parse_translation_unit(
     return functions, typedefs
 
 
-_DEFAULT_SKIP_DIRS = frozenset({
-    '.git', 'build', 'cmake-build', '__pycache__', 'node_modules',
-    '.vs', '.vscode', 'third_party', 'external', 'deps', 'vendor',
-    'test', 'tests', 'unittests', 'benchmarks',
-        # Keep generated/noisy corpus paths out of clang indexing.
-    'testing', 'examples', 'example', 'samples', 'sample', 'docs', 'doc',
-    # Additional noise dirs for large repos
-    'fuzzers', 'fuzzing', 'regression', 'fixtures',
-})
+# Corpus callers may explicitly exclude extraction/build artifacts, but source
+# categories such as tests, examples, vendored libraries, fuzzers, and docs are
+# real C/C++ and must never disappear because of a hidden indexer policy.
+_DEFAULT_SKIP_DIRS = frozenset({'.git'})
 
 C_EXTENSIONS = {'.c'}
 
@@ -3099,12 +3102,12 @@ def find_cpp_files(
             ext = os.path.splitext(fname)[1].lower()
             if ext in INDEX_EXTENSIONS:
                 filepath = os.path.join(root, fname)
-                # Skip very large files
                 try:
-                    if os.path.getsize(filepath) > 500_000:
-                        continue
-                except OSError:
-                    continue
+                    os.path.getsize(filepath)
+                except OSError as exc:
+                    raise OSError(
+                        f"failed to stat C/C++ input {filepath}: {exc}"
+                    ) from exc
                 files.append(filepath)
     return files
 
@@ -8996,6 +8999,19 @@ def _iter_parse_batch_results(
             future.cancel()
 
 
+def _write_source_quarantine_receipt(
+    path: str | os.PathLike[str],
+    receipt: dict[str, object],
+) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with atomic_output_file(destination) as staged:
+        staged.write_text(
+            json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+
 def process_project(
     project_dir: str,
     max_tokens: int = 16384,
@@ -9014,6 +9030,8 @@ def process_project(
     *,
     project_id: str,
     skip_invalid_domain_inputs: bool = False,
+    source_quarantine_manifest: str | None = None,
+    source_quarantine_receipt: str | None = None,
 ) -> list:
     """Process a single project: parse all files, build index, generate docs.
 
@@ -9037,6 +9055,22 @@ def process_project(
 
     print(f"\n--- Processing project: {stable_project_id} ---", file=sys.stderr)
 
+    if (source_quarantine_manifest is None) != (
+        source_quarantine_receipt is None
+    ):
+        raise ValueError(
+            "source_quarantine_manifest and source_quarantine_receipt must be "
+            "provided together"
+        )
+    source_quarantine = (
+        ProjectSourceQuarantine.load(
+            source_quarantine_manifest,
+            project_id=stable_project_id,
+        )
+        if source_quarantine_manifest is not None
+        else None
+    )
+
     invalid_domain_paths: set[str] = set()
 
     def _handle_invalid_domain_input(path: Path, exc: ValueError) -> None:
@@ -9047,6 +9081,22 @@ def process_project(
 
     # Find source files
     cpp_files = find_cpp_files(project_dir, extra_exclude_dirs=extra_exclude_dirs)
+    if source_quarantine is not None:
+        cpp_files, quarantine_receipt = source_quarantine.filter_candidates(
+            project_dir,
+            cpp_files,
+        )
+        assert source_quarantine_receipt is not None
+        _write_source_quarantine_receipt(
+            source_quarantine_receipt,
+            quarantine_receipt,
+        )
+        print(
+            "  Source quarantine: "
+            f"verified={quarantine_receipt['quarantined_count']} "
+            f"manifest_sha256={quarantine_receipt['manifest_sha256']}",
+            file=sys.stderr,
+        )
     print(f"  Found {len(cpp_files)} C/C++ source files", file=sys.stderr)
     if cpp_files:
         _configure_libclang()
@@ -9341,6 +9391,20 @@ def main() -> int:
              'NUL or malformed supported encodings instead of failing the entire '
              'project. The default remains fail-loud.',
     )
+    parser.add_argument(
+        '--source-quarantine-manifest',
+        type=str,
+        default=None,
+        help='Versioned exact path+size+SHA manifest for proven non-C++ files '
+             'stored under C/C++ suffixes. Requires --source-quarantine-receipt.',
+    )
+    parser.add_argument(
+        '--source-quarantine-receipt',
+        type=str,
+        default=None,
+        help='Atomic verification receipt for --source-quarantine-manifest. '
+             'Single-project mode only.',
+    )
     parser.add_argument('--memory-limit-gb', type=float, default=10.0,
                         help='Abort if this Python wrapper exceeds this max RSS in GiB (default: 10)')
     parser.add_argument('--dedup-db', type=str, default=None,
@@ -9441,6 +9505,18 @@ def main() -> int:
                 project_specs.append((full, project_id))
     else:
         parser.error("Provide --project-dir, --projects-list, or --projects-dir")
+
+    if (args.source_quarantine_manifest is None) != (
+        args.source_quarantine_receipt is None
+    ):
+        parser.error(
+            "--source-quarantine-manifest and --source-quarantine-receipt "
+            "must be provided together"
+        )
+    if args.source_quarantine_manifest is not None and len(project_specs) != 1:
+        parser.error(
+            "source quarantine receipt binding currently requires exactly one project"
+        )
 
     print(f"Processing {len(project_specs)} project(s)", file=sys.stderr)
     print(f"Output: {args.output}", file=sys.stderr)
@@ -9562,6 +9638,8 @@ def main() -> int:
                             global_symbol_index,
                             project_id=project_id,
                             skip_invalid_domain_inputs=args.skip_invalid_domain_inputs,
+                            source_quarantine_manifest=args.source_quarantine_manifest,
+                            source_quarantine_receipt=args.source_quarantine_receipt,
                         ): (pd, project_id)
                         for pd, project_id in project_specs
                     }
@@ -9589,6 +9667,8 @@ def main() -> int:
                             global_symbol_index, emit_doc=_write_doc,
                             project_id=project_id,
                             skip_invalid_domain_inputs=args.skip_invalid_domain_inputs,
+                            source_quarantine_manifest=args.source_quarantine_manifest,
+                            source_quarantine_receipt=args.source_quarantine_receipt,
                         )
                         for doc in docs:
                             _write_doc(doc)

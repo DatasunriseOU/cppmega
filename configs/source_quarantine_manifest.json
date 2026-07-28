@@ -1,0 +1,14 @@
+{
+  "schema": "cppmega.source_quarantine_manifest_v1",
+  "entries": [
+    {
+      "project_id": "corpus.local/Xbox_Live_Source",
+      "relative_path": "Xbox Live Source/XONLINE_MAIN/public/ext/sdk/vs10rtm/SDK/bin/isvtier5appsignsdk.cc",
+      "size_bytes": 21234,
+      "sha256": "d7f4a8c02356872f622eea62337980ec36e0a5ed0ec9371d0cd6513ec34ed703",
+      "classification": "mislabeled_non_cpp",
+      "detected_format": "xml_utf16le",
+      "reason": "UTF-16LE XML license document stored under a .cc suffix"
+    }
+  ]
+}
