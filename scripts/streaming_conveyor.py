@@ -82,25 +82,32 @@ from typing import Callable, Iterable, Sequence
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
-import streaming_reindex as sr  # noqa: E402
-import streaming_reindex_commits as src  # noqa: E402
+if __package__:
+    from scripts import streaming_reindex as sr  # noqa: E402
+    from scripts import streaming_reindex_commits as src  # noqa: E402
+else:  # pragma: no cover - exercised by direct file-mode execution.
+    import streaming_reindex as sr  # noqa: E402
+    import streaming_reindex_commits as src  # noqa: E402
 from nanochat_data import extract_git_history as extract_history  # noqa: E402
 
 SymbolIdentityError = sr.SymbolIdentityError
 
-from streaming_reindex_commits import (  # noqa: E402,F401
-    ROOT,
-    VENV_PYTHON,
-    RepoFailure,
-    Manifest,
-    EXTRACT_GIT,
-    DEFAULT_RANGE_SIZE,
-    stream_repo_subtrees_with_git,
-    get_commit_list,
-    stage_extract_commits,
-    process_range,
-    range_key,
-)
+if src.RepoFailure is not sr.RepoFailure or src.Manifest is not sr.Manifest:
+    raise RuntimeError(
+        "streaming pipeline imported duplicate streaming_reindex module identities"
+    )
+
+ROOT = src.ROOT
+VENV_PYTHON = src.VENV_PYTHON
+RepoFailure = src.RepoFailure
+Manifest = src.Manifest
+EXTRACT_GIT = src.EXTRACT_GIT
+DEFAULT_RANGE_SIZE = src.DEFAULT_RANGE_SIZE
+stream_repo_subtrees_with_git = src.stream_repo_subtrees_with_git
+get_commit_list = src.get_commit_list
+stage_extract_commits = src.stage_extract_commits
+process_range = src.process_range
+range_key = src.range_key
 
 # Unified conveyor manifest lives in its OWN root so it never collides with the
 # per-stream manifests (the code/commit outputs themselves still land in the

@@ -126,6 +126,44 @@ def test_cp1252_source_round_trips_without_clang_token_utf8_decode(
         assert len(function[field]) == len(function["text"])
 
 
+def test_nested_and_reopened_anonymous_namespaces_parse_with_scoped_usr(
+    tmp_path: Path,
+) -> None:
+    index_project = _load_indexer()
+    source = tmp_path / "anonymous_namespaces.cpp"
+    source.write_text(
+        """
+namespace outer {
+namespace {
+namespace {
+int nested_answer() { return 42; }
+}
+}
+namespace {
+int reopened_answer() { return 43; }
+}
+}
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    payload, parsed_count = index_project._parse_file_batch(
+        (
+            [str(source)],
+            {},
+            ["-std=c++17", "-fsyntax-only", "-Wno-everything"],
+            str(tmp_path),
+            "fixture/anonymous-namespaces",
+        )
+    )
+
+    assert parsed_count == 1
+    assert {item["name"] for item in payload["functions"]} == {
+        "nested_answer",
+        "reopened_answer",
+    }
+
+
 def test_parse_batch_recovers_nested_legacy_include_context(
     tmp_path: Path,
 ) -> None:

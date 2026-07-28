@@ -114,10 +114,44 @@ assert reindex.ROOT == repo_root
 assert reindex.TOKENIZER_PATH == repo_root / "cppmega" / "tokenizer" / "tokenizer.json"
 assert commits.ROOT == repo_root
 assert conveyor.ROOT == repo_root
+assert conveyor.sr is reindex
+assert conveyor.src is commits
+assert commits.sr is reindex
+assert conveyor.RepoFailure is reindex.RepoFailure is commits.RepoFailure
+assert conveyor.Manifest is reindex.Manifest is commits.Manifest
 assert global_index.ROOT == repo_root
 assert fixer.TOKENIZER_DIR == repo_root / "cppmega" / "tokenizer"
 assert ":(top)cppmega" in conveyor.CODE_REVISION_PATHS
 assert all("cppmega_mlx" not in path for path in conveyor.CODE_REVISION_PATHS)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_streaming_conveyor_direct_import_reuses_one_reindex_module() -> None:
+    script = f"""
+from pathlib import Path
+import sys
+
+repo_root = Path({str(REPO_ROOT)!r}).resolve()
+sys.path.insert(0, str(repo_root / "scripts"))
+
+import streaming_conveyor as conveyor
+import streaming_reindex as reindex
+import streaming_reindex_commits as commits
+
+assert conveyor.sr is reindex
+assert conveyor.src is commits
+assert commits.sr is reindex
+assert conveyor.RepoFailure is reindex.RepoFailure is commits.RepoFailure
+assert conveyor.Manifest is reindex.Manifest is commits.Manifest
 """
     completed = subprocess.run(
         [sys.executable, "-I", "-c", script],

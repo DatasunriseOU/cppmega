@@ -261,6 +261,74 @@ def test_file_local_symbols_are_scoped_even_when_clang_reuses_a_usr(
     assert "file=two.cpp" in second_key
 
 
+def test_anonymous_namespace_uses_stable_kind_signature_and_file_scope(
+    tmp_path: Path,
+) -> None:
+    first_path = tmp_path / "one.cpp"
+    second_path = tmp_path / "two.cpp"
+    first_path.write_text("namespace { namespace {} }\n", encoding="utf-8")
+    second_path.write_text("namespace { namespace {} }\n", encoding="utf-8")
+    usr = "c:@N@api@aN@aN"
+    first = _cursor(
+        first_path,
+        usr=usr,
+        displayname="",
+        line=1,
+        column=23,
+        linkage="INTERNAL",
+        storage="INVALID",
+        kind="NAMESPACE",
+        signature_type="",
+        result_type="",
+    )
+    reopened = _cursor(
+        first_path,
+        usr=usr,
+        displayname="",
+        line=8,
+        column=11,
+        linkage="INTERNAL",
+        storage="INVALID",
+        kind="NAMESPACE",
+        signature_type="",
+        result_type="",
+    )
+    second = _cursor(
+        second_path,
+        usr=usr,
+        displayname="",
+        line=1,
+        column=23,
+        linkage="INTERNAL",
+        storage="INVALID",
+        kind="NAMESPACE",
+        signature_type="",
+        result_type="",
+    )
+
+    first_key, _, first_signature = indexer.symbol_identity_for_cursor(
+        first,
+        project_dir=str(tmp_path),
+        project="tests/case3",
+    )
+    reopened_key = indexer.symbol_identity_for_cursor(
+        reopened,
+        project_dir=str(tmp_path),
+        project="tests/case3",
+    )[0]
+    second_key = indexer.symbol_identity_for_cursor(
+        second,
+        project_dir=str(tmp_path),
+        project="tests/case3",
+    )[0]
+
+    assert first_signature == "kind=NAMESPACE"
+    assert first_key == reopened_key
+    assert first_key != second_key
+    assert "file=one.cpp" in first_key
+    assert "sig=kind%3DNAMESPACE" in first_key
+
+
 def test_signature_fallback_contains_project_file_and_location(
     tmp_path: Path,
 ) -> None:

@@ -1410,6 +1410,13 @@ def symbol_identity_for_cursor(
         _cursor_canonical_signature(cursor),
         project_dir,
     )
+    kind_name = _cursor_kind_name(cursor)
+    # Anonymous namespaces have a stable clang USR but intentionally expose no
+    # display name or type spelling.  Their clang kind is the only remaining
+    # canonical signature claim; file + USR still distinguish the actual
+    # namespace, including nested anonymous namespaces.
+    if usr and not signature and kind_name == "NAMESPACE":
+        signature = "kind=NAMESPACE"
     file_scope = force_file_scope
     uses_repo_file_location = not usr and not signature
     rel_file, identity_project = _cursor_repo_file_location_identity(
@@ -1482,18 +1489,29 @@ def symbol_identity_for_cursor(
             source="symbol_identity_for_cursor",
         )
     else:
-        identity_key = canonical_symbol_identity(
-            qname=qname,
-            kind=_cursor_kind_name(cursor),
-            usr=usr,
-            canonical_signature=signature,
-            project=identity_project,
-            file=rel_file,
-            line=getattr(loc, "line", None),
-            column=getattr(loc, "column", None),
-            force_file_scope=file_scope or is_external or not usr,
-            repo_file_location_fallback=uses_repo_file_location,
-        )
+        try:
+            identity_key = canonical_symbol_identity(
+                qname=qname,
+                kind=kind_name,
+                usr=usr,
+                canonical_signature=signature,
+                project=identity_project,
+                file=rel_file,
+                line=getattr(loc, "line", None),
+                column=getattr(loc, "column", None),
+                force_file_scope=file_scope or is_external or not usr,
+                repo_file_location_fallback=uses_repo_file_location,
+            )
+        except SymbolIdentityError as exc:
+            raise SymbolIdentityError(
+                "symbol_identity_for_cursor: "
+                f"kind={kind_name!r} qname={qname!r} "
+                f"usr={usr!r} signature={signature!r} file={rel_file!r} "
+                f"line={getattr(loc, 'line', None)!r} "
+                f"column={getattr(loc, 'column', None)!r} "
+                f"linkage={linkage_name!r} storage={storage_name!r} "
+                f"parent_kind={parent_kind!r}: {exc}"
+            ) from exc
     return identity_key, usr, signature
 
 
