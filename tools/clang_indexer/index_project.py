@@ -330,6 +330,8 @@ PartInfo: TypeAlias = tuple[str, int, int, str, str | None] | tuple[
     str,
 ]
 SymbolReference: TypeAlias = dict[str, object]
+ExternalReferenceOmissionKey: TypeAlias = tuple[str, str, str, str]
+ExternalReferenceOmissions: TypeAlias = dict[ExternalReferenceOmissionKey, int]
 
 
 def _part_dep_source(part: tuple) -> str | None:
@@ -1167,6 +1169,38 @@ def _is_absolute_identity_path(value: str) -> bool:
     )
 
 
+class _UnknownExternalProviderError(SymbolIdentityError):
+    """An external declaration cannot be bound to a trusted provider."""
+
+    def __init__(self, observed_path: str):
+        self.observed_path = observed_path
+        super().__init__(observed_path)
+
+    def __str__(self) -> str:
+        return (
+            "external declaration requires a stable provider identity, "
+            f"got path={self.observed_path!r}"
+        )
+
+
+def _record_external_reference_omission(
+    omissions: ExternalReferenceOmissions | None,
+    *,
+    relation: str,
+    cursor: Cursor,
+    error: _UnknownExternalProviderError,
+) -> None:
+    if omissions is None:
+        return
+    key = (
+        relation,
+        normalize_qualified_name(get_qualified_name(cursor)),
+        _cursor_kind_name(cursor),
+        error.observed_path,
+    )
+    omissions[key] = omissions.get(key, 0) + 1
+
+
 def _normalize_repo_relative_identity_file(file: str | None) -> str:
     normalized = _normalize_identity_path(file)
     if normalized and _is_absolute_identity_path(normalized):
@@ -1275,10 +1309,7 @@ def _cursor_repo_file_location_identity(
             ),
             external_provider_project(provider, source="cursor provider identity"),
         )
-    raise SymbolIdentityError(
-        "external declaration without USR or canonical signature requires a "
-        f"stable provider identity, got path={candidate!r}"
-    )
+    raise _UnknownExternalProviderError(candidate)
 
 
 def _cursor_identity_location(
@@ -1471,6 +1502,34 @@ def symbol_reference_for_cursor(
         "provider": provider,
         "include_provenance": include_provenance,
     }
+
+
+def _optional_symbol_reference_for_cursor(
+    cursor: Cursor,
+    *,
+    relation: str,
+    omissions: ExternalReferenceOmissions | None,
+    project_dir: str | None,
+    project_id: str | None,
+    fallback_file: str | None,
+) -> SymbolReference | None:
+    """Return only references with authoritative local/provider provenance."""
+
+    try:
+        return symbol_reference_for_cursor(
+            cursor,
+            project_dir=project_dir,
+            project_id=project_id,
+            fallback_file=fallback_file,
+        )
+    except _UnknownExternalProviderError as exc:
+        _record_external_reference_omission(
+            omissions,
+            relation=relation,
+            cursor=cursor,
+            error=exc,
+        )
+        return None
 
 
 def _normalize_symbol_reference(value: object) -> SymbolReference | None:
@@ -2573,6 +2632,7 @@ def extract_callee_references(
     project_dir: str | None = None,
     project_id: str | None = None,
     fallback_file: str | None = None,
+    external_reference_omissions: ExternalReferenceOmissions | None = None,
 ) -> tuple[list[SymbolReference], list[SymbolReference]]:
     """Return resolved local and base-library call references from one AST walk."""
     local: dict[str, SymbolReference] = {}
@@ -2584,17 +2644,20 @@ def extract_callee_references(
             if ref and ref.spelling:
                 qname = get_qualified_name(ref)
                 if qname:
-                    reference = symbol_reference_for_cursor(
+                    reference = _optional_symbol_reference_for_cursor(
                         ref,
+                        relation="call",
+                        omissions=external_reference_omissions,
                         project_dir=project_dir,
                         project_id=project_id,
                         fallback_file=fallback_file,
                     )
-                    key = str(reference["symbol_key"])
-                    if not is_system_function(qname):
-                        local[key] = reference
-                    elif is_crosslinkable_baselib(qname):
-                        baselib[key] = reference
+                    if reference is not None:
+                        key = str(reference["symbol_key"])
+                        if not is_system_function(qname):
+                            local[key] = reference
+                        elif is_crosslinkable_baselib(qname):
+                            baselib[key] = reference
         for child in node.get_children():
             walk(child)
 
@@ -2678,6 +2741,7 @@ def extract_referenced_type_references(
     project_dir: str | None = None,
     project_id: str | None = None,
     fallback_file: str | None = None,
+    external_reference_omissions: ExternalReferenceOmissions | None = None,
 ) -> list[SymbolReference]:
     """Return canonical references for non-system record/enum/typedef uses."""
     refs: dict[str, SymbolReference] = {}
@@ -2692,13 +2756,16 @@ def extract_referenced_type_references(
             ):
                 qname = get_qualified_name(ref)
                 if qname and not is_system_function(qname):
-                    reference = symbol_reference_for_cursor(
+                    reference = _optional_symbol_reference_for_cursor(
                         ref,
+                        relation="type",
+                        omissions=external_reference_omissions,
                         project_dir=project_dir,
                         project_id=project_id,
                         fallback_file=fallback_file,
                     )
-                    refs[str(reference["symbol_key"])] = reference
+                    if reference is not None:
+                        refs[str(reference["symbol_key"])] = reference
         for child in node.get_children():
             walk(child)
 
@@ -2805,6 +2872,7 @@ def parse_translation_unit(
     allow_system_types: bool = False,
     *,
     project_id: str,
+    external_reference_omissions: ExternalReferenceOmissions | None = None,
 ) -> tuple[list[FunctionDef], list[TypeDef]]:
     """Parse a single C/C++ file (source OR header) and extract function
     definitions (with callees + referenced types) AND type definitions
@@ -2865,6 +2933,7 @@ def parse_translation_unit(
         project_id=stable_project_id,
         fallback_file=rel_path,
         source_encoding=source_encoding,
+        external_reference_omissions=external_reference_omissions,
     )
     byte_to_char = _byte_to_char_mapper(source, source_encoding)
     project_dir_abs = os.path.abspath(project_dir)
@@ -2935,12 +3004,14 @@ def parse_translation_unit(
                     project_dir=project_dir,
                     project_id=stable_project_id,
                     fallback_file=rel_path,
+                    external_reference_omissions=external_reference_omissions,
                 )
                 referenced_type_refs = extract_referenced_type_references(
                     cursor,
                     project_dir=project_dir,
                     project_id=stable_project_id,
                     fallback_file=rel_path,
+                    external_reference_omissions=external_reference_omissions,
                 )
                 callees = [str(ref["qname"]) for ref in callee_refs]
                 baselib_callees = [str(ref["qname"]) for ref in baselib_callee_refs]
@@ -4910,6 +4981,7 @@ def extract_semantic_metadata(
     project_id: str,
     fallback_file: str | None = None,
     source_encoding: str = "utf-8",
+    external_reference_omissions: ExternalReferenceOmissions | None = None,
 ) -> dict:
     """Extract per-character semantic metadata from a translation unit.
 
@@ -5012,13 +5084,26 @@ def extract_semantic_metadata(
                 matches.append(span)
         return matches[:1]
 
-    def _symbol_key_for_reference(ref: Cursor) -> str:
-        return symbol_identity_for_cursor(
-            ref,
-            project_dir=project_dir,
-            project=stable_project_id,
-            fallback_file=fallback_file,
-        )[0]
+    def _symbol_key_for_reference(
+        ref: Cursor,
+        *,
+        relation: str,
+    ) -> str | None:
+        try:
+            return symbol_identity_for_cursor(
+                ref,
+                project_dir=project_dir,
+                project=stable_project_id,
+                fallback_file=fallback_file,
+            )[0]
+        except _UnknownExternalProviderError as exc:
+            _record_external_reference_omission(
+                external_reference_omissions,
+                relation=relation,
+                cursor=ref,
+                error=exc,
+            )
+            return None
 
     def _call_target_spans(
         call_cursor: Cursor,
@@ -5033,7 +5118,11 @@ def extract_semantic_metadata(
                     if (
                         child_target is not None
                         and child_target.spelling
-                        and _symbol_key_for_reference(child_target) == target_key
+                        and _symbol_key_for_reference(
+                            child_target,
+                            relation="semantic_call",
+                        )
+                        == target_key
                     ):
                         spans = _cursor_name_spans(child, child_target.spelling)
                         if spans:
@@ -5088,16 +5177,15 @@ def extract_semantic_metadata(
             if ref and ref.spelling:
                 qname = get_qualified_name(ref)
                 if qname:
-                    symbol_key, _usr, _sig = symbol_identity_for_cursor(
+                    symbol_key = _symbol_key_for_reference(
                         ref,
-                        project_dir=project_dir,
-                        project=stable_project_id,
-                        fallback_file=fallback_file,
+                        relation="semantic_symbol",
                     )
-                    sym_id = _register_symbol_key(symbol_key, ref)
-                    spans = _cursor_name_spans(cursor, ref.spelling)
-                    _annotate(symbol_ids, spans, sym_id)
-                    _annotate(def_use, spans, DEF_USE_USE)
+                    if symbol_key is not None:
+                        sym_id = _register_symbol_key(symbol_key, ref)
+                        spans = _cursor_name_spans(cursor, ref.spelling)
+                        _annotate(symbol_ids, spans, sym_id)
+                        _annotate(def_use, spans, DEF_USE_USE)
 
         # Call target annotation
         if kind in _CALL_KINDS:
@@ -5105,18 +5193,17 @@ def extract_semantic_metadata(
             if ref and ref.spelling:
                 target_qname = get_qualified_name(ref)
                 if target_qname:
-                    symbol_key, _usr, _sig = symbol_identity_for_cursor(
+                    symbol_key = _symbol_key_for_reference(
                         ref,
-                        project_dir=project_dir,
-                        project=stable_project_id,
-                        fallback_file=fallback_file,
+                        relation="semantic_call",
                     )
-                    target_id = _register_symbol_key(symbol_key, ref)
-                    _annotate(
-                        call_targets,
-                        _call_target_spans(cursor, ref, symbol_key),
-                        target_id,
-                    )
+                    if symbol_key is not None:
+                        target_id = _register_symbol_key(symbol_key, ref)
+                        _annotate(
+                            call_targets,
+                            _call_target_spans(cursor, ref, symbol_key),
+                            target_id,
+                        )
 
         # Type reference annotation
         if kind in _TYPE_REF_KINDS:
@@ -5124,18 +5211,17 @@ def extract_semantic_metadata(
             if ref and ref.spelling:
                 ref_qname = get_qualified_name(ref)
                 if ref_qname:
-                    symbol_key, _usr, _sig = symbol_identity_for_cursor(
+                    symbol_key = _symbol_key_for_reference(
                         ref,
-                        project_dir=project_dir,
-                        project=stable_project_id,
-                        fallback_file=fallback_file,
+                        relation="semantic_type",
                     )
-                    ref_id = _register_symbol_key(symbol_key, ref)
-                    _annotate(
-                        type_refs,
-                        _cursor_name_spans(cursor, ref.spelling),
-                        ref_id,
-                    )
+                    if symbol_key is not None:
+                        ref_id = _register_symbol_key(symbol_key, ref)
+                        _annotate(
+                            type_refs,
+                            _cursor_name_spans(cursor, ref.spelling),
+                            ref_id,
+                        )
 
         # Recurse into children
         for child in cursor.get_children():
@@ -8927,6 +9013,7 @@ def _parse_file_batch(args_tuple):
     clang_index = Index.create()
     func_results: list[dict] = []
     type_results: list[dict] = []
+    external_reference_omissions: ExternalReferenceOmissions = {}
     last_heartbeat = time.monotonic()
     for idx, filepath in enumerate(filepaths, start=1):
         args = _resolve_file_args(filepath, compile_db, default_args)
@@ -8937,6 +9024,7 @@ def _parse_file_batch(args_tuple):
                 args,
                 project_dir,
                 project_id=project_id,
+                external_reference_omissions=external_reference_omissions,
             )
             func_results.extend(f.to_dict() for f in functions)
             type_results.extend(t.to_dict() for t in typedefs)
@@ -8961,7 +9049,11 @@ def _parse_file_batch(args_tuple):
                 flush=True,
             )
             last_heartbeat = now
-    return {"functions": func_results, "typedefs": type_results}, len(filepaths)
+    return {
+        "functions": func_results,
+        "typedefs": type_results,
+        "external_reference_omissions": external_reference_omissions,
+    }, len(filepaths)
 
 
 def _iter_parse_batch_results(
@@ -9010,6 +9102,79 @@ def _write_source_quarantine_receipt(
             json.dumps(receipt, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+
+
+def _external_reference_omission_summary(
+    omissions: ExternalReferenceOmissions,
+) -> dict[str, object]:
+    reference_records = [
+        {
+            "relation": relation,
+            "qname": qname,
+            "symbol_kind": symbol_kind,
+            "observed_path": observed_path,
+            "observations": observations,
+        }
+        for (relation, qname, symbol_kind, observed_path), observations in sorted(
+            omissions.items()
+        )
+    ]
+    encoded_reference_records = json.dumps(
+        reference_records,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    locations: dict[tuple[str, str, str], dict[str, object]] = {}
+    for record in reference_records:
+        location_key = (
+            str(record["relation"]),
+            str(record["symbol_kind"]),
+            str(record["observed_path"]),
+        )
+        location = locations.setdefault(
+            location_key,
+            {"observations": 0, "qnames": []},
+        )
+        location["observations"] = (
+            int(location["observations"]) + int(record["observations"])
+        )
+        qnames = location["qnames"]
+        assert isinstance(qnames, list)
+        qnames.append(str(record["qname"]))
+    location_records: list[dict[str, object]] = []
+    for (relation, symbol_kind, observed_path), location in sorted(locations.items()):
+        qnames = sorted(set(str(value) for value in location["qnames"]))
+        encoded_qnames = json.dumps(
+            qnames,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        location_records.append(
+            {
+                "relation": relation,
+                "symbol_kind": symbol_kind,
+                "observed_path": observed_path,
+                "observations": int(location["observations"]),
+                "unique_qname_count": len(qnames),
+                "qnames_sha256": hashlib.sha256(encoded_qnames).hexdigest(),
+                "qname_examples": qnames[:8],
+                "qname_examples_truncated": len(qnames) > 8,
+            }
+        )
+    return {
+        "schema": "cppmega.external_reference_omissions_v1",
+        "status": "complete",
+        "reason": "unknown_external_provider",
+        "policy": "omit_graph_reference_keep_source_and_fail_on_other_identity_errors",
+        "observation_count": sum(omissions.values()),
+        "unique_reference_count": len(reference_records),
+        "reference_records_sha256": hashlib.sha256(
+            encoded_reference_records
+        ).hexdigest(),
+        "location_count": len(location_records),
+        "locations": location_records,
+    }
 
 
 def process_project(
@@ -9070,6 +9235,8 @@ def process_project(
         if source_quarantine_manifest is not None
         else None
     )
+    quarantine_receipt: dict[str, object] | None = None
+    external_reference_omissions: ExternalReferenceOmissions = {}
 
     invalid_domain_paths: set[str] = set()
 
@@ -9201,6 +9368,10 @@ def process_project(
                     index_obj.add_function(FunctionDef.from_dict(d))
                 for td in payload["typedefs"]:
                     index_obj.add_typedef(TypeDef.from_dict(td))
+                for key, count in payload["external_reference_omissions"].items():
+                    external_reference_omissions[key] = (
+                        external_reference_omissions.get(key, 0) + int(count)
+                    )
                 total_parsed += parsed_count
                 check_memory_limit(memory_limit_gb, label="index_project")
                 print(
@@ -9228,6 +9399,7 @@ def process_project(
                     args,
                     project_dir,
                     project_id=stable_project_id,
+                    external_reference_omissions=external_reference_omissions,
                 )
                 for func in functions:
                     index_obj.add_function(func)
@@ -9260,6 +9432,27 @@ def process_project(
                 last_heartbeat = now
         print(f"  Parsed {parsed} files, "
               f"{len(index_obj.functions)} functions indexed", file=sys.stderr)
+
+    external_reference_omission_summary = _external_reference_omission_summary(
+        external_reference_omissions
+    )
+    print(
+        "  Unknown external graph references omitted: "
+        f"observations={external_reference_omission_summary['observation_count']} "
+        f"unique={external_reference_omission_summary['unique_reference_count']} "
+        "reference_records_sha256="
+        f"{external_reference_omission_summary['reference_records_sha256']}",
+        file=sys.stderr,
+    )
+    if quarantine_receipt is not None:
+        quarantine_receipt["external_reference_omissions"] = (
+            external_reference_omission_summary
+        )
+        assert source_quarantine_receipt is not None
+        _write_source_quarantine_receipt(
+            source_quarantine_receipt,
+            quarantine_receipt,
+        )
 
     # Build training documents (C/C++ code path -- unchanged).
     documents: list = []
