@@ -82,6 +82,25 @@ def test_checkout_bound_unsafe_usr_uses_stable_scoped_fallback(
     assert "include/EALoad.h:9:9" in left["canonical_signature"]
 
 
+def test_semantic_whitespace_in_conversion_operator_usr_is_preserved(
+    tmp_path: Path,
+) -> None:
+    checkout = tmp_path / "checkout"
+    source = checkout / "operator.cpp"
+    source.parent.mkdir(parents=True)
+    source.write_text("struct Box { operator int() const; };\n", encoding="utf-8")
+    usr = "c:@S@Box@F@operator int#1"
+
+    reference = indexer.symbol_reference_for_cursor(
+        _cursor(source, usr=usr, displayname="operator int()"),
+        project_dir=str(checkout),
+        project_id="owner/repo",
+    )
+
+    assert reference["usr"] == usr
+    assert f"usr={usr}" in reference["symbol_key"]
+
+
 def test_mlx_emits_the_shared_integrity_version() -> None:
     probe = (
         "from cppmega_mlx.data import prompt_graph_index as m; "

@@ -962,10 +962,11 @@ def _cursor_usr(cursor: Cursor, *, project_dir: str | None = None) -> str:
         or "invalid" in usr.lower()
         or usr != usr.strip()
         or "\x1f" in usr
-        or any(
-            char.isspace() or ord(char) < 32 or ord(char) == 127
-            for char in usr
-        )
+        # Whitespace is legal semantic payload in Clang USRs for conversion
+        # operators (for example ``operator int``).  Reject only control
+        # characters here; checkout-bound anonymous USRs are rejected by the
+        # explicit project-prefix check below.
+        or any(ord(char) < 32 or ord(char) == 127 for char in usr)
         or any(
             prefix in usr
             for prefix in _project_identity_path_prefixes(project_dir)
@@ -2934,6 +2935,8 @@ def parse_translation_unit(
     *,
     project_id: str,
     external_reference_omissions: ExternalReferenceOmissions | None = None,
+    allow_include_recovery: bool = False,
+    parse_recovery_records: list[dict[str, object]] | None = None,
 ) -> tuple[list[FunctionDef], list[TypeDef]]:
     """Parse a single C/C++ file (source OR header) and extract function
     definitions (with callees + referenced types) AND type definitions
@@ -2965,19 +2968,14 @@ def parse_translation_unit(
     except OSError:
         return functions, typedefs
 
-    try:
-        tu = index.parse(
-            filepath,
-            args=compile_args,
-            # Corpus indexing parses each translation unit once. PCH preamble
-            # caches are a native-memory win only for repeated reparses; here they
-            # make many parallel clang workers retain large buffers.
-            options=TranslationUnit.PARSE_INCOMPLETE,
-        )
-    except SymbolIdentityError:
-        raise
-    except Exception as exc:
-        raise RuntimeError(f"libclang parse failed for {filepath}: {exc}") from exc
+    tu = _load_translation_unit_with_include_recovery(
+        filepath,
+        index,
+        compile_args,
+        project_dir,
+        allow_include_recovery=allow_include_recovery,
+        parse_recovery_records=parse_recovery_records,
+    )
 
     rel_path = os.path.relpath(filepath, project_dir)
     ast_depth, sibling_index, ast_node_type = extract_clang_ast_metadata(
@@ -4361,6 +4359,275 @@ def _discover_include_dirs(project_dir: str) -> list[str]:
         if os.path.basename(root) == 'include':
             include_dirs.add(root)
     return sorted(include_dirs)
+
+
+_RECOVERY_INCLUDE_DIR_CACHE: dict[str, tuple[str, ...]] = {}
+_RECOVERY_INCLUDE_DIR_RE = re.compile(
+    r"(?:include|inc(?:\.[A-Za-z0-9_-]+)?)",
+    re.IGNORECASE,
+)
+_MISSING_INCLUDE_DIAGNOSTIC_MARKERS = (
+    "file not found",
+    "cannot open include file",
+    "no such file or directory",
+)
+
+
+def _discover_recovery_include_dirs(project_dir: str) -> tuple[str, ...]:
+    """Find nested include roots for a receipt-recorded legacy parse retry.
+
+    This is deliberately separate from the normal inferred build context.  It
+    is consulted only after libclang cannot load a translation unit or reports
+    a missing include and only when no compile-command entry exists.
+    """
+
+    project_root = os.path.realpath(os.path.abspath(project_dir))
+    cached = _RECOVERY_INCLUDE_DIR_CACHE.get(project_root)
+    if cached is not None:
+        return cached
+
+    discovered: list[str] = []
+    for root, dirs, _files in os.walk(project_root):
+        dirs[:] = sorted(
+            directory
+            for directory in dirs
+            if directory not in {".git", ".hg", ".svn"}
+            and not os.path.islink(os.path.join(root, directory))
+        )
+        if _RECOVERY_INCLUDE_DIR_RE.fullmatch(os.path.basename(root)):
+            discovered.append(os.path.abspath(root))
+    result = tuple(sorted(set(discovered)))
+    _RECOVERY_INCLUDE_DIR_CACHE[project_root] = result
+    return result
+
+
+def _compile_arg_include_dirs(
+    compile_args: Sequence[str],
+    *,
+    project_dir: str,
+) -> set[str]:
+    """Return normalized include directories already present in clang args."""
+
+    existing: set[str] = set()
+    expect_path = False
+    for value in compile_args:
+        text = str(value)
+        if expect_path:
+            candidate = text
+            expect_path = False
+        elif text in {"-I", "-isystem", "-iquote"}:
+            expect_path = True
+            continue
+        elif text.startswith("-I") and text != "-I":
+            candidate = text[2:]
+        elif text.startswith("-isystem") and text != "-isystem":
+            candidate = text.removeprefix("-isystem")
+        elif text.startswith("-iquote") and text != "-iquote":
+            candidate = text.removeprefix("-iquote")
+        else:
+            continue
+        if not os.path.isabs(candidate):
+            candidate = os.path.join(project_dir, candidate)
+        existing.add(os.path.realpath(os.path.abspath(candidate)))
+    return existing
+
+
+def _include_recovery_args(
+    compile_args: Sequence[str],
+    *,
+    filepath: str,
+    project_dir: str,
+) -> tuple[list[str], list[str]]:
+    """Add ranked project-local include roots and return their relative paths."""
+
+    project_root = os.path.realpath(os.path.abspath(project_dir))
+    source_dir = os.path.realpath(os.path.abspath(os.path.dirname(filepath)))
+    candidates = {source_dir, *_discover_recovery_include_dirs(project_root)}
+    existing = _compile_arg_include_dirs(
+        compile_args,
+        project_dir=project_root,
+    )
+
+    def _relative_parts(path: str) -> tuple[str, ...]:
+        try:
+            relative = os.path.relpath(path, project_root)
+        except ValueError:
+            return ()
+        if relative == ".." or relative.startswith(f"..{os.sep}"):
+            return ()
+        return Path(relative).parts
+
+    source_parts = _relative_parts(source_dir)
+
+    def _rank(path: str) -> tuple[int, int, str]:
+        parts = _relative_parts(path)
+        shared = 0
+        for left, right in zip(source_parts, parts):
+            if left != right:
+                break
+            shared += 1
+        return (-shared, len(parts), Path(*parts).as_posix())
+
+    added_absolute: list[str] = []
+    added_relative: list[str] = []
+    for candidate in sorted(candidates, key=_rank):
+        parts = _relative_parts(candidate)
+        if not parts or candidate in existing:
+            continue
+        added_absolute.append(candidate)
+        added_relative.append(Path(*parts).as_posix())
+        existing.add(candidate)
+    return (
+        [*map(str, compile_args), *(f"-I{path}" for path in added_absolute)],
+        added_relative,
+    )
+
+
+def _missing_include_diagnostics(tu: TranslationUnit) -> list[str]:
+    diagnostics: list[str] = []
+    for diagnostic in getattr(tu, "diagnostics", ()):
+        spelling = str(getattr(diagnostic, "spelling", "") or "")
+        lowered = spelling.lower()
+        if any(marker in lowered for marker in _MISSING_INCLUDE_DIAGNOSTIC_MARKERS):
+            diagnostics.append(spelling)
+    return diagnostics
+
+
+def _translation_unit_load_error(exc: BaseException) -> bool:
+    return type(exc).__name__ == "TranslationUnitLoadError"
+
+
+def _load_translation_unit(
+    filepath: str,
+    index: Index,
+    compile_args: Sequence[str],
+) -> TranslationUnit:
+    return index.parse(
+        filepath,
+        args=list(compile_args),
+        # Corpus indexing parses each translation unit once. PCH preamble
+        # caches are a native-memory win only for repeated reparses; here they
+        # make many parallel clang workers retain large buffers.
+        options=TranslationUnit.PARSE_INCOMPLETE,
+    )
+
+
+def _load_translation_unit_with_include_recovery(
+    filepath: str,
+    index: Index,
+    compile_args: Sequence[str],
+    project_dir: str,
+    *,
+    allow_include_recovery: bool,
+    parse_recovery_records: list[dict[str, object]] | None,
+) -> TranslationUnit:
+    """Load one TU, retrying missing legacy include context transparently."""
+
+    initial_tu: TranslationUnit | None = None
+    initial_error: Exception | None = None
+    try:
+        initial_tu = _load_translation_unit(filepath, index, compile_args)
+    except SymbolIdentityError:
+        raise
+    except Exception as exc:
+        if not _translation_unit_load_error(exc):
+            raise RuntimeError(
+                f"libclang parse failed for {filepath}: {exc}"
+            ) from exc
+        initial_error = exc
+
+    initial_missing = (
+        _missing_include_diagnostics(initial_tu)
+        if initial_tu is not None
+        else []
+    )
+    if initial_error is None and not initial_missing:
+        assert initial_tu is not None
+        return initial_tu
+    if not allow_include_recovery:
+        if initial_error is not None:
+            raise RuntimeError(
+                f"libclang parse failed for {filepath}: {initial_error}"
+            ) from initial_error
+        assert initial_tu is not None
+        return initial_tu
+
+    recovery_args, added_include_dirs = _include_recovery_args(
+        compile_args,
+        filepath=filepath,
+        project_dir=project_dir,
+    )
+    if not added_include_dirs:
+        if initial_error is not None:
+            raise RuntimeError(
+                f"libclang parse failed for {filepath}: {initial_error}"
+            ) from initial_error
+        assert initial_tu is not None
+        return initial_tu
+
+    relative_path = Path(os.path.relpath(filepath, project_dir)).as_posix()
+    encoded_include_dirs = json.dumps(
+        added_include_dirs,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    record: dict[str, object] = {
+        "relative_path": relative_path,
+        "trigger": (
+            "translation_unit_load_error"
+            if initial_error is not None
+            else "missing_include_diagnostic"
+        ),
+        "added_include_dir_count": len(added_include_dirs),
+        "added_include_dirs_sha256": hashlib.sha256(
+            encoded_include_dirs
+        ).hexdigest(),
+        "added_include_dir_examples": added_include_dirs[:8],
+        "added_include_dir_examples_truncated": len(added_include_dirs) > 8,
+        "initial_missing_include_count": len(initial_missing),
+    }
+    try:
+        recovered_tu = _load_translation_unit(filepath, index, recovery_args)
+    except Exception as recovery_error:
+        record.update(
+            {
+                "status": "unresolved",
+                "retry_error_type": type(recovery_error).__name__,
+            }
+        )
+        if parse_recovery_records is not None:
+            parse_recovery_records.append(record)
+        if initial_error is not None:
+            raise RuntimeError(
+                f"libclang parse failed for {filepath} after nested include "
+                f"recovery: {recovery_error}"
+            ) from recovery_error
+        assert initial_tu is not None
+        return initial_tu
+
+    recovered_missing = _missing_include_diagnostics(recovered_tu)
+    recovered = initial_error is not None or (
+        len(recovered_missing) < len(initial_missing)
+    )
+    record.update(
+        {
+            "status": "recovered" if recovered else "unresolved",
+            "retry_missing_include_count": len(recovered_missing),
+        }
+    )
+    if parse_recovery_records is not None:
+        parse_recovery_records.append(record)
+    if recovered:
+        print(
+            "  Parse include recovery: "
+            f"{relative_path} added_dirs={len(added_include_dirs)} "
+            f"missing_includes={len(initial_missing)}->{len(recovered_missing)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return recovered_tu
+    assert initial_tu is not None
+    return initial_tu
 
 
 def _is_sane_compile_args(args: list[str]) -> bool:
@@ -9084,6 +9351,7 @@ def _parse_file_batch(args_tuple):
     func_results: list[dict] = []
     type_results: list[dict] = []
     external_reference_omissions: ExternalReferenceOmissions = {}
+    parse_recovery_records: list[dict[str, object]] = []
     last_heartbeat = time.monotonic()
     for idx, filepath in enumerate(filepaths, start=1):
         args = _resolve_file_args(filepath, compile_db, default_args)
@@ -9095,6 +9363,10 @@ def _parse_file_batch(args_tuple):
                 project_dir,
                 project_id=project_id,
                 external_reference_omissions=external_reference_omissions,
+                allow_include_recovery=not (
+                    compile_db and filepath in compile_db
+                ),
+                parse_recovery_records=parse_recovery_records,
             )
             func_results.extend(f.to_dict() for f in functions)
             type_results.extend(t.to_dict() for t in typedefs)
@@ -9123,6 +9395,7 @@ def _parse_file_batch(args_tuple):
         "functions": func_results,
         "typedefs": type_results,
         "external_reference_omissions": external_reference_omissions,
+        "parse_recovery_records": parse_recovery_records,
     }, len(filepaths)
 
 
@@ -9275,6 +9548,48 @@ def _external_reference_omission_summary(
     }
 
 
+def _parse_recovery_summary(
+    records: Iterable[dict[str, object]],
+) -> dict[str, object]:
+    normalized = sorted(
+        (dict(record) for record in records),
+        key=lambda record: (
+            str(record.get("relative_path") or ""),
+            str(record.get("trigger") or ""),
+            str(record.get("status") or ""),
+        ),
+    )
+    encoded = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    recovered_count = sum(
+        record.get("status") == "recovered" for record in normalized
+    )
+    unresolved_count = sum(
+        record.get("status") == "unresolved" for record in normalized
+    )
+    return {
+        "schema": "cppmega.source_parse_recovery_v1",
+        "status": (
+            "complete_with_unresolved"
+            if unresolved_count
+            else "complete"
+        ),
+        "policy": (
+            "retry_missing_includes_with_ranked_project_local_include_dirs_"
+            "only_without_compile_command"
+        ),
+        "attempted_file_count": len(normalized),
+        "recovered_file_count": recovered_count,
+        "unresolved_file_count": unresolved_count,
+        "records_sha256": hashlib.sha256(encoded).hexdigest(),
+        "records": normalized,
+    }
+
+
 def process_project(
     project_dir: str,
     max_tokens: int = 16384,
@@ -9335,6 +9650,7 @@ def process_project(
     )
     quarantine_receipt: dict[str, object] | None = None
     external_reference_omissions: ExternalReferenceOmissions = {}
+    parse_recovery_records: list[dict[str, object]] = []
 
     invalid_domain_paths: set[str] = set()
 
@@ -9470,6 +9786,7 @@ def process_project(
                     external_reference_omissions[key] = (
                         external_reference_omissions.get(key, 0) + int(count)
                     )
+                parse_recovery_records.extend(payload["parse_recovery_records"])
                 total_parsed += parsed_count
                 check_memory_limit(memory_limit_gb, label="index_project")
                 print(
@@ -9498,6 +9815,10 @@ def process_project(
                     project_dir,
                     project_id=stable_project_id,
                     external_reference_omissions=external_reference_omissions,
+                    allow_include_recovery=not (
+                        compile_db and filepath in compile_db
+                    ),
+                    parse_recovery_records=parse_recovery_records,
                 )
                 for func in functions:
                     index_obj.add_function(func)
@@ -9534,6 +9855,7 @@ def process_project(
     external_reference_omission_summary = _external_reference_omission_summary(
         external_reference_omissions
     )
+    parse_recovery_summary = _parse_recovery_summary(parse_recovery_records)
     print(
         "  Unknown external graph references omitted: "
         f"observations={external_reference_omission_summary['observation_count']} "
@@ -9542,10 +9864,19 @@ def process_project(
         f"{external_reference_omission_summary['reference_records_sha256']}",
         file=sys.stderr,
     )
+    print(
+        "  Source parse recovery: "
+        f"attempted={parse_recovery_summary['attempted_file_count']} "
+        f"recovered={parse_recovery_summary['recovered_file_count']} "
+        f"unresolved={parse_recovery_summary['unresolved_file_count']} "
+        f"records_sha256={parse_recovery_summary['records_sha256']}",
+        file=sys.stderr,
+    )
     if quarantine_receipt is not None:
         quarantine_receipt["external_reference_omissions"] = (
             external_reference_omission_summary
         )
+        quarantine_receipt["parse_recovery"] = parse_recovery_summary
         assert source_quarantine_receipt is not None
         _write_source_quarantine_receipt(
             source_quarantine_receipt,

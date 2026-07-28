@@ -126,6 +126,59 @@ def test_cp1252_source_round_trips_without_clang_token_utf8_decode(
         assert len(function[field]) == len(function["text"])
 
 
+def test_parse_batch_recovers_nested_legacy_include_context(
+    tmp_path: Path,
+) -> None:
+    index_project = _load_indexer()
+    source_dir = tmp_path / "legacy" / "src"
+    include_dir = tmp_path / "legacy" / "vendor" / "include"
+    source_dir.mkdir(parents=True)
+    include_dir.mkdir(parents=True)
+    source = source_dir / "main.cpp"
+    source.write_text(
+        "int legacy_answer() { return LEGACY_ANSWER; }\n",
+        encoding="utf-8",
+    )
+    (include_dir / "legacy_prelude.h").write_text(
+        "#define LEGACY_ANSWER 42\n",
+        encoding="utf-8",
+    )
+
+    payload, parsed_count = index_project._parse_file_batch(
+        (
+            [str(source)],
+            {},
+            ["-std=c++17", "-include", "legacy_prelude.h"],
+            str(tmp_path),
+            "fixture/nested-include-recovery",
+        )
+    )
+
+    assert parsed_count == 1
+    assert [item["name"] for item in payload["functions"]] == [
+        "legacy_answer"
+    ]
+    assert payload["parse_recovery_records"] == [
+        {
+            "relative_path": "legacy/src/main.cpp",
+            "trigger": "missing_include_diagnostic",
+            "added_include_dir_examples": [
+                "legacy/src",
+                "legacy/vendor/include",
+            ],
+            "added_include_dir_count": 2,
+            "added_include_dirs_sha256": (
+                "4437a42f22c598ba16c76c070b73c097adc1bee77328c2091d72"
+                "a49501c6ee5b"
+            ),
+            "added_include_dir_examples_truncated": False,
+            "initial_missing_include_count": 1,
+            "status": "recovered",
+            "retry_missing_include_count": 0,
+        }
+    ]
+
+
 def test_source_with_nul_byte_is_rejected() -> None:
     index_project = _load_indexer()
 
