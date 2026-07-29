@@ -61,9 +61,12 @@ from cppmega.data.source_conveyor_composition import (  # noqa: E402
     load_source_composition,
 )
 from cppmega.data.pr_primary_membership import (  # noqa: E402
+    PRIMARY_PR_MEMBERSHIP_ARTIFACT_NAME,
     PRIMARY_PR_MEMBERSHIP_POLICY,
+    PRIMARY_PR_MEMBERSHIP_RECEIPT_NAME,
     PRIMARY_PR_MEMBERSHIP_SCHEMA,
     verify_primary_pr_membership_binding,
+    verify_primary_pr_membership_receipt,
 )
 from cppmega.data.ci_training_scope import (  # noqa: E402
     PRIMARY_ROUTE as CI_PRIMARY_ROUTE,
@@ -1561,6 +1564,7 @@ def _load_pr_export_allowlist(
     required_validation = (
         "exact_scan_membership",
         "exact_primary_commit_membership",
+        "portable_primary_membership_verified",
         "input_revalidated_after_export",
         "document_conservation",
         "all_requested_buckets_present",
@@ -1586,6 +1590,18 @@ def _load_pr_export_allowlist(
         commit_root=commit_root,
         buckets=buckets,
     )
+    primary_membership_receipt = receipt.get("primary_membership_receipt")
+    try:
+        verify_primary_pr_membership_receipt(
+            primary_membership,
+            primary_membership_receipt,
+            output_root=pr_root,
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        raise RuntimeError(
+            f"{manifest_path}: primary PR membership receipt binding drifted: "
+            f"{error}"
+        ) from error
     completion = receipt.get("pr_completion")
     if (
         not isinstance(completion, dict)
@@ -1651,6 +1667,8 @@ def _load_pr_export_allowlist(
     expected_files = {
         Path("export_receipt.json"),
         Path("_done.json"),
+        Path(PRIMARY_PR_MEMBERSHIP_ARTIFACT_NAME),
+        Path(PRIMARY_PR_MEMBERSHIP_RECEIPT_NAME),
     }
     allowed: dict[tuple[str, int], dict[str, int]] = {
         ("pr", bucket): {} for bucket in buckets
@@ -1725,6 +1743,24 @@ def _load_pr_export_allowlist(
         raise RuntimeError(
             f"{manifest_path}: PR export has no shards for buckets {missing}"
         )
+    membership_artifact = primary_membership.get("artifact")
+    membership_receipt_sha256 = (
+        primary_membership_receipt.get("sha256")
+        if isinstance(primary_membership_receipt, dict)
+        else None
+    )
+    membership_artifact_sha256 = (
+        membership_artifact.get("sha256")
+        if isinstance(membership_artifact, dict)
+        else None
+    )
+    if (
+        not isinstance(membership_receipt_sha256, str)
+        or not isinstance(membership_artifact_sha256, str)
+    ):
+        raise RuntimeError(
+            f"{manifest_path}: primary PR membership hashes are missing"
+        )
     source_binding = {
         "pr_completion_receipt_sha256": completion["receipt_sha256"],
         "pr_store_sha256": completion["pr_store_sha256"],
@@ -1732,6 +1768,8 @@ def _load_pr_export_allowlist(
         "expected_repos_sha256": completion["expected_repos_sha256"],
         "scan_id": completion["scan_id"],
         "primary_membership_sha256": _canonical_sha256(primary_membership),
+        "primary_membership_receipt_sha256": membership_receipt_sha256,
+        "primary_membership_artifact_sha256": membership_artifact_sha256,
     }
     source_inventory_sha256 = _canonical_sha256(source_binding)
     metadata: dict[str, object] = {
@@ -1749,6 +1787,7 @@ def _load_pr_export_allowlist(
         "producer_script_sha256": exporter_sha256,
         "source_completion": completion,
         "primary_membership": primary_membership,
+        "primary_membership_receipt": primary_membership_receipt,
         "export_manifest": {
             "path": str(expected_done_path),
             "sha256": str(export_manifest["sha256"]),
