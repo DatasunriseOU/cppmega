@@ -4326,6 +4326,10 @@ class InventoryDB:
                         PREVIOUS_SCHEMA_VERSION,
                     ),
                     (LEGACY_SCHEMA_VERSION, SCHEMA_VERSION),
+                    (
+                        PREVIOUS_SCHEMA_VERSION,
+                        PREVIOUS_SCHEMA_VERSION,
+                    ),
                     (PREVIOUS_SCHEMA_VERSION, SCHEMA_VERSION),
                     (SCHEMA_VERSION, SCHEMA_VERSION),
                 }:
