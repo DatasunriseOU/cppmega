@@ -9,6 +9,15 @@
       "classification": "mislabeled_non_cpp",
       "detected_format": "xml_utf16le",
       "reason": "UTF-16LE XML license document stored under a .cc suffix"
+    },
+    {
+      "project_id": "google/filament",
+      "relative_path": "third_party/dawn/third_party/dxc/tools/clang/test/Parser/crash-report.c",
+      "size_bytes": 271,
+      "sha256": "1de7f4f21f6496cd768521481a5730b810d6e8e3074b5ba2e326d2a1679c7741",
+      "classification": "deliberate_compiler_crash_fixture",
+      "detected_format": "clang_debug_crash_pragma",
+      "reason": "Clang regression fixture deliberately invokes #pragma clang __debug crash"
     }
   ]
 }
