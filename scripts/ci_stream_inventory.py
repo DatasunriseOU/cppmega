@@ -6923,10 +6923,7 @@ class GitHubActionsInventory:
                 source_count_drift=drift,
                 roots=persisted_roots,
             )
-            return self.db._validate_source_drift_reconciliation(
-                self.db._validate_and_digests(),
-                payload,
-            )
+            return payload
 
         reconciled_by_window: dict[
             int,
@@ -6980,10 +6977,7 @@ class GitHubActionsInventory:
             source_count_drift=drift,
             roots=reconciled_roots,
         )
-        return self.db._validate_source_drift_reconciliation(
-            self.db._validate_and_digests(),
-            payload,
-        )
+        return payload
 
     def write_completion_receipt(
         self,
