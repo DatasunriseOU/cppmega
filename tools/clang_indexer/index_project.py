@@ -5973,6 +5973,19 @@ def extract_semantic_metadata(
             operator_token = spelling.removeprefix("operator").strip()
             if operator_token:
                 token_spellings.add(operator_token)
+        cursor_offsets = _cursor_extent_offsets(
+            cursor,
+            filename,
+            byte_to_char,
+        )
+        if cursor_offsets is not None:
+            cursor_start, cursor_end = cursor_offsets
+            if not any(
+                value
+                and source.find(value, cursor_start, cursor_end) >= 0
+                for value in token_spellings
+            ):
+                return []
         token_spelling_bytes = {
             value.encode(source_encoding, errors="strict")
             for value in token_spellings
@@ -6019,6 +6032,29 @@ def extract_semantic_metadata(
         target: Cursor,
         target_key: str,
     ) -> list[tuple[int, int]]:
+        target_spellings = {target.spelling}
+        if target.spelling.startswith("operator"):
+            operator_token = target.spelling.removeprefix("operator").strip()
+            if operator_token:
+                target_spellings.add(operator_token)
+        call_offsets = _cursor_extent_offsets(
+            call_cursor,
+            filename,
+            byte_to_char,
+        )
+        if call_offsets is not None:
+            call_start, call_end = call_offsets
+            if not any(
+                spelling
+                and source.find(spelling, call_start, call_end) >= 0
+                for spelling in target_spellings
+            ):
+                # Macro expansions can expose enormous synthetic call ASTs
+                # whose callee token does not exist in the original source
+                # extent. A recursive search cannot produce a valid explicit
+                # source span in that case.
+                return []
+
         def find_reference(node: Cursor) -> list[tuple[int, int]]:
             for child in node.get_children():
                 child_kind = _cursor_kind(child)

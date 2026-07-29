@@ -220,6 +220,41 @@ int reopened_answer() { return 43; }
     }
 
 
+def test_macro_expanded_call_without_explicit_callee_token_is_not_annotated(
+    tmp_path: Path,
+) -> None:
+    index_project = _load_indexer()
+    source = tmp_path / "macro_call.cpp"
+    source.write_text(
+        "#define DO_CALL() target()\n"
+        "int target() { return 7; }\n"
+        "int macro_wrapper() { return DO_CALL(); }\n"
+        "int direct_wrapper() { return target(); }\n",
+        encoding="utf-8",
+    )
+
+    payload, parsed_count = index_project._parse_file_batch(
+        (
+            [str(source)],
+            {},
+            ["-std=c++17", "-fsyntax-only", "-Wno-everything"],
+            str(tmp_path),
+            "fixture/macro-call",
+        )
+    )
+
+    assert parsed_count == 1
+    functions = {item["name"]: item for item in payload["functions"]}
+    macro_wrapper = functions["macro_wrapper"]
+    direct_wrapper = functions["direct_wrapper"]
+    assert not any(macro_wrapper["semantic_call_targets"])
+    target_start = direct_wrapper["text"].index("target")
+    target_end = target_start + len("target")
+    assert all(
+        direct_wrapper["semantic_call_targets"][target_start:target_end]
+    )
+
+
 def test_no_linkage_parameter_in_spaced_repository_path_parses(
     tmp_path: Path,
 ) -> None:
