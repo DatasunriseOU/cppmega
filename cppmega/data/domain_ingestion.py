@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 import re
+import subprocess
 from typing import BinaryIO, Callable, Iterator, Mapping, Sequence, cast
 
 from cppmega.data.build_parsers import (
@@ -157,6 +158,16 @@ _SQL_TARGET_PREDECESSORS = {"TABLE", "INTO", "UPDATE", "FROM", "JOIN", "VIEW", "
 DOMAIN_INPUT_SIZE_LIMIT_BYTES = 500_000
 DOMAIN_STREAM_READ_BYTES = 64 * 1024
 DOMAIN_SIGNATURE_READ_BYTES = 4 * 1024
+_ICONV_EUC_TW_CODEC = "iconv-euc-tw"
+_FILENAME_DECLARED_CODECS = {
+    "big5.sql": ("big5", "big5"),
+    "euc_cn.sql": ("euc_cn", "euc-cn"),
+    "euc_jp.sql": ("euc_jp", "euc-jp"),
+    "euc_kr.sql": ("euc_kr", "euc-kr"),
+    "euc_tw.sql": (_ICONV_EUC_TW_CODEC, "euc-tw"),
+    "gb18030.sql": ("gb18030", "gb18030"),
+    "sjis.sql": ("shift_jis", "shift-jis"),
+}
 _LARGE_DOMAIN_KINDS = frozenset(
     {
         DomainKind.CMAKE,
@@ -340,6 +351,75 @@ def _trailing_nul_bytes(
     return width if stream.read(width) == b"\0" * width else 0
 
 
+def _filename_declared_codec(path: Path) -> tuple[str, str] | None:
+    return _FILENAME_DECLARED_CODECS.get(path.name.casefold())
+
+
+def _decode_euc_tw(payload: bytes, *, path: Path) -> str:
+    def convert(source: str, target: str, raw: bytes) -> bytes:
+        try:
+            result = subprocess.run(
+                ["iconv", "-f", source, "-t", target],
+                input=raw,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        except OSError as exc:
+            raise ValueError(
+                f"cannot run iconv for filename-declared EUC-TW input {path}: {exc}"
+            ) from exc
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", errors="replace").strip()[:512]
+            raise ValueError(
+                f"invalid filename-declared EUC-TW domain input {path}: {detail}"
+            )
+        return result.stdout
+
+    utf8 = convert("EUC-TW", "UTF-8", payload)
+    text = utf8.decode("utf-8", errors="strict")
+    if convert("UTF-8", "EUC-TW", utf8) != payload:
+        raise ValueError(
+            f"filename-declared EUC-TW input does not round-trip exactly: {path}"
+        )
+    return text
+
+
+def _validate_euc_tw_stream(
+    stream: BinaryIO,
+    *,
+    path: Path,
+    expected_size: int,
+    trailing_nul_bytes: int,
+) -> _ValidatedDomainText:
+    if expected_size > DOMAIN_INPUT_SIZE_LIMIT_BYTES:
+        raise ValueError(
+            "filename-declared EUC-TW input exceeds the bounded native iconv "
+            f"decoder limit of {DOMAIN_INPUT_SIZE_LIMIT_BYTES} bytes: {path}"
+        )
+    stream.seek(0)
+    raw = stream.read(expected_size + 1)
+    if len(raw) != expected_size:
+        raise OSError(
+            f"domain input changed size while reading {path}: "
+            f"expected {expected_size}, read {len(raw)}"
+        )
+    payload_end = len(raw) - trailing_nul_bytes
+    payload = raw[:payload_end]
+    if b"\0" in payload:
+        raise ValueError(f"binary domain input contains NUL byte: {path}")
+    text = _decode_euc_tw(payload, path=path)
+    if "\0" in text:
+        raise ValueError(f"decoded domain input contains NUL character: {path}")
+    return _ValidatedDomainText(
+        codec=_ICONV_EUC_TW_CODEC,
+        source_encoding="euc-tw",
+        bom=b"",
+        signature_text=text[:DOMAIN_SIGNATURE_READ_BYTES],
+        trailing_nul_bytes=trailing_nul_bytes,
+    )
+
+
 def _validate_domain_stream(
     stream: BinaryIO,
     *,
@@ -421,6 +501,32 @@ def _validate_domain_stream(
             trailing_nul_bytes=trailing_nul_bytes,
         )
     except UnicodeDecodeError as utf8_exc:
+        declared_codec = _filename_declared_codec(path)
+        if declared_codec is not None:
+            codec, source_encoding = declared_codec
+            if codec == _ICONV_EUC_TW_CODEC:
+                return _validate_euc_tw_stream(
+                    stream,
+                    path=path,
+                    expected_size=expected_size,
+                    trailing_nul_bytes=trailing_nul_bytes,
+                )
+            try:
+                return _scan_domain_stream(
+                    stream,
+                    path=path,
+                    expected_size=expected_size,
+                    codec=codec,
+                    source_encoding=source_encoding,
+                    reject_raw_nul=True,
+                    trailing_nul_bytes=trailing_nul_bytes,
+                )
+            except UnicodeDecodeError as declared_exc:
+                raise ValueError(
+                    f"invalid UTF-8 or filename-declared {source_encoding} "
+                    f"domain input {path}: utf-8={utf8_exc}; "
+                    f"{source_encoding}={declared_exc}"
+                ) from declared_exc
         try:
             return _scan_domain_stream(
                 stream,
@@ -466,8 +572,10 @@ def _decode_domain_bytes(
         raise ValueError(f"domain input trailing NUL marker changed: {path}")
     payload_end = len(raw) - selected.trailing_nul_bytes
     payload = raw[len(selected.bom) : payload_end]
-    if selected.codec in {"utf-8", "cp1252"} and b"\0" in payload:
+    if selected.codec not in {"utf-16-le", "utf-16-be"} and b"\0" in payload:
         raise ValueError(f"binary domain input contains NUL byte: {path}")
+    if selected.codec == _ICONV_EUC_TW_CODEC:
+        return _decode_euc_tw(payload, path=path)
     try:
         text = payload.decode(selected.codec, errors="strict")
     except UnicodeDecodeError as exc:
@@ -503,6 +611,8 @@ def _is_domain_text_integrity_error(exc: ValueError) -> bool:
         or message.startswith("invalid UTF-8")
         or message.startswith("invalid UTF-16")
         or message.startswith("invalid windows-1252")
+        or message.startswith("invalid filename-declared")
+        or message.startswith("filename-declared")
     )
 
 
@@ -712,15 +822,25 @@ def _decodable_prefix_at_or_before(
         return _utf8_boundary_at_or_before(data, cut)
     if codec == "cp1252":
         return cut
-    if codec not in {"utf-16-le", "utf-16-be"}:
+    if codec not in {
+        "utf-16-le",
+        "utf-16-be",
+        "big5",
+        "euc_cn",
+        "euc_jp",
+        "euc_kr",
+        "gb18030",
+        "shift_jis",
+    }:
         raise ValueError(f"unsupported domain source codec {codec!r}")
-    cut -= cut % 2
+    step = 2 if codec in {"utf-16-le", "utf-16-be"} else 1
+    cut -= cut % step
     while cut > 0:
         try:
             bytes(data[:cut]).decode(codec, errors="strict")
             return cut
         except UnicodeDecodeError:
-            cut -= 2
+            cut -= step
     raise UnicodeDecodeError(
         codec,
         bytes(data[: min(len(data), 4)]),
@@ -759,6 +879,22 @@ def decode_domain_prefix(
                 final=False,
             )
         except UnicodeDecodeError as utf8_exc:
+            declared_codec = _filename_declared_codec(path_obj)
+            if declared_codec is not None:
+                codec, source_encoding = declared_codec
+                if codec == _ICONV_EUC_TW_CODEC:
+                    return _decode_euc_tw(payload_bytes, path=path_obj)
+                try:
+                    return codecs.getincrementaldecoder(codec)("strict").decode(
+                        payload_bytes,
+                        final=False,
+                    )
+                except UnicodeDecodeError as declared_exc:
+                    raise ValueError(
+                        f"invalid UTF-8 or filename-declared {source_encoding} "
+                        f"domain input {path_obj}: utf-8={utf8_exc}; "
+                        f"{source_encoding}={declared_exc}"
+                    ) from declared_exc
             try:
                 return codecs.getincrementaldecoder("cp1252")("strict").decode(
                     payload_bytes,
@@ -869,10 +1005,11 @@ def iter_domain_file_chunks(
 
     Inputs are validated in a bounded first pass before any chunk is yielded, so
     invalid encodings or binary data cannot leave a partially ingested document.
-    UTF-8, BOM-marked UTF-16, and strict Windows-1252 are decoded without
-    replacement. SQL prefers statement boundaries; build, shell, and diagnostic
-    text prefers line boundaries. Every emitted chunk has an explicit hard byte
-    cap and exact byte/character provenance into the original encoded file.
+    UTF-8, BOM-marked UTF-16, filename-declared legacy SQL encodings, and
+    strict Windows-1252 are decoded without replacement. SQL prefers statement
+    boundaries; build, shell, and diagnostic text prefers line boundaries.
+    Every emitted chunk has an explicit hard byte cap and exact byte/character
+    provenance into the original encoded file.
     """
 
     if not 4 <= max_chunk_bytes <= DOMAIN_INPUT_SIZE_LIMIT_BYTES:
