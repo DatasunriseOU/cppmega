@@ -7,7 +7,7 @@ Stack (all cp313 prebuilt, no source builds):
   - mamba_ssm 2.3.1 (local wheel — @31f3d7b + bench patches baked in)
   - causal_conv1d 1.6.1 (local wheel)
   - flash_attn 2.8.3 (local wheel)
-  - tilelang 0.1.9 from DatasunriseOU/tilelang@8fdff5aa (local abi3 wheel;
+  - tilelang 0.1.9 from DatasunriseOU/tilelang@16531673 (local abi3 wheel;
     carries the TVM __slots__ fix, restored nvbench CUDA header, and removes
     the apache-tvm-ffi<0.1.10 cap)
   - qoptim_cuda 0.0.0 (local wheel)

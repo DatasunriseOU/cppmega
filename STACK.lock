@@ -86,19 +86,21 @@ wheels:
       - fast_hadamard_transform-*.whl
 
   tilelang:
-    # DatasunriseOU/tilelang fork at 8fdff5aa carries:
+    # DatasunriseOU/tilelang fork at 16531673 carries:
     #   - upstream tile-ai/tilelang#2071 (046b1bd): removes apache-tvm-ffi<0.1.10 cap
     #     → pyproject pin is "apache-tvm-ffi>=0.1.dev0,<0.2" (compatible with FA4 beta23's >=0.1.12)
-    #   - vendored TVM submodule bumped to DatasunriseOU/tvm@36105156, which includes
+    #   - vendored TVM submodule bumped to DatasunriseOU/tvm@78f930ed, which includes
     #     apache/tvm#18938 (44dbd138d): TVMDerivedObject.__slots__ = ("__dict__", "__weakref__")
     #     → fixes the '_NestedLoopCheckVisitor' object has no attribute '_inst' import crash
     #       under tvm-ffi >=0.1.10 (_ObjectSlotsMeta enforcement).
     #   - restored 3rdparty/nvbench/l2_cache_flush.h at the exact historical
     #     blob still required by TVM's CUDA runtime source.
+    #   - adapts AdjustMatmulOrder's ND axes to this fork's boxed-Integer
+    #     permute_dims API (the upstream int64_t form does not compile here).
     # Upstream tile-ai/tilelang HEAD still caps apache-tvm-ffi<0.1.12 (PR #2373/#2736),
     # so it is NOT usable for the FA4 beta23 image. The fork is the clean path (§4 option 1).
     repo: DatasunriseOU/tilelang
-    ref: 8fdff5aa10f4265a4cb0e114d4c62613f3982180
+    ref: 16531673a11723a4d8243f2b94eb96a157c74cfc
     version: 0.1.9
     submodules: true
     build: |

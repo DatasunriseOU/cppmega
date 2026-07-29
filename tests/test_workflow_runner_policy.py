@@ -218,8 +218,8 @@ def test_fa2_wheel_build_uses_upstream_arch_knob_and_exact_kernel_trim() -> None
 
 
 def test_tilelang_tvm_pin_and_wheel_name_are_consistent() -> None:
-    tilelang_commit = "8fdff5aa10f4265a4cb0e114d4c62613f3982180"
-    tvm_commit = "36105156803007279d6ff481621b083441503cde"
+    tilelang_commit = "16531673a11723a4d8243f2b94eb96a157c74cfc"
+    tvm_commit = "78f930edc805920428388518e12d111019383d2f"
     wheel_name = "tilelang-0.1.9-cp38-abi3-linux_x86_64.whl"
 
     workflow = (

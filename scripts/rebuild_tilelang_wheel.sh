@@ -9,11 +9,12 @@
 #   (_ObjectSlotsMeta), but TileLang's vendored TVM (882a774) lacks the fix
 #   from apache/tvm#18938 (TVMDerivedObject.__slots__ = ("__dict__","__weakref__")).
 #   Upstream tile-ai/tilelang HEAD still caps apache-tvm-ffi<0.1.12, so it is
-#   NOT usable. The DatasunriseOU/tilelang fork at 8fdff5aa is the clean path:
+#   NOT usable. The DatasunriseOU/tilelang fork at 16531673 is the clean path:
 #     - carries upstream tile-ai/tilelang#2071 (removes the <0.1.10 cap)
-#     - vendored TVM submodule = DatasunriseOU/tvm@36105156, which includes
+#     - vendored TVM submodule = DatasunriseOU/tvm@78f930ed, which includes
 #       apache/tvm#18938 (the __slots__ fix) and restores the nvbench CUDA
 #       L2-cache-flush header that TVM still compiles
+#     - adapts AdjustMatmulOrder to the fork's boxed-Integer permute_dims API
 #   This script clones that fork commit, ensures the TVM submodule is checked
 #   out at the fixed commit, builds the wheel, and drops it in wheels/.
 #
@@ -27,19 +28,19 @@
 #
 # Env overrides:
 #   TILELANG_REPO    fork repo URL   (default: DatasunriseOU/tilelang)
-#   TILELANG_REF     fork commit     (default: 8fdff5aa...)
-#   TILELANG_TVM_REF vendored TVM commit (default: 36105156...)
+#   TILELANG_REF     fork commit     (default: 16531673...)
+#   TILELANG_TVM_REF vendored TVM commit (default: 78f930ed...)
 #   TILELANG_SRC_DIR clone dir        (default: $HOME/tilelang-build)
 #   WHEELS_DIR       output dir       (default: <repo>/wheels)
 
 set -euo pipefail
 
 TILELANG_REPO="${TILELANG_REPO:-https://github.com/DatasunriseOU/tilelang.git}"
-TILELANG_REF="${TILELANG_REF:-8fdff5aa10f4265a4cb0e114d4c62613f3982180}"
+TILELANG_REF="${TILELANG_REF:-16531673a11723a4d8243f2b94eb96a157c74cfc}"
 # DatasunriseOU/tvm commit that includes apache/tvm#18938 (44dbd138d) and
 # restores nvbench/l2_cache_flush.h. This is the exact submodule pin recorded
 # in the fork's 3rdparty/tvm gitlink at TILELANG_REF.
-TILELANG_TVM_REF="${TILELANG_TVM_REF:-36105156803007279d6ff481621b083441503cde}"
+TILELANG_TVM_REF="${TILELANG_TVM_REF:-78f930edc805920428388518e12d111019383d2f}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WHEELS_DIR="${WHEELS_DIR:-${REPO_ROOT}/wheels}"
