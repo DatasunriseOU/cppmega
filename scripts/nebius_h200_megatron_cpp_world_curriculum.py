@@ -338,46 +338,8 @@ def _default_stages(
 
 
 def _assert_prefix_contract(stages: list[Stage]) -> None:
-    required_sidecars = {
-        "loss_mask",
-        "doc_ids",
-        "token_domain_ids",
-        "token_role_ids",
-        "token_entity_ids",
-        "token_scope_ids",
-        "token_confidence_ids",
-        "token_structure_ids",
-        "token_dep_levels",
-        "token_ast_depth",
-        "token_sibling_index",
-        "token_ast_node_type",
-        "token_symbol_ids",
-        "token_call_targets",
-        "token_type_refs",
-        "token_def_use",
-        "token_change_mask_pre",
-        "token_change_mask_post",
-    }
-    required_graph_schema = "cppmega_graph_routes_v2"
     for stage in stages:
-        manifest = json.loads(stage.prefix.with_suffix(".json").read_text())
-        side = set(manifest.get("side_channel_paths", {}))
-        graph_schema = manifest.get("graph_sidecar_schema")
-        missing = sorted(required_sidecars - side)
-        if missing:
-            raise KeyError(f"{stage.prefix}: missing required sidecars {missing}")
-        if graph_schema != required_graph_schema:
-            raise ValueError(
-                f"{stage.prefix}: graph_sidecar_schema={graph_schema!r}, "
-                f"expected {required_graph_schema!r}"
-            )
-        source_platform = manifest.get("source_platform_sidecar")
-        if not isinstance(source_platform, dict) or source_platform.get(
-            "schema"
-        ) != "cppmega_source_platform_v1":
-            raise ValueError(
-                f"{stage.prefix}: compact source platform sidecar missing or invalid"
-            )
+        sweep._assert_prefix_contract(stage.prefix)
 
 
 def _derive_stage_graph_capacities(stages: list[Stage]) -> dict[int, dict[str, object]]:
