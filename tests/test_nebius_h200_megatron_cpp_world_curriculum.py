@@ -22,23 +22,23 @@ def _capacity(stage, *, edges=23, chunks=17):
     }
 
 
-def test_default_curriculum_uses_h200_observed_long_context_batches():
+def test_default_curriculum_keeps_token_budget_with_receipt_backed_dsa_microbatch():
     stages = _default_stages()
 
     by_seq = {stage.seq: stage for stage in stages}
 
     assert by_seq[1024].batch == 192
-    assert by_seq[1024].micro_batch == 192
+    assert by_seq[1024].micro_batch == 1
     assert by_seq[2048].batch == 96
-    assert by_seq[2048].micro_batch == 96
+    assert by_seq[2048].micro_batch == 1
     assert by_seq[4096].batch == 40
-    assert by_seq[4096].micro_batch == 40
+    assert by_seq[4096].micro_batch == 1
     assert by_seq[4096].iters == 2311
     assert by_seq[8192].batch == 16
-    assert by_seq[8192].micro_batch == 4
+    assert by_seq[8192].micro_batch == 1
     assert by_seq[8192].iters == 2756
     assert by_seq[16384].batch == 8
-    assert by_seq[16384].micro_batch == 2
+    assert by_seq[16384].micro_batch == 1
     assert by_seq[16384].iters == 2391
 
 
@@ -82,7 +82,7 @@ def test_curriculum_manifest_records_global_and_micro_batch(tmp_path):
     payload = json.loads(out.read_text())
     assert payload["schema"] == "cppmega_h200_curriculum_v2"
     assert payload["stages"][0]["global_batch"] == 16
-    assert payload["stages"][0]["micro_batch"] == 4
+    assert payload["stages"][0]["micro_batch"] == 1
     assert payload["stages"][0]["graph_capacity"]["graph_max_edges"] == 23
     assert payload["stages"][0]["remote_prefix"] == "data/seq_8192/train"
     assert payload["checkpoint_transition"] == {
@@ -108,7 +108,7 @@ def test_curriculum_container_is_fail_closed_and_bash_parseable(tmp_path):
     script_path = tmp_path / "curriculum.sh"
     script_path.write_text(script, encoding="utf-8")
 
-    assert "CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS" in script
+    assert "export CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS=0" in script
     assert 'export CPPMEGA_DSA_PATCH_ENABLED="1"' in script
     assert "--enable-dsa-patch" in script
     assert "if os.environ.get('CPPMEGA_DSA_PATCH_ENABLED', '0') == '1'" in script
@@ -116,6 +116,14 @@ def test_curriculum_container_is_fail_closed_and_bash_parseable(tmp_path):
     assert "export CPPMEGA_DSA_INDEXER_LOSS_COEFF=0.001" in script
     assert "GRAPH_PRIOR_RECEIPT=\"/data/cppmega_h200_results/stage_${STAGE_IDX}_graph_prior.json\"" in script
     assert "reason=dsa_selector_gate" in script
+    assert "--experimental-attention-variant dsa" in script
+    assert "--dsa-indexer-loss-coeff 0.001" in script
+    assert (
+        "--spec cppmega.megatron.nam56r_full_spec "
+        "build_cppmega_nam56r_full_stack_spec"
+    ) in script
+    assert "unset CPPMEGA_DENSE_GQA" in script
+    assert "--group-query-attention" not in script
     assert "apply_graph_route_attention_bias_patch()" in script
     assert "--micro-batch-size ${MBS}" in script
     assert "--global-batch-size ${BS}" in script

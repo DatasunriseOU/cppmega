@@ -117,15 +117,15 @@ def _default_stages(
             raise ValueError(f"bundle lacks default curriculum buckets: {missing}")
 
     specs = [
-        (1024, 192, 192, 1421, prefix_by_seq[1024]),
-        (2048, 96, 96, 1686, prefix_by_seq[2048]),
-        (4096, 40, 40, 2311, prefix_by_seq[4096]),
-        # H200-observed defaults. Long-context stages keep a larger global batch
-        # but split it into smaller microbatches; the previous micro==global
-        # runs OOMed on TE cross-entropy/logits materialization before graph
-        # routes became the limiting factor.
-        (8192, 16, 4, 2756, prefix_by_seq[8192]),
-        (16384, 8, 2, 2391, prefix_by_seq[16384]),
+        # The global batches preserve the established curriculum token budget.
+        # The old microbatches were measured on the dense noconv lane, not on
+        # the production DSA/MoE spec.  Default to the only receipt-backed DSA
+        # preflight size until a live capacity sweep proves a larger value.
+        (1024, 192, 1, 1421, prefix_by_seq[1024]),
+        (2048, 96, 1, 1686, prefix_by_seq[2048]),
+        (4096, 40, 1, 2311, prefix_by_seq[4096]),
+        (8192, 16, 1, 2756, prefix_by_seq[8192]),
+        (16384, 8, 1, 2391, prefix_by_seq[16384]),
     ]
     return [
         Stage(index=i, seq=seq, batch=batch, micro_batch=micro_batch, iters=iters, prefix=prefix)
@@ -282,6 +282,9 @@ def _remote_script(
         raise ValueError(
             "production curriculum requires the fused DSA patch and graph auxiliary loss"
         )
+    dsa_native_args, dsa_spec = sweep.production_dsa_launch_contract()
+    dsa_args = " ".join(shlex.quote(value) for value in dsa_native_args)
+    dsa_spec_args = " ".join(shlex.quote(value) for value in dsa_spec)
     stage_lines = "\n".join(
         "          "
         + shlex.quote(
@@ -348,7 +351,7 @@ def _remote_script(
         export CPPMEGA_STRUCTURE_ENABLED=1
         export CPPMEGA_DOMAIN_EMBEDDING_ENABLED=1
         export CPPMEGA_GRAPH_ROUTES_ENABLED=1
-        export CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS="${{CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS:-1}}"
+        export CPPMEGA_GRAPH_DENSE_ATTENTION_BIAS=0
         export CPPMEGA_DSA_PATCH_ENABLED="1"
         export CPPMEGA_DSA_GRAPH_AUX_ENABLED=1
         export CPPMEGA_DSA_GRAPH_AUX_WEIGHT=1
@@ -563,6 +566,7 @@ def _remote_script(
             export CPPMEGA_DSA_GRAPH_AUX_WEIGHT=1
             export CPPMEGA_DSA_INDEXER_LOSS_COEFF=0.001
             export CPPMEGA_DSA_SKIP_INDEXER_LOSS=0
+            unset CPPMEGA_DENSE_GQA
 
             DATA_ARGS=(--data-path 1.0 \\\"\\$DATA_PREFIX\\")
             OPTIMIZER_ARGS=(--optimizer \\\"\\$CPPMEGA_OPTIMIZER\\\")
@@ -577,7 +581,7 @@ def _remote_script(
             if [[ \\\"\\$CPPMEGA_GRAD_REDUCE_IN_BF16\\\" == 1 || \\\"\\$CPPMEGA_USE_BF16_NO_MASTER_EMERGING_OPTIMIZER\\\" == 1 ]]; then OPTIMIZER_ARGS+=(--grad-reduce-in-bf16); fi
             if [[ \\\"\\$CPPMEGA_LOCAL_DDP_DISABLE_CONTIGUOUS_GRAD_BUFFER\\\" == 1 ]]; then OPTIMIZER_ARGS+=(--local-ddp-disable-contiguous-grad-buffer); fi
 
-            GQA_ARGS=(--group-query-attention --num-query-groups \\\"\\$CPPMEGA_NUM_QUERY_GROUPS\\\" --kv-channels \\\"\\$CPPMEGA_KV_CHANNELS\\\" --swiglu --rotary-base 10000)
+            DSA_ARGS=({dsa_args})
             ATTN_ARGS=(--attention-backend \\\"\\$CPPMEGA_ATTN_BACKEND\\\")
             if [[ \\\"\\$CPPMEGA_USE_FLASH_ATTN\\\" == 1 ]]; then
               ATTN_ARGS=(--use-flash-attn \\\"\\${{ATTN_ARGS[@]}}\\\")
@@ -613,7 +617,7 @@ def _remote_script(
               --hidden-size \\\"\\$CPPMEGA_HIDDEN_SIZE\\\" \\
               --ffn-hidden-size \\\"\\$CPPMEGA_FFN_HIDDEN_SIZE\\\" \\
               --num-attention-heads \\\"\\$CPPMEGA_NUM_ATTN_HEADS\\\" \\
-              \\\"\\${{GQA_ARGS[@]}}\\\" \\
+              \\\"\\${{DSA_ARGS[@]}}\\\" \\
               --seq-length ${{SEQ}} \\
               --max-position-embeddings ${{SEQ}} \\
               --micro-batch-size ${{MBS}} \\
@@ -633,7 +637,7 @@ def _remote_script(
               --use-mcore-models \\
               --transformer-impl transformer_engine \\
               \\\"\\${{ATTN_ARGS[@]}}\\\" \\
-              --spec cppmega.megatron.nam56r_noconv_spec build_cppmega_nam56r_noconv_stack_spec \\
+              --spec {dsa_spec_args} \\
               --cross-entropy-loss-fusion \\
               --cross-entropy-fusion-impl te \\
               \\\"\\${{RECOMPUTE_ARGS[@]}}\\\" \\
@@ -716,18 +720,11 @@ def _remote_script(
 
 def _scp_from_remote(args: argparse.Namespace, ip: str, remote_path: str, local_path: Path) -> int:
     local_path.mkdir(parents=True, exist_ok=True)
+    normalized_ip = sweep._normalize_ssh_ip(ip)
     cmd = [
-        "scp",
-        "-i",
-        str(args.ssh_key),
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
-        "-o",
-        "ConnectTimeout=15",
+        *sweep.scp_base(args, normalized_ip),
         "-r",
-        f"{args.ssh_user}@{ip}:{remote_path.rstrip('/')}/.",
+        f"{args.ssh_user}@{normalized_ip}:{remote_path.rstrip('/')}/.",
         str(local_path),
     ]
     printable = " ".join(shlex.quote(part) for part in cmd)
@@ -765,6 +762,25 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--ssh-user", default="dave")
     parser.add_argument("--ssh-key", type=Path, default=sweep.default_ssh_key())
     parser.add_argument("--ssh-pubkey", type=Path, default=None)
+    parser.add_argument(
+        "--ssh-host-key",
+        default=argparse.SUPPRESS,
+        help=(
+            "Pinned Nebius ssh-ed25519 host public-key line. Required for live "
+            "runs together with --ssh-host-key-fingerprint."
+        ),
+    )
+    parser.add_argument(
+        "--ssh-host-key-file",
+        type=Path,
+        default=argparse.SUPPRESS,
+        help="File containing the pinned Nebius ssh-ed25519 host public-key line.",
+    )
+    parser.add_argument(
+        "--ssh-host-key-fingerprint",
+        default=argparse.SUPPRESS,
+        help="OpenSSH SHA256 fingerprint corresponding to the pinned host key.",
+    )
     parser.add_argument("--docker-image", default=sweep.DEFAULT_DOCKER_IMAGE)
     parser.add_argument("--bundle-root", type=Path, required=True)
     parser.add_argument("--hash-jobs", type=int, default=4)
@@ -816,7 +832,15 @@ def main(argv: Iterable[str] | None = None) -> int:
             "production curriculum cannot run with --no-enable-dsa-patch"
         )
 
+    sweep.validate_ssh_host_key_contract(args, required=not args.dry_run)
     sweep.validate_docker_image_digest(args.docker_image)
+    for name, value in (
+        ("--parent-id", args.parent_id),
+        ("--subnet-id", args.subnet_id),
+        ("--security-group-id", args.security_group_id),
+        ("--image-id", args.image_id),
+    ):
+        sweep.validate_nebius_resource_id(value, name=name)
     if args.hash_jobs <= 0:
         raise ValueError("--hash-jobs must be positive")
     bundle_root = args.bundle_root.expanduser().resolve()

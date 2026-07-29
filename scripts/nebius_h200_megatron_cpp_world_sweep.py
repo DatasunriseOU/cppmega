@@ -791,6 +791,19 @@ def stream_tar_to_remote(args: argparse.Namespace, ip: str, tar_path: Path, targ
         subprocess.run(ssh_cmd, stdin=f, check=True)
 
 
+def production_dsa_launch_contract() -> tuple[list[str], tuple[str, str]]:
+    """Return the native CLI and spec required for the production DSA lane."""
+
+    profile = get_run_profile("h200_cpp_world_mini")
+    profile.model.dense = False
+    profile.spec_module = "cppmega.megatron.nam56r_full_spec"
+    profile.spec_function = "build_cppmega_nam56r_full_stack_spec"
+    native_args = shlex.split(profile.native_args_fragment())
+    if "--experimental-attention-variant" not in native_args:
+        raise ValueError("H200 graph auxiliary launcher requires native DSA args")
+    return native_args, (profile.spec_module, profile.spec_function)
+
+
 def remote_run_script(
     batch_sizes: list[int],
     train_iters: int,
@@ -818,17 +831,10 @@ def remote_run_script(
         raise ValueError(
             "production graph auxiliary contract requires the fused DSA patch"
         )
-    dsa_profile = get_run_profile("h200_cpp_world_mini")
-    dsa_profile.model.dense = False
-    dsa_profile.spec_module = "cppmega.megatron.nam56r_full_spec"
-    dsa_profile.spec_function = "build_cppmega_nam56r_full_stack_spec"
-    dsa_native_args = shlex.split(dsa_profile.native_args_fragment())
-    if "--experimental-attention-variant" not in dsa_native_args:
-        raise ValueError("H200 graph auxiliary launcher requires native DSA args")
+    dsa_native_args, dsa_spec = production_dsa_launch_contract()
     dsa_args = " ".join(shlex.quote(value) for value in dsa_native_args)
     dsa_spec_args = " ".join(
-        shlex.quote(value)
-        for value in (dsa_profile.spec_module, dsa_profile.spec_function)
+        shlex.quote(value) for value in dsa_spec
     )
     batches = " ".join(str(v) for v in batch_sizes)
     if seq_data_prefixes is None:
