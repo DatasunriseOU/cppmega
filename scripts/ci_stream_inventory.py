@@ -18,6 +18,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import errno
 import hashlib
 import json
 import math
@@ -68,6 +69,7 @@ MAX_INVENTORY_SQLITE_ROW_BYTES = (
     + MAX_RUN_METADATA_BYTES
     + 256 * 1024
 )
+MAX_PORTABLE_SNAPSHOT_COPY_BYTES = 64 * 1024 * 1024
 IMPORTED_UPGRADE_REASON = (
     "imported pre-v3 inventory producer upgrade audit record"
 )
@@ -352,22 +354,55 @@ def _read_bounded_regular_file(
         os.close(descriptor)
 
 
-def _copy_database_snapshot_once(
-    source: Path,
+def _try_copy_on_write_clone(
+    source_descriptor: int,
     destination: Path,
-) -> tuple[int, str, tuple[int, int, int, int, int]]:
-    """Copy and hash one stable database identity in a single bounded pass."""
+) -> bool:
+    """Create an atomic private reflink when the local filesystem supports it."""
 
-    source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    source_flags |= getattr(os, "O_NOFOLLOW", 0)
-    source_descriptor = os.open(source, source_flags)
-    destination_descriptor = -1
-    try:
-        before = os.fstat(source_descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise CompletionError(
-                "inventory database snapshot source is not a regular file"
-            )
+    unsupported = {
+        errno.EINVAL,
+        errno.ENOTSUP,
+        errno.EXDEV,
+        getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+        getattr(errno, "ENOTTY", errno.EINVAL),
+    }
+    if sys.platform == "darwin":
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        clone = libc.fclonefileat
+        clone.argtypes = (
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+        )
+        clone.restype = ctypes.c_int
+        parent_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        parent_flags |= getattr(os, "O_DIRECTORY", 0)
+        parent_descriptor = os.open(destination.parent, parent_flags)
+        try:
+            if clone(
+                source_descriptor,
+                parent_descriptor,
+                os.fsencode(destination.name),
+                0,
+            ) == 0:
+                return True
+            error_number = ctypes.get_errno()
+        finally:
+            os.close(parent_descriptor)
+        if error_number in unsupported:
+            return False
+        raise CompletionError(
+            "copy-on-write inventory snapshot failed: "
+            f"{os.strerror(error_number)}"
+        )
+
+    if sys.platform.startswith("linux"):
+        import fcntl
+
         destination_descriptor = os.open(
             destination,
             os.O_WRONLY
@@ -377,23 +412,65 @@ def _copy_database_snapshot_once(
             | getattr(os, "O_NOFOLLOW", 0),
             0o600,
         )
-        digest = hashlib.sha256()
-        copied = 0
-        while True:
-            block = os.read(source_descriptor, 1024 * 1024)
-            if not block:
-                break
-            digest.update(block)
-            view = memoryview(block)
-            while view:
-                written = os.write(destination_descriptor, view)
-                if written <= 0:
-                    raise CompletionError(
-                        "inventory database snapshot write made no progress"
-                    )
-                view = view[written:]
-            copied += len(block)
-        os.fsync(destination_descriptor)
+        try:
+            fcntl.ioctl(destination_descriptor, 0x40049409, source_descriptor)
+            return True
+        except OSError as exc:
+            if exc.errno not in unsupported:
+                raise CompletionError(
+                    f"copy-on-write inventory snapshot failed: {exc}"
+                ) from exc
+        finally:
+            os.close(destination_descriptor)
+        destination.unlink()
+    return False
+
+
+def _snapshot_database_once(
+    source: Path,
+    destination: Path,
+) -> tuple[int, str, tuple[int, int, int, int, int]]:
+    """Snapshot and hash one stable database without a large physical copy."""
+
+    source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    source_flags |= getattr(os, "O_NOFOLLOW", 0)
+    source_descriptor = os.open(source, source_flags)
+    try:
+        before = os.fstat(source_descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise CompletionError(
+                "inventory database snapshot source is not a regular file"
+            )
+        cloned = _try_copy_on_write_clone(source_descriptor, destination)
+        if not cloned:
+            if before.st_size > MAX_PORTABLE_SNAPSHOT_COPY_BYTES:
+                raise CompletionError(
+                    "filesystem lacks copy-on-write snapshots; refusing a "
+                    f"{before.st_size}-byte physical inventory copy"
+                )
+            destination_descriptor = os.open(
+                destination,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                while block := os.read(source_descriptor, 1024 * 1024):
+                    view = memoryview(block)
+                    while view:
+                        written = os.write(destination_descriptor, view)
+                        if written <= 0:
+                            raise CompletionError(
+                                "inventory snapshot write made no progress"
+                            )
+                        view = view[written:]
+                os.fsync(destination_descriptor)
+            finally:
+                os.close(destination_descriptor)
+
         after = os.fstat(source_descriptor)
         identity = (
             before.st_dev,
@@ -411,11 +488,10 @@ def _copy_database_snapshot_once(
                 after.st_mtime_ns,
                 after.st_ctime_ns,
             )
-            or copied != before.st_size
         ):
             raise CompletionError(
                 "inventory database changed while its private snapshot "
-                "was copied"
+                "was created"
             )
         path_after = source.lstat()
         if (
@@ -431,12 +507,45 @@ def _copy_database_snapshot_once(
         ):
             raise CompletionError(
                 "inventory database path changed while its private snapshot "
-                "was copied"
+                "was created"
             )
-        return copied, digest.hexdigest(), identity
+
+        digest = hashlib.sha256()
+        snapshot_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        snapshot_flags |= getattr(os, "O_NOFOLLOW", 0)
+        snapshot_descriptor = os.open(destination, snapshot_flags)
+        try:
+            snapshot_before = os.fstat(snapshot_descriptor)
+            if (
+                not stat.S_ISREG(snapshot_before.st_mode)
+                or snapshot_before.st_size != before.st_size
+            ):
+                raise CompletionError(
+                    "private inventory snapshot has the wrong file identity"
+                )
+            while block := os.read(snapshot_descriptor, 1024 * 1024):
+                digest.update(block)
+            snapshot_after = os.fstat(snapshot_descriptor)
+            if (
+                snapshot_before.st_dev,
+                snapshot_before.st_ino,
+                snapshot_before.st_size,
+                snapshot_before.st_mtime_ns,
+                snapshot_before.st_ctime_ns,
+            ) != (
+                snapshot_after.st_dev,
+                snapshot_after.st_ino,
+                snapshot_after.st_size,
+                snapshot_after.st_mtime_ns,
+                snapshot_after.st_ctime_ns,
+            ):
+                raise CompletionError(
+                    "private inventory snapshot changed while it was hashed"
+                )
+        finally:
+            os.close(snapshot_descriptor)
+        return before.st_size, digest.hexdigest(), identity
     finally:
-        if destination_descriptor >= 0:
-            os.close(destination_descriptor)
         os.close(source_descriptor)
 
 
@@ -6159,14 +6268,15 @@ def verify_inventory_completion_receipt(
         )
 
     with tempfile.TemporaryDirectory(
-        prefix="cppmega-inventory-verify-"
+        prefix=".cppmega-inventory-verify-",
+        dir=database.parent,
     ) as snapshot_directory:
         snapshot = Path(snapshot_directory) / "inventory.sqlite3"
         (
             database_size,
             database_sha256,
             database_identity,
-        ) = _copy_database_snapshot_once(database, snapshot)
+        ) = _snapshot_database_once(database, snapshot)
         if (
             artifact.get("byte_size") != database_size
             or artifact.get("sha256") != database_sha256

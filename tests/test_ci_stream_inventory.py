@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import sys
 from typing import Any, Mapping
 import urllib.parse
 import zlib
@@ -1564,6 +1565,29 @@ def test_completion_receipt_verifier_is_immutable_and_read_only(
         assert snapshot_after == snapshot_before
     finally:
         database.chmod(0o644)
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Darwin clonefile contract",
+)
+def test_inventory_snapshot_uses_copy_on_write_on_apfs(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.sqlite"
+    destination = tmp_path / "snapshot.sqlite"
+    payload = b"snapshot-payload" * 65_536
+    source.write_bytes(payload)
+
+    descriptor = os.open(source, os.O_RDONLY)
+    try:
+        assert ci._try_copy_on_write_clone(descriptor, destination)
+    finally:
+        os.close(descriptor)
+
+    assert destination.read_bytes() == payload
+    destination.write_bytes(b"changed")
+    assert source.read_bytes() == payload
 
 
 def _refresh_forged_database_artifact(
