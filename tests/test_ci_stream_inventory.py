@@ -1163,11 +1163,12 @@ def test_failed_page_resumes_from_sqlite_without_replaying_completed_pages(
         ]
 
 
-def test_v2_to_v3_resume_requires_exact_audited_producer_migration(
+def test_historical_v3_same_schema_upgrade_survives_v4_migration(
     tmp_path: Path,
 ) -> None:
     old_v1_script = "1" * 64
-    old_v2_script = "2" * 64
+    initial_v3_script = "2" * 64
+    upgraded_v3_script = "3" * 64
     reason = (
         "recover unstable one-second pagination with cardinality union proof"
     )
@@ -1179,7 +1180,7 @@ def test_v2_to_v3_resume_requires_exact_audited_producer_migration(
         )
         conn.execute(
             "UPDATE inventory_meta SET value=? WHERE key='script_sha256'",
-            (old_v2_script,),
+            (upgraded_v3_script,),
         )
         conn.execute(
             """
@@ -1192,8 +1193,23 @@ def test_v2_to_v3_resume_requires_exact_audited_producer_migration(
                 "cppmega_ci_stream_inventory_v1",
                 ci.PREVIOUS_SCHEMA_VERSION,
                 old_v1_script,
-                old_v2_script,
+                initial_v3_script,
                 "2026-01-01T00:00:00Z",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO inventory_upgrades(
+                from_schema,to_schema,from_script_sha256,
+                to_script_sha256,upgraded_at
+            ) VALUES (?,?,?,?,?)
+            """,
+            (
+                ci.PREVIOUS_SCHEMA_VERSION,
+                ci.PREVIOUS_SCHEMA_VERSION,
+                initial_v3_script,
+                upgraded_v3_script,
+                "2026-01-02T00:00:00Z",
             ),
         )
     conn.close()
@@ -1205,7 +1221,7 @@ def test_v2_to_v3_resume_requires_exact_audited_producer_migration(
             tmp_path,
             DatasetAPI([]),
             resume=True,
-            allow_script_upgrade_from_sha256="3" * 64,
+            allow_script_upgrade_from_sha256="4" * 64,
             script_upgrade_reason=reason,
         )
     with pytest.raises(ci.BindingError, match="requires a reason"):
@@ -1213,14 +1229,14 @@ def test_v2_to_v3_resume_requires_exact_audited_producer_migration(
             tmp_path,
             DatasetAPI([]),
             resume=True,
-            allow_script_upgrade_from_sha256=old_v2_script,
+            allow_script_upgrade_from_sha256=upgraded_v3_script,
         )
 
     migrated = _inventory(
         tmp_path,
         DatasetAPI([]),
         resume=True,
-        allow_script_upgrade_from_sha256=old_v2_script,
+        allow_script_upgrade_from_sha256=upgraded_v3_script,
         script_upgrade_reason=reason,
     )
     migrated.run()
@@ -1230,20 +1246,24 @@ def test_v2_to_v3_resume_requires_exact_audited_producer_migration(
 
     assert [
         upgrade["reason"] for upgrade in receipt["binding_upgrades"]
-    ] == [ci.IMPORTED_UPGRADE_REASON, reason]
+    ] == [ci.IMPORTED_UPGRADE_REASON, ci.IMPORTED_UPGRADE_REASON, reason]
+    assert (
+        receipt["binding_upgrades"][1]["from_schema"],
+        receipt["binding_upgrades"][1]["to_schema"],
+    ) == (ci.PREVIOUS_SCHEMA_VERSION, ci.PREVIOUS_SCHEMA_VERSION)
     assert receipt["binding_upgrades"][-1][
         "from_script_sha256"
-    ] == old_v2_script
+    ] == upgraded_v3_script
     assert receipt["binding_upgrades"][-1][
         "to_script_sha256"
     ] == migrated.script_sha256
     with sqlite3.connect(tmp_path / "inventory.sqlite") as conn:
         assert conn.execute(
             "SELECT COUNT(*) FROM inventory_upgrades"
-        ).fetchone() == (2,)
+        ).fetchone() == (3,)
         assert conn.execute(
             "SELECT COUNT(*) FROM inventory_binding_upgrades"
-        ).fetchone() == (2,)
+        ).fetchone() == (3,)
         assert conn.execute(
             "SELECT value FROM inventory_meta WHERE key='schema'"
         ).fetchone() == (ci.SCHEMA_VERSION,)
@@ -1253,7 +1273,7 @@ def test_v2_to_v3_resume_requires_exact_audited_producer_migration(
         tmp_path,
         repeated_api,
         resume=True,
-        allow_script_upgrade_from_sha256=old_v2_script,
+        allow_script_upgrade_from_sha256=upgraded_v3_script,
         script_upgrade_reason=reason,
     )
     repeated.run()
@@ -1261,13 +1281,13 @@ def test_v2_to_v3_resume_requires_exact_audited_producer_migration(
     with sqlite3.connect(tmp_path / "inventory.sqlite") as conn:
         assert conn.execute(
             "SELECT COUNT(*) FROM inventory_binding_upgrades"
-        ).fetchone() == (2,)
+        ).fetchone() == (3,)
     with pytest.raises(ci.BindingError, match="does not exactly replay"):
         _inventory(
             tmp_path,
             DatasetAPI([]),
             resume=True,
-            allow_script_upgrade_from_sha256=old_v2_script,
+            allow_script_upgrade_from_sha256=upgraded_v3_script,
             script_upgrade_reason=f"{reason} but changed",
         )
 
