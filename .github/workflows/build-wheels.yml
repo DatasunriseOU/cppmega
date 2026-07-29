@@ -36,11 +36,14 @@ concurrency:
 
 env:
   CUDA_VERSION: "13.2.1"
+  CUDA_TOOLKIT_DEB_VERSION: "13.2.1-1"
   PYTHON_VERSION: "3.13"
   # Keep exact: C++ extension wheels, especially TransformerEngine, are ABI
   # tied to the precise stable CUDA torch wheel they were compiled against.
   TORCH_VERSION: "2.13.0+cu132"
   TORCH_INDEX: "https://download.pytorch.org/whl/cu132"
+  TORCH_CUDNN_VERSION: "9.20.0.48"
+  TORCH_NCCL_VERSION: "2.29.7"
   TORCH_CUDA_ARCH_LIST: "9.0;10.0;12.1"
 
 jobs:
@@ -269,16 +272,22 @@ jobs:
       - name: Install CUDA ${{ env.CUDA_VERSION }} (apt from NVIDIA repo)
         run: |
           set -euo pipefail
-          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
-          sudo dpkg -i cuda-keyring_1.1-1_all.deb
-          sudo apt-get update
-          # cuda-toolkit-13-2 pulls latest 13.2.x (13.2.1 by 2026-04). cudnn9-cuda-13 = cuDNN 9.
-          # libnccl-dev/libnccl2 needed by TE (nccl.h #include in common/util/logging.h).
+          keyring_deb="$RUNNER_TEMP/cuda-keyring_1.1-1_all.deb"
+          wget -qO "$keyring_deb" \
+            https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i "$keyring_deb"
+          sudo apt-get -o Acquire::Retries=5 update
+          # cuDNN 9 permits only one system CUDA variant at a time. Do not
+          # replace a persistent runner's CUDA-12 cuDNN packages. The exact
+          # CUDA-13 cuDNN/NCCL pair required by torch is installed by pip below
+          # and exported from site-packages for TransformerEngine's build.
           sudo apt-get install -y --no-install-recommends \
-              cuda-toolkit-13-2 cudnn9-cuda-13 libnccl-dev libnccl2
+            "cuda-toolkit-13-2=${CUDA_TOOLKIT_DEB_VERSION}"
           echo "CUDA_HOME=/usr/local/cuda-13.2" >> "$GITHUB_ENV"
           echo "/usr/local/cuda-13.2/bin" >> "$GITHUB_PATH"
-          /usr/local/cuda-13.2/bin/nvcc --version
+          nvcc_version=$(/usr/local/cuda-13.2/bin/nvcc --version)
+          echo "$nvcc_version"
+          grep -q 'release 13\.2' <<<"$nvcc_version"
           # Keep real driver libraries intact on persistent GPU runners. Add
           # toolkit stubs only when the host has no driver library at all.
           if ! ldconfig -p | grep -q 'libcuda\.so\.1'; then
@@ -341,7 +350,65 @@ jobs:
             echo "::warning::torch install attempt $n failed; retrying in $((30*n))s"
             sleep $((30 * n))
           done
-          python -c "import torch; print(torch.__version__, torch.version.cuda)"
+          python - <<'PY'
+          from importlib import metadata
+          from importlib.util import find_spec
+          from pathlib import Path
+          import os
+          import torch
+
+          expected = {
+              "torch": os.environ["TORCH_VERSION"],
+              "nvidia-cudnn-cu13": os.environ["TORCH_CUDNN_VERSION"],
+              "nvidia-nccl-cu13": os.environ["TORCH_NCCL_VERSION"],
+          }
+          observed = {
+              "torch": str(torch.__version__),
+              "nvidia-cudnn-cu13": metadata.version("nvidia-cudnn-cu13"),
+              "nvidia-nccl-cu13": metadata.version("nvidia-nccl-cu13"),
+          }
+          if observed != expected:
+              raise SystemExit(
+                  f"torch CUDA dependency contract drifted: "
+                  f"observed={observed!r} expected={expected!r}"
+              )
+          if torch.version.cuda != "13.2":
+              raise SystemExit(
+                  f"torch CUDA build drifted: observed={torch.version.cuda!r} "
+                  "expected='13.2'"
+              )
+          spec = find_spec("nvidia.cudnn")
+          locations = list(spec.submodule_search_locations or ()) if spec else []
+          if len(locations) != 1:
+              raise SystemExit(f"unable to resolve nvidia.cudnn root: {locations!r}")
+          cudnn_path = Path(locations[0]).resolve()
+          if not (cudnn_path / "include/cudnn.h").is_file():
+              raise SystemExit(f"cuDNN header is missing below {cudnn_path}")
+          if not any((cudnn_path / "lib").glob("libcudnn.so.9*")):
+              raise SystemExit(f"cuDNN runtime is missing below {cudnn_path}")
+          github_env = Path(os.environ["GITHUB_ENV"])
+          with github_env.open("a", encoding="utf-8") as stream:
+              stream.write(f"CUDNN_PATH={cudnn_path}\n")
+              stream.write(
+                  f"CPATH={cudnn_path / 'include'}:"
+                  f"{os.environ.get('CPATH', '')}\n"
+              )
+              stream.write(
+                  f"LIBRARY_PATH={cudnn_path / 'lib'}:"
+                  f"{os.environ.get('LIBRARY_PATH', '')}\n"
+              )
+              stream.write(
+                  "LD_LIBRARY_PATH="
+                  f"{cudnn_path / 'lib'}:"
+                  f"{os.environ.get('LD_LIBRARY_PATH', '')}\n"
+              )
+          print(
+              f"torch={torch.__version__} cuda={torch.version.cuda} "
+              f"cudnn={observed['nvidia-cudnn-cu13']} "
+              f"nccl={observed['nvidia-nccl-cu13']} "
+              f"CUDNN_PATH={cudnn_path}"
+          )
+          PY
 
       - name: Install build deps
         # scikit-build-core: PEP 517 backend used by tilelang/CMake-based wheels.
